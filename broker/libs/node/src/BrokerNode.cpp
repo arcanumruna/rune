@@ -453,6 +453,11 @@ void BrokerNode::start() {
 
     // 7. Build the ClientGateway and NodeRuntimeAgent (after aeron_ is live).
     buildGateway();
+    // hotpath-A F2: every worker-driven disk log was wired to the provisioner's
+    // demand hook (its rolls defer while no ready segment exists) — a missing
+    // provisioner thread would wedge every roll.  Never start like that.
+    if (provisionerAgent_ && !provisionerRunner_)
+        throw std::logic_error("BrokerNode: SegmentProvisionerAgent built but not wired to a runner");
 
     // 7.0 fsyncgate: a log whose recovery failed (index msync / dir fsync — the
     //     log is marked storage-failed) must never serve.  Refuse to start —

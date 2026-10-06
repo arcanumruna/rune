@@ -738,6 +738,59 @@ TEST(WorkerProduceRegression, OversizeRejectLogRateLimitedRegression) {
     EXPECT_EQ(log.logEndOffset(), 0);
 }
 
+// hotpath-A F2/F3: a produce whose append would need a roll that cannot happen
+// without blocking the worker (no pre-provisioned segment ready on a
+// provisioned log) is HELD — the frame is not decoded into state, answered or
+// appended (the production controlled poll ABORTs it and re-delivers it) — and
+// goes through once the provisioner refilled the pool.  It used to append and
+// roll inline: an open + ftruncate + mmap (+ fallocate) on the worker.
+TEST(WorkerProduceRegression, DeferredRollHoldsIngressFrameRegression) {
+    TempDir dir("hotpatha_hold_");
+    rune::storage::Log log(dir.path.string(), /*rollBytes=*/256);
+    log.recover();
+    struct Hook { static void fn(void* c, rune::storage::Log*) noexcept { ++*static_cast<int*>(c); } };
+    int demands = 0;
+    log.setProvisioning({&Hook::fn, &demands});
+    NullTransport transport;
+    auto replica = WorkerProduceFixture::makeLeaderReplica(0, 0, log, transport);
+    Worker worker(0);
+    worker.setOwnedDirect({replica.get()});
+
+    int answers = 0;
+    auto drain = [&] {
+        worker.drainReturn([&](const WorkerReturn& ret) {
+            if (ret.type == WorkerReturn::Type::ProduceResult) { EXPECT_EQ(ret.errorCode, 0); ++answers; }
+        });
+    };
+    int64_t corr = 0;
+    // Fill the active segment through the worker (no roll needed yet).
+    while (!log.rollDeferred()) {
+        const auto f = encodeProduceFrame(1, ++corr, 0, 0, /*acks=*/0, makeBatch());
+        ASSERT_GE(worker.handleIngressFrameForTest(f.data(), f.size(), 1), 0);
+        drain();
+    }
+    ASSERT_EQ(answers, corr);
+    const int64_t leo = log.logEndOffset();
+    const auto segs = log.segmentBaseOffsets().size();
+    const auto held = encodeProduceFrame(1, ++corr, 0, 0, 0, makeBatch());
+    EXPECT_LT(worker.handleIngressFrameForTest(held.data(), held.size(), 1), 0) << "the frame must be held";
+    drain();
+    EXPECT_EQ(answers, corr - 1) << "a held frame is not answered";
+    EXPECT_EQ(log.logEndOffset(), leo) << "a held frame is not appended";
+    EXPECT_EQ(log.segmentBaseOffsets().size(), segs) << "no inline segment create on the worker";
+    EXPECT_EQ(worker.intakeRollHoldsForTest(), 1u);
+    // The provisioner refills: the re-delivered frame goes through and rolls.
+    ASSERT_EQ(log.provisionReady(1), 1);
+    EXPECT_GE(worker.handleIngressFrameForTest(held.data(), held.size(), 1), 0);
+    drain();
+    EXPECT_EQ(answers, corr);
+    EXPECT_EQ(log.logEndOffset(), leo + 1);
+    EXPECT_EQ(log.segmentBaseOffsets().size(), segs + 1);
+    EXPECT_EQ(demands, 1);
+    (void)log.finalizeStagingRenames();
+    (void)log.drainStagingRenamesDone();
+}
+
 } // namespace
 } // namespace rune::node
 
