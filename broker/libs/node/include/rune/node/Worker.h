@@ -1920,6 +1920,15 @@ private:
                 queueRecoveryCheckpoint_(*gate);
             if (c.errorCode == 0) return 1;
         }
+        // Hot-path B F7: a leader-epoch-state write completed (only while owned;
+        // unowned: the next owner rewrites it — resetEpochStateForNewOwner).  An
+        // error is the replica's to handle (a pending leadership is refused and
+        // the log dir goes offline — the synchronous fence's semantics), never
+        // the log's fail-stop.
+        if (routed && r.kind == RouteKind::EpochState) {
+            if (gate && gate->replica) (void)gate->replica->epochStateWriteCompleted(static_cast<uint64_t>(r.aux), c.errorCode);
+            return 1;
+        }
 
         // C-1: the error FIRST — before any purged-slot early return.  An fsync
         // error is fail-stop whoever owns the log now (never retried).
@@ -4184,7 +4193,7 @@ private:
     std::vector<std::pair<rune::storage::Log*, uint32_t>> slotIndex_;
     std::size_t               slotIndexMask_ = 0;
 
-    enum class RouteKind : uint8_t { Durable, Background, Seal, Hint, RecoveryPoint, DirSync };
+    enum class RouteKind : uint8_t { Durable, Background, Seal, Hint, RecoveryPoint, DirSync, EpochState };
     struct TokenRoute {
         CompletionToken            token = kNoToken;   ///< kNoToken = empty bucket
         rune::storage::Log*        log   = nullptr;
@@ -4192,7 +4201,8 @@ private:
         uint32_t                   epoch = 0;
         RouteKind                  kind  = RouteKind::Durable;
         /// Durable / Background: the LEO at submit (the flush covers every
-        /// offset below it in `seg`); RecoveryPoint: the checkpoint sequence.
+        /// offset below it in `seg`); RecoveryPoint: the checkpoint sequence;
+        /// EpochState (hot-path B F7): the leader-epoch-state write sequence.
         int64_t                    aux   = 0;
     };
     std::vector<TokenRoute> routes_;
@@ -4205,6 +4215,7 @@ private:
     uint64_t    sealSubmits_    = 0;
     uint64_t    dirSyncSubmits_ = 0;   ///< E1d MEDIUM-2: batched directory fsyncs submitted
     uint64_t    rpSubmits_      = 0;   ///< E1d recovery-point checkpoint write+fdatasyncs submitted
+    uint64_t    epochStateSubmits_ = 0;   ///< hot-path B F7: leader-epoch-state syncs submitted
     std::vector<rune::storage::Log*> rpQueue_;   ///< E1d F8: logs whose checkpoint is due
     uint64_t    ioCompletionsReaped_ = 0;
     uint64_t    storageFailureSignals_ = 0;
@@ -4679,7 +4690,7 @@ private:
                 // broker) and the two-phase migration's drain-before-grant contract
                 // (WorkerPool.h), so another worker never fsyncs a log while this
                 // worker's fsync on it is in flight.
-                bool rpRouted = false, dirRouted = false;
+                bool rpRouted = false, dirRouted = false, esRouted = false;
                 std::vector<const rune::storage::LogSegment*> sealsRouted;   // cold (ownership change)
                 for (const TokenRoute& rt : routes_) {
                     if (rt.token == kNoToken || rt.log != log) continue;
@@ -4687,6 +4698,7 @@ private:
                     if (rt.kind == RouteKind::Background) fresh.bgToken      = rt.token;
                     if (rt.kind == RouteKind::RecoveryPoint) rpRouted = true;
                     if (rt.kind == RouteKind::DirSync) dirRouted = true;
+                    if (rt.kind == RouteKind::EpochState) esRouted = true;
                     if (rt.kind == RouteKind::Seal) sealsRouted.push_back(rt.seg);
                 }
                 // E1d F7 (cold): a checkpoint / seal whose completion went to a
@@ -4695,6 +4707,7 @@ private:
                 // higher seq), every not-yet-durable sealed segment is re-sealed.
                 if (!rpRouted) log->resetRecoveryCheckpointForNewOwner();
                 if (!dirRouted) log->resetDirectorySyncForNewOwner();   // MEDIUM-2 (F7 parity)
+                if (!esRouted) replica->resetEpochStateForNewOwner();   // hot-path B F7 (same rule)
                 // MEDIUM-1: ALWAYS replay — skip only the segments whose seal is
                 // routed here (their completion still arrives on this worker).
                 (void)log->requeueUndurableSeals(sealsRouted.data(), sealsRouted.size());
@@ -4843,11 +4856,46 @@ private:
         }
         work += submitRecoveryCheckpoints_();
         for (auto* replica : owned_) {
+            if (replica && replica->epochStateWriteDue()) [[unlikely]] work += submitEpochStateWrite_(*replica);
             if (replica && replica->takeFollowerFlushRequest() && replica->isDiskBacked()) {
                 if (LogFlushSlot* slot = slotOf_(replica->log())) work += requestBgFlush_(*slot) ? 1 : 0;
             }
         }
         return work;
+    }
+
+    // Hot-path B F7: a replica's leader-epoch durability point (restart fence /
+    // epoch-cache image) — never an fsync on this loop.  The slot image is
+    // written into the pre-allocated leader-epoch-state file's page cache (one
+    // small pwrite over already-allocated blocks: the io backend's write+sync
+    // request carries at most kWriteSyncMaxBlock = 64 bytes) and its fdatasync
+    // goes to the io backend; the completion confirms it (and may complete a
+    // deferred leadership).  Cold: role changes / epoch transitions only.
+    [[gnu::cold]] int submitEpochStateWrite_(rune::replication::PartitionReplica& r) noexcept {
+        if (!r.isDiskBacked()) return 0;
+        LogFlushSlot* slot = slotOf_(r.log());
+        if (slot == nullptr) return 0;                     // not (yet) owned here: next pass
+        rune::replication::PartitionReplica::EpochStateWrite w;
+        if (!r.prepareEpochStateWrite(w)) return 0;
+        if (::pwrite(w.fd, w.data, w.len, static_cast<off_t>(w.offset)) != static_cast<ssize_t>(w.len)) {
+            const int err = errno != 0 ? errno : ENOSPC;
+            r.epochStateWriteSubmitted();
+            (void)r.epochStateWriteCompleted(w.seq, err);   // fail closed (as a failed fsync)
+            ++epochStateSubmits_;
+            return 1;
+        }
+        const CompletionToken t = io_.submit(w.fd, 0);
+        if (t == kNoToken) {                               // back-pressure: retry next pass
+            r.epochStateWriteNotSubmitted();
+            return 0;
+        }
+        r.epochStateWriteSubmitted();
+        if (!routeInsert_(TokenRoute{t, r.log(), nullptr, slot->epoch, RouteKind::EpochState,
+                                     static_cast<int64_t>(w.seq)})) {
+            spdlog::critical("Worker {}: io token route table full (token={})", workerId_, t);
+        }
+        ++epochStateSubmits_;
+        return 1;
     }
 
     // Async roll seals queued by the log (every worker-driven log — the replica

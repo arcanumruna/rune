@@ -1,0 +1,200 @@
+#pragma once
+// LeaderEpochState.h — hot-path B F7: the leader-epoch durability file that the
+// owning worker writes through its io backend (never a synchronous fsync on the
+// worker).
+//
+// One pre-allocated file per disk log, `<log dir>/leader-epoch-state`, holding
+// TWO slots (the recovery-point checkpoint's scheme, Log::kRecoveryPointFile):
+// every update writes the slot NOT holding the newest durable image, with a
+// higher sequence, then fdatasyncs — one io-backend request (write + datasync),
+// no rename, no directory fsync (the file is created once, tmp + fsync + rename
+// + directory fsync, off the worker).  Restore picks the valid slot with the
+// highest sequence; a torn write fails its CRC and the other slot stands.
+//
+// A slot carries BOTH durable leader-epoch facts:
+//   - the restart fence (the highest epoch this replica ever led at), and
+//   - the leader-epoch cache (epoch → start offset).
+//
+// Slot layout (little-endian):
+//   [0]  magic u32 "LEST" | [4] version u16 | [6] reserved u16 | [8] seq u64
+//   [16] fence i64 | [24] count u32 | [28] crc32c u32 over [0,28) ++ entries
+//   [32] count × { epoch i32, startOffset i64 }
+// The slot stride (file size / 2, a multiple of 4096) bounds `count`: a cache
+// that outgrows it re-creates the file larger (cold, counted).
+#include <rune/protocol/Crc32c.h>
+
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <string>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <utility>
+#include <vector>
+
+namespace rune::storage {
+
+struct LeaderEpochState {
+    static constexpr const char*   kFileName    = "leader-epoch-state";
+    static constexpr const char*   kTmpFileName = "leader-epoch-state.tmp";
+    static constexpr uint32_t      kMagic       = 0x5453454Cu;   // "LEST"
+    static constexpr uint16_t      kVersion     = 1;
+    static constexpr std::size_t   kHeaderBytes = 32;
+    static constexpr std::size_t   kEntryBytes  = 12;
+    static constexpr std::size_t   kCrcOffset   = 28;
+    static constexpr std::size_t   kMinEntries  = 1024;          ///< per slot (stride 16 KiB)
+
+    using Entries = std::vector<std::pair<int32_t, int64_t>>;
+
+    enum class FileState : uint8_t { Missing, Corrupt, Valid };
+    struct Read {
+        FileState state = FileState::Missing;
+        uint64_t  seq   = 0;
+        int       slot  = -1;
+        int64_t   fence = -1;
+        Entries   entries;
+        std::size_t stride = 0;
+    };
+
+    [[nodiscard]] static std::string path(const std::string& dir) { return dir + "/" + kFileName; }
+
+    /// Slot stride that holds `entries` entries (4096-aligned).
+    [[nodiscard]] static constexpr std::size_t strideFor(std::size_t entries) noexcept {
+        const std::size_t want = kHeaderBytes + entries * kEntryBytes;
+        return (want + 4095u) & ~static_cast<std::size_t>(4095u);
+    }
+    [[nodiscard]] static constexpr std::size_t capacityOf(std::size_t stride) noexcept {
+        return stride < kHeaderBytes ? 0 : (stride - kHeaderBytes) / kEntryBytes;
+    }
+    /// Bytes of an encoded slot holding `count` entries.
+    [[nodiscard]] static constexpr std::size_t imageBytes(std::size_t count) noexcept {
+        return kHeaderBytes + count * kEntryBytes;
+    }
+
+    /// Encode a slot into `out` (at least imageBytes(n) bytes).  No allocation.
+    template <class It>
+    static std::size_t encode(uint8_t* out, uint64_t seq, int64_t fence, It first, It last) noexcept {
+        std::size_t n = 0;
+        uint8_t* e = out + kHeaderBytes;
+        for (It it = first; it != last; ++it, ++n) {
+            putLe32_(e, static_cast<uint32_t>(it->first));
+            putLe64_(e + 4, static_cast<uint64_t>(it->second));
+            e += kEntryBytes;
+        }
+        std::memset(out, 0, kHeaderBytes);
+        putLe32_(out + 0, kMagic);
+        out[4] = static_cast<uint8_t>(kVersion);
+        out[5] = static_cast<uint8_t>(kVersion >> 8);
+        putLe64_(out + 8, seq);
+        putLe64_(out + 16, static_cast<uint64_t>(fence));
+        putLe32_(out + 24, static_cast<uint32_t>(n));
+        const uint32_t crc = crcOf_(out, n);
+        putLe32_(out + kCrcOffset, crc);
+        return imageBytes(n);
+    }
+
+    /// Decode one slot of `len` readable bytes.  False = invalid (magic,
+    /// version, bounds or CRC).
+    static bool decode(const uint8_t* in, std::size_t len, uint64_t& seq, int64_t& fence, Entries* entries) {
+        if (len < kHeaderBytes) return false;
+        if (getLe32_(in) != kMagic) return false;
+        if (static_cast<uint16_t>(in[4] | (in[5] << 8)) != kVersion) return false;
+        const uint32_t n = getLe32_(in + 24);
+        if (imageBytes(n) > len) return false;
+        if (getLe32_(in + kCrcOffset) != crcOf_(in, n)) return false;
+        seq   = getLe64_(in + 8);
+        fence = static_cast<int64_t>(getLe64_(in + 16));
+        if (seq == 0) return false;
+        if (entries != nullptr) {
+            entries->clear();
+            entries->reserve(n);
+            const uint8_t* e = in + kHeaderBytes;
+            for (uint32_t i = 0; i < n; ++i, e += kEntryBytes)
+                entries->emplace_back(static_cast<int32_t>(getLe32_(e)), static_cast<int64_t>(getLe64_(e + 4)));
+        }
+        return true;
+    }
+
+    /// Read the newest valid slot of `<dir>/leader-epoch-state`.  Cold.
+    static Read read(const std::string& dir) {
+        Read out;
+        const std::string p = path(dir);
+        const int fd = ::open(p.c_str(), O_RDONLY);
+        if (fd < 0) {
+            if (errno != ENOENT) out.state = FileState::Corrupt;
+            return out;
+        }
+        out.state = FileState::Corrupt;
+        struct stat st{};
+        if (::fstat(fd, &st) == 0 && st.st_size >= static_cast<off_t>(2 * 4096) && (st.st_size % 8192) == 0) {
+            const std::size_t stride = static_cast<std::size_t>(st.st_size) / 2;
+            out.stride = stride;
+            std::vector<uint8_t> buf(stride);
+            Entries tmp;
+            for (int slot = 0; slot < 2; ++slot) {
+                const ssize_t n = ::pread(fd, buf.data(), stride, static_cast<off_t>(slot) * static_cast<off_t>(stride));
+                if (n != static_cast<ssize_t>(stride)) continue;
+                uint64_t seq = 0; int64_t fence = -1;
+                if (!decode(buf.data(), stride, seq, fence, &tmp)) continue;
+                if (out.state != FileState::Valid || seq > out.seq) {
+                    out.state = FileState::Valid; out.seq = seq; out.slot = slot; out.fence = fence;
+                    out.entries.swap(tmp);
+                }
+            }
+        }
+        ::close(fd);
+        return out;
+    }
+
+    /// Create (or re-create, larger) the file with slot 0 = the given image and
+    /// slot 1 empty: tmp + write + fsync + rename + FULL directory fsync.  Returns
+    /// the open fd of the renamed file (kept for every later slot write) or -errno.
+    /// Cold — never on a worker duty pass in steady state.
+    template <class It>
+    static int create(const std::string& dir, std::size_t stride, uint64_t seq, int64_t fence, It first, It last) {
+        std::vector<uint8_t> file(2 * stride, 0);
+        encode(file.data(), seq, fence, first, last);
+        const std::string tmp = dir + "/" + kTmpFileName;
+        const std::string dst = path(dir);
+        int err = 0;
+        const int fd = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) return -(errno != 0 ? errno : EIO);
+        if (::pwrite(fd, file.data(), file.size(), 0) != static_cast<ssize_t>(file.size())) err = errno != 0 ? errno : ENOSPC;
+        if (err == 0 && ::fsync(fd) != 0) err = errno != 0 ? errno : EIO;
+        if (err == 0 && ::rename(tmp.c_str(), dst.c_str()) != 0) err = errno != 0 ? errno : EIO;
+        if (err == 0) {
+            const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+            if (dfd < 0 || ::fsync(dfd) != 0) err = errno != 0 ? errno : EIO;
+            if (dfd >= 0) ::close(dfd);
+        }
+        if (err != 0) {
+            ::close(fd);
+            ::unlink(tmp.c_str());
+            return -err;
+        }
+        return fd;
+    }
+
+    /// Open the existing file for slot writes.  -errno on failure.  Cold.
+    static int openExisting(const std::string& dir) {
+        const int fd = ::open(path(dir).c_str(), O_RDWR);
+        return fd >= 0 ? fd : -(errno != 0 ? errno : EIO);
+    }
+
+private:
+    static void putLe32_(uint8_t* p, uint32_t v) noexcept { for (int i = 0; i < 4; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i)); }
+    static void putLe64_(uint8_t* p, uint64_t v) noexcept { for (int i = 0; i < 8; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i)); }
+    static uint32_t getLe32_(const uint8_t* p) noexcept { uint32_t v = 0; for (int i = 3; i >= 0; --i) v = (v << 8) | p[i]; return v; }
+    static uint64_t getLe64_(const uint8_t* p) noexcept { uint64_t v = 0; for (int i = 7; i >= 0; --i) v = (v << 8) | p[i]; return v; }
+    /// CRC over the header up to the CRC field, then the entries.
+    static uint32_t crcOf_(const uint8_t* slot, std::size_t n) noexcept {
+        const uint32_t h = rune::protocol::crc32c(slot, kCrcOffset);
+        if (n == 0) return h;
+        return rune::protocol::crc32c(h, slot + kHeaderBytes, n * kEntryBytes);
+    }
+};
+
+} // namespace rune::storage

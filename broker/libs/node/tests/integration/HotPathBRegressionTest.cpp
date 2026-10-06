@@ -5,6 +5,10 @@
 //   F5  PushRead answers are gathered from the segment read mmap straight into
 //       the return ring, bounded per worker pass (Worker::kPushPassBudgetBytes)
 //       and fair (budget-deferred reads are served first next pass).
+//   F7  role changes never fsync on the worker: the leader-epoch fence +
+//       epoch-cache image go to the two-slot leader-epoch-state file through
+//       the worker's io backend, and a controller-managed leadership acts only
+//       once that write completed (event-driven).
 #include <rune/metadata/ShardRouter.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/Worker.h>
@@ -14,11 +18,15 @@
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune/storage/LeaderEpochState.h>
 #include <rune/storage/Log.h>
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <thread>
 #include <map>
 #include <memory>
 #include <string>
@@ -72,7 +80,7 @@ struct Rig {
     PartitionReplica*                         rep = nullptr;
     int64_t                                   now = 1'000'000'000;
 
-    Rig() {
+    explicit Rig(bool controllerManaged = false) {
         log = std::make_unique<rune::storage::Log>(dir.p.string(), 64 * 1024 * 1024);
         log->recover();
         PartitionConfig c;
@@ -82,6 +90,7 @@ struct Rig {
         auto r = std::make_unique<PartitionReplica>(c, Role::Leader, 1, std::vector<int32_t>{1},
                                                     std::vector<int32_t>{1}, log.get(), &transport);
         r->setExternalFollowerFlush(true);
+        if (controllerManaged) r->setIsrChannel(&transport);
         rep = r.get();
         reg.add(1, 0, std::move(r));
         pool.setRegistry(&reg);
@@ -96,6 +105,24 @@ struct Rig {
         now += 1'000'000;
         if (frame) (void)worker().handleIngressFrameForTest(frame->data(), frame->size(), now);
         (void)worker().doWork(now);
+    }
+    void roleOp(bool leader, int64_t epoch, int32_t leaderId = 2) {
+        WorkerOp op;
+        op.type = leader ? WorkerOp::Type::BecomeLeader : WorkerOp::Type::BecomeFollower;
+        op.topicId = 1; op.partition = 0; op.roleEpoch = epoch;
+        if (leader) op.isr = {1}; else op.roleLeaderId = leaderId;
+        ASSERT_TRUE(pool.tryEnqueueOp(1, 0, std::move(op)));
+    }
+    /// Passes until `done` (the io backend completes on its own thread) —
+    /// bounded, never a sleep-based wait for an outcome.
+    template <class F> bool passUntil(F&& done, int maxMs = 5000) {
+        const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(maxMs);
+        while (!done()) {
+            if (std::chrono::steady_clock::now() > end) return false;
+            pass();
+            std::this_thread::yield();
+        }
+        return true;
     }
     void pushRead(int64_t subId, int64_t from) {
         WorkerOp op;
@@ -186,4 +213,148 @@ TEST(HotPathBRegression, DeferredPushReadRevalidatesOwnershipRegression) {
     });
     EXPECT_EQ(answeredWithData + unanswered, 4);
     EXPECT_EQ(rig.worker().deferredPushReadsForTest(), 0u);
+}
+
+// F7: the pass that executes a controller-managed BecomeLeader at a new epoch
+// must not fsync the leader-epoch fence / checkpoint inline (old: write + fsync
+// + rename + directory fsync on the worker — 2-13 ms passes for every
+// partition the worker owns).  The leadership is deferred until the owning
+// worker's io backend completed the leader-epoch-state write that carries the
+// fence AND the new epoch's cache entry; then it leads, and both are durable.
+TEST(HotPathBRegression, RoleChangeEpochDurabilityIsAsyncAndGatesLeadershipRegression) {
+    Rig rig(/*controllerManaged=*/true);
+    const auto frame = produceFrame(1, 1, 0, 100, 2);
+    for (int i = 0; i < 4; ++i) rig.pass(&frame);
+    const int64_t leo = rig.log->logEndOffset();
+    ASSERT_GT(leo, 0);
+
+    rig.roleOp(/*leader=*/false, 2);
+    rig.pass();
+    ASSERT_EQ(rig.rep->role(), Role::Follower);
+
+    rig.roleOp(/*leader=*/true, 3);
+    rig.pass();   // the role-op pass: submits the write, never waits for it
+    EXPECT_NE(rig.rep->role(), Role::Leader)
+        << "led at epoch 3 inside the role-op pass: its fence was fsynced on the worker";
+    EXPECT_TRUE(rig.rep->leadershipPendingForTest());
+    EXPECT_EQ(rig.rep->epochStateInlineWritesForTest(), 0u) << "a synchronous epoch write on the worker";
+
+    ASSERT_TRUE(rig.passUntil([&] { return rig.rep->role() == Role::Leader; })) << "leadership never completed";
+    EXPECT_EQ(rig.rep->epoch(), 3);
+    EXPECT_FALSE(rig.rep->leadershipPendingForTest());
+    EXPECT_EQ(rig.rep->epochStateInlineWritesForTest(), 0u);
+    EXPECT_GE(rig.rep->epochStateWritesForTest(), 1u);
+
+    // Durable: the fence and the epoch entry, exactly as a restart reads them.
+    const auto st = rune::storage::LeaderEpochState::read(rig.dir.p.string());
+    ASSERT_EQ(st.state, rune::storage::LeaderEpochState::FileState::Valid);
+    EXPECT_GE(st.fence, 3);
+    rune::storage::LeaderEpochCache c;
+    ASSERT_TRUE(PartitionReplica::readDurableEpochCache(rig.dir.p.string(), c));
+    EXPECT_EQ(c.latestEpoch(), 3);
+    EXPECT_EQ(c.startOffsetFor(3), leo);
+
+    // It is writable under the new epoch.
+    std::size_t errs = 0, oks = 0;
+    rig.pool.drainAllReturns([](WorkerReturn) {});
+    rig.pass(&frame);
+    rig.passUntil([&] {
+        rig.pool.drainAllReturns([&](WorkerReturn r) {
+            if (r.type == WorkerReturn::Type::ProduceResult) {
+                if (r.errorCode == 0) ++oks; else ++errs;
+            }
+        });
+        return oks + errs > 0;
+    });
+    EXPECT_EQ(errs, 0u);
+}
+
+// F7: a newer role while the leadership awaits its durable fence supersedes it
+// (never leads at the superseded epoch), and a later leadership still works.
+TEST(HotPathBRegression, DeferredLeadershipSupersededByNewerRoleRegression) {
+    Rig rig(/*controllerManaged=*/true);
+    rig.roleOp(false, 2);
+    rig.pass();
+    rig.roleOp(true, 3);
+    rig.roleOp(false, 4);    // same pass: demoted before the fence completed
+    rig.pass();
+    EXPECT_FALSE(rig.rep->leadershipPendingForTest());
+    // Let the in-flight write complete: it must not resurrect the leadership.
+    rig.passUntil([&] { return rig.rep->epochStateDurable(); });
+    for (int i = 0; i < 8; ++i) rig.pass();
+    EXPECT_EQ(rig.rep->role(), Role::Follower);
+    EXPECT_EQ(rig.rep->epoch(), 4);
+
+    rig.roleOp(true, 5);
+    rig.pass();
+    ASSERT_TRUE(rig.passUntil([&] { return rig.rep->role() == Role::Leader; }));
+    EXPECT_EQ(rig.rep->epoch(), 5);
+    rune::storage::LeaderEpochCache c;
+    ASSERT_TRUE(PartitionReplica::readDurableEpochCache(rig.dir.p.string(), c));
+    EXPECT_EQ(c.latestEpoch(), 5);
+    EXPECT_GE(rune::storage::LeaderEpochState::read(rig.dir.p.string()).fence, 5);
+}
+
+namespace {
+std::vector<uint8_t> stampedBatch(int64_t base, int n, int32_t epoch) {
+    rune::protocol::RecordBatchBuilder b(base, 1000);
+    for (int i = 0; i < n; ++i) b.append("k", "v", 1000 + i);
+    auto v = b.build();
+    rune::protocol::RecordBatchReader::stampLeaderEpoch(v.data(), epoch);
+    return v;
+}
+} // namespace
+
+// F7 restore: leader-epoch-state is authoritative (the legacy checkpoint is no
+// longer written once it exists), its fence feeds the restart fence, and a
+// state file with no valid slot is REBUILT from the batches' stamps — never
+// restored from a stale legacy checkpoint.
+TEST(HotPathBRegression, EpochStateRestoreAndCorruptionRegression) {
+    TmpDir d;
+    rune::replication::NullPartitionTransport t;
+    PartitionConfig c;
+    c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+    {
+        rune::storage::Log log(d.p.string());
+        log.recover();
+        const auto a = stampedBatch(0, 3, 1);
+        log.append(a, 2);
+        PartitionReplica r(c, Role::Leader, 1, {1}, {1}, &log, &t);
+        r.setExternalFollowerFlush(true);      // creates leader-epoch-state
+        ASSERT_TRUE(r.epochStateEnabledForTest());
+        r.setExternalFollowerFlush(false);     // control-thread mode: written inline
+        r.setIsrChannel(&t);
+        r.becomeLeader(7, {1});                // fence 7 + entry (7, 3), synchronously
+        ASSERT_EQ(r.role(), Role::Leader);
+    }
+    ASSERT_FALSE(fs::exists(d.p / "leader-epoch-checkpoint") &&
+                 fs::exists(d.p / "leader-epoch-fence")) << "legacy files still written";
+    {
+        rune::storage::Log log(d.p.string());
+        log.recover();
+        PartitionReplica r(c, Role::Follower, 7, {1}, {1}, &log, &t);
+        EXPECT_GE(r.restartFenceEpochForTest(), 7);
+        EXPECT_EQ(r.leaderEpochCacheForTest().latestEpoch(), 1)   // DUR-1: (7, 3) names no record
+            << "restored cache";
+        EXPECT_EQ(r.leaderEpochCacheForTest().startOffsetFor(1), 0);
+    }
+    // Corrupt both slots; drop in a stale legacy checkpoint claiming epoch 9.
+    {
+        std::fstream f(d.p / rune::storage::LeaderEpochState::kFileName, std::ios::in | std::ios::out | std::ios::binary);
+        const auto sz = fs::file_size(d.p / rune::storage::LeaderEpochState::kFileName);
+        f.seekp(0); f.write("XXXX", 4);
+        f.seekp(static_cast<std::streamoff>(sz / 2)); f.write("XXXX", 4);
+    }
+    {
+        rune::storage::LeaderEpochCache stale;
+        stale.assign(9, 0);
+        stale.checkpointToFile((d.p / "leader-epoch-checkpoint").string());
+    }
+    {
+        rune::storage::Log log(d.p.string());
+        log.recover();
+        PartitionReplica r(c, Role::Follower, 7, {1}, {1}, &log, &t);
+        EXPECT_EQ(r.leaderEpochCacheForTest().latestEpoch(), 1) << "trusted the stale legacy checkpoint";
+        EXPECT_EQ(r.leaderEpochCacheForTest().startOffsetFor(1), 0);
+    }
 }

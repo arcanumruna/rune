@@ -191,7 +191,9 @@ Epoch diskMaxEpoch(const std::vector<fs::path>& dirs, int32_t part) {
     Epoch m = -1;
     for (const auto& d : dirs) {
         rune::storage::LeaderEpochCache c;
-        if (c.restoreFromFile((d / "topics" / kTopic / std::to_string(part) / "leader-epoch-checkpoint").string()))
+        // Hot-path B F7: leader-epoch-state is authoritative once it exists.
+        if (rune::replication::PartitionReplica::readDurableEpochCache(
+                (d / "topics" / kTopic / std::to_string(part)).string(), c))
             m = std::max<Epoch>(m, c.latestEpoch());
     }
     return m;

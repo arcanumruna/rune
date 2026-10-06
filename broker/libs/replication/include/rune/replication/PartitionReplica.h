@@ -923,10 +923,64 @@ public:
     /// Worker-driven user replicas (every placement, F30): the follower flush,
     /// leader append / txn-marker flushes and roll seals become requests the
     /// owning worker submits to its io backend — never an inline fsync.
+    /// Hot-path B F7: also switches the leader-epoch durability (restart fence
+    /// + epoch cache) to the two-slot `leader-epoch-state` file written by the
+    /// owning worker through its io backend (see epochStateWriteDue) — never a
+    /// synchronous fsync on the worker.  Opening / creating the file is cold
+    /// (the caller's thread; BrokerNode: the control thread at replica build).
     void setExternalFollowerFlush(bool on) noexcept {
         externalFollowerFlush_ = on;
         if (!memoryBacked_ && diskLog_ != nullptr) diskLog_->setDeferSealSync(on);
+        if (on && !memoryBacked_ && diskLog_ != nullptr && es_.fd < 0) enableEpochState_();
     }
+
+    // -----------------------------------------------------------------------
+    // Hot-path B F7: async leader-epoch durability (worker-driven replicas).
+    //
+    // Every leader-epoch durability point (the restart fence before leading a
+    // new epoch, the epoch-cache checkpoint after an assign / truncation) is
+    // ONE write + fdatasync of the alternate slot of `leader-epoch-state`,
+    // submitted by the owning worker (Worker::submitEpochStateWrites_) — the
+    // recovery-point checkpoint's state machine:
+    //   Idle --prepare--> Prepared --submitted--> InFlight --completed--> Idle
+    //   (Prepared --notSubmitted--> Idle on back-pressure; still due.)
+    // Ordering is unchanged and EVENT-driven: a controller-managed
+    // becomeLeader at an epoch above the durable fence is DEFERRED (the
+    // replica keeps its previous role, applies nothing, fetches nothing) until
+    // the slot carrying the fence AND the new epoch's cache entry completed —
+    // exactly what the synchronous fsync guaranteed before.  A failed write
+    // refuses the leadership and takes the log dir offline (as before).
+    // -----------------------------------------------------------------------
+    struct EpochStateWrite { int fd = -1; const uint8_t* data = nullptr; uint32_t len = 0; int64_t offset = 0; uint64_t seq = 0; };
+    [[nodiscard]] bool epochStateWriteDue() const noexcept {
+        return es_.due && es_.stage == EsStage::Idle && es_.fd >= 0;
+    }
+    /// Idle -> Prepared: encode the alternate slot (pure memory, no syscall;
+    /// a cache that outgrew the slot re-creates the file — cold, counted).
+    bool prepareEpochStateWrite(EpochStateWrite& out);
+    /// Prepared -> InFlight.
+    void epochStateWriteSubmitted() noexcept;
+    /// Prepared -> Idle (back-pressure: still due).
+    void epochStateWriteNotSubmitted() noexcept;
+    /// InFlight completed (err = errno, 0 = ok).  Success may complete a
+    /// deferred leadership.  Returns true iff another write is due.
+    bool epochStateWriteCompleted(uint64_t seq, int err);
+    /// A fresh owner holds no route for an in-flight write (its completion
+    /// went to a previous owner): outcome unknown — rewritten with a higher seq.
+    void resetEpochStateForNewOwner() noexcept;
+    /// Nothing due and nothing in flight (every change is durable).
+    [[nodiscard]] bool epochStateDurable() const noexcept {
+        return es_.fd < 0 || (!es_.due && es_.stage == EsStage::Idle);
+    }
+    [[nodiscard]] bool leadershipPendingForTest() const noexcept { return pendingLead_.active; }
+    [[nodiscard]] uint64_t leadershipsDeferredForTest() const noexcept { return leadershipsDeferred_; }
+    [[nodiscard]] uint64_t epochStateWritesForTest() const noexcept { return es_.writes; }
+    [[nodiscard]] uint64_t epochStateInlineWritesForTest() const noexcept { return es_.inlineWrites; }
+    [[nodiscard]] bool epochStateEnabledForTest() const noexcept { return es_.fd >= 0; }
+    /// Tools / tests: the durable leader-epoch cache of `logDir` exactly as a
+    /// restart restores it (`leader-epoch-state` when present, else the legacy
+    /// `leader-epoch-checkpoint`).  False when neither holds a valid image.
+    static bool readDurableEpochCache(const std::string& logDir, rune::storage::LeaderEpochCache& out);
     [[nodiscard]] bool externalFollowerFlush() const noexcept { return externalFollowerFlush_; }
     /// Leader-epoch checkpoint writes (the one accepted synchronous disk write
     /// on a shard loop — see checkpointEpochs_).
@@ -1290,6 +1344,45 @@ private:
     uint64_t leadershipGeneration_ = 0;    ///< F15 S4: bumped on every Leader <-> Follower transition
     uint64_t epochCheckpointWrites_ = 0;   ///< see checkpointEpochs_
     void checkpointEpochs_();
+    // Hot-path B F7: async leader-epoch durability (see epochStateWriteDue).
+    enum class EsStage : uint8_t { Idle, Prepared, InFlight };
+    struct EpochStateIo {
+        int         fd = -1;            ///< leader-epoch-state (>= 0: it is the authoritative copy)
+        std::size_t stride = 0;         ///< slot stride (file size / 2)
+        int         activeSlot = -1;    ///< slot of the newest CONFIRMED image (-1: none)
+        uint64_t    seq = 0;            ///< last sequence used
+        EsStage     stage = EsStage::Idle;
+        bool        due = false;        ///< a change awaits its write
+        bool        abandoned = false;  ///< the in-flight write was superseded by an inline one
+        int         inflightSlot = -1;
+        uint64_t    inflightSeq = 0;
+        Epoch       inflightFence = -1;
+        uint64_t    inflightLeadGen = 0;   ///< pendingLead_.gen the in-flight image carried (0: none)
+        uint64_t    confirmedLeadGen = 0;  ///< same, of the newest confirmed image
+        Epoch       fenceTarget = -1;   ///< the fence the next image carries (>= fencePersisted_)
+        std::vector<uint8_t> image;     ///< the Prepared slot image (stride bytes; stable until completion)
+        uint64_t    writes = 0, inlineWrites = 0, errors = 0, recreates = 0;
+    };
+    EpochStateIo es_;
+    /// A controller-managed leadership waiting for its durable fence.
+    struct PendingLeadership {
+        bool                active = false;
+        uint64_t            gen = 0;           ///< identifies this deferral (images carrying it)
+        Epoch               epoch = -1;
+        std::vector<NodeId> isr;
+        int32_t             partitionEpoch = -1;
+        Offset              leo = -1;          ///< LEO the image's new-epoch entry starts at
+        rune::storage::LeaderEpochCache cache; ///< the cache image written (cache + the new entry)
+    };
+    PendingLeadership pendingLead_;
+    bool resumingLead_ = false;                ///< becomeLeader re-entered from the completion
+    uint64_t leadGenSeq_ = 0;
+    void enableEpochState_() noexcept;
+    bool writeEpochStateInline_() noexcept;
+    void cancelPendingLeadership_() noexcept;
+    void completePendingLeadershipIfDurable_();
+    void deferLeadership_(Epoch newEpoch, std::vector<NodeId> isr, int32_t partitionEpoch);
+    uint64_t leadershipsDeferred_ = 0, leadershipsResumed_ = 0, appliesDroppedLeadPending_ = 0;
     bool followerFlushRequested_ = false;  ///< raised by doWork, consumed by the worker
     // Per-second rate counters (RUNE_FS_LOG diagnostic) to localise the acks=all
     // throughput bottleneck: appends (LEO growth), applies (follower push-apply),
