@@ -1160,6 +1160,8 @@ public:
     /// log cleaner had posted renames pending; applies dropped meanwhile.
     [[nodiscard]] uint64_t truncatesDeferred() const noexcept { return truncatesDeferred_; }
     [[nodiscard]] uint64_t appliesDroppedTruncatePending() const noexcept { return appliesDroppedTruncatePending_; }
+    [[nodiscard]] uint64_t appliesDroppedAwaitEsForTest() const noexcept { return appliesDroppedAwaitEs_; }
+    [[nodiscard]] uint64_t appliesDroppedLeadPendingForTest() const noexcept { return appliesDroppedLeadPending_; }
     [[nodiscard]] bool     truncatePendingForTest() const noexcept { return followerSync_.truncatePending(); }
 private:
     uint64_t truncatesDeferred_ = 0;

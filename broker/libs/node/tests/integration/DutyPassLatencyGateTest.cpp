@@ -1138,6 +1138,10 @@ Outcome truncationDuringCleanerPass() {
             if (B.logStart > lsoAtLead) { rig.becomeFollower(B); extra |= kRoleOp; st = St::Demoting; }
             break;
         case St::Demoting: {
+            // Hot-path B review C1: a follower whose last divergence truncation's
+            // history is not durable yet neither fetches nor applies — the new
+            // leader's answer can only come after its next fetch.
+            if (B.rep->refetchAwaitsEpochStateForTest()) break;
             // Diverging-epoch answer from the new leader: truncate the tail
             // B wrote in its last epoch.  Deferred (TruncatePending) while B's
             // posted file ops are still queued for the cleaner.
