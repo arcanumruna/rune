@@ -648,7 +648,7 @@ public:
     /// leader is always an ISR member): every leader holds every committed
     /// record, so leadership alone is the gate.  Refusal = retriable NotLeader.
     [[nodiscard]] [[gnu::always_inline]] bool acceptsProduce() const noexcept {
-        return role_ == Role::Leader;
+        return role_ == Role::Leader && !leadPending_;
     }
     /// F15 §2.1 step 3 / §3.2: bumped by every change to the log's existing
     /// content — a tail truncation (KIP-279; formerly also a reconcile append of
@@ -1217,6 +1217,11 @@ private:
     // -----------------------------------------------------------------------
     PartitionConfig      cfg_;
     Role                 role_;
+    /// Hot-path B F7: a leadership at a newer epoch awaits its durable fence
+    /// (mirrors pendingLead_.active; next to role_ — same line as the produce
+    /// gate's load).  A sitting leader being re-elected refuses produce
+    /// (retriable NotLeader) until it leads at the new epoch, as before.
+    bool                 leadPending_ = false;
     Epoch                epoch_;
     NodeId               leaderId_;           ///< (follower) leader's NodeId; -1 if unknown
 

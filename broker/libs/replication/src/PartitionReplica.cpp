@@ -1867,6 +1867,7 @@ void PartitionReplica::completePendingLeadershipIfDurable_()
     // The fence + the new epoch's cache entry are durable: lead now.
     PendingLeadership p = std::move(pendingLead_);
     pendingLead_ = PendingLeadership{};
+    leadPending_ = false;
     ++leadershipsResumed_;
     resumingLead_ = true;
     becomeLeader(p.epoch, std::move(p.isr), p.partitionEpoch);
@@ -1884,6 +1885,7 @@ void PartitionReplica::deferLeadership_(Epoch newEpoch, std::vector<NodeId> isr,
     // re-enters becomeLeader.  Until then the replica keeps its role, applies
     // nothing and fetches nothing (the LEO the image names stays put).
     pendingLead_.active         = true;
+    leadPending_                = true;
     pendingLead_.gen            = ++leadGenSeq_;
     pendingLead_.epoch          = newEpoch;
     pendingLead_.isr            = std::move(isr);
@@ -1913,6 +1915,7 @@ void PartitionReplica::cancelPendingLeadership_() noexcept
 {
     if (!pendingLead_.active) return;
     pendingLead_ = PendingLeadership{};
+    leadPending_ = false;
     // The pending image (cache + the new entry) may land: the real cache
     // supersedes it with the next write.
     if (es_.fd >= 0) es_.due = true;

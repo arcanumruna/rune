@@ -437,3 +437,36 @@ TEST(HotPathBRegression, UnsyncedTruncationRebuildRecoversAfterCrashRegression) 
     log.append(b, 31);
     EXPECT_EQ(log.logEndOffset(), 32);
 }
+
+// F7: a sitting leader re-elected at a newer epoch (controller epoch bump) never
+// appends while its new fence is not durable — produce is refused retriably
+// (NotLeader) instead of landing under the superseded epoch, then accepted
+// under the new one.
+TEST(HotPathBRegression, EpochBumpOfSittingLeaderRefusesProduceUntilDurableRegression) {
+    Rig rig(/*controllerManaged=*/true);
+    ASSERT_EQ(rig.rep->role(), Role::Leader);
+    const auto frame = produceFrame(1, 1, 0, 100, 2);
+    rig.roleOp(true, 2);
+    rig.pass();                                   // the role-op pass (write submitted)
+    const int64_t leo = rig.log->logEndOffset();
+    rig.pass(&frame);                             // intake before this pass reaps anything
+    int16_t err = 0;
+    int answers = 0;
+    rig.pool.drainAllReturns([&](WorkerReturn r) {
+        if (r.type == WorkerReturn::Type::ProduceResult) { ++answers; err = r.errorCode; }
+    });
+    ASSERT_EQ(answers, 1);
+    EXPECT_EQ(err, static_cast<int16_t>(pc::ErrorCode::NotLeader))
+        << "appended under the superseded epoch while the new fence was not durable";
+    EXPECT_EQ(rig.log->logEndOffset(), leo);
+
+    ASSERT_TRUE(rig.passUntil([&] { return rig.rep->acceptsProduce() && rig.rep->epoch() == 2; }));
+    rig.pass(&frame);
+    err = -1;
+    rig.pool.drainAllReturns([&](WorkerReturn r) { if (r.type == WorkerReturn::Type::ProduceResult) err = r.errorCode; });
+    EXPECT_EQ(err, 0);
+    rune::storage::LeaderEpochCache c;
+    ASSERT_TRUE(PartitionReplica::readDurableEpochCache(rig.dir.p.string(), c));
+    EXPECT_EQ(c.latestEpoch(), 2);
+    EXPECT_EQ(c.startOffsetFor(2), leo);
+}
