@@ -227,6 +227,24 @@ public:
                           int64_t logPosition,
                           NodeId  leaderMemberId);
 
+    /// Controlled shutdown (Raft leadership transfer; Aeron's graceful leader
+    /// close).  A CLOSED multi-node LEADER resigns: it sends StandDown
+    /// (template 59) to every follower, stops heartbeating and re-enters
+    /// CANVASS; it votes but never stands for election again in this process
+    /// (resigned() latches).  Returns false (nothing done) unless this node is
+    /// the CLOSED leader of a multi-node cluster.  Duty-cycle thread; cold.
+    bool resign(int64_t nowNs);
+    /// A follower learns its leader resigned: it starts an election AT ONCE
+    /// (no leader-heartbeat timeout), skipping the resigned leader in the
+    /// canvass (Aeron gracefulClosedLeaderId).  Ignored unless it comes from
+    /// the leader this CLOSED follower follows, for its current term.
+    void onStandDown(int64_t nowNs, Term leadershipTermId, NodeId leaderMemberId);
+    [[nodiscard]] bool resigned() const noexcept { return resigned_; }
+    /// Controlled shutdown, any role: never stand for election again in this
+    /// process (it still votes).  A current leader keeps leading until
+    /// resign().  Duty-cycle thread.
+    void withdrawCandidacy() noexcept { resigned_ = true; }
+
     /// Review 2026-10-04 MAJOR-2/3 — candidacy rule.  `fn(ctx, candidate)`
     /// decides whether this node may VOTE for `candidate`.  The broker wires it
     /// to InternalIsrKnowledge::eligible: a node outside the newest durable ISR
@@ -365,6 +383,7 @@ private:
         RUNE_ELECTION_PUB_FWD(newLeadershipTerm)
         RUNE_ELECTION_PUB_FWD(appendPosition)
         RUNE_ELECTION_PUB_FWD(commitPosition)
+        RUNE_ELECTION_PUB_FWD(standDown)
 #undef RUNE_ELECTION_PUB_FWD
     };
     static_assert(std::is_final_v<SbeConsensusPublisher>);
@@ -441,6 +460,17 @@ private:
 
     // Election.java:100
     NodeId gracefulClosedLeaderId_ = -1;
+    /// Controlled shutdown: this node resigned its leadership (resign()) — it
+    /// never nominates itself again; while canvassing it re-sends StandDown
+    /// for the term it resigned (loss recovery on the status interval).
+    bool resigned_       = false;
+    Term resignedTermId_ = -1;
+    /// Entry time of this node's current leadership (LeaderLogReplication);
+    /// INT64_MIN = never led.  The failover-liveness grace (eligibleNodeIds).
+    int64_t leaderSinceNs_ = INT64_MIN;
+    /// gracefulClosedLeaderId_ was set by a StandDown: the resigned leader's
+    /// own canvass does not clear it until this election completes.
+    bool skipFromStandDown_ = false;
 
     // Election.java:104  private ClusterMember leaderMember = null;
     ClusterMember* leaderMember_ = nullptr;

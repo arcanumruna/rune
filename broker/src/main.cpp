@@ -238,9 +238,16 @@ int main() {
 
     const int exitCode = ctl.exitCode;
     if (exitCode != 0) {
+        // Fail-stop: never a hand-off (the storage is suspect) — stop at once.
         spdlog::critical("rune-broker: HALTING on storage failure — stopping (exit {})", exitCode);
     } else {
         spdlog::info("rune-broker: shutdown signal received — stopping");
+        // Controlled shutdown (Kafka parity): hand partition leadership (and,
+        // on the controller, the consensus) to in-sync peers BEFORE stopping,
+        // so no broker keeps sending clients to this node.  Bounded by
+        // RUNE_CONTROLLED_SHUTDOWN_MS (0 = off); on expiry it stops as before.
+        if (const auto budget = node.controlledShutdownBudget(); budget.count() > 0)
+            (void)node.controlledShutdown(budget);
     }
     node.stop();
     // Threads are joined + quiesced now → drain rings and write the final report.

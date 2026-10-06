@@ -135,4 +135,10 @@ void SbeConsensusPublisher::commitPosition(
     sink_.send(toMember, buf_.data(), len);
 }
 
+void SbeConsensusPublisher::standDown(NodeId toMember, Term leadershipTermId, NodeId leaderMemberId)
+{
+    const auto len = StandDownMsg::encode(buf_.data(), 0, leadershipTermId, leaderMemberId);
+    sink_.send(toMember, buf_.data(), len);
+}
+
 } // namespace rune::consensus

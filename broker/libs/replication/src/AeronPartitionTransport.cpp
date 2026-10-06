@@ -356,6 +356,18 @@ bool AeronPartitionTransport::sendAlterIsr(const AlterIsrMsg& msg)
     return len != 0 && enqueueOutbound(kController, wire, len);
 }
 
+bool AeronPartitionTransport::sendNodeControl(NodeId to, const AlterIsrMsg& msg)
+{
+    uint8_t wire[AlterIsrMsg::TOTAL_SIZE];
+    const std::size_t len = msg.encode(wire, sizeof wire);
+    if (len == 0) return false;
+    if (to == static_cast<NodeId>(selfId_)) {   // this node: local
+        (void)handleFrame_(wire, len);
+        return true;
+    }
+    return enqueueOutbound(static_cast<int32_t>(to), wire, len);
+}
+
 bool AeronPartitionTransport::sendInternalIsr(NodeId to, const InternalIsrMsg& msg)
 {
     uint8_t wire[InternalIsrMsg::TOTAL_SIZE];
@@ -716,6 +728,10 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         // its owning thread (a USER replica's worker; inline otherwise).
         AlterIsrResponseMsg r{};
         if (!AlterIsrResponseMsg::decode(buf, len, r)) return Action::CONTINUE;
+        if (r.topicId == AlterIsrMsg::kNodeControlTopicId) {   // controlled shutdown / register ack
+            if (nodeControlRespHandler_ != nullptr) nodeControlRespHandler_(nodeControlRespCtx_, r);
+            return Action::CONTINUE;
+        }
         if (r.topicId < 0) {
             // A coordinator partition (controller-ISR path, re-review MEDIUM-B):
             // internal replicas are driven on this (control) thread.

@@ -108,3 +108,74 @@ TEST(ControlledShutdown, BeginControlledShutdownUnknownNodeIsNoOp) {
     // Membership table must remain empty.
     EXPECT_EQ(mem.size(), 0u);
 }
+
+// Controlled shutdown (2026-10-05): a node excluded as a leader (a stopping
+// node) is never the target of a PREFERRED-leader election, even when it is
+// replicas[0], live and in the ISR.
+TEST(ControlledShutdownRegression, PreferredLeaderNeverMovesToAnExcludedNodeRegression) {
+    AssignmentMap m;
+    m.put(7, 0, PartitionAssignment{2, {2, 1, 3}, {1, 2, 3}, 4, 9});   // leader 2, preferred 1
+    m.put(7, 1, PartitionAssignment{2, {2, 1, 3}, {2, 1, 3}, 4, 9});
+    DynamicBalancer bal; DynamicBalancerInputs in;
+    in.cur = &m; in.liveNodes = {1, 2, 3};
+    in.topics = { TopicSpec{7, 2, 3, "", ""} };
+    in.excludedLeaders = {{7, 0, 1}, {7, 1, 1}};
+    for (const auto& r : bal.rebalance(in))
+        EXPECT_NE(r.rec.leaderNode, 1) << "partition " << r.rec.partition << " moved to the excluded node";
+    in.excludedLeaders.clear();
+    bool moved = false;
+    for (const auto& r : bal.rebalance(in)) moved = moved || r.rec.leaderNode == 1;
+    EXPECT_TRUE(moved) << "control: without the exclusion the preferred election fires";
+}
+
+// Fix round 1 (D5): the SOFT avoid rule for stopping nodes.
+TEST(ControlledShutdownRegression, AvoidedNodeHandsOffOrStaysOrSurvivesRegression) {
+    DynamicBalancer bal;
+    {   // a stopping leader hands off to a live in-sync replica, and leaves the ISR
+        AssignmentMap m;
+        m.put(7, 0, PartitionAssignment{1, {1, 2, 3}, {1, 2, 3}, 4, 9});
+        DynamicBalancerInputs in; in.cur = &m; in.liveNodes = {1, 2, 3};
+        in.topics = { TopicSpec{7, 1, 3, "", ""} }; in.avoidLeaders = {1};
+        auto r = bal.rebalance(in);
+        ASSERT_EQ(r.size(), 1u);
+        EXPECT_NE(r[0].rec.leaderNode, 1);
+        EXPECT_EQ(std::count(r[0].isr.begin(), r[0].isr.end(), 1), 0);
+    }
+    {   // sole in-sync replica: stays
+        AssignmentMap m;
+        m.put(7, 0, PartitionAssignment{1, {1}, {1, 2, 3}, 4, 9});
+        DynamicBalancerInputs in; in.cur = &m; in.liveNodes = {1, 2, 3};
+        in.topics = { TopicSpec{7, 1, 3, "", ""} }; in.avoidLeaders = {1};
+        EXPECT_TRUE(bal.rebalance(in).empty());
+    }
+    {   // dead leader: a non-stopping survivor first (never the extra hop)
+        AssignmentMap m;
+        m.put(7, 0, PartitionAssignment{1, {1, 2, 3}, {1, 2, 3}, 4, 9});
+        DynamicBalancerInputs in; in.cur = &m; in.liveNodes = {2, 3};
+        in.topics = { TopicSpec{7, 1, 3, "", ""} }; in.avoidLeaders = {2};
+        auto r = bal.rebalance(in);
+        ASSERT_EQ(r.size(), 1u);
+        EXPECT_EQ(r[0].rec.leaderNode, 3);
+    }
+    {   // dead leader, only the stopping survivor in sync: elected (not offline)
+        AssignmentMap m;
+        m.put(7, 0, PartitionAssignment{1, {1, 2}, {1, 2, 3}, 4, 9});
+        DynamicBalancerInputs in; in.cur = &m; in.liveNodes = {2, 3};
+        in.topics = { TopicSpec{7, 1, 3, "", ""} }; in.avoidLeaders = {2};
+        auto r = bal.rebalance(in);
+        ASSERT_EQ(r.size(), 1u);
+        EXPECT_EQ(r[0].rec.leaderNode, 2);
+    }
+}
+
+// Fix round 2 (N3): a stopping SOLE-ISR leader that is heartbeat-starved out of
+// liveNodes but still serving (data-plane alive) keeps its partition — never
+// failed over to NO_LEADER while it serves.
+TEST(ControlledShutdownRegression, DataPlaneAliveStoppingSoleLeaderKeepsItsPartitionRegression) {
+    AssignmentMap m;
+    m.put(7, 0, PartitionAssignment{1, {1}, {1, 2, 3}, 4, 9});
+    DynamicBalancer bal; DynamicBalancerInputs in;
+    in.cur = &m; in.liveNodes = {2, 3}; in.dataPlaneAliveLeaders = {1};
+    in.topics = { TopicSpec{7, 1, 3, "", ""} }; in.avoidLeaders = {1};
+    EXPECT_TRUE(bal.rebalance(in).empty()) << "a serving sole-ISR stopping leader was taken offline";
+}
