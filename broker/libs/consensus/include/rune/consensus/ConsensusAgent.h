@@ -133,6 +133,8 @@ public:
         int64_t logPosition,
         NodeId  leaderMemberId) override;
 
+    void onStandDown(int64_t nowNs, Term leadershipTermId, NodeId leaderMemberId) override;
+
     // -----------------------------------------------------------------------
     // Accessors
     // -----------------------------------------------------------------------

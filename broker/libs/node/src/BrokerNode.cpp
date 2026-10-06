@@ -15,6 +15,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <random>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -93,6 +94,10 @@ int64_t bumpProcessIncarnation(const std::string& dataDir) {
     if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) return fallback();
     return next;
 }
+// Controlled shutdown (review M1): a random, non-zero 64-bit identity of THIS
+// process — compared by identity, so a restart with a wiped data dir (whose
+// incarnation counter restarts low) is still a new process.  Cold (once).
+int64_t processNonce() { return ControlledShutdown::freshNonce(); }
 // Leader-epoch restart fence for a MEMORY-backed replica (disk-backed ones keep
 // it next to their log): <dataDir>/memory-epoch-fence/<topicId>-<partition>.
 // The records do not survive a restart, but the epochs this node led at must
@@ -428,6 +433,8 @@ void BrokerNode::start() {
         stuckMarkersCounterRegId_ = aeron_->addCounter(
             kStuckMarkersCounterTypeId, roleKey, kRoleKeyLength,
             stuckMarkersLabel(config_.nodeId));
+        outOfSyncCounterRegId_ = aeron_->addCounter(
+            kOutOfSyncCounterTypeId, roleKey, kRoleKeyLength, outOfSyncLabel(config_.nodeId));
     }
     const auto t2 = sclock::now();
 
@@ -2395,6 +2402,26 @@ void BrokerNode::buildGateway() {
     // before the control thread starts (ordered by its start).
     leaderObserver_.bind(election_.get(), nodeAgent_.get());
     runtimeAgent_->setLeaderObserver(&leaderObserver_);
+    // Controlled shutdown (Kafka parity): multi-node only — a single node has
+    // nobody to hand off to (begin completes at once).  The controller's
+    // acks of this node's NODE-level requests arrive on the legacy transport
+    // (control thread).
+    if (!config_.isSingleNode() && replTransport_ && metadataService_ && election_) {
+        // Review M1: the node-control protocol identifies this PROCESS by a
+        // random nonce (compared by identity) — never by the data-dir counter,
+        // which restarts low after a wiped dir.
+        runtimeAgent_->controlledShutdown().bind(
+            config_.nodeId, processNonce(),
+            [](void* t, int32_t to, const rune::replication::AlterIsrMsg& m) noexcept {
+                return static_cast<rune::replication::AeronPartitionTransport*>(t)->sendNodeControl(to, m);
+            }, replTransport_.get(), metadataService_.get(), election_.get(), [this] {
+                std::vector<int32_t> ids;
+                for (const auto& pc : config_.peers) ids.push_back(pc.id);
+                return ids;
+            }());
+        replTransport_->setNodeControlResponseHandler(&ControlledShutdown::onResponseThunk,
+                                                      &runtimeAgent_->controlledShutdown());
+    }
     // fsyncgate (Task 10 fix 2 / I-1): control-thread-driven replicas (internal
     // partitions) whose fsync failed → halt.
     runtimeAgent_->setStorageFailureHook([this](const std::string& dir, int err) {
@@ -2541,6 +2568,51 @@ bool BrokerNode::awaitLeader(std::chrono::milliseconds timeout) {
     return hasLeader(); // one final check at deadline
 }
 
+// ---------------------------------------------------------------------------
+// Controlled shutdown (Kafka parity) — see ControlledShutdown.h.  Observer
+// thread.  The hand-off itself is event-driven on the control thread; this
+// only waits for its ring-published status, bounded by `budget` — a
+// last-resort cap after which the caller stops as before (logged).
+// ---------------------------------------------------------------------------
+int32_t BrokerNode::outOfSyncPartitions() noexcept {
+    if (!runtimeAgent_) return -1;
+    const auto st = runtimeAgent_->controlledShutdown().observe();
+    return st.phase == ControlledShutdown::Phase::Running ? st.remaining : -1;
+}
+
+bool BrokerNode::controlledShutdown(std::chrono::milliseconds budget) {
+    if (!started_ || stopped_ || !runtimeAgent_) return false;
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    const auto deadline = t0 + budget;
+    auto& cs = runtimeAgent_->controlledShutdown();
+    if (!cs.active()) return true;   // a single node: nobody to hand anything to
+    if (!cs.begin()) {
+        spdlog::warn("BrokerNode[{}]: controlled shutdown: command ring full — stopping without "
+                     "a hand-off", config_.nodeId);
+        return false;
+    }
+    spdlog::info("BrokerNode[{}]: controlled shutdown — handing partition leadership off "
+                 "(budget {} ms)", config_.nodeId, budget.count());
+    ControlledShutdown::Status st = cs.observe();
+    while (clock::now() < deadline) {
+        st = cs.observe();
+        if (st.phase == ControlledShutdown::Phase::Done) {
+            spdlog::info("BrokerNode[{}]: controlled shutdown complete in {} ms", config_.nodeId,
+                         std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count());
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});   // paces the ring poll only
+    }
+    st = cs.observe();
+    if (st.phase == ControlledShutdown::Phase::Done) return true;
+    spdlog::warn("BrokerNode[{}]: controlled shutdown budget ({} ms) exhausted in phase {} with {} "
+                 "partition(s) still led / ISR(s) still joined here — stopping anyway (they fail "
+                 "over as on an unclean stop)", config_.nodeId, budget.count(),
+                 static_cast<int>(st.phase), st.remaining);
+    return false;
+}
+
 LeaderSnapshot BrokerNode::leaderSnapshot() const noexcept {
     return leaderObserver_.observe();
 }
@@ -2623,6 +2695,12 @@ void BrokerNode::publishRole() noexcept {
         // Publish the term this node observes (its own leadership term id).
         termCounter_->set(static_cast<std::int64_t>(v.term));
     }
+    // Rolling-restart readiness gate (controlled shutdown review L5).
+    if (!outOfSyncCounter_ && outOfSyncCounterRegId_ >= 0) {
+        try { outOfSyncCounter_ = aeron_->findCounter(outOfSyncCounterRegId_); }
+        catch (...) { outOfSyncCounter_.reset(); }
+    }
+    if (outOfSyncCounter_) outOfSyncCounter_->set(static_cast<std::int64_t>(outOfSyncPartitions()));
 }
 
 // ---------------------------------------------------------------------------
@@ -2925,6 +3003,26 @@ void BrokerNode::stop() {
     if (stopped_) return; // idempotent (controller-owned flag, F9a)
     stopped_ = true;
 
+    // Controlled shutdown fix round 2 (N2): before ANY thread is joined, halt
+    // the controller role — this node decides nothing more while its data
+    // plane goes down (workers are joined first, the runtime last), hands the
+    // consensus off at once if it leads, and tells the members it is going.
+    // Event: wait for the runtime's ring-published Halted ack (bounded — a
+    // runtime that is not running never acks).
+    if (runtimeAgent_ && runtimeAgent_->controlledShutdown().active()) {
+        auto& cs = runtimeAgent_->controlledShutdown();
+        if (cs.halt()) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+            bool acked = false;
+            while (!(acked = cs.observe().phase == ControlledShutdown::Phase::Halted) &&
+                   std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});   // paces the ring poll only
+            if (!acked)
+                spdlog::warn("BrokerNode[{}]: stop: the runtime never acked the halt (not running?) — "
+                             "stopping anyway", config_.nodeId);
+        }
+    }
+
     // 0. DR-15 fix round 1: the cold resolver thread only posts into rings it
     //    owns — stop it first (nothing below consumes it any more).
     if (resolverHub_) resolverHub_->stop();
@@ -3091,6 +3189,7 @@ void BrokerNode::stop() {
     roleCounter_.reset();
     termCounter_.reset();
     stuckMarkersCounter_.reset();   // D9: release before aeron_ (the Counter dtor uses the conductor)
+    outOfSyncCounter_.reset();      // readiness gate (L5): same rule
 
     // 4. Close the Aeron client (joins the C++ conductor thread).
     //    After aeron_.reset() all "remove publication / subscription / close client"

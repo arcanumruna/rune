@@ -259,6 +259,14 @@ struct NodeConfig {
     int64_t electionStatusIntervalMs =  20;  // default  20 ms
     int64_t startupCanvassTimeoutMs  = 100;  // default 100 ms
 
+    // Controlled shutdown (RUNE_CONTROLLED_SHUTDOWN_MS): on a graceful stop
+    // signal main() hands this node's partition leadership (and, on the
+    // controller, the consensus leadership) off before stopping.  The hand-off
+    // is event-driven; this is only the last-resort cap after which the node
+    // stops anyway (logged; the rest fails over as on an unclean stop).  Keep
+    // it below the orchestrator's kill grace (docker stop: 10 s).  0 = off.
+    int64_t controlledShutdownMs = 5'000;
+
     // Replication lag tolerance — GR-5.
     // After a follower hasn't fetched for replicaLagMaxMs, it is shrunk from the ISR.
     // Default 10 000 ms (10 s) matches the PartitionConfig default.

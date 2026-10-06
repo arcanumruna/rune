@@ -74,6 +74,10 @@ struct ConsensusMessageHandler {
         NodeId  followerMemberId,
         uint8_t flags) = 0;
 
+    // Dispatched from templateId=59 (StandDown; controlled shutdown).
+    virtual void onStandDown(int64_t /*nowNs*/, Term /*leadershipTermId*/,
+                             NodeId /*leaderMemberId*/) {}
+
     // Dispatched from templateId=55 (CommitPosition)
     virtual void onCommitPosition(
         int64_t nowNs,

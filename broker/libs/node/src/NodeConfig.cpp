@@ -665,6 +665,15 @@ ConfigResult parseNodeConfig(
         err = parseOptionalInt64Ms(getenv_fn, "RUNE_STARTUP_CANVASS_TIMEOUT_MS",
                                    cfg.startupCanvassTimeoutMs);
         if (!err.empty()) return {{}, err};
+
+        // Controlled shutdown budget (0 = no hand-off).
+        if (const char* raw = getenv_fn("RUNE_CONTROLLED_SHUTDOWN_MS"); raw && !std::string_view(raw).empty()) {
+            int64_t v = 0;
+            if (std::string_view(raw) == "0") v = 0;
+            else if (!parseInt64Positive(raw, v))
+                return {{}, std::string("RUNE_CONTROLLED_SHUTDOWN_MS must be a non-negative integer (ms), got: ") + raw};
+            cfg.controlledShutdownMs = v;
+        }
     }
 
     // --- RUNE_MIN_ISR (optional) — M1: minimum ISR size for acks=All gate ---

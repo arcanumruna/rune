@@ -148,6 +148,14 @@ public:
                 m.flags);
             break;
         }
+        case StandDownMsg::TEMPLATE_ID: {
+            if (len < StandDownMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
+            if constexpr (requires(Handler& h) { h.onStandDown(int64_t{}, Term{}, NodeId{}); }) {
+                const auto m = StandDownMsg::decode(buf, 0);
+                handler_.onStandDown(nowNs, m.leadershipTermId, m.leaderMemberId);
+            }
+            break;
+        }
         case CommitPositionMsg::TEMPLATE_ID: {
             if (len < CommitPositionMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
             const auto m = CommitPositionMsg::decode(buf, 0);
