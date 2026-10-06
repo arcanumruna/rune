@@ -45,6 +45,9 @@
 #include <rune/storage/Log.h>
 
 #include <algorithm>
+#include <array>
+#include <string>
+#include <sys/statvfs.h>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -68,12 +71,31 @@ public:
     static constexpr int32_t kDemandMsgType = 1;
     using Demand = rune::storage::Log::ProvisionDemand;
 
-    /// `capBytes`: node-wide bytes reserved by ready segments (0 = no cap).
-    explicit SegmentProvisionerAgent(std::size_t depth, int64_t capBytes = 0)
+    /// Metrics published by this thread (re-review N4).  Monotonic counters.
+    enum Metric : int {
+        kMetricBuildFailures = 0,     ///< failed builds reported to an owner (each = one inline roll)
+        kMetricRollHolds,             ///< Hold demands: rolls held for want of a ready segment
+        kMetricUnpreallocatedBuilds,  ///< ready segments built WITHOUT fallocate (over the cap)
+        kMetricParkedDropped,         ///< parked demands discarded (log retired / table full)
+        kMetricCount
+    };
+    /// Sink called on THIS thread whenever a metric changes (BrokerNode: Aeron
+    /// counters).  Plain function pointer — set before the runner starts.
+    using MetricSink = void (*)(void* ctx, int metric, int64_t value) noexcept;
+
+    /// `capBytes` (node-wide bytes reserved by ready segments' fallocate):
+    /// > 0 fixed, 0 no cap, < 0 AUTO = capFreePct % of the free space of
+    /// `capDir` (statvfs, re-evaluated off-thread every kCapRefreshServes
+    /// builds).  Over the cap a ready segment is still built, without its
+    /// block reservation (re-review N3) — never an inline roll.
+    explicit SegmentProvisionerAgent(std::size_t depth, int64_t capBytes = 0, std::string capDir = {},
+                                     int capFreePct = 10)
         : depth_(std::clamp<std::size_t>(depth, 1, rune::storage::Log::kMaxProvisionDepth)),
-          capBytes_(capBytes > 0 ? capBytes : 0) {
+          capMode_(capBytes), capDir_(std::move(capDir)), capFreePct_(std::clamp(capFreePct, 1, 100)),
+          capBytes_(capBytes > 0 ? capBytes : (capBytes < 0 ? kUnknownCap : 0)) {
         const auto w = demand_.watchInfo();
         (void)bell_.addWatch(detail::RingWatch{w.buffer, w.length, w.capacity, w.headPositionIndex});
+        if (capMode_ < 0) refreshAutoCap_();
     }
 
     SegmentProvisionerAgent(const SegmentProvisionerAgent&)            = delete;
@@ -82,6 +104,8 @@ public:
     /// The replica view (NodeRuntimeAgent::enableProvisionerView).  Before the
     /// runner starts.
     void attachViewChannel(CleanerViewChannel* ch) noexcept { channel_ = ch; }
+    /// Before the runner starts.
+    void setMetricSink(MetricSink fn, void* ctx) noexcept { sink_ = fn; sinkCtx_ = ctx; }
 
     /// The hook every provisioned log posts its demands through (any worker
     /// thread): Log::setProvisioning(provisioner.hook(), thresholdPct).
@@ -97,11 +121,15 @@ public:
     [[nodiscard]] uint64_t builtForTest()          const noexcept { return built_; }
     [[nodiscard]] uint64_t demandsServedForTest()  const noexcept { return demandsServed_; }
     [[nodiscard]] uint64_t demandsIgnoredForTest() const noexcept { return demandsIgnored_; }
-    [[nodiscard]] uint64_t failuresForTest()       const noexcept { return failures_; }
-    [[nodiscard]] uint64_t cappedForTest()         const noexcept { return capped_; }
+    [[nodiscard]] uint64_t failuresForTest()       const noexcept { return metrics_[kMetricBuildFailures]; }
+    [[nodiscard]] uint64_t unpreallocatedForTest() const noexcept { return metrics_[kMetricUnpreallocatedBuilds]; }
+    [[nodiscard]] uint64_t parkedDroppedForTest()  const noexcept { return metrics_[kMetricParkedDropped]; }
+    [[nodiscard]] uint64_t rollHoldsForTest()      const noexcept { return metrics_[kMetricRollHolds]; }
     [[nodiscard]] uint64_t viewGenerationForTest() const noexcept { return viewGen_; }
     [[nodiscard]] int64_t  reservedBytesForTest()  const noexcept { return reserved_; }
     [[nodiscard]] std::size_t parkedDemandsForTest() const noexcept { return parked_.size(); }
+    /// Tests: force the next AUTO cap evaluation to this free-space figure.
+    void setFreeBytesForTest(int64_t v) noexcept { freeBytesForTest_ = v; if (capMode_ < 0) refreshAutoCap_(); }
 
     const char* name() const noexcept override { return "rune-provisioner"; }
 
@@ -112,6 +140,7 @@ public:
             if (type != kDemandMsgType) return;
             auto* log = reinterpret_cast<rune::storage::Log*>(static_cast<std::uintptr_t>(a));
             const auto kind = static_cast<Demand>(b);
+            if (kind == Demand::Hold) bump_(kMetricRollHolds);
             if (!inView_(log)) {   // removed / not yet in the view: never dereferenced
                 ++demandsIgnored_;
                 park_(log, kind);
@@ -124,6 +153,10 @@ public:
     }
 
 private:
+    static constexpr std::size_t kMaxParked        = 4096;
+    static constexpr int64_t     kUnknownCap       = INT64_MAX / 4;   ///< AUTO before statvfs succeeded: no cap
+    static constexpr uint32_t    kCapRefreshServes = 64;
+
     static bool onDemand_(void* ctx, rune::storage::Log* log, Demand kind) noexcept {
         auto* self = static_cast<SegmentProvisionerAgent*>(ctx);
         // A full ring returns false: the owner re-posts (never lost).
@@ -134,45 +167,68 @@ private:
         return true;
     }
 
+    void bump_(int m) noexcept {
+        ++metrics_[static_cast<std::size_t>(m)];
+        if (sink_ != nullptr) sink_(sinkCtx_, m, static_cast<int64_t>(metrics_[static_cast<std::size_t>(m)]));
+    }
+
+    void refreshAutoCap_() noexcept {
+        int64_t freeBytes = freeBytesForTest_;
+        if (freeBytes < 0) {
+            struct ::statvfs sv{};
+            if (capDir_.empty() || ::statvfs(capDir_.c_str(), &sv) != 0) return;   // keep the last value
+            freeBytes = static_cast<int64_t>(sv.f_bavail) * static_cast<int64_t>(sv.f_frsize);
+        }
+        // Reservations already held count as "free" for the budget (they are
+        // the blocks the cap governs).
+        capBytes_ = std::max<int64_t>(0, (freeBytes + reserved_) * capFreePct_ / 100);
+    }
+
     int serve_(rune::storage::Log* log, Demand kind) {
         // Renames FIRST: an adoption is only allowed with room on the log's
         // rename ring, so this keeps the owner's next adoption unblocked.
         int n = log->finalizeStagingRenames();
-        account_(log);
-        if (kind != Demand::Threshold) return n;
+        Acc& acc = account_(log);
+        if (kind == Demand::Adopted) return n;
+        if (log->readyQueuedApprox() >= depth_) return n;   // the owner adopts one of those
+        if (capMode_ < 0 && ++capServes_ % kCapRefreshServes == 0) refreshAutoCap_();
         const int64_t segBytes = log->rollBytes();
-        const std::size_t queued = log->readyQueuedApprox();
-        if (queued >= depth_) return n;   // the owner adopts one of those (each ready or failure)
-        if (capBytes_ > 0 && reserved_ + segBytes > capBytes_) {
-            // Node-wide reservation cap: the owner rolls this one inline.
-            ++capped_;
-            log->reportProvisionFailure(ENOSPC);
-            return n + 1;
+        // Re-review N3: over the cap, still build (off the owner) — without
+        // the block reservation.  Never a failure / inline roll for the cap.
+        const bool falloc = capMode_ == 0 || reserved_ + segBytes <= capBytes_;
+        const int b = log->provisionReady(depth_, falloc);
+        if (b < 0) {
+            bump_(kMetricBuildFailures);   // reported to the owner by provisionReady (review M1)
+        } else if (b > 0) {
+            built_ += static_cast<uint64_t>(b);
+            if (falloc) { acc.falloc += b; reserved_ += static_cast<int64_t>(b) * segBytes; }
+            else for (int i = 0; i < b; ++i) bump_(kMetricUnpreallocatedBuilds);
         }
-        const int b = log->provisionReady(depth_);
-        if (b < 0) ++failures_;   // reported to the owner by provisionReady (review M1)
-        else built_ += static_cast<uint64_t>(b);
-        account_(log);
         return n + (b != 0 ? 1 : 0);
     }
 
-    /// Reserved-bytes accounting: re-derived per log from its ring occupancy
-    /// at every visit (self-correcting — a consumed segment is noticed at the
-    /// log's next demand; between visits the estimate only errs high).
-    void account_(rune::storage::Log* log) {
-        const int64_t now = static_cast<int64_t>(log->readyQueuedApprox()) * log->rollBytes();
-        int64_t& was = perLog_[log];
-        reserved_ += now - was;
-        was = now;
+    struct Acc { int64_t falloc = 0; int64_t segBytes = 0; };
+    /// Reserved-bytes accounting (estimate, self-correcting): a log's
+    /// fallocated ready segments can only shrink to what is still queued.
+    Acc& account_(rune::storage::Log* log) {
+        Acc& a = perLog_[log];
+        a.segBytes = log->rollBytes();
+        const auto queued = static_cast<int64_t>(log->readyQueuedApprox());
+        if (a.falloc > queued) { reserved_ -= (a.falloc - queued) * a.segBytes; a.falloc = queued; }
+        return a;
     }
 
     void park_(rune::storage::Log* log, Demand kind) {
         for (auto& p : parked_)
-            if (p.first == log) {
-                if (kind == Demand::Threshold) p.second = kind;
+            if (p.log == log) {
+                if (kind != Demand::Adopted) p.kind = Demand::Threshold;
                 return;
             }
-        if (parked_.size() < kMaxParked) parked_.emplace_back(log, kind);
+        if (parked_.size() >= kMaxParked) {   // owner's Hold re-post recovers it (re-review N2)
+            bump_(kMetricParkedDropped);
+            return;
+        }
+        parked_.push_back({log, kind == Demand::Adopted ? Demand::Adopted : Demand::Threshold});
     }
 
     [[nodiscard]] bool inView_(const rune::storage::Log* log) const noexcept {
@@ -214,36 +270,48 @@ private:
         // Logs gone from the view: forget their accounting (their ready
         // segments die with the Log, freed only after this ack).
         for (auto it = perLog_.begin(); it != perLog_.end();) {
-            if (!inView_(it->first)) { reserved_ -= it->second; it = perLog_.erase(it); }
+            if (!inView_(it->first)) { reserved_ -= it->second.falloc * it->second.segBytes; it = perLog_.erase(it); }
             else ++it;
         }
-        // Demands that arrived before their log's view: serve them now.
-        std::vector<std::pair<rune::storage::Log*, Demand>> parked;
+        // Re-review N2: a parked demand is decided by the FIRST view installed
+        // after it was parked — served if its log is in it, else DISCARDED (a
+        // retired / never-registered log; never dereferenced).  A live log
+        // whose demand raced ahead of its registration and lost is recovered
+        // by its owner's Hold re-post.  The table can never accumulate.
+        std::vector<Parked> parked;
         parked.swap(parked_);
-        for (const auto& [log, kind] : parked) {
-            if (inView_(log)) { ++demandsServed_; serve_(log, kind); }
-            else parked_.emplace_back(log, kind);   // still unknown (bounded by kMaxParked)
+        for (const auto& pk : parked) {
+            if (inView_(pk.log)) { ++demandsServed_; serve_(pk.log, pk.kind); }
+            else bump_(kMetricParkedDropped);
         }
         viewGen_    = gen;
         ackPending_ = true;
     }
 
-    static constexpr std::size_t kMaxParked = 4096;
+    struct Parked { rune::storage::Log* log; Demand kind; };
 
     std::size_t depth_;
+    int64_t     capMode_;
+    std::string capDir_;
+    int         capFreePct_;
     int64_t     capBytes_;
+    int64_t     freeBytesForTest_ = -1;
+    uint32_t    capServes_ = 0;
     int64_t     reserved_ = 0;
     rune::consensus::ControlRing<64 * 1024> demand_;   // M2O: every worker → this thread (~2.7k demands)
     detail::RingDoorbell                    bell_;
     CleanerViewChannel*                               channel_ = nullptr;
     std::vector<rune::replication::PartitionReplica*> building_;
     std::vector<rune::storage::Log*>                  logs_;      // sorted: the current view's disk logs
-    std::unordered_map<rune::storage::Log*, int64_t>  perLog_;    // reserved bytes per log (estimate)
-    std::vector<std::pair<rune::storage::Log*, Demand>> parked_;  // demands for logs not (yet) in the view
+    std::unordered_map<rune::storage::Log*, Acc>      perLog_;    // fallocated ready segments per log
+    std::vector<Parked>                               parked_;    // demands for logs not (yet) in the view
     uint64_t viewGen_     = 0;
     uint64_t buildingGen_ = 0;
     bool     ackPending_  = false;
-    uint64_t built_ = 0, demandsServed_ = 0, demandsIgnored_ = 0, failures_ = 0, capped_ = 0;
+    uint64_t built_ = 0, demandsServed_ = 0, demandsIgnored_ = 0;
+    std::array<uint64_t, kMetricCount> metrics_{};
+    MetricSink sink_ = nullptr;
+    void*      sinkCtx_ = nullptr;
 };
 
 } // namespace rune::node

@@ -1040,6 +1040,9 @@ private:
     std::unique_ptr<ParkUntilWorkIdle>                    provisionerIdleStrategy_;
     rune::consensus::MonotonicNanoClock                   provisionerClock_;
     std::unique_ptr<rune::consensus::AgentRunner>         provisionerRunner_;
+    std::array<std::int64_t, SegmentProvisionerAgent::kMetricCount>                    provCounterRegIds_{-1, -1, -1, -1};
+    std::array<std::shared_ptr<aeron::Counter>, SegmentProvisionerAgent::kMetricCount> provCounters_{};
+    static void publishProvisionMetric_(void* self, int metric, std::int64_t value) noexcept;
     [[nodiscard]] rune::storage::Log::ProvisionHook provisionHook_() noexcept {
         return provisionerAgent_ ? provisionerAgent_->hook() : rune::storage::Log::ProvisionHook{};
     }

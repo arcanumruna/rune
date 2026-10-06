@@ -455,7 +455,8 @@ public:
           cleaner_(&reg_, 128 * kMiB, -1, cleanerThrottleBytesPerSec, /*useCoalescing=*/true, 64 * kMiB),
           // hotpath-A F2: BrokerNode's segment provisioner (NodeConfig defaults).
           provisioner_(static_cast<std::size_t>(rune::node::NodeConfig{}.segmentProvisionDepth),
-                       rune::node::NodeConfig{}.segmentProvisionCapBytes),
+                       rune::node::NodeConfig{}.segmentProvisionCapBytes, fs::temp_directory_path().string(),
+                       rune::node::NodeConfig{}.segmentProvisionCapFreePct),
           provisionerIdle_(rune::node::IdleShape{10, 20, 1'000,
                                                  rune::node::NodeConfig{}.segmentProvisionerMaxParkUs * 1'000},
                            nullptr, 0, provisioner_.doorbell()) {

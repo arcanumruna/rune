@@ -107,6 +107,17 @@ inline constexpr std::int32_t kStuckMarkersCounterTypeId = 1'000'210;
 // restarts the next node only once every node reads 0.  Key = the nodeId.
 inline constexpr std::int32_t kOutOfSyncCounterTypeId = 1'000'211;
 
+// hotpath-A re-review N4 — segment provisioning metrics (monotonic), published
+// by the SegmentProvisionerAgent thread.  Key = the nodeId; one type id per
+// metric, in SegmentProvisionerAgent::Metric order.
+inline constexpr std::int32_t kProvisionBuildFailuresCounterTypeId = 1'000'212;   // = owner inline rolls
+inline constexpr std::int32_t kProvisionRollHoldsCounterTypeId     = 1'000'213;
+inline constexpr std::int32_t kProvisionUnpreallocCounterTypeId    = 1'000'214;
+inline constexpr std::int32_t kProvisionParkedDroppedCounterTypeId = 1'000'215;
+inline std::string provisionMetricLabel(const char* what, std::int32_t nodeId) {
+    return std::string("rune-segment-provision-") + what + " node=" + std::to_string(nodeId);
+}
+
 // Human-readable counter labels (also useful when browsing counters).
 inline std::string roleCounterLabel(std::int32_t nodeId) {
     return "rune-cluster-node-role node=" + std::to_string(nodeId);

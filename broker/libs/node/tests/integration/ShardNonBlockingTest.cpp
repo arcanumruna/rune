@@ -3393,7 +3393,10 @@ TEST(SegmentProvisionerRegression, DemandBeforeItsViewIsServedWhenTheViewArrives
     EXPECT_EQ(r->log()->readyQueuedApprox(), 1u) << "the new partition got its first ready segment";
 }
 
-TEST(SegmentProvisionerRegression, NodeWideReservationCapReportsAFailureNotAHoldRegression) {
+TEST(SegmentProvisionerRegression, OverTheCapBuildsWithoutFallocateNeverAFailureRegression) {
+    // Re-review N3: over the node-wide reservation cap the provisioner still
+    // builds the ready segment (off the owner), only without its fallocate —
+    // the owner never rolls inline for the cap.
     Reg R;
     NoopConsensus noop;
     NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
@@ -3407,10 +3410,66 @@ TEST(SegmentProvisionerRegression, NodeWideReservationCapReportsAFailureNotAHold
     ASSERT_TRUE(hook.fn(hook.ctx, a->log(), Log::ProvisionDemand::Threshold));
     ASSERT_TRUE(hook.fn(hook.ctx, b->log(), Log::ProvisionDemand::Threshold));
     prov.doWork(2);
-    EXPECT_EQ(prov.builtForTest(), 1u);
-    EXPECT_EQ(prov.cappedForTest(), 1u);
-    EXPECT_EQ(prov.reservedBytesForTest(), 64LL * 1024 * 1024);
-    EXPECT_EQ(b->log()->readyQueuedApprox(), 1u) << "B got a FAILURE record (its roll goes inline), not silence";
+    EXPECT_EQ(prov.builtForTest(), 2u);
+    EXPECT_EQ(prov.unpreallocatedForTest(), 1u);
+    EXPECT_EQ(prov.failuresForTest(), 0u);
+    EXPECT_EQ(prov.reservedBytesForTest(), 64LL * 1024 * 1024) << "only A's segment is fallocated";
+    EXPECT_EQ(b->log()->readyQueuedApprox(), 1u);
+    EXPECT_TRUE(b->log()->readyAvailable()) << "B got a READY segment (not a failure)";
+}
+
+TEST(SegmentProvisionerRegression, AutoCapIsAFractionOfFreeSpaceRegression) {
+    SegmentProvisionerAgent prov(1, /*capBytes=*/-1, "/", /*capFreePct=*/10);
+    prov.setFreeBytesForTest(10LL * 1024 * 1024 * 1024);
+    EXPECT_EQ(prov.capBytes(), 1LL * 1024 * 1024 * 1024);
+}
+
+TEST(SegmentProvisionerRegression, ParkedDemandOfARetiredLogIsDiscardedRegression) {
+    // Re-review N2: a demand parked for a log that never appears in the next
+    // view (retired / never registered) is discarded (counted), never kept.
+    Reg R;
+    NoopConsensus noop;
+    NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
+    SegmentProvisionerAgent prov(1);
+    prov.attachViewChannel(rt.enableProvisionerView());
+    R.add(5, 0);
+    rt.doWork(1);
+    prov.doWork(1);
+    auto hook = prov.hook();
+    for (int i = 0; i < 100; ++i) {
+        auto* gone = reinterpret_cast<Log*>(static_cast<std::uintptr_t>(0x1000 + 64 * i));
+        ASSERT_TRUE(hook.fn(hook.ctx, gone, Log::ProvisionDemand::Threshold));
+    }
+    prov.doWork(2);
+    EXPECT_EQ(prov.parkedDemandsForTest(), 100u);
+    R.add(5, 1);       // a registry change publishes a new view
+    rt.doWork(3);
+    prov.doWork(3);
+    EXPECT_EQ(prov.parkedDemandsForTest(), 0u) << "parked demands leaked";
+    EXPECT_EQ(prov.parkedDroppedForTest(), 100u);
+}
+
+TEST(SegmentProvisionerRegression, MetricsArePublishedThroughTheSinkRegression) {
+    // Re-review N4: build failures, roll holds, unpreallocated builds and
+    // dropped demands reach the metric sink (BrokerNode: Aeron counters).
+    Reg R;
+    NoopConsensus noop;
+    NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
+    SegmentProvisionerAgent prov(1);
+    std::array<int64_t, SegmentProvisionerAgent::kMetricCount> seen{};
+    prov.setMetricSink([](void* c, int m, int64_t v) noexcept {
+        (*static_cast<std::array<int64_t, SegmentProvisionerAgent::kMetricCount>*>(c))[static_cast<std::size_t>(m)] = v;
+    }, &seen);
+    prov.attachViewChannel(rt.enableProvisionerView());
+    PartitionReplica* r = R.add(5, 0);
+    rt.doWork(1);
+    prov.doWork(1);
+    r->log()->setProvisionFaultForTest(EMFILE, 1);
+    auto hook = prov.hook();
+    ASSERT_TRUE(hook.fn(hook.ctx, r->log(), Log::ProvisionDemand::Hold));
+    prov.doWork(2);
+    EXPECT_EQ(seen[SegmentProvisionerAgent::kMetricRollHolds], 1);
+    EXPECT_EQ(seen[SegmentProvisionerAgent::kMetricBuildFailures], 1);
 }
 
 TEST(SegmentProvisionerRegression, ADemandWakesAParkedProvisionerRegression) {

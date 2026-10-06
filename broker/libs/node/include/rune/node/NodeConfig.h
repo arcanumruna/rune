@@ -831,9 +831,13 @@ struct NodeConfig {
     // Fill level (% of segmentRollBytes, 1..100) at which a log demands its
     // next segment.  RUNE_SEGMENT_PROVISION_THRESHOLD_PCT.
     int32_t segmentProvisionThresholdPct = 50;
-    // Node-wide cap on bytes reserved by ready segments (0 = no cap).
-    // RUNE_SEGMENT_PROVISION_CAP_BYTES.
-    int64_t segmentProvisionCapBytes = 16LL * 1024 * 1024 * 1024;
+    // Node-wide cap on bytes reserved (fallocated) by ready segments: > 0
+    // fixed, 0 = no cap, < 0 = AUTO (default): segmentProvisionCapFreePct % of
+    // the free space of dataDir (statvfs, re-evaluated off-thread).  Over the
+    // cap a ready segment is still built — without fallocate (re-review N3).
+    // RUNE_SEGMENT_PROVISION_CAP_BYTES / RUNE_SEGMENT_PROVISION_CAP_FREE_PCT.
+    int64_t segmentProvisionCapBytes = -1;
+    int32_t segmentProvisionCapFreePct = 10;
     // The provisioner thread's park cap (µs) when idle.  Demands ring its
     // doorbell (review m5), so this bounds only fd-less work (replica-view
     // updates).  RUNE_SEGMENT_PROVISIONER_MAX_PARK_US (>= 1).

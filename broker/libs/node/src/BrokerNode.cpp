@@ -445,7 +445,22 @@ void BrokerNode::start() {
     // 5b. hotpath-A F2: the segment provisioner exists BEFORE any replica is
     //     built — every worker-driven disk log is wired to its demand hook.
     provisionerAgent_ = std::make_unique<SegmentProvisionerAgent>(
-        static_cast<std::size_t>(config_.segmentProvisionDepth), config_.segmentProvisionCapBytes);
+        static_cast<std::size_t>(config_.segmentProvisionDepth), config_.segmentProvisionCapBytes,
+        config_.dataDir, config_.segmentProvisionCapFreePct);
+    // Re-review N4: the provisioner's metrics as Aeron counters (CnC file).
+    if (aeron_) {
+        std::uint8_t key[kRoleKeyLength];
+        encodeRoleKey(key, config_.nodeId);
+        static constexpr std::pair<std::int32_t, const char*> kProvCounters[] = {
+            {kProvisionBuildFailuresCounterTypeId, "build-failures"},
+            {kProvisionRollHoldsCounterTypeId, "roll-holds"},
+            {kProvisionUnpreallocCounterTypeId, "unpreallocated-builds"},
+            {kProvisionParkedDroppedCounterTypeId, "parked-demands-dropped"}};
+        for (std::size_t i = 0; i < provCounterRegIds_.size(); ++i)
+            provCounterRegIds_[i] = aeron_->addCounter(kProvCounters[i].first, key, kRoleKeyLength,
+                                                       provisionMetricLabel(kProvCounters[i].second, config_.nodeId));
+    }
+    provisionerAgent_->setMetricSink(&BrokerNode::publishProvisionMetric_, this);
 
     // 6. Build replication (GR-2/GR-3): PartitionReplicas + AeronPartitionTransport
     //    + ReplicationMetadataBridge.  Requires: topicRegistry_ + aeron_ + consensus objs.
@@ -2662,6 +2677,21 @@ Term BrokerNode::leadershipTermId() const noexcept {
 // D9 review MEDIUM-3: TCS stuck-markers sink — CONTROL (runtime) thread only.
 // Resolves the counter registration lazily (the driver acks asynchronously);
 // false = not resolved yet, the TCS retries on its next gauge scan.
+// Re-review N4: provisioner metric sink — PROVISIONER thread only (the only
+// writer of provCounters_; resolved lazily, the driver acks asynchronously; a
+// value set before resolution is re-published with the next change).
+void BrokerNode::publishProvisionMetric_(void* self, int metric, std::int64_t value) noexcept
+{
+    auto* n = static_cast<BrokerNode*>(self);
+    if (!n->aeron_ || metric < 0 || static_cast<std::size_t>(metric) >= n->provCounters_.size()) return;
+    auto& c = n->provCounters_[static_cast<std::size_t>(metric)];
+    const std::int64_t reg = n->provCounterRegIds_[static_cast<std::size_t>(metric)];
+    if (!c && reg >= 0) {
+        try { c = n->aeron_->findCounter(reg); } catch (...) { c.reset(); }
+    }
+    if (c) c->set(value);
+}
+
 bool BrokerNode::publishStuckMarkers_(void* self, std::int64_t value)
 {
     auto* n = static_cast<BrokerNode*>(self);
@@ -3197,6 +3227,7 @@ void BrokerNode::stop() {
     termCounter_.reset();
     stuckMarkersCounter_.reset();   // D9: release before aeron_ (the Counter dtor uses the conductor)
     outOfSyncCounter_.reset();      // readiness gate (L5): same rule
+    for (auto& c : provCounters_) c.reset();   // re-review N4: same rule (the provisioner is stopped)
 
     // 4. Close the Aeron client (joins the C++ conductor thread).
     //    After aeron_.reset() all "remove publication / subscription / close client"
