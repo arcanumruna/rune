@@ -3339,6 +3339,55 @@ TEST(CompactionCleanerAgentRegression, DivergenceTruncationDefersToTruncatePendi
 
 
 // ===========================================================================
+// hotpath-A review fixes (latency gate FollowerTruncation on tmpfs, 3.5M
+// passes stuck in TruncatePending): a TruncatePending follower must not keep
+// POSTING new cleaner work (retention drops) — every post re-opens the msg
+// ring the deferred truncation waits to see drained, so a cleaner that runs
+// between the follower's retry and the owner's drain starves it forever.
+// ===========================================================================
+TEST(CompactionCleanerAgentRegression, TruncatePendingFollowerPostsNoNewCleanerWorkRegression) {
+    auto dir = cp6TempDir("hpa_trunc_starve");
+    Log log(dir.string(), /*rollBytes=*/100);
+    for (int64_t o = 0; o < 30; ++o) log.append(cp6Batch(o, "k" + std::to_string(o), "v"), o);
+    Cp6NullTransport transport;
+    auto cfg = makeCompactConfig(785);
+    PartitionReplica follower(cfg, Role::Follower, 1, {1, 2}, {1, 2}, &log, &transport);
+    follower.becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
+    {   // the leader's HW covers everything (retention may drop up to it)
+        FetchResponseMsg hw{};
+        hw.leaderEpoch = 2; hw.partition = 0; hw.topicId = 785; hw.highWatermark = 30;
+        follower.applyReplicated(hw);
+    }
+    // One posted file op pending: the divergence truncation defers.
+    {
+        const auto snap = log.sealedSegmentSnapshot();
+        ASSERT_TRUE(log.enqueueDeletedSegment((*snap)[0].baseOffset, (*snap)[0].lineage));
+        ASSERT_EQ(follower.drainRetentionDeletesOnOwner(), 1);
+        ASSERT_TRUE(log.cleanerFileOpsPending());
+    }
+    FetchResponseMsg resp{};
+    resp.leaderEpoch = 2; resp.partition = 0; resp.topicId = 785;
+    resp.errorCode   = rune::replication::kErrDivergingEpoch;
+    rune::replication::ErrorPayloadBuf epb;
+    resp.records     = epb.set(/*epoch=*/1, /*endOffset=*/20);
+    follower.applyReplicated(resp);
+    ASSERT_TRUE(follower.truncatePendingForTest());
+    // The starving interleaving: [follower retry] [cleaner drains] [owner drain
+    // posts the next proposed drop] — repeated.
+    int64_t t = 10'000'000;
+    for (int pass = 0; pass < 50 && follower.truncatePendingForTest(); ++pass) {
+        (void)follower.doWork(t += 1'000'000);
+        (void)log.runCleanerFileOps(0);
+        const auto snap = log.sealedSegmentSnapshot();
+        if (!snap->empty()) (void)log.enqueueDeletedSegment((*snap)[0].baseOffset, (*snap)[0].lineage);
+        (void)follower.drainRetentionDeletesOnOwner();
+    }
+    EXPECT_FALSE(follower.truncatePendingForTest()) << "the deferred truncation starved";
+    EXPECT_EQ(log.logEndOffset(), 20);
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
 // Fix round 6 (N5-MEDIUM-1): a TruncatePending follower on log B must not wait
 // for a whole (throttled) compaction pass of an unrelated log A — the cleaner
 // performs B's posted file ops at A's pass segment / throttle-slice boundaries.
