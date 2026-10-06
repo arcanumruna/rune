@@ -1,4 +1,5 @@
 #include <rune/storage/LogSegment.h>
+#include <rune/storage/Timestamps.h>
 #include <rune/protocol/RecordBatch.h>
 #include <algorithm>
 #include <fcntl.h>
@@ -190,12 +191,16 @@ std::unique_ptr<MappedFile> LogSegment::makeReadMap_(std::size_t bytes) {
 }
 
 std::size_t LogSegment::readMapBytesFor(int64_t rollBytes) noexcept {
-    // The roll threshold plus one large batch of overshoot, rounded up to a
-    // power of two (ensureReadMap's geometric growth then never triggers).
-    std::size_t want = rollBytes > 0 ? static_cast<std::size_t>(rollBytes) + (1u << 20) : kReadMapMinBytes;
-    std::size_t cap = kReadMapMinBytes;
-    while (cap < want && cap < (std::size_t{1} << 40)) cap *= 2;
-    return cap;
+    const std::size_t want = rollBytes > 0 ? static_cast<std::size_t>(rollBytes) + kReadMapSlackBytes : kReadMapMinBytes;
+    const std::size_t page = 4096;
+    return std::max<std::size_t>(kReadMapMinBytes, (want + page - 1) / page * page);
+}
+
+std::unique_ptr<MappedFile> LogSegment::swapReadMap(std::unique_ptr<MappedFile> m) noexcept {
+    std::unique_ptr<MappedFile> old = std::move(readMap_);
+    readMap_ = std::move(m);
+    readMapSize_ = readMap_ ? readMap_->size() : 0;
+    return old;
 }
 
 void LogSegment::openReadMap(std::size_t bytes) noexcept {
@@ -513,6 +518,7 @@ bool LogSegment::ensureReadMap() noexcept {
     if (logSize_ <= 0) return true;                   // mmap(len=0) is EINVAL — nothing to map yet
     const std::size_t want = static_cast<std::size_t>(logSize_);
     if (readMap_ && readMapSize_ >= want) return true; // steady state: no syscall
+    if (readMap_ && !ownerRemap_) return true;        // review Md5: grown off-thread — serve the mapped prefix
     // Map with GEOMETRIC HEADROOM past EOF (read-only, so the file is never
     // extended; the pages beyond EOF are never touched — readView reads only
     // [0, logSize_)).  The active segment then grows inside one mapping instead of
@@ -630,6 +636,37 @@ int LogSegment::openTrusted(int64_t nextOffset) noexcept {
     durableNext_ = nextOffset;
     syncedBytes_ = logSize_;
     index_->rebuildEntries();   // counts the cleaner-built entries (O(index entries), no I/O)
+    return 0;
+}
+
+int LogSegment::truncateInPlace(int64_t truncateOffset, int64_t& keptMaxTs) noexcept {
+    if (!ensureReadMap() || !readMap_) return -1;
+    const uint8_t* base = readMap_->data();
+    const std::size_t size = std::min(static_cast<std::size_t>(logSize_), readMapSize_);
+    const std::size_t kOverhead = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
+    std::size_t pos = 0;
+    int64_t next = baseOffset_;
+    int64_t maxTs = 0;
+    while (pos + kOverhead <= size) {
+        rune::protocol::RecordBatchReader r(base + pos, size - pos);
+        const int32_t total = r.totalLength();
+        if (total <= 0 || pos + static_cast<std::size_t>(total) > size) break;
+        if (r.baseOffset() + r.lastOffsetDelta() >= truncateOffset) break;   // cut here (whole batch)
+        const int64_t ts = toEpochMs(r.maxTimestamp());
+        if (ts > maxTs) maxTs = ts;
+        next = r.baseOffset() + r.lastOffsetDelta() + 1;
+        pos += static_cast<std::size_t>(total);
+    }
+    if (log_.is_open()) log_.flush();   // the durable fstream path: nothing buffered past the cut
+    if (::ftruncate(fd_, static_cast<off_t>(pos)) != 0) return errno != 0 ? errno : EIO;
+    const int64_t lastIdx = index_->truncateToPosition(static_cast<int64_t>(pos));
+    logSize_ = static_cast<int64_t>(pos);
+    nextOffset_ = next;
+    bytesSinceIndex_ = lastIdx < 0 ? 0 : logSize_ - lastIdx;
+    if (syncedBytes_ > logSize_) syncedBytes_ = logSize_;
+    if (durableNext_ > nextOffset_) durableNext_ = nextOffset_;
+    if (durableNext_ < baseOffset_) durableNext_ = baseOffset_;
+    keptMaxTs = maxTs;
     return 0;
 }
 

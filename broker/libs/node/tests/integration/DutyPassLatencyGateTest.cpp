@@ -675,6 +675,8 @@ public:
     }
 
     Worker& worker() { return pool_.worker(0); }
+    /// After stop() only.
+    [[nodiscard]] uint64_t provisionedForTest() const noexcept { return provisioner_.builtForTest(); }
     std::vector<std::unique_ptr<Part>>& parts() { return parts_; }
 
     // counters (test thread)
@@ -896,16 +898,36 @@ void produceLoop(GateRig& rig, Stats& st, const FrameSet& fset, const LoopCfg& l
 
 uint64_t passes(uint64_t n) { return n * static_cast<uint64_t>(scale()); }
 
-std::string counters(const GateRig& rig) {
-    char buf[512];
+std::string counters(GateRig& rig) {
+    // Review M2: fsync attribution per scenario.  The background threads are
+    // stopped first (their counters are read only after they stopped).
+    rig.stop();
+    uint64_t inlineSyncs = 0, roleSyncs = 0, cleanerFsyncs = 0, cleanerDirFsyncs = 0, inPlace = 0, dirMut = 0;
+    for (auto& p : rig.parts()) {
+        inlineSyncs += p->log->syncCallsForTest();
+        roleSyncs += p->log->roleChangeSyncCallsForTest();
+        cleanerFsyncs += p->log->cleanerFsyncsForTest();
+        cleanerDirFsyncs += p->log->cleanerDirFsyncsForTest();
+        inPlace += p->log->inPlaceTruncationsForTest();
+        dirMut += p->log->directoryMutationsForTest();
+    }
+    Worker& w = rig.worker();
+    char buf[1024];
     std::snprintf(buf, sizeof buf,
                   "acks=%" PRIu64 " errs=%" PRIu64 "(last %d) installs=%" PRIu64 " retentionDrops=%" PRIu64
                   " reads=%" PRIu64 " readMiB=%.1f markers=%" PRIu64 "/%" PRIu64 "err rolls=%" PRIu64
                   " syncCreates=%" PRIu64 " inlineFsyncs=%" PRIu64 " holds=%" PRIu64 " deferrals=%" PRIu64
-                  " failureInlineRolls=%" PRIu64,
+                  " failureInlineRolls=%" PRIu64
+                  " | FSYNC io: total=%" PRIu64 " seal=%" PRIu64 " bg=%" PRIu64 " rp=%" PRIu64 " dir=%" PRIu64
+                  " epoch=%" PRIu64 " | worker-inline: sync=%" PRIu64 " role=%" PRIu64
+                  " | cleaner: fsync=%" PRIu64 " dir=%" PRIu64 " | provisioned=%" PRIu64
+                  " | dirMutations=%" PRIu64 " inPlaceTrunc=%" PRIu64,
                   rig.produceAnswers, rig.produceErrors, static_cast<int>(rig.lastProduceError), rig.installs, rig.retentionDrops, rig.readAnswers,
                   static_cast<double>(rig.readBytes) / kMiB, rig.markersAppended, rig.markerErrors, rig.rolls,
-                  rig.syncCreates, rig.inlineFsyncs, rig.holds, rig.rollDeferrals(), rig.failureInlineRolls());
+                  rig.syncCreates, rig.inlineFsyncs, rig.holds, rig.rollDeferrals(), rig.failureInlineRolls(),
+                  w.ioSubmitCountForTest(), w.sealSubmitsForTest(), w.bgFlushSubmitsCountForTest(),
+                  w.recoveryPointSubmitsForTest(), w.dirSyncSubmitsForTest(), w.epochStateSubmitsForTest(),
+                  inlineSyncs, roleSyncs, cleanerFsyncs, cleanerDirFsyncs, rig.provisionedForTest(), dirMut, inPlace);
     return buf;
 }
 

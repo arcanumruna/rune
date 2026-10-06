@@ -11,6 +11,7 @@
 //       once that write completed (event-driven).
 #include <rune/metadata/ShardRouter.h>
 #include <rune/node/ReplicaRegistry.h>
+#include <rune/node/SegmentProvisionerAgent.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerPool.h>
@@ -80,11 +81,18 @@ struct Rig {
     std::unique_ptr<rune::storage::Log>       log;
     PartitionReplica*                         rep = nullptr;
     int64_t                                   now = 1'000'000'000;
+    std::unique_ptr<rune::node::SegmentProvisionerAgent> prov;   ///< driven on the test thread (its own "thread")
 
-    explicit Rig(bool controllerManaged = false, int64_t rollBytes = 64 * 1024 * 1024, const fs::path* at = nullptr) {
+    explicit Rig(bool controllerManaged = false, int64_t rollBytes = 64 * 1024 * 1024, const fs::path* at = nullptr,
+                 bool provisioned = false) {
         dir.p = at ? *at : ownDir.p;
         log = std::make_unique<rune::storage::Log>(dir.p.string(), rollBytes);
         log->recover();
+        if (provisioned) {
+            prov = std::make_unique<rune::node::SegmentProvisionerAgent>(1);
+            prov->addToViewForTest(log.get());
+            log->setProvisioning(prov->hook(), 50);
+        }
         PartitionConfig c;
         c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
         c.replicaLagMaxOffset = 1'000'000'000;
@@ -107,6 +115,7 @@ struct Rig {
         now += 1'000'000;
         if (frame) (void)worker().handleIngressFrameForTest(frame->data(), frame->size(), now);
         (void)worker().doWork(now);
+        if (prov) (void)prov->doWork(now);
     }
     void roleOp(bool leader, int64_t epoch, int32_t leaderId = 2) {
         WorkerOp op;
@@ -478,7 +487,7 @@ TEST(HotPathBRegression, EpochBumpOfSittingLeaderRefusesProduceUntilDurableRegre
 // munmap + mmap of up to 32 MiB inside the read pass, 100-260 us measured
 // under the cleaner's / provisioner's concurrent mmap traffic).
 TEST(HotPathBRegression, ActiveSegmentReadsNeverRemapOnTheWorkerRegression) {
-    Rig rig(/*controllerManaged=*/false, /*rollBytes=*/16 * 1024 * 1024);
+    Rig rig(/*controllerManaged=*/false, /*rollBytes=*/16 * 1024 * 1024, nullptr, /*provisioned=*/true);
     const auto frame = produceFrame(1, 1, 0, 4000, 8);   // ~32 KiB batches
     int64_t next = 0;
     for (int i = 0; i < 300; ++i) {                     // ~9.6 MiB into one segment
@@ -869,4 +878,100 @@ TEST(HotPathBRegression, LegacyEpochFilesMigrateAndAreRemovedRegression) {
         EXPECT_EQ(rune::storage::LeaderEpochState::read(d.p.string()).state,
                   rune::storage::LeaderEpochState::FileState::Valid);
     }
+}
+
+// M2: a divergence truncation inside the active segment changes no directory
+// entry (in-place ftruncate, index entries zeroed in its mapping) — so it
+// costs no directory fsync (old: a rebuilt segment + index rename + an async
+// directory fsync per truncation, a journal commit overlapping intake).
+TEST(HotPathBRegression, InSegmentTruncationNeedsNoDirectoryFsyncRegression) {
+    Rig rig(false, 64 * 1024 * 1024);
+    rig.roleOp(false, 3, 2);
+    rig.pass();
+    applyStamped(rig, 3, 3, 10);
+    const int64_t x = rig.log->logEndOffset();
+    rig.roleOp(false, 5, 2);
+    rig.pass();
+    applyStamped(rig, 5, 5, 10);
+    ASSERT_TRUE(rig.passUntil([&] { return rig.rep->epochStateDurable(); }));
+    const uint64_t dirMut = rig.log->directoryMutationsForTest();
+    const uint64_t dirSyncs = rig.worker().dirSyncSubmitsForTest();
+    rig.roleOp(false, 6, 2);
+    rig.pass();
+    rune::replication::ErrorPayloadBuf epb;
+    WorkerOp op;
+    op.type = WorkerOp::Type::ApplyReplicated; op.topicId = 1; op.partition = 0;
+    op.replicatedPayload.leaderEpoch = 6; op.replicatedPayload.partition = 0; op.replicatedPayload.topicId = 1;
+    op.replicatedPayload.errorCode = rune::replication::kErrDivergingEpoch;
+    const auto pl = epb.set(3, x);
+    op.replicatedPayload.records.assign(pl.begin(), pl.end());
+    ASSERT_TRUE(rig.pool.tryEnqueueOp(1, 0, std::move(op)));
+    ASSERT_TRUE(rig.passUntil([&] { return rig.log->logEndOffset() == x && rig.rep->epochStateDurable(); }));
+    for (int i = 0; i < 16; ++i) rig.pass();
+    EXPECT_EQ(rig.log->directoryMutationsForTest(), dirMut) << "the truncation changed the directory";
+    EXPECT_EQ(rig.worker().dirSyncSubmitsForTest(), dirSyncs) << "a directory fsync per truncation";
+    EXPECT_EQ(rig.log->inPlaceTruncationsForTest(), 1u);
+    // Readable and appendable at the cut; the index serves lookups in range.
+    applyStamped(rig, 6, 6, 4);
+    const auto v = rig.log->readView(0, 1 << 20);
+    ASSERT_FALSE(v.empty());
+    std::string why;
+    EXPECT_EQ(lineageMismatches(*rig.log, rig.rep->leaderEpochCacheForTest(), &why), 0) << why;
+    EXPECT_EQ(rig.log->readView(x, 1 << 20).baseOffset, x);
+}
+
+// M2 guard: an in-place truncated active segment recovers to exactly the
+// truncated content after a crash (the stale index tail never survives).
+TEST(HotPathBRegression, InPlaceTruncationRecoversAfterCrashRegression) {
+    TmpDir d;
+    {
+        rune::storage::Log log(d.p.string(), 1 << 20);
+        log.recover();
+        log.setDeferSealSync(true);
+        for (int i = 0; i < 400; ++i) { const auto b = stampedBatch(i * 2, 2, 1); log.append(b, i * 2 + 1); }
+        ASSERT_EQ(log.checkpointRecoveryPoint(), 0);
+        // No owner here: truncateTo lowers the recovery point inline (persistAtMost_).
+        ASSERT_TRUE(log.truncateTo(301));
+        ASSERT_EQ(log.logEndOffset(), 300);
+        EXPECT_EQ(log.inPlaceTruncationsForTest(), 1u);
+        const auto b = stampedBatch(300, 2, 2);
+        log.append(b, 301);
+        log.crashForTest();
+    }
+    rune::storage::Log log(d.p.string(), 1 << 20);
+    log.recover();
+    EXPECT_EQ(log.logEndOffset(), 302);
+    for (int64_t o : {0, 100, 298, 300}) {
+        const auto v = log.readView(o, 1);
+        ASSERT_FALSE(v.empty()) << o;
+        EXPECT_LE(v.baseOffset, o);
+        EXPECT_GT(v.nextOffset, o);
+    }
+}
+
+
+// Md5: address space is bounded — an idle partition's active segment maps
+// 1 MiB; a filling one grows (off the owner, once) to page-rounded
+// rollBytes + one maximal batch — never a power-of-two 128 MiB per segment.
+TEST(HotPathBRegression, ReadMapAddressSpaceIsBoundedAndGrownOffOwnerRegression) {
+    constexpr int64_t kRoll = 6 * 1024 * 1024 + 4096;   // not a power of two
+    Rig rig(false, kRoll, nullptr, /*provisioned=*/true);
+    EXPECT_LE(rig.log->readView(0, 1).len + 0u, 0u);
+    const auto frame = produceFrame(1, 1, 0, 4000, 8);  // ~32 KiB batches
+    for (int i = 0; i < 4; ++i) rig.pass(&frame);
+    (void)rig.log->readView(0, 1);
+    // Idle-ish: the mapping is the 1 MiB minimum.
+    // (sizes observed through the growth counter / final size below)
+    for (int i = 0; i < 110; ++i) {                     // ~3.5 MiB: past half of the roll
+        rig.pass(&frame);
+        (void)rig.log->readView(0, 1);
+    }
+    ASSERT_TRUE(rig.passUntil([&] { (void)rig.log->readView(0, 1); return rig.log->readMapGrowthsForTest() > 0; }));
+    EXPECT_EQ(rig.log->activeReadMapRemapsForTest(), 0u) << "a read-map remap on the owner";
+    EXPECT_EQ(rig.log->segmentBaseOffsets().size(), 1u);
+    EXPECT_EQ(rune::storage::LogSegment::readMapBytesFor(kRoll), static_cast<std::size_t>(kRoll) + (1u << 20));
+    EXPECT_EQ(rune::storage::LogSegment::readMapBytesFor(64LL << 20), (64u << 20) + (1u << 20))
+        << "64 MiB roll: 65 MiB per active segment (was 128 MiB)";
+    // FREE-tier sizing: 10k partitions, ~1% actively filling a segment:
+    // 9.9k x 1 MiB + 100 x 65 MiB ≈ 16 GiB of address space (was 10k x 128 MiB = 1.25 TiB).
 }

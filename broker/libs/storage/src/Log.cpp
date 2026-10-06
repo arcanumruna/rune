@@ -169,13 +169,17 @@ Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), roll
     for (int64_t b : bases)
         install_(b, std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes,
                                                   indexMaxBytes_, /*prefaultIndex*/false,
-                                                  /*eagerReadMap*/ b == bases.back(), LogSegment::readMapBytesFor(rollBytes_)));
+                                                  /*eagerReadMap*/ b == bases.back()));
     logEndOffset_ = activeSegment().nextOffset();
     // #5 non-blocking append: preallocate the active segment's blocks so hot-path
     // O_APPEND pwrite()s never stall on block allocation (append-p99 tail).
     activeSegment().preallocate(rollBytes_);
 }
 Log::~Log() {
+    // Review Md5: grown mappings never installed (the provisioner is stopped).
+    (void)mapRing_.poll([](int32_t type, int64_t a, int64_t) {
+        if (type == kMapGrownMsg) delete reinterpret_cast<MappedFile*>(static_cast<std::uintptr_t>(a));
+    }, 1 << 20);
     // Fix round 4: the cleaner thread is stopped before the Log is destroyed —
     // complete every posted file operation (a simulated crash only frees the
     // objects) and free any output still queued for the owner (its .cleaned
@@ -263,6 +267,12 @@ void Log::maybeRoll() {
         // provisionThresholdBytes_ full (one compare per append otherwise).
         if (provisioned_ && activeBytes >= provisionThresholdBytes_ && (!thresholdPosted_ || adoptedPostPending_))
             [[unlikely]] postProvisionDemands_(activeBytes);
+        // Review Md5: request the full-segment read mapping off the owner at half full.
+        if (asyncReadGrowth_ && !growOutstanding_ &&
+            static_cast<std::size_t>(activeBytes) * 2 > activeSegment().readMapBytes()) [[unlikely]] {
+            auto last = std::prev(segments_.end());
+            maybeGrowReadMap_(*last->second, last->first, true);
+        }
         return;
     }
     // hotpath-A F2 + F3: a roll NEVER blocks the owner.  No ready segment on a
@@ -557,8 +567,7 @@ int Log::provisionReady(std::size_t depth, bool preallocate) {
                 throw std::system_error(provisionFaultErr_, std::generic_category(), "provision fault (test)");
             }
             seg = LogSegment::prepareStaging(stagingLogPathFor(seq), stagingIndexPathFor(seq), seq,
-                                             kDefaultIndexIntervalBytes, indexMaxBytes_,
-                                             LogSegment::readMapBytesFor(rollBytes_));
+                                             kDefaultIndexIntervalBytes, indexMaxBytes_);
         } catch (const std::system_error& e) {
             err = e.code().value() != 0 ? e.code().value() : EIO;
         } catch (...) {
@@ -674,7 +683,7 @@ void Log::installNextSegment(int64_t base) {
         // active), the exception propagates, the next append retries.
         auto seg = std::make_unique<LogSegment>(
             dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_,
-            /*prefaultIndex*/false, /*eagerReadMap*/true, LogSegment::readMapBytesFor(rollBytes_));
+            /*prefaultIndex*/false, /*eagerReadMap*/true);
         seg->preallocate(rollBytes_);
         ++ownerPreallocs_;
         install_(base, std::move(seg));
@@ -917,7 +926,64 @@ LogReadView Log::readView(int64_t startOffset, int32_t maxBytes) noexcept {
     auto it = segments_.upper_bound(startOffset);
     if (it == segments_.begin()) return {};
     --it;
+    if (asyncReadGrowth_) {
+        // Review Md5: the mapping grows OFF the owner — never a remap here.
+        pollReadMaps_();
+        LogSegment& seg = *it->second;
+        seg.setOwnerRemap(false);
+        maybeGrowReadMap_(seg, it->first, std::next(it) == segments_.end());
+    }
     return it->second->readView(startOffset, maxBytes);
+}
+
+void Log::maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept {
+    const std::size_t mapped = seg.readMapBytes();
+    if (mapped == 0) return;                                        // no mapping yet: readView creates it
+    const auto size = static_cast<std::size_t>(seg.sizeBytes());
+    // Active: grow at half full, to the full-segment size; sealed: to its size.
+    const bool want = active ? size * 2 > mapped : size > mapped;
+    if (!want) return;
+    if (growOutstanding_) {
+        // Count-based re-request (a request lost to a full ring / a racing view
+        // change): never time-based, never wedged.
+        if (size > mapped && ++growWaits_ >= 4096) { growOutstanding_ = false; growWaits_ = 0; }
+        return;
+    }
+    std::size_t target = active ? std::max(LogSegment::readMapBytesFor(rollBytes_), size * 2) : size;
+    target = (target + (std::size_t{1} << 20) - 1) >> 20;          // MiB
+    if ((target << 20) <= mapped) return;
+    const int fd = ::fcntl(seg.logFd(), F_DUPFD_CLOEXEC, 0);       // the provisioner owns the dup
+    if (fd < 0) return;
+    if (!provisionHook_.growFn(provisionHook_.ctx, this, fd, static_cast<int64_t>(target))) { ::close(fd); return; }
+    growOutstanding_ = true;
+    growBase_ = base;
+    growGen_ = seg.installGen();
+    growWaits_ = 0;
+}
+
+void Log::pollReadMaps_() noexcept {
+    (void)mapRing_.poll([this](int32_t type, int64_t a, int64_t b) {
+        (void)b;
+        if (type == kMapFailedMsg) {
+            // Counted; this log falls back to growing on the owner (correct, slow).
+            ++readMapGrowthFailures_;
+            growOutstanding_ = false;
+            asyncReadGrowth_ = false;
+            for (auto& [base, s] : segments_) if (s) s->setOwnerRemap(true);
+            return;
+        }
+        if (type != kMapGrownMsg) return;
+        std::unique_ptr<MappedFile> m(reinterpret_cast<MappedFile*>(static_cast<std::uintptr_t>(a)));
+        growOutstanding_ = false;
+        auto it = segments_.find(growBase_);
+        if (it != segments_.end() && it->second && it->second->installGen() == growGen_ &&
+            m->size() > it->second->readMapBytes()) {
+            m = it->second->swapReadMap(std::move(m));   // m = the retired mapping
+            ++readMapGrowths_;
+        }
+        // Retire off the owner (munmap); inline only if the ring is full.
+        if (m && provisionHook_.disposeFn(provisionHook_.ctx, m.get())) (void)m.release();
+    }, 8);
 }
 int64_t Log::logStartOffset() const noexcept {
     // The oldest segment's base offset (segments_ is an ordered map keyed by base).
@@ -1590,7 +1656,11 @@ Log::SegmentBytes Log::segmentBytesAt(int64_t segmentBase) {
     SegmentBytes b;
     b.gen = it->second->installGen();
     b.fd  = it->second->logFd();
+    // Review Md5: the RC scan needs the WHOLE segment (a partial view would read
+    // as "walked") — it may map on the owner (cold: RC builds; counted remaps).
+    it->second->setOwnerRemap(true);
     const LogReadView v = it->second->mappedBytes();
+    if (asyncReadGrowth_) it->second->setOwnerRemap(false);
     b.data = v.data;
     b.size = v.len;
     return b;
@@ -1652,7 +1722,7 @@ bool Log::truncateTo_(int64_t truncateOffset) {
         int64_t base = std::max<int64_t>(0, truncateOffset);
         auto seg = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes,
                                                  indexMaxBytes_, /*prefaultIndex*/false,
-                                                 /*eagerReadMap*/true, LogSegment::readMapBytesFor(rollBytes_));
+                                                 /*eagerReadMap*/true);
         install_(base, std::move(seg));
         segments_.rbegin()->second->setDirEntryGen(++dirMutGen_);   // MEDIUM-2: deletions + re-create
         logEndOffset_ = base;
@@ -1672,6 +1742,30 @@ bool Log::truncateTo_(int64_t truncateOffset) {
     }
 
     // The active segment now straddles truncateOffset.
+    // Hot-path B review M2: a worker-driven log truncates it IN PLACE (one
+    // ftruncate of the open fd, index entries zeroed in its mapping): no new
+    // file, no index rename — the directory changes only if whole segments
+    // were deleted above, so only then is a directory fsync owed.
+    if (deferSealSync_) {
+        LogSegment& aseg = activeSegment();
+        int64_t keptMaxTs = 0;
+        const int err = aseg.truncateInPlace(truncateOffset, keptMaxTs);
+        if (err > 0) [[unlikely]] {
+            markStorageFailed(err);   // nothing changed in the segment; fail-stop (the owner halts)
+            return true;
+        }
+        if (err == 0) {
+            if (deletesFiles) aseg.setDirEntryGen(++dirMutGen_);   // MEDIUM-2: the unlinks above
+            logEndOffset_ = aseg.nextOffset();
+            activeSegmentMaxTs_ = keptMaxTs;
+            ++inPlaceTruncations_;
+            noteTruncatedTo_(logEndOffset_);
+            persistAtMost_(logEndOffset_);
+            publishSealedSnapshotFrom_(aseg.baseOffset());
+            return true;
+        }
+        // err < 0: no read mapping — rebuild the segment below.
+    }
     // We need to find the byte position of truncateOffset inside it and truncate.
     LogSegment& seg = activeSegment();
     // Recover re-scans the segment file and truncates the torn tail;
@@ -1771,7 +1865,7 @@ bool Log::truncateTo_(int64_t truncateOffset) {
         // — F3: eagerReadMap=true.
         auto newSeg = std::make_unique<LogSegment>(dir_, base, kDefaultIndexIntervalBytes,
                                                     indexMaxBytes_, /*prefaultIndex*/false,
-                                                    /*eagerReadMap*/true, LogSegment::readMapBytesFor(rollBytes_));
+                                                    /*eagerReadMap*/true);
         // E2 crash seam: the surviving prefix keeps what was already synced.
         newSeg->inheritSyncedBytesForTest(
             std::min<int64_t>(seg.syncedBytesForTest(), static_cast<int64_t>(cutPos)));
@@ -1791,7 +1885,7 @@ bool Log::truncateTo_(int64_t truncateOffset) {
         activeSegment().setDurableNext(std::min(oldDurable, activeSegment().nextOffset()));
         // MEDIUM-2: R stays below the deleted files' range until a directory
         // fsync covered the deletions (else they could reappear trusted).
-        if (deletesFiles || deferSealSync_) activeSegment().setDirEntryGen(++dirMutGen_);
+        if (deletesFiles || deferSealSync_) activeSegment().setDirEntryGen(++dirMutGen_);   // + the index rename
         logEndOffset_ = activeSegment().nextOffset();
     } catch (const std::exception& ex) {
         fatalHalt("Log::truncateTo: post-truncate storage failure rebuilding segment "
@@ -1844,7 +1938,7 @@ bool Log::reloadSegments() {
         // F3: same eager-only-for-the-active-segment rule as the constructor.
         newSegments[b] = std::make_unique<LogSegment>(dir_, b, kDefaultIndexIntervalBytes,
                                                        indexMaxBytes_, /*prefaultIndex*/false,
-                                                       /*eagerReadMap*/ b == bases.back(), LogSegment::readMapBytesFor(rollBytes_));
+                                                       /*eagerReadMap*/ b == bases.back());
         newSegments[b]->setStorageState(&storage_);   // T10: recover() sees the failure state
         // F15 S4 N1 (merged with F3's install-by-swap): every installed segment
         // carries a fresh Log-wide generation — install_ is bypassed here, so
@@ -2144,6 +2238,7 @@ bool Log::applyCleanerMsgRange_(std::size_t& i, std::size_t tail, int64_t nowMs,
         if (m.kind == MsgKind::RetentionDrop && m.logStartAfter > newStart) newStart = m.logStartAfter;
     }
     bool dropsAllowed = true;
+    if (durable && newStart > persistedLogStart_) { ++cleanerFsyncs_; ++cleanerDirFsyncs_; }   // gate attribution
     if (durable && newStart > persistedLogStart_ && !writeLogStartCheckpoint_(newStart)) {
         dropsAllowed = false;
         ++checkpointWriteFailures_;
@@ -2251,6 +2346,7 @@ int Log::runCleanerFileOps(int64_t nowMs, int64_t fileDeleteDelayMs) {
         // on it (construction recovers any prefix).
         const int dfd = ::open(dir_.c_str(), O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) { (void)::fsync(dfd); ::close(dfd); }
+        ++cleanerDirFsyncs_;
     }
     return work;
 }

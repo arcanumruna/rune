@@ -77,6 +77,7 @@ public:
         kMetricRollHolds,             ///< Hold demands: rolls held for want of a ready segment
         kMetricUnpreallocatedBuilds,  ///< ready segments built WITHOUT fallocate (over the cap)
         kMetricParkedDropped,         ///< parked demands discarded (log retired / table full)
+        kMetricReadMapFailures,       ///< review Md5: off-owner read-map growths that failed
         kMetricCount
     };
     /// Sink called on THIS thread whenever a metric changes (BrokerNode: Aeron
@@ -109,7 +110,15 @@ public:
 
     /// The hook every provisioned log posts its demands through (any worker
     /// thread): Log::setProvisioning(provisioner.hook(), thresholdPct).
-    [[nodiscard]] rune::storage::Log::ProvisionHook hook() noexcept { return {&onDemand_, this}; }
+    [[nodiscard]] rune::storage::Log::ProvisionHook hook() noexcept {
+        return {&onDemand_, this, &onGrow_, &onDispose_};
+    }
+    [[nodiscard]] uint64_t readMapsGrownForTest() const noexcept { return mapsGrown_; }
+    /// Tests without a CleanerViewChannel: put `log` into the current view.
+    void addToViewForTest(rune::storage::Log* log) {
+        logs_.push_back(log);
+        std::sort(logs_.begin(), logs_.end());
+    }
 
     /// The doorbell demands ring: give it to this agent's idle strategy
     /// (ParkUntilWorkIdle(shape, nullptr, 0, doorbell())).
@@ -137,6 +146,11 @@ public:
         int work = 0;
         if (channel_) work += applyViewUpdates_();
         work += demand_.poll([this](int32_t type, int64_t a, int64_t b) {
+            if (type == kDisposeMsgType) {   // review Md5: a retired read mapping (munmap off the owner)
+                delete reinterpret_cast<rune::storage::MappedFile*>(static_cast<std::uintptr_t>(a));
+                return;
+            }
+            if (type == kGrowMsgType) { serveGrow_(a, b); return; }
             if (type != kDemandMsgType) return;
             auto* log = reinterpret_cast<rune::storage::Log*>(static_cast<std::uintptr_t>(a));
             const auto kind = static_cast<Demand>(b);
@@ -156,6 +170,43 @@ private:
     static constexpr std::size_t kMaxParked        = 4096;
     static constexpr int64_t     kUnknownCap       = INT64_MAX / 4;   ///< AUTO before statvfs succeeded: no cap
     static constexpr uint32_t    kCapRefreshServes = 64;
+
+    static constexpr int32_t kGrowMsgType = 2, kDisposeMsgType = 3;
+    static bool onGrow_(void* ctx, rune::storage::Log* log, int fd, int64_t mib) noexcept {
+        auto* self = static_cast<SegmentProvisionerAgent*>(ctx);
+        if (!self->demand_.offer(kGrowMsgType, static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(log)),
+                                 static_cast<int64_t>(static_cast<uint32_t>(fd)) | (mib << 32)))
+            return false;
+        self->bell_.ringIfParked();
+        return true;
+    }
+    static bool onDispose_(void* ctx, void* map) noexcept {
+        auto* self = static_cast<SegmentProvisionerAgent*>(ctx);
+        if (!self->demand_.offer(kDisposeMsgType, static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(map)), 0))
+            return false;
+        self->bell_.ringIfParked();
+        return true;
+    }
+    /// Review Md5: map `mib` MiB of the dup'd segment fd and hand it to the log
+    /// (never dereferences a log that is not in the current view).
+    void serveGrow_(int64_t a, int64_t b) {
+        auto* log = reinterpret_cast<rune::storage::Log*>(static_cast<std::uintptr_t>(a));
+        const int fd = static_cast<int>(static_cast<uint32_t>(b & 0xffffffff));
+        const int64_t mib = b >> 32;
+        if (!inView_(log)) { ::close(fd); return; }   // the owner re-requests (count-based) if it is live
+        try {
+            auto* m = new rune::storage::MappedFile(rune::storage::MappedFile::BorrowedFd{fd}, std::string(),
+                                                    static_cast<std::size_t>(mib) << 20);
+            ::close(fd);
+            if (!log->offerReadMap(m)) delete m;
+            else ++mapsGrown_;
+        } catch (...) {
+            ::close(fd);
+            bump_(kMetricReadMapFailures);
+            (void)log->offerReadMapFailure(errno != 0 ? errno : ENOMEM);
+        }
+    }
+    uint64_t mapsGrown_ = 0;
 
     static bool onDemand_(void* ctx, rune::storage::Log* log, Demand kind) noexcept {
         auto* self = static_cast<SegmentProvisionerAgent*>(ctx);

@@ -443,6 +443,23 @@ public:
     [[nodiscard]] int64_t startupRecoveryPoint() const noexcept { return startupRp_; }
     [[nodiscard]] int64_t epochHistoryCapForTest() const noexcept { return rpEpochCap_; }
     [[nodiscard]] uint64_t asyncTruncationLoweringsForTest() const noexcept { return rpLowerings_; }
+    [[nodiscard]] uint64_t inPlaceTruncationsForTest() const noexcept { return inPlaceTruncations_; }
+    /// Review Md5 — provisioner thread: hand a read mapping built for this
+    /// log's outstanding growth request back to the owner.  false = ring full
+    /// (the caller destroys it; the owner re-requests).
+    [[nodiscard]] bool offerReadMap(MappedFile* m) noexcept {
+        return mapRing_.offer(kMapGrownMsg, static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(m)),
+                              static_cast<int64_t>(m->size()));
+    }
+    [[nodiscard]] bool offerReadMapFailure(int err) noexcept { return mapRing_.offer(kMapFailedMsg, err, 0); }
+    [[nodiscard]] uint64_t readMapGrowthsForTest() const noexcept { return readMapGrowths_; }
+    [[nodiscard]] uint64_t readMapGrowthFailuresForTest() const noexcept { return readMapGrowthFailures_; }
+    /// Cleaner-thread fsyncs / directory fsyncs (retention log-start
+    /// checkpoints, posted renames).  Read only after the cleaner stopped.
+    [[nodiscard]] uint64_t cleanerFsyncsForTest() const noexcept { return cleanerFsyncs_; }
+    [[nodiscard]] uint64_t cleanerDirFsyncsForTest() const noexcept { return cleanerDirFsyncs_; }
+    /// Directory mutations (create / rename / unlink) since construction.
+    [[nodiscard]] uint64_t directoryMutationsForTest() const noexcept { return dirMutGen_; }
 
     // Async checkpoint (owning worker, through its io backend):
     //   Idle --prepare--> Prepared --submitted--> InFlight --completed--> Idle
@@ -804,6 +821,11 @@ public:
     struct ProvisionHook {
         bool (*fn)(void* ctx, Log* log, ProvisionDemand kind) noexcept = nullptr;
         void* ctx = nullptr;
+        /// Review Md5 (optional): build a `mib` MiB read mapping of `fd` (a dup
+        /// the callee owns) off the owner and hand it back (offerReadMap).
+        bool (*growFn)(void* ctx, Log* log, int fd, int64_t mib) noexcept = nullptr;
+        /// Review Md5 (optional): destroy a retired read mapping off the owner.
+        bool (*disposeFn)(void* ctx, void* map) noexcept = nullptr;
     };
     /// Owner (before the log is driven): this log is served by a provisioning
     /// thread.  `thresholdPct` (1..100): fill level of the active segment at
@@ -812,6 +834,8 @@ public:
     void setProvisioning(ProvisionHook hook, int thresholdPct = 50) noexcept {
         provisioned_ = true;
         provisionHook_ = hook;
+        asyncReadGrowth_ = hook.growFn != nullptr && hook.disposeFn != nullptr;
+
         const int pct = thresholdPct < 1 ? 1 : (thresholdPct > 100 ? 100 : thresholdPct);
         provisionThresholdBytes_ = rollBytes_ / 100 * pct + (rollBytes_ % 100) * pct / 100;
     }
@@ -982,6 +1006,22 @@ private:
     bool    rpLowerDue_    = false;   ///< the on-disk R (upper bound) exceeds the truncation cap
     bool    rpKick_        = false;   ///< see takeCheckpointKick
     uint64_t rpLowerings_  = 0;
+    uint64_t inPlaceTruncations_ = 0;
+    // ---- review Md5: off-owner read-map growth (owner fields) -------------
+    using MapRing = rune::consensus::ControlRing<256>;
+    static constexpr std::int32_t kMapGrownMsg = 1, kMapFailedMsg = 2;
+    MapRing  mapRing_;                    ///< provisioner → owner: grown mappings
+    bool     asyncReadGrowth_ = false;
+    bool     growOutstanding_ = false;
+    int64_t  growBase_ = -1;
+    uint64_t growGen_ = 0;
+    uint32_t growWaits_ = 0;
+    uint64_t readMapGrowths_ = 0, readMapGrowthFailures_ = 0;
+    /// Owner: request a larger mapping for `seg` (keyed `base`) when it needs one.
+    void maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept;
+    /// Owner: install grown mappings handed back by the provisioner.
+    void pollReadMaps_() noexcept;
+    uint64_t cleanerFsyncs_ = 0, cleanerDirFsyncs_ = 0;   ///< cleaner thread (see cleanerFsyncsForTest)
     void clearTruncationCap_() noexcept { rpTruncCap_ = INT64_MAX; rpLowerDue_ = false; }
     uint64_t rpPersists_   = 0;
     uint64_t rpSeq_        = 0;       ///< highest slot seq ever written (or read)
