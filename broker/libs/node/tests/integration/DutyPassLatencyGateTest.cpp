@@ -1229,13 +1229,24 @@ Outcome leadershipChange(int nParts) {
     std::vector<bool> leading(rig.parts().size(), true);
     uint64_t flips = 0;
     const uint64_t n = passes(30'000);
+    // Event-driven cycle (hot-path B F7: a promotion leads once its durable
+    // fence completed through the io backend — milliseconds, not passes):
+    // demote the victim after it led 200 passes, promote it 50 passes later,
+    // move to the next partition once the promotion actually leads.
+    enum class Ph { Leading, Demoted, Promoting } ph = Ph::Leading;
+    std::size_t victim = 0;
+    uint64_t t = 0;
     for (uint64_t i = 0; i < n; ++i) {
         uint32_t extra = kProduce;
-        // Every 250 passes demote one partition; 50 passes later promote it
-        // at a new epoch (RC state rebuilds incrementally on the next passes).
-        const std::size_t victim = (i / 250) % rig.parts().size();
-        if (i % 250 == 0) { rig.becomeFollower(*rig.parts()[victim]); leading[victim] = false; extra |= kRoleOp; ++flips; }
-        if (i % 250 == 50) { rig.becomeLeader(*rig.parts()[victim]); leading[victim] = true; extra |= kRoleOp; }
+        ++t;
+        Part& vp = *rig.parts()[victim];
+        if (ph == Ph::Leading && t >= 200 && vp.rep->acceptsProduce()) {
+            rig.becomeFollower(vp); leading[victim] = false; extra |= kRoleOp; ++flips; ph = Ph::Demoted; t = 0;
+        } else if (ph == Ph::Demoted && t >= 50) {
+            rig.becomeLeader(vp); leading[victim] = true; extra |= kRoleOp; ph = Ph::Promoting;
+        } else if (ph == Ph::Promoting && vp.rep->acceptsProduce()) {
+            ph = Ph::Leading; t = 0; victim = (victim + 1) % rig.parts().size();
+        }
         ptrs.clear();
         // Produce only where the partition accepts it (a promotion leads once
         // its durable fence completed — F7): never a refused produce.
