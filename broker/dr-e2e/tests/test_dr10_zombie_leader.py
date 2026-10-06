@@ -668,8 +668,9 @@ def test_dr10_short_vs_long_pause(fresh_cluster, pause_case):
     time.sleep(settle_s)
 
     if pause_case == "short" and not new_election_occurred:
-        # The short pause is AMBIGUOUS by design (1.5 s vs a 300 ms leader-
-        # liveness window): the observation above runs mid-pause, so an election
+        # The short pause is AMBIGUOUS by design (1.5 s vs the leader-liveness
+        # window max(electionTimeout, 3*statusInterval) = 300 ms under the DR
+        # compose RUNE_ELECTION_TIMEOUT_MS=300; 150 ms at the broker default): the observation above runs mid-pause, so an election
         # still in flight is invisible there.  Aeron-faithful (ClosedLeader
         # StepDownRegression): a leader that resumes without an active follower
         # quorum steps down, so leadership may legitimately move AFTER the

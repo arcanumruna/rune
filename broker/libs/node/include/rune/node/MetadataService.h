@@ -1069,6 +1069,13 @@ public:
     /// reflects its whole log as of the claim).  NodeRuntimeAgent consumes an
     /// eligible-set change only when a decision could be taken (M2).
     [[nodiscard]] bool controllerReady() const noexcept { return controllerReady_(); }
+    /// D17 / DR-10 review MAJOR-1: whether THIS node is the consensus leader,
+    /// pushed by the control thread every cycle (NodeRuntimeAgent).  The
+    /// metadata replica's own role lags a consensus step-down (the bridge acts
+    /// only on a known new leader), so deciding on the replica role alone let a
+    /// stepped-down / resumed-zombie controller keep reassigning partitions.
+    /// Default true: harnesses without a consensus layer decide on the role.
+    void setConsensusLeads(bool leads) noexcept { consensusLeads_ = leads; }
     /// Fix round 2 (N2): this node is stopping (plain stop()) — it decides
     /// nothing any more (no rebalance, no AlterIsr answers, no emit).
     void halt() noexcept {
@@ -1731,7 +1738,7 @@ private:
     /// This replica may DECIDE (emit assignments, answer AlterIsr, rebalance):
     /// it leads AND its MSM reflects its whole log as of the claim.
     [[nodiscard]] bool controllerReady_() const noexcept {
-        return leaderReady_() && controllerCaughtUp_ && !halted_;
+        return leaderReady_() && consensusLeads_ && controllerCaughtUp_ && !halted_;
     }
     /// The catch-up edge: the HW (and the MSM apply cursor) reached the
     /// claim-time LEO — the map is complete; the deferred claim action runs.
@@ -1791,6 +1798,7 @@ private:
     // above the HW), so a rebuild after a truncation replays at least this far
     // (capped at the LEO) even while the freshly-demoted follower's HW reads 0.
     rune::replication::Offset committedEnd_ = 0;
+    bool consensusLeads_ = true;   ///< D17 / review MAJOR-1 (setConsensusLeads)
 
     // Follower→Leader transition gate (mirrors TCS / GCS patterns).
     bool wasLeader_ = false;

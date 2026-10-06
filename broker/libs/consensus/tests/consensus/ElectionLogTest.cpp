@@ -2228,6 +2228,9 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_HigherTermRequestVote_IsAnswere
     closeAsThreeMemberLeader(e, pub, nowNs);
     ASSERT_TRUE(e.isClosed());
     pub.clear();
+    // The zombie case: paused past the heartbeat timeout, no follower heard since
+    // (no doWork yet — the RequestVote is the first thing it processes).
+    nowNs += e.leaderHeartbeatTimeoutNs() + 1;
 
     // Candidate 1 with an equally fresh log asks for a vote in a newer term.
     const Term candTerm = e.leadershipTermId() + 1;
@@ -2326,4 +2329,124 @@ TEST(ElectionLog, LeaderLivenessGraceRegression_PeersEligibleFromLeaderLogReplic
     std::vector<NodeId> elig(out, out + n);
     EXPECT_EQ(elig, (std::vector<NodeId>{0, 1, 2}))
         << "a just-elected leader must not see its live peers as dead before CLOSED";
+}
+
+
+// DR-10 review MEDIUM-1 — leader stickiness: a CLOSED leader that still has an
+// active follower quorum DENIES a higher-term candidate and keeps leading (no
+// partial-partition ping-pong).
+TEST(ElectionLog, ClosedLeaderStickinessRegression_LeaderWithQuorumDeniesAndKeepsLeading) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+    closeAsThreeMemberLeader(e, pub, nowNs);
+    ASSERT_TRUE(e.isClosed());
+    pub.clear();
+    e.onRequestVote(e.leadershipTermId(), e.appendPosition(), e.leadershipTermId() + 1,
+                    /*candidateId=*/1, nowNs);
+    ASSERT_EQ(pub.placeVoteCalls.size(), 1u) << "a sticky leader still ANSWERS (deny)";
+    EXPECT_FALSE(pub.placeVoteCalls[0].vote);
+    EXPECT_TRUE(e.isClosed());
+    EXPECT_EQ(e.leaderMemberId(), 0);
+}
+
+// Builds a CLOSED follower (self=1) of leader 0 at term 1.
+static void closeAsFollowerOf0(Election& e, int64_t& nowNs) {
+    e.doWork(nowNs);   // → CANVASS
+    e.onNewLeadershipTerm(nowNs, 0, 1, 0, 0, 1, 0, 0, 0, 0, /*leader=*/0, 0, true, 0);
+    ASSERT_TRUE(driveToClosed(e, nowNs));
+    ASSERT_EQ(e.leaderMemberId(), 0);
+}
+
+TEST(ElectionLog, ClosedLeaderStickinessRegression_FollowerWithLiveLeaderDenies) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl);
+    closeAsFollowerOf0(e, nowNs);
+    pub.clear();
+    e.onRequestVote(e.leadershipTermId(), e.appendPosition(), e.leadershipTermId() + 1,
+                    /*candidateId=*/2, nowNs);
+    ASSERT_EQ(pub.placeVoteCalls.size(), 1u);
+    EXPECT_FALSE(pub.placeVoteCalls[0].vote) << "a follower with a live leader must not grant";
+    EXPECT_TRUE(e.isClosed());
+    EXPECT_EQ(e.leaderMemberId(), 0);
+
+    // Once the leader has been silent past the timeout the candidate is granted.
+    nowNs += e.leaderHeartbeatTimeoutNs() + 1;
+    pub.clear();
+    e.onRequestVote(e.leadershipTermId(), e.appendPosition(), e.leadershipTermId() + 1,
+                    /*candidateId=*/2, nowNs);
+    ASSERT_EQ(pub.placeVoteCalls.size(), 1u);
+    EXPECT_TRUE(pub.placeVoteCalls[0].vote);
+    EXPECT_FALSE(e.isClosed());
+}
+
+// MEDIUM-3: a candidate the candidacy gate denies (outside the newest durable
+// internal ISR) — with an equally fresh log — never unseats a CLOSED leader,
+// even one that lost its quorum view (MAJOR-R3).
+static bool denyNode2(void*, NodeId c) noexcept { return c != 2; }
+TEST(ElectionLog, ClosedLeaderStepDownRegression_GateDeniedCandidacyKeepsLeader) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+    closeAsThreeMemberLeader(e, pub, nowNs);
+    e.setVoteGate(&denyNode2, nullptr);
+    nowNs += e.leaderHeartbeatTimeoutNs() + 1;   // not sticky: only the gate protects it
+    pub.clear();
+    e.onRequestVote(e.leadershipTermId(), e.appendPosition(), e.leadershipTermId() + 1,
+                    /*candidateId=*/2, nowNs);
+    ASSERT_EQ(pub.placeVoteCalls.size(), 1u);
+    EXPECT_FALSE(pub.placeVoteCalls[0].vote);
+    EXPECT_TRUE(e.isClosed()) << "a gate-denied candidacy unseated the leader (MAJOR-R3)";
+    EXPECT_EQ(e.leaderMemberId(), 0);
+}
+
+// MEDIUM-3: CLOSED-follower variants of the higher-term NLT / CommitPosition.
+TEST(ElectionLog, ClosedLeaderStepDownRegression_FollowerHigherTermNltAndCommitLeaveClosed) {
+    for (int variant = 0; variant < 2; ++variant) {
+        TempFile nsfFile(".nsf"), tlFile(".tl");
+        NodeStateFile nsf(nsfFile.str());
+        TermLog       tl(tlFile.str());
+        FakeConsensusPublisher pub;
+        int64_t nowNs = 1'000'000LL;
+        auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl);
+        closeAsFollowerOf0(e, nowNs);
+        const Term higher = e.leadershipTermId() + 1;
+        if (variant == 0)
+            e.onNewLeadershipTerm(nowNs, e.leadershipTermId(), higher, 0, 0, higher, 0,
+                                  e.appendPosition(), 0, 0, /*leader=*/2, 0, false, 0);
+        else
+            e.onCommitPosition(nowNs, higher, 0, /*leader=*/2);
+        EXPECT_FALSE(e.isClosed()) << "variant " << variant;
+        EXPECT_EQ(e.leadershipTermId(), higher) << "variant " << variant;
+    }
+}
+
+// MEDIUM-3: the adopted term is durable — a restarted node never votes in it again.
+TEST(ElectionLog, ClosedLeaderStepDownRegression_AdoptedTermIsDurable) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    Term higher = 0;
+    {
+        NodeStateFile nsf(nsfFile.str());
+        TermLog       tl(tlFile.str());
+        FakeConsensusPublisher pub;
+        int64_t nowNs = 1'000'000LL;
+        auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+        closeAsThreeMemberLeader(e, pub, nowNs);
+        higher = e.leadershipTermId() + 3;
+        e.onNewLeadershipTerm(nowNs, e.leadershipTermId(), higher, 0, 0, higher, 0,
+                              e.appendPosition(), 0, 0, /*leader=*/2, 0, false, 0);
+        ASSERT_FALSE(e.isClosed());
+    }
+    NodeStateFile reopened(nsfFile.str());
+    EXPECT_GE(reopened.candidateTermId(), higher) << "the stepped-down term was not persisted";
 }
