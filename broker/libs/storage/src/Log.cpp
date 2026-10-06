@@ -107,6 +107,7 @@ int32_t Log::indexMaxBytesFor(int64_t rollBytes, int32_t indexIntervalBytes) noe
 
 Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), rollBytes_(segmentRollBytes) {
     indexMaxBytes_ = indexMaxBytesFor(rollBytes_, kDefaultIndexIntervalBytes);
+    spareSegNodes_.reserve(kSpareSegNodes);   // hotpath-A: recycled map nodes (see install_)
     // Reconcile any staging segment files left by a crash BEFORE discovering real
     // segments: an adopted-but-not-yet-renamed staging.log has its true base
     // recovered from the first batch header and is renamed into place (no data
@@ -256,11 +257,18 @@ void Log::maybeRoll() {
     // rollDeferred(); the first append after the provisioner / io backend
     // caught up rolls.
     if (rollBlockedNow_()) [[unlikely]] {
-        ++rollDeferrals_;
-        return;
+        // Correctness backstop: a deferral never lets a segment grow without
+        // bound (positions are 32-bit; a stuck provisioner / io backend must
+        // not wedge the log) — past the cap the roll is forced, blocking but
+        // correct (inline create / inline seal fsync, the pre-hotpath-A path).
+        if (activeSegment().sizeBytes() < maxDeferredRollBytes_()) [[likely]] {
+            ++rollDeferrals_;
+            return;
+        }
+        ++forcedRolls_;
     }
     // B1 fix (fsync-on-seal): the sealed segment is made durable exactly once.
-    if (deferSealSync_) {
+    if (deferSealSync_ && pendingSealCount_ < kMaxPendingSeals) {
         // Shard mode (spec §3.1): no inline fsync on the loop.  Push the
         // buffered bytes to the page cache, pin the sealed segment (its fd
         // must outlive the async flush — M1) and queue it (room checked above);
@@ -274,7 +282,8 @@ void Log::maybeRoll() {
         sealed.pinFlush();
         pendingSeals_[pendingSealCount_++] = &sealed;
     } else {
-        // Legacy (control-thread logs): inline seal fsync.
+        // Legacy (control-thread logs), or a FORCED roll with the seal queue
+        // full (see above): inline seal fsync.
         activeSegment().sync();
     }
     const int64_t base = logEndOffset_;
@@ -325,50 +334,75 @@ inline int64_t sealedEntryTs(LogSegment& seg, int64_t fresh) noexcept {
 }
 } // namespace
 
+void Log::snapRebaseDir_(std::size_t keepChunks, std::size_t extraChunks) {
+    // Cold-ish: once per kSnapHeadersPerDir publishes or when the chunk slots
+    // run out — O(live chunks) pointer copies, never an entry copy.
+    const std::size_t firstChunk = snapDir_ ? snapBegin_ / kSnapChunkEntries : 0;
+    auto dir = std::make_shared<SealedSnapshotDir>();
+    dir->chunkCap = std::max<std::size_t>(16, 2 * (keepChunks + extraChunks) + 2);
+    dir->chunks.reset(new std::shared_ptr<SealedSnapshotChunk>[dir->chunkCap]);
+    for (std::size_t c = 0; c < keepChunks; ++c) dir->chunks[c] = snapDir_->chunks[firstChunk + c];
+    dir->headerCap = kSnapHeadersPerDir;
+    dir->headers.reset(new SealedSegmentSnapshot[dir->headerCap]);
+    snapBegin_ -= firstChunk * kSnapChunkEntries;
+    snapEnd_   -= firstChunk * kSnapChunkEntries;
+    snapDir_ = std::move(dir);
+    snapHeadersUsed_ = 0;
+}
+
+void Log::snapPushBack_(const SegInfo& e) {
+    const std::size_t c = snapEnd_ / kSnapChunkEntries;
+    if (!snapDir_ || c >= snapDir_->chunkCap) {
+        const std::size_t live = snapDir_ ? (snapEnd_ + kSnapChunkEntries - 1) / kSnapChunkEntries -
+                                                snapBegin_ / kSnapChunkEntries
+                                          : 0;
+        snapRebaseDir_(live, 1);
+    }
+    const std::size_t cc = snapEnd_ / kSnapChunkEntries;
+    if (snapEnd_ % kSnapChunkEntries == 0 && !snapDir_->chunks[cc]) [[unlikely]]
+        snapDir_->chunks[cc] = std::make_shared<SealedSnapshotChunk>();   // once per kSnapChunkEntries
+    // Slot snapEnd_ is covered by no published snapshot (see snapEnd_).
+    snapDir_->chunks[cc]->e[snapEnd_ % kSnapChunkEntries] = e;
+    ++snapEnd_;
+}
+
 void Log::publishSnapshotView_() {
-    const SegInfo* first = snapStore_ ? snapStore_->buf.get() + snapBegin_ : nullptr;
-    std::atomic_store(&sealedSnapshot_, std::shared_ptr<const SealedSegmentSnapshot>(
-        std::make_shared<const SealedSegmentSnapshot>(snapStore_, first, snapEnd_ - snapBegin_)));
+    if (!snapDir_ || snapHeadersUsed_ == snapDir_->headerCap) {
+        const std::size_t live = snapDir_ ? (snapEnd_ + kSnapChunkEntries - 1) / kSnapChunkEntries -
+                                                snapBegin_ / kSnapChunkEntries
+                                          : 0;
+        snapRebaseDir_(live, 0);
+    }
+    SealedSegmentSnapshot& h = snapDir_->headers[snapHeadersUsed_++];
+    h = SealedSegmentSnapshot(snapDir_.get(), snapBegin_, snapEnd_ - snapBegin_);
+    // Aliasing shared_ptr: shares the directory's control block — no allocation.
+    std::atomic_store(&sealedSnapshot_, std::shared_ptr<const SealedSegmentSnapshot>(snapDir_, &h));
 }
 
 void Log::snapshotAppendSealed_(SegMap::iterator sealed) {
-    // The new entry goes to slot snapEnd_.  In place only when no published
-    // snapshot can cover that slot (snapEnd_ == snapClaimed_) and it fits;
-    // otherwise move the live entries to a fresh store with 2x room (amortized
-    // O(1): the copy happens once per doubling).
-    const std::size_t live = snapEnd_ - snapBegin_;
     // The published entries must mirror every sealed segment but the new one
     // (a log driven before its first publish — never recovered — or any other
-    // drift): else the O(n) rebuild, which also covers the new entry.
+    // drift): else the tail rebuild, which also covers the new entry.
+    const std::size_t live = snapEnd_ - snapBegin_;
     if (segments_.size() < 2 || live != segments_.size() - 2 ||
-        (live > 0 && snapStore_->buf[snapEnd_ - 1].endOffset != sealed->first)) [[unlikely]] {
-        publishSealedSnapshot();
+        (live > 0 && snapAt_(snapEnd_ - 1).endOffset != sealed->first)) [[unlikely]] {
+        publishSealedSnapshotFrom_(sealed->first);
         return;
-    }
-    if (!snapStore_ || snapEnd_ != snapClaimed_ || snapEnd_ == snapStore_->cap) {
-        auto fresh = std::make_shared<SealedSnapshotStore>();
-        fresh->cap = std::max<std::size_t>(64, 2 * (live + 1));
-        fresh->buf.reset(new SegInfo[fresh->cap]);
-        if (live > 0) std::copy(snapStore_->buf.get() + snapBegin_, snapStore_->buf.get() + snapEnd_, fresh->buf.get());
-        snapStore_ = std::move(fresh);
-        snapBegin_ = 0;
-        snapEnd_ = snapClaimed_ = live;
     }
     LogSegment& seg = *sealed->second;
     const int64_t ts = sealedEntryTs(seg, newlySealedMaxTs_);
-    snapStore_->buf[snapEnd_] = SegInfo{sealed->first, seg.sizeBytes(), ts, std::next(sealed)->first, seg.tsLineage()};
-    snapClaimed_ = ++snapEnd_;
+    snapPushBack_(SegInfo{sealed->first, seg.sizeBytes(), ts, std::next(sealed)->first, seg.tsLineage()});
     publishSnapshotView_();
 }
 
 void Log::snapshotDropFront_(std::size_t k) {
     // Retention erases a PREFIX of the sealed segments (N4-LOW-2): the snapshot
     // drops the same prefix — O(1), no entry rewritten.  A mismatch (never
-    // expected) falls back to the full rebuild.
+    // expected) falls back to the rebuild.
     const std::size_t live = snapEnd_ - snapBegin_;
     const std::size_t sealedNow = segments_.empty() ? 0 : segments_.size() - 1;
-    if (snapStore_ && k <= live && live - k == sealedNow &&
-        (sealedNow == 0 || snapStore_->buf[snapBegin_ + k].baseOffset == segments_.begin()->first)) [[likely]] {
+    if (snapDir_ && k <= live && live - k == sealedNow &&
+        (sealedNow == 0 || snapAt_(snapBegin_ + k).baseOffset == segments_.begin()->first)) [[likely]] {
         snapBegin_ += k;
         publishSnapshotView_();
         return;
@@ -376,43 +410,112 @@ void Log::snapshotDropFront_(std::size_t k) {
     publishSealedSnapshot();
 }
 
-void Log::publishSealedSnapshot() {
-    // FULL rebuild (cold paths + compaction installs): a fresh store holding one
-    // entry per sealed segment (all except the last/active), ascending.  Never
-    // touches a published store.  O(segments), one allocation.
-    //
+void Log::publishSealedSnapshot() { publishSealedSnapshotFrom_(INT64_MIN); }
+
+void Log::publishSealedSnapshotFrom_(int64_t fromBase) {
     // Timestamps (CP-8 / CP-5.1 / CRITICAL-1): a segment already published
     // keeps its value (sealed contents are immutable under one object — a
     // rebuilt / rewritten segment is a NEW object with publishedTs unset); a
-    // never-published one takes recover()'s one-time scan value
-    // (recoveryMaxTimestamps_), else 0 (= unknown); never below its floor.
-    const std::size_t n = segments_.size() > 1 ? segments_.size() - 1 : 0;
-    auto fresh = std::make_shared<SealedSnapshotStore>();
-    fresh->cap = std::max<std::size_t>(64, 2 * n);
-    fresh->buf.reset(new SegInfo[fresh->cap]);
-    std::size_t i = 0;
-    if (n > 0) {
-        auto end = std::prev(segments_.end()); // stop before active
-        for (auto it = segments_.begin(); it != end; ++it, ++i) {
-            int64_t scanned = 0;   // MEDIUM-2: 0 is a real value, never "not found"
-            if (it->second->publishedTs() == INT64_MIN) {
-                if (it->first == newlySealedBase_) {
-                    scanned = newlySealedMaxTs_;   // the roll's running max (no file I/O)
-                } else if (auto rm = recoveryMaxTimestamps_.find(it->first); rm != recoveryMaxTimestamps_.end()) {
-                    scanned = rm->second;
-                }
+    // never-published one takes the roll's running max or recover()'s
+    // one-time scan value (recoveryMaxTimestamps_), else 0 (= unknown); never
+    // below its floor.
+    auto entryFor = [this](SegMap::iterator it) {
+        int64_t scanned = 0;   // MEDIUM-2: 0 is a real value, never "not found"
+        if (it->second->publishedTs() == INT64_MIN) {
+            if (it->first == newlySealedBase_) {
+                scanned = newlySealedMaxTs_;   // the roll's running max (no file I/O)
+            } else if (auto rm = recoveryMaxTimestamps_.find(it->first); rm != recoveryMaxTimestamps_.end()) {
+                scanned = rm->second;
             }
-            const int64_t ts = sealedEntryTs(*it->second, scanned);
-            fresh->buf[i] = SegInfo{it->first, it->second->sizeBytes(), ts, std::next(it)->first,
-                                    it->second->tsLineage()};
+        }
+        const int64_t ts = sealedEntryTs(*it->second, scanned);
+        return SegInfo{it->first, it->second->sizeBytes(), ts, std::next(it)->first, it->second->tsLineage()};
+    };
+
+    // 1. Where to start: the entry just below the first one at/above fromBase
+    //    (binary search over the live entries).  Everything before it is
+    //    untouched by the caller's change and stays shared as-is.
+    std::size_t start = snapBegin_;
+    if (snapDir_ && fromBase != INT64_MIN) {
+        std::size_t lo = snapBegin_, hi = snapEnd_;
+        while (lo < hi) {
+            const std::size_t mid = lo + (hi - lo) / 2;
+            if (snapAt_(mid).baseOffset < fromBase) lo = mid + 1; else hi = mid;
+        }
+        start = lo > snapBegin_ ? lo - 1 : snapBegin_;
+    }
+    auto it = segments_.begin();
+    if (start > snapBegin_) {
+        it = segments_.find(snapAt_(start).baseOffset);
+        // The kept prefix must end exactly where the map resumes; otherwise
+        // (never expected) rebuild everything.
+        if (it == segments_.end() || it == segments_.begin() ||
+            std::prev(it)->first != snapAt_(start - 1).baseOffset) {
+            start = snapBegin_;
+            it = segments_.begin();
         }
     }
+    const auto activeIt = segments_.empty() ? segments_.end() : std::prev(segments_.end());
+
+    // 2. Walk: keep entries that compare equal; at the first difference copy-
+    //    on-write that entry's chunk (its prefix) and write the rest fresh.
+    std::size_t i = start;
+    bool diverged = false;
+    auto divergeAt = [this, &diverged](std::size_t at) {
+        diverged = true;
+        // New directory: the chunks wholly below `at` stay shared; the chunk
+        // holding `at` is copied up to `at` (its later slots may be covered by
+        // published snapshots — they are never written again).
+        const std::size_t firstChunk = snapDir_ ? snapBegin_ / kSnapChunkEntries : 0;
+        const std::size_t atChunk    = at / kSnapChunkEntries;
+        std::shared_ptr<SealedSnapshotChunk> partial;
+        if (snapDir_ && at % kSnapChunkEntries != 0) {
+            partial = std::make_shared<SealedSnapshotChunk>();
+            const SealedSnapshotChunk& src = *snapDir_->chunks[atChunk];
+            std::copy(src.e, src.e + at % kSnapChunkEntries, partial->e);
+        }
+        const std::size_t keep = snapDir_ ? atChunk - firstChunk : 0;
+        snapEnd_ = atChunk * kSnapChunkEntries;   // everything from atChunk on is re-pushed
+        if (!snapDir_) { snapBegin_ = snapEnd_ = 0; }
+        snapRebaseDir_(keep, segments_.size() / kSnapChunkEntries + 1);
+        if (partial) {
+            snapDir_->chunks[snapEnd_ / kSnapChunkEntries] = std::move(partial);
+            snapEnd_ += at % kSnapChunkEntries;
+        }
+    };
+    if (!snapDir_) divergeAt(0);
+    for (; it != activeIt && it != segments_.end(); ++it) {
+        const SegInfo e = entryFor(it);
+        if (!diverged && i < snapEnd_) {
+            if (snapAt_(i) == e) { ++i; continue; }
+            divergeAt(i);
+        }
+        // (i == snapEnd_ without a divergence: a pure tail append — the slot is
+        // covered by no published snapshot, written in place.)
+        snapPushBack_(e);
+        ++snapRebuiltEntries_;
+        ++i;
+    }
+    if (!diverged && i < snapEnd_) divergeAt(i);   // trailing entries removed (truncation)
     // CP-5.1: the recovery scan is consumed by the first publish after recover().
     recoveryMaxTimestamps_.clear();
-    snapStore_ = std::move(fresh);
-    snapBegin_ = 0;
-    snapEnd_ = snapClaimed_ = i;
+    ++snapRebuilds_;
     publishSnapshotView_();
+}
+
+bool Log::snapshotMatchesSegmentsForTest() const {
+    const auto snap = sealedSegmentSnapshot();
+    const std::size_t n = segments_.size() > 1 ? segments_.size() - 1 : 0;
+    if (!snap || snap->size() != n) return false;
+    std::size_t i = 0;
+    for (auto it = segments_.begin(); i < n; ++it, ++i) {
+        const SegInfo& si = (*snap)[i];
+        if (si.baseOffset != it->first || si.sizeBytes != it->second->sizeBytes() ||
+            si.endOffset != std::next(it)->first || si.lineage != it->second->tsLineage() ||
+            si.largestTimestamp != it->second->publishedTs())
+            return false;
+    }
+    return true;
 }
 // ---------------------------------------------------------------------------
 // Ready pool (hotpath-A F1 + F2).
@@ -425,7 +528,10 @@ int Log::provisionReady(std::size_t depth) {
     if (depth == 0) depth = 1;
     if (depth > kReadyRingCapacity) depth = kReadyRingCapacity;
     int built = 0;
-    for (;;) {
+    // At most `depth` builds per call: the owner may consume as fast as this
+    // thread builds, and an unbounded loop would starve the caller's other
+    // duties for this log (finalizeStagingRenames between refills).
+    for (std::size_t b = 0; b < depth; ++b) {
         const std::size_t tail = readyTail_.load(std::memory_order_relaxed);
         const std::size_t head = readyHead_.load(std::memory_order_acquire);
         if (tail - head >= depth) break;
@@ -463,7 +569,9 @@ LogSegment* Log::takeReady_() noexcept {
 
 void Log::installNextSegment(int64_t base) {
     // OWNER thread only.
-    if (LogSegment* prepared = takeReady_()) {
+    // A provisioned log adopts only when its rename can be queued (a FORCED
+    // roll past the overshoot cap with a full ring creates inline instead).
+    if (LogSegment* prepared = (!provisioned_ || renameRoom_()) ? takeReady_() : nullptr) {
         // ADOPT — ZERO syscalls: pure in-memory rebase.  The staging .log/.index
         // keep their temp names on disk for now; the disk rename (staging →
         // <base>.{log,index}) is deferred to the background thread.
@@ -473,9 +581,8 @@ void Log::installNextSegment(int64_t base) {
         install_(base, std::move(seg));
         // The deferred rename (SPSC; rolls are rare so the ring never fills in
         // practice).  A full ring: rename synchronously (legacy logs only).
-        // A provisioned log cannot overflow it: its provisioner finalizes the
-        // log's renames every time it refills it, and at most kMaxProvisionDepth
-        // (< kRenameRingCapacity) segments are adopted in between.
+        // A provisioned log never gets here with a full ring: maybeRoll defers
+        // its roll until the ring has room (rollBlockedNow_ / renameRoom_).
         static_assert(kRenameRingCapacity > kMaxProvisionDepth);
         if (!enqueueStagingRename(base, stagingSeq) && !provisioned_) {
             renameStagingToBase(stagingSeq, base);
@@ -496,6 +603,7 @@ void Log::installNextSegment(int64_t base) {
             dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_,
             /*prefaultIndex*/false, /*eagerReadMap*/true);
         seg->preallocate(rollBytes_);
+        ++ownerPreallocs_;
         install_(base, std::move(seg));
     }
     // MEDIUM-2: a new directory entry (the provisioner created the adopted
@@ -559,22 +667,22 @@ int Log::finalizeStagingRenames() {
     const std::size_t head = renameReqHead_.load(std::memory_order_relaxed);
     const std::size_t tail = renameReqTail_.load(std::memory_order_acquire);
     int count = 0;
-    for (std::size_t i = head; i != tail; ++i) {
-        const auto rr = renameReqRing_[i & kRenameRingMask];
-        renameStagingToBase(rr.seq, rr.base);
-        // Publish the completed base to the append-thread done-ring (best effort:
-        // if the done-ring is full the append thread will still work — the fd/mmap
-        // are name-agnostic; logPath_ just stays at the staging name until a later
-        // reconcile, and recovery rebuilds correctly regardless).
+    std::size_t i = head;
+    for (; i != tail; ++i) {
+        // hotpath-A: a request is consumed only when its completion can be
+        // published — a dropped completion would leave the owner's logPath_ at
+        // the staging name for good (and a cold path re-opening it by that
+        // path would fail the log).  A full done ring: retried next call.
         const std::size_t dt = renameDoneTail_.load(std::memory_order_relaxed);
         const std::size_t dh = renameDoneHead_.load(std::memory_order_acquire);
-        if (dt - dh < kRenameRingCapacity) {
-            renameDoneRing_[dt & kRenameRingMask] = rr.base;
-            renameDoneTail_.store(dt + 1, std::memory_order_release);
-        }
+        if (dt - dh >= kRenameRingCapacity) break;
+        const auto rr = renameReqRing_[i & kRenameRingMask];
+        renameStagingToBase(rr.seq, rr.base);
+        renameDoneRing_[dt & kRenameRingMask] = rr.base;
+        renameDoneTail_.store(dt + 1, std::memory_order_release);
         ++count;
     }
-    if (count > 0) renameReqHead_.store(tail, std::memory_order_release);
+    if (count > 0) renameReqHead_.store(i, std::memory_order_release);
     return count;
 }
 
@@ -588,7 +696,7 @@ int Log::drainStagingRenamesDone() {
     for (std::size_t i = head; i != tail; ++i) {
         const int64_t base = renameDoneRing_[i & kRenameRingMask];
         auto it = segments_.find(base);
-        if (it != segments_.end()) it->second->setLogPath(logPathForBase(base));
+        if (it != segments_.end()) it->second->setCanonicalLogPath(dir_, base);   // no allocation
         ++count;
     }
     if (count > 0) renameDoneHead_.store(tail, std::memory_order_release);
@@ -1252,14 +1360,30 @@ void Log::install_(int64_t base, std::unique_ptr<LogSegment> seg) {
         if (seg->dirEntryGen() == 0 && it->second) seg->setDirEntryGen(it->second->dirEntryGen());
         retire_(std::move(it->second));
         it->second = std::move(seg);
+    } else if (!spareSegNodes_.empty()) {
+        // hotpath-A: reuse a released node (no allocation on the roll path).
+        SegMap::node_type nh = std::move(spareSegNodes_.back());
+        spareSegNodes_.pop_back();
+        nh.key()    = base;
+        nh.mapped() = std::move(seg);
+        segments_.insert(std::move(nh));
     } else {
         segments_.emplace(base, std::move(seg));
     }
 }
 
+Log::SegMap::iterator Log::eraseKeepNode_(SegMap::iterator it) noexcept {
+    auto next = std::next(it);
+    SegMap::node_type nh = segments_.extract(it);
+    // Only an EMPTY node is kept (its segment was moved out / handed off); the
+    // vector never grows past its reservation (no allocation here either).
+    if (!nh.mapped() && spareSegNodes_.size() < spareSegNodes_.capacity()) spareSegNodes_.push_back(std::move(nh));
+    return next;
+}
+
 Log::SegMap::iterator Log::erase_(SegMap::iterator it) {
     retire_(std::move(it->second));
-    return segments_.erase(it);
+    return eraseKeepNode_(it);
 }
 
 void Log::retire_(std::unique_ptr<LogSegment> seg) {
@@ -1518,9 +1642,9 @@ bool Log::truncateTo(int64_t truncateOffset) {
     persistAtMost_(logEndOffset_);   // E1d: a mid-batch cut rounds the LEO below truncateOffset
     // Log-snapshot review MAJOR-1: segments_ changed (later segments erased, a
     // formerly sealed segment rebuilt as the ACTIVE one) — republish so the
-    // cleaner's activeBase / sealed set match.  The only earlier publish (inside
-    // the first persistAtMost_) ran BEFORE the erase.
-    publishSealedSnapshot();
+    // cleaner's activeBase / sealed set match.  hotpath-A F4: only the tail from
+    // the (new) active segment is rebuilt — the sealed prefix below it is shared.
+    publishSealedSnapshotFrom_(activeSegment().baseOffset());
     return true;
 }
 
@@ -1625,7 +1749,8 @@ void Log::reloadSegment(int64_t baseOffset) {
     reloadSegmentNoPublish_(baseOffset);
     // Log-snapshot review audit: a direct (synchronous-cleaner) reload mutates
     // segments_ too — the cleaner thread must see the new size / removal.
-    publishSealedSnapshot();
+    // hotpath-A F4: only the tail from this segment is rebuilt.
+    publishSealedSnapshotFrom_(baseOffset);
 }
 
 void Log::reloadSegmentNoPublish_(int64_t baseOffset) {
@@ -1702,7 +1827,7 @@ int Log::deleteOldSegments(int64_t retainBytes, int64_t highWatermark) {
     }
     // Log-snapshot review audit: segments_ changed — the cleaner must not keep
     // seeing (and re-targeting) the deleted bases.
-    if (deleted > 0) publishSealedSnapshot();
+    if (deleted > 0) snapshotDropFront_(static_cast<std::size_t>(deleted));   // hotpath-A F4: a prefix
     return deleted;
 }
 
@@ -1785,7 +1910,7 @@ bool Log::applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBo
         auto m = std::next(it);
         for (std::size_t k = 1; k < n; ++k) {
             msgs[1 + k].kind = MsgKind::Dispose; msgs[1 + k].base = m->first; msgs[1 + k].obj = m->second.release();
-            m = segments_.erase(m);
+            m = eraseKeepNode_(m);
         }
     } else {
         // Every record removed: drop all members (their offsets read as a gap,
@@ -1794,7 +1919,7 @@ bool Log::applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBo
         auto m = it;
         for (std::size_t k = 0; k < n; ++k) {
             msgs[1 + k].kind = MsgKind::Dispose; msgs[1 + k].base = m->first; msgs[1 + k].obj = m->second.release();
-            m = segments_.erase(m);
+            m = eraseKeepNode_(m);
         }
     }
     postMsgs_(msgs.data(), 1 + n);
@@ -1981,6 +2106,18 @@ bool Log::ownerDrainAllowed_(bool& pause) noexcept {
 }
 
 bool Log::beginColdPath_() noexcept {
+    // hotpath-A: never touch a segment by path while its staging -> <base>
+    // rename is in flight (the provisioner renames promptly; the in-memory
+    // logPath_ only follows once the owner drains the done ring).  Queued
+    // renames: defer (the caller retries — no wait).  None queued: every
+    // completed rename is in the done ring now (the provisioner publishes it
+    // before releasing the request slot) — apply them, then go on.
+    {
+        const std::size_t reqTail = renameReqTail_.load(std::memory_order_relaxed);   // owner = producer
+        const std::size_t reqHead = renameReqHead_.load(std::memory_order_acquire);
+        if (reqHead != reqTail) return false;
+        (void)drainStagingRenamesDone();
+    }
     if (fileOpsQuiescent()) { pauseSwapPost_ = pauseDropPost_ = false; return true; }
     pauseSwapPost_ = pauseDropPost_ = true;   // the next drains post nothing: let the cleaner catch up
     return false;
@@ -2155,8 +2292,10 @@ int Log::drainCleanerSwaps(int64_t maxBaseBound) {
 
 int Log::drainSwapSlots_(std::size_t head, std::size_t tail, int64_t maxBaseBound) {
     int groupsApplied = 0;
+    int64_t lowestBase = INT64_MAX;   // hotpath-A F4: the snapshot is rebuilt from here
     for (std::size_t i = head; i != tail; ) {
         const SegRef ref = swapRing_[i & kSwapRingMask];
+        if (ref.base < lowestBase) lowestBase = ref.base;
         if (ref.groupSize > 0) {
             // Fix round 2: a deferred group — the producer published all of its
             // slots with one release-store, so [i, i + groupSize) is complete.
@@ -2182,8 +2321,9 @@ int Log::drainSwapSlots_(std::size_t head, std::size_t tail, int64_t maxBaseBoun
         // Release new head so the cleaner can reuse those ring slots.
         swapHead_.store(tail, std::memory_order_release);
         // segments_ changed (segment reloaded or dropped); refresh the snapshot
-        // so the cleaner thread sees correct sizes on the next scan.
-        publishSealedSnapshot();
+        // so the cleaner thread sees correct sizes on the next scan — hotpath-A
+        // F4: only the tail from the lowest affected base is rebuilt.
+        publishSealedSnapshotFrom_(lowestBase);
     }
     return count;
 }
@@ -2243,7 +2383,7 @@ int Log::drainRetentionDeletes(int64_t maxEndBound) {
         m.kind = MsgKind::RetentionDrop;
         m.base = ref.base;
         m.obj  = it->second.release();
-        segments_.erase(it);
+        (void)eraseKeepNode_(it);
         m.logStartAfter = segments_.begin()->first;
         postMsgs_(&m, 1);
         ++count;

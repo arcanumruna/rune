@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <iomanip>
+#include <cstdio>
 #include <sstream>
 #include <filesystem>
 #include <system_error>
@@ -73,6 +74,9 @@ std::unique_ptr<LogSegment> LogSegment::prepareStaging(
     seg->nextOffset_        = 0;
     seg->staging_           = true;
     seg->stagingSeq_        = stagingSeq;
+    // hotpath-A: room for the canonical <dir>/<20-digit base>.log the owner
+    // composes in place at the rename-done drain (setCanonicalLogPath).
+    seg->logPath_.reserve(stagingLogPath.size() + 32);
     seg->logPath_           = stagingLogPath;
     const std::string& idxPath = stagingIndexPath;
     seg->log_.open(seg->logPath_, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
@@ -118,6 +122,16 @@ void LogSegment::adoptAsActive(int64_t base) {
 }
 
 void LogSegment::setLogPath(const std::string& p) noexcept { logPath_ = p; pathPending_ = false; }
+
+void LogSegment::setCanonicalLogPath(const std::string& dir, int64_t base) noexcept {
+    char digits[24];
+    std::snprintf(digits, sizeof digits, "%020lld", static_cast<long long>(base));
+    logPath_.assign(dir);
+    logPath_.push_back('/');
+    logPath_.append(digits);
+    logPath_.append(".log");
+    pathPending_ = false;
+}
 
 LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes,
                        int32_t indexMaxBytes, bool prefaultIndex, bool eagerReadMap)

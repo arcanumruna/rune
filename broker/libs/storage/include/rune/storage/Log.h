@@ -1,9 +1,12 @@
 #pragma once
 #include <rune/storage/LogSegment.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <compare>
 #include <cstdint>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <utility>
@@ -38,47 +41,104 @@ struct SegInfo {
     // more — the persisted recovery point moves about once per roll and would
     // force a republish of every entry.  The cleaner asks the log:
     // Log::cleanerCompactionAllowedThrough(entry.endOffset).
+    friend bool operator==(const SegInfo&, const SegInfo&) = default;
 };
 
-/// hotpath-A F4: the backing store of sealed-segment snapshots.  A growable
-/// array SHARED by every snapshot published from it: the owner appends in place
-/// only at slots no published snapshot covers (>= every published end), and
-/// never rewrites a published slot — a change to published entries (compaction,
-/// truncation, reload) builds a NEW store.  Readers only read [begin, end) of
-/// their own snapshot, so an in-place append never races a reader.
-struct SealedSnapshotStore {
-    std::unique_ptr<SegInfo[]> buf;
-    std::size_t                cap = 0;
+class SealedSegmentSnapshot;
+
+/// hotpath-A F4 (backlog D16): sealed-segment snapshots are a PERSISTENT,
+/// CHUNKED structure — publishing one never copies the entry list.
+///
+///  * Entries live in fixed-size chunks (kSnapChunkEntries SegInfo each).  A
+///    chunk is SHARED by every directory (and so every snapshot) that covers
+///    it; the owner writes a slot in place ONLY when no published snapshot
+///    covers it (at or beyond every published end), and never rewrites a
+///    published slot.  A change to published entries (compaction install,
+///    truncation, reload) copies-on-write the chunk holding the first changed
+///    entry and builds the rest of the TAIL fresh — the prefix stays shared.
+///  * A directory (SealedSnapshotDir) maps chunk numbers to chunks and holds a
+///    fixed pool of snapshot HEADERS: a publish fills the next header and hands
+///    it out through an ALIASING shared_ptr of the directory — no allocation.
+///    A new directory (O(segments / kSnapChunkEntries) pointer copies) is
+///    built only when its chunk slots or its header pool run out.
+///
+/// So a roll appends ONE entry, a retention drop advances the front (both O(1),
+/// allocation-free except one chunk per kSnapChunkEntries rolls and one
+/// directory per kSnapHeadersPerDir publishes); truncation / compaction /
+/// reload rebuild only the tail from the first changed entry.
+inline constexpr std::size_t kSnapChunkEntries  = 256;
+inline constexpr std::size_t kSnapHeadersPerDir = 1024;
+struct SealedSnapshotChunk {
+    SegInfo e[kSnapChunkEntries];
 };
 
-/// Immutable, contiguous view of the sealed segments (all but the active one),
-/// ascending by base offset.  Vector-like read API (size / [] / iteration /
-/// front / back; iterators are pointers).  Publishing one is O(1) amortized:
-/// a roll appends ONE entry in place, a retention drop advances the front;
-/// only a compaction install / truncation / reload rebuilds the store.
+/// Immutable view of the sealed segments (all but the active one), ascending
+/// by base offset.  Vector-like read API (size / [] / random-access iteration
+/// / front / back).  Valid while the shared_ptr it was obtained through lives.
 class SealedSegmentSnapshot {
 public:
-    using value_type     = SegInfo;
-    using size_type      = std::size_t;
-    using const_iterator = const SegInfo*;
-    using iterator       = const SegInfo*;
+    using value_type = SegInfo;
+    using size_type  = std::size_t;
+    class const_iterator {
+    public:
+        using iterator_category = std::random_access_iterator_tag;
+        using value_type        = SegInfo;
+        using difference_type   = std::ptrdiff_t;
+        using pointer           = const SegInfo*;
+        using reference         = const SegInfo&;
+        const_iterator() = default;
+        const_iterator(const SealedSegmentSnapshot* s, std::size_t i) noexcept : s_(s), i_(i) {}
+        reference operator*() const noexcept { return (*s_)[i_]; }
+        pointer operator->() const noexcept { return &(*s_)[i_]; }
+        reference operator[](difference_type d) const noexcept { return (*s_)[i_ + static_cast<std::size_t>(d)]; }
+        const_iterator& operator++() noexcept { ++i_; return *this; }
+        const_iterator operator++(int) noexcept { auto t = *this; ++i_; return t; }
+        const_iterator& operator--() noexcept { --i_; return *this; }
+        const_iterator operator--(int) noexcept { auto t = *this; --i_; return t; }
+        const_iterator& operator+=(difference_type d) noexcept { i_ += static_cast<std::size_t>(d); return *this; }
+        const_iterator& operator-=(difference_type d) noexcept { i_ -= static_cast<std::size_t>(d); return *this; }
+        friend const_iterator operator+(const_iterator a, difference_type d) noexcept { a += d; return a; }
+        friend const_iterator operator+(difference_type d, const_iterator a) noexcept { a += d; return a; }
+        friend const_iterator operator-(const_iterator a, difference_type d) noexcept { a -= d; return a; }
+        friend difference_type operator-(const_iterator a, const_iterator b) noexcept {
+            return static_cast<difference_type>(a.i_) - static_cast<difference_type>(b.i_);
+        }
+        friend bool operator==(const_iterator a, const_iterator b) noexcept { return a.i_ == b.i_; }
+        friend auto operator<=>(const_iterator a, const_iterator b) noexcept { return a.i_ <=> b.i_; }
+    private:
+        const SealedSegmentSnapshot* s_ = nullptr;
+        std::size_t                  i_ = 0;
+    };
+    using iterator = const_iterator;
+
     SealedSegmentSnapshot() = default;
-    SealedSegmentSnapshot(std::shared_ptr<const SealedSnapshotStore> store, const SegInfo* first,
-                          std::size_t n) noexcept
-        : store_(std::move(store)), data_(first), n_(n) {}
+    SealedSegmentSnapshot(const struct SealedSnapshotDir* dir, std::size_t first, std::size_t n) noexcept
+        : dir_(dir), first_(first), n_(n) {}
     [[nodiscard]] std::size_t size()  const noexcept { return n_; }
     [[nodiscard]] bool        empty() const noexcept { return n_ == 0; }
-    [[nodiscard]] const SegInfo* data()  const noexcept { return data_; }
-    [[nodiscard]] const SegInfo* begin() const noexcept { return data_; }
-    [[nodiscard]] const SegInfo* end()   const noexcept { return data_ + n_; }
-    [[nodiscard]] const SegInfo& operator[](std::size_t i) const noexcept { return data_[i]; }
-    [[nodiscard]] const SegInfo& front() const noexcept { return data_[0]; }
-    [[nodiscard]] const SegInfo& back()  const noexcept { return data_[n_ - 1]; }
+    [[nodiscard]] const_iterator begin() const noexcept { return {this, 0}; }
+    [[nodiscard]] const_iterator end()   const noexcept { return {this, n_}; }
+    [[nodiscard]] inline const SegInfo& operator[](std::size_t i) const noexcept;
+    [[nodiscard]] const SegInfo& front() const noexcept { return (*this)[0]; }
+    [[nodiscard]] const SegInfo& back()  const noexcept { return (*this)[n_ - 1]; }
 private:
-    std::shared_ptr<const SealedSnapshotStore> store_;   ///< keeps the entries alive
-    const SegInfo* data_ = nullptr;
-    std::size_t    n_    = 0;
+    const struct SealedSnapshotDir* dir_ = nullptr;   ///< kept alive by the aliasing shared_ptr
+    std::size_t first_ = 0;   ///< absolute entry index in dir_
+    std::size_t n_     = 0;
 };
+
+/// See kSnapChunkEntries.  Entry `a` (absolute) is chunks[a / K]->e[a % K].
+struct SealedSnapshotDir {
+    std::unique_ptr<std::shared_ptr<SealedSnapshotChunk>[]> chunks;
+    std::size_t chunkCap = 0;
+    std::unique_ptr<SealedSegmentSnapshot[]> headers;   ///< aliasing-publish targets
+    std::size_t headerCap = 0;
+};
+
+inline const SegInfo& SealedSegmentSnapshot::operator[](std::size_t i) const noexcept {
+    const std::size_t a = first_ + i;
+    return dir_->chunks[a / kSnapChunkEntries]->e[a % kSnapChunkEntries];
+}
 
 /// On-disk append-only log: a sequence of LogSegment files in a directory.
 ///
@@ -221,6 +281,22 @@ public:
     [[nodiscard]] bool rollDeferred() const noexcept {
         if (segments_.empty() || segments_.rbegin()->second->sizeBytes() < rollBytes_) [[likely]] return false;
         return rollBlockedNow_();
+    }
+    /// hotpath-A F4 (tests): snapshot tail rebuilds / entries they wrote, and
+    /// whether the published snapshot equals the sealed segments exactly.
+    [[nodiscard]] uint64_t snapshotRebuildsForTest() const noexcept { return snapRebuilds_; }
+    [[nodiscard]] uint64_t snapshotRebuiltEntriesForTest() const noexcept { return snapRebuiltEntries_; }
+    [[nodiscard]] bool snapshotMatchesSegmentsForTest() const;
+    /// F1 (tests): block reservations (fallocate) the OWNER made for a next
+    /// segment at roll — 0 for a provisioned log (the provisioner reserves).
+    [[nodiscard]] uint64_t ownerPreallocsForTest() const noexcept { return ownerPreallocs_; }
+    /// Deferred rolls forced past the overshoot cap (blocking, correct).
+    [[nodiscard]] uint64_t forcedRollsForTest() const noexcept { return forcedRolls_; }
+    /// A deferred roll is forced once the active segment reaches this size.
+    [[nodiscard]] int64_t maxDeferredRollBytesForTest() const noexcept { return maxDeferredRollBytes_(); }
+    [[nodiscard]] int64_t segmentSizeForTest(int64_t base) const noexcept {
+        auto it = segments_.find(base);
+        return it == segments_.end() ? -1 : it->second->sizeBytes();
     }
     /// Rolls deferred by rollDeferred()'s condition (appends that overshot).
     [[nodiscard]] uint64_t rollDeferralsForTest() const noexcept { return rollDeferrals_; }
@@ -878,6 +954,14 @@ private:
     /// publishSealedSnapshot() call consumes it so it does not persist past recovery.
     std::map<int64_t, int64_t> recoveryMaxTimestamps_;
     SegMap segments_;
+    /// hotpath-A: recycled map nodes — a roll's install_ reuses a node a
+    /// retention drop / compaction / erase_ released, so a roll in steady
+    /// state (with retention) allocates nothing.  Reserved once (ctor).
+    static constexpr std::size_t kSpareSegNodes = 64;
+    std::vector<SegMap::node_type> spareSegNodes_;
+    /// Erase `it` (its LogSegment already moved out / released), keeping the
+    /// node for reuse.  Returns the next iterator.
+    SegMap::iterator eraseKeepNode_(SegMap::iterator it) noexcept;
     uint64_t segInstallGen_ = 0;   ///< F15 S4 N1: segment install generation
 
     // CP-6/race-fix: atomic snapshot of sealed segment {baseOffset, sizeBytes}.
@@ -893,19 +977,35 @@ private:
     // only affected when a roll occurs (infrequent).
     mutable std::shared_ptr<const SealedSegmentSnapshot> sealedSnapshot_{
         std::make_shared<SealedSegmentSnapshot>()};
-    // hotpath-A F4: the owner's side of the snapshot store (see
-    // SealedSnapshotStore): live entries are [snapBegin_, snapEnd_); slots
-    // below snapClaimed_ may be covered by a published snapshot and are never
-    // rewritten.  Owner thread only.
-    std::shared_ptr<SealedSnapshotStore> snapStore_;
-    std::size_t snapBegin_ = 0, snapEnd_ = 0, snapClaimed_ = 0;
-    /// Publish [snapBegin_, snapEnd_) as the cleaner's snapshot (one small
-    /// header allocation + the atomic store).
+    // hotpath-A F4: the owner's side of the chunked snapshot (see
+    // kSnapChunkEntries).  Live entries are the absolute indices
+    // [snapBegin_, snapEnd_) of snapDir_; every published snapshot of any
+    // directory sharing a chunk ends at or below snapEnd_, so slots >= snapEnd_
+    // are written in place.  Owner thread only.
+    std::shared_ptr<SealedSnapshotDir> snapDir_;
+    std::size_t snapBegin_ = 0, snapEnd_ = 0, snapHeadersUsed_ = 0;
+    uint64_t    snapRebuilds_ = 0;        ///< tail rebuilds (tests)
+    uint64_t    snapRebuiltEntries_ = 0;  ///< entries written by tail rebuilds (tests)
+    [[nodiscard]] const SegInfo& snapAt_(std::size_t a) const noexcept {
+        return snapDir_->chunks[a / kSnapChunkEntries]->e[a % kSnapChunkEntries];
+    }
+    /// A fresh directory holding the live chunks of the current one, rebased
+    /// so the first live chunk is chunk 0, with room for `extraChunks` more.
+    void snapRebaseDir_(std::size_t keepChunks, std::size_t extraChunks);
+    /// Write entry `e` at absolute slot snapEnd_ (unpublished) and advance.
+    void snapPushBack_(const SegInfo& e);
+    /// Publish [snapBegin_, snapEnd_) — fills the directory's next header and
+    /// stores an aliasing shared_ptr (no allocation unless the pool is spent).
     void publishSnapshotView_();
-    /// Roll: append the newly sealed segment's entry (O(1) amortized).
+    /// Roll: append the newly sealed segment's entry (O(1)).
     void snapshotAppendSealed_(SegMap::iterator sealed);
     /// Retention: the front `k` sealed segments were erased (O(1)).
     void snapshotDropFront_(std::size_t k);
+    /// Rebuild the snapshot from the first entry whose segment may have changed
+    /// — segments at or above `fromBase` (and the entry just below it: its end
+    /// offset / timestamp floor may have moved).  Entries that compare equal
+    /// are kept (shared); the rest of the tail is written fresh.
+    void publishSealedSnapshotFrom_(int64_t fromBase);
     /// The cleaner's view of persistedRp_ (single writer: the owner).
     alignas(64) std::atomic<int64_t> cleanerPersistedRp_{kRecoveryPointUnknown};
     void setPersistedRp_(int64_t v) noexcept {
@@ -1076,12 +1176,28 @@ private:
     bool          provisioned_ = false;   ///< see setProvisioning (owner config)
     ProvisionHook provisionHook_{};
     uint64_t      rollDeferrals_ = 0;     ///< see rollDeferralsForTest (owner)
+    uint64_t      ownerPreallocs_ = 0;    ///< see ownerPreallocsForTest (owner)
+    uint64_t      forcedRolls_    = 0;    ///< see forcedRollsForTest (owner)
+    /// Overshoot cap of a deferred roll: rollBytes + clamp(rollBytes, 1 MiB,
+    /// 256 MiB) — far below the 2 GiB segment position limit.
+    [[nodiscard]] int64_t maxDeferredRollBytes_() const noexcept {
+        return rollBytes_ + std::clamp<int64_t>(rollBytes_, int64_t{1} << 20, int64_t{256} << 20);
+    }
+
+    /// Owner: the staging-rename request ring has a free slot.
+    [[nodiscard]] bool renameRoom_() const noexcept {
+        return renameReqTail_.load(std::memory_order_relaxed) - renameReqHead_.load(std::memory_order_acquire) <
+               kRenameRingCapacity;
+    }
     /// Owner: take the oldest ready segment (nullptr = none).
     LogSegment* takeReady_() noexcept;
     /// rollDeferred() minus the size check.
     [[nodiscard]] bool rollBlockedNow_() const noexcept {
         if (deferSealSync_ && pendingSealCount_ >= kMaxPendingSeals) return true;   // F3
-        return provisioned_ && !readyAvailable();                                     // F2
+        // F2: no ready segment — or no room to queue its staging -> base rename
+        // (an adoption must never drop its rename: the segment would keep its
+        // staging name / pathPending for good and retention would stall).
+        return provisioned_ && (!readyAvailable() || !renameRoom_());
     }
 
     /// Adopt the oldest ready segment as the active segment at `base` (in-memory;
