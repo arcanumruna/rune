@@ -6,7 +6,11 @@ add_library(rune_storage src/dummy.cpp src/MappedFile.cpp src/OffsetIndex.cpp sr
     src/ProducePath.cpp)
 target_include_directories(rune_storage PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        # hotpath-A review M2: the ready ring is rune::consensus::ControlRing
+        # (header-only agrona ring copy) — no hand-rolled atomics in storage.
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../consensus/include>
         ${RUNE_PROTOCOL_INCLUDE})
+target_link_libraries(rune_storage PUBLIC aeron::aeron)
 # ProducePath.cpp uses spdlog (warn/error/debug logging).
 find_package(spdlog QUIET)
 if(spdlog_FOUND)
@@ -15,7 +19,7 @@ endif()
 
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
-    add_executable(rune_storage_tests tests/storage/SmokeTest.cpp tests/storage/MappedFileTest.cpp tests/storage/OffsetIndexTest.cpp tests/storage/LogSegmentTest.cpp tests/storage/LogTest.cpp tests/storage/RetentionTest.cpp tests/storage/LeaderEpochCacheTest.cpp tests/storage/LeaderEpochCachePersistTest.cpp tests/storage/ProducerStateManagerTest.cpp tests/storage/PartitionApiTest.cpp tests/storage/OffsetMapTest.cpp tests/storage/LogCleanerTest.cpp tests/storage/SkimpyOffsetMapTest.cpp tests/storage/LogReadViewTest.cpp tests/storage/ThrottlerTest.cpp tests/storage/CleanerOffsetCheckpointTest.cpp tests/storage/ProducerIdScanTest.cpp tests/storage/RecoveryPointTest.cpp)
+    add_executable(rune_storage_tests tests/storage/SmokeTest.cpp tests/storage/MappedFileTest.cpp tests/storage/OffsetIndexTest.cpp tests/storage/LogSegmentTest.cpp tests/storage/LogTest.cpp tests/storage/RetentionTest.cpp tests/storage/LeaderEpochCacheTest.cpp tests/storage/LeaderEpochCachePersistTest.cpp tests/storage/ProducerStateManagerTest.cpp tests/storage/PartitionApiTest.cpp tests/storage/OffsetMapTest.cpp tests/storage/LogCleanerTest.cpp tests/storage/SkimpyOffsetMapTest.cpp tests/storage/LogReadViewTest.cpp tests/storage/ThrottlerTest.cpp tests/storage/CleanerOffsetCheckpointTest.cpp tests/storage/ProducerIdScanTest.cpp tests/storage/RecoveryPointTest.cpp tests/storage/SegmentLifecycleHotpathTest.cpp)
     add_executable(rune_in_memory_log_tests tests/storage/InMemoryLogTest.cpp
         tests/storage/InMemoryLogReadViewTest.cpp)
     target_link_libraries(rune_in_memory_log_tests PRIVATE rune_storage GTest::gtest_main)

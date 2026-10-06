@@ -50,6 +50,7 @@ public:
     M2ORingBuffer& operator=(const M2ORingBuffer&) = delete;
 
     [[nodiscard]] aeron::util::index_t capacity()     const { return m_capacity; }
+    [[nodiscard]] aeron::util::index_t headPositionIndex() const { return m_headPositionIndex; }
     [[nodiscard]] aeron::util::index_t maxMsgLength() const { return m_maxMsgLength; }
 
     /// Raw writable base pointer — combine with a tryClaim() offset for a zero-copy

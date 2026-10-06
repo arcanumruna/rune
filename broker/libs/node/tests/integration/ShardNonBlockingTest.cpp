@@ -23,6 +23,8 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/ITxnRequestHandler.h>
 #include <rune/node/ShardAgent.h>
+#include <rune/node/SegmentProvisionerAgent.h>
+#include <rune/node/ParkUntilWorkIdle.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/WorkerOp.h>
@@ -3126,7 +3128,7 @@ TEST_P(StrictPlacementRegression, RecoveryPointCheckpointIsAsyncAfterSealComplet
     EXPECT_EQ(s.w.recoveryPointSubmitsForTest(), 1u) << "ONE write+fdatasync request";
     EXPECT_EQ(s.log->persistedRecoveryPoint(), 0) << "the persisted R moved at submit";
     ASSERT_FALSE(s.log->sealedSegmentSnapshot()->empty());
-    EXPECT_FALSE(s.log->sealedSegmentSnapshot()->front().belowRecoveryPoint)
+    EXPECT_FALSE(s.log->cleanerCompactionAllowedThrough(s.log->sealedSegmentSnapshot()->front().endOffset))
         << "the cleaner gate opened before the checkpoint was durable";
     s.w.setReapPausedForTest(false);
     for (int i = 0; i < kCap && s.log->persistedRecoveryPoint() < bBase; ++i) {
@@ -3137,7 +3139,7 @@ TEST_P(StrictPlacementRegression, RecoveryPointCheckpointIsAsyncAfterSealComplet
     EXPECT_EQ(s.w.recoveryPointSubmitsForTest(), 1u);
     EXPECT_EQ(s.log->recoveryCheckpointStage(), RpStage::Idle);
     EXPECT_EQ(s.log->syncCallsForTest(), 0u) << "no inline fsync on the worker loop";
-    EXPECT_TRUE(s.log->sealedSegmentSnapshot()->front().belowRecoveryPoint)
+    EXPECT_TRUE(s.log->cleanerCompactionAllowedThrough(s.log->sealedSegmentSnapshot()->front().endOffset))
         << "the cleaner may now compact the durable sealed segment";
     // Steady state: no further checkpoint without a new boundary crossing.
     const uint64_t settled = s.w.recoveryPointSubmitsForTest();
@@ -3317,4 +3319,187 @@ TEST(ShardNonBlockingRegression, ReownedLogKeepsStrictSealGateUntilRoutedSealCom
     bool acked3 = false;
     for (const auto& r : a.rets) acked3 = acked3 || r.correlationId == 3;
     EXPECT_TRUE(acked3) << "the Strict ack after the re-own never fired";
+}
+
+// ============================================================================
+// hotpath-A review M4 — the SegmentProvisionerAgent's memory-safety protocol.
+// It dereferences raw Log* taken from a ring: only logs of its acked replica
+// view are ever touched, and a removed replica is freed only after the
+// provisioner (as well as the cleaner) acked a view without it.
+// ============================================================================
+TEST(SegmentProvisionerRegression, RetiredReplicaIsFreedOnlyAfterTheProvisionerAckedRegression) {
+    Reg R;
+    NoopConsensus noop;
+    NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
+    LogCleanerAgent cleaner(&R.reg);
+    cleaner.attachViewChannel(rt.enableCleanerView());
+    SegmentProvisionerAgent prov(1);
+    prov.attachViewChannel(rt.enableProvisionerView());
+    R.add(5, 0);
+    R.add(5, 1);
+    rt.doWork(1);
+    cleaner.doWork(1);
+    prov.doWork(1);
+    rt.doWork(2);
+    EXPECT_EQ(rt.provisionerAckedGenForTest(), R.reg.generation());
+    R.reg.remove(5, 0);
+    rt.doWork(3);
+    cleaner.doWork(3);   // the cleaner acks the new view ...
+    rt.doWork(4);
+    EXPECT_EQ(rt.cleanerAckedGenForTest(), R.reg.generation());
+    EXPECT_EQ(R.reg.retiredCountForTest(), 1u) << "... but the provisioner may still hold it: not freed";
+    prov.doWork(4);      // swaps to the new view + acks
+    rt.doWork(5);
+    EXPECT_EQ(rt.provisionerAckedGenForTest(), R.reg.generation());
+    EXPECT_EQ(R.reg.retiredCountForTest(), 0u) << "freed once BOTH acked";
+}
+
+TEST(SegmentProvisionerRegression, DemandForALogNotInTheViewIsNeverDereferencedRegression) {
+    Reg R;
+    NoopConsensus noop;
+    NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
+    SegmentProvisionerAgent prov(1);
+    prov.attachViewChannel(rt.enableProvisionerView());
+    R.add(5, 0);
+    rt.doWork(1);
+    prov.doWork(1);
+    // A dangling address (a removed replica's freed Log): must never be touched.
+    auto* bogus = reinterpret_cast<Log*>(static_cast<std::uintptr_t>(0x10));
+    auto hook = prov.hook();
+    ASSERT_TRUE(hook.fn(hook.ctx, bogus, Log::ProvisionDemand::Threshold));
+    prov.doWork(2);   // would crash if dereferenced
+    EXPECT_EQ(prov.demandsIgnoredForTest(), 1u);
+    EXPECT_EQ(prov.builtForTest(), 0u);
+}
+
+TEST(SegmentProvisionerRegression, DemandBeforeItsViewIsServedWhenTheViewArrivesRegression) {
+    Reg R;
+    NoopConsensus noop;
+    NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
+    SegmentProvisionerAgent prov(1);
+    prov.attachViewChannel(rt.enableProvisionerView());
+    PartitionReplica* r = R.add(5, 0);
+    auto hook = prov.hook();
+    // A brand-new partition demands before the provisioner saw it in a view.
+    ASSERT_TRUE(hook.fn(hook.ctx, r->log(), Log::ProvisionDemand::Threshold));
+    prov.doWork(1);
+    EXPECT_EQ(prov.demandsIgnoredForTest(), 1u);
+    EXPECT_EQ(prov.parkedDemandsForTest(), 1u);
+    EXPECT_EQ(r->log()->readyQueuedApprox(), 0u);
+    rt.doWork(2);     // publishes the view
+    prov.doWork(2);   // installs it and serves the parked demand
+    EXPECT_EQ(prov.parkedDemandsForTest(), 0u);
+    EXPECT_EQ(prov.builtForTest(), 1u);
+    EXPECT_EQ(r->log()->readyQueuedApprox(), 1u) << "the new partition got its first ready segment";
+}
+
+TEST(SegmentProvisionerRegression, OverTheCapBuildsWithoutFallocateNeverAFailureRegression) {
+    // Re-review N3: over the node-wide reservation cap the provisioner still
+    // builds the ready segment (off the owner), only without its fallocate —
+    // the owner never rolls inline for the cap.
+    Reg R;
+    NoopConsensus noop;
+    NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
+    SegmentProvisionerAgent prov(1, /*capBytes=*/64LL * 1024 * 1024);   // room for ONE 64 MiB segment
+    prov.attachViewChannel(rt.enableProvisionerView());
+    PartitionReplica* a = R.add(5, 0);
+    PartitionReplica* b = R.add(5, 1);
+    rt.doWork(1);
+    prov.doWork(1);
+    auto hook = prov.hook();
+    ASSERT_TRUE(hook.fn(hook.ctx, a->log(), Log::ProvisionDemand::Threshold));
+    ASSERT_TRUE(hook.fn(hook.ctx, b->log(), Log::ProvisionDemand::Threshold));
+    prov.doWork(2);
+    EXPECT_EQ(prov.builtForTest(), 2u);
+    EXPECT_EQ(prov.unpreallocatedForTest(), 1u);
+    EXPECT_EQ(prov.failuresForTest(), 0u);
+    EXPECT_EQ(prov.reservedBytesForTest(), 64LL * 1024 * 1024) << "only A's segment is fallocated";
+    EXPECT_EQ(b->log()->readyQueuedApprox(), 1u);
+    EXPECT_TRUE(b->log()->readyAvailable()) << "B got a READY segment (not a failure)";
+}
+
+TEST(SegmentProvisionerRegression, AutoCapIsAFractionOfFreeSpaceRegression) {
+    SegmentProvisionerAgent prov(1, /*capBytes=*/-1, "/", /*capFreePct=*/10);
+    prov.setFreeBytesForTest(10LL * 1024 * 1024 * 1024);
+    EXPECT_EQ(prov.capBytes(), 1LL * 1024 * 1024 * 1024);
+}
+
+TEST(SegmentProvisionerRegression, ParkedDemandOfARetiredLogIsDiscardedRegression) {
+    // Re-review N2: a demand parked for a log that never appears in the next
+    // view (retired / never registered) is discarded (counted), never kept.
+    Reg R;
+    NoopConsensus noop;
+    NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
+    SegmentProvisionerAgent prov(1);
+    prov.attachViewChannel(rt.enableProvisionerView());
+    R.add(5, 0);
+    rt.doWork(1);
+    prov.doWork(1);
+    auto hook = prov.hook();
+    for (int i = 0; i < 100; ++i) {
+        auto* gone = reinterpret_cast<Log*>(static_cast<std::uintptr_t>(0x1000 + 64 * i));
+        ASSERT_TRUE(hook.fn(hook.ctx, gone, Log::ProvisionDemand::Threshold));
+    }
+    prov.doWork(2);
+    EXPECT_EQ(prov.parkedDemandsForTest(), 100u);
+    R.add(5, 1);       // a registry change publishes a new view
+    rt.doWork(3);
+    prov.doWork(3);
+    EXPECT_EQ(prov.parkedDemandsForTest(), 0u) << "parked demands leaked";
+    EXPECT_EQ(prov.parkedDroppedForTest(), 100u);
+}
+
+TEST(SegmentProvisionerRegression, MetricsArePublishedThroughTheSinkRegression) {
+    // Re-review N4: build failures, roll holds, unpreallocated builds and
+    // dropped demands reach the metric sink (BrokerNode: Aeron counters).
+    Reg R;
+    NoopConsensus noop;
+    NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
+    SegmentProvisionerAgent prov(1);
+    std::array<int64_t, SegmentProvisionerAgent::kMetricCount> seen{};
+    prov.setMetricSink([](void* c, int m, int64_t v) noexcept {
+        (*static_cast<std::array<int64_t, SegmentProvisionerAgent::kMetricCount>*>(c))[static_cast<std::size_t>(m)] = v;
+    }, &seen);
+    prov.attachViewChannel(rt.enableProvisionerView());
+    PartitionReplica* r = R.add(5, 0);
+    rt.doWork(1);
+    prov.doWork(1);
+    r->log()->setProvisionFaultForTest(EMFILE, 1);
+    auto hook = prov.hook();
+    ASSERT_TRUE(hook.fn(hook.ctx, r->log(), Log::ProvisionDemand::Hold));
+    prov.doWork(2);
+    EXPECT_EQ(seen[SegmentProvisionerAgent::kMetricRollHolds], 1);
+    EXPECT_EQ(seen[SegmentProvisionerAgent::kMetricBuildFailures], 1);
+}
+
+TEST(SegmentProvisionerRegression, ADemandWakesAParkedProvisionerRegression) {
+    // Review m5: the provisioner parks long on its doorbell; a demand wakes it.
+    Reg R;
+    NoopConsensus noop;
+    NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
+    SegmentProvisionerAgent prov(1);
+    prov.attachViewChannel(rt.enableProvisionerView());
+    PartitionReplica* r = R.add(5, 0);
+    rt.doWork(1);
+    ParkUntilWorkIdle idle(IdleShape{0, 0, 2'000'000'000LL, 2'000'000'000LL}, nullptr, 0, prov.doorbell());
+    rune::consensus::MonotonicNanoClock clk;
+    rune::consensus::AgentRunner runner(prov, idle, clk);
+    runner.start();
+    // The first pass installs the view; the runner then parks (2 s period).
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    const auto t0 = std::chrono::steady_clock::now();
+    auto hook = prov.hook();
+    ASSERT_TRUE(hook.fn(hook.ctx, r->log(), Log::ProvisionDemand::Threshold));
+    while (r->log()->readyQueuedApprox() == 0 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    runner.stopAndJoin();
+    EXPECT_EQ(r->log()->readyQueuedApprox(), 1u);
+    EXPECT_LT(waited, std::chrono::milliseconds(1000)) << "the demand waited out the park";
+}
+
+TEST(SegmentProvisionerRegression, BrokerNodeRefusesToStartWithAnUnwiredProvisionerRegression) {
+    EXPECT_THROW(requireProvisionerRunner(/*agentBuilt=*/true, /*runnerBuilt=*/false), std::logic_error);
+    EXPECT_NO_THROW(requireProvisionerRunner(true, true));
+    EXPECT_NO_THROW(requireProvisionerRunner(false, false));
 }

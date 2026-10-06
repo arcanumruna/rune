@@ -391,9 +391,9 @@ TEST(RecoveryPointRegression, CleanerNeverCompactsAboveRecoveryPoint) {
 
     const auto snap = log->sealedSegmentSnapshot();
     ASSERT_EQ(snap->size(), bases.size() - 1);
-    EXPECT_TRUE((*snap)[0].belowRecoveryPoint);
-    EXPECT_FALSE((*snap)[1].belowRecoveryPoint) << "seg1 ends above the persisted R";
-    EXPECT_FALSE((*snap)[2].belowRecoveryPoint);
+    EXPECT_TRUE(log->cleanerCompactionAllowedThrough((*snap)[0].endOffset));
+    EXPECT_FALSE(log->cleanerCompactionAllowedThrough((*snap)[1].endOffset)) << "seg1 ends above the persisted R";
+    EXPECT_FALSE(log->cleanerCompactionAllowedThrough((*snap)[2].endOffset));
 
     const auto before1 = fs::file_size(segPath(dir, bases[1]));
     LogCleaner cleaner;

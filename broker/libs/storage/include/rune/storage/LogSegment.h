@@ -302,6 +302,10 @@ public:
     /// Adopted from staging and the staging→<base> rename not yet confirmed
     /// (Log::drainStagingRenamesDone → setLogPath).  In-memory, no syscall.
     bool pathPending() const noexcept { return pathPending_; }
+    /// hotpath-A: setLogPath(<dir>/<20-digit base>.log) composed IN PLACE —
+    /// no allocation when the capacity was reserved off-thread (prepareStaging
+    /// reserves it), so the owner's rename-done drain allocates nothing.
+    void setCanonicalLogPath(const std::string& dir, int64_t base) noexcept;
 
     /// TEST-ONLY: whether the read-only .log mapping currently exists.  A
     /// sealed segment recovered from disk starts false (F3: lazy mapping) and

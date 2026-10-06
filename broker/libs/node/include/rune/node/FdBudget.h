@@ -44,7 +44,12 @@ inline constexpr uint64_t kBaseFds                  = 1024;
 inline constexpr uint64_t kInternalPartitionsReserve = 64;
 
 /// Estimated open files the broker needs for `topics` (formula above).
-[[nodiscard]] uint64_t estimateFdNeed(const std::vector<TopicSpec>& topics) noexcept;
+/// `readySegmentsPerPartition` (hotpath-A review M3): the segment provisioner
+/// may hold up to NodeConfig::segmentProvisionDepth READY segments per user
+/// partition (kFdsPerSegment fds each) — counted so the startup check never
+/// passes while the provisioner later hits EMFILE.
+[[nodiscard]] uint64_t estimateFdNeed(const std::vector<TopicSpec>& topics,
+                                      uint64_t readySegmentsPerPartition = 0) noexcept;
 
 enum class FdLimitVerdict : uint8_t { Ok, Warn, Refuse };
 struct FdLimitDecision {

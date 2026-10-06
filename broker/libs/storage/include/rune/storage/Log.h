@@ -1,9 +1,13 @@
 #pragma once
 #include <rune/storage/LogSegment.h>
+#include <rune/consensus/ControlRing.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <compare>
 #include <cstdint>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <utility>
@@ -29,18 +33,113 @@ struct SegInfo {
     /// entry's endOffset) WITHOUT reading the writer-owned segments_ map — so the
     /// cleaner never advances its watermark past not-yet-sealed (active) records.
     int64_t endOffset        = 0;
-    /// E1d: the segment ends at or below the PERSISTED recovery point (or no
-    /// recovery point was ever persisted — recovery then trusts every sealed
-    /// segment), so restart recovery trusts it as-is.  The cleaner compacts
-    /// ONLY such segments: compaction never creates an offset gap in the region
-    /// recovery validates with its segment-chain check.
-    bool    belowRecoveryPoint = true;
     /// The segment's content lineage (LogSegment::tsLineage) when this entry
-    /// was published: largestTimestamp is reused by the next publish only when
-    /// base AND lineage match — never across a truncate that rebuilt the segment.
+    /// was published: a queued cleaner swap / retention proposal carries it and
+    /// the owner applies it only to the SAME incarnation.
     uint64_t lineage = 0;
+    // E1d (hotpath-A F4): whether the cleaner may compact this segment (it ends
+    // at or below the PERSISTED recovery point) is NOT stored per entry any
+    // more — the persisted recovery point moves about once per roll and would
+    // force a republish of every entry.  The cleaner asks the log:
+    // Log::cleanerCompactionAllowedThrough(entry.endOffset).
+    friend bool operator==(const SegInfo&, const SegInfo&) = default;
 };
-using SealedSegmentSnapshot = std::vector<SegInfo>;
+
+class SealedSegmentSnapshot;
+
+/// hotpath-A F4 (backlog D16): sealed-segment snapshots are a PERSISTENT,
+/// CHUNKED structure — publishing one never copies the entry list.
+///
+///  * Entries live in fixed-size chunks (kSnapChunkEntries SegInfo each).  A
+///    chunk is SHARED by every directory (and so every snapshot) that covers
+///    it; the owner writes a slot in place ONLY when no published snapshot
+///    covers it (at or beyond every published end), and never rewrites a
+///    published slot.  A change to published entries (compaction install,
+///    truncation, reload) copies-on-write the chunk holding the first changed
+///    entry and builds the rest of the TAIL fresh — the prefix stays shared.
+///  * A directory (SealedSnapshotDir) maps chunk numbers to chunks and holds a
+///    fixed pool of snapshot HEADERS: a publish fills the next header and hands
+///    it out through an ALIASING shared_ptr of the directory — no allocation.
+///    A new directory (O(segments / kSnapChunkEntries) pointer copies) is
+///    built only when its chunk slots or its header pool run out.
+///
+/// So a roll appends ONE entry, a retention drop advances the front (both O(1),
+/// allocation-free except one chunk per kSnapChunkEntries rolls and one
+/// directory per kSnapHeadersPerDir publishes); truncation / compaction /
+/// reload rebuild only the tail from the first changed entry.
+inline constexpr std::size_t kSnapChunkEntries  = 64;   // review m3: ~2.5 KiB per chunk
+inline constexpr std::size_t kSnapHeadersPerDir = 64;   // review m3: ~1.5 KiB pool per directory
+struct SealedSnapshotChunk {
+    SegInfo e[kSnapChunkEntries];
+};
+
+/// Immutable view of the sealed segments (all but the active one), ascending
+/// by base offset.  Vector-like read API (size / [] / random-access iteration
+/// / front / back).  Valid while the shared_ptr it was obtained through lives.
+class SealedSegmentSnapshot {
+public:
+    using value_type = SegInfo;
+    using size_type  = std::size_t;
+    class const_iterator {
+    public:
+        using iterator_category = std::random_access_iterator_tag;
+        using value_type        = SegInfo;
+        using difference_type   = std::ptrdiff_t;
+        using pointer           = const SegInfo*;
+        using reference         = const SegInfo&;
+        const_iterator() = default;
+        const_iterator(const SealedSegmentSnapshot* s, std::size_t i) noexcept : s_(s), i_(i) {}
+        reference operator*() const noexcept { return (*s_)[i_]; }
+        pointer operator->() const noexcept { return &(*s_)[i_]; }
+        reference operator[](difference_type d) const noexcept { return (*s_)[i_ + static_cast<std::size_t>(d)]; }
+        const_iterator& operator++() noexcept { ++i_; return *this; }
+        const_iterator operator++(int) noexcept { auto t = *this; ++i_; return t; }
+        const_iterator& operator--() noexcept { --i_; return *this; }
+        const_iterator operator--(int) noexcept { auto t = *this; --i_; return t; }
+        const_iterator& operator+=(difference_type d) noexcept { i_ += static_cast<std::size_t>(d); return *this; }
+        const_iterator& operator-=(difference_type d) noexcept { i_ -= static_cast<std::size_t>(d); return *this; }
+        friend const_iterator operator+(const_iterator a, difference_type d) noexcept { a += d; return a; }
+        friend const_iterator operator+(difference_type d, const_iterator a) noexcept { a += d; return a; }
+        friend const_iterator operator-(const_iterator a, difference_type d) noexcept { a -= d; return a; }
+        friend difference_type operator-(const_iterator a, const_iterator b) noexcept {
+            return static_cast<difference_type>(a.i_) - static_cast<difference_type>(b.i_);
+        }
+        friend bool operator==(const_iterator a, const_iterator b) noexcept { return a.i_ == b.i_; }
+        friend auto operator<=>(const_iterator a, const_iterator b) noexcept { return a.i_ <=> b.i_; }
+    private:
+        const SealedSegmentSnapshot* s_ = nullptr;
+        std::size_t                  i_ = 0;
+    };
+    using iterator = const_iterator;
+
+    SealedSegmentSnapshot() = default;
+    SealedSegmentSnapshot(const struct SealedSnapshotDir* dir, std::size_t first, std::size_t n) noexcept
+        : dir_(dir), first_(first), n_(n) {}
+    [[nodiscard]] std::size_t size()  const noexcept { return n_; }
+    [[nodiscard]] bool        empty() const noexcept { return n_ == 0; }
+    [[nodiscard]] const_iterator begin() const noexcept { return {this, 0}; }
+    [[nodiscard]] const_iterator end()   const noexcept { return {this, n_}; }
+    [[nodiscard]] inline const SegInfo& operator[](std::size_t i) const noexcept;
+    [[nodiscard]] const SegInfo& front() const noexcept { return (*this)[0]; }
+    [[nodiscard]] const SegInfo& back()  const noexcept { return (*this)[n_ - 1]; }
+private:
+    const struct SealedSnapshotDir* dir_ = nullptr;   ///< kept alive by the aliasing shared_ptr
+    std::size_t first_ = 0;   ///< absolute entry index in dir_
+    std::size_t n_     = 0;
+};
+
+/// See kSnapChunkEntries.  Entry `a` (absolute) is chunks[a / K]->e[a % K].
+struct SealedSnapshotDir {
+    std::unique_ptr<std::shared_ptr<SealedSnapshotChunk>[]> chunks;
+    std::size_t chunkCap = 0;
+    std::unique_ptr<SealedSegmentSnapshot[]> headers;   ///< aliasing-publish targets
+    std::size_t headerCap = 0;
+};
+
+inline const SegInfo& SealedSegmentSnapshot::operator[](std::size_t i) const noexcept {
+    const std::size_t a = first_ + i;
+    return dir_->chunks[a / kSnapChunkEntries]->e[a % kSnapChunkEntries];
+}
 
 /// On-disk append-only log: a sequence of LogSegment files in a directory.
 ///
@@ -170,6 +269,39 @@ public:
     /// Legacy (off): the seal fsync stays inline.  Owner thread only.
     void setDeferSealSync(bool on) noexcept { deferSealSync_ = on; }
     [[nodiscard]] bool deferSealSync() const noexcept { return deferSealSync_; }
+
+    // ---- hotpath-A: a roll never blocks the owner (F2 / F3) -----------------
+    /// The active segment is full but the roll cannot happen NOW without
+    /// blocking the owner: no pre-provisioned segment is ready (provisioned
+    /// logs never create one inline — F2) or the async seal queue is full
+    /// (worker-driven logs never fsync a seal inline — F3).  O(1), owner thread.
+    /// The intake back-pressures on it (Worker: controlled-poll ABORT of the
+    /// frame); an append that still arrives (follower apply, txn marker, op
+    /// ring) lands in the active segment and the roll happens at the first
+    /// append after the condition clears (the segment overshoots rollBytes).
+    [[nodiscard]] bool rollDeferred() noexcept {
+        if (segments_.empty() || segments_.rbegin()->second->sizeBytes() < rollBytes_) [[likely]] return false;
+        return rollBlockedNow_();
+    }
+    /// hotpath-A F4 (tests): snapshot tail rebuilds / entries they wrote, and
+    /// whether the published snapshot equals the sealed segments exactly.
+    [[nodiscard]] uint64_t snapshotRebuildsForTest() const noexcept { return snapRebuilds_; }
+    [[nodiscard]] uint64_t snapshotRebuiltEntriesForTest() const noexcept { return snapRebuiltEntries_; }
+    [[nodiscard]] bool snapshotMatchesSegmentsForTest() const;
+    /// F1 (tests): block reservations (fallocate) the OWNER made for a next
+    /// segment at roll — 0 for a provisioned log (the provisioner reserves).
+    [[nodiscard]] uint64_t ownerPreallocsForTest() const noexcept { return ownerPreallocs_; }
+    /// Deferred rolls forced past the overshoot cap (blocking, correct).
+    [[nodiscard]] uint64_t forcedRollsForTest() const noexcept { return forcedRolls_; }
+    /// A deferred roll is forced once the active segment reaches this size.
+    [[nodiscard]] int64_t maxDeferredRollBytesForTest() const noexcept { return maxDeferredRollBytes_(); }
+    [[nodiscard]] int64_t segmentSizeForTest(int64_t base) const noexcept {
+        auto it = segments_.find(base);
+        return it == segments_.end() ? -1 : it->second->sizeBytes();
+    }
+    /// Rolls deferred by rollDeferred()'s condition (appends that overshot).
+    [[nodiscard]] uint64_t rollDeferralsForTest() const noexcept { return rollDeferrals_; }
+    static constexpr std::size_t kMaxPendingSealsForTest() noexcept { return kMaxPendingSeals; }
     [[nodiscard]] std::size_t pendingSealCount() const noexcept { return pendingSealCount_; }
     /// Oldest pending seal (pinned; the caller submits its logFd()).
     [[nodiscard]] LogSegment* frontPendingSeal() const noexcept {
@@ -260,6 +392,14 @@ public:
     /// as-is — the cleaner may compact it (E1d invariant 3).
     [[nodiscard]] bool compactionAllowedThrough(int64_t segEnd) const noexcept {
         return persistedRp_ == kRecoveryPointUnknown || segEnd <= persistedRp_;
+    }
+    /// Cleaner thread (hotpath-A F4): compactionAllowedThrough() against the
+    /// persisted recovery point the owner PUBLISHED (release-store whenever it
+    /// moves — no snapshot republish).  Advisory: the owner re-checks
+    /// compactionAllowedThrough() before installing any compaction output.
+    [[nodiscard]] bool cleanerCompactionAllowedThrough(int64_t segEnd) const noexcept {
+        const int64_t rp = cleanerPersistedRp_.load(std::memory_order_acquire);
+        return rp == kRecoveryPointUnknown || segEnd <= rp;
     }
     /// An async (io backend) fdatasync of `seg`'s fd completed successfully:
     /// every byte written to it before the submit — offsets below `upTo` (the
@@ -549,7 +689,7 @@ public:
     /// Owner: try to start a cold path now (true = quiescent; the caller then
     /// calls truncateTo / reloadSegments).  false = it is deferred and the
     /// owner's drains post nothing until it runs or is cancelled.
-    [[nodiscard]] bool tryBeginColdPath() noexcept { return beginColdPath_(); }
+    [[nodiscard]] bool tryBeginColdPath() noexcept { return beginColdPath_(INT64_MIN); }
     /// Owner: a deferred cold path was abandoned (role change) — resume posting.
     void cancelColdPathWait() noexcept { pauseSwapPost_ = pauseDropPost_ = false; }
     /// Cleaner thread: posted operations not yet performed (a compaction pass
@@ -569,13 +709,13 @@ public:
     // 100% cause of the append-p99 tail: on APFS a single open() is ~35µs p50 /
     // 62µs p99 with multi-ms spikes, so a roll that creates the next segment on
     // the append thread produces a ~200-460µs tail.  We move that creation to a
-    // BACKGROUND thread: it pre-builds ONE staging segment (files opened, index
-    // ftruncated + mmap'd + prefaulted) under a temporary name.  At roll the
+    // BACKGROUND thread: it pre-builds staging segments (files opened, index
+    // ftruncated + mmap'd + prefaulted, blocks fallocated) under temporary names.  At roll the
     // append thread ADOPTS it with ZERO syscalls — a pure in-memory rebase (the
     // already-open fd + index mmap are name-agnostic).  The staging → <base>.{log,
     // index} disk rename is DEFERRED to the background thread (finalizeStaging-
-    // Renames), off the hot path.  The seal fsync of the OUTGOING segment stays
-    // fully synchronous (durability unchanged).
+    // Renames), off the hot path.  The seal fsync of the OUTGOING segment is
+    // queued for the owner's io backend (worker-driven logs) or inline (legacy).
     //
     // Crash-safety: a staging.log adopted-but-not-yet-renamed at crash time holds
     // real data; Log construction recovers its true base from the first batch
@@ -584,18 +724,94 @@ public:
     // All cross-thread handoff is wait-free release/acquire.  The APPEND thread is
     // the ONLY mutator of segments_ (single-writer invariant preserved); the
     // BACKGROUND thread only does file I/O and never touches segments_:
-    //   preparedSegment_ : bg builds + release-stores; append takes (exchange).
-    //   preprovInFlight_ : guards the bg from building two + the fallback race.
+    //   ready ring       : bg → append  (built segments; see below).
     //   renameReq ring   : append → bg  (deferred staging→base disk rename).
     //   renameDone ring  : bg → append  (update logPath_ after the disk rename).
     // -----------------------------------------------------------------------
 
-    /// Background thread: build the next staging segment if none is ready and one
-    /// isn't already in flight.  Pure file I/O + object construction on the
-    /// caller (background) thread; NEVER touches segments_.  Idempotent and cheap
-    /// when a segment is already prepared.  Returns 1 if it built a segment (work
-    /// done), 0 otherwise — so it can participate in an agent's doWork idle loop.
-    int preprovisionPending();
+    // hotpath-A (F1 + F2): the ready pool.  The provisioning thread keeps up to
+    // `depth` READY segments per log on a ring (rune::consensus::ControlRing —
+    // the agrona ring copy; provisioner = producer, owner = the one consumer).
+    // Each one is fully built off the owner: files created + opened, index
+    // ftruncated + mmapped + prefaulted, read map created AND its blocks
+    // fallocated (F1).  A roll adopts the oldest one with zero syscalls.
+    //
+    // Demand-driven (review M3): a PROVISIONED log reserves nothing while its
+    // active segment is below the fill threshold; the owner posts a Threshold
+    // demand (ProvisionHook) when the active segment crosses it, and an Adopted
+    // demand after every adoption (the provisioner then finalizes the rename).
+    // A provisioned log never creates a segment on the owner while the
+    // provisioner can still deliver: with no ready segment the roll is deferred
+    // (rollDeferred(); the intake holds).  Every Threshold demand ends in a
+    // ready segment or a FAILURE record on the same ring (review M1: a failed
+    // build, or the node-wide reservation cap) — on a failure the owner rolls
+    // INLINE once (blocking, correct, counted + rate-limited log; a failed
+    // inline create fails the log exactly as before).  Crash safety: a ready
+    // segment never written is an empty staging file — construction deletes it
+    // (recoverStagingFiles); a clean shutdown deletes the unconsumed ones.
+    static constexpr std::size_t kMaxProvisionDepth = 8;
+    /// Threshold: the active segment crossed the fill threshold (build).
+    /// Adopted: a ready segment was adopted (finalize its rename).
+    /// Hold: a roll is being HELD for want of a ready segment — posted at the
+    /// first blocked check of an episode and again every kHoldRepostChecks
+    /// blocked checks (re-review N2: recovers a demand the provisioner could
+    /// not keep; counted as the roll-hold metric).  Served like Threshold.
+    enum class ProvisionDemand : int64_t { Threshold = 1, Adopted = 2, Hold = 3 };
+    static constexpr uint32_t kHoldRepostChecks = 1024;
+    /// Demand signal (owner thread → provisioner).  A plain function pointer +
+    /// context (no virtual call).  Returns false when the demand could not be
+    /// queued (full ring): the owner re-posts it later (never lost).
+    struct ProvisionHook {
+        bool (*fn)(void* ctx, Log* log, ProvisionDemand kind) noexcept = nullptr;
+        void* ctx = nullptr;
+    };
+    /// Owner (before the log is driven): this log is served by a provisioning
+    /// thread.  `thresholdPct` (1..100): fill level of the active segment at
+    /// which the next segment is demanded.  Legacy (never called): an empty
+    /// pool falls back to the inline create (control-thread logs, tests).
+    void setProvisioning(ProvisionHook hook, int thresholdPct = 50) noexcept {
+        provisioned_ = true;
+        provisionHook_ = hook;
+        const int pct = thresholdPct < 1 ? 1 : (thresholdPct > 100 ? 100 : thresholdPct);
+        provisionThresholdBytes_ = rollBytes_ / 100 * pct + (rollBytes_ % 100) * pct / 100;
+    }
+    [[nodiscard]] bool provisioned() const noexcept { return provisioned_; }
+    [[nodiscard]] int64_t rollBytes() const noexcept { return rollBytes_; }
+    /// Provisioning thread: top the ready pool up to `depth` (clamped to
+    /// [1, kMaxProvisionDepth]), at most `depth` builds per call.  Pure file I/O
+    /// + object construction, NEVER touches segments_.  Returns the number of
+    /// segments built.  A failed build posts a FAILURE record (review M1) and
+    /// returns -errno.
+    int provisionReady(std::size_t depth, bool preallocate = true);
+    /// Provisioning thread: tell the owner no segment will come for its pending
+    /// demand (e.g. the node-wide reservation cap): the owner rolls inline.
+    void reportProvisionFailure(int err) noexcept;
+    /// Provisioning thread: ready segments queued and not yet taken by the
+    /// owner (approximate while the owner runs; an estimate for depth / cap
+    /// accounting only).
+    [[nodiscard]] std::size_t readyQueuedApprox() const noexcept {
+        const std::int64_t b = readyRing_.pendingBytes();
+        return b <= 0 ? 0 : static_cast<std::size_t>(b) / ReadyRing::kRecordBytes;
+    }
+    /// Legacy single-slot form (the cleaner-driven provisioning): provisionReady(1).
+    int preprovisionPending() { return provisionReady(1); }
+    /// Owner: a ready segment is available (pulls the next record — a ready
+    /// segment or a failure — into the owner-side front slot).
+    [[nodiscard]] bool readyAvailable() noexcept { pullReady_(); return readyFront_ != nullptr; }
+    /// Owner (tests): ready segments pooled (front slot + queued).
+    [[nodiscard]] std::size_t readyCountForTest() const noexcept {
+        return (readyFront_ != nullptr ? 1 : 0) + readyQueuedApprox();
+    }
+    /// Owner (tests / observability): provisioning failures seen and the rolls
+    /// they forced inline.
+    [[nodiscard]] uint64_t provisionFailuresForTest() const noexcept { return provisionFailures_; }
+    [[nodiscard]] uint64_t failureInlineRollsForTest() const noexcept { return failureInlineRolls_; }
+    /// Test seam (re-review N1): called inside beginColdPath_ between its
+    /// rename-ring read and its done-ring drain — a test plays the provisioner
+    /// finishing a rename exactly there.  Owner thread; null in production.
+    void setColdPathInterleaveForTest(void (*fn)(void*), void* ctx) noexcept { coldSeamFn_ = fn; coldSeamCtx_ = ctx; }
+    /// Provisioning thread (tests): make the next `n` builds fail with `err`.
+    void setProvisionFaultForTest(int err, int n = 1) noexcept { provisionFaultErr_ = err; provisionFaultN_ = n; }
 
     /// Background thread: perform any deferred staging→base disk renames enqueued
     /// by the append thread at roll, and publish each completed base back to the
@@ -782,6 +998,14 @@ private:
     /// publishSealedSnapshot() call consumes it so it does not persist past recovery.
     std::map<int64_t, int64_t> recoveryMaxTimestamps_;
     SegMap segments_;
+    /// hotpath-A: recycled map nodes — a roll's install_ reuses a node a
+    /// retention drop / compaction / erase_ released, so a roll in steady
+    /// state (with retention) allocates nothing.  Reserved once (ctor).
+    static constexpr std::size_t kSpareSegNodes = 64;
+    std::vector<SegMap::node_type> spareSegNodes_;
+    /// Erase `it` (its LogSegment already moved out / released), keeping the
+    /// node for reuse.  Returns the next iterator.
+    SegMap::iterator eraseKeepNode_(SegMap::iterator it) noexcept;
     uint64_t segInstallGen_ = 0;   ///< F15 S4 N1: segment install generation
 
     // CP-6/race-fix: atomic snapshot of sealed segment {baseOffset, sizeBytes}.
@@ -797,6 +1021,41 @@ private:
     // only affected when a roll occurs (infrequent).
     mutable std::shared_ptr<const SealedSegmentSnapshot> sealedSnapshot_{
         std::make_shared<SealedSegmentSnapshot>()};
+    // hotpath-A F4: the owner's side of the chunked snapshot (see
+    // kSnapChunkEntries).  Live entries are the absolute indices
+    // [snapBegin_, snapEnd_) of snapDir_; every published snapshot of any
+    // directory sharing a chunk ends at or below snapEnd_, so slots >= snapEnd_
+    // are written in place.  Owner thread only.
+    std::shared_ptr<SealedSnapshotDir> snapDir_;
+    std::size_t snapBegin_ = 0, snapEnd_ = 0, snapHeadersUsed_ = 0;
+    uint64_t    snapRebuilds_ = 0;        ///< tail rebuilds (tests)
+    uint64_t    snapRebuiltEntries_ = 0;  ///< entries written by tail rebuilds (tests)
+    [[nodiscard]] const SegInfo& snapAt_(std::size_t a) const noexcept {
+        return snapDir_->chunks[a / kSnapChunkEntries]->e[a % kSnapChunkEntries];
+    }
+    /// A fresh directory holding the live chunks of the current one, rebased
+    /// so the first live chunk is chunk 0, with room for `extraChunks` more.
+    void snapRebaseDir_(std::size_t keepChunks, std::size_t extraChunks);
+    /// Write entry `e` at absolute slot snapEnd_ (unpublished) and advance.
+    void snapPushBack_(const SegInfo& e);
+    /// Publish [snapBegin_, snapEnd_) — fills the directory's next header and
+    /// stores an aliasing shared_ptr (no allocation unless the pool is spent).
+    void publishSnapshotView_();
+    /// Roll: append the newly sealed segment's entry (O(1)).
+    void snapshotAppendSealed_(SegMap::iterator sealed);
+    /// Retention: the front `k` sealed segments were erased (O(1)).
+    void snapshotDropFront_(std::size_t k);
+    /// Rebuild the snapshot from the first entry whose segment may have changed
+    /// — segments at or above `fromBase` (and the entry just below it: its end
+    /// offset / timestamp floor may have moved).  Entries that compare equal
+    /// are kept (shared); the rest of the tail is written fresh.
+    void publishSealedSnapshotFrom_(int64_t fromBase);
+    /// The cleaner's view of persistedRp_ (single writer: the owner).
+    alignas(64) std::atomic<int64_t> cleanerPersistedRp_{kRecoveryPointUnknown};
+    void setPersistedRp_(int64_t v) noexcept {
+        persistedRp_ = v;
+        cleanerPersistedRp_.store(v, std::memory_order_release);
+    }
 
     // CP-6: pending cleaner swaps — LOCK-FREE single-producer/single-consumer
     // ring.  Producer = the single cleaner thread (enqueueCleanedSegment);
@@ -917,7 +1176,7 @@ private:
                                         RenamePending, FlushInFlight, RecoveryPoint, BadOutput };
     /// Owner: may a cold path run now?  true = every posted operation is done
     /// (and coldPathWanted_ is cleared); false = deferred (posting paused).
-    bool beginColdPath_() noexcept;
+    bool beginColdPath_(int64_t touchFrom) noexcept;   ///< touchFrom: lowest segment base touched
     /// Owner drains (swap / retention): false while a cold path waits for the
     /// cleaner to drain the msg ring (posting would starve it).  Also surfaces a
     /// cleaner checkpoint failure as a storage failure.
@@ -950,19 +1209,78 @@ private:
     /// Bg-thread-owned (only preprovisionPending writes it).
     std::size_t stagingSeq_ = 0;
 
-    /// Prepared staging segment: bg-thread builds + publishes via release-store;
-    /// append-thread takes it (acquire + exchange to nullptr) at roll.  Raw owning
-    /// pointer handed across the atomic; whoever sets it to nullptr owns deletion.
-    std::atomic<LogSegment*> preparedSegment_{nullptr};
-    /// True while a staging segment is prepared OR being built — prevents the bg
-    /// thread from building a second one and lets the append thread know a segment
-    /// is (or will be) available.  Set by bg thread before building; cleared by
-    /// the append thread after it adopts (or discards) the prepared segment.
-    std::atomic<bool> preprovInFlight_{false};
+    /// hotpath-A F2: the ready pool (see kMaxProvisionDepth).  Records:
+    /// kReadyMsg {a = LogSegment* (owning)} and kFailedMsg {a = errno}.
+    using ReadyRing = rune::consensus::ControlRing<512>;
+    static constexpr std::int32_t kReadyMsg = 1, kFailedMsg = 2;
+    ReadyRing   readyRing_;
+    LogSegment* readyFront_ = nullptr;     ///< owner: next ready segment (taken off the ring)
+    int         failFront_  = 0;           ///< owner: a pulled failure not yet acted on (errno)
+    bool          provisioned_ = false;   ///< see setProvisioning (owner config)
+    ProvisionHook provisionHook_{};
+    int64_t       provisionThresholdBytes_ = 0;   ///< owner: Threshold demand point
+    bool          thresholdPosted_ = false;       ///< owner: Threshold demand queued for this segment
+    void (*coldSeamFn_)(void*) = nullptr;         ///< see setColdPathInterleaveForTest
+    void* coldSeamCtx_ = nullptr;
+    bool          adoptedPostPending_ = false;    ///< owner: an Adopted demand still to queue
+    uint64_t      provisionFailures_ = 0;         ///< owner: failure records pulled
+    uint64_t      failureInlineRolls_ = 0;        ///< owner: rolls made inline because of one
+    int           provisionFaultErr_ = 0, provisionFaultN_ = 0;   ///< provisioner (tests)
+    /// Owner: pull the next ready record into the front slot (no-op when one is there).
+    void pullReady_() noexcept;
+    /// Owner: queue the demands that are due (threshold crossed / adoption).
+    void postProvisionDemands_(int64_t activeBytes) noexcept;
+    /// Owner: a blocked check (no ready segment): post the Hold demand at the
+    /// first check of an episode and every kHoldRepostChecks checks after.
+    void noteHoldCheck_() noexcept {
+        if ((holdChecks_++ % kHoldRepostChecks) == 0 || holdPostPending_) {
+            holdPostPending_ = provisionHook_.fn == nullptr ||
+                               !provisionHook_.fn(provisionHook_.ctx, this, ProvisionDemand::Hold);
+            if (provisionHook_.fn == nullptr) holdPostPending_ = false;
+        }
+    }
+    uint32_t holdChecks_ = 0;        ///< owner: blocked checks in the current hold episode
+    bool     holdPostPending_ = false;
+    uint64_t      rollDeferrals_ = 0;     ///< see rollDeferralsForTest (owner)
+    uint64_t      ownerPreallocs_ = 0;    ///< see ownerPreallocsForTest (owner)
+    uint64_t      forcedRolls_    = 0;    ///< see forcedRollsForTest (owner)
+    /// Overshoot cap of a deferred roll: rollBytes + clamp(rollBytes, 1 MiB,
+    /// 256 MiB) — far below the 2 GiB segment position limit.
+    [[nodiscard]] int64_t maxDeferredRollBytes_() const noexcept {
+        // Review L1: never past the 32-bit segment position limit (minus room
+        // for one maximal batch).
+        const int64_t cap = rollBytes_ + std::clamp<int64_t>(rollBytes_, int64_t{1} << 20, int64_t{256} << 20);
+        return std::min<int64_t>(cap, int64_t{INT32_MAX} - (int64_t{64} << 20));
+    }
 
-    /// Adopt the pre-provisioned staging segment as the active segment at `base`
-    /// (in-memory; enqueues the deferred rename), or synchronously create one if
-    /// none is ready (append thread only).
+    /// Owner: the staging-rename request ring has a free slot.
+    [[nodiscard]] bool renameRoom_() const noexcept {
+        return renameReqTail_.load(std::memory_order_relaxed) - renameReqHead_.load(std::memory_order_acquire) <
+               kRenameRingCapacity;
+    }
+    /// Owner: take the oldest ready segment (nullptr = none).
+    LogSegment* takeReady_() noexcept;
+    /// rollDeferred() minus the size check.
+    [[nodiscard]] bool rollBlockedNow_() noexcept {
+        if (deferSealSync_ && pendingSealCount_ >= kMaxPendingSeals) return true;   // F3
+        if (!provisioned_) return false;
+        // F2: no ready segment — or no room to queue its staging -> base rename
+        // (an adoption must never drop its rename: the segment would keep its
+        // staging name / pathPending for good and retention would stall).
+        // A pulled FAILURE (review M1) unblocks: the roll goes inline.
+        postProvisionDemands_(rollBytes_);   // a demand lost to a full ring is re-posted here
+        if (!readyAvailable()) {
+            if (failFront_ != 0) return false;
+            noteHoldCheck_();
+            return true;
+        }
+        return !renameRoom_();
+    }
+
+    /// Adopt the oldest ready segment as the active segment at `base` (in-memory;
+    /// enqueues the deferred rename, posts the provisioning demand), or — legacy
+    /// (non-provisioned) logs only — synchronously create one if none is ready.
+    /// Owner thread only.
     void installNextSegment(int64_t base);
     /// Reconcile staging files left by a crash (append thread, constructor only).
     void recoverStagingFiles();

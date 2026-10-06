@@ -673,6 +673,8 @@ public:
     /// Fix round 1: frames ABORTed because their session held acks (G-A6 per-
     /// client pause) / op drains skipped because the ack queue had no room.
     [[nodiscard]] uint64_t intakePausedFramesForTest() const noexcept { return intakePausedFrames_; }
+    /// hotpath-A: frames held (ABORT) because their partition's roll was deferred.
+    [[nodiscard]] uint64_t intakeRollHoldsForTest() const noexcept { return intakeRollHolds_; }
     [[nodiscard]] uint64_t ackRoomOpPausesForTest() const noexcept { return ackRoomOpPauses_; }
     /// Fix round 2 (finding 9): session signals (Failed / Held / Released) the
     /// return ring could not take at once — deferred to a later pass, never lost.
@@ -3701,6 +3703,7 @@ private:
     int32_t  lastAnnouncedClientVersion_ = -1;   ///< D6 test probe (the last SessionAnnounce's)
     uint64_t sessionClosesSeen_    = 0;
     uint64_t intakePausedFrames_   = 0;   // fix round 1: per-session G-A6 pause (ABORTs); D8d: + direct budget
+    uint64_t intakeRollHolds_      = 0;   // hotpath-A: frames held because their partition's roll is deferred
     uint32_t directSessionAckBudget_ = SessionAckSink::kDefaultDirectSessionBudget;   // D8d
     uint64_t ackRoomOpPauses_      = 0;   // fix round 1: op drains skipped, ack queue full
     uint64_t sessionSignalsDeferred_ = 0; // fix round 2 (finding 9)
@@ -5305,19 +5308,33 @@ private:
                         if (direct == SessionAckSink::kDirectDropClosed) [[unlikely]]
                             return aeron::ControlledPollAction::CONTINUE;
                     }
-                    polled += handleWorkerIngressFrame_(data, len, nowNs, direct);
+                    const int r = handleWorkerIngressFrame_(data, len, nowNs, direct);
+                    // hotpath-A F2/F3: the partition's roll is deferred (no ready
+                    // segment / seal queue full) — hold THIS frame in the image.
+                    if (r < 0) [[unlikely]] return aeron::ControlledPollAction::ABORT;
+                    polled += r;
                     return aeron::ControlledPollAction::CONTINUE;
                 });
             return polled;
         }
-        workerIngress_->poll(
+        workerIngress_->controlledPoll(
             K,   // E5.1.3: poll up to K frames (reservation guarantees K ack slots)
             [this, nowNs, &polled]
             (const uint8_t* data, std::size_t len, aeron::Header& /*hdr*/) {
-                polled += handleWorkerIngressFrame_(data, len, nowNs);
+                const int r = handleWorkerIngressFrame_(data, len, nowNs);
+                if (r < 0) [[unlikely]] return aeron::ControlledPollAction::ABORT;   // hotpath-A: held
+                polled += r;
+                return aeron::ControlledPollAction::CONTINUE;
             });
         return polled;
     }
+
+    /// hotpath-A F2/F3 — returned by handleWorkerIngressFrame_ for a frame the
+    /// worker HOLDS (controlled-poll ABORT: the frame stays in its image and is
+    /// re-delivered on a later pass): its partition's roll is deferred because
+    /// no pre-provisioned segment is ready or the async seal queue is full.
+    /// Nothing was decoded into state, answered or appended.  Never blocks.
+    static constexpr int kIngressHeld = -1;
 
     // Client MessageHeader: sessionId is LE64 at byte 8 (blockLength, templateId,
     // schemaId, version: 4 × u16) — read without decoding the whole frame.
@@ -5366,6 +5383,23 @@ private:
 
         // Look up the owned Log + replica for this partition.
         auto [log, replica] = getLogAndReplicaForPartition_(msg.topicId, msg.partition);
+
+        // hotpath-A F2/F3: back-pressure — the append would need a roll that
+        // cannot happen without blocking this pass (no ready segment: never an
+        // inline create; seal queue full: never an inline fsync).  Hold the
+        // frame (the caller ABORTs the controlled poll); its admission unit is
+        // given back.  O(1): one size compare (+ one acquire load when full).
+        // Review m1: the hold is image-wide (a controlled-poll ABORT stops every
+        // later frame of the same publisher on this worker until the roll can
+        // happen — bounded by the provisioner's refill / a reported failure /
+        // the seal-queue drain).  Frames that would be REFUSED anyway (not the
+        // leader, oversize) are never held: they are answered at once.
+        if (log != nullptr && log->rollDeferred() && produceRoleGatePasses_(replica) &&
+            msg.recordBatch.size() <= maxIntakeBatchBytes()) [[unlikely]] {
+            if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
+            ++intakeRollHolds_;
+            return kIngressHeld;
+        }
 
         // E5.1.3 review fix #3: acksAll = (acks != 0).
         // The Produce wire field carries 0=NoAck, 1=Leader, -1 (0xFF)=All.
