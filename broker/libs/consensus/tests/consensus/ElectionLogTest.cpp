@@ -2149,3 +2149,181 @@ TEST(ElectionStandDownRegression, ResignedLeaderCanvassKeepsTheFollowersSkipRegr
     for (int i = 0; i < 5; ++i) { now2 += kStatusIntervalNs; l.doWork(now2); }
     EXPECT_GT(pub2.canvasses, 0) << "a resigned leader that never canvasses can block a quorum";
 }
+
+// ===========================================================================
+// ClosedLeaderStepDownRegression (DR-10 repeated-flap, box run 2026-10-05).
+//
+// A leader that reached CLOSED never left it: it ignored a higher-term NLT /
+// CommitPosition (only the pre-CLOSED Leader* states stepped down), it never
+// checked for an active follower quorum, and it silently dropped RequestVote
+// (no reply in CLOSED).  A leader paused past the heartbeat timeout (docker
+// pause) therefore resumed as a zombie CLOSED leader of the old term: the
+// survivors elected a new leader without it, and when THAT leader was paused
+// next, the zombie never voted — the two live nodes stayed headless for 4+
+// minutes.  Aeron leaves the steady state in all three cases
+// (ConsensusModuleAgent: inactive-follower-quorum → enterElection; a higher
+// leadershipTermId NLT → enterElection; an unexpected RequestVote with a
+// higher term → enterElection).
+// ===========================================================================
+
+static void closeAsThreeMemberLeader(Election& e, FakeConsensusPublisher& pub, int64_t& nowNs) {
+    bringToLeaderLogReplication(e, nowNs);
+    EXPECT_TRUE(driveLeaderToClosed(e, nowNs, pub, {1, 2}));
+    EXPECT_EQ(e.leaderMemberId(), 0);
+}
+
+TEST(ElectionLog, ClosedLeaderStepDownRegression_HigherTermNLT_StepsDownAndFollows) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+    closeAsThreeMemberLeader(e, pub, nowNs);
+    ASSERT_TRUE(e.isClosed());
+
+    const Term higher = e.leadershipTermId() + 1;
+    auto nlt = [&] {
+        e.onNewLeadershipTerm(nowNs, /*logLeadershipTermId=*/e.leadershipTermId(),
+                              /*nextLeadershipTermId=*/higher, 0, 0,
+                              /*leadershipTermId=*/higher, 0,
+                              /*logPosition=*/e.appendPosition(), 0, 0,
+                              /*leaderMemberId=*/2, 0, false, 0);
+    };
+    nlt();
+    EXPECT_FALSE(e.isClosed()) << "a CLOSED leader must step down on a higher-term NLT";
+    EXPECT_NE(e.leaderMemberId(), 0) << "the stepped-down node must not still report itself leader";
+    EXPECT_EQ(e.leadershipTermId(), higher);
+
+    // The new leader's next heartbeat NLT makes it a follower of node 2.
+    nlt();
+    ASSERT_TRUE(driveToClosed(e, nowNs));
+    EXPECT_EQ(e.leaderMemberId(), 2);
+    EXPECT_EQ(e.leadershipTermId(), higher);
+}
+
+TEST(ElectionLog, ClosedLeaderStepDownRegression_HigherTermCommit_StepsDown) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+    closeAsThreeMemberLeader(e, pub, nowNs);
+    ASSERT_TRUE(e.isClosed());
+
+    const Term higher = e.leadershipTermId() + 2;
+    e.onCommitPosition(nowNs, higher, /*logPosition=*/0, /*leaderMemberId=*/1);
+    EXPECT_EQ(e.state(), ElectionState::Canvass);
+    EXPECT_EQ(e.leadershipTermId(), higher);
+}
+
+TEST(ElectionLog, ClosedLeaderStepDownRegression_HigherTermRequestVote_IsAnswered) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+    closeAsThreeMemberLeader(e, pub, nowNs);
+    ASSERT_TRUE(e.isClosed());
+    pub.clear();
+
+    // Candidate 1 with an equally fresh log asks for a vote in a newer term.
+    const Term candTerm = e.leadershipTermId() + 1;
+    e.onRequestVote(/*logLeadershipTermId=*/e.leadershipTermId(), e.appendPosition(),
+                    candTerm, /*candidateId=*/1, nowNs);
+
+    ASSERT_EQ(pub.placeVoteCalls.size(), 1u)
+        << "a CLOSED (zombie) leader must answer a higher-term RequestVote — "
+           "a silent drop withholds the vote the survivors need for a majority";
+    EXPECT_TRUE(pub.placeVoteCalls[0].vote);
+    EXPECT_EQ(pub.placeVoteCalls[0].toMember, 1);
+    EXPECT_FALSE(e.isClosed());
+    EXPECT_NE(e.leaderMemberId(), 0);
+}
+
+TEST(ElectionLog, ClosedLeaderStepDownRegression_LostFollowerQuorum_StepsDown) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+    closeAsThreeMemberLeader(e, pub, nowNs);
+    ASSERT_TRUE(e.isClosed());
+
+    // Paused / partitioned leader: no AppendPosition from any follower for longer
+    // than the heartbeat timeout (the docker-pause resume case).
+    nowNs += e.leaderHeartbeatTimeoutNs() + 1;
+    e.doWork(nowNs);
+    EXPECT_EQ(e.state(), ElectionState::Canvass)
+        << "a CLOSED leader without an active follower quorum must step down";
+    EXPECT_EQ(e.leaderMemberId(), -1);
+}
+
+TEST(ElectionLog, ClosedLeaderStepDownRegression_LiveFollowers_KeepLeadership) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+    closeAsThreeMemberLeader(e, pub, nowNs);
+    ASSERT_TRUE(e.isClosed());
+
+    // Only ONE follower reports (2 of 3 incl. the leader = quorum) for 10 timeouts.
+    const int64_t end = nowNs + 10 * e.leaderHeartbeatTimeoutNs();
+    while (nowNs < end) {
+        nowNs += kStatusIntervalNs;
+        e.onAppendPosition(nowNs, e.leadershipTermId(), e.appendPosition(), 1, 0);
+        e.doWork(nowNs);
+        ASSERT_TRUE(e.isClosed()) << "a leader with a live follower quorum must keep leadership";
+    }
+    EXPECT_EQ(e.leaderMemberId(), 0);
+}
+
+TEST(ElectionLog, ClosedLeaderStepDownRegression_StaleCandidateRequestVote_KeepsLeadership) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+    closeAsThreeMemberLeader(e, pub, nowNs);
+    ASSERT_TRUE(e.isClosed());
+    pub.clear();
+
+    // A candidate whose log is BEHIND ours asks at a higher term: denied, and a
+    // denied candidacy must never unseat the live leader (MAJOR-R3).
+    e.onRequestVote(/*logLeadershipTermId=*/-1, /*logPosition=*/0,
+                    e.leadershipTermId() + 1, /*candidateId=*/1, nowNs);
+    ASSERT_EQ(pub.placeVoteCalls.size(), 1u);
+    EXPECT_FALSE(pub.placeVoteCalls[0].vote);
+    EXPECT_TRUE(e.isClosed());
+    EXPECT_EQ(e.leaderMemberId(), 0);
+}
+
+// DR-10 flap (2026-10-05, second layer): the node runtime treats a node as the
+// consensus leader from LEADER_LOG_REPLICATION on (isLocalLeader), and its
+// partition controller reassigns off eligibleNodeIds() right away.  The peer
+// liveness grace was seeded only in electionComplete() (CLOSED), so for the
+// whole LEADER_* window every peer read as dead (eligN=1): the new controller
+// fenced EVERY partition — including those of a live peer — to itself with
+// ISR {self}.  The grace must hold from the moment this node leads.
+TEST(ElectionLog, LeaderLivenessGraceRegression_PeersEligibleFromLeaderLogReplication) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+    int64_t nowNs = 1'000'000'000'000LL;   // far past any sentinel window
+    bringToLeaderLogReplication(e, nowNs);
+    ASSERT_EQ(e.state(), ElectionState::LeaderLogReplication);
+
+    NodeId out[8];
+    const std::size_t n = e.eligibleNodeIds(nowNs, 0, out, 8);
+    std::vector<NodeId> elig(out, out + n);
+    EXPECT_EQ(elig, (std::vector<NodeId>{0, 1, 2}))
+        << "a just-elected leader must not see its live peers as dead before CLOSED";
+}

@@ -1061,7 +1061,12 @@ int PartitionReplica::retryOwedFetchAnswers_() noexcept
 std::vector<uint8_t> PartitionReplica::read(Offset fetchOffset,
                                               int32_t maxBytes) const
 {
-    Offset hw = highWatermark();
+    return readUpTo(fetchOffset, maxBytes, highWatermark());
+}
+
+std::vector<uint8_t> PartitionReplica::readUpTo(Offset fetchOffset, int32_t maxBytes,
+                                                Offset hw) const
+{
     if (fetchOffset >= hw) {
         return {}; // nothing committed at this position
     }

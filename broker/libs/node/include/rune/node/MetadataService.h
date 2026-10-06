@@ -1516,6 +1516,7 @@ public:
         // hw is the next-unwritten offset so the last committed is hw-1).
         msm_.commit(hw - 1);
         if (cursor > lastApplied_) lastApplied_ = cursor;
+        if (hw > committedEnd_) committedEnd_ = hw;
         if (amLeader) maybeCatchUp_();
 
         // Drain the dynamic assignment queue (bounded per cycle).
@@ -1536,7 +1537,13 @@ public:
     bool rebuildFromLog() {
         if (!replica_) return false;
 
-        const rune::replication::Offset hw = replica_->highWatermark();
+        // MetadataTruncationRebuildRegression: a demoted follower's HW is 0
+        // until its new leader answers — replaying only to it published an EMPTY
+        // committed map and the bridge quarantined every replica of this node.
+        // What this MSM already committed survives any truncation.
+        const rune::replication::Offset hw = std::max(
+            replica_->highWatermark(),
+            std::min(committedEnd_, replica_->logEndOffset()));
 
         // Reset state.  The fresh MSM restarts its committed version at 0: fold
         // the old one into the epoch so routingVersion() never repeats a value.
@@ -1551,7 +1558,7 @@ public:
 
         while (cursor < hw) {
             const std::vector<uint8_t> data =
-                replica_->read(cursor, kChunkBytes);
+                replica_->readUpTo(cursor, kChunkBytes, hw);
             if (data.empty()) break;
 
             std::size_t pos = 0;
@@ -1597,6 +1604,7 @@ public:
         // Commit everything up to hw-1.
         msm_.commit(hw - 1);
         lastApplied_ = cursor;
+        committedEnd_ = hw;
         return true;
     }
 
@@ -1778,6 +1786,11 @@ private:
 
     // Last log offset we have read batches from.  Initialized to -1 (nothing applied).
     rune::replication::Offset lastApplied_ = -1;
+    // MetadataTruncationRebuildRegression: exclusive end of the log the MSM has
+    // COMMITTED.  Committed records are never truncated (KIP-101/279 cut only
+    // above the HW), so a rebuild after a truncation replays at least this far
+    // (capped at the LEO) even while the freshly-demoted follower's HW reads 0.
+    rune::replication::Offset committedEnd_ = 0;
 
     // Follower→Leader transition gate (mirrors TCS / GCS patterns).
     bool wasLeader_ = false;
