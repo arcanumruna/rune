@@ -82,7 +82,7 @@ std::size_t countSuffix(const fs::path& dir, const std::string& suffix) {
     return n;
 }
 
-/// Counts demands of each kind ([0] = all, [1] = Threshold, [2] = Adopted).
+/// Counts demands of each kind ([0] = all, [1] = Threshold, [2] = Adopted, [3] = Hold).
 struct NoopHook {
     static bool fn(void* ctx, Log*, Log::ProvisionDemand k) noexcept {
         auto* c = static_cast<int*>(ctx);
@@ -174,7 +174,7 @@ TEST(SegmentLifecycleRegression, RollNeverPreallocatesOnOwnerRegression) {
     {
         Log log(dir.string(), 512);
         log.recover();
-        int demands[3] = {0, 0, 0};
+        int demands[4] = {0, 0, 0, 0};
         log.setProvisioning({&NoopHook::fn, demands});
         int64_t off = 0;
         int rolls = 0;
@@ -203,7 +203,7 @@ TEST(SegmentLifecycleRegression, ProvisionedRollWithEmptyPoolDefersNeverCreatesI
     {
         Log log(dir.string(), 512);
         log.recover();
-        int demands[3] = {0, 0, 0};
+        int demands[4] = {0, 0, 0, 0};
         log.setProvisioning({&NoopHook::fn, demands});
         int64_t off = 0;
         while (!log.rollDeferred()) off = put(log, off);   // fill the active segment
@@ -232,7 +232,7 @@ TEST(SegmentLifecycleRegression, DeferredRollOvershootIsBoundedRegression) {
     {
         Log log(dir.string(), 512);
         log.recover();
-        int demands[3] = {0, 0, 0};
+        int demands[4] = {0, 0, 0, 0};
         log.setProvisioning({&NoopHook::fn, demands});
         int64_t off = 0;
         while (log.segmentBaseOffsets().size() < 2 && off < 1000000) off = put(log, off);
@@ -415,7 +415,7 @@ TEST(SegmentLifecycleRegression, FullRenameRingDefersRollNeverDropsRenameRegress
     {
         Log log(dir.string(), 256);
         log.recover();
-        int demands[3] = {0, 0, 0};
+        int demands[4] = {0, 0, 0, 0};
         log.setProvisioning({&NoopHook::fn, demands});
         int64_t off = 0;
         // Adopt segments without ever finalizing their renames.
@@ -469,7 +469,7 @@ TEST(SegmentLifecycleRegression, SteadyStateRollAllocatesNothingOnOwnerRegressio
     {
         Log log(dir.string(), 256);
         log.recover();
-        int demands[3] = {0, 0, 0};
+        int demands[4] = {0, 0, 0, 0};
         log.setProvisioning({&NoopHook::fn, demands});
         // Pre-built batches: building one allocates (test side, outside windows).
         std::vector<std::vector<uint8_t>> batches;
@@ -526,7 +526,7 @@ TEST(SegmentLifecycleRegression, ProvisionerFailureRollsInlineNeverHangsRegressi
     {
         Log log(dir.string(), 512);
         log.recover();
-        int demands[3] = {0, 0, 0};
+        int demands[4] = {0, 0, 0, 0};
         log.setProvisioning({&NoopHook::fn, demands});
         int64_t off = 0;
         while (!log.rollDeferred()) off = put(log, off);
@@ -559,7 +559,7 @@ TEST(SegmentLifecycleRegression, ProvisionerFailureThenInlineFailureFailsTheLogR
     {
         Log log(dir.string(), 512);
         log.recover();
-        int demands[3] = {0, 0, 0};
+        int demands[4] = {0, 0, 0, 0};
         log.setProvisioning({&NoopHook::fn, demands});
         int64_t off = 0;
         while (!log.rollDeferred()) off = put(log, off);
@@ -582,7 +582,7 @@ TEST(SegmentLifecycleRegression, ProvisioningIsDemandDrivenByFillThresholdRegres
     {
         Log log(dir.string(), 4096);
         log.recover();
-        int demands[3] = {0, 0, 0};
+        int demands[4] = {0, 0, 0, 0};
         log.setProvisioning({&NoopHook::fn, demands}, /*thresholdPct=*/50);
         int64_t off = 0;
         // Fill to just below half: no demand.
@@ -604,8 +604,9 @@ TEST(SegmentLifecycleRegression, LostDemandIsRepostedRegression) {
     {
         struct Flaky {
             int accepted = 0, refused = 0, refuseLeft = 3;
-            static bool fn(void* c, Log*, Log::ProvisionDemand) noexcept {
+            static bool fn(void* c, Log*, Log::ProvisionDemand k) noexcept {
                 auto* f = static_cast<Flaky*>(c);
+                if (k != Log::ProvisionDemand::Threshold) return true;
                 if (f->refuseLeft > 0) { --f->refuseLeft; ++f->refused; return false; }
                 ++f->accepted;
                 return true;
@@ -656,7 +657,7 @@ TEST(SegmentLifecycleRegression, CrashWithReadyAndQueuedRenamesRecoversAllDataRe
     {
         Log log(dir.string(), 256);
         log.recover();
-        int demands[3] = {0, 0, 0};
+        int demands[4] = {0, 0, 0, 0};
         log.setProvisioning({&NoopHook::fn, demands});
         int64_t off = 0;
         int adopted = 0;
@@ -717,6 +718,142 @@ TEST(SegmentLifecycleRegression, TornStagingFileIsQuarantinedNeverOverwritesRegr
         EXPECT_EQ(log.recover(), leo);
         EXPECT_EQ(fs::file_size(seg0), size0) << "the existing segment was overwritten";
         EXPECT_TRUE(fs::exists(dir / ".staging-77.stlog.corrupt")) << "quarantined, not deleted";
+    }
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// Re-review N1: a rename that completes between the cold path's done-ring
+// drain and its rename-ring read must never be missed — truncateTo would
+// delete the segment by its STALE staging path (a silent no-op), leaving the
+// real <base>.log on disk: the truncated (divergent) records resurrect after a
+// restart.
+// ===========================================================================
+namespace {
+std::string base20(int64_t b) {
+    std::string s = std::to_string(b);
+    return std::string(20 - s.size(), '0') + s;
+}
+} // namespace
+
+TEST(SegmentLifecycleRegression, RenameCompletingInsideColdPathIsNeverMissedRegression) {
+    const auto dir = freshDir("rune_slh_n1");
+    int64_t bBase = -1;
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        int64_t off = 0;
+        while (log.segmentSizeForTest(0) < 512) off = put(log, off);   // A [0, ..) inline-created
+        int demands[4] = {0, 0, 0, 0};
+        log.setProvisioning({&NoopHook::fn, demands});
+        ASSERT_EQ(log.provisionReady(1), 1);
+        off = put(log, off);                                          // rolls: adopts B
+        bBase = log.segmentBaseOffsets().back();
+        ASSERT_GT(bBase, 0);
+        for (int i = 0; i < 3; ++i) off = put(log, off);
+        // The provisioner finishes B's rename exactly inside the cold path.
+        log.setColdPathInterleaveForTest([](void* l) { (void)static_cast<Log*>(l)->finalizeStagingRenames(); }, &log);
+        bool done = false;
+        for (int i = 0; i < 4 && !done; ++i) {
+            done = log.truncateTo(bBase);
+            log.setColdPathInterleaveForTest(nullptr, nullptr);
+        }
+        ASSERT_TRUE(done);
+        EXPECT_FALSE(log.storageFailed());
+        EXPECT_EQ(log.logEndOffset(), bBase);
+        EXPECT_FALSE(fs::exists(dir / (base20(bBase) + ".log")))
+            << "the truncated segment's file survived (deleted by its stale staging path)";
+        log.crashForTest();
+    }
+    {
+        Log log(dir.string(), 512);
+        EXPECT_EQ(log.recover(), bBase) << "truncated records resurrected after restart";
+    }
+    fs::remove_all(dir);
+}
+
+// Re-review N1, the reloadSegments window: same interleaving, reload must see
+// the renamed file and keep every record.
+TEST(SegmentLifecycleRegression, RenameCompletingInsideReloadIsNeverMissedRegression) {
+    const auto dir = freshDir("rune_slh_n1r");
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        int64_t off = 0;
+        while (log.segmentSizeForTest(0) < 512) off = put(log, off);
+        int demands[4] = {0, 0, 0, 0};
+        log.setProvisioning({&NoopHook::fn, demands});
+        ASSERT_EQ(log.provisionReady(1), 1);
+        off = put(log, off);
+        for (int i = 0; i < 3; ++i) off = put(log, off);
+        const int64_t leo = log.logEndOffset();
+        log.setColdPathInterleaveForTest([](void* l) { (void)static_cast<Log*>(l)->finalizeStagingRenames(); }, &log);
+        bool done = false;
+        for (int i = 0; i < 4 && !done; ++i) {
+            done = log.reloadSegments();
+            log.setColdPathInterleaveForTest(nullptr, nullptr);
+        }
+        ASSERT_TRUE(done);
+        EXPECT_FALSE(log.storageFailed());
+        EXPECT_EQ(log.logEndOffset(), leo);
+        off = put(log, off);
+        EXPECT_FALSE(log.storageFailed());
+        int64_t cursor = 0;
+        while (cursor < off) {
+            auto bytes = log.read(cursor, 1 << 20);
+            ASSERT_FALSE(bytes.empty()) << cursor;
+            RecordBatchReader r(bytes.data(), bytes.size());
+            ASSERT_TRUE(r.ensureValid());
+            cursor = r.baseOffset() + r.lastOffsetDelta() + 1;
+        }
+    }
+    fs::remove_all(dir);
+}
+
+// Re-review N2: a held roll re-posts its demand (Hold) at the first blocked
+// check and every kHoldRepostChecks checks — a demand the provisioner could not
+// keep (parked for a log it did not know yet, then dropped) is recovered; a
+// hold never waits forever on a lost demand.
+TEST(SegmentLifecycleRegression, HeldRollRepostsItsDemandRegression) {
+    const auto dir = freshDir("rune_slh_n2");
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        int demands[4] = {0, 0, 0, 0};
+        log.setProvisioning({&NoopHook::fn, demands});
+        int64_t off = 0;
+        while (!log.rollDeferred()) off = put(log, off);
+        EXPECT_EQ(demands[1], 1) << "Threshold";
+        EXPECT_EQ(demands[3], 1) << "the hold episode posted its Hold demand at once";
+        for (uint32_t i = 0; i < 3 * Log::kHoldRepostChecks; ++i) ASSERT_TRUE(log.rollDeferred());
+        EXPECT_EQ(demands[3], 4) << "re-posted every kHoldRepostChecks blocked checks";
+        ASSERT_EQ(log.provisionReady(1), 1);
+        off = put(log, off);   // rolls: the episode ends
+        while (!log.rollDeferred()) off = put(log, off);
+        EXPECT_EQ(demands[3], 5) << "a new episode posts again";
+    }
+    fs::remove_all(dir);
+}
+
+// Re-review N3: over the reservation cap a ready segment is still built off the
+// owner, only without its block reservation (no inline roll on the worker).
+TEST(SegmentLifecycleRegression, UnpreallocatedReadySegmentIsAdoptedRegression) {
+    const auto dir = freshDir("rune_slh_n3");
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        int demands[4] = {0, 0, 0, 0};
+        log.setProvisioning({&NoopHook::fn, demands});
+        int64_t off = 0;
+        while (!log.rollDeferred()) off = put(log, off);
+        ASSERT_EQ(log.provisionReady(1, /*preallocate=*/false), 1);
+        const auto segs = log.segmentBaseOffsets().size();
+        off = put(log, off);
+        EXPECT_EQ(log.segmentBaseOffsets().size(), segs + 1);
+        EXPECT_EQ(log.failureInlineRollsForTest(), 0u);
+        EXPECT_EQ(log.ownerPreallocsForTest(), 0u);
+        (void)log.finalizeStagingRenames();
+        (void)log.drainStagingRenamesDone();
     }
     fs::remove_all(dir);
 }

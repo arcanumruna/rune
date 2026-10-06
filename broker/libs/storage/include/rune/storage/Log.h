@@ -750,7 +750,14 @@ public:
     // segment never written is an empty staging file — construction deletes it
     // (recoverStagingFiles); a clean shutdown deletes the unconsumed ones.
     static constexpr std::size_t kMaxProvisionDepth = 8;
-    enum class ProvisionDemand : int64_t { Threshold = 1, Adopted = 2 };
+    /// Threshold: the active segment crossed the fill threshold (build).
+    /// Adopted: a ready segment was adopted (finalize its rename).
+    /// Hold: a roll is being HELD for want of a ready segment — posted at the
+    /// first blocked check of an episode and again every kHoldRepostChecks
+    /// blocked checks (re-review N2: recovers a demand the provisioner could
+    /// not keep; counted as the roll-hold metric).  Served like Threshold.
+    enum class ProvisionDemand : int64_t { Threshold = 1, Adopted = 2, Hold = 3 };
+    static constexpr uint32_t kHoldRepostChecks = 1024;
     /// Demand signal (owner thread → provisioner).  A plain function pointer +
     /// context (no virtual call).  Returns false when the demand could not be
     /// queued (full ring): the owner re-posts it later (never lost).
@@ -775,7 +782,7 @@ public:
     /// + object construction, NEVER touches segments_.  Returns the number of
     /// segments built.  A failed build posts a FAILURE record (review M1) and
     /// returns -errno.
-    int provisionReady(std::size_t depth);
+    int provisionReady(std::size_t depth, bool preallocate = true);
     /// Provisioning thread: tell the owner no segment will come for its pending
     /// demand (e.g. the node-wide reservation cap): the owner rolls inline.
     void reportProvisionFailure(int err) noexcept;
@@ -799,6 +806,10 @@ public:
     /// they forced inline.
     [[nodiscard]] uint64_t provisionFailuresForTest() const noexcept { return provisionFailures_; }
     [[nodiscard]] uint64_t failureInlineRollsForTest() const noexcept { return failureInlineRolls_; }
+    /// Test seam (re-review N1): called inside beginColdPath_ between its
+    /// rename-ring read and its done-ring drain — a test plays the provisioner
+    /// finishing a rename exactly there.  Owner thread; null in production.
+    void setColdPathInterleaveForTest(void (*fn)(void*), void* ctx) noexcept { coldSeamFn_ = fn; coldSeamCtx_ = ctx; }
     /// Provisioning thread (tests): make the next `n` builds fail with `err`.
     void setProvisionFaultForTest(int err, int n = 1) noexcept { provisionFaultErr_ = err; provisionFaultN_ = n; }
 
@@ -1209,6 +1220,8 @@ private:
     ProvisionHook provisionHook_{};
     int64_t       provisionThresholdBytes_ = 0;   ///< owner: Threshold demand point
     bool          thresholdPosted_ = false;       ///< owner: Threshold demand queued for this segment
+    void (*coldSeamFn_)(void*) = nullptr;         ///< see setColdPathInterleaveForTest
+    void* coldSeamCtx_ = nullptr;
     bool          adoptedPostPending_ = false;    ///< owner: an Adopted demand still to queue
     uint64_t      provisionFailures_ = 0;         ///< owner: failure records pulled
     uint64_t      failureInlineRolls_ = 0;        ///< owner: rolls made inline because of one
@@ -1217,6 +1230,17 @@ private:
     void pullReady_() noexcept;
     /// Owner: queue the demands that are due (threshold crossed / adoption).
     void postProvisionDemands_(int64_t activeBytes) noexcept;
+    /// Owner: a blocked check (no ready segment): post the Hold demand at the
+    /// first check of an episode and every kHoldRepostChecks checks after.
+    void noteHoldCheck_() noexcept {
+        if ((holdChecks_++ % kHoldRepostChecks) == 0 || holdPostPending_) {
+            holdPostPending_ = provisionHook_.fn == nullptr ||
+                               !provisionHook_.fn(provisionHook_.ctx, this, ProvisionDemand::Hold);
+            if (provisionHook_.fn == nullptr) holdPostPending_ = false;
+        }
+    }
+    uint32_t holdChecks_ = 0;        ///< owner: blocked checks in the current hold episode
+    bool     holdPostPending_ = false;
     uint64_t      rollDeferrals_ = 0;     ///< see rollDeferralsForTest (owner)
     uint64_t      ownerPreallocs_ = 0;    ///< see ownerPreallocsForTest (owner)
     uint64_t      forcedRolls_    = 0;    ///< see forcedRollsForTest (owner)
@@ -1245,7 +1269,11 @@ private:
         // staging name / pathPending for good and retention would stall).
         // A pulled FAILURE (review M1) unblocks: the roll goes inline.
         postProvisionDemands_(rollBytes_);   // a demand lost to a full ring is re-posted here
-        if (!readyAvailable()) return failFront_ == 0;
+        if (!readyAvailable()) {
+            if (failFront_ != 0) return false;
+            noteHoldCheck_();
+            return true;
+        }
         return !renameRoom_();
     }
 

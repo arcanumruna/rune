@@ -535,7 +535,7 @@ bool Log::snapshotMatchesSegmentsForTest() const {
 // ---------------------------------------------------------------------------
 // Ready pool (hotpath-A F1 + F2).
 // ---------------------------------------------------------------------------
-int Log::provisionReady(std::size_t depth) {
+int Log::provisionReady(std::size_t depth, bool preallocate) {
     // PROVISIONING thread only (the ring's single producer).  NEVER touches
     // segments_.  Every expensive step of a roll happens here: create + open
     // the files, ftruncate + mmap + prefault the index, map the read view, and
@@ -574,7 +574,9 @@ int Log::provisionReady(std::size_t depth) {
         }
         // F1: reserve the blocks HERE (was fallocate(rollBytes) on the owner at
         // every roll — 150-330 µs).  KEEP_SIZE: O_APPEND still writes at offset 0.
-        seg->preallocate(rollBytes_);
+        // Re-review N3: over the node-wide reservation cap the segment is still
+        // built off the owner — only the block reservation is shed.
+        if (preallocate) seg->preallocate(rollBytes_);
         LogSegment* raw = seg.release();
         // Publish: the ring's commit hands the fully built segment (files, maps,
         // blocks) to the owner's poll in pullReady_().
@@ -684,6 +686,8 @@ void Log::installNextSegment(int64_t base) {
     segments_.rbegin()->second->setDirEntryGen(++dirMutGen_);
     // Review M3: the new active segment demands its successor at the threshold.
     thresholdPosted_ = false;
+    holdChecks_ = 0;            // a hold episode ends with the roll
+    holdPostPending_ = false;
     if (provisioned_) postProvisionDemands_(0);
 }
 // --- Staging path helpers (background-pre-provisioning naming convention) ---
@@ -2207,20 +2211,25 @@ bool Log::ownerDrainAllowed_(bool& pause) noexcept {
 bool Log::beginColdPath_(int64_t touchFrom) noexcept {
     // hotpath-A: never touch a segment by path while its staging -> <base>
     // rename is in flight (the provisioner renames promptly; the in-memory
-    // logPath_ only follows once the owner drains the done ring).  Completed
-    // renames are applied first; a QUEUED rename defers the cold path only if
-    // its segment is one the cold path touches (base >= touchFrom — review m6:
-    // a sustained roll rate must not starve retention of the old segments).
-    // The caller retries — no wait.
+    // logPath_ only follows once the owner drains the done ring).  A QUEUED
+    // rename defers the cold path only if its segment is one the cold path
+    // touches (base >= touchFrom — review m6).  The caller retries — no wait.
+    //
+    // Re-review N1 — ORDER MATTERS: acquire the request head FIRST, then drain
+    // the done ring.  The provisioner publishes a completion (done ring) before
+    // it releases the request slot, so every rename below the acquired head is
+    // visible to the drain that follows; a rename that completes after the
+    // acquire is still inside [head, tail) and defers.  (Draining first missed
+    // a rename completing in between: the cold path then deleted the segment by
+    // its stale staging path and the real <base>.log survived.)
+    const std::size_t reqTail = renameReqTail_.load(std::memory_order_relaxed);   // owner = producer
+    const std::size_t reqHead = renameReqHead_.load(std::memory_order_acquire);
+    if (coldSeamFn_ != nullptr) [[unlikely]] coldSeamFn_(coldSeamCtx_);
     (void)drainStagingRenamesDone();
-    {
-        const std::size_t reqTail = renameReqTail_.load(std::memory_order_relaxed);   // owner = producer
-        const std::size_t reqHead = renameReqHead_.load(std::memory_order_acquire);
-        // Slots in [head, tail) were written by this (producer) thread and are
-        // only read by the consumer: reading them here races nothing.
-        for (std::size_t i = reqHead; i != reqTail; ++i)
-            if (renameReqRing_[i & kRenameRingMask].base >= touchFrom) return false;
-    }
+    // Slots in [head, tail) were written by this (producer) thread and are only
+    // read by the consumer: reading them here races nothing.
+    for (std::size_t i = reqHead; i != reqTail; ++i)
+        if (renameReqRing_[i & kRenameRingMask].base >= touchFrom) return false;
     if (fileOpsQuiescent()) { pauseSwapPost_ = pauseDropPost_ = false; return true; }
     pauseSwapPost_ = pauseDropPost_ = true;   // the next drains post nothing: let the cleaner catch up
     return false;
