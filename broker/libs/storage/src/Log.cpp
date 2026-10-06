@@ -106,7 +106,9 @@ int32_t Log::indexMaxBytesFor(int64_t rollBytes, int32_t indexIntervalBytes) noe
 }
 
 Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), rollBytes_(segmentRollBytes) {
-    indexMaxBytes_ = indexMaxBytesFor(rollBytes_, kDefaultIndexIntervalBytes);
+    // Review m2: sized for the deferred-roll overshoot cap, so a segment that
+    // overshot rollBytes never grows its index mapping on the owner.
+    indexMaxBytes_ = indexMaxBytesFor(maxDeferredRollBytes_(), kDefaultIndexIntervalBytes);
     spareSegNodes_.reserve(kSpareSegNodes);   // hotpath-A: recycled map nodes (see install_)
     // Reconcile any staging segment files left by a crash BEFORE discovering real
     // segments: an adopted-but-not-yet-renamed staging.log has its true base
@@ -204,7 +206,9 @@ Log::~Log() {
     // so these are single-threaded.  Finalize any pending staging→base renames so
     // a clean shutdown leaves correctly-named files on disk (otherwise the next
     // recover() would reconcile them anyway — this is just hygiene).
-    {
+    // A simulated CRASH (crashForTest) leaves the renames and the ready
+    // staging files exactly as a real crash would (construction reconciles).
+    if (!crashedForTest_) {
         const std::size_t head = renameReqHead_.load(std::memory_order_relaxed);
         const std::size_t tail = renameReqTail_.load(std::memory_order_relaxed);
         for (std::size_t i = head; i != tail; ++i) {
@@ -215,9 +219,13 @@ Log::~Log() {
     // hotpath-A F2: free every ready-but-unconsumed segment (the provisioner is
     // stopped: this thread is the ring's only party now).  Its destructor
     // closes fds / unmaps; then its never-written staging files are removed.
-    for (LogSegment* ready = takeReady_(); ready != nullptr; ready = takeReady_()) {
+    failFront_ = 0;
+    for (LogSegment* ready = takeReady_(); ready != nullptr || failFront_ != 0; ready = takeReady_()) {
+        failFront_ = 0;   // failure records hold nothing
+        if (ready == nullptr) continue;
         const int64_t seq = ready->stagingSeq();
         delete ready;
+        if (crashedForTest_) continue;
         std::error_code ec;
         std::filesystem::remove(stagingLogPathFor(seq), ec);
         std::filesystem::remove(stagingIndexPathFor(seq), ec);
@@ -249,7 +257,14 @@ void Log::maybeRoll() {
     // a roll is DEFERRED (hotpath-A, below), by the appends that arrive before
     // the condition clears.  A single oversized batch (larger than rollBytes)
     // always starts a new segment of its own — no splitting occurs.
-    if (activeSegment().sizeBytes() < rollBytes_) [[likely]] return;
+    const int64_t activeBytes = activeSegment().sizeBytes();
+    if (activeBytes < rollBytes_) [[likely]] {
+        // Review M3: demand the next segment once the active one is
+        // provisionThresholdBytes_ full (one compare per append otherwise).
+        if (provisioned_ && activeBytes >= provisionThresholdBytes_ && (!thresholdPosted_ || adoptedPostPending_))
+            [[unlikely]] postProvisionDemands_(activeBytes);
+        return;
+    }
     // hotpath-A F2 + F3: a roll NEVER blocks the owner.  No ready segment on a
     // provisioned log (never an inline create), or the async seal queue full
     // (never an inline seal fsync on a worker-driven log): defer the roll — the
@@ -526,44 +541,95 @@ int Log::provisionReady(std::size_t depth) {
     // the files, ftruncate + mmap + prefault the index, map the read view, and
     // fallocate the segment's blocks (F1).
     if (depth == 0) depth = 1;
-    if (depth > kReadyRingCapacity) depth = kReadyRingCapacity;
+    if (depth > kMaxProvisionDepth) depth = kMaxProvisionDepth;
     int built = 0;
     // At most `depth` builds per call: the owner may consume as fast as this
     // thread builds, and an unbounded loop would starve the caller's other
     // duties for this log (finalizeStagingRenames between refills).
     for (std::size_t b = 0; b < depth; ++b) {
-        const std::size_t tail = readyTail_.load(std::memory_order_relaxed);
-        const std::size_t head = readyHead_.load(std::memory_order_acquire);
-        if (tail - head >= depth) break;
+        if (readyQueuedApprox() >= depth) break;
         const int64_t seq = static_cast<int64_t>(stagingSeq_++);
         std::unique_ptr<LogSegment> seg;
+        int err = 0;
         try {
+            if (provisionFaultN_ > 0) [[unlikely]] {
+                --provisionFaultN_;
+                throw std::system_error(provisionFaultErr_, std::generic_category(), "provision fault (test)");
+            }
             seg = LogSegment::prepareStaging(stagingLogPathFor(seq), stagingIndexPathFor(seq), seq,
                                              kDefaultIndexIntervalBytes, indexMaxBytes_);
+        } catch (const std::system_error& e) {
+            err = e.code().value() != 0 ? e.code().value() : EIO;
         } catch (...) {
+            err = EIO;
+        }
+        if (err != 0) {
             std::error_code ec;   // a half-built staging file holds no data
             std::filesystem::remove(stagingLogPathFor(seq), ec);
             std::filesystem::remove(stagingIndexPathFor(seq), ec);
-            break;                // retried on the next call
+            // Review M1: never silent — the owner learns it over the ring and
+            // rolls inline (a failing inline create then fails the log).
+            reportProvisionFailure(err);
+            return -err;
         }
         // F1: reserve the blocks HERE (was fallocate(rollBytes) on the owner at
         // every roll — 150-330 µs).  KEEP_SIZE: O_APPEND still writes at offset 0.
         seg->preallocate(rollBytes_);
-        readyRing_[tail & kReadyRingMask] = seg.release();
-        // Publish: the release-store hands the fully built segment (files, maps,
-        // blocks) to the owner's acquire-load in takeReady_().
-        readyTail_.store(tail + 1, std::memory_order_release);
+        LogSegment* raw = seg.release();
+        // Publish: the ring's commit hands the fully built segment (files, maps,
+        // blocks) to the owner's poll in pullReady_().
+        if (!readyRing_.offer(kReadyMsg, static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(raw)), 0)) {
+            const int64_t s2 = raw->stagingSeq();
+            delete raw;   // ring full (failure records queued): nothing lost, retried on demand
+            std::error_code ec;
+            std::filesystem::remove(stagingLogPathFor(s2), ec);
+            std::filesystem::remove(stagingIndexPathFor(s2), ec);
+            break;
+        }
         ++built;
     }
     return built;
 }
 
+void Log::reportProvisionFailure(int err) noexcept {
+    // Provisioning thread.  A full ring already holds records the owner will
+    // pull first (each ends a hold), so a dropped failure record loses nothing.
+    (void)readyRing_.offer(kFailedMsg, err != 0 ? err : EIO, 0);
+}
+
+void Log::pullReady_() noexcept {
+    // OWNER (the ring's one consumer).  One record per call into the front slot.
+    if (readyFront_ != nullptr || failFront_ != 0) return;
+    (void)readyRing_.poll([this](int32_t type, int64_t a, int64_t) noexcept {
+        if (type == kReadyMsg) {
+            readyFront_ = reinterpret_cast<LogSegment*>(static_cast<std::uintptr_t>(a));
+        } else if (type == kFailedMsg) {
+            failFront_ = a != 0 ? static_cast<int>(a) : EIO;
+            ++provisionFailures_;
+            // Counted; logged rate-limited (powers of two — no timer).
+            if ((provisionFailures_ & (provisionFailures_ - 1)) == 0)
+                spdlog::warn("Log {}: segment provisioning failed (errno={}, failures={}): the next roll "
+                             "creates its segment inline", dir_, failFront_, provisionFailures_);
+        }
+    }, 1);
+}
+
+void Log::postProvisionDemands_(int64_t activeBytes) noexcept {
+    // OWNER.  Cold: at most a few times per segment (a failed offer is retried
+    // at the next append / hold check — a demand is never lost).
+    if (provisionHook_.fn == nullptr) return;
+    if (adoptedPostPending_ &&
+        provisionHook_.fn(provisionHook_.ctx, this, ProvisionDemand::Adopted))
+        adoptedPostPending_ = false;
+    if (!thresholdPosted_ && activeBytes >= provisionThresholdBytes_ &&
+        provisionHook_.fn(provisionHook_.ctx, this, ProvisionDemand::Threshold))
+        thresholdPosted_ = true;
+}
+
 LogSegment* Log::takeReady_() noexcept {
-    const std::size_t head = readyHead_.load(std::memory_order_relaxed);
-    const std::size_t tail = readyTail_.load(std::memory_order_acquire);
-    if (head == tail) return nullptr;
-    LogSegment* seg = readyRing_[head & kReadyRingMask];
-    readyHead_.store(head + 1, std::memory_order_release);   // the slot is the producer's again
+    pullReady_();
+    LogSegment* seg = readyFront_;
+    readyFront_ = nullptr;
     return seg;
 }
 
@@ -571,7 +637,11 @@ void Log::installNextSegment(int64_t base) {
     // OWNER thread only.
     // A provisioned log adopts only when its rename can be queued (a FORCED
     // roll past the overshoot cap with a full ring creates inline instead).
-    if (LogSegment* prepared = (!provisioned_ || renameRoom_()) ? takeReady_() : nullptr) {
+    // Review M1: a pulled provisioning FAILURE makes this roll inline (below).
+    pullReady_();
+    const bool failureRoll = provisioned_ && readyFront_ == nullptr && failFront_ != 0;
+    if (failureRoll) { failFront_ = 0; ++failureInlineRolls_; }
+    if (LogSegment* prepared = (!provisioned_ || renameRoom_()) && !failureRoll ? takeReady_() : nullptr) {
         // ADOPT — ZERO syscalls: pure in-memory rebase.  The staging .log/.index
         // keep their temp names on disk for now; the disk rename (staging →
         // <base>.{log,index}) is deferred to the background thread.
@@ -590,8 +660,8 @@ void Log::installNextSegment(int64_t base) {
             if (it != segments_.end())
                 it->second->setLogPath(logPathForBase(base));
         }
-        // F2: event-driven refill — tell the provisioner one was consumed.
-        if (provisionHook_.fn != nullptr) provisionHook_.fn(provisionHook_.ctx, this);
+        // F2: event-driven — the provisioner finalizes the rename (Adopted).
+        adoptedPostPending_ = true;
     } else {
         // LEGACY (non-provisioned) logs only — maybeRoll defers a provisioned
         // log's roll instead.  Correctness fallback: synchronous create (+ the
@@ -612,6 +682,9 @@ void Log::installNextSegment(int64_t base) {
     // reconciles — so the entry is durable once a directory fsync issued
     // after this point completes.
     segments_.rbegin()->second->setDirEntryGen(++dirMutGen_);
+    // Review M3: the new active segment demands its successor at the threshold.
+    thresholdPosted_ = false;
+    if (provisioned_) postProvisionDemands_(0);
 }
 // --- Staging path helpers (background-pre-provisioning naming convention) ---
 // NOTE: staging files use NON-".log"/".index" extensions (.stlog/.stidx) so they
@@ -732,8 +805,27 @@ void Log::recoverStagingFiles() {
             f.read(reinterpret_cast<char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
             f.close();
             rune::protocol::RecordBatchReader r(hdr.data(), hdr.size());
-            int64_t base = r.baseOffset();
-            std::filesystem::rename(lp, logPathForBase(base), ec);
+            const int32_t total = r.totalLength();
+            // Review m4: trust the base only from a COMPLETE, CRC-valid first
+            // batch, and never overwrite an existing segment.  Anything else is
+            // quarantined (kept, renamed .stlog.corrupt — never deleted, never
+            // parsed into a bogus base); recovery's chain validation handles the
+            // resulting gap like any lost write.
+            bool valid = false;
+            if (total > 0 && total <= fileSize) {
+                std::vector<uint8_t> first(static_cast<std::size_t>(total));
+                std::ifstream f2(lp, std::ios::binary);
+                f2.read(reinterpret_cast<char*>(first.data()), total);
+                valid = f2.good() && rune::protocol::RecordBatchReader(first.data(), first.size()).ensureValid();
+            }
+            const std::string target = valid ? logPathForBase(r.baseOffset()) : std::string();
+            if (valid && !std::filesystem::exists(target, ec)) {
+                std::filesystem::rename(lp, target, ec);
+            } else {
+                spdlog::error("Log {}: staging file {} {} — quarantined as .corrupt (never parsed / overwritten)",
+                              dir_, lp.string(), valid ? "would overwrite an existing segment" : "has no valid first batch");
+                std::filesystem::rename(lp, lp.string() + ".corrupt", ec);
+            }
             // Drop any co-named staging.index (recover() rebuilds the index).
         } else {
             f.close();
@@ -1451,7 +1543,12 @@ bool Log::truncateTo(int64_t truncateOffset) {
     if (truncateOffset >= logEndOffset_) return true; // nothing to do
     // Fix round 5: never touch a file by path while the cleaner still has
     // posted renames to perform — deferred, no wait (the caller retries).
-    if (!beginColdPath_()) return false;
+    {
+        // Touched: the segment holding truncateOffset and every later one.
+        auto t = segments_.upper_bound(truncateOffset);
+        const int64_t touchFrom = t == segments_.begin() ? INT64_MIN : std::prev(t)->first;
+        if (!beginColdPath_(touchFrom)) return false;
+    }
     // E1d F6: the lowered recovery point is DURABLE before any file is deleted
     // or resized (a crash in between must never trust bytes about to go).
     persistAtMost_(std::max<int64_t>(0, truncateOffset));
@@ -1649,7 +1746,7 @@ bool Log::truncateTo(int64_t truncateOffset) {
 }
 
 bool Log::reloadSegments() {
-    if (!beginColdPath_()) return false;   // fix round 5: posted renames first (deferred, no wait)
+    if (!beginColdPath_(INT64_MIN)) return false;   // fix round 5: posted renames first (deferred, no wait)
     // Re-discover segment files on disk (same logic as the constructor).
     std::vector<int64_t> bases;
     for (auto& e : std::filesystem::directory_iterator(dir_))
@@ -1809,7 +1906,8 @@ void Log::reloadSegmentNoPublish_(int64_t baseOffset) {
 }
 
 int Log::deleteOldSegments(int64_t retainBytes, int64_t highWatermark) {
-    if (!beginColdPath_()) return 0;   // fix round 5: posted renames first (retried next pass)
+    // Review m6: queued renames never block it (it stops at a pathPending segment).
+    if (!beginColdPath_(INT64_MAX)) return 0;   // fix round 5: posted renames first (retried next pass)
     int deleted = 0;
     int64_t total = totalBytes();   // review LOW-2: one O(n) sum, then a running total
     while (segments_.size() > 1 && total > retainBytes) {
@@ -1817,6 +1915,7 @@ int Log::deleteOldSegments(int64_t retainBytes, int64_t highWatermark) {
         // MAJOR-3 (Kafka: HW >= nextSegment.baseOffset): never delete a segment
         // holding records above the HW (not yet replicated / committed).
         if (std::next(it)->first > highWatermark) break;
+        if (it->second->pathPending()) break;   // its staging rename is in flight (review m6)
         std::string base = it->second->logPath();
         std::string idx = indexPathForLog(base);
         total -= it->second->sizeBytes();
@@ -2105,18 +2204,22 @@ bool Log::ownerDrainAllowed_(bool& pause) noexcept {
     return true;
 }
 
-bool Log::beginColdPath_() noexcept {
+bool Log::beginColdPath_(int64_t touchFrom) noexcept {
     // hotpath-A: never touch a segment by path while its staging -> <base>
     // rename is in flight (the provisioner renames promptly; the in-memory
-    // logPath_ only follows once the owner drains the done ring).  Queued
-    // renames: defer (the caller retries — no wait).  None queued: every
-    // completed rename is in the done ring now (the provisioner publishes it
-    // before releasing the request slot) — apply them, then go on.
+    // logPath_ only follows once the owner drains the done ring).  Completed
+    // renames are applied first; a QUEUED rename defers the cold path only if
+    // its segment is one the cold path touches (base >= touchFrom — review m6:
+    // a sustained roll rate must not starve retention of the old segments).
+    // The caller retries — no wait.
+    (void)drainStagingRenamesDone();
     {
         const std::size_t reqTail = renameReqTail_.load(std::memory_order_relaxed);   // owner = producer
         const std::size_t reqHead = renameReqHead_.load(std::memory_order_acquire);
-        if (reqHead != reqTail) return false;
-        (void)drainStagingRenamesDone();
+        // Slots in [head, tail) were written by this (producer) thread and are
+        // only read by the consumer: reading them here races nothing.
+        for (std::size_t i = reqHead; i != reqTail; ++i)
+            if (renameReqRing_[i & kRenameRingMask].base >= touchFrom) return false;
     }
     if (fileOpsQuiescent()) { pauseSwapPost_ = pauseDropPost_ = false; return true; }
     pauseSwapPost_ = pauseDropPost_ = true;   // the next drains post nothing: let the cleaner catch up

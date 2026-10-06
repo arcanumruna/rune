@@ -6,7 +6,11 @@ add_library(rune_storage src/dummy.cpp src/MappedFile.cpp src/OffsetIndex.cpp sr
     src/ProducePath.cpp)
 target_include_directories(rune_storage PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        # hotpath-A review M2: the ready ring is rune::consensus::ControlRing
+        # (header-only agrona ring copy) — no hand-rolled atomics in storage.
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../consensus/include>
         ${RUNE_PROTOCOL_INCLUDE})
+target_link_libraries(rune_storage PUBLIC aeron::aeron)
 # ProducePath.cpp uses spdlog (warn/error/debug logging).
 find_package(spdlog QUIET)
 if(spdlog_FOUND)

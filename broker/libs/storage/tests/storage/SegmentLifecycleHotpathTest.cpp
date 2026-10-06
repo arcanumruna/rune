@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <new>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -81,8 +82,14 @@ std::size_t countSuffix(const fs::path& dir, const std::string& suffix) {
     return n;
 }
 
+/// Counts demands of each kind ([0] = all, [1] = Threshold, [2] = Adopted).
 struct NoopHook {
-    static void fn(void* ctx, Log*) noexcept { ++*static_cast<int*>(ctx); }
+    static bool fn(void* ctx, Log*, Log::ProvisionDemand k) noexcept {
+        auto* c = static_cast<int*>(ctx);
+        ++c[0];
+        ++c[static_cast<int>(k)];
+        return true;
+    }
 };
 
 } // namespace
@@ -167,8 +174,8 @@ TEST(SegmentLifecycleRegression, RollNeverPreallocatesOnOwnerRegression) {
     {
         Log log(dir.string(), 512);
         log.recover();
-        int demands = 0;
-        log.setProvisioning({&NoopHook::fn, &demands});
+        int demands[3] = {0, 0, 0};
+        log.setProvisioning({&NoopHook::fn, demands});
         int64_t off = 0;
         int rolls = 0;
         const uint64_t before = log.ownerPreallocsForTest();
@@ -181,7 +188,7 @@ TEST(SegmentLifecycleRegression, RollNeverPreallocatesOnOwnerRegression) {
             (void)log.drainStagingRenamesDone();
         }
         EXPECT_EQ(log.ownerPreallocsForTest(), before) << "F1: fallocate of the next segment on the owner";
-        EXPECT_EQ(demands, rolls) << "every adopted segment posts one refill demand";
+        EXPECT_EQ(demands[2], rolls) << "every adopted segment posts one Adopted demand";
     }
     fs::remove_all(dir);
 }
@@ -196,8 +203,8 @@ TEST(SegmentLifecycleRegression, ProvisionedRollWithEmptyPoolDefersNeverCreatesI
     {
         Log log(dir.string(), 512);
         log.recover();
-        int demands = 0;
-        log.setProvisioning({&NoopHook::fn, &demands});
+        int demands[3] = {0, 0, 0};
+        log.setProvisioning({&NoopHook::fn, demands});
         int64_t off = 0;
         while (!log.rollDeferred()) off = put(log, off);   // fill the active segment
         const auto segsBefore = log.segmentBaseOffsets().size();
@@ -212,7 +219,7 @@ TEST(SegmentLifecycleRegression, ProvisionedRollWithEmptyPoolDefersNeverCreatesI
         EXPECT_FALSE(log.rollDeferred()) << "a ready segment clears the deferral";
         off = put(log, off);
         EXPECT_EQ(log.segmentBaseOffsets().size(), segsBefore + 1) << "the deferred roll happened";
-        EXPECT_EQ(demands, 1);
+        EXPECT_EQ(demands[2], 1);
         EXPECT_TRUE(log.snapshotMatchesSegmentsForTest());
     }
     fs::remove_all(dir);
@@ -225,8 +232,8 @@ TEST(SegmentLifecycleRegression, DeferredRollOvershootIsBoundedRegression) {
     {
         Log log(dir.string(), 512);
         log.recover();
-        int demands = 0;
-        log.setProvisioning({&NoopHook::fn, &demands});
+        int demands[3] = {0, 0, 0};
+        log.setProvisioning({&NoopHook::fn, demands});
         int64_t off = 0;
         while (log.segmentBaseOffsets().size() < 2 && off < 1000000) off = put(log, off);
         ASSERT_EQ(log.segmentBaseOffsets().size(), 2u) << "the overshoot cap forced a roll";
@@ -295,14 +302,15 @@ TEST(SegmentLifecycleRegression, RollAndRetentionPublishSnapshotInConstantTimeRe
         // Retention: drop a prefix — O(1) (no rebuild).
         const auto bases = log.segmentBaseOffsets();
         const auto snap = log.sealedSegmentSnapshot();
+        const std::size_t kDrop = target / 2;   // spans whole chunks
         std::size_t next = 0;
         int dropped = 0;
-        for (int guard = 0; dropped < 300 && guard < 100000; ++guard) {
-            while (next < 300 && log.enqueueDeletedSegment(bases[next], (*snap)[next].lineage)) ++next;
+        for (int guard = 0; dropped < static_cast<int>(kDrop) && guard < 100000; ++guard) {
+            while (next < kDrop && log.enqueueDeletedSegment(bases[next], (*snap)[next].lineage)) ++next;
             dropped += log.drainRetentionDeletes(INT64_MAX);
             (void)log.runCleanerFileOps(0, 0);
         }
-        ASSERT_EQ(dropped, 300);
+        ASSERT_EQ(dropped, static_cast<int>(kDrop));
         EXPECT_EQ(log.snapshotRebuildsForTest(), rebuilds0) << "F4: a retention drop rebuilt the snapshot";
         EXPECT_TRUE(log.snapshotMatchesSegmentsForTest());
         // And rolls continue in O(1) after the front moved.
@@ -407,8 +415,8 @@ TEST(SegmentLifecycleRegression, FullRenameRingDefersRollNeverDropsRenameRegress
     {
         Log log(dir.string(), 256);
         log.recover();
-        int demands = 0;
-        log.setProvisioning({&NoopHook::fn, &demands});
+        int demands[3] = {0, 0, 0};
+        log.setProvisioning({&NoopHook::fn, demands});
         int64_t off = 0;
         // Adopt segments without ever finalizing their renames.
         for (int guard = 0; guard < 100000; ++guard) {
@@ -461,8 +469,8 @@ TEST(SegmentLifecycleRegression, SteadyStateRollAllocatesNothingOnOwnerRegressio
     {
         Log log(dir.string(), 256);
         log.recover();
-        int demands = 0;
-        log.setProvisioning({&NoopHook::fn, &demands});
+        int demands[3] = {0, 0, 0};
+        log.setProvisioning({&NoopHook::fn, demands});
         // Pre-built batches: building one allocates (test side, outside windows).
         std::vector<std::vector<uint8_t>> batches;
         int64_t off = 0;
@@ -493,14 +501,222 @@ TEST(SegmentLifecycleRegression, SteadyStateRollAllocatesNothingOnOwnerRegressio
         for (int i = 0; i < 2000; ++i) { housekeeping(); appendCounted(off); }
         tAllocs = 0;
         const auto segs0 = log.segmentBaseOffsets().size();
-        const uint64_t installs0 = static_cast<uint64_t>(demands);
+        const uint64_t installs0 = static_cast<uint64_t>(demands[2]);
         for (int i = 0; i < 2000; ++i) { housekeeping(); appendCounted(off); }
-        const uint64_t rolls = static_cast<uint64_t>(demands) - installs0;
+        const uint64_t rolls = static_cast<uint64_t>(demands[2]) - installs0;
         ASSERT_GT(rolls, 300u) << "the window must roll many times";
         EXPECT_LE(log.segmentBaseOffsets().size(), segs0 + 2) << "retention keeps up";
         // Bounded by the snapshot's rare chunk / directory allocations only.
-        const uint64_t allowed = 2 + 2 * (rolls / kSnapChunkEntries + 1) + 2 * (2 * rolls / kSnapHeadersPerDir + 1);
+        // a chunk: 1-2 allocations; a directory: 3 (control block, chunk table, header pool).
+        const uint64_t allowed = 2 + 2 * (rolls / kSnapChunkEntries + 1) + 3 * (2 * rolls / kSnapHeadersPerDir + 1);
         EXPECT_LE(tAllocs, allowed) << "owner allocations: " << tAllocs << " over " << rolls << " rolls";
+    }
+    fs::remove_all(dir);
+}
+
+// ===========================================================================
+// Review fixes (2026-10-06 review M1 / M3 / m4 / m6).
+// ===========================================================================
+
+// M1: a failed provisioner build is REPORTED to the owner over the ready ring;
+// the held roll then happens inline (blocking, correct, counted) — a produce
+// never waits forever on a provisioner that cannot deliver.
+TEST(SegmentLifecycleRegression, ProvisionerFailureRollsInlineNeverHangsRegression) {
+    const auto dir = freshDir("rune_slh_m1");
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        int demands[3] = {0, 0, 0};
+        log.setProvisioning({&NoopHook::fn, demands});
+        int64_t off = 0;
+        while (!log.rollDeferred()) off = put(log, off);
+        ASSERT_GE(demands[1], 1) << "the Threshold demand was posted";
+        log.setProvisionFaultForTest(EMFILE, 1);
+        EXPECT_LT(log.provisionReady(1), 0) << "the build failed (provisioner side)";
+        EXPECT_FALSE(log.rollDeferred()) << "a reported failure ends the hold";
+        const auto segs = log.segmentBaseOffsets().size();
+        off = put(log, off);
+        EXPECT_EQ(log.segmentBaseOffsets().size(), segs + 1) << "the roll went inline";
+        EXPECT_EQ(log.provisionFailuresForTest(), 1u);
+        EXPECT_EQ(log.failureInlineRollsForTest(), 1u);
+        EXPECT_FALSE(log.storageFailed());
+        // The next segment is provisioned normally again.
+        while (!log.rollDeferred()) off = put(log, off);
+        ASSERT_EQ(log.provisionReady(1), 1);
+        off = put(log, off);
+        EXPECT_EQ(log.segmentBaseOffsets().size(), segs + 2);
+        EXPECT_EQ(log.failureInlineRollsForTest(), 1u);
+        (void)log.finalizeStagingRenames();
+        (void)log.drainStagingRenamesDone();
+    }
+    fs::remove_all(dir);
+}
+
+// M1: ... and when the inline create fails too, the log FAILS (fail-stop, the
+// pre-hotpath-A semantics) — loudly, never a silent hold.
+TEST(SegmentLifecycleRegression, ProvisionerFailureThenInlineFailureFailsTheLogRegression) {
+    const auto dir = freshDir("rune_slh_m1b");
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        int demands[3] = {0, 0, 0};
+        log.setProvisioning({&NoopHook::fn, demands});
+        int64_t off = 0;
+        while (!log.rollDeferred()) off = put(log, off);
+        log.setProvisionFaultForTest(EACCES, 1);
+        (void)log.provisionReady(1);
+        // The directory becomes unwritable: the inline create fails as well.
+        fs::permissions(dir, fs::perms::owner_read | fs::perms::owner_exec);
+        EXPECT_THROW((void)put(log, off), std::exception);
+        fs::permissions(dir, fs::perms::owner_all);
+        EXPECT_TRUE(log.storageFailed()) << "a failed inline create fails the log (E1 fail-stop)";
+    }
+    fs::remove_all(dir);
+}
+
+// M3: demand-driven provisioning — no ready segment is demanded (reserved)
+// while the active segment is below the threshold; exactly one Threshold
+// demand per segment when it crosses it.
+TEST(SegmentLifecycleRegression, ProvisioningIsDemandDrivenByFillThresholdRegression) {
+    const auto dir = freshDir("rune_slh_m3");
+    {
+        Log log(dir.string(), 4096);
+        log.recover();
+        int demands[3] = {0, 0, 0};
+        log.setProvisioning({&NoopHook::fn, demands}, /*thresholdPct=*/50);
+        int64_t off = 0;
+        // Fill to just below half: no demand.
+        while (log.segmentSizeForTest(0) + 200 < 2048) off = put(log, off);
+        EXPECT_EQ(demands[1], 0) << "an idle / lightly used partition demands nothing";
+        EXPECT_EQ(log.readyCountForTest(), 0u);
+        EXPECT_EQ(countSuffix(dir, ".stlog"), 0u) << "nothing reserved on disk";
+        while (log.segmentSizeForTest(0) < 2048 + 200) off = put(log, off);
+        EXPECT_EQ(demands[1], 1) << "one Threshold demand at the crossing";
+        for (int i = 0; i < 5; ++i) off = put(log, off);
+        EXPECT_EQ(demands[1], 1) << "never re-posted once queued";
+    }
+    fs::remove_all(dir);
+}
+
+// M3: a demand lost to a full provisioner ring is re-posted (never lost).
+TEST(SegmentLifecycleRegression, LostDemandIsRepostedRegression) {
+    const auto dir = freshDir("rune_slh_m3lost");
+    {
+        struct Flaky {
+            int accepted = 0, refused = 0, refuseLeft = 3;
+            static bool fn(void* c, Log*, Log::ProvisionDemand) noexcept {
+                auto* f = static_cast<Flaky*>(c);
+                if (f->refuseLeft > 0) { --f->refuseLeft; ++f->refused; return false; }
+                ++f->accepted;
+                return true;
+            }
+        } flaky;
+        Log log(dir.string(), 512);
+        log.recover();
+        log.setProvisioning({&Flaky::fn, &flaky});
+        int64_t off = 0;
+        while (!log.rollDeferred()) off = put(log, off);
+        EXPECT_EQ(flaky.refused, 3);
+        EXPECT_EQ(flaky.accepted, 1) << "the Threshold demand got through on a retry";
+    }
+    fs::remove_all(dir);
+}
+
+// m6: a queued staging rename of the TAIL segment never blocks retention of
+// the old segments (deleteOldSegments) — only cold paths touching it defer.
+TEST(SegmentLifecycleRegression, QueuedTailRenameDoesNotBlockRetentionRegression) {
+    const auto dir = freshDir("rune_slh_m6");
+    {
+        Log log(dir.string(), 256);
+        log.recover();
+        int64_t off = 0;
+        while (log.segmentBaseOffsets().size() < 6) off = put(log, off);   // inline-created (legacy) segments
+        ASSERT_EQ(log.provisionReady(1), 1);
+        const auto before = log.segmentBaseOffsets().size();
+        while (log.segmentBaseOffsets().size() == before) off = put(log, off);   // adopts: a rename queued
+        for (int i = 0; i < 2; ++i) off = put(log, off);   // LEO well inside the adopted segment
+        EXPECT_GT(log.deleteOldSegments(/*retainBytes=*/0, /*hw=*/INT64_MAX), 0)
+            << "retention of old segments must not wait for the tail's rename";
+        EXPECT_FALSE(log.truncateTo(log.segmentBaseOffsets().back() + 1))
+            << "a cold path touching the renaming segment still defers";
+        (void)log.finalizeStagingRenames();
+        EXPECT_TRUE(log.truncateTo(log.segmentBaseOffsets().back() + 1));
+        EXPECT_FALSE(log.storageFailed());
+    }
+    fs::remove_all(dir);
+}
+
+// m4: stale data — a CRASH with >= 2 ready (never written) segments and >= 2
+// adopted-but-unrenamed segments recovers every record, the right bases, and
+// leaves no staging file behind.
+TEST(SegmentLifecycleRegression, CrashWithReadyAndQueuedRenamesRecoversAllDataRegression) {
+    const auto dir = freshDir("rune_slh_m4crash");
+    int64_t leo = 0;
+    std::vector<int64_t> bases;
+    {
+        Log log(dir.string(), 256);
+        log.recover();
+        int demands[3] = {0, 0, 0};
+        log.setProvisioning({&NoopHook::fn, demands});
+        int64_t off = 0;
+        int adopted = 0;
+        for (int guard = 0; adopted < 3 && guard < 100000; ++guard) {
+            (void)log.provisionReady(2);
+            const auto n = log.segmentBaseOffsets().size();
+            off = put(log, off);
+            if (log.segmentBaseOffsets().size() > n) ++adopted;
+        }
+        for (int i = 0; i < 3; ++i) off = put(log, off);
+        (void)log.provisionReady(2);   // >= 2 ready, never written
+        ASSERT_GE(countSuffix(dir, ".stlog"), 5u) << "3 unrenamed adopted + 2 ready";
+        leo = log.logEndOffset();
+        bases = log.segmentBaseOffsets();
+        log.crashForTest();   // no rename drain, no staging cleanup
+    }
+    {
+        Log log(dir.string(), 256);
+        EXPECT_EQ(log.recover(), leo);
+        EXPECT_EQ(log.segmentBaseOffsets(), bases);
+        EXPECT_EQ(countSuffix(dir, ".stlog"), 0u);
+        int64_t cursor = 0;
+        while (cursor < leo) {
+            auto bytes = log.read(cursor, 1 << 20);
+            ASSERT_FALSE(bytes.empty()) << cursor;
+            RecordBatchReader r(bytes.data(), bytes.size());
+            ASSERT_TRUE(r.ensureValid());
+            ASSERT_EQ(r.baseOffset(), cursor);
+            cursor = r.baseOffset() + r.lastOffsetDelta() + 1;
+        }
+    }
+    fs::remove_all(dir);
+}
+
+// m4: a staging file whose first batch is torn is never parsed into a bogus
+// base and never overwrites an existing segment — it is quarantined.
+TEST(SegmentLifecycleRegression, TornStagingFileIsQuarantinedNeverOverwritesRegression) {
+    const auto dir = freshDir("rune_slh_m4torn");
+    int64_t leo = 0;
+    {
+        Log log(dir.string(), 1 << 20);
+        log.recover();
+        int64_t off = 0;
+        for (int i = 0; i < 5; ++i) off = put(log, off);
+        leo = log.logEndOffset();
+    }
+    const auto seg0 = dir / "00000000000000000000.log";
+    const auto size0 = fs::file_size(seg0);
+    {
+        // A torn staging file whose garbage header "says" base 0.
+        std::ofstream f(dir / ".staging-77.stlog", std::ios::binary);
+        std::vector<char> junk(200, 0);
+        junk[8] = 0x7f;   // totalLength garbage, no valid CRC
+        f.write(junk.data(), static_cast<std::streamsize>(junk.size()));
+    }
+    {
+        Log log(dir.string(), 1 << 20);
+        EXPECT_EQ(log.recover(), leo);
+        EXPECT_EQ(fs::file_size(seg0), size0) << "the existing segment was overwritten";
+        EXPECT_TRUE(fs::exists(dir / ".staging-77.stlog.corrupt")) << "quarantined, not deleted";
     }
     fs::remove_all(dir);
 }
