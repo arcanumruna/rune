@@ -304,6 +304,17 @@ public:
     void setAlterIsrHandler(AlterIsrHandler fn, void* ctx) noexcept {
         alterIsrHandler_ = fn; alterIsrCtx_ = ctx;
     }
+    /// CONTROL thread: a NODE-level request (controlled shutdown / register /
+    /// peer confirmation, topicId == AlterIsrMsg::kNodeControlTopicId) to ONE
+    /// node (self = delivered locally, synchronously).  Cold.
+    bool sendNodeControl(NodeId to, const AlterIsrMsg& msg);
+    /// CONTROL thread: the controller's answer to this node's NODE-level
+    /// request (controlled shutdown / register: topicId ==
+    /// AlterIsrMsg::kNodeControlTopicId) — delivered here, never to a replica.
+    using NodeControlResponseHandler = void (*)(void* ctx, const AlterIsrResponseMsg& resp);
+    void setNodeControlResponseHandler(NodeControlResponseHandler fn, void* ctx) noexcept {
+        nodeControlRespHandler_ = fn; nodeControlRespCtx_ = ctx;
+    }
 
     // -----------------------------------------------------------------------
     // D9: cross-node transaction markers (cold control traffic).
@@ -567,6 +578,8 @@ private:
     int32_t                                controllerId_    = -1;       ///< control thread
     AlterIsrHandler                        alterIsrHandler_ = nullptr;  ///< control thread
     void*                                  alterIsrCtx_     = nullptr;
+    NodeControlResponseHandler             nodeControlRespHandler_ = nullptr;  ///< control thread
+    void*                                  nodeControlRespCtx_     = nullptr;
     WriteTxnMarkerHandler                  txnMarkerHandler_     = nullptr;  ///< control thread (D9)
     WriteTxnMarkerResponseHandler          txnMarkerRespHandler_ = nullptr;
     void*                                  txnMarkerCtx_         = nullptr;

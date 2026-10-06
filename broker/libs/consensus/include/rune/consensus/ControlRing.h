@@ -84,6 +84,27 @@ public:
         return n;
     }
 
+    /// One message's ring footprint: the 8-byte record header + the 16-byte body (8-aligned).
+    static constexpr std::size_t kRecordBytes = 24;
+    /// Committed-or-claimed bytes not yet consumed (producer position - consumer position).  Any thread;
+    /// approximate while the other side runs (a wrap's padding record counts too).  Diagnostics and
+    /// depth estimates only — never a correctness decision.
+    [[nodiscard]] std::int64_t pendingBytes() const noexcept {
+        return ring_.producerPosition() - ring_.consumerPosition();
+    }
+    /// What a doorbell watch needs (node/detail/RingDoorbell.h RingWatch): buffer, its length (capacity +
+    /// trailer), the pow2 payload capacity and the head-position index.  Startup wiring only.
+    struct WatchInfo {
+        std::uint8_t*        buffer;
+        aeron::util::index_t length;
+        aeron::util::index_t capacity;
+        aeron::util::index_t headPositionIndex;
+    };
+    [[nodiscard]] WatchInfo watchInfo() noexcept {
+        return {storage_.data(), static_cast<aeron::util::index_t>(storage_.size()),
+                static_cast<aeron::util::index_t>(Capacity), ring_.headPositionIndex()};
+    }
+
 private:
     alignas(64) std::array<std::uint8_t,
                            Capacity + static_cast<std::size_t>(detail::M2ORingBuffer::trailerLength())>

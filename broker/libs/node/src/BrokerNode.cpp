@@ -15,6 +15,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <random>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -93,6 +94,10 @@ int64_t bumpProcessIncarnation(const std::string& dataDir) {
     if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) return fallback();
     return next;
 }
+// Controlled shutdown (review M1): a random, non-zero 64-bit identity of THIS
+// process — compared by identity, so a restart with a wiped data dir (whose
+// incarnation counter restarts low) is still a new process.  Cold (once).
+int64_t processNonce() { return ControlledShutdown::freshNonce(); }
 // Leader-epoch restart fence for a MEMORY-backed replica (disk-backed ones keep
 // it next to their log): <dataDir>/memory-epoch-fence/<topicId>-<partition>.
 // The records do not survive a restart, but the epochs this node led at must
@@ -115,8 +120,15 @@ void setMemoryEpochFence(rune::replication::PartitionReplica& r, const std::stri
 // fsync on the worker.  Internal partitions (topicId < 0) run on the control
 // thread, which services neither flush requests nor pending seals: they keep
 // the inline path.
-void applyWorkerDrivenDurability(rune::replication::PartitionReplica& replica, int32_t topicId) noexcept {
-    if (topicId >= 0) replica.setExternalFollowerFlush(true);
+// hotpath-A F2: a worker-driven disk log is also PROVISIONED — the
+// SegmentProvisionerAgent keeps its ready segments; a roll never creates one
+// on the worker (it is deferred and the intake back-pressures instead).
+void applyWorkerDrivenDurability(rune::replication::PartitionReplica& replica, int32_t topicId,
+                                 rune::storage::Log::ProvisionHook provision, int thresholdPct) noexcept {
+    if (topicId < 0) return;
+    replica.setExternalFollowerFlush(true);
+    if (provision.fn != nullptr && replica.isDiskBacked() && replica.log() != nullptr)
+        replica.log()->setProvisioning(provision, thresholdPct);
 }
 
 int32_t clampI32(int64_t v) noexcept {
@@ -421,6 +433,8 @@ void BrokerNode::start() {
         stuckMarkersCounterRegId_ = aeron_->addCounter(
             kStuckMarkersCounterTypeId, roleKey, kRoleKeyLength,
             stuckMarkersLabel(config_.nodeId));
+        outOfSyncCounterRegId_ = aeron_->addCounter(
+            kOutOfSyncCounterTypeId, roleKey, kRoleKeyLength, outOfSyncLabel(config_.nodeId));
     }
     const auto t2 = sclock::now();
 
@@ -428,12 +442,36 @@ void BrokerNode::start() {
     buildConsensusObjects();
     const auto t3 = sclock::now();
 
+    // 5b. hotpath-A F2: the segment provisioner exists BEFORE any replica is
+    //     built — every worker-driven disk log is wired to its demand hook.
+    provisionerAgent_ = std::make_unique<SegmentProvisionerAgent>(
+        static_cast<std::size_t>(config_.segmentProvisionDepth), config_.segmentProvisionCapBytes,
+        config_.dataDir, config_.segmentProvisionCapFreePct);
+    // Re-review N4: the provisioner's metrics as Aeron counters (CnC file).
+    if (aeron_) {
+        std::uint8_t key[kRoleKeyLength];
+        encodeRoleKey(key, config_.nodeId);
+        static constexpr std::pair<std::int32_t, const char*> kProvCounters[] = {
+            {kProvisionBuildFailuresCounterTypeId, "build-failures"},
+            {kProvisionRollHoldsCounterTypeId, "roll-holds"},
+            {kProvisionUnpreallocCounterTypeId, "unpreallocated-builds"},
+            {kProvisionParkedDroppedCounterTypeId, "parked-demands-dropped"}};
+        for (std::size_t i = 0; i < provCounterRegIds_.size(); ++i)
+            provCounterRegIds_[i] = aeron_->addCounter(kProvCounters[i].first, key, kRoleKeyLength,
+                                                       provisionMetricLabel(kProvCounters[i].second, config_.nodeId));
+    }
+    provisionerAgent_->setMetricSink(&BrokerNode::publishProvisionMetric_, this);
+
     // 6. Build replication (GR-2/GR-3): PartitionReplicas + AeronPartitionTransport
     //    + ReplicationMetadataBridge.  Requires: topicRegistry_ + aeron_ + consensus objs.
     buildReplication();
 
     // 7. Build the ClientGateway and NodeRuntimeAgent (after aeron_ is live).
     buildGateway();
+    // hotpath-A F2: every worker-driven disk log was wired to the provisioner's
+    // demand hook (its rolls defer while no ready segment exists) — a missing
+    // provisioner thread would wedge every roll.  Never start like that.
+    requireProvisionerRunner(provisionerAgent_ != nullptr, provisionerRunner_ != nullptr);
 
     // 7.0 fsyncgate: a log whose recovery failed (index msync / dir fsync — the
     //     log is marked storage-failed) must never serve.  Refuse to start —
@@ -513,6 +551,11 @@ void BrokerNode::start() {
     //    enqueued but never drained if agentRunner_ hasn't started yet).
     if (cleanerRunner_) {
         cleanerRunner_->start();
+    }
+    // 8b. hotpath-A F2: the segment provisioner (its own thread: never stalled
+    //     by a compaction pass).
+    if (provisionerRunner_) {
+        provisionerRunner_->start();
     }
 
     // 9. DR-15 fix round 1: the cold peer-hostname resolver thread — every
@@ -1152,7 +1195,7 @@ void BrokerNode::buildReplication() {
                 : std::make_unique<PartitionReplica>(
                       pcfg, Role::Follower, /*epoch=*/0,
                       allNodeIds, allNodeIds, diskLogPtr, transport);
-            applyWorkerDrivenDurability(*replica, topicId);   // Task 10 + F30
+            applyWorkerDrivenDurability(*replica, topicId, provisionHook_(), config_.segmentProvisionThresholdPct);   // Task 10 + F30 + hotpath-A
             if (isMemory) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
             // Kafka AlterPartition: user-partition ISR changes go through the
             // controller (multi-node); internal partitions keep a leader-local ISR.
@@ -1328,7 +1371,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
             : std::make_unique<PartitionReplica>(
                   pcfg, Role::Follower, /*epoch=*/0,
                   allNodeIds, allNodeIds, diskLogPtr, transport);
-        applyWorkerDrivenDurability(*replica, topicId);   // same policy as boot (F30 fix round 1, F3)
+        applyWorkerDrivenDurability(*replica, topicId, provisionHook_(), config_.segmentProvisionThresholdPct);   // same policy as boot (F30 fix round 1, F3)
         if (isMemory) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
         if (topicId >= 0 && replTransport_ && !config_.isSingleNode())
             replica->setIsrChannel(replTransport_.get());   // Kafka AlterPartition (see boot)
@@ -2378,6 +2421,26 @@ void BrokerNode::buildGateway() {
     // before the control thread starts (ordered by its start).
     leaderObserver_.bind(election_.get(), nodeAgent_.get());
     runtimeAgent_->setLeaderObserver(&leaderObserver_);
+    // Controlled shutdown (Kafka parity): multi-node only — a single node has
+    // nobody to hand off to (begin completes at once).  The controller's
+    // acks of this node's NODE-level requests arrive on the legacy transport
+    // (control thread).
+    if (!config_.isSingleNode() && replTransport_ && metadataService_ && election_) {
+        // Review M1: the node-control protocol identifies this PROCESS by a
+        // random nonce (compared by identity) — never by the data-dir counter,
+        // which restarts low after a wiped dir.
+        runtimeAgent_->controlledShutdown().bind(
+            config_.nodeId, processNonce(),
+            [](void* t, int32_t to, const rune::replication::AlterIsrMsg& m) noexcept {
+                return static_cast<rune::replication::AeronPartitionTransport*>(t)->sendNodeControl(to, m);
+            }, replTransport_.get(), metadataService_.get(), election_.get(), [this] {
+                std::vector<int32_t> ids;
+                for (const auto& pc : config_.peers) ids.push_back(pc.id);
+                return ids;
+            }());
+        replTransport_->setNodeControlResponseHandler(&ControlledShutdown::onResponseThunk,
+                                                      &runtimeAgent_->controlledShutdown());
+    }
     // fsyncgate (Task 10 fix 2 / I-1): control-thread-driven replicas (internal
     // partitions) whose fsync failed → halt.
     runtimeAgent_->setStorageFailureHook([this](const std::string& dir, int err) {
@@ -2481,6 +2544,21 @@ void BrokerNode::buildGateway() {
         if (runtimeAgent_) cleanerAgent_->attachViewChannel(runtimeAgent_->enableCleanerView());
         cleanerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
             *cleanerAgent_, cleanerIdleStrategy_, cleanerClock_);
+        // hotpath-A F2: pre-provisioning + staging renames belong to the
+        // SegmentProvisionerAgent (its own view, its own thread).
+        if (provisionerAgent_ && runtimeAgent_) {
+            cleanerAgent_->setExternalProvisioner(true);
+            provisionerAgent_->attachViewChannel(runtimeAgent_->enableProvisionerView());
+            // Review m5: park on the demand ring's doorbell (woken by a demand),
+            // so an idle provisioner costs ~1/maxPark wakeups, not 10k/s.
+            provisionerIdleStrategy_ = std::make_unique<ParkUntilWorkIdle>(
+                IdleShape{10, 20, 1'000, std::max<int64_t>(config_.segmentProvisionerMaxParkUs, 1) * 1'000},
+                nullptr, 0, provisionerAgent_->doorbell());
+            provisionerRunner_ = std::make_unique<rune::consensus::AgentRunner>(
+                *provisionerAgent_, *provisionerIdleStrategy_, provisionerClock_);
+            spdlog::info("BrokerNode[{}]: SegmentProvisionerAgent wired (depth={}, maxPark={}us)", nodeId,
+                         provisionerAgent_->depth(), config_.segmentProvisionerMaxParkUs);
+        }
         spdlog::info("BrokerNode[{}]: LogCleanerAgent wired ({} replicas, coalescing={}, ioThrottle={})",
                      nodeId, replicaRegistry_->replicaCount(),
                      config_.enableCompactionCoalescing ? "on" : "off",
@@ -2510,6 +2588,51 @@ bool BrokerNode::awaitLeader(std::chrono::milliseconds timeout) {
         std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
     return hasLeader(); // one final check at deadline
+}
+
+// ---------------------------------------------------------------------------
+// Controlled shutdown (Kafka parity) — see ControlledShutdown.h.  Observer
+// thread.  The hand-off itself is event-driven on the control thread; this
+// only waits for its ring-published status, bounded by `budget` — a
+// last-resort cap after which the caller stops as before (logged).
+// ---------------------------------------------------------------------------
+int32_t BrokerNode::outOfSyncPartitions() noexcept {
+    if (!runtimeAgent_) return -1;
+    const auto st = runtimeAgent_->controlledShutdown().observe();
+    return st.phase == ControlledShutdown::Phase::Running ? st.remaining : -1;
+}
+
+bool BrokerNode::controlledShutdown(std::chrono::milliseconds budget) {
+    if (!started_ || stopped_ || !runtimeAgent_) return false;
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    const auto deadline = t0 + budget;
+    auto& cs = runtimeAgent_->controlledShutdown();
+    if (!cs.active()) return true;   // a single node: nobody to hand anything to
+    if (!cs.begin()) {
+        spdlog::warn("BrokerNode[{}]: controlled shutdown: command ring full — stopping without "
+                     "a hand-off", config_.nodeId);
+        return false;
+    }
+    spdlog::info("BrokerNode[{}]: controlled shutdown — handing partition leadership off "
+                 "(budget {} ms)", config_.nodeId, budget.count());
+    ControlledShutdown::Status st = cs.observe();
+    while (clock::now() < deadline) {
+        st = cs.observe();
+        if (st.phase == ControlledShutdown::Phase::Done) {
+            spdlog::info("BrokerNode[{}]: controlled shutdown complete in {} ms", config_.nodeId,
+                         std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count());
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});   // paces the ring poll only
+    }
+    st = cs.observe();
+    if (st.phase == ControlledShutdown::Phase::Done) return true;
+    spdlog::warn("BrokerNode[{}]: controlled shutdown budget ({} ms) exhausted in phase {} with {} "
+                 "partition(s) still led / ISR(s) still joined here — stopping anyway (they fail "
+                 "over as on an unclean stop)", config_.nodeId, budget.count(),
+                 static_cast<int>(st.phase), st.remaining);
+    return false;
 }
 
 LeaderSnapshot BrokerNode::leaderSnapshot() const noexcept {
@@ -2554,6 +2677,21 @@ Term BrokerNode::leadershipTermId() const noexcept {
 // D9 review MEDIUM-3: TCS stuck-markers sink — CONTROL (runtime) thread only.
 // Resolves the counter registration lazily (the driver acks asynchronously);
 // false = not resolved yet, the TCS retries on its next gauge scan.
+// Re-review N4: provisioner metric sink — PROVISIONER thread only (the only
+// writer of provCounters_; resolved lazily, the driver acks asynchronously; a
+// value set before resolution is re-published with the next change).
+void BrokerNode::publishProvisionMetric_(void* self, int metric, std::int64_t value) noexcept
+{
+    auto* n = static_cast<BrokerNode*>(self);
+    if (!n->aeron_ || metric < 0 || static_cast<std::size_t>(metric) >= n->provCounters_.size()) return;
+    auto& c = n->provCounters_[static_cast<std::size_t>(metric)];
+    const std::int64_t reg = n->provCounterRegIds_[static_cast<std::size_t>(metric)];
+    if (!c && reg >= 0) {
+        try { c = n->aeron_->findCounter(reg); } catch (...) { c.reset(); }
+    }
+    if (c) c->set(value);
+}
+
 bool BrokerNode::publishStuckMarkers_(void* self, std::int64_t value)
 {
     auto* n = static_cast<BrokerNode*>(self);
@@ -2594,6 +2732,12 @@ void BrokerNode::publishRole() noexcept {
         // Publish the term this node observes (its own leadership term id).
         termCounter_->set(static_cast<std::int64_t>(v.term));
     }
+    // Rolling-restart readiness gate (controlled shutdown review L5).
+    if (!outOfSyncCounter_ && outOfSyncCounterRegId_ >= 0) {
+        try { outOfSyncCounter_ = aeron_->findCounter(outOfSyncCounterRegId_); }
+        catch (...) { outOfSyncCounter_.reset(); }
+    }
+    if (outOfSyncCounter_) outOfSyncCounter_->set(static_cast<std::int64_t>(outOfSyncPartitions()));
 }
 
 // ---------------------------------------------------------------------------
@@ -2896,6 +3040,26 @@ void BrokerNode::stop() {
     if (stopped_) return; // idempotent (controller-owned flag, F9a)
     stopped_ = true;
 
+    // Controlled shutdown fix round 2 (N2): before ANY thread is joined, halt
+    // the controller role — this node decides nothing more while its data
+    // plane goes down (workers are joined first, the runtime last), hands the
+    // consensus off at once if it leads, and tells the members it is going.
+    // Event: wait for the runtime's ring-published Halted ack (bounded — a
+    // runtime that is not running never acks).
+    if (runtimeAgent_ && runtimeAgent_->controlledShutdown().active()) {
+        auto& cs = runtimeAgent_->controlledShutdown();
+        if (cs.halt()) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+            bool acked = false;
+            while (!(acked = cs.observe().phase == ControlledShutdown::Phase::Halted) &&
+                   std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});   // paces the ring poll only
+            if (!acked)
+                spdlog::warn("BrokerNode[{}]: stop: the runtime never acked the halt (not running?) — "
+                             "stopping anyway", config_.nodeId);
+        }
+    }
+
     // 0. DR-15 fix round 1: the cold resolver thread only posts into rings it
     //    owns — stop it first (nothing below consumes it any more).
     if (resolverHub_) resolverHub_->stop();
@@ -2952,6 +3116,12 @@ void BrokerNode::stop() {
         cleanerRunner_->stopAndJoin();
     }
     cleanerAgent_.reset();
+    // hotpath-A F2: the provisioner too (workers are joined: no demand is
+    // posted any more; the logs it serves outlive it — the registry is torn
+    // down later, and ~Log frees the ready segments it left).
+    if (provisionerRunner_) {
+        provisionerRunner_->stopAndJoin();
+    }
 
     // 1c. Stop the main agent runner (signal + join the duty-cycle thread).
     if (agentRunner_) {
@@ -3056,6 +3226,8 @@ void BrokerNode::stop() {
     roleCounter_.reset();
     termCounter_.reset();
     stuckMarkersCounter_.reset();   // D9: release before aeron_ (the Counter dtor uses the conductor)
+    outOfSyncCounter_.reset();      // readiness gate (L5): same rule
+    for (auto& c : provCounters_) c.reset();   // re-review N4: same rule (the provisioner is stopped)
 
     // 4. Close the Aeron client (joins the C++ conductor thread).
     //    After aeron_.reset() all "remove publication / subscription / close client"

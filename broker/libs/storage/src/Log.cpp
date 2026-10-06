@@ -106,7 +106,10 @@ int32_t Log::indexMaxBytesFor(int64_t rollBytes, int32_t indexIntervalBytes) noe
 }
 
 Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), rollBytes_(segmentRollBytes) {
-    indexMaxBytes_ = indexMaxBytesFor(rollBytes_, kDefaultIndexIntervalBytes);
+    // Review m2: sized for the deferred-roll overshoot cap, so a segment that
+    // overshot rollBytes never grows its index mapping on the owner.
+    indexMaxBytes_ = indexMaxBytesFor(maxDeferredRollBytes_(), kDefaultIndexIntervalBytes);
+    spareSegNodes_.reserve(kSpareSegNodes);   // hotpath-A: recycled map nodes (see install_)
     // Reconcile any staging segment files left by a crash BEFORE discovering real
     // segments: an adopted-but-not-yet-renamed staging.log has its true base
     // recovered from the first batch header and is renamed into place (no data
@@ -157,7 +160,7 @@ Log::Log(std::string dir, int64_t segmentRollBytes) : dir_(std::move(dir)), roll
     rpTmpPath_ = dir_ + "/" + kRecoveryPointTmpFile;
     {
         const RpFileRead rf = readRecoveryPointFile(dir_);
-        if (rf.state == RpFileState::Valid) persistedRp_ = rf.r;
+        if (rf.state == RpFileState::Valid) setPersistedRp_(rf.r);
     }
     // F3: eager read-map ONLY the LAST (highest-base) segment — it becomes the
     // active segment.  Earlier (sealed) segments map their .log lazily on first
@@ -203,7 +206,9 @@ Log::~Log() {
     // so these are single-threaded.  Finalize any pending staging→base renames so
     // a clean shutdown leaves correctly-named files on disk (otherwise the next
     // recover() would reconcile them anyway — this is just hygiene).
-    {
+    // A simulated CRASH (crashForTest) leaves the renames and the ready
+    // staging files exactly as a real crash would (construction reconciles).
+    if (!crashedForTest_) {
         const std::size_t head = renameReqHead_.load(std::memory_order_relaxed);
         const std::size_t tail = renameReqTail_.load(std::memory_order_relaxed);
         for (std::size_t i = head; i != tail; ++i) {
@@ -211,13 +216,16 @@ Log::~Log() {
             renameStagingToBase(rr.seq, rr.base);
         }
     }
-    // Free any prepared-but-unconsumed staging segment (raw ptr handed via the
-    // atomic handoff slot).  Its destructor closes fds / unmaps; then remove its
-    // orphaned staging files from disk.
-    LogSegment* prepared = preparedSegment_.exchange(nullptr, std::memory_order_acq_rel);
-    if (prepared) {
-        const int64_t seq = prepared->stagingSeq();
-        delete prepared;
+    // hotpath-A F2: free every ready-but-unconsumed segment (the provisioner is
+    // stopped: this thread is the ring's only party now).  Its destructor
+    // closes fds / unmaps; then its never-written staging files are removed.
+    failFront_ = 0;
+    for (LogSegment* ready = takeReady_(); ready != nullptr || failFront_ != 0; ready = takeReady_()) {
+        failFront_ = 0;   // failure records hold nothing
+        if (ready == nullptr) continue;
+        const int64_t seq = ready->stagingSeq();
+        delete ready;
+        if (crashedForTest_) continue;
         std::error_code ec;
         std::filesystem::remove(stagingLogPathFor(seq), ec);
         std::filesystem::remove(stagingIndexPathFor(seq), ec);
@@ -245,263 +253,443 @@ LogSegment& Log::activeSegment() {
 
 void Log::maybeRoll() {
     // CL6: Roll decision is made BEFORE writing the new batch (Kafka-style).
-    // A segment can therefore exceed rollBytes by at most one batch.
-    // A single oversized batch (larger than rollBytes) always starts a new
-    // segment of its own — no splitting occurs.
-    if (activeSegment().sizeBytes() >= rollBytes_) {
-        // B1 fix (fsync-on-seal): fsync the segment being sealed BEFORE
-        // opening a new one.  appendNoSync() writes to page cache only; if
-        // a roll fires mid-flush-window the sealed segment would otherwise
-        // never be fsync'd (Log::sync() only fsyncs the ACTIVE segment).
-        // Fsyncing here guarantees that every segment receiving a no-sync
-        // write is fsync'd exactly once — at seal time — so Log::sync()
-        // after a roll means "all no-sync writes since last sync are on disk
-        // across all segment boundaries".
-        if (deferSealSync_ && pendingSealCount_ < kMaxPendingSeals) {
-            // Shard mode (spec §3.1): no inline fsync on the loop.  Push the
-            // buffered bytes to the page cache, pin the sealed segment (its fd
-            // must outlive the async flush — M1) and queue it; the owning worker
-            // fdatasyncs it through its io backend, and Strict acks on this log
-            // wait until every pending seal has completed.
-            LogSegment& sealed = activeSegment();
-            if (const int e = sealed.flushBufferedToPageCache(); e != 0) {
-                markStorageFailed(e);
-                throw std::system_error(e, std::generic_category(), "Log seal flush " + dir_);
-            }
-            sealed.pinFlush();
-            pendingSeals_[pendingSealCount_++] = &sealed;
-        } else {
-            // Legacy (or > kMaxPendingSeals seals outstanding): inline seal fsync.
-            activeSegment().sync();
+    // A segment can therefore exceed rollBytes by at most one batch — or, while
+    // a roll is DEFERRED (hotpath-A, below), by the appends that arrive before
+    // the condition clears.  A single oversized batch (larger than rollBytes)
+    // always starts a new segment of its own — no splitting occurs.
+    const int64_t activeBytes = activeSegment().sizeBytes();
+    if (activeBytes < rollBytes_) [[likely]] {
+        // Review M3: demand the next segment once the active one is
+        // provisionThresholdBytes_ full (one compare per append otherwise).
+        if (provisioned_ && activeBytes >= provisionThresholdBytes_ && (!thresholdPosted_ || adoptedPostPending_))
+            [[unlikely]] postProvisionDemands_(activeBytes);
+        return;
+    }
+    // hotpath-A F2 + F3: a roll NEVER blocks the owner.  No ready segment on a
+    // provisioned log (never an inline create), or the async seal queue full
+    // (never an inline seal fsync on a worker-driven log): defer the roll — the
+    // batch lands in the active segment; the intake back-pressures on
+    // rollDeferred(); the first append after the provisioner / io backend
+    // caught up rolls.
+    if (rollBlockedNow_()) [[unlikely]] {
+        // Correctness backstop: a deferral never lets a segment grow without
+        // bound (positions are 32-bit; a stuck provisioner / io backend must
+        // not wedge the log) — past the cap the roll is forced, blocking but
+        // correct (inline create / inline seal fsync, the pre-hotpath-A path).
+        if (activeSegment().sizeBytes() < maxDeferredRollBytes_()) [[likely]] {
+            ++rollDeferrals_;
+            return;
         }
-        const int64_t sealedBase = activeSegment().baseOffset();
-        int64_t base = logEndOffset_;
-        // Install the NEXT segment.  Adopts the background-pre-provisioned staging
-        // segment (ZERO syscalls: in-memory rebase; the staging→<base> disk rename
-        // is deferred to the bg thread) when ready; otherwise falls back to a
-        // synchronous create.  The seal fsync above is unchanged and fully
-        // synchronous (durability preserved).
-        // E1 review (Kafka: an IOException on roll takes the log dir offline): a failed next-segment
-        // create (open / ftruncate / mmap on a dead or full disk) is FAIL-STOP — never a silent retry
-        // loop that re-pins the sealed segment and answers every produce with an internal error.
-        try {
-            installNextSegment(base);
-        } catch (const std::system_error& e) {
-            markStorageFailed(e.code().value());
-            throw;
-        } catch (...) {
-            markStorageFailed(EIO);
-            throw;
+        ++forcedRolls_;
+    }
+    // B1 fix (fsync-on-seal): the sealed segment is made durable exactly once.
+    if (deferSealSync_ && pendingSealCount_ < kMaxPendingSeals) {
+        // Shard mode (spec §3.1): no inline fsync on the loop.  Push the
+        // buffered bytes to the page cache, pin the sealed segment (its fd
+        // must outlive the async flush — M1) and queue it (room checked above);
+        // the owning worker fdatasyncs it through its io backend, and Strict
+        // acks on this log wait until every pending seal has completed.
+        LogSegment& sealed = activeSegment();
+        if (const int e = sealed.flushBufferedToPageCache(); e != 0) {
+            markStorageFailed(e);
+            throw std::system_error(e, std::generic_category(), "Log seal flush " + dir_);
         }
-        // #5 non-blocking append: preallocate the freshly-installed active segment's
-        // blocks (negligible vs the seal fsync above) so its hot-path appends don't
-        // stall on block allocation.
-        activeSegment().preallocate(rollBytes_);
-        // CP-8 FIX (incremental largestTimestamp): capture the running max we
-        // tracked for the about-to-be-sealed segment, then reset for the new
-        // active segment.  publishSealedSnapshot will use this captured value
-        // (via newlySealedMaxTs_) instead of re-scanning the file.
-        newlySealedMaxTs_ = activeSegmentMaxTs_;
-        newlySealedBase_  = sealedBase;
-        activeSegmentMaxTs_ = 0;
-        // E1d: an inline seal made the sealed segment durable — R may cross into
-        // the new active segment (persisted inline on the legacy path only).
-        advanceRecoveryPoint_();
-        maybeCheckpointInline_();
-        // Publish snapshot: a new sealed segment just appeared.
-        publishSealedSnapshot();
-        // Clear the seal-time hint after the snapshot consumed it.
-        newlySealedMaxTs_ = 0;
-        newlySealedBase_  = -1;
+        sealed.pinFlush();
+        pendingSeals_[pendingSealCount_++] = &sealed;
+    } else {
+        // Legacy (control-thread logs), or a FORCED roll with the seal queue
+        // full (see above): inline seal fsync.
+        activeSegment().sync();
     }
-}
-
-void Log::publishSealedSnapshot() {
-    // Build a fresh immutable snapshot of all sealed segments (all except the
-    // last/active).  Called on the single-writer append thread only.
-    // The active segment is excluded: its sizeBytes is mutated on appends.
-    //
-    // CP-8 FIX (incremental largestTimestamp): we NO LONGER re-scan the file for
-    // a newly-sealed segment on the hot append path.  Instead, maybeRoll() maintains
-    // activeSegmentMaxTs_ (a running max of maxTimestamp() across every batch appended
-    // to the active segment) and stores it in newlySealedMaxTs_ just before calling us.
-    // For segments already present in the previous snapshot, we reuse the
-    // cached largestTimestamp value (sealed segments are immutable).
-    // For the newly-sealed segment (not yet in prevSnap), we use newlySealedMaxTs_.
-    // Zero extra I/O on the append path: NO file open, NO read, NO heap allocation.
-    //
-    // CP-5.1 FIX (retention-after-restart): recover() populates recoveryMaxTimestamps_
-    // with the REAL per-segment largestTimestamp obtained via a one-time batch scan.
-    // When a segment is not found in prevSnap AND newlySealedMaxTs_ == 0 (the recover()
-    // publish path), we look up the recovery map before falling back to 0.
-    // The map is drained (cleared) here after its first use so it never persists past
-    // recovery.  This ensures time-retention gets correct timestamps after a restart.
-    auto prevSnap = std::atomic_load(&sealedSnapshot_);
-
-    auto snap = std::make_shared<SealedSegmentSnapshot>();
-    if (segments_.size() > 1) {
-        snap->reserve(segments_.size() - 1);
-        // D11: both segments_ and prevSnap are ascending by baseOffset — one merge
-        // walk (O(n) per roll; was a scan of prevSnap per segment, O(n^2) on the
-        // append path once a partition holds thousands of segments).
-        std::size_t prevIdx = 0;
-        auto it  = segments_.begin();
-        auto end = std::prev(segments_.end()); // stop before active
-        for (; it != end; ++it) {
-            int64_t base  = it->first;
-            int64_t bytes = it->second->sizeBytes();
-            // Exclusive end = next segment's base (the active segment's base for the
-            // last sealed entry).  std::next(it) is always valid here (it != end,
-            // and end == the active segment).
-            int64_t endOff = std::next(it)->first;
-            const uint64_t lineage = it->second->tsLineage();
-            // Try to reuse largestTimestamp from the previous snapshot for this
-            // segment (sealed segments are immutable after they are created).
-            // The cache key is (base, lineage): a segment truncateTo() rebuilt
-            // and re-appended is a NEW incarnation at an old base — its stale
-            // pre-truncate timestamp must never be reused (log-snapshot review
-            // MAJOR-1: time retention would delete fresh data early).
-            int64_t largestTs = 0;
-            bool    found     = false;   // MEDIUM-2: 0 is a real timestamp, not "not found"
-            if (prevSnap) {
-                const SealedSegmentSnapshot& prev = *prevSnap;
-                while (prevIdx < prev.size() && prev[prevIdx].baseOffset < base) ++prevIdx;
-                if (prevIdx < prev.size() && prev[prevIdx].baseOffset == base &&
-                    prev[prevIdx].lineage == lineage) {
-                    largestTs = prev[prevIdx].largestTimestamp;
-                    found     = true;
-                }
-            }
-            // If not found in the previous snapshot, this is either:
-            //   (a) The NEWLY SEALED segment from maybeRoll(): use newlySealedMaxTs_
-            //       (CP-8 fix — zero append-path I/O at seal time).
-            //   (b) A segment recovered from disk by recover(): use recoveryMaxTimestamps_
-            //       (CP-5.1 fix — real timestamps to prevent retention-after-restart data loss).
-            if (!found) {
-                if (base == newlySealedBase_) {
-                    largestTs = newlySealedMaxTs_;
-                } else {
-                    // CP-5.1: check the recovery map (populated by recover() batch scan).
-                    auto rmIt = recoveryMaxTimestamps_.find(base);
-                    if (rmIt != recoveryMaxTimestamps_.end()) {
-                        largestTs = rmIt->second;
-                    }
-                }
-            }
-            // CRITICAL-1: never below what the segment(s) this one replaced or
-            // absorbed published (a compaction rewrite / coalesced merge).
-            if (it->second->tsFloor() > largestTs) largestTs = it->second->tsFloor();
-            it->second->setPublishedTs(largestTs);
-            snap->push_back({base, bytes, largestTs, endOff, compactionAllowedThrough(endOff), lineage});
-        }
-    }
-    // CP-5.1: clear the recovery map after first use — it is only needed for the
-    // one-time recover() publishSealedSnapshot() call; subsequent calls (from
-    // maybeRoll()/drainCleanerSwaps()) must not inherit stale recovery values.
-    recoveryMaxTimestamps_.clear();
-    std::atomic_store(&sealedSnapshot_, std::shared_ptr<const SealedSegmentSnapshot>(std::move(snap)));
-}
-// ---------------------------------------------------------------------------
-// Background segment pre-provisioning.
-// ---------------------------------------------------------------------------
-int Log::preprovisionPending() {
-    // BACKGROUND thread only.  Keep exactly ONE staging segment ready at all
-    // times so the append thread never pays a create at roll.  NEVER touches
-    // segments_ (single-writer invariant): it only builds a detached LogSegment
-    // (file I/O) and publishes it via the atomic handoff slot.
-    //
-    // preprovInFlight_ guards against building two segments and against a race
-    // with the append-thread synchronous fallback (installNextSegment):
-    //   - We CAS false→true to claim the build.  If it was already true, either a
-    //     prepared segment is waiting (append thread hasn't consumed it) or a
-    //     build is in progress — either way, nothing to do.
-    bool expected = false;
-    if (!preprovInFlight_.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel, std::memory_order_acquire)) {
-        return 0; // already prepared or building
-    }
-    // If a prepared segment somehow already exists (shouldn't, given the flag),
-    // release the claim and bail — never leak a second one.
-    if (preparedSegment_.load(std::memory_order_acquire) != nullptr) {
-        preprovInFlight_.store(false, std::memory_order_release);
-        return 0;
-    }
-    // Build the staging segment (the expensive open + ftruncate + mmap + prefault
-    // all happen HERE, on this background thread).
-    const int64_t seq = static_cast<int64_t>(stagingSeq_++);
-    std::unique_ptr<LogSegment> seg;
+    const int64_t base = logEndOffset_;
+    // Install the NEXT segment: adopt the oldest ready (pre-provisioned) one —
+    // ZERO syscalls, its blocks already fallocated by the provisioner (F1);
+    // legacy logs fall back to a synchronous create when the pool is empty.
+    // E1 review (Kafka: an IOException on roll takes the log dir offline): a failed next-segment
+    // create (open / ftruncate / mmap on a dead or full disk) is FAIL-STOP — never a silent retry
+    // loop that re-pins the sealed segment and answers every produce with an internal error.
     try {
-        seg = LogSegment::prepareStaging(stagingLogPathFor(seq), stagingIndexPathFor(seq), seq,
-                                         kDefaultIndexIntervalBytes, indexMaxBytes_);
+        installNextSegment(base);
+    } catch (const std::system_error& e) {
+        markStorageFailed(e.code().value());
+        throw;
     } catch (...) {
-        // On any failure, release the claim so the append thread falls back to a
-        // synchronous create and we retry next cycle.
-        preprovInFlight_.store(false, std::memory_order_release);
-        return 0;
+        markStorageFailed(EIO);
+        throw;
     }
-    // Publish: release-store hands the fully-built segment (files + mmap) to the
-    // append thread's acquire-load in installNextSegment().
-    preparedSegment_.store(seg.release(), std::memory_order_release);
-    return 1;
+    // CP-8 FIX (incremental largestTimestamp): the running max tracked for the
+    // just-sealed segment becomes its entry's timestamp; reset for the new one.
+    const auto sealedIt = std::prev(segments_.end(), 2);
+    newlySealedMaxTs_ = activeSegmentMaxTs_;
+    newlySealedBase_  = sealedIt->first;
+    activeSegmentMaxTs_ = 0;
+    // E1d: an inline seal made the sealed segment durable — R may cross into
+    // the new active segment (persisted inline on the legacy path only).
+    advanceRecoveryPoint_();
+    maybeCheckpointInline_();
+    // hotpath-A F4: ONE O(1) publish per roll — append the sealed entry.
+    snapshotAppendSealed_(sealedIt);
+    newlySealedMaxTs_ = 0;
+    newlySealedBase_  = -1;
+}
+
+// ---------------------------------------------------------------------------
+// Sealed-segment snapshot (hotpath-A F4).
+// ---------------------------------------------------------------------------
+namespace {
+// Largest timestamp of a sealed segment's entry: the value it was last
+// published with (sealed contents never change under one object), else
+// `fresh` (the roll's running max / the recovery scan / 0), never below its
+// floor (CRITICAL-1: what the segments it replaced or absorbed published).
+inline int64_t sealedEntryTs(LogSegment& seg, int64_t fresh) noexcept {
+    int64_t ts = seg.publishedTs() != INT64_MIN ? seg.publishedTs() : fresh;
+    if (seg.tsFloor() > ts) ts = seg.tsFloor();
+    seg.setPublishedTs(ts);
+    return ts;
+}
+} // namespace
+
+void Log::snapRebaseDir_(std::size_t keepChunks, std::size_t extraChunks) {
+    // Cold-ish: once per kSnapHeadersPerDir publishes or when the chunk slots
+    // run out — O(live chunks) pointer copies, never an entry copy.
+    const std::size_t firstChunk = snapDir_ ? snapBegin_ / kSnapChunkEntries : 0;
+    auto dir = std::make_shared<SealedSnapshotDir>();
+    dir->chunkCap = std::max<std::size_t>(16, 2 * (keepChunks + extraChunks) + 2);
+    dir->chunks.reset(new std::shared_ptr<SealedSnapshotChunk>[dir->chunkCap]);
+    for (std::size_t c = 0; c < keepChunks; ++c) dir->chunks[c] = snapDir_->chunks[firstChunk + c];
+    dir->headerCap = kSnapHeadersPerDir;
+    dir->headers.reset(new SealedSegmentSnapshot[dir->headerCap]);
+    snapBegin_ -= firstChunk * kSnapChunkEntries;
+    snapEnd_   -= firstChunk * kSnapChunkEntries;
+    snapDir_ = std::move(dir);
+    snapHeadersUsed_ = 0;
+}
+
+void Log::snapPushBack_(const SegInfo& e) {
+    const std::size_t c = snapEnd_ / kSnapChunkEntries;
+    if (!snapDir_ || c >= snapDir_->chunkCap) {
+        const std::size_t live = snapDir_ ? (snapEnd_ + kSnapChunkEntries - 1) / kSnapChunkEntries -
+                                                snapBegin_ / kSnapChunkEntries
+                                          : 0;
+        snapRebaseDir_(live, 1);
+    }
+    const std::size_t cc = snapEnd_ / kSnapChunkEntries;
+    if (snapEnd_ % kSnapChunkEntries == 0 && !snapDir_->chunks[cc]) [[unlikely]]
+        snapDir_->chunks[cc] = std::make_shared<SealedSnapshotChunk>();   // once per kSnapChunkEntries
+    // Slot snapEnd_ is covered by no published snapshot (see snapEnd_).
+    snapDir_->chunks[cc]->e[snapEnd_ % kSnapChunkEntries] = e;
+    ++snapEnd_;
+}
+
+void Log::publishSnapshotView_() {
+    if (!snapDir_ || snapHeadersUsed_ == snapDir_->headerCap) {
+        const std::size_t live = snapDir_ ? (snapEnd_ + kSnapChunkEntries - 1) / kSnapChunkEntries -
+                                                snapBegin_ / kSnapChunkEntries
+                                          : 0;
+        snapRebaseDir_(live, 0);
+    }
+    SealedSegmentSnapshot& h = snapDir_->headers[snapHeadersUsed_++];
+    h = SealedSegmentSnapshot(snapDir_.get(), snapBegin_, snapEnd_ - snapBegin_);
+    // Aliasing shared_ptr: shares the directory's control block — no allocation.
+    std::atomic_store(&sealedSnapshot_, std::shared_ptr<const SealedSegmentSnapshot>(snapDir_, &h));
+}
+
+void Log::snapshotAppendSealed_(SegMap::iterator sealed) {
+    // The published entries must mirror every sealed segment but the new one
+    // (a log driven before its first publish — never recovered — or any other
+    // drift): else the tail rebuild, which also covers the new entry.
+    const std::size_t live = snapEnd_ - snapBegin_;
+    if (segments_.size() < 2 || live != segments_.size() - 2 ||
+        (live > 0 && snapAt_(snapEnd_ - 1).endOffset != sealed->first)) [[unlikely]] {
+        publishSealedSnapshotFrom_(sealed->first);
+        return;
+    }
+    LogSegment& seg = *sealed->second;
+    const int64_t ts = sealedEntryTs(seg, newlySealedMaxTs_);
+    snapPushBack_(SegInfo{sealed->first, seg.sizeBytes(), ts, std::next(sealed)->first, seg.tsLineage()});
+    publishSnapshotView_();
+}
+
+void Log::snapshotDropFront_(std::size_t k) {
+    // Retention erases a PREFIX of the sealed segments (N4-LOW-2): the snapshot
+    // drops the same prefix — O(1), no entry rewritten.  A mismatch (never
+    // expected) falls back to the rebuild.
+    const std::size_t live = snapEnd_ - snapBegin_;
+    const std::size_t sealedNow = segments_.empty() ? 0 : segments_.size() - 1;
+    if (snapDir_ && k <= live && live - k == sealedNow &&
+        (sealedNow == 0 || snapAt_(snapBegin_ + k).baseOffset == segments_.begin()->first)) [[likely]] {
+        snapBegin_ += k;
+        publishSnapshotView_();
+        return;
+    }
+    publishSealedSnapshot();
+}
+
+void Log::publishSealedSnapshot() { publishSealedSnapshotFrom_(INT64_MIN); }
+
+void Log::publishSealedSnapshotFrom_(int64_t fromBase) {
+    // Timestamps (CP-8 / CP-5.1 / CRITICAL-1): a segment already published
+    // keeps its value (sealed contents are immutable under one object — a
+    // rebuilt / rewritten segment is a NEW object with publishedTs unset); a
+    // never-published one takes the roll's running max or recover()'s
+    // one-time scan value (recoveryMaxTimestamps_), else 0 (= unknown); never
+    // below its floor.
+    auto entryFor = [this](SegMap::iterator it) {
+        int64_t scanned = 0;   // MEDIUM-2: 0 is a real value, never "not found"
+        if (it->second->publishedTs() == INT64_MIN) {
+            if (it->first == newlySealedBase_) {
+                scanned = newlySealedMaxTs_;   // the roll's running max (no file I/O)
+            } else if (auto rm = recoveryMaxTimestamps_.find(it->first); rm != recoveryMaxTimestamps_.end()) {
+                scanned = rm->second;
+            }
+        }
+        const int64_t ts = sealedEntryTs(*it->second, scanned);
+        return SegInfo{it->first, it->second->sizeBytes(), ts, std::next(it)->first, it->second->tsLineage()};
+    };
+
+    // 1. Where to start: the entry just below the first one at/above fromBase
+    //    (binary search over the live entries).  Everything before it is
+    //    untouched by the caller's change and stays shared as-is.
+    std::size_t start = snapBegin_;
+    if (snapDir_ && fromBase != INT64_MIN) {
+        std::size_t lo = snapBegin_, hi = snapEnd_;
+        while (lo < hi) {
+            const std::size_t mid = lo + (hi - lo) / 2;
+            if (snapAt_(mid).baseOffset < fromBase) lo = mid + 1; else hi = mid;
+        }
+        start = lo > snapBegin_ ? lo - 1 : snapBegin_;
+    }
+    auto it = segments_.begin();
+    if (start > snapBegin_) {
+        it = segments_.find(snapAt_(start).baseOffset);
+        // The kept prefix must end exactly where the map resumes; otherwise
+        // (never expected) rebuild everything.
+        if (it == segments_.end() || it == segments_.begin() ||
+            std::prev(it)->first != snapAt_(start - 1).baseOffset) {
+            start = snapBegin_;
+            it = segments_.begin();
+        }
+    }
+    const auto activeIt = segments_.empty() ? segments_.end() : std::prev(segments_.end());
+
+    // 2. Walk: keep entries that compare equal; at the first difference copy-
+    //    on-write that entry's chunk (its prefix) and write the rest fresh.
+    std::size_t i = start;
+    bool diverged = false;
+    auto divergeAt = [this, &diverged](std::size_t at) {
+        diverged = true;
+        // New directory: the chunks wholly below `at` stay shared; the chunk
+        // holding `at` is copied up to `at` (its later slots may be covered by
+        // published snapshots — they are never written again).
+        const std::size_t firstChunk = snapDir_ ? snapBegin_ / kSnapChunkEntries : 0;
+        const std::size_t atChunk    = at / kSnapChunkEntries;
+        std::shared_ptr<SealedSnapshotChunk> partial;
+        if (snapDir_ && at % kSnapChunkEntries != 0) {
+            partial = std::make_shared<SealedSnapshotChunk>();
+            const SealedSnapshotChunk& src = *snapDir_->chunks[atChunk];
+            std::copy(src.e, src.e + at % kSnapChunkEntries, partial->e);
+        }
+        const std::size_t keep = snapDir_ ? atChunk - firstChunk : 0;
+        snapEnd_ = atChunk * kSnapChunkEntries;   // everything from atChunk on is re-pushed
+        if (!snapDir_) { snapBegin_ = snapEnd_ = 0; }
+        snapRebaseDir_(keep, segments_.size() / kSnapChunkEntries + 1);
+        if (partial) {
+            snapDir_->chunks[snapEnd_ / kSnapChunkEntries] = std::move(partial);
+            snapEnd_ += at % kSnapChunkEntries;
+        }
+    };
+    if (!snapDir_) divergeAt(0);
+    for (; it != activeIt && it != segments_.end(); ++it) {
+        const SegInfo e = entryFor(it);
+        if (!diverged && i < snapEnd_) {
+            if (snapAt_(i) == e) { ++i; continue; }
+            divergeAt(i);
+        }
+        // (i == snapEnd_ without a divergence: a pure tail append — the slot is
+        // covered by no published snapshot, written in place.)
+        snapPushBack_(e);
+        ++snapRebuiltEntries_;
+        ++i;
+    }
+    if (!diverged && i < snapEnd_) divergeAt(i);   // trailing entries removed (truncation)
+    // CP-5.1: the recovery scan is consumed by the first publish after recover().
+    recoveryMaxTimestamps_.clear();
+    ++snapRebuilds_;
+    publishSnapshotView_();
+}
+
+bool Log::snapshotMatchesSegmentsForTest() const {
+    const auto snap = sealedSegmentSnapshot();
+    const std::size_t n = segments_.size() > 1 ? segments_.size() - 1 : 0;
+    if (!snap || snap->size() != n) return false;
+    std::size_t i = 0;
+    for (auto it = segments_.begin(); i < n; ++it, ++i) {
+        const SegInfo& si = (*snap)[i];
+        if (si.baseOffset != it->first || si.sizeBytes != it->second->sizeBytes() ||
+            si.endOffset != std::next(it)->first || si.lineage != it->second->tsLineage() ||
+            si.largestTimestamp != it->second->publishedTs())
+            return false;
+    }
+    return true;
+}
+// ---------------------------------------------------------------------------
+// Ready pool (hotpath-A F1 + F2).
+// ---------------------------------------------------------------------------
+int Log::provisionReady(std::size_t depth, bool preallocate) {
+    // PROVISIONING thread only (the ring's single producer).  NEVER touches
+    // segments_.  Every expensive step of a roll happens here: create + open
+    // the files, ftruncate + mmap + prefault the index, map the read view, and
+    // fallocate the segment's blocks (F1).
+    if (depth == 0) depth = 1;
+    if (depth > kMaxProvisionDepth) depth = kMaxProvisionDepth;
+    int built = 0;
+    // At most `depth` builds per call: the owner may consume as fast as this
+    // thread builds, and an unbounded loop would starve the caller's other
+    // duties for this log (finalizeStagingRenames between refills).
+    for (std::size_t b = 0; b < depth; ++b) {
+        if (readyQueuedApprox() >= depth) break;
+        const int64_t seq = static_cast<int64_t>(stagingSeq_++);
+        std::unique_ptr<LogSegment> seg;
+        int err = 0;
+        try {
+            if (provisionFaultN_ > 0) [[unlikely]] {
+                --provisionFaultN_;
+                throw std::system_error(provisionFaultErr_, std::generic_category(), "provision fault (test)");
+            }
+            seg = LogSegment::prepareStaging(stagingLogPathFor(seq), stagingIndexPathFor(seq), seq,
+                                             kDefaultIndexIntervalBytes, indexMaxBytes_);
+        } catch (const std::system_error& e) {
+            err = e.code().value() != 0 ? e.code().value() : EIO;
+        } catch (...) {
+            err = EIO;
+        }
+        if (err != 0) {
+            std::error_code ec;   // a half-built staging file holds no data
+            std::filesystem::remove(stagingLogPathFor(seq), ec);
+            std::filesystem::remove(stagingIndexPathFor(seq), ec);
+            // Review M1: never silent — the owner learns it over the ring and
+            // rolls inline (a failing inline create then fails the log).
+            reportProvisionFailure(err);
+            return -err;
+        }
+        // F1: reserve the blocks HERE (was fallocate(rollBytes) on the owner at
+        // every roll — 150-330 µs).  KEEP_SIZE: O_APPEND still writes at offset 0.
+        // Re-review N3: over the node-wide reservation cap the segment is still
+        // built off the owner — only the block reservation is shed.
+        if (preallocate) seg->preallocate(rollBytes_);
+        LogSegment* raw = seg.release();
+        // Publish: the ring's commit hands the fully built segment (files, maps,
+        // blocks) to the owner's poll in pullReady_().
+        if (!readyRing_.offer(kReadyMsg, static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(raw)), 0)) {
+            const int64_t s2 = raw->stagingSeq();
+            delete raw;   // ring full (failure records queued): nothing lost, retried on demand
+            std::error_code ec;
+            std::filesystem::remove(stagingLogPathFor(s2), ec);
+            std::filesystem::remove(stagingIndexPathFor(s2), ec);
+            break;
+        }
+        ++built;
+    }
+    return built;
+}
+
+void Log::reportProvisionFailure(int err) noexcept {
+    // Provisioning thread.  A full ring already holds records the owner will
+    // pull first (each ends a hold), so a dropped failure record loses nothing.
+    (void)readyRing_.offer(kFailedMsg, err != 0 ? err : EIO, 0);
+}
+
+void Log::pullReady_() noexcept {
+    // OWNER (the ring's one consumer).  One record per call into the front slot.
+    if (readyFront_ != nullptr || failFront_ != 0) return;
+    (void)readyRing_.poll([this](int32_t type, int64_t a, int64_t) noexcept {
+        if (type == kReadyMsg) {
+            readyFront_ = reinterpret_cast<LogSegment*>(static_cast<std::uintptr_t>(a));
+        } else if (type == kFailedMsg) {
+            failFront_ = a != 0 ? static_cast<int>(a) : EIO;
+            ++provisionFailures_;
+            // Counted; logged rate-limited (powers of two — no timer).
+            if ((provisionFailures_ & (provisionFailures_ - 1)) == 0)
+                spdlog::warn("Log {}: segment provisioning failed (errno={}, failures={}): the next roll "
+                             "creates its segment inline", dir_, failFront_, provisionFailures_);
+        }
+    }, 1);
+}
+
+void Log::postProvisionDemands_(int64_t activeBytes) noexcept {
+    // OWNER.  Cold: at most a few times per segment (a failed offer is retried
+    // at the next append / hold check — a demand is never lost).
+    if (provisionHook_.fn == nullptr) return;
+    if (adoptedPostPending_ &&
+        provisionHook_.fn(provisionHook_.ctx, this, ProvisionDemand::Adopted))
+        adoptedPostPending_ = false;
+    if (!thresholdPosted_ && activeBytes >= provisionThresholdBytes_ &&
+        provisionHook_.fn(provisionHook_.ctx, this, ProvisionDemand::Threshold))
+        thresholdPosted_ = true;
+}
+
+LogSegment* Log::takeReady_() noexcept {
+    pullReady_();
+    LogSegment* seg = readyFront_;
+    readyFront_ = nullptr;
+    return seg;
 }
 
 void Log::installNextSegment(int64_t base) {
-    // APPEND thread only.  Adopt the pre-provisioned staging segment if ready;
-    // else synchronously create one (correctness fallback — slower, only when the
-    // bg thread hasn't produced one yet, e.g. right after startup or two rolls in
-    // quick succession).
-    LogSegment* prepared = preparedSegment_.exchange(nullptr, std::memory_order_acq_rel);
-    if (prepared) {
-        // ADOPT — ZERO syscalls on the hot path: pure in-memory rebase.  The
-        // staging .log/.index keep their temp names on disk for now; we enqueue
-        // the disk rename (staging → <base>.{log,index}) for the background
-        // thread to perform off the hot path.
+    // OWNER thread only.
+    // A provisioned log adopts only when its rename can be queued (a FORCED
+    // roll past the overshoot cap with a full ring creates inline instead).
+    // Review M1: a pulled provisioning FAILURE makes this roll inline (below).
+    pullReady_();
+    const bool failureRoll = provisioned_ && readyFront_ == nullptr && failFront_ != 0;
+    if (failureRoll) { failFront_ = 0; ++failureInlineRolls_; }
+    if (LogSegment* prepared = (!provisioned_ || renameRoom_()) && !failureRoll ? takeReady_() : nullptr) {
+        // ADOPT — ZERO syscalls: pure in-memory rebase.  The staging .log/.index
+        // keep their temp names on disk for now; the disk rename (staging →
+        // <base>.{log,index}) is deferred to the background thread.
         std::unique_ptr<LogSegment> seg(prepared);
         const int64_t stagingSeq = seg->stagingSeq();
         seg->adoptAsActive(base);            // in-memory only
         install_(base, std::move(seg));
-        // Enqueue the deferred rename (single-slot-safe SPSC; rolls are rare so
-        // the small ring never fills).  If it somehow can't be enqueued, do the
-        // rename synchronously as a fallback (still correct, just slower).
-        if (!enqueueStagingRename(base, stagingSeq)) {
+        // The deferred rename (SPSC; rolls are rare so the ring never fills in
+        // practice).  A full ring: rename synchronously (legacy logs only).
+        // A provisioned log never gets here with a full ring: maybeRoll defers
+        // its roll until the ring has room (rollBlockedNow_ / renameRoom_).
+        static_assert(kRenameRingCapacity > kMaxProvisionDepth);
+        if (!enqueueStagingRename(base, stagingSeq) && !provisioned_) {
             renameStagingToBase(stagingSeq, base);
             auto it = segments_.find(base);
             if (it != segments_.end())
                 it->second->setLogPath(logPathForBase(base));
         }
-        // Release the in-flight claim so the bg thread builds the NEXT staging
-        // segment on its following cycle.
-        preprovInFlight_.store(false, std::memory_order_release);
+        // F2: event-driven — the provisioner finalizes the rename (Adopted).
+        adoptedPostPending_ = true;
     } else {
-        // No prepared segment yet (startup, or two rolls closer together than one
-        // bg cycle).  Correctness fallback: synchronous create.  A build in
-        // progress will publish a segment that the NEXT roll consumes; we do NOT
-        // touch preprovInFlight_ here.  This IS a brand-new ACTIVE segment (F3):
-        // eagerReadMap=true, matching prepareStaging's own openReadMap() call.
-        //
-        // F3 fix-round-1: construct into a LOCAL first, and only install into
-        // segments_ once construction has fully succeeded.  LogSegment's ctor
-        // can now throw (e.g. open() failing — see item 2), and segments_[base]
-        // = make_unique<...>(...) would otherwise risk std::map::operator[]
-        // inserting a null entry for `base` before the throwing RHS is fully
-        // evaluated.  With this ordering, a failed roll leaves segments_
-        // completely untouched — the OLD (just-sealed) segment stays the
-        // active segment (still a valid, if over-size, entry), the exception
-        // propagates to the append() caller, and the next append() retries
-        // the roll.  Log is NEVER left without an active segment.
+        // LEGACY (non-provisioned) logs only — maybeRoll defers a provisioned
+        // log's roll instead.  Correctness fallback: synchronous create (+ the
+        // F1 preallocation, inline here by necessity).  F3 fix-round-1: built
+        // into a LOCAL and installed only once construction fully succeeded — a
+        // failed roll leaves segments_ untouched (the just-sealed segment stays
+        // active), the exception propagates, the next append retries.
         auto seg = std::make_unique<LogSegment>(
             dir_, base, kDefaultIndexIntervalBytes, indexMaxBytes_,
             /*prefaultIndex*/false, /*eagerReadMap*/true);
+        seg->preallocate(rollBytes_);
+        ++ownerPreallocs_;
         install_(base, std::move(seg));
     }
-    // MEDIUM-2: a new directory entry (the bg thread created the adopted
+    // MEDIUM-2: a new directory entry (the provisioner created the adopted
     // staging file before publishing it; the fallback created it just now).
     // A crash before its rename leaves the staging name, which construction
     // reconciles — so the entry is durable once a directory fsync issued
     // after this point completes.
     segments_.rbegin()->second->setDirEntryGen(++dirMutGen_);
+    // Review M3: the new active segment demands its successor at the threshold.
+    thresholdPosted_ = false;
+    holdChecks_ = 0;            // a hold episode ends with the roll
+    holdPostPending_ = false;
+    if (provisioned_) postProvisionDemands_(0);
 }
-
 // --- Staging path helpers (background-pre-provisioning naming convention) ---
 // NOTE: staging files use NON-".log"/".index" extensions (.stlog/.stidx) so they
 // are invisible to any directory scan that keys off ".log"/".index" (segment
@@ -556,22 +744,22 @@ int Log::finalizeStagingRenames() {
     const std::size_t head = renameReqHead_.load(std::memory_order_relaxed);
     const std::size_t tail = renameReqTail_.load(std::memory_order_acquire);
     int count = 0;
-    for (std::size_t i = head; i != tail; ++i) {
-        const auto rr = renameReqRing_[i & kRenameRingMask];
-        renameStagingToBase(rr.seq, rr.base);
-        // Publish the completed base to the append-thread done-ring (best effort:
-        // if the done-ring is full the append thread will still work — the fd/mmap
-        // are name-agnostic; logPath_ just stays at the staging name until a later
-        // reconcile, and recovery rebuilds correctly regardless).
+    std::size_t i = head;
+    for (; i != tail; ++i) {
+        // hotpath-A: a request is consumed only when its completion can be
+        // published — a dropped completion would leave the owner's logPath_ at
+        // the staging name for good (and a cold path re-opening it by that
+        // path would fail the log).  A full done ring: retried next call.
         const std::size_t dt = renameDoneTail_.load(std::memory_order_relaxed);
         const std::size_t dh = renameDoneHead_.load(std::memory_order_acquire);
-        if (dt - dh < kRenameRingCapacity) {
-            renameDoneRing_[dt & kRenameRingMask] = rr.base;
-            renameDoneTail_.store(dt + 1, std::memory_order_release);
-        }
+        if (dt - dh >= kRenameRingCapacity) break;
+        const auto rr = renameReqRing_[i & kRenameRingMask];
+        renameStagingToBase(rr.seq, rr.base);
+        renameDoneRing_[dt & kRenameRingMask] = rr.base;
+        renameDoneTail_.store(dt + 1, std::memory_order_release);
         ++count;
     }
-    if (count > 0) renameReqHead_.store(tail, std::memory_order_release);
+    if (count > 0) renameReqHead_.store(i, std::memory_order_release);
     return count;
 }
 
@@ -585,7 +773,7 @@ int Log::drainStagingRenamesDone() {
     for (std::size_t i = head; i != tail; ++i) {
         const int64_t base = renameDoneRing_[i & kRenameRingMask];
         auto it = segments_.find(base);
-        if (it != segments_.end()) it->second->setLogPath(logPathForBase(base));
+        if (it != segments_.end()) it->second->setCanonicalLogPath(dir_, base);   // no allocation
         ++count;
     }
     if (count > 0) renameDoneHead_.store(tail, std::memory_order_release);
@@ -621,8 +809,27 @@ void Log::recoverStagingFiles() {
             f.read(reinterpret_cast<char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
             f.close();
             rune::protocol::RecordBatchReader r(hdr.data(), hdr.size());
-            int64_t base = r.baseOffset();
-            std::filesystem::rename(lp, logPathForBase(base), ec);
+            const int32_t total = r.totalLength();
+            // Review m4: trust the base only from a COMPLETE, CRC-valid first
+            // batch, and never overwrite an existing segment.  Anything else is
+            // quarantined (kept, renamed .stlog.corrupt — never deleted, never
+            // parsed into a bogus base); recovery's chain validation handles the
+            // resulting gap like any lost write.
+            bool valid = false;
+            if (total > 0 && total <= fileSize) {
+                std::vector<uint8_t> first(static_cast<std::size_t>(total));
+                std::ifstream f2(lp, std::ios::binary);
+                f2.read(reinterpret_cast<char*>(first.data()), total);
+                valid = f2.good() && rune::protocol::RecordBatchReader(first.data(), first.size()).ensureValid();
+            }
+            const std::string target = valid ? logPathForBase(r.baseOffset()) : std::string();
+            if (valid && !std::filesystem::exists(target, ec)) {
+                std::filesystem::rename(lp, target, ec);
+            } else {
+                spdlog::error("Log {}: staging file {} {} — quarantined as .corrupt (never parsed / overwritten)",
+                              dir_, lp.string(), valid ? "would overwrite an existing segment" : "has no valid first batch");
+                std::filesystem::rename(lp, lp.string() + ".corrupt", ec);
+            }
             // Drop any co-named staging.index (recover() rebuilds the index).
         } else {
             f.close();
@@ -978,7 +1185,7 @@ int Log::createRecoveryPointFile_(int64_t r) noexcept {
     }
     rpFd_ = fd;   // the renamed inode: kept open for every later slot write
     rpActiveSlot_ = 0;
-    persistedRp_ = r;
+    setPersistedRp_(r);
     ++rpPersists_;
     return 0;
 }
@@ -1017,13 +1224,14 @@ int Log::checkpointRecoveryPoint_(bool publish) noexcept {
                          dir_, v, err);
         return err;
     }
-    const bool moved = v != persistedRp_;
-    persistedRp_ = v;
+    // hotpath-A F4: the cleaner gate moves with ONE release-store (no snapshot
+    // republish — the snapshot no longer carries the recovery point).
+    (void)publish;
+    setPersistedRp_(v);
     rpUnconfirmedMax_ = kRecoveryPointUnknown;   // every possibly-landed write has a LOWER seq
     rpActiveSlot_ = target;
     ++rpPersists_;
     refreshRpDue_();
-    if (publish && moved && !segments_.empty()) publishSealedSnapshot();   // cleaner gate
     return 0;
 }
 
@@ -1118,12 +1326,12 @@ bool Log::recoveryCheckpointCompleted(uint64_t seq, int err) noexcept {
     if (!done.abandoned) {
         // DURABLE now (write + fdatasync completed): only now may the cleaner
         // gate and the persisted R move.
-        const bool moved = done.value != persistedRp_;
-        persistedRp_ = done.value;
+        // hotpath-A F4: the cleaner gate moves with ONE release-store — no second
+        // snapshot publish per roll (was an O(segments) rebuild + allocation).
+        setPersistedRp_(done.value);
         rpUnconfirmedMax_ = kRecoveryPointUnknown;   // the highest-seq write: confirmed
         rpActiveSlot_ = done.slot;
         ++rpPersists_;
-        if (moved && !segments_.empty()) publishSealedSnapshot();   // cold: ≈ once per roll
     }
     refreshRpDue_();
     return recoveryCheckpointDue() || directorySyncDue();
@@ -1248,14 +1456,30 @@ void Log::install_(int64_t base, std::unique_ptr<LogSegment> seg) {
         if (seg->dirEntryGen() == 0 && it->second) seg->setDirEntryGen(it->second->dirEntryGen());
         retire_(std::move(it->second));
         it->second = std::move(seg);
+    } else if (!spareSegNodes_.empty()) {
+        // hotpath-A: reuse a released node (no allocation on the roll path).
+        SegMap::node_type nh = std::move(spareSegNodes_.back());
+        spareSegNodes_.pop_back();
+        nh.key()    = base;
+        nh.mapped() = std::move(seg);
+        segments_.insert(std::move(nh));
     } else {
         segments_.emplace(base, std::move(seg));
     }
 }
 
+Log::SegMap::iterator Log::eraseKeepNode_(SegMap::iterator it) noexcept {
+    auto next = std::next(it);
+    SegMap::node_type nh = segments_.extract(it);
+    // Only an EMPTY node is kept (its segment was moved out / handed off); the
+    // vector never grows past its reservation (no allocation here either).
+    if (!nh.mapped() && spareSegNodes_.size() < spareSegNodes_.capacity()) spareSegNodes_.push_back(std::move(nh));
+    return next;
+}
+
 Log::SegMap::iterator Log::erase_(SegMap::iterator it) {
     retire_(std::move(it->second));
-    return segments_.erase(it);
+    return eraseKeepNode_(it);
 }
 
 void Log::retire_(std::unique_ptr<LogSegment> seg) {
@@ -1323,7 +1547,12 @@ bool Log::truncateTo(int64_t truncateOffset) {
     if (truncateOffset >= logEndOffset_) return true; // nothing to do
     // Fix round 5: never touch a file by path while the cleaner still has
     // posted renames to perform — deferred, no wait (the caller retries).
-    if (!beginColdPath_()) return false;
+    {
+        // Touched: the segment holding truncateOffset and every later one.
+        auto t = segments_.upper_bound(truncateOffset);
+        const int64_t touchFrom = t == segments_.begin() ? INT64_MIN : std::prev(t)->first;
+        if (!beginColdPath_(touchFrom)) return false;
+    }
     // E1d F6: the lowered recovery point is DURABLE before any file is deleted
     // or resized (a crash in between must never trust bytes about to go).
     persistAtMost_(std::max<int64_t>(0, truncateOffset));
@@ -1514,14 +1743,14 @@ bool Log::truncateTo(int64_t truncateOffset) {
     persistAtMost_(logEndOffset_);   // E1d: a mid-batch cut rounds the LEO below truncateOffset
     // Log-snapshot review MAJOR-1: segments_ changed (later segments erased, a
     // formerly sealed segment rebuilt as the ACTIVE one) — republish so the
-    // cleaner's activeBase / sealed set match.  The only earlier publish (inside
-    // the first persistAtMost_) ran BEFORE the erase.
-    publishSealedSnapshot();
+    // cleaner's activeBase / sealed set match.  hotpath-A F4: only the tail from
+    // the (new) active segment is rebuilt — the sealed prefix below it is shared.
+    publishSealedSnapshotFrom_(activeSegment().baseOffset());
     return true;
 }
 
 bool Log::reloadSegments() {
-    if (!beginColdPath_()) return false;   // fix round 5: posted renames first (deferred, no wait)
+    if (!beginColdPath_(INT64_MIN)) return false;   // fix round 5: posted renames first (deferred, no wait)
     // Re-discover segment files on disk (same logic as the constructor).
     std::vector<int64_t> bases;
     for (auto& e : std::filesystem::directory_iterator(dir_))
@@ -1621,7 +1850,8 @@ void Log::reloadSegment(int64_t baseOffset) {
     reloadSegmentNoPublish_(baseOffset);
     // Log-snapshot review audit: a direct (synchronous-cleaner) reload mutates
     // segments_ too — the cleaner thread must see the new size / removal.
-    publishSealedSnapshot();
+    // hotpath-A F4: only the tail from this segment is rebuilt.
+    publishSealedSnapshotFrom_(baseOffset);
 }
 
 void Log::reloadSegmentNoPublish_(int64_t baseOffset) {
@@ -1680,7 +1910,8 @@ void Log::reloadSegmentNoPublish_(int64_t baseOffset) {
 }
 
 int Log::deleteOldSegments(int64_t retainBytes, int64_t highWatermark) {
-    if (!beginColdPath_()) return 0;   // fix round 5: posted renames first (retried next pass)
+    // Review m6: queued renames never block it (it stops at a pathPending segment).
+    if (!beginColdPath_(INT64_MAX)) return 0;   // fix round 5: posted renames first (retried next pass)
     int deleted = 0;
     int64_t total = totalBytes();   // review LOW-2: one O(n) sum, then a running total
     while (segments_.size() > 1 && total > retainBytes) {
@@ -1688,6 +1919,7 @@ int Log::deleteOldSegments(int64_t retainBytes, int64_t highWatermark) {
         // MAJOR-3 (Kafka: HW >= nextSegment.baseOffset): never delete a segment
         // holding records above the HW (not yet replicated / committed).
         if (std::next(it)->first > highWatermark) break;
+        if (it->second->pathPending()) break;   // its staging rename is in flight (review m6)
         std::string base = it->second->logPath();
         std::string idx = indexPathForLog(base);
         total -= it->second->sizeBytes();
@@ -1698,7 +1930,7 @@ int Log::deleteOldSegments(int64_t retainBytes, int64_t highWatermark) {
     }
     // Log-snapshot review audit: segments_ changed — the cleaner must not keep
     // seeing (and re-targeting) the deleted bases.
-    if (deleted > 0) publishSealedSnapshot();
+    if (deleted > 0) snapshotDropFront_(static_cast<std::size_t>(deleted));   // hotpath-A F4: a prefix
     return deleted;
 }
 
@@ -1781,7 +2013,7 @@ bool Log::applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBo
         auto m = std::next(it);
         for (std::size_t k = 1; k < n; ++k) {
             msgs[1 + k].kind = MsgKind::Dispose; msgs[1 + k].base = m->first; msgs[1 + k].obj = m->second.release();
-            m = segments_.erase(m);
+            m = eraseKeepNode_(m);
         }
     } else {
         // Every record removed: drop all members (their offsets read as a gap,
@@ -1790,7 +2022,7 @@ bool Log::applyCleanedGroup_(std::size_t first, std::size_t n, int64_t maxBaseBo
         auto m = it;
         for (std::size_t k = 0; k < n; ++k) {
             msgs[1 + k].kind = MsgKind::Dispose; msgs[1 + k].base = m->first; msgs[1 + k].obj = m->second.release();
-            m = segments_.erase(m);
+            m = eraseKeepNode_(m);
         }
     }
     postMsgs_(msgs.data(), 1 + n);
@@ -1976,7 +2208,28 @@ bool Log::ownerDrainAllowed_(bool& pause) noexcept {
     return true;
 }
 
-bool Log::beginColdPath_() noexcept {
+bool Log::beginColdPath_(int64_t touchFrom) noexcept {
+    // hotpath-A: never touch a segment by path while its staging -> <base>
+    // rename is in flight (the provisioner renames promptly; the in-memory
+    // logPath_ only follows once the owner drains the done ring).  A QUEUED
+    // rename defers the cold path only if its segment is one the cold path
+    // touches (base >= touchFrom — review m6).  The caller retries — no wait.
+    //
+    // Re-review N1 — ORDER MATTERS: acquire the request head FIRST, then drain
+    // the done ring.  The provisioner publishes a completion (done ring) before
+    // it releases the request slot, so every rename below the acquired head is
+    // visible to the drain that follows; a rename that completes after the
+    // acquire is still inside [head, tail) and defers.  (Draining first missed
+    // a rename completing in between: the cold path then deleted the segment by
+    // its stale staging path and the real <base>.log survived.)
+    const std::size_t reqTail = renameReqTail_.load(std::memory_order_relaxed);   // owner = producer
+    const std::size_t reqHead = renameReqHead_.load(std::memory_order_acquire);
+    if (coldSeamFn_ != nullptr) [[unlikely]] coldSeamFn_(coldSeamCtx_);
+    (void)drainStagingRenamesDone();
+    // Slots in [head, tail) were written by this (producer) thread and are only
+    // read by the consumer: reading them here races nothing.
+    for (std::size_t i = reqHead; i != reqTail; ++i)
+        if (renameReqRing_[i & kRenameRingMask].base >= touchFrom) return false;
     if (fileOpsQuiescent()) { pauseSwapPost_ = pauseDropPost_ = false; return true; }
     pauseSwapPost_ = pauseDropPost_ = true;   // the next drains post nothing: let the cleaner catch up
     return false;
@@ -2151,8 +2404,10 @@ int Log::drainCleanerSwaps(int64_t maxBaseBound) {
 
 int Log::drainSwapSlots_(std::size_t head, std::size_t tail, int64_t maxBaseBound) {
     int groupsApplied = 0;
+    int64_t lowestBase = INT64_MAX;   // hotpath-A F4: the snapshot is rebuilt from here
     for (std::size_t i = head; i != tail; ) {
         const SegRef ref = swapRing_[i & kSwapRingMask];
+        if (ref.base < lowestBase) lowestBase = ref.base;
         if (ref.groupSize > 0) {
             // Fix round 2: a deferred group — the producer published all of its
             // slots with one release-store, so [i, i + groupSize) is complete.
@@ -2178,8 +2433,9 @@ int Log::drainSwapSlots_(std::size_t head, std::size_t tail, int64_t maxBaseBoun
         // Release new head so the cleaner can reuse those ring slots.
         swapHead_.store(tail, std::memory_order_release);
         // segments_ changed (segment reloaded or dropped); refresh the snapshot
-        // so the cleaner thread sees correct sizes on the next scan.
-        publishSealedSnapshot();
+        // so the cleaner thread sees correct sizes on the next scan — hotpath-A
+        // F4: only the tail from the lowest affected base is rebuilt.
+        publishSealedSnapshotFrom_(lowestBase);
     }
     return count;
 }
@@ -2239,7 +2495,7 @@ int Log::drainRetentionDeletes(int64_t maxEndBound) {
         m.kind = MsgKind::RetentionDrop;
         m.base = ref.base;
         m.obj  = it->second.release();
-        segments_.erase(it);
+        (void)eraseKeepNode_(it);
         m.logStartAfter = segments_.begin()->first;
         postMsgs_(&m, 1);
         ++count;
@@ -2250,8 +2506,10 @@ int Log::drainRetentionDeletes(int64_t maxEndBound) {
     if (i != head) {
         deleteHead_.store(i, std::memory_order_release);
     }
-    // Refresh the sealed snapshot so the cleaner sees the updated segment list.
-    if (count > 0) publishSealedSnapshot();
+    // Refresh the sealed snapshot so the cleaner sees the updated segment list:
+    // hotpath-A F4 — the erased segments are a prefix, so the snapshot only
+    // advances its front (O(1), no rebuild).
+    if (count > 0) snapshotDropFront_(static_cast<std::size_t>(count));
     return count;
 }
 

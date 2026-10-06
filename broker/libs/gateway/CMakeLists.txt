@@ -117,6 +117,11 @@ if(BUILD_TESTING)
     target_link_libraries(rune_gateway_record_egress_lifetime_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
     gtest_discover_tests(rune_gateway_record_egress_lifetime_tests)
 
+    # 2026-10-05: (session, correlationId) = ONE subscription (duplicate Subscribe dedupe) — no Aeron.
+    add_executable(rune_gateway_subscribe_dedupe_tests tests/gateway/SubscribeDedupeTest.cpp)
+    target_link_libraries(rune_gateway_subscribe_dedupe_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_subscribe_dedupe_tests)
+
     # -------------------------------------------------------------------------
     # ClientGateway integration tests — embedded Aeron driver + ipc loopback.
     # Gated behind BUILD_GATEWAY_TESTS (default ON when BUILD_TESTING=ON).

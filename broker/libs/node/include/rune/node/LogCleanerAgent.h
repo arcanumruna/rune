@@ -162,6 +162,10 @@ public:
     /// I1: Kafka producer.id.expiration.ms for the producer-tail retention
     /// (NodeConfig::producerIdExpirationMs).  Call before the runner starts.
     void setProducerIdExpirationMs(int64_t ms) noexcept { producerIdExpirationMs_ = ms; }
+    /// hotpath-A F2: segment pre-provisioning + staging renames are done by a
+    /// SegmentProvisionerAgent (BrokerNode) — not by this agent.  Call before
+    /// the runner starts.
+    void setExternalProvisioner(bool on) noexcept { externalProvisioner_ = on; }
     [[nodiscard]] int64_t producerIdExpirationMsForTest() const noexcept { return producerIdExpirationMs_; }
     [[nodiscard]] uint64_t viewGenerationForTest() const noexcept { return viewGen_; }
     [[nodiscard]] std::size_t viewSizeForTest() const noexcept { return view_.size(); }
@@ -213,12 +217,19 @@ public:
         // callers treat >0 as "a segment was compacted / retention ran").  Pre-
         // provisioning is background housekeeping that reaches steady state (returns
         // 0) after building one segment, so excluding it keeps that signal clean.
-        for (auto* r : replicas_()) {
-            // Task M1 precondition #2: skip memory-backed replicas.
-            // r->log() asserts isDiskBacked() — never call it on an InMemoryLog.
-            if (r && r->isDiskBacked()) {
-                r->log()->preprovisionPending();
-                r->log()->finalizeStagingRenames();
+        //
+        // hotpath-A F2: in BrokerNode a dedicated SegmentProvisionerAgent owns
+        // this (K ready segments per log, event-driven, never stalled by a
+        // compaction pass) — setExternalProvisioner(true) turns it off here (the
+        // rename ring and the ready ring have ONE consumer / producer each).
+        if (!externalProvisioner_) {
+            for (auto* r : replicas_()) {
+                // Task M1 precondition #2: skip memory-backed replicas.
+                // r->log() asserts isDiskBacked() — never call it on an InMemoryLog.
+                if (r && r->isDiskBacked()) {
+                    r->log()->preprovisionPending();
+                    r->log()->finalizeStagingRenames();
+                }
             }
         }
 
@@ -354,7 +365,7 @@ public:
             // first such segment's base bounds the pass (records at/after it
             // are preserved verbatim).
             for (const auto& si : *snap) {
-                if (si.belowRecoveryPoint) continue;
+                if (log->cleanerCompactionAllowedThrough(si.endOffset)) continue;
                 if (si.baseOffset < firstUncleanable) firstUncleanable = si.baseOffset;
                 break;
             }
@@ -940,6 +951,7 @@ private:
     rune::storage::SkimpyOffsetMap dedupeMap_;
     std::vector<int64_t> scratchBases_;
     bool skipCycleFileOpsForTest_ = false;   ///< test seam: skip the top-of-cycle file ops
+    bool externalProvisioner_ = false;       ///< hotpath-A F2: see setExternalProvisioner
     rune::storage::Log* boundaryExclude_ = nullptr;   ///< the log a pass is compacting (fix round 6)
     int64_t boundaryNowMs_ = 0;
     static void drainOtherLogsHook_(void* self) { static_cast<LogCleanerAgent*>(self)->drainOtherLogs_(); }

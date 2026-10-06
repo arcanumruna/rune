@@ -562,6 +562,11 @@ public:
     ///
     /// The returned vector's lifetime is the caller's responsibility.
     std::vector<uint8_t> read(Offset fetchOffset, int32_t maxBytes) const;
+    /// read() bounded by `bound` instead of the current HW: whole batches whose
+    /// last record is below `bound`.  For a caller that KNOWS [0, bound) is
+    /// committed while this replica's HW does not show it yet (a demoted
+    /// follower's HW reads 0 until its new leader answers) — never past it.
+    std::vector<uint8_t> readUpTo(Offset fetchOffset, int32_t maxBytes, Offset bound) const;
 
     // -----------------------------------------------------------------------
     // Follower API
@@ -972,6 +977,8 @@ public:
     /// push on, a non-zero count means the follower had to be re-served
     /// (lost/dropped push → 20 ms resend window).
     [[nodiscard]] uint64_t fetchDataServesForTest() const noexcept { return fetchDataServes_; }
+    /// Test seam: a follower-side log truncation (KIP-279), bumping logGeneration().
+    void truncateLogForTest(Offset truncateOffset) { truncateLog(truncateOffset); }
     /// F27: replication sends this replica had REFUSED by its transport (pushes,
     /// fetch answers, follower fetches/acks) — each one was retried next pass.
     [[nodiscard]] uint64_t sendRefusalsForTest() const noexcept { return sendRefusals_; }

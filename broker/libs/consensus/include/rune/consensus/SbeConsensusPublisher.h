@@ -94,6 +94,8 @@ public:
         int64_t logPosition,
         NodeId  leaderMemberId) override;
 
+    void standDown(NodeId toMember, Term leadershipTermId, NodeId leaderMemberId) override;
+
 private:
     // Concrete sink + construction-time tag (Task 11 fix 2, B2): the runtime duty
     // cycle (worker 0's pass under fused placement) never dispatches through the

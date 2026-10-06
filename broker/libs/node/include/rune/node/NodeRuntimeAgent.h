@@ -39,6 +39,7 @@
 #include <rune/node/OneToOneByteRing.h>
 #include <rune/node/OwnerThreadTestTask.h>
 #include <rune/node/LeaderObserver.h>
+#include <rune/node/ControlledShutdown.h>
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune_fr/FlightRecorder.h>
@@ -174,6 +175,28 @@ public:
     /// F9a: the control-thread → observer leadership ring.  Set before start.
     void setLeaderObserver(LeaderObserver* o) noexcept { leaderObserver_ = o; }
 
+    int drainNodeControl_() {
+        int sent = 0;
+        if (auto& out = metadataService_->nodeControlOutbox(); !out.empty()) [[unlikely]] {
+            std::size_t n = 0;
+            while (n < out.size() && transport_->sendAlterIsr(out[n])) ++n;
+            out.erase(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(n));
+            sent += static_cast<int>(n);
+        }
+        if (auto& out = metadataService_->nodeControlResponseOutbox(); !out.empty()) [[unlikely]] {
+            std::size_t n = 0;
+            while (n < out.size() && transport_->sendAlterIsrResponse(out[n].first, out[n].second)) ++n;
+            out.erase(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(n));
+            sent += static_cast<int>(n);
+        }
+        return sent;
+    }
+
+    /// Controlled shutdown state machine (driven on this agent's slow tick).
+    /// BrokerNode binds it before the control thread starts; begin()/observe()
+    /// are its cross-thread ring endpoints.
+    ControlledShutdown& controlledShutdown() noexcept { return controlledShutdown_; }
+
     // fsyncgate fail-stop (Task 10 fix 2 / I-1): replicas this control thread
     // drives (internal partitions; all partitions without a WorkerPool) whose
     // log fsync failed are reported here ONCE → BrokerNode halts (exit 74).
@@ -204,11 +227,14 @@ public:
     // Task 10 round 4: the LogCleanerAgent's replica view channel (rings only).
     // BrokerNode calls this before any runner starts and attaches the result to
     // the cleaner.  The channel lives here (outlives the cleaner on shutdown).
-    CleanerViewChannel* enableCleanerView() {
-        if (!cleanerChannel_) cleanerChannel_ = std::make_unique<CleanerViewChannel>();
-        return cleanerChannel_.get();
+    CleanerViewChannel* enableCleanerView() { return views_[kCleanerView].enable(); }
+    [[nodiscard]] std::uint64_t cleanerAckedGenForTest() const noexcept { return views_[kCleanerView].ackedGen; }
+    /// hotpath-A F2: the SegmentProvisionerAgent's replica view — the same
+    /// protocol: a retired replica is freed only once the provisioner acked too.
+    CleanerViewChannel* enableProvisionerView() { return views_[kProvisionerView].enable(); }
+    [[nodiscard]] std::uint64_t provisionerAckedGenForTest() const noexcept {
+        return views_[kProvisionerView].ackedGen;
     }
-    [[nodiscard]] std::uint64_t cleanerAckedGenForTest() const noexcept { return cleanerAckedGen_; }
 
     /// Aeron's io.aeron.cluster.ConsensusModuleAgent.SLOW_TICK_INTERVAL_NS.
     static constexpr int64_t kSlowTickIntervalNs = 10'000'000;   // 10 ms
@@ -252,10 +278,12 @@ private:
             // Round 4: the off-thread cleaner holds replica pointers too (its own
             // ring-delivered view) — a retired replica is freed only once every
             // worker AND the cleaner acked a generation at or above its removal.
-            work += publishCleanerView_();
             std::uint64_t safe = workerPool_ ? workerPool_->minAckedOwnershipGen()
                                              : registry_->generation();
-            if (cleanerChannel_ && cleanerAckedGen_ < safe) safe = cleanerAckedGen_;
+            for (auto& v : views_) {   // the cleaner + the provisioner (hotpath-A)
+                work += publishView_(v);
+                if (v.channel && v.ackedGen < safe) safe = v.ackedGen;
+            }
             registry_->collectRetired(safe);
         }
 
@@ -287,8 +315,18 @@ private:
         //     and the gateway uses it for ALL per-produce/subscribe lookups within
         //     that cycle.  Zero atomic_load per produce on the hot path.
         if (metadataService_) {
+            // D17 / DR-10 review MAJOR-1: only the CONSENSUS leader decides.  The
+            // metadata replica keeps its Leader role after a consensus step-down
+            // until the bridge learns the new leader; deciding on that role let a
+            // stepped-down (or resumed-zombie) controller reassign partitions.
+            metadataService_->setConsensusLeads(isLocalLeader_());
             const int metaWork = metadataService_->doWork(nowNs);
             work += metaWork;
+            // Controlled shutdown (cold; two empty() checks when idle): member
+            // confirmations → the controller, the controller's pushed COMPLETE
+            // → the stopping node.  Every cycle (events, not the slow tick).
+            if (election_) metadataService_->noteController(static_cast<int32_t>(election_->leaderMemberId()));
+            if (transport_) [[likely]] work += drainNodeControl_();
 
             // GR-7 / Task-14: FAILOVER reassignment of partition leadership.
             //
@@ -449,6 +487,9 @@ private:
                         prevEligInit_ = true;
                     }
                 }
+                // Controlled shutdown (cold): register / hand-off steps, on
+                // the same slow tick as the rebalance it depends on.
+                slowWork += controlledShutdown_.doWork(nowNs);
                 failoverTick_.done(nowNs, slowWork);
             }
 
@@ -956,51 +997,61 @@ private:
     // RUNE_CTRL_LOG temp diagnostic — read once at construction (not per scan).
     const bool                                         ctrlLog_ = ::getenv("RUNE_CTRL_LOG") != nullptr;
     LeaderObserver*                                    leaderObserver_ = nullptr;  // F9a, non-owning
+    ControlledShutdown                                 controlledShutdown_;        // control thread (+ rings)
     StorageFailureHook                                 storageFailureHook_;
     std::function<void(const std::string&)>            fatalHook_;
 
-    // Task 10 round 4: cleaner view publication (control-thread side).
-    std::unique_ptr<CleanerViewChannel>                cleanerChannel_;
-    std::vector<rune::replication::PartitionReplica*>  cleanerSnapshot_;   // generation being published
-    std::uint64_t cleanerPublishingGen_ = static_cast<std::uint64_t>(-1);
-    std::size_t   cleanerNextIndex_     = 0;
-    bool          cleanerPublished_     = true;
-    std::uint64_t cleanerAckedGen_      = 0;
-    std::vector<uint8_t>                               cleanerScratch_;
-    int publishCleanerView_() {
-        if (!cleanerChannel_) return 0;
-        int work = cleanerChannel_->ack.drain([this](int32_t, aeron::concurrent::AtomicBuffer& buf,
-                                                     aeron::util::index_t off, aeron::util::index_t) {
+    // Task 10 round 4: off-thread replica-view publication (control-thread
+    // side) — the cleaner's and (hotpath-A) the segment provisioner's.
+    struct ViewPub {
+        std::unique_ptr<CleanerViewChannel>               channel;
+        std::vector<rune::replication::PartitionReplica*> snapshot;   // generation being published
+        std::uint64_t publishingGen = static_cast<std::uint64_t>(-1);
+        std::size_t   nextIndex     = 0;
+        bool          published     = true;
+        std::uint64_t ackedGen      = 0;
+        CleanerViewChannel* enable() {
+            if (!channel) channel = std::make_unique<CleanerViewChannel>();
+            return channel.get();
+        }
+    };
+    static constexpr std::size_t kCleanerView = 0, kProvisionerView = 1;
+    std::array<ViewPub, 2>                             views_;
+    std::vector<uint8_t>                               viewScratch_;
+    int publishView_(ViewPub& v) {
+        if (!v.channel) return 0;
+        int work = v.channel->ack.drain([&v](int32_t, aeron::concurrent::AtomicBuffer& buf,
+                                             aeron::util::index_t off, aeron::util::index_t) {
             std::uint64_t g;
             std::memcpy(&g, buf.buffer() + off, 8);
-            if (g > cleanerAckedGen_) cleanerAckedGen_ = g;
+            if (g > v.ackedGen) v.ackedGen = g;
         }, 16);
         const std::uint64_t gen = registry_->generation();
-        if (gen != cleanerPublishingGen_) {   // cold: on registry change only
-            cleanerSnapshot_      = registry_->allReplicas();
-            cleanerPublishingGen_ = gen;
-            cleanerNextIndex_     = 0;
-            cleanerPublished_     = false;
+        if (gen != v.publishingGen) {   // cold: on registry change only
+            v.snapshot      = registry_->allReplicas();
+            v.publishingGen = gen;
+            v.nextIndex     = 0;
+            v.published     = false;
         }
-        while (!cleanerPublished_) {
-            const std::size_t total = cleanerSnapshot_.size();
+        while (!v.published) {
+            const std::size_t total = v.snapshot.size();
             const std::size_t count = std::min<std::size_t>(CleanerViewChannel::kPtrsPerChunk,
-                                                            total - cleanerNextIndex_);
-            cleanerScratch_.resize(CleanerViewChannel::kHeaderBytes + 8 * count);
-            uint8_t* p = cleanerScratch_.data();
-            const uint32_t t32 = static_cast<uint32_t>(total), i32 = static_cast<uint32_t>(cleanerNextIndex_),
+                                                            total - v.nextIndex);
+            viewScratch_.resize(CleanerViewChannel::kHeaderBytes + 8 * count);
+            uint8_t* p = viewScratch_.data();
+            const uint32_t t32 = static_cast<uint32_t>(total), i32 = static_cast<uint32_t>(v.nextIndex),
                            c32 = static_cast<uint32_t>(count), pad = 0;
             std::memcpy(p, &gen, 8); std::memcpy(p + 8, &t32, 4); std::memcpy(p + 12, &i32, 4);
             std::memcpy(p + 16, &c32, 4); std::memcpy(p + 20, &pad, 4);
             for (std::size_t i = 0; i < count; ++i) {
-                const std::uint64_t v = reinterpret_cast<std::uintptr_t>(cleanerSnapshot_[cleanerNextIndex_ + i]);
-                std::memcpy(p + CleanerViewChannel::kHeaderBytes + 8 * i, &v, 8);
+                const std::uint64_t ptr = reinterpret_cast<std::uintptr_t>(v.snapshot[v.nextIndex + i]);
+                std::memcpy(p + CleanerViewChannel::kHeaderBytes + 8 * i, &ptr, 8);
             }
-            if (!cleanerChannel_->view.write(p, cleanerScratch_.size(), CleanerViewChannel::kViewMsgType))
+            if (!v.channel->view.write(p, viewScratch_.size(), CleanerViewChannel::kViewMsgType))
                 break;   // ring full: resumed next cycle (time-independent)
-            cleanerNextIndex_ += count;
+            v.nextIndex += count;
             ++work;
-            if (cleanerNextIndex_ >= total) cleanerPublished_ = true;
+            if (v.nextIndex >= total) v.published = true;
         }
         return work;
     }

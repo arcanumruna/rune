@@ -29,6 +29,13 @@ TEST(FdBudgetRegression, EstimateCountsSegmentsAndE1dFdsPerPartition) {
     EXPECT_EQ(estimateFdNeed({}), kBaseFds + kInternal);
 }
 
+// hotpath-A review M3: the provisioner's READY segments are budgeted too.
+TEST(FdBudgetRegression, EstimateCountsProvisionerReadySegmentsRegression) {
+    EXPECT_EQ(estimateFdNeed({topic(300)}, /*ready=*/2),
+              kBaseFds + kInternal + 300 * ((kDefaultOpenSegments + 2) * kFdsPerSegment + kE1dFdsPerLog));
+    EXPECT_EQ(estimateFdNeed({topic(300)}, 0), estimateFdNeed({topic(300)}));
+}
+
 TEST(FdBudgetRegression, SoftIsRaisedToHard) {
     const auto d = decideFdLimit(/*soft=*/1024, /*hard=*/524288, false, /*need=*/10'000);
     EXPECT_EQ(d.verdict, FdLimitVerdict::Ok);

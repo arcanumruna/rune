@@ -1283,6 +1283,14 @@ if(BUILD_TESTING)
         target_include_directories(rune_epoch_restart_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_epoch_restart_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_epoch_restart_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+
+        # Controlled shutdown (Kafka parity): a gracefully stopping node hands
+        # its partitions (and the controller its consensus leadership) off
+        # before it exits.
+        add_executable(rune_controlled_shutdown_e2e_tests tests/integration/ControlledShutdownRegressionTest.cpp)
+        target_include_directories(rune_controlled_shutdown_e2e_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_controlled_shutdown_e2e_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_controlled_shutdown_e2e_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
     endif()
 
     # ---------------------------------------------------------------------------

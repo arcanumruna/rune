@@ -259,6 +259,14 @@ struct NodeConfig {
     int64_t electionStatusIntervalMs =  20;  // default  20 ms
     int64_t startupCanvassTimeoutMs  = 100;  // default 100 ms
 
+    // Controlled shutdown (RUNE_CONTROLLED_SHUTDOWN_MS): on a graceful stop
+    // signal main() hands this node's partition leadership (and, on the
+    // controller, the consensus leadership) off before stopping.  The hand-off
+    // is event-driven; this is only the last-resort cap after which the node
+    // stops anyway (logged; the rest fails over as on an unclean stop).  Keep
+    // it below the orchestrator's kill grace (docker stop: 10 s).  0 = off.
+    int64_t controlledShutdownMs = 5'000;
+
     // Replication lag tolerance — GR-5.
     // After a follower hasn't fetched for replicaLagMaxMs, it is shrunk from the ISR.
     // Default 10 000 ms (10 s) matches the PartitionConfig default.
@@ -807,6 +815,33 @@ struct NodeConfig {
     // producer-state rebuild still knows it; older producers are expired.
     // Default 7 days.  Overridable via RUNE_PRODUCER_ID_EXPIRATION_MS (>= 0).
     int64_t producerIdExpirationMs = 7LL * 24 * 3600 * 1000;
+
+    // hotpath-A F2 + review M3: READY (pre-provisioned, fallocated) segments
+    // the SegmentProvisionerAgent builds for a disk-backed user log — DEMAND-
+    // DRIVEN: nothing is reserved until the log's active segment is
+    // segmentProvisionThresholdPct full; then up to `depth` ready segments are
+    // built (the next roll adopts one with zero syscalls).  Idle partitions
+    // reserve 0 extra blocks / fds / mmaps.  Worst-case disk reservation per
+    // busy partition: depth x segmentRollBytes (fallocate KEEP_SIZE), bounded
+    // node-wide by segmentProvisionCapBytes.  A roll that arrives before its
+    // ready segment is deferred (the intake holds, bounded); a build failure or
+    // the cap makes that roll inline (blocking, correct, counted).
+    // depth: clamped to [1, Log::kMaxProvisionDepth].  RUNE_SEGMENT_PROVISION_DEPTH.
+    int32_t segmentProvisionDepth = 1;
+    // Fill level (% of segmentRollBytes, 1..100) at which a log demands its
+    // next segment.  RUNE_SEGMENT_PROVISION_THRESHOLD_PCT.
+    int32_t segmentProvisionThresholdPct = 50;
+    // Node-wide cap on bytes reserved (fallocated) by ready segments: > 0
+    // fixed, 0 = no cap, < 0 = AUTO (default): segmentProvisionCapFreePct % of
+    // the free space of dataDir (statvfs, re-evaluated off-thread).  Over the
+    // cap a ready segment is still built — without fallocate (re-review N3).
+    // RUNE_SEGMENT_PROVISION_CAP_BYTES / RUNE_SEGMENT_PROVISION_CAP_FREE_PCT.
+    int64_t segmentProvisionCapBytes = -1;
+    int32_t segmentProvisionCapFreePct = 10;
+    // The provisioner thread's park cap (µs) when idle.  Demands ring its
+    // doorbell (review m5), so this bounds only fd-less work (replica-view
+    // updates).  RUNE_SEGMENT_PROVISIONER_MAX_PARK_US (>= 1).
+    int64_t segmentProvisionerMaxParkUs = 10'000;
 
     // Segment roll size (bytes) for the internal __consumer_offsets log.
     // Default 64 MiB matches TopicSpec::segmentRollBytes.

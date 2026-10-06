@@ -738,6 +738,178 @@ TEST(WorkerProduceRegression, OversizeRejectLogRateLimitedRegression) {
     EXPECT_EQ(log.logEndOffset(), 0);
 }
 
+// hotpath-A review m1: the hold through the REAL controlled poll.  A frame
+// whose partition's roll is deferred ABORTs its image: it and every later frame
+// of the SAME publisher wait (image-wide back-pressure, the documented
+// contract), while OTHER images keep flowing; once a ready segment exists the
+// held frames are re-delivered in order — none lost, none duplicated.
+TEST_F(WorkerProduceFixture, HeldFrameAbortsOnlyItsImageAndIsRedeliveredRegression)
+{
+    constexpr int32_t kStream = 509;
+    const std::string kChannel = "aeron:ipc";
+    TempDir dirA("hold_img_a_"), dirB("hold_img_b_");
+    rune::storage::Log logA(dirA.path.string(), /*rollBytes=*/256);
+    rune::storage::Log logB(dirB.path.string());
+    logA.recover();
+    logB.recover();
+    struct Hook { static bool fn(void*, rune::storage::Log*, rune::storage::Log::ProvisionDemand) noexcept { return true; } };
+    logA.setProvisioning({&Hook::fn, nullptr});
+    NullTransport transport;
+    auto repA = makeLeaderReplica(20, 0, logA, transport);
+    auto repB = makeLeaderReplica(20, 1, logB, transport);
+    WorkerIngress ingress(aeron_, kChannel, kStream);
+    ASSERT_TRUE(ingress.resolved());
+    constexpr std::size_t kRingBytes = 256 * 1024;
+    Worker worker(0, kRingBytes, kRingBytes);
+    worker.setOwnedDirect({repA.get(), repB.get()});
+    worker.setWorkerIngress(&ingress, /*active=*/true);
+
+    std::vector<std::pair<int64_t, int64_t>> acked;   // (session, correlation), in order
+    auto drain = [&] {
+        worker.drainReturn([&](const WorkerReturn& r) {
+            if (r.type == WorkerReturn::Type::ProduceResult) {
+                EXPECT_EQ(r.errorCode, 0);
+                acked.emplace_back(r.sessionId, r.correlationId);
+            }
+        });
+    };
+    // Fill A until its next append needs a roll (no ready segment).
+    int64_t corr = 0;
+    while (!logA.rollDeferred()) {
+        const auto f = encodeProduceFrame(1, ++corr, 20, 0, 0, makeBatch());
+        ASSERT_GE(worker.handleIngressFrameForTest(f.data(), f.size(), 1), 0);
+        drain();
+    }
+    acked.clear();
+
+    auto pub1 = makeExclusivePub(kChannel, kStream);
+    auto pub2 = makeExclusivePub(kChannel, kStream);
+    ASSERT_TRUE(pub1 && pub2);
+    waitConnected(*pub1, ingress);
+    waitConnected(*pub2, ingress);
+    const auto a1 = encodeProduceFrame(/*session*/11, 101, 20, 0, 0, makeBatch());   // A: held
+    const auto b1 = encodeProduceFrame(11, 102, 20, 1, 0, makeBatch());              // B, behind it
+    const auto b2 = encodeProduceFrame(/*session*/22, 201, 20, 1, 0, makeBatch());   // other image
+    ASSERT_TRUE(offerBounded(*pub1, a1.data(), a1.size()));
+    ASSERT_TRUE(offerBounded(*pub1, b1.data(), b1.size()));
+    ASSERT_TRUE(offerBounded(*pub2, b2.data(), b2.size()));
+    using clk = std::chrono::steady_clock;
+    auto pump = [&](auto done, std::chrono::milliseconds budget = 5000ms) {
+        const auto deadline = clk::now() + budget;
+        while (clk::now() < deadline && !done()) {
+            worker.doWork(std::chrono::duration_cast<std::chrono::nanoseconds>(clk::now().time_since_epoch()).count());
+            drain();
+            std::this_thread::sleep_for(100us);
+        }
+    };
+    pump([&] { return !acked.empty(); });
+    pump([&] { return false; }, 300ms);   // keep polling a while: nothing more may pass
+    ASSERT_EQ(acked.size(), 1u) << "only the OTHER image's frame may pass";
+    EXPECT_EQ(acked[0], std::make_pair(int64_t{22}, int64_t{201}));
+    EXPECT_GE(worker.intakeRollHoldsForTest(), 1u);
+    // A ready segment arrives: the held image resumes, in order.
+    ASSERT_EQ(logA.provisionReady(1), 1);
+    pump([&] { return acked.size() >= 3; });
+    ASSERT_EQ(acked.size(), 3u);
+    EXPECT_EQ(acked[1], std::make_pair(int64_t{11}, int64_t{101}));
+    EXPECT_EQ(acked[2], std::make_pair(int64_t{11}, int64_t{102}));
+    (void)logA.finalizeStagingRenames();
+    (void)logA.drainStagingRenamesDone();
+}
+
+// hotpath-A F2/F3: a produce whose append would need a roll that cannot happen
+// without blocking the worker (no pre-provisioned segment ready on a
+// provisioned log) is HELD — the frame is not decoded into state, answered or
+// appended (the production controlled poll ABORTs it and re-delivers it) — and
+// goes through once the provisioner refilled the pool.  It used to append and
+// roll inline: an open + ftruncate + mmap (+ fallocate) on the worker.
+TEST(WorkerProduceRegression, DeferredRollHoldsIngressFrameRegression) {
+    TempDir dir("hotpatha_hold_");
+    rune::storage::Log log(dir.path.string(), /*rollBytes=*/256);
+    log.recover();
+    struct Hook {
+        static bool fn(void* c, rune::storage::Log*, rune::storage::Log::ProvisionDemand k) noexcept {
+            if (k == rune::storage::Log::ProvisionDemand::Adopted) ++*static_cast<int*>(c);
+            return true;
+        }
+    };
+    int demands = 0;
+    log.setProvisioning({&Hook::fn, &demands});
+    NullTransport transport;
+    auto replica = WorkerProduceFixture::makeLeaderReplica(0, 0, log, transport);
+    Worker worker(0);
+    worker.setOwnedDirect({replica.get()});
+
+    int answers = 0;
+    auto drain = [&] {
+        worker.drainReturn([&](const WorkerReturn& ret) {
+            if (ret.type == WorkerReturn::Type::ProduceResult) { EXPECT_EQ(ret.errorCode, 0); ++answers; }
+        });
+    };
+    int64_t corr = 0;
+    // Fill the active segment through the worker (no roll needed yet).
+    while (!log.rollDeferred()) {
+        const auto f = encodeProduceFrame(1, ++corr, 0, 0, /*acks=*/0, makeBatch());
+        ASSERT_GE(worker.handleIngressFrameForTest(f.data(), f.size(), 1), 0);
+        drain();
+    }
+    ASSERT_EQ(answers, corr);
+    const int64_t leo = log.logEndOffset();
+    const auto segs = log.segmentBaseOffsets().size();
+    const auto held = encodeProduceFrame(1, ++corr, 0, 0, 0, makeBatch());
+    EXPECT_LT(worker.handleIngressFrameForTest(held.data(), held.size(), 1), 0) << "the frame must be held";
+    drain();
+    EXPECT_EQ(answers, corr - 1) << "a held frame is not answered";
+    EXPECT_EQ(log.logEndOffset(), leo) << "a held frame is not appended";
+    EXPECT_EQ(log.segmentBaseOffsets().size(), segs) << "no inline segment create on the worker";
+    EXPECT_EQ(worker.intakeRollHoldsForTest(), 1u);
+    // The provisioner refills: the re-delivered frame goes through and rolls.
+    ASSERT_EQ(log.provisionReady(1), 1);
+    EXPECT_GE(worker.handleIngressFrameForTest(held.data(), held.size(), 1), 0);
+    drain();
+    EXPECT_EQ(answers, corr);
+    EXPECT_EQ(log.logEndOffset(), leo + 1);
+    EXPECT_EQ(log.segmentBaseOffsets().size(), segs + 1);
+    EXPECT_EQ(demands, 1);
+    (void)log.finalizeStagingRenames();
+    (void)log.drainStagingRenamesDone();
+}
+
+// hotpath-A review m1: a frame that would be REFUSED anyway (this replica is
+// not the leader) is answered at once — never held behind a deferred roll.
+TEST(WorkerProduceRegression, RefusedFrameIsAnsweredNotHeldWhileRollDeferredRegression) {
+    TempDir dir("hotpatha_refuse_");
+    rune::storage::Log log(dir.path.string(), /*rollBytes=*/256);
+    log.recover();
+    struct Hook { static bool fn(void*, rune::storage::Log*, rune::storage::Log::ProvisionDemand) noexcept { return true; } };
+    log.setProvisioning({&Hook::fn, nullptr});
+    int64_t off = 0;
+    while (!log.rollDeferred()) {   // fill (as a follower's replicated appends would)
+        rune::protocol::RecordBatchBuilder b(off, 1000);
+        b.append("k", "v", 1000);
+        const auto bb = b.build();
+        off = log.appendNoSync(bb.data(), bb.size(), off);
+    }
+    NullTransport transport;
+    rune::replication::PartitionConfig cfg{};
+    cfg.topicId = 0; cfg.partitionId = 0; cfg.selfId = 1; cfg.minIsr = 1;
+    cfg.replicaLagMaxMs = 10'000; cfg.replicaLagMaxOffset = 10'000;
+    cfg.fetchIntervalNs = 1'000'000LL; cfg.isrCheckIntervalNs = 1'000'000LL; cfg.maxFetchBytes = 1 << 20;
+    auto follower = std::make_unique<rune::replication::PartitionReplica>(
+        cfg, rune::replication::Role::Follower, 1, std::vector<rune::replication::NodeId>{1, 2},
+        std::vector<rune::replication::NodeId>{1, 2}, &log, &transport);
+    Worker worker(0);
+    worker.setOwnedDirect({follower.get()});
+    const auto f = encodeProduceFrame(1, 7, 0, 0, 0, makeBatch());
+    EXPECT_GE(worker.handleIngressFrameForTest(f.data(), f.size(), 1), 0) << "a refused frame must not be held";
+    int16_t code = -1;
+    worker.drainReturn([&](const WorkerReturn& r) {
+        if (r.type == WorkerReturn::Type::ProduceResult) code = r.errorCode;
+    });
+    EXPECT_EQ(code, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_EQ(worker.intakeRollHoldsForTest(), 0u);
+}
+
 } // namespace
 } // namespace rune::node
 

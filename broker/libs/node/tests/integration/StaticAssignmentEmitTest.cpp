@@ -46,6 +46,7 @@
 
 #include <gtest/gtest.h>
 
+#include <rune/node/ControlledShutdown.h>
 #include <rune/node/MetadataService.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/ReplicationMetadataBridge.h>
@@ -1000,7 +1001,9 @@ struct CtlRig {
     std::unique_ptr<PartitionReplica> r1, r2, r3;
     std::unique_ptr<MetadataService> svc;
     int64_t clock = 0;
-    CtlRig() {
+    /// `userTopics` false: no user topic, the coordinator partition (-1, 0)
+    /// on the controller path only (a cluster with no user topics).
+    explicit CtlRig(bool userTopics = true) {
         log1.recover(); log2.recover(); log3.recover();
         r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), Role::Leader, 1, all, all, &log1, &transport);
         r2 = std::make_unique<PartitionReplica>(makeMetaCfg(2), Role::Follower, 1, all, all, &log2, &transport);
@@ -1009,7 +1012,12 @@ struct CtlRig {
         transport.addFollower(2, r2.get());
         transport.addFollower(3, r3.get());
         svc = std::make_unique<MetadataService>(r1.get(), 1);
-        svc->configure({TopicSpec{0, 1, 3, "", "t"}}, all);
+        if (userTopics) {
+            svc->configure({TopicSpec{0, 1, 3, "", "t"}}, all);
+        } else {
+            svc->configure({}, all);
+            svc->setCoordinatorPartitions({rune::metadata::PartitionKey{-1, 0}}, all);
+        }
         drive(50);
     }
     void drive(int n) {
@@ -1413,4 +1421,574 @@ TEST(EpochRestartControllerRegression, RuntimeTopicDuringCatchUpNeverReassignsEx
     EXPECT_EQ(pa->partitionEpoch, pe) << "an existing partition was re-assigned by the static path";
     EXPECT_EQ(pa->isr.size(), isrSize);
     EXPECT_NE(svc1.assignment(1, 0), nullptr) << "the runtime topic was never assigned";
+}
+
+// ===========================================================================
+// Controlled shutdown (Kafka parity) — controller side.  A node stopping
+// gracefully sends a NODE-level request (AlterIsr channel, topicId =
+// kNodeControlTopicId, kNodeShutdown); the controller then never elects it,
+// moves every partition it leads to another live in-sync replica (new epoch,
+// the stopping node leaves the ISR), drops it from the ISRs it follows in, and
+// refuses to re-admit it — until a NEW incarnation registers (kNodeRegister).
+// A partition whose only in-sync replica is the stopping leader stays (no
+// clean alternative; never an unclean election, no record churn).
+// ===========================================================================
+namespace {
+rune::replication::AlterIsrMsg nodeControl(int32_t node, int64_t inc, bool shutdown) {
+    using rune::replication::AlterIsrMsg;
+    AlterIsrMsg m{};
+    m.topicId = AlterIsrMsg::kNodeControlTopicId; m.partition = 0;
+    m.leaderId = node; m.leaderEpoch = 0; m.partitionEpoch = 0;
+    m.isrCount = AlterIsrMsg::kLeaderEpochBump;
+    m.isr[1] = shutdown ? AlterIsrMsg::kNodeShutdown : AlterIsrMsg::kNodeRegister;
+    m.isr[3] = static_cast<int32_t>(static_cast<uint32_t>(inc));
+    m.isr[4] = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(inc) >> 32));
+    return m;
+}
+/// The leader proposes `isr` (an AlterIsr on the committed state); true = enqueued.
+bool proposeIsr(CtlRig& c, std::vector<int32_t> isr) {
+    const auto& a = c.pa();
+    rune::replication::AlterIsrMsg m{};
+    m.topicId = 0; m.partition = 0; m.leaderId = a.leaderNode; m.leaderEpoch = a.leaderEpoch;
+    m.isrCount = static_cast<int32_t>(isr.size());
+    for (std::size_t i = 0; i < isr.size(); ++i) m.isr[i] = isr[i];
+    m.partitionEpoch = a.partitionEpoch;
+    const bool ok = c.svc->onAlterIsr(m);
+    c.drive(50);
+    return ok;
+}
+} // namespace
+
+TEST(ControlledShutdownControllerRegression, StoppingLeaderHandsOffToAnIsrMemberAtANewEpochRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    for (int32_t n : {1, 2, 3}) if (n != L) (void)c.svc->onAlterIsr(nodeControl(n, 20 + n, false));   // members register
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(L, 7, /*shutdown=*/true), &resp, &answer);
+    EXPECT_TRUE(answer) << "the controller never acked the shutdown request";
+    EXPECT_EQ(resp.topicId, rune::replication::AlterIsrMsg::kNodeControlTopicId);
+    EXPECT_EQ(resp.leaderId, L);
+    EXPECT_EQ(resp.leaderEpoch, 7) << "the ack must carry the requester's incarnation";
+    EXPECT_EQ(resp.errorCode, rune::replication::AlterIsrMsg::kNodeShutdownPending)
+        << "COMPLETE while the stopping node still leads";
+    c.tick();
+    // Moved in the controller's map, but not COMPLETE until every other live
+    // member confirmed its own map routes around the stopping node.
+    resp = {}; answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(L, 7, true), &resp, &answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::AlterIsrMsg::kNodeShutdownPending)
+        << "COMPLETE before the other members confirmed";
+    EXPECT_EQ(resp.partition, 1) << "the answer names the responding controller";
+    for (int32_t member : {1, 2, 3}) {
+        if (member == L) continue;
+        auto conf = nodeControl(L, 7, false);
+        conf.isr[1] = rune::replication::AlterIsrMsg::kNodeShutdownConfirm;   // NOLINT
+        conf.isr[2] = member;
+        conf.isr[5] = rune::replication::AlterIsrMsg::kConfirmUserClear | rune::replication::AlterIsrMsg::kConfirmAllClear;
+        bool a = false;
+        (void)c.svc->onAlterIsr(conf, &resp, &a);
+        EXPECT_FALSE(a) << "a confirmation is never answered";
+    }
+    resp = {}; answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(L, 7, true), &resp, &answer);
+    EXPECT_TRUE(answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::kAlterIsrOk) << "the hand-off was never confirmed COMPLETE";
+    const auto& pa = c.pa();
+    EXPECT_NE(pa.leaderNode, L) << "the stopping node still leads";
+    EXPECT_EQ(pa.leaderEpoch, le + 1) << "the hand-off is a new leader epoch";
+    EXPECT_EQ(std::count(pa.isr.begin(), pa.isr.end(), L), 0) << "the stopping node stayed in the ISR";
+    EXPECT_EQ(pa.isr.size(), 2u);
+    // Preferred-leader passes never move it back while it is stopping.
+    for (int i = 0; i < 5; ++i) {
+        (void)c.svc->reassignDeadPartitionLeaders({1, 2, 3}, 1024);
+        c.drive(20);
+    }
+    EXPECT_NE(c.pa().leaderNode, L);
+    EXPECT_EQ(c.pa().leaderEpoch, le + 1);
+}
+
+TEST(ControlledShutdownControllerRegression, SoleIsrPartitionStaysWithTheStoppingLeaderRegression) {
+    CtlRig c;
+    c.soleIsr();
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch, pe = c.pa().partitionEpoch;
+    (void)c.svc->onAlterIsr(nodeControl(L, 7, true));
+    const auto leo = c.r1->logEndOffset();
+    for (int i = 0; i < 5; ++i) c.tick();
+    EXPECT_EQ(c.pa().leaderNode, L) << "a sole-ISR partition was moved (unclean) or taken offline";
+    EXPECT_EQ(c.pa().leaderEpoch, le);
+    EXPECT_EQ(c.pa().partitionEpoch, pe);
+    EXPECT_EQ(c.pa().isr, std::vector<int32_t>{L});
+    EXPECT_EQ(c.r1->logEndOffset(), leo) << "record churn for a partition that cannot move";
+    // A follower that catches up (the leader re-admits it) makes it movable.
+    const int32_t F = L == 1 ? 2 : 1;
+    ASSERT_TRUE(proposeIsr(c, {L, F}));
+    c.tick();
+    EXPECT_EQ(c.pa().leaderNode, F) << "the partition became movable but stayed with the stopping node";
+}
+
+TEST(ControlledShutdownControllerRegression, StoppingFollowerLeavesTheIsrAndIsNotReadmittedRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    const int32_t F = L == 1 ? 2 : 1;
+    (void)c.svc->onAlterIsr(nodeControl(F, 7, true));
+    c.tick();
+    EXPECT_EQ(c.pa().leaderNode, L) << "a stopping FOLLOWER moved the leadership";
+    EXPECT_EQ(c.pa().leaderEpoch, le);
+    EXPECT_EQ(std::count(c.pa().isr.begin(), c.pa().isr.end(), F), 0) << "the stopping follower stayed in the ISR";
+    std::vector<int32_t> isr = c.pa().isr;
+    isr.push_back(F);
+    EXPECT_FALSE(proposeIsr(c, isr)) << "the stopping follower was re-admitted";
+    EXPECT_EQ(std::count(c.pa().isr.begin(), c.pa().isr.end(), F), 0);
+}
+
+TEST(ControlledShutdownControllerRegression, NewIncarnationRegisterClearsTheShutdownMarkRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;
+    const int32_t F = L == 1 ? 2 : 1;
+    (void)c.svc->onAlterIsr(nodeControl(F, 7, true));
+    c.tick();
+    ASSERT_EQ(std::count(c.pa().isr.begin(), c.pa().isr.end(), F), 0);
+    // A stale register of the stopping incarnation clears nothing.
+    (void)c.svc->onAlterIsr(nodeControl(F, 7, false));
+    std::vector<int32_t> isr = c.pa().isr;
+    isr.push_back(F);
+    EXPECT_FALSE(proposeIsr(c, isr)) << "the stopping incarnation's own register cleared its mark";
+    // The restarted node (incarnation 8) registers: it is a normal member again.
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(F, 8, false), &resp, &answer);
+    EXPECT_TRUE(answer);
+    EXPECT_EQ(resp.leaderEpoch, 8);
+    EXPECT_TRUE(proposeIsr(c, isr)) << "the restarted node was never re-admitted";
+    EXPECT_EQ(std::count(c.pa().isr.begin(), c.pa().isr.end(), F), 1);
+    // An older incarnation's late shutdown request is ignored.
+    (void)c.svc->onAlterIsr(nodeControl(F, 7, true));
+    c.tick();
+    EXPECT_EQ(std::count(c.pa().isr.begin(), c.pa().isr.end(), F), 1) << "a dead incarnation's request applied";
+}
+
+// Node side: what keeps a stopping node from exiting — every ISR it is in,
+// EXCEPT a partition it leads as the SOLE in-sync replica (cannot move without
+// an unclean election: it stays and goes offline with the node, no data loss).
+// The controller's own pre-resign view counts user partitions only.
+TEST(ControlledShutdownControllerRegression, NodeSideDoneConditionLetsSoleIsrPartitionsStayRegression) {
+    rune::metadata::AssignmentMap m;
+    m.put(0, 0, PartitionAssignment{1, {1}, {1, 2, 3}, 3, 5});        // sole ISR: stays
+    m.put(0, 1, PartitionAssignment{1, {1, 2}, {1, 2, 3}, 3, 5});     // movable: blocks
+    m.put(0, 2, PartitionAssignment{2, {2, 1}, {1, 2, 3}, 3, 5});     // follower in ISR: blocks
+    m.put(0, 3, PartitionAssignment{2, {2, 3}, {1, 2, 3}, 3, 5});     // not in ISR: free
+    m.put(-1, 0, PartitionAssignment{1, {1, 2}, {1, 2, 3}, 3, 5});    // coordinator
+    EXPECT_EQ(rune::node::ControlledShutdown::blocking(m, 1, /*userOnly=*/false), 3);
+    EXPECT_EQ(rune::node::ControlledShutdown::blocking(m, 1, /*userOnly=*/true), 2);
+    EXPECT_EQ(rune::node::ControlledShutdown::blocking(m, 3, /*userOnly=*/false), 1);
+}
+
+// ===========================================================================
+// Controlled shutdown — fix round 1 (review 2026-10-05).
+// ===========================================================================
+namespace {
+rune::replication::AlterIsrMsg confirmation(int32_t stopping, int64_t nonce, int32_t member, bool clear = true) {
+    auto c = nodeControl(stopping, nonce, false);
+    c.isr[1] = rune::replication::AlterIsrMsg::kNodeShutdownConfirm;
+    c.isr[2] = member;
+    c.isr[5] = clear ? (rune::replication::AlterIsrMsg::kConfirmUserClear | rune::replication::AlterIsrMsg::kConfirmAllClear) : 0;
+    return c;
+}
+bool isrHas(const PartitionAssignment& pa, int32_t n) {
+    return std::count(pa.isr.begin(), pa.isr.end(), n) != 0;
+}
+} // namespace
+
+// M1 (MAJOR): the process identity is compared by IDENTITY, never by order —
+// a restart whose identity is LOWER than the marked one (a wiped data dir, a
+// rescheduled pod, a wall-clock fallback) must clear the shutdown mark.
+TEST(ControlledShutdownControllerRegression, RegisterFromALowerIdentityClearsTheMarkRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;
+    const int32_t F = L == 1 ? 2 : 1;
+    (void)c.svc->onAlterIsr(nodeControl(F, 7, true));
+    c.tick();
+    ASSERT_FALSE(isrHas(c.pa(), F));
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(F, 1, false), &resp, &answer);   // the restarted process
+    EXPECT_TRUE(answer) << "the restarted (lower-identity) process was dropped as a dead one";
+    std::vector<int32_t> isr = c.pa().isr;
+    isr.push_back(F);
+    EXPECT_TRUE(proposeIsr(c, isr)) << "a restarted node with a lower identity stays fenced forever";
+    // The stopped process's identity is superseded: its late requests change nothing.
+    (void)c.svc->onAlterIsr(nodeControl(F, 7, true));
+    c.tick();
+    EXPECT_TRUE(isrHas(c.pa(), F)) << "a superseded process's late shutdown request applied";
+}
+
+// D1: COMPLETE is an EVENT — the last member confirmation alone pushes it to
+// the stopping node (no wait for the stopping node's loss-recovery re-send).
+TEST(ControlledShutdownControllerRegression, LastConfirmationPushesCompleteWithoutAResendRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;
+    for (int32_t n : {1, 2, 3}) (void)c.svc->onAlterIsr(nodeControl(n, 10 + n, false));   // every member registers
+    (void)c.svc->onAlterIsr(nodeControl(L, 10 + L, true));
+    c.tick();
+    ASSERT_NE(c.pa().leaderNode, L);
+    auto& out = c.svc->nodeControlResponseOutbox();
+    out.clear();
+    for (int32_t m : {1, 2, 3}) {
+        if (m == L || m == 1) continue;   // 1 is the controller itself
+        (void)c.svc->onAlterIsr(confirmation(L, 10 + L, m));
+    }
+    bool pushed = false;
+    for (const auto& [to, r] : out)
+        pushed = pushed || (to == L && r.leaderId == L && r.errorCode == rune::replication::kAlterIsrOk);
+    EXPECT_TRUE(pushed) << "the last confirmation did not push COMPLETE to the stopping node";
+}
+
+// D3: with NO user topics the stopping node must still leave the coordinator
+// ISRs (else its stop always burns the whole budget).
+TEST(ControlledShutdownControllerRegression, NoUserTopicsStoppingNodeLeavesCoordinatorIsrsRegression) {
+    CtlRig c(/*userTopics=*/false);
+    c.tick();
+    const auto* pa = c.svc->assignment(-1, 0);
+    ASSERT_NE(pa, nullptr);
+    ASSERT_EQ(pa->isr.size(), 3u);
+    const int32_t F = pa->leaderNode == 2 ? 3 : 2;
+    (void)c.svc->onAlterIsr(nodeControl(F, 5, true));
+    c.tick();
+    pa = c.svc->assignment(-1, 0);
+    EXPECT_FALSE(isrHas(*pa, F)) << "the stopping node stayed in the coordinator ISR";
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answer = false;
+    for (int32_t m : {2, 3}) if (m != F) (void)c.svc->onAlterIsr(confirmation(F, 5, m));
+    (void)c.svc->onAlterIsr(nodeControl(F, 5, true), &resp, &answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::kAlterIsrOk);
+}
+
+// D4: a member that never spoke the protocol (an older binary mid-roll) is not
+// waited for; one that registered is.
+TEST(ControlledShutdownControllerRegression, SilentOldMemberDoesNotHoldCompleteRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;             // stopping
+    const int32_t newer = L == 2 ? 3 : 2;            // registered + confirms
+    // The third member never sends anything (an older binary).
+    (void)c.svc->onAlterIsr(nodeControl(newer, 42, false));
+    (void)c.svc->onAlterIsr(nodeControl(L, 77, true));
+    c.tick();
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(L, 77, true), &resp, &answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::AlterIsrMsg::kNodeShutdownPending)
+        << "COMPLETE before the registered member confirmed";
+    (void)c.svc->onAlterIsr(confirmation(L, 77, newer));
+    resp = {}; answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(L, 77, true), &resp, &answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::kAlterIsrOk)
+        << "a silent (pre-upgrade) member held the hand-off";
+}
+
+// D5: a DEAD leader's partition fails over to a live NON-stopping in-sync
+// replica (never via the stopping node: no extra hop); with only the stopping
+// node left in sync it is still elected (better than offline).
+TEST(ControlledShutdownControllerRegression, DeadLeaderFailsOverToANonStoppingIsrMemberRegression) {
+    {
+        CtlRig c;
+        const int32_t L = c.pa().leaderNode;
+        std::vector<int32_t> others;
+        for (int32_t n : {1, 2, 3}) if (n != L) others.push_back(n);
+        const int32_t S = others[0], Y = others[1];   // S = lowest id: the default pick
+        (void)c.svc->onAlterIsr(nodeControl(S, 9, true));
+        c.tick({S, Y});                               // L is dead
+        EXPECT_EQ(c.pa().leaderNode, Y) << "failed over to the stopping node (an extra hop)";
+    }
+    {
+        CtlRig c;
+        const int32_t L = c.pa().leaderNode;
+        std::vector<int32_t> others;
+        for (int32_t n : {1, 2, 3}) if (n != L) others.push_back(n);
+        const int32_t S = others[0], Y = others[1];
+        ASSERT_TRUE(proposeIsr(c, {L, S}));           // Y out of sync
+        (void)c.svc->onAlterIsr(nodeControl(S, 9, true));
+        c.tick({S, Y});
+        EXPECT_EQ(c.pa().leaderNode, S) << "the only live in-sync survivor (stopping) was not elected";
+    }
+}
+
+// Two nodes stopping at once: each hands off to the remaining in-sync member;
+// neither is ever a target for the other's partitions.
+TEST(ControlledShutdownControllerRegression, TwoNodesStoppingAtOnceRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;
+    std::vector<int32_t> others;
+    for (int32_t n : {1, 2, 3}) if (n != L) others.push_back(n);
+    (void)c.svc->onAlterIsr(nodeControl(L, 3, true));
+    (void)c.svc->onAlterIsr(nodeControl(others[0], 4, true));
+    c.tick();
+    c.tick();
+    EXPECT_EQ(c.pa().leaderNode, others[1]);
+    EXPECT_EQ(c.pa().isr, std::vector<int32_t>{others[1]});
+}
+
+// ---------------------------------------------------------------------------
+// Node side (ControlledShutdown state machine) — deterministic, no transport:
+// a recording send function and a real Election driven by hand.
+// ---------------------------------------------------------------------------
+namespace {
+struct NullPublisher final : rune::consensus::ConsensusPublisher {
+    void canvassPosition(NodeId, rune::consensus::Term, int64_t, rune::consensus::Term, NodeId) override {}
+    void requestVote(NodeId, rune::consensus::Term, int64_t, rune::consensus::Term, NodeId) override {}
+    void placeVote(NodeId, rune::consensus::Term, rune::consensus::Term, int64_t, NodeId, NodeId, bool) override {}
+    void newLeadershipTerm(NodeId, rune::consensus::Term, rune::consensus::Term, int64_t, int64_t,
+                           rune::consensus::Term, int64_t, int64_t, int64_t, int64_t, NodeId, int32_t, bool,
+                           int64_t) override {}
+    void appendPosition(NodeId, rune::consensus::Term, int64_t, NodeId, uint8_t) override {}
+    void commitPosition(NodeId, rune::consensus::Term, int64_t, NodeId) override {}
+};
+struct NodeSideRig {
+    SaeTempDir d{"csnode"};
+    std::string base() const { return d.path; }
+    rune::consensus::NodeStateFile nsf{d.path + "/nsf"};
+    rune::consensus::TermLog       tl{d.path + "/tl"};
+    NullPublisher pub;
+    std::vector<rune::consensus::ClusterMember> members() {
+        std::vector<rune::consensus::ClusterMember> ms(3);
+        for (int i = 0; i < 3; ++i) { ms[i].id = i; ms[i].logPosition = 0; }
+        return ms;
+    }
+    rune::consensus::Election e{true, -1, 0, 0, 0, 0, members(), 0, pub, nsf, tl,
+                                150'000'000LL, 50'000'000LL, 300'000'000LL, 42};
+    MetadataService md{nullptr, 0};
+    rune::node::ControlledShutdown cs;
+    int sends = 0;
+    static bool send(void* self, int32_t, const rune::replication::AlterIsrMsg&) noexcept {
+        ++static_cast<NodeSideRig*>(self)->sends;
+        return true;
+    }
+    NodeSideRig() { cs.bind(0, 0x1234, &NodeSideRig::send, this, &md, &e, {0, 1, 2}); }
+    /// Follow leader 1 (a CLOSED follower).
+    void followLeader1(int64_t& now) {
+        e.doWork(now);
+        e.onRequestVote(0, 0, 1, 1, now);
+        e.onNewLeadershipTerm(now, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, true, 0);
+        for (int i = 0; i < 20 && !e.isClosed(); ++i) e.doWork(++now);
+        ASSERT_TRUE(e.isClosed());
+        ASSERT_EQ(e.leaderMemberId(), 1);
+    }
+};
+} // namespace
+
+// LOW-3: a graceful stop before any controller is known (and leading nothing)
+// completes at once — there is nobody to hand anything to.
+TEST(ControlledShutdownNodeRegression, StopWithNoControllerKnownCompletesAtOnceRegression) {
+    NodeSideRig r;
+    ASSERT_EQ(r.e.leaderMemberId(), -1);
+    ASSERT_TRUE(r.cs.begin());
+    (void)r.cs.doWork(1'000'000);
+    EXPECT_EQ(r.cs.phaseOnControl(), rune::node::ControlledShutdown::Phase::Done)
+        << "a stop with no controller known waited for one";
+}
+
+// LOW-2: the Register request to a controller that never answers (an older
+// binary) backs off — bounded traffic, not 20 rounds/s forever.
+TEST(ControlledShutdownNodeRegression, RegisterBacksOffAgainstASilentControllerRegression) {
+    NodeSideRig r;
+    int64_t now = 1'000'000;
+    r.followLeader1(now);
+    for (int64_t t = 0; t < 60'000; t += 10) (void)r.cs.doWork(now + t * 1'000'000LL);   // 60 s, 10 ms ticks
+    EXPECT_LT(r.sends, 3 * 100) << "unbounded Register re-sends to a silent controller";
+    EXPECT_GT(r.sends, 0);
+}
+
+// LOW-5: the rolling-restart readiness gate — a node reports how many of its
+// partitions it is NOT in sync for (committed map); 0 = safe to restart the next.
+TEST(ControlledShutdownNodeRegression, ReportsOutOfSyncPartitionsForTheReadinessGateRegression) {
+    rune::metadata::AssignmentMap m;
+    m.put(0, 0, PartitionAssignment{1, {1, 0}, {0, 1, 2}, 3, 5});
+    m.put(0, 1, PartitionAssignment{1, {1, 2}, {0, 1, 2}, 3, 5});   // 0 out of sync
+    m.put(0, 2, PartitionAssignment{2, {2, 1}, {1, 2}, 3, 5});      // 0 not a replica
+    EXPECT_EQ(rune::node::ControlledShutdown::outOfSync(m, 0), 1);
+    EXPECT_EQ(rune::node::ControlledShutdown::outOfSync(m, 1), 0);
+}
+
+// ===========================================================================
+// Controlled shutdown — fix round 2 (re-review 2026-10-05).
+// ===========================================================================
+
+// N1: a late request from a process this member never recorded (P1) must not
+// fence the LIVE process (P2) forever: P2's next request is answered
+// kNodeSuperseded (an event), P2 rotates to a fresh identity (P3) and P3 is
+// adopted — the stale mark is cleared, with no controller change.
+TEST(ControlledShutdownControllerRegression, LateUnseenOldProcessNeverFencesTheLiveOneRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;
+    const int32_t F = L == 1 ? 2 : 1;
+    (void)c.svc->onAlterIsr(nodeControl(F, /*P2*/ 22, false));
+    (void)c.svc->onAlterIsr(nodeControl(F, /*P1*/ 11, true));    // late frame of the dead process
+    c.tick();
+    ASSERT_FALSE(isrHas(c.pa(), F));
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(F, 22, false), &resp, &answer);   // the live process
+    ASSERT_TRUE(answer) << "the live process's request was dropped silently (fenced until restart)";
+    EXPECT_EQ(resp.errorCode, rune::replication::AlterIsrMsg::kNodeSuperseded);
+    EXPECT_EQ(resp.leaderEpoch, 22) << "the answer must echo the superseded identity";
+    resp = {}; answer = false;
+    (void)c.svc->onAlterIsr(nodeControl(F, /*P3*/ 33, false), &resp, &answer);
+    EXPECT_EQ(resp.errorCode, rune::replication::kAlterIsrOk);
+    std::vector<int32_t> isr = c.pa().isr;
+    isr.push_back(F);
+    EXPECT_TRUE(proposeIsr(c, isr)) << "the live node stayed fenced";
+}
+
+// N5: COMPLETE is pushed again when completion goes true → false → true.
+TEST(ControlledShutdownControllerRegression, CompleteIsPushedAgainAfterItFlippedRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;
+    for (int32_t n : {1, 2, 3}) (void)c.svc->onAlterIsr(nodeControl(n, 10 + n, false));
+    (void)c.svc->onAlterIsr(nodeControl(L, 10 + L, true));
+    c.tick();
+    auto& out = c.svc->nodeControlResponseOutbox();
+    auto confirmAll = [&](bool clear) {
+        for (int32_t m : {2, 3}) if (m != L) (void)c.svc->onAlterIsr(confirmation(L, 10 + L, m, clear));
+    };
+    auto pushes = [&] {
+        int n = 0;
+        for (const auto& [to, r] : out) n += (to == L && r.errorCode == rune::replication::kAlterIsrOk) ? 1 : 0;
+        return n;
+    };
+    confirmAll(true);
+    ASSERT_EQ(pushes(), 1);
+    confirmAll(false);   // a member's map no longer clear
+    (void)c.svc->onAlterIsr(nodeControl(L, 10 + L, true));
+    confirmAll(true);
+    EXPECT_EQ(pushes(), 2) << "COMPLETE was not re-pushed after completion flipped back";
+}
+
+// N2 (controller side): a halted controller decides nothing — no move to
+// itself while its data plane is going down.
+TEST(ControlledShutdownControllerRegression, HaltedControllerDecidesNothingRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    c.svc->halt();
+    (void)c.svc->onAlterIsr(nodeControl(L, 5, true));
+    c.tick({1, 2, 3});
+    c.tick({1});   // the others look dead: a live controller would fail over to itself
+    EXPECT_EQ(c.pa().leaderNode, L);
+    EXPECT_EQ(c.pa().leaderEpoch, le) << "a halted controller still decided";
+}
+
+namespace {
+struct RecordingRig : NodeSideRig {
+    std::vector<rune::replication::AlterIsrMsg> sent;
+    static bool rec(void* self, int32_t, const rune::replication::AlterIsrMsg& m) noexcept {
+        static_cast<RecordingRig*>(self)->sent.push_back(m);
+        return true;
+    }
+    RecordingRig() { cs.bind(0, 0x1234, &RecordingRig::rec, this, &md, &e, {0, 1, 2}); }
+    static int64_t nonceOf(const rune::replication::AlterIsrMsg& m) {
+        return static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(m.isr[4])) << 32) |
+                                    static_cast<uint32_t>(m.isr[3]));
+    }
+    void answer(int16_t code) {
+        rune::replication::AlterIsrResponseMsg r{};
+        r.topicId = rune::replication::AlterIsrMsg::kNodeControlTopicId;
+        r.partition = 1; r.leaderId = 0;
+        const int64_t n = cs.nonceOnControl();
+        r.leaderEpoch = static_cast<int32_t>(static_cast<uint32_t>(n));
+        r.partitionEpoch = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(n) >> 32));
+        r.errorCode = code;
+        cs.onResponse(r);
+    }
+};
+} // namespace
+
+// N1 (node side): kNodeSuperseded → a fresh identity, re-sent at once.
+TEST(ControlledShutdownNodeRegression, SupersededAnswerRotatesTheIdentityAndResendsRegression) {
+    RecordingRig r;
+    int64_t now = 1'000'000;
+    r.followLeader1(now);
+    (void)r.cs.doWork(now);
+    ASSERT_FALSE(r.sent.empty());
+    const int64_t before = r.cs.nonceOnControl();
+    r.answer(rune::replication::AlterIsrMsg::kNodeSuperseded);
+    r.sent.clear();
+    (void)r.cs.doWork(now + 1);   // well inside the 50 ms re-send window
+    ASSERT_FALSE(r.sent.empty()) << "no immediate re-send after kNodeSuperseded";
+    EXPECT_NE(RecordingRig::nonceOf(r.sent.back()), before) << "the identity was not rotated";
+    EXPECT_EQ(RecordingRig::nonceOf(r.sent.back()), r.cs.nonceOnControl());
+}
+
+// N4: the readiness gate turns unknown (-1) when the controller is lost.
+TEST(ControlledShutdownNodeRegression, ReadinessGateUnknownWithoutAControllerRegression) {
+    RecordingRig r;
+    int64_t now = 1'000'000;
+    r.followLeader1(now);
+    (void)r.cs.doWork(now);
+    r.answer(rune::replication::kAlterIsrOk);   // registered with controller 1
+    (void)r.cs.doWork(++now);
+    (void)r.cs.doWork(++now);
+    ASSERT_EQ(r.cs.observe().phase, rune::node::ControlledShutdown::Phase::Running);
+    ASSERT_EQ(r.cs.observe().remaining, 0);
+    r.e.onStandDown(++now, r.e.leadershipTermId(), 1);   // controller gone (election)
+    ASSERT_EQ(r.e.leaderMemberId(), -1);
+    (void)r.cs.doWork(++now);
+    EXPECT_EQ(r.cs.observe().remaining, -1) << "the readiness gate kept a stale value without a controller";
+}
+
+// N2 (node side): halt — never stands again, resigns if it leads, tells the
+// members it is going (they avoid it at once), acks Halted.
+TEST(ControlledShutdownNodeRegression, HaltStopsDecidingAndAcksRegression) {
+    RecordingRig r;
+    int64_t now = 1'000'000;
+    r.followLeader1(now);
+    ASSERT_TRUE(r.cs.halt());
+    r.sent.clear();
+    (void)r.cs.doWork(++now);
+    EXPECT_EQ(r.cs.observe().phase, rune::node::ControlledShutdown::Phase::Halted);
+    EXPECT_TRUE(r.e.resigned()) << "the halted node may still stand for election";
+    bool told = false;
+    for (const auto& m : r.sent) told = told || (m.isr[1] & rune::replication::AlterIsrMsg::kNodeShutdown) != 0;
+    EXPECT_TRUE(told) << "the members were not told the node is going";
+}
+
+// D17 / DR-10 review MAJOR-1: a consensus leader that stepped down (quorum loss,
+// higher-term NLT, granted RequestVote — or a resumed zombie before it does) keeps
+// its __cluster_metadata replica's Leader role until the bridge learns a NEW
+// leader.  Its controller must stop deciding the moment consensus leadership is
+// gone: otherwise it reassigns every partition it leads over an eligible set
+// that no longer contains itself, and those records COMMIT while the followers
+// still fetch from it.
+TEST(ControllerConsensusGateRegression, SteppedDownConsensusLeaderEmitsNoReassignmentRegression) {
+    SaeTempDir dir1("cg1"), dir2("cg2"), dir3("cg3");
+    rune::storage::Log log1(dir1.path), log2(dir2.path), log3(dir3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    constexpr NodeId kNode1 = 1, kNode2 = 2, kNode3 = 3;
+    const std::vector<NodeId> allNodes = {kNode1, kNode2, kNode3};
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode1), Role::Leader, 1, allNodes, allNodes, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode2), Role::Follower, 1, allNodes, allNodes, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(kNode3), Role::Follower, 1, allNodes, allNodes, &log3, &transport);
+    transport.setLeader(r1.get());
+    transport.addFollower(kNode2, r2.get());
+    transport.addFollower(kNode3, r3.get());
+    MetadataService svc1(r1.get(), kNode1);
+    svc1.configure({TopicSpec{0, 3, 3, "", "t"}}, allNodes);
+    int64_t clock = 0;
+    for (int i = 0; i < 50; ++i) {
+        clock += 1'000'000LL;
+        r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+        transport.pump(clock);
+        (void)svc1.doWork(clock);
+    }
+    ASSERT_TRUE(svc1.controllerReady());
+    const Offset leoBefore = r1->logEndOffset();
+
+    // Consensus leadership is gone; the metadata replica still reads Leader.
+    svc1.setConsensusLeads(false);
+    EXPECT_FALSE(svc1.controllerReady()) << "a non-consensus-leader must not decide";
+    EXPECT_EQ(svc1.runDynamicRebalanceOnTick({kNode2, kNode3}, nullptr), 0u)
+        << "a stepped-down controller reassigned partitions over an eligible set without itself";
+    EXPECT_EQ(r1->logEndOffset(), leoBefore) << "a stepped-down controller appended to the metadata log";
+
+    svc1.setConsensusLeads(true);
+    EXPECT_TRUE(svc1.controllerReady()) << "regaining consensus leadership restores deciding";
 }

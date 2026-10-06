@@ -124,6 +124,14 @@ struct DynamicBalancerInputs {
     /// requester at a new epoch: it is the sole in-sync replica).
     struct LeaderExclusion { int32_t topicId; int32_t partition; int32_t node; };
     std::vector<LeaderExclusion> excludedLeaders;
+    /// Controlled shutdown (2026-10-05): nodes stopping gracefully.  Unlike an
+    /// exclusion this is a SOFT rule: an avoided node is never a preferred
+    /// target, a partition it leads moves to another live in-sync replica (it
+    /// leaves that ISR) — or stays with it when it is the sole in-sync replica
+    /// (no unclean election) — and a DEAD leader's partition fails over to it
+    /// only when no live, non-avoided in-sync replica exists (better than
+    /// offline).
+    std::vector<int32_t>         avoidLeaders;
     /// Fix round 2 N3 (Kafka leader.imbalance.per.broker.percentage): a
     /// preferred-leader election to node N fires only when MORE than this
     /// percentage of the partitions N is preferred for are led elsewhere
