@@ -295,16 +295,13 @@ void Log::maybeRoll() {
     }
     // B1 fix (fsync-on-seal): the sealed segment is made durable exactly once.
     if (deferSealSync_ && pendingSealCount_ < kMaxPendingSeals) {
-        // Shard mode (spec §3.1): no inline fsync on the loop.  Push the
-        // buffered bytes to the page cache, pin the sealed segment (its fd
-        // must outlive the async flush — M1) and queue it (room checked above);
-        // the owning worker fdatasyncs it through its io backend, and Strict
-        // acks on this log wait until every pending seal has completed.
+        // Shard mode (spec §3.1): no inline fsync on the loop.  Pin the
+        // sealed segment (its fd must outlive the async flush — M1) and queue
+        // it (room checked above); the owning worker fdatasyncs it through its
+        // io backend, and Strict acks on this log wait until every pending
+        // seal has completed.  (D20: writes are unbuffered pwrites — nothing
+        // to push to the page cache first.)
         LogSegment& sealed = activeSegment();
-        if (const int e = sealed.flushBufferedToPageCache(); e != 0) {
-            markStorageFailed(e);
-            throw std::system_error(e, std::generic_category(), "Log seal flush " + dir_);
-        }
         sealed.pinFlush();
         pendingSeals_[pendingSealCount_++] = &sealed;
     } else {

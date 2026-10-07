@@ -218,12 +218,6 @@ LogSegment::~LogSegment() {
     if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
 }
 
-int LogSegment::flushBufferedToPageCache() noexcept {
-    // D20: every write is a pwrite/pwritev straight into the page cache — there
-    // is no userspace buffer left to push.  Kept as the seal-protocol hook.
-    return 0;
-}
-
 // D20: write all of [data, data+len) at the O_APPEND end of the .log through
 // fd_ — the durable append() path (formerly a buffered fstream write + flush).
 // Retries a short write / EINTR like the libc stream did; 0 or errno (ENOSPC for

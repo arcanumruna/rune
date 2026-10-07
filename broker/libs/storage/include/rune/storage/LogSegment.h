@@ -178,10 +178,6 @@ public:
     uint32_t unpinFlush() noexcept { return flushPins_ > 0 ? --flushPins_ : 0; }
     [[nodiscard]] uint32_t flushPins() const noexcept { return flushPins_; }
 
-    /// Seal hook before the fd is handed to the io backend.  D20: writes are
-    /// unbuffered (pwrite), so there is nothing to push — always 0.
-    [[nodiscard]] int flushBufferedToPageCache() noexcept;
-
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
 
     /// Zero-copy read: returns a span into a read-only mmap of the .log covering
