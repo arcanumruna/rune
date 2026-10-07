@@ -433,6 +433,15 @@ public:
     /// <log dir>/leader-epoch-fence; memory-backed ones are given a path under
     /// the node's data dir by BrokerNode.  Loads the persisted value.  Cold.
     void setLeaderEpochFenceFile(std::string path);
+    /// D15 review m5: a MEMORY-backed replica's restart fence lives in a
+    /// `leader-epoch-state` file in its own directory `dir` (under the node's
+    /// data dir), written like a disk replica's: by the owning worker's io
+    /// backend (worker-driven) — a new-epoch leadership is deferred until the
+    /// slot carrying the fence completed.  `legacyFenceFile` (the pre-D15
+    /// plain fence file) is migrated into it and removed once durable.  No
+    /// valid durable state: the fence stays unknown (the first leadership of
+    /// the incarnation is refused, as without a data dir).  Cold.
+    void setMemoryEpochStateDir(const std::string& dir, const std::string& legacyFenceFile);
     [[nodiscard]] Epoch restartFenceEpochForTest() const noexcept { return restartFenceEpoch_; }
     [[nodiscard]] bool  staleLeadershipPendingForTest() const noexcept { return staleLead_.pending; }
     [[nodiscard]] uint64_t staleLeadershipRefusalsForTest() const noexcept { return staleLeadRefusals_; }
@@ -1590,6 +1599,9 @@ private:
     /// is offline for the rest of this incarnation (sticky): every leadership
     /// is refused and the controller is told (kBumpLogDirFailed).
     bool logDirOffline_ = false;
+    /// Hot-path B F7 / D15 m5: the directory holding `leader-epoch-state`
+    /// (a disk replica: its log dir; a memory replica: setMemoryEpochStateDir).
+    std::string esDir_;
     /// Fix round 2 N1/N2: the follower report of a leaderless partition.
     struct LeaderlessReport {
         bool    pending = false;

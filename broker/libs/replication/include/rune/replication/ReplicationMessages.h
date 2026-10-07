@@ -425,6 +425,25 @@ struct ErrorPayloadBuf {
 // proposal was derived from) is still the committed partitionEpoch —
 // compare-and-set on a monotonic version (no ABA).  Generated SBE codec.
 // ---------------------------------------------------------------------------
+/// D15 — the cluster's METADATA FEATURE LEVEL (KRaft metadata.version): the
+/// level is committed to __cluster_metadata (FeatureLevelRecord) by the
+/// controller only once EVERY cluster member advertised support for it
+/// (AlterIsrMsg::kNodeFeatureLevelSlot), or at the bootstrap of a fresh
+/// metadata log.  It gates ONLY request / record kinds an older peer cannot
+/// handle — never a safety mechanism that already shipped (review M1): the
+/// leader-epoch fence protocol (refuse + bump + leaderless reports, 9c80eab)
+/// is part of kBase and is unconditional.  Monotonic.
+namespace MetadataFeature {
+/// main as of 9c80eab (the epoch fence protocol included).
+inline constexpr int16_t kBase = 0;
+/// D15: leaderless marks on NO_LEADER records (trailer) — older binaries
+/// ignore them, so nothing is gated on it yet; future request kinds an older
+/// controller would drop are gated on a level above it.
+inline constexpr int16_t kLeaderlessMarks = 1;
+/// The level this binary supports.
+inline constexpr int16_t kLatest = kLeaderlessMarks;
+} // namespace MetadataFeature
+
 struct AlterIsrMsg {
     static constexpr uint16_t TEMPLATE_ID = 7;
     static constexpr int kMaxIsr = 16;
@@ -487,6 +506,10 @@ struct AlterIsrMsg {
     /// (fix round 2, N1): the receiving process is alive by definition — it
     /// rotates to a fresh identity and re-sends at once.
     static constexpr int16_t kNodeSuperseded = 7;
+    /// D15 (metadata.version gate): every node-control request carries the
+    /// highest metadata feature level its binary supports in this slot (an
+    /// older binary leaves it 0 = MetadataFeature::kBase).
+    static constexpr int kNodeFeatureLevelSlot = 6;
     int32_t topicId        = 0;
     int32_t partition      = 0;
     NodeId  leaderId       = -1;

@@ -119,6 +119,11 @@ public:
     //    re-emitted stale decision (e.g. a static epoch-0 assignment) regresses.
     [[nodiscard]] uint64_t regressionsRejected() const noexcept { return regressionsRejected_; }
 
+    // ── D15: the committed metadata feature level (KRaft metadata.version;
+    //    FeatureLevelRecord).  Monotonic: a lower record is ignored.  0 = no
+    //    record yet (a log written by pre-D15 binaries). ─────────────────────
+    [[nodiscard]] int16_t featureLevel() const noexcept { return featureLevel_; }
+
 private:
     // Committed assignments (pos <= committedPos)
     AssignmentMap committed_;
@@ -133,6 +138,9 @@ private:
     };
 
     std::vector<PendingEntry> pending_;
+    /// D15: uncommitted FeatureLevelRecords (pos, level).
+    std::vector<std::pair<int64_t, int16_t>> pendingFeature_;
+    int16_t featureLevel_ = 0;
 
     int64_t committedPos_ = -1;
 

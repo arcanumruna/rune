@@ -1934,6 +1934,13 @@ private:
             if (gate && gate->replica) (void)gate->replica->epochStateWriteCompleted(static_cast<uint64_t>(r.aux), c.errorCode);
             return 1;
         }
+        // D15 m5: a memory replica's — only while still owned here (else its
+        // next owner rewrites it: rebuildFlushSlots_).
+        if (routed && r.kind == RouteKind::MemEpochState) {
+            if (std::find(owned_.begin(), owned_.end(), r.replica) != owned_.end())
+                (void)r.replica->epochStateWriteCompleted(static_cast<uint64_t>(r.aux), c.errorCode);
+            return 1;
+        }
 
         // C-1: the error FIRST — before any purged-slot early return.  An fsync
         // error is fail-stop whoever owns the log now (never retried).
@@ -4198,7 +4205,8 @@ private:
     std::vector<std::pair<rune::storage::Log*, uint32_t>> slotIndex_;
     std::size_t               slotIndexMask_ = 0;
 
-    enum class RouteKind : uint8_t { Durable, Background, Seal, Hint, RecoveryPoint, DirSync, EpochState };
+    enum class RouteKind : uint8_t { Durable, Background, Seal, Hint, RecoveryPoint, DirSync, EpochState,
+                                     MemEpochState };   ///< D15 m5: a MEMORY replica's epoch-state write (no Log)
     struct TokenRoute {
         CompletionToken            token = kNoToken;   ///< kNoToken = empty bucket
         rune::storage::Log*        log   = nullptr;
@@ -4209,6 +4217,9 @@ private:
         /// offset below it in `seg`); RecoveryPoint: the checkpoint sequence;
         /// EpochState (hot-path B F7): the leader-epoch-state write sequence.
         int64_t                    aux   = 0;
+        /// MemEpochState (D15 m5): the memory replica (identity only — touched
+        /// on completion only while still owned here).
+        rune::replication::PartitionReplica* replica = nullptr;
     };
     std::vector<TokenRoute> routes_;
     std::size_t             routeMask_ = 0;
@@ -4676,7 +4687,18 @@ private:
         std::vector<LogFlushSlot> next;
         next.reserve(owned_.size());
         for (auto* replica : owned_) {
-            if (!replica || !replica->isDiskBacked()) continue;
+            if (replica && !replica->isDiskBacked()) {
+                // D15 m5: a memory replica's epoch-state write whose completion
+                // is not routed here (a previous owner's): outcome unknown —
+                // rewritten (no-op when nothing is in flight).
+                bool memRouted = false;
+                for (const TokenRoute& rt : routes_)
+                    memRouted = memRouted || (rt.token != kNoToken && rt.kind == RouteKind::MemEpochState &&
+                                              rt.replica == replica);
+                if (!memRouted) replica->resetEpochStateForNewOwner();
+                continue;
+            }
+            if (!replica) continue;
             rune::storage::Log* log = replica->log();
             if (!log) continue;
             bool dup = false;
@@ -4882,9 +4904,11 @@ private:
     // goes to the io backend; the completion confirms it (and may complete a
     // deferred leadership).  Cold: role changes / epoch transitions only.
     [[gnu::cold]] int submitEpochStateWrite_(rune::replication::PartitionReplica& r) noexcept {
-        if (!r.isDiskBacked()) return 0;
-        LogFlushSlot* slot = slotOf_(r.log());
-        if (slot == nullptr) return 0;                     // not (yet) owned here: next pass
+        // D15 m5: a memory replica's fence goes through the same async writer
+        // (its leader-epoch-state lives in its own dir; no Log / flush slot).
+        const bool disk = r.isDiskBacked();
+        LogFlushSlot* slot = disk ? slotOf_(r.log()) : nullptr;
+        if (disk && slot == nullptr) return 0;             // not (yet) owned here: next pass
         rune::replication::PartitionReplica::EpochStateWrite w;
         std::size_t need = 0;
         if (!r.prepareEpochStateWrite(esScratch_.data(), esScratch_.size(), w, need)) {
@@ -4907,9 +4931,15 @@ private:
             return 0;
         }
         r.epochStateWriteSubmitted();
-        const bool routed = forceRouteFailForTest_ == 0 &&
-                            routeInsert_(TokenRoute{t, r.log(), nullptr, slot->epoch, RouteKind::EpochState,
-                                                    static_cast<int64_t>(w.seq)});
+        TokenRoute route;
+        route.token = t;
+        route.aux   = static_cast<int64_t>(w.seq);
+        if (disk) {
+            route.log = r.log(); route.epoch = slot->epoch; route.kind = RouteKind::EpochState;
+        } else {
+            route.replica = &r; route.kind = RouteKind::MemEpochState;
+        }
+        const bool routed = forceRouteFailForTest_ == 0 && routeInsert_(route);
         if (!routed) [[unlikely]] {
             if (forceRouteFailForTest_ > 0) --forceRouteFailForTest_;
             // Review Md3: an unroutable completion is never observed — the write

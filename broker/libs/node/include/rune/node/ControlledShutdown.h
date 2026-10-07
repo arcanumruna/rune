@@ -285,6 +285,8 @@ private:
         m.partitionEpoch = 0;
         m.isrCount  = rune::replication::AlterIsrMsg::kLeaderEpochBump;
         m.isr[1]    = flags;
+        // D15: the metadata feature level this binary supports.
+        m.isr[rune::replication::AlterIsrMsg::kNodeFeatureLevelSlot] = rune::replication::MetadataFeature::kLatest;
         m.isr[3]    = static_cast<int32_t>(static_cast<uint32_t>(incarnation_));
         m.isr[4]    = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(incarnation_) >> 32));
         q.lastSendNs = nowNs;   // before the sends: a local answer arrives synchronously

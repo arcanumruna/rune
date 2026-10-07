@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <rune/metadata/PartitionAssignment.h>
 #include <rune/protocol/MetadataRecords.h>
 
 #include <cstdint>
@@ -64,6 +65,9 @@ struct BalancerRecord {
     /// rec.isr / rec.replicas are views into these.
     std::vector<int32_t> isr;
     std::vector<int32_t> replicas;
+    /// D15: a leaderless record's mark — appended as the trailer after `rec`
+    /// (MetadataExtensions.h); Kind::None = no trailer.
+    LeaderlessMark mark{};
 
     BalancerRecord()                                  = default;
     BalancerRecord(BalancerRecord&&)                  = default;
