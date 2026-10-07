@@ -1864,8 +1864,9 @@ bool PartitionReplica::prepareEpochStateWrite(uint8_t* buf, std::size_t cap, Epo
     if (!epochStateWriteDue()) return false;
     const std::size_t entries = epochImageEntries_();
     if (ES::capacityOf(es_.stride) < entries) [[unlikely]] {
-        // Cold, counted (review L1, backlog): the history outgrew the slot —
-        // re-created larger, once per doubling of the epoch history.
+        // Cold, counted: the history outgrew the slot — re-created larger,
+        // once per doubling.  D21 L1: slots are pre-sized for kMinEntries
+        // (4096) epochs, so this needs thousands of RETAINED epochs.
         if (writeEpochStateInline_()) completePendingLeadershipIfDurable_();
         return false;
     }

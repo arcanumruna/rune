@@ -4876,8 +4876,9 @@ private:
 
     // Hot-path B F7: a replica's leader-epoch durability point (restart fence /
     // epoch-cache image) — never an fsync on this loop.  The slot image is
-    // written into the pre-allocated leader-epoch-state file's page cache (one
-    // small pwrite over already-allocated blocks: the io backend's write+sync
+    // written into the pre-sized leader-epoch-state file's page cache (one
+    // small pwrite inside the file's size — a sparse slot's blocks are
+    // allocated at writeback, by the io backend's fdatasync; the write+sync
     // request carries at most kWriteSyncMaxBlock = 64 bytes) and its fdatasync
     // goes to the io backend; the completion confirms it (and may complete a
     // deferred leadership).  Cold: role changes / epoch transitions only.

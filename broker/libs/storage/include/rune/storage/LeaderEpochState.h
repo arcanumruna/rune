@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <fcntl.h>
 #include <string>
 #include <sys/stat.h>
@@ -45,7 +46,12 @@ struct LeaderEpochState {
     static constexpr std::size_t   kHeaderBytes = 32;
     static constexpr std::size_t   kEntryBytes  = 12;
     static constexpr std::size_t   kCrcOffset   = 28;
-    static constexpr std::size_t   kMinEntries  = 64;            ///< per slot (stride 4 KiB; review Md4: 8 KiB file per partition)
+    /// Per slot.  D21 review L1: pre-sized so a history practically never
+    /// outgrows it (outgrowing re-creates the file — fsync + rename + dir fsync
+    /// — on whichever thread writes next, possibly a worker): 52 KiB stride,
+    /// 4434 entries.  The file is SPARSE (create() writes slot 0's image only),
+    /// so the pre-size costs address space, not blocks (review Md4).
+    static constexpr std::size_t   kMinEntries  = 4096;
 
     using Entries = std::vector<std::pair<int32_t, int64_t>>;
 
@@ -164,14 +170,17 @@ struct LeaderEpochState {
     /// Cold — never on a worker duty pass in steady state.
     template <class It>
     static int create(const std::string& dir, std::size_t stride, uint64_t seq, int64_t fence, It first, It last) {
-        std::vector<uint8_t> file(2 * stride, 0);
-        encode(file.data(), seq, fence, first, last);
+        std::vector<uint8_t> img(imageBytes(static_cast<std::size_t>(std::distance(first, last))), 0);
+        const std::size_t len = encode(img.data(), seq, fence, first, last);
         const std::string tmp = dir + "/" + kTmpFileName;
         const std::string dst = path(dir);
         int err = 0;
         const int fd = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) return -(errno != 0 ? errno : EIO);
-        if (::pwrite(fd, file.data(), file.size(), 0) != static_cast<ssize_t>(file.size())) err = errno != 0 ? errno : ENOSPC;
+        // Sparse (D21 L1): the size first (slot 1 reads as zeros = empty), then
+        // slot 0's image only.
+        if (::ftruncate(fd, static_cast<off_t>(2 * stride)) != 0) err = errno != 0 ? errno : EIO;
+        if (err == 0 && ::pwrite(fd, img.data(), len, 0) != static_cast<ssize_t>(len)) err = errno != 0 ? errno : ENOSPC;
         if (err == 0 && ::fsync(fd) != 0) err = errno != 0 ? errno : EIO;
         if (err == 0 && ::rename(tmp.c_str(), dst.c_str()) != 0) err = errno != 0 ? errno : EIO;
         if (err == 0) {

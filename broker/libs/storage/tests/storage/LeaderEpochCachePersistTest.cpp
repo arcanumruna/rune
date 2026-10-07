@@ -116,3 +116,39 @@ TEST(LeaderEpochCachePersist, EntriesAccessor) {
     EXPECT_EQ(v[1].first, 2);  EXPECT_EQ(v[1].second, 100);
     EXPECT_EQ(v[2].first, 5);  EXPECT_EQ(v[2].second, 300);
 }
+
+// ---------------------------------------------------------------------------
+// D21 review L1: the leader-epoch-state file is pre-sized so its history
+// practically never outgrows a slot — outgrowing it re-creates the file
+// (fsync + rename + directory fsync), which can land on a worker.  Sparse: the
+// pre-size costs address space, not blocks.
+// ---------------------------------------------------------------------------
+#include <rune/storage/LeaderEpochState.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <utility>
+#include <vector>
+
+TEST(LeaderEpochStateRegression, FreshFileIsPresizedAndSparseRegression) {
+    using ES = rune::storage::LeaderEpochState;
+    const auto dir = std::filesystem::temp_directory_path() / ("rune_les_presize_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const std::size_t stride = ES::strideFor(ES::kMinEntries);
+    EXPECT_GE(ES::capacityOf(stride), 4096u) << "a slot must hold thousands of epochs";
+    const std::vector<std::pair<int32_t, int64_t>> e{{1, 0}, {2, 100}};
+    const int fd = ES::create(dir.string(), stride, 1, 2, e.begin(), e.end());
+    ASSERT_GE(fd, 0);
+    struct stat st{};
+    ASSERT_EQ(::fstat(fd, &st), 0);
+    EXPECT_EQ(static_cast<std::size_t>(st.st_size), 2 * stride);
+#if defined(__linux__)   // ext4 / xfs: a hole costs no blocks (APFS allocates small extended files)
+    EXPECT_LE(static_cast<int64_t>(st.st_blocks) * 512, int64_t{16} << 10) << "pre-size must not cost blocks";
+#endif
+    ::close(fd);
+    const auto rd = ES::read(dir.string());
+    EXPECT_EQ(rd.state, ES::FileState::Valid);
+    EXPECT_EQ(rd.entries, e);
+    EXPECT_EQ(rd.fence, 2);
+    std::filesystem::remove_all(dir);
+}

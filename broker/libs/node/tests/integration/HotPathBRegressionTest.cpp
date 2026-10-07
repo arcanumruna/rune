@@ -9,6 +9,7 @@
 //       epoch-cache image go to the two-slot leader-epoch-state file through
 //       the worker's io backend, and a controller-managed leadership acts only
 //       once that write completed (event-driven).
+#include <sys/stat.h>
 #include <rune/metadata/ShardRouter.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/SegmentProvisionerAgent.h>
@@ -773,7 +774,15 @@ TEST(HotPathBRegression, IdlePartitionHoldsNoEpochStateFdRegression) {
     rig.pass();
     ASSERT_TRUE(rig.passUntil([&] { return rig.rep->role() == Role::Leader && rig.rep->epochStateDurable(); }));
     EXPECT_FALSE(rig.rep->epochStateFdOpenForTest()) << "an fd per idle partition";
-    EXPECT_LE(fs::file_size(rig.dir.p / "leader-epoch-state"), 8192u);
+    // D21 L1: pre-sized (logical) but sparse — the blocks stay small (Linux;
+    // APFS allocates small extended files).
+    EXPECT_EQ(fs::file_size(rig.dir.p / "leader-epoch-state"),
+              2 * rune::storage::LeaderEpochState::strideFor(rune::storage::LeaderEpochState::kMinEntries));
+#if defined(__linux__)
+    struct stat st{};
+    ASSERT_EQ(::stat((rig.dir.p / "leader-epoch-state").c_str(), &st), 0);
+    EXPECT_LE(static_cast<int64_t>(st.st_blocks) * 512, int64_t{16} << 10);
+#endif
 }
 
 // Md6: the writer is never switched while a write is in flight.
