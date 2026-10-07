@@ -1,0 +1,9 @@
+# --- rune-crypto (project) ---
+/build/
+build/
+build-*/
+.conan2/
+CMakeUserPresets.json
+conan*.cmake
+*.cmake
+.DS_Store
