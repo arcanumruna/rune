@@ -1076,7 +1076,6 @@ private:
     /// Persist min(R, bound) inline when the on-disk value (or an in-progress
     /// checkpoint's) exceeds `bound` (F6: before a truncation deletes data).
     void persistAtMost_(int64_t bound) noexcept;
-    int  checkpointRecoveryPoint_(bool publishSnapshot) noexcept;
     /// Create the pre-allocated two-slot file holding `r` (tmp + fsync + rename
     /// + full dir fsync), open rpFd_.  Cold (first recovery).
     int  createRecoveryPointFile_(int64_t r) noexcept;

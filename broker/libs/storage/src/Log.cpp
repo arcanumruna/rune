@@ -1091,7 +1091,7 @@ int64_t Log::recover() {
         }
         // Re-review N5: created with the HELD value (the epoch guard), never past it.
         if (rf.state == RpFileState::Missing) (void)createRecoveryPointFile_(recoveryPoint_);
-        else if (storage_.failedErrno == 0)  (void)checkpointRecoveryPoint_(/*publish=*/false);
+        else if (storage_.failedErrno == 0)  (void)checkpointRecoveryPoint();
     }
 
     // CP-5.1 FIX (retention-after-restart): compute the REAL largestTimestamp for
@@ -1289,9 +1289,7 @@ int Log::createRecoveryPointFile_(int64_t r) noexcept {
     return 0;
 }
 
-int Log::checkpointRecoveryPoint() noexcept { return checkpointRecoveryPoint_(/*publish=*/true); }
-
-int Log::checkpointRecoveryPoint_(bool publish) noexcept {
+int Log::checkpointRecoveryPoint() noexcept {
     if (!recovered_) return 0;
     if (storage_.failedErrno != 0) return storage_.failedErrno;
     if (rpFd_ < 0) return 0;
@@ -1325,7 +1323,6 @@ int Log::checkpointRecoveryPoint_(bool publish) noexcept {
     }
     // hotpath-A F4: the cleaner gate moves with ONE release-store (no snapshot
     // republish — the snapshot no longer carries the recovery point).
-    (void)publish;
     setPersistedRp_(v);
     rpUnconfirmedMax_ = kRecoveryPointUnknown;   // every possibly-landed write has a LOWER seq
     rpActiveSlot_ = target;
