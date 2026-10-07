@@ -76,6 +76,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>   // std::abort (LOW-1 fail-stop)
 #include <deque>
 #include <utility>
 #include <optional>
@@ -1408,6 +1409,24 @@ public:
         // the MSM from the committed log as it is now.
         if (replica_->logGeneration() != lastLogGen_) {
             lastLogGen_ = replica_->logGeneration();
+            // DR-10 review LOW-1: committed records are never truncated (the
+            // internal-ISR candidacy gate elects only a leader holding them) —
+            // a cut below what this MSM committed means that invariant broke
+            // (unclean consensus election, or a bug).  The demoted follower's
+            // HW reads 0, so the replica's own "below committed" warning cannot
+            // fire: this is the only place that knows.  Fail-stop like every
+            // other storage invariant violation — never publish a shorter map
+            // (a restart rebuilds from the surviving log: committedEnd_ = 0).
+            const rune::replication::Offset cut = replica_->lastTruncationOffset();
+            if (cut < committedEnd_) [[unlikely]] {
+                spdlog::critical("MetadataService[{}]: __cluster_metadata truncated at {} — below the "
+                                 "committed end {} (committed metadata lost: unclean consensus "
+                                 "election or an internal-ISR invariant bug); halting",
+                                 selfId_, static_cast<long long>(cut),
+                                 static_cast<long long>(committedEnd_));
+                spdlog::default_logger()->flush();
+                std::abort();
+            }
             rebuildFromLog();
         }
 
