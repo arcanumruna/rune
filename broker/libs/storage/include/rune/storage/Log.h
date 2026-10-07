@@ -882,6 +882,8 @@ public:
     /// Owner (tests / observability): provisioning failures seen and the rolls
     /// they forced inline.
     [[nodiscard]] uint64_t provisionFailuresForTest() const noexcept { return provisionFailures_; }
+    /// Provisioning thread: built segments dropped for a full ready ring (D19 N6d).
+    [[nodiscard]] uint64_t readyDropsForTest() const noexcept { return readyDrops_; }
     [[nodiscard]] uint64_t failureInlineRollsForTest() const noexcept { return failureInlineRolls_; }
     /// Test seam (re-review N1): called inside beginColdPath_ between its
     /// rename-ring read and its done-ring drain — a test plays the provisioner
@@ -1326,9 +1328,11 @@ private:
     }
     /// Provisioning thread (D19 N6b): end positions of the last failure
     /// records offered (0 = none); one still queued has end > consumerPosition.
-    static constexpr std::size_t kFailMarks = 8;
+    static constexpr std::size_t kFailMarks = 32;   // >= the ring's record capacity
+    static_assert(kFailMarks * ReadyRing::kRecordBytes >= 512, "a mark per ready-ring record");
     std::array<std::int64_t, kFailMarks> failMarkEnd_{};
     std::size_t failMarkNext_ = 0;
+    uint64_t    readyDrops_ = 0;   ///< provisioning thread (D19 N6d)
     [[nodiscard]] std::size_t queuedFailures_() const noexcept {
         const std::int64_t consumed = readyRing_.consumerPosition();
         std::size_t n = 0;

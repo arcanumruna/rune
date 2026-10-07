@@ -605,7 +605,12 @@ int Log::provisionReady(std::size_t depth, bool preallocate) {
             std::error_code ec;
             std::filesystem::remove(stagingLogPathFor(s2), ec);
             std::filesystem::remove(stagingIndexPathFor(s2), ec);
-            break;
+            // D19 N6d: never silent — counted, logged (rate-limited) and
+            // reported as a failed build.  The queued records each end an
+            // owner hold, so no demand is left without an answer.
+            if ((++readyDrops_ & (readyDrops_ - 1)) == 0)
+                spdlog::warn("Log {}: ready ring full — a built segment was discarded (drops={})", dir_, readyDrops_);
+            return built > 0 ? built : -ENOBUFS;
         }
         ++built;
     }

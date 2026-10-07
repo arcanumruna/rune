@@ -1042,3 +1042,23 @@ TEST(SegmentLifecycleRegression, RenameInFlightIsBoundedByTheDoneRingRegression)
     }
     fs::remove_all(dir);
 }
+
+// D19 re-review N6d: a built segment whose ready-ring offer fails (ring full)
+// is never dropped silently — the build reports a failure (counted).
+TEST(SegmentLifecycleRegression, ReadyRingFullAfterABuildIsReportedRegression) {
+    const auto dir = freshDir("rune_slh_n6d");
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        log.setProvisioning(nullptr);
+        // Fill the ready ring with FAILURE records (each failed build posts one).
+        log.setProvisionFaultForTest(EIO, 1 << 20);
+        for (int i = 0; i < 64; ++i) (void)log.provisionReady(1);
+        log.setProvisionFaultForTest(0, 0);
+        EXPECT_EQ(log.readyQueuedApprox(), 0u) << "failure records are not ready segments";
+        EXPECT_LT(log.provisionReady(1), 0) << "the built segment could not be queued: reported, not silent";
+        EXPECT_EQ(countSuffix(dir, ".stlog"), 0u) << "its staging files are removed";
+        EXPECT_EQ(log.readyDropsForTest(), 1u);
+    }
+    fs::remove_all(dir);
+}
