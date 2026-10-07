@@ -228,16 +228,29 @@ private:
         const int64_t segBytes = log->rollBytes();
         // Re-review N3: over the cap, still build (off the owner) — without
         // the block reservation.  Never a failure / inline roll for the cap.
-        const bool falloc = capMode_ == 0 || reserved_ + segBytes <= capBytes_;
-        const int b = log->provisionReady(depth_, falloc);
-        if (b < 0) {
-            bump_(kMetricBuildFailures);   // reported to the owner by provisionReady (review M1)
-        } else if (b > 0) {
-            built_ += static_cast<uint64_t>(b);
-            if (falloc) { acc.falloc += b; reserved_ += static_cast<int64_t>(b) * segBytes; }
-            else for (int i = 0; i < b; ++i) bump_(kMetricUnpreallocatedBuilds);
+        // D19 N6a: only as many fallocated builds as fit under the cap (was
+        // one check per serve, then up to `depth` reservations); the rest of
+        // the depth is built without its reservation.
+        const std::size_t queued = log->readyQueuedApprox();
+        const std::size_t fit =
+            capMode_ == 0 ? depth_
+                          : (reserved_ < capBytes_ && segBytes > 0
+                                 ? static_cast<std::size_t>((capBytes_ - reserved_) / segBytes) : 0);
+        const std::size_t fallocTarget = std::min(depth_, queued + fit);
+        int built = 0, err = 0;
+        if (fallocTarget > queued) {
+            const int r = log->provisionReady(fallocTarget, /*preallocate=*/true);
+            if (r < 0) err = r;
+            else { built += r; acc.falloc += r; reserved_ += static_cast<int64_t>(r) * segBytes; }
         }
-        return n + (b != 0 ? 1 : 0);
+        if (err == 0 && depth_ > fallocTarget) {
+            const int r = log->provisionReady(depth_, /*preallocate=*/false);
+            if (r < 0) err = r;
+            else { built += r; for (int i = 0; i < r; ++i) bump_(kMetricUnpreallocatedBuilds); }
+        }
+        if (err < 0) bump_(kMetricBuildFailures);   // reported to the owner by provisionReady (review M1)
+        built_ += static_cast<uint64_t>(built);
+        return n + (built != 0 || err != 0 ? 1 : 0);
     }
 
     struct Acc { int64_t falloc = 0; int64_t segBytes = 0; };

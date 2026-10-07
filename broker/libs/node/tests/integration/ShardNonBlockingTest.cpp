@@ -3430,6 +3430,24 @@ TEST(SegmentProvisionerRegression, OverTheCapBuildsWithoutFallocateNeverAFailure
     EXPECT_TRUE(b->log()->readyAvailable()) << "B got a READY segment (not a failure)";
 }
 
+TEST(SegmentProvisionerRegression, DepthBuildNeverOvershootsTheCapRegression) {
+    // D19 re-review N6a: the cap was checked once per serve, then up to `depth`
+    // segments were fallocated — (depth-1) x rollBytes past the cap.
+    Reg R;
+    NoopConsensus noop;
+    NodeRuntimeAgent rt(noop, nullptr, nullptr, nullptr, &R.reg, nullptr);
+    SegmentProvisionerAgent prov(3, /*capBytes=*/64LL * 1024 * 1024);   // room for ONE 64 MiB segment
+    prov.attachViewChannel(rt.enableProvisionerView());
+    PartitionReplica* a = R.add(5, 0);
+    rt.doWork(1);
+    prov.doWork(1);
+    ASSERT_TRUE(postDemandForTest(prov.channel(), a->log(), Log::ProvisionDemand::Threshold));
+    prov.doWork(2);
+    EXPECT_EQ(prov.builtForTest(), 3u) << "the depth is still built (off the owner)";
+    EXPECT_EQ(prov.reservedBytesForTest(), 64LL * 1024 * 1024) << "only what fits the cap is fallocated";
+    EXPECT_EQ(prov.unpreallocatedForTest(), 2u);
+}
+
 TEST(SegmentProvisionerRegression, AutoCapIsAFractionOfFreeSpaceRegression) {
     SegmentProvisionerAgent prov(1, /*capBytes=*/-1, "/", /*capFreePct=*/10);
     prov.setFreeBytesForTest(10LL * 1024 * 1024 * 1024);
