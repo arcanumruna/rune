@@ -2547,7 +2547,7 @@ void BrokerNode::buildGateway() {
             *cleanerAgent_, cleanerIdleStrategy_, cleanerClock_);
         // hotpath-A F2: pre-provisioning + staging renames belong to the
         // SegmentProvisionerAgent (its own view, its own thread).
-        if (provisionerAgent_ && runtimeAgent_) {
+        if (provisionerAgent_ && runtimeAgent_ && !skipProvisionerRunnerForTest_) {
             cleanerAgent_->setExternalProvisioner(true);
             provisionerAgent_->attachViewChannel(runtimeAgent_->enableProvisionerView());
             // Review m5: park on the demand ring's doorbell (woken by a demand),

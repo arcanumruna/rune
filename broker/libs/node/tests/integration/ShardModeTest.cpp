@@ -807,6 +807,17 @@ TEST(ShardModeRegression, StartRefusesWhenALogFailedRecovery) {
     node.stop();
 }
 
+// D19 review L8: the start refusal for a provisioner without its runner thread,
+// end to end through BrokerNode::start (the unit test pins requireProvisionerRunner).
+TEST(ShardModeRegression, StartRefusesWithAnUnwiredProvisionerRegression) {
+    TmpDir dir{"provunwired"};
+    const auto ports = ShardPorts::discover(1, 1);
+    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
+    node.skipProvisionerRunnerForTest();
+    EXPECT_THROW(node.start(), std::logic_error) << "provisioned rolls would wait forever on no thread";
+    node.stop();
+}
+
 TEST(ShardModeRegression, StartRefusesWhenTheSchemaLogFailedRecovery) {
     // Task 10 fix 3 / I1: the schema log lives outside the replica registry.
     TmpDir dir{"schemafail"};
