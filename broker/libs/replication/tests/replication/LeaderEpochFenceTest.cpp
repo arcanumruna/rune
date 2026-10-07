@@ -148,3 +148,55 @@ TEST(LeaderEpochFenceRegression, FenceWriteFailureTakesLogDirOfflineStickyRegres
     EXPECT_EQ(r->role(), Role::Leader);
 }
 
+
+// D15 review m5: a MEMORY-backed replica's restart fence is written by the
+// owning worker's async epoch-state writer (leader-epoch-state in its own
+// dir), never by a synchronous fsync on the worker: a new-epoch leadership is
+// DEFERRED until the slot carrying the fence completed (same durability-
+// before-acting ordering as the disk path), and the fence survives a restart.
+// A legacy plain fence file (pre-D15 layout) is migrated into it.
+#include <fcntl.h>
+TEST(LeaderEpochFenceRegression, MemoryFenceWrittenByTheAsyncEpochStateWriterRegression) {
+    Dir d;
+    const std::string stateDir = (d.path / "0-0.state").string();
+    const std::string legacy = (d.path / "0-0").string();
+    {
+        std::FILE* fp = std::fopen(legacy.c_str(), "w");
+        ASSERT_NE(fp, nullptr);
+        std::fputs("4\n", fp);
+        std::fclose(fp);
+    }
+    {
+        rune::storage::InMemoryLog log(1 << 20, 10'000);
+        CapturingTransport t;
+        auto r = memReplica(log, t);
+        r->setExternalFollowerFlush(true);   // worker-driven (every user replica)
+        r->setMemoryEpochStateDir(stateDir, legacy);
+        EXPECT_EQ(r->restartFenceEpochForTest(), 4) << "the legacy fence file was not migrated";
+        const auto inlineBefore = r->epochStateInlineWritesForTest();
+        r->becomeLeader(5, kAll);
+        EXPECT_NE(r->role(), Role::Leader) << "led before its fence was durable";
+        EXPECT_TRUE(r->leadershipPendingForTest()) << "the memory fence was not deferred to the async writer";
+        EXPECT_EQ(r->epochStateInlineWritesForTest(), inlineBefore) << "synchronous fence write on the worker";
+        // The owning worker's io backend.
+        std::vector<uint8_t> buf(64 * 1024);
+        PartitionReplica::EpochStateWrite w;
+        std::size_t need = 0;
+        ASSERT_TRUE(r->prepareEpochStateWrite(buf.data(), buf.size(), w, need));
+        r->epochStateWriteSubmitted();
+        ASSERT_EQ(::pwrite(w.fd, w.data, w.len, w.offset), static_cast<ssize_t>(w.len));
+        ASSERT_EQ(::fsync(w.fd), 0);
+        (void)r->epochStateWriteCompleted(w.seq, 0);
+        EXPECT_EQ(r->role(), Role::Leader) << "the durable fence never completed the leadership";
+    }
+    EXPECT_FALSE(fs::exists(legacy)) << "the migrated legacy fence file is still trusted next to the state";
+    rune::storage::InMemoryLog log(1 << 20, 10'000);   // restarted: empty
+    CapturingTransport t;
+    auto r = memReplica(log, t);
+    r->setExternalFollowerFlush(true);
+    r->setMemoryEpochStateDir(stateDir, legacy);
+    EXPECT_EQ(r->restartFenceEpochForTest(), 5);
+    r->becomeLeader(5, kAll);
+    EXPECT_NE(r->role(), Role::Leader) << "re-led epoch 5 after a restart";
+    EXPECT_TRUE(r->staleLeadershipPendingForTest());
+}

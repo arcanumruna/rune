@@ -1711,7 +1711,7 @@ std::size_t PartitionReplica::encodeEpochImage_(uint8_t* buf, uint64_t seq, Epoc
 bool PartitionReplica::openEpochStateFd_() noexcept
 {
     if (es_.fd >= 0) return true;
-    const int fd = rune::storage::LeaderEpochState::openExisting(diskLog_->dir());
+    const int fd = rune::storage::LeaderEpochState::openExisting(esDir_);
     if (fd < 0) return false;
     es_.fd = fd;
     return true;
@@ -1727,7 +1727,8 @@ void PartitionReplica::enableEpochState_() noexcept
 {
     using ES = rune::storage::LeaderEpochState;
     try {
-        const std::string dir = diskLog_->dir();
+        if (esDir_.empty() && diskLog_ != nullptr) esDir_ = diskLog_->dir();
+        const std::string dir = esDir_;
         const auto st = ES::read(dir);
         if (es_.fenceTarget < fencePersisted_) es_.fenceTarget = fencePersisted_;
         const std::size_t n = epochCache_.size();
@@ -1750,7 +1751,7 @@ void PartitionReplica::enableEpochState_() noexcept
                     spdlog::critical("PartitionReplica[topic={} part={}]: updating {} failed — log FAILED "
                                      "(fail-stop)", cfg_.topicId, cfg_.partitionId, ES::path(dir));
                     logDirOffline_ = true;
-                    diskLog_->markStorageFailed(EIO);
+                    if (!memoryBacked_ && diskLog_ != nullptr) diskLog_->markStorageFailed(EIO);
                     return;   // es_ stays enabled: nothing is ever written to a legacy file
                 }
             }
@@ -1813,7 +1814,7 @@ bool PartitionReplica::writeEpochStateInline_() noexcept
             uint64_t sq = 0; int64_t fc = -1;
             (void)ES::decode(img.data(), img.size(), sq, fc, &ents);
             if (es_.fd >= 0) { ::close(es_.fd); es_.fd = -1; }
-            const int fd = ES::create(diskLog_->dir(), stride, seq, fence, ents.begin(), ents.end());
+            const int fd = ES::create(esDir_, stride, seq, fence, ents.begin(), ents.end());
             ++es_.recreates;
             if (fd < 0) { ++es_.errors; return false; }
             ::close(fd);
@@ -2906,6 +2907,61 @@ void PartitionReplica::setLeaderEpochFenceFile(std::string path)
     }
     if (v > fencePersisted_)    fencePersisted_    = static_cast<Epoch>(v);
     if (v > restartFenceEpoch_) restartFenceEpoch_ = static_cast<Epoch>(v);
+}
+
+void PartitionReplica::setMemoryEpochStateDir(const std::string& dir, const std::string& legacyFenceFile)
+{
+    using ES = rune::storage::LeaderEpochState;
+    if (!memoryBacked_ || dir.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        spdlog::error("PartitionReplica[topic={} part={}]: memory epoch-state dir {} unavailable ({}) — "
+                      "fence unknown: the first leadership is refused", cfg_.topicId, cfg_.partitionId, dir,
+                      ec.message());
+        return;
+    }
+    // The pre-D15 plain fence file: its value is part of the fence.
+    long long legacy = -1;
+    if (!legacyFenceFile.empty()) {
+        if (FILE* f = std::fopen(legacyFenceFile.c_str(), "r")) {
+            if (std::fscanf(f, "%lld", &legacy) != 1) legacy = -1;
+            std::fclose(f);
+        }
+    }
+    const auto st = ES::read(dir);
+    if (st.state != ES::FileState::Valid && st.state != ES::FileState::Missing) {
+        // Corrupt durable state: the epochs led earlier are unknown — never
+        // overwrite it with a smaller fence; refuse the first leadership.
+        spdlog::error("PartitionReplica[topic={} part={}]: {} unreadable — fence unknown: the first "
+                      "leadership is refused", cfg_.topicId, cfg_.partitionId, ES::path(dir));
+        return;
+    }
+    Epoch fence = static_cast<Epoch>(legacy);
+    if (st.state == ES::FileState::Valid && static_cast<Epoch>(st.fence) > fence) fence = static_cast<Epoch>(st.fence);
+    if (fence > restartFenceEpoch_) restartFenceEpoch_ = fence;
+    if (fence > es_.fenceTarget)    es_.fenceTarget    = fence;
+    if (st.state == ES::FileState::Valid && static_cast<Epoch>(st.fence) > fencePersisted_)
+        fencePersisted_ = static_cast<Epoch>(st.fence);
+    esDir_ = dir;
+    enableEpochState_();   // brings the file up to the migrated fence (cold, this thread)
+    if (!es_.enabled || fencePersisted_ < fence) {
+        esDir_.clear();
+        es_.enabled = false;
+        return;   // fence unknown (fenceFile_ empty): the first leadership is refused
+    }
+    // A fence exists (marker; persistLedEpoch_ writes through es_).
+    fenceFile_ = dir + "/leader-epoch-fence";
+    if (!legacyFenceFile.empty() && legacy >= 0) {
+        // The state file now durably holds >= the legacy value: never trust
+        // the legacy file again (unlink + directory fsync).
+        if (::unlink(legacyFenceFile.c_str()) == 0) {
+            const auto slash = legacyFenceFile.find_last_of('/');
+            const std::string ldir = slash == std::string::npos ? std::string(".") : legacyFenceFile.substr(0, slash);
+            const int dfd = ::open(ldir.c_str(), O_RDONLY | O_DIRECTORY);
+            if (dfd >= 0) { (void)::fsync(dfd); ::close(dfd); }
+        }
+    }
 }
 
 bool PartitionReplica::persistLedEpoch_(Epoch e)

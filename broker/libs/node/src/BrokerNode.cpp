@@ -99,7 +99,7 @@ int64_t bumpProcessIncarnation(const std::string& dataDir) {
 // incarnation counter restarts low) is still a new process.  Cold (once).
 int64_t processNonce() { return ControlledShutdown::freshNonce(); }
 // Leader-epoch restart fence for a MEMORY-backed replica (disk-backed ones keep
-// it next to their log): <dataDir>/memory-epoch-fence/<topicId>-<partition>.
+// it next to their log): <dataDir>/memory-epoch-fence/<topicId>-<partition>.state/.
 // The records do not survive a restart, but the epochs this node led at must
 // (a restarted leader must never lead again at one of them).  Cold.
 void setMemoryEpochFence(rune::replication::PartitionReplica& r, const std::string& dataDir,
@@ -109,7 +109,11 @@ void setMemoryEpochFence(rune::replication::PartitionReplica& r, const std::stri
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     if (ec) return;
-    r.setLeaderEpochFenceFile(dir + "/" + std::to_string(topicId) + "-" + std::to_string(partition));
+    // D15 review m5: written by the owning worker's async epoch-state writer
+    // (leader-epoch-state in <t>-<p>.state/), like a disk replica's; the
+    // pre-D15 plain fence file <t>-<p> is migrated into it.
+    const std::string base = dir + "/" + std::to_string(topicId) + "-" + std::to_string(partition);
+    r.setMemoryEpochStateDir(base + ".state", base);
 }
 // Task 10 (spec §3.1) + F30: the ONE place a newly built replica's disk
 // durability policy is set — boot (buildReplication) and runtime-created
