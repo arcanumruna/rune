@@ -6,7 +6,6 @@
 #include <string>
 #include <vector>
 #include <memory>
-#include <fstream>
 #include <unistd.h>
 #include <utility>
 namespace rune::storage {
@@ -19,22 +18,28 @@ namespace rune::storage {
 ///                    on this log (inline or async).  Sticky — never clears; a later
 ///                    "successful" fsync cannot vouch for pages the kernel dropped.
 ///   faultForTest   — test-only: while non-zero every inline sync fails with it.
-///   writeFaultForTest — test-only: while non-zero every data write (pwrite / pwritev /
-///                    fstream) fails with it (E1: dead disk without any fsync).
+///   writeFaultForTest — test-only: while non-zero every data write (pwrite /
+///                    pwritev) fails with it (E1: dead disk without any fsync).
 struct LogStorageState {
     uint64_t syncCalls    = 0;
     uint64_t roleChangeSyncs = 0;   ///< recover()'s index msync + dir fsync (truncate / startup)
     int      failedErrno  = 0;
     int      faultForTest = 0;
     int      writeFaultForTest = 0;
+    /// D20 review M1 test seam: when set, the durable append's pwrite retry loop
+    /// (LogSegment::writeAll_) calls this instead of ::pwrite, so a test can force
+    /// a short write / EINTR / hard errno.  Null in production (one predictable
+    /// branch on the already syscall-bound durable path; not the pwrite hot path).
+    ssize_t (*pwriteForTest)(int fd, const void* buf, std::size_t n, off_t off) = nullptr;
 };
 
 /// A single on-disk log segment: a ".log" data file paired with a ".index" mmap.
 ///
 /// Durability policy:
 ///   append() calls sync() after every write (durable-by-default).
-///   sync() flushes the libc fstream buffer via flush(), then fdatasyncs the
-///   ".log" POSIX fd so bytes reach storage, then msyncs the ".index" mmap so
+///   Every .log write goes straight to the page cache through the segment's one
+///   POSIX fd (D20: no fstream / FILE*).  sync() fsyncs that
+///   ".log" fd so bytes reach storage, then msyncs the ".index" mmap so
 ///   the index and log are consistent on disk after a crash.
 ///
 ///   This adds per-append latency. A future group-commit path can batch several
@@ -104,11 +109,11 @@ public:
                                 int64_t baseOffset, int64_t lastOffset,
                                 int32_t leaderEpoch = -1);
 
-    /// Flush libc buffer + fdatasync ".log" + msync ".index".
+    /// fsync ".log" + msync ".index" (D20: no libc buffer to flush).
     /// Called automatically by append() (durable-by-default).
     /// External callers (e.g. group-commit) may call this explicitly after
     /// batching multiple appendNoSync() calls.
-    /// Throws std::system_error on ANY failure (stream flush, fsync, index msync)
+    /// Throws std::system_error on ANY failure (fsync, index msync)
     /// and marks the owning Log permanently failed (LogStorageState::failedErrno).
     /// On an already-failed log it throws without touching the disk.
     void sync();
@@ -162,9 +167,8 @@ public:
     uint32_t unpinFlush() noexcept { return flushPins_ > 0 ? --flushPins_ : 0; }
     [[nodiscard]] uint32_t flushPins() const noexcept { return flushPins_; }
 
-    /// Push the libc fstream buffer to the page cache (write(2), no fsync).  Used
-    /// by a deferred (async) seal before the fd is handed to the io backend.
-    /// Returns 0 or EIO.
+    /// Seal hook before the fd is handed to the io backend.  D20: writes are
+    /// unbuffered (pwrite), so there is nothing to push — always 0.
     [[nodiscard]] int flushBufferedToPageCache() noexcept;
 
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
@@ -368,6 +372,9 @@ private:
     /// Shared write core: update index, write bytes, advance nextOffset_.
     /// Does NOT call sync(). Called by append() and appendNoSync().
     int64_t writeAndUpdateState(const uint8_t* data, std::size_t len, int64_t lastOffset);
+    /// D20: pwrite all of [data, data+len) at logSize_ through fd_ (EINTR /
+    /// short-write retry).  0 or errno.
+    int writeAll_(const uint8_t* data, std::size_t len) noexcept;
     [[noreturn]] void failWrite_(int err, const char* what);   ///< E1: sticky fail-stop + throw
 
     /// (Re)map the .log read-only to cover the currently-written logSize_ bytes so
@@ -386,10 +393,10 @@ private:
     void openReadMap(std::size_t bytes = 0) noexcept;
     int64_t baseOffset_; int32_t indexIntervalBytes_;
     int32_t indexMaxBytes_;   // right-sized initial .index mmap size (grows on demand)
-    std::string logPath_; std::fstream log_;
+    std::string logPath_;   // D20: no std::fstream — fd_ is the only .log handle
     LogStorageState* storage_ = nullptr;  // owning Log's health/accounting (may be null)
     uint32_t flushPins_ = 0;              // M1: async flushes in flight on fd_
-    int fd_ = -1;   // POSIX fd for fdatasync — mirrors log_ (write path uses fstream)
+    int fd_ = -1;   // the .log's only handle: pwrite/pwritev/pread/ftruncate/fsync/read-mmap
     std::unique_ptr<OffsetIndex> index_;
     uint64_t installGen_ = 0;
     uint64_t tsLineage_ = 0;     ///< see tsLineage()
