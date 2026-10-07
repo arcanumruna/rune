@@ -1005,8 +1005,14 @@ public:
     /// Tests (power-loss seam): completions of epoch-state writes are held —
     /// the write stays InFlight (never confirmed) until released.
     void holdEpochStateCompletionsForTest(bool on) noexcept { esHoldForTest_ = on; }
+    [[nodiscard]] bool epochStateCompletionHeldForTest() const noexcept { return esHeld_; }
     /// Tests: the next `n` completions report `err`.
     void failNextEpochStateCompletionsForTest(int n, int err) noexcept { esFailN_ = n; esFailErr_ = err; }
+    /// Tests (re-review N4): write the history inline now (as the outgrown-slot
+    /// re-create does).  Only while nothing is in flight.
+    bool writeEpochStateInlineForTest() noexcept { return writeEpochStateInline_(); }
+    /// Tests (re-review N6): the next `n` inline epoch-state writes fail (process-wide, single-threaded tests).
+    static void failInlineEpochStateWritesForTest(int n) noexcept { inlineFailN_ = n; }
     /// Tests: deliver a held completion now.
     void releaseHeldEpochStateForTest() {
         esHoldForTest_ = false;
@@ -1443,10 +1449,12 @@ private:
     bool awaitEsFetch_ = false;        ///< C1: a divergence truncation's re-fetch waits for its durable history
     bool esHoldForTest_ = false;
     int  esFailN_ = 0, esFailErr_ = 0;
+    static inline int inlineFailN_ = 0;
     uint64_t esHeldSeq_ = 0;  int esHeldErr_ = 0;  bool esHeld_ = false;
     uint64_t appliesDroppedAwaitEs_ = 0;
     void cancelPendingLeadership_() noexcept;
     void completePendingLeadershipIfDurable_();
+    void onHistoryDurable_();
     void deferLeadership_(Epoch newEpoch, std::vector<NodeId> isr, int32_t partitionEpoch);
     uint64_t leadershipsDeferred_ = 0, leadershipsResumed_ = 0, appliesDroppedLeadPending_ = 0;
     bool followerFlushRequested_ = false;  ///< raised by doWork, consumed by the worker

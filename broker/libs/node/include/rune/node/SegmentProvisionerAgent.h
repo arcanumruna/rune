@@ -172,10 +172,9 @@ private:
     static constexpr uint32_t    kCapRefreshServes = 64;
 
     static constexpr int32_t kGrowMsgType = 2, kDisposeMsgType = 3;
-    static bool onGrow_(void* ctx, rune::storage::Log* log, int fd, int64_t mib) noexcept {
+    static bool onGrow_(void* ctx, rune::storage::Log* log, int64_t packed) noexcept {
         auto* self = static_cast<SegmentProvisionerAgent*>(ctx);
-        if (!self->demand_.offer(kGrowMsgType, static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(log)),
-                                 static_cast<int64_t>(static_cast<uint32_t>(fd)) | (mib << 32)))
+        if (!self->demand_.offer(kGrowMsgType, static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(log)), packed))
             return false;
         self->bell_.ringIfParked();
         return true;
@@ -191,21 +190,31 @@ private:
     /// (never dereferences a log that is not in the current view).
     void serveGrow_(int64_t a, int64_t b) {
         auto* log = reinterpret_cast<rune::storage::Log*>(static_cast<std::uintptr_t>(a));
-        const int fd = static_cast<int>(static_cast<uint32_t>(b & 0xffffffff));
-        const int64_t mib = b >> 32;
+        const int fd = rune::storage::Log::requestFd(b);
+        const int64_t mib = rune::storage::Log::requestMiB(b);
         if (!inView_(log)) { ::close(fd); return; }   // the owner re-requests (count-based) if it is live
+        if (holdGrowsForTest_) { heldGrows_.push_back({a, b}); return; }
         try {
             auto* m = new rune::storage::MappedFile(rune::storage::MappedFile::BorrowedFd{fd}, std::string(),
                                                     static_cast<std::size_t>(mib) << 20);
             ::close(fd);
-            if (!log->offerReadMap(m)) delete m;
+            if (!log->offerReadMap(m, b)) delete m;
             else ++mapsGrown_;
         } catch (...) {
             ::close(fd);
             bump_(kMetricReadMapFailures);
-            (void)log->offerReadMapFailure(errno != 0 ? errno : ENOMEM);
+            (void)log->offerReadMapFailure(errno != 0 ? errno : ENOMEM, b);
         }
     }
+public:
+    /// Tests (re-review N2): hold growth requests; release them (in order) later.
+    void holdGrowsForTest(bool on) {
+        holdGrowsForTest_ = on;
+        if (!on) { auto h = std::move(heldGrows_); heldGrows_.clear(); for (auto& [x, y] : h) serveGrow_(x, y); }
+    }
+private:
+    bool holdGrowsForTest_ = false;
+    std::vector<std::pair<int64_t, int64_t>> heldGrows_;
     uint64_t mapsGrown_ = 0;
 
     static bool onDemand_(void* ctx, rune::storage::Log* log, Demand kind) noexcept {

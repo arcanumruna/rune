@@ -640,24 +640,39 @@ int LogSegment::openTrusted(int64_t nextOffset) noexcept {
 }
 
 int LogSegment::truncateInPlace(int64_t truncateOffset, int64_t& keptMaxTs) noexcept {
-    if (!ensureReadMap() || !readMap_) return -1;
+    if (log_.is_open()) log_.flush();   // the durable fstream path: nothing buffered past the cut
+    // Re-review N1: the cut is derived from the WHOLE segment — never from a
+    // prefix-only mapping (Md5 grows maps off the owner; a demoted leader's
+    // segment may never have had its grown map installed).  This cold path
+    // maps the whole file on the owner if it must.
+    const bool savedRemap = ownerRemap_;
+    ownerRemap_ = true;
+    const bool mapped = ensureReadMap() && readMap_ && readMapSize_ >= static_cast<std::size_t>(logSize_);
+    ownerRemap_ = savedRemap;
+    if (!mapped) return -1;
     const uint8_t* base = readMap_->data();
-    const std::size_t size = std::min(static_cast<std::size_t>(logSize_), readMapSize_);
+    const std::size_t size = static_cast<std::size_t>(logSize_);
     const std::size_t kOverhead = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
     std::size_t pos = 0;
     int64_t next = baseOffset_;
     int64_t maxTs = 0;
+    bool atCut = false;
     while (pos + kOverhead <= size) {
         rune::protocol::RecordBatchReader r(base + pos, size - pos);
         const int32_t total = r.totalLength();
         if (total <= 0 || pos + static_cast<std::size_t>(total) > size) break;
-        if (r.baseOffset() + r.lastOffsetDelta() >= truncateOffset) break;   // cut here (whole batch)
+        if (r.baseOffset() + r.lastOffsetDelta() >= truncateOffset) { atCut = true; break; }   // cut here (whole batch)
         const int64_t ts = toEpochMs(r.maxTimestamp());
         if (ts > maxTs) maxTs = ts;
         next = r.baseOffset() + r.lastOffsetDelta() + 1;
         pos += static_cast<std::size_t>(total);
     }
-    if (log_.is_open()) log_.flush();   // the durable fstream path: nothing buffered past the cut
+    // Re-review N1: the walk must stop AT the batch holding truncateOffset (or
+    // at the true end of the segment's batches) — anything else (an unparsable
+    // batch inside the segment) would cut below the requested offset and
+    // silently delete records: fail the log loudly instead.
+    if (!atCut && pos != size) [[unlikely]] return EIO;
+    if (!atCut && next < truncateOffset && next != nextOffset_) [[unlikely]] return EIO;
     if (::ftruncate(fd_, static_cast<off_t>(pos)) != 0) return errno != 0 ? errno : EIO;
     const int64_t lastIdx = index_->truncateToPosition(static_cast<int64_t>(pos));
     logSize_ = static_cast<int64_t>(pos);

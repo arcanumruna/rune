@@ -927,11 +927,16 @@ LogReadView Log::readView(int64_t startOffset, int32_t maxBytes) noexcept {
     if (it == segments_.begin()) return {};
     --it;
     if (asyncReadGrowth_) {
-        // Review Md5: the mapping grows OFF the owner — never a remap here.
+        // Review Md5: the mapping grows OFF the owner.
         pollReadMaps_();
         LogSegment& seg = *it->second;
-        seg.setOwnerRemap(false);
-        maybeGrowReadMap_(seg, it->first, std::next(it) == segments_.end());
+        const bool active = std::next(it) == segments_.end();
+        maybeGrowReadMap_(seg, it->first, active);
+        // Re-review N3: never stall readers on the provisioner — data already
+        // past the mapping is served by a (counted, cold) owner remap.
+        const bool beyond = seg.readMapBytes() != 0 && static_cast<std::size_t>(seg.sizeBytes()) > seg.readMapBytes();
+        if (beyond) [[unlikely]] ++ownerFallbackRemaps_;
+        seg.setOwnerRemap(beyond);
     }
     return it->second->readView(startOffset, maxBytes);
 }
@@ -947,14 +952,19 @@ void Log::maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept
         // Count-based re-request (a request lost to a full ring / a racing view
         // change): never time-based, never wedged.
         if (size > mapped && ++growWaits_ >= 4096) { growOutstanding_ = false; growWaits_ = 0; }
-        return;
+        if (growOutstanding_) return;
     }
     std::size_t target = active ? std::max(LogSegment::readMapBytesFor(rollBytes_), size * 2) : size;
     target = (target + (std::size_t{1} << 20) - 1) >> 20;          // MiB
     if ((target << 20) <= mapped) return;
     const int fd = ::fcntl(seg.logFd(), F_DUPFD_CLOEXEC, 0);       // the provisioner owns the dup
     if (fd < 0) return;
-    if (!provisionHook_.growFn(provisionHook_.ctx, this, fd, static_cast<int64_t>(target))) { ::close(fd); return; }
+    const int64_t seq = (growSeq_ + 1) & 0x7FFFF;
+    if (!provisionHook_.growFn(provisionHook_.ctx, this, packRequest(fd, static_cast<int64_t>(target), seq))) {
+        ::close(fd);
+        return;
+    }
+    growSeq_ = seq;
     growOutstanding_ = true;
     growBase_ = base;
     growGen_ = seg.installGen();
@@ -963,8 +973,8 @@ void Log::maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept
 
 void Log::pollReadMaps_() noexcept {
     (void)mapRing_.poll([this](int32_t type, int64_t a, int64_t b) {
-        (void)b;
         if (type == kMapFailedMsg) {
+            if ((a & 0x7FFFF) != growSeq_) return;   // re-review N2: a superseded request
             // Counted; this log falls back to growing on the owner (correct, slow).
             ++readMapGrowthFailures_;
             growOutstanding_ = false;
@@ -974,8 +984,13 @@ void Log::pollReadMaps_() noexcept {
         }
         if (type != kMapGrownMsg) return;
         std::unique_ptr<MappedFile> m(reinterpret_cast<MappedFile*>(static_cast<std::uintptr_t>(a)));
-        growOutstanding_ = false;
-        auto it = segments_.find(growBase_);
+        // Re-review N2: only the answer to the OUTSTANDING request (its seq) is
+        // installed, and only into the segment it was made for (base + install
+        // generation); a late answer to a superseded request maps another file.
+        const bool current = b == growSeq_ && growOutstanding_;
+        if (current) growOutstanding_ = false;
+        auto it = current ? segments_.find(growBase_) : segments_.end();
+        if (!current) ++readMapsDiscarded_;
         if (it != segments_.end() && it->second && it->second->installGen() == growGen_ &&
             m->size() > it->second->readMapBytes()) {
             m = it->second->swapReadMap(std::move(m));   // m = the retired mapping
@@ -1074,7 +1089,8 @@ int64_t Log::recover() {
             rpFd_ = ::open(rpPath_.c_str(), O_RDWR);
             if (rpFd_ < 0 && storage_.failedErrno == 0) storage_.failedErrno = errno != 0 ? errno : EIO;
         }
-        if (rf.state == RpFileState::Missing) (void)createRecoveryPointFile_(next);
+        // Re-review N5: created with the HELD value (the epoch guard), never past it.
+        if (rf.state == RpFileState::Missing) (void)createRecoveryPointFile_(recoveryPoint_);
         else if (storage_.failedErrno == 0)  (void)checkpointRecoveryPoint_(/*publish=*/false);
     }
 
@@ -1751,6 +1767,8 @@ bool Log::truncateTo_(int64_t truncateOffset) {
         int64_t keptMaxTs = 0;
         const int err = aseg.truncateInPlace(truncateOffset, keptMaxTs);
         if (err > 0) [[unlikely]] {
+            spdlog::critical("Log {}: in-place truncation to {} failed (errno={}) — the cut could not be "
+                             "placed at the requested offset; log FAILED (fail-stop)", dir_, truncateOffset, err);
             markStorageFailed(err);   // nothing changed in the segment; fail-stop (the owner halts)
             return true;
         }

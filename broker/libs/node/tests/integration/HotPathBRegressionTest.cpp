@@ -975,3 +975,169 @@ TEST(HotPathBRegression, ReadMapAddressSpaceIsBoundedAndGrownOffOwnerRegression)
     // FREE-tier sizing: 10k partitions, ~1% actively filling a segment:
     // 9.9k x 1 MiB + 100 x 65 MiB ≈ 16 GiB of address space (was 10k x 128 MiB = 1.25 TiB).
 }
+
+// ===========================================================================
+// Re-review (2026-10-06, rereview of bfc92af): N1-N6.
+// ===========================================================================
+namespace {
+/// A worker-driven (deferred-seal) provisioned log whose provisioner is driven
+/// by hand (or not at all).
+struct ProvLog {
+    TmpDir d;
+    rune::node::SegmentProvisionerAgent prov{1};
+    std::unique_ptr<rune::storage::Log> log;
+    int64_t next = 0;
+    explicit ProvLog(int64_t roll = 64LL << 20) {
+        log = std::make_unique<rune::storage::Log>(d.p.string(), roll);
+        log->recover();
+        log->setDeferSealSync(true);
+        prov.addToViewForTest(log.get());
+        log->setProvisioning(prov.hook(), 50);
+    }
+    void appendBytes(std::size_t bytes) {   // ~16 KiB batches
+        for (std::size_t done = 0; done < bytes;) {
+            rune::protocol::RecordBatchBuilder b(next, 1000);
+            for (int k = 0; k < 2; ++k) b.append("k", std::string(8000, 'x'), 1000 + k);
+            auto v = b.build();
+            log->appendNoSync(v.data(), v.size(), next + 1);
+            next += 2;
+            done += v.size();
+        }
+    }
+};
+} // namespace
+
+// N1: an in-place truncation over a PARTIAL read map (growth requested, never
+// installed) cuts exactly at the requested offset — never at the mapped prefix.
+TEST(HotPathBRegression, InPlaceTruncationOverPartialReadMapCutsAtTheOffsetRegression) {
+    ProvLog p;
+    p.appendBytes(200 * 1024);
+    (void)p.log->readView(0, 1);           // served: the owner no longer remaps this segment
+    p.appendBytes(1400 * 1024);            // ~1.6 MiB: past the 1 MiB mapping (growth never served)
+    const int64_t x = (p.next / 2) * 2 - 20;   // a batch boundary well past 1 MiB
+    ASSERT_GT(x * 8100, int64_t{1} << 20);
+    ASSERT_TRUE(p.log->truncateTo(x));
+    EXPECT_EQ(p.log->logEndOffset(), x) << "the cut landed below the requested offset (records deleted)";
+    EXPECT_FALSE(p.log->storageFailed());
+}
+
+// N2: a late grown mapping answering a superseded request is never installed
+// into another segment.
+TEST(HotPathBRegression, LateReadMapForSupersededRequestIsDiscardedRegression) {
+    ProvLog p(2LL << 20);
+    p.appendBytes(600 * 1024);              // past half of the 1 MiB map: request #1 (segment A)
+    p.prov.holdGrowsForTest(true);
+    (void)p.prov.doWork(0);                 // request #1 held
+    p.appendBytes(1600 * 1024);             // past the roll size
+    for (int i = 0; i < 64 && p.log->segmentBaseOffsets().size() < 2; ++i) { (void)p.prov.doWork(0); p.appendBytes(16 * 1024); }
+    ASSERT_GE(p.log->segmentBaseOffsets().size(), 2u) << "precondition: rolled to segment B";
+    const int64_t bBase = p.log->segmentBaseOffsets().back();
+    p.appendBytes(1200 * 1024);             // B past its 1 MiB map
+    p.log->expireReadMapRequestForTest();
+    (void)p.log->readView(bBase, 1);        // re-request for B (request #1 superseded)
+    p.prov.holdGrowsForTest(false);         // A's late mapping arrives
+    (void)p.log->readView(bBase, 1);
+    EXPECT_GE(p.log->readMapsDiscardedForTest(), 1u) << "the superseded mapping was not discarded";
+    const auto v = p.log->readView(bBase, 1);
+    ASSERT_FALSE(v.empty());
+    EXPECT_EQ(v.baseOffset, bBase) << "segment B serves another file's bytes";
+    (void)p.prov.doWork(0);
+    (void)p.log->readView(bBase, 1);
+    const auto w = p.log->readView(p.next - 2, 1);
+    ASSERT_FALSE(w.empty());
+    EXPECT_EQ(w.baseOffset, p.next - 2);
+}
+
+// N3: readers never stall on the provisioner — data past the mapping is served.
+TEST(HotPathBRegression, ReadsPastTheMappingNeverStallOnTheProvisionerRegression) {
+    ProvLog p;
+    p.appendBytes(200 * 1024);
+    (void)p.log->readView(0, 1);
+    p.appendBytes(1400 * 1024);             // provisioner never runs
+    const int64_t at = p.next - 2;
+    const auto v = p.log->readView(at, 1);
+    ASSERT_FALSE(v.empty()) << "a follower / consumer read past the mapping stalled on the provisioner";
+    EXPECT_EQ(v.baseOffset, at);
+    EXPECT_GE(p.log->ownerFallbackRemapsForTest(), 1u);
+}
+
+// N4: the re-fetch wait is released by ANY path that made the history durable
+// (here: an inline write after a failed async one) — never wedged.
+TEST(HotPathBRegression, RefetchWaitReleasedByInlineDurabilityRegression) {
+    Rig rig(false, 4096);
+    rig.roleOp(false, 3, 2);
+    rig.pass();
+    applyStamped(rig, 3, 3, 4);
+    const int64_t x = rig.log->logEndOffset();
+    rig.roleOp(false, 5, 2);
+    rig.pass();
+    applyStamped(rig, 5, 5, 4);
+    ASSERT_TRUE(rig.passUntil([&] { return rig.rep->epochStateDurable(); }));
+    rig.rep->holdEpochStateCompletionsForTest(true);
+    rig.roleOp(false, 6, 2);
+    rig.pass();
+    rune::replication::ErrorPayloadBuf epb;
+    WorkerOp op;
+    op.type = WorkerOp::Type::ApplyReplicated; op.topicId = 1; op.partition = 0;
+    op.replicatedPayload.leaderEpoch = 6; op.replicatedPayload.partition = 0; op.replicatedPayload.topicId = 1;
+    op.replicatedPayload.errorCode = rune::replication::kErrDivergingEpoch;
+    const auto pl = epb.set(3, x);
+    op.replicatedPayload.records.assign(pl.begin(), pl.end());
+    ASSERT_TRUE(rig.pool.tryEnqueueOp(1, 0, std::move(op)));
+    ASSERT_TRUE(rig.passUntil([&] { return rig.log->logEndOffset() == x; }));
+    ASSERT_TRUE(rig.rep->refetchAwaitsEpochStateForTest());
+    ASSERT_TRUE(rig.passUntil([&] { return rig.rep->epochStateCompletionHeldForTest(); }));
+    rig.rep->failNextEpochStateCompletionsForTest(1, EIO);
+    rig.rep->releaseHeldEpochStateForTest();          // async write failed: still due (backoff)
+    ASSERT_FALSE(rig.rep->epochStateDurable());
+    ASSERT_TRUE(rig.rep->writeEpochStateInlineForTest());   // durable through the inline path
+    EXPECT_FALSE(rig.rep->refetchAwaitsEpochStateForTest()) << "the re-fetch wait wedged";
+}
+
+// N5: a missing recovery-point file next to epoch history is created at the
+// held (startup) value — never at the log end.
+TEST(HotPathBRegression, MissingRecoveryPointFileHonoursTheEpochGuardRegression) {
+    TmpDir d;
+    {
+        rune::storage::Log log(d.p.string(), 4096);
+        log.recover();
+        for (int i = 0; i < 60; ++i) log.append(stampedBatch(i * 2, 2, 1), i * 2 + 1);
+    }
+    rune::storage::LeaderEpochCache c;
+    c.assign(1, 0);
+    c.checkpointToFile((d.p / "leader-epoch-checkpoint").string());
+    fs::remove(d.p / rune::storage::Log::kRecoveryPointFile);
+    rune::storage::Log log(d.p.string(), 4096);
+    log.recover();
+    ASSERT_LT(log.startupRecoveryPoint(), log.logEndOffset()) << "precondition: several segments";
+    EXPECT_EQ(log.persistedRecoveryPoint(), log.startupRecoveryPoint())
+        << "the new recovery-point file trusts epoch history that was never reconciled";
+}
+
+// N6: a failed update of a valid state file never falls back to a second
+// (legacy) authority — the log fails instead.
+TEST(HotPathBRegression, FailedEpochStateUpdateNeverFallsBackToLegacyRegression) {
+    TmpDir d;
+    {
+        rune::storage::Log log(d.p.string());
+        log.recover();
+        log.append(stampedBatch(0, 3, 1), 2);
+        log.append(stampedBatch(3, 2, 2), 4);
+    }
+    {   // a valid but stale state file (misses epoch 2)
+        const std::vector<std::pair<int32_t, int64_t>> e{{1, 0}};
+        const int fd = rune::storage::LeaderEpochState::create(d.p.string(), 4096, 1, 1, e.begin(), e.end());
+        ASSERT_GE(fd, 0);
+        ::close(fd);
+    }
+    PartitionConfig c;
+    c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+    rune::replication::NullPartitionTransport t;
+    rune::storage::Log log(d.p.string());
+    log.recover();
+    PartitionReplica::failInlineEpochStateWritesForTest(1);
+    PartitionReplica r(c, Role::Follower, 2, {1}, {1}, &log, &t);
+    PartitionReplica::failInlineEpochStateWritesForTest(0);
+    EXPECT_FALSE(fs::exists(d.p / "leader-epoch-checkpoint")) << "a second (legacy) epoch authority was written";
+    EXPECT_TRUE(log.storageFailed());
+}

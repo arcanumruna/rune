@@ -447,11 +447,25 @@ public:
     /// Review Md5 — provisioner thread: hand a read mapping built for this
     /// log's outstanding growth request back to the owner.  false = ring full
     /// (the caller destroys it; the owner re-requests).
-    [[nodiscard]] bool offerReadMap(MappedFile* m) noexcept {
+    [[nodiscard]] bool offerReadMap(MappedFile* m, int64_t packedRequest) noexcept {
+        // Re-review N2: the answer carries the request's identity (its seq).
         return mapRing_.offer(kMapGrownMsg, static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(m)),
-                              static_cast<int64_t>(m->size()));
+                              requestSeq(packedRequest));
     }
-    [[nodiscard]] bool offerReadMapFailure(int err) noexcept { return mapRing_.offer(kMapFailedMsg, err, 0); }
+    [[nodiscard]] bool offerReadMapFailure(int err, int64_t packedRequest) noexcept {
+        return mapRing_.offer(kMapFailedMsg, (static_cast<int64_t>(err) << 32) | requestSeq(packedRequest), 0);
+    }
+    /// Re-review N2: a growth request packs (dup'd fd : 24 | MiB : 20 | seq : 19).
+    [[nodiscard]] static int64_t packRequest(int fd, int64_t mib, int64_t seq) noexcept {
+        return (static_cast<int64_t>(fd) & 0xFFFFFF) | ((mib & 0xFFFFF) << 24) | ((seq & 0x7FFFF) << 44);
+    }
+    [[nodiscard]] static int requestFd(int64_t p) noexcept { return static_cast<int>(p & 0xFFFFFF); }
+    [[nodiscard]] static int64_t requestMiB(int64_t p) noexcept { return (p >> 24) & 0xFFFFF; }
+    [[nodiscard]] static int64_t requestSeq(int64_t p) noexcept { return (p >> 44) & 0x7FFFF; }
+    [[nodiscard]] uint64_t readMapsDiscardedForTest() const noexcept { return readMapsDiscarded_; }
+    [[nodiscard]] uint64_t ownerFallbackRemapsForTest() const noexcept { return ownerFallbackRemaps_; }
+    /// Tests (re-review N2): force the count-based re-request on the next need.
+    void expireReadMapRequestForTest() noexcept { growWaits_ = 1u << 30; }
     [[nodiscard]] uint64_t readMapGrowthsForTest() const noexcept { return readMapGrowths_; }
     [[nodiscard]] uint64_t readMapGrowthFailuresForTest() const noexcept { return readMapGrowthFailures_; }
     /// Cleaner-thread fsyncs / directory fsyncs (retention log-start
@@ -823,7 +837,7 @@ public:
         void* ctx = nullptr;
         /// Review Md5 (optional): build a `mib` MiB read mapping of `fd` (a dup
         /// the callee owns) off the owner and hand it back (offerReadMap).
-        bool (*growFn)(void* ctx, Log* log, int fd, int64_t mib) noexcept = nullptr;
+        bool (*growFn)(void* ctx, Log* log, int64_t packedRequest) noexcept = nullptr;
         /// Review Md5 (optional): destroy a retired read mapping off the owner.
         bool (*disposeFn)(void* ctx, void* map) noexcept = nullptr;
     };
@@ -1016,7 +1030,8 @@ private:
     int64_t  growBase_ = -1;
     uint64_t growGen_ = 0;
     uint32_t growWaits_ = 0;
-    uint64_t readMapGrowths_ = 0, readMapGrowthFailures_ = 0;
+    uint64_t readMapGrowths_ = 0, readMapGrowthFailures_ = 0, readMapsDiscarded_ = 0, ownerFallbackRemaps_ = 0;
+    int64_t  growSeq_ = 0;   ///< re-review N2: the outstanding request's identity
     /// Owner: request a larger mapping for `seg` (keyed `base`) when it needs one.
     void maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept;
     /// Owner: install grown mappings handed back by the provisioner.

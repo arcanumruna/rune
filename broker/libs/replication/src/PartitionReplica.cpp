@@ -447,6 +447,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
 void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
 {
     cancelPendingLeadership_();   // hot-path B F7: a newer role supersedes a deferred leadership
+    onHistoryDurable_();          // re-review N4
     // Fix round 5: a role change abandons a deferred divergence truncation
     // (reset below / leadership) — let the log post cleaner work again.
     if (followerSync_.truncatePending() && !memoryBacked_ && diskLog_ != nullptr) diskLog_->cancelColdPathWait();
@@ -1743,10 +1744,14 @@ void PartitionReplica::enableEpochState_() noexcept
             if (!(onDisk == epochCache_) || static_cast<Epoch>(st.fence) < es_.fenceTarget) {
                 es_.due = true;
                 if (!writeEpochStateInline_()) {
-                    spdlog::error("PartitionReplica[topic={} part={}]: updating {} failed — leader-epoch "
-                                  "durability stays synchronous", cfg_.topicId, cfg_.partitionId, ES::path(dir));
-                    es_ = EpochStateIo{};
-                    return;
+                    // Re-review N6: the state file is the authority and could not
+                    // be brought up to date — never fall back to a second (legacy)
+                    // authority next to it: fail-stop the log (restart re-derives).
+                    spdlog::critical("PartitionReplica[topic={} part={}]: updating {} failed — log FAILED "
+                                     "(fail-stop)", cfg_.topicId, cfg_.partitionId, ES::path(dir));
+                    logDirOffline_ = true;
+                    diskLog_->markStorageFailed(EIO);
+                    return;   // es_ stays enabled: nothing is ever written to a legacy file
                 }
             }
         } else {
@@ -1816,6 +1821,7 @@ bool PartitionReplica::writeEpochStateInline_() noexcept
             es_.activeSlot = 0;
         } else {
             if (!openEpochStateFd_()) { ++es_.errors; return false; }
+            if (inlineFailN_ > 0) [[unlikely]] { --inlineFailN_; ++es_.errors; return false; }
             const int target = es_.activeSlot < 0 ? 0 : 1 - es_.activeSlot;
             std::vector<uint8_t> img(ES::imageBytes(entries));
             const uint64_t seq = ++es_.seq;
@@ -1843,6 +1849,7 @@ bool PartitionReplica::writeEpochStateInline_() noexcept
         es_.pendingMin = INT64_MAX;
         pushEpochCap_();
         closeEpochStateFdIfIdle_();
+        onHistoryDurable_();
         return true;
     } catch (...) {
         ++es_.errors;
@@ -1964,18 +1971,25 @@ bool PartitionReplica::epochStateWriteCompleted(uint64_t seq, int err)
     ++es_.writes;
     pushEpochCap_();
     completePendingLeadershipIfDurable_();
-    if (awaitEsFetch_ && epochStateDurable()) {
-        // Review C1: the truncated history is durable — the re-fetch may go.
-        awaitEsFetch_ = false;
-        if (role_ == Role::Follower && !pendingLead_.active) {
-            followerSync_.reset();
-            lastFetchEmitNs_ = 0;
-            if (sendFetchToLeader_(nextFetch())) followerSync_.onFetchSent();
-            else ++sendRefusals_;
-        }
-    }
+    onHistoryDurable_();
     closeEpochStateFdIfIdle_();
     return epochStateWriteDue();
+}
+
+void PartitionReplica::onHistoryDurable_()
+{
+    // Re-review N4: the ONE "history became durable" hook — async completion,
+    // inline write (incl. the outgrown-slot re-create), a pending leadership
+    // that cleared `due` without a write, and every role transition.
+    if (!awaitEsFetch_ || !epochStateDurable()) return;
+    // Review C1: the truncated history is durable — the re-fetch may go.
+    awaitEsFetch_ = false;
+    if (role_ == Role::Follower && !pendingLead_.active) {
+        followerSync_.reset();
+        lastFetchEmitNs_ = 0;
+        if (sendFetchToLeader_(nextFetch())) followerSync_.onFetchSent();
+        else ++sendRefusals_;
+    }
 }
 
 void PartitionReplica::completePendingLeadershipIfDurable_()
@@ -2003,6 +2017,7 @@ void PartitionReplica::completePendingLeadershipIfDurable_()
         pushEpochCap_();
         closeEpochStateFdIfIdle_();
     }
+    onHistoryDurable_();
 }
 
 void PartitionReplica::deferLeadership_(Epoch newEpoch, std::vector<NodeId> isr, int32_t partitionEpoch)
@@ -2293,6 +2308,9 @@ int PartitionReplica::doWork(int64_t nowNs)
             }
 
         }
+    } else if (awaitEsFetch_ && epochStateDurable()) [[unlikely]] {
+        onHistoryDurable_();   // re-review N4: never wedged, whichever path made it durable
+        ++work;
     } else if (!pendingLead_.active && !awaitEsFetch_) [[likely]] {   // F7 / C1: neither fetches while its history is not durable
         // F18 (I-1): a wedge is bound to the offset — a truncation that moved our
         // LEO clears it (time-independent: no timer).  While wedged the follower
