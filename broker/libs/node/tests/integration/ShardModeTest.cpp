@@ -1525,8 +1525,13 @@ TEST(ShardModeRegression, KilledPausedClientsSessionAndAcksAreFreedRegression) {
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
     const std::string gw = gatewayChannel(ports, 0);
+    // D11: aborts because a WORKER HOLDS this session's acks — not credit / worker-cap pauses (D8c), which also
+    // count in heldProduceAborts but hold nothing: their acks fit the client's egress window.
     auto gatewayPauses = [&] {
-        return node.onControlThreadForTest([&] { return node.gatewayForTest()->heldProduceAbortsForTest(); });
+        return node.onControlThreadForTest([&] {
+            auto* g = node.gatewayForTest();
+            return g->heldProduceAbortsForTest() - g->creditProduceAbortsForTest() - g->workerCapProduceAbortsForTest();
+        });
     };
     auto sessionAlive = [&](int64_t sid) {
         return node.onControlThreadForTest([&] { return node.gatewayForTest()->sessionLastSeenNsForTest(sid) >= 0; });
@@ -1536,28 +1541,42 @@ TEST(ShardModeRegression, KilledPausedClientsSessionAndAcksAreFreedRegression) {
             return node.workerForTest(0)->sessionAcksPendingForTest();
         });
     };
-    int64_t sidA = 0;
+    auto clientImages = [&] { return node.onControlThreadForTest([&] { return node.gatewayForTest()->clientImageCountForTest(); }); };
+    const int images0 = clientImages();
+    ShardTestClient b(bd.path, 1 << 20, true);
+    int64_t sidA = 0, sidB = 0;
     {
         ShardTestClient a(ad.path, 1 << 20, /*legacyTransport=*/true);
         sidA = a.connect(gw, kClientStream);
         ASSERT_GT(sidA, 0);
         ASSERT_TRUE(a.produceUntilOk(gw, kClientStream, sidA, 0, 0, /*acks=*/1, makeBatch(1)));
-        // Precondition: the worker HOLDS A's acks (A reads nothing; 40k acks >> its 128 KiB egress window).  The
-        // gateway pause itself is not required here (it can lag a burst under load — D8c).
-        (void)pauseClient(a, gw, sidA, 50'000'000, [&] { return gatewayPauses() > 0 || acksPending() > 256; });
+        // Precondition: the worker HOLDS A's acks (A reads nothing; 40k acks >> its egress window).  D11: wait for
+        // a HOLD abort — a transient ack backlog (pending > 256) or a credit pause is not a hold: those acks still
+        // fit A's window and drain moments later.
+        (void)pauseClient(a, gw, sidA, 50'000'000, [&] { return gatewayPauses() > 0; });
         ASSERT_TRUE(awaitBrokerState([&] { return acksPending() > 0; }, 10s))
             << "the worker holds A's acks (stall offer=" << a.lastStallOffer_ << ")";
+        // D8b-L (LOW-4): another session on the SAME worker keeps full intake WHILE A still pins its acks.
+        sidB = b.connect(gw, kClientStream);
+        ASSERT_GT(sidB, 0);
+        for (int k = 0; k < 5; ++k)
+            ASSERT_TRUE(b.produceUntilOk(gw, kClientStream, sidB, 0, 0, /*acks=*/1, makeBatch(1), /*maxAttempts=*/3))
+                << "B's produce " << k << " starved while A pins acks";
+        ASSERT_GT(acksPending(), 0) << "A still pins acks while B is served; A alive=" << sessionAlive(sidA);
     }                                                                  // A is killed (client + driver closed)
     const auto killed = std::chrono::steady_clock::now();
     EXPECT_TRUE(awaitBrokerState([&] { return !sessionAlive(sidA) && acksPending() == 0; }, 40s))
         << "a killed paused client's session and owed acks must be freed";
     const auto took = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - killed);
     EXPECT_LE(took.count(), 25) << "~5 s NOT_CONNECTED + 10 s lease, not the 10-min held bound";
-    ShardTestClient b(bd.path, 1 << 20, true);
-    const int64_t sidB = b.connect(gw, kClientStream);
-    ASSERT_GT(sidB, 0);
+    // D8b-L (LOW-4): A's image at the gateway is released (an aborted held frame never pins it); B's stays.
+    EXPECT_TRUE(awaitBrokerState([&] { return clientImages() == images0 + 1; }, 40s))
+        << "the killed client's gateway image was not released: images=" << clientImages() << " baseline=" << images0;
+    // B sent nothing during that wait (no keepalives): its session may be reaped on the normal lease — a new one.
+    const int64_t sidB2 = b.connect(gw, kClientStream);
+    ASSERT_GT(sidB2, 0);
     for (int k = 0; k < 5; ++k)
-        ASSERT_TRUE(b.produceUntilOk(gw, kClientStream, sidB, 0, 0, /*acks=*/1, makeBatch(1), /*maxAttempts=*/3));
+        ASSERT_TRUE(b.produceUntilOk(gw, kClientStream, sidB2, 0, 0, /*acks=*/1, makeBatch(1), /*maxAttempts=*/3));
     node.stop();
 }
 
@@ -1565,15 +1584,23 @@ TEST(ShardModeRegression, KilledPausedClientsSessionAndAcksAreFreedRegression) {
 // stops calling for longer than the publication-connection timeout: the worker's claim reports NOT_CONNECTED
 // (Lost) — a suspicion, not a verdict.  The session and every queued ack survive; once the client pumps again the
 // publication is Found and it reads every ack.  (7dc95c1 failed the session at NOT_CONNECTED and dropped its acks.)
-TEST(ShardModeRegression, PausedInvokerClientSurvivesNotConnectedRegression) {
+namespace {
+void runPausedInvokerClientSurvivesNotConnected(uint32_t gatewayProduceCredits) {
     TmpDir dir{"invcl"}, ad{"inva"};
     const auto ports = ShardPorts::discover(1, 1);
-    BrokerNode node{makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false)};
+    NodeConfig cfg = makeShardConfig(0, dir.path, ports, 1, 1, /*fused=*/false);
+    cfg.gatewayProduceCredits = gatewayProduceCredits;   // 0 = default (1024)
+    BrokerNode node{cfg};
     node.start();
     ASSERT_TRUE(node.awaitLeader(10'000ms));
     const std::string gw = gatewayChannel(ports, 0);
+    // D11: aborts because a WORKER HOLDS this session's acks — not credit / worker-cap pauses (D8c), which also
+    // count in heldProduceAborts but hold nothing: their acks fit the client's egress window.
     auto gatewayPauses = [&] {
-        return node.onControlThreadForTest([&] { return node.gatewayForTest()->heldProduceAbortsForTest(); });
+        return node.onControlThreadForTest([&] {
+            auto* g = node.gatewayForTest();
+            return g->heldProduceAbortsForTest() - g->creditProduceAbortsForTest() - g->workerCapProduceAbortsForTest();
+        });
     };
     ShardTestClient a(ad.path, 1 << 20, /*legacyTransport=*/true, DriverMode::Invoker);
     const int64_t sidA = a.connect(gw, kClientStream);
@@ -1585,10 +1612,14 @@ TEST(ShardModeRegression, PausedInvokerClientSurvivesNotConnectedRegression) {
             return node.workerForTest(0)->sessionAcksPendingForTest();
         });
     };
-    // Precondition: the worker HOLDS A's acks (the gateway pause can lag a burst under load — D8c).
-    const int64_t n = pauseClient(a, gw, sidA, c0, [&] { return gatewayPauses() > 0 || acksPending() > 256; });
+    // Precondition: the worker HOLDS A's acks (D11: a HOLD abort — not a credit pause / transient backlog).
+    const int64_t n = pauseClient(a, gw, sidA, c0, [&] { return gatewayPauses() > 0; });
     ASSERT_GT(n, 0) << "stall offer=" << a.lastStallOffer_;
-    ASSERT_TRUE(awaitBrokerState([&] { return acksPending() > 0; }, 10s)) << "the worker holds A's acks";
+    ASSERT_TRUE(awaitBrokerState([&] { return acksPending() > 0; }, 10s)) << "the worker holds A's acks; n=" << n
+        << " aborts{all=" << gatewayPauses() << " credit="
+        << node.onControlThreadForTest([&] { return node.gatewayForTest()->creditProduceAbortsForTest(); })
+        << " workerCap=" << node.onControlThreadForTest([&] { return node.gatewayForTest()->workerCapProduceAbortsForTest(); })
+        << "}";
     // The client stops pumping until the broker has seen its publication go NOT_CONNECTED (or, pre-fix, closed it).
     auto lostOrClosed = [&] {
         return node.onControlThreadForTest([&] {
@@ -1606,6 +1637,20 @@ TEST(ShardModeRegression, PausedInvokerClientSurvivesNotConnectedRegression) {
         return !g->sessionLostForTest(sidA) && g->sessionLastSeenNsForTest(sidA) >= 0;
     })) << "Found clears Lost; the session lives on";
     node.stop();
+}
+} // namespace
+
+TEST(ShardModeRegression, PausedInvokerClientSurvivesNotConnectedRegression) {
+    runPausedInvokerClientSurvivesNotConnected(0);
+}
+
+// D11 (ShardModeRegression.PausedInvokerClientSurvivesNotConnectedRegression flaked under load: "the worker holds
+// A's acks" never held).  The pause predicate accepted ANY gateway produce abort — but a CREDIT pause (D8c: the
+// session's forwarded produces not yet acked) is not a hold: its <= credits acks all fit the client's egress window
+// once the worker catches up, so the worker never holds any.  Under load the worker lags the client and the credit
+// pause comes first.  A 1-credit gateway makes that ordering deterministic.
+TEST(ShardModeRegression, PausedInvokerCreditPauseIsNotAHoldRegression) {
+    runPausedInvokerClientSurvivesNotConnected(1);
 }
 
 // ===========================================================================

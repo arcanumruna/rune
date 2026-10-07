@@ -1232,8 +1232,12 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
             if (kind == K::Lost) {
                 if (s->lostByWorkers == 0) s->lostSinceNs = nowNs_;
                 s->lostByWorkers |= bit;
-            } else {
+            } else if (s->lostByWorkers & bit) {
+                // D8b-L: a Found is a successful claim — proof the client is alive.  If another worker is still
+                // Lost its suspicion restarts here (it cannot predate this proof of life), so the lease never
+                // runs from an edge older than the newest evidence the client was reachable.
                 s->lostByWorkers &= ~bit;
+                if (s->lostByWorkers != 0) s->lostSinceNs = nowNs_;
             }
             return;
         }

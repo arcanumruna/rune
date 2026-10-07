@@ -9,6 +9,7 @@
 // Uses an embedded UDP Aeron driver (same pattern as WorkerEgressTest).  The Log
 // is written before driving doWork (single-threaded test), so readView observes
 // committed data.  bound = LEO (no replica → read_uncommitted passthrough).
+#include <rune/aeronutil/testing/FreePort.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
@@ -44,6 +45,9 @@ using namespace rune::node;
 namespace pc = rune::protocol::client;
 
 namespace {
+// D11: loopback endpoints from the shared allocator (20000..31999, never bind-0) — the old
+// fixed 24xxx ports collided with the allocator's ports in concurrently running tests.
+inline std::string freeEndpoint() { return "127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort()); }
 
 constexpr std::size_t kRingBytes = 512 * 1024;
 
@@ -158,10 +162,11 @@ TEST_F(WorkerPushFixture, DeliversAllBatchesInOrderExactlyOnce) {
     for (int i = 0; i < kN; ++i) appendBatch(log, i, 1);
     ASSERT_EQ(log.logEndOffset(), kN);
 
-    const char* control = "127.0.0.1:24810";
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
     WorkerEgress eg(aeron_, control, 3001);
     ASSERT_TRUE(eg.resolved());
-    auto sub = resolveSub(control, "127.0.0.1:24811", 3001);
+    auto sub = resolveSub(control, freeEndpoint(), 3001);
     ASSERT_NE(sub, nullptr);
     ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
 
@@ -189,16 +194,7 @@ TEST_F(WorkerPushFixture, RecordsCarryTheSubscribeCorrelationIdRegression) {
     auto dir = tempLogDir();
     rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
     for (int i = 0; i < 3; ++i) appendBatch(log, i, 1);
-    auto freePort = [] {
-        const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-        sockaddr_in a{};
-        a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
-        (void)::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
-        socklen_t len = sizeof a;
-        (void)::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-        ::close(fd);
-        return std::to_string(ntohs(a.sin_port));
-    };
+    auto freePort = [] { return std::to_string(rune::aeronutil::testing::allocFreeUdpPort()); };   // D11: never bind-0
     const std::string control = "127.0.0.1:" + freePort();
     const std::string local   = "127.0.0.1:" + freePort();
     WorkerEgress eg(aeron_, control.c_str(), 3011);
@@ -237,10 +233,11 @@ TEST_F(WorkerPushFixture, MultiRecordBatchesAdvanceCursorByRecordCount) {
     appendBatch(log, 8, 2);   // offsets 8..9
     ASSERT_EQ(log.logEndOffset(), 10);
 
-    const char* control = "127.0.0.1:24820";
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
     WorkerEgress eg(aeron_, control, 3002);
     ASSERT_TRUE(eg.resolved());
-    auto sub = resolveSub(control, "127.0.0.1:24821", 3002);
+    auto sub = resolveSub(control, freeEndpoint(), 3002);
     ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
 
     Worker w(0, kRingBytes, kRingBytes);
@@ -267,10 +264,11 @@ TEST_F(WorkerPushFixture, ControlBatchesAreSkipped) {
     appendBatch(log, 2, 1);                 // data @2
     ASSERT_EQ(log.logEndOffset(), 3);
 
-    const char* control = "127.0.0.1:24830";
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
     WorkerEgress eg(aeron_, control, 3003);
     ASSERT_TRUE(eg.resolved());
-    auto sub = resolveSub(control, "127.0.0.1:24831", 3003);
+    auto sub = resolveSub(control, freeEndpoint(), 3003);
     ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
 
     Worker w(0, kRingBytes, kRingBytes);
@@ -296,10 +294,11 @@ TEST_F(WorkerPushFixture, SubscribeFromNonZeroOffset) {
     rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
     for (int i = 0; i < 10; ++i) appendBatch(log, i, 1);
 
-    const char* control = "127.0.0.1:24840";
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
     WorkerEgress eg(aeron_, control, 3004);
     ASSERT_TRUE(eg.resolved());
-    auto sub = resolveSub(control, "127.0.0.1:24841", 3004);
+    auto sub = resolveSub(control, freeEndpoint(), 3004);
     ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
 
     Worker w(0, kRingBytes, kRingBytes);
@@ -321,10 +320,11 @@ TEST_F(WorkerPushFixture, UnsubscribeStopsFurtherDelivery) {
     rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
     for (int i = 0; i < 5; ++i) appendBatch(log, i, 1);
 
-    const char* control = "127.0.0.1:24850";
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
     WorkerEgress eg(aeron_, control, 3005);
     ASSERT_TRUE(eg.resolved());
-    auto sub = resolveSub(control, "127.0.0.1:24851", 3005);
+    auto sub = resolveSub(control, freeEndpoint(), 3005);
     ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
 
     Worker w(0, kRingBytes, kRingBytes);
@@ -435,10 +435,11 @@ TEST_F(WorkerLargeBatchPushRegression, OneMiBBatchDeliveredIntactThenSmallBatch)
     const auto big   = f19AppendSized(log, 1024 * 1024);   // offset 0
     const auto small = f19AppendSized(log, 16);            // offset 1
 
-    const char* control = "127.0.0.1:24910";
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
     WorkerEgress eg(aeron_, control, 3101);
     ASSERT_TRUE(eg.resolved());
-    auto sub = resolveSub(control, "127.0.0.1:24911", 3101);
+    auto sub = resolveSub(control, freeEndpoint(), 3101);
     ASSERT_NE(sub, nullptr);
     ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
 
@@ -468,10 +469,11 @@ TEST_F(WorkerLargeBatchPushRegression, BackPressuredLargeOfferRetriesWithoutLoss
     std::vector<std::vector<uint8_t>> stored;
     for (int i = 0; i < kBatches; ++i) stored.push_back(f19AppendSized(log, 1024 * 1024));
 
-    const char* control = "127.0.0.1:24920";
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
     WorkerEgress eg(aeron_, control, 3102);
     ASSERT_TRUE(eg.resolved());
-    auto sub = resolveSub(control, "127.0.0.1:24921", 3102);
+    auto sub = resolveSub(control, freeEndpoint(), 3102);
     ASSERT_NE(sub, nullptr);
     ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
 
@@ -513,10 +515,11 @@ TEST_F(WorkerOversizePushRegression, AboveMaxMessageLengthAnswersErrorNoSilentAd
     f19AppendSized(logB, 16);          // B: another subscription, must flow
     f19AppendSized(logB, 16);
 
-    const char* control = "127.0.0.1:24930";
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
     WorkerEgress eg(aeron_, control, 3103);
     ASSERT_TRUE(eg.resolved());
-    auto sub = resolveSub(control, "127.0.0.1:24931", 3103);
+    auto sub = resolveSub(control, freeEndpoint(), 3103);
     ASSERT_NE(sub, nullptr);
     ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
 
@@ -604,10 +607,11 @@ TEST_F(TxnRcRegression, WorkerPushReadCommittedHoldsOpenTxn) {
     rep.onLeaderLogAppended();
     ASSERT_EQ(rep.highWatermark(), 3);
 
-    const char* control = "127.0.0.1:24860";
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
     WorkerEgress eg(aeron_, control, 3010);
     ASSERT_TRUE(eg.resolved());
-    auto sub = resolveSub(control, "127.0.0.1:24861", 3010);
+    auto sub = resolveSub(control, freeEndpoint(), 3010);
     ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
 
     Worker w(0, kRingBytes, kRingBytes);
@@ -636,10 +640,11 @@ TEST_F(TxnRcRegression, WorkerPushFiltersAbortedBatch) {
     rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &log, &t);
     rep.onLeaderLogAppended();
 
-    const char* control = "127.0.0.1:24870";
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
     WorkerEgress eg(aeron_, control, 3011);
     ASSERT_TRUE(eg.resolved());
-    auto sub = resolveSub(control, "127.0.0.1:24871", 3011);
+    auto sub = resolveSub(control, freeEndpoint(), 3011);
     ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
 
     Worker w(0, kRingBytes, kRingBytes);
@@ -670,10 +675,11 @@ TEST_F(TxnRcRegression, WorkerPushPreCarrierGroupCutsAtAbortedBatch) {
     rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &log, &t);
     rep.onLeaderLogAppended();
 
-    const char* control = "127.0.0.1:24880";
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
     WorkerEgress eg(aeron_, control, 3012);
     ASSERT_TRUE(eg.resolved());
-    auto sub = resolveSub(control, "127.0.0.1:24881", 3012);
+    auto sub = resolveSub(control, freeEndpoint(), 3012);
     ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
 
     Worker w(0, kRingBytes, kRingBytes);

@@ -27,6 +27,7 @@
 // thread round trip on a live node (paced by its duty cycle) — no sleeps.
 // ---------------------------------------------------------------------------
 #include "../support/TestNodeConfig.h"
+#include <rune/aeronutil/testing/FreePort.h>
 
 #include <rune/consensus/Election.h>
 #include <rune/consensus/ElectionState.h>
@@ -81,18 +82,10 @@ struct CceDir {
     ~CceDir() { std::error_code ec; fs::remove_all(path, ec); }
 };
 
-uint16_t freeUdpPort() {
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) throw std::runtime_error("socket() failed");
-    sockaddr_in a{};
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = ::inet_addr("127.0.0.1");
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) < 0) { ::close(fd); throw std::runtime_error("bind"); }
-    socklen_t len = sizeof a;
-    ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-    ::close(fd);
-    return ntohs(a.sin_port);
-}
+// D11: never an ephemeral port — the kernel hands a just-freed ephemeral port to
+// the next process that binds port 0, so concurrently running test binaries
+// collided ("Address already in use" at gateway construction).
+uint16_t freeUdpPort() { return rune::aeronutil::testing::allocFreeUdpPort(); }
 
 /// Distinct free loopback UDP ports.
 std::vector<uint16_t> freePorts(int n) {

@@ -1,5 +1,6 @@
 // EmbeddedDriverTest.cpp — one embedded driver is driven by exactly one thread
 // (spec §3.6); invoker mode has no driver thread; stale/active dir handling.
+#include <rune/aeronutil/testing/FreePort.h>
 #include <sys/stat.h>
 #include <rune/node/EmbeddedDriver.h>
 
@@ -296,15 +297,7 @@ TEST(EmbeddedDriverRegression, EnvIdleArgsMismatchRefusesCleanlyRegression) {
 #include <sys/socket.h>
 
 namespace {
-uint16_t freeUdpPortForWake() {
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
-    ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
-    socklen_t len = sizeof(a);
-    ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-    ::close(fd);
-    return ntohs(a.sin_port);
-}
+uint16_t freeUdpPortForWake() { return rune::aeronutil::testing::allocFreeUdpPort(); }   // D11: never bind-0
 void sendJunkDatagram(uint16_t port) {
     const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons(port);

@@ -852,23 +852,10 @@ TEST(GR5_Integration, AcksAll_Deferred_HWGate) {
     ASSERT_TRUE(node1.awaitLeader(8s));
     ASSERT_TRUE(node2.awaitLeader(8s));
 
-    std::this_thread::sleep_for(300ms);
-
-    const rune::consensus::NodeId lid = node0.leaderId();
-    ASSERT_GE(lid, 0);
-    ASSERT_LE(lid, 2);
-
     std::array<rune::node::BrokerNode*, 3> allNodes{&node0, &node1, &node2};
-    rune::node::BrokerNode* leaderNode = allNodes[lid];
-
-    {
-        const auto roleDeadline = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < roleDeadline) {
-            if (leaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(10ms);
-        }
-    }
-    ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
+    const int lid = settledPartitionLeader(allNodes);   // D11: the partition leader, not the consensus leader
+    ASSERT_GE(lid, 0) << "no settled partition leader for topic 0 / partition 0";
+    rune::node::BrokerNode* leaderNode = allNodes[static_cast<std::size_t>(lid)];
 
     // Configure minIsr=2 on the leader gateway (3-node majority requires 2 replicas).
     leaderNode->setGatewayMinIsr(2);
@@ -1003,25 +990,12 @@ TEST(GR5_Integration, MinIsr_FollowerKilled_Refuses) {
     ASSERT_TRUE(node0p->awaitLeader(8s));
     ASSERT_TRUE(node1p->awaitLeader(8s));
     ASSERT_TRUE(node2p->awaitLeader(8s));
-    std::this_thread::sleep_for(300ms);
-
-    const rune::consensus::NodeId lid = node0p->leaderId();
-    ASSERT_GE(lid, 0);
-    ASSERT_LE(lid, 2);
-
     std::array<rune::node::BrokerNode*, 3> allNodes{node0p.get(), node1p.get(), node2p.get()};
     std::array<std::unique_ptr<rune::node::BrokerNode>*, 3>
         owners{&node0p, &node1p, &node2p};
-    rune::node::BrokerNode* leaderNode = allNodes[lid];
-
-    {
-        const auto roleDeadline = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < roleDeadline) {
-            if (leaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(10ms);
-        }
-    }
-    ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
+    const int lid = settledPartitionLeader(allNodes);   // D11: the partition leader, not the consensus leader
+    ASSERT_GE(lid, 0) << "no settled partition leader for topic 0 / partition 0";
+    rune::node::BrokerNode* leaderNode = allNodes[static_cast<std::size_t>(lid)];
 
     // Set minIsr=2 on the leader gateway (requires both followers in ISR for acks=All).
     leaderNode->setGatewayMinIsr(2);
@@ -1227,26 +1201,13 @@ TEST(GR5_Integration, AcksAll_SingleRecord_NotAckedAtHwZero_GR9) {
     ASSERT_TRUE(node0p->awaitLeader(8s));
     ASSERT_TRUE(node1p->awaitLeader(8s));
     ASSERT_TRUE(node2p->awaitLeader(8s));
-    std::this_thread::sleep_for(300ms);
-
-    const rune::consensus::NodeId lid = node0p->leaderId();
-    ASSERT_GE(lid, 0);
-    ASSERT_LE(lid, 2);
-
     std::array<rune::node::BrokerNode*, 3> allNodes{
         node0p.get(), node1p.get(), node2p.get()};
     std::array<std::unique_ptr<rune::node::BrokerNode>*, 3>
         owners{&node0p, &node1p, &node2p};
-    rune::node::BrokerNode* leaderNode = allNodes[lid];
-
-    {
-        const auto roleDeadline = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < roleDeadline) {
-            if (leaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(10ms);
-        }
-    }
-    ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
+    const int lid = settledPartitionLeader(allNodes);   // D11: the partition leader, not the consensus leader
+    ASSERT_GE(lid, 0) << "no settled partition leader for topic 0 / partition 0";
+    rune::node::BrokerNode* leaderNode = allNodes[static_cast<std::size_t>(lid)];
 
     // minIsr=2: the single-record produce passes the ISR gate (3 in ISR) but
     // requires a MAJORITY (2 of 3) LEO>=1 for HW to advance past 0.

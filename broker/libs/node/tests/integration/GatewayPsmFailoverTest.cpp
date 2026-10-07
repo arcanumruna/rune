@@ -541,27 +541,12 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
     ASSERT_TRUE(node0->awaitLeader(8s));
     ASSERT_TRUE(node1->awaitLeader(8s));
     ASSERT_TRUE(node2->awaitLeader(8s));
-    std::this_thread::sleep_for(300ms);
-
-    const rune::consensus::NodeId lid = node0->leaderId();
-    ASSERT_GE(lid, 0);
-    ASSERT_LE(lid, 2);
-
     std::array<rune::node::BrokerNode*, 3> allNodes{
         node0.get(), node1.get(), node2.get()};
+    // D11: the PARTITION leader (owner-thread role, settled) — not the consensus leader.
+    const int lid = settledPartitionLeader(allNodes);
+    ASSERT_GE(lid, 0) << "no settled partition leader for topic 0 / partition 0";
     rune::node::BrokerNode* leaderNode = allNodes[static_cast<std::size_t>(lid)];
-
-    // Wait for replication bridge to promote the leader replica.
-    {
-        const auto dl = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < dl) {
-            if (leaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(20ms);
-        }
-    }
-    ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
-    ASSERT_TRUE(hasReplica(*leaderNode));
-    ASSERT_EQ(roleOnOwner(*leaderNode), Role::Leader);
 
     // Start the test-client Aeron driver.
     Tx2bClientDriver clientDrv(clientDir.path / "aeron");
@@ -636,56 +621,15 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
     ASSERT_NE(surv1, nullptr);
     ASSERT_NE(surv2, nullptr);
 
-    // Wait for re-election.
-    rune::consensus::NodeId newLid = -1;
-    {
-        const auto dl = std::chrono::steady_clock::now() + 15s;
-        while (std::chrono::steady_clock::now() < dl) {
-            const auto l1 = surv1->leaderId();
-            const auto l2 = surv2->leaderId();
-            if (l1 >= 0 && l1 != lid && l2 >= 0 && l1 == l2) {
-                newLid = l1;
-                break;
-            }
-            std::this_thread::sleep_for(50ms);
-        }
-    }
-    ASSERT_GE(newLid, 0) << "Surviving nodes must re-elect a new leader";
-    ASSERT_NE(newLid, lid) << "New leader must differ from the killed leader";
-    std::this_thread::sleep_for(500ms);  // let new leader settle
-
-    rune::node::BrokerNode* newLeaderNode =
-        (surv1->isLeader()) ? surv1 : surv2;
-    ASSERT_TRUE(newLeaderNode->isLeader());
-
-    // Wait for new leader's replication bridge to fire → doWork() wasLeader_
-    // transition → rebuildProducerStateFromLogs() with HW-bound.
-    {
-        const auto dl = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < dl) {
-            if (newLeaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(20ms);
-        }
-    }
-    ASSERT_TRUE(newLeaderNode->replicationIsLeaderForTest())
-        << "New leader's replication bridge must report isLeader (PSM rebuild fires)";
-
-    ASSERT_TRUE(hasReplica(*newLeaderNode));
-
-    // Partition failover (metadata reassignment of the dead leader's partitions)
-    // is ASYNCHRONOUS and completes shortly AFTER consensus re-election — the
-    // reassignment liveness window must expire before the dead node is treated as
-    // gone.  Poll for the partition replica to reach Leader role rather than
-    // asserting it instantaneously (mirrors the consensus-isLeader poll above).
-    {
-        const auto dl = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < dl &&
-               roleOnOwner(*newLeaderNode) != Role::Leader) {
-            std::this_thread::sleep_for(20ms);
-        }
-    }
-    ASSERT_EQ(roleOnOwner(*newLeaderNode), Role::Leader)
-        << "New leader's partition replica must be promoted (async failover)";
+    // D11: the NEW partition leader among the survivors (owner-thread role, settled after the
+    // async partition failover) — not the consensus leader, which may be the other survivor.
+    std::array<rune::node::BrokerNode*, 2> survivors{surv1, surv2};
+    const int newIdx = settledPartitionLeader(survivors);
+    ASSERT_GE(newIdx, 0) << "no surviving partition leader after failover";
+    rune::node::BrokerNode* newLeaderNode = survivors[static_cast<std::size_t>(newIdx)];
+    int newLid = -1;
+    for (int i = 0; i < 3; ++i) if (allNodes[static_cast<std::size_t>(i)] == newLeaderNode) newLid = i;
+    ASSERT_NE(newLid, lid);
     ASSERT_GE(leoOnOwner(*newLeaderNode), committedHw)
         << "New leader must hold all committed records (LEO >= committedHw="
         << committedHw << ")";
