@@ -587,6 +587,14 @@ int Log::provisionReady(std::size_t depth, bool preallocate) {
         // Re-review N3: over the node-wide reservation cap the segment is still
         // built off the owner — only the block reservation is shed.
         if (preallocate) seg->preallocate(rollBytes_);
+        // D19 L2: the map node the owner will install this segment into, built
+        // here (an allocation the owner no longer makes per roll).  Best effort:
+        // without one the owner falls back to its spare pool / an emplace.
+        try {
+            SegMap tmp;
+            tmp.emplace(int64_t{0}, nullptr);
+            seg->setSpareMapNode(tmp.extract(tmp.begin()));
+        } catch (...) {}
         LogSegment* raw = seg.release();
         // Publish: the ring's commit hands the fully built segment (files, maps,
         // blocks) to the owner's poll in pullReady_().
@@ -656,6 +664,11 @@ void Log::installNextSegment(int64_t base) {
         // keep their temp names on disk for now; the disk rename (staging →
         // <base>.{log,index}) is deferred to the background thread.
         std::unique_ptr<LogSegment> seg(prepared);
+        // D19 L2: keep the node the provisioner built (only while the spare
+        // pool has room — the pool never reallocates; an untaken node is
+        // freed with its segment, off the roll).
+        if (spareSegNodes_.size() < spareSegNodes_.capacity())
+            if (SegMap::node_type nh = seg->takeSpareMapNode(); !nh.empty()) spareSegNodes_.push_back(std::move(nh));
         const int64_t stagingSeq = seg->stagingSeq();
         seg->adoptAsActive(base);            // in-memory only
         install_(base, std::move(seg));

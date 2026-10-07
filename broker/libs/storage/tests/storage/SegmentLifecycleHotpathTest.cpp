@@ -520,6 +520,46 @@ TEST(SegmentLifecycleRegression, SteadyStateRollAllocatesNothingOnOwnerRegressio
     fs::remove_all(dir);
 }
 
+// D19 review L2: a log WITHOUT retention (compacted / infinite retention)
+// releases no map node, so the owner used to allocate one map node per roll.
+// The provisioner now builds the node with the ready segment.
+TEST(SegmentLifecycleRegression, NoRetentionRollAllocatesNoMapNodeOnOwnerRegression) {
+    const auto dir = freshDir("rune_slh_alloc_noret");
+    {
+        Log log(dir.string(), 256);
+        log.recover();
+        int demands[4] = {0, 0, 0, 0};
+        rune::storage::testing::DemandChannelForTest demandCh{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh);
+        int64_t off = 0;
+        auto appendCounted = [&](int64_t& o) {
+            RecordBatchBuilder b(o, 1000 + o);
+            b.append("k", "value-" + std::to_string(o), 1000 + o);
+            const auto batch = b.build();
+            tCount = true;
+            o = log.appendNoSync(batch.data(), batch.size(), o);
+            tCount = false;
+        };
+        auto housekeeping = [&] {   // provisioner side (another thread in production)
+            (void)log.provisionReady(2);
+            (void)log.finalizeStagingRenames();
+            tCount = true;
+            (void)log.drainStagingRenamesDone();
+            tCount = false;
+        };
+        for (int i = 0; i < 200; ++i) { housekeeping(); appendCounted(off); }
+        tAllocs = 0;
+        const uint64_t installs0 = static_cast<uint64_t>(demands[2]);
+        for (int i = 0; i < 1200; ++i) { housekeeping(); appendCounted(off); }
+        const uint64_t rolls = static_cast<uint64_t>(demands[2]) - installs0;
+        ASSERT_GT(rolls, 150u) << "the window must roll many times";
+        // Only the snapshot's rare chunk / directory allocations (no map node per roll).
+        const uint64_t allowed = 2 + 2 * (rolls / kSnapChunkEntries + 1) + 3 * (2 * rolls / kSnapHeadersPerDir + 1);
+        EXPECT_LE(tAllocs, allowed) << "owner allocations: " << tAllocs << " over " << rolls << " rolls";
+    }
+    fs::remove_all(dir);
+}
+
 // ===========================================================================
 // Review fixes (2026-10-06 review M1 / M3 / m4 / m6).
 // ===========================================================================

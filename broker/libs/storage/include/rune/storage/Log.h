@@ -986,7 +986,7 @@ private:
     std::vector<std::unique_ptr<LogSegment>> retiredSegments_;
     bool reloadAllocFaultForTest_ = false;   // F3 r7: test-only (cold path)
     uint32_t ownerTag_ = UINT32_MAX;
-    using SegMap = std::map<int64_t, std::unique_ptr<LogSegment>>;
+    using SegMap = LogSegmentMap;
     /// Wire `seg` into this log (storage state) and store it at `base`, retiring
     /// any pinned segment it replaces.
     void install_(int64_t base, std::unique_ptr<LogSegment> seg);

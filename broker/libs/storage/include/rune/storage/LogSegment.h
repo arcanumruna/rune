@@ -3,6 +3,7 @@
 #include <rune/storage/OffsetIndex.h>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 #include <memory>
@@ -50,6 +51,11 @@ struct LogStorageState {
 ///   gateway group-commit path: the caller MUST eventually call sync() before
 ///   acking any offset as fsync-durable.  acks=Leader/acks=1 semantics: a
 ///   leader crash before the next sync() may lose un-flushed acked records.
+class LogSegment;
+/// The owner's segment map (Log::SegMap).  Declared here so a provisioned
+/// segment can carry the map node it will be installed into (D19 L2).
+using LogSegmentMap = std::map<int64_t, std::unique_ptr<LogSegment>>;
+
 class LogSegment {
 public:
     /// @param indexMaxBytes  initial size of the mmap-backed .index.  Historically
@@ -323,6 +329,12 @@ public:
     /// after adoption).  Only meaningful for a pre-provisioned segment.
     int64_t stagingSeq() const noexcept { return stagingSeq_; }
 
+    /// D19 L2: an empty map node built with the segment off the owner (the
+    /// provisioner); the owner installs the adopted segment into it instead of
+    /// allocating one (logs without retention never release a node to reuse).
+    void setSpareMapNode(LogSegmentMap::node_type nh) noexcept { spareMapNode_ = std::move(nh); }
+    [[nodiscard]] LogSegmentMap::node_type takeSpareMapNode() noexcept { return std::move(spareMapNode_); }
+
     /// Adopt a staging segment as the live segment at `base` (append thread only).
     /// PURE IN-MEMORY rebase — ZERO syscalls (no rename/open/mmap).  The staging
     /// files keep their temp names on disk; writes go through the already-open fd
@@ -409,6 +421,7 @@ private:
     bool staging_ = false;   // true until adoptAsActive() rebases a pre-provisioned segment
     bool pathPending_ = false;   // see pathPending()
     int64_t stagingSeq_ = -1; // pre-provision staging sequence (see stagingSeq())
+    LogSegmentMap::node_type spareMapNode_;   // see setSpareMapNode (empty when none)
 
     // Read-only mmap of the .log for zero-copy readView().  Created WITH the
     // segment (openReadMap; lazily only if that failed) with headroom past EOF,
