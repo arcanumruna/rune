@@ -1347,3 +1347,21 @@ TEST(HotPathBRegression, EpochStateFsyncFdOutlivesItsReplicaUntilTheCompletionRe
     for (int i = 0; i < 2000 && ::fcntl(syncFd, F_GETFD) != -1; ++i) { rig.pass(); std::this_thread::yield(); }
     EXPECT_EQ(::fcntl(syncFd, F_GETFD), -1) << "the fsync's fd leaked after its completion";
 }
+
+// D21 review L4: a becomeLeader at an epoch BELOW the pending (deferred)
+// leadership's is a stale controller record — refused explicitly, never a
+// cancel of the newer leadership followed by a lead at the older epoch.
+TEST(HotPathBRegression, BecomeLeaderBelowThePendingEpochIsRefusedRegression) {
+    Rig rig(/*controllerManaged=*/true);
+    rig.worker().setReapPausedForTest(true);
+    rig.roleOp(true, 5);
+    rig.pass();   // pending at epoch 5 (its fence write in flight)
+    ASSERT_TRUE(rig.rep->leadershipPendingForTest());
+    rig.roleOp(true, 4);   // stale (lower) epoch
+    rig.pass();
+    EXPECT_TRUE(rig.rep->leadershipPendingForTest()) << "the newer pending leadership was cancelled";
+    rig.worker().setReapPausedForTest(false);
+    ASSERT_TRUE(rig.passUntil([&] { return !rig.rep->leadershipPendingForTest(); }));
+    EXPECT_EQ(rig.rep->epoch(), 5) << "led at the stale epoch";
+    EXPECT_EQ(rig.rep->role(), Role::Leader);
+}

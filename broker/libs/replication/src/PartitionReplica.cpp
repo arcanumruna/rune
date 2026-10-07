@@ -291,6 +291,15 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
             pendingLead_.partitionEpoch = partitionEpoch;
             return;
         }
+        // D21 review L4: an OLDER epoch than the pending leadership's is a stale
+        // record (the controller commits leader epochs monotonically) — refused
+        // explicitly: never cancel the newer leadership to lead at the older one.
+        if (newEpoch < pendingLead_.epoch) {
+            spdlog::warn("PartitionReplica[topic={} part={}]: becomeLeader at epoch {} below the pending "
+                         "leadership's epoch {} — stale, ignored", cfg_.topicId, cfg_.partitionId, newEpoch,
+                         pendingLead_.epoch);
+            return;
+        }
         cancelPendingLeadership_();
     }
     // Fix round 5: a role change abandons a deferred divergence truncation
