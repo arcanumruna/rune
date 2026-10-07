@@ -39,6 +39,15 @@
 // The latency-critical fast-ack (emitted on every apply, pure, maxBytes=0) is
 // INDEPENDENT of this machine — it advances the leader's follower-offset → HW
 // for acks=majority.  FollowerSync governs only the periodic/catch-up fetch.
+//
+// Deferred roll (hotpath-A m2, D19 N6e): while the follower's log cannot roll
+// (no ready segment / seal queue full — Log::rollDeferred()), a data fetch is
+// sent with maxBytes=0.  That keeps the ISR liveness (the leader hears the
+// fetch) but NOT the catch-up: the follower's LEO stands still while the
+// leader's grows, so its lag accrues and a deferral longer than
+// replicaLagMaxMs (slow disk + full seal queue) shrinks it out of the ISR.
+// Bounded and intended — the follower rejoins once it catches up, exactly as
+// a follower on a slow disk would in Kafka.
 // ---------------------------------------------------------------------------
 
 #include <cstdint>
