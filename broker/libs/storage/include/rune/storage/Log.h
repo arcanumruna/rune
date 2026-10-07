@@ -1380,9 +1380,13 @@ private:
         return std::min<int64_t>(cap, kMaxRollBytes);
     }
 
-    /// Owner: the staging-rename request ring has a free slot.
+    /// Owner: room for one more rename IN FLIGHT — queued requests plus
+    /// completions not yet drained (D19 N6c: reqTail - doneHead, both
+    /// owner-written; every consumed request publishes exactly one completion,
+    /// so finalizeStagingRenames always finds room on the done ring and never
+    /// strands a request no one re-drives).
     [[nodiscard]] bool renameRoom_() const noexcept {
-        return renameReqTail_.load(std::memory_order_relaxed) - renameReqHead_.load(std::memory_order_acquire) <
+        return renameReqTail_.load(std::memory_order_relaxed) - renameDoneHead_.load(std::memory_order_relaxed) <
                kRenameRingCapacity;
     }
     /// Owner: take the oldest ready segment (nullptr = none).

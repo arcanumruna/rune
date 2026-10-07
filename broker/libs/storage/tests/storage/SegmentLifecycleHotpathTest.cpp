@@ -1007,3 +1007,38 @@ TEST(SegmentLifecycleRegression, ReadySegmentBehindAStaleFailureIsAdoptedRegress
     }
     fs::remove_all(dir);
 }
+
+// D19 re-review N6c: the rename request ring and its done ring are bounded
+// TOGETHER — an adoption needs room for its completion too.  Before, the owner
+// could keep adopting while the done ring was full; finalizeStagingRenames then
+// stopped with requests queued and nothing re-drove them (an un-renamed
+// staging file behind a non-held roll).
+TEST(SegmentLifecycleRegression, RenameInFlightIsBoundedByTheDoneRingRegression) {
+    const auto dir = freshDir("rune_slh_n6c");
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        int demands[4] = {0, 0, 0, 0};
+        rune::storage::testing::DemandChannelForTest ch{&NoopHook::fn, demands};
+        log.setProvisioning(&ch);
+        int64_t off = 0;
+        int rolls = 0;
+        for (int i = 0; i < 80; ++i) {
+            (void)log.provisionReady(2);
+            const auto n = log.segmentBaseOffsets().size();
+            while (log.segmentBaseOffsets().size() == n && !log.rollDeferred()) off = put(log, off);
+            if (log.segmentBaseOffsets().size() == n) break;   // held
+            ++rolls;
+            (void)log.finalizeStagingRenames();   // the owner never drains the done ring here
+        }
+        EXPECT_LT(rolls, 80) << "adoptions must hold while their completions cannot be published";
+        EXPECT_EQ(countSuffix(dir, ".stlog"), log.readyCountForTest())
+            << "every adopted segment's rename was performed (none stranded)";
+        (void)log.drainStagingRenamesDone();
+        (void)log.provisionReady(2);
+        const auto n = log.segmentBaseOffsets().size();
+        for (int i = 0; i < 64 && log.segmentBaseOffsets().size() == n; ++i) off = put(log, off);
+        EXPECT_GT(log.segmentBaseOffsets().size(), n) << "draining the done ring releases the held roll";
+    }
+    fs::remove_all(dir);
+}

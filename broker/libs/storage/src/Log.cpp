@@ -764,8 +764,7 @@ bool Log::enqueueStagingRename(int64_t base, int64_t seq) noexcept {
     // small ring never fills in practice; a full ring returns false and the
     // caller renames synchronously (still correct).
     const std::size_t tail = renameReqTail_.load(std::memory_order_relaxed);
-    const std::size_t head = renameReqHead_.load(std::memory_order_acquire);
-    if (tail - head >= kRenameRingCapacity) return false;
+    if (!renameRoom_()) return false;   // D19 N6c: bounded with the done ring
     renameReqRing_[tail & kRenameRingMask] = {base, seq};
     renameReqTail_.store(tail + 1, std::memory_order_release);
     return true;
@@ -783,7 +782,9 @@ int Log::finalizeStagingRenames() {
         // hotpath-A: a request is consumed only when its completion can be
         // published — a dropped completion would leave the owner's logPath_ at
         // the staging name for good (and a cold path re-opening it by that
-        // path would fail the log).  A full done ring: retried next call.
+        // path would fail the log).  Unreachable since D19 N6c: the owner
+        // enqueues only while requests + undrained completions < capacity
+        // (renameRoom_), so the done ring always has room here; kept as a guard.
         const std::size_t dt = renameDoneTail_.load(std::memory_order_relaxed);
         const std::size_t dh = renameDoneHead_.load(std::memory_order_acquire);
         if (dt - dh >= kRenameRingCapacity) break;
