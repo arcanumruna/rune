@@ -2562,3 +2562,43 @@ TEST(ElectionLog, TwoMemberClusterRegression_LeaderKeepsLeadingWhileFollowerRepo
     EXPECT_EQ(e.leaderMemberId(), 0);
 }
 
+// ===========================================================================
+// DR-10 review LOW-6 — the adopted leadershipTermId is in memory only (as in
+// Aeron: ConsensusModuleAgent.leadershipTermId is recovered from the
+// RecordingLog; only the candidate term is in the NodeStateFile).  Safe because
+// the durable candidateTermId — persisted with fsync before the step-down
+// completes — is what a restarted node's election starts from: it never
+// re-follows the deposed leader's (older) term.
+// ===========================================================================
+TEST(ElectionLog, ClosedLeaderStepDownRegression_RestartAfterAdoptedTermIgnoresDeposedLeader) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    Term deposed = 0, higher = 0;
+    {
+        NodeStateFile nsf(nsfFile.str());
+        TermLog       tl(tlFile.str());
+        FakeConsensusPublisher pub;
+        int64_t nowNs = 1'000'000LL;
+        auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl);
+        closeAsFollowerOf0(e, nowNs);
+        deposed = e.leadershipTermId();
+        higher  = deposed + 1;
+        e.onCommitPosition(nowNs, higher, 0, /*leader=*/2);   // adopt T+1 (memory) → CANVASS
+        ASSERT_FALSE(e.isClosed());
+        ASSERT_EQ(e.leadershipTermId(), higher);
+    }   // crash: the adopted leadershipTermId is lost, the TermLog still says `deposed`
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    int64_t nowNs = 5'000'000'000LL;
+    auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl, true, deposed, 0, 0);
+    e.doWork(nowNs);   // INIT → CANVASS (candidate term from the NodeStateFile)
+    EXPECT_GE(e.candidateTermId(), higher);
+    // The deposed leader's heartbeat for its old term must not be followed.
+    for (int i = 0; i < 20; ++i) {
+        e.onNewLeadershipTerm(nowNs, deposed, deposed, 0, 0, deposed, 0, 0, 0, 0,
+                              /*leader=*/0, 0, false, 0);
+        nowNs += kStatusIntervalNs;
+        e.doWork(nowNs);
+        ASSERT_NE(e.leaderMemberId(), 0) << "restarted node re-followed the deposed leader";
+    }
+}
