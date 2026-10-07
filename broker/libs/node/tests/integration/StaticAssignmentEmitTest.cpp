@@ -52,6 +52,7 @@
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/metadata/StaticBalancer.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune/storage/InMemoryLog.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/MetadataRecords.h>
 
@@ -397,8 +398,9 @@ TEST(StaticAssignmentEmitTest, OneRecordPerAppend_LargeTopicSetNeverMegaAppend) 
     // LEO immediately after append: should be exactly kTopicCount if each record
     // got its own append call.  If a mega-append was used, this would be 1.
     const Offset leoAfterEmit = replica->logEndOffset();
-    EXPECT_EQ(leoAfterEmit, static_cast<Offset>(kTopicCount))
-        << "logEndOffset must advance by exactly " << kTopicCount
+    // D15: + the fresh log's bootstrap FeatureLevelRecord (its own entry).
+    EXPECT_EQ(leoAfterEmit, static_cast<Offset>(kTopicCount) + 1)
+        << "logEndOffset must advance by exactly " << kTopicCount << " + 1"
         << " (one log entry per assignment record); got " << leoAfterEmit
         << " — a value of 1 means records were incorrectly mega-appended";
 
@@ -510,8 +512,9 @@ TEST(StaticAssignmentEmitTest, BalancerError_IncrementCounterEmitsNothing) {
     transport.pump(clock);
     svc.doWork(clock);  // triggers emitStaticAssignmentIfNeeded(); balancer must throw
 
-    // No records must have been appended.
-    EXPECT_EQ(replica->logEndOffset(), 0)
+    // No assignment records must have been appended (D15: only the fresh
+    // log's bootstrap FeatureLevelRecord).
+    EXPECT_EQ(replica->logEndOffset(), 1)
         << "no assignment records must be appended when BalancerError is thrown";
 
     // The error counter must be non-zero.
@@ -1003,7 +1006,9 @@ struct CtlRig {
     int64_t clock = 0;
     /// `userTopics` false: no user topic, the coordinator partition (-1, 0)
     /// on the controller path only (a cluster with no user topics).
-    explicit CtlRig(bool userTopics = true) {
+    std::vector<TopicSpec> topics{TopicSpec{0, 1, 3, "", "t"}};
+    explicit CtlRig(bool userTopics = true, std::vector<TopicSpec> ts = {}) {
+        if (!ts.empty()) topics = std::move(ts);
         log1.recover(); log2.recover(); log3.recover();
         r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), Role::Leader, 1, all, all, &log1, &transport);
         r2 = std::make_unique<PartitionReplica>(makeMetaCfg(2), Role::Follower, 1, all, all, &log2, &transport);
@@ -1013,7 +1018,7 @@ struct CtlRig {
         transport.addFollower(3, r3.get());
         svc = std::make_unique<MetadataService>(r1.get(), 1);
         if (userTopics) {
-            svc->configure({TopicSpec{0, 1, 3, "", "t"}}, all);
+            svc->configure(topics, all);
         } else {
             svc->configure({}, all);
             svc->setCoordinatorPartitions({rune::metadata::PartitionKey{-1, 0}}, all);
@@ -1991,4 +1996,444 @@ TEST(ControllerConsensusGateRegression, SteppedDownConsensusLeaderEmitsNoReassig
 
     svc1.setConsensusLeads(true);
     EXPECT_TRUE(svc1.controllerReady()) << "regaining consensus leadership restores deciding";
+}
+
+
+// ===========================================================================
+// D15 (2026-10-07): memory-backed replica epoch edge cases.
+// ===========================================================================
+
+namespace {
+/// The metadata controller moves from node 1 to node 2 (consensus term 2):
+/// a NEW MetadataService on node 2 that knows only the replicated log.
+struct Failover {
+    CtlRig& c;
+    MetadataService svc2;
+    explicit Failover(CtlRig& rig, bool survivor = false) : c(rig), svc2(rig.r2.get(), 2) {
+        c.r1->becomeFollower(2, 2);
+        c.r3->becomeFollower(2, 2);
+        c.r2->becomeLeader(2, c.all);
+        c.transport.removeFollower(2);
+        c.transport.setLeader(c.r2.get());
+        c.transport.addFollower(1, c.r1.get());
+        svc2.configure(c.topics, c.all);
+        svc2.setAllowSurvivorElection(survivor);
+        drive(100);
+    }
+    void drive(int n) {
+        for (int i = 0; i < n; ++i) {
+            c.clock += 1'000'000LL;
+            (void)svc2.doWork(c.clock);
+            c.r1->doWork(c.clock); c.r2->doWork(c.clock); c.r3->doWork(c.clock);
+            c.transport.pump(c.clock);
+        }
+    }
+    void tick(std::vector<NodeId> eligible = {1, 2, 3}) {
+        (void)svc2.reassignDeadPartitionLeaders(eligible, 0);
+        drive(50);
+    }
+    const PartitionAssignment& pa(int32_t t = 0) { return *svc2.assignment(t, 0); }
+};
+rune::replication::AlterIsrMsg reportOf(int32_t topic, int32_t node, int32_t epoch, int32_t leo, int64_t inc,
+                                        bool logDirFailed = false) {
+    auto m = leaderlessReport(node, epoch, leo, inc, logDirFailed);
+    m.topicId = topic;
+    return m;
+}
+rune::replication::AlterIsrMsg bumpOf(const PartitionAssignment& a, int32_t topic, int64_t inc, bool memory,
+                                      int32_t leo = 0, bool logDirFailed = false) {
+    using rune::replication::AlterIsrMsg;
+    AlterIsrMsg m{};
+    m.topicId = topic; m.partition = 0; m.leaderId = a.leaderNode; m.leaderEpoch = a.leaderEpoch;
+    m.isrCount = AlterIsrMsg::kLeaderEpochBump;
+    m.partitionEpoch = a.partitionEpoch;
+    m.isr[0] = a.leaderEpoch;
+    m.isr[1] = AlterIsrMsg::kBumpFenceValid | (memory ? AlterIsrMsg::kBumpMemoryBacked : 0) |
+               (logDirFailed ? AlterIsrMsg::kBumpLogDirFailed : 0);
+    m.isr[2] = leo;
+    m.isr[3] = static_cast<int32_t>(inc);
+    return m;
+}
+} // namespace
+
+// D15 item 1: a sole-ISR MEMORY leader restarted EMPTY and its partition was
+// made leaderless, to be decided on fresh reports.  The controller then FAILS
+// OVER.  The successor knew nothing of it (the mark was controller memory):
+// its balancer re-elected the empty leader blind — wiping the replica that
+// holds the data.  The mark is committed with the leaderless record: the
+// successor re-derives it, re-arms the partition at a new leaderless epoch
+// (every replica reports to IT), and decides on those fresh reports.
+TEST(D15MemoryEpochRegression, EmptyMemoryLeaderMarkSurvivesControllerFailoverRegression) {
+    CtlRig c;
+    c.svc->setAllowSurvivorElection(true);
+    c.soleIsr();
+    const int32_t L = c.pa().leaderNode;
+    ASSERT_NE(L, 2) << "precondition: the empty leader is not the successor controller";
+    const int32_t G = 6 - L - 2;                       // holds the data (not in the ISR)
+    (void)c.svc->onAlterIsr(bumpOf(c.pa(), 0, /*inc=*/2, /*memory=*/true));
+    c.tick();
+    ASSERT_EQ(c.pa().leaderNode, NO_LEADER);
+    const int32_t lle = c.pa().leaderEpoch;
+    Failover f(c, /*survivor=*/true);
+    ASSERT_TRUE(f.svc2.controllerCaughtUpForTest());
+    f.tick();
+    EXPECT_NE(f.pa().leaderNode, L) << "the successor controller re-elected the empty memory leader blind";
+    ASSERT_EQ(f.pa().leaderNode, NO_LEADER);
+    const int32_t rearmed = f.pa().leaderEpoch;
+    EXPECT_EQ(rearmed, lle + 1) << "the successor did not re-arm the leaderless partition exactly once";
+    // Reports to the OLD leaderless epoch (answered by the dead controller) decide nothing.
+    (void)f.svc2.onAlterIsr(reportOf(0, L, lle, 0, 2));
+    (void)f.svc2.onAlterIsr(reportOf(0, 2, lle, 0, 1));
+    (void)f.svc2.onAlterIsr(reportOf(0, G, lle, 10, 1));
+    f.tick();
+    EXPECT_EQ(f.pa().leaderNode, NO_LEADER) << "decided on reports of a previous leaderless epoch";
+    (void)f.svc2.onAlterIsr(reportOf(0, L, rearmed, 0, 2));
+    (void)f.svc2.onAlterIsr(reportOf(0, 2, rearmed, 0, 1));
+    f.tick();
+    EXPECT_EQ(f.pa().leaderNode, NO_LEADER) << "decided before every live replica reported";
+    (void)f.svc2.onAlterIsr(reportOf(0, G, rearmed, 10, 1));
+    f.tick();
+    EXPECT_EQ(f.pa().leaderNode, G) << "the replica holding the data was not elected";
+    EXPECT_EQ(f.pa().leaderEpoch, rearmed + 1);
+    const auto leo = c.r2->logEndOffset();
+    for (int i = 0; i < 5; ++i) f.tick();
+    EXPECT_EQ(c.r2->logEndOffset(), leo) << "the decided partition kept churning records";
+}
+
+// D15 item 1 (N1 across a failover): the sole-ISR leader's log dir went
+// offline; the partition was made leaderless.  The successor controller must
+// not re-grant the offline replica (it refused again + one more NO_LEADER
+// record per controller change before); a report from its NEW incarnation
+// (healthy dir) — sent because the successor re-armed the partition —
+// re-registers it and it is elected.
+TEST(D15MemoryEpochRegression, LogDirOfflineMarkSurvivesControllerFailoverRegression) {
+    CtlRig c;
+    c.soleIsr();
+    const int32_t L = c.pa().leaderNode;
+    ASSERT_NE(L, 2);
+    (void)c.svc->onAlterIsr(bumpOf(c.pa(), 0, /*inc=*/5, /*memory=*/false, /*leo=*/3, /*failed=*/true));
+    c.tick();
+    ASSERT_EQ(c.pa().leaderNode, NO_LEADER);
+    Failover f(c);
+    f.tick();
+    EXPECT_NE(f.pa().leaderNode, L) << "the successor controller re-granted a replica whose log dir is offline";
+    ASSERT_EQ(f.pa().leaderNode, NO_LEADER);
+    const int32_t rearmed = f.pa().leaderEpoch;
+    (void)f.svc2.onAlterIsr(reportOf(0, L, rearmed, 3, 5, /*failed=*/true));   // same incarnation: still offline
+    f.tick();
+    EXPECT_EQ(f.pa().leaderNode, NO_LEADER);
+    (void)f.svc2.onAlterIsr(reportOf(0, L, rearmed, 3, 6));                    // restarted, healthy
+    f.tick();
+    EXPECT_EQ(f.pa().leaderNode, L) << "the re-registered replica was never elected";
+    EXPECT_EQ(f.pa().leaderEpoch, rearmed + 1);
+}
+
+// D15 item 2: the two same-index partitions of a co-partition group are led
+// by one MEMORY node that restarts empty; both go leaderless.  Topic 0's only
+// ISR member is that node (empty: a clean choice for it); topic 1's ISR holds
+// replicas WITH data.  Decided per partition, the unit split (topic 0 → the
+// empty node, topic 1 → a data holder).  Decided as a unit: no leader is
+// clean for both — held as a unit (survivor election off), or ONE survivor
+// for both (on).
+TEST(D15MemoryEpochRegression, CoPartitionUnitLeaderlessDecidedAsOneUnitRegression) {
+    for (const bool survivor : {false, true}) {
+        SCOPED_TRACE(survivor ? "survivor election ON" : "survivor election OFF");
+        CtlRig c(true, {TopicSpec{0, 1, 3, "g", "k"}, TopicSpec{1, 1, 3, "g", "k"}});
+        c.svc->setAllowSurvivorElection(survivor);
+        const PartitionAssignment a0 = *c.svc->assignment(0, 0);
+        const int32_t L = a0.leaderNode;
+        ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, L) << "precondition: the unit is colocated";
+        {   // topic 0: ISR shrinks to {L}
+            rune::replication::AlterIsrMsg m{};
+            m.topicId = 0; m.partition = 0; m.leaderId = L; m.leaderEpoch = a0.leaderEpoch;
+            m.isrCount = 1; m.isr[0] = L; m.partitionEpoch = a0.partitionEpoch;
+            ASSERT_TRUE(c.svc->onAlterIsr(m));
+            c.drive(50);
+        }
+        (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(0, 0), 0, 2, /*memory=*/true));
+        (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(1, 0), 1, 2, /*memory=*/true));
+        // The data holders are not live at the bump: no clean failover exists.
+        c.tick({L});
+        ASSERT_EQ(c.svc->assignment(0, 0)->leaderNode, NO_LEADER);
+        ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, NO_LEADER);
+        const int32_t e0 = c.svc->assignment(0, 0)->leaderEpoch, e1 = c.svc->assignment(1, 0)->leaderEpoch;
+        for (int32_t n : {1, 2, 3}) {
+            (void)c.svc->onAlterIsr(reportOf(0, n, e0, 0, n == L ? 2 : 1));
+            (void)c.svc->onAlterIsr(reportOf(1, n, e1, n == L ? 0 : 10, n == L ? 2 : 1));
+        }
+        c.tick();
+        // Review M2 ruling: data safety beats colocation — no leader is clean
+        // for both, so each member gets ITS clean leader (no unclean election
+        // for either; the preferred-leader pass restores colocation later).
+        const int32_t l0 = c.svc->assignment(0, 0)->leaderNode, l1 = c.svc->assignment(1, 0)->leaderNode;
+        EXPECT_EQ(l0, L) << "topic 0's only clean candidate is its sole ISR member";
+        EXPECT_NE(l1, L) << "the empty node was elected over replicas holding topic 1's data";
+        EXPECT_NE(l1, NO_LEADER) << "topic 1 has clean candidates, yet it was held";
+        EXPECT_EQ(c.svc->assignment(1, 0)->isr.size(), 3u) << "topic 1 was elected uncleanly";
+    }
+}
+
+// D15 review M2: each member of a co-partition unit has a DIFFERENT clean
+// leader and none is common.  Survivor (unclean) election must not elect one
+// replica for both — the member it is not clean for would lose committed
+// records; each member gets its own clean leader instead.
+TEST(D15MemoryEpochRegression, CoPartitionUnitNeverUncleanWhenEachMemberHasACleanLeaderRegression) {
+    CtlRig c(true, {TopicSpec{0, 1, 3, "g", "k"}, TopicSpec{1, 1, 3, "g", "k"}});
+    c.svc->setAllowSurvivorElection(true);
+    const int32_t L = c.svc->assignment(0, 0)->leaderNode;
+    ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, L);
+    const int32_t A = L == 1 ? 2 : 1, B = 6 - L - A;
+    auto shrink = [&](int32_t topic, int32_t other) {
+        const PartitionAssignment a = *c.svc->assignment(topic, 0);
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = topic; m.partition = 0; m.leaderId = L; m.leaderEpoch = a.leaderEpoch;
+        m.isrCount = 2; m.isr[0] = L; m.isr[1] = other; m.partitionEpoch = a.partitionEpoch;
+        ASSERT_TRUE(c.svc->onAlterIsr(m));
+        c.drive(50);
+    };
+    shrink(0, A);   // topic 0 ISR {L, A}
+    shrink(1, B);   // topic 1 ISR {L, B}
+    (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(0, 0), 0, 2, /*memory=*/true));
+    (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(1, 0), 1, 2, /*memory=*/true));
+    c.tick({L});
+    ASSERT_EQ(c.svc->assignment(0, 0)->leaderNode, NO_LEADER);
+    ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, NO_LEADER);
+    const int32_t e0 = c.svc->assignment(0, 0)->leaderEpoch, e1 = c.svc->assignment(1, 0)->leaderEpoch;
+    // topic 0: A holds 10 (clean), B 5;  topic 1: B holds 10 (clean), A 5.
+    (void)c.svc->onAlterIsr(reportOf(0, L, e0, 0, 2));
+    (void)c.svc->onAlterIsr(reportOf(0, A, e0, 10, 1));
+    (void)c.svc->onAlterIsr(reportOf(0, B, e0, 5, 1));
+    (void)c.svc->onAlterIsr(reportOf(1, L, e1, 0, 2));
+    (void)c.svc->onAlterIsr(reportOf(1, A, e1, 5, 1));
+    (void)c.svc->onAlterIsr(reportOf(1, B, e1, 10, 1));
+    c.tick();
+    EXPECT_EQ(c.svc->assignment(0, 0)->leaderNode, A) << "topic 0 lost committed records (unclean election)";
+    EXPECT_EQ(c.svc->assignment(1, 0)->leaderNode, B) << "topic 1 lost committed records (unclean election)";
+}
+
+// D15 review m3: a co-partition sibling leaderless for ANOTHER reason (its
+// leader's log dir went offline) is decided WITH the unit's empty-memory
+// member — before, only the memory member was decided and the sibling, whose
+// group ISR intersection excluded the offline node, stayed leaderless although
+// a clean candidate of its own was live.
+TEST(D15MemoryEpochRegression, CoPartitionUnitDecidesSiblingsLeaderlessForOtherReasonsRegression) {
+    CtlRig c(true, {TopicSpec{0, 1, 3, "g", "k"}, TopicSpec{1, 1, 3, "g", "k"}});
+    const int32_t L = c.svc->assignment(0, 0)->leaderNode;
+    ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, L);
+    const int32_t A = L == 1 ? 2 : 1, B = 6 - L - A;
+    auto shrink = [&](int32_t topic, std::vector<int32_t> isr) {
+        const PartitionAssignment a = *c.svc->assignment(topic, 0);
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = topic; m.partition = 0; m.leaderId = L; m.leaderEpoch = a.leaderEpoch;
+        m.isrCount = static_cast<int32_t>(isr.size());
+        for (std::size_t i = 0; i < isr.size(); ++i) m.isr[i] = isr[i];
+        m.partitionEpoch = a.partitionEpoch;
+        ASSERT_TRUE(c.svc->onAlterIsr(m));
+        c.drive(50);
+    };
+    shrink(0, {L});      // topic 0 (memory): sole ISR
+    shrink(1, {L, A});   // topic 1 (disk)
+    (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(0, 0), 0, 2, /*memory=*/true));
+    (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(1, 0), 1, 2, /*memory=*/false, /*leo=*/7, /*failed=*/true));
+    c.tick({L});
+    ASSERT_EQ(c.svc->assignment(0, 0)->leaderNode, NO_LEADER);
+    ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, NO_LEADER);
+    const int32_t e0 = c.svc->assignment(0, 0)->leaderEpoch, e1 = c.svc->assignment(1, 0)->leaderEpoch;
+    for (int32_t n : {L, A, B}) (void)c.svc->onAlterIsr(reportOf(0, n, e0, 0, n == L ? 2 : 1));
+    (void)c.svc->onAlterIsr(reportOf(1, L, e1, 7, 2, /*failed=*/true));
+    (void)c.svc->onAlterIsr(reportOf(1, A, e1, 7, 1));
+    (void)c.svc->onAlterIsr(reportOf(1, B, e1, 3, 1));
+    c.tick();
+    c.tick();
+    EXPECT_EQ(c.svc->assignment(0, 0)->leaderNode, L);
+    EXPECT_EQ(c.svc->assignment(1, 0)->leaderNode, A)
+        << "the sibling leaderless for another reason was never decided with its unit";
+}
+
+// D15 review M1: the leader-epoch FENCE protocol is unconditional — a log
+// written by pre-D15 binaries (no FeatureLevelRecord: level 0) and a member
+// that never re-registers (the level can never be raised) must keep main's
+// 9c80eab behaviour.  A memory-backed sole-ISR leader restarted EMPTY is
+// told (bridge, committed map) to lead the epoch it already led: it refuses,
+// asks for a new epoch, and the controller makes the partition leaderless at
+// a NEW epoch (decided on fresh reports) — never a second history under the
+// old epoch (committed loss).  At 2cccff5 the level-0 replica led it.
+TEST(D15FeatureGateRegression, FenceProtocolUnconditionalAtLevelZeroRegression) {
+    SaeTempDir d1("fz1"), d2("fz2"), d3("fz3"), df("fzf");
+    rune::storage::Log log1(d1.path), log2(d2.path), log3(d3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    const std::vector<NodeId> all{1, 2, 3};
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), Role::Leader, 1, all, all, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(2), Role::Follower, 1, all, all, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(3), Role::Follower, 1, all, all, &log3, &transport);
+    transport.setLeader(r1.get());
+    transport.addFollower(2, r2.get());
+    transport.addFollower(3, r3.get());
+    MetadataService svc(r1.get(), 1);
+    svc.setSupportedFeatureLevel(MetadataFeature::kBase);   // the log predates D15: never bootstrapped
+    svc.configure({TopicSpec{0, 1, 3, "", "t"}}, all);
+    svc.setClusterMembers(all);
+    int64_t clock = 0;
+    auto drive = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            clock += 1'000'000LL;
+            (void)svc.doWork(clock);
+            r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+            transport.pump(clock);
+        }
+    };
+    drive(50);
+    auto reg = [&](int32_t node, int64_t inc, int16_t level) {
+        auto m = nodeControl(node, inc, false);
+        m.isr[AlterIsrMsg::kNodeFeatureLevelSlot] = level;
+        (void)svc.onAlterIsr(m);
+    };
+    reg(2, 11, MetadataFeature::kLatest);   // node 3 never re-registers: the level stays 0
+    drive(20);
+    ASSERT_EQ(svc.featureLevel(), MetadataFeature::kBase);
+    const PartitionAssignment a = *svc.assignment(0, 0);
+    const int32_t L = a.leaderNode;
+    {   // sole ISR {L}
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = 0; m.partition = 0; m.leaderId = L; m.leaderEpoch = a.leaderEpoch;
+        m.isrCount = 1; m.isr[0] = L; m.partitionEpoch = a.partitionEpoch;
+        ASSERT_TRUE(svc.onAlterIsr(m));
+        drive(50);
+    }
+    const int32_t le = svc.assignment(0, 0)->leaderEpoch;
+    // L restarted: an EMPTY memory log, its fence says it led `le`.
+    {
+        std::FILE* fp = std::fopen((df.path + "/fence").c_str(), "w");
+        ASSERT_NE(fp, nullptr);
+        std::fprintf(fp, "%d\n", le);
+        std::fclose(fp);
+    }
+    struct Capture final : InMemoryTransport {
+        std::vector<AlterIsrMsg> sent;
+        bool sendAlterIsr(const AlterIsrMsg& m) override { sent.push_back(m); return true; }
+    } cap;
+    rune::storage::InMemoryLog mem(1 << 20, 10'000);
+    ReplicaRegistry regy;
+    PartitionConfig cfg = makeMetaCfg(L);
+    cfg.topicId = 0;
+    regy.add(0, 0, std::make_unique<PartitionReplica>(cfg, Role::Follower, 0, all, all, &mem, &cap));
+    PartitionReplica* r = regy.lookup(0, 0);
+    r->setIsrChannel(&cap);
+    r->setProcessIncarnation(2);
+    r->setLeaderEpochFenceFile(df.path + "/fence");
+    ReplicationMetadataBridge bridge(L, all, regy, &svc.msmForTest());
+    (void)bridge.doWork(1, 1);
+    EXPECT_NE(r->role(), Role::Leader) << "led epoch " << le << " again with an EMPTY log at feature level 0";
+    for (int i = 0; i < 3 && cap.sent.empty(); ++i) r->doWork(clock += 100'000'000LL);
+    ASSERT_FALSE(cap.sent.empty()) << "no new epoch requested at feature level 0";
+    (void)svc.onAlterIsr(cap.sent.back());
+    (void)svc.reassignDeadPartitionLeaders(all, 0);
+    drive(50);
+    const auto* pa = svc.assignment(0, 0);
+    EXPECT_GT(pa->leaderEpoch, le) << "the controller never moved the partition past the fenced epoch";
+    EXPECT_EQ(pa->leaderNode, NO_LEADER) << "the empty memory leader was re-elected blind";
+    (void)bridge.doWork(1, 1);
+    EXPECT_NE(r->role(), Role::Leader);
+    EXPECT_EQ(svc.featureLevel(), MetadataFeature::kBase);
+}
+
+// D15 item 3 (controller side): the level is raised only once EVERY cluster
+// member advertised support for it; a brand-new metadata log is bootstrapped
+// at the latest level; a log written by older binaries stays at the base
+// level while any member is an older binary (or has not registered).
+TEST(D15FeatureGateRegression, LevelRaisedOnlyOnceEveryMemberSupportsItRegression) {
+    {
+        CtlRig fresh;
+        EXPECT_EQ(fresh.svc->featureLevel(), MetadataFeature::kLatest) << "a fresh log was not bootstrapped";
+    }
+    // A log written by an older binary: no bootstrap record.
+    SaeTempDir d1("fl1"), d2("fl2"), d3("fl3");
+    rune::storage::Log log1(d1.path), log2(d2.path), log3(d3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    const std::vector<NodeId> all{1, 2, 3};
+    InMemoryTransport transport;
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), Role::Leader, 1, all, all, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(2), Role::Follower, 1, all, all, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(3), Role::Follower, 1, all, all, &log3, &transport);
+    transport.setLeader(r1.get());
+    transport.addFollower(2, r2.get());
+    transport.addFollower(3, r3.get());
+    MetadataService svc(r1.get(), 1);
+    svc.setSupportedFeatureLevel(MetadataFeature::kBase);   // emulates the older binary
+    svc.configure({TopicSpec{0, 1, 3, "", "t"}}, all);
+    svc.setClusterMembers(all);
+    int64_t clock = 0;
+    auto drive = [&](MetadataService& s, int n) {
+        for (int i = 0; i < n; ++i) {
+            clock += 1'000'000LL;
+            (void)s.doWork(clock);
+            r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+            transport.pump(clock);
+        }
+    };
+    drive(svc, 50);
+    ASSERT_NE(svc.assignment(0, 0), nullptr);
+    ASSERT_EQ(svc.featureLevel(), MetadataFeature::kBase);
+    // Node 1 is upgraded (consensus term 2 on the same log).
+    r1->becomeFollower(2, 1);
+    r1->becomeLeader(2, all);
+    r2->becomeFollower(2, 1);
+    r3->becomeFollower(2, 1);
+    MetadataService up(r1.get(), 1);
+    up.configure({TopicSpec{0, 1, 3, "", "t"}}, all);
+    up.setClusterMembers(all);
+    drive(up, 50);
+    ASSERT_TRUE(up.controllerCaughtUpForTest());
+    auto reg = [&](int32_t node, int64_t inc, int16_t level) {
+        auto m = nodeControl(node, inc, false);
+        m.isr[AlterIsrMsg::kNodeFeatureLevelSlot] = level;
+        (void)up.onAlterIsr(m);
+    };
+    const auto leo0 = r1->logEndOffset();
+    reg(2, 11, MetadataFeature::kLatest);
+    reg(3, 21, MetadataFeature::kBase);                        // node 3 still runs the older binary
+    drive(up, 50);
+    EXPECT_EQ(up.featureLevel(), MetadataFeature::kBase) << "raised while a member is an older binary";
+    EXPECT_EQ(r1->logEndOffset(), leo0);
+    reg(3, 22, MetadataFeature::kLatest);                      // node 3 restarted upgraded
+    drive(up, 50);
+    EXPECT_EQ(up.featureLevel(), MetadataFeature::kLatest) << "never raised once every member supports it";
+    EXPECT_EQ(r1->logEndOffset(), leo0 + 1) << "exactly one FeatureLevelRecord";
+    reg(3, 23, MetadataFeature::kBase);                        // a downgrade attempt: monotonic
+    drive(up, 50);
+    EXPECT_EQ(up.featureLevel(), MetadataFeature::kLatest);
+}
+
+// D15 re-review MAJOR (m3): while one member of a co-partition unit is HELD
+// leaderless (an empty memory leader, no clean candidate, survivor election
+// off), a sibling whose live leader dies must still fail over normally — the
+// balancer filter may hold back only the leaderless member's record.
+TEST(D15MemoryEpochRegression, HeldUnitMemberNeverBlocksSiblingFailoverRegression) {
+    CtlRig c(true, {TopicSpec{0, 1, 3, "g", "k"}, TopicSpec{1, 1, 3, "g", "k"}});
+    const int32_t L = c.svc->assignment(0, 0)->leaderNode;
+    ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, L);
+    const int32_t A = L == 1 ? 2 : 1, B = 6 - L - A;
+    {   // topic 0 (memory): ISR {L, A}
+        const PartitionAssignment a = *c.svc->assignment(0, 0);
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = 0; m.partition = 0; m.leaderId = L; m.leaderEpoch = a.leaderEpoch;
+        m.isrCount = 2; m.isr[0] = L; m.isr[1] = A; m.partitionEpoch = a.partitionEpoch;
+        ASSERT_TRUE(c.svc->onAlterIsr(m));
+        c.drive(50);
+    }
+    (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(0, 0), 0, 2, /*memory=*/true));
+    (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(1, 0), 1, 2, /*memory=*/false, /*leo=*/5));
+    c.tick({L});   // A, B not live: topic 0 goes leaderless, topic 1 stays with L
+    ASSERT_EQ(c.svc->assignment(0, 0)->leaderNode, NO_LEADER);
+    ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, L);
+    const int32_t e0 = c.svc->assignment(0, 0)->leaderEpoch;
+    (void)c.svc->onAlterIsr(reportOf(0, L, e0, 0, 2));
+    (void)c.svc->onAlterIsr(reportOf(0, A, e0, 0, 1));
+    (void)c.svc->onAlterIsr(reportOf(0, B, e0, 10, 1));   // non-ISR holds more: no clean candidate
+    c.tick({A, B});   // L dies
+    c.tick({A, B});
+    EXPECT_EQ(c.svc->assignment(0, 0)->leaderNode, NO_LEADER) << "the held member was elected uncleanly";
+    EXPECT_EQ(c.svc->assignment(1, 0)->leaderNode, A)
+        << "the sibling's dead leader was never failed over while a unit member is held";
 }
