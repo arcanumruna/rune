@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace rune::node {
 
@@ -42,11 +43,17 @@ static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::SessionSignal) ==
     return sbe::MessageHeader::encodedLength() + sbe::WorkerReturn::computeLength(ret.chunk.size());
 }
 
-/// SBE wrap-in-place encode of `ret` into [buf, buf+n).  `n` must be at least
-/// workerReturnEncodedLength(ret).  No intermediate struct, no memcpy of scalars.
-inline void encodeWorkerReturnSbe(char* buf, std::size_t n, const WorkerReturn& ret) {
+/// Bytes one WorkerReturn with a `chunkLen`-byte chunk occupies in a ring slot.
+[[nodiscard]] inline std::size_t workerReturnEncodedLength(std::size_t chunkLen) noexcept {
     namespace sbe = rune::protocol::internal::sbe;
-    sbe::WorkerReturn enc;
+    return sbe::MessageHeader::encodedLength() + sbe::WorkerReturn::computeLength(chunkLen);
+}
+
+/// Header + fixed block of `ret` (every scalar), wrap-in-place.  The encoder is
+/// left positioned at the chunk's var-data length field.
+inline void encodeWorkerReturnHead(rune::protocol::internal::sbe::WorkerReturn& enc, char* buf,
+                                   std::size_t n, const WorkerReturn& ret) {
+    namespace sbe = rune::protocol::internal::sbe;
     enc.wrapAndApplyHeader(buf, 0, n);
     enc.returnType(static_cast<sbe::ReturnType::Value>(static_cast<std::uint8_t>(ret.type)))
        .sessionId(ret.sessionId)
@@ -74,8 +81,44 @@ inline void encodeWorkerReturnSbe(char* buf, std::size_t n, const WorkerReturn& 
        .groupCarrierReceived(ret.groupCarrierReceived ? 1 : 0)
        .targetReplicaId(ret.targetReplicaId)
        .incarnation(ret.incarnation);
+}
+
+/// SBE wrap-in-place encode of `ret` into [buf, buf+n).  `n` must be at least
+/// workerReturnEncodedLength(ret).  No intermediate struct, no memcpy of scalars.
+inline void encodeWorkerReturnSbe(char* buf, std::size_t n, const WorkerReturn& ret) {
+    namespace sbe = rune::protocol::internal::sbe;
+    sbe::WorkerReturn enc;
+    encodeWorkerReturnHead(enc, buf, n, ret);
     enc.putChunk(reinterpret_cast<const char*>(ret.chunk.data()),
                  static_cast<std::uint32_t>(ret.chunk.size()));
+}
+
+/// One contiguous piece of a gathered chunk (a run of whole record batches in
+/// a segment's read mmap).
+struct ChunkRun {
+    const std::uint8_t* data = nullptr;
+    std::uint32_t       len  = 0;
+};
+
+/// F5 (hot-path B): encode `ret` with a chunk GATHERED from `runs` (total
+/// `total` bytes) straight into the claimed slot [buf, buf+n) — the ONLY copy
+/// of the bytes between the log's read mmap and the consumer thread (no
+/// intermediate vector).  `ret.chunk` is ignored.  `n` must be at least
+/// workerReturnEncodedLength(total).
+inline void encodeWorkerReturnGather(char* buf, std::size_t n, const WorkerReturn& ret,
+                                     const ChunkRun* runs, std::size_t nRuns, std::uint32_t total) {
+    namespace sbe = rune::protocol::internal::sbe;
+    sbe::WorkerReturn enc;
+    encodeWorkerReturnHead(enc, buf, n, ret);
+    const std::uint64_t lenPos = enc.sbePosition();
+    const std::uint32_t lenLe  = SBE_LITTLE_ENDIAN_ENCODE_32(total);
+    std::memcpy(buf + lenPos, &lenLe, sizeof lenLe);
+    std::uint64_t pos = lenPos + sizeof lenLe;
+    for (std::size_t i = 0; i < nRuns; ++i) {
+        std::memcpy(buf + pos, runs[i].data, runs[i].len);
+        pos += runs[i].len;
+    }
+    enc.sbePosition(pos);
 }
 
 // ---------------------------------------------------------------------------

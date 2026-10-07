@@ -455,7 +455,8 @@ void BrokerNode::start() {
             {kProvisionBuildFailuresCounterTypeId, "build-failures"},
             {kProvisionRollHoldsCounterTypeId, "roll-holds"},
             {kProvisionUnpreallocCounterTypeId, "unpreallocated-builds"},
-            {kProvisionParkedDroppedCounterTypeId, "parked-demands-dropped"}};
+            {kProvisionParkedDroppedCounterTypeId, "parked-demands-dropped"},
+            {kProvisionReadMapFailuresCounterTypeId, "read-map-failures"}};
         for (std::size_t i = 0; i < provCounterRegIds_.size(); ++i)
             provCounterRegIds_[i] = aeron_->addCounter(kProvCounters[i].first, key, kRoleKeyLength,
                                                        provisionMetricLabel(kProvCounters[i].second, config_.nodeId));

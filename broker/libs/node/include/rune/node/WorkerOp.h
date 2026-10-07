@@ -38,6 +38,7 @@
 #include <rune/replication/ReplicationMessages.h>  // FetchResponseMsg
 #include <rune/node/SessionSignalKind.h>
 #include <rune/storage/Log.h>
+
 #include <rune_protocol_internal_sbe/MessageHeader.h>
 #include <rune_protocol_internal_sbe/WorkerOp.h>
 
@@ -469,8 +470,19 @@ struct WorkerReturn {
     bool    isGroup        = false;
     bool    groupCarrierReceived = false;
 
-    // The data chunk returned by log->read().  Moved out of the worker.
+    // The data chunk (owned).  The worker encodes PushRead chunks straight from
+    // the log's read mmap into the return ring (F5) and never fills this for
+    // them; it carries the other returns' payloads (StorageFailure dir, refused
+    // marker) and the chunk of a copy-mode drain (Worker::drainReturn).
     std::vector<uint8_t> chunk;
+    // F5: a ZERO-COPY view of the chunk in the return ring, set by a view-mode
+    // drain (Worker::drainReturnView) instead of copying into `chunk`.  Valid
+    // ONLY inside that drain's callback — never stored, never encoded.
+    std::span<const uint8_t> chunkView;
+    /// The chunk bytes, whichever carrier holds them.
+    [[nodiscard]] std::span<const uint8_t> chunkBytes() const noexcept {
+        return chunkView.data() != nullptr ? chunkView : std::span<const uint8_t>(chunk);
+    }
 
     // -----------------------------------------------------------------------
     // F15 S4 (addendum R-3): a PushReadResult echoes the bound the OWNING

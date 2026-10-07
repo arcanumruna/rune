@@ -240,6 +240,10 @@ public:
     /// readView() calls on this log (single-owner counter; F18 B-2 proves a
     /// fetch costs exactly one lookup and a conflated duplicate none).
     [[nodiscard]] uint64_t readViewCallsForTest() const noexcept { return readViewCalls_; }
+    /// Hot-path B F5: on-demand read-map creations / remaps of the ACTIVE segment.
+    [[nodiscard]] uint64_t activeReadMapRemapsForTest() const noexcept {
+        return segments_.empty() ? 0 : segments_.rbegin()->second->readMapRemaps();
+    }
     /// E2 crash-simulation seam: {segment .log path, bytes made durable by the
     /// last inline sync in this incarnation (-1 = none)} for every installed
     /// segment.  A DR harness truncates each file to its durable extent to
@@ -409,6 +413,67 @@ public:
     bool noteFlushCompleted(LogSegment* seg, int64_t upTo) noexcept;
     /// Persist R now, inline (cold paths).  0 or the errno (fail-stop).
     int checkpointRecoveryPoint() noexcept;
+    /// Hot-path B F7 (worker-driven logs, deferSealSync): E1d F6 requires the
+    /// on-disk recovery point <= the truncation's resulting LEO before
+    /// truncateTo touches any file.  Instead of truncateTo's inline write +
+    /// fdatasync on the worker, the owner's io backend writes the lowered value
+    /// first: true = already durable (truncateTo writes nothing inline); false
+    /// = a lowering checkpoint is due / in flight (takeCheckpointKick() queues
+    /// it on the owner) — retry next pass (FollowerSync TruncatePending).  Once
+    /// armed, R never advances above the cut until the truncation ran or was
+    /// abandoned (cancelColdPathWait).  Inline-sync logs: always true.
+    bool prepareTruncationTo(int64_t x) noexcept;
+    /// Owner: a lowering checkpoint became due outside a completion (once).
+    [[nodiscard]] bool takeCheckpointKick() noexcept { const bool k = rpKick_; rpKick_ = false; return k; }
+    /// Review C1 (Kafka: the leader-epoch checkpoint is flushed before the
+    /// recovery point advances): the owner's replica caps R at the lowest
+    /// offset whose epoch history is not yet durable (INT64_MAX = none).
+    /// Raising it may let R advance (a checkpoint kick follows).  Owner thread.
+    void setEpochHistoryCap(int64_t c) noexcept;
+    /// Review C1: before recover() — recovery keeps the persisted recovery
+    /// point at the startup value (never raises it to the recovered LEO) until
+    /// the epoch-history owner lifts the cap (setEpochHistoryCap).  Automatic
+    /// for a directory that holds a replica's epoch history
+    /// (leader-epoch-state / leader-epoch-checkpoint): its PartitionReplica
+    /// lifts it once the reconciled history is durable.
+    void setEpochHistoryGuard(bool on) noexcept { epochGuard_ = on; }
+    /// The recovery point recovery started from (persisted value, or the
+    /// upgrade default) — the replica re-derives epoch history from here.
+    /// kRecoveryPointUnknown before recover().
+    [[nodiscard]] int64_t startupRecoveryPoint() const noexcept { return startupRp_; }
+    [[nodiscard]] int64_t epochHistoryCapForTest() const noexcept { return rpEpochCap_; }
+    [[nodiscard]] uint64_t asyncTruncationLoweringsForTest() const noexcept { return rpLowerings_; }
+    [[nodiscard]] uint64_t inPlaceTruncationsForTest() const noexcept { return inPlaceTruncations_; }
+    /// Review Md5 — provisioner thread: hand a read mapping built for this
+    /// log's outstanding growth request back to the owner.  false = ring full
+    /// (the caller destroys it; the owner re-requests).
+    [[nodiscard]] bool offerReadMap(MappedFile* m, int64_t packedRequest) noexcept {
+        // Re-review N2: the answer carries the request's identity (its seq).
+        return mapRing_.offer(kMapGrownMsg, static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(m)),
+                              requestSeq(packedRequest));
+    }
+    [[nodiscard]] bool offerReadMapFailure(int err, int64_t packedRequest) noexcept {
+        return mapRing_.offer(kMapFailedMsg, (static_cast<int64_t>(err) << 32) | requestSeq(packedRequest), 0);
+    }
+    /// Re-review N2: a growth request packs (dup'd fd : 24 | MiB : 20 | seq : 19).
+    [[nodiscard]] static int64_t packRequest(int fd, int64_t mib, int64_t seq) noexcept {
+        return (static_cast<int64_t>(fd) & 0xFFFFFF) | ((mib & 0xFFFFF) << 24) | ((seq & 0x7FFFF) << 44);
+    }
+    [[nodiscard]] static int requestFd(int64_t p) noexcept { return static_cast<int>(p & 0xFFFFFF); }
+    [[nodiscard]] static int64_t requestMiB(int64_t p) noexcept { return (p >> 24) & 0xFFFFF; }
+    [[nodiscard]] static int64_t requestSeq(int64_t p) noexcept { return (p >> 44) & 0x7FFFF; }
+    [[nodiscard]] uint64_t readMapsDiscardedForTest() const noexcept { return readMapsDiscarded_; }
+    [[nodiscard]] uint64_t ownerFallbackRemapsForTest() const noexcept { return ownerFallbackRemaps_; }
+    /// Tests (re-review N2): force the count-based re-request on the next need.
+    void expireReadMapRequestForTest() noexcept { growWaits_ = 1u << 30; }
+    [[nodiscard]] uint64_t readMapGrowthsForTest() const noexcept { return readMapGrowths_; }
+    [[nodiscard]] uint64_t readMapGrowthFailuresForTest() const noexcept { return readMapGrowthFailures_; }
+    /// Cleaner-thread fsyncs / directory fsyncs (retention log-start
+    /// checkpoints, posted renames).  Read only after the cleaner stopped.
+    [[nodiscard]] uint64_t cleanerFsyncsForTest() const noexcept { return cleanerFsyncs_; }
+    [[nodiscard]] uint64_t cleanerDirFsyncsForTest() const noexcept { return cleanerDirFsyncs_; }
+    /// Directory mutations (create / rename / unlink) since construction.
+    [[nodiscard]] uint64_t directoryMutationsForTest() const noexcept { return dirMutGen_; }
 
     // Async checkpoint (owning worker, through its io backend):
     //   Idle --prepare--> Prepared --submitted--> InFlight --completed--> Idle
@@ -418,7 +483,7 @@ public:
     /// R crossed a segment boundary since the last persist and no checkpoint is
     /// in progress (O(1)).
     [[nodiscard]] bool recoveryCheckpointDue() const noexcept {
-        return rpDue_ && rp_.stage == RpStage::Idle && recovered_ && rpFd_ >= 0 &&
+        return (rpDue_ || rpLowerDue_) && rp_.stage == RpStage::Idle && recovered_ && rpFd_ >= 0 &&
                storage_.failedErrno == 0;
     }
     /// The write the owner submits: `len` bytes of `data` at `offset` of `fd`,
@@ -492,6 +557,9 @@ public:
     /// performed every posted file operation — retry on a later duty pass (the
     /// replica parks in FollowerSync::TruncatePending; never waits).
     [[nodiscard]] bool truncateTo(int64_t truncateOffset);
+private:
+    bool truncateTo_(int64_t truncateOffset);
+public:
     std::vector<int64_t> segmentBaseOffsets() const;
     /// F15 S4 (I-C): the base offset of the first segment whose base is
     /// strictly above `offset`, or -1 if none.  Non-allocating, O(log segments);
@@ -691,7 +759,10 @@ public:
     /// owner's drains post nothing until it runs or is cancelled.
     [[nodiscard]] bool tryBeginColdPath() noexcept { return beginColdPath_(INT64_MIN); }
     /// Owner: a deferred cold path was abandoned (role change) — resume posting.
-    void cancelColdPathWait() noexcept { pauseSwapPost_ = pauseDropPost_ = false; }
+    void cancelColdPathWait() noexcept {
+        pauseSwapPost_ = pauseDropPost_ = false;
+        clearTruncationCap_();   // hot-path B F7: an abandoned truncation releases R
+    }
     /// Cleaner thread: posted operations not yet performed (a compaction pass
     /// must not start on this log before they are — fix round 5).
     [[nodiscard]] bool cleanerFileOpsPending() const noexcept;
@@ -764,6 +835,11 @@ public:
     struct ProvisionHook {
         bool (*fn)(void* ctx, Log* log, ProvisionDemand kind) noexcept = nullptr;
         void* ctx = nullptr;
+        /// Review Md5 (optional): build a `mib` MiB read mapping of `fd` (a dup
+        /// the callee owns) off the owner and hand it back (offerReadMap).
+        bool (*growFn)(void* ctx, Log* log, int64_t packedRequest) noexcept = nullptr;
+        /// Review Md5 (optional): destroy a retired read mapping off the owner.
+        bool (*disposeFn)(void* ctx, void* map) noexcept = nullptr;
     };
     /// Owner (before the log is driven): this log is served by a provisioning
     /// thread.  `thresholdPct` (1..100): fill level of the active segment at
@@ -772,6 +848,8 @@ public:
     void setProvisioning(ProvisionHook hook, int thresholdPct = 50) noexcept {
         provisioned_ = true;
         provisionHook_ = hook;
+        asyncReadGrowth_ = hook.growFn != nullptr && hook.disposeFn != nullptr;
+
         const int pct = thresholdPct < 1 ? 1 : (thresholdPct > 100 ? 100 : thresholdPct);
         provisionThresholdBytes_ = rollBytes_ / 100 * pct + (rollBytes_ % 100) * pct / 100;
     }
@@ -932,6 +1010,34 @@ private:
     /// by a confirmed durable write with a higher seq.
     int64_t rpUnconfirmedMax_ = kRecoveryPointUnknown;
     bool    rpDue_         = false;   ///< R crossed a segment boundary since the last persist
+    /// Hot-path B F7: a truncation to rpTruncCap_ waits for the on-disk R to be
+    /// lowered to it (async, the owner's io backend).  INT64_MAX = none.
+    int64_t rpTruncCap_    = INT64_MAX;
+    int64_t rpEpochCap_    = INT64_MAX;   ///< review C1: see setEpochHistoryCap
+    bool    epochGuard_    = false;       ///< review C1: see setEpochHistoryGuard
+    int64_t startupRp_     = -1;          ///< see startupRecoveryPoint
+    int64_t rpGuardTarget_ = -1;          ///< the recovered R held back by the guard
+    bool    rpLowerDue_    = false;   ///< the on-disk R (upper bound) exceeds the truncation cap
+    bool    rpKick_        = false;   ///< see takeCheckpointKick
+    uint64_t rpLowerings_  = 0;
+    uint64_t inPlaceTruncations_ = 0;
+    // ---- review Md5: off-owner read-map growth (owner fields) -------------
+    using MapRing = rune::consensus::ControlRing<256>;
+    static constexpr std::int32_t kMapGrownMsg = 1, kMapFailedMsg = 2;
+    MapRing  mapRing_;                    ///< provisioner → owner: grown mappings
+    bool     asyncReadGrowth_ = false;
+    bool     growOutstanding_ = false;
+    int64_t  growBase_ = -1;
+    uint64_t growGen_ = 0;
+    uint32_t growWaits_ = 0;
+    uint64_t readMapGrowths_ = 0, readMapGrowthFailures_ = 0, readMapsDiscarded_ = 0, ownerFallbackRemaps_ = 0;
+    int64_t  growSeq_ = 0;   ///< re-review N2: the outstanding request's identity
+    /// Owner: request a larger mapping for `seg` (keyed `base`) when it needs one.
+    void maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept;
+    /// Owner: install grown mappings handed back by the provisioner.
+    void pollReadMaps_() noexcept;
+    uint64_t cleanerFsyncs_ = 0, cleanerDirFsyncs_ = 0;   ///< cleaner thread (see cleanerFsyncsForTest)
+    void clearTruncationCap_() noexcept { rpTruncCap_ = INT64_MAX; rpLowerDue_ = false; }
     uint64_t rpPersists_   = 0;
     uint64_t rpSeq_        = 0;       ///< highest slot seq ever written (or read)
     int      rpActiveSlot_ = -1;      ///< the slot holding persistedRp_ (-1 = none)

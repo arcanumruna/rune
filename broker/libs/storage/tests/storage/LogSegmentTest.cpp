@@ -874,3 +874,20 @@ TEST(LogSegmentRegression, OpenFailureThrowsNotSilentNoSync) {
 
     std::filesystem::remove_all(dir);
 }
+
+// Re-review-2 medium (hot-path B): a segment whose logical end is past its last
+// surviving batch (compaction removed the tail) truncated exactly at that end
+// cuts nothing — it must succeed, not fail-stop the log (availability).
+TEST(LogSegmentRegression, InPlaceTruncateAtCompactedTailEndCutsNothingRegression) {
+    auto dir = makeTempDir("rune_seg_ctail");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    LogSegment seg(dir.string(), 0);
+    RecordBatchBuilder b0(0, 1000); b0.append("k", "v0", 1000);
+    ASSERT_EQ(seg.append(b0.build(), 9), 10);   // logical end 10, last batch ends at 0
+    const int64_t sizeBefore = seg.sizeBytes();
+    int64_t keptMaxTs = 0;
+    EXPECT_EQ(seg.truncateInPlace(10, keptMaxTs), 0) << "a no-op truncation at the compacted tail end failed the log";
+    EXPECT_EQ(seg.nextOffset(), 10);
+    EXPECT_EQ(seg.sizeBytes(), sizeBefore) << "nothing may be cut";
+    std::filesystem::remove_all(dir);
+}

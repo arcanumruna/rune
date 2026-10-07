@@ -648,7 +648,7 @@ public:
     /// leader is always an ISR member): every leader holds every committed
     /// record, so leadership alone is the gate.  Refusal = retriable NotLeader.
     [[nodiscard]] [[gnu::always_inline]] bool acceptsProduce() const noexcept {
-        return role_ == Role::Leader;
+        return role_ == Role::Leader && !leadPending_;
     }
     /// F15 §2.1 step 3 / §3.2: bumped by every change to the log's existing
     /// content — a tail truncation (KIP-279; formerly also a reconcile append of
@@ -923,10 +923,105 @@ public:
     /// Worker-driven user replicas (every placement, F30): the follower flush,
     /// leader append / txn-marker flushes and roll seals become requests the
     /// owning worker submits to its io backend — never an inline fsync.
+    /// Hot-path B F7: also switches the leader-epoch durability (restart fence
+    /// + epoch cache) to the two-slot `leader-epoch-state` file written by the
+    /// owning worker through its io backend (see epochStateWriteDue) — never a
+    /// synchronous fsync on the worker.  Opening / creating the file is cold
+    /// (the caller's thread; BrokerNode: the control thread at replica build).
     void setExternalFollowerFlush(bool on) noexcept {
+        // Review Md6: never switch the epoch-state writer while a write is in
+        // flight (the inline path would target the confirmed slot / race the
+        // io backend's fdatasync on the fd).  Configuration-time only.
+        if (!on && es_.stage != EsStage::Idle) [[unlikely]] {
+            assert(false && "setExternalFollowerFlush(false) with an epoch-state write in flight");
+            return;
+        }
         externalFollowerFlush_ = on;
         if (!memoryBacked_ && diskLog_ != nullptr) diskLog_->setDeferSealSync(on);
+        if (on && !memoryBacked_ && diskLog_ != nullptr && !es_.enabled) enableEpochState_();
     }
+
+    // -----------------------------------------------------------------------
+    // Hot-path B F7: async leader-epoch durability (worker-driven replicas).
+    //
+    // Every leader-epoch durability point (the restart fence before leading a
+    // new epoch, the epoch-cache checkpoint after an assign / truncation) is
+    // ONE write + fdatasync of the alternate slot of `leader-epoch-state`,
+    // submitted by the owning worker (Worker::submitEpochStateWrites_) — the
+    // recovery-point checkpoint's state machine:
+    //   Idle --prepare--> Prepared --submitted--> InFlight --completed--> Idle
+    //   (Prepared --notSubmitted--> Idle on back-pressure; still due.)
+    // Ordering is unchanged and EVENT-driven: a controller-managed
+    // becomeLeader at an epoch above the durable fence is DEFERRED (the
+    // replica keeps its previous role, applies nothing, fetches nothing) until
+    // the slot carrying the fence AND the new epoch's cache entry completed —
+    // exactly what the synchronous fsync guaranteed before.  A failed write
+    // refuses the leadership and takes the log dir offline (as before).
+    // -----------------------------------------------------------------------
+    struct EpochStateWrite { int fd = -1; const uint8_t* data = nullptr; uint32_t len = 0; int64_t offset = 0; uint64_t seq = 0; };
+    /// A change awaits its write, nothing is in flight, and the retry backoff
+    /// of a failed write (Md2) has passed.
+    [[nodiscard]] bool epochStateWriteDue() const noexcept {
+        return es_.enabled && es_.due && es_.stage == EsStage::Idle && lastKnownNowNs_ >= es_.retryNotBeforeNs;
+    }
+    /// Idle -> Prepared: encode the alternate slot into the CALLER's buffer
+    /// (review Md4: the owning worker's scratch — the bytes are copied into the
+    /// page cache by the caller's pwrite before it returns, so nothing per
+    /// replica stays resident).  `need` = the bytes required; false with
+    /// need > cap: grow the buffer and call again.  Opens the file lazily
+    /// (cold: role / epoch transitions only).
+    bool prepareEpochStateWrite(uint8_t* buf, std::size_t cap, EpochStateWrite& out, std::size_t& need);
+    /// Prepared -> InFlight.
+    void epochStateWriteSubmitted() noexcept;
+    /// Prepared -> Idle (back-pressure: still due).
+    void epochStateWriteNotSubmitted() noexcept;
+    /// InFlight, but its completion cannot be routed back (review Md3): the
+    /// outcome will never be observed — treated as not written (still due,
+    /// rewritten with a higher seq).  Never wedges a promotion.
+    void epochStateWriteNotRouted() noexcept;
+    /// InFlight completed (err = errno, 0 = ok).  Success may complete a
+    /// deferred leadership, a deferred re-fetch and lift the recovery-point
+    /// cap.  A failure is retried with backoff; kMaxEpochStateFailures in a row
+    /// fail the log (fail-stop, like any other storage failure).  Returns true
+    /// iff another write is due.
+    bool epochStateWriteCompleted(uint64_t seq, int err);
+    static constexpr int kMaxEpochStateFailures = 3;
+    /// A fresh owner holds no route for an in-flight write (its completion
+    /// went to a previous owner): outcome unknown — rewritten with a higher seq.
+    void resetEpochStateForNewOwner() noexcept;
+    /// Nothing due and nothing in flight (every change is durable).
+    [[nodiscard]] bool epochStateDurable() const noexcept {
+        return !es_.enabled || (!es_.due && es_.stage == EsStage::Idle);
+    }
+    [[nodiscard]] bool leadershipPendingForTest() const noexcept { return pendingLead_.active; }
+    [[nodiscard]] uint64_t leadershipsDeferredForTest() const noexcept { return leadershipsDeferred_; }
+    [[nodiscard]] uint64_t leadershipsResumedForTest() const noexcept { return leadershipsResumed_; }
+    [[nodiscard]] uint64_t epochStateWritesForTest() const noexcept { return es_.writes; }
+    [[nodiscard]] uint64_t epochStateInlineWritesForTest() const noexcept { return es_.inlineWrites; }
+    [[nodiscard]] uint64_t epochStateErrorsForTest() const noexcept { return es_.errors; }
+    [[nodiscard]] bool epochStateEnabledForTest() const noexcept { return es_.enabled; }
+    [[nodiscard]] bool epochStateFdOpenForTest() const noexcept { return es_.fd >= 0; }
+    [[nodiscard]] bool refetchAwaitsEpochStateForTest() const noexcept { return awaitEsFetch_; }
+    /// Tests (power-loss seam): completions of epoch-state writes are held —
+    /// the write stays InFlight (never confirmed) until released.
+    void holdEpochStateCompletionsForTest(bool on) noexcept { esHoldForTest_ = on; }
+    [[nodiscard]] bool epochStateCompletionHeldForTest() const noexcept { return esHeld_; }
+    /// Tests: the next `n` completions report `err`.
+    void failNextEpochStateCompletionsForTest(int n, int err) noexcept { esFailN_ = n; esFailErr_ = err; }
+    /// Tests (re-review N4): write the history inline now (as the outgrown-slot
+    /// re-create does).  Only while nothing is in flight.
+    bool writeEpochStateInlineForTest() noexcept { return writeEpochStateInline_(); }
+    /// Tests (re-review N6): the next `n` inline epoch-state writes fail (process-wide, single-threaded tests).
+    static void failInlineEpochStateWritesForTest(int n) noexcept { inlineFailN_ = n; }
+    /// Tests: deliver a held completion now.
+    void releaseHeldEpochStateForTest() {
+        esHoldForTest_ = false;
+        if (esHeld_) { esHeld_ = false; (void)epochStateWriteCompleted(esHeldSeq_, esHeldErr_); }
+    }
+    /// Tools / tests: the durable leader-epoch cache of `logDir` exactly as a
+    /// restart restores it (`leader-epoch-state` when present, else the legacy
+    /// `leader-epoch-checkpoint`).  False when neither holds a valid image.
+    static bool readDurableEpochCache(const std::string& logDir, rune::storage::LeaderEpochCache& out);
     [[nodiscard]] bool externalFollowerFlush() const noexcept { return externalFollowerFlush_; }
     /// Leader-epoch checkpoint writes (the one accepted synchronous disk write
     /// on a shard loop — see checkpointEpochs_).
@@ -1071,6 +1166,8 @@ public:
     /// log cleaner had posted renames pending; applies dropped meanwhile.
     [[nodiscard]] uint64_t truncatesDeferred() const noexcept { return truncatesDeferred_; }
     [[nodiscard]] uint64_t appliesDroppedTruncatePending() const noexcept { return appliesDroppedTruncatePending_; }
+    [[nodiscard]] uint64_t appliesDroppedAwaitEsForTest() const noexcept { return appliesDroppedAwaitEs_; }
+    [[nodiscard]] uint64_t appliesDroppedLeadPendingForTest() const noexcept { return appliesDroppedLeadPending_; }
     [[nodiscard]] bool     truncatePendingForTest() const noexcept { return followerSync_.truncatePending(); }
 private:
     uint64_t truncatesDeferred_ = 0;
@@ -1163,6 +1260,11 @@ private:
     // -----------------------------------------------------------------------
     PartitionConfig      cfg_;
     Role                 role_;
+    /// Hot-path B F7: a leadership at a newer epoch awaits its durable fence
+    /// (mirrors pendingLead_.active; next to role_ — same line as the produce
+    /// gate's load).  A sitting leader being re-elected refuses produce
+    /// (retriable NotLeader) until it leads at the new epoch, as before.
+    bool                 leadPending_ = false;
     Epoch                epoch_;
     NodeId               leaderId_;           ///< (follower) leader's NodeId; -1 if unknown
 
@@ -1289,7 +1391,72 @@ private:
     Offset   lastTruncationOffset_ = 0;    ///< F15: cut point of the last generation bump
     uint64_t leadershipGeneration_ = 0;    ///< F15 S4: bumped on every Leader <-> Follower transition
     uint64_t epochCheckpointWrites_ = 0;   ///< see checkpointEpochs_
-    void checkpointEpochs_();
+    static constexpr Offset kChangedFromLatest = INT64_MIN;
+    void checkpointEpochs_(Offset changedFrom = kChangedFromLatest);
+    // Hot-path B F7: async leader-epoch durability (see epochStateWriteDue).
+    enum class EsStage : uint8_t { Idle, Prepared, InFlight };
+    struct EpochStateIo {
+        bool        enabled = false;    ///< leader-epoch-state is the authoritative copy
+        int         fd = -1;            ///< open only while a write is due / in flight (review Md4)
+        std::size_t stride = 0;         ///< slot stride (file size / 2)
+        int         activeSlot = -1;    ///< slot of the newest CONFIRMED image (-1: none)
+        uint64_t    seq = 0;            ///< last sequence used
+        EsStage     stage = EsStage::Idle;
+        bool        due = false;        ///< a change awaits its write
+        int         inflightSlot = -1;
+        uint64_t    inflightSeq = 0;
+        Epoch       inflightFence = -1;
+        uint64_t    inflightLeadGen = 0;   ///< pendingLead_.gen the in-flight image carried (0: none)
+        uint64_t    confirmedLeadGen = 0;  ///< same, of the newest confirmed image
+        Epoch       fenceTarget = -1;   ///< the fence the next image carries (>= fencePersisted_)
+        // Review C1: the lowest log offset whose epoch history is changed but
+        // not yet durable — pending (not yet in an image) / in flight.  The
+        // log's recovery point never passes min(pendingMin, inflightMin).
+        int64_t     pendingMin = INT64_MAX;
+        int64_t     inflightMin = INT64_MAX;
+        int         failures = 0;       ///< consecutive failed writes (Md2)
+        int64_t     retryNotBeforeNs = 0;
+        uint64_t    writes = 0, inlineWrites = 0, errors = 0, recreates = 0, notRouted = 0;
+    };
+    EpochStateIo es_;
+    /// A controller-managed leadership waiting for its durable fence.
+    struct PendingLeadership {
+        bool                active = false;
+        uint64_t            gen = 0;           ///< identifies this deferral (images carrying it)
+        Epoch               epoch = -1;
+        std::vector<NodeId> isr;
+        int32_t             partitionEpoch = -1;
+        Offset              leo = -1;          ///< LEO the image's new-epoch entry starts at
+    };
+    PendingLeadership pendingLead_;
+    bool resumingLead_ = false;                ///< becomeLeader re-entered from the completion
+    uint64_t leadGenSeq_ = 0;
+    void enableEpochState_() noexcept;
+    bool writeEpochStateInline_() noexcept;
+    bool openEpochStateFd_() noexcept;
+    void closeEpochStateFdIfIdle_() noexcept;
+    /// Review C1: the epoch history from `x` on changed (not yet durable).
+    void noteEpochChange_(Offset x) noexcept;
+    void pushEpochCap_() noexcept;
+    /// Review C1 (b), Kafka recovery: entries at/above the recovery point are
+    /// re-derived from the batches' stamped epochs (stale ones dropped,
+    /// missing ones assigned).  Cold, construction only.
+    void reconcileEpochCacheWithLog_();
+    /// Encode the image the next write carries (cache [+ pending leadership's
+    /// entry]) into buf (>= LeaderEpochState::imageBytes(n)).
+    std::size_t encodeEpochImage_(uint8_t* buf, uint64_t seq, Epoch fence) const noexcept;
+    [[nodiscard]] std::size_t epochImageEntries_() const noexcept;
+    bool awaitEsFetch_ = false;        ///< C1: a divergence truncation's re-fetch waits for its durable history
+    bool esHoldForTest_ = false;
+    int  esFailN_ = 0, esFailErr_ = 0;
+    static inline int inlineFailN_ = 0;
+    uint64_t esHeldSeq_ = 0;  int esHeldErr_ = 0;  bool esHeld_ = false;
+    uint64_t appliesDroppedAwaitEs_ = 0;
+    void cancelPendingLeadership_() noexcept;
+    void completePendingLeadershipIfDurable_();
+    void onHistoryDurable_();
+    void deferLeadership_(Epoch newEpoch, std::vector<NodeId> isr, int32_t partitionEpoch);
+    uint64_t leadershipsDeferred_ = 0, leadershipsResumed_ = 0, appliesDroppedLeadPending_ = 0;
     bool followerFlushRequested_ = false;  ///< raised by doWork, consumed by the worker
     // Per-second rate counters (RUNE_FS_LOG diagnostic) to localise the acks=all
     // throughput bottleneck: appends (LEO growth), applies (follower push-apply),

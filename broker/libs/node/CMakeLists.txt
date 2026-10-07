@@ -791,6 +791,19 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_duty_pass_latency_gate_tests
         PROPERTIES TIMEOUT 1800 RUN_SERIAL TRUE)
 
+    # Hot-path B (2026-10-05): deterministic regressions behind the latency-gate
+    # findings F5 / F7 / F8 (PushRead zero-copy + per-pass bound, async epoch
+    # durability, TruncatePending pass cost).  No Aeron required.
+    add_executable(rune_hotpath_b_regression_tests
+        tests/integration/HotPathBRegressionTest.cpp)
+    target_link_libraries(rune_hotpath_b_regression_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        rune_transaction
+        GTest::gtest_main)
+    gtest_discover_tests(rune_hotpath_b_regression_tests)
+
     # ---------------------------------------------------------------------------
     # CP-9: RetentionCleanerAgent integration tests — separate cleaner-cadence
     #   retention: time (largestTimestamp), size, log-start-offset; async delete

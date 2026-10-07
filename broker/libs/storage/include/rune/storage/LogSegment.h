@@ -64,7 +64,7 @@ public:
     ///   retained sealed segments no longer cost N read mmaps + N fds up front.
     LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes = 4096,
                int32_t indexMaxBytes = 8 * 1024 * 1024, bool prefaultIndex = false,
-               bool eagerReadMap = false);
+               bool eagerReadMap = false, std::size_t readMapBytes = 0);
     ~LogSegment();
     /// Raw-pointer overload — avoids heap allocation on the produce hot path.
     /// [data, data+len) must be a valid record batch.  Returns nextOffset.
@@ -187,7 +187,19 @@ public:
     /// readView (F3): a failed lazy map returns an empty view.
     LogReadView mappedBytes() noexcept;
 
-    int64_t recover();
+    /// `syncIndex` = false (hot-path B F7, a worker-driven log's truncation):
+    /// the rebuilt index is renamed into place without msync / directory fsync
+    /// (the owner gates R on an async directory fsync instead).
+    int64_t recover(bool syncIndex = true);
+    /// Hot-path B review M2: truncate THIS (active) segment in place at the
+    /// batch holding `truncateOffset` (rounded down, as truncateTo): one
+    /// ftruncate of the open fd, the index entries past the cut zeroed in its
+    /// mapping, the cursors rewound.  No new file, no rename, no directory
+    /// change (so no directory fsync), no file read (header walk over the read
+    /// mapping).  `keptMaxTs` = the kept prefix's max timestamp (ms).
+    /// 0 = done; > 0 = errno (ftruncate failed — nothing changed); -1 = not
+    /// applicable (no read mapping): the caller rebuilds the segment.
+    int truncateInPlace(int64_t truncateOffset, int64_t& keptMaxTs) noexcept;
     /// Fix round 3 (O(1) owner-thread install): adopt a SEALED segment whose
     /// .log and .index were built, CRC-verified and fsynced by the cleaner
     /// thread — no re-read, no CRC, no index rebuild, no fsync.  `nextOffset`
@@ -282,7 +294,25 @@ public:
                                                     int32_t indexMaxBytes);
     static std::unique_ptr<LogSegment> prepareStaging(
         const std::string& stagingLogPath, const std::string& stagingIndexPath,
-        int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes);
+        int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes,
+        std::size_t readMapBytes = 0);
+    /// Hot-path B F5 + review Md5: the read mapping a segment that grows to
+    /// `rollBytes` ends with — page-rounded rollBytes + one maximal batch (never
+    /// a power of two).  Segments start with kReadMapMinBytes (an idle
+    /// partition costs 1 MiB of address space) and a provisioned log grows the
+    /// mapping OFF the owner (SegmentProvisionerAgent; Log::readView never
+    /// remaps on the owner — a munmap + mmap of tens of MiB measured 100-260 us
+    /// on the worker).
+    [[nodiscard]] static std::size_t readMapBytesFor(int64_t rollBytes) noexcept;
+    static constexpr std::size_t kReadMapSlackBytes = 1u << 20;
+    /// Bytes currently mapped for readView.
+    [[nodiscard]] std::size_t readMapBytes() const noexcept { return readMapSize_; }
+    /// false: readView serves only the mapped prefix and never (re)maps on the
+    /// caller's thread once a mapping exists (the owner of a provisioned log).
+    void setOwnerRemap(bool on) noexcept { ownerRemap_ = on; }
+    /// Install a larger mapping built off-thread; returns the previous one (to
+    /// be destroyed off-thread).  Owner thread.
+    std::unique_ptr<MappedFile> swapReadMap(std::unique_ptr<MappedFile> m) noexcept;
 
     /// The staging sequence number this segment was pre-provisioned under (so the
     /// append thread can tell the background thread which staging files to rename
@@ -319,6 +349,10 @@ public:
     /// (ensureReadMap() returned false), e.g. because the backing file is gone
     /// or the map/open syscall failed.  Monotonically increasing; never reset.
     [[nodiscard]] uint64_t readMapFailures() const noexcept { return readMapFailures_; }
+    /// Hot-path B F5: read mappings created / grown on demand by readView (the
+    /// caller's thread — the owner's, for a push / fetch).  0 for a segment
+    /// created whole-segment-mapped and never outgrowing it.
+    [[nodiscard]] uint64_t readMapRemaps() const noexcept { return readMapRemaps_; }
 
     /// Update the in-memory .log path after the background thread renamed the
     /// staging file to its final <base>.log on disk (append thread only).  The
@@ -349,7 +383,7 @@ private:
     std::unique_ptr<MappedFile> makeReadMap_(std::size_t bytes);   // D3b r2: through fd_, never by path
     bool ensureReadMap() noexcept;
     /// Eagerly create the read mapping at segment construction (off the hot path).
-    void openReadMap() noexcept;
+    void openReadMap(std::size_t bytes = 0) noexcept;
     int64_t baseOffset_; int32_t indexIntervalBytes_;
     int32_t indexMaxBytes_;   // right-sized initial .index mmap size (grows on demand)
     std::string logPath_; std::fstream log_;
@@ -377,6 +411,8 @@ private:
     std::size_t readMapSize_ = 0;   // bytes currently mapped by readMap_ (>= logSize_ headroom)
     static constexpr std::size_t kReadMapMinBytes = 1u << 20;   // first read mapping: 1 MiB
     bool     readMapFaultForTest_ = false;   // D3b r2 test seam (setReadMapFaultForTest)
+    uint64_t readMapRemaps_ = 0;
+    bool     ownerRemap_ = true;
     uint64_t readMapFailures_ = 0;  // count of failed ensureReadMap() calls — see readMapFailures()
 };
 

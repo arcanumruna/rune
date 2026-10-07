@@ -1,4 +1,5 @@
 #include <rune/storage/LogSegment.h>
+#include <rune/storage/Timestamps.h>
 #include <rune/protocol/RecordBatch.h>
 #include <algorithm>
 #include <fcntl.h>
@@ -61,7 +62,7 @@ std::unique_ptr<LogSegment> LogSegment::openPrebuilt(
 
 std::unique_ptr<LogSegment> LogSegment::prepareStaging(
     const std::string& stagingLogPath, const std::string& stagingIndexPath,
-    int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes) {
+    int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes, std::size_t readMapBytes) {
     // Construct at provisional base 0.  All the expensive syscalls (2 open()s for
     // the .log fstream+fd, 1 open() + ftruncate + mmap + prefault for the .index)
     // happen HERE, on the background thread.  The staging files use non-.log/.index
@@ -97,7 +98,7 @@ std::unique_ptr<LogSegment> LogSegment::prepareStaging(
     // Right-sized index, PREFAULTED so the append/roll hot path never faults it.
     seg->index_ = std::make_unique<OffsetIndex>(idxPath, /*base*/0, indexMaxBytes,
                                                 /*prefault*/true);
-    seg->openReadMap();   // background thread: the read mapping is ready at adopt
+    seg->openReadMap(readMapBytes);   // background thread: the read mapping is ready at adopt — whole-segment sized (F5)
     return seg;
 }
 
@@ -134,7 +135,8 @@ void LogSegment::setCanonicalLogPath(const std::string& dir, int64_t base) noexc
 }
 
 LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexIntervalBytes,
-                       int32_t indexMaxBytes, bool prefaultIndex, bool eagerReadMap)
+                       int32_t indexMaxBytes, bool prefaultIndex, bool eagerReadMap,
+                       std::size_t readMapBytes)
     : baseOffset_(baseOffset), indexIntervalBytes_(indexIntervalBytes),
       indexMaxBytes_(indexMaxBytes), nextOffset_(baseOffset), durableNext_(baseOffset) {
     logPath_ = fname(dir, baseOffset, ".log");
@@ -172,7 +174,7 @@ LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexInterva
     // see MappedFile).  A sealed segment recovered from disk (eagerReadMap ==
     // false, the default) maps lazily on its first readView(): N retained
     // segments no longer means N eager read mmaps kept forever.
-    if (eagerReadMap) openReadMap();
+    if (eagerReadMap) openReadMap(readMapBytes);
 }
 
 // D3b fix round 2: the read mapping is ALWAYS made through this segment's own
@@ -188,14 +190,27 @@ std::unique_ptr<MappedFile> LogSegment::makeReadMap_(std::size_t bytes) {
     return std::make_unique<MappedFile>(logPath_, bytes, /*writable*/false);   // unreachable: ctor throws on fd_ < 0
 }
 
-void LogSegment::openReadMap() noexcept {
+std::size_t LogSegment::readMapBytesFor(int64_t rollBytes) noexcept {
+    const std::size_t want = rollBytes > 0 ? static_cast<std::size_t>(rollBytes) + kReadMapSlackBytes : kReadMapMinBytes;
+    const std::size_t page = 4096;
+    return std::max<std::size_t>(kReadMapMinBytes, (want + page - 1) / page * page);
+}
+
+std::unique_ptr<MappedFile> LogSegment::swapReadMap(std::unique_ptr<MappedFile> m) noexcept {
+    std::unique_ptr<MappedFile> old = std::move(readMap_);
+    readMap_ = std::move(m);
+    readMapSize_ = readMap_ ? readMap_->size() : 0;
+    return old;
+}
+
+void LogSegment::openReadMap(std::size_t bytes) noexcept {
     // Create the read-only .log mapping WITH the segment (spec §1a.5): the first
     // readView() after a roll must not allocate a MappedFile + mmap on the
     // push/fetch hot path.  kReadMapMinBytes of headroom past EOF (never touched:
     // readView reads only [0, logSize_)).  Failure is non-fatal — ensureReadMap()
     // falls back to creating it lazily.
     try {
-        readMap_     = makeReadMap_(kReadMapMinBytes);
+        readMap_     = makeReadMap_(std::max(bytes, kReadMapMinBytes));
         readMapSize_ = readMap_->size();
     } catch (...) {
         readMap_.reset();
@@ -503,6 +518,7 @@ bool LogSegment::ensureReadMap() noexcept {
     if (logSize_ <= 0) return true;                   // mmap(len=0) is EINVAL — nothing to map yet
     const std::size_t want = static_cast<std::size_t>(logSize_);
     if (readMap_ && readMapSize_ >= want) return true; // steady state: no syscall
+    if (readMap_ && !ownerRemap_) return true;        // review Md5: grown off-thread — serve the mapped prefix
     // Map with GEOMETRIC HEADROOM past EOF (read-only, so the file is never
     // extended; the pages beyond EOF are never touched — readView reads only
     // [0, logSize_)).  The active segment then grows inside one mapping instead of
@@ -510,6 +526,7 @@ bool LogSegment::ensureReadMap() noexcept {
     // costs no syscalls.  A remap happens only O(log(segment/kMin)) times.
     std::size_t cap = readMapSize_ > 0 ? readMapSize_ : kReadMapMinBytes;
     while (cap < want) cap *= 2;
+    ++readMapRemaps_;
     try {
         if (!readMap_) {
             // Read-only mapping (writable=false → no ftruncate; never mutates .log).
@@ -622,7 +639,56 @@ int LogSegment::openTrusted(int64_t nextOffset) noexcept {
     return 0;
 }
 
-int64_t LogSegment::recover() {
+int LogSegment::truncateInPlace(int64_t truncateOffset, int64_t& keptMaxTs) noexcept {
+    if (log_.is_open()) log_.flush();   // the durable fstream path: nothing buffered past the cut
+    // Re-review N1: the cut is derived from the WHOLE segment — never from a
+    // prefix-only mapping (Md5 grows maps off the owner; a demoted leader's
+    // segment may never have had its grown map installed).  This cold path
+    // maps the whole file on the owner if it must.
+    const bool savedRemap = ownerRemap_;
+    ownerRemap_ = true;
+    const bool mapped = ensureReadMap() && readMap_ && readMapSize_ >= static_cast<std::size_t>(logSize_);
+    ownerRemap_ = savedRemap;
+    if (!mapped) return -1;
+    const uint8_t* base = readMap_->data();
+    const std::size_t size = static_cast<std::size_t>(logSize_);
+    const std::size_t kOverhead = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
+    std::size_t pos = 0;
+    int64_t next = baseOffset_;
+    int64_t maxTs = 0;
+    bool atCut = false;
+    while (pos + kOverhead <= size) {
+        rune::protocol::RecordBatchReader r(base + pos, size - pos);
+        const int32_t total = r.totalLength();
+        if (total <= 0 || pos + static_cast<std::size_t>(total) > size) break;
+        if (r.baseOffset() + r.lastOffsetDelta() >= truncateOffset) { atCut = true; break; }   // cut here (whole batch)
+        const int64_t ts = toEpochMs(r.maxTimestamp());
+        if (ts > maxTs) maxTs = ts;
+        next = r.baseOffset() + r.lastOffsetDelta() + 1;
+        pos += static_cast<std::size_t>(total);
+    }
+    // Re-review N1: the walk must stop AT the batch holding truncateOffset (or
+    // at the true end of the segment's batches) — anything else (an unparsable
+    // batch inside the segment) would cut below the requested offset and
+    // silently delete records: fail the log loudly instead.
+    if (!atCut && pos != size) [[unlikely]] return EIO;
+    if (::ftruncate(fd_, static_cast<off_t>(pos)) != 0) return errno != 0 ? errno : EIO;
+    const int64_t lastIdx = index_->truncateToPosition(static_cast<int64_t>(pos));
+    logSize_ = static_cast<int64_t>(pos);
+    // Walked the whole segment without reaching truncateOffset (pos == size):
+    // nothing is cut.  A compacted segment's logical end can lie past its last
+    // surviving batch, so keep it, capped at the requested offset (re-review-2
+    // medium: the former "next != nextOffset_" guard fail-stopped this no-op).
+    nextOffset_ = atCut ? next : std::min(nextOffset_, truncateOffset);
+    bytesSinceIndex_ = lastIdx < 0 ? 0 : logSize_ - lastIdx;
+    if (syncedBytes_ > logSize_) syncedBytes_ = logSize_;
+    if (durableNext_ > nextOffset_) durableNext_ = nextOffset_;
+    if (durableNext_ < baseOffset_) durableNext_ = baseOffset_;
+    keptMaxTs = maxTs;
+    return 0;
+}
+
+int64_t LogSegment::recover(bool syncIndex) {
     log_.seekg(0, std::ios::end);
     int64_t fileSize = log_.tellg();
     std::vector<uint8_t> buf(static_cast<size_t>(fileSize));
@@ -673,9 +739,11 @@ int64_t LogSegment::recover() {
     // Accepted role-change sync work (truncateTo on a role / epoch change, and
     // startup recovery) — counted, and an error is fail-stop (sticky per log)
     // rather than an exception escaping a worker loop.
-    if (storage_) ++storage_->roleChangeSyncs;
-    if (const int e = (storage_ && storage_->faultForTest) ? storage_->faultForTest : index_->sync(); e != 0) {
-        if (storage_ && storage_->failedErrno == 0) storage_->failedErrno = e;
+    if (syncIndex) {
+        if (storage_) ++storage_->roleChangeSyncs;
+        if (const int e = (storage_ && storage_->faultForTest) ? storage_->faultForTest : index_->sync(); e != 0) {
+            if (storage_ && storage_->failedErrno == 0) storage_->failedErrno = e;
+        }
     }
     if (::rename(indexTmp.c_str(), indexPath.c_str()) != 0) {
         const int e = errno;
@@ -691,7 +759,7 @@ int64_t LogSegment::recover() {
                                 "LogSegment::recover rename " + indexTmp + " -> " + indexPath);
     }
     // fsync the directory for durability of the rename
-    {
+    if (syncIndex) {
         std::string dir = logPath_.substr(0, logPath_.rfind('/'));
         int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
         if (dfd >= 0) {

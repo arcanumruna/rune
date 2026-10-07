@@ -675,6 +675,8 @@ public:
     }
 
     Worker& worker() { return pool_.worker(0); }
+    /// After stop() only.
+    [[nodiscard]] uint64_t provisionedForTest() const noexcept { return provisioner_.builtForTest(); }
     std::vector<std::unique_ptr<Part>>& parts() { return parts_; }
 
     // counters (test thread)
@@ -896,16 +898,36 @@ void produceLoop(GateRig& rig, Stats& st, const FrameSet& fset, const LoopCfg& l
 
 uint64_t passes(uint64_t n) { return n * static_cast<uint64_t>(scale()); }
 
-std::string counters(const GateRig& rig) {
-    char buf[512];
+std::string counters(GateRig& rig) {
+    // Review M2: fsync attribution per scenario.  The background threads are
+    // stopped first (their counters are read only after they stopped).
+    rig.stop();
+    uint64_t inlineSyncs = 0, roleSyncs = 0, cleanerFsyncs = 0, cleanerDirFsyncs = 0, inPlace = 0, dirMut = 0;
+    for (auto& p : rig.parts()) {
+        inlineSyncs += p->log->syncCallsForTest();
+        roleSyncs += p->log->roleChangeSyncCallsForTest();
+        cleanerFsyncs += p->log->cleanerFsyncsForTest();
+        cleanerDirFsyncs += p->log->cleanerDirFsyncsForTest();
+        inPlace += p->log->inPlaceTruncationsForTest();
+        dirMut += p->log->directoryMutationsForTest();
+    }
+    Worker& w = rig.worker();
+    char buf[1024];
     std::snprintf(buf, sizeof buf,
                   "acks=%" PRIu64 " errs=%" PRIu64 "(last %d) installs=%" PRIu64 " retentionDrops=%" PRIu64
                   " reads=%" PRIu64 " readMiB=%.1f markers=%" PRIu64 "/%" PRIu64 "err rolls=%" PRIu64
                   " syncCreates=%" PRIu64 " inlineFsyncs=%" PRIu64 " holds=%" PRIu64 " deferrals=%" PRIu64
-                  " failureInlineRolls=%" PRIu64,
+                  " failureInlineRolls=%" PRIu64
+                  " | FSYNC io: seal=%" PRIu64 " bg=%" PRIu64 " rp=%" PRIu64 " dir=%" PRIu64
+                  " epoch=%" PRIu64 " | worker-inline: sync=%" PRIu64 " role=%" PRIu64
+                  " | cleaner: fsync=%" PRIu64 " dir=%" PRIu64 " | provisioned=%" PRIu64
+                  " | dirMutations=%" PRIu64 " inPlaceTrunc=%" PRIu64,
                   rig.produceAnswers, rig.produceErrors, static_cast<int>(rig.lastProduceError), rig.installs, rig.retentionDrops, rig.readAnswers,
                   static_cast<double>(rig.readBytes) / kMiB, rig.markersAppended, rig.markerErrors, rig.rolls,
-                  rig.syncCreates, rig.inlineFsyncs, rig.holds, rig.rollDeferrals(), rig.failureInlineRolls());
+                  rig.syncCreates, rig.inlineFsyncs, rig.holds, rig.rollDeferrals(), rig.failureInlineRolls(),
+                  w.sealSubmitsForTest(), w.bgFlushSubmitsCountForTest(),
+                  w.recoveryPointSubmitsForTest(), w.dirSyncSubmitsForTest(), w.epochStateSubmitsForTest(),
+                  inlineSyncs, roleSyncs, cleanerFsyncs, cleanerDirFsyncs, rig.provisionedForTest(), dirMut, inPlace);
     return buf;
 }
 
@@ -1116,6 +1138,10 @@ Outcome truncationDuringCleanerPass() {
             if (B.logStart > lsoAtLead) { rig.becomeFollower(B); extra |= kRoleOp; st = St::Demoting; }
             break;
         case St::Demoting: {
+            // Hot-path B review C1: a follower whose last divergence truncation's
+            // history is not durable yet neither fetches nor applies — the new
+            // leader's answer can only come after its next fetch.
+            if (B.rep->refetchAwaitsEpochStateForTest()) break;
             // Diverging-epoch answer from the new leader: truncate the tail
             // B wrote in its last epoch.  Deferred (TruncatePending) while B's
             // posted file ops are still queued for the cleaner.
@@ -1183,28 +1209,62 @@ Outcome leadershipChange(int nParts) {
         rig.add(PartSpec{.topicId = 1, .part = i, .rollBytes = 1 * kMiB, .controllerManaged = true});
     rig.start();
     // Controller-managed partitions start at a NEW epoch (fence persisted).
+    // Hot-path B F7: the fence is written through the worker's io backend and
+    // the leadership acts once it completed — drive passes until it did
+    // (bounded; the completion pass is measured as a HOT pass).
     for (auto& p : rig.parts()) rig.becomeLeader(*p);
+    auto allLead = [&] {
+        for (auto& p : rig.parts()) if (!p->rep->acceptsProduce()) return false;
+        return true;
+    };
     {
         const std::vector<uint8_t>* none[] = {nullptr};
         step(rig, o.stats, none, 0, kRoleOp);
+        for (int k = 0; k < 2'000'000 && !allLead(); ++k) step(rig, o.stats, none, 0, 0);
+        EXPECT_TRUE(allLead()) << "precondition: every partition leads";
+        if (!allLead()) return o;
     }
     const FrameSet fset = framesFor(rig, BatchShape{});
     std::vector<const std::vector<uint8_t>*> ptrs;
     std::vector<bool> leading(rig.parts().size(), true);
     uint64_t flips = 0;
     const uint64_t n = passes(30'000);
-    for (uint64_t i = 0; i < n; ++i) {
+    // Event-driven cycle (hot-path B F7: a promotion leads once its durable
+    // fence completed through the io backend — milliseconds, not passes):
+    // demote the victim after it led 200 passes, promote it 50 passes later,
+    // move to the next partition once the promotion actually leads.
+    enum class Ph { Leading, Demoted, Promoting } ph = Ph::Leading;
+    std::size_t victim = 0;
+    uint64_t t = 0;
+    // At least n passes AND 24 flips (a promotion waits for an fdatasync:
+    // milliseconds of idle passes), bounded.
+    for (uint64_t i = 0; (i < n || flips < 24) && i < 200 * n; ++i) {
         uint32_t extra = kProduce;
-        // Every 250 passes demote one partition; 50 passes later promote it
-        // at a new epoch (RC state rebuilds incrementally on the next passes).
-        const std::size_t victim = (i / 250) % rig.parts().size();
-        if (i % 250 == 0) { rig.becomeFollower(*rig.parts()[victim]); leading[victim] = false; extra |= kRoleOp; ++flips; }
-        if (i % 250 == 50) { rig.becomeLeader(*rig.parts()[victim]); leading[victim] = true; extra |= kRoleOp; }
+        ++t;
+        Part& vp = *rig.parts()[victim];
+        if (ph == Ph::Leading && t >= 200 && vp.rep->acceptsProduce()) {
+            rig.becomeFollower(vp); leading[victim] = false; extra |= kRoleOp; ++flips; ph = Ph::Demoted; t = 0;
+        } else if (ph == Ph::Demoted && t >= 50) {
+            rig.becomeLeader(vp); leading[victim] = true; extra |= kRoleOp; ph = Ph::Promoting;
+        } else if (ph == Ph::Promoting && vp.rep->acceptsProduce()) {
+            ph = Ph::Leading; t = 0; victim = (victim + 1) % rig.parts().size();
+        }
         ptrs.clear();
+        // Produce only where the partition accepts it (a promotion leads once
+        // its durable fence completed — F7): never a refused produce.
         for (std::size_t k = 0; k < rig.parts().size(); ++k)
-            if (leading[k] && !((extra & kRoleOp) != 0 && k == victim)) ptrs.push_back(&fset.frames[k]);
+            if (leading[k] && rig.parts()[k]->rep->acceptsProduce() && !((extra & kRoleOp) != 0 && k == victim))
+                ptrs.push_back(&fset.frames[k]);
         const int64_t ns = rig.pass(ptrs.data(), static_cast<int>(ptrs.size()));
         o.stats.add(ns, rig.observe(extra), rig.lastSplit);
+    }
+    if (ph == Ph::Demoted) {   // end in leadership: promote the demoted victim
+        rig.becomeLeader(*rig.parts()[victim]);
+        leading[victim] = true;
+    }
+    {
+        const std::vector<uint8_t>* none[] = {nullptr};
+        for (int k = 0; k < 2'000'000 && !allLead(); ++k) step(rig, o.stats, none, 0, 0);
     }
     EXPECT_GT(flips, 10u);
     for (auto& p : rig.parts()) EXPECT_EQ(p->rep->role(), Role::Leader);

@@ -114,6 +114,7 @@ inline constexpr std::int32_t kProvisionBuildFailuresCounterTypeId = 1'000'212; 
 inline constexpr std::int32_t kProvisionRollHoldsCounterTypeId     = 1'000'213;
 inline constexpr std::int32_t kProvisionUnpreallocCounterTypeId    = 1'000'214;
 inline constexpr std::int32_t kProvisionParkedDroppedCounterTypeId = 1'000'215;
+inline constexpr std::int32_t kProvisionReadMapFailuresCounterTypeId = 1'000'216;   // hot-path B review Md5
 inline std::string provisionMetricLabel(const char* what, std::int32_t nodeId) {
     return std::string("rune-segment-provision-") + what + " node=" + std::to_string(nodeId);
 }

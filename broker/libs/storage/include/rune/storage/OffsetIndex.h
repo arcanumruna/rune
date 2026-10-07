@@ -33,6 +33,10 @@ public:
     /// entries_ == 0.
     void setBaseOffset(int64_t base) noexcept { baseOffset_ = base; }
     int lastSearchLow() const { return lastSearchLow_; }
+    /// Hot-path B review M2: drop (zero) every entry at or past byte `pos` —
+    /// an in-place tail truncation of the segment.  Memory only (no syscall).
+    /// Returns the position of the last kept entry (-1 = none).
+    int64_t truncateToPosition(int64_t pos) noexcept;
 protected:
     int slotFor(int64_t target) const;         // largest-lower-bound slot, -1 if none
     OffsetPosition parseEntry(int slot) const;

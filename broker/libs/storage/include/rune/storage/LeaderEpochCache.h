@@ -163,6 +163,17 @@ public:
     // Written crash-safely: open(.tmp), write, fsync, rename.
     // -------------------------------------------------------------------------
 
+    /// The entries, ascending epoch (no copy).  Hot-path B F7: encoded straight
+    /// into the leader-epoch-state slot image.
+    [[nodiscard]] const std::map<int32_t, int64_t>& map() const noexcept { return epochs_; }
+    [[nodiscard]] std::size_t size() const noexcept { return epochs_.size(); }
+    /// Replace every entry (restore from leader-epoch-state).
+    void replaceAll(const std::vector<std::pair<int32_t, int64_t>>& v) {
+        epochs_.clear();
+        for (const auto& [ep, off] : v) epochs_[ep] = off;
+    }
+    [[nodiscard]] bool operator==(const LeaderEpochCache& o) const noexcept { return epochs_ == o.epochs_; }
+
     /// Return all (epoch, startOffset) entries in ascending epoch order.
     [[nodiscard]] std::vector<std::pair<int32_t, int64_t>> entries() const {
         std::vector<std::pair<int32_t, int64_t>> v;
