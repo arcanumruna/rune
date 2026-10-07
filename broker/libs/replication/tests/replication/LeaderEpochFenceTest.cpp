@@ -147,3 +147,58 @@ TEST(LeaderEpochFenceRegression, FenceWriteFailureTakesLogDirOfflineStickyRegres
     r->becomeLeader(5, kAll);
     EXPECT_EQ(r->role(), Role::Leader);
 }
+
+// D15 item 3 (metadata.version gate): below MetadataFeature::kEpochFence the
+// controller may be an older binary that silently drops bump requests and
+// leaderless reports.  The replica then keeps the pre-fence behaviour: it
+// leads at a fenced epoch (and without any fence), sends no bump and no
+// report — but still persists its fence, so it is exact once the level is
+// raised; at the epoch-fence level the same situation refuses and bumps.
+TEST(LeaderEpochFenceRegression, BelowFeatureLevelLeadsUnfencedAndSendsNoBumpRegression) {
+    Dir d;
+    const std::string fence = (d.path / "fence-0-0").string();
+    {
+        rune::storage::InMemoryLog log(1 << 20, 10'000);
+        CapturingTransport t;
+        auto r = memReplica(log, t);
+        r->setLeaderEpochFenceFile(fence);
+        r->becomeLeader(5, kAll);
+        ASSERT_EQ(r->role(), Role::Leader);
+    }
+    {   // restarted, cluster level below the protocol
+        rune::storage::InMemoryLog log(1 << 20, 10'000);
+        CapturingTransport t;
+        auto r = memReplica(log, t);
+        r->setLeaderEpochFenceFile(fence);
+        r->setMetadataFeatureLevel(MetadataFeature::kBase);
+        r->becomeLeader(5, kAll);
+        EXPECT_EQ(r->role(), Role::Leader) << "refused a leadership an older controller would never re-grant";
+        r->becomeFollower(6, NodeId{-1});
+        EXPECT_FALSE(r->leaderlessReportPendingForTest()) << "a leaderless report sent to a pre-D15 controller";
+        r->doWork(1'000'000'000);
+        EXPECT_TRUE(t.sent.empty()) << "a bump / report was sent below the feature level";
+        r->becomeLeader(7, kAll);
+        ASSERT_EQ(r->role(), Role::Leader);
+    }
+    {   // restarted again, the level now supports the protocol: the fence (7, persisted under the legacy level) holds
+        rune::storage::InMemoryLog log(1 << 20, 10'000);
+        CapturingTransport t;
+        auto r = memReplica(log, t);
+        r->setLeaderEpochFenceFile(fence);
+        r->setMetadataFeatureLevel(MetadataFeature::kEpochFence);
+        r->becomeLeader(7, kAll);
+        EXPECT_NE(r->role(), Role::Leader) << "re-led a fenced epoch at the epoch-fence level";
+        r->doWork(1'000'000'000);
+        ASSERT_EQ(t.sent.size(), 1u);
+        EXPECT_EQ(t.sent[0].isr[0], 7) << "the fence persisted under the legacy level was lost";
+    }
+    {   // no fence file at all (memory log, no data dir), legacy level: leads as before the fence
+        rune::storage::InMemoryLog log(1 << 20, 10'000);
+        CapturingTransport t;
+        auto r = memReplica(log, t);
+        r->setMetadataFeatureLevel(MetadataFeature::kBase);
+        r->becomeLeader(3, kAll);
+        EXPECT_EQ(r->role(), Role::Leader);
+        EXPECT_EQ(r->unfencedLegacyLeadsForTest(), 1u);
+    }
+}

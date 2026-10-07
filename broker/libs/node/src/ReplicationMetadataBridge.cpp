@@ -46,12 +46,14 @@ void ReplicationMetadataBridge::routeBecomeLeader_(
         op.roleEpoch = epoch;
         op.isr       = std::move(isr);
         op.rolePartitionEpoch = partitionEpoch;   // MEDIUM-1: AlterIsr CAS version
+        op.acks      = roleFeatureLevel_;         // D15: role ops carry the feature level in `acks`
         // Never dropped: retried every cycle until the owning ring accepts it.
         enqueueRoleOp_(std::move(op), /*fence=*/false);
     } else {
         // Internal partition (topicId < 0) or no worker pool: direct call.
         // Both the internal replica's doWork AND MetadataService/GCS/TCS run
         // on the control thread, so this is single-threaded — no race.
+        replica->setMetadataFeatureLevel(roleFeatureLevel_);   // D15
         replica->becomeLeader(epoch, std::move(isr), partitionEpoch);
     }
 }
@@ -77,9 +79,11 @@ void ReplicationMetadataBridge::routeBecomeFollower_(
         op.replica      = replica;
         op.roleEpoch    = epoch;
         op.roleLeaderId = leaderId;
+        op.acks         = roleFeatureLevel_;      // D15
         enqueueRoleOp_(std::move(op), fence);
     } else {
         // Internal partition (topicId < 0) or no worker pool: direct call.
+        replica->setMetadataFeatureLevel(roleFeatureLevel_);   // D15
         replica->becomeFollower(epoch, leaderId);
     }
 }

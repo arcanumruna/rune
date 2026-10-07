@@ -425,6 +425,24 @@ struct ErrorPayloadBuf {
 // proposal was derived from) is still the committed partitionEpoch —
 // compare-and-set on a monotonic version (no ABA).  Generated SBE codec.
 // ---------------------------------------------------------------------------
+/// D15 — the cluster's METADATA FEATURE LEVEL (KRaft metadata.version): the
+/// level is committed to __cluster_metadata (FeatureLevelRecord) by the
+/// controller only once EVERY cluster member advertised support for it
+/// (AlterIsrMsg::kNodeFeatureLevelSlot), or at the bootstrap of a fresh
+/// metadata log.  A request kind an older controller would silently drop is
+/// sent only when the COMMITTED level supports it; below it the replica keeps
+/// the pre-feature behaviour (rolling-upgrade compatibility).  Monotonic.
+namespace MetadataFeature {
+/// Pre-D15 binaries: no leader-epoch bump requests / leaderless reports.
+inline constexpr int16_t kBase = 0;
+/// The leader-epoch restart fence protocol: a replica refuses leadership at a
+/// fenced epoch and asks for a bump (kLeaderEpochBump), leaderless follower
+/// reports, the log-dir-offline flag, and leaderless marks on the records.
+inline constexpr int16_t kEpochFence = 1;
+/// The level this binary supports.
+inline constexpr int16_t kLatest = kEpochFence;
+} // namespace MetadataFeature
+
 struct AlterIsrMsg {
     static constexpr uint16_t TEMPLATE_ID = 7;
     static constexpr int kMaxIsr = 16;
@@ -487,6 +505,10 @@ struct AlterIsrMsg {
     /// (fix round 2, N1): the receiving process is alive by definition — it
     /// rotates to a fresh identity and re-sends at once.
     static constexpr int16_t kNodeSuperseded = 7;
+    /// D15 (metadata.version gate): every node-control request carries the
+    /// highest metadata feature level its binary supports in this slot (an
+    /// older binary leaves it 0 = MetadataFeature::kBase).
+    static constexpr int kNodeFeatureLevelSlot = 6;
     int32_t topicId        = 0;
     int32_t partition      = 0;
     NodeId  leaderId       = -1;

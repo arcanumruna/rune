@@ -3075,6 +3075,8 @@ private:
             static_cast<rune::replication::Epoch>(op.roleEpoch());
 
         try {
+            // D15: role ops carry the committed metadata feature level in `acks`.
+            replica->setMetadataFeatureLevel(static_cast<int16_t>(op.acks()));
             replica->becomeLeader(epoch, std::move(isr), op.rolePartitionEpoch());
         } catch (const std::exception& ex) {
             spdlog::warn("Worker {}: becomeLeader threw for topicId={} partition={}: {}",
@@ -3111,6 +3113,7 @@ private:
         const rune::replication::NodeId leaderId =
             static_cast<rune::replication::NodeId>(op.roleLeaderId());
         try {
+            replica->setMetadataFeatureLevel(static_cast<int16_t>(op.acks()));   // D15
             replica->becomeFollower(epoch, leaderId);
         } catch (const std::exception& ex) {
             spdlog::warn("Worker {}: becomeFollower threw for topicId={} partition={}: {}",

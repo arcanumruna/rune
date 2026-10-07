@@ -2325,6 +2325,9 @@ void BrokerNode::buildGateway() {
                 // collapse).  See DynamicBalancerInputs::minIsr.
                 metadataService_->setMinIsr(config_.gatewayMinIsr);
                 metadataService_->setAllowSurvivorElection(config_.survivorLeaderElection);
+                // D15: the metadata feature level is raised only once every
+                // member advertised it (its node-control registration).
+                metadataService_->setClusterMembers(balancerNodes);
                 // Re-review 2026-10-04 MEDIUM-B: the coordinator partitions
                 // (__consumer_offsets, __transaction_state) are on the controller-
                 // ISR path multi-node: this controller assigns them (ISR commits,

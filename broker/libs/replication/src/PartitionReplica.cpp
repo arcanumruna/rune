@@ -312,7 +312,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
     // never led again — a second history under it would be invisible to
     // KIP-101 truncation.  Controller-managed only: it re-elects us at a new
     // epoch on request.
-    if (isrChannel_ != nullptr && newEpoch <= restartFenceEpoch_) [[unlikely]] {
+    if (fenceProtocol_() && newEpoch <= restartFenceEpoch_) [[unlikely]] {
         refuseStaleLeadership_(newEpoch, partitionEpoch);
         return;
     }
@@ -336,8 +336,14 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
             if (!noFence && !fenceFile_.empty()) logDirOffline_ = true;
             if (newEpoch > restartFenceEpoch_) restartFenceEpoch_ = newEpoch;
             fenceEstablished_ = true;
-            refuseStaleLeadership_(newEpoch, partitionEpoch);
-            return;
+            if (fenceProtocol_()) {
+                refuseStaleLeadership_(newEpoch, partitionEpoch);
+                return;
+            }
+            // D15: the committed feature level predates the fence protocol —
+            // the controller may drop a bump request (the partition would
+            // stay leaderless): lead unfenced, exactly as a pre-fence binary.
+            ++unfencedLegacyLeads_;
         }
     }
     staleLead_.pending = false;
@@ -455,7 +461,7 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     // N1/N2: a replica of a LEADERLESS partition reports itself (LEO,
     // incarnation, log-dir state) to the controller once per leaderless epoch
     // — the event the controller decides the partition's next leader on.
-    if (isrChannel_ != nullptr && leaderId < 0 && (!report_.pending || report_.epoch != leaderEpoch)) {
+    if (fenceProtocol_() && leaderId < 0 && (!report_.pending || report_.epoch != leaderEpoch)) {
         report_.pending = true;
         report_.epoch   = leaderEpoch;
         report_.sent    = false;
@@ -1947,11 +1953,13 @@ bool PartitionReplica::epochStateWriteCompleted(uint64_t seq, int err)
             // the log dir goes offline and the leadership is refused.
             const Epoch e = pendingLead_.epoch;
             const int32_t pe = pendingLead_.partitionEpoch;
+            std::vector<NodeId> isr = pendingLead_.isr;   // cold (a failed write)
             cancelPendingLeadership_();
             logDirOffline_ = true;
             if (e > restartFenceEpoch_) restartFenceEpoch_ = e;
             fenceEstablished_ = true;
-            refuseStaleLeadership_(e, pe);
+            if (fenceProtocol_()) refuseStaleLeadership_(e, pe);
+            else becomeLeader(e, std::move(isr), pe);   // D15: legacy level — leads unfenced (no bump)
         }
         if (es_.failures >= kMaxEpochStateFailures && !memoryBacked_ && diskLog_ != nullptr) {
             // Like every other storage failure on the log: fail-stop (the owner
