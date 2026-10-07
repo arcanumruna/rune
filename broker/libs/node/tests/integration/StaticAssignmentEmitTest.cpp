@@ -52,6 +52,7 @@
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/metadata/StaticBalancer.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune/storage/InMemoryLog.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/MetadataRecords.h>
 
@@ -2169,60 +2170,92 @@ TEST(D15MemoryEpochRegression, CoPartitionUnitLeaderlessDecidedAsOneUnitRegressi
     }
 }
 
-// D15 item 3 (replica side, through the bridge): the committed map carries
-// no FeatureLevelRecord (a log written by pre-D15 binaries — the controller
-// may be one that silently drops bump requests).  A replica told to lead at a
-// fenced epoch must NOT refuse (it would stay leaderless under an old
-// controller): it leads as before the fence.  Once the committed level
-// supports the protocol, the same situation refuses and asks for a bump.
-TEST(D15FeatureGateRegression, BridgeStampsCommittedFeatureLevelOnRolesRegression) {
-    SaeTempDir d("fg"), dl("fgl");
-    rune::storage::Log log(dl.path);
-    log.recover();
+// D15 review M1: the leader-epoch FENCE protocol is unconditional — a log
+// written by pre-D15 binaries (no FeatureLevelRecord: level 0) and a member
+// that never re-registers (the level can never be raised) must keep main's
+// 9c80eab behaviour.  A memory-backed sole-ISR leader restarted EMPTY is
+// told (bridge, committed map) to lead the epoch it already led: it refuses,
+// asks for a new epoch, and the controller makes the partition leaderless at
+// a NEW epoch (decided on fresh reports) — never a second history under the
+// old epoch (committed loss).  At 2cccff5 the level-0 replica led it.
+TEST(D15FeatureGateRegression, FenceProtocolUnconditionalAtLevelZeroRegression) {
+    SaeTempDir d1("fz1"), d2("fz2"), d3("fz3"), df("fzf");
+    rune::storage::Log log1(d1.path), log2(d2.path), log3(d3.path);
+    log1.recover(); log2.recover(); log3.recover();
+    const std::vector<NodeId> all{1, 2, 3};
     InMemoryTransport transport;
-    {   // the fence of an earlier incarnation: epoch 7
-        std::FILE* fp = std::fopen((d.path + "/fence").c_str(), "w");
+    auto r1 = std::make_unique<PartitionReplica>(makeMetaCfg(1), Role::Leader, 1, all, all, &log1, &transport);
+    auto r2 = std::make_unique<PartitionReplica>(makeMetaCfg(2), Role::Follower, 1, all, all, &log2, &transport);
+    auto r3 = std::make_unique<PartitionReplica>(makeMetaCfg(3), Role::Follower, 1, all, all, &log3, &transport);
+    transport.setLeader(r1.get());
+    transport.addFollower(2, r2.get());
+    transport.addFollower(3, r3.get());
+    MetadataService svc(r1.get(), 1);
+    svc.setSupportedFeatureLevel(MetadataFeature::kBase);   // the log predates D15: never bootstrapped
+    svc.configure({TopicSpec{0, 1, 3, "", "t"}}, all);
+    svc.setClusterMembers(all);
+    int64_t clock = 0;
+    auto drive = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            clock += 1'000'000LL;
+            (void)svc.doWork(clock);
+            r1->doWork(clock); r2->doWork(clock); r3->doWork(clock);
+            transport.pump(clock);
+        }
+    };
+    drive(50);
+    auto reg = [&](int32_t node, int64_t inc, int16_t level) {
+        auto m = nodeControl(node, inc, false);
+        m.isr[AlterIsrMsg::kNodeFeatureLevelSlot] = level;
+        (void)svc.onAlterIsr(m);
+    };
+    reg(2, 11, MetadataFeature::kLatest);   // node 3 never re-registers: the level stays 0
+    drive(20);
+    ASSERT_EQ(svc.featureLevel(), MetadataFeature::kBase);
+    const PartitionAssignment a = *svc.assignment(0, 0);
+    const int32_t L = a.leaderNode;
+    {   // sole ISR {L}
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = 0; m.partition = 0; m.leaderId = L; m.leaderEpoch = a.leaderEpoch;
+        m.isrCount = 1; m.isr[0] = L; m.partitionEpoch = a.partitionEpoch;
+        ASSERT_TRUE(svc.onAlterIsr(m));
+        drive(50);
+    }
+    const int32_t le = svc.assignment(0, 0)->leaderEpoch;
+    // L restarted: an EMPTY memory log, its fence says it led `le`.
+    {
+        std::FILE* fp = std::fopen((df.path + "/fence").c_str(), "w");
         ASSERT_NE(fp, nullptr);
-        std::fputs("7\n", fp);
+        std::fprintf(fp, "%d\n", le);
         std::fclose(fp);
     }
-    const std::vector<NodeId> allNodes = {1, 2, 3};
-    ReplicaRegistry reg;
-    PartitionConfig cfg = makeMetaCfg(1);
+    struct Capture final : InMemoryTransport {
+        std::vector<AlterIsrMsg> sent;
+        bool sendAlterIsr(const AlterIsrMsg& m) override { sent.push_back(m); return true; }
+    } cap;
+    rune::storage::InMemoryLog mem(1 << 20, 10'000);
+    ReplicaRegistry regy;
+    PartitionConfig cfg = makeMetaCfg(L);
     cfg.topicId = 0;
-    reg.add(0, 0, std::make_unique<PartitionReplica>(cfg, Role::Follower, 0, allNodes, allNodes, &log, &transport));
-    PartitionReplica* r = reg.lookup(0, 0);
-    r->setIsrChannel(&transport);
-    r->setLeaderEpochFenceFile(d.path + "/fence");
-    MetadataStateMachine msm;
-    int64_t pos = 0;
-    auto assign = [&](int32_t leader, int32_t epoch) {
-        std::vector<int32_t> isr{1, 2, 3}, reps{1, 2, 3};
-        pmd::UpdatePartitionAssignmentRecord rec;
-        rec.topicId = 0; rec.partition = 0; rec.leaderNode = leader;
-        rec.isr = pmd::Int32ArrayView{isr.data(), 3}; rec.replicas = pmd::Int32ArrayView{reps.data(), 3};
-        rec.leaderEpoch = epoch; rec.partitionEpoch = epoch;
-        uint8_t buf[256];
-        const std::size_t n = rec.encode(buf, sizeof buf);
-        msm.apply(buf, n, pos);
-        msm.commit(pos++);
-    };
-    ReplicationMetadataBridge bridge(1, allNodes, reg, &msm);
-    assign(1, 5);
+    regy.add(0, 0, std::make_unique<PartitionReplica>(cfg, Role::Follower, 0, all, all, &mem, &cap));
+    PartitionReplica* r = regy.lookup(0, 0);
+    r->setIsrChannel(&cap);
+    r->setProcessIncarnation(2);
+    r->setLeaderEpochFenceFile(df.path + "/fence");
+    ReplicationMetadataBridge bridge(L, all, regy, &svc.msmForTest());
     (void)bridge.doWork(1, 1);
-    EXPECT_EQ(r->role(), Role::Leader)
-        << "below the epoch-fence feature level a fenced leadership was refused (an old controller "
-           "would never answer the bump: leaderless forever)";
-    // The cluster's level is raised (FeatureLevelRecord, type 6, level 1).
-    const uint8_t feature[] = {6, 0, 0, 1, 0};
-    msm.apply(feature, sizeof feature, pos);
-    msm.commit(pos++);
-    assign(2, 6);
+    EXPECT_NE(r->role(), Role::Leader) << "led epoch " << le << " again with an EMPTY log at feature level 0";
+    for (int i = 0; i < 3 && cap.sent.empty(); ++i) r->doWork(clock += 100'000'000LL);
+    ASSERT_FALSE(cap.sent.empty()) << "no new epoch requested at feature level 0";
+    (void)svc.onAlterIsr(cap.sent.back());
+    (void)svc.reassignDeadPartitionLeaders(all, 0);
+    drive(50);
+    const auto* pa = svc.assignment(0, 0);
+    EXPECT_GT(pa->leaderEpoch, le) << "the controller never moved the partition past the fenced epoch";
+    EXPECT_EQ(pa->leaderNode, NO_LEADER) << "the empty memory leader was re-elected blind";
     (void)bridge.doWork(1, 1);
-    assign(1, 7);
-    (void)bridge.doWork(1, 1);
-    EXPECT_NE(r->role(), Role::Leader) << "at the epoch-fence level a fenced epoch was led again";
-    EXPECT_TRUE(r->staleLeadershipPendingForTest()) << "no bump requested at the epoch-fence level";
+    EXPECT_NE(r->role(), Role::Leader);
+    EXPECT_EQ(svc.featureLevel(), MetadataFeature::kBase);
 }
 
 // D15 item 3 (controller side): the level is raised only once EVERY cluster

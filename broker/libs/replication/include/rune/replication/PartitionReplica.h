@@ -433,17 +433,6 @@ public:
     /// <log dir>/leader-epoch-fence; memory-backed ones are given a path under
     /// the node's data dir by BrokerNode.  Loads the persisted value.  Cold.
     void setLeaderEpochFenceFile(std::string path);
-    /// D15 (metadata.version gate): the cluster's COMMITTED metadata feature
-    /// level, stamped by the bridge on every role change (owning thread).
-    /// Below MetadataFeature::kEpochFence the controller may be an older
-    /// binary that silently drops bump requests / leaderless reports: the
-    /// replica then keeps the pre-fence behaviour — it still persists its
-    /// fence (so it is exact once the level is raised) but never refuses a
-    /// leadership on it and sends no bump / report.  Default: kLatest
-    /// (standalone / test replicas).
-    void setMetadataFeatureLevel(int16_t level) noexcept { metadataFeatureLevel_ = level; }
-    [[nodiscard]] int16_t metadataFeatureLevel() const noexcept { return metadataFeatureLevel_; }
-    [[nodiscard]] uint64_t unfencedLegacyLeadsForTest() const noexcept { return unfencedLegacyLeads_; }
     [[nodiscard]] Epoch restartFenceEpochForTest() const noexcept { return restartFenceEpoch_; }
     [[nodiscard]] bool  staleLeadershipPendingForTest() const noexcept { return staleLead_.pending; }
     [[nodiscard]] uint64_t staleLeadershipRefusalsForTest() const noexcept { return staleLeadRefusals_; }
@@ -1601,14 +1590,6 @@ private:
     /// is offline for the rest of this incarnation (sticky): every leadership
     /// is refused and the controller is told (kBumpLogDirFailed).
     bool logDirOffline_ = false;
-    /// D15: see setMetadataFeatureLevel.
-    int16_t  metadataFeatureLevel_ = MetadataFeature::kLatest;
-    uint64_t unfencedLegacyLeads_  = 0;
-    /// The leader-epoch fence PROTOCOL (refuse + bump + reports) is on:
-    /// controller-managed AND the committed feature level supports it.
-    [[nodiscard]] bool fenceProtocol_() const noexcept {
-        return isrChannel_ != nullptr && metadataFeatureLevel_ >= MetadataFeature::kEpochFence;
-    }
     /// Fix round 2 N1/N2: the follower report of a leaderless partition.
     struct LeaderlessReport {
         bool    pending = false;

@@ -429,18 +429,19 @@ struct ErrorPayloadBuf {
 /// level is committed to __cluster_metadata (FeatureLevelRecord) by the
 /// controller only once EVERY cluster member advertised support for it
 /// (AlterIsrMsg::kNodeFeatureLevelSlot), or at the bootstrap of a fresh
-/// metadata log.  A request kind an older controller would silently drop is
-/// sent only when the COMMITTED level supports it; below it the replica keeps
-/// the pre-feature behaviour (rolling-upgrade compatibility).  Monotonic.
+/// metadata log.  It gates ONLY request / record kinds an older peer cannot
+/// handle — never a safety mechanism that already shipped (review M1): the
+/// leader-epoch fence protocol (refuse + bump + leaderless reports, 9c80eab)
+/// is part of kBase and is unconditional.  Monotonic.
 namespace MetadataFeature {
-/// Pre-D15 binaries: no leader-epoch bump requests / leaderless reports.
+/// main as of 9c80eab (the epoch fence protocol included).
 inline constexpr int16_t kBase = 0;
-/// The leader-epoch restart fence protocol: a replica refuses leadership at a
-/// fenced epoch and asks for a bump (kLeaderEpochBump), leaderless follower
-/// reports, the log-dir-offline flag, and leaderless marks on the records.
-inline constexpr int16_t kEpochFence = 1;
+/// D15: leaderless marks on NO_LEADER records (trailer) — older binaries
+/// ignore them, so nothing is gated on it yet; future request kinds an older
+/// controller would drop are gated on a level above it.
+inline constexpr int16_t kLeaderlessMarks = 1;
 /// The level this binary supports.
-inline constexpr int16_t kLatest = kEpochFence;
+inline constexpr int16_t kLatest = kLeaderlessMarks;
 } // namespace MetadataFeature
 
 struct AlterIsrMsg {

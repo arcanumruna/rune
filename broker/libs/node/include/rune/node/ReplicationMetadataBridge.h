@@ -302,8 +302,6 @@ private:
         if (!anyChange) {
             return 0;
         }
-        // D15: every role op carries the COMMITTED metadata feature level.
-        roleFeatureLevel_ = msm_->featureLevel();
 
         // Apply role transitions for user partitions only.
         // electedLeaders + leaderUpdates → becomeLeader
@@ -556,10 +554,6 @@ private:
     // Snapshot of the committed map as of the last applyUserPartitionRoles call.
     // Used to compute the delta on subsequent cycles.
     rune::metadata::AssignmentMap                  prevMap_;
-    /// D15: the committed feature level stamped on the role ops being routed
-    /// (Step B: the MSM's; Step A internal partitions: kLatest — they are not
-    /// controller-managed).
-    int16_t roleFeatureLevel_ = rune::replication::MetadataFeature::kLatest;
 
     // Last observed consensus state (initialized to "no leader, epoch 0").
     // These are duty-cycle-thread-only (not atomic).
