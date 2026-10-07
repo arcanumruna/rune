@@ -260,40 +260,13 @@ TEST(GatewayReplicationWiring, ThreeNode_FollowersConverge_HWAdvances) {
     ASSERT_TRUE(node1.awaitLeader(8s)) << "node1 did not converge to a leader";
     ASSERT_TRUE(node2.awaitLeader(8s)) << "node2 did not converge to a leader";
 
-    // Give the metadata bridge a moment to apply the initial becomeLeader/becomeFollower
-    // transition (it fires on the first duty-cycle after election convergence).
-    std::this_thread::sleep_for(300ms);
-
-    // Determine which node is the leader.
-    const rune::consensus::NodeId lid = node0.leaderId();
-    ASSERT_GE(lid, 0) << "no leader elected";
-    ASSERT_LE(lid, 2);
-    ASSERT_EQ(node1.leaderId(), lid);
-    ASSERT_EQ(node2.leaderId(), lid);
-
-    // Access the leader's partition replica via its replicaRegistry.
-    rune::node::BrokerNode* leaderNode = nullptr;
-    if (lid == 0) leaderNode = &node0;
-    else if (lid == 1) leaderNode = &node1;
-    else leaderNode = &node2;
-
-    ASSERT_NE(leaderNode, nullptr);
-
-    // Get the leader's PartitionReplica (topicId=0, partition=0).
-    ASSERT_TRUE(hasReplica(*leaderNode)) << "leader has no replica for topic=0 partition=0";
-
-    // Wait for the metadata bridge to transition the replica to Leader role.
-    // Uses the atomic mirror in ReplicationMetadataBridge — safe from the test thread.
-    // The bridge fires on the first duty-cycle after election converges; allow 5 s.
-    {
-        const auto roleDeadline = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < roleDeadline) {
-            if (leaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(10ms);
-        }
-    }
-    ASSERT_TRUE(leaderNode->replicationIsLeaderForTest())
-        << "leader's replication bridge must report isLeader after election convergence";
+    // D11: the PARTITION leader of (topic 0, partition 0) — not the consensus
+    // leader, which differs whenever another node wins the election under load
+    // (its gateway then answers Redirect, never a ProduceResponse).
+    const std::array<rune::node::BrokerNode*, 3> partNodes{&node0, &node1, &node2};
+    const int lid = settledPartitionLeader(partNodes);
+    ASSERT_GE(lid, 0) << "no settled partition leader for topic 0 / partition 0";
+    rune::node::BrokerNode* leaderNode = partNodes[static_cast<std::size_t>(lid)];
 
     // Produce N records via the leader's gateway over real aeron:udp.
     //
