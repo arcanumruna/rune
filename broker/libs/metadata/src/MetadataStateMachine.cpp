@@ -69,7 +69,7 @@ void MetadataStateMachine::apply(const uint8_t* buf, std::size_t len, int64_t re
         for (int32_t v : rec->replicas) pa.replicas.push_back(v);
 
         // D15: a leaderless record's mark (trailer; absent on older records).
-        if (pa.leaderNode == NO_LEADER) {
+        if (pa.leaderNode == NO_LEADER && rec->recordVersion == 0) {
             const std::size_t base = leaderless_trailer::baseSize(*rec);
             if (len > base) pa.mark = leaderless_trailer::decode(buf + base, len - base);
         }

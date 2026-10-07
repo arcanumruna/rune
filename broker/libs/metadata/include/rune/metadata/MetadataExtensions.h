@@ -2,20 +2,21 @@
 // MetadataExtensions.h — D15: broker-owned additions to the __cluster_metadata
 // record set that stay readable by OLDER binaries (rolling upgrades).
 //
-//   1. FeatureLevelRecord (recordType 6) — the cluster's committed metadata
+//   1. FeatureLevelRecord (recordType 0x8001, broker-owned id space) — the cluster's committed metadata
 //      feature level (KRaft metadata.version).  An older MSM skips an unknown
 //      record type deterministically (MetadataStateMachine::apply default).
 //   2. Leaderless mark — a fixed-size TRAILER appended after an
 //      UpdatePartitionAssignment record that makes a partition leaderless,
 //      naming WHY (an empty memory-backed leader, an offline log dir) and the
 //      replica / process incarnation it is about.  The rune-protocol decoder
-//      ignores bytes past the replicas array, so an older MSM installs the
+//      ignores bytes past the replicas array (recordVersion 0 only — a later
+//      protocol version may append its own fields), so an older MSM installs the
 //      same assignment; a newer one also installs the mark, which a successor
 //      controller re-derives its leaderless decisions from (it survives a
 //      controller failover — it is replicated state, not controller memory).
 //
 // Wire (little-endian, like every metadata record):
-//   FeatureLevelRecord: [0..1] type=6  [2] version=0  [3..4] level int16
+//   FeatureLevelRecord: [0..1] type=0x8001  [2] version=0  [3..4] level int16
 //   Leaderless trailer: [0] tag=0xD1  [1] kind uint8  [2..5] node int32
 //                       [6..13] incarnation int64
 #include <rune/metadata/PartitionAssignment.h>
@@ -28,7 +29,11 @@
 
 namespace rune::metadata {
 
-inline constexpr uint16_t kFeatureLevelRecordType = 6;
+/// Broker-owned record types live in the HIGH-BIT id space (review m4):
+/// rune-protocol's MetadataRecordType owns the small ids (1..5 today) and adds
+/// the next ones there — never a collision.  (Formal reservation of 0x8000+
+/// in rune-protocol's enum docs: backlog D15b.)
+inline constexpr uint16_t kFeatureLevelRecordType = 0x8001;
 
 struct FeatureLevelRecord {
     int16_t level = 0;

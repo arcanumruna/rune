@@ -1088,3 +1088,32 @@ TEST(MetadataStateMachineRegression, D15ExtensionsReadableByOlderDecodersRegress
     EXPECT_EQ(msm.featureLevel(), 1) << "the feature level went backwards";
     EXPECT_EQ(msm.assignment(4, 1)->leaderEpoch, 9) << "a feature record touched the assignment map";
 }
+
+// D15 review m4: the broker-owned record type must never collide with a type
+// rune-protocol adds next (it owns the small ids 1..N): broker extensions use
+// the high-bit space.  And the leaderless trailer is parsed only after a
+// VERSION-0 assignment record — a future protocol version may append its own
+// fields there.
+TEST(MetadataStateMachineRegression, D15ExtensionIdsOutsideProtocolSpaceRegression) {
+    EXPECT_GE(kFeatureLevelRecordType, 0x8000u) << "broker-owned record type in rune-protocol's id space";
+    std::vector<int32_t> isr{2}, reps{1, 2, 3};
+    UpdatePartitionAssignmentRecord rec;
+    rec.topicId = 5; rec.partition = 0; rec.leaderNode = NO_LEADER;
+    rec.isr = Int32ArrayView{isr.data(), 1}; rec.replicas = Int32ArrayView{reps.data(), 3};
+    rec.leaderEpoch = 3; rec.partitionEpoch = 3;
+    uint8_t buf[256];
+    std::size_t n = rec.encode(buf, sizeof buf);
+    LeaderlessMark mark;
+    mark.kind = LeaderlessMark::Kind::LogDirOffline; mark.node = 2; mark.incarnation = 9;
+    n += leaderless_trailer::encode(buf + n, sizeof buf - n, mark);
+    buf[2] = 1;   // a future recordVersion whose own fields follow the replicas
+    const auto v1 = UpdatePartitionAssignmentRecord::decode(buf, n);
+    if (v1.has_value()) {   // only if this rune-protocol accepts v1
+        MetadataStateMachine msm;
+        msm.apply(buf, n, 0);
+        msm.commit(0);
+        const auto* pa = msm.assignment(5, 0);
+        ASSERT_NE(pa, nullptr);
+        EXPECT_EQ(pa->mark.kind, LeaderlessMark::Kind::None) << "a v1 record's fields were read as a D15 trailer";
+    }
+}
