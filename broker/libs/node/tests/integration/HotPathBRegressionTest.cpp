@@ -19,6 +19,7 @@
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune/storage/InMemoryLog.h>
 #include <rune/storage/LeaderEpochState.h>
 #include <rune/storage/Log.h>
 
@@ -1140,4 +1141,53 @@ TEST(HotPathBRegression, FailedEpochStateUpdateNeverFallsBackToLegacyRegression)
     PartitionReplica::failInlineEpochStateWritesForTest(0);
     EXPECT_FALSE(fs::exists(d.p / "leader-epoch-checkpoint")) << "a second (legacy) epoch authority was written";
     EXPECT_TRUE(log.storageFailed());
+}
+
+
+// D15 re-review CRITICAL (m5): a MEMORY-backed user replica's restart fence
+// goes through the owning Worker's async epoch-state writer — the real Worker
+// path, not a hand-driven one.  The Worker submitted epoch-state writes for
+// disk-backed replicas only, so a memory replica's deferred leadership waited
+// forever (memory partitions never led in a multi-node cluster).  It must lead
+// once its fence is durable — and not before.
+TEST(HotPathBRegression, MemoryReplicaFenceWrittenByTheWorkerLeadsWhenDurableRegression) {
+    TmpDir d;
+    rune::replication::NullPartitionTransport transport;
+    rune::node::ReplicaRegistry reg;
+    WorkerPool pool{1, rune::metadata::ShardRouter(1)};
+    rune::storage::InMemoryLog log(1 << 20, 10'000);
+    PartitionConfig c;
+    c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+    c.replicaLagMaxOffset = 1'000'000'000;
+    auto r = std::make_unique<PartitionReplica>(c, Role::Follower, 1, std::vector<int32_t>{1},
+                                                std::vector<int32_t>{1}, &log, &transport);
+    r->setExternalFollowerFlush(true);
+    r->setIsrChannel(&transport);
+    const fs::path stateDir = d.p / "1-0.state";
+    r->setMemoryEpochStateDir(stateDir.string(), (d.p / "1-0").string());
+    PartitionReplica* rep = r.get();
+    reg.add(1, 0, std::move(r));
+    pool.setRegistry(&reg);
+    Worker& w = pool.worker(0);
+    w.setWorkerIngress(nullptr, /*active=*/true);
+    w.setShardMode(true);
+    pool.assignFromRegistry(reg);
+    int64_t now = 1'000'000'000;
+    auto pass = [&] { now += 1'000'000; (void)w.doWork(now); };
+    pass();
+    WorkerOp op;
+    op.type = WorkerOp::Type::BecomeLeader;
+    op.topicId = 1; op.partition = 0; op.roleEpoch = 3; op.isr = {1};
+    ASSERT_TRUE(pool.tryEnqueueOp(1, 0, std::move(op)));
+    pass();   // the role-op pass: submits the write, never waits for it
+    EXPECT_NE(rep->role(), Role::Leader) << "led at epoch 3 before its fence was durable";
+    EXPECT_TRUE(rep->leadershipPendingForTest());
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (rep->role() != Role::Leader && std::chrono::steady_clock::now() < end) { pass(); std::this_thread::yield(); }
+    ASSERT_EQ(rep->role(), Role::Leader) << "the memory replica's fence write was never submitted: it never leads";
+    EXPECT_EQ(rep->epoch(), 3);
+    EXPECT_EQ(rep->epochStateInlineWritesForTest(), 0u) << "a synchronous epoch write on the worker";
+    const auto st = rune::storage::LeaderEpochState::read(stateDir.string());
+    ASSERT_EQ(st.state, rune::storage::LeaderEpochState::FileState::Valid);
+    EXPECT_GE(st.fence, 3);
 }
