@@ -732,10 +732,26 @@ int LogSegment::truncateInPlace(int64_t truncateOffset, int64_t& keptMaxTs) noex
 }
 
 int64_t LogSegment::recover(bool syncIndex) {
+    // D20 review L3 — ONE rule for every error: it fails the log (sticky
+    // failedErrno, routed to the halt by the owner's loop), and it THROWS only
+    // while the segment's state is unknown (fstat / pread: no valid prefix
+    // established — a caller must never act on it, e.g. delete "later"
+    // segments on a bogus chain end).  Once the valid prefix is known
+    // (ftruncate, index rename, index msync, directory fsync) recover()
+    // completes the in-memory state and returns — Task 10 fix 3: no exception
+    // escapes a worker's role-change truncation.  Without a storage state
+    // (standalone segment) an error always throws (nothing else reports it).
+    auto failSticky = [this](int e) {
+        if (storage_ && storage_->failedErrno == 0) storage_->failedErrno = e != 0 ? e : EIO;
+    };
+    auto fail = [&](int e, const std::string& what) {
+        if (e == 0) e = EIO;
+        failSticky(e);
+        throw std::system_error(e, std::system_category(), what);
+    };
     // D20: read the whole .log through fd_ (pread), not a FILE*-backed stream.
     struct stat st{};
-    if (::fstat(fd_, &st) != 0)
-        throw std::system_error(errno, std::system_category(), "LogSegment::recover fstat " + logPath_);
+    if (::fstat(fd_, &st) != 0) fail(errno, "LogSegment::recover fstat " + logPath_);
     const int64_t fileSize = static_cast<int64_t>(st.st_size);
     std::vector<uint8_t> buf(static_cast<size_t>(fileSize));
     {
@@ -744,7 +760,7 @@ int64_t LogSegment::recover(bool syncIndex) {
             const ssize_t r = ::pread(fd_, buf.data() + got, buf.size() - got, static_cast<off_t>(got));
             if (r < 0) {
                 if (errno == EINTR) continue;
-                throw std::system_error(errno, std::system_category(), "LogSegment::recover pread " + logPath_);
+                fail(errno, "LogSegment::recover pread " + logPath_);
             }
             if (r == 0) break;   // shrank under us: validate what was read
             got += static_cast<std::size_t>(r);
@@ -782,8 +798,12 @@ int64_t LogSegment::recover(bool syncIndex) {
 
     // Truncate torn tail.
     // D20: through the segment's own fd (its inode), never by path.
-    if (::ftruncate(fd_, static_cast<off_t>(validBytes)) != 0)
-        throw std::system_error(errno, std::system_category(), "LogSegment::recover ftruncate " + logPath_);
+    if (::ftruncate(fd_, static_cast<off_t>(validBytes)) != 0) {
+        // State known (validBytes / next); the torn tail stays on disk behind a
+        // failed log (no append reaches it) and restart recovery cuts it.
+        if (!storage_) fail(errno, "LogSegment::recover ftruncate " + logPath_);
+        failSticky(errno);
+    }
     logSize_ = validBytes; nextOffset_ = next;
     if (syncedBytes_ > validBytes) syncedBytes_ = validBytes;   // E2 crash seam
     // E1d: recover() itself proves nothing durable — the owning Log decides
@@ -803,17 +823,10 @@ int64_t LogSegment::recover(bool syncIndex) {
         }
     }
     if (::rename(indexTmp.c_str(), indexPath.c_str()) != 0) {
-        const int e = errno;
-        if (storage_) {
-            // Task 10 fix 3: fail-stop, not an exception escaping a worker loop
-            // (truncateTo on a role change runs on the owning worker).  The log
-            // is permanently failed; its owner's loop routes it to the halt.  The
-            // rebuilt in-memory index (on the .tmp file) stays valid meanwhile.
-            if (storage_->failedErrno == 0) storage_->failedErrno = e != 0 ? e : EIO;
-            return nextOffset_;
-        }
-        throw std::system_error(e, std::system_category(),
-                                "LogSegment::recover rename " + indexTmp + " -> " + indexPath);
+        // State known: the rebuilt in-memory index (on the .tmp file) stays valid.
+        if (!storage_) fail(errno, "LogSegment::recover rename " + indexTmp + " -> " + indexPath);
+        failSticky(errno);
+        return nextOffset_;
     }
     // fsync the directory for durability of the rename
     if (syncIndex) {

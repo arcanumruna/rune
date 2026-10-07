@@ -294,3 +294,42 @@ TEST(SegmentFdScaleRegression, AppendNoSyncRestampResumesAShortWriteRegression) 
         fs::remove_all(dir);
     }
 }
+
+// ---------------------------------------------------------------------------
+// D20 review L3: recover() has ONE error rule — every error fails the log
+// (sticky); it throws only while the segment state is unknown (fstat / pread).
+// It used to throw on ftruncate WITHOUT failing the log (and on fstat / pread
+// without failing it either).
+// ---------------------------------------------------------------------------
+TEST(SegmentFdScaleRegression, RecoverTruncateErrorFailsTheLogRegression) {
+    const fs::path dir = freshDir("rune_d20b_l3_trunc");
+    LogStorageState st;
+    LogSegment seg(dir.string(), 0, 4096, 64 * 1024);
+    seg.setStorageState(&st);
+    const auto b = batchAt(0);
+    seg.append(b, 0);
+    // The segment's fd now names a read-only file: ftruncate fails.
+    const int ro = ::open("/dev/null", O_RDONLY);
+    ASSERT_GE(ro, 0);
+    ASSERT_EQ(::dup2(ro, seg.logFd()), seg.logFd());
+    ::close(ro);
+    EXPECT_NO_THROW(seg.recover()) << "the valid prefix is known: fail-stop, no exception";
+    EXPECT_NE(st.failedErrno, 0) << "the log is failed (sticky)";
+    fs::remove_all(dir);
+}
+
+TEST(SegmentFdScaleRegression, RecoverReadErrorFailsTheLogAndThrowsRegression) {
+    const fs::path dir = freshDir("rune_d20b_l3_read");
+    LogStorageState st;
+    LogSegment seg(dir.string(), 0, 4096, 64 * 1024);
+    seg.setStorageState(&st);
+    seg.append(batchAt(0), 0);
+    // The segment's fd now names a directory: pread fails (EISDIR).
+    const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(dfd, 0);
+    ASSERT_EQ(::dup2(dfd, seg.logFd()), seg.logFd());
+    ::close(dfd);
+    EXPECT_THROW(seg.recover(), std::system_error) << "no valid prefix: never act on it";
+    EXPECT_NE(st.failedErrno, 0) << "and the log is failed (sticky)";
+    fs::remove_all(dir);
+}
