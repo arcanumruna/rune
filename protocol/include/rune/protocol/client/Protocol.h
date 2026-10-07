@@ -15,6 +15,19 @@ inline constexpr uint16_t kProtocolVersion = 3;  // read-rework: PartitionEntry 
 // Kafka caps max.in.flight at 5 for the same reason; Rune pipelines deeper.
 inline constexpr int kIdempotentMaxInFlightBatches = 32;
 
+// client<->broker TLS/AEAD (Task 4): the crypto subheader schema id, and the
+// clientVersion/brokerVersion gates new additive Connect/ConnectResponse
+// fields (and HandshakeContinue{,Response}) are decoded under. kProtocolVersion
+// (the MessageHeader wire version) is NOT bumped — these are purely additive,
+// mirroring the existing blockLength/avail-gated idiom (see DataMessages.h
+// Produce BODY_FIXED_V0/V1). kClientVersion/kBrokerVersion below (in the
+// "Client/Broker versions" section) are bumped to 4 for this capability:
+// crypto is the v4 capability layered on top of the v3 explicit-group-
+// subscriptions capability.
+inline constexpr uint16_t kCryptoSchemaId      = 121;
+inline constexpr int32_t  kClientVersionCrypto = 4;  // minimum ConnectRequest.clientVersion offering crypto fields
+inline constexpr int32_t  kBrokerVersionCrypto = 4;  // minimum broker version choosing crypto fields
+
 enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/consume 16-31, groups/txn 32-63, view 64-95
     Connect          = 1,
     ConnectResponse  = 2,
@@ -26,6 +39,9 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     // MD1 Task 10: Metadata request/response — control range 8-9
     MetadataRequest  = 8,
     MetadataResponse = 9,
+    // client<->broker TLS/AEAD (Task 4): handshake continuation — control range 10-11
+    HandshakeContinue         = 10,
+    HandshakeContinueResponse = 11,
     // produce/consume range (16-31)
     Produce             = 16,
     ProduceResponse     = 17,
@@ -111,6 +127,8 @@ enum class ErrorCode : uint16_t {
     // unknown).  Sent ONLY to clients whose ConnectRequest.clientVersion is
     // >= kClientVersionUnknownProducerId; older clients get OutOfOrderSequence.
     UnknownProducerId      = 28,
+    // client<->broker TLS/AEAD (Task 4)
+    HandshakeFailed        = 29,  // crypto handshake could not complete (cipher mismatch, bad token, decrypt failure, ...)
 };
 
 // ---------------------------------------------------------------------------
@@ -126,10 +144,13 @@ enum class ErrorCode : uint16_t {
 //       correlationId); the coordinator creates no subscription at SyncGroup.
 //       A broker coordinator refuses JoinGroup from a client below 3
 //       (ErrorCode::ProtocolVersion, non-retriable).
+//   4 — client<->broker TLS/AEAD (Task 4): offers crypto fields on Connect
+//       (cipherList/handshakeBytes/authToken) and understands
+//       HandshakeContinue/HandshakeContinueResponse. See kClientVersionCrypto.
 // ---------------------------------------------------------------------------
 inline constexpr int32_t kClientVersionUnknownProducerId          = 2;
 inline constexpr int32_t kClientVersionExplicitGroupSubscriptions = 3;
-inline constexpr int32_t kClientVersion                           = 3;   // what this protocol's client announces
+inline constexpr int32_t kClientVersion                           = 4;   // what this protocol's client announces
 
 // ---------------------------------------------------------------------------
 // Broker versions (ConnectResponse.brokerVersion, an additive trailing field;
@@ -138,9 +159,11 @@ inline constexpr int32_t kClientVersion                           = 3;   // what
 //       coordinator does not auto-subscribe members, Records carry the
 //       creating Subscribe's correlationId, session / subscription ids are
 //       cluster-unique.  A client runs a GroupConsumer only against >= 3.
+//   4 — client<->broker TLS/AEAD (Task 4): may choose a cipher / send
+//       handshake bytes on ConnectResponse. See kBrokerVersionCrypto.
 // ---------------------------------------------------------------------------
 inline constexpr int32_t kBrokerVersionExplicitGroupSubscriptions = 3;
-inline constexpr int32_t kBrokerVersion                           = 3;   // what this protocol's broker announces
+inline constexpr int32_t kBrokerVersion                           = 4;   // what this protocol's broker announces
 
 /// True when a session that connected with `clientVersion` may be answered
 /// UnknownProducerId (else the broker answers OutOfOrderSequence, as before).
