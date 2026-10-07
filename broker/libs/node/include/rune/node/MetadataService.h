@@ -1447,8 +1447,11 @@ public:
                 return inflight_.count(partitionKey_(br.rec.topicId, br.rec.partition)) != 0;
             });
         }
-        // D15 m3: a co-partition unit with an empty-memory leaderless member
-        // is decided as a whole by decideLeaderless_ — never piecemeal here.
+        // D15 m3: the LEADERLESS members of a co-partition unit with an
+        // empty-memory member are decided by decideLeaderless_ (on fresh
+        // reports) — never piecemeal here.  Siblings that HAVE a leader keep
+        // the balancer's normal failover (re-review MAJOR: a held member must
+        // never block a sibling whose leader died).
         if (!emptyMemoryLeader_.empty()) {
             unitScratch_.clear();
             for (const auto& [k, e] : emptyMemoryLeader_) {
@@ -1457,8 +1460,11 @@ public:
             }
             std::erase_if(recs, [this](const rune::metadata::BalancerRecord& br) {
                 const int64_t k = partitionKey_(br.rec.topicId, br.rec.partition);
-                return std::find(unitScratch_.begin(), unitScratch_.end(), k) != unitScratch_.end() &&
-                       br.rec.leaderNode != rune::metadata::NO_LEADER;
+                if (br.rec.leaderNode == rune::metadata::NO_LEADER ||
+                    std::find(unitScratch_.begin(), unitScratch_.end(), k) == unitScratch_.end())
+                    return false;
+                const auto* cur = msm_.assignment(br.rec.topicId, br.rec.partition);
+                return cur != nullptr && cur->leaderNode == rune::metadata::NO_LEADER;
             });
         }
         // MAJOR-1: the bump requests the balancer did not fail over (before

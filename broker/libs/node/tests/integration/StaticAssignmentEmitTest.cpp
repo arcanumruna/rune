@@ -2404,3 +2404,36 @@ TEST(D15FeatureGateRegression, LevelRaisedOnlyOnceEveryMemberSupportsItRegressio
     drive(up, 50);
     EXPECT_EQ(up.featureLevel(), MetadataFeature::kLatest);
 }
+
+// D15 re-review MAJOR (m3): while one member of a co-partition unit is HELD
+// leaderless (an empty memory leader, no clean candidate, survivor election
+// off), a sibling whose live leader dies must still fail over normally — the
+// balancer filter may hold back only the leaderless member's record.
+TEST(D15MemoryEpochRegression, HeldUnitMemberNeverBlocksSiblingFailoverRegression) {
+    CtlRig c(true, {TopicSpec{0, 1, 3, "g", "k"}, TopicSpec{1, 1, 3, "g", "k"}});
+    const int32_t L = c.svc->assignment(0, 0)->leaderNode;
+    ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, L);
+    const int32_t A = L == 1 ? 2 : 1, B = 6 - L - A;
+    {   // topic 0 (memory): ISR {L, A}
+        const PartitionAssignment a = *c.svc->assignment(0, 0);
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = 0; m.partition = 0; m.leaderId = L; m.leaderEpoch = a.leaderEpoch;
+        m.isrCount = 2; m.isr[0] = L; m.isr[1] = A; m.partitionEpoch = a.partitionEpoch;
+        ASSERT_TRUE(c.svc->onAlterIsr(m));
+        c.drive(50);
+    }
+    (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(0, 0), 0, 2, /*memory=*/true));
+    (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(1, 0), 1, 2, /*memory=*/false, /*leo=*/5));
+    c.tick({L});   // A, B not live: topic 0 goes leaderless, topic 1 stays with L
+    ASSERT_EQ(c.svc->assignment(0, 0)->leaderNode, NO_LEADER);
+    ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, L);
+    const int32_t e0 = c.svc->assignment(0, 0)->leaderEpoch;
+    (void)c.svc->onAlterIsr(reportOf(0, L, e0, 0, 2));
+    (void)c.svc->onAlterIsr(reportOf(0, A, e0, 0, 1));
+    (void)c.svc->onAlterIsr(reportOf(0, B, e0, 10, 1));   // non-ISR holds more: no clean candidate
+    c.tick({A, B});   // L dies
+    c.tick({A, B});
+    EXPECT_EQ(c.svc->assignment(0, 0)->leaderNode, NO_LEADER) << "the held member was elected uncleanly";
+    EXPECT_EQ(c.svc->assignment(1, 0)->leaderNode, A)
+        << "the sibling's dead leader was never failed over while a unit member is held";
+}

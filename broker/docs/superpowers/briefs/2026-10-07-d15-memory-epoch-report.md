@@ -105,3 +105,9 @@
 - **Verification:** targeted `ctest -j4 -E DutyPassLatencyGate` (consensus, election, metadata/MSM, StaticAssignmentEmit, rebalance, AlterIsr, controlled shutdown, epoch-restart, fence, memory, bridge, hot-path B, epoch state): 516/516 passed. `check_no_atomics.py` OK.
 
 Superseded statements above: item 3's sender-side gate (removed by M1); "survivor election picks one replica available for all" (M2); record type 6 (now 0x8001); the remaining-inconsistency paragraph (fixed by m5).
+
+## Re-review fixes (briefs/2026-10-07-d15-rereview.md)
+
+- **CRITICAL (m5):** `Worker::submitEpochStateWrite_` skipped non-disk replicas, so a memory replica's deferred leadership never completed. A memory replica's write now goes through the same io-backend path, routed as `MemEpochState` by replica identity. It is completed only while the replica is still owned, and a new owner rewrites a write whose completion went elsewhere. RED->GREEN through a real Worker: `HotPathBRegression.MemoryReplicaFenceWrittenByTheWorkerLeadsWhenDurableRegression`.
+- **MAJOR (m3):** the balancer filter now holds back only the records of a unit's LEADERLESS members. A sibling whose leader died fails over normally. RED->GREEN: `D15MemoryEpochRegression.HeldUnitMemberNeverBlocksSiblingFailoverRegression`.
+- **Targeted `ctest -j4 -E DutyPassLatencyGate`** (the earlier set plus WorkerPool, ShardWorker and Durability): 609/609 passed. `check_no_atomics` OK.
