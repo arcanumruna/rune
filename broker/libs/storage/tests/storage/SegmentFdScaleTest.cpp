@@ -15,9 +15,12 @@
 // never wall-clock.  Every test here is a regression test.
 #include <gtest/gtest.h>
 #include <rune/storage/LogSegment.h>
+#include <rune/storage/MappedFile.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <cerrno>
+#include <cstring>
+#include <fstream>
 #include <filesystem>
 #include <system_error>
 #include <memory>
@@ -331,5 +334,49 @@ TEST(SegmentFdScaleRegression, RecoverReadErrorFailsTheLogAndThrowsRegression) {
     ::close(dfd);
     EXPECT_THROW(seg.recover(), std::system_error) << "no valid prefix: never act on it";
     EXPECT_NE(st.failedErrno, 0) << "and the log is failed (sticky)";
+    fs::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// D20 review L5: a read map built off the owner borrows a DUP of the segment's
+// fd that the provisioner closes right after mapping.  Installed into the
+// segment, a later owner remap (resize) went through that closed fd NUMBER —
+// remapping whatever file reused it.  The installed map now remaps through the
+// segment's own fd.
+// ---------------------------------------------------------------------------
+TEST(SegmentFdScaleRegression, InstalledOffOwnerReadMapRemapsTheSegmentsOwnFdRegression) {
+    const fs::path dir = freshDir("rune_d20b_l5_remap");
+    LogSegment seg(dir.string(), 0, 4096, 1 << 20);
+    int64_t off = 0;
+    const std::string big(64 * 1024, 'x');
+    auto fillTo = [&](int64_t bytes) {
+        while (seg.sizeBytes() < bytes) {
+            RecordBatchBuilder b(off, 1000);
+            b.append("k", big, 1000);
+            const auto bb = b.build();
+            off = seg.appendNoSync(bb.data(), bb.size(), off);
+        }
+    };
+    fillTo(int64_t{1} << 19);   // 0.5 MiB
+    // The provisioner's growth: map a dup (1 MiB), close the dup.
+    const int dupFd = ::fcntl(seg.logFd(), F_DUPFD_CLOEXEC, 0);
+    ASSERT_GE(dupFd, 0);
+    auto grown = std::make_unique<MappedFile>(MappedFile::BorrowedFd{dupFd}, std::string(), std::size_t{1} << 20);
+    ::close(dupFd);
+    // A decoy file reuses the closed fd number.
+    const fs::path decoy = dir / "decoy.bin";
+    { std::ofstream f(decoy, std::ios::binary); const std::string junk(4 << 20, 'J'); f << junk; }
+    const int decoyFd = ::open(decoy.c_str(), O_RDONLY);
+    ASSERT_EQ(decoyFd, dupFd) << "precondition: the fd number was reused";
+    fillTo(int64_t{3} << 19);   // ~1.5 MiB: past the 1 MiB map
+    (void)seg.swapReadMap(std::move(grown));
+    seg.setOwnerRemap(true);   // e.g. the async growth failed: the owner remaps
+    const auto v = seg.readView(0, 1 << 30);
+    ASSERT_FALSE(v.empty());
+    ASSERT_EQ(static_cast<int64_t>(v.len), seg.sizeBytes());
+    std::vector<uint8_t> disk(v.len);
+    ASSERT_EQ(::pread(seg.logFd(), disk.data(), disk.size(), 0), static_cast<ssize_t>(disk.size()));
+    EXPECT_EQ(std::memcmp(v.data, disk.data(), v.len), 0) << "the remap read another file";
+    ::close(decoyFd);
     fs::remove_all(dir);
 }

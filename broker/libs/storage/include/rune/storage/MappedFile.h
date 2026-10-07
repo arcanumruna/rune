@@ -19,6 +19,11 @@ public:
     /// be mapped in its place.  Maps at least the file's current size.
     struct BorrowedFd { int fd; };
     MappedFile(BorrowedFd borrowedFd, std::string path, size_t initialBytes);
+    /// D20 review L5: point a borrowed-fd mapping's future resize() at `fd`
+    /// (the fd its new owner keeps open), or -1 = no fd (a later resize then
+    /// fails instead of remapping a reused fd number).  The current mapping is
+    /// untouched.  Only for a borrowed-fd mapping.
+    void rebindBorrowedFd(int fd) noexcept { if (borrowed_) borrowedFd_ = fd; }
     ~MappedFile();
     MappedFile(const MappedFile&) = delete;
     MappedFile& operator=(const MappedFile&) = delete;
@@ -46,6 +51,7 @@ public:
 private:
     std::string path_; uint8_t* data_ = nullptr; size_t size_ = 0; int fd_ = -1; bool writable_;
     int borrowedFd_ = -1;   ///< D3b r2: read-only mapping through a caller-owned fd (never closed here)
+    bool borrowed_ = false; ///< built from a BorrowedFd (resize: only ever through borrowedFd_)
     void mapNow();
 };
 } // namespace rune::storage

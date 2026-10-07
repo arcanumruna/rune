@@ -194,6 +194,11 @@ std::size_t LogSegment::readMapBytesFor(int64_t rollBytes) noexcept {
 
 std::unique_ptr<MappedFile> LogSegment::swapReadMap(std::unique_ptr<MappedFile> m) noexcept {
     std::unique_ptr<MappedFile> old = std::move(readMap_);
+    // D20 review L5: a map built off the owner borrowed a dup the provisioner
+    // has already closed — remap only ever through THIS segment's fd; the
+    // retired map keeps no fd (its fd number may be reused after the segment).
+    if (m) m->rebindBorrowedFd(fd_);
+    if (old) old->rebindBorrowedFd(-1);
     readMap_ = std::move(m);
     readMapSize_ = readMap_ ? readMap_->size() : 0;
     return old;
