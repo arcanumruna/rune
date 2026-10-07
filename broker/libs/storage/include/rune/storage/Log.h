@@ -332,6 +332,10 @@ public:
     /// after a truncation are never treated as already flushed.  Owner-thread
     /// only (the thread that appends / truncates); no allocation.
     static constexpr int64_t kNoTruncation = INT64_MAX;
+    /// Largest accepted segment roll size: segment positions are 32-bit, and a
+    /// deferred roll may overshoot rollBytes by one maximal batch (64 MiB
+    /// headroom).  NodeConfig refuses a larger segmentRollBytes (D19 L1).
+    static constexpr int64_t kMaxRollBytes = int64_t{INT32_MAX} - (int64_t{64} << 20);
     [[nodiscard]] int64_t takeTruncationLowWater() noexcept {
         const int64_t v = truncationLowWater_;
         truncationLowWater_ = kNoTruncation;
@@ -1356,7 +1360,7 @@ private:
         // Review L1: never past the 32-bit segment position limit (minus room
         // for one maximal batch).
         const int64_t cap = rollBytes_ + std::clamp<int64_t>(rollBytes_, int64_t{1} << 20, int64_t{256} << 20);
-        return std::min<int64_t>(cap, int64_t{INT32_MAX} - (int64_t{64} << 20));
+        return std::min<int64_t>(cap, kMaxRollBytes);
     }
 
     /// Owner: the staging-rename request ring has a free slot.

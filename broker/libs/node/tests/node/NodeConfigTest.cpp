@@ -10,6 +10,8 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace rune::node {
 
@@ -2754,3 +2756,33 @@ TEST(NodeConfigRegression, UncleanConsensusElection_DefaultOffEnvOptIn) {
     EXPECT_FALSE(off.config->uncleanConsensusElection);
 }
 } // namespace rune::node
+
+namespace rune::node {
+// D19 review L1: a segment's positions are 32-bit — a segmentRollBytes past the
+// segment position limit (INT32_MAX minus one maximal batch of headroom) is
+// refused at config time instead of being clamped silently at roll time.
+TEST(NodeConfigTest, SegmentRollBytesPastPositionLimitRefusedRegression) {
+    auto env = base3node();
+    env["RUNE_TOPICS"] = "big:1:delete:" + std::to_string(int64_t{2} << 30);   // 2 GiB
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.error.empty());
+    EXPECT_NE(r.error.find("segmentRollBytes"), std::string::npos) << r.error;
+
+    env["RUNE_TOPICS"] = "big:1:delete:" + std::to_string(int64_t{1} << 30);   // 1 GiB: fine
+    auto ok = parseNodeConfig(fakeEnv(env));
+    ASSERT_TRUE(ok.error.empty()) << ok.error;
+    EXPECT_EQ(ok.config->topics[0].segmentRollBytes, int64_t{1} << 30);
+}
+
+// D19 review L5: the provision depth is clamped to [1, 8] (same as the agent).
+TEST(NodeConfigTest, SegmentProvisionDepthClampedToOneEight) {
+    for (const auto& [raw, want] : std::vector<std::pair<const char*, int32_t>>{
+             {"0", 1}, {"1", 1}, {"3", 3}, {"8", 8}, {"64", 8}, {"-5", 1}}) {
+        auto env = base3node();
+        env["RUNE_SEGMENT_PROVISION_DEPTH"] = raw;
+        auto r = parseNodeConfig(fakeEnv(env));
+        ASSERT_TRUE(r.error.empty()) << r.error;
+        EXPECT_EQ(r.config->segmentProvisionDepth, want) << raw;
+    }
+}
+}  // namespace rune::node

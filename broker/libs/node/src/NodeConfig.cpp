@@ -1,6 +1,7 @@
 #include <rune/node/NodeConfig.h>
 #include <rune/consensus/PeerResolution.h>
-#include <rune/node/Worker.h>                         // Worker::maxAcceptableBatchBytes (THE batch limit)
+#include <rune/node/Worker.h>
+#include <rune/storage/Log.h>                       // Log::kMaxRollBytes                         // Worker::maxAcceptableBatchBytes (THE batch limit)
 
 #include <stdexcept>
 
@@ -912,6 +913,10 @@ ConfigResult parseNodeConfig(
                 {
                     std::string err = parseOptField(1, "segmentRollBytes", ts.segmentRollBytes, false);
                     if (!err.empty()) return {{}, err};
+                    // D19 L1: segment positions are 32-bit (Log::kMaxRollBytes).
+                    if (ts.segmentRollBytes > rune::storage::Log::kMaxRollBytes)
+                        return {{}, std::string("RUNE_TOPICS segmentRollBytes must be <= ") +
+                                        std::to_string(rune::storage::Log::kMaxRollBytes) + " in: " + std::string(entry)};
                 }
 
                 // Positional[2] (optional): deleteRetentionMs (non-negative int64)
