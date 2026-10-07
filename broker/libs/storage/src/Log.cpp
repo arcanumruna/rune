@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <new>
+#include <charconv>
 #include <fstream>
 #include <spdlog/spdlog.h>
 #include <cerrno>
@@ -813,49 +814,126 @@ void Log::recoverStagingFiles() {
     //   - orphan staging.index with no matching staging.log → delete.
     std::error_code ec;
     std::vector<std::filesystem::path> stagingLogs, stagingIdx;
+    // D19 N5a: the canonical segment bases — a recovered base must fit the
+    // chain between them (an inline roll can create a canonical successor
+    // while an adopted segment's rename is still queued).
+    std::vector<int64_t> canonical;
     for (auto& e : std::filesystem::directory_iterator(dir_, ec)) {
         const std::string fn = e.path().filename().string();
-        if (fn.rfind(kStagingPrefix, 0) != 0) continue;
+        if (fn.rfind(kStagingPrefix, 0) != 0) {
+            if (e.path().extension() == ".log") {
+                const std::string stem = e.path().stem().string();
+                int64_t b = -1;
+                const auto [ptr, perr] = std::from_chars(stem.data(), stem.data() + stem.size(), b);
+                if (perr == std::errc() && ptr == stem.data() + stem.size()) canonical.push_back(b);
+            }
+            continue;
+        }
         if (e.path().extension() == ".stlog")      stagingLogs.push_back(e.path());
         else if (e.path().extension() == ".stidx") stagingIdx.push_back(e.path());
     }
+    // Read one whole batch at `pos` (nullopt-style: empty = absent / torn / CRC-invalid).
+    auto readBatch = [](std::ifstream& f, int64_t pos, int64_t fileSize) -> std::vector<uint8_t> {
+        constexpr int64_t kOv = rune::protocol::batch::kRecordBatchOverhead;
+        if (fileSize - pos < kOv) return {};
+        std::vector<uint8_t> hdr(static_cast<std::size_t>(kOv));
+        f.clear();
+        f.seekg(pos);
+        if (!f.read(reinterpret_cast<char*>(hdr.data()), kOv)) return {};
+        const int32_t total = rune::protocol::RecordBatchReader(hdr.data(), hdr.size()).totalLength();
+        if (total < kOv || total > fileSize - pos) return {};
+        std::vector<uint8_t> b(static_cast<std::size_t>(total));
+        f.seekg(pos);
+        if (!f.read(reinterpret_cast<char*>(b.data()), total)) return {};
+        if (!rune::protocol::RecordBatchReader(b.data(), b.size()).ensureValid()) return {};
+        return b;
+    };
+    // D19 N5b: the last offset of a file's valid batch prefix (-1 = none) —
+    // logged for both candidates of a duplicate base (crash recovery only).
+    auto lastOffsetOf = [&](const std::filesystem::path& p) -> int64_t {
+        std::ifstream g(p, std::ios::binary);
+        if (!g.is_open()) return -1;
+        g.seekg(0, std::ios::end);
+        const int64_t size = g.tellg();
+        int64_t pos = 0, last = -1;
+        for (;;) {
+            const auto b = readBatch(g, pos, size);
+            if (b.empty()) break;
+            rune::protocol::RecordBatchReader br(b.data(), b.size());
+            last = br.baseOffset() + br.lastOffsetDelta();
+            pos += static_cast<int64_t>(b.size());
+        }
+        return last;
+    };
+    struct Recovered { std::filesystem::path path; int64_t base; };
+    std::vector<Recovered> found;
+    auto quarantine = [&](const std::filesystem::path& lp, const std::string& why) {
+        // Kept (renamed .stlog.corrupt), never parsed into the log and never
+        // reclaimed automatically — the operator decides (D19 N5b).
+        spdlog::error("Log {}: staging file {} {} — quarantined as .corrupt (never parsed / overwritten)",
+                      dir_, lp.string(), why);
+        std::filesystem::rename(lp, lp.string() + ".corrupt", ec);
+    };
     for (const auto& lp : stagingLogs) {
         std::ifstream f(lp, std::ios::binary);
         int64_t fileSize = 0;
         if (f.is_open()) { f.seekg(0, std::ios::end); fileSize = f.tellg(); f.seekg(0, std::ios::beg); }
-        if (fileSize >= static_cast<int64_t>(rune::protocol::batch::kRecordBatchOverhead)) {
-            // Read the first batch header to recover the true base offset.
-            std::vector<uint8_t> hdr(static_cast<std::size_t>(
-                std::min<int64_t>(fileSize, rune::protocol::batch::kRecordBatchOverhead + 64)));
-            f.read(reinterpret_cast<char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
-            f.close();
-            rune::protocol::RecordBatchReader r(hdr.data(), hdr.size());
-            const int32_t total = r.totalLength();
-            // Review m4: trust the base only from a COMPLETE, CRC-valid first
-            // batch, and never overwrite an existing segment.  Anything else is
-            // quarantined (kept, renamed .stlog.corrupt — never deleted, never
-            // parsed into a bogus base); recovery's chain validation handles the
-            // resulting gap like any lost write.
-            bool valid = false;
-            if (total > 0 && total <= fileSize) {
-                std::vector<uint8_t> first(static_cast<std::size_t>(total));
-                std::ifstream f2(lp, std::ios::binary);
-                f2.read(reinterpret_cast<char*>(first.data()), total);
-                valid = f2.good() && rune::protocol::RecordBatchReader(first.data(), first.size()).ensureValid();
-            }
-            const std::string target = valid ? logPathForBase(r.baseOffset()) : std::string();
-            if (valid && !std::filesystem::exists(target, ec)) {
-                std::filesystem::rename(lp, target, ec);
-            } else {
-                spdlog::error("Log {}: staging file {} {} — quarantined as .corrupt (never parsed / overwritten)",
-                              dir_, lp.string(), valid ? "would overwrite an existing segment" : "has no valid first batch");
-                std::filesystem::rename(lp, lp.string() + ".corrupt", ec);
-            }
-            // Drop any co-named staging.index (recover() rebuilds the index).
-        } else {
+        if (fileSize < static_cast<int64_t>(rune::protocol::batch::kRecordBatchOverhead)) {
             f.close();
             std::filesystem::remove(lp, ec); // empty / torn — never adopted
+            continue;
         }
+        // Review m4: trust the base only from a COMPLETE, CRC-valid first
+        // batch, and never overwrite an existing segment.  Anything else is
+        // quarantined; recovery's chain validation handles the resulting gap
+        // like any lost write.
+        const auto first = readBatch(f, 0, fileSize);
+        if (first.empty()) { f.close(); quarantine(lp, "has no valid first batch"); continue; }
+        rune::protocol::RecordBatchReader r(first.data(), first.size());
+        const int64_t base = r.baseOffset();
+        const int64_t end1 = base + int64_t{r.lastOffsetDelta()} + 1;
+        // D19 N5a: baseOffset is not under the CRC — cross-check it.  A
+        // CRC-valid second batch must start exactly where the first ends.
+        const auto second = readBatch(f, static_cast<int64_t>(first.size()), fileSize);
+        f.close();
+        if (!second.empty() && rune::protocol::RecordBatchReader(second.data(), second.size()).baseOffset() != end1) {
+            quarantine(lp, "first batch base " + std::to_string(base) + " does not chain to its next batch");
+            continue;
+        }
+        if (std::find(canonical.begin(), canonical.end(), base) != canonical.end()) {
+            {
+                // D19 N5b: both candidates' extents, so an operator can decide.
+                quarantine(lp, "would overwrite existing segment " + logPathForBase(base) + " (base " +
+                                   std::to_string(base) + "; staging last offset " + std::to_string(lastOffsetOf(lp)) +
+                                   ", existing last offset " + std::to_string(lastOffsetOf(logPathForBase(base))) + ")");
+            }
+            continue;
+        }
+        found.push_back({lp, base});
+    }
+    // D19 N5a: in base order, each recovered base must lie at or above the
+    // end of the segment below it and its records below the segment above it
+    // (a corrupted base cannot overlay live offsets).  Compaction gaps are fine.
+    std::sort(canonical.begin(), canonical.end());
+    std::sort(found.begin(), found.end(), [](const Recovered& x, const Recovered& y) { return x.base < y.base; });
+    for (const auto& rec : found) {
+        auto above = std::upper_bound(canonical.begin(), canonical.end(), rec.base);
+        if (above != canonical.begin()) {
+            const int64_t prevBase = *std::prev(above);
+            const int64_t prevEnd  = std::max(prevBase, lastOffsetOf(logPathForBase(prevBase)) + 1);
+            if (rec.base < prevEnd) {
+                quarantine(rec.path, "base " + std::to_string(rec.base) + " overlaps segment " +
+                                         std::to_string(prevBase) + " (ends at " + std::to_string(prevEnd) + ")");
+                continue;
+            }
+        }
+        if (above != canonical.end() && lastOffsetOf(rec.path) >= *above) {
+            quarantine(rec.path, "records of base " + std::to_string(rec.base) + " overlap segment " +
+                                     std::to_string(*above));
+            continue;
+        }
+        std::filesystem::rename(rec.path, logPathForBase(rec.base), ec);
+        if (!ec) canonical.insert(std::upper_bound(canonical.begin(), canonical.end(), rec.base), rec.base);
     }
     // Remove any leftover staging .index files (rebuilt by recover() when needed).
     for (const auto& ip : stagingIdx) std::filesystem::remove(ip, ec);

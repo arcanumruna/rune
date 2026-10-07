@@ -1302,9 +1302,12 @@ private:
     int32_t indexMaxBytes_;
 
     /// Temp-name prefix for pre-provisioned staging segment files.  Files named
-    /// <dir>/<kStagingPrefix><seq>.log / .index.  Swept at Log construction if
-    /// left over from a crash (they hold no acked data — a crash before the roll
-    /// means the segment was never activated).
+    /// <dir>/<kStagingPrefix><seq>.stlog / .stidx.  Reconciled at Log
+    /// construction (recoverStagingFiles): an empty one is deleted; an adopted
+    /// one is renamed to its base when that base fits the segment chain (D19
+    /// N5a), else quarantined as .stlog.corrupt — kept for the operator and
+    /// NEVER reclaimed automatically (N5b: both candidates' last offsets are
+    /// logged for a duplicate base).
     static constexpr const char* kStagingPrefix = ".staging-";
     /// Monotonic counter so successive staging files get distinct names (avoids
     /// reusing a name whose fd/mmap the append thread may still hold post-adopt).

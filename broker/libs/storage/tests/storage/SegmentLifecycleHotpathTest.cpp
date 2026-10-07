@@ -912,3 +912,74 @@ TEST(SegmentLifecycleRegression, UnpreallocatedReadySegmentIsAdoptedRegression) 
     }
     fs::remove_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// D19 re-review N5a: a staging file's baseOffset is NOT under the batch CRC.
+// A recovered base must fit the segment chain: above every canonical segment
+// base, and (with a second batch) chained by the batch's own lastOffsetDelta.
+// ---------------------------------------------------------------------------
+namespace {
+std::vector<uint8_t> batchAt(int64_t base, int records = 1) {
+    RecordBatchBuilder b(base, 1000);
+    for (int i = 0; i < records; ++i) b.append("k", "v" + std::to_string(base + i), 1000);
+    return b.build();
+}
+void writeStaging(const fs::path& dir, int64_t seq, const std::vector<std::vector<uint8_t>>& batches) {
+    std::ofstream f(dir / (std::string(".staging-") + std::to_string(seq) + ".stlog"), std::ios::binary);
+    for (const auto& b : batches) f.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
+}
+/// Three canonical segments; returns their bases (ascending) and the LEO.
+std::pair<std::vector<int64_t>, int64_t> threeSegments(const fs::path& dir) {
+    Log log(dir.string(), 512);
+    log.recover();
+    int64_t off = 0;
+    while (log.segmentBaseOffsets().size() < 3) off = put(log, off);
+    log.sync();
+    auto bases = log.segmentBaseOffsets();
+    return {std::vector<int64_t>(bases.begin(), bases.end()), log.logEndOffset()};
+}
+}  // namespace
+
+TEST(SegmentLifecycleRegression, StagingBaseBelowTheChainIsQuarantinedRegression) {
+    const auto dir = freshDir("rune_slh_n5a_low");
+    const auto [bases, leo] = threeSegments(dir);
+    ASSERT_GT(bases[1] + 1, bases[0]);
+    // A CRC-valid batch whose (uncovered) baseOffset lands inside the chain.
+    writeStaging(dir, 7, {batchAt(bases[1] + 1)});
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        const auto after = log.segmentBaseOffsets();
+        EXPECT_EQ(std::count(after.begin(), after.end(), bases[1] + 1), 0) << "a bogus base entered the chain";
+        EXPECT_EQ(log.logEndOffset(), leo);
+        EXPECT_EQ(countSuffix(dir, ".stlog.corrupt"), 1u) << "quarantined (kept for the operator)";
+    }
+    fs::remove_all(dir);
+}
+
+TEST(SegmentLifecycleRegression, StagingBaseNotChainedToItsNextBatchIsQuarantinedRegression) {
+    const auto dir = freshDir("rune_slh_n5a_chain");
+    const auto [bases, leo] = threeSegments(dir);
+    // First batch's base corrupted high; the second batch starts at the real LEO.
+    writeStaging(dir, 8, {batchAt(leo + 5000, 2), batchAt(leo + 2)});
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        EXPECT_EQ(log.logEndOffset(), leo) << "a bogus base moved the LEO";
+        EXPECT_EQ(countSuffix(dir, ".stlog.corrupt"), 1u);
+    }
+    fs::remove_all(dir);
+}
+
+TEST(SegmentLifecycleRegression, StagingBaseAboveTheChainIsRecovered) {
+    const auto dir = freshDir("rune_slh_n5a_ok");
+    const auto [bases, leo] = threeSegments(dir);
+    writeStaging(dir, 9, {batchAt(leo, 2), batchAt(leo + 2)});   // the adopted-but-not-renamed segment
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        EXPECT_EQ(log.logEndOffset(), leo + 3) << "an adopted segment's data is never lost";
+        EXPECT_EQ(countSuffix(dir, ".corrupt"), 0u);
+    }
+    fs::remove_all(dir);
+}
