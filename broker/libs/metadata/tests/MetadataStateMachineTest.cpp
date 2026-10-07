@@ -1026,3 +1026,65 @@ TEST(MetadataStateMachineRegression, EpochRegressionRecordsIgnoredInApplyAndRepl
         check(msm, "replayed (pending, one commit)");
     }
 }
+
+// D15: the broker-owned metadata extensions stay readable by OLDER binaries
+// (rolling upgrades) and are folded deterministically by newer ones:
+//  - a leaderless record's mark is a trailer the rune-protocol decoder (what an
+//    older MSM runs) ignores — it installs the same assignment; a newer MSM
+//    installs the mark too;
+//  - a FeatureLevelRecord is an unknown type to an older MSM (skipped by the
+//    switch default); a newer MSM commits it only at its commit point,
+//    monotonically, and a revert drops an uncommitted one.
+#include "rune/metadata/MetadataExtensions.h"
+TEST(MetadataStateMachineRegression, D15ExtensionsReadableByOlderDecodersRegression) {
+    std::vector<int32_t> isr{2, 3}, reps{1, 2, 3};
+    UpdatePartitionAssignmentRecord rec;
+    rec.topicId = 4; rec.partition = 1; rec.leaderNode = NO_LEADER;
+    rec.isr = Int32ArrayView{isr.data(), 2}; rec.replicas = Int32ArrayView{reps.data(), 3};
+    rec.leaderEpoch = 9; rec.partitionEpoch = 11;
+    uint8_t buf[256];
+    std::size_t n = rec.encode(buf, sizeof buf);
+    LeaderlessMark mark;
+    mark.kind = LeaderlessMark::Kind::EmptyMemoryLeader; mark.node = 2; mark.incarnation = 0x1234567890LL;
+    n += leaderless_trailer::encode(buf + n, sizeof buf - n, mark);
+    const auto old = UpdatePartitionAssignmentRecord::decode(buf, n);   // what an older MSM decodes
+    ASSERT_TRUE(old.has_value());
+    EXPECT_EQ(old->leaderNode, NO_LEADER);
+    EXPECT_EQ(old->leaderEpoch, 9);
+    EXPECT_EQ(old->partitionEpoch, 11);
+    EXPECT_EQ(old->replicas.size(), 3u);
+    MetadataStateMachine msm;
+    msm.apply(buf, n, 0);
+    msm.commit(0);
+    const auto* pa = msm.assignment(4, 1);
+    ASSERT_NE(pa, nullptr);
+    EXPECT_EQ(pa->mark.kind, LeaderlessMark::Kind::EmptyMemoryLeader);
+    EXPECT_EQ(pa->mark.node, 2);
+    EXPECT_EQ(pa->mark.incarnation, 0x1234567890LL);
+
+    FeatureLevelRecord f; f.level = 1;
+    uint8_t fb[8];
+    const std::size_t fn = f.encode(fb, sizeof fb);
+    const auto t = peekRecordType(fb, fn);
+    ASSERT_TRUE(t.has_value());
+    EXPECT_NE(*t, MetadataRecordType::CreateTopic);
+    EXPECT_NE(*t, MetadataRecordType::UpdatePartitionAssignment);
+    EXPECT_NE(*t, MetadataRecordType::NodeJoin);
+    EXPECT_NE(*t, MetadataRecordType::NodeLeave);
+    EXPECT_NE(*t, MetadataRecordType::ControlTick);
+    EXPECT_EQ(msm.featureLevel(), 0);
+    msm.apply(fb, fn, 1);
+    EXPECT_EQ(msm.featureLevel(), 0) << "an uncommitted feature level took effect";
+    msm.revert(0);
+    msm.commit(1);
+    EXPECT_EQ(msm.featureLevel(), 0) << "a reverted feature level took effect";
+    msm.apply(fb, fn, 2);
+    msm.commit(2);
+    EXPECT_EQ(msm.featureLevel(), 1);
+    f.level = 0;
+    (void)f.encode(fb, sizeof fb);
+    msm.apply(fb, fn, 3);
+    msm.commit(3);
+    EXPECT_EQ(msm.featureLevel(), 1) << "the feature level went backwards";
+    EXPECT_EQ(msm.assignment(4, 1)->leaderEpoch, 9) << "a feature record touched the assignment map";
+}

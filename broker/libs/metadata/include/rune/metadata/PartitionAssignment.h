@@ -28,12 +28,26 @@ inline constexpr int32_t NO_LEADER_CHANGE = -2;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// In-memory snapshot of a single partition's assignment at a point in time.
+/// D15: why a partition is LEADERLESS — committed with its NO_LEADER record
+/// (MetadataExtensions.h trailer), so a successor controller knows it.
+struct LeaderlessMark {
+    enum class Kind : uint8_t {
+        None              = 0,
+        EmptyMemoryLeader = 1,   ///< `node`, the memory-backed sole-ISR leader, restarted EMPTY
+        LogDirOffline     = 2,   ///< `node`'s log dir is offline (until a new incarnation)
+    };
+    Kind    kind        = Kind::None;
+    int32_t node        = -1;
+    int64_t incarnation = 0;     ///< `node`'s process incarnation the mark is about
+};
+
 struct PartitionAssignment {
     int32_t              leaderNode;      ///< Current leader; NO_LEADER (-1) if none.
     std::vector<int32_t> isr;             ///< In-sync replica set (ordered by convention).
     std::vector<int32_t> replicas;        ///< Full replica set.
     int32_t              leaderEpoch;     ///< Bumps on leader change or replica removal.
     int32_t              partitionEpoch;  ///< Bumps on every applied change.
+    LeaderlessMark       mark{};          ///< D15: set only on a leaderless record that carried one.
 };
 
 /// Describes a requested mutation.  Fields use sentinel values to mean "unchanged".
