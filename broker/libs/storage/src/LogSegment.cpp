@@ -672,11 +672,14 @@ int LogSegment::truncateInPlace(int64_t truncateOffset, int64_t& keptMaxTs) noex
     // batch inside the segment) would cut below the requested offset and
     // silently delete records: fail the log loudly instead.
     if (!atCut && pos != size) [[unlikely]] return EIO;
-    if (!atCut && next < truncateOffset && next != nextOffset_) [[unlikely]] return EIO;
     if (::ftruncate(fd_, static_cast<off_t>(pos)) != 0) return errno != 0 ? errno : EIO;
     const int64_t lastIdx = index_->truncateToPosition(static_cast<int64_t>(pos));
     logSize_ = static_cast<int64_t>(pos);
-    nextOffset_ = next;
+    // Walked the whole segment without reaching truncateOffset (pos == size):
+    // nothing is cut.  A compacted segment's logical end can lie past its last
+    // surviving batch, so keep it, capped at the requested offset (re-review-2
+    // medium: the former "next != nextOffset_" guard fail-stopped this no-op).
+    nextOffset_ = atCut ? next : std::min(nextOffset_, truncateOffset);
     bytesSinceIndex_ = lastIdx < 0 ? 0 : logSize_ - lastIdx;
     if (syncedBytes_ > logSize_) syncedBytes_ = logSize_;
     if (durableNext_ > nextOffset_) durableNext_ = nextOffset_;
