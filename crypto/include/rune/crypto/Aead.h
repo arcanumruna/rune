@@ -17,10 +17,17 @@ public:
     ~AeadCipher();
     AeadCipher(AeadCipher&&) noexcept; AeadCipher& operator=(AeadCipher&&) noexcept;
     AeadCipher(const AeadCipher&) = delete; AeadCipher& operator=(const AeadCipher&) = delete;
-    // out must have room for plainLen + kTagSize. Returns bytes written (plainLen + 16). noexcept, no alloc.
+    // out must have room for plainLen + kTagSize. noexcept, no alloc.
+    // Returns plainLen + kTagSize on success, or 0 on cipher error (e.g. the underlying
+    // EVP nonce-reset/update/finalize/get-tag call failed). On 0 the caller MUST NOT
+    // transmit `out` — treating a cipher error as success would risk encrypting under a
+    // stale nonce (keystream/tag reuse under the same key).
     size_t seal(uint64_t seq, const uint8_t* aad, size_t aadLen,
                 const uint8_t* plain, size_t plainLen, uint8_t* out) noexcept;
-    // out must have room for ctLen - kTagSize. Returns plaintext length, or -1 on auth failure. no alloc.
+    // out must have room for ctLen - kTagSize. no alloc.
+    // Returns the plaintext length on success, or -1 on auth failure (tag mismatch) or
+    // cipher error. On -1 the contents of `out` are UNSPECIFIED and UNAUTHENTICATED —
+    // the caller MUST discard them and must not act on any bytes written there.
     long open(uint64_t seq, const uint8_t* aad, size_t aadLen,
               const uint8_t* ct, size_t ctLen, uint8_t* out) noexcept;
 private:

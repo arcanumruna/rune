@@ -23,11 +23,14 @@ size_t AeadCipher::seal(uint64_t seq,const uint8_t* aad,size_t aadLen,
                         const uint8_t* plain,size_t plainLen,uint8_t* out) noexcept {
   uint8_t nonce[12]; makeNonce(prefix_,seq,nonce);
   int len=0;
-  EVP_EncryptInit_ex(ctx_,nullptr,nullptr,nullptr,nonce); // reuse key, new nonce
-  if(aadLen){ EVP_EncryptUpdate(ctx_,nullptr,&len,aad,(int)aadLen); }
-  EVP_EncryptUpdate(ctx_,out,&len,plain,(int)plainLen);
-  int fin=0; EVP_EncryptFinal_ex(ctx_,out+len,&fin);
-  EVP_CIPHER_CTX_ctrl(ctx_,EVP_CTRL_AEAD_GET_TAG,(int)kTagSize,out+plainLen);
+  // Fail closed: if the nonce-reset step itself silently failed, the ctx would still hold
+  // the PRIOR nonce, so encrypting now would reuse keystream/tag under the same key — the
+  // caller must not transmit, hence 0 ("do not transmit") rather than proceeding.
+  if(EVP_EncryptInit_ex(ctx_,nullptr,nullptr,nullptr,nonce)!=1) return 0; // reuse key, new nonce
+  if(aadLen){ if(EVP_EncryptUpdate(ctx_,nullptr,&len,aad,(int)aadLen)!=1) return 0; }
+  if(EVP_EncryptUpdate(ctx_,out,&len,plain,(int)plainLen)!=1) return 0;
+  int fin=0; if(EVP_EncryptFinal_ex(ctx_,out+len,&fin)!=1) return 0;
+  if(EVP_CIPHER_CTX_ctrl(ctx_,EVP_CTRL_AEAD_GET_TAG,(int)kTagSize,out+plainLen)!=1) return 0;
   return plainLen+kTagSize;
 }
 long AeadCipher::open(uint64_t seq,const uint8_t* aad,size_t aadLen,
@@ -36,10 +39,10 @@ long AeadCipher::open(uint64_t seq,const uint8_t* aad,size_t aadLen,
   size_t bodyLen=ctLen-kTagSize;
   uint8_t nonce[12]; makeNonce(prefix_,seq,nonce);
   int len=0;
-  EVP_DecryptInit_ex(ctx_,nullptr,nullptr,nullptr,nonce);
-  if(aadLen){ EVP_DecryptUpdate(ctx_,nullptr,&len,aad,(int)aadLen); }
-  EVP_DecryptUpdate(ctx_,out,&len,ct,(int)bodyLen);
-  EVP_CIPHER_CTX_ctrl(ctx_,EVP_CTRL_AEAD_SET_TAG,(int)kTagSize,(void*)(ct+bodyLen));
+  if(EVP_DecryptInit_ex(ctx_,nullptr,nullptr,nullptr,nonce)!=1) return -1;
+  if(aadLen){ if(EVP_DecryptUpdate(ctx_,nullptr,&len,aad,(int)aadLen)!=1) return -1; }
+  if(EVP_DecryptUpdate(ctx_,out,&len,ct,(int)bodyLen)!=1) return -1;
+  if(EVP_CIPHER_CTX_ctrl(ctx_,EVP_CTRL_AEAD_SET_TAG,(int)kTagSize,(void*)(ct+bodyLen))!=1) return -1;
   int fin=0;
   if(EVP_DecryptFinal_ex(ctx_,out+len,&fin)<=0) return -1; // tag mismatch
   return (long)bodyLen;
