@@ -91,7 +91,7 @@ struct Rig {
         if (provisioned) {
             prov = std::make_unique<rune::node::SegmentProvisionerAgent>(1);
             prov->addToViewForTest(log.get());
-            log->setProvisioning(prov->hook(), 50);
+            log->setProvisioning(prov->channel(), 50);
         }
         PartitionConfig c;
         c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
@@ -992,7 +992,7 @@ struct ProvLog {
         log->recover();
         log->setDeferSealSync(true);
         prov.addToViewForTest(log.get());
-        log->setProvisioning(prov.hook(), 50);
+        log->setProvisioning(prov.channel(), 50);
     }
     void appendBytes(std::size_t bytes) {   // ~16 KiB batches
         for (std::size_t done = 0; done < bytes;) {

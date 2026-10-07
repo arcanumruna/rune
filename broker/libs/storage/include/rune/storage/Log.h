@@ -1,6 +1,7 @@
 #pragma once
 #include <rune/storage/LogSegment.h>
 #include <rune/consensus/ControlRing.h>
+#include <rune/storage/ProvisionChannel.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -813,7 +814,7 @@ public:
     //
     // Demand-driven (review M3): a PROVISIONED log reserves nothing while its
     // active segment is below the fill threshold; the owner posts a Threshold
-    // demand (ProvisionHook) when the active segment crosses it, and an Adopted
+    // demand (ProvisionChannel) when the active segment crosses it, and an Adopted
     // demand after every adoption (the provisioner then finalizes the rename).
     // A provisioned log never creates a segment on the owner while the
     // provisioner can still deliver: with no ready segment the roll is deferred
@@ -833,26 +834,18 @@ public:
     /// not keep; counted as the roll-hold metric).  Served like Threshold.
     enum class ProvisionDemand : int64_t { Threshold = 1, Adopted = 2, Hold = 3 };
     static constexpr uint32_t kHoldRepostChecks = 1024;
-    /// Demand signal (owner thread → provisioner).  A plain function pointer +
-    /// context (no virtual call).  Returns false when the demand could not be
-    /// queued (full ring): the owner re-posts it later (never lost).
-    struct ProvisionHook {
-        bool (*fn)(void* ctx, Log* log, ProvisionDemand kind) noexcept = nullptr;
-        void* ctx = nullptr;
-        /// Review Md5 (optional): build a `mib` MiB read mapping of `fd` (a dup
-        /// the callee owns) off the owner and hand it back (offerReadMap).
-        bool (*growFn)(void* ctx, Log* log, int64_t packedRequest) noexcept = nullptr;
-        /// Review Md5 (optional): destroy a retired read mapping off the owner.
-        bool (*disposeFn)(void* ctx, void* map) noexcept = nullptr;
-    };
     /// Owner (before the log is driven): this log is served by a provisioning
     /// thread.  `thresholdPct` (1..100): fill level of the active segment at
     /// which the next segment is demanded.  Legacy (never called): an empty
     /// pool falls back to the inline create (control-thread logs, tests).
-    void setProvisioning(ProvisionHook hook, int thresholdPct = 50) noexcept {
+    /// Demands, read-map growth requests and retired read maps go to `channel`
+    /// (D19 L3: a concrete channel — a direct call on the roll path, never an
+    /// indirect one).  A full channel returns false: the owner re-posts later
+    /// (never lost).  nullptr: provisioned, but no demand is ever posted (tests).
+    void setProvisioning(ProvisionChannel* channel, int thresholdPct = 50) noexcept {
         provisioned_ = true;
-        provisionHook_ = hook;
-        asyncReadGrowth_ = hook.growFn != nullptr && hook.disposeFn != nullptr;
+        provisionChannel_ = channel;
+        asyncReadGrowth_ = channel != nullptr && channel->servesReadMaps();
 
         const int pct = thresholdPct < 1 ? 1 : (thresholdPct > 100 ? 100 : thresholdPct);
         provisionThresholdBytes_ = rollBytes_ / 100 * pct + (rollBytes_ % 100) * pct / 100;
@@ -1326,7 +1319,7 @@ private:
     LogSegment* readyFront_ = nullptr;     ///< owner: next ready segment (taken off the ring)
     int         failFront_  = 0;           ///< owner: a pulled failure not yet acted on (errno)
     bool          provisioned_ = false;   ///< see setProvisioning (owner config)
-    ProvisionHook provisionHook_{};
+    ProvisionChannel* provisionChannel_ = nullptr;
     int64_t       provisionThresholdBytes_ = 0;   ///< owner: Threshold demand point
     bool          thresholdPosted_ = false;       ///< owner: Threshold demand queued for this segment
     void (*coldSeamFn_)(void*) = nullptr;         ///< see setColdPathInterleaveForTest
@@ -1337,15 +1330,19 @@ private:
     int           provisionFaultErr_ = 0, provisionFaultN_ = 0;   ///< provisioner (tests)
     /// Owner: pull the next ready record into the front slot (no-op when one is there).
     void pullReady_() noexcept;
+    /// Owner: post one demand (false = channel full, re-post later).
+    bool postDemand_(ProvisionDemand kind) noexcept {
+        return provisionChannel_->post(ProvisionChannel::kDemandMsgType,
+                                       static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(this)),
+                                       static_cast<int64_t>(kind));
+    }
     /// Owner: queue the demands that are due (threshold crossed / adoption).
     void postProvisionDemands_(int64_t activeBytes) noexcept;
     /// Owner: a blocked check (no ready segment): post the Hold demand at the
     /// first check of an episode and every kHoldRepostChecks checks after.
     void noteHoldCheck_() noexcept {
         if ((holdChecks_++ % kHoldRepostChecks) == 0 || holdPostPending_) {
-            holdPostPending_ = provisionHook_.fn == nullptr ||
-                               !provisionHook_.fn(provisionHook_.ctx, this, ProvisionDemand::Hold);
-            if (provisionHook_.fn == nullptr) holdPostPending_ = false;
+            holdPostPending_ = provisionChannel_ != nullptr && !postDemand_(ProvisionDemand::Hold);
         }
     }
     uint32_t holdChecks_ = 0;        ///< owner: blocked checks in the current hold episode

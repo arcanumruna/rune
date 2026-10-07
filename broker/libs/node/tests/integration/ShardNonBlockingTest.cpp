@@ -174,6 +174,15 @@ struct StrictShard {
 // Never-block: no inline fsync on the shard loop.
 // ============================================================================
 
+namespace {
+/// D19 L3: post a demand to the provisioner's concrete channel (as a Log does).
+bool postDemandForTest(rune::storage::ProvisionChannel* ch, rune::storage::Log* log,
+                       rune::storage::Log::ProvisionDemand kind) noexcept {
+    return ch->post(rune::storage::ProvisionChannel::kDemandMsgType,
+                    static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(log)), static_cast<int64_t>(kind));
+}
+}  // namespace
+
 TEST(ShardNonBlockingRegression, FollowerFlushNeverSyncsOnTheWorkerThread) {
     TmpDir d;
     Log log(d.path.string(), 64LL * 1024 * 1024); log.recover();
@@ -3368,8 +3377,8 @@ TEST(SegmentProvisionerRegression, DemandForALogNotInTheViewIsNeverDereferencedR
     prov.doWork(1);
     // A dangling address (a removed replica's freed Log): must never be touched.
     auto* bogus = reinterpret_cast<Log*>(static_cast<std::uintptr_t>(0x10));
-    auto hook = prov.hook();
-    ASSERT_TRUE(hook.fn(hook.ctx, bogus, Log::ProvisionDemand::Threshold));
+    auto* ch = prov.channel();
+    ASSERT_TRUE(postDemandForTest(ch, bogus, Log::ProvisionDemand::Threshold));
     prov.doWork(2);   // would crash if dereferenced
     EXPECT_EQ(prov.demandsIgnoredForTest(), 1u);
     EXPECT_EQ(prov.builtForTest(), 0u);
@@ -3382,9 +3391,9 @@ TEST(SegmentProvisionerRegression, DemandBeforeItsViewIsServedWhenTheViewArrives
     SegmentProvisionerAgent prov(1);
     prov.attachViewChannel(rt.enableProvisionerView());
     PartitionReplica* r = R.add(5, 0);
-    auto hook = prov.hook();
+    auto* ch = prov.channel();
     // A brand-new partition demands before the provisioner saw it in a view.
-    ASSERT_TRUE(hook.fn(hook.ctx, r->log(), Log::ProvisionDemand::Threshold));
+    ASSERT_TRUE(postDemandForTest(ch, r->log(), Log::ProvisionDemand::Threshold));
     prov.doWork(1);
     EXPECT_EQ(prov.demandsIgnoredForTest(), 1u);
     EXPECT_EQ(prov.parkedDemandsForTest(), 1u);
@@ -3409,9 +3418,9 @@ TEST(SegmentProvisionerRegression, OverTheCapBuildsWithoutFallocateNeverAFailure
     PartitionReplica* b = R.add(5, 1);
     rt.doWork(1);
     prov.doWork(1);
-    auto hook = prov.hook();
-    ASSERT_TRUE(hook.fn(hook.ctx, a->log(), Log::ProvisionDemand::Threshold));
-    ASSERT_TRUE(hook.fn(hook.ctx, b->log(), Log::ProvisionDemand::Threshold));
+    auto* ch = prov.channel();
+    ASSERT_TRUE(postDemandForTest(ch, a->log(), Log::ProvisionDemand::Threshold));
+    ASSERT_TRUE(postDemandForTest(ch, b->log(), Log::ProvisionDemand::Threshold));
     prov.doWork(2);
     EXPECT_EQ(prov.builtForTest(), 2u);
     EXPECT_EQ(prov.unpreallocatedForTest(), 1u);
@@ -3438,10 +3447,10 @@ TEST(SegmentProvisionerRegression, ParkedDemandOfARetiredLogIsDiscardedRegressio
     R.add(5, 0);
     rt.doWork(1);
     prov.doWork(1);
-    auto hook = prov.hook();
+    auto* ch = prov.channel();
     for (int i = 0; i < 100; ++i) {
         auto* gone = reinterpret_cast<Log*>(static_cast<std::uintptr_t>(0x1000 + 64 * i));
-        ASSERT_TRUE(hook.fn(hook.ctx, gone, Log::ProvisionDemand::Threshold));
+        ASSERT_TRUE(postDemandForTest(ch, gone, Log::ProvisionDemand::Threshold));
     }
     prov.doWork(2);
     EXPECT_EQ(prov.parkedDemandsForTest(), 100u);
@@ -3468,8 +3477,8 @@ TEST(SegmentProvisionerRegression, MetricsArePublishedThroughTheSinkRegression) 
     rt.doWork(1);
     prov.doWork(1);
     r->log()->setProvisionFaultForTest(EMFILE, 1);
-    auto hook = prov.hook();
-    ASSERT_TRUE(hook.fn(hook.ctx, r->log(), Log::ProvisionDemand::Hold));
+    auto* ch = prov.channel();
+    ASSERT_TRUE(postDemandForTest(ch, r->log(), Log::ProvisionDemand::Hold));
     prov.doWork(2);
     EXPECT_EQ(seen[SegmentProvisionerAgent::kMetricRollHolds], 1);
     EXPECT_EQ(seen[SegmentProvisionerAgent::kMetricBuildFailures], 1);
@@ -3491,8 +3500,8 @@ TEST(SegmentProvisionerRegression, ADemandWakesAParkedProvisionerRegression) {
     // The first pass installs the view; the runner then parks (2 s period).
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     const auto t0 = std::chrono::steady_clock::now();
-    auto hook = prov.hook();
-    ASSERT_TRUE(hook.fn(hook.ctx, r->log(), Log::ProvisionDemand::Threshold));
+    auto* ch = prov.channel();
+    ASSERT_TRUE(postDemandForTest(ch, r->log(), Log::ProvisionDemand::Threshold));
     while (r->log()->readyQueuedApprox() == 0 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     const auto waited = std::chrono::steady_clock::now() - t0;

@@ -124,10 +124,10 @@ void setMemoryEpochFence(rune::replication::PartitionReplica& r, const std::stri
 // SegmentProvisionerAgent keeps its ready segments; a roll never creates one
 // on the worker (it is deferred and the intake back-pressures instead).
 void applyWorkerDrivenDurability(rune::replication::PartitionReplica& replica, int32_t topicId,
-                                 rune::storage::Log::ProvisionHook provision, int thresholdPct) noexcept {
+                                 rune::storage::ProvisionChannel* provision, int thresholdPct) noexcept {
     if (topicId < 0) return;
     replica.setExternalFollowerFlush(true);
-    if (provision.fn != nullptr && replica.isDiskBacked() && replica.log() != nullptr)
+    if (provision != nullptr && replica.isDiskBacked() && replica.log() != nullptr)
         replica.log()->setProvisioning(provision, thresholdPct);
 }
 
@@ -1196,7 +1196,7 @@ void BrokerNode::buildReplication() {
                 : std::make_unique<PartitionReplica>(
                       pcfg, Role::Follower, /*epoch=*/0,
                       allNodeIds, allNodeIds, diskLogPtr, transport);
-            applyWorkerDrivenDurability(*replica, topicId, provisionHook_(), config_.segmentProvisionThresholdPct);   // Task 10 + F30 + hotpath-A
+            applyWorkerDrivenDurability(*replica, topicId, provisionChannel_(), config_.segmentProvisionThresholdPct);   // Task 10 + F30 + hotpath-A
             if (isMemory) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
             // Kafka AlterPartition: user-partition ISR changes go through the
             // controller (multi-node); internal partitions keep a leader-local ISR.
@@ -1372,7 +1372,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
             : std::make_unique<PartitionReplica>(
                   pcfg, Role::Follower, /*epoch=*/0,
                   allNodeIds, allNodeIds, diskLogPtr, transport);
-        applyWorkerDrivenDurability(*replica, topicId, provisionHook_(), config_.segmentProvisionThresholdPct);   // same policy as boot (F30 fix round 1, F3)
+        applyWorkerDrivenDurability(*replica, topicId, provisionChannel_(), config_.segmentProvisionThresholdPct);   // same policy as boot (F30 fix round 1, F3)
         if (isMemory) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
         if (topicId >= 0 && replTransport_ && !config_.isSingleNode())
             replica->setIsrChannel(replTransport_.get());   // Kafka AlterPartition (see boot)

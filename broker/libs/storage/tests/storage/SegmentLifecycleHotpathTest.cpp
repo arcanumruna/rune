@@ -17,6 +17,7 @@
 //
 // Every test here is a regression test (name contains "Regression").
 #include <gtest/gtest.h>
+#include <rune/storage/testing/DemandChannelForTest.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 
@@ -175,7 +176,8 @@ TEST(SegmentLifecycleRegression, RollNeverPreallocatesOnOwnerRegression) {
         Log log(dir.string(), 512);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh1{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh1);
         int64_t off = 0;
         int rolls = 0;
         const uint64_t before = log.ownerPreallocsForTest();
@@ -204,7 +206,8 @@ TEST(SegmentLifecycleRegression, ProvisionedRollWithEmptyPoolDefersNeverCreatesI
         Log log(dir.string(), 512);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh2{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh2);
         int64_t off = 0;
         while (!log.rollDeferred()) off = put(log, off);   // fill the active segment
         const auto segsBefore = log.segmentBaseOffsets().size();
@@ -233,7 +236,8 @@ TEST(SegmentLifecycleRegression, DeferredRollOvershootIsBoundedRegression) {
         Log log(dir.string(), 512);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh3{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh3);
         int64_t off = 0;
         while (log.segmentBaseOffsets().size() < 2 && off < 1000000) off = put(log, off);
         ASSERT_EQ(log.segmentBaseOffsets().size(), 2u) << "the overshoot cap forced a roll";
@@ -416,7 +420,8 @@ TEST(SegmentLifecycleRegression, FullRenameRingDefersRollNeverDropsRenameRegress
         Log log(dir.string(), 256);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh4{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh4);
         int64_t off = 0;
         // Adopt segments without ever finalizing their renames.
         for (int guard = 0; guard < 100000; ++guard) {
@@ -470,7 +475,8 @@ TEST(SegmentLifecycleRegression, SteadyStateRollAllocatesNothingOnOwnerRegressio
         Log log(dir.string(), 256);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh5{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh5);
         // Pre-built batches: building one allocates (test side, outside windows).
         std::vector<std::vector<uint8_t>> batches;
         int64_t off = 0;
@@ -527,7 +533,8 @@ TEST(SegmentLifecycleRegression, ProvisionerFailureRollsInlineNeverHangsRegressi
         Log log(dir.string(), 512);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh6{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh6);
         int64_t off = 0;
         while (!log.rollDeferred()) off = put(log, off);
         ASSERT_GE(demands[1], 1) << "the Threshold demand was posted";
@@ -560,7 +567,8 @@ TEST(SegmentLifecycleRegression, ProvisionerFailureThenInlineFailureFailsTheLogR
         Log log(dir.string(), 512);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh7{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh7);
         int64_t off = 0;
         while (!log.rollDeferred()) off = put(log, off);
         log.setProvisionFaultForTest(EACCES, 1);
@@ -583,7 +591,8 @@ TEST(SegmentLifecycleRegression, ProvisioningIsDemandDrivenByFillThresholdRegres
         Log log(dir.string(), 4096);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands}, /*thresholdPct=*/50);
+        rune::storage::testing::DemandChannelForTest demandCh8{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh8, /*thresholdPct=*/50);
         int64_t off = 0;
         // Fill to just below half: no demand.
         while (log.segmentSizeForTest(0) + 200 < 2048) off = put(log, off);
@@ -614,7 +623,8 @@ TEST(SegmentLifecycleRegression, LostDemandIsRepostedRegression) {
         } flaky;
         Log log(dir.string(), 512);
         log.recover();
-        log.setProvisioning({&Flaky::fn, &flaky});
+        rune::storage::testing::DemandChannelForTest demandCh9{&Flaky::fn, &flaky};
+        log.setProvisioning(&demandCh9);
         int64_t off = 0;
         while (!log.rollDeferred()) off = put(log, off);
         EXPECT_EQ(flaky.refused, 3);
@@ -658,7 +668,8 @@ TEST(SegmentLifecycleRegression, CrashWithReadyAndQueuedRenamesRecoversAllDataRe
         Log log(dir.string(), 256);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh10{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh10);
         int64_t off = 0;
         int adopted = 0;
         for (int guard = 0; adopted < 3 && guard < 100000; ++guard) {
@@ -745,7 +756,8 @@ TEST(SegmentLifecycleRegression, RenameCompletingInsideColdPathIsNeverMissedRegr
         int64_t off = 0;
         while (log.segmentSizeForTest(0) < 512) off = put(log, off);   // A [0, ..) inline-created
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh11{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh11);
         ASSERT_EQ(log.provisionReady(1), 1);
         off = put(log, off);                                          // rolls: adopts B
         bBase = log.segmentBaseOffsets().back();
@@ -782,7 +794,8 @@ TEST(SegmentLifecycleRegression, RenameCompletingInsideReloadIsNeverMissedRegres
         int64_t off = 0;
         while (log.segmentSizeForTest(0) < 512) off = put(log, off);
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh12{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh12);
         ASSERT_EQ(log.provisionReady(1), 1);
         off = put(log, off);
         for (int i = 0; i < 3; ++i) off = put(log, off);
@@ -820,7 +833,8 @@ TEST(SegmentLifecycleRegression, HeldRollRepostsItsDemandRegression) {
         Log log(dir.string(), 512);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh13{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh13);
         int64_t off = 0;
         while (!log.rollDeferred()) off = put(log, off);
         EXPECT_EQ(demands[1], 1) << "Threshold";
@@ -843,7 +857,8 @@ TEST(SegmentLifecycleRegression, UnpreallocatedReadySegmentIsAdoptedRegression) 
         Log log(dir.string(), 512);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh14{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh14);
         int64_t off = 0;
         while (!log.rollDeferred()) off = put(log, off);
         ASSERT_EQ(log.provisionReady(1, /*preallocate=*/false), 1);

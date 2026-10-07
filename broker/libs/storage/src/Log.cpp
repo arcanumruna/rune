@@ -629,12 +629,10 @@ void Log::pullReady_() noexcept {
 void Log::postProvisionDemands_(int64_t activeBytes) noexcept {
     // OWNER.  Cold: at most a few times per segment (a failed offer is retried
     // at the next append / hold check — a demand is never lost).
-    if (provisionHook_.fn == nullptr) return;
-    if (adoptedPostPending_ &&
-        provisionHook_.fn(provisionHook_.ctx, this, ProvisionDemand::Adopted))
+    if (provisionChannel_ == nullptr) return;
+    if (adoptedPostPending_ && postDemand_(ProvisionDemand::Adopted))
         adoptedPostPending_ = false;
-    if (!thresholdPosted_ && activeBytes >= provisionThresholdBytes_ &&
-        provisionHook_.fn(provisionHook_.ctx, this, ProvisionDemand::Threshold))
+    if (!thresholdPosted_ && activeBytes >= provisionThresholdBytes_ && postDemand_(ProvisionDemand::Threshold))
         thresholdPosted_ = true;
 }
 
@@ -960,7 +958,9 @@ void Log::maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept
     const int fd = ::fcntl(seg.logFd(), F_DUPFD_CLOEXEC, 0);       // the provisioner owns the dup
     if (fd < 0) return;
     const int64_t seq = (growSeq_ + 1) & 0x7FFFF;
-    if (!provisionHook_.growFn(provisionHook_.ctx, this, packRequest(fd, static_cast<int64_t>(target), seq))) {
+    if (!provisionChannel_->post(ProvisionChannel::kGrowMsgType,
+                                 static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(this)),
+                                 packRequest(fd, static_cast<int64_t>(target), seq))) {
         ::close(fd);
         return;
     }
@@ -997,7 +997,9 @@ void Log::pollReadMaps_() noexcept {
             ++readMapGrowths_;
         }
         // Retire off the owner (munmap); inline only if the ring is full.
-        if (m && provisionHook_.disposeFn(provisionHook_.ctx, m.get())) (void)m.release();
+        if (m && provisionChannel_->post(ProvisionChannel::kDisposeMsgType,
+                                         static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(m.get())), 0))
+            (void)m.release();
     }, 8);
 }
 int64_t Log::logStartOffset() const noexcept {

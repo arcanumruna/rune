@@ -22,7 +22,7 @@
 // never unbounded or silent.
 //
 // Event-driven (rings only, no lock, never a busy spin):
-//   worker → provisioner  `demand_`: ONE ControlRing (M2O — every worker thread
+//   worker → provisioner  `chan_` (storage::ProvisionChannel): ONE ControlRing (M2O — every worker thread
 //                         offers; this thread polls) + its DOORBELL (review m5):
 //                         an offer wakes this thread when it parks, so it parks
 //                         long when idle (ParkUntilWorkIdle with doorbell()).
@@ -68,7 +68,7 @@ inline void requireProvisionerRunner(bool agentBuilt, bool runnerBuilt) {
 
 class SegmentProvisionerAgent final : public rune::consensus::Agent {
 public:
-    static constexpr int32_t kDemandMsgType = 1;
+    static constexpr int32_t kDemandMsgType = rune::storage::ProvisionChannel::kDemandMsgType;
     using Demand = rune::storage::Log::ProvisionDemand;
 
     /// Metrics published by this thread (re-review N4).  Monotonic counters.
@@ -94,8 +94,6 @@ public:
         : depth_(std::clamp<std::size_t>(depth, 1, rune::storage::Log::kMaxProvisionDepth)),
           capMode_(capBytes), capDir_(std::move(capDir)), capFreePct_(std::clamp(capFreePct, 1, 100)),
           capBytes_(capBytes > 0 ? capBytes : (capBytes < 0 ? kUnknownCap : 0)) {
-        const auto w = demand_.watchInfo();
-        (void)bell_.addWatch(detail::RingWatch{w.buffer, w.length, w.capacity, w.headPositionIndex});
         if (capMode_ < 0) refreshAutoCap_();
     }
 
@@ -109,10 +107,8 @@ public:
     void setMetricSink(MetricSink fn, void* ctx) noexcept { sink_ = fn; sinkCtx_ = ctx; }
 
     /// The hook every provisioned log posts its demands through (any worker
-    /// thread): Log::setProvisioning(provisioner.hook(), thresholdPct).
-    [[nodiscard]] rune::storage::Log::ProvisionHook hook() noexcept {
-        return {&onDemand_, this, &onGrow_, &onDispose_};
-    }
+    /// thread): Log::setProvisioning(provisioner.channel(), thresholdPct).
+    [[nodiscard]] rune::storage::ProvisionChannel* channel() noexcept { return &chan_; }
     [[nodiscard]] uint64_t readMapsGrownForTest() const noexcept { return mapsGrown_; }
     /// Tests without a CleanerViewChannel: put `log` into the current view.
     void addToViewForTest(rune::storage::Log* log) {
@@ -122,7 +118,7 @@ public:
 
     /// The doorbell demands ring: give it to this agent's idle strategy
     /// (ParkUntilWorkIdle(shape, nullptr, 0, doorbell())).
-    [[nodiscard]] detail::RingDoorbell* doorbell() noexcept { return &bell_; }
+    [[nodiscard]] detail::RingDoorbell* doorbell() noexcept { return &chan_.doorbell(); }
 
     [[nodiscard]] std::size_t depth() const noexcept { return depth_; }
     [[nodiscard]] int64_t     capBytes() const noexcept { return capBytes_; }
@@ -145,7 +141,7 @@ public:
     int doWork(int64_t /*nowNs*/) override {
         int work = 0;
         if (channel_) work += applyViewUpdates_();
-        work += demand_.poll([this](int32_t type, int64_t a, int64_t b) {
+        work += chan_.ring().poll([this](int32_t type, int64_t a, int64_t b) {
             if (type == kDisposeMsgType) {   // review Md5: a retired read mapping (munmap off the owner)
                 delete reinterpret_cast<rune::storage::MappedFile*>(static_cast<std::uintptr_t>(a));
                 return;
@@ -171,21 +167,8 @@ private:
     static constexpr int64_t     kUnknownCap       = INT64_MAX / 4;   ///< AUTO before statvfs succeeded: no cap
     static constexpr uint32_t    kCapRefreshServes = 64;
 
-    static constexpr int32_t kGrowMsgType = 2, kDisposeMsgType = 3;
-    static bool onGrow_(void* ctx, rune::storage::Log* log, int64_t packed) noexcept {
-        auto* self = static_cast<SegmentProvisionerAgent*>(ctx);
-        if (!self->demand_.offer(kGrowMsgType, static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(log)), packed))
-            return false;
-        self->bell_.ringIfParked();
-        return true;
-    }
-    static bool onDispose_(void* ctx, void* map) noexcept {
-        auto* self = static_cast<SegmentProvisionerAgent*>(ctx);
-        if (!self->demand_.offer(kDisposeMsgType, static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(map)), 0))
-            return false;
-        self->bell_.ringIfParked();
-        return true;
-    }
+    static constexpr int32_t kGrowMsgType    = rune::storage::ProvisionChannel::kGrowMsgType;
+    static constexpr int32_t kDisposeMsgType = rune::storage::ProvisionChannel::kDisposeMsgType;
     /// Review Md5: map `mib` MiB of the dup'd segment fd and hand it to the log
     /// (never dereferences a log that is not in the current view).
     void serveGrow_(int64_t a, int64_t b) {
@@ -216,16 +199,6 @@ private:
     bool holdGrowsForTest_ = false;
     std::vector<std::pair<int64_t, int64_t>> heldGrows_;
     uint64_t mapsGrown_ = 0;
-
-    static bool onDemand_(void* ctx, rune::storage::Log* log, Demand kind) noexcept {
-        auto* self = static_cast<SegmentProvisionerAgent*>(ctx);
-        // A full ring returns false: the owner re-posts (never lost).
-        if (!self->demand_.offer(kDemandMsgType, static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(log)),
-                                 static_cast<int64_t>(kind)))
-            return false;
-        self->bell_.ringIfParked();
-        return true;
-    }
 
     void bump_(int m) noexcept {
         ++metrics_[static_cast<std::size_t>(m)];
@@ -358,8 +331,7 @@ private:
     int64_t     freeBytesForTest_ = -1;
     uint32_t    capServes_ = 0;
     int64_t     reserved_ = 0;
-    rune::consensus::ControlRing<64 * 1024> demand_;   // M2O: every worker → this thread (~2.7k demands)
-    detail::RingDoorbell                    bell_;
+    rune::storage::ProvisionChannel chan_;   // M2O: every worker → this thread (~2.7k demands) + doorbell
     CleanerViewChannel*                               channel_ = nullptr;
     std::vector<rune::replication::PartitionReplica*> building_;
     std::vector<rune::storage::Log*>                  logs_;      // sorted: the current view's disk logs
