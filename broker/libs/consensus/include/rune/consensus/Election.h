@@ -461,7 +461,8 @@ private:
     bool isExtendedCanvass_ = false; // true during first canvass on startup
     bool isFirstInit_       = true;  // Election.java:101
 
-    // Election.java:100
+    // Election.java:100 — scoped to ONE election (Aeron: a constructor argument
+    // of that election); cleared at electionComplete (DR-10 review LOW-2).
     NodeId gracefulClosedLeaderId_ = -1;
     /// Controlled shutdown: this node resigned its leadership (resign()) — it
     /// never nominates itself again; while canvassing it re-sends StandDown

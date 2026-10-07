@@ -2450,3 +2450,44 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_AdoptedTermIsDurable) {
     NodeStateFile reopened(nsfFile.str());
     EXPECT_GE(reopened.candidateTermId(), higher) << "the stepped-down term was not persisted";
 }
+
+// ===========================================================================
+// DR-10 review LOW-2 — gracefulClosedLeaderId persisted across elections.
+// Aeron builds a new Election per election; the graceful-close leader id is a
+// constructor argument of ONE election.  Rune's Election is long-lived, so the
+// id set by a StandDown must be dropped when that hand-off election completes —
+// else every later election still skips the resigned member in
+// isUnanimousCandidate / isUnanimousLeader and nominates without hearing from
+// it (no longer unanimous: it might hold a fresher log).
+// ===========================================================================
+TEST(ElectionStandDownRegression, GracefulLeaderSkipEndsWithItsElectionRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    StandDownRecorder pub;
+    auto e = makeSdElection(0, pub, nsf, tl, 42);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);
+    e.onRequestVote(0, 0, 1, 1, nowNs);
+    e.onNewLeadershipTerm(nowNs, 0, 1, 0, 0, 1, 0, 0, 0, 0, /*leader=*/1, 0, true, 0);
+    ASSERT_TRUE(driveToClosed(e, nowNs));
+    ASSERT_EQ(e.leaderMemberId(), 1);
+
+    // Leader 1 resigns; the hand-off election elects node 2.
+    e.onStandDown(nowNs, /*term=*/1, /*leader=*/1);
+    ASSERT_EQ(e.state(), ElectionState::Canvass);
+    e.onRequestVote(0, 0, 2, 2, nowNs);
+    e.onNewLeadershipTerm(nowNs, 0, 2, 0, 0, 2, 0, 0, 0, 0, /*leader=*/2, 0, false, 0);
+    ASSERT_TRUE(driveToClosed(e, nowNs));
+    ASSERT_EQ(e.leaderMemberId(), 2);
+
+    // Leader 2 dies: an ordinary (non-graceful) election follows.
+    nowNs += 10 * e.leaderHeartbeatTimeoutNs();
+    e.doWork(nowNs);
+    ASSERT_EQ(e.state(), ElectionState::Canvass);
+    // Only node 2 reports: node 1's position is unknown → not unanimous.
+    e.onCanvassPosition(0, 0, 2, 2);
+    e.doWork(nowNs + 1);
+    EXPECT_EQ(e.state(), ElectionState::Canvass)
+        << "a later election still skipped the member that resigned two terms ago";
+}

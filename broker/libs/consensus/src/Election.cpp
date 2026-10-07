@@ -1342,7 +1342,12 @@ void Election::electionComplete(int64_t nowNs)
         }
     }
 
-    skipFromStandDown_ = false;   // the hand-off election is over
+    // The hand-off election is over.  Aeron builds a new Election per election
+    // and passes the graceful-close leader id to that ONE election only; this
+    // Election is long-lived, so drop it here — later elections must hear from
+    // every member again (DR-10 review LOW-2).
+    skipFromStandDown_      = false;
+    gracefulClosedLeaderId_ = -1;   // NULL_VALUE
     state(ElectionState::Closed, nowNs, "electionComplete");
 }
 
