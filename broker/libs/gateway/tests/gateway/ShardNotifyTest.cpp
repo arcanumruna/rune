@@ -311,9 +311,37 @@ TEST(GatewayShardNotifyRegression, LostSessionIsReapedOnTheNormalLeaseFromTheLos
     gw.reapExpiredForTest(L + T + 1);
     EXPECT_EQ(gw.sessionLastSeenNsForTest(lost), -1) << "lost for a full lease -> reaped (its acks are freed)";
     EXPECT_GE(gw.sessionLastSeenNsForTest(found), 0) << "Found cancels the lost reap (back to the held bound)";
-    EXPECT_EQ(gw.sessionLastSeenNsForTest(both), -1) << "still lost on worker 1 -> reaped";
+    EXPECT_GE(gw.sessionLastSeenNsForTest(both), 0) << "worker 0's Found (proof of life) restarted the lease (D8b-L)";
+    gw.reapExpiredForTest(L + 1'000'000'000 + T + 1);
+    EXPECT_EQ(gw.sessionLastSeenNsForTest(both), -1) << "still lost on worker 1 -> reaped a lease after the Found";
     gw.reapExpiredForTest(ClientGateway::kDefaultMaxHeldIdleNs + 1);
     EXPECT_EQ(gw.sessionLastSeenNsForTest(found), -1) << "a found, still-held session keeps the held bound";
+}
+
+// D8b-L (re-review low): lost on worker 0 at L, on worker 1 at L+2 s, then worker 0 reports Found at L+4 s (a
+// successful claim: the client is alive).  Worker 1's suspicion cannot predate that proof of life, so the lease runs
+// from the Found — before, it kept running from worker 0's Lost edge at L and the live session was reaped at L+T.
+TEST(GatewayShardNotifyRegression, FoundOnOneWorkerRestartsTheLostLeaseOfAnotherRegression) {
+    using K = rune::node::SessionSignalKind;
+    ClientGateway gw = ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; }, 1);
+    rune::node::WorkerPool pool(2, rune::metadata::ShardRouter(2), 1 << 16, 1 << 16, 16, 16);
+    gw.setWorkerPool(&pool);
+    gw.setShardMode(true);
+    constexpr int64_t T = ClientGateway::kDefaultSessionTimeoutNs;
+    constexpr int64_t S = 1'000'000'000;
+    constexpr int64_t L = 3 * T;
+    const int64_t sid = gw.injectTestSession(0);
+    ASSERT_TRUE(pool.worker(0).injectReturnForTest(signal(sid, 0, K::Lost)));
+    gw.drainWorkerReturnsForTest(L);
+    ASSERT_TRUE(pool.worker(1).injectReturnForTest(signal(sid, 1, K::Lost)));
+    gw.drainWorkerReturnsForTest(L + 2 * S);
+    ASSERT_TRUE(pool.worker(0).injectReturnForTest(signal(sid, 0, K::Found)));
+    gw.drainWorkerReturnsForTest(L + 4 * S);
+    ASSERT_TRUE(gw.sessionLostForTest(sid)) << "still lost on worker 1";
+    gw.reapExpiredForTest(L + T + 1);
+    EXPECT_GE(gw.sessionLastSeenNsForTest(sid), 0) << "the lease must not run from worker 0's stale Lost edge";
+    gw.reapExpiredForTest(L + 4 * S + T + 1);
+    EXPECT_EQ(gw.sessionLastSeenNsForTest(sid), -1) << "lost on worker 1 for a full lease after the Found -> reaped";
 }
 
 // D8b re-review (round 2) MEDIUM-1: a held session that sent nothing for > sessionTimeout and then drains its whole

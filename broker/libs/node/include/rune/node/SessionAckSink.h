@@ -154,8 +154,10 @@ public:
     /// drains reports Progress at most once per this many flushes, counted from its
     /// Held edge / previous Progress.  A worker under backoff idle passes at
     /// >= ~5k/s (200 µs max park) and far faster when busy, so 1024 passes is
-    /// <= ~200 ms (~100 ms at ~10k passes/s) — orders of magnitude inside the
-    /// runtime's held bound (10 min), at <= ~10 signals/s per held session.
+    /// <= ~200 ms — orders of magnitude inside the runtime's held bound (10 min).
+    /// The signal rate is pass-rate / 1024 per held session: ~5/s idle, ~10/s at
+    /// 10k passes/s, ~1k/s for a busy worker at ~1M passes/s (D8b-L: the rate
+    /// scales with the pass rate — it is not a fixed ~10/s).
     static constexpr uint64_t    kProgressPassInterval = 1024;
     /// D8d: admitDirect results (AckEntry::direct).
     static constexpr uint8_t     kDirectRefused   = 0;   ///< ABORT the frame (held / no budget / band / full)

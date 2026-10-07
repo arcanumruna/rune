@@ -51,7 +51,8 @@ struct Session {
     // protocol::client::kClientVersionUnknownProducerId).  0 = unknown (oldest).
     int32_t                                        clientVersion = 0;
     // D8b round 2: bit w set = worker w reports this session's ack publication
-    // Lost (NOT_CONNECTED); lostSinceNs = when the mask last became non-zero.
+    // Lost (NOT_CONNECTED); lostSinceNs = when the mask last became non-zero, restarted by a Found
+    // from one worker while another is still Lost (D8b-L: a successful claim is proof of life).
     // Non-zero → reapExpired uses the normal lease measured from lostSinceNs.
     uint64_t                                       lostByWorkers = 0;
     int64_t                                        lostSinceNs   = 0;
