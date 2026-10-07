@@ -1024,6 +1024,15 @@ std::vector<uint8_t> Log::read(int64_t startOffset, int32_t maxBytes) {
     --it;
     return it->second->read(startOffset, maxBytes);
 }
+LogReadView Log::readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
+                          bool& firstTooLarge) noexcept {
+    RUNE_FR_SPAN_READ(rune_fr::Site::ReadLogRead, 0);
+    firstTooLarge = false;
+    auto it = segments_.upper_bound(startOffset);
+    if (it == segments_.begin()) return {};
+    --it;
+    return it->second->readInto(startOffset, maxBytes, buf, bufCap, firstTooLarge);
+}
 LogReadView Log::readView(int64_t startOffset, int32_t maxBytes) noexcept {
     RUNE_FR_SPAN_READ(rune_fr::Site::ReadLogRead, 0);
     ++readViewCalls_;

@@ -611,6 +611,82 @@ LogReadView LogSegment::mappedBytes() noexcept {
     return v;
 }
 
+LogReadView LogSegment::readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
+                                 bool& firstTooLarge) noexcept {
+    firstTooLarge = false;
+    if (logSize_ <= 0 || fd_ < 0 || buf == nullptr || bufCap == 0) return {};
+    using rune::protocol::RecordBatchReader;
+    const std::size_t kOverhead = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
+    // The sparse index points at or before the target batch (<= one index
+    // interval + one batch earlier).  One window covers that skip + maxBytes.
+    const OffsetPosition op = index_->lookup(startOffset);
+    const int64_t pos0 = op.position > 0 ? op.position : 0;
+    if (pos0 >= logSize_) return {};
+    const std::size_t remaining = static_cast<std::size_t>(logSize_ - pos0);
+    // Only what this read needs: maxBytes + the sparse-index skip (<= two index
+    // intervals) — never the whole buffer.  A first batch past it -> firstTooLarge.
+    const std::size_t need = (maxBytes > 0 ? static_cast<std::size_t>(maxBytes) : 0) +
+                             2 * static_cast<std::size_t>(indexIntervalBytes_) + kOverhead;
+    const std::size_t want = std::min({remaining, bufCap, need});
+    const std::size_t limit = std::min(remaining, bufCap);   // the most this buffer can ever hold
+    std::size_t got = 0;
+    // pread [got, upTo) (short reads / EINTR retried); false on error / EOF before upTo.
+    auto fill = [&](std::size_t upTo) noexcept {
+        while (got < upTo) {
+            const ssize_t r = ::pread(fd_, buf + got, upTo - got, static_cast<off_t>(pos0) + static_cast<off_t>(got));
+            if (r < 0) { if (errno == EINTR) continue; return false; }
+            if (r == 0) return false;
+            got += static_cast<std::size_t>(r);
+        }
+        return true;
+    };
+    (void)fill(want);
+    std::size_t pos = 0, firstPos = SIZE_MAX;
+    int64_t firstBase = 0;
+    for (;;) {
+        if (pos + kOverhead > got) {
+            // Window ended between batches: read on (up to the buffer) unless
+            // the segment's bytes are exhausted (the offset is absent).
+            if (got >= remaining) return {};
+            if (got >= limit || !fill(std::min(limit, pos + kOverhead))) { firstTooLarge = got >= limit; return {}; }
+            continue;
+        }
+        RecordBatchReader r(buf + pos, got - pos);
+        const int32_t total = r.totalLength();
+        if (total <= 0) return {};                                     // torn tail
+        const std::size_t end = pos + static_cast<std::size_t>(total);
+        if (end > got) {
+            // Cut by the request-sized window: read the rest of THIS batch when
+            // the buffer can hold it (review MEDIUM-1: never a needless fallback).
+            if (end > limit) { firstTooLarge = end <= remaining; return {}; }
+            if (!fill(end)) return {};
+            continue;
+        }
+        if (r.baseOffset() + r.lastOffsetDelta() >= startOffset) { firstPos = pos; firstBase = r.baseOffset(); break; }
+        pos = end;
+    }
+    const std::size_t cap = maxBytes > 0 ? static_cast<std::size_t>(maxBytes) : 0;
+    std::size_t end = firstPos;
+    int64_t nextOff = firstBase;
+    while (end + kOverhead <= got) {
+        RecordBatchReader r(buf + end, got - end);
+        const int32_t total = r.totalLength();
+        if (total <= 0 || end + static_cast<std::size_t>(total) > got) break;
+        if (end != firstPos) {
+            if (cap == 0) break;
+            if ((end - firstPos) + static_cast<std::size_t>(total) > cap) break;
+        }
+        end += static_cast<std::size_t>(total);
+        nextOff = r.baseOffset() + r.lastOffsetDelta() + 1;
+    }
+    LogReadView v;
+    v.data       = buf + firstPos;
+    v.len        = end - firstPos;
+    v.baseOffset = firstBase;
+    v.nextOffset = nextOff;
+    return v;
+}
+
 LogReadView LogSegment::readView(int64_t startOffset, int32_t maxBytes) noexcept {
     if (logSize_ <= 0) return {};
     ensureReadMap();

@@ -187,6 +187,39 @@ TEST_F(WorkerPushFixture, DeliversAllBatchesInOrderExactlyOnce) {
     std::filesystem::remove_all(dir);
 }
 
+// #65 review MAJOR-1: the in-worker subscription push (per-worker egress, on
+// by default in shard mode) reads with a pread into the worker scratch — never
+// through the segment read MMAP (first-touch faults take the process mmap_lock,
+// queued behind the provisioner / cleaner mmap+munmap: ~1 ms worker passes).
+TEST_F(WorkerPushFixture, OwnedSubscriptionPushNeverFaultsThroughTheReadMapRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);
+    constexpr int kN = 20;
+    for (int i = 0; i < kN; ++i) appendBatch(log, i, 1);
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3021);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3021);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    const uint64_t viewsBefore = log.readViewCallsForTest();
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, 0, &log)));
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1);
+        sub->poll(c.fa.handler(), 64);
+        return static_cast<int>(c.baseOffsets.size()) >= kN;
+    }, 10s)) << "received " << c.baseOffsets.size() << "/" << kN;
+    for (int i = 0; i < kN; ++i) EXPECT_EQ(c.baseOffsets[i], i);
+    EXPECT_EQ(log.readViewCallsForTest(), viewsBefore)
+        << "the owned-subscription push read through the segment read mmap";
+    EXPECT_EQ(w.pushReadMapFallbacksForTest(), 0u);
+    std::filesystem::remove_all(dir);
+}
+
 // CG routing round 3 (MAJOR-1): every Records push carries the correlationId
 // of the client Subscribe that created the subscription, so the client binds
 // the push to ITS request (exact instance identity).  RED: 0.

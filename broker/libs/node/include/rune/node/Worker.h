@@ -2522,9 +2522,11 @@ private:
             if (s.nextOffset >= bound) continue;
 
             const bool freshPass = pushBudgetLeft_ == kPushPassBudgetBytes;
-            // noexcept (F3): a failed lazy map is an empty view (retry next pass).
-            const rune::storage::LogReadView view = s.logPtr->readView(
-                s.nextOffset, static_cast<int32_t>(std::min<std::size_t>(kPushMaxChunkBytes, pushBudgetLeft_)));
+            // #65 (review MAJOR-1): a pread into the worker's scratch — never the
+            // segment read mmap.  noexcept (F3): a failed read is an empty view
+            // (retry next pass).
+            const rune::storage::LogReadView view = readNoFault_(
+                s.logPtr, s.nextOffset, std::min<std::size_t>(kPushMaxChunkBytes, pushBudgetLeft_));
             if (view.empty()) continue;
 
             std::size_t pos = 0;
@@ -2877,9 +2879,10 @@ private:
         const bool freshPass = pushBudgetLeft_ == kPushPassBudgetBytes;
         const std::size_t fit = pushReadChunkFit_();
         const std::size_t cap = std::min({static_cast<std::size_t>(kMaxPushReadChunkBytes), fit, pushBudgetLeft_});
-        // noexcept (F3): a failed lazy map is an empty view — answered empty, the
-        // gateway retries next cycle (as a throwing Log::read was before).
-        const rune::storage::LogReadView v = log->readView(a.nextOffset, static_cast<int32_t>(cap));
+        // #65: a pread into the worker's scratch (readNoFault_) — never the
+        // segment read mmap.  noexcept (F3): a failed read is an empty view —
+        // answered empty, the gateway retries next cycle.
+        const rune::storage::LogReadView v = readNoFault_(log, a.nextOffset, cap);
         if (v.empty()) return PushChunk::Empty;
         const bool preCarrier = a.isGroup && !a.carrier;
         std::size_t rd = 0, nRuns = 0, total = 0;
@@ -2991,6 +2994,23 @@ private:
             ++n;
         }
         return n;
+    }
+
+    // #65: the worker's push reads.  First-touch page faults on a segment read
+    // MMAP take the process mmap_lock for read — queued behind the provisioner /
+    // cleaner threads' mmap/munmap holding it for write: ~1 ms off-CPU worker
+    // passes (box perf, briefs/2026-10-07-reads-retention-bisect.md).  So: ONE
+    // pread into the preallocated scratch (no allocation, no fault).  Only a
+    // first batch larger than the whole scratch (near the ring's max message)
+    // falls back to the mapped view — counted.  The view is valid until the
+    // next push read on this thread.
+    rune::storage::LogReadView readNoFault_(rune::storage::Log* log, int64_t offset, std::size_t maxBytes) noexcept {
+        bool tooLarge = false;
+        const rune::storage::LogReadView v = log->readInto(offset, static_cast<int32_t>(maxBytes), pushScratch_.data(),
+                                                           pushScratch_.size(), tooLarge);
+        if (!tooLarge) [[likely]] return v;
+        ++pushReadMapFallbacks_;
+        return log->readView(offset, static_cast<int32_t>(maxBytes));
     }
 
     [[gnu::cold]] void notePushReadOversize_(int32_t topicId, int32_t partition, int64_t offset) noexcept {
@@ -4027,10 +4047,18 @@ public:
     [[nodiscard]] uint64_t pushReadChunksForTest() const noexcept { return pushReadChunks_; }
     [[nodiscard]] uint64_t pushReadBytesForTest() const noexcept { return pushReadBytes_; }
     [[nodiscard]] uint64_t pushReadsDeferredForTest() const noexcept { return pushReadsDeferred_; }
+    /// #65: push reads that fell back to the segment read mmap (first batch > scratch).
+    [[nodiscard]] uint64_t pushReadMapFallbacksForTest() const noexcept { return pushReadMapFallbacks_; }
     [[nodiscard]] std::size_t deferredPushReadsForTest() const noexcept { return deferredPushCount_; }
 private:
     std::size_t                           pushBudgetLeft_ = kPushPassBudgetBytes;
     std::array<ChunkRun, kMaxPushRuns>    pushRuns_{};
+    /// #65: push-read pread target (allocated once, at construction): one
+    /// pass's push budget + the sparse-index skip slack + room for a first
+    /// batch past the budget (a fresh pass always takes one).  Larger first
+    /// batches fall back to the mapped view (pushReadMapFallbacks_).
+    std::vector<uint8_t>                  pushScratch_ = std::vector<uint8_t>(2 * kPushPassBudgetBytes + 64 * 1024);
+    uint64_t                              pushReadMapFallbacks_ = 0;
     std::size_t                           pushRotor_ = 0;   ///< in-worker push: first sub served next pass
     uint64_t                              pushReadChunks_ = 0, pushReadBytes_ = 0, pushReadsDeferred_ = 0;
 

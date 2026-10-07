@@ -190,6 +190,13 @@ public:
     /// ...) returns an empty LogReadView instead of throwing — callers already
     /// treat empty as "nothing now; retry next cycle".  See readMapFailures().
     LogReadView readView(int64_t startOffset, int32_t maxBytes) noexcept;
+    /// #65: readView's batch semantics (first batch whole, then whole batches up
+    /// to maxBytes) served by ONE pread into the caller's buffer — no mapping,
+    /// so no page fault (and no process mmap_lock) on the caller's thread, no
+    /// allocation.  The view points into `buf`.  `firstTooLarge` is set when the
+    /// first deliverable batch does not fit `bufCap` (caller falls back).
+    LogReadView readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
+                         bool& firstTooLarge) noexcept;
     /// F15 S4 fix round 1 (cold-cache build): the read-only mapping of the
     /// written bytes [0, sizeBytes()) WITHOUT touching any page (an mmap /
     /// remap syscall at most; no index lookup, no header read).  The caller

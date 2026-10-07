@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
+#include <rune/storage/Log.h>
 #include <rune/storage/LogSegment.h>
 #include <rune/storage/OffsetIndex.h>
 #include <rune/protocol/RecordBatch.h>
 #include <climits>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <numeric>
@@ -889,5 +891,93 @@ TEST(LogSegmentRegression, InPlaceTruncateAtCompactedTailEndCutsNothingRegressio
     EXPECT_EQ(seg.truncateInPlace(10, keptMaxTs), 0) << "a no-op truncation at the compacted tail end failed the log";
     EXPECT_EQ(seg.nextOffset(), 10);
     EXPECT_EQ(seg.sizeBytes(), sizeBefore) << "nothing may be cut";
+    std::filesystem::remove_all(dir);
+}
+
+// #65: readInto (one pread into the caller's buffer, no mapping) serves EXACTLY
+// readView's batches — every start offset (incl. mid-batch and sparse-index
+// skips), every maxBytes shape; a buffer too small for the first batch is
+// reported (firstTooLarge) and an absent offset is plainly empty.
+TEST(LogSegmentRegression, ReadIntoMatchesReadViewWithoutMappingRegression) {
+    auto dir = makeTempDir("rune_seg_readinto");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    LogSegment seg(dir.string(), 0, 4096);
+    int64_t off = 0;
+    for (int i = 0; i < 200; ++i) {
+        const int n = 1 + (i % 5);
+        auto batch = makeBatch(off, 1000 + i, n);
+        seg.append(batch, off + n - 1);
+        off += n;
+    }
+    std::vector<uint8_t> buf(256 * 1024);
+    for (int64_t start = 0; start < off; start += 7) {
+        for (int32_t maxBytes : {0, 300, 4096, 64 * 1024, 1 << 20}) {
+            bool tooLarge = true;
+            const auto into = seg.readInto(start, maxBytes, buf.data(), buf.size(), tooLarge);
+            const auto view = seg.readView(start, maxBytes);
+            ASSERT_FALSE(tooLarge) << "start " << start << " maxBytes " << maxBytes;
+            ASSERT_EQ(into.len, view.len) << "start " << start << " maxBytes " << maxBytes;
+            ASSERT_EQ(into.baseOffset, view.baseOffset);
+            ASSERT_EQ(into.nextOffset, view.nextOffset);
+            ASSERT_EQ(0, std::memcmp(into.data, view.data, into.len));
+        }
+    }
+    bool tooLarge = false;
+    EXPECT_TRUE(seg.readInto(off + 5, 4096, buf.data(), buf.size(), tooLarge).empty());
+    EXPECT_FALSE(tooLarge) << "an absent offset is not a too-small buffer";
+    uint8_t tiny[32];
+    EXPECT_TRUE(seg.readInto(0, 4096, tiny, sizeof tiny, tooLarge).empty());
+    EXPECT_TRUE(tooLarge) << "the first batch does not fit 32 bytes";
+    std::filesystem::remove_all(dir);
+}
+
+// #65 review MEDIUM-2: large batches (> the 4 KiB index interval) so a
+// request-sized window cuts the first batch (readInto must read on, never
+// report a needless firstTooLarge), multi-segment Log::readInto picks the right
+// segment, and a buffer smaller than readView's answer yields an exact batch
+// PREFIX of it.
+TEST(LogSegmentRegression, ReadIntoLargeBatchesMultiSegmentAndBufferLimitRegression) {
+    auto dir = makeTempDir("rune_log_readinto");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    rune::storage::Log log(dir.string(), 96 * 1024);   // small segments: several rolls
+    int64_t off = 0;
+    for (int i = 0; i < 60; ++i) {
+        RecordBatchBuilder b(off, 1000 + i);
+        const int n = 1 + (i % 3);
+        const std::string value(1500 + (i % 7) * 1700, static_cast<char>('a' + (i % 26)));   // 1.5 .. 11.7 KiB records
+        for (int k = 0; k < n; ++k) b.append("k", value, 1000 + i);
+        log.append(b.build(), off + n - 1);
+        off += n;
+    }
+    ASSERT_GE(log.segmentBaseOffsets().size(), 3u);
+    std::vector<uint8_t> big(512 * 1024);
+    for (int64_t start = 0; start < off; start += 3) {
+        for (int32_t maxBytes : {0, 1024, 4096, 40 * 1024, 1 << 20}) {
+            bool tooLarge = true;
+            const auto into = log.readInto(start, maxBytes, big.data(), big.size(), tooLarge);
+            const auto view = log.readView(start, maxBytes);
+            ASSERT_FALSE(tooLarge) << "start " << start << " maxBytes " << maxBytes;
+            ASSERT_EQ(into.len, view.len) << "start " << start << " maxBytes " << maxBytes;
+            ASSERT_EQ(into.baseOffset, view.baseOffset);
+            ASSERT_EQ(into.nextOffset, view.nextOffset);
+            ASSERT_EQ(0, std::memcmp(into.data, view.data, into.len));
+        }
+        // Buffer limit: smaller than the full answer, larger than the first batch.
+        const auto view = log.readView(start, 1 << 20);
+        if (view.empty()) continue;
+        RecordBatchReader first(view.data, view.len);
+        const std::size_t firstLen = static_cast<std::size_t>(first.totalLength());
+        std::vector<uint8_t> small(firstLen + 2 * 4096 + 64 + 100);
+        bool tooLarge = true;
+        const auto into = log.readInto(start, 1 << 20, small.data(), small.size(), tooLarge);
+        ASSERT_FALSE(tooLarge) << "start " << start;
+        ASSERT_GE(into.len, firstLen);
+        ASSERT_LE(into.len, view.len);
+        ASSERT_EQ(into.baseOffset, view.baseOffset);
+        ASSERT_EQ(0, std::memcmp(into.data, view.data, into.len)) << "not a prefix of readView's answer";
+        std::size_t pos = 0;
+        while (pos < into.len) { RecordBatchReader r(into.data + pos, into.len - pos); ASSERT_TRUE(r.ensureValid()); pos += static_cast<std::size_t>(r.totalLength()); }
+        ASSERT_EQ(pos, into.len) << "a cut batch was returned";
+    }
     std::filesystem::remove_all(dir);
 }

@@ -207,6 +207,10 @@ public:
     /// noexcept (F3): a failed lazy map on the target segment returns an empty
     /// view rather than throwing — see LogSegment::readView.
     LogReadView readView(int64_t startOffset, int32_t maxBytes) noexcept;
+    /// #65: LogSegment::readInto on the segment holding startOffset (pread into
+    /// `buf`; never counted as a readView, never maps).
+    LogReadView readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
+                         bool& firstTooLarge) noexcept;
 
     int64_t logEndOffset() const noexcept { return logEndOffset_; }
     /// F27 R2: Log-wide segment install generation — changes whenever ANY segment

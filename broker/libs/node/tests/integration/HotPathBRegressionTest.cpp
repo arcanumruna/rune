@@ -1507,3 +1507,47 @@ TEST(HotPathBRegression, CompactionGapIsNoEpochHistoryDisagreementRegression) {
     EXPECT_EQ(r.epochHistoryRebuildsForTest(), 0u) << "a compaction gap was taken for a stale history";
     EXPECT_EQ(r.leaderEpochCacheForTest().startOffsetFor(2), 10);
 }
+
+// #65 (box bisect 2026-10-07, briefs/2026-10-07-reads-retention-bisect.md): F5
+// read PushRead chunks through the segment read MMAP.  First touch of freshly
+// written pages faults, and every fault takes the process mmap_lock for read —
+// queued behind the provisioner / cleaner threads' mmap / munmap (segment
+// rolls, retention) holding it for write: worker passes of ~1 ms off-CPU
+// (perf: rwsem_down_read_slowpath in do_user_addr_fault 132 -> 435 per run;
+// Reads+Retention/2p p99.9 128 -> 226 us).  A PushRead must be served by a
+// pread into the worker's preallocated scratch (no allocation, no page fault),
+// never through the read mapping.
+TEST(HotPathBRegression, PushReadNeverFaultsThroughTheReadMapRegression) {
+    Rig rig;
+    const auto frame = produceFrame(1, 1, 0, 1000, 4);
+    for (int i = 0; i < 64; ++i) rig.pass(&frame);
+    rig.pool.drainAllReturns([](WorkerReturn) {});
+    ASSERT_GT(rig.log->logEndOffset(), 200);
+    const uint64_t viewsBefore = rig.log->readViewCallsForTest();
+    rig.pushRead(500, 0);
+    rig.pushRead(501, rig.log->logEndOffset() - 8);
+    int answered = 0;
+    for (int passes = 0; answered < 2 && passes < 16; ++passes) {
+        rig.pass();
+        rig.pool.drainAllReturns([&](WorkerReturn r) {
+            if (r.type != WorkerReturn::Type::PushReadResult) return;
+            ASSERT_EQ(r.errorCode, 0);
+            ASSERT_GT(r.chunk.size(), 0u);
+            std::size_t pos = 0;
+            int64_t expect = -1;
+            while (pos < r.chunk.size()) {
+                rune::protocol::RecordBatchReader b(r.chunk.data() + pos, r.chunk.size() - pos);
+                ASSERT_TRUE(b.ensureValid());
+                if (expect >= 0) ASSERT_EQ(b.baseOffset(), expect);
+                expect = b.baseOffset() + b.lastOffsetDelta() + 1;
+                pos += static_cast<std::size_t>(b.totalLength());
+            }
+            ASSERT_EQ(pos, r.chunk.size());
+            EXPECT_EQ(r.newNextOffset, expect);
+            ++answered;
+        });
+    }
+    EXPECT_EQ(answered, 2);
+    EXPECT_EQ(rig.log->readViewCallsForTest(), viewsBefore)
+        << "a PushRead was served through the segment read mmap (page faults on the worker, mmap_lock)";
+}
