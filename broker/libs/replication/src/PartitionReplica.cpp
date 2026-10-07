@@ -207,6 +207,14 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
         }
         const rune::storage::LeaderEpochCache before = epochCache_;   // cold copy
         const Epoch stateFence = es.state == ES::FileState::Valid ? static_cast<Epoch>(es.fence) : Epoch{-1};
+        // D21 L2: no valid slot (or the durable "unknown" marker) — the fence is unknown.
+        if (es.state == ES::FileState::Corrupt ||
+            (es.state == ES::FileState::Valid && static_cast<Epoch>(es.fence) == kFenceUnknown)) {
+            fenceUnknown_ = true;
+            spdlog::error("PartitionReplica[topic={} part={}]: {} has no valid slot — the restart fence is "
+                          "unknown: the first leadership is refused", cfg_.topicId, cfg_.partitionId,
+                          ES::path(diskLog_->dir()));
+        }
         // Fix round 1 (MEDIUM-5): a missing / corrupt checkpoint over a non-empty
         // recovered log is REBUILT from the batches' stamped epochs (never left
         // silently empty — an empty cache answers every validation as divergent).
@@ -337,7 +345,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
         // is refused and every epoch the controller grants after it is new
         // (it commits leader epochs monotonically).  A failed fence write:
         // refused too (fail closed) — the bump fails over or re-grants.
-        const bool noFence = fenceFile_.empty() && !fenceEstablished_;
+        const bool noFence = (fenceFile_.empty() && !fenceEstablished_) || fenceUnknown_;
         // Hot-path B F7: worker-driven — the fence write goes through the
         // owning worker's io backend; lead once it completed (event-driven).
         if (!logDirOffline_ && !noFence && !fenceFile_.empty() && newEpoch > fencePersisted_ &&
@@ -350,6 +358,16 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
             if (!noFence && !fenceFile_.empty()) logDirOffline_ = true;
             if (newEpoch > restartFenceEpoch_) restartFenceEpoch_ = newEpoch;
             fenceEstablished_ = true;
+            if (fenceUnknown_) {
+                // D21 L2: the refused epoch becomes the durable fence (it clears
+                // the "unknown" marker once written): every later grant is new.
+                fenceUnknown_ = false;
+                if (newEpoch > es_.fenceTarget) es_.fenceTarget = newEpoch;
+                if (es_.enabled) {
+                    es_.due = true;
+                    if (!externalFollowerFlush_) (void)writeEpochStateInline_();   // control thread: inline
+                }
+            }
             refuseStaleLeadership_(newEpoch, partitionEpoch);
             return;
         }
@@ -1774,7 +1792,7 @@ void PartitionReplica::enableEpochState_() noexcept
             const std::size_t stride = ES::strideFor(std::max<std::size_t>(ES::kMinEntries, 2 * n + 2));
             const uint64_t seq = st.seq + 1;
             const auto& m = epochCache_.map();
-            const int fd = ES::create(dir, stride, seq, std::max(fencePersisted_, es_.fenceTarget), m.begin(), m.end());
+            const int fd = ES::create(dir, stride, seq, imageFence_(), m.begin(), m.end());
             if (fd < 0) {
                 spdlog::error("PartitionReplica[topic={} part={}]: creating {} failed (errno={}) — "
                               "leader-epoch durability stays synchronous",
@@ -1815,7 +1833,7 @@ bool PartitionReplica::writeEpochStateInline_() noexcept
         return false;
     }
     try {
-        const Epoch fence = std::max(fencePersisted_, es_.fenceTarget);
+        const Epoch fence = imageFence_();
         const std::size_t entries = epochImageEntries_();
         if (ES::capacityOf(es_.stride) < entries) {
             // Outgrew the slot: re-create larger (tmp + fsync + rename + dir fsync).
@@ -1898,7 +1916,7 @@ bool PartitionReplica::prepareEpochStateWrite(uint8_t* buf, std::size_t cap, Epo
     }
     const int slot = es_.activeSlot < 0 ? 0 : 1 - es_.activeSlot;
     const uint64_t seq = ++es_.seq;
-    const Epoch fence = std::max(fencePersisted_, es_.fenceTarget);
+    const Epoch fence = imageFence_();
     const std::size_t len = encodeEpochImage_(buf, seq, fence);
     es_.stage = EsStage::Prepared;
     es_.inflightSlot = slot;

@@ -1365,3 +1365,58 @@ TEST(HotPathBRegression, BecomeLeaderBelowThePendingEpochIsRefusedRegression) {
     EXPECT_EQ(rig.rep->epoch(), 5) << "led at the stale epoch";
     EXPECT_EQ(rig.rep->role(), Role::Leader);
 }
+
+// D21 review L2: both leader-epoch-state slots corrupt — the restart fence
+// (an epoch led with no surviving batch: here 7) is unknown.  It used to be
+// re-derived from the stamps only (1), so the replica led at 7 AGAIN (a second
+// history under one epoch).  Now the first leadership is refused (the
+// controller bumps; every later grant is new), and the "unknown" marker is
+// durable until that refusal's fence is — a restart in between still refuses.
+TEST(HotPathBRegression, CorruptEpochStateRefusesTheFirstLeadershipRegression) {
+    TmpDir d;
+    rune::replication::NullPartitionTransport t;
+    PartitionConfig c;
+    c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+    {
+        rune::storage::Log log(d.p.string());
+        log.recover();
+        log.append(stampedBatch(0, 3, 1), 2);
+        PartitionReplica r(c, Role::Leader, 1, {1}, {1}, &log, &t);
+        r.setExternalFollowerFlush(true);
+        r.setExternalFollowerFlush(false);
+        r.setIsrChannel(&t);
+        r.becomeLeader(7, {1});                // fence 7, no batch at 7
+        ASSERT_EQ(r.role(), Role::Leader);
+    }
+    {
+        std::fstream f(d.p / rune::storage::LeaderEpochState::kFileName, std::ios::in | std::ios::out | std::ios::binary);
+        const auto sz = fs::file_size(d.p / rune::storage::LeaderEpochState::kFileName);
+        f.seekp(0); f.write("XXXX", 4);
+        f.seekp(static_cast<std::streamoff>(sz / 2)); f.write("XXXX", 4);
+    }
+    {   // restart over the corrupt file, no leadership offered (crash window)
+        rune::storage::Log log(d.p.string());
+        log.recover();
+        PartitionReplica r(c, Role::Follower, 7, {1}, {1}, &log, &t);
+        EXPECT_EQ(r.leaderEpochCacheForTest().latestEpoch(), 1);
+    }
+    {
+        rune::storage::Log log(d.p.string());
+        log.recover();
+        PartitionReplica r(c, Role::Follower, 7, {1}, {1}, &log, &t);
+        r.setIsrChannel(&t);
+        r.becomeLeader(7, {1});
+        EXPECT_NE(r.role(), Role::Leader) << "led at an epoch an earlier incarnation may have led at";
+        EXPECT_GE(r.restartFenceEpochForTest(), 7);
+    }
+    {   // the refusal's fence is durable: epochs <= 7 stay refused, a bump leads
+        rune::storage::Log log(d.p.string());
+        log.recover();
+        PartitionReplica r(c, Role::Follower, 7, {1}, {1}, &log, &t);
+        r.setIsrChannel(&t);
+        EXPECT_GE(r.restartFenceEpochForTest(), 7);
+        r.becomeLeader(8, {1});
+        EXPECT_EQ(r.role(), Role::Leader);
+        EXPECT_EQ(r.epoch(), 8);
+    }
+}

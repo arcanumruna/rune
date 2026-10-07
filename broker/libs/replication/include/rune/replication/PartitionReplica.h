@@ -1613,6 +1613,16 @@ private:
     int  sendLeaderlessReport_(int64_t nowNs);
     [[nodiscard]] int32_t bumpFlags_() const noexcept;
     bool fenceEstablished_ = false;          ///< no-fence-file mode: the first leadership was refused
+    /// D21 review L2: both leader-epoch-state slots were corrupt — the epochs an
+    /// earlier incarnation led at are unknown (an epoch led with no surviving
+    /// batch is in no stamp).  The first leadership is refused (the controller
+    /// bumps); until that refusal's fence is durable, every image carries
+    /// kFenceUnknown so a restart in between still knows.
+    bool fenceUnknown_ = false;
+    static constexpr Epoch kFenceUnknown = -2;
+    [[nodiscard]] Epoch imageFence_() const noexcept {
+        return fenceUnknown_ ? kFenceUnknown : std::max(fencePersisted_, es_.fenceTarget);
+    }
     bool fenceErrorLogged_ = false;
     static constexpr int64_t kAlterIsrResendNs = 50'000'000LL;   // 50 ms
     std::array<uint8_t, ErrorPayload::SIZE> errPayload_{};      ///< DivergingEpoch / OOR answer payload
