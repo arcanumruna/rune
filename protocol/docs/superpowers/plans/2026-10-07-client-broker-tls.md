@@ -219,10 +219,14 @@ public:
     ~AeadCipher();
     AeadCipher(AeadCipher&&) noexcept; AeadCipher& operator=(AeadCipher&&) noexcept;
     AeadCipher(const AeadCipher&) = delete; AeadCipher& operator=(const AeadCipher&) = delete;
-    // out must have room for plainLen + kTagSize. Returns bytes written (plainLen + 16). noexcept, no alloc.
+    // out must have room for plainLen + kTagSize. Returns bytes written
+    // (plainLen + 16), or 0 on a cipher error — on 0 the caller MUST NOT
+    // transmit (encrypting again under a reused nonce is forbidden). noexcept, no alloc.
     size_t seal(uint64_t seq, const uint8_t* aad, size_t aadLen,
                 const uint8_t* plain, size_t plainLen, uint8_t* out) noexcept;
-    // out must have room for ctLen - kTagSize. Returns plaintext length, or -1 on auth failure. no alloc.
+    // out must have room for ctLen - kTagSize. Returns plaintext length, or -1
+    // on auth failure or any cipher error. On -1 the contents of `out` are
+    // UNSPECIFIED and unauthenticated — the caller MUST discard them. no alloc.
     long open(uint64_t seq, const uint8_t* aad, size_t aadLen,
               const uint8_t* ct, size_t ctLen, uint8_t* out) noexcept;
 private:
@@ -304,12 +308,15 @@ static void makeNonce(const uint8_t pfx[4], uint64_t seq, uint8_t nonce[12]){
 size_t AeadCipher::seal(uint64_t seq,const uint8_t* aad,size_t aadLen,
                         const uint8_t* plain,size_t plainLen,uint8_t* out) noexcept {
   uint8_t nonce[12]; makeNonce(prefix_,seq,nonce);
-  int len=0;
-  EVP_EncryptInit_ex(ctx_,nullptr,nullptr,nullptr,nonce); // reuse key, new nonce
-  if(aadLen){ EVP_EncryptUpdate(ctx_,nullptr,&len,aad,(int)aadLen); }
-  EVP_EncryptUpdate(ctx_,out,&len,plain,(int)plainLen);
-  int fin=0; EVP_EncryptFinal_ex(ctx_,out+len,&fin);
-  EVP_CIPHER_CTX_ctrl(ctx_,EVP_CTRL_AEAD_GET_TAG,(int)kTagSize,out+plainLen);
+  int len=0, fin=0;
+  // Fail CLOSED on every EVP step: a silently-failed Init would reuse the prior
+  // nonce under the same key (catastrophic keystream/tag reuse). Return 0 → caller
+  // must NOT transmit. No alloc; these checks are branch-only on the hot path.
+  if (EVP_EncryptInit_ex(ctx_,nullptr,nullptr,nullptr,nonce) != 1) return 0; // reuse key, new nonce
+  if (aadLen && EVP_EncryptUpdate(ctx_,nullptr,&len,aad,(int)aadLen) != 1) return 0;
+  if (EVP_EncryptUpdate(ctx_,out,&len,plain,(int)plainLen) != 1) return 0;
+  if (EVP_EncryptFinal_ex(ctx_,out+len,&fin) != 1) return 0;
+  if (EVP_CIPHER_CTX_ctrl(ctx_,EVP_CTRL_AEAD_GET_TAG,(int)kTagSize,out+plainLen) != 1) return 0;
   return plainLen+kTagSize;
 }
 long AeadCipher::open(uint64_t seq,const uint8_t* aad,size_t aadLen,
@@ -317,13 +324,13 @@ long AeadCipher::open(uint64_t seq,const uint8_t* aad,size_t aadLen,
   if(ctLen<kTagSize) return -1;
   size_t bodyLen=ctLen-kTagSize;
   uint8_t nonce[12]; makeNonce(prefix_,seq,nonce);
-  int len=0;
-  EVP_DecryptInit_ex(ctx_,nullptr,nullptr,nullptr,nonce);
-  if(aadLen){ EVP_DecryptUpdate(ctx_,nullptr,&len,aad,(int)aadLen); }
-  EVP_DecryptUpdate(ctx_,out,&len,ct,(int)bodyLen);
-  EVP_CIPHER_CTX_ctrl(ctx_,EVP_CTRL_AEAD_SET_TAG,(int)kTagSize,(void*)(ct+bodyLen));
-  int fin=0;
-  if(EVP_DecryptFinal_ex(ctx_,out+len,&fin)<=0) return -1; // tag mismatch
+  int len=0, fin=0;
+  // Fail closed on every step; -1 means "do not use out" (see Aead.h contract).
+  if (EVP_DecryptInit_ex(ctx_,nullptr,nullptr,nullptr,nonce) != 1) return -1;
+  if (aadLen && EVP_DecryptUpdate(ctx_,nullptr,&len,aad,(int)aadLen) != 1) return -1;
+  if (EVP_DecryptUpdate(ctx_,out,&len,ct,(int)bodyLen) != 1) return -1;
+  if (EVP_CIPHER_CTX_ctrl(ctx_,EVP_CTRL_AEAD_SET_TAG,(int)kTagSize,(void*)(ct+bodyLen)) != 1) return -1;
+  if (EVP_DecryptFinal_ex(ctx_,out+len,&fin) <= 0) return -1; // tag mismatch
   return (long)bodyLen;
 }
 }
