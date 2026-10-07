@@ -2162,12 +2162,92 @@ TEST(D15MemoryEpochRegression, CoPartitionUnitLeaderlessDecidedAsOneUnitRegressi
             (void)c.svc->onAlterIsr(reportOf(1, n, e1, n == L ? 0 : 10, n == L ? 2 : 1));
         }
         c.tick();
+        // Review M2 ruling: data safety beats colocation — no leader is clean
+        // for both, so each member gets ITS clean leader (no unclean election
+        // for either; the preferred-leader pass restores colocation later).
         const int32_t l0 = c.svc->assignment(0, 0)->leaderNode, l1 = c.svc->assignment(1, 0)->leaderNode;
-        EXPECT_EQ(l0, l1) << "the co-partition unit split: topic 0 -> " << l0 << ", topic 1 -> " << l1;
+        EXPECT_EQ(l0, L) << "topic 0's only clean candidate is its sole ISR member";
         EXPECT_NE(l1, L) << "the empty node was elected over replicas holding topic 1's data";
-        if (survivor) EXPECT_NE(l0, NO_LEADER) << "survivor election allowed, yet the unit was held";
-        else          EXPECT_EQ(l0, NO_LEADER);
+        EXPECT_NE(l1, NO_LEADER) << "topic 1 has clean candidates, yet it was held";
+        EXPECT_EQ(c.svc->assignment(1, 0)->isr.size(), 3u) << "topic 1 was elected uncleanly";
     }
+}
+
+// D15 review M2: each member of a co-partition unit has a DIFFERENT clean
+// leader and none is common.  Survivor (unclean) election must not elect one
+// replica for both — the member it is not clean for would lose committed
+// records; each member gets its own clean leader instead.
+TEST(D15MemoryEpochRegression, CoPartitionUnitNeverUncleanWhenEachMemberHasACleanLeaderRegression) {
+    CtlRig c(true, {TopicSpec{0, 1, 3, "g", "k"}, TopicSpec{1, 1, 3, "g", "k"}});
+    c.svc->setAllowSurvivorElection(true);
+    const int32_t L = c.svc->assignment(0, 0)->leaderNode;
+    ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, L);
+    const int32_t A = L == 1 ? 2 : 1, B = 6 - L - A;
+    auto shrink = [&](int32_t topic, int32_t other) {
+        const PartitionAssignment a = *c.svc->assignment(topic, 0);
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = topic; m.partition = 0; m.leaderId = L; m.leaderEpoch = a.leaderEpoch;
+        m.isrCount = 2; m.isr[0] = L; m.isr[1] = other; m.partitionEpoch = a.partitionEpoch;
+        ASSERT_TRUE(c.svc->onAlterIsr(m));
+        c.drive(50);
+    };
+    shrink(0, A);   // topic 0 ISR {L, A}
+    shrink(1, B);   // topic 1 ISR {L, B}
+    (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(0, 0), 0, 2, /*memory=*/true));
+    (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(1, 0), 1, 2, /*memory=*/true));
+    c.tick({L});
+    ASSERT_EQ(c.svc->assignment(0, 0)->leaderNode, NO_LEADER);
+    ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, NO_LEADER);
+    const int32_t e0 = c.svc->assignment(0, 0)->leaderEpoch, e1 = c.svc->assignment(1, 0)->leaderEpoch;
+    // topic 0: A holds 10 (clean), B 5;  topic 1: B holds 10 (clean), A 5.
+    (void)c.svc->onAlterIsr(reportOf(0, L, e0, 0, 2));
+    (void)c.svc->onAlterIsr(reportOf(0, A, e0, 10, 1));
+    (void)c.svc->onAlterIsr(reportOf(0, B, e0, 5, 1));
+    (void)c.svc->onAlterIsr(reportOf(1, L, e1, 0, 2));
+    (void)c.svc->onAlterIsr(reportOf(1, A, e1, 5, 1));
+    (void)c.svc->onAlterIsr(reportOf(1, B, e1, 10, 1));
+    c.tick();
+    EXPECT_EQ(c.svc->assignment(0, 0)->leaderNode, A) << "topic 0 lost committed records (unclean election)";
+    EXPECT_EQ(c.svc->assignment(1, 0)->leaderNode, B) << "topic 1 lost committed records (unclean election)";
+}
+
+// D15 review m3: a co-partition sibling leaderless for ANOTHER reason (its
+// leader's log dir went offline) is decided WITH the unit's empty-memory
+// member — before, only the memory member was decided and the sibling, whose
+// group ISR intersection excluded the offline node, stayed leaderless although
+// a clean candidate of its own was live.
+TEST(D15MemoryEpochRegression, CoPartitionUnitDecidesSiblingsLeaderlessForOtherReasonsRegression) {
+    CtlRig c(true, {TopicSpec{0, 1, 3, "g", "k"}, TopicSpec{1, 1, 3, "g", "k"}});
+    const int32_t L = c.svc->assignment(0, 0)->leaderNode;
+    ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, L);
+    const int32_t A = L == 1 ? 2 : 1, B = 6 - L - A;
+    auto shrink = [&](int32_t topic, std::vector<int32_t> isr) {
+        const PartitionAssignment a = *c.svc->assignment(topic, 0);
+        rune::replication::AlterIsrMsg m{};
+        m.topicId = topic; m.partition = 0; m.leaderId = L; m.leaderEpoch = a.leaderEpoch;
+        m.isrCount = static_cast<int32_t>(isr.size());
+        for (std::size_t i = 0; i < isr.size(); ++i) m.isr[i] = isr[i];
+        m.partitionEpoch = a.partitionEpoch;
+        ASSERT_TRUE(c.svc->onAlterIsr(m));
+        c.drive(50);
+    };
+    shrink(0, {L});      // topic 0 (memory): sole ISR
+    shrink(1, {L, A});   // topic 1 (disk)
+    (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(0, 0), 0, 2, /*memory=*/true));
+    (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(1, 0), 1, 2, /*memory=*/false, /*leo=*/7, /*failed=*/true));
+    c.tick({L});
+    ASSERT_EQ(c.svc->assignment(0, 0)->leaderNode, NO_LEADER);
+    ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, NO_LEADER);
+    const int32_t e0 = c.svc->assignment(0, 0)->leaderEpoch, e1 = c.svc->assignment(1, 0)->leaderEpoch;
+    for (int32_t n : {L, A, B}) (void)c.svc->onAlterIsr(reportOf(0, n, e0, 0, n == L ? 2 : 1));
+    (void)c.svc->onAlterIsr(reportOf(1, L, e1, 7, 2, /*failed=*/true));
+    (void)c.svc->onAlterIsr(reportOf(1, A, e1, 7, 1));
+    (void)c.svc->onAlterIsr(reportOf(1, B, e1, 3, 1));
+    c.tick();
+    c.tick();
+    EXPECT_EQ(c.svc->assignment(0, 0)->leaderNode, L);
+    EXPECT_EQ(c.svc->assignment(1, 0)->leaderNode, A)
+        << "the sibling leaderless for another reason was never decided with its unit";
 }
 
 // D15 review M1: the leader-epoch FENCE protocol is unconditional — a log

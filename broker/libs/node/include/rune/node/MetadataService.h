@@ -916,7 +916,7 @@ public:
         const bool replica = std::find(pa.replicas.begin(), pa.replicas.end(), m.leaderId) != pa.replicas.end();
         if (replica && pa.leaderNode == rune::metadata::NO_LEADER && m.leaderEpoch == pa.leaderEpoch)
             leaderlessReports_[partitionKey_(m.topicId, m.partition)][m.leaderId] =
-                FreshReport{m.isr[2], failed};
+                FreshReport{m.isr[2], failed, pa.leaderEpoch};
         reply(rr::kAlterIsrOk, pa.partitionEpoch);
         return false;
     }
@@ -930,12 +930,14 @@ public:
     /// leaderless (Kafka: offline, ISR lineage kept).
     ///
     /// D15 item 2: decided per CO-PARTITION UNIT (same-index partitions of a
-    /// co-partition group move / fence as one): the unit's leaderless members
-    /// are decided together, once every one of them has its fresh reports, on
-    /// ONE leader that is a clean choice for all of them (preferring the live
-    /// leader of a sibling that is not leaderless, so the unit stays
-    /// colocated).  No common clean leader: survivor election (opt-in) picks
-    /// one available replica for all of them, else the whole unit is held.
+    /// co-partition group): ALL its leaderless members (whatever made them
+    /// leaderless — review m3) are decided together, once every one has its
+    /// fresh reports: ONE leader clean for all of them when one exists
+    /// (preferring a live sibling's leader — colocated); else (review M2:
+    /// data safety beats colocation) each member gets its own clean leader and
+    /// the preferred-leader pass restores colocation later; survivor
+    /// (unclean, opt-in) election only for a member with no clean candidate.
+    /// The balancer leaves such a unit to this pass (runDynamicRebalanceOnTick).
     void decideLeaderless_(std::vector<rune::metadata::BalancerRecord>& recs, int maxRecords) {
         namespace rm = rune::metadata;
         // Prune superseded entries (a newer committed decision).
@@ -965,61 +967,48 @@ public:
             if (std::find(unitVisited_.begin(), unitVisited_.end(), key0) != unitVisited_.end()) continue;
             unitKeys_(key0, unitScratch_);
             for (int64_t k : unitScratch_) unitVisited_.push_back(k);
-            // The unit's leaderless members awaiting a decision, and the live
-            // leader of a sibling that has one.
+            // The unit's LEADERLESS members (review m3: whatever made them
+            // leaderless — an empty memory leader, an offline log dir, a dead
+            // ISR) and the live leader of a sibling that has one.
             int32_t siblingLeader = -1;
-            std::size_t memberCount = 0;
             bool ready = true;
+            struct View { int64_t key; const rm::PartitionAssignment* pa; const std::unordered_map<int32_t, FreshReport>* reps; int32_t maxLeo; };
+            std::vector<View> members;   // cold path (a leaderless decision)
             for (int64_t k : unitScratch_) {
                 const auto* pa = msm_.assignment(static_cast<int32_t>(k >> 32), static_cast<int32_t>(static_cast<uint32_t>(k)));
                 if (pa == nullptr) continue;
-                const auto e = emptyMemoryLeader_.find(k);
-                if (e == emptyMemoryLeader_.end()) {
-                    if (pa->leaderNode >= 0 && isEligible_(pa->leaderNode) && !isShutting_(pa->leaderNode))
-                        siblingLeader = pa->leaderNode;
+                if (pa->leaderNode != rm::NO_LEADER) {
+                    if (isEligible_(pa->leaderNode) && !isShutting_(pa->leaderNode)) siblingLeader = pa->leaderNode;
                     continue;
                 }
-                ++memberCount;
-                if (pa->leaderEpoch < e->second.leaderlessEpoch || busy(k)) { ready = false; continue; }
-                // Wait for the fresh report of every live replica.
-                const auto r = leaderlessReports_.find(k);
+                const auto e = emptyMemoryLeader_.find(k);
+                if ((e != emptyMemoryLeader_.end() && pa->leaderEpoch < e->second.leaderlessEpoch) || busy(k)) { ready = false; continue; }
+                // Wait for the fresh report (THIS leaderless epoch) of every live replica.
+                const auto& reps = leaderlessReports_[k];
                 for (int32_t n : pa->replicas) {
                     if (!isEligible_(n)) continue;
-                    if (r == leaderlessReports_.end() || r->second.find(n) == r->second.end()) { ready = false; break; }
+                    const auto r = reps.find(n);
+                    if (r == reps.end() || r->second.epoch != pa->leaderEpoch) { ready = false; break; }
                 }
+                members.push_back(View{k, pa, &reps, -1});
             }
-            if (!ready || memberCount == 0) continue;
-            if (static_cast<int>(recs.size() + memberCount) > maxRecords) continue;   // next tick, as a unit
-            // Per member: is n available (live, reported, healthy), clean (an
-            // ISR member nobody available holds more than), and its LEO.
-            struct View { int64_t key; const rm::PartitionAssignment* pa; const std::unordered_map<int32_t, FreshReport>* reps; int32_t maxLeo; };
-            std::vector<View> members;   // cold path (a leaderless decision)
-            members.reserve(memberCount);
-            for (int64_t k : unitScratch_) {
-                if (emptyMemoryLeader_.count(k) == 0) continue;
-                const int32_t t = static_cast<int32_t>(k >> 32), p = static_cast<int32_t>(static_cast<uint32_t>(k));
-                View v{k, msm_.assignment(t, p), &leaderlessReports_[k], -1};
-                members.push_back(v);
-            }
+            if (!ready || members.empty()) continue;
+            if (static_cast<int>(recs.size() + members.size()) > maxRecords) continue;   // next tick, as a unit
             auto avail = [&](const View& v, int32_t n, int32_t* leo) {
                 if (!isEligible_(n) || isShutting_(n)) return false;
                 if (std::find(v.pa->replicas.begin(), v.pa->replicas.end(), n) == v.pa->replicas.end()) return false;
                 const auto r = v.reps->find(n);
-                if (r == v.reps->end() || r->second.logDirFailed) return false;
+                if (r == v.reps->end() || r->second.logDirFailed || r->second.epoch != v.pa->leaderEpoch) return false;
                 if (isOffline_(static_cast<int32_t>(v.key >> 32), static_cast<int32_t>(static_cast<uint32_t>(v.key)), n)) return false;
                 if (leo) *leo = r->second.leo;
                 return true;
             };
-            bool anyAvailEverywhere = true;
-            for (auto& v : members) {
-                bool any = false;
+            for (auto& v : members)
                 for (int32_t n : v.pa->replicas) {
                     int32_t leo = -1;
-                    if (avail(v, n, &leo)) { any = true; v.maxLeo = std::max(v.maxLeo, leo); }
+                    if (avail(v, n, &leo)) v.maxLeo = std::max(v.maxLeo, leo);
                 }
-                anyAvailEverywhere = anyAvailEverywhere && any;
-            }
-            if (!anyAvailEverywhere) continue;   // nobody to elect yet for some member
+            // Clean: an available ISR member nobody available holds more than.
             auto clean = [&](const View& v, int32_t n) {
                 int32_t leo = -1;
                 return avail(v, n, &leo) && leo >= v.maxLeo &&
@@ -1029,34 +1018,44 @@ public:
                 for (const auto& v : members) if (!clean(v, n)) return false;
                 return true;
             };
-            int32_t leader = -1;
-            bool unclean = false;
-            if (siblingLeader >= 0 && cleanForAll(siblingLeader)) leader = siblingLeader;
-            for (std::size_t i = 0; leader < 0 && i < members[0].pa->replicas.size(); ++i)
-                if (cleanForAll(members[0].pa->replicas[i])) leader = members[0].pa->replicas[i];
-            if (leader < 0 && allowSurvivorElection_) {
-                int64_t bestSum = -1;
-                for (int32_t n : members[0].pa->replicas) {
-                    int64_t sum = 0;
-                    bool ok = true;
-                    for (const auto& v : members) {
-                        int32_t leo = -1;
-                        ok = ok && avail(v, n, &leo);
-                        sum += leo;
-                    }
-                    if (ok && sum > bestSum) { bestSum = sum; leader = n; }
-                }
-                unclean = leader >= 0;
-            }
-            if (leader < 0) {
-                // Held offline (Kafka: unclean election disabled): the markers
-                // stay so the balancer never re-elects the empty leader; no
-                // record is ever appended for them (no churn).
-                for (const auto& v : members)
-                    if (heldLeaderless_.insert(v.key).second) ++leaderlessHeld_;
-                continue;
-            }
+            // 1. One leader clean for EVERY member (colocated, preferring a
+            //    live sibling's leader).
+            int32_t common = -1;
+            if (siblingLeader >= 0 && cleanForAll(siblingLeader)) common = siblingLeader;
+            for (std::size_t i = 0; common < 0 && i < members[0].pa->replicas.size(); ++i)
+                if (cleanForAll(members[0].pa->replicas[i])) common = members[0].pa->replicas[i];
+            // 2. Review M2 (data safety beats colocation): otherwise each member
+            //    gets ITS OWN clean leader (preferring one already chosen in the
+            //    unit, then the sibling's) — the preferred-leader pass restores
+            //    colocation later.  3. Survivor (unclean) election only for a
+            //    member with NO clean candidate at all (opt-in), else it is held.
+            std::vector<int32_t> chosen;   // cold
             for (const auto& v : members) {
+                int32_t leader = -1;
+                bool unclean = false;
+                if (common >= 0) {
+                    leader = common;
+                } else {
+                    for (int32_t n : chosen) if (leader < 0 && clean(v, n)) leader = n;
+                    if (leader < 0 && siblingLeader >= 0 && clean(v, siblingLeader)) leader = siblingLeader;
+                    for (int32_t n : v.pa->replicas) if (leader < 0 && clean(v, n)) leader = n;
+                    if (leader < 0 && allowSurvivorElection_) {
+                        int32_t bestLeo = -1;
+                        for (int32_t n : v.pa->replicas) {
+                            int32_t leo = -1;
+                            if (avail(v, n, &leo) && leo > bestLeo) { bestLeo = leo; leader = n; }
+                        }
+                        unclean = leader >= 0;
+                    }
+                }
+                if (leader < 0) {
+                    // Held offline (Kafka: unclean election disabled, or nobody
+                    // available): the marker stays so the balancer never
+                    // re-elects the empty leader; no record (no churn).
+                    if (heldLeaderless_.insert(v.key).second) ++leaderlessHeld_;
+                    continue;
+                }
+                if (std::find(chosen.begin(), chosen.end(), leader) == chosen.end()) chosen.push_back(leader);
                 rm::BalancerRecord br;
                 br.replicas = v.pa->replicas;
                 br.rec.topicId     = static_cast<int32_t>(v.key >> 32);
@@ -1064,7 +1063,7 @@ public:
                 br.rec.leaderNode  = leader;
                 br.rec.leaderEpoch = v.pa->leaderEpoch + 1;
                 br.rec.partitionEpoch = std::max(v.pa->partitionEpoch + 1, br.rec.leaderEpoch);
-                if (unclean && !clean(v, leader)) {
+                if (unclean) {
                     br.isr = {leader};                               // unclean, opt-in
                 } else {
                     br.isr.push_back(leader);                        // clean: nobody holds more
@@ -1446,6 +1445,20 @@ public:
         if (!inflight_.empty()) {
             std::erase_if(recs, [this](const rune::metadata::BalancerRecord& br) {
                 return inflight_.count(partitionKey_(br.rec.topicId, br.rec.partition)) != 0;
+            });
+        }
+        // D15 m3: a co-partition unit with an empty-memory leaderless member
+        // is decided as a whole by decideLeaderless_ — never piecemeal here.
+        if (!emptyMemoryLeader_.empty()) {
+            unitScratch_.clear();
+            for (const auto& [k, e] : emptyMemoryLeader_) {
+                unitKeys_(k, unitVisited_);
+                unitScratch_.insert(unitScratch_.end(), unitVisited_.begin(), unitVisited_.end());
+            }
+            std::erase_if(recs, [this](const rune::metadata::BalancerRecord& br) {
+                const int64_t k = partitionKey_(br.rec.topicId, br.rec.partition);
+                return std::find(unitScratch_.begin(), unitScratch_.end(), k) != unitScratch_.end() &&
+                       br.rec.leaderNode != rune::metadata::NO_LEADER;
             });
         }
         // MAJOR-1: the bump requests the balancer did not fail over (before
@@ -1973,6 +1986,30 @@ private:
             ++leaderlessMarksRestored_;
             pendingDynamicRecords_.push_back(std::move(br));
         });
+        // Review m3: the unit's OTHER leaderless members are decided with it —
+        // they report to this controller too (re-armed, no mark).
+        std::vector<int64_t> rearmed, unit;   // cold (a claim)
+        for (const auto& q : pendingDynamicRecords_) rearmed.push_back(partitionKey_(q.rec.topicId, q.rec.partition));
+        for (const auto& [k, e] : emptyMemoryLeader_) {
+            unitKeys_(k, unit);
+            for (int64_t u : unit) {
+                if (std::find(rearmed.begin(), rearmed.end(), u) != rearmed.end()) continue;
+                const auto* pa = msm_.assignment(static_cast<int32_t>(u >> 32), static_cast<int32_t>(static_cast<uint32_t>(u)));
+                if (pa == nullptr || pa->leaderNode != rm::NO_LEADER) continue;
+                rm::BalancerRecord br;
+                br.isr      = pa->isr;
+                br.replicas = pa->replicas;
+                br.rec.topicId        = static_cast<int32_t>(u >> 32);
+                br.rec.partition      = static_cast<int32_t>(static_cast<uint32_t>(u));
+                br.rec.leaderNode     = rm::NO_LEADER;
+                br.rec.leaderEpoch    = pa->leaderEpoch + 1;
+                br.rec.partitionEpoch = std::max(pa->partitionEpoch + 1, br.rec.leaderEpoch);
+                br.rec.isr      = rune::protocol::metadata::Int32ArrayView{br.isr.data(), static_cast<uint16_t>(br.isr.size())};
+                br.rec.replicas = rune::protocol::metadata::Int32ArrayView{br.replicas.data(), static_cast<uint16_t>(br.replicas.size())};
+                rearmed.push_back(u);
+                pendingDynamicRecords_.push_back(std::move(br));
+            }
+        }
     }
 
     void drainDynamicQueue() {
@@ -2109,7 +2146,7 @@ private:
     int16_t featureInflightLevel_  = -1;   ///< appended under this leadership, not applied yet
     /// D15 item 2: decideLeaderless_ scratch (capacity persists).
     std::vector<int64_t> unitScratch_, unitVisited_, unitDecided_;
-    struct FreshReport { int32_t leo = -1; bool logDirFailed = false; };
+    struct FreshReport { int32_t leo = -1; bool logDirFailed = false; int32_t epoch = -1; };
     std::unordered_map<int64_t, std::unordered_map<int32_t, FreshReport>> leaderlessReports_;
     uint64_t leaderlessHeld_ = 0;   ///< partitions held leaderless (log dir failed / unclean needed)
     std::unordered_set<int64_t> heldLeaderless_;
