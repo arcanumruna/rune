@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <utility>
 namespace rune::storage {
@@ -27,6 +28,10 @@ struct LogStorageState {
     int      failedErrno  = 0;
     int      faultForTest = 0;
     int      writeFaultForTest = 0;
+    /// writeFaultForTest value (D20 review L2): the NEXT page-cache append
+    /// (appendNoSync / appendNoSyncRestamp) writes only part of the batch in
+    /// its first syscall, then resumes like a real short write; resets to 0.
+    static constexpr int kShortWriteOnceForTest = -1;
     /// D20 review M1 test seam: when set, the durable append's pwrite retry loop
     /// (LogSegment::writeAll_) calls this instead of ::pwrite, so a test can force
     /// a short write / EINTR / hard errno.  Null in production (one predictable
@@ -387,6 +392,10 @@ private:
     /// D20: pwrite all of [data, data+len) at logSize_ through fd_ (EINTR /
     /// short-write retry).  0 or errno.
     int writeAll_(const uint8_t* data, std::size_t len) noexcept;
+    /// D20 review L2 (cold): finish a page-cache append whose first pwrite /
+    /// pwritev returned `first` (< total) — resume a short write / EINTR at
+    /// logSize_ + done like writeAll_.  0 or errno (ENOSPC for no progress).
+    int finishShortWrite_(const struct ::iovec* iov, int cnt, std::size_t total, ssize_t first) noexcept;
     [[noreturn]] void failWrite_(int err, const char* what);   ///< E1: sticky fail-stop + throw
 
     /// (Re)map the .log read-only to cover the currently-written logSize_ bytes so

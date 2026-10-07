@@ -229,18 +229,42 @@ int LogSegment::flushBufferedToPageCache() noexcept {
 // Retries a short write / EINTR like the libc stream did; 0 or errno (ENOSPC for
 // a zero-progress write).
 int LogSegment::writeAll_(const uint8_t* data, std::size_t len) noexcept {
+    const struct ::iovec one{const_cast<uint8_t*>(data), len};
+    errno = EINTR;   // "nothing written yet, retry"
+    return finishShortWrite_(&one, 1, len, -1);
+}
+
+int LogSegment::finishShortWrite_(const struct ::iovec* iov, int cnt, std::size_t total, ssize_t first) noexcept {
     std::size_t done = 0;
-    while (done < len) {
-        const off_t off = static_cast<off_t>(logSize_) + static_cast<off_t>(done);
-        const ssize_t w = (storage_ && storage_->pwriteForTest)
-            ? storage_->pwriteForTest(fd_, data + done, len - done, off)
-            : ::pwrite(fd_, data + done, len - done, off);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return errno != 0 ? errno : EIO;
+    if (first < 0) {
+        if (errno != EINTR) return errno != 0 ? errno : EIO;
+    } else if (first == 0 && total > 0) {
+        return ENOSPC;
+    } else {
+        done = static_cast<std::size_t>(first);
+    }
+    std::size_t skip = done;
+    for (int i = 0; i < cnt; ++i) {
+        const auto* p = static_cast<const uint8_t*>(iov[i].iov_base);
+        std::size_t n = iov[i].iov_len;
+        if (skip >= n) { skip -= n; continue; }
+        p += skip;
+        n -= skip;
+        skip = 0;
+        while (n > 0) {
+            const off_t off = static_cast<off_t>(logSize_) + static_cast<off_t>(done);
+            const ssize_t w = (storage_ && storage_->pwriteForTest)
+                ? storage_->pwriteForTest(fd_, p, n, off)
+                : ::pwrite(fd_, p, n, off);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                return errno != 0 ? errno : EIO;
+            }
+            if (w == 0) return ENOSPC;
+            p += w;
+            n -= static_cast<std::size_t>(w);
+            done += static_cast<std::size_t>(w);
         }
-        if (w == 0) return ENOSPC;
-        done += static_cast<std::size_t>(w);
     }
     return 0;
 }
@@ -328,7 +352,7 @@ int64_t LogSegment::writeAndUpdateState(const uint8_t* data, std::size_t len, in
         index_->append(r.baseOffset(), logSize_); // C4: OffsetIndex::append guards 2GiB
         bytesSinceIndex_ = 0;
     }
-    if (storage_ && storage_->writeFaultForTest != 0) [[unlikely]]
+    if (storage_ && storage_->writeFaultForTest > 0) [[unlikely]]
         failWrite_(storage_->writeFaultForTest, "LogSegment::append write");
     if (const int e = writeAll_(data, len); e != 0) [[unlikely]]
         failWrite_(e, "LogSegment::append write");
@@ -389,11 +413,21 @@ int64_t LogSegment::appendNoSync(const uint8_t* data, std::size_t len, int64_t l
     // entry points at bytes never written — harmless: the log is then failed (no reads/appends) and
     // restart recovery rebuilds the index from the valid data.
     off_t writePos = static_cast<off_t>(logSize_);
-    if (storage_ && storage_->writeFaultForTest != 0) [[unlikely]]
-        failWrite_(storage_->writeFaultForTest, "LogSegment::appendNoSync pwrite");
-    ssize_t written = ::pwrite(fd_, data, len, writePos);
-    if (written < 0 || static_cast<std::size_t>(written) != len) [[unlikely]]
-        failWrite_(written < 0 ? errno : ENOSPC, "LogSegment::appendNoSync pwrite");   // short write = out of space
+    ssize_t written;
+    if (storage_ && storage_->writeFaultForTest != 0) [[unlikely]] {
+        if (storage_->writeFaultForTest != LogStorageState::kShortWriteOnceForTest)
+            failWrite_(storage_->writeFaultForTest, "LogSegment::appendNoSync pwrite");
+        storage_->writeFaultForTest = 0;
+        written = ::pwrite(fd_, data, len / 2, writePos);   // a simulated short write
+    } else {
+        written = ::pwrite(fd_, data, len, writePos);
+    }
+    if (written != static_cast<ssize_t>(len)) [[unlikely]] {
+        // D20 review L2: resumed like the durable path (EINTR / short write).
+        const struct ::iovec one{const_cast<uint8_t*>(data), len};
+        if (const int e = finishShortWrite_(&one, 1, len, written); e != 0)
+            failWrite_(e, "LogSegment::appendNoSync pwrite");
+    }
 
     logSize_ += static_cast<int64_t>(len);
     bytesSinceIndex_ += static_cast<int64_t>(len);
@@ -453,11 +487,20 @@ int64_t LogSegment::appendNoSyncRestamp(const uint8_t* data, std::size_t len,
     }
 
     off_t writePos = static_cast<off_t>(logSize_);
-    if (storage_ && storage_->writeFaultForTest != 0) [[unlikely]]
-        failWrite_(storage_->writeFaultForTest, "LogSegment::appendNoSyncRestamp pwritev");
-    ssize_t written = ::pwritev(fd_, iov, iovCnt, writePos);
-    if (written < 0 || static_cast<std::size_t>(written) != len) [[unlikely]]
-        failWrite_(written < 0 ? errno : ENOSPC, "LogSegment::appendNoSyncRestamp pwritev");
+    ssize_t written;
+    if (storage_ && storage_->writeFaultForTest != 0) [[unlikely]] {
+        if (storage_->writeFaultForTest != LogStorageState::kShortWriteOnceForTest)
+            failWrite_(storage_->writeFaultForTest, "LogSegment::appendNoSyncRestamp pwritev");
+        storage_->writeFaultForTest = 0;
+        written = ::pwritev(fd_, iov, 1, writePos);   // a simulated short write (first iovec only)
+    } else {
+        written = ::pwritev(fd_, iov, iovCnt, writePos);
+    }
+    if (written != static_cast<ssize_t>(len)) [[unlikely]] {
+        // D20 review L2: resumed like the durable path (EINTR / short write).
+        if (const int e = finishShortWrite_(iov, iovCnt, len, written); e != 0)
+            failWrite_(e, "LogSegment::appendNoSyncRestamp pwritev");
+    }
 
     // maxTimestamp lives at kMaxTimestampOffset (outside the base-offset field),
     // so reading it from the read-only `data` is correct.

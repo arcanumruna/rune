@@ -1374,7 +1374,7 @@ int Log::createRecoveryPointFile_(int64_t r) noexcept {
     int err = 0;
     const int fd = ::open(rpTmpPath_.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) err = errno != 0 ? errno : EIO;
-    if (err == 0 && storage_.writeFaultForTest != 0) err = storage_.writeFaultForTest;
+    if (err == 0 && storage_.writeFaultForTest > 0) err = storage_.writeFaultForTest;
     if (err == 0 && ::pwrite(fd, file.data(), file.size(), 0) != static_cast<ssize_t>(file.size()))
         err = errno != 0 ? errno : ENOSPC;
     ++storage_.roleChangeSyncs;
@@ -1420,7 +1420,7 @@ int Log::checkpointRecoveryPoint() noexcept {
     const uint64_t seq = ++rpSeq_;
     encodeRpSlot(img, seq, v);
     int err = 0;
-    if (storage_.writeFaultForTest != 0) err = storage_.writeFaultForTest;
+    if (storage_.writeFaultForTest > 0) err = storage_.writeFaultForTest;
     else if (::pwrite(rpFd_, img, sizeof img, static_cast<off_t>(target * kRpSlotStride)) != static_cast<ssize_t>(sizeof img))
         err = errno != 0 ? errno : ENOSPC;
     ++storage_.roleChangeSyncs;

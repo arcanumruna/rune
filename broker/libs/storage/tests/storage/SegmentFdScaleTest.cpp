@@ -252,3 +252,45 @@ void tornTailThenAppend(bool prealloc) {
 
 TEST(SegmentFdScaleRegression, RecoverTornTailThenAppendRegression) { tornTailThenAppend(false); }
 TEST(SegmentFdScaleRegression, RecoverTornTailThenAppendPreallocatedRegression) { tornTailThenAppend(true); }
+
+// ---------------------------------------------------------------------------
+// D20 review L2: the page-cache appends (appendNoSync / appendNoSyncRestamp)
+// resume a short write like the durable path, instead of failing the log with
+// a fabricated ENOSPC.  kShortWriteOnceForTest makes the first syscall write
+// only part of the batch.
+// ---------------------------------------------------------------------------
+TEST(SegmentFdScaleRegression, AppendNoSyncResumesAShortWriteRegression) {
+    const fs::path dir = freshDir("rune_d20b_l2_nosync");
+    LogStorageState st;
+    LogSegment seg(dir.string(), 0, 4096, 64 * 1024);
+    seg.setStorageState(&st);
+    const auto b0 = batchAt(0), b1 = batchAt(1);
+    st.writeFaultForTest = LogStorageState::kShortWriteOnceForTest;
+    EXPECT_EQ(seg.appendNoSync(b0.data(), b0.size(), 0), 1);
+    EXPECT_EQ(st.failedErrno, 0) << "a short write is resumed, not a fail-stop";
+    EXPECT_EQ(seg.appendNoSync(b1.data(), b1.size(), 1), 2);
+    EXPECT_EQ(fileEnd(seg.logFd()), static_cast<off_t>(b0.size() + b1.size()));
+    EXPECT_EQ(seg.read(0, 1 << 16).size(), b0.size() + b1.size());
+    fs::remove_all(dir);
+}
+
+TEST(SegmentFdScaleRegression, AppendNoSyncRestampResumesAShortWriteRegression) {
+    for (const int32_t epoch : {-1, 7}) {
+        const fs::path dir = freshDir("rune_d20b_l2_restamp");
+        LogStorageState st;
+        LogSegment seg(dir.string(), 0, 4096, 64 * 1024);
+        seg.setStorageState(&st);
+        const auto b = batchAt(999);   // producer's base; restamped to 0
+        st.writeFaultForTest = LogStorageState::kShortWriteOnceForTest;
+        EXPECT_EQ(seg.appendNoSyncRestamp(b.data(), b.size(), 0, 0, epoch), 1);
+        EXPECT_EQ(st.failedErrno, 0) << "epoch " << epoch;
+        EXPECT_EQ(fileEnd(seg.logFd()), static_cast<off_t>(b.size()));
+        const auto got = seg.read(0, 1 << 16);
+        ASSERT_EQ(got.size(), b.size());
+        RecordBatchReader r(got.data(), got.size());
+        EXPECT_TRUE(r.ensureValid()) << "every byte after the cut landed in order";
+        EXPECT_EQ(r.baseOffset(), 0);
+        if (epoch >= 0) EXPECT_EQ(r.partitionLeaderEpoch(), epoch);
+        fs::remove_all(dir);
+    }
+}
