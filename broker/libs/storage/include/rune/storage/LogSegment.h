@@ -26,6 +26,11 @@ struct LogStorageState {
     int      failedErrno  = 0;
     int      faultForTest = 0;
     int      writeFaultForTest = 0;
+    /// D20 review M1 test seam: when set, the durable append's pwrite retry loop
+    /// (LogSegment::writeAll_) calls this instead of ::pwrite, so a test can force
+    /// a short write / EINTR / hard errno.  Null in production (one predictable
+    /// branch on the already syscall-bound durable path; not the pwrite hot path).
+    ssize_t (*pwriteForTest)(int fd, const void* buf, std::size_t n, off_t off) = nullptr;
 };
 
 /// A single on-disk log segment: a ".log" data file paired with a ".index" mmap.

@@ -231,7 +231,10 @@ int LogSegment::flushBufferedToPageCache() noexcept {
 int LogSegment::writeAll_(const uint8_t* data, std::size_t len) noexcept {
     std::size_t done = 0;
     while (done < len) {
-        const ssize_t w = ::pwrite(fd_, data + done, len - done, static_cast<off_t>(logSize_) + static_cast<off_t>(done));
+        const off_t off = static_cast<off_t>(logSize_) + static_cast<off_t>(done);
+        const ssize_t w = (storage_ && storage_->pwriteForTest)
+            ? storage_->pwriteForTest(fd_, data + done, len - done, off)
+            : ::pwrite(fd_, data + done, len - done, off);
         if (w < 0) {
             if (errno == EINTR) continue;
             return errno != 0 ? errno : EIO;

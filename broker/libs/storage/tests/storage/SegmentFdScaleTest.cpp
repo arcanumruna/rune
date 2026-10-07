@@ -17,7 +17,9 @@
 #include <rune/storage/LogSegment.h>
 #include <rune/protocol/RecordBatch.h>
 
+#include <cerrno>
 #include <filesystem>
+#include <system_error>
 #include <memory>
 #include <string>
 #include <vector>
@@ -131,3 +133,122 @@ TEST(SegmentFdScaleRegression, RecoveredAndStagedSegmentsHoldNoStdioStreamRegres
     EXPECT_EQ(openFdCount(), before) << "segment destruction leaked descriptors";
     fs::remove_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// D20 review M1: the durable append's pwrite retry loop (writeAll_).
+// ---------------------------------------------------------------------------
+namespace {
+int gCalls = 0;
+ssize_t shortThenFull(int fd, const void* b, std::size_t n, off_t off) {
+    ++gCalls;
+    return ::pwrite(fd, b, gCalls == 1 && n > 1 ? n / 2 : n, off);   // first call: half
+}
+ssize_t eintrThenFull(int fd, const void* b, std::size_t n, off_t off) {
+    if (++gCalls == 1) { errno = EINTR; return -1; }
+    return ::pwrite(fd, b, n, off);
+}
+ssize_t hardEio(int, const void*, std::size_t, off_t) { ++gCalls; errno = EIO; return -1; }
+
+off_t fileEnd(int fd) { return ::lseek(fd, 0, SEEK_END); }
+} // namespace
+
+TEST(SegmentFdScaleRegression, DurableAppendCompletesAShortWriteRegression) {
+    const fs::path dir = freshDir("rune_d20_short");
+    LogStorageState st;
+    LogSegment seg(dir.string(), 0, 4096, 64 * 1024);
+    seg.setStorageState(&st);
+    gCalls = 0; st.pwriteForTest = &shortThenFull;
+    const auto b = batchAt(0);
+    seg.append(b, 0);
+    EXPECT_EQ(gCalls, 2) << "the short write must be continued, not failed";
+    EXPECT_EQ(st.failedErrno, 0);
+    EXPECT_EQ(fileEnd(seg.logFd()), static_cast<off_t>(b.size()));
+    EXPECT_EQ(seg.read(0, 1 << 16), b);
+    fs::remove_all(dir);
+}
+
+TEST(SegmentFdScaleRegression, DurableAppendRetriesEintrRegression) {
+    const fs::path dir = freshDir("rune_d20_eintr");
+    LogStorageState st;
+    LogSegment seg(dir.string(), 0, 4096, 64 * 1024);
+    seg.setStorageState(&st);
+    gCalls = 0; st.pwriteForTest = &eintrThenFull;
+    const auto b = batchAt(0);
+    EXPECT_EQ(seg.append(b, 0), 1);
+    EXPECT_EQ(gCalls, 2);
+    EXPECT_EQ(st.failedErrno, 0);
+    EXPECT_EQ(fileEnd(seg.logFd()), static_cast<off_t>(b.size()));
+    EXPECT_EQ(seg.read(0, 1 << 16), b);
+    fs::remove_all(dir);
+}
+
+TEST(SegmentFdScaleRegression, DurableAppendHardErrorIsFailStopWithErrnoRegression) {
+    const fs::path dir = freshDir("rune_d20_eio");
+    LogStorageState st;
+    LogSegment seg(dir.string(), 0, 4096, 64 * 1024);
+    seg.setStorageState(&st);
+    gCalls = 0; st.pwriteForTest = &hardEio;
+    const auto b = batchAt(0);
+    try {
+        seg.append(b, 0);
+        FAIL() << "a hard write error must throw";
+    } catch (const std::system_error& e) {
+        EXPECT_EQ(e.code().value(), EIO);
+    }
+    EXPECT_EQ(gCalls, 1) << "a hard errno is never retried";
+    EXPECT_EQ(st.failedErrno, EIO) << "sticky fail-stop";
+    EXPECT_EQ(seg.sizeBytes(), 0);
+    st.pwriteForTest = nullptr;
+    EXPECT_THROW(seg.sync(), std::system_error) << "a failed log never syncs again";
+    fs::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// D20 review M2: recover() over a torn tail (pread + ftruncate through fd_),
+// then append — with and without preallocated (KEEP_SIZE) blocks.  The append
+// must land right after the cut (O_APPEND EOF == logSize_: review L1), and a
+// second recovery must read every valid batch.
+// ---------------------------------------------------------------------------
+namespace {
+void tornTailThenAppend(bool prealloc) {
+    const fs::path dir = freshDir(prealloc ? "rune_d20_torn_pre" : "rune_d20_torn");
+    const auto b0 = batchAt(0), b1 = batchAt(1), b2 = batchAt(2);
+    std::string logPath;
+    {
+        LogSegment s(dir.string(), 0, 4096, 64 * 1024);
+        s.append(b0, 0);
+        s.append(b1, 1);
+        logPath = s.logPath();
+    }
+    {   // torn tail: half of a third batch
+        const int fd = ::open(logPath.c_str(), O_WRONLY | O_APPEND);
+        ASSERT_GE(fd, 0);
+        ASSERT_EQ(::write(fd, b2.data(), b2.size() / 2), static_cast<ssize_t>(b2.size() / 2));
+        ::close(fd);
+    }
+    const off_t valid = static_cast<off_t>(b0.size() + b1.size());
+    {
+        LogSegment s(dir.string(), 0, 4096, 64 * 1024);
+        if (prealloc) s.preallocate(1 << 20);
+        ASSERT_EQ(s.recover(/*syncIndex*/false), 2);
+        ASSERT_EQ(s.sizeBytes(), static_cast<int64_t>(valid));
+        if (prealloc) s.preallocate(1 << 20);
+        EXPECT_EQ(fileEnd(s.logFd()), valid) << "O_APPEND EOF must equal logSize_ after the cut";
+        s.append(b2, 2);
+        EXPECT_EQ(fileEnd(s.logFd()), valid + static_cast<off_t>(b2.size()));
+        EXPECT_EQ(s.read(2, 1 << 16), b2) << "the append landed right after the cut";
+    }
+    {
+        LogSegment s(dir.string(), 0, 4096, 64 * 1024);
+        EXPECT_EQ(s.recover(/*syncIndex*/false), 3) << "every valid batch survives a second recovery";
+        std::vector<uint8_t> all(b0);
+        all.insert(all.end(), b1.begin(), b1.end());
+        all.insert(all.end(), b2.begin(), b2.end());
+        EXPECT_EQ(s.read(0, 1 << 16), all);
+    }
+    fs::remove_all(dir);
+}
+} // namespace
+
+TEST(SegmentFdScaleRegression, RecoverTornTailThenAppendRegression) { tornTailThenAppend(false); }
+TEST(SegmentFdScaleRegression, RecoverTornTailThenAppendPreallocatedRegression) { tornTailThenAppend(true); }

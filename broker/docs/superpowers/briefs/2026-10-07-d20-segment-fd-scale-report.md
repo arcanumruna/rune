@@ -58,7 +58,7 @@ Both tests also check that no descriptor leaks after destruction.
 Before the fix, the cost grows worse than linearly with N, because the walk over the list misses the cache. After the fix it is flat. At 40k segments, draining 256 drops goes from about 1.3 s of `fclose` walking to about 0.4 ms. macOS stdio does not walk a list in `fclose`, which is why the gate passed there and on ext4 and failed only on Linux tmpfs, where segment rolls are fast enough to build up 40k segments.
 
 ## Verification
-- `rune_storage_tests`: 388/388 passed, including the 2 new tests.
+- `rune_storage_tests`: 393/393 passed, including the 7 new `SegmentFdScaleRegression` tests (fd count, plus review M1 short-write/EINTR/hard-errno through the `pwriteForTest` seam and M2 torn-tail recover-then-append with/without preallocation). Targeted ctest (storage, segment, log, retention, cleaner, compaction, recovery; latency gates excluded) at -j4: 489/489 passed.
 - Full `ctest -j6` on macOS, with the machine at load ≈100–150 from three concurrent agents: 3960/3981 passed and 21 failed.
   - The 17 failures in `DutyPassLatencyGateRegression.*` are all scheduler stalls. The p50 values are normal (≈6 µs), and the worst passes show 20–120 ms of wall time inside intake or wait (`i/w/r`). Budgets were not loosened. Per the coordinator, the gates will be re-run on a quiet machine after merge.
   - The other 4 failures passed when re-run with `--rerun-failed -j1`: `GatewayReplicationWiring.ThreeNode_FollowersConverge_HWAdvances`, `GR4_Integration.ProduceViaGateway_FollowersConverge_HWAdvances`, `GR6_Integration.SubscriberBoundedByHW_FullyReplicated` and `CompactionRetentionSmoke.RestartResume_Checkpoint`.
