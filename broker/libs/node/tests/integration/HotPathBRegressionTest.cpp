@@ -10,6 +10,7 @@
 //       the worker's io backend, and a controller-managed leadership acts only
 //       once that write completed (event-driven).
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <rune/metadata/ShardRouter.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/SegmentProvisionerAgent.h>
@@ -32,6 +33,8 @@
 #include <thread>
 #include <map>
 #include <memory>
+#include <cstdlib>
+#include <new>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -72,6 +75,23 @@ std::vector<uint8_t> produceFrame(int64_t corr, int32_t topicId, int32_t part, s
     msg.encode(frame.data());
     return frame;
 }
+
+// The same-address replacement test: the block of one deleted object is kept
+// (not freed) so the next object is built at the SAME address (deterministic
+// pointer reuse, no allocator luck).  Everything else frees normally.
+}  // namespace
+void* gKeepFreedBlock = nullptr;
+bool  gKeptBlockFreed = false;
+void operator delete(void* p) noexcept {
+    if (p != nullptr && p == gKeepFreedBlock) { gKeptBlockFreed = true; return; }
+    std::free(p);
+}
+void operator delete(void* p, std::size_t) noexcept { ::operator delete(p); }
+void* operator new(std::size_t n) {
+    if (void* p = std::malloc(n ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+namespace {
 
 /// One worker (shard mode, registry-routed ops) owning one leader partition.
 struct Rig {
@@ -1199,4 +1219,131 @@ TEST(HotPathBRegression, MemoryReplicaFenceWrittenByTheWorkerLeadsWhenDurableReg
     const auto st = rune::storage::LeaderEpochState::read(stateDir.string());
     ASSERT_EQ(st.state, rune::storage::LeaderEpochState::FileState::Valid);
     EXPECT_GE(st.fence, 3);
+}
+
+// Coordinator must-fix (durability): epoch-state completions were routed by RAW
+// pointer (the Log for disk replicas, the replica for memory ones).  A replica
+// deleted and replaced (same Log / same address) within one fsync let the old
+// replica's completion confirm the NEW replica's fence write before its own
+// fsync — durability-before-acting violated.  The route carries the replica's
+// identity + incarnation; a mismatch is dropped.
+TEST(HotPathBRegression, StaleEpochStateCompletionNeverConfirmsAReplacementReplicaRegression) {
+    Rig rig(/*controllerManaged=*/true);
+    rig.worker().setReapPausedForTest(true);
+    rig.roleOp(true, 3);
+    rig.pass();   // A submits its fence write; the completion is held
+    ASSERT_TRUE(rig.rep->leadershipPendingForTest());
+    const auto tA = rig.worker().lastEpochStateTokenForTest();
+    // A is deleted; B — a new replica over the SAME Log (fresh state file:
+    // its write sequence restarts) — takes its place on the same worker.
+    rig.reg.remove(1, 0);
+    fs::remove(rig.dir.p / "leader-epoch-state");
+    PartitionConfig c;
+    c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+    c.replicaLagMaxOffset = 1'000'000'000;
+    c.followerFlushIntervalNs = 0;
+    auto b = std::make_unique<PartitionReplica>(c, Role::Leader, 1, std::vector<int32_t>{1},
+                                                std::vector<int32_t>{1}, rig.log.get(), &rig.transport);
+    b->setExternalFollowerFlush(true);
+    b->setIsrChannel(&rig.transport);
+    PartitionReplica* B = b.get();
+    rig.reg.add(1, 0, std::move(b));
+    rig.rep = B;
+    rig.pool.assignFromRegistry(rig.reg);
+    rig.roleOp(true, 3);
+    rig.pass();   // B submits its own fence write (completion held too)
+    ASSERT_TRUE(B->leadershipPendingForTest());
+    ASSERT_NE(rig.worker().lastEpochStateTokenForTest(), tA);
+    rig.worker().deliverCompletionForTest({tA, 0, 0});   // A's stale completion arrives
+    EXPECT_TRUE(B->leadershipPendingForTest()) << "A's fsync confirmed B's fence";
+    EXPECT_NE(B->epoch(), 3);
+    rig.worker().setReapPausedForTest(false);
+    EXPECT_TRUE(rig.passUntil([&] { return B->role() == Role::Leader && B->epoch() == 3; }))
+        << "B leads on its OWN completion";
+}
+
+// Same, memory-backed replicas: the route held the replica's raw pointer and
+// ownership was checked by pointer — a replacement replica allocated at the
+// SAME address passed as the owner of the old one's completion.
+TEST(HotPathBRegression, StaleMemoryFenceCompletionNeverConfirmsAReplicaAtTheSameAddressRegression) {
+    TmpDir d;
+    rune::replication::NullPartitionTransport transport;
+    rune::node::ReplicaRegistry reg;
+    WorkerPool pool{1, rune::metadata::ShardRouter(1)};
+    rune::storage::InMemoryLog logA(1 << 20, 10'000), logB(1 << 20, 10'000);
+    PartitionConfig c;
+    c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+    c.replicaLagMaxOffset = 1'000'000'000;
+    auto make = [&](void* mem, rune::storage::InMemoryLog& log, const fs::path& stateDir) {
+        std::unique_ptr<PartitionReplica> r(new (mem) PartitionReplica(c, Role::Follower, 1, std::vector<int32_t>{1},
+                                                                       std::vector<int32_t>{1}, &log, &transport));
+        r->setExternalFollowerFlush(true);
+        r->setIsrChannel(&transport);
+        r->setMemoryEpochStateDir(stateDir.string(), (stateDir.string() + ".fence"));
+        return r;
+    };
+    void* memA = ::operator new(sizeof(PartitionReplica));
+    gKeepFreedBlock = memA;   // A's block survives A's delete: B is built at the SAME address
+    reg.add(1, 0, make(memA, logA, d.p / "a.state"));
+    pool.setRegistry(&reg);
+    Worker& w = pool.worker(0);
+    w.setWorkerIngress(nullptr, /*active=*/true);
+    w.setShardMode(true);
+    pool.assignFromRegistry(reg);
+    int64_t now = 1'000'000'000;
+    auto pass = [&] { now += 1'000'000; (void)w.doWork(now); };
+    auto lead = [&] {
+        WorkerOp op;
+        op.type = WorkerOp::Type::BecomeLeader;
+        op.topicId = 1; op.partition = 0; op.roleEpoch = 3; op.isr = {1};
+        ASSERT_TRUE(pool.tryEnqueueOp(1, 0, std::move(op)));
+    };
+    pass();
+    w.setReapPausedForTest(true);
+    lead();
+    pass();   // A submits its fence write; the completion is held
+    const auto tA = w.lastEpochStateTokenForTest();
+    reg.remove(1, 0);   // A retired, dropped by the worker, then freed (every worker acked)
+    pool.assignFromRegistry(reg);
+    pass();
+    ASSERT_EQ(reg.collectRetired(UINT64_MAX), 1u);
+    // B allocated at the same address (fresh state dir: the same write seq).
+    ASSERT_TRUE(gKeptBlockFreed) << "precondition: A was deleted";
+    gKeepFreedBlock = nullptr;   // B's own delete frees normally
+    void* memB = memA;
+    reg.add(1, 0, make(memB, logB, d.p / "b.state"));
+    auto* B = static_cast<PartitionReplica*>(memB);
+    pool.assignFromRegistry(reg);
+    lead();
+    pass();   // B submits its own fence write (held)
+    ASSERT_TRUE(B->leadershipPendingForTest());
+    ASSERT_NE(w.lastEpochStateTokenForTest(), tA);
+    w.deliverCompletionForTest({tA, 0, 0});   // A's stale completion
+    EXPECT_TRUE(B->leadershipPendingForTest()) << "A's fsync confirmed B's fence";
+    w.setReapPausedForTest(false);
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (B->role() != Role::Leader && std::chrono::steady_clock::now() < end) { pass(); std::this_thread::yield(); }
+    EXPECT_EQ(B->role(), Role::Leader) << "B leads on its OWN completion";
+}
+
+// Coordinator must-fix: an epoch-state fd is never closed while an fsync on it
+// is in flight.  The fsync runs on a dup its route owns — open until the
+// completion is reaped (even after the replica, whose fd it duplicated, is
+// destroyed), then closed (no leak).
+TEST(HotPathBRegression, EpochStateFsyncFdOutlivesItsReplicaUntilTheCompletionRegression) {
+    Rig rig(/*controllerManaged=*/true);
+    rig.worker().setReapPausedForTest(true);
+    rig.roleOp(true, 3);
+    rig.pass();   // the fence write's fsync is in flight (completion held)
+    ASSERT_TRUE(rig.rep->leadershipPendingForTest());
+    const int syncFd = rig.worker().lastEpochStateSyncFdForTest();
+    ASSERT_GE(syncFd, 0);
+    rig.reg.remove(1, 0);          // the replica is dropped and destroyed meanwhile
+    rig.pool.assignFromRegistry(rig.reg);
+    rig.pass();
+    ASSERT_EQ(rig.reg.collectRetired(UINT64_MAX), 1u);
+    EXPECT_NE(::fcntl(syncFd, F_GETFD), -1) << "the in-flight fsync's fd was closed under it";
+    rig.worker().setReapPausedForTest(false);
+    for (int i = 0; i < 2000 && ::fcntl(syncFd, F_GETFD) != -1; ++i) { rig.pass(); std::this_thread::yield(); }
+    EXPECT_EQ(::fcntl(syncFd, F_GETFD), -1) << "the fsync's fd leaked after its completion";
 }

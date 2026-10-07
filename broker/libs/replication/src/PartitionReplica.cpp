@@ -151,7 +151,12 @@ PartitionReplica::PartitionReplica(PartitionConfig            cfg,
 
 // Defined here (not defaulted in the header) so the unique_ptr<RecordBatchBuilder>
 // member destroys a COMPLETE type — RecordBatch.h is included in this TU.
-PartitionReplica::~PartitionReplica() = default;
+PartitionReplica::~PartitionReplica()
+{
+    // The leader-epoch-state fd (open while a write is due / in flight).  Safe
+    // even with an fsync in flight: the worker fsyncs a dup its route owns.
+    if (es_.fd >= 0) ::close(es_.fd);
+}
 
 // Shared construction logic for both backend overloads (de-virtualized seam).
 void PartitionReplica::initReplica(std::vector<NodeId> replicas,

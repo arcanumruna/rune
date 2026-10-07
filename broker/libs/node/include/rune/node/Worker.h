@@ -1228,6 +1228,10 @@ public:
     [[nodiscard]] uint64_t    recoveryPointSubmitsForTest() const noexcept { return rpSubmits_; }
     [[nodiscard]] uint64_t    dirSyncSubmitsForTest() const noexcept { return dirSyncSubmits_; }
     [[nodiscard]] uint64_t    epochStateSubmitsForTest() const noexcept { return epochStateSubmits_; }
+    /// The io token of the last leader-epoch-state write submitted (kNoToken = none).
+    [[nodiscard]] CompletionToken lastEpochStateTokenForTest() const noexcept { return lastEpochStateToken_; }
+    /// The fd the last leader-epoch-state fsync was submitted on.
+    [[nodiscard]] int lastEpochStateSyncFdForTest() const noexcept { return lastEpochStateSyncFd_; }
     [[nodiscard]] uint64_t    epochStateNotRoutedForTest() const noexcept { return epochStateNotRouted_; }
     [[nodiscard]] uint64_t    bgFlushSubmitsCountForTest() const noexcept { return bgFlushSubmits_; }
     /// Review Md3 seam: the next `n` epoch-state route inserts fail.
@@ -1931,13 +1935,17 @@ private:
         // the log dir goes offline — the synchronous fence's semantics), never
         // the log's fail-stop.
         if (routed && r.kind == RouteKind::EpochState) {
-            if (gate && gate->replica) (void)gate->replica->epochStateWriteCompleted(static_cast<uint64_t>(r.aux), c.errorCode);
+            if (r.syncFd >= 0) ::close(r.syncFd);
+            if (gate && sameReplica_(r, gate->replica))
+                (void)gate->replica->epochStateWriteCompleted(static_cast<uint64_t>(r.aux), c.errorCode);
             return 1;
         }
         // D15 m5: a memory replica's — only while still owned here (else its
-        // next owner rewrites it: rebuildFlushSlots_).
+        // next owner rewrites it: rebuildFlushSlots_) and still the SAME
+        // replica (an owned replica at a reused address is another one).
         if (routed && r.kind == RouteKind::MemEpochState) {
-            if (std::find(owned_.begin(), owned_.end(), r.replica) != owned_.end())
+            if (r.syncFd >= 0) ::close(r.syncFd);
+            if (std::find(owned_.begin(), owned_.end(), r.replica) != owned_.end() && sameReplica_(r, r.replica))
                 (void)r.replica->epochStateWriteCompleted(static_cast<uint64_t>(r.aux), c.errorCode);
             return 1;
         }
@@ -4217,10 +4225,25 @@ private:
         /// offset below it in `seg`); RecoveryPoint: the checkpoint sequence;
         /// EpochState (hot-path B F7): the leader-epoch-state write sequence.
         int64_t                    aux   = 0;
-        /// MemEpochState (D15 m5): the memory replica (identity only — touched
-        /// on completion only while still owned here).
+        /// EpochState / MemEpochState: the replica (identity only — touched on
+        /// completion only while still owned here) and its registry
+        /// incarnation: a replica deleted and replaced within one fsync (same
+        /// Log, or the same address) never passes as the owner of the old
+        /// one's completion (coordinator must-fix: durability-before-acting).
         rune::replication::PartitionReplica* replica = nullptr;
+        uint32_t                             incarnation = 0;
+        /// EpochState / MemEpochState: the dup'd fd the fsync runs on — closed
+        /// by this worker when the completion arrives (whatever its outcome),
+        /// so the replica may close its own fd at any time: an fd number is
+        /// never closed (and reused) under an in-flight fsync.
+        int                                  syncFd = -1;
     };
+    /// The replica a routed epoch-state completion belongs to, if it is still
+    /// that replica (same object AND incarnation) — else nullptr (dropped).
+    [[nodiscard]] static bool sameReplica_(const TokenRoute& r,
+                                           const rune::replication::PartitionReplica* live) noexcept {
+        return live != nullptr && live == r.replica && live->incarnation() == r.incarnation;
+    }
     std::vector<TokenRoute> routes_;
     std::size_t             routeMask_ = 0;
 
@@ -4232,6 +4255,8 @@ private:
     uint64_t    dirSyncSubmits_ = 0;   ///< E1d MEDIUM-2: batched directory fsyncs submitted
     uint64_t    rpSubmits_      = 0;   ///< E1d recovery-point checkpoint write+fdatasyncs submitted
     uint64_t    epochStateSubmits_ = 0;   ///< hot-path B F7: leader-epoch-state syncs submitted
+    CompletionToken lastEpochStateToken_ = kNoToken;   ///< tests (lastEpochStateTokenForTest)
+    int             lastEpochStateSyncFd_ = -1;        ///< tests (lastEpochStateSyncFdForTest)
     uint64_t    epochStateNotRouted_ = 0; ///< review Md3
     int         forceRouteFailForTest_ = 0;
     std::vector<uint8_t> esScratch_ = std::vector<uint8_t>(4096);   ///< review Md4: one image buffer per worker
@@ -4694,7 +4719,7 @@ private:
                 bool memRouted = false;
                 for (const TokenRoute& rt : routes_)
                     memRouted = memRouted || (rt.token != kNoToken && rt.kind == RouteKind::MemEpochState &&
-                                              rt.replica == replica);
+                                              sameReplica_(rt, replica));
                 if (!memRouted) replica->resetEpochStateForNewOwner();
                 continue;
             }
@@ -4728,7 +4753,7 @@ private:
                     if (rt.kind == RouteKind::Background) fresh.bgToken      = rt.token;
                     if (rt.kind == RouteKind::RecoveryPoint) rpRouted = true;
                     if (rt.kind == RouteKind::DirSync) dirRouted = true;
-                    if (rt.kind == RouteKind::EpochState) esRouted = true;
+                    if (rt.kind == RouteKind::EpochState && sameReplica_(rt, replica)) esRouted = true;
                     if (rt.kind == RouteKind::Seal) sealsRouted.push_back(rt.seg);
                 }
                 // E1d F7 (cold): a checkpoint / seal whose completion went to a
@@ -4926,23 +4951,44 @@ private:
             ++epochStateSubmits_;
             return 1;
         }
-        const CompletionToken t = io_.submit(w.fd, 0);
+        // The fsync runs on a DUP owned by its route (closed on completion):
+        // the replica may close / reopen its own fd at any time — an fd number
+        // is never closed under an in-flight fsync (and then reused).
+        const int syncFd = ::fcntl(w.fd, F_DUPFD_CLOEXEC, 0);
+        if (syncFd < 0) {
+            const int err = errno != 0 ? errno : EMFILE;
+            r.epochStateWriteSubmitted();
+            (void)r.epochStateWriteCompleted(w.seq, err);   // the failure path (retry / fail-stop)
+            ++epochStateSubmits_;
+            return 1;
+        }
+        const CompletionToken t = io_.submit(syncFd, 0);
         if (t == kNoToken) {                               // back-pressure: retry next pass
+            ::close(syncFd);                               // never submitted
             r.epochStateWriteNotSubmitted();
             return 0;
         }
         r.epochStateWriteSubmitted();
+        lastEpochStateToken_ = t;
+        lastEpochStateSyncFd_ = syncFd;
         TokenRoute route;
         route.token = t;
         route.aux   = static_cast<int64_t>(w.seq);
+        route.replica = &r;
+        route.incarnation = r.incarnation();
+        route.syncFd = syncFd;
         if (disk) {
             route.log = r.log(); route.epoch = slot->epoch; route.kind = RouteKind::EpochState;
         } else {
-            route.replica = &r; route.kind = RouteKind::MemEpochState;
+            route.kind = RouteKind::MemEpochState;
         }
         const bool routed = forceRouteFailForTest_ == 0 && routeInsert_(route);
         if (!routed) [[unlikely]] {
             if (forceRouteFailForTest_ > 0) --forceRouteFailForTest_;
+            // Its completion is never observed, so its dup is never known to be
+            // idle: deliberately left open (unreachable in production — the
+            // route table holds 2x the io depth) rather than closed under the
+            // in-flight fsync.
             // Review Md3: an unroutable completion is never observed — the write
             // is treated as not done and rewritten next pass (never wedged).
             spdlog::critical("Worker {}: io token route table full (token={}) — epoch-state write re-queued",
