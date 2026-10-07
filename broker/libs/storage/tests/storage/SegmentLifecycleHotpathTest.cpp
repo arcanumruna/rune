@@ -19,6 +19,8 @@
 #include <gtest/gtest.h>
 #include <rune/storage/testing/DemandChannelForTest.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/MappedFile.h>
+#include <fcntl.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <atomic>
@@ -1059,6 +1061,48 @@ TEST(SegmentLifecycleRegression, ReadyRingFullAfterABuildIsReportedRegression) {
         EXPECT_LT(log.provisionReady(1), 0) << "the built segment could not be queued: reported, not silent";
         EXPECT_EQ(countSuffix(dir, ".stlog"), 0u) << "its staging files are removed";
         EXPECT_EQ(log.readyDropsForTest(), 1u);
+    }
+    fs::remove_all(dir);
+}
+
+// D21 re-review-2 low: a SEALED segment read beyond its mapping is remapped on
+// the owner in that same read (re-review N3) — an async growth request for it
+// was dead weight (a dup + an off-owner mmap whose answer is then discarded).
+TEST(SegmentLifecycleRegression, SealedSegmentBeyondItsMapPostsNoGrowthRequestRegression) {
+    const auto dir = freshDir("rune_slh_sealed_grow");
+    {
+        Log log(dir.string(), 2 << 20);
+        log.recover();
+        ProvisionChannel ch;   // nobody serves it: posts stay queued (countable)
+        log.setProvisioning(&ch);
+        const std::string big(64 * 1024, 'x');
+        int64_t off = 0;
+        auto putBig = [&] {
+            RecordBatchBuilder b(off, 1000);
+            b.append("k", big, 1000);
+            const auto bb = b.build();
+            off = log.appendNoSync(bb.data(), bb.size(), off);
+        };
+        while (log.segmentForTest(0)->sizeBytes() < (1 << 19)) putBig();   // 0.5 MiB
+        // A small (1 MiB) mapping of segment 0, made while it was small.
+        const int dupFd = ::fcntl(log.segmentForTest(0)->logFd(), F_DUPFD_CLOEXEC, 0);
+        ASSERT_GE(dupFd, 0);
+        auto small = std::make_unique<MappedFile>(MappedFile::BorrowedFd{dupFd}, std::string(), std::size_t{1} << 20);
+        ::close(dupFd);
+        while (log.segmentBaseOffsets().size() < 2) {   // seal segment 0 (~2 MiB)
+            (void)log.provisionReady(1);
+            putBig();
+            (void)log.finalizeStagingRenames();
+            (void)log.drainStagingRenamesDone();
+        }
+        LogSegment* s0 = log.segmentForTest(0);
+        ASSERT_GT(s0->sizeBytes(), int64_t{1} << 20);
+        (void)s0->swapReadMap(std::move(small));
+        log.expireReadMapRequestForTest();   // no growth request outstanding (the active one's)
+        const int64_t queued0 = ch.ring().pendingBytes();
+        const auto v = log.readView(20, 1 << 20);   // offset 20: past the 1 MiB map
+        EXPECT_FALSE(v.empty()) << "served by the owner remap";
+        EXPECT_EQ(ch.ring().pendingBytes(), queued0) << "a growth request was posted for a sealed segment";
     }
     fs::remove_all(dir);
 }

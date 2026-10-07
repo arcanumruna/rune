@@ -1048,9 +1048,14 @@ LogReadView Log::readView(int64_t startOffset, int32_t maxBytes) noexcept {
 void Log::maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept {
     const std::size_t mapped = seg.readMapBytes();
     if (mapped == 0) return;                                        // no mapping yet: readView creates it
+    // D21 re-review-2 low: a SEALED segment never grows off the owner — it
+    // wants growth only when read beyond its mapping, and readView remaps it
+    // on the owner in that same call (re-review N3), so an async answer could
+    // only be discarded (a dup + an off-owner mmap for nothing).
+    if (!active) return;
     const auto size = static_cast<std::size_t>(seg.sizeBytes());
-    // Active: grow at half full, to the full-segment size; sealed: to its size.
-    const bool want = active ? size * 2 > mapped : size > mapped;
+    // Active: grow at half full, to the full-segment size.
+    const bool want = size * 2 > mapped;
     if (!want) return;
     if (growOutstanding_) {
         // Count-based re-request (a request lost to a full ring / a racing view
@@ -1058,7 +1063,7 @@ void Log::maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept
         if (size > mapped && ++growWaits_ >= 4096) { growOutstanding_ = false; growWaits_ = 0; }
         if (growOutstanding_) return;
     }
-    std::size_t target = active ? std::max(LogSegment::readMapBytesFor(rollBytes_), size * 2) : size;
+    std::size_t target = std::max(LogSegment::readMapBytesFor(rollBytes_), size * 2);
     target = (target + (std::size_t{1} << 20) - 1) >> 20;          // MiB
     if ((target << 20) <= mapped) return;
     const int fd = ::fcntl(seg.logFd(), F_DUPFD_CLOEXEC, 0);       // the provisioner owns the dup
