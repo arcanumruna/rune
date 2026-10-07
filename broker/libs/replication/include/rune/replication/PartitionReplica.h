@@ -1442,7 +1442,7 @@ private:
     uint64_t leadGenSeq_ = 0;
     void enableEpochState_() noexcept;
     bool writeEpochStateInline_() noexcept;
-    bool openEpochStateFd_() noexcept;
+    int  openEpochStateFd_() noexcept;   ///< 0 or errno
     void closeEpochStateFdIfIdle_() noexcept;
     /// Review C1: the epoch history from `x` on changed (not yet durable).
     void noteEpochChange_(Offset x) noexcept;

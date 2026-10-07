@@ -1740,13 +1740,15 @@ std::size_t PartitionReplica::encodeEpochImage_(uint8_t* buf, uint64_t seq, Epoc
     });
 }
 
-bool PartitionReplica::openEpochStateFd_() noexcept
+int PartitionReplica::openEpochStateFd_() noexcept
 {
-    if (es_.fd >= 0) return true;
+    // 0 or the open's errno (D21 re-review low: returned, never re-read from a
+    // possibly clobbered errno by the caller).
+    if (es_.fd >= 0) return 0;
     const int fd = rune::storage::LeaderEpochState::openExisting(esDir_);
-    if (fd < 0) return false;
+    if (fd < 0) return -fd;
     es_.fd = fd;
-    return true;
+    return 0;
 }
 
 void PartitionReplica::closeEpochStateFdIfIdle_() noexcept
@@ -1853,7 +1855,7 @@ bool PartitionReplica::writeEpochStateInline_() noexcept
             es_.stride = stride;
             es_.activeSlot = 0;
         } else {
-            if (!openEpochStateFd_()) { ++es_.errors; return false; }
+            if (openEpochStateFd_() != 0) { ++es_.errors; return false; }
             if (inlineFailN_ > 0) [[unlikely]] { --inlineFailN_; ++es_.errors; return false; }
             const int target = es_.activeSlot < 0 ? 0 : 1 - es_.activeSlot;
             std::vector<uint8_t> img(ES::imageBytes(entries));
@@ -1905,13 +1907,13 @@ bool PartitionReplica::prepareEpochStateWrite(uint8_t* buf, std::size_t cap, Epo
     }
     need = ES::imageBytes(entries);
     if (cap < need) return false;
-    if (!openEpochStateFd_()) {
+    if (const int openErr = openEpochStateFd_(); openErr != 0) {
         es_.stage = EsStage::InFlight;              // fail through the regular failure path
         es_.inflightSeq = ++es_.seq;
         es_.inflightMin = es_.pendingMin;
         es_.pendingMin = INT64_MAX;
         es_.due = false;
-        (void)epochStateWriteCompleted(es_.inflightSeq, errno != 0 ? errno : EIO);
+        (void)epochStateWriteCompleted(es_.inflightSeq, openErr);
         return false;
     }
     const int slot = es_.activeSlot < 0 ? 0 : 1 - es_.activeSlot;
