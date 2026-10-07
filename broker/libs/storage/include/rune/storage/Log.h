@@ -863,10 +863,12 @@ public:
     void reportProvisionFailure(int err) noexcept;
     /// Provisioning thread: ready segments queued and not yet taken by the
     /// owner (approximate while the owner runs; an estimate for depth / cap
-    /// accounting only).
+    /// accounting only).  FAILURE records still queued are not counted (D19
+    /// N6b: a queued failure must not stand in for a ready segment).
     [[nodiscard]] std::size_t readyQueuedApprox() const noexcept {
-        const std::int64_t b = readyRing_.pendingBytes();
-        return b <= 0 ? 0 : static_cast<std::size_t>(b) / ReadyRing::kRecordBytes;
+        const std::size_t all = readyRecordsQueued_();
+        const std::size_t fails = queuedFailures_();
+        return all > fails ? all - fails : 0;
     }
     /// Legacy single-slot form (the cleaner-driven provisioning): provisionReady(1).
     int preprovisionPending() { return provisionReady(1); }
@@ -875,7 +877,7 @@ public:
     [[nodiscard]] bool readyAvailable() noexcept { pullReady_(); return readyFront_ != nullptr; }
     /// Owner (tests): ready segments pooled (front slot + queued).
     [[nodiscard]] std::size_t readyCountForTest() const noexcept {
-        return (readyFront_ != nullptr ? 1 : 0) + readyQueuedApprox();
+        return (readyFront_ != nullptr ? 1 : 0) + readyRecordsQueued_();
     }
     /// Owner (tests / observability): provisioning failures seen and the rolls
     /// they forced inline.
@@ -1317,6 +1319,22 @@ private:
     /// hotpath-A F2: the ready pool (see kMaxProvisionDepth).  Records:
     /// kReadyMsg {a = LogSegment* (owning)} and kFailedMsg {a = errno}.
     using ReadyRing = rune::consensus::ControlRing<512>;
+    /// Records (ready or failure) queued on the ready ring (any thread, approximate).
+    [[nodiscard]] std::size_t readyRecordsQueued_() const noexcept {
+        const std::int64_t b = readyRing_.pendingBytes();
+        return b <= 0 ? 0 : static_cast<std::size_t>(b) / ReadyRing::kRecordBytes;
+    }
+    /// Provisioning thread (D19 N6b): end positions of the last failure
+    /// records offered (0 = none); one still queued has end > consumerPosition.
+    static constexpr std::size_t kFailMarks = 8;
+    std::array<std::int64_t, kFailMarks> failMarkEnd_{};
+    std::size_t failMarkNext_ = 0;
+    [[nodiscard]] std::size_t queuedFailures_() const noexcept {
+        const std::int64_t consumed = readyRing_.consumerPosition();
+        std::size_t n = 0;
+        for (const std::int64_t e : failMarkEnd_) n += e > consumed ? 1 : 0;
+        return n;
+    }
     static constexpr std::int32_t kReadyMsg = 1, kFailedMsg = 2;
     ReadyRing   readyRing_;
     LogSegment* readyFront_ = nullptr;     ///< owner: next ready segment (taken off the ring)

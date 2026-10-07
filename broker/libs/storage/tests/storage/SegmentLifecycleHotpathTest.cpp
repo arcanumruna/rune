@@ -983,3 +983,27 @@ TEST(SegmentLifecycleRegression, StagingBaseAboveTheChainIsRecovered) {
     }
     fs::remove_all(dir);
 }
+
+// D19 re-review N6b: a ready segment queued behind a stale FAILURE record is
+// adopted — the failure no longer forces one needless inline roll.
+TEST(SegmentLifecycleRegression, ReadySegmentBehindAStaleFailureIsAdoptedRegression) {
+    const auto dir = freshDir("rune_slh_n6b");
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        int demands[4] = {0, 0, 0, 0};
+        rune::storage::testing::DemandChannelForTest ch{&NoopHook::fn, demands};
+        log.setProvisioning(&ch);
+        log.setProvisionFaultForTest(EIO, 1);
+        ASSERT_LT(log.provisionReady(1), 0) << "the failed build posts a FAILURE record";
+        ASSERT_EQ(log.provisionReady(1), 1) << "a later build succeeds behind it";
+        const uint64_t prealloc0 = log.ownerPreallocsForTest();
+        int64_t off = 0;
+        const auto n = log.segmentBaseOffsets().size();
+        while (log.segmentBaseOffsets().size() == n) off = put(log, off);
+        EXPECT_EQ(log.failureInlineRollsForTest(), 0u) << "the stale failure forced an inline roll";
+        EXPECT_EQ(log.ownerPreallocsForTest(), prealloc0) << "the queued ready segment was adopted";
+        EXPECT_EQ(log.provisionFailuresForTest(), 1u) << "the failure is still counted";
+    }
+    fs::remove_all(dir);
+}

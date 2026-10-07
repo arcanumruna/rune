@@ -615,7 +615,10 @@ int Log::provisionReady(std::size_t depth, bool preallocate) {
 void Log::reportProvisionFailure(int err) noexcept {
     // Provisioning thread.  A full ring already holds records the owner will
     // pull first (each ends a hold), so a dropped failure record loses nothing.
-    (void)readyRing_.offer(kFailedMsg, err != 0 ? err : EIO, 0);
+    if (readyRing_.offer(kFailedMsg, err != 0 ? err : EIO, 0)) {
+        // D19 N6b: remember where it ends (this thread is the one producer).
+        failMarkEnd_[failMarkNext_++ % kFailMarks] = readyRing_.producerPosition();
+    }
 }
 
 void Log::pullReady_() noexcept {
@@ -658,8 +661,17 @@ void Log::installNextSegment(int64_t base) {
     // roll past the overshoot cap with a full ring creates inline instead).
     // Review M1: a pulled provisioning FAILURE makes this roll inline (below).
     pullReady_();
-    const bool failureRoll = provisioned_ && readyFront_ == nullptr && failFront_ != 0;
-    if (failureRoll) { failFront_ = 0; ++failureInlineRolls_; }
+    // D19 N6b: a failure followed by a ready segment is stale (a later build
+    // succeeded) — skip it and adopt; only a failure with nothing behind it
+    // forces the inline roll.
+    bool failureRoll = false;
+    while (provisioned_ && readyFront_ == nullptr && failFront_ != 0) {
+        failFront_ = 0;
+        failureRoll = true;
+        pullReady_();
+    }
+    if (readyFront_ != nullptr) failureRoll = false;
+    if (failureRoll) ++failureInlineRolls_;
     if (LogSegment* prepared = (!provisioned_ || renameRoom_()) && !failureRoll ? takeReady_() : nullptr) {
         // ADOPT — ZERO syscalls: pure in-memory rebase.  The staging .log/.index
         // keep their temp names on disk for now; the disk rename (staging →
