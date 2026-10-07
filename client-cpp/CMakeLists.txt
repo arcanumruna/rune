@@ -210,11 +210,14 @@ if(aeron_FOUND)
         $<INSTALL_INTERFACE:include>
     )
     target_link_libraries(rune_client_transport PUBLIC aeron::aeron spdlog::spdlog rune_fr rune_gso rune_client_driver_wake)
-    # client<->broker TLS/AEAD (Task 5): SessionMachine.h (pulled in transitively via
-    # ClientAgent et al) needs rune_crypto/OpenSSL symbols at link time; PRIVATE since
-    # it's an implementation detail of the handshake drive, not part of this target's
-    # own public API surface.
-    target_link_libraries(rune_client_transport PRIVATE rune_crypto OpenSSL::SSL OpenSSL::Crypto)
+    # client<->broker TLS/AEAD (Task 5): SessionMachine.h is a PUBLIC header that
+    # #includes rune-crypto's headers and holds a TlsSession/CryptoState member, so
+    # every downstream target compiling a TU that includes ClientAgent.h/Client.h
+    # (rune_client_api, rune_client_producer, test/benchmark targets, ...) needs
+    # rune_crypto's include dir too — PUBLIC, same as rune_fr right above (fix
+    # round 1: an earlier PRIVATE here only satisfied THIS target's own link,
+    # not the transitive header dependency every downstream target has).
+    target_link_libraries(rune_client_transport PUBLIC rune_crypto OpenSSL::SSL OpenSSL::Crypto)
 
     # Linux CI portability: libuuid is needed on Linux but not macOS (no-op there).
     if(UNIX AND NOT APPLE)
@@ -249,9 +252,11 @@ if(aeron_FOUND)
         spdlog::spdlog
         rune_codec
     )
-    # client<->broker TLS/AEAD (Task 5): ClientAgent.cpp drives SessionMachine's
-    # handshake directly (header-only); PRIVATE, same rationale as rune_client_transport.
-    target_link_libraries(rune_client_agent PRIVATE rune_crypto OpenSSL::SSL OpenSSL::Crypto)
+    # client<->broker TLS/AEAD (Task 5): PUBLIC, same transitive-header reason as
+    # rune_client_transport above — ClientAgent.h is itself a public header
+    # downstream targets (rune_client_producer, rune_client_subscriber,
+    # rune_client_api, ...) compile against.
+    target_link_libraries(rune_client_agent PUBLIC rune_crypto OpenSSL::SSL OpenSSL::Crypto)
     if(UNIX AND NOT APPLE)
         find_library(UUID_LIB uuid)
         if(UUID_LIB)

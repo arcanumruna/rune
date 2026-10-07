@@ -64,94 +64,6 @@ using ErrorCode = rpc::ErrorCode;
 using FrameStatus = rpc::FrameStatus;
 using FrameCheck  = rpc::FrameCheck;
 
-// ---------------------------------------------------------------------------
-// client<->broker TLS/AEAD (Task 5) — compile-time field detection.
-//
-// rune-protocol currently has TWO divergent, not-yet-reconciled feature
-// branches touching rpc::ConnectRequest/ConnectResponse: one adds
-// ConnectResponse.brokerVersion (capability gate), the other adds the crypto
-// fields (ConnectRequest.cipherList/handshakeBytes/authToken,
-// ConnectResponse.chosenCipher/handshakeBytes) — and they collide on the same
-// trailing byte offset (see Task 5 report). Until those branches are merged,
-// this adapter must keep compiling against EITHER rpc:: struct shape, so
-// every optional field below is read through a `requires`-guarded
-// if-constexpr that defaults the client-side view field when the underlying
-// rpc:: struct doesn't declare it, rather than hard-depending on both at once.
-// ---------------------------------------------------------------------------
-template <typename T>
-concept HasBrokerVersionField = requires(const T& t) { t.brokerVersion; };
-template <typename T>
-concept HasChosenCipherField = requires(const T& t) { t.chosenCipher; };
-template <typename T>
-concept HasRespHandshakeBytesField = requires(const T& t) { t.handshakeBytes; };
-template <typename T>
-concept HasCipherListField = requires(const T& t) { t.cipherList; };
-template <typename T>
-concept HasReqHandshakeBytesField = requires(const T& t) { t.handshakeBytes; };
-template <typename T>
-concept HasAuthTokenField = requires(const T& t) { t.authToken; };
-template <typename T>
-concept HasIngressEndpointField = requires(const T& t) { t.ingressEndpoint; };
-template <typename T>
-concept HasLegacyV0Shape = requires { T::BODY_FIXED_V0; T::ENCODED_SIZE_V0; };
-
-// NOTE: `if constexpr` on one of the concepts above only actually discards the
-// false branch (rather than still hard-type-checking it, since these decode/
-// encode functions below are ordinary non-template functions) when the
-// checked expression is itself template-dependent — hence every field access
-// is funneled through one of these small TEMPLATE helpers (instantiated with
-// the concrete rpc:: struct type), never written inline in a non-template
-// if-constexpr.
-template <typename RawT>
-inline int32_t getBrokerVersionOr0(const RawT& raw) noexcept {
-    if constexpr (HasBrokerVersionField<RawT>) { return raw.brokerVersion; } else { return 0; }
-}
-template <typename RawT>
-inline void setBrokerVersionField(RawT& msg, int32_t v) noexcept {
-    if constexpr (HasBrokerVersionField<RawT>) { msg.brokerVersion = v; }
-}
-template <typename RawT>
-inline std::size_t encodeLegacyV0IfPresent(RawT&, uint8_t* buf, std::size_t fallback) noexcept {
-    if constexpr (HasLegacyV0Shape<RawT>) {
-        rune::protocol::client::detail::putLE16(buf, 0, RawT::BODY_FIXED_V0);
-        return RawT::ENCODED_SIZE_V0;
-    } else {
-        return fallback;
-    }
-}
-template <typename RawT>
-inline uint8_t getChosenCipherOr0(const RawT& raw) noexcept {
-    if constexpr (HasChosenCipherField<RawT>) { return raw.chosenCipher; } else { return 0; }
-}
-template <typename RawT>
-inline void setChosenCipherField(RawT& msg, uint8_t v) noexcept {
-    if constexpr (HasChosenCipherField<RawT>) { msg.chosenCipher = v; }
-}
-template <typename RawT>
-inline std::string_view getRespHandshakeBytesOrEmpty(const RawT& raw) noexcept {
-    if constexpr (HasRespHandshakeBytesField<RawT>) { return raw.handshakeBytes; } else { return {}; }
-}
-template <typename RawT>
-inline void setRespHandshakeBytesField(RawT& msg, std::string_view v) noexcept {
-    if constexpr (HasRespHandshakeBytesField<RawT>) { msg.handshakeBytes = v; }
-}
-template <typename RawT>
-inline std::span<const uint8_t> getCipherListOrEmpty(const RawT& raw) noexcept {
-    if constexpr (HasCipherListField<RawT>) { return raw.cipherList; } else { return {}; }
-}
-template <typename RawT>
-inline std::string_view getReqHandshakeBytesOrEmpty(const RawT& raw) noexcept {
-    if constexpr (HasReqHandshakeBytesField<RawT>) { return raw.handshakeBytes; } else { return {}; }
-}
-template <typename RawT>
-inline std::string_view getAuthTokenOrEmpty(const RawT& raw) noexcept {
-    if constexpr (HasAuthTokenField<RawT>) { return raw.authToken; } else { return {}; }
-}
-template <typename RawT>
-inline std::string getIngressEndpointOrEmpty(const RawT& raw) noexcept {
-    if constexpr (HasIngressEndpointField<RawT>) { return std::string(raw.ingressEndpoint); } else { return {}; }
-}
-
 // ===========================================================================
 // Adapter entry points — encode / decode
 //
@@ -218,9 +130,9 @@ inline std::optional<ConnectRequestView> decodeConnectRequest(const uint8_t* buf
     v.egressStreamId = opt->egressStreamId;
     v.clientVersion  = opt->clientVersion;
     v.egressChannel  = opt->egressChannel;
-    v.cipherList     = getCipherListOrEmpty(*opt);
-    v.handshakeBytes = getReqHandshakeBytesOrEmpty(*opt);
-    v.authToken      = getAuthTokenOrEmpty(*opt);
+    v.cipherList     = opt->cipherList;
+    v.handshakeBytes = opt->handshakeBytes;
+    v.authToken      = opt->authToken;
     return v;
 }
 
@@ -296,14 +208,14 @@ inline std::size_t encodeConnectResponse(uint8_t* buf,
     msg.code              = code;
     msg.leaderMemberId    = leaderMemberId;
     msg.assignedSessionId = assignedSessionId;
-    setBrokerVersionField(msg, brokerVersion < 0 ? 0 : brokerVersion);
-    setChosenCipherField(msg, chosenCipher);
-    setRespHandshakeBytesField(msg, handshakeBytes);
+    msg.brokerVersion     = brokerVersion < 0 ? 0 : brokerVersion;
+    msg.chosenCipher      = chosenCipher;
+    msg.handshakeBytes    = handshakeBytes;
     const std::size_t n = msg.encode(buf);
     if (brokerVersion >= 0) return n;
-    // An older broker's 38-byte frame (no brokerVersion field) — a no-op fallback
-    // when this rpc:: struct shape doesn't have brokerVersion at all.
-    return encodeLegacyV0IfPresent(msg, buf, n);
+    // An older broker's 38-byte frame (no brokerVersion field).
+    rune::protocol::client::detail::putLE16(buf, 0, rpc::ConnectResponse::BODY_FIXED_V0);
+    return rpc::ConnectResponse::ENCODED_SIZE_V0;
 }
 
 /// Decode a ConnectResponse frame.
@@ -317,9 +229,9 @@ inline std::optional<ConnectResponseView> decodeConnectResponse(const uint8_t* b
     v.code              = opt->code;
     v.leaderMemberId    = opt->leaderMemberId;
     v.assignedSessionId = opt->assignedSessionId;
-    v.brokerVersion  = getBrokerVersionOr0(*opt);
-    v.chosenCipher   = getChosenCipherOr0(*opt);
-    v.handshakeBytes = getRespHandshakeBytesOrEmpty(*opt);
+    v.brokerVersion     = opt->brokerVersion;
+    v.chosenCipher      = opt->chosenCipher;
+    v.handshakeBytes    = opt->handshakeBytes;
     return v;
 }
 
@@ -600,7 +512,7 @@ inline std::optional<MetadataResponseDecoded> decodeMetadataResponse(
         pv.ingressStreamId = p.ingressStreamId;  // E5.1: per-worker ingress stream
         pv.egressControlPort = p.egressControlPort;  // read-rework: per-worker MDC egress
         pv.egressStreamId  = p.egressStreamId;
-        pv.ingressEndpoint = getIngressEndpointOrEmpty(p);  // Task 16 (shard brokers)
+        pv.ingressEndpoint = std::string(p.ingressEndpoint);  // Task 16 (shard brokers)
         result.partitions.push_back(std::move(pv));
     }
 
