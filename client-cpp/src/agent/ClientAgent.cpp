@@ -728,17 +728,33 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
             opt->leaderMemberId,
             opt->assignedSessionId,
             opt->correlationId,
-            nowNs);
+            nowNs,
+            // client<->broker TLS/AEAD (Task 5): a chosenCipher != 0 sends the
+            // machine into Handshaking instead of Connected — see
+            // SessionMachine::onConnectResponse.  A pre-v4 broker's decode leaves
+            // these at their defaults (0 / empty), so this is a no-op then.
+            opt->chosenCipher,
+            opt->handshakeBytes);
         s.machine.onActivity(nowNs);
-        lastConnectAccepted_ = awaited && opt->code == 0 && s.machine.state() == session::SessionState::Connected;
+        // Task 5: "accepted" now means reached Connected — true immediately for a
+        // plaintext connect, true only once the TLS handshake finishes (possibly
+        // on a LATER HandshakeContinueResponse leg, see that case below) for a
+        // crypto one.
+        const bool nowConnected = s.machine.state() == session::SessionState::Connected;
+        lastConnectAccepted_ = awaited && opt->code == 0 && nowConnected;
         lastConnectSession_  = 0;
         for (uint32_t i = 0; i < sessions_.size(); ++i) {
             if (sessions_[i].get() == &s) { lastConnectSession_ = i; break; }
         }
         lastConnectAwaited_ = awaited;
+        // brokerVersion is informational (a capability gate) and safe to record
+        // as soon as the broker answers OK, even while a crypto handshake is
+        // still pending — it doesn't depend on encryption being established.
+        if (awaited && opt->code == 0) {
+            s.brokerVersion = opt->brokerVersion;
+        }
         if (lastConnectAccepted_) {
             ++s.connectEpoch;                  // MEDIUM-1: a new connect episode
-            s.brokerVersion = opt->brokerVersion;
         }
         // (F8c C3: the observer — Client::onEgressFrame — publishes the new
         // state to app threads (Client::state()) BEFORE it completes the
@@ -750,6 +766,39 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         // and per-partition routing is active (no cost single-node).
         if (lastConnectAccepted_ && routeIndex_.size() != 0 && produceResendFn_) {
             produceResendFn_();
+        }
+        if (egressObserver_) {
+            egressObserver_(tid, buf, len);
+        }
+        break;
+    }
+
+    case codec::TemplateId::HandshakeContinueResponse: {
+        // client<->broker TLS/AEAD (Task 5): a later leg of a multi-round TLS
+        // handshake started by the ConnectResponse case above.  Only meaningful
+        // while the session's machine is Handshaking — a stale/duplicate leg
+        // after the handshake already finished or failed is a safe no-op (the
+        // machine itself ignores it outside Handshaking / on a stale correlationId).
+        auto opt = codec::decodeHandshakeContinueResponse(buf, len);
+        if (!opt) break;
+        Session& s = sessionForConnectCorrId(opt->correlationId);
+        const bool wasHandshaking = s.machine.state() == session::SessionState::Handshaking;
+        s.machine.onHandshakeContinueResponse(opt->code, opt->handshakeBytes, opt->correlationId, nowNs);
+        s.machine.onActivity(nowNs);
+        if (wasHandshaking && s.machine.state() == session::SessionState::Connected) {
+            // The handshake just finished on this leg — mirror the ConnectResponse
+            // case's "new connect episode" bookkeeping (brokerVersion was already
+            // recorded on the first leg, above).
+            lastConnectAccepted_ = true;
+            lastConnectAwaited_  = true;
+            lastConnectSession_  = 0;
+            for (uint32_t i = 0; i < sessions_.size(); ++i) {
+                if (sessions_[i].get() == &s) { lastConnectSession_ = i; break; }
+            }
+            ++s.connectEpoch;
+            if (routeIndex_.size() != 0 && produceResendFn_) {
+                produceResendFn_();
+            }
         }
         if (egressObserver_) {
             egressObserver_(tid, buf, len);
@@ -951,7 +1000,14 @@ Session& ClientAgent::sessionForConnectCorrId(int64_t corrId) noexcept {
         // A session awaiting its ConnectResponse holds the matching correlationId
         // on its SessionMachine while Connecting.  Match only non-seed or genuinely
         // in-flight sessions; the seed is the fallback below.
-        if (s->machine.state() == session::SessionState::Connecting &&
+        // client<->broker TLS/AEAD (Task 5): Handshaking is ALSO an in-flight
+        // connect episode (the SAME correlationId as the initiating
+        // ConnectRequest, carried across every HandshakeContinue/
+        // HandshakeContinueResponse leg) — without this, a multi-node client's
+        // HandshakeContinueResponse for a NON-seed session would always fall
+        // through to the seed below.
+        if ((s->machine.state() == session::SessionState::Connecting ||
+             s->machine.state() == session::SessionState::Handshaking) &&
             s->machine.correlationId() == corrId) {
             return *s;
         }
