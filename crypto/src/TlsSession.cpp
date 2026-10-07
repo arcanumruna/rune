@@ -149,7 +149,13 @@ TlsSession TlsSession::makeClient(const char* trustPemOrNull, const char* expect
     return s;
   }
   if (expectHost && expectHost[0]) {
-    SSL_set1_host(s.ssl_, expectHost);          // hostname check against the cert SAN
+    // Hostname pinning against the cert SAN. Must fail CLOSED: if this doesn't install
+    // (e.g. OOM), SSL_VERIFY_PEER alone would still accept any chain-valid cert for ANY
+    // host, which is a hostname-check bypass — so refuse to hand back a usable session.
+    if (SSL_set1_host(s.ssl_, expectHost) != 1) {
+      s.release();
+      return s;
+    }
     SSL_set_tlsext_host_name(s.ssl_, expectHost);  // SNI
   }
   if (!attachMemoryBios(s.ssl_, s.rbio_, s.wbio_)) {
@@ -199,9 +205,14 @@ bool TlsSession::done() const noexcept {
 }
 
 SessionKeys TlsSession::exportKeys(Cipher negotiated, int64_t sessionId) const noexcept {
-  SessionKeys keys{};
-  keys.cipher = negotiated;
-  if (!valid()) return keys;
+  // Fail CLOSED: a SessionKeys with Cipher::None and zeroed key material marks failure.
+  // Must never hand back zero-filled keys under a cipher that looks real — for TLS 1.3 the
+  // exporter itself returns 0 on a not-yet-finished/failed handshake, and both peers would
+  // then "agree" on an all-zero key, so this is guarded on done()/failed_ AND on every
+  // SSL_export_keying_material return, not just valid().
+  SessionKeys failure{};
+  failure.cipher = Cipher::None;
+  if (!done() || failed_) return failure;
 
   // Bind every export to sessionId so the same TLS connection can't be reused to derive
   // the same directional key material for a different logical session.
@@ -213,17 +224,30 @@ SessionKeys TlsSession::exportKeys(Cipher negotiated, int64_t sessionId) const n
   static constexpr char kC2bIv[] = "rune c2b iv";
   static constexpr char kB2cIv[] = "rune b2c iv";
 
-  SSL_export_keying_material(const_cast<SSL*>(ssl_), keys.c2b.bytes, sizeof keys.c2b.bytes,
-                              kC2bKey, sizeof(kC2bKey) - 1, ctx, sizeof ctx, 1);
-  SSL_export_keying_material(const_cast<SSL*>(ssl_), keys.b2c.bytes, sizeof keys.b2c.bytes,
-                              kB2cKey, sizeof(kB2cKey) - 1, ctx, sizeof ctx, 1);
+  SessionKeys keys{};
+  keys.cipher = negotiated;
+  SSL* ssl = const_cast<SSL*>(ssl_);
+
+  if (SSL_export_keying_material(ssl, keys.c2b.bytes, sizeof keys.c2b.bytes, kC2bKey,
+                                  sizeof(kC2bKey) - 1, ctx, sizeof ctx, 1) != 1) {
+    return failure;
+  }
+  if (SSL_export_keying_material(ssl, keys.b2c.bytes, sizeof keys.b2c.bytes, kB2cKey,
+                                  sizeof(kB2cKey) - 1, ctx, sizeof ctx, 1) != 1) {
+    return failure;
+  }
 
   uint8_t ivbuf[4];
-  SSL_export_keying_material(const_cast<SSL*>(ssl_), ivbuf, sizeof ivbuf, kC2bIv,
-                              sizeof(kC2bIv) - 1, ctx, sizeof ctx, 1);
+  if (SSL_export_keying_material(ssl, ivbuf, sizeof ivbuf, kC2bIv, sizeof(kC2bIv) - 1, ctx,
+                                  sizeof ctx, 1) != 1) {
+    return failure;
+  }
   std::memcpy(keys.c2bPrefix, ivbuf, sizeof ivbuf);
-  SSL_export_keying_material(const_cast<SSL*>(ssl_), ivbuf, sizeof ivbuf, kB2cIv,
-                              sizeof(kB2cIv) - 1, ctx, sizeof ctx, 1);
+
+  if (SSL_export_keying_material(ssl, ivbuf, sizeof ivbuf, kB2cIv, sizeof(kB2cIv) - 1, ctx,
+                                  sizeof ctx, 1) != 1) {
+    return failure;
+  }
   std::memcpy(keys.b2cPrefix, ivbuf, sizeof ivbuf);
 
   return keys;
