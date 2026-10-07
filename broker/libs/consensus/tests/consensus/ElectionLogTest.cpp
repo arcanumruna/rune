@@ -2491,3 +2491,74 @@ TEST(ElectionStandDownRegression, GracefulLeaderSkipEndsWithItsElectionRegressio
     EXPECT_EQ(e.state(), ElectionState::Canvass)
         << "a later election still skipped the member that resigned two terms ago";
 }
+
+// ===========================================================================
+// DR-10 review LOW-4 — 2-member clusters.  quorumThreshold(2) == 2: since the
+// CLOSED step-down (ClosedLeaderStepDownRegression, Aeron "inactive follower
+// quorum") a 2-node leader steps down when its only follower stops reporting —
+// a minority never leads (DR-4).  It keeps leading while the follower reports.
+// A 2-node cluster therefore tolerates NO node failure (consensus and every
+// controller decision pause until both nodes are up) — run 1 or >= 3 nodes.
+// ===========================================================================
+static void closeAsTwoMemberLeader(Election& e, FakeConsensusPublisher& pub, int64_t& nowNs) {
+    e.doWork(nowNs);                       // INIT → CANVASS
+    e.onCanvassPosition(0, 0, 0, 1);
+    nowNs += kStartupCanvassTimeoutNs + 1;
+    e.doWork(nowNs);                       // → NOMINATE (unanimous)
+    nowNs += kElectionTimeoutNs * 10;
+    e.doWork(nowNs);                       // → CANDIDATE_BALLOT
+    nowNs += 1;
+    e.doWork(nowNs);
+    e.onVote(0, 0, e.candidateTermId(), 0, 1, true);
+    nowNs += 1;
+    e.doWork(nowNs);                       // → LEADER_LOG_REPLICATION
+    ASSERT_TRUE(driveLeaderToClosed(e, nowNs, pub, {1}));
+    ASSERT_EQ(e.leaderMemberId(), 0);
+}
+static std::vector<ClusterMember> makeMembers2(NodeId self = 0) {
+    auto ms = makeMembers3(self);
+    ms.pop_back();
+    return ms;
+}
+
+TEST(ElectionLog, TwoMemberClusterRegression_LeaderStepsDownWhenItsOnlyFollowerDies) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(makeMembers2(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+    closeAsTwoMemberLeader(e, pub, nowNs);
+    ASSERT_TRUE(e.isClosed());
+
+    nowNs += e.leaderHeartbeatTimeoutNs() + 1;   // follower 1 silent past the timeout
+    e.doWork(nowNs);
+    EXPECT_EQ(e.state(), ElectionState::Canvass)
+        << "a 2-member leader without its only follower is a minority and must not lead";
+    EXPECT_EQ(e.leaderMemberId(), -1);
+    // Alone it can never win (needs both votes): it stays leaderless.
+    for (int i = 0; i < 20; ++i) {
+        nowNs += kElectionTimeoutNs;
+        e.doWork(nowNs);
+        ASSERT_EQ(e.leaderMemberId(), -1) << "a lone 2-member node elected itself";
+    }
+}
+
+TEST(ElectionLog, TwoMemberClusterRegression_LeaderKeepsLeadingWhileFollowerReports) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(makeMembers2(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+    closeAsTwoMemberLeader(e, pub, nowNs);
+    const int64_t end = nowNs + 10 * e.leaderHeartbeatTimeoutNs();
+    while (nowNs < end) {
+        nowNs += kStatusIntervalNs;
+        e.onAppendPosition(nowNs, e.leadershipTermId(), e.appendPosition(), 1, 0);
+        e.doWork(nowNs);
+        ASSERT_TRUE(e.isClosed());
+    }
+    EXPECT_EQ(e.leaderMemberId(), 0);
+}
+

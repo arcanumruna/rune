@@ -188,6 +188,14 @@ bash docker/e2e.sh
 Both use the **same image** — clustering is purely a matter of `RUNE_NODE_ID` +
 `RUNE_PEERS` + a shared network.
 
+**Avoid two-node clusters.** A 2-node cluster needs **both** nodes for a
+quorum (`floor(2/2)+1 = 2`), so it tolerates no node loss.  When one node stops
+reporting, the consensus leader steps down after the leader heartbeat timeout
+(`max(election timeout, 3 × status interval)`, 150 ms by default) — a minority
+never leads — and the survivor stays without a consensus leader (no controller
+decisions: failover, ISR changes, topic creation) until the other node returns.  This is Raft / Aeron behaviour, not a
+fault.  Run 1 node (dev) or an odd count ≥ 3 (HA).
+
 ---
 
 ## Customizable 3-node cluster (parameterized)
