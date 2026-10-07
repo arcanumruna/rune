@@ -297,6 +297,47 @@ def _wait_for_new_leader_among_majority(cluster, zombie_svc: str,
     return new_lid, new_leader_svc
 
 
+# Settle oracle (DR-10 review LOW-5).  A settled cluster: every running node
+# reports a role, exactly one reports LEADER and all others FOLLOWER, and that
+# (leader, term) is unchanged over _SETTLE_STABLE_READS consecutive polls
+# (~1 s at the 0.2 s poll — several leader-heartbeat windows, so a resumed
+# zombie that is about to step down cannot pass as settled).  Bounded by a
+# deadline; never a fixed sleep.
+_SETTLE_DEADLINE_S = 90.0
+_SETTLE_STABLE_READS = 5
+
+
+def _wait_for_settled_leader(cluster, deadline_s: float = _SETTLE_DEADLINE_S) -> str:
+    """Wait until a single, stable leader is followed by every running node.
+
+    Returns the settled leader's service.  Raises AssertionError at the deadline
+    with the last observation (an unsettled cluster is a convergence failure).
+    """
+    running = cluster.running_services()
+    deadline = time.time() + deadline_s
+    last_obs: tuple[int, int] | None = None
+    stable = 0
+    readings: dict[str, tuple[str, int, int] | None] = {}
+    while time.time() < deadline:
+        readings = {svc: cluster._read_role(svc) for svc in running}
+        leaders = {(r[1], r[2]) for r in readings.values() if r is not None and r[0] == "LEADER"}
+        all_decided = all(r is not None and r[0] in ("LEADER", "FOLLOWER")
+                          for r in readings.values())
+        obs = next(iter(leaders)) if (len(leaders) == 1 and all_decided) else None
+        if obs is not None and obs == last_obs:
+            stable += 1
+        else:
+            stable = 1 if obs is not None else 0
+        last_obs = obs
+        if stable >= _SETTLE_STABLE_READS:
+            return node_id_to_service(obs[0])
+        time.sleep(cluster._LEADER_POLL_S)
+    raise AssertionError(
+        f"cluster did not settle on a single followed leader within {deadline_s}s "
+        f"(running={running}, last role readings={readings})"
+    )
+
+
 def _identify_leader_with_container(cluster, timeout_s: int = 30) -> tuple[int, str]:
     """Identify the current leader and verify its container id is resolvable.
 
@@ -663,9 +704,12 @@ def test_dr10_short_vs_long_pause(fresh_cluster, pause_case):
     finally:
         faults.unpause(cluster, zombie_svc)
 
-    # Settle window: node needs time to receive heartbeats / detect term changes.
-    settle_s = 10.0 if (pause_case == "long" or new_election_occurred) else 4.0
-    time.sleep(settle_s)
+    # Settle (DR-10 review LOW-5): condition-based, not a fixed sleep — wait
+    # (with a deadline) until exactly one node leads and every other node
+    # follows, unchanged over consecutive role-counter reads.  The fixed 4 s
+    # short-pause sleep was computed BEFORE the late-election re-check below, so
+    # a late-detected election ran the full convergence assertions after 4 s.
+    settled_svc = _wait_for_settled_leader(cluster)
 
     if pause_case == "short" and not new_election_occurred:
         # The short pause is AMBIGUOUS by design (1.5 s vs the leader-liveness
@@ -676,7 +720,6 @@ def test_dr10_short_vs_long_pause(fresh_cluster, pause_case):
         # quorum steps down, so leadership may legitimately move AFTER the
         # observation.  Decide the ambiguity on the settled cluster: a moved
         # leadership gets the full zombie-fencing convergence assertions below.
-        settled_svc = node_id_to_service(assert_single_leader(cluster))
         if settled_svc != zombie_svc:
             new_election_occurred = True
             new_leader_svc = settled_svc

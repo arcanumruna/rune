@@ -34,6 +34,7 @@
 // NO Docker. All waits are bounded (kDriverCap + ASSERT_TRUE). No busy-spin.
 // ---------------------------------------------------------------------------
 
+#include <spdlog/sinks/stdout_color_sinks.h>
 #include <gtest/gtest.h>
 
 #include <rune/node/MetadataService.h>
@@ -671,3 +672,55 @@ TEST(MetadataReplicationTest, MetadataTruncationRebuildRegression_CommittedMapSu
         EXPECT_EQ(pa->leaderNode, 1);
     }
 }
+
+// ===========================================================================
+// MetadataTruncationBelowCommittedRegression (DR-10 review LOW-1): a KIP-279
+// truncation that cuts BELOW what this MSM already committed must never
+// happen under Raft safety (the internal-ISR candidacy gate elects only a
+// leader holding every committed record).  If it does (unclean consensus
+// election, or a bug) the committed map can no longer be trusted: fail-stop
+// with a critical log like every other storage invariant violation — never
+// silently rebuild and publish a shorter map.  (After the restart the MSM
+// rebuilds from the surviving log: committedEnd_ starts at 0.)
+// ===========================================================================
+TEST(MetadataReplicationDeathTest, MetadataTruncationBelowCommittedRegression_HaltsNeverPublishes) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    MrtTempDir dir("trunc_below_committed");
+    rune::storage::Log log(dir.path);
+    log.recover();
+
+    const NodeId selfId = 1;
+    const std::vector<NodeId> nodes = {selfId};
+    InMemoryTransport transport;
+    auto replica = std::make_unique<PartitionReplica>(
+        makeMetaCfg(selfId, /*minIsr=*/1),
+        Role::Leader, /*epoch=*/1, nodes, nodes, &log, &transport);
+    transport.setLeader(replica.get());
+
+    const std::vector<int32_t> isr = {1}, replicas = {1};
+    Offset cut = -1;
+    for (int t = 0; t < 5; ++t) {
+        const Offset base = appendAssignment(replica.get(), t, 0, 1, isr, replicas, 1, t + 1);
+        ASSERT_GE(base, 0);
+        if (t == 2) cut = base;   // the start of a committed batch
+    }
+    int64_t clock = 0;
+    for (int i = 0; i < 50; ++i) { clock += 2'000'000LL; replica->doWork(clock); transport.pump(clock); }
+
+    MetadataService svc(replica.get(), selfId);
+    svc.doWork(clock);
+    for (int t = 0; t < 5; ++t) ASSERT_NE(svc.assignment(t, 0), nullptr);
+    ASSERT_GT(replica->highWatermark(), cut) << "setup: the cut must be below the committed end";
+
+    replica->becomeFollower(/*epoch=*/2, /*leaderId=*/2);
+    replica->truncateLogForTest(cut);
+    clock += 2'000'000LL;
+    EXPECT_DEATH({
+        // spdlog's default sink is stdout; the death matcher reads stderr.
+        spdlog::set_default_logger(spdlog::stderr_color_st("ltrunc"));
+        svc.doWork(clock);
+    }, "below the committed end");
+}
+
+// A truncation exactly AT the committed end (the DR-10 zombie case) is legal
+// and must not halt — covered by MetadataTruncationRebuildRegression above.

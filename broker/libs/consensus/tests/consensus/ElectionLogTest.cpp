@@ -2450,3 +2450,155 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_AdoptedTermIsDurable) {
     NodeStateFile reopened(nsfFile.str());
     EXPECT_GE(reopened.candidateTermId(), higher) << "the stepped-down term was not persisted";
 }
+
+// ===========================================================================
+// DR-10 review LOW-2 — gracefulClosedLeaderId persisted across elections.
+// Aeron builds a new Election per election; the graceful-close leader id is a
+// constructor argument of ONE election.  Rune's Election is long-lived, so the
+// id set by a StandDown must be dropped when that hand-off election completes —
+// else every later election still skips the resigned member in
+// isUnanimousCandidate / isUnanimousLeader and nominates without hearing from
+// it (no longer unanimous: it might hold a fresher log).
+// ===========================================================================
+TEST(ElectionStandDownRegression, GracefulLeaderSkipEndsWithItsElectionRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    StandDownRecorder pub;
+    auto e = makeSdElection(0, pub, nsf, tl, 42);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);
+    e.onRequestVote(0, 0, 1, 1, nowNs);
+    e.onNewLeadershipTerm(nowNs, 0, 1, 0, 0, 1, 0, 0, 0, 0, /*leader=*/1, 0, true, 0);
+    ASSERT_TRUE(driveToClosed(e, nowNs));
+    ASSERT_EQ(e.leaderMemberId(), 1);
+
+    // Leader 1 resigns; the hand-off election elects node 2.
+    e.onStandDown(nowNs, /*term=*/1, /*leader=*/1);
+    ASSERT_EQ(e.state(), ElectionState::Canvass);
+    e.onRequestVote(0, 0, 2, 2, nowNs);
+    e.onNewLeadershipTerm(nowNs, 0, 2, 0, 0, 2, 0, 0, 0, 0, /*leader=*/2, 0, false, 0);
+    ASSERT_TRUE(driveToClosed(e, nowNs));
+    ASSERT_EQ(e.leaderMemberId(), 2);
+
+    // Leader 2 dies: an ordinary (non-graceful) election follows.
+    nowNs += 10 * e.leaderHeartbeatTimeoutNs();
+    e.doWork(nowNs);
+    ASSERT_EQ(e.state(), ElectionState::Canvass);
+    // Only node 2 reports: node 1's position is unknown → not unanimous.
+    e.onCanvassPosition(0, 0, 2, 2);
+    e.doWork(nowNs + 1);
+    EXPECT_EQ(e.state(), ElectionState::Canvass)
+        << "a later election still skipped the member that resigned two terms ago";
+}
+
+// ===========================================================================
+// DR-10 review LOW-4 — 2-member clusters.  quorumThreshold(2) == 2: since the
+// CLOSED step-down (ClosedLeaderStepDownRegression, Aeron "inactive follower
+// quorum") a 2-node leader steps down when its only follower stops reporting —
+// a minority never leads (DR-4).  It keeps leading while the follower reports.
+// A 2-node cluster therefore tolerates NO node failure (consensus and every
+// controller decision pause until both nodes are up) — run 1 or >= 3 nodes.
+// ===========================================================================
+static void closeAsTwoMemberLeader(Election& e, FakeConsensusPublisher& pub, int64_t& nowNs) {
+    e.doWork(nowNs);                       // INIT → CANVASS
+    e.onCanvassPosition(0, 0, 0, 1);
+    nowNs += kStartupCanvassTimeoutNs + 1;
+    e.doWork(nowNs);                       // → NOMINATE (unanimous)
+    nowNs += kElectionTimeoutNs * 10;
+    e.doWork(nowNs);                       // → CANDIDATE_BALLOT
+    nowNs += 1;
+    e.doWork(nowNs);
+    e.onVote(0, 0, e.candidateTermId(), 0, 1, true);
+    nowNs += 1;
+    e.doWork(nowNs);                       // → LEADER_LOG_REPLICATION
+    ASSERT_TRUE(driveLeaderToClosed(e, nowNs, pub, {1}));
+    ASSERT_EQ(e.leaderMemberId(), 0);
+}
+static std::vector<ClusterMember> makeMembers2(NodeId self = 0) {
+    auto ms = makeMembers3(self);
+    ms.pop_back();
+    return ms;
+}
+
+TEST(ElectionLog, TwoMemberClusterRegression_LeaderStepsDownWhenItsOnlyFollowerDies) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(makeMembers2(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+    closeAsTwoMemberLeader(e, pub, nowNs);
+    ASSERT_TRUE(e.isClosed());
+
+    nowNs += e.leaderHeartbeatTimeoutNs() + 1;   // follower 1 silent past the timeout
+    e.doWork(nowNs);
+    EXPECT_EQ(e.state(), ElectionState::Canvass)
+        << "a 2-member leader without its only follower is a minority and must not lead";
+    EXPECT_EQ(e.leaderMemberId(), -1);
+    // Alone it can never win (needs both votes): it stays leaderless.
+    for (int i = 0; i < 20; ++i) {
+        nowNs += kElectionTimeoutNs;
+        e.doWork(nowNs);
+        ASSERT_EQ(e.leaderMemberId(), -1) << "a lone 2-member node elected itself";
+    }
+}
+
+TEST(ElectionLog, TwoMemberClusterRegression_LeaderKeepsLeadingWhileFollowerReports) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(makeMembers2(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+    closeAsTwoMemberLeader(e, pub, nowNs);
+    const int64_t end = nowNs + 10 * e.leaderHeartbeatTimeoutNs();
+    while (nowNs < end) {
+        nowNs += kStatusIntervalNs;
+        e.onAppendPosition(nowNs, e.leadershipTermId(), e.appendPosition(), 1, 0);
+        e.doWork(nowNs);
+        ASSERT_TRUE(e.isClosed());
+    }
+    EXPECT_EQ(e.leaderMemberId(), 0);
+}
+
+// ===========================================================================
+// DR-10 review LOW-6 — the adopted leadershipTermId is in memory only (as in
+// Aeron: ConsensusModuleAgent.leadershipTermId is recovered from the
+// RecordingLog; only the candidate term is in the NodeStateFile).  Safe because
+// the durable candidateTermId — persisted with fsync before the step-down
+// completes — is what a restarted node's election starts from: it never
+// re-follows the deposed leader's (older) term.
+// ===========================================================================
+TEST(ElectionLog, ClosedLeaderStepDownRegression_RestartAfterAdoptedTermIgnoresDeposedLeader) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    Term deposed = 0, higher = 0;
+    {
+        NodeStateFile nsf(nsfFile.str());
+        TermLog       tl(tlFile.str());
+        FakeConsensusPublisher pub;
+        int64_t nowNs = 1'000'000LL;
+        auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl);
+        closeAsFollowerOf0(e, nowNs);
+        deposed = e.leadershipTermId();
+        higher  = deposed + 1;
+        e.onCommitPosition(nowNs, higher, 0, /*leader=*/2);   // adopt T+1 (memory) → CANVASS
+        ASSERT_FALSE(e.isClosed());
+        ASSERT_EQ(e.leadershipTermId(), higher);
+    }   // crash: the adopted leadershipTermId is lost, the TermLog still says `deposed`
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    FakeConsensusPublisher pub;
+    int64_t nowNs = 5'000'000'000LL;
+    auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl, true, deposed, 0, 0);
+    e.doWork(nowNs);   // INIT → CANVASS (candidate term from the NodeStateFile)
+    EXPECT_GE(e.candidateTermId(), higher);
+    // The deposed leader's heartbeat for its old term must not be followed.
+    for (int i = 0; i < 20; ++i) {
+        e.onNewLeadershipTerm(nowNs, deposed, deposed, 0, 0, deposed, 0, 0, 0, 0,
+                              /*leader=*/0, 0, false, 0);
+        nowNs += kStatusIntervalNs;
+        e.doWork(nowNs);
+        ASSERT_NE(e.leaderMemberId(), 0) << "restarted node re-followed the deposed leader";
+    }
+}

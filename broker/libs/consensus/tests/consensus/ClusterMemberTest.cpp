@@ -291,6 +291,22 @@ TEST(ClusterMember, HasActiveQuorum_2of5_False) {
     EXPECT_FALSE(ClusterMember::hasActiveQuorum(members, nowNs, timeoutNs));
 }
 
+// Aeron member.isLeader() exemption (DR-10 review LOW-3): the leader never
+// records its own AppendPosition — it counts as active when named.
+TEST(ClusterMember, HasActiveQuorum_LeaderExemptWhenNamed) {
+    int64_t nowNs     = 1'000'000'000LL;
+    int64_t timeoutNs = 500'000'000LL;
+    std::array<ClusterMember, 3> members = {
+        makeInactiveMember(0, 1, 0, nowNs, timeoutNs),   // the leader (never self-reports)
+        makeActiveMember(1, 1, 0, nowNs, timeoutNs),
+        makeInactiveMember(2, 1, 0, nowNs, timeoutNs),
+    };
+    EXPECT_FALSE(ClusterMember::hasActiveQuorum(members, nowNs, timeoutNs));
+    EXPECT_TRUE(ClusterMember::hasActiveQuorum(members, nowNs, timeoutNs, /*leaderMemberId=*/0));
+    members[1] = makeInactiveMember(1, 1, 0, nowNs, timeoutNs);
+    EXPECT_FALSE(ClusterMember::hasActiveQuorum(members, nowNs, timeoutNs, /*leaderMemberId=*/0));
+}
+
 // ---------------------------------------------------------------------------
 // 6. hasQuorumAtPosition
 //    ClusterMember.java:907-925

@@ -442,6 +442,17 @@ private:
     int64_t notifiedCommitPosition_  = 0;  // Election.java:88
 
     // Term fields — Election.java:94-96
+    /// In memory only, also when adopted from a higher-term NLT / CommitPosition
+    /// on leaving CLOSED (DR-10 review LOW-6) — exactly as Aeron, whose
+    /// ConsensusModuleAgent.leadershipTermId is recovered from the RecordingLog
+    /// (here: the TermLog, appended at electionComplete) and whose only durable
+    /// election term is the NodeStateFile candidate term.  Safe: the adoption
+    /// first persists candidateTermId (proposeMaxCandidateTermId, fsync), and a
+    /// restarted node's init() starts from max(persisted candidate term, this),
+    /// so it never votes at or below the adopted term nor re-follows the deposed
+    /// leader's older term (ClosedLeaderStepDownRegression_RestartAfter...).  The
+    /// ack term may fall back below it after a crash — same reasoning as
+    /// votedTermId_ below: knowledge persisted, never acked.
     Term leadershipTermId_    = 0;
     Term logLeadershipTermId_ = 0;
     Term candidateTermId_     = 0;
@@ -461,7 +472,8 @@ private:
     bool isExtendedCanvass_ = false; // true during first canvass on startup
     bool isFirstInit_       = true;  // Election.java:101
 
-    // Election.java:100
+    // Election.java:100 — scoped to ONE election (Aeron: a constructor argument
+    // of that election); cleared at electionComplete (DR-10 review LOW-2).
     NodeId gracefulClosedLeaderId_ = -1;
     /// Controlled shutdown: this node resigned its leadership (resign()) — it
     /// never nominates itself again; while canvassing it re-sends StandDown
