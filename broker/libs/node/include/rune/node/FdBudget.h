@@ -3,9 +3,11 @@
 //
 // Every recovered partition log holds, for its whole lifetime:
 //   * 2 fds for E1d (the recovery-point checkpoint file + its directory), and
-//   * up to kFdsPerSegment fds per OPEN segment (the .log fstream, the .log
-//     POSIX fd used for pwrite/fdatasync, the .index mapping, the read-only
-//     .log mapping).
+//   * kFdsPerSegment fds per OPEN segment: the .log POSIX fd (every write /
+//     read / truncate / fsync, and the read-only .log mapping borrows it) and
+//     the writable .index mapping's fd (kept for grow-on-demand ftruncate).
+//     D20 removed the per-segment std::fstream (its own fd + a FILE* whose
+//     glibc fclose is O(open FILEs)); SegmentFdScaleRegression pins the count.
 // Linux defaults to a soft RLIMIT_NOFILE of 1024, which ~300 partitions
 // exhaust — the next roll / recovery open() then fails with EMFILE, the log is
 // fail-stopped and the broker halts (and on restart recovery fails again).
@@ -37,7 +39,7 @@
 
 namespace rune::node {
 
-inline constexpr uint64_t kFdsPerSegment            = 4;
+inline constexpr uint64_t kFdsPerSegment            = 2;
 inline constexpr uint64_t kE1dFdsPerLog             = 2;
 inline constexpr uint64_t kDefaultOpenSegments      = 4;
 inline constexpr uint64_t kBaseFds                  = 1024;
