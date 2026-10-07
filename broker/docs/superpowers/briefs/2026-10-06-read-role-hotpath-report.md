@@ -269,3 +269,37 @@ Neither the epoch-state io, the C1 cap nor the Md5 growth causes it. It appears 
 This is the reviewer's "cost moved from COLD into a HOT first write" mechanism, but through the extent conversion of the first write, not through the new fsyncs. The fsync counts confirm it: the after tree issues fewer io fsyncs in this scenario (656 vs 1058).
 
 **Fix candidate** (F6 follow-up, not in this branch): have the provisioner pre-write or zero the first page(s) of each ready segment, so that the owner's first write is never an unwritten-extent conversion. It must be confirmed on bare metal. The gate budgets are untouched, and LeadershipChange/8p stays within its listed `kKnownFailures` ceiling.
+
+---
+
+# Re-review fixes (rereview of `bfc92af`, `2026-10-06-read-role-hotpath-rereview.md`)
+
+Commit `ef1782d`. Each fix has a `*Regression` test, and all six were shown RED with their fix disabled.
+
+| ID | Fix | Test |
+|---|---|---|
+| N1 (critical) | The in-place truncation takes its cut from the whole segment: it maps the whole file on the owner, on this cold path. It fails the log loudly unless the walk stopped at the batch holding the offset, or at the segment end. | `InPlaceTruncationOverPartialReadMapCutsAtTheOffsetRegression` |
+| N2 | Each growth request carries a seq, packed with the dup'd fd and the size. A late answer to a superseded request is discarded (munmapped off the owner). | `LateReadMapForSupersededRequestIsDiscardedRegression` |
+| N3 | Data already past the mapping is served by a counted owner remap. Readers never stall on the provisioner. | `ReadsPastTheMappingNeverStallOnTheProvisionerRegression` |
+| N4 | One `onHistoryDurable_` hook releases the re-fetch wait. It is called from the async completion, the inline write, the pending-leadership clear, `becomeFollower` and the follower duty pass. | `RefetchWaitReleasedByInlineDurabilityRegression` |
+| N5 | A missing recovery-point file is created at the epoch guard's held value. | `MissingRecoveryPointFileHonoursTheEpochGuardRegression` |
+| N6 | A failed update of a valid `leader-epoch-state` fails the log. It never falls back to the legacy files. | `FailedEpochStateUpdateNeverFallsBackToLegacyRegression` |
+
+The lows are appended to backlog D21.
+
+## Tests
+`ctest -j6` ran with the machine loaded by another agent's stress loop (load average 21-30).
+- **3966/3972 passed.**
+- Non-gate failures, both green in isolation:
+  - `ConsensusCandidacyElectionRegression.StaleKnowledgeLearnedThroughExchange_SurvivorsElect`
+  - `PerWorkerReplication.ExactEffectiveMaxBatchReplicatesPerWorkerRegression`
+- **Debug latency-gate misses under this load** (re-run in isolation, still loaded; budgets not loosened):
+
+| Scenario | Measured | Budget |
+|---|---|---|
+| Compaction/64MiB/1p | max 8.8 ms | 6 ms |
+| FollowerTruncation/2p | p99.9 1.25 ms | 1 ms |
+| Reads+Retention/2p | p99.9 2.1 ms | 1 ms |
+| TxnMarkers/4p | max 6.5 ms | 6 ms |
+
+The worst passes are produce-intake passes. The local latency re-run was skipped on instruction. The Reads* and SegmentRoll check moves to the bare-metal box run after merge.
