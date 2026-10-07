@@ -2132,6 +2132,10 @@ void PartitionReplica::reconcileEpochCacheWithLog_()
         const std::vector<uint8_t> b = diskLog_->read(o, 1);
         if (b.size() < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) return INT32_MIN;
         rune::protocol::RecordBatchReader r(b.data(), b.size());
+        // D21 re-review low: over a compaction gap read(o) returns a LATER
+        // batch — it says nothing about o's epoch (no evidence, never "stale").
+        // (A batch stamped -1 carries no epoch either: skipped by the callers.)
+        if (r.baseOffset() > o) return INT32_MIN;
         return r.partitionLeaderEpoch();
     };
     // The recovery point recovery STARTED from (not the one it persisted
@@ -2157,6 +2161,7 @@ void PartitionReplica::reconcileEpochCacheWithLog_()
         if (stale) {
             spdlog::warn("PartitionReplica[topic={} part={}]: durable epoch history disagrees with the log's "
                          "stamps — rebuilt from the log", cfg_.topicId, cfg_.partitionId);
+            ++epochHistoryRebuilds_;
             epochCache_.truncateFromEnd(INT64_MIN);
             from = start;
         }

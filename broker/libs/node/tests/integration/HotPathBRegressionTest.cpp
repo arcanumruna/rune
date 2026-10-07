@@ -1471,3 +1471,39 @@ TEST(HotPathBRegression, LostUnsyncedIndexAfterFallbackTruncationIsRebuiltRegres
         EXPECT_GE(r.baseOffset() + r.lastOffsetDelta(), o) << "looked up through a lost index";
     }
 }
+
+// D21 re-review low: the below-recovery-point spot-check reads the batch AT an
+// offset — over a compaction gap read(o) returns a LATER batch (another
+// epoch), which was taken as a disagreement: a false "stale" and a full log
+// scan at every restart.  A batch that does not contain o is no evidence.
+TEST(HotPathBRegression, CompactionGapIsNoEpochHistoryDisagreementRegression) {
+    TmpDir d;
+    rune::replication::NullPartitionTransport t;
+    PartitionConfig c;
+    c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+    {
+        rune::storage::Log log(d.p.string());
+        log.recover();
+        log.append(stampedBatch(0, 5, 1), 4);     // epoch 1: [0, 4]; [5, 9] compacted away
+        log.append(stampedBatch(10, 2, 2), 11);   // epoch 2 from 10
+        ASSERT_EQ(log.checkpointRecoveryPoint(), 0);
+        PartitionReplica r(c, Role::Follower, 2, {1}, {1}, &log, &t);
+        r.setExternalFollowerFlush(true);   // leader-epoch-state written
+        r.setExternalFollowerFlush(false);
+        ASSERT_TRUE(r.writeEpochStateInlineForTest() || r.epochStateEnabledForTest());
+    }
+    {   // history {1:0, 2:10} as written, but entry 1's last offset (9) is in the gap
+        const std::vector<std::pair<int32_t, int64_t>> e{{1, 0}, {2, 10}};
+        const int fd = rune::storage::LeaderEpochState::create(
+            d.p.string(), rune::storage::LeaderEpochState::strideFor(rune::storage::LeaderEpochState::kMinEntries),
+            100, 2, e.begin(), e.end());
+        ASSERT_GE(fd, 0);
+        ::close(fd);
+    }
+    rune::storage::Log log(d.p.string());
+    log.recover();
+    ASSERT_GT(log.startupRecoveryPoint(), 10) << "precondition: the history is below the recovery point";
+    PartitionReplica r(c, Role::Follower, 2, {1}, {1}, &log, &t);
+    EXPECT_EQ(r.epochHistoryRebuildsForTest(), 0u) << "a compaction gap was taken for a stale history";
+    EXPECT_EQ(r.leaderEpochCacheForTest().startOffsetFor(2), 10);
+}
