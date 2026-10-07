@@ -1006,6 +1006,8 @@ public:
     [[nodiscard]] uint64_t leadershipsDeferredForTest() const noexcept { return leadershipsDeferred_; }
     [[nodiscard]] uint64_t leadershipsResumedForTest() const noexcept { return leadershipsResumed_; }
     [[nodiscard]] uint64_t epochStateWritesForTest() const noexcept { return es_.writes; }
+    /// Restarts whose durable epoch history disagreed with the stamps (rebuilt).
+    [[nodiscard]] uint64_t epochHistoryRebuildsForTest() const noexcept { return epochHistoryRebuilds_; }
     [[nodiscard]] uint64_t epochStateInlineWritesForTest() const noexcept { return es_.inlineWrites; }
     [[nodiscard]] uint64_t epochStateErrorsForTest() const noexcept { return es_.errors; }
     [[nodiscard]] bool epochStateEnabledForTest() const noexcept { return es_.enabled; }
@@ -1442,7 +1444,7 @@ private:
     uint64_t leadGenSeq_ = 0;
     void enableEpochState_() noexcept;
     bool writeEpochStateInline_() noexcept;
-    bool openEpochStateFd_() noexcept;
+    int  openEpochStateFd_() noexcept;   ///< 0 or errno
     void closeEpochStateFdIfIdle_() noexcept;
     /// Review C1: the epoch history from `x` on changed (not yet durable).
     void noteEpochChange_(Offset x) noexcept;
@@ -1613,6 +1615,17 @@ private:
     int  sendLeaderlessReport_(int64_t nowNs);
     [[nodiscard]] int32_t bumpFlags_() const noexcept;
     bool fenceEstablished_ = false;          ///< no-fence-file mode: the first leadership was refused
+    /// D21 review L2: both leader-epoch-state slots were corrupt — the epochs an
+    /// earlier incarnation led at are unknown (an epoch led with no surviving
+    /// batch is in no stamp).  The first leadership is refused (the controller
+    /// bumps); until that refusal's fence is durable, every image carries
+    /// kFenceUnknown so a restart in between still knows.
+    bool fenceUnknown_ = false;
+    uint64_t epochHistoryRebuilds_ = 0;   ///< see epochHistoryRebuildsForTest
+    static constexpr Epoch kFenceUnknown = -2;
+    [[nodiscard]] Epoch imageFence_() const noexcept {
+        return fenceUnknown_ ? kFenceUnknown : std::max(fencePersisted_, es_.fenceTarget);
+    }
     bool fenceErrorLogged_ = false;
     static constexpr int64_t kAlterIsrResendNs = 50'000'000LL;   // 50 ms
     std::array<uint8_t, ErrorPayload::SIZE> errPayload_{};      ///< DivergingEpoch / OOR answer payload

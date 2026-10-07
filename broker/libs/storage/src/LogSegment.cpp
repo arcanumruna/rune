@@ -194,6 +194,11 @@ std::size_t LogSegment::readMapBytesFor(int64_t rollBytes) noexcept {
 
 std::unique_ptr<MappedFile> LogSegment::swapReadMap(std::unique_ptr<MappedFile> m) noexcept {
     std::unique_ptr<MappedFile> old = std::move(readMap_);
+    // D20 review L5: a map built off the owner borrowed a dup the provisioner
+    // has already closed — remap only ever through THIS segment's fd; the
+    // retired map keeps no fd (its fd number may be reused after the segment).
+    if (m) m->rebindBorrowedFd(fd_);
+    if (old) old->rebindBorrowedFd(-1);
     readMap_ = std::move(m);
     readMapSize_ = readMap_ ? readMap_->size() : 0;
     return old;
@@ -218,29 +223,47 @@ LogSegment::~LogSegment() {
     if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
 }
 
-int LogSegment::flushBufferedToPageCache() noexcept {
-    // D20: every write is a pwrite/pwritev straight into the page cache — there
-    // is no userspace buffer left to push.  Kept as the seal-protocol hook.
-    return 0;
-}
-
 // D20: write all of [data, data+len) at the O_APPEND end of the .log through
 // fd_ — the durable append() path (formerly a buffered fstream write + flush).
 // Retries a short write / EINTR like the libc stream did; 0 or errno (ENOSPC for
 // a zero-progress write).
 int LogSegment::writeAll_(const uint8_t* data, std::size_t len) noexcept {
+    const struct ::iovec one{const_cast<uint8_t*>(data), len};
+    errno = EINTR;   // "nothing written yet, retry"
+    return finishShortWrite_(&one, 1, len, -1);
+}
+
+int LogSegment::finishShortWrite_(const struct ::iovec* iov, int cnt, std::size_t total, ssize_t first) noexcept {
     std::size_t done = 0;
-    while (done < len) {
-        const off_t off = static_cast<off_t>(logSize_) + static_cast<off_t>(done);
-        const ssize_t w = (storage_ && storage_->pwriteForTest)
-            ? storage_->pwriteForTest(fd_, data + done, len - done, off)
-            : ::pwrite(fd_, data + done, len - done, off);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return errno != 0 ? errno : EIO;
+    if (first < 0) {
+        if (errno != EINTR) return errno != 0 ? errno : EIO;
+    } else if (first == 0 && total > 0) {
+        return ENOSPC;
+    } else {
+        done = static_cast<std::size_t>(first);
+    }
+    std::size_t skip = done;
+    for (int i = 0; i < cnt; ++i) {
+        const auto* p = static_cast<const uint8_t*>(iov[i].iov_base);
+        std::size_t n = iov[i].iov_len;
+        if (skip >= n) { skip -= n; continue; }
+        p += skip;
+        n -= skip;
+        skip = 0;
+        while (n > 0) {
+            const off_t off = static_cast<off_t>(logSize_) + static_cast<off_t>(done);
+            const ssize_t w = (storage_ && storage_->pwriteForTest)
+                ? storage_->pwriteForTest(fd_, p, n, off)
+                : ::pwrite(fd_, p, n, off);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                return errno != 0 ? errno : EIO;
+            }
+            if (w == 0) return ENOSPC;
+            p += w;
+            n -= static_cast<std::size_t>(w);
+            done += static_cast<std::size_t>(w);
         }
-        if (w == 0) return ENOSPC;
-        done += static_cast<std::size_t>(w);
     }
     return 0;
 }
@@ -328,7 +351,7 @@ int64_t LogSegment::writeAndUpdateState(const uint8_t* data, std::size_t len, in
         index_->append(r.baseOffset(), logSize_); // C4: OffsetIndex::append guards 2GiB
         bytesSinceIndex_ = 0;
     }
-    if (storage_ && storage_->writeFaultForTest != 0) [[unlikely]]
+    if (storage_ && storage_->writeFaultForTest > 0) [[unlikely]]
         failWrite_(storage_->writeFaultForTest, "LogSegment::append write");
     if (const int e = writeAll_(data, len); e != 0) [[unlikely]]
         failWrite_(e, "LogSegment::append write");
@@ -389,11 +412,21 @@ int64_t LogSegment::appendNoSync(const uint8_t* data, std::size_t len, int64_t l
     // entry points at bytes never written — harmless: the log is then failed (no reads/appends) and
     // restart recovery rebuilds the index from the valid data.
     off_t writePos = static_cast<off_t>(logSize_);
-    if (storage_ && storage_->writeFaultForTest != 0) [[unlikely]]
-        failWrite_(storage_->writeFaultForTest, "LogSegment::appendNoSync pwrite");
-    ssize_t written = ::pwrite(fd_, data, len, writePos);
-    if (written < 0 || static_cast<std::size_t>(written) != len) [[unlikely]]
-        failWrite_(written < 0 ? errno : ENOSPC, "LogSegment::appendNoSync pwrite");   // short write = out of space
+    ssize_t written;
+    if (storage_ && storage_->writeFaultForTest != 0) [[unlikely]] {
+        if (storage_->writeFaultForTest != LogStorageState::kShortWriteOnceForTest)
+            failWrite_(storage_->writeFaultForTest, "LogSegment::appendNoSync pwrite");
+        storage_->writeFaultForTest = 0;
+        written = ::pwrite(fd_, data, len / 2, writePos);   // a simulated short write
+    } else {
+        written = ::pwrite(fd_, data, len, writePos);
+    }
+    if (written != static_cast<ssize_t>(len)) [[unlikely]] {
+        // D20 review L2: resumed like the durable path (EINTR / short write).
+        const struct ::iovec one{const_cast<uint8_t*>(data), len};
+        if (const int e = finishShortWrite_(&one, 1, len, written); e != 0)
+            failWrite_(e, "LogSegment::appendNoSync pwrite");
+    }
 
     logSize_ += static_cast<int64_t>(len);
     bytesSinceIndex_ += static_cast<int64_t>(len);
@@ -453,11 +486,20 @@ int64_t LogSegment::appendNoSyncRestamp(const uint8_t* data, std::size_t len,
     }
 
     off_t writePos = static_cast<off_t>(logSize_);
-    if (storage_ && storage_->writeFaultForTest != 0) [[unlikely]]
-        failWrite_(storage_->writeFaultForTest, "LogSegment::appendNoSyncRestamp pwritev");
-    ssize_t written = ::pwritev(fd_, iov, iovCnt, writePos);
-    if (written < 0 || static_cast<std::size_t>(written) != len) [[unlikely]]
-        failWrite_(written < 0 ? errno : ENOSPC, "LogSegment::appendNoSyncRestamp pwritev");
+    ssize_t written;
+    if (storage_ && storage_->writeFaultForTest != 0) [[unlikely]] {
+        if (storage_->writeFaultForTest != LogStorageState::kShortWriteOnceForTest)
+            failWrite_(storage_->writeFaultForTest, "LogSegment::appendNoSyncRestamp pwritev");
+        storage_->writeFaultForTest = 0;
+        written = ::pwritev(fd_, iov, 1, writePos);   // a simulated short write (first iovec only)
+    } else {
+        written = ::pwritev(fd_, iov, iovCnt, writePos);
+    }
+    if (written != static_cast<ssize_t>(len)) [[unlikely]] {
+        // D20 review L2: resumed like the durable path (EINTR / short write).
+        if (const int e = finishShortWrite_(iov, iovCnt, len, written); e != 0)
+            failWrite_(e, "LogSegment::appendNoSyncRestamp pwritev");
+    }
 
     // maxTimestamp lives at kMaxTimestampOffset (outside the base-offset field),
     // so reading it from the read-only `data` is correct.
@@ -689,10 +731,26 @@ int LogSegment::truncateInPlace(int64_t truncateOffset, int64_t& keptMaxTs) noex
 }
 
 int64_t LogSegment::recover(bool syncIndex) {
+    // D20 review L3 — ONE rule for every error: it fails the log (sticky
+    // failedErrno, routed to the halt by the owner's loop), and it THROWS only
+    // while the segment's state is unknown (fstat / pread: no valid prefix
+    // established — a caller must never act on it, e.g. delete "later"
+    // segments on a bogus chain end).  Once the valid prefix is known
+    // (ftruncate, index rename, index msync, directory fsync) recover()
+    // completes the in-memory state and returns — Task 10 fix 3: no exception
+    // escapes a worker's role-change truncation.  Without a storage state
+    // (standalone segment) an error always throws (nothing else reports it).
+    auto failSticky = [this](int e) {
+        if (storage_ && storage_->failedErrno == 0) storage_->failedErrno = e != 0 ? e : EIO;
+    };
+    auto fail = [&](int e, const std::string& what) {
+        if (e == 0) e = EIO;
+        failSticky(e);
+        throw std::system_error(e, std::system_category(), what);
+    };
     // D20: read the whole .log through fd_ (pread), not a FILE*-backed stream.
     struct stat st{};
-    if (::fstat(fd_, &st) != 0)
-        throw std::system_error(errno, std::system_category(), "LogSegment::recover fstat " + logPath_);
+    if (::fstat(fd_, &st) != 0) fail(errno, "LogSegment::recover fstat " + logPath_);
     const int64_t fileSize = static_cast<int64_t>(st.st_size);
     std::vector<uint8_t> buf(static_cast<size_t>(fileSize));
     {
@@ -701,7 +759,7 @@ int64_t LogSegment::recover(bool syncIndex) {
             const ssize_t r = ::pread(fd_, buf.data() + got, buf.size() - got, static_cast<off_t>(got));
             if (r < 0) {
                 if (errno == EINTR) continue;
-                throw std::system_error(errno, std::system_category(), "LogSegment::recover pread " + logPath_);
+                fail(errno, "LogSegment::recover pread " + logPath_);
             }
             if (r == 0) break;   // shrank under us: validate what was read
             got += static_cast<std::size_t>(r);
@@ -739,8 +797,12 @@ int64_t LogSegment::recover(bool syncIndex) {
 
     // Truncate torn tail.
     // D20: through the segment's own fd (its inode), never by path.
-    if (::ftruncate(fd_, static_cast<off_t>(validBytes)) != 0)
-        throw std::system_error(errno, std::system_category(), "LogSegment::recover ftruncate " + logPath_);
+    if (::ftruncate(fd_, static_cast<off_t>(validBytes)) != 0) {
+        // State known (validBytes / next); the torn tail stays on disk behind a
+        // failed log (no append reaches it) and restart recovery cuts it.
+        if (!storage_) fail(errno, "LogSegment::recover ftruncate " + logPath_);
+        failSticky(errno);
+    }
     logSize_ = validBytes; nextOffset_ = next;
     if (syncedBytes_ > validBytes) syncedBytes_ = validBytes;   // E2 crash seam
     // E1d: recover() itself proves nothing durable — the owning Log decides
@@ -760,17 +822,10 @@ int64_t LogSegment::recover(bool syncIndex) {
         }
     }
     if (::rename(indexTmp.c_str(), indexPath.c_str()) != 0) {
-        const int e = errno;
-        if (storage_) {
-            // Task 10 fix 3: fail-stop, not an exception escaping a worker loop
-            // (truncateTo on a role change runs on the owning worker).  The log
-            // is permanently failed; its owner's loop routes it to the halt.  The
-            // rebuilt in-memory index (on the .tmp file) stays valid meanwhile.
-            if (storage_->failedErrno == 0) storage_->failedErrno = e != 0 ? e : EIO;
-            return nextOffset_;
-        }
-        throw std::system_error(e, std::system_category(),
-                                "LogSegment::recover rename " + indexTmp + " -> " + indexPath);
+        // State known: the rebuilt in-memory index (on the .tmp file) stays valid.
+        if (!storage_) fail(errno, "LogSegment::recover rename " + indexTmp + " -> " + indexPath);
+        failSticky(errno);
+        return nextOffset_;
     }
     // fsync the directory for durability of the rename
     if (syncIndex) {

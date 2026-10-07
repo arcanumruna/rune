@@ -15,9 +15,12 @@
 // never wall-clock.  Every test here is a regression test.
 #include <gtest/gtest.h>
 #include <rune/storage/LogSegment.h>
+#include <rune/storage/MappedFile.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <cerrno>
+#include <cstring>
+#include <fstream>
 #include <filesystem>
 #include <system_error>
 #include <memory>
@@ -252,3 +255,128 @@ void tornTailThenAppend(bool prealloc) {
 
 TEST(SegmentFdScaleRegression, RecoverTornTailThenAppendRegression) { tornTailThenAppend(false); }
 TEST(SegmentFdScaleRegression, RecoverTornTailThenAppendPreallocatedRegression) { tornTailThenAppend(true); }
+
+// ---------------------------------------------------------------------------
+// D20 review L2: the page-cache appends (appendNoSync / appendNoSyncRestamp)
+// resume a short write like the durable path, instead of failing the log with
+// a fabricated ENOSPC.  kShortWriteOnceForTest makes the first syscall write
+// only part of the batch.
+// ---------------------------------------------------------------------------
+TEST(SegmentFdScaleRegression, AppendNoSyncResumesAShortWriteRegression) {
+    const fs::path dir = freshDir("rune_d20b_l2_nosync");
+    LogStorageState st;
+    LogSegment seg(dir.string(), 0, 4096, 64 * 1024);
+    seg.setStorageState(&st);
+    const auto b0 = batchAt(0), b1 = batchAt(1);
+    st.writeFaultForTest = LogStorageState::kShortWriteOnceForTest;
+    EXPECT_EQ(seg.appendNoSync(b0.data(), b0.size(), 0), 1);
+    EXPECT_EQ(st.failedErrno, 0) << "a short write is resumed, not a fail-stop";
+    EXPECT_EQ(seg.appendNoSync(b1.data(), b1.size(), 1), 2);
+    EXPECT_EQ(fileEnd(seg.logFd()), static_cast<off_t>(b0.size() + b1.size()));
+    EXPECT_EQ(seg.read(0, 1 << 16).size(), b0.size() + b1.size());
+    fs::remove_all(dir);
+}
+
+TEST(SegmentFdScaleRegression, AppendNoSyncRestampResumesAShortWriteRegression) {
+    for (const int32_t epoch : {-1, 7}) {
+        const fs::path dir = freshDir("rune_d20b_l2_restamp");
+        LogStorageState st;
+        LogSegment seg(dir.string(), 0, 4096, 64 * 1024);
+        seg.setStorageState(&st);
+        const auto b = batchAt(999);   // producer's base; restamped to 0
+        st.writeFaultForTest = LogStorageState::kShortWriteOnceForTest;
+        EXPECT_EQ(seg.appendNoSyncRestamp(b.data(), b.size(), 0, 0, epoch), 1);
+        EXPECT_EQ(st.failedErrno, 0) << "epoch " << epoch;
+        EXPECT_EQ(fileEnd(seg.logFd()), static_cast<off_t>(b.size()));
+        const auto got = seg.read(0, 1 << 16);
+        ASSERT_EQ(got.size(), b.size());
+        RecordBatchReader r(got.data(), got.size());
+        EXPECT_TRUE(r.ensureValid()) << "every byte after the cut landed in order";
+        EXPECT_EQ(r.baseOffset(), 0);
+        if (epoch >= 0) EXPECT_EQ(r.partitionLeaderEpoch(), epoch);
+        fs::remove_all(dir);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D20 review L3: recover() has ONE error rule — every error fails the log
+// (sticky); it throws only while the segment state is unknown (fstat / pread).
+// It used to throw on ftruncate WITHOUT failing the log (and on fstat / pread
+// without failing it either).
+// ---------------------------------------------------------------------------
+TEST(SegmentFdScaleRegression, RecoverTruncateErrorFailsTheLogRegression) {
+    const fs::path dir = freshDir("rune_d20b_l3_trunc");
+    LogStorageState st;
+    LogSegment seg(dir.string(), 0, 4096, 64 * 1024);
+    seg.setStorageState(&st);
+    const auto b = batchAt(0);
+    seg.append(b, 0);
+    // The segment's fd now names a read-only file: ftruncate fails.
+    const int ro = ::open("/dev/null", O_RDONLY);
+    ASSERT_GE(ro, 0);
+    ASSERT_EQ(::dup2(ro, seg.logFd()), seg.logFd());
+    ::close(ro);
+    EXPECT_NO_THROW(seg.recover()) << "the valid prefix is known: fail-stop, no exception";
+    EXPECT_NE(st.failedErrno, 0) << "the log is failed (sticky)";
+    fs::remove_all(dir);
+}
+
+TEST(SegmentFdScaleRegression, RecoverReadErrorFailsTheLogAndThrowsRegression) {
+    const fs::path dir = freshDir("rune_d20b_l3_read");
+    LogStorageState st;
+    LogSegment seg(dir.string(), 0, 4096, 64 * 1024);
+    seg.setStorageState(&st);
+    seg.append(batchAt(0), 0);
+    // The segment's fd now names a directory: pread fails (EISDIR).
+    const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    ASSERT_GE(dfd, 0);
+    ASSERT_EQ(::dup2(dfd, seg.logFd()), seg.logFd());
+    ::close(dfd);
+    EXPECT_THROW(seg.recover(), std::system_error) << "no valid prefix: never act on it";
+    EXPECT_NE(st.failedErrno, 0) << "and the log is failed (sticky)";
+    fs::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// D20 review L5: a read map built off the owner borrows a DUP of the segment's
+// fd that the provisioner closes right after mapping.  Installed into the
+// segment, a later owner remap (resize) went through that closed fd NUMBER —
+// remapping whatever file reused it.  The installed map now remaps through the
+// segment's own fd.
+// ---------------------------------------------------------------------------
+TEST(SegmentFdScaleRegression, InstalledOffOwnerReadMapRemapsTheSegmentsOwnFdRegression) {
+    const fs::path dir = freshDir("rune_d20b_l5_remap");
+    LogSegment seg(dir.string(), 0, 4096, 1 << 20);
+    int64_t off = 0;
+    const std::string big(64 * 1024, 'x');
+    auto fillTo = [&](int64_t bytes) {
+        while (seg.sizeBytes() < bytes) {
+            RecordBatchBuilder b(off, 1000);
+            b.append("k", big, 1000);
+            const auto bb = b.build();
+            off = seg.appendNoSync(bb.data(), bb.size(), off);
+        }
+    };
+    fillTo(int64_t{1} << 19);   // 0.5 MiB
+    // The provisioner's growth: map a dup (1 MiB), close the dup.
+    const int dupFd = ::fcntl(seg.logFd(), F_DUPFD_CLOEXEC, 0);
+    ASSERT_GE(dupFd, 0);
+    auto grown = std::make_unique<MappedFile>(MappedFile::BorrowedFd{dupFd}, std::string(), std::size_t{1} << 20);
+    ::close(dupFd);
+    // A decoy file reuses the closed fd number.
+    const fs::path decoy = dir / "decoy.bin";
+    { std::ofstream f(decoy, std::ios::binary); const std::string junk(4 << 20, 'J'); f << junk; }
+    const int decoyFd = ::open(decoy.c_str(), O_RDONLY);
+    ASSERT_EQ(decoyFd, dupFd) << "precondition: the fd number was reused";
+    fillTo(int64_t{3} << 19);   // ~1.5 MiB: past the 1 MiB map
+    (void)seg.swapReadMap(std::move(grown));
+    seg.setOwnerRemap(true);   // e.g. the async growth failed: the owner remaps
+    const auto v = seg.readView(0, 1 << 30);
+    ASSERT_FALSE(v.empty());
+    ASSERT_EQ(static_cast<int64_t>(v.len), seg.sizeBytes());
+    std::vector<uint8_t> disk(v.len);
+    ASSERT_EQ(::pread(seg.logFd(), disk.data(), disk.size(), 0), static_cast<ssize_t>(disk.size()));
+    EXPECT_EQ(std::memcmp(v.data, disk.data(), v.len), 0) << "the remap read another file";
+    ::close(decoyFd);
+    fs::remove_all(dir);
+}

@@ -3,9 +3,11 @@
 #include <rune/storage/OffsetIndex.h>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 #include <memory>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <utility>
 namespace rune::storage {
@@ -26,6 +28,10 @@ struct LogStorageState {
     int      failedErrno  = 0;
     int      faultForTest = 0;
     int      writeFaultForTest = 0;
+    /// writeFaultForTest value (D20 review L2): the NEXT page-cache append
+    /// (appendNoSync / appendNoSyncRestamp) writes only part of the batch in
+    /// its first syscall, then resumes like a real short write; resets to 0.
+    static constexpr int kShortWriteOnceForTest = -1;
     /// D20 review M1 test seam: when set, the durable append's pwrite retry loop
     /// (LogSegment::writeAll_) calls this instead of ::pwrite, so a test can force
     /// a short write / EINTR / hard errno.  Null in production (one predictable
@@ -50,6 +56,11 @@ struct LogStorageState {
 ///   gateway group-commit path: the caller MUST eventually call sync() before
 ///   acking any offset as fsync-durable.  acks=Leader/acks=1 semantics: a
 ///   leader crash before the next sync() may lose un-flushed acked records.
+class LogSegment;
+/// The owner's segment map (Log::SegMap).  Declared here so a provisioned
+/// segment can carry the map node it will be installed into (D19 L2).
+using LogSegmentMap = std::map<int64_t, std::unique_ptr<LogSegment>>;
+
 class LogSegment {
 public:
     /// @param indexMaxBytes  initial size of the mmap-backed .index.  Historically
@@ -166,10 +177,6 @@ public:
     void     pinFlush() noexcept { ++flushPins_; }
     uint32_t unpinFlush() noexcept { return flushPins_ > 0 ? --flushPins_ : 0; }
     [[nodiscard]] uint32_t flushPins() const noexcept { return flushPins_; }
-
-    /// Seal hook before the fd is handed to the io backend.  D20: writes are
-    /// unbuffered (pwrite), so there is nothing to push — always 0.
-    [[nodiscard]] int flushBufferedToPageCache() noexcept;
 
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes);
 
@@ -323,6 +330,12 @@ public:
     /// after adoption).  Only meaningful for a pre-provisioned segment.
     int64_t stagingSeq() const noexcept { return stagingSeq_; }
 
+    /// D19 L2: an empty map node built with the segment off the owner (the
+    /// provisioner); the owner installs the adopted segment into it instead of
+    /// allocating one (logs without retention never release a node to reuse).
+    void setSpareMapNode(LogSegmentMap::node_type nh) noexcept { spareMapNode_ = std::move(nh); }
+    [[nodiscard]] LogSegmentMap::node_type takeSpareMapNode() noexcept { return std::move(spareMapNode_); }
+
     /// Adopt a staging segment as the live segment at `base` (append thread only).
     /// PURE IN-MEMORY rebase — ZERO syscalls (no rename/open/mmap).  The staging
     /// files keep their temp names on disk; writes go through the already-open fd
@@ -375,6 +388,10 @@ private:
     /// D20: pwrite all of [data, data+len) at logSize_ through fd_ (EINTR /
     /// short-write retry).  0 or errno.
     int writeAll_(const uint8_t* data, std::size_t len) noexcept;
+    /// D20 review L2 (cold): finish a page-cache append whose first pwrite /
+    /// pwritev returned `first` (< total) — resume a short write / EINTR at
+    /// logSize_ + done like writeAll_.  0 or errno (ENOSPC for no progress).
+    int finishShortWrite_(const struct ::iovec* iov, int cnt, std::size_t total, ssize_t first) noexcept;
     [[noreturn]] void failWrite_(int err, const char* what);   ///< E1: sticky fail-stop + throw
 
     /// (Re)map the .log read-only to cover the currently-written logSize_ bytes so
@@ -409,6 +426,7 @@ private:
     bool staging_ = false;   // true until adoptAsActive() rebases a pre-provisioned segment
     bool pathPending_ = false;   // see pathPending()
     int64_t stagingSeq_ = -1; // pre-provision staging sequence (see stagingSeq())
+    LogSegmentMap::node_type spareMapNode_;   // see setSpareMapNode (empty when none)
 
     // Read-only mmap of the .log for zero-copy readView().  Created WITH the
     // segment (openReadMap; lazily only if that failed) with headroom past EOF,

@@ -1,6 +1,7 @@
 #pragma once
 #include <rune/storage/LogSegment.h>
 #include <rune/consensus/ControlRing.h>
+#include <rune/storage/ProvisionChannel.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -332,6 +333,10 @@ public:
     /// after a truncation are never treated as already flushed.  Owner-thread
     /// only (the thread that appends / truncates); no allocation.
     static constexpr int64_t kNoTruncation = INT64_MAX;
+    /// Largest accepted segment roll size: segment positions are 32-bit, and a
+    /// deferred roll may overshoot rollBytes by one maximal batch (64 MiB
+    /// headroom).  NodeConfig refuses a larger segmentRollBytes (D19 L1).
+    static constexpr int64_t kMaxRollBytes = int64_t{INT32_MAX} - (int64_t{64} << 20);
     [[nodiscard]] int64_t takeTruncationLowWater() noexcept {
         const int64_t v = truncationLowWater_;
         truncationLowWater_ = kNoTruncation;
@@ -809,7 +814,7 @@ public:
     //
     // Demand-driven (review M3): a PROVISIONED log reserves nothing while its
     // active segment is below the fill threshold; the owner posts a Threshold
-    // demand (ProvisionHook) when the active segment crosses it, and an Adopted
+    // demand (ProvisionChannel) when the active segment crosses it, and an Adopted
     // demand after every adoption (the provisioner then finalizes the rename).
     // A provisioned log never creates a segment on the owner while the
     // provisioner can still deliver: with no ready segment the roll is deferred
@@ -829,26 +834,18 @@ public:
     /// not keep; counted as the roll-hold metric).  Served like Threshold.
     enum class ProvisionDemand : int64_t { Threshold = 1, Adopted = 2, Hold = 3 };
     static constexpr uint32_t kHoldRepostChecks = 1024;
-    /// Demand signal (owner thread → provisioner).  A plain function pointer +
-    /// context (no virtual call).  Returns false when the demand could not be
-    /// queued (full ring): the owner re-posts it later (never lost).
-    struct ProvisionHook {
-        bool (*fn)(void* ctx, Log* log, ProvisionDemand kind) noexcept = nullptr;
-        void* ctx = nullptr;
-        /// Review Md5 (optional): build a `mib` MiB read mapping of `fd` (a dup
-        /// the callee owns) off the owner and hand it back (offerReadMap).
-        bool (*growFn)(void* ctx, Log* log, int64_t packedRequest) noexcept = nullptr;
-        /// Review Md5 (optional): destroy a retired read mapping off the owner.
-        bool (*disposeFn)(void* ctx, void* map) noexcept = nullptr;
-    };
     /// Owner (before the log is driven): this log is served by a provisioning
     /// thread.  `thresholdPct` (1..100): fill level of the active segment at
     /// which the next segment is demanded.  Legacy (never called): an empty
     /// pool falls back to the inline create (control-thread logs, tests).
-    void setProvisioning(ProvisionHook hook, int thresholdPct = 50) noexcept {
+    /// Demands, read-map growth requests and retired read maps go to `channel`
+    /// (D19 L3: a concrete channel — a direct call on the roll path, never an
+    /// indirect one).  A full channel returns false: the owner re-posts later
+    /// (never lost).  nullptr: provisioned, but no demand is ever posted (tests).
+    void setProvisioning(ProvisionChannel* channel, int thresholdPct = 50) noexcept {
         provisioned_ = true;
-        provisionHook_ = hook;
-        asyncReadGrowth_ = hook.growFn != nullptr && hook.disposeFn != nullptr;
+        provisionChannel_ = channel;
+        asyncReadGrowth_ = channel != nullptr && channel->servesReadMaps();
 
         const int pct = thresholdPct < 1 ? 1 : (thresholdPct > 100 ? 100 : thresholdPct);
         provisionThresholdBytes_ = rollBytes_ / 100 * pct + (rollBytes_ % 100) * pct / 100;
@@ -866,10 +863,12 @@ public:
     void reportProvisionFailure(int err) noexcept;
     /// Provisioning thread: ready segments queued and not yet taken by the
     /// owner (approximate while the owner runs; an estimate for depth / cap
-    /// accounting only).
+    /// accounting only).  FAILURE records still queued are not counted (D19
+    /// N6b: a queued failure must not stand in for a ready segment).
     [[nodiscard]] std::size_t readyQueuedApprox() const noexcept {
-        const std::int64_t b = readyRing_.pendingBytes();
-        return b <= 0 ? 0 : static_cast<std::size_t>(b) / ReadyRing::kRecordBytes;
+        const std::size_t all = readyRecordsQueued_();
+        const std::size_t fails = queuedFailures_();
+        return all > fails ? all - fails : 0;
     }
     /// Legacy single-slot form (the cleaner-driven provisioning): provisionReady(1).
     int preprovisionPending() { return provisionReady(1); }
@@ -878,11 +877,13 @@ public:
     [[nodiscard]] bool readyAvailable() noexcept { pullReady_(); return readyFront_ != nullptr; }
     /// Owner (tests): ready segments pooled (front slot + queued).
     [[nodiscard]] std::size_t readyCountForTest() const noexcept {
-        return (readyFront_ != nullptr ? 1 : 0) + readyQueuedApprox();
+        return (readyFront_ != nullptr ? 1 : 0) + readyRecordsQueued_();
     }
     /// Owner (tests / observability): provisioning failures seen and the rolls
     /// they forced inline.
     [[nodiscard]] uint64_t provisionFailuresForTest() const noexcept { return provisionFailures_; }
+    /// Provisioning thread: built segments dropped for a full ready ring (D19 N6d).
+    [[nodiscard]] uint64_t readyDropsForTest() const noexcept { return readyDrops_; }
     [[nodiscard]] uint64_t failureInlineRollsForTest() const noexcept { return failureInlineRolls_; }
     /// Test seam (re-review N1): called inside beginColdPath_ between its
     /// rename-ring read and its done-ring drain — a test plays the provisioner
@@ -989,7 +990,7 @@ private:
     std::vector<std::unique_ptr<LogSegment>> retiredSegments_;
     bool reloadAllocFaultForTest_ = false;   // F3 r7: test-only (cold path)
     uint32_t ownerTag_ = UINT32_MAX;
-    using SegMap = std::map<int64_t, std::unique_ptr<LogSegment>>;
+    using SegMap = LogSegmentMap;
     /// Wire `seg` into this log (storage state) and store it at `base`, retiring
     /// any pinned segment it replaces.
     void install_(int64_t base, std::unique_ptr<LogSegment> seg);
@@ -1072,7 +1073,6 @@ private:
     /// Persist min(R, bound) inline when the on-disk value (or an in-progress
     /// checkpoint's) exceeds `bound` (F6: before a truncation deletes data).
     void persistAtMost_(int64_t bound) noexcept;
-    int  checkpointRecoveryPoint_(bool publishSnapshot) noexcept;
     /// Create the pre-allocated two-slot file holding `r` (tmp + fsync + rename
     /// + full dir fsync), open rpFd_.  Cold (first recovery).
     int  createRecoveryPointFile_(int64_t r) noexcept;
@@ -1306,9 +1306,12 @@ private:
     int32_t indexMaxBytes_;
 
     /// Temp-name prefix for pre-provisioned staging segment files.  Files named
-    /// <dir>/<kStagingPrefix><seq>.log / .index.  Swept at Log construction if
-    /// left over from a crash (they hold no acked data — a crash before the roll
-    /// means the segment was never activated).
+    /// <dir>/<kStagingPrefix><seq>.stlog / .stidx.  Reconciled at Log
+    /// construction (recoverStagingFiles): an empty one is deleted; an adopted
+    /// one is renamed to its base when that base fits the segment chain (D19
+    /// N5a), else quarantined as .stlog.corrupt — kept for the operator and
+    /// NEVER reclaimed automatically (N5b: both candidates' last offsets are
+    /// logged for a duplicate base).
     static constexpr const char* kStagingPrefix = ".staging-";
     /// Monotonic counter so successive staging files get distinct names (avoids
     /// reusing a name whose fd/mmap the append thread may still hold post-adopt).
@@ -1318,12 +1321,30 @@ private:
     /// hotpath-A F2: the ready pool (see kMaxProvisionDepth).  Records:
     /// kReadyMsg {a = LogSegment* (owning)} and kFailedMsg {a = errno}.
     using ReadyRing = rune::consensus::ControlRing<512>;
+    /// Records (ready or failure) queued on the ready ring (any thread, approximate).
+    [[nodiscard]] std::size_t readyRecordsQueued_() const noexcept {
+        const std::int64_t b = readyRing_.pendingBytes();
+        return b <= 0 ? 0 : static_cast<std::size_t>(b) / ReadyRing::kRecordBytes;
+    }
+    /// Provisioning thread (D19 N6b): end positions of the last failure
+    /// records offered (0 = none); one still queued has end > consumerPosition.
+    static constexpr std::size_t kFailMarks = 32;   // >= the ring's record capacity
+    static_assert(kFailMarks * ReadyRing::kRecordBytes >= 512, "a mark per ready-ring record");
+    std::array<std::int64_t, kFailMarks> failMarkEnd_{};
+    std::size_t failMarkNext_ = 0;
+    uint64_t    readyDrops_ = 0;   ///< provisioning thread (D19 N6d)
+    [[nodiscard]] std::size_t queuedFailures_() const noexcept {
+        const std::int64_t consumed = readyRing_.consumerPosition();
+        std::size_t n = 0;
+        for (const std::int64_t e : failMarkEnd_) n += e > consumed ? 1 : 0;
+        return n;
+    }
     static constexpr std::int32_t kReadyMsg = 1, kFailedMsg = 2;
     ReadyRing   readyRing_;
     LogSegment* readyFront_ = nullptr;     ///< owner: next ready segment (taken off the ring)
     int         failFront_  = 0;           ///< owner: a pulled failure not yet acted on (errno)
     bool          provisioned_ = false;   ///< see setProvisioning (owner config)
-    ProvisionHook provisionHook_{};
+    ProvisionChannel* provisionChannel_ = nullptr;
     int64_t       provisionThresholdBytes_ = 0;   ///< owner: Threshold demand point
     bool          thresholdPosted_ = false;       ///< owner: Threshold demand queued for this segment
     void (*coldSeamFn_)(void*) = nullptr;         ///< see setColdPathInterleaveForTest
@@ -1334,15 +1355,19 @@ private:
     int           provisionFaultErr_ = 0, provisionFaultN_ = 0;   ///< provisioner (tests)
     /// Owner: pull the next ready record into the front slot (no-op when one is there).
     void pullReady_() noexcept;
+    /// Owner: post one demand (false = channel full, re-post later).
+    bool postDemand_(ProvisionDemand kind) noexcept {
+        return provisionChannel_->post(ProvisionChannel::kDemandMsgType,
+                                       static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(this)),
+                                       static_cast<int64_t>(kind));
+    }
     /// Owner: queue the demands that are due (threshold crossed / adoption).
     void postProvisionDemands_(int64_t activeBytes) noexcept;
     /// Owner: a blocked check (no ready segment): post the Hold demand at the
     /// first check of an episode and every kHoldRepostChecks checks after.
     void noteHoldCheck_() noexcept {
         if ((holdChecks_++ % kHoldRepostChecks) == 0 || holdPostPending_) {
-            holdPostPending_ = provisionHook_.fn == nullptr ||
-                               !provisionHook_.fn(provisionHook_.ctx, this, ProvisionDemand::Hold);
-            if (provisionHook_.fn == nullptr) holdPostPending_ = false;
+            holdPostPending_ = provisionChannel_ != nullptr && !postDemand_(ProvisionDemand::Hold);
         }
     }
     uint32_t holdChecks_ = 0;        ///< owner: blocked checks in the current hold episode
@@ -1356,12 +1381,16 @@ private:
         // Review L1: never past the 32-bit segment position limit (minus room
         // for one maximal batch).
         const int64_t cap = rollBytes_ + std::clamp<int64_t>(rollBytes_, int64_t{1} << 20, int64_t{256} << 20);
-        return std::min<int64_t>(cap, int64_t{INT32_MAX} - (int64_t{64} << 20));
+        return std::min<int64_t>(cap, kMaxRollBytes);
     }
 
-    /// Owner: the staging-rename request ring has a free slot.
+    /// Owner: room for one more rename IN FLIGHT — queued requests plus
+    /// completions not yet drained (D19 N6c: reqTail - doneHead, both
+    /// owner-written; every consumed request publishes exactly one completion,
+    /// so finalizeStagingRenames always finds room on the done ring and never
+    /// strands a request no one re-drives).
     [[nodiscard]] bool renameRoom_() const noexcept {
-        return renameReqTail_.load(std::memory_order_relaxed) - renameReqHead_.load(std::memory_order_acquire) <
+        return renameReqTail_.load(std::memory_order_relaxed) - renameDoneHead_.load(std::memory_order_relaxed) <
                kRenameRingCapacity;
     }
     /// Owner: take the oldest ready segment (nullptr = none).

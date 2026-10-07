@@ -500,7 +500,7 @@ public:
         auto r = std::make_unique<PartitionReplica>(c, Role::Leader, 1, std::vector<int32_t>{1},
                                                     std::vector<int32_t>{1}, p->log.get(), &transport_);
         r->setExternalFollowerFlush(true);          // BrokerNode::applyWorkerDrivenDurability
-        p->log->setProvisioning(provisioner_.hook(),
+        p->log->setProvisioning(provisioner_.channel(),
                                 rune::node::NodeConfig{}.segmentProvisionThresholdPct);   // ... + hotpath-A F2 / M3
         if (s.controllerManaged) {
             r->setLeaderEpochFenceFile((d / "leader-epoch-fence").string());

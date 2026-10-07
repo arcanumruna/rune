@@ -443,6 +443,9 @@ public:
     /// Test-only: during start(), re-run one user log's recovery with this msync
     /// errno injected (exercises the refuse-to-start path).
     void setRecoveryFaultForTest(int err) noexcept { recoveryFaultForTest_ = err; }
+    /// Test-only (D19 L8): build the provisioner but not its runner thread —
+    /// start() must refuse (every provisioned roll would wait forever).
+    void skipProvisionerRunnerForTest() noexcept { skipProvisionerRunnerForTest_ = true; }
     /// Test-only: during start(), re-run the SCHEMA log's recovery with this msync errno.
     void setSchemaRecoveryFaultForTest(int err) noexcept { schemaRecoveryFaultForTest_ = err; }
 
@@ -989,6 +992,7 @@ private:
     void refuseStartOnFailedRecovery_();
     void onInvariantViolation_(const std::string& what);
     int  recoveryFaultForTest_ = 0;
+    bool skipProvisionerRunnerForTest_ = false;
     int  schemaRecoveryFaultForTest_ = 0;
     int32_t                                      shardResolveStallWorkerForTest_ = -1;
     std::chrono::milliseconds                    shardResolveStallForTest_{0};
@@ -1043,8 +1047,8 @@ private:
     std::array<std::int64_t, SegmentProvisionerAgent::kMetricCount>                    provCounterRegIds_{-1, -1, -1, -1, -1};
     std::array<std::shared_ptr<aeron::Counter>, SegmentProvisionerAgent::kMetricCount> provCounters_{};
     static void publishProvisionMetric_(void* self, int metric, std::int64_t value) noexcept;
-    [[nodiscard]] rune::storage::Log::ProvisionHook provisionHook_() noexcept {
-        return provisionerAgent_ ? provisionerAgent_->hook() : rune::storage::Log::ProvisionHook{};
+    [[nodiscard]] rune::storage::ProvisionChannel* provisionChannel_() noexcept {
+        return provisionerAgent_ ? provisionerAgent_->channel() : nullptr;
     }
 
     // -----------------------------------------------------------------------

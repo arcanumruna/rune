@@ -151,7 +151,12 @@ PartitionReplica::PartitionReplica(PartitionConfig            cfg,
 
 // Defined here (not defaulted in the header) so the unique_ptr<RecordBatchBuilder>
 // member destroys a COMPLETE type — RecordBatch.h is included in this TU.
-PartitionReplica::~PartitionReplica() = default;
+PartitionReplica::~PartitionReplica()
+{
+    // The leader-epoch-state fd (open while a write is due / in flight).  Safe
+    // even with an fsync in flight: the worker fsyncs a dup its route owns.
+    if (es_.fd >= 0) ::close(es_.fd);
+}
 
 // Shared construction logic for both backend overloads (de-virtualized seam).
 void PartitionReplica::initReplica(std::vector<NodeId> replicas,
@@ -202,6 +207,14 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
         }
         const rune::storage::LeaderEpochCache before = epochCache_;   // cold copy
         const Epoch stateFence = es.state == ES::FileState::Valid ? static_cast<Epoch>(es.fence) : Epoch{-1};
+        // D21 L2: no valid slot (or the durable "unknown" marker) — the fence is unknown.
+        if (es.state == ES::FileState::Corrupt ||
+            (es.state == ES::FileState::Valid && static_cast<Epoch>(es.fence) == kFenceUnknown)) {
+            fenceUnknown_ = true;
+            spdlog::error("PartitionReplica[topic={} part={}]: {} has no valid slot — the restart fence is "
+                          "unknown: the first leadership is refused", cfg_.topicId, cfg_.partitionId,
+                          ES::path(diskLog_->dir()));
+        }
         // Fix round 1 (MEDIUM-5): a missing / corrupt checkpoint over a non-empty
         // recovered log is REBUILT from the batches' stamped epochs (never left
         // silently empty — an empty cache answers every validation as divergent).
@@ -286,6 +299,15 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
             pendingLead_.partitionEpoch = partitionEpoch;
             return;
         }
+        // D21 review L4: an OLDER epoch than the pending leadership's is a stale
+        // record (the controller commits leader epochs monotonically) — refused
+        // explicitly: never cancel the newer leadership to lead at the older one.
+        if (newEpoch < pendingLead_.epoch) {
+            spdlog::warn("PartitionReplica[topic={} part={}]: becomeLeader at epoch {} below the pending "
+                         "leadership's epoch {} — stale, ignored", cfg_.topicId, cfg_.partitionId, newEpoch,
+                         pendingLead_.epoch);
+            return;
+        }
         cancelPendingLeadership_();
     }
     // Fix round 5: a role change abandons a deferred divergence truncation
@@ -323,7 +345,7 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
         // is refused and every epoch the controller grants after it is new
         // (it commits leader epochs monotonically).  A failed fence write:
         // refused too (fail closed) — the bump fails over or re-grants.
-        const bool noFence = fenceFile_.empty() && !fenceEstablished_;
+        const bool noFence = (fenceFile_.empty() && !fenceEstablished_) || fenceUnknown_;
         // Hot-path B F7: worker-driven — the fence write goes through the
         // owning worker's io backend; lead once it completed (event-driven).
         if (!logDirOffline_ && !noFence && !fenceFile_.empty() && newEpoch > fencePersisted_ &&
@@ -336,6 +358,16 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
             if (!noFence && !fenceFile_.empty()) logDirOffline_ = true;
             if (newEpoch > restartFenceEpoch_) restartFenceEpoch_ = newEpoch;
             fenceEstablished_ = true;
+            if (fenceUnknown_) {
+                // D21 L2: the refused epoch becomes the durable fence (it clears
+                // the "unknown" marker once written): every later grant is new.
+                fenceUnknown_ = false;
+                if (newEpoch > es_.fenceTarget) es_.fenceTarget = newEpoch;
+                if (es_.enabled) {
+                    es_.due = true;
+                    if (!externalFollowerFlush_) (void)writeEpochStateInline_();   // control thread: inline
+                }
+            }
             refuseStaleLeadership_(newEpoch, partitionEpoch);
             return;
         }
@@ -1708,13 +1740,15 @@ std::size_t PartitionReplica::encodeEpochImage_(uint8_t* buf, uint64_t seq, Epoc
     });
 }
 
-bool PartitionReplica::openEpochStateFd_() noexcept
+int PartitionReplica::openEpochStateFd_() noexcept
 {
-    if (es_.fd >= 0) return true;
+    // 0 or the open's errno (D21 re-review low: returned, never re-read from a
+    // possibly clobbered errno by the caller).
+    if (es_.fd >= 0) return 0;
     const int fd = rune::storage::LeaderEpochState::openExisting(esDir_);
-    if (fd < 0) return false;
+    if (fd < 0) return -fd;
     es_.fd = fd;
-    return true;
+    return 0;
 }
 
 void PartitionReplica::closeEpochStateFdIfIdle_() noexcept
@@ -1760,7 +1794,7 @@ void PartitionReplica::enableEpochState_() noexcept
             const std::size_t stride = ES::strideFor(std::max<std::size_t>(ES::kMinEntries, 2 * n + 2));
             const uint64_t seq = st.seq + 1;
             const auto& m = epochCache_.map();
-            const int fd = ES::create(dir, stride, seq, std::max(fencePersisted_, es_.fenceTarget), m.begin(), m.end());
+            const int fd = ES::create(dir, stride, seq, imageFence_(), m.begin(), m.end());
             if (fd < 0) {
                 spdlog::error("PartitionReplica[topic={} part={}]: creating {} failed (errno={}) — "
                               "leader-epoch durability stays synchronous",
@@ -1801,7 +1835,7 @@ bool PartitionReplica::writeEpochStateInline_() noexcept
         return false;
     }
     try {
-        const Epoch fence = std::max(fencePersisted_, es_.fenceTarget);
+        const Epoch fence = imageFence_();
         const std::size_t entries = epochImageEntries_();
         if (ES::capacityOf(es_.stride) < entries) {
             // Outgrew the slot: re-create larger (tmp + fsync + rename + dir fsync).
@@ -1821,7 +1855,7 @@ bool PartitionReplica::writeEpochStateInline_() noexcept
             es_.stride = stride;
             es_.activeSlot = 0;
         } else {
-            if (!openEpochStateFd_()) { ++es_.errors; return false; }
+            if (openEpochStateFd_() != 0) { ++es_.errors; return false; }
             if (inlineFailN_ > 0) [[unlikely]] { --inlineFailN_; ++es_.errors; return false; }
             const int target = es_.activeSlot < 0 ? 0 : 1 - es_.activeSlot;
             std::vector<uint8_t> img(ES::imageBytes(entries));
@@ -1865,25 +1899,26 @@ bool PartitionReplica::prepareEpochStateWrite(uint8_t* buf, std::size_t cap, Epo
     if (!epochStateWriteDue()) return false;
     const std::size_t entries = epochImageEntries_();
     if (ES::capacityOf(es_.stride) < entries) [[unlikely]] {
-        // Cold, counted (review L1, backlog): the history outgrew the slot —
-        // re-created larger, once per doubling of the epoch history.
+        // Cold, counted: the history outgrew the slot — re-created larger,
+        // once per doubling.  D21 L1: slots are pre-sized for kMinEntries
+        // (4096) epochs, so this needs thousands of RETAINED epochs.
         if (writeEpochStateInline_()) completePendingLeadershipIfDurable_();
         return false;
     }
     need = ES::imageBytes(entries);
     if (cap < need) return false;
-    if (!openEpochStateFd_()) {
+    if (const int openErr = openEpochStateFd_(); openErr != 0) {
         es_.stage = EsStage::InFlight;              // fail through the regular failure path
         es_.inflightSeq = ++es_.seq;
         es_.inflightMin = es_.pendingMin;
         es_.pendingMin = INT64_MAX;
         es_.due = false;
-        (void)epochStateWriteCompleted(es_.inflightSeq, errno != 0 ? errno : EIO);
+        (void)epochStateWriteCompleted(es_.inflightSeq, openErr);
         return false;
     }
     const int slot = es_.activeSlot < 0 ? 0 : 1 - es_.activeSlot;
     const uint64_t seq = ++es_.seq;
-    const Epoch fence = std::max(fencePersisted_, es_.fenceTarget);
+    const Epoch fence = imageFence_();
     const std::size_t len = encodeEpochImage_(buf, seq, fence);
     es_.stage = EsStage::Prepared;
     es_.inflightSlot = slot;
@@ -2097,6 +2132,10 @@ void PartitionReplica::reconcileEpochCacheWithLog_()
         const std::vector<uint8_t> b = diskLog_->read(o, 1);
         if (b.size() < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) return INT32_MIN;
         rune::protocol::RecordBatchReader r(b.data(), b.size());
+        // D21 re-review low: over a compaction gap read(o) returns a LATER
+        // batch — it says nothing about o's epoch (no evidence, never "stale").
+        // (A batch stamped -1 carries no epoch either: skipped by the callers.)
+        if (r.baseOffset() > o) return INT32_MIN;
         return r.partitionLeaderEpoch();
     };
     // The recovery point recovery STARTED from (not the one it persisted
@@ -2122,6 +2161,7 @@ void PartitionReplica::reconcileEpochCacheWithLog_()
         if (stale) {
             spdlog::warn("PartitionReplica[topic={} part={}]: durable epoch history disagrees with the log's "
                          "stamps — rebuilt from the log", cfg_.topicId, cfg_.partitionId);
+            ++epochHistoryRebuilds_;
             epochCache_.truncateFromEnd(INT64_MIN);
             from = start;
         }

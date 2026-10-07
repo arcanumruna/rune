@@ -57,7 +57,7 @@ MappedFile::MappedFile(std::string path, size_t initialBytes, bool writable, boo
     }
 }
 MappedFile::MappedFile(BorrowedFd borrowedFd, std::string path, size_t initialBytes)
-    : path_(std::move(path)), size_(initialBytes), writable_(false), borrowedFd_(borrowedFd.fd) {
+    : path_(std::move(path)), size_(initialBytes), writable_(false), borrowedFd_(borrowedFd.fd), borrowed_(true) {
     if (borrowedFd_ < 0) throw std::runtime_error("MappedFile: invalid borrowed fd for " + path_);
     struct stat st{};
     if (::fstat(borrowedFd_, &st) == 0 && st.st_size > 0 && static_cast<size_t>(st.st_size) > size_)
@@ -83,8 +83,10 @@ void MappedFile::resize(size_t newBytes) {
                 throw std::runtime_error("ftruncate failed: " + path_);
             size_ = newBytes;
             mapNow();
-        } else if (borrowedFd_ >= 0) {
+        } else if (borrowed_) {
             // D3b r2: remap through the borrowed fd (the file's inode) — never by path.
+            // D20 review L5: an unbound one (retired) fails rather than guess.
+            if (borrowedFd_ < 0) throw std::runtime_error("MappedFile: resize of an unbound borrowed mapping " + path_);
             fd_ = borrowedFd_;
             size_ = newBytes;
             try { mapNow(); } catch (...) { fd_ = -1; throw; }

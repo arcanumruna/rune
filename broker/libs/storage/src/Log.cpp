@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <new>
+#include <charconv>
 #include <fstream>
 #include <spdlog/spdlog.h>
 #include <cerrno>
@@ -294,16 +295,13 @@ void Log::maybeRoll() {
     }
     // B1 fix (fsync-on-seal): the sealed segment is made durable exactly once.
     if (deferSealSync_ && pendingSealCount_ < kMaxPendingSeals) {
-        // Shard mode (spec §3.1): no inline fsync on the loop.  Push the
-        // buffered bytes to the page cache, pin the sealed segment (its fd
-        // must outlive the async flush — M1) and queue it (room checked above);
-        // the owning worker fdatasyncs it through its io backend, and Strict
-        // acks on this log wait until every pending seal has completed.
+        // Shard mode (spec §3.1): no inline fsync on the loop.  Pin the
+        // sealed segment (its fd must outlive the async flush — M1) and queue
+        // it (room checked above); the owning worker fdatasyncs it through its
+        // io backend, and Strict acks on this log wait until every pending
+        // seal has completed.  (D20: writes are unbuffered pwrites — nothing
+        // to push to the page cache first.)
         LogSegment& sealed = activeSegment();
-        if (const int e = sealed.flushBufferedToPageCache(); e != 0) {
-            markStorageFailed(e);
-            throw std::system_error(e, std::generic_category(), "Log seal flush " + dir_);
-        }
         sealed.pinFlush();
         pendingSeals_[pendingSealCount_++] = &sealed;
     } else {
@@ -587,6 +585,14 @@ int Log::provisionReady(std::size_t depth, bool preallocate) {
         // Re-review N3: over the node-wide reservation cap the segment is still
         // built off the owner — only the block reservation is shed.
         if (preallocate) seg->preallocate(rollBytes_);
+        // D19 L2: the map node the owner will install this segment into, built
+        // here (an allocation the owner no longer makes per roll).  Best effort:
+        // without one the owner falls back to its spare pool / an emplace.
+        try {
+            SegMap tmp;
+            tmp.emplace(int64_t{0}, nullptr);
+            seg->setSpareMapNode(tmp.extract(tmp.begin()));
+        } catch (...) {}
         LogSegment* raw = seg.release();
         // Publish: the ring's commit hands the fully built segment (files, maps,
         // blocks) to the owner's poll in pullReady_().
@@ -596,7 +602,12 @@ int Log::provisionReady(std::size_t depth, bool preallocate) {
             std::error_code ec;
             std::filesystem::remove(stagingLogPathFor(s2), ec);
             std::filesystem::remove(stagingIndexPathFor(s2), ec);
-            break;
+            // D19 N6d: never silent — counted, logged (rate-limited) and
+            // reported as a failed build.  The queued records each end an
+            // owner hold, so no demand is left without an answer.
+            if ((++readyDrops_ & (readyDrops_ - 1)) == 0)
+                spdlog::warn("Log {}: ready ring full — a built segment was discarded (drops={})", dir_, readyDrops_);
+            return built > 0 ? built : -ENOBUFS;
         }
         ++built;
     }
@@ -606,7 +617,10 @@ int Log::provisionReady(std::size_t depth, bool preallocate) {
 void Log::reportProvisionFailure(int err) noexcept {
     // Provisioning thread.  A full ring already holds records the owner will
     // pull first (each ends a hold), so a dropped failure record loses nothing.
-    (void)readyRing_.offer(kFailedMsg, err != 0 ? err : EIO, 0);
+    if (readyRing_.offer(kFailedMsg, err != 0 ? err : EIO, 0)) {
+        // D19 N6b: remember where it ends (this thread is the one producer).
+        failMarkEnd_[failMarkNext_++ % kFailMarks] = readyRing_.producerPosition();
+    }
 }
 
 void Log::pullReady_() noexcept {
@@ -629,12 +643,10 @@ void Log::pullReady_() noexcept {
 void Log::postProvisionDemands_(int64_t activeBytes) noexcept {
     // OWNER.  Cold: at most a few times per segment (a failed offer is retried
     // at the next append / hold check — a demand is never lost).
-    if (provisionHook_.fn == nullptr) return;
-    if (adoptedPostPending_ &&
-        provisionHook_.fn(provisionHook_.ctx, this, ProvisionDemand::Adopted))
+    if (provisionChannel_ == nullptr) return;
+    if (adoptedPostPending_ && postDemand_(ProvisionDemand::Adopted))
         adoptedPostPending_ = false;
-    if (!thresholdPosted_ && activeBytes >= provisionThresholdBytes_ &&
-        provisionHook_.fn(provisionHook_.ctx, this, ProvisionDemand::Threshold))
+    if (!thresholdPosted_ && activeBytes >= provisionThresholdBytes_ && postDemand_(ProvisionDemand::Threshold))
         thresholdPosted_ = true;
 }
 
@@ -651,13 +663,27 @@ void Log::installNextSegment(int64_t base) {
     // roll past the overshoot cap with a full ring creates inline instead).
     // Review M1: a pulled provisioning FAILURE makes this roll inline (below).
     pullReady_();
-    const bool failureRoll = provisioned_ && readyFront_ == nullptr && failFront_ != 0;
-    if (failureRoll) { failFront_ = 0; ++failureInlineRolls_; }
+    // D19 N6b: a failure followed by a ready segment is stale (a later build
+    // succeeded) — skip it and adopt; only a failure with nothing behind it
+    // forces the inline roll.
+    bool failureRoll = false;
+    while (provisioned_ && readyFront_ == nullptr && failFront_ != 0) {
+        failFront_ = 0;
+        failureRoll = true;
+        pullReady_();
+    }
+    if (readyFront_ != nullptr) failureRoll = false;
+    if (failureRoll) ++failureInlineRolls_;
     if (LogSegment* prepared = (!provisioned_ || renameRoom_()) && !failureRoll ? takeReady_() : nullptr) {
         // ADOPT — ZERO syscalls: pure in-memory rebase.  The staging .log/.index
         // keep their temp names on disk for now; the disk rename (staging →
         // <base>.{log,index}) is deferred to the background thread.
         std::unique_ptr<LogSegment> seg(prepared);
+        // D19 L2: keep the node the provisioner built (only while the spare
+        // pool has room — the pool never reallocates; an untaken node is
+        // freed with its segment, off the roll).
+        if (spareSegNodes_.size() < spareSegNodes_.capacity())
+            if (SegMap::node_type nh = seg->takeSpareMapNode(); !nh.empty()) spareSegNodes_.push_back(std::move(nh));
         const int64_t stagingSeq = seg->stagingSeq();
         seg->adoptAsActive(base);            // in-memory only
         install_(base, std::move(seg));
@@ -740,8 +766,7 @@ bool Log::enqueueStagingRename(int64_t base, int64_t seq) noexcept {
     // small ring never fills in practice; a full ring returns false and the
     // caller renames synchronously (still correct).
     const std::size_t tail = renameReqTail_.load(std::memory_order_relaxed);
-    const std::size_t head = renameReqHead_.load(std::memory_order_acquire);
-    if (tail - head >= kRenameRingCapacity) return false;
+    if (!renameRoom_()) return false;   // D19 N6c: bounded with the done ring
     renameReqRing_[tail & kRenameRingMask] = {base, seq};
     renameReqTail_.store(tail + 1, std::memory_order_release);
     return true;
@@ -759,7 +784,9 @@ int Log::finalizeStagingRenames() {
         // hotpath-A: a request is consumed only when its completion can be
         // published — a dropped completion would leave the owner's logPath_ at
         // the staging name for good (and a cold path re-opening it by that
-        // path would fail the log).  A full done ring: retried next call.
+        // path would fail the log).  Unreachable since D19 N6c: the owner
+        // enqueues only while requests + undrained completions < capacity
+        // (renameRoom_), so the done ring always has room here; kept as a guard.
         const std::size_t dt = renameDoneTail_.load(std::memory_order_relaxed);
         const std::size_t dh = renameDoneHead_.load(std::memory_order_acquire);
         if (dt - dh >= kRenameRingCapacity) break;
@@ -802,49 +829,126 @@ void Log::recoverStagingFiles() {
     //   - orphan staging.index with no matching staging.log → delete.
     std::error_code ec;
     std::vector<std::filesystem::path> stagingLogs, stagingIdx;
+    // D19 N5a: the canonical segment bases — a recovered base must fit the
+    // chain between them (an inline roll can create a canonical successor
+    // while an adopted segment's rename is still queued).
+    std::vector<int64_t> canonical;
     for (auto& e : std::filesystem::directory_iterator(dir_, ec)) {
         const std::string fn = e.path().filename().string();
-        if (fn.rfind(kStagingPrefix, 0) != 0) continue;
+        if (fn.rfind(kStagingPrefix, 0) != 0) {
+            if (e.path().extension() == ".log") {
+                const std::string stem = e.path().stem().string();
+                int64_t b = -1;
+                const auto [ptr, perr] = std::from_chars(stem.data(), stem.data() + stem.size(), b);
+                if (perr == std::errc() && ptr == stem.data() + stem.size()) canonical.push_back(b);
+            }
+            continue;
+        }
         if (e.path().extension() == ".stlog")      stagingLogs.push_back(e.path());
         else if (e.path().extension() == ".stidx") stagingIdx.push_back(e.path());
     }
+    // Read one whole batch at `pos` (nullopt-style: empty = absent / torn / CRC-invalid).
+    auto readBatch = [](std::ifstream& f, int64_t pos, int64_t fileSize) -> std::vector<uint8_t> {
+        constexpr int64_t kOv = rune::protocol::batch::kRecordBatchOverhead;
+        if (fileSize - pos < kOv) return {};
+        std::vector<uint8_t> hdr(static_cast<std::size_t>(kOv));
+        f.clear();
+        f.seekg(pos);
+        if (!f.read(reinterpret_cast<char*>(hdr.data()), kOv)) return {};
+        const int32_t total = rune::protocol::RecordBatchReader(hdr.data(), hdr.size()).totalLength();
+        if (total < kOv || total > fileSize - pos) return {};
+        std::vector<uint8_t> b(static_cast<std::size_t>(total));
+        f.seekg(pos);
+        if (!f.read(reinterpret_cast<char*>(b.data()), total)) return {};
+        if (!rune::protocol::RecordBatchReader(b.data(), b.size()).ensureValid()) return {};
+        return b;
+    };
+    // D19 N5b: the last offset of a file's valid batch prefix (-1 = none) —
+    // logged for both candidates of a duplicate base (crash recovery only).
+    auto lastOffsetOf = [&](const std::filesystem::path& p) -> int64_t {
+        std::ifstream g(p, std::ios::binary);
+        if (!g.is_open()) return -1;
+        g.seekg(0, std::ios::end);
+        const int64_t size = g.tellg();
+        int64_t pos = 0, last = -1;
+        for (;;) {
+            const auto b = readBatch(g, pos, size);
+            if (b.empty()) break;
+            rune::protocol::RecordBatchReader br(b.data(), b.size());
+            last = br.baseOffset() + br.lastOffsetDelta();
+            pos += static_cast<int64_t>(b.size());
+        }
+        return last;
+    };
+    struct Recovered { std::filesystem::path path; int64_t base; };
+    std::vector<Recovered> found;
+    auto quarantine = [&](const std::filesystem::path& lp, const std::string& why) {
+        // Kept (renamed .stlog.corrupt), never parsed into the log and never
+        // reclaimed automatically — the operator decides (D19 N5b).
+        spdlog::error("Log {}: staging file {} {} — quarantined as .corrupt (never parsed / overwritten)",
+                      dir_, lp.string(), why);
+        std::filesystem::rename(lp, lp.string() + ".corrupt", ec);
+    };
     for (const auto& lp : stagingLogs) {
         std::ifstream f(lp, std::ios::binary);
         int64_t fileSize = 0;
         if (f.is_open()) { f.seekg(0, std::ios::end); fileSize = f.tellg(); f.seekg(0, std::ios::beg); }
-        if (fileSize >= static_cast<int64_t>(rune::protocol::batch::kRecordBatchOverhead)) {
-            // Read the first batch header to recover the true base offset.
-            std::vector<uint8_t> hdr(static_cast<std::size_t>(
-                std::min<int64_t>(fileSize, rune::protocol::batch::kRecordBatchOverhead + 64)));
-            f.read(reinterpret_cast<char*>(hdr.data()), static_cast<std::streamsize>(hdr.size()));
-            f.close();
-            rune::protocol::RecordBatchReader r(hdr.data(), hdr.size());
-            const int32_t total = r.totalLength();
-            // Review m4: trust the base only from a COMPLETE, CRC-valid first
-            // batch, and never overwrite an existing segment.  Anything else is
-            // quarantined (kept, renamed .stlog.corrupt — never deleted, never
-            // parsed into a bogus base); recovery's chain validation handles the
-            // resulting gap like any lost write.
-            bool valid = false;
-            if (total > 0 && total <= fileSize) {
-                std::vector<uint8_t> first(static_cast<std::size_t>(total));
-                std::ifstream f2(lp, std::ios::binary);
-                f2.read(reinterpret_cast<char*>(first.data()), total);
-                valid = f2.good() && rune::protocol::RecordBatchReader(first.data(), first.size()).ensureValid();
-            }
-            const std::string target = valid ? logPathForBase(r.baseOffset()) : std::string();
-            if (valid && !std::filesystem::exists(target, ec)) {
-                std::filesystem::rename(lp, target, ec);
-            } else {
-                spdlog::error("Log {}: staging file {} {} — quarantined as .corrupt (never parsed / overwritten)",
-                              dir_, lp.string(), valid ? "would overwrite an existing segment" : "has no valid first batch");
-                std::filesystem::rename(lp, lp.string() + ".corrupt", ec);
-            }
-            // Drop any co-named staging.index (recover() rebuilds the index).
-        } else {
+        if (fileSize < static_cast<int64_t>(rune::protocol::batch::kRecordBatchOverhead)) {
             f.close();
             std::filesystem::remove(lp, ec); // empty / torn — never adopted
+            continue;
         }
+        // Review m4: trust the base only from a COMPLETE, CRC-valid first
+        // batch, and never overwrite an existing segment.  Anything else is
+        // quarantined; recovery's chain validation handles the resulting gap
+        // like any lost write.
+        const auto first = readBatch(f, 0, fileSize);
+        if (first.empty()) { f.close(); quarantine(lp, "has no valid first batch"); continue; }
+        rune::protocol::RecordBatchReader r(first.data(), first.size());
+        const int64_t base = r.baseOffset();
+        const int64_t end1 = base + int64_t{r.lastOffsetDelta()} + 1;
+        // D19 N5a: baseOffset is not under the CRC — cross-check it.  A
+        // CRC-valid second batch must start exactly where the first ends.
+        const auto second = readBatch(f, static_cast<int64_t>(first.size()), fileSize);
+        f.close();
+        if (!second.empty() && rune::protocol::RecordBatchReader(second.data(), second.size()).baseOffset() != end1) {
+            quarantine(lp, "first batch base " + std::to_string(base) + " does not chain to its next batch");
+            continue;
+        }
+        if (std::find(canonical.begin(), canonical.end(), base) != canonical.end()) {
+            {
+                // D19 N5b: both candidates' extents, so an operator can decide.
+                quarantine(lp, "would overwrite existing segment " + logPathForBase(base) + " (base " +
+                                   std::to_string(base) + "; staging last offset " + std::to_string(lastOffsetOf(lp)) +
+                                   ", existing last offset " + std::to_string(lastOffsetOf(logPathForBase(base))) + ")");
+            }
+            continue;
+        }
+        found.push_back({lp, base});
+    }
+    // D19 N5a: in base order, each recovered base must lie at or above the
+    // end of the segment below it and its records below the segment above it
+    // (a corrupted base cannot overlay live offsets).  Compaction gaps are fine.
+    std::sort(canonical.begin(), canonical.end());
+    std::sort(found.begin(), found.end(), [](const Recovered& x, const Recovered& y) { return x.base < y.base; });
+    for (const auto& rec : found) {
+        auto above = std::upper_bound(canonical.begin(), canonical.end(), rec.base);
+        if (above != canonical.begin()) {
+            const int64_t prevBase = *std::prev(above);
+            const int64_t prevEnd  = std::max(prevBase, lastOffsetOf(logPathForBase(prevBase)) + 1);
+            if (rec.base < prevEnd) {
+                quarantine(rec.path, "base " + std::to_string(rec.base) + " overlaps segment " +
+                                         std::to_string(prevBase) + " (ends at " + std::to_string(prevEnd) + ")");
+                continue;
+            }
+        }
+        if (above != canonical.end() && lastOffsetOf(rec.path) >= *above) {
+            quarantine(rec.path, "records of base " + std::to_string(rec.base) + " overlap segment " +
+                                     std::to_string(*above));
+            continue;
+        }
+        std::filesystem::rename(rec.path, logPathForBase(rec.base), ec);
+        if (!ec) canonical.insert(std::upper_bound(canonical.begin(), canonical.end(), rec.base), rec.base);
     }
     // Remove any leftover staging .index files (rebuilt by recover() when needed).
     for (const auto& ip : stagingIdx) std::filesystem::remove(ip, ec);
@@ -944,9 +1048,14 @@ LogReadView Log::readView(int64_t startOffset, int32_t maxBytes) noexcept {
 void Log::maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept {
     const std::size_t mapped = seg.readMapBytes();
     if (mapped == 0) return;                                        // no mapping yet: readView creates it
+    // D21 re-review-2 low: a SEALED segment never grows off the owner — it
+    // wants growth only when read beyond its mapping, and readView remaps it
+    // on the owner in that same call (re-review N3), so an async answer could
+    // only be discarded (a dup + an off-owner mmap for nothing).
+    if (!active) return;
     const auto size = static_cast<std::size_t>(seg.sizeBytes());
-    // Active: grow at half full, to the full-segment size; sealed: to its size.
-    const bool want = active ? size * 2 > mapped : size > mapped;
+    // Active: grow at half full, to the full-segment size.
+    const bool want = size * 2 > mapped;
     if (!want) return;
     if (growOutstanding_) {
         // Count-based re-request (a request lost to a full ring / a racing view
@@ -954,13 +1063,15 @@ void Log::maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept
         if (size > mapped && ++growWaits_ >= 4096) { growOutstanding_ = false; growWaits_ = 0; }
         if (growOutstanding_) return;
     }
-    std::size_t target = active ? std::max(LogSegment::readMapBytesFor(rollBytes_), size * 2) : size;
+    std::size_t target = std::max(LogSegment::readMapBytesFor(rollBytes_), size * 2);
     target = (target + (std::size_t{1} << 20) - 1) >> 20;          // MiB
     if ((target << 20) <= mapped) return;
     const int fd = ::fcntl(seg.logFd(), F_DUPFD_CLOEXEC, 0);       // the provisioner owns the dup
     if (fd < 0) return;
     const int64_t seq = (growSeq_ + 1) & 0x7FFFF;
-    if (!provisionHook_.growFn(provisionHook_.ctx, this, packRequest(fd, static_cast<int64_t>(target), seq))) {
+    if (!provisionChannel_->post(ProvisionChannel::kGrowMsgType,
+                                 static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(this)),
+                                 packRequest(fd, static_cast<int64_t>(target), seq))) {
         ::close(fd);
         return;
     }
@@ -997,7 +1108,9 @@ void Log::pollReadMaps_() noexcept {
             ++readMapGrowths_;
         }
         // Retire off the owner (munmap); inline only if the ring is full.
-        if (m && provisionHook_.disposeFn(provisionHook_.ctx, m.get())) (void)m.release();
+        if (m && provisionChannel_->post(ProvisionChannel::kDisposeMsgType,
+                                         static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(m.get())), 0))
+            (void)m.release();
     }, 8);
 }
 int64_t Log::logStartOffset() const noexcept {
@@ -1091,7 +1204,7 @@ int64_t Log::recover() {
         }
         // Re-review N5: created with the HELD value (the epoch guard), never past it.
         if (rf.state == RpFileState::Missing) (void)createRecoveryPointFile_(recoveryPoint_);
-        else if (storage_.failedErrno == 0)  (void)checkpointRecoveryPoint_(/*publish=*/false);
+        else if (storage_.failedErrno == 0)  (void)checkpointRecoveryPoint();
     }
 
     // CP-5.1 FIX (retention-after-restart): compute the REAL largestTimestamp for
@@ -1263,7 +1376,7 @@ int Log::createRecoveryPointFile_(int64_t r) noexcept {
     int err = 0;
     const int fd = ::open(rpTmpPath_.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) err = errno != 0 ? errno : EIO;
-    if (err == 0 && storage_.writeFaultForTest != 0) err = storage_.writeFaultForTest;
+    if (err == 0 && storage_.writeFaultForTest > 0) err = storage_.writeFaultForTest;
     if (err == 0 && ::pwrite(fd, file.data(), file.size(), 0) != static_cast<ssize_t>(file.size()))
         err = errno != 0 ? errno : ENOSPC;
     ++storage_.roleChangeSyncs;
@@ -1289,9 +1402,7 @@ int Log::createRecoveryPointFile_(int64_t r) noexcept {
     return 0;
 }
 
-int Log::checkpointRecoveryPoint() noexcept { return checkpointRecoveryPoint_(/*publish=*/true); }
-
-int Log::checkpointRecoveryPoint_(bool publish) noexcept {
+int Log::checkpointRecoveryPoint() noexcept {
     if (!recovered_) return 0;
     if (storage_.failedErrno != 0) return storage_.failedErrno;
     if (rpFd_ < 0) return 0;
@@ -1311,7 +1422,7 @@ int Log::checkpointRecoveryPoint_(bool publish) noexcept {
     const uint64_t seq = ++rpSeq_;
     encodeRpSlot(img, seq, v);
     int err = 0;
-    if (storage_.writeFaultForTest != 0) err = storage_.writeFaultForTest;
+    if (storage_.writeFaultForTest > 0) err = storage_.writeFaultForTest;
     else if (::pwrite(rpFd_, img, sizeof img, static_cast<off_t>(target * kRpSlotStride)) != static_cast<ssize_t>(sizeof img))
         err = errno != 0 ? errno : ENOSPC;
     ++storage_.roleChangeSyncs;
@@ -1325,7 +1436,6 @@ int Log::checkpointRecoveryPoint_(bool publish) noexcept {
     }
     // hotpath-A F4: the cleaner gate moves with ONE release-store (no snapshot
     // republish — the snapshot no longer carries the recovery point).
-    (void)publish;
     setPersistedRp_(v);
     rpUnconfirmedMax_ = kRecoveryPointUnknown;   // every possibly-landed write has a LOWER seq
     rpActiveSlot_ = target;

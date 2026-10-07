@@ -92,6 +92,11 @@ public:
     [[nodiscard]] std::int64_t pendingBytes() const noexcept {
         return ring_.producerPosition() - ring_.consumerPosition();
     }
+    /// The ring's producer / consumer positions (bytes; monotonic).  Approximate
+    /// while the other side runs — estimates only (e.g. "is a record I offered
+    /// still queued": its end position > consumerPosition()).
+    [[nodiscard]] std::int64_t producerPosition() const noexcept { return ring_.producerPosition(); }
+    [[nodiscard]] std::int64_t consumerPosition() const noexcept { return ring_.consumerPosition(); }
     /// What a doorbell watch needs (node/detail/RingDoorbell.h RingWatch): buffer, its length (capacity +
     /// trailer), the pow2 payload capacity and the head-position index.  Startup wiring only.
     struct WatchInfo {

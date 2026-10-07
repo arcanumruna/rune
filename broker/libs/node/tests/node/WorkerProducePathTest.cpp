@@ -33,6 +33,7 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/node/EmbeddedDriver.h>
+#include <rune/storage/testing/DemandChannelForTest.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/replication/PartitionReplica.h>
@@ -753,7 +754,8 @@ TEST_F(WorkerProduceFixture, HeldFrameAbortsOnlyItsImageAndIsRedeliveredRegressi
     logA.recover();
     logB.recover();
     struct Hook { static bool fn(void*, rune::storage::Log*, rune::storage::Log::ProvisionDemand) noexcept { return true; } };
-    logA.setProvisioning({&Hook::fn, nullptr});
+    rune::storage::testing::DemandChannelForTest demandCh1{&Hook::fn, nullptr};
+    logA.setProvisioning(&demandCh1);
     NullTransport transport;
     auto repA = makeLeaderReplica(20, 0, logA, transport);
     auto repB = makeLeaderReplica(20, 1, logB, transport);
@@ -834,7 +836,8 @@ TEST(WorkerProduceRegression, DeferredRollHoldsIngressFrameRegression) {
         }
     };
     int demands = 0;
-    log.setProvisioning({&Hook::fn, &demands});
+    rune::storage::testing::DemandChannelForTest demandCh2{&Hook::fn, &demands};
+    log.setProvisioning(&demandCh2);
     NullTransport transport;
     auto replica = WorkerProduceFixture::makeLeaderReplica(0, 0, log, transport);
     Worker worker(0);
@@ -882,7 +885,8 @@ TEST(WorkerProduceRegression, RefusedFrameIsAnsweredNotHeldWhileRollDeferredRegr
     rune::storage::Log log(dir.path.string(), /*rollBytes=*/256);
     log.recover();
     struct Hook { static bool fn(void*, rune::storage::Log*, rune::storage::Log::ProvisionDemand) noexcept { return true; } };
-    log.setProvisioning({&Hook::fn, nullptr});
+    rune::storage::testing::DemandChannelForTest demandCh3{&Hook::fn, nullptr};
+    log.setProvisioning(&demandCh3);
     int64_t off = 0;
     while (!log.rollDeferred()) {   // fill (as a follower's replicated appends would)
         rune::protocol::RecordBatchBuilder b(off, 1000);

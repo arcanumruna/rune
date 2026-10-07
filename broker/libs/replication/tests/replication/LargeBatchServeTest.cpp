@@ -9,6 +9,7 @@
 // Deterministic: injected clock, InMemoryTransport, bounded driver loop.
 // ---------------------------------------------------------------------------
 #include <gtest/gtest.h>
+#include <rune/storage/testing/DemandChannelForTest.h>
 
 #include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/RecordBatch.h>
@@ -478,7 +479,8 @@ TEST(FollowerRollBackPressureRegression, FollowerStopsFetchingDataWhileRollDefer
     rune::storage::Log followerLog{followerDir.path, /*rollBytes=*/512};
     followerLog.recover();
     struct Hook { static bool fn(void*, rune::storage::Log*, rune::storage::Log::ProvisionDemand) noexcept { return true; } };
-    followerLog.setProvisioning({&Hook::fn, nullptr});
+    rune::storage::testing::DemandChannelForTest demandCh1{&Hook::fn, nullptr};
+    followerLog.setProvisioning(&demandCh1);
     CapturingTransport transport;
     const std::vector<NodeId> replicas{kLeaderId, kFollowerId};
     auto leader = std::make_unique<PartitionReplica>(makeCfg(kLeaderId, false), Role::Leader, 1, replicas, replicas,

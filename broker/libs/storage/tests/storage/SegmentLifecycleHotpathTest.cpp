@@ -17,7 +17,10 @@
 //
 // Every test here is a regression test (name contains "Regression").
 #include <gtest/gtest.h>
+#include <rune/storage/testing/DemandChannelForTest.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/MappedFile.h>
+#include <fcntl.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <atomic>
@@ -175,7 +178,8 @@ TEST(SegmentLifecycleRegression, RollNeverPreallocatesOnOwnerRegression) {
         Log log(dir.string(), 512);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh1{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh1);
         int64_t off = 0;
         int rolls = 0;
         const uint64_t before = log.ownerPreallocsForTest();
@@ -204,7 +208,8 @@ TEST(SegmentLifecycleRegression, ProvisionedRollWithEmptyPoolDefersNeverCreatesI
         Log log(dir.string(), 512);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh2{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh2);
         int64_t off = 0;
         while (!log.rollDeferred()) off = put(log, off);   // fill the active segment
         const auto segsBefore = log.segmentBaseOffsets().size();
@@ -233,7 +238,8 @@ TEST(SegmentLifecycleRegression, DeferredRollOvershootIsBoundedRegression) {
         Log log(dir.string(), 512);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh3{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh3);
         int64_t off = 0;
         while (log.segmentBaseOffsets().size() < 2 && off < 1000000) off = put(log, off);
         ASSERT_EQ(log.segmentBaseOffsets().size(), 2u) << "the overshoot cap forced a roll";
@@ -416,7 +422,8 @@ TEST(SegmentLifecycleRegression, FullRenameRingDefersRollNeverDropsRenameRegress
         Log log(dir.string(), 256);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh4{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh4);
         int64_t off = 0;
         // Adopt segments without ever finalizing their renames.
         for (int guard = 0; guard < 100000; ++guard) {
@@ -470,7 +477,8 @@ TEST(SegmentLifecycleRegression, SteadyStateRollAllocatesNothingOnOwnerRegressio
         Log log(dir.string(), 256);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh5{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh5);
         // Pre-built batches: building one allocates (test side, outside windows).
         std::vector<std::vector<uint8_t>> batches;
         int64_t off = 0;
@@ -514,6 +522,46 @@ TEST(SegmentLifecycleRegression, SteadyStateRollAllocatesNothingOnOwnerRegressio
     fs::remove_all(dir);
 }
 
+// D19 review L2: a log WITHOUT retention (compacted / infinite retention)
+// releases no map node, so the owner used to allocate one map node per roll.
+// The provisioner now builds the node with the ready segment.
+TEST(SegmentLifecycleRegression, NoRetentionRollAllocatesNoMapNodeOnOwnerRegression) {
+    const auto dir = freshDir("rune_slh_alloc_noret");
+    {
+        Log log(dir.string(), 256);
+        log.recover();
+        int demands[4] = {0, 0, 0, 0};
+        rune::storage::testing::DemandChannelForTest demandCh{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh);
+        int64_t off = 0;
+        auto appendCounted = [&](int64_t& o) {
+            RecordBatchBuilder b(o, 1000 + o);
+            b.append("k", "value-" + std::to_string(o), 1000 + o);
+            const auto batch = b.build();
+            tCount = true;
+            o = log.appendNoSync(batch.data(), batch.size(), o);
+            tCount = false;
+        };
+        auto housekeeping = [&] {   // provisioner side (another thread in production)
+            (void)log.provisionReady(2);
+            (void)log.finalizeStagingRenames();
+            tCount = true;
+            (void)log.drainStagingRenamesDone();
+            tCount = false;
+        };
+        for (int i = 0; i < 200; ++i) { housekeeping(); appendCounted(off); }
+        tAllocs = 0;
+        const uint64_t installs0 = static_cast<uint64_t>(demands[2]);
+        for (int i = 0; i < 1200; ++i) { housekeeping(); appendCounted(off); }
+        const uint64_t rolls = static_cast<uint64_t>(demands[2]) - installs0;
+        ASSERT_GT(rolls, 150u) << "the window must roll many times";
+        // Only the snapshot's rare chunk / directory allocations (no map node per roll).
+        const uint64_t allowed = 2 + 2 * (rolls / kSnapChunkEntries + 1) + 3 * (2 * rolls / kSnapHeadersPerDir + 1);
+        EXPECT_LE(tAllocs, allowed) << "owner allocations: " << tAllocs << " over " << rolls << " rolls";
+    }
+    fs::remove_all(dir);
+}
+
 // ===========================================================================
 // Review fixes (2026-10-06 review M1 / M3 / m4 / m6).
 // ===========================================================================
@@ -527,7 +575,8 @@ TEST(SegmentLifecycleRegression, ProvisionerFailureRollsInlineNeverHangsRegressi
         Log log(dir.string(), 512);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh6{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh6);
         int64_t off = 0;
         while (!log.rollDeferred()) off = put(log, off);
         ASSERT_GE(demands[1], 1) << "the Threshold demand was posted";
@@ -560,7 +609,8 @@ TEST(SegmentLifecycleRegression, ProvisionerFailureThenInlineFailureFailsTheLogR
         Log log(dir.string(), 512);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh7{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh7);
         int64_t off = 0;
         while (!log.rollDeferred()) off = put(log, off);
         log.setProvisionFaultForTest(EACCES, 1);
@@ -583,7 +633,8 @@ TEST(SegmentLifecycleRegression, ProvisioningIsDemandDrivenByFillThresholdRegres
         Log log(dir.string(), 4096);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands}, /*thresholdPct=*/50);
+        rune::storage::testing::DemandChannelForTest demandCh8{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh8, /*thresholdPct=*/50);
         int64_t off = 0;
         // Fill to just below half: no demand.
         while (log.segmentSizeForTest(0) + 200 < 2048) off = put(log, off);
@@ -614,7 +665,8 @@ TEST(SegmentLifecycleRegression, LostDemandIsRepostedRegression) {
         } flaky;
         Log log(dir.string(), 512);
         log.recover();
-        log.setProvisioning({&Flaky::fn, &flaky});
+        rune::storage::testing::DemandChannelForTest demandCh9{&Flaky::fn, &flaky};
+        log.setProvisioning(&demandCh9);
         int64_t off = 0;
         while (!log.rollDeferred()) off = put(log, off);
         EXPECT_EQ(flaky.refused, 3);
@@ -658,7 +710,8 @@ TEST(SegmentLifecycleRegression, CrashWithReadyAndQueuedRenamesRecoversAllDataRe
         Log log(dir.string(), 256);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh10{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh10);
         int64_t off = 0;
         int adopted = 0;
         for (int guard = 0; adopted < 3 && guard < 100000; ++guard) {
@@ -745,7 +798,8 @@ TEST(SegmentLifecycleRegression, RenameCompletingInsideColdPathIsNeverMissedRegr
         int64_t off = 0;
         while (log.segmentSizeForTest(0) < 512) off = put(log, off);   // A [0, ..) inline-created
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh11{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh11);
         ASSERT_EQ(log.provisionReady(1), 1);
         off = put(log, off);                                          // rolls: adopts B
         bBase = log.segmentBaseOffsets().back();
@@ -782,7 +836,8 @@ TEST(SegmentLifecycleRegression, RenameCompletingInsideReloadIsNeverMissedRegres
         int64_t off = 0;
         while (log.segmentSizeForTest(0) < 512) off = put(log, off);
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh12{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh12);
         ASSERT_EQ(log.provisionReady(1), 1);
         off = put(log, off);
         for (int i = 0; i < 3; ++i) off = put(log, off);
@@ -820,7 +875,8 @@ TEST(SegmentLifecycleRegression, HeldRollRepostsItsDemandRegression) {
         Log log(dir.string(), 512);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh13{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh13);
         int64_t off = 0;
         while (!log.rollDeferred()) off = put(log, off);
         EXPECT_EQ(demands[1], 1) << "Threshold";
@@ -843,7 +899,8 @@ TEST(SegmentLifecycleRegression, UnpreallocatedReadySegmentIsAdoptedRegression) 
         Log log(dir.string(), 512);
         log.recover();
         int demands[4] = {0, 0, 0, 0};
-        log.setProvisioning({&NoopHook::fn, demands});
+        rune::storage::testing::DemandChannelForTest demandCh14{&NoopHook::fn, demands};
+        log.setProvisioning(&demandCh14);
         int64_t off = 0;
         while (!log.rollDeferred()) off = put(log, off);
         ASSERT_EQ(log.provisionReady(1, /*preallocate=*/false), 1);
@@ -854,6 +911,198 @@ TEST(SegmentLifecycleRegression, UnpreallocatedReadySegmentIsAdoptedRegression) 
         EXPECT_EQ(log.ownerPreallocsForTest(), 0u);
         (void)log.finalizeStagingRenames();
         (void)log.drainStagingRenamesDone();
+    }
+    fs::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// D19 re-review N5a: a staging file's baseOffset is NOT under the batch CRC.
+// A recovered base must fit the segment chain: above every canonical segment
+// base, and (with a second batch) chained by the batch's own lastOffsetDelta.
+// ---------------------------------------------------------------------------
+namespace {
+std::vector<uint8_t> batchAt(int64_t base, int records = 1) {
+    RecordBatchBuilder b(base, 1000);
+    for (int i = 0; i < records; ++i) b.append("k", "v" + std::to_string(base + i), 1000);
+    return b.build();
+}
+void writeStaging(const fs::path& dir, int64_t seq, const std::vector<std::vector<uint8_t>>& batches) {
+    std::ofstream f(dir / (std::string(".staging-") + std::to_string(seq) + ".stlog"), std::ios::binary);
+    for (const auto& b : batches) f.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
+}
+/// Three canonical segments; returns their bases (ascending) and the LEO.
+std::pair<std::vector<int64_t>, int64_t> threeSegments(const fs::path& dir) {
+    Log log(dir.string(), 512);
+    log.recover();
+    int64_t off = 0;
+    while (log.segmentBaseOffsets().size() < 3) off = put(log, off);
+    log.sync();
+    auto bases = log.segmentBaseOffsets();
+    return {std::vector<int64_t>(bases.begin(), bases.end()), log.logEndOffset()};
+}
+}  // namespace
+
+TEST(SegmentLifecycleRegression, StagingBaseBelowTheChainIsQuarantinedRegression) {
+    const auto dir = freshDir("rune_slh_n5a_low");
+    const auto [bases, leo] = threeSegments(dir);
+    ASSERT_GT(bases[1] + 1, bases[0]);
+    // A CRC-valid batch whose (uncovered) baseOffset lands inside the chain.
+    writeStaging(dir, 7, {batchAt(bases[1] + 1)});
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        const auto after = log.segmentBaseOffsets();
+        EXPECT_EQ(std::count(after.begin(), after.end(), bases[1] + 1), 0) << "a bogus base entered the chain";
+        EXPECT_EQ(log.logEndOffset(), leo);
+        EXPECT_EQ(countSuffix(dir, ".stlog.corrupt"), 1u) << "quarantined (kept for the operator)";
+    }
+    fs::remove_all(dir);
+}
+
+TEST(SegmentLifecycleRegression, StagingBaseNotChainedToItsNextBatchIsQuarantinedRegression) {
+    const auto dir = freshDir("rune_slh_n5a_chain");
+    const auto [bases, leo] = threeSegments(dir);
+    // First batch's base corrupted high; the second batch starts at the real LEO.
+    writeStaging(dir, 8, {batchAt(leo + 5000, 2), batchAt(leo + 2)});
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        EXPECT_EQ(log.logEndOffset(), leo) << "a bogus base moved the LEO";
+        EXPECT_EQ(countSuffix(dir, ".stlog.corrupt"), 1u);
+    }
+    fs::remove_all(dir);
+}
+
+TEST(SegmentLifecycleRegression, StagingBaseAboveTheChainIsRecovered) {
+    const auto dir = freshDir("rune_slh_n5a_ok");
+    const auto [bases, leo] = threeSegments(dir);
+    writeStaging(dir, 9, {batchAt(leo, 2), batchAt(leo + 2)});   // the adopted-but-not-renamed segment
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        EXPECT_EQ(log.logEndOffset(), leo + 3) << "an adopted segment's data is never lost";
+        EXPECT_EQ(countSuffix(dir, ".corrupt"), 0u);
+    }
+    fs::remove_all(dir);
+}
+
+// D19 re-review N6b: a ready segment queued behind a stale FAILURE record is
+// adopted — the failure no longer forces one needless inline roll.
+TEST(SegmentLifecycleRegression, ReadySegmentBehindAStaleFailureIsAdoptedRegression) {
+    const auto dir = freshDir("rune_slh_n6b");
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        int demands[4] = {0, 0, 0, 0};
+        rune::storage::testing::DemandChannelForTest ch{&NoopHook::fn, demands};
+        log.setProvisioning(&ch);
+        log.setProvisionFaultForTest(EIO, 1);
+        ASSERT_LT(log.provisionReady(1), 0) << "the failed build posts a FAILURE record";
+        ASSERT_EQ(log.provisionReady(1), 1) << "a later build succeeds behind it";
+        const uint64_t prealloc0 = log.ownerPreallocsForTest();
+        int64_t off = 0;
+        const auto n = log.segmentBaseOffsets().size();
+        while (log.segmentBaseOffsets().size() == n) off = put(log, off);
+        EXPECT_EQ(log.failureInlineRollsForTest(), 0u) << "the stale failure forced an inline roll";
+        EXPECT_EQ(log.ownerPreallocsForTest(), prealloc0) << "the queued ready segment was adopted";
+        EXPECT_EQ(log.provisionFailuresForTest(), 1u) << "the failure is still counted";
+    }
+    fs::remove_all(dir);
+}
+
+// D19 re-review N6c: the rename request ring and its done ring are bounded
+// TOGETHER — an adoption needs room for its completion too.  Before, the owner
+// could keep adopting while the done ring was full; finalizeStagingRenames then
+// stopped with requests queued and nothing re-drove them (an un-renamed
+// staging file behind a non-held roll).
+TEST(SegmentLifecycleRegression, RenameInFlightIsBoundedByTheDoneRingRegression) {
+    const auto dir = freshDir("rune_slh_n6c");
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        int demands[4] = {0, 0, 0, 0};
+        rune::storage::testing::DemandChannelForTest ch{&NoopHook::fn, demands};
+        log.setProvisioning(&ch);
+        int64_t off = 0;
+        int rolls = 0;
+        for (int i = 0; i < 80; ++i) {
+            (void)log.provisionReady(2);
+            const auto n = log.segmentBaseOffsets().size();
+            while (log.segmentBaseOffsets().size() == n && !log.rollDeferred()) off = put(log, off);
+            if (log.segmentBaseOffsets().size() == n) break;   // held
+            ++rolls;
+            (void)log.finalizeStagingRenames();   // the owner never drains the done ring here
+        }
+        EXPECT_LT(rolls, 80) << "adoptions must hold while their completions cannot be published";
+        EXPECT_EQ(countSuffix(dir, ".stlog"), log.readyCountForTest())
+            << "every adopted segment's rename was performed (none stranded)";
+        (void)log.drainStagingRenamesDone();
+        (void)log.provisionReady(2);
+        const auto n = log.segmentBaseOffsets().size();
+        for (int i = 0; i < 64 && log.segmentBaseOffsets().size() == n; ++i) off = put(log, off);
+        EXPECT_GT(log.segmentBaseOffsets().size(), n) << "draining the done ring releases the held roll";
+    }
+    fs::remove_all(dir);
+}
+
+// D19 re-review N6d: a built segment whose ready-ring offer fails (ring full)
+// is never dropped silently — the build reports a failure (counted).
+TEST(SegmentLifecycleRegression, ReadyRingFullAfterABuildIsReportedRegression) {
+    const auto dir = freshDir("rune_slh_n6d");
+    {
+        Log log(dir.string(), 512);
+        log.recover();
+        log.setProvisioning(nullptr);
+        // Fill the ready ring with FAILURE records (each failed build posts one).
+        log.setProvisionFaultForTest(EIO, 1 << 20);
+        for (int i = 0; i < 64; ++i) (void)log.provisionReady(1);
+        log.setProvisionFaultForTest(0, 0);
+        EXPECT_EQ(log.readyQueuedApprox(), 0u) << "failure records are not ready segments";
+        EXPECT_LT(log.provisionReady(1), 0) << "the built segment could not be queued: reported, not silent";
+        EXPECT_EQ(countSuffix(dir, ".stlog"), 0u) << "its staging files are removed";
+        EXPECT_EQ(log.readyDropsForTest(), 1u);
+    }
+    fs::remove_all(dir);
+}
+
+// D21 re-review-2 low: a SEALED segment read beyond its mapping is remapped on
+// the owner in that same read (re-review N3) — an async growth request for it
+// was dead weight (a dup + an off-owner mmap whose answer is then discarded).
+TEST(SegmentLifecycleRegression, SealedSegmentBeyondItsMapPostsNoGrowthRequestRegression) {
+    const auto dir = freshDir("rune_slh_sealed_grow");
+    {
+        Log log(dir.string(), 2 << 20);
+        log.recover();
+        ProvisionChannel ch;   // nobody serves it: posts stay queued (countable)
+        log.setProvisioning(&ch);
+        const std::string big(64 * 1024, 'x');
+        int64_t off = 0;
+        auto putBig = [&] {
+            RecordBatchBuilder b(off, 1000);
+            b.append("k", big, 1000);
+            const auto bb = b.build();
+            off = log.appendNoSync(bb.data(), bb.size(), off);
+        };
+        while (log.segmentForTest(0)->sizeBytes() < (1 << 19)) putBig();   // 0.5 MiB
+        // A small (1 MiB) mapping of segment 0, made while it was small.
+        const int dupFd = ::fcntl(log.segmentForTest(0)->logFd(), F_DUPFD_CLOEXEC, 0);
+        ASSERT_GE(dupFd, 0);
+        auto small = std::make_unique<MappedFile>(MappedFile::BorrowedFd{dupFd}, std::string(), std::size_t{1} << 20);
+        ::close(dupFd);
+        while (log.segmentBaseOffsets().size() < 2) {   // seal segment 0 (~2 MiB)
+            (void)log.provisionReady(1);
+            putBig();
+            (void)log.finalizeStagingRenames();
+            (void)log.drainStagingRenamesDone();
+        }
+        LogSegment* s0 = log.segmentForTest(0);
+        ASSERT_GT(s0->sizeBytes(), int64_t{1} << 20);
+        (void)s0->swapReadMap(std::move(small));
+        log.expireReadMapRequestForTest();   // no growth request outstanding (the active one's)
+        const int64_t queued0 = ch.ring().pendingBytes();
+        const auto v = log.readView(20, 1 << 20);   // offset 20: past the 1 MiB map
+        EXPECT_FALSE(v.empty()) << "served by the owner remap";
+        EXPECT_EQ(ch.ring().pendingBytes(), queued0) << "a growth request was posted for a sealed segment";
     }
     fs::remove_all(dir);
 }

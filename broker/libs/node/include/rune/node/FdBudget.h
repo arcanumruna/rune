@@ -28,6 +28,11 @@
 // Every partition is assumed hosted on this node (replication factor up to
 // the cluster size).  kBaseFds covers Aeron (driver + client), client and
 // replication sockets, worker/io_uring/flusher fds, logs and internal files.
+// It also absorbs the TRANSIENT segment fds the formula leaves out (D20
+// review L5): a retired segment kept open by an in-flight seal flush (M1 pin;
+// only while a truncation / retention races that flush, at most
+// kMaxPendingSeals per log) and recover()'s short-lived .index.tmp /
+// directory-fsync fds.  The estimate only drives the startup WARN.
 //
 // Deployment: set the hard limit high — systemd `LimitNOFILE=1048576`,
 // Docker `--ulimit nofile=1048576:1048576` (most engines default to ~1M),

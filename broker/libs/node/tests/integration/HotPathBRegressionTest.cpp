@@ -9,6 +9,8 @@
 //       epoch-cache image go to the two-slot leader-epoch-state file through
 //       the worker's io backend, and a controller-managed leadership acts only
 //       once that write completed (event-driven).
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <rune/metadata/ShardRouter.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/SegmentProvisionerAgent.h>
@@ -31,6 +33,8 @@
 #include <thread>
 #include <map>
 #include <memory>
+#include <cstdlib>
+#include <new>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -72,6 +76,23 @@ std::vector<uint8_t> produceFrame(int64_t corr, int32_t topicId, int32_t part, s
     return frame;
 }
 
+// The same-address replacement test: the block of one deleted object is kept
+// (not freed) so the next object is built at the SAME address (deterministic
+// pointer reuse, no allocator luck).  Everything else frees normally.
+}  // namespace
+void* gKeepFreedBlock = nullptr;
+bool  gKeptBlockFreed = false;
+void operator delete(void* p) noexcept {
+    if (p != nullptr && p == gKeepFreedBlock) { gKeptBlockFreed = true; return; }
+    std::free(p);
+}
+void operator delete(void* p, std::size_t) noexcept { ::operator delete(p); }
+void* operator new(std::size_t n) {
+    if (void* p = std::malloc(n ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+namespace {
+
 /// One worker (shard mode, registry-routed ops) owning one leader partition.
 struct Rig {
     TmpDir                                    ownDir;
@@ -92,7 +113,7 @@ struct Rig {
         if (provisioned) {
             prov = std::make_unique<rune::node::SegmentProvisionerAgent>(1);
             prov->addToViewForTest(log.get());
-            log->setProvisioning(prov->hook(), 50);
+            log->setProvisioning(prov->channel(), 50);
         }
         PartitionConfig c;
         c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
@@ -774,7 +795,15 @@ TEST(HotPathBRegression, IdlePartitionHoldsNoEpochStateFdRegression) {
     rig.pass();
     ASSERT_TRUE(rig.passUntil([&] { return rig.rep->role() == Role::Leader && rig.rep->epochStateDurable(); }));
     EXPECT_FALSE(rig.rep->epochStateFdOpenForTest()) << "an fd per idle partition";
-    EXPECT_LE(fs::file_size(rig.dir.p / "leader-epoch-state"), 8192u);
+    // D21 L1: pre-sized (logical) but sparse — the blocks stay small (Linux;
+    // APFS allocates small extended files).
+    EXPECT_EQ(fs::file_size(rig.dir.p / "leader-epoch-state"),
+              2 * rune::storage::LeaderEpochState::strideFor(rune::storage::LeaderEpochState::kMinEntries));
+#if defined(__linux__)
+    struct stat st{};
+    ASSERT_EQ(::stat((rig.dir.p / "leader-epoch-state").c_str(), &st), 0);
+    EXPECT_LE(static_cast<int64_t>(st.st_blocks) * 512, int64_t{16} << 10);
+#endif
 }
 
 // Md6: the writer is never switched while a write is in flight.
@@ -993,7 +1022,7 @@ struct ProvLog {
         log->recover();
         log->setDeferSealSync(true);
         prov.addToViewForTest(log.get());
-        log->setProvisioning(prov.hook(), 50);
+        log->setProvisioning(prov.channel(), 50);
     }
     void appendBytes(std::size_t bytes) {   // ~16 KiB batches
         for (std::size_t done = 0; done < bytes;) {
@@ -1190,4 +1219,291 @@ TEST(HotPathBRegression, MemoryReplicaFenceWrittenByTheWorkerLeadsWhenDurableReg
     const auto st = rune::storage::LeaderEpochState::read(stateDir.string());
     ASSERT_EQ(st.state, rune::storage::LeaderEpochState::FileState::Valid);
     EXPECT_GE(st.fence, 3);
+}
+
+// Coordinator must-fix (durability): epoch-state completions were routed by RAW
+// pointer (the Log for disk replicas, the replica for memory ones).  A replica
+// deleted and replaced (same Log / same address) within one fsync let the old
+// replica's completion confirm the NEW replica's fence write before its own
+// fsync — durability-before-acting violated.  The route carries the replica's
+// identity + incarnation; a mismatch is dropped.
+TEST(HotPathBRegression, StaleEpochStateCompletionNeverConfirmsAReplacementReplicaRegression) {
+    Rig rig(/*controllerManaged=*/true);
+    rig.worker().setReapPausedForTest(true);
+    rig.roleOp(true, 3);
+    rig.pass();   // A submits its fence write; the completion is held
+    ASSERT_TRUE(rig.rep->leadershipPendingForTest());
+    const auto tA = rig.worker().lastEpochStateTokenForTest();
+    // A is deleted; B — a new replica over the SAME Log (fresh state file:
+    // its write sequence restarts) — takes its place on the same worker.
+    rig.reg.remove(1, 0);
+    fs::remove(rig.dir.p / "leader-epoch-state");
+    PartitionConfig c;
+    c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+    c.replicaLagMaxOffset = 1'000'000'000;
+    c.followerFlushIntervalNs = 0;
+    auto b = std::make_unique<PartitionReplica>(c, Role::Leader, 1, std::vector<int32_t>{1},
+                                                std::vector<int32_t>{1}, rig.log.get(), &rig.transport);
+    b->setExternalFollowerFlush(true);
+    b->setIsrChannel(&rig.transport);
+    PartitionReplica* B = b.get();
+    rig.reg.add(1, 0, std::move(b));
+    rig.rep = B;
+    rig.pool.assignFromRegistry(rig.reg);
+    rig.roleOp(true, 3);
+    rig.pass();   // B submits its own fence write (completion held too)
+    ASSERT_TRUE(B->leadershipPendingForTest());
+    ASSERT_NE(rig.worker().lastEpochStateTokenForTest(), tA);
+    rig.worker().deliverCompletionForTest({tA, 0, 0});   // A's stale completion arrives
+    EXPECT_TRUE(B->leadershipPendingForTest()) << "A's fsync confirmed B's fence";
+    EXPECT_NE(B->epoch(), 3);
+    rig.worker().setReapPausedForTest(false);
+    EXPECT_TRUE(rig.passUntil([&] { return B->role() == Role::Leader && B->epoch() == 3; }))
+        << "B leads on its OWN completion";
+}
+
+// Same, memory-backed replicas: the route held the replica's raw pointer and
+// ownership was checked by pointer — a replacement replica allocated at the
+// SAME address passed as the owner of the old one's completion.
+TEST(HotPathBRegression, StaleMemoryFenceCompletionNeverConfirmsAReplicaAtTheSameAddressRegression) {
+    TmpDir d;
+    rune::replication::NullPartitionTransport transport;
+    rune::node::ReplicaRegistry reg;
+    WorkerPool pool{1, rune::metadata::ShardRouter(1)};
+    rune::storage::InMemoryLog logA(1 << 20, 10'000), logB(1 << 20, 10'000);
+    PartitionConfig c;
+    c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+    c.replicaLagMaxOffset = 1'000'000'000;
+    auto make = [&](void* mem, rune::storage::InMemoryLog& log, const fs::path& stateDir) {
+        std::unique_ptr<PartitionReplica> r(new (mem) PartitionReplica(c, Role::Follower, 1, std::vector<int32_t>{1},
+                                                                       std::vector<int32_t>{1}, &log, &transport));
+        r->setExternalFollowerFlush(true);
+        r->setIsrChannel(&transport);
+        r->setMemoryEpochStateDir(stateDir.string(), (stateDir.string() + ".fence"));
+        return r;
+    };
+    void* memA = ::operator new(sizeof(PartitionReplica));
+    gKeepFreedBlock = memA;   // A's block survives A's delete: B is built at the SAME address
+    reg.add(1, 0, make(memA, logA, d.p / "a.state"));
+    pool.setRegistry(&reg);
+    Worker& w = pool.worker(0);
+    w.setWorkerIngress(nullptr, /*active=*/true);
+    w.setShardMode(true);
+    pool.assignFromRegistry(reg);
+    int64_t now = 1'000'000'000;
+    auto pass = [&] { now += 1'000'000; (void)w.doWork(now); };
+    auto lead = [&] {
+        WorkerOp op;
+        op.type = WorkerOp::Type::BecomeLeader;
+        op.topicId = 1; op.partition = 0; op.roleEpoch = 3; op.isr = {1};
+        ASSERT_TRUE(pool.tryEnqueueOp(1, 0, std::move(op)));
+    };
+    pass();
+    w.setReapPausedForTest(true);
+    lead();
+    pass();   // A submits its fence write; the completion is held
+    const auto tA = w.lastEpochStateTokenForTest();
+    reg.remove(1, 0);   // A retired, dropped by the worker, then freed (every worker acked)
+    pool.assignFromRegistry(reg);
+    pass();
+    ASSERT_EQ(reg.collectRetired(UINT64_MAX), 1u);
+    // B allocated at the same address (fresh state dir: the same write seq).
+    ASSERT_TRUE(gKeptBlockFreed) << "precondition: A was deleted";
+    gKeepFreedBlock = nullptr;   // B's own delete frees normally
+    void* memB = memA;
+    reg.add(1, 0, make(memB, logB, d.p / "b.state"));
+    auto* B = static_cast<PartitionReplica*>(memB);
+    pool.assignFromRegistry(reg);
+    lead();
+    pass();   // B submits its own fence write (held)
+    ASSERT_TRUE(B->leadershipPendingForTest());
+    ASSERT_NE(w.lastEpochStateTokenForTest(), tA);
+    w.deliverCompletionForTest({tA, 0, 0});   // A's stale completion
+    EXPECT_TRUE(B->leadershipPendingForTest()) << "A's fsync confirmed B's fence";
+    w.setReapPausedForTest(false);
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (B->role() != Role::Leader && std::chrono::steady_clock::now() < end) { pass(); std::this_thread::yield(); }
+    EXPECT_EQ(B->role(), Role::Leader) << "B leads on its OWN completion";
+}
+
+// Coordinator must-fix: an epoch-state fd is never closed while an fsync on it
+// is in flight.  The fsync runs on a dup its route owns — open until the
+// completion is reaped (even after the replica, whose fd it duplicated, is
+// destroyed), then closed (no leak).
+TEST(HotPathBRegression, EpochStateFsyncFdOutlivesItsReplicaUntilTheCompletionRegression) {
+    Rig rig(/*controllerManaged=*/true);
+    rig.worker().setReapPausedForTest(true);
+    rig.roleOp(true, 3);
+    rig.pass();   // the fence write's fsync is in flight (completion held)
+    ASSERT_TRUE(rig.rep->leadershipPendingForTest());
+    const int syncFd = rig.worker().lastEpochStateSyncFdForTest();
+    ASSERT_GE(syncFd, 0);
+    rig.reg.remove(1, 0);          // the replica is dropped and destroyed meanwhile
+    rig.pool.assignFromRegistry(rig.reg);
+    rig.pass();
+    ASSERT_EQ(rig.reg.collectRetired(UINT64_MAX), 1u);
+    EXPECT_NE(::fcntl(syncFd, F_GETFD), -1) << "the in-flight fsync's fd was closed under it";
+    rig.worker().setReapPausedForTest(false);
+    for (int i = 0; i < 2000 && ::fcntl(syncFd, F_GETFD) != -1; ++i) { rig.pass(); std::this_thread::yield(); }
+    EXPECT_EQ(::fcntl(syncFd, F_GETFD), -1) << "the fsync's fd leaked after its completion";
+}
+
+// D21 review L4: a becomeLeader at an epoch BELOW the pending (deferred)
+// leadership's is a stale controller record — refused explicitly, never a
+// cancel of the newer leadership followed by a lead at the older epoch.
+TEST(HotPathBRegression, BecomeLeaderBelowThePendingEpochIsRefusedRegression) {
+    Rig rig(/*controllerManaged=*/true);
+    rig.worker().setReapPausedForTest(true);
+    rig.roleOp(true, 5);
+    rig.pass();   // pending at epoch 5 (its fence write in flight)
+    ASSERT_TRUE(rig.rep->leadershipPendingForTest());
+    rig.roleOp(true, 4);   // stale (lower) epoch
+    rig.pass();
+    EXPECT_TRUE(rig.rep->leadershipPendingForTest()) << "the newer pending leadership was cancelled";
+    rig.worker().setReapPausedForTest(false);
+    ASSERT_TRUE(rig.passUntil([&] { return !rig.rep->leadershipPendingForTest(); }));
+    EXPECT_EQ(rig.rep->epoch(), 5) << "led at the stale epoch";
+    EXPECT_EQ(rig.rep->role(), Role::Leader);
+}
+
+// D21 review L2: both leader-epoch-state slots corrupt — the restart fence
+// (an epoch led with no surviving batch: here 7) is unknown.  It used to be
+// re-derived from the stamps only (1), so the replica led at 7 AGAIN (a second
+// history under one epoch).  Now the first leadership is refused (the
+// controller bumps; every later grant is new), and the "unknown" marker is
+// durable until that refusal's fence is — a restart in between still refuses.
+TEST(HotPathBRegression, CorruptEpochStateRefusesTheFirstLeadershipRegression) {
+    TmpDir d;
+    rune::replication::NullPartitionTransport t;
+    PartitionConfig c;
+    c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+    {
+        rune::storage::Log log(d.p.string());
+        log.recover();
+        log.append(stampedBatch(0, 3, 1), 2);
+        PartitionReplica r(c, Role::Leader, 1, {1}, {1}, &log, &t);
+        r.setExternalFollowerFlush(true);
+        r.setExternalFollowerFlush(false);
+        r.setIsrChannel(&t);
+        r.becomeLeader(7, {1});                // fence 7, no batch at 7
+        ASSERT_EQ(r.role(), Role::Leader);
+    }
+    {
+        std::fstream f(d.p / rune::storage::LeaderEpochState::kFileName, std::ios::in | std::ios::out | std::ios::binary);
+        const auto sz = fs::file_size(d.p / rune::storage::LeaderEpochState::kFileName);
+        f.seekp(0); f.write("XXXX", 4);
+        f.seekp(static_cast<std::streamoff>(sz / 2)); f.write("XXXX", 4);
+    }
+    {   // restart over the corrupt file, no leadership offered (crash window)
+        rune::storage::Log log(d.p.string());
+        log.recover();
+        PartitionReplica r(c, Role::Follower, 7, {1}, {1}, &log, &t);
+        EXPECT_EQ(r.leaderEpochCacheForTest().latestEpoch(), 1);
+    }
+    {
+        rune::storage::Log log(d.p.string());
+        log.recover();
+        PartitionReplica r(c, Role::Follower, 7, {1}, {1}, &log, &t);
+        r.setIsrChannel(&t);
+        r.becomeLeader(7, {1});
+        EXPECT_NE(r.role(), Role::Leader) << "led at an epoch an earlier incarnation may have led at";
+        EXPECT_GE(r.restartFenceEpochForTest(), 7);
+    }
+    {   // the refusal's fence is durable: epochs <= 7 stay refused, a bump leads
+        rune::storage::Log log(d.p.string());
+        log.recover();
+        PartitionReplica r(c, Role::Follower, 7, {1}, {1}, &log, &t);
+        r.setIsrChannel(&t);
+        EXPECT_GE(r.restartFenceEpochForTest(), 7);
+        r.becomeLeader(8, {1});
+        EXPECT_EQ(r.role(), Role::Leader);
+        EXPECT_EQ(r.epoch(), 8);
+    }
+}
+
+// D21 review L3: the legacy truncation fallback (no read map: the index is
+// rebuilt and RENAMED without msync) followed by a crash that loses the index
+// pages, with the recovery point INSIDE the active segment: a restart never
+// looks a record up through that index unrebuilt — every segment is
+// recover()ed (index rebuilt from the .log) at startup.
+TEST(HotPathBRegression, LostUnsyncedIndexAfterFallbackTruncationIsRebuiltRegression) {
+    TmpDir d;
+    std::string indexPath;
+    {
+        rune::storage::Log log(d.p.string(), 1 << 20);
+        log.recover();
+        log.setDeferSealSync(true);
+        for (int i = 0; i < 400; ++i) { const auto b = stampedBatch(i * 2, 2, 1); log.append(b, i * 2 + 1); }
+        ASSERT_EQ(log.checkpointRecoveryPoint(), 0);
+        ASSERT_GT(log.persistedRecoveryPoint(), 0) << "precondition: R inside the active segment";
+        auto* seg = log.segmentForTest(0);
+        ASSERT_NE(seg, nullptr);
+        (void)seg->swapReadMap(nullptr);     // no read map, and none can be made:
+        seg->setReadMapFaultForTest(true);   // the legacy rebuild fallback
+        ASSERT_TRUE(log.truncateTo(601));    // inside batch [600, 601]
+        ASSERT_EQ(log.logEndOffset(), 600);
+        ASSERT_EQ(log.inPlaceTruncationsForTest(), 0u) << "precondition: the legacy rebuild fallback ran";
+        ASSERT_GT(log.persistedRecoveryPoint(), 0);
+        indexPath = (d.p / "00000000000000000000.index").string();   // (seg was replaced by the rebuild)
+        log.crashForTest();
+    }
+    {   // the rebuilt index's pages never reached the disk: what is there is
+        // garbage — entries pointing into the middle of batches
+        const auto sz = fs::file_size(indexPath);
+        std::vector<uint8_t> junk(sz, 0);
+        for (std::size_t i = 0; i + 8 <= std::min<std::size_t>(sz, 4096); i += 8) {
+            const int32_t rel = static_cast<int32_t>(i);   // ascending relative offsets
+            const int32_t pos = 7;                          // never a batch start
+            std::memcpy(junk.data() + i, &rel, 4);
+            std::memcpy(junk.data() + i + 4, &pos, 4);
+        }
+        std::ofstream f(indexPath, std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char*>(junk.data()), static_cast<std::streamsize>(junk.size()));
+    }
+    rune::storage::Log log(d.p.string(), 1 << 20);
+    log.recover();
+    EXPECT_EQ(log.logEndOffset(), 600);
+    for (int64_t o = 0; o < 600; o += 37) {
+        const auto bytes = log.read(o, 1 << 16);
+        ASSERT_FALSE(bytes.empty()) << o;
+        rune::protocol::RecordBatchReader r(bytes.data(), bytes.size());
+        EXPECT_LE(r.baseOffset(), o);
+        EXPECT_GE(r.baseOffset() + r.lastOffsetDelta(), o) << "looked up through a lost index";
+    }
+}
+
+// D21 re-review low: the below-recovery-point spot-check reads the batch AT an
+// offset — over a compaction gap read(o) returns a LATER batch (another
+// epoch), which was taken as a disagreement: a false "stale" and a full log
+// scan at every restart.  A batch that does not contain o is no evidence.
+TEST(HotPathBRegression, CompactionGapIsNoEpochHistoryDisagreementRegression) {
+    TmpDir d;
+    rune::replication::NullPartitionTransport t;
+    PartitionConfig c;
+    c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+    {
+        rune::storage::Log log(d.p.string());
+        log.recover();
+        log.append(stampedBatch(0, 5, 1), 4);     // epoch 1: [0, 4]; [5, 9] compacted away
+        log.append(stampedBatch(10, 2, 2), 11);   // epoch 2 from 10
+        ASSERT_EQ(log.checkpointRecoveryPoint(), 0);
+        PartitionReplica r(c, Role::Follower, 2, {1}, {1}, &log, &t);
+        r.setExternalFollowerFlush(true);   // leader-epoch-state written
+        r.setExternalFollowerFlush(false);
+        ASSERT_TRUE(r.writeEpochStateInlineForTest() || r.epochStateEnabledForTest());
+    }
+    {   // history {1:0, 2:10} as written, but entry 1's last offset (9) is in the gap
+        const std::vector<std::pair<int32_t, int64_t>> e{{1, 0}, {2, 10}};
+        const int fd = rune::storage::LeaderEpochState::create(
+            d.p.string(), rune::storage::LeaderEpochState::strideFor(rune::storage::LeaderEpochState::kMinEntries),
+            100, 2, e.begin(), e.end());
+        ASSERT_GE(fd, 0);
+        ::close(fd);
+    }
+    rune::storage::Log log(d.p.string());
+    log.recover();
+    ASSERT_GT(log.startupRecoveryPoint(), 10) << "precondition: the history is below the recovery point";
+    PartitionReplica r(c, Role::Follower, 2, {1}, {1}, &log, &t);
+    EXPECT_EQ(r.epochHistoryRebuildsForTest(), 0u) << "a compaction gap was taken for a stale history";
+    EXPECT_EQ(r.leaderEpochCacheForTest().startOffsetFor(2), 10);
 }
