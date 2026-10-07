@@ -430,6 +430,7 @@ TEST(Tls, UntrustedCertRejected) {
   - `done()`: `SSL_is_init_finished(ssl)`.
   - `exportKeys`: `SSL_export_keying_material(ssl, out, 32, label, labelLen, nullptr, 0, 0)` with distinct labels `"rune c2b key"`, `"rune b2c key"`, and 4-byte prefixes exported with labels `"rune c2b iv"`/`"rune b2c iv"` mixed with `sessionId` as context. Both sides use the same labels → identical keys.
   - Enforce TLS 1.3 only: `SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION)`.
+  - **Fail closed in the security core:** guard `exportKeys` on `done() && !failed_` and check all four `SSL_export_keying_material` return values — never return zeroed keys on a not-finished/failed session (a deterministic all-zero key both peers would "agree" on). Check `SSL_set1_host`'s return and fail the session if it is 0 — an uninstalled hostname check must never leave `SSL_VERIFY_PEER` accepting a CA-valid cert for any host.
 
 - [ ] **Step 5: Run — verify pass; commit.** Wire `testdata` copy into the test `WORKING_DIRECTORY` (`gtest_discover_tests(... WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tests)`). Commit `feat: TlsSession memory-BIO 1.3 handshake + key export`.
 
