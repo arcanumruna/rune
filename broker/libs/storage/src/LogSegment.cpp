@@ -47,10 +47,9 @@ std::unique_ptr<LogSegment> LogSegment::openPrebuilt(
     seg->indexMaxBytes_      = indexMaxBytes;
     seg->nextOffset_         = base;
     seg->durableNext_        = base;
-    seg->log_.open(logFile, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
-    if (!seg->log_.is_open())
-        throw std::runtime_error("LogSegment::openPrebuilt: cannot open " + logFile);
-    seg->fd_ = ::open(logFile.c_str(), O_RDWR | O_APPEND);
+    // D20: the raw fd is the segment's ONLY handle on its .log (no FILE*/fstream —
+    // glibc's fclose walks the process-wide FILE list: O(open segments)).
+    seg->fd_ = ::open(logFile.c_str(), O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
     if (seg->fd_ < 0)
         throw std::system_error(errno, std::system_category(), "LogSegment::openPrebuilt: open " + logFile);
     seg->index_ = std::make_unique<OffsetIndex>(indexFile, base, indexMaxBytes);
@@ -63,8 +62,8 @@ std::unique_ptr<LogSegment> LogSegment::openPrebuilt(
 std::unique_ptr<LogSegment> LogSegment::prepareStaging(
     const std::string& stagingLogPath, const std::string& stagingIndexPath,
     int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes, std::size_t readMapBytes) {
-    // Construct at provisional base 0.  All the expensive syscalls (2 open()s for
-    // the .log fstream+fd, 1 open() + ftruncate + mmap + prefault for the .index)
+    // Construct at provisional base 0.  All the expensive syscalls (1 open() for
+    // the .log fd, 1 open() + ftruncate + mmap + prefault for the .index)
     // happen HERE, on the background thread.  The staging files use non-.log/.index
     // extensions (invisible to segment/retention scans); the adopt-time rename
     // gives them their final <base>.log/.index names.
@@ -80,10 +79,7 @@ std::unique_ptr<LogSegment> LogSegment::prepareStaging(
     seg->logPath_.reserve(stagingLogPath.size() + 32);
     seg->logPath_           = stagingLogPath;
     const std::string& idxPath = stagingIndexPath;
-    seg->log_.open(seg->logPath_, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
-    if (!seg->log_.is_open()) { std::ofstream(seg->logPath_, std::ios::binary).close();
-        seg->log_.open(seg->logPath_, std::ios::in | std::ios::out | std::ios::binary | std::ios::app); }
-    seg->fd_ = ::open(seg->logPath_.c_str(), O_RDWR | O_APPEND | O_CREAT, 0644);
+    seg->fd_ = ::open(seg->logPath_.c_str(), O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
     // F3 fix-round-1, item 2: an unchecked open() failure used to leave fd_ at
     // -1 and silently continue — sync() would then silently skip the
     // fdatasync forever (fd_ < 0 is a no-op in sync()), a silent durability
@@ -140,14 +136,14 @@ LogSegment::LogSegment(std::string dir, int64_t baseOffset, int32_t indexInterva
     : baseOffset_(baseOffset), indexIntervalBytes_(indexIntervalBytes),
       indexMaxBytes_(indexMaxBytes), nextOffset_(baseOffset), durableNext_(baseOffset) {
     logPath_ = fname(dir, baseOffset, ".log");
-    log_.open(logPath_, std::ios::in | std::ios::out | std::ios::binary | std::ios::app);
-    if (!log_.is_open()) { std::ofstream(logPath_, std::ios::binary).close();
-        log_.open(logPath_, std::ios::in | std::ios::out | std::ios::binary | std::ios::app); }
-    // Open a POSIX fd for fsync and direct reads (pread).
-    // O_RDWR so we can use pread() from it in read() without the fstream
-    // mixed-mode slowdown on macOS.  Writes still go through fstream for
-    // simplicity; fd_ is used for fdatasync and pread only.
-    fd_ = ::open(logPath_.c_str(), O_RDWR | O_APPEND | O_CREAT, 0644);
+    // D20: ONE raw POSIX fd is the segment's only handle on its .log — every
+    // write (pwrite/pwritev), read (pread / read mmap), truncate (ftruncate) and
+    // sync (fsync) goes through it.  No std::fstream: each one held a libc FILE*
+    // (+ its own fd) for the segment's whole life, and glibc's fclose unlinks the
+    // FILE from ONE process-wide list with a linear walk — O(open segments) per
+    // segment destruction (>1M owner passes to drain 256 retention drops at 40k
+    // segments).
+    fd_ = ::open(logPath_.c_str(), O_RDWR | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
     // F3 fix-round-1, item 2: see prepareStaging()'s identical check above —
     // an unchecked open() failure used to leave fd_ at -1 and silently
     // continue, so sync() would silently skip the fdatasync forever (a
@@ -223,8 +219,27 @@ LogSegment::~LogSegment() {
 }
 
 int LogSegment::flushBufferedToPageCache() noexcept {
-    log_.flush();
-    return log_ ? 0 : EIO;
+    // D20: every write is a pwrite/pwritev straight into the page cache — there
+    // is no userspace buffer left to push.  Kept as the seal-protocol hook.
+    return 0;
+}
+
+// D20: write all of [data, data+len) at the O_APPEND end of the .log through
+// fd_ — the durable append() path (formerly a buffered fstream write + flush).
+// Retries a short write / EINTR like the libc stream did; 0 or errno (ENOSPC for
+// a zero-progress write).
+int LogSegment::writeAll_(const uint8_t* data, std::size_t len) noexcept {
+    std::size_t done = 0;
+    while (done < len) {
+        const ssize_t w = ::pwrite(fd_, data + done, len - done, static_cast<off_t>(logSize_) + static_cast<off_t>(done));
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return errno != 0 ? errno : EIO;
+        }
+        if (w == 0) return ENOSPC;
+        done += static_cast<std::size_t>(w);
+    }
+    return 0;
 }
 
 void LogSegment::sync() {
@@ -238,10 +253,8 @@ void LogSegment::sync() {
         }
     }
     int err = 0;
-    // 1. Flush libc buffer → OS page cache.
-    log_.flush();
-    if (!log_) err = EIO;
-    if (err == 0 && storage_ && storage_->faultForTest != 0) err = storage_->faultForTest;
+    // 1. (D20) No libc buffer: every write already reached the page cache.
+    if (storage_ && storage_->faultForTest != 0) err = storage_->faultForTest;
     // 2. fsync: flush page cache → storage device (data + size metadata needed to read).
     if (err == 0 && fd_ >= 0 && ::fsync(fd_) != 0) err = errno;
     // 3. msync: ensure mmap'd index pages are also written to device.
@@ -260,9 +273,7 @@ int LogSegment::syncForRecovery() noexcept {
         if (storage_->failedErrno != 0) return storage_->failedErrno;
     }
     int err = 0;
-    log_.flush();
-    if (!log_) err = EIO;
-    if (err == 0 && storage_ && storage_->faultForTest != 0) err = storage_->faultForTest;
+    if (storage_ && storage_->faultForTest != 0) err = storage_->faultForTest;
     if (err == 0 && fd_ >= 0 && ::fsync(fd_) != 0) err = errno != 0 ? errno : EIO;
     if (err != 0) {
         if (storage_ && storage_->failedErrno == 0) storage_->failedErrno = err;
@@ -301,7 +312,7 @@ void LogSegment::preallocate(int64_t bytes) noexcept {
 
 // ---------------------------------------------------------------------------
 // writeAndUpdateState — shared core: update index + write bytes + advance LEO.
-// Writes via fstream (buffered, write-only path) for the durable append() path.
+// Writes through fd_ (D20: pwrite, no fstream) for the durable append() path.
 // Does NOT call sync(). Called by append() and (indirectly) appendNoSync().
 // ---------------------------------------------------------------------------
 int64_t LogSegment::writeAndUpdateState(const uint8_t* data, std::size_t len, int64_t lastOffset) {
@@ -314,13 +325,10 @@ int64_t LogSegment::writeAndUpdateState(const uint8_t* data, std::size_t len, in
         index_->append(r.baseOffset(), logSize_); // C4: OffsetIndex::append guards 2GiB
         bytesSinceIndex_ = 0;
     }
-    log_.seekp(0, std::ios::end);
-    if (storage_ && storage_->writeFaultForTest != 0) [[unlikely]] {
-        log_.setstate(std::ios::badbit);
+    if (storage_ && storage_->writeFaultForTest != 0) [[unlikely]]
         failWrite_(storage_->writeFaultForTest, "LogSegment::append write");
-    }
-    log_.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(len));
-    if (!log_) [[unlikely]] failWrite_(errno != 0 ? errno : EIO, "LogSegment::append write");
+    if (const int e = writeAll_(data, len); e != 0) [[unlikely]]
+        failWrite_(e, "LogSegment::append write");
     logSize_ += static_cast<int64_t>(len);
     bytesSinceIndex_ += static_cast<int64_t>(len);
     nextOffset_ = lastOffset + 1;
@@ -349,8 +357,7 @@ int64_t LogSegment::append(const std::vector<uint8_t>& batch, int64_t lastOffset
 
 int64_t LogSegment::appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffset) {
     // No-sync path: write via pwrite() directly to fd_ (O_RDWR|O_APPEND),
-    // bypassing the fstream write path entirely.  pwrite() goes directly to the
-    // OS page cache — no userspace buffer, no seekp/write fstream overhead.
+    // pwrite() goes directly to the OS page cache — no userspace buffer.
     // No fsync: data is page-cache-durable only (acks=Leader / acks=1 trade-off).
     //
     // Guard: batch must be at least the size of record-batch overhead.
@@ -370,12 +377,7 @@ int64_t LogSegment::appendNoSync(const uint8_t* data, std::size_t len, int64_t l
     // pwrite() on macOS with O_APPEND ignores the offset argument for the actual
     // write location (always appends to end), but using logSize_ makes the intent
     // clear and lets pread() read the data from the same position.
-    //
-    // Note: because we bypass fstream's write buffer here, the fstream's internal
-    // "dirty" state may be stale. We must NOT mix fstream writes and pwrite()
-    // calls without a sync — so appendNoSync exclusively uses pwrite(), and
-    // append() (durable path) uses fstream.  In practice, the log is only ever
-    // used via one path (either fstream-append or pwrite-appendNoSync) at a time.
+    // (D20: append() writes through the same fd_ — the paths may mix freely.)
     //
     // Durability: pwrite() to a non-O_SYNC fd writes to page cache only.
     // A leader crash before sync() (flushDirtyLogs) may lose the tail.
@@ -480,11 +482,7 @@ std::vector<uint8_t> LogSegment::read(int64_t startOffset, int32_t maxBytes) {
     // the batch or exhaust the segment.
     for (;;) {
         std::vector<uint8_t> buf(static_cast<size_t>(toRead));
-        // Use pread() via fd_ to avoid fstream mixed read/write mode overhead.
-        // On macOS, fstream::seekg() after a write flushes the write buffer
-        // through a slow path (~600µs per call observed); pread() is O(1) and
-        // bypasses the fstream buffer entirely.  fd_ is O_RDWR | O_APPEND so
-        // pread() is legal (pread ignores the file position for the read).
+        // pread() via fd_ (O_RDWR | O_APPEND; pread ignores the file position).
         if (toRead > 0 && fd_ >= 0) {
             ssize_t nread = ::pread(fd_, buf.data(), static_cast<std::size_t>(toRead),
                                    static_cast<off_t>(op.position));
@@ -640,7 +638,6 @@ int LogSegment::openTrusted(int64_t nextOffset) noexcept {
 }
 
 int LogSegment::truncateInPlace(int64_t truncateOffset, int64_t& keptMaxTs) noexcept {
-    if (log_.is_open()) log_.flush();   // the durable fstream path: nothing buffered past the cut
     // Re-review N1: the cut is derived from the WHOLE segment — never from a
     // prefix-only mapping (Md5 grows maps off the owner; a demoted leader's
     // segment may never have had its grown map installed).  This cold path
@@ -689,11 +686,25 @@ int LogSegment::truncateInPlace(int64_t truncateOffset, int64_t& keptMaxTs) noex
 }
 
 int64_t LogSegment::recover(bool syncIndex) {
-    log_.seekg(0, std::ios::end);
-    int64_t fileSize = log_.tellg();
+    // D20: read the whole .log through fd_ (pread), not a FILE*-backed stream.
+    struct stat st{};
+    if (::fstat(fd_, &st) != 0)
+        throw std::system_error(errno, std::system_category(), "LogSegment::recover fstat " + logPath_);
+    const int64_t fileSize = static_cast<int64_t>(st.st_size);
     std::vector<uint8_t> buf(static_cast<size_t>(fileSize));
-    log_.seekg(0, std::ios::beg);
-    if (fileSize > 0) log_.read(reinterpret_cast<char*>(buf.data()), fileSize);
+    {
+        std::size_t got = 0;
+        while (got < buf.size()) {
+            const ssize_t r = ::pread(fd_, buf.data() + got, buf.size() - got, static_cast<off_t>(got));
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                throw std::system_error(errno, std::system_category(), "LogSegment::recover pread " + logPath_);
+            }
+            if (r == 0) break;   // shrank under us: validate what was read
+            got += static_cast<std::size_t>(r);
+        }
+        buf.resize(got);
+    }
 
     // B3: rebuild into .index.tmp, then atomically rename over the canonical .index
     // so there is never a window where the on-disk index is stale/orphaned.
@@ -724,9 +735,9 @@ int64_t LogSegment::recover(bool syncIndex) {
     }
 
     // Truncate torn tail.
-    std::filesystem::resize_file(logPath_, static_cast<uintmax_t>(validBytes));
-    log_.close();
-    log_.open(logPath_, std::ios::in | std::ios::out | std::ios::binary);
+    // D20: through the segment's own fd (its inode), never by path.
+    if (::ftruncate(fd_, static_cast<off_t>(validBytes)) != 0)
+        throw std::system_error(errno, std::system_category(), "LogSegment::recover ftruncate " + logPath_);
     logSize_ = validBytes; nextOffset_ = next;
     if (syncedBytes_ > validBytes) syncedBytes_ = validBytes;   // E2 crash seam
     // E1d: recover() itself proves nothing durable — the owning Log decides
