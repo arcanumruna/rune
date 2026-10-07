@@ -1541,28 +1541,42 @@ TEST(ShardModeRegression, KilledPausedClientsSessionAndAcksAreFreedRegression) {
             return node.workerForTest(0)->sessionAcksPendingForTest();
         });
     };
-    int64_t sidA = 0;
+    auto clientImages = [&] { return node.onControlThreadForTest([&] { return node.gatewayForTest()->clientImageCountForTest(); }); };
+    const int images0 = clientImages();
+    ShardTestClient b(bd.path, 1 << 20, true);
+    int64_t sidA = 0, sidB = 0;
     {
         ShardTestClient a(ad.path, 1 << 20, /*legacyTransport=*/true);
         sidA = a.connect(gw, kClientStream);
         ASSERT_GT(sidA, 0);
         ASSERT_TRUE(a.produceUntilOk(gw, kClientStream, sidA, 0, 0, /*acks=*/1, makeBatch(1)));
-        // Precondition: the worker HOLDS A's acks (A reads nothing; 40k acks >> its 128 KiB egress window).  The
-        // gateway pause itself is not required here (it can lag a burst under load — D8c).
-        (void)pauseClient(a, gw, sidA, 50'000'000, [&] { return gatewayPauses() > 0 || acksPending() > 256; });
+        // Precondition: the worker HOLDS A's acks (A reads nothing; 40k acks >> its egress window).  D11: wait for
+        // a HOLD abort — a transient ack backlog (pending > 256) or a credit pause is not a hold: those acks still
+        // fit A's window and drain moments later.
+        (void)pauseClient(a, gw, sidA, 50'000'000, [&] { return gatewayPauses() > 0; });
         ASSERT_TRUE(awaitBrokerState([&] { return acksPending() > 0; }, 10s))
             << "the worker holds A's acks (stall offer=" << a.lastStallOffer_ << ")";
+        // D8b-L (LOW-4): another session on the SAME worker keeps full intake WHILE A still pins its acks.
+        sidB = b.connect(gw, kClientStream);
+        ASSERT_GT(sidB, 0);
+        for (int k = 0; k < 5; ++k)
+            ASSERT_TRUE(b.produceUntilOk(gw, kClientStream, sidB, 0, 0, /*acks=*/1, makeBatch(1), /*maxAttempts=*/3))
+                << "B's produce " << k << " starved while A pins acks";
+        ASSERT_GT(acksPending(), 0) << "A still pins acks while B is served; A alive=" << sessionAlive(sidA);
     }                                                                  // A is killed (client + driver closed)
     const auto killed = std::chrono::steady_clock::now();
     EXPECT_TRUE(awaitBrokerState([&] { return !sessionAlive(sidA) && acksPending() == 0; }, 40s))
         << "a killed paused client's session and owed acks must be freed";
     const auto took = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - killed);
     EXPECT_LE(took.count(), 25) << "~5 s NOT_CONNECTED + 10 s lease, not the 10-min held bound";
-    ShardTestClient b(bd.path, 1 << 20, true);
-    const int64_t sidB = b.connect(gw, kClientStream);
-    ASSERT_GT(sidB, 0);
+    // D8b-L (LOW-4): A's image at the gateway is released (an aborted held frame never pins it); B's stays.
+    EXPECT_TRUE(awaitBrokerState([&] { return clientImages() == images0 + 1; }, 40s))
+        << "the killed client's gateway image was not released: images=" << clientImages() << " baseline=" << images0;
+    // B sent nothing during that wait (no keepalives): its session may be reaped on the normal lease — a new one.
+    const int64_t sidB2 = b.connect(gw, kClientStream);
+    ASSERT_GT(sidB2, 0);
     for (int k = 0; k < 5; ++k)
-        ASSERT_TRUE(b.produceUntilOk(gw, kClientStream, sidB, 0, 0, /*acks=*/1, makeBatch(1), /*maxAttempts=*/3));
+        ASSERT_TRUE(b.produceUntilOk(gw, kClientStream, sidB2, 0, 0, /*acks=*/1, makeBatch(1), /*maxAttempts=*/3));
     node.stop();
 }
 
@@ -1598,8 +1612,8 @@ void runPausedInvokerClientSurvivesNotConnected(uint32_t gatewayProduceCredits) 
             return node.workerForTest(0)->sessionAcksPendingForTest();
         });
     };
-    // Precondition: the worker HOLDS A's acks (the gateway pause can lag a burst under load — D8c).
-    const int64_t n = pauseClient(a, gw, sidA, c0, [&] { return gatewayPauses() > 0 || acksPending() > 256; });
+    // Precondition: the worker HOLDS A's acks (D11: a HOLD abort — not a credit pause / transient backlog).
+    const int64_t n = pauseClient(a, gw, sidA, c0, [&] { return gatewayPauses() > 0; });
     ASSERT_GT(n, 0) << "stall offer=" << a.lastStallOffer_;
     ASSERT_TRUE(awaitBrokerState([&] { return acksPending() > 0; }, 10s)) << "the worker holds A's acks; n=" << n
         << " aborts{all=" << gatewayPauses() << " credit="

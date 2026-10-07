@@ -1925,6 +1925,9 @@ public:
     /// Fix round 3: Produce frames ABORTed because their session was held
     /// (control thread only — read via BrokerNode::onControlThreadForTest).
     [[nodiscard]] uint64_t heldProduceAbortsForTest() const noexcept { return heldProduceAborts_; }
+    /// D8b-L (LOW-4): images on the client ingress subscription (control thread) — a dead client's image must be
+    /// released, never pinned by an aborted (held) Produce frame.
+    [[nodiscard]] int clientImageCountForTest() const { return sub_ ? sub_->imageCount() : 0; }
     /// D8c: one shutdown line with the paused-produce counters (only when any
     /// pause happened; warn so it shows at the perf log level).  Call once the
     /// control thread is joined.
