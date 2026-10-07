@@ -1431,8 +1431,8 @@ TEST(BrokerNodeRegression, HeterogeneousFollowerDropIsBoundedRegression) {
     ctx.aeronDir(dcfg.dir);
     auto aeron = aeron::Aeron::connect(ctx);
 
-    const std::string chanL = "aeron:udp?endpoint=127.0.0.1:40121";
-    const std::string chanF = "aeron:udp?endpoint=127.0.0.1:40122";
+    const std::string chanL = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());   // D11: allocator, not fixed
+    const std::string chanF = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
     rune::replication::AeronPartitionTransport ldrT(aeron, chanL, 910, 1, 4 << 20);
     rune::replication::AeronPartitionTransport flwT(aeron, chanF, 910, 2, 4 << 20);
     ldrT.setPublicationMaxMessageBytes(rune::replication::aeronMaxMessageLength(ncfg.aeronTermBufferBytes));
@@ -1819,20 +1819,9 @@ TEST(BrokerNodeTest, OwnerThreadHookTimeoutCancelsTaskRegression) {
 TEST(BrokerNodeRegression, GatewayEnforcesProduceIntakeLimit) {
     TempDir tmp{"f18_wire_"};
     NodeConfig cfg = makeSingleNodeConfig(tmp.path);
-    // A kernel-assigned free port (the fixed 50001 collides with parallel suites).
-    {
-        const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-        ASSERT_GE(fd, 0);
-        sockaddr_in a{};
-        a.sin_family = AF_INET;
-        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        ASSERT_EQ(::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)), 0);
-        socklen_t len = sizeof(a);
-        ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-        ::close(fd);
-        cfg.clientEndpoint.channel =
-            "aeron:udp?endpoint=127.0.0.1:" + std::to_string(ntohs(a.sin_port));
-    }
+    // A free port from the shared allocator (the fixed 50001 collides with parallel suites).
+    cfg.clientEndpoint.channel =   // D11: never an ephemeral (bind-0) port
+        "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
     BrokerNode node{cfg};
     node.start();
     ASSERT_NE(node.gatewayForTest(), nullptr);
@@ -1848,19 +1837,8 @@ TEST(BrokerNodeRegression, GatewayEnforcesProduceIntakeLimit) {
 TEST(BrokerNodeRegression, GatewayAndEveryWorkerShareTheOneBatchLimit) {
     TempDir tmp{"wave2_limit_"};
     NodeConfig cfg = makeSingleNodeConfig(tmp.path);
-    {
-        const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-        ASSERT_GE(fd, 0);
-        sockaddr_in a{};
-        a.sin_family = AF_INET;
-        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        ASSERT_EQ(::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)), 0);
-        socklen_t len = sizeof(a);
-        ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-        ::close(fd);
-        cfg.clientEndpoint.channel =
-            "aeron:udp?endpoint=127.0.0.1:" + std::to_string(ntohs(a.sin_port));
-    }
+    cfg.clientEndpoint.channel =   // D11: never an ephemeral (bind-0) port
+        "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
     cfg.workerCount = 2;
     TopicSpec ts;
     ts.name           = "wave2-limit";

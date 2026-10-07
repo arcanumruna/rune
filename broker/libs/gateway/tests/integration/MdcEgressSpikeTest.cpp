@@ -16,6 +16,7 @@
 //     delivering to the removed endpoint.  Hence dynamic mode, not manual.
 //
 // This file documents the exact working channel syntax and guards the mechanic.
+#include <rune/aeronutil/testing/FreePort.h>
 #include <gtest/gtest.h>
 #include <Aeron.h>
 #include <ExclusivePublication.h>
@@ -39,12 +40,17 @@ constexpr int32_t kEgressStream = 1001;
 // to it and the driver auto-adds them as destinations (and auto-removes on
 // liveness timeout).  The publisher never manages the destination list — ideal
 // for shared-nothing (the worker owns only the pub; no control-thread touch).
-constexpr const char* kPubChannel  =
-    "aeron:udp?control-mode=dynamic|control=127.0.0.1:24700|fc=min";
-constexpr const char* kSub1Channel =
-    "aeron:udp?control=127.0.0.1:24700|control-mode=dynamic|endpoint=127.0.0.1:24611";
-constexpr const char* kSub2Channel =
-    "aeron:udp?control=127.0.0.1:24700|control-mode=dynamic|endpoint=127.0.0.1:24612";
+// D11: ports from the shared allocator (the fixed 24700/24611/24612 collided with
+// allocator ports in concurrently running tests).
+const std::string kControlEp = "127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+const std::string kPubChannelS  = "aeron:udp?control-mode=dynamic|control=" + kControlEp + "|fc=min";
+const std::string kSub1ChannelS = "aeron:udp?control=" + kControlEp + "|control-mode=dynamic|endpoint=127.0.0.1:" +
+                                  std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+const std::string kSub2ChannelS = "aeron:udp?control=" + kControlEp + "|control-mode=dynamic|endpoint=127.0.0.1:" +
+                                  std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+const char* const kPubChannel  = kPubChannelS.c_str();
+const char* const kSub1Channel = kSub1ChannelS.c_str();
+const char* const kSub2Channel = kSub2ChannelS.c_str();
 
 class MdcSpikeFixture : public ::testing::Test {
 protected:

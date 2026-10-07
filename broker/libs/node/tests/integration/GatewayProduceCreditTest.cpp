@@ -7,6 +7,7 @@
 // admit/ABORT decision and dispatch of the shard-mode controlled poll), the
 // worker by explicit doWork passes whose returns feed the gateway — every
 // ordering is deterministic.  No sleeps; every wait has a hard iteration cap.
+#include <rune/aeronutil/testing/FreePort.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/EmbeddedDriver.h>
@@ -90,16 +91,8 @@ std::vector<uint8_t> produceFrame(int64_t sid, int64_t corr, uint8_t acks) {
     m.encode(f.data());
     return f;
 }
-// A free loopback UDP port (bind to 0, read it back, release it).
-int freeUdpPort() {
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
-    ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a);
-    socklen_t n = sizeof a;
-    ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &n);
-    ::close(fd);
-    return ntohs(a.sin_port);
-}
+// A free loopback UDP port outside the ephemeral range (D11: never bind-0 — parallel tests collided).
+int freeUdpPort() { return rune::aeronutil::testing::allocFreeUdpPort(); }
 rune::node::WorkerReturn creditSignal(int64_t sid, int64_t n) {
     rune::node::WorkerReturn r;
     r.type = rune::node::WorkerReturn::Type::SessionSignal;

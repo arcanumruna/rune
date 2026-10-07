@@ -5,6 +5,7 @@
 //
 // Uses an embedded UDP-capable Aeron media driver (same pattern validated by the
 // MDC egress spike).
+#include <rune/aeronutil/testing/FreePort.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/WorkerEgress.h>
 
@@ -29,7 +30,11 @@ using namespace rune::node;
 namespace {
 
 constexpr int32_t kStream = 2001;
-constexpr const char* kControl = "127.0.0.1:24720";
+// D11: loopback endpoints from the shared allocator (20000..31999, never bind-0) — the old
+// fixed 24xxx ports collided with the allocator's ports in concurrently running tests.
+inline std::string freeEndpoint() { return "127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort()); }
+const std::string kControlEp = freeEndpoint();
+const char* const kControl = kControlEp.c_str();
 
 class WorkerEgressFixture : public ::testing::Test {
 protected:
@@ -94,8 +99,8 @@ TEST_F(WorkerEgressFixture, ResolvesAndDeliversToDynamicSubscribers) {
     ASSERT_TRUE(eg.resolved()) << "WorkerEgress publication did not resolve";
     EXPECT_EQ(eg.streamId(), kStream);
 
-    auto sub1 = resolveSub(subChannel("127.0.0.1:24721"), kStream);
-    auto sub2 = resolveSub(subChannel("127.0.0.1:24722"), kStream);
+    auto sub1 = resolveSub(subChannel(freeEndpoint().c_str()), kStream);
+    auto sub2 = resolveSub(subChannel(freeEndpoint().c_str()), kStream);
     ASSERT_NE(sub1, nullptr);
     ASSERT_NE(sub2, nullptr);
 
@@ -140,13 +145,14 @@ TEST_F(WorkerEgressFixture, NullAeronIsUnresolvedAndSendIsNoop) {
 // NOTE: fc=min was intentionally REMOVED (min flow control paced the publisher to
 // the slowest/late receiver and stalled the reader); default flow control is used.
 TEST_F(WorkerEgressFixture, AccessorsAndChannelFormat) {
-    WorkerEgress eg(aeron_, "127.0.0.1:24730", 2099);
+    const std::string ep = freeEndpoint();
+    WorkerEgress eg(aeron_, ep.c_str(), 2099);
     ASSERT_TRUE(eg.resolved());
     EXPECT_EQ(eg.streamId(), 2099);
-    EXPECT_EQ(eg.controlEndpoint(), "127.0.0.1:24730");
+    EXPECT_EQ(eg.controlEndpoint(), ep);
     const std::string& ch = eg.channel();
     EXPECT_NE(ch.find("control-mode=dynamic"), std::string::npos) << ch;
-    EXPECT_NE(ch.find("control=127.0.0.1:24730"), std::string::npos) << ch;
+    EXPECT_NE(ch.find("control=" + ep), std::string::npos) << ch;
     EXPECT_EQ(ch.find("fc=min"), std::string::npos) << "fc=min must NOT be present: " << ch;
     EXPECT_GT(eg.maxPayloadLength(), 0);
 }
@@ -154,7 +160,8 @@ TEST_F(WorkerEgressFixture, AccessorsAndChannelFormat) {
 // send() with NO subscribers connected must not crash and must return <= 0
 // (not-connected / back-pressure) so the caller does not advance its cursor.
 TEST_F(WorkerEgressFixture, SendWithNoSubscribersReturnsNonPositive) {
-    WorkerEgress eg(aeron_, "127.0.0.1:24740", 2098);
+    const std::string ep = freeEndpoint();
+    WorkerEgress eg(aeron_, ep.c_str(), 2098);
     ASSERT_TRUE(eg.resolved());
     EXPECT_FALSE(eg.isConnected());  // no subscriber yet
     uint8_t payload[64];
@@ -166,11 +173,12 @@ TEST_F(WorkerEgressFixture, SendWithNoSubscribersReturnsNonPositive) {
 // A frame larger than maxPayloadLength must be fragmented by offer() and
 // reassembled into a single message by the subscriber's FragmentAssembler.
 TEST_F(WorkerEgressFixture, LargeFrameFragmentsAndReassembles) {
-    const char* control = "127.0.0.1:24750";
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
     WorkerEgress eg(aeron_, control, 2097);
     ASSERT_TRUE(eg.resolved());
     auto sub = resolveSub(std::string("aeron:udp?control=") + control +
-                          "|control-mode=dynamic|endpoint=127.0.0.1:24751", 2097);
+                          "|control-mode=dynamic|endpoint=" + freeEndpoint(), 2097);
     ASSERT_NE(sub, nullptr);
     ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
 
@@ -191,13 +199,14 @@ TEST_F(WorkerEgressFixture, LargeFrameFragmentsAndReassembles) {
 // A subscriber that joins AFTER the publication exists still receives subsequent
 // sends (dynamic-MDC auto-add on connect).
 TEST_F(WorkerEgressFixture, LateSubscriberReceivesSubsequentSends) {
-    const char* control = "127.0.0.1:24760";
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
     WorkerEgress eg(aeron_, control, 2096);
     ASSERT_TRUE(eg.resolved());
 
     // Late subscriber joins now (after the pub existed).
     auto sub = resolveSub(std::string("aeron:udp?control=") + control +
-                          "|control-mode=dynamic|endpoint=127.0.0.1:24761", 2096);
+                          "|control-mode=dynamic|endpoint=" + freeEndpoint(), 2096);
     ASSERT_NE(sub, nullptr);
     ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
 

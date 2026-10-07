@@ -1,5 +1,6 @@
 // AeronPumpInvokerTest.cpp — with NO driver thread and NO client conductor thread,
 // every startup resolve completes by pumping its own driver + conductor (spec §3.6).
+#include <rune/aeronutil/testing/FreePort.h>
 #include <rune/consensus/AeronIngress.h>
 #include <rune/consensus/IngressRing.h>
 #include <rune/gateway/ClientGateway.h>
@@ -28,15 +29,7 @@ namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 
 namespace {
-uint16_t freeUdpPort() {
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = 0;
-    ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a));
-    socklen_t len = sizeof(a);
-    ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
-    ::close(fd);
-    return ntohs(a.sin_port);
-}
+uint16_t freeUdpPort() { return rune::aeronutil::testing::allocFreeUdpPort(); }   // D11: never bind-0
 
 struct InvokerShard {
     fs::path dir;
