@@ -1420,3 +1420,54 @@ TEST(HotPathBRegression, CorruptEpochStateRefusesTheFirstLeadershipRegression) {
         EXPECT_EQ(r.epoch(), 8);
     }
 }
+
+// D21 review L3: the legacy truncation fallback (no read map: the index is
+// rebuilt and RENAMED without msync) followed by a crash that loses the index
+// pages, with the recovery point INSIDE the active segment: a restart never
+// looks a record up through that index unrebuilt — every segment is
+// recover()ed (index rebuilt from the .log) at startup.
+TEST(HotPathBRegression, LostUnsyncedIndexAfterFallbackTruncationIsRebuiltRegression) {
+    TmpDir d;
+    std::string indexPath;
+    {
+        rune::storage::Log log(d.p.string(), 1 << 20);
+        log.recover();
+        log.setDeferSealSync(true);
+        for (int i = 0; i < 400; ++i) { const auto b = stampedBatch(i * 2, 2, 1); log.append(b, i * 2 + 1); }
+        ASSERT_EQ(log.checkpointRecoveryPoint(), 0);
+        ASSERT_GT(log.persistedRecoveryPoint(), 0) << "precondition: R inside the active segment";
+        auto* seg = log.segmentForTest(0);
+        ASSERT_NE(seg, nullptr);
+        (void)seg->swapReadMap(nullptr);     // no read map, and none can be made:
+        seg->setReadMapFaultForTest(true);   // the legacy rebuild fallback
+        ASSERT_TRUE(log.truncateTo(601));    // inside batch [600, 601]
+        ASSERT_EQ(log.logEndOffset(), 600);
+        ASSERT_EQ(log.inPlaceTruncationsForTest(), 0u) << "precondition: the legacy rebuild fallback ran";
+        ASSERT_GT(log.persistedRecoveryPoint(), 0);
+        indexPath = (d.p / "00000000000000000000.index").string();   // (seg was replaced by the rebuild)
+        log.crashForTest();
+    }
+    {   // the rebuilt index's pages never reached the disk: what is there is
+        // garbage — entries pointing into the middle of batches
+        const auto sz = fs::file_size(indexPath);
+        std::vector<uint8_t> junk(sz, 0);
+        for (std::size_t i = 0; i + 8 <= std::min<std::size_t>(sz, 4096); i += 8) {
+            const int32_t rel = static_cast<int32_t>(i);   // ascending relative offsets
+            const int32_t pos = 7;                          // never a batch start
+            std::memcpy(junk.data() + i, &rel, 4);
+            std::memcpy(junk.data() + i + 4, &pos, 4);
+        }
+        std::ofstream f(indexPath, std::ios::binary | std::ios::trunc);
+        f.write(reinterpret_cast<const char*>(junk.data()), static_cast<std::streamsize>(junk.size()));
+    }
+    rune::storage::Log log(d.p.string(), 1 << 20);
+    log.recover();
+    EXPECT_EQ(log.logEndOffset(), 600);
+    for (int64_t o = 0; o < 600; o += 37) {
+        const auto bytes = log.read(o, 1 << 16);
+        ASSERT_FALSE(bytes.empty()) << o;
+        rune::protocol::RecordBatchReader r(bytes.data(), bytes.size());
+        EXPECT_LE(r.baseOffset(), o);
+        EXPECT_GE(r.baseOffset() + r.lastOffsetDelta(), o) << "looked up through a lost index";
+    }
+}
