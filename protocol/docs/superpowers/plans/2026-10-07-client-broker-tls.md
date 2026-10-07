@@ -146,6 +146,16 @@ TEST(Caps, HardwareAesImpliesAesPreferred) {
     else
         EXPECT_EQ(rune::crypto::bestLocalCipher(), rune::crypto::Cipher::ChaCha20Poly1305);
 }
+// Non-tautological: validate hasHardwareAes() against an INDEPENDENT ground truth
+// on x86_64 (the compiler's own CPUID), so a wrong ia32cap word/bit is caught.
+TEST(Caps, HardwareAesMatchesIndependentGroundTruth) {
+#if defined(__x86_64__) || defined(_M_X64)
+    __builtin_cpu_init();
+    EXPECT_EQ(rune::crypto::hasHardwareAes(), __builtin_cpu_supports("aes") != 0);
+#else
+    GTEST_SKIP() << "independent AES-NI ground truth only defined on x86_64";
+#endif
+}
 ```
 
 - [ ] **Step 4: Run — verify fail (link error: `bestLocalCipher` undefined)**
@@ -166,7 +176,10 @@ bool hasHardwareAes() noexcept {
     // OPENSSL_ia32cap bit 57 = AES-NI on x86; on other arches OpenSSL still
     // runtime-selects HW AES-GCM, so fall back to "AES-GCM fetch succeeds + fast".
 #if defined(__x86_64__) || defined(_M_X64)
-    return (OPENSSL_ia32cap_P[0] & (1ULL << 57)) != 0;
+    // AES-NI is capability bit 57. OPENSSL_ia32cap_P is an array of 32-bit words,
+    // so bit 57 lives in word[1] at local bit 25 (57-32) — matching OpenSSL's own
+    // AESNI_CAPABLE (crypto/aes_platform.h). (word[0] & (1ULL<<57) is always 0.)
+    return (OPENSSL_ia32cap_P[1] & (1u << (57 - 32))) != 0;
 #else
     return true; // ARMv8 crypto / other: OpenSSL picks HW impl when present
 #endif
