@@ -1203,16 +1203,13 @@ int Election::closedLeaderHeartbeat(int64_t nowNs)
 }
 
 // ClosedLeaderStepDownRegression: the leader itself is always active
-// (Aeron ClusterMember.hasActiveQuorum: member.isLeader() || isActive).
+// (Aeron ClusterMember.hasActiveQuorum: member.isLeader() || isActive).  One
+// implementation: ClusterMember::hasActiveQuorum with this node as the leader
+// (DR-10 review LOW-3).  Callers invoke it only while this node leads.
 bool Election::hasActiveFollowerQuorum_(int64_t nowNs) const noexcept
 {
-    int threshold = ClusterMember::quorumThreshold(static_cast<int>(clusterMembers_.size()));
-    for (const ClusterMember& m : clusterMembers_) {
-        if (m.id == thisMemberId_ || m.isActive(nowNs, leaderHeartbeatTimeoutNs_)) {
-            if (--threshold <= 0) return true;
-        }
-    }
-    return false;
+    return ClusterMember::hasActiveQuorum(clusterMembers_, nowNs, leaderHeartbeatTimeoutNs_,
+                                          thisMemberId_);
 }
 
 // ClosedLeaderStepDownRegression: leave the CLOSED steady state for a fresh
