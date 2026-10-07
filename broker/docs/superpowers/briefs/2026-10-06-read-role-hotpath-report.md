@@ -9,7 +9,7 @@
   - `4c63945` gate scenario adaptation
   - `c2f8d9b` F5 read map
 - **Checks:**
-  - `ctest -j8` (build-fast): **3954/3954 passed**, including the Debug latency gate.
+  - `ctest -j8` (build-fast): **3954/3954 passed** (round 0); after the review fixes **3966/3966 passed**, including the Debug latency gate.
   - `check_no_atomics`: OK. Allowlist categories are identical to `70217bd` (RING 66, CLEANER 63, CRASH-ORDER 1, CPU-HINT 3, SLICE-B 44, UNSCOPED 27).
   - `check_single_driver_pumper`: OK.
   - No new atomics or mutexes, and no virtual calls.
@@ -117,3 +117,155 @@ FollowerTruncation on tmpfs fails its truncations ≥ 3 precondition **both befo
 
 ### Bare-metal confirmation
 None of the F6 / VM residuals can be fixed by the worker. They need a bench-box run.
+
+---
+
+# Review fixes (review 2026-10-06 `2026-10-06-read-role-hotpath-review.md`: REJECT, 1 critical / 2 major / 6 medium / 4 low)
+
+Commits on top of `2ab1bc2`:
+
+| Commit | What |
+|---|---|
+| `80b61f1` | C1, M1, Md1, Md2, Md3, Md4, Md6 |
+| `fb4c46b` | M2 (in-place truncation + fsync attribution in the gate), Md5 |
+| `68cefb6` | Lows → backlog **D21** |
+| `3e03c0b` … `8910ef8` | Gate scenarios made event-driven for async promotions / C1 re-fetch. Budgets and `kKnownFailures` untouched. |
+
+Every behavioural fix has a `HotPathBRegression.*Regression` test. Each was shown RED with the fix disabled, then green. The suite is now 21 tests.
+
+## Fixes
+
+### C1 (Kafka model)
+**(a) Ordering.** The epoch history now becomes durable before the recovery point can rely on it.
+- The log's recovery point never passes epoch history that is not durable (`Log::setEpochHistoryCap`). The cap comes from the replica's pending and in-flight change offsets: the start of an assign, the truncation point, a deferral's LEO, or a cancelled deferral's LEO.
+- After a divergence truncation, a follower neither re-fetches nor applies until the write carrying the truncated history completes. The re-fetch is sent from `epochStateWriteCompleted`, using production `epochStateDurable()`, so it is event-driven.
+
+**(b) Restore.** On restart, the epoch cache is rebuilt from the batch stamps:
+- Entries at or above the **startup** recovery point (`Log::startupRecoveryPoint`) are re-derived from the stamps on the surviving batches. Stale entries are dropped and missing ones assigned.
+- History below that point is spot-checked against the stamps with O(entries) point reads. A mismatch triggers a full rebuild.
+- In a directory that holds epoch history, `Log::recover` keeps the persisted recovery point at the startup value until the replica has made the reconciled history durable and lifts the guard.
+
+**Tests:**
+- `EpochHistoryNeverLagsRecoveryPointAcrossPowerLossRegression` (power-loss seam: the file is reverted to its last confirmed image).
+- `DivergenceTruncationRefetchWaitsForDurableHistoryRegression`.
+- `RefetchResumesOnDurableHistoryRegression`.
+- RED before the fix: offset 20 is stamped 6 while the restored history says 3.
+
+### M1 (ruling: no downgrade support)
+- After the first durable write of `leader-epoch-state`, the legacy `leader-epoch-checkpoint` and `leader-epoch-fence` files (and their `.tmp`) are unlinked, followed by one full directory fsync. This is cold and never runs on a worker.
+- If both formats are present, the state file wins. A legacy-only directory is migrated, validated against the stamps. A corrupt state file is rebuilt from the stamps, never from legacy files.
+- Test: `LegacyEpochFilesMigrateAndAreRemovedRegression` covers three cases: a stale legacy-only directory, both formats present, and a corrupt state file with legacy files present.
+
+### M2 (truncation and fsync attribution)
+**In-place truncation.** A worker-driven truncation inside the active segment is now done **in place**:
+- one `ftruncate` of the open fd;
+- index entries past the cut are zeroed in its mapping;
+- a header walk over the read map, with no file read, no new file and no index rename.
+
+A directory fsync is therefore owed only when whole segments were unlinked.
+- Tests: `InSegmentTruncationNeedsNoDirectoryFsyncRegression` (RED: a directory fsync per truncation) and `InPlaceTruncationRecoversAfterCrashRegression`.
+
+**Fsync attribution.** The gate now prints per-scenario counts:
+- io-backend seal, background, recovery-point, directory and epoch-state fdatasyncs;
+- inline syncs on the worker;
+- cleaner fsyncs and directory fsyncs;
+- provisioned segments, directory mutations and in-place truncations.
+
+### Mediums
+- **Md1:** a cancelled deferral caps the recovery point at its entry, so a restart re-derives it. Test: `CancelledLeadershipLeavesNoPhantomEpochAfterCrashRegression`.
+- **Md2:** a failed epoch-state write is re-armed, with exponential backoff measured in ns. Three failures in a row mark the log storage-failed and take its directory offline (fail-stop). Test: `FailedEpochStateWriteRetriesThenFailsStopRegression`.
+- **Md3:** an unroutable completion re-queues the write (`epochStateWriteNotRouted`). Test: `UnroutableEpochStateCompletionNeverWedgesPromotionRegression`.
+- **Md4:** the per-replica image is gone (one scratch buffer per worker; the bytes are copied by `pwrite`). The fd is open only while a write is due or in flight. The file is 8 KiB. Test: `IdlePartitionHoldsNoEpochStateFdRegression`.
+- **Md5:** read maps start at 1 MiB. A provisioned log grows each segment's map to page-round(rollBytes + 1 MiB), never a power of two. The growth runs on the `SegmentProvisionerAgent`: a dup'd fd goes out, the mapping comes back over a per-log ControlRing, and the old mapping is munmapped there. `readView` never remaps on the owner. Failures are counted (Aeron counter `read-map-failures`) and fall back to owner growth.
+  - FREE-tier sizing: 10k partitions with about 1% filling is roughly 9.9k × 1 MiB + 100 × 65 MiB ≈ 16 GiB of address space. It was 10k × 128 MiB ≈ 1.25 TiB.
+  - The RC scan (`segmentBytesAt`) may still map on the owner. It is cold and counted.
+  - Tests: `ReadMapAddressSpaceIsBoundedAndGrownOffOwnerRegression` and `ActiveSegmentReadsNeverRemapOnTheWorkerRegression` (now provisioned).
+- **Md6:** the writer cannot be switched while a write is in flight (assert, refused in Release), and the inline path asserts Idle. Test: `EpochStateWriterToggleWhileInFlightRefusedRegression`.
+
+### Lows
+L1-L4 are in `docs/superpowers/backlog-2026-10-03.md` as **D21**.
+
+## Release latency gate: before (`70217bd` + test-only counter backport) vs after (`8910ef8`)
+
+**Setup:**
+- Linux arm64 Release, `rune-latgate-builder:a940b8b`, Docker Desktop VM (kernel 7.0.12-linuxkit).
+- 0 other containers and no ctest during every run, sampled every 5 s.
+- The before tree carries a test-only backport (fsync counters plus the same event-driven LeadershipChange cycle). Its production code is untouched.
+
+Values are p99.9 / max in µs, best attempt. COLD = the worst allowed-cold pass.
+
+| Scenario | before ext4 | after ext4 | before tmpfs | after tmpfs |
+|---|---|---|---|---|
+| Reads+SegmentRoll/1p | 632 / 2,184 | 719 / 2,751 | 18 / 249 | 18 / 263 |
+| Reads+Retention/2p | 799 / 1,266 | 1,622 / 2,787 | 20 / 194 | 21 / 168 |
+| Reads+Compaction 16 MiB/1p | 62 / 138 | **22 / 95** | 62 / 97 | **17 / 29** ✅ |
+| LeadershipChange/1p | 22 / 142, COLD 10,609 | **6 / 90, COLD 7** ✅ | 12 / 53, COLD 47 | 12 / 63, COLD 4 ✅ |
+| LeadershipChange/8p | 67 / 222, COLD 15,690 | 47 / 248, COLD 58 | 34 / 112, COLD 105 | 38 / 67, COLD 28 ✅ |
+| FollowerTruncation/2p | 153 / 1,706, COLD 6,095 | 198 / 1,723, COLD 274 | 14 / 224, COLD 110 | 16 / 264, COLD 85 |
+| SegmentRoll/8p | 1,177 / 2,148 | 1,576 / 6,738 | 132 / 232 | 94 / 242 |
+| Retention time+size/2p | 795 / 1,098 | 2,074 / 5,575 | 26 / 294 | 28 / 250 |
+| TxnMarkers/4p | 42 / 260 | 42 / 403 | 15 / 28 | 16 / 28 |
+| SteadyProduce/1p (control) | 8 / 35 | 8 / 117 | 4 / 35 | 5 / 22 |
+
+**Fsync counts, ext4, same runs** (b → a). io = io-backend submissions from the worker; cleaner = cleaner-thread fsyncs / directory fsyncs.
+
+| Scenario | seal | bg | rp | dir | epoch | worker-inline role syncs | cleaner fsync / dir |
+|---|---|---|---|---|---|---|---|
+| Retention/2p | 4651 → 4604 | 10 → 12 | 6 → 6 | 6 → 6 | 0 → 0 | 10 → 10 | 815/1630 → 816/1632 |
+| Reads+Retention/2p | 4679 → 4607 | 12 → 12 | 8 → 6 | 8 → 6 | 0 → 0 | 10 → 10 | 789/1578 → 796/1592 |
+| TxnMarkers/4p | 48 → 48 | 527 → 556 | 48 → 48 | 48 → 48 | 0 → 0 | 20 → 20 | 0 → 0 |
+| SegmentRoll/8p | 8174 → 8883 | 65 → 75 | 27 → 24 | 26 → 23 | 0 → 0 | 40 → 40 | 0 → 0 |
+| FollowerTruncation/2p | 3446 → 3947 | 10 → 54 | 9 → 45 | 8 → 34 | 0 → 24 | 34 → 10 | 12/28 → 15/36 |
+| LeadershipChange/8p | 226 → 209 | 384 → 160 | 226 → 164 | 222 → 91 | 0 → 32 | 40 → 40 | 0 → 0 |
+
+The legacy inline checkpoint syncs (fsync + rename + directory fsync) in the before tree are counted in its COLD role-op passes (7-36 ms). They do not appear in these io counts.
+
+## Explaining each ext4 delta
+
+### Retention, Reads+Retention, TxnMarkers/4p, SegmentRoll/8p, SteadyProduce/1p
+These are best-of-run single numbers. Their fsync counts are identical within ±2% (the same seal, cleaner, retention and dir work).
+
+To check them I ran an **interleaved ABAB, n = 15 per side**: 70217bd and HEAD alternating, the same ext4 volume recreated each run, with no load events logged. Medians (p25-p75) for before vs after:
+
+| Scenario | Metric | Before | After |
+|---|---|---|---|
+| Retention/2p | p99.9 | 1182 (1044-1639) | 1456 (1166-1570) |
+| Retention/2p | max | 37.3 ms (33-44) | 35.2 ms (31-45) |
+| Reads+Retention/2p | p99.9 | 1483 (1214-1717) | 1207 (1106-1426) |
+| Reads+Retention/2p | max | 13.8 ms (12-19) | 14.0 ms (12.6-22) |
+| TxnMarkers/4p | p99.9 | 44 (42-45) | 42 (42-44) |
+| TxnMarkers/4p | max | 243 (213-265) | 257 (218-272) |
+| SegmentRoll/8p | p99.9 | 1872 (1585-1920) | 1788 (1573-1951) |
+| SegmentRoll/8p | max | 7.2 ms (5.0-10.8) | 6.3 ms (4.4-18.7) |
+| SteadyProduce/1p | max | 294 (256-349) | 364 (254-716) |
+| SteadyProduce/8p | max | 354 (321-1626) | 325 (314-396) |
+| Reads+SegmentRoll/1p | p99.9 | 739 (542-772) | 716 (501-769) |
+| Reads+SegmentRoll/1p | max | 2.8 ms (2.0-4.9) | 3.5 ms (3.3-5.1) |
+| FollowerTruncation/2p | p99.9 | 177 (160-189) | 189 (179-219) |
+| FollowerTruncation/2p | max | 1.95 ms (1.6-2.2) | 1.71 ms (1.7-2.0) |
+
+The IQRs overlap for every row. **These single-run deltas are not regressions.** The earlier report's attribution of them was unproven; this replaces it.
+
+### LeadershipChange/8p: one real ext4 regression
+The ABAB max is **864 µs (825-884) before vs 1,652 µs (1,634-1,706) after**, with no IQR overlap. p99.9 is 73 vs 78.
+
+**Attribution** (per-frame intake probe, removed afterwards):
+- The worst passes are single produce frames whose `pwrite` is the **first write into a freshly adopted, fallocated segment**: LEO = active base + 32. This is the F6 ext4 first-write class from the hot-path A report (0.5-3.7 ms).
+- The worker part of those passes is ≤ 31 µs, and tmpfs shows no regression (67 vs 112).
+- In HEAD, all 8 partitions hit it at their 58th segment, at the same segment index in every run. In the before tree, single partitions hit it at segments 96, 107 and 115 at about 780 µs.
+
+**A/B experiments on the HEAD binary** (env switches, not committed) to isolate the cause:
+
+| Variant | max |
+|---|---|
+| Epoch-state io kept but with **no fdatasync** | 1.5 ms spikes remain |
+| **No slot pwrite** and no fdatasync | 1.5 ms spikes remain |
+| **No recovery-point cap** (C1) | 1.7 ms remains |
+| **Async epoch state off** (the legacy synchronous checkpoint on the worker) | **873-914 µs, identical to before** |
+| Read-map growth off | 1.76-3.3 ms (unchanged) |
+
+Neither the epoch-state io, the C1 cap nor the Md5 growth causes it. It appears exactly when the synchronous legacy checkpoint (fsync + rename + directory fsync on the worker at every role change, 7-36 ms COLD passes) is removed. The journal commits those COLD syncs used to force now land elsewhere, and one of them coincides with the 8 partitions' first writes into segment 58.
+
+This is the reviewer's "cost moved from COLD into a HOT first write" mechanism, but through the extent conversion of the first write, not through the new fsyncs. The fsync counts confirm it: the after tree issues fewer io fsyncs in this scenario (656 vs 1058).
+
+**Fix candidate** (F6 follow-up, not in this branch): have the provisioner pre-write or zero the first page(s) of each ready segment, so that the owner's first write is never an unwritten-extent conversion. It must be confirmed on bare metal. The gate budgets are untouched, and LeadershipChange/8p stays within its listed `kKnownFailures` ceiling.
