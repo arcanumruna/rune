@@ -170,6 +170,23 @@ public:
         ipv4 = e.ipv4;
         return e.has;
     }
+    /// The channel to ADD a publication on: `channel` with its managed endpoint
+    /// host replaced by the address this inbox last received for it (numeric —
+    /// the driver never resolves it), or `channel` unchanged when the host is
+    /// unmanaged / not resolved yet.  DR-4 (2026-10-07): a re-add after the
+    /// host's address CHANGED must not depend on the driver's own name cache
+    /// having applied the change first — a hostname add resolved on the stale
+    /// cache kept the publication on the old address (another member).  Cold
+    /// (allocates).
+    [[nodiscard]] std::string addChannel(const std::string& channel, int hostIdx) const {
+        std::uint32_t ip = 0;
+        if (!addressOf(hostIdx, ip)) return channel;
+        in_addr a{};
+        a.s_addr = ip;
+        char buf[INET_ADDRSTRLEN] = {};
+        if (::inet_ntop(AF_INET, &a, buf, sizeof buf) == nullptr) return channel;
+        return PeerHostTable::withEndpointHost(channel, buf);
+    }
     /// Index of a channel's endpoint host in the managed table (-1: unmanaged,
     /// numeric, or no table).
     [[nodiscard]] int hostIndexOfChannel(std::string_view channel) const noexcept {

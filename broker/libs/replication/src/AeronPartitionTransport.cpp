@@ -1143,9 +1143,10 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
 void AeronPartitionTransport::registerPub_(PeerPub& p) noexcept
 {
     if (p.attempts > 0) ++pubReAdds_;
-    p.addGen = inbox_.generation(p.hostIdx);
+    p.addGen     = inbox_.generation(p.hostIdx);
+    p.boundKnown = inbox_.addressOf(p.hostIdx, p.boundIp);
     try {
-        p.registrationId = aeron_->addExclusivePublication(p.channel, p.streamId);
+        p.registrationId = aeron_->addExclusivePublication(inbox_.addChannel(p.channel, p.hostIdx), p.streamId);
         p.registered     = true;
     } catch (const std::exception& ex) {
         onPubFailed_(p, ex.what());
@@ -1167,8 +1168,34 @@ void AeronPartitionTransport::onPubFailed_(PeerPub& p, const char* why) noexcept
 
 void AeronPartitionTransport::onHostResolved_(int idx) noexcept
 {
-    for (auto& [nodeId, peer] : peers_)
-        if (!peer.pub && !peer.registered && peer.hostIdx == idx) registerPub_(peer);
+    for (auto& [nodeId, peer] : peers_) {
+        if (peer.hostIdx != idx) continue;
+        if (!peer.pub && !peer.registered) { registerPub_(peer); continue; }
+        // An add still in flight is never superseded (the Aeron client only
+        // releases a publication it has FOUND — overwriting the id would leak one
+        // on the old address): once it completes, the hub's next confirmation
+        // (~1 s) finds it bound to the stale address and re-adds.
+        if (!peer.pub) continue;
+        // DR-4 (2026-10-07): the peer's host now resolves to a DIFFERENT address
+        // (a restarted container / pod got a new IP — two restarted peers can
+        // swap theirs).  The live publication still sends to the old address,
+        // where ANOTHER member's inbound (same port + stream) accepts the frames
+        // and answers the status messages, so Aeron never re-resolves it: this
+        // peer's fetch answers reached the wrong member forever (its
+        // __cluster_metadata follower never caught up).  Re-add it on the new
+        // address (the driver's name cache got the change first).
+        std::uint32_t ip = 0;
+        if (!inbox_.addressOf(idx, ip)) continue;
+        if (!peer.boundKnown) { peer.boundIp = ip; peer.boundKnown = true; continue; }
+        if (ip == peer.boundIp) continue;   // a confirmation of the same address
+        spdlog::warn("AeronPartitionTransport: peerId={} host of {} changed address — re-adding its "
+                     "publication", peer.peerId, peer.channel);
+        peer.pub.reset();
+        peer.registered     = false;
+        peer.registrationId = -1;
+        ++pubAddressReAdds_;
+        registerPub_(peer);
+    }
 }
 
 void AeronPartitionTransport::resolvePendingPubs()

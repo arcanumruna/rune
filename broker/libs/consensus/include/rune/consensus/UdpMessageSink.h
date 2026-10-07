@@ -59,6 +59,7 @@
 #include <ExclusivePublication.h>
 #include <concurrent/logbuffer/BufferClaim.h>
 
+#include <cstdio>
 #include <string>
 #include <unordered_map>
 #include <memory>
@@ -88,6 +89,7 @@ public:
     {
         // DR-15 fix round 1: off-thread resolution events (PeerResolverHub).
         inbox_.attach(resolution);
+        (void)inbox_.poll();   // prefilled addresses first: the adds below go out numeric (DR-4)
         // Register all peer slots.  addExclusivePublication is async — it never
         // throws for an unresolvable host here; the error (if any) surfaces later
         // in findExclusivePublication().
@@ -175,15 +177,19 @@ private:
         int         hostIdx        = -1;       // managed peer host (-1: unmanaged / no resolver)
         uint32_t    addGen         = 0;        // host resolution generation at the last add
         uint32_t    failures       = 0;        // errored registrations so far
+        uint32_t    boundIp        = 0;        // the host's address at the last add (network order)
+        bool        boundKnown     = false;    // boundIp valid (the host had resolved at that add)
         std::shared_ptr<aeron::ExclusivePublication> pub; // null until resolved
     };
 
     // Issue addExclusivePublication for a peer slot (async; does not resolve).
     void registerPeer(PeerSlot& slot, bool retry = true) noexcept {
         if (retry) ++reAdds_;
-        slot.addGen = inbox_.generation(slot.hostIdx);
+        slot.addGen     = inbox_.generation(slot.hostIdx);
+        slot.boundKnown = inbox_.addressOf(slot.hostIdx, slot.boundIp);
         try {
-            slot.registrationId = aeron_->addExclusivePublication(slot.channel, slot.streamId);
+            slot.registrationId = aeron_->addExclusivePublication(inbox_.addChannel(slot.channel, slot.hostIdx),
+                                                                  slot.streamId);
             slot.registered     = true;
         } catch (const std::exception&) {
             // addExclusivePublication is normally async and does not throw for a
@@ -207,8 +213,34 @@ private:
     }
 
     void onHostResolved_(int idx) noexcept {
-        for (auto& [nodeId, slot] : peers_)
-            if (!slot.pub && !slot.registered && slot.hostIdx == idx) registerPeer(slot);
+        for (auto& [nodeId, slot] : peers_) {
+            if (slot.hostIdx != idx) continue;
+            if (!slot.pub && !slot.registered) { registerPeer(slot); continue; }
+            // An add still in flight is never superseded (the Aeron client only
+            // releases a publication it has FOUND — overwriting the id would leak
+            // one on the old address): once it completes, the hub's next
+            // confirmation (~1 s) finds it bound to the stale address and re-adds.
+            if (!slot.pub) continue;
+            // DR-4 (2026-10-07): the peer's host now resolves to a DIFFERENT
+            // address (a restarted container / pod got a new IP — two restarted
+            // peers can even swap theirs).  The live publication still sends to
+            // the old address, where ANOTHER member's subscription (same port +
+            // stream) accepts the frames and answers the status messages, so
+            // Aeron never re-resolves it: consensus traffic for this peer reaches
+            // the wrong member forever.  Re-add it on the new address (the
+            // driver's name cache got the change first — PeerResolverHub order).
+            std::uint32_t ip = 0;
+            if (!inbox_.addressOf(idx, ip)) continue;
+            if (!slot.boundKnown) { slot.boundIp = ip; slot.boundKnown = true; continue; }
+            if (ip == slot.boundIp) continue;   // a confirmation of the same address
+            std::fprintf(stderr, "UdpMessageSink: peer %d host of %s changed address — re-adding its "
+                                 "publication\n", static_cast<int>(nodeId), slot.channel.c_str());
+            slot.pub.reset();
+            slot.registered     = false;
+            slot.registrationId = -1;
+            ++unresolved_;   // resolvePending() must probe the new registration (it early-outs at 0)
+            registerPeer(slot);
+        }
     }
 
     // Non-blocking: resolution events (a few loads when empty), then one

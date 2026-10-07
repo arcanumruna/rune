@@ -395,6 +395,9 @@ TEST(UnresolvedPeerRegression, HubPostsResolutionsConfirmationsAndIpChangesRegre
 // owner already has the host cached (here: the driver cannot create the
 // endpoint yet — modelled by a driver cache that lags the owner's) is re-added
 // on the next resolver confirmation; without it the peer stays cut for good.
+// DR-4 (2026-10-07): owners now add on the NUMERIC address they hold, so the
+// lagging-driver-cache case no longer fails the add at all — these tests pin
+// that stronger property (reachable at once, no re-add).
 // ---------------------------------------------------------------------------
 namespace {
 struct LaggingDriverCache {
@@ -418,7 +421,7 @@ struct LaggingDriverCache {
 };
 }
 
-TEST(UnresolvedPeerRegression, ConsensusSinkReAddsAfterANonDnsAddFailureRegression) {
+TEST(UnresolvedPeerRegression, ConsensusSinkLaggingDriverCacheNeverFailsTheAddRegression) {
     LaggingDriverCache env;
     InvokerShard s(env.driverHub.subscribeDriver());
     auto pump = s.pump();
@@ -437,17 +440,15 @@ TEST(UnresolvedPeerRegression, ConsensusSinkReAddsAfterANonDnsAddFailureRegressi
         (void)sub->poll([&](aeron::concurrent::AtomicBuffer&, aeron::util::index_t, aeron::util::index_t,
                             aeron::Header&) { ++received; }, 16);
     };
-    for (int i = 0; i < 2000; ++i) pass();
-    ASSERT_EQ(received, 0) << "the add must have failed";
-    env.driverCanAddNow();                                   // the cause is gone — no owner event yet
-    for (int i = 0; i < 2000; ++i) pass();
-    EXPECT_EQ(received, 0);
-    env.ownerConfirmation();                                 // the resolver's next re-check
+    // DR-4 (2026-10-07): an owner that has the host's address adds on the
+    // NUMERIC endpoint — a driver whose own name cache lags can no longer fail
+    // (or mis-resolve) the add: the peer is reachable at once, no re-add.
     ASSERT_TRUE(driveUntil(pass, [&] { return received > 0; }))
-        << "consensus stayed cut after a non-DNS add failure on a cached host";
+        << "a lagging driver name cache still cut consensus (the add was not numeric)";
+    EXPECT_EQ(sink.reAddsForTest(), 0u);
 }
 
-TEST(UnresolvedPeerRegression, PlaneReAddsAfterANonDnsAddFailureRegression) {
+TEST(UnresolvedPeerRegression, PlaneLaggingDriverCacheNeverFailsTheAddRegression) {
     LaggingDriverCache env;
     InvokerShard s(env.driverHub.subscribeDriver());
     auto pump = s.pump();
@@ -455,17 +456,13 @@ TEST(UnresolvedPeerRegression, PlaneReAddsAfterANonDnsAddFailureRegression) {
     t.attachResolution(env.ownerHub.subscribeOwner());
     ASSERT_TRUE(t.attach(s.client, {{1, udp(kLateHost, rune::aeronutil::testing::allocFreeUdpPort())}}, 7512, pump));
     auto pass = [&] { (void)pump.pump(); (void)t.drivePeerResolve(); };
-    for (int i = 0; i < 2000; ++i) pass();
-    ASSERT_FALSE(t.allPeersResolved());
-    env.driverCanAddNow();
-    for (int i = 0; i < 2000; ++i) pass();
-    EXPECT_FALSE(t.allPeersResolved());
-    env.ownerConfirmation();
+    // DR-4 (2026-10-07): numeric add — a lagging driver name cache is irrelevant.
     ASSERT_TRUE(driveUntil(pass, [&] { return t.allPeersResolved(); }))
-        << "the plane stayed cut after a non-DNS add failure on a cached host";
+        << "a lagging driver name cache still cut the plane (the add was not numeric)";
+    EXPECT_EQ(t.peerReAddsForTest(), 0u);
 }
 
-TEST(UnresolvedPeerRegression, PartitionTransportReAddsAfterANonDnsAddFailureRegression) {
+TEST(UnresolvedPeerRegression, PartitionTransportLaggingDriverCacheNeverFailsTheAddRegression) {
     LaggingDriverCache env;
     InvokerShard s(env.driverHub.subscribeDriver());
     auto pump = s.pump();
@@ -474,14 +471,10 @@ TEST(UnresolvedPeerRegression, PartitionTransportReAddsAfterANonDnsAddFailureReg
     t.addPeer(1, udp(kLateHost, rune::aeronutil::testing::allocFreeUdpPort()), 7514);
     int64_t nowNs = 0;
     auto pass = [&] { (void)pump.pump(); (void)t.poll(++nowNs); };
-    for (int i = 0; i < 2000; ++i) pass();
-    ASSERT_EQ(t.unresolvedPeerCount(), 1);
-    env.driverCanAddNow();
-    for (int i = 0; i < 2000; ++i) pass();
-    EXPECT_EQ(t.unresolvedPeerCount(), 1);
-    env.ownerConfirmation();
+    // DR-4 (2026-10-07): numeric add — a lagging driver name cache is irrelevant.
     ASSERT_TRUE(driveUntil(pass, [&] { return t.unresolvedPeerCount() == 0; }))
-        << "the internal plane stayed cut after a non-DNS add failure on a cached host";
+        << "a lagging driver name cache still cut the internal plane (the add was not numeric)";
+    EXPECT_EQ(t.peerPubReAdds(), 0u);
 }
 
 // ---------------------------------------------------------------------------
@@ -534,4 +527,108 @@ TEST(UnresolvedPeerRegression, ResolverInitArgsOutliveTheInstallCallRegression) 
                   reinterpret_cast<uintptr_t>(&lk));
     EXPECT_STREQ(args, expected) << "the resolver init args dangle (stack buffer)";
     aeron_driver_context_close(ctx);
+}
+
+// ---------------------------------------------------------------------------
+// DR-4 (box dc274e8, 2026-10-07): two peers killed together restart and come
+// back on each OTHER's old IPs (Docker / k8s address reuse).  A survivor's
+// already-RESOLVED publication to each kept sending to the old address, where
+// the OTHER member's inbound (same port + stream) accepted the frames and
+// answered status messages — Aeron never re-resolved: consensus NLTs and
+// __cluster_metadata catch-up answers reached the wrong member forever (a
+// restarted member never learned the leader / the assignments; its replicas
+// followed no leader; a subscription it served delivered nothing).
+// Every owner of peer publications must re-add a resolved peer whose host now
+// resolves to a DIFFERENT address — and only then (a confirmation of the same
+// address is not a re-add).  macOS loopback has one address, so the receivers
+// cannot swap here: the owner's reaction is asserted (the swap itself is the
+// dockerized DR-4 loop).
+// ---------------------------------------------------------------------------
+namespace {
+struct MovingHost {
+    TestDns dns;
+    PeerResolverHub hub{{kLateHost}, dns.fn()};
+    MovingHost() { dns.set(kLateHost, "127.0.0.1"); hub.resolveAllNow(); }
+    void confirm(int64_t t) { hub.makeAllDueForTest(); (void)hub.runOnceForTest(t); }
+    void moveTo(const char* ip, int64_t t) { dns.set(kLateHost, ip); confirm(t); }
+};
+}
+
+TEST(UnresolvedPeerRegression, ConsensusSinkReAddsOnPeerIpChangeRegression) {
+    MovingHost env;
+    InvokerShard s(env.hub.subscribeDriver());
+    auto pump = s.pump();
+    const uint16_t port = rune::aeronutil::testing::allocFreeUdpPort();
+    constexpr int32_t kStream = 7515;
+    const int64_t subReg = s.client->addSubscription(udp("127.0.0.1", port), kStream);
+    std::shared_ptr<aeron::Subscription> sub;
+    ASSERT_TRUE(driveUntil([&] { (void)pump.pump(); }, [&] { return (sub = s.client->findSubscription(subReg)) != nullptr; }));
+    std::unordered_map<rune::consensus::NodeId, UdpMessageSink::PeerEndpoint> peers{{1, {udp(kLateHost, port), kStream}}};
+    UdpMessageSink sink(s.client, peers, pump, env.hub.subscribeOwner());
+    int received = 0;
+    const uint8_t msg[16] = {7};
+    auto pass = [&] {
+        sink.send(1, msg, sizeof msg);
+        (void)pump.pump();
+        (void)sub->poll([&](aeron::concurrent::AtomicBuffer&, aeron::util::index_t, aeron::util::index_t,
+                            aeron::Header&) { ++received; }, 16);
+    };
+    ASSERT_TRUE(driveUntil(pass, [&] { return received > 0; }));
+    EXPECT_EQ(sink.reAddsForTest(), 0u);
+    env.confirm(1);
+    for (int i = 0; i < 2000; ++i) pass();
+    EXPECT_EQ(sink.reAddsForTest(), 0u) << "a confirmation of the same address must not re-add";
+    env.moveTo("127.0.0.2", 2);
+    ASSERT_TRUE(driveUntil(pass, [&] { return sink.reAddsForTest() == 1u && sink.unresolvedForTest() == 0; }))
+        << "the consensus publication kept sending to the peer's OLD address";
+    // ...and back: the re-added publication must actually be USED again (DR-4
+    // ipfix1: it was re-registered but never probed — every send dropped).
+    env.moveTo("127.0.0.1", 3);
+    ASSERT_TRUE(driveUntil(pass, [&] { return sink.reAddsForTest() == 2u; }));
+    received = 0;
+    ASSERT_TRUE(driveUntil(pass, [&] { return received > 0; }))
+        << "consensus never reached the peer at its new address after the re-add";
+}
+
+TEST(UnresolvedPeerRegression, PartitionTransportReAddsOnPeerIpChangeRegression) {
+    MovingHost env;
+    InvokerShard s(env.hub.subscribeDriver());
+    auto pump = s.pump();
+    rune::replication::AeronPartitionTransport t(s.client, "aeron:ipc", 7516, /*selfId=*/0, 64 * 1024, pump);
+    t.attachResolution(env.hub.subscribeOwner());
+    t.addPeer(1, udp(kLateHost, rune::aeronutil::testing::allocFreeUdpPort()), 7517);
+    int64_t nowNs = 0;
+    auto pass = [&] { (void)pump.pump(); (void)t.poll(++nowNs); };
+    ASSERT_TRUE(driveUntil(pass, [&] { return t.unresolvedPeerCount() == 0; }));
+    const uint64_t base = t.peerPubAddressReAdds();
+    env.confirm(1);
+    for (int i = 0; i < 2000; ++i) pass();
+    EXPECT_EQ(t.peerPubAddressReAdds(), base) << "a confirmation of the same address must not re-add";
+    env.moveTo("127.0.0.2", 2);
+    ASSERT_TRUE(driveUntil(pass, [&] { return t.peerPubAddressReAdds() == base + 1 && t.unresolvedPeerCount() == 0; }))
+        << "the internal-partition publication kept sending to the peer's OLD address";
+    env.moveTo("127.0.0.1", 3);
+    ASSERT_TRUE(driveUntil(pass, [&] { return t.peerPubAddressReAdds() == base + 2 && t.unresolvedPeerCount() == 0; }))
+        << "the re-added internal-partition publication never came back into use";
+}
+
+TEST(UnresolvedPeerRegression, PlaneReAddsOnPeerIpChangeRegression) {
+    MovingHost env;
+    InvokerShard s(env.hub.subscribeDriver());
+    auto pump = s.pump();
+    WorkerReplicationTransport t(0, "aeron:ipc", 7518, WorkerReplicationTransport::DeferredAttach{});
+    t.attachResolution(env.hub.subscribeOwner());
+    ASSERT_TRUE(t.attach(s.client, {{1, udp(kLateHost, rune::aeronutil::testing::allocFreeUdpPort())}}, 7518, pump));
+    auto pass = [&] { (void)pump.pump(); (void)t.drivePeerResolve(); };
+    ASSERT_TRUE(driveUntil(pass, [&] { return t.allPeersResolved(); }));
+    const uint64_t base = t.peerReAddsForTest();
+    env.confirm(1);
+    for (int i = 0; i < 2000; ++i) pass();
+    EXPECT_EQ(t.peerReAddsForTest(), base) << "a confirmation of the same address must not re-add";
+    env.moveTo("127.0.0.2", 2);
+    ASSERT_TRUE(driveUntil(pass, [&] { return t.peerReAddsForTest() == base + 1 && t.allPeersResolved(); }))
+        << "the shard plane's publication kept sending to the peer's OLD address";
+    env.moveTo("127.0.0.1", 3);
+    ASSERT_TRUE(driveUntil(pass, [&] { return t.peerReAddsForTest() == base + 2 && t.allPeersResolved(); }))
+        << "the re-added shard-plane publication never came back into use";
 }

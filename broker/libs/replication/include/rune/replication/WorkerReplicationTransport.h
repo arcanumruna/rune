@@ -142,7 +142,12 @@ public:
 
     /// DR-15 fix round 1: the resolution events of this registry's owner thread
     /// (the off-thread PeerResolverHub).  Cold; before attach().
-    void attachResolution(rune::consensus::PeerResolutionSource src) { inbox_.attach(src); }
+    /// Drains the prefilled ring at once (startup thread, before the owner runs)
+    /// so startup adds already go out on the NUMERIC address (DR-4).
+    void attachResolution(rune::consensus::PeerResolutionSource src) {
+        inbox_.attach(src);
+        (void)inbox_.poll([this](int idx) { onHostResolved_(idx); });
+    }
 
     /// LEGACY planes (they ride the node client): every re-add after startup is
     /// made by the CONTROL thread through `broker` (review MEDIUM-2).  Before
@@ -180,6 +185,7 @@ public:
             if (pubCount_ == kMaxPeers) break;
             pubs_[pubCount_] = PeerPub{peerId, nullptr, false};
             try {
+                cold_[pubCount_] = PeerCold{channel, inbox_.hostIndexOfChannel(channel)};
                 resolving_.push_back(Resolving{pubCount_, channel, inbox_.hostIndexOfChannel(channel)});
             } catch (...) {
                 configured_ = false;   // allocation failure at startup: refuse (caller throws)
@@ -465,6 +471,7 @@ private:
     {
         if (retry) ++reAdds_;
         r.addGen = inbox_.generation(r.hostIdx);
+        cold_[r.slot].boundKnown = inbox_.addressOf(r.hostIdx, cold_[r.slot].boundIp);
         if (broker_ != nullptr) {
             r.regId = broker_->requestAdd(pubs_[r.slot].id) ? kBrokered : kWaiting;
             return;
@@ -472,7 +479,7 @@ private:
         const auto aeron = aeron_.lock();
         if (!aeron) { r.regId = kWaiting; return; }   // client closed (teardown)
         try {
-            r.regId = aeron->addExclusivePublication(r.channel, streamId_);
+            r.regId = aeron->addExclusivePublication(inbox_.addChannel(r.channel, r.hostIdx), streamId_);
         } catch (const std::exception& e) {
             onFailed_(r, e.what());
         }
@@ -495,6 +502,37 @@ private:
     {
         for (auto& r : resolving_)
             if (r.hostIdx == idx && r.regId == kWaiting) addNow_(r, /*retry=*/true);
+        // DR-4 (2026-10-07): a RESOLVED peer whose host now resolves to a
+        // different address (a restarted container / pod got a new IP — two
+        // restarted peers can swap theirs).  Its publication still sends to the
+        // old address, where ANOTHER member's inbound (same port + stream)
+        // accepts the frames and answers status messages, so Aeron never
+        // re-resolves it.  Drop it and re-add on the new (numeric) address.
+        // An add still in flight is never superseded (the Aeron client releases
+        // only a publication it has FOUND): once it completes on a stale
+        // address, the hub's next confirmation (~1 s) re-adds it here.  Legacy
+        // planes (broker_) are left to the control thread: releasing their pub
+        // here would take the node client's admin lock on the worker (backlog).
+        // Cold path.
+        if (broker_ != nullptr) return;
+        for (std::size_t i = 0; i < pubCount_; ++i) {
+            PeerCold& c = cold_[i];
+            if (c.hostIdx != idx || !pubs_[i].pub) continue;
+            std::uint32_t ip = 0;
+            if (!inbox_.addressOf(idx, ip)) continue;
+            if (!c.boundKnown) { c.boundIp = ip; c.boundKnown = true; continue; }
+            if (ip == c.boundIp) continue;   // a confirmation of the same address
+            spdlog::warn("AeronPubRegistry: peer {} host of {} changed address — re-adding its publication",
+                         pubs_[i].id, c.channel);
+            try {
+                resolving_.push_back(Resolving{i, c.channel, idx});
+            } catch (...) {
+                continue;   // allocation failure: keep the (stale) pub; retried on the next confirmation
+            }
+            pubs_[i].pub.reset();
+            allResolved_ = false;
+            addNow_(resolving_.back(), /*retry=*/true);
+        }
     }
 
     void onBrokerResult_(rune::replication::NodeId peer, PubAddBroker::PubPtr pub) noexcept
@@ -543,6 +581,15 @@ private:
     uint64_t                       oversizeDrops_ = 0;   // F3 r6: owner-worker-thread only
     std::array<PeerPub, kMaxPeers> pubs_{};
     std::size_t                    pubCount_    = 0;
+    /// Cold per-peer data (kept off the hot pubs_ array): re-add target + the
+    /// address the live publication was added on (DR-4 IP-change re-add).
+    struct PeerCold {
+        std::string   channel;
+        int           hostIdx    = -1;
+        std::uint32_t boundIp    = 0;
+        bool          boundKnown = false;
+    };
+    std::array<PeerCold, kMaxPeers> cold_{};
     // Non-owning (never extends the client's life past its owner's teardown).
     std::weak_ptr<aeron::Aeron>    aeron_;               // for re-adds (owner thread)
     int32_t                        streamId_    = 0;

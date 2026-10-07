@@ -403,10 +403,17 @@ public:
 
     /// Publication re-adds issued after a registration error (DR-15).
     [[nodiscard]] uint64_t peerPubReAdds() const noexcept { return pubReAdds_; }
+    /// Re-adds made because a peer host's address changed (DR-4).
+    [[nodiscard]] uint64_t peerPubAddressReAdds() const noexcept { return pubAddressReAdds_; }
 
     /// DR-15 fix round 1: this transport's resolution events (the off-thread
     /// PeerResolverHub).  Cold; before addPeer().  Control thread consumes.
-    void attachResolution(rune::consensus::PeerResolutionSource src) { inbox_.attach(src); }
+    /// Drains the prefilled ring at once (startup thread, before the owner runs)
+    /// so startup adds already go out on the NUMERIC address (DR-4).
+    void attachResolution(rune::consensus::PeerResolutionSource src) {
+        inbox_.attach(src);
+        (void)inbox_.poll([this](int idx) { onHostResolved_(idx); });
+    }
 
     /// Legacy per-worker planes' re-adds, made on THIS (control) thread — the
     /// node client's admin owner (review MEDIUM-2).  Before the control thread
@@ -436,11 +443,14 @@ private:
         int         hostIdx        = -1;     ///< managed peer host (-1: unmanaged)
         uint32_t    addGen         = 0;      ///< host resolution generation at the last add
         uint32_t    attempts       = 0;      ///< failed registrations so far
+        uint32_t    boundIp        = 0;      ///< host address at the last add (network order)
+        bool        boundKnown     = false;  ///< boundIp valid
     };
     rune::consensus::PeerResolutionInbox inbox_;   ///< control thread: resolution events
     std::vector<PubAddBroker*>           brokers_; ///< legacy planes' control-thread re-adds
     uint64_t pubFailures_   = 0;             ///< registration failures (rate-limited log)
     uint64_t pubReAdds_     = 0;
+    uint64_t pubAddressReAdds_ = 0;           ///< re-adds after a peer host's address changed (DR-4)
     /// The resolution event of host `idx`: re-add every peer waiting on it.
     void onHostResolved_(int idx) noexcept;
     /// Issue addExclusivePublication for `p` (an error → onPubFailed_).

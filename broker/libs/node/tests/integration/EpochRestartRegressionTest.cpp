@@ -507,3 +507,70 @@ TEST(EpochRestartRegression, SingleNodeRestartBumpsLeaderEpochRegression) {
     EXPECT_TRUE(eventually([&] { return settledWith(raw(ns), part, 4) >= 0; }));
     for (auto& n : ns) n->stop();
 }
+
+// ===========================================================================
+// 4. DR-4 quorum loss + recovery (box dc274e8 committed-loss): kill the
+//    consensus leader (controller) and one follower abruptly (no controlled
+//    shutdown) — the lone survivor must never serve, and once both restart
+//    every partition's committed records must become readable again (its
+//    leader's HW reaches the committed prefix).  Ground truth: the partition
+//    the killed controller led was re-led by the survivor; the restarted
+//    members never caught up (root cause: a Docker IP swap — see
+//    UnresolvedPeerRegression.*OnPeerIpChange; loopback cannot swap, so this
+//    pins the in-process quorum-loss recovery itself).
+// ===========================================================================
+TEST(EpochRestartRegression, QuorumLossKillControllerAndFollowerRecoversCommittedRegression) {
+    constexpr int32_t kParts = 3;
+    constexpr int kK = 5;
+    TmpDir d0{"q0"}, d1{"q1"}, d2{"q2"};
+    const auto ports = Ports::discover(3);
+    std::array<NodeConfig, 3> cfg{makeConfig(0, d0.path, ports, kParts), makeConfig(1, d1.path, ports, kParts),
+                                  makeConfig(2, d2.path, ports, kParts)};
+    for (auto& c : cfg) c.controlledShutdownMs = 0;   // SIGKILL parity: no hand-off
+    std::array<std::unique_ptr<BrokerNode>, 3> ns;
+    startAll(ns, cfg, {0, 1, 2});
+    for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+    for (int32_t p = 0; p < kParts; ++p) {
+        ASSERT_TRUE(produceAny(raw(ns), p, static_cast<uint8_t>(0xA0 + p), kK));
+        ASSERT_TRUE(eventually([&] { return settledWith(raw(ns), p, kK) >= 0; })) << "partition " << p;
+    }
+    // One agreed controller (the partitions it leads are failed over with it).
+    int controller = -1;
+    ASSERT_TRUE(eventually([&] {
+        controller = ns[0]->leaderId();
+        return controller >= 0 && ns[1]->leaderId() == controller && ns[2]->leaderId() == controller;
+    }));
+    ns[static_cast<std::size_t>(controller)]->stop();
+    ns[static_cast<std::size_t>(controller)].reset();
+    // DR-4 ground truth: the two remaining nodes elect a new controller before
+    // the second kill; the survivor is that new controller.
+    int survivor = -1;
+    ASSERT_TRUE(eventually([&] {
+        const int a = (controller + 1) % 3, b = (controller + 2) % 3;
+        const int la = ns[static_cast<std::size_t>(a)]->leaderId(), lb = ns[static_cast<std::size_t>(b)]->leaderId();
+        if (la >= 0 && la == lb && la != controller) { survivor = la; return true; }
+        return false;
+    }));
+    const int follower = 3 - controller - survivor;
+    ns[static_cast<std::size_t>(follower)]->stop();
+    ns[static_cast<std::size_t>(follower)].reset();
+    // The survivor notices the quorum loss (no consensus leader).
+    ASSERT_TRUE(eventually([&] { return ns[static_cast<std::size_t>(survivor)]->leaderId() < 0; }));
+    startAll(ns, cfg, {controller, follower});
+    for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(60s));
+    // Every replica converges on the committed leadership (DR-4 ground truth:
+    // the restarted ex-controller's metadata follower never appended past its
+    // pre-crash LEO — it never learned the new assignments, its replicas of the
+    // partitions it had led followed NO leader forever, and a subscription it
+    // served delivered nothing), and every committed record is readable.
+    for (int32_t p = 0; p < kParts; ++p) {
+        EXPECT_TRUE(eventually([&] { return settledWith(raw(ns), p, kK) >= 0; }, 60'000ms))
+            << "partition " << p << " never re-settled on all three nodes after recovery";
+    }
+    EXPECT_TRUE(eventually([&] {
+        const Offset a = leoOnOwner(*ns[0], -3, 0);
+        return a > 0 && leoOnOwner(*ns[1], -3, 0) == a && leoOnOwner(*ns[2], -3, 0) == a;
+    }, 60'000ms)) << "__cluster_metadata LEOs never converged: " << leoOnOwner(*ns[0], -3, 0) << "/"
+                  << leoOnOwner(*ns[1], -3, 0) << "/" << leoOnOwner(*ns[2], -3, 0);
+    for (auto& n : ns) if (n) n->stop();
+}
