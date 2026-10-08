@@ -18,6 +18,7 @@
 #include <rune/client/Client.h>
 #include <rune/client/Completions.h>
 #include <rune/client/group/GroupConsumer.h>
+#include <rune/client/producer/TransactionalProducer.h>
 
 #include <gtest/gtest.h>
 
@@ -141,11 +142,15 @@ struct GroupRig {
         bool ok = false;
         ASSERT_TRUE(drive([&] {
             cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
-                if (cc.token == t) ok = cc.status == rc::OpStatus::Ok;
+                if (cc.token == t) {
+                    ok      = cc.status == rc::OpStatus::Ok;
+                    seedSid = cc.value;   // the seed session's broker id
+                }
             });
             return ok;
         }));
     }
+    int64_t seedSid = 0;  // set by connect()
     /// A subscription for partition `p` registered on endpoint `ep`, or nullptr.
     [[nodiscard]] const test_support::InvokerGateway::Subscribed* subAt(int32_t p, int ep) const {
         const auto* s = gw.latestSubscription(1, p);
@@ -1262,4 +1267,246 @@ TEST(GroupRoutingRegression, MemberOnAFollowerJoinsTheCoordinatorRegression) {
     r.gw.pushRecords(*r.subAt(1, 0), 0, 3);
     ASSERT_TRUE(r.drive([&] { return got.records[0] >= 2 && got.records[1] >= 3; }, 4'000'000))
         << "records: p0=" << got.records[0] << " p1=" << got.records[1];
+
+    // D4 coordinator session (review MAJOR-1/2/3): the seed never moves for a
+    // coordinator answer — the coordinator gets its own (one-per-node) session.
+    EXPECT_EQ(r.client.testSessionStateAt(0), rc::session::SessionState::Connected);
+    EXPECT_EQ(r.gw.connectsAt[0], 1) << "the seed session was reconnected (it must not move)";
+    EXPECT_EQ(r.gw.connectsAt[n1], 1) << "a second session was opened to the coordinator node";
+    EXPECT_EQ(r.client.testSessionCount(), 2u) << "one session per node: the seed (node 0) + node 1";
+    EXPECT_EQ(r.client.testTransport().ingressChannel(), r.c.gatewayChannel) << "the seed was retargeted";
+    std::size_t first = r.gw.groupEndpoints.size();
+    for (std::size_t i = 0; i < r.gw.groupEndpoints.size(); ++i) {
+        if (r.gw.groupEndpoints[i] == n1) { first = i; break; }
+    }
+    ASSERT_LT(first, r.gw.groupEndpoints.size());
+    const int64_t coordSid = r.gw.groupSessionIds[first];
+    EXPECT_NE(coordSid, r.seedSid) << "coordinator frames carry the coordinator session's own id";
+    for (std::size_t i = first; i < r.gw.groupEndpoints.size(); ++i) {
+        EXPECT_EQ(r.gw.groupEndpoints[i], n1) << "group frame " << i << " after the join left the coordinator";
+        EXPECT_EQ(r.gw.groupSessionIds[i], coordSid) << "group frame " << i << " carries another session's id";
+    }
+    EXPECT_EQ(r.subAt(1, 0)->sessionId, r.seedSid) << "the old seed node's partition rides the seed session";
+}
+
+// D4: a transactional producer bootstrapped on a FOLLOWER.  The follower answers
+// InitProducerId ErrorResponse{NotCoordinator, coordinator endpoint}; the
+// request must be re-sent on the coordinator's session (not wait out its op
+// deadline, not move the seed).  RED without the coordinator route: the
+// InitProducerId in flight on the follower is never answered.
+TEST(GroupRoutingRegression, TxnProducerOnAFollowerInitsOnTheCoordinatorRegression) {
+    GroupRig r(4133, 4134);
+    const auto [n1, p1port] = r.addNode(4133);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions            = {{1, 0, n1, 1, 4133, ""}, {1, 1, 0, 1, 4133, ""}};
+    r.gw.coordinatorEndpoint   = n1;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p1port);
+    r.gw.initPidReply          = true;
+    auto tp = r.client.transactionalProducer("tx-d4");
+    r.connect();
+    const auto t0 = std::chrono::steady_clock::now();
+    const rc::Token t = r.nextToken++;
+    ASSERT_EQ(tp.initTransactions(r.cq, t), rc::OpResult::Accepted);
+    bool done = false;
+    rc::OpStatus st = rc::OpStatus::Closed;
+    int64_t pid = 0;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+            if (cc.token == t) { done = true; st = cc.status; pid = cc.value; }
+        });
+        return done;
+    }, 4'000'000)) << "InitProducerId never completed (NotCoordinator answers: " << r.gw.notCoordinatorAnswers << ")";
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    EXPECT_EQ(st, rc::OpStatus::Ok);
+    EXPECT_EQ(pid, 4242);
+    EXPECT_LT(ms, 5'000) << "completed only after " << ms << " ms (an op deadline, not the redirect)";
+    ASSERT_GE(r.gw.coordinatorEndpoints.size(), 2u);
+    EXPECT_EQ(r.gw.coordinatorEndpoints.front(), 0) << "precondition: the first InitProducerId went to the follower";
+    EXPECT_GE(r.gw.notCoordinatorAnswers, 1);
+    EXPECT_EQ(r.gw.coordinatorEndpoints.back(), n1) << "the InitProducerId was not re-sent to the coordinator";
+    EXPECT_NE(r.gw.coordinatorSessionIds.back(), r.seedSid) << "re-sent on the coordinator's own session";
+    EXPECT_EQ(r.gw.connectsAt[0], 1) << "the seed session must not move / reconnect";
+    EXPECT_EQ(r.client.testSessionStateAt(0), rc::session::SessionState::Connected);
+}
+
+// D4: coordinator failover while the member is Stable.  The old coordinator
+// answers a Heartbeat ErrorResponse{NotCoordinator, new coordinator}; the
+// member re-joins on the new coordinator's session — first seed -> node 1,
+// then node 1 -> node 2 (a coordinator session to a coordinator session).
+TEST(GroupRoutingRegression, CoordinatorFailoverWhileStableRejoinsTheNewCoordinatorRegression) {
+    GroupRig r(4135, 4136);
+    const auto [n1, p1port] = r.addNode(4135);
+    const auto [n2, p2port] = r.addNode(4135);
+    r.gw.moreBrokers         = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions          = {{1, 0, 0, 1, 4135, ""}, {1, 1, 0, 1, 4135, ""}};
+    r.gw.groupAssignment     = {{1, 0}, {1, 1}};
+    r.gw.coordinatorEndpoint = 0;   // the seed node is the coordinator at first
+    r.gw.holdJoins           = false;
+
+    rc::GroupConfig gcfg;
+    gcfg.sessionTimeoutMs = 600;   // a heartbeat every 200 ms
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    Consumed got;
+    wire(gc, got);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return gc.generation() == 1 && r.gw.heartbeats >= 1; }, 4'000'000))
+        << "precondition: Stable at generation 1 on the seed";
+
+    // Failover 1: node 1 is the coordinator now; the seed node knows it.
+    const int joinsBefore = r.gw.joinGroups;
+    r.gw.groupGeneration       = 2;
+    r.gw.coordinatorEndpoint   = n1;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p1port);
+    ASSERT_TRUE(r.drive([&] { return gc.generation() == 2; }, 4'000'000))
+        << "the member never re-joined the new coordinator (NotCoordinator answers: "
+        << r.gw.notCoordinatorAnswers << ")";
+    EXPECT_GT(r.gw.joinGroups, joinsBefore);
+    EXPECT_EQ(r.gw.groupEndpoints.back(), n1);
+    const int hb1 = r.gw.heartbeats;
+    ASSERT_TRUE(r.drive([&] { return r.gw.heartbeats > hb1 && r.gw.groupEndpoints.back() == n1; }, 4'000'000))
+        << "precondition: Stable on node 1 (heartbeating there)";
+
+    // Failover 2: node 2 takes over; node 1 (the old coordinator) knows it.
+    r.gw.groupGeneration       = 3;
+    r.gw.coordinatorEndpoint   = n2;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p2port);
+    ASSERT_TRUE(r.drive([&] { return gc.generation() == 3; }, 4'000'000))
+        << "the member never followed the coordinator to node 2";
+    EXPECT_EQ(r.gw.groupEndpoints.back(), n2);
+    EXPECT_EQ(r.gw.connectsAt[0], 1) << "the seed session must never move";
+    EXPECT_EQ(r.gw.connectsAt[n1], 1);
+    EXPECT_EQ(r.gw.connectsAt[n2], 1);
+}
+
+// D4 (review MEDIUM-1): a late NotCoordinator naming the coordinator the member
+// already joined (an answer to a frame sent to the follower before the move)
+// changes nothing — no rebalance, no new session, no reconnect.
+TEST(GroupRoutingRegression, LateNotCoordinatorNamingTheCurrentCoordinatorIsANoOpRegression) {
+    GroupRig r(4137, 4138);
+    const auto [n1, p1port] = r.addNode(4137);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions            = {{1, 0, n1, 1, 4137, ""}, {1, 1, n1, 1, 4137, ""}};
+    r.gw.groupAssignment       = {{1, 0}, {1, 1}};
+    r.gw.coordinatorEndpoint   = n1;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p1port);
+    r.gw.holdJoins             = false;
+
+    rc::GroupConfig gcfg;
+    gcfg.sessionTimeoutMs = 600;   // a heartbeat every 200 ms
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    Consumed got;
+    wire(gc, got);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return gc.generation() == 1 && r.gw.heartbeats >= 1; }, 4'000'000))
+        << "precondition: Stable on the coordinator";
+    const int joins    = r.gw.joinGroups;
+    const int connects = r.gw.connects;
+    const std::size_t sessions = r.client.testSessionCount();
+
+    // The follower's late answer, naming the coordinator the member is on.
+    r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator),
+                   r.gw.coordinatorRedirectTo, r.seedSid, 0);
+    const int hb = r.gw.heartbeats;
+    ASSERT_TRUE(r.drive([&] { return r.gw.heartbeats >= hb + 2; }, 4'000'000));
+    EXPECT_EQ(r.gw.joinGroups, joins) << "a late answer naming the current coordinator forced a rebalance";
+    EXPECT_EQ(r.gw.connects, connects) << "a late answer naming the current coordinator reconnected a session";
+    EXPECT_EQ(r.client.testSessionCount(), sessions);
+    EXPECT_EQ(gc.generation(), 1);
+    EXPECT_EQ(r.gw.groupEndpoints.back(), n1);
+}
+
+// D4 (review MEDIUM-3, ghost member): a JoinGroup the coordinator HOLDS (a
+// rebalance) on a session that then resumes with the SAME id is not re-sent —
+// the held join is answered on it; a second JoinGroup with an empty memberId
+// would register a ghost member.  RED with the unconditional re-join of
+// Joining members on every connect (a0f61a1): two JoinGroups.
+TEST(GroupRoutingRegression, ResumeKeepingTheSessionIdKeepsTheHeldJoinRegression) {
+    GroupRig r(4139, 4140);
+    r.gw.partitions      = {{1, 0, 0, 1, 4139, ""}, {1, 1, 0, 1, 4139, ""}};
+    r.gw.groupAssignment = {{1, 0}, {1, 1}};
+    r.gw.holdJoins       = true;
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed got;
+    wire(gc, got);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.gw.pendingJoins.empty(); }));
+    ASSERT_EQ(r.gw.joinGroups, 1);
+    const int connects = r.gw.connects;
+
+    // The broker lost track of the session for a moment: the seed resumes and
+    // the gateway hands the SAME session id back.
+    r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired), "", r.seedSid, 0);
+    ASSERT_TRUE(r.drive([&] {
+        return r.gw.connects > connects &&
+               r.client.testSessionStateAt(0) == rc::session::SessionState::Connected;
+    })) << "precondition: the seed resumed";
+    ASSERT_TRUE(r.drive([&] { return r.gw.metadataRequests >= 2; })) << "the resume's ConnectResponse was handled";
+    EXPECT_EQ(r.gw.joinGroups, 1) << "the held JoinGroup was re-sent on the same session (a ghost member)";
+
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return gc.generation() == 1; })) << "the held join was never completed";
+    EXPECT_EQ(r.gw.joinGroups, 1);
+}
+
+// D4 (review MAJOR-3): a NotCoordinator answer whose correlationId equals the
+// seed's in-flight connect corrId (another counter's namespace) must not fail
+// that connect.  RED before: the seed machine took it as a connect error ->
+// terminal Disconnected.
+TEST(GroupRoutingRegression, NotCoordinatorWithAConnectCorrIdNeverFailsTheConnectRegression) {
+    GroupRig r(4141, 4142);
+    const auto [n1, p1port] = r.addNode(4141);
+    r.gw.replyConnects = false;
+    ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
+    const rc::Token t = r.nextToken++;
+    ASSERT_EQ(r.client.connect(r.cq, t), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.connectCorrIds.empty(); }));
+    ASSERT_EQ(r.client.testSessionStateAt(0), rc::session::SessionState::Connecting);
+    r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator),
+                   "127.0.0.1:" + std::to_string(p1port), 0, r.gw.connectCorrIds.back());
+    ASSERT_TRUE(r.drive([&] { return r.client.testCoordinatorRedirects() == 1; }))
+        << "precondition: the NotCoordinator answer was handled";
+    EXPECT_NE(r.client.testSessionStateAt(0), rc::session::SessionState::Disconnected)
+        << "a NotCoordinator answer failed the seed's connect";
+    r.gw.replyConnects = true;
+    bool ok = false;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+            if (cc.token == t) ok = cc.status == rc::OpStatus::Ok;
+        });
+        return ok;
+    }, 4'000'000)) << "the seed never connected";
+}
+
+// D4 fallback: the named coordinator is unreachable — its session gives up
+// (connect budget spent -> Disconnected) and the coordinator route falls back
+// to the seed, whose node answers again with the coordinator; once that node is
+// reachable the member joins there.  Paced by the session's own connect budget
+// (no loop at round-trip speed).
+TEST(GroupRoutingRegression, UnreachableCoordinatorFallsBackToTheSeedAndRetriesRegression) {
+    RigOptions o;
+    o.connectTimeoutMs = 300;   // the coordinator session gives up after 4 x 300 ms
+    GroupRig r(4143, 4144, o);
+    const auto [n1, p1port] = r.addNode(4143);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions            = {{1, 0, 0, 1, 4143, ""}, {1, 1, 0, 1, 4143, ""}};
+    r.gw.groupAssignment       = {{1, 0}, {1, 1}};
+    r.gw.coordinatorEndpoint   = n1;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p1port);
+    r.gw.holdJoins             = false;
+    r.gw.deadEndpoints.insert(n1);
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed got;
+    wire(gc, got);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.client.testCoordinatorFallbacks() >= 1; }, 8'000'000))
+        << "the coordinator session never gave up / fell back (state "
+        << static_cast<int>(r.client.testSessionStateAt(1)) << ")";
+    // Bounded by the connect budget: one NotCoordinator answer per give-up (+1 in flight).
+    EXPECT_LE(r.gw.notCoordinatorAnswers, static_cast<int>(r.client.testCoordinatorFallbacks()) + 2)
+        << "the redirect loop ran at round-trip speed";
+    r.gw.deadEndpoints.erase(n1);
+    ASSERT_TRUE(r.drive([&] { return gc.generation() == 1; }, 8'000'000))
+        << "the member never joined the coordinator once reachable";
+    EXPECT_EQ(r.gw.groupEndpoints.back(), n1);
+    EXPECT_EQ(r.gw.connectsAt[0], 1) << "the seed session must never move";
 }
