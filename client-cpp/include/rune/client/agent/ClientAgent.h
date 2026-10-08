@@ -465,6 +465,26 @@ public:
     transport::AeronTransport::OfferResult offerOnSession(uint32_t index, const uint8_t* buf,
                                                           std::size_t len) noexcept;
 
+    /// D4 (coordinator session — Kafka's coordinator connection): the index of
+    /// the session to the group / txn COORDINATOR at `channel`: that node's ONE
+    /// session (sessionForEndpoint: lazily opened, async connect, its own crypto
+    /// state and disjoint correlationId range — the same session partition routes
+    /// to that node use); 0 when `channel` is empty or names the seed's node.  A
+    /// terminally Disconnected one is re-driven (its own connect budget paces it).
+    /// The seed never moves for it.  Agent thread only; cold path.
+    [[nodiscard]] uint32_t coordinatorSessionIndex(const std::string& channel, int64_t nowNs) noexcept;
+    /// D4: offer ONE coordinator frame (group / non-Produce txn) on session
+    /// `index`: the header sessionId is re-stamped with that session's id (as
+    /// offerProduceToLeader_ does for a leader), then sealed under that session's
+    /// CryptoState and offered on its node ingress.  Retry (= hold; the owner
+    /// re-sends on that session's connect) while it is not Connected.
+    transport::AeronTransport::OfferResult offerToCoordinator(uint32_t index, const uint8_t* buf,
+                                                              std::size_t len) noexcept;
+    /// D4: session `index`'s machine (read-only; the seed when out of range).
+    [[nodiscard]] const session::SessionMachine& sessionMachineAt(uint32_t index) const noexcept {
+        return (index < sessions_.size() ? *sessions_[index] : *sessions_[0]).machine;
+    }
+
     [[nodiscard]] std::string routeEndpointFor(int32_t topicId, int32_t partition) const noexcept;
     [[nodiscard]] std::string dataChannelFor(int32_t topicId, int32_t partition) const noexcept;
     [[nodiscard]] bool multiNodeRouting() const noexcept { return routeIndex_.size() != 0; }
@@ -884,8 +904,6 @@ private:
     /// control path) back at the configured gateway and forget the stuck-to
     /// leader.  No-op when already there.  Agent thread only (cold path).
     bool retargetSeedToBootstrap_() noexcept;
-    /// D4: seedSession().endpoint = the transport's current default channel.
-    void syncSeedEndpoint_() noexcept;
     /// T15a fix2 A-B1: the inverse — back to seed.lastKnownLeaderChannel (no-op
     /// when none is known or already there).  Agent thread only (cold path).
     bool retargetSeedToLastKnownLeader_() noexcept;

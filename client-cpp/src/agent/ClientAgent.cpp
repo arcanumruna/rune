@@ -693,19 +693,7 @@ bool ClientAgent::sendFrame(const uint8_t* buf, std::size_t len) {
 
 bool ClientAgent::retarget(const std::string& newIngressChannel) noexcept {
     // FIX F8: forward to the transport's noexcept, non-throwing retarget.
-    if (!transport_.retarget(newIngressChannel)) return false;
-    syncSeedEndpoint_();
-    return true;
-}
-
-// D4: the seed session IS the session on the transport's default publication —
-// its endpoint identity follows every retarget.  Otherwise a moved seed still
-// claims the node it left (sessionForEndpoint), and frames for that node's
-// partitions ride the seed to the NEW node, which redirects them back forever.
-void ClientAgent::syncSeedEndpoint_() noexcept {
-    Session& seed  = seedSession();
-    seed.endpoint    = transport_.ingressChannel();
-    seed.io.endpoint = seed.endpoint;   // its control frames ride the (retargeted) default pub
+    return transport_.retarget(newIngressChannel);
 }
 
 // ---------------------------------------------------------------------------
@@ -911,7 +899,14 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
                 (int)opt->message.size(), opt->message.data(),
                 s.endpoint.c_str(), (int)(&s == &seedSession()));
         }
-        s.machine.onErrorResponse(opt->code, opt->message, opt->correlationId, nowNs);
+        // D4 (review MAJOR-3): NotCoordinator answers a group / txn COORDINATOR
+        // request, never a Connect — its correlationId comes from another
+        // namespace (the Client's / the txn producer's counters) and may equal a
+        // session's in-flight connect corrId, which would fail that connect.  It
+        // concerns only the Client (the coordinator route), never a machine.
+        if (opt->code != static_cast<int16_t>(::rune::protocol::client::ErrorCode::NotCoordinator)) {
+            s.machine.onErrorResponse(opt->code, opt->message, opt->correlationId, nowNs);
+        }
         s.machine.onActivity(nowNs);
         if (egressObserver_) {
             egressObserver_(tid, buf, len);
@@ -1002,12 +997,12 @@ bool SessionEndpointIo::retargetToBootstrap() noexcept {
     // Only the seed session's endpoint is the transport's default publication,
     // which redirects / stick-to-leader retarget.  A leader session addresses its
     // own endpoint explicitly and is re-routed by metadata: nothing to undo.
-    if (this != &agent->seedSession().io) return true;   // D4: the seed by identity (its endpoint follows retargets)
+    if (endpoint != agent->cfg_.transport.ingressChannel) return true;
     return agent->retargetSeedToBootstrap_();
 }
 
 bool SessionEndpointIo::retargetToLastKnownLeader() noexcept {
-    if (this != &agent->seedSession().io) return true;  // leader session: no-op (D4: seed by identity)
+    if (endpoint != agent->cfg_.transport.ingressChannel) return true;  // leader session: no-op
     return agent->retargetSeedToLastKnownLeader_();
 }
 
@@ -1020,7 +1015,6 @@ bool ClientAgent::retargetSeedToBootstrap_() noexcept {
     // replaces the transport's channel string.
     const std::string leaving = transport_.ingressChannel();
     if (!transport_.retarget(bootstrap)) return false;  // old pub intact; next attempt retries
-    syncSeedEndpoint_();
     Session& seed               = seedSession();
     seed.lastKnownLeaderChannel = leaving;
     seed.lastKnownLeaderNode    = seed.currentLeaderNode;
@@ -1038,7 +1032,6 @@ bool ClientAgent::retargetSeedToLastKnownLeader_() noexcept {
     if (transport_.ingressChannel() != cfg_.transport.ingressChannel) return true;
     if (transport_.ingressChannel() == seed.lastKnownLeaderChannel) return true;
     if (!transport_.retarget(seed.lastKnownLeaderChannel)) return false;  // next odd attempt retries
-    syncSeedEndpoint_();
     seed.currentLeaderChannel = seed.lastKnownLeaderChannel;
     seed.currentLeaderNode    = seed.lastKnownLeaderNode;
     return true;
@@ -1064,7 +1057,7 @@ bool ClientAgent::offerControlTo(const std::string& channel,
     // Seed endpoint == transport default ingress channel → byte-identical default
     // offer (single-node fast path).  Otherwise route the control frame to the
     // session's own endpoint over the shared transport (default ingress stream id).
-    if (channel.empty() || channel == transport_.ingressChannel()) {   // D4: the CURRENT seed channel
+    if (channel.empty() || channel == cfg_.transport.ingressChannel) {
         return transport_.offer(buf, len);
     }
     return transport_.offerTo(channel, cfg_.transport.ingressStreamId, buf, len);
@@ -1170,7 +1163,7 @@ void ClientAgent::releaseRoutePub_(transport::AeronTransport::PubHandle h) noexc
     // Never a session's own control publication or the default channel's: only a
     // route-only (worker data) publication is closed.
     const std::string* ch = transport_.publicationChannel(h);
-    if (ch == nullptr || *ch == cfg_.transport.ingressChannel || *ch == transport_.ingressChannel()) return;
+    if (ch == nullptr || *ch == cfg_.transport.ingressChannel) return;
     for (const auto& s : sessions_) {
         if (s->endpoint == *ch) return;
     }
@@ -1255,6 +1248,27 @@ transport::AeronTransport::OfferResult ClientAgent::offerOnSession(uint32_t inde
     if (transport_.offerTo(sessions_[index]->endpoint, cfg_.transport.ingressStreamId, buf, len)) return R::Accepted;
     ++ingressOfferRefused_;
     return R::Retry;
+}
+
+uint32_t ClientAgent::coordinatorSessionIndex(const std::string& channel, int64_t nowNs) noexcept {
+    if (channel.empty() || failed_) return 0;
+    const uint32_t idx = sessionIndexFor_(channel);   // M6: one session per node (lazily opened)
+    (void)reviveSession(idx, nowNs);                  // a gave-up one connects again (no-op otherwise)
+    return idx;
+}
+
+transport::AeronTransport::OfferResult ClientAgent::offerToCoordinator(uint32_t index, const uint8_t* buf,
+                                                                      std::size_t len) noexcept {
+    using R = transport::AeronTransport::OfferResult;
+    if (failed_ || index >= sessions_.size()) [[unlikely]] return R::Fatal;
+    const session::SessionMachine& m = sessions_[index]->machine;
+    // Not Connected: held — the owner re-sends on this session's connect (the
+    // group hub re-joins; the txn producer re-sends on the session change).
+    if (m.state() != session::SessionState::Connected || m.sessionId() == 0) return R::Retry;
+    if (len >= ::rune::protocol::client::MessageHeader::ENCODED_SIZE) {
+        ::rune::protocol::client::detail::putLE64(const_cast<uint8_t*>(buf), 8, m.sessionId());
+    }
+    return offerOnSession(index, buf, len);   // seals under THIS session's crypto state
 }
 
 bool ClientAgent::reviveSession(uint32_t index, int64_t nowNs) noexcept {

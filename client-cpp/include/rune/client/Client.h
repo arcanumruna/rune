@@ -435,6 +435,12 @@ public:
         return agent_.testPublicationOpen(channel, streamId);
     }
     [[nodiscard]] std::size_t testSessionCount() const noexcept { return agent_.sessionCount(); }
+    /// D4: the coordinator route (empty = the seed), its session index, and how
+    /// many coordinator moves / fallbacks were followed (duty thread / owner).
+    [[nodiscard]] const std::string& testCoordinatorChannel() const noexcept { return coordinatorChannel_; }
+    [[nodiscard]] uint32_t testCoordinatorSessionIndex() const noexcept { return coordIdx_; }
+    [[nodiscard]] uint64_t testCoordinatorRedirects() const noexcept { return coordinatorRedirects_; }
+    [[nodiscard]] uint64_t testCoordinatorFallbacks() const noexcept { return coordinatorFallbacks_; }
     /// Test hook (duty-cycle thread only): agent session `i`'s state.
     [[nodiscard]] session::SessionState testSessionStateAt(uint32_t i) const noexcept { return agent_.sessionStateAt(i); }
     [[nodiscard]] uint64_t testSessionConnectFailuresAt(uint32_t i) const noexcept { return agent_.sessionConnectFailuresAt(i); }
@@ -823,9 +829,36 @@ private:
                                          detail::AndWaitIssue issue, void* issueCtx, std::string* text);
     /// I3: pin the completion target a command carries (re-encoded counted).
     void pinCommandTarget_(detail::HubCommand& cmd) noexcept;
-    /// D4: a follower named the group / txn coordinator — move the seed there.
+    /// D4: a follower named the group / txn coordinator (ErrorResponse{
+    /// NotCoordinator, endpoint}) — the coordinator route follows it (the seed
+    /// session never moves).  No-op when it names the current coordinator.
     void onCoordinatorRedirect_(const std::string& endpoint);
-    uint64_t coordinatorRedirects_ = 0;
+    /// D4: tell the group hub the COORDINATOR session's (connected, sessionId,
+    /// episode) if it changed; a coordinator session that (re)connected joins the
+    /// members there; one that gave up falls back to the seed.  Called from
+    /// syncSeedSession_ (every transition point) and before the group's session
+    /// watch.  Duty thread only; O(1) when unchanged.
+    void syncCoordinatorSession_() noexcept;
+    /// D4: the coordinator session's broker id (0 while not connected / known).
+    [[nodiscard]] int64_t coordSessionId_() const noexcept {
+        return agent_.sessionMachineAt(coordIdx_).sessionId();
+    }
+    // ---- D4 coordinator route (duty thread only) ----------------------------
+    // Kafka's coordinator connection: empty = the seed (byte-identical to the
+    // pre-D4 client until a NotCoordinator answer names another node).
+    std::string coordinatorChannel_;
+    uint32_t    coordIdx_ = 0;          // its agent session index (0 = the seed)
+    uint64_t    coordFailBase_ = 0;     // its connectFailures() when it became the coordinator
+    uint64_t    coordinatorRedirects_ = 0;   // coordinator moves followed
+    uint64_t    coordinatorFallbacks_ = 0;   // coordinator sessions given up (back to the seed)
+    // The last coordinator-session tuple the group hub was told about.
+    uint32_t              lastCoordIdx_     = 0;
+    session::SessionState lastCoordState_   = session::SessionState::Disconnected;
+    int64_t               lastCoordSid_     = 0;
+    int64_t               lastCoordEpisode_ = 0;
+    /// Every group frame (JoinGroup / SyncGroup / Heartbeat / OffsetFetch):
+    /// the seed's ring path, or the coordinator session (built once).
+    group::SendFn coordSendFn_;
     /// F8c C5: route one Txn* command to its producer (ring: resolved against
     /// txnProducers_; direct: the caller's handle holds the impl).
     void applyTxnCommand_(const detail::HubCommand& cmd, bool direct);
@@ -931,6 +964,8 @@ private:
     [[nodiscard]] std::exception_ptr submitError_(const char* what, std::size_t frameLen) const;
     /// F8a fix2: duty-thread direct send on the default ingress publication.
     static detail::SendResult directSendTrampoline_(void* ctx, const uint8_t* buf, std::size_t len);
+    /// D4: the group hub's direct sends (OffsetCommit / LeaveGroup) to the coordinator.
+    static detail::SendResult coordDirectSendTrampoline_(void* ctx, const uint8_t* buf, std::size_t len);
     /// Group fetch routing (GroupConsumerHub::FetchRouter, ctx = this): a
     /// member's per-partition Subscribe goes to the partition leader's session.
     static uint32_t fetchLeaderTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept;
