@@ -855,6 +855,15 @@ private:
     std::vector<ProduceAck>     produceAcks_;  // reserved in the ctor; owner clears
     bool                        forwardProduceResponses_ = true;
     bool                        mnDebug_ = false;  // RUNE_MN_DEBUG, read ONCE
+
+    /// client<->broker TLS/AEAD (Task 6): reusable decrypt scratch for
+    /// dispatchEgressFrame's data-plane open path — holds the reconstructed
+    /// [24B header][plaintext body] a decrypted egress frame is checkFrame'd /
+    /// switched on.  Single-writer (the agent's own doWork thread), grows to
+    /// the largest egress frame decrypted so far and never shrinks (zero
+    /// steady-state allocation once warmed up) — same shape as AeronTransport's
+    /// cryptoSealScratch_ on the encrypt side.
+    std::vector<uint8_t>        egressDecryptScratch_;
     uint32_t sessionIndexFor_(const std::string& endpoint) noexcept;
     void releaseRoutePub_(transport::AeronTransport::PubHandle h) noexcept;  // M4
 

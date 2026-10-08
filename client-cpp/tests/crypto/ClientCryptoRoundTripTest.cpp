@@ -1,20 +1,25 @@
 // tests/crypto/ClientCryptoRoundTripTest.cpp
 //
-// client<->broker TLS/AEAD (Task 5) — handshake half.
+// client<->broker TLS/AEAD — handshake half (Task 5) + data-plane half (Task 6).
 //
-// Drives a real SessionMachine (client role, fake SessionIo — no Aeron) against a
-// real rune::crypto::TlsSession::makeServer loopback, using rune-crypto's own test
-// certs.  Asserts the machine reaches Connected + encrypted, and that the derived
-// per-direction AeadCiphers round-trip a frame against an INDEPENDENTLY exported
-// server-side key (proving key agreement without reaching into SessionMachine's
-// private TlsSession).
+// Handshake half: drives a real SessionMachine (client role, fake SessionIo —
+// no Aeron) against a real rune::crypto::TlsSession::makeServer loopback,
+// using rune-crypto's own test certs.  Asserts the machine reaches Connected +
+// encrypted, and that the derived per-direction AeadCiphers round-trip a frame
+// against an INDEPENDENTLY exported server-side key (proving key agreement
+// without reaching into SessionMachine's private TlsSession).
 //
-// The "data half" (sealing/opening real Produce/egress frames through
-// ClientAgent) is Task 6 — out of scope here.
+// Data-plane half (Task 6, ClientCryptoFrame* below): exercises
+// rune::client::codec::sealProduceFrame / openEgressFrame — the pure,
+// Aeron-free envelope seal/open ClientAgent::offerProduceToLeader_ /
+// dispatchEgressFrame call — standalone, with a real AeadCipher derived the
+// same way (TLS exporter + makeServer loopback).  The ClientAgent/AeronTransport
+// *integration* of these two functions is aeron-linked and verified on the box.
 
 #include <gtest/gtest.h>
 
 #include <rune/client/codec/Codec.h>
+#include <rune/client/codec/CryptoFrame.h>
 #include <rune/client/session/SessionMachine.h>
 #include <rune/crypto/TlsSession.h>
 
@@ -246,4 +251,205 @@ TEST(ClientCryptoRoundTrip, CryptoOffConnectIsByteIdenticalToPreTask5) {
     EXPECT_TRUE(req->cipherList.empty());
     EXPECT_TRUE(req->handshakeBytes.empty());
     EXPECT_FALSE(m.cryptoState().encrypted);
+}
+
+// ---------------------------------------------------------------------------
+// client<->broker TLS/AEAD (Task 6) — data-plane half: sealProduceFrame /
+// openEgressFrame.  Standalone (no Aeron): a real handshake derives the
+// client-side CryptoState (cc::sealProduceFrame's `send`); an independently
+// exported "broker-side" CryptoState (cc::openEgressFrame's `recv`, bound to
+// the SAME c2b key/prefix) proves the wire format + AEAD binding end to end,
+// the same technique ClientCryptoRoundTrip.HandshakeReachesConnectedAndEncrypted
+// uses above.
+// ---------------------------------------------------------------------------
+namespace {
+
+/// Build [24B MessageHeader][body] — the plaintext ClientAgent::offerProduceToLeader_
+/// hands to sealProduceFrame, sessionId already patched in (Task 1.3's in-place patch).
+std::vector<uint8_t> buildPlainProduceFrame(int64_t sessionId, int64_t correlationId,
+                                             std::string_view body) {
+    namespace rpc = rune::protocol::client;
+    std::vector<uint8_t> buf(rpc::MessageHeader::ENCODED_SIZE + body.size());
+    rpc::MessageHeader h;
+    h.blockLength   = static_cast<uint16_t>(body.size());
+    h.templateId    = static_cast<uint16_t>(rpc::TemplateId::Produce);
+    h.sessionId     = sessionId;
+    h.correlationId = correlationId;
+    h.encode(buf.data());
+    std::memcpy(buf.data() + rpc::MessageHeader::ENCODED_SIZE, body.data(), body.size());
+    return buf;
+}
+
+/// Independently-exported "broker-side" CryptoState: `recv` is bound to the
+/// SAME c2b key/prefix the client's `send` (m.cryptoState().send) seals with —
+/// i.e. what the broker would use to open a client->broker frame.  `send`
+/// (b2c) is populated too so the fixture mirrors a real CryptoState shape,
+/// though these tests only exercise `recv`.
+sm::CryptoState brokerSideCryptoStateFor(cr::TlsSession& srv, const sm::SessionMachine& m,
+                                          int64_t sessionId) {
+    const auto keys = srv.exportKeys(m.cryptoState().cipher, sessionId);
+    sm::CryptoState c;
+    c.encrypted = true;
+    c.cipher    = keys.cipher;
+    c.send.emplace(keys.cipher, keys.b2c, keys.b2cPrefix);  // broker -> client
+    c.recv.emplace(keys.cipher, keys.c2b, keys.c2bPrefix);  // client -> broker
+    return c;
+}
+
+/// Shared setup: drive a real TLS handshake to Connected+encrypted and return
+/// the matching broker-side CryptoState.  `m`/`srv`/`io` are caller-owned (TLS
+/// session + session machine are non-movable) so they outlive the returned
+/// broker-side state for the duration of the test.
+struct FrameFixture {
+    std::string    serverPem, serverKey, caPem;
+    cr::TlsSession  srv;
+    FakeIo          io;
+    sm::SessionMachine m;
+    static constexpr int64_t kSessionId = 42;
+
+    FrameFixture()
+        : serverPem(slurp(testdataPath("server.pem")))
+        , serverKey(slurp(testdataPath("server.key")))
+        , caPem(slurp(testdataPath("ca.pem")))
+        , srv(cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str()))
+        , m(io, [this] {
+              sm::SessionConfig c;
+              c.egressChannel  = "aeron:udp?endpoint=client:40456";
+              c.offerCrypto    = true;
+              c.tlsTrustPem    = caPem;
+              c.tlsExpectHost  = "localhost";
+              return c;
+          }())
+    {}
+
+    bool established(int64_t nowNs) {
+        m.connect(nowNs);
+        return driveHandshake(m, io, srv, kSessionId, nowNs + 1) && m.cryptoState().encrypted;
+    }
+};
+
+}  // namespace
+
+TEST(ClientCryptoFrame, RoundTripSealThenOpenRecoversPlaintext) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    sm::CryptoState brokerSide = brokerSideCryptoStateFor(f.srv, f.m, FrameFixture::kSessionId);
+    const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, /*correlationId=*/777,
+                                               "hello-produce-body");
+
+    uint8_t sealed[256];
+    const std::size_t sealedLen = cc::sealProduceFrame(f.m.cryptoState(), plain.data(), plain.size(),
+                                                        sealed, sizeof sealed);
+    ASSERT_GT(sealedLen, 0u);
+    EXPECT_EQ(sealedLen, plain.size() + rune::protocol::client::kCryptoOverhead);
+
+    uint8_t opened[256];
+    const std::size_t openedLen =
+        cc::openEgressFrame(brokerSide, sealed, sealedLen, opened, sizeof opened);
+    ASSERT_EQ(openedLen, plain.size());
+    EXPECT_EQ(0, std::memcmp(plain.data(), opened, plain.size()));
+}
+
+TEST(ClientCryptoFrame, TamperedCiphertextIsDroppedWindowNotPoisoned) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    sm::CryptoState brokerSide = brokerSideCryptoStateFor(f.srv, f.m, FrameFixture::kSessionId);
+    const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 778, "tamper-me");
+
+    uint8_t sealed[256];
+    const std::size_t sealedLen = cc::sealProduceFrame(f.m.cryptoState(), plain.data(), plain.size(),
+                                                        sealed, sizeof sealed);
+    ASSERT_GT(sealedLen, 0u);
+    sealed[sealedLen - 1] ^= 0x01;  // flip a tag byte -> AEAD auth must fail
+
+    const uint64_t recvSeqBefore    = brokerSide.recvSeq;
+    const uint64_t recvWindowBefore = brokerSide.recvWindow;
+
+    uint8_t opened[256];
+    const std::size_t openedLen =
+        cc::openEgressFrame(brokerSide, sealed, sealedLen, opened, sizeof opened);
+    EXPECT_EQ(openedLen, 0u);
+    // A forged/tampered frame must never poison the anti-replay window.
+    EXPECT_EQ(brokerSide.recvSeq, recvSeqBefore);
+    EXPECT_EQ(brokerSide.recvWindow, recvWindowBefore);
+}
+
+TEST(ClientCryptoFrame, TamperedHeaderBreaksAadBindingAndIsDropped) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    sm::CryptoState brokerSide = brokerSideCryptoStateFor(f.srv, f.m, FrameFixture::kSessionId);
+    const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 779, "aad-bound-body");
+
+    uint8_t sealed[256];
+    const std::size_t sealedLen = cc::sealProduceFrame(f.m.cryptoState(), plain.data(), plain.size(),
+                                                        sealed, sizeof sealed);
+    ASSERT_GT(sealedLen, 0u);
+    // Flip a byte inside the CLEAR MessageHeader (correlationId, offset 16) —
+    // the ciphertext/tag are untouched, but the header is part of the AAD, so
+    // this must still fail authentication.
+    sealed[16] ^= 0x01;
+
+    uint8_t opened[256];
+    const std::size_t openedLen =
+        cc::openEgressFrame(brokerSide, sealed, sealedLen, opened, sizeof opened);
+    EXPECT_EQ(openedLen, 0u);
+}
+
+TEST(ClientCryptoFrame, ReplayedSeqIsDropped) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    sm::CryptoState brokerSide = brokerSideCryptoStateFor(f.srv, f.m, FrameFixture::kSessionId);
+    const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 780, "replay-me");
+
+    uint8_t sealed[256];
+    const std::size_t sealedLen = cc::sealProduceFrame(f.m.cryptoState(), plain.data(), plain.size(),
+                                                        sealed, sizeof sealed);
+    ASSERT_GT(sealedLen, 0u);
+
+    uint8_t opened[256];
+    const std::size_t first =
+        cc::openEgressFrame(brokerSide, sealed, sealedLen, opened, sizeof opened);
+    ASSERT_EQ(first, plain.size());
+
+    // Deliver the EXACT SAME sealed frame again — a replay.
+    const std::size_t second =
+        cc::openEgressFrame(brokerSide, sealed, sealedLen, opened, sizeof opened);
+    EXPECT_EQ(second, 0u);
+}
+
+TEST(ClientCryptoFrame, InWindowReorderIsAcceptedOutOfOrderDeliveryWorks) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    sm::CryptoState brokerSide = brokerSideCryptoStateFor(f.srv, f.m, FrameFixture::kSessionId);
+
+    uint8_t sealed1[256], sealed2[256], sealed3[256];
+    const auto plain1 = buildPlainProduceFrame(FrameFixture::kSessionId, 781, "seq-1");
+    const auto plain2 = buildPlainProduceFrame(FrameFixture::kSessionId, 782, "seq-2");
+    const auto plain3 = buildPlainProduceFrame(FrameFixture::kSessionId, 783, "seq-3");
+    const std::size_t len1 = cc::sealProduceFrame(f.m.cryptoState(), plain1.data(), plain1.size(), sealed1, sizeof sealed1);
+    const std::size_t len2 = cc::sealProduceFrame(f.m.cryptoState(), plain2.data(), plain2.size(), sealed2, sizeof sealed2);
+    const std::size_t len3 = cc::sealProduceFrame(f.m.cryptoState(), plain3.data(), plain3.size(), sealed3, sizeof sealed3);
+    ASSERT_GT(len1, 0u); ASSERT_GT(len2, 0u); ASSERT_GT(len3, 0u);
+
+    uint8_t opened[256];
+    // Deliver seq=1, then seq=3 (skipping 2), then seq=2 — a legitimate
+    // network reorder.  seq=2 is still inside the 64-wide window and unseen.
+    EXPECT_EQ(cc::openEgressFrame(brokerSide, sealed1, len1, opened, sizeof opened), plain1.size());
+    EXPECT_EQ(cc::openEgressFrame(brokerSide, sealed3, len3, opened, sizeof opened), plain3.size());
+    const std::size_t reordered = cc::openEgressFrame(brokerSide, sealed2, len2, opened, sizeof opened);
+    ASSERT_EQ(reordered, plain2.size());
+    EXPECT_EQ(0, std::memcmp(plain2.data(), opened, plain2.size()));
+
+    // A SECOND delivery of the reordered seq=2 is now a replay.
+    EXPECT_EQ(cc::openEgressFrame(brokerSide, sealed2, len2, opened, sizeof opened), 0u);
 }

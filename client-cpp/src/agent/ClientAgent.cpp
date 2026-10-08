@@ -13,6 +13,7 @@
 
 #include <rune/client/agent/ClientAgent.h>
 #include <rune/client/agent/AgentRingMessages.h>
+#include <rune/client/codec/CryptoFrame.h>  // Task 6: data-plane seal/open
 #include <rune/client/codec/DataCodec.h>
 #include <rune/protocol/client/MessageHeader.h>  // Task 1.3: re-stamp sessionId (offset 8)
 
@@ -692,6 +693,75 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
                                        const uint8_t* buf,
                                        std::size_t    len) noexcept
 {
+    // client<->broker TLS/AEAD (Task 6): decrypt BEFORE checkFrame, when this
+    // frame belongs to an encrypted session.  The 24B MessageHeader is ALWAYS
+    // clear (it's the AEAD AAD), so templateId (offset 2) / sessionId (offset
+    // 8) can be read directly off the wire — no decode needed to make this
+    // decision.  ConnectResponse / HandshakeContinueResponse are exempt: they
+    // precede or complete key establishment itself and are always plaintext,
+    // even on an otherwise-encrypted session (e.g. a stale duplicate delivered
+    // after a later reconnect re-encrypted the session).  Plaintext path
+    // (crypto off, or no encrypted session claims this sessionId) is
+    // byte-identical to before Task 6 — buf/len are reassigned only on a
+    // successful decrypt.
+    //
+    // sessionId is NOT a safe disambiguator on its own in multi-node mode: the
+    // broker assigns it from a plain per-node counter starting at 1 (no node
+    // id / epoch folded in), so two sessions to two different leader nodes
+    // commonly share the same sessionId (e.g. both get 1 on their first
+    // connect).  Rather than guess, try EVERY session currently claiming this
+    // sessionId: AeadCipher::open authenticates under each candidate's own
+    // key, so a wrong candidate just fails closed (0, no side effects — the
+    // anti-replay window is committed only after a tag verifies) and costs
+    // nothing but one extra open() call; cluster size bounds the candidate
+    // count.  If at least one encrypted candidate exists but NONE
+    // authenticates, this is a genuine tamper/replay (or an unresolvable
+    // collision) — drop rather than risk falling through to plaintext
+    // dispatch on an encrypted session's frame.
+    if (len >= rune::protocol::client::MessageHeader::ENCODED_SIZE) {
+        const auto peekedTid = static_cast<codec::TemplateId>(
+            rune::protocol::client::detail::getLE16(buf, 2));
+        if (peekedTid != codec::TemplateId::ConnectResponse &&
+            peekedTid != codec::TemplateId::HandshakeContinueResponse) {
+            const int64_t sid = rune::protocol::client::detail::getLE64(buf, 8);
+            bool sawEncryptedCandidate = false;
+            bool decrypted             = false;
+            if (sid != 0) {
+                for (auto& sp : sessions_) {
+                    Session& cand = *sp;
+                    if (cand.machine.sessionId() != sid || !cand.machine.cryptoState().encrypted) continue;
+                    sawEncryptedCandidate = true;
+                    // Plaintext is always kCryptoOverhead (28) bytes SHORTER than
+                    // the wire frame it reconstructs from — `len` is always enough.
+                    // noexcept contract: vector::resize can throw (bad_alloc); contained
+                    // here the same way AeronTransport::sealScratch contains its own
+                    // grow — a failed grow drops the frame instead of terminating.
+                    if (egressDecryptScratch_.size() < len) {
+                        try {
+                            egressDecryptScratch_.resize(len);
+                        } catch (...) {
+                            return;  // scratch exhausted — drop
+                        }
+                    }
+                    const std::size_t plainLen = codec::openEgressFrame(
+                        cand.machine.cryptoState(), buf, len,
+                        egressDecryptScratch_.data(), egressDecryptScratch_.size());
+                    if (plainLen != 0) {
+                        buf = egressDecryptScratch_.data();
+                        len = plainLen;
+                        decrypted = true;
+                        break;
+                    }
+                    // Wrong candidate (sessionId collision) or genuine tamper —
+                    // try the next candidate before giving up.
+                }
+            }
+            if (!decrypted && sawEncryptedCandidate) {
+                return;  // every encrypted candidate failed auth — drop
+            }
+        }
+    }
+
     // Validate frame.
     const auto check = codec::checkFrame(buf, len);
     if (check.status != codec::FrameStatus::Ok) {
@@ -1157,6 +1227,24 @@ std::string ClientAgent::dataChannelFor(int32_t topicId, int32_t partition) cons
     return idx == detail::FlatIndexMap::kNone ? std::string{} : routes_[idx].dataChannel;
 }
 
+namespace {
+/// client<->broker TLS/AEAD (Task 6): seal `buf`/`len` under `crypto` into
+/// `transport`'s reusable seal scratch (AeronTransport::sealScratch — single-
+/// writer, grows-only, no per-call heap allocation once warmed up).  Returns
+/// {nullptr/scratch, 0} on failure (scratch exhausted, or AeadCipher::seal's
+/// own 0 = "cipher error, do not transmit" contract) — callers must treat a
+/// 0 length as DROP, never transmit.  Callers check `crypto.encrypted` first;
+/// this only runs the seal+scratch mechanics for the encrypted path.
+struct SealedFrame { uint8_t* buf; std::size_t len; };
+SealedFrame sealForOffer(transport::AeronTransport& transport, session::CryptoState& crypto,
+                         const uint8_t* buf, std::size_t len) noexcept {
+    const std::size_t need = len + rune::protocol::client::kCryptoOverhead;
+    uint8_t* scratch = transport.sealScratch(need);
+    if (scratch == nullptr) return {nullptr, 0};
+    return {scratch, codec::sealProduceFrame(crypto, buf, len, scratch, need)};
+}
+} // namespace
+
 bool ClientAgent::offerProduceToLeader_(int32_t topicId, int32_t partition,
                                         int32_t ingressStreamId,
                                         const uint8_t* buf, std::size_t len,
@@ -1188,8 +1276,45 @@ bool ClientAgent::offerProduceToLeader_(int32_t topicId, int32_t partition,
             if (len >= 16) {
                 ::rune::protocol::client::detail::putLE64(const_cast<uint8_t*>(buf), 8, sid);
             }
+            // client<->broker TLS/AEAD (Task 6): seal under the LEADER session's
+            // CryptoState — the sessionId just patched above belongs to it.
+            // Plaintext path (crypto off) is byte-identical to before Task 6.
+            if (leader.machine.cryptoState().encrypted) {
+                // Backlog B1 interaction: a PENDING RecordBatch CRC is normally
+                // computed lazily, only once Aeron accepts the frame (so a
+                // back-pressured offer never wastes the computation) — it
+                // patches crc.crcAt bytes inside the PLAINTEXT buf/term later.
+                // Once sealed, buf's body is opaque ciphertext: that deferred
+                // patch would corrupt the AEAD tag instead of writing a real
+                // CRC.  So when encrypting, finalize the CRC in the plaintext
+                // NOW (sealFrame is unconditional/idempotent, same bytes B1's
+                // own lazy path would have written) and offer the sealed frame
+                // with an EMPTY FrameCrc — nothing left to defer.
+                if (crc.pending()) {
+                    transport::sealFrame(const_cast<uint8_t*>(buf), len, crc);
+                }
+                const SealedFrame sealed = sealForOffer(transport_, leader.machine.cryptoState(), buf, len);
+                if (sealed.len == 0) return false;  // seal failed — DROP, do not transmit
+                return transport_.offerOn(r.pub, sealed.buf, sealed.len, {});
+            }
             return transport_.offerOn(r.pub, buf, len, crc);
         }
+    }
+    // Single-node / no matching route: default offer.  The buf's sessionId was
+    // already stamped from the SEED session (doWork's producerDrainFn_ call
+    // passes seedSession().machine.sessionId() before reaching here), so the
+    // seed's CryptoState is the matching one to seal under.
+    Session& seed = seedSession();
+    if (seed.machine.cryptoState().encrypted) {
+        // Backlog B1 interaction — see the identical comment in the leader
+        // branch above: finalize a pending CRC in the plaintext BEFORE
+        // sealing; the sealed frame offers with an empty FrameCrc.
+        if (crc.pending()) {
+            transport::sealFrame(const_cast<uint8_t*>(buf), len, crc);
+        }
+        const SealedFrame sealed = sealForOffer(transport_, seed.machine.cryptoState(), buf, len);
+        if (sealed.len == 0) return false;  // seal failed — DROP, do not transmit
+        return transport_.offer(ingressStreamId, sealed.buf, sealed.len, {});
     }
     return transport_.offer(ingressStreamId, buf, len, crc);
 }

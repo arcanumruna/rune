@@ -392,6 +392,26 @@ bool AeronTransport::offerOn(PubHandle h, const uint8_t* buf, std::size_t len, F
 }
 
 // ---------------------------------------------------------------------------
+// client<->broker TLS/AEAD (Task 6) — reusable seal scratch
+// ---------------------------------------------------------------------------
+
+uint8_t* AeronTransport::sealScratch(std::size_t minCap) noexcept {
+    // noexcept contract: std::vector::resize can throw (bad_alloc) — contained
+    // here, same reasoning as offer()'s own noexcept-wraps-a-throwing-call note
+    // above.  A failed grow returns nullptr; the caller (offerProduceToLeader_)
+    // treats that as a seal failure and drops the frame rather than risk
+    // writing past a too-small buffer.
+    if (cryptoSealScratch_.size() < minCap) {
+        try {
+            cryptoSealScratch_.resize(minCap);
+        } catch (...) {
+            return nullptr;
+        }
+    }
+    return cryptoSealScratch_.data();
+}
+
+// ---------------------------------------------------------------------------
 // offer (per-worker stream)
 // ---------------------------------------------------------------------------
 

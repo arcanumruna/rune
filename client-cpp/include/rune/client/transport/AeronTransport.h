@@ -216,6 +216,15 @@ public:
     /// while the publication resolves or is back-pressured (retry next cycle).
     bool offerOn(PubHandle h, const uint8_t* buf, std::size_t len, FrameCrc crc = {}) noexcept;
 
+    /// client<->broker TLS/AEAD (Task 6): the reusable seal scratch for the
+    /// data-plane encrypt path (ClientAgent::offerProduceToLeader_).  Owned by
+    /// the transport (single-writer, same duty thread as offer/offerOn — never
+    /// two seals in flight at once), so one buffer suffices across every
+    /// session; grows to the largest frame sealed so far and never shrinks
+    /// (zero steady-state allocation once warmed up).  Returns nullptr if
+    /// minCap cannot be allocated (caller must then drop the frame).
+    [[nodiscard]] uint8_t* sealScratch(std::size_t minCap) noexcept;
+
     /// Test/simulation seam: the clock that drives every Resolution deadline and
     /// retry backoff (default: steady_clock).  pumpUntil_'s own wall-time bound
     /// in start()/retarget() stays on the real clock.  nullptr restores default.
@@ -454,6 +463,10 @@ private:
         bool        armed = false;
     };
     PendingSeal seal_{};
+    /// client<->broker TLS/AEAD (Task 6): backing storage for sealScratch()
+    /// above.  Grow-only (std::vector::resize never shrinks capacity on grow;
+    /// we never call shrink_to_fit) — see sealScratch()'s doc comment.
+    std::vector<uint8_t> cryptoSealScratch_;
     /// Aeron's offer() takes its supplier as a std::function (Publication.h);
     /// built ONCE here (captures `this`; the transport is immovable) so the hot
     /// path never constructs one.  Seals on the first (BEGIN) fragment.
