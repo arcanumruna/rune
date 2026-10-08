@@ -66,9 +66,15 @@ NodeStateFile::NodeStateFile(std::string path, int fileSyncLevel)
         // candidateTermId — same write order as an update (single owner thread).
         *slotAt(kLogPositionOffset) = 0;
         *slotAt(kTimestampOffset)   = 0;
+        *slotAt(kFollowFloorOffset) = NULL_VALUE + kFloorBias;   // stored biased: 0 = a pre-D24 file
         crashOrderBarrier();   // metadata stores precede the id store (CRASH-ORDER)
         *slotAt(kCandidateTermIdOffset) = NULL_VALUE;
 
+        syncFile();
+    } else if (*slotAt(kFollowFloorOffset) == 0) {
+        // D24 re-review P1-MEDIUM-1: a pre-D24 file — freeze its conservative
+        // floor (the candidate term) NOW, so later own candidacies never move it.
+        *slotAt(kFollowFloorOffset) = static_cast<int64_t>(candidateTermId()) + kFloorBias;
         syncFile();
     }
     // Existing file: values are already present in the mapping.
@@ -156,6 +162,32 @@ Term NodeStateFile::proposeMaxCandidateTermId(
 // ---------------------------------------------------------------------------
 // Sync
 // ---------------------------------------------------------------------------
+
+Term NodeStateFile::followFloorTermId() const {
+    const int64_t raw = *slotAt(kFollowFloorOffset);
+    // D24 review MEDIUM-1: a file written before the slot existed reads 0 — no
+    // record of what this node granted / led / followed: the floor is its whole
+    // candidate term (the pre-D24 rule — never follows below it).
+    if (raw == 0) return candidateTermId();
+    return static_cast<Term>(raw - kFloorBias);
+}
+
+Term NodeStateFile::proposeMaxFollowFloorTermId(
+    Term term, int64_t logPosition, int64_t timestampMs)
+{
+    const bool floorUp = term > followFloorTermId();
+    const bool candUp  = term > candidateTermId();
+    if (!floorUp && !candUp) return candidateTermId();
+    if (floorUp) *slotAt(kFollowFloorOffset) = static_cast<int64_t>(term) + kFloorBias;
+    if (candUp) {
+        *slotAt(kLogPositionOffset) = logPosition;
+        *slotAt(kTimestampOffset)   = timestampMs;
+        crashOrderBarrier();
+        *slotAt(kCandidateTermIdOffset) = static_cast<int64_t>(term);
+    }
+    syncFile();
+    return candidateTermId();
+}
 
 void NodeStateFile::syncFile() const {
     if (fileSyncLevel_ > 0) {

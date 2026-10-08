@@ -28,6 +28,7 @@ struct ConsensusPublisher {
     virtual void candidacyState(NodeId /*toMember*/, NodeId /*fromMember*/,
                                 const CandidacyState& /*state*/) {}
 
+
     /// Controlled shutdown (Raft leadership transfer / Aeron graceful leader
     /// close): the leader `leaderMemberId` of `leadershipTermId` resigns —
     /// followers start an election at once, skipping it (template 59).

@@ -14,10 +14,19 @@
 //
 // Rings: req_ worker → control, resp_ control → worker (one consumer each).
 // Cold path only (a peer that errored at startup, re-added on its host's
-// resolution event); allocation is fine here.
+// resolution event or address change); allocation is fine here.
+//
+// D24(b): an add carries the address the owner's resolution inbox holds for
+// the peer's host — the control thread adds on that NUMERIC endpoint (never the
+// driver's possibly stale name cache); a publication superseded by a re-add is
+// handed back (kRelease) and dropped on the control thread, never the worker.
 
 #include <rune/consensus/ControlRing.h>
+#include <rune/consensus/PeerResolution.h>
 #include <rune/replication/Types.h>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 #include <Aeron.h>
 #include <ExclusivePublication.h>
@@ -42,13 +51,36 @@ public:
     ~PubAddBroker() {
         drainResults_([](NodeId, PubPtr) {});
         for (auto& o : outbox_) delete o.holder;
+        (void)req_.poll([](std::int32_t type, std::int64_t, std::int64_t b) {
+            if (type == kRelease) delete reinterpret_cast<PubPtr*>(static_cast<std::intptr_t>(b));
+        });
     }
     PubAddBroker(const PubAddBroker&)            = delete;
     PubAddBroker& operator=(const PubAddBroker&) = delete;
 
     // ---- OWNER (worker) side -------------------------------------------------
     /// false = request ring full (the owner keeps the peer waiting).
-    [[nodiscard]] bool requestAdd(NodeId peer) noexcept { return req_.offer(kAdd, peer); }
+    /// `ipv4` (network order) is the address the owner holds for the peer's
+    /// host; ipKnown=false adds on the configured channel unchanged.
+    [[nodiscard]] bool requestAdd(NodeId peer, std::uint32_t ipv4 = 0, bool ipKnown = false) noexcept {
+        return req_.offer(kAdd, peer, ipKnown ? static_cast<std::int64_t>(ipv4) + 1 : 0);
+    }
+    /// Hands a superseded publication to the control thread to drop (the last
+    /// reference releases it through the node client's admin lock).  false =
+    /// ring full / allocation failed: `pub` is left untouched with the caller.
+    [[nodiscard]] bool release(PubPtr& pub) noexcept {
+        // D24 review MEDIUM-2: MOVE the reference into the holder before it is
+        // offered — a copy would let the control thread drop its reference
+        // first and leave the LAST one (the admin-lock release) on the worker.
+        PubPtr* holder = nullptr;
+        try { holder = new PubPtr(std::move(pub)); } catch (...) { return false; }   // pub untouched on throw
+        if (!req_.offer(kRelease, 0, static_cast<std::int64_t>(reinterpret_cast<std::intptr_t>(holder)))) {
+            pub = std::move(*holder);   // never offered: hand it back
+            delete holder;
+            return false;
+        }
+        return true;
+    }
 
     /// onResult(peer, pub) — pub == nullptr: the registration failed.
     template <typename F>
@@ -56,15 +88,22 @@ public:
 
     // ---- CONTROL side (the node client's admin thread) ------------------------
     int doWork(aeron::Aeron& client) noexcept {
-        int work = req_.poll([&](std::int32_t type, std::int64_t a, std::int64_t) {
+        int work = req_.poll([&](std::int32_t type, std::int64_t a, std::int64_t b) {
+            if (type == kRelease) {
+                delete reinterpret_cast<PubPtr*>(static_cast<std::intptr_t>(b));   // drop on THIS thread
+                ++releases_;
+                return;
+            }
             if (type != kAdd) return;
             const NodeId peer = static_cast<NodeId>(a);
             const std::string* ch = channelOf_(peer);
             if (ch == nullptr) { outbox_.push_back({peer, nullptr}); return; }
             try {
-                pending_.push_back({peer, client.addExclusivePublication(*ch, streamId_)});
+                lastAddChannel_ = b > 0 ? numericChannel_(*ch, static_cast<std::uint32_t>(b - 1)) : *ch;
+                pending_.push_back({peer, client.addExclusivePublication(lastAddChannel_, streamId_)});
             } catch (const std::exception& e) {
-                spdlog::warn("PubAddBroker: peer {} addExclusivePublication {} failed: {}", peer, *ch, e.what());
+                spdlog::warn("PubAddBroker: peer {} addExclusivePublication {} failed: {}", peer, lastAddChannel_,
+                             e.what());
                 outbox_.push_back({peer, nullptr});
             }
         });
@@ -93,8 +132,11 @@ public:
         return work;
     }
 
+    [[nodiscard]] const std::string& lastAddChannelForTest() const noexcept { return lastAddChannel_; }
+    [[nodiscard]] uint64_t releasesForTest() const noexcept { return releases_; }
+
 private:
-    static constexpr std::int32_t kAdd = 1, kResult = 2;
+    static constexpr std::int32_t kAdd = 1, kResult = 2, kRelease = 3;
     struct Pending { NodeId peer; int64_t regId; };
     struct Out     { NodeId peer; PubPtr* holder; };
 
@@ -108,6 +150,13 @@ private:
             onResult(static_cast<NodeId>(a), std::move(pub));
         });
     }
+    [[nodiscard]] static std::string numericChannel_(const std::string& channel, std::uint32_t ipv4) {
+        in_addr a{};
+        a.s_addr = ipv4;
+        char buf[INET_ADDRSTRLEN] = {};
+        if (::inet_ntop(AF_INET, &a, buf, sizeof buf) == nullptr) return channel;
+        return rune::consensus::PeerHostTable::withEndpointHost(channel, buf);
+    }
     [[nodiscard]] const std::string* channelOf_(NodeId peer) const noexcept {
         for (const auto& [id, ch] : channels_) if (id == peer) return &ch;
         return nullptr;
@@ -119,6 +168,8 @@ private:
     rune::consensus::ControlRing<1024>          resp_;   // control → owner
     std::vector<Pending>                        pending_;   // control-owned
     std::vector<Out>                            outbox_;    // control-owned
+    std::string                                 lastAddChannel_;   // control-owned
+    uint64_t                                    releases_ = 0;     // control-owned
 };
 
 } // namespace rune::replication

@@ -17,15 +17,14 @@ bool PeerResolverHub::resolveWithGetaddrinfo(const std::string& host, std::uint3
     hints.ai_protocol = IPPROTO_UDP;
     addrinfo* res = nullptr;
     if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || res == nullptr) return false;
-    bool ok = false;
-    for (addrinfo* r = res; r != nullptr && !ok; r = r->ai_next) {
-        if (r->ai_family == AF_INET && r->ai_addr != nullptr) {
-            ipv4 = reinterpret_cast<const sockaddr_in*>(r->ai_addr)->sin_addr.s_addr;
-            ok   = true;
-        }
+    std::uint32_t addrs[16];
+    std::size_t n = 0;
+    for (addrinfo* r = res; r != nullptr && n < 16; r = r->ai_next) {
+        if (r->ai_family == AF_INET && r->ai_addr != nullptr)
+            addrs[n++] = reinterpret_cast<const sockaddr_in*>(r->ai_addr)->sin_addr.s_addr;
     }
     ::freeaddrinfo(res);
-    return ok;
+    return pickAddress(addrs, n, ipv4);   // D24(c): keep the current address while it is a record
 }
 
 namespace {
@@ -67,7 +66,13 @@ int PeerResolverHub::serveHostRequests_() {
         work += p.req->poll([&](std::int32_t type, std::int64_t a, std::int64_t b) {
             if (type != rune::consensus::kHostResolveRequest) return;
             std::unique_ptr<std::string> host(reinterpret_cast<std::string*>(static_cast<std::intptr_t>(b)));
+            // Review LOW-9: a managed host resolves to the address the hub pins
+            // (the same one owners and the driver cache were given).
             std::uint32_t ip = 0;
+            if (host) {
+                const int idx = table_.indexOf(*host);
+                if (idx >= 0 && hosts_[static_cast<std::size_t>(idx)].has) ip = hosts_[static_cast<std::size_t>(idx)].ipv4;
+            }
             const bool ok = host && fn_(*host, ip);
             p.outbox.emplace_back(a, ok ? static_cast<std::int64_t>(ip) : -1);
         }, 16);
@@ -137,7 +142,7 @@ int PeerResolverHub::doWork_(int64_t nowNs) {
 
 int PeerResolverHub::probe_(std::size_t i, int64_t nowNs) {
     HostState& h = hosts_[i];
-    std::uint32_t ip = 0;
+    std::uint32_t ip = h.has ? h.ipv4 : 0;   // D24(c): in = the current address
     const bool ok = fn_(table_.host(i), ip);
     if (!ok) {
         h.nextProbeNs = nowNs + h.backoffNs;

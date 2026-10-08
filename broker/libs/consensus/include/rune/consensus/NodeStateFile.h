@@ -22,7 +22,11 @@ namespace rune::consensus {
  *   [0..7]   int64_t  candidateTermId   — written LAST on update
  *   [8..15]  int64_t  timestamp         — epoch-ms of last update (plain)
  *   [16..23] int64_t  logPosition       — log position of last update (plain)
- *   [24..]   padding to kFileSize
+ *   [24..31] int64_t  followFloor + 2   — D24 follow floor, stored biased by kFloorBias:
+ *                                         raw 1 = NULL_VALUE (fresh file), raw 0 = a pre-D24
+ *                                         file (the floor reads as candidateTermId).  Stored
+ *                                         before candidateTermId, one sync for both.
+ *   [32..]   padding to kFileSize
  *
  * NULL_VALUE sentinel for candidateTermId = -1 (matching Aeron's Aeron.NULL_VALUE).
  */
@@ -86,8 +90,24 @@ public:
      */
     Term proposeMaxCandidateTermId(Term candidateTermId, int64_t logPosition, int64_t timestampMs);
 
+    /**
+     * D24: the durable FOLLOW FLOOR — the highest term this node granted a vote
+     * in, led, followed or adopted from a leader.  It never follows a leader
+     * below it.  NULL_VALUE on a fresh file (and on a file written before the
+     * slot existed, which reads raw 0: the floor is the candidate term — the
+     * pre-D24 rule).
+     */
+    Term followFloorTermId() const;
+
+    /**
+     * D24: raise the follow floor AND the candidate term to `term` (each only
+     * if higher) with ONE sync.  The floor is stored before the candidate term
+     * (both before the sync); returns the resulting candidateTermId.
+     */
+    Term proposeMaxFollowFloorTermId(Term term, int64_t logPosition, int64_t timestampMs);
+
 private:
-    // Fixed file size: three int64_t fields = 24 bytes, padded to 64 bytes.
+    // Fixed file size: four int64_t fields = 32 bytes, padded to 64 bytes.
     static constexpr std::size_t kFileSize = 64;
 
     // Byte offsets within the mapped region.
@@ -95,6 +115,8 @@ private:
     static constexpr std::size_t kCandidateTermIdOffset = 0;
     static constexpr std::size_t kTimestampOffset       = 8;
     static constexpr std::size_t kLogPositionOffset     = 16;
+    static constexpr std::size_t kFollowFloorOffset     = 24;   ///< D24 (stored + kFloorBias)
+    static constexpr int64_t     kFloorBias             = 2;    ///< raw 0 = a pre-D24 file
 
     std::string path_;
     int         fileSyncLevel_;

@@ -80,9 +80,11 @@ struct CommitPositionCall { NodeId toMember; Term leadershipTermId; int64_t logP
                             NodeId leaderMemberId; };
 
 // ---------------------------------------------------------------------------
-// FakeConsensusPublisher — records all outbound messages
+// ElectionLogFakePublisher — records all outbound messages
 // ---------------------------------------------------------------------------
-struct FakeConsensusPublisher : ConsensusPublisher {
+// Unique name: several test files in this binary define a FakeConsensusPublisher
+// (an ODR clash — the linker silently kept the other file's vtable).
+struct ElectionLogFakePublisher : ConsensusPublisher {
     std::vector<CanvassCall>      canvassCalls;
     std::vector<RequestVoteCall>  requestVoteCalls;
     std::vector<PlaceVoteCall>    placeVoteCalls;
@@ -141,7 +143,7 @@ static std::vector<ClusterMember> makeMembers3(NodeId self = 0) {
 static Election makeElection(
     std::vector<ClusterMember> members,
     NodeId                     self,
-    FakeConsensusPublisher&    pub,
+    ElectionLogFakePublisher&    pub,
     NodeStateFile&             nsf,
     TermLog&                   tl,
     bool                       isNodeStartup = true,
@@ -191,7 +193,7 @@ static bool driveToClosed(Election& e, int64_t& nowNs) {
 // Used in 3-member leader tests to make quorum advance.
 static bool driveLeaderToClosed(
     Election& leader, int64_t& nowNs,
-    FakeConsensusPublisher& pub,
+    ElectionLogFakePublisher& pub,
     std::vector<NodeId> followerIds)
 {
     for (int i = 0; i < 100 && !leader.isClosed(); ++i) {
@@ -226,7 +228,7 @@ TEST(ElectionLog, SingleMember_EndToEnd_Closed) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
 
     auto e = makeElection(makeMembers1(0), 0, pub, nsf, tl);
     int64_t nowNs = 1'000'000LL;
@@ -244,7 +246,7 @@ TEST(ElectionLog, SingleMember_LeadershipTermId_IsOne) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
 
     auto e = makeElection(makeMembers1(0), 0, pub, nsf, tl);
     int64_t nowNs = 1'000'000LL;
@@ -259,7 +261,7 @@ TEST(ElectionLog, SingleMember_IsClosed_ReturnsTrueAfterClosed) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
 
     auto e = makeElection(makeMembers1(0), 0, pub, nsf, tl);
     EXPECT_FALSE(e.isClosed());
@@ -274,7 +276,7 @@ TEST(ElectionLog, SingleMember_LeaderMemberId_IsSelf) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
 
     auto e = makeElection(makeMembers1(0), 0, pub, nsf, tl);
     int64_t nowNs = 1'000'000LL;
@@ -288,7 +290,7 @@ TEST(ElectionLog, SingleMember_NoMessagesEmittedToPeers) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
 
     auto e = makeElection(makeMembers1(0), 0, pub, nsf, tl);
     int64_t nowNs = 1'000'000LL;
@@ -305,7 +307,7 @@ TEST(ElectionLog, SingleMember_DoWork_AfterClosed_IsNoop) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
 
     auto e = makeElection(makeMembers1(0), 0, pub, nsf, tl);
     int64_t nowNs = 1'000'000LL;
@@ -351,7 +353,7 @@ TEST(ElectionLog, ThreeMember_Leader_EndToEnd_Closed) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
 
     int64_t nowNs = 1'000'000LL;
@@ -368,7 +370,7 @@ TEST(ElectionLog, ThreeMember_Leader_TermLog_HasEntry) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, 0);
 
     int64_t nowNs = 1'000'000LL;
@@ -384,7 +386,7 @@ TEST(ElectionLog, ThreeMember_Leader_NLT_EmittedToPeers) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, 0);
 
     int64_t nowNs = 1'000'000LL;
@@ -416,7 +418,7 @@ TEST(ElectionLog, ThreeMember_Leader_CommitPosition_EmittedToPeers) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, 0);
 
     int64_t nowNs = 1'000'000LL;
@@ -440,7 +442,7 @@ TEST(ElectionLog, ThreeMember_Leader_LeaderMemberId_IsSelf) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, 0);
 
     int64_t nowNs = 1'000'000LL;
@@ -455,7 +457,7 @@ TEST(ElectionLog, ThreeMember_Leader_QuorumVote_Timeout_Closed) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, 0);
 
     int64_t nowNs = 1'000'000LL;
@@ -493,7 +495,7 @@ TEST(ElectionLog, OnAppendPosition_UpdatesMemberLogPosition) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, 0);
 
     int64_t nowNs = 1'000'000LL;
@@ -514,7 +516,7 @@ TEST(ElectionLog, OnAppendPosition_WrongTerm_DoesNotUpdateMember) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     // Use a 5-member cluster so quorum requires 3 and self-alone isn't enough.
     std::vector<ClusterMember> ms5(5);
     for (int i = 0; i < 5; i++) {
@@ -562,7 +564,7 @@ TEST(ElectionLog, OnAppendPosition_FromSelf_Processed) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, 0);
 
     int64_t nowNs = 1'000'000LL;
@@ -586,7 +588,7 @@ TEST(ElectionLog, OnCommitPosition_UpdatesNotifiedCommitPosition) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     // Use a follower election (node 0 in FOLLOWER_BALLOT after voting for node 1)
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
 
@@ -614,7 +616,7 @@ TEST(ElectionLog, OnCommitPosition_WrongTerm_Ignored) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
 
     int64_t nowNs = 1'000'000LL;
@@ -636,7 +638,7 @@ TEST(ElectionLog, OnCommitPosition_DoesNotDecrease) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
 
     int64_t nowNs = 1'000'000LL;
@@ -662,7 +664,7 @@ TEST(ElectionLog, Follower_FromFollowerBallot_NLT_DrivesClosed) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     // Node 0 is a follower that voted for node 1 in term 1
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
 
@@ -687,7 +689,7 @@ TEST(ElectionLog, Follower_EmitsAppendPosition_ToLeader) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
 
     int64_t nowNs = 1'000'000LL;
@@ -712,7 +714,7 @@ TEST(ElectionLog, OnNewLeadershipTerm_Stale_Ignored) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     // Node 0 with leadershipTermId=5 already
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, /*leadershipTermId=*/5);
 
@@ -732,7 +734,7 @@ TEST(ElectionLog, Follower_FromCanvass_NLT_DrivesClosed) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
 
     int64_t nowNs = 1'000'000LL;
@@ -752,7 +754,7 @@ TEST(ElectionLog, Follower_LeadershipTermId_SetFromNLT) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
 
     int64_t nowNs = 1'000'000LL;
@@ -769,7 +771,7 @@ TEST(ElectionLog, Follower_LeaderMemberId_CorrectAfterNLT) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
 
     int64_t nowNs = 1'000'000LL;
@@ -787,7 +789,7 @@ TEST(ElectionLog, OnNewLeadershipTerm_Ignored_WhenClosed) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers1(0), 0, pub, nsf, tl);
 
     int64_t nowNs = 1'000'000LL;
@@ -809,7 +811,7 @@ TEST(ElectionLog, NextDeadlineNs_InLeaderLogReplication) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, 0);
 
     int64_t nowNs = 1'000'000LL;
@@ -827,7 +829,7 @@ TEST(ElectionLog, NextDeadlineNs_InClosed_IsMinValue) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers1(0), 0, pub, nsf, tl);
 
     int64_t nowNs = 1'000'000LL;
@@ -841,7 +843,7 @@ TEST(ElectionLog, NextDeadlineNs_InCandidateBallot) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, 0);
 
     int64_t nowNs = 1'000'000LL;
@@ -871,14 +873,14 @@ TEST(ElectionLog, Full_LeaderAndFollower_BothReachClosed) {
     TempFile nsfFile0(".nsf"), tlFile0(".tl");
     NodeStateFile nsf0(nsfFile0.str());
     TermLog       tl0(tlFile0.str());
-    FakeConsensusPublisher pub0;
+    ElectionLogFakePublisher pub0;
     auto leader = makeElection(makeMembers3(0), 0, pub0, nsf0, tl0, true, 0, 0, 0, 0);
 
     // Node 2: follower
     TempFile nsfFile2(".nsf"), tlFile2(".tl");
     NodeStateFile nsf2(nsfFile2.str());
     TermLog       tl2(tlFile2.str());
-    FakeConsensusPublisher pub2;
+    ElectionLogFakePublisher pub2;
     auto follower = makeElection(makeMembers3(2), 2, pub2, nsf2, tl2, true, 0, 0, 0, 0);
 
     int64_t leaderNs = 1'000'000LL;
@@ -930,7 +932,7 @@ TEST(ElectionLog, ThreeMember_Leader_ClosesInFewSteps) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, 0);
 
     int64_t nowNs = 1'000'000LL;
@@ -964,7 +966,7 @@ TEST(ElectionLog, FollowerPersistsTermEntryOnClose) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
 
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
     int64_t nowNs = 1'000'000LL;
@@ -1013,7 +1015,7 @@ TEST(ElectionLog, Leader_FollowerWrongTerm_DoesNotAdvanceQuorum) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     // seed=0 so bringToLeaderLogReplication nominates immediately
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
 
@@ -1051,7 +1053,7 @@ TEST(ElectionLog, NLT_HigherTerm_IsAdoptedAndFollowed) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
 
     int64_t nowNs = 1'000'000LL;
@@ -1094,7 +1096,7 @@ TEST(ElectionLog, NLT_LeaderLogBehindFollower_IsIgnored) {
     // for term=6 (>5) will grant the vote and set candidateTermId_=6.
     NodeStateFile nsf(nsfFile.str());
     TermLog tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
 
     // Node 0 with logLeadershipTermId=5, appendPosition=200
     std::vector<ClusterMember> ms(3);
@@ -1166,7 +1168,7 @@ TEST(ElectionLog, N1_NonZeroLogLeadershipTermId_QuorumStillReached) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
 
     // 3-member cluster; leader is node 0.
     // logLeadershipTermId=3 to simulate a node that has appended entries in an
@@ -1249,7 +1251,7 @@ TEST(ElectionLog, PartB1_HigherTermNLT_WhileLeaderReady_StepsDownToCanvass) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
 
     int64_t nowNs = 1'000'000LL;
@@ -1313,7 +1315,7 @@ TEST(ElectionLog, PartB1b_HigherTermCommit_WhileLeaderReady_StepsDown) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
 
     int64_t nowNs = 1'000'000LL;
@@ -1354,7 +1356,7 @@ TEST(ElectionLog, PartB4_NLT_StaleBallotReject_IgnoredWhenNextTermBehindCandidat
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
 
     int64_t nowNs = 1'000'000LL;
@@ -1407,7 +1409,7 @@ TEST(ElectionLog, PartB5_VotePersistAcrossRestart_FollowerBallotPath) {
     {
         NodeStateFile nsf(nsfFile.str());
         TermLog       tl(tlFile.str());
-        FakeConsensusPublisher pub;
+        ElectionLogFakePublisher pub;
         auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
         int64_t nowNs = 1'000'000LL;
         e.doWork(nowNs); // INIT → CANVASS
@@ -1429,7 +1431,7 @@ TEST(ElectionLog, PartB5_VotePersistAcrossRestart_FollowerBallotPath) {
 
     // Reconstruct a full Election — it must clamp candidateTermId_ to the persisted value.
     TermLog       tl2(tlFile.str());
-    FakeConsensusPublisher pub2;
+    ElectionLogFakePublisher pub2;
     Election e2(/*isNodeStartup=*/false, /*gracefulClosedLeaderId=*/-1,
                 /*leadershipTermId=*/grantedTerm, /*logLeadershipTermId=*/0,
                 /*logPosition=*/0, /*appendPosition=*/0,
@@ -1441,7 +1443,7 @@ TEST(ElectionLog, PartB5_VotePersistAcrossRestart_FollowerBallotPath) {
     // The reconstructed election must not grant a vote for the same term it already voted in.
     // candidateTermId_ = max(persistedTerm≥7, leadershipTermId=7) = ≥7.
     // A vote request for term=7 (== candidateTermId_) must be denied.
-    FakeConsensusPublisher pub3;
+    ElectionLogFakePublisher pub3;
     NodeStateFile nsf3(nsfFile.str());
     TermLog       tl3(tlFile.str());
     Election e3(/*isNodeStartup=*/false, /*gracefulClosedLeaderId=*/-1,
@@ -1475,7 +1477,7 @@ TEST(ElectionLog, PartB6_ElectionTimeoutAtExactBoundary_Transitions) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
 
     int64_t nowNs = 1'000'000LL;
@@ -1520,7 +1522,7 @@ TEST(ElectionLog, PartB7_DuplicateOldPositionAppend_DoesNotAdvanceQuorum) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
 
     std::vector<ClusterMember> ms(3);
     for (int i = 0; i < 3; i++) {
@@ -1588,7 +1590,7 @@ TEST(ElectionLog, PartB8_C5_PassthroughGuard_PositivePath_FollowerReachesLogInit
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
 
     // logPosition == appendPosition == 0: Phase-2 precondition holds.
     // followerReplay() must pass through to FollowerLogInit without asserting.
@@ -1631,7 +1633,7 @@ TEST(ElectionLog, ClosedHeartbeat_SingleMember_IsNoop) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
 
     auto e = makeElection(makeMembers1(0), 0, pub, nsf, tl);
     int64_t nowNs = 1'000'000LL;
@@ -1665,7 +1667,7 @@ TEST(ElectionLog, ClosedHeartbeat_ThreeMember_Leader_EmitsNLT_SameTermId) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     // seed=0: bringToLeaderLogReplication nominates immediately.
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
 
@@ -1728,7 +1730,7 @@ TEST(ElectionLog, ClosedHeartbeat_ThreeMember_Leader_MultipleHeartbeats_SameTerm
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
 
     int64_t nowNs = 1'000'000LL;
@@ -1780,7 +1782,7 @@ TEST(ElectionLog, ClosedFollower_NoHeartbeatBroadcast_ButLivenessRearmed) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
 
     // Node 0 is a follower that voted for node 1.
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
@@ -1836,7 +1838,7 @@ TEST(ElectionLog, ClosedFollower_DeadLeader_ReCanvasses) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
 
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl);
 
@@ -1868,7 +1870,7 @@ TEST(ElectionLog, PartB8b_C5_PassthroughGuard_LeaderReplay_PositivePath) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
 
     int64_t nowNs = 1'000'000LL;
@@ -1912,7 +1914,7 @@ TEST(ElectionLogRegression, BecomeLeaderGrantsLivenessGraceToSilentPeer) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
 
     // Node 0 is self.  Win the election via canvass+votes from BOTH peers (votes
     // do NOT set the append-position liveness clock — only onAppendPosition does),
@@ -1956,7 +1958,7 @@ TEST(ElectionLogRegression, BecomeLeaderGrantsLivenessGraceToSilentPeer) {
 // heartbeat timeout, and it never stands for election again in this process.
 // ===========================================================================
 namespace {
-// Own publisher (NOT derived from FakeConsensusPublisher: several test TUs
+// Own publisher (NOT derived from ElectionLogFakePublisher: several test TUs
 // define different global classes of that name — deriving from it here would
 // pick up another TU's inline members).
 struct StandDownRecorder final : ConsensusPublisher {
@@ -2166,7 +2168,7 @@ TEST(ElectionStandDownRegression, ResignedLeaderCanvassKeepsTheFollowersSkipRegr
 // higher term → enterElection).
 // ===========================================================================
 
-static void closeAsThreeMemberLeader(Election& e, FakeConsensusPublisher& pub, int64_t& nowNs) {
+static void closeAsThreeMemberLeader(Election& e, ElectionLogFakePublisher& pub, int64_t& nowNs) {
     bringToLeaderLogReplication(e, nowNs);
     EXPECT_TRUE(driveLeaderToClosed(e, nowNs, pub, {1, 2}));
     EXPECT_EQ(e.leaderMemberId(), 0);
@@ -2176,7 +2178,7 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_HigherTermNLT_StepsDownAndFollo
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     int64_t nowNs = 1'000'000LL;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
     closeAsThreeMemberLeader(e, pub, nowNs);
@@ -2206,7 +2208,7 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_HigherTermCommit_StepsDown) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     int64_t nowNs = 1'000'000LL;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
     closeAsThreeMemberLeader(e, pub, nowNs);
@@ -2222,7 +2224,7 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_HigherTermRequestVote_IsAnswere
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     int64_t nowNs = 1'000'000LL;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
     closeAsThreeMemberLeader(e, pub, nowNs);
@@ -2250,7 +2252,7 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_LostFollowerQuorum_StepsDown) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     int64_t nowNs = 1'000'000LL;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
     closeAsThreeMemberLeader(e, pub, nowNs);
@@ -2269,7 +2271,7 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_LiveFollowers_KeepLeadership) {
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     int64_t nowNs = 1'000'000LL;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
     closeAsThreeMemberLeader(e, pub, nowNs);
@@ -2290,7 +2292,7 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_StaleCandidateRequestVote_Keeps
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     int64_t nowNs = 1'000'000LL;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
     closeAsThreeMemberLeader(e, pub, nowNs);
@@ -2318,7 +2320,7 @@ TEST(ElectionLog, LeaderLivenessGraceRegression_PeersEligibleFromLeaderLogReplic
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
     int64_t nowNs = 1'000'000'000'000LL;   // far past any sentinel window
     bringToLeaderLogReplication(e, nowNs);
@@ -2339,7 +2341,7 @@ TEST(ElectionLog, ClosedLeaderStickinessRegression_LeaderWithQuorumDeniesAndKeep
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     int64_t nowNs = 1'000'000LL;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
     closeAsThreeMemberLeader(e, pub, nowNs);
@@ -2365,7 +2367,7 @@ TEST(ElectionLog, ClosedLeaderStickinessRegression_FollowerWithLiveLeaderDenies)
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     int64_t nowNs = 1'000'000LL;
     auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl);
     closeAsFollowerOf0(e, nowNs);
@@ -2395,7 +2397,7 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_GateDeniedCandidacyKeepsLeader)
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     int64_t nowNs = 1'000'000LL;
     auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
     closeAsThreeMemberLeader(e, pub, nowNs);
@@ -2416,7 +2418,7 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_FollowerHigherTermNltAndCommitL
         TempFile nsfFile(".nsf"), tlFile(".tl");
         NodeStateFile nsf(nsfFile.str());
         TermLog       tl(tlFile.str());
-        FakeConsensusPublisher pub;
+        ElectionLogFakePublisher pub;
         int64_t nowNs = 1'000'000LL;
         auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl);
         closeAsFollowerOf0(e, nowNs);
@@ -2438,7 +2440,7 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_AdoptedTermIsDurable) {
     {
         NodeStateFile nsf(nsfFile.str());
         TermLog       tl(tlFile.str());
-        FakeConsensusPublisher pub;
+        ElectionLogFakePublisher pub;
         int64_t nowNs = 1'000'000LL;
         auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
         closeAsThreeMemberLeader(e, pub, nowNs);
@@ -2500,7 +2502,7 @@ TEST(ElectionStandDownRegression, GracefulLeaderSkipEndsWithItsElectionRegressio
 // A 2-node cluster therefore tolerates NO node failure (consensus and every
 // controller decision pause until both nodes are up) — run 1 or >= 3 nodes.
 // ===========================================================================
-static void closeAsTwoMemberLeader(Election& e, FakeConsensusPublisher& pub, int64_t& nowNs) {
+static void closeAsTwoMemberLeader(Election& e, ElectionLogFakePublisher& pub, int64_t& nowNs) {
     e.doWork(nowNs);                       // INIT → CANVASS
     e.onCanvassPosition(0, 0, 0, 1);
     nowNs += kStartupCanvassTimeoutNs + 1;
@@ -2525,7 +2527,7 @@ TEST(ElectionLog, TwoMemberClusterRegression_LeaderStepsDownWhenItsOnlyFollowerD
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     int64_t nowNs = 1'000'000LL;
     auto e = makeElection(makeMembers2(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
     closeAsTwoMemberLeader(e, pub, nowNs);
@@ -2548,7 +2550,7 @@ TEST(ElectionLog, TwoMemberClusterRegression_LeaderKeepsLeadingWhileFollowerRepo
     TempFile nsfFile(".nsf"), tlFile(".tl");
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     int64_t nowNs = 1'000'000LL;
     auto e = makeElection(makeMembers2(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
     closeAsTwoMemberLeader(e, pub, nowNs);
@@ -2576,7 +2578,7 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_RestartAfterAdoptedTermIgnoresD
     {
         NodeStateFile nsf(nsfFile.str());
         TermLog       tl(tlFile.str());
-        FakeConsensusPublisher pub;
+        ElectionLogFakePublisher pub;
         int64_t nowNs = 1'000'000LL;
         auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl);
         closeAsFollowerOf0(e, nowNs);
@@ -2588,7 +2590,7 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_RestartAfterAdoptedTermIgnoresD
     }   // crash: the adopted leadershipTermId is lost, the TermLog still says `deposed`
     NodeStateFile nsf(nsfFile.str());
     TermLog       tl(tlFile.str());
-    FakeConsensusPublisher pub;
+    ElectionLogFakePublisher pub;
     int64_t nowNs = 5'000'000'000LL;
     auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl, true, deposed, 0, 0);
     e.doWork(nowNs);   // INIT → CANVASS (candidate term from the NodeStateFile)
@@ -2600,5 +2602,265 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_RestartAfterAdoptedTermIgnoresD
         nowNs += kStatusIntervalNs;
         e.doWork(nowNs);
         ASSERT_NE(e.leaderMemberId(), 0) << "restarted node re-followed the deposed leader";
+    }
+}
+
+// ===========================================================================
+// D24 (DR-4 review MAJOR-1 / MEDIUM-3) — a node whose OWN failed candidacies
+// raised its durable candidateTermId above the elected leader's term refused
+// that leader's NewLeadershipTerm as a "stale ballot", and its own RequestVotes
+// were refused by the leader's stickiness: stranded until the leader died
+// (timing-dependent: canvass timeout vs. the first heartbeat after a restart).
+// The node may follow any leader at or above its durable FOLLOW FLOOR — the
+// highest term it granted a vote in, led, followed, or adopted from a leader —
+// never below it (Raft's durable-term rule for exactly the terms whose
+// participation can help a leader; an own failed candidacy helps no one).
+// ===========================================================================
+namespace {
+// Runs `rounds` own candidacies that fail (member 2 canvasses, nobody votes).
+void runFailedCandidacies(Election& e, int64_t& nowNs, int rounds) {
+    for (int r = 0; r < rounds; ++r) {
+        const Term before = e.candidateTermId();
+        for (int i = 0; i < 200 && e.candidateTermId() == before; ++i) {
+            e.onCanvassPosition(e.logLeadershipTermId(), e.appendPosition(), e.leadershipTermId(), 2);
+            nowNs += kStatusIntervalNs;
+            e.doWork(nowNs);
+        }
+        ASSERT_GT(e.candidateTermId(), before) << "candidacy round " << r << " never started";
+        for (int i = 0; i < 200 && e.state() != ElectionState::Canvass; ++i) {
+            nowNs += kStatusIntervalNs;
+            e.doWork(nowNs);   // ballot times out without votes → CANVASS
+        }
+        ASSERT_EQ(e.state(), ElectionState::Canvass);
+    }
+}
+void heartbeatNlt(Election& e, int64_t nowNs, Term term, NodeId leader) {
+    e.onNewLeadershipTerm(nowNs, term, term, 0, 0, term, 0, 0, 0, 0, leader, 0, false, 0);
+}
+} // namespace
+
+TEST(ElectionLog, StrandedCanvassRegression_FollowsLeaderAfterOwnFailedCandidaciesRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    Term term = 0;
+    {
+        NodeStateFile nsf(nsfFile.str());
+        TermLog       tl(tlFile.str());
+        ElectionLogFakePublisher pub;
+        int64_t nowNs = 1'000'000LL;
+        auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl);
+        closeAsFollowerOf0(e, nowNs);
+        term = e.leadershipTermId();
+    }   // restart: the leader (0) is alive at `term`
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    ElectionLogFakePublisher pub;
+    int64_t nowNs = 5'000'000'000LL;
+    auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl, true, term, 0, 0);
+    e.doWork(nowNs);   // INIT → CANVASS
+    // The leader's heartbeats are slow to reach us: our own candidacies fail first.
+    runFailedCandidacies(e, nowNs, 2);
+    ASSERT_GT(e.candidateTermId(), term);
+    heartbeatNlt(e, nowNs, term, /*leader=*/0);
+    ASSERT_TRUE(driveToClosed(e, nowNs)) << "stranded: refused the live leader of term " << term
+                                         << " after own failed candidacies (candidateTermId="
+                                         << e.candidateTermId() << ")";
+    EXPECT_EQ(e.leaderMemberId(), 0);
+    EXPECT_EQ(e.leadershipTermId(), term);
+}
+
+TEST(ElectionLog, StrandedCanvassRegression_RefusesStaleLeaderAfterGrantingNewerVoteRegression) {
+    // Review counterexample: granted a vote at 4, restarted with the TermLog at 2,
+    // a zombie leader's NLT for 3 must not be followed.
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    {
+        NodeStateFile nsf(nsfFile.str());
+        TermLog       tl(tlFile.str());
+        ElectionLogFakePublisher pub;
+        int64_t nowNs = 1'000'000LL;
+        auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl, true, /*term=*/2, 0, 0);
+        e.doWork(nowNs);   // → CANVASS
+        e.onRequestVote(/*logLeadershipTermId=*/2, 0, /*candidateTermId=*/4, /*candidateId=*/2, nowNs);
+        ASSERT_EQ(e.state(), ElectionState::FollowerBallot);
+    }   // crash before term 4's NLT arrives
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    ElectionLogFakePublisher pub;
+    int64_t nowNs = 5'000'000'000LL;
+    auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl, true, /*term=*/2, 0, 0);
+    e.doWork(nowNs);
+    for (int i = 0; i < 20; ++i) {
+        heartbeatNlt(e, nowNs, 3, /*leader=*/0);
+        nowNs += kStatusIntervalNs;
+        e.doWork(nowNs);
+        ASSERT_NE(e.leaderMemberId(), 0) << "followed term 3 after granting a vote at 4";
+    }
+}
+
+TEST(ElectionLog, StrandedCanvassRegression_RefusesStaleLeaderAfterLeadingNewerTermRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    Term won = 0;
+    {
+        NodeStateFile nsf(nsfFile.str());
+        TermLog       tl(tlFile.str());
+        ElectionLogFakePublisher pub;
+        int64_t nowNs = 1'000'000LL;
+        auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, /*term=*/1, 0, 0, /*seed=*/0);
+        bringToLeaderLogReplication(e, nowNs);   // won term `won`, crashes before its TermLog entry
+        won = e.leadershipTermId();
+        ASSERT_GT(won, 1);
+    }
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    ElectionLogFakePublisher pub;
+    int64_t nowNs = 5'000'000'000LL;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, /*term=*/1, 0, 0);
+    e.doWork(nowNs);
+    for (int i = 0; i < 20; ++i) {
+        heartbeatNlt(e, nowNs, won - 1, /*leader=*/1);
+        nowNs += kStatusIntervalNs;
+        e.doWork(nowNs);
+        ASSERT_NE(e.leaderMemberId(), 1) << "followed term " << won - 1 << " after leading " << won;
+    }
+}
+
+TEST(ElectionLog, StrandedCanvassRegression_RefusesStaleLeaderAfterFollowingNewerTermRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    {
+        NodeStateFile nsf(nsfFile.str());
+        TermLog       tl(tlFile.str());
+        ElectionLogFakePublisher pub;
+        int64_t nowNs = 1'000'000LL;
+        auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl, true, /*term=*/2, 0, 0);
+        e.doWork(nowNs);
+        heartbeatNlt(e, nowNs, 4, /*leader=*/2);   // follows term 4, crashes before its TermLog entry
+        ASSERT_EQ(e.leaderMemberId(), 2);
+    }
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    ElectionLogFakePublisher pub;
+    int64_t nowNs = 5'000'000'000LL;
+    auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl, true, /*term=*/2, 0, 0);
+    e.doWork(nowNs);
+    for (int i = 0; i < 20; ++i) {
+        heartbeatNlt(e, nowNs, 3, /*leader=*/0);
+        nowNs += kStatusIntervalNs;
+        e.doWork(nowNs);
+        ASSERT_NE(e.leaderMemberId(), 0) << "followed term 3 after following term 4";
+    }
+}
+
+// ---- D24 review round 2 ----------------------------------------------------
+
+// MAJOR-1: a heartbeat NLT handled before the first doWork (INIT) must neither
+// bypass nor overwrite the durable floor.
+TEST(ElectionLog, StrandedCanvassRegression_NltBeforeInitNeverBypassesTheFloorRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    {
+        NodeStateFile nsf(nsfFile.str());
+        TermLog       tl(tlFile.str());
+        ElectionLogFakePublisher pub;
+        int64_t nowNs = 1'000'000LL;
+        auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl, true, /*term=*/2, 0, 0);
+        e.doWork(nowNs);
+        e.onRequestVote(2, 0, /*candidateTermId=*/4, /*candidateId=*/2, nowNs);   // floor 4
+        ASSERT_EQ(e.followFloorTermId(), 4);
+    }
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    ElectionLogFakePublisher pub;
+    int64_t nowNs = 5'000'000'000LL;
+    auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl, true, /*term=*/0, 0, 0);   // production: term 0
+    EXPECT_EQ(e.followFloorTermId(), 4) << "the floor must be in force from construction";
+    heartbeatNlt(e, nowNs, 3, /*leader=*/0);   // arrives while still INIT
+    for (int i = 0; i < 20; ++i) {
+        nowNs += kStatusIntervalNs;
+        e.doWork(nowNs);
+        heartbeatNlt(e, nowNs, 3, /*leader=*/0);
+        ASSERT_NE(e.leaderMemberId(), 0) << "followed term 3 after granting 4 (NLT before init)";
+    }
+    EXPECT_GE(e.followFloorTermId(), 4);
+}
+
+// MAJOR-2: a candidate in its BALLOT keeps its ballot — an older leader's NLT
+// must not make it abandon a quorum a peer granted it.
+TEST(ElectionLog, StrandedCanvassRegression_CandidateBallotKeepsItsBallotRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    ElectionLogFakePublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, /*term=*/1, 0, 0, /*seed=*/0);
+    e.doWork(nowNs);
+    e.onCanvassPosition(1, 0, 1, 1);
+    e.onCanvassPosition(1, 0, 1, 2);
+    nowNs += kStartupCanvassTimeoutNs + 1;
+    e.doWork(nowNs);
+    nowNs += kElectionTimeoutNs * 10;
+    e.doWork(nowNs);
+    ASSERT_EQ(e.state(), ElectionState::CandidateBallot);
+    const Term standing = e.candidateTermId();
+    ASSERT_GT(standing, 1);
+    heartbeatNlt(e, nowNs, 1, /*leader=*/1);   // the old term's leader is heard mid-ballot
+    EXPECT_EQ(e.state(), ElectionState::CandidateBallot) << "abandoned its own ballot for an older leader";
+    EXPECT_NE(e.leaderMemberId(), 1);
+}
+
+// MEDIUM-3: the FOLLOW site raises the floor on its own (no adoption, no grant):
+// an own candidacy stood at 3, then term 3's leader is followed.
+TEST(ElectionLog, StrandedCanvassRegression_FollowSiteAloneRaisesTheFloorRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    {
+        NodeStateFile nsf(nsfFile.str());
+        TermLog       tl(tlFile.str());
+        ElectionLogFakePublisher pub;
+        int64_t nowNs = 1'000'000LL;
+        auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl, true, /*term=*/2, 0, 0);
+        e.doWork(nowNs);
+        runFailedCandidacies(e, nowNs, 1);       // candidate term 3, floor untouched
+        ASSERT_EQ(e.candidateTermId(), 3);
+        ASSERT_LT(e.followFloorTermId(), 3);
+        heartbeatNlt(e, nowNs, 3, /*leader=*/2);   // next == candidate: no adoption
+        ASSERT_EQ(e.leaderMemberId(), 2);
+        EXPECT_EQ(e.followFloorTermId(), 3) << "following term 3 must raise the floor";
+    }
+    NodeStateFile nsf(nsfFile.str());
+    EXPECT_EQ(nsf.followFloorTermId(), 3);
+}
+
+// MEDIUM-3: the quorum-after-timeout win and the single-node win raise the floor.
+TEST(ElectionLog, StrandedCanvassRegression_QuorumAndSingleNodeWinsRaiseTheFloorRegression) {
+    {
+        TempFile nsfFile(".nsf"), tlFile(".tl");
+        NodeStateFile nsf(nsfFile.str());
+        TermLog       tl(tlFile.str());
+        ElectionLogFakePublisher pub;
+        int64_t nowNs = 1'000'000LL;
+        auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, /*term=*/1, 0, 0, /*seed=*/0);
+        e.doWork(nowNs);
+        e.onCanvassPosition(1, 0, 1, 1);
+        e.onCanvassPosition(1, 0, 1, 2);
+        nowNs += kStartupCanvassTimeoutNs + 1;
+        e.doWork(nowNs);
+        nowNs += kElectionTimeoutNs * 10;
+        e.doWork(nowNs);
+        nowNs += 1;
+        e.doWork(nowNs);
+        ASSERT_EQ(e.state(), ElectionState::CandidateBallot);
+        e.onVote(1, 0, e.candidateTermId(), 0, /*voter=*/1, true);   // one vote: a quorum, not unanimous
+        nowNs += kElectionTimeoutNs + 1;
+        e.doWork(nowNs);
+        ASSERT_EQ(e.leaderMemberId(), 0) << "quorum leader after the ballot timeout";
+        EXPECT_EQ(nsf.followFloorTermId(), e.leadershipTermId());
+    }
+    {
+        TempFile nsfFile(".nsf"), tlFile(".tl");
+        NodeStateFile nsf(nsfFile.str());
+        TermLog       tl(tlFile.str());
+        ElectionLogFakePublisher pub;
+        int64_t nowNs = 1'000'000LL;
+        auto e = makeElection(makeMembers1(0), 0, pub, nsf, tl);
+        e.doWork(nowNs);
+        ASSERT_EQ(e.leaderMemberId(), 0);
+        EXPECT_EQ(nsf.followFloorTermId(), e.leadershipTermId());
     }
 }

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <filesystem>
 #include <string>
+#include <fcntl.h>
 #include <unistd.h>
 
 using namespace rune::consensus;
@@ -372,5 +373,45 @@ TEST(NodeStateFile, FileSyncLevel1_FreshInit_DurableNullValue) {
     {
         NodeStateFile nsf2(t.path.string(), /*fileSyncLevel=*/1);
         EXPECT_EQ(nsf2.candidateTermId(), NodeStateFile::NULL_VALUE);
+    }
+}
+
+// D24: the durable follow floor (slot 24, stored biased so a pre-D24 file is
+// recognisable).
+TEST(NodeStateFileRegression, FollowFloorFreshRaiseReopenAndLegacyRegression) {
+    TempNsf t("_floor");
+    {
+        NodeStateFile nsf(t.path.string());
+        EXPECT_EQ(nsf.followFloorTermId(), NodeStateFile::NULL_VALUE) << "fresh file: no floor";
+        EXPECT_EQ(nsf.proposeMaxFollowFloorTermId(5, 100, 0), 5);
+        EXPECT_EQ(nsf.followFloorTermId(), 5);
+        EXPECT_EQ(nsf.candidateTermId(), 5) << "the floor raises the candidate term with it";
+        EXPECT_EQ(nsf.proposeMaxCandidateTermId(9, 0, 0), 9);   // own candidacy: candidate only
+        EXPECT_EQ(nsf.followFloorTermId(), 5);
+        EXPECT_EQ(nsf.proposeMaxFollowFloorTermId(7, 0, 0), 9) << "never lowers the candidate term";
+        EXPECT_EQ(nsf.followFloorTermId(), 7);
+        EXPECT_EQ(nsf.proposeMaxFollowFloorTermId(6, 0, 0), 9);
+        EXPECT_EQ(nsf.followFloorTermId(), 7) << "never lowers the floor";
+    }
+    {
+        NodeStateFile nsf(t.path.string());
+        EXPECT_EQ(nsf.followFloorTermId(), 7) << "the floor survives a reopen";
+        EXPECT_EQ(nsf.candidateTermId(), 9);
+    }
+    {   // a file written before the slot existed: raw 0 → the floor is the candidate term
+        const int fd = ::open(t.path.c_str(), O_RDWR);
+        ASSERT_GE(fd, 0);
+        const int64_t zero = 0;
+        ASSERT_EQ(::pwrite(fd, &zero, sizeof zero, 24), static_cast<ssize_t>(sizeof zero));
+        ::close(fd);
+        NodeStateFile nsf(t.path.string());
+        EXPECT_EQ(nsf.followFloorTermId(), 9) << "legacy file: never follows below its candidate term";
+        // Migrated at open: later own candidacies must not move it (re-review P1-MEDIUM-1).
+        EXPECT_EQ(nsf.proposeMaxCandidateTermId(12, 0, 0), 12);
+        EXPECT_EQ(nsf.followFloorTermId(), 9);
+    }
+    {
+        NodeStateFile nsf(t.path.string());
+        EXPECT_EQ(nsf.followFloorTermId(), 9) << "the migrated floor is durable";
     }
 }

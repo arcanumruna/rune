@@ -632,3 +632,68 @@ TEST(UnresolvedPeerRegression, PlaneReAddsOnPeerIpChangeRegression) {
     ASSERT_TRUE(driveUntil(pass, [&] { return t.peerReAddsForTest() == base + 2 && t.allPeersResolved(); }))
         << "the re-added shard-plane publication never came back into use";
 }
+
+// D24(b) (DR-4 review MEDIUM-2): a LEGACY plane (node client shared with the
+// control thread) also re-adds a peer whose host moved — on the control
+// thread, on the NUMERIC new address (never the driver's possibly stale name
+// cache), and its old publication is released on the control thread too.
+TEST(UnresolvedPeerRegression, LegacyPlaneReAddsOnPeerIpChangeViaTheControlThreadRegression) {
+    MovingHost env;
+    InvokerShard s(env.hub.subscribeDriver());
+    auto pump = s.pump();
+    const std::vector<std::pair<rune::replication::NodeId, std::string>> peers{
+        {1, udp(kLateHost, rune::aeronutil::testing::allocFreeUdpPort())}};
+    rune::replication::PubAddBroker broker(peers, 7519);
+    AeronPubRegistry reg;
+    reg.attachResolution(env.hub.subscribeOwner());
+    reg.setAddBroker(&broker);
+    reg.attach(s.client, peers, 7519, pump);
+    // The control thread's duty (AeronPartitionTransport::poll → broker.doWork) + the owner's.
+    auto pass = [&] { (void)broker.doWork(*s.client); (void)pump.pump(); (void)reg.drivePeerResolve(); };
+    ASSERT_TRUE(driveUntil(pass, [&] { return reg.allResolved(); }));
+    const uint64_t base = reg.peerReAdds();
+    env.confirm(1);
+    for (int i = 0; i < 2000; ++i) pass();
+    EXPECT_EQ(reg.peerReAdds(), base) << "a confirmation of the same address must not re-add";
+    env.moveTo("127.0.0.2", 2);
+    ASSERT_TRUE(driveUntil(pass, [&] { return reg.peerReAdds() == base + 1 && reg.allResolved(); }))
+        << "the legacy plane's publication kept sending to the peer's OLD address";
+    EXPECT_NE(broker.lastAddChannelForTest().find("127.0.0.2"), std::string::npos)
+        << "re-added on " << broker.lastAddChannelForTest() << " — not the numeric new address";
+    EXPECT_EQ(broker.releasesForTest(), 1u) << "the stale publication must be released on the control thread";
+    env.moveTo("127.0.0.1", 3);
+    ASSERT_TRUE(driveUntil(pass, [&] { return reg.peerReAdds() == base + 2 && reg.allResolved(); }))
+        << "the re-added legacy-plane publication never came back into use";
+    EXPECT_EQ(broker.releasesForTest(), 2u);
+}
+
+// D24(c): a peer host with SEVERAL A records (round-robin DNS) comes back from
+// getaddrinfo in rotating order — the hub posted a "new" address on every ~1 s
+// re-check and every owner re-added its publication each time.  The current
+// address is kept while it is still among the records.
+TEST(UnresolvedPeerRegression, MultiARecordHostKeepsItsAddressRegression) {
+    auto ip = [](const char* s) { in_addr a{}; ::inet_pton(AF_INET, s, &a); return a.s_addr; };
+    const std::uint32_t a = ip("10.0.0.1"), b = ip("10.0.0.2"), c = ip("10.0.0.3");
+    const std::uint32_t order1[] = {a, b}, order2[] = {b, a}, gone[] = {c};
+    std::uint32_t cur = 0;
+    ASSERT_TRUE(PeerResolverHub::pickAddress(order1, 2, cur));
+    EXPECT_EQ(cur, a) << "no current address: the first record";
+    ASSERT_TRUE(PeerResolverHub::pickAddress(order2, 2, cur));
+    EXPECT_EQ(cur, a) << "rotated order: the current address is still a record — keep it";
+    ASSERT_TRUE(PeerResolverHub::pickAddress(gone, 1, cur));
+    EXPECT_EQ(cur, c) << "the current address is gone: move to the first record";
+    EXPECT_FALSE(PeerResolverHub::pickAddress(gone, 0, cur));
+
+    // The hub hands the resolver the current address on every re-check.
+    std::vector<std::uint32_t> seen;
+    PeerResolverHub hub({kLateHost}, [&](const std::string&, std::uint32_t& io) {
+        seen.push_back(io);
+        const std::uint32_t recs[] = {seen.size() % 2 ? a : b, seen.size() % 2 ? b : a};   // rotates
+        return PeerResolverHub::pickAddress(recs, 2, io);
+    });
+    hub.resolveAllNow();
+    for (int t = 1; t <= 4; ++t) { hub.makeAllDueForTest(); (void)hub.runOnceForTest(t); }
+    ASSERT_EQ(seen.size(), 5u);
+    EXPECT_EQ(seen[0], 0u);
+    for (std::size_t i = 1; i < seen.size(); ++i) EXPECT_EQ(seen[i], a) << "re-check " << i << " moved the address";
+}

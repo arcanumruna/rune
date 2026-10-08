@@ -261,6 +261,9 @@ public:
         return ackTerm(candidateTermId_, votedTermId_, leadershipTermId_);
     }
     [[nodiscard]] Term votedTermId() const noexcept { return votedTermId_; }
+    /// D24: the durable follow floor (see followFloorTermId_).
+    [[nodiscard]] Term followFloorTermId() const noexcept { return followFloorTermId_; }
+
 
     /// Re-review round 3 CRITICAL-R3 — knowledge exchange.  `src(ctx, out)`
     /// fills this node's newest durable metadata-ISR state (false = none /
@@ -457,15 +460,18 @@ private:
     Term logLeadershipTermId_ = 0;
     Term candidateTermId_     = 0;
     /// Highest term this node GRANTED a vote in (MAJOR-R3) — a denial or an
-    /// own (abandoned) candidacy never raises it.  Not persisted (round-4
-    /// LOW-R4-4): after a restart the ack term can be BELOW a term this node
-    /// granted in before the crash, so the knowledge store may PERSIST a
-    /// deposed leader's internal ISR state — knowledge only, exactly what
-    /// adopt() does.  It never ACKS one: the internal replica restarts as
-    /// Follower at epoch 0 with no leader, and the durable candidateTermId_
-    /// makes the election ignore the stale term's NewLeadershipTerm (a node
-    /// never re-follows a deposed leader).
+    /// own (abandoned) candidacy never raises it.  After a restart it starts at
+    /// the durable follow floor (D24; round-4 LOW-R4-4 closed): a grant before
+    /// the crash still refuses an older term's internal ISR states.
     Term votedTermId_         = 0;
+    /// D24: the durable FOLLOW FLOOR (NodeStateFile) — the highest term this
+    /// node granted a vote in, led, followed, or adopted from a leader's
+    /// NLT / CommitPosition.  It never follows a leader below it; it MAY follow
+    /// one below candidateTermId_ when only its own failed candidacies (or
+    /// denials) raised that — they helped no leader (DR-4 review MAJOR-1).
+    Term followFloorTermId_   = -1;
+    /// Raises the follow floor and the candidate term to `term`, durably (one sync).
+    void raiseFollowFloor_(Term term);
 
     // Election config — Election.java:80
     bool isNodeStartup_     = false;

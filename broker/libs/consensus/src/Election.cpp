@@ -67,6 +67,12 @@ Election::Election(bool             isNodeStartup,
     initialTimeOfLastUpdateNs_ = INT64_MIN / 2;
     timeOfLastUpdateNs_        = initialTimeOfLastUpdateNs_;
 
+    // D24 review MAJOR-1: the durable follow floor (and the ack term it
+    // restores) is in force from construction — never only from init(): a
+    // message handled before the first doWork must already see it.
+    followFloorTermId_ = std::max(followFloorTermId_, nodeStateFile_.followFloorTermId());
+    votedTermId_       = std::max(votedTermId_, followFloorTermId_);
+
     // Follower leader-liveness timeout (mirrors Aeron's leaderHeartbeatTimeoutNs).
     // A follower re-enters CANVASS if it hears no leader heartbeat within this
     // window.  The leader broadcasts NLT+CommitPosition every
@@ -289,14 +295,19 @@ int Election::init(int64_t nowNs)
 {
     // Election.java:681: candidateTermId = max(nodeStateFile.candidateTerm().candidateTermId(), leadershipTermId)
     Term persistedTerm = nodeStateFile_.candidateTermId();
-    candidateTermId_   = std::max(persistedTerm, leadershipTermId_);
+    // D24: the durable follow floor survives the restart; the ack term with it
+    // (a grant / lead / follow before the crash still refuses an older term).
+    followFloorTermId_ = std::max(followFloorTermId_, nodeStateFile_.followFloorTermId());
+    votedTermId_       = std::max(votedTermId_, followFloorTermId_);
+    // Review LOW-2: never stand at (or below) a term already granted / followed.
+    candidateTermId_   = std::max({persistedTerm, leadershipTermId_, followFloorTermId_});
 
     const int memberCount = static_cast<int>(clusterMembers_.size());
 
     if (memberCount == 1) {
         // Election.java:683-691: single-node shortcut — win immediately.
         candidateTermId_++;
-        nodeStateFile_.proposeMaxCandidateTermId(candidateTermId_, logPosition_, /*timestampMs=*/0);
+        raiseFollowFloor_(candidateTermId_);   // D24: leads it (durable first — review LOW-1)
 
         // Point leaderMember at the single (self) member.
         leaderMember_     = memberById(thisMemberId_);
@@ -419,6 +430,7 @@ int Election::candidateBallot(int64_t nowNs)
 
     // Election.java:758-763: unanimous check (no timeout needed)
     if (ClusterMember::isUnanimousLeader(clusterMembers_, candidateTermId_, gracefulClosedLeaderId_)) {
+        raiseFollowFloor_(candidateTermId_);   // D24: leads it (durable before any NLT; review LOW-1: first)
         leaderMember_     = memberById(thisMemberId_);
         leadershipTermId_ = candidateTermId_;
         // Election.java:762: state(LEADER_LOG_REPLICATION, nowNs, "unanimous leader")
@@ -431,6 +443,7 @@ int Election::candidateBallot(int64_t nowNs)
     if (nowNs >= (timeOfLastStateChangeNs_ + electionTimeoutNs_)) {
         if (ClusterMember::isQuorumLeader(clusterMembers_, candidateTermId_)) {
             // Election.java:769-771: quorum leader
+            raiseFollowFloor_(candidateTermId_);   // D24: leads it (durable before any NLT; review LOW-1: first)
             leaderMember_     = memberById(thisMemberId_);
             leadershipTermId_ = candidateTermId_;
             state(ElectionState::LeaderLogReplication, nowNs, "quorum leader after timeout");
@@ -793,8 +806,7 @@ void Election::onRequestVote(Term    logLeadershipTermId,
                state_ == ElectionState::FollowerBallot) {
         // Election.java:373-380: candidate is up-to-date and we can vote
         // Election.java:376-377: proposeMaxCandidateTermId
-        candidateTermId_ = nodeStateFile_.proposeMaxCandidateTermId(
-            candidateTermId, logPosition, /*timestampMs=*/0);
+        raiseFollowFloor_(candidateTermId);   // D24: a GRANT (candidate term + floor, one sync)
         votedTermId_ = std::max(votedTermId_, candidateTermId);   // MAJOR-R3: a GRANT
         placeVote(candidateTermId, candidateId, true);
         // Election.java:379: state(FOLLOWER_BALLOT, nowNs, "")
@@ -851,6 +863,10 @@ void Election::onNewLeadershipTerm(int64_t nowNs,
                                    bool    /*isStartup*/,
                                    int64_t commitPositionArg)
 {
+    // D24 review MAJOR-1: nothing is decided before init() (as onCanvassPosition /
+    // onRequestVote) — the leader's next heartbeat repeats it.
+    if (state_ == ElectionState::Init) return;
+
     // Election.java:430: if CLOSED ignore — EXCEPT a same-term NLT from the leader
     // we already follow is a LIVENESS HEARTBEAT, not an election message.  The
     // leader's periodic Closed-state broadcast is publishNewLeadershipTermToAll()
@@ -905,10 +921,10 @@ void Election::onNewLeadershipTerm(int64_t nowNs,
         // state was silently dropped.  Now we adopt the higher term and transition back
         // to CANVASS so the node participates in the new election rather than holding a
         // stale leadership.
-        if (leadershipTermIdArg > leadershipTermId_) {
-            // Adopt the new term durably (mirrors Aeron proposeMaxCandidateTermId).
-            candidateTermId_ = nodeStateFile_.proposeMaxCandidateTermId(
-                leadershipTermIdArg, logPosition_, /*timestampMs=*/0);
+        if (leadershipTermIdArg > leadershipTermId_ && memberById(leaderMemberIdArg) != nullptr) {   // review LOW-5
+            // Adopt the new term durably (mirrors Aeron proposeMaxCandidateTermId);
+            // D24: a leader announced it — the floor rises with it.
+            raiseFollowFloor_(leadershipTermIdArg);
             leadershipTermId_ = leadershipTermIdArg;
             // Step down: return to CANVASS to re-participate in the new election.
             state(ElectionState::Canvass, nowNs, "A1: higher-term NLT in LEADER state → step down");
@@ -945,14 +961,30 @@ void Election::onNewLeadershipTerm(int64_t nowNs,
     // If nextLeadershipTermId < candidateTermId_, the NLT is for a stale ballot
     // this node already advanced past — ignore.
     if (nextLeadershipTermId > candidateTermId_) {
-        // Adopt the higher term — node missed its ballot round.
-        candidateTermId_ = nodeStateFile_.proposeMaxCandidateTermId(
-            nextLeadershipTermId, logPosition_, /*timestampMs=*/0);
+        // Adopt the higher term — node missed its ballot round.  D24: a leader
+        // announced it — the follow floor rises with it.
+        raiseFollowFloor_(nextLeadershipTermId);
     } else if (nextLeadershipTermId < candidateTermId_) {
-        // Stale ballot — this node has already advanced past nextLeadershipTermId.
-        return;
+        // D24 (DR-4 review MAJOR-1 / MEDIUM-3): a candidate term above the
+        // leader's is a stale ballot only if this node GRANTED, LED, FOLLOWED or
+        // adopted from a leader a newer term (the durable follow floor) — a
+        // newer term's leader may exist, elected with this node's help, so the
+        // old one is a zombie.  A candidate term raised only by our own failed
+        // candidacies (or by denials) helped no leader: following the live
+        // leader of the older term is safe, and refusing it strands this node
+        // (the leader's stickiness denies our RequestVotes) until it dies.
+        // Review MAJOR-2: only while CANVASSING / NOMINATING — a candidate in
+        // its ballot may hold a winning quorum (a peer granted it: that peer's
+        // floor is already above this term); abandoning it would strand that peer.
+        const bool canvassing = state_ == ElectionState::Canvass || state_ == ElectionState::Nominate;
+        // (A member that GRANTED a newer term to a candidacy that then failed
+        // stays out until the leader changes — closing that needs PreVote,
+        // backlog D29; a step-down notice reopened partial-partition ping-pong.)
+        if (!canvassing || leadershipTermIdArg < followFloorTermId_) return;
     }
     // nextLeadershipTermId == candidateTermId_: this node participated; continue.
+    // (Review LOW-2, defence in depth: never below the floor, whatever the branch.)
+    if (leadershipTermIdArg < followFloorTermId_) return;
 
     // Election.java:456-458: locate the sending leader member
     ClusterMember* leaderM = memberById(leaderMemberIdArg);
@@ -970,6 +1002,7 @@ void Election::onNewLeadershipTerm(int64_t nowNs,
     }
 
     // Election.java:460-470: set leader member + leadership term
+    raiseFollowFloor_(leadershipTermIdArg);   // D24: follows it (durable before any ack; review LOW-1: first)
     leaderMember_     = leaderM;
     leadershipTermId_ = leadershipTermIdArg;
     logSessionId_     = logSessionIdArg;
@@ -1038,6 +1071,8 @@ void Election::onCommitPosition(int64_t nowNs,
                                 int64_t logPositionArg,
                                 NodeId  /*leaderMemberIdArg*/)
 {
+    if (state_ == ElectionState::Init) return;   // D24 review MAJOR-1 (see onNewLeadershipTerm)
+
     // A1 fix (audit 2026-09-11): a CommitPosition with a strictly-higher term while
     // this node is in a LEADER state signals a new election has concluded elsewhere.
     // Step down and re-enter CANVASS to participate, per Aeron Election.java:517-533
@@ -1056,8 +1091,7 @@ void Election::onCommitPosition(int64_t nowNs,
              state_ == ElectionState::LeaderInit           ||
              state_ == ElectionState::LeaderReady);
         if (inLeaderState) {
-            candidateTermId_ = nodeStateFile_.proposeMaxCandidateTermId(
-                leadershipTermIdArg, logPosition_, /*timestampMs=*/0);
+            raiseFollowFloor_(leadershipTermIdArg);   // D24: a leader announced it
             leadershipTermId_ = leadershipTermIdArg;
             state(ElectionState::Canvass, nowNs, "A1: higher-term CommitPosition in LEADER state → step down");
             return;
@@ -1212,6 +1246,14 @@ bool Election::hasActiveFollowerQuorum_(int64_t nowNs) const noexcept
                                           thisMemberId_);
 }
 
+void Election::raiseFollowFloor_(Term term)
+{
+    if (term <= followFloorTermId_ && term <= candidateTermId_) return;
+    candidateTermId_   = std::max(candidateTermId_,
+                                  nodeStateFile_.proposeMaxFollowFloorTermId(term, logPosition_, /*timestampMs=*/0));
+    followFloorTermId_ = std::max(followFloorTermId_, term);
+}
+
 // ClosedLeaderStepDownRegression: leave the CLOSED steady state for a fresh
 // election (Aeron enterElection()).  Adopts `term` durably when it is newer,
 // forgets the leader (leaderMemberId() → -1 while re-electing) and disarms the
@@ -1219,8 +1261,7 @@ bool Election::hasActiveFollowerQuorum_(int64_t nowNs) const noexcept
 void Election::leaveClosedForElection_(Term term, int64_t nowNs, const char* reason)
 {
     if (term > leadershipTermId_) {
-        candidateTermId_ = nodeStateFile_.proposeMaxCandidateTermId(
-            term, logPosition_, /*timestampMs=*/0);
+        raiseFollowFloor_(term);   // D24: a leader announced it (NLT / CommitPosition)
         leadershipTermId_ = term;
     }
     leaderMember_ = nullptr;
