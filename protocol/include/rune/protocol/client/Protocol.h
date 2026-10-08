@@ -63,6 +63,8 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     DefineTopicResponse  = 65,
     GetTopicSchema       = 66,
     TopicSchemaResponse  = 67,
+    AlterTopic           = 68,
+    AlterTopicResponse   = 69,
 };
 
 enum class ErrorCode : uint16_t {
@@ -111,6 +113,9 @@ enum class ErrorCode : uint16_t {
     // unknown).  Sent ONLY to clients whose ConnectRequest.clientVersion is
     // >= kClientVersionUnknownProducerId; older clients get OutOfOrderSequence.
     UnknownProducerId      = 28,
+    // schema-evolution error codes (AlterTopic, 0c)
+    SchemaIncompatible     = 29,  // proposed AlterTopic ops are incompatible with existing data/consumers
+    SchemaConflict         = 30,  // AlterTopic.expectedVersion stale — topic schema changed since the caller last read it
 };
 
 // ---------------------------------------------------------------------------

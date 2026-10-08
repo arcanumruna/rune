@@ -714,19 +714,35 @@ TEST(DispatchCheckFrame, UnknownTemplateFiftyFive) {
 }
 
 TEST(DispatchCheckFrame, KnownTemplateSixtyFour) {
-    // 64 = DefineTopic (0b schema range 64..67 — now assigned)
+    // 64 = DefineTopic (0b/0c schema range 64..69 — now assigned)
     auto buf = makeValidHeaderBuf(64);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status, rpc::FrameStatus::Ok);
     EXPECT_EQ(fc.templateId, 64u);
 }
 
-TEST(DispatchCheckFrame, UnknownTemplateSixtyEight) {
-    // 68 = first unassigned id in schema/view range after TopicSchemaResponse=67
+TEST(DispatchCheckFrame, KnownTemplateSixtyEight) {
+    // 68 = AlterTopic (0b schema range 64..69 — now assigned)
     auto buf = makeValidHeaderBuf(68);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
-    EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
+    EXPECT_EQ(fc.status, rpc::FrameStatus::Ok);
     EXPECT_EQ(fc.templateId, 68u);
+}
+
+TEST(DispatchCheckFrame, KnownTemplateSixtyNine) {
+    // 69 = AlterTopicResponse (0b schema range 64..69 — now assigned)
+    auto buf = makeValidHeaderBuf(69);
+    const auto fc = rpc::checkFrame(buf.data(), buf.size());
+    EXPECT_EQ(fc.status, rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, 69u);
+}
+
+TEST(DispatchCheckFrame, UnknownTemplateSeventy) {
+    // 70 = first unassigned id in schema/view range after AlterTopicResponse=69
+    auto buf = makeValidHeaderBuf(70);
+    const auto fc = rpc::checkFrame(buf.data(), buf.size());
+    EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
+    EXPECT_EQ(fc.templateId, 70u);
 }
 
 TEST(DispatchCheckFrame, UnknownTemplateNinetyNine) {
@@ -887,13 +903,13 @@ TEST(DispatchIsKnownTemplate, KnownBoundaries) {
     EXPECT_TRUE(rpc::isKnownTemplate(8));
     EXPECT_TRUE(rpc::isKnownTemplate(9));
 
-    // 0b schema registry range: 64..67 must all be known.
-    for (uint16_t tid = 64; tid <= 67; ++tid) {
+    // 0b/0c schema range: 64..69 must all be known.
+    for (uint16_t tid = 64; tid <= 69; ++tid) {
         EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
     }
 
     // Not known: 0, 10..15 (unassigned control gap), 22..31 (unassigned produce/consume gap),
-    //            55..63 (unassigned groups/txn gap after TX-1), 68+ (unassigned schema/view gap),
+    //            55..63 (unassigned groups/txn gap after TX-1), 70+ (unassigned schema/view gap),
     //            65535.
     EXPECT_FALSE(rpc::isKnownTemplate(0));
     EXPECT_FALSE(rpc::isKnownTemplate(10));
@@ -901,6 +917,6 @@ TEST(DispatchIsKnownTemplate, KnownBoundaries) {
     EXPECT_FALSE(rpc::isKnownTemplate(22));
     EXPECT_FALSE(rpc::isKnownTemplate(31));
     EXPECT_FALSE(rpc::isKnownTemplate(55));
-    EXPECT_FALSE(rpc::isKnownTemplate(68));
+    EXPECT_FALSE(rpc::isKnownTemplate(70));
     EXPECT_FALSE(rpc::isKnownTemplate(65535));
 }

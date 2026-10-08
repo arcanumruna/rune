@@ -239,3 +239,170 @@ TEST(SchemaConformance, TopicSchemaResponseFrameCheck) {
     ASSERT_TRUE(tid.has_value());
     EXPECT_EQ(*tid, static_cast<uint16_t>(rpc::TemplateId::TopicSchemaResponse));
 }
+
+// ===========================================================================
+// AlterTopic golden vector
+//
+// Fields:
+//   expectedVersion = 4
+//   topicName       = "schema_test"  (11 bytes)
+//   opsBlob         = {0x11, 0x22, 0x33, 0x44}  (4 bytes)
+//
+// Wire layout (47 bytes total):
+//   [0..1]   blockLength=2         : 02 00
+//   [2..3]   templateId=68         : 44 00
+//   [4..5]   schemaId=120          : 78 00
+//   [6..7]   version=3             : 03 00
+//   [8..15]  sessionId  (LE64)     : 88 77 66 55 44 33 22 11
+//   [16..23] correlationId (LE64)  : 11 10 0F 0E 0D 0C 0B 0A
+//   [24..25] expectedVersion=4(LE16): 04 00
+//   [26..27] topicName len=11(LE16): 0B 00
+//   [28..38] "schema_test"
+//   [39..42] opsLen=4 (LE32)       : 04 00 00 00
+//   [43..46] 11 22 33 44
+// ===========================================================================
+
+static constexpr uint8_t kAlterTopicGolden[] = {
+    // header
+    0x02, 0x00,              // blockLength = 2
+    0x44, 0x00,              // templateId  = 68
+    0x78, 0x00,              // schemaId    = 120
+    0x03, 0x00,              // version     = 3
+    0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // sessionId
+    0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,  // correlationId
+    // body fixed (2 bytes)
+    0x04, 0x00,              // expectedVersion = 4
+    // topicName varstr
+    0x0B, 0x00,              // len = 11
+    0x73, 0x63, 0x68, 0x65, 0x6D, 0x61, 0x5F, 0x74, 0x65, 0x73, 0x74,  // "schema_test"
+    // opsBlob varbytes32
+    0x04, 0x00, 0x00, 0x00,  // len = 4
+    0x11, 0x22, 0x33, 0x44,
+};
+static constexpr std::size_t kAlterTopicGoldenSize = sizeof(kAlterTopicGolden);  // 47
+
+TEST(SchemaConformance, AlterTopicDecodeGolden) {
+    ASSERT_EQ(kAlterTopicGoldenSize, 47u);
+
+    assertHeader(kAlterTopicGolden, kAlterTopicGoldenSize,
+                 rpc::AlterTopic::TEMPLATE_ID, rpc::AlterTopic::BODY_FIXED);
+
+    auto msgOpt = rpc::AlterTopic::decode(kAlterTopicGolden, kAlterTopicGoldenSize);
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,       kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,   kCorrelationId);
+    EXPECT_EQ(msgOpt->expectedVersion, 4u);
+    EXPECT_EQ(msgOpt->topicName,       "schema_test");
+    ASSERT_EQ(msgOpt->opsLen,          4u);
+    static constexpr uint8_t kOps[] = {0x11, 0x22, 0x33, 0x44};
+    EXPECT_EQ(std::memcmp(msgOpt->opsBlob, kOps, 4), 0);
+}
+
+TEST(SchemaConformance, AlterTopicEncodeGolden) {
+    static constexpr uint8_t kOps[] = {0x11, 0x22, 0x33, 0x44};
+
+    rpc::AlterTopic msg;
+    msg.sessionId       = kSessionId;
+    msg.correlationId   = kCorrelationId;
+    msg.topicName       = "schema_test";
+    msg.expectedVersion = 4;
+    msg.opsBlob         = kOps;
+    msg.opsLen          = 4;
+
+    ASSERT_EQ(msg.encodedSize(), kAlterTopicGoldenSize);
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, kAlterTopicGoldenSize);
+    EXPECT_EQ(std::memcmp(enc.data(), kAlterTopicGolden, n), 0)
+        << "Encoded AlterTopic bytes differ from golden";
+}
+
+// Also verify checkFrame/peekTemplateId accept the golden bytes.
+TEST(SchemaConformance, AlterTopicFrameCheck) {
+    const auto fc = rpc::checkFrame(kAlterTopicGolden, kAlterTopicGoldenSize);
+    EXPECT_EQ(fc.status, rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::AlterTopic));
+
+    const auto tid = rpc::peekTemplateId(kAlterTopicGolden, kAlterTopicGoldenSize);
+    ASSERT_TRUE(tid.has_value());
+    EXPECT_EQ(*tid, static_cast<uint16_t>(rpc::TemplateId::AlterTopic));
+}
+
+// ===========================================================================
+// AlterTopicResponse golden vector
+//
+// Fields:
+//   topicId    = 42
+//   newVersion = 5
+//   errorCode  = 0 (OK)
+//
+// Wire layout (32 bytes total):
+//   [0..1]   blockLength=8         : 08 00
+//   [2..3]   templateId=69         : 45 00
+//   [4..5]   schemaId=120          : 78 00
+//   [6..7]   version=3             : 03 00
+//   [8..15]  sessionId  (LE64)     : 88 77 66 55 44 33 22 11
+//   [16..23] correlationId (LE64)  : 11 10 0F 0E 0D 0C 0B 0A
+//   [24..27] topicId=42 (LE32)     : 2A 00 00 00
+//   [28..29] newVersion=5 (LE16)   : 05 00
+//   [30..31] errorCode=0 (LE16)    : 00 00
+// ===========================================================================
+
+static constexpr uint8_t kAlterTopicResponseGolden[] = {
+    // header
+    0x08, 0x00,              // blockLength = 8
+    0x45, 0x00,              // templateId  = 69
+    0x78, 0x00,              // schemaId    = 120
+    0x03, 0x00,              // version     = 3
+    0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // sessionId
+    0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,  // correlationId
+    // body fixed (8 bytes)
+    0x2A, 0x00, 0x00, 0x00,  // topicId = 42
+    0x05, 0x00,              // newVersion = 5
+    0x00, 0x00,              // errorCode = 0
+};
+static constexpr std::size_t kAlterTopicResponseGoldenSize = sizeof(kAlterTopicResponseGolden);  // 32
+
+TEST(SchemaConformance, AlterTopicResponseDecodeGolden) {
+    ASSERT_EQ(kAlterTopicResponseGoldenSize, 32u);
+
+    assertHeader(kAlterTopicResponseGolden, kAlterTopicResponseGoldenSize,
+                 rpc::AlterTopicResponse::TEMPLATE_ID, rpc::AlterTopicResponse::BODY_FIXED);
+
+    auto msgOpt = rpc::AlterTopicResponse::decode(kAlterTopicResponseGolden, kAlterTopicResponseGoldenSize);
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,     kSessionId);
+    EXPECT_EQ(msgOpt->correlationId, kCorrelationId);
+    EXPECT_EQ(msgOpt->topicId,       42);
+    EXPECT_EQ(msgOpt->newVersion,    5u);
+    EXPECT_EQ(msgOpt->errorCode,     0u);
+}
+
+TEST(SchemaConformance, AlterTopicResponseEncodeGolden) {
+    rpc::AlterTopicResponse msg;
+    msg.sessionId     = kSessionId;
+    msg.correlationId = kCorrelationId;
+    msg.topicId       = 42;
+    msg.newVersion    = 5;
+    msg.errorCode     = 0;
+
+    ASSERT_EQ(msg.encodedSize(), kAlterTopicResponseGoldenSize);
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, kAlterTopicResponseGoldenSize);
+    EXPECT_EQ(std::memcmp(enc.data(), kAlterTopicResponseGolden, n), 0)
+        << "Encoded AlterTopicResponse bytes differ from golden";
+}
+
+// Also verify checkFrame/peekTemplateId accept the golden bytes.
+TEST(SchemaConformance, AlterTopicResponseFrameCheck) {
+    const auto fc = rpc::checkFrame(kAlterTopicResponseGolden, kAlterTopicResponseGoldenSize);
+    EXPECT_EQ(fc.status, rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::AlterTopicResponse));
+
+    const auto tid = rpc::peekTemplateId(kAlterTopicResponseGolden, kAlterTopicResponseGoldenSize);
+    ASSERT_TRUE(tid.has_value());
+    EXPECT_EQ(*tid, static_cast<uint16_t>(rpc::TemplateId::AlterTopicResponse));
+}

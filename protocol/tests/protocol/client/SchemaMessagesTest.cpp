@@ -80,3 +80,49 @@ TEST(SchemaMessages, DecodeRejectsTruncated) {
     in.encode(buf.data());
     EXPECT_FALSE(DefineTopic::decode(buf.data(), buf.size() - 1).has_value());
 }
+
+TEST(SchemaMessages, AlterTopicRoundTrip) {
+    std::vector<uint8_t> blob = {0x11, 0x22, 0x33, 0x44};  // opaque ops blob
+    AlterTopic in;
+    in.sessionId = 7; in.correlationId = 99;
+    in.topicName = "characters";
+    in.expectedVersion = 4;
+    in.opsBlob = blob.data();
+    in.opsLen = static_cast<uint32_t>(blob.size());
+
+    std::vector<uint8_t> buf(in.encodedSize());
+    const std::size_t n = in.encode(buf.data());
+    ASSERT_EQ(n, in.encodedSize());
+    EXPECT_EQ(peekTemplateId(buf.data(), n),
+              static_cast<uint16_t>(TemplateId::AlterTopic));
+
+    auto out = AlterTopic::decode(buf.data(), n);
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->sessionId, 7);
+    EXPECT_EQ(out->correlationId, 99);
+    EXPECT_EQ(out->topicName, "characters");
+    EXPECT_EQ(out->expectedVersion, 4u);
+    ASSERT_EQ(out->opsLen, blob.size());
+    EXPECT_EQ(0, std::memcmp(out->opsBlob, blob.data(), blob.size()));
+}
+
+TEST(SchemaMessages, AlterTopicResponseRoundTrip) {
+    AlterTopicResponse in;
+    in.sessionId = 7; in.correlationId = 99;
+    in.topicId = 0x40000000; in.newVersion = 5;
+    in.errorCode = static_cast<uint16_t>(ErrorCode::OK);
+    std::vector<uint8_t> buf(in.encodedSize());
+    const std::size_t n = in.encode(buf.data());
+    auto out = AlterTopicResponse::decode(buf.data(), n);
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->topicId, 0x40000000);
+    EXPECT_EQ(out->newVersion, 5);
+    EXPECT_EQ(out->errorCode, 0);
+}
+
+TEST(SchemaMessages, AlterTopicDecodeRejectsTruncated) {
+    AlterTopic in; in.topicName = "x"; in.expectedVersion = 1;
+    std::vector<uint8_t> buf(in.encodedSize());
+    in.encode(buf.data());
+    EXPECT_FALSE(AlterTopic::decode(buf.data(), buf.size() - 1).has_value());
+}
