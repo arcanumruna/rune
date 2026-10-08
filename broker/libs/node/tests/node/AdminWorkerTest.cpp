@@ -303,7 +303,7 @@ TEST(AdminWorkerRegression, AlterDropUnderForwardRejected) {
 
     // ALTER #2: DROP a live field under the now-persisted FORWARD mode → reject.
     h.runAlter(12,13,"characters",0, opsBlob({dropOp("name")}));
-    EXPECT_EQ(h.lastAlterErr, 29);                       // SchemaIncompatible
+    EXPECT_EQ(h.lastAlterErr, 30);                       // SchemaIncompatible
     EXPECT_EQ(h.reg.byName("characters")->version, 2);   // version unchanged
 }
 
@@ -322,7 +322,7 @@ TEST(AdminWorkerRegression, AlterWithStaleExpectedVersionConflicts) {
     // Now a client that still thinks the topic is v1 tries to ALTER with
     // expectedVersion=1 → stale → SchemaConflict, registry stays v2.
     h.runAlter(12,13,"characters",/*expected=*/1, opsBlob({addOp("extra",PrimType::Int64)}));
-    EXPECT_EQ(h.lastAlterErr, 30);                       // SchemaConflict
+    EXPECT_EQ(h.lastAlterErr, 31);                       // SchemaConflict
     EXPECT_EQ(h.lastAlterVersion, 2);                    // response carries current version
     EXPECT_EQ(h.reg.byName("characters")->version, 2);   // no lost update
 }

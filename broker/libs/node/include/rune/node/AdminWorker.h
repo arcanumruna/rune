@@ -20,8 +20,8 @@ namespace rune::node {
 //   InvalidSchema         = 23
 //   SchemaValidationFailed= 24  (not used in this task)
 //   TopicExists           = 25
-//   SchemaIncompatible    = 29  (ALTER: ops rejected by the compatibility gate)
-//   SchemaConflict        = 30  (ALTER: stale expectedVersion — optimistic CAS)
+//   SchemaIncompatible    = 30  (ALTER: ops rejected by the compatibility gate)
+//   SchemaConflict        = 31  (ALTER: stale expectedVersion — optimistic CAS)
 
 // ---------------------------------------------------------------------------
 // AdminDeps — effects the AdminWorker needs, all resolved on the admin thread.

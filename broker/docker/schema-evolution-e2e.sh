@@ -271,12 +271,12 @@ fi
 # Tighten beyond "any nonzero exit": the CLI's cmdSchemaAlter returns the
 # broker's wire errorCode as its process exit code (rune::cli reportAlterResult
 # -> `return static_cast<int>(r.errorCode)`), and
-# rune::protocol::client::ErrorCode::SchemaIncompatible == 29 (Protocol.h) —
-# distinct from SchemaConflict (30, phase 7) or any other failure mode (e.g. a
+# rune::protocol::client::ErrorCode::SchemaIncompatible == 30 (Protocol.h) —
+# distinct from SchemaConflict (31, phase 7) or any other failure mode (e.g. a
 # CLI usage error, a connect/timeout failure, or a different broker rejection).
 # Require BOTH the exact code AND the message token so this phase cannot be
 # satisfied by some other, unrelated rejection.
-RUNE_SCHEMA_INCOMPATIBLE_CODE=29
+RUNE_SCHEMA_INCOMPATIBLE_CODE=30
 if [ "${reject_rc}" -ne "${RUNE_SCHEMA_INCOMPATIBLE_CODE}" ]; then
     echo "[in] FAIL: drop-under-forward was rejected, but with exit=${reject_rc}" \
          "(want ${RUNE_SCHEMA_INCOMPATIBLE_CODE} = SchemaIncompatible)" >&2

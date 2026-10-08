@@ -14,8 +14,8 @@ static constexpr uint16_t kInternal       =  6;
 static constexpr uint16_t kUnknownTopic   =  7;
 static constexpr uint16_t kInvalidSchema  = 23;
 static constexpr uint16_t kTopicExists    = 25;
-static constexpr uint16_t kSchemaIncompatible = 29;  // ALTER compat gate reject
-static constexpr uint16_t kSchemaConflict     = 30;  // ALTER stale expectedVersion (CAS)
+static constexpr uint16_t kSchemaIncompatible = 30;  // ALTER compat gate reject
+static constexpr uint16_t kSchemaConflict     = 31;  // ALTER stale expectedVersion (CAS)
 
 AdminWorker::AdminWorker(SchemaRegistry& reg,
                          rune::replication::PartitionReplica* replica,
