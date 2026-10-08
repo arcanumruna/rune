@@ -31,6 +31,30 @@ inline bool isLiveAt(const FieldDescriptor& f, uint16_t v) noexcept {
     return v >= f.sinceVersion && v < f.untilVersion;
 }
 
+// Lay out `fields` in place: fixed-width fields get a byte offset into the
+// fixed block (in field order), var-len fields get a var-data index (in
+// field order); returns the resulting blockLength (sum of fixed widths).
+// Shared by DescriptorBuilder::build() and materializeAsOf() so both compute
+// offsets identically for whatever live set of fields they're given.
+inline uint32_t computeOffsets(std::vector<FieldDescriptor>& fields) noexcept {
+    uint32_t offset = 0;
+    for (auto& f : fields) {
+        if (!isVarLen(f.type)) {   // FixedStr is not var-len → laid in the block
+            f.offset = offset;
+            offset  += fieldWidth(f);
+        }
+    }
+    uint32_t blockLength = offset;
+
+    uint32_t varIndex = 0;
+    for (auto& f : fields) {
+        if (isVarLen(f.type)) {
+            f.offset = varIndex++;
+        }
+    }
+    return blockLength;
+}
+
 struct Descriptor {
     std::string  name;
     uint16_t     version     = 1;
@@ -103,23 +127,7 @@ public:
         d.version = version_;
         d.fields  = fields_;
 
-        // First pass: assign fixed offsets and compute blockLength
-        uint32_t offset = 0;
-        for (auto& f : d.fields) {
-            if (!isVarLen(f.type)) {   // FixedStr is not var-len → laid in the block
-                f.offset = offset;
-                offset  += fieldWidth(f);   // was fixedSize(f.type)
-            }
-        }
-        d.blockLength = offset;
-
-        // Second pass: assign var-index offsets to var-len fields
-        uint32_t varIndex = 0;
-        for (auto& f : d.fields) {
-            if (isVarLen(f.type)) {
-                f.offset = varIndex++;
-            }
-        }
+        d.blockLength = computeOffsets(d.fields);
 
         // Enforce the additive-only invariant: iterating var fields in
         // var-index order must yield non-decreasing sinceVersion. This is the
