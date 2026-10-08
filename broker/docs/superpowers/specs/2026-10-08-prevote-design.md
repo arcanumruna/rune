@@ -152,3 +152,40 @@ status-interval. It adds no durable writes.
   Trade-off: a node refusing a live leader by floor no longer holds that leader's lease. Liveness wins over the
   theoretical ratchet; the notice deposes that leader anyway.
 - **M4.** No latency in the sim harness — moved to the backlog.
+
+## D29b follow-ups (2026-10-08)
+
+- **Leader-state CheckQuorum** (r1 LOW-6 / r2 MEDIUM-3). In LeaderLogReplication / LeaderReady, after
+  `leaderHeartbeatTimeoutNs_` without an active follower quorum, the would-be leader broadcasts StandDown and
+  canvasses (`Election::leaderStatesTimedOut_` / `standDownFromLeaderStates_`). Aeron has no such timeout: its
+  CheckQuorum runs in the agent only outside elections. That gap was harmless in Aeron, but here a leader-elect that
+  lost its inbound links kept stamping the D29 lease on its peers.
+  - Test: `D29bRegression_LeaderElectWithDeadInboundStandsDownAndTheRestElect`, 5 nodes, 8 seeds. It is RED without
+    the timeout.
+- **Sim latency, reordering and stalls** (r2 M4).
+  - `SimNet` has a seeded per-message delay (`maxDelayMs`) and per-node stalls (`stallUntilNs`). `SIM_JITTER=<ms>`
+    re-runs every sim with jitter.
+  - All PreVote and D29b sims pass at 0, 2, 5 and 10 ms.
+- **Split-vote mitigation, found and measured with the jittered sim.** A NOMINATE node that grants a peer's pre-vote
+  abandons its own unwon pre-ballot and re-arms its nomination one random back-off later.
+  - This is non-binding, so only our own candidacy is delayed.
+  - Measured on a 5-node controlled hand-off over 200 seeds (rounds lost to a split ballot):
+
+    | Jitter | PreVote off | PreVote (D29) | + mitigation | Worst case, before → after |
+    |---|---|---|---|---|
+    | 0 ms | 13 | 13 | 1 | 356 → 151 ms |
+    | 5 ms | 60 | 36 | 12 | 751 → 257 ms |
+    | 10 ms | 82 | 48 | 38 | 888 → 324 ms |
+
+  - Killed-leader worst case: 1095 → 594 ms (0 ms jitter) and 2118 → 878 ms (10 ms jitter).
+- **r1 LOWs.**
+  - LOW-1: the self pre-vote follows the current gate.
+  - LOW-2: a won pre-ballot is due at once in `nextDeadlineNs`.
+  - LOW-3: the pre-ballot restarts when a deny-with-raise lifts `candidateTermId_`.
+  - Each has a RED-first test.
+- **r2 LOW-6.** The inversion regression also runs with production-style restarts (`boot(i, 0)`).
+- **Ruled, not changed.**
+  - r2 LOW-1 (the notice StandDown is sent once): a lost StandDown costs at most one lease (H). The leader-state
+    CheckQuorum bounds the leader side.
+  - r2 LOW-2 (the lease deny in leader states skips Aeron's deny-with-raise): a leader state either reaches CLOSED or
+    times out within H. The raise then happens on the next real vote.

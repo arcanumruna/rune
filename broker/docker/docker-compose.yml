@@ -18,12 +18,16 @@ x-broker-build: &broker-build
   dockerfile: docker/Dockerfile
   additional_contexts:
     # relative to this compose file's dir (docker/), so ../../rune-protocol = the sibling repo
-    rune-protocol: ../../rune-protocol
+    # RUNE_PROTOCOL_DIR overrides it (e.g. a rune-protocol worktree on main when the
+    # sibling checkout sits on a feature branch).
+    rune-protocol: ${RUNE_PROTOCOL_DIR:-../../rune-protocol}
     # rune-fr flight recorder: compiled sibling lib wired by the root CMakeLists
     # (add_library(rune_fr ...) from ${SRC}/../rune-fr).  Needs src/ AND include/.
     rune-fr: ../../rune-fr
     # rune-codec (0a): compiled sibling codec lib; Dockerfile COPYs --from=rune-codec.
     rune-codec: ../../rune-codec
+    # rune-crypto (client<->broker TLS/AEAD): the Dockerfile COPYs --from=rune-crypto.
+    rune-crypto: ../../rune-crypto
 
 x-broker-env: &broker-env
   # GR-9: peer spec includes the replicationPort (4th segment) so the data-plane
@@ -47,7 +51,7 @@ x-broker-env: &broker-env
   # Optional log level (honoured by src/main.cpp via RUNE_LOG_LEVEL); "info"
   # keeps the E2E output readable.  Set "debug" to surface gateway
   # redirect/accept/subscribe decisions when diagnosing.
-  RUNE_LOG_LEVEL: "info"
+  RUNE_LOG_LEVEL: "${RUNE_LOG_LEVEL:-info}"
   # Diagnostic per-tick FollowerSync/ISR + transport-rate logging (RUNE_FS_LOG) is
   # opt-in: unset / "" / "0" = OFF, and "0" is now also the DEFAULT (fd9a8bb).
   # This explicit off pins e2e to off regardless of future default changes, so it
@@ -155,7 +159,7 @@ services:
       dockerfile: docker/Dockerfile.probe
       additional_contexts:
         # relative to this compose file's dir (docker/), so ../../rune-protocol = the sibling repo
-        rune-protocol: ../../rune-protocol
+        rune-protocol: ${RUNE_PROTOCOL_DIR:-../../rune-protocol}
     platform: linux/amd64
     hostname: probe
     shm_size: "256m"

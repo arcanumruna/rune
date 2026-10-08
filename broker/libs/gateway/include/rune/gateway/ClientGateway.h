@@ -973,6 +973,13 @@ public:
     // Single-writer: call only on the duty-cycle thread or before doWork().
     // -----------------------------------------------------------------------
     void applyDisconnectForTest(const uint8_t* buf, std::size_t len) { handleDisconnect(buf, len); }
+    void applyGroupForTest(const uint8_t* buf, std::size_t len, uint16_t tid, int64_t nowNs = 0) {
+        handleGroupMessage(buf, len, nowNs, tid);
+    }
+    void applyTxnForTest(const uint8_t* buf, std::size_t len, uint16_t tid, int64_t nowNs = 0) {
+        handleTxnMessage(buf, len, nowNs, tid);
+    }
+    [[nodiscard]] uint64_t coordinatorRedirectsForTest() const noexcept { return coordinatorRedirects_; }
     void applyMetadataForTest(const uint8_t* buf, std::size_t len) {
         handleMetadata(buf, len);
     }
@@ -1333,6 +1340,9 @@ private:
     // TX-3: Transaction coordination handler — routes templateIds 45,47,49,51,53
     // to TransactionCoordinationService.
     void handleTxnMessage   (const uint8_t* buf, std::size_t len, int64_t nowNs, uint16_t tid);
+    // D4: a follower redirects a group / txn coordinator request to the leader.
+    bool redirectToCoordinator_(Session& session, int64_t correlationId);
+    uint64_t coordinatorRedirects_ = 0;
     // Task 8a: schema DDL handlers — route DefineTopic (64) / GetTopicSchema (66)
     // to the admin sink (ring hand-off).  Validate frame + require known session,
     // decode, copy fields into the sink, RETURN immediately (no hot-path blocking).

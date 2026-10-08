@@ -244,3 +244,48 @@ def test_cg_rebalance_member_leave(fresh_cluster, members):
     assert_group_no_committed_loss(gr_combined)
     assert_group_bounded_duplicates(gr2)
     assert_single_leader(cluster)
+
+
+@pytest.mark.fault
+@pytest.mark.timeout(600)
+def test_cg_members_on_a_follower_find_the_coordinator(fresh_cluster):
+    """D4 (backlog) "group subscribe redirect": members bootstrapped against a
+    FOLLOWER (not the group coordinator / cluster leader).  The follower answers
+    their coordinator requests ErrorResponse{NotCoordinator, leader endpoint};
+    the client moves its seed session to the coordinator, re-joins there and
+    follows each partition's leader (Subscribe Redirect), then consumes
+    everything exactly as on the leader.  The producer also targets the follower
+    (produce redirect).  Before the fix: 0 of 80 consumed.  (The join latency
+    bound lives in the client's in-process GroupRoutingRegression.
+    MemberOnAFollowerJoinsTheCoordinatorRegression.)"""
+    cluster = fresh_cluster
+    assert_single_leader(cluster)
+    follower_svc = cluster.follower_service()
+    _, leader_svc = cluster.identify_leader()
+    assert follower_svc != leader_svc
+
+    gr = run_group(
+        2,
+        network=cluster.compose.network_name(),
+        target_service=follower_svc,
+        group_id="cg-on-follower",
+        topics=_TOPIC,
+        records=_RECORDS,
+        keys=8,
+        partitions=4,
+        cid_base=_next_cid_base(),
+        subscribe_ms=_SUBSCRIBE_MS,
+        autocommit_ms=1000,
+        timeout_ms=_TIMEOUT_MS,
+        timeout_s=300,
+        produce_after_members_ms=8000,
+    )
+    assert gr.produce_results.ok, (
+        "producer via follower failed:\n" + "\n".join(
+            f"[cid={c.cid} rc={c.rc}]\n{c.raw[-800:]}"
+            for c in gr.produce_results.clients if c.rc != 0 or c.exit_code != 0))
+    assert len(gr.all_produced) == _RECORDS
+    assert_group_single_owner(gr)
+    assert_group_no_committed_loss(gr)
+    assert_group_bounded_duplicates(gr)
+    assert_single_leader(cluster)

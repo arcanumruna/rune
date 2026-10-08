@@ -277,6 +277,7 @@ public:
     [[nodiscard]] uint64_t preVotesGrantedForTest() const noexcept { return preVotesGranted_; }
     [[nodiscard]] uint64_t preVotesDeniedForTest() const noexcept { return preVotesDenied_; }
     [[nodiscard]] uint64_t termFloorStepDownsForTest() const noexcept { return termFloorStepDowns_; }
+    [[nodiscard]] uint64_t leaderStateStandDownsForTest() const noexcept { return leaderStateStandDowns_; }
     [[nodiscard]] uint64_t preBallotTermCatchUpsForTest() const noexcept { return preBallotTermCatchUps_; }
 
 
@@ -504,6 +505,11 @@ private:
     uint64_t  preBallotsStarted_ = 0, preBallotsLost_ = 0, preVotesGranted_ = 0, preVotesDenied_ = 0;
     uint64_t  termFloorStepDowns_ = 0, preBallotTermCatchUps_ = 0;
     [[nodiscard]] uint32_t selfBit_() const noexcept;
+    // D29b: leader-state CheckQuorum (see Election.cpp).
+    [[nodiscard]] bool leaderStatesTimedOut_(int64_t nowNs) const noexcept;
+    void standDownFromLeaderStates_(int64_t nowNs);
+    uint64_t leaderStateStandDowns_ = 0;
+    Term     deferredForTerm_ = -1;   // D29b LOW-1: the peer term our candidacy last deferred to
     void noteLeaderHeard_(NodeId leaderId, Term term, int64_t nowNs) noexcept;
     [[nodiscard]] bool leaderLeaseLive_(int64_t nowNs, NodeId candidateId) const noexcept;
     void startPreBallot_(int64_t nowNs);

@@ -5372,6 +5372,7 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
                       tid, hdrOpt->sessionId);
         return;
     }
+    if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
 
     // Dispatch to the service.  The service encodes the response into scratch_.
     // Capacity is passed so handlers bound-check BEFORE writing each element;
@@ -5414,6 +5415,44 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
 }
 
 // ---------------------------------------------------------------------------
+// D4 (backlog "group subscribe redirect"): the group / transaction coordinator
+// is the consensus leader (GroupCoordinationService / TransactionCoordination-
+// Service coordinatorFor: v1 seam).  A follower used to answer every group /
+// txn request NotCoordinator — but Rune has no FindCoordinator, and the client
+// re-sends coordinator requests on its seed session, so a member bootstrapped
+// against a follower re-joined that follower forever (dockerized repro:
+// test_cg_members_on_a_follower_find_the_coordinator consumed 0 of 80).  Like
+// a data op on a follower, the answer names the coordinator:
+// ErrorResponse{NotCoordinator, leader endpoint}.  NotCoordinator (not Redirect)
+// so the client tells it from a data-op redirect — while a group is active the
+// client never moves its seed on a data-op Redirect, but a coordinator answer
+// moves the seed (the coordinator's session by design) and the member re-joins
+// there (rune-client-cpp Client::onCoordinatorRedirect_).  Unknown leader
+// endpoint (election in progress): fall through — the service answers the typed
+// NotCoordinator (retriable).
+// ---------------------------------------------------------------------------
+bool ClientGateway::redirectToCoordinator_(Session& session, int64_t correlationId)
+{
+    if (!leaderView_) return false;
+    const LeaderView lv = leaderView_();
+    if (lv.isLeader || lv.leaderClientEndpoint.empty()) return false;
+    pc::ErrorResponse errResp;
+    errResp.sessionId     = session.sessionId;
+    errResp.correlationId = correlationId;
+    errResp.code          = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+    errResp.message       = lv.leaderClientEndpoint;
+    const std::size_t needed = pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 +
+                               errResp.message.size();
+    if (needed > scratch_.size()) return false;
+    const std::size_t encoded = errResp.encode(scratch_.data());
+    ++coordinatorRedirects_;
+    spdlog::debug("ClientGateway: coordinator request on a follower sessionId={} corr={} → NotCoordinator {}",
+                  session.sessionId, correlationId, lv.leaderClientEndpoint);
+    sendTo(session, scratch_.data(), encoded);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // handleTxnMessage (TX-3) — route transaction frames to the
 // TransactionCoordinationService.
 //
@@ -5442,6 +5481,7 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
                       tid, hdrOpt->sessionId);
         return;
     }
+    if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
 
     std::size_t encoded = 0;
     const std::size_t cap = scratch_.size();

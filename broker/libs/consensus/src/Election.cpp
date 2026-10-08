@@ -171,7 +171,8 @@ int64_t Election::nextDeadlineNs() const noexcept {
 
         case ElectionState::Nominate:
             // Wait for nominationDeadlineNs, or interval publish.
-            return std::min(preBallot_.active ? preBallot_.deadlineNs : nominationDeadlineNs_,
+            // r1 LOW-2: a won pre-ballot is due at once (nominationDeadlineNs_ passed).
+            return std::min(preBallot_.active && !preBallotWon_() ? preBallot_.deadlineNs : nominationDeadlineNs_,
                             timeOfLastUpdateNs_ + electionStatusIntervalNs_);
 
         case ElectionState::CandidateBallot:
@@ -402,10 +403,15 @@ int Election::nominate(int64_t nowNs)
         // leader never bumps a real term (no term inflation, and a bridge member
         // never grants it a binding vote that would raise its follow floor).
         if (clusterMembers_.size() > 1) {
-            if (!preBallot_.active) {
+            // r1 LOW-3: a deny-with-raise lifted candidateTermId_ past the running
+            // pre-ballot's term — ask again at the new term + 1.
+            if (!preBallot_.active || preBallot_.term <= candidateTermId_) {
                 startPreBallot_(nowNs);
                 return 1;
             }
+            // r1 LOW-1: the self pre-vote follows the CURRENT gate, like the real
+            // self-vote (gateSelfVote_) — our knowledge may have changed since.
+            if (!mayVoteFor(thisMemberId_)) preBallot_.grantedMask &= ~selfBit_();
             if (preBallot_.denied || !preBallotWon_()) {
                 if (nowNs >= preBallot_.deadlineNs || preBallot_.denied) {
                     preBallot_ = PreBallot{};
@@ -527,6 +533,12 @@ int Election::leaderLogReplication(int64_t nowNs)
 {
     int workCount = 0;
 
+    // D29b (review LOW-6 / r2 MEDIUM-3): leader-state CheckQuorum.
+    if (leaderStatesTimedOut_(nowNs)) {
+        standDownFromLeaderStates_(nowNs);
+        return 1;
+    }
+
     // Election.java:812-817: publish NLT + CommitPosition on interval
     if (hasUpdateIntervalExpired(nowNs, electionStatusIntervalNs_)) {
         timeOfLastUpdateNs_ = nowNs;
@@ -605,6 +617,12 @@ int Election::leaderInit(int64_t nowNs)
 int Election::leaderReady(int64_t nowNs)
 {
     int workCount = 0;
+
+    // D29b (review LOW-6 / r2 MEDIUM-3): leader-state CheckQuorum.
+    if (leaderStatesTimedOut_(nowNs)) {
+        standDownFromLeaderStates_(nowNs);
+        return 1;
+    }
 
     // Election.java:880-887: publish NLT on interval
     if (hasUpdateIntervalExpired(nowNs, electionStatusIntervalNs_)) {
@@ -1295,6 +1313,39 @@ bool Election::hasActiveFollowerQuorum_(int64_t nowNs) const noexcept
                                           thisMemberId_);
 }
 
+// D29b — leader-state CheckQuorum (documented Raft tightening, like the PreVote
+// lease it protects).  Aeron's leader states have no quorum timeout: its
+// CheckQuorum runs in the agent's slow tick only while no election is in
+// progress.  That is harmless in Aeron, but here every NewLeadershipTerm a
+// would-be leader broadcasts stamps the D29 lease on its peers — one that won
+// a ballot and then lost its INBOUND links (no AppendPosition ever arrives)
+// would keep the others denying each other's pre-votes for as long as the link
+// stays one-way.  So: in LeaderLogReplication / LeaderReady, after a heartbeat
+// timeout without an active follower quorum, stand down (StandDown drops the
+// peers' lease at once) and canvass.  Time-independent: a leader-elect that
+// hears its followers never trips it, however slow the election.
+// CONTRACT (review MEDIUM-3): every follower election state must publish
+// AppendPosition to the leader at least every status interval — as Aeron's
+// updateFollowerLogReplication does — or this trips on a live quorum.  Today
+// the follower states are pass-throughs (PHASE-2-ARCHIVE-DEFERRED) and a
+// follower reaches CLOSED, where FollowerLiveness sends it, within one pass;
+// wiring real archive catch-up must keep that cadence.
+bool Election::leaderStatesTimedOut_(int64_t nowNs) const noexcept
+{
+    return clusterMembers_.size() > 1 &&
+           nowNs - leaderSinceNs_ >= leaderHeartbeatTimeoutNs_ &&
+           !hasActiveFollowerQuorum_(nowNs);
+}
+
+void Election::standDownFromLeaderStates_(int64_t nowNs)
+{
+    ++leaderStateStandDowns_;
+    for (const ClusterMember& m : clusterMembers_)
+        if (m.id != thisMemberId_) publisher_.standDown(m.id, leadershipTermId_, thisMemberId_);
+    leaderMember_ = nullptr;
+    state(ElectionState::Canvass, nowNs, "leader state without an active follower quorum → stand down");
+}
+
 // ---------------------------------------------------------------------------
 // D29 PreVote (Raft thesis §9.6) + TermFloorNotice.
 // ---------------------------------------------------------------------------
@@ -1373,6 +1424,24 @@ void Election::onPreVoteRequest(int64_t nowNs, Term term, Term logLeadershipTerm
                                                  logLeadershipTermId, logPosition) <= 0 &&
                        mayVoteFor(candidateId) && !leaderLeaseLive_(nowNs, candidateId);
     if (grant) ++preVotesGranted_; else ++preVotesDenied_;
+    // D29b (review M4, measured): a NOMINATE node that grants a peer's pre-vote
+    // abandons its own unwon pre-ballot and re-arms its nomination one fresh
+    // random back-off later.  Non-binding (no term, no floor), so only our own
+    // candidacy is delayed; it stops simultaneous pre-ballot winners from all
+    // standing at the same term and splitting the real ballot (5-node hand-off,
+    // 200 seeds: lost rounds 13→1 at 0 ms jitter, 36→12 at 5 ms, worst 751→257 ms).
+    // Review LOW-1: once per peer term — a re-asked pre-vote (status interval)
+    // does not push our candidacy out again.
+    if (grant && state_ == ElectionState::Nominate && term != deferredForTerm_) {
+        deferredForTerm_ = term;
+        if (preBallot_.active && !preBallotWon_()) preBallot_ = PreBallot{};
+        if (!preBallot_.active) {
+            std::uniform_real_distribution<double> dist(0.0, 1.0);
+            nominationDeadlineNs_ = std::max(nominationDeadlineNs_,
+                nowNs + (electionTimeoutNs_ >> 1) +
+                static_cast<int64_t>(dist(rng_) * static_cast<double>(electionTimeoutNs_ >> 1)));
+        }
+    }
     publisher_.preVoteResponse(candidateId, term, thisMemberId_, grant,
                                std::max(candidateTermId_, followFloorTermId_));
 }

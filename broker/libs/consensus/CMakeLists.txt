@@ -36,6 +36,13 @@ if(BUILD_TESTING)
     include(GoogleTest)
     gtest_discover_tests(rune_consensus_tests
         PROPERTIES ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+    # D29b review MEDIUM-1: the PreVote / D29b sims again with seeded delivery
+    # jitter (late + reordered responses), so a jitter-only regression is RED in ctest.
+    foreach(jit 5 10)
+        add_test(NAME ConsensusSimsUnderJitter${jit}Regression
+                 COMMAND rune_consensus_tests --gtest_filter=*PreVoteRegression*:*D29bRegression*)
+        set_tests_properties(ConsensusSimsUnderJitter${jit}Regression PROPERTIES ENVIRONMENT "SIM_JITTER=${jit}")
+    endforeach()
 endif()
 
 option(BUILD_INTEGRATION_TESTING "Build integration tests" ON)

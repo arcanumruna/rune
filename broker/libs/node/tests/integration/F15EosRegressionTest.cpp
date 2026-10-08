@@ -5823,3 +5823,152 @@ TEST(TxnRcRegression, UnmappableSealedSegmentStallsTheBuildRegression) {
     EXPECT_EQ(R.log->lazySealedMappedForTest(), 0u) << "the finished build kept the sealed maps it brought back";
     EXPECT_FALSE(sealed->hasReadMapForTest());
 }
+
+// ============================================================================
+// D4 (backlog): "pipelined transactional batches -> OutOfOrderSequence" and
+// "coordinator segfault on EndTxn" were reported by the client C10 session and
+// never reproduced (E3 report).  These pin the broker side: a pipeline of
+// transactional batches to one partition (sent before any ack) is validated in
+// send order on both ingress paths, and every EndTxn edge answers without
+// crashing, double-dispatching markers or leaving the producer wedged.
+// ============================================================================
+namespace {
+// A transactional produce with acks=leader through the REAL gateway path (the
+// worker runs only when the caller drives it: everything queued is pipelined).
+void gwProduceTxnAcks1(TxnRig& T) {
+    const auto f = produceFrame(T.sid, ++T.corr, txnBatch(T.pid, T.epoch, T.seq), /*acks=*/1, 0, 0,
+                                T.pid, T.epoch, T.seq);
+    ++T.seq;
+    T.m.gw.applyProduceForTest(f.data(), f.size());
+}
+int nonZero(const std::vector<int16_t>& v) {
+    int n = 0;
+    for (auto e : v) n += e != 0 ? 1 : 0;
+    return n;
+}
+} // namespace
+
+TEST(D4TxnRegression, PipelinedTxnBatchesThroughTheGatewayAreNeverOutOfOrderRegression) {
+    TxnRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    constexpr int kTxns = 12, kBatches = 32;
+    int64_t now = 10;
+    for (int t = 0; t < kTxns; ++t) {
+        ASSERT_EQ(T.addPartition(), 0) << "txn " << t;
+        const std::size_t before = T.m.cap.produceErrors.size();
+        for (int b = 0; b < kBatches; ++b) gwProduceTxnAcks1(T);          // the whole pipeline in flight
+        for (int i = 0; i < 64 && T.m.cap.produceErrors.size() < before + kBatches; ++i) T.m.runWorker(now++);
+        ASSERT_EQ(T.m.cap.produceErrors.size(), before + kBatches) << "every pipelined batch answered, txn " << t;
+        ASSERT_EQ(nonZero(T.m.cap.produceErrors), 0) << "no OutOfOrderSequence / error in txn " << t;
+        const bool commit = (t % 3) != 2;
+        ASSERT_EQ(T.endTxn(commit), 999) << "markers dispatched, response deferred";
+        T.runUntilNoMarkerAwaited(now); now += 64;
+        ASSERT_EQ(T.controlFrames.size(), static_cast<std::size_t>(t + 1));
+        ASSERT_EQ(T.endTxnFrameError(static_cast<std::size_t>(t)).value_or(-1), 0) << "txn " << t << " completed";
+    }
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), static_cast<int64_t>(kTxns) * (kBatches + 1))
+        << "every data batch + exactly one marker per transaction";
+}
+
+TEST(D4TxnRegression, PipelinedTxnBatchesOnTheShardIngressAreNeverOutOfOrderRegression) {
+    TxnRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    int64_t now = 10;
+    for (int t = 0; t < 6; ++t) {
+        ASSERT_EQ(T.addPartition(), 0);
+        for (int b = 0; b < 32; ++b) {
+            ASSERT_EQ(T.m.ingressTxn(T.sid, ++T.corr, T.pid, T.epoch, T.seq, /*acks=*/1, now), 1)
+                << "txn " << t << " batch " << b << " accepted in send order";
+            ++T.seq;
+        }
+        for (int i = 0; i < 8; ++i) T.m.runWorker(now++);
+        ASSERT_EQ(T.endTxn(true), 999);
+        T.runUntilNoMarkerAwaited(now); now += 64;
+        ASSERT_EQ(T.endTxnFrameError(static_cast<std::size_t>(t)).value_or(-1), 0);
+    }
+    EXPECT_EQ(nonZero(T.m.cap.produceErrors), 0);
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 6 * 33);
+}
+
+TEST(D4TxnRegression, EndTxnForAnUnknownTransactionalIdAnswersWithoutCrashingRegression) {
+    TxnRig T;                                     // no InitProducerId: the coordinator has no entry
+    T.pid = 4242; T.epoch = 0;
+    const int16_t e = T.endTxn(true);
+    EXPECT_NE(e, 999) << "nothing to wait for: answered synchronously";
+    EXPECT_NE(e, 0) << "an unknown transactional id is never OK";
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 0) << "no marker for a producer that never ran a transaction";
+}
+
+TEST(D4TxnRegression, EndTxnWithNoPartitionsNeitherCrashesNorWedgesTheProducerRegression) {
+    TxnRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    const int16_t e = T.endTxn(true);             // nothing added: Empty state
+    EXPECT_NE(e, 999) << "no partitions -> no markers -> no deferred response";
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), 0);
+    // The producer still runs a normal transaction afterwards.
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    ASSERT_EQ(T.endTxn(true), 999);
+    T.runUntilNoMarkerAwaited(100);
+    ASSERT_FALSE(T.controlFrames.empty());
+    EXPECT_EQ(T.endTxnFrameError(T.controlFrames.size() - 1).value_or(-1), 0);
+}
+
+TEST(D4TxnRegression, EndTxnRetriedWhileMarkersAreOutstandingNeverDispatchesTwiceRegression) {
+    TxnRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(10 + i);
+    const int64_t leoBefore = T.m.r->log()->logEndOffset();
+    ASSERT_EQ(T.endTxn(true), 999);
+    // Client timeout -> same-direction retry, then a confused opposite-direction one,
+    // both BEFORE the first EndTxn's marker landed (worker not run).
+    const int16_t same = T.endTxn(true);
+    const int16_t opposite = T.endTxn(false);
+    EXPECT_EQ(same, static_cast<int16_t>(pc::ErrorCode::ConcurrentTransactions))
+        << "Kafka: same direction while Prepare* is retriable CONCURRENT_TRANSACTIONS";
+    EXPECT_EQ(opposite, static_cast<int16_t>(pc::ErrorCode::InvalidTxnState));
+    T.runUntilNoMarkerAwaited(20);
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), leoBefore + 1) << "exactly one marker appended";
+    ASSERT_EQ(T.controlFrames.size(), 1u) << "the original EndTxn answered exactly once";
+    EXPECT_EQ(T.endTxnFrameError(0).value_or(-1), 0);
+    EXPECT_EQ(T.endTxn(true), 0) << "after completion the same-direction retry is the idempotent OK";
+}
+
+TEST(D4TxnRegression, EndTxnWithAStaleEpochIsFencedWithoutMarkersRegression) {
+    TxnRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    ASSERT_EQ(T.addPartition(), 0);
+    T.produceTxn();
+    for (int i = 0; i < 4; ++i) T.m.runWorker(10 + i);
+    const int64_t leoBefore = T.m.r->log()->logEndOffset();
+    const int16_t liveEpoch = T.epoch;
+    T.epoch = static_cast<int16_t>(liveEpoch - 1);   // a zombie instance of the same producer
+    const int16_t e = T.endTxn(true);
+    EXPECT_NE(e, 999);
+    EXPECT_TRUE(e == static_cast<int16_t>(pc::ErrorCode::ProducerFenced) ||
+                e == static_cast<int16_t>(pc::ErrorCode::InvalidProducerEpoch)) << "got " << e;
+    EXPECT_EQ(T.m.r->log()->logEndOffset(), leoBefore) << "a fenced EndTxn writes no marker";
+    T.epoch = liveEpoch;
+    ASSERT_EQ(T.endTxn(true), 999) << "the live instance still commits";
+    T.runUntilNoMarkerAwaited(30);
+    EXPECT_EQ(T.endTxnFrameError(0).value_or(-1), 0);
+}
+
+TEST(D4TxnRegression, MalformedEndTxnFramesAreIgnoredRegression) {
+    TxnRig T;
+    ASSERT_EQ(T.initPid(), 0);
+    std::array<uint8_t, 7> junk{1, 2, 3, 4, 5, 6, 7};
+    EXPECT_EQ(T.tcs->handleEndTxn(junk.data(), junk.size(), 1, T.out.data(), T.out.size()), 0u);
+    EXPECT_EQ(T.tcs->handleEndTxn(nullptr, 0, 1, T.out.data(), T.out.size()), 0u);
+    // A valid frame whose declared transactionalId runs past the buffer.
+    pc::EndTxn q; q.sessionId = 1; q.correlationId = 1; q.producerId = T.pid; q.producerEpoch = T.epoch;
+    q.commit = 1; q.transactionalId = T.tid();
+    std::vector<uint8_t> f(q.encodedSize()); q.encode(f.data());
+    for (std::size_t cut = 1; cut < f.size(); ++cut)
+        (void)T.tcs->handleEndTxn(f.data(), cut, 1, T.out.data(), T.out.size());   // must not crash (ASan/UBSan)
+    // Output buffer too small for the answer.
+    EXPECT_EQ(T.tcs->handleEndTxn(f.data(), f.size(), 1, T.out.data(), 1), 0u);
+    SUCCEED();
+}
