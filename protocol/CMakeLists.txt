@@ -28,6 +28,7 @@ if(BUILD_TESTING)
             tests/protocol/NodeJoinRecordTest.cpp
             tests/protocol/ControlTickRecordTest.cpp
             tests/protocol/client/MessageHeaderTest.cpp
+            tests/protocol/client/CryptoEnvelopeTest.cpp
             tests/protocol/client/ControlMessagesConnectTest.cpp
             tests/protocol/client/ControlMessagesKeepaliveDisconnectErrorTest.cpp
             tests/protocol/client/PingMessagesTest.cpp

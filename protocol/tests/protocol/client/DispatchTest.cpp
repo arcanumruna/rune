@@ -680,16 +680,24 @@ TEST(DispatchCheckFrame, KnownTemplateNine) {
     EXPECT_EQ(fc.templateId, 9u);
 }
 
-TEST(DispatchCheckFrame, UnknownTemplateTen) {
-    // 10 = still unassigned in control range
+TEST(DispatchCheckFrame, KnownTemplateTen) {
+    // 10 = HandshakeContinue — assigned by client<->broker TLS/AEAD (Task 4); must be Ok.
     auto buf = makeValidHeaderBuf(10);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
-    EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
+    EXPECT_EQ(fc.status, rpc::FrameStatus::Ok);
     EXPECT_EQ(fc.templateId, 10u);
 }
 
+TEST(DispatchCheckFrame, KnownTemplateEleven) {
+    // 11 = HandshakeContinueResponse — assigned by client<->broker TLS/AEAD (Task 4); must be Ok.
+    auto buf = makeValidHeaderBuf(11);
+    const auto fc = rpc::checkFrame(buf.data(), buf.size());
+    EXPECT_EQ(fc.status, rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, 11u);
+}
+
 TEST(DispatchCheckFrame, UnknownTemplateFifteen) {
-    // 15 = last in control range (unassigned)
+    // 15 = last in control range (unassigned; 10/11 are now HandshakeContinue{,Response})
     auto buf = makeValidHeaderBuf(15);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
@@ -903,16 +911,22 @@ TEST(DispatchIsKnownTemplate, KnownBoundaries) {
     EXPECT_TRUE(rpc::isKnownTemplate(8));
     EXPECT_TRUE(rpc::isKnownTemplate(9));
 
+    // client<->broker TLS/AEAD (Task 4): HandshakeContinue=10, HandshakeContinueResponse=11
+    // are now known.
+    EXPECT_TRUE(rpc::isKnownTemplate(10));
+    EXPECT_TRUE(rpc::isKnownTemplate(11));
+
     // 0b/0c schema range: 64..69 must all be known.
     for (uint16_t tid = 64; tid <= 69; ++tid) {
         EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
     }
 
-    // Not known: 0, 10..15 (unassigned control gap), 22..31 (unassigned produce/consume gap),
+    // Not known: 0, 12..15 (unassigned control gap after HandshakeContinue{,Response}),
+    //            22..31 (unassigned produce/consume gap),
     //            55..63 (unassigned groups/txn gap after TX-1), 70+ (unassigned schema/view gap),
     //            65535.
     EXPECT_FALSE(rpc::isKnownTemplate(0));
-    EXPECT_FALSE(rpc::isKnownTemplate(10));
+    EXPECT_FALSE(rpc::isKnownTemplate(12));
     EXPECT_FALSE(rpc::isKnownTemplate(15));
     EXPECT_FALSE(rpc::isKnownTemplate(22));
     EXPECT_FALSE(rpc::isKnownTemplate(31));

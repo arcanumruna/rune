@@ -447,7 +447,9 @@ TEST(MetadataMessages, IsKnownTemplateBoundaries)
 {
     EXPECT_TRUE(rpc::isKnownTemplate(8))   << "MetadataRequest=8 must be known";
     EXPECT_TRUE(rpc::isKnownTemplate(9))   << "MetadataResponse=9 must be known";
-    EXPECT_FALSE(rpc::isKnownTemplate(10)) << "10 is still unassigned";
+    EXPECT_TRUE(rpc::isKnownTemplate(10))  << "HandshakeContinue=10 must be known (Task 4)";
+    EXPECT_TRUE(rpc::isKnownTemplate(11))  << "HandshakeContinueResponse=11 must be known (Task 4)";
+    EXPECT_FALSE(rpc::isKnownTemplate(12)) << "12 is still unassigned";
     EXPECT_FALSE(rpc::isKnownTemplate(15)) << "15 is still unassigned";
 }
 

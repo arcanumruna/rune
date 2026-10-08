@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string_view>
 #include "Codec.h"
 #include "MessageHeader.h"
@@ -22,6 +23,22 @@ namespace rune::protocol::client {
 //   [34..]    egressChannel bytes
 //
 // Total = 24 + 8 + 2 + egressChannel.size() = 34 + egressChannel.size()
+//
+// client<->broker TLS/AEAD (Task 4) — additive trailing crypto fields:
+//   [..+2]   cipherList length : uint16  (var prefix, putVarBytes)
+//   [..+n]   cipherList bytes
+//   [..+4]   handshakeBytes length : uint32  (var prefix, putVarBytes32)
+//   [..+m]   handshakeBytes bytes
+//   [..+2]   authToken length : uint16  (var prefix, putVarStr)
+//   [..+k]   authToken bytes
+// These three fields are written ONLY when at least one is non-empty (i.e.
+// the client is offering crypto); an old (<v4) peer that never sets them
+// sees byte-identical frames to before this task. On decode they are only
+// attempted when clientVersion >= kClientVersionCrypto AND trailing bytes
+// remain — absence of either ⇒ "no crypto offered" (fields stay default).
+// This mirrors the additive blockLength/avail-gated idiom used elsewhere in
+// this codec (see Produce's BODY_FIXED_V0/V1 in DataMessages.h) without
+// bumping kProtocolVersion.
 // ---------------------------------------------------------------------------
 struct ConnectRequest {
     int64_t      sessionId       = 0;
@@ -30,11 +47,17 @@ struct ConnectRequest {
     int32_t      clientVersion   = 0;
     std::string_view egressChannel;   // e.g. "aeron:udp?endpoint=host:port"
 
+    // v4 additive crypto fields — default-empty ⇒ no crypto offered.
+    std::span<const uint8_t> cipherList;    // client-preferred cipher ids, in order
+    std::string_view         handshakeBytes; // opening handshake blob (e.g. TLS ClientHello)
+    std::string_view         authToken;      // optional bearer/auth token
+
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::Connect); // 1
     static constexpr uint16_t BODY_FIXED  = 8;  // fixed body bytes (not counting header or var fields)
 
     /// Encode the full frame into buf.  buf must be large enough:
     ///   MessageHeader::ENCODED_SIZE + BODY_FIXED + 2 + egressChannel.size()
+    ///   [+ 2+cipherList.size() + 4+handshakeBytes.size() + 2+authToken.size() if offering crypto]
     /// Returns total bytes written.
     std::size_t encode(uint8_t* buf) const noexcept {
         // Write header
@@ -54,9 +77,21 @@ struct ConnectRequest {
 
         // Var field starting at byte 32
         const std::size_t varOffset = fixedBase + BODY_FIXED;
-        const std::size_t varWritten = putVarStr(buf + varOffset, egressChannel);
+        std::size_t pos = varOffset + putVarStr(buf + varOffset, egressChannel);
 
-        return varOffset + varWritten;
+        // v4 additive crypto fields — omitted entirely when nothing is offered,
+        // so an old-style ConnectRequest (no crypto fields set) encodes to
+        // byte-identical output as before this task.
+        const bool offersCrypto = !cipherList.empty() || !handshakeBytes.empty() || !authToken.empty();
+        if (offersCrypto) {
+            pos += putVarBytes(buf + pos, cipherList.data(), static_cast<uint16_t>(cipherList.size()));
+            pos += putVarBytes32(buf + pos,
+                                 reinterpret_cast<const uint8_t*>(handshakeBytes.data()),
+                                 static_cast<uint32_t>(handshakeBytes.size()));
+            pos += putVarStr(buf + pos, authToken);
+        }
+
+        return pos;
     }
 
     /// Decode a full frame from buf[0..avail-1].
@@ -83,6 +118,25 @@ struct ConnectRequest {
         std::size_t pos = fixedBase + BODY_FIXED;
         if (!getVarStr(buf, avail, pos, msg.egressChannel)) return std::nullopt;
 
+        // v4 additive crypto fields (trailing) — only attempted when the
+        // sender declares clientVersion >= kClientVersionCrypto AND there are
+        // bytes left to read. Absence of either ⇒ no crypto offered (fields
+        // stay default-empty); an old (<v4) client's frame decodes exactly
+        // as before this task.
+        if (msg.clientVersion >= kClientVersionCrypto && pos < avail) {
+            const uint8_t* clData = nullptr;
+            uint16_t       clLen  = 0;
+            if (!getVarBytes(buf, avail, pos, clData, clLen)) return std::nullopt;
+            msg.cipherList = std::span<const uint8_t>(clData, clLen);
+
+            const uint8_t* hbData = nullptr;
+            uint32_t       hbLen  = 0;
+            if (!getVarBytes32(buf, avail, pos, hbData, hbLen)) return std::nullopt;
+            msg.handshakeBytes = std::string_view(reinterpret_cast<const char*>(hbData), hbLen);
+
+            if (!getVarStr(buf, avail, pos, msg.authToken)) return std::nullopt;
+        }
+
         return msg;
     }
 };
@@ -92,7 +146,7 @@ struct ConnectRequest {
 //
 // Frame layout (all little-endian):
 //   [0..23]   MessageHeader (24 bytes)
-//     blockLength = BODY_FIXED (14)
+//     blockLength = BODY_FIXED (18)
 //     templateId  = 2
 //   [24..25]  code              : int16
 //   [26..29]  leaderMemberId    : int32
@@ -101,6 +155,20 @@ struct ConnectRequest {
 //                                         frame of an older broker = 0)
 //
 // Total = 24 + 18 = 42 bytes (no var fields); decode accepts the 38-byte form.
+//
+// client<->broker TLS/AEAD (Task 4) — additive trailing crypto fields,
+// layered AFTER brokerVersion:
+//   [42]      chosenCipher : uint8   (rune::crypto::Cipher value; 0 = none chosen)
+//   [43..46]  handshakeBytes length : uint32 (var prefix, putVarBytes32)
+//   [47..]    handshakeBytes bytes
+// Written ONLY when the broker actually chose a cipher or has handshake
+// bytes to return (chosenCipher != 0 || !handshakeBytes.empty()); otherwise
+// encode() produces the exact main 42-byte brokerVersion frame, byte-for-byte.
+// On decode, the trailing fields are only read when hdr.blockLength >=
+// BODY_FIXED_V4 AND avail >= ENCODED_SIZE_V4 — the same blockLength/avail-
+// gated idiom used by Produce's BODY_FIXED_V0/V1 in DataMessages.h.
+// kProtocolVersion is not bumped; absence of the gate ⇒ no crypto chosen
+// (fields stay default).
 // ---------------------------------------------------------------------------
 struct ConnectResponse {
     int64_t sessionId         = 0;
@@ -110,17 +178,28 @@ struct ConnectResponse {
     int64_t assignedSessionId = 0;
     int32_t brokerVersion     = kBrokerVersion;  // capability gate (Protocol.h)
 
+    // v4 additive crypto fields — default ⇒ no crypto chosen.
+    uint8_t           chosenCipher = 0;    // rune::crypto::Cipher value; 0 = none
+    std::string_view  handshakeBytes;      // handshake continuation blob (e.g. TLS ServerHello)
+
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::ConnectResponse); // 2
-    static constexpr uint16_t BODY_FIXED  = 18;
+    static constexpr uint16_t BODY_FIXED    = 18;  // incl. brokerVersion (main)
     static constexpr uint16_t BODY_FIXED_V0 = 14;  // an older broker's body (no brokerVersion)
+    static constexpr uint16_t BODY_FIXED_V4 = 19;  // + chosenCipher byte, AFTER brokerVersion
 
     static constexpr std::size_t ENCODED_SIZE    = MessageHeader::ENCODED_SIZE + BODY_FIXED;     // 42
     static constexpr std::size_t ENCODED_SIZE_V0 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V0;  // 38
+    static constexpr std::size_t ENCODED_SIZE_V4 = MessageHeader::ENCODED_SIZE + BODY_FIXED_V4;  // 43
 
-    /// Encode the full frame (42 bytes) into buf.  Returns 42.
+    /// Encode the full frame into buf. Returns ENCODED_SIZE (42) when no
+    /// crypto was chosen — byte-identical to main's brokerVersion frame — or
+    /// ENCODED_SIZE_V4 + 4 + handshakeBytes.size() when the broker chose a
+    /// cipher and/or has handshake bytes to send.
     std::size_t encode(uint8_t* buf) const noexcept {
+        const bool chosenCrypto = (chosenCipher != 0) || !handshakeBytes.empty();
+
         MessageHeader hdr;
-        hdr.blockLength   = BODY_FIXED;
+        hdr.blockLength   = chosenCrypto ? BODY_FIXED_V4 : BODY_FIXED;
         hdr.templateId    = TEMPLATE_ID;
         hdr.schemaId      = kSchemaId;
         hdr.version       = kProtocolVersion;
@@ -134,7 +213,14 @@ struct ConnectResponse {
         detail::putLE64 (buf, fixedBase + 6, assignedSessionId);
         detail::putLE32 (buf, fixedBase + 14, brokerVersion);
 
-        return ENCODED_SIZE;
+        if (!chosenCrypto) return ENCODED_SIZE;
+
+        buf[fixedBase + 18] = chosenCipher;  // @42, AFTER brokerVersion [14..17]
+        std::size_t pos = static_cast<std::size_t>(fixedBase) + BODY_FIXED_V4;
+        pos += putVarBytes32(buf + pos,
+                             reinterpret_cast<const uint8_t*>(handshakeBytes.data()),
+                             static_cast<uint32_t>(handshakeBytes.size()));
+        return pos;
     }
 
     /// Decode a full frame from buf[0..avail-1].
@@ -160,6 +246,17 @@ struct ConnectResponse {
         msg.brokerVersion = (hdr.blockLength >= BODY_FIXED && avail >= ENCODED_SIZE)
                                 ? static_cast<int32_t>(detail::getLE32(buf, fixedBase + 14))
                                 : 0;
+
+        // v4 additive crypto fields — gated on blockLength/avail (mirrors the
+        // Produce BODY_FIXED_V0/V1 idiom). Absence ⇒ no crypto chosen.
+        if (hdr.blockLength >= BODY_FIXED_V4 && avail >= ENCODED_SIZE_V4) {
+            msg.chosenCipher = buf[fixedBase + 18];  // @42, AFTER brokerVersion [14..17]
+            std::size_t pos = static_cast<std::size_t>(fixedBase) + BODY_FIXED_V4;
+            const uint8_t* hbData = nullptr;
+            uint32_t       hbLen  = 0;
+            if (!getVarBytes32(buf, avail, pos, hbData, hbLen)) return std::nullopt;
+            msg.handshakeBytes = std::string_view(reinterpret_cast<const char*>(hbData), hbLen);
+        }
 
         return msg;
     }
@@ -345,5 +442,177 @@ struct ErrorResponse {
         return msg;
     }
 };
+
+// ---------------------------------------------------------------------------
+// HandshakeContinue  (templateId 10, BODY_FIXED = 0)
+//
+// client<->broker TLS/AEAD (Task 4) — a continuation leg of a multi-round
+// crypto handshake (sent after the initial Connect/ConnectResponse exchange
+// when the chosen cipher needs more than one round-trip, e.g. TLS).
+//
+// Frame layout (all little-endian):
+//   [0..23]   MessageHeader (24 bytes)
+//     blockLength = BODY_FIXED (0)
+//     templateId  = 10
+//   [24..27]  handshakeBytes length : uint32 (var prefix, putVarBytes32)
+//   [28..]    handshakeBytes bytes
+//
+// Total = 24 + 4 + handshakeBytes.size() = 28 + handshakeBytes.size()
+// ---------------------------------------------------------------------------
+struct HandshakeContinue {
+    int64_t           sessionId     = 0;
+    int64_t           correlationId = 0;
+    std::string_view  handshakeBytes;
+
+    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::HandshakeContinue); // 10
+    static constexpr uint16_t BODY_FIXED  = 0;
+
+    /// Total encoded size: header + 4-byte var32 prefix + handshakeBytes.
+    std::size_t encodedSize() const noexcept {
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 4u + handshakeBytes.size();
+    }
+
+    /// Encode the full frame into buf. buf must be >= encodedSize() bytes.
+    /// Returns total bytes written.
+    std::size_t encode(uint8_t* buf) const noexcept {
+        MessageHeader hdr;
+        hdr.blockLength   = BODY_FIXED;
+        hdr.templateId    = TEMPLATE_ID;
+        hdr.schemaId      = kSchemaId;
+        hdr.version       = kProtocolVersion;
+        hdr.sessionId     = sessionId;
+        hdr.correlationId = correlationId;
+        hdr.encode(buf);
+
+        constexpr std::size_t fixedBase = MessageHeader::ENCODED_SIZE;
+        std::size_t pos = fixedBase + BODY_FIXED;
+        pos += putVarBytes32(buf + pos,
+                             reinterpret_cast<const uint8_t*>(handshakeBytes.data()),
+                             static_cast<uint32_t>(handshakeBytes.size()));
+        return pos;
+    }
+
+    /// Decode a full frame from buf[0..avail-1].
+    /// Returns nullopt on any truncation or header mismatch.
+    static std::optional<HandshakeContinue> decode(const uint8_t* buf, std::size_t avail) noexcept {
+        auto hdrOpt = MessageHeader::decode(buf, avail);
+        if (!hdrOpt) return std::nullopt;
+        const MessageHeader& hdr = *hdrOpt;
+        if (hdr.schemaId   != kSchemaId)   return std::nullopt;
+        if (hdr.templateId != TEMPLATE_ID) return std::nullopt;
+
+        constexpr std::size_t fixedBase = MessageHeader::ENCODED_SIZE;
+        if (avail < fixedBase + BODY_FIXED) return std::nullopt;
+
+        HandshakeContinue msg;
+        msg.sessionId     = hdr.sessionId;
+        msg.correlationId = hdr.correlationId;
+
+        std::size_t pos = fixedBase + BODY_FIXED;
+        const uint8_t* hbData = nullptr;
+        uint32_t       hbLen  = 0;
+        if (!getVarBytes32(buf, avail, pos, hbData, hbLen)) return std::nullopt;
+        msg.handshakeBytes = std::string_view(reinterpret_cast<const char*>(hbData), hbLen);
+
+        return msg;
+    }
+};
+
+/// Free-function encode helper: bounds-checks against bufSize before calling
+/// HandshakeContinue::encode. Returns 0 (no write) if bufSize is too small.
+inline std::size_t encodeHandshakeContinue(uint8_t* buf, std::size_t bufSize,
+                                           const HandshakeContinue& msg) noexcept {
+    if (bufSize < msg.encodedSize()) return 0;
+    return msg.encode(buf);
+}
+
+// ---------------------------------------------------------------------------
+// HandshakeContinueResponse  (templateId 11, BODY_FIXED = 2)
+//
+// client<->broker TLS/AEAD (Task 4) — the broker's reply to a
+// HandshakeContinue leg: either more handshake bytes to send back (code ==
+// ErrorCode::OK, continue) or a terminal code (e.g.
+// ErrorCode::HandshakeFailed) ending the handshake.
+//
+// Frame layout (all little-endian):
+//   [0..23]   MessageHeader (24 bytes)
+//     blockLength = BODY_FIXED (2)
+//     templateId  = 11
+//   [24..25]  code : int16  (rune::protocol::client::ErrorCode value)
+//   [26..29]  handshakeBytes length : uint32 (var prefix, putVarBytes32)
+//   [30..]    handshakeBytes bytes
+//
+// Total = 24 + 2 + 4 + handshakeBytes.size() = 30 + handshakeBytes.size()
+// ---------------------------------------------------------------------------
+struct HandshakeContinueResponse {
+    int64_t           sessionId     = 0;
+    int64_t           correlationId = 0;
+    int16_t           code          = 0;  // rune::protocol::client::ErrorCode value
+    std::string_view  handshakeBytes;
+
+    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::HandshakeContinueResponse); // 11
+    static constexpr uint16_t BODY_FIXED  = 2;
+
+    /// Total encoded size: header + code + 4-byte var32 prefix + handshakeBytes.
+    std::size_t encodedSize() const noexcept {
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 4u + handshakeBytes.size();
+    }
+
+    /// Encode the full frame into buf. buf must be >= encodedSize() bytes.
+    /// Returns total bytes written.
+    std::size_t encode(uint8_t* buf) const noexcept {
+        MessageHeader hdr;
+        hdr.blockLength   = BODY_FIXED;
+        hdr.templateId    = TEMPLATE_ID;
+        hdr.schemaId      = kSchemaId;
+        hdr.version       = kProtocolVersion;
+        hdr.sessionId     = sessionId;
+        hdr.correlationId = correlationId;
+        hdr.encode(buf);
+
+        constexpr int fixedBase = static_cast<int>(MessageHeader::ENCODED_SIZE);
+        detail::putLE16s(buf, fixedBase + 0, code);
+
+        std::size_t pos = static_cast<std::size_t>(fixedBase) + BODY_FIXED;
+        pos += putVarBytes32(buf + pos,
+                             reinterpret_cast<const uint8_t*>(handshakeBytes.data()),
+                             static_cast<uint32_t>(handshakeBytes.size()));
+        return pos;
+    }
+
+    /// Decode a full frame from buf[0..avail-1].
+    /// Returns nullopt on any truncation or header mismatch.
+    static std::optional<HandshakeContinueResponse> decode(const uint8_t* buf, std::size_t avail) noexcept {
+        auto hdrOpt = MessageHeader::decode(buf, avail);
+        if (!hdrOpt) return std::nullopt;
+        const MessageHeader& hdr = *hdrOpt;
+        if (hdr.schemaId   != kSchemaId)   return std::nullopt;
+        if (hdr.templateId != TEMPLATE_ID) return std::nullopt;
+
+        constexpr std::size_t fixedBase = MessageHeader::ENCODED_SIZE;
+        if (avail < fixedBase + BODY_FIXED) return std::nullopt;
+
+        HandshakeContinueResponse msg;
+        msg.sessionId     = hdr.sessionId;
+        msg.correlationId = hdr.correlationId;
+        msg.code          = detail::getLE16s(buf, static_cast<int>(fixedBase) + 0);
+
+        std::size_t pos = fixedBase + BODY_FIXED;
+        const uint8_t* hbData = nullptr;
+        uint32_t       hbLen  = 0;
+        if (!getVarBytes32(buf, avail, pos, hbData, hbLen)) return std::nullopt;
+        msg.handshakeBytes = std::string_view(reinterpret_cast<const char*>(hbData), hbLen);
+
+        return msg;
+    }
+};
+
+/// Free-function encode helper: bounds-checks against bufSize before calling
+/// HandshakeContinueResponse::encode. Returns 0 (no write) if bufSize is too small.
+inline std::size_t encodeHandshakeContinueResponse(uint8_t* buf, std::size_t bufSize,
+                                                   const HandshakeContinueResponse& msg) noexcept {
+    if (bufSize < msg.encodedSize()) return 0;
+    return msg.encode(buf);
+}
 
 } // namespace rune::protocol::client

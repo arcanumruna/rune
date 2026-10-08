@@ -76,6 +76,15 @@ struct FrameCheck {
         tid == static_cast<uint16_t>(TemplateId::MetadataResponse)) {
         return true;
     }
+    // client<->broker TLS/AEAD (Task 4/5): HandshakeContinue=10, HandshakeContinueResponse=11.
+    // Added here because Task 4 defined these ids in Protocol.h but didn't extend
+    // isKnownTemplate() for them — found while wiring the Task 5 client-side drive
+    // (ClientAgent::dispatchEgressFrame's checkFrame() silently dropped every
+    // HandshakeContinueResponse as UnknownTemplate without this).
+    if (tid == static_cast<uint16_t>(TemplateId::HandshakeContinue) ||
+        tid == static_cast<uint16_t>(TemplateId::HandshakeContinueResponse)) {
+        return true;
+    }
     // Milestone B produce/subscribe range: 16..21
     if (tid >= static_cast<uint16_t>(TemplateId::Produce) &&
         tid <= static_cast<uint16_t>(TemplateId::Unsubscribe)) {

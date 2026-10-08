@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <climits>
 #include <cstring>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -600,4 +601,213 @@ TEST(ConnectRequestCodec, VarFieldClaimsMoreThanAvailAtExactHeaderPlusFixed) {
     // avail == 34: the prefix claims 1 byte but pos after reading prefix is 34,
     // leaving 0 bytes — rejected.
     EXPECT_FALSE(rpc::ConnectRequest::decode(buf.data(), written).has_value());
+}
+
+// ===========================================================================
+// client<->broker TLS/AEAD (Task 4) — additive v4 crypto fields +
+// HandshakeContinue/HandshakeContinueResponse.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// ConnectRequest — v4 client offering crypto fields round-trips, and an old
+// (<v4) client's request is unaffected (no crypto fields, byte-identical to
+// pre-Task-4 wire format).
+// ---------------------------------------------------------------------------
+TEST(ConnectRequest, V4CipherListHandshakeAuthTokenRoundTrip) {
+    const uint8_t ciphers[] = {1, 2, 3};
+
+    rpc::ConnectRequest req;
+    req.sessionId      = 11;
+    req.correlationId  = 22;
+    req.egressStreamId = 7;
+    req.clientVersion  = rpc::kClientVersionCrypto;  // 4
+    req.egressChannel  = "aeron:ipc";
+    req.cipherList      = std::span<const uint8_t>(ciphers, 3);
+    req.handshakeBytes  = "\x16\x03\x03hello";
+    req.authToken       = "tok-123";
+
+    std::array<uint8_t, 256> buf{};
+    const std::size_t written = req.encode(buf.data());
+    // Must be larger than the old (no-crypto) size for the same channel.
+    EXPECT_GT(written, 24u + 8u + 2u + req.egressChannel.size());
+
+    auto decoded = rpc::ConnectRequest::decode(buf.data(), written);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->egressChannel, req.egressChannel);
+    ASSERT_EQ(decoded->cipherList.size(), 3u);
+    EXPECT_EQ(decoded->cipherList[0], 1);
+    EXPECT_EQ(decoded->cipherList[1], 2);
+    EXPECT_EQ(decoded->cipherList[2], 3);
+    EXPECT_EQ(decoded->handshakeBytes, req.handshakeBytes);
+    EXPECT_EQ(decoded->authToken, req.authToken);
+}
+
+TEST(ConnectRequest, OldClientNoCryptoFieldsByteIdenticalToPreTask4) {
+    // A client that never sets cipherList/handshakeBytes/authToken (the
+    // default) must encode to exactly the legacy frame size — no trailing
+    // bytes added — regardless of clientVersion.
+    rpc::ConnectRequest req;
+    req.egressStreamId = 3;
+    req.clientVersion  = 1;  // pre-crypto client
+    req.egressChannel  = "aeron:ipc";
+
+    std::array<uint8_t, 128> buf{};
+    const std::size_t written = req.encode(buf.data());
+    EXPECT_EQ(written, 24u + 8u + 2u + req.egressChannel.size());
+
+    auto decoded = rpc::ConnectRequest::decode(buf.data(), written);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_TRUE(decoded->cipherList.empty());
+    EXPECT_TRUE(decoded->handshakeBytes.empty());
+    EXPECT_TRUE(decoded->authToken.empty());
+}
+
+// ---------------------------------------------------------------------------
+// ConnectResponse — additive v4 crypto field (OldDecoderIgnoresNewCryptoField).
+//
+// A v4 ConnectResponse with chosenCipher/handshakeBytes set still decodes
+// its V0 fields when avail is truncated to the old (V0) size — the new
+// crypto fields default (absent), proving back-compat gating.
+// ---------------------------------------------------------------------------
+TEST(ConnectResponse, OldDecoderIgnoresNewCryptoField) {
+    rpc::ConnectResponse resp;
+    resp.sessionId         = 5;
+    resp.correlationId     = 6;
+    resp.code              = static_cast<int16_t>(rpc::ErrorCode::OK);
+    resp.leaderMemberId    = 1;
+    resp.assignedSessionId = 100;
+    resp.chosenCipher      = 2;
+    resp.handshakeBytes    = "serverhello";
+
+    std::array<uint8_t, 128> buf{};
+    const std::size_t written = resp.encode(buf.data());
+    ASSERT_GT(written, rpc::ConnectResponse::ENCODED_SIZE);
+
+    // Full decode sees the new crypto fields.
+    auto full = rpc::ConnectResponse::decode(buf.data(), written);
+    ASSERT_TRUE(full.has_value());
+    EXPECT_EQ(full->chosenCipher, 2);
+    EXPECT_EQ(full->handshakeBytes, "serverhello");
+
+    // Truncated to the old (V0) size: new fields default, old fields intact.
+    auto truncated = rpc::ConnectResponse::decode(buf.data(), rpc::ConnectResponse::ENCODED_SIZE);
+    ASSERT_TRUE(truncated.has_value());
+    EXPECT_EQ(truncated->chosenCipher, 0);
+    EXPECT_TRUE(truncated->handshakeBytes.empty());
+    EXPECT_EQ(truncated->leaderMemberId, 1);
+    EXPECT_EQ(truncated->assignedSessionId, 100);
+}
+
+TEST(ConnectResponse, NoChosenCipherByteIdenticalToPreTask4) {
+    // Default chosenCipher/handshakeBytes must encode to exactly the legacy
+    // 38-byte frame — unaffected by this task.
+    rpc::ConnectResponse resp;
+    resp.code              = 0;
+    resp.leaderMemberId    = 1;
+    resp.assignedSessionId = 2;
+
+    std::array<uint8_t, 64> buf{};
+    const std::size_t written = resp.encode(buf.data());
+    EXPECT_EQ(written, rpc::ConnectResponse::ENCODED_SIZE);  // 38
+
+    auto decoded = rpc::ConnectResponse::decode(buf.data(), written);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->chosenCipher, 0);
+    EXPECT_TRUE(decoded->handshakeBytes.empty());
+}
+
+// ---------------------------------------------------------------------------
+// HandshakeContinue — round trip via the free encodeHandshakeContinue helper.
+// ---------------------------------------------------------------------------
+TEST(HandshakeContinue, RoundTrip) {
+    uint8_t buf[256];
+    const char* hs = "\x16\x03\x03...";  // arbitrary handshake bytes
+
+    rpc::HandshakeContinue m;
+    m.sessionId     = 5;
+    m.correlationId = 9;
+    m.handshakeBytes = {hs, 3};
+
+    std::size_t n = rpc::encodeHandshakeContinue(buf, sizeof buf, m);
+    ASSERT_GT(n, 0u);
+
+    auto d = rpc::HandshakeContinue::decode(buf, n);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->sessionId, 5);
+    EXPECT_EQ(d->correlationId, 9);
+    ASSERT_EQ(d->handshakeBytes.size(), 3u);
+    EXPECT_EQ(d->handshakeBytes, std::string_view(hs, 3));
+}
+
+TEST(HandshakeContinue, EncodeRejectsUndersizedBuffer) {
+    rpc::HandshakeContinue m;
+    m.handshakeBytes = "abcdefgh";  // 8 bytes
+
+    uint8_t small[10];  // too small for header(24)+4+8
+    EXPECT_EQ(rpc::encodeHandshakeContinue(small, sizeof small, m), 0u);
+}
+
+TEST(HandshakeContinue, TemplateIdIsTen) {
+    EXPECT_EQ(rpc::HandshakeContinue::TEMPLATE_ID, static_cast<uint16_t>(rpc::TemplateId::HandshakeContinue));
+    EXPECT_EQ(rpc::HandshakeContinue::TEMPLATE_ID, 10);
+}
+
+// ---------------------------------------------------------------------------
+// HandshakeContinueResponse — round trip, including a terminal
+// ErrorCode::HandshakeFailed code with no further handshake bytes.
+// ---------------------------------------------------------------------------
+TEST(HandshakeContinueResponse, RoundTrip) {
+    uint8_t buf[256];
+    rpc::HandshakeContinueResponse m;
+    m.sessionId      = 1;
+    m.correlationId  = 2;
+    m.code           = static_cast<int16_t>(rpc::ErrorCode::OK);
+    m.handshakeBytes = "serverfinished";
+
+    std::size_t n = rpc::encodeHandshakeContinueResponse(buf, sizeof buf, m);
+    ASSERT_GT(n, 0u);
+
+    auto d = rpc::HandshakeContinueResponse::decode(buf, n);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->sessionId, 1);
+    EXPECT_EQ(d->correlationId, 2);
+    EXPECT_EQ(d->code, static_cast<int16_t>(rpc::ErrorCode::OK));
+    EXPECT_EQ(d->handshakeBytes, "serverfinished");
+}
+
+TEST(HandshakeContinueResponse, TerminalHandshakeFailedRoundTrip) {
+    uint8_t buf[64];
+    rpc::HandshakeContinueResponse m;
+    m.sessionId     = 3;
+    m.correlationId = 4;
+    m.code          = static_cast<int16_t>(rpc::ErrorCode::HandshakeFailed);
+    // No further handshake bytes on failure.
+
+    std::size_t n = rpc::encodeHandshakeContinueResponse(buf, sizeof buf, m);
+    ASSERT_GT(n, 0u);
+
+    auto d = rpc::HandshakeContinueResponse::decode(buf, n);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->code, static_cast<int16_t>(rpc::ErrorCode::HandshakeFailed));
+    EXPECT_EQ(static_cast<int16_t>(rpc::ErrorCode::HandshakeFailed), 29);
+    EXPECT_TRUE(d->handshakeBytes.empty());
+}
+
+TEST(HandshakeContinueResponse, TemplateIdIsEleven) {
+    EXPECT_EQ(rpc::HandshakeContinueResponse::TEMPLATE_ID,
+              static_cast<uint16_t>(rpc::TemplateId::HandshakeContinueResponse));
+    EXPECT_EQ(rpc::HandshakeContinueResponse::TEMPLATE_ID, 11);
+}
+
+// ---------------------------------------------------------------------------
+// Version gate constants — kClientVersion/kBrokerVersion bumped to 4;
+// kProtocolVersion (the MessageHeader wire version) stays at 3.
+// ---------------------------------------------------------------------------
+TEST(VersionGates, ClientBrokerVersionBumpedProtocolVersionUnchanged) {
+    EXPECT_EQ(rpc::kClientVersion, 4);
+    EXPECT_EQ(rpc::kBrokerVersion, 4);
+    EXPECT_EQ(rpc::kClientVersionCrypto, 4);
+    EXPECT_EQ(rpc::kBrokerVersionCrypto, 4);
+    EXPECT_EQ(rpc::kProtocolVersion, 3);
+    EXPECT_EQ(rpc::kCryptoSchemaId, 121);
 }
