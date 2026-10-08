@@ -469,12 +469,14 @@ private:
     /// ConsensusModuleAgent.leadershipTermId is recovered from the RecordingLog
     /// (here: the TermLog, appended at electionComplete) and whose only durable
     /// election term is the NodeStateFile candidate term.  Safe: the adoption
-    /// first persists candidateTermId (proposeMaxCandidateTermId, fsync), and a
-    /// restarted node's init() starts from max(persisted candidate term, this),
-    /// so it never votes at or below the adopted term nor re-follows the deposed
-    /// leader's older term (ClosedLeaderStepDownRegression_RestartAfter...).  The
-    /// ack term may fall back below it after a crash — same reasoning as
-    /// votedTermId_ below: knowledge persisted, never acked.
+    /// first raises the durable follow floor + candidate term (raiseFollowFloor_,
+    /// NodeStateFile slot 24, one sync), and a restarted node's init() starts
+    /// from max(persisted candidate term, floor, this), so it never votes at or
+    /// below the adopted term nor re-follows the deposed leader's older term
+    /// (ClosedLeaderStepDownRegression_RestartAfter...).  Since D24 the ack term
+    /// does not fall back either: init() restores votedTermId_ from the floor,
+    /// so ackTermId() >= the adopted term after a crash (LOW-6 re-evaluated;
+    /// ClosedLeaderStepDownRegression_AdoptedTermAckTermSurvivesRestart).
     Term leadershipTermId_    = 0;
     Term logLeadershipTermId_ = 0;
     Term candidateTermId_     = 0;

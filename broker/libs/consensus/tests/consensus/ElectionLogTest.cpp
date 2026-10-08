@@ -2621,6 +2621,44 @@ TEST(ElectionLog, ClosedLeaderStepDownRegression_RestartAfterAdoptedTermIgnoresD
     }
 }
 
+// DR-10 review LOW-6, re-evaluated against D24: the adopted leadershipTermId
+// itself stays in memory (as in Aeron), but adopting it raises the DURABLE
+// follow floor (NodeStateFile slot 24) — and a restarted node restores
+// votedTermId_ from that floor.  So the ack term (max(voted, leadership)) no
+// longer falls back below the adopted term after a crash: a node that moved
+// on to T+1 never acks a term-T internal ISR state again.
+TEST(ElectionLog, ClosedLeaderStepDownRegression_AdoptedTermAckTermSurvivesRestart) {
+    for (const bool viaNlt : {false, true}) {
+        SCOPED_TRACE(viaNlt ? "adopted from a NewLeadershipTerm" : "adopted from a CommitPosition");
+        TempFile nf(".nsf"), tf(".tl");
+        Term deposed = 0, higher = 0;
+        {
+            NodeStateFile nsf(nf.str());
+            TermLog       tl(tf.str());
+            ElectionLogFakePublisher pub;
+            int64_t nowNs = 1'000'000LL;
+            auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl);
+            closeAsFollowerOf0(e, nowNs);
+            deposed = e.leadershipTermId();
+            higher  = deposed + 1;
+            if (viaNlt)
+                e.onNewLeadershipTerm(nowNs, deposed, higher, 0, 0, higher, 0, 0, 0, 0,
+                                      /*leader=*/2, 0, false, 0);
+            else
+                e.onCommitPosition(nowNs, higher, 0, /*leader=*/2);
+            ASSERT_GE(e.leadershipTermId(), higher);
+            ASSERT_GE(e.followFloorTermId(), higher) << "the adopted term did not reach the durable floor";
+        }   // crash
+        NodeStateFile nsf(nf.str());
+        EXPECT_GE(nsf.followFloorTermId(), higher) << "slot 24 does not hold the adopted term";
+        TermLog       tl(tf.str());
+        ElectionLogFakePublisher pub;
+        auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl, true, deposed, 0, 0);
+        e.doWork(5'000'000'000LL);   // INIT -> CANVASS
+        EXPECT_GE(e.ackTermId(), higher) << "the ack term fell back below the adopted term after a crash";
+    }
+}
+
 // ===========================================================================
 // D24 (DR-4 review MAJOR-1 / MEDIUM-3) — a node whose OWN failed candidacies
 // raised its durable candidateTermId above the elected leader's term refused
