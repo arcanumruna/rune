@@ -122,17 +122,24 @@ static AlterOp setCompatOp(CompatMode m) {
 }
 
 // ---------------------------------------------------------------------------
-// rebuildFromLog — same logic as BrokerNode::buildAdminWorker.
-// Replays the __topic_schemas log [0, HW) into a SchemaRegistry.
+// rebuildFromLog — same logic as BrokerNode::buildAdminWorker (including its
+// fail-loud-on-corrupt-record fix: see CorruptRecordAbortsBootReplayRegression
+// below). Replays the __topic_schemas log [0, HW) into a SchemaRegistry.
+//
+// Returns false iff a record's TopicSchema::deserialize failed (corrupt/
+// truncated payload) — the replay ABORTS at that point (no later batch is
+// applied), matching BrokerNode::buildAdminWorker's throw-and-degrade path.
+// Returns true on a clean (possibly partial/empty) replay.
 // ---------------------------------------------------------------------------
-static void rebuildSchemaRegistryFromLog(
+static bool rebuildSchemaRegistryFromLog(
     const PartitionReplica* replica, SchemaRegistry& reg)
 {
     const Offset hw = replica->highWatermark();
-    if (hw <= 0) return;
+    if (hw <= 0) return true;
 
     static constexpr int32_t kChunk = 64 * 1024 * 1024;
     Offset fetchOffset = 0;
+    bool replayFailed = false;
 
     while (fetchOffset < hw) {
         std::vector<uint8_t> data =
@@ -156,7 +163,7 @@ static void rebuildSchemaRegistryFromLog(
             const int32_t tl = reader.totalLength();
             if (tl <= 0 || static_cast<std::size_t>(tl) > rem) break;
 
-            reader.forEach([&reg](std::string_view /*key*/,
+            reader.forEach([&reg, &replayFailed](std::string_view /*key*/,
                                    std::string_view val,
                                    int64_t /*offset*/,
                                    int64_t /*ts*/) {
@@ -164,17 +171,22 @@ static void rebuildSchemaRegistryFromLog(
                     reinterpret_cast<const uint8_t*>(val.data()), val.size()));
                 if (ts) {
                     reg.applyRecord(*ts);
+                } else {
+                    replayFailed = true;  // corrupt/truncated — abort, never skip
                 }
             });
+            if (replayFailed) break;
 
             const Offset bne = reader.baseOffset() + reader.lastOffsetDelta() + 1;
             if (bne > lastBatchEnd) lastBatchEnd = bne;
             pos += static_cast<std::size_t>(tl);
         }
+        if (replayFailed) break;
 
         if (lastBatchEnd <= fetchOffset) break;
         fetchOffset = lastBatchEnd;
     }
+    return !replayFailed;
 }
 
 // ---------------------------------------------------------------------------
@@ -731,6 +743,94 @@ TEST_F(SchemaPersistenceTest, CorruptRecordAbortsRebuildRegression) {
     EXPECT_EQ(pv2, nullptr)
         << "Regression: the v2 ALTER record AFTER the corrupt one must NOT be "
            "silently applied — rebuildFromLog_ must ABORT at the corrupt record, "
+           "never continue past it and paper over the version gap";
+}
+
+// ---------------------------------------------------------------------------
+// Follow-up final-review Regression: CorruptRecordAbortsBootReplayRegression
+//
+// Same-class bug as Finding 1 above, but on the BOOT-time replay path
+// (BrokerNode::buildAdminWorker's inline [0,HW) rebuild — the PRIMARY schema
+// recovery path, hit on EVERY boot, not just a Follower->Leader promotion).
+// Pre-fix, that inline loop ALSO silently skipped a record whose
+// TopicSchema::deserialize failed, leaving the same kind of undetected
+// version gap. BrokerNode::buildAdminWorker now throws std::runtime_error on
+// such a record (caught by its own enclosing try/catch, which logs
+// spdlog::error and degrades — schema DDL unavailable — same convention as
+// every other AdminWorker setup failure in that function).
+//
+// rebuildSchemaRegistryFromLog() above is this test file's established
+// stand-in for that inline boot logic (BrokerNode itself needs a full Aeron
+// driver to construct, too heavy for this test binary) and has been updated
+// to mirror the SAME fail-loud/abort behavior, returning false on a corrupt
+// record. This test exercises that mirror with the identical sandwiched-
+// corruption setup as CorruptRecordAbortsRebuildRegression above.
+// ---------------------------------------------------------------------------
+TEST_F(SchemaPersistenceTest, CorruptRecordAbortsBootReplayRegression) {
+    // 1. DEFINE v1 "characters" via the normal production commit path.
+    DefineTopicMsg def;
+    def.session        = 1;
+    def.corr           = 2;
+    def.name           = "characters";
+    def.keyField       = "userId";
+    def.partitionCount = 4;
+    def.validate       = false;
+    def.blob           = charsBlob();
+    driveDefine(def);
+    ASSERT_EQ(lastDefineError_, 0u) << "Precondition: DefineTopic (v1) must succeed";
+    const int32_t topicId = lastDefineTopicId_;
+
+    tick(5);  // advance HW to cover v1
+
+    // 2. Append a DELIBERATELY CORRUPT/TRUNCATED record directly onto the
+    //    replica, sandwiched between v1 and the v2 ALTER below — same
+    //    construction as CorruptRecordAbortsRebuildRegression.
+    {
+        const uint8_t keyBuf[6] = {0, 0, 0, 0, 0, 0};
+        const uint8_t corruptPayload[2] = {0xDE, 0xAD};  // < 4B: fails readI32LE(topicId)
+        const rune::replication::Offset base = replica_->appendKeyed(
+            std::span<const uint8_t>(keyBuf, 6),
+            std::span<const uint8_t>(corruptPayload, 2),
+            /*acksAll=*/true);
+        ASSERT_GE(base, 0) << "Precondition: the corrupt record must land in the log";
+        replica_->onLeaderLogAppended();
+    }
+    tick(5);  // advance HW to cover the corrupt record
+
+    // 3. A further valid ALTER AFTER the corrupt record, on the LIVE
+    //    adminWorker_/registry_ (unaffected by the raw append above).
+    AlterTopicMsg alter1;
+    alter1.session         = 10;
+    alter1.corr            = 11;
+    alter1.topicName       = "characters";
+    alter1.expectedVersion = 0;
+    alter1.opsBlob         = altersOpsBlob({addOp("score", PrimType::Int64)});
+    driveAlter(alter1);
+    ASSERT_EQ(lastAlterError_, 0u) << "Precondition: ALTER after the corrupt record must "
+                                      "still succeed on the LIVE (uncorrupted) registry";
+    ASSERT_EQ(lastAlterVersion_, 2u);
+
+    tick(5);  // advance HW to cover v2
+
+    // 4. Boot-time replay of the WHOLE log from scratch (same logic as
+    //    BrokerNode::buildAdminWorker, post-fix) — must fail loud and abort.
+    SchemaRegistry bootReg;
+    const bool ok = rebuildSchemaRegistryFromLog(replica_.get(), bootReg);
+
+    EXPECT_FALSE(ok)
+        << "Regression: a corrupt/truncated __topic_schemas record on the BOOT "
+           "replay path must be LOUDLY detected (replay returns false), never "
+           "silently skipped";
+
+    const RegistryEntry* bv1 = bootReg.byIdVersion(topicId, 1);
+    ASSERT_NE(bv1, nullptr) << "v1 (committed BEFORE the corrupt record) must still "
+                                "be reconstructed";
+    EXPECT_EQ(bv1->version, 1u);
+
+    const RegistryEntry* bv2 = bootReg.byIdVersion(topicId, 2);
+    EXPECT_EQ(bv2, nullptr)
+        << "Regression: the v2 ALTER record AFTER the corrupt one must NOT be "
+           "silently applied — boot replay must ABORT at the corrupt record, "
            "never continue past it and paper over the version gap";
 }
 
