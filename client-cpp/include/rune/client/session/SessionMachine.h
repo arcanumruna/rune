@@ -18,6 +18,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <string>
@@ -181,15 +182,48 @@ struct SessionConfig {
 // onHandshakeBytes); `send`/`recv` are the two directional AeadCiphers derived
 // from the TLS exporter.  Exactly the variables THIS state needs (rule 3) — no
 // scattered booleans elsewhere in SessionMachine track crypto readiness.
+//
+// Per-sender egress (Task 20 / per-worker-egress-crypto-addendum): in shard
+// mode a session has MULTIPLE independent broker->client senders — the
+// gateway (senderId 0, `recv`/`recvSeq`/`recvWindow` below, UNCHANGED from
+// pre-Task-20) and each shard worker i (senderId i+1). Workers seal with a
+// key the client never receives over the wire; the client re-derives it
+// locally from the retained `b2cKey`/`b2cPrefix` via
+// rune::crypto::deriveSenderKey (same derivation the broker used), so `b2cKey`
+// (the raw b2c master key) and `b2cPrefix` must be retained here — they used
+// to be consumed directly into `recv` and discarded. `workerRecv[senderId-1]`
+// is a Rule-3 slot holding EXACTLY the three things a non-gateway sender's
+// receive stream needs — its own lazily-derived+cached AeadCipher and its own
+// INDEPENDENT replay window (recvSeq/recvWindow) — so a replay/forged seq on
+// one worker's stream can never affect the gateway's or another worker's.
+// Fixed-size array (senders are few: the gateway + up to kMaxShardWorkers
+// shard workers) — no heap, no map, zero per-frame allocation; a cipher is
+// constructed only once, on first sight of that senderId.
 // ---------------------------------------------------------------------------
 struct CryptoState {
     bool                  encrypted  = false;
     rune::crypto::Cipher  cipher{};
     uint16_t              epoch      = 0;
     uint64_t              sendSeq    = 0;
-    uint64_t              recvSeq    = 0;
-    uint64_t              recvWindow = 0;
-    std::optional<rune::crypto::AeadCipher> send, recv;
+    uint64_t              recvSeq    = 0;      // sender 0 (gateway) — UNCHANGED pre-Task-20 field
+    uint64_t              recvWindow = 0;      // sender 0 (gateway) — UNCHANGED pre-Task-20 field
+    std::optional<rune::crypto::AeadCipher> send, recv;  // recv == sender 0 (gateway)
+
+    // Retained raw b2c key + nonce prefix (Task 20): lets the client re-derive
+    // any worker's per-sender key locally, matching the broker's derivation.
+    // No key material ever crosses the wire. Only meaningful when `recv` is
+    // engaged (i.e. `encrypted`); populated alongside `recv` in finishHandshake_.
+    rune::crypto::AeadKey b2cKey{};
+    uint8_t               b2cPrefix[rune::crypto::kNoncePrefix] = {};
+
+    // One slot per non-gateway sender (senderId k >= 1, indexed k-1).
+    struct WorkerRecv {
+        std::optional<rune::crypto::AeadCipher> cipher;
+        uint64_t recvSeq    = 0;
+        uint64_t recvWindow = 0;
+    };
+    static constexpr uint8_t kMaxShardWorkers = 32;
+    std::array<WorkerRecv, kMaxShardWorkers> workerRecv{};
 };
 
 // ---------------------------------------------------------------------------
@@ -776,6 +810,11 @@ private:
         cryptoState_.cipher = keys.cipher;
         cryptoState_.send.emplace(keys.cipher, keys.c2b, keys.c2bPrefix);
         cryptoState_.recv.emplace(keys.cipher, keys.b2c, keys.b2cPrefix);
+        // Task 20: retain the raw b2c key + prefix so per-sender (shard worker)
+        // keys can be re-derived locally later, lazily, on first sight of each
+        // senderId — see CryptoState::workerRecv.
+        cryptoState_.b2cKey = keys.b2c;
+        std::memcpy(cryptoState_.b2cPrefix, keys.b2cPrefix, sizeof(cryptoState_.b2cPrefix));
         cryptoState_.encrypted = true;
         tls_.reset();  // handshake object no longer needed once keys are exported
         finishConnected_(nowNs);

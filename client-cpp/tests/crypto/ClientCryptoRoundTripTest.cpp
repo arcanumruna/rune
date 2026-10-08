@@ -388,6 +388,46 @@ std::vector<uint8_t> buildPlainProduceFrame(int64_t sessionId, int64_t correlati
     return buildPlainFrame(rune::protocol::client::TemplateId::Produce, sessionId, correlationId, body);
 }
 
+/// Task 20: seal a broker->client ("egress") frame AS a given `senderId`,
+/// using a caller-supplied cipher already bound to that sender's OWN b2c-
+/// derived key (sender 0 = the gateway's unchanged b2c cipher; sender k>=1 =
+/// a cipher built from rune::crypto::deriveSenderKey(b2c, k, ...)) and a
+/// caller-chosen `seq` (each sender owns its own independent seq stream per
+/// the per-worker-egress-crypto addendum — these tests model that directly
+/// rather than threading a second CryptoState::sendSeq per sender, which the
+/// client-side CryptoState this task adds has no reason to carry: only the
+/// RECEIVE side needs per-sender state on the client). Mirrors sealFrame's
+/// wire layout exactly, including writing `senderId` into the CryptoSubHeader
+/// (sealFrame's own default-constructed sub-header always leaves this field
+/// at 0 — the production gateway/sender-0 path).
+std::vector<uint8_t> sealAsSender(rune::crypto::AeadCipher& cipher, rune::crypto::Cipher cipherId,
+                                   uint8_t senderId, uint64_t seq,
+                                   int64_t sessionId, int64_t correlationId,
+                                   std::string_view body) {
+    namespace rpc = rune::protocol::client;
+    const auto plain = buildPlainProduceFrame(sessionId, correlationId, body);
+    const std::size_t bodyLen = plain.size() - rpc::MessageHeader::ENCODED_SIZE;
+
+    std::vector<uint8_t> out(rpc::kCryptoHeaderBytes + bodyLen + rune::crypto::kTagSize);
+    std::memcpy(out.data(), plain.data(), rpc::MessageHeader::ENCODED_SIZE);
+
+    rpc::CryptoSubHeader sub;
+    sub.version  = 1;
+    sub.cipher   = static_cast<uint8_t>(cipherId);
+    sub.epoch    = 0;
+    sub.senderId = senderId;
+    sub.seq      = seq;
+    sub.encode(out.data() + rpc::MessageHeader::ENCODED_SIZE);
+
+    const std::size_t n = cipher.seal(
+        seq, out.data(), rpc::kCryptoHeaderBytes,
+        plain.data() + rpc::MessageHeader::ENCODED_SIZE, bodyLen,
+        out.data() + rpc::kCryptoHeaderBytes);
+    EXPECT_GT(n, 0u) << "sealAsSender: AeadCipher::seal failed";
+    out.resize(rpc::kCryptoHeaderBytes + n);
+    return out;
+}
+
 /// Independently-exported "broker-side" CryptoState: `recv` is bound to the
 /// SAME c2b key/prefix the client's `send` (m.cryptoState().send) seals with —
 /// i.e. what the broker would use to open a client->broker frame.  `send`
@@ -632,4 +672,170 @@ TEST(ClientCryptoFrame, UnsealedControlFrameFailsToOpenOnEncryptedSession) {
     const std::size_t openedLen =
         cc::openEgressFrame(brokerSide, plain, plainLen, opened, sizeof opened);
     EXPECT_EQ(openedLen, 0u) << "an unsealed control frame must never be accepted on an encrypted session";
+}
+
+// ---------------------------------------------------------------------------
+// Task 20 — per-sender recv ciphers + replay windows: the CLIENT opens
+// broker->client ("egress") frames sealed by MULTIPLE independent senders
+// (gateway = senderId 0; shard worker i = senderId i+1), selecting the recv
+// cipher + replay window by the clear (AAD-authenticated) senderId, with NO
+// trial decrypt. These exercise `f.m.cryptoState()` directly — the client's
+// REAL CryptoState (populated by the real TLS handshake FrameFixture drives),
+// which now also retains `b2cKey`/`b2cPrefix` so it can re-derive each
+// sender's key itself, exactly like the broker does when it derives the SAME
+// keys independently via `srv.exportKeys` + `rune::crypto::deriveSenderKey`
+// below (never sent over the wire).
+// ---------------------------------------------------------------------------
+
+TEST(ClientCryptoPerSender, Sender0OpensExactlyAsTodayRegression) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    const auto keys = f.srv.exportKeys(f.m.cryptoState().cipher, FrameFixture::kSessionId);
+    ASSERT_NE(keys.cipher, rune::crypto::Cipher::None);
+    rune::crypto::AeadCipher gatewayCipher(keys.cipher, keys.b2c, keys.b2cPrefix);  // sender 0, UNCHANGED
+
+    const auto sealed = sealAsSender(gatewayCipher, keys.cipher, /*senderId=*/0, /*seq=*/1,
+                                      FrameFixture::kSessionId, /*correlationId=*/900, "gateway-frame");
+
+    uint8_t opened[256];
+    const std::size_t openedLen =
+        cc::openEgressFrame(f.m.cryptoState(), sealed.data(), sealed.size(), opened, sizeof opened);
+    ASSERT_GT(openedLen, 0u) << "sender 0 (gateway) must open exactly as before Task 20";
+
+    const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 900, "gateway-frame");
+    ASSERT_EQ(openedLen, plain.size());
+    EXPECT_EQ(0, std::memcmp(plain.data(), opened, plain.size()));
+
+    // Sender 0 must still be exactly CryptoState::recv/recvSeq/recvWindow —
+    // no worker slot touched.
+    EXPECT_EQ(f.m.cryptoState().recvSeq, 1u);
+    for (const auto& w : f.m.cryptoState().workerRecv) {
+        EXPECT_FALSE(w.cipher.has_value());
+    }
+}
+
+TEST(ClientCryptoPerSender, Sender1AndSender2OpenUnderTheirOwnDerivedKeysNotEachOthers) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    const auto keys = f.srv.exportKeys(f.m.cryptoState().cipher, FrameFixture::kSessionId);
+    ASSERT_NE(keys.cipher, rune::crypto::Cipher::None);
+
+    rune::crypto::AeadKey derived1{}, derived2{};
+    ASSERT_TRUE(rune::crypto::deriveSenderKey(keys.b2c, 1, derived1));
+    ASSERT_TRUE(rune::crypto::deriveSenderKey(keys.b2c, 2, derived2));
+    EXPECT_NE(0, std::memcmp(derived1.bytes, derived2.bytes, sizeof derived1.bytes))
+        << "distinct senders must get distinct keys";
+
+    rune::crypto::AeadCipher worker1Cipher(keys.cipher, derived1, keys.b2cPrefix);
+    rune::crypto::AeadCipher worker2Cipher(keys.cipher, derived2, keys.b2cPrefix);
+
+    const auto sealed1 = sealAsSender(worker1Cipher, keys.cipher, /*senderId=*/1, /*seq=*/1,
+                                       FrameFixture::kSessionId, 901, "worker-1-record");
+    const auto sealed2 = sealAsSender(worker2Cipher, keys.cipher, /*senderId=*/2, /*seq=*/1,
+                                       FrameFixture::kSessionId, 902, "worker-2-record");
+
+    uint8_t opened[256];
+
+    // Sender 1 opens under the client's lazily-derived sender-1 cipher.
+    const std::size_t len1 =
+        cc::openEgressFrame(f.m.cryptoState(), sealed1.data(), sealed1.size(), opened, sizeof opened);
+    const auto plain1 = buildPlainProduceFrame(FrameFixture::kSessionId, 901, "worker-1-record");
+    ASSERT_EQ(len1, plain1.size());
+    EXPECT_EQ(0, std::memcmp(plain1.data(), opened, plain1.size()));
+    ASSERT_TRUE(f.m.cryptoState().workerRecv[0].cipher.has_value())
+        << "sender 1's cipher must be cached on first sight (workerRecv[senderId-1])";
+
+    // Sender 2 opens under its OWN lazily-derived cipher — independent of sender 1.
+    const std::size_t len2 =
+        cc::openEgressFrame(f.m.cryptoState(), sealed2.data(), sealed2.size(), opened, sizeof opened);
+    const auto plain2 = buildPlainProduceFrame(FrameFixture::kSessionId, 902, "worker-2-record");
+    ASSERT_EQ(len2, plain2.size());
+    EXPECT_EQ(0, std::memcmp(plain2.data(), opened, plain2.size()));
+    ASSERT_TRUE(f.m.cryptoState().workerRecv[1].cipher.has_value());
+
+    // A sender-1-sealed frame must NOT open mislabelled as sender 2: re-seal
+    // the SAME plaintext/seq under sender 1's cipher but stamp the subheader
+    // with senderId=2 — the client selects sender 2's (different) key, so
+    // authentication (bound to the senderId-carrying AAD too) must fail.
+    const auto mislabelled = sealAsSender(worker1Cipher, keys.cipher, /*senderId=*/2, /*seq=*/2,
+                                           FrameFixture::kSessionId, 903, "mislabelled");
+    const std::size_t badLen =
+        cc::openEgressFrame(f.m.cryptoState(), mislabelled.data(), mislabelled.size(), opened, sizeof opened);
+    EXPECT_EQ(badLen, 0u) << "a sender-1 frame must not open as sender 2 (distinct keys, no trial decrypt)";
+}
+
+TEST(ClientCryptoPerSender, PerSenderReplayWindowsAreIndependent) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    const auto keys = f.srv.exportKeys(f.m.cryptoState().cipher, FrameFixture::kSessionId);
+    ASSERT_NE(keys.cipher, rune::crypto::Cipher::None);
+
+    rune::crypto::AeadKey derived1{}, derived2{};
+    ASSERT_TRUE(rune::crypto::deriveSenderKey(keys.b2c, 1, derived1));
+    ASSERT_TRUE(rune::crypto::deriveSenderKey(keys.b2c, 2, derived2));
+    rune::crypto::AeadCipher worker1Cipher(keys.cipher, derived1, keys.b2cPrefix);
+    rune::crypto::AeadCipher worker2Cipher(keys.cipher, derived2, keys.b2cPrefix);
+
+    const auto sealed1 = sealAsSender(worker1Cipher, keys.cipher, /*senderId=*/1, /*seq=*/1,
+                                       FrameFixture::kSessionId, 904, "seq-1-on-sender-1");
+    // SAME seq (1), on sender 2 — an independent stream, so this is NOT a replay.
+    const auto sealed2 = sealAsSender(worker2Cipher, keys.cipher, /*senderId=*/2, /*seq=*/1,
+                                       FrameFixture::kSessionId, 905, "seq-1-on-sender-2");
+
+    uint8_t opened[256];
+    const std::size_t first =
+        cc::openEgressFrame(f.m.cryptoState(), sealed1.data(), sealed1.size(), opened, sizeof opened);
+    ASSERT_GT(first, 0u);
+
+    // Replaying the EXACT SAME sender-1 frame must be dropped (sender 1's window).
+    const std::size_t replayed =
+        cc::openEgressFrame(f.m.cryptoState(), sealed1.data(), sealed1.size(), opened, sizeof opened);
+    EXPECT_EQ(replayed, 0u) << "a replay on sender 1's stream must be dropped";
+
+    // But the SAME seq (1) delivered on sender 2's INDEPENDENT window must
+    // still be accepted — sender 2 has never seen seq 1 before.
+    const std::size_t secondSenderFirstDelivery =
+        cc::openEgressFrame(f.m.cryptoState(), sealed2.data(), sealed2.size(), opened, sizeof opened);
+    EXPECT_GT(secondSenderFirstDelivery, 0u)
+        << "sender 2's replay window must be independent of sender 1's";
+}
+
+TEST(ClientCryptoPerSender, ForgedOrOutOfRangeSenderIdIsDroppedFailClosed) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    const auto keys = f.srv.exportKeys(f.m.cryptoState().cipher, FrameFixture::kSessionId);
+    ASSERT_NE(keys.cipher, rune::crypto::Cipher::None);
+    rune::crypto::AeadCipher someCipher(keys.cipher, keys.b2c, keys.b2cPrefix);
+
+    // senderId 250 is far beyond CryptoState::kMaxShardWorkers (32) -> the
+    // client cannot/will-not derive a key for it. Fail closed: drop, no trial
+    // decrypt against any OTHER sender's cipher.
+    const auto forged = sealAsSender(someCipher, keys.cipher, /*senderId=*/250, /*seq=*/1,
+                                      FrameFixture::kSessionId, 906, "forged-sender");
+
+    uint8_t opened[256];
+    const std::size_t openedLen =
+        cc::openEgressFrame(f.m.cryptoState(), forged.data(), forged.size(), opened, sizeof opened);
+    EXPECT_EQ(openedLen, 0u) << "an out-of-range/unknown senderId must be dropped, fail-closed";
+
+    // Also: a frame claiming a VALID senderId (1) but sealed under a totally
+    // unrelated (non-derived) key must fail auth once the client selects
+    // sender 1's real derived cipher -- no trial decrypt lets it slip through
+    // under some other key.
+    rune::crypto::AeadKey randomKey{};
+    for (std::size_t i = 0; i < sizeof randomKey.bytes; ++i) randomKey.bytes[i] = static_cast<uint8_t>(i * 7 + 1);
+    rune::crypto::AeadCipher wrongKeyCipher(keys.cipher, randomKey, keys.b2cPrefix);
+    const auto wrongKeyFrame = sealAsSender(wrongKeyCipher, keys.cipher, /*senderId=*/1, /*seq=*/1,
+                                             FrameFixture::kSessionId, 907, "wrong-key-sender-1");
+    const std::size_t wrongKeyOpenedLen =
+        cc::openEgressFrame(f.m.cryptoState(), wrongKeyFrame.data(), wrongKeyFrame.size(), opened, sizeof opened);
+    EXPECT_EQ(wrongKeyOpenedLen, 0u) << "wrong key under a valid senderId must fail auth, not succeed";
 }

@@ -72,6 +72,51 @@ inline void replayWindowCommit(uint64_t& recvSeq, uint64_t& recvWindow,
     }
 }
 
+/// Task 20 (per-sender broker->client recv): the {cipher, recvSeq, recvWindow}
+/// triple openEgressFrame runs check->open->commit against for one senderId.
+/// Non-owning — points INTO session::CryptoState (sender 0's existing fields,
+/// or a workerRecv[] slot); `cipher == nullptr` means "fail closed, drop" (an
+/// unencrypted session, an out-of-range senderId, or a key that failed to
+/// derive). No field is ever swapped at the call site on a failed open — this
+/// is purely cipher/window SELECTION, never a fallback/trial decrypt.
+struct RecvSlot {
+    rune::crypto::AeadCipher* cipher     = nullptr;
+    uint64_t*                 recvSeq    = nullptr;
+    uint64_t*                 recvWindow = nullptr;
+};
+
+/// Select (and, for a non-gateway sender, lazily derive+cache) the recv slot
+/// for `senderId`. senderId 0 is the gateway — returns EXACTLY
+/// crypto.recv/recvSeq/recvWindow, the pre-Task-20 fields, untouched: byte-
+/// identical selection cost (one branch, no derivation, no cache lookup actually
+/// IS a cache hit — it's the same fields openEgressFrame always used).
+/// senderId k>=1 indexes crypto.workerRecv[k-1] (fixed-size, kMaxShardWorkers
+/// wide): on first sight of that senderId, derives its key via
+/// rune::crypto::deriveSenderKey(crypto.b2cKey, senderId, ...) and constructs
+/// its AeadCipher ONCE (cold path); every subsequent frame from that sender
+/// is an array-index cache hit — zero per-frame allocation. Fails closed
+/// (returns a null RecvSlot) if the session isn't encrypted, senderId is out
+/// of range, or derivation fails — the caller must drop rather than ever try
+/// another sender's cipher.
+[[nodiscard]] inline RecvSlot selectRecvSlot(session::CryptoState& crypto,
+                                              uint8_t senderId) noexcept {
+    if (!crypto.recv.has_value()) return {};  // not an encrypted session — fail closed
+    if (senderId == 0) {
+        return RecvSlot{&*crypto.recv, &crypto.recvSeq, &crypto.recvWindow};
+    }
+    const std::size_t idx = static_cast<std::size_t>(senderId) - 1;
+    if (idx >= session::CryptoState::kMaxShardWorkers) return {};  // out of range — fail closed
+    auto& slot = crypto.workerRecv[idx];
+    if (!slot.cipher.has_value()) {
+        rune::crypto::AeadKey derived{};
+        if (!rune::crypto::deriveSenderKey(crypto.b2cKey, senderId, derived)) {
+            return {};  // underivable — fail closed, no cipher cached
+        }
+        slot.cipher.emplace(crypto.cipher, derived, crypto.b2cPrefix);
+    }
+    return RecvSlot{&*slot.cipher, &slot.recvSeq, &slot.recvWindow};
+}
+
 }  // namespace detail_crypto
 
 /// Seal an outbound client→broker frame.  NOT produce-specific — `plain` is a
@@ -130,34 +175,50 @@ inline void replayWindowCommit(uint64_t& recvSeq, uint64_t& recvWindow,
 /// auth failure (tampered ciphertext OR tampered header — the header is part
 /// of the AAD).  The window is committed ONLY after the tag verifies, so a
 /// forged seq can never poison it against a later legitimate frame.
+/// Task 20: `wire`'s CryptoSubHeader.senderId (clear, authenticated-via-AAD)
+/// selects WHICH sender's {cipher, recvSeq, recvWindow} this frame is opened
+/// against — senderId 0 is the gateway (byte-identical to pre-Task-20: the
+/// same crypto.recv/recvSeq/recvWindow fields, same checks, same order), and
+/// senderId k>=1 is shard worker k-1's independently-keyed, independently-
+/// windowed stream (see detail_crypto::selectRecvSlot). Exactly ONE open()
+/// call is ever made, against the selected sender's cipher — an unknown or
+/// underivable senderId drops the frame (fail closed); there is no second/
+/// trial decrypt against any other sender's key.
 [[nodiscard]] inline std::size_t openEgressFrame(
     session::CryptoState& crypto,
     const uint8_t* wire, std::size_t wireLen,
     uint8_t* scratch, std::size_t scratchCap) noexcept {
     namespace rpc = rune::protocol::client;
     constexpr std::size_t kMinWire = rpc::kCryptoHeaderBytes + rune::crypto::kTagSize;
-    if (wireLen < kMinWire || !crypto.recv.has_value()) return 0;
+    if (wireLen < kMinWire) return 0;
 
     const auto subOpt = rpc::CryptoSubHeader::decode(
         wire + rpc::MessageHeader::ENCODED_SIZE,
         wireLen - rpc::MessageHeader::ENCODED_SIZE);
     if (!subOpt) return 0;
-    const uint64_t seq = subOpt->seq;
+    const uint64_t seq      = subOpt->seq;
+    const uint8_t  senderId = subOpt->senderId;
 
-    if (!detail_crypto::replayWindowCheck(crypto.recvSeq, crypto.recvWindow, seq)) return 0;
+    // One array-index selection on a byte already parsed (senderId 0 is a
+    // direct reference to the pre-Task-20 fields; k>=1 is, after the cold
+    // first-sight derivation, an O(1) cache hit) — no trial decrypt.
+    const detail_crypto::RecvSlot slot = detail_crypto::selectRecvSlot(crypto, senderId);
+    if (slot.cipher == nullptr) return 0;  // unknown/underivable sender — fail closed
+
+    if (!detail_crypto::replayWindowCheck(*slot.recvSeq, *slot.recvWindow, seq)) return 0;
 
     const std::size_t ctLen    = wireLen - rpc::kCryptoHeaderBytes;
     const std::size_t plainCap = ctLen - rune::crypto::kTagSize;
     const std::size_t outLen   = rpc::MessageHeader::ENCODED_SIZE + plainCap;
     if (scratchCap < outLen) return 0;
 
-    const long plainLen = crypto.recv->open(
+    const long plainLen = slot.cipher->open(
         seq, wire, rpc::kCryptoHeaderBytes,
         wire + rpc::kCryptoHeaderBytes, ctLen,
         scratch + rpc::MessageHeader::ENCODED_SIZE);
     if (plainLen < 0) return 0;  // auth failure — discard; window NOT updated
 
-    detail_crypto::replayWindowCommit(crypto.recvSeq, crypto.recvWindow, seq);
+    detail_crypto::replayWindowCommit(*slot.recvSeq, *slot.recvWindow, seq);
 
     std::memcpy(scratch, wire, rpc::MessageHeader::ENCODED_SIZE);  // clear header, unchanged
     return rpc::MessageHeader::ENCODED_SIZE + static_cast<std::size_t>(plainLen);
