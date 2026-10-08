@@ -733,3 +733,81 @@ TEST(GatewayProduceCreditRegression, CapDeferredProduceIsNotReDecodedOnRedeliver
     EXPECT_EQ(r.gw.controlledPollFramesForTest(more), 1u);
     EXPECT_EQ(r.gw.capDeferMemoAbortsForTest(), 10u);
 }
+
+// D8c re-review LOW-R5 (lows batch C): the per-worker routed counters with TWO workers — produces forwarded to both
+// are counted on their owning worker; a Credit naming worker 1 returns only worker 1's share (and only the session's
+// share there — a Credit beyond it is clamped and counted, never taken from worker 0); a close returns the session's
+// share on EVERY worker at once.
+TEST(GatewayProduceCreditRegression, CreditsAndCloseAreAttributedPerWorkerWithTwoWorkersRegression) {
+    TmpDir d{"log2w"};
+    constexpr int32_t kParts = 8;
+    rune::gateway::TopicRegistry topics{{rune::node::TopicSpec{"t", kParts}}, d.path.string()};
+    NullTransport t;
+    ReplicaRegistry reg;
+    rune::metadata::ShardRouter router(2);
+    int32_t pOn[2] = {-1, -1};                                       // one partition owned by each worker
+    for (int32_t p = 0; p < kParts; ++p) {
+        PartitionConfig c = cfg();
+        c.partitionId = p;
+        reg.add(0, p, std::make_unique<PartitionReplica>(c, Role::Leader, 1, std::vector<NodeId>{1},
+                                                         std::vector<NodeId>{1}, topics.log(0, p), &t));
+        const int32_t w = router.workerForPartition(0, p);
+        if (pOn[w] < 0) pOn[w] = p;
+    }
+    ASSERT_GE(pOn[0], 0);
+    ASSERT_GE(pOn[1], 0);
+    WorkerPool pool{2, router, 32u << 20, 32u << 20, 16, 16};
+    pool.assignFromRegistry(reg);
+    pool.setRegistry(&reg);
+    pool.setRunnersStartedForTest(true);
+    auto gw = rune::gateway::ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; });
+    gw.setTopicRegistry(&topics);
+    gw.setReplicaRegistry(&reg);
+    gw.setWorkerPool(&pool);
+    gw.setPerWorkerIngressActive(true);
+    gw.setCommittedMetadataReady(true);
+    gw.setShardMode(true);
+    ASSERT_EQ(pool.ownerWorkerId(0, pOn[0]), 0);
+    ASSERT_EQ(pool.ownerWorkerId(0, pOn[1]), 1);
+    auto frame = [](int64_t sid, int64_t corr, int32_t partition) {
+        auto f = produceFrame(sid, corr, 0);
+        pc::Produce m = *pc::Produce::decode(f.data(), f.size());
+        m.partition = partition;
+        std::vector<uint8_t> out(m.encodedSize());
+        m.encode(out.data());
+        return out;
+    };
+    auto credit = [](int64_t sid, int32_t worker, int64_t n) {
+        auto r = creditSignal(sid, n);
+        r.partition = worker;
+        return r;
+    };
+    const int64_t a = gw.injectTestSession(0), b = gw.injectTestSession(0);
+    std::vector<std::vector<uint8_t>> fa, fb;
+    for (int i = 0; i < 5; ++i) fa.push_back(frame(a, i, pOn[0]));
+    for (int i = 0; i < 3; ++i) fa.push_back(frame(a, 10 + i, pOn[1]));
+    for (int i = 0; i < 2; ++i) fb.push_back(frame(b, i, pOn[1]));
+    ASSERT_EQ(gw.controlledPollFramesForTest(fa), 8u);
+    ASSERT_EQ(gw.controlledPollFramesForTest(fb), 2u);
+    EXPECT_EQ(gw.routedInFlightForTest(0), 5u) << "a's produces to worker 0";
+    EXPECT_EQ(gw.routedInFlightForTest(1), 5u) << "a's 3 + b's 2 to worker 1";
+    gw.handleWorkerReturnForTest(credit(a, 1, 2));                    // worker 1 claimed 2 of a's acks
+    EXPECT_EQ(gw.routedInFlightForTest(0), 5u) << "worker 0's share untouched";
+    EXPECT_EQ(gw.routedInFlightForTest(1), 3u);
+    EXPECT_EQ(gw.produceInFlightForTest(a), 6);
+    gw.handleWorkerReturnForTest(credit(a, 1, 4));                    // beyond a's share on worker 1 (1 left)
+    EXPECT_EQ(gw.produceCreditUnderflowsForTest(), 1u) << "clamped and counted";
+    EXPECT_EQ(gw.routedInFlightForTest(0), 5u) << "never taken from another worker";
+    EXPECT_EQ(gw.routedInFlightForTest(1), 2u) << "only a's last one there: b's 2 remain";
+    EXPECT_EQ(gw.produceInFlightForTest(a), 5);
+    pc::Disconnect dc; dc.sessionId = a; dc.correlationId = 1;
+    std::vector<uint8_t> buf(pc::Disconnect::ENCODED_SIZE);
+    dc.encode(buf.data());
+    gw.applyDisconnectForTest(buf.data(), buf.size());
+    EXPECT_EQ(gw.routedInFlightForTest(0), 0u) << "the close returned a's share on worker 0 ...";
+    EXPECT_EQ(gw.routedInFlightForTest(1), 2u) << "... and on worker 1, leaving b's";
+    gw.handleWorkerReturnForTest(credit(b, 1, 2));
+    EXPECT_EQ(gw.routedInFlightForTest(1), 0u);
+    EXPECT_EQ(gw.produceInFlightForTest(b), 0);
+    EXPECT_EQ(gw.produceCreditUnderflowsForTest(), 1u);
+}
