@@ -10,7 +10,8 @@ add_library(rune_codec_dep STATIC
     ${RUNE_CODEC_ROOT}/src/Serialize.cpp
     ${RUNE_CODEC_ROOT}/src/Record.cpp
     ${RUNE_CODEC_ROOT}/src/Validator.cpp
-    ${RUNE_CODEC_ROOT}/src/Generator.cpp)
+    ${RUNE_CODEC_ROOT}/src/Generator.cpp
+    ${RUNE_CODEC_ROOT}/src/AlterOps.cpp)
 target_include_directories(rune_codec_dep PUBLIC ${RUNE_CODEC_ROOT}/include)
 
 # ── rune_ql library ──────────────────────────────────────────────────────────
