@@ -152,3 +152,55 @@ TEST(LeaderEpochStateRegression, FreshFileIsPresizedAndSparseRegression) {
     EXPECT_EQ(rd.fence, 2);
     std::filesystem::remove_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// D23 (D21 review L4): the pre-sized file is sparse, so the worker's first
+// write of slot 1 (pwrite + fdatasync through the io backend) had to ALLOCATE
+// blocks — ENOSPC on a full disk, where the pre-sparse file's overwrite could
+// not fail.  create() must leave the reachable head of BOTH slots allocated
+// (written), so an in-place slot write lands on allocated blocks only.  A
+// large stride makes the file sparse on every filesystem (APFS allocates
+// small extended files in full, ext4 / xfs never do).
+// ---------------------------------------------------------------------------
+#include <fcntl.h>
+
+namespace {
+/// True iff [off, off + 1) is backed by data (not a hole).
+bool isDataAt(int fd, off_t off) {
+    const off_t d = ::lseek(fd, off, SEEK_DATA);
+    return d == off;
+}
+} // namespace
+
+TEST(LeaderEpochStateRegression, CreateAllocatesTheHeadOfBothSlotsRegression) {
+    using ES = rune::storage::LeaderEpochState;
+    const auto dir = std::filesystem::temp_directory_path() / ("rune_les_reserve_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    const std::size_t stride = std::size_t{32} << 20;   // a 64 MiB file: sparse everywhere
+    const std::vector<std::pair<int32_t, int64_t>> e{{1, 0}, {2, 100}};
+    const int fd = ES::create(dir.string(), stride, 1, 2, e.begin(), e.end());
+    ASSERT_GE(fd, 0);
+    const std::size_t reserved = ES::reserveFor(e.size(), stride);
+    EXPECT_GE(reserved, ES::imageBytes(2 * e.size() + 2)) << "room to grow in place";
+    EXPECT_EQ(reserved % 4096, 0u);
+    for (int slot = 0; slot < 2; ++slot)
+        for (std::size_t b = 0; b < reserved; b += 4096)
+            EXPECT_TRUE(isDataAt(fd, static_cast<off_t>(slot * stride + b)))
+                << "slot " << slot << " block at +" << b << " is a hole (the worker's write would allocate)";
+    ::close(fd);
+    const auto rd = ES::read(dir.string());
+    EXPECT_EQ(rd.state, ES::FileState::Valid);
+    EXPECT_EQ(rd.entries, e);
+    std::filesystem::remove_all(dir);
+}
+
+// A slot image never outgrows the reserved head in place: reserveFor() bounds
+// it below the stride, and the reservation covers at least one block.
+TEST(LeaderEpochState, ReserveIsBlockAlignedAndWithinTheStride) {
+    using ES = rune::storage::LeaderEpochState;
+    const std::size_t stride = ES::strideFor(ES::kMinEntries);
+    EXPECT_EQ(ES::reserveFor(0, stride), 4096u);
+    EXPECT_GE(ES::reserveFor(1000, stride), ES::imageBytes(2002));
+    EXPECT_EQ(ES::reserveFor(100000, stride), stride) << "never past the slot";
+}

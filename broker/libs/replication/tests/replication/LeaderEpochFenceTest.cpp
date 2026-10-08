@@ -200,3 +200,45 @@ TEST(LeaderEpochFenceRegression, MemoryFenceWrittenByTheAsyncEpochStateWriterReg
     EXPECT_NE(r->role(), Role::Leader) << "re-led epoch 5 after a restart";
     EXPECT_TRUE(r->staleLeadershipPendingForTest());
 }
+
+// D23 (D21 review L4): a leader-epoch-state file left SPARSE by an earlier
+// build (slot 1 a hole) is reserved when the replica enables it (cold,
+// construction) — the worker's first in-place write of slot 1 must never
+// allocate a block (ENOSPC on a full disk).  64 MiB: sparse on every fs.
+#include <rune/storage/LeaderEpochState.h>
+TEST(LeaderEpochFenceRegression, SparseEpochStateFileIsReservedOnEnableRegression) {
+    using ES = rune::storage::LeaderEpochState;
+    Dir d;
+    const fs::path logDir = d.path / "log";
+    fs::create_directories(logDir);
+    const std::size_t stride = std::size_t{32} << 20;
+    {   // the pre-D23 layout: size set, slot 0's image only
+        const std::vector<std::pair<int32_t, int64_t>> e;   // matches the empty log: no write at enable
+        std::vector<uint8_t> img(ES::imageBytes(e.size()));
+        const std::size_t len = ES::encode(img.data(), 1, 1, e.begin(), e.end());
+        const int fd = ::open(ES::path(logDir.string()).c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        ASSERT_GE(fd, 0);
+        ASSERT_EQ(::ftruncate(fd, static_cast<off_t>(2 * stride)), 0);
+        ASSERT_EQ(::pwrite(fd, img.data(), len, 0), static_cast<ssize_t>(len));
+        ASSERT_EQ(::lseek(fd, static_cast<off_t>(stride), SEEK_HOLE), static_cast<off_t>(stride))
+            << "precondition: slot 1 is a hole";
+        ::close(fd);
+    }
+    rune::storage::Log log(logDir.string());
+    log.recover();
+    CapturingTransport t;
+    auto r = std::make_unique<PartitionReplica>(cfg(), Role::Follower, 0, kAll, kAll, &log, &t);
+    r->setIsrChannel(&t);
+    ASSERT_TRUE(r->epochStateEnabledForTest());
+    ASSERT_EQ(r->epochStateInlineWritesForTest(), 0u) << "precondition: enable wrote no slot";
+    const int fd = ::open(ES::path(logDir.string()).c_str(), O_RDONLY);
+    ASSERT_GE(fd, 0);
+    const off_t hole = ::lseek(fd, static_cast<off_t>(stride), SEEK_HOLE);
+    ::close(fd);
+    EXPECT_GE(hole, static_cast<off_t>(stride + 4096)) << "slot 1's head is still a hole after enable";
+    EXPECT_GE(r->epochStateReservedForTest(), 4096u);
+    // The in-place write that follows fits the reserved head (no re-create).
+    const uint64_t recreates = r->epochStateRecreatesForTest();
+    EXPECT_TRUE(r->writeEpochStateInlineForTest());
+    EXPECT_EQ(r->epochStateRecreatesForTest(), recreates);
+}
