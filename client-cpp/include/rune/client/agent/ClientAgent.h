@@ -896,6 +896,17 @@ private:
                                const uint8_t* buf, std::size_t len,
                                transport::FrameCrc crc) noexcept;
 
+    // ---- client<->broker TLS/AEAD (Task 6b): seal every OTHER non-handshake --
+    // client->broker send site under its DESTINATION session's CryptoState.
+    // Shared by offerControlTo / offerIngress_ / offerOnSession (every
+    // non-Produce publication write) — offerProduceToLeader_ already seals on
+    // its own (via sealForOffer) and does not call this.  No-op (buf/len
+    // unchanged) when `crypto.encrypted` is false — byte-identical plaintext
+    // path.  Reseats buf/len to the transport's reusable seal scratch on
+    // success; returns false (DROP, never transmit) on seal failure.
+    [[nodiscard]] bool sealForDestination_(session::CryptoState& crypto,
+                                           const uint8_t*& buf, std::size_t& len) noexcept;
+
     // ---- Ring buffer (MPSC: many app threads write, one agent thread reads) -
     // Buffer size = power-of-two capacity + trailer.
     // Stored as aligned raw bytes; AtomicBuffer wraps it.

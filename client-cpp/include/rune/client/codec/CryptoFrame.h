@@ -1,14 +1,17 @@
 // include/rune/client/codec/CryptoFrame.h
 //
-// client<->broker TLS/AEAD (Task 6) — data-plane AEAD envelope seal/open.
+// client<->broker TLS/AEAD (Task 6 / 6b) — data-plane AEAD envelope seal/open.
 //
-// Pure wire-level helpers that seal an outbound Produce frame / open an
+// Pure wire-level helpers that seal an outbound client->broker frame / open an
 // inbound egress frame using a session's CryptoState (Task 5's
 // rune::client::session::CryptoState).  No Aeron dependency — the only inputs
 // are plain buffers and a CryptoState reference, so this header is
 // unit-testable standalone (native, no aeron, a real rune::crypto::AeadCipher
-// + OpenSSL).  ClientAgent::offerProduceToLeader_ / dispatchEgressFrame are
-// thin callers of these two functions.
+// + OpenSSL).  sealFrame is generic — it seals ANY [24B header][body] frame,
+// not just Produce (Task 6b: Keepalive/Disconnect/Subscribe/... reuse it too).
+// ClientAgent::offerProduceToLeader_ / offerControlTo / offerIngress_ /
+// offerOnSession / dispatchEgressFrame are thin callers of these two
+// functions.
 //
 // Wire layout for an encrypted client<->broker frame (see
 // rune/protocol/client/CryptoEnvelope.h):
@@ -71,10 +74,13 @@ inline void replayWindowCommit(uint64_t& recvSeq, uint64_t& recvWindow,
 
 }  // namespace detail_crypto
 
-/// Seal an outbound produce frame.  `plain` is [24B MessageHeader][body] —
-/// the sessionId must already be patched in-place (offerProduceToLeader_ does
-/// this BEFORE calling here, so the patched header is part of the AAD);
-/// `plainLen` >= MessageHeader::ENCODED_SIZE.  Writes
+/// Seal an outbound client→broker frame.  NOT produce-specific — `plain` is a
+/// generic [24B MessageHeader][body] for ANY non-handshake template (Produce,
+/// Keepalive/Ping, Disconnect, Subscribe, Unsubscribe, Metadata, group/txn,
+/// ...): the sessionId must already be patched in-place (every caller patches
+/// — or already carries — the destination session's sessionId BEFORE calling
+/// here, so the final header is part of the AAD); `plainLen` >=
+/// MessageHeader::ENCODED_SIZE.  Writes
 /// [24B header][12B CryptoSubHeader][sealed body][16B tag] into `scratch`
 /// (caller-owned, reused across calls — needs plainLen +
 /// rune::protocol::client::kCryptoOverhead bytes of capacity).
@@ -82,7 +88,7 @@ inline void replayWindowCommit(uint64_t& recvSeq, uint64_t& recvWindow,
 /// bad input / seal failure — the caller MUST NOT transmit on 0 (AeadCipher's
 /// own contract: a cipher error must never be mistaken for success, which
 /// would risk nonce/keystream reuse under the same key).
-[[nodiscard]] inline std::size_t sealProduceFrame(
+[[nodiscard]] inline std::size_t sealFrame(
     session::CryptoState& crypto,
     const uint8_t* plain, std::size_t plainLen,
     uint8_t* scratch, std::size_t scratchCap) noexcept {

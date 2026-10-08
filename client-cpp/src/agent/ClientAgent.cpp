@@ -473,6 +473,17 @@ transport::AeronTransport::OfferResult ClientAgent::offerIngress_(const uint8_t*
         --testForcedOffers_;
         return testForcedOffer_;
     }
+    // client<->broker TLS/AEAD (Task 6b): this is the DEFAULT ingress path
+    // (ring-drained kMsgSend frames, and every offerDefault() caller) — it
+    // always targets the seed/bootstrap session, so seal under ITS
+    // CryptoState.  Plaintext path (crypto off) is byte-identical to before
+    // Task 6b.  Seal failure returns Retry (not Fatal): the frame was never
+    // transmitted, and the caller's own retry (ring record stays at head /
+    // Client's unsent-frame park) re-offers the ORIGINAL plaintext buf next
+    // cycle — a fresh seal attempt, not a replay of a stale ciphertext.
+    if (!sealForDestination_(seedSession().machine.cryptoState(), buf, len)) {
+        return transport::AeronTransport::OfferResult::Retry;  // seal failed — DROP, do not transmit
+    }
     return transport_.offerResult(buf, len);
 }
 
@@ -1022,6 +1033,20 @@ bool ClientAgent::retargetSeedToLastKnownLeader_() noexcept {
 bool ClientAgent::offerControlTo(const std::string& channel,
                                  const uint8_t* buf, std::size_t len) noexcept {
     if (failed_) [[unlikely]] return false;  // T15b: a failed client does no I/O
+    // client<->broker TLS/AEAD (Task 6b): seal under the DESTINATION session's
+    // CryptoState.  sessionForEndpoint(channel) resolves the SAME session
+    // whose own SessionEndpointIo::sendFrame is calling here (a session never
+    // calls offerControlTo with an endpoint other than its own), so this never
+    // lazily opens a new session as a side effect.  Covers every session-
+    // machine-originated control frame (ConnectRequest, HandshakeContinue,
+    // Keepalive/Ping, Disconnect) on EVERY session (seed and leader).
+    // ConnectRequest/HandshakeContinue are naturally plaintext here (sent
+    // while encrypted==false) and are defensively exempt by templateId too
+    // (see sealForDestination_).  Plaintext path (crypto off) is byte-
+    // identical to before Task 6b.
+    if (!sealForDestination_(sessionForEndpoint(channel).machine.cryptoState(), buf, len)) {
+        return false;  // seal failed — DROP, do not transmit
+    }
     // Seed endpoint == transport default ingress channel → byte-identical default
     // offer (single-node fast path).  Otherwise route the control frame to the
     // session's own endpoint over the shared transport (default ingress stream id).
@@ -1202,8 +1227,17 @@ int64_t ClientAgent::connectedSessionId(uint32_t index) const noexcept {
 transport::AeronTransport::OfferResult ClientAgent::offerOnSession(uint32_t index, const uint8_t* buf,
                                                                   std::size_t len) noexcept {
     using R = transport::AeronTransport::OfferResult;
-    if (index == 0) return offerDefault(buf, len);  // the seed: its (possibly retargeted) default pub
+    if (index == 0) return offerDefault(buf, len);  // the seed: offerDefault->offerIngress_ already seals
     if (failed_ || index >= sessions_.size()) [[unlikely]] return R::Fatal;
+    // client<->broker TLS/AEAD (Task 6b): seal under session `index`'s OWN
+    // CryptoState — its sessionId is already final in `buf` (every caller,
+    // e.g. GroupConsumerHub's fetch routing, stamps it from
+    // router_.sessionId(target) before encoding, same as offerControlTo's
+    // callers).  Plaintext path (crypto off) is byte-identical to before.
+    if (!sealForDestination_(sessions_[index]->machine.cryptoState(), buf, len)) {
+        ++ingressOfferRefused_;
+        return R::Retry;  // seal failed — DROP, do not transmit
+    }
     if (transport_.offerTo(sessions_[index]->endpoint, cfg_.transport.ingressStreamId, buf, len)) return R::Accepted;
     ++ingressOfferRefused_;
     return R::Retry;
@@ -1228,22 +1262,56 @@ std::string ClientAgent::dataChannelFor(int32_t topicId, int32_t partition) cons
 }
 
 namespace {
-/// client<->broker TLS/AEAD (Task 6): seal `buf`/`len` under `crypto` into
-/// `transport`'s reusable seal scratch (AeronTransport::sealScratch — single-
-/// writer, grows-only, no per-call heap allocation once warmed up).  Returns
-/// {nullptr/scratch, 0} on failure (scratch exhausted, or AeadCipher::seal's
-/// own 0 = "cipher error, do not transmit" contract) — callers must treat a
-/// 0 length as DROP, never transmit.  Callers check `crypto.encrypted` first;
-/// this only runs the seal+scratch mechanics for the encrypted path.
+/// client<->broker TLS/AEAD (Task 6 / 6b): seal `buf`/`len` under `crypto`
+/// into `transport`'s reusable seal scratch (AeronTransport::sealScratch —
+/// single-writer, grows-only, no per-call heap allocation once warmed up).
+/// Shared by EVERY non-handshake client->broker send site (offerProduceToLeader_,
+/// offerControlTo, offerIngress_, offerOnSession) — all run on the single
+/// agent/duty thread and each consumes the scratch synchronously (seal, then
+/// immediately offer) before the next one runs, so one scratch buffer is safe
+/// (no re-entrancy).  Returns {nullptr/scratch, 0} on failure (scratch
+/// exhausted, or AeadCipher::seal's own 0 = "cipher error, do not transmit"
+/// contract) — callers must treat a 0 length as DROP, never transmit.
+/// Callers check `crypto.encrypted` first; this only runs the seal+scratch
+/// mechanics for the encrypted path.
 struct SealedFrame { uint8_t* buf; std::size_t len; };
 SealedFrame sealForOffer(transport::AeronTransport& transport, session::CryptoState& crypto,
                          const uint8_t* buf, std::size_t len) noexcept {
     const std::size_t need = len + rune::protocol::client::kCryptoOverhead;
     uint8_t* scratch = transport.sealScratch(need);
     if (scratch == nullptr) return {nullptr, 0};
-    return {scratch, codec::sealProduceFrame(crypto, buf, len, scratch, need)};
+    return {scratch, codec::sealFrame(crypto, buf, len, scratch, need)};
 }
 } // namespace
+
+/// client<->broker TLS/AEAD (Task 6b): the single seal-or-passthrough decision
+/// shared by every NON-Produce client->broker send site (offerControlTo,
+/// offerIngress_, offerOnSession — offerProduceToLeader_ already seals
+/// directly via sealForOffer and is NOT routed through here, to avoid a
+/// double seal).  Plaintext path (`!crypto.encrypted`) leaves buf/len
+/// untouched — byte-identical to pre-Task-6b behaviour.  When encrypted,
+/// defensively exempts Connect(1)/HandshakeContinue(10) by templateId (belt-
+/// and-suspenders: both are only ever sent while this session's
+/// crypto.encrypted is still false, since the handshake itself is what flips
+/// it to true — see finishHandshake_ in SessionMachine.h), then seals via the
+/// shared sealForOffer/sealScratch mechanics.  Returns false iff the frame
+/// must be DROPPED (seal failure) — callers must not transmit in that case.
+bool ClientAgent::sealForDestination_(session::CryptoState& crypto,
+                                      const uint8_t*& buf, std::size_t& len) noexcept {
+    if (!crypto.encrypted) return true;  // plaintext session: nothing to do
+    if (len >= rune::protocol::client::MessageHeader::ENCODED_SIZE) {
+        const auto tid = static_cast<codec::TemplateId>(
+            rune::protocol::client::detail::getLE16(buf, 2));
+        if (tid == codec::TemplateId::Connect || tid == codec::TemplateId::HandshakeContinue) {
+            return true;  // handshake frame: never sealed, defensively
+        }
+    }
+    const SealedFrame sealed = sealForOffer(transport_, crypto, buf, len);
+    if (sealed.len == 0) return false;  // seal failed — DROP, do not transmit
+    buf = sealed.buf;
+    len = sealed.len;
+    return true;
+}
 
 bool ClientAgent::offerProduceToLeader_(int32_t topicId, int32_t partition,
                                         int32_t ingressStreamId,

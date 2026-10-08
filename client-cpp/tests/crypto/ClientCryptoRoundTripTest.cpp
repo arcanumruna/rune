@@ -10,11 +10,17 @@
 // without reaching into SessionMachine's private TlsSession).
 //
 // Data-plane half (Task 6, ClientCryptoFrame* below): exercises
-// rune::client::codec::sealProduceFrame / openEgressFrame — the pure,
-// Aeron-free envelope seal/open ClientAgent::offerProduceToLeader_ /
-// dispatchEgressFrame call — standalone, with a real AeadCipher derived the
-// same way (TLS exporter + makeServer loopback).  The ClientAgent/AeronTransport
-// *integration* of these two functions is aeron-linked and verified on the box.
+// rune::client::codec::sealFrame / openEgressFrame — the pure, Aeron-free
+// envelope seal/open ClientAgent::offerProduceToLeader_ / offerControlTo /
+// offerIngress_ / offerOnSession / dispatchEgressFrame call — standalone,
+// with a real AeadCipher derived the same way (TLS exporter + makeServer
+// loopback).  sealFrame is generic (NOT produce-specific — Task 6b renamed it
+// from sealProduceFrame once every non-handshake client->broker send site
+// started reusing it), so ClientCryptoFrame.ControlFrameRoundTrip below seals
+// a Keepalive (a control template, not Produce) to prove the two sides agree
+// beyond the Produce-only case Task 6 originally covered.  The
+// ClientAgent/AeronTransport *integration* of these functions is aeron-linked
+// and verified on the box.
 
 #include <gtest/gtest.h>
 
@@ -254,30 +260,49 @@ TEST(ClientCryptoRoundTrip, CryptoOffConnectIsByteIdenticalToPreTask5) {
 }
 
 // ---------------------------------------------------------------------------
-// client<->broker TLS/AEAD (Task 6) — data-plane half: sealProduceFrame /
+// client<->broker TLS/AEAD (Task 6 / 6b) — data-plane half: sealFrame /
 // openEgressFrame.  Standalone (no Aeron): a real handshake derives the
-// client-side CryptoState (cc::sealProduceFrame's `send`); an independently
+// client-side CryptoState (cc::sealFrame's `send`); an independently
 // exported "broker-side" CryptoState (cc::openEgressFrame's `recv`, bound to
 // the SAME c2b key/prefix) proves the wire format + AEAD binding end to end,
 // the same technique ClientCryptoRoundTrip.HandshakeReachesConnectedAndEncrypted
-// uses above.
+// uses above.  sealFrame is generic (Task 6b: NOT produce-specific), so
+// buildPlainFrame below builds ANY templateId's [24B header][body] —
+// ClientCryptoFrame.RoundTripSealThenOpenRecoversPlaintext (and friends)
+// exercise Produce; ClientCryptoFrame.ControlFrameRoundTripSealThenOpen below
+// exercises Keepalive, proving the two sides agree beyond the Produce-only
+// case Task 6 originally covered (the bug Task 6b fixes: ClientAgent only
+// sealed Produce, so an encrypted session's Keepalive/Subscribe/... frames
+// went out in the clear and the broker's open() dropped them).
 // ---------------------------------------------------------------------------
 namespace {
 
-/// Build [24B MessageHeader][body] — the plaintext ClientAgent::offerProduceToLeader_
-/// hands to sealProduceFrame, sessionId already patched in (Task 1.3's in-place patch).
-std::vector<uint8_t> buildPlainProduceFrame(int64_t sessionId, int64_t correlationId,
-                                             std::string_view body) {
+/// Build [24B MessageHeader][body] for `templateId` — the plaintext every
+/// sealFrame call site (offerProduceToLeader_ for Produce; offerControlTo /
+/// offerIngress_ / offerOnSession for every other non-handshake template)
+/// hands to sealFrame, sessionId already patched in (Task 1.3's in-place
+/// patch for Produce; already-final for session-machine-originated control
+/// frames — see ClientAgent::sealForDestination_'s doc comment).
+std::vector<uint8_t> buildPlainFrame(rune::protocol::client::TemplateId templateId,
+                                      int64_t sessionId, int64_t correlationId,
+                                      std::string_view body) {
     namespace rpc = rune::protocol::client;
     std::vector<uint8_t> buf(rpc::MessageHeader::ENCODED_SIZE + body.size());
     rpc::MessageHeader h;
     h.blockLength   = static_cast<uint16_t>(body.size());
-    h.templateId    = static_cast<uint16_t>(rpc::TemplateId::Produce);
+    h.templateId    = static_cast<uint16_t>(templateId);
     h.sessionId     = sessionId;
     h.correlationId = correlationId;
     h.encode(buf.data());
     std::memcpy(buf.data() + rpc::MessageHeader::ENCODED_SIZE, body.data(), body.size());
     return buf;
+}
+
+/// Produce-specific convenience wrapper (keeps the existing Produce tests
+/// below unchanged in spirit — same frame shape as before Task 6b).
+std::vector<uint8_t> buildPlainProduceFrame(int64_t sessionId, int64_t correlationId,
+                                             std::string_view body) {
+    return buildPlainFrame(rune::protocol::client::TemplateId::Produce, sessionId, correlationId, body);
 }
 
 /// Independently-exported "broker-side" CryptoState: `recv` is bound to the
@@ -340,7 +365,7 @@ TEST(ClientCryptoFrame, RoundTripSealThenOpenRecoversPlaintext) {
                                                "hello-produce-body");
 
     uint8_t sealed[256];
-    const std::size_t sealedLen = cc::sealProduceFrame(f.m.cryptoState(), plain.data(), plain.size(),
+    const std::size_t sealedLen = cc::sealFrame(f.m.cryptoState(), plain.data(), plain.size(),
                                                         sealed, sizeof sealed);
     ASSERT_GT(sealedLen, 0u);
     EXPECT_EQ(sealedLen, plain.size() + rune::protocol::client::kCryptoOverhead);
@@ -361,7 +386,7 @@ TEST(ClientCryptoFrame, TamperedCiphertextIsDroppedWindowNotPoisoned) {
     const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 778, "tamper-me");
 
     uint8_t sealed[256];
-    const std::size_t sealedLen = cc::sealProduceFrame(f.m.cryptoState(), plain.data(), plain.size(),
+    const std::size_t sealedLen = cc::sealFrame(f.m.cryptoState(), plain.data(), plain.size(),
                                                         sealed, sizeof sealed);
     ASSERT_GT(sealedLen, 0u);
     sealed[sealedLen - 1] ^= 0x01;  // flip a tag byte -> AEAD auth must fail
@@ -387,7 +412,7 @@ TEST(ClientCryptoFrame, TamperedHeaderBreaksAadBindingAndIsDropped) {
     const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 779, "aad-bound-body");
 
     uint8_t sealed[256];
-    const std::size_t sealedLen = cc::sealProduceFrame(f.m.cryptoState(), plain.data(), plain.size(),
+    const std::size_t sealedLen = cc::sealFrame(f.m.cryptoState(), plain.data(), plain.size(),
                                                         sealed, sizeof sealed);
     ASSERT_GT(sealedLen, 0u);
     // Flip a byte inside the CLEAR MessageHeader (correlationId, offset 16) —
@@ -410,7 +435,7 @@ TEST(ClientCryptoFrame, ReplayedSeqIsDropped) {
     const auto plain = buildPlainProduceFrame(FrameFixture::kSessionId, 780, "replay-me");
 
     uint8_t sealed[256];
-    const std::size_t sealedLen = cc::sealProduceFrame(f.m.cryptoState(), plain.data(), plain.size(),
+    const std::size_t sealedLen = cc::sealFrame(f.m.cryptoState(), plain.data(), plain.size(),
                                                         sealed, sizeof sealed);
     ASSERT_GT(sealedLen, 0u);
 
@@ -436,9 +461,9 @@ TEST(ClientCryptoFrame, InWindowReorderIsAcceptedOutOfOrderDeliveryWorks) {
     const auto plain1 = buildPlainProduceFrame(FrameFixture::kSessionId, 781, "seq-1");
     const auto plain2 = buildPlainProduceFrame(FrameFixture::kSessionId, 782, "seq-2");
     const auto plain3 = buildPlainProduceFrame(FrameFixture::kSessionId, 783, "seq-3");
-    const std::size_t len1 = cc::sealProduceFrame(f.m.cryptoState(), plain1.data(), plain1.size(), sealed1, sizeof sealed1);
-    const std::size_t len2 = cc::sealProduceFrame(f.m.cryptoState(), plain2.data(), plain2.size(), sealed2, sizeof sealed2);
-    const std::size_t len3 = cc::sealProduceFrame(f.m.cryptoState(), plain3.data(), plain3.size(), sealed3, sizeof sealed3);
+    const std::size_t len1 = cc::sealFrame(f.m.cryptoState(), plain1.data(), plain1.size(), sealed1, sizeof sealed1);
+    const std::size_t len2 = cc::sealFrame(f.m.cryptoState(), plain2.data(), plain2.size(), sealed2, sizeof sealed2);
+    const std::size_t len3 = cc::sealFrame(f.m.cryptoState(), plain3.data(), plain3.size(), sealed3, sizeof sealed3);
     ASSERT_GT(len1, 0u); ASSERT_GT(len2, 0u); ASSERT_GT(len3, 0u);
 
     uint8_t opened[256];
@@ -452,4 +477,76 @@ TEST(ClientCryptoFrame, InWindowReorderIsAcceptedOutOfOrderDeliveryWorks) {
 
     // A SECOND delivery of the reordered seq=2 is now a replay.
     EXPECT_EQ(cc::openEgressFrame(brokerSide, sealed2, len2, opened, sizeof opened), 0u);
+}
+
+// ---------------------------------------------------------------------------
+// Task 6b: a NON-Produce (control) template seals on the client and opens on
+// the broker side, proving sealFrame (renamed from sealProduceFrame) is
+// genuinely generic — this is the bug Task 6b fixes: ClientAgent used to seal
+// ONLY Produce, so on an encrypted session a Keepalive went out in the clear
+// and the broker's open() dropped it (session eventually times out).
+// ---------------------------------------------------------------------------
+TEST(ClientCryptoFrame, ControlFrameRoundTripSealThenOpen) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    sm::CryptoState brokerSide = brokerSideCryptoStateFor(f.srv, f.m, FrameFixture::kSessionId);
+
+    // A REAL Keepalive wire frame (rpc::Keepalive, TemplateId::Keepalive==3) —
+    // exactly what ClientAgent::offerControlTo seals today via
+    // sealForDestination_ (SessionMachine's tickConnected sends an encodePing
+    // Ping=6 frame in practice; Keepalive is the sibling control template this
+    // test exercises, both equally NOT Produce and equally in scope).
+    uint8_t plain[rune::protocol::client::Keepalive::ENCODED_SIZE];
+    const std::size_t plainLen =
+        cc::encodeKeepalive(plain, sizeof plain, FrameFixture::kSessionId, /*correlationId=*/-1);
+    ASSERT_GT(plainLen, 0u);
+
+    uint8_t sealed[256];
+    const std::size_t sealedLen =
+        cc::sealFrame(f.m.cryptoState(), plain, plainLen, sealed, sizeof sealed);
+    ASSERT_GT(sealedLen, 0u) << "sealFrame must seal ANY non-handshake template, not just Produce";
+    EXPECT_EQ(sealedLen, plainLen + rune::protocol::client::kCryptoOverhead);
+
+    uint8_t opened[256];
+    const std::size_t openedLen =
+        cc::openEgressFrame(brokerSide, sealed, sealedLen, opened, sizeof opened);
+    ASSERT_EQ(openedLen, plainLen)
+        << "the broker's open() must recover a sealed Keepalive exactly like a sealed Produce";
+    EXPECT_EQ(0, std::memcmp(plain, opened, plainLen));
+
+    // And the recovered plaintext decodes back to the same Keepalive fields.
+    auto decoded = cc::decodeKeepalive(opened, openedLen);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->sessionId, FrameFixture::kSessionId);
+    EXPECT_EQ(decoded->correlationId, -1);
+}
+
+// RED-evidence companion (kept GREEN; see task-6b-report.md for the transcript
+// of actually flipping this to prove it fails): sending the Keepalive frame
+// UNSEALED (i.e. in the clear) must fail to open on an encrypted broker-side
+// CryptoState — the broker's open() must never silently accept plaintext on
+// an encrypted session.  This is exactly what used to happen before Task 6b
+// (ClientAgent sealed only Produce): a plaintext control frame reached the
+// broker, which looked for a sealed envelope and failed/dropped it.
+TEST(ClientCryptoFrame, UnsealedControlFrameFailsToOpenOnEncryptedSession) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    sm::CryptoState brokerSide = brokerSideCryptoStateFor(f.srv, f.m, FrameFixture::kSessionId);
+
+    uint8_t plain[rune::protocol::client::Keepalive::ENCODED_SIZE];
+    const std::size_t plainLen =
+        cc::encodeKeepalive(plain, sizeof plain, FrameFixture::kSessionId, /*correlationId=*/-1);
+    ASSERT_GT(plainLen, 0u);
+
+    // The broker only ever sees sealed wire frames on an encrypted session —
+    // openEgressFrame on the plain 24-byte frame (no CryptoSubHeader, no tag)
+    // must fail (too short to even decode a subheader), not silently succeed.
+    uint8_t opened[256];
+    const std::size_t openedLen =
+        cc::openEgressFrame(brokerSide, plain, plainLen, opened, sizeof opened);
+    EXPECT_EQ(openedLen, 0u) << "an unsealed control frame must never be accepted on an encrypted session";
 }
