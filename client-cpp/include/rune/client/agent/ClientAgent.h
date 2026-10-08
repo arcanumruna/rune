@@ -93,9 +93,16 @@ class ClientAgent;
 // adapter is a NO-OP (multi-node addresses endpoints explicitly — it never
 // retargets the shared default pub).  Agent-thread only.
 // ---------------------------------------------------------------------------
+struct Session;
+
 struct SessionEndpointIo : session::SessionIo {
     ClientAgent* agent   = nullptr;    // owner (shared transport lives here)
     std::string  endpoint;             // this session's ingress channel
+    /// D4 r2: the Session this adapter belongs to — its control frames are
+    /// sealed under ITS crypto state and routed by ITS identity (seed = the
+    /// default publication), never looked up by endpoint string (a seed moved
+    /// off its bootstrap and a session to that bootstrap share the string).
+    Session*     owner   = nullptr;
 
     SessionEndpointIo(ClientAgent* a, std::string ep)
         : agent(a), endpoint(std::move(ep)) {}
@@ -165,7 +172,7 @@ struct Session {
         , io(agent, sessionEndpoint)
         , machine(io, std::move(cfg))
         , currentLeaderChannel(sessionEndpoint)
-    {}
+    { io.owner = this; }
 };
 
 // ---------------------------------------------------------------------------
@@ -473,6 +480,14 @@ public:
     /// terminally Disconnected one is re-driven (its own connect budget paces it).
     /// The seed never moves for it.  Agent thread only; cold path.
     [[nodiscard]] uint32_t coordinatorSessionIndex(const std::string& channel, int64_t nowNs) noexcept;
+    /// D4 r2: where the seed session physically is — the channel the default
+    /// ingress publication points at (its bootstrap identity unless a data-op
+    /// redirect / stick-to-leader retarget moved it).
+    [[nodiscard]] const std::string& seedChannel() const noexcept { return transport_.ingressChannel(); }
+    /// D4 r2 LOW-2: (topicId, partition) has a partition route (else it rides the seed).
+    [[nodiscard]] bool hasRoute(int32_t topicId, int32_t partition) const noexcept {
+        return routeIndex_.size() != 0 && routeIndex_.find(routeKey(topicId, partition)) != detail::FlatIndexMap::kNone;
+    }
     /// D4: offer ONE coordinator frame (group / non-Produce txn) on session
     /// `index`: the header sessionId is re-stamped with that session's id (as
     /// offerProduceToLeader_ does for a leader), then sealed under that session's
@@ -898,8 +913,9 @@ private:
     // Used by SessionEndpointIo::sendFrame — offers a session's control frame to
     // that session's endpoint over the shared transport (default ingress stream id).
     friend struct SessionEndpointIo;
-    bool offerControlTo(const std::string& channel,
-                        const uint8_t* buf, std::size_t len) noexcept;
+    bool offerControlTo(Session& owner, const uint8_t* buf, std::size_t len) noexcept;
+    /// Open a NEW session to `endpoint` (async connect, disjoint corrId range).
+    Session& openSession_(const std::string& endpoint) noexcept;
     /// T15a fix1 I1: point the default ingress publication (the seed session's
     /// control path) back at the configured gateway and forget the stuck-to
     /// leader.  No-op when already there.  Agent thread only (cold path).

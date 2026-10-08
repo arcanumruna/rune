@@ -1574,8 +1574,12 @@ void GroupConsumerHub::onConnected(int64_t sessionId, const SendFn& sendFn)
             // One that went out on THIS session (a resume that kept its id) is
             // left alone: the coordinator may hold it (a rebalance), and a
             // second JoinGroup with an empty memberId would register a ghost
-            // member (review MEDIUM-3).  A session that changed id took its
-            // members with it (the broker expires them with the session).
+            // member (review MEDIUM-3).  After a session id change the held
+            // join's answer is addressed to the old session (lost, or taken by
+            // the re-join); a ghost from the old join costs one rebalance after
+            // sessionTimeoutMs — the same as waiting out the join deadline (the
+            // broker reaps members by sessionTimeoutMs, not with the client
+            // session; KIP-394 MEMBER_ID_REQUIRED is the real fix — ticket).
             toRejoining_(*impl);
             sendJoinGroup(*impl, sessionId, sendFn);
         }

@@ -273,10 +273,11 @@ Client::Client(ClientConfig cfg)
             const auto pv = codec::decodeProduce(buf, len);
             const int32_t topicId   = pv ? pv->topicId : 0;
             const int32_t partition = pv ? pv->partition : 0;
-            if (coordIdx_ != 0) [[unlikely]] {
+            if (coordIdx_ != 0 && !agent_.hasRoute(topicId, partition)) [[unlikely]] {
                 // D4: the txn producer stamps the COORDINATOR session's id; a
                 // Produce without a partition route rides the seed — its id.
-                // (A routed one is re-stamped with its leader's anyway.)
+                // (A routed one is re-stamped with its leader's: r2 LOW-2, never
+                // held on the seed.)
                 const int64_t seedSid = agent_.seedSession().machine.sessionId();
                 if (seedSid == 0) return false;  // held: re-offered next cycle
                 rune::protocol::client::detail::putLE64(const_cast<uint8_t*>(buf), 8, seedSid);
@@ -3965,11 +3966,25 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
 void Client::onCoordinatorRedirect_(const std::string& endpoint) {
     const std::string channel = toChannel(endpoint);  // LOW-1 (N2)
     // Review MEDIUM-1: an answer naming the coordinator already in use (a late
-    // answer to a frame sent before the move) changes nothing at all.
-    const std::string& current = coordinatorChannel_.empty() ? agent_.seedSession().endpoint : coordinatorChannel_;
+    // answer to a frame sent before the move) changes nothing at all.  r2
+    // MAJOR-1: "the seed" means where the seed PHYSICALLY is (its default
+    // publication), not its bootstrap identity — a seed a data-op redirect moved
+    // to L that hears NotCoordinator{bootstrap} must route to the bootstrap.
+    const std::string& current = coordIdx_ == 0 ? agent_.seedChannel() : coordinatorChannel_;
     if (agent::ClientAgent::sameEndpoint(channel, current)) return;
+    // r2 LOW-3: a coordinator whose session was Rejected / Closed is not
+    // re-followed until fresh metadata arrives (the member waits its join
+    // deadline, the txn op its retry) — never a 100 ms move/fallback loop.
+    if (!coordRejectedChannel_.empty()) {
+        if (metadataResponses_ == coordRejectedMeta_ &&
+            agent::ClientAgent::sameEndpoint(channel, coordRejectedChannel_)) {
+            scheduleMetadataRefresh();
+            return;
+        }
+        coordRejectedChannel_.clear();
+    }
     ++coordinatorRedirects_;
-    // That node's ONE session (lazily opened / re-driven) — 0 = the seed's node.
+    // That node's ONE session (lazily opened / re-driven) — 0 = the seed is there.
     coordIdx_ = agent_.coordinatorSessionIndex(channel, now());
     if (coordIdx_ == 0) coordinatorChannel_.clear();
     else                coordinatorChannel_ = channel;
@@ -3995,6 +4010,10 @@ void Client::syncCoordinatorSession_() noexcept {
                              agent_.sessionConnectFailuresAt(coordIdx_) != coordFailBase_);
         if (gaveUp) {
             ++coordinatorFallbacks_;
+            if (st == session::SessionState::Rejected || st == session::SessionState::Closed) {
+                coordRejectedChannel_ = coordinatorChannel_;   // r2 LOW-3
+                coordRejectedMeta_    = metadataResponses_;
+            }
             coordinatorChannel_.clear();
             coordIdx_ = 0;
             groupConsumerHub_.onCoordinatorMoved();

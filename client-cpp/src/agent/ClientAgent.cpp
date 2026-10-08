@@ -892,7 +892,22 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
         if (!opt) break;
         // Task 1.3: route to the session whose in-flight connect corrId matches
         // (a Redirect/NotLeader during a session's connect); otherwise the seed.
-        Session& s = sessionForConnectCorrId(opt->correlationId);
+        // D4 r2 MEDIUM-1: a session-level answer (SessionExpired / UnknownSession,
+        // the broker's sendSessionExpired_: corr 0, header = the dead session's
+        // cluster-unique id) that matches no in-flight connect goes to the session
+        // owning that id — e.g. the coordinator session — never the healthy seed.
+        Session* sp = &sessionForConnectCorrId(opt->correlationId);
+        if (sp == &seedSession() && opt->sessionId != 0 &&
+            (opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::SessionExpired) ||
+             opt->code == static_cast<int16_t>(::rune::protocol::client::ErrorCode::UnknownSession)) &&
+            !(seedSession().machine.correlationId() == opt->correlationId &&
+              (seedSession().machine.state() == session::SessionState::Connecting ||
+               seedSession().machine.state() == session::SessionState::Handshaking))) {
+            for (std::size_t i = 1; i < sessions_.size(); ++i) {
+                if (sessions_[i]->machine.sessionId() == opt->sessionId) { sp = sessions_[i].get(); break; }
+            }
+        }
+        Session& s = *sp;
         if (mnDebug_) {
             std::fprintf(stderr, "[MNDBG err] ErrorResponse corrId=%lld code=%d msg='%.*s' -> session ep='%s' (isSeed=%d)\n",
                 (long long)opt->correlationId, (int)opt->code,
@@ -980,7 +995,7 @@ void ClientAgent::dispatchEgressFrame(int64_t nowNs,
 // ---------------------------------------------------------------------------
 
 bool SessionEndpointIo::sendFrame(const uint8_t* buf, std::size_t len) {
-    return agent->offerControlTo(endpoint, buf, len);
+    return agent->offerControlTo(*owner, buf, len);
 }
 
 bool SessionEndpointIo::retarget(const std::string& /*newIngressChannel*/) noexcept {
@@ -997,12 +1012,12 @@ bool SessionEndpointIo::retargetToBootstrap() noexcept {
     // Only the seed session's endpoint is the transport's default publication,
     // which redirects / stick-to-leader retarget.  A leader session addresses its
     // own endpoint explicitly and is re-routed by metadata: nothing to undo.
-    if (endpoint != agent->cfg_.transport.ingressChannel) return true;
+    if (owner != &agent->seedSession()) return true;   // D4 r2: the seed by identity (a session may share its bootstrap string)
     return agent->retargetSeedToBootstrap_();
 }
 
 bool SessionEndpointIo::retargetToLastKnownLeader() noexcept {
-    if (endpoint != agent->cfg_.transport.ingressChannel) return true;  // leader session: no-op
+    if (owner != &agent->seedSession()) return true;  // leader session: no-op (D4 r2: by identity)
     return agent->retargetSeedToLastKnownLeader_();
 }
 
@@ -1037,41 +1052,28 @@ bool ClientAgent::retargetSeedToLastKnownLeader_() noexcept {
     return true;
 }
 
-bool ClientAgent::offerControlTo(const std::string& channel,
-                                 const uint8_t* buf, std::size_t len) noexcept {
+bool ClientAgent::offerControlTo(Session& owner, const uint8_t* buf, std::size_t len) noexcept {
     if (failed_) [[unlikely]] return false;  // T15b: a failed client does no I/O
-    // client<->broker TLS/AEAD (Task 6b): seal under the DESTINATION session's
-    // CryptoState.  sessionForEndpoint(channel) resolves the SAME session
-    // whose own SessionEndpointIo::sendFrame is calling here (a session never
-    // calls offerControlTo with an endpoint other than its own), so this never
-    // lazily opens a new session as a side effect.  Covers every session-
-    // machine-originated control frame (ConnectRequest, HandshakeContinue,
-    // Keepalive/Ping, Disconnect) on EVERY session (seed and leader).
+    // client<->broker TLS/AEAD (Task 6b): seal under the SENDING session's own
+    // CryptoState (D4 r2: by identity — never a lookup by endpoint string, which
+    // a seed moved off its bootstrap shares with a session to that bootstrap).
+    // Covers every session-machine-originated control frame (ConnectRequest,
+    // HandshakeContinue, Keepalive/Ping, Disconnect) on EVERY session.
     // ConnectRequest/HandshakeContinue are naturally plaintext here (sent
     // while encrypted==false) and are defensively exempt by templateId too
     // (see sealForDestination_).  Plaintext path (crypto off) is byte-
     // identical to before Task 6b.
-    if (!sealForDestination_(sessionForEndpoint(channel).machine.cryptoState(), buf, len)) {
+    if (!sealForDestination_(owner.machine.cryptoState(), buf, len)) {
         return false;  // seal failed — DROP, do not transmit
     }
-    // Seed endpoint == transport default ingress channel → byte-identical default
-    // offer (single-node fast path).  Otherwise route the control frame to the
-    // session's own endpoint over the shared transport (default ingress stream id).
-    if (channel.empty() || channel == cfg_.transport.ingressChannel) {
-        return transport_.offer(buf, len);
-    }
-    return transport_.offerTo(channel, cfg_.transport.ingressStreamId, buf, len);
+    // The seed → the default publication (wherever it points: byte-identical
+    // single-node fast path).  Any other session → its own endpoint over the
+    // shared transport (default ingress stream id).
+    if (&owner == &seedSession()) return transport_.offer(buf, len);
+    return transport_.offerTo(owner.endpoint, cfg_.transport.ingressStreamId, buf, len);
 }
 
-Session& ClientAgent::sessionForEndpoint(const std::string& endpoint) noexcept {
-    // Empty / seed endpoint → the seed session (single-node hot path, no scan cost
-    // when there is only one session).
-    if (endpoint.empty() || sameEndpoint(endpoint, seedSession().endpoint)) {
-        return seedSession();
-    }
-    for (auto& s : sessions_) {
-        if (sameEndpoint(s->endpoint, endpoint)) return *s;  // M6: one session per node
-    }
+Session& ClientAgent::openSession_(const std::string& endpoint) noexcept {
     // Lazily open a NEW session to this endpoint over the SHARED transport.  Its
     // SessionMachine gets its own IO adapter (offerTo(endpoint,...)) → its own
     // ConnectRequest → its own sessionId on the one driver.  ASYNC: submit connect
@@ -1095,6 +1097,18 @@ Session& ClientAgent::sessionForEndpoint(const std::string& endpoint) noexcept {
             sessions_.size(), (long long)s.machine.correlationId());
     }
     return s;
+}
+
+Session& ClientAgent::sessionForEndpoint(const std::string& endpoint) noexcept {
+    // Empty / seed endpoint → the seed session (single-node hot path, no scan cost
+    // when there is only one session).
+    if (endpoint.empty() || sameEndpoint(endpoint, seedSession().endpoint)) {
+        return seedSession();
+    }
+    for (auto& s : sessions_) {
+        if (sameEndpoint(s->endpoint, endpoint)) return *s;  // M6: one session per node
+    }
+    return openSession_(endpoint);
 }
 
 Session& ClientAgent::sessionForConnectCorrId(int64_t corrId) noexcept {
@@ -1252,8 +1266,22 @@ transport::AeronTransport::OfferResult ClientAgent::offerOnSession(uint32_t inde
 
 uint32_t ClientAgent::coordinatorSessionIndex(const std::string& channel, int64_t nowNs) noexcept {
     if (channel.empty() || failed_) return 0;
-    const uint32_t idx = sessionIndexFor_(channel);   // M6: one session per node (lazily opened)
-    (void)reviveSession(idx, nowNs);                  // a gave-up one connects again (no-op otherwise)
+    // D4 r2 MAJOR-1: the seed is the coordinator's session only where it
+    // PHYSICALLY is (its default publication), not by its bootstrap identity.
+    if (sameEndpoint(channel, transport_.ingressChannel())) return 0;
+    uint32_t idx = 0;
+    for (uint32_t i = 1; i < sessions_.size(); ++i) {   // that node's own session (M6), never the seed
+        if (sameEndpoint(sessions_[i]->endpoint, channel)) { idx = i; break; }
+    }
+    if (idx == 0) {
+        // None yet.  The seed's BOOTSTRAP node while the seed sits elsewhere
+        // (moved by a data-op redirect) gets a session of its own: the seed stays
+        // where its data ops are; sessionForEndpoint (identity lookup) would
+        // return the seed, so open it directly.
+        (void)openSession_(channel);
+        idx = static_cast<uint32_t>(sessions_.size() - 1);
+    }
+    (void)reviveSession(idx, nowNs);   // a gave-up one connects again (no-op otherwise)
     return idx;
 }
 

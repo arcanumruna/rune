@@ -1225,9 +1225,9 @@ TEST(GroupRoutingRegression, BatchHeldOnAConnectingDeadLeaderAsksForMetadataRegr
 // ===========================================================================
 // D4 (broker backlog "group subscribe redirect", 2026-10-08): a member
 // bootstrapped against a FOLLOWER.  The follower answers the coordinator
-// request ErrorResponse{NotCoordinator, coordinator endpoint}; the seed session
-// must move to the coordinator and the member join there at once — before the
-// fix the group-active rule kept the seed on the follower and the member
+// request ErrorResponse{NotCoordinator, coordinator endpoint}; the member must
+// join the coordinator at once on that node's own session (the coordinator
+// route) while the seed session stays where it is — before the fix the member
 // re-joined the follower forever (dockerized: 0 of 80 records consumed).
 // ===========================================================================
 TEST(GroupRoutingRegression, MemberOnAFollowerJoinsTheCoordinatorRegression) {
@@ -1509,4 +1509,158 @@ TEST(GroupRoutingRegression, UnreachableCoordinatorFallsBackToTheSeedAndRetriesR
         << "the member never joined the coordinator once reachable";
     EXPECT_EQ(r.gw.groupEndpoints.back(), n1);
     EXPECT_EQ(r.gw.connectsAt[0], 1) << "the seed session must never move";
+}
+
+// ===========================================================================
+// D4 fix round 1 (re-review r2)
+// ===========================================================================
+
+namespace {
+// The seed was retargeted off its bootstrap (node 0) to node 1 by a plain
+// Subscribe's data-op Redirect: the seed's identity is node 0, it is
+// physically on node 1.
+void moveSeedToNode1(GroupRig& r, int n1, int p1port, int32_t topicIdx) {
+    r.gw.subscribeRedirectNext = 1;
+    r.gw.subscribeRedirectTo   = "127.0.0.1:" + std::to_string(p1port);
+    (void)topicIdx;
+    ASSERT_TRUE(r.drive([&] {
+        return r.client.testTransport().ingressChannel() == udp(p1port) && r.gw.connectsAt[n1] >= 1 &&
+               r.client.testSessionStateAt(0) == rc::session::SessionState::Connected;
+    }, 4'000'000)) << "precondition: the seed was retargeted to node 1";
+}
+} // namespace
+
+// MAJOR-1 (r2): the txn coordinator is the BOOTSTRAP node while the seed sits
+// on node 1 (moved there by a data-op Redirect).  Node 1 answers InitProducerId
+// NotCoordinator{bootstrap}; the request must reach the bootstrap node.  RED at
+// d22a757: the answer was taken for "the coordinator is already the seed" (a
+// no-op) and the InitProducerId was never re-sent.
+TEST(GroupRoutingRegression, TxnCoordinatorOnTheBootstrapAfterASeedRetargetRegression) {
+    GroupRig r(4171, 4172);
+    const auto [n1, p1port] = r.addNode(4171);
+    r.gw.moreBrokers = {{1, "127.0.0.1", p1port}};
+    r.gw.holdJoins   = false;
+    r.connect();
+    auto sub = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                  [](const rc::Record&) {});
+    moveSeedToNode1(r, n1, p1port, 0);
+    r.gw.coordinatorEndpoint   = 0;   // the bootstrap node is the coordinator
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(r.gw.brokerPort);
+    r.gw.initPidReply          = true;
+    const int seedConnects = r.gw.connectsAt[n1];
+    auto tp = r.client.transactionalProducer("tx-d4-boot");
+    const rc::Token t = r.nextToken++;
+    ASSERT_EQ(tp.initTransactions(r.cq, t), rc::OpResult::Accepted);
+    bool done = false;
+    rc::OpStatus st = rc::OpStatus::Closed;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+            if (cc.token == t) { done = true; st = cc.status; }
+        });
+        return done;
+    }, 3'000'000)) << "InitProducerId never reached the bootstrap coordinator (NotCoordinator answers: "
+                   << r.gw.notCoordinatorAnswers << ")";
+    EXPECT_EQ(st, rc::OpStatus::Ok);
+    ASSERT_FALSE(r.gw.coordinatorEndpoints.empty());
+    EXPECT_EQ(r.gw.coordinatorEndpoints.front(), n1) << "precondition: the first InitProducerId rode the seed";
+    EXPECT_EQ(r.gw.coordinatorEndpoints.back(), 0) << "re-sent to the bootstrap coordinator";
+    EXPECT_EQ(r.client.testTransport().ingressChannel(), udp(p1port)) << "the seed must not move";
+    EXPECT_EQ(r.gw.connectsAt[n1], seedConnects) << "the seed must not reconnect";
+}
+
+// MAJOR-1 (r2), group flavour: the member's coordinator is the bootstrap node
+// while the seed sits on node 1.  RED at d22a757: one JoinGroup to node 1,
+// NotCoordinator{bootstrap} ignored, never joined.
+TEST(GroupRoutingRegression, GroupCoordinatorOnTheBootstrapAfterASeedRetargetRegression) {
+    GroupRig r(4173, 4174);
+    const auto [n1, p1port] = r.addNode(4173);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4173, ""}, {1, 1, 0, 1, 4173, ""}};
+    r.gw.groupAssignment = {{1, 0}, {1, 1}};
+    r.gw.holdJoins       = false;
+    r.connect();
+    auto sub = r.client.subscribe(r.client.topic("b"), 0, rc::SubscribeOptions{rc::From::earliest()},
+                                  [](const rc::Record&) {});
+    moveSeedToNode1(r, n1, p1port, 1);
+    r.gw.coordinatorEndpoint   = 0;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(r.gw.brokerPort);
+    rc::GroupConfig gcfg;
+    gcfg.sessionTimeoutMs = 30'000;   // the join deadline must not be what un-sticks it
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    bool assigned = false;
+    gc.onAssigned([&](std::vector<rc::TopicPartition>) { assigned = true; });
+    ASSERT_TRUE(r.drive([&] { return assigned; }, 3'000'000))
+        << "the member never joined the bootstrap coordinator (NotCoordinator answers: "
+        << r.gw.notCoordinatorAnswers << ", joins " << r.gw.joinGroups << ")";
+    EXPECT_EQ(r.gw.groupEndpoints.back(), 0);
+    EXPECT_EQ(r.client.testTransport().ingressChannel(), udp(p1port)) << "the seed must not move";
+}
+
+// MEDIUM-1 (r2): a SessionExpired for the COORDINATOR session (header sessionId
+// = its cluster-unique id, correlationId 0 — the broker's sendSessionExpired_)
+// must reach that session, never the healthy seed.  RED at d22a757: the seed
+// went Resuming and reconnected; the coordinator session never learned.
+TEST(GroupRoutingRegression, SessionExpiredForTheCoordinatorSessionNeverHitsTheSeedRegression) {
+    GroupRig r(4175, 4176);
+    const auto [n1, p1port] = r.addNode(4175);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions            = {{1, 0, n1, 1, 4175, ""}, {1, 1, n1, 1, 4175, ""}};
+    r.gw.groupAssignment       = {{1, 0}, {1, 1}};
+    r.gw.coordinatorEndpoint   = n1;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p1port);
+    r.gw.holdJoins             = false;
+    rc::GroupConfig gcfg;
+    gcfg.sessionTimeoutMs = 600;
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return gc.generation() == 1 && r.gw.heartbeats >= 1; }, 4'000'000));
+    const int64_t coordSid = r.gw.groupSessionIds.back();
+    ASSERT_NE(coordSid, r.seedSid);
+    ASSERT_EQ(r.gw.connectsAt[0], 1);
+    ASSERT_EQ(r.gw.connectsAt[n1], 1);
+    r.gw.sendError(n1, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired), "", coordSid, 0);
+    ASSERT_TRUE(r.drive([&] { return r.gw.connectsAt[n1] >= 2 || r.gw.connectsAt[0] >= 2; }, 4'000'000))
+        << "nobody reacted to the SessionExpired";
+    EXPECT_EQ(r.gw.connectsAt[n1], 2) << "the coordinator session did not resume";
+    EXPECT_EQ(r.gw.connectsAt[0], 1) << "the SessionExpired of the coordinator session hit the seed";
+    EXPECT_EQ(r.client.testSessionStateAt(0), rc::session::SessionState::Connected);
+}
+
+// r2 LOW-5: a commitSync of a member whose coordinator is a session of its own
+// goes there (coordDirectSendTrampoline_), stamped with that session's id.
+TEST(GroupRoutingRegression, CommitSyncRidesTheCoordinatorSessionRegression) {
+    GroupRig r(4177, 4178);
+    const auto [n1, p1port] = r.addNode(4177);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions            = {{1, 0, n1, 1, 4177, ""}, {1, 1, n1, 1, 4177, ""}};
+    r.gw.groupAssignment       = {{1, 0}, {1, 1}};
+    r.gw.subscribeLeader       = {{0, n1}, {1, n1}};
+    r.gw.coordinatorEndpoint   = n1;
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p1port);
+    r.gw.holdJoins             = false;
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed got;
+    wire(gc, got);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, n1) != nullptr && r.subAt(1, n1) != nullptr; }, 4'000'000));
+    r.gw.pushRecords(*r.subAt(0, n1), 0, 2);
+    ASSERT_TRUE(r.drive([&] { return got.records[0] >= 2; }, 4'000'000));
+    const int64_t coordSid = r.gw.groupSessionIds.back();
+    const std::size_t before = r.gw.offsetCommits.size();
+    const rc::Token t = r.nextToken++;
+    ASSERT_EQ(gc.commitSync(r.cq, t), rc::OpResult::Accepted);
+    rc::OpStatus st = rc::OpStatus::Closed;
+    bool done = false;
+    ASSERT_TRUE(r.drive([&] {
+        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+            if (cc.token == t) { done = true; st = cc.status; }
+        });
+        return done;
+    }, 4'000'000));
+    EXPECT_EQ(st, rc::OpStatus::Ok);
+    ASSERT_GT(r.gw.offsetCommits.size(), before);
+    const auto& f = r.gw.offsetCommits.back();
+    const auto oc = rune::protocol::client::OffsetCommit::decode(f.data(), f.size());
+    ASSERT_TRUE(oc.has_value());
+    EXPECT_EQ(oc->sessionId, coordSid) << "the OffsetCommit did not ride the coordinator session";
 }

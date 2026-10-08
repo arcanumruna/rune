@@ -851,6 +851,10 @@ private:
     uint64_t    coordFailBase_ = 0;     // its connectFailures() when it became the coordinator
     uint64_t    coordinatorRedirects_ = 0;   // coordinator moves followed
     uint64_t    coordinatorFallbacks_ = 0;   // coordinator sessions given up (back to the seed)
+    // r2 LOW-3: a coordinator channel whose session was Rejected / Closed, and
+    // the metadataResponses_ count then (re-followed only after fresh metadata).
+    std::string coordRejectedChannel_;
+    int         coordRejectedMeta_ = 0;
     // The last coordinator-session tuple the group hub was told about.
     uint32_t              lastCoordIdx_     = 0;
     session::SessionState lastCoordState_   = session::SessionState::Disconnected;
