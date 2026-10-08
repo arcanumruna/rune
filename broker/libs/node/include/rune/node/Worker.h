@@ -1428,6 +1428,7 @@ public:
             RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerReplicaDoWorkStage, 0);
             for (auto* replica : owned_) {
                 if (!replica) continue;
+                const ReplReadScope rs(*replica, replScratch_);
                 work += replica->doWork(nowNs);
             }
             work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
@@ -1526,7 +1527,9 @@ private:
         else if (replTransportCtx_) [[unlikely]]
             work += replTransportPollFn_(replTransportCtx_, kReplFetchLimit, this, nowNs);   // test seam
         for (auto* replica : owned_) {
-            if (replica) work += replica->doWork(nowNs);
+            if (!replica) continue;
+            const ReplReadScope rs(*replica, replScratch_);
+            work += replica->doWork(nowNs);
         }
         work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
         if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
@@ -3213,6 +3216,7 @@ private:
         req.lastFetchedEpoch = op.frLastFetchedEpoch();
         req.incarnation      = op.frIncarnation();
 
+        const ReplReadScope rs(*replica, replScratch_);
         try {
             replica->onFetchRequest(req, op.frNowNs(),
                                     static_cast<uint32_t>(op.ownershipGen()));   // F27 R1
@@ -3427,6 +3431,7 @@ private:
         try {
             // F15 N2: the marker lands AS a control batch (restamped in place),
             // with the replica's own role gate (NotLeader, retriable) and min-ISR gate.
+            const ReplReadScope rs(*replica, replScratch_);   // D26: its push reads into the scratch
             const rune::replication::Offset base = replica->appendControlBatch(markerSpan, /*acksAll=*/true);
             if (base >= 0) {
                 ret.baseOffset = base;
@@ -3592,6 +3597,7 @@ private:
         // Mirrors executeFetchRequestWire_ (~1664).
         case static_cast<uint16_t>(rr::ReplicationTemplateId::FetchRequest): {
             const rr::FetchRequestMsg req = rr::FetchRequestMsg::decode(frame, 0);
+            const ReplReadScope rs(*replica, replScratch_);
             try {
                 replica->onFetchRequest(req, nowNs);
             } catch (const std::exception& ex) {
@@ -4059,6 +4065,22 @@ private:
     /// batches fall back to the mapped view (pushReadMapFallbacks_).
     std::vector<uint8_t>                  pushScratch_ = std::vector<uint8_t>(2 * kPushPassBudgetBytes + 64 * 1024);
     uint64_t                              pushReadMapFallbacks_ = 0;
+    /// D26: replication read scratch — a fetch serve / owed re-serve / push of
+    /// an owned replica preads into it (PartitionReplica::setReadScratch), never
+    /// faulting through the segment read map.  maxFetchBytes (1 MiB) + the
+    /// sparse-index skip slack; larger reads fall back to the mapped view.
+    std::vector<uint8_t>                  replScratch_ = std::vector<uint8_t>((1u << 20) + 64 * 1024);
+    /// Sets the replica's read scratch for one call from this thread, cleared
+    /// after: a replica handed to another owner never keeps this worker's buffer.
+    struct ReplReadScope {
+        rune::replication::PartitionReplica& r;
+        ReplReadScope(rune::replication::PartitionReplica& rep, std::vector<uint8_t>& buf) noexcept : r(rep) {
+            r.setReadScratch(buf.data(), buf.size());
+        }
+        ~ReplReadScope() { r.setReadScratch(nullptr, 0); }
+        ReplReadScope(const ReplReadScope&) = delete;
+        ReplReadScope& operator=(const ReplReadScope&) = delete;
+    };
     std::size_t                           pushRotor_ = 0;   ///< in-worker push: first sub served next pass
     uint64_t                              pushReadChunks_ = 0, pushReadBytes_ = 0, pushReadsDeferred_ = 0;
 

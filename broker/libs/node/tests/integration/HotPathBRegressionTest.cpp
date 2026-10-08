@@ -106,7 +106,7 @@ struct Rig {
     std::unique_ptr<rune::node::SegmentProvisionerAgent> prov;   ///< driven on the test thread (its own "thread")
 
     explicit Rig(bool controllerManaged = false, int64_t rollBytes = 64 * 1024 * 1024, const fs::path* at = nullptr,
-                 bool provisioned = false) {
+                 bool provisioned = false, bool withFollower = false) {
         dir.p = at ? *at : ownDir.p;
         log = std::make_unique<rune::storage::Log>(dir.p.string(), rollBytes);
         log->recover();
@@ -119,8 +119,8 @@ struct Rig {
         c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
         c.replicaLagMaxOffset = 1'000'000'000;
         c.followerFlushIntervalNs = 0;
-        auto r = std::make_unique<PartitionReplica>(c, Role::Leader, 1, std::vector<int32_t>{1},
-                                                    std::vector<int32_t>{1}, log.get(), &transport);
+        const std::vector<int32_t> set = withFollower ? std::vector<int32_t>{1, 2} : std::vector<int32_t>{1};
+        auto r = std::make_unique<PartitionReplica>(c, Role::Leader, 1, set, set, log.get(), &transport);
         r->setExternalFollowerFlush(true);
         if (controllerManaged) r->setIsrChannel(&transport);
         rep = r.get();
@@ -156,6 +156,19 @@ struct Rig {
             std::this_thread::yield();
         }
         return true;
+    }
+    /// D26: follower 2's FetchRequest, as the replication transport hands it to the owning worker.
+    void fetch(int64_t from) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::FetchRequest; op.topicId = 1; op.partition = 0; op.replica = rep;
+        op.fetchRequestPayload.leaderEpoch = 1;
+        op.fetchRequestPayload.partition   = 0;
+        op.fetchRequestPayload.followerId  = 2;
+        op.fetchRequestPayload.fetchOffset = from;
+        op.fetchRequestPayload.maxBytes    = 512 * 1024;
+        op.fetchRequestPayload.topicId     = 1;
+        op.fetchRequestPayload.nowNs       = now;
+        ASSERT_TRUE(pool.tryEnqueueOp(1, 0, std::move(op)));
     }
     void pushRead(int64_t subId, int64_t from) {
         WorkerOp op;
@@ -1550,4 +1563,45 @@ TEST(HotPathBRegression, PushReadNeverFaultsThroughTheReadMapRegression) {
     EXPECT_EQ(answered, 2);
     EXPECT_EQ(rig.log->readViewCallsForTest(), viewsBefore)
         << "a PushRead was served through the segment read mmap (page faults on the worker, mmap_lock)";
+}
+
+// D26 (box 2026-10-08, gate Fetch+Retention/2p): follower fetches served on the
+// worker read through the segment read MMAP — first-touch page faults take the
+// process mmap_lock, queued behind the provisioner / cleaner mmap+munmap (perf:
+// 1438 of 1597 worker D-state switches in rwsem_down_read_slowpath from a page
+// fault; fetch-only passes up to 1.4 ms).  A worker-served fetch must read with a
+// pread into the worker's scratch, never through the mapping.
+TEST(HotPathBRegression, FollowerFetchNeverFaultsThroughTheReadMapRegression) {
+    Rig rig(false, 64 * 1024 * 1024, nullptr, false, /*withFollower=*/true);
+    const auto frame = produceFrame(1, 1, 0, 1000, 4);
+    for (int i = 0; i < 64; ++i) rig.pass(&frame);
+    rig.pool.drainAllReturns([](WorkerReturn) {});
+    ASSERT_GT(rig.log->logEndOffset(), 200);
+    const uint64_t viewsBefore = rig.log->readViewCallsForTest();
+    const uint64_t servesBefore = rig.rep->fetchDataServesForTest();
+    rig.fetch(0);
+    rig.pass();
+    rig.fetch(rig.log->logEndOffset() - 8);
+    rig.pass();
+    EXPECT_GE(rig.rep->fetchDataServesForTest(), servesBefore + 1) << "the fetch was not served with data";
+    EXPECT_EQ(rig.log->readViewCallsForTest(), viewsBefore)
+        << "a follower fetch was served through the segment read mmap (page faults on the worker, mmap_lock)";
+}
+
+// D26 review M3: the leader's PUSH to an in-sync follower (pushToFollowers, on
+// the owner's doWork) reads the same way — never through the read map.
+TEST(HotPathBRegression, FollowerPushNeverFaultsThroughTheReadMapRegression) {
+    Rig rig(false, 64 * 1024 * 1024, nullptr, false, /*withFollower=*/true);
+    const auto frame = produceFrame(1, 1, 0, 1000, 4);
+    for (int i = 0; i < 8; ++i) rig.pass(&frame);
+    rig.fetch(rig.log->logEndOffset());   // follower 2 validated and caught up: pushes start
+    rig.pass();
+    rig.pool.drainAllReturns([](WorkerReturn) {});
+    const uint64_t viewsBefore = rig.log->readViewCallsForTest();
+    const int64_t pushesBefore = rig.rep->pushesForTest();
+    for (int i = 0; i < 32; ++i) rig.pass(&frame);
+    EXPECT_GT(rig.rep->pushesForTest(), pushesBefore) << "the leader never pushed to the in-sync follower";
+    EXPECT_EQ(rig.log->readViewCallsForTest(), viewsBefore)
+        << "a leader push read through the segment read mmap (page faults on the worker, mmap_lock)";
+    EXPECT_EQ(rig.rep->readMapFallbacksForTest(), 0u);
 }

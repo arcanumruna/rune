@@ -908,7 +908,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // fails per min-ISR) instead of re-fetching forever behind silent drops.
     rune::storage::LogReadView view{};
     if (serve == FetchServe::Data && req.fetchOffset < logEndOffset_()) {
-        view = onLog([&](auto& L) { return L.readView(req.fetchOffset, req.maxBytes); });
+        view = readLog_(req.fetchOffset, req.maxBytes);
         if (view.len > static_cast<std::size_t>(req.maxBytes)) [[unlikely]] {
             int64_t frame = std::numeric_limits<int64_t>::max();
             onTransport([&](auto& t) { frame = t.maxFetchRecordsBytes(); });
@@ -1082,12 +1082,17 @@ int PartitionReplica::retryOwedFetchAnswers_() noexcept
         if (owed.data && owed.fetchOffset < leo) {
             // The view itself is re-taken every attempt (cheap; never cached across
             // passes — a cleaner swap may remap the segment between them).
-            view = onLog([&](auto& L) { return L.readView(owed.fetchOffset, owed.maxBytes); });
+            view = readLog_(owed.fetchOffset, owed.maxBytes);
             if (view.empty()) [[unlikely]] continue;   // transient read-map failure: next pass
             // F7 / R2: the whole-batch walk is memoised only while the LEO, the
             // view (same mapping, same length) AND the log's segment install
             // generation are unchanged — a compaction swap at the same LEO
             // rewrites the bytes below it and must rebuild (never a torn batch).
+            // (D26: with a read scratch the view pointer is constant; the memo
+            // still holds — an owed entry's fetchOffset is fixed (a new one
+            // resets the memo), a leader's log never truncates within its
+            // leadership, and every segment (re)install bumps the install
+            // generation: the same offset/LEO/len/install gen = the same bytes.)
             const uint64_t installGen = onLog([&](auto& L) { return L.installGeneration(); });
             if (s.owed.builtLeo != leo || s.owed.builtView != view.data ||
                 s.owed.builtLen != view.len || s.owed.builtInstallGen != installGen) {
@@ -3294,6 +3299,17 @@ Offset PartitionReplica::pushFloor_() const noexcept
     return floor;
 }
 
+rune::storage::LogReadView PartitionReplica::readLog_(Offset from, int32_t maxBytes) noexcept
+{
+    if (!memoryBacked_ && readScratch_ != nullptr) [[likely]] {
+        bool tooLarge = false;
+        const rune::storage::LogReadView v = diskLog_->readInto(from, maxBytes, readScratch_, readScratchCap_, tooLarge);
+        if (!tooLarge) [[likely]] return v;
+        ++readMapFallbacks_;
+    }
+    return onLog([&](auto& L) { return L.readView(from, maxBytes); });
+}
+
 int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexcept
 {
     RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplPushToFollowers,
@@ -3344,7 +3360,7 @@ int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexce
             // transport copies the bytes once, straight into the follower's term.
             // (F3 round 6 item 1: chunk capped at the transport's LIVE ceiling —
             // F18 m-3's pushCap; one ceiling: maxFetchRecordsBytes().)
-            v = onLog([&](auto& L) { return L.readView(from, static_cast<int32_t>(pushCap)); });
+            v = readLog_(from, static_cast<int32_t>(pushCap));
             // F18 / KIP-74: a first batch larger than maxFetchBytes is still pushed
             // whole (never stuck).  FLOW CONTROL: no batch that begins at or beyond
             // pushCeiling is pushed (in-flight <= kPushFlowWindow).

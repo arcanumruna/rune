@@ -1083,6 +1083,18 @@ public:
     /// push on, a non-zero count means the follower had to be re-served
     /// (lost/dropped push → 20 ms resend window).
     [[nodiscard]] uint64_t fetchDataServesForTest() const noexcept { return fetchDataServes_; }
+    /// D26: the calling thread's log-read scratch (non-owning).  The owning
+    /// worker sets it around each call into this replica (onFetchRequest /
+    /// doWork) and clears it after, so a fetch serve, owed re-serve or push
+    /// reads the disk log with a pread into it — never through the segment read
+    /// mmap, whose first-touch page faults wait on the process mmap_lock behind
+    /// the provisioner / cleaner.  Null (control thread, tests): the mapped view.
+    void setReadScratch(uint8_t* buf, std::size_t cap) noexcept { readScratch_ = buf; readScratchCap_ = cap; }
+    /// D26: reads that fell back to the mapped view with a scratch set (a first
+    /// batch larger than the scratch).
+    [[nodiscard]] uint64_t readMapFallbacksForTest() const noexcept { return readMapFallbacks_; }
+    /// Leader pushes that read a chunk (pushToFollowers).
+    [[nodiscard]] int64_t pushesForTest() const noexcept { return rtPushes_; }
     /// Test seam: a follower-side log truncation (KIP-279), bumping logGeneration().
     void truncateLogForTest(Offset truncateOffset) { truncateLog(truncateOffset); }
     /// F27: replication sends this replica had REFUSED by its transport (pushes,
@@ -1288,6 +1300,13 @@ private:
     rune::storage::Log*         diskLog_ = nullptr;  ///< non-null iff !memoryBacked_
     rune::storage::InMemoryLog* memLog_  = nullptr;  ///< non-null iff  memoryBacked_
     bool                        memoryBacked_ = false;
+    uint8_t*                    readScratch_ = nullptr;     ///< D26: see setReadScratch()
+    std::size_t                 readScratchCap_ = 0;
+    uint64_t                    readMapFallbacks_ = 0;
+    /// D26: a whole-batch read of the active log — a pread into readScratch_
+    /// when set (disk log), else the mapped view.  The view lives until the next
+    /// read through this helper on the same thread.
+    rune::storage::LogReadView readLog_(Offset from, int32_t maxBytes) noexcept;
     PartitionTransport*         transport_;   ///< non-owning
     using PerWorkerTransport = WorkerReplicationTransportImpl<AeronPubRegistry>;
     TransportKind       tkind_     = TransportKind::Generic;  ///< fixed at construction
