@@ -89,6 +89,31 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_gateway_crypto_tests)
 
     # -------------------------------------------------------------------------
+    # Task 15: SECURITY REGRESSION SUITE (named `*Regression*` so it is
+    # selected as the run-first priority gate per CLAUDE.md rule 6/7).
+    # Consolidates the tamper/AAD/replay/cross-session/per-sender/downgrade/
+    # handshake security properties proven piecemeal across
+    # rune_gateway_crypto_tests + rune_gateway_require_tls_tests, plus the
+    # gaps GatewayCryptoRegressionTest.cpp's own file header documents.
+    # Same aeron-free build shape as rune_gateway_crypto_tests above (links
+    # rune_crypto + GTest only; needs this lib's + libs/node's include/ dirs
+    # + the protocol include dir, but deliberately skips linking
+    # rune_gateway/rune_node to stay off <Aeron.h>).
+    # -------------------------------------------------------------------------
+    add_executable(rune_gateway_crypto_regression_tests
+        tests/GatewayCryptoRegressionTest.cpp)
+    target_include_directories(rune_gateway_crypto_regression_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../node/include
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_gateway_crypto_regression_tests PRIVATE
+        rune_crypto
+        GTest::gtest_main)
+    target_compile_definitions(rune_gateway_crypto_regression_tests PRIVATE
+        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
+    gtest_discover_tests(rune_gateway_crypto_regression_tests)
+
+    # -------------------------------------------------------------------------
     # Task 9: require_tls / shard-mode downgrade-safety decision logic
     # (ConnectDowngradePolicy.h) + cert/key FILE PATH -> PEM TEXT loading
     # (rune/node/PemFile.{h,cpp}). Aeron-free for the same reason as
