@@ -794,6 +794,23 @@ if(BUILD_TESTING)
 
     gtest_discover_tests(rune_client_crypto_tests)
 
+    # ── Task 15: SECURITY REGRESSION SUITE (named `*Regression*` so it is
+    # selected as the run-first priority gate per CLAUDE.md rule 6/7).
+    # Consolidates the tamper/AAD/replay/cross-session/per-sender/downgrade/
+    # handshake security properties already proven piecemeal in
+    # rune_client_crypto_tests, plus the gaps
+    # ClientCryptoRegressionTest.cpp's own file header documents. Same
+    # aeron-free build shape as rune_client_crypto_tests above. ──
+    add_executable(rune_client_crypto_regression_tests
+        tests/crypto/ClientCryptoRegressionTest.cpp
+    )
+    target_link_libraries(rune_client_crypto_regression_tests PRIVATE rune_client rune_crypto GTest::gtest_main)
+    target_include_directories(rune_client_crypto_regression_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_compile_definitions(rune_client_crypto_regression_tests PRIVATE
+        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
+
+    gtest_discover_tests(rune_client_crypto_regression_tests)
+
     # ── Transport tests (CC-3) — embedded Aeron driver + ipc loopback echo ──
     if(aeron_FOUND)
         add_executable(rune_transport_tests
