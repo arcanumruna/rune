@@ -815,7 +815,7 @@ TEST(ClientCryptoPerSender, ForgedOrOutOfRangeSenderIdIsDroppedFailClosed) {
     ASSERT_NE(keys.cipher, rune::crypto::Cipher::None);
     rune::crypto::AeadCipher someCipher(keys.cipher, keys.b2c, keys.b2cPrefix);
 
-    // senderId 250 is far beyond CryptoState::kMaxShardWorkers (32) -> the
+    // senderId 250 is far beyond CryptoState::kMaxShardWorkers (64) -> the
     // client cannot/will-not derive a key for it. Fail closed: drop, no trial
     // decrypt against any OTHER sender's cipher.
     const auto forged = sealAsSender(someCipher, keys.cipher, /*senderId=*/250, /*seq=*/1,
@@ -838,4 +838,70 @@ TEST(ClientCryptoPerSender, ForgedOrOutOfRangeSenderIdIsDroppedFailClosed) {
     const std::size_t wrongKeyOpenedLen =
         cc::openEgressFrame(f.m.cryptoState(), wrongKeyFrame.data(), wrongKeyFrame.size(), opened, sizeof opened);
     EXPECT_EQ(wrongKeyOpenedLen, 0u) << "wrong key under a valid senderId must fail auth, not succeed";
+}
+
+// Code-review fix (Task 20 changes-requested): the broker's canonical shard
+// worker cap is rune::node::NodeConfig::kMaxShardWorkers == 64 (rune-broker-tls,
+// libs/node/include/rune/node/NodeConfig.h), so worker senderIds run 1..64. The
+// original CryptoState::kMaxShardWorkers was 32 -- a legitimately-configured
+// 33-64 worker deployment would have its top-half workers' senderIds rejected
+// as "out of range" by selectRecvSlot, permanently (fail-closed, so not a
+// security hole, but an availability bug: those workers' Records would never
+// open). This pins the exact boundary: senderId 64 (the top worker) MUST open;
+// senderId 65 MUST NOT. Also checks 33 (inside the old, too-small bound) opens,
+// since that's the case that was silently broken before this fix.
+TEST(ClientCryptoPerSender, BoundaryWorkerSenderIdsUpToBrokerMaxOpenOneBeyondIsDropped) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    ASSERT_TRUE(f.established(1'000'000'000LL));
+
+    const auto keys = f.srv.exportKeys(f.m.cryptoState().cipher, FrameFixture::kSessionId);
+    ASSERT_NE(keys.cipher, rune::crypto::Cipher::None);
+
+    uint8_t opened[256];
+
+    // senderId 33 -- inside the OLD (too-small, 32-worker) bound; must open.
+    {
+        rune::crypto::AeadKey derived33{};
+        ASSERT_TRUE(rune::crypto::deriveSenderKey(keys.b2c, 33, derived33));
+        rune::crypto::AeadCipher cipher33(keys.cipher, derived33, keys.b2cPrefix);
+        const auto sealed33 = sealAsSender(cipher33, keys.cipher, /*senderId=*/33, /*seq=*/1,
+                                            FrameFixture::kSessionId, 908, "worker-33-record");
+        const std::size_t len33 =
+            cc::openEgressFrame(f.m.cryptoState(), sealed33.data(), sealed33.size(), opened, sizeof opened);
+        const auto plain33 = buildPlainProduceFrame(FrameFixture::kSessionId, 908, "worker-33-record");
+        ASSERT_EQ(len33, plain33.size())
+            << "senderId 33 (within the broker's 64-worker max) must open -- this is exactly "
+               "the top-half-of-a-large-deployment case the kMaxShardWorkers=32 bug broke";
+        EXPECT_EQ(0, std::memcmp(plain33.data(), opened, plain33.size()));
+    }
+
+    // senderId 64 -- the broker's max worker (NodeConfig::kMaxShardWorkers);
+    // the LAST valid slot. Must open.
+    {
+        rune::crypto::AeadKey derived64{};
+        ASSERT_TRUE(rune::crypto::deriveSenderKey(keys.b2c, 64, derived64));
+        rune::crypto::AeadCipher cipher64(keys.cipher, derived64, keys.b2cPrefix);
+        const auto sealed64 = sealAsSender(cipher64, keys.cipher, /*senderId=*/64, /*seq=*/1,
+                                            FrameFixture::kSessionId, 909, "worker-64-record");
+        const std::size_t len64 =
+            cc::openEgressFrame(f.m.cryptoState(), sealed64.data(), sealed64.size(), opened, sizeof opened);
+        const auto plain64 = buildPlainProduceFrame(FrameFixture::kSessionId, 909, "worker-64-record");
+        ASSERT_EQ(len64, plain64.size())
+            << "senderId 64 (the broker's top worker) must open -- the exact boundary this fix restores";
+        EXPECT_EQ(0, std::memcmp(plain64.data(), opened, plain64.size()));
+    }
+
+    // senderId 65 -- one past the broker's max; no worker can ever legitimately
+    // claim it. Must be dropped, fail-closed.
+    {
+        rune::crypto::AeadKey derived65{};
+        ASSERT_TRUE(rune::crypto::deriveSenderKey(keys.b2c, 65, derived65));
+        rune::crypto::AeadCipher cipher65(keys.cipher, derived65, keys.b2cPrefix);
+        const auto sealed65 = sealAsSender(cipher65, keys.cipher, /*senderId=*/65, /*seq=*/1,
+                                            FrameFixture::kSessionId, 910, "forged-worker-65-record");
+        const std::size_t len65 =
+            cc::openEgressFrame(f.m.cryptoState(), sealed65.data(), sealed65.size(), opened, sizeof opened);
+        EXPECT_EQ(len65, 0u) << "senderId 65 is one past the broker's max worker -- must be dropped, fail-closed";
+    }
 }

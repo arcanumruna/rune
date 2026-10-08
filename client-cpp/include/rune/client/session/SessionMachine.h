@@ -222,7 +222,16 @@ struct CryptoState {
         uint64_t recvSeq    = 0;
         uint64_t recvWindow = 0;
     };
-    static constexpr uint8_t kMaxShardWorkers = 32;
+    // CROSS-REPO INVARIANT: must stay >= rune::node::NodeConfig::kMaxShardWorkers
+    // (rune-broker-tls, libs/node/include/rune/node/NodeConfig.h — currently 64,
+    // enforced by NodeConfig::validate). Worker i seals with senderId = i+1, so a
+    // broker legitimately configured with up to NodeConfig::kMaxShardWorkers
+    // workers can produce senderIds up to that same count; this table must have a
+    // slot for every one of them or the client's selectRecvSlot fail-closed path
+    // (idx >= kMaxShardWorkers) silently (and permanently) drops that worker's
+    // Records. The two repos can't share a header, so this value is NOT derived
+    // from NodeConfig — if the broker's max ever changes, mirror it here too.
+    static constexpr uint8_t kMaxShardWorkers = 64;
     std::array<WorkerRecv, kMaxShardWorkers> workerRecv{};
 };
 
