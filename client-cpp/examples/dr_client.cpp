@@ -123,6 +123,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <sstream>
@@ -801,6 +802,31 @@ int main() {
     if (cfg.topics.empty()) {
         std::cerr << "CLIENT: no valid topics parsed from RUNE_TOPICS='" << topicsStr << "'\n";
         return 1;
+    }
+
+    // client<->broker TLS/AEAD (Task 16 encrypted e2e): enable crypto from env.
+    //   RUNE_CLIENT_TLS=1          offer crypto (v(crypto) ConnectRequest + TLS 1.3 handshake)
+    //   RUNE_TLS_TRUST_PEM=<path>  CA-bundle file to trust; unset => system store
+    //   RUNE_TLS_EXPECT_HOST=<h>   hostname checked against the broker cert SAN (e.g. localhost)
+    //   RUNE_TLS_REQUIRE=1         fail the connection unless it ends up encrypted (anti-downgrade)
+    if (getEnvInt("RUNE_CLIENT_TLS", 0) != 0) {
+        cfg.offerCrypto   = true;
+        cfg.requireCrypto = getEnvInt("RUNE_TLS_REQUIRE", 0) != 0;
+        cfg.tlsExpectHost = getEnvStr("RUNE_TLS_EXPECT_HOST");
+        const std::string trustPath = getEnvStr("RUNE_TLS_TRUST_PEM");
+        if (!trustPath.empty()) {
+            std::ifstream tf(trustPath, std::ios::binary);
+            if (!tf) {
+                std::cerr << "CLIENT: cannot read RUNE_TLS_TRUST_PEM='" << trustPath << "'\n";
+                return 1;
+            }
+            std::ostringstream ss;
+            ss << tf.rdbuf();
+            cfg.tlsTrustPem = ss.str();  // PEM text (makeClient's trust bundle)
+        }  // else leave tlsTrustPem = nullopt => trust the system store
+        std::cerr << "CLIENT: TLS enabled (offerCrypto=1 require=" << (cfg.requireCrypto ? 1 : 0)
+                  << " expectHost='" << cfg.tlsExpectHost << "' trust="
+                  << (trustPath.empty() ? std::string("system") : trustPath) << ")\n";
     }
 
     int rc = 0;

@@ -86,6 +86,11 @@ struct ConnectRequestView {
     int32_t      egressStreamId = 0;
     int32_t      clientVersion  = 0;
     std::string_view egressChannel;  // view into the original buffer
+
+    // v4 additive crypto fields (Task 5) — default-empty => no crypto offered.
+    std::span<const uint8_t> cipherList;
+    std::string_view         handshakeBytes;
+    std::string_view         authToken;
 };
 
 /// Encode a ConnectRequest frame into buf[0..cap-1].
@@ -125,7 +130,46 @@ inline std::optional<ConnectRequestView> decodeConnectRequest(const uint8_t* buf
     v.egressStreamId = opt->egressStreamId;
     v.clientVersion  = opt->clientVersion;
     v.egressChannel  = opt->egressChannel;
+    v.cipherList     = opt->cipherList;
+    v.handshakeBytes = opt->handshakeBytes;
+    v.authToken      = opt->authToken;
     return v;
+}
+
+/// Task 5 (client<->broker TLS/AEAD): encode a v4 ConnectRequest OFFERING crypto —
+/// cipherList/handshakeBytes/authToken.  Unlike encodeConnectRequest() above (fixed
+/// kScratchCap=512 caller buffer), this grows `buf` (a caller-owned, reusable
+/// std::vector) to fit: the handshake bytes of a TLS 1.3 ClientHello (and later,
+/// resumed) flights do not reliably fit in 512 bytes.  Cold path only (once per
+/// connect episode) — the steady-state produce/subscribe hot path never calls this.
+/// Returns total bytes written (buf is resized to exactly fit).
+inline std::size_t encodeConnectRequestCrypto(std::vector<uint8_t>&     buf,
+                                               std::string_view         egressChannel,
+                                               int32_t                  egressStreamId,
+                                               int32_t                  clientVersion,
+                                               int64_t                  sessionId,
+                                               int64_t                  correlationId,
+                                               std::span<const uint8_t> cipherList,
+                                               std::string_view         handshakeBytes,
+                                               std::string_view         authToken) noexcept {
+    rpc::ConnectRequest msg;
+    msg.sessionId      = sessionId;
+    msg.correlationId  = correlationId;
+    msg.egressStreamId = egressStreamId;
+    msg.clientVersion  = clientVersion;
+    msg.egressChannel  = egressChannel;
+    msg.cipherList     = cipherList;
+    msg.handshakeBytes = handshakeBytes;
+    msg.authToken      = authToken;
+
+    const std::size_t needed = rpc::MessageHeader::ENCODED_SIZE
+                              + rpc::ConnectRequest::BODY_FIXED
+                              + 2u + egressChannel.size()
+                              + 2u + cipherList.size()
+                              + 4u + handshakeBytes.size()
+                              + 2u + authToken.size();
+    buf.resize(needed);
+    return msg.encode(buf.data());
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +182,10 @@ struct ConnectResponseView {
     int32_t leaderMemberId    = -1;
     int64_t assignedSessionId = 0;
     int32_t brokerVersion     = 0;   // capability gate (0 = a broker that predates the field)
+
+    // v4 additive crypto fields (Task 5) — default => no crypto chosen.
+    uint8_t          chosenCipher = 0;   // rune::crypto::Cipher value; 0 = none
+    std::string_view handshakeBytes;     // handshake continuation blob (e.g. TLS ServerHello)
 };
 
 /// Encode a ConnectResponse frame into buf[0..cap-1].
@@ -150,7 +198,9 @@ inline std::size_t encodeConnectResponse(uint8_t* buf,
                                           int64_t     assignedSessionId,
                                           int64_t     sessionId,
                                           int64_t     correlationId,
-                                          int32_t     brokerVersion = rpc::kBrokerVersion) noexcept {
+                                          int32_t     brokerVersion = rpc::kBrokerVersion,
+                                          uint8_t     chosenCipher = 0,
+                                          std::string_view handshakeBytes = {}) noexcept {
     if (cap < rpc::ConnectResponse::ENCODED_SIZE) return 0u;
     rpc::ConnectResponse msg;
     msg.sessionId         = sessionId;
@@ -159,6 +209,8 @@ inline std::size_t encodeConnectResponse(uint8_t* buf,
     msg.leaderMemberId    = leaderMemberId;
     msg.assignedSessionId = assignedSessionId;
     msg.brokerVersion     = brokerVersion < 0 ? 0 : brokerVersion;
+    msg.chosenCipher      = chosenCipher;
+    msg.handshakeBytes    = handshakeBytes;
     const std::size_t n = msg.encode(buf);
     if (brokerVersion >= 0) return n;
     // An older broker's 38-byte frame (no brokerVersion field).
@@ -178,6 +230,8 @@ inline std::optional<ConnectResponseView> decodeConnectResponse(const uint8_t* b
     v.leaderMemberId    = opt->leaderMemberId;
     v.assignedSessionId = opt->assignedSessionId;
     v.brokerVersion     = opt->brokerVersion;
+    v.chosenCipher      = opt->chosenCipher;
+    v.handshakeBytes    = opt->handshakeBytes;
     return v;
 }
 
@@ -463,6 +517,68 @@ inline std::optional<MetadataResponseDecoded> decodeMetadataResponse(
     }
 
     return result;
+}
+
+// ===========================================================================
+// client<->broker TLS/AEAD (Task 5): HandshakeContinue / HandshakeContinueResponse
+// adapters.  Brand-new template ids (10/11) — no legacy-peer compatibility gating
+// needed (an old peer never sends/expects them).
+// ===========================================================================
+
+/// Task 5: encode a HandshakeContinue (a later leg of a multi-round handshake).
+/// Grows `buf` (caller-owned, reusable) to fit — cold path only, see
+/// encodeConnectRequestCrypto() above for why this isn't the fixed kScratchCap.
+inline std::size_t encodeHandshakeContinue(std::vector<uint8_t>& buf,
+                                            std::string_view      handshakeBytes,
+                                            int64_t                sessionId,
+                                            int64_t                correlationId) noexcept {
+    rpc::HandshakeContinue msg;
+    msg.sessionId      = sessionId;
+    msg.correlationId  = correlationId;
+    msg.handshakeBytes = handshakeBytes;
+    buf.resize(msg.encodedSize());
+    return msg.encode(buf.data());
+}
+
+/// Decode a HandshakeContinue frame (broker-side use; kept here for symmetry/tests).
+inline std::optional<rpc::HandshakeContinue> decodeHandshakeContinue(const uint8_t* buf,
+                                                                      std::size_t    len) noexcept {
+    return rpc::HandshakeContinue::decode(buf, len);
+}
+
+struct HandshakeContinueResponseView {
+    int64_t           sessionId     = 0;
+    int64_t           correlationId = 0;
+    int16_t           code          = 0;  // ErrorCode value
+    std::string_view  handshakeBytes;
+};
+
+/// Task 5: encode a HandshakeContinueResponse (test / fake-broker use).
+inline std::size_t encodeHandshakeContinueResponse(std::vector<uint8_t>& buf,
+                                                     int16_t                code,
+                                                     std::string_view       handshakeBytes,
+                                                     int64_t                sessionId,
+                                                     int64_t                correlationId) noexcept {
+    rpc::HandshakeContinueResponse msg;
+    msg.sessionId      = sessionId;
+    msg.correlationId  = correlationId;
+    msg.code           = code;
+    msg.handshakeBytes = handshakeBytes;
+    buf.resize(msg.encodedSize());
+    return msg.encode(buf.data());
+}
+
+/// Decode a HandshakeContinueResponse frame.
+inline std::optional<HandshakeContinueResponseView> decodeHandshakeContinueResponse(
+    const uint8_t* buf, std::size_t len) noexcept {
+    auto opt = rpc::HandshakeContinueResponse::decode(buf, len);
+    if (!opt) return std::nullopt;
+    HandshakeContinueResponseView v;
+    v.sessionId      = opt->sessionId;
+    v.correlationId  = opt->correlationId;
+    v.code           = opt->code;
+    v.handshakeBytes = opt->handshakeBytes;
+    return v;
 }
 
 // ===========================================================================

@@ -19,6 +19,23 @@ if(NOT TARGET aeron::aeron)
     add_library(aeron::aeron ALIAS rune_aeron_stub)
 endif()
 find_package(spdlog REQUIRED)
+# client<->broker TLS/AEAD (Task 5): TLS 1.3 handshake + AEAD (rune-crypto, below).
+find_package(OpenSSL REQUIRED)
+
+# Task 9 / spec §11: RUNE_TLS — the client<->broker TLS/AEAD enablement gate,
+# mirroring the broker's RUNE_TLS CMake option for a consistent build matrix.
+# Unlike the broker, the client has no env-driven TLS config to gate: its
+# crypto core (Tasks 5-8/8b) is already always compiled in, and
+# offerCrypto/tlsTrustPem/tlsExpectHost/authToken/requireCrypto
+# (ClientConfig, mapped into session::SessionConfig by Client.cpp's
+# toAgentConfig()) are plain programmatic fields an application sets in code
+# — they default to false/empty regardless of this option, so a caller who
+# never touches them gets today's byte-identical plaintext connect either
+# way. This option exists so RUNE_TLS=ON/OFF can be passed uniformly across
+# both repos' build scripts; it does not currently change this repo's compiled
+# output (reserved for a future env-var-driven default, symmetric with the
+# broker's RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE/RUNE_REQUIRE_TLS).
+option(RUNE_TLS "Enable the RUNE_TLS client<->broker TLS/AEAD config path (build-matrix parity with the broker; no effect on this repo's compiled output today)" OFF)
 
 option(ENABLE_COVERAGE "Enable coverage instrumentation" OFF)
 if(ENABLE_COVERAGE)
@@ -115,6 +132,20 @@ else()
     target_compile_definitions(rune_fr PUBLIC RUNE_FR=0)
 endif()
 
+# ── rune-crypto (client<->broker TLS/AEAD, Task 5) — sibling source static lib ──
+# Mirrors the rune-fr wiring above: TlsSession (TLS 1.3 memory-BIO handshake) +
+# AeadCipher (seal/open) + Caps (CPU cipher selection), consumed by SessionMachine.h
+# (header-only) and, once Task 6 lands, the produce/egress seal/open seams.
+set(RUNE_CRYPTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-crypto"
+    CACHE PATH "Path to the rune-crypto sibling repo")
+add_library(rune_crypto STATIC
+    ${RUNE_CRYPTO_ROOT}/src/Caps.cpp
+    ${RUNE_CRYPTO_ROOT}/src/Aead.cpp
+    ${RUNE_CRYPTO_ROOT}/src/TlsSession.cpp)
+target_include_directories(rune_crypto PUBLIC ${RUNE_CRYPTO_ROOT}/include)
+target_link_libraries(rune_crypto PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+target_compile_features(rune_crypto PUBLIC cxx_std_23)
+
 # ── rune-codec (0a) — consumed as a SIBLING source static lib (like rune-fr) ──
 set(RUNE_CODEC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-codec"
     CACHE PATH "Path to the rune-codec sibling repo")
@@ -196,6 +227,14 @@ if(aeron_FOUND)
         $<INSTALL_INTERFACE:include>
     )
     target_link_libraries(rune_client_transport PUBLIC aeron::aeron spdlog::spdlog rune_fr rune_gso rune_client_driver_wake)
+    # client<->broker TLS/AEAD (Task 5): SessionMachine.h is a PUBLIC header that
+    # #includes rune-crypto's headers and holds a TlsSession/CryptoState member, so
+    # every downstream target compiling a TU that includes ClientAgent.h/Client.h
+    # (rune_client_api, rune_client_producer, test/benchmark targets, ...) needs
+    # rune_crypto's include dir too — PUBLIC, same as rune_fr right above (fix
+    # round 1: an earlier PRIVATE here only satisfied THIS target's own link,
+    # not the transitive header dependency every downstream target has).
+    target_link_libraries(rune_client_transport PUBLIC rune_crypto OpenSSL::SSL OpenSSL::Crypto)
 
     # Linux CI portability: libuuid is needed on Linux but not macOS (no-op there).
     if(UNIX AND NOT APPLE)
@@ -230,6 +269,11 @@ if(aeron_FOUND)
         spdlog::spdlog
         rune_codec
     )
+    # client<->broker TLS/AEAD (Task 5): PUBLIC, same transitive-header reason as
+    # rune_client_transport above — ClientAgent.h is itself a public header
+    # downstream targets (rune_client_producer, rune_client_subscriber,
+    # rune_client_api, ...) compile against.
+    target_link_libraries(rune_client_agent PUBLIC rune_crypto OpenSSL::SSL OpenSSL::Crypto)
     if(UNIX AND NOT APPLE)
         find_library(UUID_LIB uuid)
         if(UUID_LIB)
@@ -772,10 +816,43 @@ if(BUILD_TESTING)
     add_executable(rune_session_tests
         tests/session/SessionMachineTest.cpp
     )
-    target_link_libraries(rune_session_tests PRIVATE rune_client GTest::gtest_main)
+    # client<->broker TLS/AEAD (Task 5): SessionMachine.h now drives a real
+    # TlsSession/AeadCipher directly (header-only) — this target links rune_crypto
+    # itself since it never goes through rune_client_agent/transport.
+    target_link_libraries(rune_session_tests PRIVATE rune_client rune_crypto GTest::gtest_main)
     target_include_directories(rune_session_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
 
     gtest_discover_tests(rune_session_tests)
+
+    # ── client<->broker TLS/AEAD (Task 5): handshake drive round-trip ─────────
+    # No Aeron dependency — drives a real SessionMachine (fake SessionIo) against
+    # a real TlsSession::makeServer loopback, over rune-crypto's own test certs.
+    add_executable(rune_client_crypto_tests
+        tests/crypto/ClientCryptoRoundTripTest.cpp
+    )
+    target_link_libraries(rune_client_crypto_tests PRIVATE rune_client rune_crypto GTest::gtest_main)
+    target_include_directories(rune_client_crypto_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_compile_definitions(rune_client_crypto_tests PRIVATE
+        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
+
+    gtest_discover_tests(rune_client_crypto_tests)
+
+    # ── Task 15: SECURITY REGRESSION SUITE (named `*Regression*` so it is
+    # selected as the run-first priority gate per CLAUDE.md rule 6/7).
+    # Consolidates the tamper/AAD/replay/cross-session/per-sender/downgrade/
+    # handshake security properties already proven piecemeal in
+    # rune_client_crypto_tests, plus the gaps
+    # ClientCryptoRegressionTest.cpp's own file header documents. Same
+    # aeron-free build shape as rune_client_crypto_tests above. ──
+    add_executable(rune_client_crypto_regression_tests
+        tests/crypto/ClientCryptoRegressionTest.cpp
+    )
+    target_link_libraries(rune_client_crypto_regression_tests PRIVATE rune_client rune_crypto GTest::gtest_main)
+    target_include_directories(rune_client_crypto_regression_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_compile_definitions(rune_client_crypto_regression_tests PRIVATE
+        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
+
+    gtest_discover_tests(rune_client_crypto_regression_tests)
 
     # ── Transport tests (CC-3) — embedded Aeron driver + ipc loopback echo ──
     if(aeron_FOUND)

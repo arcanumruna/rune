@@ -1012,7 +1012,7 @@ TEST(CliLive, AlterTopicLive) {
     try { std::filesystem::remove_all(baseDir); } catch (...) {}
 }
 
-// Test 11: AlterTopicSchemaIncompatible — SchemaIncompatible(29) -> clear message
+// Test 11: AlterTopicSchemaIncompatible — SchemaIncompatible(30) -> clear message
 TEST(CliLive, AlterTopicSchemaIncompatible) {
     static constexpr int32_t kIn = 1242, kOut = 1243;
     const std::string baseDir = cliUniqueDir();
@@ -1037,7 +1037,7 @@ TEST(CliLive, AlterTopicSchemaIncompatible) {
     auto r = runCli(gw, aeronDir, args);
 
     EXPECT_EQ(r.rc, static_cast<int>(rpc::ErrorCode::SchemaIncompatible))
-        << "CLI must return 29 (SchemaIncompatible); err=" << r.err;
+        << "CLI must return 30 (SchemaIncompatible); err=" << r.err;
     EXPECT_NE(r.err.find("incompatible"), std::string::npos)
         << "err must mention 'incompatible'; got: " << r.err;
 
@@ -1045,7 +1045,7 @@ TEST(CliLive, AlterTopicSchemaIncompatible) {
     try { std::filesystem::remove_all(baseDir); } catch (...) {}
 }
 
-// Test 12: AlterTopicSchemaConflict — SchemaConflict(30) -> clear message
+// Test 12: AlterTopicSchemaConflict — SchemaConflict(31) -> clear message
 TEST(CliLive, AlterTopicSchemaConflict) {
     static constexpr int32_t kIn = 1244, kOut = 1245;
     const std::string baseDir = cliUniqueDir();
@@ -1071,7 +1071,7 @@ TEST(CliLive, AlterTopicSchemaConflict) {
     auto r = runCli(gw, aeronDir, args);
 
     EXPECT_EQ(r.rc, static_cast<int>(rpc::ErrorCode::SchemaConflict))
-        << "CLI must return 30 (SchemaConflict); err=" << r.err;
+        << "CLI must return 31 (SchemaConflict); err=" << r.err;
     EXPECT_NE(r.err.find("stale"), std::string::npos)
         << "err must mention 'stale'; got: " << r.err;
 

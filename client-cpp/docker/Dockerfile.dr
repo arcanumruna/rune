@@ -11,6 +11,7 @@
 #     --build-context rune-fr=../rune-fr \
 #     --build-context rune-codec=../rune-codec \
 #     --build-context rune-ql=../rune-ql \
+#     --build-context rune-crypto=../rune-crypto \
 #     -f docker/Dockerfile.dr \
 #     -t rune-dr-client:$(git rev-parse --short HEAD) .   # always a git-SHA tag, never dev/latest
 #
@@ -66,6 +67,13 @@ COPY --from=rune-codec tools   /rune-codec/tools
 COPY --from=rune-ql src     /rune-ql/src
 COPY --from=rune-ql include /rune-ql/include
 
+# client<->broker TLS/AEAD (Task 5): rune-crypto sibling (TlsSession + AeadCipher +
+# CPU cipher selection), compiled into rune_crypto by the client's CMakeLists.
+# Supplied via the BuildKit named build context `rune-crypto`:
+#   docker build --build-context rune-crypto=../rune-crypto ...
+COPY --from=rune-crypto src     /rune-crypto/src
+COPY --from=rune-crypto include /rune-crypto/include
+
 # Application sources.
 COPY . .
 
@@ -80,6 +88,7 @@ RUN cmake -S . -B build -G Ninja \
         -DRUNE_CODEC_ROOT=/rune-codec \
         -DRUNE_QL_ROOT=/rune-ql \
         -DRUNE_FR_DIR=/rune-fr \
+        -DRUNE_CRYPTO_ROOT=/rune-crypto \
     && cmake --build build --target dr_client -j2
 
 RUN cp -L /usr/local/lib64/libstdc++.so.6 /build/libstdc++.so.6

@@ -855,6 +855,15 @@ private:
     std::vector<ProduceAck>     produceAcks_;  // reserved in the ctor; owner clears
     bool                        forwardProduceResponses_ = true;
     bool                        mnDebug_ = false;  // RUNE_MN_DEBUG, read ONCE
+
+    /// client<->broker TLS/AEAD (Task 6): reusable decrypt scratch for
+    /// dispatchEgressFrame's data-plane open path — holds the reconstructed
+    /// [24B header][plaintext body] a decrypted egress frame is checkFrame'd /
+    /// switched on.  Single-writer (the agent's own doWork thread), grows to
+    /// the largest egress frame decrypted so far and never shrinks (zero
+    /// steady-state allocation once warmed up) — same shape as AeronTransport's
+    /// cryptoSealScratch_ on the encrypt side.
+    std::vector<uint8_t>        egressDecryptScratch_;
     uint32_t sessionIndexFor_(const std::string& endpoint) noexcept;
     void releaseRoutePub_(transport::AeronTransport::PubHandle h) noexcept;  // M4
 
@@ -886,6 +895,17 @@ private:
     bool offerProduceToLeader_(int32_t topicId, int32_t partition, int32_t ingressStreamId,
                                const uint8_t* buf, std::size_t len,
                                transport::FrameCrc crc) noexcept;
+
+    // ---- client<->broker TLS/AEAD (Task 6b): seal every OTHER non-handshake --
+    // client->broker send site under its DESTINATION session's CryptoState.
+    // Shared by offerControlTo / offerIngress_ / offerOnSession (every
+    // non-Produce publication write) — offerProduceToLeader_ already seals on
+    // its own (via sealForOffer) and does not call this.  No-op (buf/len
+    // unchanged) when `crypto.encrypted` is false — byte-identical plaintext
+    // path.  Reseats buf/len to the transport's reusable seal scratch on
+    // success; returns false (DROP, never transmit) on seal failure.
+    [[nodiscard]] bool sealForDestination_(session::CryptoState& crypto,
+                                           const uint8_t*& buf, std::size_t& len) noexcept;
 
     // ---- Ring buffer (MPSC: many app threads write, one agent thread reads) -
     // Buffer size = power-of-two capacity + trailer.

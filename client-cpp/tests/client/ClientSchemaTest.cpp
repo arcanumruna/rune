@@ -810,7 +810,7 @@ TEST(ClientSchema, AlterTopicFutureResolvesOnOK) {
 // ===========================================================================
 // Test 12: AlterTopicResponseErrorCodePropagates
 //
-// A stale expectedVersion -> SchemaConflict (broker errorCode 30).  The result
+// A stale expectedVersion -> SchemaConflict (broker errorCode 31).  The result
 // carries the errorCode without throwing (same contract as DefineTopic/
 // GetTopicSchema broker errors).
 // ===========================================================================
