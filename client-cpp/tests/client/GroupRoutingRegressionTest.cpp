@@ -1229,7 +1229,11 @@ TEST(GroupRoutingRegression, MemberOnAFollowerJoinsTheCoordinatorRegression) {
     GroupRig r(4131, 4132);
     const auto [n1, p1port] = r.addNode(4131);
     r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
-    r.gw.partitions            = {{1, 0, /*leader*/ n1, 1, 4131, ""}, {1, 1, n1, 1, 4131, ""}};
+    // Partition 0 is led by the coordinator (node 1); partition 1 by the
+    // bootstrap follower (node 0) — after the seed moves to node 1, partition 1
+    // still needs a session to node 0.
+    r.gw.partitions            = {{1, 0, /*leader*/ n1, 1, 4131, ""}, {1, 1, /*leader*/ 0, 1, 4131, ""}};
+    r.gw.subscribeLeader       = {{0, n1}, {1, 0}};
     r.gw.groupAssignment       = {{1, 0}, {1, 1}};
     r.gw.coordinatorEndpoint   = n1;                                     // node 1 is the coordinator
     r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p1port);
@@ -1250,4 +1254,12 @@ TEST(GroupRoutingRegression, MemberOnAFollowerJoinsTheCoordinatorRegression) {
     EXPECT_LT(ms, 5'000) << "joined only after " << ms << " ms (a join deadline, not the redirect)";
     EXPECT_GE(r.gw.notCoordinatorAnswers, 1) << "precondition: the follower answered NotCoordinator";
     EXPECT_EQ(r.gw.groupEndpoints.back(), n1) << "the last group frame did not reach the coordinator";
+    // Both partitions are consumed from their own leaders — including the one the
+    // old seed node leads (the moved seed must not still claim that node).
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, n1) != nullptr && r.subAt(1, 0) != nullptr; }, 4'000'000))
+        << "a partition never subscribed on its leader (refusals=" << r.gw.subscribeRefusals << ")";
+    r.gw.pushRecords(*r.subAt(0, n1), 0, 2);
+    r.gw.pushRecords(*r.subAt(1, 0), 0, 3);
+    ASSERT_TRUE(r.drive([&] { return got.records[0] >= 2 && got.records[1] >= 3; }, 4'000'000))
+        << "records: p0=" << got.records[0] << " p1=" << got.records[1];
 }

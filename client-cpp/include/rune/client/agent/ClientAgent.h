@@ -884,6 +884,8 @@ private:
     /// control path) back at the configured gateway and forget the stuck-to
     /// leader.  No-op when already there.  Agent thread only (cold path).
     bool retargetSeedToBootstrap_() noexcept;
+    /// D4: seedSession().endpoint = the transport's current default channel.
+    void syncSeedEndpoint_() noexcept;
     /// T15a fix2 A-B1: the inverse — back to seed.lastKnownLeaderChannel (no-op
     /// when none is known or already there).  Agent thread only (cold path).
     bool retargetSeedToLastKnownLeader_() noexcept;

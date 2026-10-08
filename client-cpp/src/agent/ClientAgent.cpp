@@ -693,7 +693,19 @@ bool ClientAgent::sendFrame(const uint8_t* buf, std::size_t len) {
 
 bool ClientAgent::retarget(const std::string& newIngressChannel) noexcept {
     // FIX F8: forward to the transport's noexcept, non-throwing retarget.
-    return transport_.retarget(newIngressChannel);
+    if (!transport_.retarget(newIngressChannel)) return false;
+    syncSeedEndpoint_();
+    return true;
+}
+
+// D4: the seed session IS the session on the transport's default publication —
+// its endpoint identity follows every retarget.  Otherwise a moved seed still
+// claims the node it left (sessionForEndpoint), and frames for that node's
+// partitions ride the seed to the NEW node, which redirects them back forever.
+void ClientAgent::syncSeedEndpoint_() noexcept {
+    Session& seed  = seedSession();
+    seed.endpoint    = transport_.ingressChannel();
+    seed.io.endpoint = seed.endpoint;   // its control frames ride the (retargeted) default pub
 }
 
 // ---------------------------------------------------------------------------
@@ -990,12 +1002,12 @@ bool SessionEndpointIo::retargetToBootstrap() noexcept {
     // Only the seed session's endpoint is the transport's default publication,
     // which redirects / stick-to-leader retarget.  A leader session addresses its
     // own endpoint explicitly and is re-routed by metadata: nothing to undo.
-    if (endpoint != agent->cfg_.transport.ingressChannel) return true;
+    if (this != &agent->seedSession().io) return true;   // D4: the seed by identity (its endpoint follows retargets)
     return agent->retargetSeedToBootstrap_();
 }
 
 bool SessionEndpointIo::retargetToLastKnownLeader() noexcept {
-    if (endpoint != agent->cfg_.transport.ingressChannel) return true;  // leader session: no-op
+    if (this != &agent->seedSession().io) return true;  // leader session: no-op (D4: seed by identity)
     return agent->retargetSeedToLastKnownLeader_();
 }
 
@@ -1008,6 +1020,7 @@ bool ClientAgent::retargetSeedToBootstrap_() noexcept {
     // replaces the transport's channel string.
     const std::string leaving = transport_.ingressChannel();
     if (!transport_.retarget(bootstrap)) return false;  // old pub intact; next attempt retries
+    syncSeedEndpoint_();
     Session& seed               = seedSession();
     seed.lastKnownLeaderChannel = leaving;
     seed.lastKnownLeaderNode    = seed.currentLeaderNode;
@@ -1025,6 +1038,7 @@ bool ClientAgent::retargetSeedToLastKnownLeader_() noexcept {
     if (transport_.ingressChannel() != cfg_.transport.ingressChannel) return true;
     if (transport_.ingressChannel() == seed.lastKnownLeaderChannel) return true;
     if (!transport_.retarget(seed.lastKnownLeaderChannel)) return false;  // next odd attempt retries
+    syncSeedEndpoint_();
     seed.currentLeaderChannel = seed.lastKnownLeaderChannel;
     seed.currentLeaderNode    = seed.lastKnownLeaderNode;
     return true;
@@ -1050,7 +1064,7 @@ bool ClientAgent::offerControlTo(const std::string& channel,
     // Seed endpoint == transport default ingress channel → byte-identical default
     // offer (single-node fast path).  Otherwise route the control frame to the
     // session's own endpoint over the shared transport (default ingress stream id).
-    if (channel.empty() || channel == cfg_.transport.ingressChannel) {
+    if (channel.empty() || channel == transport_.ingressChannel()) {   // D4: the CURRENT seed channel
         return transport_.offer(buf, len);
     }
     return transport_.offerTo(channel, cfg_.transport.ingressStreamId, buf, len);
@@ -1156,7 +1170,7 @@ void ClientAgent::releaseRoutePub_(transport::AeronTransport::PubHandle h) noexc
     // Never a session's own control publication or the default channel's: only a
     // route-only (worker data) publication is closed.
     const std::string* ch = transport_.publicationChannel(h);
-    if (ch == nullptr || *ch == cfg_.transport.ingressChannel) return;
+    if (ch == nullptr || *ch == cfg_.transport.ingressChannel || *ch == transport_.ingressChannel()) return;
     for (const auto& s : sessions_) {
         if (s->endpoint == *ch) return;
     }
