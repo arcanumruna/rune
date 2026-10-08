@@ -41,3 +41,23 @@ TEST(DescriptorRegression, AcceptsNonDecreasingVarSinceVersion) {
    .add("c", PrimType::String, /*sinceVersion=*/3);
   EXPECT_NO_THROW(b.build());
 }
+
+TEST(Descriptor, UntilVersionDefaultsToInfinity) {
+    rune::codec::FieldDescriptor f;
+    EXPECT_EQ(f.untilVersion, 0xFFFF);
+}
+TEST(Descriptor, IsLiveAtRespectsSinceAndUntil) {
+    rune::codec::FieldDescriptor f; f.sinceVersion = 2; f.untilVersion = 4;
+    EXPECT_FALSE(isLiveAt(f, 1));
+    EXPECT_TRUE (isLiveAt(f, 2));
+    EXPECT_TRUE (isLiveAt(f, 3));
+    EXPECT_FALSE(isLiveAt(f, 4));   // until is exclusive
+}
+TEST(Descriptor, AddTaggedPreservesExplicitTagThroughBuild) {
+    rune::codec::DescriptorBuilder b("t");
+    b.addTagged("a", 7, rune::codec::PrimType::Int32, 1, 0xFFFF, false, {});
+    b.addTagged("b", 3, rune::codec::PrimType::Int64, 1, 0xFFFF, false, {});
+    auto d = b.build();
+    EXPECT_EQ(d.find("a")->id, 7);   // NOT 0
+    EXPECT_EQ(d.find("b")->id, 3);   // NOT 1
+}

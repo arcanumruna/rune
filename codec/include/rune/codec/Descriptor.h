@@ -11,10 +11,11 @@ namespace rune::codec {
 
 struct FieldDescriptor {
     std::string  name;
-    uint16_t     id           = 0;
+    uint16_t     id           = 0;    // durable tag: stable identity across schema versions
     PrimType     type         = PrimType::Int32;
     uint32_t     offset       = 0;    // byte offset (fixed fields) or var index (var-len fields)
     uint16_t     sinceVersion = 1;
+    uint16_t     untilVersion = 0xFFFF; // exclusive: field is live for v in [sinceVersion, untilVersion)
     bool         isKey        = false;
     uint16_t     fixedLen     = 0;    // non-zero for FixedStr: per-field byte width in the block
     std::vector<int32_t> enumValues;  // non-empty => Enum whitelist
@@ -23,6 +24,11 @@ struct FieldDescriptor {
 // Byte width of a field in the fixed block (0 for var-len). FixedStr uses its per-field length.
 inline uint32_t fieldWidth(const FieldDescriptor& f) noexcept {
     return f.type == PrimType::FixedStr ? f.fixedLen : fixedSize(f.type);
+}
+
+// True when field f is part of the schema at version v: [sinceVersion, untilVersion).
+inline bool isLiveAt(const FieldDescriptor& f, uint16_t v) noexcept {
+    return v >= f.sinceVersion && v < f.untilVersion;
 }
 
 struct Descriptor {
@@ -47,27 +53,45 @@ public:
     DescriptorBuilder& add(std::string name, PrimType type,
                            uint16_t sinceVersion = 1, bool isKey = false,
                            std::vector<int32_t> enumValues = {}) {
+        return addTagged(std::move(name), static_cast<uint16_t>(fields_.size()), type,
+                          sinceVersion, 0xFFFF, isKey, std::move(enumValues));
+    }
+
+    DescriptorBuilder& addFixedStr(std::string name, uint16_t len,
+                                   uint16_t sinceVersion = 1, bool isKey = false) {
+        return addFixedStrTagged(std::move(name), static_cast<uint16_t>(fields_.size()), len,
+                                  sinceVersion, 0xFFFF, isKey);
+    }
+
+    // Explicit-tag variants: the caller owns the durable `tag` (FieldDescriptor::id),
+    // which must remain stable across schema versions even as fields are added/retired.
+    DescriptorBuilder& addTagged(std::string name, uint16_t tag, PrimType type,
+                                 uint16_t sinceVersion, uint16_t untilVersion, bool isKey,
+                                 std::vector<int32_t> enumValues) {
         FieldDescriptor f;
         f.name         = std::move(name);
-        f.id           = static_cast<uint16_t>(fields_.size());
+        f.id           = tag;
         f.type         = type;
         f.offset       = 0;
         f.sinceVersion = sinceVersion;
+        f.untilVersion = untilVersion;
         f.isKey        = isKey;
         f.enumValues   = std::move(enumValues);
         fields_.push_back(std::move(f));
         return *this;
     }
 
-    DescriptorBuilder& addFixedStr(std::string name, uint16_t len,
-                                   uint16_t sinceVersion = 1, bool isKey = false) {
+    DescriptorBuilder& addFixedStrTagged(std::string name, uint16_t tag, uint16_t len,
+                                         uint16_t sinceVersion, uint16_t untilVersion,
+                                         bool isKey) {
         FieldDescriptor f;
         f.name         = std::move(name);
-        f.id           = static_cast<uint16_t>(fields_.size());
+        f.id           = tag;
         f.type         = PrimType::FixedStr;
         f.fixedLen     = len;
         f.offset       = 0;
         f.sinceVersion = sinceVersion;
+        f.untilVersion = untilVersion;
         f.isKey        = isKey;
         fields_.push_back(std::move(f));
         return *this;
