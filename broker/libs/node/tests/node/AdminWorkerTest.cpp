@@ -205,3 +205,20 @@ TEST(AdminWorkerRegression, FollowerRejectsDefine) {
     EXPECT_EQ(h.lastErr,6);                          // Internal (not leader)
     EXPECT_EQ(h.creates,0);
 }
+
+// Regression (Task 10): the create path must route version/nextTag through a
+// single contiguous-version helper rather than a hardcoded literal. A freshly
+// defined topic is still version 1 (no behavior change), and nextTag starts
+// past every field the schema already declares (fieldCount) so Task 11's
+// ALTER allocates a fresh tag instead of colliding with an existing one.
+TEST(AdminWorkerRegression, DefineTopicVersionOneAndNextTagEqualsFieldCount) {
+    Harness h;
+    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
+    ASSERT_EQ(h.lastErr,0);
+    EXPECT_EQ(h.lastTopicId, 0);
+    const RegistryEntry* e = h.reg.byName("characters");
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(e->version, 1);
+    // charsBlob(): id, userId, name == 3 fields.
+    EXPECT_EQ(h.reg.nextTagFor(e->topicId), 3);
+}

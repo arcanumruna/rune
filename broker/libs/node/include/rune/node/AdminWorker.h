@@ -126,6 +126,19 @@ private:
     // Start the next queued DefineTopic (if idle).
     void startNext_(int64_t nowNs);
 
+    // ── Version-assignment helper (Task 10) ─────────────────────────────────
+    // SOURCE OF TRUTH for the version assigned to a schema commit on
+    // `topicId`, shared by DefineTopic (create, this task) and ALTER's own
+    // commit path (Task 11). Versions MUST be CONTIGUOUS: SchemaRegistry
+    // indexes a topic's versions by (version - 1) in a per-topic std::deque
+    // (see SchemaRegistry.h), so skipping ahead leaves an unfilled gap slot.
+    // No prior version for `topicId` (always true for DefineTopic, which only
+    // ever targets a brand-new topicId just allocated by the control thread)
+    // → the topic is being created for the first time → kInitialSchemaVersion.
+    [[nodiscard]] uint16_t nextSchemaVersion_(int32_t topicId) const;
+
+    static constexpr uint16_t kInitialSchemaVersion = 1;
+
     enum class DdlState {
         Idle,             // nothing in flight
         AwaitingId,       // requested createTopic; waiting for reply ring
@@ -140,6 +153,9 @@ private:
         int64_t        appendedBase  = -1;   // set on AwaitingCommit (HW must reach it)
         int64_t        appendedLast  = -1;
         int64_t        startedNs     = 0;    // for timeout
+        uint16_t       fieldCount    = 0;    // field count of msg.blob's descriptor,
+                                              // captured once during PARSING
+                                              // (startNext_) — seeds nextTag on create.
     };
 
     SchemaRegistry&                       reg_;

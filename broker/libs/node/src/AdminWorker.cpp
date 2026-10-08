@@ -24,6 +24,14 @@ AdminWorker::AdminWorker(SchemaRegistry& reg,
     , replicaSet_(std::move(replicaSet))
     , deps_(std::move(deps)) {}
 
+// ─── nextSchemaVersion_ — single source of truth for CONTIGUOUS versions ────
+// (Task 10). DefineTopic (create, this task) and ALTER (Task 11) both route
+// their commit's version through this one helper.
+uint16_t AdminWorker::nextSchemaVersion_(int32_t topicId) const {
+    const RegistryEntry* latest = reg_.latest(topicId);
+    return latest ? static_cast<uint16_t>(latest->version + 1) : kInitialSchemaVersion;
+}
+
 // ─── Role events (control → admin) ──────────────────────────────────────────
 //
 // RULING-2 A: the schema replica's role is driven ONLY here, on the admin thread.
@@ -94,11 +102,15 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
     // ── AWAITING_COMMIT ── append the durable TopicSchema record.
     TopicSchema ts;
     ts.topicId        = reply.topicId;
-    ts.version        = 1;
+    ts.version        = nextSchemaVersion_(reply.topicId);
     ts.partitionCount = inFlight_->msg.partitionCount;
     ts.keyField       = inFlight_->msg.keyField;
     ts.validate       = inFlight_->msg.validate;
     ts.descriptorBlob = inFlight_->msg.blob;
+    // DefineTopic (create): nextTag starts past every field the fresh schema
+    // already declares, so the first ALTER ADD (Task 11) allocates a tag that
+    // doesn't collide with an existing one.
+    ts.nextTag        = inFlight_->fieldCount;
 
     // D: leader guard.  If we are not the leader, DDL cannot be committed here.
     if (!leader_ || !replica_) {
@@ -159,10 +171,15 @@ void AdminWorker::startNext_(int64_t nowNs) {
     DefineTopicMsg msg = std::move(pending_.front());
     pending_.pop_front();
 
-    // ── PARSING ── validate the descriptor blob is well-formed.
+    // ── PARSING ── validate the descriptor blob is well-formed, and capture
+    // its field count in the same pass (seeds nextTag for the create path —
+    // see DdlOp::fieldCount — avoiding a second deserialize of the same blob
+    // later).
+    std::size_t fieldCount = 0;
     try {
-        [[maybe_unused]] auto _ = rune::codec::deserialize(
+        const rune::codec::Descriptor parsed = rune::codec::deserialize(
             std::span<const uint8_t>(msg.blob.data(), msg.blob.size()));
+        fieldCount = parsed.fields.size();
     } catch (...) {
         deps_.respondDefine(msg.session, msg.corr, -1, 0, kInvalidSchema);
         return;
@@ -183,9 +200,10 @@ void AdminWorker::startNext_(int64_t nowNs) {
 
     // ── CREATING ── post a create-topic request to the control thread (ring).
     DdlOp op;
-    op.ticket    = nextTicket_++;
-    op.startedNs = nowNs;
-    op.msg       = std::move(msg);
+    op.ticket     = nextTicket_++;
+    op.startedNs  = nowNs;
+    op.fieldCount = static_cast<uint16_t>(fieldCount);
+    op.msg        = std::move(msg);
 
     if (!deps_.requestCreateTopic(op.ticket, op.msg.partitionCount, op.msg.name)) {
         // Ring full (should not happen for rare DDL) → Internal; requeue would risk
@@ -217,18 +235,19 @@ bool AdminWorker::advance_(int64_t nowNs) {
             // ── on-commit ── apply to registry, push validators, respond OK.
             TopicSchema ts;
             ts.topicId        = inFlight_->topicId;
-            ts.version        = 1;
+            ts.version        = nextSchemaVersion_(inFlight_->topicId);
             ts.partitionCount = inFlight_->msg.partitionCount;
             ts.keyField       = inFlight_->msg.keyField;
             ts.validate       = inFlight_->msg.validate;
             ts.descriptorBlob = inFlight_->msg.blob;
+            ts.nextTag        = inFlight_->fieldCount;
             reg_.applyRecord(ts);
             if (inFlight_->msg.validate) {
                 if (const RegistryEntry* entry = reg_.byId(inFlight_->topicId))
                     deps_.pushValidators(*entry, inFlight_->topicId);
             }
             deps_.respondDefine(inFlight_->msg.session, inFlight_->msg.corr,
-                                inFlight_->topicId, 1, kOK);
+                                inFlight_->topicId, ts.version, kOK);
             inFlight_.reset();
             state_ = DdlState::Idle;
             return true;
