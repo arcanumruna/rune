@@ -268,8 +268,10 @@ void Log::maybeRoll() {
         // provisionThresholdBytes_ full (one compare per append otherwise).
         if (provisioned_ && activeBytes >= provisionThresholdBytes_ && (!thresholdPosted_ || adoptedPostPending_))
             [[unlikely]] postProvisionDemands_(activeBytes);
-        // Review Md5: request the full-segment read mapping off the owner at half full.
-        if (asyncReadGrowth_ && !growOutstanding_ &&
+        // Review Md5: request the full-segment read mapping off the owner at
+        // half full — D26: only for a log that has a mapped reader (a push-only
+        // log's answer was never polled: a dead off-owner mmap).
+        if (asyncReadGrowth_ && mapReaders_ && !growOutstanding_ &&
             static_cast<std::size_t>(activeBytes) * 2 > activeSegment().readMapBytes()) [[unlikely]] {
             auto last = std::prev(segments_.end());
             maybeGrowReadMap_(*last->second, last->first, true);
@@ -1059,6 +1061,7 @@ LogReadView Log::readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, s
 LogReadView Log::readView(int64_t startOffset, int32_t maxBytes) noexcept {
     RUNE_FR_SPAN_READ(rune_fr::Site::ReadLogRead, 0);
     ++readViewCalls_;
+    mapReaders_ = true;   // D26: growth is provisioned only for logs read through the mapping
     auto it = segments_.upper_bound(startOffset);
     if (it == segments_.begin()) return {};
     --it;
@@ -1111,6 +1114,7 @@ void Log::maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept
         return;
     }
     growSeq_ = seq;
+    ++readMapGrowRequests_;
     growOutstanding_ = true;
     growBase_ = base;
     growGen_ = seg.installGen();

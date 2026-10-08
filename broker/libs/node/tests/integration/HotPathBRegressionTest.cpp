@@ -922,6 +922,7 @@ TEST(HotPathBRegression, InPlaceTruncationOverPartialReadMapCutsAtTheOffsetRegre
 // into another segment.
 TEST(HotPathBRegression, LateReadMapForSupersededRequestIsDiscardedRegression) {
     ProvLog p(2LL << 20);
+    (void)p.log->readView(0, 1);            // D26: a mapped reader (growth is provisioned only for those)
     p.appendBytes(600 * 1024);              // past half of the 1 MiB map: request #1 (segment A)
     p.prov.holdGrowsForTest(true);
     (void)p.prov.doWork(0);                 // request #1 held
@@ -929,6 +930,7 @@ TEST(HotPathBRegression, LateReadMapForSupersededRequestIsDiscardedRegression) {
     for (int i = 0; i < 64 && p.log->segmentBaseOffsets().size() < 2; ++i) { (void)p.prov.doWork(0); p.appendBytes(16 * 1024); }
     ASSERT_GE(p.log->segmentBaseOffsets().size(), 2u) << "precondition: rolled to segment B";
     const int64_t bBase = p.log->segmentBaseOffsets().back();
+    (void)p.log->readView(bBase, 1);        // D26: B is mapped lazily by its first mapped read (1 MiB)
     p.appendBytes(1200 * 1024);             // B past its 1 MiB map
     p.log->expireReadMapRequestForTest();
     (void)p.log->readView(bBase, 1);        // re-request for B (request #1 superseded)
@@ -1449,4 +1451,34 @@ TEST(HotPathBRegression, PushReadCursorInACompactedTailGapAdvancesRegression) {
     })) << "the PushRead was never answered";
     EXPECT_EQ(next, 12) << "the cursor in the tail gap did not advance";
     EXPECT_GT(bytes, 0u);
+}
+
+// D26 (fix65 review LOW-1): push reads no longer use the read map (#65), so on
+// a log nobody reads through the mapping the provisioner's read-map work was
+// dead: a 1 MiB mmap per staged segment (munmapped again at its seal) and a
+// whole-segment growth mmap at half full whose answer was never polled — each
+// an mmap_lock write hold (and the munmap a TLB shootdown) against the
+// workers.  A push-only log maps nothing after construction.
+TEST(HotPathBRegression, PushOnlyLogNeverProvisionsReadMapsRegression) {
+    constexpr int64_t kRoll = 1536 * 1024;   // past half of the 1 MiB first mapping
+    Rig rig(false, kRoll, nullptr, /*provisioned=*/true);
+    const auto frame = produceFrame(1, 1, 0, 16 * 1024, 2);   // ~32 KiB batches
+    int64_t next = 0;
+    ASSERT_TRUE(rig.passUntil([&] {
+        rig.pass(&frame);
+        rig.pushRead(900, next);
+        rig.pass();
+        rig.pool.drainAllReturns([&](WorkerReturn r) {
+            if (r.type == WorkerReturn::Type::PushReadResult && r.errorCode == 0 && r.newNextOffset > next)
+                next = r.newNextOffset;
+        });
+        return rig.log->segmentBaseOffsets().size() >= 3;
+    })) << "precondition: several rolls";
+    ASSERT_GT(next, 0) << "precondition: the push reads consumed the log";
+    EXPECT_EQ(rig.log->readViewCallsForTest(), 0u) << "precondition: no mapped reader";
+    EXPECT_EQ(rig.log->readMapGrowRequestsForTest(), 0u) << "a read-map growth mmap for a log nobody maps";
+    const auto bases = rig.log->segmentBaseOffsets();
+    for (std::size_t i = 1; i < bases.size(); ++i)
+        EXPECT_FALSE(rig.log->segmentForTest(bases[i])->hasReadMapForTest())
+            << "segment " << bases[i] << " was provisioned with a read map nobody reads";
 }

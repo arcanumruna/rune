@@ -94,7 +94,12 @@ std::unique_ptr<LogSegment> LogSegment::prepareStaging(
     // Right-sized index, PREFAULTED so the append/roll hot path never faults it.
     seg->index_ = std::make_unique<OffsetIndex>(idxPath, /*base*/0, indexMaxBytes,
                                                 /*prefault*/true);
-    seg->openReadMap(readMapBytes);   // background thread: the read mapping is ready at adopt — whole-segment sized (F5)
+    // D26 (fix65 review LOW-1): no read mapping by default.  Push / fetch
+    // reads pread (#65 / D26); only the cold mapped readers (RC rebuild, PSM
+    // rebuild, truncation prep, the rare too-large fallback) map — lazily on
+    // first readView — so a staged segment's mmap (+ its munmap at seal) was
+    // dead mmap_lock work for every push-only log.
+    if (readMapBytes > 0) seg->openReadMap(readMapBytes);
     return seg;
 }
 

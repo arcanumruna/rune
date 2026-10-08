@@ -332,17 +332,19 @@ public:
                                                     const std::string& indexFile,
                                                     int64_t nextOffset, int32_t indexIntervalBytes,
                                                     int32_t indexMaxBytes);
+    /// `readMapBytes` 0 (the default, D26): no read mapping — a later
+    /// readView maps lazily (push / fetch reads pread and never map).
     static std::unique_ptr<LogSegment> prepareStaging(
         const std::string& stagingLogPath, const std::string& stagingIndexPath,
         int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes,
         std::size_t readMapBytes = 0);
     /// Hot-path B F5 + review Md5: the read mapping a segment that grows to
     /// `rollBytes` ends with — page-rounded rollBytes + one maximal batch (never
-    /// a power of two).  Segments start with kReadMapMinBytes (an idle
-    /// partition costs 1 MiB of address space) and a provisioned log grows the
-    /// mapping OFF the owner (SegmentProvisionerAgent; Log::readView never
-    /// remaps on the owner — a munmap + mmap of tens of MiB measured 100-260 us
-    /// on the worker).
+    /// a power of two).  A mapping starts at kReadMapMinBytes and a provisioned
+    /// log that is read through it grows it OFF the owner
+    /// (SegmentProvisionerAgent; a munmap + mmap of tens of MiB measured
+    /// 100-260 us on the worker).  D26: only mapped readers (readView) cause
+    /// any of this — push / fetch reads pread (#65).
     [[nodiscard]] static std::size_t readMapBytesFor(int64_t rollBytes) noexcept;
     static constexpr std::size_t kReadMapSlackBytes = 1u << 20;
     /// Bytes currently mapped for readView.
@@ -462,10 +464,12 @@ private:
     int64_t stagingSeq_ = -1; // pre-provision staging sequence (see stagingSeq())
     LogSegmentMap::node_type spareMapNode_;   // see setSpareMapNode (empty when none)
 
-    // Read-only mmap of the .log for zero-copy readView().  Created WITH the
-    // segment (openReadMap; lazily only if that failed) with headroom past EOF,
-    // grow-remapped (geometrically) only when the active segment outgrows it.  Separate O_RDONLY fd from the writer's fd_, but
-    // the same inode → shared page cache, so it observes committed appends.
+    // Read-only mmap of the .log for zero-copy readView().  Created lazily by
+    // the first readView (D26: never for a segment only pread — push / fetch
+    // reads), or eagerly for the recovered active segment, with headroom past
+    // EOF; grown geometrically (off the owner on a provisioned log) only when
+    // the active segment outgrows it.  Maps through the segment's own fd_ (the
+    // same inode → shared page cache, so it observes committed appends).
     std::unique_ptr<MappedFile> readMap_;
     std::size_t readMapSize_ = 0;   // bytes currently mapped by readMap_ (>= logSize_ headroom)
     static constexpr std::size_t kReadMapMinBytes = 1u << 20;   // first read mapping: 1 MiB
