@@ -229,14 +229,18 @@ LogSegment::~LogSegment() {
 // a zero-progress write).
 int LogSegment::writeAll_(const uint8_t* data, std::size_t len) noexcept {
     const struct ::iovec one{const_cast<uint8_t*>(data), len};
-    errno = EINTR;   // "nothing written yet, retry"
-    return finishShortWrite_(&one, 1, len, -1);
+    return finishShortWrite_(&one, 1, len, kNotWrittenYet, 0);
 }
 
-int LogSegment::finishShortWrite_(const struct ::iovec* iov, int cnt, std::size_t total, ssize_t first) noexcept {
+int LogSegment::finishShortWrite_(const struct ::iovec* iov, int cnt, std::size_t total, ssize_t first,
+                                  int firstErr) noexcept {
+    // D23 (D20 review L5): the first attempt's outcome is explicit — no errno
+    // primed as a sentinel.  kNotWrittenYet: nothing attempted (writeAll_).
     std::size_t done = 0;
-    if (first < 0) {
-        if (errno != EINTR) return errno != 0 ? errno : EIO;
+    if (first == kNotWrittenYet) {
+        // start at 0
+    } else if (first < 0) {
+        if (firstErr != EINTR) return firstErr != 0 ? firstErr : EIO;
     } else if (first == 0 && total > 0) {
         return ENOSPC;
     } else {
@@ -423,8 +427,9 @@ int64_t LogSegment::appendNoSync(const uint8_t* data, std::size_t len, int64_t l
     }
     if (written != static_cast<ssize_t>(len)) [[unlikely]] {
         // D20 review L2: resumed like the durable path (EINTR / short write).
+        const int firstErr = written < 0 ? errno : 0;
         const struct ::iovec one{const_cast<uint8_t*>(data), len};
-        if (const int e = finishShortWrite_(&one, 1, len, written); e != 0)
+        if (const int e = finishShortWrite_(&one, 1, len, written, firstErr); e != 0)
             failWrite_(e, "LogSegment::appendNoSync pwrite");
     }
 
@@ -497,7 +502,8 @@ int64_t LogSegment::appendNoSyncRestamp(const uint8_t* data, std::size_t len,
     }
     if (written != static_cast<ssize_t>(len)) [[unlikely]] {
         // D20 review L2: resumed like the durable path (EINTR / short write).
-        if (const int e = finishShortWrite_(iov, iovCnt, len, written); e != 0)
+        const int firstErr = written < 0 ? errno : 0;
+        if (const int e = finishShortWrite_(iov, iovCnt, len, written, firstErr); e != 0)
             failWrite_(e, "LogSegment::appendNoSyncRestamp pwritev");
     }
 

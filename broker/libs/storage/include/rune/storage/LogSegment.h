@@ -402,7 +402,12 @@ private:
     /// D20 review L2 (cold): finish a page-cache append whose first pwrite /
     /// pwritev returned `first` (< total) — resume a short write / EINTR at
     /// logSize_ + done like writeAll_.  0 or errno (ENOSPC for no progress).
-    int finishShortWrite_(const struct ::iovec* iov, int cnt, std::size_t total, ssize_t first) noexcept;
+    /// `firstErr`: the errno of a failed first attempt (first < 0), captured
+    /// by the caller right after its syscall.
+    int finishShortWrite_(const struct ::iovec* iov, int cnt, std::size_t total, ssize_t first,
+                          int firstErr) noexcept;
+    /// `first` for "no attempt made yet" (writeAll_): write from byte 0.
+    static constexpr ssize_t kNotWrittenYet = -2;
     [[noreturn]] void failWrite_(int err, const char* what);   ///< E1: sticky fail-stop + throw
 
     /// (Re)map the .log read-only to cover the currently-written logSize_ bytes so
