@@ -29,6 +29,8 @@
 #include <gtest/gtest.h>
 
 #include <rune/node/AdminWorker.h>
+#include <rune/node/NodeRuntimeAgent.h>
+#include <rune/node/ReplicaRegistry.h>
 #include <rune/node/SchemaRegistry.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/Types.h>
@@ -623,4 +625,215 @@ TEST_F(SchemaPersistenceTest, ReplayReconstructsAllVersionsAndNextTag) {
         << "nextTag must survive rebuildFromLog_ (follower rebuild)";
     EXPECT_EQ(promotedLatest->compatMode, CompatMode::Forward)
         << "compatMode must survive rebuildFromLog_ (follower rebuild)";
+}
+
+// ---------------------------------------------------------------------------
+// Task 15b regression: OldVersionsSurviveCompactionRegression
+//
+// __topic_schemas is a Compact-policy log (BrokerNode.cpp:2825-2828).  Before
+// Task 15b, BOTH appendKeyed call sites in AdminWorker.cpp (the DefineTopic
+// create commit, onCreateTopicReply, and the ALTER commit) keyed every
+// TopicSchema record by topicId ALONE (4-byte i32 LE).  The Kafka-style log
+// cleaner (rune::storage::LogCleaner) compacts on EXACTLY the key stored with
+// the record via appendKeyed (RecordBatchReader::forEachRecord's `key` param,
+// fed straight into the dedupe OffsetMap) — there is no separate
+// key-extractor for this log.  So pre-fix, v1/v2/v3 of the same topic were
+// the SAME compaction key, and the cleaner physically deleted all but the
+// latest version — destroying the version history that old-fingerprint
+// client binding (Tasks 8/13/19) and multi-version replay (Task 15) depend
+// on.
+//
+// This test appends v1/v2/v3 via the PRODUCTION AdminWorker append path
+// (DefineTopic + 2x ALTER) into a Log configured with segmentRollBytes=1 (so
+// EVERY append rolls a fresh segment — v1 and v2 end up SEALED/compactable,
+// not stuck in the never-compacted active segment), runs REAL compaction via
+// the production duty-cycle mechanism (rune::node::NodeRuntimeAgent::
+// runBoundedCompaction over a rune::node::ReplicaRegistry — the exact harness
+// CompactionCorrectnessTest.cpp's OffsetStoreRebuildFromCompactedLog test
+// uses; NOT hand-rolled), then rebuilds a FRESH SchemaRegistry from the
+// now-compacted log and asserts versions {1,2,3} ALL survive.
+//
+// Pre-fix (topicId-only key): FAILS — only v3 survives compaction.
+// Post-fix (topicId,version composite key): PASSES.
+// ---------------------------------------------------------------------------
+TEST(SchemaPersistenceCompaction, OldVersionsSurviveCompactionRegression) {
+    TmpSchemaDir dir("compact");
+
+    // segmentRollBytes=1: maybeRoll() seals the active segment once it holds
+    // >= 1 byte, so the batch AFTER the first one always starts a fresh
+    // segment.  Three appends (v1, v2, v3) therefore land in THREE distinct
+    // segments: v1 and v2 sealed (compactable), v3 in the active segment.
+    rune::storage::Log log(dir.path, /*segmentRollBytes=*/1);
+    log.recover();
+
+    auto transport = std::make_unique<NullPartitionTransport>();
+
+    PartitionConfig cfg = makeSingleNodeSchemaConfig();
+    cfg.minCleanableDirtyRatio = 0.0;  // compact eagerly regardless of dirty fraction
+
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, /*epoch=*/1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1},
+        &log, transport.get());
+
+    SchemaRegistry registry;
+
+    int64_t  pendingTicket     = -1;
+    int32_t  nextTopicId       = 0;
+    int32_t  lastDefineTopicId = -1;
+    uint16_t lastDefineError   = 0xffff;
+    uint16_t lastAlterVersion  = 0;
+    uint16_t lastAlterError    = 0xffff;
+
+    AdminDeps deps;
+    deps.requestCreateTopic = [&](int64_t ticket, int32_t, const std::string&) -> bool {
+        pendingTicket = ticket;
+        return true;
+    };
+    deps.pushValidators = [](const RegistryEntry&, int32_t) {};
+    deps.respondDefine  = [&](int64_t, int64_t, int32_t topicId, uint16_t,
+                             uint16_t errorCode) {
+        lastDefineTopicId = topicId;
+        lastDefineError   = errorCode;
+    };
+    deps.respondGet = [](int64_t, int64_t, int32_t, uint16_t,
+                         const std::vector<uint8_t>&, uint16_t) {};
+    deps.respondAlter = [&](int64_t, int64_t, int32_t, uint16_t newVersion,
+                           uint16_t errorCode) {
+        lastAlterVersion = newVersion;
+        lastAlterError   = errorCode;
+    };
+
+    AdminWorker worker(registry, replica.get(), /*selfId=*/1,
+                       std::vector<int32_t>{1}, std::move(deps));
+    worker.onRole(AdminRoleMsg{/*leader=*/true, /*epoch=*/1, /*leaderId=*/1});
+
+    auto driveDefineLocal = [&](const DefineTopicMsg& msg) {
+        worker.submitDefineTopic(msg);
+        pendingTicket = -1;
+        int64_t nowNs = 0;
+        for (int i = 0; i < 50; ++i) {
+            nowNs += 1'000'000LL;
+            worker.doWork(nowNs);
+            if (pendingTicket >= 0) {
+                CreateTopicReplyMsg reply;
+                reply.ticket   = pendingTicket;
+                reply.topicId  = nextTopicId++;
+                pendingTicket  = -1;
+                worker.onCreateTopicReply(reply);
+            }
+        }
+    };
+    auto driveAlterLocal = [&](const AlterTopicMsg& msg) {
+        worker.submitAlterTopic(msg);
+        int64_t nowNs = 0;
+        for (int i = 0; i < 50; ++i) {
+            nowNs += 1'000'000LL;
+            worker.doWork(nowNs);
+        }
+    };
+
+    // v1: DEFINE "characters" (3 fields).
+    DefineTopicMsg def;
+    def.session        = 1;
+    def.corr           = 2;
+    def.name           = "characters";
+    def.keyField       = "userId";
+    def.partitionCount = 4;
+    def.validate       = false;
+    def.blob           = charsBlob();
+    driveDefineLocal(def);
+    ASSERT_EQ(lastDefineError, 0u) << "Precondition: DefineTopic (v1) must succeed";
+    const int32_t topicId = lastDefineTopicId;
+
+    // v2: ALTER — ADD "score".
+    AlterTopicMsg alter1;
+    alter1.session         = 10;
+    alter1.corr            = 11;
+    alter1.topicName       = "characters";
+    alter1.expectedVersion = 0;
+    alter1.opsBlob         = altersOpsBlob({addOp("score", PrimType::Int64)});
+    driveAlterLocal(alter1);
+    ASSERT_EQ(lastAlterError, 0u) << "Precondition: ALTER #1 (v2) must succeed";
+    ASSERT_EQ(lastAlterVersion, 2u);
+
+    // v3: ALTER — SET COMPATIBILITY FORWARD.
+    AlterTopicMsg alter2;
+    alter2.session         = 12;
+    alter2.corr            = 13;
+    alter2.topicName       = "characters";
+    alter2.expectedVersion = 0;
+    alter2.opsBlob         = altersOpsBlob({setCompatOp(CompatMode::Forward)});
+    driveAlterLocal(alter2);
+    ASSERT_EQ(lastAlterError, 0u) << "Precondition: ALTER #2 (v3) must succeed";
+    ASSERT_EQ(lastAlterVersion, 3u);
+
+    // Belt-and-suspenders HW advance (same pattern as the other tests above).
+    {
+        int64_t nowNs = 0;
+        for (int i = 0; i < 5; ++i) {
+            nowNs += 1'000'000LL;
+            replica->doWork(nowNs);
+        }
+    }
+
+    // Capture v1's fingerprint BEFORE compaction, from an independent replay —
+    // this is the value an old client's typed gate would have compiled
+    // against, and must still resolve via byFingerprint() AFTER compaction.
+    SchemaRegistry preCompactReg;
+    rebuildSchemaRegistryFromLog(replica.get(), preCompactReg);
+    const RegistryEntry* preV1 = preCompactReg.byIdVersion(topicId, 1);
+    ASSERT_NE(preV1, nullptr) << "Precondition: v1 must be present before compaction";
+    const uint64_t v1Fingerprint = preV1->fingerprint;
+
+    // Sanity: rollBytes=1 must have produced >= 2 segments (>=1 sealed +
+    // active), or this test would not exercise compaction at all.
+    const auto basesBefore = log.segmentBaseOffsets();
+    ASSERT_GE(basesBefore.size(), 2u)
+        << "Need >= 2 segments (sealed + active) to exercise compaction of "
+           "superseded schema versions — vacuousness guard";
+
+    // --- Run REAL compaction via the production duty-cycle mechanism. ---
+    rune::node::ReplicaRegistry replicaRegistry;
+    PartitionReplica* rawReplica = replica.get();
+    replicaRegistry.add(kSchemaTopicId, /*partition=*/0, std::move(replica));
+
+    class NoopConsensusAgent : public rune::consensus::Agent {
+    public:
+        int doWork(int64_t) override { return 0; }
+    };
+    NoopConsensusAgent consensusAgent;
+    rune::node::NodeRuntimeAgent runtimeAgent(
+        consensusAgent, /*election=*/nullptr, /*bridge=*/nullptr,
+        /*transport=*/nullptr, &replicaRegistry, /*gateway=*/nullptr);
+
+    const std::size_t sealedCount = basesBefore.size() - 1;
+    for (std::size_t i = 0; i < sealedCount + 20; ++i) {
+        runtimeAgent.runBoundedCompaction(static_cast<int64_t>(i) * 1'000'000LL);
+    }
+    log.reloadSegments();
+
+    // --- Rebuild a FRESH SchemaRegistry from the (now compacted) log. ---
+    SchemaRegistry postCompactReg;
+    rebuildSchemaRegistryFromLog(rawReplica, postCompactReg);
+
+    const RegistryEntry* v1 = postCompactReg.byIdVersion(topicId, 1);
+    const RegistryEntry* v2 = postCompactReg.byIdVersion(topicId, 2);
+    const RegistryEntry* v3 = postCompactReg.byIdVersion(topicId, 3);
+    ASSERT_NE(v1, nullptr)
+        << "v1 must survive compaction — pre-Task-15b topicId-only keying "
+           "collapses all versions into one compaction key and this FAILS";
+    ASSERT_NE(v2, nullptr) << "v2 must survive compaction";
+    ASSERT_NE(v3, nullptr) << "v3 must survive compaction";
+    EXPECT_EQ(v1->version, 1u);
+    EXPECT_EQ(v2->version, 2u);
+    EXPECT_EQ(v3->version, 3u);
+
+    const RegistryEntry* lat = postCompactReg.latest(topicId);
+    ASSERT_NE(lat, nullptr);
+    EXPECT_EQ(lat->version, 3u) << "latest() must be v3 after compaction + rebuild";
+
+    EXPECT_EQ(postCompactReg.byFingerprint(topicId, v1Fingerprint), v1)
+        << "byFingerprint for the OLD v1 fingerprint must still resolve after "
+           "compaction (old-fingerprint client binding depends on this)";
 }

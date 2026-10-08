@@ -160,15 +160,27 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
     }
 
     const std::vector<uint8_t> payload = ts.serialize();
-    uint8_t keyBuf[4];
+    // Task 15b: the __topic_schemas log is CleanupPolicy::Compact, and the
+    // Kafka-style LogCleaner compacts on EXACTLY the key stored here via
+    // appendKeyed (it has no separate key-extractor for this log) — so a
+    // topicId-only key would make every version of a topic collide on the
+    // SAME compaction key and the cleaner would physically delete all but the
+    // latest version.  Key by the COMPOSITE (topicId:i32 LE, version:u16 LE)
+    // = 6 bytes instead, so every version is its own distinct compaction key
+    // and survives compaction (old-fingerprint client binding + multi-version
+    // replay depend on every version staying durable).
+    uint8_t keyBuf[6];
     const uint32_t u = static_cast<uint32_t>(reply.topicId);
     keyBuf[0] = static_cast<uint8_t>(u & 0xff);
     keyBuf[1] = static_cast<uint8_t>((u >> 8) & 0xff);
     keyBuf[2] = static_cast<uint8_t>((u >> 16) & 0xff);
     keyBuf[3] = static_cast<uint8_t>((u >> 24) & 0xff);
+    const uint16_t v = ts.version;
+    keyBuf[4] = static_cast<uint8_t>(v & 0xff);
+    keyBuf[5] = static_cast<uint8_t>((v >> 8) & 0xff);
 
     const rune::replication::Offset base =
-        replica_->appendKeyed(std::span<const uint8_t>(keyBuf, 4),
+        replica_->appendKeyed(std::span<const uint8_t>(keyBuf, 6),
                               std::span<const uint8_t>(payload.data(), payload.size()),
                               /*acksAll=*/true);
     if (base < 0) {
@@ -346,15 +358,20 @@ void AdminWorker::startAlter_(AlterTopicMsg msg, int64_t nowNs) {
     ts.compatMode     = mode;
 
     const std::vector<uint8_t> payload = ts.serialize();
-    uint8_t keyBuf[4];
+    // Task 15b: composite (topicId, version) compaction key — see the matching
+    // comment at the DefineTopic append site in onCreateTopicReply above.
+    uint8_t keyBuf[6];
     const uint32_t u = static_cast<uint32_t>(topicId);
     keyBuf[0] = static_cast<uint8_t>(u & 0xff);
     keyBuf[1] = static_cast<uint8_t>((u >> 8) & 0xff);
     keyBuf[2] = static_cast<uint8_t>((u >> 16) & 0xff);
     keyBuf[3] = static_cast<uint8_t>((u >> 24) & 0xff);
+    const uint16_t v = ts.version;
+    keyBuf[4] = static_cast<uint8_t>(v & 0xff);
+    keyBuf[5] = static_cast<uint8_t>((v >> 8) & 0xff);
 
     const rune::replication::Offset base =
-        replica_->appendKeyed(std::span<const uint8_t>(keyBuf, 4),
+        replica_->appendKeyed(std::span<const uint8_t>(keyBuf, 6),
                               std::span<const uint8_t>(payload.data(), payload.size()),
                               /*acksAll=*/true);
     if (base < 0) {
