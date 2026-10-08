@@ -26,6 +26,13 @@ tests/*
 tests/e2e/*
 !tests/e2e/rune_ql_probe.cpp
 !tests/e2e/characters.rql
+# Task 21 — real-Aeron schema-evolution e2e (docker/schema-evolution-e2e.sh,
+# rune-broker repo): the evo_probe_vN sources + the .rql alter fixtures.
+!tests/e2e/evo_probe_v1.cpp
+!tests/e2e/evo_probe_v2.cpp
+!tests/e2e/evo_probe_v3.cpp
+!tests/e2e/evo_probe_v4.cpp
+!tests/e2e/schema_evolution
 
 # Editor / OS
 .vscode/

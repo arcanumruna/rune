@@ -1,0 +1,2 @@
+-- tests/e2e/schema_evolution/v2_add.rql — ADD COLUMN: chars_evo v1 -> v2.
+alter topic chars_evo add column level int32;

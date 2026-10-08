@@ -1,0 +1,2 @@
+-- tests/e2e/schema_evolution/v3_drop.rql — DROP COLUMN (default BACKWARD): v2 -> v3.
+alter topic chars_evo drop column name;

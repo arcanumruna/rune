@@ -1,0 +1,3 @@
+-- tests/e2e/schema_evolution/v6_drop_reject.rql — DROP COLUMN under FORWARD compat:
+-- must be REJECTED by the broker (SchemaIncompatible, non-zero CLI exit).
+alter topic chars_evo drop column power;

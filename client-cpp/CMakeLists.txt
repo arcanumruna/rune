@@ -540,6 +540,47 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
             target_link_libraries(rune_ql_probe PRIVATE ${UUID_LIB_QL_PROBE})
         endif()
     endif()
+
+    # ── Task 21 — real-Aeron schema-evolution e2e probes ──────────────────────
+    #
+    # docker/schema-evolution-e2e.sh (rune-broker) drives, phase by phase,
+    # INSIDE this image, against a live broker:
+    #   rune schema apply/alter tests/e2e/schema_evolution/*.rql --broker <node>
+    #   rune schema generate chars_evo --out <dir> --broker <node>
+    #   (orchestrator copies/renames the generated chars_evo.gen.h into
+    #    evo-gen/chars_evo_vN.gen.h, with its "namespace gen {" renamed to
+    #    "namespace gen_vN {" via sed, so multiple per-version snapshots of the
+    #    SAME struct name can coexist in one translation unit)
+    #   cmake --build . --target evo_probe_vN
+    #   ./evo_probe_vN
+    #
+    # Each evo_probe_vN is EXCLUDE_FROM_ALL (like rune_ql_probe): configured at
+    # cmake time, but only compiles once its generated header(s) exist.
+    set(RUNE_EVO_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/evo-gen"
+        CACHE PATH "Directory holding the per-version chars_evo_vN.gen.h snapshots for the evo_probe_vN targets")
+    file(MAKE_DIRECTORY "${RUNE_EVO_GEN_DIR}")
+
+    foreach(evoN 1 2 3 4)
+        add_executable(evo_probe_v${evoN} EXCLUDE_FROM_ALL
+            tests/e2e/evo_probe_v${evoN}.cpp
+        )
+        target_include_directories(evo_probe_v${evoN} PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+            "${RUNE_EVO_GEN_DIR}"
+        )
+        target_link_libraries(evo_probe_v${evoN} PRIVATE
+            rune_client_api
+            rune_client_producer
+            rune_client_subscriber
+            rune_codec
+        )
+        if(UNIX AND NOT APPLE)
+            find_library(UUID_LIB_EVO_${evoN} uuid)
+            if(UUID_LIB_EVO_${evoN})
+                target_link_libraries(evo_probe_v${evoN} PRIVATE ${UUID_LIB_EVO_${evoN}})
+            endif()
+        endif()
+    endforeach()
 endif()
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────

@@ -47,8 +47,14 @@ COPY conanfile.py conandata.yml VERSION.txt ./
 RUN conan install . --output-folder=conan-release --build=missing -s build_type=Release
 
 # ── Sibling build contexts ────────────────────────────────────────────────────
-# rune-protocol (main): header-only.  CMake resolves RUNE_PROTOCOL_INCLUDE below.
+# rune-protocol (main): headers + the src/net GSO/driver-wake C sources that
+# rune_gso / rune_client_driver_wake compile (CMakeLists.txt resolves them via
+# ${RUNE_PROTOCOL_INCLUDE}/../src/net/*.c) — mirrors the rune-broker Dockerfile's
+# equivalent fix (COPY --from=rune-protocol src); this image was stale without
+# it (Task 21 fix-on-sight: CMake failed configure with "No SOURCES given to
+# target: rune_gso / rune_client_driver_wake").
 COPY --from=rune-protocol include /rune-protocol/include
+COPY --from=rune-protocol src     /rune-protocol/src
 # rune-codec (0c): compiled sibling (src + include) + the rune_codec_gen tool source.
 COPY --from=rune-codec src     /rune-codec/src
 COPY --from=rune-codec include /rune-codec/include
