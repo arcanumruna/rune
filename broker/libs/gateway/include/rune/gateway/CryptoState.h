@@ -46,6 +46,17 @@ struct CryptoState {
     // other CryptoState field.
     rune::crypto::AeadKey                    b2c{};
     uint8_t                                  b2cPrefix[4] = {};
+
+    // Task 22 (shard worker decrypts produce / per-worker ingress,
+    // 2026-10-08): the RAW c2b key + 4-byte nonce prefix, retained alongside
+    // `recv` (which already holds the AeadCipher built FROM these same
+    // bytes) so the gateway can ship the SAME bytes to every shard worker at
+    // SessionAnnounce time — ingress has a SINGLE sender (the client), so
+    // (unlike b2c) no per-worker derivation: every worker opens produce
+    // under this exact key. Shard mode only; legacy mode never reads this.
+    // Zero-valued for every plaintext session.
+    rune::crypto::AeadKey                    c2b{};
+    uint8_t                                  c2bPrefix[4] = {};
 };
 
 } // namespace rune::gateway

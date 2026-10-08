@@ -1135,7 +1135,8 @@ int ClientGateway::retryPendingCryptoAnnounces_()
         }
         if (sessionAnnouncer_.announce(*workerPool_, sid, s->egressChannel, s->egressStreamId,
                                         s->clientVersion, /*sessionEncrypted=*/true, /*keyReady=*/true,
-                                        s->crypto.b2c, s->crypto.b2cPrefix, s->crypto.cipher)) {
+                                        s->crypto.b2c, s->crypto.b2cPrefix, s->crypto.cipher,
+                                        s->crypto.c2b, s->crypto.c2bPrefix)) {
             ++work;
             pendingCryptoAnnounces_[i] = pendingCryptoAnnounces_.back();
             pendingCryptoAnnounces_.pop_back();
@@ -2070,6 +2071,13 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
     // own per-sender key (shard mode only; unread in legacy mode).
     session.crypto.b2c = keys.b2c;
     std::memcpy(session.crypto.b2cPrefix, keys.b2cPrefix, 4);
+    // Task 22 (shard worker decrypts produce / per-worker ingress): retain
+    // the RAW c2b key + prefix the same way (session.crypto.recv above
+    // already holds the AeadCipher built from these same bytes) so the
+    // gateway can ship this session's SINGLE ingress key to every shard
+    // worker (shard mode only; unread in legacy mode).
+    session.crypto.c2b = keys.c2b;
+    std::memcpy(session.crypto.c2bPrefix, keys.c2bPrefix, 4);
 
     // Task 19 ★: ship the real per-worker key now. Every worker ALREADY has
     // a "parked" entry for this session from the FIRST (announce-before-
@@ -2084,7 +2092,8 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
         !sessionAnnouncer_.announce(*workerPool_, pending.sessionId, pending.egressChannel,
                                      pending.egressStreamId, pending.clientVersion,
                                      /*sessionEncrypted=*/true, /*keyReady=*/true,
-                                     session.crypto.b2c, session.crypto.b2cPrefix, session.crypto.cipher)) {
+                                     session.crypto.b2c, session.crypto.b2cPrefix, session.crypto.cipher,
+                                     session.crypto.c2b, session.crypto.c2bPrefix)) {
         pendingCryptoAnnounces_.push_back(pending.sessionId);
     }
 

@@ -99,6 +99,30 @@
 //      authenticated senderId byte fails auth (never silently redirected).
 //  20. WorkerDeriveSenderKeyZeroEqualsGatewayB2c — senderId==0 is defined
 //      to equal the gateway's own (unchanged) b2c key.
+//
+// Task 22 cases (shard worker DECRYPTS produce / per-worker ingress,
+// 2026-10-08 — rune::node::openProduceFrame, RecordsOpen.h, the ingress
+// counterpart to Task 19's egress seal; ingress has a SINGLE sender, the
+// client, so ONE c2b key shared by every worker — no per-sender split):
+//  21. WorkerIngressOpensClientSealedProduceAndDecodes — a client-sealed
+//      Produce frame opens on a worker-owned RecordsOpenCtx and the
+//      reconstructed plaintext decodes correctly via the REAL
+//      rune::protocol::client::Produce::decode.
+//  22. WorkerIngressTamperedCiphertextDropped / 23. TamperedHeaderAadDropped
+//      — tamper anywhere in the AAD or ciphertext fails auth, dropped.
+//  24. WorkerIngressReplayedSeqDropped — the exact same wire frame replayed
+//      is rejected the second time.
+//  25. WorkerIngressTooOldSeqDropped — a seq more than 64 behind the
+//      worker's own high-water mark is rejected.
+//  26. WorkerIngressWindowNotPoisonedByForgedFrame (+ RedToggle) — a forged
+//      (wrong-key) frame fails auth and must not poison the window against
+//      a later, legitimately-sealed frame using the same seq.
+//  27. WorkerIngressNoKeyYetFailsClosed — no c2b key installed yet (pre-key/
+//      unknown session) fails closed, never a plaintext fallback.
+//  28. WorkerIngressOwnWindowIndependentOfGatewayWindow — the worker's own
+//      replay window tolerates forward gaps left by gateway-bound frames
+//      sharing the client's single c2b seq stream; neither window is
+//      touched by the other's traffic.
 
 #include <gtest/gtest.h>
 
@@ -106,6 +130,7 @@
 #include <rune/crypto/Cipher.h>
 #include <rune/crypto/TlsSession.h>
 #include <rune/gateway/CryptoFrame.h>
+#include <rune/node/RecordsOpen.h>
 #include <rune/node/RecordsSeal.h>
 #include <rune/node/SessionAnnounceKeyTail.h>
 #include <rune/protocol/client/CryptoEnvelope.h>
@@ -411,6 +436,11 @@ DataPlaneFixture makeDataPlaneFixture(int64_t sessionId) {
     // sender keys from the SAME fixture (mirrors the real gateway code).
     f.gw.b2c = srvKeys.b2c;
     std::memcpy(f.gw.b2cPrefix, srvKeys.b2cPrefix, 4);
+    // Task 22: retain the RAW c2b key/prefix exactly as
+    // handleHandshakeContinue_ now ALSO does, so tests can ship the SAME
+    // ingress key to a simulated worker (mirrors the real gateway code).
+    f.gw.c2b = srvKeys.c2b;
+    std::memcpy(f.gw.c2bPrefix, srvKeys.c2bPrefix, 4);
     f.clientSend.emplace(cliKeys.cipher, cliKeys.c2b, cliKeys.c2bPrefix);
     f.clientRecv.emplace(cliKeys.cipher, cliKeys.b2c, cliKeys.b2cPrefix);
     return f;
@@ -955,43 +985,382 @@ TEST(GatewayCryptoDataPlane, WorkerDeriveSenderKeyZeroEqualsGatewayB2c) {
     EXPECT_EQ(0, std::memcmp(out.bytes, f.gw.b2c.bytes, sizeof(out.bytes)));
 }
 
+// ===========================================================================
+// Task 22 (shard worker decrypts produce / per-worker ingress, 2026-10-08):
+// rune::node::openProduceFrame (RecordsOpen.h) is the raw-crypto-params OPEN
+// step a shard worker's handleWorkerIngressFrame_ calls BEFORE
+// rune::protocol::client::Produce::decode, for a produce frame the client
+// sealed under the session's c2b cipher (the SAME key the gateway uses to
+// open the client's control frames — ingress has a single sender, no
+// per-worker derivation, unlike the b2c egress key). Mirrors
+// rune::gateway::codec::openIngressFrame's cases (5/7/8/9/10/11 above) one
+// for one, but against a worker-owned RecordsOpenCtx instead of the
+// gateway's own CryptoState, AND proves the reconstructed plaintext
+// actually decodes via the real rune::protocol::client::Produce::decode —
+// the "feed the EXISTING decode/produce path unchanged" requirement.
+// ===========================================================================
+
+namespace {
+
+// Build + encode a real Produce message exactly the shape a client would
+// send (full [24B MessageHeader][body] frame via Produce::encode) — used as
+// the `plain` input to sealFrameAsPeer so the sealed wire frame is a
+// genuine Produce frame, not just header-shaped bytes.
+std::vector<uint8_t> encodeProduceFrame(int64_t sessionId, int64_t correlationId,
+                                        int32_t topicId, int32_t partition,
+                                        int64_t producerId, int16_t producerEpoch,
+                                        int32_t baseSequence, uint8_t acks,
+                                        const std::vector<uint8_t>& batch) {
+    rpc::Produce p;
+    p.sessionId      = sessionId;
+    p.correlationId  = correlationId;
+    p.topicId        = topicId;
+    p.partition      = partition;
+    p.partitionKnown = 1;
+    p.acks           = acks;
+    p.producerId     = producerId;
+    p.producerEpoch  = producerEpoch;
+    p.baseSequence   = baseSequence;
+    p.recordBatch    = std::span<const uint8_t>(batch.data(), batch.size());
+    std::vector<uint8_t> out(p.encodedSize());
+    p.encode(out.data());
+    return out;
+}
+
+// A worker's own per-session ingress crypto state, built the way
+// executeSessionAnnounceWire_ builds WorkerSessionCrypto::recv/recvSeq/
+// recvWindow from the SessionAnnounceCryptoTail's c2b fields — but using
+// the fixture's raw c2b bytes directly (standing in for "the gateway
+// shipped this worker the real c2b key").  A SEPARATE recvSeq/recvWindow
+// instance per test/worker — never shared with the gateway's own
+// `f.gw.recvSeq`/`recvWindow` (the "own replay window" invariant).
+struct WorkerIngressFixture {
+    std::optional<cr::AeadCipher> recv;
+    uint64_t recvSeq    = 0;
+    uint64_t recvWindow = 0;
+
+    pn::RecordsOpenCtx ctx() {
+        pn::RecordsOpenCtx c;
+        c.recv       = recv.has_value() ? &*recv : nullptr;
+        c.recvSeq    = &recvSeq;
+        c.recvWindow = &recvWindow;
+        return c;
+    }
+};
+
+WorkerIngressFixture makeWorkerIngressFixture(const DataPlaneFixture& f) {
+    WorkerIngressFixture w;
+    w.recv.emplace(f.gw.cipher, f.gw.c2b, f.gw.c2bPrefix);
+    return w;
+}
+
+}  // namespace
+
+TEST(GatewayCryptoDataPlane, WorkerIngressOpensClientSealedProduceAndDecodes) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/40);
+    WorkerIngressFixture w = makeWorkerIngressFixture(f);
+
+    const std::vector<uint8_t> batch(48, 0x9C);
+    const auto plain = encodeProduceFrame(/*sessionId=*/40, /*correlationId=*/5,
+                                           /*topicId=*/11, /*partition=*/2,
+                                           /*producerId=*/-1, /*producerEpoch=*/0,
+                                           /*baseSequence=*/-1, /*acks=*/1, batch);
+    const auto wire = sealFrameAsPeer(*f.clientSend, /*seq=*/1, plain);
+
+    pn::RecordsOpenCtx ctx = w.ctx();
+    std::vector<uint8_t> scratch(wire.size());
+    const std::size_t n = pn::openProduceFrame(ctx, wire.data(), wire.size(), scratch.data(), scratch.size());
+    ASSERT_EQ(n, plain.size());
+    EXPECT_EQ(w.recvSeq, 1u);
+    EXPECT_NE(w.recvWindow & 1u, 0u);
+
+    // Feed the reconstructed [24B header][plaintext body] into the EXACT
+    // decode function handleWorkerIngressFrame_ calls — proving it decodes
+    // to the right Produce, not just that the bytes round-trip.
+    const auto msgOpt = rpc::Produce::decode(scratch.data(), n);
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId, 40);
+    EXPECT_EQ(msgOpt->correlationId, 5);
+    EXPECT_EQ(msgOpt->topicId, 11);
+    EXPECT_EQ(msgOpt->partition, 2);
+    EXPECT_EQ(msgOpt->acks, 1);
+    ASSERT_EQ(msgOpt->recordBatch.size(), batch.size());
+    EXPECT_EQ(0, std::memcmp(msgOpt->recordBatch.data(), batch.data(), batch.size()));
+}
+
+TEST(GatewayCryptoDataPlane, WorkerIngressTamperedCiphertextDropped) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/41);
+    WorkerIngressFixture w = makeWorkerIngressFixture(f);
+
+    const auto plain = encodeProduceFrame(41, 1, 1, 0, -1, 0, -1, 0, {0x01, 0x02});
+    auto wire = sealFrameAsPeer(*f.clientSend, 1, plain);
+    wire[rpc::kCryptoHeaderBytes] ^= 0xFF;  // flip one ciphertext byte
+
+    pn::RecordsOpenCtx ctx = w.ctx();
+    std::vector<uint8_t> scratch(wire.size());
+    const std::size_t n = pn::openProduceFrame(ctx, wire.data(), wire.size(), scratch.data(), scratch.size());
+    EXPECT_EQ(n, 0u) << "a tampered produce frame must never decode as plaintext";
+    EXPECT_EQ(w.recvSeq, 0u) << "auth failed before commit — window untouched";
+    EXPECT_EQ(w.recvWindow, 0u);
+}
+
+TEST(GatewayCryptoDataPlane, WorkerIngressTamperedHeaderAadDropped) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/42);
+    WorkerIngressFixture w = makeWorkerIngressFixture(f);
+
+    const auto plain = encodeProduceFrame(42, 1, 1, 0, -1, 0, -1, 0, {0x03});
+    auto wire = sealFrameAsPeer(*f.clientSend, 1, plain);
+    wire[0] ^= 0xFF;  // flip a clear MessageHeader byte — it is part of the AAD
+
+    pn::RecordsOpenCtx ctx = w.ctx();
+    std::vector<uint8_t> scratch(wire.size());
+    const std::size_t n = pn::openProduceFrame(ctx, wire.data(), wire.size(), scratch.data(), scratch.size());
+    EXPECT_EQ(n, 0u) << "a tampered clear header must fail auth, never be accepted";
+}
+
+TEST(GatewayCryptoDataPlane, WorkerIngressReplayedSeqDropped) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/43);
+    WorkerIngressFixture w = makeWorkerIngressFixture(f);
+
+    const auto plain = encodeProduceFrame(43, 1, 1, 0, -1, 0, -1, 0, {0x04});
+    const auto wire = sealFrameAsPeer(*f.clientSend, 1, plain);
+
+    pn::RecordsOpenCtx ctx = w.ctx();
+    std::vector<uint8_t> scratch(wire.size());
+    const std::size_t n1 = pn::openProduceFrame(ctx, wire.data(), wire.size(), scratch.data(), scratch.size());
+    ASSERT_EQ(n1, plain.size());
+
+    // Replay the EXACT same wire frame — must be rejected the second time.
+    const std::size_t n2 = pn::openProduceFrame(ctx, wire.data(), wire.size(), scratch.data(), scratch.size());
+    EXPECT_EQ(n2, 0u) << "a replayed seq must be dropped";
+}
+
+TEST(GatewayCryptoDataPlane, WorkerIngressTooOldSeqDropped) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/44);
+    WorkerIngressFixture w = makeWorkerIngressFixture(f);
+    pn::RecordsOpenCtx ctx = w.ctx();
+
+    // Advance the window far ahead (seq=100), then try seq=1 — more than 64
+    // behind the high-water mark.
+    const auto plainAhead = encodeProduceFrame(44, 1, 1, 0, -1, 0, -1, 0, {0x05});
+    const auto wireAhead  = sealFrameAsPeer(*f.clientSend, 100, plainAhead);
+    std::vector<uint8_t> scratch(wireAhead.size());
+    ASSERT_GT(pn::openProduceFrame(ctx, wireAhead.data(), wireAhead.size(), scratch.data(), scratch.size()), 0u);
+    ASSERT_EQ(w.recvSeq, 100u);
+
+    const auto plainOld = encodeProduceFrame(44, 2, 1, 0, -1, 0, -1, 0, {0x06});
+    const auto wireOld  = sealFrameAsPeer(*f.clientSend, 1, plainOld);
+    scratch.assign(wireOld.size(), 0);
+    const std::size_t n = pn::openProduceFrame(ctx, wireOld.data(), wireOld.size(), scratch.data(), scratch.size());
+    EXPECT_EQ(n, 0u) << "a seq more than 64 behind the high-water mark must be dropped as too old";
+}
+
+TEST(GatewayCryptoDataPlane, WorkerIngressWindowNotPoisonedByForgedFrame) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/45);
+    WorkerIngressFixture w = makeWorkerIngressFixture(f);
+    pn::RecordsOpenCtx ctx = w.ctx();
+
+    // A forged frame (sealed under the WRONG key) claiming seq=5 must fail
+    // auth and NOT poison the window — a later, legitimately-sealed seq=5
+    // frame must still be accepted.
+    cr::AeadCipher wrongKeySend(f.gw.cipher, f.gw.b2c /* wrong key: b2c, not c2b */, f.gw.c2bPrefix);
+    const auto forgedPlain = encodeProduceFrame(45, 1, 1, 0, -1, 0, -1, 0, {0x07});
+    const auto forgedWire  = sealFrameAsPeer(wrongKeySend, 5, forgedPlain);
+    std::vector<uint8_t> scratch(forgedWire.size());
+    const std::size_t nForged = pn::openProduceFrame(ctx, forgedWire.data(), forgedWire.size(),
+                                                       scratch.data(), scratch.size());
+    EXPECT_EQ(nForged, 0u);
+    EXPECT_EQ(w.recvSeq, 0u) << "a forged frame must never advance the window";
+
+    const auto legitPlain = encodeProduceFrame(45, 2, 1, 0, -1, 0, -1, 0, {0x08});
+    const auto legitWire  = sealFrameAsPeer(*f.clientSend, 5, legitPlain);
+    scratch.assign(legitWire.size(), 0);
+    const std::size_t nLegit = pn::openProduceFrame(ctx, legitWire.data(), legitWire.size(),
+                                                      scratch.data(), scratch.size());
+    EXPECT_EQ(nLegit, legitPlain.size())
+        << "the legitimate seq=5 frame must still succeed — the window must not have been "
+           "poisoned by the forged frame that never authenticated";
+}
+
+TEST(GatewayCryptoDataPlane, WorkerIngressNoKeyYetFailsClosed) {
+    // Pre-key / unknown-session case: the worker has a sessionCrypto_ entry
+    // (sessionEncrypted known from the first announce wave) but no real c2b
+    // key installed yet (recv == nullopt). openProduceFrame must fail
+    // closed — NEVER fall back to decoding the ciphertext as plaintext.
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/46);
+    const auto plain = encodeProduceFrame(46, 1, 1, 0, -1, 0, -1, 0, {0x09});
+    const auto wire = sealFrameAsPeer(*f.clientSend, 1, plain);
+
+    uint64_t recvSeq = 0, recvWindow = 0;
+    pn::RecordsOpenCtx ctx;
+    ctx.recv       = nullptr;   // no key installed yet
+    ctx.recvSeq    = &recvSeq;
+    ctx.recvWindow = &recvWindow;
+
+    std::vector<uint8_t> scratch(wire.size());
+    const std::size_t n = pn::openProduceFrame(ctx, wire.data(), wire.size(), scratch.data(), scratch.size());
+    EXPECT_EQ(n, 0u) << "no key installed yet must fail closed, never decode as plaintext";
+    EXPECT_EQ(recvSeq, 0u) << "a failed open must not even consume a sequence number";
+}
+
+TEST(GatewayCryptoDataPlane, WorkerIngressOwnWindowIndependentOfGatewayWindow) {
+    // Nonce/replay note: the client seals EVERY client->broker frame under
+    // ONE c2b cipher + a single monotonic sendSeq, so produce (worker-bound)
+    // and control (gateway-bound) frames never collide in seq space — but
+    // each receiver keeps its OWN replay window and sees only its subset of
+    // the stream (forward gaps where the other's frames were). Simulate:
+    // seq=1 goes to the gateway (opened on f.gw), seq=2 goes to the worker
+    // (opened on w) — the worker's window must accept seq=2 even though it
+    // never saw seq=1 at all (a forward gap, never shared with the gateway's
+    // own window).
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/47);
+    WorkerIngressFixture w = makeWorkerIngressFixture(f);
+
+    const auto controlPlain = encodeProduceFrame(47, 1, 1, 0, -1, 0, -1, 0, {0x0A});
+    const auto controlWire  = sealFrameAsPeer(*f.clientSend, 1, controlPlain);
+    std::vector<uint8_t> gwScratch(controlWire.size());
+    const std::size_t nGw = rune::gateway::codec::openIngressFrame(
+        f.gw, controlWire.data(), controlWire.size(), gwScratch.data(), gwScratch.size());
+    ASSERT_GT(nGw, 0u);
+    EXPECT_EQ(f.gw.recvSeq, 1u);
+    EXPECT_EQ(w.recvSeq, 0u) << "the worker's window must be untouched by gateway-bound traffic";
+
+    const auto producePlain = encodeProduceFrame(47, 2, 1, 0, -1, 0, -1, 0, {0x0B});
+    const auto produceWire  = sealFrameAsPeer(*f.clientSend, 2, producePlain);
+    pn::RecordsOpenCtx ctx = w.ctx();
+    std::vector<uint8_t> wScratch(produceWire.size());
+    const std::size_t nW = pn::openProduceFrame(ctx, produceWire.data(), produceWire.size(),
+                                                 wScratch.data(), wScratch.size());
+    EXPECT_GT(nW, 0u) << "the worker must accept seq=2 despite never having seen seq=1 "
+                          "(a forward gap where the gateway-bound frame was) — never a shared window";
+    EXPECT_EQ(w.recvSeq, 2u);
+    EXPECT_EQ(f.gw.recvSeq, 1u) << "the gateway's own window must be untouched by worker-bound traffic";
+}
+
 // ---------------------------------------------------------------------------
-// Task 19: SessionAnnounceKeyTail.h — the [cipher|prefix|key|channel] byte
-// layout Worker.h's enqueueOp/executeSessionAnnounceWire_ ride on the
-// SessionAnnounce op's EXISTING variable tail (no new SBE field — see that
-// header's file comment). Pure byte-format functions, zero Aeron/crypto
-// dependency: unit-tested standalone here, same TU as the rest of this
-// file's aeron-free crypto coverage.
+// RED-evidence toggle for openProduceFrame (RecordsOpen.h): a LOCAL,
+// deliberately-buggy copy that commits the replay window BEFORE checking
+// the AEAD auth result, instead of after — mirrors
+// WindowNotPoisonedByForgedFrame_RedToggle above but for the worker-ingress
+// open step. Always `false` in the committed file; see task-22-report.md
+// for the RED run (flip to `true` locally to reproduce).
+// ---------------------------------------------------------------------------
+namespace {
+constexpr bool kInjectWorkerIngressCommitBeforeAuthBug = false;
+
+// Reuses the REAL replayWindowCheck/Commit (rune::node::detail_open) so this
+// isolates EXACTLY the ordering bug — the check is identical to the
+// production function; only the COMMIT is moved to before open() instead of
+// after.
+std::size_t openProduceFrameBuggy(const pn::RecordsOpenCtx& ctx, const uint8_t* wire,
+                                   std::size_t wireLen, uint8_t* scratch,
+                                   std::size_t scratchCap) noexcept {
+    namespace dc = rune::node::detail_open;
+    if (!ctx.recv || !ctx.recvSeq || !ctx.recvWindow) return 0;
+    constexpr std::size_t kMinWire = rpc::kCryptoHeaderBytes + rune::crypto::kTagSize;
+    if (wireLen < kMinWire) return 0;
+    const auto subOpt = rpc::CryptoSubHeader::decode(
+        wire + rpc::MessageHeader::ENCODED_SIZE, wireLen - rpc::MessageHeader::ENCODED_SIZE);
+    if (!subOpt) return 0;
+    const uint64_t seq = subOpt->seq;
+
+    if (!dc::replayWindowCheck(*ctx.recvSeq, *ctx.recvWindow, seq)) return 0;
+
+    // BUG: commit the window before authenticating — a forged seq that
+    // passes the (pre-auth) check now poisons the window even though the
+    // frame is about to be rejected for failing the AEAD tag.
+    dc::replayWindowCommit(*ctx.recvSeq, *ctx.recvWindow, seq);
+
+    const std::size_t ctLen    = wireLen - rpc::kCryptoHeaderBytes;
+    const std::size_t plainCap = ctLen - rune::crypto::kTagSize;
+    const std::size_t outLen   = rpc::MessageHeader::ENCODED_SIZE + plainCap;
+    if (scratchCap < outLen) return 0;
+    const long plainLen = ctx.recv->open(seq, wire, rpc::kCryptoHeaderBytes,
+                                          wire + rpc::kCryptoHeaderBytes, ctLen,
+                                          scratch + rpc::MessageHeader::ENCODED_SIZE);
+    if (plainLen < 0) return 0;
+    std::memcpy(scratch, wire, rpc::MessageHeader::ENCODED_SIZE);
+    return rpc::MessageHeader::ENCODED_SIZE + static_cast<std::size_t>(plainLen);
+}
+}  // namespace
+
+TEST(GatewayCryptoDataPlane, WorkerIngressWindowNotPoisonedByForgedFrame_RedToggle) {
+    if (!kInjectWorkerIngressCommitBeforeAuthBug) {
+        GTEST_SKIP() << "RED-evidence toggle off in the committed file (see task-22-report.md)";
+    }
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/48);
+    WorkerIngressFixture w = makeWorkerIngressFixture(f);
+    pn::RecordsOpenCtx ctx = w.ctx();
+
+    const auto plain = encodeProduceFrame(48, 1, 1, 0, -1, 0, -1, 0, {0x0C});
+    const uint8_t fakePrefix[cr::kNoncePrefix] = {1, 2, 3, 4};
+    cr::AeadCipher wrongKeyCipher(f.gw.cipher, cr::AeadKey{}, fakePrefix);
+    const auto forged = sealFrameAsPeer(wrongKeyCipher, /*seq=*/5, plain);
+
+    std::vector<uint8_t> scratch(forged.size());
+    const std::size_t nForged = openProduceFrameBuggy(
+        ctx, forged.data(), forged.size(), scratch.data(), scratch.size());
+    EXPECT_EQ(nForged, 0u);
+
+    // With the bug, the window was already poisoned to seq=5 — the
+    // legitimate seq=5 frame is now wrongly rejected as a replay.
+    const auto legit = sealFrameAsPeer(*f.clientSend, /*seq=*/5, plain);
+    scratch.assign(legit.size(), 0);
+    const std::size_t nLegit = openProduceFrameBuggy(
+        ctx, legit.data(), legit.size(), scratch.data(), scratch.size());
+    EXPECT_EQ(nLegit, plain.size()) << "expected to FAIL under the injected bug (RED evidence)";
+}
+
+// ---------------------------------------------------------------------------
+// Task 19 + Task 22: SessionAnnounceKeyTail.h — the
+// [cipher|b2cPrefix|b2cKey|c2bPrefix|c2bKey|channel] byte layout Worker.h's
+// enqueueOp/executeSessionAnnounceWire_ ride on the SessionAnnounce op's
+// EXISTING variable tail (no new SBE field — see that header's file
+// comment). Task 22 extended the tail to ALSO carry the session's c2b
+// ingress key/prefix alongside Task 19's b2c egress key/prefix — these
+// round-trip tests now cover both. Pure byte-format functions, zero
+// Aeron/crypto dependency: unit-tested standalone here, same TU as the rest
+// of this file's aeron-free crypto coverage.
 // ---------------------------------------------------------------------------
 
 TEST(SessionAnnounceKeyTail, EncodeDecodeRoundTrips) {
-    uint8_t prefix[4] = {0x11, 0x22, 0x33, 0x44};
-    uint8_t key[32];
-    for (int i = 0; i < 32; ++i) key[static_cast<std::size_t>(i)] = static_cast<uint8_t>(i);
+    uint8_t b2cPrefix[4] = {0x11, 0x22, 0x33, 0x44};
+    uint8_t b2cKey[32];
+    for (int i = 0; i < 32; ++i) b2cKey[static_cast<std::size_t>(i)] = static_cast<uint8_t>(i);
+    // Task 22: the tail now ALSO carries the session's c2b ingress key +
+    // prefix — distinct bytes from b2c, so a round trip cannot accidentally
+    // pass by aliasing the two fields.
+    uint8_t c2bPrefix[4] = {0x55, 0x66, 0x77, 0x88};
+    uint8_t c2bKey[32];
+    for (int i = 0; i < 32; ++i) c2bKey[static_cast<std::size_t>(i)] = static_cast<uint8_t>(31 - i);
     const std::string channel = "aeron:udp?endpoint=127.0.0.1:9999";
 
     std::vector<uint8_t> buf(rune::node::kSessionAnnounceCryptoHeaderBytes + channel.size());
     const std::size_t n = rune::node::encodeSessionAnnounceCryptoTail(
-        buf.data(), buf.size(), /*cipher=*/static_cast<uint8_t>(cr::Cipher::Aes256Gcm), prefix, key,
-        channel.data(), channel.size());
+        buf.data(), buf.size(), /*cipher=*/static_cast<uint8_t>(cr::Cipher::Aes256Gcm),
+        b2cPrefix, b2cKey, c2bPrefix, c2bKey, channel.data(), channel.size());
     ASSERT_EQ(n, buf.size());
 
     const auto decoded = rune::node::decodeSessionAnnounceCryptoTail(
         reinterpret_cast<const char*>(buf.data()), n);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->cipher, static_cast<uint8_t>(cr::Cipher::Aes256Gcm));
-    EXPECT_EQ(0, std::memcmp(decoded->prefix, prefix, 4));
-    EXPECT_EQ(0, std::memcmp(decoded->key, key, 32));
+    EXPECT_EQ(0, std::memcmp(decoded->b2cPrefix, b2cPrefix, 4));
+    EXPECT_EQ(0, std::memcmp(decoded->b2cKey, b2cKey, 32));
+    EXPECT_EQ(0, std::memcmp(decoded->c2bPrefix, c2bPrefix, 4));
+    EXPECT_EQ(0, std::memcmp(decoded->c2bKey, c2bKey, 32));
     ASSERT_EQ(decoded->channel.size(), channel.size());
     EXPECT_EQ(decoded->channel, channel);
 }
 
 TEST(SessionAnnounceKeyTail, EncodeDecodeRoundTripsWithEmptyChannel) {
-    uint8_t prefix[4] = {0, 0, 0, 0};
-    uint8_t key[32] = {};
+    uint8_t b2cPrefix[4] = {0, 0, 0, 0};
+    uint8_t b2cKey[32] = {};
+    uint8_t c2bPrefix[4] = {0, 0, 0, 0};
+    uint8_t c2bKey[32] = {};
     std::vector<uint8_t> buf(rune::node::kSessionAnnounceCryptoHeaderBytes);
     const std::size_t n = rune::node::encodeSessionAnnounceCryptoTail(
-        buf.data(), buf.size(), 1, prefix, key, nullptr, 0);
+        buf.data(), buf.size(), 1, b2cPrefix, b2cKey, c2bPrefix, c2bKey, nullptr, 0);
     ASSERT_EQ(n, rune::node::kSessionAnnounceCryptoHeaderBytes);
     const auto decoded = rune::node::decodeSessionAnnounceCryptoTail(
         reinterpret_cast<const char*>(buf.data()), n);
@@ -1000,10 +1369,10 @@ TEST(SessionAnnounceKeyTail, EncodeDecodeRoundTripsWithEmptyChannel) {
 }
 
 TEST(SessionAnnounceKeyTail, EncodeFailsClosedWhenBufferTooSmall) {
-    uint8_t prefix[4] = {}, key[32] = {};
+    uint8_t b2cPrefix[4] = {}, b2cKey[32] = {}, c2bPrefix[4] = {}, c2bKey[32] = {};
     std::vector<uint8_t> tooSmall(rune::node::kSessionAnnounceCryptoHeaderBytes - 1);
     const std::size_t n = rune::node::encodeSessionAnnounceCryptoTail(
-        tooSmall.data(), tooSmall.size(), 1, prefix, key, "x", 1);
+        tooSmall.data(), tooSmall.size(), 1, b2cPrefix, b2cKey, c2bPrefix, c2bKey, "x", 1);
     EXPECT_EQ(n, 0u) << "must never write a truncated crypto header — 0 means 'do not enqueue this'";
 }
 

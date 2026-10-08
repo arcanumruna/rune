@@ -61,10 +61,23 @@ public:
     /// when `sessionEncrypted && keyReady`; `sessionEncrypted=false`
     /// (plaintext, the default) touches nothing — zero bytes added,
     /// byte-identical to every pre-Task-19 call.
+    ///
+    /// Task 22 (shard worker decrypts produce / per-worker ingress): `c2b`/
+    /// `c2bPrefix` are the session's RAW client->broker key/prefix — UNLIKE
+    /// `b2c` above, this is NOT derived per worker (ingress has a SINGLE
+    /// sender, the client): every worker gets the SAME bytes, straight from
+    /// the gateway's own `session.crypto.c2b`/`c2bPrefix` (Task 8's ingress
+    /// open key, retained raw alongside `b2c` — see CryptoState.h). Read
+    /// ONLY when `sessionEncrypted && keyReady`, same gate as `b2c`;
+    /// `c2bKeyValid` on the wire mirrors `keyReady` directly (no derivation
+    /// step to fail: copying raw bytes cannot fail the way deriveSenderKey
+    /// can) — false on the first (parked) wave, true once the real keys
+    /// exist.
     bool announce(WorkerPool& pool, int64_t sessionId, std::string_view channel, int32_t streamId,
                   int32_t clientVersion = 0, bool sessionEncrypted = false, bool keyReady = false,
                   const rune::crypto::AeadKey& b2c = {}, const uint8_t* b2cPrefix = nullptr,
-                  rune::crypto::Cipher cipher = rune::crypto::Cipher::None) {
+                  rune::crypto::Cipher cipher = rune::crypto::Cipher::None,
+                  const rune::crypto::AeadKey& c2b = {}, const uint8_t* c2bPrefix = nullptr) {
         Announcing* a = findAnnouncing_(sessionId);
         if (!a) { announcing_.push_back({sessionId, allMask_(pool)}); a = &announcing_.back(); }
         for (int32_t w = 0; w < pool.workerCount(); ++w) {
@@ -98,6 +111,19 @@ public:
             }
             // else: sessionEncrypted && !keyReady (the first wave — no real
             // key exists yet) or plaintext — op.senderKeyValid stays false.
+
+            // Task 22: c2b ingress key — the SAME raw bytes for every worker
+            // (no per-worker derivation; see this function's doc comment).
+            // Gated identically to the b2c branch above: only once the real
+            // handshake keys exist (sessionEncrypted && keyReady).
+            if (sessionEncrypted && keyReady) {
+                op.c2bKeyValid = true;
+                std::memcpy(op.c2bKeyPrefix, c2bPrefix, 4);
+                std::memcpy(op.c2bKey, c2b.bytes, 32);
+            }
+            // else: op.c2bKeyValid stays false — fail closed (the worker
+            // parks/drops this session's produce ingress, never plaintext).
+
             if (pool.worker(w).tryEnqueueOp(std::move(op))) a->remaining &= ~bit;
         }
         if (a->remaining != 0) return false;
