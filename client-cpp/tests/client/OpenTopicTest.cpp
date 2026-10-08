@@ -124,7 +124,7 @@ TEST(OpenTopic, SendBufferReuse) {
     // callCount is stored outside TypedTopic so assertions work after the move.
     int callCount = 0;
     rune::client::TypedTopic<StubT, StubProducer> topic(
-        StubProducer{&callCount}, /*topicId=*/42);
+        StubProducer{&callCount}, /*topicId=*/42, /*version=*/1);
 
     StubT rec1{0x0102030405060708ULL};
     StubT rec2{0x0807060504030201ULL};

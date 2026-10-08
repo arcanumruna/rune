@@ -32,6 +32,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -81,6 +82,20 @@ struct GateGateway {
     uint16_t             getVersion   = 1;
     uint16_t             getErrorCode = 0;
     std::vector<uint8_t> getBlob;
+
+    // Task 19: fingerprint-selecting GetTopicSchema responses (the broker's
+    // Task 13/18 behavior).  A nonzero requestedFingerprint is looked up in
+    // this table; when absent the reply is an error (unknown schema — an
+    // old generated client whose version the broker has no record of).  A
+    // zero requestedFingerprint ("latest") always uses the plain getXxx
+    // fields above, regardless of this table.
+    struct FingerprintOverride {
+        int32_t               topicId;
+        uint16_t              version;
+        std::vector<uint8_t>  blob;
+    };
+    std::map<uint64_t, FingerprintOverride> fingerprintOverrides;
+    uint16_t unknownFingerprintErrorCode = 1;  // any nonzero "not found" code
 
     uint8_t replyBuf[4096]{};
 
@@ -170,11 +185,29 @@ struct GateGateway {
             rpc::TopicSchemaResponse resp;
             resp.sessionId      = opt->sessionId;
             resp.correlationId  = opt->correlationId;
-            resp.topicId        = getTopicId;
-            resp.version        = getVersion;
-            resp.errorCode      = getErrorCode;
-            resp.descriptorBlob = getBlob.data();
-            resp.descriptorLen  = static_cast<uint32_t>(getBlob.size());
+
+            if (opt->requestedFingerprint != 0) {
+                auto it = fingerprintOverrides.find(opt->requestedFingerprint);
+                if (it != fingerprintOverrides.end()) {
+                    resp.topicId        = it->second.topicId;
+                    resp.version        = it->second.version;
+                    resp.errorCode      = 0;
+                    resp.descriptorBlob = it->second.blob.data();
+                    resp.descriptorLen  = static_cast<uint32_t>(it->second.blob.size());
+                } else {
+                    resp.topicId        = -1;
+                    resp.version        = 0;
+                    resp.errorCode      = unknownFingerprintErrorCode;
+                    resp.descriptorBlob = nullptr;
+                    resp.descriptorLen  = 0;
+                }
+            } else {
+                resp.topicId        = getTopicId;
+                resp.version        = getVersion;
+                resp.errorCode      = getErrorCode;
+                resp.descriptorBlob = getBlob.data();
+                resp.descriptorLen  = static_cast<uint32_t>(getBlob.size());
+            }
 
             std::vector<uint8_t> scratch(resp.encodedSize() + 32u);
             const std::size_t n = resp.encode(scratch.data());
@@ -286,6 +319,79 @@ struct StubT_Mismatch {
 };
 const uint64_t StubT_Mismatch::kFingerprint = fingerprint(makeCharsDescriptor()) ^ 0xFF;
 
+// ---------------------------------------------------------------------------
+// Task 19: version-binding stub types.
+//
+// StubV1 is what a client compiled against schema version 1 looks like;
+// StubV1::kVersion is deliberately 42 — NOT 1 — so a test asserting the
+// stamped bytes == 1 cannot be passing by accident (it would fail if send()
+// stamped the codegen-baked kVersion instead of the broker-bound version).
+// ---------------------------------------------------------------------------
+static Descriptor makeCharsV1Descriptor() {
+    return DescriptorBuilder("characters", 1)
+        .add("id",     PrimType::Int64)
+        .add("userId", PrimType::Int64, 1, /*isKey=*/true)
+        .add("name",   PrimType::String)
+        .build();
+}
+static Descriptor makeCharsV2Descriptor() {
+    return DescriptorBuilder("characters", 2)
+        .add("id",     PrimType::Int64)
+        .add("userId", PrimType::Int64, 1, /*isKey=*/true)
+        .add("name",   PrimType::String)
+        .add("level",  PrimType::Int32)
+        .build();
+}
+
+struct StubV1 {
+    static const uint64_t kFingerprint;
+    static constexpr std::string_view kSchemaName = "characters";
+    static constexpr uint16_t kVersion = 42;  // deliberately != 1 (see note above)
+    size_t encodedSize() const noexcept { return 4; }
+    size_t encode(uint8_t* buf) const noexcept {
+        // Mirrors the real codegen layout: [blockLength:u16 LE][version:u16 LE].
+        buf[0] = 0x04; buf[1] = 0x00;
+        buf[2] = static_cast<uint8_t>(kVersion & 0xffu);
+        buf[3] = static_cast<uint8_t>((kVersion >> 8) & 0xffu);
+        return 4;
+    }
+};
+const uint64_t StubV1::kFingerprint = fingerprint(makeCharsV1Descriptor());
+
+/// Captures the exact bytes TypedTopic::send() hands to the producer — the
+/// test seam used to assert the stamped version without a live Aeron round
+/// trip (TypedTopic's second template param exists for exactly this).
+struct StubCaptureProducer {
+    explicit StubCaptureProducer(std::vector<uint8_t>* captured) noexcept : captured_(captured) {}
+    void send(rune::client::TopicHandle, const rune::client::Key&,
+             std::span<const uint8_t> value) noexcept {
+        if (captured_) captured_->assign(value.begin(), value.end());
+    }
+    std::vector<uint8_t>* captured_ = nullptr;
+};
+
+/// Pumps a GateGateway from a helper thread while the test thread blocks
+/// inside a Client *AndWait call (same pattern as HandleLifetimeTest's
+/// GatewayPump, adapted to GateGateway::poll()).
+struct GateGatewayPump {
+    GateGateway&       gw;
+    std::atomic<bool>  stopFlag{false};
+    std::thread        t;
+    explicit GateGatewayPump(GateGateway& g)
+        : gw(g), t([this] {
+              while (!stopFlag.load(std::memory_order_acquire)) {
+                  if (gw.poll(16) == 0) std::this_thread::sleep_for(kPollSleep);
+              }
+          }) {}
+    void stop() {
+        if (t.joinable()) {
+            stopFlag.store(true, std::memory_order_release);
+            t.join();
+        }
+    }
+    ~GateGatewayPump() { stop(); }
+};
+
 // ===========================================================================
 // Test 1: openTopic<StubT_Match> resolves when kFingerprint matches
 // ===========================================================================
@@ -392,4 +498,113 @@ TEST(OpenTopicGate, OpenTopicSendDoesNotThrow) {
     ASSERT_NO_THROW(tt.send(rec)) << "send() must not throw";
     // Call send again to exercise buffer-reuse (same capacity, no realloc).
     ASSERT_NO_THROW(tt.send(rec)) << "second send() must not throw";
+}
+
+// ===========================================================================
+// Task 19: version-binding typed gate + record version stamping
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Test 4: openTopicAndWait<StubV1> binds the version whose fingerprint
+// matches T::kFingerprint — NOT latest — and every send() stamps that bound
+// version onto the record header (bytes [2..3], overwriting the codegen-baked
+// kVersion).
+//
+// The topic is at v2 ("latest" — what a plain getTopicSchemaAndWait(name)
+// would return), but the broker also still knows v1's materialized
+// descriptor and answers a GetTopicSchema(requestedFingerprint =
+// StubV1::kFingerprint) with {version=1, v1 blob} (Task 13's fingerprint-
+// selecting lookup, Task 18's wire support).
+// ===========================================================================
+TEST(OpenTopicGate, BindsToVersionWhoseFingerprintMatchesAndStamps) {
+    GateHarness h(1306, 1307);
+    h.build();
+    h.connectAndWait();
+
+    // "Latest" (v2) — must NOT be what StubV1 binds to.
+    h.gw->getTopicId   = 0x40000002;
+    h.gw->getVersion   = 2;
+    h.gw->getBlob      = serialize(makeCharsV2Descriptor());
+    h.gw->getErrorCode = 0;
+
+    // The fingerprint-selecting answer for StubV1's compiled-against version.
+    h.gw->fingerprintOverrides[StubV1::kFingerprint] = GateGateway::FingerprintOverride{
+        /*topicId=*/0x40000001, /*version=*/1, serialize(makeCharsV1Descriptor())};
+
+    TypedTopic<StubV1> tt = [&] {
+        GateGatewayPump pump(*h.gw);
+        return h.client->openTopicAndWait<StubV1>("characters");
+    }();
+
+    EXPECT_EQ(tt.boundVersion(), 1u)
+        << "openTopicAndWait<StubV1> must bind version 1 (its fingerprint's "
+           "version), not latest (2)";
+
+    // send() through the real (Aeron) producer must still not throw.
+    StubV1 rec;
+    ASSERT_NO_THROW(tt.send(rec)) << "send() must not throw";
+
+    // Assert the stamped bytes via the TypedTopic<T, ProducerT> test seam,
+    // bound to the SAME version openTopicAndWait returned above — proves
+    // send() stamps the broker-bound version (1), not StubV1::kVersion (42,
+    // deliberately different — see the stub's definition).
+    std::vector<uint8_t> captured;
+    TypedTopic<StubV1, StubCaptureProducer> stampTopic(
+        StubCaptureProducer{&captured}, /*topicId=*/0x40000001, tt.boundVersion());
+    stampTopic.send(rec);
+
+    ASSERT_GE(captured.size(), 4u);
+    const uint16_t stampedVersion =
+        static_cast<uint16_t>(captured[2]) | (static_cast<uint16_t>(captured[3]) << 8);
+    EXPECT_EQ(stampedVersion, 1u)
+        << "send() must stamp the broker-bound version (1), not the "
+           "codegen-baked StubV1::kVersion (42)";
+}
+
+// ===========================================================================
+// Test 5: an unknown fingerprint (the broker has no version matching
+// T::kFingerprint — e.g. an old generated client whose schema predates the
+// topic's recorded history, or a genuinely stale one) still throws the
+// "generated type is stale" error.
+// ===========================================================================
+TEST(OpenTopicGate, StaleFingerprintStillThrows) {
+    GateHarness h(1308, 1309);
+    h.build();
+    h.connectAndWait();
+
+    // "Latest" is v2; the broker's fingerprintOverrides table is left empty,
+    // so ANY requestedFingerprint lookup (including StubV1's) is "not found".
+    h.gw->getTopicId   = 0x40000002;
+    h.gw->getVersion   = 2;
+    h.gw->getBlob      = serialize(makeCharsV2Descriptor());
+    h.gw->getErrorCode = 0;
+
+    GateGatewayPump pump(*h.gw);
+    EXPECT_THROW((void)h.client->openTopicAndWait<StubV1>("characters"), std::runtime_error)
+        << "openTopicAndWait must throw when the broker has no version "
+           "matching T::kFingerprint";
+}
+
+// ===========================================================================
+// Regression: the version stamp always reflects the bound version, never the
+// codegen-baked kVersion — pinned with a version that is NOT 1 so a test that
+// accidentally asserted the baked version instead would fail loudly.
+// ===========================================================================
+TEST(OpenTopicGate, SendStampsBoundVersionNotCodegenVersionRegression) {
+    std::vector<uint8_t> captured;
+    TypedTopic<StubV1, StubCaptureProducer> topic(
+        StubCaptureProducer{&captured}, /*topicId=*/1, /*version=*/7);
+
+    StubV1 rec;
+    topic.send(rec);
+
+    ASSERT_GE(captured.size(), 4u);
+    const uint16_t stampedVersion =
+        static_cast<uint16_t>(captured[2]) | (static_cast<uint16_t>(captured[3]) << 8);
+    EXPECT_EQ(stampedVersion, 7u)
+        << "regression: send() must overwrite StubV1's baked kVersion (42) "
+           "with the bound version (7)";
+    EXPECT_NE(stampedVersion, StubV1::kVersion)
+        << "regression: the stamped version must never be the codegen-baked "
+           "kVersion once a different version is bound";
 }

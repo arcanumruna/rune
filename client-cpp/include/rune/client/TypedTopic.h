@@ -75,11 +75,18 @@ namespace rune::client {
 template <class T, class ProducerT = Producer>
 class TypedTopic {
 public:
-    /// Construct from an existing producer handle and topicId.
-    /// Typically obtained from Client::openTopic<T>().
-    TypedTopic(ProducerT producer, int32_t topicId)
+    /// Construct from an existing producer handle, topicId, and the schema
+    /// VERSION this topic is bound to (Task 19).  `version` is the version
+    /// whose fingerprint matched T::kFingerprint when the broker answered the
+    /// open gate (Client::openTopicAndWait / TypedTopic::fromSchema) — NOT
+    /// necessarily T::kVersion (the codegen-baked compile-time version): an
+    /// old generated client stays bound to the version it compiled against
+    /// even after the topic evolves.  Every send() stamps this bound version
+    /// onto the encoded record, overwriting the codegen-baked kVersion.
+    TypedTopic(ProducerT producer, int32_t topicId, uint16_t version)
         : producer_(std::move(producer))
         , topicId_(topicId)
+        , version_(version)
     {}
 
     // F8c C7 (spec §3.1 rule 3): move-only — it owns its Producer, which is
@@ -108,7 +115,10 @@ public:
         if (!schemaMatches(T::kFingerprint, descriptorBlob)) {
             throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
         }
-        return TypedTopic(client.producer(), static_cast<int32_t>(c.value));
+        // c.aux carries the schema version bound to this descriptor (Task 18
+        // wire contract: GetTopicSchema completion value=topicId, aux=version).
+        return TypedTopic(client.producer(), static_cast<int32_t>(c.value),
+                          static_cast<uint16_t>(c.aux));
     }
 
     // ---- Hot path — ZERO per-send heap allocation ----------------------------
@@ -133,6 +143,17 @@ public:
         const std::size_t n = rec.encode(buf_.data());
         if (n == 0) return;
 
+        // Task 19: stamp the BOUND version onto the encoded record header,
+        // overwriting the codegen-baked T::kVersion at bytes [2..3] (LE u16 —
+        // Generator.cpp's encode() layout: [blockLength:u16][version:u16]...).
+        // This is what keeps a client compiled against an older schema
+        // version writing records tagged with that older version after the
+        // topic has evolved out from under it.
+        if (n >= 4) {
+            buf_[2] = static_cast<uint8_t>(version_ & 0xffu);
+            buf_[3] = static_cast<uint8_t>((version_ >> 8) & 0xffu);
+        }
+
         // Route through the existing ProducerT::send (TopicHandle + empty key).
         // TopicHandle{topicId_, 1}: partitionCount=1 → partition=0.
         // For a real deployment with multiple partitions the caller should
@@ -150,9 +171,13 @@ public:
     /// (capacity must be non-decreasing — proves RULE #4 on the zero-alloc path).
     [[nodiscard]] std::size_t bufCapacity() const noexcept { return buf_.capacity(); }
 
+    /// The schema version this topic is bound to (Task 19 test seam).
+    [[nodiscard]] uint16_t boundVersion() const noexcept { return version_; }
+
 private:
     ProducerT              producer_;
     int32_t                topicId_;
+    uint16_t               version_ = 0;  // bound schema version; stamped onto every send()
     std::vector<uint8_t>   buf_;   // reused; grown to high-water mark, never freed per send
 };
 

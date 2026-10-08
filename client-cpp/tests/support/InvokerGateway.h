@@ -11,6 +11,8 @@
 #include "AeronTestErrors.h"
 #include <rune/client/codec/Codec.h>
 #include <rune/client/codec/DataCodec.h>
+#include <rune/codec/Fingerprint.h>
+#include <rune/codec/Serialize.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/GroupMessages.h>
@@ -1062,6 +1064,24 @@ private:
             r.errorCode      = schemaErrorCode;
             r.descriptorBlob = schemaBlob.data();
             r.descriptorLen  = static_cast<uint32_t>(schemaBlob.size());
+            // Task 19: a nonzero requestedFingerprint selects by fingerprint
+            // (the real broker's Task 13/18 behavior).  This stub only knows
+            // one materialized version (schemaBlob/schemaVersion), so a
+            // request for any OTHER fingerprint cannot be resolved here —
+            // answer not-found, same as a real broker would for a fingerprint
+            // it never saw.
+            if (g->requestedFingerprint != 0) {
+                bool matches = false;
+                try {
+                    matches = rune::codec::fingerprint(rune::codec::deserialize(
+                        std::span<const uint8_t>(schemaBlob))) == g->requestedFingerprint;
+                } catch (...) {}
+                if (!matches) {
+                    r.errorCode      = schemaErrorCode != 0 ? schemaErrorCode : 1;
+                    r.descriptorBlob = nullptr;
+                    r.descriptorLen  = 0;
+                }
+            }
             std::vector<uint8_t> out(r.encodedSize());
             const std::size_t n = r.encode(out.data());
             send(0, out.data(), n);

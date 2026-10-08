@@ -555,22 +555,30 @@ public:
     [[nodiscard]] std::vector<std::pair<std::string, int32_t>>
     listTopics(std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
 
-    /// Open a typed topic: getTopicSchemaAndWait(name), then the EXACT-
-    /// fingerprint gate on THIS thread (TypedTopic::fromSchema).  No thread is
-    /// spawned (the old async-task continuation is gone); the per-topic schema
-    /// cache is written by the duty thread when it handles the response.
+    /// Open a typed topic: getTopicSchemaAndWait(name, T::kFingerprint) — the
+    /// VERSION-BINDING gate (Task 19).  The broker (Task 13) searches the
+    /// topic's schema history for the version whose fingerprint equals
+    /// T::kFingerprint and, on a match, returns THAT version's materialized
+    /// descriptor blob — not necessarily the latest.  This is what lets a
+    /// client compiled against an older schema version keep working after the
+    /// topic has evolved: it binds to (and every send() stamps) the version it
+    /// was actually compiled against, instead of whatever is latest.
+    ///
+    /// A broker errorCode (no version has that fingerprint — UnknownSchema or
+    /// equivalent) throws the same "stale generated type" error as an exact
+    /// descriptor mismatch did before Task 18 added fingerprint selection.
+    ///
+    /// No thread is spawned (the old async-task continuation is gone); the
+    /// per-topic schema cache is written by the duty thread when it handles
+    /// the response.
     template <class T>
     [[nodiscard]] TypedTopic<T> openTopicAndWait(std::string_view name,
                                                  std::chrono::nanoseconds timeout = kDefaultWaitTimeout) {
-        TopicSchemaResult r = getTopicSchemaAndWait(name, timeout);
+        TopicSchemaResult r = getTopicSchemaAndWait(name, T::kFingerprint, timeout);
         if (r.errorCode != 0) {
-            throw std::runtime_error("openTopic: broker returned errorCode " +
-                                     std::to_string(r.errorCode));
-        }
-        if (!schemaMatches(T::kFingerprint, std::span<const uint8_t>(r.descriptorBlob))) {
             throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
         }
-        return TypedTopic<T>(producer(), r.topicId);
+        return TypedTopic<T>(producer(), r.topicId, r.version);
     }
 
     /// Test hooks (duty thread only, or after close): completions addressed to
