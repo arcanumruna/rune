@@ -1,11 +1,13 @@
 #pragma once
 #include <cstdint>
+#include <deque>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+#include <rune/codec/AlterOps.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Validator.h>
 
@@ -22,9 +24,12 @@ inline constexpr uint32_t RUNTIME_TOPIC_ID_BASE  = 0x40000000u;
 ///   nextTag:u16, compatMode:u8.
 /// The trailing (nextTag, compatMode) pair is APPENDED after the original
 /// layout (schema-evolution, Task 9) so legacy records written before these
-/// fields existed still deserialize: when the trailing bytes are absent,
-/// deserialize() defaults compatMode=0 (BACKWARD) and nextTag to the field
-/// count of the embedded descriptor.
+/// fields existed still deserialize: when the trailing bytes are absent
+/// entirely, deserialize() defaults compatMode=BACKWARD and nextTag to the
+/// field count of the embedded descriptor. A trailing tail that is present
+/// but not exactly 3 bytes (1 or 2 leftover bytes, or >3) is truncated/
+/// malformed and deserialize() rejects it (returns std::nullopt), same as
+/// every other bounds check in this function.
 struct TopicSchema {
     int32_t               topicId        = -1;
     uint16_t              version        = 1;
@@ -33,7 +38,7 @@ struct TopicSchema {
     bool                  validate       = false;
     std::vector<uint8_t>  descriptorBlob;
     uint16_t              nextTag        = 0;    // next durable tag to allocate on ADD
-    uint8_t               compatMode     = 0;    // 0=BACKWARD, 1=FORWARD
+    rune::codec::CompatMode compatMode   = rune::codec::CompatMode::Backward;
 
     [[nodiscard]] std::vector<uint8_t> serialize() const;
     [[nodiscard]] static std::optional<TopicSchema> deserialize(std::span<const uint8_t> buf);
@@ -55,7 +60,7 @@ struct RegistryEntry {
     uint16_t                         version        = 1;
     int32_t                          partitionCount = 1;
     uint16_t                         nextTag        = 0;
-    uint8_t                          compatMode     = 0;
+    rune::codec::CompatMode          compatMode     = rune::codec::CompatMode::Backward;
 };
 
 /// Single-threaded, AdminWorker-owned schema registry.
@@ -104,7 +109,15 @@ private:
     // topicId -> all applied versions, indexed by (version - 1); versions
     // are applied in order by AdminWorker/rebuildFromRecords so this never
     // has gaps in practice. Single-writer (admin-thread-owned) — no atomics.
-    std::unordered_map<int32_t, std::vector<RegistryEntry>> byId_;
+    //
+    // std::deque, NOT std::vector: callers (e.g. Task 11's ALTER flow) hold
+    // a `const RegistryEntry*` from byId/latest/byIdVersion/byFingerprint
+    // across a subsequent applyRecord() of a new version. A vector's
+    // push_back/resize may reallocate and invalidate every existing element
+    // pointer; a deque's insertion/growth at the back invalidates iterators
+    // but never references/pointers to already-existing elements, so those
+    // pointers stay valid.
+    std::unordered_map<int32_t, std::deque<RegistryEntry>> byId_;
     std::unordered_map<std::string, int32_t>   nameToId_;
     uint32_t runtimeIdHighWater_ = RUNTIME_TOPIC_ID_BASE;
 };

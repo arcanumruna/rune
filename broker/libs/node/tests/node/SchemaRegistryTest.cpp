@@ -100,7 +100,7 @@ static TopicSchema makeTopicSchema(int32_t topicId, uint16_t version, const Desc
     ts.validate        = false;
     ts.descriptorBlob  = serialize(evolving);
     ts.nextTag         = static_cast<uint16_t>(evolving.fields.size());
-    ts.compatMode      = 0;
+    ts.compatMode      = CompatMode::Backward;
     return ts;
 }
 
@@ -140,6 +140,64 @@ TEST(SchemaRegistryRegression, LegacyRecordWithoutTrailingFieldsDeserializesWith
 
     auto back = TopicSchema::deserialize(bytes);
     ASSERT_TRUE(back.has_value());
-    EXPECT_EQ(back->compatMode, 0);
+    EXPECT_EQ(back->compatMode, CompatMode::Backward);
     EXPECT_EQ(back->nextTag, 3u);  // makeSchema() builds a 3-field descriptor
+}
+
+// Regression: a trailing tail that is PRESENT but truncated (1 or 2 of the 3
+// bytes) must be rejected as malformed, not silently treated as a legacy
+// (zero-trailing-byte) record.
+TEST(SchemaRegistryRegression, PartiallyTruncatedTrailingTailIsRejected) {
+    TopicSchema ts = makeSchema(0x40000003, "partial_tail", false);
+    ts.nextTag = 7;
+    ts.compatMode = CompatMode::Forward;
+    auto bytes = ts.serialize();
+    ASSERT_GE(bytes.size(), 3u);
+
+    // Drop 2 of the 3 trailing bytes -> exactly 1 leftover byte.
+    auto oneLeftover = bytes;
+    oneLeftover.resize(oneLeftover.size() - 2);
+    EXPECT_FALSE(TopicSchema::deserialize(oneLeftover).has_value());
+
+    // Drop 1 of the 3 trailing bytes -> exactly 2 leftover bytes.
+    auto twoLeftover = bytes;
+    twoLeftover.resize(twoLeftover.size() - 1);
+    EXPECT_FALSE(TopicSchema::deserialize(twoLeftover).has_value());
+
+    // Sanity: the untruncated record still deserializes fine.
+    auto whole = TopicSchema::deserialize(bytes);
+    ASSERT_TRUE(whole.has_value());
+    EXPECT_EQ(whole->nextTag, 7);
+    EXPECT_EQ(whole->compatMode, CompatMode::Forward);
+}
+
+// Regression: a `const RegistryEntry*` taken from latest() before a new
+// version is applied must remain valid afterward -- byId_'s per-topic
+// container is a deque specifically so growing it (Task 11's ALTER flow:
+// read latest(), applyRecord() the new version, read back) never
+// reallocates and invalidates a previously-returned pointer.
+TEST(SchemaRegistryRegression, LatestPointerSurvivesSubsequentApplyRecord) {
+    SchemaRegistry reg;
+    reg.applyRecord(makeTopicSchema(1, 1, evolvingV1()));
+
+    const RegistryEntry* p1 = reg.latest(1);
+    ASSERT_NE(p1, nullptr);
+    const uint64_t fp1Before = p1->fingerprint;
+    const uint16_t version1Before = p1->version;
+
+    // Drive enough additional applyRecord() calls (on other topics too, to
+    // also exercise growth of unrelated map buckets) that a vector-backed
+    // implementation would very likely have reallocated by now.
+    for (int32_t t = 2; t < 20; ++t) {
+        reg.applyRecord(makeTopicSchema(t, 1, evolvingV1()));
+    }
+    reg.applyRecord(makeTopicSchema(1, 2, evolvingV2()));
+
+    // p1 must still point at the same, unmodified v1 entry.
+    EXPECT_EQ(p1->version, version1Before);
+    EXPECT_EQ(p1->fingerprint, fp1Before);
+    EXPECT_EQ(p1->topicId, 1);
+
+    // And the registry now also reports v2 as latest, independently.
+    EXPECT_EQ(reg.latest(1)->version, 2);
 }

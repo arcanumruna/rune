@@ -105,7 +105,7 @@ std::vector<uint8_t> TopicSchema::serialize() const {
     // [schema-evolution] trailing fields appended after the original layout
     // (Task 9) — see deserialize() for the legacy-record default behavior.
     writeU16LE(buf, nextTag);
-    writeU8(buf, compatMode);
+    writeU8(buf, static_cast<uint8_t>(compatMode));
 
     return buf;
 }
@@ -139,22 +139,30 @@ std::optional<TopicSchema> TopicSchema::deserialize(std::span<const uint8_t> buf
 
     // [schema-evolution] trailing (nextTag, compatMode) pair, appended after
     // the original layout (Task 9). A legacy record (written before these
-    // fields existed) simply has no bytes left here: default compatMode=0
-    // (BACKWARD) and nextTag to the embedded descriptor's field count, so a
-    // migrated single-version topic's next ADD allocates a fresh tag past
-    // every field it already has. If the trailing u16 IS present but the
-    // following u8 is missing, that's genuine truncation, not a legacy
-    // record -- reject it.
-    if (readU16LE(buf, pos, ts.nextTag)) {
-        if (!readU8(buf, pos, ts.compatMode)) return std::nullopt;
-    } else {
-        ts.compatMode = 0;
+    // fields existed) has exactly 0 bytes left here: default
+    // compatMode=BACKWARD and nextTag to the embedded descriptor's field
+    // count, so a migrated single-version topic's next ADD allocates a
+    // fresh tag past every field it already has. Any OTHER leftover byte
+    // count (1 or 2 -- a partially-written/truncated tail -- or more than
+    // 3 -- an unknown trailing extension) is rejected, same as every other
+    // bounds check in this function: only an EXACT 3-byte tail is accepted
+    // as present-and-whole.
+    const size_t remaining = buf.size() - pos;
+    if (remaining == 0) {
+        ts.compatMode = rune::codec::CompatMode::Backward;
         try {
             const rune::codec::Descriptor d = rune::codec::deserialize(ts.descriptorBlob);
             ts.nextTag = static_cast<uint16_t>(d.fields.size());
         } catch (const std::exception&) {
             ts.nextTag = 0;
         }
+    } else if (remaining == 3) {
+        uint8_t compatByte = 0;
+        if (!readU16LE(buf, pos, ts.nextTag))   return std::nullopt;
+        if (!readU8(buf, pos, compatByte))      return std::nullopt;
+        ts.compatMode = static_cast<rune::codec::CompatMode>(compatByte);
+    } else {
+        return std::nullopt;  // truncated (1-2 bytes) or unrecognized (>3 bytes) tail
     }
 
     return ts;
@@ -190,6 +198,9 @@ void SchemaRegistry::applyRecord(const TopicSchema& ts) {
     nameToId_[schemaName] = ts.topicId;
 
     // Keep ALL versions: append (never overwrite) by version, 1-based index.
+    // byId_'s per-topic container is a deque (not a vector) specifically so
+    // growing it here never invalidates a `const RegistryEntry*` a caller
+    // already holds from a prior byId/latest/byIdVersion/byFingerprint call.
     auto& versions = byId_[ts.topicId];
     const size_t idx = (ts.version > 0) ? static_cast<size_t>(ts.version - 1) : size_t{0};
     if (idx >= versions.size()) versions.resize(idx + 1);
