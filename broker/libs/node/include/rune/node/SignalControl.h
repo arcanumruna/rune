@@ -9,6 +9,11 @@
 //      macOS — no signalfd) and posts events onto the main CONTROL ring:
 //        SIGINT / SIGTERM → kStopEvent
 //        SIGUSR1          → kFrDumpEvent   (dump the flight-recorder report)
+//        SIGHUP           → kTlsReloadEvent (Task 9: RUNE_TLS cert/key renewal —
+//                           main() forwards this to BrokerNode::requestTlsCertReload(),
+//                           which itself only offers a trigger onto a ring the
+//                           gateway's OWN duty-cycle thread polls and acts on —
+//                           the signal path never touches gateway state directly)
 //      The halt path (BrokerNode fail-stop, on the runtime thread) posts
 //      kHaltEvent{exitCode} on the SAME ring via postHalt() — the exit code
 //      travels in the message, never through a global.
@@ -35,9 +40,10 @@ namespace rune::node {
 /// Main control ring: signal thread + runtime (halt) → main thread.
 using ControlEventRing = rune::consensus::ControlRing<1024>;
 
-inline constexpr std::int32_t kStopEvent   = 1;
-inline constexpr std::int32_t kFrDumpEvent = 2;
-inline constexpr std::int32_t kHaltEvent   = 3;   ///< a = exit code
+inline constexpr std::int32_t kStopEvent      = 1;
+inline constexpr std::int32_t kFrDumpEvent    = 2;
+inline constexpr std::int32_t kHaltEvent      = 3;   ///< a = exit code
+inline constexpr std::int32_t kTlsReloadEvent = 4;   ///< Task 9: SIGHUP — reload cert/key
 
 /// The signals the control plane owns (blocked everywhere, consumed by sigwait).
 inline sigset_t controlSignalSet() noexcept {
@@ -46,6 +52,7 @@ inline sigset_t controlSignalSet() noexcept {
     sigaddset(&set, SIGINT);
     sigaddset(&set, SIGTERM);
     sigaddset(&set, SIGUSR1);
+    sigaddset(&set, SIGHUP);    // Task 9: RUNE_TLS cert/key renewal (reload, not stop)
     sigaddset(&set, SIGUSR2);   // internal: wakes the signal thread for shutdown
     return set;
 }
@@ -64,7 +71,7 @@ inline int blockControlSignals() noexcept {
     struct sigaction dfl {};
     dfl.sa_handler = SIG_DFL;
     sigemptyset(&dfl.sa_mask);
-    for (const int sig : {SIGINT, SIGTERM, SIGUSR1, SIGUSR2}) {
+    for (const int sig : {SIGINT, SIGTERM, SIGUSR1, SIGHUP, SIGUSR2}) {
         if (::sigaction(sig, &dfl, nullptr) != 0) return errno;
     }
     return 0;
@@ -118,6 +125,7 @@ private:
             if (sig == SIGUSR2) continue;   // wake only (an external SIGUSR2 is ignored)
             std::int32_t ev = 0;
             if (sig == SIGUSR1) ev = kFrDumpEvent;
+            else if (sig == SIGHUP) ev = kTlsReloadEvent;   // Task 9: cert/key renewal
             else if (sig == SIGINT || sig == SIGTERM) ev = kStopEvent;
             else continue;   // spurious wake (macOS sigwait may report sig 0): ignore
             // Full ring: main is not draining (wedged) — a repeated signal will

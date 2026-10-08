@@ -12,16 +12,36 @@
 #include <Aeron.h>
 #include <ExclusivePublication.h>
 
+// client<->broker TLS/AEAD (Task 7): Session's own CryptoState holds the two
+// directional AeadCiphers once a server-role TLS handshake completes
+// (ClientGateway::handleHandshakeContinue_).  NOTE (build/linkage trap,
+// task-7-interfaces.md): this header is already part of rune_gateway's
+// PUBLIC interface (it includes <Aeron.h>) — pulling rune/crypto/Aead.h in
+// here means every downstream target that compiles a TU including
+// SessionTable.h now needs rune_crypto's include dir transitively.  rune_crypto
+// + OpenSSL must be linked PUBLIC on rune_gateway (mirroring rune_fr / the
+// client's Task-5 fix-round-1), not PRIVATE as the brief's literal text says.
+//
+// CryptoState itself (Task 8) lives in its own aeron-free header —
+// rune/gateway/CryptoState.h — so the data-plane codec (CryptoFrame.h) that
+// seals/opens frames under it can be unit-tested standalone without ever
+// touching <Aeron.h>.
+#include <rune/gateway/CryptoState.h>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
 namespace rune::gateway {
 
+// ---------------------------------------------------------------------------
+// CryptoState — see rune/gateway/CryptoState.h (extracted there in Task 8 so
+// the aeron-free data-plane codec can use it without pulling in <Aeron.h>).
 // ---------------------------------------------------------------------------
 // Session — one connected client.
 // ---------------------------------------------------------------------------
@@ -93,6 +113,11 @@ struct Session {
         }
     };
     std::unordered_map<SubKey, int64_t, SubKeyHash> subIdByKey;
+
+    // client<->broker TLS/AEAD (Task 7): this session's crypto state.
+    // `crypto.encrypted` is false (default CryptoState) for a plaintext
+    // session — byte-identical to every pre-Task-7 Session.
+    CryptoState crypto;
 };
 
 // ---------------------------------------------------------------------------

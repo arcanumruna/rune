@@ -1,5 +1,6 @@
 add_library(rune_node
     src/NodeConfig.cpp
+    src/PemFile.cpp
     src/BrokerNode.cpp
     src/EmbeddedDriver.cpp
     src/PeerResolverHub.cpp

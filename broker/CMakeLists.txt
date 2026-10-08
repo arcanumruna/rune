@@ -59,6 +59,36 @@ else()
     target_compile_definitions(rune_fr PUBLIC RUNE_FR=0)
 endif()
 
+# ── rune-crypto — client<->broker TLS/AEAD (Task 7) ──────────────────────────
+# Consumed as a SIBLING source lib, exactly like rune-fr/rune-codec above (no
+# conan publish gate yet).  Header-first (TlsSession.h/Aead.h/Cipher.h) + 3
+# small .cpp.
+#
+# ★ BUILD/LINKAGE TRAP (task-7-interfaces.md, Task-5 precedent on the client
+#   side): rune/gateway/SessionTable.h is already part of rune_gateway's
+#   PUBLIC interface (it includes <Aeron.h>) and now also includes
+#   rune/crypto/Aead.h + Cipher.h for Session::CryptoState.  Every downstream
+#   target that compiles a TU including SessionTable.h/ClientGateway.h
+#   therefore needs rune_crypto's include dir transitively — rune_node does
+#   (BrokerNode.h/NodeRuntimeAgent.h/GroupCoordinationService.cpp/
+#   TransactionCoordinationService.cpp all #include ClientGateway.h directly;
+#   so do several libs/node/tests/integration/*.cpp).  rune_crypto + OpenSSL
+#   are therefore linked PUBLIC on rune_gateway below (never PRIVATE — that
+#   was exactly the client's Task-5 fix-round-1 Critical).  rune_node already
+#   links rune_gateway PUBLIC (see its CMakeLists.txt), so the PUBLIC chain
+#   propagates to rune_broker and every test/benchmark executable without any
+#   further change here.
+find_package(OpenSSL REQUIRED)
+set(RUNE_CRYPTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-crypto"
+    CACHE PATH "Path to the rune-crypto sibling repo")
+add_library(rune_crypto STATIC
+    ${RUNE_CRYPTO_ROOT}/src/Caps.cpp
+    ${RUNE_CRYPTO_ROOT}/src/Aead.cpp
+    ${RUNE_CRYPTO_ROOT}/src/TlsSession.cpp)
+target_include_directories(rune_crypto PUBLIC ${RUNE_CRYPTO_ROOT}/include)
+target_link_libraries(rune_crypto PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+target_compile_features(rune_crypto PUBLIC cxx_std_23)
+
 # ── rune_gso — UDP GSO/GRO Aeron transport bindings ──────────────────────────
 # rune-protocol sibling C source (spec 2026-10-03-aeron-udp-gso-gro).  Linux does GSO/GRO; other platforms
 # compile a no-op (create() returns NULL -> stock Aeron).
@@ -86,6 +116,16 @@ add_library(rune_codec STATIC
     ${RUNE_CODEC_ROOT}/src/Generator.cpp)
 target_include_directories(rune_codec PUBLIC ${RUNE_CODEC_ROOT}/include)
 target_compile_features(rune_codec PUBLIC cxx_std_23)
+
+# Task 9 / spec §11: RUNE_TLS — the client<->broker TLS/AEAD enablement gate.
+# OFF (default): NodeConfig.cpp never reads RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE/
+# RUNE_REQUIRE_TLS from the environment (guarded by the RUNE_TLS_ENABLED compile
+# definition below) — tlsCertFile/tlsKeyFile/requireTls stay at their empty/false
+# defaults no matter what an operator sets, so a RUNE_TLS=OFF build is
+# byte-identical plaintext (the crypto core itself, Tasks 5-8/8b, is already
+# always compiled in — this option gates ONLY the config path that could ever
+# arm it). ON: the broker can be deployed with cert/key files + require_tls.
+option(RUNE_TLS "Enable the RUNE_TLS client<->broker TLS/AEAD config path (cert/key file loading, require_tls, SIGHUP reload)" OFF)
 
 option(ENABLE_COVERAGE "Enable coverage instrumentation" OFF)
 if(ENABLE_COVERAGE)
@@ -178,6 +218,9 @@ add_subdirectory(libs/replication)
 add_subdirectory(libs/coordination)
 add_subdirectory(libs/transaction)
 add_subdirectory(libs/node)
+if(RUNE_TLS)
+    target_compile_definitions(rune_node PRIVATE RUNE_TLS_ENABLED)
+endif()
 add_subdirectory(libs/gateway)
 
 # Flight-recorder instrumentation: link rune_fr PUBLIC into every instrumented
@@ -187,6 +230,19 @@ target_link_libraries(rune_consensus   PUBLIC rune_fr)
 target_link_libraries(rune_replication PUBLIC rune_fr)
 target_link_libraries(rune_node        PUBLIC rune_fr rune_codec)
 target_link_libraries(rune_gateway     PUBLIC rune_fr)
+
+# client<->broker TLS/AEAD (Task 8b): the node header Worker.h now reaches
+# <rune/crypto/Aead.h> via RecordsPush.h -> RecordsSeal.h (the Records-push seal
+# step, raw-crypto-params so it stays decoupled from rune_gateway).  Every lib
+# that COMPILES a node-header chain reaching Worker.h therefore needs
+# rune_crypto's include dir.  rune_node owns Worker.h (PUBLIC so rune_broker +
+# rune_gateway dependents inherit it); rune_replication compiles node headers via
+# RUNE_NODE_INCLUDE WITHOUT linking rune_node, so it needs rune_crypto directly.
+# rune_gateway already links rune_crypto PUBLIC (libs/gateway/CMakeLists.txt).
+# Unconditional (not RUNE_TLS-gated): the crypto headers/sources are always
+# compiled; RUNE_TLS only gates the RUNE_TLS_ENABLED runtime env parsing.
+target_link_libraries(rune_node        PUBLIC rune_crypto)
+target_link_libraries(rune_replication PUBLIC rune_crypto)
 
 add_executable(rune_broker src/main.cpp)
 target_link_libraries(rune_broker PRIVATE rune_node rune_storage rune_fr spdlog::spdlog)

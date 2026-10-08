@@ -49,16 +49,18 @@ static void haltHandler(void* ctx, int exitCode) noexcept {
 
 // main-thread state fed by drainControlEvents (owned by main).
 struct ControlState {
-    bool stop     = false;
-    int  exitCode = 0;   // non-zero: halt requested by the broker (fail-stop)
-    int  frDumps  = 0;   // pending SIGUSR1 report requests
+    bool stop      = false;
+    int  exitCode  = 0;   // non-zero: halt requested by the broker (fail-stop)
+    int  frDumps   = 0;   // pending SIGUSR1 report requests
+    int  tlsReload = 0;   // Task 9: pending SIGHUP (RUNE_TLS cert/key renewal) requests
 };
 
 static void drainControlEvents(rune::node::ControlEventRing& events, ControlState& st) {
     events.poll([&st](std::int32_t type, std::int64_t a, std::int64_t) {
         switch (type) {
-            case rune::node::kStopEvent:   st.stop = true; break;
-            case rune::node::kFrDumpEvent: ++st.frDumps; break;
+            case rune::node::kStopEvent:      st.stop = true; break;
+            case rune::node::kFrDumpEvent:    ++st.frDumps; break;
+            case rune::node::kTlsReloadEvent: ++st.tlsReload; break;
             case rune::node::kHaltEvent:
                 if (st.exitCode == 0) st.exitCode = static_cast<int>(a);
                 st.stop = true;
@@ -217,6 +219,16 @@ int main() {
         if (ctl.frDumps > 0) {
             ctl.frDumps = 0;
             frReport("run" + std::to_string(frDumpSeq++));
+        }
+        // Task 9 (RUNE_TLS SIGHUP reload): forward to BrokerNode, which only
+        // offers a trigger onto a ring the gateway's OWN duty-cycle thread
+        // polls and acts on (shared-nothing — main() never touches gateway
+        // state). A momentarily-full ring just waits for the next SIGHUP.
+        if (ctl.tlsReload > 0) {
+            ctl.tlsReload = 0;
+            if (!node.requestTlsCertReload()) {
+                spdlog::warn("rune-broker: TLS reload trigger ring full — will retry on the next SIGHUP");
+            }
         }
         // Publish the machine-readable leadership signal (Aeron node-role +
         // leadership-term counters).  The dr-e2e harness reads these via

@@ -7,3 +7,7 @@ requirements:
   - "spdlog/1.14.0"
   - "gtest/1.16.0"
   - "benchmark/1.8.2"
+  # client<->broker TLS/AEAD (Task 7): rune-crypto is consumed as a sibling
+  # source lib (see RUNE_CRYPTO_ROOT in CMakeLists.txt, mirroring rune-fr/
+  # rune-codec) — its own OpenSSL dependency still needs a conan requires here.
+  - "openssl/3.3.2"

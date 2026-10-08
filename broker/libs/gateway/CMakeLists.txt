@@ -23,6 +23,13 @@ target_include_directories(rune_gateway PUBLIC
 # compiles correctly and consumers of rune_gateway also get rune_replication headers.
 target_link_libraries(rune_gateway PUBLIC rune_storage rune_replication rune_transaction rune_metadata rune_consensus rune_aeron_util)
 target_include_directories(rune_gateway PUBLIC ${RUNE_NODE_INCLUDE})
+# client<->broker TLS/AEAD (Task 7): SessionTable.h (public header) now holds a
+# Session::CryptoState built from rune_crypto's AeadCipher; PUBLIC so every
+# consumer of this header (rune_node, its tests/integration/*, and everything
+# PUBLIC-linking rune_node transitively) gets rune_crypto's include dir too —
+# see the ★ BUILD/LINKAGE TRAP comment on rune_crypto's add_library() in the
+# top-level CMakeLists.txt.
+target_link_libraries(rune_gateway PUBLIC rune_crypto)
 # rune_codec PUBLIC: Worker.h (included transitively via WorkerPool.h) now
 # includes rune/codec/Validator.h for the Task 7 per-worker schema validation
 # hook.  Consumers that include Worker.h via RUNE_NODE_INCLUDE need rune_codec headers.
@@ -50,6 +57,83 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_gateway_session_tests)
+
+    # -------------------------------------------------------------------------
+    # client<->broker TLS/AEAD (Task 7 handshake + Task 8 data-plane AEAD):
+    # gateway server-role crypto — Aeron-free (no ClientGateway/SessionTable
+    # involved; see the file's own header comment for why). Links rune_crypto
+    # + GTest ONLY (not rune_gateway, which would drag in <Aeron.h>). Task 8
+    # added direct #includes of rune/gateway/{CryptoState,CryptoFrame}.h (both
+    # aeron-free — CryptoState was extracted out of SessionTable.h specifically
+    # so this target could use the REAL type) and rune/protocol/client/
+    # {CryptoEnvelope,MessageHeader}.h, so this target needs this lib's own
+    # include/ dir and the protocol include dir too (rune_gateway itself gets
+    # both PUBLIC above; this target deliberately skips linking rune_gateway).
+    # Task 8b additionally #includes rune/node/RecordsSeal.h (the Records-push
+    # seal step — aeron-free by construction, unlike RecordsPush.h itself, see
+    # that header's own comment), so this target also needs libs/node's
+    # include/ dir; it still deliberately skips linking rune_node (which would
+    # drag in <Aeron.h> via RecordsPush.h's #include <ExclusivePublication.h>).
+    # -------------------------------------------------------------------------
+    add_executable(rune_gateway_crypto_tests
+        tests/GatewayCryptoTest.cpp)
+    target_include_directories(rune_gateway_crypto_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../node/include
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_gateway_crypto_tests PRIVATE
+        rune_crypto
+        GTest::gtest_main)
+    target_compile_definitions(rune_gateway_crypto_tests PRIVATE
+        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
+    gtest_discover_tests(rune_gateway_crypto_tests)
+
+    # -------------------------------------------------------------------------
+    # Task 15: SECURITY REGRESSION SUITE (named `*Regression*` so it is
+    # selected as the run-first priority gate per CLAUDE.md rule 6/7).
+    # Consolidates the tamper/AAD/replay/cross-session/per-sender/downgrade/
+    # handshake security properties proven piecemeal across
+    # rune_gateway_crypto_tests + rune_gateway_require_tls_tests, plus the
+    # gaps GatewayCryptoRegressionTest.cpp's own file header documents.
+    # Same aeron-free build shape as rune_gateway_crypto_tests above (links
+    # rune_crypto + GTest only; needs this lib's + libs/node's include/ dirs
+    # + the protocol include dir, but deliberately skips linking
+    # rune_gateway/rune_node to stay off <Aeron.h>).
+    # -------------------------------------------------------------------------
+    add_executable(rune_gateway_crypto_regression_tests
+        tests/GatewayCryptoRegressionTest.cpp)
+    target_include_directories(rune_gateway_crypto_regression_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../node/include
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_gateway_crypto_regression_tests PRIVATE
+        rune_crypto
+        GTest::gtest_main)
+    target_compile_definitions(rune_gateway_crypto_regression_tests PRIVATE
+        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
+    gtest_discover_tests(rune_gateway_crypto_regression_tests)
+
+    # -------------------------------------------------------------------------
+    # Task 9: require_tls / shard-mode downgrade-safety decision logic
+    # (ConnectDowngradePolicy.h) + cert/key FILE PATH -> PEM TEXT loading
+    # (rune/node/PemFile.{h,cpp}). Aeron-free for the same reason as
+    # rune_gateway_crypto_tests above: compiles PemFile.cpp directly (NOT
+    # rune_node, which would drag in Worker.h -> RecordsPush.h -> Aeron) +
+    # rune_crypto + GTest only.
+    # -------------------------------------------------------------------------
+    add_executable(rune_gateway_require_tls_tests
+        tests/RequireTlsDowngradeTest.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../node/src/PemFile.cpp)
+    target_include_directories(rune_gateway_require_tls_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../node/include
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_gateway_require_tls_tests PRIVATE
+        rune_crypto
+        GTest::gtest_main)
+    target_compile_definitions(rune_gateway_require_tls_tests PRIVATE
+        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
+    gtest_discover_tests(rune_gateway_require_tls_tests)
 
     # -------------------------------------------------------------------------
     # TopicRegistry unit tests (GB-1) — no Aeron, real filesystem + rune_storage.

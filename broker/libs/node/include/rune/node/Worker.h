@@ -86,6 +86,10 @@
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/WorkerEgress.h>
 #include <rune/node/RecordsPush.h>
+#include <rune/node/SessionAnnounceKeyTail.h>
+#include <rune/node/RecordsOpen.h>
+#include <rune/crypto/Aead.h>
+#include <rune/crypto/Cipher.h>
 #include <rune/replication/ReplicationFrameLimits.h>   // F18 frame limits (maxAcceptableBatchBytes)
 #include <rune/node/WorkerReplicationTransport.h>
 #include <rune/node/IoBackend.h>
@@ -793,6 +797,54 @@ public:
         RcState* rc = nullptr;
     };
 
+    // -----------------------------------------------------------------------
+    // Task 19 (per-worker egress crypto addendum, 2026-10-08): this worker's
+    // OWN Records-egress crypto state for one encrypted session (Rule 3 — a
+    // dedicated state holding exactly what sealing ITS OWN Records pushes for
+    // that session needs). Built ONCE, off the hot path, when a SessionAnnounce
+    // for the session arrives (executeSessionAnnounceWire_); reused by every
+    // subscription of that session on this worker — `sendSeq` is a single
+    // per-(worker,session) counter, NEVER per-subscription (two subscriptions
+    // of the same session sealing under independently-incrementing sendSeqs
+    // would reuse nonces under the same key — exactly the bug class this
+    // feature exists to prevent).
+    //
+    // An entry exists here IFF the session is encrypted (sessionEncrypted was
+    // true on its SessionAnnounce) — a plaintext session never gets one, so
+    // pushOwnedSubscriptions_'s lookup is a no-op (empty vector) for an
+    // all-plaintext deployment: zero impact on plaintext sessions.
+    //
+    // `send` may be nullopt even though an entry exists: this worker's
+    // specific key failed to derive (SessionAnnouncer::announce's fail-closed
+    // path) or hasn't arrived yet — sendRecordsFrame's RecordsSealCtx
+    // contract (a present ctx with a null `send`) then fails closed
+    // (sealRecordsFrame returns 0, nothing is ever transmitted), never a
+    // plaintext fallback.
+    // Task 22 (shard worker decrypts produce / per-worker ingress,
+    // 2026-10-08): `recv`/`recvSeq`/`recvWindow` are this worker's OWN c2b
+    // ingress open context + anti-replay window for the session — built
+    // alongside `send` above (same struct, same install site:
+    // executeSessionAnnounceWire_), but a SEPARATE cipher/counter/window:
+    // ingress (client->worker) and egress (worker->client) are independent
+    // AEAD directions under independent keys, and this worker's own c2b
+    // window is independent of the gateway's (and every other worker's) —
+    // see RecordsOpen.h's doc comment for why that is safe (the client's
+    // single monotonic c2b sendSeq is never split between receivers; each
+    // receiver just sees its own subset with forward gaps, never a nonce
+    // hazard). `recv` may be nullopt even though an entry exists (no key
+    // yet, or the gateway never shipped one) — RecordsOpenCtx's own
+    // null-`recv` contract then fails closed (openProduceFrame returns 0,
+    // the frame is dropped), never a plaintext fallback.
+    struct WorkerSessionCrypto {
+        int64_t                                  sessionId = 0;
+        std::optional<rune::crypto::AeadCipher>  send;      ///< this worker's own per-sender b2c cipher (egress)
+        uint64_t                                 sendSeq   = 0;   ///< this worker's OWN counter (independent of the gateway's / other workers')
+        uint8_t                                  cipher    = 0;   ///< rune::crypto::Cipher value (shared by both directions)
+        std::optional<rune::crypto::AeadCipher>  recv;      ///< this session's c2b ingress cipher (shared across every worker; one sender)
+        uint64_t                                 recvSeq    = 0;  ///< this worker's OWN replay-window high-water seq (ingress)
+        uint64_t                                 recvWindow = 0;  ///< this worker's OWN replay-window bitmap (ingress)
+    };
+
     /// Test-only: the worker-local subscription table (worker-thread state).
     [[nodiscard]] const std::vector<WorkerSubscription>& subscriptionsForTest() const noexcept {
         return subs_;
@@ -959,10 +1011,34 @@ public:
             tailLen  = op.schemaUpdateBlob.size();
             break;
         case WorkerOp::Type::SessionAnnounce:
-            // Task 13: the client session's egress channel (view, copied once).
             tailKind = sbe::TailKind::Value::EGRESS_CHANNEL;
-            tailSrc  = reinterpret_cast<const uint8_t*>(op.egressChannel.data());
-            tailLen  = op.egressChannel.size();
+            if (op.sessionEncrypted) [[unlikely]] {
+                // Task 19: cold, once per (session, worker) — stamp the
+                // [cipher|prefix|key] crypto header ahead of the channel
+                // bytes into this worker's own reused scratch (zero heap
+                // allocation). PLAINTEXT SessionAnnounce (the common case,
+                // op.sessionEncrypted == false by default) takes the
+                // untouched branch below — byte-identical to pre-Task-19.
+                const std::size_t n = encodeSessionAnnounceCryptoTail(
+                    sessionAnnounceTailScratch_.data(), sessionAnnounceTailScratch_.size(),
+                    op.senderCipher, op.senderKeyPrefix, op.senderKey,
+                    op.c2bKeyPrefix, op.c2bKey,
+                    op.egressChannel.data(), op.egressChannel.size());
+                if (n == 0) [[unlikely]] {
+                    // Unreachable by construction (the egress channel is
+                    // already bounded to SessionAckSink::kMaxChannelBytes at
+                    // Connect time) — halt rather than enqueue a truncated
+                    // crypto tail a worker could misparse.
+                    haltInvariant_("SessionAnnounce crypto tail too large for scratch",
+                                    "Task 19: egress channel exceeded kMaxChannelBytes", 0);
+                }
+                tailSrc = sessionAnnounceTailScratch_.data();
+                tailLen = n;
+            } else {
+                // Task 13: the client session's egress channel (view, copied once).
+                tailSrc = reinterpret_cast<const uint8_t*>(op.egressChannel.data());
+                tailLen = op.egressChannel.size();
+            }
             break;
         default:
             break;  // NONE tail
@@ -992,6 +1068,26 @@ public:
             ring.tryClaim(sbe::WorkerOp::sbeTemplateId(), n);
         if (idx < 0) return EnqueueResult::Full;  // ring full — back-pressure
 
+        // Task 19: SessionAnnounce reuses the `isolation` wire byte for
+        // sessionEncrypted and the `durabilityTier` wire byte for
+        // senderKeyValid (see WorkerOp::sessionEncrypted's doc comment) —
+        // every OTHER op type keeps its own field's value unchanged. A
+        // plaintext SessionAnnounce (op.sessionEncrypted/senderKeyValid both
+        // default false) writes 0/0 here, exactly what op.isolation/
+        // op.durabilityTier already default to — byte-identical to every
+        // pre-Task-19 SessionAnnounce.
+        //
+        // Task 22: SessionAnnounce additionally reuses the `isGroup` wire
+        // byte for c2bKeyValid (isGroup is otherwise Subscribe-only — unused
+        // for SessionAnnounce, same "reuse what's already on the wire"
+        // discipline). Every OTHER op type keeps op.isGroup unchanged.
+        const std::uint8_t wireIsolation = (op.type == WorkerOp::Type::SessionAnnounce)
+            ? (op.sessionEncrypted ? 1u : 0u) : op.isolation;
+        const std::uint8_t wireDurabilityTier = (op.type == WorkerOp::Type::SessionAnnounce)
+            ? (op.senderKeyValid ? 1u : 0u) : op.durabilityTier;
+        const bool wireIsGroup = (op.type == WorkerOp::Type::SessionAnnounce)
+            ? op.c2bKeyValid : op.isGroup;
+
         sbe::WorkerOp enc;
         enc.wrapAndApplyHeader(reinterpret_cast<char*>(ring.base() + idx), 0, n);
         enc.opType(static_cast<sbe::OpType::Value>(static_cast<std::uint8_t>(op.type)))
@@ -1010,13 +1106,13 @@ public:
            .batchAttrs(op.batchAttrs)
            .deferAck(static_cast<std::uint8_t>((op.deferAck ? kOpFlagDeferAck : 0u) |
                                                (op.crcValidated ? kOpFlagCrcValidated : 0u)))
-           .durabilityTier(op.durabilityTier)
+           .durabilityTier(wireDurabilityTier)
            .enqueuedAtNs(op.enqueuedAtNs)
            .subscriptionId(op.subscriptionId)
            .nextOffset(op.nextOffset)
            .hwBound(op.hwBound)
-           .isolation(op.isolation)
-           .isGroup(op.isGroup ? 1 : 0)
+           .isolation(wireIsolation)
+           .isGroup(wireIsGroup ? 1 : 0)
            .groupCarrierReceived(op.groupCarrierReceived ? 1 : 0)
            .roleEpoch(static_cast<std::int64_t>(op.roleEpoch))
            .roleLeaderId(static_cast<std::int32_t>(op.roleLeaderId))
@@ -1559,7 +1655,26 @@ private:
         // observed (consumer first: consumer <= producer) — I1 hold rule.
         if (ackSink_) {
             const int64_t consumed = sessionRing_.consumerPosition();
-            work += ackSink_->flush(sessionRing_.producerPosition(), consumed);
+            // Task 23 (★★ shared sendSeq — CRITICAL nonce safety): the sink
+            // owns no crypto table of its own (shared-nothing); this lookup
+            // hands it THIS worker's per-session WorkerSessionCrypto entry —
+            // the EXACT SAME entry (and therefore the exact same `sendSeq`
+            // counter and `send` cipher) pushOwnedSubscriptions_ uses to seal
+            // Records for this session. Acks and Records therefore draw from
+            // ONE monotonic seq under ONE key — never a separate ack counter
+            // (that would reuse nonces, catastrophic for AES-GCM). nullptr
+            // (no entry: plaintext session) takes the exact pre-Task-23
+            // in-place-encode claim, unchanged.
+            work += ackSink_->flush(sessionRing_.producerPosition(), consumed,
+                [this](int64_t sid) -> const RecordsSealCtx* {
+                    WorkerSessionCrypto* cr = findSessionCrypto_(sid);
+                    if (!cr) return nullptr;
+                    ackSealCtx_.send     = cr->send.has_value() ? &*cr->send : nullptr;
+                    ackSealCtx_.sendSeq  = &cr->sendSeq;
+                    ackSealCtx_.cipher   = cr->cipher;
+                    ackSealCtx_.senderId = static_cast<uint8_t>(workerId_ + 1);
+                    return &ackSealCtx_;
+                });
             work += reportSessionSignals_();
         }
         if (work == 0) work += prepareIdle_();   // A9: only a pass that may park pays for it
@@ -2235,6 +2350,7 @@ private:
         case WorkerOp::Type::SessionClose:
             ++sessionClosesSeen_;
             if (ackSink_) ackSink_->close(op.sessionId());
+            eraseSessionCrypto_(op.sessionId());   // Task 19: no-op if the session was never encrypted
             break;
         }
     }
@@ -2252,15 +2368,87 @@ private:
         lastAnnouncedClientVersion_ = version;
         const std::uint32_t len = op.tailLength();
         const char* p           = op.tail();
+
+        // Task 19: see WorkerOp::sessionEncrypted's doc comment for the wire
+        // reuse (isolation/durabilityTier bytes + the tail's crypto prefix).
+        const bool sessionEncrypted = op.isolation() != 0;
+        std::string_view channel(p, len);
+        if (sessionEncrypted) [[unlikely]] {
+            const bool senderKeyValid = op.durabilityTier() != 0;
+            // Task 22: c2bKeyValid rides the `isGroup` wire byte for
+            // SessionAnnounce (see enqueueOp's wireIsGroup comment).
+            const bool c2bKeyValid    = op.isGroup() != 0;
+            const auto decoded = rune::node::decodeSessionAnnounceCryptoTail(p, len);
+            WorkerSessionCrypto* cr = findSessionCrypto_(sid);
+            if (!cr) { sessionCrypto_.push_back(WorkerSessionCrypto{}); cr = &sessionCrypto_.back(); }
+            cr->sessionId  = sid;
+            cr->sendSeq    = 0;    // fresh counter for THIS session on THIS worker (egress)
+            cr->send.reset();      // fail closed by default: no cipher until proven valid below
+            cr->recvSeq    = 0;    // fresh replay window for THIS session on THIS worker (ingress)
+            cr->recvWindow = 0;
+            cr->recv.reset();      // fail closed by default: no cipher until proven valid below
+            if (!decoded) [[unlikely]] {
+                // Fail closed: a truncated/garbage tail must never be treated
+                // as "this session is fine, push plaintext" — the entry stays
+                // present (sessionEncrypted known) with no cipher installed,
+                // so the push path parks/drops (RecordsSealCtx's own
+                // null-`send` contract) rather than leaking.
+                //
+                // Review fix (Minor, robustness): `channel` was initialized
+                // above to the RAW tail (p, len) — which here still includes
+                // the would-be 37-byte crypto header, since decoding it
+                // failed. Reset it to empty rather than handing
+                // ackSink_->announce() that garbage as if it were a channel
+                // string. Unreachable by construction (the gateway never
+                // sends a truncated tail), but a malformed tail must fail
+                // clean, not mis-announce.
+                channel = std::string_view{};
+                spdlog::critical("Worker {}: session {} SessionAnnounce crypto tail too short "
+                                  "({} B) — Records egress for this session will be parked "
+                                  "(fail-closed)", workerId_, sid, len);
+            } else {
+                channel = decoded->channel;
+                cr->cipher = decoded->cipher;
+                if (senderKeyValid) {
+                    // This worker's OWN per-sender key + its OWN sendSeq
+                    // (independent of the gateway's and every other
+                    // worker's — see RecordsSealCtx::senderId's doc comment).
+                    rune::crypto::AeadKey key{};
+                    std::memcpy(key.bytes, decoded->b2cKey, sizeof(key.bytes));
+                    cr->send.emplace(static_cast<rune::crypto::Cipher>(decoded->cipher),
+                                      key, decoded->b2cPrefix);
+                }
+                // else: the gateway's own deriveSenderKey() failed for this
+                // worker (SessionAnnouncer's fail-closed path) — leave
+                // cr->send empty; the push path parks, never plaintext.
+
+                // Task 22: the session's c2b ingress key — the SAME bytes on
+                // every worker (no per-worker derivation; see
+                // SessionAnnounceKeyTail.h's doc comment). `c2bKeyValid`
+                // mirrors `senderKeyValid`'s fail-closed contract.
+                if (c2bKeyValid) {
+                    rune::crypto::AeadKey ingressKey{};
+                    std::memcpy(ingressKey.bytes, decoded->c2bKey, sizeof(ingressKey.bytes));
+                    cr->recv.emplace(static_cast<rune::crypto::Cipher>(decoded->cipher),
+                                      ingressKey, decoded->c2bPrefix);
+                }
+                // else: the first (parked) wave, or the gateway never shipped
+                // a valid c2b key — leave cr->recv empty; the produce-ingress
+                // decrypt path parks/drops, never plaintext.
+            }
+        } else {
+            eraseSessionCrypto_(sid);   // re-announced as plaintext (should not happen, but never stale)
+        }
+
         if (!ackSink_) return;
         // Fix round 1 (I2): unreachable by construction — the runtime counts
         // every session a worker table can hold (accepted + announced-pending +
         // closes not yet queued everywhere) against kMaxSessions − 1, and
         // refuses longer channels at Connect.  A refusal would leave an
         // accepted session that is never acked: halt, never a silent drop.
-        if (!ackSink_->announce(sid, std::string_view(p, len), stream, version)) [[unlikely]] {
+        if (!ackSink_->announce(sid, channel, stream, version)) [[unlikely]] {
             spdlog::critical("Worker {}: session {} announcement refused (sessions {}, channel {} B, max {})",
-                             workerId_, sid, ackSink_->sessionCount(), len, SessionAckSink::kMaxChannelBytes);
+                             workerId_, sid, ackSink_->sessionCount(), channel.size(), SessionAckSink::kMaxChannelBytes);
             haltInvariant_("session announcement refused", "Task 13 I2: runtime session cap violated", 0);
         }
     }
@@ -2468,11 +2656,38 @@ private:
     // as back-pressured Records) otherwise.  Returns 1 if sent.  Cold path.
     // correlationId 0 + a message naming subscription/topic/partition/offset
     // (encodePushTooLargeError — the F15 S3 m-f convention).
-    int sendPushTooLarge_(WorkerSubscription& s, aeron::ExclusivePublication* pub) {
+    //
+    // Task 23 (mandatory egress audit — 3rd worker->client path found): this
+    // frame goes straight to the client on `pub` (the same per-consumer /
+    // shared-MDC egress Records uses), via sendEncodedToPub_ — NOT through
+    // sendTo/sendRecordsFrame, so it was NEVER sealed even after Task 19
+    // sealed Records. Mirrors the gateway's own analogous path exactly:
+    // ClientGateway::trySendOwedPushError_ already seals (its sendTo() is
+    // the single chokepoint every gateway->client send funnels through —
+    // see sendTo's doc comment), but the worker has no such chokepoint, so
+    // it must seal here explicitly. `seal` non-null ⇒ encrypted session:
+    // seal BEFORE sending (same ordering as sendRecordsFrame/the ack path —
+    // never claim/offer on an unsealed buffer), using the SAME per-session
+    // cr->send/sendSeq/senderId `pushOwnedSubscriptions_` built for Records
+    // (one shared monotonic seq across every worker->client frame type under
+    // this session's one b2c key). Fail-closed: seal==0 (no key yet / AEAD
+    // error) ⇒ return 0 — s.pushState stays ErrorOwed, retried next pass,
+    // exactly like back-pressure; NEVER a plaintext send on an encrypted
+    // session.
+    int sendPushTooLarge_(WorkerSubscription& s, aeron::ExclusivePublication* pub,
+                          const RecordsSealCtx* seal = nullptr) {
         static_assert(kPushTooLargeErrorMaxBytes <= kEgressScratchSize);
         const std::size_t n = encodePushTooLargeError(
             egressScratch_.data(), s.sessionId, s.subscriptionId, s.topicId, s.partition,
             s.nextOffset, s.failedFrameLen, pub->maxMessageLength());
+        if (seal) [[unlikely]] {
+            const std::size_t sn = sealRecordsFrame(*seal, egressScratch_.data(), n,
+                                                    pushTooLargeSealScratch_.data(), pushTooLargeSealScratch_.size());
+            if (sn == 0) [[unlikely]] return 0;   // fail-closed — never transmit, retried next pass
+            if (sendEncodedToPub_(pub, pushTooLargeSealScratch_.data(), sn) <= 0) return 0;
+            s.pushState = WorkerSubscription::PushState::Failed;
+            return 1;
+        }
         if (sendEncodedToPub_(pub, egressScratch_.data(), n) <= 0) return 0;
         s.pushState = WorkerSubscription::PushState::Failed;
         return 1;
@@ -2501,9 +2716,40 @@ private:
             if (!egressPub && workerEgress_) egressPub = workerEgress_->pub();
             if (!egressPub) continue;  // nowhere to send yet
 
+            // Task 19 (per-worker egress crypto addendum): looked up ONCE per
+            // subscription-drain call (not per batch) — `cr` is shared across
+            // every batch pushed for `s` in this pass, so they all seal under
+            // the SAME AeadCipher + the SAME monotonic sendSeq (never a
+            // per-batch-reset counter: that would reuse nonces under this
+            // worker's key). nullptr == plaintext session (the common case;
+            // sessionCrypto_ is empty for an all-plaintext deployment) — takes
+            // the exact pre-Task-19 zero-copy path below, untouched.
+            // Task 23 audit fix: moved ABOVE the pushState/ErrorOwed check
+            // (was below it) so sendPushTooLarge_'s retry call site (just
+            // below) ALSO gets `sealPtr` — this frame is worker->client
+            // egress too (the audit's 3rd path; see sendPushTooLarge_'s own
+            // comment) and MUST seal under the exact same cr/sendSeq as
+            // Records for this session.
+            WorkerSessionCrypto* cr = findSessionCrypto_(s.sessionId);
+            RecordsSealCtx seal;
+            const RecordsSealCtx* sealPtr = nullptr;
+            if (cr) [[unlikely]] {
+                // Fail closed (RecordsSealCtx/sealRecordsFrame's own
+                // contract): cr->send may be nullopt (this worker's key
+                // failed to derive, or hasn't arrived yet) — seal.send stays
+                // null, sealRecordsFrame returns 0, sendRecordsFrame/
+                // sendPushTooLarge_ never transmit. NEVER a plaintext
+                // fallback once `cr` exists.
+                seal.send     = cr->send.has_value() ? &*cr->send : nullptr;
+                seal.sendSeq  = &cr->sendSeq;
+                seal.cipher   = cr->cipher;
+                seal.senderId = static_cast<uint8_t>(workerId_ + 1);   // unique per worker; gateway == 0
+                sealPtr = &seal;
+            }
+
             if (s.pushState != WorkerSubscription::PushState::Live) [[unlikely]] {
                 if (s.pushState == WorkerSubscription::PushState::ErrorOwed)
-                    work += sendPushTooLarge_(s, egressPub);
+                    work += sendPushTooLarge_(s, egressPub, sealPtr);
                 continue;   // parked AT the undeliverable batch
             }
 
@@ -2609,8 +2855,13 @@ private:
                 // (tryClaim fast path / vectored [fixed | batch] offer — zero
                 // copy of the batch).  Above it: fail this subscription
                 // explicitly and park AT the batch — never skip forward.
+                // Task 19: `sealPtr` is null for a plaintext session (the
+                // exact pre-Task-19 call, unchanged); non-null seals via this
+                // worker's own per-sender key/sendSeq (or fails closed —
+                // Retry, never a plaintext frame — if the key never arrived).
                 const RecordsSendResult sent =
-                    sendRecordsFrame(*egressPub, rec, egressScratch_.data(), egressScratch_.size());
+                    sendRecordsFrame(*egressPub, rec, egressScratch_.data(), egressScratch_.size(),
+                                      sealPtr, sealPtr ? &recordsSealScratch_ : nullptr);
                 if (sent.kind == RecordsSendKind::TooLarge) [[unlikely]] {
                     spdlog::error("Worker {}: push sub={} (topicId={} partition={}) failed at "
                                   "offset={}: Records frame {} B exceeds the egress "
@@ -2620,7 +2871,7 @@ private:
                                   rec.encodedSize(), egressPub->maxMessageLength());
                     s.pushState      = WorkerSubscription::PushState::ErrorOwed;
                     s.failedFrameLen = rec.encodedSize();
-                    work += sendPushTooLarge_(s, egressPub);
+                    work += sendPushTooLarge_(s, egressPub, sealPtr);
                     break;
                 }
                 const int64_t r = sent.position;
@@ -4027,6 +4278,69 @@ private:
     std::vector<WorkerSubscription> subs_;
     uint64_t egressReleases_ = 0;   ///< release ops executed (record-egress retire-on-ack)
 
+    // Task 19: this worker's per-session Records-egress crypto state — see
+    // WorkerSessionCrypto's doc comment. Entries exist ONLY for encrypted
+    // sessions (never for plaintext ones): empty for an all-plaintext
+    // deployment. Linear scan (bounded by this worker's own concurrently
+    // encrypted sessions, not the whole shard) — same style already used for
+    // subs_; a hash-by-sessionId is a known follow-up if that count ever
+    // gets large enough to matter.
+    std::vector<WorkerSessionCrypto> sessionCrypto_;
+    [[nodiscard]] WorkerSessionCrypto* findSessionCrypto_(int64_t sid) noexcept {
+        for (auto& e : sessionCrypto_) if (e.sessionId == sid) return &e;
+        return nullptr;
+    }
+    void eraseSessionCrypto_(int64_t sid) noexcept {
+        for (std::size_t i = 0; i < sessionCrypto_.size(); ++i) {
+            if (sessionCrypto_[i].sessionId == sid) {
+                sessionCrypto_[i] = std::move(sessionCrypto_.back());
+                sessionCrypto_.pop_back();
+                return;
+            }
+        }
+    }
+    /// Test-only: whether this worker holds (any) crypto state for a session.
+    [[nodiscard]] bool sessionCryptoInstalledForTest(int64_t sid) const noexcept {
+        for (const auto& e : sessionCrypto_) if (e.sessionId == sid) return e.send.has_value();
+        return false;
+    }
+    [[nodiscard]] std::size_t sessionCryptoCountForTest() const noexcept { return sessionCrypto_.size(); }
+
+    // Task 19: this worker's OWN RecordsSealScratch for its Records-egress
+    // seal path (shared-nothing: never shared across threads — mirrors
+    // ClientGateway::recordsSealScratch_). Grow-once, reused every push.
+    RecordsSealScratch recordsSealScratch_;
+
+    // Task 23: scratch RecordsSealCtx handed to SessionAckSink::flush's
+    // crypto-lookup callback (built fresh per lookup call, consumed
+    // synchronously inside that same flush() call — never held across
+    // passes). Deliberately a SEPARATE instance from pushOwnedSubscriptions_'s
+    // local `seal` (Records): the two run at different points of one doWork()
+    // pass on the same thread, never concurrently, but keeping them distinct
+    // avoids any accidental aliasing between the Records egress call site and
+    // the ack-flush call site. Both still point at the SAME WorkerSessionCrypto
+    // entry's `send`/`sendSeq`/`cipher` for a given session — the shared
+    // counter lives in sessionCrypto_, not here.
+    RecordsSealCtx ackSealCtx_;
+
+    // Task 22 (shard worker decrypts produce / per-worker ingress): this
+    // worker's OWN scratch for openProduceFrame()'s decrypted output
+    // (RecordsOpen.h). Grow-once (capacity persists; resize() only ever
+    // grows), reused every encrypted produce frame — never a per-frame heap
+    // allocation on the hot path. The decrypted frame is always
+    // kCryptoOverhead (28) bytes SHORTER than the wire frame it came from,
+    // so sizing it to the wire frame's own length is always enough.
+    std::vector<uint8_t> workerIngressOpenScratch_;
+
+    // Task 19: cold scratch for assembling an encrypted SessionAnnounce's
+    // combined [cipher|prefix|key|channel] tail (see SessionAnnounceKeyTail.h).
+    // Sized for the fixed crypto header + the largest egress channel the
+    // runtime will ever announce (SessionAckSink::kMaxChannelBytes). A
+    // worker-owned member (not a per-call stack buffer) so enqueueOp's hot
+    // Produce/PushRead/etc. callers never pay for it on their stack frame.
+    std::array<uint8_t, kSessionAnnounceCryptoHeaderBytes + SessionAckSink::kMaxChannelBytes>
+        sessionAnnounceTailScratch_{};
+
     // read-rework T3/T4 (I3): per-worker encode scratch for the in-worker push
     // loop.  Holds one encoded single-fragment Records frame (tryClaim fast
     // path), or just the 52-byte fixed part of a larger frame whose batch bytes
@@ -4039,6 +4353,13 @@ private:
     // Max bytes fetched per subscription per cycle via readView (matches gateway).
     static constexpr int32_t     kPushMaxChunkBytes = static_cast<int32_t>(512 * 1024);
     std::vector<uint8_t> egressScratch_;
+    // Task 23 (egress audit, 3rd path): sendPushTooLarge_'s ENCRYPTED-session
+    // seal output. kPushTooLargeErrorMaxBytes is a compile-time bound (the
+    // ErrorResponse message is a fixed-format snprintf, never user data), so
+    // — like the ack path's scratch — a fixed array is strictly simpler than
+    // a grow-once vector and still zero-allocation (Rule 4).
+    std::array<uint8_t, kPushTooLargeErrorMaxBytes + rune::protocol::client::kCryptoOverhead>
+        pushTooLargeSealScratch_{};
 public:
     /// F5 (hot-path B): the consumer-push byte budget of ONE worker pass, shared
     /// by gateway PushRead answers and in-worker egress pushes: every pushed
@@ -5703,12 +6024,57 @@ private:
         RUNE_FR_SPAN_PRODUCE(rune_fr::Site::WorkerIngressRecv, 0);
         namespace pc = rune::protocol::client;
 
-        // Decode the produce frame.
-        auto msgOpt = pc::Produce::decode(data, len);
+        // Task 22 (shard worker decrypts produce / per-worker ingress,
+        // 2026-10-08): peek the CLEAR sessionId (the MessageHeader is always
+        // plaintext — it forms part of the AEAD AAD) and look up this
+        // session's c2b ingress ctx BEFORE touching the rest of the frame.
+        // An entry here exists IFF the session is encrypted (see
+        // executeSessionAnnounceWire_ / eraseSessionCrypto_: a plaintext
+        // session never gets one, and SessionClose/re-announce-as-plaintext
+        // erase it) — so a hit means "decrypt or drop", NEVER "maybe
+        // plaintext". sessionCrypto_ is empty for an all-plaintext
+        // deployment, so this is a cheap no-op scan for the common case:
+        // the decode path below is byte-identical to pre-Task-22 when no
+        // entry is found.
+        const uint8_t* decData = data;
+        std::size_t    decLen  = len;
+        if (!sessionCrypto_.empty() && len >= kProduceSessionIdEnd) [[unlikely]] {
+            WorkerSessionCrypto* cr = findSessionCrypto_(produceSessionIdOf_(data));
+            if (cr) [[unlikely]] {
+                RecordsOpenCtx openCtx;
+                openCtx.recv       = cr->recv.has_value() ? &*cr->recv : nullptr;
+                openCtx.recvSeq    = &cr->recvSeq;
+                openCtx.recvWindow = &cr->recvWindow;
+                // The reconstructed plaintext frame is always kCryptoOverhead
+                // bytes SHORTER than the wire frame — sizing to `len` is
+                // always enough. Grow-once (capacity persists across calls).
+                if (workerIngressOpenScratch_.size() < len) workerIngressOpenScratch_.resize(len);
+                const std::size_t n = openProduceFrame(openCtx, data, len,
+                                                        workerIngressOpenScratch_.data(),
+                                                        workerIngressOpenScratch_.size());
+                if (n == 0) [[unlikely]] {
+                    // Fail-closed: no key yet / tamper / replay / too-old —
+                    // NEVER decode the ciphertext as plaintext. Same drop
+                    // contract as an undecodable plaintext frame below.
+                    if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
+                    spdlog::warn("Worker {}: WorkerIngress: produce decrypt failed (session={}, "
+                                 "len={}); dropping (fail-closed)",
+                                 workerId_, produceSessionIdOf_(data), len);
+                    return 0;
+                }
+                decData = workerIngressOpenScratch_.data();
+                decLen  = n;
+            }
+        }
+
+        // Decode the produce frame (plaintext path: decData/decLen ==
+        // data/len, byte-identical to pre-Task-22; encrypted path: the
+        // reconstructed [24B header][plaintext body] from above).
+        auto msgOpt = pc::Produce::decode(decData, decLen);
         if (!msgOpt) {
             if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
             spdlog::warn("Worker {}: WorkerIngress: failed to decode Produce frame "
-                         "len={}; dropping", workerId_, len);
+                         "len={}; dropping", workerId_, decLen);
             return 0;
         }
         const pc::Produce& msg = *msgOpt;

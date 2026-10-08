@@ -185,6 +185,49 @@ struct WorkerOp {
     // worker acking directly gates UnknownProducerId on it).
     int32_t          clientVersion = 0;
 
+    // Task 19 (per-worker egress crypto addendum, 2026-10-08): SessionAnnounce
+    // key handoff. `sessionEncrypted` is the session's own crypto.encrypted
+    // (true even if THIS worker's specific key below failed to derive — see
+    // senderKeyValid); the worker must treat an encrypted session it has no
+    // valid key for as "park/drop", NEVER plaintext. `senderKeyValid` gates
+    // whether senderCipher/senderKeyPrefix/senderKey below are a real,
+    // installable key (deriveSenderKey() succeeded on the gateway).
+    //
+    // senderId is deliberately NOT carried here: a worker derives it locally
+    // as workerId_ + 1 (unique per worker; gateway == 0) — see
+    // RecordsSealCtx::senderId.
+    //
+    // WIRE NOTE: carried with ZERO new SBE fields (see
+    // SessionAnnounceKeyTail.h's file header for why) — sessionEncrypted
+    // rides the wire `isolation` byte (PushRead-only otherwise), senderKeyValid
+    // rides the wire `durabilityTier` byte (Produce-only otherwise); the
+    // cipher/prefix/key ride as a fixed-size PREFIX of the SessionAnnounce
+    // tail (ahead of the egressChannel bytes), encoded/decoded by
+    // SessionAnnounceKeyTail.h. A plaintext session's wire bytes (isolation,
+    // durabilityTier, tail) are completely untouched — byte-identical to
+    // every pre-Task-19 SessionAnnounce.
+    bool    sessionEncrypted  = false;
+    bool    senderKeyValid    = false;
+    uint8_t senderCipher      = 0;      ///< rune::crypto::Cipher value (shared by both directions)
+    uint8_t senderKeyPrefix[4] = {};    ///< 4-byte AEAD nonce prefix (the session's b2cPrefix)
+    uint8_t senderKey[32]      = {};    ///< deriveSenderKey(b2c, workerId+1) output for THIS worker
+
+    // Task 22 (shard worker decrypts produce / per-worker ingress,
+    // 2026-10-08): the session's c2b (client->broker) key + prefix, for the
+    // worker's OWN ingress open context (RecordsOpenCtx, RecordsOpen.h).
+    // UNLIKE senderKey above, this is NOT derived per worker — ingress has a
+    // SINGLE sender (the client), so every worker of the session gets the
+    // SAME raw c2b key + prefix the gateway itself opens control frames
+    // with (one c2b key, no per-sender split — see the addendum's "Scope").
+    // `c2bKeyValid` mirrors `senderKeyValid`'s fail-closed contract: false
+    // on the first (parked, no-real-key) announce wave or any upstream
+    // derivation failure — the worker must then park/drop that session's
+    // produce ingress, never decode it as plaintext. Cipher is shared with
+    // the egress key above (senderCipher) — one cipher per session.
+    bool    c2bKeyValid       = false;
+    uint8_t c2bKeyPrefix[4]   = {};     ///< 4-byte AEAD nonce prefix (the session's c2bPrefix)
+    uint8_t c2bKey[32]        = {};     ///< the session's RAW c2b key (same for every worker)
+
     // SetOwnership: the ReplicaRegistry generation this owned set reflects
     // (acked back as WorkerReturn::OwnershipAck).  Task 10 fix 3.
     uint64_t ownershipGen = 0;
