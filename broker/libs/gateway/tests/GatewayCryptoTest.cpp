@@ -61,6 +61,29 @@
 //  11. WindowNotPoisonedByForgedFrame — a forged frame (wrong key, claims a
 //      fresh seq) fails auth and must NOT advance recvSeq/recvWindow; the
 //      SAME seq sent correctly afterwards must still succeed.
+//
+// Task 8b cases (rune::node::sealRecordsFrame, RecordsSeal.h — the function
+// ClientGateway::pushRecords_ calls for an ENCRYPTED session's Records push;
+// aeron-free by construction, so it IS unit-testable standalone, unlike
+// sendRecordsFrame itself which pulls in <ExclusivePublication.h>):
+//  12. RecordsPushSealOpensOnClient_Small — a single-fragment-sized Records
+//      frame, sealed exactly the way pushRecords_ will, opens under the
+//      client's b2c AeadCipher and round-trips the ORIGINAL Records fields
+//      (not just raw bytes) through Records::decode.
+//  13. RecordsPushSealOpensOnClient_Large — a batch far larger than one MTU
+//      (the plaintext path would have taken the zero-copy vectored offer)
+//      proves the seal-level contiguous-assembly logic at that size.
+//  14. RecordsPushSealTamperedCiphertextDropped — a flipped ciphertext byte
+//      fails auth; the client must never accept a tampered Records push.
+//  15. RecordsPushSealMisconfiguredCtxFailsClosed — a RecordsSealCtx with a
+//      null `send` (the "encrypted but key not installed" case) makes
+//      sealRecordsFrame fail closed (return 0), never falling back to
+//      transmitting the frame in the clear.
+//  16. RecordsPushPlaintextBug_RedToggle — RED-evidence toggle: reproduces
+//      the ORIGINAL Task-8b bug (Records pushed in the clear on an
+//      encrypted session) and shows the client-side open attempt on those
+//      unsealed bytes fails/garbles — exactly why consumer fetch was
+//      entirely broken on an encrypted session before this fix.
 
 #include <gtest/gtest.h>
 
@@ -68,7 +91,9 @@
 #include <rune/crypto/Cipher.h>
 #include <rune/crypto/TlsSession.h>
 #include <rune/gateway/CryptoFrame.h>
+#include <rune/node/RecordsSeal.h>
 #include <rune/protocol/client/CryptoEnvelope.h>
+#include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/MessageHeader.h>
 
 #include <cstdint>
@@ -595,4 +620,219 @@ TEST(GatewayCryptoDataPlane, WindowNotPoisonedByForgedFrame_RedToggle) {
     const std::size_t nLegit = openIngressFrameBuggy(
         f.gw, legit.data(), legit.size(), scratch.data(), scratch.size());
     EXPECT_EQ(nLegit, plain.size()) << "expected to FAIL under the injected bug (RED evidence)";
+}
+
+// ===========================================================================
+// Task 8b — seal the BROKER's Records push (consumer-fetch) path.
+//
+// rune::node::sealRecordsFrame (RecordsSeal.h) is the raw-crypto-params seal
+// step rune::node::sendRecordsFrame (RecordsPush.h) calls for an ENCRYPTED
+// session's Records push — see RecordsPush.h's file header comment for the
+// full encrypted-path flow (assemble contiguous plaintext -> seal -> publish
+// a single contiguous sealed buffer). sendRecordsFrame itself cannot be
+// linked here (it pulls in <ExclusivePublication.h>, unavailable on this
+// aeron-free host — the aeron-linked tryClaim/offer wiring is box-deferred),
+// but sealRecordsFrame has ZERO Aeron dependency by construction, so the
+// seal/open round-trip — the actual bug fix (Records sent in the clear on
+// an encrypted session, dropped by the client) — is fully testable here.
+// ===========================================================================
+
+namespace {
+
+namespace pn = rune::node;
+
+// Build a Records frame exactly as ClientGateway::pushSubscriptions()
+// builds one (sessionId/correlationId/subscriptionId/topicId/partition/
+// baseOffset + a zero-copy-in-production, here owned, batch span).
+rpc::Records makeRecordsFrame(int64_t sessionId, int64_t correlationId, int64_t subscriptionId,
+                               int32_t topicId, int32_t partition, int64_t baseOffset,
+                               const std::vector<uint8_t>& batch) {
+    rpc::Records rec;
+    rec.sessionId      = sessionId;
+    rec.correlationId  = correlationId;
+    rec.subscriptionId = subscriptionId;
+    rec.topicId        = topicId;
+    rec.partition       = partition;
+    rec.baseOffset      = baseOffset;
+    rec.recordBatch     = std::span<const uint8_t>(batch.data(), batch.size());
+    return rec;
+}
+
+// Seal `rec` exactly the way pushRecords_/sendRecordsFrame's ENCRYPTED
+// branch does: rec.encode() into a contiguous plaintext buffer, then
+// rune::node::sealRecordsFrame() into a sealed buffer.  Returns the sealed
+// bytes (empty on seal failure).
+std::vector<uint8_t> sealRecordsAsPushWould(const rpc::Records& rec, cr::AeadCipher& send,
+                                            uint64_t& sendSeq, cr::Cipher cipher, uint16_t epoch) {
+    const std::size_t frameLen = rec.encodedSize();
+    std::vector<uint8_t> plain(frameLen);
+    rec.encode(plain.data());
+
+    pn::RecordsSealCtx ctx;
+    ctx.send    = &send;
+    ctx.sendSeq = &sendSeq;
+    ctx.cipher  = static_cast<uint8_t>(cipher);
+    ctx.epoch   = epoch;
+
+    std::vector<uint8_t> sealed(frameLen + rpc::kCryptoOverhead);
+    const std::size_t n = pn::sealRecordsFrame(ctx, plain.data(), frameLen, sealed.data(), sealed.size());
+    sealed.resize(n);  // n==0 -> empty, signalling failure to the caller
+    return sealed;
+}
+
+// Open `sealed` the way the CLIENT's dispatchEgressFrame does for every
+// non-handshake egress frame: decode the CryptoSubHeader at [24..35], AEAD
+// open under the client's own b2c AeadCipher (AAD = the 36 clear bytes),
+// then Records::decode the reconstructed [24B header][plaintext body].
+// Returns nullopt on ANY failure (truncation, decode failure, auth
+// failure) — exactly "the client drops it" from the bug report.
+//
+// `storage` is an OUT param: Records::decode returns a ZERO-COPY view into
+// the buffer it was given (recordBatch is a span, not an owned vector), so
+// the reconstructed plaintext must outlive the returned Records — it is
+// caller-owned (kept alive by the test for as long as it inspects the
+// result), never a function-local temporary.
+std::optional<rpc::Records> openRecordsAsClientWould(const std::vector<uint8_t>& sealed,
+                                                      cr::AeadCipher& recv,
+                                                      std::vector<uint8_t>& storage) {
+    if (sealed.size() < rpc::kCryptoHeaderBytes + cr::kTagSize) return std::nullopt;
+    const auto subOpt = rpc::CryptoSubHeader::decode(
+        sealed.data() + rpc::MessageHeader::ENCODED_SIZE,
+        sealed.size() - rpc::MessageHeader::ENCODED_SIZE);
+    if (!subOpt) return std::nullopt;
+
+    const std::size_t ctLen = sealed.size() - rpc::kCryptoHeaderBytes;
+    storage.assign(rpc::MessageHeader::ENCODED_SIZE + ctLen, 0);  // >= plaintext cap
+    const long m = recv.open(subOpt->seq, sealed.data(), rpc::kCryptoHeaderBytes,
+                              sealed.data() + rpc::kCryptoHeaderBytes, ctLen,
+                              storage.data() + rpc::MessageHeader::ENCODED_SIZE);
+    if (m < 0) return std::nullopt;  // auth failure
+
+    std::memcpy(storage.data(), sealed.data(), rpc::MessageHeader::ENCODED_SIZE);
+    storage.resize(rpc::MessageHeader::ENCODED_SIZE + static_cast<std::size_t>(m));
+    return rpc::Records::decode(storage.data(), storage.size());
+}
+
+}  // namespace
+
+TEST(GatewayCryptoDataPlane, RecordsPushSealOpensOnClient_Small) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/20);
+
+    const std::vector<uint8_t> batch(64, 0xAB);  // single-fragment-sized
+    const rpc::Records rec = makeRecordsFrame(20, 99, 5, 3, 1, 1000, batch);
+
+    const auto sealed = sealRecordsAsPushWould(rec, *f.gw.send, f.gw.sendSeq, f.gw.cipher, f.gw.epoch);
+    ASSERT_FALSE(sealed.empty()) << "seal must not fail in this test setup";
+    EXPECT_EQ(f.gw.sendSeq, 1u);
+
+    std::vector<uint8_t> storage;
+    const auto opened = openRecordsAsClientWould(sealed, *f.clientRecv, storage);
+    ASSERT_TRUE(opened.has_value()) << "a sealed Records frame must decrypt on the client";
+    EXPECT_EQ(opened->sessionId, rec.sessionId);
+    EXPECT_EQ(opened->correlationId, rec.correlationId);
+    EXPECT_EQ(opened->subscriptionId, rec.subscriptionId);
+    EXPECT_EQ(opened->topicId, rec.topicId);
+    EXPECT_EQ(opened->partition, rec.partition);
+    EXPECT_EQ(opened->baseOffset, rec.baseOffset);
+    ASSERT_EQ(opened->recordBatch.size(), batch.size());
+    EXPECT_EQ(0, std::memcmp(opened->recordBatch.data(), batch.data(), batch.size()));
+}
+
+TEST(GatewayCryptoDataPlane, RecordsPushSealOpensOnClient_Large) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/21);
+
+    // Far larger than any realistic maxPayloadLength (~1376-8192 B MTU) —
+    // the plaintext path would have taken the zero-copy vectored offer;
+    // this proves the seal-level contiguous-assembly logic survives at that
+    // size (the actual tryClaim/single-offer choice inside sendRecordsFrame
+    // is box-deferred — Aeron-linked — but the seal step is identical
+    // regardless of which publish call follows it).
+    std::vector<uint8_t> batch(256 * 1024);
+    for (std::size_t i = 0; i < batch.size(); ++i) batch[i] = static_cast<uint8_t>(i & 0xFF);
+    const rpc::Records rec = makeRecordsFrame(21, 100, 6, 4, 2, 2000, batch);
+
+    const auto sealed = sealRecordsAsPushWould(rec, *f.gw.send, f.gw.sendSeq, f.gw.cipher, f.gw.epoch);
+    ASSERT_FALSE(sealed.empty());
+    EXPECT_EQ(sealed.size(), rec.encodedSize() + rpc::kCryptoOverhead);
+
+    std::vector<uint8_t> storage;
+    const auto opened = openRecordsAsClientWould(sealed, *f.clientRecv, storage);
+    ASSERT_TRUE(opened.has_value());
+    ASSERT_EQ(opened->recordBatch.size(), batch.size());
+    EXPECT_EQ(0, std::memcmp(opened->recordBatch.data(), batch.data(), batch.size()));
+}
+
+TEST(GatewayCryptoDataPlane, RecordsPushSealTamperedCiphertextDropped) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/22);
+    const std::vector<uint8_t> batch(128, 0x11);
+    const rpc::Records rec = makeRecordsFrame(22, 1, 1, 1, 0, 0, batch);
+
+    auto sealed = sealRecordsAsPushWould(rec, *f.gw.send, f.gw.sendSeq, f.gw.cipher, f.gw.epoch);
+    ASSERT_FALSE(sealed.empty());
+    sealed[rpc::kCryptoHeaderBytes] ^= 0xFF;  // flip one ciphertext byte
+
+    std::vector<uint8_t> storage;
+    const auto opened = openRecordsAsClientWould(sealed, *f.clientRecv, storage);
+    EXPECT_FALSE(opened.has_value()) << "a tampered Records push must never decrypt";
+}
+
+TEST(GatewayCryptoDataPlane, RecordsPushSealMisconfiguredCtxFailsClosed) {
+    // "encrypted but key not installed" — session.crypto.encrypted==true,
+    // session.crypto.send has no value: pushRecords_ still builds a
+    // RecordsSealCtx (gated on `encrypted` alone, mirroring sendTo), but
+    // with a null `send`. sealRecordsFrame must fail closed, never
+    // transmitting the frame in the clear.
+    const std::vector<uint8_t> batch(32, 0x22);
+    const rpc::Records rec = makeRecordsFrame(23, 1, 1, 1, 0, 0, batch);
+    const std::size_t frameLen = rec.encodedSize();
+    std::vector<uint8_t> plain(frameLen);
+    rec.encode(plain.data());
+
+    uint64_t sendSeq = 0;
+    pn::RecordsSealCtx ctx;
+    ctx.send    = nullptr;  // key not installed
+    ctx.sendSeq = &sendSeq;
+
+    std::vector<uint8_t> sealed(frameLen + rpc::kCryptoOverhead);
+    const std::size_t n = pn::sealRecordsFrame(ctx, plain.data(), frameLen, sealed.data(), sealed.size());
+    EXPECT_EQ(n, 0u);
+    EXPECT_EQ(sendSeq, 0u) << "a failed seal must not even consume a sequence number";
+}
+
+// ---------------------------------------------------------------------------
+// RED-evidence toggle: reproduces the ORIGINAL Task-8b bug (Records pushed
+// in the clear on an encrypted session — pushRecords_ -> sendRecordsFrame
+// wrote directly to the raw publication, bypassing sendTo's Task 8
+// sealing). Always `false` in the committed file; see task-8b-report.md for
+// the RED run (flip to `true` locally to reproduce).
+// ---------------------------------------------------------------------------
+namespace {
+constexpr bool kInjectPlaintextRecordsPushBug = false;
+}
+
+TEST(GatewayCryptoDataPlane, RecordsPushPlaintextBug_RedToggle) {
+    if (!kInjectPlaintextRecordsPushBug) {
+        GTEST_SKIP() << "RED-evidence toggle off in the committed file (see task-8b-report.md)";
+    }
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/24);
+    const std::vector<uint8_t> batch(64, 0xCD);
+    const rpc::Records rec = makeRecordsFrame(24, 1, 1, 1, 0, 0, batch);
+
+    // BUG: the pre-fix pushRecords_ sent rec.encode()'s PLAIN bytes straight
+    // to the publication — no seal at all — even though the session is
+    // encrypted. The client's dispatchEgressFrame decrypts EVERY non-
+    // handshake egress frame unconditionally, so it tries to open these
+    // plain bytes as if they were sealed.
+    const std::size_t frameLen = rec.encodedSize();
+    std::vector<uint8_t> plainWire(frameLen);
+    rec.encode(plainWire.data());
+
+    std::vector<uint8_t> storage;
+    const auto opened = openRecordsAsClientWould(plainWire, *f.clientRecv, storage);
+    // Expected to FAIL under the injected bug (RED evidence): the client
+    // cannot recover the Records frame from unsealed bytes — exactly why
+    // consumer fetch was entirely broken on an encrypted session.
+    EXPECT_TRUE(opened.has_value())
+        << "expected to FAIL under the injected bug (RED evidence): the client "
+           "cannot open a plaintext Records push as if it were sealed";
 }

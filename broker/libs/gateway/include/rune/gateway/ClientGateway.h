@@ -1609,6 +1609,17 @@ private:
     std::vector<uint8_t>                 decryptScratch_;
     std::vector<uint8_t>                 sealScratch_;
 
+    // client<->broker TLS/AEAD (Task 8b): pushRecords_'s own grow-once seal
+    // scratch for an ENCRYPTED session's Records push (rune::node::
+    // RecordsSealScratch — see RecordsPush.h's file header comment for the
+    // encrypted path). Separate from sealScratch_ above (that one is
+    // sendTo()'s, sized plainLen + kCryptoOverhead for ordinary responses;
+    // Records frames can be far larger — up to maxMessageLength — and need
+    // their own contiguous plaintext-assembly buffer too, which ordinary
+    // responses never do). Single-writer (duty-cycle thread only), never
+    // shared across threads (shared-nothing).
+    rune::node::RecordsSealScratch       recordsSealScratch_;
+
     // Max accepted produce-batch WIRE size.  A batch above this is rejected LOUDLY
     // with MessageTooLarge (never silently dropped).  The zero-copy append path no
     // longer needs a fixed restamp scratch — the base offset is patched into the

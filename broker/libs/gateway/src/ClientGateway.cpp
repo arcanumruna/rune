@@ -274,16 +274,44 @@ void ClientGateway::enqueueOrBestEffort_(Session&       session,
 }
 
 // ---------------------------------------------------------------------------
-// F19: pushRecords_ — send one Records push frame on the session's egress.
-// Real egress → rune::node::sendRecordsFrame (tryClaim fast path for one-MTU
-// frames, unchanged; vectored [fixed | batch] offer above it; TooLarge above
-// maxMessageLength).  Null egress (injectTestSession) → the test capture hook
-// (treated as sent); no hook → Retry.
+// F19 / Task 8b: pushRecords_ — send one Records push frame on the session's
+// egress.  Real egress, PLAINTEXT session → rune::node::sendRecordsFrame's
+// unchanged path (tryClaim fast path for one-MTU frames; vectored
+// [fixed | batch] offer above it; TooLarge above maxMessageLength).
+//
+// Real egress, ENCRYPTED session (session.crypto.encrypted): the Records
+// push is the highest-volume broker->client traffic and was bypassing
+// sendTo's Task 8 sealing entirely — sent in the clear, dropped by the
+// client's decrypt-everything-but-handshake dispatch. Build a
+// rune::node::RecordsSealCtx from the session's OWN crypto fields (raw
+// params — never rune::gateway::CryptoState itself; RecordsPush.h/
+// RecordsSeal.h must not depend on libs/gateway, see RecordsSeal.h's file
+// header comment) and pass it + this gateway's own recordsSealScratch_ to
+// sendRecordsFrame, which assembles the contiguous plaintext, seals it, and
+// publishes the single contiguous sealed buffer (see RecordsPush.h's
+// ENCRYPTED-path comment). Gated on `encrypted` alone (not
+// `session.crypto.send.has_value()`), exactly like sendTo — a null `send`
+// (key not installed) is still passed through as a RecordsSealCtx with a
+// null `send`, so sealRecordsFrame fails closed instead of ever falling
+// back to plaintext.
+//
+// Null egress (injectTestSession) → the test capture hook (treated as
+// sent); no hook → Retry.
 // ---------------------------------------------------------------------------
 rune::node::RecordsSendResult ClientGateway::pushRecords_(Session& session, const pc::Records& rec)
 {
-    if (session.egress) [[likely]]
+    if (session.egress) [[likely]] {
+        if (session.crypto.encrypted) {
+            rune::node::RecordsSealCtx seal;
+            seal.send    = session.crypto.send.has_value() ? &*session.crypto.send : nullptr;
+            seal.sendSeq = &session.crypto.sendSeq;
+            seal.cipher  = static_cast<uint8_t>(session.crypto.cipher);
+            seal.epoch   = session.crypto.epoch;
+            return rune::node::sendRecordsFrame(*session.egress, rec, scratch_.data(), scratch_.size(),
+                                                &seal, &recordsSealScratch_);
+        }
         return rune::node::sendRecordsFrame(*session.egress, rec, scratch_.data(), scratch_.size());
+    }
     if (!onEgressFrame_) return {rune::node::RecordsSendKind::Retry, -1};
     captureTestRecordsFrame_(session, rec);
     return {rune::node::RecordsSendKind::Sent, 1};

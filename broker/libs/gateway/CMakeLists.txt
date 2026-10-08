@@ -69,11 +69,17 @@ if(BUILD_TESTING)
     # {CryptoEnvelope,MessageHeader}.h, so this target needs this lib's own
     # include/ dir and the protocol include dir too (rune_gateway itself gets
     # both PUBLIC above; this target deliberately skips linking rune_gateway).
+    # Task 8b additionally #includes rune/node/RecordsSeal.h (the Records-push
+    # seal step — aeron-free by construction, unlike RecordsPush.h itself, see
+    # that header's own comment), so this target also needs libs/node's
+    # include/ dir; it still deliberately skips linking rune_node (which would
+    # drag in <Aeron.h> via RecordsPush.h's #include <ExclusivePublication.h>).
     # -------------------------------------------------------------------------
     add_executable(rune_gateway_crypto_tests
         tests/GatewayCryptoTest.cpp)
     target_include_directories(rune_gateway_crypto_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../node/include
         ${RUNE_PROTOCOL_INCLUDE})
     target_link_libraries(rune_gateway_crypto_tests PRIVATE
         rune_crypto
