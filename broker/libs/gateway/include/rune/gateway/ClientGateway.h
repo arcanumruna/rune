@@ -56,6 +56,10 @@
 #include <rune/gateway/IGroupRequestHandler.h>
 #include <rune/gateway/ITxnRequestHandler.h>
 #include <rune/gateway/IAdminRequestSink.h>
+// client<->broker TLS/AEAD (Task 7): server-role handshake driver. SessionTable.h
+// (above) already pulls in rune/crypto/Aead.h + Cipher.h for CryptoState; this
+// adds TlsSession itself for PendingConnect's in-flight handshake.
+#include <rune/crypto/TlsSession.h>
 
 // Forward-declared to avoid pulling the full WorkerPool header (and its heavy
 // chain: Worker → SpscRing → WorkerOp → ReplicationMessages) into the gateway
@@ -198,6 +202,14 @@ public:
     //                                 constructing thread; the default pump sleep-polls a threaded driver.
     //                                 Production fused placement uses the default pump (BrokerNode's
     //                                 interim runner services the runtime driver during start()).
+    // @param tlsCertPem / tlsKeyPem   client<->broker TLS/AEAD (Task 7): the broker's own TLS
+    //                                 server cert + private key, as PEM TEXT (not file paths) —
+    //                                 loaded once, at construction.  Both empty (the default) =
+    //                                 crypto disabled: a Connect that offers cipherList/handshakeBytes
+    //                                 silently degrades to the pre-Task-7 plaintext path, byte-
+    //                                 identical to today.  Task 9 owns the RUNE_TLS toggle / actual
+    //                                 file loading + SIGHUP reload / require_tls hard-reject; this
+    //                                 constructor only takes the PEM text it's handed.
     ClientGateway(std::shared_ptr<aeron::Aeron>       aeron,
                   std::string                         clientChannel,
                   int32_t                             clientStreamId,
@@ -205,7 +217,9 @@ public:
                   int64_t                             sessionTimeoutNs         = kDefaultSessionTimeoutNs,
                   std::function<LeaderView()>         leaderView               = nullptr,
                   int64_t                             connectResolveTimeoutNs  = kDefaultConnectResolveTimeoutNs,
-                  rune::aeronutil::AeronPump          pump                     = {});
+                  rune::aeronutil::AeronPump          pump                     = {},
+                  std::string                         tlsCertPem               = {},
+                  std::string                         tlsKeyPem                = {});
 
     ~ClientGateway() = default;
 
@@ -1161,6 +1175,37 @@ private:
         // the duty thread (PeerResolverHub); no publication registered yet
         // (registrationId unused) until the numeric endpoint is known.
         bool        awaitingResolve = false;
+
+        // ---------------------------------------------------------------
+        // client<->broker TLS/AEAD (Task 7) — server-role handshake state.
+        // Engaged only when the client's ConnectRequest offered crypto
+        // (non-empty cipherList + handshakeBytes) AND this gateway was
+        // configured with a cert/key; nullopt for the whole plaintext path
+        // (byte-identical to pre-Task-7).  `chosenCipher`/`hsBytes` mirror
+        // the client's own SessionMachine fields (task-7-interfaces.md
+        // points at them as the canonical shape): hsBytes holds the
+        // server's own pending outbound handshake bytes, drained into the
+        // NEXT ConnectResponse/HandshakeContinueResponse leg and cleared
+        // right after — never grows unbounded across legs.
+        // ---------------------------------------------------------------
+        std::optional<rune::crypto::TlsSession> tls;
+        rune::crypto::Cipher                    chosenCipher = rune::crypto::Cipher::None;
+        std::vector<uint8_t>                    hsBytes;
+        // Set once the first ConnectResponse (carrying chosenCipher +
+        // the server's first flight) has been sent: this entry stays alive
+        // in pendingConnects_ (not erased, no Session yet) until the
+        // client's HandshakeContinue legs drive tls->done() — see
+        // handleHandshakeContinue_.  Mutually exclusive with `tls ==
+        // nullopt` being erased immediately (plaintext path, unchanged).
+        bool        awaitingHandshake = false;
+        // Set when the server-role TlsSession rejected the client's
+        // opening handshake bytes (malformed/invalid ClientHello, a bad
+        // token embedded in it, cert/SNI mismatch, ...) or (later, in
+        // handleHandshakeContinue_) exportKeys() returned the
+        // Cipher::None fail-closed sentinel.  pollPendingConnects answers
+        // ConnectResponse{HandshakeFailed} and creates no session — never
+        // installs all-zero keys.
+        bool        cryptoFailed = false;
     };
 
     // -----------------------------------------------------------------------
@@ -1175,6 +1220,17 @@ private:
     // Dispatch helpers
     // -----------------------------------------------------------------------
     void handleConnect   (const uint8_t* buf, std::size_t len, int64_t nowNs);
+    // client<->broker TLS/AEAD (Task 7): a later leg of a multi-round TLS
+    // handshake, after the initial Connect/ConnectResponse leg (handleConnect)
+    // started it.  Looks up the in-flight PendingConnect by sessionId (not yet
+    // promoted to sessions_), drives TlsSession::readInbound/writeOutbound, and
+    // on done() exports keys (direction-mirrored — see task-7-interfaces.md)
+    // and promotes the session.  Unknown sessionId / decode failure → drop.
+    void handleHandshakeContinue_(const uint8_t* buf, std::size_t len, int64_t nowNs);
+    // Pull every pending outbound handshake byte out of pending.tls into
+    // pending.hsBytes (growable — cold path, once per handshake leg; clears
+    // first).  No-op if pending.tls is empty.
+    static void drainHandshakeOutbound_(PendingConnect& pending);
     void handleKeepalive (const uint8_t* buf, std::size_t len, int64_t nowNs);
     void handlePing      (const uint8_t* buf, std::size_t len, int64_t nowNs);
     void handleDisconnect(const uint8_t* buf, std::size_t len);
@@ -1454,6 +1510,11 @@ private:
     int64_t                              maxHeldIdleNs_ = kDefaultMaxHeldIdleNs;
     int64_t                              connectResolveTimeoutNs_;
     std::function<LeaderView()>          leaderView_;
+    // client<->broker TLS/AEAD (Task 7): this broker's TLS server cert/key,
+    // as PEM text, loaded once at construction.  Both empty = crypto disabled
+    // (see the ctor's tlsCertPem/tlsKeyPem doc comment).
+    std::string                          tlsCertPem_;
+    std::string                          tlsKeyPem_;
 
     std::shared_ptr<aeron::Subscription> sub_;
     rune::aeronutil::FragmentAssembler   assembler_;

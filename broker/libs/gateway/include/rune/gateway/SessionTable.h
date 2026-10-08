@@ -12,15 +12,49 @@
 #include <Aeron.h>
 #include <ExclusivePublication.h>
 
+// client<->broker TLS/AEAD (Task 7): Session's own CryptoState holds the two
+// directional AeadCiphers once a server-role TLS handshake completes
+// (ClientGateway::handleHandshakeContinue_).  NOTE (build/linkage trap,
+// task-7-interfaces.md): this header is already part of rune_gateway's
+// PUBLIC interface (it includes <Aeron.h>) — pulling rune/crypto/Aead.h in
+// here means every downstream target that compiles a TU including
+// SessionTable.h now needs rune_crypto's include dir transitively.  rune_crypto
+// + OpenSSL must be linked PUBLIC on rune_gateway (mirroring rune_fr / the
+// client's Task-5 fix-round-1), not PRIVATE as the brief's literal text says.
+#include <rune/crypto/Aead.h>
+#include <rune/crypto/Cipher.h>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
 namespace rune::gateway {
+
+// ---------------------------------------------------------------------------
+// CryptoState — client<->broker TLS/AEAD (Task 7), the broker's OWN per-
+// session crypto state (NOT the client's rune::client::session::CryptoState —
+// a separate type, same shape, by design: Rule 3, "each state holds exactly
+// the variables it needs").  Populated once a server-role TlsSession reaches
+// done() and exportKeys() returns a real cipher (ClientGateway::
+// handleHandshakeContinue_).  Direction mapping is the MIRROR of the client's
+// (see task-7-interfaces.md's "DIRECTION MAPPING" trap):
+//   recv <- c2b/c2bPrefix  (OPENS client->broker ingress)
+//   send <- b2c/b2cPrefix  (SEALS broker->client egress)
+// ---------------------------------------------------------------------------
+struct CryptoState {
+    bool                                     encrypted  = false;
+    rune::crypto::Cipher                     cipher{};
+    uint16_t                                 epoch      = 0;
+    uint64_t                                 sendSeq    = 0;
+    uint64_t                                 recvSeq    = 0;
+    uint64_t                                 recvWindow = 0;
+    std::optional<rune::crypto::AeadCipher>  send, recv;
+};
 
 // ---------------------------------------------------------------------------
 // Session — one connected client.
@@ -93,6 +127,11 @@ struct Session {
         }
     };
     std::unordered_map<SubKey, int64_t, SubKeyHash> subIdByKey;
+
+    // client<->broker TLS/AEAD (Task 7): this session's crypto state.
+    // `crypto.encrypted` is false (default CryptoState) for a plaintext
+    // session — byte-identical to every pre-Task-7 Session.
+    CryptoState crypto;
 };
 
 // ---------------------------------------------------------------------------

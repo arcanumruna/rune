@@ -23,6 +23,13 @@ target_include_directories(rune_gateway PUBLIC
 # compiles correctly and consumers of rune_gateway also get rune_replication headers.
 target_link_libraries(rune_gateway PUBLIC rune_storage rune_replication rune_transaction rune_metadata rune_consensus rune_aeron_util)
 target_include_directories(rune_gateway PUBLIC ${RUNE_NODE_INCLUDE})
+# client<->broker TLS/AEAD (Task 7): SessionTable.h (public header) now holds a
+# Session::CryptoState built from rune_crypto's AeadCipher; PUBLIC so every
+# consumer of this header (rune_node, its tests/integration/*, and everything
+# PUBLIC-linking rune_node transitively) gets rune_crypto's include dir too —
+# see the ★ BUILD/LINKAGE TRAP comment on rune_crypto's add_library() in the
+# top-level CMakeLists.txt.
+target_link_libraries(rune_gateway PUBLIC rune_crypto)
 # rune_codec PUBLIC: Worker.h (included transitively via WorkerPool.h) now
 # includes rune/codec/Validator.h for the Task 7 per-worker schema validation
 # hook.  Consumers that include Worker.h via RUNE_NODE_INCLUDE need rune_codec headers.
@@ -50,6 +57,20 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_gateway_session_tests)
+
+    # -------------------------------------------------------------------------
+    # client<->broker TLS/AEAD (Task 7): gateway server-role handshake —
+    # Aeron-free (no ClientGateway/SessionTable involved; see the file's own
+    # header comment for why). Links rune_crypto + GTest ONLY (not rune_gateway).
+    # -------------------------------------------------------------------------
+    add_executable(rune_gateway_crypto_tests
+        tests/GatewayCryptoTest.cpp)
+    target_link_libraries(rune_gateway_crypto_tests PRIVATE
+        rune_crypto
+        GTest::gtest_main)
+    target_compile_definitions(rune_gateway_crypto_tests PRIVATE
+        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
+    gtest_discover_tests(rune_gateway_crypto_tests)
 
     # -------------------------------------------------------------------------
     # TopicRegistry unit tests (GB-1) — no Aeron, real filesystem + rune_storage.

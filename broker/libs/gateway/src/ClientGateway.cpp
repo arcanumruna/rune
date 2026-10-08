@@ -83,7 +83,9 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
                              int64_t                         sessionTimeoutNs,
                              std::function<LeaderView()>     leaderView,
                              int64_t                         connectResolveTimeoutNs,
-                             rune::aeronutil::AeronPump      pump)
+                             rune::aeronutil::AeronPump      pump,
+                             std::string                     tlsCertPem,
+                             std::string                     tlsKeyPem)
     : aeron_(std::move(aeron))
     , clientChannel_(std::move(clientChannel))
     , clientStreamId_(clientStreamId)
@@ -91,6 +93,8 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
     , sessionTimeoutNs_(sessionTimeoutNs)
     , connectResolveTimeoutNs_(connectResolveTimeoutNs)
     , leaderView_(std::move(leaderView))
+    , tlsCertPem_(std::move(tlsCertPem))
+    , tlsKeyPem_(std::move(tlsKeyPem))
 {
     // Pre-allocate the draining-release vector (bounded by kMaxPendingConnects).
     // pendingConnects_ is a deque — no reserve() needed; O(1) front push/pop.
@@ -887,6 +891,11 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::Connect:
             handleConnect(buf, len, nowNs_);
             break;
+        // client<->broker TLS/AEAD (Task 7): a later leg of a multi-round TLS
+        // handshake started on the Connect/ConnectResponse leg above.
+        case pc::TemplateId::HandshakeContinue:
+            handleHandshakeContinue_(buf, len, nowNs_);
+            break;
         case pc::TemplateId::Keepalive:
             handleKeepalive(buf, len, nowNs_);
             break;
@@ -1403,6 +1412,49 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     pc_entry.egressStreamId        = req.egressStreamId;
     pc_entry.clientVersion         = req.clientVersion;   // D6
 
+    // client<->broker TLS/AEAD (Task 7): drive the server-role handshake's
+    // FIRST leg right here, synchronously, off the client's ClientHello
+    // bytes carried on this very ConnectRequest.  Skipped entirely for a
+    // redirect (this node will create no session either way) and when this
+    // gateway has no cert/key configured (silent plaintext degrade — Task 9
+    // owns require_tls's hard rejection of that case).
+    // NOTE: capturedLeaderEndpoint was already std::move()'d into
+    // pc_entry.leaderClientEndpoint above — read the redirect decision back
+    // off pc_entry, not the now-moved-from local.
+    const bool isRedirectCapture = (!pc_entry.isLeader && !pc_entry.leaderClientEndpoint.empty());
+    const bool clientOffersCrypto = !req.cipherList.empty() && !req.handshakeBytes.empty();
+    const bool brokerHasTls       = !tlsCertPem_.empty() && !tlsKeyPem_.empty();
+    if (!isRedirectCapture && clientOffersCrypto && brokerHasTls) {
+        pc_entry.tls.emplace(rune::crypto::TlsSession::makeServer(tlsCertPem_.c_str(), tlsKeyPem_.c_str()));
+        if (!pc_entry.tls->valid()) {
+            // Local TLS init failure (e.g. a misconfigured cert/key on THIS
+            // broker) — degrade to plaintext rather than hard-fail a connect
+            // over a broker-side problem the client had no part in (mirrors
+            // the client's own beginCryptoHandshake_ degrade-on-local-failure).
+            pc_entry.tls.reset();
+        } else {
+            // The broker's chosen cipher: the client's first preference.
+            // (A real negotiation policy — e.g. intersecting with a broker
+            // allow-list — is Task 9's RUNE_TLS/require_tls scope; here we
+            // mirror the client reference test's own driveHandshake(), which
+            // takes cipherList[0] verbatim.)
+            pc_entry.chosenCipher = static_cast<rune::crypto::Cipher>(req.cipherList[0]);
+            const auto hs = pc_entry.tls->readInbound(
+                reinterpret_cast<const uint8_t*>(req.handshakeBytes.data()),
+                req.handshakeBytes.size());
+            if (hs == rune::crypto::HsState::Failed) {
+                // Malformed/invalid ClientHello (bad token embedded in it,
+                // cert/SNI mismatch, protocol error, ...) — fail the connect
+                // non-retriably; pollPendingConnects answers
+                // ConnectResponse{HandshakeFailed} and creates no session.
+                pc_entry.cryptoFailed = true;
+                pc_entry.tls.reset();
+            } else {
+                drainHandshakeOutbound_(pc_entry);
+            }
+        }
+    }
+
     // DR-15 fix round 2 (LOW-4): a reply HOSTNAME is resolved off-thread by the
     // cold resolver (never by a driver conductor on a duty thread); the session
     // stays pending — bounded by the connect timeout — until the hub answers.
@@ -1424,6 +1476,26 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // Kick off the egress publication registration (returns immediately).
     if (!registerConnectEgress_(pc_entry)) return;
     pendingConnects_.push_back(std::move(pc_entry));
+}
+
+// ---------------------------------------------------------------------------
+// client<->broker TLS/AEAD (Task 7): drain every pending outbound handshake
+// byte out of pending.tls into pending.hsBytes.  Mirrors the client's own
+// SessionMachine::drainHandshakeOutbound_() exactly (cold path — once per
+// handshake leg; the growable vector is explicitly out of the zero-alloc
+// hot-path rule, same reasoning as the client side). No-op if pending.tls is
+// empty (callers only invoke this with tls engaged).
+// ---------------------------------------------------------------------------
+void ClientGateway::drainHandshakeOutbound_(PendingConnect& pending)
+{
+    pending.hsBytes.clear();
+    if (!pending.tls) return;
+    uint8_t chunk[4096];
+    for (;;) {
+        const std::size_t n = pending.tls->writeOutbound(chunk, sizeof(chunk));
+        if (n == 0) break;
+        pending.hsBytes.insert(pending.hsBytes.end(), chunk, chunk + n);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,6 +1617,13 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
         }
 
         if (pending.awaitingResolve) { ++it; continue; }   // reply host not resolved yet (LOW-4)
+        // client<->broker TLS/AEAD (Task 7): the first ConnectResponse (with
+        // the chosen cipher + server's first flight) was already sent; this
+        // entry now waits for the client's HandshakeContinue legs
+        // (handleHandshakeContinue_) to drive tls->done() — never re-sent nor
+        // erased here.  The generic timeout check above still bounds a
+        // client that never continues the handshake.
+        if (pending.awaitingHandshake) { ++it; continue; }
 
         // Try to find the publication (non-blocking).
         std::shared_ptr<aeron::ExclusivePublication> pub;
@@ -1619,6 +1698,17 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
                 continue;
             }
             encoded = err.encode(scratch_.data());
+        } else if (pending.cryptoFailed) {
+            // client<->broker TLS/AEAD (Task 7): the server-role TlsSession
+            // rejected the client's opening handshake bytes (handleConnect).
+            // Fail the connect non-retriably — mirrors the redirect branch
+            // above in creating NO session (Invariant FIX A extends to this
+            // path too: never add a session the client wasn't told about).
+            pc::ConnectResponse resp;
+            resp.sessionId     = 0;
+            resp.correlationId = pending.correlationId;
+            resp.code          = static_cast<int16_t>(pc::ErrorCode::HandshakeFailed);
+            encoded = resp.encode(scratch_.data());
         } else {
             // Task 13 (spec §3.4) announce-before-accept: every worker must know
             // this session's reply destination before the client can learn its
@@ -1656,6 +1746,15 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             resp.code              = static_cast<int16_t>(pc::ErrorCode::OK);
             resp.leaderMemberId    = thisNodeId_;
             resp.assignedSessionId = pending.sessionId;
+            if (pending.tls) {
+                // client<->broker TLS/AEAD (Task 7): offer the chosen cipher +
+                // the server's first handshake flight (ServerHello/cert/
+                // Finished) on this SAME leg — mirrors the client's Task-5
+                // first-leg shape (ConnectResponse v4's additive fields).
+                resp.chosenCipher   = static_cast<uint8_t>(pending.chosenCipher);
+                resp.handshakeBytes = std::string_view(
+                    reinterpret_cast<const char*>(pending.hsBytes.data()), pending.hsBytes.size());
+            }
             encoded = resp.encode(scratch_.data());
         }
 
@@ -1673,19 +1772,139 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             continue;
         }
 
-        // Send succeeded.  Redirect entries create NO session (the resolvedPub
-        // shared_ptr release on erase frees the transient egress registration).
-        if (!isRedirect) {
-            // Only now is it safe to add the session (leader-accept path).
-            // Carry the client's egress endpoint so a per-consumer unicast Records
-            // publication can be lazily created on the first subscribe.
-            sessions_.add(pending.sessionId, std::move(pub), nowNs,
-                          pending.egressChannel, pending.egressStreamId,
-                          pending.clientVersion);
+        // Send succeeded.  Redirect / handshake-failure entries create NO
+        // session (the resolvedPub shared_ptr release on erase frees the
+        // transient egress registration).
+        if (isRedirect || pending.cryptoFailed) {
+            it = pendingConnects_.erase(it);
+            continue;
         }
+        if (pending.tls) {
+            // client<->broker TLS/AEAD (Task 7): the client now has its
+            // sessionId and the server's first flight; it drives the rest
+            // over HandshakeContinue/HandshakeContinueResponse
+            // (handleHandshakeContinue_).  Do NOT promote to SessionTable yet
+            // (Invariant FIX A: no session without a completed, keyed
+            // handshake) and do NOT erase — this entry keeps the in-flight
+            // TlsSession (and the now-resolved, Aeron-connected pub) alive,
+            // keyed by sessionId.
+            pending.awaitingHandshake = true;
+            ++it;
+            continue;
+        }
+        // Only now is it safe to add the session (leader-accept, plaintext
+        // path).  Carry the client's egress endpoint so a per-consumer
+        // unicast Records publication can be lazily created on the first
+        // subscribe.
+        sessions_.add(pending.sessionId, std::move(pub), nowNs,
+                      pending.egressChannel, pending.egressStreamId,
+                      pending.clientVersion);
 
         it = pendingConnects_.erase(it);
     }
+}
+
+// ---------------------------------------------------------------------------
+// client<->broker TLS/AEAD (Task 7): handleHandshakeContinue_ — a later leg
+// of a multi-round TLS handshake, after handleConnect/pollPendingConnects
+// started it on the ConnectResponse leg.  The session this concerns has NOT
+// been promoted to sessions_ yet (it's still a PendingConnect with
+// awaitingHandshake==true) — this is the ONLY other place besides
+// pollPendingConnects that may promote one.  Linear scan over pendingConnects_
+// (a deque bounded by kMaxPendingConnects==64) keyed by sessionId.  Unknown
+// sessionId / decode failure / no matching awaiting-handshake entry → drop,
+// never crash (same contract as every other dispatch handler).
+// ---------------------------------------------------------------------------
+void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len, int64_t nowNs)
+{
+    auto hcOpt = pc::HandshakeContinue::decode(buf, len);
+    if (!hcOpt) return;  // truncated — drop
+    const auto& hc = *hcOpt;
+
+    auto it = pendingConnects_.begin();
+    for (; it != pendingConnects_.end(); ++it) {
+        if (it->sessionId == hc.sessionId && it->awaitingHandshake) break;
+    }
+    if (it == pendingConnects_.end()) return;  // stale/unknown — drop (client retries are safe: no-op)
+
+    PendingConnect& pending = *it;
+    // Defensive: awaitingHandshake is only ever set together with tls
+    // engaged (pollPendingConnects); a missing tls here would be a logic bug
+    // elsewhere, not a peer-triggerable condition — drop rather than crash.
+    if (!pending.tls || !pending.resolvedPub) return;
+
+    const auto hs = pending.tls->readInbound(
+        reinterpret_cast<const uint8_t*>(hc.handshakeBytes.data()), hc.handshakeBytes.size());
+    if (hs == rune::crypto::HsState::Failed) {
+        pc::HandshakeContinueResponse fail;
+        fail.sessionId     = pending.sessionId;
+        fail.correlationId = hc.correlationId;
+        fail.code          = static_cast<int16_t>(pc::ErrorCode::HandshakeFailed);
+        const std::size_t need = fail.encodedSize();
+        if (need <= scratch_.size()) {
+            (void)sendOnPub(*pending.resolvedPub, scratch_.data(), fail.encode(scratch_.data()));
+        }
+        closeDroppedPendingConnect_(pending);  // Task 13: close-everywhere for an announced-but-never-accepted session
+        pendingConnects_.erase(it);
+        return;
+    }
+
+    drainHandshakeOutbound_(pending);
+    if (!pending.hsBytes.empty()) {
+        pc::HandshakeContinueResponse cont;
+        cont.sessionId     = pending.sessionId;
+        cont.correlationId = hc.correlationId;
+        cont.code          = static_cast<int16_t>(pc::ErrorCode::OK);
+        cont.handshakeBytes = std::string_view(
+            reinterpret_cast<const char*>(pending.hsBytes.data()), pending.hsBytes.size());
+        const std::size_t need = cont.encodedSize();
+        if (need <= scratch_.size()) {
+            // Best-effort (matches the rest of the connect-leg sends in this
+            // file, which stash-and-retry via pollPendingConnects; a dropped
+            // HandshakeContinueResponse here just means the client's own
+            // connect-timeout retries the leg — bounded, never silent data
+            // corruption, since no keys are installed until done() below).
+            (void)sendOnPub(*pending.resolvedPub, scratch_.data(), cont.encode(scratch_.data()));
+        } else {
+            spdlog::warn("ClientGateway: HandshakeContinueResponse too large ({}B) for session={}; dropping leg",
+                         need, pending.sessionId);
+        }
+    }
+
+    if (!pending.tls->done()) return;  // more legs to come
+
+    // client<->broker TLS/AEAD (Task 7): exportKeys's documented fail-closed
+    // sentinel — Cipher::None means "do not trust these keys", never install
+    // an all-zero AeadCipher.
+    const rune::crypto::SessionKeys keys = pending.tls->exportKeys(pending.chosenCipher, pending.sessionId);
+    if (keys.cipher == rune::crypto::Cipher::None) {
+        pc::HandshakeContinueResponse fail;
+        fail.sessionId     = pending.sessionId;
+        fail.correlationId = hc.correlationId;
+        fail.code          = static_cast<int16_t>(pc::ErrorCode::HandshakeFailed);
+        const std::size_t need = fail.encodedSize();
+        if (need <= scratch_.size()) {
+            (void)sendOnPub(*pending.resolvedPub, scratch_.data(), fail.encode(scratch_.data()));
+        }
+        closeDroppedPendingConnect_(pending);
+        pendingConnects_.erase(it);
+        return;
+    }
+
+    // ★ DIRECTION MAPPING (task-7-interfaces.md) — the broker is the mirror
+    // of the client: recv OPENS client->broker ingress (c2b/c2bPrefix), send
+    // SEALS broker->client egress (b2c/b2cPrefix).  Getting this backwards
+    // makes the handshake "succeed" with matching keys while every data-plane
+    // AEAD op fails.
+    Session& session = sessions_.add(pending.sessionId, std::move(pending.resolvedPub), nowNs,
+                                      pending.egressChannel, pending.egressStreamId,
+                                      pending.clientVersion);
+    session.crypto.cipher = keys.cipher;
+    session.crypto.recv.emplace(keys.cipher, keys.c2b, keys.c2bPrefix);  // OPENs client->broker
+    session.crypto.send.emplace(keys.cipher, keys.b2c, keys.b2cPrefix);  // SEALs broker->client
+    session.crypto.encrypted = true;
+
+    pendingConnects_.erase(it);
 }
 
 // ---------------------------------------------------------------------------

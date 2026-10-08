@@ -59,6 +59,36 @@ else()
     target_compile_definitions(rune_fr PUBLIC RUNE_FR=0)
 endif()
 
+# ── rune-crypto — client<->broker TLS/AEAD (Task 7) ──────────────────────────
+# Consumed as a SIBLING source lib, exactly like rune-fr/rune-codec above (no
+# conan publish gate yet).  Header-first (TlsSession.h/Aead.h/Cipher.h) + 3
+# small .cpp.
+#
+# ★ BUILD/LINKAGE TRAP (task-7-interfaces.md, Task-5 precedent on the client
+#   side): rune/gateway/SessionTable.h is already part of rune_gateway's
+#   PUBLIC interface (it includes <Aeron.h>) and now also includes
+#   rune/crypto/Aead.h + Cipher.h for Session::CryptoState.  Every downstream
+#   target that compiles a TU including SessionTable.h/ClientGateway.h
+#   therefore needs rune_crypto's include dir transitively — rune_node does
+#   (BrokerNode.h/NodeRuntimeAgent.h/GroupCoordinationService.cpp/
+#   TransactionCoordinationService.cpp all #include ClientGateway.h directly;
+#   so do several libs/node/tests/integration/*.cpp).  rune_crypto + OpenSSL
+#   are therefore linked PUBLIC on rune_gateway below (never PRIVATE — that
+#   was exactly the client's Task-5 fix-round-1 Critical).  rune_node already
+#   links rune_gateway PUBLIC (see its CMakeLists.txt), so the PUBLIC chain
+#   propagates to rune_broker and every test/benchmark executable without any
+#   further change here.
+find_package(OpenSSL REQUIRED)
+set(RUNE_CRYPTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-crypto"
+    CACHE PATH "Path to the rune-crypto sibling repo")
+add_library(rune_crypto STATIC
+    ${RUNE_CRYPTO_ROOT}/src/Caps.cpp
+    ${RUNE_CRYPTO_ROOT}/src/Aead.cpp
+    ${RUNE_CRYPTO_ROOT}/src/TlsSession.cpp)
+target_include_directories(rune_crypto PUBLIC ${RUNE_CRYPTO_ROOT}/include)
+target_link_libraries(rune_crypto PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+target_compile_features(rune_crypto PUBLIC cxx_std_23)
+
 # ── rune_gso — UDP GSO/GRO Aeron transport bindings ──────────────────────────
 # rune-protocol sibling C source (spec 2026-10-03-aeron-udp-gso-gro).  Linux does GSO/GRO; other platforms
 # compile a no-op (create() returns NULL -> stock Aeron).
