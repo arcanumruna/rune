@@ -30,6 +30,8 @@ services:
       RUNE_PEERS: "0@rune-1:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200},1@rune-2:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200},2@rune-3:${CONSENSUS_PORT:-40111}:${CLIENT_PORT:-40200}"
       RUNE_CLIENT_ENDPOINT: "0.0.0.0:${CLIENT_PORT:-40200}"
       RUNE_DATA_DIR: /var/lib/rune
+      # Container /dev/shm budget: 48 MiB per log at the 16 MiB default term.
+      RUNE_AERON_TERM_BUFFER_BYTES: "${RUNE_AERON_TERM_BUFFER_BYTES:-4194304}"
       # --- optional (defaults shown) ---
       RUNE_CLIENT_STREAM_ID: "${RUNE_CLIENT_STREAM_ID:-1}"
       RUNE_CONSENSUS_STREAM_ID: "${RUNE_CONSENSUS_STREAM_ID:-10}"

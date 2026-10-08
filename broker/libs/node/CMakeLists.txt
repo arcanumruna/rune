@@ -1,12 +1,32 @@
 add_library(rune_node
     src/NodeConfig.cpp
     src/BrokerNode.cpp
+    src/EmbeddedDriver.cpp
+    src/PeerResolverHub.cpp
+    src/HostDefaults.cpp
+    src/FdBudget.cpp
+    src/ShardAgent.cpp
     src/ReplicationMetadataBridge.cpp
     src/GroupCoordinationService.cpp
     src/TransactionCoordinationService.cpp
+    src/SchemaRegistry.cpp
+    src/AdminWorker.cpp)
+
+# The worker's io backends, as their own leaf library: Worker.h's header-inline
+# code (instantiated by rune_replication's AeronPartitionTransport.cpp too) calls
+# UringFlushBackend::submit/submitFadvise, so rune_replication must link these
+# symbols without linking rune_node (which depends on it).  Linux-only failure
+# before (macOS compiles UringFlushBackend.cpp to an empty TU): replication-only
+# test executables did not link.
+add_library(rune_io_backend
     src/PortableFlushBackend.cpp
     # UringFlushBackend.cpp compiles to an empty TU on non-Linux (#ifdef __linux__).
     src/UringFlushBackend.cpp)
+target_include_directories(rune_io_backend PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    ${RUNE_PROTOCOL_INCLUDE})
+target_link_libraries(rune_io_backend PUBLIC rune_consensus spdlog::spdlog)
+target_link_libraries(rune_node PUBLIC rune_io_backend)
 # E5.1.2d: ProducePath.cpp was moved from libs/gateway/src/ to libs/storage/src/
 # (compiled into rune_storage, a true leaf lib). Both rune_gateway and rune_node
 # depend on rune_storage, so the circular-dep workaround is eliminated.
@@ -23,7 +43,7 @@ target_include_directories(rune_node PUBLIC
 #   now ODR-used via MetadataService::reassignDeadPartitionLeaders from NodeRuntimeAgent)
 target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordination rune_transaction rune_metadata_msm rune_static_balancer rune_dynamic_balancer)
 if(aeron_FOUND)
-    target_link_libraries(rune_node PUBLIC aeron::aeron rune_replication_aeron)
+    target_link_libraries(rune_node PUBLIC aeron::aeron rune_replication_aeron rune_aeron_util)
     # Aeron's embedded media driver calls uuid_generate() from libuuid on Linux;
     # macOS provides it in system libs and the ConanCenter aeron recipe doesn't
     # propagate it. Link it PUBLIC so every driver-embedding consumer (rune_broker
@@ -37,6 +57,36 @@ endif()
 # spdlog is PUBLIC because Worker.h (a PUBLIC header) uses spdlog calls inline.
 # E2 inc2a: Worker.h was extended with inline execute methods that log via spdlog.
 target_link_libraries(rune_node PUBLIC spdlog::spdlog)
+# UDP GSO/GRO Aeron transport bindings (EmbeddedDriver, HostDefaults probe).
+target_link_libraries(rune_node PUBLIC rune_gso)
+
+# A7 park-until-work + epoll-first polling (review L4: ONE copy, shared with rune-client-cpp): the rune-protocol
+# sibling C source, like rune_gso.  Aeron's internal driver headers are C; they include siblings relative to
+# <root>, <root>/aeron, <root>/aeronmd (same probe as rune_gso).  Non-Linux compiles a stub (0 fds -> timed park).
+add_library(rune_driver_wake STATIC ${RUNE_PROTOCOL_INCLUDE}/../src/net/rune_driver_wake.c)
+set_target_properties(rune_driver_wake PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
+target_include_directories(rune_driver_wake PUBLIC ${RUNE_PROTOCOL_INCLUDE})
+if(UNIX AND NOT APPLE)
+    target_link_libraries(rune_driver_wake PRIVATE aeron::aeron)
+    foreach(_rune_aeron_inc IN LISTS aeron_INCLUDE_DIRS)
+        target_include_directories(rune_driver_wake PRIVATE
+            "${_rune_aeron_inc}" "${_rune_aeron_inc}/aeron" "${_rune_aeron_inc}/aeronmd")
+    endforeach()
+endif()
+target_link_libraries(rune_node PUBLIC rune_driver_wake)
+
+# DR-15 fix round 1: the embedded drivers' cache-only peer name resolver (C glue over Aeron's internal
+# name-resolver vtable; the cache is C++ PeerResolutionInbox).  Every platform (it is not a Linux feature).
+add_library(rune_peer_name_resolver STATIC src/c/rune_peer_name_resolver.c)
+set_target_properties(rune_peer_name_resolver PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON
+                      POSITION_INDEPENDENT_CODE ON)
+target_include_directories(rune_peer_name_resolver PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(rune_peer_name_resolver PRIVATE aeron::aeron)
+foreach(_rune_aeron_inc IN LISTS aeron_INCLUDE_DIRS)
+    target_include_directories(rune_peer_name_resolver PRIVATE
+        "${_rune_aeron_inc}" "${_rune_aeron_inc}/aeron" "${_rune_aeron_inc}/aeronmd")
+endforeach()
+target_link_libraries(rune_node PUBLIC rune_peer_name_resolver)
 
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
@@ -54,20 +104,121 @@ if(BUILD_TESTING)
     # not stopped at first). A real rune-side race still fails the build either way.
     set(RUNE_TSAN_AERON_SUPP
         "${CMAKE_SOURCE_DIR}/cmake/tsan-aeron.supp")
+
+    # Task 13 (spec §3.4): worker-side ack sink + announce-before-accept (no driver).
+    add_executable(rune_session_ack_sink_tests tests/node/SessionAckSinkTest.cpp)
+    target_link_libraries(rune_session_ack_sink_tests PRIVATE rune_node GTest::gtest_main)
+    gtest_discover_tests(rune_session_ack_sink_tests)
+    add_executable(rune_session_announcer_tests tests/node/SessionAnnouncerTest.cpp)
+    target_link_libraries(rune_session_announcer_tests PRIVATE rune_node rune_metadata GTest::gtest_main)
+    gtest_discover_tests(rune_session_announcer_tests)
+    if(UNIX AND NOT APPLE)
+        # Real-driver UDP GSO/GRO bindings tests (Linux kernels only: UDP_SEGMENT/UDP_GRO).
+        add_executable(rune_udp_gso_tests tests/node/UdpGsoBindingsTest.cpp)
+        target_link_libraries(rune_udp_gso_tests PRIVATE rune_gso rune_node aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_udp_gso_tests)
+    endif()
     set(RUNE_AERON_TSAN_ENV
         "TSAN_OPTIONS=halt_on_error=1 suppressions=${RUNE_TSAN_AERON_SUPP}")
 
-    # Unit tests (NodeConfig + PortableFlushBackend + OneToOneByteRing + WorkerWire)
+    # Unit tests (NodeConfig + PortableFlushBackend + OneToOneByteRing + SchemaCodecSmoke + SchemaRegistry + AdminWorker)
     add_executable(rune_node_tests
         tests/node/NodeConfigTest.cpp
+        tests/node/HostDefaultsTest.cpp
+        tests/node/FdBudgetTest.cpp
         tests/node/PortableFlushBackendTest.cpp
         tests/node/OneToOneByteRingTest.cpp
+        tests/node/SchemaCodecSmokeTest.cpp
+        tests/node/SchemaRegistryTest.cpp
+        tests/node/AdminWorkerTest.cpp
+        tests/node/SignalControlTest.cpp
+        tests/node/LeaderObserverTest.cpp
+        tests/node/OwnerThreadTestTaskTest.cpp
+        tests/node/ThreadAffinityTest.cpp
+        tests/node/ParkUntilWorkIdleTest.cpp
+        tests/node/RingDoorbellTest.cpp
         )
     target_link_libraries(rune_node_tests PRIVATE
         rune_node
+        rune_codec
         GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_node_tests)
+
+    # ---------------------------------------------------------------------------
+    # E5 Task 2: WorkerReplicationValidator unit tests — pure symmetric-worker-count
+    # validator (header-only, no Aeron required).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_worker_replication_validator_tests
+        tests/node/WorkerReplicationValidatorTest.cpp)
+    target_link_libraries(rune_worker_replication_validator_tests PRIVATE
+        rune_node
+        GTest::gtest_main)
+    gtest_discover_tests(rune_worker_replication_validator_tests)
+
+    # ---------------------------------------------------------------------------
+    # E5 Task 5: PerWorkerReplicationWiring unit tests — BrokerNode wiring logic.
+    #
+    # Tests:
+    #   1. FlagOffUsesLegacyTransportForAll — zero planes; legacy for all.
+    #   2. FlagOnUserPartsOnPlanesInternalOnLegacy — W planes; user→plane; internal→legacy.
+    #   3. *Regression*: MismatchedPeerWorkerCountRefusesStart — THROWS.
+    #   4. *Regression*: UnresolvedPlaneAbortsStart — THROWS.
+    #   5. SingleNodeNoPeersSkipsPlaneConstruction — no planes on single-node.
+    #   6. WorkerReplicationTransportPointerRoundTrip — pointer type compiles.
+    #
+    # Test seam: FakePubRegistry (inline) injected via WorkerReplicationTransportImpl<>.
+    # WorkerReplicationTransport.h includes Aeron headers → gated behind aeron_FOUND.
+    # No Aeron driver started, no filesystem, no network.
+    # ---------------------------------------------------------------------------
+    if(aeron_FOUND)
+        add_executable(rune_per_worker_replication_wiring_tests
+            tests/node/PerWorkerReplicationWiringTest.cpp)
+        target_link_libraries(rune_per_worker_replication_wiring_tests PRIVATE
+            rune_node
+            rune_replication
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_per_worker_replication_wiring_tests)
+    endif()
+
+    # ---------------------------------------------------------------------------
+    # E5 Task 3: WorkerReplicationTransport unit tests — send path (per-worker
+    # sub + per-peer pubs, direct-claim encode).
+    #
+    # Tests (no Aeron driver required):
+    #   1. SendFetchResponseSelectsPeerPubAndEncodesFrame — exact peer routing +
+    #      byte-identical SBE frame (round-trip decode).
+    #   2. SendFetchRequestBroadcastsToAllPeers — sendFetchRequest hits ALL peers.
+    #   3. SendOleRequestRoutesToLeader — OLE request to single target peer.
+    #   4. SendOleResponseRoutesToFollower — OLE response to single target peer.
+    #   5. SendReconcileRequestStampsReconcileTemplateId — FetchRequest +
+    #      ReconcileFetchReq templateId in place.
+    #   6. SendReconcileResponseStampsReconcileTemplateId — FetchResponse +
+    #      ReconcileFetchResp templateId in place.
+    #   7. ResolvedTrueWhenFakeRegistryHasPeers — resolved() gate.
+    #   8. SendFetchResponseEmptyRecords — HW-only update (zero records).
+    #   9. SendFetchRequestBroadcastsToThreePeers — 3-peer broadcast regression.
+    #  10. WorkerIdAccessor — workerId() returns configured id.
+    #
+    # Test seam: FakePubRegistry (SharedFakePubRegistry) injected via the
+    # WorkerReplicationTransportImpl<PubRegistry> template — no Aeron driver.
+    # The WorkerReplicationTransport.h header includes Aeron headers (tryClaim
+    # etc.) so the target must link aeron::aeron for include-path resolution.
+    # Gated behind aeron_FOUND (not BUILD_BROKER_NODE_TESTS: no driver started).
+    # ---------------------------------------------------------------------------
+    if(aeron_FOUND)
+        add_executable(rune_worker_replication_transport_tests
+            tests/node/WorkerReplicationTransportTest.cpp
+            tests/node/ReplicaTransportKindTest.cpp
+            tests/node/F27SendNeverDroppedRegressionTest.cpp)
+        target_link_libraries(rune_worker_replication_transport_tests PRIVATE
+            rune_node
+            rune_replication
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_worker_replication_transport_tests)
+    endif()
 
     # ---------------------------------------------------------------------------
     # E5.1.2b: ProducePathTest — unit tests for the shared handleProduceBatch
@@ -308,6 +459,74 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # Task 6: SchemaPersistenceTest — __topic_schemas log + AdminWorker wiring.
+    #
+    # Tests (on-host, no Aeron / media driver):
+    #   1. SchemaRecord_LandsInLog
+    #   2. RebuildFromLog_RecoveryAfterRestart
+    #   3. DuplicateDefineTopic_IdempotentOnLog
+    #   4. ValidateTrue_PushValidatorsCalled
+    #   5. Regression_RULING1_TopicIdIsReturnedByCreateTopic
+    #
+    # NOT tested here (Docker-gated / Task 8):
+    #   - majority-durable commit (Aeron follower replicas required)
+    #   - full client DDL e2e (gateway required)
+    # ---------------------------------------------------------------------------
+    add_executable(rune_schema_persistence_tests
+        tests/integration/SchemaPersistenceTest.cpp)
+    target_include_directories(rune_schema_persistence_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_schema_persistence_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_schema_persistence_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
+    # Task 8a: SchemaGatewayTest — gateway → admin ring → replica → response
+    # DDL round-trip (RULING-2 E/F), plus SchemaGatewayRegression.DdlDoesNotBlockProduce.
+    # On-host (no Aeron); real-Aeron majority-durable + failover deferred to 8b.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_schema_gateway_tests
+        tests/integration/SchemaGatewayTest.cpp)
+    target_include_directories(rune_schema_gateway_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_schema_gateway_tests PRIVATE
+        rune_node
+        rune_gateway
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_schema_gateway_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
+    # Task 7: ProduceValidationTest — per-worker schema validation hook.
+    #
+    # Tests (on-host, no Aeron / media driver):
+    #   1. SchemaUpdate_Regression_ValidatorInstalledOnWorkerThread
+    #   2. SchemaUpdate_Regression_WellFormedRecord_AppendProceeds
+    #   3. SchemaUpdate_Regression_MalformedRecord_ValidationFailed
+    #   4. SchemaUpdate_Regression_BadEnumRecord_ValidationFailed
+    #   5. SchemaUpdate_Regression_NoValidator_FallsThrough
+    #
+    # Uses InMemoryLog + Worker directly (no Aeron required).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_produce_validation_tests
+        tests/integration/ProduceValidationTest.cpp)
+    target_include_directories(rune_produce_validation_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_produce_validation_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_produce_validation_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
     # MD1 Task 4: MetadataService / MetadataStateMachine replication integration
     # tests — 5 test cases:
     #   1. SingleNode: HW-gated visibility.
@@ -373,6 +592,29 @@ if(BUILD_TESTING)
         rune_replication
         GTest::gtest_main)
     gtest_discover_tests(rune_static_assignment_emit_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
+    # Task 8b (RULING-4, SINGLE-NODE): RuntimeTopicReplica integration test — a
+    # RUNTIME-defined topic (DefineTopic → AdminWorker → control-hook createTopic)
+    # becomes produce/consume-capable because the control thread creates +
+    # registers its user PartitionReplica and emits its assignment so the bridge
+    # promotes it to Leader.  Proves: register replica (bumps generation) →
+    # addRuntimeTopic emits assignment → bridge promotes to Leader → produce
+    # appends (LEO advances) → consume reads back.  Uses InMemoryTransport (no
+    # Aeron); the full real-Aeron socket e2e is Task 13 (Docker).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_runtime_topic_replica_tests
+        tests/integration/RuntimeTopicReplicaTest.cpp)
+    target_include_directories(rune_runtime_topic_replica_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_runtime_topic_replica_tests PRIVATE
+        rune_node
+        rune_metadata_msm
+        rune_static_balancer
+        rune_replication
+        GTest::gtest_main)
+    gtest_discover_tests(rune_runtime_topic_replica_tests
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
@@ -529,6 +771,40 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 
     # ---------------------------------------------------------------------------
+    # Duty-pass latency gate (*LatencyGate* + *Regression*): drives the REAL
+    # production worker duty pass (shard-mode Worker + fused NodeRuntimeAgent)
+    # while the real off-thread LogCleanerAgent rolls / retains / compacts /
+    # truncates, and fails when the pass MAX or p99.9 exceeds the per-build-type
+    # budget (Release vs Debug constants in the test).  RUN_SERIAL: a latency
+    # measurement must not share the host with other test processes.
+    # Benchmark mode: RUNE_LATENCY_GATE_BENCH=1 (prints, never fails).
+    # No Aeron required.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_duty_pass_latency_gate_tests
+        tests/integration/DutyPassLatencyGateTest.cpp)
+    target_link_libraries(rune_duty_pass_latency_gate_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        rune_transaction
+        GTest::gtest_main)
+    gtest_discover_tests(rune_duty_pass_latency_gate_tests
+        PROPERTIES TIMEOUT 1800 RUN_SERIAL TRUE)
+
+    # Hot-path B (2026-10-05): deterministic regressions behind the latency-gate
+    # findings F5 / F7 / F8 (PushRead zero-copy + per-pass bound, async epoch
+    # durability, TruncatePending pass cost).  No Aeron required.
+    add_executable(rune_hotpath_b_regression_tests
+        tests/integration/HotPathBRegressionTest.cpp)
+    target_link_libraries(rune_hotpath_b_regression_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        rune_transaction
+        GTest::gtest_main)
+    gtest_discover_tests(rune_hotpath_b_regression_tests)
+
+    # ---------------------------------------------------------------------------
     # CP-9: RetentionCleanerAgent integration tests — separate cleaner-cadence
     #   retention: time (largestTimestamp), size, log-start-offset; async delete
     #   (.deleted rename + delayed physical remove); retention off append thread;
@@ -565,9 +841,65 @@ if(BUILD_TESTING)
                 rune_node
                 aeron::aeron
                 GTest::gtest_main)
+            # RESOURCE_LOCK rune_udp_ports: these tests start real BrokerNodes /
+            # transports binding UDP ports (incl. discovered ephemeral ports for
+            # the F3 e2e client) — the same TOCTOU port race as the other UDP
+            # suites (seen under ctest -j2: a shard suite's discovered gateway
+            # port was taken concurrently → "Address already in use").
             gtest_discover_tests(rune_broker_node_tests
-                PROPERTIES TIMEOUT 60
+                PROPERTIES TIMEOUT 60 RESOURCE_LOCK rune_udp_ports
                 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # EmbeddedDriver: one driver, one pumping thread (spec §3.6).
+            add_executable(rune_embedded_driver_tests tests/node/EmbeddedDriverTest.cpp)
+            target_link_libraries(rune_embedded_driver_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_embedded_driver_tests
+                PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            add_executable(rune_aeron_pump_tests tests/node/AeronPumpInvokerTest.cpp
+                tests/node/UnresolvedPeerRegressionTest.cpp)
+            target_link_libraries(rune_aeron_pump_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_aeron_pump_tests PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # A9: worker ring doorbells (op / session / ret_ space wait), parked shard runner wake,
+            # ADMIN_ACTION retry on worker claims — REAL invoker driver.
+            add_executable(rune_worker_doorbell_tests tests/node/WorkerDoorbellTest.cpp)
+            target_link_libraries(rune_worker_doorbell_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_worker_doorbell_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            add_executable(rune_shard_agent_tests tests/node/ShardAgentTest.cpp)
+            target_link_libraries(rune_shard_agent_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_shard_agent_tests PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # Task 13 (spec §3.4): worker-side acks on the worker's own session
+            # publication, REAL invoker driver over aeron:ipc.
+            add_executable(rune_shard_worker_ack_tests tests/node/ShardWorkerAckTest.cpp)
+            target_link_libraries(rune_shard_worker_ack_tests PRIVATE rune_node rune_replication rune_codec aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_shard_worker_ack_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # D8c: credit-based gateway pause of a slow gateway-routed client — a
+            # real gateway in front of a real worker with worker-side acks.
+            add_executable(rune_gateway_produce_credit_tests tests/integration/GatewayProduceCreditTest.cpp)
+            target_link_libraries(rune_gateway_produce_credit_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_gateway_produce_credit_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # Spec §3.1 never-block: follower flush / owned-log sync / Strict tier
+            # go through the worker's io backend; background-token routing.
+            add_executable(rune_shard_nonblocking_tests tests/integration/ShardNonBlockingTest.cpp)
+            target_link_libraries(rune_shard_nonblocking_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_shard_nonblocking_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # F15 (EOS marker / LSO correctness): S0 failing *Regression* tests
+            # (design note 2026-10-01-f15-eos-marker-lso-design.md).
+            add_executable(rune_f15_eos_regression_tests tests/integration/F15EosRegressionTest.cpp)
+            target_link_libraries(rune_f15_eos_regression_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_f15_eos_regression_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # D9 (cross-node transaction markers): gateway unit + 3-node
+            # in-process integration over the real cluster-plane transport.
+            add_executable(rune_d9_cross_node_marker_tests tests/integration/D9CrossNodeMarkerTest.cpp)
+            target_link_libraries(rune_d9_cross_node_marker_tests PRIVATE rune_node rune_replication aeron::aeron GTest::gtest_main)
+            gtest_discover_tests(rune_d9_cross_node_marker_tests PROPERTIES TIMEOUT 120 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # RoleCounter publish→read integration test: BrokerNode publishes the
             # Aeron node-role/term counters; CncFileReader reads them back (the
@@ -897,6 +1229,71 @@ if(BUILD_TESTING)
     endif()
 
     # ---------------------------------------------------------------------------
+    # DUR-1 round-4 follow-up LOW-B: the consensus candidacy gate + template-58
+    # knowledge exchange + internal-ISR term source driven end to end over real
+    # Aeron (in-process BrokerNodes on loopback, no Docker).  *Regression*.
+    # ---------------------------------------------------------------------------
+    if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
+        add_executable(rune_consensus_candidacy_tests
+            tests/integration/ConsensusCandidacyElectionTest.cpp)
+        target_include_directories(rune_consensus_candidacy_tests PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_consensus_candidacy_tests PRIVATE
+            rune_node
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_consensus_candidacy_tests
+            PROPERTIES TIMEOUT 180 RESOURCE_LOCK rune_udp_ports)
+    endif()
+
+    # ---------------------------------------------------------------------------
+    # E5 Task 7: PerWorkerReplicationTest — in-process per-worker replication
+    # integration + failover suite (perWorkerReplication flag ON).
+    #
+    # 3 BrokerNodes with perWorkerReplication=true, workerCount=2, replBaseStreamId=200.
+    # Real aeron:udp — no Docker, no InMemoryTransport.
+    #
+    # Tests:
+    #   AcksAllThreeNodeReplicatesAndCommits — FetchRequest(1)/FetchResponse(2) E2E.
+    #   RollingLeaderKillNoCommittedLossRegression (*Regression*) — OLE+reconcile(3-6).
+    #   EpochChangeTruncatesDivergentTailOnly — divergent-tail truncation path.
+    #
+    # RESOURCE_LOCK rune_udp_ports: same ephemeral-port TOCTOU concern as GR-7.
+    # ---------------------------------------------------------------------------
+    if(BUILD_NODE_UDP_TESTS AND aeron_FOUND)
+        add_executable(rune_per_worker_replication_integration_tests
+            tests/integration/PerWorkerReplicationTest.cpp)
+        target_link_libraries(rune_per_worker_replication_integration_tests PRIVATE
+            rune_node
+            aeron::aeron
+            GTest::gtest_main)
+        gtest_discover_tests(rune_per_worker_replication_integration_tests
+            PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+
+        # Self-contained worker shards (spec §3.1): per-worker invoker driver +
+        # client, ShardAgent pass, shard replication planes over real UDP.
+        add_executable(rune_shard_mode_tests tests/integration/ShardModeTest.cpp)
+        target_include_directories(rune_shard_mode_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_shard_mode_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_shard_mode_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+
+        # Leader-epoch monotonicity across restarts (Kafka parity): full cold
+        # restart, single-node restart, stale same-epoch tail on a follower.
+        add_executable(rune_epoch_restart_tests tests/integration/EpochRestartRegressionTest.cpp)
+        target_include_directories(rune_epoch_restart_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_epoch_restart_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_epoch_restart_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+
+        # Controlled shutdown (Kafka parity): a gracefully stopping node hands
+        # its partitions (and the controller its consensus leadership) off
+        # before it exits.
+        add_executable(rune_controlled_shutdown_e2e_tests tests/integration/ControlledShutdownRegressionTest.cpp)
+        target_include_directories(rune_controlled_shutdown_e2e_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_controlled_shutdown_e2e_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_controlled_shutdown_e2e_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+    endif()
+
+    # ---------------------------------------------------------------------------
     # TX-2b fix round 1 (A): HW-bound unit test — no Aeron required.
     #
     # DivergentTail_HWBoundRebuild_NoFalseDuplicate:
@@ -913,6 +1310,8 @@ if(BUILD_TESTING)
         tests/integration/GatewayPsmFailoverTest.cpp)
     target_compile_definitions(rune_psm_hw_bound_tests PRIVATE
         TX2B_UNIT_ONLY=1)
+    target_include_directories(rune_psm_hw_bound_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/libs/aeronutil/include)   # header-only testing/FreePort.h
     target_link_libraries(rune_psm_hw_bound_tests PRIVATE
         rune_storage
         GTest::gtest_main)

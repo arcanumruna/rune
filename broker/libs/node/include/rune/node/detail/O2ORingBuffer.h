@@ -23,6 +23,12 @@
 // Threading: EXACTLY ONE producer thread may call tryClaim()/write(); EXACTLY ONE
 // consumer thread may call read()/controlledRead().  claimCapacity() is
 // single-producer (no CAS — the producer owns the tail).
+//
+// A9 doorbells (RingDoorbell.h): optional, set at startup before either thread runs.
+//   consumer doorbell — commit() rings the consumer's doorbell iff it is parking (fence + load otherwise);
+//   producer doorbell — a producer refused for space arms the want-space word (tryClaim does it itself, and
+//                       re-claims once; armSpaceWait for other space gates); the consumer rings the producer's
+//                       doorbell after it frees space iff the word was set.
 
 #include <climits>
 #include <cstdint>
@@ -33,6 +39,10 @@
 #include <util/BitUtil.h>
 #include <util/Index.h>
 #include <util/Exceptions.h>
+#include <rune/consensus/detail/TsanAnnotations.h>
+#include <rune/node/detail/RingDoorbell.h>
+
+#include <atomic>
 
 namespace rune::node::detail {
 
@@ -84,8 +94,18 @@ public:
 
         const aeron::util::index_t recordLength =
             static_cast<aeron::util::index_t>(length) + RD::RecordDescriptor::HEADER_LENGTH;
-        const aeron::util::index_t recordIndex = claimCapacity(recordLength);
-        if (INSUFFICIENT_CAPACITY == recordIndex) return recordIndex;
+        aeron::util::index_t recordIndex = claimCapacity(recordLength);
+        if (INSUFFICIENT_CAPACITY == recordIndex) [[unlikely]] {
+            // A9 review M-2: a refused producer with a doorbell arms the space wait, then re-checks by
+            // claiming again (Dekker: the consumer advances its head, fences, then reads the word).  A refusal
+            // returned from here therefore always leaves the word set: the consumer's next read rings the
+            // producer's doorbell — every producer retry loop ("retry next cycle") wakes on freed space.
+            if (m_producerBell == nullptr) return recordIndex;
+            armSpaceWait();
+            recordIndex = claimCapacity(recordLength);
+            if (INSUFFICIENT_CAPACITY == recordIndex) return recordIndex;
+            disarmSpaceWait();
+        }
 
         m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
         std::atomic_thread_fence(std::memory_order_release);
@@ -95,10 +115,49 @@ public:
 
     /// Publish a message previously reserved with tryClaim().
     void commit(aeron::util::index_t index) {
+        commitWithoutNotifyForTest(index);
+        if (m_consumerBell != nullptr) m_consumerBell->ringIfParked();   // A9
+    }
+
+    /// commit()'s publish step alone (tests interleave a parking consumer between publish and notify;
+    /// production always calls commit()).
+    void commitWithoutNotifyForTest(aeron::util::index_t index) {
         namespace RD = aeron::concurrent::ringbuffer;
         const aeron::util::index_t recordIndex = computeRecordIndex(index);
         const std::int32_t recordLength = verifyClaimedSpaceNotReleased(recordIndex);
+        RUNE_TSAN_RELEASE(m_buffer.buffer() + recordIndex);
         m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
+    }
+    /// commit()'s notify step alone (tests only).
+    void notifyConsumerForTest() noexcept {
+        if (m_consumerBell != nullptr) m_consumerBell->ringIfParked();
+    }
+
+    // ------------------------------------------------------------------
+    // A9 doorbells (startup only: set before the producer / consumer threads run).
+    // ------------------------------------------------------------------
+
+    void setConsumerDoorbell(RingDoorbell* bell) noexcept { m_consumerBell = bell; }
+    void setProducerDoorbell(RingDoorbell* bell) noexcept { m_producerBell = bell; }
+    [[nodiscard]] bool hasConsumerDoorbell() const noexcept { return m_consumerBell != nullptr; }
+    [[nodiscard]] bool hasProducerDoorbell() const noexcept { return m_producerBell != nullptr; }
+
+    /// What the consumer's doorbell watches (committed record at the head).
+    [[nodiscard]] RingWatch watch() noexcept {
+        return RingWatch{m_buffer.buffer(), m_buffer.capacity(), m_capacity, m_headPositionIndex};
+    }
+
+    /// Producer, refused for space: announce it.  The caller MUST re-check its space condition after this
+    /// call (Dekker: the consumer frees space, fences, then reads the word) — if space is there now, run
+    /// again instead of parking.
+    void armSpaceWait() noexcept {
+        m_spaceWanted.store(1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+    /// Producer: no longer waiting for space.
+    void disarmSpaceWait() noexcept { m_spaceWanted.store(0, std::memory_order_relaxed); }
+    [[nodiscard]] bool spaceWaitArmedForTest() const noexcept {
+        return m_spaceWanted.load(std::memory_order_relaxed) != 0;
     }
 
     /// Discard a message previously reserved with tryClaim() (becomes padding).
@@ -106,6 +165,7 @@ public:
         namespace RD = aeron::concurrent::ringbuffer;
         const aeron::util::index_t recordIndex = computeRecordIndex(index);
         const std::int32_t recordLength = verifyClaimedSpaceNotReleased(recordIndex);
+        RUNE_TSAN_RELEASE(m_buffer.buffer() + recordIndex);
         m_buffer.putInt32(RD::RecordDescriptor::typeOffset(recordIndex),
                           RD::RecordDescriptor::PADDING_MSG_TYPE_ID);
         m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
@@ -144,7 +204,9 @@ public:
         ScopeExit cleanup([&]() {
             if (bytesRead != 0) {
                 m_buffer.setMemory(headIndex, static_cast<std::size_t>(bytesRead), 0);
+                RUNE_TSAN_RELEASE(m_buffer.buffer() + headPositionIndex);
                 m_buffer.putInt64Ordered(headPositionIndex, head + bytesRead);
+                notifySpace_();
             }
         });
 
@@ -153,6 +215,7 @@ public:
             const std::int32_t recordLength =
                 m_buffer.getInt32Volatile(RD::RecordDescriptor::lengthOffset(recordIndex));
             if (recordLength <= 0) break;
+            RUNE_TSAN_ACQUIRE(m_buffer.buffer() + recordIndex);
 
             bytesRead += aeron::util::BitUtil::align(recordLength, RD::RecordDescriptor::ALIGNMENT);
 
@@ -188,7 +251,9 @@ public:
         ScopeExit cleanup([&]() {
             if (bytesRead > 0) {
                 m_buffer.setMemory(headIndex, static_cast<std::size_t>(bytesRead), 0);
+                RUNE_TSAN_RELEASE(m_buffer.buffer() + headPositionIndex);
                 m_buffer.putInt64Ordered(headPositionIndex, head + bytesRead);
+                notifySpace_();
             }
         });
 
@@ -197,6 +262,7 @@ public:
             const std::int32_t recordLength =
                 m_buffer.getInt32Volatile(RD::RecordDescriptor::lengthOffset(recordIndex));
             if (recordLength <= 0) break;
+            RUNE_TSAN_ACQUIRE(m_buffer.buffer() + recordIndex);
 
             const aeron::util::index_t alignedLength =
                 aeron::util::BitUtil::align(recordLength, RD::RecordDescriptor::ALIGNMENT);
@@ -216,13 +282,24 @@ public:
             if (action == ControlledAction::BREAK) break;
             if (action == ControlledAction::COMMIT) {
                 m_buffer.setMemory(headIndex, static_cast<std::size_t>(bytesRead), 0);
+                RUNE_TSAN_RELEASE(m_buffer.buffer() + headPositionIndex);
                 m_buffer.putInt64Ordered(headPositionIndex, head + bytesRead);
+                notifySpace_();
                 headIndex += bytesRead;
                 head      += bytesRead;
                 bytesRead = 0;
             }
         }
         return messagesRead;
+    }
+
+    /// Producer position (tail, bytes ever claimed) — any thread (volatile load).
+    [[nodiscard]] std::int64_t producerPosition() const {
+        return m_buffer.getInt64Volatile(m_tailPositionIndex);
+    }
+    /// Consumer position (head, bytes ever consumed) — the consumer thread.
+    [[nodiscard]] std::int64_t consumerPosition() const {
+        return m_buffer.getInt64(m_headPositionIndex);
     }
 
     /// Bytes currently unconsumed in the ring (tail - head), clamped to [0, capacity].
@@ -315,6 +392,7 @@ private:
 
         if (requiredCapacity > availableCapacity) {
             head = m_buffer.getInt64Volatile(m_headPositionIndex);
+            RUNE_TSAN_ACQUIRE(m_buffer.buffer() + m_headPositionIndex);
             if (requiredCapacity > (capacity - static_cast<aeron::util::index_t>(tail - head))) {
                 return INSUFFICIENT_CAPACITY;
             }
@@ -336,6 +414,7 @@ private:
             aeron::util::index_t headIndex = static_cast<aeron::util::index_t>(head) & mask;
             if (requiredCapacity > headIndex) {
                 head = m_buffer.getInt64Volatile(m_headPositionIndex);
+                RUNE_TSAN_ACQUIRE(m_buffer.buffer() + m_headPositionIndex);
                 headIndex = static_cast<aeron::util::index_t>(head) & mask;
                 if (requiredCapacity > headIndex) {
                     writeIndex = INSUFFICIENT_CAPACITY;
@@ -355,6 +434,7 @@ private:
             std::atomic_thread_fence(std::memory_order_release);
             m_buffer.putInt32(RD::RecordDescriptor::typeOffset(recordIndex),
                               RD::RecordDescriptor::PADDING_MSG_TYPE_ID);
+            RUNE_TSAN_RELEASE(m_buffer.buffer() + recordIndex);
             m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), padding);
         }
 
@@ -365,8 +445,20 @@ private:
         return writeIndex;
     }
 
+    // A9: the consumer freed space — wake a producer that armed a space wait.
+    void notifySpace_() noexcept {
+        if (m_producerBell == nullptr) return;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (m_spaceWanted.load(std::memory_order_relaxed) != 0 &&
+            m_spaceWanted.exchange(0, std::memory_order_acq_rel) != 0)
+            m_producerBell->ring();
+    }
+
     aeron::concurrent::AtomicBuffer m_buffer;
-    aeron::util::index_t m_capacity               = 0;
+    RingDoorbell* m_consumerBell = nullptr;   ///< A9: rung by commit() (startup-set)
+    RingDoorbell* m_producerBell = nullptr;   ///< A9: rung by the consumer on freed space (startup-set)
+    alignas(64) std::atomic<std::uint32_t> m_spaceWanted{0};   ///< A9: producer waits for space (own line)
+    alignas(64) aeron::util::index_t m_capacity   = 0;           // review L-2: not on the space-wait line
     aeron::util::index_t m_maxMsgLength           = 0;
     aeron::util::index_t m_headPositionIndex      = 0;
     aeron::util::index_t m_headCachePositionIndex = 0;

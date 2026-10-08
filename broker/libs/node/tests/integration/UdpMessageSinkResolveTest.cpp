@@ -25,6 +25,7 @@
 //      127.0.0.1 resolves and send() delivers (sanity: the fix does not break
 //      the happy path).
 
+#include <rune/aeronutil/testing/FreePort.h>
 #include <rune/node/UdpMessageSink.h>
 
 #include <gtest/gtest.h>
@@ -126,23 +127,7 @@ struct TempDir {
 };
 
 static uint16_t discoverFreeUdpPort() {
-    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) throw std::runtime_error("socket() failed");
-    struct sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = 0;
-    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
-    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd);
-        throw std::runtime_error("bind() failed");
-    }
-    socklen_t addrLen = sizeof(addr);
-    ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen);
-    const uint16_t netPort = addr.sin_port;
-    const uint16_t port =
-        static_cast<uint16_t>((netPort >> 8) | ((netPort & 0xFFu) << 8));
-    ::close(fd);
-    return port;
+    return rune::aeronutil::testing::allocFreeUdpPort();   // D8: never an ephemeral port
 }
 
 static std::shared_ptr<aeron::Aeron> connectClient(const std::string& aeronDir) {

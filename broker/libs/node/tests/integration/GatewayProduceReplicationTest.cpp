@@ -29,6 +29,8 @@
 // NO Docker.  All waits are bounded (hard cap + ASSERT).  No busy-spin.
 // ---------------------------------------------------------------------------
 
+#include <rune/aeronutil/testing/FreePort.h>
+#include "../support/TestNodeConfig.h"
 #include <gtest/gtest.h>
 
 // Gateway
@@ -37,6 +39,8 @@
 
 // Node / replication
 #include <rune/node/BrokerNode.h>
+#include <rune/node/EmbeddedDriver.h>
+#include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
 #include "support/TestWorkerCount.h"
 #include <rune/node/ReplicaRegistry.h>
@@ -69,6 +73,7 @@ extern "C" {
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -78,6 +83,7 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 using namespace rune::replication;
+using namespace rune::node::test;  // F1: leoOnOwner/hwOnOwner/appendOnOwner/...
 namespace pc = rune::protocol::client;
 
 // ===========================================================================
@@ -110,20 +116,7 @@ static std::vector<uint8_t> makeBatch(int32_t recordCount, int64_t baseOffsetPla
 }
 
 static uint16_t gr4DiscoverFreeUdpPort() {
-    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) throw std::runtime_error("socket() failed");
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
-    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd); throw std::runtime_error("bind() failed");
-    }
-    socklen_t addrLen = sizeof(addr);
-    ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen);
-    const uint16_t netPort = addr.sin_port;
-    const uint16_t port = static_cast<uint16_t>((netPort >> 8) | ((netPort & 0xFFu) << 8));
-    ::close(fd);
-    return port;
+    return rune::aeronutil::testing::allocFreeUdpPort();   // D8: never an ephemeral port
 }
 
 static std::vector<uint16_t> gr4DiscoverFreePorts(int n) {
@@ -147,6 +140,7 @@ static rune::node::NodeConfig makeGr4Config(
     const std::vector<uint16_t>& rPorts)
 {
     rune::node::NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId              = nodeId;
     cfg.dataDir             = dataDir.string();
     cfg.consensusStreamId   = 30;
@@ -349,7 +343,8 @@ TEST(GR4_Unit, NonLeaderProduceRejected_ReplicaRoleCheck) {
 //   - The test opens a real Aeron:udp client connection to the elected leader's
 //     client endpoint.
 //   - Sends N Produce messages; asserts ProduceResponse{OK} for each.
-//   - Waits (bounded) for all followers' replicaForTest(0,0)->logEndOffset()
+//   - Waits (bounded) for all followers' LEO (read on the owning thread via
+//     leoOrMinusOne / onOwnerThreadForTest)
 //     to converge to N and leader highWatermark() >= N.
 //
 // NO Docker.  NO mocks.  Real aeron:udp on loopback.
@@ -364,71 +359,27 @@ TEST(GR4_Unit, NonLeaderProduceRejected_ReplicaRoleCheck) {
 // the test-client side to avoid sharing a media driver with a BrokerNode.
 // ---------------------------------------------------------------------------
 struct Gr4ClientDriver {
-    aeron_driver_context_t* driverCtx   = nullptr;
-    aeron_driver_t*         driver      = nullptr;
-    std::atomic<bool>       running{false};
-    std::thread             thread;
+    // One dedicated pumping thread (EmbeddedDriver::Threaded); no caller-side
+    // readiness pumping — aeron_driver_init/start already wrote cnc.dat and
+    // stamped the heartbeat synchronously before the driver thread even starts.
+    rune::node::EmbeddedDriver    driver;
     std::shared_ptr<aeron::Aeron> aeron;
 
-    explicit Gr4ClientDriver(const fs::path& aeronDir) {
-        fs::create_directories(aeronDir);
-
-        aeron_driver_context_init(&driverCtx);
-        aeron_driver_context_set_dir(driverCtx, aeronDir.string().c_str());
-        aeron_driver_context_set_threading_mode(driverCtx, AERON_THREADING_MODE_SHARED);
-        aeron_driver_context_set_dir_delete_on_start(driverCtx, true);
-        aeron_driver_context_set_dir_delete_on_shutdown(driverCtx, true);
-        aeron_driver_context_set_shared_idle_strategy(driverCtx, "sleep-ns");
-        aeron_driver_context_set_term_buffer_sparse_file(driverCtx, true);
-        aeron_driver_context_set_term_buffer_length(driverCtx, 64 * 1024);
-
-        EXPECT_EQ(aeron_driver_init(&driver, driverCtx), 0);
-        EXPECT_EQ(aeron_driver_start(driver, /*manual_main_loop=*/true), 0);
-
-        running.store(true, std::memory_order_release);
-        thread = std::thread([this]() {
-            while (running.load(std::memory_order_acquire)) {
-                aeron_driver_main_idle_strategy(
-                    driver,
-                    aeron_driver_main_do_work(driver));
-            }
-        });
-
-        // Wait for CnC file.
-        const std::string cncPath = aeronDir.string() + "/cnc.dat";
-        for (int i = 0; i < 400; ++i) {
-            aeron_driver_main_do_work(driver);
-            if (fs::exists(cncPath)) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds{1});
-        }
-
+    explicit Gr4ClientDriver(const fs::path& aeronDir)
+        : driver(makeCfg(aeronDir), rune::node::DriverMode::Threaded)
+    {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir.string());
         aeron = aeron::Aeron::connect(ctx);
     }
 
-    ~Gr4ClientDriver() {
-        aeron.reset();
-        if (running.exchange(false, std::memory_order_acq_rel)) {
-            if (thread.joinable()) thread.join();
-        }
-        if (driver) {
-            const auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::milliseconds{50};
-            while (std::chrono::steady_clock::now() < deadline) {
-                if (aeron_driver_main_do_work(driver) == 0) {
-                    aeron_driver_main_do_work(driver);
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::microseconds{200});
-            }
-            aeron_driver_close(driver);
-            driver = nullptr;
-        }
-        if (driverCtx) {
-            aeron_driver_context_close(driverCtx);
-            driverCtx = nullptr;
-        }
+private:
+    static rune::node::EmbeddedDriverConfig makeCfg(const fs::path& aeronDir) {
+        fs::create_directories(aeronDir);
+        rune::node::EmbeddedDriverConfig cfg;
+        cfg.dir             = aeronDir.string();
+        cfg.termBufferBytes = 256 * 1024;   // receiver window = term/2 must be >= the broker MTU (derived 65504 on loopback)
+        return cfg;
     }
 };
 
@@ -643,15 +594,14 @@ TEST(GR4_Integration, ProduceViaGateway_FollowersConverge_HWAdvances) {
     // -----------------------------------------------------------------------
     // 5. Verify leader replica LEO == kNumRecords.
     // -----------------------------------------------------------------------
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr) << "leader must have a replica for topic=0 partition=0";
-    EXPECT_EQ(leaderReplica->logEndOffset(), static_cast<Offset>(kNumRecords))
+    ASSERT_TRUE(hasReplica(*leaderNode)) << "leader must have a replica for topic=0 partition=0";
+    EXPECT_EQ(leoOnOwner(*leaderNode), static_cast<Offset>(kNumRecords))
         << "leader replica LEO must equal kNumRecords after produce";
 
     // -----------------------------------------------------------------------
     // 6. Wait for followers to replicate and HW to advance.
     // -----------------------------------------------------------------------
-    const Offset targetLeo = leaderReplica->logEndOffset();
+    const Offset targetLeo = leoOnOwner(*leaderNode);
     ASSERT_GT(targetLeo, 0) << "leader LEO must be > 0 after produce";
 
     bool converged = false;
@@ -661,13 +611,13 @@ TEST(GR4_Integration, ProduceViaGateway_FollowersConverge_HWAdvances) {
             bool allFollowersHaveLeo = true;
             for (int i = 0; i < 3; ++i) {
                 if (allNodes[i] == leaderNode) continue;
-                PartitionReplica* fr = allNodes[i]->replicaForTest(0, 0);
-                if (!fr || fr->logEndOffset() < targetLeo) {
+                // -1 when the follower has no replica (== the old !fr case).
+                if (leoOrMinusOne(*allNodes[i]) < targetLeo) {
                     allFollowersHaveLeo = false;
                     break;
                 }
             }
-            if (allFollowersHaveLeo && leaderReplica->highWatermark() >= targetLeo) {
+            if (allFollowersHaveLeo && hwOnOwner(*leaderNode) >= targetLeo) {
                 converged = true;
                 break;
             }
@@ -678,21 +628,33 @@ TEST(GR4_Integration, ProduceViaGateway_FollowersConverge_HWAdvances) {
     ASSERT_TRUE(converged)
         << "Replication did not converge within 12 s after gateway produce. "
         << "Leader LEO=" << targetLeo
-        << " HW=" << leaderReplica->highWatermark();
+        << " HW=" << hwOnOwner(*leaderNode);
 
-    EXPECT_GE(leaderReplica->highWatermark(), targetLeo)
+    EXPECT_GE(hwOnOwner(*leaderNode), targetLeo)
         << "Leader HW must advance to >= targetLeo after follower acks";
 
     // Verify at least one follower converged.
     bool anyFollowerConverged = false;
     for (int i = 0; i < 3; ++i) {
         if (allNodes[i] == leaderNode) continue;
-        PartitionReplica* fr = allNodes[i]->replicaForTest(0, 0);
-        if (fr && fr->logEndOffset() >= targetLeo) {
+        if (leoOrMinusOne(*allNodes[i]) >= targetLeo) {
             anyFollowerConverged = true;
         }
     }
     EXPECT_TRUE(anyFollowerConverged) << "At least one follower must have replicated";
+
+    // F30 fix round 1 (F7): BrokerNode wiring, default (thread-placement)
+    // config — every user replica on every node is worker-driven: its follower
+    // flush / roll seals are io submissions of the owning worker, never an
+    // inline fsync.  Read on the replica's TRUE owner thread.
+    for (int i = 0; i < 3; ++i) {
+        const bool workerDriven = allNodes[i]->onOwnerThreadForTest(0, 0,
+            [](rune::replication::PartitionReplica& r) {
+                return r.externalFollowerFlush() && r.isDiskBacked() && r.log()->deferSealSync();
+            });
+        EXPECT_TRUE(workerDriven) << "node " << i << ": user replica must use the worker's external flush "
+                                     "+ deferred seals (BrokerNode wiring)";
+    }
 
     // -----------------------------------------------------------------------
     // 7. Teardown.

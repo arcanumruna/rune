@@ -5,6 +5,8 @@
 //
 // Uses an embedded UDP-capable Aeron media driver (same pattern validated by the
 // MDC egress spike).
+#include <rune/aeronutil/testing/FreePort.h>
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/node/WorkerEgress.h>
 
 #include <Aeron.h>
@@ -28,19 +30,21 @@ using namespace rune::node;
 namespace {
 
 constexpr int32_t kStream = 2001;
-constexpr const char* kControl = "127.0.0.1:24720";
+// D11: loopback endpoints from the shared allocator (20000..31999, never bind-0) — the old
+// fixed 24xxx ports collided with the allocator's ports in concurrently running tests.
+inline std::string freeEndpoint() { return "127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort()); }
+const std::string kControlEp = freeEndpoint();
+const char* const kControl = kControlEp.c_str();
 
 class WorkerEgressFixture : public ::testing::Test {
 protected:
-    aeron_driver_context_t* driverCtx_ = nullptr;
-    aeron_driver_t*         driver_    = nullptr;
-    std::thread             driverThread_;
-    std::atomic<bool>       driverRunning_{false};
+    std::unique_ptr<rune::node::EmbeddedDriver> driver_;
     std::shared_ptr<aeron::Aeron> aeron_;
     std::string aeronDir_;
 
     void SetUp() override {
         startDriver();
+        if (HasFatalFailure()) return;  // driver failed to start: don't block in connect
         aeron::Context ctx;
         ctx.aeronDir(aeronDir_);
         aeron_ = aeron::Aeron::connect(ctx);
@@ -52,26 +56,21 @@ protected:
         aeronDir_ = (std::filesystem::temp_directory_path() /
                      ("rune_wegress_" + std::to_string(::getpid()))).string();
         std::filesystem::remove_all(aeronDir_);
-        aeron_driver_context_init(&driverCtx_);
-        aeron_driver_context_set_dir(driverCtx_, aeronDir_.c_str());
-        aeron_driver_context_set_threading_mode(driverCtx_, AERON_THREADING_MODE_SHARED);
-        aeron_driver_context_set_dir_delete_on_start(driverCtx_, true);
-        aeron_driver_context_set_dir_delete_on_shutdown(driverCtx_, true);
-        aeron_driver_context_set_shared_idle_strategy(driverCtx_, "sleep-ns");
-        aeron_driver_context_set_term_buffer_sparse_file(driverCtx_, true);
-        aeron_driver_context_set_term_buffer_length(driverCtx_, 64 * 1024);
-        ASSERT_EQ(aeron_driver_init(&driver_, driverCtx_), 0) << aeron_errmsg();
-        ASSERT_EQ(aeron_driver_start(driver_, /*manual_main_loop=*/true), 0) << aeron_errmsg();
-        driverRunning_.store(true, std::memory_order_release);
-        driverThread_ = std::thread([this]() {
-            while (driverRunning_.load(std::memory_order_acquire))
-                aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_));
-        });
+        // One dedicated pumping thread (EmbeddedDriver::Threaded); no caller-side
+        // readiness pumping needed — aeron_driver_init already wrote cnc.dat and
+        // stamped the heartbeat synchronously before the driver thread starts.
+        rune::node::EmbeddedDriverConfig cfg;
+        cfg.dir             = aeronDir_;
+        cfg.termBufferBytes = 64 * 1024;
+        cfg.mtuBytes        = 1408;   // pinned: the fragmentation test needs maxPayload*3 < term/8
+        try {
+            driver_ = std::make_unique<rune::node::EmbeddedDriver>(cfg, rune::node::DriverMode::Threaded);
+        } catch (const std::exception& e) {
+            FAIL() << "EmbeddedDriver failed to start: " << e.what();
+        }
     }
     void stopDriver() {
-        if (driverRunning_.exchange(false) && driverThread_.joinable()) driverThread_.join();
-        if (driver_) { aeron_driver_close(driver_); driver_ = nullptr; }
-        if (driverCtx_) { aeron_driver_context_close(driverCtx_); driverCtx_ = nullptr; }
+        driver_.reset();
     }
 
     template <typename Pred>
@@ -100,8 +99,8 @@ TEST_F(WorkerEgressFixture, ResolvesAndDeliversToDynamicSubscribers) {
     ASSERT_TRUE(eg.resolved()) << "WorkerEgress publication did not resolve";
     EXPECT_EQ(eg.streamId(), kStream);
 
-    auto sub1 = resolveSub(subChannel("127.0.0.1:24721"), kStream);
-    auto sub2 = resolveSub(subChannel("127.0.0.1:24722"), kStream);
+    auto sub1 = resolveSub(subChannel(freeEndpoint().c_str()), kStream);
+    auto sub2 = resolveSub(subChannel(freeEndpoint().c_str()), kStream);
     ASSERT_NE(sub1, nullptr);
     ASSERT_NE(sub2, nullptr);
 
@@ -146,13 +145,14 @@ TEST_F(WorkerEgressFixture, NullAeronIsUnresolvedAndSendIsNoop) {
 // NOTE: fc=min was intentionally REMOVED (min flow control paced the publisher to
 // the slowest/late receiver and stalled the reader); default flow control is used.
 TEST_F(WorkerEgressFixture, AccessorsAndChannelFormat) {
-    WorkerEgress eg(aeron_, "127.0.0.1:24730", 2099);
+    const std::string ep = freeEndpoint();
+    WorkerEgress eg(aeron_, ep.c_str(), 2099);
     ASSERT_TRUE(eg.resolved());
     EXPECT_EQ(eg.streamId(), 2099);
-    EXPECT_EQ(eg.controlEndpoint(), "127.0.0.1:24730");
+    EXPECT_EQ(eg.controlEndpoint(), ep);
     const std::string& ch = eg.channel();
     EXPECT_NE(ch.find("control-mode=dynamic"), std::string::npos) << ch;
-    EXPECT_NE(ch.find("control=127.0.0.1:24730"), std::string::npos) << ch;
+    EXPECT_NE(ch.find("control=" + ep), std::string::npos) << ch;
     EXPECT_EQ(ch.find("fc=min"), std::string::npos) << "fc=min must NOT be present: " << ch;
     EXPECT_GT(eg.maxPayloadLength(), 0);
 }
@@ -160,7 +160,8 @@ TEST_F(WorkerEgressFixture, AccessorsAndChannelFormat) {
 // send() with NO subscribers connected must not crash and must return <= 0
 // (not-connected / back-pressure) so the caller does not advance its cursor.
 TEST_F(WorkerEgressFixture, SendWithNoSubscribersReturnsNonPositive) {
-    WorkerEgress eg(aeron_, "127.0.0.1:24740", 2098);
+    const std::string ep = freeEndpoint();
+    WorkerEgress eg(aeron_, ep.c_str(), 2098);
     ASSERT_TRUE(eg.resolved());
     EXPECT_FALSE(eg.isConnected());  // no subscriber yet
     uint8_t payload[64];
@@ -172,11 +173,12 @@ TEST_F(WorkerEgressFixture, SendWithNoSubscribersReturnsNonPositive) {
 // A frame larger than maxPayloadLength must be fragmented by offer() and
 // reassembled into a single message by the subscriber's FragmentAssembler.
 TEST_F(WorkerEgressFixture, LargeFrameFragmentsAndReassembles) {
-    const char* control = "127.0.0.1:24750";
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
     WorkerEgress eg(aeron_, control, 2097);
     ASSERT_TRUE(eg.resolved());
     auto sub = resolveSub(std::string("aeron:udp?control=") + control +
-                          "|control-mode=dynamic|endpoint=127.0.0.1:24751", 2097);
+                          "|control-mode=dynamic|endpoint=" + freeEndpoint(), 2097);
     ASSERT_NE(sub, nullptr);
     ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
 
@@ -197,13 +199,14 @@ TEST_F(WorkerEgressFixture, LargeFrameFragmentsAndReassembles) {
 // A subscriber that joins AFTER the publication exists still receives subsequent
 // sends (dynamic-MDC auto-add on connect).
 TEST_F(WorkerEgressFixture, LateSubscriberReceivesSubsequentSends) {
-    const char* control = "127.0.0.1:24760";
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
     WorkerEgress eg(aeron_, control, 2096);
     ASSERT_TRUE(eg.resolved());
 
     // Late subscriber joins now (after the pub existed).
     auto sub = resolveSub(std::string("aeron:udp?control=") + control +
-                          "|control-mode=dynamic|endpoint=127.0.0.1:24761", 2096);
+                          "|control-mode=dynamic|endpoint=" + freeEndpoint(), 2096);
     ASSERT_NE(sub, nullptr);
     ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
 

@@ -7,9 +7,19 @@
 //
 //   TX2b_GatewayDriven.DivergentTail_HWBoundRebuild_NoFalseDuplicate
 //
-//   Directly tests the CRITICAL TX-2b fix: rebuildFromLog() must use the
-//   committed high-watermark (HW) as its scan upper bound, NOT the log-end-
-//   offset (LEO).
+//   Pins rebuildFromLog()'s BOUND semantics: a state built to HW does not
+//   cover the tail above it; one built to LEO does.
+//
+//   NOTE (PSM <-> log consistency, review of b4594f8): the broker no longer
+//   answers produces from an HW-bounded state.  A new leader KEEPS its tail
+//   above HW, so an HW-bounded state accepted a resend of the first tail batch
+//   (a silent duplicate) and answered OOS for later stored ones.  The answering
+//   states are built to LEO and REBUILT on every log-generation change (a
+//   KIP-101 truncation of that tail included), which is what prevents the
+//   false-Duplicate this test was written for — see
+//   PsmLogConsistencyRegression.* (F15EosRegressionTest.cpp).  Scenario C below
+//   is therefore the CORRECT state for a log whose tail is kept, and the
+//   truncation case is covered by the invalidation, not by the bound.
 //
 //   Scenario:
 //     - Log has kN committed batches (pid=P, epoch=E, seq 0..kN-1) + 1 UNCOMMITTED
@@ -50,6 +60,7 @@
 // NO Docker.  C++23.
 // ---------------------------------------------------------------------------
 
+#include <rune/aeronutil/testing/FreePort.h>
 #include <gtest/gtest.h>
 
 // Storage + protocol (both unit and integration; no Aeron dependency)
@@ -61,7 +72,10 @@
 // Integration-only headers (require Aeron)
 #include <rune/replication/PartitionReplica.h>
 #include <rune/node/BrokerNode.h>
+#include <rune/node/EmbeddedDriver.h>
+#include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
+#include "../support/TestNodeConfig.h"
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -87,6 +101,7 @@ extern "C" {
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 
@@ -95,6 +110,7 @@ using namespace std::chrono_literals;
 using namespace rune::storage;
 #ifndef TX2B_UNIT_ONLY
 using namespace rune::replication;
+using namespace rune::node::test;  // F1: leoOnOwner/hwOnOwner/appendOnOwner/...
 namespace pc = rune::protocol::client;
 #endif // TX2B_UNIT_ONLY
 
@@ -195,7 +211,7 @@ TEST(TX2b_GatewayDriven, DivergentTail_HWBoundRebuild_NoFalseDuplicate) {
     ASSERT_EQ(leoOffset, static_cast<int64_t>(kN + 1));
 
     // -----------------------------------------------------------------------
-    // Scenario B (POST-FIX): HW-bounded scan — the correct behavior.
+    // Scenario B: HW-bounded scan — a prefix state (no longer used to answer).
     // -----------------------------------------------------------------------
     {
         ProducerStateManager psmHw;
@@ -230,9 +246,9 @@ TEST(TX2b_GatewayDriven, DivergentTail_HWBoundRebuild_NoFalseDuplicate) {
     }
 
     // -----------------------------------------------------------------------
-    // Scenario C (PRE-FIX): LEO-bounded scan — the BUG.
-    // Asserts isDuplicate() == true to confirm this test is a valid
-    // RED/GREEN discriminator: code that uses LEO fails where HW-bound passes.
+    // Scenario C: LEO-bounded scan — the bound the answering states use (with
+    // rebuild-on-truncation; see the NOTE in the file header): the kept tail
+    // is covered (a resend of it is a duplicate).
     // -----------------------------------------------------------------------
     {
         ProducerStateManager psmLeo;
@@ -242,11 +258,10 @@ TEST(TX2b_GatewayDriven, DivergentTail_HWBoundRebuild_NoFalseDuplicate) {
         // producer retry of kUncSeq is incorrectly marked Duplicate.
         const auto vrUnc = psmLeo.validate(/*topicId=*/0, kPid, kPartition, kEpoch, kUncSeq, kUncSeq);
         EXPECT_TRUE(vrUnc.isDuplicate())
-            << "PRE-FIX REGRESSION CHECK: LEO-bound rebuildFromLog MUST produce"
-            << " false-Duplicate for uncommitted seq=" << kUncSeq << "."
-            << " This EXPECT documents the pre-fix bug (LEO-bound seeds PSM from"
-            << " uncommitted batches). Scenario B (HW-bound) corrects this to Accept."
-            << " Together B+C prove: HW-bound=Accept (FIX), LEO-bound=Duplicate (BUG).";
+            << "LEO-bound rebuildFromLog must cover the kept tail (seq=" << kUncSeq << "):"
+            << " a resend of a STORED tail batch is a duplicate, never appended again."
+            << " If the tail is later truncated, the owner's log-generation check"
+            << " rebuilds the state before answering (PsmLogConsistencyRegression.*).";
 
         // Committed seqs are still Duplicate in LEO-bound mode (correct in both cases).
         for (int seq = 0; seq < kN; ++seq) {
@@ -264,19 +279,7 @@ TEST(TX2b_GatewayDriven, DivergentTail_HWBoundRebuild_NoFalseDuplicate) {
 // ===========================================================================
 
 static uint16_t tx2bFreePort() {
-    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) throw std::runtime_error("socket failed");
-    struct sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
-    ::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
-    socklen_t l = sizeof(addr);
-    ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &l);
-    const uint16_t netPort = addr.sin_port;
-    const uint16_t port = static_cast<uint16_t>(
-        (netPort >> 8) | ((netPort & 0xFFu) << 8));
-    ::close(fd);
-    return port;
+    return rune::aeronutil::testing::allocFreeUdpPort();   // D8: never an ephemeral port
 }
 
 static std::vector<uint16_t> tx2bFreePorts(int n) {
@@ -300,6 +303,7 @@ static rune::node::NodeConfig makeTx2bConfig(
     const std::vector<uint16_t>& rPorts)
 {
     rune::node::NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId              = nodeId;
     cfg.dataDir             = dataDir.string();
     cfg.consensusStreamId   = 71;
@@ -335,59 +339,27 @@ static rune::node::NodeConfig makeTx2bConfig(
 
 // Test-client embedded Aeron driver (mirrors Gr5ClientDriver exactly).
 struct Tx2bClientDriver {
-    aeron_driver_context_t*       driverCtx = nullptr;
-    aeron_driver_t*               driver    = nullptr;
-    std::atomic<bool>             running{false};
-    std::thread                   thread;
+    // One dedicated pumping thread (EmbeddedDriver::Threaded); no caller-side
+    // readiness pumping — aeron_driver_init/start already wrote cnc.dat and
+    // stamped the heartbeat synchronously before the driver thread even starts.
+    rune::node::EmbeddedDriver    driver;
     std::shared_ptr<aeron::Aeron> aeron;
 
-    explicit Tx2bClientDriver(const fs::path& aeronDir) {
-        fs::create_directories(aeronDir);
-        aeron_driver_context_init(&driverCtx);
-        aeron_driver_context_set_dir(driverCtx, aeronDir.string().c_str());
-        aeron_driver_context_set_threading_mode(driverCtx, AERON_THREADING_MODE_SHARED);
-        aeron_driver_context_set_dir_delete_on_start(driverCtx, true);
-        aeron_driver_context_set_dir_delete_on_shutdown(driverCtx, true);
-        aeron_driver_context_set_shared_idle_strategy(driverCtx, "sleep-ns");
-        aeron_driver_context_set_term_buffer_sparse_file(driverCtx, true);
-        aeron_driver_context_set_term_buffer_length(driverCtx, 64 * 1024);
-
-        EXPECT_EQ(aeron_driver_init(&driver, driverCtx), 0);
-        EXPECT_EQ(aeron_driver_start(driver, /*manual_main_loop=*/true), 0);
-        running.store(true, std::memory_order_release);
-        thread = std::thread([this]() {
-            while (running.load(std::memory_order_acquire)) {
-                aeron_driver_main_idle_strategy(
-                    driver, aeron_driver_main_do_work(driver));
-            }
-        });
-
-        const std::string cncPath = aeronDir.string() + "/cnc.dat";
-        for (int i = 0; i < 400; ++i) {
-            aeron_driver_main_do_work(driver);
-            if (fs::exists(cncPath)) break;
-            std::this_thread::sleep_for(1ms);
-        }
-
+    explicit Tx2bClientDriver(const fs::path& aeronDir)
+        : driver(makeCfg(aeronDir), rune::node::DriverMode::Threaded)
+    {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir.string());
         aeron = aeron::Aeron::connect(ctx);
     }
 
-    ~Tx2bClientDriver() {
-        aeron.reset();
-        if (running.exchange(false, std::memory_order_acq_rel)) {
-            if (thread.joinable()) thread.join();
-        }
-        if (driver) {
-            const auto dl = std::chrono::steady_clock::now() + 50ms;
-            while (std::chrono::steady_clock::now() < dl) {
-                if (aeron_driver_main_do_work(driver) == 0) break;
-                std::this_thread::sleep_for(200us);
-            }
-            aeron_driver_close(driver);
-        }
-        if (driverCtx) aeron_driver_context_close(driverCtx);
+private:
+    static rune::node::EmbeddedDriverConfig makeCfg(const fs::path& aeronDir) {
+        fs::create_directories(aeronDir);
+        rune::node::EmbeddedDriverConfig cfg;
+        cfg.dir             = aeronDir.string();
+        cfg.termBufferBytes = 256 * 1024;   // receiver window = term/2 must be >= the broker MTU (derived 65504 on loopback)
+        return cfg;
     }
 };
 
@@ -569,28 +541,12 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
     ASSERT_TRUE(node0->awaitLeader(8s));
     ASSERT_TRUE(node1->awaitLeader(8s));
     ASSERT_TRUE(node2->awaitLeader(8s));
-    std::this_thread::sleep_for(300ms);
-
-    const rune::consensus::NodeId lid = node0->leaderId();
-    ASSERT_GE(lid, 0);
-    ASSERT_LE(lid, 2);
-
     std::array<rune::node::BrokerNode*, 3> allNodes{
         node0.get(), node1.get(), node2.get()};
+    // D11: the PARTITION leader (owner-thread role, settled) — not the consensus leader.
+    const int lid = settledPartitionLeader(allNodes);
+    ASSERT_GE(lid, 0) << "no settled partition leader for topic 0 / partition 0";
     rune::node::BrokerNode* leaderNode = allNodes[static_cast<std::size_t>(lid)];
-
-    // Wait for replication bridge to promote the leader replica.
-    {
-        const auto dl = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < dl) {
-            if (leaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(20ms);
-        }
-    }
-    ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr);
-    ASSERT_EQ(leaderReplica->role(), Role::Leader);
 
     // Start the test-client Aeron driver.
     Tx2bClientDriver clientDrv(clientDir.path / "aeron");
@@ -632,18 +588,18 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
     }
 
     // Wait for majority HW to cover all kN batches.
-    const Offset targetLeo = leaderReplica->logEndOffset();
+    const Offset targetLeo = leoOnOwner(*leaderNode);
     ASSERT_GT(targetLeo, 0) << "leader LEO must be > 0 after produces";
     {
         const auto dl = std::chrono::steady_clock::now() + 10s;
         while (std::chrono::steady_clock::now() < dl) {
-            if (leaderReplica->highWatermark() >= targetLeo) break;
+            if (hwOnOwner(*leaderNode) >= targetLeo) break;
             std::this_thread::sleep_for(20ms);
         }
     }
-    ASSERT_GE(leaderReplica->highWatermark(), targetLeo)
+    ASSERT_GE(hwOnOwner(*leaderNode), targetLeo)
         << "leader HW must reach " << targetLeo << " before failover";
-    const Offset committedHw = leaderReplica->highWatermark();
+    const Offset committedHw = hwOnOwner(*leaderNode);
 
     // Disconnect from old leader before killing it.
     conn1.ingressPub.reset();
@@ -665,58 +621,16 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
     ASSERT_NE(surv1, nullptr);
     ASSERT_NE(surv2, nullptr);
 
-    // Wait for re-election.
-    rune::consensus::NodeId newLid = -1;
-    {
-        const auto dl = std::chrono::steady_clock::now() + 15s;
-        while (std::chrono::steady_clock::now() < dl) {
-            const auto l1 = surv1->leaderId();
-            const auto l2 = surv2->leaderId();
-            if (l1 >= 0 && l1 != lid && l2 >= 0 && l1 == l2) {
-                newLid = l1;
-                break;
-            }
-            std::this_thread::sleep_for(50ms);
-        }
-    }
-    ASSERT_GE(newLid, 0) << "Surviving nodes must re-elect a new leader";
-    ASSERT_NE(newLid, lid) << "New leader must differ from the killed leader";
-    std::this_thread::sleep_for(500ms);  // let new leader settle
-
-    rune::node::BrokerNode* newLeaderNode =
-        (surv1->isLeader()) ? surv1 : surv2;
-    ASSERT_TRUE(newLeaderNode->isLeader());
-
-    // Wait for new leader's replication bridge to fire → doWork() wasLeader_
-    // transition → rebuildProducerStateFromLogs() with HW-bound.
-    {
-        const auto dl = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < dl) {
-            if (newLeaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(20ms);
-        }
-    }
-    ASSERT_TRUE(newLeaderNode->replicationIsLeaderForTest())
-        << "New leader's replication bridge must report isLeader (PSM rebuild fires)";
-
-    PartitionReplica* newReplica = newLeaderNode->replicaForTest(0, 0);
-    ASSERT_NE(newReplica, nullptr);
-
-    // Partition failover (metadata reassignment of the dead leader's partitions)
-    // is ASYNCHRONOUS and completes shortly AFTER consensus re-election — the
-    // reassignment liveness window must expire before the dead node is treated as
-    // gone.  Poll for the partition replica to reach Leader role rather than
-    // asserting it instantaneously (mirrors the consensus-isLeader poll above).
-    {
-        const auto dl = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < dl &&
-               newReplica->role() != Role::Leader) {
-            std::this_thread::sleep_for(20ms);
-        }
-    }
-    ASSERT_EQ(newReplica->role(), Role::Leader)
-        << "New leader's partition replica must be promoted (async failover)";
-    ASSERT_GE(newReplica->logEndOffset(), committedHw)
+    // D11: the NEW partition leader among the survivors (owner-thread role, settled after the
+    // async partition failover) — not the consensus leader, which may be the other survivor.
+    std::array<rune::node::BrokerNode*, 2> survivors{surv1, surv2};
+    const int newIdx = settledPartitionLeader(survivors);
+    ASSERT_GE(newIdx, 0) << "no surviving partition leader after failover";
+    rune::node::BrokerNode* newLeaderNode = survivors[static_cast<std::size_t>(newIdx)];
+    int newLid = -1;
+    for (int i = 0; i < 3; ++i) if (allNodes[static_cast<std::size_t>(i)] == newLeaderNode) newLid = i;
+    ASSERT_NE(newLid, lid);
+    ASSERT_GE(leoOnOwner(*newLeaderNode), committedHw)
         << "New leader must hold all committed records (LEO >= committedHw="
         << committedHw << ")";
 
@@ -729,7 +643,7 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
         clientDrv, newLeaderCh, kClientStreamId, egressPort2);
     ASSERT_GT(conn2.assignedSessionId, 0) << "failed to connect to new leader gateway";
 
-    const Offset logEndBeforeRetry = newReplica->logEndOffset();
+    const Offset logEndBeforeRetry = leoOnOwner(*newLeaderNode);
 
     // -----------------------------------------------------------------------
     // KEY ASSERTION 1: Re-send seq=kN-1 (last committed) → Duplicate.
@@ -750,7 +664,7 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
             << baseOffsets[static_cast<std::size_t>(lastSeq)]
             << ". A different baseOffset means the gateway re-appended "
                "(TX-2b PSM rebuild bug: stale window caused Accept of a Duplicate).";
-        EXPECT_EQ(newReplica->logEndOffset(), logEndBeforeRetry)
+        EXPECT_EQ(leoOnOwner(*newLeaderNode), logEndBeforeRetry)
             << "logEndOffset must NOT advance on a Duplicate — re-append detected! "
                "Pre-fix: fresh PSM = empty map → Accept → re-append → data corruption.";
     }
@@ -764,7 +678,7 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
         EXPECT_EQ(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
         EXPECT_EQ(resp->baseOffset, baseOffsets[0])
             << "Dup seq=0 must return original baseOffset=" << baseOffsets[0];
-        EXPECT_EQ(newReplica->logEndOffset(), logEndBeforeRetry)
+        EXPECT_EQ(leoOnOwner(*newLeaderNode), logEndBeforeRetry)
             << "log must not advance on dup seq=0";
     }
 
@@ -780,7 +694,7 @@ TEST(TX2b_GatewayDriven, FailoverDedup_HandleProducePath) {
         EXPECT_GT(resp->baseOffset, baseOffsets[kN - 1])
             << "New seq=" << kN
             << " must have a baseOffset strictly above the last committed batch";
-        EXPECT_GT(newReplica->logEndOffset(), logEndBeforeRetry)
+        EXPECT_GT(leoOnOwner(*newLeaderNode), logEndBeforeRetry)
             << "log MUST advance for a genuinely new sequence (seq=" << kN << ")";
     }
 

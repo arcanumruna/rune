@@ -154,6 +154,9 @@ static inline std::vector<uint8_t> makeDataBatch(int64_t baseOffset,
     builder.setProducerId(producerId);
     builder.setProducerEpoch(producerEpoch);
     builder.setBaseSequence(baseSequence);
+    // Transactional data (F15 / Kafka parity): read_committed filters aborted data only from
+    // batches carrying kAttrTransactional — the harness produces inside transactions.
+    builder.setTransactional(true);
     builder.append({}, value, 0);
     return builder.build();
 }

@@ -1,15 +1,15 @@
 // ---------------------------------------------------------------------------
 // ProducerStateManager.cpp — Kafka-style idempotent producer dedup.
 //
-// On-disk snapshot format (all little-endian):
+// On-disk snapshot format (all little-endian), VERSION 3:
 //
 // File header:
 //   [0..3]   uint32  magic        = kFileMagic (0x50534D47 "PSMG")
-//   [4..7]   uint32  version      = 1
+//   [4..7]   uint32  version      = 3
 //   [8..11]  uint32  entryCount
-//   [12..15] uint32  _pad = 0
+//   [12..15] uint32  windowSlots  = W (kRetryWindowSize at write time)
 //
-// Per-entry (fixed size = kEntrySize):
+// Per-entry (fixed size = 32 + W*16 + 4):
 //   [0..7]   int64   producerId
 //   [8..11]  int32   partition
 //   [12..13] int16   producerEpoch
@@ -17,16 +17,17 @@
 //   [16..19] int32   lastSequence
 //   [20..23] int32   windowHead
 //   [24..27] int32   windowCount
-//   [28..31] int32   _pad = 0
-//   Then kRetryWindowSize * kBatchDescSize bytes of window slots:
+//   [28..31] int32   topicId
+//   Then W * 16 bytes of window slots:
 //     slot: int32 baseSequence, int32 lastSequence, int64 baseOffset (16 bytes)
 //   Trailing uint32 CRC32C of everything in the entry before the checksum.
 //
-// kEntrySize = 32 + kRetryWindowSize * 16 + 4
-//            = 32 + 5 * 16 + 4 = 116 bytes
+// Version 2 (TX-2c .. EOS-OOS): identical except [12..15] was pad (0) and W was
+// implicitly 5.  recover() reads both; a recorded W different from the current
+// kRetryWindowSize is re-windowed (slots replayed oldest-first, the newest
+// min(W, kRetryWindowSize) kept).  Version 1 (no topicId) is rejected.
 //
-// The file is written atomically: entries, then file header, then fsync.
-// Replay: read header, then read each entry verbatim.
+// The file is written atomically: temp file, fsync, rename.
 // A torn entry (file too short, CRC mismatch) stops replay; we keep what we
 // decoded so far — the last snapshot is always consistent.
 // ---------------------------------------------------------------------------
@@ -34,6 +35,7 @@
 #include <rune/storage/ProducerStateManager.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/InMemoryLog.h>
+#include <rune/storage/ControlMarkerLayout.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <fcntl.h>
@@ -44,6 +46,7 @@
 #include <bit>
 #include <cassert>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 #include <vector>
@@ -89,20 +92,26 @@ static T rle(const uint8_t* p) noexcept { T v{}; std::memcpy(&v, p, sizeof(T)); 
 // Layout constants
 // ---------------------------------------------------------------------------
 static constexpr uint32_t kFileMagic   = 0x50534D47u; // "PSMG"
-// TX-2c: bumped to version 2 to include topicId in the per-entry header.
-// Version 1 snapshots (no topicId) are rejected cleanly in recover().
-static constexpr uint32_t kFileVersion = 2u;
-static constexpr uint32_t kFileHdrSize = 16u;         // magic+version+count+pad
+// TX-2c: version 2 added topicId to the per-entry header.
+// EOS-OOS: version 3 records the window size in the file header (the window
+// grew 5 -> kIdempotentMaxInFlightBatches).  Version 1 is rejected.
+static constexpr uint32_t kFileVersion   = 3u;
+static constexpr uint32_t kFileVersionV2 = 2u;
+static constexpr uint32_t kV2WindowSlots = 5u;
+static constexpr uint32_t kFileHdrSize   = ProducerStateManager::kSnapshotFileHeaderBytes;
 
 static constexpr uint32_t kBatchDescSize = 16u;       // int32+int32+int64
-// Per-entry fixed header (TX-2c, version 2):
+// Per-entry fixed header:
 //   producerId(8) + partition(4) + epoch(2) + pad(2)
 //   + lastSequence(4) + windowHead(4) + windowCount(4) + topicId(4) = 32
-// topicId replaces the former trailing pad(4) at [28..31].
 static constexpr uint32_t kEntryFixedSize = 32u;
-static constexpr uint32_t kWindowBytes    = kRetryWindowSize * kBatchDescSize; // 80
 static constexpr uint32_t kChecksumSize   = 4u;
-static constexpr uint32_t kEntrySize      = kEntryFixedSize + kWindowBytes + kChecksumSize; // 116
+static constexpr uint32_t entrySizeFor(uint32_t windowSlots) noexcept {
+    return kEntryFixedSize + windowSlots * kBatchDescSize + kChecksumSize;
+}
+static constexpr uint32_t kWindowBytes = static_cast<uint32_t>(kRetryWindowSize) * kBatchDescSize;
+static constexpr uint32_t kEntrySize   = entrySizeFor(static_cast<uint32_t>(kRetryWindowSize));
+static_assert(kEntrySize == ProducerStateManager::kSnapshotEntryBytes);
 
 // -------------------------------------------------------------------------
 // Encode one BatchDescriptor into p (16 bytes, LE)
@@ -147,7 +156,11 @@ ProducerStateManager::validate(int32_t topicId,
         // Brand-new producer on this partition — trust-on-first-use.
         // Epoch is accepted as-is for the first appearance of a (producerId, partition)
         // pair on this node. Cross-node epoch fencing requires a coordinator.
-        if (baseSequence != 0) return ValidationResult::oos();
+        // D6 (Kafka UNKNOWN_PRODUCER_ID): a non-zero first sequence means this
+        // state does not know the producer — typically retention removed all its
+        // batches before a rebuild.  NOT appended; the caller answers it with
+        // the partition's logStartOffset (OutOfOrderSequence to old clients).
+        if (baseSequence != 0) return ValidationResult::unknownProducer();
         return ValidationResult::accept();
     }
 
@@ -164,29 +177,46 @@ ProducerStateManager::validate(int32_t topicId,
         return ValidationResult::accept();
     }
 
-    // Same epoch — check sequence.
-    // First, scan the retry window for an exact duplicate.
+    // Same epoch.  Hot path: the next in-order batch — header only, no scan.
+    if (baseSequence > e.lastSequence) {
+        // lastSequence == -1 means no batch appended yet in this epoch → expect 0.
+        if (baseSequence == e.lastSequence + 1) return ValidationResult::accept();
+        // D6 L1: a rebuilt marker-only entry knows the epoch, not the producer's sequence.
+        if (e.markerOnly) return ValidationResult::unknownProducer();
+        return ValidationResult::oos();   // forward gap
+    }
+
+    // Review I2: sequences wrap INT32_MAX -> 0 (Kafka incrementSequence).  The
+    // batch after lastSequence == INT32_MAX starts at 0 and is IN ORDER — never
+    // a known-old duplicate (that would answer OK without appending: loss).
+    if (e.lastSequence == std::numeric_limits<int32_t>::max() && baseSequence == 0)
+        return ValidationResult::accept();
+
+    // baseSequence <= lastSequence: a retransmit (rare).  An exact match in the
+    // window answers with the original offset.  Filled slots are [0, count)
+    // (circular only once full; the match is order-independent).
     for (int i = 0; i < e.windowCount; ++i) {
-        // Window is stored oldest-first from windowHead when full, or from [0]
-        // when not full. The easiest approach: iterate all filled slots.
-        // Slots 0..windowCount-1 if not yet wrapped; circular otherwise.
-        int slot = (e.windowHead - e.windowCount + kRetryWindowSize + i) % kRetryWindowSize;
-        const auto& bd = e.window[slot];
-        if (bd.baseSequence == baseSequence && bd.lastSequence == lastSequenceInBatch) {
-            return ValidationResult::dup(bd.baseOffset);
+        const auto& r = e.seqs[static_cast<std::size_t>(i)];
+        if (r.base == baseSequence && r.last == lastSequenceInBatch) {
+            const int64_t off = e.baseOffsets[static_cast<std::size_t>(i)];
+            return ValidationResult::dup(off, off + (r.last - r.base));
         }
     }
 
-    // Compute the expected next baseSequence.
-    // lastSequence == -1 means no batch appended yet in this epoch.
-    int32_t expected = (e.lastSequence < 0) ? 0 : e.lastSequence + 1;
-
-    if (baseSequence == expected) {
-        return ValidationResult::accept();
+    // EOS-OOS (Kafka DUPLICATE_SEQUENCE_NUMBER parity): entirely at or below
+    // lastSequence but not in the window → a KNOWN-OLD duplicate.  Every
+    // sequence <= lastSequence of this epoch was appended (in order, from 0), so
+    // the records are stored: OK with an unknown offset, never re-appended.  Its
+    // answer waits on the batch holding lastSequence (the newest slot).
+    if (lastSequenceInBatch <= e.lastSequence) {
+        const int n = e.newestSlot();
+        const int64_t covered = n < 0 ? int64_t{-1}
+            : e.baseOffsets[static_cast<std::size_t>(n)] +
+              (e.seqs[static_cast<std::size_t>(n)].last - e.seqs[static_cast<std::size_t>(n)].base);
+        return ValidationResult::dup(-1, covered);
     }
 
-    // baseSequence < expected and not in retry window → stale / gap
-    // baseSequence > expected → forward gap
+    // Partially overlaps lastSequence (base <= last < end) → OutOfOrderSequence.
     return ValidationResult::oos();
 }
 
@@ -203,22 +233,55 @@ void ProducerStateManager::update(int32_t topicId,
 {
     ProducerStateEntry& e = getOrCreate(topicId, producerId, partition);
 
+    // F15 S5: a replayed batch older than an already-applied fence (or a
+    // later epoch) never re-enters the window — it would make a new session's
+    // sequence look like a duplicate of zombie data.
+    if (producerEpoch < e.producerEpoch) return;
+
     if (producerEpoch > e.producerEpoch) {
         // New epoch: clear retry window + reset sequence state.
         e.producerEpoch = producerEpoch;
         e.lastSequence  = -1;
-        e.windowHead    = 0;
-        e.windowCount   = 0;
-        e.window        = {};
+        e.resetWindow();
     }
 
     // Record the batch in the retry window (circular, evicts oldest when full).
-    BatchDescriptor bd{baseSequence, lastSequence, baseOffset};
-    e.window[e.windowHead] = bd;
-    e.windowHead = (e.windowHead + 1) % kRetryWindowSize;
-    if (e.windowCount < kRetryWindowSize) ++e.windowCount;
-
+    e.push(baseSequence, lastSequence, baseOffset);
     e.lastSequence = lastSequence;
+    e.markerOnly   = false;   // D6 L1: a sequence of this epoch is known now
+}
+
+// ---------------------------------------------------------------------------
+// fenceEpoch — F15 S5 (C1+, I3): raise only
+// ---------------------------------------------------------------------------
+void ProducerStateManager::fenceEpoch(int32_t topicId, int64_t producerId, int32_t partition,
+                                      int16_t producerEpoch, bool fromRebuild, int32_t coordinatorEpoch)
+{
+    if (producerId < 0 || producerEpoch < 0) return;
+    ProducerStateEntry& e = getOrCreate(topicId, producerId, partition);
+    if (coordinatorEpoch > e.coordinatorEpoch) e.coordinatorEpoch = coordinatorEpoch;   // D9 MAJOR-2
+    if (producerEpoch <= e.producerEpoch) return;
+    e.producerEpoch = producerEpoch;
+    e.lastSequence  = -1;
+    e.markerOnly    = fromRebuild;   // D6 L1: no sequence of this epoch survives in the log
+    e.resetWindow();
+}
+
+bool ProducerStateManager::markerCoordinatorFenced(int32_t topicId, int64_t producerId, int32_t partition,
+                                                   int32_t coordinatorEpoch) const
+{
+    const ProducerStateEntry* e = entry(topicId, producerId, partition);
+    return e != nullptr && coordinatorEpoch < e->coordinatorEpoch;
+}
+
+// ---------------------------------------------------------------------------
+// clearPartition — F15 S5 (I3): before a rebuild of (topicId, partition)
+// ---------------------------------------------------------------------------
+void ProducerStateManager::clearPartition(int32_t topicId, int32_t partition)
+{
+    std::erase_if(map_, [&](const auto& kv) noexcept {
+        return kv.first.topicId == topicId && kv.first.partition == partition;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -262,7 +325,7 @@ void ProducerStateManager::takeSnapshot(const std::string& path) const
     wle<uint32_t>(p,      kFileMagic);
     wle<uint32_t>(p + 4,  kFileVersion);
     wle<uint32_t>(p + 8,  static_cast<uint32_t>(count));
-    wle<uint32_t>(p + 12, 0u); // pad
+    wle<uint32_t>(p + 12, static_cast<uint32_t>(kRetryWindowSize)); // v3: window slots
     p += kFileHdrSize;
 
     // Entries.
@@ -274,13 +337,13 @@ void ProducerStateManager::takeSnapshot(const std::string& path) const
         wle<int16_t>(ep + 12, e.producerEpoch);
         wle<int16_t>(ep + 14, 0); // pad
         wle<int32_t>(ep + 16, e.lastSequence);
-        wle<int32_t>(ep + 20, e.windowHead);
-        wle<int32_t>(ep + 24, e.windowCount);
+        wle<int32_t>(ep + 20, static_cast<int32_t>(e.windowHead));
+        wle<int32_t>(ep + 24, static_cast<int32_t>(e.windowCount));
         wle<int32_t>(ep + 28, key.topicId); // TX-2c: topicId (replaces former pad)
 
         uint8_t* wp = ep + kEntryFixedSize;
         for (int i = 0; i < kRetryWindowSize; ++i) {
-            encodeBatch(wp + static_cast<std::size_t>(i) * kBatchDescSize, e.window[i]);
+            encodeBatch(wp + static_cast<std::size_t>(i) * kBatchDescSize, e.slot(i));
         }
 
         // CRC over the entry body (excluding the trailing checksum itself).
@@ -355,21 +418,31 @@ int ProducerStateManager::recover(const std::string& path)
 
     const uint8_t* p = buf.data();
 
-    // Validate file header.
-    if (rle<uint32_t>(p) != kFileMagic || rle<uint32_t>(p + 4) != kFileVersion) {
-        return 0; // wrong magic/version
+    // Validate file header (v3: recorded window size; v2: implicit 5 slots).
+    if (rle<uint32_t>(p) != kFileMagic) return 0;
+    const uint32_t version = rle<uint32_t>(p + 4);
+    uint32_t slots = 0;
+    if (version == kFileVersion) {
+        slots = rle<uint32_t>(p + 12);
+        if (slots == 0 || slots > 255u) return 0;           // corrupt header
+    } else if (version == kFileVersionV2) {
+        slots = kV2WindowSlots;
+    } else {
+        return 0;                                           // v1 / unknown
     }
+    const uint32_t entrySize   = entrySizeFor(slots);
+    const uint32_t windowBytes = slots * kBatchDescSize;
     const uint32_t count = rle<uint32_t>(p + 8);
     p += kFileHdrSize;
 
     // S4: 64-bit arithmetic to prevent overflow for large count values from disk.
     const uint64_t needed = static_cast<uint64_t>(kFileHdrSize) +
-                            static_cast<uint64_t>(count) * static_cast<uint64_t>(kEntrySize);
+                            static_cast<uint64_t>(count) * static_cast<uint64_t>(entrySize);
     if (static_cast<uint64_t>(fileSize) < needed) {
         return 0; // file truncated
     }
     // Bound count against fileSize to prevent over-read if count is forged.
-    const uint32_t maxEntries = static_cast<uint32_t>((fileSize - kFileHdrSize) / kEntrySize);
+    const uint32_t maxEntries = static_cast<uint32_t>((fileSize - kFileHdrSize) / entrySize);
 
     map_.clear();
     int loaded = 0;
@@ -377,11 +450,11 @@ int ProducerStateManager::recover(const std::string& path)
     const uint32_t safeCount = std::min(count, maxEntries);
 
     for (uint32_t i = 0; i < safeCount; ++i) {
-        const uint8_t* ep = p + static_cast<std::size_t>(i) * kEntrySize;
+        const uint8_t* ep = p + static_cast<std::size_t>(i) * entrySize;
 
         // CRC check.
-        uint32_t storedCksum = rle<uint32_t>(ep + kEntryFixedSize + kWindowBytes);
-        uint32_t computed    = crc32c(ep, kEntryFixedSize + kWindowBytes);
+        uint32_t storedCksum = rle<uint32_t>(ep + kEntryFixedSize + windowBytes);
+        uint32_t computed    = crc32c(ep, kEntryFixedSize + windowBytes);
         if (storedCksum != computed) {
             break; // torn/corrupt entry — stop here, keep what we have
         }
@@ -394,19 +467,24 @@ int ProducerStateManager::recover(const std::string& path)
         e.producerEpoch = rle<int16_t>(ep + 12);
         // [14..15] pad
         e.lastSequence  = rle<int32_t>(ep + 16);
-        e.windowHead    = rle<int32_t>(ep + 20);
-        e.windowCount   = rle<int32_t>(ep + 24);
+        int32_t head    = rle<int32_t>(ep + 20);
+        int32_t cnt     = rle<int32_t>(ep + 24);
         key.topicId     = rle<int32_t>(ep + 28); // TX-2c: topicId (was former pad)
 
         // S5: clamp windowHead/windowCount to valid ranges (defense against corrupt snapshots).
-        if (e.windowCount < 0 || e.windowCount > kRetryWindowSize)
-            e.windowCount = std::clamp(e.windowCount, 0, kRetryWindowSize);
-        if (e.windowHead < 0 || e.windowHead >= kRetryWindowSize)
-            e.windowHead = 0;
+        const auto islots = static_cast<int32_t>(slots);
+        cnt = std::clamp(cnt, 0, islots);
+        if (head < 0 || head >= islots) head = 0;
 
+        // Replay the recorded slots oldest-first into the current window: the
+        // newest min(slots, kRetryWindowSize) survive, in order (re-windowing
+        // when the recorded size differs; identity when it is the same).
         const uint8_t* wp = ep + kEntryFixedSize;
-        for (int j = 0; j < kRetryWindowSize; ++j) {
-            e.window[j] = decodeBatch(wp + static_cast<std::size_t>(j) * kBatchDescSize);
+        const int32_t oldest = (cnt < islots) ? 0 : head;
+        for (int32_t j = 0; j < cnt; ++j) {
+            const int32_t s = (oldest + j) % islots;
+            const BatchDescriptor bd = decodeBatch(wp + static_cast<std::size_t>(s) * kBatchDescSize);
+            e.push(bd.baseSequence, bd.lastSequence, bd.baseOffset);
         }
 
         map_.emplace(key, e);
@@ -431,160 +509,137 @@ int ProducerStateManager::recover(const std::string& path)
 //     the real produce sequence.
 //
 // Non-idempotent batches (producerId == -1) are silently skipped.
-// Control batches are also skipped (their producerId is set but baseSequence
-// is typically -1 — the PSM only tracks data batches).
+// Control batches are applied as epoch raises (fenceEpoch, F15 S5 / I3) —
+// never as sequences.
 //
-// TX-2b: highWatermark MUST be the committed HW (replica->highWatermark()),
-// not the log-end-offset (LEO).  Batches above HW may be truncated by KIP-101
-// divergence resolution; seeding PSM state from them would produce a false-
-// Duplicate for a producer retry of a never-committed sequence, with the
-// duplicate-reported offset pointing at a truncated-away (non-existent) log
-// position — acknowledged data loss.
+// PSM <-> log consistency (review of b4594f8; supersedes TX-2b's HW bound): a
+// state that answers produces is built to the LEO — every stored batch, the
+// leader's kept tail above HW included (Kafka loads producer state to the log
+// end).  Built only to HW it ACCEPTED a resend of the first tail batch (a
+// silent duplicate) and answered OOS for later stored ones.  The tail's
+// possible KIP-101 truncation is handled by invalidation: the owner rebuilds
+// on every log-generation / leadership change (RcState, proveInlinePsm_), so
+// no window ever covers a truncated-away offset.
 //
-// takeSnapshot / recover: not called in the current codebase hot path.  They
-// are a future Phase-5 optimisation for fast restart on large logs (skip the
-// full scan with a pre-built PSM image).
+// takeSnapshot / recover: not called by the broker (no production caller).
+// recover() restores whatever was snapshotted without checking it against the
+// log, so a future caller must re-validate (rebuild the suffix past the
+// snapshot and drop it on a log-generation change) before answering produces.
 //
 // Production callers of rebuildFromLog:
-//   • ClientGateway::rebuildProducerStateFromLogs (ClientGateway.cpp:212) —
-//     called on leader election / restart over every (topicId, partition).
-//   • PartitionReplica::truncateLog (Task 11) — re-rebuild fired atomically
-//     when a KIP-101 divergence truncation lands at or below the rebuild HW.
+//   • ClientGateway::proveInlinePsm_ — the inline path, per partition, to LEO.
+//   • Worker::provePassthroughPsm_ — replica-less partitions, to LEO.
+//   • RcState::advance — a memory-backed partition (InMemoryLog), to LEO.
+//   • PartitionReplica::truncateLog (Task 11) — its own (test-only) state.
 //
 // Cold path: allocations acceptable.
 // ---------------------------------------------------------------------------
+namespace {
+// The first segment base strictly above `offset` (a compaction gap below the
+// bound), or -1.  An InMemoryLog has no gaps: every offset in [logStart, LEO)
+// is held by a batch.
+int64_t nextBaseAfter(Log& log, int64_t offset) noexcept { return log.nextSegmentBaseAfter(offset); }
+int64_t nextBaseAfter(InMemoryLog&, int64_t) noexcept { return -1; }
+// One past the last written offset of the segment holding `offset` (-1 = unknown / no segment).
+int64_t segmentEndAt(Log& log, int64_t offset) noexcept { return log.segmentNextOffsetAt(offset); }
+int64_t segmentEndAt(InMemoryLog&, int64_t) noexcept { return -1; }
+// Per-step budget of the synchronous rebuildFromLog loop.
+constexpr std::size_t kSyncStepBytes = 4u * 1024u * 1024u;
+} // namespace
+
 template<class LogT>
-void ProducerStateManager::rebuildFromLog(int32_t topicId,
+bool ProducerStateManager::rebuildFromLog(int32_t topicId,
                                            LogT&    log,
                                            int64_t highWatermark,
                                            int32_t partition)
 {
-    // Task 11: record the HW bound for this rebuild so PartitionReplica::truncateLog
-    // can detect when a subsequent KIP-101 divergence truncation falls below it and
-    // must trigger a re-rebuild to keep the dedup window consistent.
-    rebuildHw_ = highWatermark;
+    Rebuild r;
+    beginRebuild(r, topicId, log, highWatermark, partition);
+    Rebuild::Status st = Rebuild::Status::InProgress;
+    while (st == Rebuild::Status::InProgress) st = rebuildStep(r, log, kSyncStepBytes);
+    return st == Rebuild::Status::Done;
+}
 
-    // TX-2c multi-partition fix: clear ONLY the keys for this (topicId, partition)
-    // instead of the whole map.  ClientGateway::rebuildProducerStateFromLogs calls
-    // this method in a loop over every (topicId, partition) on ONE shared PSM.
-    // The old map_.clear() wiped every prior partition's state on each iteration —
-    // only the LAST partition iterated survived, making dedup silently broken for
-    // any topic with >1 partition or any node hosting >1 (topicId, partition).
-    // With erase_if, each call is still idempotent for its own (topicId, partition)
-    // (RebuildIsIdempotent passes), but state from other partitions is preserved.
-    std::erase_if(map_, [&](const auto& kv) noexcept {
-        return kv.first.topicId == topicId && kv.first.partition == partition;
-    });
+template<class LogT>
+void ProducerStateManager::beginRebuild(Rebuild& r, int32_t topicId, LogT& log, int64_t bound,
+                                        int32_t partition)
+{
+    // Task 11: record the bound for PartitionReplica::truncateLog's re-rebuild test.
+    rebuildHw_ = bound;
+    // TX-2c: clear ONLY this (topicId, partition) — the map is shared.
+    clearPartition(topicId, partition);
+    r.topicId   = topicId;
+    r.partition = partition;
+    // CP-3: start at the first surviving offset (retention advances it).
+    r.next      = log.logStartOffset();
+    r.target    = bound;
+}
 
-    if (highWatermark <= 0) return;
-
-    static constexpr int32_t kChunkBytes = 64 * 1024 * 1024; // 64 MiB per read
-
-    // CP-3: start the scan at the log's FIRST surviving segment base, not a
-    // hardcoded 0.  Size retention (Delete / CompactDelete via
-    // Log::deleteOldSegments) can age out the front of the log, advancing the
-    // first segment's base past 0.  In that case log.read(0) returns empty and
-    // a fetchOffset==0 start would bail immediately, reconstructing NO producer
-    // state — silently breaking idempotent dedup after any retention on the
-    // producer-bearing log (e.g. __transaction_state).  Beginning at the first
-    // live segment base makes rebuild robust to a trimmed log prefix.
-    int64_t fetchOffset = 0;
-    {
-        const auto segBases = log.segmentBaseOffsets();
-        if (!segBases.empty() && segBases.front() > 0) {
-            fetchOffset = segBases.front();
-        }
-    }
-
-    while (fetchOffset < highWatermark) {
-        // Log::read() resolves only ONE segment per call (the segment that
-        // contains fetchOffset).  Loop until we reach highWatermark.
-        std::vector<uint8_t> data =
-            log.read(fetchOffset, kChunkBytes);
-        if (data.empty()) {
-            // CP-4: log.read() can return empty even when more segments exist.
-            // After compaction (Compact / CompactDelete policy via
-            // LogCleaner::cleanSegment), records within a segment are removed
-            // and the surviving records may not start at the segment's logical
-            // base offset.  If fetchOffset falls in a gap (e.g. offset N was
-            // compacted away, but the segment's base is < N), read() returns
-            // empty because no batch covers offset N.  Simply breaking here
-            // would stop the rebuild prematurely, leaving producer state for
-            // later segments unseen — yielding spurious OOS errors on retries.
-            //
-            // Fix: when read() returns empty, try to advance fetchOffset to
-            // the start of the next segment whose base is strictly greater
-            // than the current fetchOffset.  If no such segment exists, the
-            // log truly has no more data and we stop.
-            const auto segBases = log.segmentBaseOffsets();
-            auto it = std::upper_bound(segBases.begin(), segBases.end(), fetchOffset);
-            if (it == segBases.end()) break; // no segment after fetchOffset
-            fetchOffset = *it;
+template<class LogT>
+ProducerStateManager::Rebuild::Status
+ProducerStateManager::rebuildStep(Rebuild& r, LogT& log, std::size_t budgetBytes)
+{
+    using S = Rebuild::Status;
+    const int64_t logStart = log.logStartOffset();
+    if (r.next < logStart) r.next = logStart;   // retention between steps: those batches are gone
+    std::size_t consumed = 0;
+    while (r.next < r.target) {
+        if (consumed >= budgetBytes && consumed > 0) return S::InProgress;
+        const std::size_t room = budgetBytes > consumed ? budgetBytes - consumed : 1;
+        const LogReadView v = log.readView(r.next, static_cast<int32_t>(
+            std::min<std::size_t>(room, static_cast<std::size_t>(std::numeric_limits<int32_t>::max()))));
+        if (v.empty()) {
+            // Re-review C1: an empty view BELOW the segment's written end means bytes exist that
+            // cannot be read (corrupt length, failed mapping) — never a gap: fail the proof.
+            if (const int64_t segEnd = segmentEndAt(log, r.next); segEnd > r.next) return S::Failed;
+            // CP-4: a compaction gap (a sealed segment's superseded tail) — or
+            // the end of the data.  Skip to the next segment base.
+            const int64_t nb = nextBaseAfter(log, r.next);
+            if (nb < 0 || nb >= r.target) return S::Done;
+            if (nb <= r.next) return S::Failed;   // no progress
+            r.next = nb;
             continue;
         }
-
+        // readView yields WHOLE batches only (the first one always): a batch is
+        // never cut at the window edge.
         std::size_t pos = 0;
-        int64_t     lastBatchEnd = fetchOffset; // progress sentinel
-
-        while (pos < data.size()) {
-            const uint8_t*    batchStart = data.data() + pos;
-            const std::size_t remaining  = data.size() - pos;
-
-            if (remaining < static_cast<std::size_t>(
-                    rune::protocol::batch::kRecordBatchOverhead))
-                break;
-
-            rune::protocol::RecordBatchReader reader(batchStart, remaining);
-
+        const int64_t before = r.next;
+        constexpr std::size_t kOverhead = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
+        while (pos + kOverhead <= v.len) {
+            rune::protocol::RecordBatchReader reader(v.data + pos, v.len - pos);
             const int32_t tl = reader.totalLength();
-            if (tl <= 0 || static_cast<std::size_t>(tl) > remaining) break;
-
-            // Only CRC-valid batches are accepted.
-            if (!reader.ensureValid()) break;
-
+            if (tl <= 0 || static_cast<std::size_t>(tl) > v.len - pos) return S::Failed;
             const int64_t batchBase = reader.baseOffset();
+            if (batchBase >= r.target) return S::Done;   // past the bound (before its CRC matters)
+            if (!reader.ensureValid()) return S::Failed;
             const int32_t lastDelta = reader.lastOffsetDelta();
-            const int64_t batchEnd  = batchBase + lastDelta + 1;
-
-            // Skip control batches (COMMIT/ABORT markers) — they are tagged
-            // with the CONTROL attribute bit; their baseSequence is meaningless
-            // for idempotent-producer dedup (and is typically -1 when built by
-            // ControlMarker::build which doesn't stamp a sequence).
-            const bool isControl =
-                (reader.attributes() & rune::protocol::batch::kAttrControl) != 0;
-
-            // TX-2b: stop processing batches once we reach or exceed the HW bound.
-            // The outer while(fetchOffset < highWatermark) controls which LOG
-            // SEGMENTS are fetched, but within a single read() chunk the segment
-            // may contain batches beyond HW (e.g. the uncommitted tail in the same
-            // segment as the last committed batch).  We must stop here — otherwise
-            // we would seed PSM state from uncommitted batches that may later be
-            // truncated by KIP-101, producing a false-Duplicate for a real produce.
-            if (batchBase >= highWatermark) break;
-
-            const int64_t pid   = reader.producerId();
-            const int16_t epoch = reader.producerEpoch();
-            const int32_t baseSeq = reader.baseSequence();
-
-            // Record idempotent data batches only:
-            //   producerId >= 0 — idempotent producer
-            //   baseSequence >= 0 — valid sequence (non-idempotent default is -1)
-            //   not a control batch
-            if (!isControl && pid >= 0 && baseSeq >= 0) {
-                // lastSequence = baseSequence + lastOffsetDelta
-                // (for a multi-record batch, lastOffsetDelta == recordCount - 1,
-                //  matching how handleProduce computes lastSeqInBatch).
-                const int32_t lastSeq = baseSeq + lastDelta;
-                update(topicId, pid, partition, epoch, baseSeq, lastSeq, batchBase);
+            const int64_t batchLast = batchBase + lastDelta;
+            if (batchLast >= r.next) {   // below the cursor: already applied (re-framed by compaction)
+                const int64_t pid = reader.producerId();
+                const bool isControl =
+                    (reader.attributes() & rune::protocol::batch::kAttrControl) != 0;
+                // F15 S5 (I3): a control batch is an epoch raise, never a sequence.
+                if (isControl && pid >= 0) {
+                    fenceEpoch(r.topicId, pid, r.partition, reader.producerEpoch(), /*fromRebuild=*/true,
+                               control_marker::coordinatorEpoch(v.data + pos, static_cast<std::size_t>(tl)));
+                } else if (!isControl && pid >= 0 && reader.baseSequence() >= 0) {
+                    const int32_t baseSeq = reader.baseSequence();
+                    update(r.topicId, pid, r.partition, reader.producerEpoch(), baseSeq, baseSeq + lastDelta,
+                           batchBase);
+                }
+                r.next = batchLast + 1;
             }
-
-            if (batchEnd > lastBatchEnd) lastBatchEnd = batchEnd;
             pos += static_cast<std::size_t>(tl);
         }
-
-        if (lastBatchEnd <= fetchOffset) break; // no progress — stop
-        fetchOffset = lastBatchEnd;
+        if (pos != v.len) return S::Failed;   // a fragment inside the written bytes
+        consumed += v.len;
+        if (r.next <= before) {
+            // The whole view lay below the cursor: continue after it.
+            if (v.nextOffset <= r.next) return S::Failed;
+            r.next = v.nextOffset;
+        }
     }
+    return S::Done;
 }
 
 // De-virtualized seam (Milestone D Phase 2): explicit instantiations for the two
@@ -592,9 +647,15 @@ void ProducerStateManager::rebuildFromLog(int32_t topicId,
 // used with; each instantiation calls read()/segmentBaseOffsets() directly (no
 // vtable).  Keeping the definition out-of-line avoids pulling the segment/
 // filesystem machinery into every translation unit that includes the header.
-template void ProducerStateManager::rebuildFromLog<Log>(
+template bool ProducerStateManager::rebuildFromLog<Log>(
         int32_t, Log&, int64_t, int32_t);
-template void ProducerStateManager::rebuildFromLog<InMemoryLog>(
+template bool ProducerStateManager::rebuildFromLog<InMemoryLog>(
         int32_t, InMemoryLog&, int64_t, int32_t);
+template void ProducerStateManager::beginRebuild<Log>(Rebuild&, int32_t, Log&, int64_t, int32_t);
+template void ProducerStateManager::beginRebuild<InMemoryLog>(Rebuild&, int32_t, InMemoryLog&, int64_t, int32_t);
+template ProducerStateManager::Rebuild::Status
+ProducerStateManager::rebuildStep<Log>(Rebuild&, Log&, std::size_t);
+template ProducerStateManager::Rebuild::Status
+ProducerStateManager::rebuildStep<InMemoryLog>(Rebuild&, InMemoryLog&, std::size_t);
 
 } // namespace rune::storage

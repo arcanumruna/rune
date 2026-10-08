@@ -94,12 +94,12 @@ static PartitionConfig makeFollowerConfig(NodeId selfId, NodeId leaderId)
 // Null transport: we drive the PSM and truncation directly — no fetch round-trips.
 class NullTransportPsm : public PartitionTransport {
 public:
-    void sendFetchRequest(const FetchRequestMsg&) override {}
-    void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
-    void sendOffsetsForLeaderEpochRequest(
-            NodeId, const OffsetsForLeaderEpochReqMsg&) override {}
-    void sendOffsetsForLeaderEpochResponse(
-            NodeId, const OffsetsForLeaderEpochRespMsg&) override {}
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { return true; }
+    bool sendOffsetsForLeaderEpochRequest(
+            NodeId, const OffsetsForLeaderEpochReqMsg&) override { return true; }
+    bool sendOffsetsForLeaderEpochResponse(
+            NodeId, const OffsetsForLeaderEpochRespMsg&) override { return true; }
 };
 
 // ---------------------------------------------------------------------------
@@ -123,8 +123,8 @@ static int64_t seedLog(InMemoryLog& log,
 // ===========================================================================
 // TEST 1 — Re-rebuild fires when truncation is BELOW the rebuild HW
 //
-// Key: kRetryWindowSize == 5, so with kTotal=6 batches (seqs 0..5):
-//   after rebuild at HW=6, window = {seq1, seq2, seq3, seq4, seq5},
+// Key: with kTotal=6 batches (seqs 0..5, all inside the 32-batch window):
+//   after rebuild at HW=6, window = {seq0 .. seq5},
 //   lastSequence = 5.
 //
 // Truncation to kTruncTo=3 removes offsets 3,4,5 from the log.
@@ -141,8 +141,7 @@ static int64_t seedLog(InMemoryLog& log,
 
 TEST(PsmReRebuildOnLowTruncation, ReRebuildsWhenTruncationBelowRebuildHw)
 {
-    // 6 batches (offsets 0..5, seqs 0..5) → all fit in retry window (size=5)
-    // after the last 5.  HW=6 covers all committed; truncate to 3 (< HW=6).
+    // 6 batches (offsets 0..5, seqs 0..5) → all fit in the retry window.  HW=6 covers all committed; truncate to 3 (< HW=6).
     static constexpr int32_t kTotal     = 6;    // LEO=6 after seeding
     static constexpr int32_t kRebuildHw = 6;    // rebuild PSM at HW=6 (all committed)
     static constexpr int32_t kTruncTo   = 3;    // truncate to offset 3 (< rebuild HW)
@@ -175,7 +174,7 @@ TEST(PsmReRebuildOnLowTruncation, ReRebuildsWhenTruncationBelowRebuildHw)
         << "rebuildHighWatermark should equal kRebuildHw after explicit rebuild";
 
     // Before truncation: seq=kTruncTo (= seq 3, offset 3) IS in the retry
-    // window (one of the last 5 batches) → Duplicate.
+    // window → Duplicate.
     {
         int32_t seq = kTruncTo;  // seq=3, offset=3 — committed and in window
         auto r = psm.validate(kTopicId, kPid, kPartition, /*epoch=*/0,
@@ -188,15 +187,17 @@ TEST(PsmReRebuildOnLowTruncation, ReRebuildsWhenTruncationBelowRebuildHw)
     // Force a truncation to kTruncTo via OffsetsForLeaderEpochResponse.
     follower.becomeFollower(/*leaderEpoch=*/2, leaderId);
 
-    OffsetsForLeaderEpochRespMsg resp{};
-    resp.leaderEpoch   = 2;
-    resp.partition     = kPartition;
-    resp.responseEpoch = 1;    // shared epoch = 1
-    resp.endOffset     = kTruncTo;
-    resp.errorCode     = 0;    // kErrNone
-    resp.topicId       = kTopicId;
+    // KIP-320/595: the new leader's DivergingEpoch answer — our lineage ends
+    // at kTruncTo on its side (KIP-279 truncation on the fetch path).
+    FetchResponseMsg resp{};
+    resp.leaderEpoch        = 2;
+    resp.partition          = kPartition;
+    resp.errorCode          = rune::replication::kErrDivergingEpoch;
+    resp.topicId            = kTopicId;
+    rune::replication::ErrorPayloadBuf epb;
+    resp.records            = epb.set(/*shared epoch=*/1, kTruncTo);
 
-    follower.applyOffsetsForLeaderEpochResponse(resp);
+    follower.applyReplicated(resp);
 
     // --- Key assertions ---
 
@@ -280,15 +281,17 @@ TEST(PsmReRebuildOnLowTruncation, NoReRebuildWhenTruncationAboveRebuildHw)
     // Force a truncation to kTruncTo=8 (> kRebuildHw=5) — PSM does NOT re-rebuild.
     follower.becomeFollower(/*leaderEpoch=*/2, leaderId);
 
-    OffsetsForLeaderEpochRespMsg resp{};
-    resp.leaderEpoch   = 2;
-    resp.partition     = kPartition;
-    resp.responseEpoch = 1;
-    resp.endOffset     = kTruncTo;
-    resp.errorCode     = 0;
-    resp.topicId       = kTopicId;
+    // KIP-320/595: the new leader's DivergingEpoch answer — our lineage ends
+    // at kTruncTo on its side (KIP-279 truncation on the fetch path).
+    FetchResponseMsg resp{};
+    resp.leaderEpoch        = 2;
+    resp.partition          = kPartition;
+    resp.errorCode          = rune::replication::kErrDivergingEpoch;
+    resp.topicId            = kTopicId;
+    rune::replication::ErrorPayloadBuf epb;
+    resp.records            = epb.set(/*shared epoch=*/1, kTruncTo);
 
-    follower.applyOffsetsForLeaderEpochResponse(resp);
+    follower.applyReplicated(resp);
 
     // rebuildHighWatermark stays at kRebuildHw — no re-rebuild was triggered.
     EXPECT_EQ(psm.rebuildHighWatermark(), kRebuildHw)
@@ -352,15 +355,17 @@ TEST(PsmReRebuildOnLowTruncation, ReRebuildAtomicWithTruncation)
     // Trigger a truncation to kTruncTo (< kRebuildHw) via epoch response.
     follower.becomeFollower(/*leaderEpoch=*/2, leaderId);
 
-    OffsetsForLeaderEpochRespMsg resp{};
-    resp.leaderEpoch   = 2;
-    resp.partition     = kPartition;
-    resp.responseEpoch = 1;
-    resp.endOffset     = kTruncTo;
-    resp.errorCode     = 0;
-    resp.topicId       = kTopicId;
+    // KIP-320/595: the new leader's DivergingEpoch answer — our lineage ends
+    // at kTruncTo on its side (KIP-279 truncation on the fetch path).
+    FetchResponseMsg resp{};
+    resp.leaderEpoch        = 2;
+    resp.partition          = kPartition;
+    resp.errorCode          = rune::replication::kErrDivergingEpoch;
+    resp.topicId            = kTopicId;
+    rune::replication::ErrorPayloadBuf epb;
+    resp.records            = epb.set(/*shared epoch=*/1, kTruncTo);
 
-    follower.applyOffsetsForLeaderEpochResponse(resp);
+    follower.applyReplicated(resp);
 
     // Atomicity assertion: both log state and PSM state reflect kTruncTo in one
     // step — no intermediate window where log is truncated but PSM is not.

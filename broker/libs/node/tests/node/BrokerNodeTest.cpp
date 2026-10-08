@@ -13,18 +13,35 @@
 // All waits are bounded with hard deadlines + ASSERT.
 // Unique temp paths use getpid() + atomic counter.
 
+#include <rune/aeronutil/testing/FreePort.h>
+#include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
+#include <rune/node/HostDefaults.h>
+#include <rune/node/Worker.h>
+#include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
+#include <utility>
 #include <rune/node/NodeConfig.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 #include "support/TestWorkerCount.h"
+#include "support/ShardTestClient.h"
+#include <rune/codec/Descriptor.h>
+#include <rune/codec/Serialize.h>
+#include <rune/metadata/ShardRouter.h>
 
 #include <gtest/gtest.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <map>
+#include <stdexcept>
 #include <limits>
 #include <string>
 #include <thread>
@@ -40,6 +57,13 @@ namespace {
 // ---------------------------------------------------------------------------
 // Unique temp-path generator  (getpid + atomic counter)
 // ---------------------------------------------------------------------------
+// F3 round 6, item 7: WorkerOp ring framing computed from the GENERATED codec
+// constants (never a literal) — it moves whenever rune-protocol grows WorkerOp.
+static constexpr std::size_t kWorkerOpFramingFromCodec =
+    rune::protocol::internal::sbe::MessageHeader::encodedLength() +
+    rune::protocol::internal::sbe::WorkerOp::sbeBlockLength() +
+    rune::protocol::internal::sbe::WorkerOp::tailHeaderLength();
+
 static fs::path makeTempDataDir(std::string_view tag = "") {
     static std::atomic<uint32_t> g_seq{0};
     auto seq  = g_seq.fetch_add(1, std::memory_order_relaxed);
@@ -53,6 +77,7 @@ static fs::path makeTempDataDir(std::string_view tag = "") {
 // ---------------------------------------------------------------------------
 static NodeConfig makeSingleNodeConfig(const fs::path& dataDir) {
     NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId            = 0;
     cfg.dataDir           = dataDir.string();
     cfg.consensusStreamId = 10;
@@ -60,10 +85,10 @@ static NodeConfig makeSingleNodeConfig(const fs::path& dataDir) {
     PeerConfig self;
     self.id            = 0;
     self.host          = "127.0.0.1";
-    self.consensusPort = 40111;
+    self.consensusPort = rune::aeronutil::testing::allocFreeUdpPort();   // D8: never a fixed port
     cfg.peers          = {self};
 
-    cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:50001";
+    cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
     cfg.clientEndpoint.streamId = 1;
 
     cfg.workerCount = rune::node::test::workerCountFromEnv();
@@ -158,6 +183,39 @@ TEST(BrokerNodeTest, SingleNode_SelfElects) {
     EXPECT_EQ(node.leaderId(), static_cast<rune::consensus::NodeId>(cfg.nodeId));
 
     node.stop();
+}
+
+// Boot-level proof that every driver/client site honours aeronDir (the parse-level
+// NodeConfigRegression tests can't see BrokerNode's call sites).
+TEST(BrokerNodeRegression, AeronDirOverrideIsWhereTheDriverRuns) {
+    TempDir data{"aerondir_data_"};
+    TempDir aeron{"aerondir_aeron_"};
+    NodeConfig cfg = makeSingleNodeConfig(data.path);
+    cfg.aeronDir = (aeron.path / "a").string();
+
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(2s));
+    EXPECT_TRUE(fs::exists(fs::path{cfg.aeronDir} / "cnc.dat"))
+        << "driver must run in the configured RUNE_AERON_DIR";
+    EXPECT_FALSE(fs::exists(data.path / "aeron" / "cnc.dat"))
+        << "no driver may fall back to dataDir/aeron when aeronDir is set";
+    node.stop();
+}
+
+// An Aeron dir equal to the data dir would be recursively deleted by the driver
+// (dir_delete_on_start) — start() must refuse before any side effect.
+TEST(BrokerNodeRegression, AeronDirEqualToDataDirRefusedAtStartLogSurvives) {
+    TempDir data{"aerondir_same_"};
+    fs::create_directories(data.path);
+    const auto sentinel = data.path / "00000000000000000000.log";
+    { std::ofstream(sentinel) << "segment"; }
+
+    NodeConfig cfg = makeSingleNodeConfig(data.path);
+    cfg.aeronDir = data.path.string();
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::runtime_error);
+    EXPECT_TRUE(fs::exists(sentinel)) << "refusal must happen before the driver deletes anything";
 }
 
 // ===========================================================================
@@ -588,6 +646,7 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
     // -------------------------------------------------------------------------
     auto makeCoalescingConfig = [](const fs::path& dataDir, bool coalesce) -> NodeConfig {
         NodeConfig cfg;
+        rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
         cfg.nodeId            = 0;
         cfg.dataDir           = dataDir.string();
         cfg.consensusStreamId = 10;
@@ -595,10 +654,10 @@ TEST(BrokerNodeTest, CoalescingEndToEndViaBrokerNode) {
         PeerConfig self;
         self.id            = 0;
         self.host          = "127.0.0.1";
-        self.consensusPort = 40111;
+        self.consensusPort = rune::aeronutil::testing::allocFreeUdpPort();   // D8: never a fixed port
         cfg.peers          = {self};
 
-        cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:50001";
+        cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
         cfg.clientEndpoint.streamId = 1;
 
         TopicSpec ts;
@@ -917,10 +976,12 @@ TEST(BrokerNodeTest, M1_AllInSyncDurabilityWiresEndToEnd) {
 
     ASSERT_TRUE(node.awaitLeader(2s)) << "single-node must self-elect within 2 s";
 
-    auto* replica = node.replicaForTest(0, 0);
-    ASSERT_NE(replica, nullptr) << "replica must exist for topic 0 partition 0";
+    ASSERT_TRUE(rune::node::test::hasReplica(node)) << "replica must exist for topic 0 partition 0";
 
-    EXPECT_EQ(replica->durability(), rune::replication::DurabilityMode::AllInSync)
+    // F1: read on the replica's OWNING thread (no raw cross-thread replica access).
+    EXPECT_EQ(node.onOwnerThreadForTest(0, 0,
+                  [](rune::replication::PartitionReplica& r) { return r.durability(); }),
+              rune::replication::DurabilityMode::AllInSync)
         << "Task M1 precondition #1: durability=1 in TopicSpec must produce AllInSync "
            "PartitionReplica — durability field was not threaded through to PartitionConfig";
 
@@ -963,13 +1024,17 @@ TEST(BrokerNodeTest, M1_MemoryBackedPartitionSkipsCleaner) {
     // Give the cleaner time to run (it must NOT crash on the memory-backed replica).
     std::this_thread::sleep_for(std::chrono::milliseconds{500});
 
-    auto* replica = node.replicaForTest(0, 0);
-    ASSERT_NE(replica, nullptr) << "replica must exist for topic 0 partition 0";
+    ASSERT_TRUE(rune::node::test::hasReplica(node)) << "replica must exist for topic 0 partition 0";
 
     // Verify the log is memory-backed (de-virtualized seam: isMemoryBacked()).
-    EXPECT_TRUE(replica->isMemoryBacked())
+    // F1: read on the replica's OWNING thread.
+    const auto [memBacked, diskBacked] = node.onOwnerThreadForTest(0, 0,
+        [](rune::replication::PartitionReplica& r) {
+            return std::pair{r.isMemoryBacked(), r.isDiskBacked()};
+        });
+    EXPECT_TRUE(memBacked)
         << "Task M1: persistence=Memory must produce a memory-backed replica (InMemoryLog)";
-    EXPECT_FALSE(replica->isDiskBacked())
+    EXPECT_FALSE(diskBacked)
         << "Task M1: persistence=Memory replica must not be disk-backed";
 
     // If we reach here without a crash/assertion, the cleaner correctly skipped
@@ -1051,4 +1116,803 @@ TEST(BrokerNodeTest, PerWorkerEgressWiredWithContiguousStreams) {
     node.stop();
 }
 
+// F15 S3 (design note §6): a tryClaim exception now HALTS, so the return ring
+// size is a correctness setting — its max message must hold one 512 KiB
+// PushReadResult chunk plus its header.  A smaller ring refuses to start,
+// before any side effect.
+TEST(ReturnOverflowRegression, StartupRefusesReturnRingBelowMaxPushChunk) {
+    EXPECT_TRUE(Worker::returnRingCoversMaxPushChunk(32u << 20)) << "the default must pass";
+    EXPECT_TRUE(Worker::returnRingCoversMaxPushChunk(8u << 20));
+    EXPECT_FALSE(Worker::returnRingCoversMaxPushChunk(4u << 20)) << "4 MiB ring: max message 512 KiB < chunk + header";
+    const fs::path dir = makeTempDataDir("retring_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerReturnRingBytes = 1 << 20;
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::runtime_error);
+    EXPECT_FALSE(fs::exists(cfg.effectiveAeronDir())) << "refusal must precede the driver start";
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// F15 S3 fix round 1 (review I-1): the return ring must also hold the largest
+// batch any intake path can store (a PushRead of one whole batch that does not
+// fit would halt on every restart: a crash loop).  Legacy: min(gateway max
+// produce batch, ingress max message); shard: min(max produce batch, 16 MiB,
+// term / 8).  Plus ret ring >= ingress ring, and the owed-return cap in range.
+TEST(ReturnOverflowRegression, StartupRefusesReturnRingBelowMaxStorableBatch) {
+    constexpr std::size_t MiB = 1u << 20;
+    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 4096).has_value())
+        << "the defaults must pass";
+    EXPECT_TRUE(Worker::validateRingConfig(8 * MiB, 32 * MiB, 4096).has_value())
+        << "Legacy: an 8 MiB return ring cannot hold a 2-4 MiB batch the 32 MiB ingress ring accepts";
+    EXPECT_TRUE(Worker::validateRingConfig(16 * MiB, 32 * MiB, 4096).has_value())
+        << "return ring smaller than the ingress ring";
+    // Re-review 1 I-3 / re-review 2 m-h: the Aeron term no longer enters the
+    // startup check (every intake path refuses an oversize batch with
+    // MessageTooLarge — ReturnOverflowRegression.OneBatchLimitOnEveryPath), so
+    // the shipped configs' ring sizes start: cluster.sh / CLAUDE.md (32/32)
+    // above, replbench.sh (64/64) here.
+    EXPECT_FALSE(Worker::validateRingConfig(64 * MiB, 64 * MiB, 4096).has_value())
+        << "replbench.sh (rings 64/64)";
+    EXPECT_FALSE(Worker::validateRingConfig(128 * MiB, 32 * MiB, 4096).has_value());
+    EXPECT_TRUE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 9000).has_value())
+        << "owed-return cap above the ceiling";
+    EXPECT_TRUE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 100).has_value())
+        << "owed-return cap below the floor";
+    EXPECT_FALSE(Worker::validateRingConfig(32 * MiB, 32 * MiB, 8192).has_value());
+    {
+        const fs::path dir = makeTempDataDir("retring8_");
+        NodeConfig cfg = makeSingleNodeConfig(dir);
+        cfg.workerReturnRingBytes = 8 << 20;   // ingress stays 32 MiB
+        BrokerNode node{cfg};
+        EXPECT_THROW(node.start(), std::runtime_error);
+        EXPECT_FALSE(fs::exists(cfg.effectiveAeronDir())) << "refusal must precede the driver start";
+        std::error_code ec; fs::remove_all(dir, ec);
+    }
+    {
+        const fs::path dir = makeTempDataDir("owedcap_");
+        NodeConfig cfg = makeSingleNodeConfig(dir);
+        cfg.workerMaxOwedReturns = 9000;
+        BrokerNode node{cfg};
+        EXPECT_THROW(node.start(), std::runtime_error);
+        EXPECT_FALSE(fs::exists(cfg.effectiveAeronDir())) << "refusal must precede the driver start";
+        std::error_code ec; fs::remove_all(dir, ec);
+    }
+}
+
+TEST(BrokerNodeRegression, ShardInvalidConfigRefusesStartBeforeAnySideEffect) {
+    const fs::path dir = makeTempDataDir("shardbad_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    // Since 2026-10-02 unset per-worker ports are DERIVED (shard is the default),
+    // so "no ports" is no longer invalid; an explicit out-of-range base still is
+    // (65535 + worker 1 overflows the port space).
+    cfg.workerMode = NodeConfig::WorkerMode::Shard;
+    cfg.workerCount = 2;
+    cfg.workerCoreBase = -1;
+    cfg.workerIngressBasePort = 65535;
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::runtime_error);
+    EXPECT_FALSE(fs::exists(cfg.effectiveAeronDir())) << "refusal must precede the driver start";
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
+// F3 round 4 (supersedes round 3's validateReplicationFetchCeiling tests,
+// which tested a startup-refusal design the controller replaced): instead of
+// refusing to start whenever the gateway's configured max batch exceeds a
+// transport's hard maximum, derive the gateway's EFFECTIVE max produce-batch
+// size from the actual transport limits and use THAT to reject oversize
+// produce batches at the gateway (see ClientGatewayHotPathTest.cpp's
+// OversizeProduceBatchRejectedNotAcceptedRegression for the gateway-side
+// enforcement).  Startup now refuses ONLY when the operator EXPLICITLY
+// configures a max batch that the transport can never carry.
+// ---------------------------------------------------------------------------
+
+// Unit test of the derivation itself (effectiveMaxProduceBatchBytes()):
+//   1. Multi-node: effective = min(configured default, ingress hard max,
+//      replication hard max) — whichever of the three is tightest wins.
+//   2. An EXPLICIT override smaller than every hard max is honored exactly
+//      (the min() picks the configured value itself).
+//   3. Single-node EXCLUDES the replication term (round 3's exemption,
+//      narrowed in round 4 to just the replication half of the min) — a tiny
+//      replicationOutboundRingBytes must NOT affect a single-node result,
+//      but a tiny ingress ring/term still must.
+TEST(BrokerNodeRegression, EffectiveMaxBatchDerivedFromTransportRegression) {
+    const fs::path dir = makeTempDataDir("effmaxderive_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    PeerConfig peer1;
+    peer1.id = 1; peer1.host = "127.0.0.1"; peer1.consensusPort = 40114;
+    cfg.peers.push_back(peer1);
+    ASSERT_FALSE(cfg.isSingleNode());
+
+    cfg.aeronTermBufferBytes         = 1 * 1024 * 1024; // term bound = 131072
+    cfg.workerIngressRingBytes       = 8 * 1024 * 1024;  // ring bound = 1048576 -> ingress hard max = 131072
+    cfg.replicationOutboundRingBytes = 2 * 1024 * 1024;  // ring bound = 262144 -> repl hard max = min(131072,262144) - framing
+
+    const int32_t ingressMax = ingressHardTransportMaxBytes(cfg);
+    const int32_t replMax    = replicationHardTransportMaxBytes(cfg);
+    // F3 round 5: exact numbers (real framing constants, no hand /8 shortcut):
+    //   worker ring tail  = 8 MiB/8 − WorkerOp framing (SBE header + block + tail
+    //                       prefix, from the generated codec — 247 with rune-protocol fb82500)
+    //   aeron ingress     = term max msg 131072 − Produce framing (24 hdr? + 24 + 2 + 4)
+    //   replication       = min(ring 262144 − 16 − 46, term 131072 − 46) = 131026
+    EXPECT_EQ(workerIngressMaxBatchBytes(cfg), 1048576u - kWorkerOpFramingFromCodec);
+    EXPECT_EQ(ingressMax, aeronIngressMaxBatchBytes(cfg));
+    EXPECT_LT(ingressMax, 131072);
+    EXPECT_EQ(replMax, 131072 - static_cast<int32_t>(
+                           rune::replication::FetchResponseMsg::encodedSize(0)));
+
+    // (1) Default config (no explicit override): effective = min(8 MiB, ingressMax, replMax).
+    // Here the Aeron-ingress Produce framing (54) exceeds the FetchResponse
+    // framing (46), so ingress is the tightest by 8 bytes.
+    EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg),
+              static_cast<std::size_t>(std::min(ingressMax, replMax)));
+    EXPECT_EQ(ingressMax, 131072 - 54);
+
+    // (2) Explicit override smaller than every hard max wins exactly.
+    cfg.maxProduceBatchBytes = 1000;
+    EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg), 1000u);
+    cfg.maxProduceBatchBytes.reset();
+
+    // (3) Single-node — integration wave 2 (F18 ⇄ S3 merge plan, binding):
+    // the replication terms apply ALWAYS, so the limit does not change when a
+    // node later joins a cluster (F3 round 4's single-node exemption is
+    // overruled).  The same sizes give the same limit single- and multi-node.
+    NodeConfig singleCfg = makeSingleNodeConfig(dir);
+    ASSERT_TRUE(singleCfg.isSingleNode());
+    singleCfg.aeronTermBufferBytes         = cfg.aeronTermBufferBytes;
+    singleCfg.workerIngressRingBytes       = cfg.workerIngressRingBytes;
+    singleCfg.workerReturnRingBytes        = cfg.workerReturnRingBytes;
+    singleCfg.replicationOutboundRingBytes = cfg.replicationOutboundRingBytes;
+    EXPECT_EQ(effectiveMaxProduceBatchBytes(singleCfg), effectiveMaxProduceBatchBytes(cfg))
+        << "single-node applies the replication terms too";
+    singleCfg.replicationOutboundRingBytes = 64 * 1024;   // tiny ring: it binds single-node too
+    EXPECT_LT(effectiveMaxProduceBatchBytes(singleCfg), static_cast<std::size_t>(ingressMax));
+
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// End-to-end: BrokerNode::start() refuses, before any side effect, ONLY when
+// an EXPLICIT max-produce-batch override exceeds the hard transport maximum.
+// Uses a SINGLE-node config deliberately (round 3's exemption no longer
+// applies wholesale — see point 3 of the round-4 ruling): the ingress limit
+// alone is enough to trigger the refusal, proving single-node is NOT exempt
+// from this check in general, only from the replication half of it.
+TEST(BrokerNodeRegression, ExplicitOversizeMaxBatchConfigRefusedRegression) {
+    const fs::path dir = makeTempDataDir("explicitoversize_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    ASSERT_TRUE(cfg.isSingleNode());
+    cfg.aeronTermBufferBytes   = 64 * 1024; // term bound = 8192
+    cfg.workerIngressRingBytes = 64 * 1024; // ring bound = 8192 -> ingress hard max = 8192
+    cfg.maxProduceBatchBytes   = 10 * 1024 * 1024;  // EXPLICIT 10 MiB >> hard max
+
+    // Pure-function check first (naming the exact numbers).
+    auto err = validateExplicitMaxProduceBatch(cfg);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find(std::to_string(10 * 1024 * 1024)), std::string::npos) << *err;
+    EXPECT_NE(err->find(std::to_string(ingressHardTransportMaxBytes(cfg))), std::string::npos) << *err;
+
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::runtime_error);
+    EXPECT_FALSE(fs::exists(cfg.effectiveAeronDir())) << "refusal must precede the driver start";
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// The default (unset) config must NEVER be refused, however small the hard
+// transport maximum ends up — this is the behavior that makes all 19
+// previously-failing multi-node integration tests pass again without any
+// per-test config patch (F3 round 4, point 4 of the ruling).
+TEST(BrokerNodeRegression, DefaultMaxBatchConfigNeverRefusedRegression) {
+    NodeConfig cfg = makeSingleNodeConfig(makeTempDataDir("defaultnotrefused_"));
+    PeerConfig peer1;
+    peer1.id = 1; peer1.host = "127.0.0.1"; peer1.consensusPort = 40115;
+    cfg.peers.push_back(peer1);
+    cfg.aeronTermBufferBytes = 64 * 1024;            // tiny — would have refused under round 3
+    cfg.replicationOutboundRingBytes = 64 * 1024;
+    cfg.workerIngressRingBytes = 64 * 1024;
+    ASSERT_FALSE(cfg.maxProduceBatchBytes.has_value()) << "test setup: must be the unset default";
+    EXPECT_FALSE(validateExplicitMaxProduceBatch(cfg).has_value());
+}
+
+
+// ---------------------------------------------------------------------------
+// F3 round 5, items C1 + M4: the derivation is the SAME function the
+// transports enforce.  Pins the exact default numbers and checks them against
+// REAL transport instances (one EmbeddedDriver, default 4 MiB term):
+//   legacy (AeronPartitionTransport, 4 MiB outbound ring):
+//     min(524288 − 16 envelope − 46 framing, 524288 − 46) = 524226
+//   per-worker (WorkerReplicationTransport, gather send): 524288 − 46 = 524242
+//   worker ingress ring (32 MiB): 4194304 − WorkerOp framing from the codec
+//     (8 SBE header + sbeBlockLength + 4 tail prefix: 4194073 with rune-protocol
+//     66bf9e6, 4194057 with fb82500's targetReplicaId/incarnation fields)
+//   aeron ingress (4 MiB term):   524288 − Produce framing
+// → effective (multi-node) = 524226 = the ENFORCED legacy ceiling (round 4
+//   derived 524242, 16 bytes above what the legacy ring path can carry).
+// ---------------------------------------------------------------------------
+TEST(BrokerNodeRegression, DerivedMaxMatchesRealTransportsRegression) {
+    const fs::path dir = makeTempDataDir("derivedreal_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    PeerConfig peer1;
+    peer1.id = 1; peer1.host = "127.0.0.1"; peer1.consensusPort = 40116;
+    cfg.peers.push_back(peer1);
+    ASSERT_FALSE(cfg.isSingleNode());
+    // Pinned (the numbers below are for a 4 MiB term + 4 MiB outbound ring — the
+    // pre-2026-10-02 defaults; the derivation-vs-transport property is size-free).
+    cfg.aeronTermBufferBytes = 4 * 1024 * 1024;
+    cfg.replicationOutboundRingBytes = 4 * 1024 * 1024;
+    ASSERT_EQ(cfg.workerIngressRingBytes, 32 * 1024 * 1024);
+
+    EXPECT_EQ(replicationHardTransportMaxBytes(cfg), 524226);
+    EXPECT_EQ(workerIngressMaxBatchBytes(cfg), 4194304u - kWorkerOpFramingFromCodec);
+    EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg), 524226u);
+    // F3 round 6, item 1: the multi-node fetch/push chunk is bounded by the
+    // replication hard max too (a 1 MiB coalesced push over the 524226 B
+    // ceiling was dropped → 20 ms re-serve stall).  Single-node keeps 1 MiB.
+    EXPECT_EQ(userTopicMaxFetchBytes(cfg), 524226);
+    {
+        NodeConfig single = makeSingleNodeConfig(dir);
+        EXPECT_EQ(userTopicMaxFetchBytes(single), 1 << 20);
+    }
+
+    fs::create_directories(dir);
+    EmbeddedDriverConfig dcfg = EmbeddedDriverConfig::fromNode(cfg, (dir / "aeron").string());
+    ASSERT_EQ(dcfg.termBufferBytes, cfg.aeronTermBufferBytes);
+    EmbeddedDriver driver(dcfg, DriverMode::Threaded);
+    aeron::Context ctx;
+    ctx.aeronDir(dcfg.dir);
+    auto aeron = aeron::Aeron::connect(ctx);
+
+    const std::string chanA = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(40117);
+    const std::string chanB = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(40118);
+    rune::replication::AeronPartitionTransport legacy(
+        aeron, chanA, 900, /*selfId=*/0, cfg.replicationOutboundRingBytes);
+    // As BrokerNode (F18): the publication bound, set before any worker runs.
+    legacy.setPublicationMaxMessageBytes(rune::replication::aeronMaxMessageLength(cfg.aeronTermBufferBytes));
+    WorkerReplicationTransport perWorker(aeron, 0, chanB, 901, {{1, chanA}}, 902);
+    ASSERT_TRUE(perWorker.resolved());
+
+    const std::size_t eff = effectiveMaxProduceBatchBytes(cfg);
+    EXPECT_EQ(legacy.maxFetchResponseBytes(), 524226) << "derived == enforced (legacy ring path)";
+    EXPECT_EQ(perWorker.maxFetchResponseBytes(), 524242) << "derived == enforced (gather path)";
+    EXPECT_GE(static_cast<std::size_t>(legacy.maxFetchResponseBytes()), eff);
+    EXPECT_GE(static_cast<std::size_t>(perWorker.maxFetchResponseBytes()), eff);
+    EXPECT_EQ(perWorker.maxFetchResponseBytes(),
+              WorkerReplicationTransport::maxFetchResponseBytesFor(cfg.aeronTermBufferBytes));
+
+    Worker w(0, static_cast<std::size_t>(cfg.workerIngressRingBytes));
+    EXPECT_EQ(w.maxOpTailBytes(), workerIngressMaxBatchBytes(cfg));
+    EXPECT_GE(w.maxOpTailBytes(), eff);
+
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// F3 round 5, item M3: an effective max too small to carry a single record
+// (here: a 1 KiB worker ingress ring → 128 − WorkerOp framing → 0) must REFUSE to
+// start with a clear error naming the numbers — never silently fall back to
+// the 8 MiB default (round 4's gateway setter did exactly that for 0).
+TEST(BrokerNodeRegression, EffectiveMaxBelowMinimumRefusesStartRegression) {
+    const fs::path dir = makeTempDataDir("effmaxzero_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerIngressRingBytes = 1024;
+    EXPECT_EQ(effectiveMaxProduceBatchBytes(cfg), 0u);
+    auto err = validateEffectiveMaxProduceBatch(cfg);
+    ASSERT_TRUE(err.has_value());
+    EXPECT_NE(err->find("workerIngress=0"), std::string::npos) << *err;
+
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::runtime_error);
+    EXPECT_FALSE(fs::exists(cfg.effectiveAeronDir())) << "refusal must precede the driver start";
+
+    // Exactly one record-batch header + 1 byte is the minimum accepted.
+    cfg.workerIngressRingBytes = 32 * 1024 * 1024;
+    cfg.maxProduceBatchBytes   = static_cast<int64_t>(kMinSaneMaxProduceBatchBytes) - 1;
+    EXPECT_TRUE(validateEffectiveMaxProduceBatch(cfg).has_value());
+    cfg.maxProduceBatchBytes   = static_cast<int64_t>(kMinSaneMaxProduceBatchBytes);
+    EXPECT_FALSE(validateEffectiveMaxProduceBatch(cfg).has_value());
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
+// F3 round 6, item 6: heterogeneous LEGACY config — the leader's transport can
+// carry a batch the follower's worker ingress ring can never hold.  The
+// follower's AeronPartitionTransport drop path (FetchResponse → fitsIngressTail)
+// must log (rate-limited) and stay BOUNDED: one drop per leader serve (push,
+// then one re-serve per 20 ms resend window), never a per-cycle spin and never
+// an ABORT-retry loop that would wedge the subscription.  Simulated replica
+// clock; the yield only waits for real Aeron IO.
+// ---------------------------------------------------------------------------
+TEST(BrokerNodeRegression, HeterogeneousFollowerDropIsBoundedRegression) {
+    const fs::path dir = makeTempDataDir("hetero_");
+    fs::create_directories(dir);
+    NodeConfig ncfg = makeSingleNodeConfig(dir);
+    ncfg.aeronTermBufferBytes = 1 << 20;                 // leader ceiling ~131 KB
+    EmbeddedDriverConfig dcfg = EmbeddedDriverConfig::fromNode(ncfg, (dir / "aeron").string());
+    EmbeddedDriver driver(dcfg, DriverMode::Threaded);
+    aeron::Context ctx;
+    ctx.aeronDir(dcfg.dir);
+    auto aeron = aeron::Aeron::connect(ctx);
+
+    const std::string chanL = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());   // D11: allocator, not fixed
+    const std::string chanF = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+    rune::replication::AeronPartitionTransport ldrT(aeron, chanL, 910, 1, 4 << 20);
+    rune::replication::AeronPartitionTransport flwT(aeron, chanF, 910, 2, 4 << 20);
+    ldrT.setPublicationMaxMessageBytes(rune::replication::aeronMaxMessageLength(ncfg.aeronTermBufferBytes));
+    flwT.setPublicationMaxMessageBytes(rune::replication::aeronMaxMessageLength(ncfg.aeronTermBufferBytes));
+    ldrT.addPeer(2, chanF, 910);
+    flwT.addPeer(1, chanL, 910);
+
+    rune::replication::PartitionConfig pc;
+    pc.topicId = 0; pc.partitionId = 0; pc.minIsr = 1;
+    pc.replicaLagMaxMs = 1'000'000; pc.replicaLagMaxOffset = 1'000'000;
+    pc.fetchIntervalNs = 5'000'000LL; pc.isrCheckIntervalNs = 10'000'000LL;
+    pc.maxFetchBytes = 1 << 20; pc.pushOnAppend = true;
+    auto lc = pc; lc.selfId = 1;
+    auto fc = pc; fc.selfId = 2;
+    fs::create_directories(dir / "l"); fs::create_directories(dir / "f");
+    rune::storage::Log logL((dir / "l").string());
+    rune::storage::Log logF((dir / "f").string());
+    rune::replication::PartitionReplica leader(lc, rune::replication::Role::Leader, 1, {1, 2}, {1, 2}, &logL, &ldrT);
+    rune::replication::PartitionReplica follower(fc, rune::replication::Role::Follower, 1, {1, 2}, {1, 2}, &logF, &flwT);
+    follower.becomeFollower(1, 1);
+    ldrT.registerReplica(0, 0, &leader);
+    flwT.registerReplica(0, 0, &follower);
+
+    // The follower's worker ring (64 KiB → ~7.9 KB max tail) is SMALLER than
+    // what the leader's transport carries — the heterogeneous config.
+    rune::metadata::ShardRouter router(1);
+    WorkerPool pool(1, router, /*ingressRingBytes=*/64 * 1024);
+    pool.worker(0).setOwnedDirect({&follower});
+    flwT.setWorkerPool(&pool);
+
+    {
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.append("k", std::string(20000, 'z'), 1000);   // fits the leader, never the follower ring
+        logL.append(b.build(), 0);
+    }
+    leader.onLeaderLogAppended();
+
+    int64_t sim = 1'000'000'000;
+    auto cycle = [&](int64_t step) {
+        sim += step;
+        (void)ldrT.poll(sim);
+        (void)flwT.poll(sim);
+        (void)leader.doWork(sim);
+        (void)pool.worker(0).doWork(sim);
+        pool.worker(0).drainReturn([](const WorkerReturn&) {});
+    };
+    // Phase 1: wait (real IO) until the first oversize frame reached the follower.
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (flwT.unfittableApplyDropsForTest() == 0 && std::chrono::steady_clock::now() < deadline) {
+        cycle(100'000);                                  // 100 µs of replica time
+        std::this_thread::yield();
+    }
+    ASSERT_GE(flwT.unfittableApplyDropsForTest(), 1u) << "the oversize frame must be dropped, not applied";
+    const uint64_t d1 = flwT.unfittableApplyDropsForTest();
+
+    // Phase 2: 2000 cycles = 200 ms of replica time.  Drops are bounded by the
+    // leader's serve cadence (20 ms resend window → ≤ ~10 re-serves), NOT by
+    // the number of cycles (a spin would be ~2000).
+    for (int i = 0; i < 2000; ++i) cycle(100'000);
+    const uint64_t extra = flwT.unfittableApplyDropsForTest() - d1;
+    EXPECT_LE(extra, 12u) << "drops must be bounded by the re-serve cadence, not the cycle count";
+    EXPECT_EQ(follower.logEndOffset(), 0) << "the unfittable batch is never applied";
+
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
+// F3 round 7, item 1: the REAL production SchemaUpdate path end to end on a
+// live single-node BrokerNode (2 workers): a client DefineTopic(validate=true)
+// → gateway → admin thread commits it to __topic_schemas → pushValidators →
+// AdminWorkerAgent::postSchemaUpdate (admin→control ring, kA2cSchemaUpdate) →
+// control-thread hook type dispatch → schemaFanout_.pump → EVERY worker's
+// ingress ring → each worker installs the Validator on ITS OWN thread.
+// Then a non-conforming produce is rejected (SchemaValidationFailed) and a
+// conforming one is accepted.  Every wait is condition-driven and bounded.
+// ---------------------------------------------------------------------------
+namespace {
+std::vector<uint8_t> charactersValue(bool conforming) {
+    std::vector<uint8_t> b;
+    auto le16 = [&](uint16_t v) { b.push_back(uint8_t(v)); b.push_back(uint8_t(v >> 8)); };
+    auto le32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) b.push_back(uint8_t(v >> (8 * i))); };
+    auto le64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) b.push_back(uint8_t(v >> (8 * i))); };
+    le16(12); le16(1);                         // blockLength (int64 + int32), version
+    le64(1);                                   // id
+    le32(conforming ? 1u : 99u);               // enum type: 99 is NOT in {0,1,2}
+    const std::string_view name = "Alice";
+    le32(static_cast<uint32_t>(name.size()));
+    b.insert(b.end(), name.begin(), name.end());
+    return b;
+}
+std::vector<uint8_t> charactersBatch(bool conforming) {
+    const auto v = charactersValue(conforming);
+    rune::protocol::RecordBatchBuilder bb(0, 1000);
+    bb.append(std::string_view{}, std::string_view(reinterpret_cast<const char*>(v.data()), v.size()), 1000);
+    return bb.build();
+}
+} // namespace
+
+TEST(BrokerNodeRegression, DefineTopicValidatorReachesEveryWorkerEndToEndRegression) {
+    const fs::path dir = makeTempDataDir("schema_e2e_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.workerCount = 2;
+    const uint16_t clientPort = rune::node::test::freeUdpPort();
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(30s));
+
+    rune::node::test::ShardTestClient client(dir / "client-aeron");
+    const std::string& gw = cfg.clientEndpoint.channel;
+    const int32_t stream  = cfg.clientEndpoint.streamId;
+    const int64_t sid = client.connect(gw, stream);
+    ASSERT_GT(sid, 0);
+
+    const auto desc = rune::codec::DescriptorBuilder("characters")
+        .add("id",   rune::codec::PrimType::Int64)
+        .add("type", rune::codec::PrimType::Enum, 1, false, {0, 1, 2})
+        .add("name", rune::codec::PrimType::String)
+        .build();
+    const std::vector<uint8_t> blob = rune::codec::serialize(desc);
+    constexpr uint32_t kParts = 8;              // spread partitions over both workers
+
+    // F3 round 8: ONE overall deadline (well under ctest's 300 s), checked by
+    // every wait; only the documented "settling" codes are retried (short
+    // backoff); a missing response ends the test immediately.  The gateway
+    // reaps a session idle for 10 s (kDefaultSessionTimeoutNs), so no single
+    // client-silent phase may approach that — the validator wait is capped at 5 s.
+    namespace pc = rune::protocol::client;
+    using Clock = std::chrono::steady_clock;
+    const auto testDeadline = Clock::now() + 20s;
+    auto remaining = [&] { return std::chrono::duration_cast<std::chrono::milliseconds>(testDeadline - Clock::now()); };
+    constexpr uint16_t kDdlInternal = static_cast<uint16_t>(pc::ErrorCode::Internal);      // admin not leader yet
+    constexpr uint16_t kDdlExists   = static_cast<uint16_t>(pc::ErrorCode::TopicExists);
+
+    int32_t topicId = -1;
+    bool    sawInternal = false;
+    while (topicId < 0) {
+        ASSERT_GT(remaining().count(), 0) << "DefineTopic did not commit within the test deadline";
+        auto def = client.defineTopicUntil(gw, stream, sid, "characters", kParts, /*validate=*/true,
+                                           blob, std::min(testDeadline, Clock::now() + 5s));
+        ASSERT_TRUE(def.has_value()) << "no DefineTopicResponse — gateway/admin path did not answer";
+        if (def->errorCode == 0) { topicId = def->topicId; break; }
+        if (def->errorCode == kDdlExists && sawInternal) {
+            // A retry after a reply we treated as failed: the DDL had actually
+            // committed.  Treat as success ONLY if the topic really exists.
+            ASSERT_GE(def->topicId, 0) << "TopicExists without a topic id";
+            ASSERT_TRUE(rune::node::test::hasReplica(node, def->topicId, 0))
+                << "TopicExists but the topic has no replica";
+            topicId = def->topicId;
+            break;
+        }
+        ASSERT_EQ(def->errorCode, kDdlInternal)
+            << "DefineTopic failed with a non-retryable code " << def->errorCode;
+        sawInternal = true;
+        std::this_thread::sleep_for(20ms);        // admin leadership settling (short backoff)
+    }
+    ASSERT_GE(topicId, 0);
+
+    // Condition-driven: EVERY worker has the validator.  Each probe runs ON the
+    // owning worker's thread (owner-thread test task) — worker state is never
+    // read cross-thread.  Partition p of the topic is owned by
+    // ShardRouter(2).workerForPartition(topicId, p); cover every worker.
+    rune::metadata::ShardRouter router(2);
+    std::map<int32_t, int32_t> probePartitionForWorker;
+    for (int32_t p = 0; p < static_cast<int32_t>(kParts); ++p)
+        probePartitionForWorker.emplace(router.workerForPartition(topicId, p), p);
+    ASSERT_EQ(probePartitionForWorker.size(), 2u) << "test setup: partitions must span both workers";
+    {
+        const auto validatorDeadline = std::min(testDeadline, Clock::now() + 5s);   // < session idle reap
+        std::map<int32_t, bool> installed;
+        auto allInstalled = [&] {
+            for (auto [w, p] : probePartitionForWorker) {
+                if (installed[w]) continue;
+                if (!rune::node::test::hasReplica(node, topicId, p)) return false;
+                installed[w] = node.onOwnerThreadForTest(topicId, p,
+                    [&node, w = w, topicId](rune::replication::PartitionReplica&) {
+                        return node.workerForTest(w)->hasValidatorForTest(topicId);
+                    });
+                if (!installed[w]) return false;
+            }
+            return true;
+        };
+        while (!allInstalled() && Clock::now() < validatorDeadline)
+            std::this_thread::sleep_for(5ms);    // poll interval, not correctness
+        // Fatal: the produce phase is meaningless without validators.
+        for (auto [w, p] : probePartitionForWorker)
+            ASSERT_TRUE(installed[w]) << "worker " << w << " never installed the validator";
+    }
+
+    // F30 fix round 1 (F3): a RUNTIME-created user replica (thread placement,
+    // the default WorkerMode) gets the same worker-driven durability as a boot
+    // one — external follower flush + deferred roll seals, never inline fsync.
+    for (int32_t p = 0; p < static_cast<int32_t>(kParts); ++p) {
+        const bool workerDriven = node.onOwnerThreadForTest(topicId, p,
+            [](rune::replication::PartitionReplica& r) {
+                return r.externalFollowerFlush() && r.isDiskBacked() && r.log()->deferSealSync();
+            });
+        EXPECT_TRUE(workerDriven) << "runtime topic partition " << p
+                                  << ": must use the worker's external flush + deferred seals";
+    }
+
+    // Produce: non-conforming rejected, conforming accepted.  Retry ONLY
+    // NotLeader (runtime-topic leadership settling) with a short backoff; a
+    // missing response or the overall deadline fails at once.
+    auto produceSettled = [&](const std::vector<uint8_t>& batch, int32_t partition) -> std::optional<int16_t> {
+        while (remaining().count() > 0) {
+            const int64_t corr = client.nextCorrelationId();   // never reuse a correlation id
+            if (!client.produce(gw, stream, sid, corr, topicId, partition, 0, batch)) return std::nullopt;
+            auto ack = client.awaitProduceResponseUntil(corr, std::min(testDeadline, Clock::now() + 2s));
+            if (!ack) return std::nullopt;               // no response: do not retry
+            if (ack->errorCode != static_cast<int16_t>(pc::ErrorCode::NotLeader)) return ack->errorCode;
+            std::this_thread::sleep_for(20ms);
+        }
+        return std::nullopt;
+    };
+    for (auto [w, p] : probePartitionForWorker) {
+        const auto bad = produceSettled(charactersBatch(false), p);
+        ASSERT_TRUE(bad.has_value()) << "worker " << w << ": no ProduceResponse (or test deadline)";
+        EXPECT_EQ(*bad, static_cast<int16_t>(pc::ErrorCode::SchemaValidationFailed))
+            << "worker " << w << ": a non-conforming record must be rejected";
+        const auto good = produceSettled(charactersBatch(true), p);
+        ASSERT_TRUE(good.has_value()) << "worker " << w << ": no ProduceResponse (or test deadline)";
+        EXPECT_EQ(*good, 0) << "worker " << w << ": a conforming record must be accepted";
+    }
+
+    node.stop();
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+TEST(BrokerNodeRegression, StartNeverPumpsNodeDriverFromCallerThread) {
+    const fs::path dir = makeTempDataDir("drvrace_");
+    BrokerNode node{makeSingleNodeConfig(dir)};
+    node.start();
+    ASSERT_NE(node.driverForTest(), nullptr);
+    EXPECT_EQ(node.driverForTest()->callerPumpsWhileThreadRunning(), 0u);
+    EXPECT_EQ(node.driverForTest()->foreignPumpAttempts(), 0u);
+    node.stop();
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// ===========================================================================
+// F1 REGRESSION: owner-thread test hook runs on the replica's TRUE owner.
+//
+// The old replicaForTest() raw accessor let tests append()/read LEO/HW from the
+// TEST thread while a WORKER owned the replica (append pushes inline on the
+// worker's single-writer ExclusivePublication → corrupted/lost replication
+// frames under load).  onOwnerThreadForTest must execute:
+//   - user partitions (WorkerPool present) → on the OWNING worker thread
+//     (never the test thread, never the control thread; stable per partition;
+//     distinct threads for partitions owned by distinct workers);
+//   - internal partitions (topicId < 0)    → on the CONTROL thread;
+// and fail loudly on misuse (not running, admin-owned __topic_schemas, missing
+// replica for the reference form) while propagating the callable's exceptions.
+// ===========================================================================
+TEST(BrokerNodeTest, OwnerThreadHookRunsOnTrueOwnerThreadRegression) {
+    using rune::replication::PartitionReplica;
+    TempDir tmp{"f1_owner_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    cfg.workerCount = 2;
+
+    TopicSpec ts;
+    ts.name           = "f1";
+    ts.partitionCount = 8;
+    ts.topicId        = 0;
+    cfg.topics = {ts};
+
+    BrokerNode node{cfg};
+    auto threadOf = [](PartitionReplica&) { return std::this_thread::get_id(); };
+
+    // Not started → no owner thread → loud failure (never a silent test-thread run).
+    EXPECT_THROW(node.onOwnerThreadForTest(0, 0, threadOf), std::logic_error);
+
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(2s));
+    ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s));
+
+    const auto testTid    = std::this_thread::get_id();
+    const auto controlTid = node.onControlThreadForTest([] { return std::this_thread::get_id(); });
+    EXPECT_NE(controlTid, testTid) << "control-thread task ran on the test thread";
+
+    // User partitions → the owning WORKER thread.
+    std::map<int32_t, std::thread::id> tidByWorker;
+    for (int32_t p = 0; p < static_cast<int32_t>(ts.partitionCount); ++p) {
+        const auto tid = node.onOwnerThreadForTest(0, p, threadOf);
+        EXPECT_NE(tid, testTid)    << "partition " << p << " ran on the test thread";
+        EXPECT_NE(tid, controlTid) << "partition " << p << " (worker-owned) ran on the control thread";
+        EXPECT_EQ(tid, node.onOwnerThreadForTest(0, p, threadOf))
+            << "partition " << p << " owner thread must be stable";
+        const int32_t wid = node.workerForPartitionForTest(0, p);
+        ASSERT_GE(wid, 0);
+        auto [it, inserted] = tidByWorker.emplace(wid, tid);
+        if (!inserted) {
+            EXPECT_EQ(it->second, tid) << "partitions of worker " << wid << " ran on different threads";
+        }
+    }
+    for (auto a = tidByWorker.begin(); a != tidByWorker.end(); ++a) {
+        for (auto b = std::next(a); b != tidByWorker.end(); ++b) {
+            EXPECT_NE(a->second, b->second)
+                << "workers " << a->first << " and " << b->first << " share a thread";
+        }
+    }
+
+    // Internal partitions (topicId < 0) → the CONTROL thread.
+    int internalSeen = 0;
+    for (int32_t t : {-1, -2, -3}) {
+        if (!rune::node::test::hasReplica(node, t, 0)) continue;
+        ++internalSeen;
+        EXPECT_EQ(node.onOwnerThreadForTest(t, 0, threadOf), controlTid)
+            << "internal partition topicId=" << t << " must run on the control thread";
+    }
+    EXPECT_GE(internalSeen, 1) << "expected at least one internal partition replica";
+
+    // Mutation on the owner: append advances LEO by exactly one record.
+    const auto leo0 = rune::node::test::leoOnOwner(node);
+    const std::vector<uint8_t> payload(16, 0x5A);
+    EXPECT_GE(rune::node::test::appendOnOwner(node, payload, /*acksAll=*/false), 0);
+    EXPECT_EQ(rune::node::test::leoOnOwner(node), leo0 + 1);
+
+    // Misuse fails loudly; the callable's own exceptions propagate.
+    EXPECT_FALSE(rune::node::test::hasReplica(node, 0, 99));            // pointer form: nullptr
+    EXPECT_THROW(rune::node::test::leoOnOwner(node, 0, 99), std::runtime_error);  // ref form
+    EXPECT_THROW(node.onOwnerThreadForTest(kSchemaTopicId, 0, threadOf), std::invalid_argument);
+    EXPECT_THROW(node.onOwnerThreadForTest(0, 0,
+                     [](PartitionReplica&) -> int { throw std::domain_error("boom"); }),
+                 std::domain_error);
+
+    node.stop();
+    EXPECT_THROW(node.onOwnerThreadForTest(0, 0, threadOf), std::logic_error);
+}
+
+// ===========================================================================
+// F1 REGRESSION: a task the owner has not STARTED by the deadline is cancelled
+// and NEVER runs afterwards (its callable captures test locals by reference —
+// running it after the test frame unwinds would be a use-after-free).
+// ===========================================================================
+TEST(BrokerNodeTest, OwnerThreadHookTimeoutCancelsTaskRegression) {
+    TempDir tmp{"f1_cancel_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    TopicSpec ts;
+    ts.name           = "f1c";
+    ts.partitionCount = 1;
+    ts.topicId        = 0;
+    cfg.topics = {ts};
+
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(2s));
+
+    // Occupy the control thread with a task that blocks until released (hard cap).
+    std::promise<void> started, release;
+    auto releaseFut = release.get_future().share();
+    auto blocker = std::async(std::launch::async, [&] {
+        return node.onControlThreadForTest([&started, releaseFut] {
+            started.set_value();
+            return releaseFut.wait_for(10s) == std::future_status::ready;
+        }, 15s);
+    });
+    ASSERT_EQ(started.get_future().wait_for(5s), std::future_status::ready);
+
+    // Queued behind the blocker → cannot start within 100ms → the owner skips it
+    // + the caller throws.  F9a fix round 1: the caller waits for the owner's
+    // decision with no bound, so the blocker is released from another thread
+    // AFTER the 100 ms deadline (the owner then reaches + skips the task).
+    std::thread releaser([&release] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{400});
+        release.set_value();
+    });
+    bool ran = false;
+    EXPECT_THROW(node.onControlThreadForTest([&ran] { ran = true; return 0; },
+                                             std::chrono::milliseconds{100}),
+                 std::runtime_error);
+    releaser.join();
+    EXPECT_TRUE(blocker.get()) << "blocker task must have been released, not timed out";
+
+    // FIFO round-trip AFTER the cancelled task: it has been drained by now.
+    EXPECT_EQ(node.onControlThreadForTest([] { return 7; }), 7);
+    EXPECT_FALSE(ran) << "a cancelled (timed-out) task must never run";
+
+    node.stop();
+}
+
+// F18: the started node enforces the derived intake limit on the gateway (not the
+// old hardcoded 8 MiB, which a default worker-ingress op frame cannot carry).
+TEST(BrokerNodeRegression, GatewayEnforcesProduceIntakeLimit) {
+    TempDir tmp{"f18_wire_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    // A free port from the shared allocator (the fixed 50001 collides with parallel suites).
+    cfg.clientEndpoint.channel =   // D11: never an ephemeral (bind-0) port
+        "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_NE(node.gatewayForTest(), nullptr);
+    EXPECT_EQ(node.gatewayForTest()->maxProduceBatchBytes(),
+              static_cast<std::size_t>(cfg.produceIntakeLimit()));
+    node.stop();
+}
+
+// Integration wave 2 (F18 ⇄ F15 S3 ⇄ F19, S3 re-review 3 minor 1): ONE batch
+// limit.  The started node's gateway limit == EVERY worker's intake limit ==
+// the config formula (Worker::maxAcceptableBatchBytes over the raw ring / term
+// sizes, replication and egress terms included even single-node).
+TEST(BrokerNodeRegression, GatewayAndEveryWorkerShareTheOneBatchLimit) {
+    TempDir tmp{"wave2_limit_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    cfg.clientEndpoint.channel =   // D11: never an ephemeral (bind-0) port
+        "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
+    cfg.workerCount = 2;
+    TopicSpec ts;
+    ts.name           = "wave2-limit";
+    ts.partitionCount = 4;
+    ts.topicId        = 0;
+    cfg.topics        = {ts};
+
+    const std::size_t formula = Worker::maxAcceptableBatchBytes(
+        static_cast<std::size_t>(cfg.workerIngressRingBytes),
+        static_cast<std::size_t>(cfg.workerReturnRingBytes),
+        static_cast<std::size_t>(cfg.replicationOutboundRingBytes),
+        static_cast<std::size_t>(cfg.aeronTermBufferBytes),
+        static_cast<std::size_t>(cfg.aeronTermBufferBytes),
+        static_cast<std::size_t>(cfg.aeronTermBufferBytes));
+    ASSERT_EQ(static_cast<std::size_t>(cfg.produceIntakeLimit()), formula) << "a thin wrapper";
+
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_NE(node.gatewayForTest(), nullptr);
+    EXPECT_EQ(node.gatewayForTest()->maxProduceBatchBytes(), formula);
+    int workers = 0;
+    // Set once at startup, before any worker thread runs; immutable after.
+    for (int32_t w = 0; Worker* wk = node.workerForTest(w); ++w, ++workers)
+        EXPECT_EQ(wk->maxIntakeBatchBytes(), formula) << "worker " << w;
+    EXPECT_EQ(workers, 2);
+    node.stop();
+}
+
+} // namespace rune::node
+
+namespace rune::node {
+// REGRESSION (k3s, broker 7ad0b2a): the bench's cluster.sh binds the client
+// endpoint on 0.0.0.0 with every peer on 127.0.0.1 — start() derived mtu=1472
+// (the NIC) instead of 65504 (14-18k vs 136,234 rec/s).  A real BrokerNode with
+// exactly those endpoints must resolve the 64 KiB loopback MTU (clamped only by
+// the platform's socket limit).
+TEST(BrokerNodeRegression, ClusterShStyleWildcardBindDerivesLoopbackMtuRegression) {
+    const fs::path dir = makeTempDataDir("wildmtu_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=0.0.0.0:" + std::to_string(cfg.peers[0].clientPort ? cfg.peers[0].clientPort : 50001);
+    ASSERT_EQ(cfg.aeronMtuBytes, NodeConfig::kAeronAuto) << "default = derived";
+    BrokerNode node{cfg};
+    node.start();
+    const auto& eff = node.effectiveConfigForTest();
+    const auto facts = probeHostNetFacts({"127.0.0.1"});
+    if (std::min(facts.rmemMax, facts.wmemMax) >= 1024 * 1024)
+        EXPECT_EQ(eff.aeronMtuBytes, 65504) << "wildcard bind + loopback peers is loopback";
+    else
+        EXPECT_GT(eff.aeronMtuBytes, 1472) << "loopback, clamped by small socket limits";
+    node.stop();
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+} // namespace rune::node
+
+namespace rune::node {
+// D8 root cause (PerWorkerReplication segfault, 2026-10-03): a ClientGateway that failed to construct (here: its
+// client port is already bound) was logged and SKIPPED — the node ran HEADLESS: in consensus (it could lead)
+// but unreachable by any client, and gatewayForTest() was null.  Now start() refuses, like the per-worker planes.
+TEST(BrokerNodeRegression, GatewayConstructionFailureRefusesToStartNotHeadless) {
+    const fs::path dir = makeTempDataDir("headless_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    const uint16_t clientPort = rune::node::test::freeUdpPort();
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
+    const int squat = ::socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(squat, 0);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(clientPort);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(::bind(squat, reinterpret_cast<sockaddr*>(&a), sizeof(a)), 0) << "test setup: occupy the client port";
+    BrokerNode node{cfg};
+    EXPECT_THROW(node.start(), std::exception) << "a node without its client gateway must not run";
+    EXPECT_EQ(node.gatewayForTest(), nullptr);
+    node.stop();
+    ::close(squat);
+}
 } // namespace rune::node

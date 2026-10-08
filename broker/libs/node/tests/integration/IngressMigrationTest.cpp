@@ -46,9 +46,11 @@
 // C++23, LE, no virtual on hot path, no cross-worker forwarding.
 // ---------------------------------------------------------------------------
 
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/WorkerOp.h>
+#include <rune/node/WorkerPool.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/ProducerStateManager.h>
@@ -112,19 +114,19 @@ struct TempDir {
 // ---------------------------------------------------------------------------
 class NullTransport : public rune::replication::PartitionTransport {
 public:
-    void sendFetchRequest(const rune::replication::FetchRequestMsg&) override {}
-    void sendFetchResponse(rune::replication::NodeId,
-                           const rune::replication::FetchResponseMsg&) override {}
-    void sendOffsetsForLeaderEpochRequest(
+    bool sendFetchRequest(const rune::replication::FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(rune::replication::NodeId,
+                           const rune::replication::FetchResponseMsg&) override { return true; }
+    bool sendOffsetsForLeaderEpochRequest(
             rune::replication::NodeId,
-            const rune::replication::OffsetsForLeaderEpochReqMsg&) override {}
-    void sendOffsetsForLeaderEpochResponse(
+            const rune::replication::OffsetsForLeaderEpochReqMsg&) override { return true; }
+    bool sendOffsetsForLeaderEpochResponse(
             rune::replication::NodeId,
-            const rune::replication::OffsetsForLeaderEpochRespMsg&) override {}
-    void sendReconcileRequest(rune::replication::NodeId,
-                              const rune::replication::FetchRequestMsg&) override {}
-    void sendReconcileResponse(rune::replication::NodeId,
-                               const rune::replication::FetchResponseMsg&) override {}
+            const rune::replication::OffsetsForLeaderEpochRespMsg&) override { return true; }
+    bool sendReconcileRequest(rune::replication::NodeId,
+                              const rune::replication::FetchRequestMsg&) override { return true; }
+    bool sendReconcileResponse(rune::replication::NodeId,
+                               const rune::replication::FetchResponseMsg&) override { return true; }
 };
 
 // ---------------------------------------------------------------------------
@@ -274,55 +276,19 @@ private:
 
     void startDriver() {
         const std::string aeronDir = (tmpDir_->path / "aeron").string();
+        fs::create_directories(aeronDir);
 
-        aeron_driver_context_init(&driverCtx_);
-        aeron_driver_context_set_dir(driverCtx_, aeronDir.c_str());
-        aeron_driver_context_set_threading_mode(driverCtx_, AERON_THREADING_MODE_SHARED);
-        aeron_driver_context_set_dir_delete_on_start(driverCtx_, true);
-        aeron_driver_context_set_dir_delete_on_shutdown(driverCtx_, true);
-        aeron_driver_context_set_shared_idle_strategy(driverCtx_, "sleep-ns");
-        aeron_driver_context_set_term_buffer_sparse_file(driverCtx_, true);
-        aeron_driver_context_set_term_buffer_length(driverCtx_, 64 * 1024);
-
-        ASSERT_EQ(aeron_driver_init(&driver_, driverCtx_), 0)
-            << "aeron_driver_init: " << aeron_errmsg();
-        ASSERT_EQ(aeron_driver_start(driver_, /*manual_main_loop=*/true), 0)
-            << "aeron_driver_start: " << aeron_errmsg();
-
-        driverRunning_.store(true, std::memory_order_release);
-        driverThread_ = std::thread([this]() {
-            while (driverRunning_.load(std::memory_order_acquire)) {
-                aeron_driver_main_idle_strategy(driver_,
-                    aeron_driver_main_do_work(driver_));
-            }
-        });
-
-        const std::string cncPath = aeronDir + "/cnc.dat";
-        for (int i = 0; i < 400; ++i) {
-            aeron_driver_main_do_work(driver_);
-            if (fs::exists(cncPath)) break;
-            std::this_thread::sleep_for(1ms);
-        }
-        ASSERT_TRUE(fs::exists(cncPath)) << "Aeron cnc.dat not created";
+        // One dedicated pumping thread (EmbeddedDriver::Threaded); no caller-side
+        // readiness pumping — aeron_driver_init already wrote cnc.dat synchronously
+        // (aeron_driver.c:864, :911) before the driver thread even starts.
+        rune::node::EmbeddedDriverConfig cfg;
+        cfg.dir             = aeronDir;
+        cfg.termBufferBytes = 64 * 1024;
+        driver_ = std::make_unique<rune::node::EmbeddedDriver>(cfg, rune::node::DriverMode::Threaded);
     }
 
     void stopDriver() {
-        if (driverRunning_.exchange(false, std::memory_order_acq_rel)) {
-            if (driverThread_.joinable()) driverThread_.join();
-        }
-        if (driver_) {
-            const auto dl = std::chrono::steady_clock::now() + 50ms;
-            while (std::chrono::steady_clock::now() < dl) {
-                if (aeron_driver_main_do_work(driver_) == 0) break;
-                std::this_thread::sleep_for(200us);
-            }
-            aeron_driver_close(driver_);
-            driver_ = nullptr;
-        }
-        if (driverCtx_) {
-            aeron_driver_context_close(driverCtx_);
-            driverCtx_ = nullptr;
-        }
+        driver_.reset();
     }
 
     void connectAeron() {
@@ -334,10 +300,7 @@ private:
     }
 
     std::unique_ptr<TempDir>    tmpDir_;
-    aeron_driver_context_t*     driverCtx_   = nullptr;
-    aeron_driver_t*             driver_      = nullptr;
-    std::atomic<bool>           driverRunning_{false};
-    std::thread                 driverThread_;
+    std::unique_ptr<rune::node::EmbeddedDriver> driver_;
 };
 
 // ===========================================================================
@@ -383,28 +346,12 @@ TEST_F(IngressMigrationFixture, ExOwner_RejectsWithNotLeader)
     waitConnected(*pubA, *ingressA_);
 
     // --- Step 1: Transfer ownership away from worker A ---
-    // Send BecomeFollower via the ingress_ ring (control-thread → worker thread).
-    {
-        WorkerOp op{};
-        op.type        = WorkerOp::Type::BecomeFollower;
-        op.topicId     = kTopicId;
-        op.partition   = kPartition;
-        op.replica     = replica.get();
-        op.roleEpoch   = static_cast<rune::replication::Epoch>(2);
-        op.roleLeaderId = static_cast<rune::replication::NodeId>(99); // dummy new leader
-        ASSERT_TRUE(workerA.tryEnqueueOp(op))
-            << "Failed to enqueue BecomeFollower to worker A";
-    }
-    // SetOwnership: empty set (worker A loses the partition).
-    {
-        WorkerOp op{};
-        op.type     = WorkerOp::Type::SetOwnership;
-        op.topicId  = kTopicId;
-        op.partition = kPartition;
-        // ownedSet empty → worker A owns nothing after this
-        ASSERT_TRUE(workerA.tryEnqueueOp(op))
-            << "Failed to enqueue SetOwnership(empty) to worker A";
-    }
+    // Task 10 fix 3 / F7: the explicit test-only two-phase migration API —
+    // RELEASE on worker A (BecomeFollower, then SetOwnership(empty), FIFO).
+    ASSERT_TRUE(rune::node::WorkerPool::releaseReplicaForTestMigration(
+        workerA, replica.get(), {}, static_cast<rune::replication::Epoch>(2),
+        static_cast<rune::replication::NodeId>(99)))
+        << "Failed to enqueue the release to worker A";
 
     // Drive doWork to process the ring ops (BecomeFollower + SetOwnership).
     {
@@ -606,26 +553,10 @@ TEST_F(IngressMigrationFixture, PsmReconstructionOnOwnershipGain_DedupsAcrossMov
     //   d. SetOwnership({replica}) → Worker B's ingress_ ring.
     // -------------------------------------------------------------------
 
-    // (a) BecomeFollower to Worker A.
-    {
-        WorkerOp op{};
-        op.type         = WorkerOp::Type::BecomeFollower;
-        op.topicId      = kTopicId;
-        op.partition    = kPartition;
-        op.replica      = replica.get();
-        op.roleEpoch    = static_cast<rune::replication::Epoch>(2);
-        op.roleLeaderId = static_cast<rune::replication::NodeId>(99);
-        ASSERT_TRUE(workerA->tryEnqueueOp(op));
-    }
-    // (b) SetOwnership(empty) to Worker A.
-    {
-        WorkerOp op{};
-        op.type     = WorkerOp::Type::SetOwnership;
-        op.topicId  = kTopicId;
-        op.partition = kPartition;
-        // ownedSet empty → Worker A owns nothing.
-        ASSERT_TRUE(workerA->tryEnqueueOp(op));
-    }
+    // (a)+(b) RELEASE on Worker A via the test-only migration API.
+    ASSERT_TRUE(rune::node::WorkerPool::releaseReplicaForTestMigration(
+        *workerA, replica.get(), {}, static_cast<rune::replication::Epoch>(2),
+        static_cast<rune::replication::NodeId>(99)));
 
     // Drive Worker A to process BecomeFollower + SetOwnership.
     {
@@ -644,27 +575,12 @@ TEST_F(IngressMigrationFixture, PsmReconstructionOnOwnershipGain_DedupsAcrossMov
     ASSERT_NE(replica->role(), rune::replication::Role::Leader)
         << "Replica must not be Leader after BecomeFollower";
 
-    // (c) BecomeLeader to Worker B (triggers PSM reconstruction on worker B's thread).
-    {
-        WorkerOp op{};
-        op.type        = WorkerOp::Type::BecomeLeader;
-        op.topicId     = kTopicId;
-        op.partition   = kPartition;
-        op.replica     = replica.get();
-        op.roleEpoch   = static_cast<rune::replication::Epoch>(2);
-        op.roleLeaderId = 0; // unused for BecomeLeader
-        op.isr         = {static_cast<rune::replication::NodeId>(1)}; // new ISR
-        ASSERT_TRUE(workerB->tryEnqueueOp(op));
-    }
-    // (d) SetOwnership({replica}) to Worker B.
-    {
-        WorkerOp op{};
-        op.type     = WorkerOp::Type::SetOwnership;
-        op.topicId  = kTopicId;
-        op.partition = kPartition;
-        op.ownedSet = {replica.get()};
-        ASSERT_TRUE(workerB->tryEnqueueOp(op));
-    }
+    // (c)+(d) GRANT on Worker B — only after A released (drained above).  The
+    // test-only migration API orders SetOwnership BEFORE BecomeLeader, so the
+    // role op passes the ownership guard (PSM reconstruction still fires on B).
+    ASSERT_TRUE(rune::node::WorkerPool::grantReplicaForTestMigration(
+        *workerB, replica.get(), {replica.get()}, static_cast<rune::replication::Epoch>(2),
+        {static_cast<rune::replication::NodeId>(1)}));
 
     // Drive Worker B to process BecomeLeader + SetOwnership.
     // After BecomeLeader the PSM reconstruction seam fires:
@@ -941,20 +857,9 @@ TEST_F(IngressMigrationFixture, ExactlyOnceAcrossMove_RetrySpanningMove)
 
     ASSERT_EQ(log.logEndOffset(), static_cast<int64_t>(kN));
 
-    // --- Phase 2: Demote Worker A, promote Worker B ---
-    {
-        WorkerOp op{};
-        op.type = WorkerOp::Type::BecomeFollower;
-        op.topicId = kTopicId; op.partition = kPartition;
-        op.replica = replica.get();
-        op.roleEpoch = 3; op.roleLeaderId = 99;
-        ASSERT_TRUE(workerA->tryEnqueueOp(op));
-    }
-    {
-        WorkerOp op{};
-        op.type = WorkerOp::Type::SetOwnership;
-        ASSERT_TRUE(workerA->tryEnqueueOp(op));
-    }
+    // --- Phase 2: Demote Worker A, promote Worker B (test-only migration API) ---
+    ASSERT_TRUE(rune::node::WorkerPool::releaseReplicaForTestMigration(
+        *workerA, replica.get(), {}, 3, 99));
     {
         using clk = std::chrono::steady_clock;
         const auto dl = clk::now() + 3s;
@@ -968,21 +873,8 @@ TEST_F(IngressMigrationFixture, ExactlyOnceAcrossMove_RetrySpanningMove)
     }
     ASSERT_EQ(workerA->ownedCount(), 0u);
 
-    {
-        WorkerOp op{};
-        op.type = WorkerOp::Type::BecomeLeader;
-        op.topicId = kTopicId; op.partition = kPartition;
-        op.replica = replica.get();
-        op.roleEpoch = 3;
-        op.isr = {2};
-        ASSERT_TRUE(workerB->tryEnqueueOp(op));
-    }
-    {
-        WorkerOp op{};
-        op.type = WorkerOp::Type::SetOwnership;
-        op.ownedSet = {replica.get()};
-        ASSERT_TRUE(workerB->tryEnqueueOp(op));
-    }
+    ASSERT_TRUE(rune::node::WorkerPool::grantReplicaForTestMigration(
+        *workerB, replica.get(), {replica.get()}, 3, {2}));
     {
         using clk = std::chrono::steady_clock;
         const auto dl = clk::now() + 3s;

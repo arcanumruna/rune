@@ -13,6 +13,7 @@
 // agent to consume all messages; strict timeout via std::future or poll.
 
 #include <gtest/gtest.h>
+#include <array>
 
 #include <rune/consensus/ConsensusAgent.h>
 #include <rune/consensus/AgentRunner.h>
@@ -479,4 +480,51 @@ TEST_F(AgentRunnerIngressRingTest, ManualNanoClock_InjectsTime) {
 
     // The agent must have seen the injected clock value (42ms or very close).
     EXPECT_GE(lastNow.load(), 42'000'000LL);
+}
+
+// F16 regression (run under TSan): two producers claim/commit concurrently into
+// a small ring (40 B payloads → 48 B records → padding on every wrap) while one
+// consumer drains.  Exercises the M2O CAS claim, padding records, the shared head
+// cache and freed-space reuse.  Every message from each producer arrives once,
+// in that producer's order, intact.
+TEST(IngressRingRegression, MultiProducerHandoffWithPaddingIsOrdered) {
+    rune::consensus::IngressRing ring(4096);
+    constexpr std::uint32_t kPerProducer = 20'000;
+    constexpr std::size_t   kLen = 40;
+    // A lost message must FAIL, not hang until the ctest timeout.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    auto produce = [&](std::uint32_t pid) {
+        for (std::uint32_t i = 0; i < kPerProducer; ++i) {
+            aeron::util::index_t idx;
+            while ((idx = ring.tryClaim(kLen)) < 0) {
+                if (std::chrono::steady_clock::now() >= deadline) return;
+                std::this_thread::yield();
+            }
+            std::uint8_t* p = ring.base() + idx;
+            std::memcpy(p, &pid, sizeof(pid));
+            std::memcpy(p + 4, &i, sizeof(i));
+            std::memset(p + 8, static_cast<int>((pid * 31 + i) & 0xFF), kLen - 8);
+            ring.commit(idx);
+        }
+    };
+    std::thread p0(produce, 0u), p1(produce, 1u);
+    std::array<std::uint32_t, 2> next{0, 0};
+    bool ok = true;
+    while ((next[0] < kPerProducer || next[1] < kPerProducer) && std::chrono::steady_clock::now() < deadline) {
+        const int n = ring.drain([&](std::int32_t, aeron::concurrent::AtomicBuffer& buf,
+                                     aeron::util::index_t off, aeron::util::index_t len) {
+            const std::uint8_t* p = buf.buffer() + off;
+            std::uint32_t pid, seq;
+            std::memcpy(&pid, p, 4);
+            std::memcpy(&seq, p + 4, 4);
+            if (pid > 1 || seq != next[pid] || static_cast<std::size_t>(len) != kLen ||
+                p[kLen - 1] != static_cast<std::uint8_t>((pid * 31 + seq) & 0xFF)) ok = false;
+            if (pid <= 1) ++next[pid];
+        }, 64);
+        if (n == 0) std::this_thread::yield();
+    }
+    p0.join(); p1.join();
+    EXPECT_TRUE(ok) << "a message arrived out of producer order or corrupted";
+    EXPECT_EQ(next[0], kPerProducer);
+    EXPECT_EQ(next[1], kPerProducer);
 }

@@ -12,18 +12,18 @@
 //
 // Thread-safety: poll() must be called from ONE thread only.
 
+#include <rune/aeronutil/AeronPump.h>
 #include <rune/consensus/IngressRing.h>
 
 #include <Aeron.h>
 #include <Subscription.h>
-#include <FragmentAssembler.h>
+#include <rune/aeronutil/FragmentAssembler.h>
 #include <concurrent/AtomicBuffer.h>
 #include <util/Index.h>
 
 #include <memory>
 #include <stdexcept>
 #include <chrono>
-#include <thread>
 
 namespace rune::consensus {
 
@@ -36,34 +36,22 @@ public:
     // @param channel      Aeron channel URI, e.g. "aeron:ipc".
     // @param streamId     The stream this node listens on.
     // @param ingressRing  Ring to write decoded frames into.
+    // @param pump         Startup resolve pump (default: sleep-poll a threaded driver).
+    //                     (Production fused placement services the runtime driver from
+    //                     an interim runner and uses the default pump — BrokerNode.)
     AeronIngress(std::shared_ptr<aeron::Aeron> aeron,
                  const std::string&            channel,
                  int32_t                       streamId,
-                 IngressRing&                  ingressRing)
+                 IngressRing&                  ingressRing,
+                 rune::aeronutil::AeronPump    pump = {})
         : aeron_(std::move(aeron))
         , ingressRing_(ingressRing)
-        , assembler_([this](aeron::concurrent::AtomicBuffer& buffer,
-                            aeron::util::index_t             offset,
-                            aeron::util::index_t             length,
-                            aeron::Header&                   /*header*/)
-          {
-              // Write fragment bytes into the ingress ring.
-              // IngressRing::write() accepts uint8_t* and size_t.
-              ingressRing_.write(
-                  reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
-                  static_cast<std::size_t>(length));
-          })
     {
         int64_t regId = aeron_->addSubscription(channel, streamId);
 
-        // Wait up to 5 s for the subscription to be resolved.
-        using namespace std::chrono;
-        auto deadline = steady_clock::now() + seconds{5};
-        while (steady_clock::now() < deadline) {
-            sub_ = aeron_->findSubscription(regId);
-            if (sub_) break;
-            std::this_thread::sleep_for(milliseconds{1});
-        }
+        // Until Aeron answers (bounded by Aeron's driverTimeoutMs, default 10 s).  Spec §3.6: an invoker driver/conductor (fused runtime) is
+        // pumped by this thread between probes; the default pump sleeps 1 ms.
+        sub_ = pump.resolve([&] { return aeron_->findSubscription(regId); }, rune::aeronutil::AeronPump::kUntilAnswered);   // D8: until Aeron answers
         if (!sub_) {
             throw std::runtime_error("AeronIngress: subscription not resolved within timeout");
         }
@@ -78,8 +66,23 @@ public:
     // poll — drive the subscription; returns fragment count.
     // Must be called from ONE thread only.
     // -----------------------------------------------------------------------
+    // Task 11 fix 2 (B3): templated assembler + handler — no std::function.
     int poll(int fragmentLimit = 10) {
-        return sub_->poll(assembler_.handler(), fragmentLimit);
+        const int n = sub_->poll(
+            [this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l,
+                   aeron::Header& h) {
+                assembler_.onFragment(
+                    [this](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
+                           aeron::util::index_t length, aeron::Header&) {
+                        // Write the (reassembled) frame into the ingress ring.
+                        ingressRing_.write(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
+                                           static_cast<std::size_t>(length));
+                    },
+                    b, o, l, h);
+            },
+            fragmentLimit);
+        imageWatch_.afterPoll(*sub_, assembler_);   // free buffers of lost images (m-c)
+        return n;
     }
 
     aeron::Subscription& subscription() { return *sub_; }
@@ -88,7 +91,8 @@ private:
     std::shared_ptr<aeron::Aeron>          aeron_;
     std::shared_ptr<aeron::Subscription>   sub_;
     IngressRing&                           ingressRing_;
-    aeron::FragmentAssembler               assembler_;
+    rune::aeronutil::FragmentAssembler     assembler_;
+    rune::aeronutil::ImageLossWatch        imageWatch_;
 };
 
 } // namespace rune::consensus

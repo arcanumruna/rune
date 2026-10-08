@@ -325,13 +325,13 @@ struct BrtAeronDriver {
             }
         });
 
-        // Wait for the CnC file (conductor ready).
+        // No caller-side pumping here: aeron_driver_init/aeron_driver_start already
+        // wrote cnc.dat and stamped the heartbeat synchronously (aeron_driver.c:864,
+        // :911) before workThread even starts, so a client can connect immediately.
+        // A second thread pumping the conductor here — even just to poll for
+        // cnc.dat — would race workThread on the single-pumper driver contract.
         const std::string cncPath = aeronDir + "/cnc.dat";
-        for (int i = 0; i < 400; ++i) {
-            aeron_driver_main_do_work(driver);
-            if (fs::exists(cncPath)) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds{1});
-        }
+        EXPECT_TRUE(fs::exists(cncPath)) << "Aeron cnc.dat not created by aeron_driver_init/start";
 
         aeron::Context aeronCtx;
         aeronCtx.aeronDir(aeronDir);

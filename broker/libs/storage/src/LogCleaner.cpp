@@ -1,5 +1,7 @@
 #include <rune/storage/LogCleaner.h>
+#include <cstring>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/storage/ControlMarkerLayout.h>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -140,6 +142,162 @@ void buildIndex(const std::string& indexPath, int64_t baseOffset,
 
 } // anonymous namespace
 
+
+namespace {
+// D3 (I4): a COMMIT/ABORT marker batch.  Never key-compacted, never indexed in the
+// offset map (Kafka: control batches are not subject to key compaction).
+bool isControlBatch(const rune::protocol::RecordBatchReader& r) {
+    return (static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) != 0;
+}
+bool isTransactionalBatch(const rune::protocol::RecordBatchReader& r) {
+    return (static_cast<uint16_t>(r.attributes()) &
+            static_cast<uint16_t>(rune::protocol::batch::kAttrTransactional)) != 0;
+}
+// Kafka LogCleaner parity (ProducerTails.h): note the batch if it is an
+// idempotent DATA batch starting below `toOffset`.
+void noteProducerTail(const uint8_t* batch, const rune::protocol::RecordBatchReader& r, Offset toOffset,
+                      ProducerTails& tails) {
+    if (r.producerId() < 0 || r.baseSequence() < 0) return;
+    if ((static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) != 0)
+        return;
+    if (r.baseOffset() >= toOffset) return;
+    tails.note(r.producerId(), r.baseOffset() + r.lastOffsetDelta(),
+               static_cast<int64_t>(rune::protocol::detail::getLE64(batch + rune::protocol::batch::kMaxTimestampOffset)));
+}
+// C2 (Kafka BatchRetention.RETAIN_EMPTY): the RECORD-LESS producer-tail batch —
+// covers `lastOffset`, carries the producer id / epoch / the batch's last
+// sequence / its maxTimestamp, holds no record (no key can resurrect).
+void appendEmptyTailBatch(std::vector<uint8_t>& out, std::vector<uint8_t>& tmp, int64_t lastOffset,
+                          int64_t maxTimestampMs, int64_t producerId, int16_t producerEpoch, int32_t lastSequence,
+                          bool transactional) {
+    rune::protocol::RecordBatchBuilder b(lastOffset, maxTimestampMs);
+    b.setTransactional(transactional);
+    b.setProducerId(producerId);
+    b.setProducerEpoch(producerEpoch);
+    b.setBaseSequence(lastSequence);
+    b.buildInto(tmp);   // recordCount 0 (the builder writes lastOffsetDelta -1)
+    rune::protocol::detail::putLE(tmp, rune::protocol::batch::kLastOffsetDeltaOffset, static_cast<uint32_t>(0));
+    const uint32_t crc = rune::protocol::crc32c(tmp.data() + rune::protocol::batch::kAttributesOffset,
+                                                tmp.size() - rune::protocol::batch::kAttributesOffset);
+    rune::protocol::detail::putLE(tmp, rune::protocol::batch::kCrcOffset, crc);
+    out.insert(out.end(), tmp.begin(), tmp.end());
+}
+// D3b: the control type of a marker batch — kCommit / kAbort, or kUnparseable.
+// TWO encodings: the PRODUCTION marker (ControlMarker::build — its layout is
+// defined ONCE in ControlMarkerLayout.h; its record carries NO length varint) and
+// a Kafka-framed control record (length varint first) whose key is the 2-byte LE
+// controlType.  Anything else is UNPARSEABLE: the cleaner treats its transaction
+// as UNRESOLVED (caps the pass at it) — never as COMMIT, which would index data
+// that may have been aborted (fix round 2).
+int markerControlType(const uint8_t* batch, std::size_t len, const rune::protocol::RecordBatchReader& r) {
+    namespace cml = rune::storage::control_marker;
+    const int t = cml::controlType(batch, len);
+    if (t != cml::kUnparseable) return t;
+    if (r.recordCount() != 1 || batch[cml::kBatchHeaderSize] == 0) return cml::kUnparseable;   // not Kafka-framed
+    int out = cml::kUnparseable;
+    r.forEachRecord([&](std::string_view key, std::string_view, int64_t, int64_t) {
+        if (key.size() != 2) return;
+        const int v = static_cast<int>(static_cast<uint16_t>(static_cast<uint8_t>(key[0])) |
+                                       static_cast<uint16_t>(static_cast<uint8_t>(key[1])) << 8);
+        if (v == cml::kCommit || v == cml::kAbort) out = v;
+    });
+    return out;
+}
+
+// D3b: the transaction pre-pass (Kafka: the cleaner's aborted-txn collection +
+// CleanedTransactionMetadata, the LSO bound).  Walks EVERY batch of every listed
+// segment with base offset < toOffset (from log start: a txn's data may lie in the
+// clean prefix while its marker lies in the dirty section), in offset order, and
+// feeds `txn` (aborted ranges, unresolved txns, empty-txn markers) plus the
+// producer tails (ProducerTails.h — all producers' last batches below toOffset).
+// Markers at/after toOffset (<= the committed HW) are not trusted: a txn whose
+// marker was not seen stays unresolved and caps the pass (txn.cleanLimit()).
+// Returns the bytes read (throttled by the caller like the M3 prefix reads).
+int64_t scanTxnState(const std::string& dir, const std::vector<int64_t>& bases, Offset toOffset,
+                     Offset markerRemovalBound, TxnCleanState& txn, ProducerTails& tails,
+                     const BoundaryHook& hook) {
+    int64_t bytes = 0;
+    for (int64_t segBase : bases) {
+        if (segBase >= toOffset) break;
+        hook();   // fix round 6: segment boundary
+        const auto buf = readFile(segmentLogPath(dir, segBase));
+        bytes += static_cast<int64_t>(buf.size());
+        std::size_t pos = 0;
+        while (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= buf.size()) {
+            rune::protocol::RecordBatchReader r(buf.data() + pos, buf.size() - pos);
+            const int32_t total = r.totalLength();
+            if (total <= 0 || pos + static_cast<std::size_t>(total) > buf.size()) break;
+            if (!r.ensureValid()) break;
+            const int64_t base = r.baseOffset();
+            if (base >= toOffset) break;
+            noteProducerTail(buf.data() + pos, r, toOffset, tails);
+            const int64_t pid  = r.producerId();
+            const int64_t last = base + r.lastOffsetDelta();
+            if (pid >= 0) {
+                if (isControlBatch(r)) {
+                    const int type = markerControlType(buf.data() + pos, static_cast<std::size_t>(total), r);
+                    if (type == rune::storage::control_marker::kUnparseable)
+                        txn.onUnresolvedMarker(pid, base);   // never COMMIT (fix round 2)
+                    else
+                        txn.onMarker(pid, base, type == rune::storage::control_marker::kAbort,
+                                     r.hasDeleteHorizon() ? r.deleteHorizonMs() : TxnCleanState::kNoHorizon);
+                }
+                else if (isTransactionalBatch(r))
+                    txn.onTxnDataBatch(pid, base, last, r.recordCount() > 0);
+                else                              txn.onProducerBatch(pid, last);
+            }
+            pos += static_cast<std::size_t>(total);
+        }
+    }
+    txn.finish(toOffset, markerRemovalBound);
+    return bytes;
+}
+
+// D3b: what a rewrite does with a control batch (Kafka: a marker whose txn has no
+// batch left is removable; KIP-534: the first removable pass stamps its delete
+// horizon, a pass at/after the horizon drops it).  Without a wall clock (nowMs < 0,
+// the legacy path) a marker is never removed.
+enum class MarkerAction { Keep, Stamp, Drop };
+MarkerAction markerAction(const rune::protocol::RecordBatchReader& r, int64_t batchLastOffset,
+                          Offset cleanBoundaryOffset, const TxnCleanState* txn, int64_t nowMs) {
+    if (txn == nullptr || nowMs < 0 || batchLastOffset >= cleanBoundaryOffset ||
+        !txn->markerRemovable(r.baseOffset()))
+        return MarkerAction::Keep;
+    if (r.hasDeleteHorizon()) return nowMs >= r.deleteHorizonMs() ? MarkerAction::Drop : MarkerAction::Keep;
+    return MarkerAction::Stamp;
+}
+// Copy a control batch, stamping the delete horizon (kAttrDeleteHorizon + the
+// horizon in baseTimestamp — the RecordBatch contract) and re-sealing the CRC.
+void appendStampedControlBatch(std::vector<uint8_t>& out, const uint8_t* batch, std::size_t len, int64_t horizonMs) {
+    namespace b = rune::protocol::batch;
+    const std::size_t at = out.size();
+    out.insert(out.end(), batch, batch + len);
+    uint8_t* p = out.data() + at;
+    const uint16_t attrs = static_cast<uint16_t>(rune::protocol::detail::getLE16(p + b::kAttributesOffset)) |
+                           static_cast<uint16_t>(b::kAttrDeleteHorizon);
+    p[b::kAttributesOffset]     = static_cast<uint8_t>(attrs);
+    p[b::kAttributesOffset + 1] = static_cast<uint8_t>(attrs >> 8);
+    const uint64_t h = static_cast<uint64_t>(horizonMs);
+    for (int i = 0; i < 8; ++i) p[b::kBaseTimestampOffset + i] = static_cast<uint8_t>(h >> (i * 8));
+    const uint32_t crc = rune::protocol::crc32c(p + b::kAttributesOffset, len - static_cast<std::size_t>(b::kAttributesOffset));
+    for (int i = 0; i < 4; ++i) p[b::kCrcOffset + i] = static_cast<uint8_t>(crc >> (i * 8));
+}
+// D3b: the rewrite's handling of one control batch (shared by every path).
+// Returns true iff the segment's content changed.
+bool rewriteControlBatch(std::vector<uint8_t>& out, const uint8_t* batch, std::size_t len,
+                         const rune::protocol::RecordBatchReader& r, int64_t batchLastOffset,
+                         Offset cleanBoundaryOffset, const TxnCleanState* txn, int64_t nowMs,
+                         int64_t deleteRetentionMs) {
+    switch (markerAction(r, batchLastOffset, cleanBoundaryOffset, txn, nowMs)) {
+        case MarkerAction::Drop:  return true;
+        case MarkerAction::Stamp: appendStampedControlBatch(out, batch, len, nowMs + deleteRetentionMs); return true;
+        case MarkerAction::Keep:  break;
+    }
+    out.insert(out.end(), batch, batch + len);
+    return false;
+}
+} // namespace
+
 // ---------------------------------------------------------------------------
 // buildOffsetMap  (APPEND-THREAD ONLY — derives bases from segments_)
 // ---------------------------------------------------------------------------
@@ -158,15 +316,24 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
                                            const std::vector<int64_t>& bases,
                                            Offset fromOffset, Offset toOffset,
                                            SkimpyOffsetMap& map) {
-    if (fromOffset >= toOffset) return -1;
+    prefixBytesRead_ = 0;
+    TxnCleanState& txn = map.txnState();
+    txn.clear();
+    if (fromOffset >= toOffset) { txn.finish(toOffset, markerRemovalBound_); return -1; }
+    // D3b: transaction pre-pass (+ producer tails) over the whole log below
+    // toOffset; the map never indexes at/after the first unresolved txn (LSO) nor
+    // aborted txn data.  M3: these reads are throttled by the caller.
+    prefixBytesRead_ = scanTxnState(dir, bases, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_);
+    toOffset = txn.cleanLimit();
 
     for (size_t i = 0; i < bases.size(); ++i) {
         int64_t segBase = bases[i];
         int64_t segEnd  = (i + 1 < bases.size()) ? bases[i + 1] : toOffset;
 
-        if (segEnd <= fromOffset) continue;
         if (segBase >= toOffset)  break;
+        if (segEnd <= fromOffset) continue;   // clean prefix: covered by the pre-pass
 
+        hook_();   // fix round 6: segment boundary
         auto buf = readFile(segmentLogPath(dir, segBase));
         if (buf.empty()) continue;
 
@@ -179,7 +346,8 @@ Offset LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             if (!r.ensureValid()) break;
 
             bool full = false;
-            r.forEach([&](std::string_view key, std::string_view /*val*/,
+            if (!isControlBatch(r) && !(isTransactionalBatch(r) && txn.isAborted(r.producerId(), r.baseOffset())))
+                r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
                           int64_t offset, int64_t /*ts*/) {
                 if (full) return;
                 if (offset < fromOffset || offset >= toOffset) return;
@@ -205,7 +373,13 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
                                          const std::vector<int64_t>& bases,
                                          Offset fromOffset, Offset toOffset,
                                          OffsetMap& map) {
-    if (fromOffset >= toOffset) return;
+    prefixBytesRead_ = 0;
+    TxnCleanState& txn = map.txnState();
+    txn.clear();
+    if (fromOffset >= toOffset) { txn.finish(toOffset, markerRemovalBound_); return; }
+    // D3b: transaction pre-pass (+ producer tails) — see the bounded overload.
+    prefixBytesRead_ = scanTxnState(dir, bases, toOffset, markerRemovalBound_, txn, map.producerTails(), hook_);
+    toOffset = txn.cleanLimit();
 
     // Walk segments that overlap [fromOffset, toOffset).  `bases` and `dir` are
     // supplied explicitly (from the sealed-segment snapshot on the cleaner thread,
@@ -222,11 +396,13 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
         int64_t segBase = bases[i];
         int64_t segEnd = (i + 1 < bases.size()) ? bases[i + 1] : toOffset;
 
-        // Skip segments entirely outside [fromOffset, toOffset).
-        if (segEnd <= fromOffset) continue;
+        // Skip segments entirely outside [fromOffset, toOffset) — except that a
+        // clean-prefix segment's producer tails are still noted (ProducerTails.h).
         if (segBase >= toOffset) break;
+        if (segEnd <= fromOffset) continue;   // clean prefix: covered by the pre-pass
 
         // Read segment from disk.
+        hook_();   // fix round 6: segment boundary
         auto buf = readFile(segmentLogPath(dir, segBase));
         if (buf.empty()) continue;
 
@@ -240,7 +416,8 @@ void LogCleaner::buildOffsetMapFromBases(const std::string& dir,
             // A3: CRC-gate the walk — stop on the first corrupt batch (same as recover()).
             if (!r.ensureValid()) break;
 
-            r.forEach([&](std::string_view key, std::string_view /*val*/,
+            if (!isControlBatch(r) && !(isTransactionalBatch(r) && txn.isAborted(r.producerId(), r.baseOffset())))
+                r.forEachRecord([&](std::string_view key, std::string_view /*val*/,
                           int64_t offset, int64_t /*ts*/) {
                 if (offset < fromOffset || offset >= toOffset) return;
                 if (key.empty()) return; // skip null-key records (not compactable)
@@ -260,8 +437,10 @@ bool LogCleaner::rewriteSegmentImpl(
     const std::function<std::optional<Offset>(std::string_view)>& getLatest,
     Offset fromOffset, Offset cleanBoundaryOffset,
     int64_t nowNs, int64_t deleteRetentionMs,
-    int64_t nowMs, bool* changed)
+    int64_t nowMs, bool* changed, const ProducerTails* tails, const TxnCleanState* txn)
 {
+    // D3b: never clean at/after the pass's first unresolved transaction (LSO).
+    if (txn != nullptr) cleanBoundaryOffset = std::min(cleanBoundaryOffset, txn->cleanLimit());
     std::string logPath   = segmentLogPath(dir, segBase);
     std::string newPath   = logPath + ".new";
     std::string idxPath   = segmentIndexPath(dir, segBase);
@@ -270,6 +449,8 @@ bool LogCleaner::rewriteSegmentImpl(
     std::filesystem::remove(newPath);
 
     // Read the current segment.
+    ++rewriteSegmentsRead_;
+    hook_();   // fix round 6: segment boundary
     auto buf = readFile(logPath);
     if (buf.empty()) return false;
 
@@ -329,6 +510,48 @@ bool LogCleaner::rewriteSegmentImpl(
         int32_t origBaseSequence  = static_cast<int32_t>(
             rune::protocol::detail::getLE32(buf.data() + pos + rune::protocol::batch::kBaseSequenceOffset));
         int64_t batchBaseOffset   = r.baseOffset();
+        const int64_t batchLastOffset = batchBaseOffset + r.lastOffsetDelta();
+        const bool batchIsData = origProducerId >= 0 && origBaseSequence >= 0 &&
+            (static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) == 0;
+        const int64_t batchMaxTs = static_cast<int64_t>(
+            rune::protocol::detail::getLE64(buf.data() + pos + rune::protocol::batch::kMaxTimestampOffset));
+        // C2 / I1: does this batch carry its producer's last metadata (Kafka
+        // isBatchLastRecordOfProducer, unexpired)?  Then it is never removed
+        // whole: kept records carry it, else a record-less batch does.
+        const bool tailNeeded = batchIsData && tails != nullptr && batchLastOffset < cleanBoundaryOffset &&
+            tails->mustRetain(origProducerId, batchLastOffset, batchMaxTs, nowMs, producerIdExpirationMs_);
+        if (batchIsData && r.recordCount() == 0) {
+            // A record-less producer-tail batch of an earlier pass: kept while
+            // it is still the (unexpired) tail, dropped once superseded.
+            if (batchLastOffset >= cleanBoundaryOffset || tailNeeded)
+                outBuf.insert(outBuf.end(), buf.begin() + static_cast<std::ptrdiff_t>(pos),
+                              buf.begin() + static_cast<std::ptrdiff_t>(pos + static_cast<size_t>(total)));
+            else
+                modified = true;
+            pos += static_cast<size_t>(total);
+            continue;
+        }
+        if (isControlBatch(r)) {   // D3: markers are never key-compacted; D3b: removed once empty + past horizon
+            if (rewriteControlBatch(outBuf, buf.data() + pos, static_cast<size_t>(total), r, batchLastOffset,
+                                    cleanBoundaryOffset, txn, nowMs, deleteRetentionMs))
+                modified = true;
+            pos += static_cast<size_t>(total);
+            continue;
+        }
+        const bool batchIsTxn = isTransactionalBatch(r);   // D3: rebuilt records keep the txn bit
+        if (batchIsTxn && txn != nullptr && batchLastOffset < cleanBoundaryOffset &&
+            txn->isAborted(origProducerId, batchBaseOffset)) {
+            // D3b (Kafka): aborted transactional data is discarded by the cleaner;
+            // the producer's last batch keeps its metadata only (C2, RETAIN_EMPTY).
+            modified = true;
+            if (tailNeeded)
+                appendEmptyTailBatch(outBuf, tmpBatch, batchLastOffset, batchMaxTs, origProducerId, origProducerEpoch,
+                                     origBaseSequence + static_cast<int32_t>(batchLastOffset - batchBaseOffset),
+                                     /*transactional=*/true);
+            pos += static_cast<size_t>(total);
+            continue;
+        }
+        bool lastKept = false;   // the record at batchLastOffset was emitted
 
         // CP-8: does this batch contain any tombstone (for horizon stamping)?
         // We track this as we iterate records and then stamp the batch if needed.
@@ -348,13 +571,14 @@ bool LogCleaner::rewriteSegmentImpl(
         // record becomes a batch with baseOffset == that record's offset).
         // A2: After building, patch in the original producer fields and
         // recompute CRC to preserve idempotent-producer identity.
-        r.forEach([&](std::string_view key, std::string_view val,
+        r.forEachRecord([&](std::string_view key, std::string_view val,
                       int64_t offset, int64_t timestamp) {
             // Helper: emit this record as its own single-record batch,
             // preserving the original batch's producer identity (A2).
             // @param horizonMs  If >= 0, stamp this as a delete-horizon batch.
             auto keepWithHorizon = [&](int64_t horizonMs) {
                 rune::protocol::RecordBatchBuilder b(offset, timestamp);
+                b.setTransactional(batchIsTxn);
                 if (horizonMs >= 0) {
                     // CP-8: Stamp the output batch with the delete horizon.
                     // This sets kAttrDeleteHorizon and puts horizonMs into baseTimestamp.
@@ -364,6 +588,10 @@ bool LogCleaner::rewriteSegmentImpl(
                 // CP-10 ULL: use buildInto(tmpBatch) — reuses capacity, avoids per-record alloc.
                 b.buildInto(tmpBatch);
                 auto& batch = tmpBatch;
+                // Kafka parity: a rebuilt batch keeps the partitionLeaderEpoch of
+                // the batch it came from (CRC-excluded field) — the epoch lineage
+                // (KIP-320 fetch validation, epoch-cache rebuilds) survives compaction.
+                rune::protocol::RecordBatchReader::stampLeaderEpoch(batch.data(), r.partitionLeaderEpoch());
 
                 // A2: Patch producerId, producerEpoch, baseSequence into the
                 // rebuilt batch.  The record's sequence number within the
@@ -407,6 +635,7 @@ bool LogCleaner::rewriteSegmentImpl(
                 }
 
                 outBuf.insert(outBuf.end(), batch.begin(), batch.end());
+                if (offset == batchLastOffset) lastKept = true;
             };
 
             auto keep = [&]() { keepWithHorizon(-1); };
@@ -419,6 +648,7 @@ bool LogCleaner::rewriteSegmentImpl(
 
             // Null-key records: always keep (not compactable).
             if (key.empty()) { keep(); return; }
+
 
             // UNIFIED RETAIN RULE (Kafka LogCleaner.shouldRetainRecord).
             //
@@ -489,6 +719,12 @@ bool LogCleaner::rewriteSegmentImpl(
             // Keep this record (non-tombstone, or tombstone within retention).
             keep();
         });
+        // C2: the producer's last record was dropped — keep its METADATA only.
+        if (tailNeeded && !lastKept) {
+            appendEmptyTailBatch(outBuf, tmpBatch, batchLastOffset, batchMaxTs, origProducerId, origProducerEpoch,
+                                 origBaseSequence + static_cast<int32_t>(batchLastOffset - batchBaseOffset),
+                                 batchIsTxn);
+        }
 
         pos += static_cast<size_t>(total);
     }
@@ -501,10 +737,14 @@ bool LogCleaner::rewriteSegmentImpl(
     // rewritten) only discovers segments with on-disk .log files, so a deleted
     // segment is simply absent — Log remains consistent and LEO is unaffected.
     if (outBuf.empty()) {
+        if (changed) *changed = true; // segment removed — content changed
+        if (deferredOut_ != nullptr) {   // fix round 2: the owner thread drops it
+            deferInstall_(dir, {segBase}, outBuf);
+            return true;
+        }
         std::filesystem::remove(logPath);
         std::filesystem::remove(idxPath);
         fsyncDir(dir);
-        if (changed) *changed = true; // segment removed — content changed
         return true;
     }
 
@@ -518,6 +758,12 @@ bool LogCleaner::rewriteSegmentImpl(
         return true; // file present + valid, unchanged
     }
     if (changed) *changed = true;
+    if (deferredOut_ != nullptr) {
+        // Fix round 2: never replace the original here — the owner thread
+        // validates and installs the output (Log::drainCleanerSwaps).
+        deferInstall_(dir, {segBase}, outBuf);
+        return true;
+    }
 
     // Durable atomic swap: write → fsync file → rename → fsync dir.
     //
@@ -558,7 +804,8 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, OffsetM
                                 int64_t nowMs) {
     return rewriteSegmentImpl(dir, segBase,
         [&map](std::string_view key) -> std::optional<Offset> { return map.get(key); },
-        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs);
+        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs, nullptr,
+        &map.producerTails(), &map.txnState());
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +817,8 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, SkimpyO
                                 int64_t nowMs) {
     return rewriteSegmentImpl(dir, segBase,
         [&map](std::string_view key) -> std::optional<Offset> { return map.get(key); },
-        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs);
+        fromOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs, nullptr,
+        &map.producerTails(), &map.txnState());
 }
 
 // ---------------------------------------------------------------------------
@@ -578,8 +826,9 @@ bool LogCleaner::rewriteSegment(const std::string& dir, int64_t segBase, SkimpyO
 // ---------------------------------------------------------------------------
 void LogCleaner::compact(Log& log, OffsetMap& map,
                          Offset firstDirtyOffset, Offset cleanBoundaryOffset,
-                         int64_t nowNs, int64_t deleteRetentionMs) {
+                         int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs) {
     const std::string& dir = log.dir();
+    rewriteSegmentsRead_ = 0;
 
     // Clean up any stale .log.new temp files left by a previous crashed run.
     for (auto& e : std::filesystem::directory_iterator(dir)) {
@@ -590,15 +839,23 @@ void LogCleaner::compact(Log& log, OffsetMap& map,
 
     auto bases = log.segmentBaseOffsets();
     if (bases.empty()) return;
+    // D3b: never at/after the first unresolved transaction (the LSO the map's
+    // pre-pass found; kNone when the map was not built by buildOffsetMap).
+    cleanBoundaryOffset = std::min(cleanBoundaryOffset, map.txnState().cleanLimit());
 
     // The ACTIVE segment is always the last one — never compact it.
     // Also never compact segments whose base is >= cleanBoundaryOffset.
     int64_t activeBase = bases.back();
 
-    for (int64_t segBase : bases) {
+    for (std::size_t i = 0; i < bases.size(); ++i) {
+        const int64_t segBase = bases[i];
         if (segBase == activeBase) continue;       // active segment — skip
         if (segBase >= cleanBoundaryOffset) break; // at/past HW — stop
-        rewriteSegment(dir, segBase, map, firstDirtyOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs);
+        // E1d invariant 3: never compact a segment ending above the persisted
+        // recovery point — restart recovery chain-validates it, and a
+        // compaction gap there would be taken for a lost write (truncation).
+        if (i + 1 < bases.size() && !log.compactionAllowedThrough(bases[i + 1])) break;
+        rewriteSegment(dir, segBase, map, firstDirtyOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs);
     }
 
     // Reload the log's in-memory state from the rewritten files.
@@ -614,10 +871,10 @@ void LogCleaner::compact(Log& log, OffsetMap& map,
 // clean  (convenience: build map + compact in one call)
 // ---------------------------------------------------------------------------
 void LogCleaner::clean(Log& log, Offset firstDirtyOffset, Offset cleanBoundaryOffset,
-                       int64_t nowNs, int64_t deleteRetentionMs) {
+                       int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs) {
     OffsetMap map;
     buildOffsetMap(log, firstDirtyOffset, cleanBoundaryOffset, map);
-    compact(log, map, firstDirtyOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs);
+    compact(log, map, firstDirtyOffset, cleanBoundaryOffset, nowNs, deleteRetentionMs, nowMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -689,6 +946,7 @@ CleanPassResult LogCleaner::produceCleanedFileBounded(
     int64_t nowMs)
 {
     CleanPassResult result{false, activeBase};
+    rewriteSegmentsRead_ = 0;
 
     if (sealedBases.empty()) return result;
     if (segBase >= activeBase) return result;
@@ -717,6 +975,7 @@ CleanPassResult LogCleaner::produceCleanedFileBounded(
         // Read bytes can be estimated from sealedBases sizes (file reads).
         // For simplicity, throttle after the full map-build pass.
         buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+        if (throttler && prefixBytesRead_ > 0) throttler->maybeThrottle(prefixBytesRead_);   // M3
         if (throttler) {
             // Approximate read bytes: size of the segment file being processed.
             // For the cleaner-thread path we throttle after the map is built.
@@ -732,15 +991,19 @@ CleanPassResult LogCleaner::produceCleanedFileBounded(
     // passEnd: the first offset NOT covered by this pass.
     // If the map filled up: latestOffset() < activeBase − 1 → partial pass.
     // If the map covered everything: latestOffset() == the last-offset-before-activeBase.
+    // D3b: never at/after the first unresolved transaction (LSO).
+    const Offset limit = std::min<Offset>(activeBase, map.txnState().cleanLimit());
+    result.passEnd = limit;
     Offset latestMapped = map.latestOffset();
-    if (latestMapped < 0) {
-        // Map got nothing (no records in range) — nothing to compact.
-        // passEnd stays as activeBase so the watermark advances.
+    if (latestMapped < 0 && !map.txnState().hasWork(nowMs)) {
+        // Map got nothing (no keyed records in range) and no aborted data /
+        // removable marker — nothing to compact.  passEnd stays at the limit.
         return result;
     }
-    Offset passEnd = latestMapped + 1;  // next pass starts here
-    // Clamp: passEnd can't exceed activeBase.
-    if (passEnd > activeBase) passEnd = activeBase;
+    // A FULL map stops the pass at its last key; otherwise the scan covered the
+    // whole range up to the limit.
+    Offset passEnd = (latestMapped >= 0 && map.isFull()) ? latestMapped + 1 : limit;
+    if (passEnd > limit) passEnd = limit;
     result.passEnd = passEnd;
 
     // Only rewrite the segment if its base is within [globalDirtyStart, passEnd).
@@ -806,8 +1069,52 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
     Throttler* throttler,
     int64_t nowMs)
 {
+    deferredWritten_.clear();
+    if (deferredSeq_ != nullptr) {
+        // Fix round 3: the owner thread installs earlier outputs with renames
+        // only (no fsync on the worker).  Make those directory entries durable
+        // HERE, off the hot path, once per pass.  Not needed for crash safety
+        // (any un-fsynced prefix of the rename protocol recovers via .cleaned /
+        // .swap at construction) — it only bounds how much finished compaction
+        // a power loss can undo.
+        fsyncDir(dir);
+    }
+    try {
+        return produceCleanedRangeBoundedImpl_(dir, sealedBases, sealedSizes, activeBase,
+                                               globalDirtyStart, nowNs, deleteRetentionMs, map,
+                                               useCoalescing, groupRollBytes, throttler, nowMs);
+    } catch (...) {
+        // N-LOW-1: an exception mid-pass loses result.groups — remove this pass's
+        // outputs now (never enqueued; the originals are untouched).
+        std::error_code ec;
+        for (const auto& p : deferredWritten_) std::filesystem::remove(p, ec);
+        deferredWritten_.clear();
+        throw;
+    }
+}
+
+RangeCleanResult LogCleaner::produceCleanedRangeBoundedImpl_(
+    const std::string& dir,
+    const std::vector<int64_t>& sealedBases,
+    const std::vector<int64_t>& sealedSizes,
+    Offset activeBase,
+    Offset globalDirtyStart,
+    int64_t nowNs, int64_t deleteRetentionMs,
+    SkimpyOffsetMap& map,
+    bool useCoalescing,
+    int64_t groupRollBytes,
+    Throttler* throttler,
+    int64_t nowMs)
+{
     RangeCleanResult result;
+    rewriteSegmentsRead_ = 0;
     result.passEnd = activeBase;   // default: nothing dirty → advance to activeBase
+    // Fix round 2: deferred-install mode collects outputs into result.groups.
+    struct DeferredScope {
+        std::vector<CleanedGroup>*& slot;
+        ~DeferredScope() { slot = nullptr; }
+    } deferredScope{deferredOut_};
+    deferredOut_ = deferredSeq_ != nullptr ? &result.groups : nullptr;
 
     if (sealedBases.empty()) return result;
     if (globalDirtyStart < 0) globalDirtyStart = 0;
@@ -825,16 +1132,28 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
     // one pass without a member's keys vanishing after it is deleted.
     map.clear();
     buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+    // M3: the clean-prefix reads for producer tails count against the I/O throttle.
+    if (throttler && prefixBytesRead_ > 0) throttler->maybeThrottle(prefixBytesRead_);
+
+    // D3b: the pass never reaches the first unresolved transaction (Kafka: the
+    // cleanable range ends at the LSO) — the watermark stops there too.
+    const TxnCleanState& txn = map.txnState();
+    const Offset limit = std::min<Offset>(activeBase, txn.cleanLimit());
+    result.passEnd = limit;
 
     const Offset latestMapped = map.latestOffset();
-    if (latestMapped < 0) {
-        // No compactable (non-null-key) records in the dirty range.  Nothing to
-        // rewrite; the caller advances the watermark to activeBase.
-        return result; // compacted=false, passEnd=activeBase, rewrittenBases empty
+    if (latestMapped < 0 && !txn.hasWork(nowMs)) {
+        // No compactable (non-null-key) records and no aborted data / removable
+        // marker in the range.  Nothing to rewrite; the caller advances the
+        // watermark to the limit.
+        return result; // compacted=false, passEnd=limit, rewrittenBases empty
     }
 
-    Offset passEnd = latestMapped + 1;
-    if (passEnd > activeBase) passEnd = activeBase;
+    // A FULL map covered [globalDirtyStart, latestMapped]; otherwise the scan
+    // covered the whole range up to the limit (records past the last key are
+    // unkeyed, markers or aborted data — the rewrite handles them this pass).
+    Offset passEnd = map.isFull() ? latestMapped + 1 : limit;
+    if (passEnd > limit) passEnd = limit;
     result.passEnd = passEnd;
 
     // The in-pass segments are those whose byte range overlaps [logStart, passEnd),
@@ -860,6 +1179,20 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
         const int64_t roll = (groupRollBytes > 0) ? groupRollBytes
                                                    : (64LL * 1024 * 1024);
         auto groups = groupSegmentsBySize(inPassBases, inPassSizes, roll);
+        if (deferredOut_ != nullptr) {
+            // Bound each group so the owner's ring claim always fits.
+            std::vector<SegmentGroup> split;
+            for (auto& g : groups) {
+                for (std::size_t i = 0; i < g.bases.size(); i += kMaxDeferredGroupMembers) {
+                    SegmentGroup part;
+                    const std::size_t e = std::min(g.bases.size(), i + kMaxDeferredGroupMembers);
+                    part.bases.assign(g.bases.begin() + static_cast<std::ptrdiff_t>(i),
+                                      g.bases.begin() + static_cast<std::ptrdiff_t>(e));
+                    split.push_back(std::move(part));
+                }
+            }
+            groups.swap(split);
+        }
         for (const auto& g : groups) {
             if (g.bases.empty()) continue;
             bool changed = false;
@@ -880,7 +1213,7 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
     for (int64_t b : inPassBases) {
         bool changed = false;
         rewriteSegmentImpl(dir, b, getLatest, globalDirtyStart, passEnd,
-                           nowNs, deleteRetentionMs, nowMs, &changed);
+                           nowNs, deleteRetentionMs, nowMs, &changed, &map.producerTails(), &map.txnState());
 
         // A segment needs a swap enqueue iff its on-disk content changed (records
         // dropped / tombstone stamped / emptied), OR its .log is now absent (emptied
@@ -890,7 +1223,9 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
         // disk and NOT enqueued — no churn (one exists() stat covers both branches).
         std::error_code ec;
         const bool present = std::filesystem::exists(segmentLogPath(dir, b), ec);
-        if (changed || !present) {
+        // Deferred mode never removes a file here, so an absent .log is the
+        // owner's own (already applied) work — only real changes are reported.
+        if (changed || (!present && deferredOut_ == nullptr)) {
             result.rewrittenBases.push_back(b);
             result.compacted = true;
         }
@@ -905,6 +1240,59 @@ RangeCleanResult LogCleaner::produceCleanedRangeBounded(
     }
 
     return result;
+}
+
+// Fix round 2: deferred-install output (cleaner thread).  Writes `out` durably
+// (fsynced data, never renamed over anything) to a unique cleaned path; the
+// owner thread validates + installs it or deletes it.  An empty `out` = every
+// member's records were removed: no file, the owner drops the members.
+void LogCleaner::deferInstall_(const std::string& dir, const std::vector<int64_t>& bases,
+                               const std::vector<uint8_t>& out) {
+    CleanedGroup g;
+    g.bases = bases;
+    g.seq = static_cast<uint32_t>(++*deferredSeq_);
+    g.hasOutput = !out.empty();
+    if (g.hasOutput) {
+        // Fix round 3: the cleaner builds the COMPLETE segment so the owner's
+        // install is O(1) — CRC-verify every output batch, derive nextOffset and
+        // build the sparse index (the same rule as LogSegment::append/recover),
+        // then write both files fsynced.  The owner never re-reads them.
+        const int64_t outBase = bases.front();
+        std::vector<uint8_t> idx;
+        std::size_t pos = 0;
+        int64_t bytesSince = 0;
+        int64_t next = outBase;
+        while (pos < out.size()) {
+            rune::protocol::RecordBatchReader r(out.data() + pos, out.size() - pos);
+            const int32_t total = (pos + static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead) <= out.size())
+                                      ? r.totalLength() : 0;
+            if (total <= 0 || pos + static_cast<std::size_t>(total) > out.size() || !r.ensureValid())
+                throw std::runtime_error("LogCleaner: compacted output failed verification (segment " +
+                                         std::to_string(outBase) + ")");
+            if (bytesSince == 0 || bytesSince >= 4096) {
+                if (pos > static_cast<std::size_t>(INT32_MAX))
+                    throw std::runtime_error("LogCleaner: index position exceeds 2GiB limit");
+                const int32_t rel  = static_cast<int32_t>(r.baseOffset() - outBase);
+                const int32_t phys = static_cast<int32_t>(pos);
+                const std::size_t at = idx.size();
+                idx.resize(at + 8);
+                std::memcpy(idx.data() + at, &rel, 4);
+                std::memcpy(idx.data() + at + 4, &phys, 4);
+                bytesSince = 0;
+            }
+            bytesSince += total;
+            next = r.baseOffset() + r.lastOffsetDelta() + 1;
+            pos += static_cast<std::size_t>(total);
+        }
+        g.nextOffset = next;
+        const std::string logOut = Log::cleanedLogPath(dir, outBase, g.seq);
+        const std::string idxOut = Log::cleanedIndexPath(dir, outBase, g.seq);
+        deferredWritten_.push_back(logOut);
+        writeFileDurable(logOut, out);
+        deferredWritten_.push_back(idxOut);
+        writeFileDurable(idxOut, idx);
+    }
+    deferredOut_->push_back(std::move(g));
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,6 +1393,9 @@ void LogCleaner::mergeGroupWithMap(
 {
     if (changed) *changed = false;
     if (groupInPass.empty()) return;
+    // D3b: never at/after the first unresolved transaction (LSO).
+    const TxnCleanState* txn = &map.txnState();
+    passEnd = std::min(passEnd, txn->cleanLimit());
 
     const int64_t outBase = groupInPass.front();
     const std::string outLogPath = segmentLogPath(dir, outBase);
@@ -1022,6 +1413,8 @@ void LogCleaner::mergeGroupWithMap(
     std::vector<uint8_t> tmpBatch;
     tmpBatch.reserve(512);
     for (int64_t segBase : groupInPass) {
+        ++rewriteSegmentsRead_;
+        hook_();   // fix round 6: segment boundary
         auto buf = readFile(segmentLogPath(dir, segBase));
         if (buf.empty()) continue;
         outBuf.reserve(outBuf.size() + buf.size());
@@ -1046,15 +1439,56 @@ void LogCleaner::mergeGroupWithMap(
                 rune::protocol::detail::getLE32(buf.data() + pos
                     + rune::protocol::batch::kBaseSequenceOffset));
             int64_t batchBaseOffset   = r.baseOffset();
+            const int64_t batchLastOffset = batchBaseOffset + r.lastOffsetDelta();
+            const bool batchIsData = origProducerId >= 0 && origBaseSequence >= 0 &&
+                (static_cast<uint16_t>(r.attributes()) & static_cast<uint16_t>(rune::protocol::batch::kAttrControl)) == 0;
+            const int64_t batchMaxTs = static_cast<int64_t>(
+                rune::protocol::detail::getLE64(buf.data() + pos + rune::protocol::batch::kMaxTimestampOffset));
+            // C2 / I1 (see rewriteSegmentImpl): producer-tail metadata retention.
+            const bool tailNeeded = batchIsData && batchLastOffset < passEnd &&
+                map.producerTails().mustRetain(origProducerId, batchLastOffset, batchMaxTs, nowMs,
+                                               producerIdExpirationMs_);
+            if (batchIsData && r.recordCount() == 0) {
+                if (batchLastOffset >= passEnd || tailNeeded)
+                    outBuf.insert(outBuf.end(), buf.begin() + static_cast<std::ptrdiff_t>(pos),
+                                  buf.begin() + static_cast<std::ptrdiff_t>(pos + static_cast<size_t>(total)));
+                else
+                    modified = true;
+                pos += static_cast<size_t>(total);
+                continue;
+            }
+            if (isControlBatch(r)) {   // D3: never key-compacted; D3b: removed once empty + past horizon
+                if (rewriteControlBatch(outBuf, buf.data() + pos, static_cast<size_t>(total), r, batchLastOffset,
+                                        passEnd, txn, nowMs, deleteRetentionMs))
+                    modified = true;
+                pos += static_cast<size_t>(total);
+                continue;
+            }
+            const bool batchIsTxn = isTransactionalBatch(r);   // D3: rebuilt records keep the txn bit
+            if (batchIsTxn && batchLastOffset < passEnd && txn->isAborted(origProducerId, batchBaseOffset)) {
+                // D3b (Kafka): aborted txn data is discarded; a producer tail keeps its metadata (C2).
+                modified = true;
+                if (tailNeeded)
+                    appendEmptyTailBatch(outBuf, tmpBatch, batchLastOffset, batchMaxTs, origProducerId,
+                                         origProducerEpoch,
+                                         origBaseSequence + static_cast<int32_t>(batchLastOffset - batchBaseOffset),
+                                         /*transactional=*/true);
+                pos += static_cast<size_t>(total);
+                continue;
+            }
+            bool lastKept = false;
 
-            r.forEach([&](std::string_view key, std::string_view val,
+            r.forEachRecord([&](std::string_view key, std::string_view val,
                           int64_t offset, int64_t timestamp) {
                 auto keepWithHorizon2 = [&](int64_t horizonMs2) {
                     rune::protocol::RecordBatchBuilder b2(offset, timestamp);
+                    b2.setTransactional(batchIsTxn);
                     if (horizonMs2 >= 0) b2.setDeleteHorizonMs(horizonMs2);
                     b2.append(key, val, timestamp);
                     b2.buildInto(tmpBatch);
                     auto& batch = tmpBatch;
+                    // Kafka parity: keep the source batch's partitionLeaderEpoch.
+                    rune::protocol::RecordBatchReader::stampLeaderEpoch(batch.data(), r.partitionLeaderEpoch());
                     // A2: Patch producer identity.
                     {
                         uint64_t u = static_cast<uint64_t>(origProducerId);
@@ -1083,6 +1517,7 @@ void LogCleaner::mergeGroupWithMap(
                     batch[rune::protocol::batch::kCrcOffset + 2] = static_cast<uint8_t>(newCrc >> 16);
                     batch[rune::protocol::batch::kCrcOffset + 3] = static_cast<uint8_t>(newCrc >> 24);
                     outBuf.insert(outBuf.end(), batch.begin(), batch.end());
+                    if (offset == batchLastOffset) lastKept = true;
                 };
                 auto keep2 = [&]() { keepWithHorizon2(-1); };
 
@@ -1111,6 +1546,12 @@ void LogCleaner::mergeGroupWithMap(
                 }
                 keep2();
             });
+            if (tailNeeded && !lastKept) {   // C2: metadata only
+                appendEmptyTailBatch(outBuf, tmpBatch, batchLastOffset, batchMaxTs, origProducerId,
+                                     origProducerEpoch,
+                                     origBaseSequence + static_cast<int32_t>(batchLastOffset - batchBaseOffset),
+                                 batchIsTxn);
+            }
 
             pos += static_cast<size_t>(total);
         }
@@ -1121,6 +1562,13 @@ void LogCleaner::mergeGroupWithMap(
     // (re-framing alone is not a logical change) — no rewrite, no enqueue.
     if (!modified) return;
     if (changed) *changed = true;
+    if (deferredOut_ != nullptr) {
+        // Fix round 2: hand the merged output (or the all-removed group) to the
+        // owner thread; the member files stay untouched until it validates.
+        deferInstall_(dir, groupInPass, outBuf);
+        if (throttler && !outBuf.empty()) throttler->maybeThrottle(static_cast<int64_t>(outBuf.size()));
+        return;
+    }
 
     if (outBuf.empty()) {
         // All records removed — delete every member segment.
@@ -1160,6 +1608,7 @@ CleanPassResult LogCleaner::produceCleanedGroupBounded(
     int64_t nowMs)
 {
     CleanPassResult result{false, activeBase};
+    rewriteSegmentsRead_ = 0;
     if (group.bases.empty()) return result;
 
     // All bases in the group must be < activeBase.
@@ -1180,17 +1629,21 @@ CleanPassResult LogCleaner::produceCleanedGroupBounded(
     std::size_t maxSlots = SkimpyOffsetMap::maxSlotsFromBudget(dedupeBufferBytes);
     SkimpyOffsetMap map(maxSlots > 0 ? maxSlots : 1);
     buildOffsetMapFromBases(dir, sealedBases, globalDirtyStart, activeBase, map);
+    if (throttler && prefixBytesRead_ > 0) throttler->maybeThrottle(prefixBytesRead_);   // M3
 
     // Throttle the map-build read phase (approx from combined group size).
     if (throttler && group.combinedBytes > 0) {
         throttler->maybeThrottle(group.combinedBytes);
     }
 
+    // D3b: never at/after the first unresolved transaction (LSO).
+    const Offset limit = std::min<Offset>(activeBase, map.txnState().cleanLimit());
+    result.passEnd = limit;
     Offset latestMapped = map.latestOffset();
-    if (latestMapped < 0) return result; // nothing to compact
+    if (latestMapped < 0 && !map.txnState().hasWork(nowMs)) return result; // nothing to compact
 
-    Offset passEnd = latestMapped + 1;
-    if (passEnd > activeBase) passEnd = activeBase;
+    Offset passEnd = (latestMapped >= 0 && map.isFull()) ? latestMapped + 1 : limit;
+    if (passEnd > limit) passEnd = limit;
     result.passEnd = passEnd;
 
     // Determine which segments in the group fall within [globalDirtyStart, passEnd).
@@ -1227,6 +1680,12 @@ bool LogCleaner::cleanSegment(Log& log, Offset segBase, Offset segEnd,
     const int64_t activeBase = bases.back();
     if (segBase == activeBase) return false;   // never compact the active segment
     (void)segEnd; // retained for API symmetry / future byte-budgeted variants
+    // E1d invariant 3: only a segment ending at or below the persisted recovery
+    // point (restart recovery trusts it as-is) may be compacted.
+    {
+        const auto it = std::upper_bound(bases.begin(), bases.end(), segBase);
+        if (it == bases.end() || !log.compactionAllowedThrough(*it)) return false;
+    }
 
     // Produce the compacted file off the map — same pure-file core the cleaner
     // thread uses.  `bases` here is the append-thread's live view (safe on this

@@ -34,7 +34,11 @@ import signal
 
 from .dockerutil import run
 
-NETEM_IMAGE = "rune-netem:dev"
+import hashlib
+
+_NETEM_DOCKERFILE = "FROM alpine:3.20\nRUN apk add --no-cache iproute2 iptables\n"
+# Content-addressed tag (never dev/latest): a changed Dockerfile is a new image.
+NETEM_IMAGE = "rune-netem:" + hashlib.sha256(_NETEM_DOCKERFILE.encode()).hexdigest()[:12]
 _NETEM_BUILT = False
 
 
@@ -48,8 +52,7 @@ def ensure_netem_image() -> None:
     if exists.ok:
         _NETEM_BUILT = True
         return
-    dockerfile = "FROM alpine:latest\nRUN apk add --no-cache iproute2 iptables\n"
-    _build_from_stdin(dockerfile)
+    _build_from_stdin(_NETEM_DOCKERFILE)
     _NETEM_BUILT = True
 
 

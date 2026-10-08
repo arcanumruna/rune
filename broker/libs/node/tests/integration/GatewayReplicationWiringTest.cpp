@@ -26,9 +26,13 @@
 // NO Docker.  NO mocks for the replication path.  Real aeron:udp on loopback.
 // ---------------------------------------------------------------------------
 
+#include <rune/aeronutil/testing/FreePort.h>
+#include "../support/TestNodeConfig.h"
 #include <gtest/gtest.h>
 
 #include <rune/node/BrokerNode.h>
+#include <rune/node/EmbeddedDriver.h>
+#include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
 #include "support/TestWorkerCount.h"
 #include <rune/node/ReplicaRegistry.h>
@@ -64,6 +68,7 @@ extern "C" {
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -73,6 +78,7 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 using namespace rune::replication;
+using namespace rune::node::test;  // F1: leoOnOwner/hwOnOwner/appendOnOwner/...
 
 // ---------------------------------------------------------------------------
 // Helpers (mirrors UdpClusterElectionTest)
@@ -95,20 +101,7 @@ struct GrTempDir {
 };
 
 static uint16_t grDiscoverFreeUdpPort() {
-    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) throw std::runtime_error("socket() failed");
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
-    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd); throw std::runtime_error("bind() failed");
-    }
-    socklen_t addrLen = sizeof(addr);
-    ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen);
-    const uint16_t netPort = addr.sin_port;
-    const uint16_t port = static_cast<uint16_t>((netPort >> 8) | ((netPort & 0xFFu) << 8));
-    ::close(fd);
-    return port;
+    return rune::aeronutil::testing::allocFreeUdpPort();   // D8: never an ephemeral port
 }
 
 static std::vector<uint16_t> grDiscoverFreePorts(int n) {
@@ -132,67 +125,27 @@ namespace pc = rune::protocol::client;
 // test thread — that would race PartitionReplica's single-writer state).
 // ---------------------------------------------------------------------------
 struct GrClientDriver {
-    aeron_driver_context_t* driverCtx = nullptr;
-    aeron_driver_t*         driver    = nullptr;
-    std::atomic<bool>       running{false};
-    std::thread             thread;
+    // One dedicated pumping thread (EmbeddedDriver::Threaded); no caller-side
+    // readiness pumping — aeron_driver_init/start already wrote cnc.dat and
+    // stamped the heartbeat synchronously before the driver thread even starts.
+    rune::node::EmbeddedDriver    driver;
     std::shared_ptr<aeron::Aeron> aeron;
 
-    explicit GrClientDriver(const fs::path& aeronDir) {
-        fs::create_directories(aeronDir);
-        aeron_driver_context_init(&driverCtx);
-        aeron_driver_context_set_dir(driverCtx, aeronDir.string().c_str());
-        aeron_driver_context_set_threading_mode(driverCtx, AERON_THREADING_MODE_SHARED);
-        aeron_driver_context_set_dir_delete_on_start(driverCtx, true);
-        aeron_driver_context_set_dir_delete_on_shutdown(driverCtx, true);
-        aeron_driver_context_set_shared_idle_strategy(driverCtx, "sleep-ns");
-        aeron_driver_context_set_term_buffer_sparse_file(driverCtx, true);
-        aeron_driver_context_set_term_buffer_length(driverCtx, 64 * 1024);
-
-        EXPECT_EQ(aeron_driver_init(&driver, driverCtx), 0);
-        EXPECT_EQ(aeron_driver_start(driver, /*manual_main_loop=*/true), 0);
-
-        running.store(true, std::memory_order_release);
-        thread = std::thread([this]() {
-            while (running.load(std::memory_order_acquire)) {
-                aeron_driver_main_idle_strategy(
-                    driver, aeron_driver_main_do_work(driver));
-            }
-        });
-
-        const std::string cncPath = aeronDir.string() + "/cnc.dat";
-        for (int i = 0; i < 400; ++i) {
-            aeron_driver_main_do_work(driver);
-            if (fs::exists(cncPath)) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds{1});
-        }
+    explicit GrClientDriver(const fs::path& aeronDir)
+        : driver(makeCfg(aeronDir), rune::node::DriverMode::Threaded)
+    {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir.string());
         aeron = aeron::Aeron::connect(ctx);
     }
 
-    ~GrClientDriver() {
-        aeron.reset();
-        if (running.exchange(false, std::memory_order_acq_rel)) {
-            if (thread.joinable()) thread.join();
-        }
-        if (driver) {
-            const auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::milliseconds{50};
-            while (std::chrono::steady_clock::now() < deadline) {
-                if (aeron_driver_main_do_work(driver) == 0) {
-                    aeron_driver_main_do_work(driver);
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::microseconds{200});
-            }
-            aeron_driver_close(driver);
-            driver = nullptr;
-        }
-        if (driverCtx) {
-            aeron_driver_context_close(driverCtx);
-            driverCtx = nullptr;
-        }
+private:
+    static rune::node::EmbeddedDriverConfig makeCfg(const fs::path& aeronDir) {
+        fs::create_directories(aeronDir);
+        rune::node::EmbeddedDriverConfig cfg;
+        cfg.dir             = aeronDir.string();
+        cfg.termBufferBytes = 256 * 1024;   // receiver window = term/2 must be >= the broker MTU (derived 65504 on loopback)
+        return cfg;
     }
 };
 
@@ -228,6 +181,7 @@ static rune::node::NodeConfig makeGrConfig(
     const std::vector<uint16_t>& rPorts)    // replication ports
 {
     rune::node::NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId              = nodeId;
     cfg.dataDir             = dataDir.string();
     cfg.consensusStreamId   = 10;
@@ -306,45 +260,17 @@ TEST(GatewayReplicationWiring, ThreeNode_FollowersConverge_HWAdvances) {
     ASSERT_TRUE(node1.awaitLeader(8s)) << "node1 did not converge to a leader";
     ASSERT_TRUE(node2.awaitLeader(8s)) << "node2 did not converge to a leader";
 
-    // Give the metadata bridge a moment to apply the initial becomeLeader/becomeFollower
-    // transition (it fires on the first duty-cycle after election convergence).
-    std::this_thread::sleep_for(300ms);
-
-    // Determine which node is the leader.
-    const rune::consensus::NodeId lid = node0.leaderId();
-    ASSERT_GE(lid, 0) << "no leader elected";
-    ASSERT_LE(lid, 2);
-    ASSERT_EQ(node1.leaderId(), lid);
-    ASSERT_EQ(node2.leaderId(), lid);
-
-    // Access the leader's partition replica via its replicaRegistry.
-    rune::node::BrokerNode* leaderNode = nullptr;
-    if (lid == 0) leaderNode = &node0;
-    else if (lid == 1) leaderNode = &node1;
-    else leaderNode = &node2;
-
-    ASSERT_NE(leaderNode, nullptr);
-
-    // Get the leader's PartitionReplica (topicId=0, partition=0).
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr) << "leader has no replica for topic=0 partition=0";
-
-    // Wait for the metadata bridge to transition the replica to Leader role.
-    // Uses the atomic mirror in ReplicationMetadataBridge — safe from the test thread.
-    // The bridge fires on the first duty-cycle after election converges; allow 5 s.
-    {
-        const auto roleDeadline = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < roleDeadline) {
-            if (leaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(10ms);
-        }
-    }
-    ASSERT_TRUE(leaderNode->replicationIsLeaderForTest())
-        << "leader's replication bridge must report isLeader after election convergence";
+    // D11: the PARTITION leader of (topic 0, partition 0) — not the consensus
+    // leader, which differs whenever another node wins the election under load
+    // (its gateway then answers Redirect, never a ProduceResponse).
+    const std::array<rune::node::BrokerNode*, 3> partNodes{&node0, &node1, &node2};
+    const int lid = settledPartitionLeader(partNodes);
+    ASSERT_GE(lid, 0) << "no settled partition leader for topic 0 / partition 0";
+    rune::node::BrokerNode* leaderNode = partNodes[static_cast<std::size_t>(lid)];
 
     // Produce N records via the leader's gateway over real aeron:udp.
     //
-    // IMPORTANT: we do NOT call leaderReplica->append() from the test thread.
+    // IMPORTANT: we do NOT call PartitionReplica::append() from the test thread.
     // PartitionReplica is single-writer (duty-cycle-thread-only); a test-thread
     // append() races the leader's duty cycle (onFetchRequest → recomputeHw,
     // pushToFollowers → Aeron publish), which TSan correctly flags. Driving the
@@ -490,11 +416,10 @@ TEST(GatewayReplicationWiring, ThreeNode_FollowersConverge_HWAdvances) {
     // the ISR, which simultaneously proves the leader committed AND the followers
     // replicated (HW only advances past an offset the ISR has acknowledged).
     auto leaderCommittedHw = [&]() -> Offset {
-        return leaderReplica->cleanerHighWatermark();
+        return cleanerHwOrMinusOne(*leaderNode);
     };
     auto followerCommittedHw = [&](int i) -> Offset {
-        PartitionReplica* fr = allNodes[i]->replicaForTest(0, 0);
-        return fr ? fr->cleanerHighWatermark() : -1;
+        return cleanerHwOrMinusOne(*allNodes[i]);   // -1 when no replica
     };
 
     while (Wall::now() < deadline) {
@@ -790,4 +715,85 @@ TEST(GatewayReplicationWiring, Unit_RoleFlip_RepeatedLeaderChanges) {
     // Epoch must be strictly increasing across all changes.
     EXPECT_GT(bridge.lastEpoch(), Epoch{0});
     EXPECT_EQ(bridge.lastEpoch(), Epoch{4});
+}
+
+// ---------------------------------------------------------------------------
+// Re-review 2026-10-04 (fix round 2) MEDIUM-B, real path (3 BrokerNodes over
+// aeron:udp): the coordinator partitions (__consumer_offsets -1,
+// __transaction_state -2) are on the controller-ISR path — the controller
+// assigns them in the committed metadata map and the bridge drives them from
+// it.  The consensus leader leads both (it is in their committed ISR); after it
+// is killed, the new consensus leader takes them over through a committed
+// assignment (leader epoch bumped), not through the consensus term.
+// Polling is paced by blocking control-thread round-trips (no sleeps).
+// ---------------------------------------------------------------------------
+TEST(GatewayReplicationWiring, ThreeNode_CoordinatorPartitionsOnControllerPath_FailOverViaMap) {
+    GrTempDir dir0{"gr_cp0_"}, dir1{"gr_cp1_"}, dir2{"gr_cp2_"};
+    const auto cPorts = grDiscoverFreePorts(3);
+    const auto kPorts = grDiscoverFreePorts(3);
+    const auto rPorts = grDiscoverFreePorts(3);
+    auto node0 = std::make_unique<rune::node::BrokerNode>(makeGrConfig(0, dir0.path, cPorts, kPorts, rPorts));
+    auto node1 = std::make_unique<rune::node::BrokerNode>(makeGrConfig(1, dir1.path, cPorts, kPorts, rPorts));
+    auto node2 = std::make_unique<rune::node::BrokerNode>(makeGrConfig(2, dir2.path, cPorts, kPorts, rPorts));
+    node0->start(); node1->start(); node2->start();
+    ASSERT_TRUE(node0->awaitLeader(8s));
+    ASSERT_TRUE(node1->awaitLeader(8s));
+    ASSERT_TRUE(node2->awaitLeader(8s));
+    std::array<std::unique_ptr<rune::node::BrokerNode>*, 3> owners{&node0, &node1, &node2};
+
+    struct View { int32_t mapLeader = -9; int32_t mapEpoch = -1; bool replicaLeads = false; };
+    // Read, on node `n`'s control thread, its committed assignment of (t,0) and
+    // whether its replica of (t,0) is a Leader at that epoch.
+    auto view = [&](rune::node::BrokerNode& n, int32_t t) {
+        return n.onControlThreadForTest([&n, t] {
+            View v;
+            if (auto* svc = n.metadataServiceForTest()) {
+                if (const auto* pa = svc->assignment(t, 0)) { v.mapLeader = pa->leaderNode; v.mapEpoch = pa->leaderEpoch; }
+            }
+            return v;
+        });
+    };
+    auto leads = [&](rune::node::BrokerNode& n, int32_t t, int32_t epoch) {
+        return n.onOwnerThreadForTest(t, 0, [epoch](rune::replication::PartitionReplica* r) {
+            return r != nullptr && r->role() == rune::replication::Role::Leader && r->epoch() == epoch;
+        });
+    };
+    auto awaitCoordinatorLeader = [&](rune::node::BrokerNode& n, int32_t self, int32_t t, View& out) {
+        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            out = view(n, t);
+            if (out.mapLeader == self && leads(n, t, out.mapEpoch)) return true;
+        }
+        return false;
+    };
+
+    const rune::consensus::NodeId l0 = node0->leaderId();
+    ASSERT_GE(l0, 0);
+    View off0, txn0;
+    ASSERT_TRUE(awaitCoordinatorLeader(**owners[l0], l0, -1, off0))
+        << "__consumer_offsets: map leader " << off0.mapLeader << " (consensus leader " << l0 << ")";
+    ASSERT_TRUE(awaitCoordinatorLeader(**owners[l0], l0, -2, txn0))
+        << "__transaction_state: map leader " << txn0.mapLeader;
+
+    owners[l0]->reset();                         // kill the consensus leader
+    std::vector<int> surv;
+    for (int i = 0; i < 3; ++i) if (i != l0) surv.push_back(i);
+    rune::consensus::NodeId l1 = -1;
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 15s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto a = (*owners[surv[0]])->leaderId(), b = (*owners[surv[1]])->leaderId();
+            if (a >= 0 && a != l0 && a == b) { l1 = a; break; }
+            (void)(*owners[surv[0]])->onControlThreadForTest([] { return 0; });   // pace
+        }
+    }
+    ASSERT_GE(l1, 0) << "no consensus re-election";
+    View off1, txn1;
+    EXPECT_TRUE(awaitCoordinatorLeader(**owners[l1], l1, -1, off1))
+        << "__consumer_offsets did not fail over to the new controller via the map (map leader "
+        << off1.mapLeader << ")";
+    EXPECT_GT(off1.mapEpoch, off0.mapEpoch) << "no committed leader change";
+    EXPECT_TRUE(awaitCoordinatorLeader(**owners[l1], l1, -2, txn1))
+        << "__transaction_state did not fail over (map leader " << txn1.mapLeader << ")";
+    for (auto* o : owners) if (*o) (*o)->stop();
 }

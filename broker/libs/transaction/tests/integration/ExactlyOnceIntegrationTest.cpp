@@ -502,16 +502,13 @@ TEST(ExactlyOnce, IdempotentProducerRetry_WindowWraps_OldDupAccepted)
         ASSERT_GE(off, 0);
     }
 
-    // Retry batch 0 — it may have been evicted from the window.
-    // If evicted, retryBaseOffset=-1 and the harness returns -1 (OOS).
-    // If still in window (kRetryWindowSize+1 items, window size = 5),
-    // batch 0 is evicted → OOS → -1.  This tests OOS rejection.
+    // Retry batch 0 — evicted from the window (kRetryWindowSize+1 batches).
+    // EOS-OOS: entirely <= lastSequence → a KNOWN-OLD duplicate (Kafka
+    // DUPLICATE_SEQUENCE_NUMBER): OK with an unknown offset, never OOS.
     auto vr = h.partition(0).psm.validate(
                   /*topicId=*/0, ir.producerId, 0, ir.producerEpoch, 0, 0);
-    // With window size = 5, appending 6 batches evicts batch 0.
-    // Retrying an evicted batch is OOS (not a known dup).
-    EXPECT_TRUE(vr.isOos() || vr.isDuplicate())
-        << "Evicted batch either causes OOS or is still in window";
+    EXPECT_TRUE(vr.isDuplicate()) << "an evicted, stored batch is a known-old duplicate";
+    EXPECT_EQ(vr.retryBaseOffset, -1);
     (void)firstOff;
 }
 
@@ -1035,7 +1032,9 @@ TEST(AtomicVisibility, CompleteCommit_TransitionsToEmpty_ReadyForNextTxn)
     // State must be Empty after complete.
     auto st = h.coordinator().state("reuse-txn");
     ASSERT_TRUE(st.has_value());
-    EXPECT_EQ(*st, TxnState::Empty) << "State must be Empty after complete commit";
+    // F15 §5.4 (5113a52, Kafka parity): CompleteCommit is the RESTING state after a commit; the
+    // txnId is reusable from it (the next AddPartitions starts a new txn) — asserted below.
+    EXPECT_EQ(*st, TxnState::CompleteCommit) << "CompleteCommit is the resting state after a commit";
 
     // Next txn on same txnId works.
     ASSERT_TRUE(h.addAllPartitions("reuse-txn", ir.producerId, ir.producerEpoch).ok());
@@ -1158,7 +1157,7 @@ TEST(DisasterRecovery, TxnLog_DurableAcrossReopen_StatePreserved)
     // Verify state before reopen.
     auto stBefore = h.coordinator().state("durable-txn");
     ASSERT_TRUE(stBefore.has_value());
-    EXPECT_EQ(*stBefore, TxnState::Empty);
+    EXPECT_EQ(*stBefore, TxnState::CompleteCommit);   // F15 §5.4 resting state
 
     // Reopen (no crash, orderly restart).
     h.recreateCoordinator(1);
@@ -1166,8 +1165,8 @@ TEST(DisasterRecovery, TxnLog_DurableAcrossReopen_StatePreserved)
     // State recovered.
     auto stAfter = h.coordinator().state("durable-txn");
     ASSERT_TRUE(stAfter.has_value());
-    EXPECT_EQ(*stAfter, TxnState::Empty)
-        << "Completed txn state must be Empty in the recovered coordinator";
+    EXPECT_EQ(*stAfter, TxnState::CompleteCommit)
+        << "the completed txn's resting state must survive the reopen (F15 §5.4)";
 }
 
 // ---------------------------------------------------------------------------

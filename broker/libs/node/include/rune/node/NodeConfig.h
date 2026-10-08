@@ -35,14 +35,19 @@
 // E5.2: Aeron media-driver threading mode (optional):
 //   RUNE_AERON_THREADING_MODE — "shared" (default) or "dedicated" (case-insensitive).
 //                               Any unrecognised value floors to "shared".
-//   RUNE_AERON_DRIVER_IDLE    — idle strategy string for the driver thread(s);
-//                               default "sleep-ns" (identical to today's hard-coded value).
+//   RUNE_AERON_DRIVER_IDLE    — idle strategy string for the node driver thread(s);
+//                               unset = "backoff" in shard mode, "sleep-ns" in legacy (D2).
 //
 // All Aeron channels use the aeron:udp transport (container transport).
 
+#include <rune/node/IdleShape.h>
+
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -124,6 +129,12 @@ struct TopicSpec {
     //   2 = Strict  — ack only after local fsync completion AND (if acks=All) HW advance.
     // Default Majority (1) so all existing tests are parity-unchanged.
     uint8_t         durabilityTier = 1;  // 0=Leader, 1=Majority, 2=Strict
+
+    // Task 5 (0b): schema validation flag.
+    // When true, the AdminWorker validates incoming produce records against the
+    // registered schema for this topic before appending.  Default false (no validation)
+    // so all existing topics are parity-unchanged until the caller opts in.
+    bool            validate = false;
 };
 
 struct PeerConfig {
@@ -132,6 +143,23 @@ struct PeerConfig {
     uint16_t consensusPort    = 0;
     uint16_t clientPort       = 0;  // 0 = no known client endpoint (GB-4, backward-compatible)
     uint16_t replicationPort  = 0;  // 0 = no replication endpoint (GR-3, backward-compatible)
+
+    // Task 1 (per-worker replication transport): advertised per-worker replication
+    // stream count for this peer.  0 = unknown / feature disabled (default).
+    // Self's entry is populated from NodeConfig::workerCount during parseNodeConfig.
+    // Remote peers' entries are populated from membership descriptors when received.
+    int32_t  workerCount      = 0;  // 0 = unknown
+
+    // Self-contained worker shards (spec §3.3): this peer's explicit per-worker base
+    // ports.  Worker w listens on replBasePort + w (replication) and
+    // ingressBasePort + w (client produce).  0 = not advertised (legacy peers).
+    uint16_t replBasePort    = 0;
+    uint16_t ingressBasePort = 0;
+    // 2026-10-02: the peer's per-worker dynamic-MDC egress-control base (worker w
+    // = base + w) — advertised to clients in MetadataResponse for partitions this
+    // peer LEADS.  6th RUNE_PEERS segment; 0 = not advertised (derived at start
+    // in shard mode, HostDefaults.h).
+    uint16_t egressControlBasePort = 0;
 
     /// "aeron:udp?endpoint=<host>:<consensusPort>"
     std::string consensusChannel() const;
@@ -149,12 +177,75 @@ struct ClientEndpoint {
 };
 
 struct NodeConfig {
+    /// "Derive from the host" sentinel for the Aeron transport sizes (mtu, socket
+    /// buffer, receive window) — resolved once at BrokerNode::start() by
+    /// applyHostDerivedDefaults (HostDefaults.h).  Any other value is explicit.
+    static constexpr int32_t kAeronAuto = -1;
+    /// workerCoreBase sentinel: derive the affinity layout from the host (-1 stays
+    /// "explicitly disabled").
+    static constexpr int32_t kWorkerCoreBaseAuto = -2;
+
     int32_t             nodeId          = -1;
     std::vector<PeerConfig> peers;       // includes self; sorted by id
     ClientEndpoint      clientEndpoint;
     std::string         dataDir;
+    // Aeron directory (CnC + every mmapped term buffer) — RUNE_AERON_DIR.
+    // Empty → dataDir/aeron (legacy default).  Aeron's log buffers MUST live on
+    // tmpfs (/dev/shm) for performance: on a disk-backed dataDir the default puts
+    // every message's term-buffer writes through ext4 page-cache writeback.
+    std::string         aeronDir;
+    [[nodiscard]] std::string effectiveAeronDir() const {
+        return aeronDir.empty() ? (std::filesystem::path{dataDir} / "aeron").string()
+                                : aeronDir;
+    }
     int32_t             consensusStreamId    = 0;
     int32_t             replicationStreamId  = 20;  // GR-3: stream for per-partition replication
+
+    // Task 1 (per-worker replication transport):
+    //
+    // perWorkerReplication: when true, each worker opens its own dedicated
+    //   replication transport on stream replBaseStreamId + workerId, replacing
+    //   the shared control-thread replication path.  Default false.
+    //   Overridable via RUNE_PER_WORKER_REPLICATION ("1" or "true" → true).
+    //
+    // replBaseStreamId: base Aeron stream id for the per-worker replication
+    //   streams.  Worker W uses stream replBaseStreamId + W.
+    //   The range [replBaseStreamId, replBaseStreamId + workerCount - 1] must
+    //   not overlap clientStreamId, workerIngress/egress base ranges, or the
+    //   consensus/replication stream ids (enforced by validateStreamRanges()).
+    //   Default 2000 — chosen to be disjoint from all existing defaults.
+    //   Overridable via RUNE_REPL_BASE_STREAM_ID (parseInt32).
+    bool    perWorkerReplication = false;
+    int32_t replBaseStreamId     = 2000;
+
+    // Self-contained worker shards (spec §3.1-§3.3).  DEFAULT (2026-10-02, the
+    // measured 110k rec/s config, findings §4): shard mode + fused runtime
+    // placement, 1 worker per node — what the bench's RUNE_SHARD=1 set.  The legacy
+    // mode stays selectable (RUNE_WORKER_MODE=legacy / RUNE_RUNTIME_PLACEMENT=thread).
+    // Unset per-worker base ports are derived per node id (HostDefaults.h
+    // deriveShardBasePorts) at BrokerNode::start().
+    enum class WorkerMode : uint8_t { Legacy = 0, Shard = 1 };          // RUNE_WORKER_MODE
+    enum class RuntimePlacement : uint8_t { Thread = 0, Fused = 1 };    // RUNE_RUNTIME_PLACEMENT
+    WorkerMode       workerMode       = WorkerMode::Shard;
+    RuntimePlacement runtimePlacement = RuntimePlacement::Fused;
+    std::optional<int32_t> workerIngressBasePort;   // RUNE_WORKER_INGRESS_BASE_PORT (nullopt = unset)
+    std::optional<int32_t> workerReplBasePort;      // RUNE_WORKER_REPL_BASE_PORT    (nullopt = unset)
+    static constexpr int32_t kMaxShardWorkers = 64;   // runtime→worker announce mask width
+    /// Client liveness of EVERY embedded Aeron driver (node + shard drivers) and the matching media-driver timeout
+    /// of their in-process clients.  Driver and client live in this process, so the check can only detect this
+    /// process's own stall (SIGSTOP, VM stall, docker pause) — and Aeron's 10 s default then killed the broker on
+    /// resume (DR-10).  Default: effectively unbounded (1 h, = the rune client's in-process shards); tests set a
+    /// short value to prove no startup phase starves an invoker driver.  No env var.
+    static constexpr int64_t kInProcessLivenessNs = 3'600'000'000'000LL;
+    int64_t shardClientLivenessTimeoutNs = kInProcessLivenessNs;
+    /// The in-process clients' media-driver timeout (ms) matching shardClientLivenessTimeoutNs (never below
+    /// Aeron's 10 s default).
+    [[nodiscard]] long inProcessDriverTimeoutMs() const noexcept {
+        const long ms = static_cast<long>(shardClientLivenessTimeoutNs / 1'000'000);
+        return ms > 10'000 ? ms : 10'000;
+    }
+    [[nodiscard]] bool shardMode() const noexcept { return workerMode == WorkerMode::Shard; }
+    [[nodiscard]] bool fused() const noexcept { return runtimePlacement == RuntimePlacement::Fused; }
 
     // Topics declared via RUNE_TOPICS (GB-1).
     // Empty when RUNE_TOPICS is absent or empty — valid state (no topics).
@@ -168,6 +259,14 @@ struct NodeConfig {
     int64_t electionStatusIntervalMs =  20;  // default  20 ms
     int64_t startupCanvassTimeoutMs  = 100;  // default 100 ms
 
+    // Controlled shutdown (RUNE_CONTROLLED_SHUTDOWN_MS): on a graceful stop
+    // signal main() hands this node's partition leadership (and, on the
+    // controller, the consensus leadership) off before stopping.  The hand-off
+    // is event-driven; this is only the last-resort cap after which the node
+    // stops anyway (logged; the rest fails over as on an unclean stop).  Keep
+    // it below the orchestrator's kill grace (docker stop: 10 s).  0 = off.
+    int64_t controlledShutdownMs = 5'000;
+
     // Replication lag tolerance — GR-5.
     // After a follower hasn't fetched for replicaLagMaxMs, it is shrunk from the ISR.
     // Default 10 000 ms (10 s) matches the PartitionConfig default.
@@ -179,6 +278,16 @@ struct NodeConfig {
     // is only the lost-push backstop + ISR keepalive.  Exposed so acks=all
     // round-trip cadence can be tuned/measured on shared hardware.
     int64_t fetchIntervalNs = 5'000'000LL;
+    // D8b: a back-pressure-paused (held) client session is reaped only after this long without activity
+    // or a worker Progress signal (RUNE_MAX_HELD_IDLE_MS, 1 ms .. 24 h; 0 = gateway default 10 min, Kafka
+    // connections.max.idle.ms).
+    int64_t maxHeldIdleMs = 0;
+    // D8c: shard-mode per-session produce credit budget of the gateway-routed path — the most forwarded
+    // produces of one session whose acks no worker has claimed yet (RUNE_GATEWAY_PRODUCE_CREDITS,
+    // 1 .. kMaxGatewayProduceCredits; 0 = gateway default 1024).  At the budget the gateway pauses that
+    // client (controlled ABORT) before any worker's ack queue can fill.
+    static constexpr uint32_t kMaxGatewayProduceCredits = 4096;   // == ClientGateway::kMaxSessionProduceCredits
+    uint32_t gatewayProduceCredits = 0;
 
     // Backoff idle max park (RUNE_IDLE_MAX_PARK_US, default 200µs) for the runtime
     // + worker AgentRunners.  The default Agrona 1ms max park adds up to ~1ms wake
@@ -186,7 +295,102 @@ struct NodeConfig {
     // (worker→control→net→control→worker …); 200µs cuts that 5x without pegging a
     // core (backoff still sleeps → consensus heartbeats are not starved, unlike
     // busyspin which triggers re-elections on shared cores).
+    // D2 review R2-L2: shard mode — it caps the shard workers' backoff / wake park and the startup pump; in FUSED
+    // placement also the runtime + node driver (they ride worker 0).  In THREAD placement the runtime, admin and
+    // node-driver threads use RUNE_CONTROL_IDLE_MAX_PARK_US instead (controlIdleShape); fused: only the admin thread.
     int64_t idleMaxParkUs = 200;
+    bool    idleMaxParkUsExplicit = false;   ///< RUNE_IDLE_MAX_PARK_US was set (shard mode warns: R2-L2)
+
+    // D2 round 2 — control-plane idle (shard mode).  The node driver thread, the runtime thread (thread
+    // placement) and the admin thread carry almost no traffic in shard mode, yet Aeron's backoff (10 spins,
+    // 20 yields, park 1 us doubling) re-armed on every heartbeat / status message: idle, the three nodes'
+    // control planes burned ~1 core on the 4-core box (node driver ~14% each: ~17k empty recvmmsg/s; runtime
+    // ~10-14% each: ~3k yields + 3.4k parks/s) and starved whatever shared their core.  Shard mode: no yields,
+    // park from kControlIdleMinParkUs doubling to controlIdleMaxParkUs (RUNE_CONTROL_IDLE_MAX_PARK_US).  The
+    // node driver spins ONCE (each Aeron spin is a whole duty cycle — a recvmmsg per socket, ~60-90 us).
+    // Measured idle on k3s-node-01 (node driver, Aeron backoff args): default 11.6% -> 1-0-50us-1ms 9.5%
+    // -> 1-0-100us-2ms 7% -> 1-0-250us-4ms 5.5% each; involuntary switches 2.9k/s -> ~1/s (no yields).
+    // A control message waits at most one park (<= 2 ms) — consensus timeouts are 100s of ms.  Legacy mode
+    // (the data path rides the runtime and the node driver) keeps its shapes.  Never busy-spin.
+    static constexpr int64_t kControlIdleMinParkUs        = 100;
+    static constexpr int64_t kControlIdleMaxParkUsDefault = 2000;
+    int64_t controlIdleMaxParkUs = kControlIdleMaxParkUsDefault;
+    /// A backoff idle shape: spin passes, yield passes, then park minParkNs doubling to maxParkNs.
+    struct BackoffShape {
+        int64_t spins     = 10;
+        int64_t yields    = 20;
+        int64_t minParkNs = 1'000;
+        int64_t maxParkNs = 1'000'000;
+        friend bool operator==(const BackoffShape&, const BackoffShape&) = default;
+    };
+    /// Shard mode: the control-plane park shape (10 spins — a runtime / admin pass touches no syscall).
+    [[nodiscard]] BackoffShape controlIdleShape() const noexcept {
+        const int64_t maxNs = controlIdleMaxParkUs * 1'000;
+        return BackoffShape{10, 0, std::min<int64_t>(kControlIdleMinParkUs * 1'000, maxNs), maxNs};
+    }
+    /// The runtime thread's idle (thread placement; RUNE_RUNTIME_IDLE=busyspin overrides).
+    [[nodiscard]] BackoffShape runtimeIdleShape() const noexcept {
+        return shardMode() ? controlIdleShape() : BackoffShape{10, 20, 1'000, idleMaxParkUs * 1'000};
+    }
+    /// The admin thread's idle.
+    [[nodiscard]] BackoffShape adminIdleShape() const noexcept {
+        return shardMode() ? controlIdleShape() : BackoffShape{};
+    }
+
+    // A7 park-until-work (findings §4.12): shard workers park in ppoll() on their invoker driver's
+    // socket-readiness fds and their io_uring completion fd (rune_driver_wake.h; Linux), woken by the next
+    // datagram / fsync completion and bounded by the backoff park period (1 µs doubling to idleMaxParkUs —
+    // the bound for work that has no fd: cross-thread rings, Aeron timers).  RUNE_IDLE_WAKE=0 → the legacy
+    // Aeron backoff (timed park).  The spin / yield phase BEFORE the first park stays the Aeron 10 / 20 in
+    // both modes (review M1): fd-less work (a ring message from another thread, a conductor command, a
+    // timer) usually lands within microseconds of a busy pass, and a park there costs >= the timer slack.
+    bool idleWake = true;
+    // Idle passes before parking (RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS, a non-negative integer; anything
+    // else refuses startup).  kIdleAuto = the Aeron 10 / 20.
+    static constexpr int32_t kIdleAuto = -1;
+    static constexpr int32_t kAeronIdleSpins  = 10;
+    static constexpr int32_t kAeronIdleYields = 20;
+    int32_t idleSpins  = kIdleAuto;
+    int32_t idleYields = kIdleAuto;
+
+    // A9 ring doorbells (findings §4.15): with park-until-work, the cross-thread rings a shard worker consumes
+    // (runtime → worker ops, session lifecycle, worker → fused-runtime returns, admin → fused-runtime, portable
+    // fsync completions) ring an eventfd in its park set, so ring work ends a park like a datagram does.  Every
+    // wake source a pass can wait on then has an fd — datagrams, io_uring completions, ring messages — so a park
+    // can last idleDoorbellParkUs: what is left without an fd is timers, and every timer on the worker path is
+    // >= 1 ms (Aeron: NAK 60 ms, SM 200 ms, heartbeats 100 ms+, timer interval 1 s; Rune: election status
+    // 20 ms, fetch backstop 5 ms, log sync 10 ms, ack timeout 30 s).
+    // The Aeron spin / yield phase stays in front of the first park (auto 10 / 20, as A7): measured (§4.15)
+    // on the 4-core box at 20k rec/s, dropping it (RUNE_IDLE_SPINS=0 RUNE_IDLE_YIELDS=0) cuts worker CPU ~6 pts
+    // but costs ~+100 µs p50 — every event then pays a park wake on a saturated box.  With the phase kept the
+    // 1 ms doorbell park still cuts idle-cluster worker CPU 30% -> 18% at an unchanged 20k p50.
+    // RUNE_IDLE_DOORBELL=0 → A7's shape exactly (no doorbell, Aeron 10 / 20, 1 µs .. idleMaxParkUs).
+    bool idleDoorbell = true;
+    // The doorbell shape's park: first park (RUNE_IDLE_DOORBELL_MIN_PARK_US) doubling to the timer bound
+    // (RUNE_IDLE_DOORBELL_PARK_US).  Positive integers; anything else refuses startup.
+    int64_t idleDoorbellMinParkUs = 1'000;
+    int64_t idleDoorbellParkUs    = 1'000;
+
+    /// Shard workers park on driver readiness unless RUNE_IDLE_WAKE=0.
+    [[nodiscard]] bool shardIdleWantsWake() const noexcept { return idleWake; }
+    /// The shard-worker backoff shape.  The Aeron spin / yield phase (auto 10 / 20) in both modes (review M1;
+    /// A9 measured).  `doorbell`: the runner parks on a ring doorbell too (A9) — the doorbell park
+    /// (idleDoorbellMinParkUs .. idleDoorbellParkUs); otherwise A7's 1 µs .. idleMaxParkUs.
+    [[nodiscard]] IdleShape shardIdleShape(bool doorbell = false) const noexcept {
+        IdleShape s;
+        if (doorbell) {
+            s.maxSpins  = idleSpins  >= 0 ? idleSpins  : kAeronIdleSpins;
+            s.maxYields = idleYields >= 0 ? idleYields : kAeronIdleYields;
+            s.minParkNs = idleDoorbellMinParkUs * 1'000;
+            s.maxParkNs = idleDoorbellParkUs * 1'000;
+            return s;
+        }
+        s.maxSpins  = idleSpins  >= 0 ? idleSpins  : kAeronIdleSpins;
+        s.maxYields = idleYields >= 0 ? idleYields : kAeronIdleYields;
+        s.minParkNs = 1'000;
+        s.maxParkNs = idleMaxParkUs * 1'000;
+        return s;
+    }
 
     // Minimum ISR size gate for acks=All produces — GR-5 [M1].
     // Default: cluster majority (|peers|/2 + 1), so a 3-node cluster requires 2.
@@ -194,6 +398,23 @@ struct NodeConfig {
     // Overridable at runtime via RUNE_MIN_ISR env var.
     // Also forwarded to PartitionConfig::minIsr in buildReplication().
     int32_t gatewayMinIsr = 1;
+
+    // Review 2026-10-04 MEDIUM-3 (RUNE_SURVIVOR_LEADER_ELECTION, default false):
+    // opt-in position-proven survivor election for a partition whose committed
+    // ISR has no live member (Kafka unclean.leader.election.enable analog).
+    bool survivorLeaderElection = false;
+
+    // Re-review 2026-10-04 MEDIUM-B (RUNE_UNCLEAN_CONSENSUS_ELECTION, default
+    // false): operator escape hatch for the consensus candidacy gate.  Normally
+    // a node votes only for a candidate in the newest durable __cluster_metadata
+    // ISR it knows (InternalIsrKnowledge) — if no live node is in it, the
+    // consensus stays leaderless until a member returns (Kafka: an offline
+    // partition).  ON = the gate is not wired: the election is data-blind and a
+    // node missing committed metadata records may win (they are then LOST —
+    // the analog of unclean.leader.election.enable for the metadata log).  Set
+    // it only to recover a cluster whose metadata ISR members are gone for
+    // good, then turn it off again.
+    bool uncleanConsensusElection = false;
 
     // Milestone E1: number of in-process partition workers. Each owned shard is
     // assigned to worker = hash(shardId) % workerCount (ShardRouter). Default 1
@@ -230,19 +451,30 @@ struct NodeConfig {
     // E4: per-worker CPU affinity base core (Linux-only; macOS is a no-op).
     //
     // When >= 0, worker i pins its own AgentRunner thread to core
-    // (workerCoreBase + i) on the first doWork call (self-pin on entry).
+    // (workerCoreBase + i) on the first doWork call (self-pin on entry).  Pinning is
+    // for cache locality only: shard workers idle with BACKOFF unless
+    // RUNE_WORKER_IDLE=busyspin (then every shard worker busy-spins, pinned or not;
+    // "yielding"/"sleeping" are treated as backoff in shard mode).
     //
-    // -1 (default) = affinity DISABLED — no pinning, current behaviour preserved.
-    //   All existing tests are parity-unchanged at the default.
+    // kWorkerCoreBaseAuto (-2, DEFAULT) = derived at start (HostDefaults.h
+    //   deriveWorkerCoreBase): Linux shard mode pins node i of a co-located
+    //   cluster to cores 1+i*W.. when the box has the cores (the bench layout),
+    //   one-node-per-host to 1..W; otherwise / legacy / non-Linux → -1.
+    // -1 = affinity explicitly DISABLED.
     //
     // Example: with workerCoreBase=2 and workerCount=4, workers pin to cores
     //   2, 3, 4, 5 — reserving cores 0 and 1 for the control thread, Aeron
     //   media driver, and kernel housekeeping (see AffinityConfig in the E4 spec).
     //
     // Overridable via RUNE_WORKER_CORE_BASE env var.
-    //   Absent or empty → -1 (disabled).
+    //   Absent or empty → kWorkerCoreBaseAuto (derived).
     //   Any value < -1   → -1 (clamped to disabled).
-    int32_t workerCoreBase = -1;
+    int32_t workerCoreBase = kWorkerCoreBaseAuto;
+    /// Do the shard workers busy-spin?  Only on the explicit RUNE_WORKER_IDLE=busyspin opt-in — never
+    /// by default, pinned or not (measured: no p50/p99 gain over backoff; it pegs cores the box needs).
+    [[nodiscard]] bool shardWorkersBusySpin() const noexcept {
+        return workerIdleStrategy == WorkerIdleStrategy::BusySpin;
+    }
 
     // E5.1: per-worker Aeron ingress stream id base.
     //
@@ -282,12 +514,22 @@ struct NodeConfig {
     //     RUNE_WORKER_EGRESS_CONTROL_HOST with the broker's reachable address.
     //   - workerEgressControlBasePort: base UDP control port; worker W uses
     //     base + W.  RUNE_WORKER_EGRESS_CONTROL_BASE_PORT.  Must not collide with
-    //     client/consensus/replication ports.
+    //     client/consensus/replication ports.  nullopt = not configured: legacy
+    //     mode binds kDefaultWorkerEgressControlBasePort (via
+    //     effectiveWorkerEgressControlBasePort()); shard mode refuses to start
+    //     (spec §3.3: every per-worker port explicit — a shared default would let
+    //     co-located shard nodes silently collide).
     //   - workerEgressBaseStreamId: 0 = unset; resolved in buildWorkerPool to
     //     workerIngressBaseStreamId + workerCount (keeps ingress/egress stream
     //     ranges non-overlapping).  RUNE_WORKER_EGRESS_BASE_STREAM.
     std::string workerEgressControlHost     = "127.0.0.1";
-    int32_t     workerEgressControlBasePort = 40300;
+    static constexpr int32_t kDefaultWorkerEgressControlBasePort = 40300;
+    std::optional<int32_t> workerEgressControlBasePort;
+    /// The egress-control base port actually bound: the configured value, else the
+    /// legacy default.  The ONLY way readers obtain the port.
+    [[nodiscard]] int32_t effectiveWorkerEgressControlBasePort() const noexcept {
+        return workerEgressControlBasePort.value_or(kDefaultWorkerEgressControlBasePort);
+    }
     int32_t     workerEgressBaseStreamId    = 0;  // 0 = unset; resolved in buildWorkerPool
 
     // Shared-nothing conformance ([[rune-shared-nothing-law]]): all cross-thread
@@ -305,7 +547,7 @@ struct NodeConfig {
     //     RUNE_IO_COMPLETION_RING_DEPTH. Default 1024 (matches Worker::kIoCompletionDepth).
     //   - memoryLogRingBytes: byte capacity of each InMemoryLog single-owner ring.
     //     RUNE_MEMORY_LOG_RING_BYTES. Default 8 MiB.
-    int32_t replicationOutboundRingBytes = 4 * 1024 * 1024;
+    int32_t replicationOutboundRingBytes = 32 * 1024 * 1024;   // findings §4 (was 4 MiB)
     int32_t workerIngressRingBytes       = 32 * 1024 * 1024;
     int32_t workerReturnRingBytes        = 32 * 1024 * 1024;
     int32_t ioSubmitRingDepth            = 1024;
@@ -313,28 +555,78 @@ struct NodeConfig {
     int32_t memoryLogRingBytes           = 8 * 1024 * 1024;
     //   - aeronTermBufferBytes: Aeron term buffer length (bytes) for the embedded
     //     media driver — sizes every publication/subscription log buffer.  Power
-    //     of two in [64 KiB, 1 GiB].  Default 4 MiB; deployments raise it (e.g.
-    //     32 MiB via RUNE_AERON_TERM_BUFFER_BYTES) for deep in-flight throughput.
-    int32_t aeronTermBufferBytes         = 4 * 1024 * 1024;
+    //     of two in [64 KiB, 1 GiB].  Default 16 MiB (findings §4; was 4 MiB).
+    //     Every publication/image maps 3 terms (48 MiB at the default, NON-sparse
+    //     → really allocated on the aeron dir's filesystem): tests set smaller.
+    // 1 MiB (measured 2026-10-03, 3-node acks=all: >= 16 MiB throughput, no 100+ ms term-rotation stalls,
+    // 16x less /dev/shm).  Max Aeron message = term/8 = 128 KiB -> the batch limit (batchLimitFormula).
+    int32_t aeronTermBufferBytes         = 1024 * 1024;
+    /// RUNE_AERON_CONTROL_TERM_BYTES: term of the worker's per-session ACK publications only — small so a
+    /// term rotation never cleans 16 MiB inside the worker pass.  NOT the gateway egress publications:
+    /// consumer record pushes travel there (max message = term/8 must cover the largest batch).
+    /// Power of two, >= max(64 KiB, 2 x MTU) (enforced in HostDefaults).
+    int32_t aeronControlTermBufferBytes  = 1024 * 1024;
+    /// Periodic fsync of a worker's owned logs (leader side) and of follower-applied data, in ms.
+    /// 0 = never (default; Kafka's log.flush.interval.* default): durability via replication + OS
+    /// writeback; recovery semantics in DUR-1.  The Strict tier keeps its per-write fsync.
+    /// RUNE_WORKER_SYNC_INTERVAL_MS / RUNE_FOLLOWER_FLUSH_INTERVAL_MS.
+    int64_t workerSyncIntervalMs         = 0;
+    /// RUNE_IOWQ_CORES (cpu list "0,4-5"): CPUs for the io_uring io-wq kernel threads.  Unbound, they may
+    /// run on (and preempt) a pinned worker's core.  Applied per worker thread at its first pass (io-wq is
+    /// per task; the mask covers io-wq threads created afterwards).  Empty = derived (HostDefaults: only
+    /// for the derived co-located layout — the allowed CPUs outside every node's workers).
+    std::vector<int32_t> ioWorkerCpus;
+    /// RUNE_NONWORKER_CORES (cpu list): CPUs for every NON-worker thread the broker creates (threaded node
+    /// driver, Aeron client conductor, runtime, admin, cleaner, flushers, signal + main threads).  Unbound,
+    /// they run on (and preempt) the pinned workers' cores (D2).  Empty = derived (HostDefaults: with pinned
+    /// workers, the allowed CPUs outside the worker cores — every co-located node's for the conventional
+    /// layout, else this node's own); still empty = affinity unchanged.
+    std::vector<int32_t> nonWorkerCpus;
+    int64_t followerFlushIntervalMs      = 0;
+    //   - produce intake limit (F18): the largest produce batch the broker accepts
+    //     is DERIVED, never refused at startup — produceIntakeLimit() below.  A
+    //     batch above it is answered MessageTooLarge at intake (gateway + worker
+    //     ingress), so an accepted batch always fits one replication frame.
+    static constexpr int32_t kDefaultMaxProduceBatchBytes = 8 * 1024 * 1024;
     //   - aeronMtuBytes: Aeron UDP MTU (bytes) for the embedded media driver.
-    //     RUNE_AERON_MTU.  Not required to be a power of two.  Default 1408
-    //     (Aeron's own AERON_MTU_LENGTH_DEFAULT — the max that fits the default
-    //     socket SO_SNDBUF on all platforms).
+    //     RUNE_AERON_MTU.  Not required to be a power of two.  Default kAeronAuto:
+    //     DERIVED at start (HostDefaults.h deriveAeronTransport) — 65504 when every
+    //     endpoint is loopback, else the egress interface MTU minus IP/UDP headers
+    //     aligned to 32; always clamped <= the socket buffer the driver will get.
     //
-    //     WHY NOT jumbo (65504): aeron_driver_init() rejects with EINVAL(22) when
-    //     mtu_length > the probed socket SO_SNDBUF max (aeron_driver.c:451).  On
-    //     macOS (and any host with the default ~64 KiB SO_SNDBUF cap) a 65504-byte
-    //     MTU fails driver startup outright — every real embedded-driver test
-    //     (GR-7 / TX-2b failover) crashed at init.  Deployments that raise
-    //     SO_SNDBUF (net.inet.udp.maxdgram / net.core.wmem_max) and want jumbo
-    //     frames for deep batched produces can set RUNE_AERON_MTU=65504.
-    int32_t aeronMtuBytes                = 1408;
+    //     The EINVAL lesson: aeron_driver_init() rejects mtu_length > the probed
+    //     socket SO_SNDBUF (aeron_driver.c:451).  macOS's default UDP SO_SNDBUF is
+    //     9216 (net.inet.udp.maxdgram) and its cap ~8 MiB (kern.ipc.maxsockbuf):
+    //     a 65504 MTU with the OS-default buffer crashed every embedded-driver
+    //     test at init.  The derivation sets the socket buffer first and clamps the
+    //     MTU (even an explicit one, with a WARN) so that can never recur.
+    int32_t aeronMtuBytes                = kAeronAuto;
     //   - gatewayFragmentLimit: maximum fragments polled per ClientGateway
     //     doWork() cycle (RUNE_GATEWAY_FRAGMENT_LIMIT).  Not required to be a
     //     power of two — parsed with parseInt32.  Default 256 (raised from the
     //     old hard-coded 10 to prevent head-of-line blocking on batched ingress).
     //     Also reused for per-worker ingress poll (Task E5.1.2).
     int32_t gatewayFragmentLimit         = 256;
+    //   - maxProduceBatchBytes: F3 round 4 — EXPLICIT override of the gateway's
+    //     max accepted produce-batch wire size (RUNE_MAX_PRODUCE_BATCH_BYTES).
+    //     std::nullopt (default — NOT set) means "use the derived effective
+    //     value" (min of the configured default, the ingress transport's hard
+    //     per-message maximum, and the replication transport's hard per-message
+    //     maximum minus its response framing overhead — see BrokerNode.cpp's
+    //     effectiveMaxProduceBatchBytes()/validateExplicitMaxProduceBatch()).
+    //   F3 round 6: the effective max is a CLUSTER-WIDE constraint.  Shard
+    //   mode verifies it per replication plane (PlaneHello carries it; a
+    //   mismatch is Refused like a worker-count mismatch).  Legacy mode does
+    //   NOT verify it: aeronTermBufferBytes / workerIngressRingBytes /
+    //   replicationOutboundRingBytes / maxProduceBatchBytes MUST be identical
+    //   on every node (logged at startup).
+    //     A SET value is a deliberate operator request for a LARGER (or
+    //     smaller) ceiling than the derived default would give; BrokerNode::
+    //     start() refuses to start (naming the exact numbers) if an explicit
+    //     value exceeds what the transport can actually carry — silently
+    //     capping an EXPLICIT request would be a silent surprise, unlike
+    //     capping the un-set default, which was never a promise to begin with.
+    std::optional<int64_t> maxProduceBatchBytes;
     // ── Per-tick drain/poll batch limits (all raised from tiny hard-coded 10/16
     //    defaults that throttled the acks=majority replication pipeline; each is a
     //    KNOB so we always know what bounds the per-cycle batch).  A value of 0 is
@@ -359,19 +651,61 @@ struct NodeConfig {
     //     (~160 B).  Default 256.  The old code reserved 2×maxMsgLength per ack,
     //     capping produce intake at ~4 frames/cycle on a multi-MB return ring.
     int32_t workerAckSlotBytes           = 256;
+    //   - workerMaxOwedReturns: F15 S3 static cap on a worker's owed returns
+    //     (parked acks=all + Strict acks awaiting fsync + owed facts), the G-A6
+    //     reservation (RUNE_WORKER_MAX_OWED_RETURNS, default 4096, valid
+    //     [256, 8192]; out of range refuses to start).
+    int32_t workerMaxOwedReturns         = 4096;
     //   - aeronRcvWindowBytes: Aeron receiver flow-control initial window (bytes).
-    //     RUNE_AERON_RCV_WINDOW.  Must be a power of two.  Default 128 KiB
-    //     (128 * 1024); raise to e.g. 4 MiB on high-throughput deployments to
-    //     avoid receiver window throttling on large batched produces.
-    int32_t aeronRcvWindowBytes          = 128 * 1024;
+    //     RUNE_AERON_RCV_WINDOW.  Must be a power of two.  Default kAeronAuto:
+    //     min(4 MiB, socketBuffer/4, term/2) rounded down to a power of two
+    //     (window <= socket buffer <= sysctl; with 64 KiB datagrams a window near
+    //     SO_RCVBUF drops packets — kernel truesize).  Was 128 KiB (F28).
+    int32_t aeronRcvWindowBytes          = kAeronAuto;
+
+    //   - aeronTermBufferSparse: create term buffers as sparse files (true, Aeron's
+    //     default here) or fully allocated + zero-filled at creation (false).
+    //     RUNE_AERON_TERM_SPARSE=true|false.  Sparse terms page-fault on the first
+    //     write to every page (measured ~15% of a loaded shard thread) and turn a
+    //     full tmpfs into a mid-run SIGBUS; non-sparse moves both to publication
+    //     creation (a full tmpfs then fails the create, loudly).  Default
+    //     nullopt = DERIVED at start: non-sparse when the Aeron dir is on tmpfs
+    //     (findings §4 SPARSE: 73–79k → 100–105k rec/s), sparse on a disk-backed
+    //     dir (pre-allocation would zero-fill 48 MiB per log to disk on the
+    //     conductor thread).
+    std::optional<bool> aeronTermBufferSparse;
+
+    //   - Aeron sender/receiver batching per syscall (0 = Aeron default 2; 1..16).
+    //     RUNE_AERON_MAX_MSGS_PER_SEND  -> network_publication_max_messages_per_send
+    //     RUNE_AERON_SENDER_IOV         -> sender_io_vector_capacity (sendmmsg batch)
+    //     RUNE_AERON_RECEIVER_IOV       -> receiver_io_vector_capacity (recvmmsg batch)
+    //     With UDP GSO active (below) and MAX_MSGS_PER_SEND unset, the driver uses 16 (Aeron's max) so a
+    //     burst of MTU-size fragments forms one GSO super-datagram.
+    int32_t aeronMaxMessagesPerSend      = 0;
+    int32_t aeronSenderIoVectorCapacity  = 0;
+    int32_t aeronReceiverIoVectorCapacity = 0;
+
+    //   - aeronUdpGso: install the rune_gso Aeron UDP transport bindings — Linux UDP GSO (UDP_SEGMENT) on
+    //     send, UDP GRO on receive; wire format unchanged (peers see <= MTU datagrams), auto-off where the
+    //     kernel/platform lacks them (stock Aeron).  RUNE_AERON_UDP_GSO=0|false forces stock Aeron (A/B,
+    //     fault isolation).  Spec docs/superpowers/specs/2026-10-03-aeron-udp-gso-gro-design.md.
+    bool aeronUdpGso = true;
+
+    //   - aeronEpollPoll: A7 (findings §4.12) — the media driver's transport pollers take ONE epoll_wait(0)
+    //     per duty cycle and recvmmsg only the ready sockets, for every poller with > 1 transport (Aeron
+    //     does that only beyond 5 transports and otherwise recvmmsg-s every socket each cycle, mostly
+    //     empty: the top CPU cost of an invoker shard pass).  Delivery unchanged; Linux only (elsewhere
+    //     stock).  RUNE_AERON_EPOLL_POLL=0|false = Aeron's stock poller (A/B, fault isolation).
+    bool aeronEpollPoll = true;
 
     //   - aeronSocketBufferBytes: OS UDP socket SO_SNDBUF / SO_RCVBUF (bytes) for
     //     the embedded media driver's sockets.  RUNE_AERON_SOCKET_BUFFER_BYTES.
     //     Larger socket buffers absorb produce/ack bursts on loopback/LAN so the
     //     kernel does not drop datagrams under load (which would otherwise force
-    //     Aeron NAK/retransmit or app-level retransmit).  0 = leave Aeron's default.
-    //     Default 2 MiB.  (Task 6: transport reliability hardening.)
-    int32_t aeronSocketBufferBytes       = 2 * 1024 * 1024;
+    //     Aeron NAK/retransmit or app-level retransmit).  0 = leave the OS default.
+    //     Default kAeronAuto: min(16 MiB, net.core.rmem_max/wmem_max) (macOS: the
+    //     probed SO_*BUF cap); capped below 16 MiB → loud WARN naming the sysctls.
+    int32_t aeronSocketBufferBytes       = kAeronAuto;
 
     // E5.2: Aeron media-driver threading mode.
     //
@@ -397,13 +731,40 @@ struct NodeConfig {
     AeronThreadingMode aeronThreadingMode = AeronThreadingMode::Shared;
 
     // E5.2: driver-idle strategy string applied to whichever idle setter(s)
-    // the active threading mode uses (RUNE_AERON_DRIVER_IDLE, default "sleep-ns").
+    // the active threading mode uses (RUNE_AERON_DRIVER_IDLE).
     //   Shared    mode: passed to aeron_driver_context_set_shared_idle_strategy.
     //   Dedicated mode: passed to conductor / sender / receiver idle setters.
-    // Any unrecognised value is passed through to Aeron (it will use its own
-    // default on error — safe degradation).  Default "sleep-ns" is identical
-    // to today's hard-coded value so unset env → byte-identical behaviour.
-    std::string driverIdleStrategy = "sleep-ns";
+    // An unrecognised value (or malformed RUNE_AERON_DRIVER_IDLE_ARGS) refuses the node
+    // driver's construction (D2 round 2: Aeron's failed setter left a NULL idle function —
+    // the driver thread aborted on its first idle pass).
+    // D2: empty (DEFAULT) = derived — effectiveDriverIdleStrategy().
+    std::string driverIdleStrategy;
+    /// The node driver's idle strategy: RUNE_AERON_DRIVER_IDLE if set; else "backoff" in shard mode (the
+    /// node driver carries only control-plane traffic there — Aeron's backoff spins, yields, then parks up
+    /// to 1 ms; "sleep-ns" with Aeron's tiny default sleep effectively polls, ~45% CPU per node) and
+    /// "sleep-ns" in legacy mode (the data path rides that driver).  The per-worker invoker drivers have
+    /// no idle loop (pumped by their worker).
+    [[nodiscard]] std::string_view effectiveDriverIdleStrategy() const noexcept {
+        if (!driverIdleStrategy.empty()) return driverIdleStrategy;
+        return shardMode() ? std::string_view("backoff") : std::string_view("sleep-ns");
+    }
+    /// RUNE_AERON_DRIVER_IDLE_ARGS: Aeron idle-strategy init args for the node driver (backoff:
+    /// "spins-yields-minPark-maxPark", durations in ns or with a ns/us/ms/s suffix).  Empty = derived.
+    std::string driverIdleArgs;
+    /// D2 review R2-L3: Aeron builds yield / spin / noop without init args (only backoff and sleep-ns /
+    /// sleeping take them).
+    [[nodiscard]] static bool driverIdleTakesArgs(std::string_view strategy) noexcept {
+        return strategy == "backoff" || strategy == "sleep-ns" || strategy == "sleeping";
+    }
+    /// The node driver's idle args: RUNE_AERON_DRIVER_IDLE_ARGS if set; else, for the DERIVED shard-mode
+    /// backoff, the control-plane shape with one spin pass ("1-0-<minParkNs>-<maxParkNs>"); else empty
+    /// (Aeron's own: AERON_*_IDLE_STRATEGY_INIT_ARGS or its built-in defaults).
+    [[nodiscard]] std::string effectiveDriverIdleArgs() const {
+        if (!driverIdleArgs.empty()) return driverIdleArgs;
+        if (!driverIdleStrategy.empty() || !shardMode()) return {};
+        const BackoffShape c = controlIdleShape();
+        return "1-0-" + std::to_string(c.minParkNs) + "-" + std::to_string(c.maxParkNs);
+    }
 
     // E5.1.3: per-worker Aeron ingress flag.
     //
@@ -448,6 +809,40 @@ struct NodeConfig {
     // Overridable via RUNE_ENABLE_COALESCING env var ("0" or "false" → off).
     bool enableCompactionCoalescing = true;
 
+    // PSM fix round 1 (I1, Kafka producer.id.expiration.ms): compaction keeps the
+    // last batch METADATA of every producer active within this window (a
+    // record-less batch when its last record is compacted away) so a
+    // producer-state rebuild still knows it; older producers are expired.
+    // Default 7 days.  Overridable via RUNE_PRODUCER_ID_EXPIRATION_MS (>= 0).
+    int64_t producerIdExpirationMs = 7LL * 24 * 3600 * 1000;
+
+    // hotpath-A F2 + review M3: READY (pre-provisioned, fallocated) segments
+    // the SegmentProvisionerAgent builds for a disk-backed user log — DEMAND-
+    // DRIVEN: nothing is reserved until the log's active segment is
+    // segmentProvisionThresholdPct full; then up to `depth` ready segments are
+    // built (the next roll adopts one with zero syscalls).  Idle partitions
+    // reserve 0 extra blocks / fds / mmaps.  Worst-case disk reservation per
+    // busy partition: depth x segmentRollBytes (fallocate KEEP_SIZE), bounded
+    // node-wide by segmentProvisionCapBytes.  A roll that arrives before its
+    // ready segment is deferred (the intake holds, bounded); a build failure or
+    // the cap makes that roll inline (blocking, correct, counted).
+    // depth: clamped to [1, Log::kMaxProvisionDepth].  RUNE_SEGMENT_PROVISION_DEPTH.
+    int32_t segmentProvisionDepth = 1;
+    // Fill level (% of segmentRollBytes, 1..100) at which a log demands its
+    // next segment.  RUNE_SEGMENT_PROVISION_THRESHOLD_PCT.
+    int32_t segmentProvisionThresholdPct = 50;
+    // Node-wide cap on bytes reserved (fallocated) by ready segments: > 0
+    // fixed, 0 = no cap, < 0 = AUTO (default): segmentProvisionCapFreePct % of
+    // the free space of dataDir (statvfs, re-evaluated off-thread).  Over the
+    // cap a ready segment is still built — without fallocate (re-review N3).
+    // RUNE_SEGMENT_PROVISION_CAP_BYTES / RUNE_SEGMENT_PROVISION_CAP_FREE_PCT.
+    int64_t segmentProvisionCapBytes = -1;
+    int32_t segmentProvisionCapFreePct = 10;
+    // The provisioner thread's park cap (µs) when idle.  Demands ring its
+    // doorbell (review m5), so this bounds only fd-less work (replica-view
+    // updates).  RUNE_SEGMENT_PROVISIONER_MAX_PARK_US (>= 1).
+    int64_t segmentProvisionerMaxParkUs = 10'000;
+
     // Segment roll size (bytes) for the internal __consumer_offsets log.
     // Default 64 MiB matches TopicSpec::segmentRollBytes.
     // Tests may set a small value (e.g. 128) to force multiple sealed segments
@@ -459,12 +854,76 @@ struct NodeConfig {
     const PeerConfig& self() const;
 
     bool isSingleNode() const { return peers.size() == 1; }
+
+    /// Task 1 (per-worker replication transport): validate that the per-worker
+    /// replication stream range [replBaseStreamId, replBaseStreamId+workerCount-1]
+    /// does not overlap any other configured stream id or range:
+    ///   - clientStreamId (clientEndpoint.streamId)
+    ///   - workerIngress range [workerIngressBaseStreamId, +workerCount-1]
+    ///   - workerEgress range [workerEgressBaseStreamId, +workerCount-1]  (if set)
+    ///   - consensusStreamId
+    ///   - replicationStreamId
+    ///
+    /// Returns std::nullopt when the configuration is valid.
+    /// Returns an error string describing the first detected overlap when invalid.
+    ///
+    /// NOT called during parseNodeConfig.  Callers (e.g. BrokerNode startup)
+    /// must invoke this after parsing and refuse to start if it returns an error.
+    std::optional<std::string> validateStreamRanges() const;
+
+    /// Refuses an Aeron dir that would destroy the log: the embedded driver runs
+    /// with dir_delete_on_start + delete-on-shutdown and recursively deletes its
+    /// directory, so aeronDir must not be a filesystem root, equal to dataDir, or an
+    /// ancestor of dataDir.  Paths are compared absolute + weakly-canonical (symlinks
+    /// resolved for the existing prefix).  Empty aeronDir (→ dataDir/aeron) is safe.
+    std::optional<std::string> validateAeronDir() const;
+
+    /// Shard mode: every port this node binds + co-located peers' advertised
+    /// ranges, peer base ports, symmetric worker count, stream ranges.  nullopt =
+    /// valid (always nullopt in legacy mode unless placement=fused).  BrokerNode
+    /// refuses to start on an error (no silent fallback).
+    std::optional<std::string> validateShardConfig() const;
+
+    /// The produce INTAKE limit — a thin wrapper over THE batch-limit formula,
+    /// Worker::maxAcceptableBatchBytes(ingress ring, return ring, replication
+    /// outbound ring, replication term, egress term, client ingress term)
+    /// (F18 ⇄ F15 S3 ⇄ F19 ⇄ F3, integration wave 2), lowered by an explicit
+    /// RUNE_MAX_PRODUCE_BATCH_BYTES.  Larger → MessageTooLarge at the gateway and the
+    /// worker ingress, before append.  Never a startup refusal (small rings /
+    /// terms only lower the limit).  Replication terms apply even single-node.
+    [[nodiscard]] int32_t produceIntakeLimit() const;
+    /// THE formula alone over this config's raw ring / term sizes (no explicit
+    /// override): Worker::maxAcceptableBatchBytes(ingress ring, return ring,
+    /// repl outbound ring, term, term, term).  produceIntakeLimit() =
+    /// min(this, explicit RUNE_MAX_PRODUCE_BATCH_BYTES if set).
+    [[nodiscard]] std::size_t batchLimitFormula() const;
+
+    /// Host part of clientEndpoint.channel (the client-facing bind host).
+    std::string clientBindHost() const;
+    std::string shardIngressBindChannel(int32_t w) const;  // aeron:udp?endpoint=<clientBindHost>:<ingressBase+w>
+    std::string shardReplBindChannel(int32_t w) const;     // aeron:udp?endpoint=<peerBindHost>:<replBase+w>
+    /// DR-15 fix round 1 (MEDIUM-1): the host this node BINDS its peer-facing
+    /// inbound subscriptions on (consensus, replication, shard planes).  Never
+    /// depends on this node's own DNS record (a k8s headless-service record
+    /// appears only once the pod is Ready — after it bound): RUNE_PEER_BIND_HOST
+    /// when set, else self().host when numeric, else the wildcard 0.0.0.0.
+    /// self().host stays the ADVERTISED name peers dial.
+    std::string peerBindHost() const;
+    std::string selfConsensusBindChannel() const;     // aeron:udp?endpoint=<peerBindHost>:<consensusPort>
+    std::string selfReplicationBindChannel() const;   // "" when replicationPort == 0
+    std::string peerBindHostOverride;                 // RUNE_PEER_BIND_HOST (empty = derived)
+    static std::string shardPeerReplChannel(const PeerConfig& p, int32_t w);  // <p.host>:<p.replBasePort+w>
+    static std::string shardIngressEndpoint(const PeerConfig& p, int32_t w);  // "<p.host>:<p.ingressBasePort+w>"
 };
 
 struct ConfigResult {
     std::optional<NodeConfig> config;
     std::string               error;
 };
+
+/// Parse a Linux cpu list ("0", "0,4-5"); sorted + deduplicated.  nullopt on any malformed token,
+/// a reversed range, an empty list or a CPU >= 1024 (CPU_SETSIZE).
+[[nodiscard]] std::optional<std::vector<int32_t>> parseCpuList(std::string_view s);
 
 /// Parse and validate node configuration from an injected env-lookup function.
 /// Use this overload in tests (inject a fake env map) so tests never touch

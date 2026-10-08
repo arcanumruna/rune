@@ -36,11 +36,16 @@
 // vectors.  Move-semantics for the vectors ensure no copies on the hot path.
 
 #include <rune/replication/ReplicationMessages.h>  // FetchResponseMsg
+#include <rune/node/SessionSignalKind.h>
 #include <rune/storage/Log.h>
+
+#include <rune_protocol_internal_sbe/MessageHeader.h>
+#include <rune_protocol_internal_sbe/WorkerOp.h>
 
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace rune::replication { class PartitionReplica; }
@@ -63,11 +68,13 @@ struct WorkerOp {
         FetchRequest,             ///< transport → worker: leader handles follower FetchRequest
         OffsetsForLeaderEpochReq, ///< transport → worker: leader handles KIP-101 epoch probe
         ReconcileFetchResp,       ///< transport → worker: deficient leader applies survivor data
-        // Task #13: appendControlRecord race fix — route txn COMMIT/ABORT marker
-        // appends to the owning worker when per-worker ingress is active.
-        // Fire-and-forget (no WorkerReturn): the gateway pre-computes the base
-        // offset from log->logEndOffset() before enqueueing and returns it
-        // synchronously; the worker appends via replica->append(marker, acksAll).
+        // Task #13 / F15 K3: route txn COMMIT/ABORT marker appends to the owning
+        // worker under the produce-routing predicate (every mode with a worker
+        // pool).  The worker appends via replica->appendControlBatch (F15 N2: a
+        // real control batch, role + min-ISR gated) and answers
+        // ControlRecordAppended{correlationId = marker token, baseOffset = where
+        // it ACTUALLY landed} (Task 10 round 4: never pre-computed) — or
+        // ControlRecordRefused when the ownership guard refuses it.
         // Internal partitions (topicId < 0) never use this path.
         AppendControlRecord,      ///< gateway → worker: append txn control marker to user partition
         // read-rework T3/T4: subscription lifecycle routed to the owning worker so
@@ -76,6 +83,30 @@ struct WorkerOp {
         // Fire-and-forget (no WorkerReturn): registration/removal only.
         Subscribe,                ///< gateway → worker: register/update a subscription cursor
         Unsubscribe,              ///< gateway → worker: remove a subscription
+        // Task 7: admin → worker schema validator push.
+        // Carries topicId (existing scalar) + descriptor blob (tail, TailKind=DESCRIPTOR_BLOB).
+        // Worker builds a local rune::codec::Validator from the blob on its own thread
+        // (shared-nothing: validators_ is worker-owned, never touched by any other thread).
+        SchemaUpdate,             ///< admin → worker: install/update a per-topic Validator
+        // Self-contained worker shards (spec §3.4, Task 13) — values 13/14 = the
+        // schema's SESSION_ANNOUNCE / SESSION_CLOSE.  Runtime → EVERY worker,
+        // control plane (connect / disconnect rate), never ownership-gated.
+        SessionAnnounce,          ///< runtime → worker: session reply destination (tail = egress channel)
+        SessionClose,             ///< runtime → worker: forget the session + its queued acks
+        // Task 10 round 4: follower/peer-side handlers on a USER replica, routed
+        // to the owning worker (they touch the replica's log/state).
+        OffsetsForLeaderEpochResp = 15, ///< transport → worker: follower applies a KIP-101 answer
+        ReconcileFetchReq         = 16, ///< transport → worker: survivor serves a reconcile pull
+        // MEDIUM-2: the controller's AlterIsr answer for a USER partition leader
+        // (roleEpoch = leaderEpoch, rolePartitionEpoch, replicatedPayload.errorCode).
+        AlterIsrResponse          = 18, ///< transport → worker: PartitionReplica::onAlterIsrResponse
+        // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
+        // control → owning worker: run a test-owned OwnerThreadTestTask against
+        // `replica` on the worker's OWN thread.  The opaque task ref travels in the
+        // `egressPub` pointer slot (no new wire field, no hot-path encode branch).
+        // Never enqueued by production code; the worker's handler is a cold branch.
+        // Value 200 matches the schema's TEST_TASK (outside the dense prod range).
+        TestTask = 200,           ///< control → worker: run a test task (test-only)
     };
 
     Type    type    = Type::Produce;
@@ -85,9 +116,22 @@ struct WorkerOp {
     // -----------------------------------------------------------------------
     // Non-owning pointer to the PartitionReplica for this (topicId, partition).
     // Null if no replica wired (passthrough / single-node).
-    // Lifetime invariant: the replica registry outlives the ring.
+    //
+    // Task 10 round 4: the pointer is NEVER dereferenced on the control thread.
+    // Production routing (WorkerPool::tryEnqueueOp) resolves (topicId,
+    // partition) through the ReplicaRegistry at routing time and stamps the
+    // pointer + identity (targetReplicaId, incarnation) from that lookup; the
+    // worker executes only if it owns that exact incarnation and then uses ITS
+    // OWN pointer for the id.  incarnation 0 = unregistered (not gated: unit
+    // tests / passthrough); ReplicaRegistry::kStaleIncarnation = the target is
+    // gone (always refused through the op's normal response path).
     // -----------------------------------------------------------------------
     rune::replication::PartitionReplica* replica = nullptr;
+    uint32_t targetReplicaId = 0;
+    uint32_t incarnation     = 0;
+    // Produce (Task 10 round 5): the runtime's current min-ISR admission policy
+    // (0 = the replica's configured minIsr).  Applied by the OWNING worker.
+    int32_t  minIsr          = 0;
 
     // -----------------------------------------------------------------------
     // Non-owning Log* — set by the gateway at enqueue time from the
@@ -126,7 +170,24 @@ struct WorkerOp {
     // egress ExclusivePublication created + lifetime-owned by the gateway, written
     // only by the owning worker.  Passed through the ring as a uint64 (like
     // replica/logPtr).  nullptr → worker uses the shared MDC pub (broadcast).
+    // Egress RELEASE op (retire-on-ack): an Unsubscribe with subscriptionId 0 and
+    // egressPub != nullptr — the worker drops every subscription on that pub and
+    // returns EgressReleased (token = correlationId); only then does the gateway
+    // destroy the pub.
     void* egressPub = nullptr;
+
+    // SessionAnnounce (Task 13): the client session's egress stream + channel.
+    // egressChannel is a VIEW valid only for the synchronous tryEnqueueOp call
+    // (copied once into the ring slot as the tail, TailKind = EGRESS_CHANNEL).
+    int32_t          egressStreamId = 0;
+    std::string_view egressChannel;
+    // D6: SessionAnnounce — the session's ConnectRequest.clientVersion (a
+    // worker acking directly gates UnknownProducerId on it).
+    int32_t          clientVersion = 0;
+
+    // SetOwnership: the ReplicaRegistry generation this owned set reflects
+    // (acked back as WorkerReturn::OwnershipAck).  Task 10 fix 3.
+    uint64_t ownershipGen = 0;
 
     // lastOffsetDelta from the RecordBatch header (kLastOffsetDeltaOffset=23, LE32).
     // The worker computes lastOffset = worker_base + lastOffsetDelta.
@@ -143,8 +204,24 @@ struct WorkerOp {
 
     // deferAck: true when the gateway determined (before enqueueing) that the
     // response should be deferred (acks=All + replica + committedMetadataReady).
-    // Forwarded in WorkerReturn so the gateway knows to enqueue PendingAck.
+    //
+    // WIRE NOTE (F15 S5 fix round 2, N-4): the SBE WorkerOp field named
+    // `deferAck` (rune-internal-ring.xml) is a FLAG BYTE, not a bool:
+    //   bit 0 (kOpFlagDeferAck = 0x01)     — this deferAck (acks=all, steady state)
+    //   bit 1 (kOpFlagCrcValidated = 0x02) — crcValidated (below; Produce only)
+    // Writer: Worker::enqueueOp only.  Readers MUST mask the bit they need
+    // (executeProduceWire_ does); `deferAck() != 0` is wrong.  Rename the
+    // schema field to `flags` the next time rune-protocol's schema is touched.
     bool deferAck = false;
+
+    // F15 S5 fix round 1 (review M-3): the producer of this Produce op ran
+    // RecordBatchReader::ensureValid() (CRC32C) on EXACTLY these batch bytes
+    // before enqueueing them.  Only then may the worker skip its own CRC pass.
+    // Set by ClientGateway::handleProduce right after its ensureValid; any
+    // other op producer (test rigs, a future forward / retry queue) leaves it
+    // false and the worker validates.  Carried over the ring as bit 1 of the
+    // wire `deferAck` byte (kOpFlagCrcValidated) — no protocol change.
+    bool crcValidated = false;
 
     // durabilityTier: controls when the ProduceResult ack is emitted.
     //   0 = Leader  — ack immediately after appendNoSync (today's default).
@@ -189,6 +266,10 @@ struct WorkerOp {
     // Leader node for BecomeFollower (-1 = no leader / NO_LEADER).
     rune::replication::NodeId roleLeaderId = -1;
 
+    // BecomeLeader / AlterIsrResponse: the committed assignment's partitionEpoch
+    // (AlterIsr compare-and-set, MEDIUM-1); -1 = not controller-managed.
+    int32_t rolePartitionEpoch = -1;
+
     // -----------------------------------------------------------------------
     // ApplyReplicated-specific fields
     // -----------------------------------------------------------------------
@@ -212,6 +293,16 @@ struct WorkerOp {
     // -----------------------------------------------------------------------
     std::vector<rune::replication::PartitionReplica*> ownedSet;
 
+    // Task 7: SchemaUpdate payload — descriptor blob for a single topic.
+    //
+    // Lifetime: the blob is COPIED into the ring slot at enqueue time
+    // (tryEnqueueOp, via putTail).  The worker reads it zero-copy from the
+    // ring view inside executeSchemaUpdateWire_ on ITS OWN thread.
+    //
+    // topicId is carried in the existing common scalar field (WorkerOp::topicId).
+    // The blob is carried as the variable tail (TailKind = DESCRIPTOR_BLOB).
+    std::vector<uint8_t> schemaUpdateBlob;
+
     // -----------------------------------------------------------------------
     // E5.1.2c: FetchRequest-specific fields (leader handles follower fetch).
     // Copied flat from the FetchRequestMsg + timestamp — no pointer into
@@ -224,7 +315,14 @@ struct WorkerOp {
         rune::replication::Offset      fetchOffset  = 0;
         int32_t                        maxBytes     = 0;
         int32_t                        topicId      = 0;
+        int32_t                        lastFetchedEpoch = -1;   ///< KIP-320/595 (-1 = none)
+        int64_t                        incarnation  = 0;        ///< KIP-903 follower process incarnation
         int64_t                        nowNs        = 0;
+        /// F27 R1: the follower's connection generation at the transport (0 =
+        /// not tracked).  On the SBE ring it rides in `ownershipGen` (a SetOwnership
+        /// -only field; no FetchRequest op uses it) — a dedicated rune-protocol
+        /// schema field is a follow-up.
+        uint32_t                       connGen      = 0;
     } fetchRequestPayload;
 
     // -----------------------------------------------------------------------
@@ -247,10 +345,49 @@ struct WorkerOp {
 // ---------------------------------------------------------------------------
 // WorkerReturn — result sent from Worker back to the control thread.
 // ---------------------------------------------------------------------------
+// SessionSignalKind (the WorkerReturn::Type::SessionSignal kinds): rune/node/SessionSignalKind.h.
+
 struct WorkerReturn {
     enum class Type : uint8_t {
         ProduceResult,   ///< result of a Produce op
         PushReadResult,  ///< result of a PushRead op
+        /// Task 13 (fix rounds 1-2): a per-session fact from worker `partition`
+        /// about sessionId; `lastOffset` = SessionSignalKind:
+        ///   Failed   — its ack publication can never deliver (add / find error,
+        ///              CLOSED, MAX_POSITION_EXCEEDED): the runtime closes the
+        ///              session everywhere and tells the client (SessionExpired);
+        ///   Held     — the worker holds acks for it (the client reads slower
+        ///              than it produces): the runtime pauses that session's
+        ///              gateway intake (controlled ABORT) — G-A6 on the
+        ///              gateway-routed path;
+        ///   Released — no longer held on this worker;
+        ///   Lost / Found (D8b) — its ack publication reports NOT_CONNECTED /
+        ///              is connected again; acks stay queued meanwhile — the
+        ///              runtime reaps a session lost on any worker on the
+        ///              normal lease measured from the Lost edge;
+        ///   Progress (D8b) — a held session's acks are being claimed (the
+        ///              client reads): the runtime refreshes its lease.
+        ///              At most once per SessionAckSink::kProgressPassInterval
+        ///              passes per session.
+        ///   Credit (D8c) — baseOffset gateway-routed acks of the session were
+        ///              claimed: the runtime returns that many produce credits
+        ///              (<= one per session per worker pass).
+        /// Rides sbe ReturnType value 2 — RESERVED_2 (PRODUCE_NOTIFY, retired by
+        /// F15 §7; static_assert in WorkerReturnCodec.h); in-process ring only.
+        SessionSignal = 2,
+        /// fsyncgate fail-stop (Task 10 fix 1): a log's fsync failed.  topicId /
+        /// partition name it, errorCode = errno, chunk = the log directory.  The
+        /// runtime logs critical and halts the broker (kExitStorageFailure).
+        StorageFailure = 3,   ///< == sbe ReturnType::STORAGE_FAILURE
+        /// SetOwnership applied: partition = workerId, lastOffset = ownershipGen.
+        OwnershipAck = 4,
+        /// AppendControlRecord refused by the ownership guard: topicId /
+        /// partition, the marker in chunk (re-routed or surfaced as NotLeader).
+        ControlRecordRefused = 5,
+        /// AppendControlRecord executed: correlationId = the runtime's marker
+        /// token, baseOffset = where the marker ACTUALLY landed (authoritative),
+        /// or errorCode != 0 when the append failed.  Task 10 round 4 (P1).
+        ControlRecordAppended = 6,
     };
 
     Type    type = Type::ProduceResult;
@@ -268,13 +405,34 @@ struct WorkerReturn {
     // Result code: 0 = success, non-zero = error (mirrors pc::ErrorCode).
     int16_t errorCode     = 0;
 
-    // Whether the gateway should enqueue a deferred ack (acks=All) instead of
-    // sending immediately.  True only when the produce was appended successfully
-    // AND acks=All AND replica is set AND committedMetadataReady is true.
+    // F15 S2 (review m6): on a ProduceResult, true means "FACTS ONLY, NO
+    // ANSWER" — the owning worker's copy of a SUCCESSFUL append (errorCode 0)
+    // that it parks the answer of (acks=all: emitted at append; Strict: at fsync
+    // completion), so the gateway's PSM / LsoTracker / dirty-log mirrors learn
+    // it.  Every answer (OK or error) has deferAck == false; an error result
+    // never carries it.  TEMPORARY: deleted with the mirrors by S4 (LSO) and S5
+    // (PSM).  (On the op side, WorkerOp::deferAck still means "acks=all".)
     bool    deferAck      = false;
 
-    // Non-owning pointer to the replica (for the pending-ack path).
+    // D8c: a ProduceResult ANSWER of a GATEWAY-routed (op-ring) produce — the
+    // runtime holds a produce credit for it until the worker's SessionAckSink
+    // CLAIMS the ack (SessionSignal Credit).  Worker-local only: NOT encoded
+    // (the SBE WorkerReturn layout is pinned); emitProduceAck_ reads it from
+    // the struct the answer travels in (parked waiters, the return FIFO).
+    bool    gatewayCredit = false;
+
+    // D8d: a ProduceResult ANSWER of a DIRECT (worker-ingress) produce counted
+    // against the worker's direct budget (SessionAckSink::admitDirect's result,
+    // copied to AckEntry::direct; returned when the ack leaves the sink).
+    // Worker-local only: NOT encoded, like gatewayCredit.
+    uint8_t directAck     = 0;
+
+    // Non-owning pointer to the replica.  Task 10 round 4: the runtime never
+    // dereferences it — it refers to the replica by (targetReplicaId,
+    // incarnation), echoed from the op, and resolves through the registry.
     rune::replication::PartitionReplica* replica = nullptr;
+    uint32_t targetReplicaId = 0;
+    uint32_t incarnation     = 0;
 
     // Producer-state update fields (forwarded from WorkerOp for PSM update).
     // Gateway calls producerStateManager_.update() after receiving the result.
@@ -312,8 +470,55 @@ struct WorkerReturn {
     bool    isGroup        = false;
     bool    groupCarrierReceived = false;
 
-    // The data chunk returned by log->read().  Moved out of the worker.
+    // The data chunk (owned).  The worker encodes PushRead chunks straight from
+    // the log's read mmap into the return ring (F5) and never fills this for
+    // them; it carries the other returns' payloads (StorageFailure dir, refused
+    // marker) and the chunk of a copy-mode drain (Worker::drainReturn).
     std::vector<uint8_t> chunk;
+    // F5: a ZERO-COPY view of the chunk in the return ring, set by a view-mode
+    // drain (Worker::drainReturnView) instead of copying into `chunk`.  Valid
+    // ONLY inside that drain's callback — never stored, never encoded.
+    std::span<const uint8_t> chunkView;
+    /// The chunk bytes, whichever carrier holds them.
+    [[nodiscard]] std::span<const uint8_t> chunkBytes() const noexcept {
+        return chunkView.data() != nullptr ? chunkView : std::span<const uint8_t>(chunk);
+    }
+
+    // -----------------------------------------------------------------------
+    // F15 S4 (addendum R-3): a PushReadResult echoes the bound the OWNING
+    // worker applied and whether its read_committed state was ready.  The
+    // WorkerReturn layout is pinned (ProtocolRegression.WorkerReturnLayoutUnchanged),
+    // so two fields that a PushReadResult never otherwise uses carry them:
+    //   lastOffset → the effective bound W read up to (exclusive): min(op hwBound,
+    //                live HW) for read_uncommitted, min(op hwBound, LSO(live HW))
+    //                for read_committed; -1 when nothing was bounded (not ready).
+    //   deferAck   → read_committed state of the partition not yet Ready (§2.3).
+    // -----------------------------------------------------------------------
+    [[nodiscard]] int64_t pushEffectiveBound() const noexcept { return lastOffset; }
+    [[nodiscard]] bool    pushRcNotReady()     const noexcept { return deferAck; }
+    void setPushEffectiveBound(int64_t b) noexcept { lastOffset = b; }
+    void setPushRcNotReady(bool v) noexcept { deferAck = v; }
 };
+
+/// F18 (m-1): outcome of enqueueing a WorkerOp.  Full = back-pressure (retry
+/// later); TooLarge = the op's tail can never fit one ring frame — NOT retriable
+/// (a caller that retries it would livelock); answer it as an error instead.
+enum class EnqueueResult : uint8_t { Enqueued, Full, TooLarge };
+
+/// The wire `deferAck` byte of a WorkerOp is a flag set (F15 S5 fix round 1).
+inline constexpr uint8_t kOpFlagDeferAck     = 0x01;   ///< WorkerOp::deferAck (acks=all, steady state)
+inline constexpr uint8_t kOpFlagCrcValidated = 0x02;   ///< WorkerOp::crcValidated (Produce only)
+
+// ---------------------------------------------------------------------------
+// workerOpFrameBytes — the encoded size of one WorkerOp ring frame carrying a
+// `tailLen`-byte variable tail (record batch / replicated records): SBE header +
+// block + varData.  The ONE formula Worker::tryEnqueueOp claims with, and the one
+// the produce intake limit (NodeConfig::produceIntakeLimit, F18) and the follower
+// apply guard check a batch against (ingress ring maxMsgLength = capacity / 8).
+// ---------------------------------------------------------------------------
+[[nodiscard]] inline std::size_t workerOpFrameBytes(std::size_t tailLen) {
+    return ::rune::protocol::internal::sbe::MessageHeader::encodedLength() +
+           ::rune::protocol::internal::sbe::WorkerOp::computeLength(tailLen);
+}
 
 } // namespace rune::node

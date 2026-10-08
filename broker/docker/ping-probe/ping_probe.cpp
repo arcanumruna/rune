@@ -114,13 +114,11 @@ static bool startDriver(const std::string& aeronDir) {
         }
     });
 
-    // Wait for cnc.dat (bounded).
+    // No caller-side pumping: aeron_driver_init/start already wrote cnc.dat and
+    // stamped the heartbeat synchronously before g_driverThread even starts;
+    // pumping here too would be a second concurrent pumper on the
+    // single-pumper driver (spec Sec 3.6).
     const std::string cncPath = aeronDir + "/cnc.dat";
-    for (int i = 0; i < 500; ++i) {
-        aeron_driver_main_do_work(g_driver);
-        if (fs::exists(cncPath)) break;
-        std::this_thread::sleep_for(2ms);
-    }
     if (!fs::exists(cncPath)) {
         std::cerr << "PROBE: Aeron CnC file not created within timeout\n";
         return false;

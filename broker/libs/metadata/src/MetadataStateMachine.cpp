@@ -5,6 +5,7 @@
 
 #include "rune/metadata/MetadataStateMachine.h"
 #include "rune/protocol/MetadataRecords.h"
+#include "rune/metadata/MetadataExtensions.h"
 
 #include <algorithm>
 
@@ -23,6 +24,15 @@ void MetadataStateMachine::apply(const uint8_t* buf, std::size_t len, int64_t re
     // Peek at type
     auto typeOpt = peekRecordType(buf, len);
     if (!typeOpt.has_value()) return;
+
+    // D15: broker-owned record types (older binaries skip them — default below).
+    if (static_cast<uint16_t>(*typeOpt) == kFeatureLevelRecordType) {
+        const auto rec = FeatureLevelRecord::decode(buf, len);
+        if (!rec.has_value()) return;
+        if (recordPos <= committedPos_) { if (rec->level > featureLevel_) featureLevel_ = rec->level; }
+        else pendingFeature_.emplace_back(recordPos, rec->level);
+        return;
+    }
 
     switch (*typeOpt) {
     case MetadataRecordType::CreateTopic: {
@@ -58,9 +68,15 @@ void MetadataStateMachine::apply(const uint8_t* buf, std::size_t len, int64_t re
         pa.replicas.reserve(rec->replicas.size());
         for (int32_t v : rec->replicas) pa.replicas.push_back(v);
 
+        // D15: a leaderless record's mark (trailer; absent on older records).
+        if (pa.leaderNode == NO_LEADER && rec->recordVersion == 0) {
+            const std::size_t base = leaderless_trailer::baseSize(*rec);
+            if (len > base) pa.mark = leaderless_trailer::decode(buf + base, len - base);
+        }
+
         // If pos is already committed, install directly.
         if (recordPos <= committedPos_) {
-            committed_.put(rec->topicId, rec->partition, pa);
+            install_(rec->topicId, rec->partition, pa);
         } else {
             // Queue as pending
             pending_.push_back(PendingEntry{
@@ -107,8 +123,33 @@ void MetadataStateMachine::commit(int64_t committedPos)
     flushPending(committedPos);
 }
 
+// N4 (fix round 2) — LATENT HAZARD: the MSM has no topic-delete path; if one
+// lands with topic-id REUSE, the delete must erase committed_ for the old
+// topic's partitions, or this guard silently rejects the recreated topic's
+// epoch-0 records (leaderless forever).  Topic ids are never reused today.
+void MetadataStateMachine::install_(int32_t topicId, int32_t partition,
+                                    const PartitionAssignment& pa)
+{
+    if (const PartitionAssignment* cur = committed_.get(topicId, partition)) {
+        const bool regress =
+            pa.leaderEpoch < cur->leaderEpoch ||
+            (pa.leaderEpoch == cur->leaderEpoch && pa.leaderNode != cur->leaderNode) ||
+            pa.partitionEpoch < cur->partitionEpoch;
+        if (regress) { ++regressionsRejected_; return; }
+    }
+    committed_.put(topicId, partition, pa);
+    ++committedVersion_;
+}
+
 void MetadataStateMachine::flushPending(int64_t upToPos)
 {
+    if (!pendingFeature_.empty()) {
+        std::erase_if(pendingFeature_, [&](const std::pair<int64_t, int16_t>& f) {
+            if (f.first > upToPos) return false;
+            if (f.second > featureLevel_) featureLevel_ = f.second;
+            return true;
+        });
+    }
     if (pending_.empty()) return;
 
     // Sort by log position to ensure deterministic installation order
@@ -120,7 +161,7 @@ void MetadataStateMachine::flushPending(int64_t upToPos)
     std::size_t kept = 0;
     for (auto& e : pending_) {
         if (e.pos <= upToPos) {
-            committed_.put(e.topicId, e.partition, e.assignment);
+            install_(e.topicId, e.partition, e.assignment);
         } else {
             // Move back to the kept region
             pending_[kept++] = std::move(e);
@@ -139,6 +180,7 @@ void MetadataStateMachine::revert(int64_t toCommittedPos)
     // The committed map is untouched — only uncommitted speculation is pruned.
     // O(n) in pending_ size, which is bounded by the max number of in-flight
     // (uncommitted) records.
+    std::erase_if(pendingFeature_, [&](const std::pair<int64_t, int16_t>& f) { return f.first > toCommittedPos; });
     if (pending_.empty()) return;
 
     std::size_t kept = 0;

@@ -8,16 +8,14 @@
 // ## Design
 //   - Subscribes to (channel, streamId) via a bounded resolve loop that mirrors
 //     ClientGateway.cpp:85-99 exactly: addSubscription + findSubscription loop,
-//     kResolveMaxMs=5000 ms / kResolveSliceMs=1 ms slices.
-//   - Wraps an aeron::FragmentAssembler (member) to reassemble multi-fragment
-//     messages (produces can exceed a single Aeron MTU) — same as the gateway.
-//   - poll<Handler>(fragmentLimit, handler) is TEMPLATED on Handler so OUR
-//     call site stays concrete and inlined.
-//   - The only std::function / type-erasure crossing is Aeron's own
-//     fragment_handler_t at the Subscription::poll boundary.  We bridge from
-//     the fixed assembler callback to the concrete Handler via a raw-function-
-//     pointer + void* trampoline (zero overhead, zero additional std::function
-//     of our own).
+//     until Aeron answers (AeronPump::kUntilAnswered, bounded by Aeron's driverTimeoutMs); via AeronPump (1 ms sleep with the default pump,
+//     invoker pumping of the shard's own driver + conductor otherwise, §3.6).
+//   - Reassembles multi-fragment messages (produces can exceed a single Aeron
+//     MTU) with rune::aeronutil::FragmentAssembler — same as the gateway;
+//     buffers of lost images are freed by an ImageLossWatch after each poll.
+//   - poll<Handler>(fragmentLimit, handler) is TEMPLATED on Handler and the
+//     assembler delegate is a template argument, all inlined into Aeron's
+//     templated Subscription/Image poll: no std::function, no trampoline.
 //   - ZERO-COPY: the handler receives a pointer into Aeron's term buffer valid
 //     ONLY for the duration of the handler call.  Do NOT store the pointer.
 //   - SINGLE-OWNER / SINGLE-THREAD: one WorkerIngress per worker, polled only
@@ -33,9 +31,12 @@
 //   The caller must check resolved() after construction.
 // ---------------------------------------------------------------------------
 
+#include <rune/aeronutil/AeronPump.h>
+
 #include <Aeron.h>
+#include <spdlog/spdlog.h>
 #include <Subscription.h>
-#include <FragmentAssembler.h>
+#include <rune/aeronutil/FragmentAssembler.h>
 #include <concurrent/AtomicBuffer.h>
 #include <util/Index.h>
 
@@ -62,35 +63,34 @@ public:
     // -----------------------------------------------------------------------
     WorkerIngress(std::shared_ptr<aeron::Aeron> aeron,
                   std::string                   channel,
-                  int32_t                       streamId) noexcept
+                  int32_t                       streamId,
+                  rune::aeronutil::AeronPump    pump   = {},
+                  std::chrono::milliseconds     budget = rune::aeronutil::AeronPump::kUntilAnswered) noexcept
         : aeron_(std::move(aeron))
         , channel_(std::move(channel))
         , streamId_(streamId)
-        // The assembler's fixed callback dispatches to the per-poll trampoline
-        // via raw void* + function pointer.  No std::function of our own.
-        , assembler_([this](aeron::concurrent::AtomicBuffer& buffer,
-                            aeron::util::index_t             offset,
-                            aeron::util::index_t             length,
-                            aeron::Header&                   header) {
-              // Invoke trampoline: trampoline_(ctx_, data, len, hdr).
-              // ctx_/trampoline_ are set for the duration of each poll() call.
-              trampoline_(ctx_,
-                          reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
-                          static_cast<std::size_t>(length),
-                          header);
-          })
     {
         if (!aeron_) return;  // null aeron_ → unresolved
 
-        // Mirror ClientGateway.cpp:85-99 EXACTLY.
-        int64_t regId = aeron_->addSubscription(channel_, streamId_);
-
-        using clock = std::chrono::steady_clock;
-        auto deadline = clock::now() + std::chrono::milliseconds{kResolveMaxMs};
-        while (clock::now() < deadline) {
-            sub_ = aeron_->findSubscription(regId);
-            if (sub_) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds{kResolveSliceMs});
+        // Add, then resolve (spec §3.6): the default pump sleeps 1 ms between
+        // probes (legacy ClientGateway.cpp:85-99 behaviour); an invoker pump
+        // drives this shard's own driver + conductor instead of sleeping.
+        // A driver registration error (bad channel, ...) makes add/find THROW;
+        // this ctor is noexcept, so it becomes a logged resolve failure.
+        bool failed = false;
+        try {
+            const int64_t regId = aeron_->addSubscription(channel_, streamId_);
+            sub_ = pump.resolve([&]() -> std::shared_ptr<aeron::Subscription> {
+                try {
+                    return aeron_->findSubscription(regId);
+                } catch (const std::exception& e) {
+                    spdlog::error("WorkerIngress: subscription {} stream {} failed: {}", channel_, streamId_, e.what());
+                    failed = true;
+                    return nullptr;
+                }
+            }, budget, &failed);
+        } catch (const std::exception& e) {
+            spdlog::error("WorkerIngress: addSubscription {} stream {} failed: {}", channel_, streamId_, e.what());
         }
         // sub_ == nullptr → resolved() returns false; caller handles.
     }
@@ -126,55 +126,69 @@ public:
     // Returns the number of fragments handled (add to doWork work count).
     // Returns 0 if not resolved().
     //
-    // No std::function of our own.  The only type-erasure is Aeron's own
-    // fragment_handler_t at the Subscription::poll boundary.
+    // No std::function anywhere (Task 11 fix 2: rune templated assembler).
     // -----------------------------------------------------------------------
     template <class Handler>
     int poll(int fragmentLimit, Handler&& handler) {
         if (!sub_) [[unlikely]] return 0;
 
-        // Install the concrete handler as a raw trampoline for this call.
-        // poll() is synchronous and single-threaded — the raw pointer is
-        // valid for the entire duration of sub_->poll(...).
-        using H = std::remove_reference_t<Handler>;
-        ctx_        = static_cast<void*>(std::addressof(handler));
-        trampoline_ = [](void* ctx,
-                         const uint8_t*   data,
-                         std::size_t      len,
-                         aeron::Header&   hdr) {
-            (*static_cast<H*>(ctx))(data, len, hdr);
-        };
+        // Task 11 fix 2 (B3): templated assembler + the caller's handler, all
+        // inlined into Aeron's templated Subscription/Image poll — no
+        // std::function, no trampoline.
+        const int n = sub_->poll(
+            [this, &handler](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o,
+                             aeron::util::index_t l, aeron::Header& h) {
+                assembler_.onFragment(
+                    [&handler](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
+                               aeron::util::index_t length, aeron::Header& header) {
+                        handler(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
+                                static_cast<std::size_t>(length), header);
+                    },
+                    b, o, l, h);
+            },
+            fragmentLimit);
+        imageWatch_.afterPoll(*sub_, assembler_);   // free buffers of lost images (m-c)
+        return n;
+    }
 
-        int result = sub_->poll(assembler_.handler(), fragmentLimit);
-
-        // Clear trampoline to prevent accidental use after the call stack is gone.
-        ctx_        = nullptr;
-        trampoline_ = nullptr;
-        return result;
+    // -----------------------------------------------------------------------
+    // controlledPoll — as poll(), but the handler returns aeron::Controlled-
+    // PollAction (Task 13 fix round 1, G-A6 per-client pause).  ABORT leaves
+    // the message (its END fragment) on ITS image — one client publication —
+    // and Aeron moves on to the other images.  Use ONE poll flavour per
+    // WorkerIngress (separate reassembly state; a shard uses only this one).
+    // -----------------------------------------------------------------------
+    template <class Handler>
+    int controlledPoll(int fragmentLimit, Handler&& handler) {
+        if (!sub_) [[unlikely]] return 0;
+        const int n = sub_->controlledPoll(
+            [this, &handler](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o,
+                             aeron::util::index_t l, aeron::Header& h) {
+                return controlledAssembler_.onFragment(
+                    [&handler](aeron::concurrent::AtomicBuffer& buffer, aeron::util::index_t offset,
+                               aeron::util::index_t length, aeron::Header& header) {
+                        return handler(reinterpret_cast<const uint8_t*>(buffer.buffer() + offset),
+                                       static_cast<std::size_t>(length), header);
+                    },
+                    b, o, l, h);
+            },
+            fragmentLimit);
+        controlledImageWatch_.afterPoll(*sub_, controlledAssembler_);
+        return n;
     }
 
 private:
     // Mirror the exact constants from ClientGateway.cpp:49-50.
-    static constexpr int kResolveMaxMs   = 5000;  // 5 s
-    static constexpr int kResolveSliceMs = 1;
-
-    // Raw-pointer trampoline: set for the duration of each poll() call.
-    // No std::function, no heap allocation, no virtual call of our own.
-    using TrampolineFn = void(*)(void* ctx,
-                                 const uint8_t* data,
-                                 std::size_t    len,
-                                 aeron::Header& hdr);
 
     std::shared_ptr<aeron::Aeron>          aeron_;
     std::string                            channel_;
     int32_t                                streamId_;
     std::shared_ptr<aeron::Subscription>   sub_;
 
-    // Per-poll trampoline state (valid only during sub_->poll()).
-    void*          ctx_        = nullptr;
-    TrampolineFn   trampoline_ = nullptr;
-
-    aeron::FragmentAssembler               assembler_;
+    rune::aeronutil::FragmentAssembler     assembler_;
+    rune::aeronutil::ImageLossWatch        imageWatch_;
+    rune::aeronutil::ControlledFragmentAssembler controlledAssembler_;   // controlledPoll only
+    rune::aeronutil::ImageLossWatch              controlledImageWatch_;
 };
 
 } // namespace rune::node

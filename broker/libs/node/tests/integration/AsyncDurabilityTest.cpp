@@ -30,6 +30,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -55,6 +56,8 @@ static fs::path makeTempDir(const char* stem = "async_dur") {
     auto n = std::to_string(::getpid()) + "_" +
              std::to_string(g_seq.fetch_add(1, std::memory_order_relaxed));
     auto p = fs::temp_directory_path() / (std::string(stem) + "_" + n);
+    std::error_code ec;
+    fs::remove_all(p, ec);          // a recycled pid must never inherit a stale log
     fs::create_directories(p);
     return p;
 }
@@ -62,9 +65,9 @@ static fs::path makeTempDir(const char* stem = "async_dur") {
 // Null transport (no-op — single-node tests, no replication).
 class NullTransport : public rune::replication::PartitionTransport {
 public:
-    void sendFetchRequest(const rune::replication::FetchRequestMsg&) override {}
-    void sendFetchResponse(rune::replication::NodeId,
-                           const rune::replication::FetchResponseMsg&) override {}
+    bool sendFetchRequest(const rune::replication::FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(rune::replication::NodeId,
+                           const rune::replication::FetchResponseMsg&) override { return true; }
 };
 
 // Build a minimal record batch containing `numRecords` records.
@@ -159,15 +162,18 @@ struct WorkerHarness {
         op.durabilityTier   = tier;
         op.recordBatchBytes = std::move(batch);
 
-        bool ok = worker->tryEnqueueOp(std::move(op));
+        bool ok = static_cast<bool>(worker->tryEnqueueOp(std::move(op)));
         ASSERT_TRUE(ok) << "Worker ingress ring full — test harness error";
     }
 
     // Drain the return ring; update lastReturn and totalReturns.
-    // Returns number of returns drained in this call.
+    // Returns number of returns drained in this call.  Every ProduceResult is
+    // an answer (F15 S5 deleted the append-time facts-only return).
     int drainReturns() {
         int count = 0;
         worker->drainReturn([&](WorkerReturn ret) {
+            if (ret.type == WorkerReturn::Type::ProduceResult && ret.deferAck)
+                ADD_FAILURE() << "a facts-only return (deleted by F15 S5)";
             lastReturn = ret;
             ++totalReturns;
             ++count;
@@ -457,6 +463,8 @@ TEST(AsyncDurability, SubmitRingFullHoldsProduce) {
     int returned = 0;
     bool sawNonOk = false;
     auto drainFn = [&](WorkerReturn ret) {
+        if (ret.type == WorkerReturn::Type::ProduceResult && ret.deferAck)
+            ADD_FAILURE() << "a facts-only return (deleted by F15 S5)";
         ++returned;
         if (ret.errorCode != 0) sawNonOk = true;
     };
@@ -534,7 +542,7 @@ TEST(BackPressure, WorkerIngressFullReturnsFalseNoFalseOK) {
         op.durabilityTier   = 0; // immediate ack (tier=0: Leader)
         op.recordBatchBytes = std::move(batch);
 
-        bool ok = h.worker->tryEnqueueOp(std::move(op));
+        bool ok = static_cast<bool>(h.worker->tryEnqueueOp(std::move(op)));
         if (!ok) {
             gotFull = true;
             break;
@@ -764,4 +772,20 @@ TEST(BackPressure, InMemoryLogBackPressureModeRefusesWhenFull) {
     // BackPressure InMemoryLog produces a false-OK ack at the Worker level.
     // The test gap is acknowledged; the fix is tracked as F5.
     // Label: R5-BackPressure-InMemoryLogBackPressureIntegration (gap=F5)
+}
+
+// Harness fix (found by the Task 11 gate): temp dirs are named <stem>_<pid>_<seq>
+// and were never removed, so a later test process that got a RECYCLED pid
+// re-opened a stale log (BackPressure.WorkerReturnFullDoesNotCrashAndLogsWarn
+// saw LEO 2000 for 1000 appends).  makeTempDir must always hand out a fresh dir.
+TEST(AsyncDurabilityHarnessRegression, TempDirIsFreshEvenWhenAStaleOneExists) {
+    const auto stale = fs::temp_directory_path() /
+                       ("async_dur_fresh_" + std::to_string(::getpid()) + "_" +
+                        std::to_string(g_seq.load(std::memory_order_relaxed)));
+    fs::create_directories(stale);
+    { std::ofstream(stale / "00000000000000000000.log") << "stale segment from a dead pid"; }
+    const fs::path p = makeTempDir("async_dur_fresh");
+    ASSERT_EQ(p, stale);
+    EXPECT_TRUE(fs::is_empty(p)) << "a recycled pid must never inherit a previous process's log";
+    std::error_code ec; fs::remove_all(p, ec);
 }

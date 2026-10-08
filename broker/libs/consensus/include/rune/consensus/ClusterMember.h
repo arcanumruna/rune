@@ -169,15 +169,22 @@ struct ClusterMember {
     }
 
     // ClusterMember.java:828-845  hasActiveQuorum(ClusterMember[], long, long)
-    // Returns true when active-member count >= quorumThreshold(N).
+    // Returns true when active-member count >= quorumThreshold(N).  A member
+    // counts when `member.isLeader() || isActive(nowNs, timeoutNs)` (Aeron): the
+    // leader never records its own AppendPosition, so it is exempt — pass its id
+    // as `leaderMemberId` (-1 = no leader exemption).  The single implementation
+    // of the check (the CLOSED leader's "inactive follower quorum" step-down in
+    // Election uses it too — DR-10 review LOW-3).
     static bool hasActiveQuorum(
         std::span<const ClusterMember> clusterMembers,
         int64_t                        nowNs,
-        int64_t                        timeoutNs) noexcept
+        int64_t                        timeoutNs,
+        NodeId                         leaderMemberId = -1) noexcept
     {
         int threshold = quorumThreshold(static_cast<int>(clusterMembers.size()));
         for (const auto& member : clusterMembers) {
-            if (member.isActive(nowNs, timeoutNs)) {
+            if ((leaderMemberId >= 0 && member.id == leaderMemberId) ||
+                member.isActive(nowNs, timeoutNs)) {
                 if (--threshold <= 0) return true;
             }
         }

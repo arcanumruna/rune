@@ -1,0 +1,317 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a70a8d0..e18cc43 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -167,6 +167,21 @@ if(aeron_FOUND)
+     endif()
+ endif()
+ 
++# ── rune_client_driver_wake — A7 park-until-work: an invoker driver's readiness fds ──
++# A C TU: Aeron's internal driver headers are C (same include probe as rune_gso).  Non-Linux: a stub (0 fds).
++if(aeron_FOUND)
++    add_library(rune_client_driver_wake STATIC src/transport/DriverWakeFds.c)
++    set_target_properties(rune_client_driver_wake PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
++    target_include_directories(rune_client_driver_wake PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
++    if(UNIX AND NOT APPLE)
++        target_link_libraries(rune_client_driver_wake PRIVATE aeron::aeron)
++        foreach(_rune_aeron_inc IN LISTS aeron_INCLUDE_DIRS)
++            target_include_directories(rune_client_driver_wake PRIVATE
++                "${_rune_aeron_inc}" "${_rune_aeron_inc}/aeron" "${_rune_aeron_inc}/aeronmd")
++        endforeach()
++    endif()
++endif()
++
+ # ── rune_client_transport — AeronTransport (compiled, links aeronmd C driver) ─
+ if(aeron_FOUND)
+     add_library(rune_client_transport STATIC
+@@ -177,7 +192,7 @@ if(aeron_FOUND)
+         $<BUILD_INTERFACE:${RUNE_PROTOCOL_INCLUDE}>  # FrameCrc.h (B1): Crc32c / RecordBatch layout
+         $<INSTALL_INTERFACE:include>
+     )
+-    target_link_libraries(rune_client_transport PUBLIC aeron::aeron spdlog::spdlog rune_fr rune_gso)
++    target_link_libraries(rune_client_transport PUBLIC aeron::aeron spdlog::spdlog rune_fr rune_gso rune_client_driver_wake)
+ 
+     # Linux CI portability: libuuid is needed on Linux but not macOS (no-op there).
+     if(UNIX AND NOT APPLE)
+diff --git a/examples/bench/InvokerBench.cpp b/examples/bench/InvokerBench.cpp
+index 2f1ea67..6a3d5af 100644
+--- a/examples/bench/InvokerBench.cpp
++++ b/examples/bench/InvokerBench.cpp
+@@ -13,6 +13,7 @@
+ // one-record OneToOneRingBuffers per shard (shard -> main "ready", main -> shard
+ // "start" carrying the common schedule origin); each ShardResult is written
+ // only by its shard thread and read by main after join().
++#include "BenchIdle.h"
+ #include "InvokerBench.h"
+ #include "BenchEnv.h"
+ #include "LogLinearHistogram.h"
+@@ -69,6 +70,8 @@ struct ShardResult {
+     std::string error;
+     int         udpMask = -1;            // installed GSO(1)/GRO(2) of this shard's driver (-1 = never started)
+     uint64_t    gsoFallbacks = 0, groDisabled = 0;   // runtime fallbacks, read after the driver closed
++    uint64_t    parks = 0;               // A7: idle passes parked (RUNE_BENCH_IDLE=park)
++    int         wakeFds = 0;             // A7: driver readiness fds the parks wait on
+ };
+ 
+ // Start barrier with no atomics (F8 law: cross-thread state only through rings):
+@@ -145,6 +148,13 @@ void runShard(const BenchArgs& a, const rs::ShardGroupConfig& g, uint32_t index,
+         if (owned.empty()) throw std::runtime_error("shard owns no partition of " + topicName);
+         const std::vector<uint8_t> value(static_cast<std::size_t>(a.valueBytes), uint8_t{0xAB});
+ 
++        // A7: park idle passes on the driver's readiness (BenchIdle.h) unless RUNE_BENCH_IDLE=spin.
++        const bool park = parseBenchIdle(std::getenv("RUNE_BENCH_IDLE")) == BenchIdle::Park;
++        int wfds[8];
++        const int nw = park ? shard.wakeFds(wfds, 8) : 0;
++        BenchParker parker(wfds, nw);
++        out.wakeFds = nw;
++
+         signalReady(link);
+         signaled = true;
+         int64_t startNs = 0;
+@@ -196,14 +206,16 @@ void runShard(const BenchArgs& a, const rs::ShardGroupConfig& g, uint32_t index,
+             // Saturation also starts at the common origin (every shard together;
+             // the warm-up window is measured from it).
+             const uint64_t due = open ? std::min(total, schedule.dueCount(now)) : (now < startNs ? 0 : total);
++            const uint64_t sentBefore = out.sent;
++            bool blocked = false;   // a due send waits on credit (an ack / status message), not on the clock
+             while (out.sent < due && (open || out.sent - out.acked < static_cast<uint64_t>(a.window))) {
+                 const int32_t p = owned[rr % owned.size()];
+                 PartitionTimestamps& ring = *sched[static_cast<std::size_t>(p)];
+-                if (ring.full()) break;
++                if (ring.full()) { blocked = true; break; }
+                 const rc::SendResult r = shard.trySend(topic, keyOf[static_cast<std::size_t>(p)], value);
+                 // Stays due (its latency keeps accruing).  QueueFull: the batch-ack
+                 // queue is out of credit until pollBatchAcks() below drains it.
+-                if (r == rc::SendResult::BackPressured || r == rc::SendResult::QueueFull) break;
++                if (r == rc::SendResult::BackPressured || r == rc::SendResult::QueueFull) { blocked = true; break; }
+                 if (r != rc::SendResult::Ok) {
+                     throw std::runtime_error("trySend failed: SendResult=" + std::to_string(static_cast<int>(r)));
+                 }
+@@ -211,9 +223,17 @@ void runShard(const BenchArgs& a, const rs::ShardGroupConfig& g, uint32_t index,
+                 ++out.sent;
+                 ++rr;
+             }
+-            shard.doWork();
++            const int work = shard.doWork();
+             ackNow = monoNs();
+-            shard.pollBatchAcks(onAck);
++            const int acks = shard.pollBatchAcks(onAck);
++            // A7: an idle pass parks until a datagram, the next scheduled send, or maxPark (never past a
++            // due send: latency is measured from the schedule).  Credit waits (closed window, ring / queue
++            // full, back-pressure) wake on the ack datagram.
++            if (park && work == 0 && acks == 0 && out.sent == sentBefore && !(out.sent >= total && out.acked >= out.sent)) {
++                const bool clockBound = open && !blocked && out.sent < total;
++                const int64_t nextDue = clockBound ? schedule.scheduledNs(out.sent) : kNoNextSend;
++                parker.park(benchParkTimeoutNs(nextDue, monoNs(), kBenchMaxParkNs));
++            }
+             if (lost) {
+                 throw std::runtime_error(
+                     "ack not attributable to sent records (latency attribution lost): partition=" +
+@@ -231,6 +251,7 @@ void runShard(const BenchArgs& a, const rs::ShardGroupConfig& g, uint32_t index,
+         }
+         out.cpuSeconds = readThreadSelfCpuSeconds();
+         out.core       = rc::detail::currentCore();
++        out.parks      = parker.parks();
+         try {
+             (void)shard.closeAndWait(std::chrono::seconds(5));  // everything acked: quick, clean teardown
+         } catch (const std::exception&) {
+@@ -365,7 +386,8 @@ int invokerBenchMain(int argc, char** argv) {
+         inWindow += r.ackedInWindow;
+         errors += r.errors;
+         lastAck = std::max(lastAck, r.lastAckNs);
+-        std::printf("THREAD shard=%u core=%d cpu_s=%.3f", i, r.core, r.cpuSeconds);
++        std::printf("THREAD shard=%u core=%d cpu_s=%.3f idle_parks=%llu wake_fds=%d", i, r.core, r.cpuSeconds,
++                    static_cast<unsigned long long>(r.parks), r.wakeFds);
+         if (r.haveFirstError) {
+             std::printf(" first_failed_batch=partition:%d,seq:%d,records:%d,epoch:%d,errorCode:%d",
+                         r.firstError.partition, r.firstError.baseSequence, r.firstError.recordCount,
+@@ -392,7 +414,7 @@ int invokerBenchMain(int argc, char** argv) {
+     std::printf("RESULT mode=%s shards=%u core=%d rate=%llu duration_s=%lld warmup_s=%lld window=%lld records=%llu "
+                 "value=%d acks=%s max_in_flight=%d linger_us=%lld batch_bytes=%d max_frame=%d mtu=%zu "
+                 "sent=%llu acked=%llu errors=%llu measured=%llu achieved_rps=%.0f "
+-                "p50_us=%.1f p99_us=%.1f p999_us=%.1f max_us=%.1f gso=%s gro=%s gso_fallbacks=%llu gro_disabled=%llu%s\n",
++                "p50_us=%.1f p99_us=%.1f p999_us=%.1f max_us=%.1f gso=%s gro=%s gso_fallbacks=%llu gro_disabled=%llu idle=%s%s\n",
+                 a.mode == BenchArgs::Mode::Open ? "open" : "saturate", a.shards, a.core,
+                 static_cast<unsigned long long>(a.rate), static_cast<long long>(a.durationS),
+                 static_cast<long long>(a.warmupS), static_cast<long long>(a.window),
+@@ -403,6 +425,7 @@ int invokerBenchMain(int argc, char** argv) {
+                 us(all.valueAtQuantile(0.50)), p99us, us(all.valueAtQuantile(0.999)), us(all.max()),
+                 (udpMask & 1) ? "on" : "off", (udpMask & 2) ? "on" : "off",   // INSTALLED, not config+probe
+                 static_cast<unsigned long long>(gsoFallbacks), static_cast<unsigned long long>(groDisabled),
++                parseBenchIdle(std::getenv("RUNE_BENCH_IDLE")) == BenchIdle::Park ? "park" : "spin",
+                 ok ? "" : " run_error=1");
+     std::fflush(stdout);
+     if (!ok || errors != 0) return 1;
+diff --git a/include/rune/client/Client.h b/include/rune/client/Client.h
+index 974580f..9dd0ee1 100644
+--- a/include/rune/client/Client.h
++++ b/include/rune/client/Client.h
+@@ -268,6 +268,11 @@ public:
+     /// returns 0 without running a nested cycle.  Thread mode: throws logic_error.
+     int doWork();
+ 
++    /// A7 park-until-work (Invoker owner): the embedded invoker driver's socket-readiness fds — park in
++    /// ppoll() on them when doWork() returned 0 instead of spinning; a datagram (an ack, a status message)
++    /// wakes the owner.  0 fds in Thread driver mode or off Linux.  Valid until close.
++    [[nodiscard]] int wakeFds(int* out, int max) const noexcept { return agent_.testTransport().wakeFds(out, max); }
++
+     /// True once the Aeron client closed itself (invoker owner stalled past
+     /// aeronClientLivenessTimeoutNs, or the driver timed out).
+     [[nodiscard]] bool transportClosed() const noexcept { return agent_.transportClosed(); }
+diff --git a/include/rune/client/shard/ClientShard.h b/include/rune/client/shard/ClientShard.h
+index ae35cbd..69e166f 100644
+--- a/include/rune/client/shard/ClientShard.h
++++ b/include/rune/client/shard/ClientShard.h
+@@ -126,6 +126,9 @@ public:
+     /// std::logic_error.
+     int doWork();
+ 
++    /// A7 park-until-work (Invoker owner): the shard driver's socket-readiness fds (Client::wakeFds).
++    [[nodiscard]] int wakeFds(int* out, int max) const noexcept { return client_->wakeFds(out, max); }
++
+     /// Invoker mode: h(const BatchAck&) for every batch ack completed since the
+     /// last call (F8c: OpKind::BatchAck completions in the shard-owned queue).
+     /// Every accepted record is reported in exactly one BatchAck (a failed /
+diff --git a/include/rune/client/transport/AeronTransport.h b/include/rune/client/transport/AeronTransport.h
+index 4a4e5d4..b369516 100644
+--- a/include/rune/client/transport/AeronTransport.h
++++ b/include/rune/client/transport/AeronTransport.h
+@@ -113,6 +113,11 @@ public:
+ 
+     /// True when a background driver thread exists (Thread mode after start()).
+     [[nodiscard]] bool usesDriverThread() const noexcept { return driverThread_.joinable(); }
++    /// A7 park-until-work: this INVOKER driver's socket-readiness fds (its receiver / sender transport
++    /// pollers' epoll instances, DriverWakeFds.h) into `out` (at most `max`); returns how many.  0 in
++    /// Thread mode (the driver thread consumes the sockets), before start() / after stop(), or off Linux.
++    /// Owned by the driver: valid until stop().  The pumping owner parks in ppoll() on them between passes.
++    [[nodiscard]] int wakeFds(int* out, int max) const noexcept;
+ 
+     /// True when the Aeron client conductor is invoker-driven (no conductor thread).
+     [[nodiscard]] bool usesConductorInvoker() const noexcept {
+diff --git a/src/transport/AeronTransport.cpp b/src/transport/AeronTransport.cpp
+index 5d4e61e..a4ee226 100644
+--- a/src/transport/AeronTransport.cpp
++++ b/src/transport/AeronTransport.cpp
+@@ -14,6 +14,7 @@
+ //   - tryClaim / fallback to offer for zero-copy send.
+ //   - FragmentAssembler wraps all poll calls for multi-frame reassembly.
+ 
++#include "rune/client/transport/DriverWakeFds.h"
+ #include <rune/client/transport/AeronTransport.h>
+ #include "rune/protocol/net/rune_udp_gso.h"
+ 
+@@ -69,6 +70,11 @@ bool AeronTransport::pumpUntil_(Ready&& ready, int64_t timeoutNs) {
+     }
+ }
+ 
++int AeronTransport::wakeFds(int* out, int max) const noexcept {
++    if (cfg_.driverMode != DriverMode::Invoker || driver_ == nullptr) return 0;
++    return rune_client_driver_wake_fds(driver_, out, max);
++}
++
+ int AeronTransport::dutyCycle() noexcept {
+     if (cfg_.driverMode != DriverMode::Invoker || driver_ == nullptr) return 0;
+     // spec §3.1 order: driver, then client conductor.  T15 R2: the driver
+diff --git a/tests/bench/BenchUtilTest.cpp b/tests/bench/BenchUtilTest.cpp
+index b0d1cb4..2da87fa 100644
+--- a/tests/bench/BenchUtilTest.cpp
++++ b/tests/bench/BenchUtilTest.cpp
+@@ -329,3 +329,31 @@ TEST(PartitionTimestamps, UnsequencedProducerAcksInSendOrder) {
+     EXPECT_FALSE(p.onAck(-1, 1, -1, rec)) << "nothing left to attribute";
+     EXPECT_EQ(got, (std::vector<int64_t>{7, 8, 9}));
+ }
++
++// ---------------------------------------------------------------------------
++// A7: the invoker bench parks (ppoll on its driver's wake fds) instead of spinning when a pass did
++// nothing — until the next scheduled send, a datagram, or maxPark.  RUNE_BENCH_IDLE=spin = the old loop.
++// ---------------------------------------------------------------------------
++#include "BenchIdle.h"
++
++TEST(BenchIdle, ModeParsing) {
++    EXPECT_EQ(parseBenchIdle(nullptr), BenchIdle::Park) << "default: park";
++    EXPECT_EQ(parseBenchIdle(""), BenchIdle::Park);
++    EXPECT_EQ(parseBenchIdle("park"), BenchIdle::Park);
++    EXPECT_EQ(parseBenchIdle("spin"), BenchIdle::Spin);
++    EXPECT_EQ(parseBenchIdle("SPIN"), BenchIdle::Spin);
++    EXPECT_EQ(parseBenchIdle("garbage"), BenchIdle::Park);
++}
++
++TEST(BenchIdleRegression, ParkTimeoutBoundedByNextDueSendAndMaxPark) {
++    constexpr int64_t kMax = 200'000;
++    // Nothing due before maxPark: park the full period.
++    EXPECT_EQ(benchParkTimeoutNs(/*nextDueNs=*/1'000'000, /*nowNs=*/0, kMax), kMax);
++    // The next send is due in 30 us: wake for it.
++    EXPECT_EQ(benchParkTimeoutNs(30'000, 0, kMax), 30'000);
++    // Already due (or overdue): never park.
++    EXPECT_EQ(benchParkTimeoutNs(100, 100, kMax), 0);
++    EXPECT_EQ(benchParkTimeoutNs(50, 100, kMax), 0);
++    // No further sends (all sent / closed window): bounded by maxPark only.
++    EXPECT_EQ(benchParkTimeoutNs(kNoNextSend, 0, kMax), kMax);
++}
+diff --git a/tests/transport/InvokerTransportTest.cpp b/tests/transport/InvokerTransportTest.cpp
+index 8515202..b81b705 100644
+--- a/tests/transport/InvokerTransportTest.cpp
++++ b/tests/transport/InvokerTransportTest.cpp
+@@ -531,3 +531,62 @@ TEST(InvokerTransportCrc, RefusedOfferNeverComputesTheCrc) {
+     rx.stop();
+     pub.stop();
+ }
++
++// ---------------------------------------------------------------------------
++// A7 park-until-work (rune-broker findings §4.12): an INVOKER transport exposes its driver's
++// transport-poller epoll fds so the owner can park in ppoll() until a datagram arrives, instead of
++// polling every socket each pass (a pegged core).  Linux only; a Thread-mode driver exposes none.
++// ---------------------------------------------------------------------------
++#include <poll.h>
++
++TEST(InvokerTransportWake, ThreadModeExposesNoWakeFds) {
++    Config c = invokerConfig("aeron:ipc", "aeron:ipc", 3190);
++    c.driverMode = DriverMode::Thread;
++    Transport t{c};
++    t.start();
++    int fds[4];
++    EXPECT_EQ(t.wakeFds(fds, 4), 0) << "the driver's own thread consumes the sockets";
++    t.stop();
++}
++
++TEST(InvokerTransportWakeRegression, ParkedOwnerWakesOnInboundDatagram) {
++#if !defined(__linux__)
++    GTEST_SKIP() << "driver wake fds are Linux-only (Aeron's transport pollers use epoll there)";
++#else
++    const std::string ch = "aeron:udp?endpoint=127.0.0.1:24731";
++    Transport t{invokerConfig(ch, ch, 3191)};
++    t.start();
++    ASSERT_TRUE(pumpUntil(t, [&] { return t.ingressConnected() && t.egressConnected(); }));
++    for (int i = 0; i < 200; ++i) t.dutyCycle();   // settle setup / status traffic
++    int fds[4];
++    const int n = t.wakeFds(fds, 4);
++    ASSERT_EQ(n, 2) << "receiver + sender transport pollers";
++    pollfd pfds[4];
++    for (int i = 0; i < n; ++i) pfds[i] = pollfd{fds[i], POLLIN, 0};
++
++    // Quiet: nothing readable, a park waits out its timeout.
++    timespec quiet{0, 20'000'000};
++    EXPECT_EQ(::ppoll(pfds, static_cast<nfds_t>(n), &quiet, nullptr), 0);
++
++    // A datagram on the driver's socket (a plain sender: not an Aeron frame, the receiver drops it)
++    // ends a 2 s park immediately.
++    const int s = ::socket(AF_INET, SOCK_DGRAM, 0);
++    sockaddr_in a{};
++    a.sin_family = AF_INET; a.sin_port = htons(24731); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    const char junk[8] = {1, 2, 3, 4, 5, 6, 7, 8};
++    ASSERT_EQ(::sendto(s, junk, sizeof junk, 0, reinterpret_cast<sockaddr*>(&a), sizeof a), 8);
++    ::close(s);
++    const timespec ts{2, 0};
++    const auto t0 = std::chrono::steady_clock::now();
++    const int r = ::ppoll(pfds, static_cast<nfds_t>(n), &ts, nullptr);
++    const auto waitedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
++    EXPECT_GT(r, 0) << "the inbound datagram must make a wake fd readable";
++    EXPECT_LT(waitedMs, 1'000);
++
++    // The owner's pass drains it: quiet again (level-triggered, no sticky wake).
++    for (int i = 0; i < 10; ++i) t.dutyCycle();
++    EXPECT_EQ(::ppoll(pfds, static_cast<nfds_t>(n), &quiet, nullptr), 0);
++    t.stop();
++    EXPECT_EQ(t.wakeFds(fds, 4), 0) << "no fds once the driver is closed";
++#endif
++}

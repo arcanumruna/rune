@@ -61,6 +61,18 @@ class CmdResult:
         return self.returncode == 0
 
 
+def _run_container_name(args: list[str]) -> str | None:
+    """The --name of a `docker run ...` command line, else None."""
+    if len(args) < 2 or args[0] != "docker" or args[1] != "run":
+        return None
+    for i, a in enumerate(args):
+        if a == "--name" and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith("--name="):
+            return a.split("=", 1)[1]
+    return None
+
+
 def run(args: list[str], *, timeout: int = DEFAULT_TIMEOUT, check: bool = False,
         env: dict[str, str] | None = None) -> CmdResult:
     """Run a command with a hard timeout. Never blocks forever.
@@ -78,6 +90,18 @@ def run(args: list[str], *, timeout: int = DEFAULT_TIMEOUT, check: bool = False,
             env=env,
         )
     except subprocess.TimeoutExpired as exc:  # pragma: no cover - defensive
+        # Killing the `docker run` CLI does not stop its container: remove a
+        # named one so it cannot keep producing into the next test (DR-15 phantoms).
+        name = _run_container_name(args)
+        log_dir = os.environ.get("DR_CLIENT_LOG_DIR")
+        if name and log_dir:  # keep the full partial output (the exception text gets truncated)
+            os.makedirs(log_dir, exist_ok=True)
+            with open(os.path.join(log_dir, f"TIMEOUT-{name}.log"), "w") as fh:
+                for part in (exc.stdout, exc.stderr):
+                    if part:
+                        fh.write(part.decode(errors="replace") if isinstance(part, bytes) else part)
+        if name:
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True, timeout=60)
         raise TimeoutError(
             f"command timed out after {timeout}s: {' '.join(args)}\n"
             f"stdout so far:\n{exc.stdout}\nstderr so far:\n{exc.stderr}"
@@ -140,9 +164,11 @@ class Compose:
         return run(self._base() + ["build", *services],
                    timeout=timeout, check=True, env=self._env())
 
-    def down(self, timeout: int = 120) -> CmdResult:
+    def down(self, timeout: int = 120, keep_volumes: bool = False) -> CmdResult:
         # -v removes named volumes (fresh state), --remove-orphans cleans stragglers.
-        return run(self._base() + ["down", "-v", "--remove-orphans"], timeout=timeout)
+        # keep_volumes: the containers go, the logs stay (DR_STALE_DATA restarts on them).
+        args = ["down", "--remove-orphans"] if keep_volumes else ["down", "-v", "--remove-orphans"]
+        return run(self._base() + args, timeout=timeout)
 
     def stop(self, service: str, timeout: int = 60) -> CmdResult:
         return run(self._base() + ["stop", service], timeout=timeout)

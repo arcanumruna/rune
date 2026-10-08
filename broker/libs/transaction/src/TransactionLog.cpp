@@ -6,6 +6,7 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/transaction/TransactionLog.h>
+#include <rune/transaction/detail/Crc32c.h>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -13,7 +14,6 @@
 
 #include <cassert>
 #include <cstring>
-#include <mutex>
 #include <stdexcept>
 #include <system_error>
 
@@ -35,33 +35,10 @@ static T read_le(const uint8_t* p) noexcept { T v; std::memcpy(&v, p, sizeof(T))
 // ---------------------------------------------------------------------------
 // CRC32C software table (Castagnoli)
 // ---------------------------------------------------------------------------
-static uint32_t     crc32c_tbl[256];
-static std::once_flag crc32c_tbl_once;
-
-static void build_crc32c_table() noexcept {
-    for (uint32_t i = 0; i < 256; ++i) {
-        uint32_t crc = i;
-        for (int j = 0; j < 8; ++j) {
-            crc = (crc >> 1) ^ (0x82F63B78u & -(crc & 1u));
-        }
-        crc32c_tbl[i] = crc;
-    }
-}
-
-// A6: thread-safe one-time table init. build/extract are static and could be
-// called from a non-writer thread (e.g. a read-committed consumer verifying a
-// batch); std::call_once removes the data race on the lazy table fill.
-static void init_crc32c_table() noexcept {
-    std::call_once(crc32c_tbl_once, build_crc32c_table);
-}
-
 /*static*/
 uint32_t TransactionLog::crc32c(const uint8_t* data, std::size_t len, uint32_t crc) noexcept {
-    init_crc32c_table();
-    for (std::size_t i = 0; i < len; ++i) {
-        crc = (crc >> 8) ^ crc32c_tbl[(crc ^ data[i]) & 0xFFu];
-    }
-    return crc ^ 0xFFFFFFFFu;
+    // F15 S1: constexpr table (no std::call_once — shared-nothing law).
+    return detail::crc32c(data, len, crc);
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +88,7 @@ void TransactionLog::appendFromMetadata(const TransactionMetadata& meta,
     e.pendingNewProducerId    = meta.pendingNewProducerId;    // A2
     e.pendingNewProducerEpoch = meta.pendingNewProducerEpoch; // A2
     e.pendingOffsets          = meta.pendingOffsets;           // F3
+    e.fencingEpoch            = meta.fencingEpoch;             // F15 concern 3
     append(e);
 }
 
@@ -143,8 +121,8 @@ void TransactionLog::applyEntry(const TxnLogEntry& entry) {
     // F3: recover pending consumer-group offsets so a recovered PrepareCommit
     // can re-apply them on resolve (durable-before-visible ordering).
     meta.pendingOffsets          = entry.pendingOffsets;
-    // fencingEpoch is not persisted; reset to false on recover
-    meta.fencingEpoch      = false;
+    // F15 concern 3: fencingEpoch is persisted in header byte 27 (bit0).
+    meta.fencingEpoch      = entry.fencingEpoch;
 }
 
 // ---------------------------------------------------------------------------
@@ -157,7 +135,7 @@ void TransactionLog::applyEntry(const TxnLogEntry& entry) {
 //   [16..23]  int64   producerId
 //   [24..25]  int16   producerEpoch
 //   [26]      uint8   state
-//   [27]      uint8   _pad = 0
+//   [27]      uint8   flags: bit0 = fencingEpoch (F15; was always-0 padding)
 //   [28..31]  int32   coordinatorEpoch
 //   [32..35]  int32   txnTimeoutMs
 //   [36..37]  uint16  txnIdLen
@@ -230,7 +208,7 @@ void TransactionLog::appendRecord(const TxnLogEntry& entry) {
     write_le<int64_t> (p + 16, entry.producerId);
     write_le<int16_t> (p + 24, entry.producerEpoch);
     p[26] = static_cast<uint8_t>(entry.state);
-    p[27] = 0u; // padding
+    p[27] = entry.fencingEpoch ? 0x01u : 0u;   // flags (F15): bit0 = fencingEpoch
     write_le<int32_t> (p + 28, entry.coordinatorEpoch);
     write_le<int32_t> (p + 32, entry.txnTimeoutMs);
     write_le<uint16_t>(p + 36, txnIdLen);
@@ -276,16 +254,21 @@ void TransactionLog::appendRecord(const TxnLogEntry& entry) {
     pos += kChecksumSize;
     assert(pos == totalLength);
 
+    // fsyncgate (E1 review): the first write/fsync error is STICKY — a later "successful" fsync cannot
+    // vouch for pages the kernel already dropped, so no further append may report success.
+    if (failedErrno_ != 0) {
+        throw std::system_error(failedErrno_, std::system_category(),
+                                "TransactionLog: append refused, storage failed " + path_);
+    }
+    auto fail = [&](int err, const char* what) {
+        failedErrno_ = err != 0 ? err : EIO;
+        throw std::system_error(failedErrno_, std::system_category(), std::string("TransactionLog: ") + what + " " + path_);
+    };
+    if (writeFaultForTest_ != 0) fail(writeFaultForTest_, "pwrite");
     ssize_t written = ::pwrite(fd_, buf.data(), totalLength,
                                 static_cast<off_t>(writePos_));
-    if (written != static_cast<ssize_t>(totalLength)) {
-        throw std::system_error(errno, std::system_category(),
-                                "TransactionLog: pwrite " + path_);
-    }
-    if (::fsync(fd_) != 0) {
-        throw std::system_error(errno, std::system_category(),
-                                "TransactionLog: fsync " + path_);
-    }
+    if (written != static_cast<ssize_t>(totalLength)) fail(written < 0 ? errno : ENOSPC, "pwrite");
+    if (::fsync(fd_) != 0) fail(errno, "fsync");
     writePos_ += static_cast<int64_t>(totalLength);
 }
 
@@ -334,6 +317,7 @@ void TransactionLog::replayAndTruncate() {
         int64_t producerId        = read_le<int64_t> (rb + 16);
         int16_t producerEpoch     = read_le<int16_t> (rb + 24);
         uint8_t stateRaw          = rb[26];
+        const bool fencingFlag    = (rb[27] & 0x01u) != 0;   // F15: flags byte
         int32_t coordinatorEpoch  = read_le<int32_t> (rb + 28);
         int32_t txnTimeoutMs      = read_le<int32_t> (rb + 32);
         uint16_t txnIdLen         = read_le<uint16_t>(rb + 36);
@@ -415,6 +399,7 @@ void TransactionLog::replayAndTruncate() {
         entry.pendingNewProducerId    = pendingNewPid;                              // A2
         entry.pendingNewProducerEpoch = static_cast<ProducerEpoch>(pendingNewEpoch);// A2
         entry.pendingOffsets          = std::move(pendingOffsets);                   // F3
+        entry.fencingEpoch            = fencingFlag;                                 // F15
         applyEntry(entry);
 
         pos         += static_cast<int64_t>(totalLength);

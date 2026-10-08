@@ -49,6 +49,8 @@
 // for integration tests.  Bounded waits throughout.
 // ---------------------------------------------------------------------------
 
+#include <rune/aeronutil/testing/FreePort.h>
+#include "../support/TestNodeConfig.h"
 #include <gtest/gtest.h>
 
 // Gateway
@@ -57,6 +59,8 @@
 
 // Node / replication
 #include <rune/node/BrokerNode.h>
+#include <rune/node/EmbeddedDriver.h>
+#include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
 #include <rune/node/NodeConfig.h>
 #include "support/TestWorkerCount.h"
 #include <rune/node/ReplicaRegistry.h>
@@ -89,6 +93,7 @@ extern "C" {
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -98,6 +103,7 @@ extern "C" {
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 using namespace rune::replication;
+using namespace rune::node::test;  // F1: leoOnOwner/hwOnOwner/appendOnOwner/...
 namespace pc = rune::protocol::client;
 
 // ===========================================================================
@@ -131,20 +137,7 @@ static std::vector<uint8_t> makeBatch(int32_t recordCount,
 }
 
 static uint16_t gr5DiscoverFreeUdpPort() {
-    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) throw std::runtime_error("socket() failed");
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
-    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd); throw std::runtime_error("bind() failed");
-    }
-    socklen_t addrLen = sizeof(addr);
-    ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen);
-    const uint16_t netPort = addr.sin_port;
-    const uint16_t port = static_cast<uint16_t>((netPort >> 8) | ((netPort & 0xFFu) << 8));
-    ::close(fd);
-    return port;
+    return rune::aeronutil::testing::allocFreeUdpPort();   // D8: never an ephemeral port
 }
 
 static std::vector<uint16_t> gr5DiscoverFreePorts(int n) {
@@ -168,6 +161,7 @@ static rune::node::NodeConfig makeGr5Config(
     const std::vector<uint16_t>& rPorts)
 {
     rune::node::NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId              = nodeId;
     cfg.dataDir             = dataDir.string();
     cfg.consensusStreamId   = 30;
@@ -706,69 +700,27 @@ TEST(GR5_Unit, PendingAck_Bounded) {
 // ===========================================================================
 
 struct Gr5ClientDriver {
-    aeron_driver_context_t* driverCtx   = nullptr;
-    aeron_driver_t*         driver      = nullptr;
-    std::atomic<bool>       running{false};
-    std::thread             thread;
+    // One dedicated pumping thread (EmbeddedDriver::Threaded); no caller-side
+    // readiness pumping — aeron_driver_init/start already wrote cnc.dat and
+    // stamped the heartbeat synchronously before the driver thread even starts.
+    rune::node::EmbeddedDriver    driver;
     std::shared_ptr<aeron::Aeron> aeron;
 
-    explicit Gr5ClientDriver(const fs::path& aeronDir) {
-        fs::create_directories(aeronDir);
-
-        aeron_driver_context_init(&driverCtx);
-        aeron_driver_context_set_dir(driverCtx, aeronDir.string().c_str());
-        aeron_driver_context_set_threading_mode(driverCtx, AERON_THREADING_MODE_SHARED);
-        aeron_driver_context_set_dir_delete_on_start(driverCtx, true);
-        aeron_driver_context_set_dir_delete_on_shutdown(driverCtx, true);
-        aeron_driver_context_set_shared_idle_strategy(driverCtx, "sleep-ns");
-        aeron_driver_context_set_term_buffer_sparse_file(driverCtx, true);
-        aeron_driver_context_set_term_buffer_length(driverCtx, 64 * 1024);
-
-        EXPECT_EQ(aeron_driver_init(&driver, driverCtx), 0);
-        EXPECT_EQ(aeron_driver_start(driver, /*manual_main_loop=*/true), 0);
-
-        running.store(true, std::memory_order_release);
-        thread = std::thread([this]() {
-            while (running.load(std::memory_order_acquire)) {
-                aeron_driver_main_idle_strategy(
-                    driver, aeron_driver_main_do_work(driver));
-            }
-        });
-
-        const std::string cncPath = aeronDir.string() + "/cnc.dat";
-        for (int i = 0; i < 400; ++i) {
-            aeron_driver_main_do_work(driver);
-            if (fs::exists(cncPath)) break;
-            std::this_thread::sleep_for(1ms);
-        }
-
+    explicit Gr5ClientDriver(const fs::path& aeronDir)
+        : driver(makeCfg(aeronDir), rune::node::DriverMode::Threaded)
+    {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir.string());
         aeron = aeron::Aeron::connect(ctx);
     }
 
-    ~Gr5ClientDriver() {
-        aeron.reset();
-        if (running.exchange(false, std::memory_order_acq_rel)) {
-            if (thread.joinable()) thread.join();
-        }
-        if (driver) {
-            const auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::milliseconds{50};
-            while (std::chrono::steady_clock::now() < deadline) {
-                if (aeron_driver_main_do_work(driver) == 0) {
-                    aeron_driver_main_do_work(driver);
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::microseconds{200});
-            }
-            aeron_driver_close(driver);
-            driver = nullptr;
-        }
-        if (driverCtx) {
-            aeron_driver_context_close(driverCtx);
-            driverCtx = nullptr;
-        }
+private:
+    static rune::node::EmbeddedDriverConfig makeCfg(const fs::path& aeronDir) {
+        fs::create_directories(aeronDir);
+        rune::node::EmbeddedDriverConfig cfg;
+        cfg.dir             = aeronDir.string();
+        cfg.termBufferBytes = 256 * 1024;   // receiver window = term/2 must be >= the broker MTU (derived 65504 on loopback)
+        return cfg;
     }
 };
 
@@ -900,23 +852,10 @@ TEST(GR5_Integration, AcksAll_Deferred_HWGate) {
     ASSERT_TRUE(node1.awaitLeader(8s));
     ASSERT_TRUE(node2.awaitLeader(8s));
 
-    std::this_thread::sleep_for(300ms);
-
-    const rune::consensus::NodeId lid = node0.leaderId();
-    ASSERT_GE(lid, 0);
-    ASSERT_LE(lid, 2);
-
     std::array<rune::node::BrokerNode*, 3> allNodes{&node0, &node1, &node2};
-    rune::node::BrokerNode* leaderNode = allNodes[lid];
-
-    {
-        const auto roleDeadline = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < roleDeadline) {
-            if (leaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(10ms);
-        }
-    }
-    ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
+    const int lid = settledPartitionLeader(allNodes);   // D11: the partition leader, not the consensus leader
+    ASSERT_GE(lid, 0) << "no settled partition leader for topic 0 / partition 0";
+    rune::node::BrokerNode* leaderNode = allNodes[static_cast<std::size_t>(lid)];
 
     // Configure minIsr=2 on the leader gateway (3-node majority requires 2 replicas).
     leaderNode->setGatewayMinIsr(2);
@@ -935,8 +874,7 @@ TEST(GR5_Integration, AcksAll_Deferred_HWGate) {
     ASSERT_GT(conn.assignedSessionId, 0) << "failed to connect to leader gateway";
 
     // Get leader replica for HW inspection.
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr);
+    ASSERT_TRUE(hasReplica(*leaderNode));
 
     // --- Send acks=All produce ---
     constexpr int kNumRecords = 5;
@@ -989,9 +927,10 @@ TEST(GR5_Integration, AcksAll_Deferred_HWGate) {
     // (GR-9: HW is EXCLUSIVE — the response only fires when HW > lastOffset in
     // drainPendingAcks, i.e. HW >= lastOffset + 1 == kNumRecords.)
     const Offset lastOffset = static_cast<Offset>(kNumRecords - 1);
-    EXPECT_GT(leaderReplica->highWatermark(), lastOffset)
+    const Offset hwAtResponse = hwOnOwner(*leaderNode);
+    EXPECT_GT(hwAtResponse, lastOffset)
         << "acks=All ProduceResponse must not fire before HW > lastOffset; "
-        << "HW=" << leaderReplica->highWatermark()
+        << "HW=" << hwAtResponse
         << " lastOffset=" << lastOffset;
 
     conn.ingressPub.reset();
@@ -1051,41 +990,27 @@ TEST(GR5_Integration, MinIsr_FollowerKilled_Refuses) {
     ASSERT_TRUE(node0p->awaitLeader(8s));
     ASSERT_TRUE(node1p->awaitLeader(8s));
     ASSERT_TRUE(node2p->awaitLeader(8s));
-    std::this_thread::sleep_for(300ms);
-
-    const rune::consensus::NodeId lid = node0p->leaderId();
-    ASSERT_GE(lid, 0);
-    ASSERT_LE(lid, 2);
-
     std::array<rune::node::BrokerNode*, 3> allNodes{node0p.get(), node1p.get(), node2p.get()};
     std::array<std::unique_ptr<rune::node::BrokerNode>*, 3>
         owners{&node0p, &node1p, &node2p};
-    rune::node::BrokerNode* leaderNode = allNodes[lid];
-
-    {
-        const auto roleDeadline = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < roleDeadline) {
-            if (leaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(10ms);
-        }
-    }
-    ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
+    const int lid = settledPartitionLeader(allNodes);   // D11: the partition leader, not the consensus leader
+    ASSERT_GE(lid, 0) << "no settled partition leader for topic 0 / partition 0";
+    rune::node::BrokerNode* leaderNode = allNodes[static_cast<std::size_t>(lid)];
 
     // Set minIsr=2 on the leader gateway (requires both followers in ISR for acks=All).
     leaderNode->setGatewayMinIsr(2);
 
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr);
+    ASSERT_TRUE(hasReplica(*leaderNode));
 
     // Verify ISR starts at 3 (all nodes in sync).
     {
         const auto isrDeadline = std::chrono::steady_clock::now() + 5s;
         while (std::chrono::steady_clock::now() < isrDeadline) {
-            if (static_cast<int>(leaderReplica->isr().size()) >= 2) break;
+            if (isrSizeOnOwner(*leaderNode) >= 2) break;
             std::this_thread::sleep_for(20ms);
         }
     }
-    EXPECT_GE(static_cast<int>(leaderReplica->isr().size()), 2)
+    EXPECT_GE(isrSizeOnOwner(*leaderNode), 2)
         << "ISR must start with at least 2 nodes before killing a follower";
 
     // --- Start client driver ---
@@ -1168,7 +1093,7 @@ TEST(GR5_Integration, MinIsr_FollowerKilled_Refuses) {
 
             // Wait for ProduceResponse (any response for this produce).
             const int64_t thisCorrId = prodN.correlationId;
-            const Offset leoBeforeThis = leaderReplica->logEndOffset();
+            const Offset leoBeforeThis = leoOnOwner(*leaderNode);
             std::optional<pc::ProduceResponse> thisResp;
             {
                 aeron::FragmentAssembler pollAsm([&](aeron::concurrent::AtomicBuffer& buf,
@@ -1198,7 +1123,7 @@ TEST(GR5_Integration, MinIsr_FollowerKilled_Refuses) {
                 static_cast<int16_t>(pc::ErrorCode::MinIsrViolation)) {
                 // Got the rejection we're looking for.
                 // Verify no data was appended for this specific rejected produce.
-                EXPECT_EQ(leaderReplica->logEndOffset(), leoBeforeThis)
+                EXPECT_EQ(leoOnOwner(*leaderNode), leoBeforeThis)
                     << "MinIsrViolation must not advance LEO "
                     << "(leoBeforeThis=" << leoBeforeThis << ")";
                 rejResp = thisResp;
@@ -1212,7 +1137,7 @@ TEST(GR5_Integration, MinIsr_FollowerKilled_Refuses) {
     ASSERT_TRUE(rejResp.has_value())
         << "No MinIsrViolation received within 10s (ISR never dropped below minIsr=3 "
         << "after follower kill?). Current ISR size="
-        << leaderReplica->isr().size();
+        << isrSizeOnOwner(*leaderNode);
     EXPECT_EQ(rejResp->errorCode, static_cast<int16_t>(pc::ErrorCode::MinIsrViolation))
         << "Expected MinIsrViolation";
 
@@ -1276,33 +1201,19 @@ TEST(GR5_Integration, AcksAll_SingleRecord_NotAckedAtHwZero_GR9) {
     ASSERT_TRUE(node0p->awaitLeader(8s));
     ASSERT_TRUE(node1p->awaitLeader(8s));
     ASSERT_TRUE(node2p->awaitLeader(8s));
-    std::this_thread::sleep_for(300ms);
-
-    const rune::consensus::NodeId lid = node0p->leaderId();
-    ASSERT_GE(lid, 0);
-    ASSERT_LE(lid, 2);
-
     std::array<rune::node::BrokerNode*, 3> allNodes{
         node0p.get(), node1p.get(), node2p.get()};
     std::array<std::unique_ptr<rune::node::BrokerNode>*, 3>
         owners{&node0p, &node1p, &node2p};
-    rune::node::BrokerNode* leaderNode = allNodes[lid];
-
-    {
-        const auto roleDeadline = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < roleDeadline) {
-            if (leaderNode->replicationIsLeaderForTest()) break;
-            std::this_thread::sleep_for(10ms);
-        }
-    }
-    ASSERT_TRUE(leaderNode->replicationIsLeaderForTest());
+    const int lid = settledPartitionLeader(allNodes);   // D11: the partition leader, not the consensus leader
+    ASSERT_GE(lid, 0) << "no settled partition leader for topic 0 / partition 0";
+    rune::node::BrokerNode* leaderNode = allNodes[static_cast<std::size_t>(lid)];
 
     // minIsr=2: the single-record produce passes the ISR gate (3 in ISR) but
     // requires a MAJORITY (2 of 3) LEO>=1 for HW to advance past 0.
     leaderNode->setGatewayMinIsr(2);
 
-    PartitionReplica* leaderReplica = leaderNode->replicaForTest(0, 0);
-    ASSERT_NE(leaderReplica, nullptr);
+    ASSERT_TRUE(hasReplica(*leaderNode));
     rune::gateway::ClientGateway* leaderGw = leaderNode->gatewayForTest();
     ASSERT_NE(leaderGw, nullptr);
 
@@ -1371,18 +1282,45 @@ TEST(GR5_Integration, AcksAll_SingleRecord_NotAckedAtHwZero_GR9) {
         EXPECT_NE(anyResp->errorCode, static_cast<int16_t>(pc::ErrorCode::OK))
             << "GR-9 REGRESSION: single-record acks=All was acked OK while it "
                "cannot be majority-committed (both followers dead). HW="
-            << leaderReplica->highWatermark();
+            << hwOnOwner(*leaderNode);
     }
 
     // The leader's HW must be pinned at 0 (nothing majority-committed).
-    EXPECT_EQ(leaderReplica->highWatermark(), static_cast<Offset>(0))
+    EXPECT_EQ(hwOnOwner(*leaderNode), static_cast<Offset>(0))
         << "leader HW must stay 0 with no follower replication";
+
+    // Kafka model (DUR-1): the controller fences the dead followers out of the
+    // committed ISR (and the leader's lag check proposes the same) — once the
+    // committed ISR is below min-ISR an acks=all produce is REFUSED up front
+    // (NotEnoughReplicas), never deferred.  Either outcome satisfies GR-9 (never
+    // an OK); the deferred-entry check below applies only when the produce was
+    // accepted before the fencing landed.
+    const bool refusedUpFront =
+        anyResp.has_value() && anyResp->errorCode != static_cast<int16_t>(pc::ErrorCode::OK);
 
     // The record was appended to the leader log (LEO advanced) but the ack is
     // still deferred: the pending-ack entry must remain enqueued.
-    EXPECT_GE(leaderGw->pendingAckCount(), static_cast<std::size_t>(1))
-        << "acks=All entry for the single record must remain deferred "
-           "(HW=0 does NOT satisfy HW > lastOffset=0)";
+    // F15 I-A: a worker-owned partition's acks=all waiter is parked on the
+    // OWNING worker (the gateway's pendingAcks_ holds only inline-path acks), so
+    // read the worker's owed-ack count on that worker's thread.
+    const int32_t ownerWorker = leaderNode->workerForPartitionForTest(prod.topicId, prod.partition);
+    if (refusedUpFront) {
+        // refused (min-ISR): nothing to defer
+    } else if (ownerWorker >= 0) {
+        rune::node::Worker* w = leaderNode->workerForTest(ownerWorker);
+        ASSERT_NE(w, nullptr);
+        EXPECT_GE(leaderNode->onOwnerThreadForTest(prod.topicId, prod.partition,
+                      [w](rune::replication::PartitionReplica&) { return w->reservedAckSlotsForTest(); }),
+                  int64_t{1})
+            << "acks=All entry for the single record must remain deferred on the owning worker "
+               "(HW=0 does NOT satisfy HW > lastOffset=0)";
+    } else {
+        EXPECT_GE(leaderNode->onControlThreadForTest(
+                      [leaderGw] { return leaderGw->pendingAckCount(); }),
+                  static_cast<std::size_t>(1))
+            << "acks=All entry for the single record must remain deferred "
+               "(HW=0 does NOT satisfy HW > lastOffset=0)";
+    }
 
     // Cleanup.
     conn.ingressPub.reset();

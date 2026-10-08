@@ -47,6 +47,8 @@
 #include <string>
 #include <vector>
 
+#include <rune/storage/LogReadView.h>
+
 namespace rune::storage {
 
 /// Policy controlling behaviour when the ring reaches capacity.
@@ -153,6 +155,41 @@ public:
 
         return out;
     }
+
+    /// Zero-copy read (spec §3.5a.2): the CONTIGUOUS run of whole batches starting
+    /// at the batch containing startOffset, capped at maxBytes — the first batch is
+    /// always included (same progress guarantee as LogSegment::readView).  Stops at
+    /// a ring wrap (next batch not adjacent); the caller continues from nextOffset.
+    LogReadView readView(int64_t startOffset, int32_t maxBytes) noexcept {
+        if (startOffset < logStartOffset_ || entryCount_ == 0) return {};
+        std::size_t lo = 0, hi = entryCount_;
+        while (lo < hi) {
+            const std::size_t mid = lo + (hi - lo) / 2;
+            if (entryAt(mid).lastOffset < startOffset) lo = mid + 1; else hi = mid;
+        }
+        if (lo == entryCount_) return {};
+        const Entry& first = entryAt(lo);
+        LogReadView v;
+        v.data       = ring_.data() + first.ringOffset;
+        v.len        = first.length;
+        v.baseOffset = first.baseOffset;
+        v.nextOffset = first.lastOffset + 1;
+        const std::size_t cap = maxBytes > 0 ? static_cast<std::size_t>(maxBytes) : 0;
+        std::size_t end = first.ringOffset + first.length;
+        for (std::size_t i = lo + 1; i < entryCount_; ++i) {
+            const Entry& e = entryAt(i);
+            if (e.ringOffset != end) break;                   // wrapped: not contiguous
+            if (cap == 0 || v.len + e.length > cap) break;
+            v.len += e.length;
+            end   += e.length;
+            v.nextOffset = e.lastOffset + 1;
+        }
+        return v;
+    }
+
+    /// F27 R2: parity with Log::installGeneration() — an in-memory ring never
+    /// swaps segments; truncation/eviction change the LEO/view the memo also keys on.
+    [[nodiscard]] uint64_t installGeneration() const noexcept { return 0; }
 
     [[nodiscard]] int64_t logEndOffset() const noexcept {
         return logEndOffset_;

@@ -43,6 +43,7 @@
 #include <rune/gateway/TopicRegistry.h>
 
 // Node / coordination
+#include <rune/node/EmbeddedDriver.h>
 #include <rune/node/GroupCoordinationService.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/ReplicaRegistry.h>
@@ -140,8 +141,8 @@ static PartitionConfig makePartCfg(int32_t selfId = 1) {
 
 class NullTransport : public PartitionTransport {
 public:
-    void sendFetchRequest(const FetchRequestMsg&) override {}
-    void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { return true; }
 };
 
 // Build kN individual record batches (one per record) and write them to the log.
@@ -182,44 +183,24 @@ static uint16_t frameTemplateId(const uint8_t* buf, std::size_t len) {
 // Uses IPC so no network ports are needed.
 // ===========================================================================
 struct EmbeddedAeronDriver {
-    aeron_driver_context_t* driverCtx = nullptr;
-    aeron_driver_t*         driver    = nullptr;
-    std::atomic<bool>       running{false};
-    std::thread             thread;
-    std::shared_ptr<aeron::Aeron> aeron;
-    bool                    ok = false;
+    // One dedicated pumping thread (EmbeddedDriver::Threaded); no caller-side
+    // readiness pumping — aeron_driver_init/start already wrote cnc.dat and
+    // stamped the heartbeat synchronously before the driver thread even starts.
+    std::unique_ptr<rune::node::EmbeddedDriver> driver;
+    std::shared_ptr<aeron::Aeron>                aeron;
+    bool                                          ok = false;
 
     // Returns false on failure (call site checks ok flag).
     bool start(const std::string& aeronDir) {
         fs::create_directories(aeronDir);
-        aeron_driver_context_init(&driverCtx);
-        aeron_driver_context_set_dir(driverCtx, aeronDir.c_str());
-        aeron_driver_context_set_threading_mode(driverCtx, AERON_THREADING_MODE_SHARED);
-        aeron_driver_context_set_dir_delete_on_start(driverCtx, true);
-        aeron_driver_context_set_dir_delete_on_shutdown(driverCtx, true);
-        aeron_driver_context_set_shared_idle_strategy(driverCtx, "sleep-ns");
-        aeron_driver_context_set_term_buffer_sparse_file(driverCtx, true);
-        aeron_driver_context_set_term_buffer_length(driverCtx, 64 * 1024);
-
-        if (aeron_driver_init(&driver, driverCtx) != 0) return false;
-        if (aeron_driver_start(driver, /*manual_main_loop=*/true) != 0) return false;
-
-        running.store(true, std::memory_order_release);
-        thread = std::thread([this]() {
-            while (running.load(std::memory_order_acquire)) {
-                aeron_driver_main_idle_strategy(
-                    driver, aeron_driver_main_do_work(driver));
-            }
-        });
-
-        // Spin until cnc.dat appears (driver ready).
-        const std::string cncPath = aeronDir + "/cnc.dat";
-        for (int i = 0; i < 500; ++i) {
-            aeron_driver_main_do_work(driver);
-            if (fs::exists(cncPath)) break;
-            std::this_thread::sleep_for(1ms);
+        rune::node::EmbeddedDriverConfig cfg;
+        cfg.dir             = aeronDir;
+        cfg.termBufferBytes = 64 * 1024;
+        try {
+            driver = std::make_unique<rune::node::EmbeddedDriver>(cfg, rune::node::DriverMode::Threaded);
+        } catch (const std::exception&) {
+            return false;
         }
-        if (!fs::exists(cncPath)) return false;
 
         aeron::Context ctx;
         ctx.aeronDir(aeronDir);
@@ -231,22 +212,7 @@ struct EmbeddedAeronDriver {
 
     ~EmbeddedAeronDriver() {
         aeron.reset();
-        if (running.exchange(false, std::memory_order_acq_rel)) {
-            if (thread.joinable()) thread.join();
-        }
-        if (driver) {
-            const auto dl = std::chrono::steady_clock::now() + 50ms;
-            while (std::chrono::steady_clock::now() < dl) {
-                if (aeron_driver_main_do_work(driver) == 0) {
-                    aeron_driver_main_do_work(driver); break;
-                }
-                std::this_thread::sleep_for(200us);
-            }
-            aeron_driver_close(driver);   driver    = nullptr;
-        }
-        if (driverCtx) {
-            aeron_driver_context_close(driverCtx); driverCtx = nullptr;
-        }
+        driver.reset();
     }
 };
 
@@ -438,6 +404,52 @@ protected:
     }
 
     // -----------------------------------------------------------------------
+    // CG routing redesign: the coordinator creates no subscription at SyncGroup
+    // — the member subscribes explicitly to each assigned partition (on the
+    // partition's leader; here the single node) after its OffsetFetch, from
+    // the committed offset (else the log start).  Mirrors the client.
+    // Returns the subscription ids (from the captured SubscribeResponses).
+    // -----------------------------------------------------------------------
+    std::vector<int64_t> subscribeAssigned(int64_t sessionId, const std::string& group,
+                                           const std::string& memberId, int64_t corrBase) {
+        std::vector<int64_t> ids;
+        const auto& coord = service_->coordinator(group);
+        for (const auto& member : coord.members()) {
+            if (member.memberId != memberId) continue;
+            for (const auto& mtp : member.assignment) {
+                const auto committed = offsetStore_->fetch(group, mtp);
+                pc::Subscribe msg;
+                msg.sessionId      = sessionId;
+                msg.correlationId  = corrBase++;
+                msg.topicId        = kTopicId;
+                msg.partition      = mtp.partition;
+                msg.partitionKnown = 1;
+                msg.fromOffset     = committed.has_value() ? committed->offset : 0;
+                msg.isolation      = 0;
+                uint8_t buf[kBufSz]{};
+                const auto n = msg.encode(buf);
+                const std::size_t before = capturedFrames(sessionId).size();
+                gw_->applySubscribeForTest(buf, n);
+                const auto frames = capturedFrames(sessionId);
+                for (std::size_t i = before; i < frames.size(); ++i) {
+                    const auto r = pc::SubscribeResponse::decode(frames[i].bytes.data(), frames[i].bytes.size());
+                    if (r && r->correlationId == msg.correlationId && r->errorCode == 0) ids.push_back(r->subscriptionId);
+                }
+            }
+        }
+        return ids;
+    }
+    void unsubscribe(int64_t sessionId, int64_t subscriptionId) {
+        pc::Unsubscribe msg;
+        msg.sessionId      = sessionId;
+        msg.correlationId  = 0;
+        msg.subscriptionId = subscriptionId;
+        uint8_t buf[kBufSz]{};
+        const auto n = msg.encode(buf);
+        gw_->applyUnsubscribeForTest(buf, n);
+    }
+
+    // -----------------------------------------------------------------------
     // Drive service_->doWork until predicate or cap.
     // -----------------------------------------------------------------------
     bool driveUntil(std::function<bool()> pred, int cap = kCap) {
@@ -546,14 +558,14 @@ TEST_F(CG4DeliveryFixture, EachPartitionToExactlyOneMember) {
     });
     ASSERT_TRUE(stable) << "Must reach Stable after both members re-join";
 
-    // SyncGroup for each member — this triggers addGroupSubscription inside
-    // handleSyncGroup (subscriptions are created on SyncGroup OK, not on Stable).
+    // SyncGroup for each member; then each subscribes explicitly (redesign:
+    // the coordinator creates no subscription).
     EXPECT_EQ(doSync(sess1, 5, group, m1), 0) << "m1 SyncGroup must succeed";
     EXPECT_EQ(doSync(sess2, 6, group, m2), 0) << "m2 SyncGroup must succeed";
-
-    // Service should have called addGroupSubscription for each member×partition.
-    EXPECT_EQ(gw_->groupMemberSubCount(sess1), 1u) << "m1 must own 1 group sub";
-    EXPECT_EQ(gw_->groupMemberSubCount(sess2), 1u) << "m2 must own 1 group sub";
+    EXPECT_EQ(gw_->subscriptionCount(), 0u) << "SyncGroup must not create subscriptions";
+    EXPECT_EQ(subscribeAssigned(sess1, group, m1, 100).size(), 1u);
+    EXPECT_EQ(subscribeAssigned(sess2, group, m2, 200).size(), 1u);
+    EXPECT_EQ(gw_->groupMemberSubCount(sess1), 0u) << "no coordinator-owned group subs";
     EXPECT_EQ(gw_->subscriptionCount(), 2u);
 
     // Pump pushSubscriptions to deliver Records.
@@ -629,10 +641,12 @@ TEST_F(CG4DeliveryFixture, ResumeFromCommittedOffset) {
     });
     ASSERT_TRUE(stable);
 
-    // SyncGroup for each member — triggers addGroupSubscription (reads committed
-    // offset at this point, so the subscription starts from the committed offset).
+    // SyncGroup for each member, then the explicit subscriptions from the
+    // committed offset (the member's OffsetFetch answer).
     EXPECT_EQ(doSync(sess1, 14, group, m1), 0) << "m1 SyncGroup must succeed";
     EXPECT_EQ(doSync(sess2, 15, group, m2), 0) << "m2 SyncGroup must succeed";
+    EXPECT_EQ(subscribeAssigned(sess1, group, m1, 100).size(), 1u);
+    EXPECT_EQ(subscribeAssigned(sess2, group, m2, 200).size(), 1u);
 
     // Determine which member owns p0 (via coordinator assignment).
     const auto& coord = service_->coordinator(group);
@@ -710,26 +724,30 @@ TEST_F(CG4DeliveryFixture, EagerRevokeAndReassign) {
     });
     ASSERT_TRUE(stable) << "Phase 1 must reach Stable";
 
-    // SyncGroup for each member — triggers addGroupSubscription.
+    // SyncGroup for each member, then the members' explicit subscriptions.
     EXPECT_EQ(doSync(sess1, 28, group, m1), 0) << "m1 Phase1 SyncGroup must succeed";
     EXPECT_EQ(doSync(sess2, 29, group, m2), 0) << "m2 Phase1 SyncGroup must succeed";
-
-    // Service must have added group subs for the 2 members.
+    const auto ids1 = subscribeAssigned(sess1, group, m1, 100);
+    const auto ids2 = subscribeAssigned(sess2, group, m2, 200);
     EXPECT_EQ(gw_->subscriptionCount(), 2u)
-        << "Phase 1: 2 members, 2 partitions → 2 group subs";
+        << "Phase 1: 2 members, 2 partitions → 2 member subscriptions";
 
     // Phase 2: 3rd member joins → triggers rebalance.
+    clearFrames(sess1);
+    clearFrames(sess2);
     const int64_t sess3 = injectSession();
     const std::string m3 = doJoin(sess3, 24, group);
     ASSERT_FALSE(m3.empty());
 
-    // After 3rd join, coordinator moves to PreparingRebalance.
-    // The service (in doWork) fires onEnterPreparingRebalance → revokes subs.
-    const bool revoked = driveUntil([&] {
-        return gw_->subscriptionCount() == 0;
+    // After the 3rd join the coordinator revokes eagerly: an empty Assign to
+    // every existing member, which (the client) unsubscribes its partitions.
+    const bool revokeSent = driveUntil([&] {
+        return !controlFrames(sess1).empty() && !controlFrames(sess2).empty();
     }, 50);
-    EXPECT_TRUE(revoked)
-        << "After 3rd member joins, eager revoke must drop all group subs to 0";
+    EXPECT_TRUE(revokeSent) << "After 3rd member joins, each existing member must get a revoke Assign";
+    for (const int64_t id : ids1) unsubscribe(sess1, id);
+    for (const int64_t id : ids2) unsubscribe(sess2, id);
+    EXPECT_EQ(gw_->subscriptionCount(), 0u) << "the members' Unsubscribes drop their subscriptions";
 
     // All 3 members re-join for Phase 2.
     doJoin(sess1, 25, group, m1);
@@ -861,6 +879,128 @@ TEST_F(CG4DeliveryFixture, AssignFramesDelivered) {
 // ===========================================================================
 // Pure encode/decode unit tests — kept from original (no orchestration).
 // ===========================================================================
+
+// Redesign regression: SyncGroup must NOT create the member's subscriptions
+// (they pushed before the member knew its position — records dropped, cursor
+// ahead: stalled / lost partitions).  RED on main: one group sub per member.
+TEST_F(CG4DeliveryFixture, SyncGroupCreatesNoSubscriptionRegression) {
+    const std::string group = "g-cg-no-auto-sub";
+    const int64_t sess1 = injectSession();
+    const std::string m1 = doJoin(sess1, 1, group);
+    ASSERT_FALSE(m1.empty());
+    doJoin(sess1, 2, group, m1);
+    ASSERT_TRUE(driveUntil([&] { return service_->coordinator(group).state() == GroupState::Stable; }));
+    ASSERT_EQ(doSync(sess1, 3, group, m1), 0);
+    EXPECT_EQ(gw_->subscriptionCount(), 0u);
+    EXPECT_EQ(gw_->groupMemberSubCount(sess1), 0u);
+    pumpPush(20);
+    for (const auto& f : capturedFrames(sess1)) {
+        EXPECT_FALSE(pc::Records::decode(f.bytes.data(), f.bytes.size()).has_value())
+            << "records pushed before the member subscribed";
+    }
+}
+
+// Redesign regression: session ids and subscription ids are cluster-unique —
+// the node id is in the high bits ((nodeId + 1) << 40), so two nodes never
+// hand a client the same id (a client holding one session per node
+// demultiplexes Records by subscriptionId).  RED on main: small per-node
+// counters (1, 2, ...) collided across nodes.
+TEST_F(CG4DeliveryFixture, SessionAndSubscriptionIdsCarryTheNodeIdRegression) {
+    const int64_t prefix = int64_t{2} << 40;  // (thisNodeId 1 + 1) << 40
+    const int64_t sess1  = injectSession();
+    EXPECT_EQ(sess1 >> 40, 2) << "session id " << sess1 << " lacks the node prefix";
+    EXPECT_GT(sess1, 0);
+    pc::Subscribe msg;
+    msg.sessionId      = sess1;
+    msg.correlationId  = 7;
+    msg.topicId        = kTopicId;
+    msg.partition      = 0;
+    msg.partitionKnown = 1;
+    uint8_t buf[kBufSz]{};
+    gw_->applySubscribeForTest(buf, msg.encode(buf));
+    int64_t subId = 0;
+    for (const auto& f : capturedFrames(sess1)) {
+        const auto r = pc::SubscribeResponse::decode(f.bytes.data(), f.bytes.size());
+        if (r && r->correlationId == 7) subId = r->subscriptionId;
+    }
+    EXPECT_EQ(subId & ~((int64_t{1} << 40) - 1), prefix) << "subscription id " << subId << " lacks the node prefix";
+    EXPECT_GT(subId & ((int64_t{1} << 40) - 1), 0);
+}
+
+// Only the owning session may Unsubscribe a subscription (a stale client
+// episode or another client naming the id is ignored).  RED on main: any
+// session's Unsubscribe removed it.
+TEST_F(CG4DeliveryFixture, UnsubscribeFromAnotherSessionIsIgnoredRegression) {
+    const int64_t owner = injectSession();
+    const int64_t other = injectSession();
+    pc::Subscribe msg;
+    msg.sessionId      = owner;
+    msg.correlationId  = 9;
+    msg.topicId        = kTopicId;
+    msg.partition      = 1;
+    msg.partitionKnown = 1;
+    uint8_t buf[kBufSz]{};
+    gw_->applySubscribeForTest(buf, msg.encode(buf));
+    ASSERT_EQ(gw_->subscriptionCount(), 1u);
+    int64_t subId = 0;
+    for (const auto& f : capturedFrames(owner)) {
+        const auto r = pc::SubscribeResponse::decode(f.bytes.data(), f.bytes.size());
+        if (r && r->correlationId == 9) subId = r->subscriptionId;
+    }
+    ASSERT_NE(subId, 0);
+    unsubscribe(other, subId);
+    EXPECT_EQ(gw_->subscriptionCount(), 1u) << "another session removed the subscription";
+    unsubscribe(owner, subId);
+    EXPECT_EQ(gw_->subscriptionCount(), 0u);
+}
+
+// CG routing round 3 (MAJOR-1): the gateway's Records pushes carry the
+// creating Subscribe's correlationId.  RED: 0.
+TEST_F(CG4DeliveryFixture, GatewayRecordsCarryTheSubscribeCorrelationIdRegression) {
+    const int64_t sess = injectSession();
+    pc::Subscribe msg;
+    msg.sessionId      = sess;
+    msg.correlationId  = 0x2000000000000777LL;
+    msg.topicId        = kTopicId;
+    msg.partition      = 0;
+    msg.partitionKnown = 1;
+    msg.fromOffset     = 0;
+    uint8_t buf[kBufSz]{};
+    gw_->applySubscribeForTest(buf, msg.encode(buf));
+    pumpPush(30);
+    int records = 0;
+    for (const auto& f : capturedFrames(sess)) {
+        const auto r = pc::Records::decode(f.bytes.data(), f.bytes.size());
+        if (!r) continue;
+        ++records;
+        EXPECT_EQ(r->correlationId, 0x2000000000000777LL);
+    }
+    EXPECT_GT(records, 0) << "precondition: the partition has records";
+}
+
+// CG routing round 3 (MAJOR-2): a JoinGroup from a client below version 3 is
+// refused (ErrorCode::ProtocolVersion, non-retriable) — that client relies on
+// coordinator-created subscriptions this broker no longer makes.  RED: joined.
+TEST_F(CG4DeliveryFixture, JoinGroupFromAnOldClientIsRefusedRegression) {
+    const int64_t sess = gw_->injectTestSession(clock_, /*clientVersion=*/2);
+    pc::JoinGroup msg;
+    msg.sessionId        = sess;
+    msg.correlationId    = 1;
+    msg.sessionTimeoutMs = 5000;
+    const std::string group = "g-old-client";
+    msg.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+    std::array<int32_t, 1> topics{kTopicId};
+    uint8_t req[kBufSz]{}, out[kBufSz]{};
+    const auto reqLen = msg.encode(req, std::span<const int32_t>(topics));
+    const auto outLen = service_->handleJoinGroup(req, reqLen, clock_, out, kBufSz);
+    const auto resp = pc::JoinGroupResponse::decode(out, outLen);
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::ProtocolVersion));
+    EXPECT_TRUE(resp->memberId.empty());
+    // A current client joins.
+    const int64_t cur = injectSession();
+    EXPECT_FALSE(doJoin(cur, 2, group).empty());
+}
 
 TEST(CG4_AssignFrameEncodeDecode, FullAssign) {
     static constexpr std::size_t kBufSz2 = 512;

@@ -57,6 +57,8 @@ RUN conan install . --output-folder=conan-release --build=missing -s build_type=
 # in this image. Supplied via a BuildKit named build context:
 #   docker build --build-context rune-protocol=../rune-protocol ...
 COPY --from=rune-protocol include /rune-protocol/include
+# GSO-1 / A7: rune_gso + rune_driver_wake compile rune-protocol C sources (src/net).
+COPY --from=rune-protocol src     /rune-protocol/src
 
 # ── rune-fr flight recorder sibling (compiled: src + include) ─────────────────
 # The root CMakeLists wires add_library(rune_fr ...) from ${SRC}/../rune-fr, which
@@ -65,6 +67,16 @@ COPY --from=rune-protocol include /rune-protocol/include
 # BuildKit named build context `rune-fr` (see docker-compose additional_contexts).
 COPY --from=rune-fr src     /rune-fr/src
 COPY --from=rune-fr include /rune-fr/include
+
+# ── rune-codec (0a) sibling (compiled: src + include) ─────────────────────────
+# The root CMakeLists wires add_library(rune_codec ...) from ${RUNE_CODEC_ROOT}
+# (default ${SRC}/../rune-codec → /rune-codec here) and links it into rune_node.
+# rune-codec is COMPILED (Serialize/Record/Validator/Generator), so copy BOTH its
+# sources and headers.  Supplied via the BuildKit named build context `rune-codec`
+# (see docker-compose additional_contexts).  The CMake configure below passes
+# -DRUNE_CODEC_ROOT=/rune-codec so the sibling path resolves inside the image.
+COPY --from=rune-codec src     /rune-codec/src
+COPY --from=rune-codec include /rune-codec/include
 
 # ── Application sources (copied last so edits don't bust the conan cache) ─────
 COPY . .
@@ -75,6 +87,9 @@ RUN cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=OFF \
         -DBUILD_BENCHMARKS=OFF \
+        -DBUILD_INTEGRATION_TESTING=OFF \
+        -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
+        -DRUNE_CODEC_ROOT=/rune-codec \
     && cmake --build build --target rune_broker rune_role
 
 # gcc-13's libstdc++ is newer than bookworm-slim's; stage it for the runtime.
@@ -102,8 +117,9 @@ COPY --from=builder /build/build/rune_broker /usr/local/bin/rune_broker
 # rune_role: standalone Aeron role-counter reader — the dr-e2e harness runs it
 # via `docker exec` to detect leadership from counters (not log scraping).
 COPY --from=builder /build/build/rune_role /usr/local/bin/rune_role
-COPY --from=builder /build/libstdc++.so.6 /usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.32
-RUN ldconfig
+# Multi-arch: the multiarch lib dir is x86_64-linux-gnu or aarch64-linux-gnu (= uname -m).
+COPY --from=builder /build/libstdc++.so.6 /tmp/libstdc++.so.6.0.32
+RUN mv /tmp/libstdc++.so.6.0.32 /usr/lib/$(uname -m)-linux-gnu/libstdc++.so.6.0.32 && ldconfig
 
 # Entrypoint (defaults RUNE_DATA_DIR, exec's the binary as PID 1 → clean SIGTERM).
 COPY docker/entrypoint.sh /entrypoint.sh

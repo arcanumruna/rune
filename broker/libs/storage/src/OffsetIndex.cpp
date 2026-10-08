@@ -60,6 +60,23 @@ OffsetPosition OffsetIndex::lookup(int64_t target) const {
     if (slot < 0) return { baseOffset_, 0 };
     return parseEntry(slot);
 }
+int64_t OffsetIndex::truncateToPosition(int64_t pos) noexcept {
+    uint8_t* p = const_cast<uint8_t*>(file_->data());
+    while (entries_ > 0) {
+        int32_t epos = 0;
+        std::memcpy(&epos, p + static_cast<size_t>(entries_ - 1) * static_cast<size_t>(kEntrySize) + 4, 4);
+        if (epos < pos) break;
+        std::memset(p + static_cast<size_t>(entries_ - 1) * static_cast<size_t>(kEntrySize), 0,
+                    static_cast<size_t>(kEntrySize));
+        --entries_;
+    }
+    lastSearchLow_ = 0;
+    if (entries_ == 0) return -1;
+    int32_t last = 0;
+    std::memcpy(&last, p + static_cast<size_t>(entries_ - 1) * static_cast<size_t>(kEntrySize) + 4, 4);
+    return last;
+}
+
 void OffsetIndex::rebuildEntries() {
     entries_ = 0;
     const uint8_t* p = file_->data();

@@ -21,7 +21,6 @@
 #include <rune/consensus/ElectionState.h>
 #include <rune/consensus/Types.h>
 
-#include <atomic>
 #include <cstdint>
 
 namespace rune::consensus {
@@ -75,6 +74,9 @@ public:
     // -----------------------------------------------------------------------
     // ConsensusMessageHandler overrides — forward to election_
     // -----------------------------------------------------------------------
+
+    void onCandidacyState(int64_t nowNs, NodeId fromMember,
+                          const CandidacyState& state) override;
 
     void onCanvassPosition(
         int64_t nowNs,
@@ -131,6 +133,8 @@ public:
         int64_t logPosition,
         NodeId  leaderMemberId) override;
 
+    void onStandDown(int64_t nowNs, Term leadershipTermId, NodeId leaderMemberId) override;
+
     // -----------------------------------------------------------------------
     // Accessors
     // -----------------------------------------------------------------------
@@ -142,9 +146,9 @@ public:
     bool isClosed()       const noexcept { return election_.isClosed(); }
 
     // Total ingress messages processed since construction (for tests).
-    int64_t messagesProcessed() const noexcept {
-        return messagesProcessed_.load(std::memory_order_acquire);
-    }
+    // F9a: owner-thread state — read it on the duty-cycle thread, or after the
+    // AgentRunner was joined (join = happens-before).  Never cross-thread live.
+    int64_t messagesProcessed() const noexcept { return messagesProcessed_; }
 
 private:
     // The stored nowNs during a doWork() — used by onXxx handlers
@@ -153,10 +157,12 @@ private:
 
     Election&         election_;
     IngressRing&      ingressRing_;
-    ConsensusAdapter  adapter_;   // dispatches decoded frames back to *this
+    // Concrete (final) handler: every decoded message is a DIRECT call (fix 2, B2).
+    BasicConsensusAdapter<ConsensusAgent> adapter_;   // dispatches decoded frames back to *this
 
     // Count of ingress messages dispatched (for integration-test assertions).
-    std::atomic<int64_t> messagesProcessed_{0};
+    // Duty-cycle-thread-owned plain counter (F9a: no atomics).
+    int64_t messagesProcessed_{0};
 };
 
 } // namespace rune::consensus

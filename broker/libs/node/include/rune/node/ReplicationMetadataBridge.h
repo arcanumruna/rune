@@ -16,6 +16,10 @@
 //     Rationale: __cluster_metadata's own leadership cannot come from the map it
 //     holds (bootstrap chicken-and-egg); MD1-4/MD1-6 rely on this path to emit
 //     assignments.
+//     Re-review 2026-10-04 MEDIUM-B: with setCoordinatorPartitionsOnController
+//     (multi-node), -1 / -2 instead follow the committed map like USER
+//     partitions (the controller assigns them — see
+//     MetadataService::decideCoordinatorPartition); only -3 stays here.
 //
 //   USER partitions (topicId >= 0):
 //     Follow the COMMITTED assignment map (apply-committed-only — never pending):
@@ -63,6 +67,8 @@
 #include <rune/metadata/MetadataStateMachine.h>
 
 #include <atomic>
+#include <deque>
+#include <string>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -138,6 +144,14 @@ public:
         workerPool_ = pool;
     }
 
+    /// Re-review 2026-10-04 MEDIUM-B: the coordinator partitions
+    /// (__consumer_offsets -1, __transaction_state -2) are on the controller-
+    /// ISR path (MetadataService::decideCoordinatorPartition): when on, they are
+    /// driven from the COMMITTED assignment map exactly like user partitions
+    /// (Step B; never deleted), not from consensus leadership (Step A).
+    /// BrokerNode turns it on multi-node.  Duty-cycle thread.
+    void setCoordinatorPartitionsOnController(bool on) noexcept { coordinatorOnController_ = on; }
+
     // -----------------------------------------------------------------------
     // doWork — single duty-cycle step.
     //
@@ -167,7 +181,10 @@ public:
             currentEpoch = lastObservedEpoch_;
         }
 
-        int work = 0;
+        // Task 10 round-3 addendum: role ops the worker ring could not take
+        // (back-pressure / full ring) are retried every cycle, in order, until
+        // delivered — never silently dropped.  Time-independent (no timers).
+        int work = flushPendingRoleOps_();
 
         // ── Step A: INTERNAL partitions ──────────────────────────────────────
         // Drive internal partitions (topicId < 0) from cluster-consensus
@@ -189,6 +206,9 @@ public:
             for (auto* replica : registry_.allReplicas()) {
                 if (!replica) continue;
                 if (replica->topicId() >= 0) continue;  // skip user partitions
+                // MEDIUM-B: coordinator partitions follow the committed map
+                // (Step B), not consensus leadership.
+                if (coordinatorOnController_ && isCoordinatorTopic_(replica->topicId())) continue;
 
                 if (selfIsClusterLeader) {
                     routeBecomeLeader_(replica, currentEpoch, allReplicaIds_);
@@ -285,18 +305,20 @@ private:
 
         // Apply role transitions for user partitions only.
         // electedLeaders + leaderUpdates → becomeLeader
+        // MEDIUM-B: plus the coordinator partitions when they are on the
+        // controller path (mapDriven_).
         for (const auto& key : delta.electedLeaders) {
-            if (key.topicId < 0) continue;  // only user partitions (guard)
+            if (!mapDriven_(key.topicId)) continue;  // user (+ coordinator) partitions only
             applyBecomeLeaderForKey(key, currentMap);
         }
         for (const auto& key : delta.leaderUpdates) {
-            if (key.topicId < 0) continue;
+            if (!mapDriven_(key.topicId)) continue;
             applyBecomeLeaderForKey(key, currentMap);
         }
 
         // followers → becomeFollower
         for (const auto& key : delta.followers) {
-            if (key.topicId < 0) continue;
+            if (!mapDriven_(key.topicId)) continue;
             applyBecomeFollowerForKey(key, currentMap);
         }
 
@@ -332,12 +354,91 @@ private:
     void routeBecomeLeader_(
         rune::replication::PartitionReplica*          replica,
         rune::replication::Epoch                      epoch,
-        std::vector<rune::replication::NodeId>        isr) noexcept;
+        std::vector<rune::replication::NodeId>        isr,
+        int32_t                                       partitionEpoch = -1) noexcept;
+    /// F15 §3.1: record the role just routed as the gateway's intended-role hint.
+    void recordIntendedRole_(rune::replication::PartitionReplica* replica,
+                             ReplicaRegistry::IntendedRole role) noexcept;
+
+    // -----------------------------------------------------------------------
+    // Role ops not yet accepted by the owning worker's ring (Task 10 round-3
+    // addendum; round 4 M2):
+    //   - one FIFO PER OWNING WORKER: a full ring on one worker never holds back
+    //     role ops for the others (no cross-worker head-of-line blocking);
+    //   - per-replica order is preserved (nothing is attempted directly while an
+    //     older op waits in that worker's queue);
+    //   - a newer role op for a replica that already has one pending SUPERSEDES
+    //     it in place (BecomeLeader / BecomeFollower are absolute, epoch-stamped
+    //     states: only the latest matters) — the queue is bounded by the number
+    //     of replicas, not by the churn rate;
+    //   - each entry refers to its replica by (topic, partition, incarnation)
+    //     ONLY and is re-resolved through the registry at delivery: an op whose
+    //     replica was removed / re-registered meanwhile is dropped without
+    //     dereferencing anything (it would be stamped stale and refused anyway);
+    //   - growth is warned, rate-limited (each doubling past 64).
+    // A back-pressured REMOVAL FENCE (applyDeleteForKey) is either delivered or
+    // provably moot — see flushPendingRoleOps_ in the .cpp for the argument.
+    // -----------------------------------------------------------------------
+    struct PendingRoleOp {
+        WorkerOp op;
+        uint32_t incarnation = 0;
+        bool     fence       = false;   // the removal fence of applyDeleteForKey
+    };
+    std::vector<std::deque<PendingRoleOp>> pendingRoleOps_;   // indexed by owning worker
+    std::size_t pendingRoleOpsTotal_ = 0;
+    std::size_t pendingWarnAt_       = 64;
+    uint64_t    roleOpsCoalesced_    = 0;
+    uint64_t    fencesMoot_          = 0;
+    uint64_t    staleRoleOpsDropped_ = 0;
+    // M1: a std::logic_error from WorkerPool (the F7 ownership invariant, raised
+    // inside the inline reconcile of tryEnqueueOp) must not cross this
+    // noexcept chain (std::terminate).  It is caught at the bridge boundary and
+    // handed to NodeRuntimeAgent, which routes it to the halt path (exit 70).
+    bool        fatalPending_ = false;
+    std::string fatalWhat_;
+    void enqueueRoleOp_(WorkerOp op, bool fence) noexcept;
+    int  flushPendingRoleOps_() noexcept;
+    bool tryRoute_(WorkerOp op) noexcept;
+
+public:
+    /// Test-only.
+    void routeBecomeLeaderForTest(rune::replication::PartitionReplica* r, rune::replication::Epoch e,
+                                  std::vector<rune::replication::NodeId> isr) noexcept {
+        routeBecomeLeader_(r, e, std::move(isr));
+    }
+    void routeBecomeFollowerForTest(rune::replication::PartitionReplica* r, rune::replication::Epoch e,
+                                    rune::replication::NodeId leader) noexcept {
+        routeBecomeFollower_(r, e, leader);
+    }
+    [[nodiscard]] std::size_t pendingRoleOpsForTest() const noexcept { return pendingRoleOpsTotal_; }
+    [[nodiscard]] std::size_t pendingRoleOpsForWorkerForTest(std::size_t w) const noexcept {
+        return w < pendingRoleOps_.size() ? pendingRoleOps_[w].size() : 0;
+    }
+    [[nodiscard]] uint64_t roleOpsCoalescedForTest() const noexcept { return roleOpsCoalesced_; }
+    [[nodiscard]] uint64_t fencesMootForTest() const noexcept { return fencesMoot_; }
+    int flushPendingRoleOpsForTest() noexcept { return flushPendingRoleOps_(); }
+    void routeRemovalFenceForTest(rune::replication::PartitionReplica* r, rune::replication::Epoch e) noexcept {
+        routeBecomeFollower_(r, e, rune::metadata::NO_LEADER, /*fence=*/true);
+    }
+    void applyDeleteForTest(int32_t topicId, int32_t partition) noexcept {
+        applyDeleteForKey(rune::metadata::PartitionKey{topicId, partition}, prevMap_);
+    }
+
+    /// M1: an invariant violation caught at the bridge boundary (once).
+    /// NodeRuntimeAgent takes it after doWork and halts (exit 70).
+    [[nodiscard]] bool takeFatal(std::string& what) noexcept {
+        if (!fatalPending_) return false;
+        fatalPending_ = false;
+        what = std::move(fatalWhat_);
+        return true;
+    }
+private:
 
     void routeBecomeFollower_(
         rune::replication::PartitionReplica*  replica,
         rune::replication::Epoch              epoch,
-        rune::replication::NodeId             leaderId) noexcept;
+        rune::replication::NodeId             leaderId,
+        bool                                  fence = false) noexcept;
 
     void applyBecomeLeaderForKey(
         const rune::metadata::PartitionKey& key,
@@ -360,7 +461,7 @@ private:
             isr.push_back(static_cast<rune::replication::NodeId>(n));
         }
 
-        routeBecomeLeader_(replica, perPartEpoch, std::move(isr));
+        routeBecomeLeader_(replica, perPartEpoch, std::move(isr), pa->partitionEpoch);
     }
 
     void applyBecomeFollowerForKey(
@@ -416,9 +517,13 @@ private:
         const rune::replication::Epoch fenceEpoch =
             pa ? static_cast<rune::replication::Epoch>(pa->leaderEpoch) : 0;
 
-        replica->becomeFollower(fenceEpoch, rune::metadata::NO_LEADER);
+        // Task 10 fix 3: a USER replica is owned by a worker — fence it on the
+        // owner's thread (routed role op, FIFO before the SetOwnership that drops
+        // it), never by a direct cross-thread call.  Internal: direct (control).
+        routeBecomeFollower_(replica, fenceEpoch, rune::metadata::NO_LEADER, /*fence=*/true);
 
-        // Quarantine: erase from routing.  The replica is destroyed here.
+        // Quarantine: erase from routing.  The replica is RETIRED in the registry
+        // and freed only after every worker acked the SetOwnership that drops it.
         registry_.remove(key.topicId, key.partition);
     }
 
@@ -426,7 +531,12 @@ private:
     // Fields
     // -----------------------------------------------------------------------
 
+    [[nodiscard]] static constexpr bool isCoordinatorTopic_(int32_t t) noexcept { return t == -1 || t == -2; }
+    [[nodiscard]] bool mapDriven_(int32_t t) const noexcept {
+        return t >= 0 || (coordinatorOnController_ && isCoordinatorTopic_(t));
+    }
     rune::consensus::NodeId                        selfId_;
+    bool                                           coordinatorOnController_ = false;   ///< MEDIUM-B
     std::vector<rune::replication::NodeId>         allReplicaIds_;
     ReplicaRegistry&                               registry_;
 

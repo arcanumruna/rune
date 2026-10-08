@@ -14,9 +14,11 @@
 // ExclusivePublication (in UdpMessageSink) and Subscription (in AeronIngress)
 // are accessed from the same thread. Correct.
 //
-// Also mirrors the atomic leader-id update: when onNewLeadershipTerm is
-// accepted (leaderMemberId known + Closed/FollowerReady reached), the agent
-// updates observedLeaderId_ so observer threads can read it via leaderId().
+// Also mirrors the observed leader id: when onNewLeadershipTerm is accepted
+// (leaderMemberId known + Closed/FollowerReady reached), the agent updates
+// observedLeaderId_.  F9a: that field is a plain duty-cycle-owned value —
+// leaderId() is for the duty-cycle thread only.  Observer threads learn the
+// leader via LeaderObserver's ring (published once per cycle by the runtime).
 
 #include <rune/consensus/ConsensusAgent.h>
 #include <rune/consensus/AeronIngress.h>
@@ -25,7 +27,6 @@
 #include <rune/consensus/Types.h>
 #include <rune_fr/FlightRecorder.h>
 
-#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -48,10 +49,7 @@ public:
         , consensusAgent_(consensusAgent)
         , election_(election)
         , nodeId_(nodeId)
-    {
-        // kNullLeaderId = -1 (no leader known yet)
-        observedLeaderId_.store(-1, std::memory_order_relaxed);
-    }
+    {}
 
     NodeConsensusAgent(const NodeConsensusAgent&)            = delete;
     NodeConsensusAgent& operator=(const NodeConsensusAgent&) = delete;
@@ -69,22 +67,19 @@ public:
         // 2. Drive consensus (drains IngressRing + runs Election)
         workCount += consensusAgent_.doWork(nowNs);
 
-        // 3. Mirror the observed leader id for observer-thread-safe reads.
-        //    The election.leaderMemberId() is only safe on the duty-cycle thread;
-        //    we store it into the atomic so external threads can read it safely.
-        //    Only update when the election is closed (leader confirmed) or when
-        //    leaderMember is known (follower accepted NLT).
+        // 3. Mirror the observed leader id (duty-cycle-owned; observers get it
+        //    via LeaderObserver's ring).  Only a decided leader is mirrored:
+        //    election closed (leader confirmed) or leaderMember known (follower
+        //    accepted NLT).
         updateObservedLeader();
 
         return workCount;
     }
 
     // -----------------------------------------------------------------------
-    // Observer-thread-safe leader id (atomic read)
+    // Observed leader id — DUTY-CYCLE (control) thread only (F9a).
     // -----------------------------------------------------------------------
-    rune::consensus::NodeId leaderId() const noexcept {
-        return observedLeaderId_.load(std::memory_order_acquire);
-    }
+    rune::consensus::NodeId leaderId() const noexcept { return observedLeaderId_; }
 
 private:
     static constexpr int kFragmentLimit = 10;
@@ -140,10 +135,7 @@ private:
                 break;
         }
 
-        // Only write if changed to avoid unnecessary cache-line bouncing.
-        if (observedLeaderId_.load(std::memory_order_relaxed) != newLeaderId) {
-            observedLeaderId_.store(newLeaderId, std::memory_order_release);
-        }
+        observedLeaderId_ = newLeaderId;
     }
 
     rune::consensus::AeronIngress&   ingress_;
@@ -151,8 +143,31 @@ private:
     rune::consensus::Election&       election_;
     rune::consensus::NodeId          nodeId_;
 
-    // Release-written by duty-cycle thread; acquire-read by observer threads.
-    std::atomic<rune::consensus::NodeId> observedLeaderId_{-1};
+    // Duty-cycle-thread-owned (F9a: no atomics).  -1 = no leader known.
+    rune::consensus::NodeId observedLeaderId_{-1};
 };
+
+// ---------------------------------------------------------------------------
+// isLocalLeader — THE owner-thread leadership predicate (Task 11 fix 2, review
+// m1).  F9a (integration wave 2): consensus state is plain owner-thread state, so
+// this is CONTROL-thread only — the runtime's per-cycle leadership push.  Other
+// threads use BrokerNode::isLeader() (LeaderObserver ring); LeaderObserver::
+// computeOnControl() applies the same predicate.
+//   multi-node: the NodeConsensusAgent's observed leader id == self
+//   single-node: the election is in a leader state (incl. pass-through ones) or Closed
+// ---------------------------------------------------------------------------
+[[nodiscard]] inline bool isLocalLeader(const NodeConsensusAgent*        multi,
+                                        const rune::consensus::Election* election,
+                                        rune::consensus::NodeId          self) noexcept {
+    if (!election) return false;
+    if (multi) return multi->leaderId() == self;
+    using rune::consensus::ElectionState;
+    const int32_t c = election->stateCode();
+    return c == static_cast<int32_t>(ElectionState::LeaderLogReplication) ||
+           c == static_cast<int32_t>(ElectionState::LeaderReplay)         ||
+           c == static_cast<int32_t>(ElectionState::LeaderInit)           ||
+           c == static_cast<int32_t>(ElectionState::LeaderReady)          ||
+           c == static_cast<int32_t>(ElectionState::Closed);
+}
 
 } // namespace rune::node

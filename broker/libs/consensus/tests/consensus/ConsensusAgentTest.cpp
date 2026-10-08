@@ -72,12 +72,7 @@ struct TempFile {
     std::string str() const { return path.string(); }
 };
 
-// ---------------------------------------------------------------------------
-// NullSink — captures nothing; used when we don't care about outbound traffic
-// ---------------------------------------------------------------------------
-struct NullSink final : public MessageSink {
-    void send(NodeId, const uint8_t*, std::size_t) override {}
-};
+// NullSink — rune::consensus::NullSink (production no-op sink, Task 11 fix 2).
 
 // ---------------------------------------------------------------------------
 // RecordSink — captures bytes for loopback into IngressRing

@@ -29,6 +29,7 @@
 #include <util/BitUtil.h>
 #include <util/Index.h>
 #include <util/Exceptions.h>
+#include <rune/consensus/detail/TsanAnnotations.h>
 
 namespace rune::consensus::detail {
 
@@ -49,6 +50,7 @@ public:
     M2ORingBuffer& operator=(const M2ORingBuffer&) = delete;
 
     [[nodiscard]] aeron::util::index_t capacity()     const { return m_capacity; }
+    [[nodiscard]] aeron::util::index_t headPositionIndex() const { return m_headPositionIndex; }
     [[nodiscard]] aeron::util::index_t maxMsgLength() const { return m_maxMsgLength; }
 
     /// Raw writable base pointer — combine with a tryClaim() offset for a zero-copy
@@ -85,6 +87,7 @@ public:
         namespace RD = aeron::concurrent::ringbuffer;
         const aeron::util::index_t recordIndex = computeRecordIndex(index);
         const std::int32_t recordLength = verifyClaimedSpaceNotReleased(recordIndex);
+        RUNE_TSAN_RELEASE(m_buffer.buffer() + recordIndex);
         m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
     }
 
@@ -93,6 +96,7 @@ public:
         namespace RD = aeron::concurrent::ringbuffer;
         const aeron::util::index_t recordIndex = computeRecordIndex(index);
         const std::int32_t recordLength = verifyClaimedSpaceNotReleased(recordIndex);
+        RUNE_TSAN_RELEASE(m_buffer.buffer() + recordIndex);
         m_buffer.putInt32(RD::RecordDescriptor::typeOffset(recordIndex),
                           RD::RecordDescriptor::PADDING_MSG_TYPE_ID);
         m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
@@ -118,6 +122,25 @@ public:
     /// (msgTypeId, AtomicBuffer&, encodedOffset, length).  Returns messages read.
     template <typename Handler>
     int read(Handler&& handler, int messageCountLimit) {
+        // One ring walk (controlledRead) — a plain read always consumes.
+        return controlledRead(
+            [&handler](std::int32_t msgTypeId, aeron::concurrent::AtomicBuffer& buf,
+                       aeron::util::index_t offset, aeron::util::index_t length) {
+                handler(msgTypeId, buf, offset, length);
+                return true;
+            },
+            messageCountLimit);
+    }
+
+    template <typename Handler>
+    int read(Handler&& handler) { return read(std::forward<Handler>(handler), INT_MAX); }
+
+    /// Controlled read (Agrona's controlledRead with CONTINUE / ABORT only):
+    /// handler(msgTypeId, buf, offset, length) returns true to CONSUME the message
+    /// and continue, false to ABORT — that message is NOT consumed (it is re-read
+    /// on the next call) and the read stops.  Returns messages consumed.
+    template <typename Handler>
+    int controlledRead(Handler&& handler, int messageCountLimit) {
         namespace RD = aeron::concurrent::ringbuffer;
         int messagesRead = 0;
 
@@ -131,6 +154,7 @@ public:
         ScopeExit cleanup([&]() {
             if (bytesRead != 0) {
                 m_buffer.setMemory(headIndex, static_cast<std::size_t>(bytesRead), 0);
+                RUNE_TSAN_RELEASE(m_buffer.buffer() + headPositionIndex);
                 m_buffer.putInt64Ordered(headPositionIndex, head + bytesRead);
             }
         });
@@ -140,23 +164,26 @@ public:
             const std::int32_t recordLength =
                 m_buffer.getInt32Volatile(RD::RecordDescriptor::lengthOffset(recordIndex));
             if (recordLength <= 0) break;
+            RUNE_TSAN_ACQUIRE(m_buffer.buffer() + recordIndex);
 
-            bytesRead += aeron::util::BitUtil::align(recordLength, RD::RecordDescriptor::ALIGNMENT);
-
+            const aeron::util::index_t aligned =
+                aeron::util::BitUtil::align(recordLength, RD::RecordDescriptor::ALIGNMENT);
             const std::int32_t msgTypeId =
                 m_buffer.getInt32(RD::RecordDescriptor::typeOffset(recordIndex));
-            if (RD::RecordDescriptor::PADDING_MSG_TYPE_ID == msgTypeId) continue;
-
-            handler(msgTypeId, m_buffer,
-                    RD::RecordDescriptor::encodedMsgOffset(recordIndex),
-                    recordLength - RD::RecordDescriptor::HEADER_LENGTH);
+            if (RD::RecordDescriptor::PADDING_MSG_TYPE_ID == msgTypeId) {
+                bytesRead += aligned;
+                continue;
+            }
+            if (!handler(msgTypeId, m_buffer,
+                         RD::RecordDescriptor::encodedMsgOffset(recordIndex),
+                         recordLength - RD::RecordDescriptor::HEADER_LENGTH)) {
+                break;                                   // ABORT: leave this record
+            }
+            bytesRead += aligned;
             ++messagesRead;
         }
         return messagesRead;
     }
-
-    template <typename Handler>
-    int read(Handler&& handler) { return read(std::forward<Handler>(handler), INT_MAX); }
 
     [[nodiscard]] std::int64_t producerPosition() const {
         return m_buffer.getInt64Volatile(m_tailPositionIndex);
@@ -236,6 +263,7 @@ private:
         const aeron::util::index_t mask = capacity - 1;
 
         std::int64_t head = m_buffer.getInt64Volatile(headCachePositionIndex);
+        RUNE_TSAN_ACQUIRE(m_buffer.buffer() + headCachePositionIndex);   // cache written by another producer
 
         std::int64_t tail;
         std::int64_t newTail;
@@ -250,10 +278,13 @@ private:
 
             if (requiredCapacity > availableCapacity) {
                 head = m_buffer.getInt64Volatile(m_headPositionIndex);
+                RUNE_TSAN_ACQUIRE(m_buffer.buffer() + m_headPositionIndex);
 
                 if (requiredCapacity > (capacity - static_cast<aeron::util::index_t>(tail - head))) {
                     return INSUFFICIENT_CAPACITY;
                 }
+
+                RUNE_TSAN_RELEASE(m_buffer.buffer() + headCachePositionIndex);
 
                 m_buffer.putInt64Ordered(headCachePositionIndex, head);
             }
@@ -271,12 +302,15 @@ private:
 
                 if (requiredCapacity > headIndex) {
                     head = m_buffer.getInt64Volatile(m_headPositionIndex);
+                    RUNE_TSAN_ACQUIRE(m_buffer.buffer() + m_headPositionIndex);
                     headIndex = static_cast<aeron::util::index_t>(head) & mask;
 
                     if (requiredCapacity > headIndex) {
                         writeIndex = INSUFFICIENT_CAPACITY;
                         newTail = tail; // claim no space; only pad to the buffer end
                     }
+
+                    RUNE_TSAN_RELEASE(m_buffer.buffer() + headCachePositionIndex);
 
                     m_buffer.putInt64Ordered(headCachePositionIndex, head);
                 }
@@ -291,6 +325,7 @@ private:
             std::atomic_thread_fence(std::memory_order_release);
             m_buffer.putInt32(RD::RecordDescriptor::typeOffset(tailIndex),
                               RD::RecordDescriptor::PADDING_MSG_TYPE_ID);
+            RUNE_TSAN_RELEASE(m_buffer.buffer() + tailIndex);
             m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(tailIndex), padding);
         }
 

@@ -55,17 +55,25 @@
 // Only the pointer is stored in this header (setWorkerPool takes WorkerPool*).
 // The full WorkerPool.h / WorkerOp.h are included in AeronPartitionTransport.cpp
 // (compiled under rune_replication_aeron which has RUNE_NODE_INCLUDE).
-namespace rune::node { class WorkerPool; }
+namespace rune::node { class WorkerPool; class ReplicaRegistry; }
 
+#include <rune/replication/OutboundHoldRouter.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune/replication/ReplicationFrameLimits.h>
+#include <rune_protocol_internal_sbe/MessageHeader.h>
+#include <rune_protocol_internal_sbe/OutboundFrame.h>
+#include <concurrent/logbuffer/FrameDescriptor.h>
 #include <rune/replication/ReplicationMessages.h>
+#include <rune/replication/PubAddBroker.h>
+#include <rune/consensus/PeerResolution.h>
 
+#include <rune/aeronutil/AeronPump.h>
 #include <rune/consensus/IngressRing.h>  // agrona ManyToOne ring (outbound marshalling)
 
 #include <Aeron.h>
 #include <ExclusivePublication.h>
 #include <Subscription.h>
-#include <ControlledFragmentAssembler.h>
+#include <rune/aeronutil/FragmentAssembler.h>
 #include <concurrent/AtomicBuffer.h>
 #include <concurrent/logbuffer/BufferClaim.h>
 
@@ -99,13 +107,41 @@ public:
     /// The ingress Subscription is registered synchronously (bounded 5 s wait)
     /// in the constructor — this is the only synchronous resolve; it runs once
     /// at startup, never on the duty-cycle hot path.
+    /// (F3 round 5 item I3 — the publication bound term/8 — is F18's
+    ///  setPublicationMaxMessageBytes(), set once before any worker runs.)
     /// \param outboundRingBytes Payload bytes of the outbound ManyToOne ring
     ///        (NodeConfig::replicationOutboundRingBytes). Power of two.
+    /// \param pump  Startup resolve pump (spec §3.6): an invoker driver +
+    ///        conductor (fused runtime) is pumped by this thread between probes;
+    ///        the default pump sleep-polls a threaded driver.
+    ///        Production fused placement uses the default pump (the runtime driver
+    ///        is serviced by BrokerNode's interim startup runner).
     AeronPartitionTransport(std::shared_ptr<aeron::Aeron> aeron,
                             const std::string&             ingressChannel,
                             int32_t                        ingressStreamId,
                             NodeId                         selfId,
-                            int                            outboundRingBytes = 4 * 1024 * 1024);
+                            int                            outboundRingBytes = 4 * 1024 * 1024,
+                            rune::aeronutil::AeronPump     pump = {});
+
+    /// Fixed overhead of the SBE OutboundFrame envelope (SBE header +
+    /// targetNodeId block + varData length prefix) that wraps every frame in
+    /// the worker→control outbound ring — ReplicationFrameLimits.h's constant.
+    static constexpr std::size_t kOutboundEnvelopeOverhead =
+        ::rune::replication::kOutboundEnvelopeOverhead;
+
+    /// F3 round 5 (config-only view): the records payload a FetchResponse (or
+    /// push) can carry over this transport — min(outbound ring bound, Aeron
+    /// publication bound), i.e. ReplicationFrameLimits.h's two terms (the SAME
+    /// functions THE batch-limit formula uses).  The live instance reports the
+    /// same via maxFetchRecordsBytes() once setPublicationMaxMessageBytes() ran.
+    [[nodiscard]] static int32_t maxFetchResponseBytesFor(int outboundRingBytes,
+                                                          int32_t termBufferBytes) noexcept {
+        const int64_t c = std::min(
+            ::rune::replication::maxFetchRecordsViaOutboundRing(outboundRingBytes),
+            termBufferBytes > 0 ? ::rune::replication::maxFetchRecordsViaPublication(termBufferBytes)
+                                : int64_t{0});
+        return static_cast<int32_t>(std::clamp<int64_t>(c, 0, INT32_MAX));
+    }
 
     ~AeronPartitionTransport() override = default;
 
@@ -140,7 +176,84 @@ public:
     // -----------------------------------------------------------------------
 
     /// Register a replica so inbound frames can be routed to it.
+    /// Task 10 round 4: ignored once a ReplicaRegistry is wired (the transport
+    /// then holds NO replica pointer at all — it resolves at use time).
     void registerReplica(int32_t topicId, PartitionId partitionId, PartitionReplica* replica);
+    /// Drop a registration (standalone mode — no registry wired).
+    void unregisterReplica(int32_t topicId, PartitionId partitionId);
+
+    /// Task 10 round 4 (Critical 1): resolve every inbound frame's replica
+    /// through the ReplicaRegistry at USE time (a removed partition resolves to
+    /// nothing: the frame is dropped, nothing freed is ever dereferenced).
+    /// Wiring it drops any pointer registered so far.  Control thread only.
+    /// \param userPartitions false when USER (topicId >= 0) replicas live on
+    ///        per-worker replication planes (E5 Task 5): this legacy transport
+    ///        then resolves internal partitions only, exactly as before.
+    void setReplicaRegistry(const rune::node::ReplicaRegistry* registry,
+                            bool userPartitions = true) noexcept {
+        registry_ = registry;
+        registryUserPartitions_ = userPartitions;
+        replicas_.clear();
+    }
+    /// Test hook: number of raw replica pointers the transport holds.
+    [[nodiscard]] std::size_t heldReplicaPointersForTest() const noexcept { return replicas_.size(); }
+    /// Test hook: feed one reassembled replication frame through onFragment.
+    /// Returns false iff the frame was NOT consumed (ABORT → would be redelivered).
+    bool deliverFrameForTest(const uint8_t* frame, std::size_t len, int64_t nowNs);
+    /// F18: follower apply/reconcile frames refused because their records cannot
+    /// fit one worker-ingress frame (a replication error; never a crash/livelock).
+    [[nodiscard]] uint64_t oversizedApplyRefused() const noexcept { return oversizedApplyRefused_; }
+    /// F18: outbound frames dropped because they exceed the publication
+    /// maxMessageLength — NOT back-pressure.  Unreachable once the replica answers
+    /// an unservable batch with kErrRecordTooLarge; a non-zero value is a bug
+    /// signal.  Bumped only by the polling thread (sendOnPub).  (Merge F18⇄F16:
+    /// the outbound-RING oversize sites are entered by several worker threads, so
+    /// they only warn — F16 removed exactly that multi-writer counter class.)
+    [[nodiscard]] uint64_t oversizedFrameDropped() const noexcept { return oversizedFrameDropped_; }
+
+    /// F18: the replication publication's maxMessageLength (min(term/8, 16 MiB)),
+    /// set ONCE before any worker runs (BrokerNode, from aeronTermBufferBytes) so
+    /// worker-thread replicas can bound a FetchResponse without touching the
+    /// control-owned peers_/pubs.  0 = unknown (outbound-ring bound only).
+    void setPublicationMaxMessageBytes(int64_t n) noexcept { pubMaxMessageBytes_ = n; }
+
+    /// F18 (B-1): the largest records payload this node's worker ingress ring can
+    /// take in ONE apply op (ring/8 − op framing).  Set ONCE before any worker
+    /// runs.  Caps this node's outgoing follower fetch AND reconcile-pull (B-3)
+    /// maxBytes so the answering peer never sends more than this node can apply.
+    /// 0 = no cap.
+    void setApplyRecordsCap(int64_t n) noexcept { applyRecordsCap_ = n; }
+    /// F18 (B-1): responses dropped (NOT wedged) because the whole response was
+    /// above the apply frame while its batch at the front fit — recovered by the
+    /// capped fetch.
+    [[nodiscard]] uint64_t oversizedApplyDropped() const noexcept { return oversizedApplyDropped_; }
+
+    /// F18: largest records payload ONE FetchResponse can carry (worker-safe:
+    /// reads only state immutable after start).  = outbound-ring frame and, when
+    /// known, the publication frame, each minus its framing.
+    [[nodiscard]] int64_t maxFetchRecordsBytes() const noexcept override;
+    /// F16: this transport's own traffic counters (shared-nothing: per instance,
+    /// written only by the thread that polls it).  Control thread / tests.
+    struct TxStats { int64_t polls = 0; int64_t fragsRecv = 0; int64_t outDrained = 0; };
+    [[nodiscard]] TxStats txStatsForTest() const noexcept;
+    /// F27 F1: held-FIFO counters (control thread / tests).
+    [[nodiscard]] const OutboundHoldStats& holdStatsForTest() const noexcept {
+        return holdRouter_.stats();
+    }
+    /// F27: frames currently held for `peer` / whether it is marked down (tests).
+    [[nodiscard]] std::size_t heldFramesForTest(NodeId peer) const noexcept { return holdRouter_.heldFrames(peer); }
+    [[nodiscard]] bool peerDownForTest(NodeId peer) const noexcept { return holdRouter_.isDown(peer); }
+    /// D9 (re-review MEDIUM-1): the link state last observed for `peer` (its
+    /// publication connected).  Control thread / tests.
+    [[nodiscard]] bool peerLinkUpForTest(NodeId peer) const noexcept {
+        for (const auto& l : links_) if (l.peer == peer) return l.up;
+        return false;
+    }
+    /// D9 (re-review NEW MAJOR-1): inbound images attributed to `peer` so far.
+    [[nodiscard]] uint64_t inboundImagesFromForTest(NodeId peer) const noexcept {
+        for (const auto& l : links_) if (l.peer == peer) return l.imagesSeen;
+        return 0;
+    }
 
     // -----------------------------------------------------------------------
     // PartitionTransport interface
@@ -148,22 +261,113 @@ public:
 
     /// (Follower → Leader) encode and offer a FetchRequest on the leader's pub.
     /// Non-blocking: drops if the pub is not yet resolved or back-pressured.
-    void sendFetchRequest(const FetchRequestMsg& req) override;
+    bool sendFetchRequest(const FetchRequestMsg& req) override;
+    /// Same broadcast as sendFetchRequest (the leader NodeId is not on this wire);
+    /// overridden so the call stays direct on this final class (Task 11 fix 2).
+    bool sendFetchRequestTo(NodeId /*leader*/, const FetchRequestMsg& req) override { return sendFetchRequest(req); }
+    /// Task 11 fix 2 (B2): PartitionReplica dispatches this final class directly.
+    [[nodiscard]] TransportKind kind() const noexcept override { return TransportKind::Aeron; }
 
     /// (Leader → Follower) encode and offer a FetchResponse to a follower.
     /// Non-blocking: drops if the follower's pub is not yet resolved.
-    void sendFetchResponse(NodeId toFollower,
+    bool sendFetchResponse(NodeId toFollower,
                            const FetchResponseMsg& resp) override;
 
     // DR-BUG-6: OffsetsForLeaderEpoch exchange + deficient-leader reconcile.
-    void sendOffsetsForLeaderEpochRequest(
+    bool sendOffsetsForLeaderEpochRequest(
             NodeId toLeader, const OffsetsForLeaderEpochReqMsg& req) override;
-    void sendOffsetsForLeaderEpochResponse(
+    bool sendOffsetsForLeaderEpochResponse(
             NodeId toFollower, const OffsetsForLeaderEpochRespMsg& resp) override;
-    void sendReconcileRequest(
+    bool sendReconcileRequest(
             NodeId toPeer, const FetchRequestMsg& req) override;
-    void sendReconcileResponse(
+    bool sendReconcileResponse(
             NodeId toPeer, const FetchResponseMsg& resp) override;
+
+    /// Kafka AlterPartition (any thread: MPSC outbound ring).  Routed on the
+    /// control thread to the CURRENT controller (setControllerId); delivered
+    /// locally when this node is the controller.
+    bool sendAlterIsr(const AlterIsrMsg& msg) override;
+    /// MAJOR-2/3: internal-ISR state / ack (control thread; cold).
+    bool sendInternalIsr(NodeId to, const InternalIsrMsg& msg) override;
+    bool sendInternalIsrAck(NodeId to, const InternalIsrAckMsg& msg) override;
+    /// CONTROL thread (controller side): answer an AlterIsr (to `toLeader`;
+    /// self = delivered locally).  Cold.
+    bool sendAlterIsrResponse(NodeId toLeader, const AlterIsrResponseMsg& msg);
+
+    /// CONTROL thread: the current controller (consensus leader) node, -1 unknown.
+    void setControllerId(int32_t id) noexcept { controllerId_ = id; }
+    /// CONTROL thread: the controller-side AlterIsr handler (MetadataService),
+    /// called on the control thread for every AlterIsr this node receives.
+    /// Returns true when `resp` must be sent back to the proposing leader
+    /// (Kafka AlterPartitionResponse — MEDIUM-2).
+    using AlterIsrHandler = bool (*)(void* ctx, const AlterIsrMsg& msg, AlterIsrResponseMsg& resp);
+    void setAlterIsrHandler(AlterIsrHandler fn, void* ctx) noexcept {
+        alterIsrHandler_ = fn; alterIsrCtx_ = ctx;
+    }
+    /// CONTROL thread: a NODE-level request (controlled shutdown / register /
+    /// peer confirmation, topicId == AlterIsrMsg::kNodeControlTopicId) to ONE
+    /// node (self = delivered locally, synchronously).  Cold.
+    bool sendNodeControl(NodeId to, const AlterIsrMsg& msg);
+    /// CONTROL thread: the controller's answer to this node's NODE-level
+    /// request (controlled shutdown / register: topicId ==
+    /// AlterIsrMsg::kNodeControlTopicId) — delivered here, never to a replica.
+    using NodeControlResponseHandler = void (*)(void* ctx, const AlterIsrResponseMsg& resp);
+    void setNodeControlResponseHandler(NodeControlResponseHandler fn, void* ctx) noexcept {
+        nodeControlRespHandler_ = fn; nodeControlRespCtx_ = ctx;
+    }
+
+    // -----------------------------------------------------------------------
+    // D9: cross-node transaction markers (cold control traffic).
+    //
+    // Sends: any thread (MPSC outbound ring); false = ring full (the caller
+    // keeps the marker / response and retries — never dropped).  A send to
+    // this node itself is delivered locally (never happens in practice: a
+    // locally led partition takes the local marker path).
+    // Handlers: called on the CONTROL thread (poll) for every decoded frame —
+    // function pointer + ctx (no virtual / std::function), set by BrokerNode to
+    // the gateway.  Unset = the frame is dropped (the coordinator re-sends).
+    // -----------------------------------------------------------------------
+    bool sendWriteTxnMarker(NodeId to, const WriteTxnMarkerMsg& msg);
+    bool sendWriteTxnMarkerResponse(NodeId to, const WriteTxnMarkerResponseMsg& msg);
+    using WriteTxnMarkerHandler         = void (*)(void* ctx, const WriteTxnMarkerMsg& msg);
+    using WriteTxnMarkerResponseHandler = void (*)(void* ctx, const WriteTxnMarkerResponseMsg& msg);
+    void setTxnMarkerHandlers(WriteTxnMarkerHandler onMarker, WriteTxnMarkerResponseHandler onResponse,
+                              void* ctx) noexcept {
+        txnMarkerHandler_ = onMarker; txnMarkerRespHandler_ = onResponse; txnMarkerCtx_ = ctx;
+    }
+    /// D9 review MAJOR-1: the plane-reconnect event, CONTROL thread (poll):
+    /// `peer` >= 0 = this node's link to that peer went down→up (its hold-router
+    /// connection generation was bumped — frames to it may have been dropped
+    /// while it was down); -1 = a new inbound image appeared (some peer's link
+    /// to this node came back; frames from it may have been dropped).
+    using PlaneReconnectHandler = void (*)(void* ctx, int32_t peer);
+    void setPlaneReconnectHandler(PlaneReconnectHandler fn, void* ctx) noexcept {
+        reconnectHandler_ = fn; reconnectCtx_ = ctx;
+    }
+    /// Thunks matching the gateway's TxnMarkerChannel send signatures (ctx = this).
+    static bool sendWriteTxnMarkerThunk(void* self, int32_t to, const WriteTxnMarkerMsg& msg) {
+        return static_cast<AeronPartitionTransport*>(self)->sendWriteTxnMarker(static_cast<NodeId>(to), msg);
+    }
+    static bool sendWriteTxnMarkerResponseThunk(void* self, int32_t to, const WriteTxnMarkerResponseMsg& msg) {
+        return static_cast<AeronPartitionTransport*>(self)->sendWriteTxnMarkerResponse(static_cast<NodeId>(to), msg);
+    }
+
+    /// F3's int32 view of the ONE live ceiling, maxFetchRecordsBytes() (F18):
+    /// min(outbound ring bound, publication bound) — worker-safe (both fixed
+    /// before any worker runs).  poll()'s FetchRequest/reconcile clamps start
+    /// from it.
+    [[nodiscard]] int32_t maxFetchResponseBytes() const noexcept {
+        return static_cast<int32_t>(std::clamp<int64_t>(maxFetchRecordsBytes(), 0, INT32_MAX));
+    }
+
+
+    /// F3 round 6: replicated-records frames that can never fit the owning
+    /// worker's ingress ring (heterogeneous config) — handled by F18's one
+    /// mechanism: dropped (front batch fits) or refused (follower wedged).
+    /// Control thread.
+    [[nodiscard]] uint64_t unfittableApplyDropsForTest() const noexcept {
+        return oversizedApplyDropped_ + oversizedApplyRefused_;
+    }
 
     // -----------------------------------------------------------------------
     // Duty-cycle step
@@ -197,6 +401,25 @@ public:
     /// Number of peers whose publication has not yet been resolved.
     [[nodiscard]] int unresolvedPeerCount() const noexcept;
 
+    /// Publication re-adds issued after a registration error (DR-15).
+    [[nodiscard]] uint64_t peerPubReAdds() const noexcept { return pubReAdds_; }
+    /// Re-adds made because a peer host's address changed (DR-4).
+    [[nodiscard]] uint64_t peerPubAddressReAdds() const noexcept { return pubAddressReAdds_; }
+
+    /// DR-15 fix round 1: this transport's resolution events (the off-thread
+    /// PeerResolverHub).  Cold; before addPeer().  Control thread consumes.
+    /// Drains the prefilled ring at once (startup thread, before the owner runs)
+    /// so startup adds already go out on the NUMERIC address (DR-4).
+    void attachResolution(rune::consensus::PeerResolutionSource src) {
+        inbox_.attach(src);
+        (void)inbox_.poll([this](int idx) { onHostResolved_(idx); });
+    }
+
+    /// Legacy per-worker planes' re-adds, made on THIS (control) thread — the
+    /// node client's admin owner (review MEDIUM-2).  Before the control thread
+    /// runs; brokers must outlive this transport's last poll().
+    void addPubAddBroker(PubAddBroker* broker) { brokers_.push_back(broker); }
+
     /// Number of peers registered.
     [[nodiscard]] int peerCount() const noexcept {
         return static_cast<int>(peers_.size());
@@ -211,8 +434,29 @@ private:
         NodeId      peerId         = -1;
         int64_t     registrationId = -1;     ///< from addExclusivePublication
         std::shared_ptr<aeron::ExclusivePublication> pub; ///< null until resolved
-        bool        registered     = false;  ///< addExclusivePublication called
+        bool        registered     = false;  ///< a registration is in flight / live
+        // DR-15: an errored registration (peer hostname not resolvable while it
+        // restarts) is RE-ADDED on its host's resolution event (fix round 1:
+        // event-driven, never a pass count) — never dropped for good.
+        std::string channel;                 ///< egress channel (re-add target)
+        int32_t     streamId       = 0;
+        int         hostIdx        = -1;     ///< managed peer host (-1: unmanaged)
+        uint32_t    addGen         = 0;      ///< host resolution generation at the last add
+        uint32_t    attempts       = 0;      ///< failed registrations so far
+        uint32_t    boundIp        = 0;      ///< host address at the last add (network order)
+        bool        boundKnown     = false;  ///< boundIp valid
     };
+    rune::consensus::PeerResolutionInbox inbox_;   ///< control thread: resolution events
+    std::vector<PubAddBroker*>           brokers_; ///< legacy planes' control-thread re-adds
+    uint64_t pubFailures_   = 0;             ///< registration failures (rate-limited log)
+    uint64_t pubReAdds_     = 0;
+    uint64_t pubAddressReAdds_ = 0;           ///< re-adds after a peer host's address changed (DR-4)
+    /// The resolution event of host `idx`: re-add every peer waiting on it.
+    void onHostResolved_(int idx) noexcept;
+    /// Issue addExclusivePublication for `p` (an error → onPubFailed_).
+    void registerPub_(PeerPub& p) noexcept;
+    /// Re-add now if the host resolved since that add, else wait for its event.
+    void onPubFailed_(PeerPub& p, const char* why) noexcept;
 
     // -----------------------------------------------------------------------
     // Internal helpers
@@ -222,11 +466,36 @@ private:
     /// One non-blocking findExclusivePublication per unresolved peer.
     void resolvePendingPubs();
 
-    /// Send a raw buffer on a peer's ExclusivePublication.
-    /// Returns true if the frame was accepted (> 0 from tryClaim/offer).
-    /// Non-blocking; caller bears the drop silently.
-    bool sendOnPub(aeron::ExclusivePublication& pub,
-                   const uint8_t* buf, std::size_t len);
+    /// Send a raw buffer on a peer's ExclusivePublication.  Returns the Aeron
+    /// result (> 0 accepted; BACK_PRESSURED / ADMIN_ACTION / NOT_CONNECTED ...
+    /// refused — the caller HOLDS the frame, F27) or kOfferOversized (permanent).
+    int64_t sendOnPub(aeron::ExclusivePublication& pub,
+                      const uint8_t* buf, std::size_t len);
+
+    /// F27 F1 / R1: the hold router's Offer policy — offer `buf` to peer `id`'s
+    /// pub.  No publication (registration failed, or not resolved yet) means the
+    /// peer is DOWN (kOfferPeerDown): its frames are not held; the down→up edge
+    /// bumps its connection generation (see OutboundHoldRouter.h).
+    struct PubOffer {
+        AeronPartitionTransport* t;
+        int64_t operator()(NodeId id, const uint8_t* buf, std::size_t len) {
+            PeerPub* p = t->findPeer(id);
+            if (p == nullptr || !p->registered || !p->pub) return kOfferPeerDown;
+            return t->sendOnPub(*p->pub, buf, len);
+        }
+    };
+    friend struct PubOffer;
+
+    /// R1: the connection generation stamped on a FetchRequest from `peer`
+    /// (control thread).  Observes the link first, so a peer that reconnected
+    /// while nothing was being sent to it still raises the edge before its fetch
+    /// reaches the replica.
+    uint32_t peerConnGen_(NodeId peer) noexcept {
+        PeerPub* p = findPeer(peer);
+        holdRouter_.noteLink(peer, p && p->registered && p->pub && p->pub->isConnected());
+        return holdRouter_.connGen(peer);
+    }
+    uint64_t lastPushFailed_ = 0;   ///< R3: last logged OutboundHoldStats::pushFailed
 
     /// Look up a peer's PeerPub entry (or nullptr if not found).
     PeerPub* findPeer(NodeId id);
@@ -242,12 +511,13 @@ private:
     // ManyToOneRingBuffer via IngressRing — MPSC, lock-free).  The CONTROL thread
     // drains the ring in poll() and does the actual peers_/pub offers.
     //
-    // Back-pressure: on a full ring, enqueueOutbound() returns false and bumps
-    // outboundRingFullCount_ — the send is skipped (NOT silently "succeeded").
+    // Back-pressure: on a full ring, enqueueOutbound() returns false — the send
+    // is skipped (NOT silently "succeeded") and the worker caller sees it.
     // Replication sends are retriable (follower re-requests / leader re-responds
     // next cycle), so skip-and-retry is the correct policy here.
     // -----------------------------------------------------------------------
     static constexpr int32_t kBroadcast = -1;
+    static constexpr int32_t kController = -2;   ///< resolved to controllerId_ at drain
 
     /// Stack fast-path size for a single encoded wire frame.  A frame that fits is
     /// encoded/framed on the stack (no heap); a LARGER frame (e.g. a big replicated
@@ -265,6 +535,16 @@ private:
     /// WORKER-thread side: encode routing header + wire frame → outbound ring.
     /// Returns false on full ring (back-pressure; caller's op is retriable).
     bool enqueueOutbound(int32_t targetNodeId, const uint8_t* wire, std::size_t len);
+
+    /// WORKER-thread side, ZERO-COPY FetchResponse: encode the FetchResponse SBE
+    /// message DIRECTLY into the claimed OutboundFrame payload region of the ring
+    /// slot — one copy (records: log mmap → ring), skipping the intermediate
+    /// `wire` buffer + its memcpy that enqueueOutbound(wire,len) would incur.
+    /// \param reconcile  when true, re-stamp the FetchResponse templateId to the
+    ///        reconcile id (DR reverse-catch-up) after encoding, matching
+    ///        sendReconcileResponse's wire.  Returns false on full ring.
+    bool enqueueFetchResponse(int32_t targetNodeId, const FetchResponseMsg& resp,
+                              bool reconcile = false);
 
     /// CONTROL-thread side: drain the outbound ring and do the real peer offers.
     /// Called from poll().  Only this path touches peers_/pubs on send.
@@ -285,6 +565,8 @@ private:
                                            aeron::util::index_t             offset,
                                            aeron::util::index_t             length,
                                            aeron::Header&                   header);
+    /// The frame handler proper (onFragment minus the Aeron plumbing).
+    aeron::ControlledPollAction handleFrame_(const uint8_t* buf, std::size_t len);
 
     // -----------------------------------------------------------------------
     // Fields
@@ -299,9 +581,36 @@ private:
 
     std::shared_ptr<aeron::Aeron>          aeron_;
     std::shared_ptr<aeron::Subscription>   sub_;
-    aeron::ControlledFragmentAssembler     assembler_;
+    rune::aeronutil::ControlledFragmentAssembler assembler_;   // templated (Task 11 fix 2, B3)
+    rune::aeronutil::ImageLossWatch              imageWatch_;  // review m-c
 
     NodeId                                 selfId_;
+    int32_t                                controllerId_    = -1;       ///< control thread
+    AlterIsrHandler                        alterIsrHandler_ = nullptr;  ///< control thread
+    void*                                  alterIsrCtx_     = nullptr;
+    NodeControlResponseHandler             nodeControlRespHandler_ = nullptr;  ///< control thread
+    void*                                  nodeControlRespCtx_     = nullptr;
+    WriteTxnMarkerHandler                  txnMarkerHandler_     = nullptr;  ///< control thread (D9)
+    WriteTxnMarkerResponseHandler          txnMarkerRespHandler_ = nullptr;
+    void*                                  txnMarkerCtx_         = nullptr;
+    PlaneReconnectHandler                  reconnectHandler_     = nullptr;  ///< control thread (D9)
+    void*                                  reconnectCtx_         = nullptr;
+    uint64_t                               lastUpEdges_          = 0;
+    int                                    lastImageCount_       = 0;
+    std::vector<std::pair<NodeId, uint32_t>> notifiedGen_;                     ///< per-peer gen last reported
+    /// D9 (re-review): per-peer link view — publication connected (edge-detected
+    /// every poll) and the host its inbound images come from (image → peer).
+    struct PeerLink {
+        NodeId      peer       = -1;
+        const PeerPub* pub     = nullptr;   ///< into peers_ (stable element address)
+        std::string host;              ///< from the peer's endpoint ("" = unknown)
+        bool        up         = false;
+        uint64_t    imagesSeen = 0;
+    };
+    std::vector<PeerLink> links_;
+    std::vector<int32_t>  knownImageSessions_;   ///< cold: image sessions already attributed
+    /// D9: probe down peers' links + report down→up edges / new inbound images.
+    int notePlaneReconnects_();
     int64_t                                nowNs_ = 0; ///< updated at top of poll()
 
     // Per-peer egress publications (keyed by NodeId).
@@ -329,14 +638,35 @@ private:
     // Size is NodeConfig-configurable (replicationOutboundRingBytes) — passed to
     // the ctor and used to construct this ring in the init list.
     rune::consensus::IngressRing outboundRing_;
+    // F27 F1: per-peer held FIFOs (control thread only) — a frame the ring
+    // accepted is never dropped by drainOutbound (see OutboundHoldRouter.h).
+    OutboundHoldRouter<PubOffer> holdRouter_;
+    uint64_t oversizedApplyRefused_ = 0;   // F18; control thread only
+    uint64_t oversizedFrameDropped_ = 0;   // F18; see oversizedFrameDropped()
+    int64_t  pubMaxMessageBytes_    = 0;   // F18; immutable after start
+    int64_t  applyRecordsCap_       = 0;   // F18 (B-1); immutable after start
+    uint64_t oversizedApplyDropped_ = 0;   // F18 (B-1); control thread only
 
-    // Back-pressure observability: bumped when the outbound ring is full and a
-    // (retriable) send had to be skipped. Control-thread reads for logging.
-    uint64_t outboundRingFullCount_ = 0;
+    // (F16: the write-only outboundRingFullCount_ was removed — several worker
+    // threads bumped it unsynchronised; back-pressure is the false return.)
+
+    // F16: traffic counters + FR receive sequence — per instance, written only by
+    // the thread that polls this transport (no process-wide globals, no atomics).
+    int64_t  txRateLastNs_ = 0;
+    int64_t  txPolls_      = 0;   ///< poll() calls (RUNE_FS_LOG only)
+    int64_t  txFragsRecv_  = 0;   ///< fragments received
+    int64_t  txOutDrained_ = 0;   ///< outbound messages drained to Aeron
+    uint32_t inRecvSeq_    = 0;   ///< FR ReplFragRecv correlation
+    // (F9a 29f9aec made the same file-static → per-instance move; one set.)
 
     // E2 inc2a: optional WorkerPool — when non-null, FetchResponse frames are
     // enqueued to the owning worker instead of calling applyReplicated inline.
     rune::node::WorkerPool* workerPool_ = nullptr;
+
+    // Task 10 round 4: when wired, the ONLY replica source (use-time resolve).
+    const rune::node::ReplicaRegistry* registry_ = nullptr;
+    bool registryUserPartitions_ = true;
+    PartitionReplica* resolveReplica_(int32_t topicId, PartitionId partitionId) const noexcept;
 };
 
 } // namespace rune::replication

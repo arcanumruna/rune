@@ -85,6 +85,10 @@ void ReverseIndex::rebuild(const AssignmentMap& m)
                      const PartitionAssignment& pa)
     {
         if (pa.leaderNode == NO_LEADER) return;
+        // Internal (coordinator) partitions are assigned by the controller too
+        // (re-review MEDIUM-B) but have no gpid (gpidOf requires topicId >= 0)
+        // and never count toward user-partition leader balance.
+        if (topicId < 0) return;
         setBit(pa.leaderNode, gpidOf(topicId, partition));
     });
 }
@@ -164,30 +168,12 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
     // reflect already-decided swaps within this rebalance cycle.
     // (Mutable copy; we adjust when we emit a leadership change.)
 
-    // ── Restorability check (time-independent convergence) ────────────────────
-    // A live replica is "restorable" — safe to re-admit to the ISR / re-elect as
-    // preferred leader after a transient-liveness collapse dropped it from the ISR —
-    // ONLY when we have POSITIVE proof it still holds the committed prefix: its
-    // reported logEndPosition >= the reference leader's, from the ReplicaPositionTable.
-    //
-    // Absent that proof (no position report for the node or the leader) we must NOT
-    // restore: a node outside the ISR is by-definition not in-sync, and electing it
-    // without proof of catch-up would risk committed-data loss.  This keeps the old
-    // "preferred-leader only if in ISR" safety while ADDING position-proven
-    // restoration — the mechanism that lets a transient heartbeat false-positive
-    // stop permanently collapsing leadership, for ANY window (no tuned grace).
-    //
-    // NOTE: this activates only once replica position reports are plumbed into the
-    // controller's ReplicaPositionTable; until then it is a safe no-op (see the
-    // position-report wiring in NodeRuntimeAgent / MetadataService).
-    auto restorable = [&](int32_t topicId, int32_t part,
-                          int32_t node, int32_t refLeader) -> bool {
-        if (!in.positions) return false;
-        const auto np = in.positions->get(topicId, part, node);
-        const auto lp = in.positions->get(topicId, part, refLeader);
-        if (!np || !lp) return false;   // no proof of catch-up → not restorable (safety)
-        return np->logEndPosition >= lp->logEndPosition;
-    };
+    // (The position-based "restorability" — electing / re-seeding into the ISR a
+    //  live replica outside the committed ISR whose reported LEO caught up — is
+    //  retired.  Kafka model (user decision 2026-10-03): elections pick ONLY from
+    //  the committed ISR; a LEO report proves nothing about lineage (a longer log
+    //  may end in an uncommitted old-epoch tail).  A partition leader re-admits
+    //  caught-up followers itself (AlterIsr), which is what un-collapses an ISR.)
 
     // ── 3. Group topics by coPartitionGroup ──────────────────────────────────
     std::map<std::string, std::vector<const TopicSpec*>> namedGroups;
@@ -199,6 +185,26 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
         else
             singletons.push_back(&ts);
     }
+
+    // ── 3b. Per-node preferred-leader imbalance (N3, Kafka ratio) ──────────
+    std::unordered_map<int32_t, int32_t> preferredFor, displacedFrom;
+    if (in.imbalancePct > 0) {
+        for (const auto& ts : in.topics) {
+            for (int32_t p = 0; p < ts.partitionCount; ++p) {
+                const PartitionAssignment* cur = in.cur->get(ts.topicId, p);
+                if (!cur || cur->replicas.empty()) continue;
+                const int32_t pref = cur->replicas[0];
+                ++preferredFor[pref];
+                if (cur->leaderNode != pref) ++displacedFrom[pref];
+            }
+        }
+    }
+    auto imbalanced = [&](int32_t node) {
+        if (in.imbalancePct <= 0) return true;
+        const int32_t total = preferredFor.count(node) ? preferredFor.at(node) : 0;
+        const int32_t off   = displacedFrom.count(node) ? displacedFrom.at(node) : 0;
+        return total > 0 && off * 100 > in.imbalancePct * total;
+    };
 
     // ── 4. Result accumulator ───────────────────────────────────────────────
     std::vector<BalancerRecord> result;
@@ -225,8 +231,27 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
             enum class Action { None, Failover, Preferred };
             Action groupAction = Action::None;
             int32_t computedLeader = NO_LEADER_CHANGE;
+            // Set when computedLeader was chosen by the position-proven survivor
+            // election (a live replica proven to hold the committed prefix, but not in
+            // the stale committed ISR) — the ISR-membership safety assert is satisfied
+            // by position proof instead of committed-ISR membership.
+            bool positionProven = false;
 
             const TopicSpec* driver = nullptr;
+
+            // MAJOR-1: leaders excluded at this partition index (a restarted
+            // ex-leader that asked for a new epoch) — never re-elected here,
+            // never kept in the new ISR.
+            std::vector<int32_t> excluded;
+            for (const auto& ex : in.excludedLeaders)
+                for (const TopicSpec* ts : members)
+                    if (ex.topicId == ts->topicId && ex.partition == p && !isIn(ex.node, excluded))
+                        excluded.push_back(ex.node);
+            auto isExcludedLeader = [&](int32_t topicId, int32_t node) {
+                for (const auto& ex : in.excludedLeaders)
+                    if (ex.topicId == topicId && ex.partition == p && ex.node == node) return true;
+                return false;
+            };
 
             for (const TopicSpec* ts : members) {
                 const PartitionAssignment* cur = in.cur->get(ts->topicId, p);
@@ -241,6 +266,8 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                 // over.  Time-independent: converges off data-plane progress.
                 const bool leaderDead =
                     (cur->leaderNode == NO_LEADER)
+                    || isExcludedLeader(ts->topicId, cur->leaderNode)
+                    || isIn(cur->leaderNode, in.avoidLeaders)   // a stopping leader hands off
                     || (!isIn(cur->leaderNode, in.liveNodes)
                         && !isIn(cur->leaderNode, in.dataPlaneAliveLeaders));
 
@@ -261,17 +288,15 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
 
                     const bool prefIsLive = isIn(preferred, in.liveNodes);
                     if (!prefIsLive) continue;
-                    // Preferred is valid if it is in the ISR, OR — after a transient
-                    // liveness collapse dropped it from the ISR — if it is restorable
-                    // (caught up per positions / RF==N).  Restoring from outside the
-                    // stale ISR is what breaks the "collapsed to survivor forever"
-                    // deadlock; the emit path below re-seeds a healthy ISR so the new
-                    // leader is in its own ISR and acks=majority can commit again.
-                    const bool prefInIsr = isIn(preferred, cur->isr);
-                    if (!prefInIsr &&
-                        !restorable(ts->topicId, p, preferred, cur->leaderNode)) {
-                        continue;
-                    }
+                    // An excluded node (a restarted ex-leader that asked for a
+                    // new epoch, or a node in controlled shutdown) is never a
+                    // leadership target — not even the preferred one.
+                    if (isExcludedLeader(ts->topicId, preferred)) continue;
+                    if (isIn(preferred, in.avoidLeaders)) continue;
+                    if (!imbalanced(preferred)) continue;   // N3: below the ratio
+                    // Kafka: a preferred election only targets a member of the
+                    // committed ISR (the leader's AlterIsr re-admits it first).
+                    if (!isIn(preferred, cur->isr)) continue;
 
                     // Only trigger if it improves balance (preferred leads fewer than current).
                     const int32_t prefLoad    = leaderLoad.count(preferred)
@@ -314,26 +339,114 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
 
                     if (groupIsr.empty()) break;
                 }
-
-                // ── minIsr FLOOR (time-independent liveness guard) ──────────────────
-                // A PARTIAL in-sync set — non-empty but below the commit quorum
-                // (0 < |groupIsr| < minIsr) — is the signature of a transiently
-                // ISOLATED observer (VM CPU starvation / heartbeat jitter), NOT proof
-                // that the peers died.  Failing over here would install ISR<minIsr →
-                // permanent MinIsrViolation → every acks=all produce rejected (the
-                // startup collapse: node1 becomeLeader isr.size=1).  Keep the current
-                // leader and re-converge when a majority returns (a later cycle whose
-                // groupIsr ≥ minIsr does the real failover).  Idempotent, converges for
-                // ANY jitter window, no tuned grace.  A FULLY empty groupIsr (total
-                // loss) still falls through to the NO_LEADER safety path below.
-                if (!groupIsr.empty() &&
-                    groupIsr.size() < static_cast<std::size_t>(in.minIsr)) {
-                    continue;  // below commit quorum → do not fail over this partition
+                if (!excluded.empty()) {
+                    const bool hadExcluded = std::any_of(groupIsr.begin(), groupIsr.end(),
+                        [&](int32_t n) { return isIn(n, excluded); });
+                    std::erase_if(groupIsr, [&](int32_t n) { return isIn(n, excluded); });
+                    // The excluded requester is the only live in-sync member:
+                    // no clean alternative — the caller re-elects it at a new
+                    // epoch (never NO_LEADER / a survivor election from here).
+                    if (groupIsr.empty() && hadExcluded) continue;
+                }
+                // Fix round 2 (N3): a stopping leader still SERVING — heartbeat-
+                // live or data-plane alive (its frontier advances) — keeps a
+                // partition no non-stopping in-sync replica can take.
+                const PartitionAssignment* drv = in.cur->get(driver->topicId, p);
+                const bool leaderServingAndStopping =
+                    drv && isIn(drv->leaderNode, in.avoidLeaders) &&
+                    (isIn(drv->leaderNode, in.liveNodes) || isIn(drv->leaderNode, in.dataPlaneAliveLeaders));
+                if (groupIsr.empty() && leaderServingAndStopping) continue;
+                if (!in.avoidLeaders.empty() && !groupIsr.empty()) {
+                    // Controlled shutdown: prefer a live NON-stopping in-sync
+                    // replica.  With none left: a stopping LEADER keeps the
+                    // partition (sole in-sync replica — no unclean election);
+                    // a DEAD leader's partition goes to the stopping survivor
+                    // (better than offline).
+                    std::vector<int32_t> keep;
+                    for (int32_t n : groupIsr) if (!isIn(n, in.avoidLeaders)) keep.push_back(n);
+                    if (!keep.empty()) groupIsr.swap(keep);
+                    else if (leaderServingAndStopping) continue;
                 }
 
+                // NB: NO minIsr floor here.  A single surviving in-ISR replica
+                // (0 < |groupIsr| < minIsr) is a VALID failover target: it holds the
+                // committed prefix (it was in-sync), so promoting it serves committed
+                // data without loss; new acks=all produce correctly blocks at the
+                // gateway until the ISR re-expands to minIsr.  Blocking this failover
+                // instead stalls the partition on the dead leader FOREVER — clients
+                // keep redirecting to the dead endpoint (committed-loss on read).
+                //
+                // The transient-isolation case a floor once guarded (observer sees a
+                // false eligN=1 while peers are alive) is now prevented upstream: the
+                // FollowerLiveness state machine keeps every live follower's
+                // AppendPosition fresh, so eligibleNodeIds() is ACCURATE — a lone
+                // eligible in-ISR member means the others are genuinely gone.  Split
+                // brain is still impossible: this runs on the consensus leader, which
+                // only holds leadership with a majority quorum.  in.minIsr remains the
+                // gateway produce gate (acks=all), not a failover gate.
                 if (groupIsr.empty()) {
-                    // No node is in-ISR for all members AND live → NO_LEADER for all.
+                    // ── Position-proven clean survivor election ────────────────────
+                    // The committed ISR (intersected over the group) has NO live
+                    // member — it went stale, shrinking to nodes that are now dead
+                    // while the live survivors were never re-admitted (data-plane ISR
+                    // expand not yet propagated to the committed map).  Going NO_LEADER
+                    // here strands the partition forever even though live survivors
+                    // hold the committed prefix (dr5_leader_isolation committed-loss).
+                    //
+                    // SAFETY (no committed loss): a committed record under acks=all was
+                    // durable on >= minIsr replicas.  If MORE than (RF - minIsr)
+                    // replicas survive, at least one record-holder survives; the
+                    // highest-(leaderEpoch,leo) live survivor holds a superset of every
+                    // live replica's log, hence the full committed prefix.  Electing it
+                    // is a CLEAN election (becomeLeader caps the committed floor at the
+                    // new leader's HW view, so no uncommitted tail is exposed).  Gate on
+                    // the survivor count so a genuine minority still (correctly) stays
+                    // NO_LEADER.  Time-independent: decided off positions, not timing.
                     computedLeader = NO_LEADER;
+                    positionProven = false;
+                    // MEDIUM-3: opt-in only (Kafka: offline unless unclean
+                    // election is enabled) — default stays NO_LEADER below.
+                    for (const TopicSpec* ts : members) {
+                        if (!in.allowSurvivorElection) break;
+                        const PartitionAssignment* mc = in.cur->get(ts->topicId, p);
+                        if (!mc || mc->replicas.empty() || !in.positions) {
+                            computedLeader = NO_LEADER; positionProven = false; break;
+                        }
+                        const int rf = static_cast<int>(mc->replicas.size());
+                        // Count only live replicas that REPORTED a position: an
+                        // unreported one may be the only live holder, and the best
+                        // reported replica would then lack committed records.
+                        int liveInReplicas = 0;
+                        for (int32_t r : mc->replicas)
+                            if (isIn(r, in.liveNodes) && in.positions->get(ts->topicId, p, r).has_value())
+                                ++liveInReplicas;
+                        // Need strictly more than (RF - minIsr) survivors for the
+                        // pigeonhole completeness guarantee to hold.
+                        if (liveInReplicas < (rf - in.minIsr + 1)) {
+                            computedLeader = NO_LEADER; positionProven = false; break;
+                        }
+                        // Highest-(epoch,leo) live replica WITH a position report.
+                        int32_t best = NO_LEADER;
+                        rune::consensus::Term bestEp = -1; int64_t bestLeo = -1;
+                        for (int32_t r : mc->replicas) {
+                            if (!isIn(r, in.liveNodes)) continue;
+                            auto opt = in.positions->get(ts->topicId, p, r);
+                            if (!opt.has_value()) continue; // no proof → not a candidate
+                            const auto ep  = static_cast<rune::consensus::Term>(opt->leaderEpoch);
+                            const auto leo = opt->logEndPosition;
+                            const int cmp = (best == NO_LEADER) ? 1
+                                : rune::consensus::ClusterMember::compareLog(ep, leo, bestEp, bestLeo);
+                            if (cmp > 0 || (cmp == 0 && r < best)) {
+                                best = r; bestEp = ep; bestLeo = leo;
+                            }
+                        }
+                        if (best == NO_LEADER) { computedLeader = NO_LEADER; positionProven = false; break; }
+                        // All members of a co-partition group must agree on one leader:
+                        // require the SAME survivor across members (they co-partition).
+                        if (computedLeader == NO_LEADER) computedLeader = best;
+                        else if (computedLeader != best) { computedLeader = NO_LEADER; positionProven = false; break; }
+                        positionProven = true;
+                    }
                 } else {
                     // Run FailoverElection with the intersected ISR to pick a winner.
                     // We synthesise a proxy PartitionAssignment whose ISR is the group
@@ -365,7 +478,13 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                 // Per-member safety assert: computedLeader must be in member.isr ∧ live,
                 // OR computedLeader == NO_LEADER (intersection was empty).
                 // If intersection logic is correct this always holds; assert defensively.
-                if (computedLeader != NO_LEADER) {
+                // EXCEPTION: a position-proven survivor election (positionProven) elects
+                // a live replica that is NOT in the stale committed ISR but is proven by
+                // the ReplicaPositionTable to hold the committed prefix — its safety comes
+                // from position proof + the survivor-count gate, not ISR membership, so we
+                // only require it to be live (never let it be outside the replica set,
+                // which the election above already guarantees).
+                if (computedLeader != NO_LEADER && !positionProven) {
                     for (const TopicSpec* ts : members) {
                         const PartitionAssignment* mc = in.cur->get(ts->topicId, p);
                         if (!mc) continue;
@@ -376,6 +495,9 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                             break;
                         }
                     }
+                } else if (computedLeader != NO_LEADER && positionProven) {
+                    // Position-proven: only require liveness (defence-in-depth).
+                    if (!isIn(computedLeader, in.liveNodes)) computedLeader = NO_LEADER;
                 }
             } else {
                 // Preferred-leader: use replicas[0] of the driver.
@@ -386,20 +508,15 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                 // ── Safety: the candidate must be safe leader for EVERY member.
                 //
                 // Preferred-leader is a best-effort optimisation, not a safety op.
-                // "Safe" = live AND holds the committed prefix for that member —
-                // either already in the member's ISR, OR restorable (caught up per
-                // positions / RF==N) after a transient-liveness collapse dropped it
-                // from the ISR.  Restoration re-seeds the ISR in the emit path below.
-                // If it can't move as a unit safely, skip the whole group.
+                // "Safe" = live AND in the member's committed ISR (Kafka).  If it
+                // can't move as a unit safely, skip the whole group.
                 // ─────────────────────────────────────────────────────────────────────
                 bool safeForAll = isIn(candidate, in.liveNodes);
                 if (safeForAll) {
                     for (const TopicSpec* ts : members) {
                         const PartitionAssignment* mc = in.cur->get(ts->topicId, p);
                         if (!mc) { safeForAll = false; break; }
-                        const bool inIsr = isIn(candidate, mc->isr);
-                        if (!inIsr &&
-                            !restorable(ts->topicId, p, candidate, mc->leaderNode)) {
+                        if (!isIn(candidate, mc->isr)) {
                             safeForAll = false;
                             break;
                         }
@@ -423,47 +540,45 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                 chg.newLeader = computedLeader;
 
                 if (groupAction == Action::Failover) {
-                    // New ISR = cur.isr ∩ liveNodes ∩ groupIsr-winner neighbourhood,
-                    // with elected leader first.  For the NO_LEADER case the new ISR
-                    // is empty (no live in-sync replica for this member).
-                    std::vector<int32_t> newIsr;
-                    newIsr.reserve(cur->isr.size());
                     if (computedLeader != NO_LEADER) {
+                        // New ISR = cur.isr ∩ liveNodes with the elected leader first.
+                        std::vector<int32_t> newIsr;
+                        newIsr.reserve(cur->isr.size());
                         newIsr.push_back(computedLeader);
                         for (int32_t node : cur->isr) {
-                            if (node != computedLeader && isIn(node, in.liveNodes))
+                            if (node != computedLeader && isIn(node, in.liveNodes) &&
+                                !isIn(node, excluded) && !isIn(node, in.avoidLeaders))
                                 newIsr.push_back(node);
                         }
+                        chg.newIsr = std::move(newIsr);
+                    } else {
+                        // NO_LEADER (no live in-sync survivor): RETAIN the ISR lineage
+                        // — do NOT clear it.  cur.isr is the set of replicas that held
+                        // the committed prefix when the last survivor died.  Clearing
+                        // it to {} made the partition PERMANENTLY offline: every later
+                        // tick recomputed proposedIsr = {} ∩ liveNodes = {} → NO_LEADER
+                        // forever, even after a former-ISR replica rejoined caught-up
+                        // (dr3 rolling leader-kill: partitions stuck NO_LEADER, produce
+                        // 44/50).  Retaining cur.isr lets a returning in-sync replica be
+                        // cleanly re-elected on a later tick (FailoverElection then finds
+                        // a non-empty proposed ISR).  Kafka parity: an offline partition
+                        // keeps its ISR lineage; recovery is a clean election, never
+                        // unclean.  newIsr == cur.isr → mergeChange applies only the
+                        // leader→NO_LEADER flip, no spurious ISR churn.
+                        chg.newIsr = cur->isr;
                     }
-                    chg.newIsr      = std::move(newIsr);
                     chg.newReplicas = {};  // replica set unchanged
                 } else {
-                    // Preferred-leader.
-                    if (isIn(computedLeader, cur->isr)) {
-                        // Normal case: elected leader already in ISR → ISR unchanged.
-                        chg.newIsr      = {};
-                    } else {
-                        // Restoration from a collapsed ISR (transient-liveness recovery):
-                        // the elected leader was dropped from the ISR during the earlier
-                        // failover shrink.  Re-seed a healthy ISR = {newLeader} ∪ the live
-                        // restorable replicas (caught up per positions / RF==N), so the
-                        // leader is in its own ISR and the set reaches minIsr again.  The
-                        // data-plane IsrManager maintains it from here.
-                        std::vector<int32_t> newIsr;
-                        newIsr.push_back(computedLeader);
-                        for (int32_t node : cur->replicas) {
-                            if (node == computedLeader) continue;
-                            if (isIn(node, in.liveNodes) &&
-                                restorable(ts->topicId, p, node, cur->leaderNode))
-                                newIsr.push_back(node);
-                        }
-                        // Retain any current ISR members still live but not already added
-                        // (e.g. the survivor that has been leading).
-                        for (int32_t node : cur->isr)
-                            if (!isIn(node, newIsr) && isIn(node, in.liveNodes))
-                                newIsr.push_back(node);
-                        chg.newIsr = std::move(newIsr);
-                    }
+                    // Preferred-leader: the elected leader is in every member's
+                    // committed ISR (checked above) → the ISR is carried over
+                    // unchanged (leader first).  NB mergeChange applies newIsr
+                    // literally — an empty one would EMPTY the committed ISR.
+                    std::vector<int32_t> newIsr;
+                    newIsr.reserve(cur->isr.size());
+                    newIsr.push_back(computedLeader);
+                    for (int32_t node : cur->isr)
+                        if (node != computedLeader) newIsr.push_back(node);
+                    chg.newIsr = std::move(newIsr);
                     chg.newReplicas = {};
                 }
 

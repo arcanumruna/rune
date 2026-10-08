@@ -109,6 +109,9 @@ public:
         amap.forEach([&](int32_t topicId, int32_t partition,
                          const PartitionAssignment& pa)
         {
+            // Internal (coordinator) partitions are in the map too (re-review
+            // MEDIUM-B) but are not client-routed: no gpid.
+            if (topicId < 0) return;
             const int32_t gpid = gpidOf(topicId, partition);
             assert(gpid >= 0 && "gpidOf must return a non-negative gpid");
             if (gpid < 0) return;  // release-safe: skip rather than corrupt

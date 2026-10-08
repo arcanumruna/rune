@@ -288,13 +288,11 @@ private:
             }
         });
 
-        // Wait for cnc.dat to appear (bounded).
+        // No caller-side pumping: aeron_driver_init/start already wrote cnc.dat
+        // and stamped the heartbeat synchronously before driverThread_ even
+        // starts; pumping here would be a second concurrent pumper on the
+        // single-pumper driver (spec Sec 3.6).
         const std::string cncPath = aeronDir + "/cnc.dat";
-        for (int i = 0; i < 400; ++i) {
-            aeron_driver_main_do_work(driver_);
-            if (fs::exists(cncPath)) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds{1});
-        }
         ASSERT_TRUE(fs::exists(cncPath))
             << "Aeron CnC file not created within timeout";
     }
@@ -354,6 +352,10 @@ TEST_F(GatewayLoopbackFixture, Connect_RoundTrip) {
     EXPECT_GE(resp.assignedSessionId, 1);
     EXPECT_EQ(resp.leaderMemberId, kThisNodeId);
     EXPECT_EQ(gw_->sessionCount(), 1u);
+    // CG round 3/4: the broker advertises its version (the 42-byte form,
+    // golden connect_response_v3.bin) and its session ids carry its node id.
+    EXPECT_EQ(resp.brokerVersion, pc::kBrokerVersion);
+    EXPECT_EQ(resp.assignedSessionId >> 40, static_cast<int64_t>(kThisNodeId) + 1);
 }
 
 // ===========================================================================
@@ -950,13 +952,11 @@ TEST_F(GatewayLoopbackFixture, MultiplePings_AllPongsReceived) {
 //
 // Strategy: send a ConnectRequest whose egressChannel is "aeron:bogus" — a
 // syntactically parseable-but-invalid channel that Aeron's media driver will
-// reject.  resolvePublication() catches the resulting exception and returns
-// nullptr; handleConnect() sees nullptr and returns early (no session added).
+// reject.  The async pending-connect path sees the registration error and
+// drops the connect (no session added).
 //
-// Note on timing: Aeron rejects the channel at the driver level without
-// waiting the full kResolveMaxMs=5s timeout, so the test completes quickly.
-// In the unlikely event the rejection is delayed, this test is still bounded
-// by a single occurrence of the resolve path and by the outer pump() deadline.
+// Note on timing: Aeron rejects the channel at the driver level, so the test
+// completes quickly; it is bounded by the outer pump() deadline.
 // ===========================================================================
 TEST_F(GatewayLoopbackFixture, UnresolvableEgressChannel_NoSession_GatewayKeepsServing) {
     // We need a raw ingress publication to send the bad ConnectRequest.

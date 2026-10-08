@@ -57,11 +57,14 @@ static std::vector<uint8_t> makeDataBatch(int64_t baseOffset,
 }
 
 // Build a LE data batch with a specific producerId stamped in via setProducerId().
+// The pid models a TRANSACTIONAL producer, so the TRANSACTIONAL attribute is set
+// as on every real txn batch (F15 N3: only a transactional batch opens a txn).
 static std::vector<uint8_t> makeDataBatchWithPid(int64_t baseOffset, int64_t producerId,
                                                   std::string_view value = "data")
 {
     rune::protocol::RecordBatchBuilder builder(baseOffset, /*baseTimestamp=*/1000);
     builder.setProducerId(producerId);
+    builder.setTransactional(producerId >= 0);
     builder.append({}, value, 1000);
     return builder.build();
 }

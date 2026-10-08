@@ -21,6 +21,7 @@
 #include <concurrent/AtomicBuffer.h>
 
 #include <functional>
+#include <utility>
 #include <cstdint>
 #include <cstddef>
 #include <vector>
@@ -45,6 +46,7 @@ class IngressRing {
 public:
     // (msgTypeId, AtomicBuffer& buf, encodedOffset, length) — same shape as
     // agrona's handler_t, defined here so we don't depend on the stock ring header.
+    // Legacy alias (callers may still name the shape; drain() takes any callable).
     using DrainHandler = std::function<void(std::int32_t,
                                             aeron::concurrent::AtomicBuffer&,
                                             aeron::util::index_t,
@@ -95,8 +97,18 @@ public:
     // -----------------------------------------------------------------------
 
     /// Drain up to limit messages, invoking handler for each.  Returns count read.
-    int drain(const DrainHandler& handler, int limit = 10) {
-        return ring_.read(handler, limit);
+    /// TEMPLATED (Task 11 fix 2, B1): the handler is inlined into the ring read —
+    /// never wrapped in a std::function on the per-cycle drain.
+    template <class Handler>
+    int drain(Handler&& handler, int limit = 10) {
+        return ring_.read(std::forward<Handler>(handler), limit);
+    }
+
+    /// Controlled drain: handler returns true to consume, false to ABORT (the
+    /// message stays in the ring and is re-read next drain).  Returns consumed.
+    template <class Handler>
+    int controlledDrain(Handler&& handler, int limit = 10) {
+        return ring_.controlledRead(std::forward<Handler>(handler), limit);
     }
 
     // -----------------------------------------------------------------------
@@ -105,6 +117,9 @@ public:
 
     int64_t producerPosition() const { return ring_.producerPosition(); }
     int64_t consumerPosition() const { return ring_.consumerPosition(); }
+
+    /// Payload capacity in bytes (power of two).
+    std::size_t capacity() const { return static_cast<std::size_t>(ring_.capacity()); }
 
     /// Largest single message the ring accepts (agrona: capacity / 8).  write()/
     /// tryClaim() reject a larger message — callers that frame variable-length

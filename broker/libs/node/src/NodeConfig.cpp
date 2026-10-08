@@ -1,9 +1,17 @@
 #include <rune/node/NodeConfig.h>
+#include <rune/consensus/PeerResolution.h>
+#include <rune/node/Worker.h>
+#include <rune/storage/Log.h>                       // Log::kMaxRollBytes                         // Worker::maxAcceptableBatchBytes (THE batch limit)
+
+#include <stdexcept>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cerrno>
 #include <charconv>
+#include <filesystem>
+#include <optional>
 #include <cstdlib>
 #include <sstream>
 #include <string_view>
@@ -71,83 +79,63 @@ static bool parsePort(std::string_view sv, uint16_t& out) {
     return true;
 }
 
-/// Parse one peer entry of the form "id@host:consensusPort[:clientPort[:replPort]]".
-/// Optional segments (backward-compatible):
-///   - "1@host:40111"               → consensusPort=40111, clientPort=0, replPort=0
-///   - "1@host:40111:40200"         → consensusPort=40111, clientPort=40200, replPort=0
-///   - "1@host:40111:40200:40300"   → consensusPort=40111, clientPort=40200, replPort=40300
+/// Parse one peer entry of the form
+///   "id@host:consensusPort[:clientPort[:replPort[:replBasePort[:ingressBasePort[:egressControlBasePort]]]]]".
+/// Optional segments (backward-compatible; absent → 0):
+///   - "1@host:40111"                         → consensusPort=40111
+///   - "1@host:40111:40200"                   → + clientPort=40200
+///   - "1@host:40111:40200:40300"             → + replPort=40300
+///   - "1@host:40111:40200:40300:40600:40500" → + replBasePort=40600, ingressBasePort=40500
+///     (self-contained worker shards, spec §3.3: worker w uses base + w)
+///   - 6th segment: egressControlBasePort (per-worker dynamic-MDC egress control,
+///     advertised to clients for partitions the peer leads; 2026-10-02).
+/// More than 6 port segments is an error.
 /// Returns an error string on failure or an empty string on success.
 static std::string parsePeer(std::string_view entry, PeerConfig& out) {
     auto at = entry.find('@');
     if (at == std::string_view::npos)
         return std::string("malformed peer entry (missing '@'): ") + std::string(entry);
-
     std::string_view idPart   = trim(entry.substr(0, at));
     std::string_view hostPort = trim(entry.substr(at + 1));
-
     int32_t id{};
     if (!parseInt32(idPart, id))
         return std::string("peer id is not a valid integer in entry: ") + std::string(entry);
-
-    // Split on the FIRST colon for host.
     auto firstColon = hostPort.find(':');
     if (firstColon == std::string_view::npos)
         return std::string("malformed peer entry (missing ':' in host:port): ") + std::string(entry);
-
-    std::string_view host        = trim(hostPort.substr(0, firstColon));
-    std::string_view remainder   = trim(hostPort.substr(firstColon + 1));
-
+    std::string_view host = trim(hostPort.substr(0, firstColon));
     if (host.empty())
         return std::string("peer host is empty in entry: ") + std::string(entry);
 
-    // remainder may be: "consensusPort" | "consensusPort:clientPort" | "consensusPort:clientPort:replPort"
-    auto secondColon = remainder.find(':');
-
-    std::string_view consensusPortPart;
-    std::string_view clientPortPart;
-    std::string_view replPortPart;
-    bool hasClientPort = false;
-    bool hasReplPort   = false;
-
-    if (secondColon == std::string_view::npos) {
-        // Two-segment: no clientPort.
-        consensusPortPart = remainder;
-    } else {
-        // Three-or-four-segment: consensusPort:clientPort[:replPort].
-        consensusPortPart = trim(remainder.substr(0, secondColon));
-        std::string_view rest2 = trim(remainder.substr(secondColon + 1));
-        auto thirdColon = rest2.find(':');
-        if (thirdColon == std::string_view::npos) {
-            clientPortPart = rest2;
-        } else {
-            clientPortPart = trim(rest2.substr(0, thirdColon));
-            replPortPart   = trim(rest2.substr(thirdColon + 1));
-            hasReplPort    = true;
-        }
-        hasClientPort = true;
+    // consensusPort[:clientPort[:replicationPort[:replBasePort[:ingressBasePort]]]]
+    static constexpr const char* kNames[6] = {
+        "consensusPort", "clientPort", "replicationPort", "replBasePort", "ingressBasePort",
+        "egressControlBasePort"};
+    std::array<std::string_view, 6> parts{};
+    std::size_t n = 0;
+    std::string_view rem = trim(hostPort.substr(firstColon + 1));
+    for (;;) {
+        if (n == parts.size())
+            return std::string("too many ':' port segments (max 6) in peer entry: ") + std::string(entry);
+        const auto c = rem.find(':');
+        parts[n++] = trim(c == std::string_view::npos ? rem : rem.substr(0, c));
+        if (c == std::string_view::npos) break;
+        rem = rem.substr(c + 1);
     }
-
-    uint16_t consensusPort{};
-    if (!parsePort(consensusPortPart, consensusPort))
-        return std::string("peer consensusPort is invalid or out of range in entry: ") + std::string(entry);
-
-    uint16_t clientPort = 0;
-    if (hasClientPort) {
-        if (!parsePort(clientPortPart, clientPort))
-            return std::string("peer clientPort is invalid or out of range in entry: ") + std::string(entry);
+    std::array<uint16_t, 6> ports{};
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!parsePort(parts[i], ports[i]))
+            return std::string("peer ") + kNames[i] + " is invalid or out of range in entry: " +
+                   std::string(entry);
     }
-
-    uint16_t replPort = 0;
-    if (hasReplPort) {
-        if (!parsePort(replPortPart, replPort))
-            return std::string("peer replicationPort is invalid or out of range in entry: ") + std::string(entry);
-    }
-
-    out.id               = id;
-    out.host             = std::string(host);
-    out.consensusPort    = consensusPort;
-    out.clientPort       = clientPort;
-    out.replicationPort  = replPort;
+    out.id              = id;
+    out.host            = std::string(host);
+    out.consensusPort   = ports[0];
+    out.clientPort      = ports[1];
+    out.replicationPort = ports[2];
+    out.replBasePort    = ports[3];
+    out.ingressBasePort = ports[4];
+    out.egressControlBasePort = ports[5];
     return {};
 }
 
@@ -184,8 +172,315 @@ const PeerConfig& NodeConfig::self() const {
 }
 
 // ---------------------------------------------------------------------------
+// NodeConfig::validateStreamRanges  (Task 1 — per-worker replication transport)
+// ---------------------------------------------------------------------------
+
+std::optional<std::string> NodeConfig::validateStreamRanges() const {
+    if (workerCount <= 0) return std::nullopt;  // empty range — nothing to check
+
+    // Helper: does the range [base, base+count-1] contain the single stream id?
+    auto rangeContains = [](int32_t base, int32_t count, int32_t id) -> bool {
+        return id >= base && id < base + count;
+    };
+
+    // Helper: do two ranges [a, a+ac-1] and [b, b+bc-1] overlap?
+    auto rangesOverlap = [](int32_t a, int32_t ac, int32_t b, int32_t bc) -> bool {
+        return a < b + bc && b < a + ac;
+    };
+
+    const int32_t base  = replBaseStreamId;
+    const int32_t count = workerCount;
+
+    // Check vs. clientStreamId (single stream).
+    if (rangeContains(base, count, clientEndpoint.streamId)) {
+        return "RUNE_REPL_BASE_STREAM_ID range [" + std::to_string(base) + ", " +
+               std::to_string(base + count - 1) + "] overlaps clientStreamId=" +
+               std::to_string(clientEndpoint.streamId);
+    }
+
+    // Check vs. consensusStreamId (single stream).
+    if (rangeContains(base, count, consensusStreamId)) {
+        return "RUNE_REPL_BASE_STREAM_ID range [" + std::to_string(base) + ", " +
+               std::to_string(base + count - 1) + "] overlaps consensusStreamId=" +
+               std::to_string(consensusStreamId);
+    }
+
+    // Check vs. replicationStreamId (single stream).
+    if (rangeContains(base, count, replicationStreamId)) {
+        return "RUNE_REPL_BASE_STREAM_ID range [" + std::to_string(base) + ", " +
+               std::to_string(base + count - 1) + "] overlaps replicationStreamId=" +
+               std::to_string(replicationStreamId);
+    }
+
+    // Check vs. workerIngress range [workerIngressBaseStreamId, +workerCount-1].
+    if (workerIngressBaseStreamId > 0 &&
+        rangesOverlap(base, count, workerIngressBaseStreamId, workerCount)) {
+        return "RUNE_REPL_BASE_STREAM_ID range [" + std::to_string(base) + ", " +
+               std::to_string(base + count - 1) + "] overlaps workerIngress range [" +
+               std::to_string(workerIngressBaseStreamId) + ", " +
+               std::to_string(workerIngressBaseStreamId + workerCount - 1) + "]";
+    }
+
+    // Check vs. workerEgress range [workerEgressBaseStreamId, +workerCount-1]
+    // (only when explicitly set — 0 means unresolved).
+    if (workerEgressBaseStreamId > 0 &&
+        rangesOverlap(base, count, workerEgressBaseStreamId, workerCount)) {
+        return "RUNE_REPL_BASE_STREAM_ID range [" + std::to_string(base) + ", " +
+               std::to_string(base + count - 1) + "] overlaps workerEgress range [" +
+               std::to_string(workerEgressBaseStreamId) + ", " +
+               std::to_string(workerEgressBaseStreamId + workerCount - 1) + "]";
+    }
+
+    return std::nullopt;  // no overlap detected
+}
+
+// ---------------------------------------------------------------------------
+// Self-contained worker shards (spec §3.3): per-worker channels + validation
+// ---------------------------------------------------------------------------
+
+std::string NodeConfig::clientBindHost() const {
+    const std::string_view ch = clientEndpoint.channel;
+    const auto ep = ch.find("endpoint=");
+    if (ep == std::string_view::npos) return "0.0.0.0";
+    std::string_view hp = ch.substr(ep + 9);
+    if (const auto bar = hp.find('|'); bar != std::string_view::npos) hp = hp.substr(0, bar);
+    const auto colon = hp.rfind(':');
+    return std::string(colon == std::string_view::npos ? hp : hp.substr(0, colon));
+}
+namespace {
+// Absolute, symlink-resolved (for the existing prefix), lexically normal, with no
+// trailing empty element, so "/a/b/", "/a/./b" and "/a/b/c/.." compare equal.
+std::filesystem::path normalizedDir(const std::string& p) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path abs = fs::absolute(p, ec);
+    if (ec) abs = fs::path{p};
+    fs::path canon = fs::weakly_canonical(abs, ec);
+    fs::path out = (ec ? abs : canon).lexically_normal();
+    if (!out.has_filename() && out != out.root_path()) out = out.parent_path();
+    return out;
+}
+} // namespace
+
+std::optional<std::string> NodeConfig::validateAeronDir() const {
+    if (aeronDir.empty()) return std::nullopt;   // default dataDir/aeron is always safe
+    const auto a = normalizedDir(aeronDir);
+    if (a == a.root_path())
+        return "RUNE_AERON_DIR must not be a filesystem root (" + aeronDir +
+               "): the embedded Aeron driver deletes its directory on start/shutdown";
+    if (dataDir.empty()) return std::nullopt;
+    const auto d = normalizedDir(dataDir);
+    auto ai = a.begin();
+    auto di = d.begin();
+    for (; ai != a.end() && di != d.end(); ++ai, ++di)
+        if (*ai != *di) return std::nullopt;     // diverged → neither contains the other
+    if (ai == a.end())                           // aeronDir == dataDir or is its ancestor
+        return "RUNE_AERON_DIR (" + aeronDir + ") equals or contains RUNE_DATA_DIR (" +
+               dataDir + "): the embedded Aeron driver recursively deletes its directory "
+               "on start/shutdown and would wipe the log";
+    return std::nullopt;
+}
+
+// Shard channel helpers are only meaningful after validateShardConfig() passed
+// (shard mode, explicit base ports, w in [0, W)).  Called on anything else they
+// refuse loudly (logic_error) instead of dereferencing an unset optional or
+// building a port-0 channel.
+namespace {
+void requireShardWorker(int32_t w, int32_t workerCount, const char* what) {
+    const int32_t W = workerCount >= 1 ? workerCount : 1;
+    if (w < 0 || w >= W)
+        throw std::logic_error(std::string(what) + ": worker " + std::to_string(w) +
+                               " out of range [0, " + std::to_string(W) + ")");
+}
+} // namespace
+
+std::string NodeConfig::shardIngressBindChannel(int32_t w) const {
+    if (!workerIngressBasePort)
+        throw std::logic_error("shardIngressBindChannel: RUNE_WORKER_INGRESS_BASE_PORT unset "
+                               "(only valid after validateShardConfig)");
+    requireShardWorker(w, workerCount, "shardIngressBindChannel");
+    return "aeron:udp?endpoint=" + clientBindHost() + ":" + std::to_string(*workerIngressBasePort + w);
+}
+std::string NodeConfig::shardReplBindChannel(int32_t w) const {
+    if (!workerReplBasePort)
+        throw std::logic_error("shardReplBindChannel: RUNE_WORKER_REPL_BASE_PORT unset "
+                               "(only valid after validateShardConfig)");
+    requireShardWorker(w, workerCount, "shardReplBindChannel");
+    return "aeron:udp?endpoint=" + peerBindHost() + ":" + std::to_string(*workerReplBasePort + w);
+}
+std::string NodeConfig::peerBindHost() const {
+    if (!peerBindHostOverride.empty()) return peerBindHostOverride;
+    const std::string& h = self().host;
+    return rune::consensus::PeerHostTable::isNumericHost(h) ? h : std::string("0.0.0.0");
+}
+std::string NodeConfig::selfConsensusBindChannel() const {
+    return "aeron:udp?endpoint=" + peerBindHost() + ":" + std::to_string(self().consensusPort);
+}
+std::string NodeConfig::selfReplicationBindChannel() const {
+    if (self().replicationPort == 0) return {};
+    return "aeron:udp?endpoint=" + peerBindHost() + ":" + std::to_string(self().replicationPort);
+}
+std::string NodeConfig::shardPeerReplChannel(const PeerConfig& p, int32_t w) {
+    if (p.replBasePort == 0 || w < 0)
+        throw std::logic_error("shardPeerReplChannel: peer " + std::to_string(p.id) +
+                               " has no replBasePort / bad worker " + std::to_string(w) +
+                               " (only valid after validateShardConfig)");
+    return "aeron:udp?endpoint=" + p.host + ":" + std::to_string(static_cast<int32_t>(p.replBasePort) + w);
+}
+std::string NodeConfig::shardIngressEndpoint(const PeerConfig& p, int32_t w) {
+    if (p.ingressBasePort == 0 || w < 0)
+        throw std::logic_error("shardIngressEndpoint: peer " + std::to_string(p.id) +
+                               " has no ingressBasePort / bad worker " + std::to_string(w));
+    return p.host + ":" + std::to_string(static_cast<int32_t>(p.ingressBasePort) + w);
+}
+
+// F18 ⇄ F15 S3 (integration wave 2): a thin wrapper over the ONE batch-limit
+// formula.  Replication terms apply even single-node (the limit must not change
+// when a node joins a cluster); every publication — replication and client
+// egress — uses the embedded driver's term (no channel overrides term-length).
+static_assert(NodeConfig::kDefaultMaxProduceBatchBytes == Worker::kMaxProduceBatchBytes,
+              "one 8 MiB ceiling");
+std::size_t NodeConfig::batchLimitFormula() const {
+    const auto term = static_cast<std::size_t>(aeronTermBufferBytes);
+    return Worker::maxAcceptableBatchBytes(
+        static_cast<std::size_t>(workerIngressRingBytes),
+        static_cast<std::size_t>(workerReturnRingBytes),
+        static_cast<std::size_t>(replicationOutboundRingBytes),
+        term,    // replication publications
+        term,    // client egress publications
+        term);   // client Produce frame on the broker's term (F3)
+}
+
+int32_t NodeConfig::produceIntakeLimit() const {
+    std::size_t limit = batchLimitFormula();
+    // F3 round 4: an EXPLICIT RUNE_MAX_PRODUCE_BATCH_BYTES can only LOWER it
+    // (BrokerNode refuses to start when it exceeds the formula).
+    if (maxProduceBatchBytes && *maxProduceBatchBytes > 0)
+        limit = std::min(limit, static_cast<std::size_t>(*maxProduceBatchBytes));
+    return static_cast<int32_t>(limit);
+}
+
+std::optional<std::string> NodeConfig::validateShardConfig() const {
+    if (fused() && !shardMode())
+        return std::string("RUNE_RUNTIME_PLACEMENT=fused requires RUNE_WORKER_MODE=shard");
+    if (!shardMode()) return std::nullopt;
+
+    const int32_t W = workerCount >= 1 ? workerCount : 1;
+    if (W > kMaxShardWorkers)
+        return "shard mode supports at most " + std::to_string(kMaxShardWorkers) +
+               " workers per node, got RUNE_WORKERS=" + std::to_string(W);
+    // Every per-worker base port must be explicit and its whole range [base, base+W-1]
+    // must be a valid port range (no silent default in shard mode).
+    auto checkBase = [W](const std::optional<int32_t>& base, const char* env) -> std::optional<std::string> {
+        if (!base.has_value())
+            return std::string("shard mode requires ") + env + " to be set explicitly";
+        if (*base < 1 || *base + W - 1 > 65535)
+            return std::string("shard mode requires ") + env + " in [1, " + std::to_string(65536 - W) +
+                   "], got " + std::to_string(*base);
+        return std::nullopt;
+    };
+    if (auto e = checkBase(workerIngressBasePort, "RUNE_WORKER_INGRESS_BASE_PORT")) return e;
+    if (auto e = checkBase(workerReplBasePort, "RUNE_WORKER_REPL_BASE_PORT")) return e;
+    if (auto e = checkBase(workerEgressControlBasePort, "RUNE_WORKER_EGRESS_CONTROL_BASE_PORT")) return e;
+    const int32_t ingressBase = *workerIngressBasePort;
+    const int32_t replBase    = *workerReplBasePort;
+    const int32_t egressBase  = effectiveWorkerEgressControlBasePort();
+
+    for (const auto& p : peers) {
+        if (p.replBasePort == 0)
+            return "shard mode requires replBasePort for peer " + std::to_string(p.id) +
+                   " in RUNE_PEERS (id@host:consensus:client:repl:replBase:ingressBase)";
+        if (p.ingressBasePort == 0)
+            return "shard mode requires ingressBasePort for peer " + std::to_string(p.id) +
+                   " in RUNE_PEERS (id@host:consensus:client:repl:replBase:ingressBase)";
+        if (p.id != nodeId && p.workerCount != 0 && p.workerCount != W)
+            return "shard mode requires a symmetric worker count: peer " + std::to_string(p.id) +
+                   " advertises " + std::to_string(p.workerCount) + ", self has " + std::to_string(W);
+    }
+    const PeerConfig& me = self();
+    if (me.replBasePort != replBase)
+        return "RUNE_WORKER_REPL_BASE_PORT=" + std::to_string(replBase) +
+               " disagrees with self RUNE_PEERS replBasePort=" + std::to_string(me.replBasePort) +
+               " (an unadvertised base is the DERIVED one every peer computes — advertise it in RUNE_PEERS)";
+    if (me.ingressBasePort != ingressBase)
+        return "RUNE_WORKER_INGRESS_BASE_PORT=" + std::to_string(ingressBase) +
+               " disagrees with self RUNE_PEERS ingressBasePort=" + std::to_string(me.ingressBasePort) +
+               " (an unadvertised base is the DERIVED one every peer computes — advertise it in RUNE_PEERS)";
+    if (me.egressControlBasePort != 0 && me.egressControlBasePort != egressBase)
+        return "RUNE_WORKER_EGRESS_CONTROL_BASE_PORT=" + std::to_string(egressBase) +
+               " disagrees with self RUNE_PEERS egressControlBasePort=" + std::to_string(me.egressControlBasePort) +
+               " (peers advertise it to clients; an unadvertised base is the DERIVED one — advertise it as the "
+               "6th RUNE_PEERS segment)";
+
+    struct Bind { int32_t port; std::string what; };
+    std::vector<Bind> binds;
+    binds.push_back({me.consensusPort, "consensusPort"});
+    if (me.clientPort != 0)      binds.push_back({me.clientPort, "clientPort"});
+    if (me.replicationPort != 0) binds.push_back({me.replicationPort, "replicationPort"});
+    for (int32_t w = 0; w < W; ++w) {
+        const std::string tag = "[w" + std::to_string(w) + "]";
+        binds.push_back({ingressBase + w, "workerIngress" + tag});
+        binds.push_back({replBase + w, "workerRepl" + tag});
+        binds.push_back({egressBase + w, "workerEgressControl" + tag});
+    }
+    for (std::size_t i = 0; i < binds.size(); ++i)
+        for (std::size_t j = i + 1; j < binds.size(); ++j)
+            if (binds[i].port == binds[j].port)
+                return "port collision: " + binds[i].what + " and " + binds[j].what +
+                       " both bind " + std::to_string(binds[i].port);
+
+    for (const auto& p : peers) {
+        if (p.id == nodeId || p.host != me.host) continue;       // only co-located peers can collide
+        std::vector<Bind> theirs{{p.consensusPort, "consensusPort"}};
+        if (p.clientPort != 0)      theirs.push_back({p.clientPort, "clientPort"});
+        if (p.replicationPort != 0) theirs.push_back({p.replicationPort, "replicationPort"});
+        for (int32_t w = 0; w < W; ++w) {
+            theirs.push_back({p.ingressBasePort + w, "workerIngress[w" + std::to_string(w) + "]"});
+            theirs.push_back({p.replBasePort + w, "workerRepl[w" + std::to_string(w) + "]"});
+        }
+        for (const auto& a : binds)
+            for (const auto& b : theirs)
+                if (a.port == b.port)
+                    return "port collision with co-located peer " + std::to_string(p.id) + " (" +
+                           p.host + "): our " + a.what + " and its " + b.what + " both use " +
+                           std::to_string(a.port);
+    }
+    return validateStreamRanges();
+}
+
+// ---------------------------------------------------------------------------
 // parseNodeConfig
 // ---------------------------------------------------------------------------
+
+std::optional<std::vector<int32_t>> parseCpuList(std::string_view s) {
+    std::vector<int32_t> out;
+    if (s.empty()) return std::nullopt;
+    std::size_t pos = 0;
+    auto num = [](std::string_view t, int32_t& v) {
+        if (t.empty() || t.size() > 4) return false;
+        v = 0;
+        for (char c : t) { if (c < '0' || c > '9') return false; v = v * 10 + (c - '0'); }
+        return v < 1024;
+    };
+    while (pos <= s.size()) {
+        const std::size_t comma = std::min(s.find(',', pos), s.size());
+        const std::string_view tok = s.substr(pos, comma - pos);
+        const std::size_t dash = tok.find('-');
+        int32_t lo = 0, hi = 0;
+        if (dash == std::string_view::npos) {
+            if (!num(tok, lo)) return std::nullopt;
+            hi = lo;
+        } else if (!num(tok.substr(0, dash), lo) || !num(tok.substr(dash + 1), hi) || hi < lo) {
+            return std::nullopt;
+        }
+        for (int32_t c = lo; c <= hi; ++c) out.push_back(c);
+        if (comma == s.size()) break;
+        pos = comma + 1;
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
 
 ConfigResult parseNodeConfig(
     const std::function<const char*(const char*)>& getenv_fn)
@@ -300,6 +595,17 @@ ConfigResult parseNodeConfig(
             return {{}, std::string("RUNE_REPLICATION_STREAM_ID is not a valid integer: ") + rawReplStream};
     }
 
+    // --- RUNE_REPL_BASE_STREAM_ID (optional, default 2000) — Task 1 ---
+    // Base Aeron stream id for per-worker replication streams.
+    // Worker W uses stream replBaseStreamId + W.
+    // Default 2000 is disjoint from all existing default stream ids/ranges.
+    int32_t replBaseStreamId = 2000;
+    const char* rawReplBase = getenv_fn("RUNE_REPL_BASE_STREAM_ID");
+    if (rawReplBase && !std::string_view(rawReplBase).empty()) {
+        if (!parseInt32(rawReplBase, replBaseStreamId))
+            return {{}, std::string("RUNE_REPL_BASE_STREAM_ID is not a valid integer: ") + rawReplBase};
+    }
+
     // --- Election timing (optional, positive ms, env-overridable) ---
     // Defaults set in NodeConfig field initializers; only override if env var present.
     NodeConfig cfg;
@@ -309,8 +615,16 @@ ConfigResult parseNodeConfig(
     cfg.consensusStreamId   = consensusStreamId;
     cfg.replicationStreamId = replicationStreamId;
 
-    cfg.clientEndpoint.channel  = std::string("aeron:udp?endpoint=") + rawClient;
+    // host:port (canonical) or an already-formed Aeron channel (docker/README.md
+    // form) — never wrapped twice (regression: shard ingress "unknown host").
+    cfg.clientEndpoint.channel  = std::string_view(rawClient).starts_with("aeron:")
+                                      ? std::string(rawClient)
+                                      : std::string("aeron:udp?endpoint=") + rawClient;
     cfg.clientEndpoint.streamId = clientStreamId;
+    cfg.replBaseStreamId        = replBaseStreamId;
+    // RUNE_AERON_DIR (optional): Aeron dir override (empty → dataDir/aeron).
+    if (const char* ad = getenv_fn("RUNE_AERON_DIR")) cfg.aeronDir = ad;
+    if (auto err = cfg.validateAeronDir()) return {{}, *err};
 
     // E5.1: resolve workerIngressBaseStreamId — default to clientStreamId+1 when unset.
     cfg.workerIngressBaseStreamId = (workerIngressBaseStreamId == 0)
@@ -319,14 +633,18 @@ ConfigResult parseNodeConfig(
 
     // read-rework T3/T4: per-worker dynamic-MDC egress config (optional overrides;
     // buildWorkerPool resolves workerEgressBaseStreamId=0 → ingressBase+workerCount).
+    // DR-15 fix round 1 (MEDIUM-1): peer-facing bind host (default: derived — see peerBindHost()).
+    if (const char* bh = getenv_fn("RUNE_PEER_BIND_HOST"); bh && *bh) cfg.peerBindHostOverride = bh;
     {
         const char* rawEgHost = getenv_fn("RUNE_WORKER_EGRESS_CONTROL_HOST");
         if (rawEgHost && !std::string_view(rawEgHost).empty())
             cfg.workerEgressControlHost = rawEgHost;
         const char* rawEgPort = getenv_fn("RUNE_WORKER_EGRESS_CONTROL_BASE_PORT");
         if (rawEgPort && !std::string_view(rawEgPort).empty()) {
-            if (!parseInt32(rawEgPort, cfg.workerEgressControlBasePort))
+            int32_t port{};
+            if (!parseInt32(rawEgPort, port))
                 return {{}, std::string("RUNE_WORKER_EGRESS_CONTROL_BASE_PORT is not a valid integer: ") + rawEgPort};
+            cfg.workerEgressControlBasePort = port;
         }
         const char* rawEgStream = getenv_fn("RUNE_WORKER_EGRESS_BASE_STREAM");
         if (rawEgStream && !std::string_view(rawEgStream).empty()) {
@@ -348,6 +666,15 @@ ConfigResult parseNodeConfig(
         err = parseOptionalInt64Ms(getenv_fn, "RUNE_STARTUP_CANVASS_TIMEOUT_MS",
                                    cfg.startupCanvassTimeoutMs);
         if (!err.empty()) return {{}, err};
+
+        // Controlled shutdown budget (0 = no hand-off).
+        if (const char* raw = getenv_fn("RUNE_CONTROLLED_SHUTDOWN_MS"); raw && !std::string_view(raw).empty()) {
+            int64_t v = 0;
+            if (std::string_view(raw) == "0") v = 0;
+            else if (!parseInt64Positive(raw, v))
+                return {{}, std::string("RUNE_CONTROLLED_SHUTDOWN_MS must be a non-negative integer (ms), got: ") + raw};
+            cfg.controlledShutdownMs = v;
+        }
     }
 
     // --- RUNE_MIN_ISR (optional) — M1: minimum ISR size for acks=All gate ---
@@ -361,6 +688,28 @@ ConfigResult parseNodeConfig(
             if (!parseInt32(rawMinIsr, v) || v < 1)
                 return {{}, std::string("RUNE_MIN_ISR must be a positive integer, got: ") + rawMinIsr};
             cfg.gatewayMinIsr = v;
+        }
+    }
+
+    // --- RUNE_SURVIVOR_LEADER_ELECTION (optional, default OFF) — review
+    // 2026-10-04 MEDIUM-3: opt in to the position-proven survivor election (a
+    // partition whose committed ISR has no live member elects its most complete
+    // reporting live replica).  Kafka keeps such a partition offline unless
+    // unclean.leader.election.enable — so does Rune by default.
+    {
+        const char* raw = getenv_fn("RUNE_SURVIVOR_LEADER_ELECTION");
+        if (raw) {
+            const std::string_view sv(raw);
+            cfg.survivorLeaderElection = (sv == "1" || sv == "true" || sv == "TRUE");
+        }
+    }
+    // Re-review 2026-10-04 MEDIUM-B: unclean consensus election (default OFF) —
+    // see NodeConfig::uncleanConsensusElection.
+    {
+        const char* raw = getenv_fn("RUNE_UNCLEAN_CONSENSUS_ELECTION");
+        if (raw) {
+            const std::string_view sv(raw);
+            cfg.uncleanConsensusElection = (sv == "1" || sv == "true" || sv == "TRUE");
         }
     }
 
@@ -564,6 +913,10 @@ ConfigResult parseNodeConfig(
                 {
                     std::string err = parseOptField(1, "segmentRollBytes", ts.segmentRollBytes, false);
                     if (!err.empty()) return {{}, err};
+                    // D19 L1: segment positions are 32-bit (Log::kMaxRollBytes).
+                    if (ts.segmentRollBytes > rune::storage::Log::kMaxRollBytes)
+                        return {{}, std::string("RUNE_TOPICS segmentRollBytes must be <= ") +
+                                        std::to_string(rune::storage::Log::kMaxRollBytes) + " in: " + std::string(entry)};
                 }
 
                 // Positional[2] (optional): deleteRetentionMs (non-negative int64)
@@ -648,6 +1001,40 @@ ConfigResult parseNodeConfig(
         // Absent or empty → keep the default (true, set in NodeConfig initializers).
     }
 
+    // --- RUNE_PRODUCER_ID_EXPIRATION_MS (optional, >= 0) — PSM fix round 1 (I1). ---
+    if (const char* raw = getenv_fn("RUNE_PRODUCER_ID_EXPIRATION_MS"); raw && *raw) {
+        char* end = nullptr;
+        const long long v = std::strtoll(raw, &end, 10);
+        if (end != raw && v >= 0) cfg.producerIdExpirationMs = static_cast<int64_t>(v);
+    }
+
+    // --- hotpath-A F2: RUNE_SEGMENT_PROVISION_DEPTH / RUNE_SEGMENT_PROVISIONER_MAX_PARK_US ---
+    if (const char* raw = getenv_fn("RUNE_SEGMENT_PROVISION_DEPTH"); raw && *raw) {
+        char* end = nullptr;
+        const long v = std::strtol(raw, &end, 10);
+        if (end != raw) cfg.segmentProvisionDepth = static_cast<int32_t>(std::clamp<long>(v, 1, 8));
+    }
+    if (const char* raw = getenv_fn("RUNE_SEGMENT_PROVISION_THRESHOLD_PCT"); raw && *raw) {
+        char* end = nullptr;
+        const long v = std::strtol(raw, &end, 10);
+        if (end != raw) cfg.segmentProvisionThresholdPct = static_cast<int32_t>(std::clamp<long>(v, 1, 100));
+    }
+    if (const char* raw = getenv_fn("RUNE_SEGMENT_PROVISION_CAP_BYTES"); raw && *raw) {
+        char* end = nullptr;
+        const long long v = std::strtoll(raw, &end, 10);
+        if (end != raw) cfg.segmentProvisionCapBytes = static_cast<int64_t>(v < 0 ? -1 : v);
+    }
+    if (const char* raw = getenv_fn("RUNE_SEGMENT_PROVISION_CAP_FREE_PCT"); raw && *raw) {
+        char* end = nullptr;
+        const long v = std::strtol(raw, &end, 10);
+        if (end != raw) cfg.segmentProvisionCapFreePct = static_cast<int32_t>(std::clamp<long>(v, 1, 100));
+    }
+    if (const char* raw = getenv_fn("RUNE_SEGMENT_PROVISIONER_MAX_PARK_US"); raw && *raw) {
+        char* end = nullptr;
+        const long long v = std::strtoll(raw, &end, 10);
+        if (end != raw && v >= 1) cfg.segmentProvisionerMaxParkUs = static_cast<int64_t>(v);
+    }
+
     // --- RUNE_WORKERS (optional) — Milestone E1: in-process partition worker count (floor 1). ---
     if (const char* w = getenv_fn("RUNE_WORKERS")) {
         char* end = nullptr;
@@ -672,17 +1059,74 @@ ConfigResult parseNodeConfig(
     parsePow2(getenv_fn("RUNE_IO_COMPLETION_RING_DEPTH"), cfg.ioCompletionRingDepth);
     parsePow2(getenv_fn("RUNE_MEMORY_LOG_RING_BYTES"),    cfg.memoryLogRingBytes);
     parsePow2(getenv_fn("RUNE_AERON_TERM_BUFFER_BYTES"),  cfg.aeronTermBufferBytes);
-    // RUNE_AERON_MTU: MTU is not required to be a power of two — use parseInt32.
-    if (const char* raw = getenv_fn("RUNE_AERON_MTU")) {
-        if (raw && !std::string_view(raw).empty()) {
-            int32_t v{};
-            if (parseInt32(raw, v)) {
-                cfg.aeronMtuBytes = v;
-            }
-            // Unparseable → keep default 65504 (safe degradation).
+    if (const char* raw = getenv_fn("RUNE_IOWQ_CORES"); raw && *raw) {
+        auto cpus = parseCpuList(raw);
+        if (!cpus) return {{}, std::string("RUNE_IOWQ_CORES must be a cpu list like 0,4-5, got '") + raw + "'"};
+        cfg.ioWorkerCpus = std::move(*cpus);
+    }
+    if (const char* raw = getenv_fn("RUNE_NONWORKER_CORES"); raw && *raw) {
+        auto cpus = parseCpuList(raw);
+        if (!cpus) return {{}, std::string("RUNE_NONWORKER_CORES must be a cpu list like 0,4-5, got '") + raw + "'"};
+        cfg.nonWorkerCpus = std::move(*cpus);
+    }
+    for (auto [name, field] : {std::pair{"RUNE_WORKER_SYNC_INTERVAL_MS", &cfg.workerSyncIntervalMs},
+                               std::pair{"RUNE_FOLLOWER_FLUSH_INTERVAL_MS", &cfg.followerFlushIntervalMs}}) {
+        if (const char* raw = getenv_fn(name); raw && *raw) {
+            char* end = nullptr;
+            const long long v = std::strtoll(raw, &end, 10);
+            constexpr long long kMaxMs = 30LL * 24 * 3600 * 1000;   // 30 days: ms->ns never overflows
+            if (end == raw || *end != '\0' || v < 0 || v > kMaxMs)
+                return {{}, std::string(name) + " must be an integer in [0, 2592000000] ms (0 = never), got '" +
+                                raw + "'"};
+            *field = v;
         }
     }
+    if (const char* raw = getenv_fn("RUNE_AERON_CONTROL_TERM_BYTES"); raw && *raw) {
+        int32_t ct = 0;
+        parsePow2(raw, ct);
+        if (ct < 64 * 1024)   // Aeron's minimum term; not a power of two -> ct stays 0
+            return {{}, std::string("RUNE_AERON_CONTROL_TERM_BYTES must be a power of two >= 65536, got '") + raw + "'"};
+        cfg.aeronControlTermBufferBytes = ct;
+    }
+    // RUNE_AERON_MTU: MTU is not required to be a power of two — use parseInt32.
+    // Unset → derived (HostDefaults).  An explicit value must be a valid Aeron
+    // MTU (> 32-byte data header, <= 65504); 32-byte alignment / socket-buffer fit
+    // are enforced (clamped + WARN) at start.  Garbage is refused, never a 64 B MTU.
+    if (const char* raw = getenv_fn("RUNE_AERON_MTU"); raw && *raw) {
+        int32_t v{};
+        if (!parseInt32(raw, v) || v <= 32 || v > 65504)
+            return {{}, std::string("RUNE_AERON_MTU must be an integer in [33, 65504], got: ") + raw};
+        cfg.aeronMtuBytes = v;
+    }
     parsePow2(getenv_fn("RUNE_AERON_RCV_WINDOW"), cfg.aeronRcvWindowBytes);
+    for (auto [name, field] : {std::pair{"RUNE_AERON_MAX_MSGS_PER_SEND", &cfg.aeronMaxMessagesPerSend},
+                               std::pair{"RUNE_AERON_SENDER_IOV", &cfg.aeronSenderIoVectorCapacity},
+                               std::pair{"RUNE_AERON_RECEIVER_IOV", &cfg.aeronReceiverIoVectorCapacity}}) {
+        if (const char* raw = getenv_fn(name); raw && *raw) {
+            int32_t v{};
+            if (!parseInt32(raw, v) || v < 1 || v > 16)
+                return {{}, std::string(name) + " must be an integer in [1, 16], got '" + raw + "'"};
+            *field = v;
+        }
+    }
+    if (const char* raw = getenv_fn("RUNE_AERON_UDP_GSO"); raw && *raw) {
+        const std::string_view v(raw);
+        if (v == "1" || v == "true") cfg.aeronUdpGso = true;
+        else if (v == "0" || v == "false") cfg.aeronUdpGso = false;
+        else return {{}, std::string("RUNE_AERON_UDP_GSO must be 0/1/false/true, got '") + raw + "'"};
+    }
+    if (const char* raw = getenv_fn("RUNE_AERON_EPOLL_POLL"); raw && *raw) {
+        const std::string_view v(raw);
+        if (v == "1" || v == "true") cfg.aeronEpollPoll = true;
+        else if (v == "0" || v == "false") cfg.aeronEpollPoll = false;
+        else return {{}, std::string("RUNE_AERON_EPOLL_POLL must be 0/1/false/true, got '") + raw + "'"};
+    }
+    if (const char* raw = getenv_fn("RUNE_AERON_TERM_SPARSE"); raw && *raw) {
+        const std::string_view v(raw);
+        if (v == "false" || v == "0") cfg.aeronTermBufferSparse = false;   // explicit (else derived)
+        else if (v == "true" || v == "1") cfg.aeronTermBufferSparse = true;
+        else return {{}, std::string("RUNE_AERON_TERM_SPARSE must be true|false, got '") + raw + "'"};
+    }
     // RUNE_AERON_SOCKET_BUFFER_BYTES: OS UDP SO_SNDBUF/SO_RCVBUF (Task 6). Not
     // required to be a power of two.  0 leaves Aeron's default.
     if (const char* raw = getenv_fn("RUNE_AERON_SOCKET_BUFFER_BYTES")) {
@@ -715,6 +1159,15 @@ ConfigResult parseNodeConfig(
     parseLimit("RUNE_WORKER_RETURN_DRAIN_LIMIT",  cfg.workerReturnDrainLimit);
     parseLimit("RUNE_REPL_FRAGMENT_LIMIT",        cfg.replFragmentLimit);
     parseLimit("RUNE_CONSENSUS_FRAGMENT_LIMIT",   cfg.consensusFragmentLimit);
+    // F15 S3: owed-return cap.  Strict: any integer is kept as given and the
+    // [256, 8192] range is enforced at start() (Worker::validateRingConfig), so
+    // 0 / negative refuse loudly; a non-integer is a configuration error here.
+    if (const char* raw = getenv_fn("RUNE_WORKER_MAX_OWED_RETURNS"); raw && *raw) {
+        int32_t v{};
+        if (!parseInt32(raw, v))
+            return {{}, std::string("RUNE_WORKER_MAX_OWED_RETURNS is not a valid integer: ") + raw};
+        cfg.workerMaxOwedReturns = v;
+    }
 
     // RUNE_WORKER_ACK_SLOT_BYTES: return-ring reservation slot size for ProduceResult.
     if (const char* raw = getenv_fn("RUNE_WORKER_ACK_SLOT_BYTES")) {
@@ -770,10 +1223,9 @@ ConfigResult parseNodeConfig(
     if (const char* wcb = getenv_fn("RUNE_WORKER_CORE_BASE")) {
         if (wcb && !std::string_view(wcb).empty()) {
             int32_t v{};
-            if (parseInt32(wcb, v)) {
-                cfg.workerCoreBase = (v < -1) ? -1 : v;
-            }
-            // Unparseable → keep default -1 (disabled; no error — safe degradation).
+            // Unparseable → -1 (DISABLED, never the auto layout: garbage must not
+            // turn a busy-spin on).  Values < -1 are clamped to -1.
+            cfg.workerCoreBase = parseInt32(wcb, v) ? ((v < -1) ? -1 : v) : -1;
         }
     }
     // Absent → keep NodeConfig default (-1 = disabled).
@@ -795,15 +1247,64 @@ ConfigResult parseNodeConfig(
     }
     // Absent → keep NodeConfig default (Shared).
 
-    // --- RUNE_AERON_DRIVER_IDLE (optional, default "sleep-ns") — E5.2 ---
+    // --- RUNE_AERON_DRIVER_IDLE (optional) — E5.2 ---
     // Passed to the Aeron idle-strategy setter(s) for the active threading mode.
-    // Default "sleep-ns" is byte-identical to today's hard-coded value.
+    // Unset = derived (D2): backoff in shard mode, sleep-ns in legacy —
+    // NodeConfig::effectiveDriverIdleStrategy().
     if (const char* adi = getenv_fn("RUNE_AERON_DRIVER_IDLE")) {
         if (adi && !std::string_view(adi).empty()) {
             cfg.driverIdleStrategy = std::string(adi);
         }
     }
-    // Absent → keep NodeConfig default ("sleep-ns").
+    // Absent → empty (derived).
+    // D2 round 2: the node driver's idle init args (Aeron syntax; refused at driver start if malformed).
+    if (const char* ada = getenv_fn("RUNE_AERON_DRIVER_IDLE_ARGS"); ada && *ada) cfg.driverIdleArgs = ada;
+    // D2 round 2: the shard-mode control-plane park cap (node driver, runtime thread, admin thread).
+    if (const char* raw = getenv_fn("RUNE_CONTROL_IDLE_MAX_PARK_US"); raw && *raw) {
+        char* end = nullptr;
+        const long long v = std::strtoll(raw, &end, 10);
+        if (end == raw || *end != '\0' || v < 1 || v > 1'000'000)
+            return {{}, std::string("RUNE_CONTROL_IDLE_MAX_PARK_US must be an integer in [1, 1000000] us, got '") +
+                            raw + "'"};
+        cfg.controlIdleMaxParkUs = v;
+    }
+    {   // D2 round-2 review R2-Md-1: the park cap must stay well inside the election cadence, or an idle leader's
+        // heartbeats slip into endless leadership churn.  Limit = 1/4 of the election status interval: an explicit
+        // larger cap is refused; the default is clamped (so lowering only the interval never refuses a default).
+        const int64_t limitUs = std::max<int64_t>(1, cfg.electionStatusIntervalMs * 1000 / 4);
+        if (cfg.controlIdleMaxParkUs > limitUs) {
+            const char* raw = getenv_fn("RUNE_CONTROL_IDLE_MAX_PARK_US");
+            if (raw && *raw)
+                return {{}, "RUNE_CONTROL_IDLE_MAX_PARK_US=" + std::string(raw) + " us exceeds 1/4 of "
+                            "RUNE_ELECTION_STATUS_INTERVAL_MS (" + std::to_string(cfg.electionStatusIntervalMs) +
+                            " ms -> max " + std::to_string(limitUs) + " us): heartbeats would miss the election cadence"};
+            cfg.controlIdleMaxParkUs = limitUs;
+        }
+    }
+
+    // --- RUNE_MAX_HELD_IDLE_MS (optional, D8b) --- held-session no-progress reap bound, 1 ms .. 24 h
+    // (bounded: BrokerNode converts it to ns — no overflow; re-review LOW-B).
+    if (const char* raw = getenv_fn("RUNE_MAX_HELD_IDLE_MS"); raw && *raw) {
+        constexpr long long kMaxHeldIdleMsCap = 24LL * 3600 * 1000;
+        char* end = nullptr;
+        errno = 0;
+        const long long v = std::strtoll(raw, &end, 10);
+        if (end == raw || *end != '\0' || errno == ERANGE || v < 1 || v > kMaxHeldIdleMsCap)
+            return {{}, std::string("RUNE_MAX_HELD_IDLE_MS must be an integer in [1, 86400000] (ms), got '") + raw + "'"};
+        cfg.maxHeldIdleMs = v;
+    }
+
+    // --- RUNE_GATEWAY_PRODUCE_CREDITS (optional, D8c) --- per-session gateway-routed produce credit budget
+    if (const char* raw = getenv_fn("RUNE_GATEWAY_PRODUCE_CREDITS"); raw && *raw) {
+        char* end = nullptr;
+        errno = 0;
+        const long long v = std::strtoll(raw, &end, 10);
+        if (end == raw || *end != '\0' || errno == ERANGE || v < 1 ||
+            v > static_cast<long long>(NodeConfig::kMaxGatewayProduceCredits))
+            return {{}, std::string("RUNE_GATEWAY_PRODUCE_CREDITS must be an integer in [1, ") +
+                            std::to_string(NodeConfig::kMaxGatewayProduceCredits) + "], got '" + raw + "'"};
+        cfg.gatewayProduceCredits = static_cast<uint32_t>(v);
+    }
 
     // --- RUNE_FETCH_INTERVAL_US (optional, default 5000µs) ---
     // Follower periodic-fetch backstop cadence.  Lower = faster acks=all
@@ -823,9 +1324,49 @@ ConfigResult parseNodeConfig(
         if (imp && !std::string_view(imp).empty()) {
             char* end = nullptr;
             long long us = std::strtoll(imp, &end, 10);
-            if (end != imp && us > 0) cfg.idleMaxParkUs = us;
+            if (end != imp && us > 0) { cfg.idleMaxParkUs = us; cfg.idleMaxParkUsExplicit = true; }
         }
     }
+
+    // --- A7: RUNE_IDLE_WAKE (default on) / RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS (default auto) ---
+    // Shard-worker park-until-work (NodeConfig::idleWake): 0/1/false/true like RUNE_AERON_UDP_GSO; spins /
+    // yields: a non-negative decimal integer (auto = the Aeron 10 / 20, NodeConfig::shardIdleShape).  Anything
+    // else refuses startup (review D3: a typo must never silently measure the other arm).
+    if (const char* raw = getenv_fn("RUNE_IDLE_WAKE"); raw && *raw) {
+        const std::string_view v(raw);
+        if (v == "1" || v == "true") cfg.idleWake = true;
+        else if (v == "0" || v == "false") cfg.idleWake = false;
+        else return {{}, std::string("RUNE_IDLE_WAKE must be 0/1/false/true, got '") + raw + "'"};
+    }
+    for (auto [name, field] : {std::pair{"RUNE_IDLE_SPINS", &cfg.idleSpins},
+                               std::pair{"RUNE_IDLE_YIELDS", &cfg.idleYields}}) {
+        if (const char* raw = getenv_fn(name); raw && *raw) {
+            int32_t n{};
+            if (!parseInt32(raw, n) || n < 0)
+                return {{}, std::string(name) + " must be a non-negative integer, got '" + raw + "'"};
+            *field = n;
+        }
+    }
+    // --- A9: RUNE_IDLE_DOORBELL (default on) / RUNE_IDLE_DOORBELL_MIN_PARK_US / RUNE_IDLE_DOORBELL_PARK_US ---
+    // (NodeConfig::idleDoorbell).  Garbage refuses startup, like the A7 knobs.
+    if (const char* raw = getenv_fn("RUNE_IDLE_DOORBELL"); raw && *raw) {
+        const std::string_view v(raw);
+        if (v == "1" || v == "true") cfg.idleDoorbell = true;
+        else if (v == "0" || v == "false") cfg.idleDoorbell = false;
+        else return {{}, std::string("RUNE_IDLE_DOORBELL must be 0/1/false/true, got '") + raw + "'"};
+    }
+    for (auto [name, field] : {std::pair{"RUNE_IDLE_DOORBELL_MIN_PARK_US", &cfg.idleDoorbellMinParkUs},
+                               std::pair{"RUNE_IDLE_DOORBELL_PARK_US", &cfg.idleDoorbellParkUs}}) {
+        if (const char* raw = getenv_fn(name); raw && *raw) {
+            int32_t n{};
+            if (!parseInt32(raw, n) || n <= 0 || n > 1'000'000)
+                return {{}, std::string(name) + " must be an integer in 1..1000000, got '" + raw + "'"};
+            *field = n;
+        }
+    }
+    if (cfg.idleDoorbellMinParkUs > cfg.idleDoorbellParkUs)
+        return {{}, "RUNE_IDLE_DOORBELL_MIN_PARK_US (" + std::to_string(cfg.idleDoorbellMinParkUs) +
+                    ") must not exceed RUNE_IDLE_DOORBELL_PARK_US (" + std::to_string(cfg.idleDoorbellParkUs) + ")"};
 
     // --- RUNE_PER_WORKER_INGRESS (optional, default false) — E5.1.3 ---
     // When "1" or "true", each worker gets its own Aeron subscription and the
@@ -847,6 +1388,82 @@ ConfigResult parseNodeConfig(
         if (pwe && !std::string_view(pwe).empty()) {
             std::string_view sv(pwe);
             cfg.perWorkerEgressEnabled = (sv == "1" || sv == "true" || sv == "TRUE");
+        }
+    }
+
+    // --- RUNE_PER_WORKER_REPLICATION (optional, default false) — Task 1 ---
+    // When "1" or "true", each worker opens its own dedicated replication transport
+    // on stream replBaseStreamId + workerId, replacing the shared control-thread
+    // replication path.  Default false: shared path remains live.
+    if (const char* pwr = getenv_fn("RUNE_PER_WORKER_REPLICATION")) {
+        if (pwr && !std::string_view(pwr).empty()) {
+            std::string_view sv(pwr);
+            cfg.perWorkerReplication = (sv == "1" || sv == "true" || sv == "TRUE");
+        }
+    }
+    // Absent → keep NodeConfig default (false).
+
+    // --- Self-contained worker shards (spec §3.1-§3.3) ---
+    auto lower = [](std::string s) {
+        for (auto& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        return s;
+    };
+    if (const char* raw = getenv_fn("RUNE_WORKER_MODE"); raw && *raw) {
+        const std::string s = lower(std::string(trim(raw)));
+        if (s == "legacy")     cfg.workerMode = NodeConfig::WorkerMode::Legacy;
+        else if (s == "shard") cfg.workerMode = NodeConfig::WorkerMode::Shard;
+        else return {{}, std::string("RUNE_WORKER_MODE must be 'legacy' or 'shard', got: ") + raw};
+    }
+    if (const char* raw = getenv_fn("RUNE_RUNTIME_PLACEMENT"); raw && *raw) {
+        const std::string s = lower(std::string(trim(raw)));
+        if (s == "thread")     cfg.runtimePlacement = NodeConfig::RuntimePlacement::Thread;
+        else if (s == "fused") cfg.runtimePlacement = NodeConfig::RuntimePlacement::Fused;
+        else return {{}, std::string("RUNE_RUNTIME_PLACEMENT must be 'thread' or 'fused', got: ") + raw};
+    }
+    if (const char* raw = getenv_fn("RUNE_WORKER_INGRESS_BASE_PORT"); raw && *raw) {
+        int32_t port{};
+        if (!parseInt32(raw, port))
+            return {{}, std::string("RUNE_WORKER_INGRESS_BASE_PORT is not a valid integer: ") + raw};
+        if (port < 1 || port > 65535)   // rejected in every mode (no silent fallback)
+            return {{}, std::string("RUNE_WORKER_INGRESS_BASE_PORT must be a port in [1, 65535], got: ") + raw};
+        cfg.workerIngressBasePort = port;
+    }
+    // F3 round 4: EXPLICIT override of the gateway's max accepted produce-batch
+    // size.  Left unset (nullopt) by default — BrokerNode::start() then derives
+    // the effective ceiling from the transport instead of refusing startup.
+    if (const char* raw = getenv_fn("RUNE_MAX_PRODUCE_BATCH_BYTES"); raw && *raw) {
+        int64_t bytes{};
+        if (!parseInt64Positive(raw, bytes))
+            return {{}, std::string("RUNE_MAX_PRODUCE_BATCH_BYTES must be a positive integer, got: ") + raw};
+        cfg.maxProduceBatchBytes = bytes;
+    }
+    if (const char* raw = getenv_fn("RUNE_WORKER_REPL_BASE_PORT"); raw && *raw) {
+        int32_t port{};
+        if (!parseInt32(raw, port))
+            return {{}, std::string("RUNE_WORKER_REPL_BASE_PORT is not a valid integer: ") + raw};
+        if (port < 1 || port > 65535)   // rejected in every mode (no silent fallback)
+            return {{}, std::string("RUNE_WORKER_REPL_BASE_PORT must be a port in [1, 65535], got: ") + raw};
+        cfg.workerReplBasePort = port;
+    }
+    if (cfg.shardMode()) {
+        // A shard IS per-worker ingress + replication + egress on the worker's own driver.
+        cfg.perWorkerIngressEnabled = true;
+        cfg.perWorkerReplication    = true;
+        cfg.perWorkerEgressEnabled  = true;
+    }
+
+    // Task 1: populate self peer's workerCount from cfg.workerCount so that
+    // membership descriptors advertise the correct per-worker replication capacity.
+    // Only set when workerCount > 1 (explicitly configured for multi-worker mode);
+    // leave at 0 (unknown) for the default single-worker configuration so that
+    // the default-on field is distinguishable from an explicit deployment choice.
+    // Shard mode always stamps (even W=1): symmetric-worker-count validation needs it.
+    if (cfg.workerCount > 1 || cfg.shardMode()) {
+        for (auto& p : cfg.peers) {
+            if (p.id == cfg.nodeId) {
+                p.workerCount = cfg.workerCount;
+                break;
+            }
         }
     }
 

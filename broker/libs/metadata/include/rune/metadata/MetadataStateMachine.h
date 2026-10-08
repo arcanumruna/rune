@@ -97,6 +97,10 @@ public:
     // ── Expose the committed map (read-only) for delta derivation. ────────────
     const AssignmentMap& committedMap() const noexcept { return committed_; }
 
+    // ── Bumped on every committed-map mutation (install / restore).  Lets a
+    //    consumer rebuild derived state (the RoutingImage) only on change. ────
+    [[nodiscard]] uint64_t committedVersion() const noexcept { return committedVersion_; }
+
     // ── MVCC revert: discard pending records with pos > toCommittedPos. ───────
     // Used when a commit is lost (e.g. leader failover).  The committed map is
     // untouched — only uncommitted speculation in pending_ is pruned.
@@ -106,6 +110,19 @@ public:
     // Incremented in apply() when a record's recordVersion is unsupported.
     // The record is NOT applied and does NOT crash apply().
     [[nodiscard]] uint64_t lossCount() const noexcept { return lossCount_; }
+
+    // ── Epoch-regression guard (KRaft invariant; epoch-restart fix round 1):
+    //    an assignment record never moves a partition BACK — it is ignored
+    //    (counted here) when its leaderEpoch is lower than the installed one,
+    //    equal with a different leader (one epoch, one leader), or its
+    //    partitionEpoch is lower.  Every controller decision bumps; only a
+    //    re-emitted stale decision (e.g. a static epoch-0 assignment) regresses.
+    [[nodiscard]] uint64_t regressionsRejected() const noexcept { return regressionsRejected_; }
+
+    // ── D15: the committed metadata feature level (KRaft metadata.version;
+    //    FeatureLevelRecord).  Monotonic: a lower record is ignored.  0 = no
+    //    record yet (a log written by pre-D15 binaries). ─────────────────────
+    [[nodiscard]] int16_t featureLevel() const noexcept { return featureLevel_; }
 
 private:
     // Committed assignments (pos <= committedPos)
@@ -121,13 +138,21 @@ private:
     };
 
     std::vector<PendingEntry> pending_;
+    /// D15: uncommitted FeatureLevelRecords (pos, level).
+    std::vector<std::pair<int64_t, int16_t>> pendingFeature_;
+    int16_t featureLevel_ = 0;
 
     int64_t committedPos_ = -1;
 
+    // See committedVersion().
+    uint64_t committedVersion_ = 0;
+
     // Count of records skipped due to unknown recordVersion (handleLoss).
     uint64_t lossCount_ = 0;
+    uint64_t regressionsRejected_ = 0;
 
     void flushPending(int64_t upToPos);
+    void install_(int32_t topicId, int32_t partition, const PartitionAssignment& pa);
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -176,6 +201,7 @@ void MetadataStateMachine::restore(Reader& r)
     // Full reset — pending discarded, committed cleared
     committed_.clear();
     pending_.clear();
+    ++committedVersion_;
 
     committedPos_ = r.readInt64();
     const int32_t count = r.readInt32();

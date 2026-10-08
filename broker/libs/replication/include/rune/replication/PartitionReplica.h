@@ -46,10 +46,13 @@
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <limits>
 #include <vector>
 #include <string>
 
 #include <rune/replication/Types.h>
+#include <algorithm>
+#include <rune/replication/FollowerSlots.h>
 #include <rune/replication/FollowerSync.h>
 #include <rune/replication/HighWatermark.h>
 #include <rune/replication/IsrManager.h>
@@ -65,6 +68,8 @@
 namespace rune::protocol { class RecordBatchBuilder; }
 
 namespace rune::replication {
+
+class InternalIsrKnowledge;
 
 // ---------------------------------------------------------------------------
 // ReplicaPositionReport — soft per-replica position snapshot consumed by the
@@ -91,12 +96,58 @@ inline constexpr int16_t kErrStaleEpoch   = -1;   // request epoch < local epoch
 inline constexpr int16_t kErrNotLeader    = -2;   // this node is not the leader
 inline constexpr int16_t kErrMinIsr       = -3;   // ISR too small to produce
 inline constexpr int16_t kErrOutOfRange   = -4;   // fetchOffset out of range
-// DR-BUG-6: leader is deferring the epoch answer while it reverse-reconciles a
+// RETIRED (DR-BUG-6 reverse reconcile; kept so the code is never reused): a
+// leader deferred the epoch answer while it reverse-reconciled a
 // genuine committed continuation from this (ahead, on-lineage) follower.  This
 // is a KEEP-ALIVE, NOT a truncation directive: the follower KEEPS its tail and
 // RESETS its fallback probe counter so a slow reconcile under packet loss never
 // trips the destructive fallback-to-committedHw truncation (the DR-8 loss).
 inline constexpr int16_t kErrReconcileDeferred = -5;
+// F18 ⇄ F3 (one code, both meanings): the first batch at the requested offset
+// cannot be delivered AT ALL over this transport — it does not fit ONE
+// replication frame (leader: its outbound/publication frame; follower: its own
+// worker-ingress ring), independent of the follower's requested maxBytes.
+// Distinct from kErrNone-with-empty-records ("caught up"): there is real data
+// here that can never reach the follower at this size.  NOT retriable for this
+// offset: the follower is forced Behind (F3, FollowerSync::forceBehind) and
+// stops fetching it ("wedged", F18), and the leader does not count the request
+// as ISR liveness, so the follower leaves the ISR visibly instead of pinning HW
+// forever.  Cleared by a leadership/epoch change or a truncation that moves the
+// follower's LEO.
+inline constexpr int16_t kErrRecordTooLarge = -6;
+// KIP-320/595 DivergingEpoch: the follower's (fetchOffset, lastFetchedEpoch) is
+// not on the leader's epoch lineage.  The answer carries divergingEpoch /
+// divergingEndOffset (= the leader's endOffsetForEpoch(lastFetchedEpoch)); the
+// follower truncates to min(divergingEndOffset, its own end offset of that
+// epoch) — or, if it never held that epoch, to its own end of the largest
+// earlier epoch (another round) — and re-fetches.  Never credited (ISR / HW):
+// only a fetch that passed validation counts.
+inline constexpr int16_t kErrDivergingEpoch = -7;
+// -8 was kErrLeaderNotComplete (the retired leader-completeness HOLD answer).
+// Reserved: never reused on the wire.
+// KIP-903 (local return code, never on the wire): the fetch came from an OLDER
+// process incarnation of the follower than one already seen — dropped (no
+// answer, no credit).
+inline constexpr int16_t kErrStaleIncarnation = -10;
+// The default replication fetch-ceiling (requested chunk size) used for
+// every PartitionConfig across the broker (see BrokerNode.cpp).  This is
+// deliberately NOT required to cover the gateway's max accepted produce
+// batch: F3 round 2's progress rule means a first batch larger than this
+// value is still served ALONE whenever it fits the transport's real hard
+// per-message maximum (see onFetchRequest/pushToFollowers and
+// PartitionTransport::maxFetchRecordsBytes()) — only a batch that exceeds
+// even that hard transport maximum is genuinely unfetchable
+// (kErrRecordTooLarge).  THE batch limit (NodeConfig::produceIntakeLimit)
+// guarantees no such batch is ever ACCEPTED: the gateway and every worker
+// reject a produce batch above THE batch limit (Worker::maxAcceptableBatchBytes) with
+// MessageTooLarge (F3 round 5).
+//
+// F3 round 2 briefly raised this to 8 MiB to (wrongly) paper over a gap that
+// the progress rule above already closes correctly; round 3 reverted it to
+// 1 MiB — raising it changes replication chunking/latency for every topic
+// with no benchmark, a real risk against the p99 <=100µs target, and is not
+// needed now that the progress rule handles the oversize case correctly.
+inline constexpr int32_t kDefaultMaxFetchBytes = 1 << 20;
 
 // ---------------------------------------------------------------------------
 // PartitionConfig — constructor argument bundle
@@ -110,6 +161,7 @@ struct PartitionConfig {
     int         minIsr            = 1;              ///< min ISR for acksAll produce
     int64_t     fetchIntervalNs   = 50'000'000LL;   ///< follower fetch cadence (50 ms backstop; push is steady-state)
     int64_t     isrCheckIntervalNs = 10'000'000LL;  ///< leader ISR check cadence (10 ms)
+    int64_t     followerFlushIntervalNs = 20'000'000LL;   ///< follower coalesced fsync interval; 0 = off (durability via replication)
     int32_t     maxFetchBytes     = 1 << 20;        ///< max bytes per fetch (1 MiB)
     bool        pushOnAppend      = true;            ///< GR-10: leader pushes to ISR followers immediately on append
     bool        fastAckOnApply    = true;            ///< GR-10: follower fast-acks (emit FetchRequest immediately after applyReplicated)
@@ -143,22 +195,47 @@ struct PartitionConfig {
 // PartitionTransport — injected interface (no Aeron in this file)
 //
 // Leader uses sendFetchResponse(); follower uses sendFetchRequest().
+//
+// F27 — every send REPORTS whether the frame was accepted by the transport
+// (true) or refused (false: Aeron BACK_PRESSURED / ADMIN_ACTION / NOT_CONNECTED,
+// no publication, oversized, outbound ring full).  The replica never assumes a
+// refused send was delivered: it retries on its next pass (time-independent);
+// it never waits for a resend timer to discover its own drop.
 // The fake pumps responses back into the leader via its onFetchRequest() and
 // pumps requests back into the follower via its applyReplicated().
 // ---------------------------------------------------------------------------
+enum class TransportKind : uint8_t {
+    Generic   = 0,  ///< virtual dispatch — test fakes only (BrokerNode asserts never in production)
+    PerWorker = 1,  ///< concrete final WorkerReplicationTransport — direct calls
+    Aeron     = 2,  ///< concrete final AeronPartitionTransport (internal partitions) — direct calls
+    Null      = 3,  ///< concrete final NullPartitionTransport (no peers) — direct no-op calls
+};
+
 class PartitionTransport {
 public:
     virtual ~PartitionTransport() = default;
 
+    /// Construction-time classification (spec §3.5a.1): PartitionReplica reads
+    /// this ONCE and dispatches the PerWorker arm through a direct call.
+    [[nodiscard]] virtual TransportKind kind() const noexcept { return TransportKind::Generic; }
+
     /// (Follower → Leader) send a FetchRequest.
-    virtual void sendFetchRequest(const FetchRequestMsg& req) = 0;
+    virtual bool sendFetchRequest(const FetchRequestMsg& req) = 0;
+
+    /// (Follower → its KNOWN leader) spec §3.5.2: unicast.  Default keeps the old
+    /// behaviour for transports that cannot address a peer (tests, legacy ring).
+    virtual bool sendFetchRequestTo(NodeId /*leader*/, const FetchRequestMsg& req) {
+        return sendFetchRequest(req);
+    }
 
     /// (Leader → Follower) send a FetchResponse.
-    virtual void sendFetchResponse(NodeId toFollower,
+    virtual bool sendFetchResponse(NodeId toFollower,
                                    const FetchResponseMsg& resp) = 0;
 
     // -----------------------------------------------------------------------
-    // DR-BUG-6 — OffsetsForLeaderEpoch exchange + deficient-leader reconcile.
+    // OffsetsForLeaderEpoch exchange + the RETIRED DR-BUG-6 reverse reconcile
+    // (PartitionReplica no longer sends either; the plumbing stays for wire
+    // compatibility).
     //
     // These are peer-routed (addressed to a specific NodeId).  They have SAFE
     // DEFAULT NO-OP bodies so a transport that has not implemented them yet
@@ -171,23 +248,71 @@ public:
 
     /// (New follower → New leader) ask for the leader's end offset for the last
     /// epoch they share (KIP-101), BEFORE the follower truncates on epoch change.
-    virtual void sendOffsetsForLeaderEpochRequest(
-            NodeId /*toLeader*/, const OffsetsForLeaderEpochReqMsg& /*req*/) {}
+    virtual bool sendOffsetsForLeaderEpochRequest(
+            NodeId /*toLeader*/, const OffsetsForLeaderEpochReqMsg& /*req*/) { return true; }
 
     /// (Leader → New follower) the epoch-boundary answer.
-    virtual void sendOffsetsForLeaderEpochResponse(
-            NodeId /*toFollower*/, const OffsetsForLeaderEpochRespMsg& /*resp*/) {}
+    virtual bool sendOffsetsForLeaderEpochResponse(
+            NodeId /*toFollower*/, const OffsetsForLeaderEpochRespMsg& /*resp*/) { return true; }
+
+    /// F18: the largest records payload ONE FetchResponse can carry to any peer
+    /// on this transport (conservative min over its frame bounds).  Unbounded by
+    /// default (test fakes).  Queried only on cold paths (an oversized first
+    /// batch) and once per push.
+    [[nodiscard]] virtual int64_t maxFetchRecordsBytes() const noexcept {
+        return std::numeric_limits<int64_t>::max();
+    }
 
     /// (Deficient leader → ahead survivor) pull missing committed records
     /// [fromOffset, survivorLEO) — a REVERSE fetch (leader fetches from a
     /// follower).  Reuses the FetchRequest shape.
-    virtual void sendReconcileRequest(
-            NodeId /*toPeer*/, const FetchRequestMsg& /*req*/) {}
+    virtual bool sendReconcileRequest(
+            NodeId /*toPeer*/, const FetchRequestMsg& /*req*/) { return true; }
 
     /// (Ahead survivor → deficient leader) serve the requested records.
     /// Reuses the FetchResponse shape.
-    virtual void sendReconcileResponse(
-            NodeId /*toPeer*/, const FetchResponseMsg& /*resp*/) {}
+    virtual bool sendReconcileResponse(
+            NodeId /*toPeer*/, const FetchResponseMsg& /*resp*/) { return true; }
+
+    /// (Partition leader → controller) Kafka AlterPartition: propose an ISR
+    /// change.  Cold path (ISR changes only).  Default: no controller channel
+    /// (false = not sent; a replica with this transport as its ISR channel
+    /// re-sends on its resend cadence).
+    virtual bool sendAlterIsr(const AlterIsrMsg& /*msg*/) { return false; }
+
+    /// (Internal-partition leader → replica) the versioned internal ISR state
+    /// (MAJOR-2/3).  Cold path (ISR changes only); re-sent until acked.
+    virtual bool sendInternalIsr(NodeId /*to*/, const InternalIsrMsg& /*msg*/) { return false; }
+    /// (Replica → internal-partition leader) "I durably hold that state".
+    virtual bool sendInternalIsrAck(NodeId /*to*/, const InternalIsrAckMsg& /*msg*/) { return false; }
+
+    // (F3 fix-round-2 item A's maxFetchResponseBytes() — the hard per-message
+    //  records ceiling a FIRST batch is served alone within — is the SAME
+    //  quantity as F18's maxFetchRecordsBytes() above: one virtual.)
+};
+
+class AeronPubRegistry;
+template <typename PubRegistry> class WorkerReplicationTransportImpl;
+class AeronPartitionTransport;
+
+// ---------------------------------------------------------------------------
+// NullPartitionTransport — production transport for a replica with no
+// replication endpoint (single-node / no repl port): every send is a no-op.
+// Final + TransportKind::Null so the replica calls it directly (Task 11 fix 2;
+// replaces the test InMemoryTransport — mutex + unbounded queues — in BrokerNode).
+// ---------------------------------------------------------------------------
+class NullPartitionTransport final : public PartitionTransport {
+public:
+    [[nodiscard]] TransportKind kind() const noexcept override { return TransportKind::Null; }
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+    bool sendFetchRequestTo(NodeId, const FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { return true; }
+    bool sendOffsetsForLeaderEpochRequest(NodeId, const OffsetsForLeaderEpochReqMsg&) override { return true; }
+    bool sendOffsetsForLeaderEpochResponse(NodeId, const OffsetsForLeaderEpochRespMsg&) override { return true; }
+    bool sendReconcileRequest(NodeId, const FetchRequestMsg&) override { return true; }
+    bool sendReconcileResponse(NodeId, const FetchResponseMsg&) override { return true; }
+    bool sendInternalIsr(NodeId, const InternalIsrMsg&) override { return true; }
+    bool sendInternalIsrAck(NodeId, const InternalIsrAckMsg&) override { return true; }
 };
 
 // ---------------------------------------------------------------------------
@@ -195,6 +320,9 @@ public:
 // ---------------------------------------------------------------------------
 class PartitionReplica {
 public:
+    /// Transport arm chosen at construction (spec §3.5a.1).
+    [[nodiscard]] TransportKind transportKindForTest() const noexcept { return tkind_; }
+
     // -----------------------------------------------------------------------
     // Construction
     // -----------------------------------------------------------------------
@@ -239,10 +367,110 @@ public:
 
     /// Transition to Leader with the given epoch.
     /// Resets ISR from replicas, seeds ReplicaLeaderState.
-    void becomeLeader(Epoch newEpoch, std::vector<NodeId> isr);
+    /// A SAME-EPOCH re-assert while already Leader (a partitionEpoch-only ISR
+    /// change: the controller committed a new ISR, e.g. our AlterIsr) only
+    /// applies that committed ISR and resets nothing else (follower slots, push
+    /// state, HW floors, the epoch cache).
+    /// `partitionEpoch` = the committed assignment's partition epoch (the
+    /// AlterIsr compare-and-set version, MEDIUM-1); -1 = not controller-managed
+    /// (internal partitions, unit rigs).
+    void becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int32_t partitionEpoch = -1);
 
-    /// Transition to Follower with the given leader epoch.
+    /// Transition to Follower with the given leader epoch.  A same-epoch
+    /// re-assert of the same leader while already Follower is a no-op.
     void becomeFollower(Epoch leaderEpoch, NodeId leaderId);
+
+    /// Kafka AlterPartition wiring: ISR changes of this (leader) replica are
+    /// PROPOSED to the controller through `channel` and applied only once the
+    /// controller committed them (they come back as a same-epoch becomeLeader).
+    /// nullptr (default) = self-managed ISR (single node / unit rigs).  Set
+    /// before the replica is driven.
+    void setIsrChannel(PartitionTransport* channel) noexcept { isrChannel_ = channel; }
+    /// Kafka broker fencing (leader only): members the cluster considers DEAD
+    /// (not in `live`) leave the ISR at once instead of after replicaLagMaxMs —
+    /// self-managed ISR: immediately; controller-managed: proposed (AlterIsr).
+    /// Cold; called on the control thread for INTERNAL partitions (whose ISR is
+    /// leader-local); user partitions are fenced by the controller.
+    void shrinkIsrToLive(std::span<const int32_t> live, int64_t nowNs);
+    /// Kafka AlterPartitionResponse (MEDIUM-2): the controller's explicit answer
+    /// to our AlterIsr.  A reject (INELIGIBLE_REPLICA / FENCED_LEADER_EPOCH /
+    /// INVALID_UPDATE_VERSION / invalid) clears the pending proposal (the HW
+    /// then counts the committed ISR only); a commit resolves it through the
+    /// applied assignment (becomeLeader re-assert with a newer partitionEpoch).
+    /// After an INELIGIBLE reject, additions are not re-proposed for
+    /// kAlterIsrResendNs (shrinks are never held back).  Owner thread.
+    void onAlterIsrResponse(const AlterIsrResponseMsg& r);
+    /// KIP-903: this node's PROCESS incarnation (monotonic per node, bumped on
+    /// every start; 0 = untracked).  Stamped on every FetchRequest this replica
+    /// sends; set once before the replica is driven (ReplicaRegistry::add).
+    void setProcessIncarnation(int64_t inc) noexcept { processIncarnation_ = inc; }
+    [[nodiscard]] int64_t processIncarnation() const noexcept { return processIncarnation_; }
+
+    // -----------------------------------------------------------------------
+    // Leader-epoch restart fence (Kafka parity; 2026-10-05 epoch-restart fix).
+    //
+    // Every establishment of leadership must use a leader epoch strictly
+    // greater than any epoch already in any replica's log: KIP-101 truncation
+    // cannot tell two histories written under the SAME epoch apart.  After a
+    // restart the committed assignment this node replays can name it leader at
+    // the very epoch its previous incarnation led (and wrote) at — leading at
+    // it again would write a second history under that epoch.
+    //
+    // restartFenceEpoch_ = the highest epoch this replica led at in ANY earlier
+    // incarnation (durable `leader-epoch-fence` file, written tmp+fsync+rename
+    // at every new-epoch becomeLeader, before the first append) or holds in its
+    // log lineage (leader-epoch checkpoint).  When a controller manages this
+    // partition (setIsrChannel != null), becomeLeader(e <= fence) is REFUSED:
+    // the replica stays a follower of no leader (never accepts a produce) and
+    // asks the controller for a new epoch (AlterIsr with
+    // isrCount == AlterIsrMsg::kLeaderEpochBump), re-sent every kAlterIsrResendNs
+    // (loss recovery only) until a newer role arrives.  The controller answers
+    // with the same assignment at leaderEpoch + 1 (MetadataService::onAlterIsr).
+    // Without a controller (single node: no other replica can diverge) the
+    // fence is inert.
+    // -----------------------------------------------------------------------
+    /// Where the fence persists.  Disk-backed replicas default to
+    /// <log dir>/leader-epoch-fence; memory-backed ones are given a path under
+    /// the node's data dir by BrokerNode.  Loads the persisted value.  Cold.
+    void setLeaderEpochFenceFile(std::string path);
+    /// D15 review m5: a MEMORY-backed replica's restart fence lives in a
+    /// `leader-epoch-state` file in its own directory `dir` (under the node's
+    /// data dir), written like a disk replica's: by the owning worker's io
+    /// backend (worker-driven) — a new-epoch leadership is deferred until the
+    /// slot carrying the fence completed.  `legacyFenceFile` (the pre-D15
+    /// plain fence file) is migrated into it and removed once durable.  No
+    /// valid durable state: the fence stays unknown (the first leadership of
+    /// the incarnation is refused, as without a data dir).  Cold.
+    void setMemoryEpochStateDir(const std::string& dir, const std::string& legacyFenceFile);
+    [[nodiscard]] Epoch restartFenceEpochForTest() const noexcept { return restartFenceEpoch_; }
+    [[nodiscard]] bool  staleLeadershipPendingForTest() const noexcept { return staleLead_.pending; }
+    [[nodiscard]] uint64_t staleLeadershipRefusalsForTest() const noexcept { return staleLeadRefusals_; }
+    [[nodiscard]] bool logDirOfflineForTest() const noexcept { return logDirOffline_; }
+    [[nodiscard]] bool leaderlessReportPendingForTest() const noexcept { return report_.pending; }
+    /// Test view: the committed partitionEpoch this leader derives proposals from.
+    [[nodiscard]] int32_t committedPartitionEpochForTest() const noexcept { return committedPartitionEpoch_; }
+    /// INTERNAL partitions (MAJOR-2/3): ISR changes commit on a MAJORITY's
+    /// durable knowledge instead of at once — the leader publishes each change
+    /// (InternalIsr) to every replica, each persists it in `k` and acks, and it
+    /// commits once a majority holds it; the HW counts committed ∪ proposed
+    /// until then.  A new leadership starts from every replica (HW-counting
+    /// seed) and publishes its first ISR only once every member it keeps
+    /// fetched (validated) at >= max(HW, electionLeo_) — so a published ISR
+    /// never names a member lacking committed records.  The consensus election
+    /// then votes only for members of the newest durable ISRs
+    /// (InternalIsrKnowledge::eligible).  nullptr = self-managed.  Set before
+    /// the replica is driven (control thread).
+    void setInternalIsrKnowledge(InternalIsrKnowledge* k) noexcept { isrKnowledge_ = k; }
+    /// (Follower side) persist an internal ISR state, ack it to its leader.
+    void onInternalIsr(const InternalIsrMsg& m);
+    /// (Leader side) a replica holds our published state (or newer).
+    void onInternalIsrAck(const InternalIsrAckMsg& m);
+    /// Test view: a new internal leadership has not yet committed its first ISR.
+    [[nodiscard]] bool internalSeedPendingForTest() const noexcept { return internalSeedPending_; }
+    /// Test view: an AlterIsr proposal is in flight.
+    [[nodiscard]] bool isrProposalPendingForTest() const noexcept { return isrProposal_.pending; }
+    /// Test view: the maximal ISR the HW is computed over (committed ∪ proposed).
+    [[nodiscard]] const std::vector<NodeId>& maximalIsrForTest() const noexcept;
 
     // -----------------------------------------------------------------------
     // Leader API
@@ -256,7 +484,36 @@ public:
     ///
     /// Does NOT block. Does NOT wait for followers. The caller drives doWork()
     /// to pump follower fetches which advance the HW.
+    ///
+    /// F15 N2: a prebuilt control batch (isControlBatch) is never wrapped: it is
+    /// delegated to appendControlBatch (and so may also return kAppendNotLeader).
     Offset append(std::span<const uint8_t> records, bool acksAll = true);
+
+    /// appendControlBatch / append() failure codes (all negative: never an offset).
+    static constexpr Offset kAppendMinIsr       = -1;   ///< gated by min-ISR (retriable)
+    static constexpr Offset kAppendNotLeader    = -2;   ///< this replica is not the leader (retriable)
+    static constexpr Offset kAppendInvalidBatch = -3;   ///< not a whole, CRC-valid control batch
+    static constexpr Offset kAppendBackPressure = -4;   ///< in-memory ring full (retriable)
+
+    /// F15 N2: append a PREBUILT control batch (a txn COMMIT/ABORT marker) AS a
+    /// control batch — the bytes land verbatim (CONTROL|TRANSACTIONAL, the
+    /// marker's producerId), never wrapped as the value of a data batch.
+    ///
+    ///   - role gate: not Leader → kAppendNotLeader (no assert; retriable);
+    ///   - the min-ISR gate of append() → kAppendMinIsr;
+    ///   - the base offset is restamped in place (Log::appendNoSyncRestamp;
+    ///     CRC-safe: [0..7] precede the CRC region), never via makeBatch_;
+    ///   - then append()'s post-append sequence: leader LEO, HW, cleaner
+    ///     publish, push-on-append, and the SAME flush request append() issues
+    ///     (worker-driven: followerFlushRequested_ for the owning worker;
+    ///     control-thread internal partitions: the inline durable sync).
+    ///
+    /// \returns the marker's base offset, or a negative kAppend* code.
+    Offset appendControlBatch(std::span<const uint8_t> controlBatch, bool acksAll = true);
+
+    /// True iff `bytes` is exactly one whole, CRC-valid record batch with the
+    /// CONTROL attribute — i.e. a prebuilt txn marker.
+    [[nodiscard]] static bool isControlBatch(std::span<const uint8_t> bytes) noexcept;
 
     /// CP-1: append a single record with an explicit (non-empty) key.
     ///
@@ -300,7 +557,12 @@ public:
     ///               the actual current time so time-lag eviction is correct.
     ///
     /// \returns kErrNone on success, error code otherwise.
-    int16_t onFetchRequest(const FetchRequestMsg& req, int64_t nowNs);
+    /// \param connGen  F27 R1: the follower's connection generation at the
+    ///                 transport (0 = not tracked).  A CHANGED generation means
+    ///                 the link to that follower went down and came back — frames
+    ///                 the transport accepted meanwhile may never have arrived, so
+    ///                 its push state is rewound to this fetch (re-sent, not lost).
+    int16_t onFetchRequest(const FetchRequestMsg& req, int64_t nowNs, uint32_t connGen = 0);
 
     /// Read committed records (≤ highWatermark) starting at fetchOffset.
     ///
@@ -309,6 +571,11 @@ public:
     ///
     /// The returned vector's lifetime is the caller's responsibility.
     std::vector<uint8_t> read(Offset fetchOffset, int32_t maxBytes) const;
+    /// read() bounded by `bound` instead of the current HW: whole batches whose
+    /// last record is below `bound`.  For a caller that KNOWS [0, bound) is
+    /// committed while this replica's HW does not show it yet (a demoted
+    /// follower's HW reads 0 until its new leader answers) — never past it.
+    std::vector<uint8_t> readUpTo(Offset fetchOffset, int32_t maxBytes, Offset bound) const;
 
     // -----------------------------------------------------------------------
     // Follower API
@@ -317,48 +584,51 @@ public:
     /// Apply a FetchResponse received from the leader.
     ///
     /// On epoch change (response.leaderEpoch > local):
-    ///   1. Compute truncation offset via EpochFencing.
-    ///   2. Truncate local Log to that offset.
-    ///   3. Adopt the new epoch.
+    /// KIP-320/595: a DivergingEpoch answer runs the KIP-279 truncation and
+    /// re-fetches; a frame from an older OR newer epoch than ours is dropped
+    /// (never adopted, never truncated on).  Applied batches keep the leader's
+    /// stamped partitionLeaderEpoch; the epoch cache is built from those stamps.
     ///
     /// Then append the records to the local Log (if any).
     /// Update local HW = min(local LEO, response.highWatermark).
     void applyReplicated(const FetchResponseMsg& resp);
 
-    /// Build a FetchRequest for the leader: fetchOffset = local LEO.
+    /// Build a FetchRequest for the leader: fetchOffset = local LEO,
+    /// lastFetchedEpoch = the epoch of the last batch in our log (-1 = empty).
     FetchRequestMsg nextFetch() const noexcept;
 
+    /// KIP-320/595: the epoch of the last record in our log (the epoch-cache
+    /// entry owning offset LEO-1), -1 for an empty log.
+    [[nodiscard]] int32_t lastFetchedEpoch() const noexcept;
+    /// Test view: the epoch of OUR record at offset-1 (what a follower whose log
+    /// is a prefix of ours ending at `offset` sends as lastFetchedEpoch).
+    [[nodiscard]] int32_t lastFetchedEpochAtForTest(Offset offset) const {
+        return offset <= 0 ? -1 : epochCache_.epochForOffset(offset - 1);
+    }
+
     // -----------------------------------------------------------------------
-    // DR-BUG-6 — OffsetsForLeaderEpoch exchange (KIP-101) + deficient-leader
-    // reverse-catch-up reconcile.
+    // OffsetsForLeaderEpoch (KIP-101) + the retired DR-BUG-6 reverse reconcile.
+    //
+    // Divergence is resolved on the FETCH path (lastFetchedEpoch validation +
+    // DivergingEpoch, KIP-320/595); followers never send side probes and a
+    // leader never pulls records it did not hold when elected.  The handlers
+    // stay so the transports' message plumbing (and a peer on an older build)
+    // stays well-defined.
     // -----------------------------------------------------------------------
 
-    /// (Leader) Handle an OffsetsForLeaderEpochRequest from a follower that is
-    /// deciding whether/where to truncate on an epoch change.  Answers from the
-    /// LeaderEpochCache: (responseEpoch, endOffset) — see LeaderEpochCache::
-    /// endOffsetForEpoch.  Sends the response via
-    /// transport_->sendOffsetsForLeaderEpochResponse().
+    /// (Leader) Answer an OffsetsForLeaderEpoch query authoritatively from the
+    /// LeaderEpochCache: (responseEpoch, endOffset) = endOffsetForEpoch.  No
+    /// state change, no ISR / HW credit.
     void onOffsetsForLeaderEpochRequest(const OffsetsForLeaderEpochReqMsg& req);
 
-    /// (Follower) Apply the leader's OffsetsForLeaderEpoch answer: perform the
-    /// DEFERRED, correct truncation.
-    ///   • responseEpoch == our latest epoch  → SHARED (possibly open) epoch:
-    ///     no divergence.  We keep our tail (the leader reconciles anything it
-    ///     lacks).  Truncate only to min(ourLEO, endOffset) which, for a shared
-    ///     open epoch (endOffset == leaderLEO), can be BELOW our LEO — but those
-    ///     are committed records the leader is missing, so we KEEP them.
-    ///   • responseEpoch  < our latest epoch  → GENUINE divergence at the epoch
-    ///     boundary: truncate to min(ourLEO, endOffset).
-    /// Never truncates below our committed HW floor (defence in depth).
+    /// (Follower) Retired: this build never probes, so an answer is ignored.
     void applyOffsetsForLeaderEpochResponse(const OffsetsForLeaderEpochRespMsg& resp);
 
-    /// (Any role) Serve a reconcile pull: read raw log bytes [fromOffset, LEO)
-    /// and reply via transport_->sendReconcileResponse().  Used by an ahead
-    /// survivor to feed committed records to a deficient new leader.
+    /// Retired reverse-reconcile pull: ignored (a leader never takes records it
+    /// did not hold when elected).
     void onReconcileRequest(const FetchRequestMsg& req);
 
-    /// (Leader) Apply reconcile records pulled from an ahead survivor: append
-    /// the strictly-new committed tail and advance LEO/HW.
+    /// Retired reverse-reconcile answer: ignored.
     void applyReconcileResponse(const FetchResponseMsg& resp);
 
     // -----------------------------------------------------------------------
@@ -381,6 +651,30 @@ public:
 
     [[nodiscard]] Role        role()           const noexcept { return role_; }
     [[nodiscard]] Epoch       epoch()          const noexcept { return epoch_; }
+    /// THE produce gate — the only predicate every produce / control-batch
+    /// append path consults (worker, gateway inline, internal stores via
+    /// append*, the DR harness).  Kafka model (HW = min LEO over the ISR, the
+    /// leader is always an ISR member): every leader holds every committed
+    /// record, so leadership alone is the gate.  Refusal = retriable NotLeader.
+    [[nodiscard]] [[gnu::always_inline]] bool acceptsProduce() const noexcept {
+        return role_ == Role::Leader && !leadPending_;
+    }
+    /// F15 §2.1 step 3 / §3.2: bumped by every change to the log's existing
+    /// content — a tail truncation (KIP-279; formerly also a reconcile append of
+    /// foreign old-term batches).  A parked waiter compares it with the value it parked under.
+    /// Owner thread only (plain member, no atomic).
+    [[nodiscard]] uint64_t    logGeneration()  const noexcept { return logGeneration_; }
+    /// The offset the log was cut to by the change that last bumped
+    /// logGeneration() (a reconcile append records the LEO before it): every
+    /// offset below it is unchanged by that change.  Owner thread only.
+    [[nodiscard]] Offset      lastTruncationOffset() const noexcept { return lastTruncationOffset_; }
+    /// F15 S4: bumped on every Leader <-> Follower transition (becomeLeader from
+    /// a non-leader, becomeFollower, self-demotion in onFetchRequest) — NOT on a
+    /// leader-epoch bump while still Leader.  While Follower the log may grow by
+    /// replicated appends that a leader-side incremental state never saw, so the
+    /// worker's read_committed state is valid only within one leadership.
+    /// Owner thread only (plain member, no atomic).
+    [[nodiscard]] uint64_t    leadershipGeneration() const noexcept { return leadershipGeneration_; }
     [[nodiscard]] Offset      logEndOffset()   const noexcept { return logEndOffset_(); }
     [[nodiscard]] Offset      highWatermark()  const noexcept;
 
@@ -397,7 +691,7 @@ public:
     // The LogCleanerAgent runs on its OWN thread (cleanerRunner_) concurrently
     // with the duty/append thread (NodeRuntimeAgent on agentRunner_).  It MUST
     // NOT read the live leader/ISR state (leaderState_, isrManager_->isr(),
-    // leaderComplete_, lastHealthyHw_, role_) — those are mutated by the duty
+    // lastHealthyHw_, role_) — those are mutated by the duty
     // thread without synchronisation (torn std::vector reads, non-atomic scalar
     // writes → UB, TSan-proven).
     //
@@ -432,6 +726,99 @@ public:
     // fresh value.
     [[nodiscard]] Offset gatewayHighWatermark() const noexcept {
         return publishedHwForCleaner_.load(std::memory_order_acquire);
+    }
+    // D3b (Kafka LogCleaner parity): the cleaner never cleans at/after the last
+    // stable offset — an OPEN transaction's data must stay untouched (it may still
+    // abort, and an aborted value must never supersede a committed one).  The
+    // OWNING worker publishes the first offset of the earliest open transaction of
+    // its read_committed state (RcState LsoTracker) here; the LogCleanerAgent caps
+    // firstUncleanable at it, exactly as it does at cleanerHighWatermark().
+    // INVARIANT (fix round 1): a partition with read_committed state (topicId >= 0
+    // — exactly the partitions a Worker builds an RcState for) STARTS at 0 = clean
+    // nothing, and is 0 whenever that state is not Ready (unbuilt / scanning): the
+    // worker publishes 0 BEFORE any rebuild step and the first real value only on
+    // READY.  So no cleaner pass starts while the log's transaction state is being
+    // rebuilt (and the worker defers draining a cleaner swap until the rebuild is
+    // done — see Worker::cleanerSwapsDeferred_).  kNoCleanerLso = no open
+    // transaction, or no read_committed state at all (internal topics, topicId <
+    // 0): no cap beyond HW (the cleaner's own log scan still never cleans an
+    // unresolved txn).  Slightly stale is safe like the HW snapshot.
+    static constexpr Offset kNoCleanerLso = std::numeric_limits<Offset>::max();
+    void publishCleanerLso(Offset firstUnstableOffset) noexcept {
+        publishedLsoForCleaner_.store(firstUnstableOffset, std::memory_order_release);
+    }
+    // D3b fix round 1: the minimum fetch position over EVERY assigned replica (not
+    // just the ISR), published by the duty/owning thread in publishCleanerState().
+    // A txn marker below it is held by every replica, so the cleaner may remove it;
+    // at/above it a lagging replica (possibly outside the ISR) that already holds
+    // the txn's data may still need the marker — removing it would make that
+    // replica, once leader, read the aborted data as the producer's NEXT txn.  A
+    // replica that never fetched counts as 0, so a permanently dead assigned
+    // replica keeps every marker (correctness over growth).  Follower role: 0.
+    // Only REAL fetch positions count (onFetchRequest), relearned every
+    // leadership; an OffsetsForLeaderEpoch probe's LEO never does (it may be a
+    // divergent pre-truncation tail).  The bound TRUSTS reported fetch positions:
+    // a follower that lost an unflushed tail in a crash keeps its old position
+    // here until it fetches again — safe unless a marker's delete horizon
+    // (deleteRetentionMs) expires within that follower's restart.
+    // kNoCleanerLso when this is the only assigned replica.
+    [[nodiscard]] Offset cleanerMarkerRemovalBound() const noexcept {
+        return publishedMarkerBoundForCleaner_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] Offset cleanerLastStableOffset() const noexcept {
+        return publishedLsoForCleaner_.load(std::memory_order_acquire);
+    }
+    /// Fix round 2: the owner thread installs a deferred compaction output only
+    /// when every member base is below min(HW, LSO) — the cleaner selected them
+    /// strictly below both.  Owner thread (reads the live HW).
+    [[nodiscard]] Offset cleanerSwapBound() const noexcept {
+        // Compaction is leader-only: an output the cleaner produced before a
+        // demotion is rejected (bound below every base), never installed on a
+        // follower.
+        if (role_ != Role::Leader) return std::numeric_limits<Offset>::min();
+        return std::min<Offset>(highWatermark(), cleanerLastStableOffset());
+    }
+    /// Fix round 2: drain the cleaner's swap ring on the OWNER thread (validate +
+    /// install deferred compaction outputs), then rewind the clean watermark to
+    /// the lowest rejected range — the cleaner advanced it BEFORE enqueueing
+    /// (so this owner store is always later in lastCleanOffset_'s modification
+    /// order), and a rejected range must be recompacted.  Disk-backed only.
+    int drainCleanerSwapsOnOwner() {
+        rune::storage::Log* l = log();
+        const int work = l->drainCleanerSwaps(cleanerSwapBound());
+        const int64_t low = l->takeCleanerRejectLowWater();
+        if (low != INT64_MAX) requestCleanerRewind(low);
+        return work;
+    }
+    /// Fix round 3 (N-MEDIUM-2): retention deletes are only PROPOSED by the
+    /// cleaner; the owner validates (identity, not active, segment end <= HW)
+    /// and only then renames the files away.  Disk-backed only.
+    int drainRetentionDeletesOnOwner() {
+        return log()->drainRetentionDeletes(highWatermark());
+    }
+
+    // ---- Fix round 3 (N-MEDIUM-1): clean-watermark rewind channel ----------
+    // lastCleanOffset_ is written by the cleaner only.  The owner, on rejecting
+    // a compaction output, PUBLISHES a rewind point instead of storing the
+    // watermark itself (a concurrent cleaner pass would overwrite that store).
+    // Owner = single writer of gen/to; cleaner = single writer of ack.  The
+    // owner folds a new rejection into a not-yet-acknowledged one (min), so a
+    // rewind is never lost — at worst over-conservative.
+    void requestCleanerRewind(Offset to) noexcept {
+        const uint64_t gen   = cleanerRewindGen_.load(std::memory_order_relaxed);
+        const uint64_t acked = cleanerRewindAck_.load(std::memory_order_acquire);
+        const Offset   prev  = cleanerRewindTo_.load(std::memory_order_relaxed);
+        cleanerRewindTo_.store(acked == gen ? to : std::min(prev, to), std::memory_order_relaxed);
+        cleanerRewindGen_.store(gen + 1, std::memory_order_release);
+    }
+    /// Cleaner thread: fold any published rewind into the clean watermark.
+    /// Called at pass start and right after the pass stores its passEnd.
+    void applyCleanerRewind() noexcept {
+        const uint64_t gen = cleanerRewindGen_.load(std::memory_order_acquire);
+        if (gen == cleanerRewindAck_.load(std::memory_order_relaxed)) return;
+        const Offset to = cleanerRewindTo_.load(std::memory_order_relaxed);
+        if (to < lastCleanOffset()) setLastCleanOffset(to);
+        cleanerRewindAck_.store(gen, std::memory_order_release);
     }
     // Task #13: gatewayIsrSize() — acquire-load of the published ISR size snapshot.
     // The owning worker publishes (in publishCleanerState()) the current ISR size
@@ -474,6 +861,8 @@ public:
     [[nodiscard]] NodeId      selfId()         const noexcept { return cfg_.selfId; }
     /// E5.1.2d: min-ISR required for acks=All produce on this partition.
     [[nodiscard]] int         minIsr()         const noexcept { return cfg_.minIsr; }
+    /// TEST SEAM: change min-ISR on a live leader (e.g. an ISR-recovery scenario without a 2nd node).
+    void setMinIsrForTest(int v) noexcept { cfg_.minIsr = v; effectiveMinIsr_ = v; }
     /// CP-1: the log cleanup policy for this partition (consulted by the LogCleaner).
     [[nodiscard]] CleanupPolicy cleanupPolicy() const noexcept { return cfg_.cleanupPolicy; }
 
@@ -518,7 +907,142 @@ public:
     /// NodeRuntimeAgent drains, PartitionFailoverCoordinator) skip memory-backed
     /// partitions via this predicate.
     [[nodiscard]] bool isMemoryBacked() const noexcept { return memoryBacked_; }
+    /// The InMemoryLog of a memory-backed partition (nullptr when disk-backed).
+    /// Owner thread only (the producer-state rebuild of the owning worker).
+    [[nodiscard]] rune::storage::InMemoryLog* memoryLog() const noexcept {
+        return memoryBacked_ ? memLog_ : nullptr;
+    }
     [[nodiscard]] bool isDiskBacked()   const noexcept { return !memoryBacked_; }
+
+    /// Shard mode (spec §3.1 never-block): this replica never fsyncs inline.
+    /// The time-gated follower flush, the direct append() (txn markers) and the
+    /// reconcile append become page-cache writes plus a flush REQUEST that the
+    /// owning worker submits to its io backend; the disk log's roll seal is
+    /// deferred to the worker too (Log::setDeferSealSync).  Set before the
+    /// replica is driven; legacy = false (inline fsyncs, unchanged).
+    /// Task 10 fix 3: registry identity (set once by ReplicaRegistry::add on the
+    /// control thread, before any worker learns of the replica).  (0, 0) =
+    /// unregistered: ops for it are not ownership-gated.
+    void setRegistryHandle(uint32_t id, uint32_t incarnation) noexcept {
+        registryId_ = id; incarnation_ = incarnation;
+    }
+    [[nodiscard]] uint32_t registryId()  const noexcept { return registryId_; }
+    [[nodiscard]] uint32_t incarnation() const noexcept { return incarnation_; }
+
+    /// Worker-driven user replicas (every placement, F30): the follower flush,
+    /// leader append / txn-marker flushes and roll seals become requests the
+    /// owning worker submits to its io backend — never an inline fsync.
+    /// Hot-path B F7: also switches the leader-epoch durability (restart fence
+    /// + epoch cache) to the two-slot `leader-epoch-state` file written by the
+    /// owning worker through its io backend (see epochStateWriteDue) — never a
+    /// synchronous fsync on the worker.  Opening / creating the file is cold
+    /// (the caller's thread; BrokerNode: the control thread at replica build).
+    void setExternalFollowerFlush(bool on) noexcept {
+        // Review Md6: never switch the epoch-state writer while a write is in
+        // flight (the inline path would target the confirmed slot / race the
+        // io backend's fdatasync on the fd).  Configuration-time only.
+        if (!on && es_.stage != EsStage::Idle) [[unlikely]] {
+            assert(false && "setExternalFollowerFlush(false) with an epoch-state write in flight");
+            return;
+        }
+        externalFollowerFlush_ = on;
+        if (!memoryBacked_ && diskLog_ != nullptr) diskLog_->setDeferSealSync(on);
+        if (on && !memoryBacked_ && diskLog_ != nullptr && !es_.enabled) enableEpochState_();
+    }
+
+    // -----------------------------------------------------------------------
+    // Hot-path B F7: async leader-epoch durability (worker-driven replicas).
+    //
+    // Every leader-epoch durability point (the restart fence before leading a
+    // new epoch, the epoch-cache checkpoint after an assign / truncation) is
+    // ONE write + fdatasync of the alternate slot of `leader-epoch-state`,
+    // submitted by the owning worker (Worker::submitEpochStateWrites_) — the
+    // recovery-point checkpoint's state machine:
+    //   Idle --prepare--> Prepared --submitted--> InFlight --completed--> Idle
+    //   (Prepared --notSubmitted--> Idle on back-pressure; still due.)
+    // Ordering is unchanged and EVENT-driven: a controller-managed
+    // becomeLeader at an epoch above the durable fence is DEFERRED (the
+    // replica keeps its previous role, applies nothing, fetches nothing) until
+    // the slot carrying the fence AND the new epoch's cache entry completed —
+    // exactly what the synchronous fsync guaranteed before.  A failed write
+    // refuses the leadership and takes the log dir offline (as before).
+    // -----------------------------------------------------------------------
+    struct EpochStateWrite { int fd = -1; const uint8_t* data = nullptr; uint32_t len = 0; int64_t offset = 0; uint64_t seq = 0; };
+    /// A change awaits its write, nothing is in flight, and the retry backoff
+    /// of a failed write (Md2) has passed.
+    [[nodiscard]] bool epochStateWriteDue() const noexcept {
+        return es_.enabled && es_.due && es_.stage == EsStage::Idle && lastKnownNowNs_ >= es_.retryNotBeforeNs;
+    }
+    /// Idle -> Prepared: encode the alternate slot into the CALLER's buffer
+    /// (review Md4: the owning worker's scratch — the bytes are copied into the
+    /// page cache by the caller's pwrite before it returns, so nothing per
+    /// replica stays resident).  `need` = the bytes required; false with
+    /// need > cap: grow the buffer and call again.  Opens the file lazily
+    /// (cold: role / epoch transitions only).
+    bool prepareEpochStateWrite(uint8_t* buf, std::size_t cap, EpochStateWrite& out, std::size_t& need);
+    /// Prepared -> InFlight.
+    void epochStateWriteSubmitted() noexcept;
+    /// Prepared -> Idle (back-pressure: still due).
+    void epochStateWriteNotSubmitted() noexcept;
+    /// InFlight, but its completion cannot be routed back (review Md3): the
+    /// outcome will never be observed — treated as not written (still due,
+    /// rewritten with a higher seq).  Never wedges a promotion.
+    void epochStateWriteNotRouted() noexcept;
+    /// InFlight completed (err = errno, 0 = ok).  Success may complete a
+    /// deferred leadership, a deferred re-fetch and lift the recovery-point
+    /// cap.  A failure is retried with backoff; kMaxEpochStateFailures in a row
+    /// fail the log (fail-stop, like any other storage failure).  Returns true
+    /// iff another write is due.
+    bool epochStateWriteCompleted(uint64_t seq, int err);
+    static constexpr int kMaxEpochStateFailures = 3;
+    /// A fresh owner holds no route for an in-flight write (its completion
+    /// went to a previous owner): outcome unknown — rewritten with a higher seq.
+    void resetEpochStateForNewOwner() noexcept;
+    /// Nothing due and nothing in flight (every change is durable).
+    [[nodiscard]] bool epochStateDurable() const noexcept {
+        return !es_.enabled || (!es_.due && es_.stage == EsStage::Idle);
+    }
+    [[nodiscard]] bool leadershipPendingForTest() const noexcept { return pendingLead_.active; }
+    [[nodiscard]] uint64_t leadershipsDeferredForTest() const noexcept { return leadershipsDeferred_; }
+    [[nodiscard]] uint64_t leadershipsResumedForTest() const noexcept { return leadershipsResumed_; }
+    [[nodiscard]] uint64_t epochStateWritesForTest() const noexcept { return es_.writes; }
+    /// Restarts whose durable epoch history disagreed with the stamps (rebuilt).
+    [[nodiscard]] uint64_t epochHistoryRebuildsForTest() const noexcept { return epochHistoryRebuilds_; }
+    [[nodiscard]] uint64_t epochStateInlineWritesForTest() const noexcept { return es_.inlineWrites; }
+    [[nodiscard]] uint64_t epochStateErrorsForTest() const noexcept { return es_.errors; }
+    [[nodiscard]] bool epochStateEnabledForTest() const noexcept { return es_.enabled; }
+    [[nodiscard]] bool epochStateFdOpenForTest() const noexcept { return es_.fd >= 0; }
+    [[nodiscard]] bool refetchAwaitsEpochStateForTest() const noexcept { return awaitEsFetch_; }
+    /// Tests (power-loss seam): completions of epoch-state writes are held —
+    /// the write stays InFlight (never confirmed) until released.
+    void holdEpochStateCompletionsForTest(bool on) noexcept { esHoldForTest_ = on; }
+    [[nodiscard]] bool epochStateCompletionHeldForTest() const noexcept { return esHeld_; }
+    /// Tests: the next `n` completions report `err`.
+    void failNextEpochStateCompletionsForTest(int n, int err) noexcept { esFailN_ = n; esFailErr_ = err; }
+    /// Tests (re-review N4): write the history inline now (as the outgrown-slot
+    /// re-create does).  Only while nothing is in flight.
+    bool writeEpochStateInlineForTest() noexcept { return writeEpochStateInline_(); }
+    /// Tests (re-review N6): the next `n` inline epoch-state writes fail (process-wide, single-threaded tests).
+    static void failInlineEpochStateWritesForTest(int n) noexcept { inlineFailN_ = n; }
+    /// Tests: deliver a held completion now.
+    void releaseHeldEpochStateForTest() {
+        esHoldForTest_ = false;
+        if (esHeld_) { esHeld_ = false; (void)epochStateWriteCompleted(esHeldSeq_, esHeldErr_); }
+    }
+    /// Tools / tests: the durable leader-epoch cache of `logDir` exactly as a
+    /// restart restores it (`leader-epoch-state` when present, else the legacy
+    /// `leader-epoch-checkpoint`).  False when neither holds a valid image.
+    static bool readDurableEpochCache(const std::string& logDir, rune::storage::LeaderEpochCache& out);
+    [[nodiscard]] bool externalFollowerFlush() const noexcept { return externalFollowerFlush_; }
+    /// Leader-epoch checkpoint writes (the one accepted synchronous disk write
+    /// on a shard loop — see checkpointEpochs_).
+    [[nodiscard]] uint64_t epochCheckpointWritesForTest() const noexcept { return epochCheckpointWrites_; }
+    /// Worker side: consume a pending flush request (true once per request).
+    [[nodiscard]] bool takeFollowerFlushRequest() noexcept {
+        const bool r = followerFlushRequested_;
+        followerFlushRequested_ = false;
+        return r;
+    }
 
     /// Task 9: test accessor — exposes the internal epoch cache for restart-
     /// durability tests.  Disk-backed only (memory-backed partitions have no
@@ -536,6 +1060,43 @@ public:
     }
     [[nodiscard]] const rune::storage::ProducerStateManager& producerStateManagerForTest() const noexcept {
         return psm_;
+    }
+
+    /// F3 fix-round-2, item A.3 test accessor: drive the private pushToFollowers()
+    /// directly, so a test can control fromOffset/pushCeiling precisely without
+    /// needing GR-10's real coalesced-push cadence.
+    /// F27: `fromOffset` is ignored — every follower is pushed from its own cursor.
+    void pushToFollowersForTest(Offset /*fromOffset*/, Offset pushCeiling = kNoPushCeiling) noexcept {
+        (void)pushToFollowers(pushCeiling);
+    }
+
+    /// F3 round 5, item I2 test accessors: how many times the "batch exceeds the
+    /// transport's hard ceiling" condition was EVALUATED (each one is a log read
+    /// + parse), and how many critical log lines it actually EMITTED.
+    [[nodiscard]] uint64_t unsendableBatchEvaluationsForTest() const noexcept {
+        return unsendableBatchLogCount_;
+    }
+    [[nodiscard]] uint64_t unsendablePushLogEmitsForTest() const noexcept {
+        return unsendablePushLogEmits_;
+    }
+    /// F3 round 6: FETCH responses that carried records (Data serves) — with
+    /// push on, a non-zero count means the follower had to be re-served
+    /// (lost/dropped push → 20 ms resend window).
+    [[nodiscard]] uint64_t fetchDataServesForTest() const noexcept { return fetchDataServes_; }
+    /// Test seam: a follower-side log truncation (KIP-279), bumping logGeneration().
+    void truncateLogForTest(Offset truncateOffset) { truncateLog(truncateOffset); }
+    /// F27: replication sends this replica had REFUSED by its transport (pushes,
+    /// fetch answers, follower fetches/acks) — each one was retried next pass.
+    [[nodiscard]] uint64_t sendRefusalsForTest() const noexcept { return sendRefusals_; }
+    /// Test view of the push flow window (== kPushFlowWindow, asserted below).
+    static constexpr Offset kPushFlowWindowForTest = 16384;
+    /// F27 F7: times an owed Data answer's whole-batch walk was (re)built.
+    [[nodiscard]] uint64_t owedAnswerRebuildsForTest() const noexcept { return owedRebuilds_; }
+    /// The leader's tracked LEO for `follower` (-1 = none) — B1 SET semantics.
+    [[nodiscard]] Offset followerLeoForTest(NodeId follower) const noexcept {
+        const auto& m = leaderState_.followerLeos();
+        const auto it = m.find(follower);
+        return it == m.end() ? -1 : it->second;
     }
 
     /// Non-owning pointer to the underlying disk Log (for cleaner / compaction /
@@ -556,6 +1117,20 @@ public:
     /// ISR as seen by the leader (empty for follower).
     [[nodiscard]] const std::vector<NodeId>& isr() const noexcept;
 
+    // F18 (cumulative, never reset — exported for ops/tests).
+    /// Leader: fetches answered kErrRecordTooLarge (first batch > one frame).
+    [[nodiscard]] uint64_t recordTooLargeServed() const noexcept { return recordTooLargeServed_; }
+    /// Follower: times this replica wedged on an unreplicable batch.
+    [[nodiscard]] uint64_t wedgedRefusals() const noexcept { return wedgedRefusals_; }
+    /// Follower: the offset it is wedged at (stops fetching it), or -1.
+    [[nodiscard]] Offset wedgedAtOffset() const noexcept { return wedgedAtOffset_; }
+    /// F18 (B-1): this node's transport could not hand the follower the batch
+    /// whose baseOffset is `batchBase` (it cannot fit one worker-ingress frame on
+    /// its own).  Wedges ONLY if that batch is the one at our LEO and the answer
+    /// is from the current (or a newer) epoch — a multi-batch prefix, a push from
+    /// further ahead or a duplicate never wedges.
+    void onUnapplicableBatch(Offset batchBase, Epoch leaderEpoch);
+
 private:
     // -----------------------------------------------------------------------
     // Internal helpers
@@ -565,27 +1140,6 @@ private:
     /// The pointer fields + memoryBacked_ are set in each constructor's init list;
     /// this seeds the leader/follower state, epoch cache, and cleaner snapshots.
     void initReplica(std::vector<NodeId> replicas, std::vector<NodeId> isr);
-
-    /// (Leader) DR-BUG-6 divergence guard — is an ahead follower's tail a genuine
-    /// continuation of THIS leader's OWN epoch lineage (KIP-101), i.e. safe to
-    /// keep+reverse-reconcile rather than direct the follower to truncate?
-    ///
-    /// Gates on the follower's tail EPOCH, NOT on ISR membership.  Because the
-    /// GR-2 bridge seeds ISR = ALL replicas, ISR membership cannot distinguish a
-    /// committed continuation from a divergent tail — both look "in ISR".  The
-    /// only sound discriminator is epoch lineage:
-    ///
-    ///   endOffsetForEpoch(requestedEpoch, leaderLEO) → (responseEpoch, endOffset)
-    ///
-    /// The follower's ahead tail is a shared continuation ONLY when the leader
-    /// shares the EXACT epoch the follower's tail is in AND that epoch is the
-    /// leader's own latest OPEN epoch (endOffset == leaderLEO, boundary >=
-    /// leaderLEO).  Then the follower's [leaderLEO, followerLEO) tail extends the
-    /// leader's still-open shared epoch → keep + reverse-reconcile.  Otherwise the
-    /// follower's tail is from a divergent / non-shared epoch → the leader answers
-    /// authoritatively and the follower TRUNCATES to the shared-epoch end offset.
-    [[nodiscard]] bool followerTailIsSharedContinuation(
-            Epoch requestedEpoch, Offset followerLeo) const;
 
     /// (Leader) Recompute HW from ReplicaLeaderState and propagate to leader ISR.
     void recomputeHw();
@@ -600,10 +1154,14 @@ private:
 
     /// Publish the current served HW + role into the cleaner-visible atomics
     /// (release-store).  MUST be called on the DUTY/append thread only, at every
-    /// site that can change the served HW, the ISR, the completeness gate, or the
+    /// site that can change the served HW, the ISR, or the
     /// role.  The LogCleanerAgent reads these via cleanerHighWatermark() /
     /// cleanerRole() (acquire-load) so it never touches the live racy state.
     void publishCleanerState() noexcept;
+    /// CRITICAL-1: forget every published follower position (new leadership /
+    /// demotion) — the controller snapshot then carries self only until a
+    /// follower fetches (validated) in this leadership.
+    void clearPublishedFollowerPositions_() noexcept;
 
     /// (Leader) Propagate current ISR into ReplicaLeaderState.
     void syncIsrToLeaderState();
@@ -611,11 +1169,28 @@ private:
     /// (Follower) Truncate the log to `truncateOffset` (inclusive last valid
     /// offset = truncateOffset - 1).  Updates local LEO.
     void truncateLog(Offset truncateOffset);
+    /// Fix round 5: the tail of a KIP-279 divergence truncation (truncate, reset
+    /// the fetch state, re-fetch) — run at once or from TruncatePending.
+    void completeDivergenceTruncation_(Offset truncTo);
+public:
+    /// Fix round 5 observability: divergence truncations deferred because the
+    /// log cleaner had posted renames pending; applies dropped meanwhile.
+    [[nodiscard]] uint64_t truncatesDeferred() const noexcept { return truncatesDeferred_; }
+    [[nodiscard]] uint64_t appliesDroppedTruncatePending() const noexcept { return appliesDroppedTruncatePending_; }
+    [[nodiscard]] uint64_t appliesDroppedAwaitEsForTest() const noexcept { return appliesDroppedAwaitEs_; }
+    [[nodiscard]] uint64_t appliesDroppedLeadPendingForTest() const noexcept { return appliesDroppedLeadPending_; }
+    [[nodiscard]] bool     truncatePendingForTest() const noexcept { return followerSync_.truncatePending(); }
+private:
+    uint64_t truncatesDeferred_ = 0;
+    uint64_t appliesDroppedTruncatePending_ = 0;
 
-    /// (Leader) GR-10: push records starting at fromOffset to all ISR followers
-    /// via unsolicited FetchResponse.  Non-blocking (tryClaim/offer); a dropped
-    /// push is fine — the fetch backstop recovers it.  Uses encodeScratch_ (no
-    /// per-call alloc).  Only called when cfg_.pushOnAppend is true.
+    /// (Leader) GR-10: push records to all ISR followers via unsolicited
+    /// FetchResponse.  Non-blocking (tryClaim/offer).  F27: each follower is
+    /// pushed from ITS OWN cursor (FollowerSlot::pushCursor) and its cursor
+    /// advances only when the transport ACCEPTED the push to it — a refused push
+    /// is re-sent on the next pass (time-independent), followers that got it are
+    /// not re-sent.  Builds the FetchResponse via makeFetchResponse() (zero-copy
+    /// records view).  Only called when cfg_.pushOnAppend is true.
     // Flow control: the leader never pushes more than kPushFlowWindow records ahead
     // of the slowest ISR follower's acked LEO.  Outrunning the follower makes Aeron
     // back-pressure and DROP best-effort pushes → the follower stalls behind the gap
@@ -623,16 +1198,84 @@ private:
     // leader to the follower's apply rate instead → stable.  Well under an Aeron term
     // buffer's record capacity so a full window never overflows the publication.
     static constexpr Offset kPushFlowWindow  = 16384;
+    static_assert(kPushFlowWindow == kPushFlowWindowForTest);
     static constexpr Offset kNoPushCeiling   = (1LL << 62);
-    /// Push [fromOffset, min(LEO, pushCeiling)) to ISR followers (whole-batch aligned,
-    /// capped at maxFetchBytes).  Advances lastPushedOffset_ to the last offset pushed.
-    void pushToFollowers(Offset fromOffset, Offset pushCeiling = kNoPushCeiling) noexcept;
+    /// Push [cursor_f, min(LEO, pushCeiling)) to each ISR follower f (whole-batch
+    /// aligned, capped at the frame).  `floor` = pushFloor_() when the caller
+    /// already has it (doWork, F9), else kFloorUnknown (computed here).  An ISR
+    /// follower without a slot cannot exist (the ISR is within the replica set the
+    /// slots are built from) and is skipped.
+    /// Returns the number of pushes the transport ACCEPTED (doWork's work count).
+    static constexpr Offset kFloorUnknown = -1;
+    int pushToFollowers(Offset pushCeiling = kNoPushCeiling, Offset floor = kFloorUnknown) noexcept;
+    /// F27: the lowest push cursor over the ISR followers (LEO when there are none)
+    /// — the derived replacement of the former shared lastPushedOffset_.
+    [[nodiscard]] Offset pushFloor_() const noexcept;
+    /// F27: re-send fetch answers the transport refused (FollowerSlot::owed).
+    /// Never refreshes ISR liveness (only a real fetch does).  Returns sends made.
+    int retryOwedFetchAnswers_() noexcept;
+    /// F27: send a fetch answer to `slot`'s follower; on refusal record it as owed
+    /// and forget it as served (never conflate against an unsent answer).
+    bool sendFetchAnswer_(FollowerSlot* slot, NodeId follower, const FetchResponseMsg& resp,
+                          Offset fetchOffset, int32_t maxBytes, bool data, Offset dataEnd);
+    /// F27 F3: DR sends that are OWED when refused and re-sent next pass.
+    void sendEpochAnswer_(NodeId to, const OffsetsForLeaderEpochRespMsg& m);
+    /// F27 F3: re-send owed DR frames (any role).  Returns sends accepted.
+    int retryOwedDrSends_() noexcept;
+
+    /// F3 round 5, item I2: true while the push head is a remembered UNSENDABLE
+    /// batch and nothing that could change the outcome (LEO, ISR, follower
+    /// position via pushCeiling, epoch) has changed — doWork() then skips the
+    /// push entirely (no readView/parse, no work count).  One compare when unarmed.
+    [[nodiscard]] bool unsendablePushSuppressed_(Offset pushCeiling, Offset floor) const noexcept;
+    /// Order-sensitive signature of the current ISR (cold: only computed while
+    /// an unsendable-push memo is armed or being armed).
+    [[nodiscard]] uint64_t isrSignature_() const noexcept;
+    // Spec §3.5.2: follower FetchRequests are unicast to the known leader.
+    /// F27: true iff the transport accepted the request.
+    bool sendFetchToLeader_(const FetchRequestMsg& req);
+
+    /// (Follower) KIP-279 truncation on a DivergingEpoch answer, then re-fetch.
+    void onDivergingEpoch_(int32_t divergingEpoch, Offset divergingEndOffset);
+    /// (Follower) Kafka LeaderEpochFileCache.assign on append: record the start
+    /// of every new epoch stamped on the batches in [p, p+len) (whole batches).
+    /// Returns true when the cache changed.
+    bool assignEpochsFromBatches_(const uint8_t* p, std::size_t len);
+    /// Cold: rebuild the epoch cache from every stamped batch in the log.
+    void rebuildEpochCacheFromLog_();
+
+    /// Build a FetchResponseMsg stamped with this partition's identity
+    /// (epoch/partitionId/topicId, logStartOffset=0) plus the given HW,
+    /// errorCode and records.  ZERO-COPY: `records` is a view (into the log's
+    /// read mmap, or an empty span for an error/HW-only reply) that the caller
+    /// MUST keep alive until transport_->sendFetchResponse()/sendReconcileResponse()
+    /// returns — both encode synchronously into the outbound ring before
+    /// returning.  Replaces the old encode-into-encodeScratch_ → decode →
+    /// re-encode round-trip (one full record-bytes copy + a decode parse per
+    /// replication frame).
+    FetchResponseMsg makeFetchResponse(Offset highWatermark, int16_t errorCode,
+                                       std::span<const uint8_t> records) const noexcept {
+        FetchResponseMsg r{};
+        r.leaderEpoch    = epoch_;
+        r.partition      = cfg_.partitionId;
+        r.highWatermark  = highWatermark;
+        r.logStartOffset = 0;
+        r.errorCode      = errorCode;
+        r.topicId        = cfg_.topicId;
+        r.records        = records;
+        return r;
+    }
 
     // -----------------------------------------------------------------------
     // Fields
     // -----------------------------------------------------------------------
     PartitionConfig      cfg_;
     Role                 role_;
+    /// Hot-path B F7: a leadership at a newer epoch awaits its durable fence
+    /// (mirrors pendingLead_.active; next to role_ — same line as the produce
+    /// gate's load).  A sitting leader being re-elected refuses produce
+    /// (retriable NotLeader) until it leads at the new epoch, as before.
+    bool                 leadPending_ = false;
     Epoch                epoch_;
     NodeId               leaderId_;           ///< (follower) leader's NodeId; -1 if unknown
 
@@ -646,6 +1289,16 @@ private:
     rune::storage::InMemoryLog* memLog_  = nullptr;  ///< non-null iff  memoryBacked_
     bool                        memoryBacked_ = false;
     PartitionTransport*         transport_;   ///< non-owning
+    using PerWorkerTransport = WorkerReplicationTransportImpl<AeronPubRegistry>;
+    TransportKind       tkind_     = TransportKind::Generic;  ///< fixed at construction
+    PerWorkerTransport* perWorker_ = nullptr;                 ///< non-null iff tkind_ == PerWorker
+    AeronPartitionTransport* aeronT_ = nullptr;               ///< non-null iff tkind_ == Aeron
+    NullPartitionTransport*  nullT_  = nullptr;               ///< non-null iff tkind_ == Null
+    /// Apply f to the concrete transport: one predicted branch, direct call on the
+    /// PerWorker arm.  Defined in PartitionReplica.cpp (its only user).
+    /// F3 fix-round-2: returns auto (was void) so callers can also use this to
+    /// QUERY the transport (e.g. maxFetchResponseBytes()), not just send.
+    template <class F> auto onTransport(F&& f);
 
     // -----------------------------------------------------------------------
     // De-virtualized hot-path log dispatch.
@@ -684,25 +1337,32 @@ private:
     // on acks=all for that partition (observed on multi-partition topics whose
     // election handed a leader-only ISR).
     std::vector<NodeId>  configuredReplicas_;
+    // D3b fix round 1: each assigned replica's fetch position in THIS leadership
+    // (parallel to configuredReplicas_; reset to 0 on becomeLeader — a position
+    // learned in an earlier term may predate a truncation).  Feeds
+    // cleanerMarkerRemovalBound().  Duty/owning thread only; no allocation after
+    // initReplica (linear search over <= FollowerSlots::kMaxReplicas).
+    std::vector<Offset>  replicaFetchPos_;
+    void noteReplicaFetchPos_(NodeId id, Offset pos) noexcept {
+        for (std::size_t i = 0; i < configuredReplicas_.size(); ++i)
+            if (configuredReplicas_[i] == id) { replicaFetchPos_[i] = pos; return; }
+    }
 
     // Epoch caches (both roles need one for truncation)
     rune::storage::LeaderEpochCache epochCache_;
 
-    // Task 11: per-partition producer dedup state.
-    //
-    // Rebuilt from the log on becomeLeader (via callers such as
-    // ClientGateway::rebuildProducerStateFromLogs) and re-rebuilt atomically
-    // when a KIP-101 divergence truncation lands below the last rebuild HW
-    // (truncateLog → conditional rebuildFromLog).  Single-writer; no locks.
+    // Task 11: a replica-held producer dedup state.  NOT the broker's: no
+    // produce is validated against it (the owning worker's psm_ and the
+    // gateway's inline state are — each proven consistent with this log, see
+    // RcState / ClientGateway::proveInlinePsm_).  Only tests rebuild it; then
+    // truncateLog re-rebuilds it when a KIP-101 truncation lands below the last
+    // rebuild bound.  Single-writer; no locks.
     rune::storage::ProducerStateManager psm_;
 
     // Timing state
     int64_t lastIsrCheckNs_  = 0;   ///< last ISR shrink/expand timestamp
     int64_t lastFetchEmitNs_ = 0;   ///< last follower fetch emission timestamp
 
-    // Pre-allocated scratch buffers (no hot-path alloc)
-    static constexpr std::size_t kScratchSize = 4 * 1024 * 1024; // 4 MiB
-    std::vector<uint8_t> encodeScratch_;   ///< for FetchResponse encoding
 
     // Reused batch-framing state (control-plane append(span)/applyReplicated
     // paths).  Held across calls so RecordBatchBuilder::reset()/buildInto()
@@ -724,10 +1384,10 @@ private:
     // One explicit state machine (see FollowerSync.h) replaces the former scattered
     // flags (heardFromLeader_ / lastResponseEmpty_ / lastKnownLeaderHw_ /
     // leoAtLastPeriodicFetch_ / dataFetchInFlight_ / dataFetchSentNs_).  Governs ONLY
-    // the normal follower fetch path; the DR epoch-probe / reconcile path pre-empts it
+    // the normal follower fetch path (a DivergingEpoch answer resets it)
     // (and keeps its own lastFetchEmitNs_ cadence).  Fast-acks (on apply) are pure
     // (maxBytes=0) and independent of this machine — they advance the leader's
-    // follower-offset → HW for acks=majority.
+    // follower-offset → HW for acks=all.
     FollowerSync followerSync_;
     // (Caught-up keepalive cadence is computed in doWork from replicaLagMaxMs so it
     //  always keeps the follower in the ISR — see the follower fetch-emit path.)
@@ -735,55 +1395,114 @@ private:
     int64_t lastKnownNowNs_ = 0;   ///< most-recent doWork() clock, for message handlers
     bool followerApplyDirty_ = false;  ///< follower applied via appendNoSync since last flush
     int64_t lastFollowerSyncNs_ = 0;   ///< last coalesced follower fsync (time-gated)
+    bool externalFollowerFlush_ = false;   ///< worker-driven (every placement): worker submits the flush (async)
+    uint32_t registryId_  = 0;             ///< ReplicaRegistry dense id (0 = unregistered)
+    uint32_t incarnation_ = 0;             ///< never-reused registration incarnation
+    uint64_t logGeneration_ = 0;           ///< F15: bumped on truncation
+    Offset   lastTruncationOffset_ = 0;    ///< F15: cut point of the last generation bump
+    uint64_t leadershipGeneration_ = 0;    ///< F15 S4: bumped on every Leader <-> Follower transition
+    uint64_t epochCheckpointWrites_ = 0;   ///< see checkpointEpochs_
+    static constexpr Offset kChangedFromLatest = INT64_MIN;
+    void checkpointEpochs_(Offset changedFrom = kChangedFromLatest);
+    // Hot-path B F7: async leader-epoch durability (see epochStateWriteDue).
+    enum class EsStage : uint8_t { Idle, Prepared, InFlight };
+    struct EpochStateIo {
+        bool        enabled = false;    ///< leader-epoch-state is the authoritative copy
+        int         fd = -1;            ///< open only while a write is due / in flight (review Md4)
+        std::size_t stride = 0;         ///< slot stride (file size / 2)
+        int         activeSlot = -1;    ///< slot of the newest CONFIRMED image (-1: none)
+        uint64_t    seq = 0;            ///< last sequence used
+        EsStage     stage = EsStage::Idle;
+        bool        due = false;        ///< a change awaits its write
+        int         inflightSlot = -1;
+        uint64_t    inflightSeq = 0;
+        Epoch       inflightFence = -1;
+        uint64_t    inflightLeadGen = 0;   ///< pendingLead_.gen the in-flight image carried (0: none)
+        uint64_t    confirmedLeadGen = 0;  ///< same, of the newest confirmed image
+        Epoch       fenceTarget = -1;   ///< the fence the next image carries (>= fencePersisted_)
+        // Review C1: the lowest log offset whose epoch history is changed but
+        // not yet durable — pending (not yet in an image) / in flight.  The
+        // log's recovery point never passes min(pendingMin, inflightMin).
+        int64_t     pendingMin = INT64_MAX;
+        int64_t     inflightMin = INT64_MAX;
+        int         failures = 0;       ///< consecutive failed writes (Md2)
+        int64_t     retryNotBeforeNs = 0;
+        uint64_t    writes = 0, inlineWrites = 0, errors = 0, recreates = 0, notRouted = 0;
+    };
+    EpochStateIo es_;
+    /// A controller-managed leadership waiting for its durable fence.
+    struct PendingLeadership {
+        bool                active = false;
+        uint64_t            gen = 0;           ///< identifies this deferral (images carrying it)
+        Epoch               epoch = -1;
+        std::vector<NodeId> isr;
+        int32_t             partitionEpoch = -1;
+        Offset              leo = -1;          ///< LEO the image's new-epoch entry starts at
+    };
+    PendingLeadership pendingLead_;
+    bool resumingLead_ = false;                ///< becomeLeader re-entered from the completion
+    uint64_t leadGenSeq_ = 0;
+    void enableEpochState_() noexcept;
+    bool writeEpochStateInline_() noexcept;
+    int  openEpochStateFd_() noexcept;   ///< 0 or errno
+    void closeEpochStateFdIfIdle_() noexcept;
+    /// Review C1: the epoch history from `x` on changed (not yet durable).
+    void noteEpochChange_(Offset x) noexcept;
+    void pushEpochCap_() noexcept;
+    /// Review C1 (b), Kafka recovery: entries at/above the recovery point are
+    /// re-derived from the batches' stamped epochs (stale ones dropped,
+    /// missing ones assigned).  Cold, construction only.
+    void reconcileEpochCacheWithLog_();
+    /// Encode the image the next write carries (cache [+ pending leadership's
+    /// entry]) into buf (>= LeaderEpochState::imageBytes(n)).
+    std::size_t encodeEpochImage_(uint8_t* buf, uint64_t seq, Epoch fence) const noexcept;
+    [[nodiscard]] std::size_t epochImageEntries_() const noexcept;
+    bool awaitEsFetch_ = false;        ///< C1: a divergence truncation's re-fetch waits for its durable history
+    bool esHoldForTest_ = false;
+    int  esFailN_ = 0, esFailErr_ = 0;
+    static inline int inlineFailN_ = 0;
+    uint64_t esHeldSeq_ = 0;  int esHeldErr_ = 0;  bool esHeld_ = false;
+    uint64_t appliesDroppedAwaitEs_ = 0;
+    void cancelPendingLeadership_() noexcept;
+    void completePendingLeadershipIfDurable_();
+    void onHistoryDurable_();
+    void deferLeadership_(Epoch newEpoch, std::vector<NodeId> isr, int32_t partitionEpoch);
+    uint64_t leadershipsDeferred_ = 0, leadershipsResumed_ = 0, appliesDroppedLeadPending_ = 0;
+    bool followerFlushRequested_ = false;  ///< raised by doWork, consumed by the worker
     // Per-second rate counters (RUNE_FS_LOG diagnostic) to localise the acks=all
     // throughput bottleneck: appends (LEO growth), applies (follower push-apply),
     // pushes sent, fast-acks received, HW advance.
     int64_t rtLastNs_ = 0;
     int64_t rtAppends_ = 0, rtApplies_ = 0, rtPushes_ = 0, rtFastAcks_ = 0;
     int64_t rtApplyBytes_ = 0, rtPushBytes_ = 0;
+    // F18 unreplicable-batch state (see kErrRecordTooLarge).
+    uint64_t recordTooLargeServed_ = 0;
+    uint64_t wedgedRefusals_       = 0;
+    Offset   wedgedAtOffset_       = -1;
+    void wedgeAt_(Offset at, const char* why);   ///< F18: enter the wedged state (log + count)
     Offset  rtLastHw_ = 0, rtLastLeo_ = 0;
 
-    // DR-BUG-6: OffsetsForLeaderEpoch deferred-truncation state.
-    //
-    // On becomeFollower(newEpoch) we do NOT truncate eagerly.  Instead we set
-    // epochProbePending_ and remember the epoch we are probing under and the
-    // committed floor captured at transition time.  The follower issues an
-    // OffsetsForLeaderEpochRequest to the new leader and defers all fetching
-    // until the answer arrives (applyOffsetsForLeaderEpochResponse), which does
-    // the correct truncation.  This prevents an up-to-date survivor from
-    // dropping its committed tail before the (possibly deficient) new leader can
-    // pull it (the DR-8 loss).
-    bool   epochProbePending_ = false;
-    Epoch  epochProbeEpoch_    = -1;   ///< epoch we transitioned into
-    Offset epochProbeFloor_    = 0;    ///< committed HW floor at transition
-    int    epochProbeAttempts_ = 0;    ///< probes issued without an answer
-
-    // DR-BUG-6: after this many unanswered probes, fall back to the conservative
-    // committed-HW truncation and resume fetching.  Keeps the replica live even
-    // when the transport does not implement OffsetsForLeaderEpoch or the new
-    // leader is not promoted yet — it degrades EXACTLY to the pre-DR-BUG-6
-    // behaviour (never loses committed data; may re-fetch a small committed
-    // tail), never a permanent stall.
-    static constexpr int kEpochProbeMaxAttempts = 8;
-
-    // DR-BUG-6: deficient-leader reconcile state.
-    //
-    // A newly-elected leader may be BEHIND the committed frontier (a deficient
-    // node elected by the data-blind consensus).  When it sees a follower whose
-    // LEO exceeds its own, it pulls the missing committed records from that
-    // ahead survivor via sendReconcileRequest() before advertising a HW that
-    // covers them.  reconcileTarget_ tracks which peer we are pulling from (to
-    // avoid a storm of duplicate reconcile requests); -1 means idle.
-    NodeId reconcileTarget_    = -1;   ///< peer we are reverse-fetching from
-
-    // DR-BUG-6 CHURN-ROBUSTNESS: wall-clock (ns) at which the in-flight reconcile
-    // pull was issued.  If a pull goes unanswered (its request or response dropped
-    // under packet loss) reconcileTarget_ would otherwise latch forever and stall
-    // the leader-driven re-drive.  The incomplete-leader doWork clears a stuck
-    // target after kReconcileStuckNs so the pull re-arms on the next cadence — the
-    // self-healing retry that makes catch-up robust to sustained loss / churn.
-    int64_t reconcileIssuedNs_ = -1;
-    static constexpr int64_t kReconcileStuckNs = 250'000'000LL; // 250 ms
+    // F3 fix-round-2, item A: count of "batch exceeds even this transport's
+    // hard ceiling" events (onFetchRequest or pushToFollowers), for
+    // rate-limited critical logging (first occurrence, then every 1024th) —
+    // same convention as LogSegment::readMapFailures_.
+    uint64_t unsendableBatchLogCount_ = 0;
+    // F3 round 5, item I2: critical log lines actually emitted by the push path
+    // (rate-limited to once per unsendable-offset transition).
+    uint64_t unsendablePushLogEmits_ = 0;
+    uint64_t fetchDataServes_ = 0;   // F3 r6: Data fetch responses with records
+    // F3 round 5, item I2: memo of the last unsendable push head.  Armed
+    // (fromOffset >= 0) by pushToFollowers() when the head batch exceeds the
+    // transport's hard ceiling; cleared by any successful push.
+    struct UnsendablePushMemo {
+        Offset   fromOffset  = -1;   ///< pushFloor_() at the failed push (-1 = unarmed)
+        Offset   leo         = -1;
+        Offset   pushCeiling = -1;
+        uint64_t isrSig      = 0;
+        Epoch    epoch       = 0;
+    };
+    UnsendablePushMemo unsendablePush_{};
+    Offset             unsendablePushLoggedOffset_ = -1;   ///< last offset logged critical
 
     // CP-2: cleaned watermark — the log offset up to which compaction has already
     // been applied.  Starts at 0 (nothing compacted).  NodeRuntimeAgent advances
@@ -791,11 +1510,15 @@ private:
     // never re-scanned or re-rewritten on the next duty-cycle call.
     // Atomic: cleaner/duty threads write; test threads may poll it concurrently.
     std::atomic<Offset> lastCleanOffset_{0};
+    std::atomic<uint64_t> cleanerRewindGen_{0};      ///< owner-written (fix round 3)
+    std::atomic<Offset>   cleanerRewindTo_{0};       ///< owner-written
+    std::atomic<uint64_t> cleanerRewindAck_{0};      ///< cleaner-written
 
-    // GR-10: push tracking — last offset that was pushed to followers.
-    // Avoids re-pushing bytes already pushed in the same append cycle.
-    Offset lastPushedOffset_ = 0;
-
+    // GR-10 push tracking is PER FOLLOWER (F27): FollowerSlot::pushedThrough /
+    // pushCursor(); the old shared lastPushedOffset_ advanced even when a push to
+    // one follower was refused, so that follower's data waited for a timer.
+    uint64_t sendRefusals_ = 0;   // F27: transport-refused replication sends (retried)
+    uint64_t owedRebuilds_ = 0;   // F27 F7: owed Data answer rebuilds (log walk)
     // Durability: effective minIsr for the acksAll produce gate.
     // Majority mode: cfg_.minIsr.
     // AllInSync  mode: replicas.size() (== RF), so every replica must be in ISR.
@@ -811,64 +1534,114 @@ private:
     // production and caused the DR-8 committed-loss).
     bool leaderLagClockNeedsReset_ = false;
 
-    // DR-BUG-6 LEADER-COMPLETENESS GATE (the final DR-8 close).
-    //
-    // A newly-promoted partition leader may have been elected by the data-BLIND
-    // consensus while it is BEHIND the true committed frontier (the double-election
-    // churn case).  Serving its own regressed committed HW immediately is the
-    // residual DR-8 loss: a committed record held on an up-to-date survivor is
-    // never delivered / gets dropped because the deficient leader advertises a HW
-    // at its own frontier and the reverse-reconcile has not (yet, or reliably under
-    // loss) caught it up.
-    //
-    // The gate enforces leader-completeness at the REPLICATION layer (not the Raft
-    // election, which stays untouched for consensus safety): on becomeLeader we
-    // enter a NOT-YET-COMPLETE state and HOLD the served/advertised high-watermark
-    // at the pre-failover committed floor (completenessFloor_).  While incomplete
-    // the leader does NOT advance the committed offset past that floor — so neither
-    // the acks=All drain nor HW-bounded subscribers (GR-6) can observe a regressed
-    // or partial view.  We LEARN each live ISR survivor's committed frontier from
-    // the probe/fetch requests they send (their LEO + epoch — the lag-clock reset
-    // keeps them in ISR so they report in), compute the highest offset a MAJORITY
-    // of the ISR holds (the true committed frontier), reverse-reconcile UP TO it
-    // from an ahead on-lineage survivor, and only THEN mark leadership COMPLETE and
-    // advertise a HW >= that frontier.  The served HW never REGRESSES below a
-    // previously-committed frontier across the failover (completenessFloor_ is a
-    // hard floor; the post-complete HW is monotonic).
-    //
-    // NO-DIVERGENCE: the frontier is computed ONLY from ON-LINEAGE survivor reports.
-    // A divergent ahead survivor (one whose tail fails the epoch-lineage gate
-    // followerTailIsSharedContinuation) contributes only min(itsLeo, ourLeo) to the
-    // majority computation — its divergent tail can NEVER raise the frontier nor be
-    // adopted (the per-batch hasEpoch gate in applyReconcileResponse rejects it).
-    // Genuine divergent tails still truncate exactly as before.
-    //
-    // BOUNDED / CHURN-ROBUST: the gate is re-armed on EVERY becomeLeader (so it
-    // survives leadership flaps under loss); completion is decided per-doWork /
-    // per-report with no busy-spin; and it degrades safely — if a majority of the
-    // ISR never reports in (genuine quorum loss), the DR-BUG-3 min-ISR gate already
-    // pins the committed offset at the floor, so the incomplete state can never
-    // expose uncommitted data.  Completion requires only that we have HEARD from a
-    // majority AND our own LEO covers the majority frontier with no reconcile in
-    // flight — an event that the reverse-reconcile machinery drives deterministically.
-    bool   leaderComplete_    = true;   ///< false while a new leader reconciles to the frontier
-    Offset completenessFloor_ = 0;      ///< pre-failover committed HW; served HW held here until complete
+    // Kafka model (user decision 2026-10-03): HW = min LEO over the (maximal)
+    // ISR — every ISR member holds every committed record, and a leader is
+    // always elected from the ISR (user partitions: the controller elects from
+    // its committed ISR; internal partitions: see updateIsr_ — their ISR only
+    // drops members the cluster considers dead, so every live node the
+    // consensus can elect is in it).  No leader-completeness gate exists.
+    Offset electionLeo_       = 0;      ///< our LEO at becomeLeader (healthy-floor recovery bound)
+    /// The controller-COMMITTED ISR (elections, min-ISR).  The HW counts the
+    /// maximal ISR (isrManager_ = committed ∪ proposed) — see updateIsr_.
+    std::vector<NodeId> committedIsr_;
+    // AlterIsr proposal state (controller-managed ISR).  ONE proposal in flight
+    // (Kafka): re-sent on cadence until the controller commits it or another
+    // committed change supersedes it.  Each proposal carries its base
+    // (= committedIsr_ when sent); the controller commits it only while that is
+    // still the committed ISR (compare-and-set, Kafka's partitionEpoch check), so
+    // a stale / re-ordered copy can never commit after a later change.  The
+    // controller never refuses a well-formed proposal from the current leader
+    // for good (only transiently: another change for the partition in flight),
+    // so a pending proposal always resolves.  The HW counts committed ∪ pending
+    // (KIP-497/841 maximal ISR).
+    struct IsrProposal {
+        bool                pending = false;
+        std::vector<NodeId> isr;          ///< proposed ISR (AlterIsr)
+        int64_t             sentNs  = 0;
+        int32_t             basePartitionEpoch = -1;   ///< MEDIUM-1: the CAS version it was derived from
+        int64_t             version = 0;               ///< internal quorum mode: the published version
+    };
+    IsrProposal isrProposal_{};
+    /// MEDIUM-1: partitionEpoch of the committed assignment (-1 = unknown /
+    /// not controller-managed).  Set by every becomeLeader.
+    int32_t committedPartitionEpoch_ = -1;
+    int64_t processIncarnation_      = 0;    ///< KIP-903 (see setProcessIncarnation)
+    // Internal quorum mode (MAJOR-2/3, see setInternalIsrKnowledge).
+    InternalIsrKnowledge* isrKnowledge_     = nullptr;
+    bool     internalSeedPending_ = false;   ///< leadership seed (every replica) not yet replaced by a committed ISR
+    int64_t  internalIsrVersion_  = 0;       ///< last version published in this leadership
+    uint32_t internalIsrAcks_     = 0;       ///< slot bits of replicas holding the latest published version
+                                             ///< (pending: commit quorum; committed: anti-entropy re-send until all ack)
+    uint32_t internalFencedMask_  = 0;       ///< slot bits the cluster considers dead (shrinkIsrToLive)
+    [[nodiscard]] bool internalQuorum_() const noexcept { return isrKnowledge_ != nullptr; }
+    void publishInternalIsr_(int64_t nowNs);
+    void maybeCommitInternalIsr_();
+    [[nodiscard]] int slotIndex_(NodeId id) const noexcept;
+    /// MEDIUM-2: after an INELIGIBLE reject, no ISR addition is proposed before
+    /// this time (a fenced replica is not re-proposed every ISR check).
+    int64_t expandBackoffUntilNs_ = 0;
+    PartitionTransport* isrChannel_ = nullptr;   ///< AlterIsr sink (null = self-managed ISR)
+    // Leader-epoch restart fence (see setLeaderEpochFenceFile).
+    std::string fenceFile_;                  ///< durable highest-led-epoch file ("" = none)
+    Epoch       restartFenceEpoch_ = -1;     ///< earlier incarnations' highest epoch (constant once driven)
+    Epoch       fencePersisted_    = -1;     ///< highest epoch written to fenceFile_
+    struct StaleLeadership {
+        bool    pending        = false;      ///< a refused leadership awaits a new epoch
+        Epoch   epoch          = -1;         ///< the refused (committed) leader epoch
+        int32_t partitionEpoch = -1;         ///< its committed partitionEpoch
+        int64_t sentNs         = 0;
+        bool    sent           = false;
+    };
+    StaleLeadership staleLead_;
+    uint64_t        staleLeadRefusals_ = 0;
+    void refuseStaleLeadership_(Epoch newEpoch, int32_t partitionEpoch);
+    int  requestLeaderEpochBump_(int64_t nowNs);
+    bool persistLedEpoch_(Epoch e);
+    /// Fix round 2 N1 (KIP-112): a fence write failed — this replica's log dir
+    /// is offline for the rest of this incarnation (sticky): every leadership
+    /// is refused and the controller is told (kBumpLogDirFailed).
+    bool logDirOffline_ = false;
+    /// Hot-path B F7 / D15 m5: the directory holding `leader-epoch-state`
+    /// (a disk replica: its log dir; a memory replica: setMemoryEpochStateDir).
+    std::string esDir_;
+    /// Fix round 2 N1/N2: the follower report of a leaderless partition.
+    struct LeaderlessReport {
+        bool    pending = false;
+        Epoch   epoch   = -1;
+        bool    sent    = false;
+        int64_t sentNs  = 0;
+    };
+    LeaderlessReport report_;
+    int  sendLeaderlessReport_(int64_t nowNs);
+    [[nodiscard]] int32_t bumpFlags_() const noexcept;
+    bool fenceEstablished_ = false;          ///< no-fence-file mode: the first leadership was refused
+    /// D21 review L2: both leader-epoch-state slots were corrupt — the epochs an
+    /// earlier incarnation led at are unknown (an epoch led with no surviving
+    /// batch is in no stamp).  The first leadership is refused (the controller
+    /// bumps); until that refusal's fence is durable, every image carries
+    /// kFenceUnknown so a restart in between still knows.
+    bool fenceUnknown_ = false;
+    uint64_t epochHistoryRebuilds_ = 0;   ///< see epochHistoryRebuildsForTest
+    static constexpr Epoch kFenceUnknown = -2;
+    [[nodiscard]] Epoch imageFence_() const noexcept {
+        return fenceUnknown_ ? kFenceUnknown : std::max(fencePersisted_, es_.fenceTarget);
+    }
+    bool fenceErrorLogged_ = false;
+    static constexpr int64_t kAlterIsrResendNs = 50'000'000LL;   // 50 ms
+    std::array<uint8_t, ErrorPayload::SIZE> errPayload_{};      ///< DivergingEpoch / OOR answer payload
+    uint64_t v2RefusalsLogged_ = 0;                             ///< mixed v2/v3: CRITICAL once
+    [[nodiscard]] bool internalPartition_() const noexcept { return cfg_.topicId < 0; }
+    [[nodiscard]] int  computeEffectiveMinIsr_(int rf) const noexcept;
+    [[nodiscard]] bool committedIsrMeetsMinIsr_(bool acksAll) const noexcept;
+    void applyCommittedIsr_(std::vector<NodeId> isr, int32_t partitionEpoch);
+    bool updateIsr_(int64_t nowNs);
+    /// Commit (self-managed) or propose (controller-managed) `desired` (an ISR
+    /// derived from committedIsr_).  Returns true when something changed / was sent.
+    bool changeIsr_(const std::vector<NodeId>& desired, int64_t nowNs, bool force = false);
+    /// The maximal ISR = committed ∪ the pending proposal → isrManager_.
+    void applyMaximalIsr_();
+    void sendIsrProposal_(int64_t nowNs);
 
-    /// (Leader) Re-evaluate the completeness gate: if we have heard from a majority
-    /// of the ISR and our LEO covers the on-lineage majority frontier with no
-    /// reconcile pending, mark leadership complete and release the served HW.
-    void maybeCompleteLeadership();
-
-    /// (Leader) The highest offset a MAJORITY of the ISR holds, computed from
-    /// ON-LINEAGE survivor reports only (a divergent ahead survivor is clamped to
-    /// our own LEO).  == the true committed frontier we must reconcile up to.
-    [[nodiscard]] Offset majorityCommittedFrontier() const;
-
-    // DR-BUG-6: per-survivor last-reported LEO (frontier), recorded from probe and
-    // fetch requests.  Used to (a) decide when a MAJORITY of the ISR has reported
-    // in (completeness quorum) and (b) — clamped for divergent tails — compute the
-    // majority committed frontier.  Single-writer (leader thread); bounded by |ISR|.
-    std::unordered_map<NodeId, Offset> survivorFrontier_;
 
     // FETCH CONFLATION: per-follower record of the last (fetchOffset, LEO) served +
     // when.  The leader SKIPS re-serving an IDENTICAL response within kFetchResendNs.
@@ -879,15 +1652,14 @@ private:
     // (measured: 99% useless applies, 47-98ms follower control→worker handoff).
     // Conflating to ONE response per distinct state removes the flood; the timeout
     // re-serve preserves lost-push / lost-response recovery.  Cleared on role change.
-    struct ServedFetch { Offset fetchOffset = -1; Offset leo = -1; int64_t timeNs = 0; };
-    std::unordered_map<NodeId, ServedFetch> servedFetch_;
-    static constexpr int64_t kFetchResendNs = 20'000'000;  // 20ms lost-push re-serve window
+    // Per-follower conflation + no-dup-fetch state (spec §3.5) — flat, slot-indexed.
+    FollowerSlots followerSlots_;
 
     // DR-BUG-3: min-ISR-gated committed offset (Kafka min.insync.replicas
-    // COMMIT semantics).  ReplicaLeaderState::computeHw() uses majority-of-ISR:
-    // when the ISR shrinks to a single member (the leader stranded in a
-    // minority), majority-of-1 == the leader's own LEO, so the raw HW jumps to
-    // uncommitted-by-a-real-majority offsets.  That polluted HW must NOT be
+    // COMMIT semantics).  ReplicaLeaderState::computeHw() is the min LEO over
+    // the ISR: when the ISR shrinks to a single member (the leader stranded in
+    // a minority), the min over {leader} == the leader's own LEO, so the raw HW
+    // jumps to offsets held by fewer than minIsr replicas.  That HW must NOT be
     // exposed as "committed" — neither to the acks=All drain nor to HW-bounded
     // subscribers (GR-6) — or a minority leader's records would be acked/
     // delivered and then truncated on failover (data-loss / phantom reads).
@@ -895,7 +1667,7 @@ private:
     // lastHealthyHw_ is the last HW observed while the ISR was healthy
     // (|ISR| >= minIsr).  While |ISR| < minIsr, highWatermark() clamps to this
     // frozen floor so the effective committed offset cannot advance past the
-    // last majority-committed offset.  It is monotonic (only advances) and is
+    // last offset committed under a healthy ISR.  It is monotonic (only advances) and is
     // refreshed on every leader HW read/recompute while the ISR is healthy.
     mutable Offset lastHealthyHw_ = 0;
 
@@ -921,6 +1693,11 @@ private:
     std::atomic<Offset> publishedHwForCleaner_{0};
     std::atomic<int>    publishedRoleForCleaner_{static_cast<int>(Role::Follower)};
     std::atomic<int>    publishedIsrSizeForGateway_{0};
+    // D3b: first unstable offset (LSO) for the cleaner — see publishCleanerLso().
+    std::atomic<Offset> publishedLsoForCleaner_{cfg_.topicId >= 0 ? Offset{0} : kNoCleanerLso};
+    // D3b fix round 1: min fetch position over every assigned replica — see
+    // cleanerMarkerRemovalBound().  0 until the first leader publication.
+    std::atomic<Offset> publishedMarkerBoundForCleaner_{0};
 
     // Controller position snapshot (see controllerReplicaLeo()/controllerLeaderEpoch()).
     // Per-node published LEO (stored as leo+1; 0 = unknown), indexed by nodeId.
@@ -981,12 +1758,12 @@ public:
     // that the leader push path (called from the produce thread) and the
     // pump() path (called from the replication duty-cycle thread) are safe to
     // call concurrently.  In single-threaded tests the lock is uncontended.
-    void sendFetchRequest(const FetchRequestMsg& req) override {
-        std::lock_guard lk(mu_);
-        pendingRequests_.push_back({req});
+    bool sendFetchRequest(const FetchRequestMsg& req) override {
+        enqueue_(pendingRequests_, {req});
+        return true;
     }
 
-    void sendFetchResponse(NodeId toFollower,
+    bool sendFetchResponse(NodeId toFollower,
                            const FetchResponseMsg& resp) override {
         PendingResponse pr;
         pr.toFollower = toFollower;
@@ -995,27 +1772,36 @@ public:
         pr.resp = resp;
         pr.resp.records = std::span<const uint8_t>(pr.recordsBuf.data(),
                                                     pr.recordsBuf.size());
-        std::lock_guard lk(mu_);
-        pendingResponses_.push_back(std::move(pr));
+        enqueue_(pendingResponses_, std::move(pr));
+        return true;
     }
 
     // DR-BUG-6: OffsetsForLeaderEpoch + reconcile peer-routed messages.
-    void sendOffsetsForLeaderEpochRequest(
+    bool sendOffsetsForLeaderEpochRequest(
             NodeId toLeader, const OffsetsForLeaderEpochReqMsg& req) override {
-        std::lock_guard lk(mu_);
-        pendingEpochReqs_.push_back({toLeader, req});
+        enqueue_(pendingEpochReqs_, {toLeader, req});
+        return true;
     }
-    void sendOffsetsForLeaderEpochResponse(
+    bool sendOffsetsForLeaderEpochResponse(
             NodeId toFollower, const OffsetsForLeaderEpochRespMsg& resp) override {
-        std::lock_guard lk(mu_);
-        pendingEpochResps_.push_back({toFollower, resp});
+        enqueue_(pendingEpochResps_, {toFollower, resp});
+        return true;
     }
-    void sendReconcileRequest(
+    bool sendReconcileRequest(
             NodeId toPeer, const FetchRequestMsg& req) override {
-        std::lock_guard lk(mu_);
-        pendingReconcileReqs_.push_back({toPeer, req});
+        enqueue_(pendingReconcileReqs_, {toPeer, req});
+        return true;
     }
-    void sendReconcileResponse(
+    // MAJOR-2/3: internal-ISR state / acks, peer-routed (delivered by pump()).
+    bool sendInternalIsr(NodeId to, const InternalIsrMsg& m) override {
+        enqueue_(pendingInternalIsr_, {to, m});
+        return true;
+    }
+    bool sendInternalIsrAck(NodeId to, const InternalIsrAckMsg& m) override {
+        enqueue_(pendingInternalIsrAck_, {to, m});
+        return true;
+    }
+    bool sendReconcileResponse(
             NodeId toPeer, const FetchResponseMsg& resp) override {
         PendingResponse pr;
         pr.toFollower = toPeer;
@@ -1023,8 +1809,8 @@ public:
         pr.resp = resp;
         pr.resp.records = std::span<const uint8_t>(pr.recordsBuf.data(),
                                                     pr.recordsBuf.size());
-        std::lock_guard lk(mu_);
-        pendingReconcileResps_.push_back(std::move(pr));
+        enqueue_(pendingReconcileResps_, std::move(pr));
+        return true;
     }
 
     /// Deliver all pending messages: FetchRequests → leader, FetchResponses → followers.
@@ -1040,10 +1826,7 @@ public:
 
         // Deliver fetch requests to the leader.
         std::vector<PendingRequest> reqs;
-        {
-            std::lock_guard lk(mu_);
-            reqs.swap(pendingRequests_);
-        }
+        take_(pendingRequests_, reqs);
         for (auto& pr : reqs) {
             if (leader_) {
                 leader_->onFetchRequest(pr.req, nowNs);
@@ -1053,10 +1836,7 @@ public:
 
         // Deliver fetch responses to followers.
         std::vector<PendingResponse> resps;
-        {
-            std::lock_guard lk(mu_);
-            resps.swap(pendingResponses_);
-        }
+        take_(pendingResponses_, resps);
         for (auto& pr : resps) {
             auto it = followers_.find(pr.toFollower);
             if (it != followers_.end()) {
@@ -1067,10 +1847,7 @@ public:
 
         // DR-BUG-6: OffsetsForLeaderEpoch requests → target (the new leader).
         std::vector<PendingEpochReq> ereqs;
-        {
-            std::lock_guard lk(mu_);
-            ereqs.swap(pendingEpochReqs_);
-        }
+        take_(pendingEpochReqs_, ereqs);
         for (auto& e : ereqs) {
             auto it = byId_.find(e.to);
             if (it != byId_.end()) {
@@ -1081,10 +1858,7 @@ public:
 
         // DR-BUG-6: OffsetsForLeaderEpoch responses → target (the follower).
         std::vector<PendingEpochResp> eresps;
-        {
-            std::lock_guard lk(mu_);
-            eresps.swap(pendingEpochResps_);
-        }
+        take_(pendingEpochResps_, eresps);
         for (auto& e : eresps) {
             auto it = byId_.find(e.to);
             if (it != byId_.end()) {
@@ -1095,10 +1869,7 @@ public:
 
         // DR-BUG-6: reconcile requests → target (the ahead survivor).
         std::vector<PendingReconcileReq> rreqs;
-        {
-            std::lock_guard lk(mu_);
-            rreqs.swap(pendingReconcileReqs_);
-        }
+        take_(pendingReconcileReqs_, rreqs);
         for (auto& r : rreqs) {
             auto it = byId_.find(r.to);
             if (it != byId_.end()) {
@@ -1109,16 +1880,27 @@ public:
 
         // DR-BUG-6: reconcile responses → target (the deficient leader).
         std::vector<PendingResponse> rresps;
-        {
-            std::lock_guard lk(mu_);
-            rresps.swap(pendingReconcileResps_);
-        }
+        take_(pendingReconcileResps_, rresps);
         for (auto& pr : rresps) {
             auto it = byId_.find(pr.toFollower);
             if (it != byId_.end()) {
                 it->second->applyReconcileResponse(pr.resp);
                 ++count;
             }
+        }
+
+        // MAJOR-2/3: internal-ISR states / acks → target.
+        std::vector<std::pair<NodeId, InternalIsrMsg>> iisr;
+        std::vector<std::pair<NodeId, InternalIsrAckMsg>> iack;
+        take_(pendingInternalIsr_, iisr);
+        take_(pendingInternalIsrAck_, iack);
+        for (auto& [to, m] : iisr) {
+            auto it = byId_.find(to);
+            if (it != byId_.end()) { it->second->onInternalIsr(m); ++count; }
+        }
+        for (auto& [to, m] : iack) {
+            auto it = byId_.find(to);
+            if (it != byId_.end()) { it->second->onInternalIsrAck(m); ++count; }
         }
 
         return count;
@@ -1133,6 +1915,16 @@ public:
     }
 
 private:
+    // Every pending queue is touched only under mu_ — through these two helpers
+    // (test fake: the leader push path and pump() may run on different threads).
+    template <class V> void enqueue_(V& v, typename V::value_type x) {
+        std::lock_guard lk(mu_);
+        v.push_back(std::move(x));
+    }
+    template <class V> void take_(V& from, V& into) {
+        std::lock_guard lk(mu_);
+        into.swap(from);
+    }
     struct PendingEpochReq  { NodeId to; OffsetsForLeaderEpochReqMsg  req; };
     struct PendingEpochResp { NodeId to; OffsetsForLeaderEpochRespMsg resp; };
     struct PendingReconcileReq { NodeId to; FetchRequestMsg req; };
@@ -1148,6 +1940,8 @@ private:
     std::vector<PendingEpochResp> pendingEpochResps_;  ///< DR-BUG-6
     std::vector<PendingReconcileReq> pendingReconcileReqs_;  ///< DR-BUG-6
     std::vector<PendingResponse>  pendingReconcileResps_;    ///< DR-BUG-6
+    std::vector<std::pair<NodeId, InternalIsrMsg>>    pendingInternalIsr_;     ///< MAJOR-2/3
+    std::vector<std::pair<NodeId, InternalIsrAckMsg>> pendingInternalIsrAck_;  ///< MAJOR-2/3
 };
 
 } // namespace rune::replication

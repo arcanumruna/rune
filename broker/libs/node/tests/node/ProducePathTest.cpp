@@ -39,6 +39,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -382,6 +383,174 @@ TEST_F(ProducePathTest, DurabilityTier2_StrictSync)
     EXPECT_TRUE(out.syncDone)
         << "durabilityTier==2 on a disk-backed log must set syncDone=true";
     EXPECT_EQ(log_.logEndOffset(), 1);
+}
+
+// ===========================================================================
+// EOS-DUP defense (eos-dup-fix-review §3): the Produce frame's producer
+// identity (not CRC-covered) must equal the CRC-covered RecordBatch header
+// (offsets 43/51/53).  The pre-460dd12 client sent frame pid -1 with a header
+// pid >= 0: the broker skipped dedup and silently appended every retransmit.
+// A mismatch is now a loud, non-retriable SchemaValidationFailed (the record
+// failed broker validation; resending the same bytes always fails again),
+// never appended, never seen by the PSM.
+// ===========================================================================
+TEST_F(ProducePathTest, IdentityRegression_FramePidMinusOneWithIdempotentHeaderRejected)
+{
+    auto b = makeBatch(1, /*pid=*/42, /*epoch=*/0, /*seq=*/0);
+    auto o = callHelper(b, log_, psm_, 1, 0, /*producerId=*/-1, /*epoch=*/0, /*seq=*/-1);
+    EXPECT_EQ(o.error, pc::ErrorCode::SchemaValidationFailed);
+    EXPECT_TRUE(o.identityMismatch);
+    EXPECT_EQ(log_.logEndOffset(), 0) << "never appended";
+    EXPECT_EQ(psm_.size(), 0u);
+}
+
+TEST_F(ProducePathTest, IdentityRegression_FramePidWithLegacyHeaderRejected)
+{
+    auto b = makeBatch(1);                                   // header pid -1
+    auto o = callHelper(b, log_, psm_, 1, 0, /*producerId=*/42, /*epoch=*/0, /*seq=*/0);
+    EXPECT_EQ(o.error, pc::ErrorCode::SchemaValidationFailed);
+    EXPECT_TRUE(o.identityMismatch);
+    EXPECT_EQ(log_.logEndOffset(), 0);
+    EXPECT_EQ(psm_.size(), 0u) << "the PSM never sees a mismatched identity";
+}
+
+TEST_F(ProducePathTest, IdentityRegression_EpochOrSequenceMismatchRejected)
+{
+    auto b = makeBatch(1, /*pid=*/42, /*epoch=*/3, /*seq=*/0);
+    auto oe = callHelper(b, log_, psm_, 1, 0, 42, /*epoch=*/2, /*seq=*/0);
+    EXPECT_EQ(oe.error, pc::ErrorCode::SchemaValidationFailed);
+    EXPECT_TRUE(oe.identityMismatch);
+    auto os = callHelper(b, log_, psm_, 1, 0, 42, /*epoch=*/3, /*seq=*/1);
+    EXPECT_EQ(os.error, pc::ErrorCode::SchemaValidationFailed);
+    EXPECT_TRUE(os.identityMismatch);
+    auto op = callHelper(b, log_, psm_, 1, 0, /*producerId=*/43, /*epoch=*/3, /*seq=*/0);
+    EXPECT_EQ(op.error, pc::ErrorCode::SchemaValidationFailed) << "both pids >= 0 but different";
+    EXPECT_TRUE(op.identityMismatch);
+    auto ok = callHelper(b, log_, psm_, 1, 0, 42, /*epoch=*/3, /*seq=*/0);
+    EXPECT_TRUE(ok.isOK()) << "the matching frame is accepted";
+    EXPECT_FALSE(ok.identityMismatch);
+    EXPECT_EQ(log_.logEndOffset(), 1);
+}
+
+// Legacy (acks=None / non-idempotent) frames carry epoch 0 against a header
+// epoch of -1 (client m1): only producerId is compared when it is < 0.
+TEST_F(ProducePathTest, IdentityRegression_LegacyFrameEpochZeroAgainstHeaderMinusOneAccepted)
+{
+    auto b = makeBatch(1);                                   // header pid/epoch/seq = -1
+    auto o = callHelper(b, log_, psm_, 1, 0, /*producerId=*/-1, /*epoch=*/0, /*seq=*/-1);
+    EXPECT_TRUE(o.isOK());
+    EXPECT_FALSE(o.identityMismatch);
+    EXPECT_EQ(log_.logEndOffset(), 1);
+}
+
+// EOS-OOS: a retransmit older than the window but entirely <= lastSequence is
+// a KNOWN-OLD duplicate: OK, offset unknown (-1), never appended.  lastOffset
+// carries the offset its ack condition must cover (the batch holding
+// lastSequence), so the caller parks it exactly like an in-window duplicate.
+TEST_F(ProducePathTest, IdempotenceWindowRegression_KnownOldDuplicateIsOkUnknownOffsetNoAppend)
+{
+    constexpr int64_t kPid = 77;
+    const int kBatches = rune::protocol::client::kIdempotentMaxInFlightBatches + 8;
+    for (int i = 0; i < kBatches; ++i) {
+        auto b = makeBatch(2, kPid, 0, 2 * i);
+        ASSERT_TRUE(callHelper(b, log_, psm_, 1, 0, kPid, 0, 2 * i).isOK()) << i;
+    }
+    const int64_t leo = log_.logEndOffset();
+    auto old = makeBatch(2, kPid, 0, 0);
+    auto o = callHelper(old, log_, psm_, 1, 0, kPid, 0, 0);
+    EXPECT_TRUE(o.isOK()) << "never OutOfOrderSequence for a stored batch";
+    EXPECT_TRUE(o.isDuplicate);
+    EXPECT_EQ(o.baseOffset, -1) << "Kafka DUPLICATE_SEQUENCE_NUMBER: offset unknown";
+    EXPECT_EQ(o.lastOffset, leo - 1) << "covers the batch holding lastSequence";
+    EXPECT_EQ(log_.logEndOffset(), leo) << "never re-appended";
+    // An in-window retransmit still reports its original range.
+    auto recent = makeBatch(2, kPid, 0, 2 * (kBatches - 1));
+    auto r = callHelper(recent, log_, psm_, 1, 0, kPid, 0, 2 * (kBatches - 1));
+    EXPECT_TRUE(r.isDuplicate);
+    EXPECT_EQ(r.baseOffset, leo - 2);
+    EXPECT_EQ(r.lastOffset, leo - 1);
+    // A batch partially overlapping lastSequence stays OutOfOrderSequence.
+    auto partial = makeBatch(3, kPid, 0, 2 * kBatches - 1);
+    EXPECT_EQ(callHelper(partial, log_, psm_, 1, 0, kPid, 0, 2 * kBatches - 1).error,
+              pc::ErrorCode::OutOfOrderSequence);
+}
+
+// Review I2: a batch whose sequences would run past INT32_MAX (signed overflow
+// in baseSequence + recordCount - 1) is refused OutOfOrderSequence, never
+// appended.  (Rune's producer bumps the epoch before overflow; a wrap BETWEEN
+// batches — seq 0 after INT32_MAX — is accepted, see the PSM regression.)
+TEST_F(ProducePathTest, IdempotenceWindowRegression_BatchCrossingInt32MaxRefused)
+{
+    constexpr int32_t kMax = std::numeric_limits<int32_t>::max();
+    constexpr int64_t kPid = 78;
+    psm_.update(1, kPid, 0, 0, 0, kMax - 2, 0);              // lastSequence = MAX - 2
+    auto b = makeBatch(3, kPid, 0, kMax - 1);                 // MAX-1, MAX, (overflow)
+    auto o = callHelper(b, log_, psm_, 1, 0, kPid, 0, kMax - 1);
+    EXPECT_EQ(o.error, pc::ErrorCode::OutOfOrderSequence);
+    EXPECT_EQ(log_.logEndOffset(), 0);
+}
+
+// ===========================================================================
+// D6 — UnknownProducerId.  A rebuilt producer state (failover / restart) that
+// lost producer P to retention answers P's next batch UnknownProducerId with
+// the partition's logStartOffset — NOT appended, never OOS.
+// ===========================================================================
+TEST(ProducePathUnknownProducerIdRegression, RebuiltAfterRetentionAnswersUnknownProducerIdWithLogStartRegression)
+{
+    TmpDir dir("d6");
+    rune::storage::Log log(dir.path.string(), /*segmentRollBytes=*/256);
+    log.recover();
+    rune::storage::ProducerStateManager live;
+    constexpr int64_t kP = 7, kQ = 8;
+    for (int32_t s = 0; s < 6; ++s) {
+        auto b = makeBatch(1, kP, 0, s);
+        ASSERT_TRUE(callHelper(b, log, live, 1, 0, kP, 0, s).isOK());
+    }
+    for (int32_t s = 0; s < 12; ++s) {
+        auto b = makeBatch(1, kQ, 2, s);
+        ASSERT_TRUE(callHelper(b, log, live, 1, 0, kQ, 2, s).isOK());
+    }
+    ASSERT_GT(log.deleteOldSegments(0), 0);
+    const int64_t logStart = log.logStartOffset();
+    ASSERT_GE(logStart, 6) << "precondition: every batch of P is below the log start";
+
+    rune::storage::ProducerStateManager rebuilt;
+    ASSERT_TRUE(rebuilt.rebuildFromLog(1, log, log.logEndOffset(), 0));
+    const int64_t leo = log.logEndOffset();
+
+    auto p6 = makeBatch(1, kP, 0, 6);
+    const auto o = callHelper(p6, log, rebuilt, 1, 0, kP, 0, 6);
+    EXPECT_EQ(o.error, pc::ErrorCode::UnknownProducerId);
+    EXPECT_EQ(o.logStartOffset, logStart);
+    EXPECT_EQ(log.logEndOffset(), leo) << "an UnknownProducerId batch was appended";
+
+    // The client's U1 answer: a new epoch from sequence 0 -> accepted.
+    auto p0 = makeBatch(1, kP, 1, 0);
+    const auto a = callHelper(p0, log, rebuilt, 1, 0, kP, 1, 0);
+    EXPECT_TRUE(a.isOK());
+    EXPECT_EQ(a.baseOffset, leo);
+    EXPECT_EQ(a.logStartOffset, -1) << "logStartOffset is carried only with UnknownProducerId";
+
+    // Known producer: gap still OOS, lower epoch still fenced.
+    auto qGap = makeBatch(1, kQ, 2, 20);
+    EXPECT_EQ(callHelper(qGap, log, rebuilt, 1, 0, kQ, 2, 20).error, pc::ErrorCode::OutOfOrderSequence);
+    auto qOld = makeBatch(1, kQ, 1, 12);
+    EXPECT_EQ(callHelper(qOld, log, rebuilt, 1, 0, kQ, 1, 12).error, pc::ErrorCode::InvalidProducerEpoch);
+    EXPECT_EQ(log.logEndOffset(), leo + 1);
+}
+
+// The version gate (ConnectRequest.clientVersion): only a client that
+// understands UnknownProducerId gets it; older clients keep OOS.
+TEST(ProducePathUnknownProducerIdRegression, AnswerIsGatedOnClientVersionRegression)
+{
+    using rune::storage::produceErrorForClient;
+    EXPECT_EQ(produceErrorForClient(pc::ErrorCode::UnknownProducerId, pc::kClientVersion),
+              pc::ErrorCode::UnknownProducerId);
+    EXPECT_EQ(produceErrorForClient(pc::ErrorCode::UnknownProducerId, 1), pc::ErrorCode::OutOfOrderSequence);
+    EXPECT_EQ(produceErrorForClient(pc::ErrorCode::UnknownProducerId, 0), pc::ErrorCode::OutOfOrderSequence);
+    EXPECT_EQ(produceErrorForClient(pc::ErrorCode::OutOfOrderSequence, pc::kClientVersion),
+              pc::ErrorCode::OutOfOrderSequence);
+    EXPECT_EQ(produceErrorForClient(pc::ErrorCode::NotLeader, 1), pc::ErrorCode::NotLeader);
 }
 
 } // namespace

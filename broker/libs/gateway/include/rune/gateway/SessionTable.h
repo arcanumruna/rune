@@ -1,4 +1,7 @@
 #pragma once
+
+#include <cstdio>
+#include <cstdlib>
 // SessionTable.h — Per-session egress tracking for the ClientGateway (BR-4).
 //
 // Design:
@@ -9,8 +12,10 @@
 #include <Aeron.h>
 #include <ExclusivePublication.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -37,6 +42,57 @@ struct Session {
     int32_t                                        egressStreamId = 0;
     std::unordered_map<int32_t, std::shared_ptr<aeron::ExclusivePublication>>
                                                    recordEgressByWorker;
+    // Task 13 fix round 2 (shard mode, G-A6 on the gateway-routed path): bit w
+    // set = worker w holds acks for this session (SessionSignal Held/Released).
+    // Non-zero → the gateway ABORTs this session's Produce frames.
+    uint64_t                                       heldByWorkers = 0;
+    // D6: ConnectRequest.clientVersion — gates behaviour the client must
+    // understand (UnknownProducerId is answered OutOfOrderSequence below
+    // protocol::client::kClientVersionUnknownProducerId).  0 = unknown (oldest).
+    int32_t                                        clientVersion = 0;
+    // D8b round 2: bit w set = worker w reports this session's ack publication
+    // Lost (NOT_CONNECTED); lostSinceNs = when the mask last became non-zero, restarted by a Found
+    // from one worker while another is still Lost (D8b-L: a successful claim is proof of life).
+    // Non-zero → reapExpired uses the normal lease measured from lostSinceNs.
+    uint64_t                                       lostByWorkers = 0;
+    int64_t                                        lostSinceNs   = 0;
+    // D8c: produce ops forwarded to the workers whose acks no worker has
+    // claimed yet (SessionSignal Credit).  At ClientGateway::sessionProduceCredits()
+    // the gateway ABORTs this session's Produce frames.  Dies with the session.
+    uint32_t                                       produceInFlight = 0;
+    // D8c fix round 1: produceInFlight split by the owning worker it was
+    // forwarded to (Credit signals name their worker) — kept so a close returns
+    // the session's share of every worker's routed cap.  Cold (close / credit).
+    static constexpr int                           kMaxWorkers = 64;   // == ClientGateway::kMaxHeldMaskWorkers
+    std::array<uint16_t, kMaxWorkers>              produceInFlightOn{};   // <= the per-session budget (4096)
+    // D8c fix round 2: tag of the worker's cap-full episode during which this
+    // session last returned a Credit from that worker (a reader — never evicted
+    // in that episode).  uint16 tags wrap after 65536 episodes (harmless: at
+    // worst one reading session is considered for eviction once more).
+    std::array<uint16_t, kMaxWorkers>              creditTagOn{};
+    // Subscribe dedupe (2026-10-05; last — review L-5: off the produce-path fields' lines): a Subscribe is identified by (session,
+    // correlationId, topicId, resolved partition) — the client binds exactly one
+    // instance per correlationId, so a re-sent Subscribe (redirect / reconnect
+    // retry paths) re-answers this subscriptionId instead of registering a
+    // second, leaked stream.  The (topic, partition) part keeps clients that do
+    // not tag per-partition Subscribes (group isolation carriers: correlationId
+    // 0 for every assigned partition) one subscription per partition.  Cold
+    // (control path: Subscribe / Unsubscribe only).  Dropped with the session,
+    // so the same correlationId on a NEW session is a new subscription.
+    struct SubKey {
+        int64_t correlationId = 0;
+        int32_t topicId       = 0;
+        int32_t partition     = 0;
+        bool operator==(const SubKey&) const = default;
+    };
+    struct SubKeyHash {
+        std::size_t operator()(const SubKey& k) const noexcept {
+            const uint64_t tp = (static_cast<uint64_t>(static_cast<uint32_t>(k.topicId)) << 32) |
+                                static_cast<uint32_t>(k.partition);
+            return std::hash<uint64_t>{}(static_cast<uint64_t>(k.correlationId) ^ (tp * 0x9E3779B97F4A7C15ULL));
+        }
+    };
+    std::unordered_map<SubKey, int64_t, SubKeyHash> subIdByKey;
 };
 
 // ---------------------------------------------------------------------------
@@ -52,11 +108,21 @@ public:
     SessionTable& operator=(const SessionTable&) = delete;
 
     // -----------------------------------------------------------------------
-    // nextSessionId() — monotonically-increasing, starts at 1.
+    // nextSessionId() — monotonically-increasing, starts at 1, OR-ed with the
+    // cluster id prefix (setIdPrefix): ((nodeId + 1) << 40) | counter makes a
+    // session id unique across the cluster's nodes (a client holds one session
+    // per node and demultiplexes by id).  Always positive.
     // -----------------------------------------------------------------------
     [[nodiscard]] int64_t nextSessionId() noexcept {
-        return ++nextId_;
+        // LOW-2: the counter must never carry into the node prefix.
+        if (++nextId_ >= (int64_t{1} << 40)) [[unlikely]] {
+            std::fprintf(stderr, "SessionTable: session id space exhausted (2^40) — aborting\n");
+            std::abort();
+        }
+        return idPrefix_ | nextId_;
     }
+    /// Cluster-unique ids: the prefix OR-ed into every id (0 = none, tests).
+    void setIdPrefix(int64_t prefix) noexcept { idPrefix_ = prefix; }
 
     // -----------------------------------------------------------------------
     // add() — insert a new session.  Returns a reference valid until remove().
@@ -65,13 +131,15 @@ public:
                  std::shared_ptr<aeron::ExclusivePublication> egress,
                  int64_t                                      nowNs,
                  std::string                                  egressChannel = {},
-                 int32_t                                      egressStreamId = 0) {
+                 int32_t                                      egressStreamId = 0,
+                 int32_t                                      clientVersion = 0) {
         Session s;
         s.sessionId      = sessionId;
         s.egress         = std::move(egress);
         s.lastSeenNs     = nowNs;
         s.egressChannel  = std::move(egressChannel);
         s.egressStreamId = egressStreamId;
+        s.clientVersion  = clientVersion;
         auto [it, _] = sessions_.emplace(sessionId, std::move(s));
         return it->second;
     }
@@ -121,6 +189,7 @@ public:
 
 private:
     int64_t                              nextId_   = 0;
+    int64_t                              idPrefix_ = 0;
     std::unordered_map<int64_t, Session> sessions_;
 };
 

@@ -53,6 +53,8 @@ CID window: 800_000+ (disjoint from DR-1/2/3/4/5/6/7).
 
 from __future__ import annotations
 
+import sys
+
 import re
 import threading
 import time
@@ -174,14 +176,25 @@ def assert_zombie_cannot_serve_write(
         start_stagger_ms=0,
     )
     serving = probe.ok and len(probe.all_produced) > 0
-    assert not serving, (
-        f"SPLIT-BRAIN [BLOCKER — DR-10]: {reason}. "
-        f"Zombie service {zombie_svc!r} successfully acked an acks=All produce "
-        f"after a higher-term leader was elected. This is a write-accepting "
-        f"split-brain. produced={len(probe.all_produced)} "
-        f"rc={probe.clients[0].rc if probe.clients else '?'} "
-        f"exit={probe.clients[0].exit_code if probe.clients else '?'}"
-    )
+    if not serving:
+        return
+    # Milestone D (per-partition leadership): the probe only BOOTSTRAPS through the zombie — the client routes
+    # each record to its partition's current leader, so an ack is not a zombie write by itself (proven with
+    # topic-aware broker logs, briefs/2026-10-04-dr10-diagnosis.md).  The split-brain property is that nothing
+    # acked through the zombie's endpoint lives only on a deposed leader: every probe record must be delivered
+    # by the real cluster (subscribe-from-earliest via a non-zombie leader).
+    others = [svc for svc in SERVICES if svc != zombie_svc]
+    leader_id = cluster.wait_for_leader(timeout_s=90, exclude=[zombie_svc])
+    true_svc = node_id_to_service(leader_id)
+    assert true_svc in others, f"no non-zombie leader to verify the probe against (leader={true_svc})"
+    sub = _subscribe_all(cluster, true_svc, _next_cid_base(), keys=18, window_ms=60_000)
+    try:
+        assert_no_committed_loss(Results(clients=probe.clients + sub.clients))
+    except AssertionError as exc:
+        raise AssertionError(
+            f"SPLIT-BRAIN [BLOCKER — DR-10]: {reason}. Zombie service {zombie_svc!r} acked an acks=All "
+            f"produce whose records the real cluster (leader {true_svc!r}) does not have: {exc}"
+        ) from exc
 
 
 def assert_no_concurrent_leaders(cluster, majority_services: list[str],
@@ -282,6 +295,47 @@ def _wait_for_new_leader_among_majority(cluster, zombie_svc: str,
         f"wait_for_new_leader still returned the zombie service {zombie_svc!r}"
     )
     return new_lid, new_leader_svc
+
+
+# Settle oracle (DR-10 review LOW-5).  A settled cluster: every running node
+# reports a role, exactly one reports LEADER and all others FOLLOWER, and that
+# (leader, term) is unchanged over _SETTLE_STABLE_READS consecutive polls
+# (~1 s at the 0.2 s poll — several leader-heartbeat windows, so a resumed
+# zombie that is about to step down cannot pass as settled).  Bounded by a
+# deadline; never a fixed sleep.
+_SETTLE_DEADLINE_S = 90.0
+_SETTLE_STABLE_READS = 5
+
+
+def _wait_for_settled_leader(cluster, deadline_s: float = _SETTLE_DEADLINE_S) -> str:
+    """Wait until a single, stable leader is followed by every running node.
+
+    Returns the settled leader's service.  Raises AssertionError at the deadline
+    with the last observation (an unsettled cluster is a convergence failure).
+    """
+    running = cluster.running_services()
+    deadline = time.time() + deadline_s
+    last_obs: tuple[int, int] | None = None
+    stable = 0
+    readings: dict[str, tuple[str, int, int] | None] = {}
+    while time.time() < deadline:
+        readings = {svc: cluster._read_role(svc) for svc in running}
+        leaders = {(r[1], r[2]) for r in readings.values() if r is not None and r[0] == "LEADER"}
+        all_decided = all(r is not None and r[0] in ("LEADER", "FOLLOWER")
+                          for r in readings.values())
+        obs = next(iter(leaders)) if (len(leaders) == 1 and all_decided) else None
+        if obs is not None and obs == last_obs:
+            stable += 1
+        else:
+            stable = 1 if obs is not None else 0
+        last_obs = obs
+        if stable >= _SETTLE_STABLE_READS:
+            return node_id_to_service(obs[0])
+        time.sleep(cluster._LEADER_POLL_S)
+    raise AssertionError(
+        f"cluster did not settle on a single followed leader within {deadline_s}s "
+        f"(running={running}, last role readings={readings})"
+    )
 
 
 def _identify_leader_with_container(cluster, timeout_s: int = 30) -> tuple[int, str]:
@@ -650,9 +704,25 @@ def test_dr10_short_vs_long_pause(fresh_cluster, pause_case):
     finally:
         faults.unpause(cluster, zombie_svc)
 
-    # Settle window: node needs time to receive heartbeats / detect term changes.
-    settle_s = 10.0 if (pause_case == "long" or new_election_occurred) else 4.0
-    time.sleep(settle_s)
+    # Settle (DR-10 review LOW-5): condition-based, not a fixed sleep — wait
+    # (with a deadline) until exactly one node leads and every other node
+    # follows, unchanged over consecutive role-counter reads.  The fixed 4 s
+    # short-pause sleep was computed BEFORE the late-election re-check below, so
+    # a late-detected election ran the full convergence assertions after 4 s.
+    settled_svc = _wait_for_settled_leader(cluster)
+
+    if pause_case == "short" and not new_election_occurred:
+        # The short pause is AMBIGUOUS by design (1.5 s vs the leader-liveness
+        # window max(electionTimeout, 3*statusInterval) = 300 ms under the DR
+        # compose RUNE_ELECTION_TIMEOUT_MS=300; 150 ms at the broker default): the observation above runs mid-pause, so an election
+        # still in flight is invisible there.  Aeron-faithful (ClosedLeader
+        # StepDownRegression): a leader that resumes without an active follower
+        # quorum steps down, so leadership may legitimately move AFTER the
+        # observation.  Decide the ambiguity on the settled cluster: a moved
+        # leadership gets the full zombie-fencing convergence assertions below.
+        if settled_svc != zombie_svc:
+            new_election_occurred = True
+            new_leader_svc = settled_svc
 
     if pause_case == "long" or new_election_occurred:
         # Full zombie-fencing convergence assertions.
@@ -682,6 +752,7 @@ def test_dr10_short_vs_long_pause(fresh_cluster, pause_case):
 @pytest.mark.fault
 @pytest.mark.timeout(1200)
 @pytest.mark.xfail(
+    sys.platform == "darwin",   # Docker Desktop only — strict, real test on Linux (the box)
     reason="HARNESS-DETERMINISM, not a broker bug: under sub-second repeated "
     "pause/unpause of the leader, Docker Desktop's embedded DNS transiently drops "
     "container names and a just-paused ex-leader remains the highest-term log "

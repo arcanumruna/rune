@@ -90,6 +90,7 @@ GroupCoordinationService::GroupCoordinationService(
 // isLocalCoordinator
 // ---------------------------------------------------------------------------
 bool GroupCoordinationService::isLocalCoordinator() const {
+    if (localLeader_ >= 0) return localLeader_ == 1;
     return isLeaderFn_ ? isLeaderFn_() : true;
 }
 
@@ -143,7 +144,17 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
     // after becoming coordinator (Follower → Leader transition).  This ensures
     // committed offsets that were replicated to this node while it was a follower
     // are visible before serving any JoinGroup / SyncGroup requests.
-    const bool amLeader = isLocalCoordinator();
+    // The offset index is valid only for the leadership AND log content it was
+    // rebuilt from, and only while the __consumer_offsets replica leads.  A new
+    // leadership or a log-content change (truncation) re-arms the rebuild.
+    const rune::replication::PartitionReplica* const offRep =
+        offsets_ ? offsets_->replica() : nullptr;
+    const bool offsetsReady = offRep == nullptr || offRep->acceptsProduce();
+    const bool amLeader = isLocalCoordinator() && offsetsReady;
+    if (offRep != nullptr) {
+        const uint64_t gen = (offRep->leadershipGeneration() << 32) ^ offRep->logGeneration();
+        if (gen != offsetsGen_) { offsetsGen_ = gen; offsetsRebuilt_ = false; }
+    }
     if (amLeader) {
         if (!wasLeader_) {
             // First duty cycle after becoming coordinator — attempt the rebuild.
@@ -279,6 +290,31 @@ size_t GroupCoordinationService::handleJoinGroup(
         resp.isLeader      = 0;
         resp.memberId      = std::span<const uint8_t>();
         return resp.encode(out);
+    }
+
+    // CG routing round 3 (MAJOR-2): a member below client version 3 relies on
+    // the coordinator-created subscriptions this broker no longer makes (and
+    // demultiplexes Records without the creating Subscribe's correlationId) —
+    // refuse it, non-retriably, instead of serving it duplicates / losses.
+    if (gateway_) {
+        const int32_t v = gateway_->sessionClientVersion(msg.sessionId);
+        if (v >= 0 && v < pc::kClientVersionExplicitGroupSubscriptions) {
+            // LOW-3: an old client re-joins forever — log the first refusal of a
+            // session and then every power of two (bounded log volume).
+            if (oldClientRefusals_.size() >= 4096) oldClientRefusals_.clear();  // bounded (log only)
+            const uint64_t n = ++oldClientRefusals_[msg.sessionId];
+            if ((n & (n - 1)) == 0) spdlog::warn("GroupCoordinationService: JoinGroup from session {} refused — client version {} < {} "
+                         "(explicit group subscriptions required); upgrade the client",
+                         msg.sessionId, v, pc::kClientVersionExplicitGroupSubscriptions);
+            pc::JoinGroupResponse resp;
+            resp.sessionId     = msg.sessionId;
+            resp.correlationId = msg.correlationId;
+            resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::ProtocolVersion);
+            resp.generationId  = 0;
+            resp.isLeader      = 0;
+            resp.memberId      = std::span<const uint8_t>();
+            return resp.encode(out);
+        }
     }
 
     // Collect subscribedTopicIds → topic names.
@@ -449,96 +485,16 @@ size_t GroupCoordinationService::handleSyncGroup(
     // Stable: return the member's assignment.
     const std::vector<coord::TopicPartition> assignment = gc.assignmentFor(memberIdStr);
 
-    // CG-6 push-subscription seam: create (or reset) the member's group push
-    // subscriptions here — at the moment the client confirms it is ready to
-    // receive records — rather than eagerly in onReachedStable.
-    //
-    // Rationale: onReachedStable fires while the client is still in Joining or
-    // Syncing state (it just sent JoinGroup and is waiting for the SyncGroup
-    // round-trip).  If subscriptions are created there, pushSubscriptions() may
-    // deliver records BEFORE the client reaches Stable, causing them to be
-    // silently dropped by GroupConsumerHub::onRecords (state != Stable guard).
-    // By the time the client enters Stable the subscription's nextOffset has
-    // already advanced past all pre-existing records → 0 records consumed.
-    //
-    // Creating subscriptions HERE (on the SyncGroup OK path) guarantees the
-    // push starts at the committed offset EXACTLY when the client is about to
-    // transition to Stable (the SyncGroupResponse triggers the transition).
-    // Any records pushed between now and the SyncGroupResponse arriving at the
-    // client are at most one network-RTT worth — a negligible window and safe
-    // because the subscription always starts from the committed offset, which
-    // is what the client will OffsetFetch next anyway.
-    //
-    // Fix #4: skip the revoke+recreate cycle when this member session already
-    // has the correct group subscriptions active (idempotent SyncGroup for an
-    // unchanged assignment — Stable→Stable re-sync).  Revoking a live sub and
-    // re-creating it from the committed offset would move the push frontier
-    // backwards (re-delivery), which is unnecessary bounded duplication when
-    // the assignment did not change.  Guard: only recreate when the session has
-    // NO live group subs (first SyncGroup in this generation) or the count
-    // differs from the assignment (partition set did change).
-    if (gateway_) {
-        const std::size_t existingSubs = gateway_->groupMemberSubCount(msg.sessionId);
-        const bool needRecreate = (existingSubs != assignment.size());
-        if (!needRecreate) {
-            // Assignment matches existing live subs — skip revoke+recreate.
-            spdlog::debug("GroupCoordinationService::handleSyncGroup: "
-                          "skipping sub recreate for member='{}' sessionId={} "
-                          "(already have {} subs = assignment size)",
-                          memberIdStr, msg.sessionId, existingSubs);
-        } else {
-        gateway_->revokeGroupSubscriptions(msg.sessionId);
-        for (const auto& tp : assignment) {
-            int32_t topicId = -1;
-            if (topics_) {
-                const auto opt = topics_->topicIdForName(tp.topic);
-                if (opt) topicId = *opt;
-            }
-            if (topicId < 0) {
-                spdlog::warn("GroupCoordinationService::handleSyncGroup: "
-                             "unknown topic '{}' for member '{}' — skipping partition",
-                             tp.topic, memberIdStr);
-                continue;
-            }
-            // Seed at the committed offset only.  Cross-generation re-delivery
-            // of [committed, delivered) is legitimate bounded duplication (the
-            // group tolerates it via assert_group_bounded_duplicates).  We do NOT
-            // import the previous generation's wire-send position: that position is
-            // the broker's PUSH frontier (nextOffset in Subscription), which may be
-            // ahead of any records actually consumed+committed by the client.
-            // Seeding at max(committed, wirePosition) would silently skip records
-            // that were pushed to the old member but never consumed — an at-least-
-            // once violation (silent loss).
-            int64_t fromOffset = 0;
-            {
-                const auto committed = offsets_->fetch(groupIdStr, tp);
-                if (committed.has_value()) fromOffset = committed->offset;
-            }
-            // Conservative default isolation = read_committed (1).  The member
-            // conveys its true isolation via a Subscribe carrier frame AFTER it
-            // enters Stable (TX-5 sendSubscribeForPartitions), which the gateway
-            // applies to THIS same group subscription.  Defaulting to
-            // read_committed closes the race window between this sub becoming
-            // push-eligible and the carrier arriving: during that window we must
-            // never leak aborted/open transactional records to a read_committed
-            // consumer.  A read_uncommitted member is simply capped at the LSO
-            // for the few ms until its carrier downgrades this sub to isolation=0
-            // — a harmless, self-correcting delay, never a correctness violation.
-            const int64_t subId = gateway_->addGroupSubscription(
-                msg.sessionId, topicId, tp.partition, fromOffset, /*isolation=*/1,
-                /*pendingCarrier=*/true);
-            if (subId < 0) {
-                spdlog::warn("GroupCoordinationService::handleSyncGroup: "
-                             "addGroupSubscription failed for member '{}' topic={} partition={}",
-                             memberIdStr, topicId, tp.partition);
-            } else {
-                spdlog::debug("GroupCoordinationService::handleSyncGroup: "
-                              "group sub for member='{}' sessionId={} topic={} partition={} fromOffset={}",
-                              memberIdStr, msg.sessionId, topicId, tp.partition, fromOffset);
-            }
-        }
-        } // end else (needRecreate)
-    } // end if (gateway_)
+    // CG routing redesign (2026-10-04): the coordinator NO LONGER creates the
+    // member's push subscriptions at SyncGroup.  With distributed partition
+    // leadership a partition's records come from its LEADER node; the member
+    // subscribes there explicitly (after its OffsetFetch answer, from the
+    // committed offset or its reset policy).  A coordinator-created
+    // subscription pushed from the SyncGroup moment, before the member knew its
+    // position — those records were dropped and the subscription's cursor ran
+    // ahead of the member (stalled / lost partitions).  The eager revoke at
+    // PreparingRebalance (onEnterPreparingRebalance) and revokeGroupSubscriptions
+    // stay: they are no-ops for members without coordinator-created subs.
 
     // Build TopicPartition32 array for the response.
     // assignScratch_ is pre-reserved; may grow if needed (rare, cold).

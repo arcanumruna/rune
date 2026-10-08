@@ -19,7 +19,8 @@
 //
 // ## Design (mirrors WorkerIngress)
 //   - Resolves the publication via a bounded addExclusivePublication +
-//     findExclusivePublication loop (kResolveMaxMs=5000 / kResolveSliceMs=1),
+//     findExclusivePublication resolve via AeronPump (until Aeron answers — AeronPump::kUntilAnswered, bounded by Aeron's driverTimeoutMs; 1 ms
+//     sleep with the default pump, invoker pumping otherwise),
 //     the same pattern used across the gateway/ingress.
 //   - Non-throwing construction; check resolved() after construction.
 //   - SINGLE-OWNER / SINGLE-THREAD: one WorkerEgress per worker, written only on
@@ -29,7 +30,10 @@
 //     the gateway egress path.
 // ---------------------------------------------------------------------------
 
+#include <rune/aeronutil/AeronPump.h>
+
 #include <Aeron.h>
+#include <spdlog/spdlog.h>
 #include <ExclusivePublication.h>
 #include <concurrent/AtomicBuffer.h>
 #include <concurrent/logbuffer/BufferClaim.h>
@@ -54,7 +58,9 @@ public:
     // -----------------------------------------------------------------------
     WorkerEgress(std::shared_ptr<aeron::Aeron> aeron,
                  std::string                   controlEndpoint,
-                 int32_t                       streamId) noexcept
+                 int32_t                       streamId,
+                 rune::aeronutil::AeronPump    pump   = {},
+                 std::chrono::milliseconds     budget = rune::aeronutil::AeronPump::kUntilAnswered) noexcept
         : aeron_(std::move(aeron))
         , controlEndpoint_(std::move(controlEndpoint))
         , streamId_(streamId)
@@ -63,13 +69,22 @@ public:
 
         channel_ = "aeron:udp?control-mode=dynamic|control=" + controlEndpoint_;
 
-        int64_t regId = aeron_->addExclusivePublication(channel_, streamId_);
-        using clock = std::chrono::steady_clock;
-        auto deadline = clock::now() + std::chrono::milliseconds{kResolveMaxMs};
-        while (clock::now() < deadline) {
-            pub_ = aeron_->findExclusivePublication(regId);
-            if (pub_) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds{kResolveSliceMs});
+        // A driver registration error (bad channel, ...) makes add/find THROW;
+        // this ctor is noexcept, so it becomes a logged resolve failure.
+        bool failed = false;
+        try {
+            const int64_t regId = aeron_->addExclusivePublication(channel_, streamId_);
+            pub_ = pump.resolve([&]() -> std::shared_ptr<aeron::ExclusivePublication> {
+                try {
+                    return aeron_->findExclusivePublication(regId);
+                } catch (const std::exception& e) {
+                    spdlog::error("WorkerEgress: publication {} stream {} failed: {}", channel_, streamId_, e.what());
+                    failed = true;
+                    return nullptr;
+                }
+            }, budget, &failed);
+        } catch (const std::exception& e) {
+            spdlog::error("WorkerEgress: addExclusivePublication {} stream {} failed: {}", channel_, streamId_, e.what());
         }
         // pub_ == nullptr → resolved() returns false; caller handles.
     }
@@ -115,6 +130,8 @@ public:
         if (len <= static_cast<std::size_t>(pub_->maxPayloadLength())) {
             aeron::concurrent::logbuffer::BufferClaim claim;
             int64_t pos = pub_->tryClaim(static_cast<aeron::util::index_t>(len), claim);
+            if (pos == aeron::ADMIN_ACTION) [[unlikely]]   // A9: term rotated — retry now (Aeron contract)
+                pos = pub_->tryClaim(static_cast<aeron::util::index_t>(len), claim);
             if (pos > 0) {
                 claim.buffer().putBytes(claim.offset(), buf, 0,
                                         static_cast<aeron::util::index_t>(len));
@@ -124,12 +141,11 @@ public:
         }
         // Larger than one MTU fragment: offer() fragments it; the client's egress
         // FragmentAssembler reassembles.
-        return pub_->offer(buf, 0, static_cast<aeron::util::index_t>(len));
+        const int64_t r = pub_->offer(buf, 0, static_cast<aeron::util::index_t>(len));
+        return r == aeron::ADMIN_ACTION ? pub_->offer(buf, 0, static_cast<aeron::util::index_t>(len)) : r;
     }
 
 private:
-    static constexpr int kResolveMaxMs   = 5000;
-    static constexpr int kResolveSliceMs = 1;
 
     std::shared_ptr<aeron::Aeron>                aeron_;
     std::string                                  controlEndpoint_;

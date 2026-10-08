@@ -96,12 +96,41 @@ inline bool decodeRoleKey(const std::uint8_t* buf, std::size_t len,
 // so observers know how far the MSM log has been committed.
 inline constexpr std::int32_t kMsmCommitPosTypeId = 1'000'204;
 
+// D9 review MEDIUM-3: "stuck transaction markers" gauge (TCS::stuckMarkers()) —
+// markers of Prepare* transactions refused for more than kStuckMarkerNs and
+// still retrying.  Key = the nodeId (same layout as the role counter).
+inline constexpr std::int32_t kStuckMarkersCounterTypeId = 1'000'210;
+
+// Controlled shutdown review L5 — the rolling-restart readiness gate: the
+// number of partitions this node replicates but is NOT in the committed ISR of
+// (-1 = unknown: no controller known, or the node is stopping).  An operator
+// restarts the next node only once every node reads 0.  Key = the nodeId.
+inline constexpr std::int32_t kOutOfSyncCounterTypeId = 1'000'211;
+
+// hotpath-A re-review N4 — segment provisioning metrics (monotonic), published
+// by the SegmentProvisionerAgent thread.  Key = the nodeId; one type id per
+// metric, in SegmentProvisionerAgent::Metric order.
+inline constexpr std::int32_t kProvisionBuildFailuresCounterTypeId = 1'000'212;   // = owner inline rolls
+inline constexpr std::int32_t kProvisionRollHoldsCounterTypeId     = 1'000'213;
+inline constexpr std::int32_t kProvisionUnpreallocCounterTypeId    = 1'000'214;
+inline constexpr std::int32_t kProvisionParkedDroppedCounterTypeId = 1'000'215;
+inline constexpr std::int32_t kProvisionReadMapFailuresCounterTypeId = 1'000'216;   // hot-path B review Md5
+inline std::string provisionMetricLabel(const char* what, std::int32_t nodeId) {
+    return std::string("rune-segment-provision-") + what + " node=" + std::to_string(nodeId);
+}
+
 // Human-readable counter labels (also useful when browsing counters).
 inline std::string roleCounterLabel(std::int32_t nodeId) {
     return "rune-cluster-node-role node=" + std::to_string(nodeId);
 }
 inline std::string termCounterLabel(std::int32_t nodeId) {
     return "rune-cluster-leadership-term node=" + std::to_string(nodeId);
+}
+inline std::string stuckMarkersLabel(std::int32_t nodeId) {
+    return "rune-txn-stuck-markers node=" + std::to_string(nodeId);
+}
+inline std::string outOfSyncLabel(std::int32_t nodeId) {
+    return "rune-node-out-of-sync-partitions node=" + std::to_string(nodeId);
 }
 inline std::string msmCommitPosLabel(std::int32_t nodeId) {
     return "rune-msm-commit-position node=" + std::to_string(nodeId);

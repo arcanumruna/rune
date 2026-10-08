@@ -30,14 +30,19 @@
 
 #include <rune/consensus/ClusterMember.h>
 #include <rune/consensus/ConsensusPublisher.h>
+#include <rune/consensus/SbeConsensusPublisher.h>
+
+#include <type_traits>
+#include <utility>
 #include <rune/consensus/ElectionState.h>
 #include <rune/consensus/FollowerLiveness.h>
 #include <rune/consensus/NodeStateFile.h>
 #include <rune/consensus/TermLog.h>
 #include <rune/consensus/Types.h>
+#include <rune/consensus/AckTerm.h>
+#include <rune/consensus/CandidacyState.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
 #include <random>
 #include <vector>
@@ -47,8 +52,9 @@ namespace rune::consensus {
 // Election — runs the Aeron Cluster election state machine.
 //
 // Single-threaded: doWork() and all onXxx() handlers must be called from the
-// same thread (ConsensusAgent duty-cycle loop). The stateCode_ atomic is written
-// with release and may be read by observer threads.
+// same thread (ConsensusAgent duty-cycle loop).  F9a: stateCode_ is a plain
+// duty-cycle-owned field; observer threads learn the leader view from the
+// LeaderObserver ring (rune::node::LeaderObserver), never by reading Election.
 class Election {
 public:
     // Election.java:110-149  constructor
@@ -103,8 +109,8 @@ public:
     // Election.java:1385 state()
     ElectionState state() const noexcept;
 
-    // Read the atomic state code (release-written on each transition).
-    // Mirrors ctx.electionStateCounter().setRelease(newState.code()).
+    // State code (written on each transition).  Duty-cycle thread only (F9a).
+    // Mirrors ctx.electionStateCounter() — observers get it via a ring snapshot.
     int32_t stateCode() const noexcept;
 
     Term    leadershipTermId()         const noexcept;
@@ -221,6 +227,71 @@ public:
                           int64_t logPosition,
                           NodeId  leaderMemberId);
 
+    /// Controlled shutdown (Raft leadership transfer; Aeron's graceful leader
+    /// close).  A CLOSED multi-node LEADER resigns: it sends StandDown
+    /// (template 59) to every follower, stops heartbeating and re-enters
+    /// CANVASS; it votes but never stands for election again in this process
+    /// (resigned() latches).  Returns false (nothing done) unless this node is
+    /// the CLOSED leader of a multi-node cluster.  Duty-cycle thread; cold.
+    bool resign(int64_t nowNs);
+    /// A follower learns its leader resigned: it starts an election AT ONCE
+    /// (no leader-heartbeat timeout), skipping the resigned leader in the
+    /// canvass (Aeron gracefulClosedLeaderId).  Ignored unless it comes from
+    /// the leader this CLOSED follower follows, for its current term.
+    void onStandDown(int64_t nowNs, Term leadershipTermId, NodeId leaderMemberId);
+    [[nodiscard]] bool resigned() const noexcept { return resigned_; }
+    /// Controlled shutdown, any role: never stand for election again in this
+    /// process (it still votes).  A current leader keeps leading until
+    /// resign().  Duty-cycle thread.
+    void withdrawCandidacy() noexcept { resigned_ = true; }
+
+    /// Review 2026-10-04 MAJOR-2/3 — candidacy rule.  `fn(ctx, candidate)`
+    /// decides whether this node may VOTE for `candidate`.  The broker wires it
+    /// to InternalIsrKnowledge::eligible: a node outside the newest durable ISR
+    /// of __cluster_metadata (which the consensus leader leads) never gathers a
+    /// majority — it would lead it without its committed records.  A denied
+    /// RequestVote is answered like a "my log is newer" deny.  Applied by
+    /// voters only: a node always may stand (re-review MAJOR-A — its own
+    /// knowledge may be stale; the voters' majority decides).  nullptr
+    /// (default) = everyone eligible (data-blind, as Aeron).  Duty-cycle thread.
+    /// The consensus term that may refuse an internal-ISR ack (rune/consensus/
+    /// AckTerm.h): the term this node GRANTED a vote in, or followed / led a
+    /// leader in.  Duty-cycle thread.
+    [[nodiscard]] Term ackTermId() const noexcept {
+        return ackTerm(candidateTermId_, votedTermId_, leadershipTermId_);
+    }
+    [[nodiscard]] Term votedTermId() const noexcept { return votedTermId_; }
+
+    /// Re-review round 3 CRITICAL-R3 — knowledge exchange.  `src(ctx, out)`
+    /// fills this node's newest durable metadata-ISR state (false = none /
+    /// unprovable: nothing sent); `learn(ctx, s)` adopts a peer's state when
+    /// newer (durably; never acked — LEARNING bypasses the ack term rule).  The
+    /// state is sent to each peer with every CanvassPosition, RequestVote and
+    /// Vote.  nullptr = no exchange.  Duty-cycle thread.
+    using CandidacySource = bool (*)(void* ctx, CandidacyState& out) noexcept;
+    using CandidacyLearn  = void (*)(void* ctx, const CandidacyState& s) noexcept;
+    void setCandidacyExchange(CandidacySource src, CandidacyLearn learn, void* ctx) noexcept {
+        candidacySrc_ = src; candidacyLearn_ = learn; candidacyCtx_ = ctx;
+    }
+    /// A peer's CandidacyState (ConsensusAgent dispatch).
+    void onCandidacyState(NodeId fromMember, const CandidacyState& s) noexcept {
+        (void)fromMember;
+        if (candidacyLearn_ != nullptr) candidacyLearn_(candidacyCtx_, s);
+    }
+
+    using VoteGate = bool (*)(void* ctx, NodeId candidate) noexcept;
+    void setVoteGate(VoteGate fn, void* ctx) noexcept { voteGate_ = fn; voteGateCtx_ = ctx; }
+    [[nodiscard]] bool mayVoteFor(NodeId candidate) const noexcept {
+        return voteGate_ == nullptr || voteGate_(voteGateCtx_, candidate);
+    }
+
+    /// Task 11 fix 2 (B2): true when every outbound consensus message is a direct
+    /// call (production SbeConsensusPublisher over a final sink); false only for
+    /// test doubles.  BrokerNode debug-asserts it.
+    [[nodiscard]] bool publishPathIsConcrete() const noexcept {
+        return publisher_.sbe != nullptr && publisher_.sbe->sinkIsConcrete();
+    }
+
 private:
     // -----------------------------------------------------------------------
     // State handlers — one per ElectionState
@@ -246,6 +317,9 @@ private:
     // broadcasting NLT on the heartbeat interval so late-joining nodes can
     // discover the existing leader and converge.  No-op for followers.
     int closedLeaderHeartbeat(int64_t nowNs);
+    // ClosedLeaderStepDownRegression (DR-10 flap): CLOSED → election exits.
+    [[nodiscard]] bool hasActiveFollowerQuorum_(int64_t nowNs) const noexcept;
+    void leaveClosedForElection_(Term term, int64_t nowNs, const char* reason);
 
     // -----------------------------------------------------------------------
     // Transition helper — Election.java:1385-1438
@@ -289,7 +363,34 @@ private:
     NodeId                                   thisMemberId_;
 
     // Election.java:74    private final ConsensusPublisher consensusPublisher;
-    ConsensusPublisher&                      publisher_;
+    // Concrete publisher + construction-time tag (Task 11 fix 2, B2): the
+    // production SbeConsensusPublisher (final) is called DIRECTLY; Generic
+    // (virtual) = test doubles only.
+    struct PublisherRef {
+        SbeConsensusPublisher* sbe     = nullptr;
+        ConsensusPublisher*    generic = nullptr;
+        static PublisherRef of(ConsensusPublisher& p) noexcept {
+            PublisherRef r;
+            if (auto* s = dynamic_cast<SbeConsensusPublisher*>(&p)) r.sbe = s; else r.generic = &p;
+            return r;
+        }
+#define RUNE_ELECTION_PUB_FWD(m)                                                      \
+        template <class... A> void m(A&&... a) const {                                \
+            if (sbe) [[likely]] sbe->m(std::forward<A>(a)...);                         \
+            else generic->m(std::forward<A>(a)...);                                    \
+        }
+        RUNE_ELECTION_PUB_FWD(candidacyState)
+        RUNE_ELECTION_PUB_FWD(canvassPosition)
+        RUNE_ELECTION_PUB_FWD(requestVote)
+        RUNE_ELECTION_PUB_FWD(placeVote)
+        RUNE_ELECTION_PUB_FWD(newLeadershipTerm)
+        RUNE_ELECTION_PUB_FWD(appendPosition)
+        RUNE_ELECTION_PUB_FWD(commitPosition)
+        RUNE_ELECTION_PUB_FWD(standDown)
+#undef RUNE_ELECTION_PUB_FWD
+    };
+    static_assert(std::is_final_v<SbeConsensusPublisher>);
+    PublisherRef                             publisher_;
 
     // Persistence (replacing ctx.nodeStateFile() and ctx.recordingLog())
     NodeStateFile&                           nodeStateFile_;
@@ -341,17 +442,50 @@ private:
     int64_t notifiedCommitPosition_  = 0;  // Election.java:88
 
     // Term fields — Election.java:94-96
+    /// In memory only, also when adopted from a higher-term NLT / CommitPosition
+    /// on leaving CLOSED (DR-10 review LOW-6) — exactly as Aeron, whose
+    /// ConsensusModuleAgent.leadershipTermId is recovered from the RecordingLog
+    /// (here: the TermLog, appended at electionComplete) and whose only durable
+    /// election term is the NodeStateFile candidate term.  Safe: the adoption
+    /// first persists candidateTermId (proposeMaxCandidateTermId, fsync), and a
+    /// restarted node's init() starts from max(persisted candidate term, this),
+    /// so it never votes at or below the adopted term nor re-follows the deposed
+    /// leader's older term (ClosedLeaderStepDownRegression_RestartAfter...).  The
+    /// ack term may fall back below it after a crash — same reasoning as
+    /// votedTermId_ below: knowledge persisted, never acked.
     Term leadershipTermId_    = 0;
     Term logLeadershipTermId_ = 0;
     Term candidateTermId_     = 0;
+    /// Highest term this node GRANTED a vote in (MAJOR-R3) — a denial or an
+    /// own (abandoned) candidacy never raises it.  Not persisted (round-4
+    /// LOW-R4-4): after a restart the ack term can be BELOW a term this node
+    /// granted in before the crash, so the knowledge store may PERSIST a
+    /// deposed leader's internal ISR state — knowledge only, exactly what
+    /// adopt() does.  It never ACKS one: the internal replica restarts as
+    /// Follower at epoch 0 with no leader, and the durable candidateTermId_
+    /// makes the election ignore the stale term's NewLeadershipTerm (a node
+    /// never re-follows a deposed leader).
+    Term votedTermId_         = 0;
 
     // Election config — Election.java:80
     bool isNodeStartup_     = false;
     bool isExtendedCanvass_ = false; // true during first canvass on startup
     bool isFirstInit_       = true;  // Election.java:101
 
-    // Election.java:100
+    // Election.java:100 — scoped to ONE election (Aeron: a constructor argument
+    // of that election); cleared at electionComplete (DR-10 review LOW-2).
     NodeId gracefulClosedLeaderId_ = -1;
+    /// Controlled shutdown: this node resigned its leadership (resign()) — it
+    /// never nominates itself again; while canvassing it re-sends StandDown
+    /// for the term it resigned (loss recovery on the status interval).
+    bool resigned_       = false;
+    Term resignedTermId_ = -1;
+    /// Entry time of this node's current leadership (LeaderLogReplication);
+    /// INT64_MIN = never led.  The failover-liveness grace (eligibleNodeIds).
+    int64_t leaderSinceNs_ = INT64_MIN;
+    /// gracefulClosedLeaderId_ was set by a StandDown: the resigned leader's
+    /// own canvass does not clear it until this election completes.
+    bool skipFromStandDown_ = false;
 
     // Election.java:104  private ClusterMember leaderMember = null;
     ClusterMember* leaderMember_ = nullptr;
@@ -368,8 +502,9 @@ private:
     // Election.java:105  private ElectionState state = INIT;
     ElectionState state_ = ElectionState::Init;
 
-    // §6.9 AtomicCounter equivalent — release-written on each state transition.
-    std::atomic<int32_t> stateCode_{0}; // Init.code() == 0
+    // §6.9 electionStateCounter equivalent — written on each state transition.
+    // Duty-cycle-owned plain field (F9a: no atomics).
+    int32_t stateCode_{0}; // Init.code() == 0
 
     // Timeout configuration (injected, not read from ctx)
     int64_t electionTimeoutNs_         = 0;
@@ -382,6 +517,18 @@ private:
 
     // Seeded RNG for nominate backoff — Election.java:723
     std::mt19937_64 rng_;
+
+    // Candidacy rule (setVoteGate).
+    VoteGate voteGate_    = nullptr;
+    void*    voteGateCtx_ = nullptr;
+    // Knowledge exchange (setCandidacyExchange).
+    CandidacySource candidacySrc_   = nullptr;
+    CandidacyLearn  candidacyLearn_ = nullptr;
+    void*           candidacyCtx_   = nullptr;
+    void publishCandidacyState_(NodeId toMember);
+    /// CRITICAL-R3: the candidate's own vote counts only if its own durable
+    /// knowledge admits it (re-evaluated every ballot step).
+    void gateSelfVote_() noexcept;
 };
 
 } // namespace rune::consensus

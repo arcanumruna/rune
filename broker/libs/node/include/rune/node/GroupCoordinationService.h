@@ -124,6 +124,13 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] bool isLocalCoordinator() const;
 
+    // Task 11 fix 2 (B1): this node's leadership for the current runtime duty
+    // cycle, pushed as a VALUE by NodeRuntimeAgent (same thread) right after
+    // consensus runs.  Once pushed, isLocalCoordinator() never calls the
+    // isLeader std::function (per-cycle, worker 0's pass under fused placement).
+    // Unpushed (-1): the callable is used (service-only tests).
+    void setLocalLeadership(bool leader) noexcept { localLeader_ = leader ? 1 : 0; }
+
     // -----------------------------------------------------------------------
     // coordinatorFor — returns the cluster-leader nodeId for any group.
     // v1 seam (Milestone-D: will map groupId → owning node).
@@ -187,6 +194,7 @@ private:
     rune::coordination::ReplicatedOffsetStore* offsets_;    // non-owning
     rune::gateway::TopicRegistry*              topics_;     // non-owning; may be null
     std::function<bool()>                      isLeaderFn_;
+    int8_t                                     localLeader_ = -1;   // see setLocalLeadership()
     std::function<NodeId()>                    leaderIdFn_;
 
     // CG-6 failover: detect Follower→Leader transition so we can rebuild the
@@ -207,6 +215,9 @@ private:
     // group resumes committing, so re-running rebuild (clear+repopulate from the
     // log) cannot clobber a live in-memory commit.
     bool offsetsRebuilt_ = false;
+    /// (leadershipGeneration << 32) ^ logGeneration of the offsets replica the
+    /// index was rebuilt against (see doWork).
+    uint64_t offsetsGen_ = 0;
 
     // CG-4: ClientGateway — non-owning; may be null (tests without push subs).
     rune::gateway::ClientGateway*              gateway_ = nullptr;
@@ -215,6 +226,8 @@ private:
     /// std::map with std::less<> (transparent comparator) so hot-path find()
     /// can be called with std::string_view without constructing a std::string.
     std::map<GroupId, rune::coordination::GroupCoordinator, std::less<>> coordinators_;
+    /// LOW-3 (CG round 4): JoinGroup refusals per old-client session (log rate-limit; cold).
+    std::map<int64_t, uint64_t> oldClientRefusals_;
 
     // CG-4: member → sessionId tracking.
     // Keyed by (groupId + ":" + memberId) for global uniqueness.

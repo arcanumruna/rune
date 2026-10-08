@@ -26,30 +26,46 @@
 // state happen on the single AgentRunner thread. No locking needed; no per-cycle heap.
 
 #include <rune/consensus/ConsensusAgent.h>  // defines rune::consensus::Agent
+#include <rune/node/AdminControlPlane.h>
+#include <rune/node/NodeConsensusAgent.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/node/GroupCoordinationService.h>
 #include <rune/node/TransactionCoordinationService.h>
 #include <rune/node/MetadataService.h>
 #include <rune/node/ReplicaRegistry.h>
+#include <rune/node/CleanerViewChannel.h>
 #include <rune/node/ReplicationMetadataBridge.h>
 #include <rune/node/WorkerPool.h>
+#include <rune/node/OneToOneByteRing.h>
+#include <rune/node/OwnerThreadTestTask.h>
+#include <rune/node/LeaderObserver.h>
+#include <rune/node/ControlledShutdown.h>
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune_fr/FlightRecorder.h>
 #include <rune/replication/Types.h>
 #include <rune/storage/LogCleaner.h>
+#include <rune/storage/Log.h>
+#include <spdlog/spdlog.h>
 #include <rune/storage/OffsetMap.h>
 #include <rune/consensus/Election.h>
+#include <rune/consensus/SlowTick.h>
 #include <rune/metadata/RoutingImage.h>
 #include <rune/metadata/Gpid.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <limits>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <type_traits>
 #include <vector>
 
 namespace rune::node {
@@ -95,7 +111,7 @@ public:
                      TransactionCoordinationService*     txnService      = nullptr,
                      MetadataService*                    metadataService = nullptr,
                      WorkerPool*                         workerPool      = nullptr) noexcept
-        : consensus_(consensusAgent)
+        : consensus_(ConsensusRef::of(consensusAgent))
         , election_(election)
         , bridge_(bridge)
         , transport_(transport)
@@ -113,7 +129,7 @@ public:
                      GroupCoordinationService*      groupService    = nullptr,
                      TransactionCoordinationService* txnService     = nullptr,
                      MetadataService*                metadataService = nullptr) noexcept
-        : consensus_(consensusAgent)
+        : consensus_(ConsensusRef::of(consensusAgent))
         , election_(nullptr)
         , bridge_(nullptr)
         , transport_(nullptr)
@@ -129,15 +145,147 @@ public:
     NodeRuntimeAgent& operator=(const NodeRuntimeAgent&) = delete;
 
     // -----------------------------------------------------------------------
+    // Task 8a: admin control-plane servicing hook (RULING-2 B).
+    //
+    // The schema DDL control plane hands off to the CONTROL thread via rings:
+    //   - createReqRing (admin → control): create physical topic + add a user
+    //     PartitionReplica (topic visibility via the ReplicaRegistry generation
+    //     → WorkerPool::reconcile mechanism); reply the authoritative id.
+    //   - egressRing (admin → control): send DDL response frames on the session
+    //     egress via gateway->sendControlFrame.
+    //   - roleRing (control → admin): posted here on leadership change.
+    //
+    // BrokerNode wires its concrete AdminControlPlane; it runs on THIS (control)
+    // thread every cycle as a DIRECT call (Task 11 fix 1: no std::function /
+    // virtual on the duty cycle — under fused placement it is worker 0's pass).
+    // Non-owning; single-writer (control thread).  Null when no admin plane.
+    // -----------------------------------------------------------------------
+    void setAdminControl(AdminControlPlane* control) noexcept { adminControl_ = control; }
+
+    /// This node's id: enables the per-cycle leadership hand-off to the gateway
+    /// (BrokerNode sets it; unset = the gateway keeps its LeaderView callable).
+    void setSelfId(int32_t selfId) noexcept { selfId_ = selfId; }
+
+    // Task 11 fix 1: which concrete consensus agent this runtime drives.  Single
+    // / Multi = a direct (final-class) call per cycle; Generic = virtual, only for
+    // test doubles.  BrokerNode always builds Single or Multi.
+    enum class ConsensusKind : uint8_t { Single, Multi, Generic };
+    [[nodiscard]] ConsensusKind consensusKind() const noexcept { return consensus_.kind; }
+
+    /// F9a: the control-thread → observer leadership ring.  Set before start.
+    void setLeaderObserver(LeaderObserver* o) noexcept { leaderObserver_ = o; }
+
+    int drainNodeControl_() {
+        int sent = 0;
+        if (auto& out = metadataService_->nodeControlOutbox(); !out.empty()) [[unlikely]] {
+            std::size_t n = 0;
+            while (n < out.size() && transport_->sendAlterIsr(out[n])) ++n;
+            out.erase(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(n));
+            sent += static_cast<int>(n);
+        }
+        if (auto& out = metadataService_->nodeControlResponseOutbox(); !out.empty()) [[unlikely]] {
+            std::size_t n = 0;
+            while (n < out.size() && transport_->sendAlterIsrResponse(out[n].first, out[n].second)) ++n;
+            out.erase(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(n));
+            sent += static_cast<int>(n);
+        }
+        return sent;
+    }
+
+    /// Controlled shutdown state machine (driven on this agent's slow tick).
+    /// BrokerNode binds it before the control thread starts; begin()/observe()
+    /// are its cross-thread ring endpoints.
+    ControlledShutdown& controlledShutdown() noexcept { return controlledShutdown_; }
+
+    // fsyncgate fail-stop (Task 10 fix 2 / I-1): replicas this control thread
+    // drives (internal partitions; all partitions without a WorkerPool) whose
+    // log fsync failed are reported here ONCE → BrokerNode halts (exit 74).
+    using StorageFailureHook = std::function<void(const std::string& logDir, int err)>;
+    void setStorageFailureHook(StorageFailureHook hook) { storageFailureHook_ = std::move(hook); }
+
+    // -----------------------------------------------------------------------
     // Agent::doWork — single-writer duty cycle.
     // Returns sum of work done by all components.
     // -----------------------------------------------------------------------
     const char* name() const noexcept override { return "rune-runtime"; }
 
     int doWork(int64_t nowNs) override {
+        // F7 ownership invariant (WorkerPool): a runtime replica move is a hard
+        // error → halt (no exception escapes onto the AgentRunner thread).
+        try {
+            return doWorkImpl_(nowNs);
+        } catch (const std::logic_error& e) {
+            if (!fatalReported_) {
+                fatalReported_ = true;
+                spdlog::critical("NodeRuntimeAgent: invariant violation: {} — halting", e.what());
+                if (fatalHook_) fatalHook_(e.what());
+            }
+            return 0;
+        }
+    }
+
+    // Task 10 round 4: the LogCleanerAgent's replica view channel (rings only).
+    // BrokerNode calls this before any runner starts and attaches the result to
+    // the cleaner.  The channel lives here (outlives the cleaner on shutdown).
+    CleanerViewChannel* enableCleanerView() { return views_[kCleanerView].enable(); }
+    [[nodiscard]] std::uint64_t cleanerAckedGenForTest() const noexcept { return views_[kCleanerView].ackedGen; }
+    /// hotpath-A F2: the SegmentProvisionerAgent's replica view — the same
+    /// protocol: a retired replica is freed only once the provisioner acked too.
+    CleanerViewChannel* enableProvisionerView() { return views_[kProvisionerView].enable(); }
+    [[nodiscard]] std::uint64_t provisionerAckedGenForTest() const noexcept {
+        return views_[kProvisionerView].ackedGen;
+    }
+
+    /// Aeron's io.aeron.cluster.ConsensusModuleAgent.SLOW_TICK_INTERVAL_NS.
+    static constexpr int64_t kSlowTickIntervalNs = 10'000'000;   // 10 ms
+
+    /// Task 11 (fused placement): run the O(partitions) failover / rebalance scan
+    /// as a slow tick every `ns` instead of every duty cycle.  0 (default, thread
+    /// placement) = every cycle.  Set before the agent runs.
+    void setSlowTickIntervalNs(int64_t ns) noexcept { failoverTick_.intervalNs = ns > 0 ? ns : 0; }
+
+    /// Test-only (this agent's thread): duty cycles run / routing images published.
+    [[nodiscard]] std::uint64_t cyclesForTest() const noexcept { return cycles_; }
+    [[nodiscard]] std::uint64_t routingImagePublishesForTest() const noexcept { return routingImagePublishes_; }
+
+    // Halt on an invariant violation (BrokerNode wires it; called once).
+    void setFatalHook(std::function<void(const std::string&)> hook) { fatalHook_ = std::move(hook); }
+
+private:
+    int doWorkImpl_(int64_t nowNs) {
         RUNE_FR_SPAN_RUNTIME(rune_fr::Site::RuntimeDoWork, 0);
+        ++cycles_;
         // 1. Consensus (Election + IngressRing drain).
-        int work = consensus_.doWork(nowNs);
+        int work = consensus_.doWork(nowNs);   // direct call (Single / Multi), never virtual in BrokerNode
+        // Task 11 fix 1: hand the gateway this cycle's leadership as a plain value
+        // (was a per-cycle std::function LeaderView — which also built a
+        // std::string on followers).  Same value BrokerNode::isLeader() reads.
+        if (selfId_ >= 0) {
+            const bool leader = isLocalLeader_();
+            if (gateway_)      gateway_->setLocalLeadership(leader);
+            if (groupService_) groupService_->setLocalLeadership(leader);   // fix 2 (B1)
+            if (txnService_)   txnService_->setLocalLeadership(leader);     // fix 2 (B1)
+        }
+        // 1a. F9a: publish the leadership view to the observer thread (ring,
+        //     only on change) right after the consensus step made it current.
+        if (leaderObserver_) leaderObserver_->publishOnControl();
+
+        // 1b. Task 10 fix 3 (I2a): fan ownership out BEFORE anything this cycle
+        //     can route ops (bridge role ops, transport poll, gateway), and free
+        //     removed replicas no worker can still reference (all acked).
+        if (workerPool_ && registry_) workerPool_->reconcile(*registry_);
+        if (registry_) {
+            // Round 4: the off-thread cleaner holds replica pointers too (its own
+            // ring-delivered view) — a retired replica is freed only once every
+            // worker AND the cleaner acked a generation at or above its removal.
+            std::uint64_t safe = workerPool_ ? workerPool_->minAckedOwnershipGen()
+                                             : registry_->generation();
+            for (auto& v : views_) {   // the cleaner + the provisioner (hotpath-A)
+                work += publishView_(v);
+                if (v.channel && v.ackedGen < safe) safe = v.ackedGen;
+            }
+            registry_->collectRetired(safe);
+        }
 
         // 2. Metadata bridge — detect leader/epoch change and flip replica roles.
         //    Reads election_ AFTER consensus step so the state is current.
@@ -146,6 +294,11 @@ public:
             const rune::replication::Epoch epoch =
                 static_cast<rune::replication::Epoch>(election_->leadershipTermId());
             work += bridge_->doWork(lid, epoch);
+            // AlterIsr proposals route to the CURRENT controller (consensus leader).
+            if (transport_) transport_->setControllerId(static_cast<int32_t>(lid));
+            // M1: an invariant violation caught at the bridge's noexcept
+            // boundary joins the uniform halt path below (exit 70).
+            if (std::string what; bridge_->takeFatal(what)) throw std::logic_error(what);
         }
 
         // 2b. Metadata service — apply committed assignment records.
@@ -162,8 +315,18 @@ public:
         //     and the gateway uses it for ALL per-produce/subscribe lookups within
         //     that cycle.  Zero atomic_load per produce on the hot path.
         if (metadataService_) {
+            // D17 / DR-10 review MAJOR-1: only the CONSENSUS leader decides.  The
+            // metadata replica keeps its Leader role after a consensus step-down
+            // until the bridge learns the new leader; deciding on that role let a
+            // stepped-down (or resumed-zombie) controller reassign partitions.
+            metadataService_->setConsensusLeads(isLocalLeader_());
             const int metaWork = metadataService_->doWork(nowNs);
             work += metaWork;
+            // Controlled shutdown (cold; two empty() checks when idle): member
+            // confirmations → the controller, the controller's pushed COMPLETE
+            // → the stopping node.  Every cycle (events, not the slow tick).
+            if (election_) metadataService_->noteController(static_cast<int32_t>(election_->leaderMemberId()));
+            if (transport_) [[likely]] work += drainNodeControl_();
 
             // GR-7 / Task-14: FAILOVER reassignment of partition leadership.
             //
@@ -177,7 +340,13 @@ public:
             // Without this, a killed node's partitions stay assigned to it in the
             // committed map forever, so the surviving nodes' replicas never get
             // promoted to Leader (GR-7 / TX-2b failover would hang).
-            if (election_) {
+            //
+            // Task 11: O(partitions) — a SLOW-TICK step (Aeron ConsensusModule-
+            // Agent::slowTickWork): due every failoverTick_.intervalNs, and again
+            // on the very next cycle while it still emits records.  Interval 0
+            // (thread placement) = every cycle, exactly as before.
+            if (election_ && failoverTick_.due(nowNs)) {
+                int slowWork = 0;
                 // BIDIRECTIONAL partition-leadership rebalance on eligible-set change.
                 //
                 // Failure detection uses the consensus heartbeat eligible set (the
@@ -202,14 +371,26 @@ public:
                 const std::size_t n = election_->eligibleNodeIds(
                     nowNs, failoverTimeoutNs, eligBuf_.data(), eligBuf_.size());
 
+                // Kafka broker fencing for INTERNAL partitions (led here, leader-
+                // local ISR): a member the cluster considers dead leaves the ISR
+                // at once — with HW = min over the ISR it would otherwise hold the
+                // HW (metadata commits!) for replicaLagMaxMs.
+                if (n > 0 && registry_) {
+                    for (auto* replica : registry_->allReplicas()) {
+                        if (replica && replica->topicId() < 0 &&
+                            replica->role() == rune::replication::Role::Leader)
+                            replica->shrinkIsrToLive(
+                                std::span<const int32_t>(eligBuf_.data(), n), nowNs);
+                    }
+                }
+
                 // Track eligible-set changes (kept for diagnostics / future gating).
                 const bool changed =
                     !prevEligInit_ || n != prevEligLen_ ||
                     !std::equal(eligBuf_.begin(), eligBuf_.begin() + n,
                                 prevEligBuf_.begin());
                 // TEMP control-plane churn diagnostic (RUNE_CTRL_LOG=1).
-                static const bool kCtrlLog = ::getenv("RUNE_CTRL_LOG") != nullptr;
-                if (kCtrlLog) {
+                if (ctrlLog_) {
                     const int32_t curLeader = election_->leaderMemberId();
                     const int64_t curTerm   = (int64_t)election_->leadershipTermId();
                     if (changed || curLeader != dbgLastLeader_ || curTerm != dbgLastTerm_) {
@@ -237,7 +418,9 @@ public:
                     // only — no access to live worker-owned state.
                     //
                     // CONVERGENCE (time-independent): we run the refresh + idempotent
-                    // reassign EVERY duty cycle, not only on an eligible-set change.
+                    // reassign on EVERY scan (every duty cycle under thread placement;
+                    // every slow tick — and the very next cycle after any emit —
+                    // under fused placement), not only on an eligible-set change.
                     // A returned replica's position becomes visible some cycles AFTER
                     // it re-enters the eligible set (the leader must observe its next
                     // fetch), so a one-shot on-change reassign would miss the
@@ -277,31 +460,48 @@ public:
                     //     every cycle) keeps it from oscillating against a heartbeat-
                     //     flapping node while still re-spreading load when the set is
                     //     stable.  restorable()/position-gating keeps every move safe.
-                    const int maxPref = changed ? 1024 : 0;
+                    //   • Epoch-restart fix round 1 (M2): also when the controller
+                    //     just caught up after its claim, or the committed map changed
+                    //     since the last pass (a returned replica re-entered an ISR —
+                    //     it becomes a preferred candidate only THEN, after the
+                    //     eligible-set edge passed).  An edge seen while the
+                    //     controller cannot decide is NOT consumed (below).
+                    const bool ctlReady = metadataService_->controllerReady();
+                    const bool recheck  = metadataService_->takePreferredRecheck();
+                    const int maxPref = (changed || recheck) ? 1024 : 0;
                     const std::size_t emitted =
                         metadataService_->reassignDeadPartitionLeaders(
                             eligibleScratch_, maxPref);
-                    if (kCtrlLog && emitted > 0)
+                    if (ctrlLog_ && emitted > 0)
                         std::fprintf(stderr,
                             "[CTRL] t=%lldms REASSIGN emitted=%zu records "
                             "(maxPref=%d eligN=%zu) — a partition leader was deemed "
                             "dead/rebalanced\n",
                             (long long)(nowNs / 1'000'000), emitted, maxPref, n);
                     work += static_cast<int>(emitted);
-                    std::copy(eligBuf_.begin(), eligBuf_.begin() + n,
-                              prevEligBuf_.begin());
-                    prevEligLen_  = n;
-                    prevEligInit_ = true;
+                    slowWork += static_cast<int>(emitted);
+                    if (ctlReady) {   // M2: never consume the edge undecided
+                        std::copy(eligBuf_.begin(), eligBuf_.begin() + n,
+                                  prevEligBuf_.begin());
+                        prevEligLen_  = n;
+                        prevEligInit_ = true;
+                    }
                 }
+                // Controlled shutdown (cold): register / hand-off steps, on
+                // the same slow tick as the rebalance it depends on.
+                slowWork += controlledShutdown_.doWork(nowNs);
+                failoverTick_.done(nowNs, slowWork);
             }
 
-            // Rebuild RoutingImage and push to gateway each cycle.
-            // This is cheap (shared_ptr swap + array copy) and done on the
-            // duty-cycle thread — no cross-thread synchronisation needed.
-            // The image is captured by the gateway's doWork on the SAME thread,
-            // so there is no cross-thread race on routingImage_.
+            // Rebuild the RoutingImage and push it to the gateway WHEN ITS INPUTS
+            // CHANGE (MetadataService::routingVersion(): committed map or the
+            // topic+node config) — Task 11: never per cycle (a heap allocation +
+            // an O(partitions) rebuild on every runtime cycle, which under fused
+            // placement is every worker-0 pass).  Done on the duty-cycle thread —
+            // the gateway reads the image on the SAME thread (no race).
             //
-            // BOOTSTRAP FIX (MD1-13): publish a RoutingImage on every duty cycle.
+            // BOOTSTRAP FIX (MD1-13): a RoutingImage is published from the very
+            // first duty cycle (the first cycle always builds).
             //
             // Two-path strategy:
             //
@@ -323,13 +523,23 @@ public:
             //   If buildStaticRoutingImage() returns null (no topics configured,
             //   or BalancerError), leave routingImage_ null → Path B (pre-MD1
             //   cluster-leader fallback) serves the produce.
-            if (gateway_) {
+            const std::uint64_t routingVersion = metadataService_->routingVersion();
+            if (gateway_ && routingVersion != routingVersionBuilt_) {
+                routingVersionBuilt_ = routingVersion;
                 const auto& cmap = metadataService_->committedMap();
-                if (!cmap.empty()) {
+                // Coordinator partitions (re-review MEDIUM-B) are in the map
+                // too: "committed metadata ready" means a USER assignment.
+                // Cold (routing-version change only).
+                bool anyUser = false;
+                cmap.forEach([&](int32_t tid, int32_t, const rune::metadata::PartitionAssignment&) {
+                    anyUser = anyUser || tid >= 0;
+                });
+                if (anyUser) {
                     // Steady state: use the committed assignment map.
                     auto img = rune::metadata::RoutingImage::buildFromMap(
                         cmap, rune::metadata::gpidOf);
                     gateway_->setRoutingImageSnapshot(std::move(img));
+                    ++routingImagePublishes_;
                     // Signal that committed metadata is available.
                     // GR-4 (per-partition NotLeader defence) and GR-5 (ISR gate)
                     // only activate in steady state so that the bootstrap window
@@ -342,6 +552,7 @@ public:
                     auto img = metadataService_->buildStaticRoutingImage();
                     if (img) {
                         gateway_->setRoutingImageSnapshot(std::move(img));
+                        ++routingImagePublishes_;
                     }
                     // committedMetadataReady_ remains false → GR-4 / GR-5 suppressed.
                     // If null (no topics / BalancerError): leave routingImage_ null too.
@@ -400,14 +611,27 @@ public:
                 for (auto* replica : registry_->allReplicas()) {
                     if (replica && replica->topicId() < 0) {
                         work += replica->doWork(nowNs);
+                        checkReplicaStorage_(replica);
                     }
                 }
             }
         } else if (registry_) {
             // Pre-E1 path: iterate registry directly (all replicas).
             for (auto* replica : registry_->allReplicas()) {
-                if (replica) work += replica->doWork(nowNs);
+                if (replica) {
+                    work += replica->doWork(nowNs);
+                    checkReplicaStorage_(replica);
+                }
             }
+        }
+
+        // 5.9. Task 8a: service the schema DDL control plane (RULING-2 B).
+        //      Drains admin→control rings (createTopic requests + response egress)
+        //      and posts leadership role events to the admin thread.  Runs BEFORE
+        //      gateway_->doWork so any DDL response frame enqueued via
+        //      sendControlFrame is flushed on the egress this same cycle.
+        if (adminControl_) {
+            work += adminControl_->doWork(nowNs);
         }
 
         // 6. Gateway.
@@ -416,15 +640,15 @@ public:
         }
 
         // 6.5. CP-6: Drain pending cleaner swaps from LogCleanerAgent.
-        //      LogCleanerAgent runs on its own thread and enqueues compacted
-        //      segment bases via Log::enqueueCleanedSegment().  The actual
-        //      in-memory segment-map reload must happen on this single-writer
-        //      thread (not on the cleaner thread), so we drain them here.
+        //      LogCleanerAgent runs on its own thread and enqueues compaction
+        //      outputs via Log::enqueueCleanedGroup().  This single-writer thread
+        //      validates and installs them in memory (no filesystem op, one group
+        //      per partition per pass) — PartitionReplica::drainCleanerSwapsOnOwner.
         //
-        //      CP-9: Also drain retention deletions (Log::drainRetentionDeletes).
-        //      The cleaner enqueues bases of segments renamed to .deleted via
-        //      Log::enqueueDeletedSegment().  The segments_ erase MUST happen
-        //      here on the append thread (single-writer invariant).
+        //      CP-9: Also drain retention PROPOSALS (Log::enqueueDeletedSegment):
+        //      this thread validates each one (incarnation, not active, ends <=
+        //      HW) and only then renames its files to *.deleted and erases it
+        //      (PartitionReplica::drainRetentionDeletesOnOwner).
         //
         //      E1/E2: when workerPool_ is wired:
         //        - INTERNAL replicas: drained here (control thread owns them).
@@ -434,8 +658,8 @@ public:
             for (auto* replica : registry_->allReplicas()) {
                 // Only internal replicas — user replicas are drained by workers.
                 if (replica && replica->topicId() < 0 && replica->isDiskBacked()) {
-                    work += replica->log()->drainCleanerSwaps();
-                    work += replica->log()->drainRetentionDeletes();
+                    work += replica->drainCleanerSwapsOnOwner();
+                    work += replica->drainRetentionDeletesOnOwner();
                     work += replica->log()->drainStagingRenamesDone();
                 }
             }
@@ -445,8 +669,8 @@ public:
                 // drainCleanerSwaps/drainRetentionDeletes/drainStagingRenamesDone are
                 // disk-Log-only operations; replica->log() asserts isDiskBacked().
                 if (replica && replica->isDiskBacked()) {
-                    work += replica->log()->drainCleanerSwaps();
-                    work += replica->log()->drainRetentionDeletes();
+                    work += replica->drainCleanerSwapsOnOwner();
+                    work += replica->drainRetentionDeletesOnOwner();
                     // Append-p99 fix: apply completed staging→base renames the
                     // background (cleaner) thread performed, so logPath_ tracks the
                     // on-disk name (append-thread-only segments_ access).
@@ -455,7 +679,37 @@ public:
             }
         }
 
+        // F1: TEST-ONLY owner-thread hook.  One empty-ring poll per CONTROL cycle
+        // (never on the worker hot path); the dispatch body is out-of-line + cold.
+        work += drainOwnerThreadTestTasks_();
+
         return work;
+    }
+
+public:
+
+    // -----------------------------------------------------------------------
+    // F1: TEST-ONLY owner-thread hook — producer side (TEST thread).
+    //
+    // Offer a ring-carried OwnerThreadTestTask ref (see OwnerThreadTestTask.h)
+    // to the CONTROL thread over testTaskRing_ (F9a: a many-to-one ControlRing,
+    // so any number of test threads may offer with NO lock; single consumer =
+    // this control thread).  Returns false if the ring is full (caller fails
+    // loudly).
+    // -----------------------------------------------------------------------
+    /// Shutdown (the controller, AFTER the runtime's AgentRunner was joined):
+    /// skip every test task still queued so no test thread waits forever.
+    void skipQueuedOwnerThreadTestTasks() noexcept {
+        for (void* ref : pendingTestTasks_) skipOwnerThreadTestTask(ref);
+        pendingTestTasks_.clear();
+        (void)testTaskRing_.poll([](int32_t, std::int64_t a, std::int64_t) noexcept {
+            skipOwnerThreadTestTask(reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)));
+        });
+    }
+
+    [[nodiscard]] bool offerOwnerThreadTestTask(void* ref) noexcept {
+        return testTaskRing_.offer(kTestTaskMsgTypeId,
+                                   static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(ref)));
     }
 
     // -----------------------------------------------------------------------
@@ -519,7 +773,7 @@ public:
                 // Run size retention when retentionBytes is set (>= 0).
                 const int64_t retBytes = replica->retentionBytes();
                 if (retBytes >= 0) {
-                    const int deleted = log->deleteOldSegments(retBytes);
+                    const int deleted = log->deleteOldSegments(retBytes, replica->highWatermark());
                     work += deleted;
                 }
                 continue; // done for this replica — never compact Delete topics
@@ -537,7 +791,7 @@ public:
                 if (policy == rune::replication::CleanupPolicy::CompactDelete) {
                     const int64_t retBytes = replica->retentionBytes();
                     if (retBytes >= 0) {
-                        work += log->deleteOldSegments(retBytes);
+                        work += log->deleteOldSegments(retBytes, replica->highWatermark());
                     }
                 }
                 continue;
@@ -575,18 +829,26 @@ public:
                 } else {
                     // 7. Compact exactly this ONE sealed segment via bounded cleaner.
                     rune::storage::LogCleaner cleaner;
-                    cleaner.cleanSegment(*log,
+                    const bool cleaned = cleaner.cleanSegment(*log,
                                          /*segBase=*/segToCompact,
                                          /*segEnd=*/segEnd,
                                          /*globalDirtyStart=*/firstDirty,
                                          nowNs,
                                          replica->deleteRetentionMs());
 
-                    // 8. Advance the cleaned watermark.
-                    replica->setLastCleanOffset(segEnd);
-
-                    ++work;
-                    compactionRan = true;
+                    // 8. Advance the cleaned watermark ONLY over a segment that
+                    //    was actually compacted (E1d F4): a segment refused by
+                    //    the recovery-point gate (it ends above the persisted R)
+                    //    stays dirty and is retried once its checkpoint is
+                    //    durable.  An EMPTY sealed segment (nothing to rewrite:
+                    //    cleanSegment false, gate open) is passed over — never a
+                    //    watermark wedged on it forever.
+                    if (cleaned || (log->compactionAllowedThrough(segEnd) &&
+                                    log->segmentNextOffsetAt(segToCompact) == segToCompact)) {
+                        replica->setLastCleanOffset(segEnd);
+                        ++work;
+                        compactionRan = true;
+                    }
                 }
             }
 
@@ -597,7 +859,7 @@ public:
             if (policy == rune::replication::CleanupPolicy::CompactDelete) {
                 const int64_t retBytes = replica->retentionBytes();
                 if (retBytes >= 0) {
-                    const int deleted = log->deleteOldSegments(retBytes);
+                    const int deleted = log->deleteOldSegments(retBytes, replica->highWatermark());
                     work += deleted;
                 }
             }
@@ -608,7 +870,98 @@ public:
     }
 
 private:
-    rune::consensus::Agent&                            consensus_;
+    // -----------------------------------------------------------------------
+    // F1: TEST-ONLY owner-thread hook — consumer side (THIS control thread).
+    //
+    // For each ring-carried task ref, resolve the replica in THIS thread's
+    // ReplicaRegistry (the registry is control-thread-owned) and route to the
+    // replica's TRUE owner, mirroring the ownership split in doWork above:
+    //   - ControlThread target, internal partition (topicId < 0), or no
+    //     WorkerPool (pre-E1: control drives every replica)  → run inline HERE.
+    //   - user partition with a WorkerPool → WorkerOp::TestTask over the
+    //     EXISTING control→worker ingress ring (this thread is its sole
+    //     producer); the owning worker runs it in its duty cycle.  Ring full →
+    //     hold in pendingTestTasks_ (FIFO) and retry next cycle; never drop.
+    // Missing replica → run inline with nullptr (the task reports the error).
+    // -----------------------------------------------------------------------
+    int drainOwnerThreadTestTasks_() {
+        int work = 0;
+        if (!pendingTestTasks_.empty()) work += retryPendingOwnerThreadTestTasks_();
+        work += testTaskRing_.poll(
+            [this](int32_t /*typeId*/, std::int64_t a, std::int64_t /*b*/) {
+                void* ref = reinterpret_cast<void*>(static_cast<std::uintptr_t>(a));
+                // Keep FIFO behind held ones; hold (never drop) on a full ingress.
+                if (!pendingTestTasks_.empty() || !dispatchOwnerThreadTestTask_(ref)) {
+                    pendingTestTasks_.push_back(ref);
+                }
+            }, 16);
+        return work;
+    }
+
+    [[gnu::cold]] [[gnu::noinline]] int retryPendingOwnerThreadTestTasks_() {
+        std::size_t i = 0;
+        for (; i < pendingTestTasks_.size(); ++i) {
+            if (!dispatchOwnerThreadTestTask_(pendingTestTasks_[i])) break;
+        }
+        pendingTestTasks_.erase(pendingTestTasks_.begin(),
+                                pendingTestTasks_.begin() + static_cast<std::ptrdiff_t>(i));
+        return static_cast<int>(i);
+    }
+
+    // Returns false only when the owning worker's ingress ring is full (the ref
+    // is then still owned by the caller, who holds it for retry).
+    [[gnu::cold]] [[gnu::noinline]] bool dispatchOwnerThreadTestTask_(void* ref) {
+        const OwnerThreadTestTask& task = ownerThreadTestTaskOf(ref);
+        if (task.target() == OwnerThreadTestTask::Target::ControlThread) {
+            runOwnerThreadTestTask(ref, nullptr);
+            return true;
+        }
+        const int32_t tid = task.topicId();
+        const int32_t pid = task.partition();
+        rune::replication::PartitionReplica* replica =
+            registry_ ? registry_->lookup(tid, pid) : nullptr;
+        if (workerPool_ && tid >= 0 && replica) {
+            WorkerOp op;
+            op.type      = WorkerOp::Type::TestTask;
+            op.topicId   = tid;
+            op.partition = pid;
+            op.replica   = replica;
+            op.egressPub = ref;   // opaque task ref (WorkerOp::TestTask contract)
+            return static_cast<bool>(workerPool_->tryEnqueueOp(tid, pid, std::move(op)));
+        }
+        runOwnerThreadTestTask(ref, replica);   // control-thread-owned (or missing)
+        return true;
+    }
+
+    static constexpr int32_t kTestTaskMsgTypeId = 0x7E57;  // F1 test-task ring msg
+    // test thread(s) → control thread (many-to-one, F9a: replaces the SPSC ring
+    // + BrokerNode's test-side mutex).  Small: tests enqueue one task at a time.
+    rune::consensus::ControlRing<4096>                 testTaskRing_;
+    // Control-thread-only: refs whose owning worker's ingress was full.
+    std::vector<void*>                                 pendingTestTasks_;
+
+    // Concrete consensus agent + construction-time tag (Task 11 fix 1).
+    struct ConsensusRef {
+        ConsensusKind                    kind    = ConsensusKind::Generic;
+        rune::consensus::ConsensusAgent* single  = nullptr;
+        NodeConsensusAgent*              multi   = nullptr;
+        rune::consensus::Agent*          generic = nullptr;
+        static ConsensusRef of(rune::consensus::Agent& a) noexcept {
+            ConsensusRef r;
+            if (auto* m = dynamic_cast<NodeConsensusAgent*>(&a)) { r.kind = ConsensusKind::Multi; r.multi = m; }
+            else if (auto* c = dynamic_cast<rune::consensus::ConsensusAgent*>(&a)) { r.kind = ConsensusKind::Single; r.single = c; }
+            else r.generic = &a;
+            return r;
+        }
+        int doWork(int64_t nowNs) const {
+            if (kind == ConsensusKind::Multi) [[likely]] return multi->doWork(nowNs);    // final → direct
+            if (kind == ConsensusKind::Single) return single->doWork(nowNs);             // final → direct
+            return generic->doWork(nowNs);                                               // test doubles only
+        }
+    };
+    static_assert(std::is_final_v<NodeConsensusAgent> && std::is_final_v<rune::consensus::ConsensusAgent>,
+                  "the runtime's consensus call must be devirtualised (final classes)");
+    ConsensusRef                                       consensus_;
     rune::consensus::Election*                         election_;   // non-owning; null when no bridge
     // Allocation-free eligible-set tracking for bidirectional leadership rebalance.
     // Fixed stack buffers reused every duty cycle (no per-cycle heap); a heap vector
@@ -633,6 +986,93 @@ private:
     TransactionCoordinationService*                    txnService_;      // non-owning; null-safe (TX-3)
     MetadataService*                                   metadataService_; // non-owning; null-safe (MD1)
     WorkerPool*                                        workerPool_;      // non-owning; null = pre-E1 path
+    // Task 8a: admin control-plane servicing hook (RULING-2 B). Null = no admin plane.
+    AdminControlPlane*                                 adminControl_ = nullptr;
+    int32_t                                            selfId_       = -1;
+    // The same predicate as BrokerNode::isLeader() (one shared function).
+    [[nodiscard]] bool isLocalLeader_() const noexcept {
+        return isLocalLeader(consensus_.kind == ConsensusKind::Multi ? consensus_.multi : nullptr,
+                             election_, selfId_);
+    }
+    // RUNE_CTRL_LOG temp diagnostic — read once at construction (not per scan).
+    const bool                                         ctrlLog_ = ::getenv("RUNE_CTRL_LOG") != nullptr;
+    LeaderObserver*                                    leaderObserver_ = nullptr;  // F9a, non-owning
+    ControlledShutdown                                 controlledShutdown_;        // control thread (+ rings)
+    StorageFailureHook                                 storageFailureHook_;
+    std::function<void(const std::string&)>            fatalHook_;
+
+    // Task 10 round 4: off-thread replica-view publication (control-thread
+    // side) — the cleaner's and (hotpath-A) the segment provisioner's.
+    struct ViewPub {
+        std::unique_ptr<CleanerViewChannel>               channel;
+        std::vector<rune::replication::PartitionReplica*> snapshot;   // generation being published
+        std::uint64_t publishingGen = static_cast<std::uint64_t>(-1);
+        std::size_t   nextIndex     = 0;
+        bool          published     = true;
+        std::uint64_t ackedGen      = 0;
+        CleanerViewChannel* enable() {
+            if (!channel) channel = std::make_unique<CleanerViewChannel>();
+            return channel.get();
+        }
+    };
+    static constexpr std::size_t kCleanerView = 0, kProvisionerView = 1;
+    std::array<ViewPub, 2>                             views_;
+    std::vector<uint8_t>                               viewScratch_;
+    int publishView_(ViewPub& v) {
+        if (!v.channel) return 0;
+        int work = v.channel->ack.drain([&v](int32_t, aeron::concurrent::AtomicBuffer& buf,
+                                             aeron::util::index_t off, aeron::util::index_t) {
+            std::uint64_t g;
+            std::memcpy(&g, buf.buffer() + off, 8);
+            if (g > v.ackedGen) v.ackedGen = g;
+        }, 16);
+        const std::uint64_t gen = registry_->generation();
+        if (gen != v.publishingGen) {   // cold: on registry change only
+            v.snapshot      = registry_->allReplicas();
+            v.publishingGen = gen;
+            v.nextIndex     = 0;
+            v.published     = false;
+        }
+        while (!v.published) {
+            const std::size_t total = v.snapshot.size();
+            const std::size_t count = std::min<std::size_t>(CleanerViewChannel::kPtrsPerChunk,
+                                                            total - v.nextIndex);
+            viewScratch_.resize(CleanerViewChannel::kHeaderBytes + 8 * count);
+            uint8_t* p = viewScratch_.data();
+            const uint32_t t32 = static_cast<uint32_t>(total), i32 = static_cast<uint32_t>(v.nextIndex),
+                           c32 = static_cast<uint32_t>(count), pad = 0;
+            std::memcpy(p, &gen, 8); std::memcpy(p + 8, &t32, 4); std::memcpy(p + 12, &i32, 4);
+            std::memcpy(p + 16, &c32, 4); std::memcpy(p + 20, &pad, 4);
+            for (std::size_t i = 0; i < count; ++i) {
+                const std::uint64_t ptr = reinterpret_cast<std::uintptr_t>(v.snapshot[v.nextIndex + i]);
+                std::memcpy(p + CleanerViewChannel::kHeaderBytes + 8 * i, &ptr, 8);
+            }
+            if (!v.channel->view.write(p, viewScratch_.size(), CleanerViewChannel::kViewMsgType))
+                break;   // ring full: resumed next cycle (time-independent)
+            v.nextIndex += count;
+            ++work;
+            if (v.nextIndex >= total) v.published = true;
+        }
+        return work;
+    }
+    rune::consensus::SlowTick                          failoverTick_;
+    std::uint64_t                                      cycles_                = 0;
+    std::uint64_t                                      routingImagePublishes_ = 0;
+    // routingVersion() of the image last published; UINT64_MAX = none yet
+    // (routingVersion() starts at 0, so the first cycle always builds).
+    std::uint64_t                                      routingVersionBuilt_   = UINT64_MAX;
+    bool                                               fatalReported_ = false;
+    bool                                               storageFailureReported_ = false;
+    void checkReplicaStorage_(rune::replication::PartitionReplica* replica) {
+        if (!replica->isDiskBacked()) return;
+        rune::storage::Log* log = replica->log();
+        if (!log->storageFailed()) [[likely]] return;
+        if (storageFailureReported_) return;
+        storageFailureReported_ = true;
+        spdlog::critical("NodeRuntimeAgent: fsync FAILED on {} (errno={}) — halting the broker",
+                         log->dir(), log->storageErrno());
+        if (storageFailureHook_) storageFailureHook_(log->dir(), log->storageErrno());
+    }
 };
 
 } // namespace rune::node

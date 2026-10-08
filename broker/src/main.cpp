@@ -5,15 +5,16 @@
 // handles SIGINT/SIGTERM for clean shutdown.
 
 #include <rune/node/BrokerNode.h>
+#include <rune/node/FdBudget.h>
 #include <rune/node/NodeConfig.h>
+#include <rune/node/SignalControl.h>
+#include <rune/node/ThreadAffinity.h>
 
 #include <rune_fr/FlightRecorder.h>
 
 #include <spdlog/spdlog.h>
 
-#include <atomic>
 #include <chrono>
-#include <csignal>
 #include <cstdlib>
 #include <cstdint>
 #include <fstream>
@@ -25,17 +26,46 @@
 using namespace std::chrono_literals;
 
 // ---------------------------------------------------------------------------
-// Signal handling (global flag; safe from signal context per POSIX)
+// Control events (F9a: no globals, no atomics, no async signal handlers).
+//
+// SIGINT/SIGTERM/SIGUSR1 are BLOCKED in every thread (masked first thing in
+// main, inherited by every thread created afterwards); a dedicated SignalThread
+// sigwait()s them and posts Stop / FrDump events on `events` (a ControlRing).
+// The broker's fail-stop halt (runtime thread) posts Halt{exitCode} on the same
+// ring.  main() is the ring's one consumer.
 // ---------------------------------------------------------------------------
-static std::atomic<bool> g_stop{false};
-static std::atomic<bool> g_frDump{false};   // SIGUSR1 → dump flight-recorder report mid-run
 
-static void sighandler(int /*sig*/) noexcept {
-    g_stop.store(true, std::memory_order_release);
+// fsyncgate fail-stop: BrokerNode calls this ONCE (runtime thread, or main
+// during start()) when a log's fsync failed.  The main loop stops the node
+// through the normal stop path, then exits with the code (74, EX_IOERR).
+static void haltHandler(void* ctx, int exitCode) noexcept {
+    auto* events = static_cast<rune::node::ControlEventRing*>(ctx);
+    if (!rune::node::postHalt(*events, exitCode)) {
+        spdlog::critical("rune-broker: control ring full — halt {} could not be posted; aborting",
+                         exitCode);
+        std::_Exit(exitCode);   // fail-stop must never be lost
+    }
 }
 
-static void frdumphandler(int /*sig*/) noexcept {
-    g_frDump.store(true, std::memory_order_release);
+// main-thread state fed by drainControlEvents (owned by main).
+struct ControlState {
+    bool stop     = false;
+    int  exitCode = 0;   // non-zero: halt requested by the broker (fail-stop)
+    int  frDumps  = 0;   // pending SIGUSR1 report requests
+};
+
+static void drainControlEvents(rune::node::ControlEventRing& events, ControlState& st) {
+    events.poll([&st](std::int32_t type, std::int64_t a, std::int64_t) {
+        switch (type) {
+            case rune::node::kStopEvent:   st.stop = true; break;
+            case rune::node::kFrDumpEvent: ++st.frDumps; break;
+            case rune::node::kHaltEvent:
+                if (st.exitCode == 0) st.exitCode = static_cast<int>(a);
+                st.stop = true;
+                break;
+            default: break;
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -85,10 +115,21 @@ static void frReport(const std::string& tag) {
 // main
 // ---------------------------------------------------------------------------
 int main() {
-    // Install signal handlers before anything else.
-    std::signal(SIGINT,  sighandler);
-    std::signal(SIGTERM, sighandler);
-    std::signal(SIGUSR1, frdumphandler);   // dump flight-recorder report without stopping
+    // F9a: block the control signals BEFORE any thread exists (every thread
+    // inherits the mask), then hand them to the one sigwait thread.
+    //
+    // WARNING: blockControlSignals() MUST stay the first thing main() does.  Any
+    // thread created BEFORE it (or any thread that later unblocks SIGINT/SIGTERM/
+    // SIGUSR1/SIGUSR2) can receive a process-directed signal with the default
+    // action — killing the broker without a clean stop — or swallow it, so the
+    // signal thread never sees it and shutdown breaks.
+    if (const int rc = rune::node::blockControlSignals(); rc != 0) {
+        std::cerr << "rune-broker: pthread_sigmask failed: " << rc << "\n";
+        return 2;
+    }
+    rune::node::ControlEventRing events;          // → main (sole consumer)
+    rune::node::SignalThread     signalThread{events};
+    ControlState                 ctl;
 
     // TEMP DEBUG (CB-5 diagnosis): honor RUNE_LOG_LEVEL=debug/trace so the
     // gateway's redirect/accept decisions are visible during E2E debugging.
@@ -111,23 +152,45 @@ int main() {
                      self.host, self.consensusPort);
     }
 
+    // FD-1: raise the soft open-file limit to the hard limit (logged), and
+    // refuse to start when the hard limit cannot hold the configured
+    // partitions (a mid-run EMFILE would fail-stop logs and halt the broker).
+    {
+        std::string fdErr;
+        if (!rune::node::applyFdLimitAtStartup(*cfg, fdErr)) {
+            spdlog::error("rune-broker: {}", fdErr);
+            std::cerr << "rune-broker: " << fdErr << "\n";
+            return 2;
+        }
+    }
+
     // Flight recorder: size per-thread rings + arm recording BEFORE start()
     // spawns the duty-cycle/worker threads that register their rings.
     frConfigure();
 
     // Construct and start the broker node.
     rune::node::BrokerNode node{std::move(*cfg)};
+    node.setHaltHandler(&haltHandler, &events);
     try {
         node.start();
     } catch (const std::exception& ex) {
         spdlog::error("rune-broker: failed to start: {}", ex.what());
-        return 1;
+        // A storage failure found during startup (failed log recovery) exits
+        // through the halt path's code (74, EX_IOERR).
+        drainControlEvents(events, ctl);
+        return ctl.exitCode != 0 ? ctl.exitCode : 1;
+    }
+
+    // D2: the main + signal threads predate start()'s non-worker pin — move them off the worker cores too.
+    if (const auto& cpus = node.nonWorkerCpus(); !cpus.empty()) {
+        (void)rune::node::pinCurrentThreadToCpus(cpus);
+        (void)rune::node::pinThreadToCpus(signalThread.nativeHandle(), cpus);
     }
 
     // For a 1-node cluster, await self-election.
     if (node.awaitLeader(5s)) {
-        spdlog::info("rune-broker: node {} is LEADER term {}",
-                     node.leaderId(), node.leadershipTermId());
+        const auto v = node.leaderSnapshot();   // ONE snapshot: id + term never torn
+        spdlog::info("rune-broker: node {} is LEADER term {}", v.leaderId, v.term);
     } else {
         spdlog::warn("rune-broker: leadership not reached within 5 s — continuing");
     }
@@ -145,9 +208,14 @@ int main() {
     spdlog::info("rune-broker: running — send SIGINT or SIGTERM to stop");
     rune::consensus::NodeId lastObservedLeader = node.leaderId();
     unsigned frDumpSeq = 0;
-    while (!g_stop.load(std::memory_order_acquire)) {
+    for (;;) {
+        drainControlEvents(events, ctl);
+        if (ctl.stop) break;
         std::this_thread::sleep_for(100ms);
-        if (g_frDump.exchange(false, std::memory_order_acq_rel)) {
+        drainControlEvents(events, ctl);
+        if (ctl.stop) break;
+        if (ctl.frDumps > 0) {
+            ctl.frDumps = 0;
             frReport("run" + std::to_string(frDumpSeq++));
         }
         // Publish the machine-readable leadership signal (Aeron node-role +
@@ -155,22 +223,35 @@ int main() {
         // rune_role instead of scraping the "is LEADER" log lines below — the
         // counters are authoritative and log-level independent.
         node.publishRole();
-        const rune::consensus::NodeId cur = node.leaderId();
+        const auto v = node.leaderSnapshot();   // ONE snapshot: id + term never torn
+        const rune::consensus::NodeId cur = v.leaderId;
         if (cur != lastObservedLeader) {
             lastObservedLeader = cur;
             if (cur >= 0) {
                 spdlog::info("rune-broker: leadership change — node {} is LEADER term {}",
-                             cur, node.leadershipTermId());
+                             cur, v.term);
             } else {
                 spdlog::info("rune-broker: leadership change — no leader (election in progress)");
             }
         }
     }
 
-    spdlog::info("rune-broker: shutdown signal received — stopping");
+    const int exitCode = ctl.exitCode;
+    if (exitCode != 0) {
+        // Fail-stop: never a hand-off (the storage is suspect) — stop at once.
+        spdlog::critical("rune-broker: HALTING on storage failure — stopping (exit {})", exitCode);
+    } else {
+        spdlog::info("rune-broker: shutdown signal received — stopping");
+        // Controlled shutdown (Kafka parity): hand partition leadership (and,
+        // on the controller, the consensus) to in-sync peers BEFORE stopping,
+        // so no broker keeps sending clients to this node.  Bounded by
+        // RUNE_CONTROLLED_SHUTDOWN_MS (0 = off); on expiry it stops as before.
+        if (const auto budget = node.controlledShutdownBudget(); budget.count() > 0)
+            (void)node.controlledShutdown(budget);
+    }
     node.stop();
     // Threads are joined + quiesced now → drain rings and write the final report.
     frReport("shutdown");
     spdlog::info("rune-broker: stopped");
-    return 0;
+    return exitCode;
 }

@@ -17,11 +17,11 @@ target_link_libraries(rune_transaction PUBLIC rune_storage rune_coordination)
 
 # ---------------------------------------------------------------------------
 # Exactly-once EOS end-to-end integration tests (P5-5).
-# Gated behind BUILD_TRANSACTION_INTEGRATION_TESTING (OFF by default) to
+# Gated behind BUILD_TRANSACTION_INTEGRATION_TESTING (ON by default — it rotted while OFF) to
 # mirror the replication / coordination integration target pattern.
 # ---------------------------------------------------------------------------
 option(BUILD_TRANSACTION_INTEGRATION_TESTING
-    "Build exactly-once EOS end-to-end integration tests (P5-5)" OFF)
+    "Build exactly-once EOS end-to-end integration tests (P5-5)" ON)   # ON: ms-fast; OFF let it rot (14 stale failures, 2026-10-03)
 if(BUILD_TRANSACTION_INTEGRATION_TESTING)
     if(NOT BUILD_TESTING)
         find_package(GTest REQUIRED)
@@ -54,7 +54,8 @@ if(BUILD_TESTING)
         tests/transaction/ReadCommittedViewTest.cpp
         tests/transaction/ControlBatchBeFormatTest.cpp
         tests/transaction/ReplicatedTxnStateStoreTest.cpp
-        tests/transaction/ProducerIdWatermarkRecoveryTest.cpp)
+        tests/transaction/ProducerIdWatermarkRecoveryTest.cpp
+        tests/transaction/F15TxnRegressionTest.cpp)
     target_link_libraries(rune_transaction_tests PRIVATE
         rune_transaction
         rune_replication

@@ -21,8 +21,12 @@ target_include_directories(rune_gateway PUBLIC
 # (raw path) to avoid a circular target dependency (rune_node → PUBLIC rune_gateway → rune_node).
 # rune_replication is linked PUBLIC so ReplicaRegistry.h (which includes PartitionReplica.h)
 # compiles correctly and consumers of rune_gateway also get rune_replication headers.
-target_link_libraries(rune_gateway PUBLIC rune_storage rune_replication rune_transaction rune_metadata rune_consensus)
+target_link_libraries(rune_gateway PUBLIC rune_storage rune_replication rune_transaction rune_metadata rune_consensus rune_aeron_util)
 target_include_directories(rune_gateway PUBLIC ${RUNE_NODE_INCLUDE})
+# rune_codec PUBLIC: Worker.h (included transitively via WorkerPool.h) now
+# includes rune/codec/Validator.h for the Task 7 per-worker schema validation
+# hook.  Consumers that include Worker.h via RUNE_NODE_INCLUDE need rune_codec headers.
+target_link_libraries(rune_gateway PUBLIC rune_codec)
 
 if(aeron_FOUND)
     target_link_libraries(rune_gateway PUBLIC aeron::aeron)
@@ -58,6 +62,17 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_gateway_topic_registry_tests)
 
     # -------------------------------------------------------------------------
+    # TopicRegistry runtime tests (Task 5) — createTopic + regression guards.
+    # No Aeron, real filesystem + rune_storage.
+    # -------------------------------------------------------------------------
+    add_executable(rune_gateway_topic_registry_runtime_tests
+        tests/gateway/TopicRegistryRuntimeTest.cpp)
+    target_link_libraries(rune_gateway_topic_registry_runtime_tests PRIVATE
+        rune_gateway
+        GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_topic_registry_runtime_tests)
+
+    # -------------------------------------------------------------------------
     # G0.1: ClientGateway egress retry queue unit tests — no Aeron, no driver.
     # Uses the test-only makeForTest() factory + FakePublication seam.
     # -------------------------------------------------------------------------
@@ -91,6 +106,21 @@ if(BUILD_TESTING)
         spdlog::spdlog
         GTest::gtest_main)
     gtest_discover_tests(rune_gateway_metadata_response_tests)
+
+    # Task 13 (spec §3.4): post-ack notifications + session close on every worker.
+    add_executable(rune_gateway_shard_notify_tests tests/gateway/ShardNotifyTest.cpp)
+    target_link_libraries(rune_gateway_shard_notify_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_shard_notify_tests)
+
+    # 2026-10-05: record-egress publication lifetime (retire-on-ack) — no Aeron.
+    add_executable(rune_gateway_record_egress_lifetime_tests tests/gateway/RecordEgressLifetimeTest.cpp)
+    target_link_libraries(rune_gateway_record_egress_lifetime_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_record_egress_lifetime_tests)
+
+    # 2026-10-05: (session, correlationId) = ONE subscription (duplicate Subscribe dedupe) — no Aeron.
+    add_executable(rune_gateway_subscribe_dedupe_tests tests/gateway/SubscribeDedupeTest.cpp)
+    target_link_libraries(rune_gateway_subscribe_dedupe_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_subscribe_dedupe_tests)
 
     # -------------------------------------------------------------------------
     # ClientGateway integration tests — embedded Aeron driver + ipc loopback.
@@ -158,6 +188,7 @@ if(BUILD_TESTING)
                 tests/integration/GatewaySubscribeTest.cpp)
             target_link_libraries(rune_gateway_subscribe_tests PRIVATE
                 rune_gateway
+                rune_node   # F19: worker-return push path (WorkerPool)
                 aeron::aeron
                 GTest::gtest_main)
             gtest_discover_tests(rune_gateway_subscribe_tests

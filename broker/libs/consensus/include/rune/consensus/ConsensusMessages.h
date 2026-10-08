@@ -41,6 +41,8 @@ enum class ConsensusTemplateId : uint16_t {
     CommitPosition     = 55,
     CatchupPosition    = 56,
     StopCatchup        = 57,
+    CandidacyState     = 58,   // re-review round 3 CRITICAL-R3 (knowledge exchange)
+    StandDown          = 59,   // controlled shutdown: the leader resigns (Rune extension)
     TerminationPosition = 75,
     TerminationAck     = 76,
 };
@@ -679,6 +681,99 @@ struct TerminationAckMsg {
         m.leadershipTermId = detail::read_le<int64_t>(p +  0);
         m.logPosition      = detail::read_le<int64_t>(p +  8);
         m.memberId         = detail::read_le<int32_t>(p + 16);
+        return m;
+    }
+};
+
+
+// ===========================================================================
+// CandidacyState  (templateId = 58) — re-review 2026-10-04 round 3
+// CRITICAL-R3: the sender's newest durable __cluster_metadata ISR state,
+// exchanged while canvassing / voting (see CandidacyState.h).
+//    blockLength = 88
+//      leaderEpoch : int64      @ +0
+//      version     : int64      @ +8
+//      fromMember  : int32      @ +16
+//      count       : int32      @ +20
+//      members     : int32[16]  @ +24
+// ===========================================================================
+struct CandidacyStateMsg {
+    int64_t leaderEpoch;
+    int64_t version;
+    int32_t fromMember;
+    int32_t count;
+    int32_t members[16];
+
+    static constexpr uint16_t TEMPLATE_ID  = 58;
+    static constexpr uint16_t BLOCK_LENGTH = 88;
+    static constexpr std::size_t TOTAL_SIZE =
+        ConsensusMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+
+    static std::size_t encode(uint8_t* buf, std::size_t offset, int64_t leaderEpoch_,
+                              int64_t version_, int32_t fromMember_, int32_t count_,
+                              const int32_t* members_) noexcept
+    {
+        std::size_t pos = offset;
+        pos += ConsensusMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
+        uint8_t* p = buf + pos;
+        detail::write_le<int64_t>(p +  0, leaderEpoch_);
+        detail::write_le<int64_t>(p +  8, version_);
+        detail::write_le<int32_t>(p + 16, fromMember_);
+        detail::write_le<int32_t>(p + 20, count_);
+        for (int i = 0; i < 16; ++i)
+            detail::write_le<int32_t>(p + 24 + 4 * i, i < count_ ? members_[i] : -1);
+        return TOTAL_SIZE;
+    }
+
+    static CandidacyStateMsg decode(const uint8_t* buf, std::size_t offset) noexcept
+    {
+        const uint8_t* p = buf + offset + ConsensusMessageHeader::ENCODED_SIZE;
+        CandidacyStateMsg m{};
+        m.leaderEpoch = detail::read_le<int64_t>(p +  0);
+        m.version     = detail::read_le<int64_t>(p +  8);
+        m.fromMember  = detail::read_le<int32_t>(p + 16);
+        m.count       = detail::read_le<int32_t>(p + 20);
+        for (int i = 0; i < 16; ++i) m.members[i] = detail::read_le<int32_t>(p + 24 + 4 * i);
+        return m;
+    }
+};
+
+// ===========================================================================
+// StandDown  (templateId = 59) — controlled shutdown (2026-10-05).  The leader
+// of `leadershipTermId` resigns before it exits: a follower of it starts an
+// election at once, skipping it (Aeron gracefulClosedLeaderId).  A Rune
+// extension (no Aeron equivalent: Aeron closes the whole cluster); an older
+// node ignores the unknown template and times the leader out as before.
+//    blockLength = 12
+//      leadershipTermId : int64   @ +0
+//      leaderMemberId   : int32   @ +8
+// ===========================================================================
+struct StandDownMsg {
+    int64_t leadershipTermId;
+    int32_t leaderMemberId;
+
+    static constexpr uint16_t TEMPLATE_ID  = 59;
+    static constexpr uint16_t BLOCK_LENGTH = 12;
+    static constexpr std::size_t TOTAL_SIZE =
+        ConsensusMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+
+    static std::size_t encode(uint8_t* buf, std::size_t offset, int64_t leadershipTermId_,
+                              int32_t leaderMemberId_) noexcept
+    {
+        std::size_t pos = offset;
+        pos += ConsensusMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
+        uint8_t* p = buf + pos;
+        detail::write_le<int64_t>(p + 0, leadershipTermId_);
+        detail::write_le<int32_t>(p + 8, leaderMemberId_);
+        return TOTAL_SIZE;
+    }
+
+    static StandDownMsg decode(const uint8_t* buf, std::size_t offset) noexcept
+    {
+        const uint8_t* p = buf + offset + ConsensusMessageHeader::ENCODED_SIZE;
+        StandDownMsg m{};
+        m.leadershipTermId = detail::read_le<int64_t>(p + 0);
+        m.leaderMemberId   = detail::read_le<int32_t>(p + 8);
         return m;
     }
 };

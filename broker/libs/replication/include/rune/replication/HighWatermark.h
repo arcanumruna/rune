@@ -6,11 +6,10 @@
 // C++23, no allocation on the hot path (follower LEO map uses std::unordered_map;
 // HW computation iterates ISR — typically 3–5 members).
 //
-// ## Model (spec §4 — majority-in-memory high-watermark)
+// ## Model (Kafka — user decision 2026-10-03: HW = min LEO over the ISR)
 //
-// A write is "durable" when a MAJORITY of the ISR hold the batch in memory.
-// The high-watermark (HW) is therefore the highest offset that a majority of
-// ISR members have confirmed. Concretely:
+// A record is committed when EVERY member of the ISR holds it.  The
+// high-watermark (HW) is therefore the minimum log end offset over the ISR:
 //
 //   1. Collect the logEndOffset (LEO) of each ISR member:
 //        – Leader: its own logEndOffset (always up-to-date; updated via
@@ -18,20 +17,16 @@
 //        – Follower: the fetchOffset MOST RECENTLY reported in its FetchRequest
 //          (updated via updateFollowerFetchOffset()).  Unknown followers
 //          default to 0 (conservative: they haven't confirmed anything).
-//   2. Sort LEOs descending.
-//   3. majority = |ISR| / 2 + 1  (strict majority).
-//   4. HW = LEOs[majority - 1]  (the majority-th highest = the value that
-//      at least `majority` members have reached or exceeded).
-//   5. HW is monotonic: store max(prevHW, computed).  Once advanced, it
-//      never regresses even if a follower truncates and re-fetches from a
-//      lower offset — the per-follower LEO tracks the LATEST reported value
-//      (may decrease on truncation), but the global HW floor prevHw_ never
-//      goes below the highest committed point.
+//   2. HW = min over those LEOs.
+//   3. HW is monotonic (Majority mode): store max(prevHW, computed).
 //
-// This differs from Kafka's ISR-min HW (which is all-ISR minimum, not
-// majority). Our spec §4 requires majority-ack for durability, consistent
-// with electing the most-up-to-date ISR member on failover (§8).
-//
+// Every ISR member then holds every committed record, so any ISR member the
+// controller elects is a complete leader (no completeness gate).  A lagging
+// member holds the HW back until the leader shrinks it out of the ISR
+// (replicaLagMaxMs) — the accepted Kafka cost.  The caller passes the MAXIMAL
+// ISR (committed ∪ proposed, KIP-497/841).  Majority vs AllInSync differ only
+// in the min-ISR they require (and AllInSync's non-monotonic floor below).
+
 // ## ISR and leader identity
 //
 // The ISR (in-sync replica set) is a list of NodeIds managed externally by
@@ -45,7 +40,7 @@
 // updateFollowerFetchOffset() tracks the LATEST reported fetch offset per
 // follower — it is NOT monotonic per-follower.  When a follower truncates and
 // re-fetches from a lower offset, the leader must use the lower value so HW
-// is recomputed from what a majority CURRENTLY holds, not from a stale
+// is recomputed from what the ISR CURRENTLY holds, not from a stale
 // pre-truncation value.  The GLOBAL HW floor (prevHw_) remains monotonic:
 // once HW reaches X it never drops below X, preserving the committed prefix
 // guarantee.
@@ -67,9 +62,9 @@
 
 namespace rune::replication {
 
-/// Per-topic durability quorum rule.
-///   Majority  — HW advances when a MAJORITY of the ISR holds the batch (spec §4 default).
-///   AllInSync — HW advances only when EVERY ISR member holds the batch (full-ISR min).
+/// Per-topic durability rule.  The HW is the min LEO over the ISR in both modes.
+///   Majority  — min-ISR = the configured minIsr; monotonic HW (default).
+///   AllInSync — min-ISR = RF; the HW tracks the ISR minimum (may retract).
 enum class DurabilityMode : uint8_t { Majority = 0, AllInSync = 1 };
 
 /// Pure leader-side state for computing the partition high-watermark.
@@ -90,9 +85,15 @@ public:
     /// The ISR is the authoritative membership list for HW computation.
     /// Eagerly recomputes and advances the monotonic HW floor so that
     /// highWatermark() is never stale after a membership change.
-    void setIsr(std::vector<NodeId> isr) {
-        isr_ = std::move(isr);
+    /// const& copies into the existing capacity (no allocation once sized —
+    /// the periodic ISR check re-syncs it).
+    void setIsr(const std::vector<NodeId>& isr) {
+        isr_.assign(isr.begin(), isr.end());
         recomputeHw(); // S1: recompute on every mutator
+    }
+    void setIsr(std::vector<NodeId>&& isr) {
+        isr_ = std::move(isr);
+        recomputeHw();
     }
 
     // -----------------------------------------------------------------------
@@ -130,8 +131,8 @@ public:
     }
 
     /// Set the durability quorum rule for this leader state.
-    /// Majority (default) — HW = majority-th highest LEO.
-    /// AllInSync — HW = full-ISR minimum LEO.
+    /// Both modes: HW = min LEO over the ISR (Majority: monotonic floor;
+    /// AllInSync: tracks the minimum, floored by setHighWatermarkFloor).
     ///
     /// Changing the mode resets the monotonic HW floor and recomputes from the
     /// current ISR LEOs under the new rule.  This is safe because setDurabilityMode
@@ -142,6 +143,16 @@ public:
         durability_ = m;
         prevHw_  = 0;  // reset floor so the new rule computes from scratch
         hwFloor_ = 0;  // reset hard floor (will be re-seeded by setHighWatermarkFloor)
+        recomputeHw();
+    }
+
+    /// Kafka Partition.makeLeader → resetReplicaState: a NEW leadership forgets
+    /// every follower position learned in an earlier one (unknown = 0 — a
+    /// member counts only once it fetched in this leadership; until then the HW
+    /// sits at the floor seeded by setHighWatermarkFloor).  In place: the map
+    /// keeps its nodes (no reallocation on the next fetch).
+    void resetFollowers() noexcept {
+        for (auto& kv : followerLeo_) kv.second = 0;
         recomputeHw();
     }
 
@@ -165,7 +176,7 @@ public:
     // Queries
     // -----------------------------------------------------------------------
 
-    /// Return the majority high-watermark (spec §4).
+    /// Return the high-watermark (min LEO over the ISR, monotonic floor).
     ///
     /// Returns the monotonic floor prevHw_, which is eagerly updated by every
     /// mutator (setLeaderLogEndOffset, setIsr, updateFollowerFetchOffset).
@@ -197,8 +208,8 @@ private:
     // Internal: recompute HW and update the floor.
     //
     // Majority (default): prevHw_ is MONOTONIC — only advances.
-    //   A follower truncation does not lower the committed frontier because
-    //   a majority already holds the batch (spec §4).
+    //   A follower truncation does not lower the committed frontier: every
+    //   ISR member held the batch when it committed.
     //
     // AllInSync: prevHw_ tracks the TRUE ISR minimum — it CAN retract when a
     //   follower falls behind.  This is intentional: the AllInSync guarantee is
@@ -224,60 +235,19 @@ private:
 
     Offset computeHw() const noexcept {
         if (isr_.empty()) return 0;
-
-        const int isrSize  = static_cast<int>(isr_.size());
-        const int majority = isrSize / 2 + 1; // strict majority, e.g. 3→2, 5→3
-
-        // A-NEW-2 fix: use a dynamically-sized buffer so ISR sizes > 32
-        // (e.g. 33, 64, 65) are computed correctly without OOB stack reads.
-        //
-        // For the common ISR sizes (3–5) this still avoids heap allocation via
-        // the small-buffer path: we allocate on the stack for ISR <= kSmallIsr
-        // and fall back to a heap vector for larger sizes.
-        //
-        // Prior bug: kMaxIsr=32 and the array was filled only up to
-        // n=min(isrSize,32), but majority was computed from the FULL isrSize.
-        // For isrSize>=64, majority-1>=32 indexed past the 32-element array
-        // (UB); for 33<=isrSize<=63 it read a zero-initialised slot (HW
-        // under-computed, not UB).  Now majority is clamped to n so the two
-        // always agree.
-        constexpr int kSmallIsr = 32;
-        Offset smallBuf[kSmallIsr]{};
-        std::vector<Offset> heapBuf;
-        Offset* leos = nullptr;
-
-        if (isrSize <= kSmallIsr) {
-            leos = smallBuf;
-        } else {
-            heapBuf.assign(static_cast<std::size_t>(isrSize), Offset{0});
-            leos = heapBuf.data();
-        }
-
-        const int n = isrSize; // always use ALL ISR members
-
-        for (int i = 0; i < n; ++i) {
-            NodeId member = isr_[static_cast<std::size_t>(i)];
+        // Kafka model: HW = min LEO over the ISR (no sort, no buffer).
+        Offset hw = INT64_MAX;
+        for (NodeId member : isr_) {
+            Offset leo;
             if (member == leaderId_) {
-                leos[i] = leaderLeo_;
+                leo = leaderLeo_;
             } else {
                 auto it = followerLeo_.find(member);
-                leos[i] = (it != followerLeo_.end()) ? it->second : 0;
+                leo = (it != followerLeo_.end()) ? it->second : 0;
             }
+            if (leo < hw) hw = leo;
         }
-
-        // Sort descending: leos[0] = highest LEO.
-        std::sort(leos, leos + n, std::greater<Offset>{});
-
-        // Select the HW index based on the durability mode:
-        //   Majority  → majority-th highest (leos[majority - 1])
-        //   AllInSync → full-ISR minimum    (leos[n - 1])
-        // Both majority-1 and n-1 are always in [0, n-1], so always in-bounds.
-        // E.g. ISR={A=100, B=90, C=80}, Majority: majority=2, HW=leos[1]=90.
-        //                               AllInSync: idx=2,      HW=leos[2]=80.
-        const int idx = (durability_ == DurabilityMode::AllInSync)
-            ? (n - 1)             // full-ISR min (last after descending sort)
-            : (majority - 1);     // majority-th highest
-        return leos[idx];
+        return hw;
     }
 
     NodeId       leaderId_   = -1;

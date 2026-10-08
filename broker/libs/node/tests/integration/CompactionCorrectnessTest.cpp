@@ -152,8 +152,8 @@ public:
 
 class Cp4NullTransport : public PartitionTransport {
 public:
-    void sendFetchRequest(const FetchRequestMsg&) override {}
-    void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { return true; }
 };
 
 // ===========================================================================
@@ -164,8 +164,8 @@ public:
 // segments.  Then retry seq 50 → must return Duplicate (prior offset), NOT
 // re-appended and NOT OutOfOrderSequence.
 //
-// Why seq 50 in a 55-batch run: kRetryWindowSize=5, so the retry window after
-// the 55th batch holds seqs 50..54.  Seq 50 IS in the window.  We verify that
+// Why seq kN-window in a (window+50)-batch run: the retry window after the
+// last batch holds seqs kN-window..kN-1; the oldest of them IS in the window.  We verify that
 // after compaction the dedup window entries — including the base offset of the
 // batch at seq 50 — are still intact so the validate() call returns Duplicate.
 //
@@ -213,10 +213,10 @@ TEST(CompactionCorrectness, IdempotentDedupSurvivesCompaction) {
 
     constexpr int64_t kPid         = 9;
     constexpr int16_t kEpoch       = 0;
-    // Use kN=55 so that seq 50 falls within the last kRetryWindowSize=5 entries
-    // of the retry window (window covers seqs 50..54 after all 55 batches).
-    constexpr int     kN           = 55;
-    constexpr int     kRetrySeq    = 50;  // the specific seq to retry post-compaction
+    // kN = window + 50 so the OLDEST window entry (kRetrySeq = kN - window)
+    // is retried: the window covers seqs kN-window..kN-1 after all kN batches.
+    constexpr int     kN           = kRetryWindowSize + 50;
+    constexpr int     kRetrySeq    = kN - kRetryWindowSize;  // the seq retried post-compaction
 
     auto replica = std::make_unique<PartitionReplica>(
         cfg, Role::Leader, /*epoch=*/1,
@@ -299,11 +299,13 @@ TEST(CompactionCorrectness, IdempotentDedupSurvivesCompaction) {
     EXPECT_EQ(lastRetryResult.status, ValidationResult::Status::Duplicate)
         << "After compaction: retry of last seq (" << (kN - 1) << ") must be Duplicate.";
 
-    // Retry of seq 49 (outside the window: window is 50..54) must be OOS.
+    // Retry of kRetrySeq-1 (outside the window) is a KNOWN-OLD duplicate
+    // (EOS-OOS: entirely <= lastSequence → OK with an unknown offset, never OOS).
     auto outsideResult = psm.validate(/*topicId=*/200, kPid, /*partition=*/0,
-                                       kEpoch, /*baseSeq=*/49, /*lastSeq=*/49);
-    EXPECT_EQ(outsideResult.status, ValidationResult::Status::OutOfOrderSequence)
-        << "Seq 49 is outside the retry window (50..54); must be OOS, not Duplicate.";
+                                       kEpoch, /*baseSeq=*/kRetrySeq - 1, /*lastSeq=*/kRetrySeq - 1);
+    EXPECT_EQ(outsideResult.status, ValidationResult::Status::Duplicate)
+        << "Seq " << kRetrySeq - 1 << " is outside the retry window: a known-old duplicate.";
+    EXPECT_EQ(outsideResult.retryBaseOffset, -1) << "known-old: offset unknown";
 
     // The next new sequence must be Accepted.
     auto newResult = psm.validate(/*topicId=*/200, kPid, /*partition=*/0,

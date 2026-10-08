@@ -32,6 +32,8 @@
 //        Without RUNE_WORKERS the config defaults to 1 (pre-E1 path).
 // ---------------------------------------------------------------------------
 
+#include <rune/aeronutil/testing/FreePort.h>
+#include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 
@@ -96,6 +98,7 @@ static std::filesystem::path makeTempDataDir(std::string_view tag) {
 static NodeConfig makeSingleNodeConfig4W(const std::filesystem::path& dataDir,
                                          int32_t workerCount) {
     NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId            = 0;
     cfg.dataDir           = dataDir.string();
     cfg.consensusStreamId = 10;
@@ -103,10 +106,10 @@ static NodeConfig makeSingleNodeConfig4W(const std::filesystem::path& dataDir,
     PeerConfig self;
     self.id            = 0;
     self.host          = "127.0.0.1";
-    self.consensusPort = 40111;
+    self.consensusPort = rune::aeronutil::testing::allocFreeUdpPort();   // D8: never a fixed port
     cfg.peers          = {self};
 
-    cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:50001";
+    cfg.clientEndpoint.channel  = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(rune::aeronutil::testing::allocFreeUdpPort());
     cfg.clientEndpoint.streamId = 1;
 
     cfg.workerCount = (workerCount >= 1) ? workerCount : 1;

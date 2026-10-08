@@ -38,6 +38,9 @@ from .dockerutil import run
 # Client image tag is overridable so each work-context uses a UNIQUE tag (never a
 # generic :dev/:latest that silently overwrites a baseline).  Set DR_CLIENT_IMAGE.
 DR_IMAGE = os.environ.get("DR_CLIENT_IMAGE", "rune-dr-client:dev")
+# The client image's platform: unset = the image's own (native arm64 on Apple Silicon, amd64 on the bench box);
+# DR_CLIENT_PLATFORM=linux/amd64 forces emulation for an amd64-only image.
+_PLATFORM_ARGS = (["--platform", os.environ["DR_CLIENT_PLATFORM"]] if os.environ.get("DR_CLIENT_PLATFORM") else [])
 
 _PRODUCED_RE = re.compile(r"PRODUCED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+) offset=(-?\d+)")
 _DELIVERED_RE = re.compile(r"DELIVERED cid=(-?\d+) key=(-?\d+) seq=(-?\d+) part=(-?\d+) offset=(-?\d+)")
@@ -268,7 +271,7 @@ def run_txn(
     args = [
         "docker", "run", "--rm",
         "--name", name,
-        "--platform", "linux/amd64",
+        *_PLATFORM_ARGS,
         "--network", network,
         "--hostname", name,
         "--shm-size=64m",
@@ -318,7 +321,7 @@ def run_txn_consume(
     args = [
         "docker", "run", "--rm",
         "--name", name,
-        "--platform", "linux/amd64",
+        *_PLATFORM_ARGS,
         "--network", network,
         "--hostname", name,
         "--shm-size=64m",
@@ -398,7 +401,7 @@ def _run_one_group_member(
     args = [
         "docker", "run", "--rm",
         "--name", name,
-        "--platform", "linux/amd64",
+        *_PLATFORM_ARGS,
         "--network", network,
         "--hostname", name,
         "--shm-size=64m",
@@ -550,6 +553,12 @@ def run_group(
 
 
 def _parse_client_output(cid: int, exit_code: int, out: str) -> ClientResult:
+    # DR_CLIENT_LOG_DIR: keep every client's full output (assertions show only a tail).
+    log_dir = os.environ.get("DR_CLIENT_LOG_DIR")
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, f"{cid}.log"), "w") as fh:
+            fh.write(out)
     res = ClientResult(cid=cid, rc=1, exit_code=exit_code, raw=out)
     for m in _PRODUCED_RE.finditer(out):
         res.produced.append(Msg(int(m[1]), int(m[2]), int(m[3]), int(m[4]), int(m[5])))
@@ -627,7 +636,7 @@ def _run_one_client(
         args = [
             "docker", "run", "--rm",
             "--name", run_name,
-            "--platform", "linux/amd64",
+            *_PLATFORM_ARGS,
             "--network", network,
             "--hostname", run_host,
             "--shm-size=64m",

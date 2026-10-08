@@ -1,0 +1,459 @@
+#pragma once
+// ShardTestClient.h — a minimal REAL wire client for shard-mode integration
+// tests: its own (threaded) embedded driver + Aeron client, raw Rune protocol
+// frames over UDP.  Every wait is a bounded poll of a real condition (hard
+// iteration cap), never a sleep-for-correctness.
+#include <rune/aeronutil/testing/FreePort.h>
+#include <rune/node/EmbeddedDriver.h>
+#include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/MessageHeader.h>
+#include <rune/protocol/client/MetadataMessages.h>
+#include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/client/SchemaMessages.h>
+
+#include <Aeron.h>
+#include <FragmentAssembler.h>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <filesystem>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace rune::node::test {
+
+namespace pc = rune::protocol::client;
+
+inline bool udpPortFree(uint16_t port) {
+    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons(port);
+    const bool ok = ::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
+    ::close(fd);
+    return ok;
+}
+
+inline uint16_t freeUdpPort() {
+    return rune::aeronutil::testing::allocFreeUdpPort();   // D8: never an ephemeral port
+}
+
+/// n disjoint blocks of `width` consecutive free UDP ports (per-worker base ranges).
+inline std::vector<uint16_t> freeUdpPortBlocks(int n, int width) {
+    std::vector<uint16_t> out;
+    for (int attempt = 0; attempt < 2000 && static_cast<int>(out.size()) < n; ++attempt) {
+        const uint16_t p = freeUdpPort();
+        if (p == 0 || static_cast<int>(p) + width > 65535) continue;
+        bool ok = true;
+        for (int k = 0; k < width && ok; ++k) ok = udpPortFree(static_cast<uint16_t>(p + k));
+        for (uint16_t q : out) if (p < q + width && q < p + width) ok = false;
+        if (ok) out.push_back(p);
+    }
+    return out;
+}
+
+struct PartitionInfo {
+    int32_t topicId = 0, partition = 0, leaderId = -1, ingressStreamId = 0;
+    std::string ingressEndpoint;
+    int32_t egressControlPort = 0;   ///< per-worker MDC egress control (leader host)
+};
+
+inline std::vector<uint8_t> makeBatch(int records) {
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    for (int i = 0; i < records; ++i) b.append("k", "v", 1000 + i);
+    return b.build();
+}
+
+class ShardTestClient {
+public:
+    static constexpr int32_t kEgressStream = 4242;
+    static constexpr int     kMaxIters     = 50'000;   // × 100 µs ⇒ 5 s hard cap per wait
+
+    /// `termBufferBytes`: the client driver's term — it bounds the client's own
+    /// publications (a Produce frame must fit term / 8).
+    /// `legacyTransport`: the pre-2026-10-02 client transport (1408 MTU, 2 MiB
+    /// socket buffers, sparse terms) instead of the host-derived one.
+    /// `mode`: Invoker = the rune-client-cpp RunnerMode::Invoker shape — the
+    /// client's driver AND conductor run only inside this client's calls (every
+    /// wait pumps them); a test that stops calling the client stops its driver
+    /// (no status messages to the broker).  Construct, use and destroy it on ONE
+    /// thread (the driver's pump owner).
+    explicit ShardTestClient(const std::filesystem::path& aeronDir, int32_t termBufferBytes = 1 << 20,
+                             bool legacyTransport = false, DriverMode mode = DriverMode::Threaded)
+        : driver_(cfgFor(aeronDir, termBufferBytes, legacyTransport), mode), invoker_(mode == DriverMode::Invoker)
+    {
+        aeron::Context ctx;
+        ctx.aeronDir(aeronDir.string());
+        ctx.useConductorAgentInvoker(invoker_);
+        aeron_ = aeron::Aeron::connect(ctx);
+        egressChannel_ = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(freeUdpPort());
+        const int64_t reg = aeron_->addSubscription(egressChannel_, kEgressStream);
+        for (int i = 0; i < kMaxIters && !egress_; ++i) { egress_ = aeron_->findSubscription(reg); pause_(); }
+    }
+    ~ShardTestClient() { pubs_.clear(); exclusivePubs_.clear(); egress_.reset(); aeron_.reset(); }
+
+    const std::string& egressChannel() const noexcept { return egressChannel_; }
+    /// Advertise the reply channel under `host` (the subscription stays bound on
+    /// 127.0.0.1) — a client that sends a HOSTNAME in its ConnectRequest.
+    void advertiseEgressHost(const std::string& host) {
+        const auto colon = egressChannel_.rfind(':');
+        egressChannel_ = "aeron:udp?endpoint=" + host + egressChannel_.substr(colon);
+    }
+
+    /// Aeron image session id of the last ConnectResponse / of the ack for `corr` (0 = none).
+    int32_t connectImageSessionId() const noexcept { return connectImage_; }
+    int32_t ackImageSessionId(int64_t corr) const {
+        auto it = ackImages_.find(corr);
+        return it == ackImages_.end() ? 0 : it->second;
+    }
+
+    int64_t connect(const std::string& gatewayChannel, int32_t stream) {
+        connect_.reset();                                  // each connect waits for ITS response
+        pc::ConnectRequest req;
+        req.correlationId  = ++corr_;
+        req.egressStreamId = kEgressStream;
+        req.clientVersion  = 1;
+        req.egressChannel  = egressChannel_;
+        std::vector<uint8_t> buf(pc::MessageHeader::ENCODED_SIZE + pc::ConnectRequest::BODY_FIXED + 2 +
+                                 req.egressChannel.size());
+        const std::size_t len = req.encode(buf.data());
+        if (!send(gatewayChannel, stream, buf.data(), len)) return -1;
+        for (int i = 0; i < kMaxIters && !connect_; ++i) { poll_(); pause_(); }
+        return connect_ && connect_->code == 0 ? connect_->assignedSessionId : -1;
+    }
+
+    bool produce(const std::string& channel, int32_t stream, int64_t sessionId, int64_t corr,
+                 int32_t topicId, int32_t partition, uint8_t acks, const std::vector<uint8_t>& batch) {
+        pc::Produce msg;
+        msg.sessionId = sessionId; msg.correlationId = corr;
+        msg.topicId = topicId; msg.partition = partition; msg.partitionKnown = 1;
+        msg.acks = acks; msg.producerId = -1; msg.producerEpoch = 0; msg.baseSequence = -1;
+        msg.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
+        std::vector<uint8_t> buf(msg.encodedSize());
+        msg.encode(buf.data());
+        return send(channel, stream, buf.data(), buf.size());
+    }
+
+    /// An idempotent produce (F15 S5 e2e): producer id / epoch / sequence on the wire.
+    bool produceIdempotent(const std::string& channel, int32_t stream, int64_t sessionId, int64_t corr,
+                           int32_t topicId, int32_t partition, uint8_t acks, int64_t producerId,
+                           int16_t producerEpoch, int32_t baseSequence, const std::vector<uint8_t>& batch) {
+        pc::Produce msg;
+        msg.sessionId = sessionId; msg.correlationId = corr;
+        msg.topicId = topicId; msg.partition = partition; msg.partitionKnown = 1;
+        msg.acks = acks; msg.producerId = producerId; msg.producerEpoch = producerEpoch;
+        msg.baseSequence = baseSequence;
+        msg.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
+        std::vector<uint8_t> buf(msg.encodedSize());
+        msg.encode(buf.data());
+        return send(channel, stream, buf.data(), buf.size());
+    }
+
+    std::optional<pc::ProduceResponse> awaitProduceResponse(int64_t corr) {
+        for (int i = 0; i < kMaxIters; ++i) {
+            poll_();
+            if (auto it = acks_.find(corr); it != acks_.end()) return it->second;
+            pause_();
+        }
+        return std::nullopt;
+    }
+
+    /// The ack already received for `corr` (no polling; nullopt = none yet).
+    std::optional<pc::ProduceResponse> ackFor(int64_t corr) const {
+        if (auto it = acks_.find(corr); it != acks_.end()) return it->second;
+        return std::nullopt;
+    }
+
+    /// Produce until an OK ack (retries NotLeader while leadership settles).  Returns the ack.
+    std::optional<pc::ProduceResponse> produceUntilOk(const std::string& channel, int32_t stream,
+                                                      int64_t sessionId, int32_t topicId,
+                                                      int32_t partition, uint8_t acks,
+                                                      const std::vector<uint8_t>& batch,
+                                                      int maxAttempts = 100) {
+        for (int a = 0; a < maxAttempts; ++a) {
+            const int64_t c = ++corr_;
+            if (!produce(channel, stream, sessionId, c, topicId, partition, acks, batch)) continue;
+            auto ack = awaitProduceResponse(c);
+            if (ack && ack->errorCode == 0) return ack;
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});   // leadership settling
+        }
+        return std::nullopt;
+    }
+
+    std::vector<PartitionInfo> metadata(const std::string& gatewayChannel, int32_t stream, int64_t sessionId) {
+        pc::MetadataRequest req;
+        req.sessionId = sessionId; req.correlationId = ++corr_;
+        std::vector<uint8_t> buf(req.encodedSize());
+        req.encode(buf.data());
+        metadata_.reset();
+        if (!send(gatewayChannel, stream, buf.data(), buf.size())) return {};
+        for (int i = 0; i < kMaxIters && !metadata_; ++i) { poll_(); pause_(); }
+        return metadata_.value_or(std::vector<PartitionInfo>{});
+    }
+
+    /// Push subscription (read_uncommitted) from `fromOffset`; pushed Records and
+    /// any ErrorResponse are captured (records(), errors()).
+    bool subscribe(const std::string& gatewayChannel, int32_t stream, int64_t sessionId,
+                   int32_t topicId, int32_t partition, int64_t fromOffset) {
+        pc::Subscribe s;
+        s.sessionId = sessionId; s.correlationId = ++corr_;
+        s.topicId = topicId; s.partition = partition; s.partitionKnown = 1;
+        s.fromOffset = fromOffset; s.isolation = 0;
+        std::vector<uint8_t> buf(s.encodedSize());
+        const std::size_t len = s.encode(buf.data());
+        return send(gatewayChannel, stream, buf.data(), len);
+    }
+    struct PushedRecords { int64_t subscriptionId; int64_t baseOffset; std::vector<uint8_t> bytes; };
+    struct ErrorSeen     { int64_t correlationId; int16_t code; std::string message; };
+    /// Poll the egress until `pred()` holds (bounded: kMaxIters × 100 µs).
+    template <class Pred> bool pollUntil(Pred pred) {
+        for (int i = 0; i < kMaxIters; ++i) { poll_(); if (pred()) return true; pause_(); }
+        return pred();
+    }
+    const std::vector<PushedRecords>& records() const noexcept { return records_; }
+    const std::vector<ErrorSeen>&     errors()  const noexcept { return errors_; }
+
+    using Clock = std::chrono::steady_clock;
+
+    /// Await the ProduceResponse for `corr` until `deadline` (nullopt = no response).
+    std::optional<pc::ProduceResponse> awaitProduceResponseUntil(int64_t corr, Clock::time_point deadline) {
+        while (Clock::now() < deadline) {
+            poll_();
+            if (auto it = acks_.find(corr); it != acks_.end()) return it->second;
+            pause_();
+        }
+        return std::nullopt;
+    }
+
+    /// Send one DefineTopic and await ITS response until `deadline` (nullopt = no response).
+    std::optional<pc::DefineTopicResponse> defineTopicUntil(const std::string& gatewayChannel, int32_t stream,
+                                                            int64_t sessionId, std::string_view name,
+                                                            uint32_t partitions, bool validate,
+                                                            const std::vector<uint8_t>& descriptor,
+                                                            Clock::time_point deadline) {
+        pc::DefineTopic m;
+        m.sessionId = sessionId; m.correlationId = ++corr_;
+        m.topicName = name; m.partitionCount = partitions; m.validate = validate;
+        m.descriptorBlob = descriptor.data();
+        m.descriptorLen  = static_cast<uint32_t>(descriptor.size());
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        const int64_t c = m.correlationId;
+        if (!send(gatewayChannel, stream, buf.data(), len)) return std::nullopt;
+        while (Clock::now() < deadline) {
+            poll_();
+            if (auto it = defines_.find(c); it != defines_.end()) return it->second;
+            pause_();
+        }
+        return std::nullopt;
+    }
+
+    int64_t nextCorrelationId() noexcept { return ++corr_; }
+
+    /// DefineTopic (DDL) → the authoritative DefineTopicResponse (nullopt on timeout).
+    std::optional<pc::DefineTopicResponse> defineTopic(const std::string& gatewayChannel, int32_t stream,
+                                                       int64_t sessionId, std::string_view name,
+                                                       uint32_t partitions, bool validate,
+                                                       const std::vector<uint8_t>& descriptor) {
+        pc::DefineTopic m;
+        m.sessionId = sessionId; m.correlationId = ++corr_;
+        m.topicName = name; m.partitionCount = partitions; m.validate = validate;
+        m.descriptorBlob = descriptor.data();
+        m.descriptorLen  = static_cast<uint32_t>(descriptor.size());
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        const int64_t c = m.correlationId;
+        if (!send(gatewayChannel, stream, buf.data(), len)) return std::nullopt;
+        for (int i = 0; i < kMaxIters * 4; ++i) {   // DDL commits through the schema log
+            poll_();
+            if (auto it = defines_.find(c); it != defines_.end()) return it->second;
+            pause_();
+        }
+        return std::nullopt;
+    }
+
+    bool disconnect(const std::string& gatewayChannel, int32_t stream, int64_t sessionId) {
+        pc::Disconnect d; d.sessionId = sessionId; d.correlationId = ++corr_;
+        std::vector<uint8_t> buf(pc::Disconnect::ENCODED_SIZE);
+        const std::size_t len = d.encode(buf.data());
+        return send(gatewayChannel, stream, buf.data(), len);
+    }
+
+    /// Offer frames make(i, out) one at a time WITHOUT reading the egress (a
+    /// client that has stopped reading its acks).  Stops at maxFrames, or when
+    /// an offer is refused AND paused() confirms the broker paused this client
+    /// (a state predicate — e.g. the gateway's pause counter — never elapsed
+    /// time; a refusal alone is just transient back-pressure: offer again).
+    /// Returns the frames accepted.
+    template <class Make, class Paused>
+    int64_t offerUntilPaused(const std::string& channel, int32_t stream, Make&& make, int64_t maxFrames,
+                             Paused&& paused) {
+        auto& pub = pubs_[{channel, stream}];
+        if (!pub) {
+            const int64_t reg = aeron_->addPublication(channel, stream);
+            for (int i = 0; i < kMaxIters && !pub; ++i) { pub = aeron_->findPublication(reg); pause_(); }
+            if (!pub) return 0;
+        }
+        return offerLoop_(*pub, std::forward<Make>(make), maxFrames, std::forward<Paused>(paused));
+    }
+    /// D8d: as offerUntilPaused, on this client's own EXCLUSIVE publication #`slot`
+    /// to (channel, stream) — a separate image at the broker per slot (several
+    /// stalled "clients" from one process).
+    template <class Make, class Paused>
+    int64_t offerUntilPausedExclusive(int slot, const std::string& channel, int32_t stream, Make&& make,
+                                      int64_t maxFrames, Paused&& paused) {
+        auto& pub = exclusivePubs_[slot];
+        if (!pub) {
+            const int64_t reg = aeron_->addExclusivePublication(channel, stream);
+            for (int i = 0; i < kMaxIters && !(pub && pub->isConnected()); ++i) {
+                if (!pub) pub = aeron_->findExclusivePublication(reg);
+                pause_();
+            }
+            if (!pub) return 0;
+        }
+        return offerLoop_(*pub, std::forward<Make>(make), maxFrames, std::forward<Paused>(paused));
+    }
+    template <class Pub, class Make, class Paused>
+    int64_t offerLoop_(Pub& p, Make&& make, int64_t maxFrames, Paused&& paused) {
+        auto* pub = &p;
+        std::vector<uint8_t> f;
+        int64_t accepted = 0;
+        // Hard cap: refused for this long without paused() → stall; returns maxFrames (the caller's "never
+        // paused" assertion fails) instead of hanging the test.
+        const auto stallBudget = std::chrono::seconds{30};
+        auto refusedSince = std::chrono::steady_clock::time_point{};
+        while (accepted < maxFrames) {
+            make(accepted, f);
+            aeron::concurrent::AtomicBuffer ab(f.data(), static_cast<aeron::util::index_t>(f.size()));
+            const int64_t r = pub->offer(ab, 0, static_cast<aeron::util::index_t>(f.size()));
+            if (r > 0) { ++accepted; refusedSince = {}; continue; }
+            if (paused()) break;
+            const auto now = std::chrono::steady_clock::now();
+            if (refusedSince == std::chrono::steady_clock::time_point{}) refusedSince = now;
+            else if (now - refusedSince > stallBudget) { lastStallOffer_ = r; lastStallAccepted_ = accepted; return maxFrames; }
+            pump_();
+        }
+        return accepted;
+    }
+
+    bool send(const std::string& channel, int32_t stream, const uint8_t* buf, std::size_t len) {
+        auto& pub = pubs_[{channel, stream}];
+        if (!pub) {
+            const int64_t reg = aeron_->addPublication(channel, stream);
+            for (int i = 0; i < kMaxIters && !pub; ++i) { pub = aeron_->findPublication(reg); pause_(); }
+            if (!pub) return false;
+        }
+        aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(buf), static_cast<aeron::util::index_t>(len));
+        for (int i = 0; i < kMaxIters; ++i) {
+            if (pub->offer(ab, 0, static_cast<aeron::util::index_t>(len)) > 0) return true;
+            pause_();
+        }
+        return false;
+    }
+
+private:
+    static EmbeddedDriverConfig cfgFor(const std::filesystem::path& d, int32_t termBufferBytes,
+                                       bool legacyTransport = false) {
+        EmbeddedDriverConfig c; c.dir = d.string(); c.termBufferBytes = termBufferBytes;
+        if (legacyTransport) {
+            c.mtuBytes = 1408; c.socketBufferBytes = 2 * 1024 * 1024; c.termBufferSparse = true;
+            // Pre-2026-10-02 = stock Aeron UDP: no GSO/GRO bindings, Aeron's 2 msgs/send.  GSO's 16-datagram
+            // bursts deepen the pipeline exactly like the 64 KiB MTU (KNOWN ISSUE in ShardModeTest).
+            c.udpGso = false;
+        }
+        // Pinned (test client, orthogonal to the broker defaults): the pre-2026-10-02
+        // 128 KiB receive window, so back-pressure tests (a client that stops
+        // reading its acks) hit it at the same depth whatever the host derives.
+        c.rcvWindowBytes = 128 * 1024;
+        return c;
+    }
+    /// Invoker mode: run the client's driver + conductor duty cycle (no-op when threaded).
+    void pump_() {
+        if (!invoker_) return;
+        driver_.doWork();
+        if (aeron_) aeron_->conductorAgentInvoker().invoke();
+    }
+    void pause_() {
+        pump_();
+        std::this_thread::sleep_for(std::chrono::microseconds{100});
+    }
+
+    void poll_() {
+        if (!egress_) return;
+        egress_->poll(assembler_.handler(), 64);
+    }
+    void onFrame_(const uint8_t* p, std::size_t n, int32_t imageSessionId) {
+        auto hdr = pc::MessageHeader::decode(p, n);
+        if (!hdr) return;
+        switch (static_cast<pc::TemplateId>(hdr->templateId)) {
+            case pc::TemplateId::ConnectResponse:
+                if (auto r = pc::ConnectResponse::decode(p, n)) { connect_ = *r; connectImage_ = imageSessionId; }
+                break;
+            case pc::TemplateId::ProduceResponse:
+                if (auto r = pc::ProduceResponse::decode(p, n)) {
+                    acks_[r->correlationId] = *r;
+                    ackImages_[r->correlationId] = imageSessionId;
+                }
+                break;
+            case pc::TemplateId::DefineTopicResponse:
+                if (auto r = pc::DefineTopicResponse::decode(p, n)) defines_[r->correlationId] = *r;
+                break;
+            case pc::TemplateId::MetadataResponse:
+                if (auto r = pc::MetadataResponse::decode(p, n)) {
+                    std::vector<PartitionInfo> v;
+                    for (const auto& e : r->partitions)
+                        v.push_back({e.topicId, e.partition, e.leaderId, e.ingressStreamId,
+                                     std::string(e.ingressEndpoint), e.egressControlPort});
+                    metadata_ = std::move(v);
+                }
+                break;
+            case pc::TemplateId::Records:
+                if (auto r = pc::Records::decode(p, n))
+                    records_.push_back({r->subscriptionId, r->baseOffset,
+                                        {r->recordBatch.begin(), r->recordBatch.end()}});
+                break;
+            case pc::TemplateId::ErrorResponse:
+                if (auto e = pc::ErrorResponse::decode(p, n))
+                    errors_.push_back({e->correlationId, e->code, std::string(e->message)});
+                break;
+            default: break;
+        }
+    }
+
+public:
+    int64_t lastStallOffer_ = 0, lastStallAccepted_ = 0;   ///< offerUntilPaused stall diagnostics
+private:
+    EmbeddedDriver                                   driver_;
+    bool                                             invoker_ = false;
+    std::shared_ptr<aeron::Aeron>                    aeron_;
+    std::string                                      egressChannel_;
+    std::shared_ptr<aeron::Subscription>             egress_;
+    std::map<std::pair<std::string, int32_t>, std::shared_ptr<aeron::Publication>> pubs_;
+    std::map<int, std::shared_ptr<aeron::ExclusivePublication>> exclusivePubs_;   // D8d: offerUntilPausedExclusive
+    aeron::FragmentAssembler assembler_{[this](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                                               aeron::util::index_t len, aeron::Header& h) {
+        onFrame_(reinterpret_cast<const uint8_t*>(b.buffer() + off), static_cast<std::size_t>(len), h.sessionId());
+    }};
+    // Aeron image (publication) session id each response arrived on — tells the
+    // runtime's session publication from a worker's own (Task 13 worker acks).
+    int32_t                                         connectImage_ = 0;
+    std::map<int64_t, int32_t>                      ackImages_;
+    std::optional<pc::ConnectResponse>              connect_;
+    std::map<int64_t, pc::ProduceResponse>          acks_;
+    std::map<int64_t, pc::DefineTopicResponse>      defines_;
+    std::optional<std::vector<PartitionInfo>>       metadata_;
+    std::vector<PushedRecords>                      records_;
+    std::vector<ErrorSeen>                          errors_;
+    int64_t                                         corr_ = 0;
+};
+
+} // namespace rune::node::test

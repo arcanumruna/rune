@@ -34,6 +34,7 @@
 // NO Docker. All waits are bounded (kDriverCap + ASSERT_TRUE). No busy-spin.
 // ---------------------------------------------------------------------------
 
+#include <spdlog/sinks/stdout_color_sinks.h>
 #include <gtest/gtest.h>
 
 #include <rune/node/MetadataService.h>
@@ -616,3 +617,110 @@ TEST_F(MetadataThreeNodeTest, FollowerHwGatedVisibility_AssignmentNotVisibleBefo
     ASSERT_NE(pa, nullptr) << "follower must see records after HW advance";
     EXPECT_EQ(pa->leaderNode, kNode1);
 }
+
+// ===========================================================================
+// MetadataTruncationRebuildRegression (DR-10 repeated flap, 2026-10-05):
+// a resumed ex-controller steps down (becomeFollower → its follower HW is 0
+// until the new leader answers) and its uncommitted tail is truncated
+// (KIP-279, logGeneration bump).  rebuildFromLog() then replayed only up to the
+// follower HW (0) and published an EMPTY committed map — the bridge saw every
+// user partition as deleted and quarantined all of this node's replicas for
+// good (no fetch → shrunk out of every ISR → the next pause was an outage).
+// Committed records are never truncated: the committed map must survive.
+// ===========================================================================
+TEST(MetadataReplicationTest, MetadataTruncationRebuildRegression_CommittedMapSurvivesDemotionTruncate) {
+    MrtTempDir dir("trunc_rebuild");
+    rune::storage::Log log(dir.path);
+    log.recover();
+
+    const NodeId selfId = 1;
+    const std::vector<NodeId> nodes = {selfId};
+    InMemoryTransport transport;
+    auto replica = std::make_unique<PartitionReplica>(
+        makeMetaCfg(selfId, /*minIsr=*/1),
+        Role::Leader, /*epoch=*/1, nodes, nodes, &log, &transport);
+    transport.setLeader(replica.get());
+
+    const std::vector<int32_t> isr = {1}, replicas = {1};
+    for (int t = 0; t < 5; ++t)
+        ASSERT_GE(appendAssignment(replica.get(), t, 0, 1, isr, replicas, 1, t + 1), 0);
+    int64_t clock = 0;
+    for (int i = 0; i < 50; ++i) { clock += 2'000'000LL; replica->doWork(clock); transport.pump(clock); }
+
+    MetadataService svc(replica.get(), selfId);
+    svc.doWork(clock);
+    for (int t = 0; t < 5; ++t) ASSERT_NE(svc.assignment(t, 0), nullptr);
+    const Offset committedLeo = replica->logEndOffset();
+    // The zombie controller's records: appended, never committed (no doWork).
+    for (int t = 0; t < 2; ++t)
+        ASSERT_GE(appendAssignment(replica.get(), t, 0, 1, isr, replicas, 9, 100 + t), 0);
+    ASSERT_GT(replica->logEndOffset(), committedLeo);
+
+    // Step down (a new controller won meanwhile) and truncate at the committed
+    // end — nothing committed is removed, but the log generation changes.
+    replica->becomeFollower(/*epoch=*/2, /*leaderId=*/2);
+    const uint64_t gen0 = replica->logGeneration();
+    replica->truncateLogForTest(committedLeo);
+    ASSERT_NE(replica->logGeneration(), gen0) << "setup: the truncate must bump the log generation";
+    clock += 2'000'000LL;
+    svc.doWork(clock);
+
+    for (int t = 0; t < 5; ++t) {
+        const auto* pa = svc.assignment(t, 0);
+        ASSERT_NE(pa, nullptr) << "committed assignment (" << t << ",0) vanished after a "
+                                  "demotion truncate — the bridge would quarantine its replica";
+        EXPECT_EQ(pa->leaderNode, 1);
+    }
+}
+
+// ===========================================================================
+// MetadataTruncationBelowCommittedRegression (DR-10 review LOW-1): a KIP-279
+// truncation that cuts BELOW what this MSM already committed must never
+// happen under Raft safety (the internal-ISR candidacy gate elects only a
+// leader holding every committed record).  If it does (unclean consensus
+// election, or a bug) the committed map can no longer be trusted: fail-stop
+// with a critical log like every other storage invariant violation — never
+// silently rebuild and publish a shorter map.  (After the restart the MSM
+// rebuilds from the surviving log: committedEnd_ starts at 0.)
+// ===========================================================================
+TEST(MetadataReplicationDeathTest, MetadataTruncationBelowCommittedRegression_HaltsNeverPublishes) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    MrtTempDir dir("trunc_below_committed");
+    rune::storage::Log log(dir.path);
+    log.recover();
+
+    const NodeId selfId = 1;
+    const std::vector<NodeId> nodes = {selfId};
+    InMemoryTransport transport;
+    auto replica = std::make_unique<PartitionReplica>(
+        makeMetaCfg(selfId, /*minIsr=*/1),
+        Role::Leader, /*epoch=*/1, nodes, nodes, &log, &transport);
+    transport.setLeader(replica.get());
+
+    const std::vector<int32_t> isr = {1}, replicas = {1};
+    Offset cut = -1;
+    for (int t = 0; t < 5; ++t) {
+        const Offset base = appendAssignment(replica.get(), t, 0, 1, isr, replicas, 1, t + 1);
+        ASSERT_GE(base, 0);
+        if (t == 2) cut = base;   // the start of a committed batch
+    }
+    int64_t clock = 0;
+    for (int i = 0; i < 50; ++i) { clock += 2'000'000LL; replica->doWork(clock); transport.pump(clock); }
+
+    MetadataService svc(replica.get(), selfId);
+    svc.doWork(clock);
+    for (int t = 0; t < 5; ++t) ASSERT_NE(svc.assignment(t, 0), nullptr);
+    ASSERT_GT(replica->highWatermark(), cut) << "setup: the cut must be below the committed end";
+
+    replica->becomeFollower(/*epoch=*/2, /*leaderId=*/2);
+    replica->truncateLogForTest(cut);
+    clock += 2'000'000LL;
+    EXPECT_DEATH({
+        // spdlog's default sink is stdout; the death matcher reads stderr.
+        spdlog::set_default_logger(spdlog::stderr_color_st("ltrunc"));
+        svc.doWork(clock);
+    }, "below the committed end");
+}
+
+// A truncation exactly AT the committed end (the DR-10 zombie case) is legal
+// and must not halt — covered by MetadataTruncationRebuildRegression above.

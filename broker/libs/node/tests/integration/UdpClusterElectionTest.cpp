@@ -20,6 +20,8 @@
 // Unique temp paths: getpid() + atomic counter.
 // All waits hard-capped with ASSERT (no infinite spin).
 
+#include <rune/aeronutil/testing/FreePort.h>
+#include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include "support/TestWorkerCount.h"
@@ -77,33 +79,7 @@ struct TempDir {
 // Accepts the small TOCTOU window; call immediately before use.
 // ---------------------------------------------------------------------------
 static uint16_t discoverFreeUdpPort() {
-    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        throw std::runtime_error("UdpClusterElectionTest: socket() failed");
-    }
-
-    struct sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = 0;          // let OS pick
-    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
-
-    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd);
-        throw std::runtime_error("UdpClusterElectionTest: bind() for port discovery failed");
-    }
-
-    socklen_t addrLen = sizeof(addr);
-    if (::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen) < 0) {
-        ::close(fd);
-        throw std::runtime_error("UdpClusterElectionTest: getsockname() failed");
-    }
-
-    // sin_port is network byte order; swap manually to avoid macro issues.
-    const uint16_t netPort = addr.sin_port;
-    const uint16_t port =
-        static_cast<uint16_t>((netPort >> 8) | ((netPort & 0xFFu) << 8));
-    ::close(fd);
-    return port;
+    return rune::aeronutil::testing::allocFreeUdpPort();   // D8: never an ephemeral port
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +110,7 @@ static NodeConfig makeThreeNodeConfig(
     const std::vector<uint16_t>& clientPorts)     // 3 ports, one per node
 {
     NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId            = nodeId;
     cfg.dataDir           = dataDir.string();
     cfg.consensusStreamId = 10;

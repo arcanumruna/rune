@@ -1,10 +1,9 @@
 #pragma once
 // NodeStateFile.h — faithful C++ port of io.aeron.cluster.NodeStateFile
-// Durable candidateTermId persistence via mmap with release/acquire fences.
+// Durable candidateTermId persistence via mmap + msync.
 // See: aeron-cluster/src/main/java/io/aeron/cluster/NodeStateFile.java
 
 #include <rune/consensus/Types.h>
-#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -13,12 +12,14 @@ namespace rune::consensus {
 /**
  * Durable storage for a single cluster node's candidateTermId.
  *
- * Backed by a memory-mapped file. The candidateTermId slot is accessed via
- * std::atomic_ref<int64_t> to provide release/acquire fences that match
- * Java's UnsafeBuffer::putLongVolatile / getLongVolatile semantics.
+ * Backed by a memory-mapped file.  F9a (no atomics): the file is owned by the
+ * consensus duty-cycle thread ONLY (no other in-process reader, no external
+ * reader of the live mapping), so the slots are plain loads/stores.  Aeron's
+ * putLongVolatile/getLongVolatile only order CPU visibility for concurrent
+ * readers — there are none — and never ordered persistence (msync does).
  *
  * File layout (8-byte aligned, fixed offsets):
- *   [0..7]   int64_t  candidateTermId   — volatile slot (release/acquire)
+ *   [0..7]   int64_t  candidateTermId   — written LAST on update
  *   [8..15]  int64_t  timestamp         — epoch-ms of last update (plain)
  *   [16..23] int64_t  logPosition       — log position of last update (plain)
  *   [24..]   padding to kFileSize
@@ -72,8 +73,8 @@ public:
      *
      * Exact port of NodeStateFile.java:274-285 and updateCandidateTermId 258-264:
      * - If candidateTermId > current: write logPosition first, then timestamp,
-     *   then store candidateTermId LAST with RELEASE ordering (so a concurrent
-     *   acquire-reader never sees a new id with stale metadata).
+     *   then store candidateTermId LAST (Aeron's write order; single owner
+     *   thread, so no fence is needed — see the class comment).
      *   Then msync if fileSyncLevel > 0.
      *   Returns the new candidateTermId.
      * - If candidateTermId <= current: no-op, returns current.
@@ -109,7 +110,7 @@ private:
     }
 
     // Write all three fields with the correct store order:
-    //   logPosition first, timestamp second, candidateTermId LAST (release).
+    //   logPosition first, timestamp second, candidateTermId LAST.
     // Mirrors NodeStateFile.java:258-264 (updateCandidateTermId).
     void updateCandidateTermId(int64_t candidateTermId, int64_t logPosition, int64_t timestampMs);
 

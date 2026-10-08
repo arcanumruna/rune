@@ -27,8 +27,10 @@
 //   Ongoing     + endTransaction(commit) → PrepareCommit
 //   Ongoing     + endTransaction(abort)  → PrepareAbort
 //   Ongoing     + timeout (doWork)       → PrepareAbort
-//   PrepareCommit + completeTransaction  → CompleteCommit → Empty
-//   PrepareAbort  + completeTransaction  → CompleteAbort  → Empty
+//   PrepareCommit + completeTransaction  → CompleteCommit (resting, F15 §5.4)
+//   PrepareAbort  + completeTransaction  → CompleteAbort  (resting, F15 §5.4)
+//   Complete*     + addPartitions        → Ongoing
+//   Complete*     + InitProducerId       → Empty (epoch bump, like Empty)
 //
 // ## InitProducerId / Zombie Fencing
 //
@@ -37,8 +39,9 @@
 //   Known txnId (re-init) → BUMP epoch (epoch++; zombie producer with old epoch fenced);
 //                           if Ongoing, first drive to PrepareAbort (mirror Kafka's
 //                           "PrepareEpochFence" path), then reset to Empty.
-//   Known txnId in PrepareCommit/PrepareAbort/CompleteCommit/CompleteAbort →
+//   Known txnId in PrepareCommit/PrepareAbort →
 //                           kConcurrentTransactions (Kafka EOS: reject, let in-flight finish).
+//   Known txnId in CompleteCommit/CompleteAbort → treated like Empty (bump).
 //
 // ## Transaction Timeout
 //
@@ -108,6 +111,8 @@ struct InitProducerIdResult {
     static constexpr int kOk                    = 0;
     static constexpr int kInvalidTxnTimeout     = 5;
     static constexpr int kConcurrentTransactions = 6;
+    /// The producerId space is exhausted (INT64_MAX) — NOT retriable.
+    static constexpr int kProducerIdsExhausted   = 7;
 
     [[nodiscard]] bool ok() const noexcept { return errorCode == kOk; }
 };
@@ -123,6 +128,9 @@ struct AddPartitionsResult {
     static constexpr int kInvalidPid           = 2;
     static constexpr int kInvalidTransition    = 3;
     static constexpr int kUnknownTxnId         = 4;
+    /// F15 m2: the caller holds the NEW identity of an overflow fence whose
+    /// PrepareAbort is still resolving — retriable (wire 27).
+    static constexpr int kConcurrentTransactions = 6;
 
     [[nodiscard]] bool ok() const noexcept { return errorCode == kOk; }
 };
@@ -136,11 +144,18 @@ struct EndTransactionResult {
     /// The set of partitions that need COMMIT/ABORT markers written (P5-3).
     std::vector<TopicPartition> partitions;
 
+    /// F15 §5.4: true when the OK is the idempotent answer to a same-direction
+    /// retry of an already COMPLETED transaction (no transition, no markers).
+    bool alreadyComplete{false};
+
     static constexpr int kOk                   = 0;
     static constexpr int kInvalidProducerEpoch = 1;
     static constexpr int kInvalidPid           = 2;
     static constexpr int kInvalidTransition    = 3;
     static constexpr int kUnknownTxnId         = 4;
+    /// F15 §5.4: same-direction retry while Prepare* (or any EndTxn by the
+    /// caller of a fence) — retriable (wire 27).
+    static constexpr int kConcurrentTransactions = 6;
 
     [[nodiscard]] bool ok() const noexcept { return errorCode == kOk; }
 };
@@ -366,7 +381,13 @@ public:
     /// On completeTransaction(ABORT) or any abort path (fence / timeout /
     ///   recovered PrepareAbort): pending offsets are DISCARDED (never written).
     ///
-    /// Valid states: Ongoing only (same guard as addPartitions).
+    /// Valid states: Ongoing; with `beginsTxn` (the AddOffsetsToTxn request,
+    /// X-1 — Kafka) also the resting Empty / Complete*, which it moves to
+    /// Ongoing exactly like addPartitions (the client sends AddOffsets as soon
+    /// as sendOffsetsToTransaction is applied — often before any
+    /// AddPartitions, and an offsets-only transaction never sends one).
+    /// TxnOffsetCommit (beginsTxn false) requires an Ongoing transaction.
+    /// Prepare* → kInvalidTransition (the service answers it as retriable 27).
     /// Epoch/PID fenced like addPartitions.
     ///
     /// \param txnId         Transactional id.
@@ -374,7 +395,8 @@ public:
     /// \param producerEpoch Must match.
     /// \param group         Consumer group id.
     /// \param offsets       Map of TopicPartition → offset to commit.
-    /// \param nowNs         Injected clock.
+    /// \param nowNs         Injected clock (the txn start when it begins one).
+    /// \param beginsTxn     true for AddOffsetsToTxn (may open the transaction).
     AddPartitionsResult addOffsetsToTxn(
         const TransactionalId&                                              txnId,
         ProducerId                                                           producerId,
@@ -382,7 +404,8 @@ public:
         const std::string&                                                   group,
         const std::map<rune::coordination::TopicPartition,
                        rune::coordination::Offset>&                          offsets,
-        int64_t                                                              nowNs);
+        int64_t                                                              nowNs,
+        bool                                                                 beginsTxn = false);
 
     // -----------------------------------------------------------------------
     // completeTransaction
@@ -398,6 +421,55 @@ public:
     /// After this call the coordinator is ready for the next transaction with
     /// the same producerId/epoch.
     CompleteTransactionResult completeTransaction(const TransactionalId& txnId);
+
+    /// Task 10 round 5: the markers of a Prepare* transaction were handed to
+    /// the owning partitions (asynchronously).  Clears markersPending so the
+    /// doWork re-drive does not write them twice; the state STAYS Prepare*
+    /// until completeTransaction() — called once every marker has landed.
+    /// (A failover recovery re-sets markersPending for any Prepare*.)
+    void markersDispatched(const TransactionalId& txnId);
+
+    // -----------------------------------------------------------------------
+    // F15 §5.1 — coordinator load / unload (TransactionCoordinationService).
+    // -----------------------------------------------------------------------
+
+    /// Replace the whole in-memory state with @p snapshot (the txn-state store
+    /// folded to its committed HW) under @p coordinatorEpoch:
+    ///   - Prepare*  → markersPending (the committed decision is re-driven);
+    ///   - Complete* → stays Complete* (resting state; a deferred overflow pid
+    ///                 swap is adopted);
+    ///   - Ongoing   → its timeout clock restarts at @p nowNs (only extends);
+    ///   - every entry adopts @p coordinatorEpoch.
+    /// The allocator is reseeded past every producerId in the snapshot.
+    /// Cold path.  \returns the highest producerId seen (or -1).
+    template<class Snapshot>
+    ProducerId reload(const Snapshot& snapshot, int32_t coordinatorEpoch, int64_t nowNs) {
+        txnMap_.clear();
+        coordinatorEpoch_ = coordinatorEpoch;
+        ProducerId maxPid = -1;
+        for (const auto& [id, meta] : snapshot) {
+            TransactionMetadata m = meta;
+            adoptRecovered_(m);
+            m.coordinatorEpoch = coordinatorEpoch;
+            if (m.state == TxnState::Ongoing) m.txnStartNs = nowNs;
+            if (m.producerId > maxPid)           maxPid = m.producerId;
+            if (m.pendingNewProducerId > maxPid) maxPid = m.pendingNewProducerId;
+            txnMap_.insert_or_assign(TransactionalId(id), std::move(m));
+        }
+        if (maxPid >= 0) allocator_.reseedAtLeast(maxPid);
+        return maxPid;
+    }
+
+    /// Drop every transaction (unload).  The allocator is kept (monotone).
+    void clear() noexcept { txnMap_.clear(); }
+
+    /// This coordinator's epoch (stamped on every transition / marker).
+    [[nodiscard]] int32_t coordinatorEpoch() const noexcept { return coordinatorEpoch_; }
+
+    /// F15 I7: the producerId allocator (block-ceiling gating is driven by the
+    /// TransactionCoordinationService, which persists the ceiling).
+    [[nodiscard]] ProducerIdAllocator&       allocator()       noexcept { return allocator_; }
+    [[nodiscard]] const ProducerIdAllocator& allocator() const noexcept { return allocator_; }
 
     // -----------------------------------------------------------------------
     // doWork — single-writer periodic step (no spin, no sleep)
@@ -460,6 +532,14 @@ private:
     /// Look up metadata; returns nullptr if not found.
     [[nodiscard]] TransactionMetadata* findMetadata(const TransactionalId& txnId) noexcept;
     [[nodiscard]] const TransactionMetadata* findMetadata(const TransactionalId& txnId) const noexcept;
+
+    /// Recovery normalisation shared by the constructor replay and reload():
+    /// Prepare* → markersPending; a CompleteAbort that still carries a deferred
+    /// overflow pid swap adopts it (Complete* is otherwise kept as-is).
+    static void adoptRecovered_(TransactionMetadata& m) noexcept;
+
+    /// Map an allocator failure sentinel to the InitProducerId answer.
+    static InitProducerIdResult allocationFailure_(ProducerId sentinel) noexcept;
 
     /// Validate epoch and PID match; returns errorCode (0 = ok).
     [[nodiscard]] int validateEpochAndPid(const TransactionMetadata& meta,

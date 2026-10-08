@@ -366,7 +366,7 @@ bool ReplicatedOffsetStore::rebuildFromLog()
             if (tl <= 0 || static_cast<std::size_t>(tl) > remaining) break;
 
             // Each outer batch has exactly 1 record: key="", value=<our payload>.
-            reader.forEach([this](std::string_view key, std::string_view val,
+            reader.forEachRecord([this](std::string_view key, std::string_view val,
                                   int64_t /*offset*/, int64_t /*ts*/) {
                 applyRecord(key, val);
             });

@@ -2,6 +2,16 @@
 
 namespace rune::consensus {
 
+void SbeConsensusPublisher::candidacyState(NodeId toMember, NodeId fromMember,
+                                           const CandidacyState& state)
+{
+    const int32_t count = state.count < 0 ? 0
+        : (state.count > CandidacyState::kMaxMembers ? CandidacyState::kMaxMembers : state.count);
+    const auto len = CandidacyStateMsg::encode(buf_.data(), 0, state.leaderEpoch, state.version,
+                                               fromMember, count, state.members.data());
+    sink_.send(toMember, buf_.data(), len);
+}
+
 void SbeConsensusPublisher::canvassPosition(
     NodeId  toMember,
     Term    logLeadershipTermId,
@@ -122,6 +132,12 @@ void SbeConsensusPublisher::commitPosition(
         leadershipTermId,
         logPosition,
         leaderMemberId);
+    sink_.send(toMember, buf_.data(), len);
+}
+
+void SbeConsensusPublisher::standDown(NodeId toMember, Term leadershipTermId, NodeId leaderMemberId)
+{
+    const auto len = StandDownMsg::encode(buf_.data(), 0, leadershipTermId, leaderMemberId);
     sink_.send(toMember, buf_.data(), len);
 }
 

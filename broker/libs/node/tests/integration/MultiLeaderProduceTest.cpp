@@ -860,7 +860,10 @@ TEST_F(MultiLeaderProduceFixture, RoutingImage_GpidScheme_CorrectLeaderLookup) {
 // This is an independent in-fixture RF=3 setup (no shared state with the main
 // topicSolo RF=2 partitions) to keep concerns isolated.
 // ===========================================================================
-TEST_F(MultiLeaderProduceFixture, Rf3_LaggingFollower_MajorityQuorumAckFires) {
+// Kafka model (fix round 1): HW = min LEO over the ISR — the lagging follower
+// holds the HW until the lag check (replicaLagMaxMs) shrinks it out of the ISR;
+// then the remaining ISR {leader, follower1} (= minIsr 2) commits.
+TEST_F(MultiLeaderProduceFixture, Rf3_LaggingFollower_ShrunkByLagThenAckFires) {
     // ---- RF=3 partition: one InMemoryTransport, leader=node1, followers=node2+node3 ----
     // minIsr=2: majority for RF=3; acks=all satisfied once leader+1 follower replicated.
     MlpTempDir dirL("rf3_L"), dirF1("rf3_F1"), dirF2("rf3_F2");
@@ -871,6 +874,7 @@ TEST_F(MultiLeaderProduceFixture, Rf3_LaggingFollower_MajorityQuorumAckFires) {
     PartitionConfig cfgL  = makeUserCfg(kNode1, /*topicId=*/99, /*partition=*/0, /*minIsr=*/2);
     PartitionConfig cfgF1 = makeUserCfg(kNode2, /*topicId=*/99, /*partition=*/0, /*minIsr=*/2);
     PartitionConfig cfgF2 = makeUserCfg(kNode3, /*topicId=*/99, /*partition=*/0, /*minIsr=*/2);
+    cfgL.replicaLagMaxMs = 50;   // the lagging follower leaves the ISR after 50 ms
 
     PartitionReplica leader(cfgL,  Role::Leader,   /*epoch=*/1, rf3Nodes, rf3Nodes, &logL,  &transport3);
     PartitionReplica follower1(cfgF1, Role::Follower, /*epoch=*/1, rf3Nodes, rf3Nodes, &logF1, &transport3);
@@ -921,8 +925,8 @@ TEST_F(MultiLeaderProduceFixture, Rf3_LaggingFollower_MajorityQuorumAckFires) {
 
     ASSERT_TRUE(hwAdvanced)
         << "HW must advance to LEO=" << leaderLeo
-        << " with majority (leader + follower1) even though follower2 lags; "
-        << "RF=3 majority quorum is 2 nodes";
+        << " once the lagging follower2 is shrunk out of the ISR";
+    EXPECT_EQ(leader.isr().size(), 2u) << "follower2 must have left the ISR first";
 
     EXPECT_EQ(leader.highWatermark(), leaderLeo)
         << "leader HW must equal LEO after majority replication";

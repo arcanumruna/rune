@@ -1,4 +1,8 @@
 #pragma once
+#include <rune/consensus/PeerResolution.h>
+
+#include <cstdio>
+#include <cstdlib>
 // ClientGateway.h — Client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 //
 // Design:
@@ -33,8 +37,10 @@
 //       (zero-alloc: pre-sized ring buffer).  Each doWork() cycle, after the
 //       replica's HW may have advanced (replication fetch responses processed by
 //       the duty-cycle thread BEFORE gateway.doWork), drainPendingAcks() checks
-//       every entry: if replica->highWatermark() >= entry.lastOffset, the
-//       ProduceResponse is sent and the entry removed.
+//       every entry: it re-resolves the replica through the ReplicaRegistry by
+//       (topicId, partition, incarnation) — no pointer is held — and if the
+//       published HW > entry.lastOffset the ProduceResponse is sent and the
+//       entry removed; a removed / re-created partition fails it with NotLeader.
 //       min-ISR gate: before enqueuing, canProduce(minIsr, acksAll=true) is
 //       checked via the ISR manager; if ISR is too small, ProduceResponse
 //       MinIsrViolation is sent immediately (no append).
@@ -45,19 +51,21 @@
 //   - Zero-alloc on the hot path: encode scratch is a fixed member buffer.
 //   - NO busy-spin.
 
+#include <rune/aeronutil/AeronPump.h>
 #include <rune/gateway/SessionTable.h>
 #include <rune/gateway/IGroupRequestHandler.h>
 #include <rune/gateway/ITxnRequestHandler.h>
+#include <rune/gateway/IAdminRequestSink.h>
 
 // Forward-declared to avoid pulling the full WorkerPool header (and its heavy
 // chain: Worker → SpscRing → WorkerOp → ReplicationMessages) into the gateway
 // header.  All WorkerPool calls are in ClientGateway.cpp.
-namespace rune::node { class WorkerPool; }
+namespace rune::node { class WorkerPool; struct WorkerReturn; }
 
 #include <Aeron.h>
 #include <Subscription.h>
 #include <ExclusivePublication.h>
-#include <FragmentAssembler.h>
+#include <rune/aeronutil/FragmentAssembler.h>
 #include <concurrent/AtomicBuffer.h>
 #include <concurrent/logbuffer/BufferClaim.h>
 #include <util/Index.h>
@@ -66,9 +74,13 @@ namespace rune::node { class WorkerPool; }
 #include <rune/storage/ProducerStateManager.h>
 #include <rune/transaction/ReadCommittedView.h>
 #include <rune/metadata/RoutingImage.h>
+#include <rune/replication/ReplicationMessages.h>
+#include <rune/node/RecordsPush.h>
+#include <rune/node/SessionAnnouncer.h>
 // G0.1: ErrorCode enum for sendRespReliable() signature.
 #include <rune/protocol/client/Protocol.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -84,6 +96,7 @@ namespace rune::node { class WorkerPool; }
 #include <unordered_map>
 #include <utility>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 namespace rune::node { class ReplicaRegistry; }
@@ -103,6 +116,15 @@ struct LeaderView {
     std::string leaderClientEndpoint;           // leader's client-facing channel; empty if unknown
 };
 
+/// Shard mode (spec §3.3): a node's explicitly configured per-worker ingress base.
+struct ShardIngressEndpoint {
+    int32_t     nodeId   = -1;
+    std::string host;
+    int32_t     basePort = 0;
+    /// The node's per-worker egress-control base (0 = unknown → this node's own).
+    int32_t     egressControlBasePort = 0;
+};
+
 // ---------------------------------------------------------------------------
 // ClientGateway
 // ---------------------------------------------------------------------------
@@ -110,12 +132,59 @@ class ClientGateway {
 public:
     // Default session timeout: 10 seconds.
     static constexpr int64_t kDefaultSessionTimeoutNs = 10LL * 1'000'000'000LL;
+    /// D8b: a HELD session (paused by back-pressure while it has not read its acks) is reaped only after this
+    /// long without activity or a worker Progress signal (the client reading its acks) — Kafka
+    /// connections.max.idle.ms (10 min).  RUNE_MAX_HELD_IDLE_MS (NodeConfig bounds it to 1 ms .. 24 h).
+    /// A session Lost on any worker is reaped on sessionTimeoutNs from its Lost edge instead (reapExpired).
+    static constexpr int64_t kDefaultMaxHeldIdleNs = 600LL * 1'000'000'000LL;
+    void setMaxHeldIdleNs(int64_t ns) noexcept { maxHeldIdleNs_ = ns > 0 ? ns : kDefaultMaxHeldIdleNs; }
+    /// D8c (shard mode, G-A6 on the gateway-routed path) — two credit bounds,
+    /// both counted from forward until the owning worker CLAIMS the ack
+    /// (SessionSignal Credit returns it):
+    ///  * per WORKER (fix round 1, MAJOR-1): at most rune::node::Worker::
+    ///    kRoutedAckBudget (16384 = the worker's 32768-entry ack queue minus its
+    ///    own 16384 reserve: owed ceiling 8192 + one drain 4096 + one poll 4096)
+    ///    forwarded, unclaimed produces to one worker, summed over ALL sessions —
+    ///    so no number of stalled gateway sessions can eat the reserve (the
+    ///    worker's op drain / direct poll never run out of ack room for them).
+    ///    Fairness inside that cap: in its last quarter (the congested band)
+    ///    only LIGHT sessions — fewer than kLightSessionInFlight in flight to
+    ///    that worker — are admitted.  A stalled session sits at its whole budget
+    ///    (>= 64) so it is paused first, while up to 4096 / 64 = 64 light
+    ///    sessions (a new client, an interactive producer) keep being served.
+    ///  * per SESSION: sessionProduceCredits_ (default 1024 = 1/16 of the routed
+    ///    share, so one session never takes more than that of a worker; >= 1024
+    ///    batches in flight per session costs a gateway client nothing at sub-ms
+    ///    RTTs — Little: 1024 / 1 ms = 1M batches/s).
+    /// At either bound the session's next Produce frame is ABORTed (controlled
+    /// poll — that client's image only): the pause engages BEFORE any worker's
+    /// ack queue can fill, whatever its burst size, MTU or socket buffers.
+    /// RUNE_GATEWAY_PRODUCE_CREDITS (NodeConfig bounds it to 1 .. kMaxSessionProduceCredits).
+    static constexpr uint32_t kDefaultSessionProduceCredits = 1024;
+    static constexpr uint32_t kMaxSessionProduceCredits     = 4096;   // 1/4 of the routed share (static_assert, .cpp)
+    static constexpr uint32_t kLightSessionInFlight         = 64;
+    static constexpr uint32_t kWorkerRoutedCap              = 16384;  // == Worker::kRoutedAckBudget (static_assert, .cpp)
+    /// Normally set at construction (BrokerNode); safe at any time — the
+    /// paused-session count is recomputed against the new budget (LOW-2).
+    void setSessionProduceCredits(uint32_t n) noexcept {
+        sessionProduceCredits_ = (n >= 1 && n <= kMaxSessionProduceCredits) ? n : kDefaultSessionProduceCredits;
+        creditBlockedSessions_ = 0;
+        sessions_.forEach([&](const Session& s) { creditBlockedSessions_ += s.produceInFlight >= sessionProduceCredits_; });
+    }
+    [[nodiscard]] uint32_t sessionProduceCredits() const noexcept { return sessionProduceCredits_; }
 
     // Async Connect egress-resolve timeout: 5 seconds.
     static constexpr int64_t kDefaultConnectResolveTimeoutNs = 5LL * 1'000'000'000LL;
 
     // Maximum in-flight pending connects.  Beyond this cap, the oldest is evicted.
     static constexpr std::size_t kMaxPendingConnects = 64;
+    /// Task 13: most concurrent sessions in shard mode — one worker ack table's
+    /// capacity (SessionAckSink::kMaxSessions − 1; static_assert in the .cpp).
+    static constexpr std::size_t kShardMaxSessions = 4095;
+    /// Task 13 fix round 3 (re-review 2, finding 2): width of Session::
+    /// heldByWorkers — every shard worker must have a bit.  NodeConfig refuses
+    /// more shard workers (kMaxShardWorkers; static_assert in BrokerNode.cpp).
+    static constexpr int32_t kMaxHeldMaskWorkers = 64;
 
     // @param aeron                    Shared Aeron client (connected to a media driver).
     // @param clientChannel            Aeron channel the gateway listens on (clients publish here).
@@ -124,13 +193,19 @@ public:
     // @param sessionTimeoutNs         Idle session expiry threshold (default 10 s).
     // @param leaderView               Callable returning current LeaderView; default: always leader.
     // @param connectResolveTimeoutNs  How long before a pending-connect egress times out (default 5 s).
+    // @param pump                     Startup resolve pump for the ingress subscription (spec §3.6):
+    //                                 an invoker driver + conductor (fused runtime) is pumped by the
+    //                                 constructing thread; the default pump sleep-polls a threaded driver.
+    //                                 Production fused placement uses the default pump (BrokerNode's
+    //                                 interim runner services the runtime driver during start()).
     ClientGateway(std::shared_ptr<aeron::Aeron>       aeron,
                   std::string                         clientChannel,
                   int32_t                             clientStreamId,
                   int32_t                             thisNodeId,
                   int64_t                             sessionTimeoutNs         = kDefaultSessionTimeoutNs,
                   std::function<LeaderView()>         leaderView               = nullptr,
-                  int64_t                             connectResolveTimeoutNs  = kDefaultConnectResolveTimeoutNs);
+                  int64_t                             connectResolveTimeoutNs  = kDefaultConnectResolveTimeoutNs,
+                  rune::aeronutil::AeronPump          pump                     = {});
 
     ~ClientGateway() = default;
 
@@ -181,6 +256,7 @@ public:
     // -----------------------------------------------------------------------
     void setTopicRegistry(TopicRegistry* registry) noexcept {
         topicRegistry_ = registry;
+        resetInlinePsm_();   // M4: a new registry = new partition identities
     }
 
     // -----------------------------------------------------------------------
@@ -203,6 +279,7 @@ public:
     // -----------------------------------------------------------------------
     void setReplicaRegistry(rune::node::ReplicaRegistry* registry) noexcept {
         replicaRegistry_ = registry;
+        resetInlinePsm_();   // M4: the facts' incarnations belong to the old registry
     }
 
     // -----------------------------------------------------------------------
@@ -251,6 +328,23 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // Task 8a: setAdminSink — wire in the schema DDL request sink (RULING-2 F).
+    // Accepts any IAdminRequestSink (e.g. the AdminWorkerAgent ring adapter).
+    // On DefineTopic (64) / GetTopicSchema (66), the gateway validates the frame,
+    // requires a known session, decodes, copies the fields into the sink, and
+    // RETURNS immediately — never blocks the produce hot path on DDL.
+    // May be null (DDL messages are dropped).  Non-owning; must outlive the
+    // gateway.  Single-writer: call only on the duty-cycle thread.
+    // -----------------------------------------------------------------------
+    void setAdminSink(rune::gateway::IAdminRequestSink* sink) noexcept {
+        adminSink_ = sink;
+    }
+
+    [[nodiscard]] rune::gateway::IAdminRequestSink* adminSink() const noexcept {
+        return adminSink_;
+    }
+
+    // -----------------------------------------------------------------------
     // MD1 Task 9: Per-partition routing image.
     //
     // setRoutingImageSnapshot — install a new routing image snapshot.
@@ -270,6 +364,11 @@ public:
     void setRoutingImageSnapshot(
             std::shared_ptr<const rune::metadata::RoutingImage> img) noexcept {
         routingImage_ = std::move(img);
+        // D9: a partition whose leadership moved fails its in-flight remote
+        // markers NotLeader (event-driven; the TCS retry re-routes) — done by
+        // the next marker pump of this same thread (review LOW-7: never calls
+        // into the coordinator from inside the routing publish).
+        routingChangedForMarkers_ = true;
     }
 
     [[nodiscard]]
@@ -309,9 +408,39 @@ public:
         committedMetadataReady_ = ready;
     }
 
+    // Task 11 fix 1: this node's leadership for the current duty cycle, pushed
+    // by the runtime agent (same thread) right after consensus runs.  Once set,
+    // doWork() reads it instead of calling the LeaderView std::function every
+    // cycle (no indirect call, no std::string build on followers).  Unset (-1):
+    // the LeaderView callable is used (gateway-only tests).
+    void setLocalLeadership(bool leader) noexcept { localLeader_ = leader ? 1 : 0; }
+
     [[nodiscard]]
     bool committedMetadataReady() const noexcept {
         return committedMetadataReady_;
+    }
+
+    // -----------------------------------------------------------------------
+    // Cluster-unique ids: every session id and subscription id this gateway
+    // allocates carries ((nodeId + 1) << 40) in its high bits, so ids never
+    // collide across the cluster's nodes (a client holding one session per
+    // node demultiplexes Records by subscriptionId).  Always positive.  The
+    // production constructor sets it from thisNodeId; test constructors keep
+    // the historical small ids unless a test sets it.
+    // -----------------------------------------------------------------------
+    static constexpr int kClusterIdShift = 40;
+    [[nodiscard]] static constexpr int64_t clusterIdPrefix(int32_t nodeId) noexcept {
+        return static_cast<int64_t>(nodeId + 1) << kClusterIdShift;
+    }
+/// MAJOR-2 (CG routing): the ConnectRequest.clientVersion of a live session,
+    /// -1 when the session is unknown.
+    [[nodiscard]] int32_t sessionClientVersion(int64_t sessionId) {
+        Session* s = sessions_.find(sessionId);
+        return s != nullptr ? s->clientVersion : -1;
+    }
+    void setClusterIdNode(int32_t nodeId) noexcept {
+        idPrefix_ = nodeId >= 0 ? clusterIdPrefix(nodeId) : 0;
+        sessions_.setIdPrefix(idPrefix_);
     }
 
     void setNodeEndpointMap(
@@ -332,8 +461,17 @@ public:
     // Must be called before doWork() on the duty-cycle thread (single-writer).
     // The pointer is non-owning; the WorkerPool must outlive the gateway.
     // -----------------------------------------------------------------------
-    void setWorkerPool(rune::node::WorkerPool* pool) noexcept {
-        workerPool_ = pool;
+    // F15 S3 (re-review 2 B-1): also narrows the produce batch limit to the
+    // pool's worker intake limit, so a gateway-routed batch the worker op /
+    // return ring cannot carry is answered MessageTooLarge, never thrown.
+    void setWorkerPool(rune::node::WorkerPool* pool) noexcept;
+    /// F15 S3 (re-review 2 B-1) ⇄ F18: THE client-visible batch limit — the ONE
+    /// gateway setter.  BrokerNode sets NodeConfig::produceIntakeLimit()
+    /// (= rune::node::Worker::maxAcceptableBatchBytes(config): rings, replication
+    /// frame, egress frame) before the gateway serves; clamped to the 8 MiB
+    /// kMaxProduceBatchBytes.  The same value bounds every worker's guard.
+    void setMaxProduceBatchBytes(std::size_t n) noexcept {
+        maxProduceBatchBytes_ = std::min(n, kMaxProduceBatchBytes);
     }
 
     [[nodiscard]] rune::node::WorkerPool* workerPool() const noexcept {
@@ -355,6 +493,15 @@ public:
 
     [[nodiscard]] bool perWorkerIngressActive() const noexcept {
         return perWorkerIngressActive_;
+    }
+
+    // Self-contained worker shards (spec §3.3): every node's explicitly configured
+    // per-worker ingress base (RUNE_PEERS, never derived).  handleMetadata advertises
+    // ingressEndpoint = "<leader.host>:<leader.basePort + ownerWorker>" per partition;
+    // a leader with no entry (or basePort 0) gets an empty endpoint.  Empty vector
+    // (legacy default) → no endpoint, no trailer.  Set before doWork() runs.
+    void setShardIngressEndpoints(std::vector<ShardIngressEndpoint> eps) noexcept {
+        shardIngressEndpoints_ = std::move(eps);
     }
 
     // read-rework T3/T4 (I3b): setPerWorkerEgressActive — when active, the gateway
@@ -399,6 +546,15 @@ public:
         return workerIngressBaseStreamId_;
     }
 
+    // Test-only: override the client ingress stream id (normally set via the
+    // production constructor).  Used to verify that, with per-worker ingress
+    // INACTIVE, the MetadataResponse advertises this stream (so the client can
+    // route per-partition to the true leader on the shared gateway stream)
+    // rather than the disabling sentinel 0.
+    void setClientStreamIdForTest(int32_t streamId) noexcept {
+        clientStreamId_ = streamId;
+    }
+
     // read-rework T3/T4 (I4): configure the per-worker dynamic-MDC egress params so
     // handleMetadata can advertise each partition's egress control port + stream id
     // (control port = base + ownerWorker; stream id = base + ownerWorker).  Only
@@ -413,6 +569,9 @@ public:
     // Default: 1 (single-node safe; for 3-node clusters, set to 2).
     // Thread-safe (atomic store): may be called from any thread.
     // -----------------------------------------------------------------------
+    /// The effective client-visible batch limit (see setMaxProduceBatchBytes).
+    [[nodiscard]] std::size_t maxProduceBatchBytes() const noexcept { return maxProduceBatchBytes_; }
+
     void setMinIsr(int minIsr) noexcept {
         minIsr_.store((minIsr >= 1) ? minIsr : 1, std::memory_order_relaxed);
     }
@@ -440,6 +599,16 @@ public:
     [[nodiscard]] int32_t fragmentLimit() const noexcept {
         return fragmentLimit_;
     }
+
+    // (F3 round 4/5's verbatim setMaxProduceBatchBytes is merged into the ONE
+    //  setter above — S3's, clamped to kMaxProduceBatchBytes; BrokerNode refuses
+    //  to start when the effective limit cannot carry one record, F3 M3.)
+    [[nodiscard]] uint64_t oversizeProduceRejectLogsForTest() const noexcept {
+        return oversizeProduceRejectLogs_;
+    }
+    /// EOS-DUP defense (inline path): produces rejected because the frame's
+    /// producer identity disagreed with the RecordBatch header.
+    [[nodiscard]] uint64_t identityMismatchRejects() const noexcept { return identityMismatchRejects_; }
 
     // -----------------------------------------------------------------------
     // pendingAckCount — number of deferred acks=All entries waiting for HW.
@@ -501,14 +670,107 @@ public:
     // \param partition Partition index.
     // \param marker    Raw control batch bytes (already CRC-covered by build()).
     //
-    // \returns baseOffset of the appended marker, or -1 if the topic/partition
-    //          is unknown or the replica is not in leader role.
+    // \param producerId / commit  the marker's producer + COMMIT/ABORT, used when
+    //          the append is asynchronous (see kControlRecordAsync).
+    //
+    // \returns baseOffset of the appended marker (synchronous paths: the caller
+    //          then calls notifyControlMarker); kControlRecordAsync when the
+    //          marker was handed to the owning worker — the offset is NOT known
+    //          yet and is never pre-computed (Task 10 round 4, P1): the gateway
+    //          itself calls notifyControlMarker with the offset the worker
+    //          ACTUALLY appended at, or surfaces a failure to the txn
+    //          coordinator; or -1 if the topic/partition is unknown or the
+    //          replica refused the append.
     //
     // Single-writer: must be called on the duty-cycle thread.
     // ---------------------------------------------------------------------------
+    static constexpr int64_t kControlRecordAsync = -2;
+    /// \param coordinatorEpoch  the epoch of the coordinator dispatching the
+    ///          marker (F15 m3): queued entries are tagged with it, purged by
+    ///          purgeQueuedMarkers() when that coordinator unloads, and echoed
+    ///          to onControlMarkerLanded / onControlMarkerRefused.
     int64_t appendControlRecord(int32_t                    topicId,
                                 int32_t                    partition,
-                                std::span<const uint8_t>   marker);
+                                std::span<const uint8_t>   marker,
+                                int64_t                    producerId,
+                                bool                       commit,
+                                int32_t                    coordinatorEpoch);
+
+    // -----------------------------------------------------------------------
+    // D9: cross-node transaction markers.
+    //
+    // Coordinator side: appendControlRecord resolves the partition's leader
+    // from the routing image; a REMOTE leader gets the marker as a
+    // WriteTxnMarker over the cluster plane (same markersInFlight_ token table,
+    // kControlRecordAsync); its WriteTxnMarkerResponse completes it through the
+    // SAME callbacks as a local marker (onControlMarkerLanded / Refused).  A
+    // routing-image leader change fails in-flight remote markers NotLeader.
+    //
+    // Leader side: appendRemoteControlRecord takes the same worker op-ring
+    // path as a local marker; the result is answered to the ORIGIN node
+    // instead of this node's own coordinator.
+    //
+    // The channel is plain function pointers + ctx (no virtual, no
+    // std::function); BrokerNode wires it to the AeronPartitionTransport.
+    // Unset (single node / unit rigs) = no forwarding (today's behaviour).
+    // All of it runs on the duty-cycle (runtime) thread.  Cold path.
+    // -----------------------------------------------------------------------
+    struct TxnMarkerChannel {
+        bool (*sendMarker)(void* ctx, int32_t toNode, const rune::replication::WriteTxnMarkerMsg& m) = nullptr;
+        bool (*sendResponse)(void* ctx, int32_t toNode,
+                             const rune::replication::WriteTxnMarkerResponseMsg& r) = nullptr;
+        void* ctx = nullptr;
+    };
+    void setTxnMarkerChannel(const TxnMarkerChannel& ch) noexcept { txnMarkerChannel_ = ch; }
+    /// Leader side: a coordinator's marker for a partition this node leads.
+    void appendRemoteControlRecord(const rune::replication::WriteTxnMarkerMsg& m);
+    /// Coordinator side: the partition leader's answer.
+    void onRemoteControlRecordResponse(const rune::replication::WriteTxnMarkerResponseMsg& r);
+    /// AeronPartitionTransport handler thunks (ctx = the gateway).
+    static void onWriteTxnMarkerThunk(void* self, const rune::replication::WriteTxnMarkerMsg& m) {
+        static_cast<ClientGateway*>(self)->appendRemoteControlRecord(m);
+    }
+    static void onWriteTxnMarkerResponseThunk(void* self, const rune::replication::WriteTxnMarkerResponseMsg& r) {
+        static_cast<ClientGateway*>(self)->onRemoteControlRecordResponse(r);
+    }
+    /// Review MAJOR-1: the cluster plane's link to `peer` came back (down→up
+    /// edge; -1 = a new inbound image whose peer is unknown) — every remote
+    /// marker in flight to it (to everyone for -1) is RE-SENT with the SAME
+    /// token by the next marker pump.  A remote marker completes only on a real
+    /// answer or a leadership change — never on a timer.
+    void onPlaneReconnect(int32_t peer) {
+        if (peer < 0) resendAllRemoteMarkers_ = true;
+        else if (std::find(reconnectedPeers_.begin(), reconnectedPeers_.end(), peer) == reconnectedPeers_.end())
+            reconnectedPeers_.push_back(peer);
+    }
+    static void onPlaneReconnectThunk(void* self, int32_t peer) {
+        static_cast<ClientGateway*>(self)->onPlaneReconnect(peer);
+    }
+    /// Test-only: this node's id (the test factories use 0).
+    void setNodeIdForTest(int32_t id) noexcept { thisNodeId_ = id; }
+    /// Test-only: the token of the last marker issued (tokens carry a boot incarnation).
+    [[nodiscard]] int64_t lastMarkerTokenForTest() const noexcept { return nextMarkerToken_ - 1; }
+    /// Test-only: doWork's marker step at `nowNs` (test gateways have no Aeron to poll).
+    int pumpTxnMarkersForTest(int64_t nowNs) { nowNs_ = nowNs; return pumpTxnMarkers_(); }
+    [[nodiscard]] std::size_t remoteMarkerIndexSizeForTest() const noexcept { return lastRemoteMarker_.size(); }
+    /// Re-review 2 MEDIUM-2: a producer expired on this node — forget its
+    /// remote-marker idempotence entries (it can have no open transaction left
+    /// for a stale copy to close).  Control thread.  Cold.
+    void onProducerExpired(int64_t producerId);
+    /// Test-only: remote markers that came back LANDED (re-review LOW-1).
+    [[nodiscard]] uint64_t remoteMarkersLandedForTest() const noexcept { return remoteMarkersLanded_; }
+    [[nodiscard]] std::size_t remoteMarkersInFlightForTest() const noexcept {
+        std::size_t n = 0;
+        for (const auto& [t, m] : markersInFlight_) n += m.remoteNode >= 0 ? 1u : 0u;
+        return n;
+    }
+
+    /// F15 m3: drop every marker still waiting in markerSendQueue_ (never
+    /// handed to a worker) whose coordinatorEpoch < @p olderThan.  Markers
+    /// already on a worker ring land (they carry a durable decision and are
+    /// idempotent); their replies are then ignored by the coordinator.
+    /// \returns the number of markers purged.  Control thread only.
+    std::size_t purgeQueuedMarkers(int32_t olderThan);
 
     // -----------------------------------------------------------------------
     // TX-4 Task 9 test hooks — feed the per-partition LSO tracker from external
@@ -571,6 +833,18 @@ public:
     bool sendControlFrame(int64_t sessionId, const uint8_t* buf, std::size_t len);
 
     // -----------------------------------------------------------------------
+    // fsyncgate fail-stop (Task 10 fix 1): invoked on THIS duty-cycle thread when
+    // a worker signals StorageFailure over its return ring, or when the gateway's
+    // own flushDirtyLogs sync fails.  BrokerNode wires it to its halt path.
+    // Cold path (std::function is fine).  Called at most once.
+    // -----------------------------------------------------------------------
+    using StorageFailureHandler = std::function<void(const std::string& logDir, int err)>;
+    void setStorageFailureHandler(StorageFailureHandler h) { storageFailureHandler_ = std::move(h); }
+    /// Invariant violations detected on the duty-cycle thread (halt, exit 70).
+    using InvariantViolationHandler = std::function<void(const std::string& what)>;
+    void setInvariantViolationHandler(InvariantViolationHandler h) { invariantViolationHandler_ = std::move(h); }
+
+    // -----------------------------------------------------------------------
     // CG-4 test / introspection hooks — not used in production code paths.
     // -----------------------------------------------------------------------
 
@@ -617,9 +891,12 @@ public:
     //
     // Returns the allocated sessionId.
     // Single-writer: call only on the duty-cycle thread or before doWork() starts.
-    int64_t injectTestSession(int64_t nowNs = 0) {
+    // D6: clientVersion = the session's ConnectRequest.clientVersion (default:
+    // the current client, which understands UnknownProducerId).
+    int64_t injectTestSession(int64_t nowNs = 0,
+                              int32_t clientVersion = rune::protocol::client::kClientVersion) {
         const int64_t sid = sessions_.nextSessionId();
-        sessions_.add(sid, /*egress=*/nullptr, nowNs);
+        sessions_.add(sid, /*egress=*/nullptr, nowNs, {}, 0, clientVersion);
         return sid;
     }
 
@@ -646,6 +923,13 @@ public:
     void applySubscribeForTest(const uint8_t* buf, std::size_t len) {
         handleSubscribe(buf, len);
     }
+    /// Test seam: feed a raw Unsubscribe frame through handleUnsubscribe().
+    void applyUnsubscribeForTest(const uint8_t* buf, std::size_t len) {
+        handleUnsubscribe(buf, len);
+    }
+    /// Test seam: one gateway push pass (pushSubscriptions) without doWork's
+    /// Aeron polling.
+    void pushSubscriptionsForTest() { pushSubscriptions(); }
 
     // -----------------------------------------------------------------------
     // applyProduceForTest — feed a raw Produce frame through the real
@@ -655,7 +939,7 @@ public:
     // Single-writer: call only on the duty-cycle thread or before doWork().
     // -----------------------------------------------------------------------
     void applyProduceForTest(const uint8_t* buf, std::size_t len) {
-        handleProduce(buf, len);
+        (void)handleProduce(buf, len);
     }
 
     // -----------------------------------------------------------------------
@@ -663,8 +947,21 @@ public:
     // the real handleMetadata() path (test seam), parallel to applyProduceForTest.
     // Single-writer: call only on the duty-cycle thread or before doWork().
     // -----------------------------------------------------------------------
+    void applyDisconnectForTest(const uint8_t* buf, std::size_t len) { handleDisconnect(buf, len); }
     void applyMetadataForTest(const uint8_t* buf, std::size_t len) {
         handleMetadata(buf, len);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 8a: DDL test seams — feed a raw DefineTopic (64) / GetTopicSchema (66)
+    // frame through the real handler path (route to the admin sink).
+    // Single-writer: call only on the duty-cycle thread or before doWork().
+    // -----------------------------------------------------------------------
+    void applyDefineTopicForTest(const uint8_t* buf, std::size_t len) {
+        handleDefineTopic(buf, len);
+    }
+    void applyGetTopicSchemaForTest(const uint8_t* buf, std::size_t len) {
+        handleGetTopicSchema(buf, len);
     }
 
     // -----------------------------------------------------------------------
@@ -681,6 +978,14 @@ public:
             }
         }
         return -1;
+    }
+
+    // F19: the push cursor (nextOffset) of subscription `subscriptionId`, or -1
+    // if no such subscription.  Tests assert a non-deliverable batch is never
+    // silently skipped (the cursor does not move past it).
+    [[nodiscard]] int64_t subscriptionNextOffsetForTest(int64_t subscriptionId) const {
+        const auto it = subscriptions_.find(subscriptionId);
+        return it == subscriptions_.end() ? -1 : it->second.nextOffset;
     }
 
     // -----------------------------------------------------------------------
@@ -700,22 +1005,30 @@ private:
     // alloc on the hot path).  Drained in drainPendingAcks() each doWork()
     // cycle after the replica's HW has advanced for this cycle.
     //
-    // Safety invariants:
-    //   - replica pointer is non-owning; outlives the gateway (same lifetime
-    //     contract as replicaRegistry_ pointer).
+    // Safety invariants (Task 10 round 4, Important 3):
+    //   - NO replica pointer is held.  The entry names its replica by
+    //     (topicId, partition, incarnation) and drainPendingAcks resolves it
+    //     through the ReplicaRegistry on EVERY check.  A miss or a different
+    //     incarnation (the partition was removed / re-created) = stale: the
+    //     ack fails RETRIABLY with NotLeader — nothing freed is dereferenced.
+    //   - incarnation 0 = the replica was not registered (unit-test fixtures):
+    //     resolved by (topicId, partition) alone.
     //   - All fields set once on enqueue; read-only during drain.
     //   - Single-writer: only touched on the duty-cycle thread.
     // -----------------------------------------------------------------------
     struct PendingAck {
         int64_t      sessionId     = 0;   ///< owning session
         int64_t      correlationId = 0;   ///< echoed back in ProduceResponse
+        int32_t      topicId       = 0;   ///< replica identity (with partition + incarnation)
         int32_t      partition     = 0;   ///< partition (echoed in ProduceResponse)
+        uint32_t     incarnation   = 0;   ///< replica incarnation at enqueue (0 = unregistered)
         int64_t      baseOffset    = 0;   ///< first offset of the batch
         int64_t      lastOffset    = 0;   ///< last offset of the batch (HW must reach this)
         int64_t      enqueuedAtNs  = 0;   ///< for timeout eviction
-        // Non-owning: null only when replicaRegistry_ is not set (passthrough mode,
-        // which does not produce acks=All entries).
-        rune::replication::PartitionReplica* replica = nullptr;
+        /// The replica's logGeneration() the waiter last validated against
+        /// (truncation / reconcile: the worker path's §3.2 rule, see
+        /// inlineWaiterStillValid_).
+        uint64_t     logGen        = 0;
     };
 
     // -----------------------------------------------------------------------
@@ -726,11 +1039,11 @@ private:
     // copied into `bytes` at enqueue time (encode-once strategy); `sessionId`
     // identifies the egress session on drain.
     //
-    // kMaxBytes = 512 covers ProduceResponse (38 B) and ErrorResponse with a
+    // kMaxBytes = 512 covers ProduceResponse (46 B, D6) and ErrorResponse with a
     // typical redirect URL (< ~450 B).  Responses that exceed kMaxBytes are
     // sent best-effort and NOT enqueued (same as pre-fix behaviour for those
     // rare oversized frames).  A static_assert in sendRespReliable_ ensures the
-    // produce-ack path (ProduceResponse::ENCODED_SIZE = 38) always fits.
+    // produce-ack path (ProduceResponse::ENCODED_SIZE = 46) always fits.
     //
     // Single-writer: all accesses are on the duty-cycle thread only.
     // -----------------------------------------------------------------------
@@ -761,6 +1074,10 @@ private:
     struct Subscription {
         int64_t subscriptionId = 0;
         int64_t sessionId      = 0;
+        // The correlationId of the client's Subscribe that created it: stamped
+        // on every Records push so the client binds the push to ITS request
+        // (exact instance identity, before and after the SubscribeResponse).
+        int64_t subscribeCorrId = 0;
         int32_t topicId        = 0;
         int32_t partition      = 0;
         int64_t nextOffset     = 0;
@@ -775,6 +1092,33 @@ private:
         // correct isolation is applied on the next duty cycle — no data loss, no
         // premature skip under a wrong isolation assumption.
         bool    groupCarrierReceived = false;
+        // ONE failure state for a push subscription (F15 S3 re-review 1 I-4 ⇄
+        // F19, merged in integration wave 2), two error paths:
+        //   - the owning worker answered a PushRead MessageTooLarge (a stored
+        //     batch larger than its return ring), or
+        //   - the next stored batch's Records frame exceeds this session's
+        //     egress publication maxMessageLength (F19).
+        // Either way the subscription is parked AT that batch (nextOffset not
+        // advanced, no further PushRead / reads / pushes: no spin) until the
+        // client unsubscribes, and owes the client one non-retriable
+        // ErrorResponse{MessageTooLarge, correlationId 0, message naming the
+        // subscription} (rune::node::encodePushTooLargeError) — re-offered each
+        // cycle until sent (errorOwed).
+        bool    failed         = false;
+        bool    errorOwed      = false;
+        rune::node::PushTooLargeCause failedCause = rune::node::PushTooLargeCause::EgressFrame;
+        std::size_t failedFrameLen = 0;   // EgressFrame: the undeliverable Records frame size
+        // F15 S4 addendum R-1 / R-3 (worker-pool PushRead path): the cursor and
+        // the HW snapshot of the PushRead in flight, and the HW snapshot at
+        // which the owning worker answered "nothing below its bound" (-1: not
+        // parked).  The subscription is not re-read until the gateway's HW
+        // snapshot moves past parkedAtHw, or its isolation carrier arrives.
+        int64_t issuedNextOffset = -1;
+        int64_t issuedHw         = -1;
+        int64_t parkedAtHw       = -1;
+        // Review I-2 fallback: push-cycle backoff after a notReady answer.
+        int64_t notReadyBackoff  = 0;
+        int64_t retryAtCycle     = 0;
     };
 
     // -----------------------------------------------------------------------
@@ -803,6 +1147,20 @@ private:
         // be created lazily on the first subscribe.
         std::string egressChannel;
         int32_t     egressStreamId = 0;
+        int32_t     clientVersion  = 0;   ///< D6: ConnectRequest.clientVersion
+
+        // Task 13 (spec §3.4): every worker has this session's reply destination
+        // queued (announce-before-accept) — set once, so a ConnectResponse retry
+        // never re-announces.  announceBegun (fix round 1, I2): at least one
+        // worker may hold it — it counts against the shard session cap, and
+        // EVERY drop of this entry (timeout, eviction, error) closes it on every
+        // worker.
+        bool        announced     = false;
+        bool        announceBegun = false;
+        // Fix round 2 (LOW-4): the client's reply host is a NAME — resolved off
+        // the duty thread (PeerResolverHub); no publication registered yet
+        // (registrationId unused) until the numeric endpoint is known.
+        bool        awaitingResolve = false;
     };
 
     // -----------------------------------------------------------------------
@@ -823,13 +1181,15 @@ private:
     // MD1 Task 10: Metadata request — answerable by any node (reads routingImage_ + nodeEndpointMap_).
     void handleMetadata     (const uint8_t* buf, std::size_t len);
     // GB-2: Produce handler — offset-assignment + leader-local append.
-    void handleProduce      (const uint8_t* buf, std::size_t len);
+    /// false = deferred, not consumed (D8c per-worker cap; shard mode only).
+    bool handleProduce      (const uint8_t* buf, std::size_t len);
     // read-rework T3/T4 (I3b): route subscription lifecycle to the owning worker
     // (per-worker egress).  Look up the Log/replica for (topicId, partition) and
     // enqueue a Subscribe/Unsubscribe WorkerOp via workerPool_->tryEnqueueOp.
     void forwardSubscribeToWorker_(int64_t subId, int64_t sessionId, int32_t topicId,
                                    int32_t partition, int64_t nextOffset, uint8_t isolation,
-                                   bool isGroup, bool groupCarrierReceived);
+                                   bool isGroup, bool groupCarrierReceived,
+                                   int64_t subscribeCorrId = 0);
     void forwardUnsubscribeToWorker_(int64_t subId, int32_t topicId, int32_t partition);
 
     // Hybrid egress: a Subscribe deferred until its session's per-consumer UNICAST
@@ -838,6 +1198,7 @@ private:
     // pollPendingRecordEgress_ once the pub is ready.
     struct BufferedSubscribe {
         int64_t subId              = 0;
+        int64_t subscribeCorrId    = 0;  // stamped on the worker's Records pushes
         int64_t sessionId          = 0;
         int32_t topicId            = 0;
         int32_t partition          = 0;
@@ -857,10 +1218,45 @@ private:
 
     // Build + route a Subscribe WorkerOp with the resolved egress pub (may be null
     // → MDC fallback).
+    rune::node::WorkerOp buildSubscribeOp_(const BufferedSubscribe& s, void* egressPub) const;
     void enqueueSubscribeOp_(const BufferedSubscribe& s, void* egressPub);
     // Resolve in-flight record-egress pubs (non-blocking) + drain buffered
     // subscribes.  Called from doWork().
     void pollPendingRecordEgress_(int64_t nowNs);
+    // A resolved record-egress pub: cache it on its Session (never replacing a
+    // cached one) and forward the buffered subscribes with the CACHED pointer.
+    void onRecordEgressResolved_(int64_t sessionId, int32_t workerId, PendingRecordEgress& pend,
+                                 std::shared_ptr<aeron::ExclusivePublication> pub);
+
+    // -----------------------------------------------------------------------
+    // Record-egress publication lifetime — RETIRE-ON-ACK (2026-10-05 fix).
+    //
+    // A per-(session, worker) record-egress pub is handed to worker w as a RAW
+    // pointer (WorkerOp::egressPub); the worker stores it in its subscription
+    // table and writes through it on every push pass.  The gateway must
+    // therefore never destroy it while w may still hold it.  When the session
+    // closes, each of its pubs moves here (still owned — the shared_ptr never
+    // crosses threads) and w is sent a release op on its op ring — the SAME
+    // FIFO ring as every Subscribe op that carried the pointer, so it executes
+    // after them: the worker drops every subscription referencing the pointer
+    // and answers SessionSignal::EgressReleased(token) on its return ring.
+    // Only that acknowledgement destroys the pub (onEgressReleased_).  A
+    // release op a full ring refuses is retried every doWork (never dropped).
+    // Event-driven: no timer decides when a pub is freed.  Cold (close rate).
+    // States per entry: Unsent (enqueued=false) → AwaitingAck (enqueued=true)
+    // → destroyed on the ack.
+    // -----------------------------------------------------------------------
+    struct RetiringEgress {
+        uint64_t                                      token     = 0;
+        int64_t                                       sessionId = 0;
+        int32_t                                       worker    = 0;
+        std::shared_ptr<aeron::ExclusivePublication>  pub;
+        bool                                          enqueued  = false;
+    };
+    void retireRecordEgress_(int64_t sid, int32_t worker, std::shared_ptr<aeron::ExclusivePublication> pub);
+    bool tryEnqueueEgressRelease_(const RetiringEgress& r);
+    int  pumpEgressReleases_();
+    void onEgressReleased_(int32_t worker, uint64_t token);
     // GB-3: Subscribe/Unsubscribe handlers.
     void handleSubscribe    (const uint8_t* buf, std::size_t len);
     void handleUnsubscribe  (const uint8_t* buf, std::size_t len);
@@ -870,6 +1266,11 @@ private:
     // TX-3: Transaction coordination handler — routes templateIds 45,47,49,51,53
     // to TransactionCoordinationService.
     void handleTxnMessage   (const uint8_t* buf, std::size_t len, int64_t nowNs, uint16_t tid);
+    // Task 8a: schema DDL handlers — route DefineTopic (64) / GetTopicSchema (66)
+    // to the admin sink (ring hand-off).  Validate frame + require known session,
+    // decode, copy fields into the sink, RETURN immediately (no hot-path blocking).
+    void handleDefineTopic  (const uint8_t* buf, std::size_t len);
+    void handleGetTopicSchema(const uint8_t* buf, std::size_t len);
     // GB-3: Push delivery — called from doWork after ingress poll.
     void pushSubscriptions  ();
     // GB-5p2: Group-commit flush — called from doWork() once per cycle AFTER all
@@ -905,6 +1306,82 @@ private:
     // Single-writer: duty-cycle thread only.
     // -----------------------------------------------------------------------
     void enqueueOrBestEffort_(Session& session, const uint8_t* buf, std::size_t len);
+    void sendSubscribeAnswer_(Session& session, const uint8_t* buf, std::size_t len);
+    // Task 13 fix round 1: shard-mode session lifecycle helpers.
+    /// Worker ack-table slots in use or about to be (I2): accepted sessions +
+    /// closes not yet queued on every worker + pending connects whose
+    /// announcement has begun.
+    [[nodiscard]] std::size_t shardSessionSlotsInUse_() const noexcept;
+    /// A dropped pending connect whose announcement began → close everywhere.
+    void closeDroppedPendingConnect_(const PendingConnect& pending);
+    /// Close an accepted session (Disconnect / SessionFailed): table, workers,
+    /// subscriptions, group-member tracking.  False = unknown session (no-op).
+    bool closeSession_(int64_t sid, bool notifyExpired = false);
+    /// Fix round 2 (finding 1) + D8c: a Produce frame of a session some worker
+    /// holds acks for (Held) or that has no produce credit left — the
+    /// shard-mode poll ABORTs it (that client's image only).
+    enum class ProducePause : uint8_t { None, Held, NoCredit };
+    [[nodiscard]] ProducePause produceFramePause_(const uint8_t* buf, std::size_t len);
+    [[nodiscard]] bool produceFrameHeld_(const uint8_t* buf, std::size_t len) {
+        return produceFramePause_(buf, len) != ProducePause::None;
+    }
+    /// Shard-mode controlled-poll decision for one reassembled client frame:
+    /// false = ABORT (counted), true = dispatch it.  One branch when no session
+    /// is paused.
+    [[nodiscard]] bool admitClientFrame_(const uint8_t* buf, std::size_t len);
+    /// D8c: one produce of `s` was forwarded to a worker / `n` of its acks were claimed.
+    void takeProduceCredit_(Session& s, int32_t worker) noexcept;
+    void returnProduceCredits_(Session& s, int32_t worker, int64_t n) noexcept;
+    /// D8c fix round 1: may `s` forward one more produce to `worker` (the
+    /// per-worker routed cap + its congested-band fairness rule)?
+    enum class WorkerAdmit : uint8_t { Admit, Band, Full };
+    [[nodiscard]] WorkerAdmit workerAdmitsProduce_(int32_t worker, const Session& s) const noexcept;
+    /// D8c fix round 2 (re-review MEDIUM-R1): the worker's routed share is FULL
+    /// and a frame was deferred — advance its cap-full episode; may expire the
+    /// held session with the largest share on that worker (see the .cpp).
+    void onWorkerCapFull_(int32_t worker);
+    /// Leaving a cap-full episode: the worker's routed share dropped below the
+    /// congested band (congestion resolved).  Credits inside the band keep the
+    /// episode (and the reader marks made in it).
+    void noteWorkerShareFreed_(int32_t worker) noexcept {
+        if (routedInFlight_[static_cast<std::size_t>(worker)] < workerRoutedCap_ - workerRoutedCap_ / 4)
+            capEpisode_[static_cast<std::size_t>(worker)] = CapEpisode{};
+    }
+    /// Validate + dispatch one reassembled client frame (onFragment's body).
+    /// false = the frame was NOT consumed (a produce deferred by the per-worker
+    /// cap): the shard-mode controlled poll ABORTs it and redelivers it later.
+    bool onClientFrame_(const uint8_t* buf, std::size_t len);
+    void onSessionSignal_(const rune::node::WorkerReturn& ret);
+    void sendSessionExpired_(aeron::ExclusivePublication* pub, Session* session, int64_t sid);
+    /// Evict the oldest pending connect (the kMaxPendingConnects cap).
+    void evictOldestPendingConnect_();
+    /// Encode an ErrorResponse{code} into scratch_ and send it reliably.
+    void sendErrorResponse_(Session& session, int64_t sessionId, int64_t correlationId,
+                            rune::protocol::client::ErrorCode code);
+
+    // F19: fail push subscription `sub` once — its next batch (at
+    // sub.nextOffset, Records frame `frameLen` bytes) exceeds the session
+    // egress maxMessageLength.  Sets sub.failed + errorOwed, logs, and tries the
+    // error (trySendOwedPushError_).  The cursor is NOT advanced.  Cold path.
+    // Single-writer: duty-cycle thread only.
+    void failPushSubscriptionTooLarge_(Subscription& sub, Session& session, std::size_t frameLen);
+
+    // F19: offer the owed ErrorResponse{MessageTooLarge, correlationId 0,
+    // message "subscription S topic T partition P offset O: ..."} directly on
+    // the session egress; clears errorOwed only once sent (retry-until-sent,
+    // like the worker's ErrorOwed — never best-effort).  Cold path.
+    void trySendOwedPushError_(Subscription& sub, Session& session);
+
+    // F19: test-only capture of a Records frame for a null-egress session
+    // (injectTestSession) via onEgressFrame_.  Kept out of pushRecords_ so the
+    // production send helper never allocates.
+    [[gnu::cold]] void captureTestRecordsFrame_(Session& session,
+                                                const rune::protocol::client::Records& rec);
+
+    // F19: send one Records frame for `rec` on `session` (tryClaim fast path /
+    // vectored offer / null-egress test hook).  Returns the RecordsSendResult.
+    rune::node::RecordsSendResult pushRecords_(Session& session,
+                                               const rune::protocol::client::Records& rec);
 
     // -----------------------------------------------------------------------
     // G0.1: sendRespReliable_ — private production implementation.
@@ -916,11 +1393,15 @@ private:
     // currentProduceSessionId_.  All internal callers (handleProduce) should
     // call sendRespReliable_() directly for clarity.
     // -----------------------------------------------------------------------
+    // D6: `ec` is mapped for the session's client version
+    // (produceErrorForClient); logStartOffset is carried on the wire (-1 =
+    // not carried — set only with UnknownProducerId).
     bool sendRespReliable_(Session& session,
                            rune::protocol::client::ErrorCode ec,
                            int32_t                           partition,
                            int64_t                           baseOffset,
-                           int64_t                           correlationId);
+                           int64_t                           correlationId,
+                           int64_t                           logStartOffset = -1);
 
     // G0.1: offerBytes_ — try to offer encoded bytes on the egress.
     // Returns > 0 on success, <= 0 on back-pressure.
@@ -960,16 +1441,6 @@ private:
     void drainPendingReleases();
 
     // -----------------------------------------------------------------------
-    // Resolve a new ExclusivePublication (bounded wait).
-    // Returns nullptr if the publication cannot be resolved within the deadline.
-    // NOTE: kept for the redirect path (non-leader with known leader endpoint),
-    // which still needs a synchronous resolve to send the ErrorResponse.
-    // The regular (leader-accept) Connect path is now async via pendingConnects_.
-    // -----------------------------------------------------------------------
-    std::shared_ptr<aeron::ExclusivePublication>
-    resolvePublication(const std::string& channel, int32_t streamId);
-
-    // -----------------------------------------------------------------------
     // Members
     // -----------------------------------------------------------------------
     std::shared_ptr<aeron::Aeron>        aeron_;
@@ -980,19 +1451,63 @@ private:
     int32_t                              workerEgressControlBasePort_ = 0; // read-rework I4
     int32_t                              workerEgressBaseStreamId_    = 0; // read-rework I4
     int64_t                              sessionTimeoutNs_;
+    int64_t                              maxHeldIdleNs_ = kDefaultMaxHeldIdleNs;
     int64_t                              connectResolveTimeoutNs_;
     std::function<LeaderView()>          leaderView_;
 
     std::shared_ptr<aeron::Subscription> sub_;
-    aeron::FragmentAssembler             assembler_;
+    rune::aeronutil::FragmentAssembler   assembler_;
+    rune::aeronutil::ImageLossWatch      imageWatch_;   // review m-c
+    // Fix round 2 (finding 1): shard mode polls the client subscription with
+    // controlledPoll (per-session produce pause); separate reassembly state.
+    rune::aeronutil::ControlledFragmentAssembler controlledAssembler_;
+    rune::aeronutil::ImageLossWatch              controlledImageWatch_;
+    std::size_t                                  heldSessions_ = 0;   // sessions with heldByWorkers != 0
+    uint64_t                                     heldProduceAborts_ = 0;   // every paused-produce ABORT (Held or no credit)
+    // D8c: per-session produce credits (shard mode).
+    uint32_t                                     sessionProduceCredits_ = kDefaultSessionProduceCredits;
+    std::size_t                                  creditBlockedSessions_ = 0;   // sessions with produceInFlight >= budget
+    uint64_t                                     creditProduceAborts_   = 0;   // ABORTs for want of credit
+    uint64_t                                     produceCreditUnderflows_ = 0; // Credit beyond in-flight (invariant breach; clamped)
+    // D8c fix round 1 (MAJOR-1): forwarded, unclaimed produces per worker (all sessions).
+    std::array<uint32_t, kMaxHeldMaskWorkers>    routedInFlight_{};
+    uint32_t                                     workerRoutedCap_ = kWorkerRoutedCap;
+    uint64_t                                     workerCapProduceAborts_ = 0;  // produces deferred by the per-worker cap
+    // D8c fix round 2: per-worker cap-full episode (rich state: Idle = tag 0;
+    // Congested{tag, deferredPolls}).  An episode ends below the congested band
+    // or with its (single) expiry.
+    struct CapEpisode {
+        uint16_t tag = 0;            ///< 0 = Idle
+        uint32_t deferredPolls = 0;  ///< frames deferred by the FULL share in this episode
+    };
+    std::array<CapEpisode, kMaxHeldMaskWorkers>  capEpisode_{};
+    uint16_t                                     capEpisodeTags_ = 0;          // global, never 0 when issued
+    uint64_t                                     workerCapEvictions_ = 0;
+    uint64_t                                     directShareExpiries_ = 0;   // D8d: worker Expire signals acted on
+    int64_t                                      lastCapEvictedSid_ = 0;
+    /// Deferred polls of one cap-full episode before an expiry is considered:
+    /// a READING session's claims return a Credit within a worker pass + one
+    /// ret_ hop, i.e. many times over in 64 gateway duty cycles; a reader that
+    /// credits in the episode is never expired.
+    static constexpr uint32_t kCapEvictAfterDeferredPolls = 64;
 
     SessionTable                         sessions_;
+    // Retire-on-ack record-egress pubs (see RetiringEgress).  Declared after
+    // sessions_ / aeron_ so it is destroyed before them (pubs before client).
+    std::vector<RetiringEgress>          retiringEgress_;
+    uint64_t                             nextRetireToken_  = 0;
+    std::size_t                          retiringUnsent_   = 0;
 
     // Async pending-connect table (BR-7a).
     // Bounded to kMaxPendingConnects; all touched only in doWork (single-writer).
     // std::deque gives O(1) pop_front (evict-oldest) while still supporting
     // erase(it) for mid-sequence resolve/timeout removals.
     std::deque<PendingConnect>           pendingConnects_;
+    rune::consensus::HostResolvePort     hostResolver_{};   // fix round 2 (LOW-4)
+    /// Apply the hub's answers to pending connects awaiting their reply host.
+    int pollHostResolutions_();
+    /// Register the egress pub of `pending` (its channel final); false = dropped.
+    bool registerConnectEgress_(PendingConnect& pending);
 
     // Draining-release table (BR-7a fix): registrationIds that were logically
     // dropped (timeout / eviction / error) before their ExclusivePublication
@@ -1014,7 +1529,7 @@ private:
 
     // Reusable encode scratch — 68 KiB covers any Milestone-A/B frame.
     // (ConnectResponse=38 B, Pong=26+echo, max echo=65535+26 = ~65 KiB;
-    //  ProduceResponse=38 B; restamp scratch = max RecordBatch = 65535 B)
+    //  ProduceResponse=46 B; restamp scratch = max RecordBatch = 65535 B)
     static constexpr std::size_t kScratchSize = 68 * 1024;
     std::array<uint8_t, kScratchSize>    scratch_{};
 
@@ -1024,7 +1539,13 @@ private:
     // page cache / ring slot via pwritev — so this bound only guards against an
     // absurd/malformed length overrunning the worker ingress ring or a segment.
     // Default 8 MiB (>> typical batches, << the 32 MiB default worker ingress ring).
-    std::size_t maxProduceBatchBytes_ = 8u * 1024u * 1024u;
+    // kMaxProduceBatchBytes (public, below the accessors) == rune::node::Worker::
+    // kMaxProduceBatchBytes (F15 S3 static_assert in ClientGateway.cpp).
+    std::size_t maxProduceBatchBytes_ = kMaxProduceBatchBytes;
+    // F3 round 6, item 2: oversize-reject log rate limiting (control thread only).
+    uint64_t oversizeProduceRejects_    = 0;
+    uint64_t identityMismatchRejects_   = 0;   // inline path: frame identity != batch header
+    uint64_t oversizeProduceRejectLogs_ = 0;
 
     // Topic registry (GB-1) — non-owning; set via setTopicRegistry().
     // Null until wired in; GB-2/GB-3 will use it for produce/subscribe dispatch.
@@ -1054,6 +1575,9 @@ private:
     // Set via setPerWorkerIngressActive() from BrokerNode::buildWorkerPool()
     // when RUNE_PER_WORKER_INGRESS=true.
     bool perWorkerIngressActive_ = false;
+    bool shardMode_ = false;   // Task 13 (spec §3.4); set before the runtime runs
+    rune::node::SessionAnnouncer sessionAnnouncer_;   // Task 13: runtime thread only
+    std::vector<ShardIngressEndpoint> shardIngressEndpoints_;  // spec §3.3; empty = legacy
 
     // read-rework T3/T4 (I3b): when true, Subscribe/Unsubscribe for user partitions
     // are routed to the owning worker (which pushes on its own egress) and the
@@ -1097,6 +1621,10 @@ private:
     // Single-writer: only accessed on the duty-cycle thread.
     rune::gateway::ITxnRequestHandler* txnService_ = nullptr;
 
+    // Task 8a: schema DDL request sink (RULING-2 F) — non-owning; set via
+    // setAdminSink().  Null → DefineTopic/GetTopicSchema are dropped.
+    rune::gateway::IAdminRequestSink* adminSink_ = nullptr;
+
     // MD1 Task 9: Per-partition RoutingImage (capture-once per duty cycle).
     //
     // routingImage_: the current routing image snapshot, captured once at the
@@ -1118,6 +1646,7 @@ private:
     //   Empty until wired in (no routing image = no redirects).
     std::shared_ptr<const rune::metadata::RoutingImage> routingImage_;
     bool                                                 committedMetadataReady_ = false;
+    int8_t                                               localLeader_ = -1;   // see setLocalLeadership()
     std::unordered_map<int32_t, std::string>             nodeEndpointMap_;
 
     // Cached nowNs for the current doWork() invocation (passed into handlers).
@@ -1131,6 +1660,17 @@ private:
 
     // GB-3: Monotonic subscription ID generator (starts at 1).
     int64_t nextSubscriptionId_ = 0;
+    int64_t idPrefix_           = 0;  // cluster-unique id prefix (setClusterIdNode)
+    [[nodiscard]] int64_t allocSubscriptionId_() noexcept {
+        // LOW-2: the counter must never carry into the node prefix (another
+        // node's ids) — 2^40 subscriptions per process lifetime.
+        if (++nextSubscriptionId_ >= (int64_t{1} << kClusterIdShift)) [[unlikely]] {
+            std::fprintf(stderr, "ClientGateway: subscription id space exhausted (2^40) — aborting\n");
+            std::abort();
+        }
+        return idPrefix_ | nextSubscriptionId_;
+    }
+
 
     // CG-4: Group-member push subscription tracking.
     // Maps memberSessionId → set of subscriptionIds that were created via
@@ -1173,6 +1713,255 @@ private:
     // gateway); raw pointer equality is the correct identity key.
     static constexpr int64_t kGroupCommitIntervalNs = 10LL * 1'000'000LL; // 10 ms
     std::unordered_set<rune::storage::Log*> dirtyLogs_;
+    StorageFailureHandler storageFailureHandler_;
+    InvariantViolationHandler invariantViolationHandler_;
+    bool                  storageFailureRaised_ = false;
+    void raiseStorageFailure_(const std::string& logDir, int err);
+    void handleWorkerReturn_(rune::node::WorkerReturn ret);   // by value: WorkerReturn complete in the .cpp
+    void onControlRecordRefused_(const rune::node::WorkerReturn& ret);
+    void onControlRecordAppended_(const rune::node::WorkerReturn& ret);
+    uint64_t controlRecordsRefused_ = 0;
+    uint64_t produceBackPressured_  = 0;   // M5: produces answered NotLeader on back-pressure
+
+    // -----------------------------------------------------------------------
+    // Task 10 round 4 (P1): asynchronous control markers.  A marker handed to
+    // a worker gets a token (the op's correlationId); its offset arrives in
+    // the worker's ControlRecordAppended reply and only THEN feeds the LSO /
+    // aborted-txn bookkeeping.  A marker the worker ring could not take waits
+    // in markerSendQueue_ (FIFO, retried every doWork — never dropped); while
+    // one waits for a partition, produces to that partition answer the
+    // retriable NotLeader so no later batch can overtake the marker.  A
+    // refused marker for a partition still on this node is re-routed (safe:
+    // no offset was pre-computed) — a bounded number of times, then it is an
+    // invariant violation (halt).  Cold path (allocation is fine).
+    // -----------------------------------------------------------------------
+    struct MarkerInFlight {
+        int32_t              topicId    = 0;
+        int32_t              partition  = 0;
+        int64_t              producerId = -1;
+        bool                 commit     = false;
+        uint32_t             reroutes   = 0;
+        int32_t              coordinatorEpoch = 0;   ///< F15 m3
+        // D9 coordinator side: forwarded to this leader node (-1 = local marker)
+        // under this routing-image leader epoch; sent = handed to the plane
+        // (false = waiting in markerSendQueue_).
+        int32_t              remoteNode        = -1;
+        int32_t              remoteLeaderEpoch = -1;
+        bool                 sent              = false;
+        // D9 leader side: appended on behalf of this coordinator node (-1 = own).
+        int32_t              originNode  = -1;
+        int64_t              originToken = 0;
+        /// re-review MEDIUM-3: leader side, the target leader epoch the origin
+        /// routed it under (-1 = not checked).
+        int32_t              targetLeaderEpoch = -1;
+        std::vector<uint8_t> bytes;
+    };
+    static constexpr uint32_t kMaxMarkerReroutes = 4;
+    std::unordered_map<int64_t, MarkerInFlight> markersInFlight_;
+    std::deque<int64_t>                         markerSendQueue_;
+    /// Review MEDIUM-1: per-boot incarnation in the high bits (bits 32..62) so
+    /// a pre-restart answer never matches a post-restart token.
+    int64_t                                     nextMarkerToken_ = initialMarkerToken_();
+    static int64_t initialMarkerToken_();
+    bool trySendMarker_(int64_t token);
+    /// F15 K3: THE routing predicate for worker-owned appends — used by the
+    /// produce path AND marker routing (appendControlRecord), in every mode,
+    /// so a marker is queued on the same op ring as the produces it must
+    /// follow (L4) and the control thread never appends to a worker-owned log.
+    [[nodiscard]] bool routesToWorker_(int32_t topicId) const noexcept {
+        return workerPool_ != nullptr && (!perWorkerIngressActive_ || topicId >= 0);
+    }
+    int  pumpMarkerQueue_();
+    // D9 (see TxnMarkerChannel).
+    TxnMarkerChannel txnMarkerChannel_{};
+    std::deque<std::pair<int32_t, rune::replication::WriteTxnMarkerResponseMsg>> pendingMarkerResponses_;
+    uint64_t remoteMarkersLanded_ = 0;           ///< D9: cold counter (tests / logs)
+    // Re-review NEW MAJOR-1: leader side, the last remote marker taken per
+    // (topic, partition, producer) and its outcome (cold; see appendRemoteControlRecord).
+    struct RemoteMarkerKey {
+        int32_t topicId = 0; int32_t partition = 0; int64_t producerId = -1;
+        bool operator==(const RemoteMarkerKey& o) const noexcept {
+            return topicId == o.topicId && partition == o.partition && producerId == o.producerId;
+        }
+    };
+    struct RemoteMarkerKeyHash {
+        std::size_t operator()(const RemoteMarkerKey& k) const noexcept {
+            return std::hash<int64_t>{}(k.producerId) ^ (static_cast<std::size_t>(static_cast<uint32_t>(k.topicId)) << 20) ^
+                   static_cast<std::size_t>(static_cast<uint32_t>(k.partition));
+        }
+    };
+    struct LastRemoteMarker {
+        int32_t origin = -1; int32_t coordinatorEpoch = -1; int64_t token = 0;
+        bool answered = false; int16_t errorCode = 0; int64_t offset = -1;
+    };
+    std::unordered_map<RemoteMarkerKey, LastRemoteMarker, RemoteMarkerKeyHash> lastRemoteMarker_;
+    uint64_t seenRegistryRoleChanges_ = 0;
+    void pruneRemoteMarkerIndex_();
+    bool routingChangedForMarkers_ = false;      ///< D9: leader-change check due (LOW-7)
+    bool resendAllRemoteMarkers_   = false;      ///< D9 MAJOR-1: re-send every remote marker
+    std::vector<int32_t> reconnectedPeers_;      ///< D9 MAJOR-1: re-send markers to these peers
+    int  resendRemoteMarkers_();
+    /// The remote leader of (topicId, partition) from the routing image, or -1
+    /// when the marker is local (no channel / image, unassigned, or led here).
+    [[nodiscard]] int32_t remoteMarkerLeader_(int32_t topicId, int32_t partition, int32_t& leaderEpoch) const noexcept;
+    bool sendRemoteMarker_(int64_t token, MarkerInFlight& m);
+    void sendMarkerResponse_(int32_t toNode, const rune::replication::WriteTxnMarkerResponseMsg& r);
+    void answerRemoteOrigin_(const MarkerInFlight& m, int16_t errorCode, int64_t offset);
+    int  pumpMarkerResponses_();
+    /// doWork's marker step: queued markers (op ring / cluster plane), queued
+    /// answers, the unanswered-remote-marker sweep.
+    int  pumpTxnMarkers_();
+    void failRemoteMarkersOnLeaderChange_();
+    /// Complete a coordinator-side marker as refused (TCS retry) and forget it.
+    void refuseMarker_(int64_t token, int16_t errorCode);
+    /// The inline (no worker pool) append of appendControlRecord.
+    int64_t appendControlRecordInline_(int32_t topicId, int32_t partition, std::span<const uint8_t> marker,
+                                       rune::storage::Log* log);
+    [[nodiscard]] bool markerQueuedFor_(int32_t topicId, int32_t partition) const noexcept;
+
+    // M5: subscription lifecycle ops the owning worker ring could not take are
+    // queued per worker (FIFO: a Subscribe/Unsubscribe pair keeps its order)
+    // and retried every doWork — never dropped.  A queued Subscribe re-resolves
+    // its session's egress publication at retry time (never a dangling pointer;
+    // a session gone meanwhile drops it).
+    struct PendingSubOp {
+        bool              unsubscribe = false;
+        bool              mdc         = false;   // forwarded with the MDC pub (no unicast)
+        BufferedSubscribe sub;                   // subscribe: everything; unsubscribe: subId/topic/partition
+    };
+    std::vector<std::deque<PendingSubOp>> pendingSubOps_;   // indexed by owning worker
+    bool trySubOp_(const PendingSubOp& p);
+    void queueSubOp_(PendingSubOp p);
+    int  pumpSubOps_();
+public:
+    [[nodiscard]] uint64_t controlRecordsRefusedForTest() const noexcept { return controlRecordsRefused_; }
+    [[nodiscard]] std::size_t markersInFlightForTest() const noexcept { return markersInFlight_.size(); }
+    [[nodiscard]] std::size_t markersQueuedForTest() const noexcept { return markerSendQueue_.size(); }
+    [[nodiscard]] std::size_t pendingSubOpsForTest() const noexcept {
+        std::size_t n = 0;
+        for (const auto& q : pendingSubOps_) n += q.size();
+        return n;
+    }
+    [[nodiscard]] std::size_t pendingAcksForTest() const noexcept { return pendingAcks_.size(); }
+    /// Test-only (single-threaded): take the per-cycle min-ISR snapshot now
+    /// (doWork does it at the top of every cycle).
+    void syncMinIsrForTest() noexcept { cachedMinIsr_ = minIsr_.load(std::memory_order_relaxed); }
+    /// Test-only: run the deferred-ack drain once at `nowNs`.
+    void drainPendingAcksForTest(int64_t nowNs) { nowNs_ = nowNs; drainPendingAcks(); }
+    /// Test-only: the node-level Follower→Leader edge doWork reacts to.
+    void onNodeLeadershipGainedForTest() { rebuildProducerStateFromLogs(); }
+    /// Test-only: inline producer-state rebuilds begun / one doWork-style drive.
+    [[nodiscard]] uint64_t inlinePsmRebuildsForTest() const noexcept { return inlinePsmRebuilds_; }
+    int advanceInlinePsmScansForTest(int64_t nowNs) { nowNs_ = nowNs; return advanceInlinePsmScans_(); }
+    void setNowForTest(int64_t nowNs) noexcept { nowNs_ = nowNs; }
+    /// Test-only: the subscription lifecycle forwarding (worker routing).
+    void forwardSubscribeForTest(int64_t subId, int64_t sessionId, int32_t topicId, int32_t partition,
+                                 int64_t nextOffset, uint8_t isolation, bool isGroup, bool carrier,
+                                 int64_t subscribeCorrId = 0) {
+        forwardSubscribeToWorker_(subId, sessionId, topicId, partition, nextOffset, isolation, isGroup, carrier,
+                                  subscribeCorrId);
+    }
+    void forwardUnsubscribeForTest(int64_t subId, int32_t topicId, int32_t partition) {
+        forwardUnsubscribeToWorker_(subId, topicId, partition);
+    }
+    /// Test-only: run the retry pumps (markers + subscription ops) once.
+    int pumpRetryQueuesForTest() { return pumpMarkerQueue_() + pumpSubOps_() + pumpEgressReleases_(); }
+    // Record-egress lifetime (retire-on-ack) test hooks.
+    void injectRecordEgressForTest(int64_t sid, int32_t worker, std::shared_ptr<aeron::ExclusivePublication> pub) {
+        if (Session* s = sessions_.find(sid)) s->recordEgressByWorker[worker] = std::move(pub);
+    }
+    void closeSessionForTest(int64_t sid) { (void)closeSession_(sid); }
+    /// Drive the resolve-completion path for (sid, worker) with `pub` and one
+    /// buffered subscribe `subId` on (topicId, partition).
+    void resolveRecordEgressForTest(int64_t sid, int32_t worker, std::shared_ptr<aeron::ExclusivePublication> pub,
+                                    int64_t subId, int32_t topicId, int32_t partition) {
+        PendingRecordEgress pend;
+        BufferedSubscribe b;
+        b.subId = subId; b.sessionId = sid; b.topicId = topicId; b.partition = partition;
+        pend.waiters.push_back(b);
+        onRecordEgressResolved_(sid, worker, pend, std::move(pub));
+    }
+    [[nodiscard]] std::size_t retiringRecordEgressCountForTest() const noexcept { return retiringEgress_.size(); }
+    [[nodiscard]] std::size_t retiringRecordEgressUnsentForTest() const noexcept { return retiringUnsent_; }
+    /// Test-only: feed a worker return through the real drain handler.
+    void handleWorkerReturnForTest(const rune::node::WorkerReturn& ret);
+    // Task 13 (spec §3.4): shard mode — announce-before-accept (every worker
+    // learns a session's reply destination before ConnectResponse), worker-side
+    // produce acks (the runtime consumes post-ack notifications, never relays
+    // answers), worker psm_ authority for user partitions, SessionClose on every
+    // worker at Disconnect / reap / connect timeout.  Set before the runtime runs.
+    void setShardMode(bool on) noexcept { shardMode_ = on; }
+
+    /// DR-15 fix round 2 (LOW-4): a client's reply-channel HOSTNAME is resolved
+    /// by the cold resolver thread through `port` and the egress publication is
+    /// added on the numeric endpoint — no driver conductor (worker 0's thread
+    /// under fused placement) ever resolves a client-supplied name.  Unset: the
+    /// channel is added as given (Aeron resolves it).  Before the gateway runs.
+    void setHostResolver(rune::consensus::HostResolvePort port) noexcept { hostResolver_ = port; }
+    [[nodiscard]] bool shardMode() const noexcept { return shardMode_; }
+    [[nodiscard]] std::size_t pendingSessionClosesForTest() const noexcept { return sessionAnnouncer_.pendingCloses(); }
+    void drainWorkerReturnsForTest(int64_t nowNs) { nowNs_ = nowNs; drainWorkerReturns_(); }
+    rune::storage::ProducerStateManager& producerStateManagerForTest() noexcept { return producerStateManager_; }
+    [[nodiscard]] int64_t sessionLastSeenNsForTest(int64_t sid) noexcept {
+        const Session* s = sessions_.find(sid);
+        return s ? s->lastSeenNs : -1;
+    }
+    void reapExpiredForTest(int64_t nowNs) { reapExpired(nowNs); }
+    /// D8b round 2: some worker reports `sid`'s ack publication Lost (NOT_CONNECTED).
+    [[nodiscard]] bool sessionLostForTest(int64_t sid) noexcept {
+        const Session* s = sessions_.find(sid);
+        return s && s->lostByWorkers != 0;
+    }
+    // Fix round 1 (I2) seams: a resolved-or-not pending connect with the given
+    // announce state (no Aeron publication), the cap accounting, eviction.
+    void injectPendingConnectForTest(int64_t sessionId, bool announceBegun) {
+        PendingConnect p;
+        p.sessionId = sessionId; p.registrationId = -1; p.announceBegun = announceBegun;
+        p.announced = announceBegun; p.egressChannel = "aeron:ipc";
+        pendingConnects_.push_back(std::move(p));
+    }
+    [[nodiscard]] std::size_t shardSessionSlotsInUseForTest() const noexcept { return shardSessionSlotsInUse_(); }
+    void evictOldestPendingConnectForTest() { evictOldestPendingConnect_(); }
+    /// Fix round 3: Produce frames ABORTed because their session was held
+    /// (control thread only — read via BrokerNode::onControlThreadForTest).
+    [[nodiscard]] uint64_t heldProduceAbortsForTest() const noexcept { return heldProduceAborts_; }
+    /// D8b-L (LOW-4): images on the client ingress subscription (control thread) — a dead client's image must be
+    /// released, never pinned by an aborted (held) Produce frame.
+    [[nodiscard]] int clientImageCountForTest() const { return sub_ ? sub_->imageCount() : 0; }
+    /// D8c: one shutdown line with the paused-produce counters (only when any
+    /// pause happened; warn so it shows at the perf log level).  Call once the
+    /// control thread is joined.
+    void logProducePauseStats() const;
+    /// D8c test seams (control thread only).
+    [[nodiscard]] uint64_t creditProduceAbortsForTest() const noexcept { return creditProduceAborts_; }
+    [[nodiscard]] uint64_t produceCreditUnderflowsForTest() const noexcept { return produceCreditUnderflows_; }
+    [[nodiscard]] std::size_t creditBlockedSessionsForTest() const noexcept { return creditBlockedSessions_; }
+    [[nodiscard]] uint32_t routedInFlightForTest(int32_t worker) const noexcept { return routedInFlight_[worker]; }
+    [[nodiscard]] uint64_t workerCapProduceAbortsForTest() const noexcept { return workerCapProduceAborts_; }
+    void setWorkerRoutedCapForTest(uint32_t cap) noexcept { workerRoutedCap_ = cap; }
+    [[nodiscard]] uint64_t workerCapEvictionsForTest() const noexcept { return workerCapEvictions_; }
+    [[nodiscard]] uint64_t directShareExpiriesForTest() const noexcept { return directShareExpiries_; }
+    [[nodiscard]] int64_t lastCapEvictedSessionForTest() const noexcept { return lastCapEvictedSid_; }
+    [[nodiscard]] int64_t produceInFlightForTest(int64_t sid) noexcept {
+        const Session* s = sessions_.find(sid);
+        return s ? static_cast<int64_t>(s->produceInFlight) : -1;
+    }
+    /// D8c: ONE shard-mode controlled poll over `frames` (each a whole client
+    /// frame on one image, in order) through the REAL per-frame decision
+    /// (admitClientFrame_) and dispatch: stops at the first ABORT, exactly as
+    /// Aeron's controlledPoll does.  Returns the frames consumed.
+    std::size_t controlledPollFramesForTest(const std::vector<std::vector<uint8_t>>& frames, std::size_t from = 0) {
+        std::size_t i = from;
+        for (; i < frames.size(); ++i) {
+            if (!admitClientFrame_(frames[i].data(), frames[i].size())) break;
+            if (!onClientFrame_(frames[i].data(), frames[i].size())) break;   // deferred: redelivered next poll
+        }
+        return i - from;
+    }
+    bool clientFrameHeldForTest(const uint8_t* buf, std::size_t len) { return produceFrameHeld_(buf, len); }
+    void injectPendingRecordEgressForTest(int64_t sid, int32_t worker) { pendingRecordEgress_[{sid, worker}]; }
+    [[nodiscard]] std::size_t pendingRecordEgressCountForTest() const noexcept { return pendingRecordEgress_.size(); }
+private:
     int64_t                                 lastFlushNs_ = 0;
 
     // GB-3: Per-cycle fairness cap — max record batches pushed per subscription
@@ -1193,17 +1982,26 @@ public:
     [[nodiscard]] int maxBatchesPerSubPerCycleForTest() const noexcept {
         return maxBatchesPerSubPerCycle_;
     }
+
+    // The 8 MiB ceiling of the client-visible batch limit (F3: the CONFIGURED
+    // default when RUNE_MAX_PRODUCE_BATCH_BYTES is unset; F15 S3: == rune::node::
+    // Worker::kMaxProduceBatchBytes).  Never enforced as-is in a running broker:
+    // BrokerNode installs NodeConfig::produceIntakeLimit() (= min(configured,
+    // Worker::maxAcceptableBatchBytes(config))) via setMaxProduceBatchBytes().
+    static constexpr std::size_t kMaxProduceBatchBytes = 8u * 1024u * 1024u;
+
 private:
 
     // GB-3: Max bytes fetched from Log::read per subscription per cycle.
     // Bounded to avoid reading unbounded data from a fast-filling log.
-    // Each batch is at most 65535 bytes (u16 var field cap) + overhead ≈ 64 KiB.
+    // The first whole batch is always returned even if larger (F19: batches are
+    // not size-capped by the Records frame — its length prefix is u32).
     static constexpr int32_t kMaxChunkBytes = static_cast<int32_t>(512 * 1024); // 512 KiB
 
-    // GB-3: Reusable push scratch — sized to hold one encoded Records frame.
-    // Records header = 50 bytes fixed + up to 65535 bytes of recordBatch.
-    // 68 KiB covers that; share kScratchSize constant.
-    // NOTE: scratch_ is already kScratchSize = 68 KiB and is reused here.
+    // GB-3: push encode scratch — scratch_ (kScratchSize) holds one encoded
+    // single-fragment Records frame (tryClaim fast path), or only the 52-byte
+    // fixed part of a larger frame sent as a vectored [fixed | batch] offer
+    // (F19: the scratch size does not bound the deliverable batch size).
     // We encode into scratch_ during push; this is safe because push happens
     // AFTER the ingress poll (handlers that use scratch_ are done for this cycle).
 
@@ -1255,18 +2053,108 @@ private:
     // the correct single-writer home: handleProduce() is the only call-site and
     // is always on the duty-cycle thread (no locks needed).
     //
-    // TX-2b: On leader transition (Follower→Leader) or on startup as leader, the
-    // PSM is rebuilt from each partition Log via rebuildProducerStateFromLogs().
-    // This mirrors the TransactionCoordinationService::doWork pattern: wasLeader_
-    // tracks the previous cycle's leadership so the rebuild fires exactly once on
-    // the first duty cycle after becoming leader.  Without this rebuild, a
-    // producer that retries an already-durable batch after failover would be
-    // incorrectly accepted (re-appended), violating exactly-once semantics.
+    // It answers a sequence only while PROVEN consistent with the partition's
+    // log: rebuilt from logStart to LEO per partition, and again whenever the
+    // log / leadership it was built for changes (inlinePsm_ / proveInlinePsm_
+    // below).  The node-level leader edge (rebuildProducerStateFromLogs) only
+    // invalidates it.  Without a proven state a producer that retries an
+    // already-durable batch would be re-appended or answered OOS.
     //
     // No per-op heap allocation: ProducerStateManager::validate() is noexcept,
     // allocation-free; update() inserts into the internal unordered_map only on
     // the first Accept for a new (producerId, partition) pair.
+    //
+    // F15 S5 (§2.5, Q3/I6): ONLY for partitions this gateway appends to itself
+    // (no worker pool — unit rigs — or an internal partition in shard mode).
+    // A worker-owned partition's producer state lives in its OWNING worker's
+    // psm_ alone, in every mode: this map is never validated, updated or
+    // rebuilt for it.
     rune::storage::ProducerStateManager producerStateManager_;
+
+    // -----------------------------------------------------------------------
+    // PSM <-> log consistency (review of b4594f8 + fix round 1).  The contract
+    // (Kafka's): an OutOfOrderSequence answer means "NOT appended"; a stored
+    // batch is answered OK (its offset in the window, -1 beyond it) or duplicate
+    // and is never appended again.  producerStateManager_ can vouch for that
+    // only while it is PROVEN consistent with the partition's log: built from
+    // logStart to LEO (every stored batch, the leader's kept tail above HW
+    // included — Kafka loads producer state to the log end) for exactly the log
+    // content and leadership it now serves.  One state per (topicId,
+    // partition) — a stable identity (TopicRegistry never deletes or reuses
+    // one; a registry swap resets every state) — plus the FACTS it was built
+    // for (M4: no Log* — the replica's incarnation + log / leadership
+    // generations, or a passthrough log's own content generation):
+    //   Unproven — nothing built (never, invalidated by a node-level leader
+    //              edge, or the replica is not a COMPLETE leader: answered
+    //              NotLeader, nothing appended — a deficient leader may still
+    //              reconcile-append old-term batches).
+    //   Scanning — a budgeted rebuild (I3: kInlinePsmStepBytes per step, one
+    //              step per idempotent batch and one per doWork cycle — never an
+    //              O(log) scan on the duty thread); answered NotLeader.
+    //   Proven   — validate against producerStateManager_.  Live appends keep
+    //              it exact (handleProduceBatch's update, markers' fenceEpoch).
+    //   Failed   — the rebuild hit an unreadable batch (I2: LATCHED — answered
+    //              Internal, outcome unknown, without rescanning) until the facts
+    //              change or retryAtNs passes (doubling backoff, capped).
+    // Any change of the facts (per-partition promotion, demotion, KIP-101
+    // truncation, reconcile append, partition re-creation) restarts the build.
+    // Inline path only (the replica is control-owned: its role / generations
+    // are this thread's state).  Cold map insert; the Proven hot path is one
+    // hash lookup + a compare, no allocation.
+    // -----------------------------------------------------------------------
+    struct InlinePsmFacts {
+        uint32_t incarnation = 0;   ///< replica registry incarnation (0 = passthrough)
+        uint64_t logGen      = 0;   ///< replica logGeneration() / passthrough Log::contentGeneration()
+        uint64_t leadGen     = 0;   ///< replica leadershipGeneration() (0 = passthrough)
+        bool operator==(const InlinePsmFacts&) const noexcept = default;
+    };
+    struct InlinePsmUnproven {};
+    struct InlinePsmScanning {
+        InlinePsmFacts facts;
+        rune::storage::ProducerStateManager::Rebuild cursor;
+        int64_t backoffNs = 0;      ///< carried into Failed (doubling)
+    };
+    struct InlinePsmProven {
+        InlinePsmFacts facts;
+    };
+    struct InlinePsmFailed {
+        InlinePsmFacts facts;
+        int64_t retryAtNs = 0;
+        int64_t backoffNs = 0;
+    };
+    using InlinePsmState = std::variant<InlinePsmUnproven, InlinePsmScanning, InlinePsmProven, InlinePsmFailed>;
+    std::unordered_map<uint64_t, InlinePsmState> inlinePsm_;
+    std::size_t inlinePsmScanning_  = 0;   ///< states in Scanning (doWork drives them; 0 = no work)
+    uint64_t    inlinePsmRebuilds_  = 0;   ///< rebuilds begun (I2 test: never one per produce)
+    static constexpr std::size_t kInlinePsmStepBytes     = 1u << 20;              // I3: per step
+    static constexpr int64_t     kInlinePsmRetryMinNs    = 100'000'000;           // I2: 100 ms
+    static constexpr int64_t     kInlinePsmRetryMaxNs    = 30'000'000'000;        // I2: 30 s
+    enum class InlinePsmGate : uint8_t {
+        Proven,       ///< validate against producerStateManager_
+        NotLeader,    ///< not a complete leader, or still building: retriable, nothing appended
+        Unprovable,   ///< the rebuild failed (latched): outcome unknown (Internal)
+    };
+    [[nodiscard]] static uint64_t inlinePsmKey_(int32_t topicId, int32_t partition) noexcept {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(topicId)) << 32) |
+               static_cast<uint64_t>(static_cast<uint32_t>(partition));
+    }
+    [[nodiscard]] InlinePsmGate proveInlinePsm_(int32_t topicId, int32_t partition,
+                                                rune::storage::Log& log,
+                                                const rune::replication::PartitionReplica* replica);
+    void setInlinePsmState_(InlinePsmState& slot, InlinePsmState next) noexcept;
+    /// One budgeted step for every partition whose inline state is Scanning
+    /// (doWork; a no-op branch while none is).
+    int advanceInlinePsmScans_();
+    void resetInlinePsm_() noexcept {
+        inlinePsm_.clear();
+        inlinePsmScanning_ = 0;
+    }
+    /// An inline acks=all waiter may still fire OK (the worker path's §3.2
+    /// rule): the replica is Leader and its log generation is unchanged — or
+    /// changed by exactly one cut strictly above the waiter's last offset (the
+    /// waiter re-bases).  Otherwise the data it waits on may be gone.
+    [[nodiscard]] static bool inlineWaiterStillValid_(const rune::replication::PartitionReplica& rep,
+                                                      PendingAck& entry) noexcept;
 
     // TX-2b: Tracks previous-cycle leadership to detect Follower→Leader transitions.
     // Same pattern as TransactionCoordinationService::wasLeader_.
@@ -1275,11 +2163,9 @@ private:
     // Initialized to false so the very first doWork() as leader fires the rebuild.
     bool wasLeader_ = false;
 
-    // TX-2b: Rebuild the PSM from all partition Logs in the TopicRegistry.
-    //
-    // Called from doWork() exactly once on Follower→Leader transition.  For each
-    // (topicId, partition) in topicRegistry_, reads the partition Log and calls
-    // ProducerStateManager::rebuildFromLog() to reconstruct the dedup window.
+    // TX-2b / TX-7: node-level Follower→Leader edge — invalidates the inline
+    // producer state of every gateway-appended partition (rebuilt lazily, to
+    // LEO, by proveInlinePsm_) and rebuilds the inline read_committed state.
     //
     // Cold path: allocations acceptable.  Single-writer: duty-cycle thread only.
     void rebuildProducerStateFromLogs();
@@ -1302,8 +2188,14 @@ private:
     // WorkerReturn type is fully defined in the .cpp (WorkerOp.h included there).
     // -----------------------------------------------------------------------
     void drainWorkerReturns_();
+    void noteWorkerReadAnswer_(Subscription& sub, int64_t effectiveBound, bool notReady) noexcept;
+    int64_t pushCycle_ = 0;   ///< pushSubscriptions passes (F15 S4 backoff clock)
 
-    // TX-4 Task 9: Per-partition LSO tracking + aborted-txn index.
+    // TX-4 Task 9: Per-partition LSO tracking + aborted-txn index — F15 S4:
+    // ONLY for the no-worker-pool inline path (unit rigs: the control thread
+    // appends and reads those logs itself).  With a worker pool (every
+    // production mode) the OWNING worker holds and serves the read_committed
+    // state (RcState, design note §2.1-§2.4); this map is never fed or read.
     //
     // Maintains read_committed isolation state for each (topicId, partition)
     // that has received at least one transactional data batch or control marker.

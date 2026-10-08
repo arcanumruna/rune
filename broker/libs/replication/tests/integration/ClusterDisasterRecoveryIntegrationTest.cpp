@@ -74,6 +74,21 @@ using namespace rune::replication::test;
 
 // Hard cap used in all bounded loops not using the harness driveUntil.
 static constexpr int kCap = 500;
+// F22 (DUR-1 Kafka model): HW = min LEO over the ISR, so a partitioned ISR
+// member holds the HW back until it is lag-shrunk (replicaLagMaxMs = 1000 ms in
+// the harness).  Tests that commit "on the majority side" while a member is cut
+// off must drive past that window (1 ms steps) — and the HW must NOT move
+// before it (no majority commit).
+static constexpr int kLagMaxMs = 1000;                 // the harness's replicaLagMaxMs (1 ms steps)
+static constexpr int kLagShrinkCap = 3 * kLagMaxMs;
+// The HW must stay EXACTLY frozen for (almost) the whole lag window: the shrink fires only once a member has not
+// caught up for > replicaLagMaxMs; 10 steps of slack for the ISR-check / fetch cadence (F22 test review MEDIUM-1).
+static constexpr int kInsideLagWindow = kLagMaxMs - 10;
+static bool isrHas(const PartitionReplica* r, NodeId id) {
+    const auto& v = r->isr();
+    return std::find(v.begin(), v.end(), id) != v.end();
+}
+static NodeId nodeIdOf(int idx) { return static_cast<NodeId>(idx + 1); }   // harness node ids are 1..n
 
 // ===========================================================================
 // Group 1: Happy path
@@ -133,24 +148,33 @@ TEST(HappyPath, FiveNode_MajorityIsThree_HWAdvances) {
     EXPECT_GE(replicatedCount, 3) << "At least 3 of 5 nodes must hold the committed record";
 }
 
-// Test 5: 5-node — a single lagging replica does NOT hold back HW.
-// We stop one follower from fetching; HW should still advance from the remaining 4.
-TEST(HappyPath, FiveNode_SingleLaggingReplicaDoesNotBlockHW) {
-    ReplicationClusterHarness h(5, /*lagMaxMs=*/1000);
+// Test 5: 5-node — Kafka model: a single lagging ISR member HOLDS the HW until it is lag-shrunk; then the HW
+// advances without it, and after the heal it catches up and rejoins the ISR.
+TEST(HappyPath, FiveNode_LaggingIsrMemberHoldsHWUntilShrunk) {
+    ReplicationClusterHarness h(5, /*lagMaxMs=*/kLagMaxMs);
 
     PartitionReplica* ldr = h.leaderReplica();
+    const Offset hwBefore = ldr->highWatermark();
     ldr->append(makePayload(0xAA));
     Offset leo = ldr->logEndOffset();
 
     // Partition off node 4 (index 4) — it won't fetch.
     h.partitionOff(4);
+    const NodeId cut = nodeIdOf(4);
 
-    // Drive the remaining 4 nodes.
-    bool ok = h.driveUntil([&]{ return ldr->highWatermark() >= leo; });
-    ASSERT_TRUE(ok) << "5-node: HW must advance even when one replica is lagging";
+    // Drive the remaining 4 nodes: inside the lag window the HW does not move at all.
+    EXPECT_FALSE(h.driveUntil([&]{ return ldr->highWatermark() >= leo; }, kInsideLagWindow))
+        << "Kafka model: the lagging ISR member holds the HW until it is shrunk";
+    EXPECT_EQ(ldr->highWatermark(), hwBefore) << "HW must stay frozen inside the lag window";
+    EXPECT_TRUE(isrHas(ldr, cut)) << "the lagging member is still in the ISR inside the lag window";
+    bool ok = h.driveUntil([&]{ return ldr->highWatermark() >= leo; }, kLagShrinkCap);
+    ASSERT_TRUE(ok) << "5-node: HW must advance once the lagging replica is lag-shrunk";
     EXPECT_GE(ldr->highWatermark(), leo);
+    EXPECT_FALSE(isrHas(ldr, cut)) << "the HW advance must come from the lag shrink";
 
     h.healPartition();
+    ASSERT_TRUE(h.driveUntil([&]{ return isrHas(ldr, cut); }, kLagShrinkCap))
+        << "the healed member catches up and rejoins the ISR";
 }
 
 // Test 33 (placed here for sequence): Multiple rounds of produce+commit stay green.
@@ -536,14 +560,21 @@ TEST(PartitionSafety, PartitionHeal_MajoritySideWins) {
 
     // Drive majority side until HW advances.
     bool ok = false;
-    for (int i = 0; i < kCap && !ok; ++i) {
+    int steps = 0;
+    const Offset hwBefore = ldr->highWatermark();
+    bool frozenViolated = false;
+    for (int i = 0; i < kLagShrinkCap && !ok; ++i, ++steps) {
         h.advanceClock(ReplicationClusterHarness::kStep1ms);
         ldr->doWork(h.clock());
         h.replicaAt(1)->doWork(h.clock());
         h.transport().pump(h.clock());
+        if (i < kInsideLagWindow && ldr->highWatermark() != hwBefore) frozenViolated = true;
         ok = (ldr->highWatermark() >= leoMajority);
     }
-    ASSERT_TRUE(ok) << "Majority side must commit the new record";
+    EXPECT_GE(steps, kInsideLagWindow) << "Kafka model: the cut-off ISR member held the HW until lag-shrunk";
+    EXPECT_FALSE(frozenViolated) << "HW must stay exactly frozen inside the lag window (no majority commit)";
+    ASSERT_TRUE(ok) << "the live side must commit the new record once the cut-off member is lag-shrunk";
+    EXPECT_FALSE(isrHas(ldr, nodeIdOf(2))) << "the HW advance must come from the lag shrink of the cut-off member";
     Offset hwMajority = ldr->highWatermark();
 
     // Heal partition — follower[2] reconnects.
@@ -557,6 +588,8 @@ TEST(PartitionSafety, PartitionHeal_MajoritySideWins) {
 
     EXPECT_GE(h.replicaAt(2)->logEndOffset(), hwMajority)
         << "Minority-side replica must catch up to majority-side committed data";
+    ASSERT_TRUE(h.driveUntil([&]{ return isrHas(ldr, nodeIdOf(2)); }, kLagShrinkCap))
+        << "the healed member rejoins the ISR";
 }
 
 // Test 20: Split-brain fenced by epoch — higher-epoch leader's writes survive.
@@ -783,20 +816,28 @@ TEST(SelfHealing, UnderReplicationRepair_ISRSizeRestored) {
     //  and we can produce + commit while 2/3 are alive.)
     h.partitionOff(2); // partition off follower[2]
 
-    // Produce more and commit with majority (2/3 still works).
+    // Produce more; it commits once the cut-off member is lag-shrunk (Kafka model, not majority).
     PartitionReplica* ldr = h.leaderReplica();
     ldr->append(makePayload(0xDD));
     Offset leoNew = ldr->logEndOffset();
 
     bool ok = false;
-    for (int i = 0; i < kCap && !ok; ++i) {
+    int steps = 0;
+    const Offset hwBefore = ldr->highWatermark();
+    bool frozenViolated = false;
+    for (int i = 0; i < kLagShrinkCap && !ok; ++i, ++steps) {
         h.advanceClock(ReplicationClusterHarness::kStep1ms);
         ldr->doWork(h.clock());
         h.replicaAt(1)->doWork(h.clock());
         h.transport().pump(h.clock());
+        if (i < kInsideLagWindow && ldr->highWatermark() != hwBefore) frozenViolated = true;
         ok = (ldr->highWatermark() >= leoNew);
     }
-    ASSERT_TRUE(ok) << "Majority (2/3) must still be able to commit";
+    EXPECT_GE(steps, kInsideLagWindow) << "Kafka model: the cut-off ISR member held the HW until lag-shrunk";
+    EXPECT_FALSE(frozenViolated) << "HW must stay exactly frozen inside the lag window (no majority commit)";
+    ASSERT_TRUE(ok) << "the two live members must commit once the cut-off member is lag-shrunk";
+    EXPECT_FALSE(isrHas(ldr, nodeIdOf(2))) << "the HW advance must come from the lag shrink of the cut-off member";
+    EXPECT_EQ(ldr->isr().size(), 2u) << "ISR shrank to the two live members";
 
     h.healPartition();
 
@@ -805,6 +846,9 @@ TEST(SelfHealing, UnderReplicationRepair_ISRSizeRestored) {
         return h.replicaAt(2)->logEndOffset() >= leoNew;
     });
     ASSERT_TRUE(ok) << "Healed follower must catch up to new leader LEO";
+    ASSERT_TRUE(h.driveUntil([&]{ return isrHas(ldr, nodeIdOf(2)); }, kLagShrinkCap))
+        << "the healed member rejoins the ISR";
+    EXPECT_EQ(ldr->isr().size(), 3u) << "ISR size restored after the repair";
 }
 
 // ===========================================================================
@@ -1128,15 +1172,22 @@ TEST(Extra, ThreeNode_KillThenRevive_RejoinConverges) {
 
     // Commit on the majority side (leader + follower[2]).
     bool ok = false;
-    for (int i = 0; i < kCap && !ok; ++i) {
+    int steps = 0;
+    const Offset hwBefore = ldr->highWatermark();
+    bool frozenViolated = false;
+    for (int i = 0; i < kLagShrinkCap && !ok; ++i, ++steps) {
         h.advanceClock(ReplicationClusterHarness::kStep1ms);
         ldr->doWork(h.clock());
         h.replicaAt(2)->doWork(h.clock());
         h.transport().pump(h.clock());
+        if (i < kInsideLagWindow && ldr->highWatermark() != hwBefore) frozenViolated = true;
         ok = (ldr->highWatermark() >= newLeo);
     }
+    EXPECT_GE(steps, kInsideLagWindow) << "Kafka model: the cut-off ISR member held the HW until lag-shrunk";
+    EXPECT_FALSE(frozenViolated) << "HW must stay exactly frozen inside the lag window (no majority commit)";
     ASSERT_TRUE(ok);
     Offset hwAfter = ldr->highWatermark();
+    EXPECT_FALSE(isrHas(ldr, nodeIdOf(1))) << "the HW advance must come from the lag shrink of the cut-off member";
 
     // Heal partition — follower[1] reconnects.
     h.healPartition();
@@ -1147,6 +1198,8 @@ TEST(Extra, ThreeNode_KillThenRevive_RejoinConverges) {
     });
     ASSERT_TRUE(ok) << "Revived follower must catch up after partition heal";
     EXPECT_GE(h.replicaAt(1)->logEndOffset(), hwAfter);
+    ASSERT_TRUE(h.driveUntil([&]{ return isrHas(ldr, nodeIdOf(1)); }, kLagShrinkCap))
+        << "the healed member rejoins the ISR";
 }
 
 // Test extra-B: 5-node — kill leader, elect, produce, kill new leader — all data intact.

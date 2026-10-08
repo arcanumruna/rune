@@ -85,8 +85,8 @@ struct TempDir {
 // Null transport — single-node leader (minIsr=1) never sends to followers.
 class NullTransport : public PartitionTransport {
 public:
-    void sendFetchRequest(const FetchRequestMsg&) override {}
-    void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { return true; }
 };
 
 static PartitionConfig makeSingleNodeConfig(NodeId selfId = 1, int minIsr = 1) {
@@ -946,4 +946,51 @@ TEST_F(CG3ServiceTest, OffsetCommitDefensiveIterationTruncatedFrame) {
             << pResp->results.size() << " results from a 1-entry frame with count=99";
     }
     // Either decode-fail (0) or bounded iteration: both are correct.
+}
+
+// Task 11 fix 2 (B1): once the runtime pushes leadership as a value, the
+// per-cycle doWork (worker 0's pass under fused placement) never calls the
+// isLeader std::function.
+TEST(GroupCoordinationServiceRegression, PushedLeadershipNeverCallsTheLeaderFunction) {
+    int calls = 0;
+    GroupCoordinationService svc(nullptr, nullptr, [&calls] { ++calls; return false; });
+    svc.setLocalLeadership(false);
+    for (int i = 0; i < 100; ++i) (void)svc.doWork(i);
+    EXPECT_FALSE(svc.isLocalCoordinator());
+    EXPECT_EQ(calls, 0) << "isLeaderFn_ called on the duty cycle after a leadership push";
+}
+
+// ---------------------------------------------------------------------------
+// Review: TCS/GCS kept stale in-memory state when the coordinator partition's
+// log content changed under them (the old reconcile appended foreign batches;
+// any truncation does the same).  The offset index is valid only for the
+// leadership AND the log content it was rebuilt from: a log-generation /
+// leadership change re-arms the rebuild, so a truncated-away commit is never
+// served.
+// ---------------------------------------------------------------------------
+TEST_F(CG3ServiceTest, OffsetIndexRebuiltWhenTheLogContentChangesRegression) {
+    ASSERT_TRUE(driveUntil([&] { return true; }, 1));
+    service_->doWork(clock_ += kStep);
+    ASSERT_TRUE(store_->commit("g-stale", tp("t", 0), 7, "", 1));
+    ASSERT_TRUE(pumpHW(replica_->logEndOffset()));
+    service_->doWork(clock_ += kStep);
+    ASSERT_TRUE(store_->fetch("g-stale", tp("t", 0)).has_value());
+
+    // Between two duty passes: demotion, a KIP-279 truncation that removes the
+    // commit record, re-promotion (a lone leader completes at once).
+    replica_->becomeFollower(2, 9);
+    FetchResponseMsg div{};
+    div.leaderEpoch = 2; div.partition = 0; div.errorCode = rune::replication::kErrDivergingEpoch;
+    { static rune::replication::ErrorPayloadBuf epb_; div.records = epb_.set(replica_->lastFetchedEpoch(), 0); }
+    replica_->applyReplicated(div);
+    ASSERT_EQ(replica_->logEndOffset(), 0) << "precondition: the commit record is gone";
+    replica_->becomeLeader(3, {kLeader});
+    ASSERT_TRUE(replica_->acceptsProduce());
+    ASSERT_TRUE(store_->commit("g-new", tp("t", 1), 3, "", 2));
+    ASSERT_TRUE(pumpHW(replica_->logEndOffset()));
+
+    service_->doWork(clock_ += kStep);
+    EXPECT_FALSE(store_->fetch("g-stale", tp("t", 0)).has_value())
+        << "a commit truncated out of the log is still served from the stale index";
+    EXPECT_TRUE(store_->fetch("g-new", tp("t", 1)).has_value());
 }

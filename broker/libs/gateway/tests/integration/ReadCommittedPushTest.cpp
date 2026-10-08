@@ -295,7 +295,6 @@ public:
     static constexpr int32_t kIngressStream = 7001;
     static constexpr int32_t kTopicId       = 0;   // "events" → vector index 0
     static constexpr int32_t kPartition     = 0;
-    static constexpr int     kPumpIter      = 50'000;
 
     // All captured egress frames: (sessionId, encoded bytes).
     // Single shared callback; tests filter by sessionId.
@@ -356,16 +355,40 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Pump doWork until condition is met or kPumpIter is exceeded.
+    // Pump doWork until a condition is met (see pump / pumpUntilQuiescent).
     // -----------------------------------------------------------------------
-    void pump(std::function<bool()> done, int iterations = kPumpIter)
+    // Progress-driven condition wait: run the gateway until done() holds, yielding
+    // only on idle passes (the driver thread delivers asynchronously).  Bounded by
+    // a pass cap, not a wall clock; callers assert done() afterwards.
+    void pump(std::function<bool()> done, int64_t cap = 4'000'000)
     {
-        using clock = std::chrono::steady_clock;
-        const auto deadline = clock::now() + std::chrono::seconds{10};
-        for (int i = 0; i < iterations && clock::now() < deadline && !done(); ++i) {
-            gw_->doWork(nowNs());
-            aeron_driver_main_idle_strategy(driver_, aeron_driver_main_do_work(driver_));
+        for (int64_t i = 0; i < cap && !done(); ++i) {
+            // driverThread_ (startDriver()) is the driver's ONE pumper; do not pump
+            // aeron_driver_main_do_work here too (second-pumper race, spec Sec 3.6).
+            if (gw_->doWork(nowNs()) == 0) std::this_thread::yield();
         }
+    }
+
+    // For ABSENCE checks ("X must NOT be delivered"): run until the system is
+    // observably quiescent — kQuiet consecutive passes in which the gateway did
+    // no work AND no new frame arrived — instead of burning an arbitrary number
+    // of passes.  Returns false (and the caller fails) if it never settles.
+    [[nodiscard]] bool pumpUntilQuiescent(int kQuiet = 2'000, int64_t cap = 4'000'000)
+    {
+        int quiet = 0;
+        std::size_t lastFrames = allFrames_.size();
+        for (int64_t i = 0; i < cap; ++i) {
+            const int w = gw_->doWork(nowNs());
+            const std::size_t f = allFrames_.size();
+            if (w == 0 && f == lastFrames) {
+                if (++quiet >= kQuiet) return true;
+                std::this_thread::yield();
+            } else {
+                quiet = 0;
+            }
+            lastFrames = f;
+        }
+        return false;
     }
 
     // -----------------------------------------------------------------------
@@ -418,12 +441,11 @@ protected:
         });
 
         // Wait for CnC file.
+        // No caller-side pumping: aeron_driver_init/start already wrote
+        // cnc.dat and stamped the heartbeat synchronously before driverThread_
+        // even starts; pumping here would be a second concurrent pumper on
+        // the single-pumper driver (spec Sec 3.6).
         const std::string cncPath = aeronDir + "/cnc.dat";
-        for (int i = 0; i < 400; ++i) {
-            aeron_driver_main_do_work(driver_);
-            if (fs::exists(cncPath)) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds{1});
-        }
         ASSERT_TRUE(fs::exists(cncPath)) << "Aeron CnC file not created";
     }
 
@@ -881,7 +903,7 @@ TEST_F(ReadCommittedPushFixture, GroupReadUncommittedSeesAbortedAfterCarrier)
     // Pump several cycles WITHOUT sending the carrier.
     // Before the fix: nextOffset would advance past the aborted records.
     // After the fix: nextOffset stalls at offset 5 (first aborted batch).
-    pump([&]() { return false; }, 200);  // run 200 duty cycles unconditionally
+    ASSERT_TRUE(pumpUntilQuiescent()) << "gateway never quiesced pre-carrier";
 
     // Verify: pre-carrier, batches 0..4 may have been delivered but NOT 5..7 or 9.
     // (nextOffset must not have advanced past 5 into the aborted records.)
@@ -1153,8 +1175,8 @@ TEST_F(ReadCommittedRebuildOnFailoverFixture, OpenTxnPinsLsoAfterFailover)
         return has0 && has1 && has2;
     });
 
-    // Run a few more cycles to confirm offset 3 does NOT leak.
-    pump([&]() { return false; }, 500);
+    // Run until quiescent to confirm offset 3 does NOT leak.
+    ASSERT_TRUE(pumpUntilQuiescent()) << "gateway never quiesced after the LSO check";
 
     const auto delivered = extractBaseOffsets(sid, allFrames_);
 

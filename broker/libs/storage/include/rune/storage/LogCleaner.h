@@ -31,10 +31,28 @@ struct CleanPassResult {
 /// lists ONLY the segments whose on-disk .log actually changed this pass (dropped
 /// records or deleted) — the caller enqueues a swap for exactly these; unchanged
 /// prefix segments are left untouched and are NOT enqueued.
+/// Fix round 2 (deferred install): one compaction output the OWNER thread must
+/// validate and install.  `bases` = the replaced segments (ascending; a merged
+/// group or a single rewrite).  hasOutput: the fsynced output is at
+/// Log::cleanedLogPath(dir, bases.front(), seq); false = every record was
+/// removed (the members are simply dropped).  The originals are untouched.
+struct CleanedGroup {
+    std::vector<int64_t> bases;
+    uint64_t             seq       = 0;
+    bool                 hasOutput = false;
+    /// hasOutput: one past the output's last offset (the installed segment's
+    /// nextOffset — the owner opens it trusted, without re-reading it).
+    int64_t              nextOffset = 0;
+};
+
 struct RangeCleanResult {
     bool                 compacted = false;
     Offset               passEnd   = -1;
     std::vector<int64_t> rewrittenBases;
+    /// Deferred-install mode only (setDeferredInstall): the outputs to hand to
+    /// the owner thread (Log::enqueueCleanedGroup).  rewrittenBases still lists
+    /// every member base.
+    std::vector<CleanedGroup> groups;
 };
 
 /// Kafka-style log compaction for a single Log.
@@ -60,7 +78,28 @@ struct RangeCleanResult {
 /// are cleaned up at the start of compact().
 class LogCleaner {
 public:
+    /// I1 (Kafka producer.id.expiration.ms): a producer whose last batch's
+    /// maxTimestamp is older than now - this is no longer retained by
+    /// compaction (ProducerTails.h).  Default 7 days; < 0 = never expire.
+    void setProducerIdExpirationMs(int64_t ms) noexcept { producerIdExpirationMs_ = ms; }
+    [[nodiscard]] int64_t producerIdExpirationMs() const noexcept { return producerIdExpirationMs_; }
+    /// M3: bytes the last offset-map build read from clean-prefix segments
+    /// (producer tails) — throttled by the bounded passes.
+    [[nodiscard]] int64_t lastPrefixBytesRead() const noexcept { return prefixBytesRead_; }
+
     LogCleaner() = default;
+
+    /// D3b fix 1: a COMMIT/ABORT marker may be removed (horizon-stamped, then
+    /// dropped) only below this offset — the minimum fetch position over EVERY
+    /// assigned replica (PartitionReplica::cleanerMarkerRemovalBound): a lagging
+    /// replica that holds a txn's data but not yet its marker must still receive
+    /// the marker, or after a failover it would treat the aborted data as part of
+    /// the producer's next txn.  Default 0 = never remove a marker (a caller with
+    /// no replica knowledge keeps them all — correctness over growth).
+    void setMarkerRemovalBound(Offset bound) noexcept { markerRemovalBound_ = bound; }
+    [[nodiscard]] Offset markerRemovalBound() const noexcept { return markerRemovalBound_; }
+    /// Segment files the rewrite phase of the last pass read (test/accounting).
+    [[nodiscard]] int64_t lastRewriteSegmentsRead() const noexcept { return rewriteSegmentsRead_; }
 
     /// Scan log batches whose base-offset falls in [fromOffset, toOffset) and
     /// populate `map` with key→latest-offset entries.
@@ -121,15 +160,18 @@ public:
     /// @param nowNs               Current monotonic time in nanoseconds.
     /// @param deleteRetentionMs   How long (ms) to retain tombstones before
     ///                            removing them entirely.
+    /// @param nowMs               Wall-clock epoch-ms (KIP-534 delete horizon for
+    ///                            tombstones AND removable txn markers).  -1 =
+    ///                            legacy nowNs tombstone path; markers are kept.
     void compact(Log& log, OffsetMap& map,
                  Offset firstDirtyOffset, Offset cleanBoundaryOffset,
-                 int64_t nowNs, int64_t deleteRetentionMs);
+                 int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs = -1);
 
     /// Convenience: build the offset map and compact in one call.
     /// The dirty range is [log.firstDirtyOffset, cleanBoundaryOffset).
     /// `firstDirtyOffset` is typically 0 for a fresh compaction.
     void clean(Log& log, Offset firstDirtyOffset, Offset cleanBoundaryOffset,
-               int64_t nowNs, int64_t deleteRetentionMs);
+               int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs = -1);
 
     /// CP-2: bounded, single-segment compaction (the duty-cycle unit of work).
     ///
@@ -299,6 +341,20 @@ public:
                                                Throttler* throttler = nullptr,
                                                int64_t nowMs = -1);
 
+    /// Fix round 2 (Kafka-style swap on the owner thread): in deferred mode
+    /// produceCleanedRangeBounded NEVER renames, replaces or deletes a segment
+    /// file — each output is written (fsynced) to a unique
+    /// Log::cleanedLogPath(dir, base, seq) and reported in
+    /// RangeCleanResult::groups; the owner thread validates and installs it
+    /// (Log::drainCleanerSwaps).  `nextSeq` is the caller's cleaner-owned
+    /// monotonic counter (unique output names across passes).
+    void setDeferredInstall(uint64_t* nextSeq) noexcept { deferredSeq_ = nextSeq; }
+    /// Fix round 6: run `hook` at every segment boundary of a pass (and the
+    /// throttler's sleep slices, if the caller wires it there too).
+    void setBoundaryHook(BoundaryHook hook) noexcept { hook_ = hook; }
+    /// Max members per deferred group (bounds the owner's ring claim).
+    static constexpr std::size_t kMaxDeferredGroupMembers = 64;
+
 private:
     /// Is a record a tombstone?
     /// Treats empty value (vlen == 0) as a delete marker, matching Kafka behaviour.
@@ -325,7 +381,9 @@ private:
                             const std::function<std::optional<Offset>(std::string_view)>& getLatest,
                             Offset fromOffset, Offset cleanBoundaryOffset,
                             int64_t nowNs, int64_t deleteRetentionMs,
-                            int64_t nowMs = -1, bool* changed = nullptr);
+                            int64_t nowMs = -1, bool* changed = nullptr,
+                            const ProducerTails* tails = nullptr,
+                            const TxnCleanState* txn = nullptr);
 
     /// Rewrite a single segment, keeping only records whose offset matches the
     /// latest entry in `map` (or is past cleanBoundaryOffset).  Tombstones
@@ -357,6 +415,26 @@ private:
                            Offset globalDirtyStart, Offset passEnd,
                            int64_t nowNs, int64_t deleteRetentionMs, int64_t nowMs,
                            Throttler* throttler, bool* changed);
+    int64_t producerIdExpirationMs_ = ProducerTails::kDefaultExpirationMs;
+    int64_t prefixBytesRead_        = 0;
+    Offset  markerRemovalBound_     = 0;
+    int64_t rewriteSegmentsRead_    = 0;
+    uint64_t* deferredSeq_          = nullptr;   ///< non-null = deferred-install mode
+    BoundaryHook hook_{};
+    std::vector<CleanedGroup>* deferredOut_ = nullptr;   ///< set for one pass
+    std::vector<std::string>   deferredWritten_;         ///< this pass's output files (exception cleanup)
+    /// Deferred mode: write `out` durably to a fresh cleaned path for `bases`
+    /// (or record an all-removed group) — never touches the originals.
+    void deferInstall_(const std::string& dir, const std::vector<int64_t>& bases,
+                       const std::vector<uint8_t>& out);
+    RangeCleanResult produceCleanedRangeBoundedImpl_(const std::string& dir,
+                                                     const std::vector<int64_t>& sealedBases,
+                                                     const std::vector<int64_t>& sealedSizes,
+                                                     Offset activeBase, Offset globalDirtyStart,
+                                                     int64_t nowNs, int64_t deleteRetentionMs,
+                                                     SkimpyOffsetMap& map, bool useCoalescing,
+                                                     int64_t groupRollBytes, Throttler* throttler,
+                                                     int64_t nowMs);
 };
 
 } // namespace rune::storage

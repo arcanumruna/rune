@@ -25,6 +25,7 @@
 //   - Bounded: hard deadline 10 s; FAIL if not converged.
 // ---------------------------------------------------------------------------
 
+#include <rune/aeronutil/testing/FreePort.h>
 #include <gtest/gtest.h>
 
 extern "C" {
@@ -36,8 +37,12 @@ extern "C" {
 
 #include <rune/replication/AeronPartitionTransport.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune/replication/ReplicationMessages.h>
+#include <rune/replication/WorkerReplicationTransport.h>
 #include <rune/storage/Log.h>
 
+#include <cstdlib>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -45,6 +50,7 @@ extern "C" {
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 #include <unistd.h>
 
 // UDP port discovery
@@ -131,24 +137,7 @@ struct TempDir {
 // Port discovery
 // ---------------------------------------------------------------------------
 static uint16_t discoverFreeUdpPort() {
-    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) throw std::runtime_error("socket() failed");
-
-    struct sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = 0;
-    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
-    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd);
-        throw std::runtime_error("bind() failed");
-    }
-    socklen_t addrLen = sizeof(addr);
-    ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen);
-    const uint16_t netPort = addr.sin_port;
-    const uint16_t port =
-        static_cast<uint16_t>((netPort >> 8) | ((netPort & 0xFFu) << 8));
-    ::close(fd);
-    return port;
+    return rune::aeronutil::testing::allocFreeUdpPort();   // D8: never an ephemeral port
 }
 
 static std::string udpChannel(uint16_t port) {
@@ -481,4 +470,330 @@ TEST(AeronPartitionTransportInteg, FetchLoop_LargeBacklog) {
         << "Follower LEO did not reach leader LEO";
     EXPECT_GE(leaderReplica.highWatermark(), targetLeo)
         << "Leader HW did not advance to LEO";
+}
+
+// ===========================================================================
+// TEST: per-worker transport gather send over REAL aeron:udp (spec §3.5a.2).
+//
+// The FetchResponse records body is handed to AeronPubRegistry::sendGatherToPeer
+// as a separate buffer: tryClaim for frames <= maxPayloadLength, a 2-buffer
+// gather offer() (Aeron fragments it) above.  Both must arrive byte-identical to
+// a single contiguous SBE encode — including the reconcile re-stamp.  Frames
+// larger than maxMessageLength are dropped (no throw).  Bounded: 10 s deadline.
+// ===========================================================================
+TEST(WorkerReplicationTransportInteg, GatherSendArrivesByteIdenticalRegression) {
+    TempDir driverTd("rune_wrt_driver_");
+    const uint16_t portA = discoverFreeUdpPort();
+    const uint16_t portB = discoverFreeUdpPort();
+    ASSERT_NE(portA, portB) << "Port collision — retry";
+    constexpr int32_t kStream = 700;
+
+    EmbeddedMediaDriver driver((driverTd.dir / "aeron").string());
+    aeron::Context aeronCtx;
+    aeronCtx.aeronDir(driver.aeronDir());
+    auto aeronClient = aeron::Aeron::connect(aeronCtx);
+
+    // Node 1 (sender) and node 2 (receiver), one worker each.
+    WorkerReplicationTransport a(aeronClient, 0, udpChannel(portA), kStream,
+                                 {{2, udpChannel(portB)}}, kStream);
+    WorkerReplicationTransport b(aeronClient, 0, udpChannel(portB), kStream,
+                                 {{1, udpChannel(portA)}}, kStream);
+    ASSERT_TRUE(a.resolved());
+    ASSERT_TRUE(b.resolved());
+
+    const int32_t maxRecords = a.maxFetchResponseBytes();   // 64 KiB term → 8 KiB msg
+    ASSERT_GT(maxRecords, 4096) << "need room for a multi-fragment frame";
+
+    auto encodeExpected = [](const FetchResponseMsg& r, bool reconcile) {
+        std::vector<uint8_t> out(FetchResponseMsg::encodedSize(r.records.size()));
+        FetchResponseMsg::encode(out.data(), 0, r.leaderEpoch, r.partition, r.highWatermark,
+                                 r.logStartOffset, r.errorCode, r.records, r.topicId);
+        if (reconcile) stampTemplateId(out.data(), 0, kReconcileFetchRespTemplateId);
+        return out;
+    };
+
+    // Send (re-sending until the image connects) and return the first frame B sees
+    // of the SAME kind + length (a late duplicate of an earlier step is skipped).
+    auto roundTrip = [&](const FetchResponseMsg& r, bool reconcile) {
+        const uint16_t wantTid = reconcile
+            ? kReconcileFetchRespTemplateId
+            : static_cast<uint16_t>(ReplicationTemplateId::FetchResponse);
+        const std::size_t wantLen = FetchResponseMsg::encodedSize(r.records.size());
+        std::vector<uint8_t> got;
+        const auto deadline = steady_clock::now() + seconds(10);
+        auto lastSend = steady_clock::now() - seconds(1);
+        while (got.empty() && steady_clock::now() < deadline) {
+            if (steady_clock::now() - lastSend >= milliseconds(50)) {
+                if (reconcile) a.sendReconcileResponse(2, r);
+                else           a.sendFetchResponse(2, r);
+                lastSend = steady_clock::now();
+            }
+            b.poll(10, [&](int32_t, int32_t, uint16_t tid, const uint8_t* f, std::size_t len) {
+                if (got.empty() && tid == wantTid && len == wantLen) got.assign(f, f + len);
+            });
+            if (got.empty()) std::this_thread::sleep_for(milliseconds(1));
+        }
+        return got;
+    };
+
+    auto mk = [](std::span<const uint8_t> recs) {
+        FetchResponseMsg r{};
+        r.leaderEpoch = 3; r.partition = 1; r.highWatermark = 9; r.logStartOffset = 0;
+        r.errorCode = 0; r.topicId = 4; r.records = recs;
+        return r;
+    };
+
+    // (1) small frame → tryClaim path.
+    const std::vector<uint8_t> small(200, 0x11);
+    const auto rs = mk(small);
+    EXPECT_EQ(roundTrip(rs, false), encodeExpected(rs, false));
+
+    // (2) multi-fragment frame (> maxPayloadLength) → 2-buffer gather offer().
+    std::vector<uint8_t> big(static_cast<std::size_t>(maxRecords) - 16);
+    for (std::size_t i = 0; i < big.size(); ++i) big[i] = static_cast<uint8_t>(i * 131u + 7u);
+    const auto rb = mk(big);
+    EXPECT_EQ(roundTrip(rb, false), encodeExpected(rb, false));
+    EXPECT_EQ(roundTrip(rb, true), encodeExpected(rb, true))
+        << "reconcile re-stamp must survive the gather path";
+
+    // (3) oversized frame is dropped, never thrown.
+    const std::vector<uint8_t> huge(static_cast<std::size_t>(maxRecords) + 1, 0x22);
+    EXPECT_NO_THROW(a.sendFetchResponse(2, mk(huge)));
+}
+
+// ===========================================================================
+// F3 round 5, item I3: AeronPartitionTransport::maxFetchResponseBytes() must
+// be the min of the outbound-ring bound AND the Aeron term bound (term/8 −
+// FetchResponse framing).  Before the fix it used the ring bound only, so with
+// a term whose maxMessageLength (term/8) is smaller than ring/8 it claimed
+// "sendable" for batches that sendOnPub() then silently DROPS (oversized
+// frame) — a follower stalled forever on such a batch.  Driver term here is
+// 64 KiB (maxMessageLength 8192) against a 4 MiB outbound ring (8× larger).
+// ===========================================================================
+TEST(AeronPartitionTransportInteg, MaxFetchResponseHonorsTermBoundRegression) {
+    TempDir driverTd("rune_apt_termbound_");
+    EmbeddedMediaDriver driver((driverTd.dir / "aeron").string());   // 64 KiB term
+    aeron::Context aeronCtx;
+    aeronCtx.aeronDir(driver.aeronDir());
+    auto aeronClient = aeron::Aeron::connect(aeronCtx);
+
+    constexpr int32_t kTermBytes = 64 * 1024;
+    constexpr int     kRingBytes = 4 * 1024 * 1024;
+    // Integration wave 2: the publication bound is F18's setter (the ctor's 5th
+    // argument is the outbound ring size — F3's required term argument is gone).
+    AeronPartitionTransport t(aeronClient, udpChannel(discoverFreeUdpPort()), 801,
+                              /*selfId=*/1, kRingBytes);
+    t.setPublicationMaxMessageBytes(rune::replication::aeronMaxMessageLength(kTermBytes));
+
+    const int32_t kFrameworkOverhead = static_cast<int32_t>(FetchResponseMsg::encodedSize(0));
+    // Aeron maxMessageLength(64 KiB term) = 8192; minus the FetchResponse framing.
+    EXPECT_EQ(t.maxFetchResponseBytes(), 8192 - kFrameworkOverhead)
+        << "the term bound (8192) is tighter than the ring bound (524288) and must win";
+    EXPECT_EQ(t.maxFetchResponseBytes(),
+              AeronPartitionTransport::maxFetchResponseBytesFor(kRingBytes, kTermBytes))
+        << "the config-only helper BrokerNode uses must equal the live instance";
+
+    // Ring tighter than term: the ring bound (ring/8 − outbound envelope −
+    // framing) must win instead.
+    AeronPartitionTransport t2(aeronClient, udpChannel(discoverFreeUdpPort()), 802,
+                               /*selfId=*/1, /*outboundRingBytes=*/64 * 1024);
+    t2.setPublicationMaxMessageBytes(rune::replication::aeronMaxMessageLength(16 * 1024 * 1024));
+    EXPECT_EQ(t2.maxFetchResponseBytes(),
+              8192 - static_cast<int32_t>(AeronPartitionTransport::kOutboundEnvelopeOverhead)
+                   - kFrameworkOverhead);
+    EXPECT_EQ(t2.maxFetchResponseBytes(),
+              AeronPartitionTransport::maxFetchResponseBytesFor(64 * 1024, 16 * 1024 * 1024));
+}
+
+// F16 regression: transport traffic counters / flight-recorder sequences were
+// file-static globals shared by every AeronPartitionTransport in the process, so
+// two transports polled on two threads (two in-process nodes, or per-worker
+// transports) raced on them (TSan: GR5_Integration.AcksAll_Deferred_HWGate).
+// Each transport must own its counters: polling/draining A never moves B's.
+TEST(AeronPartitionTransportRegression, TrafficCountersArePerInstance) {
+    TempDir driverTd("rune_f16_driver_");
+    EmbeddedMediaDriver driver((driverTd.dir / "aeron").string());
+    aeron::Context aeronCtx;
+    aeronCtx.aeronDir(driver.aeronDir());
+    auto aeronClient = aeron::Aeron::connect(aeronCtx);
+
+    const uint16_t portA = discoverFreeUdpPort();
+    const uint16_t portB = discoverFreeUdpPort();
+    ASSERT_NE(portA, portB);
+    constexpr int32_t kStream = 501;
+    AeronPartitionTransport a(aeronClient, udpChannel(portA), kStream, /*selfId=*/1);
+    AeronPartitionTransport b(aeronClient, udpChannel(portB), kStream, /*selfId=*/2);
+    a.addPeer(2, udpChannel(portB), kStream);
+    b.addPeer(1, udpChannel(portA), kStream);
+
+    const auto b0 = b.txStatsForTest();
+    FetchRequestMsg req{};
+    req.leaderEpoch = 1; req.partition = 0; req.followerId = 1;
+    req.fetchOffset = 0; req.maxBytes = 1024; req.topicId = 0;
+    a.sendFetchRequest(req);          // enqueue on A's outbound ring
+    (void)a.poll(1'000'000);          // A drains it (and counts one poll)
+
+    const auto a1 = a.txStatsForTest();
+    const auto b1 = b.txStatsForTest();
+    EXPECT_GE(a1.outDrained, 1) << "A drained its own outbound frame";
+    EXPECT_GE(a1.polls, 0);
+    EXPECT_EQ(b1.outDrained, b0.outDrained) << "draining A must not move B's counter";
+    EXPECT_EQ(b1.polls, b0.polls) << "polling A must not move B's counter";
+}
+
+// Review (eos-dup-fix-review §2.1): the transport per-second rate diagnostic
+// (RUNE_FS_LOG) must be OFF by default at its REAL call site, poll().  Its
+// counters only move while the diagnostic is on, so a default-env poll must
+// leave them at zero (the pre-fix default-ON lambda counted every poll).
+TEST(DiagFlagsRegression, TransportRateLogCallSiteOffByDefaultRegression) {
+    if (std::getenv("RUNE_FS_LOG") != nullptr)
+        GTEST_SKIP() << "RUNE_FS_LOG is set in this environment; the default is not under test";
+    TempDir driverTd("rune_diagflags_driver_");
+    EmbeddedMediaDriver driver((driverTd.dir / "aeron").string());
+    aeron::Context aeronCtx;
+    aeronCtx.aeronDir(driver.aeronDir());
+    auto aeronClient = aeron::Aeron::connect(aeronCtx);
+
+    AeronPartitionTransport t(aeronClient, udpChannel(discoverFreeUdpPort()), 503, /*selfId=*/1);
+    for (int i = 0; i < 3; ++i) (void)t.poll(1'000'000LL * (i + 1));
+    EXPECT_EQ(t.txStatsForTest().polls, 0)
+        << "the transport rate diagnostic ran with RUNE_FS_LOG unset";
+}
+
+// ===========================================================================
+// F27 re-review R1 / R4: the REAL drainOutbound wiring (PubOffer + sendOnPub)
+// over a real driver.  Peer 2 is LIVE, peer 3 is DEAD (no subscriber →
+// NOT_CONNECTED forever), peer 4's registration FAILED (no publication ever).
+// Far more broadcasts than a dead peer's FIFO could hold: every one reaches the
+// live peer, the outbound ring never freezes, nothing is held for the dead /
+// unregistered peers.  Bounded real-time loops (driver I/O), no sleeps.
+// ===========================================================================
+namespace {
+struct LiveSub {
+    std::shared_ptr<aeron::Subscription> sub;
+    int fragments = 0;
+    int poll() {
+        return sub->poll([this](aeron::concurrent::AtomicBuffer&, aeron::util::index_t,
+                                aeron::util::index_t, aeron::Header&) { ++fragments; }, 256);
+    }
+};
+LiveSub addLiveSub(aeron::Aeron& a, const std::string& ch, int32_t stream) {
+    const int64_t id = a.addSubscription(ch, stream);
+    LiveSub s;
+    const auto deadline = steady_clock::now() + seconds(5);
+    while (!(s.sub = a.findSubscription(id)) && steady_clock::now() < deadline) std::this_thread::yield();
+    return s;
+}
+} // namespace
+
+TEST(AeronPartitionTransportRegression, DrainDeadAndUnregisteredPeersNeverBlockLivePeerRegression) {
+    TempDir driverTd("rune_f27_drain_");
+    EmbeddedMediaDriver driver((driverTd.dir / "aeron").string());
+    aeron::Context aeronCtx;
+    aeronCtx.aeronDir(driver.aeronDir());
+    auto aeronClient = aeron::Aeron::connect(aeronCtx);
+
+    constexpr int32_t kStream = 931;
+    const uint16_t selfPort = discoverFreeUdpPort();
+    const uint16_t livePort = discoverFreeUdpPort();
+    const uint16_t deadPort = discoverFreeUdpPort();
+    LiveSub live = addLiveSub(*aeronClient, udpChannel(livePort), kStream);
+    ASSERT_TRUE(live.sub);
+
+    AeronPartitionTransport t(aeronClient, udpChannel(selfPort), kStream, /*selfId=*/1,
+                              /*outboundRingBytes=*/64 * 1024);    // FIFO per peer = 64 KiB
+    t.addPeer(2, udpChannel(livePort), kStream);
+    t.addPeer(3, udpChannel(deadPort), kStream);                   // nobody listens
+    t.addPeer(4, "aeron:udp?endpoint=", kStream);                  // registration fails
+
+    FetchRequestMsg req{};
+    req.leaderEpoch = 1; req.partition = 0; req.followerId = 1;
+    req.fetchOffset = 0; req.maxBytes = 1024; req.topicId = 0;
+
+    // Wait (bounded) until the live publication is connected: one probe arrives.
+    {
+        const auto deadline = steady_clock::now() + seconds(10);
+        bool up = false;
+        while (!up && steady_clock::now() < deadline) {
+            (void)t.sendFetchRequest(req);
+            (void)t.poll(1);
+            (void)live.poll();
+            up = live.fragments > 0;
+        }
+        ASSERT_TRUE(up) << "live peer never connected";
+    }
+
+    constexpr int kFrames = 6000;   // 6000 × ~72 B ≈ 430 KB ≫ a 64 KiB FIFO
+    const int before = live.fragments;
+    int sent = 0;
+    const auto deadline = steady_clock::now() + seconds(20);
+    // An abort (ring read left in place) is only legitimate when the LIVE peer's
+    // own FIFO is full (it is momentarily back-pressured: a slow subscriber under
+    // CPU load).  A dead / unregistered peer must NEVER hold a frame, so it can
+    // never be the FIFO that forces an abort.  Sampled after every drain pass.
+    std::size_t deadHeldMax = 0;
+    uint64_t abortsWithoutLiveBacklog = 0;
+    while ((sent < kFrames || live.fragments - before < kFrames) && steady_clock::now() < deadline) {
+        while (sent < kFrames && t.sendFetchRequest(req)) ++sent;   // fill the ring
+        const uint64_t abortsBefore = t.holdStatsForTest().aborts;
+        (void)t.poll(1);
+        if (t.holdStatsForTest().aborts != abortsBefore && t.heldFramesForTest(2) == 0)
+            ++abortsWithoutLiveBacklog;
+        deadHeldMax = std::max({deadHeldMax, t.heldFramesForTest(3), t.heldFramesForTest(4)});
+        (void)live.poll();
+    }
+    EXPECT_EQ(sent, kFrames) << "the outbound ring froze: a dead peer blocked the live one";
+    // >= : warm-up probes still in flight may land after `before` was sampled.
+    EXPECT_GE(live.fragments - before, kFrames) << "every broadcast reaches the live peer";
+    const auto& hs = t.holdStatsForTest();
+    EXPECT_GT(hs.downDropped, 0u) << "dead / unregistered peers' copies are discarded, not held";
+    EXPECT_EQ(deadHeldMax, 0u) << "a dead / unregistered peer held a frame";
+    EXPECT_TRUE(t.peerDownForTest(3));
+    EXPECT_TRUE(t.peerDownForTest(4));
+    // Was EXPECT_EQ(hs.aborts, 0u): timing-dependent — a live subscriber starved
+    // of CPU (ctest -j) back-pressures its publication, fills its own FIFO and
+    // correctly aborts (gate flake, 7/36 under 12-way parallel stress).  The
+    // property is that no abort happens WITHOUT live-peer backlog.
+    EXPECT_EQ(abortsWithoutLiveBacklog, 0u) << "an abort not caused by the live peer's own backlog";
+    EXPECT_EQ(hs.pushFailed, 0u);
+}
+
+// R4: an oversized frame (larger than the publication's maxMessageLength) is a
+// permanent refusal from sendOnPub (kOfferOversized): counted and discarded,
+// never held (it could never be sent).
+TEST(AeronPartitionTransportRegression, DrainOversizedFrameCountedNotHeldRegression) {
+    TempDir driverTd("rune_f27_oversize_");
+    EmbeddedMediaDriver driver((driverTd.dir / "aeron").string());   // 64 KiB term → 8 KiB max message
+    aeron::Context aeronCtx;
+    aeronCtx.aeronDir(driver.aeronDir());
+    auto aeronClient = aeron::Aeron::connect(aeronCtx);
+
+    constexpr int32_t kStream = 932;
+    const uint16_t selfPort = discoverFreeUdpPort();
+    const uint16_t livePort = discoverFreeUdpPort();
+    LiveSub live = addLiveSub(*aeronClient, udpChannel(livePort), kStream);
+    ASSERT_TRUE(live.sub);
+    AeronPartitionTransport t(aeronClient, udpChannel(selfPort), kStream, /*selfId=*/1,
+                              /*outboundRingBytes=*/1024 * 1024);   // ring frame up to 128 KiB
+    t.addPeer(2, udpChannel(livePort), kStream);
+    {   // resolve + connect (bounded)
+        FetchRequestMsg req{};
+        req.leaderEpoch = 1; req.followerId = 1; req.maxBytes = 1024;
+        const auto deadline = steady_clock::now() + seconds(10);
+        while (live.fragments == 0 && steady_clock::now() < deadline) {
+            (void)t.sendFetchRequest(req);
+            (void)t.poll(1);
+            (void)live.poll();
+        }
+        ASSERT_GT(live.fragments, 0);
+    }
+    const std::vector<uint8_t> records(20 * 1024, 0x5A);   // > 8 KiB publication max
+    FetchResponseMsg resp{};
+    resp.leaderEpoch = 1;
+    resp.records = std::span<const uint8_t>(records);
+    ASSERT_TRUE(t.sendFetchResponse(2, resp)) << "the ring accepts it";
+    for (int i = 0; i < 5; ++i) (void)t.poll(1);
+    EXPECT_EQ(t.holdStatsForTest().oversizeDropped, 1u);
+    EXPECT_EQ(t.holdStatsForTest().held, 0u) << "an unsendable frame is never held";
+    EXPECT_EQ(t.oversizedFrameDropped(), 1u);
 }

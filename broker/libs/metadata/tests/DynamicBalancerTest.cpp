@@ -319,23 +319,18 @@ TEST(DynamicBalancer, SkipNoOpForAlreadyOptimalPartition) {
 }
 
 // ---------------------------------------------------------------------------
-// REPRO (bug): transient multi-node heartbeat expiry on the 3-node bench VM
-// collapses every partition onto the sole surviving eligible node with the ISR
-// shrunk to {survivor}.  When the expired nodes return AND have fully caught up,
-// leadership must RE-CONVERGE (spread back toward the preferred replicas) so
-// acks=majority can commit again.  It does not today: preferred-leader
-// restoration is gated on stale-ISR membership (the returned nodes were dropped
-// from the ISR during the failover shrink), so leadership stays pinned on the
-// survivor forever and HW is stuck below minIsr.  The fix converges off the
-// ReplicaPositionTable (a caught-up live replica is restorable) — time-independent,
-// ISR/position-based, idempotent.  See [[rune-followersync-state-machine]].
+// Transient multi-node heartbeat expiry collapses partitions onto the sole
+// surviving node with the ISR shrunk to {survivor}.  Kafka model (DUR-1 fix
+// round): the controller never re-seeds the ISR from position reports — the
+// survivor-leader re-admits each caught-up follower through AlterIsr (committed
+// ISR change) and the preferred election then re-converges leadership.  (Was:
+// position-based "restoration" outside the committed ISR, retired — lineage-blind.)
 // ---------------------------------------------------------------------------
 // NOTE: suite name ends in "Regression" so the whole growing regression set is
 // runnable via --gtest_filter='*Regression*'.  See [[mark-regression-tests-as-suite]].
 TEST(DynamicBalancerRegression, RestoresLeadershipAfterIsrCollapseWhenReplicaCaughtUp) {
     AssignmentMap m;
-    // Post-collapse state: 3 partitions all pinned on the survivor (node 1) with
-    // ISR shrunk to {1}.  Preferred replica (replicas[0]) is 0, 1, 2 respectively.
+    // Post-collapse state: 3 partitions all pinned on the survivor (node 1).
     for (int p = 0; p < 3; ++p) {
         PartitionAssignment a;
         a.leaderNode    = 1;
@@ -345,7 +340,6 @@ TEST(DynamicBalancerRegression, RestoresLeadershipAfterIsrCollapseWhenReplicaCau
         a.partitionEpoch = 9;
         m.put(7, p, a);
     }
-    // All three replicas have returned and fully caught up to the SAME frontier.
     ReplicaPositionTable pos;
     for (int p = 0; p < 3; ++p)
         for (int n = 0; n < 3; ++n)
@@ -356,22 +350,26 @@ TEST(DynamicBalancerRegression, RestoresLeadershipAfterIsrCollapseWhenReplicaCau
     in.cur = &m; in.liveNodes = {0, 1, 2}; in.positions = &pos;
     in.topics = { TopicSpec{7, 3, 3, "", ""} };
 
-    auto recs = bal.rebalance(in);
+    // Positions alone never move leadership outside the committed ISR.
+    for (auto& r : bal.rebalance(in)) EXPECT_EQ(r.rec.leaderNode, 1);
 
-    // Partitions 0 and 2 are led by the wrong node (1); their caught-up preferred
-    // replicas (0 and 2) must be restored → at least 2 leadership records off node 1.
+    // The survivor's AlterIsr re-admitted the caught-up followers.
+    for (int p = 0; p < 3; ++p) {
+        PartitionAssignment a = *m.get(7, p);
+        a.isr = {1, 0, 2};
+        a.partitionEpoch += 1;
+        m.put(7, p, a);
+    }
+    auto recs = bal.rebalance(in);
     int restoredOffSurvivor = 0;
     for (auto& r : recs) if (r.rec.leaderNode != 1) ++restoredOffSurvivor;
     EXPECT_GE(restoredOffSurvivor, 2)
-        << "leadership must re-converge to caught-up preferred replicas after an ISR "
-           "collapse; emitted " << recs.size() << " records";
+        << "leadership must re-converge to the preferred replicas once they are back in the "
+           "committed ISR; emitted " << recs.size() << " records";
 }
 
-// SAFETY GUARD for the fix above: a returned replica that is NOT caught up (its
-// reported position lags the leader's frontier) must NEVER be elected leader —
-// electing outside the committed frontier would lose acknowledged data.  This
-// keeps the position-based restoration honest (it must gate on real catch-up, not
-// blindly restore any live preferred replica).
+// SAFETY GUARD: a returned replica outside the committed ISR (here also behind
+// the leader's frontier) must NEVER be elected leader.
 TEST(DynamicBalancerRegression, DoesNotRestoreLeadershipToLaggingReplica) {
     AssignmentMap m;
     PartitionAssignment a;
@@ -398,44 +396,173 @@ TEST(DynamicBalancerRegression, DoesNotRestoreLeadershipToLaggingReplica) {
             << "a lagging replica (node 0, leo=400 < 1000) must not be elected leader";
 }
 
+// Kafka model (DUR-1 fix round, user decision 2026-10-03): elections pick ONLY
+// from the controller-committed ISR.  A replica outside it may hold a log of
+// equal / greater length on a DIVERGENT lineage (an uncommitted tail of an older
+// epoch) while lacking committed records — a position (LEO) report is no proof.
+// Before: a "restorable" preferred replica outside the ISR (LEO >= the leader's)
+// was elected and re-seeded into the ISR → its KIP-279 truncation directives
+// would drop committed records on the others.  The leader re-admits caught-up
+// followers itself (AlterIsr); only then may a preferred election move to them.
+TEST(DynamicBalancerRegression, NeverElectsOutsideCommittedIsrEvenWithCaughtUpPosition) {
+    AssignmentMap m;
+    PartitionAssignment a;
+    a.leaderNode     = 1;
+    a.isr            = {1, 2};
+    a.replicas       = {0, 1, 2};           // preferred = 0, outside the ISR
+    a.leaderEpoch    = 6;
+    a.partitionEpoch = 9;
+    m.put(7, 0, a);
+    // Node 0's log is LONGER than the leader's but ends in an OLD epoch (an
+    // uncommitted epoch-4 tail): it lacks the epoch-5/6 committed records.
+    ReplicaPositionTable pos;
+    pos.report({7, 0, 1, 6, 1000});
+    pos.report({7, 0, 2, 6, 1000});
+    pos.report({7, 0, 0, 4, 1200});
+    DynamicBalancer bal;
+    DynamicBalancerInputs in;
+    in.cur = &m; in.liveNodes = {0, 1, 2}; in.positions = &pos;
+    in.topics = { TopicSpec{7, 1, 3, "", ""} };
+    auto recs = bal.rebalance(in);
+    for (auto& r : recs) {
+        EXPECT_NE(r.rec.leaderNode, 0) << "elected a replica outside the committed ISR";
+        for (int32_t n : r.isr)
+            EXPECT_NE(n, 0) << "the controller added a member to the ISR on a position report";
+    }
+    // Once the leader's AlterIsr re-admitted node 0, the preferred move happens.
+    a.isr = {1, 2, 0};
+    m.put(7, 0, a);
+    auto recs2 = bal.rebalance(in);
+    ASSERT_EQ(recs2.size(), 1u);
+    EXPECT_EQ(recs2[0].rec.leaderNode, 0);
+}
+
+// A preferred-leader election only moves leadership: the committed ISR must be
+// carried over unchanged.  Before: the record carried an EMPTY ISR (mergeChange
+// applies newIsr literally) — the new leader started with an empty committed
+// ISR, every AlterIsr it sent lacked itself (refused) and acks=all never
+// committed (ShardModeRegression.AdvertisedIngressRoutesAreLive… hang).
+TEST(DynamicBalancerRegression, PreferredElectionKeepsTheCommittedIsr) {
+    AssignmentMap m;
+    for (int p = 0; p < 2; ++p) {
+        PartitionAssignment a;
+        a.leaderNode     = 1;               // node 1 leads both; node 0 is preferred for p0
+        a.isr            = {1, 0, 2};
+        a.replicas       = {p == 0 ? 0 : 1, p == 0 ? 1 : 2, p == 0 ? 2 : 0};
+        a.leaderEpoch    = 3;
+        a.partitionEpoch = 4;
+        m.put(7, p, a);
+    }
+    DynamicBalancer bal;
+    DynamicBalancerInputs in;
+    in.cur = &m; in.liveNodes = {0, 1, 2};
+    in.topics = { TopicSpec{7, 2, 3, "", ""} };
+    auto recs = bal.rebalance(in);
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].rec.leaderNode, 0);
+    ASSERT_EQ(recs[0].isr.size(), 3u) << "a preferred election emptied / changed the committed ISR";
+    for (int32_t n : {0, 1, 2})
+        EXPECT_NE(std::find(recs[0].isr.begin(), recs[0].isr.end(), n), recs[0].isr.end());
+}
+
+// Position-proven survivor election (no committed-ISR member live): the
+// pigeonhole gate must count only live replicas that REPORTED a position — an
+// unreported live replica may be the only holder of the committed records, and
+// the best reported one may lack them.
+TEST(DynamicBalancerRegression, SurvivorElectionCountsOnlyReportedReplicas) {
+    AssignmentMap m;
+    PartitionAssignment a;
+    a.leaderNode     = 0;                   // dead
+    a.isr            = {0};                 // committed ISR: only the dead leader
+    a.replicas       = {0, 1, 2};
+    a.leaderEpoch    = 5;
+    a.partitionEpoch = 9;
+    m.put(7, 0, a);
+    ReplicaPositionTable pos;
+    pos.report({7, 0, 2, 3, 100});          // node 1 (live) has NOT reported
+    DynamicBalancer bal;
+    DynamicBalancerInputs in;
+    in.cur = &m; in.liveNodes = {1, 2}; in.positions = &pos; in.minIsr = 2;
+    in.topics = { TopicSpec{7, 1, 3, "", ""} };
+    in.allowSurvivorElection = true;            // MEDIUM-3: opt-in
+    auto recs = bal.rebalance(in);
+    for (auto& r : recs)
+        EXPECT_NE(r.rec.leaderNode, 2) << "elected on a pigeonhole that counted an unreported replica";
+    pos.report({7, 0, 1, 5, 400});          // node 1 reports: it is the most complete
+    auto recs2 = bal.rebalance(in);
+    ASSERT_EQ(recs2.size(), 1u);
+    EXPECT_EQ(recs2[0].rec.leaderNode, 1);
+}
+
+// Review 2026-10-04 MEDIUM-3: the position-proven survivor election (no
+// committed-ISR member live) is an availability escape Kafka does not have —
+// it stays offline unless unclean.leader.election.enable.  Default OFF: the
+// partition goes leaderless (keeps its ISR lineage) until an ISR member returns.
+TEST(DynamicBalancerRegression, SurvivorElectionIsOptInDefaultOff) {
+    AssignmentMap m;
+    PartitionAssignment a;
+    a.leaderNode     = 0;                   // dead
+    a.isr            = {0};                 // committed ISR: only the dead leader
+    a.replicas       = {0, 1, 2};
+    a.leaderEpoch    = 5;
+    a.partitionEpoch = 9;
+    m.put(7, 0, a);
+    ReplicaPositionTable pos;
+    pos.report({7, 0, 1, 5, 400});
+    pos.report({7, 0, 2, 3, 100});
+    DynamicBalancer bal;
+    DynamicBalancerInputs in;
+    in.cur = &m; in.liveNodes = {1, 2}; in.positions = &pos; in.minIsr = 2;
+    in.topics = { TopicSpec{7, 1, 3, "", ""} };
+    for (auto& r : bal.rebalance(in))
+        EXPECT_EQ(r.rec.leaderNode, NO_LEADER) << "survivor election ran without the opt-in";
+    in.allowSurvivorElection = true;            // opted in: the most complete reporter
+    auto recs = bal.rebalance(in);
+    ASSERT_EQ(recs.size(), 1u);
+    EXPECT_EQ(recs[0].rec.leaderNode, 1);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// REGRESSION SUITE — minIsr failover floor (startup-collapse fix).
+// REGRESSION SUITE — failover to surviving in-ISR replicas.
 //
-// Bug (found via e2e on a contended 4-core VM): under transient CPU-starvation
-// heartbeat jitter, the metadata controller's eligible set momentarily shrank to
-// a single node.  A FAILOVER then elected that node with a collapsed ISR of size
-// 1 (< minIsr=2) — a permanent MinIsrViolation, so every acks=all produce was
-// rejected and throughput collapsed (23–1684 rps, p99 ≈ 9 s).  Evidence:
-//   node0 becomeLeader epoch=0 isr.size=3   (clean start)
-//   node1 becomeLeader epoch=1 isr.size=1   (failover installs ISR<minIsr → dead)
+// History: an earlier "minIsr floor" blocked failover whenever the eligible ∩ ISR
+// set fell below minIsr, to stop a transient-CPU-starvation eligible-set collapse
+// from installing a phantom ISR=1 leader.  That floor was REMOVED once the
+// FollowerLiveness state machine made the eligible set ACCURATE (live followers
+// keep publishing AppendPosition every status interval), because the floor then
+// blocked GENUINE single-survivor failover — leaving a partition stuck on a dead
+// leader forever, so subscribers redirect to the dead endpoint (committed-loss on
+// read; the dr-e2e leader-kill failures).
 //
-// Fix: DynamicBalancerInputs::minIsr — a failover never installs an ISR below the
-// commit quorum.  A partial in-sync set (0 < |ISR∩live| < minIsr) is treated as
-// transient isolation of the OBSERVER, not death of the peers: keep the current
-// leader and re-converge when a majority returns (time-independent, any window).
+// Correct behaviour: a lone surviving in-ISR replica IS a valid failover target —
+// it holds the committed prefix (it was in-sync), so promoting it serves committed
+// data without loss; new acks=all produce blocks at the gateway (minIsr) until the
+// ISR re-expands.  Split brain stays impossible: the balancer runs on the
+// consensus leader, which only holds leadership with a majority quorum.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// A single momentarily-eligible node must NOT seize leadership with ISR<minIsr.
-TEST(DynamicBalancerRegression, NoFailoverBelowMinIsrOnTransientIsolation) {
+// A lone surviving in-ISR replica MUST be promoted (accurate eligible set ⇒ the
+// others are genuinely dead).  Previously blocked by the minIsr floor.
+TEST(DynamicBalancerRegression, SingleSurvivorInIsrFailsOver) {
     AssignmentMap m;
-    // part0: healthy 3-node assignment, node 0 leads, ISR = replicas = {0,1,2}.
+    // part0: node 0 leads, ISR = replicas = {0,1,2}.  Nodes 0 and 2 die; only 1 left.
     m.put(7, 0, PartitionAssignment{0, {0,1,2}, {0,1,2}, /*leaderEpoch=*/0,
                                     /*partitionEpoch=*/0});
     ReplicaPositionTable pos;
+    pos.report({7,0,1,0,100});
     DynamicBalancer bal;
     DynamicBalancerInputs in;
     in.cur = &m;
-    in.liveNodes = {1};          // ONLY node 1 eligible this cycle (0 and 2 jittered out)
+    in.liveNodes = {1};          // node 1 is the SOLE survivor (0,2 genuinely gone)
     in.positions = &pos;
-    in.minIsr = 2;               // cluster-majority commit quorum
+    in.minIsr = 2;               // gateway acks=all gate — NOT a failover gate
     in.topics = { TopicSpec{7,1,3,"",""} };
 
     auto recs = bal.rebalance(in);
-    // Old (buggy) behaviour: fail over to node 1 with ISR={1} (size 1 < 2).
-    // Fixed behaviour: below the quorum floor → no reassignment; node 0 kept.
-    EXPECT_TRUE(recs.empty())
-        << "transient single-eligible must NOT install an ISR below minIsr; "
-           "keep current leader and converge when a majority returns";
+    ASSERT_FALSE(recs.empty())
+        << "the sole surviving in-ISR replica must be promoted (it holds committed "
+           "data); blocking this strands the partition on the dead leader";
+    for (auto& r : recs) EXPECT_EQ(r.rec.leaderNode, 1);
 }
 
 // Once a MAJORITY is eligible again, the genuine failover proceeds and installs
@@ -533,4 +660,119 @@ TEST(DynamicBalancerRegression, DefaultMinIsrOnePreservesSingleSurvivorFailover)
     ASSERT_FALSE(recs.empty()) << "default minIsr=1 must still fail over to lone survivor";
     for (auto& r : recs)
         EXPECT_EQ(r.rec.leaderNode, 2);
+}
+
+// REGRESSION (dr3 rolling leader-kill: partition permanently NO_LEADER):
+// When a partition's sole ISR survivor dies (no live in-sync replica), the
+// balancer must take it NO_LEADER but RETAIN the ISR lineage — NOT clear it —
+// so the partition can recover cleanly once a former-ISR replica rejoins.
+// Clearing the ISR left partitions permanently offline (empty ISR ∩ liveNodes
+// = ∅ → NO_LEADER forever), which manifested as the client producing 44/50
+// (records for the stuck partition failed with NotLeader / redirect-exhausted).
+TEST(DynamicBalancerRegression, NoLeaderRetainsIsrAndRecoversOnRejoin) {
+    // ── Step 1: leader (node 3) with ISR collapsed to {3} dies → NO_LEADER ────
+    AssignmentMap m;
+    m.put(7, 0, PartitionAssignment{3, {3}, {1,2,3}, 5, 9});
+
+    ReplicaPositionTable pos;
+    pos.report({7,0,3,5,100});
+
+    DynamicBalancer bal;
+    DynamicBalancerInputs in;
+    in.cur       = &m;
+    in.liveNodes = {1, 2};        // node 3 (sole ISR member) is dead
+    in.positions = &pos;
+    in.topics    = { TopicSpec{7,1,3,"",""} };
+
+    auto recs = bal.rebalance(in);
+    ASSERT_FALSE(recs.empty()) << "partition must transition to NO_LEADER";
+    const BalancerRecord* offline = nullptr;
+    for (auto& r : recs) if (r.rec.topicId == 7 && r.rec.partition == 0) offline = &r;
+    ASSERT_TRUE(offline != nullptr);
+    EXPECT_EQ(offline->rec.leaderNode, NO_LEADER) << "no live in-sync survivor → NO_LEADER";
+    // CRITICAL: the ISR lineage is RETAINED, not cleared.
+    ASSERT_EQ(offline->isr.size(), 1u) << "NO_LEADER must retain the ISR lineage {3}";
+    EXPECT_EQ(offline->isr[0], 3);
+
+    // ── Step 2: apply the offline record, then node 3 rejoins → recovers ──────
+    AssignmentMap m2;
+    m2.put(7, 0, PartitionAssignment{NO_LEADER, {3}, {1,2,3},
+                                     offline->rec.leaderEpoch,
+                                     offline->rec.partitionEpoch});
+    DynamicBalancerInputs in2;
+    in2.cur       = &m2;
+    in2.liveNodes = {1, 2, 3};    // node 3 back online (caught up)
+    in2.positions = &pos;
+    in2.topics    = { TopicSpec{7,1,3,"",""} };
+
+    auto recs2 = bal.rebalance(in2);
+    ASSERT_FALSE(recs2.empty()) << "returning former-ISR member must restore leadership";
+    const BalancerRecord* recovered = nullptr;
+    for (auto& r : recs2) if (r.rec.topicId == 7 && r.rec.partition == 0) recovered = &r;
+    ASSERT_TRUE(recovered != nullptr);
+    EXPECT_EQ(recovered->rec.leaderNode, 3)
+        << "clean election: the retained-ISR replica (node 3) is re-elected leader";
+}
+
+// Epoch-restart fix round 2 (N3, Kafka leader.imbalance.per.broker.percentage):
+// a preferred-leader move back to a node fires only when MORE than
+// imbalancePct of the partitions it is preferred for are led elsewhere — a
+// count threshold, never a timer.  1 of 20 displaced (5%) stays; 3 of 20
+// (15%) move back.
+TEST(DynamicBalancerRegression, PreferredMoveBackGatedByImbalanceRatioRegression) {
+    // 40 partitions: node 1 preferred for 0..19, node 2 for 20..39; the first
+    // `displaced` of node 1's are led by node 2 (node 2 leads more: a move
+    // back improves balance).
+    auto build = [](AssignmentMap& m, int displaced) {
+        for (int p = 0; p < 40; ++p) {
+            const bool mine = p < 20;
+            const int32_t leader = mine ? (p < displaced ? 2 : 1) : 2;
+            m.put(10, p, PartitionAssignment{leader, {1, 2},
+                                             mine ? std::vector<int32_t>{1, 2} : std::vector<int32_t>{2, 1}, 1, 1});
+        }
+    };
+    ReplicaPositionTable pos;
+    for (const int displaced : {1, 3}) {
+        AssignmentMap m;
+        build(m, displaced);
+        DynamicBalancer bal; DynamicBalancerInputs in;
+        in.cur = &m; in.liveNodes = {1, 2}; in.positions = &pos;
+        in.topics = { TopicSpec{10, 40, 2, "", ""} };
+        in.imbalancePct = 10;
+        const auto recs = bal.rebalance(in);
+        if (displaced == 1) EXPECT_TRUE(recs.empty()) << "moved back below the imbalance ratio";
+        else                EXPECT_EQ(recs.size(), 3u) << "no move back above the imbalance ratio";
+        in.imbalancePct = 0;   // legacy: any imbalance
+        EXPECT_EQ(bal.rebalance(in).size(), static_cast<std::size_t>(displaced));
+    }
+}
+
+// Epoch-restart fix round 1/2 (MAJOR-1): an excluded leader (a restarted
+// ex-leader that asked for a new epoch) fails over to another live ISR member
+// and leaves the ISR; when it is the sole live in-sync member the group is
+// left untouched (the controller re-elects it at a new epoch).
+TEST(DynamicBalancerRegression, ExcludedLeaderFailsOverOrIsLeftForTheCallerRegression) {
+    ReplicaPositionTable pos;
+    {
+        AssignmentMap m;
+        m.put(10, 0, PartitionAssignment{1, {1, 2, 3}, {1, 2, 3}, 4, 4});
+        DynamicBalancer bal; DynamicBalancerInputs in;
+        in.cur = &m; in.liveNodes = {1, 2, 3}; in.positions = &pos;
+        in.topics = { TopicSpec{10, 1, 3, "", ""} };
+        in.excludedLeaders = {{10, 0, 1}};
+        const auto recs = bal.rebalance(in);
+        ASSERT_EQ(recs.size(), 1u);
+        EXPECT_NE(recs[0].rec.leaderNode, 1);
+        EXPECT_EQ(recs[0].rec.leaderEpoch, 5);
+        EXPECT_FALSE(isIn_pub(1, recs[0].isr)) << "the excluded ex-leader stayed in the ISR";
+    }
+    {
+        AssignmentMap m;
+        m.put(10, 0, PartitionAssignment{1, {1}, {1, 2, 3}, 4, 4});
+        DynamicBalancer bal; DynamicBalancerInputs in;
+        in.cur = &m; in.liveNodes = {1, 2, 3}; in.positions = &pos;
+        in.topics = { TopicSpec{10, 1, 3, "", ""} };
+        in.excludedLeaders = {{10, 0, 1}};
+        EXPECT_TRUE(bal.rebalance(in).empty()) << "a sole-ISR group must be left to the caller";
+    }
 }

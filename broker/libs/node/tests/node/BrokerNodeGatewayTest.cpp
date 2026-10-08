@@ -19,6 +19,8 @@
 // Unique temp dirs: getpid() + atomic counter.
 // Free-port discovery: bind UDP socket to :0, read port, close.
 
+#include <rune/aeronutil/testing/FreePort.h>
+#include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include "support/TestWorkerCount.h"
@@ -88,29 +90,7 @@ struct TempDir {
 // discoverFreeUdpPort — bind to 127.0.0.1:0, read the assigned port, close.
 // ---------------------------------------------------------------------------
 static uint16_t discoverFreeUdpPort() {
-    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) throw std::runtime_error("BrokerNodeGatewayTest: socket() failed");
-
-    struct sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = 0;
-    addr.sin_addr.s_addr = ::inet_addr("127.0.0.1");
-
-    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(fd);
-        throw std::runtime_error("BrokerNodeGatewayTest: bind() failed");
-    }
-
-    socklen_t addrLen = sizeof(addr);
-    if (::getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &addrLen) < 0) {
-        ::close(fd);
-        throw std::runtime_error("BrokerNodeGatewayTest: getsockname() failed");
-    }
-
-    const uint16_t netPort = addr.sin_port;
-    const uint16_t port = static_cast<uint16_t>((netPort >> 8) | ((netPort & 0xFFu) << 8));
-    ::close(fd);
-    return port;
+    return rune::aeronutil::testing::allocFreeUdpPort();   // D8: never an ephemeral port
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +98,7 @@ static uint16_t discoverFreeUdpPort() {
 // ---------------------------------------------------------------------------
 static NodeConfig makeSingleNodeConfig(const fs::path& dataDir, uint16_t clientPort) {
     NodeConfig cfg;
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId            = 0;
     cfg.dataDir           = dataDir.string();
     cfg.consensusStreamId = 10;
@@ -833,6 +814,8 @@ TEST(TxSmoke, EndToEnd_TxnProduce_Commit_ReadCommitted) {
     TempDir tmp{"tx6a_smoke_"};
 
     NodeConfig cfg;
+
+    rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
     cfg.nodeId            = 0;
     cfg.dataDir           = tmp.path.string();
     cfg.consensusStreamId = 10;
@@ -1009,6 +992,7 @@ TEST(TxSmoke, EndToEnd_TxnProduce_Commit_ReadCommitted) {
         batchBuilder.setTransactional(true);
         batchBuilder.setProducerId(pid);
         batchBuilder.setProducerEpoch(epoch);
+        batchBuilder.setBaseSequence(0);   // header == frame identity (EOS-DUP defense)
         auto batchBytes = batchBuilder.build();
 
         pc::Produce prodReq;

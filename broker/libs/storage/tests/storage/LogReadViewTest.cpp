@@ -5,6 +5,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <string>
+#include <vector>
 #include <unistd.h>
 using namespace rune::storage; using namespace rune::protocol;
 
@@ -311,7 +313,7 @@ TEST(LogReadView, TruncateThenReadIsSafeAndCorrect) {
     }
     // Prime the read mmap at the full size, then truncate to shrink the file.
     ASSERT_FALSE(log.readView(0, 1 << 20).empty());
-    log.truncateTo(5);
+    EXPECT_TRUE(log.truncateTo(5));
     EXPECT_EQ(log.logEndOffset(), 5);
 
     auto below = log.readView(0, 1 << 20);
@@ -387,5 +389,43 @@ TEST(LogReadView, WorksAfterReopenAndRecover) {
     ASSERT_FALSE(vb.empty());
     EXPECT_EQ(vb.baseOffset, bases.back());
     EXPECT_EQ(vb.nextOffset, 30) << "last segment must read through to LEO";
+    std::filesystem::remove_all(dir);
+}
+
+// Regression (Task 5, zero-copy replication): the ACTIVE segment's read mmap must
+// NOT be munmap+remapped on every append.  Replication push/fetch now call
+// readView() on every duty cycle; a per-append remap (a) costs two syscalls per
+// push and (b) unmaps the pages under any view still being consumed — a
+// replication integration test (GR7 Rejoin) segfaulted in
+// RecordBatchReader::totalLength inside LogSegment::readView this way.  The read
+// mapping reserves geometric headroom past EOF (never touched: readView only reads
+// [0, logSize_)), so views over existing bytes keep a stable address while the
+// segment grows within that headroom.
+TEST(LogReadViewRegression, ActiveSegmentMappingStableAcrossAppends) {
+    auto dir = makeTempDir("rune_rv_stable");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    Log log(dir.string(), 64LL * 1024 * 1024); // single segment, no roll
+    int64_t off = 0;
+    auto appendOne = [&](int i) {
+        RecordBatchBuilder b(off, 5000 + i);
+        b.append("k", std::string(512, static_cast<char>('a' + i % 26)), 5000 + i);
+        off = log.append(b.build(), off);
+    };
+    appendOne(0);
+    const auto first = log.readView(0, 1 << 20);
+    ASSERT_FALSE(first.empty());
+    std::vector<uint8_t> firstBytes(first.data, first.data + first.len);
+    for (int i = 1; i < 200; ++i) {
+        appendOne(i);
+        const auto v = log.readView(i, 1 << 20);        // grows the active segment view
+        ASSERT_FALSE(v.empty());
+        EXPECT_EQ(v.baseOffset, i);
+        const auto again = log.readView(0, 1);
+        ASSERT_EQ(again.data, first.data)
+            << "active-segment read mapping moved after append " << i
+            << " — views are invalidated by a per-append remap";
+    }
+    // The first view is still readable and byte-identical (mapping never unmapped).
+    EXPECT_EQ(0, std::memcmp(first.data, firstBytes.data(), firstBytes.size()));
     std::filesystem::remove_all(dir);
 }

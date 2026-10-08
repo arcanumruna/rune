@@ -3,14 +3,13 @@ add_library(rune_consensus
         src/TermLog.cpp
         src/Election.cpp
         src/SbeConsensusPublisher.cpp
-        src/ConsensusAdapter.cpp
         src/ConsensusAgent.cpp)
 target_include_directories(rune_consensus PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         ${RUNE_PROTOCOL_INCLUDE})
 # Aeron headers needed for IngressRing, IdleStrategy, AgentRunner
 if(aeron_FOUND)
-    target_link_libraries(rune_consensus PUBLIC aeron::aeron)
+    target_link_libraries(rune_consensus PUBLIC aeron::aeron rune_aeron_util)
 endif()
 
 if(BUILD_TESTING)
@@ -28,13 +27,18 @@ if(BUILD_TESTING)
         tests/consensus/ConsensusPublisherAdapterTest.cpp
         tests/consensus/ConsensusAgentTest.cpp
         tests/consensus/IdleStrategyTest.cpp
-        tests/consensus/AgentRunnerIngressRingTest.cpp)
+        tests/consensus/AgentRunnerIngressRingTest.cpp
+        tests/consensus/SlowTickTest.cpp
+        tests/consensus/IngressRingDrainTest.cpp
+        tests/consensus/ConsensusDevirtTest.cpp
+        tests/consensus/AgentRunnerStopRingTest.cpp)
     target_link_libraries(rune_consensus_tests PRIVATE rune_consensus GTest::gtest_main)
     include(GoogleTest)
-    gtest_discover_tests(rune_consensus_tests)
+    gtest_discover_tests(rune_consensus_tests
+        PROPERTIES ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 endif()
 
-option(BUILD_INTEGRATION_TESTING "Build integration tests" OFF)
+option(BUILD_INTEGRATION_TESTING "Build integration tests" ON)
 if(BUILD_INTEGRATION_TESTING)
     if(NOT BUILD_TESTING)
         find_package(GTest REQUIRED)
@@ -52,7 +56,7 @@ if(BUILD_INTEGRATION_TESTING)
         target_link_libraries(rune_consensus_integration_tests PRIVATE aeron::aeron)
     endif()
     gtest_discover_tests(rune_consensus_integration_tests
-        PROPERTIES TIMEOUT 40)
+        PROPERTIES TIMEOUT 40 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -85,5 +89,5 @@ if(BUILD_AERON_TRANSPORT_TESTS)
         GTest::gtest_main)
     # 60 s real-time timeout: embedded driver + election over real IPC
     gtest_discover_tests(rune_aeron_transport_tests
-        PROPERTIES TIMEOUT 60)
+        PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 endif()

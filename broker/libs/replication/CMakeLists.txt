@@ -1,5 +1,6 @@
 add_library(rune_replication
     src/PartitionReplica.cpp
+    src/InternalIsrKnowledge.cpp
     src/FileRecordingStore.cpp
     src/PartitionRecorder.cpp
     src/PartitionReplay.cpp)
@@ -10,29 +11,52 @@ target_include_directories(rune_replication PUBLIC
 # consumers of rune_replication also get rune_storage headers transitively.
 target_link_libraries(rune_replication PUBLIC rune_storage)
 
+# Task 4 (de-virtualised replica transport): the per-worker transport is
+# header-only Aeron code the replica calls concretely.
+if(aeron_FOUND)
+    target_link_libraries(rune_replication PUBLIC aeron::aeron spdlog::spdlog)
+    target_link_libraries(rune_replication PUBLIC rune_aeron_util)
+    target_compile_definitions(rune_replication PUBLIC RUNE_REPLICATION_HAS_AERON=1)
+endif()
+
 # ---------------------------------------------------------------------------
-# AeronPartitionTransport — compiled separately only when aeron is available.
-# Consumers that want the real transport link rune_replication_aeron.
-# The base rune_replication library remains Aeron-free (pure + InMemoryTransport).
+# AeronPartitionTransport — part of rune_replication when aeron is available
+# (Task 11 fix 2).  rune_replication_aeron is kept as a consumer-facing INTERFACE
+# name.  Layering note (review m-d): its .cpp includes node HEADERS (header-
+# inline ReplicaRegistry/WorkerPool routing), a replication→node header
+# inversion that used to be confined to rune_replication_aeron; the only node
+# SYMBOLS it needs are the worker io backends (rune_io_backend, a leaf lib).
 # ---------------------------------------------------------------------------
 if(aeron_FOUND)
-    add_library(rune_replication_aeron
-        src/AeronPartitionTransport.cpp)
-    target_include_directories(rune_replication_aeron PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        ${RUNE_NODE_INCLUDE})
-    target_link_libraries(rune_replication_aeron PUBLIC
-        rune_replication
-        rune_consensus
-        rune_metadata
-        aeron::aeron)
-    # spdlog PUBLIC because AeronPartitionTransport.h includes WorkerPool.h→Worker.h
-    # which uses spdlog inline methods; consumers must see spdlog headers.
-    target_link_libraries(rune_replication_aeron PUBLIC spdlog::spdlog)
+    # Task 11 fix 2 (B2): AeronPartitionTransport is compiled INTO rune_replication
+    # so PartitionReplica can call it directly (final class, TransportKind::Aeron)
+    # — internal partitions' sends on the runtime duty cycle are never virtual.
+    # Its .cpp only needs node HEADERS (all header-inline; no node link deps).
+    target_sources(rune_replication PRIVATE src/AeronPartitionTransport.cpp)
+    target_include_directories(rune_replication PRIVATE ${RUNE_NODE_INCLUDE})
+    target_link_libraries(rune_replication PUBLIC rune_consensus rune_metadata rune_codec)
+    # Kept as the consumer-facing name (same usage requirements as before).
+    add_library(rune_replication_aeron INTERFACE)
+    target_include_directories(rune_replication_aeron INTERFACE ${RUNE_NODE_INCLUDE})
+    target_link_libraries(rune_replication_aeron INTERFACE
+        rune_replication rune_consensus rune_metadata aeron::aeron spdlog::spdlog rune_codec)
+    # F15 S4 (merged with T11 fix 2 in integration wave 2): Worker.h (reached via
+    # the node headers above) holds the worker-owned read_committed state
+    # (LsoTracker + AbortedTxnIndex, rune/transaction/ReadCommittedView.h), and
+    # the header-inline worker code the transport instantiates calls into
+    # rune_transaction (e.g. LsoTracker::reserve).  F15 had this edge on the
+    # separate rune_replication_aeron library; T11 folded the transport INTO
+    # rune_replication, so the edge moves here.  It closes a STATIC-library
+    # cycle (rune_transaction → rune_coordination → rune_replication), which
+    # CMake resolves by repeating the archives on the link line.
+    target_link_libraries(rune_replication PUBLIC rune_transaction)
+    # ...and the worker io backends that header-inline worker code submits to
+    # (UringFlushBackend on Linux) — a leaf library, no cycle (libs/node).
+    target_link_libraries(rune_replication PUBLIC rune_io_backend)
 endif()
 
 option(BUILD_REPLICATION_INTEGRATION_TESTING
-    "Build replication cluster disaster/recovery integration tests (P3-6)" OFF)
+    "Build replication cluster disaster/recovery integration tests (P3-6)" ON)
 if(BUILD_REPLICATION_INTEGRATION_TESTING)
     if(NOT BUILD_TESTING)
         find_package(GTest REQUIRED)
@@ -47,7 +71,7 @@ if(BUILD_REPLICATION_INTEGRATION_TESTING)
         rune_replication
         GTest::gtest_main)
     gtest_discover_tests(rune_replication_integration_tests
-        PROPERTIES TIMEOUT 60)
+        PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 endif()
 
 if(BUILD_TESTING)
@@ -58,15 +82,43 @@ if(BUILD_TESTING)
         tests/replication/IsrManagerTest.cpp
         tests/replication/EpochFencingTest.cpp
         tests/replication/PartitionReplicaTest.cpp
+        tests/replication/FollowerSlotsTest.cpp
+        tests/replication/NoDupFetchGateTest.cpp
         tests/replication/PartitionRecorderTest.cpp
         tests/replication/PartitionReplayTest.cpp
         tests/replication/PartitionFailoverTest.cpp
         tests/replication/AeronPartitionTransportTest.cpp
         tests/replication/DurabilityQuorumTest.cpp
-        tests/replication/LeaderEpochCacheRestartTest.cpp)
+        tests/replication/LeaderEpochCacheRestartTest.cpp
+        tests/replication/BatchPrefixTest.cpp
+        tests/replication/LargeBatchServeTest.cpp
+        tests/replication/OutboundHoldRouterTest.cpp
+        tests/replication/F27OwedMemoSwapTest.cpp
+        tests/replication/DiagFlagsTest.cpp
+        tests/replication/LeaderEpochFenceTest.cpp)
     target_link_libraries(rune_replication_tests PRIVATE rune_replication GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_replication_tests)
+
+    # Zero-allocation proof for the leader's push/fetch paths (spec §1a.5, §3.5a.2).
+    # Own executable: it replaces global operator new to count allocations.
+    add_executable(rune_replication_zero_alloc_tests
+        tests/replication/ZeroAllocReplicaTest.cpp)
+    target_link_libraries(rune_replication_zero_alloc_tests PRIVATE rune_replication GTest::gtest_main)
+    gtest_discover_tests(rune_replication_zero_alloc_tests)
+
+    # ---------------------------------------------------------------------------
+    # E2 / DUR-1: in-process disaster-recovery integration suite (default run).
+    # Deterministic (injected clock, no sleeps), real Log + PartitionReplica +
+    # FailoverElection; storage crash seam + transport fault seams.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_dr_integration_tests
+        tests/dr/DrIntegrationTest.cpp)
+    target_include_directories(rune_dr_integration_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/dr)
+    target_link_libraries(rune_dr_integration_tests PRIVATE
+        rune_replication rune_metadata rune_consensus GTest::gtest_main)
+    gtest_discover_tests(rune_dr_integration_tests PROPERTIES TIMEOUT 120)
 
     # ---------------------------------------------------------------------------
     # FollowerSync state-machine unit tests — STANDALONE.
@@ -104,7 +156,7 @@ if(BUILD_TESTING)
             aeron::aeron
             GTest::gtest_main)
         gtest_discover_tests(rune_replication_aeron_tests
-            PROPERTIES TIMEOUT 60)
+            PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
     elseif(BUILD_AERON_REPLICATION_TESTS AND NOT aeron_FOUND)
         message(WARNING
             "BUILD_AERON_REPLICATION_TESTS=ON requires aeron; disabling rune_replication_aeron_tests")
@@ -142,5 +194,5 @@ if(BUILD_AERON_ARCHIVE_TESTS)
         aeron::aeron
         GTest::gtest_main)
     gtest_discover_tests(rune_aeron_archive_tests
-        PROPERTIES TIMEOUT 60)
+        PROPERTIES TIMEOUT 60 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 endif()

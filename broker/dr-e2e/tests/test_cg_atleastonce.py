@@ -37,6 +37,7 @@ import pytest
 
 from harness import faults
 from harness.cluster import node_id_to_service
+from harness.driver import _PLATFORM_ARGS
 from harness.driver import (
     GroupMemberResult,
     GroupResults,
@@ -113,7 +114,7 @@ def _run_group_member_named(
     args = [
         "docker", "run", "--rm",
         "--name", name,
-        "--platform", "linux/amd64",
+        *_PLATFORM_ARGS,
         "--network", network,
         "--hostname", name,
         "--shm-size=64m",

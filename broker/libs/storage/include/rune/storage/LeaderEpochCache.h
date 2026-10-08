@@ -71,9 +71,9 @@ public:
     ///         epoch reports the leader LEO, and the follower interprets a
     ///         shared open epoch as "no divergence → keep my tail" (the leader
     ///         reconciles the tail it is missing).
-    ///     When responseEpoch == -1, endOffset is the start of the leader's
-    ///     earliest cached epoch (or `logEndOffset` if the cache is empty),
-    ///     i.e. the offset up to which the two histories can be trusted.
+    ///     An epoch OLDER than the earliest cached one answers (requestedEpoch,
+    ///     start of the earliest cached epoch) — Kafka; (-1, 0) only for an
+    ///     empty cache.
     ///
     /// Pure: does not mutate the cache.
     std::pair<int32_t, int64_t>
@@ -85,10 +85,12 @@ public:
         // upper_bound(requestedEpoch) → first epoch > requestedEpoch.
         auto next = epochs_.upper_bound(requestedEpoch);
         if (next == epochs_.begin()) {
-            // No cached epoch <= requestedEpoch: the follower's requested-epoch
-            // history predates everything the leader knows → divergent.  The
-            // shared history ends at the leader's earliest start offset.
-            return {-1, epochs_.begin()->second};
+            // Kafka LeaderEpochFileCache.endOffsetFor: an epoch OLDER than the
+            // earliest cached one (its entry was truncated away / predates the
+            // retained history) answers (requestedEpoch, earliest start) — never
+            // "-1", which would read as "no shared history" and drive a
+            // full-log truncation of the follower.
+            return {requestedEpoch, epochs_.begin()->second};
         }
         auto shared = std::prev(next);               // largest epoch <= requested
         const int32_t responseEpoch = shared->first;
@@ -160,6 +162,17 @@ public:
     //
     // Written crash-safely: open(.tmp), write, fsync, rename.
     // -------------------------------------------------------------------------
+
+    /// The entries, ascending epoch (no copy).  Hot-path B F7: encoded straight
+    /// into the leader-epoch-state slot image.
+    [[nodiscard]] const std::map<int32_t, int64_t>& map() const noexcept { return epochs_; }
+    [[nodiscard]] std::size_t size() const noexcept { return epochs_.size(); }
+    /// Replace every entry (restore from leader-epoch-state).
+    void replaceAll(const std::vector<std::pair<int32_t, int64_t>>& v) {
+        epochs_.clear();
+        for (const auto& [ep, off] : v) epochs_[ep] = off;
+    }
+    [[nodiscard]] bool operator==(const LeaderEpochCache& o) const noexcept { return epochs_ == o.epochs_; }
 
     /// Return all (epoch, startOffset) entries in ascending epoch order.
     [[nodiscard]] std::vector<std::pair<int32_t, int64_t>> entries() const {

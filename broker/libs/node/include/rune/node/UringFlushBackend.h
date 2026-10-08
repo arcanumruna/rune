@@ -1,4 +1,5 @@
 #pragma once
+#include <vector>
 // UringFlushBackend.h — E3 Task 8a: Linux raw io_uring async-durability backend.
 //
 // This backend is compiled and usable ONLY on Linux.  On non-Linux platforms
@@ -16,8 +17,8 @@
 //     - Takes the next free SQE slot from the SQ ring.
 //     - Issues IORING_OP_FSYNC with IORING_FSYNC_DATASYNC on the given fd.
 //     - Stores user_data = token so the completion can be matched.
-//     - Stores flushBoundary in a worker-owned token→boundary table (sized to
-//       SQ depth) so reap() can reconstruct the full FlushCompletion.
+//     - flushBoundary is NOT tracked (Task 10 fix 1 / I2: the old token % SQ
+//       depth table aliased); completions report flushBoundary = 0.
 //     - Calls io_uring_enter(2) (syscall 426) with submit_count=1 to push the SQE.
 //     - Returns kNoToken if the SQ is full (back-pressure — caller retries).
 //
@@ -53,6 +54,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <memory>
+#include <cerrno>
 
 // Full io_uring kernel struct definitions are required here because reap() is an
 // inline template that dereferences io_uring_cqe::res.  This include sits inside
@@ -74,6 +76,20 @@ public:
     explicit UringFlushBackend(std::size_t submitDepth,
                                std::size_t completionDepth);
 
+    /// Bind the CALLING THREAD's io-wq (io_uring keeps io-wq per task, not per ring) to `cpus`
+    /// (IORING_REGISTER_IOWQ_AFF, Linux 5.14+).  Must run on the thread that submits — that is the
+    /// task whose io-wq is bound.  Submits one internal NOP first so the thread's io-wq context
+    /// exists (counts against the in-flight cap; reap drains it silently).  Returns 0, EBUSY (at
+    /// the in-flight cap / SQ full — retry later) or the kernel's errno.  Cold.
+    int setIoWorkerAffinity(const std::vector<int32_t>& cpus) noexcept;
+    /// A7 review M1: the ring fd.  poll(2) reports it readable (POLLIN) while the CQ holds unreaped
+    /// completions, so a worker parked in ppoll() on it wakes on the next fsync completion.  Owned here.
+    [[nodiscard]] int completionFd() const noexcept { return ringFd_; }
+    /// Submitted-not-yet-reaped operations (including the internal NOP).  Worker thread / tests.
+    [[nodiscard]] std::size_t inFlight() const noexcept { return inFlight_; }
+    /// user_data of the internal NOP (never a real token: tokens count up from 1).
+    static constexpr uint64_t kInternalNopUserData = ~uint64_t{0};
+
     // Non-copyable, non-movable.
     UringFlushBackend(const UringFlushBackend&)            = delete;
     UringFlushBackend& operator=(const UringFlushBackend&) = delete;
@@ -86,11 +102,44 @@ public:
     // submit — worker side (non-blocking, no allocation).
     //
     // Assigns the next token, fills an SQE for IORING_OP_FSYNC|DATASYNC on fd,
-    // stores flushBoundary in the token→boundary table, advances the SQ tail
+    // (flushBoundary is ignored — completions match by token), advances the SQ tail
     // with a release fence, and submits via io_uring_enter.
     //
     // Returns kNoToken if the SQ ring is full (back-pressure).
     [[nodiscard]] CompletionToken submit(int fd, int64_t flushBoundary) noexcept;
+
+    // E1d: a LINKED pair — IORING_OP_WRITE of `len` (<= kWriteSyncMaxBlock)
+    // bytes at `offset` of fd (IOSQE_IO_LINK) -> IORING_OP_FSYNC(DATASYNC) —
+    // submitted in ONE io_uring_enter.  The bytes are copied into a
+    // backend-owned pre-allocated block (stable until the write's CQE).  The
+    // write's CQE is internal (never handed out); the fsync's CQE carries the
+    // token: a failed write cancels the fsync (-ECANCELED), a short write is
+    // reported as ENOSPC.  Takes two in-flight slots.  kNoToken on back-pressure.
+    [[nodiscard]] CompletionToken submitWriteSync(int fd, const uint8_t* data, uint32_t len,
+                                                  int64_t offset) noexcept;
+    /// E1d MEDIUM-2: IORING_OP_FSYNC with NO DATASYNC flag (a full fsync —
+    /// a directory fd).  kNoToken on back-pressure.
+    [[nodiscard]] CompletionToken submitFsync(int fd) noexcept;
+    /// user_data tag of an internal linked-write CQE (low bits = block index).
+    static constexpr uint64_t kLinkedWriteTag = uint64_t{1} << 62;
+
+    // F15 S4 fix round 2 (RR1-4): an async IORING_OP_FADVISE(advice) on
+    // [off, off + len) of fd.  kNoToken when the SQ / in-flight cap is full
+    // (the caller skips this pass).  Same reap path; route the token.
+    [[nodiscard]] CompletionToken submitFadvise(int fd, int64_t off, uint32_t len, int advice) noexcept;
+    /// RR2-1: IORING_OP_FADVISE is supported by this kernel / ring (probed at
+    /// construction with IORING_REGISTER_PROBE; a failing probe = unsupported).
+    [[nodiscard]] bool fadviseSupported() const noexcept { return fadviseSupported_; }
+    /// E1d LOW-4a: IORING_OP_WRITE (kernel 5.6+) is supported (probed at
+    /// construction).  Without it the linked checkpoint write cannot run:
+    /// IoBackend falls back to the portable backend up front (never a
+    /// checkpoint that fails with ECANCELED forever and halts the broker).
+    [[nodiscard]] bool writeSupported() const noexcept { return writeSupported_; }
+    /// Test seam (LOW-4b): the next submitWriteSync's io_uring_enter submits
+    /// only its FIRST SQE — a real partial enter that breaks the link.
+    void forcePartialSubmitForTest(bool on) noexcept { partialSubmitForTest_ = on; }
+    /// Write failures recorded and still waiting for their fsync CQE (LOW-A: 0 at rest).
+    [[nodiscard]] std::size_t pendingWriteFailuresForTest() const noexcept { return writeFailures_.size(); }
 
     // reap — worker side (non-blocking).
     //
@@ -143,22 +192,37 @@ private:
     // Depth actually allocated for the SQ ring (== sqRingSize_).
     std::size_t submitDepth_{0};
 
-    // Worker-owned token→flushBoundary lookup table.
-    // Indexed by (token % sqRingSize_) — valid while the SQE is in-flight.
-    // Allocated once in ctor (size = sqRingSize_).  No cross-thread access.
-    std::unique_ptr<int64_t[]> boundaryTable_;
 
-    // portableFallback_: set when RUNE_IO_BACKEND=portable and io_uring is not
-    // available (e.g. Docker Desktop on Apple Silicon / Rosetta x86 emulation).
-    // submit() always returns kNoToken; reap() is a no-op.  Workers operating in
-    // this mode never use durability tier 2 (Strict) — tier 0/1 acks are
-    // enqueued synchronously without io_uring involvement.
-    bool portableFallback_{false};
+    bool fadviseSupported_{false};
+    bool writeSupported_{false};
+    bool partialSubmitForTest_{false};
+    bool probeOpcode_(uint8_t opcode) noexcept;
 
-    // Internal helper called by submit() after token allocation.
-    CompletionToken submitWithToken(int fd, int64_t flushBoundary,
-                                    CompletionToken tok,
-                                    uint32_t tail, uint32_t mask) noexcept;
+    // The one SQE submission path (fsync, fadvise, internal NOP): reserve the SQ
+    // slot, copy `sqe` in, publish the tail, io_uring_enter; rolls the tail back
+    // on failure.  Returns 0, EBUSY (SQ full) or the enter errno.
+    int pushSqe_(const struct io_uring_sqe& sqe) noexcept;
+    /// Push `n` (1-2) SQEs with ONE io_uring_enter (a linked chain must be
+    /// submitted together).  Same rollback / errors as pushSqe_.
+    /// LOW-4b: a PARTIAL enter (the kernel consumed `submitted` < n) is an
+    /// error: the unconsumed SQEs are rolled back (never submitted later,
+    /// unlinked) and `submitted` tells the caller what is in flight.
+    int pushSqes_(const struct io_uring_sqe* sqes, uint32_t n, uint32_t& submitted,
+                  uint32_t enterCount) noexcept;
+
+    // E1d linked-write blocks (pre-allocated in the ctor; worker-owned).
+    struct WriteBlock { uint8_t bytes[kWriteSyncMaxBlock]; uint32_t len = 0; CompletionToken token = 0; };
+    std::vector<WriteBlock> writeBlocks_;
+    std::vector<uint32_t>   freeWriteBlocks_;          ///< stack of free block indices
+    /// LOW-4c: fsync tokens whose linked write failed / was short, with the
+    /// WRITE's real errno (short = ENOSPC) — reported instead of ECANCELED.
+    struct WriteFailure { CompletionToken token; int32_t err; };
+    std::vector<WriteFailure> writeFailures_;
+    /// LOW-4b: tokens whose fsync SQE never reached the kernel (a partial
+    /// enter broke the link): delivered by reap() as an error completion.
+    std::vector<WriteFailure> syntheticFailures_;
+
+    CompletionToken allocToken_() noexcept;
 };
 
 // ---------------------------------------------------------------------------
@@ -166,12 +230,21 @@ private:
 // ---------------------------------------------------------------------------
 template <class H>
 int UringFlushBackend::reap(H&& handler) noexcept {
-    // Portable fallback: no io_uring rings — nothing to reap.
-    if (portableFallback_) { (void)handler; return 0; }
-
     // CQ tail is written by the kernel; acquire fence to observe kernel writes.
     const uint32_t mask = *cqRingMask_;
     int count = 0;
+    // LOW-4b: a write+fsync whose fsync never reached the kernel completes
+    // with an error (never OK).  Not a CQE: inFlight_ is untouched.
+    if (!syntheticFailures_.empty()) [[unlikely]] {
+        for (const WriteFailure& f : syntheticFailures_) {
+            FlushCompletion comp{};
+            comp.token = f.token;
+            comp.errorCode = f.err;
+            handler(comp);
+            ++count;
+        }
+        syntheticFailures_.clear();
+    }
 
     while (true) {
         // Load-acquire the CQ tail (kernel-written).
@@ -184,21 +257,43 @@ int UringFlushBackend::reap(H&& handler) noexcept {
         const uint32_t idx = head & mask;
         const struct io_uring_cqe* cqe = cqes_ + idx;
 
-        // Decode: user_data == token, res == 0 (success) or -errno (failure).
-        FlushCompletion comp{};
-        comp.token     = static_cast<CompletionToken>(cqe->user_data);
-        comp.errorCode = (cqe->res < 0) ? -cqe->res : 0;
+        // setIoWorkerAffinity's internal NOP is not a caller token: drained, never handed out.
+        if (cqe->user_data != kInternalNopUserData && (cqe->user_data & kLinkedWriteTag) != 0) [[unlikely]] {
+            // E1d: the internal write half of a write+fsync pair.  Release its
+            // block; a SHORT write poisons its fsync's token (a failed write
+            // already cancels the linked fsync: -ECANCELED).
+            const uint32_t bi = static_cast<uint32_t>(cqe->user_data & (kLinkedWriteTag - 1));
+            if (bi < writeBlocks_.size()) {
+                WriteBlock& wb = writeBlocks_[bi];
+                const int32_t werr = cqe->res < 0 ? -cqe->res
+                                   : (static_cast<uint32_t>(cqe->res) != wb.len ? ENOSPC : 0);
+                if (werr != 0 && wb.token != kNoToken && writeFailures_.size() < writeFailures_.capacity())
+                    writeFailures_.push_back({wb.token, werr});
+                freeWriteBlocks_.push_back(bi);   // capacity reserved: no allocation
+            }
+        } else if (cqe->user_data != kInternalNopUserData) [[likely]] {
+            // Decode: user_data == token, res == 0 (success) or -errno (failure).
+            FlushCompletion comp{};
+            comp.token     = static_cast<CompletionToken>(cqe->user_data);
+            comp.errorCode = (cqe->res < 0) ? -cqe->res : 0;
+            if (!writeFailures_.empty()) [[unlikely]] {
+                for (std::size_t i = 0; i < writeFailures_.size(); ++i) {
+                    if (writeFailures_[i].token != comp.token) continue;
+                    // The write's REAL errno (the linked fsync only says ECANCELED).
+                    if (comp.errorCode == 0 || comp.errorCode == ECANCELED) comp.errorCode = writeFailures_[i].err;
+                    writeFailures_[i] = writeFailures_.back();
+                    writeFailures_.pop_back();
+                    break;
+                }
+            }
 
-        // Recover flushBoundary from the worker-owned table.
-        if (comp.token != kNoToken) {
-            const uint32_t slot = static_cast<uint32_t>(comp.token) % sqRingSize_;
-            comp.flushBoundary  = boundaryTable_[slot];
-        } else {
+            // flushBoundary is informational and not tracked by io_uring (I2: the
+            // old token % ring-size table aliased).  Completions match by token.
             comp.flushBoundary = 0;
-        }
 
-        handler(comp);
-        ++count;
+            handler(comp);
+            ++count;
+        }
         if (inFlight_ > 0) --inFlight_;   // one completion drained → free a slot
 
         // Advance CQ head — store-release so the kernel sees the freed slot.

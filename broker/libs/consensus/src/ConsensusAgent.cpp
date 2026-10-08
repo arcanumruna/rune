@@ -53,7 +53,7 @@ int ConsensusAgent::doWork(int64_t nowNs) {
             // test's "exactly N processed" assertion works even for unknown
             // templateIds (which onFragment silently ignores — the ring read
             // still happened).
-            messagesProcessed_.fetch_add(1, std::memory_order_release);
+            ++messagesProcessed_;
         },
         ConsensusAdapter::FRAGMENT_LIMIT);
 
@@ -69,6 +69,12 @@ int ConsensusAgent::doWork(int64_t nowNs) {
 // ConsensusMessageHandler — forward to election_
 // (All called synchronously from doWork → drain → adapter_.onFragment)
 // ---------------------------------------------------------------------------
+
+void ConsensusAgent::onCandidacyState(int64_t /*nowNs*/, NodeId fromMember,
+                                      const CandidacyState& state)
+{
+    election_.onCandidacyState(fromMember, state);
+}
 
 void ConsensusAgent::onCanvassPosition(
     int64_t nowNs,
@@ -152,6 +158,11 @@ void ConsensusAgent::onCommitPosition(
     NodeId  leaderMemberId)
 {
     election_.onCommitPosition(nowNs, leadershipTermId, logPosition, leaderMemberId);
+}
+
+void ConsensusAgent::onStandDown(int64_t nowNs, Term leadershipTermId, NodeId leaderMemberId)
+{
+    election_.onStandDown(nowNs, leadershipTermId, leaderMemberId);
 }
 
 } // namespace rune::consensus

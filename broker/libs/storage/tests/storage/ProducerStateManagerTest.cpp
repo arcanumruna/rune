@@ -17,9 +17,16 @@
 
 #include <gtest/gtest.h>
 #include <rune/storage/ProducerStateManager.h>
+#include <rune/storage/InMemoryLog.h>
+#include <rune/storage/Log.h>
+#include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/Protocol.h>
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
+#include <limits>
+#include <vector>
 #include <fcntl.h>
 #include <filesystem>
 #include <string>
@@ -74,16 +81,19 @@ TEST(ProducerStateManager, BrandNewProducerBaseSequenceZeroAccepted) {
     EXPECT_TRUE(r.isAccept());
 }
 
+// D6: no entry + baseSequence != 0 -> UnknownProducerId (Kafka
+// UNKNOWN_PRODUCER_ID), not OutOfOrderSequence — still NOT appended.
 TEST(ProducerStateManager, BrandNewProducerNonZeroBaseSequenceRejected) {
     ProducerStateManager m;
     auto r = m.validate(0, 42, 0, 0, 1, 2);
-    EXPECT_TRUE(r.isOos());
+    EXPECT_TRUE(r.isUnknownProducerId());
+    EXPECT_FALSE(r.isAccept());
 }
 
 TEST(ProducerStateManager, BrandNewProducerLargeBaseSequenceRejected) {
     ProducerStateManager m;
     auto r = m.validate(0, 99, 0, 0, 100, 109);
-    EXPECT_TRUE(r.isOos());
+    EXPECT_TRUE(r.isUnknownProducerId());
 }
 
 // ===========================================================================
@@ -195,8 +205,10 @@ TEST(ProducerStateManager, ReplayBeyondRetryWindowIsOos) {
     }
     // The very first batch (seq 0..0) has been evicted from the window.
     auto r = m.validate(0, 30, 0, 0, 0, 0);
-    // It's below the expected next sequence but NOT in the window → OOS
-    EXPECT_TRUE(r.isOos());
+    // EOS-OOS: entirely below lastSequence but NOT in the window → a KNOWN-OLD
+    // duplicate (Kafka DUPLICATE_SEQUENCE_NUMBER: OK, offset unknown), never OOS.
+    EXPECT_TRUE(r.isDuplicate());
+    EXPECT_EQ(r.retryBaseOffset, -1);
 }
 
 // ===========================================================================
@@ -338,9 +350,10 @@ TEST(ProducerStateManager, RetryWindowEvictsOldestBatch) {
     for (int i = 0; i <= kRetryWindowSize; ++i) {
         produce(m, 301, 0, 0, i, 1, 7000 + i * 50LL);
     }
-    // Batch 0 (seq 0..0) should be evicted → OOS (below expected, not in window).
+    // Batch 0 (seq 0..0) is evicted → known-old duplicate (EOS-OOS): offset unknown.
     auto r0 = m.validate(0, 301, 0, 0, 0, 0);
-    EXPECT_TRUE(r0.isOos());
+    EXPECT_TRUE(r0.isDuplicate());
+    EXPECT_EQ(r0.retryBaseOffset, -1);
 
     // Batch 1 (seq 1..1) is the new oldest → still a Duplicate.
     auto r1 = m.validate(0, 301, 0, 0, 1, 1);
@@ -360,11 +373,12 @@ TEST(ProducerStateManager, RetryWindowCorrectAfterManyBatches) {
         EXPECT_TRUE(r.isDuplicate()) << "i=" << i;
         EXPECT_EQ(r.retryBaseOffset, 9000 + i * 10LL) << "i=" << i;
     }
-    // Batch before the window → OOS
+    // Batch before the window → known-old duplicate (EOS-OOS), offset unknown.
     int evicted = total - kRetryWindowSize - 1;
     if (evicted >= 0) {
         auto r = m.validate(0, 302, 0, 0, evicted, evicted);
-        EXPECT_TRUE(r.isOos()) << "evicted=" << evicted;
+        EXPECT_TRUE(r.isDuplicate()) << "evicted=" << evicted;
+        EXPECT_EQ(r.retryBaseOffset, -1) << "evicted=" << evicted;
     }
 }
 
@@ -485,8 +499,8 @@ TEST(ProducerStateManager, TornSnapshotStopsCleanly) {
     psm.takeSnapshot(path);
 
     // Truncate the file mid-entry (keep header + first entry + 10 bytes of second).
-    // kFileHdrSize=16, kEntrySize=116.
-    off_t truncAt = 16 + 116 + 10;
+    off_t truncAt = ProducerStateManager::kSnapshotFileHeaderBytes +
+                    ProducerStateManager::kSnapshotEntryBytes + 10;
     {
         struct stat st{};
         ::stat(path.c_str(), &st);
@@ -512,12 +526,16 @@ TEST(ProducerStateManager, CorruptCrcInFirstEntryStopsRecovery) {
     produce(psm, 20, 0, 0, 0, 1, 200);
     psm.takeSnapshot(path);
 
-    // CRC is the last 4 bytes of the first entry: file offset = 16 + (116-4) = 128.
+    // CRC is the last 4 bytes of the first entry.
     {
         int fd = ::open(path.c_str(), O_RDWR);
         ASSERT_GE(fd, 0);
-        uint8_t bad = 0xFF;
-        ::pwrite(fd, &bad, 1, 128);
+        const off_t crcAt = ProducerStateManager::kSnapshotFileHeaderBytes +
+                            ProducerStateManager::kSnapshotEntryBytes - 4;
+        uint8_t cur = 0;
+        ASSERT_EQ(::pread(fd, &cur, 1, crcAt), 1);
+        uint8_t bad = static_cast<uint8_t>(cur ^ 0xFFu);   // always a different byte
+        ::pwrite(fd, &bad, 1, crcAt);
         ::close(fd);
     }
 
@@ -630,7 +648,7 @@ TEST(ProducerStateManager, BrandNewProducerEpoch2AcceptsSeq0) {
 TEST(ProducerStateManager, BrandNewProducerEpoch2RejectsSeq1) {
     ProducerStateManager m;
     auto r = m.validate(0, 1000, 0, 2, 1, 1);
-    EXPECT_TRUE(r.isOos());
+    EXPECT_TRUE(r.isUnknownProducerId());
 }
 
 // ===========================================================================
@@ -767,10 +785,12 @@ TEST(ProducerStateManager, DuplicateDetectedAcrossWindowWrap) {
     EXPECT_EQ(r.retryBaseOffset, wrapBatchOffset);
 
     // Add one more batch — this evicts the OLDEST (slot 0, seq 0).
-    // After eviction, seq 0 is gone; a retry of seq 0 must return OOS.
+    // After eviction, seq 0 is gone from the window; a retry of seq 0 is a
+    // known-old duplicate (EOS-OOS): OK with an unknown offset, never OOS.
     produce(m, 77, 0, 0, seq, 1, offset);
     auto r2 = m.validate(0, 77, 0, 0, 0, 0);
-    EXPECT_TRUE(r2.isOos()) << "Batch evicted from window must return OOS";
+    EXPECT_TRUE(r2.isDuplicate()) << "Batch evicted from window is a known-old duplicate";
+    EXPECT_EQ(r2.retryBaseOffset, -1);
 }
 
 // ===========================================================================
@@ -910,4 +930,352 @@ TEST(ProducerStateManager, CrossTopicDedupIsolation) {
         ASSERT_NE(eb, nullptr) << "topicB entry must exist";
         EXPECT_EQ(eb->lastSequence, 2) << "topicB lastSeq must be 2";
     }
+}
+
+// ===========================================================================
+// EOS-OOS (2026-10-02, k3s): the idempotent client keeps up to
+// kIdempotentMaxInFlightBatches (32) batches in flight per partition and
+// retransmits them after an ack timeout / reconnect.  With a 5-batch window
+// every retransmit older than 5 batches — of a batch that IS stored — got
+// OutOfOrderSequence: 5,764 false failures per 100k with all 100k in the log.
+// ===========================================================================
+
+namespace {
+constexpr int kEosBatches = 40;          // > the window: forces wrap + eviction
+constexpr int kEosRecords = 2;           // records per batch
+inline int64_t eosOffset(int i) { return 10LL * i; }
+void fillEos(ProducerStateManager& m, int64_t pid) {
+    for (int i = 0; i < kEosBatches; ++i)
+        ASSERT_TRUE(produce(m, pid, 0, 0, i * kEosRecords, kEosRecords, eosOffset(i)).isAccept()) << i;
+}
+} // namespace
+
+TEST(IdempotenceWindowRegression, WindowIsTheSharedIdempotentMaxInFlight) {
+    EXPECT_EQ(kRetryWindowSize, rune::protocol::client::kIdempotentMaxInFlightBatches)
+        << "the broker dedup window must cover every batch the client may have in flight";
+    EXPECT_EQ(rune::protocol::client::kIdempotentMaxInFlightBatches, 32);
+}
+
+TEST(IdempotenceWindowRegression, RetransmitOfAnyInFlightBatchIsDuplicateWithOriginalOffset) {
+    ProducerStateManager m;
+    fillEos(m, 700);
+    const int n = rune::protocol::client::kIdempotentMaxInFlightBatches;
+    for (int i = kEosBatches - n; i < kEosBatches; ++i) {
+        const auto r = m.validate(0, 700, 0, 0, i * kEosRecords, i * kEosRecords + kEosRecords - 1);
+        ASSERT_TRUE(r.isDuplicate()) << "in-flight batch " << i << " (" << kEosBatches - i << " back)";
+        EXPECT_EQ(r.retryBaseOffset, eosOffset(i)) << i;
+        EXPECT_EQ(r.coveredLastOffset, eosOffset(i) + kEosRecords - 1) << i;
+    }
+}
+
+// Kafka DUPLICATE_SEQUENCE_NUMBER parity: a same-epoch batch entirely at or
+// below lastSequence that is no longer in the window is a KNOWN-OLD duplicate
+// (every sequence <= lastSequence of this epoch was appended in order): OK with
+// an unknown offset (-1), never OutOfOrderSequence, never re-appended.  Its
+// answer waits on the batch holding lastSequence (the newest window entry).
+TEST(IdempotenceWindowRegression, KnownOldDuplicateBelowTheWindowIsOkWithUnknownOffset) {
+    ProducerStateManager m;
+    fillEos(m, 701);
+    const int64_t newestLast = eosOffset(kEosBatches - 1) + kEosRecords - 1;
+    for (int i : {0, 1, kEosBatches - rune::protocol::client::kIdempotentMaxInFlightBatches - 1}) {
+        const auto r = m.validate(0, 701, 0, 0, i * kEosRecords, i * kEosRecords + kEosRecords - 1);
+        ASSERT_TRUE(r.isDuplicate()) << "known-old batch " << i << " must not be OutOfOrderSequence";
+        EXPECT_EQ(r.retryBaseOffset, -1) << "offset unknown (Kafka DUPLICATE_SEQUENCE_NUMBER)";
+        EXPECT_EQ(r.coveredLastOffset, newestLast) << "answer waits on the batch holding lastSequence";
+    }
+    // Different batch boundaries, still entirely below lastSequence.
+    const auto r = m.validate(0, 701, 0, 0, 1, 4);
+    EXPECT_TRUE(r.isDuplicate());
+    EXPECT_EQ(r.retryBaseOffset, -1);
+    // Never advances state: the next in-order batch is still accepted.
+    EXPECT_TRUE(m.validate(0, 701, 0, 0, kEosBatches * kEosRecords, kEosBatches * kEosRecords).isAccept());
+}
+
+TEST(IdempotenceWindowRegression, PartialOverlapOfLastSequenceStaysOutOfOrder) {
+    ProducerStateManager m;
+    fillEos(m, 702);
+    const int32_t last = kEosBatches * kEosRecords - 1;              // lastSequence
+    EXPECT_TRUE(m.validate(0, 702, 0, 0, last - 1, last + 1).isOos()) << "base <= last < end";
+    EXPECT_TRUE(m.validate(0, 702, 0, 0, last, last + 5).isOos()) << "base == last < end";
+    EXPECT_TRUE(m.validate(0, 702, 0, 0, 0, last + 1).isOos()) << "spans the whole history and beyond";
+    EXPECT_TRUE(m.validate(0, 702, 0, 0, last + 2, last + 2).isOos()) << "forward gap";
+    EXPECT_TRUE(m.validate(0, 702, 0, 0, 0, 1).isDuplicate() == true);
+    // An older epoch is still fenced, a newer epoch must restart at 0.
+    EXPECT_TRUE(m.validate(0, 702, 0, -1, 0, 1).isFenced());
+    EXPECT_TRUE(m.validate(0, 702, 0, 1, 2, 3).isOos());
+}
+
+TEST(IdempotenceWindowRegression, SnapshotRoundTripKeepsTheFullWindow) {
+    const std::string path = tmpPath("psm_eos_snap");
+    ProducerStateManager m;
+    fillEos(m, 703);
+    m.takeSnapshot(path);
+    ProducerStateManager m2;
+    ASSERT_EQ(m2.recover(path), 1);
+    const int n = rune::protocol::client::kIdempotentMaxInFlightBatches;
+    for (int i = kEosBatches - n; i < kEosBatches; ++i) {
+        const auto r = m2.validate(0, 703, 0, 0, i * kEosRecords, i * kEosRecords + kEosRecords - 1);
+        ASSERT_TRUE(r.isDuplicate()) << i;
+        EXPECT_EQ(r.retryBaseOffset, eosOffset(i)) << i;
+    }
+    EXPECT_TRUE(m2.validate(0, 703, 0, 0, kEosBatches * kEosRecords, kEosBatches * kEosRecords).isAccept());
+    ::unlink(path.c_str());
+}
+
+TEST(IdempotenceWindowRegression, RebuildFromLogRestoresTheFullWindow) {
+    rune::storage::InMemoryLog log(1 << 20, 1024);
+    for (int i = 0; i < kEosBatches; ++i) {
+        rune::protocol::RecordBatchBuilder b(log.logEndOffset(), 1000);
+        b.setProducerId(704); b.setProducerEpoch(0); b.setBaseSequence(i * kEosRecords);
+        for (int r = 0; r < kEosRecords; ++r) b.append("k", "v", 1000);
+        const auto bytes = b.build();
+        ASSERT_GE(log.append(bytes, log.logEndOffset() + kEosRecords - 1), 0);
+    }
+    ProducerStateManager m;
+    m.rebuildFromLog(0, log, log.logEndOffset(), 0);
+    const int n = rune::protocol::client::kIdempotentMaxInFlightBatches;
+    for (int i = kEosBatches - n; i < kEosBatches; ++i) {
+        const auto r = m.validate(0, 704, 0, 0, i * kEosRecords, i * kEosRecords + kEosRecords - 1);
+        ASSERT_TRUE(r.isDuplicate()) << i;
+        EXPECT_EQ(r.retryBaseOffset, static_cast<int64_t>(i) * kEosRecords) << i;
+    }
+    const auto old = m.validate(0, 704, 0, 0, 0, kEosRecords - 1);
+    EXPECT_TRUE(old.isDuplicate());
+    EXPECT_EQ(old.retryBaseOffset, -1);
+    EXPECT_EQ(old.coveredLastOffset, log.logEndOffset() - 1);
+}
+
+// Snapshot compatibility: a version-2 file (pre EOS-OOS, implicit 5-slot
+// window, wrapped: head=2) is still read, re-windowed oldest-first so the
+// newest batch (the one holding lastSequence) stays the newest.
+TEST(IdempotenceWindow, RecoversAVersion2FiveSlotSnapshot) {
+    auto crc32c = [](const uint8_t* d, std::size_t n) {
+        uint32_t c = 0xFFFFFFFFu;
+        for (std::size_t i = 0; i < n; ++i) {
+            c ^= d[i];
+            for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0x82F63B78u & (0u - (c & 1u)));
+        }
+        return c ^ 0xFFFFFFFFu;
+    };
+    auto put = [](std::vector<uint8_t>& b, std::size_t at, const void* v, std::size_t n) {
+        std::memcpy(b.data() + at, v, n);
+    };
+    constexpr std::size_t kV2Entry = 32 + 5 * 16 + 4;
+    std::vector<uint8_t> f(16 + kV2Entry, 0);
+    const uint32_t magic = 0x50534D47u, ver = 2, cnt = 1;
+    put(f, 0, &magic, 4); put(f, 4, &ver, 4); put(f, 8, &cnt, 4);
+    uint8_t* e = f.data() + 16;
+    const int64_t pid = 800; const int32_t part = 3, topic = 9, lastSeq = 6, head = 2, wcount = 5;
+    const int16_t epoch = 1;
+    std::memcpy(e, &pid, 8); std::memcpy(e + 8, &part, 4); std::memcpy(e + 12, &epoch, 2);
+    std::memcpy(e + 16, &lastSeq, 4); std::memcpy(e + 20, &head, 4); std::memcpy(e + 24, &wcount, 4);
+    std::memcpy(e + 28, &topic, 4);
+    // Batches seq 0..6 one record each; the 5-slot window holds seq 2..6, with
+    // slot (head=2) the oldest: slot2=seq2, slot3=seq3, slot4=seq4, slot0=seq5, slot1=seq6.
+    const int32_t slotSeq[5] = {5, 6, 2, 3, 4};
+    for (int s = 0; s < 5; ++s) {
+        const int32_t sq = slotSeq[s]; const int64_t off = 100 + sq;
+        std::memcpy(e + 32 + s * 16, &sq, 4); std::memcpy(e + 32 + s * 16 + 4, &sq, 4);
+        std::memcpy(e + 32 + s * 16 + 8, &off, 8);
+    }
+    const uint32_t c = crc32c(e, 32 + 5 * 16);
+    std::memcpy(e + 32 + 5 * 16, &c, 4);
+    const std::string path = tmpPath("psm_v2");
+    {
+        const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        ASSERT_GE(fd, 0);
+        ASSERT_EQ(::write(fd, f.data(), f.size()), static_cast<ssize_t>(f.size()));
+        ::close(fd);
+    }
+    ProducerStateManager m;
+    ASSERT_EQ(m.recover(path), 1);
+    for (int32_t sq = 2; sq <= 6; ++sq) {
+        const auto r = m.validate(topic, pid, part, epoch, sq, sq);
+        ASSERT_TRUE(r.isDuplicate()) << sq;
+        EXPECT_EQ(r.retryBaseOffset, 100 + sq) << sq;
+    }
+    const auto old = m.validate(topic, pid, part, epoch, 0, 1);
+    EXPECT_TRUE(old.isDuplicate());
+    EXPECT_EQ(old.retryBaseOffset, -1);
+    EXPECT_EQ(old.coveredLastOffset, 106) << "seq 6 (offset 106) is still the newest batch";
+    EXPECT_TRUE(m.validate(topic, pid, part, epoch, 7, 7).isAccept());
+    // Re-snapshot writes the current (v3) format and round-trips.
+    m.takeSnapshot(path);
+    ProducerStateManager m2;
+    ASSERT_EQ(m2.recover(path), 1);
+    EXPECT_EQ(m2.validate(topic, pid, part, epoch, 4, 4).retryBaseOffset, 104);
+    ::unlink(path.c_str());
+}
+
+// Review I2: sequences wrap INT32_MAX -> 0 (Kafka DefaultRecordBatch
+// incrementSequence).  A batch at seq 0 right after lastSequence == INT32_MAX
+// is the NEXT in-order batch — it must be accepted (appended), never taken for
+// a known-old duplicate (OK, not appended = silent loss).
+TEST(IdempotenceWindowRegression, SequenceWrapAfterInt32MaxIsInOrderNotKnownOld) {
+    constexpr int32_t kMax = std::numeric_limits<int32_t>::max();
+    ProducerStateManager m;
+    ASSERT_TRUE(m.validate(0, 710, 0, 0, 0, kMax - 10).isAccept());
+    m.update(0, 710, 0, 0, 0, kMax - 10, 0);
+    ASSERT_TRUE(m.validate(0, 710, 0, 0, kMax - 9, kMax).isAccept());
+    m.update(0, 710, 0, 0, kMax - 9, kMax, 100);
+    const auto r = m.validate(0, 710, 0, 0, 0, 4);
+    EXPECT_TRUE(r.isAccept()) << "seq 0 after INT32_MAX is in order (wrap), status="
+                              << static_cast<int>(r.status);
+    m.update(0, 710, 0, 0, 0, 4, 200);
+    EXPECT_TRUE(m.validate(0, 710, 0, 0, 5, 5).isAccept());
+    // The newest pre-wrap batch is still answered from the window.
+    const auto d = m.validate(0, 710, 0, 0, kMax - 9, kMax);
+    EXPECT_TRUE(d.isOos() || (d.isDuplicate() && d.retryBaseOffset == 100))
+        << "a pre-wrap retransmit is never answered with an unknown offset";
+}
+
+// Snapshot v3 header guard: a recorded window of 0 slots is corrupt → nothing loaded.
+TEST(IdempotenceWindow, Version3SnapshotWithZeroSlotsIsRejected) {
+    const std::string path = tmpPath("psm_v3_zero");
+    ProducerStateManager m;
+    produce(m, 720, 0, 0, 0, 1, 10);
+    m.takeSnapshot(path);
+    {
+        const int fd = ::open(path.c_str(), O_RDWR);
+        ASSERT_GE(fd, 0);
+        const uint32_t zero = 0;
+        ASSERT_EQ(::pwrite(fd, &zero, 4, 12), 4);
+        ::close(fd);
+    }
+    ProducerStateManager m2;
+    EXPECT_EQ(m2.recover(path), 0);
+    EXPECT_EQ(m2.size(), 0u);
+    ::unlink(path.c_str());
+}
+
+// Re-review of 700d86d (C1): readView also comes back EMPTY when a sealed segment's bytes cannot be
+// read (a corrupt length field, a failed mapping) — not only at a compaction gap.  Treating that as a
+// gap skipped the producer's stored batches and marked the state PROVEN: a resend of a stored batch
+// then got OutOfOrderSequence or was appended again.  Data that exists but cannot be read must FAIL
+// the proof.
+TEST(PsmRebuildRegression, CorruptLengthAfterValidBatchesFailsTheProof) {
+    const std::string dir = tmpPath("psm_corrupt_len");
+    std::filesystem::create_directories(dir);
+    {
+        rune::storage::Log log(dir);
+        log.recover();
+        std::vector<std::size_t> sizes;
+        for (int i = 0; i < 3; ++i) {
+            rune::protocol::RecordBatchBuilder b(log.logEndOffset(), 1000);
+            b.setProducerId(910); b.setProducerEpoch(0); b.setBaseSequence(i * 2);
+            b.append("k", "v", 1000); b.append("k", "v", 1000);
+            const auto bytes = b.build();
+            sizes.push_back(bytes.size());
+            ASSERT_GE(log.append(bytes, log.logEndOffset() + 1), 0);
+        }
+        // Corrupt the 2nd batch's length field (bytes [8,12) of the batch) in place, through the file:
+        // the live segment's shared mapping sees it; its nextOffset still covers all three batches.
+        std::string seg;
+        for (const auto& e : std::filesystem::directory_iterator(dir))
+            if (e.path().extension() == ".log") seg = e.path().string();
+        ASSERT_FALSE(seg.empty());
+        const int fd = ::open(seg.c_str(), O_WRONLY);
+        ASSERT_GE(fd, 0);
+        const int32_t bogus = 0x7FFFFFF0;
+        ASSERT_EQ(::pwrite(fd, &bogus, sizeof bogus, static_cast<off_t>(sizes[0] + 8)), 4);
+        ::close(fd);
+        ProducerStateManager m;
+        EXPECT_FALSE(m.rebuildFromLog(0, log, log.logEndOffset(), 0))
+            << "unreadable stored batches were skipped and the producer state reported PROVEN";
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// ===========================================================================
+// D6 — UnknownProducerId (Kafka UNKNOWN_PRODUCER_ID).  A producer the state no
+// longer knows (retention / compaction / memory-ring eviction removed all its
+// batches before a rebuild) is answered UnknownProducerId for baseSequence != 0
+// instead of OutOfOrderSequence.  Everything else is unchanged.
+// ===========================================================================
+namespace {
+std::vector<uint8_t> d6Batch(int64_t pid, int16_t epoch, int32_t seq, int64_t base) {
+    rune::protocol::RecordBatchBuilder b(base, 1000);
+    b.setProducerId(pid); b.setProducerEpoch(epoch); b.setBaseSequence(seq);
+    b.append("k", "v", 1000);
+    return b.build();
+}
+}  // namespace
+
+TEST(UnknownProducerIdRegression, RebuiltStateAfterRetentionAnswersUnknownProducerIdRegression) {
+    const std::string dir = tmpPath("psm_d6");
+    fs::create_directories(dir);
+    {
+        rune::storage::Log log(dir, /*segmentRollBytes=*/256);
+        log.recover();
+        auto app = [&](int64_t pid, int16_t e, int32_t seq) {
+            const auto b = d6Batch(pid, e, seq, log.logEndOffset());
+            ASSERT_GE(log.append(b, log.logEndOffset()), 0);
+        };
+        for (int32_t s = 0; s < 6; ++s) app(/*P*/ 7, 0, s);    // P: several segments
+        for (int32_t s = 0; s < 12; ++s) app(/*Q*/ 8, 3, s);   // Q: the rest (and the active segment)
+        ProducerStateManager live;
+        ASSERT_TRUE(live.rebuildFromLog(0, log, log.logEndOffset(), 0));
+        ASSERT_NE(live.entry(0, 7, 0), nullptr);
+
+        ASSERT_GT(log.deleteOldSegments(/*retainBytes=*/0), 0);
+        ASSERT_GE(log.logStartOffset(), 6) << "precondition: retention removed every batch of P";
+
+        // The LIVE state keeps P across retention (only a rebuild forgets it).
+        EXPECT_TRUE(live.validate(0, 7, 0, 0, 6, 6).isAccept());
+
+        ProducerStateManager rebuilt;                            // failover / restart / re-promotion
+        ASSERT_TRUE(rebuilt.rebuildFromLog(0, log, log.logEndOffset(), 0));
+        ASSERT_EQ(rebuilt.entry(0, 7, 0), nullptr) << "precondition: P is gone from the rebuilt state";
+        ASSERT_NE(rebuilt.entry(0, 8, 0), nullptr);
+
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 0, 6, 6).isUnknownProducerId()) << "P's next batch";
+        EXPECT_FALSE(rebuilt.validate(0, 7, 0, 0, 6, 6).isOos());
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 1, 0, 0).isAccept()) << "P re-sequenced at seq 0 (new epoch)";
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 0, 0, 0).isAccept()) << "seq 0 on any epoch: trust-on-first-use";
+        // Q is known: a forward gap stays OOS, epochs unchanged.
+        EXPECT_TRUE(rebuilt.validate(0, 8, 0, 3, 14, 14).isOos()) << "known entry + gap";
+        EXPECT_TRUE(rebuilt.validate(0, 8, 0, 2, 12, 12).isFenced()) << "lower epoch";
+        EXPECT_TRUE(rebuilt.validate(0, 8, 0, 4, 5, 5).isOos()) << "higher epoch, seq != 0";
+        EXPECT_TRUE(rebuilt.validate(0, 8, 0, 3, 12, 12).isAccept()) << "in order";
+    }
+    fs::remove_all(dir);
+}
+
+// D6 review L1: retention removed P's data batches but P's COMMIT marker survives — the rebuilt entry carries P's
+// epoch only (no sequence).  P's next batch at seq k > 0 must answer UnknownProducerId (Kafka evicts such a producer
+// from its state), not "known entry + gap" OutOfOrderSequence; epoch fencing of P stays.
+TEST(UnknownProducerIdRegression, MarkerOnlyRebuiltEntryAnswersUnknownProducerIdRegression) {
+    const std::string dir = tmpPath("psm_d6_l1");
+    fs::create_directories(dir);
+    {
+        rune::storage::Log log(dir, /*segmentRollBytes=*/256);
+        log.recover();
+        auto put = [&](const std::vector<uint8_t>& b) { ASSERT_GE(log.append(b, log.logEndOffset()), 0); };
+        for (int32_t s = 0; s < 6; ++s) put(d6Batch(/*P*/ 7, 2, s, log.logEndOffset()));
+        for (int32_t s = 0; s < 12; ++s) put(d6Batch(/*Q*/ 8, 0, s, log.logEndOffset()));   // rolls P's segments
+        {   // P's marker: the last batch, in the active segment (survives retention)
+            rune::protocol::RecordBatchBuilder m(log.logEndOffset(), 1000);
+            m.setProducerId(7); m.setProducerEpoch(2); m.setControl(true);
+            m.append("", "", 1000);
+            put(m.build());
+        }
+        ASSERT_GT(log.deleteOldSegments(/*retainBytes=*/0), 0);
+        ASSERT_GE(log.logStartOffset(), 6) << "precondition: retention removed every DATA batch of P";
+
+        ProducerStateManager rebuilt;
+        ASSERT_TRUE(rebuilt.rebuildFromLog(0, log, log.logEndOffset(), 0));
+        ASSERT_NE(rebuilt.entry(0, 7, 0), nullptr) << "precondition: the surviving marker made an epoch-only entry";
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 2, 6, 6).isUnknownProducerId()) << "marker-only entry, seq != 0";
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 2, 0, 0).isAccept()) << "seq 0 at the marker's epoch";
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 1, 0, 0).isFenced()) << "the marker's epoch still fences";
+        rebuilt.update(0, 7, 0, 2, 0, 0, log.logEndOffset());   // P appends again at its epoch
+        EXPECT_TRUE(rebuilt.validate(0, 7, 0, 2, 5, 5).isOos()) << "a real gap after data is OOS again";
+    }
+    fs::remove_all(dir);
+}
+
+TEST(UnknownProducerIdRegression, ProtocolIllegalSequencesStayOutOfOrderRegression) {
+    ProducerStateManager m;
+    EXPECT_TRUE(m.validate(0, 5, 0, 0, -1, 0).isOos());
+    EXPECT_TRUE(m.validate(0, 5, 0, 0, 4, 3).isOos());
 }

@@ -176,11 +176,26 @@ public:
             }
 
             // Default (allowUnclean==false, or no live replicas): unavailable.
+            //
+            // RECOVERY FIX (dr3 rolling leader-kill: partition permanently
+            // NO_LEADER): RETAIN the last-known ISR lineage instead of clearing
+            // it.  cur.isr is the set of replicas that held the committed prefix
+            // at the moment the last survivor died.  Clearing it to {} made the
+            // partition unrecoverable: every later election computed
+            // proposedIsr = {} ∩ liveNodes = {} → NO_LEADER forever, even after a
+            // former-ISR member rejoined caught-up.  By keeping cur.isr, the very
+            // next election after such a member returns to liveNodes elects it
+            // cleanly (proposedIsr non-empty again) — a SAFE clean election (the
+            // elected node was in the ISR, so it has the committed data).  This is
+            // Kafka parity: an offline partition retains its ISR lineage so a
+            // returning in-sync replica restores leadership without unclean
+            // election.  newIsr == cur.isr → mergeChange sees no ISR change (only
+            // the leader flips to NO_LEADER), so no spurious ISR churn.
             ElectionOutcome out;
             out.leaderChanged = true;
             out.wentNoLeader  = true;
             out.change.newLeader   = NO_LEADER;
-            out.change.newIsr      = {};
+            out.change.newIsr      = cur.isr;  // RETAIN lineage for safe recovery
             out.change.newReplicas = {};  // empty → mergeChange keeps cur.replicas
             return out;
         }

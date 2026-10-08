@@ -65,8 +65,8 @@ struct TempDir {
 
 class NullTransport2 : public PartitionTransport {
 public:
-    void sendFetchRequest(const FetchRequestMsg&) override {}
-    void sendFetchResponse(NodeId, const FetchResponseMsg&) override {}
+    bool sendFetchRequest(const FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { return true; }
 };
 
 static PartitionConfig makeCfg(NodeId self = 1, int minIsr = 1) {

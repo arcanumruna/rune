@@ -955,3 +955,165 @@ TEST(MetadataStateMachine, UnknownRecordVersionIsHandleLossNotCrash) {
     EXPECT_EQ(msm.lossCount(), 1u);
     EXPECT_EQ(msm.committedMap().size(), 0);
 }
+
+// Task 11: the runtime rebuilds the RoutingImage only when committedVersion()
+// moves — so it must move on EVERY committed-map change and never otherwise.
+TEST(MetadataStateMachineRegression, CommittedVersionMovesOnlyOnCommittedMapChange)
+{
+    MetadataStateMachine msm;
+    const uint64_t v0 = msm.committedVersion();
+    auto [cbuf, csz] = encodeCreate(1, 2, 1);
+    msm.apply(cbuf.data(), csz, /*pos=*/0);
+    auto [ubuf, usz] = encodeUpdate({1, 0, 7, {7}, {7}, 1, 1});
+    msm.apply(ubuf.data(), usz, /*pos=*/5);
+    EXPECT_EQ(msm.committedVersion(), v0) << "pending (uncommitted) records change nothing";
+    msm.commit(5);
+    const uint64_t v1 = msm.committedVersion();
+    EXPECT_GT(v1, v0) << "commit installed an assignment";
+    msm.commit(5);
+    EXPECT_EQ(msm.committedVersion(), v1) << "idempotent commit: no change";
+    auto [u2, u2sz] = encodeUpdate({1, 1, 3, {3}, {3}, 1, 1});
+    msm.apply(u2.data(), u2sz, /*pos=*/3);                    // at/below committedPos: installs directly
+    const uint64_t v2 = msm.committedVersion();
+    EXPECT_GT(v2, v1);
+    VecSnapshotWriter w;
+    msm.snapshot(w);
+    VecSnapshotReader r(w.data());
+    msm.restore(r);
+    EXPECT_GT(msm.committedVersion(), v2) << "restore replaces the committed map";
+}
+
+// Epoch-restart fix round 2 (N4): the MSM never installs an assignment record
+// that moves a partition BACK — a lower leaderEpoch, the same leaderEpoch with
+// a different leader, or a lower partitionEpoch — whether it arrives committed
+// at once, through the pending queue, or in a replay of the log.
+TEST(MetadataStateMachineRegression, EpochRegressionRecordsIgnoredInApplyAndReplayRegression)
+{
+    const std::vector<UpdateArgs> log = {
+        {1, 0, 5, {5, 6}, {5, 6}, 3, 4},   // installed
+        {1, 0, 6, {6, 5}, {5, 6}, 2, 9},   // lower leaderEpoch            → ignored
+        {1, 0, 6, {6},    {5, 6}, 3, 9},   // same epoch, other leader     → ignored
+        {1, 0, 5, {5},    {5, 6}, 3, 3},   // lower partitionEpoch         → ignored
+        {1, 0, 5, {5},    {5, 6}, 3, 5},   // ISR change (pe + 1)          → installed
+        {1, 0, 6, {6, 5}, {5, 6}, 4, 6},   // new election (le + 1)        → installed
+        {1, 0, 5, {5, 6}, {5, 6}, 0, 0},   // a static epoch-0 re-emit      → ignored
+    };
+    auto check = [](const MetadataStateMachine& msm, const char* how) {
+        const auto* a = msm.assignment(1, 0);
+        ASSERT_NE(a, nullptr) << how;
+        EXPECT_EQ(a->leaderNode, 6) << how;
+        EXPECT_EQ(a->leaderEpoch, 4) << how;
+        EXPECT_EQ(a->partitionEpoch, 6) << how;
+        EXPECT_EQ(a->isr, (std::vector<int32_t>{6, 5})) << how;
+        EXPECT_EQ(msm.regressionsRejected(), 4u) << how;
+    };
+    {   // committed one by one
+        MetadataStateMachine msm;
+        for (std::size_t i = 0; i < log.size(); ++i) {
+            auto [b, n] = encodeUpdate(log[i]);
+            msm.apply(b.data(), n, static_cast<int64_t>(i));
+            msm.commit(static_cast<int64_t>(i));
+        }
+        check(msm, "applied + committed one by one");
+    }
+    {   // replay: everything pending, committed in one step
+        MetadataStateMachine msm;
+        for (std::size_t i = 0; i < log.size(); ++i) {
+            auto [b, n] = encodeUpdate(log[i]);
+            msm.apply(b.data(), n, static_cast<int64_t>(i));
+        }
+        msm.commit(static_cast<int64_t>(log.size()));
+        check(msm, "replayed (pending, one commit)");
+    }
+}
+
+// D15: the broker-owned metadata extensions stay readable by OLDER binaries
+// (rolling upgrades) and are folded deterministically by newer ones:
+//  - a leaderless record's mark is a trailer the rune-protocol decoder (what an
+//    older MSM runs) ignores — it installs the same assignment; a newer MSM
+//    installs the mark too;
+//  - a FeatureLevelRecord is an unknown type to an older MSM (skipped by the
+//    switch default); a newer MSM commits it only at its commit point,
+//    monotonically, and a revert drops an uncommitted one.
+#include "rune/metadata/MetadataExtensions.h"
+TEST(MetadataStateMachineRegression, D15ExtensionsReadableByOlderDecodersRegression) {
+    std::vector<int32_t> isr{2, 3}, reps{1, 2, 3};
+    UpdatePartitionAssignmentRecord rec;
+    rec.topicId = 4; rec.partition = 1; rec.leaderNode = NO_LEADER;
+    rec.isr = Int32ArrayView{isr.data(), 2}; rec.replicas = Int32ArrayView{reps.data(), 3};
+    rec.leaderEpoch = 9; rec.partitionEpoch = 11;
+    uint8_t buf[256];
+    std::size_t n = rec.encode(buf, sizeof buf);
+    LeaderlessMark mark;
+    mark.kind = LeaderlessMark::Kind::EmptyMemoryLeader; mark.node = 2; mark.incarnation = 0x1234567890LL;
+    n += leaderless_trailer::encode(buf + n, sizeof buf - n, mark);
+    const auto old = UpdatePartitionAssignmentRecord::decode(buf, n);   // what an older MSM decodes
+    ASSERT_TRUE(old.has_value());
+    EXPECT_EQ(old->leaderNode, NO_LEADER);
+    EXPECT_EQ(old->leaderEpoch, 9);
+    EXPECT_EQ(old->partitionEpoch, 11);
+    EXPECT_EQ(old->replicas.size(), 3u);
+    MetadataStateMachine msm;
+    msm.apply(buf, n, 0);
+    msm.commit(0);
+    const auto* pa = msm.assignment(4, 1);
+    ASSERT_NE(pa, nullptr);
+    EXPECT_EQ(pa->mark.kind, LeaderlessMark::Kind::EmptyMemoryLeader);
+    EXPECT_EQ(pa->mark.node, 2);
+    EXPECT_EQ(pa->mark.incarnation, 0x1234567890LL);
+
+    FeatureLevelRecord f; f.level = 1;
+    uint8_t fb[8];
+    const std::size_t fn = f.encode(fb, sizeof fb);
+    const auto t = peekRecordType(fb, fn);
+    ASSERT_TRUE(t.has_value());
+    EXPECT_NE(*t, MetadataRecordType::CreateTopic);
+    EXPECT_NE(*t, MetadataRecordType::UpdatePartitionAssignment);
+    EXPECT_NE(*t, MetadataRecordType::NodeJoin);
+    EXPECT_NE(*t, MetadataRecordType::NodeLeave);
+    EXPECT_NE(*t, MetadataRecordType::ControlTick);
+    EXPECT_EQ(msm.featureLevel(), 0);
+    msm.apply(fb, fn, 1);
+    EXPECT_EQ(msm.featureLevel(), 0) << "an uncommitted feature level took effect";
+    msm.revert(0);
+    msm.commit(1);
+    EXPECT_EQ(msm.featureLevel(), 0) << "a reverted feature level took effect";
+    msm.apply(fb, fn, 2);
+    msm.commit(2);
+    EXPECT_EQ(msm.featureLevel(), 1);
+    f.level = 0;
+    (void)f.encode(fb, sizeof fb);
+    msm.apply(fb, fn, 3);
+    msm.commit(3);
+    EXPECT_EQ(msm.featureLevel(), 1) << "the feature level went backwards";
+    EXPECT_EQ(msm.assignment(4, 1)->leaderEpoch, 9) << "a feature record touched the assignment map";
+}
+
+// D15 review m4: the broker-owned record type must never collide with a type
+// rune-protocol adds next (it owns the small ids 1..N): broker extensions use
+// the high-bit space.  And the leaderless trailer is parsed only after a
+// VERSION-0 assignment record — a future protocol version may append its own
+// fields there.
+TEST(MetadataStateMachineRegression, D15ExtensionIdsOutsideProtocolSpaceRegression) {
+    EXPECT_GE(kFeatureLevelRecordType, 0x8000u) << "broker-owned record type in rune-protocol's id space";
+    std::vector<int32_t> isr{2}, reps{1, 2, 3};
+    UpdatePartitionAssignmentRecord rec;
+    rec.topicId = 5; rec.partition = 0; rec.leaderNode = NO_LEADER;
+    rec.isr = Int32ArrayView{isr.data(), 1}; rec.replicas = Int32ArrayView{reps.data(), 3};
+    rec.leaderEpoch = 3; rec.partitionEpoch = 3;
+    uint8_t buf[256];
+    std::size_t n = rec.encode(buf, sizeof buf);
+    LeaderlessMark mark;
+    mark.kind = LeaderlessMark::Kind::LogDirOffline; mark.node = 2; mark.incarnation = 9;
+    n += leaderless_trailer::encode(buf + n, sizeof buf - n, mark);
+    buf[2] = 1;   // a future recordVersion whose own fields follow the replicas
+    const auto v1 = UpdatePartitionAssignmentRecord::decode(buf, n);
+    if (v1.has_value()) {   // only if this rune-protocol accepts v1
+        MetadataStateMachine msm;
+        msm.apply(buf, n, 0);
+        msm.commit(0);
+        const auto* pa = msm.assignment(5, 0);
+        ASSERT_NE(pa, nullptr);
+        EXPECT_EQ(pa->mark.kind, LeaderlessMark::Kind::None) << "a v1 record's fields were read as a D15 trailer";
+    }
+}

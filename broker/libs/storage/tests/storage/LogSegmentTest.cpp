@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
+#include <rune/storage/Log.h>
 #include <rune/storage/LogSegment.h>
 #include <rune/storage/OffsetIndex.h>
 #include <rune/protocol/RecordBatch.h>
 #include <climits>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <numeric>
@@ -31,6 +33,50 @@ static std::vector<uint8_t> makeBatch(int64_t baseOffset, int64_t baseTs, int nR
     for (int i = 0; i < nRecords; ++i)
         b.append("key", "val", baseTs + i);
     return b.build();
+}
+
+// #5 non-blocking append: preallocate() must reserve disk blocks WITHOUT changing
+// st_size (so O_APPEND still writes at the true end-of-data) and must not disturb
+// append/read semantics. Idempotent + safe on unsupported filesystems.
+TEST(LogSegmentRegression, PreallocateReservesBlocksKeepsAppendSemantics) {
+    auto dir = makeTempDir("rune_seg_prealloc");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    LogSegment seg(dir.string(), 0);
+    const std::string logPath = seg.logPath();
+
+    struct stat st0{}; ASSERT_EQ(::stat(logPath.c_str(), &st0), 0);
+    EXPECT_EQ(st0.st_size, 0) << "fresh segment .log should be empty";
+
+    const int64_t kPre = 4 * 1024 * 1024;   // 4 MiB
+    seg.preallocate(kPre);
+
+    struct stat st1{}; ASSERT_EQ(::stat(logPath.c_str(), &st1), 0);
+    // CRITICAL correctness: preallocate reserves blocks but MUST NOT grow st_size —
+    // else O_APPEND would write past the reserved region and corrupt offsets.
+    EXPECT_EQ(st1.st_size, 0) << "preallocate must keep st_size unchanged (KEEP_SIZE/F_PREALLOCATE)";
+    // Best-effort (informational): blocks should be reserved on ext4/APFS; some
+    // filesystems (tmpfs/overlay) may not reflect it — never REDUCE blocks though.
+    EXPECT_GE(st1.st_blocks, st0.st_blocks);
+    RecordProperty("reserved_bytes", std::to_string((long long)st1.st_blocks * 512));
+
+    // Functional: append still lands at offset 0 and reads back correctly.
+    RecordBatchBuilder b(0, 1000); b.append("k", "v0", 1000);
+    ASSERT_EQ(seg.append(b.build(), 0), 1);
+    auto bytes = seg.read(0, 1 << 20);
+    RecordBatchReader r(bytes.data(), bytes.size());
+    ASSERT_TRUE(r.ensureValid());
+    EXPECT_EQ(r.baseOffset(), 0);
+
+    // Idempotent: a second preallocate is safe and the on-disk data is intact.
+    seg.preallocate(kPre);
+    auto bytes2 = seg.read(0, 1 << 20);
+    RecordBatchReader r2(bytes2.data(), bytes2.size());
+    ASSERT_TRUE(r2.ensureValid());
+    EXPECT_EQ(r2.baseOffset(), 0);
+
+    // Zero/negative + no-op are safe.
+    seg.preallocate(0); seg.preallocate(-1);
+    std::filesystem::remove_all(dir);
 }
 
 TEST(LogSegment, AppendThenReadBack) {
@@ -798,5 +844,140 @@ TEST(LogSegment, OffsetIndexAppendGuards2GiBPosition) {
     EXPECT_THROW(idx.append(0, tooBig), std::runtime_error)
         << "OffsetIndex::append must throw when position > INT32_MAX";
 
+    std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// F3 fix-round-1, item 2 (IMPORTANT, fix-on-sight): LogSegment's write-fd
+// open() was unchecked — on failure fd_ stayed -1 and sync() silently skipped
+// the fdatasync forever (silent durability loss).  Construction must now
+// throw std::system_error, surfacing the failure exactly like the segment's
+// other construction failures (OffsetIndex, MappedFile) already do.
+// ---------------------------------------------------------------------------
+TEST(LogSegmentRegression, OpenFailureThrowsNotSilentNoSync) {
+    auto dir = makeTempDir("rune_seg_open_fail");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+
+    // Pre-create a DIRECTORY at the exact path LogSegment would use for its
+    // .log file.  The fstream open silently fails (is_open() == false, no
+    // throw — fstream never throws by default), and the raw
+    // ::open(..., O_RDWR|O_CREAT) also fails (EISDIR: can't open a directory
+    // for writing) — while the SEPARATE .index file can still be created
+    // normally, isolating the .log open() failure from any other
+    // construction step (OffsetIndex, MappedFile) that might also throw.
+    // This also works when run as root (EISDIR, unlike EACCES, isn't a
+    // permission check), so no uid-based skip is needed.
+    std::string logPath = (dir / "00000000000000000000.log").string();
+    std::filesystem::create_directory(logPath);
+
+    EXPECT_THROW({ LogSegment seg(dir.string(), 0); }, std::system_error)
+        << "LogSegment construction must THROW (not silently continue with fd_ == -1) "
+           "when the .log file cannot be opened";
+
+    std::filesystem::remove_all(dir);
+}
+
+// Re-review-2 medium (hot-path B): a segment whose logical end is past its last
+// surviving batch (compaction removed the tail) truncated exactly at that end
+// cuts nothing — it must succeed, not fail-stop the log (availability).
+TEST(LogSegmentRegression, InPlaceTruncateAtCompactedTailEndCutsNothingRegression) {
+    auto dir = makeTempDir("rune_seg_ctail");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    LogSegment seg(dir.string(), 0);
+    RecordBatchBuilder b0(0, 1000); b0.append("k", "v0", 1000);
+    ASSERT_EQ(seg.append(b0.build(), 9), 10);   // logical end 10, last batch ends at 0
+    const int64_t sizeBefore = seg.sizeBytes();
+    int64_t keptMaxTs = 0;
+    EXPECT_EQ(seg.truncateInPlace(10, keptMaxTs), 0) << "a no-op truncation at the compacted tail end failed the log";
+    EXPECT_EQ(seg.nextOffset(), 10);
+    EXPECT_EQ(seg.sizeBytes(), sizeBefore) << "nothing may be cut";
+    std::filesystem::remove_all(dir);
+}
+
+// #65: readInto (one pread into the caller's buffer, no mapping) serves EXACTLY
+// readView's batches — every start offset (incl. mid-batch and sparse-index
+// skips), every maxBytes shape; a buffer too small for the first batch is
+// reported (firstTooLarge) and an absent offset is plainly empty.
+TEST(LogSegmentRegression, ReadIntoMatchesReadViewWithoutMappingRegression) {
+    auto dir = makeTempDir("rune_seg_readinto");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    LogSegment seg(dir.string(), 0, 4096);
+    int64_t off = 0;
+    for (int i = 0; i < 200; ++i) {
+        const int n = 1 + (i % 5);
+        auto batch = makeBatch(off, 1000 + i, n);
+        seg.append(batch, off + n - 1);
+        off += n;
+    }
+    std::vector<uint8_t> buf(256 * 1024);
+    for (int64_t start = 0; start < off; start += 7) {
+        for (int32_t maxBytes : {0, 300, 4096, 64 * 1024, 1 << 20}) {
+            bool tooLarge = true;
+            const auto into = seg.readInto(start, maxBytes, buf.data(), buf.size(), tooLarge);
+            const auto view = seg.readView(start, maxBytes);
+            ASSERT_FALSE(tooLarge) << "start " << start << " maxBytes " << maxBytes;
+            ASSERT_EQ(into.len, view.len) << "start " << start << " maxBytes " << maxBytes;
+            ASSERT_EQ(into.baseOffset, view.baseOffset);
+            ASSERT_EQ(into.nextOffset, view.nextOffset);
+            ASSERT_EQ(0, std::memcmp(into.data, view.data, into.len));
+        }
+    }
+    bool tooLarge = false;
+    EXPECT_TRUE(seg.readInto(off + 5, 4096, buf.data(), buf.size(), tooLarge).empty());
+    EXPECT_FALSE(tooLarge) << "an absent offset is not a too-small buffer";
+    uint8_t tiny[32];
+    EXPECT_TRUE(seg.readInto(0, 4096, tiny, sizeof tiny, tooLarge).empty());
+    EXPECT_TRUE(tooLarge) << "the first batch does not fit 32 bytes";
+    std::filesystem::remove_all(dir);
+}
+
+// #65 review MEDIUM-2: large batches (> the 4 KiB index interval) so a
+// request-sized window cuts the first batch (readInto must read on, never
+// report a needless firstTooLarge), multi-segment Log::readInto picks the right
+// segment, and a buffer smaller than readView's answer yields an exact batch
+// PREFIX of it.
+TEST(LogSegmentRegression, ReadIntoLargeBatchesMultiSegmentAndBufferLimitRegression) {
+    auto dir = makeTempDir("rune_log_readinto");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    rune::storage::Log log(dir.string(), 96 * 1024);   // small segments: several rolls
+    int64_t off = 0;
+    for (int i = 0; i < 60; ++i) {
+        RecordBatchBuilder b(off, 1000 + i);
+        const int n = 1 + (i % 3);
+        const std::string value(1500 + (i % 7) * 1700, static_cast<char>('a' + (i % 26)));   // 1.5 .. 11.7 KiB records
+        for (int k = 0; k < n; ++k) b.append("k", value, 1000 + i);
+        log.append(b.build(), off + n - 1);
+        off += n;
+    }
+    ASSERT_GE(log.segmentBaseOffsets().size(), 3u);
+    std::vector<uint8_t> big(512 * 1024);
+    for (int64_t start = 0; start < off; start += 3) {
+        for (int32_t maxBytes : {0, 1024, 4096, 40 * 1024, 1 << 20}) {
+            bool tooLarge = true;
+            const auto into = log.readInto(start, maxBytes, big.data(), big.size(), tooLarge);
+            const auto view = log.readView(start, maxBytes);
+            ASSERT_FALSE(tooLarge) << "start " << start << " maxBytes " << maxBytes;
+            ASSERT_EQ(into.len, view.len) << "start " << start << " maxBytes " << maxBytes;
+            ASSERT_EQ(into.baseOffset, view.baseOffset);
+            ASSERT_EQ(into.nextOffset, view.nextOffset);
+            ASSERT_EQ(0, std::memcmp(into.data, view.data, into.len));
+        }
+        // Buffer limit: smaller than the full answer, larger than the first batch.
+        const auto view = log.readView(start, 1 << 20);
+        if (view.empty()) continue;
+        RecordBatchReader first(view.data, view.len);
+        const std::size_t firstLen = static_cast<std::size_t>(first.totalLength());
+        std::vector<uint8_t> small(firstLen + 2 * 4096 + 64 + 100);
+        bool tooLarge = true;
+        const auto into = log.readInto(start, 1 << 20, small.data(), small.size(), tooLarge);
+        ASSERT_FALSE(tooLarge) << "start " << start;
+        ASSERT_GE(into.len, firstLen);
+        ASSERT_LE(into.len, view.len);
+        ASSERT_EQ(into.baseOffset, view.baseOffset);
+        ASSERT_EQ(0, std::memcmp(into.data, view.data, into.len)) << "not a prefix of readView's answer";
+        std::size_t pos = 0;
+        while (pos < into.len) { RecordBatchReader r(into.data + pos, into.len - pos); ASSERT_TRUE(r.ensureValid()); pos += static_cast<std::size_t>(r.totalLength()); }
+        ASSERT_EQ(pos, into.len) << "a cut batch was returned";
+    }
     std::filesystem::remove_all(dir);
 }

@@ -564,9 +564,9 @@ TEST(TransactionLogTest, AbortLifecycleReplay) {
 }
 
 // ---------------------------------------------------------------------------
-// TEST: fencingEpoch is NOT persisted (always false on recovery)
+// TEST: fencingEpoch IS persisted (F15: header byte 27, bit0)
 // ---------------------------------------------------------------------------
-TEST(TransactionLogTest, FencingEpochNotPersisted) {
+TEST(TransactionLogTest, FencingEpochPersistedInFlagsByte) {
     auto path = tmpPath();
     TempFile tf{path};
 
@@ -577,7 +577,7 @@ TEST(TransactionLogTest, FencingEpochNotPersisted) {
     meta.state         = TxnState::PrepareAbort;
     meta.txnStartNs    = 0;
     meta.txnTimeoutMs  = 60'000;
-    meta.fencingEpoch  = true; // this should NOT be persisted
+    meta.fencingEpoch  = true; // F15 S7 fix round 1: persisted (header byte 27, bit0)
 
     {
         TransactionLog log(path);
@@ -587,7 +587,7 @@ TEST(TransactionLogTest, FencingEpochNotPersisted) {
     TransactionLog log2(path);
     const auto* m = log2.metadata("txn-fence");
     ASSERT_NE(m, nullptr);
-    EXPECT_FALSE(m->fencingEpoch); // must be false after recovery
+    EXPECT_TRUE(m->fencingEpoch); // F15 concern 3: the §5.4 fence answers survive recovery
 }
 
 // ===========================================================================
@@ -930,4 +930,22 @@ TEST(TransactionLogTest, TopicLenOverrunsTotalLengthRejected) {
         << "The preceding good record must still be present";
     EXPECT_EQ(log3.metadata(kTxnId), nullptr)
         << "The corrupt record must not be applied to the metadata map";
+}
+
+// E1 review (fsyncgate): a failed pwrite/fsync of the transaction log must be STICKY.  It threw but left the
+// log usable: a retry after a failed fsync could report success for pages the kernel had already dropped,
+// and the in-memory txn state would then claim a durable transition that is not on disk.
+TEST(TransactionLogRegression, WriteOrFsyncFailureIsStickyFailStop) {
+    auto path = tmpPath();
+    TempFile tf{path};
+    TransactionLog log(path);
+    log.append(makeEntry("txn-1", 42, 0, TxnState::Empty));
+    log.setWriteFaultForTest(EIO);
+    EXPECT_THROW(log.append(makeEntry("txn-1", 42, 0, TxnState::Ongoing)), std::system_error);
+    EXPECT_TRUE(log.storageFailed());
+    EXPECT_EQ(log.metadata("txn-1")->state, TxnState::Empty) << "a failed append never reaches the in-memory state";
+    log.setWriteFaultForTest(0);
+    EXPECT_THROW(log.append(makeEntry("txn-1", 42, 0, TxnState::Ongoing)), std::system_error)
+        << "sticky: no later 'success' once the log failed";
+    EXPECT_EQ(log.metadata("txn-1")->state, TxnState::Empty);
 }
