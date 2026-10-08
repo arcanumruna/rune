@@ -1,6 +1,7 @@
 // ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 
 #include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/CryptoFrame.h>
 #include <cassert>
 #include <rune_fr/FlightRecorder.h>
 #include <rune/gateway/TopicRegistry.h>
@@ -847,6 +848,56 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
 
 bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
 {
+    // client<->broker TLS/AEAD (Task 8): decrypt BEFORE checkFrame — mirrors
+    // the client's dispatchEgressFrame (Task 6). templateId/sessionId are
+    // always plaintext (they form the AEAD AAD), so peek them via
+    // MessageHeader::decode without validating anything else. Connect /
+    // HandshakeContinue legs are exempt: they precede or complete key
+    // establishment itself and must stay plaintext even on a session that is
+    // otherwise `encrypted` (e.g. a stray HandshakeContinue retry delivered
+    // after done() must still be readable in the clear). Plaintext path
+    // (crypto off, or session not found/not encrypted) is byte-identical to
+    // before Task 8 — buf/len are reassigned only on a successful decrypt.
+    //
+    // Cross-node sessionId collision (task-8-interfaces.md): NOT reachable
+    // here. `sessions_` (SessionTable.h) is a flat unordered_map<sessionId,
+    // Session> that is this NODE's OWN table — find() returns at most one
+    // Session by construction of the map (a plain hash-map key lookup), and
+    // SessionTable::nextSessionId() ORs in this node's own idPrefix_, so ids
+    // are cluster-unique by construction in production. This differs from
+    // the client's own ambiguity (ClientAgent::dispatchEgressFrame): the
+    // client holds one Session PER NODE in one local collection, so the same
+    // numeric sessionId can legitimately be claimed by two different nodes'
+    // Sessions in that single collection, and the client must therefore try
+    // every encrypted candidate. The gateway never holds another node's
+    // sessions at all — a single find() + single open() is correct here, no
+    // multi-candidate AEAD-disambiguation loop is needed.
+    if (const auto hdrOpt = pc::MessageHeader::decode(buf, len)) {
+        const auto peekedTid = static_cast<pc::TemplateId>(hdrOpt->templateId);
+        if (peekedTid != pc::TemplateId::Connect &&
+            peekedTid != pc::TemplateId::HandshakeContinue) {
+            if (Session* s = sessions_.find(hdrOpt->sessionId); s != nullptr && s->crypto.encrypted) {
+                // Plaintext is always kCryptoOverhead (28) bytes SHORTER than
+                // the wire frame — `len` bytes of capacity is always enough.
+                // noexcept-adjacent hot path: vector::resize can throw
+                // (bad_alloc) — contained here so a failed grow drops the
+                // frame instead of propagating out of onFragment's callback.
+                if (decryptScratch_.size() < len) {
+                    try {
+                        decryptScratch_.resize(len);
+                    } catch (...) {
+                        return true;  // scratch exhausted — drop, never crash
+                    }
+                }
+                const std::size_t plainLen = rune::gateway::codec::openIngressFrame(
+                    s->crypto, buf, len, decryptScratch_.data(), decryptScratch_.size());
+                if (plainLen == 0) return true;  // tamper/replay/truncation — drop
+                buf = decryptScratch_.data();
+                len = plainLen;
+            }
+        }
+    }
+
     // Step 1: validate frame with checkFrame — reject anything non-conformant.
     const auto fc = pc::checkFrame(buf, len);
     if (fc.status != pc::FrameStatus::Ok) {
@@ -2024,6 +2075,44 @@ void ClientGateway::handleDisconnect(const uint8_t* buf, std::size_t len)
 // ---------------------------------------------------------------------------
 bool ClientGateway::sendTo(Session& session, const uint8_t* buf, std::size_t len)
 {
+    // client<->broker TLS/AEAD (Task 8): encrypt AFTER the response body is
+    // encoded (every caller already encoded into scratch_/its own buffer),
+    // BEFORE handing bytes to the egress. sendTo is the single chokepoint
+    // every Session-aware broker->client send path funnels through
+    // (sendRespReliable_/enqueueOrBestEffort_/offerBytes_, sendControlFrame,
+    // sendSubscribeAnswer_, drainPendingResponses, trySendOwedPushError_,
+    // handlePing, sendSessionExpired_) — so sealing here, once, covers all of
+    // them with no per-caller duplication (Rule 3: one state, one code path).
+    // `seq=++crypto.sendSeq`, encode CryptoSubHeader, seal into a reusable
+    // grow-once scratch, emit [24B header][12B subheader][ciphertext][16B
+    // tag]. Drop (never transmit) on seal failure (sealResponseFrame
+    // returns 0). Plaintext path (crypto off) is byte-identical to before
+    // Task 8 — buf/len are reassigned only on a successful seal.
+    //
+    // NOTE: the raw sendOnPub() call sites that do NOT go through sendTo
+    // (handleConnect/handleHandshakeContinue_'s ConnectResponse/
+    // HandshakeContinueResponse/HandshakeFailed legs, and the redirect/
+    // sendSessionExpired_ fallback when no Session exists yet) are
+    // intentionally left untouched: those are either the handshake legs
+    // themselves (must stay plaintext — keys are not yet installed, or are
+    // being installed by this very frame) or genuinely session-less (no
+    // CryptoState to seal under).
+    if (session.crypto.encrypted) {
+        const std::size_t need = len + rune::protocol::client::kCryptoOverhead;
+        if (sealScratch_.size() < need) {
+            try {
+                sealScratch_.resize(need);
+            } catch (...) {
+                return false;  // scratch exhausted — drop, never transmit
+            }
+        }
+        const std::size_t sealedLen = rune::gateway::codec::sealResponseFrame(
+            session.crypto, buf, len, sealScratch_.data(), sealScratch_.size());
+        if (sealedLen == 0) return false;  // seal failure — never transmit
+        buf = sealScratch_.data();
+        len = sealedLen;
+    }
+
     // Guard against null egress (test sessions injected via injectTestSession
     // have no real ExclusivePublication).
     if (!session.egress) {

@@ -59,12 +59,22 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_gateway_session_tests)
 
     # -------------------------------------------------------------------------
-    # client<->broker TLS/AEAD (Task 7): gateway server-role handshake —
-    # Aeron-free (no ClientGateway/SessionTable involved; see the file's own
-    # header comment for why). Links rune_crypto + GTest ONLY (not rune_gateway).
+    # client<->broker TLS/AEAD (Task 7 handshake + Task 8 data-plane AEAD):
+    # gateway server-role crypto — Aeron-free (no ClientGateway/SessionTable
+    # involved; see the file's own header comment for why). Links rune_crypto
+    # + GTest ONLY (not rune_gateway, which would drag in <Aeron.h>). Task 8
+    # added direct #includes of rune/gateway/{CryptoState,CryptoFrame}.h (both
+    # aeron-free — CryptoState was extracted out of SessionTable.h specifically
+    # so this target could use the REAL type) and rune/protocol/client/
+    # {CryptoEnvelope,MessageHeader}.h, so this target needs this lib's own
+    # include/ dir and the protocol include dir too (rune_gateway itself gets
+    # both PUBLIC above; this target deliberately skips linking rune_gateway).
     # -------------------------------------------------------------------------
     add_executable(rune_gateway_crypto_tests
         tests/GatewayCryptoTest.cpp)
+    target_include_directories(rune_gateway_crypto_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${RUNE_PROTOCOL_INCLUDE})
     target_link_libraries(rune_gateway_crypto_tests PRIVATE
         rune_crypto
         GTest::gtest_main)

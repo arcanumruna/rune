@@ -1594,6 +1594,21 @@ private:
     static constexpr std::size_t kScratchSize = 68 * 1024;
     std::array<uint8_t, kScratchSize>    scratch_{};
 
+    // client<->broker TLS/AEAD (Task 8): reusable, grow-once scratch buffers
+    // for the data-plane AEAD codec (rune/gateway/CryptoFrame.h) — single-
+    // writer (duty-cycle thread only), never shrink, resize() is contained in
+    // a try/catch at the call site so a bad_alloc drops the frame instead of
+    // throwing out of a noexcept-adjacent hot path (mirrors the client's
+    // egressDecryptScratch_ / AeronTransport::sealScratch).
+    //   decryptScratch_ — onClientFrame_'s openIngressFrame() destination.
+    //     Always sized to the wire frame's length: the reconstructed
+    //     plaintext frame is kCryptoOverhead (28) bytes SHORTER than the
+    //     wire frame it came from, so `len` bytes of capacity is always enough.
+    //   sealScratch_    — sendTo()'s sealResponseFrame() destination. Sized
+    //     to plainLen + kCryptoOverhead on demand.
+    std::vector<uint8_t>                 decryptScratch_;
+    std::vector<uint8_t>                 sealScratch_;
+
     // Max accepted produce-batch WIRE size.  A batch above this is rejected LOUDLY
     // with MessageTooLarge (never silently dropped).  The zero-copy append path no
     // longer needs a fixed restamp scratch — the base offset is patched into the

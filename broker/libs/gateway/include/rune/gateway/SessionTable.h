@@ -21,8 +21,12 @@
 // SessionTable.h now needs rune_crypto's include dir transitively.  rune_crypto
 // + OpenSSL must be linked PUBLIC on rune_gateway (mirroring rune_fr / the
 // client's Task-5 fix-round-1), not PRIVATE as the brief's literal text says.
-#include <rune/crypto/Aead.h>
-#include <rune/crypto/Cipher.h>
+//
+// CryptoState itself (Task 8) lives in its own aeron-free header —
+// rune/gateway/CryptoState.h — so the data-plane codec (CryptoFrame.h) that
+// seals/opens frames under it can be unit-tested standalone without ever
+// touching <Aeron.h>.
+#include <rune/gateway/CryptoState.h>
 
 #include <array>
 #include <cstddef>
@@ -36,26 +40,8 @@
 namespace rune::gateway {
 
 // ---------------------------------------------------------------------------
-// CryptoState — client<->broker TLS/AEAD (Task 7), the broker's OWN per-
-// session crypto state (NOT the client's rune::client::session::CryptoState —
-// a separate type, same shape, by design: Rule 3, "each state holds exactly
-// the variables it needs").  Populated once a server-role TlsSession reaches
-// done() and exportKeys() returns a real cipher (ClientGateway::
-// handleHandshakeContinue_).  Direction mapping is the MIRROR of the client's
-// (see task-7-interfaces.md's "DIRECTION MAPPING" trap):
-//   recv <- c2b/c2bPrefix  (OPENS client->broker ingress)
-//   send <- b2c/b2cPrefix  (SEALS broker->client egress)
-// ---------------------------------------------------------------------------
-struct CryptoState {
-    bool                                     encrypted  = false;
-    rune::crypto::Cipher                     cipher{};
-    uint16_t                                 epoch      = 0;
-    uint64_t                                 sendSeq    = 0;
-    uint64_t                                 recvSeq    = 0;
-    uint64_t                                 recvWindow = 0;
-    std::optional<rune::crypto::AeadCipher>  send, recv;
-};
-
+// CryptoState — see rune/gateway/CryptoState.h (extracted there in Task 8 so
+// the aeron-free data-plane codec can use it without pulling in <Aeron.h>).
 // ---------------------------------------------------------------------------
 // Session — one connected client.
 // ---------------------------------------------------------------------------

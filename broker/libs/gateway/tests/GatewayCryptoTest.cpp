@@ -1,8 +1,9 @@
 // libs/gateway/tests/GatewayCryptoTest.cpp
 //
-// client<->broker TLS/AEAD (Task 7) — gateway SERVER-ROLE handshake.
+// client<->broker TLS/AEAD (Task 7 handshake + Task 8 data-plane AEAD) —
+// gateway SERVER-ROLE crypto, end to end.
 //
-// Standalone, Aeron-free (this host has no Aeron — task-7-interfaces.md's
+// Standalone, Aeron-free (this host has no Aeron — task-7/8-interfaces.md's
 // BUILD/TEST SPLIT): drives a REAL server-role rune::crypto::TlsSession (the
 // broker's own handshake engine — the exact sequence of calls
 // ClientGateway::handleConnect/handleHandshakeContinue_ make, replicated here
@@ -11,11 +12,15 @@
 // TlsSession, using rune-crypto's own test certs (tests/testdata/{server,ca}.pem
 // + server.key).
 //
-// `rune::gateway::CryptoState` (libs/gateway/include/rune/gateway/
-// SessionTable.h) cannot be instantiated here directly for the same reason —
-// `GatewayCryptoState` below is a field-for-field mirror of it (Rule 3: each
-// state holds exactly what it needs), not a new/different design; it exists
-// purely so this file has zero Aeron dependency.
+// Task 8 extracted `rune::gateway::CryptoState` into its OWN aeron-free
+// header (rune/gateway/CryptoState.h) precisely so the data-plane codec
+// (rune/gateway/CryptoFrame.h — openIngressFrame/sealResponseFrame, the
+// functions ClientGateway::onClientFrame_/sendTo actually call in
+// production) can be used here directly, with zero Aeron dependency. The
+// `GatewayCryptoState` alias below is therefore the REAL production type,
+// not a hand-rolled mirror (Task 7's version of this file used a field-for-
+// field copy because CryptoState lived inside SessionTable.h, which pulls in
+// <Aeron.h> — no longer true after the Task 8 extraction).
 //
 // What this proves:
 //   1. HandshakeReachesDoneAndKeysAgree — a full in-process handshake
@@ -40,12 +45,31 @@
 //      task-7-interfaces.md requires: Cipher::None is the sentinel that MUST
 //      be checked (and is, in handleHandshakeContinue_) before any AeadCipher
 //      is built from exported keys — never install all-zero keys.
+//
+// Task 8 data-plane cases (exercise the REAL rune::gateway::codec functions):
+//   5. ClientSealedIngressOpensOnGateway — a client-sealed Produce-shaped
+//      frame opens via openIngressFrame() with the correct seq/window state.
+//   6. GatewaySealedResponseOpensOnClient — sealResponseFrame()'s wire output
+//      opens under the client's own b2c AeadCipher.
+//   7. TamperedCiphertextDropped — a flipped ciphertext byte fails auth.
+//   8. TamperedHeaderAadDropped — a flipped clear-header byte fails auth (the
+//      header is part of the AAD).
+//   9. ReplayedSeqDropped — resending the exact same wire frame is rejected
+//      the second time.
+//  10. TooOldSeqDropped — a seq more than 64 behind the current high-water
+//      mark is rejected.
+//  11. WindowNotPoisonedByForgedFrame — a forged frame (wrong key, claims a
+//      fresh seq) fails auth and must NOT advance recvSeq/recvWindow; the
+//      SAME seq sent correctly afterwards must still succeed.
 
 #include <gtest/gtest.h>
 
 #include <rune/crypto/Aead.h>
 #include <rune/crypto/Cipher.h>
 #include <rune/crypto/TlsSession.h>
+#include <rune/gateway/CryptoFrame.h>
+#include <rune/protocol/client/CryptoEnvelope.h>
+#include <rune/protocol/client/MessageHeader.h>
 
 #include <cstdint>
 #include <cstring>
@@ -53,8 +77,10 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <vector>
 
-namespace cr = rune::crypto;
+namespace cr  = rune::crypto;
+namespace rpc = rune::protocol::client;
 
 namespace {
 
@@ -73,17 +99,9 @@ std::string testdataPath(const char* name) {
 #endif
 }
 
-// Field-for-field mirror of rune::gateway::CryptoState (SessionTable.h) — see
-// the file header comment for why this file can't include that header.
-struct GatewayCryptoState {
-    bool                          encrypted  = false;
-    cr::Cipher                    cipher{};
-    uint16_t                      epoch      = 0;
-    uint64_t                      sendSeq    = 0;
-    uint64_t                      recvSeq    = 0;
-    uint64_t                      recvWindow = 0;
-    std::optional<cr::AeadCipher> send, recv;
-};
+// The REAL production type (Task 8 extracted it to its own aeron-free
+// header) — see the file header comment.
+using GatewayCryptoState = rune::gateway::CryptoState;
 
 // client<->broker TLS/AEAD (Task 7): the TOGGLE under test for the direction
 // mapping — set to true to reproduce the ★ bug task-7-interfaces.md warns
@@ -268,4 +286,313 @@ TEST(GatewayCrypto, ExportKeysNoneSentinelNeverInstalled) {
     EXPECT_FALSE(crypto.encrypted);
     EXPECT_FALSE(crypto.recv.has_value());
     EXPECT_FALSE(crypto.send.has_value());
+}
+
+// ===========================================================================
+// Task 8 — gateway data-plane AEAD (rune::gateway::codec::openIngressFrame /
+// sealResponseFrame, the REAL functions ClientGateway::onClientFrame_/sendTo
+// call in production).
+// ===========================================================================
+
+namespace {
+
+// Build a plaintext [24B MessageHeader][body] frame exactly the shape every
+// protocol::client message encodes (e.g. Produce/ProduceResponse).
+std::vector<uint8_t> buildPlainFrame(uint16_t templateId, int64_t sessionId,
+                                      const std::string& body) {
+    std::vector<uint8_t> frame(rpc::MessageHeader::ENCODED_SIZE + body.size());
+    rpc::MessageHeader hdr;
+    hdr.templateId = templateId;
+    hdr.sessionId  = sessionId;
+    hdr.encode(frame.data());
+    std::memcpy(frame.data() + rpc::MessageHeader::ENCODED_SIZE, body.data(), body.size());
+    return frame;
+}
+
+// Seal `plain` the way any real peer (client or gateway) does: clear header
+// copied verbatim, clear CryptoSubHeader{seq} encoded right after it, body
+// sealed under `sealer` with AAD = the 36 clear bytes. This is the WIRE-level
+// counterpart to rune::gateway::codec::sealResponseFrame — used here to
+// fabricate CLIENT-sealed ingress frames (sealResponseFrame itself is only
+// ever used broker-side) and to independently cross-check sealResponseFrame's
+// own output shape in GatewaySealedResponseOpensOnClient.
+std::vector<uint8_t> sealFrameAsPeer(cr::AeadCipher& sealer, uint64_t seq,
+                                      const std::vector<uint8_t>& plain) {
+    std::vector<uint8_t> out(plain.size() + rpc::kCryptoOverhead);
+    std::memcpy(out.data(), plain.data(), rpc::MessageHeader::ENCODED_SIZE);
+    rpc::CryptoSubHeader sub;
+    sub.version = 1;
+    sub.seq     = seq;
+    sub.encode(out.data() + rpc::MessageHeader::ENCODED_SIZE);
+    const std::size_t bodyLen = plain.size() - rpc::MessageHeader::ENCODED_SIZE;
+    const std::size_t n = sealer.seal(seq, out.data(), rpc::kCryptoHeaderBytes,
+                                       plain.data() + rpc::MessageHeader::ENCODED_SIZE, bodyLen,
+                                       out.data() + rpc::kCryptoHeaderBytes);
+    EXPECT_GT(n, 0u) << "test setup: seal must not itself fail";
+    out.resize(rpc::kCryptoHeaderBytes + n);
+    return out;
+}
+
+// Drives a full handshake and returns the gateway-side CryptoState (recv<-c2b,
+// send<-b2c) plus the two client-side AeadCiphers a real client would hold
+// (clientSend keyed c2b, clientRecv keyed b2c) — the shared fixture every
+// Task 8 data-plane test below starts from.
+struct DataPlaneFixture {
+    GatewayCryptoState gw;
+    std::optional<cr::AeadCipher> clientSend;  // client -> broker (c2b)
+    std::optional<cr::AeadCipher> clientRecv;  // broker -> client (b2c)
+};
+
+DataPlaneFixture makeDataPlaneFixture(int64_t sessionId) {
+    const std::string serverPem = slurp(testdataPath("server.pem"));
+    const std::string serverKey = slurp(testdataPath("server.key"));
+    const std::string caPem     = slurp(testdataPath("ca.pem"));
+
+    cr::TlsSession srv = cr::TlsSession::makeServer(serverPem.c_str(), serverKey.c_str());
+    cr::TlsSession cli = cr::TlsSession::makeClient(caPem.c_str(), "localhost");
+    EXPECT_TRUE(srv.valid());
+    EXPECT_TRUE(cli.valid());
+    EXPECT_TRUE(driveServerHandshake(srv, cli));
+
+    constexpr cr::Cipher kCipher = cr::Cipher::Aes256Gcm;
+    const cr::SessionKeys srvKeys = srv.exportKeys(kCipher, sessionId);
+    const cr::SessionKeys cliKeys = cli.exportKeys(kCipher, sessionId);
+    EXPECT_NE(srvKeys.cipher, cr::Cipher::None);
+    EXPECT_NE(cliKeys.cipher, cr::Cipher::None);
+
+    DataPlaneFixture f;
+    f.gw.cipher = srvKeys.cipher;
+    f.gw.recv.emplace(srvKeys.cipher, srvKeys.c2b, srvKeys.c2bPrefix);  // OPENs client->broker
+    f.gw.send.emplace(srvKeys.cipher, srvKeys.b2c, srvKeys.b2cPrefix);  // SEALs broker->client
+    f.gw.encrypted = true;
+    f.clientSend.emplace(cliKeys.cipher, cliKeys.c2b, cliKeys.c2bPrefix);
+    f.clientRecv.emplace(cliKeys.cipher, cliKeys.b2c, cliKeys.b2cPrefix);
+    return f;
+}
+
+}  // namespace
+
+TEST(GatewayCryptoDataPlane, ClientSealedIngressOpensOnGateway) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/7);
+
+    const auto plain = buildPlainFrame(/*templateId=*/16 /*Produce*/, 7, "produce-body");
+    const auto wire   = sealFrameAsPeer(*f.clientSend, /*seq=*/1, plain);
+
+    std::vector<uint8_t> scratch(wire.size());
+    const std::size_t n = rune::gateway::codec::openIngressFrame(
+        f.gw, wire.data(), wire.size(), scratch.data(), scratch.size());
+
+    ASSERT_EQ(n, plain.size());
+    EXPECT_EQ(0, std::memcmp(scratch.data(), plain.data(), plain.size()));
+    EXPECT_EQ(f.gw.recvSeq, 1u);
+    EXPECT_NE(f.gw.recvWindow & 1u, 0u);
+}
+
+TEST(GatewayCryptoDataPlane, GatewaySealedResponseOpensOnClient) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/8);
+
+    const auto plain = buildPlainFrame(/*templateId=*/17 /*ProduceResponse*/, 8, "response-body");
+    std::vector<uint8_t> sealScratch(plain.size() + rpc::kCryptoOverhead);
+    const std::size_t sealedLen = rune::gateway::codec::sealResponseFrame(
+        f.gw, plain.data(), plain.size(), sealScratch.data(), sealScratch.size());
+    ASSERT_GT(sealedLen, 0u);
+    EXPECT_EQ(f.gw.sendSeq, 1u);
+
+    // Open it the way a real client would: decode the subheader for `seq`,
+    // then AeadCipher::open under the client's own b2c key, AAD = the clear
+    // 36 bytes exactly as sealResponseFrame wrote them.
+    const auto subOpt = rpc::CryptoSubHeader::decode(
+        sealScratch.data() + rpc::MessageHeader::ENCODED_SIZE,
+        sealedLen - rpc::MessageHeader::ENCODED_SIZE);
+    ASSERT_TRUE(subOpt.has_value());
+    EXPECT_EQ(subOpt->seq, 1u);
+
+    std::vector<uint8_t> recovered(sealedLen);
+    const long m = f.clientRecv->open(
+        subOpt->seq, sealScratch.data(), rpc::kCryptoHeaderBytes,
+        sealScratch.data() + rpc::kCryptoHeaderBytes, sealedLen - rpc::kCryptoHeaderBytes,
+        recovered.data());
+    ASSERT_EQ(m, static_cast<long>(plain.size() - rpc::MessageHeader::ENCODED_SIZE));
+    EXPECT_EQ(0, std::memcmp(recovered.data(), plain.data() + rpc::MessageHeader::ENCODED_SIZE,
+                             static_cast<std::size_t>(m)));
+}
+
+TEST(GatewayCryptoDataPlane, TamperedCiphertextDropped) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/9);
+    const auto plain = buildPlainFrame(16, 9, "produce-body");
+    auto wire = sealFrameAsPeer(*f.clientSend, 1, plain);
+
+    // Flip one ciphertext byte (just past the clear 36-byte AAD region).
+    wire[rpc::kCryptoHeaderBytes] ^= 0xFF;
+
+    std::vector<uint8_t> scratch(wire.size());
+    const std::size_t n = rune::gateway::codec::openIngressFrame(
+        f.gw, wire.data(), wire.size(), scratch.data(), scratch.size());
+    EXPECT_EQ(n, 0u);
+    // Auth failed before commit — window untouched.
+    EXPECT_EQ(f.gw.recvSeq, 0u);
+    EXPECT_EQ(f.gw.recvWindow, 0u);
+}
+
+TEST(GatewayCryptoDataPlane, TamperedHeaderAadDropped) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/10);
+    const auto plain = buildPlainFrame(16, 10, "produce-body");
+    auto wire = sealFrameAsPeer(*f.clientSend, 1, plain);
+
+    // Flip a byte inside the clear MessageHeader (sessionId field) — it's
+    // part of the AAD, so this must also fail auth even though the
+    // ciphertext/tag themselves are untouched.
+    wire[8] ^= 0xFF;
+
+    std::vector<uint8_t> scratch(wire.size());
+    const std::size_t n = rune::gateway::codec::openIngressFrame(
+        f.gw, wire.data(), wire.size(), scratch.data(), scratch.size());
+    EXPECT_EQ(n, 0u);
+    EXPECT_EQ(f.gw.recvSeq, 0u);
+    EXPECT_EQ(f.gw.recvWindow, 0u);
+}
+
+TEST(GatewayCryptoDataPlane, ReplayedSeqDropped) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/11);
+    const auto plain = buildPlainFrame(16, 11, "produce-body");
+    const auto wire = sealFrameAsPeer(*f.clientSend, 1, plain);
+
+    std::vector<uint8_t> scratch(wire.size());
+    const std::size_t n1 = rune::gateway::codec::openIngressFrame(
+        f.gw, wire.data(), wire.size(), scratch.data(), scratch.size());
+    ASSERT_EQ(n1, plain.size());
+    EXPECT_EQ(f.gw.recvSeq, 1u);
+
+    // Resend the EXACT same wire frame — the replay-window check rejects it
+    // read-only, before even attempting to open().
+    const std::size_t n2 = rune::gateway::codec::openIngressFrame(
+        f.gw, wire.data(), wire.size(), scratch.data(), scratch.size());
+    EXPECT_EQ(n2, 0u);
+    // State unchanged by the rejected replay.
+    EXPECT_EQ(f.gw.recvSeq, 1u);
+}
+
+TEST(GatewayCryptoDataPlane, TooOldSeqDropped) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/12);
+    const auto plain = buildPlainFrame(16, 12, "produce-body");
+
+    // Advance the window to seq=100 first.
+    const auto wireAhead = sealFrameAsPeer(*f.clientSend, 100, plain);
+    std::vector<uint8_t> scratch(wireAhead.size());
+    const std::size_t nAhead = rune::gateway::codec::openIngressFrame(
+        f.gw, wireAhead.data(), wireAhead.size(), scratch.data(), scratch.size());
+    ASSERT_EQ(nAhead, plain.size());
+    ASSERT_EQ(f.gw.recvSeq, 100u);
+
+    // seq=1 is now 99 behind the high-water mark (>= 64) — too old, rejected.
+    const auto wireOld = sealFrameAsPeer(*f.clientSend, 1, plain);
+    scratch.assign(wireOld.size(), 0);
+    const std::size_t nOld = rune::gateway::codec::openIngressFrame(
+        f.gw, wireOld.data(), wireOld.size(), scratch.data(), scratch.size());
+    EXPECT_EQ(nOld, 0u);
+    EXPECT_EQ(f.gw.recvSeq, 100u);  // unchanged
+}
+
+TEST(GatewayCryptoDataPlane, WindowNotPoisonedByForgedFrame) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/13);
+    const auto plain = buildPlainFrame(16, 13, "produce-body");
+
+    // Forge: seal with a DIFFERENT (wrong) key claiming seq=5 — simulates an
+    // attacker without the real c2b key guessing/replaying a seq number.
+    // AeadCipher has no public prefix accessor (by design — it's private
+    // key-schedule state), so any 4-byte nonce prefix works here: the test
+    // only needs the wrong key material to make open() fail auth.
+    const uint8_t fakePrefix[cr::kNoncePrefix] = {1, 2, 3, 4};
+    cr::AeadCipher wrongKeyCipher(f.gw.cipher,
+                                  cr::AeadKey{} /* all-zero, != real c2b */,
+                                  fakePrefix);
+    const auto forged = sealFrameAsPeer(wrongKeyCipher, /*seq=*/5, plain);
+
+    std::vector<uint8_t> scratch(forged.size());
+    const std::size_t nForged = rune::gateway::codec::openIngressFrame(
+        f.gw, forged.data(), forged.size(), scratch.data(), scratch.size());
+    EXPECT_EQ(nForged, 0u);  // auth failure
+    // Window must NOT have been poisoned to seq=5 by the forged frame.
+    EXPECT_EQ(f.gw.recvSeq, 0u);
+    EXPECT_EQ(f.gw.recvWindow, 0u);
+
+    // The SAME seq=5, sealed correctly, must still be accepted afterwards —
+    // proof the forged attempt left no trace in the window state.
+    const auto legit = sealFrameAsPeer(*f.clientSend, /*seq=*/5, plain);
+    scratch.assign(legit.size(), 0);
+    const std::size_t nLegit = rune::gateway::codec::openIngressFrame(
+        f.gw, legit.data(), legit.size(), scratch.data(), scratch.size());
+    ASSERT_EQ(nLegit, plain.size());
+    EXPECT_EQ(f.gw.recvSeq, 5u);
+}
+
+// ---------------------------------------------------------------------------
+// RED-evidence toggle (task-8-interfaces.md: "Show RED first ... move the
+// window-commit before auth, or skip the handshake-leg exemption"). This is
+// a LOCAL, deliberately-buggy copy of openIngressFrame's logic — commits the
+// replay window BEFORE checking the AEAD auth result, instead of after — to
+// prove WindowNotPoisonedByForgedFrame actually catches that class of bug.
+// Always `false` in the committed file; see task-8-report.md for the RED run.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr bool kInjectCommitBeforeAuthBug = false;
+
+// Reuses the REAL replayWindowCheck/Commit (rune::gateway::codec::
+// detail_crypto) so this isolates EXACTLY the ordering bug the brief names —
+// the check is identical to the production function; only the COMMIT is
+// moved to before open() instead of after.
+std::size_t openIngressFrameBuggy(GatewayCryptoState& crypto, const uint8_t* wire,
+                                   std::size_t wireLen, uint8_t* scratch,
+                                   std::size_t scratchCap) noexcept {
+    namespace dc = rune::gateway::codec::detail_crypto;
+    constexpr std::size_t kMinWire = rpc::kCryptoHeaderBytes + rune::crypto::kTagSize;
+    if (wireLen < kMinWire || !crypto.recv.has_value()) return 0;
+    const auto subOpt = rpc::CryptoSubHeader::decode(
+        wire + rpc::MessageHeader::ENCODED_SIZE, wireLen - rpc::MessageHeader::ENCODED_SIZE);
+    if (!subOpt) return 0;
+    const uint64_t seq = subOpt->seq;
+
+    if (!dc::replayWindowCheck(crypto.recvSeq, crypto.recvWindow, seq)) return 0;
+
+    // BUG: commit the window before authenticating — a forged seq that
+    // passes the (pre-auth) check now poisons the window even though the
+    // frame is about to be rejected for failing the AEAD tag.
+    dc::replayWindowCommit(crypto.recvSeq, crypto.recvWindow, seq);
+
+    const std::size_t ctLen    = wireLen - rpc::kCryptoHeaderBytes;
+    const std::size_t plainCap = ctLen - rune::crypto::kTagSize;
+    const std::size_t outLen   = rpc::MessageHeader::ENCODED_SIZE + plainCap;
+    if (scratchCap < outLen) return 0;
+    const long plainLen = crypto.recv->open(seq, wire, rpc::kCryptoHeaderBytes,
+                                             wire + rpc::kCryptoHeaderBytes, ctLen,
+                                             scratch + rpc::MessageHeader::ENCODED_SIZE);
+    if (plainLen < 0) return 0;
+    std::memcpy(scratch, wire, rpc::MessageHeader::ENCODED_SIZE);
+    return rpc::MessageHeader::ENCODED_SIZE + static_cast<std::size_t>(plainLen);
+}
+}  // namespace
+
+TEST(GatewayCryptoDataPlane, WindowNotPoisonedByForgedFrame_RedToggle) {
+    if (!kInjectCommitBeforeAuthBug) {
+        GTEST_SKIP() << "RED-evidence toggle off in the committed file (see task-8-report.md)";
+    }
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/14);
+    const auto plain = buildPlainFrame(16, 14, "produce-body");
+
+    const uint8_t fakePrefix[cr::kNoncePrefix] = {1, 2, 3, 4};
+    cr::AeadCipher wrongKeyCipher(f.gw.cipher, cr::AeadKey{}, fakePrefix);
+    const auto forged = sealFrameAsPeer(wrongKeyCipher, /*seq=*/5, plain);
+
+    std::vector<uint8_t> scratch(forged.size());
+    const std::size_t nForged = openIngressFrameBuggy(
+        f.gw, forged.data(), forged.size(), scratch.data(), scratch.size());
+    EXPECT_EQ(nForged, 0u);
+
+    // With the bug, the window was already poisoned to seq=5 — the
+    // legitimate seq=5 frame is now wrongly rejected as a replay.
+    const auto legit = sealFrameAsPeer(*f.clientSend, /*seq=*/5, plain);
+    scratch.assign(legit.size(), 0);
+    const std::size_t nLegit = openIngressFrameBuggy(
+        f.gw, legit.data(), legit.size(), scratch.data(), scratch.size());
+    EXPECT_EQ(nLegit, plain.size()) << "expected to FAIL under the injected bug (RED evidence)";
 }
