@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "rune/node/SchemaRegistry.h"
 #include <rune/codec/Descriptor.h>
+#include <rune/codec/Evolve.h>
 #include <rune/codec/Serialize.h>
 #include <rune/codec/Fingerprint.h>
 using namespace rune::node;
@@ -63,4 +64,82 @@ TEST(SchemaRegistryRegression, NegativeInternalIdDoesNotAdvanceHighWater) {
     const auto* e = reg.byId(kSchemaTopicId);
     ASSERT_NE(e, nullptr);
     EXPECT_EQ(e->topicId, kSchemaTopicId);
+}
+
+// ---------------------------------------------------------------------------
+// Task 9: multi-version registry + per-version fingerprint lookup
+// ---------------------------------------------------------------------------
+
+// The cumulative "evolving" descriptor as it stood right after the v1
+// commit: 3 fields, all live since v1, none retired yet.
+static Descriptor evolvingV1() {
+    return DescriptorBuilder("chars_evo", 1)
+        .addTagged("id",       0, PrimType::Int64, 1, 0xFFFF, false, {})
+        .addTagged("userId",   1, PrimType::Int64, 1, 0xFFFF, true,  {})
+        .addTagged("strength", 2, PrimType::Int32, 1, 0xFFFF, false, {})
+        .build();
+}
+
+// The cumulative "evolving" descriptor as it stood right after the v2
+// commit (an ADD): same 3 original fields, plus a 4th ("level") that only
+// became live at v2.
+static Descriptor evolvingV2() {
+    return DescriptorBuilder("chars_evo", 2)
+        .addTagged("id",       0, PrimType::Int64, 1, 0xFFFF, false, {})
+        .addTagged("userId",   1, PrimType::Int64, 1, 0xFFFF, true,  {})
+        .addTagged("strength", 2, PrimType::Int32, 1, 0xFFFF, false, {})
+        .addTagged("level",    3, PrimType::Int32, 2, 0xFFFF, false, {})
+        .build();
+}
+
+static TopicSchema makeTopicSchema(int32_t topicId, uint16_t version, const Descriptor& evolving) {
+    TopicSchema ts;
+    ts.topicId        = topicId;
+    ts.version        = version;
+    ts.keyField        = "userId";
+    ts.validate        = false;
+    ts.descriptorBlob  = serialize(evolving);
+    ts.nextTag         = static_cast<uint16_t>(evolving.fields.size());
+    ts.compatMode      = 0;
+    return ts;
+}
+
+TEST(SchemaRegistry, KeepsMultipleVersionsAndLooksUpByFingerprint) {
+    rune::node::SchemaRegistry reg;
+    reg.applyRecord(makeTopicSchema(/*topicId=*/1, /*version=*/1, evolvingV1()));
+    reg.applyRecord(makeTopicSchema(1, 2, evolvingV2()));
+
+    ASSERT_NE(reg.byIdVersion(1, 1), nullptr);
+    ASSERT_NE(reg.byIdVersion(1, 2), nullptr);
+    EXPECT_EQ(reg.latest(1)->version, 2);
+
+    // v1's materialized view has 3 live fields; v2's has 4 -> distinct fingerprints.
+    EXPECT_EQ(reg.byIdVersion(1, 1)->descriptor.fields.size(), 3u);
+    EXPECT_EQ(reg.byIdVersion(1, 2)->descriptor.fields.size(), 4u);
+
+    auto fp1 = reg.byIdVersion(1, 1)->fingerprint;
+    EXPECT_EQ(reg.byFingerprint(1, fp1)->version, 1);   // old fingerprint resolves to v1
+
+    auto fp2 = reg.byIdVersion(1, 2)->fingerprint;
+    EXPECT_EQ(reg.byFingerprint(1, fp2)->version, 2);
+    EXPECT_NE(fp1, fp2);
+
+    EXPECT_EQ(reg.nextTagFor(1), 4);
+}
+
+// Regression: a legacy TopicSchema record (serialized before nextTag/compatMode
+// existed) must still deserialize cleanly, defaulting compatMode=BACKWARD and
+// nextTag to the embedded descriptor's field count.
+TEST(SchemaRegistryRegression, LegacyRecordWithoutTrailingFieldsDeserializesWithDefaults) {
+    TopicSchema ts = makeSchema(0x40000002, "legacy", false);
+    auto bytes = ts.serialize();
+    // Strip the trailing (nextTag:u16, compatMode:u8) bytes this build's
+    // serialize() appended, to simulate a pre-Task-9 record on disk.
+    ASSERT_GE(bytes.size(), 3u);
+    bytes.resize(bytes.size() - 3);
+
+    auto back = TopicSchema::deserialize(bytes);
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(back->compatMode, 0);
+    EXPECT_EQ(back->nextTag, 3u);  // makeSchema() builds a 3-field descriptor
 }

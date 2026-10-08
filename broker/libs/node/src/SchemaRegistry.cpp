@@ -1,4 +1,5 @@
 #include "rune/node/SchemaRegistry.h"
+#include <rune/codec/Evolve.h>
 #include <rune/codec/Fingerprint.h>
 #include <rune/codec/Serialize.h>
 #include <algorithm>
@@ -101,6 +102,11 @@ std::vector<uint8_t> TopicSchema::serialize() const {
     writeU32LE(buf, static_cast<uint32_t>(descriptorBlob.size()));
     buf.insert(buf.end(), descriptorBlob.begin(), descriptorBlob.end());
 
+    // [schema-evolution] trailing fields appended after the original layout
+    // (Task 9) — see deserialize() for the legacy-record default behavior.
+    writeU16LE(buf, nextTag);
+    writeU8(buf, compatMode);
+
     return buf;
 }
 
@@ -129,6 +135,27 @@ std::optional<TopicSchema> TopicSchema::deserialize(std::span<const uint8_t> buf
     if (!readU32LE(buf, pos, descLen))         return std::nullopt;
     if (pos + descLen > buf.size())            return std::nullopt;
     ts.descriptorBlob.assign(buf.data() + pos, buf.data() + pos + descLen);
+    pos += descLen;
+
+    // [schema-evolution] trailing (nextTag, compatMode) pair, appended after
+    // the original layout (Task 9). A legacy record (written before these
+    // fields existed) simply has no bytes left here: default compatMode=0
+    // (BACKWARD) and nextTag to the embedded descriptor's field count, so a
+    // migrated single-version topic's next ADD allocates a fresh tag past
+    // every field it already has. If the trailing u16 IS present but the
+    // following u8 is missing, that's genuine truncation, not a legacy
+    // record -- reject it.
+    if (readU16LE(buf, pos, ts.nextTag)) {
+        if (!readU8(buf, pos, ts.compatMode)) return std::nullopt;
+    } else {
+        ts.compatMode = 0;
+        try {
+            const rune::codec::Descriptor d = rune::codec::deserialize(ts.descriptorBlob);
+            ts.nextTag = static_cast<uint16_t>(d.fields.size());
+        } catch (const std::exception&) {
+            ts.nextTag = 0;
+        }
+    }
 
     return ts;
 }
@@ -140,18 +167,33 @@ void SchemaRegistry::applyRecord(const TopicSchema& ts) {
     RegistryEntry e;
     e.topicId        = ts.topicId;
     e.descriptorBlob = ts.descriptorBlob;
-    e.descriptor     = rune::codec::deserialize(ts.descriptorBlob);
-    e.fingerprint    = rune::codec::fingerprint(e.descriptor);
+
+    // `ts.descriptorBlob` carries the cumulative EVOLVING descriptor (every
+    // field ever declared for this topic, live or retired). The stored
+    // registry entry must reflect the live field set *as of ts.version*
+    // (matching offsets/blockLength a record written at that version was
+    // actually encoded with) — a fresh v1 topic's evolving descriptor has
+    // no retired/future fields, so materializeAsOf is an identity there.
+    const rune::codec::Descriptor evolving = rune::codec::deserialize(ts.descriptorBlob);
+    e.descriptor     = rune::codec::materializeAsOf(evolving, ts.version);
+    e.fingerprint    = rune::codec::fingerprintAsOf(evolving, ts.version);
     e.validator      = ts.validate
                          ? std::optional<rune::codec::Validator>(std::in_place, e.descriptor)
                          : std::nullopt;
     e.keyField       = ts.keyField;
     e.version        = ts.version;
     e.partitionCount = ts.partitionCount;
+    e.nextTag        = ts.nextTag;
+    e.compatMode     = ts.compatMode;
 
     const std::string& schemaName = e.descriptor.name;
-    nameToId_[schemaName]  = ts.topicId;
-    byId_[ts.topicId]      = std::move(e);
+    nameToId_[schemaName] = ts.topicId;
+
+    // Keep ALL versions: append (never overwrite) by version, 1-based index.
+    auto& versions = byId_[ts.topicId];
+    const size_t idx = (ts.version > 0) ? static_cast<size_t>(ts.version - 1) : size_t{0};
+    if (idx >= versions.size()) versions.resize(idx + 1);
+    versions[idx] = std::move(e);
 
     // Only genuine runtime ids advance the water mark. The `>= 0` guard keeps
     // negative internal ids (e.g. kSchemaTopicId = -4) from casting to a huge
@@ -164,14 +206,41 @@ void SchemaRegistry::applyRecord(const TopicSchema& ts) {
 }
 
 const RegistryEntry* SchemaRegistry::byId(int32_t topicId) const {
-    const auto it = byId_.find(topicId);
-    return (it != byId_.end()) ? &it->second : nullptr;
+    return latest(topicId);
 }
 
 const RegistryEntry* SchemaRegistry::byName(std::string_view name) const {
     const auto it = nameToId_.find(std::string(name));
     if (it == nameToId_.end()) return nullptr;
-    return byId(it->second);
+    return latest(it->second);
+}
+
+const RegistryEntry* SchemaRegistry::byIdVersion(int32_t topicId, uint16_t version) const {
+    const auto it = byId_.find(topicId);
+    if (it == byId_.end() || version == 0 || version > it->second.size()) return nullptr;
+    const RegistryEntry& e = it->second[version - 1];
+    return (e.topicId == topicId) ? &e : nullptr;  // guards an unfilled gap slot
+}
+
+const RegistryEntry* SchemaRegistry::latest(int32_t topicId) const {
+    const auto it = byId_.find(topicId);
+    if (it == byId_.end() || it->second.empty()) return nullptr;
+    const RegistryEntry& e = it->second.back();
+    return (e.topicId == topicId) ? &e : nullptr;  // guards an unfilled gap slot
+}
+
+const RegistryEntry* SchemaRegistry::byFingerprint(int32_t topicId, uint64_t fp) const {
+    const auto it = byId_.find(topicId);
+    if (it == byId_.end()) return nullptr;
+    for (const auto& e : it->second) {
+        if (e.topicId == topicId && e.fingerprint == fp) return &e;
+    }
+    return nullptr;
+}
+
+uint16_t SchemaRegistry::nextTagFor(int32_t topicId) const {
+    const RegistryEntry* e = latest(topicId);
+    return e ? e->nextTag : 0;
 }
 
 int32_t SchemaRegistry::allocateRuntimeId() {
