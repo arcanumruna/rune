@@ -72,8 +72,9 @@ inline std::size_t encode(uint8_t* buf, std::size_t len, const LeaderlessMark& m
     if (len < kSize) return 0;
     buf[0] = kTag;
     buf[1] = static_cast<uint8_t>(m.kind);
-    std::memcpy(buf + 2, &m.node, 4);          // little-endian hosts only (Rune is all-LE)
-    std::memcpy(buf + 6, &m.incarnation, 8);
+    namespace d = rune::protocol::metadata::detail;   // explicit LE (D15b l3)
+    d::putS32(buf, 2, static_cast<int32_t>(m.node));
+    d::putS64(buf, 6, static_cast<int64_t>(m.incarnation));
     return kSize;
 }
 
@@ -85,8 +86,9 @@ inline LeaderlessMark decode(const uint8_t* buf, std::size_t len) noexcept {
         kind != static_cast<uint8_t>(LeaderlessMark::Kind::LogDirOffline))
         return m;   // unknown kind (a newer binary): ignored
     m.kind = static_cast<LeaderlessMark::Kind>(kind);
-    std::memcpy(&m.node, buf + 2, 4);
-    std::memcpy(&m.incarnation, buf + 6, 8);
+    namespace d = rune::protocol::metadata::detail;
+    m.node        = static_cast<decltype(m.node)>(d::getS32(buf, 2));
+    m.incarnation = static_cast<decltype(m.incarnation)>(d::getS64(buf, 6));
     return m;
 }
 } // namespace leaderless_trailer
