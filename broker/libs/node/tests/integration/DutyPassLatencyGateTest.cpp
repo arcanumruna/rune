@@ -1128,7 +1128,17 @@ Outcome truncationDuringCleanerPass() {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(5);
     rune::replication::ErrorPayloadBuf epb;
     uint64_t i = 0;
-    for (; i < maxPasses && iterations < 12 && std::chrono::steady_clock::now() < deadline; ++i) {
+    // #66 (2026-10-08): a FIXED measured length.  Stopping after N demote ->
+    // diverge -> truncate -> promote cycles made the run length depend on the
+    // code under test (hot-path B's async C1/F7 durability waits stretch each
+    // cycle over 2-4x more passes), and on ext4 the tail grows with run length
+    // — percentiles of runs of different lengths are not comparable.  Run a
+    // fixed number of MEASURED passes (the baseline's former length), and at
+    // least the 3 cycles the truncation preconditions need.
+    const uint64_t measuredTarget = passes(12'000);
+    uint64_t measured = 0;
+    for (; i < maxPasses && (measured < measuredTarget || iterations < 3) &&
+           std::chrono::steady_clock::now() < deadline; ++i) {
         uint32_t extra = 0;
         const bool bLeads = st == St::Leading;
         switch (st) {
@@ -1180,6 +1190,7 @@ Outcome truncationDuringCleanerPass() {
         // counted: it would only dilute the percentiles with empty passes.
         if ((f & ~kTruncPending) != 0) {
             o.stats.add(ns, f, rig.lastSplit);
+            ++measured;
         } else {
             ++idlePasses;
             o.stats.noteIdle(ns, f);
