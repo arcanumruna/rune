@@ -464,6 +464,18 @@ TEST(EmbeddedDriverEpollPoll, InstalledOnlyWhereSupportedAndConfigured) {
     EXPECT_FALSE(stock.epollPollActive()) << "patching one driver's bindings never leaks into another's";
 }
 
+// A7 review L2: epoll-first polling reads Aeron internals — pinned to the verified release.  An Aeron upgrade
+// fails HERE (re-verify rune_driver_wake.c against the new poller / bindings layout, then move the pin); at
+// runtime any other release keeps the stock polling.
+TEST(EmbeddedDriverEpollPoll, AeronIsTheReleaseEpollFirstWasVerifiedAgainst) {
+    EXPECT_TRUE(EmbeddedDriver::epollPollSupportsAeron(aeron_version_major(), aeron_version_minor(),
+                                                       aeron_version_patch()))
+        << "runtime Aeron " << aeron_version_full() << " is not the epoll-first pin";
+    EXPECT_FALSE(EmbeddedDriver::epollPollSupportsAeron(1, 42, 0));
+    EXPECT_FALSE(EmbeddedDriver::epollPollSupportsAeron(1, 41, 5));
+    EXPECT_FALSE(EmbeddedDriver::epollPollSupportsAeron(2, 41, 4));
+}
+
 // Review M2: delivery is unchanged AND the epoll-first branch demonstrably ran (an epoll_wait selected a
 // socket, EmbeddedDriver::epollSelectedForTest) — with rune_gso's bindings and with the stock-bindings copy.
 // The stock arm (epoll-first off) delivers the same and never takes the epoll path below 6 transports.
@@ -623,7 +635,8 @@ bool waitFor(std::chrono::milliseconds limit, Pred&& pred) {
 }
 } // namespace
 
-TEST(EmbeddedDriverWakeRegression, ParkedRunnerProcessesDatagramPromptlyRegression) {
+// A7 re-review LOW-2: coverage (the wake already worked before the C1 fix) — not a regression test.
+TEST(EmbeddedDriverWake, ParkedRunnerProcessesDatagramPromptly) {
 #if !defined(__linux__)
     GTEST_SKIP() << "driver wake fds are Linux-only";
 #else
@@ -674,7 +687,8 @@ TEST(EmbeddedDriverWakeRegression, ParkedRunnerProcessesDatagramPromptlyRegressi
 }
 
 // Review M1/M2: work with NO fd (a cross-thread ring message) reaches a parked runner within the park cap.
-TEST(EmbeddedDriverWakeRegression, ParkedRunnerTakesFdLessWorkWithinTheParkCapRegression) {
+// A7 re-review LOW-2: coverage (the cap held before the fix too) — not a regression test.
+TEST(EmbeddedDriverWake, ParkedRunnerTakesFdLessWorkWithinTheParkCap) {
     TmpDir rd;
     EmbeddedDriver rdrv(cfgAt(rd.path), DriverMode::Invoker);
     auto ra = connect(rd.path, /*invoker=*/true);
@@ -750,10 +764,14 @@ TEST(EmbeddedDriverWakeRegression, PeerDownNeverLeavesWakeFdsReadyAfterAnIdlePas
         const timespec zero{0, 0};
         return ::ppoll(pf, static_cast<nfds_t>(n), &zero, nullptr) > 0;
     };
+    // A7 re-review LOW-1: the positive control — an ICMP error was actually pending at least once (a wake fd
+    // readable between passes: the only readiness these send-only sockets can have).  Without it the quiet-park
+    // assertions below would pass vacuously if setup frames / ICMP stopped (an Aeron upgrade, a sysctl, a route).
+    int pendingSeen = 0;
     for (int round = 0; round < 3; ++round) {
         // Setup frames go out every ~100 ms: pump until an ICMP error is pending (a wake fd readable after a
         // pass) or 350 ms (>= 3 setup frames per publication) have passed.
-        (void)pumpUntilFor(drv, *a, std::chrono::milliseconds(350), wakeReady);
+        if (pumpUntilFor(drv, *a, std::chrono::milliseconds(350), wakeReady)) ++pendingSeen;
         // The next pass that finds no work (no send after its poll) must leave nothing readable behind.
         ASSERT_TRUE(pumpUntilFor(drv, *a, std::chrono::seconds(5), [&] { return drv.doWork() == 0; }));
         rune::node::ParkUntilWorkIdle idle(rune::node::IdleShape{0, 0, 30'000'000, 30'000'000}, fds, n);
@@ -762,6 +780,7 @@ TEST(EmbeddedDriverWakeRegression, PeerDownNeverLeavesWakeFdsReadyAfterAnIdlePas
         EXPECT_GE(msSinceWake(t0), 20) << "round " << round << ": a peer-down error must not end the park";
         EXPECT_EQ(idle.readinessWakes(), 0u) << "round " << round << ": wake fd left ready by an unconsumed EPOLLERR";
     }
+    EXPECT_GE(pendingSeen, 1) << "positive control: no ICMP error was ever pending — the test exercised nothing";
     p1.reset();
     p2.reset();
     a.reset();
