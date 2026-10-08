@@ -235,6 +235,23 @@ public:
         return encodeGetSchema(requestRing_, m);
     }
 
+    // Task 14: AlterTopic (templateId 68) — gateway → admin ring hand-off,
+    // same discipline as submitDefineTopic/submitGetSchema above.
+    bool submitAlterTopic(int64_t sessionId, int64_t correlationId,
+                          std::string_view topicName,
+                          uint16_t expectedVersion,
+                          const uint8_t* opsBlob,
+                          uint32_t opsLen) override {
+        AlterTopicMsg m;
+        m.session         = sessionId;
+        m.corr            = correlationId;
+        m.expectedVersion = expectedVersion;
+        m.topicName.assign(topicName);
+        if (opsBlob && opsLen)
+            m.opsBlob.assign(opsBlob, opsBlob + opsLen);
+        return encodeAlterTopic(requestRing_, m);
+    }
+
     int doWork(int64_t nowNs) noexcept override {
         int work = 0;
 

@@ -42,6 +42,24 @@ struct IAdminRequestSink {
     virtual bool submitGetSchema(int64_t sessionId, int64_t correlationId,
                                  std::string_view name,
                                  uint64_t requestedFingerprint) = 0;
+
+    // AlterTopic (templateId 68) — Task 14: the gateway has decoded the frame
+    // (expectedVersion CAS + the opaque ALTER ops blob) and copies the fields
+    // into the sink, which OWNS the copy; RETURNS IMMEDIATELY (copy-and-return,
+    // same discipline as submitDefineTopic/submitGetSchema — no registry
+    // access, no blocking on the gateway hot path).
+    //
+    // expectedVersion: 0 = unconditional (no CAS); non-zero = the admin thread
+    // rejects with SchemaConflict if the topic's current version differs.
+    // opsBlob: rune::codec::encodeAlterOps() wire bytes (opaque to the gateway).
+    //
+    // Returns true if the request was accepted (enqueued on the admin ring);
+    // false on back-pressure (ring full) — the caller may drop (client retries).
+    virtual bool submitAlterTopic(int64_t sessionId, int64_t correlationId,
+                                  std::string_view topicName,
+                                  uint16_t expectedVersion,
+                                  const uint8_t* opsBlob,
+                                  uint32_t opsLen) = 0;
 };
 
 } // namespace rune::gateway

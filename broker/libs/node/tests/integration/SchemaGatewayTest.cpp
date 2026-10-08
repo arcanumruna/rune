@@ -143,6 +143,16 @@ struct SgHarness {
             m.requestedFingerprint = requestedFingerprint;
             return encodeGetSchema(*ring, m);
         }
+        // Task 14: AlterTopic (68) — mirrors AdminWorkerAgent::submitAlterTopic
+        // (BrokerNode.h), encoding onto the same requestRing.
+        bool submitAlterTopic(int64_t s, int64_t c, std::string_view topicName,
+                              uint16_t expectedVersion,
+                              const uint8_t* opsBlob, uint32_t opsLen) override {
+            AlterTopicMsg m; m.session=s; m.corr=c; m.expectedVersion=expectedVersion;
+            m.topicName.assign(topicName);
+            if (opsBlob && opsLen) m.opsBlob.assign(opsBlob, opsBlob+opsLen);
+            return encodeAlterTopic(*ring, m);
+        }
     } sink;
 
     // Captured egress frames (sessionId, bytes) via onControlFrame_.
@@ -321,6 +331,20 @@ std::vector<uint8_t> encodeDefineFrame(int64_t session, int64_t corr,
     return frame;
 }
 
+// Encode an AlterTopic client frame (Task 14).
+std::vector<uint8_t> encodeAlterFrame(int64_t session, int64_t corr,
+                                      const std::string& name,
+                                      uint16_t expectedVersion,
+                                      const std::vector<uint8_t>& opsBlob) {
+    pc::AlterTopic m;
+    m.sessionId = session; m.correlationId = corr; m.topicName = name;
+    m.expectedVersion = expectedVersion;
+    m.opsBlob = opsBlob.data(); m.opsLen = (uint32_t)opsBlob.size();
+    std::vector<uint8_t> frame(m.encodedSize());
+    m.encode(frame.data());
+    return frame;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -385,6 +409,75 @@ TEST(SchemaGateway, GetTopicSchemaRoundTrip) {
     EXPECT_EQ(resp->correlationId, 7);
     EXPECT_EQ(resp->errorCode, 0u);
     EXPECT_GT(resp->descriptorLen, 0u) << "the descriptor blob must be returned";
+}
+
+// ---------------------------------------------------------------------------
+// SchemaGatewayRegression.AlterTopicRoundTripThroughGatewayRings
+//
+// Task 14: an AlterTopic frame fed through the GATEWAY (not injected directly
+// on the admin ring, unlike Task 13's fingerprint test) must route via
+// handleAlterTopic → IAdminRequestSink::submitAlterTopic → requestRing →
+// AdminWorker, and the AlterTopicResponse (69) must come back on the session
+// egress with the new version.  Mirrors DefineTopicRoundTripThroughRings.
+//
+// define v1 (gateway frame) → ALTER add column "email" (gateway frame) →
+// response newVersion==2 → GetTopicSchema (gateway frame) confirms v2.
+// ---------------------------------------------------------------------------
+TEST(SchemaGatewayRegression, AlterTopicRoundTripThroughGatewayRings) {
+    SgHarness h;
+    auto v1Blob = charsBlob();
+    h.gw.applyDefineTopicForTest(
+        encodeDefineFrame(1, 1, "characters", 4, "userId", false, v1Blob).data(),
+        encodeDefineFrame(1, 1, "characters", 4, "userId", false, v1Blob).size());
+    h.pump();
+
+    ASSERT_NE(h.schemaReg.byName("characters"), nullptr);
+    ASSERT_EQ(h.schemaReg.byName("characters")->version, 1u);
+    h.captured.clear();
+
+    // ALTER through the GATEWAY (not a direct ring injection): proves
+    // handleAlterTopic actually routes the client frame.
+    auto opsBlob = rune::codec::encodeAlterOps({addColumnOp("email", PrimType::String)});
+    auto alterFrame = encodeAlterFrame(/*session=*/1, /*corr=*/42, "characters",
+                                       /*expectedVersion=*/0, opsBlob);
+    h.gw.applyAlterTopicForTest(alterFrame.data(), alterFrame.size());
+    h.pump();
+
+    // 1. The registry committed v2.
+    const RegistryEntry* v2 = h.schemaReg.byName("characters");
+    ASSERT_NE(v2, nullptr);
+    EXPECT_EQ(v2->version, 2u) << "ALTER routed through the gateway must commit v2";
+
+    // 2. An AlterTopicResponse (69) was produced on the session egress with OK
+    //    and the new version.
+    std::optional<pc::AlterTopicResponse> resp;
+    for (auto& [sid, bytes] : h.captured) {
+        auto d = pc::AlterTopicResponse::decode(bytes.data(), bytes.size());
+        if (d) { resp = d; break; }
+    }
+    ASSERT_TRUE(resp.has_value())
+        << "an AlterTopicResponse must be produced on the session egress";
+    EXPECT_EQ(resp->correlationId, 42);
+    EXPECT_EQ(resp->errorCode, 0u) << "ALTER must succeed (OK)";
+    EXPECT_EQ(resp->topicId, 0);
+    EXPECT_EQ(resp->newVersion, 2u);
+
+    h.captured.clear();
+
+    // 3. GetTopicSchema (gateway frame) confirms the latest is v2.
+    pc::GetTopicSchema g; g.sessionId = 1; g.correlationId = 77; g.topicName = "characters";
+    std::vector<uint8_t> gf(g.encodedSize()); g.encode(gf.data());
+    h.gw.applyGetTopicSchemaForTest(gf.data(), gf.size());
+    h.pump();
+
+    std::optional<pc::TopicSchemaResponse> getResp;
+    for (auto& [sid, bytes] : h.captured) {
+        auto d = pc::TopicSchemaResponse::decode(bytes.data(), bytes.size());
+        if (d) { getResp = d; break; }
+    }
+    ASSERT_TRUE(getResp.has_value());
+    EXPECT_EQ(getResp->errorCode, 0u);
+    EXPECT_EQ(getResp->version, 2u) << "GetTopicSchema must confirm v2 after the gateway ALTER";
 }
 
 // ---------------------------------------------------------------------------

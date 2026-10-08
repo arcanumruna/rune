@@ -963,6 +963,10 @@ public:
     void applyGetTopicSchemaForTest(const uint8_t* buf, std::size_t len) {
         handleGetTopicSchema(buf, len);
     }
+    // Task 14: AlterTopic (68) test seam — mirrors applyDefineTopicForTest.
+    void applyAlterTopicForTest(const uint8_t* buf, std::size_t len) {
+        handleAlterTopic(buf, len);
+    }
 
     // -----------------------------------------------------------------------
     // subscriptionIsolationForTest — return the isolation level (0/1) of the
@@ -1271,6 +1275,10 @@ private:
     // decode, copy fields into the sink, RETURN immediately (no hot-path blocking).
     void handleDefineTopic  (const uint8_t* buf, std::size_t len);
     void handleGetTopicSchema(const uint8_t* buf, std::size_t len);
+    // Task 14: AlterTopic (68) — same discipline (decode, copy-and-return onto
+    // the admin sink); the AlterTopicResponse (69) comes back asynchronously
+    // on the session egress via the admin→control egress ring (respondAlter).
+    void handleAlterTopic   (const uint8_t* buf, std::size_t len);
     // GB-3: Push delivery — called from doWork after ingress poll.
     void pushSubscriptions  ();
     // GB-5p2: Group-commit flush — called from doWork() once per cycle AFTER all
