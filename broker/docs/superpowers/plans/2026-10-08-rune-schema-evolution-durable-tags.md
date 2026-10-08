@@ -616,4 +616,17 @@ TEST(OpenTopicGate, StaleFingerprintStillThrows) {
 ## Regression & benchmark coverage (applies across tasks)
 
 - Every bug fixed during execution adds a `*Regression*` test in the owning repo's suite; the full regression suite runs **first** on every change.
-- Benchmarks (add/extend in the owning repo's `benchmark/` dir): `materializeAsOf` + `readField`-by-tag decode cost (O(1), zero-alloc); worker `schemaRejects_` version-select adds no steady-state allocation; `ALTER` latency measured on the AdminWorker (off the produce/consume hot path); produce/consume ABAB regression (n ≥ 15) confirming zero hot-path cost when no DDL is in flight.
+
+### Latency gates (HARD — derived from the view-engine NFRs)
+
+The view engine (downstream) must fold an event batch into a view in **< 10 µs / batch**, serve a single-node `GetViewRow` in **< 50 µs**, and a multi-node query in **< 200 µs** (view-engine spec §14.0). This plan touches the **decode hot path** that sits inside the 10 µs fold budget, so it carries a derived sub-budget that is a pass/fail gate (ABAB, n ≥ 15, report p50 **and** p99; a gate fails if p99 exceeds budget):
+
+| Benchmark | Gate | Owning task |
+|---|---|---|
+| `readField`-by-tag against a materialized per-version descriptor, per record | **≤ 150 ns p99**, zero-alloc | Task 2 |
+| `materializeAsOf` is **not** on the per-record path (computed once per (topic,version), cached) — bench proves it is called O(1) per schema-version install, never per record | no per-record call | Task 2 / Task 12 |
+| Worker `schemaRejects_` version-select (per record) overhead vs the current single-version path | **≤ +5 % / ≤ +50 ns p99**, zero added allocation | Task 12 |
+| Produce/consume steady state with the schema-evolution machinery present but **no DDL in flight** | **0 %** regression vs baseline (ABAB) | Task 12 |
+| `ALTER` end-to-end latency (control-plane) | measured & reported; must be **off** the produce/consume hot path (no effect on the above) — no hard ceiling | Task 11 |
+
+Rationale: the decode path is a slice of the downstream 10 µs fold budget; ~150 ns/record decode leaves ample headroom for project + per-field merge + flat-table upsert to fit under 10 µs for realistic batch sizes. If any decode gate is missed, it is a correctness-of-design failure for the view engine and must be fixed before the view-engine plan starts (fix-on-sight).

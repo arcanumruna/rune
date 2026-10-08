@@ -298,12 +298,24 @@ End-to-end, single source (the join generalization is the §8 gather):
 
 ## 14. Testing & benchmarks (binding — #5, #6, #16)
 
+### 14.0 Latency NFRs (HARD GATES — the reason this engine exists)
+
+These are binding pass/fail budgets, measured firsthand under default config (ABAB, n ≥ 15, report p50 **and** p99; a gate fails if p99 exceeds the budget). They drive the design (flat inline table, O(1) by-tag decode, zero steady-state allocation, shared-nothing fold):
+
+| Path | Budget | Notes |
+|---|---|---|
+| **View update from an event batch** (fold: decode → project → per-field merge → viewTable upsert) | **< 10 µs / batch** | steady state, zero-alloc; off the produce ack path |
+| **Point select spanning a single node** (`GetViewRow`: route → worker point lookup → reply) | **< 50 µs** | end-to-end incl. in-node hop |
+| **Query spanning multiple nodes** | **< 200 µs** | end-to-end incl. cross-node fan-out/gather (query surface; join views) |
+
+The schema-evolution prerequisite's decode path (`readField`-by-tag against a materialized per-version descriptor) is part of the <10µs fold budget — its own plan carries a derived sub-budget so it cannot erode this.
+
 - **Unit:** `mergeField` per rule × type; projection select/rename; tombstone erase; open-addressing table probe/erase/resize; arena spill/compaction.
 - **Fold determinism:** same log prefix → identical table byte-for-byte, across orderings that preserve per-key commit order; leader vs replica table equality at equal offset.
 - **Persistence round-trip:** snapshot → kill → load+replay `[O+1, HW)` → table equals the never-restarted table (time-independent, #16). Crash-mid-write leaves prior complete snapshot usable (CRC fallback). Offset in artifact exactly matches table.
 - **Shared-nothing audit:** no other thread touches a live `viewTable`; worker→IO handoff is ring + immutable snapshot only (extend the existing no-atomics / single-driver checker scripts).
 - **E2E (real Aeron, default config):** define a view over a topic, produce, `GetViewRow`, restart broker, confirm view recovered to latest — firsthand green before "done" (#16), via a `docker/view-engine-e2e.sh` mirroring 0b/0c e2e scripts.
-- **Benchmarks:** fold throughput (records/s, zero-alloc verified), snapshot cut pause (worker memcpy time vs table size), `GetViewRow` p50/p99, produce-path regression (fold off the critical path must not move produce latency — ABAB n≥15, #12).
+- **Benchmarks (gated against §14.0):** fold update latency per event batch **< 10 µs** p99 (zero-alloc verified); `GetViewRow` single-node **< 50 µs** p99; multi-node query **< 200 µs** p99; plus snapshot cut pause (worker memcpy time vs table size) and produce-path regression (fold off the critical path must not move produce latency — ABAB n≥15, #12). A benchmark that exceeds its §14.0 budget is a failing gate, not a note.
 - **Regression suite:** every fix gets a `*Regression*` test; full regression suite runs first on every change (#6/#7).
 
 ## 15. Open decisions for review
