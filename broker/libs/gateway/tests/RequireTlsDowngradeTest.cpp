@@ -33,11 +33,28 @@
 //   6. CertKeyRoundTripsToMakeServer — the broker's cert/key FILE PATH ->
 //      PEM TEXT load (rune::node::loadPemFile) round-trips to a VALID
 //      TlsSession::makeServer(), exactly the ClientGateway ctor's contract.
+//
+// Review fix round 2 (TlsStartupPolicy.h — BrokerNode::buildGateway()'s
+// startup-time validation, factored the same way):
+//   7. ConfiguredButUnloadableCertRefusesStartRegardlessOfRequireTls —
+//      TLS configured (a path is set) but the cert/key didn't both load ->
+//      must refuse to start, whether or not require_tls is set (closes the
+//      fail-open footgun where this only threw when require_tls was ALSO on).
+//   8. OnlyOnePathSetRefusesStart — a partial config (only cert OR only key
+//      path set) counts as "configured" and must refuse to start too.
+//   9. NeitherPathSetProceedsPlaintext — the genuinely-unconfigured case is
+//      unaffected: no refusal, stays plaintext.
+//  10. ValidConfiguredCertDoesNotRefuseStart — the happy path (both load)
+//      must NOT be caught by the new fail-fast check.
+//  11. ShardModeWithRequireTlsRefusesStart — shard mode + require_tls
+//      together can never serve a client (shard refuses crypto, require_tls
+//      refuses plaintext) -> refuse to start rather than brick silently.
 
 #include <gtest/gtest.h>
 
 #include <rune/crypto/TlsSession.h>
 #include <rune/gateway/ConnectDowngradePolicy.h>
+#include <rune/node/TlsStartupPolicy.h>
 #include <rune/node/NodeConfig.h>
 
 #include <cstdio>
@@ -174,4 +191,91 @@ TEST(RequireTlsDowngrade, LoadPemFileFailsClosedOnMissingFile) {
     EXPECT_FALSE(rune::node::loadPemFile("/nonexistent/path/does-not-exist.pem", out));
     EXPECT_TRUE(out.empty()) << "a failed load must clear `out`, never leave stale PEM text that "
                                  "could be mistaken for a loaded cert";
+}
+
+// ---------------------------------------------------------------------------
+// Review fix round 2: BrokerNode::buildGateway()'s startup-time TLS config
+// validation (TlsStartupPolicy.h). Mirrors what buildGateway() itself
+// computes: tlsCertLoaded/tlsKeyLoaded come from a REAL loadPemFile() call
+// (not hand-waved booleans) wherever the scenario calls for it, so these
+// tests exercise the exact same loadPemFile() contract buildGateway() relies
+// on, just without needing a live Aeron client to construct a BrokerNode.
+// ---------------------------------------------------------------------------
+
+TEST(TlsStartupPolicy, ConfiguredButUnloadableCertRefusesStartRegardlessOfRequireTls) {
+    // TLS configured (a cert path is set) but it does not load (missing
+    // file) -> must refuse to start. The function takes no require_tls
+    // parameter at all: the fix's whole point is that this refusal does NOT
+    // depend on require_tls (previously it only threw when require_tls was
+    // ALSO set; with require_tls off it used to log-and-degrade instead).
+    std::string certOut, keyOut;
+    const bool certLoaded = rune::node::loadPemFile("/nonexistent/cert.pem", certOut);
+    const bool keyLoaded  = rune::node::loadPemFile("/nonexistent/key.pem", keyOut);
+    ASSERT_FALSE(certLoaded);
+    ASSERT_FALSE(keyLoaded);
+
+    const bool configured = rune::node::tlsConfigured("/nonexistent/cert.pem", "/nonexistent/key.pem");
+    ASSERT_TRUE(configured);
+    EXPECT_TRUE(rune::node::mustRefuseStartForUnloadableTls(configured, certLoaded, keyLoaded));
+}
+
+TEST(TlsStartupPolicy, OnlyOnePathSetRefusesStart) {
+    const std::string serverPem = slurp(testdataPath("server.pem"));
+    ASSERT_FALSE(serverPem.empty());
+    TempPemFile certFile(serverPem);
+
+    std::string certOut, keyOut;
+    const bool certLoaded = rune::node::loadPemFile(certFile.path(), certOut);
+    const bool keyLoaded  = rune::node::loadPemFile("", keyOut);  // RUNE_TLS_KEY_FILE never set
+    ASSERT_TRUE(certLoaded);
+    ASSERT_FALSE(keyLoaded);
+
+    // A partial config still counts as "configured" -> must refuse to start,
+    // even though the one path that WAS set loaded a perfectly valid cert.
+    const bool configured = rune::node::tlsConfigured(certFile.path(), "");
+    ASSERT_TRUE(configured);
+    EXPECT_TRUE(rune::node::mustRefuseStartForUnloadableTls(configured, certLoaded, keyLoaded));
+}
+
+TEST(TlsStartupPolicy, NeitherPathSetProceedsPlaintext) {
+    // The genuinely-unconfigured case (today's default) is unaffected by
+    // this fix: no paths set -> not configured -> no refusal, plaintext.
+    std::string certOut, keyOut;
+    const bool certLoaded = rune::node::loadPemFile("", certOut);
+    const bool keyLoaded  = rune::node::loadPemFile("", keyOut);
+    const bool configured = rune::node::tlsConfigured("", "");
+    EXPECT_FALSE(configured);
+    EXPECT_FALSE(rune::node::mustRefuseStartForUnloadableTls(configured, certLoaded, keyLoaded));
+}
+
+TEST(TlsStartupPolicy, ValidConfiguredCertDoesNotRefuseStart) {
+    // The happy path: both paths set, both load -> must NOT be caught by the
+    // new fail-fast check (it must not regress the working configuration).
+    const std::string serverPem = slurp(testdataPath("server.pem"));
+    const std::string serverKey = slurp(testdataPath("server.key"));
+    ASSERT_FALSE(serverPem.empty());
+    ASSERT_FALSE(serverKey.empty());
+    TempPemFile certFile(serverPem);
+    TempPemFile keyFile(serverKey);
+
+    std::string certOut, keyOut;
+    const bool certLoaded = rune::node::loadPemFile(certFile.path(), certOut);
+    const bool keyLoaded  = rune::node::loadPemFile(keyFile.path(), keyOut);
+    ASSERT_TRUE(certLoaded);
+    ASSERT_TRUE(keyLoaded);
+
+    const bool configured = rune::node::tlsConfigured(certFile.path(), keyFile.path());
+    ASSERT_TRUE(configured);
+    EXPECT_FALSE(rune::node::mustRefuseStartForUnloadableTls(configured, certLoaded, keyLoaded));
+}
+
+TEST(TlsStartupPolicy, ShardModeWithRequireTlsRefusesStart) {
+    // Shard mode + require_tls together can never serve a client (shard
+    // mode refuses every crypto offer; require_tls refuses every plaintext
+    // fallback) -> refuse to start rather than brick silently per-Connect.
+    EXPECT_TRUE(rune::node::mustRefuseShardWithRequireTls(/*shardMode=*/true, /*requireTls=*/true));
+    // Either flag alone is fine.
+    EXPECT_FALSE(rune::node::mustRefuseShardWithRequireTls(/*shardMode=*/true, /*requireTls=*/false));
+    EXPECT_FALSE(rune::node::mustRefuseShardWithRequireTls(/*shardMode=*/false, /*requireTls=*/true));
+    EXPECT_FALSE(rune::node::mustRefuseShardWithRequireTls(/*shardMode=*/false, /*requireTls=*/false));
 }

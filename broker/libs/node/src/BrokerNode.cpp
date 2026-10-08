@@ -1,6 +1,7 @@
 #include <rune/node/BrokerNode.h>
 #include <rune/node/HostDefaults.h>
 #include <rune/node/ThreadAffinity.h>
+#include <rune/node/TlsStartupPolicy.h>
 #include <rune/replication/ReplicationFrameLimits.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/RoleCounter.h>
@@ -1806,31 +1807,54 @@ void BrokerNode::buildGateway() {
     // Task 9 (RUNE_TLS): load the broker's TLS cert/key PEM TEXT from the
     // configured file paths now, at construction, exactly once — the
     // ClientGateway ctor wants PEM text, never a path (Task 7's contract).
-    // Both empty (no RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE, or a RUNE_TLS=OFF
-    // build where the fields are never populated — see NodeConfig.cpp) =
-    // crypto disabled, byte-identical to pre-Task-7/9 behaviour.  A
-    // configured-but-unreadable file degrades to crypto-disabled (logged),
-    // same fail-open-to-plaintext-on-local-misconfig contract the gateway's
-    // handleConnect already applies to a bad in-process TlsSession init.
+    // Both paths empty (no RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE, or a
+    // RUNE_TLS=OFF build where the fields are never populated — see
+    // NodeConfig.cpp) = crypto disabled, byte-identical to pre-Task-7/9
+    // behaviour.
+    //
+    // Review fix round 2 (Important): a configured-but-unreadable cert used
+    // to log and silently clear to plaintext whenever require_tls was off —
+    // a fail-open footgun.  rune::node::mustRefuseStartForUnloadableTls
+    // (TlsStartupPolicy.h) now refuses to start whenever TLS was configured
+    // at all (either path non-empty — including a PARTIAL config, only one
+    // of the two paths set) but didn't both load — independent of
+    // require_tls.  Only when NEITHER path is set does the broker proceed
+    // plaintext (TLS genuinely not configured).
     std::string tlsCertPem, tlsKeyPem;
-    if (!config_.tlsCertFile.empty() && !config_.tlsKeyFile.empty()) {
-        const bool certOk = rune::node::loadPemFile(config_.tlsCertFile, tlsCertPem);
-        const bool keyOk  = rune::node::loadPemFile(config_.tlsKeyFile, tlsKeyPem);
-        if (!certOk || !keyOk) {
-            spdlog::error("BrokerNode[{}]: RUNE_TLS configured but cert/key could not be read "
-                          "({} / {}) — starting with TLS DISABLED (plaintext only)",
-                          nodeId, config_.tlsCertFile, config_.tlsKeyFile);
-            tlsCertPem.clear();
-            tlsKeyPem.clear();
-        }
+    const bool tlsCertLoaded   = rune::node::loadPemFile(config_.tlsCertFile, tlsCertPem);
+    const bool tlsKeyLoaded    = rune::node::loadPemFile(config_.tlsKeyFile, tlsKeyPem);
+    const bool tlsIsConfigured = rune::node::tlsConfigured(config_.tlsCertFile, config_.tlsKeyFile);
+    if (rune::node::mustRefuseStartForUnloadableTls(tlsIsConfigured, tlsCertLoaded, tlsKeyLoaded)) {
+        throw std::runtime_error(
+            "BrokerNode[" + std::to_string(nodeId) + "]: TLS is configured (RUNE_TLS_CERT_FILE='" +
+            config_.tlsCertFile + "', RUNE_TLS_KEY_FILE='" + config_.tlsKeyFile +
+            "') but could not be fully loaded (cert loaded=" + (tlsCertLoaded ? "yes" : "no") +
+            ", key loaded=" + (tlsKeyLoaded ? "yes" : "no") +
+            ") — refusing to start rather than silently degrade to plaintext");
     }
     if (config_.requireTls && (tlsCertPem.empty() || tlsKeyPem.empty())) {
         // require_tls with no usable cert would hard-reject every Connect
         // (never a silent plaintext fleet) — refuse to start instead of
-        // bricking the broker at runtime on the first client connect.
+        // bricking the broker at runtime on the first client connect.  The
+        // check above already covers "TLS configured but unloadable"; this
+        // one remains for "require_tls set but TLS not configured at all"
+        // (both paths empty).
         throw std::runtime_error("BrokerNode: RUNE_REQUIRE_TLS is set but no usable TLS cert/key "
                                   "was loaded (RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE) — refusing to "
                                   "start (every Connect would be rejected)");
+    }
+    // Review fix round 2 (Minor, pairs with the above): shard mode can never
+    // serve an encrypted session (Worker.h's per-worker Records egress
+    // stays plaintext until Task 14) — shard mode + require_tls together
+    // would reject EVERY Connect (shard refuses the crypto offer,
+    // require_tls refuses the plaintext fallback): a broker that starts but
+    // can never serve a client.  Fail loud at startup instead.
+    if (rune::node::mustRefuseShardWithRequireTls(config_.shardMode(), config_.requireTls)) {
+        throw std::runtime_error(
+            "BrokerNode[" + std::to_string(nodeId) + "]: shard mode + RUNE_REQUIRE_TLS together "
+            "cannot serve any client (per-worker Records egress stays plaintext until Task 14 — "
+            "shard mode refuses every crypto offer, require_tls refuses every plaintext "
+            "fallback) — refusing to start");
     }
 
     // Build the gateway (subscribes on clientChannel).
