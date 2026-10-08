@@ -568,6 +568,14 @@ public:
     /// equivalent) throws the same "stale generated type" error as an exact
     /// descriptor mismatch did before Task 18 added fingerprint selection.
     ///
+    /// Belt-and-suspenders (consistency with TypedTopic::fromSchema, which
+    /// still performs this check on its own completion path): even on a
+    /// broker Ok, re-verify client-side that the returned descriptor's
+    /// fingerprint actually equals T::kFingerprint before binding.  This is
+    /// a cold path (one-time at open) — not a zero-alloc/hot-path concern —
+    /// so a broker mis-selection can never silently bind a typed client to
+    /// the wrong shape.
+    ///
     /// No thread is spawned (the old async-task continuation is gone); the
     /// per-topic schema cache is written by the duty thread when it handles
     /// the response.
@@ -576,6 +584,9 @@ public:
                                                  std::chrono::nanoseconds timeout = kDefaultWaitTimeout) {
         TopicSchemaResult r = getTopicSchemaAndWait(name, T::kFingerprint, timeout);
         if (r.errorCode != 0) {
+            throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
+        }
+        if (!schemaMatches(T::kFingerprint, std::span<const uint8_t>(r.descriptorBlob))) {
             throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
         }
         return TypedTopic<T>(producer(), r.topicId, r.version);

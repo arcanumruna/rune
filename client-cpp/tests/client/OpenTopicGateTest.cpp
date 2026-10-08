@@ -586,6 +586,41 @@ TEST(OpenTopicGate, StaleFingerprintStillThrows) {
 }
 
 // ===========================================================================
+// Regression: a broker that answers Ok (errorCode 0) to a fingerprint-
+// selecting GetTopicSchema but hands back a descriptor blob whose ACTUAL
+// fingerprint does not equal T::kFingerprint (a broker mis-selection bug —
+// e.g. a lookup-table off-by-one landing on the wrong version) must still be
+// caught client-side: openTopicAndWait must never bind a typed client to the
+// wrong shape just because the broker said Ok.  This is the client-side
+// re-check restored for consistency with TypedTopic::fromSchema, which has
+// always performed it on its own completion path.
+// ===========================================================================
+TEST(OpenTopicGate, BrokerMisselectedBlobStillThrowsRegression) {
+    GateHarness h(1310, 1311);
+    h.build();
+    h.connectAndWait();
+
+    // "Latest" is v2.
+    h.gw->getTopicId   = 0x40000002;
+    h.gw->getVersion   = 2;
+    h.gw->getBlob      = serialize(makeCharsV2Descriptor());
+    h.gw->getErrorCode = 0;
+
+    // Simulate a broker mis-selection: it answers StubV1's fingerprint
+    // request with errorCode 0 (success) and version=1, but the blob it
+    // actually sends back is v2's descriptor — whose fingerprint does NOT
+    // match StubV1::kFingerprint.
+    h.gw->fingerprintOverrides[StubV1::kFingerprint] = GateGateway::FingerprintOverride{
+        /*topicId=*/0x40000001, /*version=*/1, serialize(makeCharsV2Descriptor())};
+
+    GateGatewayPump pump(*h.gw);
+    EXPECT_THROW((void)h.client->openTopicAndWait<StubV1>("characters"), std::runtime_error)
+        << "openTopicAndWait must throw when the broker's Ok response carries "
+           "a blob whose fingerprint doesn't match T::kFingerprint, even "
+           "though errorCode==0";
+}
+
+// ===========================================================================
 // Regression: the version stamp always reflects the bound version, never the
 // codegen-baked kVersion — pinned with a version that is NOT 1 so a test that
 // accidentally asserted the baked version instead would fail loudly.
