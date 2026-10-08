@@ -811,3 +811,63 @@ TEST(GatewayProduceCreditRegression, CreditsAndCloseAreAttributedPerWorkerWithTw
     EXPECT_EQ(gw.produceInFlightForTest(b), 0);
     EXPECT_EQ(gw.produceCreditUnderflowsForTest(), 1u);
 }
+
+// D10-L (egress-pub-lifetime review LOW-4, lows batch C): retire-on-ack with a REAL record-egress publication that
+// the worker actually PUSHES Records through (the gateway rig used an inert fake whose push never sent).  The pub
+// carries pushes while the session lives and after its close until the worker executes the release; it is destroyed
+// only on the worker's acknowledgement; after the release the worker never references it again (later appends to
+// the partition push nothing more to it) — no write through a released publication.
+TEST(RecordEgressLifetimeRealPubRegression, PushesThroughARealPubUntilTheReleaseThenNever) {
+    Rig r(/*withAcks=*/true);
+    ASSERT_TRUE(r.egB);
+    r.gw.setPerWorkerEgressActive(true);
+    constexpr int32_t kRecStream = 7700;
+    const int64_t subReg = r.client->addSubscription("aeron:ipc", kRecStream);
+    const int64_t pubReg = r.client->addExclusivePublication("aeron:ipc", kRecStream);
+    std::shared_ptr<aeron::Subscription> recSub;
+    std::shared_ptr<aeron::ExclusivePublication> pub;
+    for (int i = 0; i < kCap && !(recSub && pub && pub->isConnected()); ++i) {
+        r.pump();
+        if (!recSub) recSub = r.client->findSubscription(subReg);
+        if (!pub) pub = r.client->findExclusivePublication(pubReg);
+    }
+    ASSERT_TRUE(recSub && pub && pub->isConnected());
+    int records = 0;
+    auto pollRecords = [&] {
+        recSub->poll([&](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l, aeron::Header&) {
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + o);
+            if (auto h = pc::MessageHeader::decode(p, static_cast<std::size_t>(l));
+                h && h->templateId == static_cast<uint16_t>(pc::TemplateId::Records)) ++records;
+        }, 64);
+    };
+    const int64_t sid = r.session(kEgressA), b = r.session(kEgressB);
+    std::weak_ptr<aeron::ExclusivePublication> probe = pub;
+    r.gw.injectRecordEgressForTest(sid, 0, std::move(pub));          // the gateway now owns the only reference
+    auto produceFromB = [&](int64_t corr) {
+        std::vector<std::vector<uint8_t>> f{produceFrame(b, corr, 0)};
+        ASSERT_EQ(r.gw.controlledPollFramesForTest(f), 1u);
+        for (int i = 0; i < 2'000 && !r.acks.count(corr); ++i) r.runWorker();
+        ASSERT_EQ(r.acks.count(corr), 1u);
+    };
+    produceFromB(1);
+    pc::Subscribe s;
+    s.sessionId = sid; s.correlationId = 77; s.topicId = 0; s.partition = 0; s.partitionKnown = 1;
+    s.fromOffset = 0; s.isolation = 0;
+    std::vector<uint8_t> sf(s.encodedSize());
+    sf.resize(s.encode(sf.data()));
+    r.gw.applySubscribeForTest(sf.data(), sf.size());
+    for (int i = 0; i < 2'000 && records == 0; ++i) { r.runWorker(); pollRecords(); }
+    ASSERT_GT(records, 0) << "the worker pushes Records through the session's real record-egress pub";
+
+    r.gw.closeSessionForTest(sid);                                   // retire: kept alive for the worker
+    EXPECT_FALSE(probe.expired()) << "destroyed before the worker released it";
+    for (int i = 0; i < 64 && !probe.expired(); ++i) { r.runWorker(); pollRecords(); }
+    EXPECT_TRUE(probe.expired()) << "destroyed on the worker's acknowledgement (no leak)";
+    EXPECT_EQ(r.gw.retiringRecordEgressCountForTest(), 0u);
+    for (const auto& ws : r.w().subscriptionsForTest())
+        EXPECT_NE(ws.sessionId, sid) << "a cursor of the closed session outlived the release";
+    const int before = records;
+    produceFromB(2);                                                 // new data on the partition
+    for (int i = 0; i < 64; ++i) { r.runWorker(); pollRecords(); }
+    EXPECT_EQ(records, before) << "nothing is pushed for the closed session after its release";
+}
