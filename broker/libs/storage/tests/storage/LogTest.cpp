@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+#include <csignal>
+#include <sys/resource.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 #include <filesystem>
@@ -2765,4 +2767,48 @@ TEST(LogRegression, FailedLogStartCheckpointNeverRenamesAndFailsTheLogRegression
     EXPECT_FALSE(std::filesystem::exists(segFile(dir, 0, ".log")));
     EXPECT_TRUE(log.fileOpsQuiescent());
     std::filesystem::remove_all(dir);
+}
+
+// E1 low (backlog): the fault seam above injects BEFORE the syscall.  This drives a REAL short / failed
+// write through the kernel: RLIMIT_FSIZE (SIGXFSZ ignored -> write/pwritev return EFBIG or write
+// short).  In a forked child (the limit is per process).  Every append path must end sticky-failed with
+// the kernel's errno — never a torn "healthy" log, never a crash.
+TEST(LogWriteFailStopRegression, RealKernelShortWriteIsFailStopRegression) {
+    for (int path = 0; path < 3; ++path) {
+        auto dir = makeTempDir("rune_log_e1_fsize");
+        std::filesystem::create_directories(dir);
+        auto child = [&] {
+            std::signal(SIGXFSZ, SIG_IGN);
+            Log log(dir.string(), 64LL * 1024 * 1024); log.recover();
+            const auto ok = e1Batch(0);
+            log.appendNoSync(ok.data(), ok.size(), 0);
+            const auto active = std::filesystem::path(dir) / "00000000000000000000.log";
+            const auto have = static_cast<rlim_t>(std::filesystem::file_size(active));
+            rlimit lim{have + 4096, have + 4096};            // room for a few batches, then EFBIG
+            if (::setrlimit(RLIMIT_FSIZE, &lim) != 0) std::_Exit(10);
+            int64_t next = 1, base = -1;
+            int err = 0;
+            for (int i = 0; i < 100'000 && err == 0; ++i) {
+                const auto b = e1Batch(next);
+                try {
+                    if (path == 0) log.appendNoSync(b.data(), b.size(), next);
+                    else if (path == 1) log.appendNoSyncRestamp(b.data(), b.size(), 0, base);
+                    else log.append(b, next);
+                    ++next;
+                } catch (const std::system_error& e) {
+                    err = e.code().value();
+                } catch (...) {
+                    std::_Exit(11);                           // anything but system_error
+                }
+            }
+            if (err == 0) std::_Exit(12);                     // the limit never bit
+            if (!log.storageFailed()) std::_Exit(13);         // not fail-stop
+            if (log.logEndOffset() != next) std::_Exit(14);   // the failed batch is part of the log
+            try { const auto b = e1Batch(next); log.appendNoSync(b.data(), b.size(), next); std::_Exit(15); }
+            catch (const std::system_error&) {}               // sticky
+            std::_Exit(err == EFBIG || err == ENOSPC || err == EIO ? 0 : 16);
+        };
+        EXPECT_EXIT(child(), ::testing::ExitedWithCode(0), "") << "append path " << path;
+        std::filesystem::remove_all(dir);
+    }
 }
