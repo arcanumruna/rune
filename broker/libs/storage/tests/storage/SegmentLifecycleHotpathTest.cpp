@@ -31,6 +31,7 @@
 #include <fstream>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 #include <unistd.h>
 
@@ -296,7 +297,7 @@ TEST(SegmentLifecycleRegression, RollAndRetentionPublishSnapshotInConstantTimeRe
         const uint64_t rebuilds0 = log.snapshotRebuildsForTest();
         int64_t off = 0;
         while (log.segmentBaseOffsets().size() < 40) off = put(log, off, 5000 + off);
-        const auto held = log.sealedSegmentSnapshot();
+        const auto held = log.ownerSealedSnapshot();
         const std::vector<SegInfo> heldCopy(held->begin(), held->end());
         // Roll across several chunk boundaries and header-pool directories.
         const std::size_t target = 3 * kSnapChunkEntries + 50;
@@ -307,7 +308,7 @@ TEST(SegmentLifecycleRegression, RollAndRetentionPublishSnapshotInConstantTimeRe
         for (std::size_t i = 0; i < heldCopy.size(); ++i) EXPECT_EQ((*held)[i], heldCopy[i]) << i;
         // Retention: drop a prefix — O(1) (no rebuild).
         const auto bases = log.segmentBaseOffsets();
-        const auto snap = log.sealedSegmentSnapshot();
+        const auto snap = log.ownerSealedSnapshot();
         const std::size_t kDrop = target / 2;   // spans whole chunks
         std::size_t next = 0;
         int dropped = 0;
@@ -337,7 +338,7 @@ TEST(SegmentLifecycleRegression, TruncationRebuildsOnlyTheSnapshotTailRegression
         log.recover();
         int64_t off = 0;
         while (log.segmentBaseOffsets().size() < 2 * kSnapChunkEntries + 30) off = put(log, off);
-        const auto before = log.sealedSegmentSnapshot();
+        const auto before = log.ownerSealedSnapshot();
         const std::vector<SegInfo> beforeCopy(before->begin(), before->end());
         const auto bases = log.segmentBaseOffsets();
         const int64_t cut = bases[bases.size() - 6] + 1;   // into a late segment
@@ -375,7 +376,7 @@ TEST(SegmentLifecycleRegression, SnapshotMatchesSegmentsUnderRandomOpsRegression
                 off = put(log, off, 1000 + off);
             } else if (op < 88) {
                 const auto bases = log.segmentBaseOffsets();
-                const auto snap = log.sealedSegmentSnapshot();
+                const auto snap = log.ownerSealedSnapshot();
                 if (bases.size() > 3) {
                     const std::size_t k = 1 + rng() % 3;
                     for (std::size_t i = 0; i < k && i < snap->size(); ++i)
@@ -396,7 +397,7 @@ TEST(SegmentLifecycleRegression, SnapshotMatchesSegmentsUnderRandomOpsRegression
             (void)log.runCleanerFileOps(0, 0);
             ASSERT_TRUE(log.snapshotMatchesSegmentsForTest()) << "step " << step << " op " << op;
             if (step % 50 == 0) {
-                auto s = log.sealedSegmentSnapshot();
+                auto s = log.ownerSealedSnapshot();
                 held.emplace_back(s, std::vector<SegInfo>(s->begin(), s->end()));
             }
         }
@@ -446,7 +447,7 @@ TEST(SegmentLifecycleRegression, FullRenameRingDefersRollNeverDropsRenameRegress
         EXPECT_EQ(countSuffix(dir, ".stlog"), log.readyCountForTest()) << "only never-adopted ready segments";
         EXPECT_EQ(countSuffix(dir, ".log"), log.segmentBaseOffsets().size());
         // Retention can drop every sealed segment (none stuck pathPending).
-        const auto snap = log.sealedSegmentSnapshot();
+        const auto snap = log.ownerSealedSnapshot();
         std::size_t next = 0;
         int dropped = 0;
         for (int guard = 0; next < snap->size() && guard < 100000; ++guard) {
@@ -496,7 +497,7 @@ TEST(SegmentLifecycleRegression, SteadyStateRollAllocatesNothingOnOwnerRegressio
             tCount = true;
             (void)log.drainStagingRenamesDone();
             tCount = false;
-            const auto snap = log.sealedSegmentSnapshot();
+            const auto snap = log.ownerSealedSnapshot();
             if (snap->size() > 8) {
                 (void)log.enqueueDeletedSegment((*snap)[0].baseOffset, (*snap)[0].lineage);
                 tCount = true;
@@ -1105,4 +1106,37 @@ TEST(SegmentLifecycleRegression, SealedSegmentBeyondItsMapPostsNoGrowthRequestRe
         EXPECT_EQ(ch.ring().pendingBytes(), queued0) << "a growth request was posted for a sealed segment";
     }
     fs::remove_all(dir);
+}
+
+// D22: the sealed snapshot crosses owner → cleaner through a lock-free
+// latest-value triple buffer (was std::atomic_store/load on a shared_ptr — a
+// hidden libstdc++ mutex pool on the owner's roll; scripts/check_no_atomics.py
+// now rejects those).  The one consumer only ever sees whole published
+// snapshots, never older than one it already saw, and finally the latest.
+TEST(SegmentLifecycleHotpathRegression, CleanerSnapshotTripleBufferCrossThreadRegression) {
+    const fs::path d = freshDir("d22_mailbox");
+    Log log(d.string(), 1024);   // ~1 roll every few single-record batches
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> seen{0}, regressions{0};
+    std::thread cleaner([&] {
+        std::size_t last = 0;
+        while (!stop.load(std::memory_order_acquire)) {
+            const auto s = log.cleanerSnapshot();
+            if (!s) { regressions.fetch_add(1); continue; }
+            if (s->size() < last) regressions.fetch_add(1);
+            last = s->size();
+            seen.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    int64_t off = 0;
+    for (int i = 0; i < 4000; ++i) off = put(log, off);
+    stop.store(true, std::memory_order_release);
+    cleaner.join();
+    EXPECT_EQ(regressions.load(), 0u) << "the cleaner saw a null or OLDER snapshot";
+    EXPECT_GT(seen.load(), 0u);
+    const auto owner = log.ownerSealedSnapshot();
+    ASSERT_GT(owner->size(), 10u) << "precondition: many rolls";
+    const auto fin = log.cleanerSnapshot();   // the cleaner is quiescent: this thread is now its consumer
+    EXPECT_EQ(fin.get(), owner.get()) << "the cleaner never receives the latest publish";
+    fs::remove_all(d);
 }

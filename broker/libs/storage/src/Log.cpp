@@ -399,7 +399,12 @@ void Log::publishSnapshotView_() {
     SealedSegmentSnapshot& h = snapDir_->headers[snapHeadersUsed_++];
     h = SealedSegmentSnapshot(snapDir_.get(), snapBegin_, snapEnd_ - snapBegin_);
     // Aliasing shared_ptr: shares the directory's control block — no allocation.
-    std::atomic_store(&sealedSnapshot_, std::shared_ptr<const SealedSegmentSnapshot>(snapDir_, &h));
+    ownerSnap_ = std::shared_ptr<const SealedSegmentSnapshot>(snapDir_, &h);
+    // D22: hand it to the cleaner through the triple buffer (no lock).
+    snapSlot_[snapBack_] = ownerSnap_;
+    const uint8_t mine = static_cast<uint8_t>(snapBack_ + kSnapFresh);   // index + fresh bit
+    const uint8_t prev = snapMiddle_.exchange(mine, std::memory_order_acq_rel);
+    snapBack_ = static_cast<uint8_t>(prev & kSnapIndex);
 }
 
 void Log::snapshotAppendSealed_(SegMap::iterator sealed) {
@@ -527,7 +532,7 @@ void Log::publishSealedSnapshotFrom_(int64_t fromBase) {
 }
 
 bool Log::snapshotMatchesSegmentsForTest() const {
-    const auto snap = sealedSegmentSnapshot();
+    const auto snap = ownerSealedSnapshot();
     const std::size_t n = segments_.size() > 1 ? segments_.size() - 1 : 0;
     if (!snap || snap->size() != n) return false;
     std::size_t i = 0;
@@ -1250,7 +1255,7 @@ int64_t Log::recover() {
     // Publish sealed snapshot so the LogCleanerAgent can see pre-existing
     // sealed segments immediately after recovery (without waiting for the first
     // new append to trigger maybeRoll()).  Without this, the cleaner skips the
-    // log on the first doWork() call after a restart (sealedSegmentSnapshot()
+    // log on the first doWork() call after a restart (ownerSealedSnapshot()
     // returns nullptr → candidate selection skips this replica) and the
     // persisted checkpoint is never loaded via ensureCheckpoint().
     // CP-5.1: recoveryMaxTimestamps_ is consumed (and cleared) by this call.

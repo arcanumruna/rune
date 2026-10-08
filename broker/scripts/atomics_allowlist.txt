@@ -75,7 +75,6 @@ libs/node/include/rune/node/LogCleanerAgent.h | [[nodiscard]] uint64_t cyclesDon
 libs/node/include/rune/node/LogCleanerAgent.h | struct CycleDone { LogCleanerAgent& a; ~CycleDone() { a.cyclesDone_.fetch_add(1, std::memory_order_release); } } cycleDone{*this}; | 1 | CLEANER | D25 cleaner cycle counter (tests wait on cleaner progress, not sleeps)
 libs/node/include/rune/node/LogCleanerAgent.h | std::atomic<uint64_t> cyclesDone_{0}; | 1 | CLEANER | D25 cleaner cycle counter (tests wait on cleaner progress, not sleeps)
 libs/storage/include/rune/storage/Log.h | #include <atomic> | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
-libs/storage/include/rune/storage/Log.h | return std::atomic_load(&sealedSnapshot_); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
 libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> swapHead_{0}; | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
 libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> swapTail_{0}; | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
 libs/storage/include/rune/storage/Log.h | alignas(64) std::atomic<std::size_t> deleteHead_{0}; | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
@@ -203,4 +202,7 @@ libs/storage/include/rune/storage/Log.h | return renameReqTail_.load(std::memory
 libs/storage/src/Log.cpp | const std::size_t reqHead = renameReqHead_.load(std::memory_order_acquire); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
 libs/storage/src/Log.cpp | const std::size_t reqTail = renameReqTail_.load(std::memory_order_relaxed); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
 libs/storage/src/Log.cpp | if (count > 0) renameReqHead_.store(i, std::memory_order_release); | 1 | UNSCOPED | Log rename ring / pre-provisioning hand-off: slice B converts to SpscRing / ring hand-off
-libs/storage/src/Log.cpp | std::atomic_store(&sealedSnapshot_, std::shared_ptr<const SealedSegmentSnapshot>(snapDir_, &h)); | 1 | CLEANER | Log cleaner channel (swap/delete rings, sealed-segment snapshot)
+libs/storage/include/rune/storage/Log.h | alignas(64) mutable std::atomic<uint8_t> snapMiddle_{1}; | 1 | CLEANER | Log cleaner channel: sealed-snapshot latest-value triple buffer (D22, replaced the mutex-backed shared_ptr atomic_store/load)
+libs/storage/include/rune/storage/Log.h | const uint8_t prev = snapMiddle_.exchange(snapFront_, std::memory_order_acq_rel); | 1 | CLEANER | Log cleaner channel: sealed-snapshot latest-value triple buffer (D22, replaced the mutex-backed shared_ptr atomic_store/load)
+libs/storage/include/rune/storage/Log.h | if (snapMiddle_.load(std::memory_order_relaxed) & kSnapFresh) { | 1 | CLEANER | Log cleaner channel: sealed-snapshot latest-value triple buffer (D22, replaced the mutex-backed shared_ptr atomic_store/load)
+libs/storage/src/Log.cpp | const uint8_t prev = snapMiddle_.exchange(mine, std::memory_order_acq_rel); | 1 | CLEANER | Log cleaner channel: sealed-snapshot latest-value triple buffer (D22, replaced the mutex-backed shared_ptr atomic_store/load)

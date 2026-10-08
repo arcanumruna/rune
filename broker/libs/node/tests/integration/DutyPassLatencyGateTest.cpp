@@ -594,7 +594,7 @@ public:
     uint32_t observe(uint32_t extra) {
         uint32_t f = extra;
         for (auto& p : parts_) {
-            const auto snap = p->log->sealedSegmentSnapshot();
+            const auto snap = p->log->ownerSealedSnapshot();
             const std::size_t segs = snap ? snap->size() : 0;
             const int64_t active = (snap && !snap->empty()) ? snap->back().endOffset : 0;   // active base
             const uint64_t gen = p->log->installGeneration();
@@ -1105,7 +1105,7 @@ Outcome compaction(int64_t groupBytes, int nParts, bool reads) {
     auto filled = [&] {
         int64_t minBytes = INT64_MAX;
         for (auto& p : rig.parts()) {
-            const auto snap = p->log->sealedSegmentSnapshot();
+            const auto snap = p->log->ownerSealedSnapshot();
             int64_t b = 0;
             if (snap) for (const auto& si : *snap) b += si.sizeBytes;
             minBytes = std::min(minBytes, b);

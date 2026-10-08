@@ -8,7 +8,8 @@
 // Each doWork() cycle:
 //   1. Scan all eligible leader logs in the ReplicaRegistry.
 //   2. Compute byte-based dirty ratio for each log using the SEALED SEGMENT SNAPSHOT
-//      (atomic shared_ptr published by the append thread — no direct access to
+//      (Log::cleanerSnapshot(): the append thread's latest publish via a lock-free
+//       triple buffer (D22) — no direct access to
 //       Log::segments_ which would be a data race).
 //   3. Select the SINGLE filthiest log above minCleanableDirtyRatio (global max).
 //   4. Compact one sealed segment.  The cycle budget (cycleBudgetBytes_) is
@@ -181,7 +182,7 @@ public:
     // Agent::doWork — one cleaner cycle.
     //
     // Selects the filthiest eligible leader log (global max byte-dirty-ratio)
-    // using the IMMUTABLE SEALED SEGMENT SNAPSHOT (atomic shared_ptr, no data
+    // using the IMMUTABLE SEALED SEGMENT SNAPSHOT (Log::cleanerSnapshot(), no data
     // race with the append thread that mutates segments_).
     // Compacts one sealed segment per cycle. The cycle byte budget is checked
     // BEFORE processing: once bytesUsed_ >= cycleBudgetBytes_ (across cycles
@@ -333,8 +334,8 @@ public:
             // into the cleaner-owned watermark before reading it.
             replica->applyCleanerRewind();
 
-            // Load the immutable snapshot (atomic acquire — no race with append thread).
-            auto snap = log->sealedSegmentSnapshot();
+            // The latest immutable snapshot (D22 triple buffer — no race with the append thread).
+            auto snap = log->cleanerSnapshot();
             if (!snap || snap->size() < 1) continue;  // need at least one sealed segment
 
             const int64_t firstDirtyOffset = replica->lastCleanOffset();
@@ -746,7 +747,7 @@ private:
             if (retentionMs < 0 && retentionBytes < 0 && logStartOffset <= 0) continue;
 
             // Load the immutable sealed-segment snapshot (no segments_ access).
-            auto snap = log->sealedSegmentSnapshot();
+            auto snap = log->cleanerSnapshot();
             if (!snap || snap->empty()) continue;
 
             // High-watermark: never delete the active segment or segments that

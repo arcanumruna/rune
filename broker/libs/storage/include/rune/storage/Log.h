@@ -612,21 +612,24 @@ public:
     /// segment rewrites never move the LEO).
     void reloadSegment(int64_t baseOffset);
 
-    /// CP-6/race-fix: Load the latest immutable snapshot of sealed segments.
-    ///
-    /// The snapshot is a std::shared_ptr<const SealedSegmentSnapshot> published
-    /// via std::atomic on the single-writer append thread whenever segments_ changes
-    /// (in maybeRoll or after drainCleanerSwaps).  Sealed-segment sizes are fixed
-    /// once sealed so the snapshot is stable.
-    ///
-    /// The cleaner thread MUST use this accessor instead of calling segmentSize()
-    /// or segmentBaseOffsets() directly, which would race with the append thread's
-    /// mutations to segments_ (UB confirmed by TSan).
-    ///
-    /// Thread-safe: std::atomic_load provides seq_cst barrier between the
-    /// append-thread store (publishSealedSnapshot) and the cleaner-thread load.
-    std::shared_ptr<const SealedSegmentSnapshot> sealedSegmentSnapshot() const noexcept {
-        return std::atomic_load(&sealedSnapshot_);
+    /// CP-6/race-fix: the latest immutable snapshot of sealed segments, as the
+    /// OWNER (single-writer append thread) last published it — owner thread /
+    /// owner-driven tests only.  Sealed-segment sizes are fixed once sealed so
+    /// the snapshot is stable.
+    std::shared_ptr<const SealedSegmentSnapshot> ownerSealedSnapshot() const noexcept { return ownerSnap_; }
+
+    /// The latest published snapshot for THE cleaner thread (its one consumer):
+    /// a latest-value triple buffer (D22) — no lock, no allocation.  The cleaner
+    /// MUST use this instead of segmentSize() / segmentBaseOffsets(), which race
+    /// with the append thread's mutations to segments_ (UB confirmed by TSan).
+    /// (Was std::atomic_load on a shared_ptr: a hidden libstdc++ mutex pool on the
+    /// owner's roll.)
+    std::shared_ptr<const SealedSegmentSnapshot> cleanerSnapshot() const noexcept {
+        if (snapMiddle_.load(std::memory_order_relaxed) & kSnapFresh) {
+            const uint8_t prev = snapMiddle_.exchange(snapFront_, std::memory_order_acq_rel);
+            snapFront_ = static_cast<uint8_t>(prev & kSnapIndex);
+        }
+        return snapSlot_[snapFront_];
     }
 
     /// CP-6: Enqueue a cleaner-rewritten segment base for atomic swap on the
@@ -1122,19 +1125,21 @@ private:
     SegMap::iterator eraseKeepNode_(SegMap::iterator it) noexcept;
     uint64_t segInstallGen_ = 0;   ///< F15 S4 N1: segment install generation
 
-    // CP-6/race-fix: atomic snapshot of sealed segment {baseOffset, sizeBytes}.
-    // Written exclusively on the append thread; read safely on the cleaner thread
-    // via std::atomic_store / std::atomic_load (deprecated C++20 free-function
-    // API, but the only portable form available on Apple clang/libc++ 17 where
-    // std::atomic<shared_ptr<T>> is not yet fully supported).
-    //
-    // Correctness: atomic_store/load use an internal spinlock in libc++, providing
-    // a full happens-before between the store on the writer and the load on the
-    // cleaner — equivalent in strength to a mutex-protected assignment.  The
-    // spinlock is per-pointer-address (not global), so the append hot path is
-    // only affected when a roll occurs (infrequent).
-    mutable std::shared_ptr<const SealedSegmentSnapshot> sealedSnapshot_{
-        std::make_shared<SealedSegmentSnapshot>()};
+    // CP-6/race-fix: snapshot of sealed segment {baseOffset, sizeBytes}, written
+    // exclusively on the append (owner) thread.  ownerSnap_ is the owner's view
+    // (ownerSealedSnapshot()); the cleaner receives it through the D22 triple
+    // buffer below (cleanerSnapshot()) — no lock (the former std::atomic_store /
+    // atomic_load on a shared_ptr used libstdc++'s mutex pool on every roll).
+    std::shared_ptr<const SealedSegmentSnapshot> ownerSnap_{std::make_shared<SealedSegmentSnapshot>()};
+    // D22: owner → cleaner latest-value triple buffer.  slot snapBack_ is the
+    // owner's, snapFront_ the cleaner's, the third is "middle" (index in
+    // snapMiddle_, kSnapFresh = published since the cleaner last took it); a
+    // slot changes hands only through the exchange.
+    static constexpr uint8_t kSnapIndex = 3, kSnapFresh = 4;
+    mutable std::shared_ptr<const SealedSegmentSnapshot> snapSlot_[3]{ownerSnap_, ownerSnap_, ownerSnap_};
+    alignas(64) mutable std::atomic<uint8_t> snapMiddle_{1};
+    uint8_t         snapBack_  = 0;   ///< owner thread
+    mutable uint8_t snapFront_ = 2;   ///< cleaner thread
     // hotpath-A F4: the owner's side of the chunked snapshot (see
     // kSnapChunkEntries).  Live entries are the absolute indices
     // [snapBegin_, snapEnd_) of snapDir_; every published snapshot of any
