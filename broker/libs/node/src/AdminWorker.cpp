@@ -57,6 +57,17 @@ void AdminWorker::onRole(const AdminRoleMsg& role) {
         if (!wasLeader_) {
             // Follower→Leader edge: rebuild registry from the replicated log.
             rebuildFromLog_();
+            if (rebuildFailed_) [[unlikely]] {
+                // Surfaced loudly (see rebuildFromLog_ + rebuildFailed()):
+                // this node is now serving DDL as leader on top of a
+                // registry rebuild that detected and aborted on a corrupt
+                // __topic_schemas record — never silently treated as healthy.
+                spdlog::critical(
+                    "AdminWorker: promoted to LEADER (epoch={}) with a FAILED "
+                    "__topic_schemas rebuild — the SchemaRegistry may be "
+                    "missing versions past the corrupt record. See the prior "
+                    "CORRUPT __topic_schemas record log line.", role.epoch);
+            }
             wasLeader_ = true;
         }
     } else {
@@ -466,6 +477,7 @@ bool AdminWorker::advance_(int64_t nowNs) {
 
 // ─── rebuildFromLog_ — C: replay [0, HW) into the registry on promotion ──────
 void AdminWorker::rebuildFromLog_() {
+    rebuildFailed_ = false;  // fresh attempt on every Follower→Leader edge
     if (!replica_) return;
     const rune::replication::Offset hw = replica_->highWatermark();
     if (hw <= 0) return;
@@ -487,12 +499,29 @@ void AdminWorker::rebuildFromLog_() {
             if (!reader.ensureValid()) break;
             const int32_t tl = reader.totalLength();
             if (tl <= 0 || static_cast<std::size_t>(tl) > rem) break;
-            reader.forEachRecord([this](std::string_view /*key*/, std::string_view val,
+            const rune::replication::Offset batchBase = reader.baseOffset();
+            reader.forEachRecord([this, batchBase](std::string_view /*key*/, std::string_view val,
                                   int64_t /*offset*/, int64_t /*ts*/) {
                 auto ts = TopicSchema::deserialize(std::span<const uint8_t>(
                     reinterpret_cast<const uint8_t*>(val.data()), val.size()));
-                if (ts) reg_.applyRecord(*ts);
+                if (ts) {
+                    reg_.applyRecord(*ts);
+                    return;
+                }
+                // FAIL LOUD (never a silent skip): SchemaRegistry stores
+                // versions in a per-topic deque indexed by (version-1); a
+                // silently-dropped record here would leave an UNDETECTED gap
+                // and serve wrong/missing schema versions after recovery.
+                rebuildFailed_ = true;
+                spdlog::critical(
+                    "AdminWorker: CORRUPT __topic_schemas record at batch "
+                    "baseOffset={} — TopicSchema::deserialize failed "
+                    "(truncated/corrupt payload). ABORTING rebuildFromLog_ "
+                    "rather than silently skipping it (would leave an "
+                    "undetected schema-version gap).",
+                    batchBase);
             });
+            if (rebuildFailed_) return;  // abort: no further batches applied
             const rune::replication::Offset bne =
                 reader.baseOffset() + reader.lastOffsetDelta() + 1;
             if (bne > lastBatchEnd) lastBatchEnd = bne;

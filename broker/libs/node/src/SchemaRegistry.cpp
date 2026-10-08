@@ -160,6 +160,15 @@ std::optional<TopicSchema> TopicSchema::deserialize(std::span<const uint8_t> buf
         uint8_t compatByte = 0;
         if (!readU16LE(buf, pos, ts.nextTag))   return std::nullopt;
         if (!readU8(buf, pos, compatByte))      return std::nullopt;
+        // Defense-in-depth: compatByte is only well-formed as Backward(0) or
+        // Forward(1) (rune::codec::CompatMode's only two enumerators). A byte
+        // outside that range is a malformed/corrupt record — reject it the
+        // same way every other bounds/shape check in this function does,
+        // rather than silently static_cast-ing it into an unintended mode.
+        if (compatByte != static_cast<uint8_t>(rune::codec::CompatMode::Backward) &&
+            compatByte != static_cast<uint8_t>(rune::codec::CompatMode::Forward)) {
+            return std::nullopt;
+        }
         ts.compatMode = static_cast<rune::codec::CompatMode>(compatByte);
     } else {
         return std::nullopt;  // truncated (1-2 bytes) or unrecognized (>3 bytes) tail

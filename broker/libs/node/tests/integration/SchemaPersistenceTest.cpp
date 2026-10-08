@@ -628,6 +628,146 @@ TEST_F(SchemaPersistenceTest, ReplayReconstructsAllVersionsAndNextTag) {
 }
 
 // ---------------------------------------------------------------------------
+// Final-review Regression (Finding 1): CorruptRecordAbortsRebuildRegression
+//
+// Pre-fix, AdminWorker::rebuildFromLog_ SILENTLY SKIPPED a record whose
+// TopicSchema::deserialize failed (corrupt/truncated payload). Because
+// SchemaRegistry stores versions in a per-topic deque indexed by
+// (version - 1), a silently-skipped record between two valid commits left an
+// UNDETECTED version gap: the replay would "succeed" quietly while applying
+// records AFTER the corrupt one as if nothing had been dropped.
+//
+// This test appends a DELIBERATELY TRUNCATED record (2 bytes — short of the
+// 4 bytes TopicSchema::deserialize needs for just its first field) directly
+// onto the __topic_schemas replica, sandwiched between a valid v1 DEFINE and
+// a valid v2 ALTER, then promotes a FRESH AdminWorker/SchemaRegistry (the
+// Follower->Leader rebuildFromLog_ edge — same pattern as Path B above) to
+// replay the whole log from scratch (simulating a node recovering purely
+// from disk).
+//
+// Post-fix: rebuildFailed() must be true (loud + detectable), v1 (before the
+// corruption) must still be reconstructed, and v2 (after the corruption)
+// must NOT be present — proving the rebuild ABORTED at the corrupt record
+// instead of silently skipping it and papering over the gap.
+// ---------------------------------------------------------------------------
+TEST_F(SchemaPersistenceTest, CorruptRecordAbortsRebuildRegression) {
+    // 1. DEFINE v1 "characters" via the normal production commit path.
+    DefineTopicMsg def;
+    def.session        = 1;
+    def.corr           = 2;
+    def.name           = "characters";
+    def.keyField       = "userId";
+    def.partitionCount = 4;
+    def.validate       = false;
+    def.blob           = charsBlob();
+    driveDefine(def);
+    ASSERT_EQ(lastDefineError_, 0u) << "Precondition: DefineTopic (v1) must succeed";
+    const int32_t topicId = lastDefineTopicId_;
+
+    tick(5);  // advance HW to cover v1
+
+    // 2. Append a DELIBERATELY CORRUPT/TRUNCATED record DIRECTLY onto the
+    //    same replica (bypassing AdminWorker's own commit path) — simulates a
+    //    torn/garbled __topic_schemas payload landing between two valid
+    //    commits. The outer RecordBatch framing (length/CRC) is valid — only
+    //    the TopicSchema payload itself is malformed, exactly the condition
+    //    rebuildFromLog_'s `if (ts)` guard is meant to catch.
+    {
+        const uint8_t keyBuf[6] = {0, 0, 0, 0, 0, 0};  // arbitrary; irrelevant here
+        const uint8_t corruptPayload[2] = {0xDE, 0xAD};  // < 4B: fails readI32LE(topicId)
+        const rune::replication::Offset base = replica_->appendKeyed(
+            std::span<const uint8_t>(keyBuf, 6),
+            std::span<const uint8_t>(corruptPayload, 2),
+            /*acksAll=*/true);
+        ASSERT_GE(base, 0) << "Precondition: the corrupt record must land in the log";
+        replica_->onLeaderLogAppended();
+    }
+    tick(5);  // advance HW to cover the corrupt record
+
+    // 3. A further valid ALTER AFTER the corrupt record, on the LIVE
+    //    adminWorker_/registry_ (unaffected by the raw append above — the
+    //    in-memory registry only ever changes via applyRecord on commit, not
+    //    by reading the log back). This is the record a pre-fix silent-skip
+    //    would have applied as if the corrupt record never existed.
+    AlterTopicMsg alter1;
+    alter1.session         = 10;
+    alter1.corr            = 11;
+    alter1.topicName       = "characters";
+    alter1.expectedVersion = 0;
+    alter1.opsBlob         = altersOpsBlob({addOp("score", PrimType::Int64)});
+    driveAlter(alter1);
+    ASSERT_EQ(lastAlterError_, 0u) << "Precondition: ALTER after the corrupt record must "
+                                      "still succeed on the LIVE (uncorrupted) registry";
+    ASSERT_EQ(lastAlterVersion_, 2u);
+
+    tick(5);  // advance HW to cover v2
+
+    // 4. Promote a FRESH AdminWorker/SchemaRegistry — the Follower->Leader
+    //    rebuildFromLog_ edge — to replay the WHOLE log from scratch, as a
+    //    recovering node would.
+    SchemaRegistry promotedReg;
+    AdminDeps noopDeps;
+    noopDeps.requestCreateTopic = [](int64_t, int32_t, const std::string&) { return true; };
+    noopDeps.pushValidators     = [](const RegistryEntry&, int32_t) {};
+    noopDeps.respondDefine      = [](int64_t, int64_t, int32_t, uint16_t, uint16_t) {};
+    noopDeps.respondGet         = [](int64_t, int64_t, int32_t, uint16_t,
+                                     const std::vector<uint8_t>&, uint16_t) {};
+    noopDeps.respondAlter       = [](int64_t, int64_t, int32_t, uint16_t, uint16_t) {};
+
+    AdminWorker promotedWorker(promotedReg, replica_.get(), /*selfId=*/1,
+                               std::vector<int32_t>{1}, std::move(noopDeps));
+    promotedWorker.onRole(AdminRoleMsg{/*leader=*/true, /*epoch=*/1, /*leaderId=*/1});
+
+    EXPECT_TRUE(promotedWorker.rebuildFailed())
+        << "Regression: a corrupt/truncated __topic_schemas record must be LOUDLY "
+           "detected (rebuildFailed()==true), never silently skipped";
+
+    const RegistryEntry* pv1 = promotedReg.byIdVersion(topicId, 1);
+    ASSERT_NE(pv1, nullptr) << "v1 (committed BEFORE the corrupt record) must still "
+                                "be reconstructed";
+    EXPECT_EQ(pv1->version, 1u);
+
+    const RegistryEntry* pv2 = promotedReg.byIdVersion(topicId, 2);
+    EXPECT_EQ(pv2, nullptr)
+        << "Regression: the v2 ALTER record AFTER the corrupt one must NOT be "
+           "silently applied — rebuildFromLog_ must ABORT at the corrupt record, "
+           "never continue past it and paper over the version gap";
+}
+
+// ---------------------------------------------------------------------------
+// Final-review Regression (Finding 2): CompatMode2RejectedRegression
+//
+// TopicSchema::deserialize's trailing (nextTag, compatMode) tail previously
+// static_cast the raw compatMode byte straight into rune::codec::CompatMode
+// with no range check — a byte outside {0=Backward, 1=Forward} was silently
+// accepted as a well-formed (if semantically bogus) CompatMode. This test
+// proves a byte of 2 (neither enumerator) is now rejected, same as every
+// other bounds/shape check in deserialize().
+// ---------------------------------------------------------------------------
+TEST(TopicSchemaDeserializeRegression, CompatMode2RejectedRegression) {
+    TopicSchema ts;
+    ts.topicId        = 1;
+    ts.version        = 1;
+    ts.partitionCount = 1;
+    ts.validate       = false;
+    ts.keyField       = "id";
+    ts.descriptorBlob = serialize(DescriptorBuilder("t", 1).add("id", PrimType::Int64).build());
+    ts.nextTag        = 1;
+    // Deliberately malformed: neither CompatMode::Backward(0) nor
+    // CompatMode::Forward(1) — bypass the enum's type safety the same way a
+    // corrupt/garbled on-disk byte would.
+    ts.compatMode     = static_cast<CompatMode>(2);
+
+    const std::vector<uint8_t> blob = ts.serialize();
+    const auto decoded = TopicSchema::deserialize(
+        std::span<const uint8_t>(blob.data(), blob.size()));
+
+    EXPECT_FALSE(decoded.has_value())
+        << "Regression: compatMode byte=2 (neither Backward(0) nor Forward(1)) must be "
+           "REJECTED by deserialize(), not silently accepted as a valid CompatMode";
+}
+
+// ---------------------------------------------------------------------------
 // Task 15b regression: OldVersionsSurviveCompactionRegression
 //
 // __topic_schemas is a Compact-policy log (BrokerNode.cpp:2825-2828).  Before

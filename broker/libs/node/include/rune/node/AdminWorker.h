@@ -128,6 +128,16 @@ public:
     [[nodiscard]] bool isLeader() const noexcept { return leader_; }
     [[nodiscard]] std::size_t pendingCount() const noexcept { return pending_.size(); }
 
+    // Fail-loud recovery signal (regression fix): true iff the most recent
+    // rebuildFromLog_() (Follower->Leader promotion replay) hit a corrupt or
+    // truncated __topic_schemas record and ABORTED rather than silently
+    // skipping it. A silent skip would leave an UNDETECTED version gap in
+    // SchemaRegistry's per-topic deque (indexed by version-1) — wrong/missing
+    // schema versions served after recovery. Callers (tests, and any future
+    // control-plane wiring) poll this to detect/halt instead of trusting a
+    // silently-incomplete registry.
+    [[nodiscard]] bool rebuildFailed() const noexcept { return rebuildFailed_; }
+
 private:
     // Rebuild the SchemaRegistry from [0, HW) of the schema replica.
     void rebuildFromLog_();
@@ -205,6 +215,10 @@ private:
     bool     leader_      = false;
     int32_t  epoch_       = 0;
     bool     wasLeader_   = false;   // C: Follower→Leader edge detection
+
+    // Set by rebuildFromLog_() on a corrupt/truncated TopicSchema record; see
+    // rebuildFailed() above. Admin-thread-owned (no atomics — shared-nothing).
+    bool     rebuildFailed_ = false;
 
     // In-flight DDL state machine.
     DdlState        state_ = DdlState::Idle;
