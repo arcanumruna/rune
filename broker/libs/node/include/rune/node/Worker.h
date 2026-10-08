@@ -2341,6 +2341,16 @@ private:
                 // present (sessionEncrypted known) with no cipher installed,
                 // so the push path parks/drops (RecordsSealCtx's own
                 // null-`send` contract) rather than leaking.
+                //
+                // Review fix (Minor, robustness): `channel` was initialized
+                // above to the RAW tail (p, len) — which here still includes
+                // the would-be 37-byte crypto header, since decoding it
+                // failed. Reset it to empty rather than handing
+                // ackSink_->announce() that garbage as if it were a channel
+                // string. Unreachable by construction (the gateway never
+                // sends a truncated tail), but a malformed tail must fail
+                // clean, not mis-announce.
+                channel = std::string_view{};
                 spdlog::critical("Worker {}: session {} SessionAnnounce crypto tail too short "
                                   "({} B) — Records egress for this session will be parked "
                                   "(fail-closed)", workerId_, sid, len);

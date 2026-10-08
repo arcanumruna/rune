@@ -58,6 +58,21 @@
 //      crypto now) — the removed mustRefuseShardWithRequireTls no longer
 //      exists; this is asserted at the ConnectDowngradePolicy level
 //      (shouldEngageCrypto accepts shard mode's encrypted offer).
+//
+// Task 19 review fix (Important — fail-open close): non-shard per-worker
+// egress has NO SessionAnnounce crypto handoff at all (shard-mode-only
+// mechanism), so it must refuse to start under TLS rather than push an
+// encrypted session's Records in the clear (mustRefuseNonShardPerWorkerEgressTls):
+//  12. NonShardPerWorkerEgressWithRequireTlsRefusesStart
+//  13. NonShardPerWorkerEgressWithBrokerTlsRefusesStart — refuses even
+//      without require_tls (a broker with a loaded cert still engages
+//      crypto for an offering client).
+//  14. ShardPerWorkerEgressWithTlsStillAllowed — shard mode runs the
+//      handoff, so this combination is fine.
+//  15. NonShardPerWorkerEgressWithoutTlsStillAllowed — no TLS configured at
+//      all: nothing to refuse.
+//  16. PerWorkerEgressOffNeverRefuses — the guard does not apply when
+//      per-worker egress itself is off.
 
 #include <gtest/gtest.h>
 
@@ -284,4 +299,46 @@ TEST(TlsStartupPolicy, ValidConfiguredCertDoesNotRefuseStart) {
 TEST(TlsStartupPolicy, ShardModeWithRequireTlsNowStarts) {
     EXPECT_TRUE(shouldEngageCrypto(/*clientOffersCrypto=*/true, /*brokerHasTls=*/true));
     EXPECT_FALSE(mustRejectForRequireTls(/*requireTls=*/true, /*cryptoEstablished=*/true));
+}
+
+// Task 19 review fix (Important, fail-open close): removing the shard
+// refusal exposed a DIFFERENT plaintext-leak path — non-shard mode with
+// per-worker egress enabled has workers push Records directly (Worker.h),
+// but SessionAnnouncer (the per-worker crypto-key handoff) only ever runs
+// in shard mode. So a non-shard per-worker-egress worker never learns a
+// session's key: an encrypted session's Records would be pushed in the
+// clear. mustRefuseNonShardPerWorkerEgressTls closes this at startup.
+TEST(TlsStartupPolicy, NonShardPerWorkerEgressWithRequireTlsRefusesStart) {
+    EXPECT_TRUE(rune::node::mustRefuseNonShardPerWorkerEgressTls(
+        /*perWorkerEgress=*/true, /*shardMode=*/false, /*requireTls=*/true, /*brokerHasTls=*/false));
+}
+
+TEST(TlsStartupPolicy, NonShardPerWorkerEgressWithBrokerTlsRefusesStart) {
+    // require_tls need not be set at all — a broker with a loaded cert/key
+    // will still engage crypto for a client that offers it
+    // (shouldEngageCrypto does not require require_tls), so this must
+    // refuse too.
+    EXPECT_TRUE(rune::node::mustRefuseNonShardPerWorkerEgressTls(
+        /*perWorkerEgress=*/true, /*shardMode=*/false, /*requireTls=*/false, /*brokerHasTls=*/true));
+}
+
+TEST(TlsStartupPolicy, ShardPerWorkerEgressWithTlsStillAllowed) {
+    // Shard mode DOES run SessionAnnouncer's crypto handoff (this whole
+    // task), so per-worker egress + TLS is fine once shard mode is on.
+    EXPECT_FALSE(rune::node::mustRefuseNonShardPerWorkerEgressTls(
+        /*perWorkerEgress=*/true, /*shardMode=*/true, /*requireTls=*/true, /*brokerHasTls=*/true));
+}
+
+TEST(TlsStartupPolicy, NonShardPerWorkerEgressWithoutTlsStillAllowed) {
+    // No TLS configured at all and require_tls off: no encrypted session
+    // can ever reach a worker in the first place — nothing to refuse.
+    EXPECT_FALSE(rune::node::mustRefuseNonShardPerWorkerEgressTls(
+        /*perWorkerEgress=*/true, /*shardMode=*/false, /*requireTls=*/false, /*brokerHasTls=*/false));
+}
+
+TEST(TlsStartupPolicy, PerWorkerEgressOffNeverRefuses) {
+    // perWorkerEgress off: this guard does not apply at all (the gateway's
+    // own egress path seals everything itself, unaffected by shard mode).
+    EXPECT_FALSE(rune::node::mustRefuseNonShardPerWorkerEgressTls(
+        /*perWorkerEgress=*/false, /*shardMode=*/false, /*requireTls=*/true, /*brokerHasTls=*/true));
 }

@@ -1851,6 +1851,20 @@ void BrokerNode::buildGateway() {
     // mode serves encrypted sessions exactly like legacy mode — this
     // startup refusal is gone (see rune::node::TlsStartupPolicy.h's header
     // note for the removed mustRefuseShardWithRequireTls).
+    //
+    // Task 19 review fix (Important): NON-shard per-worker egress has no
+    // such key handoff at all (SessionAnnouncer only runs in shard mode) —
+    // a worker there would push an encrypted session's Records in the
+    // clear. Refuse to start rather than fail open.
+    const bool brokerHasTlsAtStartup = !tlsCertPem.empty() && !tlsKeyPem.empty();
+    if (rune::node::mustRefuseNonShardPerWorkerEgressTls(
+            config_.perWorkerEgressEnabled, config_.shardMode(), config_.requireTls,
+            brokerHasTlsAtStartup)) {
+        throw std::runtime_error(
+            "BrokerNode[" + std::to_string(nodeId) + "]: non-shard per-worker-egress has no "
+            "Records crypto handoff; it cannot serve TLS — use shard mode or disable "
+            "per-worker egress");
+    }
 
     // Build the gateway (subscribes on clientChannel).
     try {

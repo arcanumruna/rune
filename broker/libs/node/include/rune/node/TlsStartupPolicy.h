@@ -50,4 +50,27 @@ namespace rune::node {
 // mode now serves crypto exactly like legacy mode — the combination is no
 // longer a dead end and this startup refusal is gone.
 
+// Task 19 review fix (Important, fail-open close): removing the SHARD
+// refusal above exposed a DIFFERENT, still-live plaintext-leak path —
+// NON-shard mode with per-worker egress enabled (BrokerNode's
+// perWorkerEgressEnabled config). That path ALSO has workers push Records
+// directly (Worker.h's pushOwnedSubscriptions_), but it is reached only
+// through BrokerNode's non-shard wiring, which NEVER runs
+// SessionAnnouncer / the SessionAnnounce crypto handoff (that whole
+// mechanism is gated on shardMode_ — see ClientGateway::pollPendingConnects
+// / handleHandshakeContinue_). So a worker in this mode never learns a
+// session's per-sender key at all: Worker::findSessionCrypto_ always
+// returns null, and an encrypted session's Records would be pushed in the
+// CLEAR — a fail-OPEN this policy must refuse at startup rather than serve.
+// True whenever per-worker egress could possibly see an encrypted session:
+// require_tls forces crypto, OR the broker simply has a cert/key loaded (a
+// client MAY still offer crypto and get it — shouldEngageCrypto does not
+// require require_tls).
+[[nodiscard]] inline bool mustRefuseNonShardPerWorkerEgressTls(bool perWorkerEgress,
+                                                                bool shardMode,
+                                                                bool requireTls,
+                                                                bool brokerHasTls) noexcept {
+    return perWorkerEgress && !shardMode && (requireTls || brokerHasTls);
+}
+
 } // namespace rune::node
