@@ -22,6 +22,21 @@ find_package(spdlog REQUIRED)
 # client<->broker TLS/AEAD (Task 5): TLS 1.3 handshake + AEAD (rune-crypto, below).
 find_package(OpenSSL REQUIRED)
 
+# Task 9 / spec §11: RUNE_TLS — the client<->broker TLS/AEAD enablement gate,
+# mirroring the broker's RUNE_TLS CMake option for a consistent build matrix.
+# Unlike the broker, the client has no env-driven TLS config to gate: its
+# crypto core (Tasks 5-8/8b) is already always compiled in, and
+# offerCrypto/tlsTrustPem/tlsExpectHost/authToken/requireCrypto
+# (ClientConfig, mapped into session::SessionConfig by Client.cpp's
+# toAgentConfig()) are plain programmatic fields an application sets in code
+# — they default to false/empty regardless of this option, so a caller who
+# never touches them gets today's byte-identical plaintext connect either
+# way. This option exists so RUNE_TLS=ON/OFF can be passed uniformly across
+# both repos' build scripts; it does not currently change this repo's compiled
+# output (reserved for a future env-var-driven default, symmetric with the
+# broker's RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE/RUNE_REQUIRE_TLS).
+option(RUNE_TLS "Enable the RUNE_TLS client<->broker TLS/AEAD config path (build-matrix parity with the broker; no effect on this repo's compiled output today)" OFF)
+
 option(ENABLE_COVERAGE "Enable coverage instrumentation" OFF)
 if(ENABLE_COVERAGE)
     add_compile_options(--coverage -O0 -g)

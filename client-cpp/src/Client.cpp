@@ -114,6 +114,16 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
             : transport::DriverMode::Thread;
     // T15 R1: never give up once Live (shard clients); false = today's behaviour.
     acfg.session.reconnectForeverAfterLive = c.reconnectForeverAfterLive;
+
+    // Task 9 (RUNE_TLS enablement): map the public client<->broker TLS/AEAD
+    // config straight into SessionConfig. offerCrypto defaults false, so a
+    // caller who never touches these fields gets byte-identical pre-Task-5
+    // plaintext behaviour.
+    acfg.session.offerCrypto   = c.offerCrypto;
+    acfg.session.tlsTrustPem   = c.tlsTrustPem;
+    acfg.session.tlsExpectHost = c.tlsExpectHost;
+    acfg.session.authToken     = c.authToken;
+    acfg.session.requireCrypto = c.requireCrypto;
     acfg.transport.clientLivenessTimeoutNs = c.aeronClientLivenessTimeoutNs;
     // F12: malformed env values are reported (once per Client construction —
     // this runs once per Client, never per cycle), not silently dropped.

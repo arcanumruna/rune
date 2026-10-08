@@ -259,6 +259,89 @@ TEST(ClientCryptoRoundTrip, CryptoOffConnectIsByteIdenticalToPreTask5) {
     EXPECT_FALSE(m.cryptoState().encrypted);
 }
 
+TEST(ClientCryptoRoundTrip, OfferCryptoProducesCryptoConnectRequest) {
+    // Task 9: offerCrypto=true -> a v(crypto) ConnectRequest carrying a
+    // non-empty cipherList + handshakeBytes (the client's ClientHello),
+    // mirroring CryptoOffConnectIsByteIdenticalToPreTask5's negative case.
+    FakeIo io;
+    sm::SessionConfig cfg;
+    cfg.egressChannel  = "aeron:udp?endpoint=client:40456";
+    cfg.egressStreamId = 1001;
+    cfg.offerCrypto    = true;
+    cfg.tlsTrustPem    = "";  // trust nothing — this test never completes the handshake
+    sm::SessionMachine m(io, cfg);
+
+    m.connect(1'000'000'000LL);
+
+    ASSERT_EQ(io.sendCount(), 1u);
+    auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
+    ASSERT_TRUE(req.has_value());
+    EXPECT_FALSE(req->cipherList.empty());
+    EXPECT_FALSE(req->handshakeBytes.empty());
+}
+
+TEST(ClientCryptoRoundTrip, RequireCryptoFailsTerminallyOnNoCipherResponse) {
+    // Task 9 (downgrade safety): requireCrypto=true + a ConnectResponse{OK}
+    // that negotiates NO cipher (chosenCipher=0 — a plaintext broker, or a
+    // MITM that stripped the crypto offer off the wire) must NOT silently
+    // proceed to a plaintext Connected session. It must fail exactly like a
+    // real TLS handshake failure: terminal Rejected(HandshakeFailed).
+    FakeIo io;
+    sm::SessionConfig cfg;
+    cfg.egressChannel  = "aeron:udp?endpoint=client:40456";
+    cfg.egressStreamId = 1001;
+    cfg.offerCrypto    = true;
+    cfg.requireCrypto  = true;
+    cfg.tlsTrustPem    = "";
+    sm::SessionMachine m(io, cfg);
+
+    constexpr int64_t T0 = 1'000'000'000LL;
+    m.connect(T0);
+    ASSERT_EQ(m.state(), sm::SessionState::Connecting);
+
+    auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
+    ASSERT_TRUE(req.has_value());
+    ASSERT_FALSE(req->cipherList.empty()) << "requireCrypto implies offerCrypto's crypto offer";
+
+    // The broker answers OK but negotiates no cipher (chosenCipher=0,
+    // handshakeBytes empty) — exactly what onConnectResponse's "happy path —
+    // no crypto chosen" branch used to accept unconditionally.
+    m.onConnectResponse(/*code=*/0, /*leaderMemberId=*/-1, /*assignedSessionId=*/99,
+                         req->correlationId, T0 + 1, /*chosenCipher=*/0, /*handshakeBytes=*/{});
+
+    EXPECT_EQ(m.state(), sm::SessionState::Rejected)
+        << "requireCrypto must fail terminally, never silently proceed plaintext";
+    EXPECT_EQ(m.rejectCode(),
+              static_cast<int16_t>(static_cast<uint16_t>(
+                  rune::protocol::client::ErrorCode::HandshakeFailed)));
+    EXPECT_FALSE(m.cryptoState().encrypted);
+}
+
+TEST(ClientCryptoRoundTrip, RequireCryptoOffNoCipherResponseStillPlaintextConnects) {
+    // Control case: requireCrypto=false (default) with the SAME no-cipher
+    // ConnectResponse — the pre-Task-9 degrade-to-plaintext behaviour must be
+    // unchanged (back-compat with a pre-v4 / RUNE_TLS=OFF broker).
+    FakeIo io;
+    sm::SessionConfig cfg;
+    cfg.egressChannel  = "aeron:udp?endpoint=client:40456";
+    cfg.egressStreamId = 1001;
+    cfg.offerCrypto    = true;
+    cfg.requireCrypto  = false;
+    cfg.tlsTrustPem    = "";
+    sm::SessionMachine m(io, cfg);
+
+    constexpr int64_t T0 = 1'000'000'000LL;
+    m.connect(T0);
+    auto req = cc::decodeConnectRequest(io.last().data(), io.last().size());
+    ASSERT_TRUE(req.has_value());
+
+    m.onConnectResponse(/*code=*/0, /*leaderMemberId=*/-1, /*assignedSessionId=*/99,
+                         req->correlationId, T0 + 1, /*chosenCipher=*/0, /*handshakeBytes=*/{});
+
+    EXPECT_EQ(m.state(), sm::SessionState::Connected);
+    EXPECT_FALSE(m.cryptoState().encrypted);
+}
+
 // ---------------------------------------------------------------------------
 // client<->broker TLS/AEAD (Task 6 / 6b) — data-plane half: sealFrame /
 // openEgressFrame.  Standalone (no Aeron): a real handshake derives the

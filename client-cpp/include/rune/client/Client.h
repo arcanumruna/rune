@@ -64,6 +64,7 @@
 #include <cstdio>
 #include <exception>
 #include <functional>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -205,6 +206,33 @@ struct ClientConfig {
     // Mirrors the broker's RUNE_TOPICS environment variable.
     // TODO(dynamic): fetch topic metadata from the broker on connect.
     std::vector<TopicSpec> topics;
+
+    // ---- Task 9 (RUNE_TLS enablement) — client<->broker TLS/AEAD public config.
+    // Mapped 1:1 into session::SessionConfig by toAgentConfig() below. Every
+    // field defaults to today's plaintext behaviour (offerCrypto=false ->
+    // byte-identical ConnectRequest, pre-Task-5 shape).
+    //
+    // offerCrypto: true -> connect() offers a v(crypto) ConnectRequest
+    // (cipherList/handshakeBytes/authToken) and drives the TLS 1.3 handshake.
+    bool offerCrypto = false;
+    // tlsTrustPem: nullopt = trust the system store (production default);
+    // "" = trust nothing (deliberately untrusted — tests only); non-empty =
+    // a PEM CA bundle to trust instead of the system store.
+    std::optional<std::string> tlsTrustPem;
+    // tlsExpectHost: the broker's DNS name, checked against its cert's SAN
+    // (hostname verification). "" installs NO hostname check — leave empty
+    // only for loopback/tests; set this in production.
+    std::string tlsExpectHost;
+    // authToken: client authZ token carried inside the (TLS-encrypted, once
+    // offerCrypto=true) Connect handshake payload. "" = none offered.
+    std::string authToken;
+    // requireCrypto (downgrade safety, spec §11 require_tls's client-side
+    // mirror): when true, a ConnectResponse that negotiates NO cipher makes
+    // connect() fail TERMINALLY (Rejected/HandshakeFailed) rather than
+    // silently proceed plaintext — defeats a MITM that strips the crypto
+    // offer off the wire before the broker ever sees it. Meaningless unless
+    // offerCrypto is also true. Default false (back-compat).
+    bool requireCrypto = false;
 };
 
 /// Maps a ClientConfig to the agent/transport configuration (applies env overrides).

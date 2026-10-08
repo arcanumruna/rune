@@ -163,6 +163,16 @@ struct SessionConfig {
     // Client authZ token carried inside the (now-encrypted-by-TLS) Connect handshake
     // payload; "" = none offered.  Validated by the broker's existing auth path.
     std::string authToken;
+
+    // Task 9 (downgrade safety, spec §11 require_tls's client-side mirror):
+    // when true, a ConnectResponse{OK} that negotiates NO cipher (chosenCipher
+    // == 0 — a plaintext broker, or a MITM that stripped the crypto offer off
+    // the wire before the broker saw it) must NOT silently proceed to a
+    // plaintext Connected session.  onConnectResponse instead calls
+    // onHandshakeFailed_() -> terminal Rejected(HandshakeFailed), exactly like
+    // a real TLS handshake failure.  Meaningless (and left false) unless
+    // offerCrypto is also true.  Default false (back-compat).
+    bool requireCrypto = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -361,6 +371,17 @@ public:
                 transitionTo(SessionState::Handshaking);
                 onHandshakeBytes(reinterpret_cast<const uint8_t*>(handshakeBytes.data()),
                                   handshakeBytes.size(), nowNs);
+                return;
+            }
+
+            // Task 9 (downgrade safety): requireCrypto means a plaintext
+            // ConnectResponse{OK} (no cipher chosen) must NOT be treated as a
+            // happy path — fail terminally exactly like a real handshake
+            // failure, never silently proceed plaintext.  This is the
+            // client-side mirror of the broker's require_tls: either side
+            // alone defeats a MITM that strips the crypto offer off the wire.
+            if (cfg_.requireCrypto && cfg_.offerCrypto) {
+                onHandshakeFailed_(nowNs);
                 return;
             }
 
