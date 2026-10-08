@@ -328,6 +328,7 @@ void Log::maybeRoll() {
     // CP-8 FIX (incremental largestTimestamp): the running max tracked for the
     // just-sealed segment becomes its entry's timestamp; reset for the new one.
     const auto sealedIt = std::prev(segments_.end(), 2);
+    retireSealedReadMap_(sealedIt->first, *sealedIt->second);   // D30
     newlySealedMaxTs_ = activeSegmentMaxTs_;
     newlySealedBase_  = sealedIt->first;
     activeSegmentMaxTs_ = 0;
@@ -1056,7 +1057,10 @@ LogReadView Log::readView(int64_t startOffset, int32_t maxBytes) noexcept {
         if (beyond) [[unlikely]] ++ownerFallbackRemaps_;
         seg.setOwnerRemap(beyond);
     }
-    return it->second->readView(startOffset, maxBytes);
+    const bool sealedUnmapped = std::next(it) != segments_.end() && it->second->readMapBytes() == 0;
+    const LogReadView v = it->second->readView(startOffset, maxBytes);
+    if (sealedUnmapped && it->second->readMapBytes() != 0) [[unlikely]] noteSealedMapped_(it->first);
+    return v;
 }
 
 void Log::maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept {
@@ -1094,6 +1098,76 @@ void Log::maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept
     growBase_ = base;
     growGen_ = seg.installGen();
     growWaits_ = 0;
+}
+
+void Log::retireSealedReadMap_(int64_t base, LogSegment& seg) noexcept {
+    // D30: a sealed segment holds no read mapping — its bytes are read with
+    // pread (#65 / D26), and a later readView remaps lazily (F3).  Two mappings
+    // per segment (index + read map) exhausted a default vm.max_map_count
+    // (65530) at ~32k segments.  An answer to a growth request for it is
+    // orphaned (discarded + disposed on arrival).  The munmap runs off the
+    // owner (the provisioner's dispose), inline only without a channel / with
+    // the ring full.
+    if (growOutstanding_ && growBase_ == base) growBase_ = INT64_MIN;
+    std::unique_ptr<MappedFile> m = seg.swapReadMap(nullptr);
+    if (!m) return;
+    ++readMapsRetiredAtSeal_;
+    disposeReadMap_(std::move(m));
+}
+
+void Log::disposeReadMap_(std::unique_ptr<MappedFile> m) noexcept {
+    // Off the owner (the provisioner munmaps) when it serves read maps; inline
+    // (counted: a munmap = mmap_lock write on this thread) without one, with a
+    // test intercept (it never disposes — review MEDIUM-1: posting there leaked
+    // the mapping), or with the ring full.
+    if (asyncReadGrowth_ &&
+        provisionChannel_->post(ProvisionChannel::kDisposeMsgType,
+                                static_cast<int64_t>(reinterpret_cast<std::uintptr_t>(m.get())), 0)) {
+        (void)m.release();
+        return;
+    }
+    ++readMapsDisposedInline_;
+}
+
+void Log::releaseLazySealedMaps() noexcept {
+    // D30 re-review M1: a finished walk of old data (an RC build after a restart
+    // / leadership move) releases the sealed maps it brought back — an idle
+    // partition holds none (thousands of partitions x the cap would be a real
+    // share of vm.max_map_count).
+    for (std::size_t i = 0; i < mappedSealedCount_; ++i) {
+        const int64_t b = mappedSealed_[(mappedSealedHead_ + i) % kMappedSealedCap];
+        const auto it = segments_.find(b);
+        if (it == segments_.end() || std::next(it) == segments_.end()) continue;
+        if (auto m = it->second->swapReadMap(nullptr)) {
+            ++sealedMapsEvicted_;
+            disposeReadMap_(std::move(m));
+        }
+    }
+    mappedSealedHead_ = mappedSealedCount_ = 0;
+}
+
+void Log::noteSealedMapped_(int64_t base) noexcept {
+    // D30 review MAJOR-1: a sealed segment mapped again (a readView / RC walk of
+    // old data) stays mapped — without a bound, one walk of a long log brings
+    // back a mapping per segment (vm.max_map_count).  At most kMappedSealedCap
+    // lazily mapped sealed segments; the oldest retires.  Safe: a LogReadView is
+    // valid only until the next read of this log, and the eviction runs inside
+    // that next read.
+    ++sealedLazyRemaps_;
+    if (mappedSealedCount_ == kMappedSealedCap) {
+        const int64_t victim = mappedSealed_[mappedSealedHead_];
+        mappedSealedHead_ = (mappedSealedHead_ + 1) % kMappedSealedCap;
+        --mappedSealedCount_;
+        const auto vit = segments_.find(victim);
+        if (vit != segments_.end() && victim != base && std::next(vit) != segments_.end()) {
+            if (auto m = vit->second->swapReadMap(nullptr)) {
+                ++sealedMapsEvicted_;
+                disposeReadMap_(std::move(m));
+            }
+        }
+    }
+    mappedSealed_[(mappedSealedHead_ + mappedSealedCount_) % kMappedSealedCap] = base;
+    ++mappedSealedCount_;
 }
 
 void Log::pollReadMaps_() noexcept {
@@ -1804,10 +1878,13 @@ Log::SegmentBytes Log::segmentBytesAt(int64_t segmentBase) {
     // Review Md5: the RC scan needs the WHOLE segment (a partial view would read
     // as "walked") — it may map on the owner (cold: RC builds; counted remaps).
     it->second->setOwnerRemap(true);
+    const bool sealedUnmapped = std::next(it) != segments_.end() && it->second->readMapBytes() == 0;
     const LogReadView v = it->second->mappedBytes();
+    if (sealedUnmapped && it->second->readMapBytes() != 0) [[unlikely]] noteSealedMapped_(it->first);
     if (asyncReadGrowth_) it->second->setOwnerRemap(false);
     b.data = v.data;
     b.size = v.len;
+    b.written = static_cast<std::size_t>(std::max<int64_t>(it->second->sizeBytes(), 0));
     return b;
 }
 std::vector<int64_t> Log::segmentBaseOffsets() const {

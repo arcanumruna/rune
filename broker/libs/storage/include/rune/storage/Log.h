@@ -472,6 +472,15 @@ public:
     [[nodiscard]] static int64_t requestMiB(int64_t p) noexcept { return (p >> 24) & 0xFFFFF; }
     [[nodiscard]] static int64_t requestSeq(int64_t p) noexcept { return (p >> 44) & 0x7FFFF; }
     [[nodiscard]] uint64_t readMapsDiscardedForTest() const noexcept { return readMapsDiscarded_; }
+    /// D30: read mappings retired when their segment sealed.
+    [[nodiscard]] uint64_t readMapsRetiredAtSealForTest() const noexcept { return readMapsRetiredAtSeal_; }
+    /// D30: retire every lazily mapped sealed segment (a finished walk of old data).
+    void releaseLazySealedMaps() noexcept;
+    [[nodiscard]] std::size_t lazySealedMappedForTest() const noexcept { return mappedSealedCount_; }
+    [[nodiscard]] uint64_t sealedLazyRemapsForTest() const noexcept { return sealedLazyRemaps_; }
+    [[nodiscard]] uint64_t sealedMapsEvictedForTest() const noexcept { return sealedMapsEvicted_; }
+    [[nodiscard]] uint64_t readMapsDisposedInlineForTest() const noexcept { return readMapsDisposedInline_; }
+    [[nodiscard]] static constexpr std::size_t mappedSealedCapForTest() noexcept { return kMappedSealedCap; }
     [[nodiscard]] uint64_t ownerFallbackRemapsForTest() const noexcept { return ownerFallbackRemaps_; }
     /// Tests (re-review N2): force the count-based re-request on the next need.
     void expireReadMapRequestForTest() noexcept { growWaits_ = 1u << 30; }
@@ -588,6 +597,9 @@ public:
         std::size_t    size = 0;
         uint64_t       gen  = 0;
         int            fd   = -1;
+        /// The segment's written bytes: data == nullptr with written > 0 is an
+        /// UNREADABLE segment (its mapping failed) — never "walked" (D30 MAJOR-2).
+        std::size_t    written = 0;
     };
     [[nodiscard]] SegmentBytes segmentBytesAt(int64_t segmentBase);
     int64_t totalBytes() const;
@@ -1043,6 +1055,14 @@ private:
     uint64_t growGen_ = 0;
     uint32_t growWaits_ = 0;
     uint64_t readMapGrowths_ = 0, readMapGrowthFailures_ = 0, readMapsDiscarded_ = 0, ownerFallbackRemaps_ = 0;
+    uint64_t readMapsRetiredAtSeal_ = 0;   ///< D30
+    void retireSealedReadMap_(int64_t base, LogSegment& seg) noexcept;
+    void disposeReadMap_(std::unique_ptr<MappedFile> m) noexcept;
+    void noteSealedMapped_(int64_t base) noexcept;
+    static constexpr std::size_t kMappedSealedCap = 8;   ///< D30 MAJOR-1: lazily mapped sealed segments kept
+    std::array<int64_t, kMappedSealedCap> mappedSealed_{};
+    std::size_t mappedSealedHead_ = 0, mappedSealedCount_ = 0;
+    uint64_t sealedLazyRemaps_ = 0, sealedMapsEvicted_ = 0, readMapsDisposedInline_ = 0;   ///< D30 MEDIUM-3
     int64_t  growSeq_ = 0;   ///< re-review N2: the outstanding request's identity
     /// Owner: request a larger mapping for `seg` (keyed `base`) when it needs one.
     void maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept;

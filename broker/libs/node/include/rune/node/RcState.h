@@ -146,6 +146,9 @@ public:
         std::size_t waitAt   = SIZE_MAX;      ///< m2: byte cursor of a non-resident window
         uint64_t    waitNext = 0;             ///< step at which it is re-requested
         uint64_t    waitGap  = 1;             ///< doubling pass backoff (<= 64)
+        bool        stalled   = false;        ///< D30: the segment under the cursor is unreadable
+        uint64_t    stallNext = 0;            ///< step at which it is retried
+        uint64_t    stallGap  = 1;            ///< doubling pass backoff (<= 1024)
     };
     struct Ready {
         int32_t  epoch   = 0;
@@ -310,6 +313,7 @@ public:
     [[nodiscard]] const rune::transaction::LsoTracker&      tracker() const noexcept { return tracker_; }
     [[nodiscard]] const rune::transaction::AbortedTxnIndex& aborted() const noexcept { return aborted_; }
     [[nodiscard]] uint64_t    scanSteps() const noexcept { return scanSteps_; }
+    [[nodiscard]] uint64_t    unreadableStalls() const noexcept { return unreadableStalls_; }
     [[nodiscard]] std::size_t maxStepBytes() const noexcept { return maxStepBytes_; }
     [[nodiscard]] uint64_t    tailGrowths() const noexcept { return tailGrowths_; }
     [[nodiscard]] uint64_t    scannedBytes() const noexcept { return scannedBytes_; }
@@ -430,21 +434,44 @@ private:
         if (s.cursor < logStart) s.cursor = logStart;
         if (s.segBase < logStart) { s.segBase = logStart; s.bytePos = 0; s.segGen = 0; s.readAheadTo = 0; }
         std::size_t bytes = 0;
+        if (s.cursor < s.target && s.stalled && scanSteps_ < s.stallNext) return 0;   // backing off (count-based)
         if (s.cursor < s.target) {
             const auto m = log.segmentBytesAt(s.segBase);
             if (m.gen != s.segGen) { s.segGen = m.gen; s.bytePos = 0; s.readAheadTo = 0; }
-            if (m.data == nullptr || s.bytePos >= m.size) {
+            if (m.data == nullptr && m.written > s.bytePos) [[unlikely]] {
+                // D30 review MAJOR-2: bytes exist that cannot be mapped (ENOMEM,
+                // vm.max_map_count): never "walked" — skipping them would drop
+                // their abort markers and serve ABORTED records to read_committed
+                // consumers.  Stall (fail closed: the build stays Scanning, nothing
+                // is served past it) and retry next pass.
+                // Re-review M2: retried on a doubling pass-count backoff (<= 1024
+                // passes), never every pass (each retry is an mmap + allocations).
+                s.stalled   = true;
+                s.stallNext = scanSteps_ + s.stallGap;
+                s.stallGap  = std::min<uint64_t>(s.stallGap * 2, 1024);
+                if (unreadableStalls_++ % 64 == 0)
+                    spdlog::error("RcState: segment {} has {} B that cannot be mapped — read_committed build "
+                                  "stalled (fail closed; retried with backoff, {} stall(s))",
+                                  s.segBase, m.written, unreadableStalls_);
+            } else if (m.data == nullptr || s.bytePos >= m.size) {
                 // This segment is walked (or gone / empty): the next one.
+                s.stalled = false;
+                s.stallGap = 1;
                 const int64_t next = log.nextSegmentBaseAfter(s.segBase);
                 if (next < 0) s.cursor = s.target;   // nothing beyond: the LEO is reached
                 else { s.segBase = next; s.bytePos = 0; s.segGen = 0; s.readAheadTo = 0; }
             } else {
+                s.stalled = false;
+                s.stallGap = 1;
                 bytes = scanResident_(s, m, static_cast<std::size_t>(budget > 0 ? budget : 1));
             }
         }
         if (bytes > maxStepBytes_) maxStepBytes_ = bytes;
         scannedBytes_ += bytes;
-        if (s.cursor >= s.target) finish_(s);
+        if (s.cursor >= s.target) {
+            finish_(s);
+            log.releaseLazySealedMaps();   // D30 re-review M1: the walk is done
+        }
         return bytes;
     }
     std::size_t scanResident_(Scanning& s, const rune::storage::Log::SegmentBytes& m, std::size_t budget) {
@@ -573,6 +600,7 @@ private:
     uint64_t    readAheadSkippedByIssuer_ = 0;
     uint64_t    residencyGrowths_         = 0;
     uint64_t    scanSteps_        = 0;
+    uint64_t    unreadableStalls_ = 0;   ///< D30 MAJOR-2: passes stalled on an unmappable segment
     std::size_t maxStepBytes_     = 0;
     uint64_t    tailGrowths_      = 0;
     uint64_t    scannedBytes_     = 0;

@@ -1140,3 +1140,52 @@ TEST(SegmentLifecycleHotpathRegression, CleanerSnapshotTripleBufferCrossThreadRe
     EXPECT_EQ(fin.get(), owner.get()) << "the cleaner never receives the latest publish";
     fs::remove_all(d);
 }
+
+// D30 (box 2026-10-08): every sealed segment kept its read mapping (+ its
+// index) — 2 mappings per segment, so a broker died at ~32k segments on a
+// default Linux host (vm.max_map_count 65530: "mmap failed ... .index",
+// std::bad_alloc; gate SegmentRoll/8p).  Sealed bytes are read with pread
+// (#65 / D26); the read map retires at seal and a later readView remaps lazily.
+TEST(SegmentLifecycleHotpathRegression, SealedSegmentsKeepNoReadMapRegression) {
+    const fs::path d = freshDir("d30_sealed_maps");
+    Log log(d.string(), 1024);
+    int64_t off = 0;
+    for (int i = 0; i < 600; ++i) off = put(log, off);
+    const auto bases = log.segmentBaseOffsets();
+    ASSERT_GT(bases.size(), 40u) << "precondition: many rolls";
+    std::size_t mapped = 0;
+    for (std::size_t i = 0; i + 1 < bases.size(); ++i)
+        if (log.segmentForTest(bases[i])->hasReadMapForTest()) ++mapped;
+    EXPECT_EQ(mapped, 0u) << "sealed segments still hold their read mapping (" << mapped << " of " << bases.size() - 1 << ")";
+    // A later read of a sealed segment still works (lazy remap).
+    const auto v = log.readView(bases[1], 4096);
+    ASSERT_FALSE(v.empty());
+    EXPECT_EQ(v.baseOffset, bases[1]);
+    fs::remove_all(d);
+}
+
+// D30 review MAJOR-1 / MEDIUM-2: a walk of old data through the mapping (RC
+// build, readView consumers, fallbacks) maps sealed segments again — bounded:
+// at most mappedSealedCapForTest() stay mapped, the oldest retires; a second
+// read of a still-mapped sealed segment does not remap it.
+TEST(SegmentLifecycleHotpathRegression, LazilyMappedSealedSegmentsAreCappedRegression) {
+    const fs::path d = freshDir("d30_sealed_cap");
+    Log log(d.string(), 1024);
+    int64_t off = 0;
+    for (int i = 0; i < 600; ++i) off = put(log, off);
+    const auto bases = log.segmentBaseOffsets();
+    ASSERT_GT(bases.size(), 40u);
+    for (std::size_t i = 0; i + 1 < bases.size(); ++i) ASSERT_FALSE(log.readView(bases[i], 4096).empty());
+    std::size_t mapped = 0;
+    for (std::size_t i = 0; i + 1 < bases.size(); ++i)
+        if (log.segmentForTest(bases[i])->hasReadMapForTest()) ++mapped;
+    EXPECT_LE(mapped, Log::mappedSealedCapForTest()) << "a walk of old data left every sealed segment mapped";
+    EXPECT_GT(log.sealedMapsEvictedForTest(), 0u);
+    // The last-walked sealed segment is still mapped: reading it again costs no remap.
+    const int64_t last = bases[bases.size() - 2];
+    ASSERT_TRUE(log.segmentForTest(last)->hasReadMapForTest());
+    const uint64_t remaps = log.sealedLazyRemapsForTest();
+    ASSERT_FALSE(log.readView(last, 4096).empty());
+    EXPECT_EQ(log.sealedLazyRemapsForTest(), remaps) << "a still-mapped sealed segment was remapped";
+    fs::remove_all(d);
+}

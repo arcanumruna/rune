@@ -5795,3 +5795,31 @@ TEST(UnknownProducerIdRegression, OldSessionsGetTheStrictPreD6FrameAtEveryAnswer
     const std::vector<int16_t> wantNew{0, kUnknownPid, kUnknownPid, 0, 0, static_cast<int16_t>(pc::ErrorCode::Internal), kNotLeader};
     EXPECT_EQ(newCodes, wantNew);
 }
+
+// D30 review MAJOR-2 (pre-existing; D30 makes it reachable — sealed segments no
+// longer keep a read map, so every RC build maps them): a sealed segment whose
+// mapping FAILS (ENOMEM / vm.max_map_count) was taken for "walked" and skipped —
+// its abort marker never reached the aborted index and read_committed consumers
+// would receive ABORTED records.  An unreadable segment must stall the build
+// (fail closed), never be skipped.
+TEST(TxnRcRegression, UnmappableSealedSegmentStallsTheBuildRegression) {
+    RcRig R({1}, /*rollBytes=*/4096);
+    R.append(txnBatch(7, 0, 0));                 // pid 7 open at 0
+    R.append(marker(7, /*commit=*/false));       // its ABORT at 1, same (to-be-sealed) segment
+    for (int i = 0; i < 8; ++i) R.append(bigBatch(1000));   // roll past it
+    const auto bases = R.log->segmentBaseOffsets();
+    ASSERT_GE(bases.size(), 2u) << "precondition: the marker's segment is sealed; segments=" << bases.size() << " leo=" << R.log->logEndOffset();
+    ASSERT_EQ(bases.front(), 0);
+    auto* sealed = R.log->segmentForTest(0);
+    ASSERT_NE(sealed, nullptr);
+    (void)sealed->swapReadMap(nullptr);          // sealed: no resident mapping (D30 / restart)
+    sealed->setReadMapFaultForTest(true);        // and mapping it fails
+    R.own();
+    for (int i = 0; i < 64; ++i) R.pass();
+    EXPECT_NE(R.status(), Worker::kRcReady) << "the RC build completed over a segment it could not read";
+    sealed->setReadMapFaultForTest(false);       // the mapping recovers: the build resumes
+    ASSERT_TRUE(R.runUntilReady(4096));
+    EXPECT_TRUE(R.covers(7, 0)) << "the ABORT in the once-unreadable segment is missing";
+    EXPECT_EQ(R.log->lazySealedMappedForTest(), 0u) << "the finished build kept the sealed maps it brought back";
+    EXPECT_FALSE(sealed->hasReadMapForTest());
+}

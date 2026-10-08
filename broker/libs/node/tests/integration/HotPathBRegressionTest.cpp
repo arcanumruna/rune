@@ -1650,3 +1650,23 @@ TEST(HotPathBRegression, SteadyStateDutyPassesNeverAllocateRegression) {
     }
     EXPECT_EQ(gArmedAllocs, 0u) << "the worker's steady-state duty pass allocated (see the D28b backtraces above)";
 }
+
+// D30 re-review M3: on the PRODUCTION path (a provisioned, worker-driven log)
+// a sealed segment's read map retires through the provisioner's dispose (the
+// munmap runs off the worker), never inline on the worker, and the sealed
+// segments hold no read map.
+TEST(HotPathBRegression, SealedReadMapsRetireOffTheWorkerRegression) {
+    constexpr int64_t kRoll = 64 * 1024;
+    Rig rig(false, kRoll, nullptr, /*provisioned=*/true);
+    const auto frame = produceFrame(1, 1, 0, 16 * 1024, 2);
+    ASSERT_TRUE(rig.passUntil([&] {
+        rig.pass(&frame);
+        return rig.log->segmentBaseOffsets().size() >= 6;
+    })) << "precondition: several rolls";
+    rig.pass();   // the provisioner drains the dispose posts
+    EXPECT_GT(rig.log->readMapsRetiredAtSealForTest(), 0u);
+    EXPECT_EQ(rig.log->readMapsDisposedInlineForTest(), 0u) << "a read map was unmapped ON the worker";
+    const auto bases = rig.log->segmentBaseOffsets();
+    for (std::size_t i = 0; i + 1 < bases.size(); ++i)
+        EXPECT_FALSE(rig.log->segmentForTest(bases[i])->hasReadMapForTest()) << "sealed segment " << bases[i];
+}
