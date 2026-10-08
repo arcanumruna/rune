@@ -607,6 +607,13 @@ public:
     // stable c_str().
     const char* name() const noexcept override { return threadName_.c_str(); }
 
+    // D23: in-flight epoch-state fsync dups are closed after io_ is gone
+    // (teardownSyncFds_), never leaked and never closed under the fsync.
+    ~Worker() override {
+        for (const TokenRoute& r : routes_)
+            if (r.token != kNoToken && r.syncFd >= 0) teardownSyncFds_.fds.push_back(r.syncFd);
+    }
+
     // Non-copyable and non-movable (two OneToOneByteRing members are not movable).
     Worker(const Worker&)            = delete;
     Worker& operator=(const Worker&) = delete;
@@ -1329,6 +1336,8 @@ public:
     /// The fd the last leader-epoch-state fsync was submitted on.
     [[nodiscard]] int lastEpochStateSyncFdForTest() const noexcept { return lastEpochStateSyncFd_; }
     [[nodiscard]] uint64_t    epochStateNotRoutedForTest() const noexcept { return epochStateNotRouted_; }
+    /// D23: epoch-state fsync dups currently open (dup'd, not yet closed).
+    [[nodiscard]] int         epochStateSyncFdsOpenForTest() const noexcept { return epochStateSyncFdsOpen_; }
     [[nodiscard]] uint64_t    bgFlushSubmitsCountForTest() const noexcept { return bgFlushSubmits_; }
     /// Review Md3 seam: the next `n` epoch-state route inserts fail.
     void forceRouteFailForTest(int n) noexcept { forceRouteFailForTest_ = n; }
@@ -2053,7 +2062,7 @@ private:
         // the log dir goes offline — the synchronous fence's semantics), never
         // the log's fail-stop.
         if (routed && r.kind == RouteKind::EpochState) {
-            if (r.syncFd >= 0) ::close(r.syncFd);
+            if (r.syncFd >= 0) { ::close(r.syncFd); --epochStateSyncFdsOpen_; }
             if (gate && sameReplica_(r, gate->replica))
                 (void)gate->replica->epochStateWriteCompleted(static_cast<uint64_t>(r.aux), c.errorCode);
             return 1;
@@ -2062,7 +2071,7 @@ private:
         // next owner rewrites it: rebuildFlushSlots_) and still the SAME
         // replica (an owned replica at a reused address is another one).
         if (routed && r.kind == RouteKind::MemEpochState) {
-            if (r.syncFd >= 0) ::close(r.syncFd);
+            if (r.syncFd >= 0) { ::close(r.syncFd); --epochStateSyncFdsOpen_; }
             if (std::find(owned_.begin(), owned_.end(), r.replica) != owned_.end() && sameReplica_(r, r.replica))
                 (void)r.replica->epochStateWriteCompleted(static_cast<uint64_t>(r.aux), c.errorCode);
             return 1;
@@ -4028,6 +4037,17 @@ private:
     // NEVER touches it.
     OwnedSet owned_{};
 
+    // D23 (D21 review L1b): the dup fds of epoch-state fsyncs still in flight
+    // when the worker is destroyed.  Declared BEFORE io_, so it is destroyed
+    // AFTER it: the fds are closed only once the backend is gone (portable:
+    // flusher joined; io_uring: ring closed — the kernel holds its own file
+    // reference), never under an in-flight fsync.  Filled by ~Worker (cold).
+    struct DeferredFdClose {
+        std::vector<int> fds;
+        ~DeferredFdClose() { for (const int fd : fds) ::close(fd); }
+    };
+    DeferredFdClose teardownSyncFds_;
+
     // E3: per-worker async I/O backend.
     // Owned exclusively by this worker thread — submit()/reap() are called ONLY
     // from executeProduce_() and reapDurableCompletions_() which both run on
@@ -4629,6 +4649,7 @@ private:
     CompletionToken lastEpochStateToken_ = kNoToken;   ///< tests (lastEpochStateTokenForTest)
     int             lastEpochStateSyncFd_ = -1;        ///< tests (lastEpochStateSyncFdForTest)
     uint64_t    epochStateNotRouted_ = 0; ///< review Md3
+    int         epochStateSyncFdsOpen_ = 0;   ///< D23: open epoch-state fsync dups (tests)
     int         forceRouteFailForTest_ = 0;
     std::vector<uint8_t> esScratch_ = std::vector<uint8_t>(4096);   ///< review Md4: one image buffer per worker
     std::vector<rune::storage::Log*> rpQueue_;   ///< E1d F8: logs whose checkpoint is due
@@ -5218,6 +5239,11 @@ private:
         routes_.assign(cap, TokenRoute{});
         routeMask_ = cap - 1;
     }
+    /// D23: a route slot is free (cold — a scan of <= 2x the io depth).
+    [[nodiscard]] bool routeHasRoom_() const noexcept {
+        for (const TokenRoute& r : routes_) if (r.token == kNoToken) return true;
+        return false;
+    }
     bool routeInsert_(const TokenRoute& r) noexcept {
         for (std::size_t n = 0, i = static_cast<std::size_t>(r.token) & routeMask_; n <= routeMask_;
              ++n, i = (i + 1) & routeMask_) {
@@ -5313,6 +5339,16 @@ private:
             esScratch_.resize(need);                       // cold: the history outgrew the scratch
             if (!r.prepareEpochStateWrite(esScratch_.data(), esScratch_.size(), w, need)) return 0;
         }
+        // D23 (D21 review L1a): its completion must be routable, so the room
+        // is checked BEFORE the slot write and its fsync (cold: a scan of the route
+        // table) — a full table refuses the write (rewritten next pass), never
+        // an unobservable completion whose dup would be left open.
+        if (forceRouteFailForTest_ > 0 || !routeHasRoom_()) [[unlikely]] {
+            if (forceRouteFailForTest_ > 0) --forceRouteFailForTest_;
+            r.epochStateWriteNotSubmitted();   // Prepared -> Idle, still due
+            ++epochStateNotRouted_;
+            return 0;                          // back-pressure (like a refused submit)
+        }
         // The image is copied into the page cache here: the worker's scratch is
         // free again when pwrite returns (review Md4: no per-replica image).
         if (::pwrite(w.fd, w.data, w.len, static_cast<off_t>(w.offset)) != static_cast<ssize_t>(w.len)) {
@@ -5326,6 +5362,7 @@ private:
         // the replica may close / reopen its own fd at any time — an fd number
         // is never closed under an in-flight fsync (and then reused).
         const int syncFd = ::fcntl(w.fd, F_DUPFD_CLOEXEC, 0);
+        if (syncFd >= 0) ++epochStateSyncFdsOpen_;
         if (syncFd < 0) {
             const int err = errno != 0 ? errno : EMFILE;
             r.epochStateWriteSubmitted();
@@ -5336,6 +5373,7 @@ private:
         const CompletionToken t = io_.submit(syncFd, 0);
         if (t == kNoToken) {                               // back-pressure: retry next pass
             ::close(syncFd);                               // never submitted
+            --epochStateSyncFdsOpen_;
             r.epochStateWriteNotSubmitted();
             return 0;
         }
@@ -5353,15 +5391,10 @@ private:
         } else {
             route.kind = RouteKind::MemEpochState;
         }
-        const bool routed = forceRouteFailForTest_ == 0 && routeInsert_(route);
-        if (!routed) [[unlikely]] {
-            if (forceRouteFailForTest_ > 0) --forceRouteFailForTest_;
-            // Its completion is never observed, so its dup is never known to be
-            // idle: deliberately left open (unreachable in production — the
-            // route table holds 2x the io depth) rather than closed under the
-            // in-flight fsync.
-            // Review Md3: an unroutable completion is never observed — the write
-            // is treated as not done and rewritten next pass (never wedged).
+        // Cannot fail: the room was checked above and nothing ran in between
+        // on this thread (D23).  Defensive only — its dup is then left open
+        // (never closed under the in-flight fsync) and the write is redone.
+        if (!routeInsert_(route)) [[unlikely]] {
             spdlog::critical("Worker {}: io token route table full (token={}) — epoch-state write re-queued",
                              workerId_, t);
             r.epochStateWriteNotRouted();

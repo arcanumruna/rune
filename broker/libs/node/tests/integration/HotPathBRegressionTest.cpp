@@ -811,7 +811,28 @@ TEST(HotPathBRegression, UnroutableEpochStateCompletionNeverWedgesPromotionRegre
     rig.roleOp(true, 3);
     rig.pass();
     EXPECT_TRUE(rig.passUntil([&] { return rig.rep->role() == Role::Leader; }, 3000)) << "promotion wedged";
-    EXPECT_EQ(rig.worker().epochStateNotRoutedForTest(), 1u);
+    // D23 (D21 review L1a): a full route table refuses the write BEFORE its
+    // fsync is submitted — never an unobservable completion whose dup fd is
+    // left open for the process lifetime.
+    EXPECT_TRUE(rig.passUntil([&] { return rig.rep->epochStateDurable(); }, 3000));
+    EXPECT_EQ(rig.worker().epochStateSyncFdsOpenForTest(), 0) << "an epoch-state fsync dup leaked";
+}
+
+// D23 (D21 review L1b): a worker torn down with an epoch-state fsync in flight
+// closes that fsync's dup once its io backend is gone (never under the fsync).
+TEST(HotPathBRegression, WorkerTeardownClosesAnInFlightEpochStateFsyncFdRegression) {
+    int syncFd = -1;
+    {
+        Rig rig(/*controllerManaged=*/true);
+        rig.worker().setReapPausedForTest(true);
+        rig.roleOp(true, 3);
+        rig.pass();   // the fence write's fsync is in flight (completion held)
+        ASSERT_TRUE(rig.rep->leadershipPendingForTest());
+        syncFd = rig.worker().lastEpochStateSyncFdForTest();
+        ASSERT_GE(syncFd, 0);
+        ASSERT_NE(::fcntl(syncFd, F_GETFD), -1);
+    }
+    EXPECT_EQ(::fcntl(syncFd, F_GETFD), -1) << "the in-flight fsync's dup leaked past the worker's teardown";
 }
 
 // Md4: an idle partition keeps no epoch-state fd open and its file is small.
