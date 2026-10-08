@@ -993,7 +993,12 @@ public:
                 members.push_back(View{k, pa, &reps, -1});
             }
             if (!ready || members.empty()) continue;
-            if (static_cast<int>(recs.size() + members.size()) > maxRecords) continue;   // next tick, as a unit
+            // Over the remaining budget: the next tick decides it, as a unit (the
+            // runtime re-ticks on the very next cycle after any emit — SlowTick).
+            // D15b l2: an EMPTY tick always admits it — a unit larger than the
+            // whole budget otherwise never fit and stayed leaderless forever
+            // (the drain stays bounded by kMaxRecordsPerBatch).
+            if (!recs.empty() && static_cast<int>(recs.size() + members.size()) > maxRecords) continue;
             auto avail = [&](const View& v, int32_t n, int32_t* leo) {
                 if (!isEligible_(n) || isShutting_(n)) return false;
                 if (std::find(v.pa->replicas.begin(), v.pa->replicas.end(), n) == v.pa->replicas.end()) return false;

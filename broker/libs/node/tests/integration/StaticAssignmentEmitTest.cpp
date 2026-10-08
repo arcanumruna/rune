@@ -2516,3 +2516,34 @@ TEST(D15MemoryEpochRegression, MoreMarksThanOneBatchFirstRebalanceSkipsQueuedKey
         EXPECT_NE(pa->leaderNode, NO_LEADER) << "partition " << p << " never decided";
     }
 }
+
+// D15b l2: a co-partition unit is decided as ONE unit, so a unit whose
+// leaderless members exceed the remaining per-tick record budget waits for the
+// next tick (the runtime re-ticks on the very next cycle after any emit:
+// SlowTick::done).  But a unit LARGER than the whole budget never fit — not
+// even on an empty tick — and stayed leaderless forever.  An empty tick now
+// always admits the unit (the drain stays bounded by kMaxRecordsPerBatch).
+TEST(D15MemoryEpochRegression, UnitLargerThanTheRecordBudgetIsStillDecidedRegression) {
+    CtlRig c(true, {TopicSpec{0, 1, 3, "g", "k"}, TopicSpec{1, 1, 3, "g", "k"}});
+    const int32_t L = c.svc->assignment(0, 0)->leaderNode;
+    ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, L);
+    (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(0, 0), 0, 2, /*memory=*/true));
+    (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(1, 0), 1, 2, /*memory=*/true));
+    c.tick({L});   // the data holders are not live: both members go leaderless
+    ASSERT_EQ(c.svc->assignment(0, 0)->leaderNode, NO_LEADER);
+    ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, NO_LEADER);
+    const int32_t e0 = c.svc->assignment(0, 0)->leaderEpoch, e1 = c.svc->assignment(1, 0)->leaderEpoch;
+    for (int32_t n : {1, 2, 3}) {
+        (void)c.svc->onAlterIsr(reportOf(0, n, e0, n == L ? 0 : 10, n == L ? 2 : 1));
+        (void)c.svc->onAlterIsr(reportOf(1, n, e1, n == L ? 0 : 10, n == L ? 2 : 1));
+    }
+    // A record budget of 1 per tick: the 2-member unit never fits a tick.
+    for (int i = 0; i < 4; ++i) {
+        (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr, 0, /*maxRecordsPerCycle=*/1);
+        c.drive(50);
+    }
+    const int32_t l0 = c.svc->assignment(0, 0)->leaderNode, l1 = c.svc->assignment(1, 0)->leaderNode;
+    EXPECT_NE(l0, NO_LEADER) << "a unit larger than the per-tick record budget was never decided";
+    EXPECT_EQ(l0, l1) << "the unit was split";
+    EXPECT_NE(l0, L) << "the empty memory leader was elected over the replicas holding the data";
+}
