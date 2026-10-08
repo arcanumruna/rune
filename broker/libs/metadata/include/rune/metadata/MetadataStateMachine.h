@@ -172,6 +172,17 @@ private:
 //     int32 isr[0..isrCount-1]
 //     int32 replicaCount
 //     int32 replicas[0..replicaCount-1]
+//
+// D15b m4 (documented gap, no production caller today): this image does NOT
+// carry the D15 replicated state — the committed featureLevel() (a
+// FeatureLevelRecord, type 0x8001) and each leaderless assignment's
+// LeaderlessMark (the 0xD1 trailer).  A restore from it would read level 0
+// and no marks, i.e. a successor would lose the leaderless reasons exactly as
+// after a pre-D15 log (see restoreLeaderlessMarks_).  Before any caller
+// (metadata snapshotting / log compaction) lands, bump the image to carry:
+//   int16 featureLevel                     — after committedPos
+//   per entry: uint8 markKind, int32 markNode, int64 markIncarnation
+// with a format version so an older image restores as level 0 / no marks.
 
 template<typename Writer>
 void MetadataStateMachine::snapshot(Writer& w) const
