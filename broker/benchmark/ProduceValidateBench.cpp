@@ -209,6 +209,10 @@ static void SetupOn(const benchmark::State&) {
     WorkerOp schemaOp;
     schemaOp.type             = WorkerOp::Type::SchemaUpdate;
     schemaOp.topicId          = kTopicId;
+    // Task 12: validators_ is now keyed by (topicId, version) — must match
+    // makeValidValue()'s stamped version=1, or every produce in the timed
+    // loop would silently hit the "unknown schema version" reject path.
+    schemaOp.clientVersion    = 1;
     schemaOp.schemaUpdateBlob = makeCharactersBlob();
     g_fix->worker->tryEnqueueOp(std::move(schemaOp));
     // Drive doWork to apply the SchemaUpdate before the timed loop.

@@ -32,6 +32,7 @@
 // Task 6: AdminWorker + SchemaRegistry + __topic_schemas persistence.
 #include <rune/node/AdminWorker.h>
 #include <rune/node/SchemaRegistry.h>
+#include <rune/codec/Serialize.h>
 // Task 6: RecordBatch reader for rebuildFromLog (same as TxnStateStore).
 #include <rune/protocol/RecordBatch.h>
 // Task 8a: protocol response frames for DDL egress (respondDefine/respondGet).
@@ -2959,7 +2960,16 @@ void BrokerNode::buildAdminWorker() {
         // retry-on-full (each worker builds its Validator on ITS OWN thread).
         deps.pushValidators = [this](const RegistryEntry& entry, int32_t topicId) {
             if (!adminWorkerAgent_) return;
-            adminWorkerAgent_->postSchemaUpdate(topicId, entry.descriptorBlob);
+            // Task 12: fan out the PER-VERSION MATERIALIZED descriptor.
+            // entry.descriptor is already materializeAsOf(evolving, entry.version)
+            // (SchemaRegistry::applyRecord) — i.e. exactly the live field set a
+            // record written at entry.version was encoded with.  entry.descriptorBlob
+            // is the raw CUMULATIVE evolving descriptor (every field ever declared,
+            // live or retired) and must never be sent as-is: a worker building a
+            // Validator from it would validate against the WRONG (latest-evolving)
+            // layout for any version older than the current one.
+            adminWorkerAgent_->postSchemaUpdate(topicId, entry.version,
+                                                rune::codec::serialize(entry.descriptor));
         };
 
         // respondDefine / respondGet (RULING-2 F): encode the protocol response
@@ -3334,7 +3344,7 @@ int BrokerNode::serviceAdminControl_() {
                     onStorageFailure_(std::string(dir), e);
                 },
                 [this](SchemaUpdateMsg m) {
-                    schemaFanout_.post(m.topicId, std::move(m.blob));
+                    schemaFanout_.post(m.topicId, m.version, std::move(m.blob));
                 });
             if ((d == A2cDispatch::Unknown || d == A2cDispatch::Malformed) &&
                 adminToControlRejects_++ % 1024 == 0) [[unlikely]] {

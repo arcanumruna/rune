@@ -353,25 +353,29 @@ inline AdminRoleMsg decodeAdminRole(const uint8_t* buf, std::size_t len) {
     return m;
 }
 
-// ---- SchemaUpdate (admin → control; F3 round 6, item 3) ----
+// ---- SchemaUpdate (admin → control; F3 round 6, item 3; Task 12: +version) ----
 struct SchemaUpdateMsg {
     int32_t              topicId = -1;
+    uint16_t              version = 0;
     std::vector<uint8_t> blob;
 };
 
 /// Wire size of a SchemaUpdate message for `blobLen` descriptor bytes.
+/// Layout: [topicId:i32][version:u16][blob...].
 [[nodiscard]] inline constexpr std::size_t schemaUpdateWireLen(std::size_t blobLen) noexcept {
-    return 4 + blobLen;
+    return 4 + 2 + blobLen;
 }
 
-inline bool encodeSchemaUpdate(OneToOneByteRing& ring, int32_t topicId,
+inline bool encodeSchemaUpdate(OneToOneByteRing& ring, int32_t topicId, uint16_t version,
                                std::span<const uint8_t> blob) {
     using namespace admin_wire;
     const auto idx = ring.tryClaim(kA2cSchemaUpdate, schemaUpdateWireLen(blob.size()));
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
     putI32(p, topicId);
-    if (!blob.empty()) std::memcpy(p + 4, blob.data(), blob.size());
+    p[4] = static_cast<uint8_t>(version & 0xff);
+    p[5] = static_cast<uint8_t>((version >> 8) & 0xff);
+    if (!blob.empty()) std::memcpy(p + 6, blob.data(), blob.size());
     ring.commit(idx);
     return true;
 }
@@ -379,9 +383,10 @@ inline bool encodeSchemaUpdate(OneToOneByteRing& ring, int32_t topicId,
 inline SchemaUpdateMsg decodeSchemaUpdate(const uint8_t* buf, std::size_t len) {
     using namespace admin_wire;
     SchemaUpdateMsg m;
-    if (len < 4) return m;
+    if (len < 6) return m;
     m.topicId = getI32(buf);
-    m.blob.assign(buf + 4, buf + len);
+    m.version = static_cast<uint16_t>(buf[4]) | (static_cast<uint16_t>(buf[5]) << 8);
+    m.blob.assign(buf + 6, buf + len);
     return m;
 }
 
@@ -419,7 +424,7 @@ A2cDispatch dispatchAdminToControl(int32_t typeId, const uint8_t* p, std::size_t
         return A2cDispatch::StorageFailure;
     }
     case kA2cSchemaUpdate:
-        if (n < 4) return A2cDispatch::Malformed;
+        if (n < 6) return A2cDispatch::Malformed;
         onSchemaUpdate(decodeSchemaUpdate(p, n));
         return A2cDispatch::SchemaUpdate;
     default:

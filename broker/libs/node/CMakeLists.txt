@@ -512,6 +512,11 @@ if(BUILD_TESTING)
     #   4. SchemaUpdate_Regression_BadEnumRecord_ValidationFailed
     #   5. SchemaUpdate_Regression_NoValidator_FallsThrough
     #
+    # Task 12: version-keyed validators_ — each writer version gets its own
+    # Validator; a record is selected/validated by ITS OWN writer version:
+    #   6. WorkerValidator.ValidatesRecordAgainstItsOwnSchemaVersion
+    #   7. ProduceValidationRegression.UnknownSchemaVersionRejectedRegression
+    #
     # Uses InMemoryLog + Worker directly (no Aeron required).
     # ---------------------------------------------------------------------------
     add_executable(rune_produce_validation_tests

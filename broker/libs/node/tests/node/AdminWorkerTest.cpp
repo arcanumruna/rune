@@ -343,3 +343,33 @@ TEST(AdminWorkerRegression, MultiOpAlterIsAtomicOnFailure) {
     EXPECT_EQ(h.reg.byName("characters")->version, 1);   // version unchanged
     EXPECT_EQ(h.reg.nextTagFor(tid), 3);                 // no tag burned
 }
+
+// Task 12 regression: AdminWorker::advance_'s ALTER-commit seam must push the
+// freshly-committed version's validator (validate=true) — not just DefineTopic
+// — so worker validators_ stays in sync with every committed ALTER.
+TEST(AdminWorkerRegression, AlterPushesValidatorForNewVersionWhenValidateOnRegression) {
+    Harness h;
+    h.runDefine(1,2,"characters","userId",16,/*validate=*/true,charsBlob());
+    ASSERT_EQ(h.lastErr,0);
+    EXPECT_EQ(h.pushes, 1);                               // CREATE pushed v1
+
+    h.runAlter(10,11,"characters",0, opsBlob({addOp("score",PrimType::Int64)}));
+    EXPECT_EQ(h.lastAlterErr, 0);
+    EXPECT_EQ(h.lastAlterVersion, 2);
+    EXPECT_EQ(h.pushes, 2)
+        << "ALTER must ALSO push a validator for the newly committed version";
+}
+
+// Task 12 regression: an ALTER on a validate=false topic must NOT push a
+// validator (no validator was ever installed for v1 either — nothing to
+// refresh).
+TEST(AdminWorkerRegression, AlterDoesNotPushValidatorWhenValidateOffRegression) {
+    Harness h;
+    h.runDefine(1,2,"characters","userId",16,/*validate=*/false,charsBlob());
+    ASSERT_EQ(h.lastErr,0);
+    EXPECT_EQ(h.pushes, 0);
+
+    h.runAlter(10,11,"characters",0, opsBlob({addOp("score",PrimType::Int64)}));
+    EXPECT_EQ(h.lastAlterErr, 0);
+    EXPECT_EQ(h.pushes, 0);
+}

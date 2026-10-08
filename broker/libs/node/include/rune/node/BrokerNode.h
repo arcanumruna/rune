@@ -305,7 +305,7 @@ public:
     }
 
     /// admin → control ring (T10; F3 r6 extended): kA2cStorageFailure
-    /// ([errno:i32][dir]) and kA2cSchemaUpdate ([topicId:i32][blob]).
+    /// ([errno:i32][dir]) and kA2cSchemaUpdate ([topicId:i32][version:u16][blob]).
     OneToOneByteRing& failureRing() noexcept { return failureRing_; }
 
     /// F3 round 6, item 3 — ADMIN thread only (called from deps.pushValidators
@@ -314,19 +314,22 @@ public:
     /// post the update on the admin→control ring; the control thread fans it
     /// out (SchemaFanout).  Ring full → admin-owned backlog, retried every
     /// doWork.  A descriptor that can never fit the ring is refused loudly.
-    void postSchemaUpdate(int32_t topicId, const std::vector<uint8_t>& blob) {
+    /// Task 12: `version` is the schema version `blob` was materialized as of
+    /// (the caller passes RegistryEntry.descriptor/version, never the raw
+    /// evolving descriptorBlob).
+    void postSchemaUpdate(int32_t topicId, uint16_t version, const std::vector<uint8_t>& blob) {
         // Unreachable by construction (static_assert in AdminChannels.h: every
         // descriptor the request ring can deliver fits one SchemaUpdate); kept
         // as a loud backstop rather than a silent tryClaim throw.
         if (schemaUpdateWireLen(blob.size()) > static_cast<std::size_t>(failureRing_.maxMsgLength()))
             [[unlikely]] {
-            spdlog::error("AdminWorkerAgent: SchemaUpdate for topicId={} ({} B descriptor) "
+            spdlog::error("AdminWorkerAgent: SchemaUpdate for topicId={} version={} ({} B descriptor) "
                           "exceeds the admin→control ring max message ({} B); validator "
-                          "NOT pushed", topicId, blob.size(), failureRing_.maxMsgLength());
+                          "NOT pushed", topicId, version, blob.size(), failureRing_.maxMsgLength());
             return;
         }
-        if (!schemaBacklog_.empty() || !encodeSchemaUpdate(failureRing_, topicId, blob))
-            schemaBacklog_.push_back(SchemaUpdateMsg{topicId, blob});   // keep FIFO order
+        if (!schemaBacklog_.empty() || !encodeSchemaUpdate(failureRing_, topicId, version, blob))
+            schemaBacklog_.push_back(SchemaUpdateMsg{topicId, version, blob});   // keep FIFO order
     }
     [[nodiscard]] std::size_t schemaBacklogForTest() const noexcept { return schemaBacklog_.size(); }
     int flushSchemaBacklogForTest() { return flushSchemaBacklog_(); }
@@ -361,7 +364,8 @@ private:
     int flushSchemaBacklog_() {
         std::size_t sent = 0;
         while (sent < schemaBacklog_.size() &&
-               encodeSchemaUpdate(failureRing_, schemaBacklog_[sent].topicId, schemaBacklog_[sent].blob))
+               encodeSchemaUpdate(failureRing_, schemaBacklog_[sent].topicId,
+                                  schemaBacklog_[sent].version, schemaBacklog_[sent].blob))
             ++sent;
         schemaBacklog_.erase(schemaBacklog_.begin(),
                              schemaBacklog_.begin() + static_cast<std::ptrdiff_t>(sent));

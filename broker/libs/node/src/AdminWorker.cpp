@@ -379,10 +379,18 @@ bool AdminWorker::advance_(int64_t nowNs) {
         //    startAlter_) record to the registry and respond OK.
         if (inFlight_->kind == DdlKind::Alter) {
             reg_.applyRecord(inFlight_->alterSchema);
-            // SEAM (Task 12): fan out the evolved schema to the produce/consume
-            // workers here (validator refresh for the new version) once the
-            // worker-side multi-version apply lands.  Intentionally NOT done in
-            // this task — the registry commit above is the single source of truth.
+            // Task 12: fan out the evolved schema to the produce/consume workers
+            // (validator refresh for the new version) now that the worker side
+            // keys validators_ by (topicId, version) — each writer version gets
+            // its own Validator, so this never clobbers the still-live older
+            // version's validator.  byIdVersion (not byId/latest) pins exactly
+            // the version this ALTER just committed, independent of any later
+            // concurrent commit (single-threaded admin worker, but explicit).
+            if (inFlight_->alterSchema.validate) {
+                if (const RegistryEntry* entry =
+                        reg_.byIdVersion(inFlight_->topicId, inFlight_->newVersion))
+                    deps_.pushValidators(*entry, inFlight_->topicId);
+            }
             deps_.respondAlter(inFlight_->alter.session, inFlight_->alter.corr,
                                inFlight_->topicId, inFlight_->newVersion, kOK);
             inFlight_.reset();

@@ -84,10 +84,12 @@ struct WorkerOp {
         Subscribe,                ///< gateway → worker: register/update a subscription cursor
         Unsubscribe,              ///< gateway → worker: remove a subscription
         // Task 7: admin → worker schema validator push.
-        // Carries topicId (existing scalar) + descriptor blob (tail, TailKind=DESCRIPTOR_BLOB).
+        // Carries topicId (existing scalar) + descriptor blob (tail, TailKind=DESCRIPTOR_BLOB)
+        // + version (Task 12: carried in the existing `clientVersion` scalar).
         // Worker builds a local rune::codec::Validator from the blob on its own thread
-        // (shared-nothing: validators_ is worker-owned, never touched by any other thread).
-        SchemaUpdate,             ///< admin → worker: install/update a per-topic Validator
+        // (shared-nothing: validators_ is worker-owned, never touched by any other thread),
+        // keyed by (topicId, version) so every writer version has its own validator.
+        SchemaUpdate,             ///< admin → worker: install/update a per-topic-version Validator
         // Self-contained worker shards (spec §3.4, Task 13) — values 13/14 = the
         // schema's SESSION_ANNOUNCE / SESSION_CLOSE.  Runtime → EVERY worker,
         // control plane (connect / disconnect rate), never ownership-gated.
@@ -183,6 +185,11 @@ struct WorkerOp {
     std::string_view egressChannel;
     // D6: SessionAnnounce — the session's ConnectRequest.clientVersion (a
     // worker acking directly gates UnknownProducerId on it).
+    // Task 12: ALSO carries SchemaUpdate's schema version (RegistryEntry::version
+    // the installed blob was materialized as of) — set it directly when building
+    // a SchemaUpdate op (see schemaUpdateBlob's comment).  SessionAnnounce and
+    // SchemaUpdate never share one WorkerOp instance, so the reuse is safe and
+    // costs no extra branch on the shared encode path (enqueueOp).
     int32_t          clientVersion = 0;
 
     // SetOwnership: the ReplicaRegistry generation this owned set reflects
@@ -301,6 +308,11 @@ struct WorkerOp {
     //
     // topicId is carried in the existing common scalar field (WorkerOp::topicId).
     // The blob is carried as the variable tail (TailKind = DESCRIPTOR_BLOB).
+    // Task 12: the schema version this descriptor blob was materialized as of
+    // (RegistryEntry::version — matches the live field set/offsets the blob
+    // encodes) rides the existing `clientVersion` scalar field below (set it
+    // directly — no dedicated schemaUpdateVersion field, so encoding a
+    // SchemaUpdate op costs no extra branch on the shared enqueueOp path).
     std::vector<uint8_t> schemaUpdateBlob;
 
     // -----------------------------------------------------------------------
