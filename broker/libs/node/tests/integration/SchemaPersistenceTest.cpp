@@ -37,6 +37,7 @@
 
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
+#include <rune/codec/AlterOps.h>
 
 #include <atomic>
 #include <chrono>
@@ -102,6 +103,20 @@ static std::vector<uint8_t> charsBlob() {
         .add("userId", PrimType::Int64, 1, true)
         .add("name",   PrimType::String)
         .build());
+}
+
+// ALTER ops helpers (mirrors AdminWorkerTest.cpp's helpers) — used by the
+// multi-version replay regression test below.
+static std::vector<uint8_t> altersOpsBlob(const std::vector<AlterOp>& ops) {
+    return encodeAlterOps(ops);
+}
+static AlterOp addOp(const std::string& name, PrimType t) {
+    AlterOp op{}; op.type = AlterOpType::Add; op.name = name; op.primType = t; op.fixedLen = 0;
+    return op;
+}
+static AlterOp setCompatOp(CompatMode m) {
+    AlterOp op{}; op.type = AlterOpType::SetCompatibility; op.mode = m;
+    return op;
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +227,13 @@ protected:
             lastGetTopicId_ = topicId;
             lastGetError_   = errorCode;
         };
+        deps.respondAlter = [this](int64_t /*session*/, int64_t /*corr*/,
+                                   int32_t topicId, uint16_t newVersion,
+                                   uint16_t errorCode) {
+            lastAlterTopicId_ = topicId;
+            lastAlterVersion_ = newVersion;
+            lastAlterError_   = errorCode;
+        };
 
         adminWorker_ = std::make_unique<AdminWorker>(
             *registry_, replica_.get(), /*selfId=*/1,
@@ -240,6 +262,18 @@ protected:
         }
     }
 
+    // Drive one ALTER through the (synchronous, no createTopic round-trip)
+    // state machine to completion: submit → doWork loop until the single-node
+    // HW gate resolves.
+    void driveAlter(const AlterTopicMsg& msg) {
+        adminWorker_->submitAlterTopic(msg);
+        int64_t nowNs = 0;
+        for (int i = 0; i < 50; ++i) {
+            nowNs += 1'000'000LL;
+            adminWorker_->doWork(nowNs);
+        }
+    }
+
     // Drive one "doWork" tick on the replica (advances HW on single-node leader).
     void tick(int n = 1) {
         int64_t nowNs = 0;
@@ -264,6 +298,9 @@ protected:
     uint16_t lastDefineError_   = 0xffff;
     int32_t  lastGetTopicId_    = -1;
     uint16_t lastGetError_      = 0xffff;
+    int32_t  lastAlterTopicId_  = -1;
+    uint16_t lastAlterVersion_  = 0;
+    uint16_t lastAlterError_    = 0xffff;
     int      pushValidatorCallCount_ = 0;
     int32_t  lastPushedTopicId_      = -1;
 };
@@ -464,4 +501,126 @@ TEST_F(SchemaPersistenceTest, Regression_RULING1_TopicIdIsReturnedByCreateTopic)
     ASSERT_NE(e, nullptr);
     EXPECT_EQ(e->topicId, 42)
         << "Registry entry topicId must match the replied create-topic id (42)";
+}
+
+// ---------------------------------------------------------------------------
+// Regression (Task 15): ReplayReconstructsAllVersionsAndNextTag
+//
+// Task 9 made SchemaRegistry::applyRecord APPEND a version per topicId (never
+// overwrite/collapse). This test proves BOTH replay paths that depend on that
+// append semantics actually reconstruct every version of a topic, not just the
+// latest:
+//
+//   Path A — boot replay: BrokerNode.cpp's [0,HW) forEachRecord → applyRecord
+//            loop, mirrored verbatim by rebuildSchemaRegistryFromLog() above.
+//   Path B — follower rebuild: AdminWorker::rebuildFromLog_(), exercised here
+//            via a FRESH AdminWorker + FRESH SchemaRegistry wired to the SAME
+//            replica/log and promoted leader->leader at the SAME epoch (the
+//            same reuse pattern as Regression_RULING1 above) — a same-epoch
+//            becomeLeader() is an idempotent ISR re-assert (see
+//            PartitionReplica::becomeLeader), so this only exercises the
+//            Follower->Leader onRole edge's rebuildFromLog_() call without
+//            disturbing the fixture's own replica_/adminWorker_ state.
+//
+// Scenario: DEFINE v1 (3 fields) -> ALTER #1 ADDs "score" (-> v2, nextTag
+// 3->4) -> ALTER #2 SETs compatibility to FORWARD (-> v3, distinct from the
+// default BACKWARD). Both replay paths must reconstruct versions {1,2,3},
+// latest()==v3, and the v3-current nextTag/compatMode.
+// ---------------------------------------------------------------------------
+TEST_F(SchemaPersistenceTest, ReplayReconstructsAllVersionsAndNextTag) {
+    // 1. DEFINE v1: "characters" (id, userId, name) == 3 fields.
+    DefineTopicMsg def;
+    def.session        = 1;
+    def.corr           = 2;
+    def.name           = "characters";
+    def.keyField       = "userId";
+    def.partitionCount = 4;
+    def.validate       = false;
+    def.blob           = charsBlob();
+    driveDefine(def);
+    ASSERT_EQ(lastDefineError_, 0u) << "Precondition: DefineTopic must succeed";
+    const int32_t topicId = lastDefineTopicId_;
+
+    // 2. ALTER -> v2: ADD "score" (fresh durable tag == old fieldCount, 3).
+    AlterTopicMsg alter1;
+    alter1.session         = 10;
+    alter1.corr            = 11;
+    alter1.topicName       = "characters";
+    alter1.expectedVersion = 0;  // unconditional
+    alter1.opsBlob         = altersOpsBlob({addOp("score", PrimType::Int64)});
+    driveAlter(alter1);
+    ASSERT_EQ(lastAlterError_, 0u) << "Precondition: ALTER #1 (ADD score) must succeed";
+    ASSERT_EQ(lastAlterVersion_, 2u);
+
+    // 3. ALTER -> v3: SET COMPATIBILITY FORWARD (distinct from the default
+    //    BACKWARD, so the test can assert the persisted compatMode on replay).
+    AlterTopicMsg alter2;
+    alter2.session         = 12;
+    alter2.corr            = 13;
+    alter2.topicName       = "characters";
+    alter2.expectedVersion = 0;
+    alter2.opsBlob         = altersOpsBlob({setCompatOp(CompatMode::Forward)});
+    driveAlter(alter2);
+    ASSERT_EQ(lastAlterError_, 0u) << "Precondition: ALTER #2 (SET COMPAT) must succeed";
+    ASSERT_EQ(lastAlterVersion_, 3u);
+
+    tick(5);  // belt-and-suspenders HW advance (matches Test 2's pattern)
+
+    // ── Path A: boot replay into a FRESH registry. ──────────────────────────
+    SchemaRegistry bootReg;
+    rebuildSchemaRegistryFromLog(replica_.get(), bootReg);
+
+    const RegistryEntry* v1 = bootReg.byIdVersion(topicId, 1);
+    const RegistryEntry* v2 = bootReg.byIdVersion(topicId, 2);
+    const RegistryEntry* v3 = bootReg.byIdVersion(topicId, 3);
+    ASSERT_NE(v1, nullptr) << "boot replay: v1 must survive (not collapsed by v2/v3)";
+    ASSERT_NE(v2, nullptr) << "boot replay: v2 must survive";
+    ASSERT_NE(v3, nullptr) << "boot replay: v3 must survive";
+    EXPECT_EQ(v1->version, 1u);
+    EXPECT_EQ(v2->version, 2u);
+    EXPECT_EQ(v3->version, 3u);
+
+    const RegistryEntry* bootLatest = bootReg.latest(topicId);
+    ASSERT_NE(bootLatest, nullptr);
+    EXPECT_EQ(bootLatest->version, 3u) << "latest() must be v3 after boot replay";
+    EXPECT_EQ(bootLatest->nextTag, 4u)
+        << "nextTag (bumped 3->4 by the v2 ADD) must survive replay";
+    EXPECT_EQ(bootLatest->compatMode, CompatMode::Forward)
+        << "compatMode set by ALTER #2 must survive replay";
+
+    // byFingerprint must still resolve the OLDER v1 fingerprint (old producers
+    // stamping records against the pre-ALTER schema).
+    EXPECT_EQ(bootReg.byFingerprint(topicId, v1->fingerprint), v1);
+
+    // ── Path B: AdminWorker::rebuildFromLog_ (follower -> leader promotion). ─
+    SchemaRegistry promotedReg;
+    AdminDeps noopDeps;
+    noopDeps.requestCreateTopic = [](int64_t, int32_t, const std::string&) { return true; };
+    noopDeps.pushValidators     = [](const RegistryEntry&, int32_t) {};
+    noopDeps.respondDefine      = [](int64_t, int64_t, int32_t, uint16_t, uint16_t) {};
+    noopDeps.respondGet         = [](int64_t, int64_t, int32_t, uint16_t,
+                                     const std::vector<uint8_t>&, uint16_t) {};
+    noopDeps.respondAlter       = [](int64_t, int64_t, int32_t, uint16_t, uint16_t) {};
+
+    AdminWorker promotedWorker(promotedReg, replica_.get(), /*selfId=*/1,
+                               std::vector<int32_t>{1}, std::move(noopDeps));
+    promotedWorker.onRole(AdminRoleMsg{/*leader=*/true, /*epoch=*/1, /*leaderId=*/1});
+
+    const RegistryEntry* pv1 = promotedReg.byIdVersion(topicId, 1);
+    const RegistryEntry* pv2 = promotedReg.byIdVersion(topicId, 2);
+    const RegistryEntry* pv3 = promotedReg.byIdVersion(topicId, 3);
+    ASSERT_NE(pv1, nullptr) << "rebuildFromLog_: v1 must survive (not collapsed by v2/v3)";
+    ASSERT_NE(pv2, nullptr) << "rebuildFromLog_: v2 must survive";
+    ASSERT_NE(pv3, nullptr) << "rebuildFromLog_: v3 must survive";
+    EXPECT_EQ(pv1->version, 1u);
+    EXPECT_EQ(pv2->version, 2u);
+    EXPECT_EQ(pv3->version, 3u);
+
+    const RegistryEntry* promotedLatest = promotedReg.latest(topicId);
+    ASSERT_NE(promotedLatest, nullptr);
+    EXPECT_EQ(promotedLatest->version, 3u) << "latest() must be v3 after rebuildFromLog_";
+    EXPECT_EQ(promotedLatest->nextTag, 4u)
+        << "nextTag must survive rebuildFromLog_ (follower rebuild)";
+    EXPECT_EQ(promotedLatest->compatMode, CompatMode::Forward)
+        << "compatMode must survive rebuildFromLog_ (follower rebuild)";
 }
