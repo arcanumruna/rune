@@ -1987,6 +1987,12 @@ private:
     /// reports to THIS controller again (the reports the predecessor
     /// collected — and answered — died with it).  One record per marked
     /// partition per controller change; deterministic from replicated state.
+    /// D15b l5 (ruling): a NO_LEADER record written by a pre-D15 controller
+    /// carries no mark — its reason died with that controller.  It is left to
+    /// the balancer on the committed ISR, exactly as on main (never re-armed,
+    /// no mark invented): re-deciding every unmarked leaderless partition on
+    /// fresh reports would hold one whose ISR member trails a non-ISR replica,
+    /// where Kafka (and main) elect the ISR member.
     void restoreLeaderlessMarks_() {
         namespace rm = rune::metadata;
         msm_.committedMap().forEach([&](int32_t topicId, int32_t partition, const rm::PartitionAssignment& pa) {

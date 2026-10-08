@@ -2547,3 +2547,37 @@ TEST(D15MemoryEpochRegression, UnitLargerThanTheRecordBudgetIsStillDecidedRegres
     EXPECT_EQ(l0, l1) << "the unit was split";
     EXPECT_NE(l0, L) << "the empty memory leader was elected over the replicas holding the data";
 }
+
+// D15b l5 (ruling pinned): a NO_LEADER record written by a pre-D15 (main)
+// controller carries no mark.  The successor has nothing to restore: it
+// invents no mark and does not re-arm the partition (no extra record) — the
+// balancer decides it on the committed ISR exactly as main does.
+TEST(D15MemoryEpochRegression, UnmarkedLegacyLeaderlessRecordDecidedAsOnMainRegression) {
+    CtlRig c;
+    const PartitionAssignment a = c.pa();
+    {
+        std::vector<BalancerRecord> recs(1);
+        BalancerRecord& br = recs[0];
+        br.isr      = a.isr;
+        br.replicas = a.replicas;   // br.mark: Kind::None — no trailer, as main writes it
+        br.rec.topicId        = 0;
+        br.rec.partition      = 0;
+        br.rec.leaderNode     = NO_LEADER;
+        br.rec.leaderEpoch    = a.leaderEpoch + 1;
+        br.rec.partitionEpoch = std::max(a.partitionEpoch + 1, br.rec.leaderEpoch);
+        br.rec.isr      = rune::protocol::metadata::Int32ArrayView{br.isr.data(), static_cast<uint16_t>(br.isr.size())};
+        br.rec.replicas = rune::protocol::metadata::Int32ArrayView{br.replicas.data(), static_cast<uint16_t>(br.replicas.size())};
+        c.svc->emitDynamicAssignment(recs);
+        c.drive(50);
+    }
+    ASSERT_EQ(c.pa().leaderNode, NO_LEADER);
+    ASSERT_EQ(c.pa().mark.kind, LeaderlessMark::Kind::None);
+    const int32_t lle = c.pa().leaderEpoch;
+    Failover f(c);
+    ASSERT_TRUE(f.svc2.controllerCaughtUpForTest());
+    EXPECT_EQ(f.pa().leaderEpoch, lle) << "an unmarked leaderless partition was re-armed at the claim";
+    EXPECT_EQ(f.pa().mark.kind, LeaderlessMark::Kind::None);
+    f.tick();
+    EXPECT_NE(f.pa().leaderNode, NO_LEADER) << "the balancer did not decide the legacy leaderless partition";
+    EXPECT_EQ(f.pa().leaderEpoch, lle + 1);
+}
