@@ -84,6 +84,42 @@ TEST(RuneCliOffline, ApplyDryRunRoutesAlterFileToAlterPath) {
     EXPECT_EQ(o.find("schema characters"), std::string::npos) << "got: " << o;
 }
 
+// A malformed --expected-version must be a clean CLI error (non-zero exit,
+// clear message on err), never an uncaught std::invalid_argument/terminate —
+// and this must hold even under --dry-run (no broker contact needed to fail).
+TEST(RuneCliOffline, AlterRejectsNonNumericExpectedVersion) {
+    fs::path f = fs::temp_directory_path()/"alter_bad_expected_version.rql";
+    { std::ofstream o(f); o << "alter topic characters drop column nickname;"; }
+    std::ostringstream out, err;
+    int rc = rune::cli::run(
+        {"schema","alter", f.string(), "--dry-run", "--expected-version", "foo"}, out, err);
+    EXPECT_NE(rc, 0);
+    EXPECT_NE(err.str().find("--expected-version"), std::string::npos) << "got: " << err.str();
+}
+
+// An out-of-range --expected-version (> 65535, the uint16_t ceiling) must
+// also be a clean error, not a silent truncation or a crash.
+TEST(RuneCliOffline, AlterRejectsOutOfRangeExpectedVersion) {
+    fs::path f = fs::temp_directory_path()/"alter_oor_expected_version.rql";
+    { std::ofstream o(f); o << "alter topic characters drop column nickname;"; }
+    std::ostringstream out, err;
+    int rc = rune::cli::run(
+        {"schema","alter", f.string(), "--dry-run", "--expected-version", "99999999"}, out, err);
+    EXPECT_NE(rc, 0);
+    EXPECT_NE(err.str().find("--expected-version"), std::string::npos) << "got: " << err.str();
+}
+
+// A negative --expected-version must also be a clean error.
+TEST(RuneCliOffline, AlterRejectsNegativeExpectedVersion) {
+    fs::path f = fs::temp_directory_path()/"alter_neg_expected_version.rql";
+    { std::ofstream o(f); o << "alter topic characters drop column nickname;"; }
+    std::ostringstream out, err;
+    int rc = rune::cli::run(
+        {"schema","alter", f.string(), "--dry-run", "--expected-version", "-1"}, out, err);
+    EXPECT_NE(rc, 0);
+    EXPECT_NE(err.str().find("--expected-version"), std::string::npos) << "got: " << err.str();
+}
+
 // `rune schema alter` on a 'topic' (not 'alter topic') statement is an error.
 TEST(RuneCliOffline, AlterRejectsTopicStatement) {
     fs::path f = fs::temp_directory_path()/"alter_wrong_kind.rql";
@@ -165,6 +201,25 @@ TEST(RuneCliOfflineRegression, ApplyDispatchesOnParseVariant) {
     EXPECT_EQ(alterOut.str().find("schema characters"), std::string::npos)
         << "an 'alter topic' file must never produce a DefineTopic descriptor dump; got: "
         << alterOut.str();
+}
+
+// Regression: a malformed/out-of-range --expected-version must never reach
+// std::stoi uncaught (std::invalid_argument/out_of_range -> std::terminate).
+// Pinned for BOTH `alter` (where the validation must run before --dry-run
+// short-circuits, so an offline dry-run never crashes) and `apply` routed to
+// an alter file (same flag, live-only code path but still guarded).
+TEST(RuneCliOfflineRegression, ExpectedVersionMalformedIsCleanErrorNotCrash) {
+    fs::path f = fs::temp_directory_path()/"regression_expected_version.rql";
+    { std::ofstream o(f); o << "alter topic characters add column nickname string;"; }
+
+    for (const std::string& bad : {std::string("foo"), std::string("99999999"), std::string("-1")}) {
+        std::ostringstream out, err;
+        int rc = rune::cli::run(
+            {"schema","alter", f.string(), "--dry-run", "--expected-version", bad}, out, err);
+        EXPECT_NE(rc, 0) << "bad value '" << bad << "' must be a non-zero exit";
+        EXPECT_NE(err.str().find("--expected-version"), std::string::npos)
+            << "bad value '" << bad << "' must print a clear error; got: " << err.str();
+    }
 }
 
 // Regression: `rune schema alter` on an .rql file whose statement is 'topic'

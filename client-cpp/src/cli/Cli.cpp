@@ -18,6 +18,7 @@
 #include <rune/codec/Generator.h>
 #include <rune/codec/Fingerprint.h>
 
+#include <charconv>
 #include <iomanip>
 
 #include <filesystem>
@@ -80,6 +81,27 @@ bool hasFlag(const std::vector<std::string>& args, std::string_view flag) {
         if (a == flag) return true;
     }
     return false;
+}
+
+/// Parse --expected-version defensively: an empty string means "not given"
+/// (expectedVersion stays 0 = no CAS). A non-numeric value, a value with
+/// trailing garbage, or one outside uint16_t range (negative or > 65535) is
+/// a clean CLI error — never an uncaught std::invalid_argument/out_of_range
+/// out of std::stoi (which would std::terminate the process). Returns false
+/// (and writes a message to err) on a bad value; callers must check the
+/// return value BEFORE acting on `out` and before any --dry-run short-circuit,
+/// so a malformed flag is reported the same way offline and live.
+bool parseExpectedVersion(std::string_view flagStr, uint16_t& out, std::ostream& err) {
+    if (flagStr.empty()) { out = 0; return true; }
+    int value = 0;
+    const auto res = std::from_chars(flagStr.data(), flagStr.data() + flagStr.size(), value);
+    if (res.ec != std::errc{} || res.ptr != flagStr.data() + flagStr.size() ||
+        value < 0 || value > 0xFFFF) {
+        err << "error: --expected-version must be a non-negative integer (0..65535)\n";
+        return false;
+    }
+    out = static_cast<uint16_t>(value);
+    return true;
 }
 
 void printUsage(std::ostream& err) {
@@ -317,8 +339,10 @@ int cmdSchemaApply(const std::vector<std::string>& args,
         if (isAlter) {
             const auto& ad = std::get<rune::ql::AlterTopicDef>(*result);
             uint16_t expectedVersion = 0;
-            const std::string evStr = flagValue(args, "--expected-version");
-            if (!evStr.empty()) expectedVersion = static_cast<uint16_t>(std::stoi(evStr));
+            if (!parseExpectedVersion(flagValue(args, "--expected-version"), expectedVersion, err)) {
+                client.close();
+                return 1;
+            }
 
             rune::ql::AlterTopicPlan plan = rune::ql::applyAlterPlan(ad, expectedVersion);
 
@@ -427,9 +451,12 @@ int cmdSchemaAlter(const std::vector<std::string>& args,
     }
     const auto& ad = std::get<rune::ql::AlterTopicDef>(*result);
 
+    // Validate --expected-version BEFORE the --dry-run short-circuit, so a
+    // malformed value is a clean error offline too, not just live.
     uint16_t expectedVersion = 0;
-    const std::string evStr = flagValue(args, "--expected-version");
-    if (!evStr.empty()) expectedVersion = static_cast<uint16_t>(std::stoi(evStr));
+    if (!parseExpectedVersion(flagValue(args, "--expected-version"), expectedVersion, err)) {
+        return 1;
+    }
 
     // ── Dry run: emit parsed ops as text, no broker contact ───────────────────
     if (dryRun) {
