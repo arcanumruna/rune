@@ -629,4 +629,13 @@ The view engine (downstream) must fold an event batch into a view in **< 10 µs 
 | Produce/consume steady state with the schema-evolution machinery present but **no DDL in flight** | **0 %** regression vs baseline (ABAB) | Task 12 |
 | `ALTER` end-to-end latency (control-plane) | measured & reported; must be **off** the produce/consume hot path (no effect on the above) — no hard ceiling | Task 11 |
 
-Rationale: the decode path is a slice of the downstream 10 µs fold budget; ~150 ns/record decode leaves ample headroom for project + per-field merge + flat-table upsert to fit under 10 µs for realistic batch sizes. If any decode gate is missed, it is a correctness-of-design failure for the view engine and must be fixed before the view-engine plan starts (fix-on-sight).
+#### QL → wire → plan gates (DDL instance of the general query-pipeline NFR)
+
+The general NFR (user-stated 2026-10-08): **QL text → wire format ≤ 2–5 µs**, and **wire → execution plan ≤ 2–5 µs** — "it has to be extremely fast." The full SELECT-query form binds in the future **query-surface spec**; this plan carries the DDL instance of the same pipeline and gates it now (ABAB, n ≥ 15, p99):
+
+| Benchmark | Gate | Owning task |
+|---|---|---|
+| rune-ql: parse `alter topic …` text → AST → `AlterOps` wire blob (`applyAlterPlan`) | **≤ 5 µs p99** (extend `benchmark/ParseBench.cpp`) | Task 16/17 |
+| broker: `AlterOps` wire blob → `applyOps` → new evolving descriptor (the schema "plan") | **≤ 5 µs p99** | Task 11 |
+
+Rationale: the decode path is a slice of the downstream 10 µs fold budget; ~150 ns/record decode leaves ample headroom for project + per-field merge + flat-table upsert to fit under 10 µs for realistic batch sizes. The QL→wire→plan gates prove the query-pipeline grammar/transform infrastructure is already sub-5 µs before SELECT queries are layered on it. If any gate is missed, it is a correctness-of-design failure and must be fixed before the view-engine/query plan starts (fix-on-sight).
