@@ -113,8 +113,28 @@ trap teardown EXIT
 # evo_probe_vN compiled at RUNTIME once their generated headers exist).
 # ---------------------------------------------------------------------------
 log "Step 1a: Building single-node broker image (tag=${RUNE_IMAGE_TAG})..."
-docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" build 2>&1 \
-    | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+# IMPORTANT: capture `docker compose build`'s OWN exit status directly via
+# command substitution (NOT through a `| grep ... || true` pipe under
+# `set -o pipefail`, which would unconditionally report success regardless of
+# whether the build itself failed — a genuinely broken build could then
+# silently fall through to `compose up` reusing a STALE already-tagged image
+# from an earlier successful run under the same commit-sha tag, and the e2e
+# would test nothing of this run's actual source). Filter for display only
+# AFTER the real exit code is captured and checked.
+set +e
+broker_build_out=$(docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" build 2>&1)
+broker_build_rc=$?
+set -e
+echo "${broker_build_out}" | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+if [ "${broker_build_rc}" -ne 0 ]; then
+    echo "${broker_build_out}" >&2
+    fail "broker image build failed (exit ${broker_build_rc}) — see full output above"
+fi
+# Defense in depth, symmetric to the client image check below: confirm the
+# expected-for-THIS-run tag actually exists (catches the image having been
+# produced under a different/unexpected tag even if the build reported success).
+docker image inspect "rune-broker-node:${RUNE_IMAGE_TAG}" >/dev/null 2>&1 \
+    || fail "broker image not built: rune-broker-node:${RUNE_IMAGE_TAG}"
 
 log "Step 1b: Building client image (${CLIENT_IMAGE})..."
 docker build \
@@ -248,11 +268,25 @@ if [ "${reject_rc}" -eq 0 ]; then
     echo "[in] FAIL: drop-under-forward was ACCEPTED (expected a SchemaIncompatible reject)" >&2
     exit 40
 fi
-if ! echo "${reject_out}" | grep -qi "incompatible"; then
-    echo "[in] FAIL: drop-under-forward was rejected, but not with an 'incompatible' message" >&2
+# Tighten beyond "any nonzero exit": the CLI's cmdSchemaAlter returns the
+# broker's wire errorCode as its process exit code (rune::cli reportAlterResult
+# -> `return static_cast<int>(r.errorCode)`), and
+# rune::protocol::client::ErrorCode::SchemaIncompatible == 29 (Protocol.h) —
+# distinct from SchemaConflict (30, phase 7) or any other failure mode (e.g. a
+# CLI usage error, a connect/timeout failure, or a different broker rejection).
+# Require BOTH the exact code AND the message token so this phase cannot be
+# satisfied by some other, unrelated rejection.
+RUNE_SCHEMA_INCOMPATIBLE_CODE=29
+if [ "${reject_rc}" -ne "${RUNE_SCHEMA_INCOMPATIBLE_CODE}" ]; then
+    echo "[in] FAIL: drop-under-forward was rejected, but with exit=${reject_rc}" \
+         "(want ${RUNE_SCHEMA_INCOMPATIBLE_CODE} = SchemaIncompatible)" >&2
     exit 41
 fi
-echo "[in] drop-under-forward correctly REJECTED (SchemaIncompatible), exit=${reject_rc}"
+if ! echo "${reject_out}" | grep -qi "incompatible"; then
+    echo "[in] FAIL: drop-under-forward exited ${reject_rc} but without an 'incompatible' message" >&2
+    exit 42
+fi
+echo "[in] drop-under-forward correctly REJECTED (SchemaIncompatible, errorCode=${reject_rc})"
 
 echo "[in] ===== PHASE 6: the v1-bound probe (compiled ONCE, in phase 1) still opens at v5 ====="
 RUNE_MODE=open_only /build/build/evo_probe_v1
