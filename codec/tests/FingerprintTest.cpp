@@ -29,3 +29,22 @@ TEST(Fingerprint, NameEnumBoundaryNotSlidable) {
                        .build();
   EXPECT_NE(fingerprint(withEnum), fingerprint(withoutEnum));
 }
+
+// Golden stability: a schema where every field is live-forever (untilVersion
+// == 0xFFFF, the only kind that exists in any pre-evolution schema) must
+// fingerprint exactly as it did before untilVersion absorption was added.
+TEST(Fingerprint, GoldenUnchangedForAdditiveSchema) {
+    rune::codec::DescriptorBuilder b("chars");
+    b.add("id", rune::codec::PrimType::Int64);
+    b.add("userId", rune::codec::PrimType::Int64, 1, true);
+    b.add("name", rune::codec::PrimType::String);
+    EXPECT_EQ(rune::codec::fingerprint(b.build()), 0x8FC60841B8667539ULL);
+}
+
+TEST(Fingerprint, DiffersAcrossVersionsWhenFieldDropped) {
+    rune::codec::DescriptorBuilder b("t");
+    b.addTagged("id",  1, rune::codec::PrimType::Int64, 1, 0xFFFF, true, {});
+    b.addTagged("age", 2, rune::codec::PrimType::Int32, 1, 3,      false,{});
+    auto ev = b.build();
+    EXPECT_NE(rune::codec::fingerprintAsOf(ev, 1), rune::codec::fingerprintAsOf(ev, 3));
+}

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <vector>
 #include <rune/codec/Descriptor.h>
+#include <rune/codec/Evolve.h>
 
 namespace rune::codec {
 
@@ -84,9 +85,26 @@ constexpr uint64_t fnv1a_u32le(uint64_t hash, uint32_t v) noexcept {
         if (fp->type == PrimType::FixedStr) {
             hash = fnv1a_u16le(hash, fp->fixedLen);
         }
+        // Guarded, appended last: a field live-forever (untilVersion == 0xFFFF,
+        // the only kind in any pre-evolution schema) contributes nothing new,
+        // so additive schemas hash identically to before this change. Only a
+        // field that has actually been retired at some version absorbs that
+        // version into the fingerprint, so dropping a field changes the hash.
+        if (fp->untilVersion != 0xFFFF) {
+            hash = fnv1a_u16le(hash, fp->untilVersion);
+        }
     }
 
     return hash;
+}
+
+/// Version-aware fingerprint: hashes the Descriptor as it existed at
+/// schema `version` (per materializeAsOf), so two versions of the same
+/// evolving schema that differ only in which fields are live produce
+/// different fingerprints even though the underlying Descriptor is one
+/// evolving object.
+[[nodiscard]] inline uint64_t fingerprintAsOf(const Descriptor& evolving, uint16_t version) noexcept {
+    return fingerprint(materializeAsOf(evolving, version));
 }
 
 } // namespace rune::codec
