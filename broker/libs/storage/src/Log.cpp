@@ -1032,12 +1032,29 @@ std::vector<uint8_t> Log::read(int64_t startOffset, int32_t maxBytes) {
 }
 LogReadView Log::readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
                           bool& firstTooLarge) noexcept {
+    ReadIntoStatus st;
+    const LogReadView v = readInto(startOffset, maxBytes, buf, bufCap, st);
+    firstTooLarge = st == ReadIntoStatus::FirstTooLarge;
+    return v;
+}
+LogReadView Log::readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
+                          ReadIntoStatus& st, int64_t boundOffset, int* errOut) noexcept {
     RUNE_FR_SPAN_READ(rune_fr::Site::ReadLogRead, 0);
-    firstTooLarge = false;
+    st = ReadIntoStatus::Absent;
     auto it = segments_.upper_bound(startOffset);
     if (it == segments_.begin()) return {};
     --it;
-    return it->second->readInto(startOffset, maxBytes, buf, bufCap, firstTooLarge);
+    LogReadView v = it->second->readInto(startOffset, maxBytes, buf, bufCap, st, boundOffset, errOut);
+    // D26: nothing at/after startOffset in its segment — a compacted TAIL gap
+    // of a sealed segment (or an emptied one): continue at the next segment's
+    // base (below the bound), else a cursor there is answered empty forever.
+    // Never past torn / unreadable bytes or an I/O error.  One compare when found.
+    while (st == ReadIntoStatus::Absent && std::next(it) != segments_.end()) [[unlikely]] {
+        ++it;
+        if (it->first >= boundOffset) break;
+        v = it->second->readInto(std::max(startOffset, it->first), maxBytes, buf, bufCap, st, boundOffset, errOut);
+    }
+    return v;
 }
 LogReadView Log::readView(int64_t startOffset, int32_t maxBytes) noexcept {
     RUNE_FR_SPAN_READ(rune_fr::Site::ReadLogRead, 0);

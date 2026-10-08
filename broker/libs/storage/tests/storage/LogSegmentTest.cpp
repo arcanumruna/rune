@@ -981,3 +981,94 @@ TEST(LogSegmentRegression, ReadIntoLargeBatchesMultiSegmentAndBufferLimitRegress
     }
     std::filesystem::remove_all(dir);
 }
+
+// D26 (fix65 review observation): a start offset inside a compacted TAIL gap
+// of a sealed segment (the cleaner dropped the segment's last records; the next
+// segment starts above them) found no batch in the segment holding it, and
+// Log::readInto answered empty without moving to the next segment — a
+// consumer / follower cursor there never advanced (the worker answered Empty
+// with the same cursor, every cycle).  The read continues at the next segment.
+TEST(LogSegmentRegression, ReadIntoInACompactedTailGapContinuesAtTheNextSegmentRegression) {
+    auto dir = makeTempDir("rune_log_tailgap");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    auto put = [&](int64_t base, const std::vector<std::vector<uint8_t>>& batches) {
+        char name[32];
+        std::snprintf(name, sizeof name, "%020lld.log", static_cast<long long>(base));
+        std::ofstream f(dir / name, std::ios::binary);
+        for (const auto& b : batches) f.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
+    };
+    // Segment 0 kept [0, 4] (its [5, 9] compacted away); segment 10 holds [10, 11].
+    put(0, {makeBatch(0, 1000, 5)});
+    put(10, {makeBatch(10, 2000, 2)});
+    rune::storage::Log log(dir.string());
+    log.recover();
+    ASSERT_EQ(log.segmentBaseOffsets().size(), 2u) << "precondition: two segments";
+    ASSERT_EQ(log.logEndOffset(), 12);
+    std::vector<uint8_t> buf(64 * 1024);
+    for (int64_t start : {5, 7, 9}) {
+        bool tooLarge = true;
+        const auto v = log.readInto(start, 4096, buf.data(), buf.size(), tooLarge);
+        EXPECT_FALSE(tooLarge);
+        ASSERT_FALSE(v.empty()) << "start " << start << " in the tail gap: empty (cursor stuck)";
+        EXPECT_EQ(v.baseOffset, 10);
+        EXPECT_EQ(v.nextOffset, 12);
+    }
+    bool tooLarge = true;
+    EXPECT_TRUE(log.readInto(12, 4096, buf.data(), buf.size(), tooLarge).empty()) << "past the end";
+    std::filesystem::remove_all(dir);
+}
+
+// D26 (fix65 review LOW-2): a pread that fails (here: the file is shorter than
+// its written size — a mapping of the same bytes would SIGBUS) is an IoError
+// answer: empty, never "first batch too large" — the callers then never retry
+// it through the read mapping.
+TEST(LogSegmentRegression, ReadIntoIoErrorIsNeverTooLargeRegression) {
+    auto dir = makeTempDir("rune_log_readinto_eio");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    rune::storage::Log log(dir.string());
+    log.recover();
+    RecordBatchBuilder b(0, 1000);
+    b.append("k", std::string(100 * 1024, 'x'), 1000);   // one ~100 KiB batch
+    log.append(b.build(), 0);
+    // The file loses its tail behind the log's back (a failing disk / an
+    // external truncate): bytes [30 KiB, end) are gone.
+    const auto segPath = dir / "00000000000000000000.log";
+    ASSERT_EQ(::truncate(segPath.c_str(), 30 * 1024), 0);
+    std::vector<uint8_t> buf(64 * 1024);   // smaller than the batch
+    bool tooLarge = true;
+    EXPECT_TRUE(log.readInto(0, 4096, buf.data(), buf.size(), tooLarge).empty());
+    EXPECT_FALSE(tooLarge) << "an I/O error was reported as too large (the caller would fault through the mapping)";
+    ReadIntoStatus st = ReadIntoStatus::Ok;
+    int err = 0;
+    EXPECT_TRUE(log.readInto(0, 4096, buf.data(), buf.size(), st, INT64_MAX, &err).empty());
+    EXPECT_EQ(st, ReadIntoStatus::IoError);
+    EXPECT_NE(err, 0);
+    std::filesystem::remove_all(dir);
+}
+
+// D26 (fix65 review LOW-4): a read bounded by the HW / LSO a little past the
+// cursor (an acks=all leader whose LEO runs ahead) preads about one index
+// interval past the bound — not maxBytes.
+TEST(LogSegmentRegression, ReadIntoStopsNearTheBoundRegression) {
+    auto dir = makeTempDir("rune_log_readinto_bound");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    rune::storage::Log log(dir.string());
+    log.recover();
+    for (int64_t off = 0; off < 3000; ++off) log.append(makeBatch(off, 1000 + off, 1), off);   // ~70 B batches
+    std::vector<uint8_t> buf(256 * 1024);
+    LogSegment& seg = *log.segmentForTest(0);
+    for (int64_t start : {0, 1000, 2500}) {
+        const uint64_t before = seg.readIntoBytes();
+        ReadIntoStatus st;
+        const auto v = log.readInto(start, 128 * 1024, buf.data(), buf.size(), st, /*bound=*/start + 10);
+        ASSERT_EQ(st, ReadIntoStatus::Ok);
+        ASSERT_FALSE(v.empty());
+        EXPECT_EQ(v.baseOffset, start);
+        EXPECT_GE(v.nextOffset, start + 10) << "a batch below the bound is missing";
+        EXPECT_LE(seg.readIntoBytes() - before, 3u * 4096u) << "start " << start << ": read far past the bound";
+        // Unbounded: the whole request.
+        const auto w = log.readInto(start, 128 * 1024, buf.data(), buf.size(), st);
+        EXPECT_GT(w.len, v.len);
+    }
+    std::filesystem::remove_all(dir);
+}

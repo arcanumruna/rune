@@ -619,34 +619,84 @@ LogReadView LogSegment::mappedBytes() noexcept {
 
 LogReadView LogSegment::readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
                                  bool& firstTooLarge) noexcept {
-    firstTooLarge = false;
-    if (logSize_ <= 0 || fd_ < 0 || buf == nullptr || bufCap == 0) return {};
+    ReadIntoStatus st;
+    const LogReadView v = readInto(startOffset, maxBytes, buf, bufCap, st);
+    firstTooLarge = st == ReadIntoStatus::FirstTooLarge;
+    return v;
+}
+
+LogReadView LogSegment::readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
+                                 ReadIntoStatus& st, int64_t boundOffset, int* errOut) noexcept {
+    st = ReadIntoStatus::Absent;
+    if (logSize_ <= 0) return {};                                     // nothing written: absent
+    if (fd_ < 0 || buf == nullptr || bufCap == 0) { st = ReadIntoStatus::Unreadable; return {}; }
     using rune::protocol::RecordBatchReader;
     const std::size_t kOverhead = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
-    // The sparse index points at or before the target batch (<= one index
-    // interval + one batch earlier).  One window covers that skip + maxBytes.
+    const std::size_t interval = static_cast<std::size_t>(indexIntervalBytes_);
+    // The sparse index points at or before the target batch: less than one
+    // index interval earlier for a present offset; up to one interval + the
+    // batch before a compaction gap's first survivor.  One window covers that
+    // skip + maxBytes.
     const OffsetPosition op = index_->lookup(startOffset);
     const int64_t pos0 = op.position > 0 ? op.position : 0;
     if (pos0 >= logSize_) return {};
     const std::size_t remaining = static_cast<std::size_t>(logSize_ - pos0);
     // Only what this read needs: maxBytes + the sparse-index skip (<= two index
-    // intervals) — never the whole buffer.  A first batch past it -> firstTooLarge.
-    const std::size_t need = (maxBytes > 0 ? static_cast<std::size_t>(maxBytes) : 0) +
-                             2 * static_cast<std::size_t>(indexIntervalBytes_) + kOverhead;
+    // intervals) — never the whole buffer.  A first batch past it -> read on.
+    std::size_t need = (maxBytes > 0 ? static_cast<std::size_t>(maxBytes) : 0) + 2 * interval + kOverhead;
+    // D26 (fix65 review LOW-4): a caller that delivers nothing at/after
+    // `boundOffset` (the HW / LSO) needs no bytes past the batch holding it —
+    // that batch starts less than one index interval after the index entry
+    // for the bound.  (The first batch is still read whole: the scan reads on.)
+    if (boundOffset < nextOffset_ && boundOffset > startOffset) {
+        const int64_t pb = index_->lookup(boundOffset).position;
+        if (pb >= pos0) need = std::min(need, static_cast<std::size_t>(pb - pos0) + interval + kOverhead);
+    }
     const std::size_t want = std::min({remaining, bufCap, need});
     const std::size_t limit = std::min(remaining, bufCap);   // the most this buffer can ever hold
     std::size_t got = 0;
+    int ioErr = 0;   // D26 (fix65 review LOW-2): sticky — an I/O error is never reported as "too large"
     // pread [got, upTo) (short reads / EINTR retried); false on error / EOF before upTo.
     auto fill = [&](std::size_t upTo) noexcept {
         while (got < upTo) {
             const ssize_t r = ::pread(fd_, buf + got, upTo - got, static_cast<off_t>(pos0) + static_cast<off_t>(got));
-            if (r < 0) { if (errno == EINTR) continue; return false; }
-            if (r == 0) return false;
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                ioErr = errno != 0 ? errno : EIO;
+                return false;
+            }
+            if (r == 0) { ioErr = EIO; return false; }   // shorter than its written size: a mapping would SIGBUS
             got += static_cast<std::size_t>(r);
         }
         return true;
     };
-    (void)fill(want);
+    auto failed = [&]() noexcept -> LogReadView {
+        st = ReadIntoStatus::IoError;
+        ++readIntoErrors_;
+        if (errOut != nullptr) *errOut = ioErr;
+        return {};
+    };
+    // A first batch too large for `buf` (rare: the caller may then serve it
+    // through the read mapping).  Its bytes are read through once (into `buf`,
+    // discarded) first: a bad / missing page answers IoError here instead of a
+    // SIGBUS in the mapped fallback (D26, fix65 review LOW-2).  Cold.
+    auto tooLarge = [&](std::size_t at, std::size_t len) noexcept -> LogReadView {
+        for (std::size_t off = 0; off < len;) {
+            const std::size_t n = std::min(bufCap, len - off);
+            const ssize_t r = ::pread(fd_, buf, n, static_cast<off_t>(pos0) + static_cast<off_t>(at + off));
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                ioErr = errno != 0 ? errno : EIO;
+                return failed();
+            }
+            if (r == 0) { ioErr = EIO; return failed(); }
+            off += static_cast<std::size_t>(r);
+        }
+        st = ReadIntoStatus::FirstTooLarge;
+        return {};
+    };
+    if (!fill(want)) return failed();
+    readIntoBytes_ += got;
     std::size_t pos = 0, firstPos = SIZE_MAX;
     int64_t firstBase = 0;
     for (;;) {
@@ -654,18 +704,42 @@ LogReadView LogSegment::readInto(int64_t startOffset, int32_t maxBytes, uint8_t*
             // Window ended between batches: read on (up to the buffer) unless
             // the segment's bytes are exhausted (the offset is absent).
             if (got >= remaining) return {};
-            if (got >= limit || !fill(std::min(limit, pos + kOverhead))) { firstTooLarge = got >= limit; return {}; }
+            if (got >= limit) {
+                // Not even this batch's header fits after the skip: read it
+                // aside to learn the batch's extent (cold).
+                uint8_t hdr[rune::protocol::batch::kRecordBatchOverhead];
+                std::size_t h = 0;
+                while (h < kOverhead) {
+                    const ssize_t r = ::pread(fd_, hdr + h, kOverhead - h,
+                                              static_cast<off_t>(pos0) + static_cast<off_t>(pos + h));
+                    if (r < 0 && errno == EINTR) continue;
+                    if (r <= 0) { ioErr = r < 0 && errno != 0 ? errno : EIO; return failed(); }
+                    h += static_cast<std::size_t>(r);
+                }
+                const int32_t total = RecordBatchReader(hdr, kOverhead).totalLength();
+                if (total <= 0 || pos + static_cast<std::size_t>(total) > remaining) {
+                    st = ReadIntoStatus::Unreadable;
+                    return {};
+                }
+                return tooLarge(pos, static_cast<std::size_t>(total));
+            }
+            const std::size_t before = got;
+            if (!fill(std::min(limit, pos + kOverhead))) return failed();
+            readIntoBytes_ += got - before;
             continue;
         }
         RecordBatchReader r(buf + pos, got - pos);
         const int32_t total = r.totalLength();
-        if (total <= 0) return {};                                     // torn tail
+        if (total <= 0) { st = ReadIntoStatus::Unreadable; return {}; }   // torn / corrupt
         const std::size_t end = pos + static_cast<std::size_t>(total);
         if (end > got) {
             // Cut by the request-sized window: read the rest of THIS batch when
             // the buffer can hold it (review MEDIUM-1: never a needless fallback).
-            if (end > limit) { firstTooLarge = end <= remaining; return {}; }
-            if (!fill(end)) return {};
+            if (end > remaining) { st = ReadIntoStatus::Unreadable; return {}; }   // past the written end: torn
+            if (end > limit) return tooLarge(pos, end - pos);
+            const std::size_t before = got;
+            if (!fill(end)) return failed();
+            readIntoBytes_ += got - before;
             continue;
         }
         if (r.baseOffset() + r.lastOffsetDelta() >= startOffset) { firstPos = pos; firstBase = r.baseOffset(); break; }
@@ -685,6 +759,7 @@ LogReadView LogSegment::readInto(int64_t startOffset, int32_t maxBytes, uint8_t*
         end += static_cast<std::size_t>(total);
         nextOff = r.baseOffset() + r.lastOffsetDelta() + 1;
     }
+    st = ReadIntoStatus::Ok;
     LogReadView v;
     v.data       = buf + firstPos;
     v.len        = end - firstPos;

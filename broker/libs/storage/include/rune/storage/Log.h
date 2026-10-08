@@ -208,7 +208,12 @@ public:
     /// view rather than throwing — see LogSegment::readView.
     LogReadView readView(int64_t startOffset, int32_t maxBytes) noexcept;
     /// #65: LogSegment::readInto on the segment holding startOffset (pread into
-    /// `buf`; never counted as a readView, never maps).
+    /// `buf`; never counted as a readView, never maps).  D26: an Absent answer
+    /// (a compacted tail gap of a sealed segment) continues at the next
+    /// segment, so a cursor in the gap advances.  See LogSegment::readInto.
+    LogReadView readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
+                         ReadIntoStatus& st, int64_t boundOffset = INT64_MAX, int* errOut = nullptr) noexcept;
+    /// Same; `firstTooLarge` = (st == FirstTooLarge).
     LogReadView readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
                          bool& firstTooLarge) noexcept;
 

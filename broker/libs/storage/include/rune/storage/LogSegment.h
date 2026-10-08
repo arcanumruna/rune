@@ -1,8 +1,9 @@
 #pragma once
+#include <climits>
+#include <cstdint>
 #include <rune/storage/LogReadView.h>
 #include <rune/storage/OffsetIndex.h>
 #include <cstddef>
-#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -191,12 +192,29 @@ public:
     /// treat empty as "nothing now; retry next cycle".  See readMapFailures().
     LogReadView readView(int64_t startOffset, int32_t maxBytes) noexcept;
     /// #65: readView's batch semantics (first batch whole, then whole batches up
-    /// to maxBytes) served by ONE pread into the caller's buffer — no mapping,
-    /// so no page fault (and no process mmap_lock) on the caller's thread, no
-    /// allocation.  The view points into `buf`.  `firstTooLarge` is set when the
-    /// first deliverable batch does not fit `bufCap` (caller falls back).
+    /// to maxBytes) served by pread into the caller's buffer — no mapping, so
+    /// no page fault (and no process mmap_lock) on the caller's thread, no
+    /// allocation.  The view points into `buf`.  The read is sized to the
+    /// request (maxBytes + the sparse-index skip, <= two index intervals),
+    /// reading on (a second pread) only for a first batch the window cut.
+    ///  - With `bufCap < maxBytes + 2 * interval + overhead` the answer is a
+    ///    whole-batch PREFIX of readView's (the first batch always whole).
+    ///  - A start offset at a compaction gap may skip one interval + the batch
+    ///    before the first survivor; still a prefix, never a wrong batch.
+    ///  - `boundOffset` (D26): nothing at/after it is wanted (the HW / LSO) —
+    ///    the read stops one index interval past the bound's index entry.
+    /// `st`: Ok / Absent (nothing at/after startOffset here — the caller may
+    /// continue at the next segment) / FirstTooLarge (the first deliverable
+    /// batch does not fit `bufCap`: the caller may fall back) / Unreadable /
+    /// IoError (`*errOut` = errno; never retried through the mapping).
+    LogReadView readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
+                         ReadIntoStatus& st, int64_t boundOffset = INT64_MAX, int* errOut = nullptr) noexcept;
+    /// Same; `firstTooLarge` = (st == FirstTooLarge).
     LogReadView readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
                          bool& firstTooLarge) noexcept;
+    /// D26: pread failures (IoError answers) / bytes pread by readInto.
+    [[nodiscard]] uint64_t readIntoErrors() const noexcept { return readIntoErrors_; }
+    [[nodiscard]] uint64_t readIntoBytes() const noexcept { return readIntoBytes_; }
     /// F15 S4 fix round 1 (cold-cache build): the read-only mapping of the
     /// written bytes [0, sizeBytes()) WITHOUT touching any page (an mmap /
     /// remap syscall at most; no index lookup, no header read).  The caller
@@ -453,6 +471,8 @@ private:
     static constexpr std::size_t kReadMapMinBytes = 1u << 20;   // first read mapping: 1 MiB
     bool     readMapFaultForTest_ = false;   // D3b r2 test seam (setReadMapFaultForTest)
     uint64_t readMapRemaps_ = 0;
+    uint64_t readIntoErrors_ = 0;   ///< D26: readInto pread failures
+    uint64_t readIntoBytes_ = 0;    ///< D26: bytes readInto pread
     bool     ownerRemap_ = true;
     uint64_t readMapFailures_ = 0;  // count of failed ensureReadMap() calls — see readMapFailures()
 };
