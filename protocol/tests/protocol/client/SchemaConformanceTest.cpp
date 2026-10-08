@@ -150,6 +150,83 @@ TEST(SchemaConformance, DefineTopicFrameCheck) {
 }
 
 // ===========================================================================
+// GetTopicSchema golden vector
+//
+// Fields:
+//   requestedFingerprint = 0x0807060504030201  (0 = latest; non-zero here to
+//                                                 pin the fixed-field encoding)
+//   topicName            = "schema_test"  (11 bytes)
+//
+// Wire layout (45 bytes total):
+//   [0..1]   blockLength=8                  : 08 00
+//   [2..3]   templateId=66                  : 42 00
+//   [4..5]   schemaId=120                   : 78 00
+//   [6..7]   version=3                      : 03 00
+//   [8..15]  sessionId  (LE64)              : 88 77 66 55 44 33 22 11
+//   [16..23] correlationId (LE64)           : 11 10 0F 0E 0D 0C 0B 0A
+//   [24..31] requestedFingerprint (LE64)    : 01 02 03 04 05 06 07 08
+//   [32..33] topicName len=11(LE16)         : 0B 00
+//   [34..44] "schema_test"
+// ===========================================================================
+
+static constexpr uint8_t kGetTopicSchemaGolden[] = {
+    // header
+    0x08, 0x00,              // blockLength = 8
+    0x42, 0x00,              // templateId  = 66
+    0x78, 0x00,              // schemaId    = 120
+    0x03, 0x00,              // version     = 3
+    0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // sessionId
+    0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,  // correlationId
+    // body fixed (8 bytes)
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,  // requestedFingerprint
+    // topicName varstr
+    0x0B, 0x00,              // len = 11
+    0x73, 0x63, 0x68, 0x65, 0x6D, 0x61, 0x5F, 0x74, 0x65, 0x73, 0x74,  // "schema_test"
+};
+static constexpr std::size_t kGetTopicSchemaGoldenSize = sizeof(kGetTopicSchemaGolden);  // 45
+
+TEST(SchemaConformance, GetTopicSchemaDecodeGolden) {
+    ASSERT_EQ(kGetTopicSchemaGoldenSize, 45u);
+
+    assertHeader(kGetTopicSchemaGolden, kGetTopicSchemaGoldenSize,
+                 rpc::GetTopicSchema::TEMPLATE_ID, rpc::GetTopicSchema::BODY_FIXED);
+
+    auto msgOpt = rpc::GetTopicSchema::decode(kGetTopicSchemaGolden, kGetTopicSchemaGoldenSize);
+    ASSERT_TRUE(msgOpt.has_value());
+    EXPECT_EQ(msgOpt->sessionId,            kSessionId);
+    EXPECT_EQ(msgOpt->correlationId,        kCorrelationId);
+    EXPECT_EQ(msgOpt->requestedFingerprint, 0x0807060504030201ULL);
+    EXPECT_EQ(msgOpt->topicName,            "schema_test");
+}
+
+TEST(SchemaConformance, GetTopicSchemaEncodeGolden) {
+    rpc::GetTopicSchema msg;
+    msg.sessionId            = kSessionId;
+    msg.correlationId        = kCorrelationId;
+    msg.requestedFingerprint = 0x0807060504030201ULL;
+    msg.topicName            = "schema_test";
+
+    ASSERT_EQ(msg.encodedSize(), kGetTopicSchemaGoldenSize);
+
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, kGetTopicSchemaGoldenSize);
+    EXPECT_EQ(std::memcmp(enc.data(), kGetTopicSchemaGolden, n), 0)
+        << "Encoded GetTopicSchema bytes differ from golden";
+}
+
+// Also verify checkFrame/peekTemplateId accept the golden bytes.
+TEST(SchemaConformance, GetTopicSchemaFrameCheck) {
+    const auto fc = rpc::checkFrame(kGetTopicSchemaGolden, kGetTopicSchemaGoldenSize);
+    EXPECT_EQ(fc.status, rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, static_cast<uint16_t>(rpc::TemplateId::GetTopicSchema));
+
+    const auto tid = rpc::peekTemplateId(kGetTopicSchemaGolden, kGetTopicSchemaGoldenSize);
+    ASSERT_TRUE(tid.has_value());
+    EXPECT_EQ(*tid, static_cast<uint16_t>(rpc::TemplateId::GetTopicSchema));
+}
+
+// ===========================================================================
 // TopicSchemaResponse golden vector
 //
 // Fields:

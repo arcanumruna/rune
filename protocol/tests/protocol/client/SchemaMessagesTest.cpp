@@ -52,11 +52,36 @@ TEST(SchemaMessages, DefineTopicResponseRoundTrip) {
 TEST(SchemaMessages, GetTopicSchemaRoundTrip) {
     GetTopicSchema in; in.sessionId = 1; in.correlationId = 2;
     in.topicName = "characters";
+    in.requestedFingerprint = 0x0102030405060708ULL;
+    std::vector<uint8_t> buf(in.encodedSize());
+    const std::size_t n = in.encode(buf.data());
+    ASSERT_EQ(n, in.encodedSize());
+    auto out = GetTopicSchema::decode(buf.data(), n);
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->topicName, "characters");
+    EXPECT_EQ(out->requestedFingerprint, 0x0102030405060708ULL);
+}
+
+TEST(SchemaMessages, GetTopicSchemaRoundTripLatest) {
+    // requestedFingerprint = 0 means "latest" — must also survive round-trip.
+    GetTopicSchema in; in.sessionId = 1; in.correlationId = 2;
+    in.topicName = "characters";
+    in.requestedFingerprint = 0;
     std::vector<uint8_t> buf(in.encodedSize());
     const std::size_t n = in.encode(buf.data());
     auto out = GetTopicSchema::decode(buf.data(), n);
     ASSERT_TRUE(out.has_value());
-    EXPECT_EQ(out->topicName, "characters");
+    EXPECT_EQ(out->requestedFingerprint, 0u);
+}
+
+TEST(SchemaMessages, GetTopicSchemaDecodeRejectsTruncated) {
+    GetTopicSchema in; in.topicName = "x"; in.requestedFingerprint = 0xAABBCCDDEEFF0011ULL;
+    std::vector<uint8_t> buf(in.encodedSize());
+    in.encode(buf.data());
+    // Truncate within the var topicName field.
+    EXPECT_FALSE(GetTopicSchema::decode(buf.data(), buf.size() - 1).has_value());
+    // Truncate within the fixed requestedFingerprint field itself.
+    EXPECT_FALSE(GetTopicSchema::decode(buf.data(), MessageHeader::ENCODED_SIZE + 4).has_value());
 }
 
 TEST(SchemaMessages, TopicSchemaResponseRoundTrip) {

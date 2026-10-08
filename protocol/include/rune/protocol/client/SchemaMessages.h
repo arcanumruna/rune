@@ -86,20 +86,23 @@ struct DefineTopicResponse {
     }
 };
 
-// GetTopicSchema (66): body = topicName(varstr).
+// GetTopicSchema (66): body = requestedFingerprint:u64 (0 = latest), then
+//   topicName(varstr).
 struct GetTopicSchema {
     int64_t sessionId = 0, correlationId = 0;
     std::string_view topicName;
+    uint64_t requestedFingerprint = 0;  // 0 = latest
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::GetTopicSchema);
-    static constexpr uint16_t BODY_FIXED  = 0;
+    static constexpr uint16_t BODY_FIXED  = 8;  // u64 requestedFingerprint
     std::size_t encodedSize() const noexcept {
-        return MessageHeader::ENCODED_SIZE + 2u + topicName.size();
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 2u + topicName.size();
     }
     std::size_t encode(uint8_t* buf) const noexcept {
         MessageHeader hdr; hdr.blockLength = BODY_FIXED; hdr.templateId = TEMPLATE_ID;
         hdr.schemaId = kSchemaId; hdr.version = kProtocolVersion;
         hdr.sessionId = sessionId; hdr.correlationId = correlationId; hdr.encode(buf);
         std::size_t pos = MessageHeader::ENCODED_SIZE;
+        detail::putLE64(buf, static_cast<int>(pos), static_cast<int64_t>(requestedFingerprint)); pos += 8;
         pos += putVarStr(buf + pos, topicName);
         return pos;
     }
@@ -107,13 +110,18 @@ struct GetTopicSchema {
         auto h = MessageHeader::decode(buf, avail);
         if (!h || h->schemaId != kSchemaId || h->templateId != TEMPLATE_ID) return std::nullopt;
         std::size_t pos = MessageHeader::ENCODED_SIZE;
+        if (avail < pos + BODY_FIXED) return std::nullopt;
         GetTopicSchema m; m.sessionId = h->sessionId; m.correlationId = h->correlationId;
+        m.requestedFingerprint = static_cast<uint64_t>(detail::getLE64(buf, static_cast<int>(pos))); pos += 8;
         if (!getVarStr(buf, avail, pos, m.topicName)) return std::nullopt;
         return m;
     }
 };
 
 // TopicSchemaResponse (67): body = topicId:i32, version:u16, errorCode:u16, then descriptorBlob(varbytes32).
+// `version` is the schema version bound to the returned descriptorBlob (the
+// requested fingerprint's version, or latest when requestedFingerprint was 0).
+// Wire layout is unchanged.
 struct TopicSchemaResponse {
     int64_t sessionId = 0, correlationId = 0;
     int32_t topicId = -1; uint16_t version = 0; uint16_t errorCode = 0;
