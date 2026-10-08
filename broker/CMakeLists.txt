@@ -231,6 +231,19 @@ target_link_libraries(rune_replication PUBLIC rune_fr)
 target_link_libraries(rune_node        PUBLIC rune_fr rune_codec)
 target_link_libraries(rune_gateway     PUBLIC rune_fr)
 
+# client<->broker TLS/AEAD (Task 8b): the node header Worker.h now reaches
+# <rune/crypto/Aead.h> via RecordsPush.h -> RecordsSeal.h (the Records-push seal
+# step, raw-crypto-params so it stays decoupled from rune_gateway).  Every lib
+# that COMPILES a node-header chain reaching Worker.h therefore needs
+# rune_crypto's include dir.  rune_node owns Worker.h (PUBLIC so rune_broker +
+# rune_gateway dependents inherit it); rune_replication compiles node headers via
+# RUNE_NODE_INCLUDE WITHOUT linking rune_node, so it needs rune_crypto directly.
+# rune_gateway already links rune_crypto PUBLIC (libs/gateway/CMakeLists.txt).
+# Unconditional (not RUNE_TLS-gated): the crypto headers/sources are always
+# compiled; RUNE_TLS only gates the RUNE_TLS_ENABLED runtime env parsing.
+target_link_libraries(rune_node        PUBLIC rune_crypto)
+target_link_libraries(rune_replication PUBLIC rune_crypto)
+
 add_executable(rune_broker src/main.cpp)
 target_link_libraries(rune_broker PRIVATE rune_node rune_storage rune_fr spdlog::spdlog)
 if(aeron_FOUND)
