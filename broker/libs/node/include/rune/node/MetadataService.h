@@ -1447,6 +1447,21 @@ public:
                 return inflight_.count(partitionKey_(br.rec.topicId, br.rec.partition)) != 0;
             });
         }
+        // D15b l1: nor on a key whose record is still QUEUED (not appended yet)
+        // — e.g. the claim restored more leaderless marks than one drain emits:
+        // a decision now would repeat the queued record's leaderEpoch (a wasted
+        // record the MSM rejects).  Decided next tick, on the committed state.
+        // Control thread, cold (a non-empty queue); scratch capacity persists.
+        if (!pendingDynamicRecords_.empty() && !recs.empty()) {
+            pendingKeysScratch_.clear();
+            for (const auto& q : pendingDynamicRecords_)
+                pendingKeysScratch_.push_back(partitionKey_(q.rec.topicId, q.rec.partition));
+            std::sort(pendingKeysScratch_.begin(), pendingKeysScratch_.end());
+            std::erase_if(recs, [this](const rune::metadata::BalancerRecord& br) {
+                return std::binary_search(pendingKeysScratch_.begin(), pendingKeysScratch_.end(),
+                                          partitionKey_(br.rec.topicId, br.rec.partition));
+            });
+        }
         // D15 m3: the LEADERLESS members of a co-partition unit with an
         // empty-memory member are decided by decideLeaderless_ (on fresh
         // reports) — never piecemeal here.  Siblings that HAVE a leader keep
@@ -2152,6 +2167,7 @@ private:
     int16_t featureInflightLevel_  = -1;   ///< appended under this leadership, not applied yet
     /// D15 item 2: decideLeaderless_ scratch (capacity persists).
     std::vector<int64_t> unitScratch_, unitVisited_, unitDecided_;
+    std::vector<int64_t> pendingKeysScratch_;   ///< D15b l1: queued keys at a rebalance (sorted)
     struct FreshReport { int32_t leo = -1; bool logDirFailed = false; int32_t epoch = -1; };
     std::unordered_map<int64_t, std::unordered_map<int32_t, FreshReport>> leaderlessReports_;
     uint64_t leaderlessHeld_ = 0;   ///< partitions held leaderless (log dir failed / unclean needed)

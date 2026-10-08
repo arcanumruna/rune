@@ -2437,3 +2437,82 @@ TEST(D15MemoryEpochRegression, HeldUnitMemberNeverBlocksSiblingFailoverRegressio
     EXPECT_EQ(c.svc->assignment(1, 0)->leaderNode, A)
         << "the sibling's dead leader was never failed over while a unit member is held";
 }
+
+// D15b l1: a successor controller restores MORE marks at its claim than the
+// claim cycle drains (kMaxRecordsPerBatch = 256 per drain; the claim cycle
+// drains twice): the re-arms past those are still QUEUED when the first
+// rebalance (recheckOnCatchUp_) runs.  RED at 4b0b6a6: 188 duplicates.  That
+// rebalance filtered only inflight_, so the balancer elected a leader for a
+// still-queued key at the SAME leaderEpoch as its queued re-arm — a wasted
+// record the MSM rejects.  Keys in the pending queue are decided next tick.
+TEST(D15MemoryEpochRegression, MoreMarksThanOneBatchFirstRebalanceSkipsQueuedKeysRegression) {
+    constexpr int32_t kParts = 700;   // > the claim cycle's drains (2 x kMaxRecordsPerBatch)
+    static_assert(kParts > 2 * static_cast<int32_t>(MetadataService::kMaxRecordsPerBatch));
+    CtlRig c(true, {TopicSpec{0, kParts, 3, "", "t"}});
+    for (int32_t p = 0; p < kParts; ++p) ASSERT_NE(c.svc->assignment(0, p), nullptr);
+    // The predecessor made every partition leaderless: its leader's log dir is
+    // offline (mark committed with the record), the ISR lineage kept.
+    std::vector<BalancerRecord> recs;
+    for (int32_t p = 0; p < kParts; ++p) {
+        const PartitionAssignment a = *c.svc->assignment(0, p);
+        BalancerRecord br;
+        br.isr      = a.isr;
+        br.replicas = a.replicas;
+        br.mark     = LeaderlessMark{LeaderlessMark::Kind::LogDirOffline, a.leaderNode, 5};
+        br.rec.topicId        = 0;
+        br.rec.partition      = p;
+        br.rec.leaderNode     = NO_LEADER;
+        br.rec.leaderEpoch    = a.leaderEpoch + 1;
+        br.rec.partitionEpoch = std::max(a.partitionEpoch + 1, br.rec.leaderEpoch);
+        br.rec.isr      = rune::protocol::metadata::Int32ArrayView{br.isr.data(), static_cast<uint16_t>(br.isr.size())};
+        br.rec.replicas = rune::protocol::metadata::Int32ArrayView{br.replicas.data(), static_cast<uint16_t>(br.replicas.size())};
+        recs.push_back(std::move(br));
+    }
+    c.svc->emitDynamicAssignment(recs);
+    c.drive(50);
+    for (int32_t p = 0; p < kParts; ++p) ASSERT_EQ(c.svc->assignment(0, p)->leaderNode, NO_LEADER);
+    // The controller moves to node 2; drive ONLY until it caught up (the claim
+    // restores the marks and drains the first batch).
+    MetadataService svc2(c.r2.get(), 2);
+    c.r1->becomeFollower(2, 2);
+    c.r3->becomeFollower(2, 2);
+    c.r2->becomeLeader(2, c.all);
+    c.transport.removeFollower(2);
+    c.transport.setLeader(c.r2.get());
+    c.transport.addFollower(1, c.r1.get());
+    svc2.configure(c.topics, c.all);
+    for (int i = 0; i < kDriveCap; ++i) {   // (caught-up reads true before the first cycle)
+        c.clock += 1'000'000LL;
+        (void)svc2.doWork(c.clock);
+        if (svc2.controllerCaughtUpForTest()) break;
+        c.r1->doWork(c.clock); c.r2->doWork(c.clock); c.r3->doWork(c.clock);
+        c.transport.pump(c.clock);
+    }
+    ASSERT_TRUE(svc2.controllerCaughtUpForTest());
+    // The first rebalance, while kParts - 256 re-arms are still queued: every
+    // key has a record in flight or queued — nothing to decide on it now.
+    ASSERT_TRUE(svc2.takePreferredRecheck());
+    EXPECT_EQ(svc2.reassignDeadPartitionLeaders({1, 2, 3}), 0u)
+        << "the first rebalance re-decided keys whose re-arm is still queued (same-epoch duplicate)";
+    // Then the partitions are decided normally on the committed state.
+    for (int i = 0; i < 4; ++i) {
+        for (int k = 0; k < 50; ++k) {
+            c.clock += 1'000'000LL;
+            (void)svc2.doWork(c.clock);
+            c.r1->doWork(c.clock); c.r2->doWork(c.clock); c.r3->doWork(c.clock);
+            c.transport.pump(c.clock);
+        }
+        (void)svc2.reassignDeadPartitionLeaders({1, 2, 3});
+    }
+    for (int k = 0; k < 50; ++k) {
+        c.clock += 1'000'000LL;
+        (void)svc2.doWork(c.clock);
+        c.r1->doWork(c.clock); c.r2->doWork(c.clock); c.r3->doWork(c.clock);
+        c.transport.pump(c.clock);
+    }
+    for (int32_t p = 0; p < kParts; ++p) {
+        const auto* pa = svc2.assignment(0, p);
+        ASSERT_NE(pa, nullptr);
+        EXPECT_NE(pa->leaderNode, NO_LEADER) << "partition " << p << " never decided";
+    }
+}
