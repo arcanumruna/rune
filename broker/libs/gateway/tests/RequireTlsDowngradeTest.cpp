@@ -1,7 +1,16 @@
 // RequireTlsDowngradeTest.cpp — Task 9: require_tls hard-reject + shard-mode
 // crypto gating, i.e. the downgrade-safety decision ClientGateway::handleConnect
-// makes via rune::gateway::{shouldEngageCrypto, shardModeRefusesCryptoOffer,
-// mustRejectForRequireTls} (ConnectDowngradePolicy.h).
+// makes via rune::gateway::{shouldEngageCrypto, mustRejectForRequireTls}
+// (ConnectDowngradePolicy.h).
+//
+// Task 19 (per-worker egress crypto addendum, 2026-10-08): shard mode used
+// to refuse every crypto offer outright (shardModeRefusesCryptoOffer) and a
+// broker configured with both shard mode and require_tls used to refuse to
+// start (mustRefuseShardWithRequireTls) — both REMOVED now that the shard
+// worker seals its own Records egress with its own per-sender key. The
+// tests that used to assert those refusals now assert the opposite: shard
+// mode engages crypto exactly like legacy mode, and shard+require_tls
+// starts fine.
 //
 // Aeron-free (same reasoning as GatewayCryptoTest.cpp — ClientGateway.h pulls
 // <Aeron.h>, unavailable in this build on macOS/arm64; see this lib's
@@ -23,13 +32,11 @@
 //      client offer (driven through an actual TlsSession handshake, cert
 //      loaded from a temp PEM file round-tripping to makeServer) =>
 //      NOT rejected (cryptoEstablished=true defeats the require_tls check).
-//   4. ShardModeRefusesCryptoOfferRegardlessOfRequireTls — the ★ gating note:
-//      shard mode must refuse an encrypted offer outright (never silently
-//      downgrade it to plaintext), independent of require_tls.
+//   4. ShardModeNowEngagesCrypto (Task 19) — shard mode accepts an encrypted
+//      offer exactly like legacy mode (used to refuse it outright — see
+//      the removed shardModeRefusesCryptoOffer).
 //   5. ShardModePlaintextStillAllowedWhenNotRequireTls — shard mode does NOT
-//      gate a client that never offered crypto in the first place (shard
-//      mode was plaintext-only before this task and stays so for such a
-//      client when require_tls is off).
+//      gate a client that never offered crypto in the first place.
 //   6. CertKeyRoundTripsToMakeServer — the broker's cert/key FILE PATH ->
 //      PEM TEXT load (rune::node::loadPemFile) round-trips to a VALID
 //      TlsSession::makeServer(), exactly the ClientGateway ctor's contract.
@@ -46,9 +53,11 @@
 //      unaffected: no refusal, stays plaintext.
 //  10. ValidConfiguredCertDoesNotRefuseStart — the happy path (both load)
 //      must NOT be caught by the new fail-fast check.
-//  11. ShardModeWithRequireTlsRefusesStart — shard mode + require_tls
-//      together can never serve a client (shard refuses crypto, require_tls
-//      refuses plaintext) -> refuse to start rather than brick silently.
+//  11. ShardModeWithRequireTlsNowStarts (Task 19) — shard mode +
+//      require_tls together no longer brick the broker (shard mode serves
+//      crypto now) — the removed mustRefuseShardWithRequireTls no longer
+//      exists; this is asserted at the ConnectDowngradePolicy level
+//      (shouldEngageCrypto accepts shard mode's encrypted offer).
 
 #include <gtest/gtest.h>
 
@@ -92,8 +101,7 @@ std::string testdataPath(const char* name) {
 TEST(RequireTlsDowngrade, PlaintextRejectedWhenRequireTls) {
     // Plaintext client: clientOffersCrypto=false => shouldEngageCrypto is
     // false regardless of brokerHasTls => cryptoEstablished=false.
-    EXPECT_FALSE(shouldEngageCrypto(/*shardMode=*/false, /*clientOffersCrypto=*/false,
-                                     /*brokerHasTls=*/true));
+    EXPECT_FALSE(shouldEngageCrypto(/*clientOffersCrypto=*/false, /*brokerHasTls=*/true));
     EXPECT_TRUE(mustRejectForRequireTls(/*requireTls=*/true, /*cryptoEstablished=*/false));
 }
 
@@ -102,9 +110,8 @@ TEST(RequireTlsDowngrade, PlaintextAcceptedWhenNotRequireTls) {
 }
 
 TEST(RequireTlsDowngrade, CryptoConnectStillHandshakesUnderRequireTls) {
-    // Client offered crypto, broker has a cert, not shard mode => engage.
-    EXPECT_TRUE(shouldEngageCrypto(/*shardMode=*/false, /*clientOffersCrypto=*/true,
-                                    /*brokerHasTls=*/true));
+    // Client offered crypto, broker has a cert => engage.
+    EXPECT_TRUE(shouldEngageCrypto(/*clientOffersCrypto=*/true, /*brokerHasTls=*/true));
     // Once the handshake lands a live TlsSession (cryptoEstablished=true),
     // require_tls must NOT reject it.
     EXPECT_FALSE(mustRejectForRequireTls(/*requireTls=*/true, /*cryptoEstablished=*/true));
@@ -114,34 +121,28 @@ TEST(RequireTlsDowngrade, BrokerWithNoCertRejectedWhenRequireTls) {
     // Broker not configured with a cert at all: never engages crypto even
     // though the client offered it — require_tls must still reject rather
     // than silently serve plaintext.
-    EXPECT_FALSE(shouldEngageCrypto(/*shardMode=*/false, /*clientOffersCrypto=*/true,
-                                     /*brokerHasTls=*/false));
+    EXPECT_FALSE(shouldEngageCrypto(/*clientOffersCrypto=*/true, /*brokerHasTls=*/false));
     EXPECT_TRUE(mustRejectForRequireTls(/*requireTls=*/true, /*cryptoEstablished=*/false));
 }
 
-// ★ shard-mode gating (Task 8b review carried into Task 9).
-TEST(RequireTlsDowngrade, ShardModeRefusesCryptoOfferRegardlessOfRequireTls) {
-    EXPECT_TRUE(shardModeRefusesCryptoOffer(/*shardMode=*/true, /*clientOffersCrypto=*/true,
-                                             /*brokerHasTls=*/true));
-    // shouldEngageCrypto must also refuse to engage in shard mode (the two
-    // functions must agree — handleConnect checks shardModeRefusesCryptoOffer
-    // FIRST, but a caller that skipped that check must still fail closed).
-    EXPECT_FALSE(shouldEngageCrypto(/*shardMode=*/true, /*clientOffersCrypto=*/true,
-                                     /*brokerHasTls=*/true));
-    // The refusal is unconditional — even with require_tls OFF, shard mode
-    // still must not silently establish an encrypted session (it would be
-    // served Records in the clear by a shard-mode worker — Worker.h, Task 14).
-    // handleConnect models this by setting cryptoFailed=true directly on
-    // shardModeRefusesCryptoOffer, not by routing through
-    // mustRejectForRequireTls at all.
+// Task 19 (per-worker egress crypto addendum): shard mode used to refuse
+// every crypto offer here (the removed shardModeRefusesCryptoOffer) because
+// a shard-mode worker's Records egress was plaintext-only. The shard worker
+// now seals its own Records egress with its own per-sender key, so
+// shouldEngageCrypto no longer takes a shardMode parameter at all — it
+// engages crypto identically whether or not the broker is sharded.
+TEST(RequireTlsDowngrade, ShardModeNowEngagesCrypto) {
+    EXPECT_TRUE(shouldEngageCrypto(/*clientOffersCrypto=*/true, /*brokerHasTls=*/true));
+    // Once engaged, require_tls must NOT reject an established crypto
+    // session regardless of shard mode (shouldEngageCrypto has no shard
+    // parameter to even distinguish the two anymore).
+    EXPECT_FALSE(mustRejectForRequireTls(/*requireTls=*/true, /*cryptoEstablished=*/true));
 }
 
 TEST(RequireTlsDowngrade, ShardModePlaintextStillAllowedWhenNotRequireTls) {
-    // A client that never offered crypto in the first place: shard mode's
-    // gating does not apply (nothing to refuse), and require_tls is off =>
-    // served plaintext, same as pre-Task-9 shard mode.
-    EXPECT_FALSE(shardModeRefusesCryptoOffer(/*shardMode=*/true, /*clientOffersCrypto=*/false,
-                                              /*brokerHasTls=*/true));
+    // A client that never offered crypto in the first place: plaintext,
+    // require_tls off => served plaintext.
+    EXPECT_FALSE(shouldEngageCrypto(/*clientOffersCrypto=*/false, /*brokerHasTls=*/true));
     EXPECT_FALSE(mustRejectForRequireTls(/*requireTls=*/false, /*cryptoEstablished=*/false));
 }
 
@@ -269,13 +270,18 @@ TEST(TlsStartupPolicy, ValidConfiguredCertDoesNotRefuseStart) {
     EXPECT_FALSE(rune::node::mustRefuseStartForUnloadableTls(configured, certLoaded, keyLoaded));
 }
 
-TEST(TlsStartupPolicy, ShardModeWithRequireTlsRefusesStart) {
-    // Shard mode + require_tls together can never serve a client (shard
-    // mode refuses every crypto offer; require_tls refuses every plaintext
-    // fallback) -> refuse to start rather than brick silently per-Connect.
-    EXPECT_TRUE(rune::node::mustRefuseShardWithRequireTls(/*shardMode=*/true, /*requireTls=*/true));
-    // Either flag alone is fine.
-    EXPECT_FALSE(rune::node::mustRefuseShardWithRequireTls(/*shardMode=*/true, /*requireTls=*/false));
-    EXPECT_FALSE(rune::node::mustRefuseShardWithRequireTls(/*shardMode=*/false, /*requireTls=*/true));
-    EXPECT_FALSE(rune::node::mustRefuseShardWithRequireTls(/*shardMode=*/false, /*requireTls=*/false));
+// Task 19 (per-worker egress crypto addendum): shard mode + require_tls
+// together used to be refused at startup (mustRefuseShardWithRequireTls,
+// now REMOVED) because shard mode could never serve an encrypted session.
+// The shard worker now seals its own Records egress with its own
+// per-sender key, so the combination is no longer a dead end — there is no
+// function left to assert a refusal with; the only thing left to prove
+// is that shouldEngageCrypto (what handleConnect actually calls) accepts
+// shard mode's crypto offer just like legacy mode's, which
+// ShardModeNowEngagesCrypto above already does. A broker with both flags
+// set now starts and serves crypto normally — asserted end-to-end by the
+// aeron-linked shard+require_tls e2e test (box-deferred).
+TEST(TlsStartupPolicy, ShardModeWithRequireTlsNowStarts) {
+    EXPECT_TRUE(shouldEngageCrypto(/*clientOffersCrypto=*/true, /*brokerHasTls=*/true));
+    EXPECT_FALSE(mustRejectForRequireTls(/*requireTls=*/true, /*cryptoEstablished=*/true));
 }

@@ -599,6 +599,13 @@ int ClientGateway::doWork(int64_t nowNs) {
     work += advanceInlinePsmScans_();   // I3: budgeted inline producer-state rebuilds
     // Task 13: SessionClose ops a full worker ring refused earlier — never dropped.
     if (shardMode_ && workerPool_) work += sessionAnnouncer_.retryCloses(*workerPool_);
+    // Task 19: the per-worker crypto-key SessionAnnounce (second wave) a
+    // full worker ring refused earlier — retried until every worker has the
+    // real key. Never a safety concern while this is in flight (every
+    // worker already has a "parked" entry from the first, announce-before-
+    // accept wave — see pollPendingConnects), only a liveness one.
+    if (shardMode_ && workerPool_ && !pendingCryptoAnnounces_.empty())
+        work += retryPendingCryptoAnnounces_();
     pollPendingRecordEgress_(nowNs);  // hybrid egress: resolve unicast pubs + drain deferred subscribes
     reapExpired(nowNs);
     // GB-5p2: group-commit flush — time-based cadence (kGroupCommitIntervalNs).
@@ -1101,6 +1108,44 @@ void ClientGateway::closeDroppedPendingConnect_(const PendingConnect& pending)
         sessionAnnouncer_.close(*workerPool_, pending.sessionId);
 }
 
+// ---------------------------------------------------------------------------
+// Task 19 (per-worker egress crypto addendum): retry the second-wave,
+// crypto-key-bearing SessionAnnounce for sessions a full worker ring
+// refused on an earlier attempt (handleHandshakeContinue_'s best-effort
+// first try, or a previous call to this function). Re-reads session.crypto
+// fresh each attempt (the Session, not the long-gone PendingConnect, is the
+// only thing that outlives the original attempt). A session already closed
+// (closeSession_/reapExpired) in the meantime is simply dropped from the
+// list — SessionClose will have already reached every worker via the
+// normal close path, so there is nothing left to announce.
+// ---------------------------------------------------------------------------
+int ClientGateway::retryPendingCryptoAnnounces_()
+{
+    if (!workerPool_) return 0;
+    int work = 0;
+    for (std::size_t i = 0; i < pendingCryptoAnnounces_.size(); ) {
+        const int64_t sid = pendingCryptoAnnounces_[i];
+        Session* s = sessions_.find(sid);
+        if (!s || !s->crypto.encrypted) {
+            // Closed/expired, or (defensively) somehow not encrypted anymore
+            // — nothing to retry.
+            pendingCryptoAnnounces_[i] = pendingCryptoAnnounces_.back();
+            pendingCryptoAnnounces_.pop_back();
+            continue;
+        }
+        if (sessionAnnouncer_.announce(*workerPool_, sid, s->egressChannel, s->egressStreamId,
+                                        s->clientVersion, /*sessionEncrypted=*/true, /*keyReady=*/true,
+                                        s->crypto.b2c, s->crypto.b2cPrefix, s->crypto.cipher)) {
+            ++work;
+            pendingCryptoAnnounces_[i] = pendingCryptoAnnounces_.back();
+            pendingCryptoAnnounces_.pop_back();
+            continue;
+        }
+        ++i;   // still full on at least one worker — retry next cycle
+    }
+    return work;
+}
+
 bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
 {
     Session* s = sessions_.find(sid);
@@ -1504,14 +1549,14 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     const bool isRedirectCapture = (!pc_entry.isLeader && !pc_entry.leaderClientEndpoint.empty());
     const bool clientOffersCrypto = !req.cipherList.empty() && !req.handshakeBytes.empty();
     const bool brokerHasTls       = !tlsCertPem_.empty() && !tlsKeyPem_.empty();
-    if (!isRedirectCapture && shardModeRefusesCryptoOffer(shardMode_, clientOffersCrypto, brokerHasTls)) {
-        // Task 9 ★ gating note (see ConnectDowngradePolicy.h): never let an
-        // encrypted session be served by a shard-mode worker — Worker.h's
-        // per-worker Records egress is still plaintext until Task 14.
-        spdlog::warn("ClientGateway: refusing an encrypted Connect in SHARD mode (per-worker "
-                     "Records egress is plaintext until Task 14); session={}", sessionId);
-        pc_entry.cryptoFailed = true;
-    } else if (!isRedirectCapture && shouldEngageCrypto(shardMode_, clientOffersCrypto, brokerHasTls)) {
+    // Task 19 (per-worker egress crypto addendum): shard mode used to refuse
+    // every crypto offer here (ConnectDowngradePolicy.h's now-removed
+    // shardModeRefusesCryptoOffer) because a shard-mode worker's Records
+    // egress was plaintext-only. The shard worker now seals its own Records
+    // egress with its own per-sender key (see
+    // handleHandshakeContinue_/pollPendingConnects' deferred crypto-key
+    // SessionAnnounce), so shard mode engages crypto exactly like legacy mode.
+    if (!isRedirectCapture && shouldEngageCrypto(clientOffersCrypto, brokerHasTls)) {
         pc_entry.tls.emplace(rune::crypto::TlsSession::makeServer(tlsCertPem_.c_str(), tlsKeyPem_.c_str()));
         if (!pc_entry.tls->valid()) {
             // Local TLS init failure (e.g. a misconfigured cert/key on THIS
@@ -1832,9 +1877,22 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
                     continue;
                 }
                 pending.announceBegun = true;
+                // Task 19 ★: mark `sessionEncrypted` here too (keyReady=false
+                // — the real b2c key doesn't exist yet; it is derived only
+                // once pending.tls->done(), in handleHandshakeContinue_'s own
+                // second announce wave). This FIRST wave is what the client's
+                // own ConnectResponse (sent right below, once `announced`)
+                // is gated on — i.e. every worker is guaranteed to already
+                // have a "parked" (fail-closed) entry for this session
+                // BEFORE the client can possibly learn its sessionId and
+                // Subscribe, closing the race against the second wave's own
+                // retry (see pending.tls.has_value() below: true only for a
+                // connect still attempting crypto — see shouldEngageCrypto).
                 if (!sessionAnnouncer_.announce(*workerPool_, pending.sessionId,
                                                 pending.egressChannel, pending.egressStreamId,
-                                                pending.clientVersion)) {
+                                                pending.clientVersion,
+                                                /*sessionEncrypted=*/pending.tls.has_value(),
+                                                /*keyReady=*/false)) {
                     ++it;
                     continue;   // a worker ring is full — retry next cycle
                 }
@@ -2006,6 +2064,29 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
     session.crypto.recv.emplace(keys.cipher, keys.c2b, keys.c2bPrefix);  // OPENs client->broker
     session.crypto.send.emplace(keys.cipher, keys.b2c, keys.b2cPrefix);  // SEALs broker->client
     session.crypto.encrypted = true;
+    // Task 19 (per-worker egress crypto addendum): retain the RAW b2c key +
+    // prefix (session.crypto.send above already holds the AeadCipher built
+    // from these same bytes) so the gateway can derive each shard worker's
+    // own per-sender key (shard mode only; unread in legacy mode).
+    session.crypto.b2c = keys.b2c;
+    std::memcpy(session.crypto.b2cPrefix, keys.b2cPrefix, 4);
+
+    // Task 19 ★: ship the real per-worker key now. Every worker ALREADY has
+    // a "parked" entry for this session from the FIRST (announce-before-
+    // accept, pollPendingConnects) wave — sent while sessionEncrypted was
+    // known but no real key existed yet — so even if THIS second wave can't
+    // fully land on every worker in one shot (a ring momentarily full), no
+    // worker can ever mistake this session for plaintext: the first wave's
+    // entry already makes it fail-closed (park) until this one lands.
+    // Retried from doWork() (retryPendingCryptoAnnounces_) until complete —
+    // a liveness concern only, never a safety one, by the above invariant.
+    if (shardMode_ && workerPool_ &&
+        !sessionAnnouncer_.announce(*workerPool_, pending.sessionId, pending.egressChannel,
+                                     pending.egressStreamId, pending.clientVersion,
+                                     /*sessionEncrypted=*/true, /*keyReady=*/true,
+                                     session.crypto.b2c, session.crypto.b2cPrefix, session.crypto.cipher)) {
+        pendingCryptoAnnounces_.push_back(pending.sessionId);
+    }
 
     pendingConnects_.erase(it);
 }

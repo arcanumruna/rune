@@ -213,10 +213,13 @@ public:
     //                                 the PEM text it's handed.
     // @param requireTls               Task 9 (downgrade safety, spec §11): when true, a Connect
     //                                 that does NOT end up with an established crypto session
-    //                                 (plaintext client, no broker cert/key, or shard mode refusing
-    //                                 the crypto offer — see shouldEngageCrypto()'s ★ gating note)
+    //                                 (plaintext client, no broker cert/key, or a local TLS init
+    //                                 failure degrading to plaintext — see shouldEngageCrypto())
     //                                 is hard-rejected with ConnectResponse{HandshakeFailed} —
-    //                                 NEVER served plaintext.  Default false (back-compat).
+    //                                 NEVER served plaintext.  Default false (back-compat).  Task
+    //                                 19: shard mode no longer refuses crypto outright (it seals
+    //                                 its own per-worker Records egress now), so it is no longer
+    //                                 part of this list.
     ClientGateway(std::shared_ptr<aeron::Aeron>       aeron,
                   std::string                         clientChannel,
                   int32_t                             clientStreamId,
@@ -1378,6 +1381,11 @@ private:
     [[nodiscard]] std::size_t shardSessionSlotsInUse_() const noexcept;
     /// A dropped pending connect whose announcement began → close everywhere.
     void closeDroppedPendingConnect_(const PendingConnect& pending);
+    /// Task 19: retry the per-worker crypto-key SessionAnnounce (second
+    /// wave) for every session in pendingCryptoAnnounces_ a full worker ring
+    /// refused earlier. A session closed/expired in the meantime is dropped
+    /// from the list (nothing to announce). Returns work done.
+    int retryPendingCryptoAnnounces_();
     /// Close an accepted session (Disconnect / SessionFailed): table, workers,
     /// subscriptions, group-member tracking.  False = unknown session (no-op).
     bool closeSession_(int64_t sid, bool notifyExpired = false);
@@ -1676,6 +1684,14 @@ private:
     bool perWorkerIngressActive_ = false;
     bool shardMode_ = false;   // Task 13 (spec §3.4); set before the runtime runs
     rune::node::SessionAnnouncer sessionAnnouncer_;   // Task 13: runtime thread only
+    // Task 19: sessions whose per-worker crypto-key SessionAnnounce (second
+    // wave) didn't fully land on every worker on the first attempt (a ring
+    // was momentarily full) — retried each doWork() cycle
+    // (retryPendingCryptoAnnounces_) until every worker has the real key.
+    // Bounded by concurrently-connecting encrypted shard sessions (cold,
+    // connect-time only); empty in legacy mode and for every plaintext
+    // session.
+    std::vector<int64_t> pendingCryptoAnnounces_;
     std::vector<ShardIngressEndpoint> shardIngressEndpoints_;  // spec §3.3; empty = legacy
 
     // read-rework T3/T4 (I3b): when true, Subscribe/Unsubscribe for user partitions

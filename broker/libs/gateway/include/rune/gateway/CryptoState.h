@@ -35,6 +35,17 @@ struct CryptoState {
     uint64_t                                 recvSeq    = 0;
     uint64_t                                 recvWindow = 0;
     std::optional<rune::crypto::AeadCipher>  send, recv;
+
+    // Task 19 (per-worker egress crypto addendum, 2026-10-08): the RAW b2c
+    // key + 4-byte nonce prefix, retained alongside `send` (which already
+    // holds the AeadCipher built FROM these same bytes) so the gateway can
+    // derive each shard worker's own per-sender key
+    // (rune::crypto::deriveSenderKey(b2c, workerId+1, ...)) at SessionAnnounce
+    // time — shard mode only; legacy mode never reads these. Zero-valued
+    // (all-zero key/prefix) for every plaintext session, exactly like every
+    // other CryptoState field.
+    rune::crypto::AeadKey                    b2c{};
+    uint8_t                                  b2cPrefix[4] = {};
 };
 
 } // namespace rune::gateway

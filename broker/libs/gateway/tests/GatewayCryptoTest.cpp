@@ -84,6 +84,21 @@
 //      encrypted session) and shows the client-side open attempt on those
 //      unsealed bytes fails/garbles — exactly why consumer fetch was
 //      entirely broken on an encrypted session before this fix.
+//
+// Task 19 cases (per-worker egress crypto addendum, 2026-10-08 — a SHARD
+// WORKER seals its OWN Records push with its OWN deriveSenderKey()-derived
+// key, RecordsSealCtx::senderId):
+//  17. WorkerSealedRecordsOpenUnderDerivedPerSenderKey — a worker's sealed
+//      frame (senderId=w+1) opens under the SAME key the client
+//      independently re-derives from its own b2c; the subheader carries
+//      the authenticated senderId.
+//  18. TwoWorkersProduceDistinctKeysNeitherOpensUnderTheOther — two workers'
+//      derived keys differ; each worker's frame opens ONLY under its own
+//      key, never the other's.
+//  19. WorkerSealedRecordsWrongSenderIdTamperDropped — forging the
+//      authenticated senderId byte fails auth (never silently redirected).
+//  20. WorkerDeriveSenderKeyZeroEqualsGatewayB2c — senderId==0 is defined
+//      to equal the gateway's own (unchanged) b2c key.
 
 #include <gtest/gtest.h>
 
@@ -92,6 +107,7 @@
 #include <rune/crypto/TlsSession.h>
 #include <rune/gateway/CryptoFrame.h>
 #include <rune/node/RecordsSeal.h>
+#include <rune/node/SessionAnnounceKeyTail.h>
 #include <rune/protocol/client/CryptoEnvelope.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/MessageHeader.h>
@@ -390,6 +406,11 @@ DataPlaneFixture makeDataPlaneFixture(int64_t sessionId) {
     f.gw.recv.emplace(srvKeys.cipher, srvKeys.c2b, srvKeys.c2bPrefix);  // OPENs client->broker
     f.gw.send.emplace(srvKeys.cipher, srvKeys.b2c, srvKeys.b2cPrefix);  // SEALs broker->client
     f.gw.encrypted = true;
+    // Task 19: retain the RAW b2c key/prefix exactly as
+    // handleHandshakeContinue_ now does, so tests can derive per-worker
+    // sender keys from the SAME fixture (mirrors the real gateway code).
+    f.gw.b2c = srvKeys.b2c;
+    std::memcpy(f.gw.b2cPrefix, srvKeys.b2cPrefix, 4);
     f.clientSend.emplace(cliKeys.cipher, cliKeys.c2b, cliKeys.c2bPrefix);
     f.clientRecv.emplace(cliKeys.cipher, cliKeys.b2c, cliKeys.b2cPrefix);
     return f;
@@ -663,16 +684,18 @@ rpc::Records makeRecordsFrame(int64_t sessionId, int64_t correlationId, int64_t 
 // rune::node::sealRecordsFrame() into a sealed buffer.  Returns the sealed
 // bytes (empty on seal failure).
 std::vector<uint8_t> sealRecordsAsPushWould(const rpc::Records& rec, cr::AeadCipher& send,
-                                            uint64_t& sendSeq, cr::Cipher cipher, uint16_t epoch) {
+                                            uint64_t& sendSeq, cr::Cipher cipher, uint16_t epoch,
+                                            uint8_t senderId = 0) {
     const std::size_t frameLen = rec.encodedSize();
     std::vector<uint8_t> plain(frameLen);
     rec.encode(plain.data());
 
     pn::RecordsSealCtx ctx;
-    ctx.send    = &send;
-    ctx.sendSeq = &sendSeq;
-    ctx.cipher  = static_cast<uint8_t>(cipher);
-    ctx.epoch   = epoch;
+    ctx.send     = &send;
+    ctx.sendSeq  = &sendSeq;
+    ctx.cipher   = static_cast<uint8_t>(cipher);
+    ctx.epoch    = epoch;
+    ctx.senderId = senderId;   // Task 19: 0 == gateway (byte-identical default)
 
     std::vector<uint8_t> sealed(frameLen + rpc::kCryptoOverhead);
     const std::size_t n = pn::sealRecordsFrame(ctx, plain.data(), frameLen, sealed.data(), sealed.size());
@@ -797,6 +820,200 @@ TEST(GatewayCryptoDataPlane, RecordsPushSealMisconfiguredCtxFailsClosed) {
     const std::size_t n = pn::sealRecordsFrame(ctx, plain.data(), frameLen, sealed.data(), sealed.size());
     EXPECT_EQ(n, 0u);
     EXPECT_EQ(sendSeq, 0u) << "a failed seal must not even consume a sequence number";
+}
+
+// ---------------------------------------------------------------------------
+// Task 19 (per-worker egress crypto addendum, 2026-10-08): a SHARD WORKER
+// seals its OWN Records push with its OWN per-sender key
+// (deriveSenderKey(b2c, workerId+1)), stamping senderId into the
+// CryptoSubHeader (RecordsSealCtx::senderId). These cases mirror
+// RecordsPushSealOpensOnClient_Small/Large above, but with a worker's
+// derived key + senderId instead of the gateway's own b2c/senderId=0, and
+// the CLIENT re-deriving the SAME per-sender key locally (exactly per the
+// addendum's design — no key crosses the wire) to pick its recv cipher.
+// ---------------------------------------------------------------------------
+
+TEST(GatewayCryptoDataPlane, WorkerSealedRecordsOpenUnderDerivedPerSenderKey) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/30);
+
+    constexpr uint8_t kWorkerId = 2;      // worker 2 -> senderId 3
+    constexpr uint8_t kSenderId = kWorkerId + 1;
+
+    // Broker side: the gateway derives this worker's key at SessionAnnounce
+    // time from the session's raw b2c (SessionAnnouncer::announce).
+    cr::AeadKey workerKey{};
+    ASSERT_TRUE(cr::deriveSenderKey(f.gw.b2c, kSenderId, workerKey));
+    cr::AeadCipher workerSend(f.gw.cipher, workerKey, f.gw.b2cPrefix);
+    uint64_t workerSendSeq = 0;   // this worker's OWN counter — starts fresh, independent of the gateway's
+
+    const std::vector<uint8_t> batch(96, 0x5A);
+    const rpc::Records rec = makeRecordsFrame(30, 7, 2, 9, 1, 500, batch);
+    const auto sealed = sealRecordsAsPushWould(rec, workerSend, workerSendSeq, f.gw.cipher,
+                                                /*epoch=*/0, kSenderId);
+    ASSERT_FALSE(sealed.empty());
+    EXPECT_EQ(workerSendSeq, 1u);
+
+    // The subheader carries the authenticated senderId (inside the AAD).
+    const auto sub = rpc::CryptoSubHeader::decode(sealed.data() + rpc::MessageHeader::ENCODED_SIZE,
+                                                   sealed.size() - rpc::MessageHeader::ENCODED_SIZE);
+    ASSERT_TRUE(sub.has_value());
+    EXPECT_EQ(sub->senderId, kSenderId);
+
+    // Client side: re-derives the SAME per-sender key from ITS OWN b2c (the
+    // same exporter secret, never a key sent over the wire) and picks it by
+    // the clear senderId exactly as the addendum's client design describes.
+    // (makeDataPlaneFixture already proved client b2c == gateway b2c via
+    // HandshakeReachesDoneAndKeysAgree; re-deriving from f.gw.b2c here
+    // stands in for "the client's own independent derivation".)
+    cr::AeadKey derivedFromGatewayB2c{};
+    ASSERT_TRUE(cr::deriveSenderKey(f.gw.b2c, kSenderId, derivedFromGatewayB2c));
+    EXPECT_EQ(0, std::memcmp(workerKey.bytes, derivedFromGatewayB2c.bytes, sizeof(workerKey.bytes)))
+        << "deriveSenderKey must be a deterministic pure function of (b2c, senderId)";
+    cr::AeadCipher clientRecvForWorker(f.gw.cipher, workerKey, f.gw.b2cPrefix);
+
+    std::vector<uint8_t> storage;
+    const auto opened = openRecordsAsClientWould(sealed, clientRecvForWorker, storage);
+    ASSERT_TRUE(opened.has_value()) << "a worker-sealed Records frame must open under the "
+                                        "client's independently-re-derived per-sender key";
+    EXPECT_EQ(opened->sessionId, rec.sessionId);
+    ASSERT_EQ(opened->recordBatch.size(), batch.size());
+    EXPECT_EQ(0, std::memcmp(opened->recordBatch.data(), batch.data(), batch.size()));
+}
+
+TEST(GatewayCryptoDataPlane, TwoWorkersProduceDistinctKeysNeitherOpensUnderTheOther) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/31);
+
+    cr::AeadKey key1{}, key2{};
+    ASSERT_TRUE(cr::deriveSenderKey(f.gw.b2c, /*senderId=*/1, key1));   // worker 0
+    ASSERT_TRUE(cr::deriveSenderKey(f.gw.b2c, /*senderId=*/2, key2));   // worker 1
+    EXPECT_NE(0, std::memcmp(key1.bytes, key2.bytes, sizeof(key1.bytes)))
+        << "two distinct senderIds must derive two distinct keys — the whole point: independent "
+           "nonce spaces, no cross-sender AES-GCM nonce reuse";
+
+    cr::AeadCipher send1(f.gw.cipher, key1, f.gw.b2cPrefix);
+    cr::AeadCipher send2(f.gw.cipher, key2, f.gw.b2cPrefix);
+    uint64_t seq1 = 0, seq2 = 0;
+
+    const std::vector<uint8_t> batch(40, 0x7E);
+    const rpc::Records rec1 = makeRecordsFrame(31, 1, 1, 1, 0, 0, batch);
+    const rpc::Records rec2 = makeRecordsFrame(31, 1, 2, 1, 0, 0, batch);
+    const auto sealed1 = sealRecordsAsPushWould(rec1, send1, seq1, f.gw.cipher, 0, /*senderId=*/1);
+    const auto sealed2 = sealRecordsAsPushWould(rec2, send2, seq2, f.gw.cipher, 0, /*senderId=*/2);
+    ASSERT_FALSE(sealed1.empty());
+    ASSERT_FALSE(sealed2.empty());
+
+    cr::AeadCipher recv1(f.gw.cipher, key1, f.gw.b2cPrefix);
+    cr::AeadCipher recv2(f.gw.cipher, key2, f.gw.b2cPrefix);
+
+    std::vector<uint8_t> storage;
+    EXPECT_TRUE(openRecordsAsClientWould(sealed1, recv1, storage).has_value())
+        << "worker 0's frame must open under worker 0's own derived key";
+    EXPECT_TRUE(openRecordsAsClientWould(sealed2, recv2, storage).has_value())
+        << "worker 1's frame must open under worker 1's own derived key";
+
+    // Cross-sender: worker 0's frame must NOT open under worker 1's key, and
+    // vice versa (even though both frames carry a correctly-authenticated
+    // CryptoSubHeader — they are simply sealed under a different key).
+    EXPECT_FALSE(openRecordsAsClientWould(sealed1, recv2, storage).has_value())
+        << "worker 0's frame must never open under worker 1's key";
+    EXPECT_FALSE(openRecordsAsClientWould(sealed2, recv1, storage).has_value())
+        << "worker 1's frame must never open under worker 0's key";
+}
+
+TEST(GatewayCryptoDataPlane, WorkerSealedRecordsWrongSenderIdTamperDropped) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/32);
+    cr::AeadKey key{};
+    ASSERT_TRUE(cr::deriveSenderKey(f.gw.b2c, /*senderId=*/5, key));
+    cr::AeadCipher send(f.gw.cipher, key, f.gw.b2cPrefix);
+    uint64_t seq = 0;
+
+    const std::vector<uint8_t> batch(16, 0x33);
+    const rpc::Records rec = makeRecordsFrame(32, 1, 1, 1, 0, 0, batch);
+    auto sealed = sealRecordsAsPushWould(rec, send, seq, f.gw.cipher, 0, /*senderId=*/5);
+    ASSERT_FALSE(sealed.empty());
+
+    // Flip the senderId byte in the (authenticated) subheader — senderId is
+    // inside the AAD, so this must fail auth on open, never silently pick a
+    // different key and "succeed" (the addendum's "no redirection vector"
+    // security note).
+    sealed[rpc::MessageHeader::ENCODED_SIZE + 3 /* high byte of the epoch/senderId u16 */] ^= 0xFF;
+
+    cr::AeadCipher recv(f.gw.cipher, key, f.gw.b2cPrefix);
+    std::vector<uint8_t> storage;
+    EXPECT_FALSE(openRecordsAsClientWould(sealed, recv, storage).has_value())
+        << "a forged senderId byte (inside the AAD) must fail authentication, never be silently "
+           "accepted under the original key";
+}
+
+TEST(GatewayCryptoDataPlane, WorkerDeriveSenderKeyZeroEqualsGatewayB2c) {
+    // deriveSenderKey's documented contract: senderId==0 => out == b2c
+    // UNCHANGED (the gateway's own id) — never a change to the
+    // already-shipped gateway/client seal/open path.
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/33);
+    cr::AeadKey out{};
+    ASSERT_TRUE(cr::deriveSenderKey(f.gw.b2c, /*senderId=*/0, out));
+    EXPECT_EQ(0, std::memcmp(out.bytes, f.gw.b2c.bytes, sizeof(out.bytes)));
+}
+
+// ---------------------------------------------------------------------------
+// Task 19: SessionAnnounceKeyTail.h — the [cipher|prefix|key|channel] byte
+// layout Worker.h's enqueueOp/executeSessionAnnounceWire_ ride on the
+// SessionAnnounce op's EXISTING variable tail (no new SBE field — see that
+// header's file comment). Pure byte-format functions, zero Aeron/crypto
+// dependency: unit-tested standalone here, same TU as the rest of this
+// file's aeron-free crypto coverage.
+// ---------------------------------------------------------------------------
+
+TEST(SessionAnnounceKeyTail, EncodeDecodeRoundTrips) {
+    uint8_t prefix[4] = {0x11, 0x22, 0x33, 0x44};
+    uint8_t key[32];
+    for (int i = 0; i < 32; ++i) key[static_cast<std::size_t>(i)] = static_cast<uint8_t>(i);
+    const std::string channel = "aeron:udp?endpoint=127.0.0.1:9999";
+
+    std::vector<uint8_t> buf(rune::node::kSessionAnnounceCryptoHeaderBytes + channel.size());
+    const std::size_t n = rune::node::encodeSessionAnnounceCryptoTail(
+        buf.data(), buf.size(), /*cipher=*/static_cast<uint8_t>(cr::Cipher::Aes256Gcm), prefix, key,
+        channel.data(), channel.size());
+    ASSERT_EQ(n, buf.size());
+
+    const auto decoded = rune::node::decodeSessionAnnounceCryptoTail(
+        reinterpret_cast<const char*>(buf.data()), n);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->cipher, static_cast<uint8_t>(cr::Cipher::Aes256Gcm));
+    EXPECT_EQ(0, std::memcmp(decoded->prefix, prefix, 4));
+    EXPECT_EQ(0, std::memcmp(decoded->key, key, 32));
+    ASSERT_EQ(decoded->channel.size(), channel.size());
+    EXPECT_EQ(decoded->channel, channel);
+}
+
+TEST(SessionAnnounceKeyTail, EncodeDecodeRoundTripsWithEmptyChannel) {
+    uint8_t prefix[4] = {0, 0, 0, 0};
+    uint8_t key[32] = {};
+    std::vector<uint8_t> buf(rune::node::kSessionAnnounceCryptoHeaderBytes);
+    const std::size_t n = rune::node::encodeSessionAnnounceCryptoTail(
+        buf.data(), buf.size(), 1, prefix, key, nullptr, 0);
+    ASSERT_EQ(n, rune::node::kSessionAnnounceCryptoHeaderBytes);
+    const auto decoded = rune::node::decodeSessionAnnounceCryptoTail(
+        reinterpret_cast<const char*>(buf.data()), n);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_TRUE(decoded->channel.empty());
+}
+
+TEST(SessionAnnounceKeyTail, EncodeFailsClosedWhenBufferTooSmall) {
+    uint8_t prefix[4] = {}, key[32] = {};
+    std::vector<uint8_t> tooSmall(rune::node::kSessionAnnounceCryptoHeaderBytes - 1);
+    const std::size_t n = rune::node::encodeSessionAnnounceCryptoTail(
+        tooSmall.data(), tooSmall.size(), 1, prefix, key, "x", 1);
+    EXPECT_EQ(n, 0u) << "must never write a truncated crypto header — 0 means 'do not enqueue this'";
+}
+
+TEST(SessionAnnounceKeyTail, DecodeFailsClosedOnTruncatedTail) {
+    // Shorter than the fixed header: must be nullopt, NEVER parsed as if it
+    // were a (garbage) key — a worker must park, never install from this.
+    std::vector<uint8_t> truncated(rune::node::kSessionAnnounceCryptoHeaderBytes - 1, 0xAB);
+    const auto decoded = rune::node::decodeSessionAnnounceCryptoTail(
+        reinterpret_cast<const char*>(truncated.data()), truncated.size());
+    EXPECT_FALSE(decoded.has_value());
 }
 
 // ---------------------------------------------------------------------------

@@ -1843,19 +1843,14 @@ void BrokerNode::buildGateway() {
                                   "was loaded (RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE) — refusing to "
                                   "start (every Connect would be rejected)");
     }
-    // Review fix round 2 (Minor, pairs with the above): shard mode can never
-    // serve an encrypted session (Worker.h's per-worker Records egress
-    // stays plaintext until Task 14) — shard mode + require_tls together
-    // would reject EVERY Connect (shard refuses the crypto offer,
-    // require_tls refuses the plaintext fallback): a broker that starts but
-    // can never serve a client.  Fail loud at startup instead.
-    if (rune::node::mustRefuseShardWithRequireTls(config_.shardMode(), config_.requireTls)) {
-        throw std::runtime_error(
-            "BrokerNode[" + std::to_string(nodeId) + "]: shard mode + RUNE_REQUIRE_TLS together "
-            "cannot serve any client (per-worker Records egress stays plaintext until Task 14 — "
-            "shard mode refuses every crypto offer, require_tls refuses every plaintext "
-            "fallback) — refusing to start");
-    }
+    // Task 19 (per-worker egress crypto addendum): shard mode + require_tls
+    // used to be refused at startup here (the shard worker's Records egress
+    // was plaintext-only, so the combination could never serve a client).
+    // Now that the shard worker seals its own Records egress with its own
+    // per-sender key (RecordsSeal.h / SessionAnnounce key handoff), shard
+    // mode serves encrypted sessions exactly like legacy mode — this
+    // startup refusal is gone (see rune::node::TlsStartupPolicy.h's header
+    // note for the removed mustRefuseShardWithRequireTls).
 
     // Build the gateway (subscribes on clientChannel).
     try {

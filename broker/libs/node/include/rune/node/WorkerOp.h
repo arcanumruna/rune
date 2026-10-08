@@ -185,6 +185,33 @@ struct WorkerOp {
     // worker acking directly gates UnknownProducerId on it).
     int32_t          clientVersion = 0;
 
+    // Task 19 (per-worker egress crypto addendum, 2026-10-08): SessionAnnounce
+    // key handoff. `sessionEncrypted` is the session's own crypto.encrypted
+    // (true even if THIS worker's specific key below failed to derive — see
+    // senderKeyValid); the worker must treat an encrypted session it has no
+    // valid key for as "park/drop", NEVER plaintext. `senderKeyValid` gates
+    // whether senderCipher/senderKeyPrefix/senderKey below are a real,
+    // installable key (deriveSenderKey() succeeded on the gateway).
+    //
+    // senderId is deliberately NOT carried here: a worker derives it locally
+    // as workerId_ + 1 (unique per worker; gateway == 0) — see
+    // RecordsSealCtx::senderId.
+    //
+    // WIRE NOTE: carried with ZERO new SBE fields (see
+    // SessionAnnounceKeyTail.h's file header for why) — sessionEncrypted
+    // rides the wire `isolation` byte (PushRead-only otherwise), senderKeyValid
+    // rides the wire `durabilityTier` byte (Produce-only otherwise); the
+    // cipher/prefix/key ride as a fixed-size PREFIX of the SessionAnnounce
+    // tail (ahead of the egressChannel bytes), encoded/decoded by
+    // SessionAnnounceKeyTail.h. A plaintext session's wire bytes (isolation,
+    // durabilityTier, tail) are completely untouched — byte-identical to
+    // every pre-Task-19 SessionAnnounce.
+    bool    sessionEncrypted  = false;
+    bool    senderKeyValid    = false;
+    uint8_t senderCipher      = 0;      ///< rune::crypto::Cipher value
+    uint8_t senderKeyPrefix[4] = {};    ///< 4-byte AEAD nonce prefix (the session's b2cPrefix)
+    uint8_t senderKey[32]      = {};    ///< deriveSenderKey(b2c, workerId+1) output for THIS worker
+
     // SetOwnership: the ReplicaRegistry generation this owned set reflects
     // (acked back as WorkerReturn::OwnershipAck).  Task 10 fix 3.
     uint64_t ownershipGen = 0;

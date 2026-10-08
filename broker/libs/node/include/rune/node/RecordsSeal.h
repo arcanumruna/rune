@@ -13,10 +13,11 @@
 //   2. libs/node must not depend on libs/gateway: this header takes RAW
 //      crypto bits (an AeadCipher*, a sendSeq counter, a cipher id, an
 //      epoch) instead of rune::gateway::CryptoState, so it has zero gateway
-//      dependency. Both the gateway's ClientGateway::pushRecords_ (now) and
-//      the per-worker egress (Task 14, shard mode, once per-worker session
-//      keys are installed) reach the SAME sealRecordsFrame() with their own
-//      crypto state's raw fields — the one seam both callers share.
+//      dependency. Both the gateway's ClientGateway::pushRecords_ and the
+//      per-worker egress (Worker.h, Task 19, shard mode, once per-worker
+//      session keys are installed via SessionAnnounce) reach the SAME
+//      sealRecordsFrame() with their own crypto state's raw fields — the
+//      one seam both callers share.
 //
 // Mirrors rune::gateway::codec::sealResponseFrame (Task 8, CryptoFrame.h)
 // EXACTLY: same wire layout ([24B MessageHeader][12B CryptoSubHeader]
@@ -45,7 +46,7 @@ namespace rune::node {
 /// what the seal step needs; no rune::gateway::CryptoState dependency).
 /// `send`/`sendSeq` are non-owning pointers into the caller's own crypto
 /// state (e.g. `&*session.crypto.send` / `&session.crypto.sendSeq` on the
-/// gateway; a per-worker session's own fields for Task 14).
+/// gateway; a shard worker's own WorkerSessionCrypto fields, Task 19).
 ///
 /// A default-constructed (all-null) ctx means "misconfigured" — NOT
 /// plaintext. The discriminant between a plaintext and an encrypted Records
@@ -55,10 +56,18 @@ namespace rune::node {
 /// null `send` (key not yet installed) must fail closed (sealRecordsFrame
 /// returns 0, nothing is ever transmitted in the clear).
 struct RecordsSealCtx {
-    rune::crypto::AeadCipher* send    = nullptr;  ///< SEALs (b2c on the gateway)
+    rune::crypto::AeadCipher* send    = nullptr;  ///< SEALs (b2c on the gateway, or a worker's own per-sender key)
     uint64_t*                 sendSeq = nullptr;  ///< ++*sendSeq per sealed frame
     uint8_t                   cipher  = 0;        ///< rune::crypto::Cipher value
     uint16_t                  epoch   = 0;
+    /// Task 19 (per-worker egress crypto addendum): the authenticated sender
+    /// id stamped into the CryptoSubHeader (0 = gateway, unchanged default —
+    /// byte-identical to every pre-Task-19 caller of this struct; w+1 = the
+    /// shard worker with id w). Each sender MUST use a DISTINCT senderId so
+    /// each occupies an independent AES-GCM nonce space under its own
+    /// deriveSenderKey()-derived key — see RecordsSeal.h's own crypto note
+    /// and the addendum doc. Never reuse 0 for a worker.
+    uint8_t                   senderId = 0;
 };
 
 /// Seal a contiguous Records plaintext frame `plain` ([24B MessageHeader]
@@ -89,10 +98,11 @@ struct RecordsSealCtx {
     // [24..35] CryptoSubHeader, clear — also part of the AAD.
     const uint64_t seq = ++(*ctx.sendSeq);
     rpc::CryptoSubHeader sub;
-    sub.version = 1;
-    sub.cipher  = ctx.cipher;
-    sub.epoch   = ctx.epoch;
-    sub.seq     = seq;
+    sub.version  = 1;
+    sub.cipher   = ctx.cipher;
+    sub.epoch    = ctx.epoch;
+    sub.senderId = ctx.senderId;   // Task 19: authenticated (AAD) sender selector
+    sub.seq      = seq;
     sub.encode(sealed + rpc::MessageHeader::ENCODED_SIZE);
 
     // [36..] sealed body || tag.

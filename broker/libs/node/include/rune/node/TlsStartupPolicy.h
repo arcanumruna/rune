@@ -6,10 +6,12 @@
 // without Aeron, and without calling buildGateway() itself (which needs a
 // live Aeron client).
 //
-// Both checks below are startup-time, cold-path refusals: throwing here
-// means the broker never starts rather than silently serving a session in a
-// way that contradicts its own configuration (closing two fail-open
-// footguns the Task 9 review found).
+// The check below is a startup-time, cold-path refusal: throwing here means
+// the broker never starts rather than silently serving a session in a way
+// that contradicts its own configuration (closing a fail-open footgun the
+// Task 9 review found). A second such check, mustRefuseShardWithRequireTls,
+// was removed by Task 19 once shard mode could serve crypto (see its own
+// removal note below).
 
 #include <string>
 
@@ -39,18 +41,13 @@ namespace rune::node {
     return configured && !(certLoaded && keyLoaded);
 }
 
-/// Review fix (Minor, pairs with the above): shard mode can never serve an
-/// encrypted session — Worker.h's per-worker Records egress stays plaintext
-/// until Task 14 seals it (the ★ gating note; ClientGateway::handleConnect
-/// already refuses any crypto offer in shard mode via
-/// shardModeRefusesCryptoOffer). So shard mode + require_tls together would
-/// reject EVERY Connect: shard mode refuses the crypto offer, and
-/// require_tls refuses the plaintext fallback that would otherwise result —
-/// a broker that silently bricks itself one Connect at a time. Fail loud at
-/// startup instead of per-Connect.
-[[nodiscard]] inline bool mustRefuseShardWithRequireTls(bool shardMode,
-                                                         bool requireTls) noexcept {
-    return shardMode && requireTls;
-}
+// Review fix (Minor, pairs with the above) — REMOVED by Task 19 (per-worker
+// egress crypto addendum, 2026-10-08): mustRefuseShardWithRequireTls used to
+// refuse starting a broker with both shard mode and require_tls set, because
+// shard mode could not yet serve an encrypted session at all (Worker.h's
+// per-worker Records egress was plaintext-only). Task 19 made the shard
+// worker seal its own Records egress with its own per-sender key, so shard
+// mode now serves crypto exactly like legacy mode — the combination is no
+// longer a dead end and this startup refusal is gone.
 
 } // namespace rune::node

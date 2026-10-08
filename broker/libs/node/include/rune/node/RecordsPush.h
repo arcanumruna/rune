@@ -87,7 +87,7 @@ inline constexpr std::size_t kRecordsFixedBytes =
 /// reused across calls (resize() only grows; a bad_alloc in the try/catch at
 /// the call site drops the frame rather than throwing).  Shared-nothing: one
 /// instance per thread that calls sendRecordsFrame (the gateway's duty-cycle
-/// thread today; a per-worker egress thread under Task 14 — never shared
+/// thread; each shard worker's own instance since Task 19 — never shared
 /// across threads).
 struct RecordsSealScratch {
     std::vector<uint8_t> plain;
