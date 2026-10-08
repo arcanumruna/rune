@@ -1,14 +1,22 @@
 // rune-ql parser — tokenizer + recursive-descent DDL parser
 // Grammar:
-//   statement := "topic" IDENT "{" field ("," field)* ","? "}" "partitions" INT "key" IDENT ";"
-//   field     := IDENT type
-//   type      := int32|int64|uint16|uint32|uint64|float64|bool|bytes
+//   statement   := topicStmt | alterStmt
+//   topicStmt   := "topic" IDENT "{" field ("," field)* ","? "}" "partitions" INT "key" IDENT ";"
+//   alterStmt   := "alter" "topic" IDENT alterOp ("," alterOp)* ";"
+//   alterOp     := "add" "column" field
+//                | "drop" "column" IDENT
+//                | "rename" "column" IDENT "to" IDENT
+//                | "set" "compatibility" ("backward" | "forward")
+//   field       := IDENT type
+//   type        := int32|int64|uint16|uint32|uint64|float64|bool|bytes
 //              | string
 //              | string "(" INT ")"
 #include "rune/ql/Parser.h"
 #include <algorithm>
 #include <charconv>
 #include <string_view>
+#include <utility>
+#include <variant>
 
 namespace rune::ql {
 
@@ -144,6 +152,16 @@ struct Parser {
         return consume();
     }
 
+    // Expect current token to be TK::Ident with exact text `kw` (text-matched keyword);
+    // advance and return it, or return a located error.
+    std::expected<Token, ParseError> expectKeyword(std::string_view kw) noexcept {
+        if (cur.kind != TK::Ident || cur.text != kw) {
+            return std::unexpected(err(
+                std::string("expected '") + std::string(kw) + "', got '" + std::string(cur.text) + "'"));
+        }
+        return consume();
+    }
+
     // Parse a non-negative integer from cur (which must be TK::Int).
     std::expected<uint64_t, ParseError> parseInt() noexcept {
         if (cur.kind != TK::Int) {
@@ -212,8 +230,8 @@ struct Parser {
         return fd;
     }
 
-    // ---- top-level statement ----
-    std::expected<TopicDef, ParseError> parseStatement() noexcept {
+    // ---- top-level statement: "topic" ----
+    std::expected<TopicDef, ParseError> parseTopicStatement() noexcept {
         // "topic"
         if (cur.kind != TK::Ident || cur.text != "topic") {
             return std::unexpected(err("expected 'topic'"));
@@ -313,13 +331,158 @@ struct Parser {
 
         return td;
     }
+
+    // ---- alter operations ----
+    //   "add" "column" field
+    // | "drop" "column" IDENT
+    // | "rename" "column" IDENT "to" IDENT
+    // | "set" "compatibility" ("backward" | "forward")
+    std::expected<AlterOp, ParseError> parseAlterOp() noexcept {
+        if (cur.kind != TK::Ident) {
+            return std::unexpected(err("expected alter operation ('add', 'drop', 'rename', or 'set')"));
+        }
+
+        if (cur.text == "add") {
+            advance();
+            auto col = expectKeyword("column");
+            if (!col) return std::unexpected(std::move(col.error()));
+
+            auto fd = parseField();
+            if (!fd) return std::unexpected(std::move(fd.error()));
+
+            AlterOp op;
+            op.kind = AlterOpKind::Add;
+            op.field = std::move(*fd);
+            return op;
+        }
+
+        if (cur.text == "drop") {
+            advance();
+            auto col = expectKeyword("column");
+            if (!col) return std::unexpected(std::move(col.error()));
+
+            auto nameToken = expect(TK::Ident, "column name");
+            if (!nameToken) return std::unexpected(std::move(nameToken.error()));
+
+            AlterOp op;
+            op.kind = AlterOpKind::Drop;
+            op.name = std::string(nameToken->text);
+            return op;
+        }
+
+        if (cur.text == "rename") {
+            advance();
+            auto col = expectKeyword("column");
+            if (!col) return std::unexpected(std::move(col.error()));
+
+            auto oldNameToken = expect(TK::Ident, "column name");
+            if (!oldNameToken) return std::unexpected(std::move(oldNameToken.error()));
+
+            auto to = expectKeyword("to");
+            if (!to) return std::unexpected(std::move(to.error()));
+
+            auto newNameToken = expect(TK::Ident, "new column name");
+            if (!newNameToken) return std::unexpected(std::move(newNameToken.error()));
+
+            AlterOp op;
+            op.kind = AlterOpKind::Rename;
+            op.name = std::string(oldNameToken->text);
+            op.newName = std::string(newNameToken->text);
+            return op;
+        }
+
+        if (cur.text == "set") {
+            advance();
+            auto compat = expectKeyword("compatibility");
+            if (!compat) return std::unexpected(std::move(compat.error()));
+
+            if (cur.kind != TK::Ident) {
+                return std::unexpected(err("expected 'backward' or 'forward'"));
+            }
+            Compatibility mode;
+            if (cur.text == "backward")      mode = Compatibility::Backward;
+            else if (cur.text == "forward")  mode = Compatibility::Forward;
+            else {
+                return std::unexpected(err(
+                    std::string("expected 'backward' or 'forward', got '") + std::string(cur.text) + "'"));
+            }
+            advance();
+
+            AlterOp op;
+            op.kind = AlterOpKind::SetCompatibility;
+            op.mode = mode;
+            return op;
+        }
+
+        return std::unexpected(err(
+            std::string("unknown alter operation '") + std::string(cur.text) + "'"));
+    }
+
+    // ---- top-level statement: "alter" ----
+    std::expected<AlterTopicDef, ParseError> parseAlterStatement() noexcept {
+        // "alter"
+        auto alterTok = expectKeyword("alter");
+        if (!alterTok) return std::unexpected(std::move(alterTok.error()));
+
+        // "topic"
+        auto topicTok = expectKeyword("topic");
+        if (!topicTok) return std::unexpected(std::move(topicTok.error()));
+
+        // topic name
+        auto nameToken = expect(TK::Ident, "topic name");
+        if (!nameToken) return std::unexpected(std::move(nameToken.error()));
+        AlterTopicDef ad;
+        ad.name = std::string(nameToken->text);
+
+        // ops: op ("," op)*
+        while (true) {
+            auto op = parseAlterOp();
+            if (!op) return std::unexpected(std::move(op.error()));
+            ad.ops.push_back(std::move(*op));
+
+            if (cur.kind == TK::Comma) {
+                advance();
+                continue;
+            }
+            break;
+        }
+
+        // ";"
+        auto semi = expect(TK::Semi, ";");
+        if (!semi) return std::unexpected(std::move(semi.error()));
+
+        // ensure nothing follows (except EOF)
+        if (cur.kind != TK::Eof) {
+            return std::unexpected(err("unexpected token after statement"));
+        }
+
+        return ad;
+    }
 };
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-std::expected<TopicDef, ParseError> parse(std::string_view src) noexcept {
+std::expected<std::variant<TopicDef, AlterTopicDef>, ParseError> parse(std::string_view src) noexcept {
     Parser p{src};
-    return p.parseStatement();
+
+    if (p.cur.kind != TK::Ident) {
+        return std::unexpected(p.err("expected 'topic' or 'alter'"));
+    }
+
+    if (p.cur.text == "topic") {
+        auto r = p.parseTopicStatement();
+        if (!r) return std::unexpected(std::move(r.error()));
+        return std::variant<TopicDef, AlterTopicDef>(std::in_place_type<TopicDef>, std::move(*r));
+    }
+
+    if (p.cur.text == "alter") {
+        auto r = p.parseAlterStatement();
+        if (!r) return std::unexpected(std::move(r.error()));
+        return std::variant<TopicDef, AlterTopicDef>(std::in_place_type<AlterTopicDef>, std::move(*r));
+    }
+
+    return std::unexpected(p.err(
+        std::string("expected 'topic' or 'alter', got '") + std::string(p.cur.text) + "'"));
 }
 
 } // namespace rune::ql

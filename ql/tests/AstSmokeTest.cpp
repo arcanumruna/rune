@@ -21,3 +21,18 @@ TEST(Ast, ParseErrorDefaults) {
     EXPECT_EQ(e.col, 0u);
     EXPECT_EQ(e.message, "unexpected token");
 }
+
+TEST(Ast, AlterOpConstructs) {
+    rune::ql::AlterOp op{rune::ql::AlterOpKind::Rename, {}, "oldName", "newName", rune::ql::Compatibility::Forward};
+    EXPECT_EQ(op.kind, rune::ql::AlterOpKind::Rename);
+    EXPECT_EQ(op.name, "oldName");
+    EXPECT_EQ(op.newName, "newName");
+    EXPECT_EQ(op.mode, rune::ql::Compatibility::Forward);
+}
+
+TEST(Ast, AlterTopicDefConstructs) {
+    rune::ql::AlterTopicDef ad{"users", {{rune::ql::AlterOpKind::Drop, {}, "age", "", rune::ql::Compatibility::Backward}}};
+    EXPECT_EQ(ad.name, "users");
+    ASSERT_EQ(ad.ops.size(), 1u);
+    EXPECT_EQ(ad.ops[0].kind, rune::ql::AlterOpKind::Drop);
+}

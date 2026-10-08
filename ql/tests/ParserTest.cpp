@@ -5,7 +5,9 @@ using namespace rune::ql; using rune::codec::PrimType;
 TEST(Parser, ParsesCharacters) {
     auto r = parse("topic characters { id int64, userId int64, name string, code string(8) } partitions 16 key userId;");
     ASSERT_TRUE(r.has_value());
-    const TopicDef& t = *r;
+    const TopicDef* tp = std::get_if<TopicDef>(&*r);
+    ASSERT_NE(tp, nullptr);
+    const TopicDef& t = *tp;
     EXPECT_EQ(t.name, "characters");
     EXPECT_EQ(t.partitions, 16u);
     EXPECT_EQ(t.keyField, "userId");
@@ -18,7 +20,9 @@ TEST(Parser, ParsesCharacters) {
 TEST(Parser, LineCommentsAndTrailingComma) {
     auto r = parse("-- a topic\ntopic t { a int32, } partitions 1 key a;");
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->fields.size(), 1u);
+    auto* t = std::get_if<TopicDef>(&*r);
+    ASSERT_NE(t, nullptr);
+    EXPECT_EQ(t->fields.size(), 1u);
 }
 TEST(Parser, RejectsUnknownType) {
     auto r = parse("topic t { a int128 } partitions 1 key a;");
@@ -57,8 +61,10 @@ TEST(ParserRegression, RejectsStringWidthAbove65535) {
     // 65535 is the maximum valid width.
     auto rMax = parse("topic t { a string(65535) } partitions 1 key a;");
     ASSERT_TRUE(rMax.has_value());
-    EXPECT_EQ(rMax->fields[0].type, rune::codec::PrimType::FixedStr);
-    EXPECT_EQ(rMax->fields[0].fixedLen, 65535u);
+    auto* tMax = std::get_if<TopicDef>(&*rMax);
+    ASSERT_NE(tMax, nullptr);
+    EXPECT_EQ(tMax->fields[0].type, rune::codec::PrimType::FixedStr);
+    EXPECT_EQ(tMax->fields[0].fixedLen, 65535u);
 }
 
 // Guards against uint32_t truncation of partitions (review Important #1, applied to partitions).
@@ -75,4 +81,65 @@ TEST(ParserRegression, ZeroPartitionsErrorPointsAtZero) {
     ASSERT_FALSE(r.has_value());
     EXPECT_EQ(r.error().line, 2u);
     EXPECT_EQ(r.error().col, 12u);  // points at '0', not the following 'key'
+}
+
+// ── ALTER TOPIC ───────────────────────────────────────────────────────────────
+
+TEST(Parser, AlterTopicAddDropRename) {
+    auto r = rune::ql::parse("alter topic users add column score int32, drop column age, rename column name to fullName;");
+    ASSERT_TRUE(r.has_value());
+    auto* a = std::get_if<rune::ql::AlterTopicDef>(&*r);
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(a->name, "users");
+    ASSERT_EQ(a->ops.size(), 3u);
+    EXPECT_EQ(a->ops[0].kind, rune::ql::AlterOpKind::Add);
+    EXPECT_EQ(a->ops[0].field.name, "score");
+    EXPECT_EQ(a->ops[0].field.type, PrimType::Int32);
+    EXPECT_EQ(a->ops[1].kind, rune::ql::AlterOpKind::Drop);
+    EXPECT_EQ(a->ops[1].name, "age");
+    EXPECT_EQ(a->ops[2].kind, rune::ql::AlterOpKind::Rename);
+    EXPECT_EQ(a->ops[2].name, "name");
+    EXPECT_EQ(a->ops[2].newName, "fullName");
+}
+
+TEST(Parser, AlterSetCompatibility) {
+    auto r = rune::ql::parse("alter topic users set compatibility forward;");
+    ASSERT_TRUE(r.has_value());
+    auto* a = std::get_if<rune::ql::AlterTopicDef>(&*r);
+    ASSERT_NE(a, nullptr);
+    ASSERT_EQ(a->ops.size(), 1u);
+    EXPECT_EQ(a->ops[0].kind, rune::ql::AlterOpKind::SetCompatibility);
+    EXPECT_EQ(a->ops[0].mode, rune::ql::Compatibility::Forward);
+}
+
+TEST(Parser, AlterSetCompatibilityBackward) {
+    auto r = rune::ql::parse("alter topic users set compatibility backward;");
+    ASSERT_TRUE(r.has_value());
+    auto* a = std::get_if<rune::ql::AlterTopicDef>(&*r);
+    ASSERT_NE(a, nullptr);
+    EXPECT_EQ(a->ops[0].mode, rune::ql::Compatibility::Backward);
+}
+
+TEST(Parser, ExistingTopicStatementStillParses) {
+    auto r = rune::ql::parse("topic users { id int64 } partitions 4 key id;");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_NE(std::get_if<rune::ql::TopicDef>(&*r), nullptr);
+}
+
+TEST(Parser, RejectsUnknownStatementKeyword) {
+    auto r = rune::ql::parse("drop topic users;");
+    ASSERT_FALSE(r.has_value());
+}
+
+// ── ALTER TOPIC located-error regression ─────────────────────────────────────
+TEST(ParserRegression, AlterMissingColumnKeywordIsLocatedError) {
+    auto r = rune::ql::parse("alter topic users add score int32;");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find("column"), std::string::npos);
+}
+
+TEST(ParserRegression, AlterUnknownOpIsLocatedError) {
+    auto r = rune::ql::parse("alter topic users frobnicate column age;");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_GT(r.error().line, 0u);
 }
