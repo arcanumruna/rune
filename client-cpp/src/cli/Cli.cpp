@@ -25,6 +25,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 // Live broker path requires Aeron.
@@ -84,8 +85,13 @@ bool hasFlag(const std::vector<std::string>& args, std::string_view flag) {
 void printUsage(std::ostream& err) {
     err << "Usage:\n"
         << "  rune schema apply <file|-> [--dry-run] [--validate] [--broker <ep>]\n"
-        << "      Parse a .rql schema file; --dry-run prints descriptor (no broker).\n"
-        << "      Without --dry-run: define topic on broker (live).\n"
+        << "      Parse a .rql schema file (a 'topic' or an 'alter topic' statement);\n"
+        << "      --dry-run prints the descriptor / alter plan (no broker).\n"
+        << "      Without --dry-run: define (or alter) the topic on broker (live).\n"
+        << "  rune schema alter <file|-> [--dry-run] [--expected-version N] [--broker <ep>]\n"
+        << "      Parse an 'alter topic' .rql file; --dry-run prints the parsed ops.\n"
+        << "      Without --dry-run: alter topic on broker (live), gated by\n"
+        << "      --expected-version (optimistic concurrency; default 0).\n"
         << "  rune schema get <topic> --broker <ep>\n"
         << "      Fetch topic schema from broker and print descriptor.\n"
         << "  rune schema list [--verbose] --broker <ep>\n"
@@ -164,6 +170,99 @@ bool readSource(const std::string& path, std::string& src, std::ostream& err) {
     return true;
 }
 
+// ── alter plan text (dry-run) ─────────────────────────────────────────────────
+//
+// There is no shared toText() for AlterTopicDef in rune-ql/rune-codec (only
+// Descriptor has one) — this CLI-local formatter is deliberately minimal and
+// is not a wire/API contract; it exists purely for human-readable --dry-run
+// output of `apply`/`alter` on an 'alter topic' statement.
+
+std::string_view alterOpKindName(rune::ql::AlterOpKind k) {
+    switch (k) {
+        case rune::ql::AlterOpKind::Add:              return "ADD";
+        case rune::ql::AlterOpKind::Drop:             return "DROP";
+        case rune::ql::AlterOpKind::Rename:           return "RENAME";
+        case rune::ql::AlterOpKind::SetCompatibility: return "SET_COMPATIBILITY";
+    }
+    return "UNKNOWN";
+}
+
+std::string_view primTypeNameForCli(rune::codec::PrimType t) {
+    switch (t) {
+        case rune::codec::PrimType::Int32:    return "int32";
+        case rune::codec::PrimType::Int64:    return "int64";
+        case rune::codec::PrimType::UInt16:   return "uint16";
+        case rune::codec::PrimType::UInt32:   return "uint32";
+        case rune::codec::PrimType::UInt64:   return "uint64";
+        case rune::codec::PrimType::Float64:  return "float64";
+        case rune::codec::PrimType::Bool:     return "bool";
+        case rune::codec::PrimType::Enum:     return "enum";
+        case rune::codec::PrimType::String:   return "string";
+        case rune::codec::PrimType::Bytes:    return "bytes";
+        case rune::codec::PrimType::FixedStr: return "string";
+    }
+    return "unknown";
+}
+
+void printAlterPlanText(const rune::ql::AlterTopicDef& ad, std::ostream& out) {
+    out << "alter topic " << ad.name << "\n";
+    for (const auto& op : ad.ops) {
+        out << "  " << alterOpKindName(op.kind);
+        switch (op.kind) {
+            case rune::ql::AlterOpKind::Add:
+                out << " " << op.field.name << " " << primTypeNameForCli(op.field.type);
+                if (op.field.type == rune::codec::PrimType::FixedStr) {
+                    out << "(" << op.field.fixedLen << ")";
+                }
+                break;
+            case rune::ql::AlterOpKind::Drop:
+                out << " " << op.name;
+                break;
+            case rune::ql::AlterOpKind::Rename:
+                out << " " << op.name << " -> " << op.newName;
+                break;
+            case rune::ql::AlterOpKind::SetCompatibility:
+                out << " " << (op.mode == rune::ql::Compatibility::Backward ? "BACKWARD" : "FORWARD");
+                break;
+        }
+        out << "\n";
+    }
+}
+
+#ifdef RUNE_CLI_LIVE_ENABLED
+// Shared AlterTopicResult reporting for both `apply` (on an alter file) and
+// `alter`: surfaces SchemaIncompatible/SchemaConflict/UnknownTopic with clear
+// messages, any other broker errorCode generically, and newVersion on success.
+int reportAlterResult(const std::string& name, const rune::client::AlterTopicResult& r,
+                      std::ostream& out, std::ostream& err)
+{
+    namespace rpc = rune::protocol::client;
+    if (r.errorCode == static_cast<uint16_t>(rpc::ErrorCode::UnknownTopic)) {
+        err << "rune: unknown topic '" << name << "'\n";
+        return static_cast<int>(r.errorCode);
+    }
+    if (r.errorCode == static_cast<uint16_t>(rpc::ErrorCode::SchemaIncompatible)) {
+        err << "rune: alter rejected for topic '" << name
+            << "': proposed ops are incompatible with the existing schema/data\n";
+        return static_cast<int>(r.errorCode);
+    }
+    if (r.errorCode == static_cast<uint16_t>(rpc::ErrorCode::SchemaConflict)) {
+        err << "rune: alter rejected for topic '" << name
+            << "': expected version is stale (schema changed since last read; "
+               "re-fetch with `rune schema get` and retry)\n";
+        return static_cast<int>(r.errorCode);
+    }
+    if (r.errorCode != 0) {
+        err << "rune: broker error code " << r.errorCode
+            << " for topic '" << name << "'\n";
+        return static_cast<int>(r.errorCode);
+    }
+
+    out << "rune: topic '" << name << "' altered: newVersion=" << r.newVersion << "\n";
+    return 0;
+}
+#endif
+
 // ── schema apply ──────────────────────────────────────────────────────────────
 
 int cmdSchemaApply(const std::vector<std::string>& args,
@@ -185,6 +284,9 @@ int cmdSchemaApply(const std::vector<std::string>& args,
     if (!readSource(path, src, err)) return 1;
 
     // ── Parse ─────────────────────────────────────────────────────────────────
+    // Task 16 widened parse() to a variant: a 'topic' statement defines a new
+    // topic (existing path below); an 'alter topic' statement routes through
+    // applyAlterPlan()/alterTopicAndWait() instead.
     auto result = rune::ql::parse(src);
     if (!result) {
         const auto& pe = result.error();
@@ -192,22 +294,54 @@ int cmdSchemaApply(const std::vector<std::string>& args,
         return 2;
     }
 
-    // ── Dry run: emit descriptor as text, no broker contact ───────────────────
+    const bool isAlter = std::holds_alternative<rune::ql::AlterTopicDef>(*result);
+
+    // ── Dry run: emit descriptor/plan as text, no broker contact ──────────────
     if (dryRun) {
-        rune::codec::Descriptor d = rune::ql::toDescriptor(*result);
-        out << rune::codec::toText(d) << "\n";
+        if (isAlter) {
+            printAlterPlanText(std::get<rune::ql::AlterTopicDef>(*result), out);
+        } else {
+            rune::codec::Descriptor d = rune::ql::toDescriptor(std::get<rune::ql::TopicDef>(*result));
+            out << rune::codec::toText(d) << "\n";
+        }
         return 0;
     }
 
-    // ── Live: define topic on broker ──────────────────────────────────────────
+    // ── Live: define (or alter) topic on broker ───────────────────────────────
 #ifdef RUNE_CLI_LIVE_ENABLED
-    // Build the apply plan (parse → blob).
-    rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(*result);
-
     using namespace rune::client;
     Client client(buildClientConfig(args));
     try {
         if (!connectOrReport(client, err)) return 1;
+
+        if (isAlter) {
+            const auto& ad = std::get<rune::ql::AlterTopicDef>(*result);
+            uint16_t expectedVersion = 0;
+            const std::string evStr = flagValue(args, "--expected-version");
+            if (!evStr.empty()) expectedVersion = static_cast<uint16_t>(std::stoi(evStr));
+
+            rune::ql::AlterTopicPlan plan = rune::ql::applyAlterPlan(ad, expectedVersion);
+
+            AlterTopicResult r;
+            try {
+                r = client.alterTopicAndWait(
+                    plan.name, plan.expectedVersion,
+                    std::span<const uint8_t>(plan.opsBlob.data(), plan.opsBlob.size()),
+                    kCliWait);
+            } catch (const std::exception& e) {
+                if (isWaitTimeout(e)) {
+                    err << "rune: alterTopic timed out for topic: " << plan.name << "\n";
+                    client.close();
+                    return 1;
+                }
+                throw;
+            }
+            client.close();
+            return reportAlterResult(plan.name, r, out, err);
+        }
+
+        // Build the apply plan (parse → blob).
+        rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(std::get<rune::ql::TopicDef>(*result));
 
         DefineTopicResult r;
         try {
@@ -255,6 +389,88 @@ int cmdSchemaApply(const std::vector<std::string>& args,
     (void)validate;
     err << "rune schema apply: live mode requires RUNE_CLI_LIVE_ENABLED "
            "and a real Aeron build. Use --dry-run for offline descriptor output.\n";
+    return 1;
+#endif
+}
+
+// ── schema alter ──────────────────────────────────────────────────────────────
+
+int cmdSchemaAlter(const std::vector<std::string>& args,
+                   std::ostream& out,
+                   std::ostream& err)
+{
+    // args[0] == "alter", args[1] == <file|->
+    if (args.size() < 2) {
+        err << "rune schema alter: <file|-> argument required\n";
+        return 1;
+    }
+
+    const bool dryRun = hasFlag(args, "--dry-run");
+    const std::string& path = args[1];
+
+    // ── Read source ───────────────────────────────────────────────────────────
+    std::string src;
+    if (!readSource(path, src, err)) return 1;
+
+    // ── Parse ─────────────────────────────────────────────────────────────────
+    auto result = rune::ql::parse(src);
+    if (!result) {
+        const auto& pe = result.error();
+        err << path << ":" << pe.line << ":" << pe.col << ": " << pe.message << "\n";
+        return 2;
+    }
+
+    if (!std::holds_alternative<rune::ql::AlterTopicDef>(*result)) {
+        err << path << ": expected an 'alter topic' statement, got a 'topic' statement "
+               "(use `rune schema apply` to define a new topic)\n";
+        return 2;
+    }
+    const auto& ad = std::get<rune::ql::AlterTopicDef>(*result);
+
+    uint16_t expectedVersion = 0;
+    const std::string evStr = flagValue(args, "--expected-version");
+    if (!evStr.empty()) expectedVersion = static_cast<uint16_t>(std::stoi(evStr));
+
+    // ── Dry run: emit parsed ops as text, no broker contact ───────────────────
+    if (dryRun) {
+        printAlterPlanText(ad, out);
+        return 0;
+    }
+
+    // ── Live: alter topic on broker ───────────────────────────────────────────
+#ifdef RUNE_CLI_LIVE_ENABLED
+    rune::ql::AlterTopicPlan plan = rune::ql::applyAlterPlan(ad, expectedVersion);
+
+    using namespace rune::client;
+    Client client(buildClientConfig(args));
+    try {
+        if (!connectOrReport(client, err)) return 1;
+
+        AlterTopicResult r;
+        try {
+            r = client.alterTopicAndWait(
+                plan.name, plan.expectedVersion,
+                std::span<const uint8_t>(plan.opsBlob.data(), plan.opsBlob.size()),
+                kCliWait);
+        } catch (const std::exception& e) {
+            if (isWaitTimeout(e)) {
+                err << "rune: alterTopic timed out for topic: " << plan.name << "\n";
+                client.close();
+                return 1;
+            }
+            throw;
+        }
+        client.close();
+        return reportAlterResult(plan.name, r, out, err);
+
+    } catch (const std::exception& e) {
+        err << "rune error: " << e.what() << "\n";
+        client.close();
+        return 1;
+    }
+#else
+    err << "rune schema alter: live mode requires RUNE_CLI_LIVE_ENABLED "
+           "and a real Aeron build. Use --dry-run for offline output.\n";
     return 1;
 #endif
 }
@@ -485,7 +701,7 @@ int cmdSchema(const std::vector<std::string>& args,
 {
     // args[0] == "schema", args[1] == subcommand
     if (args.size() < 2) {
-        err << "rune schema: subcommand required (apply|get|list|generate)\n";
+        err << "rune schema: subcommand required (apply|alter|get|list|generate)\n";
         printUsage(err);
         return 1;
     }
@@ -496,6 +712,9 @@ int cmdSchema(const std::vector<std::string>& args,
 
     if (sub == "apply") {
         return cmdSchemaApply(subArgs, out, err);
+    }
+    if (sub == "alter") {
+        return cmdSchemaAlter(subArgs, out, err);
     }
     if (sub == "get") {
         return cmdSchemaGet(subArgs, out, err);

@@ -35,6 +35,67 @@ TEST(RuneCliOffline, ApplyReportsParseErrorWithLocation) {
 }
 
 // ---------------------------------------------------------------------------
+// Task 20: `rune schema alter` + `apply` variant dispatch (ql Task 16/17
+// widened parse() to std::variant<TopicDef, AlterTopicDef>).
+// ---------------------------------------------------------------------------
+
+// `rune schema alter <alter.rql> --dry-run` prints the parsed ops (no broker).
+TEST(RuneCliOffline, AlterDryRunPrintsParsedOps) {
+    fs::path f = fs::temp_directory_path()/"alter_characters.rql";
+    { std::ofstream o(f);
+      o << "alter topic characters add column nickname string, "
+           "set compatibility backward;"; }
+    std::ostringstream out, err;
+    int rc = rune::cli::run({"schema","alter", f.string(), "--dry-run"}, out, err);
+    EXPECT_EQ(rc, 0) << "err=" << err.str();
+    const std::string o = out.str();
+    EXPECT_NE(o.find("alter topic characters"), std::string::npos) << "got: " << o;
+    EXPECT_NE(o.find("ADD"), std::string::npos) << "got: " << o;
+    EXPECT_NE(o.find("nickname"), std::string::npos) << "got: " << o;
+    EXPECT_NE(o.find("SET_COMPATIBILITY"), std::string::npos) << "got: " << o;
+}
+
+// A 'topic' file through `apply --dry-run` still prints a DefineTopic plan
+// (the TopicDef alternative of the variant), unchanged behavior.
+TEST(RuneCliOffline, ApplyDryRunStillDefinesTopicFile) {
+    fs::path f = fs::temp_directory_path()/"topic_characters.rql";
+    { std::ofstream o(f);
+      o << "topic characters { id int64, userId int64 } partitions 4 key userId;"; }
+    std::ostringstream out, err;
+    int rc = rune::cli::run({"schema","apply", f.string(), "--dry-run"}, out, err);
+    EXPECT_EQ(rc, 0) << "err=" << err.str();
+    EXPECT_NE(out.str().find("schema characters"), std::string::npos)
+        << "got: " << out.str();
+}
+
+// An 'alter topic' file through `apply --dry-run` routes to the alter path
+// (prints the parsed ops), not the DefineTopic descriptor path.
+TEST(RuneCliOffline, ApplyDryRunRoutesAlterFileToAlterPath) {
+    fs::path f = fs::temp_directory_path()/"apply_alter.rql";
+    { std::ofstream o(f); o << "alter topic characters drop column nickname;"; }
+    std::ostringstream out, err;
+    int rc = rune::cli::run({"schema","apply", f.string(), "--dry-run"}, out, err);
+    EXPECT_EQ(rc, 0) << "err=" << err.str();
+    const std::string o = out.str();
+    EXPECT_NE(o.find("alter topic characters"), std::string::npos) << "got: " << o;
+    EXPECT_NE(o.find("DROP"), std::string::npos) << "got: " << o;
+    EXPECT_NE(o.find("nickname"), std::string::npos) << "got: " << o;
+    // Must NOT look like the DefineTopic descriptor dump.
+    EXPECT_EQ(o.find("schema characters"), std::string::npos) << "got: " << o;
+}
+
+// `rune schema alter` on a 'topic' (not 'alter topic') statement is an error.
+TEST(RuneCliOffline, AlterRejectsTopicStatement) {
+    fs::path f = fs::temp_directory_path()/"alter_wrong_kind.rql";
+    { std::ofstream o(f);
+      o << "topic characters { id int64 } partitions 1 key id;"; }
+    std::ostringstream out, err;
+    int rc = rune::cli::run({"schema","alter", f.string(), "--dry-run"}, out, err);
+    EXPECT_NE(rc, 0);
+    EXPECT_NE(err.str().find("alter topic"), std::string::npos) << "got: " << err.str();
+}
+
+// ---------------------------------------------------------------------------
 // Regression suite (engineering rule 6: named *Regression* so it filters
 // together via --gtest_filter="*Regression*").
 // ---------------------------------------------------------------------------
@@ -67,4 +128,75 @@ TEST(RuneCliOfflineRegression, ApplyReportsParseErrorWithLocationPrefix) {
         << "error output must carry file:line: location prefix; got: " << e;
     // And a message describing the unknown type.
     EXPECT_NE(e.find("type"), std::string::npos);
+}
+
+// Regression: `apply`'s dispatch on parse()'s std::variant<TopicDef,
+// AlterTopicDef> result must route EACH alternative to its own plan/path —
+// a 'topic' file keeps producing a DefineTopic descriptor dump, an
+// 'alter topic' file produces the alter-ops dump, and neither path is ever
+// taken for the other kind of statement. This pins the Task 20 fix for the
+// CLI build break (parse() used to return a bare TopicDef).
+TEST(RuneCliOfflineRegression, ApplyDispatchesOnParseVariant) {
+    fs::path topicFile = fs::temp_directory_path()/"regression_apply_topic.rql";
+    { std::ofstream o(topicFile);
+      o << "topic characters { id int64, userId int64 } partitions 4 key userId;"; }
+    fs::path alterFile = fs::temp_directory_path()/"regression_apply_alter.rql";
+    { std::ofstream o(alterFile);
+      o << "alter topic characters add column nickname string;"; }
+
+    std::ostringstream topicOut, topicErr;
+    int topicRc = rune::cli::run({"schema","apply", topicFile.string(), "--dry-run"},
+                                  topicOut, topicErr);
+    EXPECT_EQ(topicRc, 0) << "err=" << topicErr.str();
+    EXPECT_NE(topicOut.str().find("schema characters"), std::string::npos)
+        << "a 'topic' file must still produce a DefineTopic descriptor dump; got: "
+        << topicOut.str();
+    EXPECT_EQ(topicOut.str().find("alter topic"), std::string::npos)
+        << "a 'topic' file must never be routed through the alter path; got: "
+        << topicOut.str();
+
+    std::ostringstream alterOut, alterErr;
+    int alterRc = rune::cli::run({"schema","apply", alterFile.string(), "--dry-run"},
+                                  alterOut, alterErr);
+    EXPECT_EQ(alterRc, 0) << "err=" << alterErr.str();
+    EXPECT_NE(alterOut.str().find("alter topic characters"), std::string::npos)
+        << "an 'alter topic' file must be routed through the alter path; got: "
+        << alterOut.str();
+    EXPECT_EQ(alterOut.str().find("schema characters"), std::string::npos)
+        << "an 'alter topic' file must never produce a DefineTopic descriptor dump; got: "
+        << alterOut.str();
+}
+
+// Regression: `rune schema alter` on an .rql file whose statement is 'topic'
+// (not 'alter topic') must fail clearly rather than misinterpreting it.
+TEST(RuneCliOfflineRegression, AlterRejectsTopicStatement) {
+    fs::path f = fs::temp_directory_path()/"regression_alter_wrong_kind.rql";
+    { std::ofstream o(f); o << "topic characters { id int64 } partitions 1 key id;"; }
+    std::ostringstream out, err;
+    int rc = rune::cli::run({"schema","alter", f.string(), "--dry-run"}, out, err);
+    EXPECT_NE(rc, 0);
+    EXPECT_NE(err.str().find("alter topic"), std::string::npos) << "got: " << err.str();
+}
+
+// Regression: `rune schema alter --dry-run` prints every op kind (ADD/DROP/
+// RENAME/SET_COMPATIBILITY) so a reviewer can see the full plan before a
+// live CAS-gated alter is issued.
+TEST(RuneCliOfflineRegression, AlterDryRunPrintsAllOpKinds) {
+    fs::path f = fs::temp_directory_path()/"regression_alter_all_ops.rql";
+    { std::ofstream o(f);
+      o << "alter topic characters "
+           "add column nickname string, "
+           "drop column legacy, "
+           "rename column userId to playerId, "
+           "set compatibility forward;"; }
+    std::ostringstream out, err;
+    int rc = rune::cli::run({"schema","alter", f.string(), "--dry-run"}, out, err);
+    EXPECT_EQ(rc, 0) << "err=" << err.str();
+    const std::string o = out.str();
+    EXPECT_NE(o.find("ADD"), std::string::npos)              << "got: " << o;
+    EXPECT_NE(o.find("DROP"), std::string::npos)             << "got: " << o;
+    EXPECT_NE(o.find("RENAME"), std::string::npos)           << "got: " << o;
+    EXPECT_NE(o.find("userId -> playerId"), std::string::npos) << "got: " << o;
+    EXPECT_NE(o.find("SET_COMPATIBILITY"), std::string::npos) << "got: " << o;
+    EXPECT_NE(o.find("FORWARD"), std::string::npos)          << "got: " << o;
 }

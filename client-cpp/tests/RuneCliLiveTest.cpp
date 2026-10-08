@@ -139,13 +139,23 @@ struct CliTestGateway {
     uint16_t             getErrorCode = 0;
     std::vector<uint8_t> getBlob;   // set by test before call
 
+    // Canned AlterTopic response (Task 20).
+    bool     replyAlterTopic  = true;
+    int32_t  alterTopicId     = 0x40000001;
+    uint16_t alterNewVersion  = 2;
+    uint16_t alterErrorCode   = 0;
+
     // Observed state (set by onFrame).
     std::atomic<int>     definesSeen{0};
     std::atomic<int>     getsSeen{0};
+    std::atomic<int>     altersSeen{0};
     std::string          lastDefineName;
     uint32_t             lastDefinePartitions = 0;
     std::string          lastDefineKeyField;
     std::vector<uint8_t> lastDefineBlob;
+    std::string          lastAlterName;
+    uint16_t             lastAlterExpectedVersion = 0;
+    std::vector<uint8_t> lastAlterOpsBlob;
 
     uint8_t replyBuf[8192]{};
 
@@ -253,6 +263,33 @@ struct CliTestGateway {
             resp.topicId       = defineTopicId;
             resp.version       = defineVersion;
             resp.errorCode     = defineErrorCode;
+
+            const std::size_t n = resp.encode(replyBuf);
+            if (n > 0) send(replyBuf, n);
+            break;
+        }
+
+        case rcc::TemplateId::AlterTopic: {
+            auto opt = rpc::AlterTopic::decode(buf, len);
+            if (!opt) return;
+            altersSeen.fetch_add(1, std::memory_order_relaxed);
+
+            lastAlterName            = std::string(opt->topicName);
+            lastAlterExpectedVersion = opt->expectedVersion;
+            if (opt->opsBlob && opt->opsLen > 0) {
+                lastAlterOpsBlob.assign(opt->opsBlob, opt->opsBlob + opt->opsLen);
+            } else {
+                lastAlterOpsBlob.clear();
+            }
+
+            if (!replyAlterTopic) break;
+
+            rpc::AlterTopicResponse resp;
+            resp.sessionId     = opt->sessionId;
+            resp.correlationId = opt->correlationId;
+            resp.topicId       = alterTopicId;
+            resp.newVersion    = alterNewVersion;
+            resp.errorCode     = alterErrorCode;
 
             const std::size_t n = resp.encode(replyBuf);
             if (n > 0) send(replyBuf, n);
@@ -470,7 +507,7 @@ TEST(CliLive, SchemaApplyLive) {
         "topic characters { id int64, userId int64, name string } "
         "partitions 16 key userId;");
     ASSERT_TRUE(parseResult.has_value());
-    rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(*parseResult);
+    rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(std::get<rune::ql::TopicDef>(*parseResult));
     rune::codec::Descriptor dExpected = rune::codec::deserialize(
         std::span<const uint8_t>(plan.descriptorBlob.data(), plan.descriptorBlob.size()));
     EXPECT_EQ(rune::codec::fingerprint(d), rune::codec::fingerprint(dExpected))
@@ -536,7 +573,7 @@ TEST(CliLive, SchemaGetLive) {
         "topic characters { id int64, userId int64, name string } "
         "partitions 16 key userId;");
     ASSERT_TRUE(parseResult.has_value());
-    rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(*parseResult);
+    rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(std::get<rune::ql::TopicDef>(*parseResult));
 
     CliTestGateway gw(aeronDir, kIn, kOut);
     gw.getTopicId   = 0x40000001;
@@ -611,7 +648,7 @@ TEST(CliLive, SchemaListLive) {
     auto parseResult = rune::ql::parse(
         "topic characters { id int64, userId int64 } partitions 8 key userId;");
     ASSERT_TRUE(parseResult.has_value());
-    rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(*parseResult);
+    rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(std::get<rune::ql::TopicDef>(*parseResult));
 
     rune::client::ClientConfig cfg;
     cfg.gatewayChannel  = "aeron:ipc";
@@ -691,7 +728,7 @@ TEST(CliLive, SchemaListVerbose) {
         "topic characters { id int64, userId int64, name string } "
         "partitions 16 key userId;");
     ASSERT_TRUE(parseResult.has_value());
-    rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(*parseResult);
+    rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(std::get<rune::ql::TopicDef>(*parseResult));
 
     // Test via Client API directly (same pattern as SchemaListLive).
     rune::client::ClientConfig cfg;
@@ -825,7 +862,7 @@ TEST(CliLiveRegression, GetLive_DescriptorInOutput) {
     auto parseResult = rune::ql::parse(
         "topic characters { id int64 } partitions 1 key id;");
     ASSERT_TRUE(parseResult.has_value());
-    rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(*parseResult);
+    rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(std::get<rune::ql::TopicDef>(*parseResult));
 
     CliTestGateway gw(aeronDir, kIn, kOut);
     gw.getTopicId   = 0x40000011;
@@ -862,7 +899,7 @@ TEST(CliLiveRegression, ListLive_TopicPresent) {
     auto parseResult = rune::ql::parse(
         "topic characters { id int64, userId int64 } partitions 4 key userId;");
     ASSERT_TRUE(parseResult.has_value());
-    rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(*parseResult);
+    rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(std::get<rune::ql::TopicDef>(*parseResult));
 
     rune::client::ClientConfig cfg;
     cfg.gatewayChannel  = "aeron:ipc";
@@ -915,6 +952,201 @@ TEST(CliLiveRegression, ListLive_TopicPresent) {
     EXPECT_TRUE(found) << "regression: 'characters' must appear in listTopics";
 
     client.close();
+    gw.stop();
+    try { std::filesystem::remove_all(baseDir); } catch (...) {}
+}
+
+// ===========================================================================
+// Task 20: `rune schema alter` + `apply` routing an 'alter topic' file.
+// ===========================================================================
+
+// Test 10: AlterTopicLive — gateway sees correct AlterTopic, CLI emits newVersion
+TEST(CliLive, AlterTopicLive) {
+    static constexpr int32_t kIn = 1240, kOut = 1241;
+    const std::string baseDir = cliUniqueDir();
+    const std::string agentDir = baseDir;
+    const std::string aeronDir = agentDir + "/aeron";
+
+    const std::string rqlPath = writeTmpRql(
+        baseDir,
+        "alter topic characters add column nickname string, "
+        "set compatibility backward;");
+
+    CliTestGateway gw(aeronDir, kIn, kOut);
+    gw.alterTopicId    = 0x40000001;
+    gw.alterNewVersion = 2;
+    gw.alterErrorCode  = 0;
+
+    std::vector<std::string> args = {
+        "schema", "alter", rqlPath,
+        "--expected-version", "1",
+        "--cli-data-dir", agentDir,
+        "--cli-stream-in",  std::to_string(kIn),
+        "--cli-stream-out", std::to_string(kOut),
+    };
+
+    auto r = runCli(gw, aeronDir, args);
+
+    EXPECT_EQ(gw.altersSeen.load(), 1) << "gateway should have seen one AlterTopic";
+    EXPECT_EQ(gw.lastAlterName,            "characters");
+    EXPECT_EQ(gw.lastAlterExpectedVersion, 1u);
+    ASSERT_FALSE(gw.lastAlterOpsBlob.empty()) << "opsBlob must be non-empty";
+
+    // The opsBlob must decode to the same ops the CLI parsed.
+    auto decoded = rune::codec::decodeAlterOps(
+        std::span<const uint8_t>(gw.lastAlterOpsBlob.data(), gw.lastAlterOpsBlob.size()));
+    ASSERT_TRUE(decoded.has_value()) << "opsBlob must decode";
+    ASSERT_EQ(decoded->size(), 2u);
+    EXPECT_EQ((*decoded)[0].type, rune::codec::AlterOpType::Add);
+    EXPECT_EQ((*decoded)[0].name, "nickname");
+    EXPECT_EQ((*decoded)[1].type, rune::codec::AlterOpType::SetCompatibility);
+    EXPECT_EQ((*decoded)[1].mode, rune::codec::CompatMode::Backward);
+
+    EXPECT_EQ(r.rc, 0) << "CLI must return 0; err=" << r.err;
+    EXPECT_NE(r.out.find("altered"), std::string::npos)
+        << "output must contain 'altered'; got: " << r.out;
+    EXPECT_NE(r.out.find("newVersion=2"), std::string::npos)
+        << "output must contain 'newVersion=2'; got: " << r.out;
+
+    gw.stop();
+    try { std::filesystem::remove_all(baseDir); } catch (...) {}
+}
+
+// Test 11: AlterTopicSchemaIncompatible — SchemaIncompatible(29) -> clear message
+TEST(CliLive, AlterTopicSchemaIncompatible) {
+    static constexpr int32_t kIn = 1242, kOut = 1243;
+    const std::string baseDir = cliUniqueDir();
+    const std::string agentDir = baseDir;
+    const std::string aeronDir = agentDir + "/aeron";
+
+    const std::string rqlPath = writeTmpRql(
+        baseDir, "alter topic characters drop column id;");
+
+    CliTestGateway gw(aeronDir, kIn, kOut);
+    gw.alterTopicId    = -1;
+    gw.alterNewVersion = 0;
+    gw.alterErrorCode  = static_cast<uint16_t>(rpc::ErrorCode::SchemaIncompatible);
+
+    std::vector<std::string> args = {
+        "schema", "alter", rqlPath,
+        "--cli-data-dir", agentDir,
+        "--cli-stream-in",  std::to_string(kIn),
+        "--cli-stream-out", std::to_string(kOut),
+    };
+
+    auto r = runCli(gw, aeronDir, args);
+
+    EXPECT_EQ(r.rc, static_cast<int>(rpc::ErrorCode::SchemaIncompatible))
+        << "CLI must return 29 (SchemaIncompatible); err=" << r.err;
+    EXPECT_NE(r.err.find("incompatible"), std::string::npos)
+        << "err must mention 'incompatible'; got: " << r.err;
+
+    gw.stop();
+    try { std::filesystem::remove_all(baseDir); } catch (...) {}
+}
+
+// Test 12: AlterTopicSchemaConflict — SchemaConflict(30) -> clear message
+TEST(CliLive, AlterTopicSchemaConflict) {
+    static constexpr int32_t kIn = 1244, kOut = 1245;
+    const std::string baseDir = cliUniqueDir();
+    const std::string agentDir = baseDir;
+    const std::string aeronDir = agentDir + "/aeron";
+
+    const std::string rqlPath = writeTmpRql(
+        baseDir, "alter topic characters add column nickname string;");
+
+    CliTestGateway gw(aeronDir, kIn, kOut);
+    gw.alterTopicId    = -1;
+    gw.alterNewVersion = 0;
+    gw.alterErrorCode  = static_cast<uint16_t>(rpc::ErrorCode::SchemaConflict);
+
+    std::vector<std::string> args = {
+        "schema", "alter", rqlPath,
+        "--expected-version", "5",
+        "--cli-data-dir", agentDir,
+        "--cli-stream-in",  std::to_string(kIn),
+        "--cli-stream-out", std::to_string(kOut),
+    };
+
+    auto r = runCli(gw, aeronDir, args);
+
+    EXPECT_EQ(r.rc, static_cast<int>(rpc::ErrorCode::SchemaConflict))
+        << "CLI must return 30 (SchemaConflict); err=" << r.err;
+    EXPECT_NE(r.err.find("stale"), std::string::npos)
+        << "err must mention 'stale'; got: " << r.err;
+
+    gw.stop();
+    try { std::filesystem::remove_all(baseDir); } catch (...) {}
+}
+
+// Test 13: ApplyAlterFileLive — `apply` on an 'alter topic' file routes to the
+// alter path (gateway sees AlterTopic, not DefineTopic).
+TEST(CliLive, ApplyAlterFileLive) {
+    static constexpr int32_t kIn = 1246, kOut = 1247;
+    const std::string baseDir = cliUniqueDir();
+    const std::string agentDir = baseDir;
+    const std::string aeronDir = agentDir + "/aeron";
+
+    const std::string rqlPath = writeTmpRql(
+        baseDir, "alter topic characters add column nickname string;");
+
+    CliTestGateway gw(aeronDir, kIn, kOut);
+    gw.alterTopicId    = 0x40000005;
+    gw.alterNewVersion = 3;
+    gw.alterErrorCode  = 0;
+
+    std::vector<std::string> args = {
+        "schema", "apply", rqlPath,
+        "--cli-data-dir", agentDir,
+        "--cli-stream-in",  std::to_string(kIn),
+        "--cli-stream-out", std::to_string(kOut),
+    };
+
+    auto r = runCli(gw, aeronDir, args);
+
+    EXPECT_EQ(gw.altersSeen.load(), 1)  << "apply on an alter file must send AlterTopic";
+    EXPECT_EQ(gw.definesSeen.load(), 0) << "apply on an alter file must NOT send DefineTopic";
+    EXPECT_EQ(r.rc, 0) << "CLI must return 0; err=" << r.err;
+    EXPECT_NE(r.out.find("newVersion=3"), std::string::npos)
+        << "output must contain 'newVersion=3'; got: " << r.out;
+
+    gw.stop();
+    try { std::filesystem::remove_all(baseDir); } catch (...) {}
+}
+
+// ===========================================================================
+// Test 14 (Regression): AlterLive_NewVersionInOutput
+// ===========================================================================
+TEST(CliLiveRegression, AlterLive_NewVersionInOutput) {
+    static constexpr int32_t kIn = 1248, kOut = 1249;
+    const std::string baseDir = cliUniqueDir();
+    const std::string agentDir = baseDir;
+    const std::string aeronDir = agentDir + "/aeron";
+
+    const std::string rqlPath = writeTmpRql(
+        baseDir, "alter topic characters add column nickname string;");
+
+    CliTestGateway gw(aeronDir, kIn, kOut);
+    gw.alterTopicId    = 0x40000006;
+    gw.alterNewVersion = 7;
+    gw.alterErrorCode  = 0;
+
+    std::vector<std::string> args = {
+        "schema", "alter", rqlPath,
+        "--cli-data-dir", agentDir,
+        "--cli-stream-in",  std::to_string(kIn),
+        "--cli-stream-out", std::to_string(kOut),
+    };
+
+    auto r = runCli(gw, aeronDir, args);
+
+    EXPECT_EQ(r.rc, 0) << "regression: alter must return 0; err=" << r.err;
+    EXPECT_NE(r.out.find("characters"), std::string::npos)
+        << "regression: output must contain topic name 'characters'; got: " << r.out;
+    EXPECT_NE(r.out.find("newVersion=7"), std::string::npos)
+        << "regression: output must contain 'newVersion=7'; got: " << r.out;
+    EXPECT_EQ(gw.altersSeen.load(), 1) << "regression: gateway must see exactly one AlterTopic";
+
     gw.stop();
     try { std::filesystem::remove_all(baseDir); } catch (...) {}
 }
