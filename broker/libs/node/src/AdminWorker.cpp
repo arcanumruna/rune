@@ -87,13 +87,37 @@ void AdminWorker::submitAlterTopic(AlterTopicMsg msg) {
 
 void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
     // GetSchema is a pure read of the admin-owned registry — no round-trip.
-    const auto* e = reg_.byName(msg.name);
-    if (!e) {
+    //
+    // Task 13: `msg.requestedFingerprint` selects WHICH version is returned —
+    // 0 means latest; non-zero resolves the exact historical version whose
+    // per-version (materialized-as-of) fingerprint matches, so a typed client
+    // compiled against an older schema can fetch the descriptor it needs.
+    const auto* named = reg_.byName(msg.name);
+    if (!named) {
         deps_.respondGet(msg.session, msg.corr, -1, 0, {}, kUnknownTopic);
         return;
     }
+    const RegistryEntry* e = (msg.requestedFingerprint == 0)
+                                 ? named
+                                 : reg_.byFingerprint(named->topicId, msg.requestedFingerprint);
+    if (!e) {
+        // No version of this (known) topic has the requested fingerprint —
+        // same wire error as an unknown topic (no dedicated "stale fingerprint"
+        // code on the wire yet).
+        deps_.respondGet(msg.session, msg.corr, -1, 0, {}, kUnknownTopic);
+        return;
+    }
+    // IMPORTANT: `e->descriptorBlob` is the raw EVOLVING blob (every field ever
+    // declared, live or retired) — NOT what a client should rehash. The client
+    // typed-gate recomputes fingerprint(deserialize(responseBlob)) and compares
+    // it to the fingerprint it compiled against, so the wire blob MUST
+    // deserialize to the MATERIALIZED-as-of-`e->version` descriptor (whose
+    // fingerprint is exactly `e->fingerprint`, by construction in
+    // SchemaRegistry::applyRecord). Serialize `e->descriptor` (materialized),
+    // never `e->descriptorBlob` (evolving).
     deps_.respondGet(msg.session, msg.corr,
-                     e->topicId, e->version, e->descriptorBlob, kOK);
+                     e->topicId, e->version,
+                     rune::codec::serialize(e->descriptor), kOK);
 }
 
 // ─── control → admin reply ──────────────────────────────────────────────────

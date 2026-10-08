@@ -125,11 +125,19 @@ struct AlterTopicMsg {
 
 // ---------------------------------------------------------------------------
 // GetSchema request (gateway → admin).  Owning form after drain.
+//
+// requestedFingerprint (Task 13): 0 = latest (AdminWorker resolves via
+// reg_.latest); non-zero = resolve the SPECIFIC version whose per-version
+// fingerprint matches (reg_.byFingerprint) — lets a typed client fetch the
+// older descriptor it was compiled against.  Appended as the LAST member so
+// existing 3-arg aggregate inits (`GetSchemaMsg{session, corr, name}`) still
+// compile and default to 0 (latest).
 // ---------------------------------------------------------------------------
 struct GetSchemaMsg {
     int64_t     session = 0;
     int64_t     corr    = 0;
     std::string name;
+    uint64_t    requestedFingerprint = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -254,14 +262,17 @@ inline AlterTopicMsg decodeAlterTopic(const uint8_t* buf, std::size_t len) {
 }
 
 // ---- GetSchema ----
+// Wire layout: session:i64, corr:i64, requestedFingerprint:u64 (0=latest),
+// nameLen:u16 + name bytes.
 inline bool encodeGetSchema(OneToOneByteRing& ring, const GetSchemaMsg& m) {
     using namespace admin_wire;
-    const std::size_t len = 8 + 8 + 2 + m.name.size();
+    const std::size_t len = 8 + 8 + 8 + 2 + m.name.size();
     const auto idx = ring.tryClaim(kMsgGetSchema, len);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
     putI64(p, m.session); p += 8;
     putI64(p, m.corr);    p += 8;
+    putI64(p, static_cast<int64_t>(m.requestedFingerprint)); p += 8;
     putU16(p, static_cast<uint16_t>(m.name.size())); p += 2;
     std::memcpy(p, m.name.data(), m.name.size());
     ring.commit(idx);
@@ -271,12 +282,13 @@ inline bool encodeGetSchema(OneToOneByteRing& ring, const GetSchemaMsg& m) {
 inline GetSchemaMsg decodeGetSchema(const uint8_t* buf, std::size_t len) {
     using namespace admin_wire;
     GetSchemaMsg m;
-    if (len < 18) return m;
+    if (len < 26) return m;
     m.session = getI64(buf);
     m.corr    = getI64(buf + 8);
-    const uint16_t nl = getU16(buf + 16);
-    if (18 + static_cast<std::size_t>(nl) <= len)
-        m.name.assign(reinterpret_cast<const char*>(buf + 18), nl);
+    m.requestedFingerprint = static_cast<uint64_t>(getI64(buf + 16));
+    const uint16_t nl = getU16(buf + 24);
+    if (26 + static_cast<std::size_t>(nl) <= len)
+        m.name.assign(reinterpret_cast<const char*>(buf + 26), nl);
     return m;
 }
 

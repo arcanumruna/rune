@@ -225,11 +225,13 @@ public:
     }
 
     bool submitGetSchema(int64_t sessionId, int64_t correlationId,
-                         std::string_view name) override {
+                         std::string_view name,
+                         uint64_t requestedFingerprint) override {
         GetSchemaMsg m;
         m.session = sessionId;
         m.corr    = correlationId;
         m.name.assign(name);
+        m.requestedFingerprint = requestedFingerprint;
         return encodeGetSchema(requestRing_, m);
     }
 

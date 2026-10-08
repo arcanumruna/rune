@@ -5084,7 +5084,8 @@ void ClientGateway::handleGetTopicSchema(const uint8_t* buf, std::size_t len)
         spdlog::debug("ClientGateway: GetTopicSchema for unknown sessionId={} — dropped", m.sessionId);
         return;
     }
-    (void)adminSink_->submitGetSchema(m.sessionId, m.correlationId, m.topicName);
+    (void)adminSink_->submitGetSchema(m.sessionId, m.correlationId, m.topicName,
+                                      m.requestedFingerprint);
 }
 
 // ---------------------------------------------------------------------------

@@ -36,8 +36,12 @@ struct IAdminRequestSink {
                                    uint32_t descriptorLen) = 0;
 
     // GetTopicSchema (templateId 66) — likewise, copy-and-return.
+    // requestedFingerprint (Task 13): 0 = latest; non-zero = the SPECIFIC
+    // version whose per-version fingerprint matches (so a typed client can
+    // fetch the older descriptor it was compiled against).
     virtual bool submitGetSchema(int64_t sessionId, int64_t correlationId,
-                                 std::string_view name) = 0;
+                                 std::string_view name,
+                                 uint64_t requestedFingerprint) = 0;
 };
 
 } // namespace rune::gateway
