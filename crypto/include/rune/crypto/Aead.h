@@ -33,4 +33,18 @@ public:
 private:
     EVP_CIPHER_CTX* ctx_; const EVP_CIPHER* evp_; uint8_t prefix_[kNoncePrefix];
 };
+
+// Derive the per-sender broker->client AEAD key for `senderId`. In shard mode each
+// independent broker->client sender (gateway + each worker) gets its OWN b2c key so the
+// senders occupy independent nonce spaces (no cross-sender nonce reuse under one key).
+//   senderId == 0  -> `out` = `b2c` UNCHANGED (the gateway; byte-identical to the
+//                     already-shipped b2c key -- backward compatible).
+//   senderId >= 1  -> out = HKDF-Expand(PRK = b2c.bytes, info = "rune-b2c-sender" ||
+//                     senderId byte, SHA-256, L=32) via OpenSSL EVP_KDF "HKDF"
+//                     (expand-only, no salt).
+// Deterministic pure function: same (b2c, senderId) on both client and broker yields the
+// same key, with no key material ever crossing the wire.
+// Fail-closed: returns false (and leaves `out` unspecified -- callers MUST NOT use it) if
+// any EVP_KDF step fails. Never returns true with a key that wasn't actually derived.
+bool deriveSenderKey(const AeadKey& b2c, uint8_t senderId, AeadKey& out) noexcept;
 }

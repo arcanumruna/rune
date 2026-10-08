@@ -1,5 +1,8 @@
 #include "rune/crypto/Aead.h"
 #include <openssl/evp.h>
+#include <openssl/kdf.h>
+#include <openssl/core_names.h>
+#include <openssl/params.h>
 #include <cstring>
 namespace rune::crypto {
 static const EVP_CIPHER* evpFor(Cipher c){
@@ -46,5 +49,44 @@ long AeadCipher::open(uint64_t seq,const uint8_t* aad,size_t aadLen,
   int fin=0;
   if(EVP_DecryptFinal_ex(ctx_,out+len,&fin)<=0) return -1; // tag mismatch
   return (long)bodyLen;
+}
+
+namespace {
+constexpr char kSenderInfoPrefix[] = "rune-b2c-sender"; // 15 ASCII bytes, no NUL
+constexpr size_t kSenderInfoPrefixLen = sizeof(kSenderInfoPrefix) - 1;
+}
+
+bool deriveSenderKey(const AeadKey& b2c, uint8_t senderId, AeadKey& out) noexcept {
+  if (senderId == 0) {
+    // senderId 0 is the gateway: byte-identical to the already-shipped b2c key, no KDF.
+    std::memcpy(out.bytes, b2c.bytes, sizeof(out.bytes));
+    return true;
+  }
+
+  uint8_t info[kSenderInfoPrefixLen + 1];
+  std::memcpy(info, kSenderInfoPrefix, kSenderInfoPrefixLen);
+  info[kSenderInfoPrefixLen] = senderId;
+
+  EVP_KDF* kdf = EVP_KDF_fetch(nullptr, "HKDF", nullptr);
+  if (!kdf) return false;
+  EVP_KDF_CTX* kctx = EVP_KDF_CTX_new(kdf);
+  EVP_KDF_free(kdf); // ctx holds its own reference once created
+  if (!kctx) return false;
+
+  int mode = EVP_KDF_HKDF_MODE_EXPAND_ONLY;
+  OSSL_PARAM params[] = {
+    OSSL_PARAM_construct_utf8_string(OSSL_KDF_PARAM_DIGEST, const_cast<char*>("SHA256"), 0),
+    OSSL_PARAM_construct_int(OSSL_KDF_PARAM_MODE, &mode),
+    OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_KEY,
+        const_cast<uint8_t*>(b2c.bytes), sizeof(b2c.bytes)),
+    OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_INFO, info, sizeof(info)),
+    OSSL_PARAM_construct_end(),
+  };
+
+  // Fail closed: any EVP_KDF step failing leaves `out` unused by the caller (false return),
+  // never a silently-wrong-looking-valid key.
+  bool ok = EVP_KDF_derive(kctx, out.bytes, sizeof(out.bytes), params) == 1;
+  EVP_KDF_CTX_free(kctx);
+  return ok;
 }
 }
