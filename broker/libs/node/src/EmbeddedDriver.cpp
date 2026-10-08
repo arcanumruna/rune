@@ -196,9 +196,15 @@ EmbeddedDriver::EmbeddedDriver(EmbeddedDriverConfig cfg, DriverMode mode)
     }
     // A7: epoll-first polling — patches rune_gso's own bindings in place, or a private copy of Aeron's stock
     // ones (never the process-wide stock struct).  After the GSO install (it replaces the context's bindings).
-    if (cfg_.epollPoll)
+    // Review L2: only over the Aeron release its internals were verified against (else stock polling).
+    if (cfg_.epollPoll && !epollPollSupportsAeron(aeron_version_major(), aeron_version_minor(), aeron_version_patch())) {
+        spdlog::error("EmbeddedDriver: epoll-first polling disabled — it is verified against Aeron {}.{}.{}, the "
+                      "runtime is {} (re-verify rune_driver_wake.c); stock polling, no park-until-work wake fds",
+                      kEpollPollAeronPin[0], kEpollPollAeronPin[1], kEpollPollAeronPin[2], aeron_version_full());
+    } else if (cfg_.epollPoll) {
         epollPollActive_ = rune_driver_epoll_poll_install(ctx_, /*ctx_bindings_owned=*/gso_ != nullptr ? 1 : 0,
                                                           &epollBindings_) == 1;
+    }
     if (cfg_.maxMessagesPerSend > 0)
         aeron_driver_context_set_network_publication_max_messages_per_send(ctx_, static_cast<uint32_t>(cfg_.maxMessagesPerSend));
     else if (const unsigned m = rune_gso_msgs_per_send(udpGsoActive(), static_cast<std::size_t>(cfg_.mtuBytes)); m > 0)

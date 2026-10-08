@@ -128,6 +128,14 @@ public:
     [[nodiscard]] rune_gso_totals_t gsoTotals() const noexcept { return gsoTotals_; }
     /// A7: the transport pollers poll epoll-first (rune_driver_wake.h rune_driver_epoll_poll_install).
     [[nodiscard]] bool epollPollActive() const noexcept { return epollPollActive_; }
+    /// A7 review L2: rune_driver_wake.c reads Aeron driver INTERNALS (the transport poller's epoll fd, its
+    /// bindings clientd epoll_event[] array, the receiver / sender poller fields), verified against exactly
+    /// this Aeron release.  Any other runtime Aeron keeps Aeron's stock polling (no wake fds: the legacy
+    /// backoff idle) and logs why — re-verify rune_driver_wake.c, then move the pin.
+    static constexpr int kEpollPollAeronPin[3] = {1, 41, 4};
+    [[nodiscard]] static bool epollPollSupportsAeron(int major, int minor, int patch) noexcept {
+        return major == kEpollPollAeronPin[0] && minor == kEpollPollAeronPin[1] && patch == kEpollPollAeronPin[2];
+    }
     /// A7 park-until-work: this INVOKER driver's socket-readiness fds (its receiver / sender transport
     /// pollers' epoll instances, rune_driver_wake.h) into `out` (at most `max`); returns how many.  0 for a
     /// threaded driver (its own thread consumes the sockets), a closed driver, a non-Linux platform, or
