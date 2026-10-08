@@ -95,21 +95,45 @@ TEST(Backends, ApplyAlterPlanRoundTripsSetCompatibility) {
 
 // ── Regression ───────────────────────────────────────────────────────────────
 // Guards the AlterTopicPlan backend (Task 17): every AlterOpKind must map to
-// its codec AlterOpType and round-trip through encode/decode unchanged.
+// its codec AlterOpType and round-trip through encode/decode unchanged,
+// field-for-field. This is the regression gate — it must be the comprehensive
+// check, not just a spot check of .type/.mode.
 TEST(BackendsRegression, ApplyAlterPlanAllOpKindsRoundTrip) {
     auto a = std::get<AlterTopicDef>(
-        parse("alter topic users add column score int32, drop column age, "
-              "rename column name to fullName, set compatibility forward;")
+        parse("alter topic users add column score int32, add column code string(8), "
+              "drop column age, rename column name to fullName, "
+              "set compatibility forward;")
             .value());
     auto plan = applyAlterPlan(a, 42);
     auto decoded = rune::codec::decodeAlterOps(plan.opsBlob);
     ASSERT_TRUE(decoded.has_value());
-    ASSERT_EQ(decoded->size(), 4u);
+    ASSERT_EQ(decoded->size(), 5u);
+
+    // Add (non-fixed): name + primType + fixedLen
     EXPECT_EQ((*decoded)[0].type, rune::codec::AlterOpType::Add);
-    EXPECT_EQ((*decoded)[1].type, rune::codec::AlterOpType::Drop);
-    EXPECT_EQ((*decoded)[2].type, rune::codec::AlterOpType::Rename);
-    EXPECT_EQ((*decoded)[3].type, rune::codec::AlterOpType::SetCompatibility);
-    EXPECT_EQ((*decoded)[3].mode, rune::codec::CompatMode::Forward);
+    EXPECT_EQ((*decoded)[0].name, "score");
+    EXPECT_EQ((*decoded)[0].primType, rune::codec::PrimType::Int32);
+    EXPECT_EQ((*decoded)[0].fixedLen, 0u);
+
+    // Add (FixedStr): name + primType + non-zero fixedLen
+    EXPECT_EQ((*decoded)[1].type, rune::codec::AlterOpType::Add);
+    EXPECT_EQ((*decoded)[1].name, "code");
+    EXPECT_EQ((*decoded)[1].primType, rune::codec::PrimType::FixedStr);
+    EXPECT_EQ((*decoded)[1].fixedLen, 8u);
+
+    // Drop: name
+    EXPECT_EQ((*decoded)[2].type, rune::codec::AlterOpType::Drop);
+    EXPECT_EQ((*decoded)[2].name, "age");
+
+    // Rename: name (old) + newName
+    EXPECT_EQ((*decoded)[3].type, rune::codec::AlterOpType::Rename);
+    EXPECT_EQ((*decoded)[3].name, "name");
+    EXPECT_EQ((*decoded)[3].newName, "fullName");
+
+    // SetCompatibility: mode
+    EXPECT_EQ((*decoded)[4].type, rune::codec::AlterOpType::SetCompatibility);
+    EXPECT_EQ((*decoded)[4].mode, rune::codec::CompatMode::Forward);
+
     EXPECT_EQ(plan.expectedVersion, 42u);
     EXPECT_EQ(plan.name, "users");
 }

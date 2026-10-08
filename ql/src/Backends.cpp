@@ -1,5 +1,6 @@
 #include "rune/ql/Backends.h"
 #include <rune/codec/Serialize.h>
+#include <stdexcept>
 
 namespace rune::ql {
 
@@ -34,7 +35,7 @@ rune::codec::AlterOpType toCodecOpType(AlterOpKind kind) {
         case AlterOpKind::Rename:           return rune::codec::AlterOpType::Rename;
         case AlterOpKind::SetCompatibility: return rune::codec::AlterOpType::SetCompatibility;
     }
-    return rune::codec::AlterOpType::Add;
+    throw std::logic_error("unhandled AlterOpKind");
 }
 
 rune::codec::CompatMode toCodecCompatMode(Compatibility mode) {
@@ -42,7 +43,7 @@ rune::codec::CompatMode toCodecCompatMode(Compatibility mode) {
         case Compatibility::Backward: return rune::codec::CompatMode::Backward;
         case Compatibility::Forward:  return rune::codec::CompatMode::Forward;
     }
-    return rune::codec::CompatMode::Backward;
+    throw std::logic_error("unhandled Compatibility");
 }
 
 rune::codec::AlterOp toCodecOp(const AlterOp& op) {
