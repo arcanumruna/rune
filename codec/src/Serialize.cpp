@@ -39,6 +39,8 @@ static std::string padRight(std::string_view s, size_t width) {
 // ─── Magic ────────────────────────────────────────────────────────────────────
 // "RCD1" as a little-endian u32: 'R'=0x52, 'C'=0x43, 'D'=0x44, '1'=0x31
 static constexpr uint32_t kMagic = 0x31444352u;
+// "RCD2" as a little-endian u32: 'R'=0x52, 'C'=0x43, 'D'=0x44, '2'=0x32
+static constexpr uint32_t kMagicV2 = 0x32444352u;
 
 // ─── Serialize helpers ────────────────────────────────────────────────────────
 
@@ -116,8 +118,9 @@ std::vector<uint8_t> serialize(const Descriptor& d) {
     // Reserve an approximate capacity to avoid repeated reallocations
     buf.reserve(64 + d.fields.size() * 32);
 
-    // Magic
-    push_u32le(buf, kMagic);
+    // Magic — always write the current (RCD2) format. RCD1 remains readable
+    // by deserialize() for back-compat but is never produced going forward.
+    push_u32le(buf, kMagicV2);
 
     // Schema name
     push_str(buf, d.name);
@@ -134,7 +137,7 @@ std::vector<uint8_t> serialize(const Descriptor& d) {
     // Fields
     for (const auto& f : d.fields) {
         push_str(buf, f.name);
-        push_u16le(buf, f.id);
+        push_u16le(buf, f.id); // explicit durable tag
         push_u8(buf, static_cast<uint8_t>(f.type));
         push_u16le(buf, f.sinceVersion);
         push_u8(buf, f.isKey ? uint8_t{1} : uint8_t{0});
@@ -153,6 +156,10 @@ std::vector<uint8_t> serialize(const Descriptor& d) {
         if (f.type == PrimType::FixedStr) {
             push_u16le(buf, f.fixedLen);
         }
+
+        // RCD2: untilVersion appended after everything else for this field
+        // (after fixedLen for FixedStr).
+        push_u16le(buf, f.untilVersion);
     }
 
     return buf;
@@ -161,9 +168,14 @@ std::vector<uint8_t> serialize(const Descriptor& d) {
 Descriptor deserialize(std::span<const uint8_t> blob) {
     size_t pos = 0;
 
-    // Magic check
+    // Magic check — accept either RCD1 (legacy) or RCD2 (current).
     uint32_t magic = read_u32le(blob, pos);
-    if (magic != kMagic) {
+    bool isV2;
+    if (magic == kMagicV2) {
+        isV2 = true;
+    } else if (magic == kMagic) {
+        isV2 = false;
+    } else {
         throw std::runtime_error("deserialize: bad magic number");
     }
 
@@ -182,7 +194,7 @@ Descriptor deserialize(std::span<const uint8_t> blob) {
     for (uint16_t i = 0; i < fieldCount; ++i) {
         std::string fieldName = read_str(blob, pos);
 
-        uint16_t id           = read_u16le(blob, pos);
+        uint16_t tag          = read_u16le(blob, pos); // RCD1: positional id; RCD2: durable tag
         uint8_t  typeByte     = read_u8(blob, pos);
         uint16_t sinceVersion = read_u16le(blob, pos);
         uint8_t  isKeyByte    = read_u8(blob, pos);
@@ -202,19 +214,34 @@ Descriptor deserialize(std::span<const uint8_t> blob) {
             enumValues.push_back(static_cast<int32_t>(raw));
         }
 
-        // id is not passed to builder — builder assigns it sequentially (0,1,2,…)
-        // which matches the serialized id since fields are stored in declaration order.
-        // Validate that the stored id matches the expected sequential position.
-        if (id != i) {
-            throw std::runtime_error("deserialize: field id out of sequence");
+        if (!isV2) {
+            // RCD1: the stored tag is positional and must match field order —
+            // this sequence invariant is relaxed only on the RCD2 path, where
+            // tags are explicit and durable across schema versions.
+            if (tag != i) {
+                throw std::runtime_error("deserialize: field id out of sequence");
+            }
+        }
+
+        uint16_t fixedLen = 0;
+        if (type == PrimType::FixedStr) {
+            fixedLen = read_u16le(blob, pos);
+        }
+
+        // RCD2 only: untilVersion is appended after everything else for this
+        // field (after fixedLen for FixedStr). RCD1 blobs carry no
+        // untilVersion, so legacy fields are treated as live forever.
+        uint16_t untilVersion = 0xFFFF;
+        if (isV2) {
+            untilVersion = read_u16le(blob, pos);
         }
 
         if (type == PrimType::FixedStr) {
-            uint16_t fixedLen = read_u16le(blob, pos);
-            builder.addFixedStr(std::move(fieldName), fixedLen, sinceVersion, isKeyByte != 0);
+            builder.addFixedStrTagged(std::move(fieldName), tag, fixedLen,
+                                      sinceVersion, untilVersion, isKeyByte != 0);
         } else {
-            builder.add(std::move(fieldName), type, sinceVersion,
-                        isKeyByte != 0, std::move(enumValues));
+            builder.addTagged(std::move(fieldName), tag, type, sinceVersion,
+                               untilVersion, isKeyByte != 0, std::move(enumValues));
         }
     }
 

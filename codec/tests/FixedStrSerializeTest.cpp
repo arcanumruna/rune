@@ -38,3 +38,16 @@ TEST(FixedStrSerialize, ToTextRendersFixedWidth) {
     std::string t = toText(mk(8));
     EXPECT_NE(t.find("string(8)"), std::string::npos);
 }
+
+TEST(FixedStrSerialize, Rcd2RoundTripPreservesTagAndUntilForFixedStr) {
+    DescriptorBuilder b("t");
+    b.addFixedStrTagged("code", 7, 8, 1, 4, false);
+    auto d = b.build();
+    auto blob = serialize(d);
+    auto d2 = deserialize(blob);
+    auto* f = d2.find("code");
+    ASSERT_NE(f, nullptr);
+    EXPECT_EQ(f->id, 7u);
+    EXPECT_EQ(f->fixedLen, 8u);
+    EXPECT_EQ(f->untilVersion, 4u);
+}
