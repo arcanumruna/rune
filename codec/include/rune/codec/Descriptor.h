@@ -1,5 +1,6 @@
 // include/rune/codec/Descriptor.h
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -128,6 +129,32 @@ public:
         d.fields  = fields_;
 
         d.blockLength = computeOffsets(d.fields);
+
+        // Enforce durable-tag uniqueness: every field's id/tag must be
+        // distinct across the whole descriptor, live or retired. A RETIRED
+        // field (untilVersion set) may legitimately share its NAME with a
+        // LIVE field as long as the tag differs — that's the normal
+        // rename/replace evolution pattern and stays allowed. Tags
+        // colliding is a different, unsafe thing: fingerprint()'s
+        // sort-by-id becomes order-ambiguous and readField()'s
+        // first-match-by-id lookup becomes ambiguous. This also catches
+        // the add()/addTagged() mixing footgun, where add()'s auto-tag
+        // (fields_.size() at call time) can collide with an explicit tag
+        // passed to addTagged().
+        {
+            std::vector<uint16_t> tags;
+            tags.reserve(d.fields.size());
+            for (const auto& f : d.fields) {
+                tags.push_back(f.id);
+            }
+            std::sort(tags.begin(), tags.end());
+            for (size_t i = 1; i < tags.size(); ++i) {
+                if (tags[i] == tags[i - 1]) {
+                    throw std::invalid_argument(
+                        "DescriptorBuilder::build: duplicate field tag");
+                }
+            }
+        }
 
         // Enforce the additive-only invariant: iterating var fields in
         // var-index order must yield non-decreasing sinceVersion. This is the

@@ -79,3 +79,48 @@ TEST(Serialize, Rcd2TruncatedBlobThrows) {
     blob.resize(blob.size()/2);
     EXPECT_THROW(rune::codec::deserialize(blob), std::runtime_error);
 }
+
+// Regression: RCD2 drops RCD1's sequential-id check (tags are explicit and
+// durable, not positional), but it must still reject a blob with two fields
+// sharing the same tag. Left unchecked, readField()'s first-match-by-id
+// lookup and fingerprint()'s sort-by-id become ambiguous for the same bytes.
+TEST(SerializeRegression, Rcd2DuplicateTagsRejectedOnDeserialize) {
+    // Hand-crafted RCD2 blob, same field layout as
+    // ReadsLegacyRcd1AsInfiniteUntilAndPositionalTag but with the RCD2 magic
+    // and a trailing untilVersion per field. Two fields "a" and "b" both
+    // carry tag=0.
+    std::vector<uint8_t> blob;
+    auto pushU16 = [&](uint16_t v) {
+        blob.push_back(static_cast<uint8_t>(v & 0xff));
+        blob.push_back(static_cast<uint8_t>((v >> 8) & 0xff));
+    };
+    auto pushU32 = [&](uint32_t v) {
+        blob.push_back(static_cast<uint8_t>(v & 0xff));
+        blob.push_back(static_cast<uint8_t>((v >> 8) & 0xff));
+        blob.push_back(static_cast<uint8_t>((v >> 16) & 0xff));
+        blob.push_back(static_cast<uint8_t>((v >> 24) & 0xff));
+    };
+    auto pushStr = [&](const std::string& s) {
+        pushU16(static_cast<uint16_t>(s.size()));
+        for (unsigned char c : s) blob.push_back(c);
+    };
+    auto pushField = [&](const std::string& name, uint16_t tag) {
+        pushStr(name);                                                         // name
+        pushU16(tag);                                                          // tag (duplicate across fields)
+        blob.push_back(static_cast<uint8_t>(rune::codec::PrimType::Int64));    // type
+        pushU16(1);                                                            // sinceVersion
+        blob.push_back(0);                                                    // isKey
+        pushU16(0);                                                            // enumCount
+        pushU16(0xFFFF);                                                       // untilVersion (RCD2 only)
+    };
+
+    pushU32(0x32444352u); // "RCD2"
+    pushStr("t");         // schema name
+    pushU16(1);           // version
+    pushU16(2);           // fieldCount
+
+    pushField("a", 0);
+    pushField("b", 0);    // same tag as "a" -- malformed/malicious
+
+    EXPECT_THROW(rune::codec::deserialize(blob), std::runtime_error);
+}

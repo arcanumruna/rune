@@ -1,6 +1,7 @@
 // src/Serialize.cpp
 #include <rune/codec/Serialize.h>
 #include <rune/codec/Fingerprint.h>
+#include <algorithm>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -191,6 +192,19 @@ Descriptor deserialize(std::span<const uint8_t> blob) {
     // Build the descriptor via DescriptorBuilder (recomputes offsets/blockLength)
     DescriptorBuilder builder(std::move(schemaName), version);
 
+    // RCD2 only: every field's durable tag must be distinct across the whole
+    // descriptor (live or retired). RCD1 gets this for free from the id==i
+    // positional check below; RCD2 tags are explicit, so a corrupt/malicious
+    // blob can carry duplicates. Left unchecked, fingerprint()'s sort-by-id
+    // becomes order-ambiguous for equal ids (same bytes could hash
+    // differently depending on declaration order) and readField()'s
+    // first-match lookup becomes ambiguous too. Collected here and checked
+    // once all fields are read.
+    std::vector<uint16_t> seenTags;
+    if (isV2) {
+        seenTags.reserve(fieldCount);
+    }
+
     for (uint16_t i = 0; i < fieldCount; ++i) {
         std::string fieldName = read_str(blob, pos);
 
@@ -221,6 +235,8 @@ Descriptor deserialize(std::span<const uint8_t> blob) {
             if (tag != i) {
                 throw std::runtime_error("deserialize: field id out of sequence");
             }
+        } else {
+            seenTags.push_back(tag);
         }
 
         uint16_t fixedLen = 0;
@@ -242,6 +258,16 @@ Descriptor deserialize(std::span<const uint8_t> blob) {
         } else {
             builder.addTagged(std::move(fieldName), tag, type, sinceVersion,
                                untilVersion, isKeyByte != 0, std::move(enumValues));
+        }
+    }
+
+    if (isV2 && seenTags.size() > 1) {
+        std::vector<uint16_t> sortedTags = seenTags;
+        std::sort(sortedTags.begin(), sortedTags.end());
+        for (size_t k = 1; k < sortedTags.size(); ++k) {
+            if (sortedTags[k] == sortedTags[k - 1]) {
+                throw std::runtime_error("deserialize: duplicate field tag");
+            }
         }
     }
 

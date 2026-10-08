@@ -61,3 +61,29 @@ TEST(Descriptor, AddTaggedPreservesExplicitTagThroughBuild) {
     EXPECT_EQ(d.find("a")->id, 7);   // NOT 0
     EXPECT_EQ(d.find("b")->id, 3);   // NOT 1
 }
+
+// Regression: mixing add() (auto-tag from fields_.size() at call time) with
+// addTagged() in one builder is a footgun that can silently produce
+// duplicate tags, corrupting the durable-tag invariant fingerprint() and
+// readField() both rely on. build() must fail loudly instead.
+TEST(DescriptorRegression, BuildRejectsDuplicateTagsFromAddTaggedCollision) {
+    rune::codec::DescriptorBuilder b("t");
+    b.addTagged("a", 5, rune::codec::PrimType::Int32, 1, 0xFFFF, false, {});
+    b.addTagged("b", 5, rune::codec::PrimType::Int64, 1, 0xFFFF, false, {}); // same tag as "a"
+    EXPECT_THROW(b.build(), std::invalid_argument);
+}
+
+// Sibling: a RETIRED field (untilVersion set) legitimately coexists with a
+// LIVE field of the same NAME as long as the TAG differs -- that's the
+// ordinary rename/replace evolution pattern and must still be allowed. Only
+// tag collisions are rejected, never name collisions.
+TEST(DescriptorRegression, RetiredFieldSameNameDifferentTagStillBuilds) {
+    rune::codec::DescriptorBuilder b("t", /*version=*/3);
+    b.addTagged("score", 1, rune::codec::PrimType::Int32, /*sinceVersion=*/1,
+                /*untilVersion=*/2, false, {});   // retired at v2
+    b.addTagged("score", 2, rune::codec::PrimType::Int64, /*sinceVersion=*/2,
+                /*untilVersion=*/0xFFFF, false, {}); // live, different tag, same name
+    Descriptor d;
+    EXPECT_NO_THROW(d = b.build());
+    EXPECT_EQ(d.fields.size(), 2u);
+}
