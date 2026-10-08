@@ -2068,6 +2068,11 @@ public:
         const Session* s = sessions_.find(sid);
         return s && s->lostByWorkers != 0;
     }
+    /// D8b: some worker reports `sid` Held (acks queued its publication refuses).
+    [[nodiscard]] bool sessionHeldForTest(int64_t sid) noexcept {
+        const Session* s = sessions_.find(sid);
+        return s && s->heldByWorkers != 0;
+    }
     // Fix round 1 (I2) seams: a resolved-or-not pending connect with the given
     // announce state (no Aeron publication), the cap accounting, eviction.
     void injectPendingConnectForTest(int64_t sessionId, bool announceBegun) {
