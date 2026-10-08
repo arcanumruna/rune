@@ -33,31 +33,36 @@ exposure; Rune's ≤100 µs worker budget does not tolerate it.
 A worker append on ext4 issues no journal handle in steady state: it overwrites already-allocated,
 already-initialised blocks inside the file's existing size, without touching timestamps.
 
-## Design
+## Design (revised 2026-10-08: NO extra I/O — the user rejected zero-filling)
 
-1. **Initialised preallocation, off the worker.** The SegmentProvisionerAgent (already the off-thread owner
-   of segment creation, F1) preallocates a ready segment by writing zeros over `[0, rollBytes)` instead of
-   `fallocate(KEEP_SIZE)` — blocks become *written* extents and `i_size = rollBytes`. Optionally
-   `fallocate(0)` first (allocation) then zero-fill via large `pwrite`s; then `fdatasync` once, on the
-   provisioner. Cost: one sequential write of every segment's size before use (up to 2× provisioning I/O).
-2. **`O_NOCMTIME`** on the segment fd (allowed: the broker owns its files; falls back silently when EPERM)
-   so appends do not update mtime/ctime.
-3. **Logical end ≠ file size.** The log already tracks its logical size in memory (`logSize_`). Changes:
+1. **Full-size preallocation, no zero-fill.** The SegmentProvisionerAgent preallocates a ready segment with
+   `fallocate(fd, 0, 0, rollBytes)` (no `FALLOC_FL_KEEP_SIZE`): blocks reserved as unwritten extents and
+   `i_size = rollBytes` up front, so an append never grows `i_size` (no inode dirty from the size). Unwritten
+   -> written extent conversion happens at writeback (flusher / the fsync threads), not in the worker's
+   `pwrite`. No data is written twice; I/O is unchanged from today.
+2. **`O_NOCMTIME`** on the segment fd (the broker owns its files; falls back silently on EPERM) so appends do
+   not dirty the inode for mtime/ctime.
+3. **Logical end != file size.** Unwritten extents read back as zeros, so:
    - recovery scans batches from the start (as today) and stops at the first batch header whose
-     `totalLength` is 0 / CRC-invalid (zero-filled tail) — a zero header is the defined end-of-data;
-   - `sizeBytes()` / retention-by-size / snapshot use the logical size, never `st_size`;
-   - sealing a segment truncates the zero tail (`ftruncate(logicalSize)`) on the provisioner/cleaner, never
-     on the worker (so sealed files keep today's on-disk format);
-   - in-place truncation (hot-path B M2) re-zeroes the cut range instead of `ftruncate` on the active
-     segment (or truncates + re-provisions the tail off-thread).
-4. **tmpfs / non-ext4:** unchanged behaviour is acceptable; the zero-fill is cheap there. A config switch
-   (`RUNE_PREALLOC_MODE=initialized|keepsize`) keeps the old mode selectable for comparison.
+     `totalLength` is 0 / CRC-invalid — a zero header is the defined end-of-data;
+   - `sizeBytes()` / retention-by-size / snapshots use the logical size (`logSize_`), never `st_size`;
+   - sealing a segment trims the unused tail (`ftruncate(logicalSize)`) on the provisioner/cleaner, never on
+     the worker, so sealed files keep today's on-disk format;
+   - in-place truncation (hot-path B M2) of the active segment keeps `i_size` and only moves the logical end
+     (the stale bytes past it are overwritten by later appends; recovery never reads past a zero/invalid
+     header — needs a "zero the first header past the cut" step so stale batches are not resurrected).
+4. **Config switch** `RUNE_PREALLOC_MODE=full|keepsize` (default full on Linux) for A/B.
+
+Probe evidence (box, fresh ext4 loop image, 3 runs x 131k 4 KiB appends under a concurrent fdatasync storm):
+keepsize p99.9 41-46 us / p99.99 155-222 us / max 316-783 us; full+O_NOCMTIME p99.9 24-37 us / p99.99
+59-85 us / max 238-278 us (one 4.5 ms outlier, unexplained). The synthetic pressure did not reproduce the
+gate's multi-ms stalls — the gate itself (fresh scratch fs, fixed length, ABAB) is the acceptance test.
 
 ## Risks / open questions
 
 - Recovery correctness with a zero-filled tail after a crash (torn batch followed by zeros, zeros followed by
   stale data from a reused file) — needs a fault-injection test matrix (DR-15 style) before shipping.
-- 2× provisioning write bandwidth on throughput benchmarks; must be measured (Rune-vs-Kafka 1 KB acks=all).
+- Resurrection of stale batches past a logical truncation point (in-place truncate) — the zero-first-header step.
 - Disk usage: active segments occupy `rollBytes` on disk immediately (today KEEP_SIZE already reserves the
   blocks, so `du` is unchanged; `ls -l` sizes change).
 - `O_NOCMTIME` semantics on overlay/docker volumes.
