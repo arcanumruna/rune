@@ -1994,6 +1994,19 @@ void Client::onEgressFrame(codec::TemplateId tid,
             break;
         }
 
+        // D4 (coordinator redirect): a follower answers a group / txn
+        // COORDINATOR request with ErrorResponse{NotCoordinator, coordinator
+        // endpoint} (the coordinator is the consensus leader).  The seed session
+        // is the coordinator's session by design (group / txn requests ride on
+        // it), so it — unlike a data-op redirect while a group is active — moves:
+        // retarget + reconnect.  Group members re-join on the new session at
+        // once (onCoordinatorMoved → Rejoining → onConnected); txn requests in
+        // flight are re-sent on the new session by the txn producer itself.
+        if (ec == rpc::ErrorCode::NotCoordinator && !opt->message.empty()) {
+            onCoordinatorRedirect_(std::string(opt->message));
+            break;
+        }
+
         // CB-5 B: Redirect handling for pending data ops (Produce/Subscribe).
         // When a follower returns ErrorResponse{Redirect, leaderClientEndpoint}
         // for a pending Produce, we retarget the transport to the new leader
@@ -3928,6 +3941,26 @@ void Client::onMetadataResponse(const codec::MetadataResponseDecoded& resp) noex
     // F14: a fresh cluster view — txn requests waiting for the coordinator to
     // be re-discovered (NotCoordinator) back off and re-send.
     for (auto& tp : txnProducers_) tp->onCoordinatorRediscovered();
+}
+
+// D4: see the ErrorResponse handler.  Agent / duty thread.
+void Client::onCoordinatorRedirect_(const std::string& endpoint) {
+    const std::string channel =
+        (endpoint.rfind("aeron:", 0) == 0) ? endpoint : ("aeron:udp?endpoint=" + endpoint);
+    ++coordinatorRedirects_;
+    groupConsumerHub_.onCoordinatorMoved();
+    // Idempotent per episode: further NotCoordinator answers (members re-asking
+    // on the old session before the reconnect lands) change nothing.
+    if (redirectPending() && currentLeaderChannel() == channel) return;
+    if (!agent_.retarget(channel)) {
+        scheduleMetadataRefresh();   // keep the old session; the next answer retries
+        return;
+    }
+    currentLeaderChannel() = channel;
+    if (!redirectPending()) {
+        redirectPending() = true;
+        agent_.submitReconnect();
+    }
 }
 
 void Client::rediscoverTrampoline_(void* ctx) noexcept {

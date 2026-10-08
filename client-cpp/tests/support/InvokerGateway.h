@@ -184,6 +184,10 @@ struct InvokerGateway {
     // NotCoordinator (the broker's isLocalCoordinator() fence).
     int  coordinatorEndpoint = -1;
     int  notCoordinatorAnswers = 0;
+    // D4 (broker 2026-10-08): a follower answers a coordinator request with
+    // ErrorResponse{NotCoordinator, coordinator endpoint} ("host:port") when it
+    // knows the coordinator.  Empty = the typed NotCoordinator answer.
+    std::string coordinatorRedirectTo;
     // A rebalance in progress: Heartbeats are answered RebalanceInProgress
     // until the next JoinGroup (which completes it at groupGeneration).
     bool rebalancing = false;
@@ -638,6 +642,15 @@ private:
     bool notCoordinator_(int endpoint, int64_t sessionId, Resp r) {
         if (coordinatorEndpoint < 0 || endpoint == coordinatorEndpoint) return false;
         ++notCoordinatorAnswers;
+        if (!coordinatorRedirectTo.empty()) {
+            namespace rcc = rune::client::codec;
+            std::vector<uint8_t> e(256);
+            const std::size_t en = rcc::encodeErrorResponse(
+                e.data(), e.size(), static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator),
+                coordinatorRedirectTo, sessionId, 0);
+            send(0, e.data(), en);
+            return true;
+        }
         r.sessionId     = sessionId;
         r.correlationId = 0;
         r.errorCode     = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator);

@@ -823,6 +823,9 @@ private:
                                          detail::AndWaitIssue issue, void* issueCtx, std::string* text);
     /// I3: pin the completion target a command carries (re-encoded counted).
     void pinCommandTarget_(detail::HubCommand& cmd) noexcept;
+    /// D4: a follower named the group / txn coordinator — move the seed there.
+    void onCoordinatorRedirect_(const std::string& endpoint);
+    uint64_t coordinatorRedirects_ = 0;
     /// F8c C5: route one Txn* command to its producer (ring: resolved against
     /// txnProducers_; direct: the caller's handle holds the impl).
     void applyTxnCommand_(const detail::HubCommand& cmd, bool direct);

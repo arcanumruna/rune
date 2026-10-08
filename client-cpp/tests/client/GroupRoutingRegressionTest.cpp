@@ -22,6 +22,7 @@
 #include <gtest/gtest.h>
 
 #include <arpa/inet.h>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <tuple>
@@ -1214,4 +1215,39 @@ TEST(GroupRoutingRegression, BatchHeldOnAConnectingDeadLeaderAsksForMetadataRegr
     }, 4'000'000)) << "the held batch never asked for metadata";
     EXPECT_EQ(st, rc::OpStatus::Ok);
     EXPECT_EQ(r.gw.produced.back().endpoint, 0);
+}
+
+// ===========================================================================
+// D4 (broker backlog "group subscribe redirect", 2026-10-08): a member
+// bootstrapped against a FOLLOWER.  The follower answers the coordinator
+// request ErrorResponse{NotCoordinator, coordinator endpoint}; the seed session
+// must move to the coordinator and the member join there at once — before the
+// fix the group-active rule kept the seed on the follower and the member
+// re-joined the follower forever (dockerized: 0 of 80 records consumed).
+// ===========================================================================
+TEST(GroupRoutingRegression, MemberOnAFollowerJoinsTheCoordinatorRegression) {
+    GroupRig r(4131, 4132);
+    const auto [n1, p1port] = r.addNode(4131);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions            = {{1, 0, /*leader*/ n1, 1, 4131, ""}, {1, 1, n1, 1, 4131, ""}};
+    r.gw.groupAssignment       = {{1, 0}, {1, 1}};
+    r.gw.coordinatorEndpoint   = n1;                                     // node 1 is the coordinator
+    r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(p1port);
+    r.gw.holdJoins             = false;
+
+    rc::GroupConfig gcfg;
+    gcfg.sessionTimeoutMs = 30'000;   // the join deadline (30 s) must NOT be what un-sticks the member
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    Consumed got;
+    wire(gc, got);
+    bool assigned = false;
+    gc.onAssigned([&](std::vector<rc::TopicPartition>) { assigned = true; });
+    r.connect();
+    const auto t0 = std::chrono::steady_clock::now();
+    ASSERT_TRUE(r.drive([&] { return assigned; }, 4'000'000))
+        << "the member never joined the coordinator (NotCoordinator answers: " << r.gw.notCoordinatorAnswers << ")";
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    EXPECT_LT(ms, 5'000) << "joined only after " << ms << " ms (a join deadline, not the redirect)";
+    EXPECT_GE(r.gw.notCoordinatorAnswers, 1) << "precondition: the follower answered NotCoordinator";
+    EXPECT_EQ(r.gw.groupEndpoints.back(), n1) << "the last group frame did not reach the coordinator";
 }

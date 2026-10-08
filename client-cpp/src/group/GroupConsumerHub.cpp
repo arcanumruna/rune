@@ -1561,7 +1561,28 @@ void GroupConsumerHub::onConnected(int64_t sessionId, const SendFn& sendFn)
         if (impl->state == GroupConsumerState::Unjoined  ||
             impl->state == GroupConsumerState::Rejoining) {
             sendJoinGroup(*impl, sessionId, sendFn);
+        } else if (impl->state == GroupConsumerState::Joining ||
+                   impl->state == GroupConsumerState::Syncing) {
+            // D4 (review MAJOR-1): a Join / Sync in flight on the OLD session is
+            // never answered (a coordinator redirect, or a reconnect mid-join) —
+            // re-join on this one now instead of idling until the join deadline.
+            toRejoining_(*impl);
+            sendJoinGroup(*impl, sessionId, sendFn);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// onCoordinatorMoved — D4: the seed session is being moved to the coordinator
+// ---------------------------------------------------------------------------
+
+void GroupConsumerHub::onCoordinatorMoved()
+{
+    for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
+        GroupConsumerImpl* const impl = impls_[ix];
+        if (!impl->active) continue;
+        if (impl->state == GroupConsumerState::Unjoined || impl->state == GroupConsumerState::Rejoining) continue;
+        toRejoining_(*impl);   // Joining / Syncing / Stable: onConnected re-sends JoinGroup on the new session
     }
 }
 

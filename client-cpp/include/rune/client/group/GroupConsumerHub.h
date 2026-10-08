@@ -172,6 +172,9 @@ public:
     /// Trigger all Unjoined / Rejoining consumers to send JoinGroup now
     /// (called when a new ConnectResponse{OK} arrives).
     void onConnected(int64_t sessionId, const SendFn& sendFn);
+    /// D4: the coordinator is elsewhere (the seed session is moving to it):
+    /// every joined / joining member re-joins there as soon as it connects.
+    void onCoordinatorMoved();
 
     // ---- Shutdown -----------------------------------------------------------
 
