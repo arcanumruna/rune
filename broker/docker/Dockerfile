@@ -78,6 +78,16 @@ COPY --from=rune-fr include /rune-fr/include
 COPY --from=rune-codec src     /rune-codec/src
 COPY --from=rune-codec include /rune-codec/include
 
+# ── rune-crypto (client<->broker TLS/AEAD, Task 7) sibling (compiled: src+include)
+# rune_crypto (Caps/Aead/TlsSession) is COMPILED into the broker: the root
+# CMakeLists wires add_library(rune_crypto ...) from ${RUNE_CRYPTO_ROOT} and links
+# it PUBLIC on rune_gateway → transitively into rune_node/rune_broker.  Supplied via
+# the BuildKit named build context `rune-crypto`:
+#   docker build --build-context rune-crypto=../rune-crypto ...
+# The configure below passes -DRUNE_CRYPTO_ROOT=/rune-crypto; OpenSSL comes from conan.
+COPY --from=rune-crypto src     /rune-crypto/src
+COPY --from=rune-crypto include /rune-crypto/include
+
 # ── Application sources (copied last so edits don't bust the conan cache) ─────
 COPY . .
 
@@ -90,6 +100,8 @@ RUN cmake -S . -B build -G Ninja \
         -DBUILD_INTEGRATION_TESTING=OFF \
         -DRUNE_PROTOCOL_INCLUDE=/rune-protocol/include \
         -DRUNE_CODEC_ROOT=/rune-codec \
+        -DRUNE_CRYPTO_ROOT=/rune-crypto \
+        -DRUNE_TLS=ON \
     && cmake --build build --target rune_broker rune_role
 
 # gcc-13's libstdc++ is newer than bookworm-slim's; stage it for the runtime.
