@@ -185,6 +185,17 @@ static std::vector<ClusterMember> makeMembers5(NodeId self = 0) {
     return ms;
 }
 
+// D29 PreVote: the nomination deadline opens a NON-BINDING pre-ballot; these
+// rigs grant it from every peer, after which the next doWork stands for real.
+[[maybe_unused]] static void grantPreBallot(Election& e) {
+    if (!e.preBallotActiveForTest()) return;
+    for (NodeId v = 0; v < 16; ++v) e.onPreVoteResponse(e.preBallotTermForTest(), v, true);
+}
+[[maybe_unused]] static void doWorkThroughPreBallot(Election& e, int64_t nowNs) {
+    e.doWork(nowNs);
+    if (e.preBallotActiveForTest()) { grantPreBallot(e); e.doWork(nowNs); }
+}
+
 static Election makeElection(
     std::vector<ClusterMember> members,
     NodeId                     self,
@@ -434,7 +445,7 @@ TEST(ElectionBallot, Nominate_AfterBackoff_GoesToCandidateBallot) {
 
     // Drive past nomination deadline (use a very large nowNs to exceed any backoff)
     int64_t farFuture = nowNs + kStartupCanvassTimeoutNs + kElectionTimeoutNs * 10;
-    e.doWork(farFuture); // → CANDIDATE_BALLOT
+    doWorkThroughPreBallot(e, farFuture); // → (pre-ballot) → CANDIDATE_BALLOT
 
     EXPECT_EQ(e.state(), ElectionState::CandidateBallot);
     EXPECT_EQ(e.candidateTermId(), 1); // was 0, incremented to 1
@@ -453,7 +464,7 @@ TEST(ElectionBallot, Nominate_CandidateTermId_Persisted) {
         e.onCanvassPosition(0, 0, 0, 1);
         e.onCanvassPosition(0, 0, 0, 2);
         e.doWork(nowNs + kStartupCanvassTimeoutNs + 1LL);
-        e.doWork(nowNs + kStartupCanvassTimeoutNs + kElectionTimeoutNs * 10);
+        doWorkThroughPreBallot(e, nowNs + kStartupCanvassTimeoutNs + kElectionTimeoutNs * 10);
         EXPECT_EQ(e.state(), ElectionState::CandidateBallot);
         // candidateTermId should be persisted
     }
@@ -475,7 +486,7 @@ TEST(ElectionBallot, CandidateBallot_RequestVote_EmittedToPeers) {
     e.onCanvassPosition(0, 0, 0, 2);
     e.doWork(nowNs + kStartupCanvassTimeoutNs + 1LL);
     int64_t farFuture = nowNs + kStartupCanvassTimeoutNs + kElectionTimeoutNs * 10;
-    e.doWork(farFuture);
+    doWorkThroughPreBallot(e, farFuture);
     EXPECT_EQ(e.state(), ElectionState::CandidateBallot);
 
     pub.clear();
@@ -505,7 +516,7 @@ TEST(ElectionBallot, CandidateBallot_RequestVote_SentOnlyOnce) {
     e.onCanvassPosition(0, 0, 0, 2);
     e.doWork(nowNs + kStartupCanvassTimeoutNs + 1LL);
     int64_t farFuture = nowNs + kStartupCanvassTimeoutNs + kElectionTimeoutNs * 10;
-    e.doWork(farFuture);
+    doWorkThroughPreBallot(e, farFuture);
 
     pub.clear();
     e.doWork(farFuture + 1LL);  // sends to peers 1 and 2
@@ -529,7 +540,7 @@ static void bringToCandidateBallot(Election& e, int64_t& nowNs) {
     nowNs += 50'000'000LL + kStartupCanvassTimeoutNs + 1LL;
     e.doWork(nowNs);
     nowNs += kElectionTimeoutNs * 10;
-    e.doWork(nowNs);
+    doWorkThroughPreBallot(e, nowNs);
     nowNs += 1LL;
     e.doWork(nowNs); // sends RequestVotes
 }
@@ -865,7 +876,7 @@ TEST(ElectionBallot, FiveMember_TwoVotes_NotEnoughQuorum_Canvass) {
     ASSERT_EQ(e.state(), ElectionState::Nominate);
 
     // Drive to CANDIDATE_BALLOT
-    e.doWork(nowNs + kStartupCanvassTimeoutNs + kElectionTimeoutNs * 10);
+    doWorkThroughPreBallot(e, nowNs + kStartupCanvassTimeoutNs + kElectionTimeoutNs * 10);
     ASSERT_EQ(e.state(), ElectionState::CandidateBallot);
 
     Term cTerm = e.candidateTermId();
@@ -1003,7 +1014,7 @@ TEST(ElectionBallotRegression, VoteGate_StaleSelfKnowledgeStillStands) {
     e.onCanvassPosition(0, 0, 0, 2);
     for (int i = 0; i < 20 && e.state() != ElectionState::CandidateBallot; ++i) {
         nowNs += kElectionTimeoutNs;
-        e.doWork(nowNs);
+        doWorkThroughPreBallot(e, nowNs);
     }
     EXPECT_EQ(e.state(), ElectionState::CandidateBallot)
         << "a node with stale self-knowledge refused to stand (headless consensus)";
@@ -1056,7 +1067,7 @@ TEST(ElectionBallotRegression, SelfVoteGatedByOwnKnowledge_OneStaleGrantIsNotAMa
     e.onCanvassPosition(0, 0, 0, 2);
     for (int i = 0; i < 20 && e.state() != ElectionState::CandidateBallot; ++i) {
         nowNs += kElectionTimeoutNs;
-        e.doWork(nowNs);
+        doWorkThroughPreBallot(e, nowNs);
     }
     ASSERT_EQ(e.state(), ElectionState::CandidateBallot) << "MAJOR-A: the node must still stand";
     const Term term = e.candidateTermId();

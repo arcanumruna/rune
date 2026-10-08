@@ -76,6 +76,23 @@ void ConsensusAgent::onCandidacyState(int64_t /*nowNs*/, NodeId fromMember,
     election_.onCandidacyState(fromMember, state);
 }
 
+void ConsensusAgent::onPreVoteRequest(int64_t nowNs, Term term, Term logLeadershipTermId,
+                                      int64_t logPosition, NodeId candidateId)
+{
+    election_.onPreVoteRequest(nowNs, term, logLeadershipTermId, logPosition, candidateId);
+}
+
+void ConsensusAgent::onPreVoteResponse(int64_t nowNs, Term term, NodeId voterId, bool granted,
+                                       Term voterTermId)
+{
+    election_.onPreVoteResponse(term, voterId, granted, voterTermId, nowNs);
+}
+
+void ConsensusAgent::onTermFloorNotice(int64_t nowNs, NodeId fromMember, Term floorTermId, Term refusedTermId)
+{
+    election_.onTermFloorNotice(nowNs, fromMember, floorTermId, refusedTermId);
+}
+
 void ConsensusAgent::onCanvassPosition(
     int64_t nowNs,
     Term    logLeadershipTermId,

@@ -4,6 +4,7 @@
 // P2P-5b: LeaderLogReplication..Closed; onNewLeadershipTerm, onAppendPosition,
 //         onCommitPosition. Archive parts are pass-throughs (no Aeron Archive in Phase 2).
 
+#include <bit>
 #include <rune/consensus/Election.h>
 #include <rune/consensus/ClusterMember.h>
 #include <rune_fr/FlightRecorder.h>
@@ -170,7 +171,7 @@ int64_t Election::nextDeadlineNs() const noexcept {
 
         case ElectionState::Nominate:
             // Wait for nominationDeadlineNs, or interval publish.
-            return std::min(nominationDeadlineNs_,
+            return std::min(preBallot_.active ? preBallot_.deadlineNs : nominationDeadlineNs_,
                             timeOfLastUpdateNs_ + electionStatusIntervalNs_);
 
         case ElectionState::CandidateBallot:
@@ -395,6 +396,33 @@ int Election::nominate(int64_t nowNs)
 {
     // Election.java:734-741: if deadline passed → become candidate
     if (nowNs >= nominationDeadlineNs_) {
+        // D29 PreVote (Raft §9.6, a Rune extension): before raising the durable
+        // candidate term, a NON-BINDING pre-ballot at candidateTermId_ + 1 — a
+        // member that hears a live leader denies it, so a node cut off from the
+        // leader never bumps a real term (no term inflation, and a bridge member
+        // never grants it a binding vote that would raise its follow floor).
+        if (clusterMembers_.size() > 1) {
+            if (!preBallot_.active) {
+                startPreBallot_(nowNs);
+                return 1;
+            }
+            if (preBallot_.denied || !preBallotWon_()) {
+                if (nowNs >= preBallot_.deadlineNs || preBallot_.denied) {
+                    preBallot_ = PreBallot{};
+                    ++preBallotsLost_;
+                    state(ElectionState::Canvass, nowNs, "pre-ballot without a majority");
+                    return 1;
+                }
+                if (hasUpdateIntervalExpired(nowNs, electionStatusIntervalNs_)) {   // lost requests: re-ask
+                    timeOfLastUpdateNs_ = nowNs;
+                    publishCanvassPosition();   // review MEDIUM-2: peers keep counting us while we pre-ballot
+                    sendPreVoteRequests_();
+                    return 1;
+                }
+                return 0;
+            }
+            preBallot_ = PreBallot{};
+        }
         // Election.java:736-737: proposeMaxCandidateTermId(candidateTermId+1, logPosition, time)
         candidateTermId_ = nodeStateFile_.proposeMaxCandidateTermId(
             candidateTermId_ + 1, logPosition_, /*timestampMs=*/0);
@@ -775,10 +803,13 @@ void Election::onRequestVote(Term    logLeadershipTermId,
         // (the cut-off node campaigns, the bridge node grants, repeat).  A dead /
         // paused leader (DR-10) has neither, so the zombie path is unchanged.
         const bool selfLeads = leaderMember_ != nullptr && leaderMember_->id == thisMemberId_;
-        const bool sticky = selfLeads
+        // D29: a higher-term candidacy from the leader WE follow means it stepped
+        // down (TermFloorNotice / lost quorum) — never sticky against it.
+        const bool ownLeaderAsks = !selfLeads && leaderMember_ != nullptr && leaderMember_->id == candidateId;
+        const bool sticky = !ownLeaderAsks && (selfLeads
             ? hasActiveFollowerQuorum_(nowNs)
             : (followerLiveness_.armed() &&
-               nowNs - followerLiveness_.lastLeaderUpdateNs() < leaderHeartbeatTimeoutNs_);
+               nowNs - followerLiveness_.lastLeaderUpdateNs() < leaderHeartbeatTimeoutNs_));
         if (sticky) {
             placeVote(candidateTermId, candidateId, false);
             return;
@@ -789,6 +820,12 @@ void Election::onRequestVote(Term    logLeadershipTermId,
 
     if (candidateTermId <= candidateTermId_) {
         // Election.java:351-353: stale candidate → deny
+        placeVote(candidateTermId, candidateId, false);
+    } else if (state_ != ElectionState::Closed && leaderLeaseLive_(nowNs, candidateId)) {
+        // D29 review MEDIUM-1 (etcd: votes are ignored in lease): we heard a live
+        // leader within the heartbeat timeout — a binding grant now would raise
+        // our floor above it (the ratchet PreVote removes; old-version candidates
+        // skip the pre-ballot).  Deny WITHOUT adopting the term.
         placeVote(candidateTermId, candidateId, false);
     } else if (ClusterMember::compareLog(logLeadershipTermId_, appendPosition_,
                                          logLeadershipTermId, logPosition) > 0 ||
@@ -866,6 +903,7 @@ void Election::onNewLeadershipTerm(int64_t nowNs,
     // D24 review MAJOR-1: nothing is decided before init() (as onCanvassPosition /
     // onRequestVote) — the leader's next heartbeat repeats it.
     if (state_ == ElectionState::Init) return;
+    noteLeaderHeard_(leaderMemberIdArg, leadershipTermIdArg, nowNs);   // D29: even one refused below (by floor)
 
     // Election.java:430: if CLOSED ignore — EXCEPT a same-term NLT from the leader
     // we already follow is a LIVENESS HEARTBEAT, not an election message.  The
@@ -980,7 +1018,16 @@ void Election::onNewLeadershipTerm(int64_t nowNs,
         // (A member that GRANTED a newer term to a candidacy that then failed
         // stays out until the leader changes — closing that needs PreVote,
         // backlog D29; a step-down notice reopened partial-partition ping-pong.)
-        if (!canvassing || leadershipTermIdArg < followFloorTermId_) return;
+        if (leadershipTermIdArg < followFloorTermId_) {
+            // D29: tell that leader — a term at or above our floor may already
+            // have been decided with our help, so it must step down to a newer
+            // one (etcd's lower-term answer, narrowed to the floor).  Safe with
+            // PreVote: a cut-off candidate can no longer ratchet our floor.
+            if (canvassing && leaderMemberIdArg != thisMemberId_ && memberById(leaderMemberIdArg) != nullptr)
+                publisher_.termFloorNotice(leaderMemberIdArg, thisMemberId_, followFloorTermId_, leadershipTermIdArg);
+            return;
+        }
+        if (!canvassing) return;
     }
     // nextLeadershipTermId == candidateTermId_: this node participated; continue.
     // (Review LOW-2, defence in depth: never below the floor, whatever the branch.)
@@ -1069,9 +1116,10 @@ void Election::onAppendPosition(int64_t nowNs,
 void Election::onCommitPosition(int64_t nowNs,
                                 Term    leadershipTermIdArg,
                                 int64_t logPositionArg,
-                                NodeId  /*leaderMemberIdArg*/)
+                                NodeId  leaderMemberIdArg)
 {
     if (state_ == ElectionState::Init) return;   // D24 review MAJOR-1 (see onNewLeadershipTerm)
+    noteLeaderHeard_(leaderMemberIdArg, leadershipTermIdArg, nowNs);   // D29
 
     // A1 fix (audit 2026-09-11): a CommitPosition with a strictly-higher term while
     // this node is in a LEADER state signals a new election has concluded elsewhere.
@@ -1144,6 +1192,7 @@ void Election::onStandDown(int64_t nowNs, Term leadershipTermIdArg, NodeId leade
         return;   // not from the leader we follow, for our term: stale / foreign
     gracefulClosedLeaderId_ = leaderMemberIdArg;   // canvass completes without it
     skipFromStandDown_      = true;
+    if (leaderHeardId_ == leaderMemberIdArg) leaderHeardId_ = -1;   // D29 review MAJOR-1: the lease ends with it
     followerLiveness_.reset();
     state(ElectionState::Canvass, nowNs, "leader stood down (controlled shutdown) → election now");
 }
@@ -1246,6 +1295,151 @@ bool Election::hasActiveFollowerQuorum_(int64_t nowNs) const noexcept
                                           thisMemberId_);
 }
 
+// ---------------------------------------------------------------------------
+// D29 PreVote (Raft thesis §9.6) + TermFloorNotice.
+// ---------------------------------------------------------------------------
+void Election::noteLeaderHeard_(NodeId leaderId, Term term, int64_t nowNs) noexcept
+{
+    if (leaderId == thisMemberId_ || memberById(leaderId) == nullptr) return;
+    // Review MAJOR-2: a leader of a term below the one we follow / adopted is
+    // provably superseded — a zombie stuck in a leader state must never hold
+    // our lease (the survivors could then never elect after the real leader dies).
+    // Re-review M3: also below our durable floor — after a restart the Election
+    // starts at leadershipTermId 0, but the floor survives.
+    if (term < leadershipTermId_ || term < followFloorTermId_) return;
+    leaderHeardId_ = leaderId;
+    leaderHeardNs_ = nowNs;
+}
+
+bool Election::leaderLeaseLive_(int64_t nowNs, NodeId candidateId) const noexcept
+{
+    const bool selfLeads = leaderMember_ != nullptr && leaderMember_->id == thisMemberId_;
+    if (selfLeads) {
+        // A working leadership denies: CLOSED with an active follower quorum, or
+        // still establishing (leader states).
+        return state_ == ElectionState::Closed ? hasActiveFollowerQuorum_(nowNs) : true;
+    }
+    // Heard a live leader within the heartbeat timeout — unless the candidate IS
+    // that leader, or the leader we follow (it stepped down: TermFloorNotice /
+    // lost its quorum; review MEDIUM-3).
+    if (leaderMember_ != nullptr && leaderMember_->id == candidateId) return false;
+    return leaderHeardId_ >= 0 && leaderHeardId_ != candidateId &&
+           nowNs - leaderHeardNs_ < leaderHeartbeatTimeoutNs_;
+}
+
+void Election::startPreBallot_(int64_t nowNs)
+{
+    preBallot_ = PreBallot{};
+    preBallot_.active     = true;
+    preBallot_.term       = candidateTermId_ + 1;
+    preBallot_.deadlineNs = nowNs + electionTimeoutNs_;
+    if (mayVoteFor(thisMemberId_)) markPreVote_(thisMemberId_);   // the self-vote, gated like the real one
+    timeOfLastUpdateNs_ = nowNs;
+    ++preBallotsStarted_;
+    sendPreVoteRequests_();
+}
+
+void Election::sendPreVoteRequests_()
+{
+    for (std::size_t i = 0; i < clusterMembers_.size(); ++i) {
+        const NodeId id = clusterMembers_[i].id;
+        if (id == thisMemberId_ || (i < 32 && (preBallot_.grantedMask & (1u << i)))) continue;
+        publishCandidacyState_(id);   // review MEDIUM-2: our knowledge first (as the real ballot does)
+        publisher_.preVoteRequest(id, preBallot_.term, logLeadershipTermId_, appendPosition_, thisMemberId_);
+    }
+}
+
+void Election::markPreVote_(NodeId voterId) noexcept
+{
+    for (std::size_t i = 0; i < clusterMembers_.size() && i < 32; ++i)
+        if (clusterMembers_[i].id == voterId) { preBallot_.grantedMask |= (1u << i); return; }
+}
+
+bool Election::preBallotWon_() const noexcept
+{
+    const int granted = std::popcount(preBallot_.grantedMask);
+    return granted >= ClusterMember::quorumThreshold(static_cast<int>(clusterMembers_.size()));
+}
+
+void Election::onPreVoteRequest(int64_t nowNs, Term term, Term logLeadershipTermId, int64_t logPosition,
+                                NodeId candidateId)
+{
+    if (state_ == ElectionState::Init) return;
+    if (candidateId == thisMemberId_ || memberById(candidateId) == nullptr) return;
+    // Non-binding: grant iff we WOULD vote for it at `term` and no live leader
+    // holds us — and change nothing (no candidate term, no floor, no state).
+    const bool grant = term > candidateTermId_ && term > followFloorTermId_ &&
+                       ClusterMember::compareLog(logLeadershipTermId_, appendPosition_,
+                                                 logLeadershipTermId, logPosition) <= 0 &&
+                       mayVoteFor(candidateId) && !leaderLeaseLive_(nowNs, candidateId);
+    if (grant) ++preVotesGranted_; else ++preVotesDenied_;
+    publisher_.preVoteResponse(candidateId, term, thisMemberId_, grant,
+                               std::max(candidateTermId_, followFloorTermId_));
+}
+
+void Election::onPreVoteResponse(Term term, NodeId voterId, bool granted, Term voterTermId, int64_t nowNs)
+{
+    if (state_ != ElectionState::Nominate || !preBallot_.active || term != preBallot_.term) return;
+    if (voterId == thisMemberId_ || memberById(voterId) == nullptr) return;
+    if (granted) { markPreVote_(voterId); return; }
+    // Re-review M1: the real ballot fails on ANY Against (Aeron isQuorumLeader) —
+    // a pre-ballot that met an explicit denial for our term (lease, log, gate)
+    // would only raise durable terms for a certain loss: it is lost too (the term
+    // catch-up below re-asks instead).
+    if (voterTermId < preBallot_.term) { preBallot_.denied = true; return; }
+    // Review CRITICAL-1 (etcd: a rejected pre-vote carries the voter's term): a
+    // live member already holds a term >= ours durably — adopt it as our
+    // CANDIDATE term (never the floor: we took part in nothing) and re-ask above
+    // it.  Aeron's term catch-up ran through the stale node's real RequestVote,
+    // which a lost pre-ballot never sends; without this, a term/eligibility
+    // inversion (the eligible node behind in term) wedges the election forever.
+    if (voterTermId >= preBallot_.term) {
+        candidateTermId_ = std::max(candidateTermId_,
+                                    nodeStateFile_.proposeMaxCandidateTermId(voterTermId, logPosition_, 0));
+        ++preBallotTermCatchUps_;
+        const uint32_t self = preBallot_.grantedMask & selfBit_();
+        preBallot_.term        = candidateTermId_ + 1;
+        preBallot_.grantedMask = self;
+        preBallot_.denied      = false;
+        if (nowNs != INT64_MIN) preBallot_.deadlineNs = nowNs + electionTimeoutNs_;   // re-review M2: a fresh window
+        sendPreVoteRequests_();
+    }
+}
+
+uint32_t Election::selfBit_() const noexcept
+{
+    for (std::size_t i = 0; i < clusterMembers_.size() && i < 32; ++i)
+        if (clusterMembers_[i].id == thisMemberId_) return 1u << i;
+    return 0;
+}
+
+void Election::onTermFloorNotice(int64_t nowNs, NodeId fromMember, Term floorTermId, Term refusedTermId)
+{
+    // A member refused OUR NewLeadershipTerm because it granted, led, followed
+    // or adopted a newer term (its durable floor).  Its own candidacies never
+    // raise a floor, and with PreVote a cut-off candidate cannot obtain its
+    // binding vote while it hears us — so the floor is real: step down to an
+    // election above it (our followers grant our own re-candidacy).
+    if (state_ == ElectionState::Init) return;
+    if (leaderMember_ == nullptr || leaderMember_->id != thisMemberId_) return;   // only the leader
+    if (fromMember == thisMemberId_ || memberById(fromMember) == nullptr) return;
+    if (refusedTermId != leadershipTermId_ || floorTermId <= leadershipTermId_) return;
+    ++termFloorStepDowns_;
+    // Review MEDIUM-4: stand ABOVE the floor (candidate term) without adopting it
+    // as our own floor — no leader of `floorTermId` need exist (a failed grant).
+    candidateTermId_ = std::max(candidateTermId_,
+                                nodeStateFile_.proposeMaxCandidateTermId(floorTermId, logPosition_, 0));
+    // Review MEDIUM-3 / MAJOR-1: our followers canvass at once and drop our lease.
+    for (const ClusterMember& m : clusterMembers_)
+        if (m.id != thisMemberId_) publisher_.standDown(m.id, leadershipTermId_, thisMemberId_);
+    if (state_ == ElectionState::Closed) {
+        leaveClosedForElection_(leadershipTermId_, nowNs, "a member's follow floor is above our term → re-election");
+        return;
+    }
+    leaderMember_ = nullptr;
+    state(ElectionState::Canvass, nowNs, "a member's follow floor is above our term → step down");
+}
+
 void Election::raiseFollowFloor_(Term term)
 {
     if (term <= followFloorTermId_ && term <= candidateTermId_) return;
@@ -1275,6 +1469,7 @@ void Election::leaveClosedForElection_(Term term, int64_t nowNs, const char* rea
 void Election::state(ElectionState next, int64_t nowNs, const char* /*reason*/)
 {
     if (next == state_) return;
+    if (state_ == ElectionState::Nominate) preBallot_ = PreBallot{};   // D29
     if (electLog()) {
         std::fprintf(stderr,
             "[ELECT node=%d] state %d -> %d term=%lld leader=%d nowNs=%lld\n",

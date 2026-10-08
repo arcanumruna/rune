@@ -77,6 +77,30 @@ public:
                 m.protocolVersion);
             break;
         }
+        case PreVoteRequestMsg::TEMPLATE_ID: {
+            if (len < PreVoteRequestMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
+            if constexpr (requires(Handler& h) { h.onPreVoteRequest(int64_t{}, Term{}, Term{}, int64_t{}, NodeId{}); }) {
+                const auto m = PreVoteRequestMsg::decode(buf, 0);
+                handler_.onPreVoteRequest(nowNs, m.term, m.logLeadershipTermId, m.logPosition, m.candidateId);
+            }
+            break;
+        }
+        case PreVoteResponseMsg::TEMPLATE_ID: {
+            if (len < PreVoteResponseMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
+            if constexpr (requires(Handler& h) { h.onPreVoteResponse(int64_t{}, Term{}, NodeId{}, bool{}, Term{}); }) {
+                const auto m = PreVoteResponseMsg::decode(buf, 0);
+                handler_.onPreVoteResponse(nowNs, m.term, m.voterId, m.granted != 0, m.voterTermId);
+            }
+            break;
+        }
+        case TermFloorNoticeMsg::TEMPLATE_ID: {
+            if (len < TermFloorNoticeMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
+            if constexpr (requires(Handler& h) { h.onTermFloorNotice(int64_t{}, NodeId{}, Term{}, Term{}); }) {
+                const auto m = TermFloorNoticeMsg::decode(buf, 0);
+                handler_.onTermFloorNotice(nowNs, m.fromMember, m.floorTermId, m.refusedTermId);
+            }
+            break;
+        }
         case CandidacyStateMsg::TEMPLATE_ID: {
             if (len < CandidacyStateMsg::TOTAL_SIZE) { ignoredFrameCount_++; return; }
             if constexpr (requires(Handler& h, CandidacyState& cs) { h.onCandidacyState(int64_t{}, NodeId{}, cs); }) {

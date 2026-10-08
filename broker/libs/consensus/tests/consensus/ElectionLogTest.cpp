@@ -140,6 +140,17 @@ static std::vector<ClusterMember> makeMembers3(NodeId self = 0) {
     return ms;
 }
 
+// D29 PreVote: the nomination deadline opens a NON-BINDING pre-ballot; these
+// rigs grant it from every peer, after which the next doWork stands for real.
+[[maybe_unused]] static void grantPreBallot(Election& e) {
+    if (!e.preBallotActiveForTest()) return;
+    for (NodeId v = 0; v < 16; ++v) e.onPreVoteResponse(e.preBallotTermForTest(), v, true);
+}
+[[maybe_unused]] static void doWorkThroughPreBallot(Election& e, int64_t nowNs) {
+    e.doWork(nowNs);
+    if (e.preBallotActiveForTest()) { grantPreBallot(e); e.doWork(nowNs); }
+}
+
 static Election makeElection(
     std::vector<ClusterMember> members,
     NodeId                     self,
@@ -334,7 +345,7 @@ static void bringToLeaderLogReplication(Election& e, int64_t& nowNs) {
 
     // Advance past nomination backoff (seed=0 → near-zero backoff)
     nowNs += kElectionTimeoutNs * 10;
-    e.doWork(nowNs); // NOMINATE → CANDIDATE_BALLOT
+    doWorkThroughPreBallot(e, nowNs); // NOMINATE → (pre-ballot) → CANDIDATE_BALLOT
 
     nowNs += 1;
     e.doWork(nowNs); // sends RequestVotes
@@ -468,7 +479,7 @@ TEST(ElectionLog, ThreeMember_Leader_QuorumVote_Timeout_Closed) {
     e.doWork(nowNs); // NOMINATE
 
     nowNs += kElectionTimeoutNs * 10;
-    e.doWork(nowNs); // CandidateBallot
+    doWorkThroughPreBallot(e, nowNs); // (pre-ballot) → CandidateBallot
 
     nowNs += 1;
     e.doWork(nowNs); // sends RequestVotes
@@ -532,7 +543,7 @@ TEST(ElectionLog, OnAppendPosition_WrongTerm_DoesNotUpdateMember) {
     nowNs += kStartupCanvassTimeoutNs + 1;
     e.doWork(nowNs); // NOMINATE
     nowNs += kElectionTimeoutNs * 10;
-    e.doWork(nowNs); // CandidateBallot
+    doWorkThroughPreBallot(e, nowNs); // (pre-ballot) → CandidateBallot
     nowNs += 1;
     e.doWork(nowNs); // send RequestVotes
     Term cTerm = e.candidateTermId();
@@ -853,7 +864,7 @@ TEST(ElectionLog, NextDeadlineNs_InCandidateBallot) {
     nowNs += kStartupCanvassTimeoutNs + 1;
     e.doWork(nowNs);
     nowNs += kElectionTimeoutNs * 10;
-    e.doWork(nowNs); // → CandidateBallot
+    doWorkThroughPreBallot(e, nowNs); // (pre-ballot) → CandidateBallot
     ASSERT_EQ(e.state(), ElectionState::CandidateBallot);
 
     int64_t d = e.nextDeadlineNs();
@@ -1200,7 +1211,7 @@ TEST(ElectionLog, N1_NonZeroLogLeadershipTermId_QuorumStillReached) {
     leader.doWork(nowNs); // CANVASS → NOMINATE
 
     nowNs += kElectionTimeoutNs * 10;
-    leader.doWork(nowNs); // NOMINATE → CANDIDATE_BALLOT
+    doWorkThroughPreBallot(leader, nowNs); // NOMINATE → (pre-ballot) → CANDIDATE_BALLOT
 
     nowNs += 1;
     leader.doWork(nowNs); // sends RequestVotes
@@ -2093,7 +2104,7 @@ TEST(ElectionStandDownRegression, LeaderLogReplicationIgnoresOldTermCanvassPosit
     nowNs += kStartupCanvassTimeoutNs + 1;
     e.doWork(nowNs);
     nowNs += kElectionTimeoutNs * 10;
-    e.doWork(nowNs);
+    doWorkThroughPreBallot(e, nowNs);
     nowNs += 1;
     e.doWork(nowNs);
     const Term cTerm = e.candidateTermId();
@@ -2508,7 +2519,7 @@ static void closeAsTwoMemberLeader(Election& e, ElectionLogFakePublisher& pub, i
     nowNs += kStartupCanvassTimeoutNs + 1;
     e.doWork(nowNs);                       // → NOMINATE (unanimous)
     nowNs += kElectionTimeoutNs * 10;
-    e.doWork(nowNs);                       // → CANDIDATE_BALLOT
+    doWorkThroughPreBallot(e, nowNs);                       // → CANDIDATE_BALLOT
     nowNs += 1;
     e.doWork(nowNs);
     e.onVote(0, 0, e.candidateTermId(), 0, 1, true);
@@ -2625,6 +2636,7 @@ void runFailedCandidacies(Election& e, int64_t& nowNs, int rounds) {
             e.onCanvassPosition(e.logLeadershipTermId(), e.appendPosition(), e.leadershipTermId(), 2);
             nowNs += kStatusIntervalNs;
             e.doWork(nowNs);
+            grantPreBallot(e);   // member 2 (also cut off from the leader) grants the pre-ballot
         }
         ASSERT_GT(e.candidateTermId(), before) << "candidacy round " << r << " never started";
         for (int i = 0; i < 200 && e.state() != ElectionState::Canvass; ++i) {
@@ -2796,7 +2808,7 @@ TEST(ElectionLog, StrandedCanvassRegression_CandidateBallotKeepsItsBallotRegress
     nowNs += kStartupCanvassTimeoutNs + 1;
     e.doWork(nowNs);
     nowNs += kElectionTimeoutNs * 10;
-    e.doWork(nowNs);
+    doWorkThroughPreBallot(e, nowNs);
     ASSERT_EQ(e.state(), ElectionState::CandidateBallot);
     const Term standing = e.candidateTermId();
     ASSERT_GT(standing, 1);
@@ -2842,7 +2854,7 @@ TEST(ElectionLog, StrandedCanvassRegression_QuorumAndSingleNodeWinsRaiseTheFloor
         nowNs += kStartupCanvassTimeoutNs + 1;
         e.doWork(nowNs);
         nowNs += kElectionTimeoutNs * 10;
-        e.doWork(nowNs);
+        doWorkThroughPreBallot(e, nowNs);
         nowNs += 1;
         e.doWork(nowNs);
         ASSERT_EQ(e.state(), ElectionState::CandidateBallot);
@@ -2863,4 +2875,463 @@ TEST(ElectionLog, StrandedCanvassRegression_QuorumAndSingleNodeWinsRaiseTheFloor
         ASSERT_EQ(e.leaderMemberId(), 0);
         EXPECT_EQ(nsf.followFloorTermId(), e.leadershipTermId());
     }
+}
+
+// ===========================================================================
+// D29 PreVote (Raft thesis §9.6) + TermFloorNotice.
+// ===========================================================================
+namespace {
+// In-memory N-node consensus network: every Election's publisher queues its
+// messages; step() runs each node's duty cycle and then delivers.  cut[a][b]
+// drops a→b (a one-way link failure).
+struct SimNet {
+    struct Msg { NodeId to; std::function<void(Election&, int64_t)> deliver; };
+    std::vector<Msg> q;
+    bool cut[8][8]{};
+    void send(NodeId from, NodeId to, std::function<void(Election&, int64_t)> f) {
+        if (!cut[from][to]) q.push_back({to, std::move(f)});
+    }
+};
+struct RouterPub : ConsensusPublisher {
+    SimNet* net = nullptr;
+    NodeId  self = -1;
+    void canvassPosition(NodeId to, Term llt, int64_t lp, Term lt, NodeId fid) override {
+        net->send(self, to, [=](Election& e, int64_t) { e.onCanvassPosition(llt, lp, lt, fid); });
+    }
+    void requestVote(NodeId to, Term llt, int64_t lp, Term ct, NodeId cid) override {
+        net->send(self, to, [=](Election& e, int64_t now) { e.onRequestVote(llt, lp, ct, cid, now); });
+    }
+    void placeVote(NodeId to, Term ct, Term llt, int64_t lp, NodeId cid, NodeId fid, bool v) override {
+        net->send(self, to, [=](Election& e, int64_t) { e.onVote(llt, lp, ct, cid, fid, v); });
+    }
+    void newLeadershipTerm(NodeId to, Term llt, Term nlt, int64_t ntblp, int64_t nlp, Term lt, int64_t tblp,
+                           int64_t lp, int64_t rid, int64_t ts, NodeId lid, int32_t sid, bool st, int64_t cp) override {
+        net->send(self, to, [=](Election& e, int64_t now) {
+            e.onNewLeadershipTerm(now, llt, nlt, ntblp, nlp, lt, tblp, lp, rid, ts, lid, sid, st, cp);
+        });
+    }
+    void appendPosition(NodeId to, Term lt, int64_t lp, NodeId fid, uint8_t fl) override {
+        net->send(self, to, [=](Election& e, int64_t now) { e.onAppendPosition(now, lt, lp, fid, fl); });
+    }
+    void commitPosition(NodeId to, Term lt, int64_t lp, NodeId lid) override {
+        net->send(self, to, [=](Election& e, int64_t now) { e.onCommitPosition(now, lt, lp, lid); });
+    }
+    void preVoteRequest(NodeId to, Term t, Term llt, int64_t lp, NodeId cid) override {
+        net->send(self, to, [=](Election& e, int64_t now) { e.onPreVoteRequest(now, t, llt, lp, cid); });
+    }
+    void preVoteResponse(NodeId to, Term t, NodeId vid, bool g, Term vt) override {
+        net->send(self, to, [=](Election& e, int64_t now) { e.onPreVoteResponse(t, vid, g, vt, now); });
+    }
+    void termFloorNotice(NodeId to, NodeId from, Term floor, Term refused) override {
+        net->send(self, to, [=](Election& e, int64_t now) { e.onTermFloorNotice(now, from, floor, refused); });
+    }
+    void standDown(NodeId to, Term lt, NodeId lid) override {
+        net->send(self, to, [=](Election& e, int64_t now) { e.onStandDown(now, lt, lid); });
+    }
+};
+std::vector<ClusterMember> membersN(int n) {
+    std::vector<ClusterMember> ms(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) { ms[i].id = i; ms[i].logPosition = 0; ms[i].logLeadershipTermId = 0; ms[i].leadershipTermId = 0; }
+    return ms;
+}
+struct SimCluster {
+    struct Node {
+        TempFile nsfF{".nsf"}, tlF{".tl"};
+        std::unique_ptr<NodeStateFile> nsf;
+        std::unique_ptr<TermLog> tl;
+        RouterPub pub;
+        std::unique_ptr<Election> e;
+    };
+    SimNet net;
+    int n;
+    uint64_t seedBase = 1000;
+    std::vector<std::unique_ptr<Node>> nodes;
+    // deny[i][j]: node i's vote gate (CRITICAL-R3 candidacy rule) refuses j.
+    struct Gate { const bool* row; };
+    bool deny[8][8]{};
+    Gate gates[8]{};
+    static bool gateFn(void* ctx, NodeId candidate) noexcept {
+        return !static_cast<Gate*>(ctx)->row[candidate];
+    }
+    int64_t now = 1'000'000LL;
+    explicit SimCluster(int count, uint64_t seed = 1000) : n(count), seedBase(seed) {
+        for (int i = 0; i < n; ++i) {
+            auto nd = std::make_unique<Node>();
+            nd->nsf = std::make_unique<NodeStateFile>(nd->nsfF.str());
+            nd->tl  = std::make_unique<TermLog>(nd->tlF.str());
+            nodes.push_back(std::move(nd));
+            boot(i, 0);
+        }
+    }
+    // (Re)start node i from its durable state with `term` as its restored TermLog
+    // term; its log (leadership term of its last entry) is what it was.
+    void boot(int i, Term term) {
+        Node& nd = *nodes[static_cast<std::size_t>(i)];
+        const Term llt = nd.e ? nd.e->logLeadershipTermId() : 0;
+        nd.pub.net = &net; nd.pub.self = i;
+        nd.e = std::make_unique<Election>(true, -1, term, llt, 0, 0, membersN(n), i, nd.pub, *nd.nsf, *nd.tl,
+                                          kElectionTimeoutNs, kStatusIntervalNs, kStartupCanvassTimeoutNs,
+                                          /*seed=*/static_cast<uint64_t>(seedBase + 17 * i));
+        gates[i].row = deny[i];
+        nd.e->setVoteGate(&gateFn, &gates[i]);
+    }
+    Election& e(int i) { return *nodes[static_cast<std::size_t>(i)]->e; }
+    void cutBoth(int a, int b, bool on) { net.cut[a][b] = on; net.cut[b][a] = on; }
+    void step() {
+        for (int i = 0; i < n; ++i) e(i).doWork(now);
+        auto q = std::move(net.q);
+        net.q.clear();
+        for (auto& m : q) m.deliver(e(m.to), now);
+        now += 1'000'000;   // 1 ms
+    }
+    void run(int64_t ms) { for (int64_t i = 0; i < ms; ++i) step(); }
+    // The single closed leader every closed node follows, or -1.
+    int leader() {
+        int l = -1;
+        for (int i = 0; i < n; ++i) {
+            if (!e(i).isClosed()) continue;
+            const int li = e(i).leaderMemberId();
+            if (l == -1) l = li; else if (li != l) return -1;
+        }
+        return l >= 0 && e(l).isClosed() && e(l).leaderMemberId() == l ? l : -1;
+    }
+    bool allClosedUnder(int l) {
+        for (int i = 0; i < n; ++i) if (!e(i).isClosed() || e(i).leaderMemberId() != l) return false;
+        return true;
+    }
+    bool runUntil(int64_t maxMs, const std::function<bool()>& done) {
+        for (int64_t i = 0; i < maxMs; ++i) { if (done()) return true; step(); }
+        return done();
+    }
+};
+} // namespace
+
+TEST(ElectionLog, PreVoteRegression_PreBallotNeverRaisesDurableTerms) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    ElectionLogFakePublisher pub;
+    auto e = makeElection(makeMembers3(0), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);
+    e.onCanvassPosition(0, 0, 0, 1);
+    e.onCanvassPosition(0, 0, 0, 2);
+    nowNs += kStartupCanvassTimeoutNs + 1;
+    e.doWork(nowNs);                                   // → NOMINATE
+    nowNs += kElectionTimeoutNs * 10;
+    e.doWork(nowNs);                                   // → pre-ballot
+    ASSERT_TRUE(e.preBallotActiveForTest());
+    const Term before = e.candidateTermId(), fileBefore = nsf.candidateTermId();
+    for (int i = 0; i < 40 && e.state() == ElectionState::Nominate; ++i) { nowNs += kStatusIntervalNs; e.doWork(nowNs); }
+    EXPECT_EQ(e.state(), ElectionState::Canvass) << "a pre-ballot without a majority must give up";
+    EXPECT_EQ(nsf.candidateTermId(), fileBefore) << "a lost pre-ballot raised the durable candidate term";
+    EXPECT_EQ(e.candidateTermId(), before);
+    EXPECT_GE(e.preBallotsLostForTest(), 1u);
+    EXPECT_TRUE(pub.requestVoteCalls.empty()) << "a real RequestVote went out without a pre-vote majority";
+}
+
+TEST(ElectionLog, PreVoteRegression_VoterHearingALiveLeaderDeniesAndChangesNothing) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    ElectionLogFakePublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl);
+    closeAsFollowerOf0(e, nowNs);
+    const Term cand = e.candidateTermId(), floor = e.followFloorTermId();
+    heartbeatNlt(e, nowNs, e.leadershipTermId(), /*leader=*/0);   // the leader is alive
+    e.onPreVoteRequest(nowNs, cand + 5, e.logLeadershipTermId(), e.appendPosition(), /*candidate=*/2);
+    EXPECT_EQ(e.preVotesDeniedForTest(), 1u) << "pre-vote granted while the leader is alive";
+    EXPECT_EQ(e.candidateTermId(), cand);
+    EXPECT_EQ(e.followFloorTermId(), floor);
+    EXPECT_TRUE(e.isClosed());
+    // The leader we follow asking (it stepped down): granted.
+    e.onPreVoteRequest(nowNs, cand + 5, e.logLeadershipTermId(), e.appendPosition(), /*candidate=*/0);
+    EXPECT_EQ(e.preVotesGrantedForTest(), 1u) << "our own leader's re-candidacy was denied";
+    EXPECT_EQ(e.candidateTermId(), cand) << "a pre-vote changed durable state";
+    // After the heartbeat timeout without the leader: granted.
+    nowNs += kElectionTimeoutNs * 4;
+    e.onPreVoteRequest(nowNs, cand + 5, e.logLeadershipTermId(), e.appendPosition(), /*candidate=*/2);
+    EXPECT_EQ(e.preVotesGrantedForTest(), 2u);
+}
+
+TEST(ElectionLog, PreVoteRegression_CutOffCandidateNeverDisturbsALiveLeaderRegression) {
+    // Re-review P1-MAJOR-1: 5 nodes, the X–L link cut, a bridge V restarts into
+    // CANVASS.  Without PreVote X stood at rising terms and V granted them
+    // (floor ↑) — with the step-down notice, ping-pong of the majority's leader.
+    SimCluster c(5);
+    ASSERT_TRUE(c.runUntil(20'000, [&] { const int l = c.leader(); return l >= 0 && c.allClosedUnder(l); }))
+        << "precondition: the cluster elects a leader";
+    const int L = c.leader();
+    const Term T = c.e(L).leadershipTermId();
+    const int X = (L + 1) % 5, V = (L + 2) % 5;
+    c.cutBoth(X, L, true);
+    c.boot(V, T);                                           // V restarts (CANVASS)
+    c.run(6'000);                                           // 40 election timeouts
+    EXPECT_EQ(c.leader(), L) << "the live leader was disturbed";
+    EXPECT_EQ(c.e(L).leadershipTermId(), T) << "the leader's term moved";
+    EXPECT_TRUE(c.e(V).isClosed() && c.e(V).leaderMemberId() == L) << "the restarted bridge did not rejoin";
+    EXPECT_EQ(c.e(V).followFloorTermId(), T) << "the bridge's floor was ratcheted by the cut-off candidate";
+    EXPECT_LE(c.e(X).candidateTermId(), T) << "the cut-off node inflated its term (no pre-vote majority)";
+    c.cutBoth(X, L, false);                                 // heal: X rejoins the same leader
+    ASSERT_TRUE(c.runUntil(5'000, [&] { return c.allClosedUnder(L); })) << "X never rejoined after the heal";
+    EXPECT_EQ(c.e(L).leadershipTermId(), T);
+}
+
+TEST(ElectionLog, PreVoteRegression_StrandedMemberRejoinsWithOneLeaderChangeRegression) {
+    // D24 residual: a member whose durable floor is ABOVE the live leader's term
+    // (it granted a newer term to a candidacy that failed, then restarted)
+    // refuses that leader; it tells it (TermFloorNotice), the leader steps down
+    // and the cluster re-elects above the floor — once, no flapping.
+    for (const uint64_t seed : {1000u, 7u, 42u, 99u, 1234u, 31337u, 55u, 8080u}) {
+    SCOPED_TRACE(seed);
+        SimCluster c(3, seed);
+        ASSERT_TRUE(c.runUntil(20'000, [&] { const int l = c.leader(); return l >= 0 && c.allClosedUnder(l); }));
+        const int L = c.leader();
+        const Term T = c.e(L).leadershipTermId();
+        const int V = (L + 1) % 3;
+        c.nodes[static_cast<std::size_t>(V)]->nsf->proposeMaxFollowFloorTermId(T + 2, 0, 0);   // granted T+2 before
+        c.boot(V, T);
+        ASSERT_TRUE(c.runUntil(20'000, [&] { const int l = c.leader(); return l >= 0 && c.allClosedUnder(l); }))
+            << "the stranded member never rejoined";
+        const int L2 = c.leader();
+        EXPECT_GT(c.e(L2).leadershipTermId(), T + 2) << "re-elected below the stranded member's floor";
+        EXPECT_EQ(c.e(L).termFloorStepDownsForTest(), 1u) << "the leader must step down exactly once";
+        const Term T2 = c.e(L2).leadershipTermId();
+        c.run(3'000);                                           // stable afterwards
+        EXPECT_EQ(c.leader(), L2);
+        EXPECT_EQ(c.e(L2).leadershipTermId(), T2) << "leadership flapped after the re-election";
+    }
+}
+
+TEST(ElectionLog, PreVoteRegression_NoticeUnderPartialPartitionConvergesWithoutPingPongRegression) {
+    // Re-review P1-MAJOR-1, the full shape: 5 nodes, the X–L link cut, and a
+    // bridge V restarting with a durable floor ABOVE L's term (it granted a
+    // newer, failed candidacy).  V's TermFloorNotice deposes L; the majority
+    // re-elects while X (cut off from L only) canvasses.  Without PreVote X
+    // kept standing at rising terms, V granted them (its floor ratcheting past
+    // each new leader), and every new leader was deposed again.  With PreVote
+    // it converges — and STAYS converged.
+    for (const uint64_t seed : {1000u, 7u, 42u, 99u, 1234u, 31337u, 55u, 8080u}) {
+    SCOPED_TRACE(seed);
+        SimCluster c(5, seed);
+        ASSERT_TRUE(c.runUntil(20'000, [&] { const int l = c.leader(); return l >= 0 && c.allClosedUnder(l); }));
+        const int L = c.leader();
+        const Term T = c.e(L).leadershipTermId();
+        const int X = (L + 1) % 5, V = (L + 2) % 5;
+        c.cutBoth(X, L, true);
+        c.nodes[static_cast<std::size_t>(V)]->nsf->proposeMaxFollowFloorTermId(T + 2, 0, 0);
+        c.boot(V, T);
+        // Converges: one leader that every node except possibly X (cut from it, if
+        // it is L) follows.
+        auto settled = [&] {
+            const int l = c.leader();
+            if (l < 0) return false;
+            for (int i = 0; i < 5; ++i)
+                if (!(i == X && l == L) && (!c.e(i).isClosed() || c.e(i).leaderMemberId() != l)) return false;
+            return true;
+        };
+        ASSERT_TRUE(c.runUntil(30'000, settled)) << "no stable leader after the notice";
+        const int L2 = c.leader();
+        const Term T2 = c.e(L2).leadershipTermId();
+        EXPECT_GT(T2, T + 2);
+        EXPECT_LE(T2, T + 4) << "terms ran away during the re-election (ping-pong)";
+        c.run(6'000);   // 40 election timeouts: nothing moves any more
+        EXPECT_EQ(c.leader(), L2) << "leadership flapped after converging";
+        EXPECT_EQ(c.e(L2).leadershipTermId(), T2) << "the term kept rising after converging";
+    }
+}
+
+TEST(ElectionLog, PreVoteRegression_RestartWhileAPeerIsCutOffKeepsTheLeaderRegression) {
+    // 3 nodes: X cut off from the leader L, and V restarts.  V + X canvassing are
+    // a canvass quorum, so X stands.  Without PreVote V (canvassing, no
+    // stickiness) GRANTS X's real vote — its floor rises above L's term, it
+    // refuses L, and the healthy leader is deposed by a node that cannot even
+    // reach it.  With PreVote V has heard L: it denies X's pre-ballot and simply
+    // follows L — no leader change, no term change.
+    SimCluster c(3);
+    ASSERT_TRUE(c.runUntil(20'000, [&] { const int l = c.leader(); return l >= 0 && c.allClosedUnder(l); }));
+    const int L = c.leader();
+    const Term T = c.e(L).leadershipTermId();
+    const int X = (L + 1) % 3, V = (L + 2) % 3;
+    c.cutBoth(X, L, true);
+    c.boot(V, T);
+    c.run(6'000);
+    EXPECT_EQ(c.leader(), L) << "a cut-off node deposed the healthy leader";
+    EXPECT_EQ(c.e(L).leadershipTermId(), T) << "the term moved";
+    EXPECT_TRUE(c.e(V).isClosed() && c.e(V).leaderMemberId() == L) << "the restarted member did not follow the leader";
+    EXPECT_EQ(c.e(V).followFloorTermId(), T) << "the restarted member granted the cut-off node a binding vote";
+}
+
+TEST(ElectionLog, PreVoteRegression_DeadLeaderIsReplacedOnceTheLeaseExpiresRegression) {
+    // Liveness: the leader lease never wedges an election — once nobody has
+    // heard the leader for a heartbeat timeout, pre-votes are granted and a new
+    // leader is elected (3 and 5 nodes).
+    for (const int n : {3, 5}) {
+        SimCluster c(n);
+        ASSERT_TRUE(c.runUntil(20'000, [&] { const int l = c.leader(); return l >= 0 && c.allClosedUnder(l); }));
+        const int L = c.leader();
+        const Term T = c.e(L).leadershipTermId();
+        for (int i = 0; i < n; ++i) if (i != L) c.cutBoth(L, i, true);   // L is gone
+        auto replaced = [&] {
+            int l = -1;
+            for (int i = 0; i < n; ++i) {
+                if (i == L) continue;
+                if (!c.e(i).isClosed()) return false;
+                if (l == -1) l = c.e(i).leaderMemberId(); else if (c.e(i).leaderMemberId() != l) return false;
+            }
+            return l >= 0 && l != L && c.e(l).leaderMemberId() == l;
+        };
+        ASSERT_TRUE(c.runUntil(20'000, replaced)) << n << " nodes: no new leader after the old one died";
+        int nl = -1;
+        for (int i = 0; i < n; ++i) if (i != L) { nl = c.e(i).leaderMemberId(); break; }
+        EXPECT_GT(c.e(nl).leadershipTermId(), T);
+    }
+}
+
+
+TEST(ElectionLog, PreVoteRegression_TermEligibilityInversionNeverWedgesRegression) {
+    // Review CRITICAL-1: X is the only electable survivor but behind in term; Y
+    // holds a higher candidate term but X's vote gate refuses it.  X's pre-ballot
+    // at its term + 1 is denied by Y (term too low), Y's by X (gate) — before the
+    // fix nothing ever raised X's term: 2 of 3 alive, headless forever.  The
+    // denial now carries Y's term; X adopts it (candidate only) and is elected.
+    for (const uint64_t seed : {1000u, 7u, 42u, 99u, 1234u, 31337u, 55u, 8080u}) {
+    SCOPED_TRACE(seed);
+        SimCluster c(3, seed);
+        ASSERT_TRUE(c.runUntil(20'000, [&] { const int l = c.leader(); return l >= 0 && c.allClosedUnder(l); }));
+        const int F = c.leader();
+        const Term T = c.e(F).leadershipTermId();
+        const int X = (F + 1) % 3, Y = (F + 2) % 3;
+        c.nodes[static_cast<std::size_t>(Y)]->nsf->proposeMaxCandidateTermId(T + 1, 0, 0);   // a failed own candidacy
+        c.boot(Y, T);
+        ASSERT_TRUE(c.runUntil(5'000, [&] { return c.allClosedUnder(F); })) << "precondition: Y re-follows F";
+        c.deny[X][Y] = true;                                     // X's knowledge excludes Y
+        for (int i = 0; i < 3; ++i) if (i != F) c.cutBoth(F, i, true);   // F dies
+        auto electedAmongXY = [&] {
+            for (const int i : {X, Y}) if (!c.e(i).isClosed()) return false;
+            return c.e(X).leaderMemberId() == X && c.e(Y).leaderMemberId() == X;
+        };
+        ASSERT_TRUE(c.runUntil(20'000, electedAmongXY)) << "the survivors never elected: wedged on the term inversion";
+        EXPECT_GT(c.e(X).leadershipTermId(), T + 1);
+        EXPECT_GE(c.e(X).preBallotTermCatchUpsForTest(), 1u);
+    }
+}
+
+TEST(ElectionLog, PreVoteRegression_StandDownHandOffNeverWaitsOutTheLeaseRegression) {
+    // Review MAJOR-1: a controlled-shutdown hand-off in 5 nodes — the followers
+    // drop the resigned leader's lease with its StandDown, so the successor's
+    // pre-ballot succeeds at once (it used to need ~2 election timeouts).
+    SimCluster c(5);
+    ASSERT_TRUE(c.runUntil(20'000, [&] { const int l = c.leader(); return l >= 0 && c.allClosedUnder(l); }));
+    const int L = c.leader();
+    ASSERT_TRUE(c.e(L).resign(c.now));
+    auto handedOff = [&] {
+        int l = -1;
+        for (int i = 0; i < 5; ++i) {
+            if (i == L) continue;
+            if (!c.e(i).isClosed()) return false;
+            if (l == -1) l = c.e(i).leaderMemberId(); else if (c.e(i).leaderMemberId() != l) return false;
+        }
+        return l >= 0 && l != L;
+    };
+    const int64_t t0 = c.now;
+    ASSERT_TRUE(c.runUntil(20'000, handedOff)) << "no successor";
+    const int64_t tookMs = (c.now - t0) / 1'000'000;
+    uint64_t lost = 0;
+    for (int i = 0; i < 5; ++i) lost += c.e(i).preBallotsLostForTest();
+    EXPECT_EQ(lost, 0u) << "a pre-ballot was lost to the resigned leader's lease";
+    // ~37 ms with the lease dropped; ~170 ms (the lease) without.
+    EXPECT_LT(tookMs, kElectionTimeoutNs / 2 / 1'000'000) << "the hand-off waited out the lease (" << tookMs << " ms)";
+}
+
+TEST(ElectionLog, PreVoteRegression_StaleTermLeaderNeverHoldsTheLeaseRegression) {
+    // Review MAJOR-2: a zombie of an OLDER term (stuck in a leader state, its
+    // heartbeats still reaching us) must not hold our lease — else, once the
+    // real leader dies, every pre-ballot is denied for as long as it runs.
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    ElectionLogFakePublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(membersN(5), 1, pub, nsf, tl);
+    closeAsFollowerOf0(e, nowNs);
+    const Term t = e.leadershipTermId();
+    ASSERT_GE(t, 1);
+    // The real leader 0 goes silent; zombie 2 keeps sending NLT for t - 1.
+    for (int i = 0; i < 10; ++i) {
+        nowNs += kStatusIntervalNs;
+        heartbeatNlt(e, nowNs, t - 1, /*leader=*/2);
+        e.doWork(nowNs);
+    }
+    e.onPreVoteRequest(nowNs, e.candidateTermId() + 1, e.logLeadershipTermId(), e.appendPosition(), /*candidate=*/3);
+    EXPECT_EQ(e.preVotesGrantedForTest(), 1u) << "a superseded leader's heartbeat held the lease";
+}
+
+TEST(ElectionLog, PreVoteRegression_RealVoteInLeaseIsDeniedWithoutAdoptingTheTermRegression) {
+    // Review MEDIUM-1: a non-CLOSED voter that heard a live leader within the
+    // heartbeat timeout denies a REAL RequestVote too (an old-version candidate
+    // skips the pre-ballot) — and does not adopt its term.
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    ElectionLogFakePublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(makeMembers3(1), 1, pub, nsf, tl, true, /*term=*/3, 0, 0);   // our log: term 3
+    e.doWork(nowNs);                                         // → CANVASS
+    // Leader 0 of term 3 whose log is BEHIND ours (log term 1): refused, but heard — lease live.
+    e.onNewLeadershipTerm(nowNs, /*logLeadershipTermId=*/1, /*next=*/3, 0, 0, /*leadershipTermId=*/3, 0, 0, 0, 0,
+                          /*leader=*/0, 0, false, 0);
+    ASSERT_NE(e.leaderMemberId(), 0);
+    const Term cand = e.candidateTermId();
+    pub.clear();
+    e.onRequestVote(/*llt=*/2, 0, /*candidateTermId=*/cand + 3, /*candidate=*/2, nowNs);
+    ASSERT_EQ(pub.placeVoteCalls.size(), 1u);
+    EXPECT_FALSE(pub.placeVoteCalls[0].vote) << "a binding vote granted while a live leader is heard";
+    EXPECT_EQ(e.candidateTermId(), cand) << "a lease denial adopted the candidate's term";
+    EXPECT_LE(e.followFloorTermId(), 3);
+}
+
+TEST(ElectionLog, PreVoteRegression_AnyDenialLosesThePreBallotRegression) {
+    // Re-review M1: the real ballot fails on ANY Against (isQuorumLeader) — a
+    // pre-ballot that met an explicit denial at its term is lost too, rather than
+    // raising durable terms for a certain loss.
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    ElectionLogFakePublisher pub;
+    auto e = makeElection(membersN(5), 0, pub, nsf, tl, true, 0, 0, 0, /*seed=*/0);
+    int64_t nowNs = 1'000'000LL;
+    e.doWork(nowNs);
+    for (NodeId p = 1; p < 5; ++p) e.onCanvassPosition(0, 0, 0, p);
+    nowNs += kStartupCanvassTimeoutNs + 1;
+    e.doWork(nowNs);
+    nowNs += kElectionTimeoutNs * 10;
+    e.doWork(nowNs);
+    ASSERT_TRUE(e.preBallotActiveForTest());
+    const Term pt = e.preBallotTermForTest(), cand = e.candidateTermId();
+    e.onPreVoteResponse(pt, 1, true, pt - 1, nowNs);
+    e.onPreVoteResponse(pt, 2, false, pt - 1, nowNs);   // an explicit denial at our term (lease / log / gate)
+    e.onPreVoteResponse(pt, 3, true, pt - 1, nowNs);    // 4 of 5 would otherwise be a majority
+    e.doWork(nowNs + 1);
+    EXPECT_EQ(e.state(), ElectionState::Canvass) << "stood for a real ballot that a known Against would sink";
+    EXPECT_EQ(e.candidateTermId(), cand);
+    EXPECT_TRUE(pub.requestVoteCalls.empty());
+}
+
+TEST(ElectionLog, PreVoteRegression_RestartedNodeIgnoresAZombieBelowItsFloorRegression) {
+    // Re-review M3: production builds the Election with leadershipTermId 0 after a
+    // restart — the durable floor still filters a superseded leader's heartbeats
+    // out of the lease.
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    nsf.proposeMaxFollowFloorTermId(4, 0, 0);
+    TermLog       tl(tlFile.str());
+    ElectionLogFakePublisher pub;
+    int64_t nowNs = 1'000'000LL;
+    auto e = makeElection(membersN(5), 1, pub, nsf, tl, true, /*term=*/0, 0, 0);
+    e.doWork(nowNs);
+    heartbeatNlt(e, nowNs, 3, /*leader=*/2);                // a zombie of term 3 < our floor 4
+    e.onPreVoteRequest(nowNs, e.candidateTermId() + 1, e.logLeadershipTermId(), e.appendPosition(), /*candidate=*/3);
+    EXPECT_EQ(e.preVotesGrantedForTest(), 1u) << "a zombie below our floor held the lease after a restart";
 }

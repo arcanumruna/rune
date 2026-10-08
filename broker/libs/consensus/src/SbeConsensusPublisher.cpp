@@ -12,6 +12,27 @@ void SbeConsensusPublisher::candidacyState(NodeId toMember, NodeId fromMember,
     sink_.send(toMember, buf_.data(), len);
 }
 
+void SbeConsensusPublisher::preVoteRequest(NodeId toMember, Term term, Term logLeadershipTermId,
+                                           int64_t logPosition, NodeId candidateId)
+{
+    const auto len = PreVoteRequestMsg::encode(buf_.data(), 0, term, logLeadershipTermId, logPosition, candidateId);
+    sink_.send(toMember, buf_.data(), len);
+}
+
+void SbeConsensusPublisher::preVoteResponse(NodeId toMember, Term term, NodeId voterId, bool granted,
+                                            Term voterTermId)
+{
+    const auto len = PreVoteResponseMsg::encode(buf_.data(), 0, term, voterTermId, voterId, granted);
+    sink_.send(toMember, buf_.data(), len);
+}
+
+void SbeConsensusPublisher::termFloorNotice(NodeId toMember, NodeId fromMember, Term floorTermId,
+                                            Term refusedTermId)
+{
+    const auto len = TermFloorNoticeMsg::encode(buf_.data(), 0, floorTermId, refusedTermId, fromMember);
+    sink_.send(toMember, buf_.data(), len);
+}
+
 void SbeConsensusPublisher::canvassPosition(
     NodeId  toMember,
     Term    logLeadershipTermId,

@@ -1,6 +1,6 @@
-# Consensus PreVote (D29) — design (DRAFT, awaiting approval)
+# Consensus PreVote (D29) — design
 
-Status: DRAFT 2026-10-08 — nothing implemented. Origin: backlog D29 (D24 re-review P1-MAJOR-1,
+Status: APPROVED by the user 2026-10-08 ("Let's do it then"); IMPLEMENTED (see Implementation notes). Origin: backlog D29 (D24 re-review P1-MAJOR-1,
 briefs/2026-10-08-d24r2-d28-review.md).
 
 ## Problem
@@ -101,3 +101,54 @@ ballot transitions are otherwise unchanged.
 
 Every election gains one extra round trip: the pre-ballot, about one network RTT plus one
 status-interval. It adds no durable writes.
+
+## Implementation notes (2026-10-08)
+
+- **Pre-ballot.** It is a sub-phase of NOMINATE (`Election::startPreBallot_` / `preBallotWon_`), so Aeron's state
+  ordinals are unchanged. Requests are re-sent each status interval. With no majority by `electionTimeoutNs_`, the
+  node goes back to CANVASS with its term unchanged.
+- **Voter.** The grant rule is in `Election::onPreVoteRequest`. The lease is `leaderLeaseLive_`, stamped by
+  `noteLeaderHeard_` on any NewLeadershipTerm or CommitPosition from a member, including one we refused. A candidate
+  that is the leader we heard from is exempt. A real RequestVote in CLOSED is exempt from stickiness when it comes
+  from our own leader.
+- **TermFloorNotice.** Re-added as template 62. A notice step-down raises only the candidate term and broadcasts
+  StandDown, so followers drop the lease at once (review round 1).
+- **Tests:**
+  - `ElectionLog.PreVoteRegression_*`, with an in-memory N-node `SimCluster` (cut links, restarts).
+  - The stranded-member tests FAIL with the notice disabled.
+  - `ConsensusMessagesRegression.PreVoteAndFloorNotice…` covers the wire round trip.
+- **Honest finding.** With PreVote disabled, the partial-partition tests still pass in this codebase. Three existing
+  mechanisms already close the windows PreVote targets:
+  - Aeron's canvass-quorum nomination: a node nominates only if a majority is canvassing.
+  - D24: a canvassing node follows any leader at or above its floor.
+  - CLOSED stickiness.
+
+  So PreVote is kept as a cheap guard (one extra round trip per election, no durable writes). It stops terms
+  inflating whenever a canvassing majority exists, and it is what makes the step-down notice provably bounded. The
+  notice is the part that fixes the residual stranding.
+
+## Review rounds (2026-10-08)
+
+**Round 1 (briefs/2026-10-08-d29-review.md).** Safety held; every finding was a liveness or test-quality issue.
+- **CRITICAL-1 — term catch-up lost.** A denied pre-vote never carried the voter's term, which removed Aeron's term
+  catch-up (it rode on the real RequestVote). A term/eligibility inversion then wedged 2-of-3 survivors. Fix:
+  PreVoteResponse carries `voterTermId`, and the candidate adopts it as its candidate term.
+- **MAJOR-1 — StandDown kept the lease.** Fix: StandDown drops the lease.
+- **MAJOR-2 — stale-term messages stamped the lease.** Fix: a message below our term is ignored.
+- **MAJOR-3 — tests did not discriminate.** Each fix above now has a test that fails without it.
+- **MEDIUMs:**
+  - a real vote is denied in lease, without term adoption;
+  - candidacy state and canvass position are still published during the pre-ballot;
+  - the exemption also covers our own leader;
+  - the notice raises the candidate term only and broadcasts StandDown.
+
+**Round 2 (briefs/2026-10-08-d29-review-r2.md).** No CRITICAL or MAJOR findings. MEDIUMs fixed:
+- **M1.** Any explicit denial at our term loses the pre-ballot, matching Aeron's real ballot, which fails on any
+  Against.
+- **M2.** A term catch-up restarts the pre-ballot window.
+- **M3.** The lease ignores leader messages below our durable floor. Production restarts at leadershipTermId 0, and a
+  zombie must not hold the lease.
+
+  Trade-off: a node refusing a live leader by floor no longer holds that leader's lease. Liveness wins over the
+  theoretical ratchet; the notice deposes that leader anyway.
+- **M4.** No latency in the sim harness — moved to the backlog.

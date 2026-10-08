@@ -43,6 +43,9 @@ enum class ConsensusTemplateId : uint16_t {
     StopCatchup        = 57,
     CandidacyState     = 58,   // re-review round 3 CRITICAL-R3 (knowledge exchange)
     StandDown          = 59,   // controlled shutdown: the leader resigns (Rune extension)
+    PreVoteRequest     = 60,   // D29 PreVote (Raft §9.6; Rune extension)
+    PreVoteResponse    = 61,   // D29
+    TermFloorNotice    = 62,   // D29/D24: a member's follow floor is above the leader's term
     TerminationPosition = 75,
     TerminationAck     = 76,
 };
@@ -734,6 +737,136 @@ struct CandidacyStateMsg {
         m.fromMember  = detail::read_le<int32_t>(p + 16);
         m.count       = detail::read_le<int32_t>(p + 20);
         for (int i = 0; i < 16; ++i) m.members[i] = detail::read_le<int32_t>(p + 24 + 4 * i);
+        return m;
+    }
+};
+
+// ===========================================================================
+// PreVoteRequest  (templateId = 60) — D29 PreVote (Raft thesis §9.6), a Rune
+// extension.  A would-be candidate asks "would you vote for me at `term`?"
+// BEFORE raising its durable candidate term; nobody's durable state changes.
+//    blockLength = 32
+//      term                : int64  @ +0
+//      logLeadershipTermId : int64  @ +8
+//      logPosition         : int64  @ +16
+//      candidateId         : int32  @ +24
+//      (pad)               : int32  @ +28
+// ===========================================================================
+struct PreVoteRequestMsg {
+    int64_t term;
+    int64_t logLeadershipTermId;
+    int64_t logPosition;
+    int32_t candidateId;
+
+    static constexpr uint16_t TEMPLATE_ID  = 60;
+    static constexpr uint16_t BLOCK_LENGTH = 32;
+    static constexpr std::size_t TOTAL_SIZE = ConsensusMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+
+    static std::size_t encode(uint8_t* buf, std::size_t offset, int64_t term_, int64_t llt_, int64_t pos_,
+                              int32_t candidateId_) noexcept {
+        std::size_t pos = offset;
+        pos += ConsensusMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
+        uint8_t* p = buf + pos;
+        detail::write_le<int64_t>(p +  0, term_);
+        detail::write_le<int64_t>(p +  8, llt_);
+        detail::write_le<int64_t>(p + 16, pos_);
+        detail::write_le<int32_t>(p + 24, candidateId_);
+        detail::write_le<int32_t>(p + 28, 0);
+        return TOTAL_SIZE;
+    }
+    static PreVoteRequestMsg decode(const uint8_t* buf, std::size_t offset) noexcept {
+        const uint8_t* p = buf + offset + ConsensusMessageHeader::ENCODED_SIZE;
+        PreVoteRequestMsg m{};
+        m.term                = detail::read_le<int64_t>(p +  0);
+        m.logLeadershipTermId = detail::read_le<int64_t>(p +  8);
+        m.logPosition         = detail::read_le<int64_t>(p + 16);
+        m.candidateId         = detail::read_le<int32_t>(p + 24);
+        return m;
+    }
+};
+
+// ===========================================================================
+// PreVoteResponse  (templateId = 61) — D29: the voter's non-binding answer,
+// with the voter's own durable term (etcd: a rejected pre-vote carries it) so a
+// candidate behind a live member's term catches up — Aeron's term catch-up ran
+// through the stale node's real RequestVote, which PreVote no longer sends.
+//    blockLength = 24
+//      term        : int64  @ +0
+//      voterTermId : int64  @ +8   (max(candidate term, follow floor) of the voter)
+//      voterId     : int32  @ +16
+//      granted     : int32  @ +20  (0 / 1)
+// ===========================================================================
+struct PreVoteResponseMsg {
+    int64_t term;
+    int64_t voterTermId;
+    int32_t voterId;
+    int32_t granted;
+
+    static constexpr uint16_t TEMPLATE_ID  = 61;
+    static constexpr uint16_t BLOCK_LENGTH = 24;
+    static constexpr std::size_t TOTAL_SIZE = ConsensusMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+
+    static std::size_t encode(uint8_t* buf, std::size_t offset, int64_t term_, int64_t voterTermId_,
+                              int32_t voterId_, bool granted_) noexcept {
+        std::size_t pos = offset;
+        pos += ConsensusMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
+        uint8_t* p = buf + pos;
+        detail::write_le<int64_t>(p + 0, term_);
+        detail::write_le<int64_t>(p + 8, voterTermId_);
+        detail::write_le<int32_t>(p + 16, voterId_);
+        detail::write_le<int32_t>(p + 20, granted_ ? 1 : 0);
+        return TOTAL_SIZE;
+    }
+    static PreVoteResponseMsg decode(const uint8_t* buf, std::size_t offset) noexcept {
+        const uint8_t* p = buf + offset + ConsensusMessageHeader::ENCODED_SIZE;
+        PreVoteResponseMsg m{};
+        m.term        = detail::read_le<int64_t>(p + 0);
+        m.voterTermId = detail::read_le<int64_t>(p + 8);
+        m.voterId     = detail::read_le<int32_t>(p + 16);
+        m.granted     = detail::read_le<int32_t>(p + 20);
+        return m;
+    }
+};
+
+// ===========================================================================
+// TermFloorNotice  (templateId = 62) — D29/D24, a Rune extension (etcd's
+// "message from a lower-term leader" answer, narrowed to the durable follow
+// floor; safe with PreVote — a cut-off candidate can no longer ratchet a
+// bridge member's floor).  Sent by a member that refused the leader's
+// NewLeadershipTerm for `refusedTermId` because it granted, led, followed or
+// adopted a newer term (`floorTermId`); that leader steps down.
+//    blockLength = 24
+//      floorTermId   : int64  @ +0
+//      refusedTermId : int64  @ +8
+//      fromMember    : int32  @ +16
+//      (pad)         : int32  @ +20
+// ===========================================================================
+struct TermFloorNoticeMsg {
+    int64_t floorTermId;
+    int64_t refusedTermId;
+    int32_t fromMember;
+
+    static constexpr uint16_t TEMPLATE_ID  = 62;
+    static constexpr uint16_t BLOCK_LENGTH = 24;
+    static constexpr std::size_t TOTAL_SIZE = ConsensusMessageHeader::ENCODED_SIZE + BLOCK_LENGTH;
+
+    static std::size_t encode(uint8_t* buf, std::size_t offset, int64_t floorTermId_, int64_t refusedTermId_,
+                              int32_t fromMember_) noexcept {
+        std::size_t pos = offset;
+        pos += ConsensusMessageHeader::encode(buf, pos, BLOCK_LENGTH, TEMPLATE_ID);
+        uint8_t* p = buf + pos;
+        detail::write_le<int64_t>(p +  0, floorTermId_);
+        detail::write_le<int64_t>(p +  8, refusedTermId_);
+        detail::write_le<int32_t>(p + 16, fromMember_);
+        detail::write_le<int32_t>(p + 20, 0);
+        return TOTAL_SIZE;
+    }
+    static TermFloorNoticeMsg decode(const uint8_t* buf, std::size_t offset) noexcept {
+        const uint8_t* p = buf + offset + ConsensusMessageHeader::ENCODED_SIZE;
+        TermFloorNoticeMsg m{};
+        m.floorTermId   = detail::read_le<int64_t>(p +  0);
+        m.refusedTermId = detail::read_le<int64_t>(p +  8);
+        m.fromMember    = detail::read_le<int32_t>(p + 16);
         return m;
     }
 };

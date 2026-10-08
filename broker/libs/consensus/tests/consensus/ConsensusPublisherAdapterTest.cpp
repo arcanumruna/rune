@@ -774,3 +774,47 @@ TEST(ConsensusAdapterDispatch, UnknownTemplateIdIgnored)
 
     EXPECT_EQ(handler.calls(), 0); // nothing dispatched
 }
+
+// D29: PreVoteRequest (60) / PreVoteResponse (61) / TermFloorNotice (62) through
+// the production SBE publisher and adapter — a missing override anywhere
+// (publisher, adapter, handler) would silently disable PreVote.
+namespace {
+struct D29Handler {
+    int req = 0, resp = 0, notice = 0;
+    Term term = 0, llt = 0, floor = 0, refused = 0, voterTerm = 0; int64_t pos = 0; NodeId who = -1; bool granted = false;
+    void onCanvassPosition(int64_t, Term, int64_t, Term, NodeId, int32_t) {}
+    void onRequestVote(int64_t, Term, int64_t, Term, NodeId, int32_t) {}
+    void onVote(int64_t, Term, Term, int64_t, NodeId, NodeId, bool) {}
+    void onNewLeadershipTerm(int64_t, Term, Term, int64_t, int64_t, Term, int64_t, int64_t, int64_t,
+                             int64_t, NodeId, int32_t, int32_t, bool, int64_t) {}
+    void onAppendPosition(int64_t, Term, int64_t, NodeId, uint8_t) {}
+    void onCommitPosition(int64_t, Term, int64_t, NodeId) {}
+    void onPreVoteRequest(int64_t, Term t, Term l, int64_t p, NodeId c) { ++req; term = t; llt = l; pos = p; who = c; }
+    void onPreVoteResponse(int64_t, Term t, NodeId v, bool g, Term vt) { ++resp; term = t; who = v; granted = g; voterTerm = vt; }
+    void onTermFloorNotice(int64_t, NodeId f, Term fl, Term r) { ++notice; who = f; floor = fl; refused = r; }
+};
+}
+TEST(ConsensusMessagesRegression, PreVoteAndFloorNoticeRoundTripThroughPublisherAndAdapterRegression) {
+    LoopbackSink sink;
+    SbeConsensusPublisher pub(sink);
+    D29Handler h;
+    BasicConsensusAdapter<D29Handler> adapter{h};
+    pub.preVoteRequest(/*to=*/2, /*term=*/9, /*llt=*/7, /*pos=*/123456, /*candidate=*/1);
+    EXPECT_EQ(sink.last().toMember, 2);
+    adapter.onFragment(0, sink.last().bytes.data(), sink.last().bytes.size());
+    ASSERT_EQ(h.req, 1);
+    EXPECT_EQ(h.term, 9); EXPECT_EQ(h.llt, 7); EXPECT_EQ(h.pos, 123456); EXPECT_EQ(h.who, 1);
+    pub.preVoteResponse(/*to=*/1, /*term=*/9, /*voter=*/2, /*granted=*/true, /*voterTerm=*/11);
+    adapter.onFragment(0, sink.last().bytes.data(), sink.last().bytes.size());
+    ASSERT_EQ(h.resp, 1);
+    EXPECT_EQ(h.term, 9); EXPECT_EQ(h.who, 2); EXPECT_TRUE(h.granted); EXPECT_EQ(h.voterTerm, 11);
+    pub.preVoteResponse(1, 9, 2, false, 12);
+    adapter.onFragment(0, sink.last().bytes.data(), sink.last().bytes.size());
+    EXPECT_FALSE(h.granted);
+    pub.termFloorNotice(/*to=*/0, /*from=*/3, /*floor=*/12, /*refused=*/10);
+    adapter.onFragment(0, sink.last().bytes.data(), sink.last().bytes.size());
+    ASSERT_EQ(h.notice, 1);
+    EXPECT_EQ(h.who, 3); EXPECT_EQ(h.floor, 12); EXPECT_EQ(h.refused, 10);
+    adapter.onFragment(0, sink.last().bytes.data(), sink.last().bytes.size() - 1);   // truncated: ignored
+    EXPECT_EQ(h.notice, 1);
+}

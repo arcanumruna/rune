@@ -263,6 +263,21 @@ public:
     [[nodiscard]] Term votedTermId() const noexcept { return votedTermId_; }
     /// D24: the durable follow floor (see followFloorTermId_).
     [[nodiscard]] Term followFloorTermId() const noexcept { return followFloorTermId_; }
+    /// D29 PreVote (templates 60 / 61): a would-be candidate's non-binding ballot.
+    void onPreVoteRequest(int64_t nowNs, Term term, Term logLeadershipTermId, int64_t logPosition,
+                          NodeId candidateId);
+    void onPreVoteResponse(Term term, NodeId voterId, bool granted, Term voterTermId = -1,
+                           int64_t nowNs = INT64_MIN);
+    /// D29/D24: a member refused our NewLeadershipTerm for `refusedTermId` because its
+    /// follow floor `floorTermId` is above it — the leader steps down (template 62).
+    void onTermFloorNotice(int64_t nowNs, NodeId fromMember, Term floorTermId, Term refusedTermId);
+    [[nodiscard]] bool     preBallotActiveForTest() const noexcept { return preBallot_.active; }
+    [[nodiscard]] Term     preBallotTermForTest() const noexcept { return preBallot_.term; }
+    [[nodiscard]] uint64_t preBallotsLostForTest() const noexcept { return preBallotsLost_; }
+    [[nodiscard]] uint64_t preVotesGrantedForTest() const noexcept { return preVotesGranted_; }
+    [[nodiscard]] uint64_t preVotesDeniedForTest() const noexcept { return preVotesDenied_; }
+    [[nodiscard]] uint64_t termFloorStepDownsForTest() const noexcept { return termFloorStepDowns_; }
+    [[nodiscard]] uint64_t preBallotTermCatchUpsForTest() const noexcept { return preBallotTermCatchUps_; }
 
 
     /// Re-review round 3 CRITICAL-R3 — knowledge exchange.  `src(ctx, out)`
@@ -390,6 +405,9 @@ private:
         RUNE_ELECTION_PUB_FWD(appendPosition)
         RUNE_ELECTION_PUB_FWD(commitPosition)
         RUNE_ELECTION_PUB_FWD(standDown)
+        RUNE_ELECTION_PUB_FWD(preVoteRequest)
+        RUNE_ELECTION_PUB_FWD(preVoteResponse)
+        RUNE_ELECTION_PUB_FWD(termFloorNotice)
 #undef RUNE_ELECTION_PUB_FWD
     };
     static_assert(std::is_final_v<SbeConsensusPublisher>);
@@ -472,6 +490,26 @@ private:
     Term followFloorTermId_   = -1;
     /// Raises the follow floor and the candidate term to `term`, durably (one sync).
     void raiseFollowFloor_(Term term);
+    // D29 PreVote state (a sub-phase of NOMINATE; Aeron's state ordinals unchanged).
+    struct PreBallot {
+        bool     active     = false;
+        Term     term       = -1;
+        int64_t  deadlineNs = 0;
+        uint32_t grantedMask = 0;   ///< bit i = clusterMembers_[i] granted
+        bool     denied      = false;   ///< an explicit denial at our term: the real ballot would fail
+    };
+    PreBallot preBallot_{};
+    NodeId    leaderHeardId_ = -1;          ///< the last member whose NLT / CommitPosition we heard
+    int64_t   leaderHeardNs_ = 0;
+    uint64_t  preBallotsStarted_ = 0, preBallotsLost_ = 0, preVotesGranted_ = 0, preVotesDenied_ = 0;
+    uint64_t  termFloorStepDowns_ = 0, preBallotTermCatchUps_ = 0;
+    [[nodiscard]] uint32_t selfBit_() const noexcept;
+    void noteLeaderHeard_(NodeId leaderId, Term term, int64_t nowNs) noexcept;
+    [[nodiscard]] bool leaderLeaseLive_(int64_t nowNs, NodeId candidateId) const noexcept;
+    void startPreBallot_(int64_t nowNs);
+    void sendPreVoteRequests_();
+    void markPreVote_(NodeId voterId) noexcept;
+    [[nodiscard]] bool preBallotWon_() const noexcept;
 
     // Election config — Election.java:80
     bool isNodeStartup_     = false;

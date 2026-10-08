@@ -77,6 +77,10 @@ public:
 
     void onCandidacyState(int64_t nowNs, NodeId fromMember,
                           const CandidacyState& state) override;
+    void onPreVoteRequest(int64_t nowNs, Term term, Term logLeadershipTermId, int64_t logPosition,
+                          NodeId candidateId) override;
+    void onPreVoteResponse(int64_t nowNs, Term term, NodeId voterId, bool granted, Term voterTermId) override;
+    void onTermFloorNotice(int64_t nowNs, NodeId fromMember, Term floorTermId, Term refusedTermId) override;
 
     void onCanvassPosition(
         int64_t nowNs,
