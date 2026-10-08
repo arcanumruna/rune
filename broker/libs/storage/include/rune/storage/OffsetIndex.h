@@ -26,6 +26,10 @@ public:
     /// .index.tmp → .index and reopens from the canonical path).
     void rebuildEntries();
     int entries() const noexcept { return entries_; }
+    /// D28: map every page writable now (off the owner's append path).
+    void prefault() noexcept { file_->prefaultWrite(); }
+    [[nodiscard]] const uint8_t* dataForTest() const noexcept { return file_->data(); }
+    [[nodiscard]] size_t mappedBytesForTest() const noexcept { return file_->size(); }
     int64_t baseOffset() const noexcept { return baseOffset_; }
     /// Rebase an EMPTY index (used when adopting a staging segment: the index was
     /// built at a provisional base 0 with zero entries; adopting the segment at

@@ -39,14 +39,7 @@ MappedFile::MappedFile(std::string path, size_t initialBytes, bool writable, boo
         throw std::runtime_error("ftruncate failed: " + path_);  // fdGuard closes fd_
     mapNow();                                                    // fdGuard closes fd_ on throw
     fdGuard.dismissed = true;   // success: everything past this point is non-throwing
-    if (prefault && writable_ && data_) {
-        // Touch one byte per page so the pages are resident + zero-filled before
-        // the first write.  Moves the cold fault cost off the append/roll path.
-        const size_t page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
-        for (size_t off = 0; off < size_; off += page) {
-            data_[off] = data_[off];
-        }
-    }
+    if (prefault && writable_ && data_) prefaultWrite();
     if (!writable_) {
         // F3: a read-only mapping never needs its fd again — mmap(MAP_SHARED)
         // keeps the page-cache binding alive via the mapping itself, and a
@@ -65,6 +58,18 @@ MappedFile::MappedFile(BorrowedFd borrowedFd, std::string path, size_t initialBy
     fd_ = borrowedFd_;     // mapNow() maps fd_
     try { mapNow(); } catch (...) { fd_ = -1; throw; }
     fd_ = -1;              // never owned: the destructor must not close it
+}
+void MappedFile::prefaultWrite() noexcept {
+    if (!writable_ || data_ == nullptr) return;
+    // Touch one byte per page (write: the PTE is mapped writable, so the first
+    // real write never takes a fault — not even a write-protect one) to move
+    // the cold fault cost off the append/roll path.  D28: through VOLATILE
+    // accesses — the old `data_[off] = data_[off]` is a no-op self-assignment
+    // the optimizer deleted, so every Release build shipped with no prefault
+    // (the worker faulted its OffsetIndex::append writes on mmap_lock).
+    const size_t page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    volatile uint8_t* const v = data_;
+    for (size_t off = 0; off < size_; off += page) v[off] = v[off];
 }
 void MappedFile::mapNow() {
     int prot = writable_ ? (PROT_READ|PROT_WRITE) : PROT_READ;

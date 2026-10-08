@@ -1255,6 +1255,11 @@ int64_t Log::recover() {
     // persisted checkpoint is never loaded via ensureCheckpoint().
     // CP-5.1: recoveryMaxTimestamps_ is consumed (and cleared) by this call.
     publishSealedSnapshot();
+    // D28: recovery reopened the active segment's index un-prefaulted; map it
+    // writable here (startup, before the owner runs) so the owner's appends
+    // into its tail never fault on mmap_lock.  Sealed indexes are read-only
+    // from here on (and rebuildEntries already touched their entries).
+    activeSegment().prefaultIndex();
     return next;
 }
 

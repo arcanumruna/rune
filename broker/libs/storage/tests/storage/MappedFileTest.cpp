@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <atomic>
 #include <chrono>
+#include <fcntl.h>
 #include <unistd.h>
 using rune::storage::MappedFile;
 
@@ -296,4 +297,84 @@ TEST(MappedFile, SyncPersistsBeforeReopen) {
             EXPECT_EQ(mf.data()[i], static_cast<uint8_t>(i)) << "at index " << i;
     }
     std::filesystem::remove(p);
+}
+
+// D28 (box perf capture 2026-10-08): the prefault loop `data_[off] = data_[off]`
+// is a no-op self-assignment the optimizer DELETED — in every Release build the
+// provisioner's "prefaulted" index was never touched, and the worker's first
+// OffsetIndex::append into each page took a page fault (mmap_lock, queued
+// behind the provisioner / cleaner mmap+munmap).  Probed with /proc/self/pagemap
+// (bit 63 = the page is mapped in this process) — exact, unlike fault counts
+// (large folios map several pages per fault).  Must hold in Release.
+namespace {
+#ifdef __linux__
+size_t mappedPages(const uint8_t* base, size_t pages, size_t page) {
+    const int fd = ::open("/proc/self/pagemap", O_RDONLY);
+    if (fd < 0) return SIZE_MAX;
+    size_t n = 0;
+    for (size_t i = 0; i < pages; ++i) {
+        uint64_t e = 0;
+        const off_t at = static_cast<off_t>((reinterpret_cast<uintptr_t>(base) / page + i) * sizeof e);
+        if (::pread(fd, &e, sizeof e, at) == static_cast<ssize_t>(sizeof e) && (e >> 63) != 0) ++n;
+    }
+    ::close(fd);
+    return n;
+}
+#endif
+}
+TEST(MappedFileRegression, PrefaultMapsEveryPageEvenOptimizedRegression) {
+#ifndef __linux__
+    GTEST_SKIP() << "needs /proc/self/pagemap";
+#else
+    const size_t page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    const size_t pages = 64;
+    {   // control: without a prefault nothing is mapped (the probe is sensitive)
+        const auto ctl = makeTempPath("rune_mf_prefault_ctl");
+        MappedFile f(ctl.string(), pages * page, /*writable*/true, /*prefault*/false);
+        const size_t n = mappedPages(f.data(), pages, page);
+        if (n == SIZE_MAX) GTEST_SKIP() << "/proc/self/pagemap unreadable";
+        EXPECT_LT(n, pages) << "probe insensitive: an untouched mapping reads as mapped";
+        std::filesystem::remove(ctl);
+    }
+    const auto path = makeTempPath("rune_mf_prefault");
+    {   // fresh file: write-prefaulted
+        MappedFile f(path.string(), pages * page, /*writable*/true, /*prefault*/true);
+        EXPECT_EQ(mappedPages(f.data(), pages, page), pages) << "a prefaulted fresh mapping left pages unmapped";
+        for (size_t i = 0; i < pages; ++i) f.data()[i * page + 8] = static_cast<uint8_t>(i + 1);
+    }
+    {   // reopened existing file: prefaulted again
+        MappedFile f(path.string(), pages * page, /*writable*/true, /*prefault*/true);
+        EXPECT_EQ(mappedPages(f.data(), pages, page), pages) << "a prefaulted reopened mapping left pages unmapped";
+        unsigned sum = 0;
+        for (size_t i = 0; i < pages; ++i) sum += f.data()[i * page + 8];
+        EXPECT_EQ(sum, pages * (pages + 1) / 2);
+    }
+    std::filesystem::remove(path);
+#endif
+}
+
+// D28: the recovered ACTIVE segment's index is mapped before the owner appends.
+TEST(MappedFileRegression, RecoveredActiveSegmentIndexIsPrefaultedRegression) {
+#ifndef __linux__
+    GTEST_SKIP() << "needs /proc/self/pagemap";
+#else
+    const auto dir = makeTempPath("rune_mf_recovered_active");
+    std::filesystem::create_directories(dir);
+    {
+        rune::storage::Log log(dir.string(), 64 * 1024 * 1024);
+        rune::protocol::RecordBatchBuilder b(0, 1000);
+        b.append("k", "v", 1000);
+        log.append(b.build(), 0);
+        log.sync();
+    }
+    rune::storage::Log log(dir.string(), 64 * 1024 * 1024);
+    (void)log.recover();
+    const auto* idx = log.activeIndexForTest();
+    ASSERT_NE(idx, nullptr);
+    const size_t page = static_cast<size_t>(::sysconf(_SC_PAGESIZE));
+    const size_t pages = idx->mappedBytesForTest() / page;
+    ASSERT_GT(pages, 0u);
+    EXPECT_EQ(mappedPages(idx->dataForTest(), pages, page), pages) << "the recovered active index is not prefaulted";
+    std::filesystem::remove_all(dir);
+#endif
 }

@@ -26,6 +26,7 @@
 #include <rune/storage/Log.h>
 
 #include <gtest/gtest.h>
+#include <execinfo.h>
 
 #include <chrono>
 #include <filesystem>
@@ -87,7 +88,21 @@ void operator delete(void* p) noexcept {
     std::free(p);
 }
 void operator delete(void* p, std::size_t) noexcept { ::operator delete(p); }
+// D28b: heap allocations made by THIS thread while armed (the worker's duty
+// pass); the first few print a backtrace so the culprit is named.
+thread_local bool     gAllocArmed = false;
+thread_local uint64_t gArmedAllocs = 0;
 void* operator new(std::size_t n) {
+    if (gAllocArmed) [[unlikely]] {
+        if (++gArmedAllocs <= 3) {
+            gAllocArmed = false;   // backtrace itself may allocate
+            void* frames[32];
+            const int k = ::backtrace(frames, 32);
+            std::fprintf(stderr, "D28b hot-path allocation of %zu bytes:\n", n);
+            ::backtrace_symbols_fd(frames, k, 2);
+            gAllocArmed = true;
+        }
+    }
     if (void* p = std::malloc(n ? n : 1)) return p;
     throw std::bad_alloc();
 }
@@ -1604,4 +1619,34 @@ TEST(HotPathBRegression, FollowerPushNeverFaultsThroughTheReadMapRegression) {
     EXPECT_EQ(rig.log->readViewCallsForTest(), viewsBefore)
         << "a leader push read through the segment read mmap (page faults on the worker, mmap_lock)";
     EXPECT_EQ(rig.rep->readMapFallbacksForTest(), 0u);
+}
+
+// D28b (box perf capture 2026-10-08: 29 worker brk waits on mmap_lock): a
+// steady-state duty pass — produce intake, leader push to an in-sync follower,
+// follower fetches — never allocates on the worker (heap growth = brk / mmap =
+// mmap_lock, and allocator latency, on the hot path).
+TEST(HotPathBRegression, SteadyStateDutyPassesNeverAllocateRegression) {
+    Rig rig(false, 64 * 1024 * 1024, nullptr, false, /*withFollower=*/true);
+    const auto frame = produceFrame(1, 1, 0, 1000, 4);
+    auto armedPass = [&](bool produce) {
+        rig.now += 1'000'000;
+        gAllocArmed = true;
+        if (produce) (void)rig.worker().handleIngressFrameForTest(frame.data(), frame.size(), rig.now);
+        (void)rig.worker().doWork(rig.now);
+        gAllocArmed = false;
+    };
+    // Warm-up: every container reaches its steady size.
+    for (int i = 0; i < 64; ++i) rig.pass(&frame);
+    for (int i = 0; i < 256; ++i) {
+        rig.fetch(rig.log->logEndOffset());
+        rig.pass(&frame);
+        rig.pool.drainAllReturns([](WorkerReturn) {});
+    }
+    gArmedAllocs = 0;
+    for (int i = 0; i < 512; ++i) {
+        if ((i & 3) == 0) rig.fetch(rig.log->logEndOffset());   // enqueue: test side, disarmed
+        armedPass(true);
+        rig.pool.drainAllReturns([](WorkerReturn) {});
+    }
+    EXPECT_EQ(gArmedAllocs, 0u) << "the worker's steady-state duty pass allocated (see the D28b backtraces above)";
 }

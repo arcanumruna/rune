@@ -957,6 +957,10 @@ private:
     /// nothing and keeps spdlog out of this header).
     LogSegment& activeSegment();
     void maybeRoll();
+public:
+    /// D28 test seam: the active segment's offset index.
+    [[nodiscard]] const OffsetIndex* activeIndexForTest() { return activeSegment().indexForTest(); }
+private:
 
     /// Rebuild and atomically publish a new sealed-segment snapshot.
     /// MUST be called on the single-writer append thread whenever segments_ changes:

@@ -228,6 +228,10 @@ public:
     int64_t baseOffset() const noexcept { return baseOffset_; }
     int64_t sizeBytes() const noexcept { return logSize_; }
     int64_t nextOffset() const noexcept { return nextOffset_; }
+    /// D28: map the .index writable now (recovery thread) — the owner's
+    /// appends into a recovered ACTIVE segment never fault its index pages.
+    void prefaultIndex() noexcept { if (index_) index_->prefault(); }
+    [[nodiscard]] const OffsetIndex* indexForTest() const noexcept { return index_.get(); }
     std::string logPath() const { return logPath_; }
     /// Return the POSIX fd of the open .log file (the same fd used by fdatasync
     /// in sync()).  Valid for the ACTIVE segment only; -1 if not yet opened.
