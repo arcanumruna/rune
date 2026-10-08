@@ -29,9 +29,13 @@ services:
       dockerfile: docker/Dockerfile
       additional_contexts:
         # relative to this compose file's dir (docker/):
-        #   ../../rune-protocol-0b = the 0b protocol worktree (has SchemaMessages.h)
-        rune-protocol: ../../rune-protocol-0b
-        # rune-fr flight recorder: compiled sibling lib (src/ + include/)
+        #   ../../rune-protocol = the sibling worktree (has SchemaMessages.h on
+        #   this branch; the old "-0b" suffix was a prior epoch's naming and no
+        #   longer matches the schema-evolution worktree set).
+        rune-protocol: ../../rune-protocol
+        # rune-fr flight recorder: compiled sibling lib (src/ + include/).  Not
+        # part of this feature, so it is NOT worktreed under se-worktrees/ —
+        # ../../rune-fr resolves via a local symlink to the canonical checkout.
         rune-fr: ../../rune-fr
         # rune-codec (0a): compiled sibling lib (src/ + include/) linked into rune_node
         rune-codec: ../../rune-codec
