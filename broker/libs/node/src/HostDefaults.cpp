@@ -263,6 +263,11 @@ HostDerivation applyHostDerivedDefaults(NodeConfig& cfg, const HostNetFacts& fac
     if (!cfg.driverIdleArgs.empty() && !NodeConfig::driverIdleTakesArgs(cfg.effectiveDriverIdleStrategy()))
         appendWarn(out.warnings, "RUNE_AERON_DRIVER_IDLE_ARGS=" + cfg.driverIdleArgs + " is ignored: Aeron's '" +
                                  std::string(cfg.effectiveDriverIdleStrategy()) + "' idle strategy takes no args");
+    // A7 review L7: a parked worker takes fd-less work (ring hops, Aeron timers) up to the park cap late.
+    if (cfg.idleMaxParkUs > 10'000)
+        appendWarn(out.warnings, "RUNE_IDLE_MAX_PARK_US=" + std::to_string(cfg.idleMaxParkUs) +
+                                 " us: a parked worker takes fd-less work (cross-thread ring hops, Aeron NAK / "
+                                 "status / heartbeat timers) up to that late");
     // Fused placement: the runtime and the node driver ride worker 0's pass, so the knob still caps them (review Md-2).
     if (cfg.shardMode() && !cfg.fused() && cfg.idleMaxParkUsExplicit)
         appendWarn(out.warnings, "RUNE_IDLE_MAX_PARK_US=" + std::to_string(cfg.idleMaxParkUs) +

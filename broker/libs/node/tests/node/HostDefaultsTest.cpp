@@ -1060,3 +1060,13 @@ TEST(NodeConfigEnv, IdleMaxParkUsMarksExplicitRegression) {
     ASSERT_TRUE(d.config.has_value()) << d.error;
     EXPECT_FALSE(d.config->idleMaxParkUsExplicit);
 }
+
+// A7 review L7: a park cap above 10 ms is accepted (<= 1 s, NodeConfig) but named at startup — a parked
+// worker takes fd-less work that late.
+TEST(HostDefaults, LongIdleMaxParkWarnsAtStartup) {
+    NodeConfig c = threeNodeDefault(0);
+    c.idleMaxParkUs = 20'000;
+    EXPECT_NE(applyHostDerivedDefaults(c, k3sFacts()).warnings.find("up to that late"), std::string::npos);
+    NodeConfig d = threeNodeDefault(0);   // the 200 us default: silent
+    EXPECT_EQ(applyHostDerivedDefaults(d, k3sFacts()).warnings.find("up to that late"), std::string::npos);
+}
