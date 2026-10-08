@@ -96,6 +96,15 @@ struct TopicSchemaResult {
 };
 
 // ---------------------------------------------------------------------------
+// Schema DDL result type (Task 18: Client::alterTopic / alterTopicAndWait)
+// ---------------------------------------------------------------------------
+struct AlterTopicResult {
+    int32_t  topicId    = -1;
+    uint16_t newVersion = 0;
+    uint16_t errorCode  = 0;
+};
+
+// ---------------------------------------------------------------------------
 // IdleMode — controls the runner-thread idle strategy.
 //
 // LowLatency: YieldingIdleStrategy — on each idle cycle the runner calls
@@ -496,6 +505,16 @@ public:
                          bool validate, std::span<const uint8_t> descriptorBlob,
                          CompletionTarget target, Token token);
     OpResult getTopicSchema(std::string_view name, CompletionTarget target, Token token);
+    /// As above, selecting a specific schema fingerprint (0 = latest; same as
+    /// the 3-arg overload).  Task 18.
+    OpResult getTopicSchema(std::string_view name, uint64_t requestedFingerprint,
+                            CompletionTarget target, Token token);
+    /// Task 18: propose an AlterTopic (expectedVersion is the optimistic-
+    /// concurrency gate — stale -> SchemaConflict; incompatible ops ->
+    /// SchemaIncompatible).  Completion: value = topicId, aux = newVersion; a
+    /// broker errorCode in the response -> BrokerError (errorCode, value/aux kept).
+    OpResult alterTopic(std::string_view name, uint16_t expectedVersion,
+                        std::span<const uint8_t> opsBlob, CompletionTarget target, Token token);
     OpResult listTopics(CompletionTarget target, Token token);
 
     /// Decoded ListTopics payload: (name, topicId) in definition order.
@@ -522,6 +541,14 @@ public:
     /// A broker errorCode (e.g. UnknownTopic) is returned in the result.
     TopicSchemaResult getTopicSchemaAndWait(std::string_view name,
                                             std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+    /// As above, selecting a specific schema fingerprint (0 = latest).  Task 18.
+    TopicSchemaResult getTopicSchemaAndWait(std::string_view name, uint64_t requestedFingerprint,
+                                            std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+    /// Task 18: alterTopic(), blocking.  A broker errorCode (e.g.
+    /// SchemaIncompatible / SchemaConflict) is returned in the result (not thrown).
+    AlterTopicResult alterTopicAndWait(std::string_view name, uint16_t expectedVersion,
+                                       std::span<const uint8_t> opsBlob,
+                                       std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
 
     /// Topics successfully defined through this Client (Task 9 CLI), in
     /// definition order.  Duty-owned registry, read through a ListTopics op.

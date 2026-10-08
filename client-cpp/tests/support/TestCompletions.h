@@ -108,6 +108,18 @@ public:
         if (status() == rune::client::OpStatus::Ok) r.descriptorBlob = outcome().payload;
         return r;
     }
+    /// AlterTopic: as defineResult(), with (topicId, newVersion, errorCode).
+    [[nodiscard]] rune::client::AlterTopicResult alterResult() const {
+        if (!ready() || (status() != rune::client::OpStatus::Ok &&
+                         status() != rune::client::OpStatus::BrokerError)) {
+            throw std::runtime_error("alterTopic did not complete: " + describe());
+        }
+        rune::client::AlterTopicResult r;
+        r.topicId    = static_cast<int32_t>(outcome().c.value);
+        r.newVersion = static_cast<uint16_t>(outcome().c.aux);
+        r.errorCode  = outcome().c.errorCode;
+        return r;
+    }
 
 private:
     TestCq*                  cq_ = nullptr;

@@ -1094,15 +1094,37 @@ OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::st
 }
 
 OpResult Client::getTopicSchema(std::string_view name, CompletionTarget target, Token token) {
+    return getTopicSchema(name, /*requestedFingerprint=*/0, target, token);
+}
+
+OpResult Client::getTopicSchema(std::string_view name, uint64_t requestedFingerprint,
+                                CompletionTarget target, Token token) {
     namespace rpc = rune::protocol::client;
     rpc::GetTopicSchema msg;
-    msg.sessionId     = 0;
-    msg.correlationId = 0;
-    msg.topicName     = name;
+    msg.sessionId             = 0;
+    msg.correlationId         = 0;
+    msg.topicName             = name;
+    msg.requestedFingerprint  = requestedFingerprint;
     std::vector<uint8_t> frame(msg.encodedSize() + 32u);
     const std::size_t n = msg.encode(frame.data());
     if (n == 0) return OpResult::InvalidArgument;
     return issueControl_(OpKind::GetTopicSchema, target, token, std::span<const uint8_t>(frame.data(), n), 0);
+}
+
+OpResult Client::alterTopic(std::string_view name, uint16_t expectedVersion,
+                            std::span<const uint8_t> opsBlob, CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::AlterTopic msg;
+    msg.sessionId       = 0;
+    msg.correlationId   = 0;
+    msg.topicName       = name;
+    msg.expectedVersion = expectedVersion;
+    msg.opsBlob         = opsBlob.data();
+    msg.opsLen          = static_cast<uint32_t>(opsBlob.size());
+    std::vector<uint8_t> frame(msg.encodedSize() + 32u);
+    const std::size_t n = msg.encode(frame.data());
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueControl_(OpKind::AlterTopic, target, token, std::span<const uint8_t>(frame.data(), n), 0);
 }
 
 OpResult Client::listTopics(CompletionTarget target, Token token) {
@@ -1440,15 +1462,35 @@ DefineTopicResult Client::defineTopicAndWait(std::string_view name, uint32_t par
 }
 
 TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, std::chrono::nanoseconds timeout) {
+    return getTopicSchemaAndWait(name, /*requestedFingerprint=*/0, timeout);
+}
+
+TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, uint64_t requestedFingerprint,
+                                                std::chrono::nanoseconds timeout) {
     TopicSchemaResult result;
     andWait_("getTopicSchema()", timeout, 64u << 10,
-             [&](Completions& q, Token t) { return getTopicSchema(name, q, t); },
+             [&](Completions& q, Token t) { return getTopicSchema(name, requestedFingerprint, q, t); },
              [&](const Completion& c, std::span<const uint8_t> p) {
                  if (c.status != OpStatus::BrokerError) throwForStatus_("getTopicSchema()", c, p);
                  result.topicId   = static_cast<int32_t>(c.value);
                  result.version   = static_cast<uint16_t>(c.aux);
                  result.errorCode = c.errorCode;
                  if (c.status == OpStatus::Ok) result.descriptorBlob.assign(p.begin(), p.end());
+             });
+    return result;
+}
+
+AlterTopicResult Client::alterTopicAndWait(std::string_view name, uint16_t expectedVersion,
+                                           std::span<const uint8_t> opsBlob,
+                                           std::chrono::nanoseconds timeout) {
+    AlterTopicResult result;
+    andWait_("alterTopic()", timeout, 0,
+             [&](Completions& q, Token t) { return alterTopic(name, expectedVersion, opsBlob, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError) throwForStatus_("alterTopic()", c, p);
+                 result.topicId    = static_cast<int32_t>(c.value);
+                 result.newVersion = static_cast<uint16_t>(c.aux);
+                 result.errorCode  = c.errorCode;
              });
     return result;
 }
@@ -2526,6 +2568,21 @@ void Client::onEgressFrame(codec::TemplateId tid,
             completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
                          opt->topicId, opt->version, opt->errorCode, blob,
                          detail::CompletionRing::Overflow::TooLarge);
+        }
+        break;
+    }
+
+    // ---- Task 18: AlterTopicResponse (69) ----
+    case codec::TemplateId::AlterTopicResponse: {
+        namespace rpc = rune::protocol::client;
+        auto opt = rpc::AlterTopicResponse::decode(buf, len);
+        if (!opt) break;
+
+        if (const std::size_t i = findCtl_(opt->correlationId);
+            i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::AlterTopic) {
+            PendingCtl p = takeCtl_(i);
+            completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
+                         opt->topicId, opt->newVersion, opt->errorCode);
         }
         break;
     }

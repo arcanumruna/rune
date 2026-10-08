@@ -35,6 +35,7 @@ enum class OpKind : uint8_t {
     ProducerClose,  ///< producer begin-close (C6a: Producer::close(target, token))
     TxnClose,       ///< C7: TransactionalProducer::close(target, token)
     ClientDrain,    ///< C7: Client::close()'s producer drain (internal)
+    AlterTopic,     ///< Task 18: Client::alterTopic() / alterTopicAndWait()
 };
 
 enum class OpStatus : uint8_t {
@@ -56,8 +57,8 @@ enum class OpStatus : uint8_t {
 struct Completion {
     Token    token = 0;          ///< as passed at issue
     int64_t  value = 0;          ///< Send/Tier2: baseOffset (-1 if none); Connect: sessionId;
-                                 ///< DefineTopic/GetTopicSchema: topicId; ResultTooLarge: real size
-    int64_t  aux   = 0;          ///< GetTopicSchema/DefineTopic: version; Tier2: recordCount
+                                 ///< DefineTopic/GetTopicSchema/AlterTopic: topicId; ResultTooLarge: real size
+    int64_t  aux   = 0;          ///< GetTopicSchema/DefineTopic: version; AlterTopic: newVersion; Tier2: recordCount
     OpKind   op{};
     OpStatus status = OpStatus::Ok;
     uint16_t errorCode = 0;      ///< broker ErrorCode when status == BrokerError

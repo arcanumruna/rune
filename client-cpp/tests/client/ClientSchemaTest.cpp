@@ -129,6 +129,7 @@ struct SchemaTestGateway {
     bool replyConnectOK      = true;   // respond to Connect with OK
     bool replyDefineTopic    = true;   // respond to DefineTopic
     bool replyGetTopicSchema = true;   // respond to GetTopicSchema
+    bool replyAlterTopic     = true;   // respond to AlterTopic
 
     // Canned DefineTopic response fields (applied to every response).
     int32_t  defineTopicId   = 0x40000001;
@@ -140,6 +141,18 @@ struct SchemaTestGateway {
     uint16_t             getVersion   = 1;
     uint16_t             getErrorCode = 0;
     std::vector<uint8_t> getBlob      = {0xDE, 0xAD, 0xBE, 0xEF};
+    // Task 18: last requestedFingerprint seen on a GetTopicSchema request (so
+    // tests can assert the frame carried it).
+    std::atomic<uint64_t> lastRequestedFingerprint{0};
+
+    // Canned AlterTopic response fields.
+    int32_t  alterTopicId    = 0x40000001;
+    uint16_t alterNewVersion = 2;
+    uint16_t alterErrorCode  = 0;  // 0 == OK
+    // Task 18: last AlterTopic request seen (so tests can assert the frame's
+    // expectedVersion / opsBlob were encoded correctly).
+    std::atomic<uint16_t> lastAlterExpectedVersion{0};
+    std::vector<uint8_t>  lastAlterOpsBlob;
 
     // Per-op response overrides (set before the call).
     // If non-negative, override canned response per-correlationId.
@@ -158,6 +171,7 @@ struct SchemaTestGateway {
     std::atomic<int> definesSeen{0};
     std::atomic<int> getsSeen{0};
     std::atomic<int> connectsSeen{0};
+    std::atomic<int> altersSeen{0};
 
     uint8_t replyBuf[4096]{};
 
@@ -277,6 +291,7 @@ struct SchemaTestGateway {
             auto opt = rpc::GetTopicSchema::decode(buf, len);
             if (!opt) return;
             getsSeen.fetch_add(1, std::memory_order_relaxed);
+            lastRequestedFingerprint.store(opt->requestedFingerprint, std::memory_order_relaxed);
             if (!replyGetTopicSchema) break;
 
             // Encode TopicSchemaResponse.
@@ -303,6 +318,27 @@ struct SchemaTestGateway {
             std::vector<uint8_t> scratch(resp.encodedSize() + 32u);
             const std::size_t n = resp.encode(scratch.data());
             if (n > 0) send(scratch.data(), n);
+            break;
+        }
+
+        case rcc::TemplateId::AlterTopic: {
+            auto opt = rpc::AlterTopic::decode(buf, len);
+            if (!opt) return;
+            altersSeen.fetch_add(1, std::memory_order_relaxed);
+            lastAlterExpectedVersion.store(opt->expectedVersion, std::memory_order_relaxed);
+            lastAlterOpsBlob.assign(opt->opsBlob, opt->opsBlob + opt->opsLen);
+            if (!replyAlterTopic) break;
+
+            // Encode AlterTopicResponse.
+            rpc::AlterTopicResponse resp;
+            resp.sessionId     = opt->sessionId;
+            resp.correlationId = opt->correlationId;
+            resp.topicId       = alterTopicId;
+            resp.newVersion    = alterNewVersion;
+            resp.errorCode     = alterErrorCode;
+
+            const std::size_t n = resp.encode(replyBuf);
+            if (n > 0) send(replyBuf, n);
             break;
         }
 
@@ -337,6 +373,19 @@ struct SchemaHarness {
     }
     test_support::PendingOp getTopicSchemaOp(std::string_view name) {
         return cq->issue([&](Completions& q, Token t) { return client->getTopicSchema(name, q, t); });
+    }
+    /// Task 18: select a specific schema fingerprint (0 = latest).
+    test_support::PendingOp getTopicSchemaOp(std::string_view name, uint64_t requestedFingerprint) {
+        return cq->issue([&](Completions& q, Token t) {
+            return client->getTopicSchema(name, requestedFingerprint, q, t);
+        });
+    }
+    /// Task 18.
+    test_support::PendingOp alterTopicOp(std::string_view name, uint16_t expectedVersion,
+                                        std::span<const uint8_t> opsBlob) {
+        return cq->issue([&](Completions& q, Token t) {
+            return client->alterTopic(name, expectedVersion, opsBlob, q, t);
+        });
     }
 
     int64_t connectTimeoutMs = 5000;
@@ -715,4 +764,114 @@ TEST(ClientSchema, MultipleSchemaOpsInflight) {
 
     EXPECT_EQ(h.gw->definesSeen.load(), 2) << "gateway should have seen 2 DefineTopic";
     EXPECT_EQ(h.gw->getsSeen.load(),    1) << "gateway should have seen 1 GetTopicSchema";
+}
+
+// ===========================================================================
+// Task 18: Client::alterTopic / alterTopicAndWait +
+//          getTopicSchemaAndWait(name, requestedFingerprint)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Test 11: AlterTopicFutureResolvesOnOK
+//
+// An AlterTopic frame is encoded (expectedVersion + opsBlob carried correctly)
+// and an injected AlterTopicResponse surfaces as AlterTopicResult{topicId,
+// newVersion, errorCode}.
+// ---------------------------------------------------------------------------
+TEST(ClientSchema, AlterTopicFutureResolvesOnOK) {
+    SchemaHarness h(1120, 1121);
+    h.build();
+    h.connectAndWait();
+
+    h.gw->alterTopicId    = 0x40000001;
+    h.gw->alterNewVersion = 2;
+    h.gw->alterErrorCode  = 0;
+
+    std::vector<uint8_t> opsBlob = {0xA1, 0xA2, 0xA3};
+    auto fut = h.alterTopicOp("characters", /*expectedVersion=*/1, std::span<const uint8_t>(opsBlob));
+
+    h.pumpGwUntil([&]() { return fut.ready(); });
+
+    ASSERT_TRUE(fut.waitReady()) << "alterTopic() future did not resolve";
+
+    AlterTopicResult r;
+    ASSERT_NO_THROW(r = fut.alterResult()) << "alterTopic() threw";
+    EXPECT_EQ(r.topicId,    0x40000001);
+    EXPECT_EQ(r.newVersion, 2u);
+    EXPECT_EQ(r.errorCode,  0u);
+
+    // The frame carried the right expectedVersion + opsBlob (not reinvented
+    // plumbing — the gateway decoded what the wire actually carried).
+    EXPECT_EQ(h.gw->altersSeen.load(), 1) << "gateway should have seen exactly one AlterTopic";
+    EXPECT_EQ(h.gw->lastAlterExpectedVersion.load(), 1u);
+    EXPECT_EQ(h.gw->lastAlterOpsBlob, opsBlob) << "opsBlob mismatch on the wire";
+}
+
+// ===========================================================================
+// Test 12: AlterTopicResponseErrorCodePropagates
+//
+// A stale expectedVersion -> SchemaConflict (broker errorCode 30).  The result
+// carries the errorCode without throwing (same contract as DefineTopic/
+// GetTopicSchema broker errors).
+// ===========================================================================
+TEST(ClientSchema, AlterTopicResponseErrorCodePropagates) {
+    SchemaHarness h(1122, 1123);
+    h.build();
+    h.connectAndWait();
+
+    h.gw->alterTopicId    = -1;
+    h.gw->alterNewVersion = 0;
+    h.gw->alterErrorCode  = static_cast<uint16_t>(rpc::ErrorCode::SchemaConflict);
+
+    std::vector<uint8_t> opsBlob = {0xFF};
+    auto fut = h.alterTopicOp("stale_topic", /*expectedVersion=*/7, std::span<const uint8_t>(opsBlob));
+
+    h.pumpGwUntil([&]() { return fut.ready(); });
+
+    ASSERT_TRUE(fut.waitReady())
+        << "alterTopic() future did not resolve with error code";
+
+    AlterTopicResult r;
+    ASSERT_NO_THROW(r = fut.alterResult())
+        << "alterTopic() with non-OK errorCode must NOT throw — errorCode is in the result";
+    EXPECT_EQ(r.errorCode, static_cast<uint16_t>(rpc::ErrorCode::SchemaConflict));
+    EXPECT_EQ(r.topicId, -1);
+}
+
+// ===========================================================================
+// Test 13 (regression): GetTopicSchemaAndWaitThreadsRequestedFingerprintRegression
+//
+// getTopicSchemaAndWait(name, fp) must send `fp` on the wire inside the
+// GetTopicSchema frame's requestedFingerprint field — not just carry it as a
+// dead local parameter.  fp == 0 keeps the "latest" semantics (the existing
+// 0-arg / 2-arg overloads never set it, so it already defaults to 0 on the
+// wire; this pins that explicitly passing 0 is indistinguishable from that
+// default).
+// ===========================================================================
+TEST(ClientSchema, GetTopicSchemaAndWaitThreadsRequestedFingerprintRegression) {
+    SchemaHarness h(1124, 1125);
+    h.build();
+    h.connectAndWait();
+
+    h.gw->getTopicId   = 0x40000001;
+    h.gw->getVersion   = 5;
+    h.gw->getErrorCode = 0;
+    h.gw->getBlob      = {0x01};
+
+    constexpr uint64_t kFingerprint = 0xDEADBEEFCAFEF00DULL;
+
+    auto fut = h.getTopicSchemaOp("characters", kFingerprint);
+    h.pumpGwUntil([&]() { return fut.ready(); });
+    ASSERT_TRUE(fut.waitReady()) << "getTopicSchemaAndWait(fp) future did not resolve";
+    ASSERT_NO_THROW(fut.schemaResult());
+    EXPECT_EQ(h.gw->lastRequestedFingerprint.load(), kFingerprint)
+        << "regression: requestedFingerprint was not threaded onto the GetTopicSchema frame";
+
+    // A second request with fp=0 must read as "latest" (unchanged default).
+    auto fut2 = h.getTopicSchemaOp("characters", /*requestedFingerprint=*/0u);
+    h.pumpGwUntil([&]() { return fut2.ready(); });
+    ASSERT_TRUE(fut2.waitReady()) << "getTopicSchemaAndWait(0) future did not resolve";
+    ASSERT_NO_THROW(fut2.schemaResult());
+    EXPECT_EQ(h.gw->lastRequestedFingerprint.load(), 0u)
+        << "regression: fp=0 must mean latest on the wire";
 }
