@@ -110,10 +110,15 @@ inline void replayWindowCommit(uint64_t& recvSeq, uint64_t& recvWindow,
 /// failure (tampered ciphertext OR tampered header — the header is part of
 /// the AAD). The window is committed ONLY after the tag verifies, so a
 /// forged seq can never poison it against a later legitimate frame.
-[[nodiscard]] inline std::size_t openProduceFrame(
+/// Lows batch C (D8c R3): open WITHOUT committing `seq` (`seqOut`) — for a
+/// frame the worker may HOLD (controlled-poll ABORT + redelivery: a deferred
+/// roll).  Commit it with commitProduceSeq once the frame is consumed: a
+/// committed-then-held frame would fail its own redelivery as a replay and be
+/// dropped.  The window check is read-only, so an uncommitted frame re-opens.
+[[nodiscard]] inline std::size_t openProduceFrameUncommitted(
     const RecordsOpenCtx& ctx,
     const uint8_t* wire, std::size_t wireLen,
-    uint8_t* scratch, std::size_t scratchCap) noexcept {
+    uint8_t* scratch, std::size_t scratchCap, uint64_t& seqOut) noexcept {
     namespace rpc = rune::protocol::client;
     if (!ctx.recv || !ctx.recvSeq || !ctx.recvWindow) return 0;  // no key yet — fail closed, never plaintext
 
@@ -140,10 +145,26 @@ inline void replayWindowCommit(uint64_t& recvSeq, uint64_t& recvWindow,
         scratch + rpc::MessageHeader::ENCODED_SIZE);
     if (plainLen < 0) return 0;  // auth failure — discard; window NOT updated
 
-    detail_open::replayWindowCommit(*ctx.recvSeq, *ctx.recvWindow, seq);
-
     std::memcpy(scratch, wire, rpc::MessageHeader::ENCODED_SIZE);  // clear header, unchanged
+    seqOut = seq;
     return rpc::MessageHeader::ENCODED_SIZE + static_cast<std::size_t>(plainLen);
+}
+
+/// Commit an opened frame's seq (openProduceFrameUncommitted) once it is consumed.
+inline void commitProduceSeq(const RecordsOpenCtx& ctx, uint64_t seq) noexcept {
+    detail_open::replayWindowCommit(*ctx.recvSeq, *ctx.recvWindow, seq);
+}
+
+/// Open and commit at once (a frame that is always consumed).  The window is
+/// committed ONLY after the tag verifies, so a forged seq can never poison it.
+[[nodiscard]] inline std::size_t openProduceFrame(
+    const RecordsOpenCtx& ctx,
+    const uint8_t* wire, std::size_t wireLen,
+    uint8_t* scratch, std::size_t scratchCap) noexcept {
+    uint64_t seq = 0;
+    const std::size_t n = openProduceFrameUncommitted(ctx, wire, wireLen, scratch, scratchCap, seq);
+    if (n != 0) commitProduceSeq(ctx, seq);
+    return n;
 }
 
 } // namespace rune::node

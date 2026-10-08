@@ -17,7 +17,9 @@
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerPool.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/crypto/Aead.h>
 #include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/CryptoEnvelope.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/replication/PartitionReplica.h>
@@ -31,6 +33,7 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <algorithm>
 #include <set>
 #include <unistd.h>
@@ -646,4 +649,87 @@ TEST(GatewayProduceCreditRegression, CapExpiryReaderMarksCoverTheLastScanWindowO
     EXPECT_EQ(r.gw.lastCapEvictedSessionForTest(), l1);
     EXPECT_EQ(r.gw.controlledPollFramesForTest(fn), 4u) << "its share is freed: the deferred session is served";
     EXPECT_EQ(r.gw.produceCreditUnderflowsForTest(), 0u);
+}
+
+namespace {
+// An encrypted gateway session: c2b key installed exactly as handleHandshakeContinue_ does; `client` seals as the
+// client would (same key + prefix, its own monotonic seq).
+struct EncryptedSession {
+    rune::crypto::AeadKey key{};
+    uint8_t prefix[4] = {1, 2, 3, 4};
+    std::optional<rune::crypto::AeadCipher> client;
+    uint64_t seq = 0;
+    void install(rune::gateway::CryptoState& c) {
+        for (std::size_t i = 0; i < sizeof(key.bytes); ++i) key.bytes[i] = static_cast<uint8_t>(i * 7 + 3);
+        c.encrypted = true;
+        c.cipher = rune::crypto::Cipher::Aes256Gcm;
+        c.recv.emplace(rune::crypto::Cipher::Aes256Gcm, key, prefix);
+        client.emplace(rune::crypto::Cipher::Aes256Gcm, key, prefix);
+    }
+    std::vector<uint8_t> seal(const std::vector<uint8_t>& plain) {
+        const uint64_t s = ++seq;
+        std::vector<uint8_t> out(plain.size() + pc::kCryptoOverhead);
+        std::memcpy(out.data(), plain.data(), pc::MessageHeader::ENCODED_SIZE);
+        pc::CryptoSubHeader sub;
+        sub.version = 1;
+        sub.seq = s;
+        sub.encode(out.data() + pc::MessageHeader::ENCODED_SIZE);
+        const std::size_t n = client->seal(s, out.data(), pc::kCryptoHeaderBytes,
+                                           plain.data() + pc::MessageHeader::ENCODED_SIZE,
+                                           plain.size() - pc::MessageHeader::ENCODED_SIZE,
+                                           out.data() + pc::kCryptoHeaderBytes);
+        out.resize(pc::kCryptoHeaderBytes + n);
+        return out;
+    }
+};
+} // namespace
+
+// Lows batch C (D8c R3, found with it): an ENCRYPTED Produce deferred by a full worker share was decrypted — its seq
+// committed to the session's anti-replay window — then ABORTed; its redelivery failed the replay check and was
+// silently DROPPED (consumed, never forwarded or answered).  The seq is now committed only when the frame is consumed.
+TEST(GatewayProduceCreditRegression, EncryptedProduceDeferredByAFullWorkerShareIsForwardedNotDroppedRegression) {
+    Rig r(/*withAcks=*/false);
+    r.gw.setWorkerRoutedCapForTest(4);
+    const int64_t h = r.gw.injectTestSession(r.now), e = r.gw.injectTestSession(r.now);
+    EncryptedSession es;
+    es.install(*r.gw.sessionCryptoForTest(e));
+    std::vector<std::vector<uint8_t>> fh;
+    for (int i = 0; i < 4; ++i) fh.push_back(produceFrame(h, i, 0));
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fh), 4u);                  // h fills the worker's share
+    const std::vector<std::vector<uint8_t>> fe{es.seal(produceFrame(e, 42, 0))};
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fe), 0u) << "deferred by the full share";
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fe), 0u) << "still deferred on redelivery";
+    r.gw.handleWorkerReturnForTest(creditSignal(h, 4));                   // the share frees
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(fe), 1u);
+    EXPECT_EQ(r.gw.produceInFlightForTest(e), 1) << "the redelivered encrypted produce was forwarded (not a replay)";
+    EXPECT_EQ(r.gw.routedInFlightForTest(0), 1u);
+    // A real replay of a CONSUMED frame is still refused (dropped, never forwarded twice).
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(fe), 1u);
+    EXPECT_EQ(r.gw.produceInFlightForTest(e), 1) << "a consumed seq is committed: its replay is dropped";
+}
+
+// Lows batch C (D8c R3): a cap-deferred Produce is redelivered every gateway duty cycle until the share frees.  Each
+// redelivery is now ABORTed by the session's deferral memo (one probe) — never decrypted / decoded / looked up again —
+// and still counts as a deferred poll of the episode (expiry pacing unchanged).
+TEST(GatewayProduceCreditRegression, CapDeferredProduceIsNotReDecodedOnRedeliveryRegression) {
+    Rig r(/*withAcks=*/false);
+    r.gw.setWorkerRoutedCapForTest(4);
+    const int64_t h = r.gw.injectTestSession(r.now), e = r.gw.injectTestSession(r.now);
+    std::vector<std::vector<uint8_t>> fh;
+    for (int i = 0; i < 4; ++i) fh.push_back(produceFrame(h, i, 0));
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fh), 4u);
+    const std::vector<std::vector<uint8_t>> fe{produceFrame(e, 1, 0)};
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fe), 0u);                  // the first deferral decodes it
+    for (int i = 0; i < 10; ++i) ASSERT_EQ(r.gw.controlledPollFramesForTest(fe), 0u);
+    EXPECT_EQ(r.gw.capDeferMemoAbortsForTest(), 10u) << "every redelivery is ABORTed before decode";
+    EXPECT_EQ(r.gw.workerCapProduceAbortsForTest(), 11u) << "each still counts as a deferred produce";
+    r.gw.handleWorkerReturnForTest(creditSignal(h, 1));
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(fe), 1u) << "served once the worker admits it";
+    EXPECT_EQ(r.gw.produceInFlightForTest(e), 1);
+    // The memo is gone with the deferral: the session's next frames take the fast path.
+    std::vector<std::vector<uint8_t>> more{produceFrame(h, 9, 0)};
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(more), 0u) << "the share is full again (h)";
+    r.gw.handleWorkerReturnForTest(creditSignal(h, 3));
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(more), 1u);
+    EXPECT_EQ(r.gw.capDeferMemoAbortsForTest(), 10u);
 }

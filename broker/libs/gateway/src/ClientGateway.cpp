@@ -910,6 +910,12 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
     // every encrypted candidate. The gateway never holds another node's
     // sessions at all — a single find() + single open() is correct here, no
     // multi-candidate AEAD-disambiguation loop is needed.
+    // Lows batch C (D8c R3): a Produce's seq is committed to the replay window
+    // only once the frame is CONSUMED — handleProduce may defer it (full worker
+    // share: ABORT + redelivery), and a committed seq would make the redelivery
+    // a "replay" that is silently dropped.  Every other frame is always consumed.
+    int64_t  produceOpenSid = 0;
+    uint64_t produceOpenSeq = 0;
     if (const auto hdrOpt = pc::MessageHeader::decode(buf, len)) {
         const auto peekedTid = static_cast<pc::TemplateId>(hdrOpt->templateId);
         if (peekedTid != pc::TemplateId::Connect &&
@@ -927,9 +933,12 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
                         return true;  // scratch exhausted — drop, never crash
                     }
                 }
-                const std::size_t plainLen = rune::gateway::codec::openIngressFrame(
-                    s->crypto, buf, len, decryptScratch_.data(), decryptScratch_.size());
+                uint64_t seq = 0;
+                const std::size_t plainLen = rune::gateway::codec::openIngressFrameUncommitted(
+                    s->crypto, buf, len, decryptScratch_.data(), decryptScratch_.size(), seq);
                 if (plainLen == 0) return true;  // tamper/replay/truncation — drop
+                if (peekedTid == pc::TemplateId::Produce) { produceOpenSid = hdrOpt->sessionId; produceOpenSeq = seq; }
+                else rune::gateway::codec::commitIngressSeq(s->crypto, seq);
                 buf = decryptScratch_.data();
                 len = plainLen;
             }
@@ -998,8 +1007,12 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::MetadataRequest:
             handleMetadata(buf, len);
             break;
-        case pc::TemplateId::Produce:
-            return handleProduce(buf, len);
+        case pc::TemplateId::Produce: {
+            const bool consumed = handleProduce(buf, len);
+            if (produceOpenSid != 0 && consumed) [[unlikely]]
+                if (Session* s = sessions_.find(produceOpenSid)) rune::gateway::codec::commitIngressSeq(s->crypto, produceOpenSeq);
+            return consumed;
+        }
         case pc::TemplateId::Subscribe:
             handleSubscribe(buf, len);
             break;
@@ -1156,6 +1169,7 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     if (notifyExpired) sendSessionExpired_(nullptr, s, sid);
     if (s->heldByWorkers != 0) --heldSessions_;
     if (s->produceInFlight >= sessionProduceCredits_) --creditBlockedSessions_;   // D8c: its budget dies with it
+    if (s->capDeferredOn >= 0) --capDeferredSessions_;                              // R3: its deferral memo too
     for (int w = 0; w < Session::kMaxWorkers; ++w) {                               // ... and its share of each worker's cap
         if (s->produceInFlightOn[static_cast<std::size_t>(w)] == 0) continue;
         routedInFlight_[static_cast<std::size_t>(w)] -= s->produceInFlightOn[static_cast<std::size_t>(w)];
@@ -1199,17 +1213,30 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     return true;
 }
 
-ClientGateway::ProducePause ClientGateway::produceFramePause_(const uint8_t* buf, std::size_t len)
+ClientGateway::ProducePause ClientGateway::produceFramePause_(const uint8_t* buf, std::size_t len, int32_t* capWorker)
 {
     if (len < pc::MessageHeader::ENCODED_SIZE) return ProducePause::None;
     const uint16_t templateId = static_cast<uint16_t>(buf[2] | (buf[3] << 8));
     if (templateId != pc::Produce::TEMPLATE_ID) return ProducePause::None;   // only produce intake is paused
     uint64_t sid = 0;
     for (int i = 7; i >= 0; --i) sid = (sid << 8) | buf[8 + i];
-    const Session* s = sessions_.find(static_cast<int64_t>(sid));
+    Session* s = sessions_.find(static_cast<int64_t>(sid));
     if (!s) return ProducePause::None;
     if (s->heldByWorkers != 0) return ProducePause::Held;
     if (s->produceInFlight >= sessionProduceCredits_) return ProducePause::NoCredit;
+    if (s->capDeferredOn >= 0) [[unlikely]] {
+        // Lows batch C (D8c R3): this session's head Produce was deferred by a
+        // full worker share (one image per session: the redelivered frame IS
+        // it).  While that worker still refuses it, ABORT here — before the
+        // decrypt, decode and lookups handleProduce would redo every cycle.
+        const int32_t w = s->capDeferredOn;
+        const WorkerAdmit a = workerAdmitsProduce_(w, *s);
+        if (a != WorkerAdmit::Admit) {
+            if (capWorker) *capWorker = w;
+            return a == WorkerAdmit::Full ? ProducePause::WorkerCapFull : ProducePause::WorkerCapBand;
+        }
+        clearCapDeferred_(*s);                                    // admitted now: the full path runs
+    }
     return ProducePause::None;
 }
 
@@ -1222,12 +1249,25 @@ void ClientGateway::logProducePauseStats() const
 
 bool ClientGateway::admitClientFrame_(const uint8_t* buf, std::size_t len)
 {
-    if ((heldSessions_ | creditBlockedSessions_) == 0) [[likely]] return true;
-    const ProducePause p = produceFramePause_(buf, len);
+    if ((heldSessions_ | creditBlockedSessions_ | capDeferredSessions_) == 0) [[likely]] return true;
+    int32_t capWorker = -1;
+    const ProducePause p = produceFramePause_(buf, len, &capWorker);
     if (p == ProducePause::None) return true;
     ++heldProduceAborts_;
     if (p == ProducePause::NoCredit) ++creditProduceAborts_;
+    else if (p == ProducePause::WorkerCapFull || p == ProducePause::WorkerCapBand) {
+        // Exactly what handleProduce's deferral counts (expiry pacing unchanged).
+        ++workerCapProduceAborts_;
+        ++capDeferMemoAborts_;
+        if (p == ProducePause::WorkerCapFull) onWorkerCapFull_(capWorker);   // may expire this very session
+    }
     return false;
+}
+
+void ClientGateway::clearCapDeferred_(Session& s) noexcept
+{
+    s.capDeferredOn = -1;
+    --capDeferredSessions_;
 }
 
 // D8c: credits are counted only in shard mode (worker-side acks — the only mode
@@ -2598,6 +2638,9 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         if (const WorkerAdmit a = workerAdmitsProduce_(routedWorker, *session); a != WorkerAdmit::Admit) [[unlikely]] {
             ++heldProduceAborts_;
             ++workerCapProduceAborts_;
+            // Lows batch C (R3): remember the deferral — the redeliveries are
+            // ABORTed in admitClientFrame_ before any decrypt / decode.
+            if (session->capDeferredOn < 0) { session->capDeferredOn = static_cast<int8_t>(routedWorker); ++capDeferredSessions_; }
             // May expire a held session — possibly this one: `session` is not used after this.
             if (a == WorkerAdmit::Full) onWorkerCapFull_(routedWorker);
             return false;
