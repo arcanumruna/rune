@@ -10,12 +10,23 @@
 #     --build-arg RUNE_CRYPTO_BENCH_BUDGET_NS=3000 -t rune-crypto-bench .
 FROM gcc:13
 
+ARG CMAKE_VERSION=3.31.5
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        cmake \
+        curl \
         python3 \
         python3-pip \
     && rm -rf /var/lib/apt/lists/* \
     && pip3 install --no-cache-dir --break-system-packages "conan~=2.0"
+
+# rune-crypto's CMakeLists requires CMake >= 3.31; gcc:13's apt cmake is 3.25.
+# Install the official CMake build for the target arch (mirrors Dockerfile.dr).
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in arm64) CMAKE_ARCH=aarch64 ;; *) CMAKE_ARCH=x86_64 ;; esac \
+    && curl -LO https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-${CMAKE_ARCH}.tar.gz \
+    && tar -xzf cmake-${CMAKE_VERSION}-linux-${CMAKE_ARCH}.tar.gz --strip-components=1 -C /usr/local \
+    && rm cmake-${CMAKE_VERSION}-linux-${CMAKE_ARCH}.tar.gz \
+    && cmake --version
 
 WORKDIR /app
 COPY . .
