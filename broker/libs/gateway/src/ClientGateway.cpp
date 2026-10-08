@@ -1263,8 +1263,10 @@ ClientGateway::WorkerAdmit ClientGateway::workerAdmitsProduce_(int32_t worker, c
 // which frees that share at once.
 //   * Never a session that is not Held by that worker: a busy reader whose
 //     acks drain is never evicted.
-//   * Never a session that returned a Credit from that worker during this
-//     episode (it is reading, just slowly), and only after
+//   * Never a session that returned a Credit from that worker during the
+//     current scan window — the last kCapEvictAfterDeferredPolls deferred
+//     polls (it is reading, just slowly; a fresh window tag after each scan
+//     that finds no victim, as D8d's direct episodes) — and only after
 //     kCapEvictAfterDeferredPolls deferred polls in the episode, so such a
 //     reader has had its chance to show it.
 //   * No cascade / thrash: at most ONE expiry per episode.  An episode starts
@@ -1292,10 +1294,18 @@ void ClientGateway::onWorkerCapFull_(int32_t worker)
     uint16_t share = 0;
     sessions_.forEach([&](const Session& s) {
         if ((s.heldByWorkers & bit) == 0) return;                 // not held by this worker: a reader
-        if (s.creditTagOn[w] == ep.tag) return;                   // credited in this episode: a (slow) reader
+        if (s.creditTagOn[w] == ep.tag) return;                   // credited in this scan window: a (slow) reader
         if (s.produceInFlightOn[w] > share) { share = s.produceInFlightOn[w]; victim = s.sessionId; }
     });
-    if (victim == 0) return;                                      // no held session to blame: keep deferring
+    if (victim == 0) {                                            // no held session to blame: keep deferring
+        // Lows batch C (aligned with D8d's directEpisode_): reader marks count
+        // Credits of the LAST scan window only — a fresh tag per window.  A
+        // session that credited once early in a long episode and then stalled
+        // is judged by what it does now, not marked a reader forever.
+        if (++capEpisodeTags_ == 0) ++capEpisodeTags_;
+        ep.tag = capEpisodeTags_;
+        return;
+    }
     ep = CapEpisode{};                                            // the episode ends with its one expiry
     ++workerCapEvictions_;
     lastCapEvictedSid_ = victim;

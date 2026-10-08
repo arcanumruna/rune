@@ -85,10 +85,12 @@ struct Session {
     // the session's share of every worker's routed cap.  Cold (close / credit).
     static constexpr int                           kMaxWorkers = 64;   // == ClientGateway::kMaxHeldMaskWorkers
     std::array<uint16_t, kMaxWorkers>              produceInFlightOn{};   // <= the per-session budget (4096)
-    // D8c fix round 2: tag of the worker's cap-full episode during which this
-    // session last returned a Credit from that worker (a reader — never evicted
-    // in that episode).  uint16 tags wrap after 65536 episodes (harmless: at
-    // worst one reading session is considered for eviction once more).
+    // D8c fix round 2: tag of the worker's cap-full scan window (a fresh tag per
+    // kCapEvictAfterDeferredPolls deferred polls without a victim — lows batch C,
+    // as D8d) during which this session last returned a Credit from that worker
+    // (a reader — never evicted in that window).  uint16 tags wrap after 65536
+    // windows (harmless: at worst one reading session is considered for
+    // eviction once more).
     std::array<uint16_t, kMaxWorkers>              creditTagOn{};
     // Subscribe dedupe (2026-10-05; last — review L-5: off the produce-path fields' lines): a Subscribe is identified by (session,
     // correlationId, topicId, resolved partition) — the client binds exactly one

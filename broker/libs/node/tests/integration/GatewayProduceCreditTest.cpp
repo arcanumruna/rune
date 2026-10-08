@@ -609,3 +609,41 @@ TEST(GatewayProduceCreditRegression, CapExpiryOnlyHitsAHeldSessionOncePerEpisode
     EXPECT_GE(r.gw.produceInFlightForTest(n), 0);
     EXPECT_EQ(r.gw.produceCreditUnderflowsForTest(), 0u);
 }
+
+// D8c/D8d follow-up (lows batch C): the gateway's reader marks count Credits of the LAST scan window only (D8d's
+// 64-pass window) — a fresh tag per window when a scan finds no victim.  A held session that credited once early in a
+// long cap-full episode and then stalled is expired at the next scan.  (Was: a single Credit marked it a reader for
+// the whole episode — the episode, and the full share, could only end by draining below the band.)
+TEST(GatewayProduceCreditRegression, CapExpiryReaderMarksCoverTheLastScanWindowOnlyRegression) {
+    Rig r(/*withAcks=*/false);
+    r.gw.setWorkerRoutedCapForTest(400);                                  // band [300, 400)
+    const int64_t h = r.gw.injectTestSession(r.now), l1 = r.gw.injectTestSession(r.now),
+                  l2 = r.gw.injectTestSession(r.now), n = r.gw.injectTestSession(r.now),
+                  m = r.gw.injectTestSession(r.now);
+    auto frames = [](int64_t sid, int k) {
+        std::vector<std::vector<uint8_t>> f;
+        for (int i = 0; i < k; ++i) f.push_back(produceFrame(sid, i, 0));
+        return f;
+    };
+    const auto fh = frames(h, 300), f1 = frames(l1, 64), f2 = frames(l2, 36), fn = frames(n, 4), fm = frames(m, 1);
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fh), 300u);
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(f1), 64u);
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(f2), 36u);
+    ASSERT_EQ(r.gw.routedInFlightForTest(0), 400u);
+    rune::node::WorkerReturn s;
+    s.type = rune::node::WorkerReturn::Type::SessionSignal; s.sessionId = l1; s.partition = 0;
+    s.lastOffset = static_cast<int64_t>(SessionSignalKind::Held);
+    r.gw.handleWorkerReturnForTest(s);                                    // only l1 is held
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fn), 0u);                  // deferred poll 1: the episode starts
+    r.gw.handleWorkerReturnForTest(creditSignal(l1, 1));                  // l1 reads once (399, in the band)
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fm), 1u);                  // back to 400
+    constexpr uint32_t N = 64;                                            // kCapEvictAfterDeferredPolls
+    for (uint32_t i = 1; i < N; ++i) ASSERT_EQ(r.gw.controlledPollFramesForTest(fn), 0u);
+    ASSERT_EQ(r.gw.workerCapEvictionsForTest(), 0u) << "window 1: l1 credited — a reader, not expired";
+    for (uint32_t i = 0; i < N && r.gw.workerCapEvictionsForTest() == 0; ++i)
+        EXPECT_EQ(r.gw.controlledPollFramesForTest(fn), 0u);
+    EXPECT_EQ(r.gw.workerCapEvictionsForTest(), 1u) << "window 2: l1 stalled since its one Credit — expired";
+    EXPECT_EQ(r.gw.lastCapEvictedSessionForTest(), l1);
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(fn), 4u) << "its share is freed: the deferred session is served";
+    EXPECT_EQ(r.gw.produceCreditUnderflowsForTest(), 0u);
+}
