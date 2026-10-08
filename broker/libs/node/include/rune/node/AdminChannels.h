@@ -54,6 +54,7 @@ enum : int32_t {
     kMsgCreateTopicReply  = 4,
     kMsgAdminRole         = 5,
     kMsgEgressFrame       = 6,   // admin → control: [sessionId:i64][response frame]
+    kMsgAlterTopic        = 7,   // gateway → admin: ALTER TOPIC (Task 11)
 };
 
 // ---------------------------------------------------------------------------
@@ -106,6 +107,20 @@ struct DefineTopicMsg {
     std::string          name;
     std::string          keyField;
     std::vector<uint8_t> blob;
+};
+
+// ---------------------------------------------------------------------------
+// AlterTopic request (gateway → admin).  Owning form after drain (Task 11).
+// Carries the client's CAS expectation (expectedVersion; 0 = don't check) and
+// the opaque ALTER ops blob (rune::codec::encodeAlterOps wire format) that the
+// admin thread decodes + applies against the topic's current evolving schema.
+// ---------------------------------------------------------------------------
+struct AlterTopicMsg {
+    int64_t              session         = 0;
+    int64_t              corr            = 0;
+    uint16_t             expectedVersion = 0;   // 0 = unconditional (no CAS)
+    std::string          topicName;
+    std::vector<uint8_t> opsBlob;               // encodeAlterOps() wire bytes
 };
 
 // ---------------------------------------------------------------------------
@@ -197,6 +212,44 @@ inline DefineTopicMsg decodeDefineTopic(const uint8_t* buf, std::size_t len) {
     const int32_t bl = getI32(buf + pos); pos += 4;
     if (bl > 0 && pos + static_cast<std::size_t>(bl) <= len)
         m.blob.assign(buf + pos, buf + pos + bl);
+    return m;
+}
+
+// ---- AlterTopic (Task 11) ----
+inline bool encodeAlterTopic(OneToOneByteRing& ring, const AlterTopicMsg& m) {
+    using namespace admin_wire;
+    const std::size_t len = 8 + 8 + 2
+                          + 2 + m.topicName.size()
+                          + 4 + m.opsBlob.size();
+    const auto idx = ring.tryClaim(kMsgAlterTopic, len);
+    if (idx < 0) return false;
+    uint8_t* p = ring.base() + idx;
+    putI64(p, m.session);         p += 8;
+    putI64(p, m.corr);            p += 8;
+    putU16(p, m.expectedVersion); p += 2;
+    putU16(p, static_cast<uint16_t>(m.topicName.size())); p += 2;
+    std::memcpy(p, m.topicName.data(), m.topicName.size()); p += m.topicName.size();
+    putI32(p, static_cast<int32_t>(m.opsBlob.size())); p += 4;
+    if (!m.opsBlob.empty()) std::memcpy(p, m.opsBlob.data(), m.opsBlob.size());
+    ring.commit(idx);
+    return true;
+}
+
+inline AlterTopicMsg decodeAlterTopic(const uint8_t* buf, std::size_t len) {
+    using namespace admin_wire;
+    AlterTopicMsg m;
+    std::size_t pos = 0;
+    if (len < 20) return m;  // session(8)+corr(8)+expectedVersion(2)+nameLen(2)
+    m.session = getI64(buf + pos); pos += 8;
+    m.corr    = getI64(buf + pos); pos += 8;
+    m.expectedVersion = getU16(buf + pos); pos += 2;
+    const uint16_t nl = getU16(buf + pos); pos += 2;
+    if (pos + nl > len) return m;
+    m.topicName.assign(reinterpret_cast<const char*>(buf + pos), nl); pos += nl;
+    if (pos + 4 > len) return m;
+    const int32_t bl = getI32(buf + pos); pos += 4;
+    if (bl > 0 && pos + static_cast<std::size_t>(bl) <= len)
+        m.opsBlob.assign(buf + pos, buf + pos + bl);
     return m;
 }
 

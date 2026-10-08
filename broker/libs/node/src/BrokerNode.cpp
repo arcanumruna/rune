@@ -2988,6 +2988,28 @@ void BrokerNode::buildAdminWorker() {
             std::memcpy(p + 8, frame, n);
             ring.commit(idx);
         };
+        // respondAlter (Task 11): encode the AlterTopicResponse frame and push it
+        // on egressRing_ exactly like respondDefine (same single-writer egress path).
+        deps.respondAlter = [this](int64_t session, int64_t corr, int32_t topicId,
+                                   uint16_t newVersion, uint16_t errorCode) {
+            if (!adminWorkerAgent_) return;
+            namespace pc = rune::protocol::client;
+            pc::AlterTopicResponse resp;
+            resp.sessionId     = session;
+            resp.correlationId = corr;
+            resp.topicId       = topicId;
+            resp.newVersion    = newVersion;
+            resp.errorCode     = errorCode;
+            uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::AlterTopicResponse::BODY_FIXED];
+            const std::size_t n = resp.encode(frame);
+            auto& ring = adminWorkerAgent_->egressRing();
+            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + n);
+            if (idx < 0) return;  // ring full — DDL response dropped (rare); client retries
+            uint8_t* p = ring.base() + idx;
+            std::memcpy(p, &session, 8);
+            std::memcpy(p + 8, frame, n);
+            ring.commit(idx);
+        };
         deps.respondGet = [this](int64_t session, int64_t corr, int32_t topicId,
                                  uint16_t version, const std::vector<uint8_t>& blob,
                                  uint16_t errorCode) {

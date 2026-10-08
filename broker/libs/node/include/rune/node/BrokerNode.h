@@ -266,6 +266,8 @@ public:
                 worker_.submitDefineTopic(decodeDefineTopic(p, n));
             } else if (tid == kMsgGetSchema) {
                 worker_.submitGetSchema(decodeGetSchema(p, n));
+            } else if (tid == kMsgAlterTopic) {
+                worker_.submitAlterTopic(decodeAlterTopic(p, n));
             }
         }, 16);
 

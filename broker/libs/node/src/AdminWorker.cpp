@@ -1,5 +1,7 @@
 #include "rune/node/AdminWorker.h"
-#include <rune/codec/Serialize.h>  // rune::codec::deserialize (throws on bad input)
+#include <rune/codec/Serialize.h>  // rune::codec::deserialize/serialize (throws on bad input)
+#include <rune/codec/Evolve.h>     // checkCompatibility / applyOps (Task 11)
+#include <rune/codec/AlterOps.h>   // decodeAlterOps
 #include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/RecordBatch.h>
 #include <spdlog/spdlog.h>
@@ -12,6 +14,8 @@ static constexpr uint16_t kInternal       =  6;
 static constexpr uint16_t kUnknownTopic   =  7;
 static constexpr uint16_t kInvalidSchema  = 23;
 static constexpr uint16_t kTopicExists    = 25;
+static constexpr uint16_t kSchemaIncompatible = 29;  // ALTER compat gate reject
+static constexpr uint16_t kSchemaConflict     = 30;  // ALTER stale expectedVersion (CAS)
 
 AdminWorker::AdminWorker(SchemaRegistry& reg,
                          rune::replication::PartitionReplica* replica,
@@ -68,7 +72,17 @@ void AdminWorker::onRole(const AdminRoleMsg& role) {
 
 // ─── Ingress ────────────────────────────────────────────────────────────────
 void AdminWorker::submitDefineTopic(DefineTopicMsg msg) {
-    pending_.push_back(std::move(msg));
+    PendingDdl pd;
+    pd.kind   = DdlKind::Create;
+    pd.define = std::move(msg);
+    pending_.push_back(std::move(pd));
+}
+
+void AdminWorker::submitAlterTopic(AlterTopicMsg msg) {
+    PendingDdl pd;
+    pd.kind  = DdlKind::Alter;
+    pd.alter = std::move(msg);
+    pending_.push_back(std::move(pd));
 }
 
 void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
@@ -168,8 +182,15 @@ int AdminWorker::doWork(int64_t nowNs) {
 
 // ─── startNext_ — PARSING → name-lookup → CREATING (request id) ──────────────
 void AdminWorker::startNext_(int64_t nowNs) {
-    DefineTopicMsg msg = std::move(pending_.front());
+    PendingDdl pd = std::move(pending_.front());
     pending_.pop_front();
+
+    if (pd.kind == DdlKind::Alter) {
+        startAlter_(std::move(pd.alter), nowNs);
+        return;
+    }
+
+    DefineTopicMsg msg = std::move(pd.define);
 
     // ── PARSING ── validate the descriptor blob is well-formed, and capture
     // its field count in the same pass (seeds nextTag for the create path —
@@ -215,14 +236,135 @@ void AdminWorker::startNext_(int64_t nowNs) {
     state_    = DdlState::AwaitingId;
 }
 
+// ─── startAlter_ — serialized ALTER TOPIC (CAS + compat gate + atomic apply) ──
+//
+// Runs on the admin thread, reusing the DDL state machine so an ALTER is
+// serialized with CREATE and other ALTERs (single inFlight_).  Unlike CREATE it
+// SKIPS AwaitingId — the topic already exists, so there is no id round-trip to
+// the control thread; it commits synchronously to the append/AwaitingCommit path.
+void AdminWorker::startAlter_(AlterTopicMsg msg, int64_t nowNs) {
+    // ── leader guard (D) ── DDL is leader-only.
+    if (!leader_ || !replica_) {
+        deps_.respondAlter(msg.session, msg.corr, -1, 0, kInternal);
+        return;
+    }
+
+    // a. resolve the topic's LATEST applied schema.
+    const RegistryEntry* latest = reg_.byName(msg.topicName);
+    if (!latest) {
+        deps_.respondAlter(msg.session, msg.corr, -1, 0, kUnknownTopic);
+        return;
+    }
+    const int32_t  topicId    = latest->topicId;
+    const uint16_t curVersion = latest->version;
+
+    // b. optimistic CAS — a non-zero expectedVersion that no longer matches the
+    //    latest version means another ALTER landed first; reject (NO lost update).
+    if (msg.expectedVersion != 0 && msg.expectedVersion != curVersion) {
+        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kSchemaConflict);
+        return;
+    }
+
+    // c. decode the ops blob (bounds-checked; nullopt on any truncation).
+    auto ops = rune::codec::decodeAlterOps(
+        std::span<const uint8_t>(msg.opsBlob.data(), msg.opsBlob.size()));
+    if (!ops) {
+        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kInvalidSchema);
+        return;
+    }
+
+    // d. effective compatibility mode: a SET_COMPATIBILITY op (if present) sets
+    //    both the mode the gate checks AND the mode persisted on the new record;
+    //    otherwise the current mode carries forward.
+    rune::codec::CompatMode mode = latest->compatMode;
+    for (const auto& op : *ops)
+        if (op.type == rune::codec::AlterOpType::SetCompatibility) mode = op.mode;
+
+    // e. compatibility gate (e.g. DROP is rejected under Forward).
+    if (!rune::codec::checkCompatibility(*ops, mode)) {
+        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kSchemaIncompatible);
+        return;
+    }
+
+    // f. apply the ops to the CURRENT EVOLVING descriptor (all fields incl.
+    //    retired), bumping a fresh contiguous version.  applyOps is atomic: on
+    //    any failed op it returns an error and leaves `nextTag` untouched, so a
+    //    rejected ALTER appends nothing and does not bump the version.
+    rune::codec::Descriptor evolving;
+    try {
+        evolving = rune::codec::deserialize(std::span<const uint8_t>(
+            latest->descriptorBlob.data(), latest->descriptorBlob.size()));
+    } catch (...) {
+        // The stored evolving blob must be well-formed (it was validated on the
+        // way in); a throw here is an internal invariant breach, not client error.
+        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kInternal);
+        return;
+    }
+    uint16_t       nextTag    = latest->nextTag;
+    const uint16_t newVersion = static_cast<uint16_t>(curVersion + 1);  // contiguous, computed ONCE
+    auto res = rune::codec::applyOps(evolving, *ops, nextTag, newVersion);
+    if (!res) {
+        // Surface the EvolveError as InvalidSchema (message available in res.error()).
+        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kInvalidSchema);
+        return;
+    }
+
+    // g. build the new durable TopicSchema (same id/partitions/validate/keyField;
+    //    NEW evolving descriptor + post-applyOps nextTag + effective compatMode).
+    TopicSchema ts;
+    ts.topicId        = topicId;
+    ts.version        = newVersion;
+    ts.partitionCount = latest->partitionCount;
+    ts.keyField       = latest->keyField;
+    ts.validate       = latest->validator.has_value();   // same as current
+    ts.descriptorBlob = rune::codec::serialize(*res);     // the NEW evolving descriptor
+    ts.nextTag        = nextTag;                           // advanced by applyOps
+    ts.compatMode     = mode;
+
+    const std::vector<uint8_t> payload = ts.serialize();
+    uint8_t keyBuf[4];
+    const uint32_t u = static_cast<uint32_t>(topicId);
+    keyBuf[0] = static_cast<uint8_t>(u & 0xff);
+    keyBuf[1] = static_cast<uint8_t>((u >> 8) & 0xff);
+    keyBuf[2] = static_cast<uint8_t>((u >> 16) & 0xff);
+    keyBuf[3] = static_cast<uint8_t>((u >> 24) & 0xff);
+
+    const rune::replication::Offset base =
+        replica_->appendKeyed(std::span<const uint8_t>(keyBuf, 4),
+                              std::span<const uint8_t>(payload.data(), payload.size()),
+                              /*acksAll=*/true);
+    if (base < 0) {
+        // Gated (minIsr not met) → Internal; nothing committed, version unchanged.
+        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kInternal);
+        return;
+    }
+
+    DdlOp op;
+    op.kind         = DdlKind::Alter;
+    op.alter        = std::move(msg);
+    op.topicId      = topicId;
+    op.newVersion   = newVersion;
+    op.alterSchema  = std::move(ts);
+    op.appendedBase = base;
+    op.appendedLast = base;   // single-record keyed batch → last == base
+    op.startedNs    = nowNs;
+    replica_->onLeaderLogAppended();  // reconcile LEO/HW + push to followers
+    inFlight_ = std::move(op);
+    state_    = DdlState::AwaitingCommit;
+}
+
 // ─── advance_ — AWAITING_COMMIT (HW gate) + timeout ──────────────────────────
 bool AdminWorker::advance_(int64_t nowNs) {
     if (state_ == DdlState::Idle || !inFlight_) return false;
 
     // Timeout guard (error path only — not a convergence gate).
     if (nowNs - inFlight_->startedNs > kDdlTimeoutNs) {
-        deps_.respondDefine(inFlight_->msg.session, inFlight_->msg.corr,
-                            -1, 0, kInternal);
+        if (inFlight_->kind == DdlKind::Alter)
+            deps_.respondAlter(inFlight_->alter.session, inFlight_->alter.corr,
+                               inFlight_->topicId, 0, kInternal);
+        else
+            deps_.respondDefine(inFlight_->msg.session, inFlight_->msg.corr,
+                                -1, 0, kInternal);
         inFlight_.reset();
         state_ = DdlState::Idle;
         return true;
@@ -231,8 +373,25 @@ bool AdminWorker::advance_(int64_t nowNs) {
     if (state_ == DdlState::AwaitingCommit) {
         if (!replica_) { inFlight_.reset(); state_ = DdlState::Idle; return true; }
         // D: true majority-durable — HW must cover the appended offset.
-        if (replica_->highWatermark() > inFlight_->appendedLast) {
-            // ── on-commit ── apply to registry, push validators, respond OK.
+        if (replica_->highWatermark() <= inFlight_->appendedLast) return false;
+
+        // ── ALTER on-commit ── apply the (pre-built, version computed ONCE in
+        //    startAlter_) record to the registry and respond OK.
+        if (inFlight_->kind == DdlKind::Alter) {
+            reg_.applyRecord(inFlight_->alterSchema);
+            // SEAM (Task 12): fan out the evolved schema to the produce/consume
+            // workers here (validator refresh for the new version) once the
+            // worker-side multi-version apply lands.  Intentionally NOT done in
+            // this task — the registry commit above is the single source of truth.
+            deps_.respondAlter(inFlight_->alter.session, inFlight_->alter.corr,
+                               inFlight_->topicId, inFlight_->newVersion, kOK);
+            inFlight_.reset();
+            state_ = DdlState::Idle;
+            return true;
+        }
+
+        {
+            // ── CREATE on-commit ── apply to registry, push validators, respond OK.
             TopicSchema ts;
             ts.topicId        = inFlight_->topicId;
             ts.version        = nextSchemaVersion_(inFlight_->topicId);
