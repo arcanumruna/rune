@@ -29,15 +29,26 @@ namespace rune::protocol::client {
 /// 24-byte MessageHeader (i.e. at frame offset 24).
 ///
 /// Byte offsets (relative to the subheader itself):
-///   version  uint8   0
-///   cipher   uint8   1   (rune::crypto::Cipher value)
-///   epoch    uint16  2
-///   seq      uint64  4
+///   version   uint8   0
+///   cipher    uint8   1   (rune::crypto::Cipher value)
+///   epoch     uint8   2   (low byte of the wire u16 @2; key rotation, 0 today)
+///   senderId  uint8   3   (high byte of the wire u16 @2; 0 = gateway, i+1 = worker i)
+///   seq       uint64  4
+///
+/// The wire format keeps a single little-endian uint16 at sub-offset 2 for
+/// zero size growth: `epoch_lo | (senderId << 8)`. `epoch` and `senderId` are
+/// therefore each limited to 0..255 on the wire — `epoch` stays a `uint16_t`
+/// member for API continuity but must only ever hold its low byte.
+/// Backward compatibility: with `senderId == 0` and `epoch == 0` (the shipped
+/// default), the high byte is 0, so the encoded 12 bytes are byte-identical
+/// to the pre-Task-18 format — see
+/// CryptoEnvelopeTest.SubHeaderSenderIdZeroEpochZeroByteIdenticalToPreTask18.
 struct CryptoSubHeader {
-    uint8_t  version = 1;
-    uint8_t  cipher  = 0;   // rune::crypto::Cipher value
-    uint16_t epoch   = 0;
-    uint64_t seq     = 0;
+    uint8_t  version  = 1;
+    uint8_t  cipher   = 0;   // rune::crypto::Cipher value
+    uint16_t epoch    = 0;   // low byte only (0..255) — see class doc comment
+    uint8_t  senderId = 0;   // 0 = gateway, i+1 = worker i
+    uint64_t seq      = 0;
 
     static constexpr std::size_t ENCODED_SIZE = 12;
 
@@ -45,7 +56,7 @@ struct CryptoSubHeader {
     void encode(uint8_t* at) const noexcept {
         at[0] = version;
         at[1] = cipher;
-        detail::putLE16(at, 2, epoch);
+        detail::putLE16(at, 2, static_cast<uint16_t>(epoch) | (static_cast<uint16_t>(senderId) << 8));
         detail::putLE64(at, 4, static_cast<int64_t>(seq));
     }
 
@@ -53,10 +64,12 @@ struct CryptoSubHeader {
     static std::optional<CryptoSubHeader> decode(const uint8_t* buf, std::size_t avail) noexcept {
         if (avail < ENCODED_SIZE) return std::nullopt;
         CryptoSubHeader h;
-        h.version = buf[0];
-        h.cipher  = buf[1];
-        h.epoch   = detail::getLE16(buf, 2);
-        h.seq     = static_cast<uint64_t>(detail::getLE64(buf, 4));
+        h.version  = buf[0];
+        h.cipher   = buf[1];
+        const uint16_t raw = detail::getLE16(buf, 2);
+        h.epoch    = raw & 0x00FF;
+        h.senderId = static_cast<uint8_t>(raw >> 8);
+        h.seq      = static_cast<uint64_t>(detail::getLE64(buf, 4));
         return h;
     }
 };
