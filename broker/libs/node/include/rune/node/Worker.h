@@ -1655,7 +1655,26 @@ private:
         // observed (consumer first: consumer <= producer) — I1 hold rule.
         if (ackSink_) {
             const int64_t consumed = sessionRing_.consumerPosition();
-            work += ackSink_->flush(sessionRing_.producerPosition(), consumed);
+            // Task 23 (★★ shared sendSeq — CRITICAL nonce safety): the sink
+            // owns no crypto table of its own (shared-nothing); this lookup
+            // hands it THIS worker's per-session WorkerSessionCrypto entry —
+            // the EXACT SAME entry (and therefore the exact same `sendSeq`
+            // counter and `send` cipher) pushOwnedSubscriptions_ uses to seal
+            // Records for this session. Acks and Records therefore draw from
+            // ONE monotonic seq under ONE key — never a separate ack counter
+            // (that would reuse nonces, catastrophic for AES-GCM). nullptr
+            // (no entry: plaintext session) takes the exact pre-Task-23
+            // in-place-encode claim, unchanged.
+            work += ackSink_->flush(sessionRing_.producerPosition(), consumed,
+                [this](int64_t sid) -> const RecordsSealCtx* {
+                    WorkerSessionCrypto* cr = findSessionCrypto_(sid);
+                    if (!cr) return nullptr;
+                    ackSealCtx_.send     = cr->send.has_value() ? &*cr->send : nullptr;
+                    ackSealCtx_.sendSeq  = &cr->sendSeq;
+                    ackSealCtx_.cipher   = cr->cipher;
+                    ackSealCtx_.senderId = static_cast<uint8_t>(workerId_ + 1);
+                    return &ackSealCtx_;
+                });
             work += reportSessionSignals_();
         }
         if (work == 0) work += prepareIdle_();   // A9: only a pass that may park pays for it
@@ -2637,11 +2656,38 @@ private:
     // as back-pressured Records) otherwise.  Returns 1 if sent.  Cold path.
     // correlationId 0 + a message naming subscription/topic/partition/offset
     // (encodePushTooLargeError — the F15 S3 m-f convention).
-    int sendPushTooLarge_(WorkerSubscription& s, aeron::ExclusivePublication* pub) {
+    //
+    // Task 23 (mandatory egress audit — 3rd worker->client path found): this
+    // frame goes straight to the client on `pub` (the same per-consumer /
+    // shared-MDC egress Records uses), via sendEncodedToPub_ — NOT through
+    // sendTo/sendRecordsFrame, so it was NEVER sealed even after Task 19
+    // sealed Records. Mirrors the gateway's own analogous path exactly:
+    // ClientGateway::trySendOwedPushError_ already seals (its sendTo() is
+    // the single chokepoint every gateway->client send funnels through —
+    // see sendTo's doc comment), but the worker has no such chokepoint, so
+    // it must seal here explicitly. `seal` non-null ⇒ encrypted session:
+    // seal BEFORE sending (same ordering as sendRecordsFrame/the ack path —
+    // never claim/offer on an unsealed buffer), using the SAME per-session
+    // cr->send/sendSeq/senderId `pushOwnedSubscriptions_` built for Records
+    // (one shared monotonic seq across every worker->client frame type under
+    // this session's one b2c key). Fail-closed: seal==0 (no key yet / AEAD
+    // error) ⇒ return 0 — s.pushState stays ErrorOwed, retried next pass,
+    // exactly like back-pressure; NEVER a plaintext send on an encrypted
+    // session.
+    int sendPushTooLarge_(WorkerSubscription& s, aeron::ExclusivePublication* pub,
+                          const RecordsSealCtx* seal = nullptr) {
         static_assert(kPushTooLargeErrorMaxBytes <= kEgressScratchSize);
         const std::size_t n = encodePushTooLargeError(
             egressScratch_.data(), s.sessionId, s.subscriptionId, s.topicId, s.partition,
             s.nextOffset, s.failedFrameLen, pub->maxMessageLength());
+        if (seal) [[unlikely]] {
+            const std::size_t sn = sealRecordsFrame(*seal, egressScratch_.data(), n,
+                                                    pushTooLargeSealScratch_.data(), pushTooLargeSealScratch_.size());
+            if (sn == 0) [[unlikely]] return 0;   // fail-closed — never transmit, retried next pass
+            if (sendEncodedToPub_(pub, pushTooLargeSealScratch_.data(), sn) <= 0) return 0;
+            s.pushState = WorkerSubscription::PushState::Failed;
+            return 1;
+        }
         if (sendEncodedToPub_(pub, egressScratch_.data(), n) <= 0) return 0;
         s.pushState = WorkerSubscription::PushState::Failed;
         return 1;
@@ -2670,9 +2716,40 @@ private:
             if (!egressPub && workerEgress_) egressPub = workerEgress_->pub();
             if (!egressPub) continue;  // nowhere to send yet
 
+            // Task 19 (per-worker egress crypto addendum): looked up ONCE per
+            // subscription-drain call (not per batch) — `cr` is shared across
+            // every batch pushed for `s` in this pass, so they all seal under
+            // the SAME AeadCipher + the SAME monotonic sendSeq (never a
+            // per-batch-reset counter: that would reuse nonces under this
+            // worker's key). nullptr == plaintext session (the common case;
+            // sessionCrypto_ is empty for an all-plaintext deployment) — takes
+            // the exact pre-Task-19 zero-copy path below, untouched.
+            // Task 23 audit fix: moved ABOVE the pushState/ErrorOwed check
+            // (was below it) so sendPushTooLarge_'s retry call site (just
+            // below) ALSO gets `sealPtr` — this frame is worker->client
+            // egress too (the audit's 3rd path; see sendPushTooLarge_'s own
+            // comment) and MUST seal under the exact same cr/sendSeq as
+            // Records for this session.
+            WorkerSessionCrypto* cr = findSessionCrypto_(s.sessionId);
+            RecordsSealCtx seal;
+            const RecordsSealCtx* sealPtr = nullptr;
+            if (cr) [[unlikely]] {
+                // Fail closed (RecordsSealCtx/sealRecordsFrame's own
+                // contract): cr->send may be nullopt (this worker's key
+                // failed to derive, or hasn't arrived yet) — seal.send stays
+                // null, sealRecordsFrame returns 0, sendRecordsFrame/
+                // sendPushTooLarge_ never transmit. NEVER a plaintext
+                // fallback once `cr` exists.
+                seal.send     = cr->send.has_value() ? &*cr->send : nullptr;
+                seal.sendSeq  = &cr->sendSeq;
+                seal.cipher   = cr->cipher;
+                seal.senderId = static_cast<uint8_t>(workerId_ + 1);   // unique per worker; gateway == 0
+                sealPtr = &seal;
+            }
+
             if (s.pushState != WorkerSubscription::PushState::Live) [[unlikely]] {
                 if (s.pushState == WorkerSubscription::PushState::ErrorOwed)
-                    work += sendPushTooLarge_(s, egressPub);
+                    work += sendPushTooLarge_(s, egressPub, sealPtr);
                 continue;   // parked AT the undeliverable batch
             }
 
@@ -2700,30 +2777,6 @@ private:
             const rune::storage::LogReadView view = readNoFault_(
                 s.logPtr, s.nextOffset, std::min<std::size_t>(kPushMaxChunkBytes, pushBudgetLeft_));
             if (view.empty()) continue;
-
-            // Task 19 (per-worker egress crypto addendum): looked up ONCE per
-            // subscription-drain call (not per batch) — `cr` is shared across
-            // every batch pushed for `s` in this pass, so they all seal under
-            // the SAME AeadCipher + the SAME monotonic sendSeq (never a
-            // per-batch-reset counter: that would reuse nonces under this
-            // worker's key). nullptr == plaintext session (the common case;
-            // sessionCrypto_ is empty for an all-plaintext deployment) — takes
-            // the exact pre-Task-19 zero-copy path below, untouched.
-            WorkerSessionCrypto* cr = findSessionCrypto_(s.sessionId);
-            RecordsSealCtx seal;
-            const RecordsSealCtx* sealPtr = nullptr;
-            if (cr) [[unlikely]] {
-                // Fail closed (RecordsSealCtx/sealRecordsFrame's own
-                // contract): cr->send may be nullopt (this worker's key
-                // failed to derive, or hasn't arrived yet) — seal.send stays
-                // null, sealRecordsFrame returns 0, sendRecordsFrame never
-                // transmits. NEVER a plaintext fallback once `cr` exists.
-                seal.send     = cr->send.has_value() ? &*cr->send : nullptr;
-                seal.sendSeq  = &cr->sendSeq;
-                seal.cipher   = cr->cipher;
-                seal.senderId = static_cast<uint8_t>(workerId_ + 1);   // unique per worker; gateway == 0
-                sealPtr = &seal;
-            }
 
             std::size_t pos = 0;
             int pushed = 0;
@@ -2818,7 +2871,7 @@ private:
                                   rec.encodedSize(), egressPub->maxMessageLength());
                     s.pushState      = WorkerSubscription::PushState::ErrorOwed;
                     s.failedFrameLen = rec.encodedSize();
-                    work += sendPushTooLarge_(s, egressPub);
+                    work += sendPushTooLarge_(s, egressPub, sealPtr);
                     break;
                 }
                 const int64_t r = sent.position;
@@ -4258,6 +4311,18 @@ private:
     // ClientGateway::recordsSealScratch_). Grow-once, reused every push.
     RecordsSealScratch recordsSealScratch_;
 
+    // Task 23: scratch RecordsSealCtx handed to SessionAckSink::flush's
+    // crypto-lookup callback (built fresh per lookup call, consumed
+    // synchronously inside that same flush() call — never held across
+    // passes). Deliberately a SEPARATE instance from pushOwnedSubscriptions_'s
+    // local `seal` (Records): the two run at different points of one doWork()
+    // pass on the same thread, never concurrently, but keeping them distinct
+    // avoids any accidental aliasing between the Records egress call site and
+    // the ack-flush call site. Both still point at the SAME WorkerSessionCrypto
+    // entry's `send`/`sendSeq`/`cipher` for a given session — the shared
+    // counter lives in sessionCrypto_, not here.
+    RecordsSealCtx ackSealCtx_;
+
     // Task 22 (shard worker decrypts produce / per-worker ingress): this
     // worker's OWN scratch for openProduceFrame()'s decrypted output
     // (RecordsOpen.h). Grow-once (capacity persists; resize() only ever
@@ -4288,6 +4353,13 @@ private:
     // Max bytes fetched per subscription per cycle via readView (matches gateway).
     static constexpr int32_t     kPushMaxChunkBytes = static_cast<int32_t>(512 * 1024);
     std::vector<uint8_t> egressScratch_;
+    // Task 23 (egress audit, 3rd path): sendPushTooLarge_'s ENCRYPTED-session
+    // seal output. kPushTooLargeErrorMaxBytes is a compile-time bound (the
+    // ErrorResponse message is a fixed-format snprintf, never user data), so
+    // — like the ack path's scratch — a fixed array is strictly simpler than
+    // a grow-once vector and still zero-allocation (Rule 4).
+    std::array<uint8_t, kPushTooLargeErrorMaxBytes + rune::protocol::client::kCryptoOverhead>
+        pushTooLargeSealScratch_{};
 public:
     /// F5 (hot-path B): the consumer-push byte budget of ONE worker pass, shared
     /// by gateway PushRead answers and in-worker egress pushes: every pushed

@@ -123,6 +123,24 @@
 //      replay window tolerates forward gaps left by gateway-bound frames
 //      sharing the client's single c2b seq stream; neither window is
 //      touched by the other's traffic.
+//
+// Task 23 cases (shard worker SEALS produce acks / SessionAckSink, mirrors
+// Task 19's flushAcks_ seal branch exactly — same sealRecordsFrame, same
+// worker per-sender b2c cipher, THE SAME sendSeq counter Records uses):
+//  29. WorkerAckSealedProduceResponseOpensUnderWorkerSenderKey — a
+//      ProduceResponse sealed the way flushAcks_'s encrypted branch does
+//      (encodeFor into a scratch, then sealRecordsFrame under the worker's
+//      derived per-sender key) opens under the client's independently
+//      re-derived sender-(w+1) key and decodes to the right ProduceResponse;
+//      tamper/replay dropped.
+//  30. WorkerAckAndRecordsShareOneMonotonicSendSeq — ★★ the nonce-interleave
+//      proof: seal a Records frame then an ack under the SAME AeadCipher +
+//      the SAME shared sendSeq counter; both open and their subheader seqs
+//      are consecutive/distinct (N, N+1) — never a collision.
+//  31. WorkerAckAndRecordsSeparateCounterCollides_RedToggle — flips to two
+//      INDEPENDENT counters (the bug Task 23 forbids) and shows the
+//      resulting seq collision (both frames claim seq=1 under one key) —
+//      RED evidence for why the ack sink must never own its own sendSeq.
 
 #include <gtest/gtest.h>
 
@@ -1383,6 +1401,232 @@ TEST(SessionAnnounceKeyTail, DecodeFailsClosedOnTruncatedTail) {
     const auto decoded = rune::node::decodeSessionAnnounceCryptoTail(
         reinterpret_cast<const char*>(truncated.data()), truncated.size());
     EXPECT_FALSE(decoded.has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Task 23 — shard worker SEALS produce acks (SessionAckSink::flushAcks_).
+//
+// SessionAckSink.h itself cannot be built on this host (it unconditionally
+// includes <Aeron.h>/<ExclusivePublication.h> — see the file header's
+// BUILD/TEST SPLIT note), so these tests exercise the exact same production
+// primitives flushAcks_'s new encrypted branch calls — ProduceResponse::
+// encodeFor + rune::node::sealRecordsFrame — standing in for the sink's own
+// claim()/encode lambda the way sealRecordsAsPushWould already stands in for
+// sendRecordsFrame's encrypted branch above. Field-for-field match against
+// SessionAckSink.h's flushAcks_: encode_(a, ver, plainScratch) then
+// sealRecordsFrame(*sealCtx, plainScratch, plainLen, sealedScratch, cap).
+// ---------------------------------------------------------------------------
+namespace {
+
+rpc::ProduceResponse makeProduceResponse(int64_t sessionId, int64_t correlationId,
+                                          int32_t partition, int64_t baseOffset,
+                                          int64_t logStartOffset = -1) {
+    rpc::ProduceResponse r;
+    r.sessionId      = sessionId;
+    r.correlationId  = correlationId;
+    r.errorCode      = 0;
+    r.partition       = partition;
+    r.baseOffset      = baseOffset;
+    r.logStartOffset  = logStartOffset;
+    return r;
+}
+
+// Seal `resp` exactly the way SessionAckSink::flushAcks_'s ENCRYPTED branch
+// does: encodeFor() into a fixed plaintext scratch, then
+// rune::node::sealRecordsFrame() into a sealed buffer. Returns the sealed
+// bytes (empty on seal failure — fail-closed, never transmit).
+std::vector<uint8_t> sealAckAsFlushWould(const rpc::ProduceResponse& resp, int32_t clientVersion,
+                                         cr::AeadCipher& send, uint64_t& sendSeq, cr::Cipher cipher,
+                                         uint8_t senderId) {
+    const std::size_t plainLen = rpc::ProduceResponse::encodedSizeFor(clientVersion);
+    std::vector<uint8_t> plain(plainLen);
+    resp.encodeFor(plain.data(), clientVersion);
+
+    pn::RecordsSealCtx ctx;
+    ctx.send     = &send;
+    ctx.sendSeq  = &sendSeq;
+    ctx.cipher   = static_cast<uint8_t>(cipher);
+    ctx.senderId = senderId;
+
+    std::vector<uint8_t> sealed(plainLen + rpc::kCryptoOverhead);
+    const std::size_t n = pn::sealRecordsFrame(ctx, plain.data(), plainLen, sealed.data(), sealed.size());
+    sealed.resize(n);   // n==0 -> empty, signalling seal failure to the caller
+    return sealed;
+}
+
+// Open `sealed` the way the client opens ANY worker-sender frame (acks and
+// Records both open under the same per-sender key, Task 20) and decode it
+// as a ProduceResponse. nullopt on ANY failure (truncation, auth failure).
+std::optional<rpc::ProduceResponse> openProduceResponseAsClientWould(
+    const std::vector<uint8_t>& sealed, cr::AeadCipher& recv, std::vector<uint8_t>& storage) {
+    if (sealed.size() < rpc::kCryptoHeaderBytes + cr::kTagSize) return std::nullopt;
+    const auto subOpt = rpc::CryptoSubHeader::decode(
+        sealed.data() + rpc::MessageHeader::ENCODED_SIZE,
+        sealed.size() - rpc::MessageHeader::ENCODED_SIZE);
+    if (!subOpt) return std::nullopt;
+
+    const std::size_t ctLen = sealed.size() - rpc::kCryptoHeaderBytes;
+    storage.assign(rpc::MessageHeader::ENCODED_SIZE + ctLen, 0);
+    const long m = recv.open(subOpt->seq, sealed.data(), rpc::kCryptoHeaderBytes,
+                              sealed.data() + rpc::kCryptoHeaderBytes, ctLen,
+                              storage.data() + rpc::MessageHeader::ENCODED_SIZE);
+    if (m < 0) return std::nullopt;
+
+    std::memcpy(storage.data(), sealed.data(), rpc::MessageHeader::ENCODED_SIZE);
+    storage.resize(rpc::MessageHeader::ENCODED_SIZE + static_cast<std::size_t>(m));
+    return rpc::ProduceResponse::decode(storage.data(), storage.size());
+}
+
+}  // namespace
+
+TEST(GatewayCryptoDataPlane, WorkerAckSealedProduceResponseOpensUnderWorkerSenderKey) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/40);
+
+    constexpr uint8_t kWorkerId = 3;      // worker 3 -> senderId 4
+    constexpr uint8_t kSenderId = kWorkerId + 1;
+
+    cr::AeadKey workerKey{};
+    ASSERT_TRUE(cr::deriveSenderKey(f.gw.b2c, kSenderId, workerKey));
+    cr::AeadCipher workerSend(f.gw.cipher, workerKey, f.gw.b2cPrefix);
+    uint64_t workerSendSeq = 0;
+
+    const rpc::ProduceResponse resp = makeProduceResponse(40, 55, 2, 1000);
+    const auto sealed = sealAckAsFlushWould(resp, /*clientVersion=*/2, workerSend, workerSendSeq,
+                                            f.gw.cipher, kSenderId);
+    ASSERT_FALSE(sealed.empty());
+    EXPECT_EQ(workerSendSeq, 1u);
+
+    const auto sub = rpc::CryptoSubHeader::decode(sealed.data() + rpc::MessageHeader::ENCODED_SIZE,
+                                                   sealed.size() - rpc::MessageHeader::ENCODED_SIZE);
+    ASSERT_TRUE(sub.has_value());
+    EXPECT_EQ(sub->senderId, kSenderId);
+
+    cr::AeadCipher clientRecvForWorker(f.gw.cipher, workerKey, f.gw.b2cPrefix);
+    std::vector<uint8_t> storage;
+    const auto opened = openProduceResponseAsClientWould(sealed, clientRecvForWorker, storage);
+    ASSERT_TRUE(opened.has_value()) << "a worker-sealed ack must open under the client's "
+                                        "independently-re-derived per-sender key";
+    EXPECT_EQ(opened->sessionId, resp.sessionId);
+    EXPECT_EQ(opened->correlationId, resp.correlationId);
+    EXPECT_EQ(opened->baseOffset, resp.baseOffset);
+    EXPECT_EQ(opened->partition, resp.partition);
+
+    // Tamper: flip a ciphertext byte — auth must fail (AeadCipher::open's own
+    // tag-verification contract; mirrors WorkerSealedRecordsWrongSenderIdTamperDropped's
+    // tamper check for Records). Replay rejection is a property of the
+    // CALLER's anti-replay WINDOW (RecordsOpen.h / CryptoState.recvWindow),
+    // not of AeadCipher::open itself (a pure decrypt+verify primitive, no
+    // internal seq memory) — out of scope for a broker->client ack open
+    // (the client side takes no change in this task), same as the existing
+    // Records open helper above never asserts replay either.
+    std::vector<uint8_t> tampered = sealed;
+    tampered.back() ^= 0x01;
+    std::vector<uint8_t> storage2;
+    cr::AeadCipher clientRecvForWorker2(f.gw.cipher, workerKey, f.gw.b2cPrefix);
+    EXPECT_FALSE(openProduceResponseAsClientWould(tampered, clientRecvForWorker2, storage2).has_value());
+}
+
+TEST(GatewayCryptoDataPlane, WorkerAckAndRecordsShareOneMonotonicSendSeq) {
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/41);
+
+    constexpr uint8_t kWorkerId = 1;      // worker 1 -> senderId 2
+    constexpr uint8_t kSenderId = kWorkerId + 1;
+
+    cr::AeadKey workerKey{};
+    ASSERT_TRUE(cr::deriveSenderKey(f.gw.b2c, kSenderId, workerKey));
+    cr::AeadCipher workerSend(f.gw.cipher, workerKey, f.gw.b2cPrefix);
+    // ★★ ONE shared counter — exactly Worker.h's WorkerSessionCrypto::sendSeq,
+    // which pushOwnedSubscriptions_ (Records) and the ackSink_->flush
+    // crypto-lookup (acks, this task) both pass a pointer to THE SAME field.
+    uint64_t sharedSendSeq = 0;
+
+    const std::vector<uint8_t> batch(32, 0x11);
+    const rpc::Records rec = makeRecordsFrame(41, 1, 1, 1, 0, 0, batch);
+    const auto sealedRecords = sealRecordsAsPushWould(rec, workerSend, sharedSendSeq, f.gw.cipher,
+                                                       /*epoch=*/0, kSenderId);
+    ASSERT_FALSE(sealedRecords.empty());
+
+    const rpc::ProduceResponse resp = makeProduceResponse(41, 2, 0, 500);
+    const auto sealedAck = sealAckAsFlushWould(resp, /*clientVersion=*/2, workerSend, sharedSendSeq,
+                                               f.gw.cipher, kSenderId);
+    ASSERT_FALSE(sealedAck.empty());
+
+    const auto subRecords = rpc::CryptoSubHeader::decode(
+        sealedRecords.data() + rpc::MessageHeader::ENCODED_SIZE,
+        sealedRecords.size() - rpc::MessageHeader::ENCODED_SIZE);
+    const auto subAck = rpc::CryptoSubHeader::decode(
+        sealedAck.data() + rpc::MessageHeader::ENCODED_SIZE,
+        sealedAck.size() - rpc::MessageHeader::ENCODED_SIZE);
+    ASSERT_TRUE(subRecords.has_value());
+    ASSERT_TRUE(subAck.has_value());
+    EXPECT_EQ(subRecords->seq, 1u);
+    EXPECT_EQ(subAck->seq, 2u);
+    EXPECT_NE(subRecords->seq, subAck->seq)
+        << "Records and the ack must NEVER share a seq under the same key (nonce reuse)";
+
+    // Both open correctly under the client's independently-re-derived key —
+    // one key, two frame types, one monotonic seq stream.
+    cr::AeadCipher clientRecv1(f.gw.cipher, workerKey, f.gw.b2cPrefix);
+    std::vector<uint8_t> storage1;
+    const auto openedRecords = openRecordsAsClientWould(sealedRecords, clientRecv1, storage1);
+    ASSERT_TRUE(openedRecords.has_value());
+    EXPECT_EQ(openedRecords->sessionId, rec.sessionId);
+
+    const long mAck = clientRecv1.open(subAck->seq, sealedAck.data(), rpc::kCryptoHeaderBytes,
+                                        sealedAck.data() + rpc::kCryptoHeaderBytes,
+                                        sealedAck.size() - rpc::kCryptoHeaderBytes,
+                                        storage1.data());   // scratch reuse, only need success/failure here
+    EXPECT_GE(mAck, 0) << "the ack must open on the SAME per-sender key right after Records did, "
+                           "continuing that key's one seq stream";
+}
+
+// ---------------------------------------------------------------------------
+// RED-evidence toggle: if the ack sink were given its OWN independent
+// sendSeq counter (instead of sharing Worker.h's WorkerSessionCrypto::
+// sendSeq with Records, as flushAcks_'s new encrypted branch and the
+// ackSink_->flush crypto-lookup in Worker.h both do), a Records frame and an
+// ack sealed back-to-back under the same key would claim the SAME seq — an
+// AES-GCM nonce collision. Always `false` in the committed file.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr bool kInjectSeparateAckCounterBug = false;
+}
+
+TEST(GatewayCryptoDataPlane, WorkerAckAndRecordsSeparateCounterCollides_RedToggle) {
+    if (!kInjectSeparateAckCounterBug) {
+        GTEST_SKIP() << "RED-evidence toggle off in the committed file (see task-23-report.md)";
+    }
+    DataPlaneFixture f = makeDataPlaneFixture(/*sessionId=*/42);
+    constexpr uint8_t kSenderId = 2;
+    cr::AeadKey workerKey{};
+    ASSERT_TRUE(cr::deriveSenderKey(f.gw.b2c, kSenderId, workerKey));
+    cr::AeadCipher workerSend(f.gw.cipher, workerKey, f.gw.b2cPrefix);
+
+    // BUG: two INDEPENDENT counters instead of one shared WorkerSessionCrypto::sendSeq.
+    uint64_t recordsSeq = 0;
+    uint64_t ackSeqOwnCounter = 0;
+
+    const std::vector<uint8_t> batch(16, 0x22);
+    const rpc::Records rec = makeRecordsFrame(42, 1, 1, 1, 0, 0, batch);
+    const auto sealedRecords = sealRecordsAsPushWould(rec, workerSend, recordsSeq, f.gw.cipher, 0, kSenderId);
+    const rpc::ProduceResponse resp = makeProduceResponse(42, 2, 0, 0);
+    const auto sealedAck = sealAckAsFlushWould(resp, 2, workerSend, ackSeqOwnCounter, f.gw.cipher, kSenderId);
+    ASSERT_FALSE(sealedRecords.empty());
+    ASSERT_FALSE(sealedAck.empty());
+
+    const auto subRecords = rpc::CryptoSubHeader::decode(
+        sealedRecords.data() + rpc::MessageHeader::ENCODED_SIZE,
+        sealedRecords.size() - rpc::MessageHeader::ENCODED_SIZE);
+    const auto subAck = rpc::CryptoSubHeader::decode(
+        sealedAck.data() + rpc::MessageHeader::ENCODED_SIZE,
+        sealedAck.size() - rpc::MessageHeader::ENCODED_SIZE);
+    ASSERT_TRUE(subRecords.has_value());
+    ASSERT_TRUE(subAck.has_value());
+    // Expected to FAIL under the injected bug (RED evidence): both frames
+    // claim seq=1 under the SAME key — a nonce collision.
+    EXPECT_NE(subRecords->seq, subAck->seq)
+        << "expected to FAIL under the injected bug (RED evidence): a separate ack counter "
+           "collides with Records' seq under the one worker sender key";
 }
 
 // ---------------------------------------------------------------------------

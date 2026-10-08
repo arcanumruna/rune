@@ -86,6 +86,7 @@
 // delete), no node containers.  std::string only inside the policy's add()
 // (announcement, cold path).  Owner: the worker thread only.
 #include <rune/node/AeronChannel.h>
+#include <rune/node/RecordsSeal.h>
 #include <rune/node/SessionSignalKind.h>
 #include <rune/protocol/client/DataMessages.h>
 
@@ -256,13 +257,34 @@ public:
         return true;
     }
 
+    /// Task 23: every session is plaintext unless `lookupCrypto` says
+    /// otherwise — the default keeps flush()'s old 2-arg signature and
+    /// behavior byte-identical for every pre-Task-23 caller (this header's
+    /// own 1000+-line test file calls `s.flush(a, b)` throughout; a defaulted
+    /// template parameter means none of those call sites change).
+    struct NoSealLookup {
+        const RecordsSealCtx* operator()(int64_t /*sessionId*/) const noexcept { return nullptr; }
+    };
+
     /// One pass: advance announcements, then claim every queued ack on its
     /// session publication in order.  `ringProducerPos` / `ringConsumerPos`:
     /// the worker's session-lifecycle ring, sampled now (after every frame of
     /// this pass was observed) — they decide when an unknown session's ack is
-    /// truly orphaned (I1).  Returns work done.
-    int flush(int64_t ringProducerPos, int64_t ringConsumerPos) noexcept {
-        const int work = flushAcks_(ringProducerPos, ringConsumerPos);
+    /// truly orphaned (I1).
+    /// Task 23: `lookupCrypto(sessionId) -> const RecordsSealCtx*` — null for
+    /// a plaintext session (the default, and every existing caller); non-null
+    /// means "seal this session's ack under the worker's OWN per-sender b2c
+    /// cipher and sendSeq" (the SAME ctx/sendSeq Records sealing uses for that
+    /// session — see SessionAckSink.h's file header and flushAcks_'s seal
+    /// branch). The sink has no sessionId<->crypto table of its own (Rule 1:
+    /// shared-nothing — the worker already owns that table, sessionCrypto_);
+    /// this is the seam that lets the worker hand it over at flush time
+    /// without SessionAckSink depending on Worker.h's types.
+    /// Returns work done.
+    template <class CryptoLookup = NoSealLookup>
+    int flush(int64_t ringProducerPos, int64_t ringConsumerPos,
+              CryptoLookup&& lookupCrypto = CryptoLookup{}) noexcept {
+        const int work = flushAcks_(ringProducerPos, ringConsumerPos, lookupCrypto);
         if ((directDeferredThisPass_ | directEp_.tag) != 0) [[unlikely]] directEpisode_();
         return work;
     }
@@ -277,7 +299,8 @@ public:
     }
 
 private:
-    int flushAcks_(int64_t ringProducerPos, int64_t ringConsumerPos) noexcept {
+    template <class CryptoLookup>
+    int flushAcks_(int64_t ringProducerPos, int64_t ringConsumerPos, CryptoLookup& lookupCrypto) noexcept {
         ++pass_;
         int work = unresolvedCount_ ? resolvePending_() : 0;
         if (drainCount_) [[unlikely]] work += drainRegistrations_();
@@ -308,8 +331,44 @@ private:
                 if (r->blockedPass != pass_) {                      // per-session order kept
                     const int32_t ver = clientVersion_[idx];
                     // D6 review M4: the pre-D6 38 B frame below clientVersion 2.
-                    const int64_t pos = policy_.claim(r->pub, rune::protocol::client::ProduceResponse::encodedSizeFor(ver),
-                                                      [&](uint8_t* dst) { encode_(a, ver, dst); });
+                    const RecordsSealCtx* sealCtx = lookupCrypto(a.sessionId);
+                    int64_t pos;
+                    if (sealCtx) [[unlikely]] {
+                        // Task 23: this session is ENCRYPTED — seal BEFORE
+                        // claiming (mirrors sendRecordsFrame's ordering
+                        // exactly: RecordsPush.h's file header explains why
+                        // the zero-copy in-claim encode cannot survive AEAD
+                        // sealing). `sealCtx->sendSeq` is the worker's ONE
+                        // shared per-session counter (the SAME one Records
+                        // sealing increments for this session, Worker.h Task
+                        // 19/23) — ++*sendSeq happens inside sealRecordsFrame,
+                        // so acks and Records draw from one monotonic
+                        // sequence under the one b2c key, never two.
+                        const std::size_t plainLen = rune::protocol::client::ProduceResponse::encodedSizeFor(ver);
+                        encode_(a, ver, ackPlainScratch_.data());
+                        const std::size_t n = sealRecordsFrame(*sealCtx, ackPlainScratch_.data(), plainLen,
+                                                               ackSealedScratch_.data(), ackSealedScratch_.size());
+                        if (n == 0) [[unlikely]] {
+                            // Fail-closed (G-A6 never-drop + Task 23 ★★): no
+                            // send key installed yet, or an AEAD seal error —
+                            // NEVER fall back to a plaintext claim. Hold this
+                            // ack exactly like a back-pressured one (retried
+                            // next pass, in order) without touching Lost/
+                            // blockedPass — a missing key is not an Aeron
+                            // connectivity signal.
+                            if (heldPass_[idx] != pass_) {
+                                heldPass_[idx] = pass_;
+                                heldNow_[heldNowCount_++] = a.sessionId;
+                            }
+                            acks_[keep++] = a;
+                            continue;
+                        }
+                        pos = policy_.claim(r->pub, n,
+                                            [&](uint8_t* dst) { std::memcpy(dst, ackSealedScratch_.data(), n); });
+                    } else {
+                        pos = policy_.claim(r->pub, rune::protocol::client::ProduceResponse::encodedSizeFor(ver),
+                                            [&](uint8_t* dst) { encode_(a, ver, dst); });
+                    }
                     if (pos > 0) [[likely]] {
                         if (const Edges& e = edges_[idx];
                             ((e.lost | e.reportedHeld) != 0) | ((e.dflags & (kDfDelivered | kDfExpiring)) != kDfDelivered))
@@ -929,6 +988,18 @@ private:
     std::size_t                                                      freeChanCount_ = 0;
     std::array<AckEntry, kAckCapacity>                               acks_{};
     std::size_t                                                      ackCount_ = 0;
+    // Task 23: fixed scratch for the ENCRYPTED ack-seal path (flushAcks_'s
+    // seal branch). Unlike Records (RecordsSealScratch, a GROW-ONCE vector —
+    // batches are unbounded), a ProduceResponse has a compile-time-bounded
+    // max size (ENCODED_SIZE, 46 B — no record batch), so a fixed
+    // std::array is strictly simpler than grow-once here and still Rule-4
+    // zero-allocation (no vector, no resize, ever). One instance per sink
+    // (one per worker — shared-nothing); reused for every sealed ack, one at
+    // a time (the seal result is consumed synchronously before the next ack
+    // is processed, never held across iterations).
+    std::array<uint8_t, rune::protocol::client::ProduceResponse::ENCODED_SIZE>                     ackPlainScratch_{};
+    std::array<uint8_t, rune::protocol::client::ProduceResponse::ENCODED_SIZE +
+                             rune::protocol::client::kCryptoOverhead>                               ackSealedScratch_{};
     std::size_t                                                      heldAfterFlush_ = 0;
     std::size_t                                                      unreported_ = 0;
     uint64_t                                                         pass_    = 0;
