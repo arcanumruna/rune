@@ -1417,3 +1417,36 @@ TEST(HotPathBRegression, SealedReadMapsRetireOffTheWorkerRegression) {
     for (std::size_t i = 0; i + 1 < bases.size(); ++i)
         EXPECT_FALSE(rig.log->segmentForTest(bases[i])->hasReadMapForTest()) << "sealed segment " << bases[i];
 }
+
+// D26 (fix65 review observation): a consumer cursor inside a compacted TAIL
+// gap of a sealed segment was answered Empty with the same cursor every push
+// cycle (stuck).  The PushRead now serves the next segment's first batch and
+// advances the cursor past it.
+TEST(HotPathBRegression, PushReadCursorInACompactedTailGapAdvancesRegression) {
+    TmpDir at;
+    auto put = [&](int64_t base, int64_t first, int n) {
+        rune::protocol::RecordBatchBuilder b(first, 1000);
+        for (int i = 0; i < n; ++i) b.append("k", "v", 1000 + i);
+        const auto bytes = b.build();
+        char name[32];
+        std::snprintf(name, sizeof name, "%020lld.log", static_cast<long long>(base));
+        std::ofstream f(at.p / name, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    put(0, 0, 5);     // segment 0 kept [0, 4]; its [5, 9] compacted away
+    put(10, 10, 2);   // segment 10: [10, 11]
+    Rig rig(false, 64 * 1024 * 1024, &at.p);
+    ASSERT_EQ(rig.log->logEndOffset(), 12);
+    ASSERT_TRUE(rig.passUntil([&] { return rig.rep->highWatermark() == 12; })) << "precondition: HW at the LEO";
+    rig.pushRead(700, 6);
+    int64_t next = -1;
+    std::size_t bytes = 0;
+    ASSERT_TRUE(rig.passUntil([&] {
+        rig.pool.drainAllReturns([&](WorkerReturn r) {
+            if (r.type == WorkerReturn::Type::PushReadResult) { next = r.newNextOffset; bytes = r.chunk.size(); }
+        });
+        return next >= 0;
+    })) << "the PushRead was never answered";
+    EXPECT_EQ(next, 12) << "the cursor in the tail gap did not advance";
+    EXPECT_GT(bytes, 0u);
+}

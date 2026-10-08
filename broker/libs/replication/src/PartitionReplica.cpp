@@ -3325,9 +3325,21 @@ Offset PartitionReplica::pushFloor_() const noexcept
 rune::storage::LogReadView PartitionReplica::readLog_(Offset from, int32_t maxBytes) noexcept
 {
     if (!memoryBacked_ && readScratch_ != nullptr) [[likely]] {
-        bool tooLarge = false;
-        const rune::storage::LogReadView v = diskLog_->readInto(from, maxBytes, readScratch_, readScratchCap_, tooLarge);
-        if (!tooLarge) [[likely]] return v;
+        rune::storage::ReadIntoStatus st;
+        int err = 0;
+        const rune::storage::LogReadView v =
+            diskLog_->readInto(from, maxBytes, readScratch_, readScratchCap_, st, INT64_MAX, &err);
+        if (st != rune::storage::ReadIntoStatus::FirstTooLarge) [[likely]] {
+            // D26: an I/O error is answered empty (the fetch / push retries) —
+            // never retried through the read mapping (SIGBUS on the bad page).
+            if (st == rune::storage::ReadIntoStatus::IoError) [[unlikely]] {
+                ++readErrors_;
+                if ((readErrors_ & (readErrors_ - 1)) == 0)
+                    spdlog::error("PartitionReplica[topic={} part={}]: log read at {} failed (errno={}, errors={})",
+                                  cfg_.topicId, cfg_.partitionId, from, err, readErrors_);
+            }
+            return v;
+        }
         ++readMapFallbacks_;
     }
     return onLog([&](auto& L) { return L.readView(from, maxBytes); });

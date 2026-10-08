@@ -2784,7 +2784,7 @@ private:
             // segment read mmap.  noexcept (F3): a failed read is an empty view
             // (retry next pass).
             const rune::storage::LogReadView view = readNoFault_(
-                s.logPtr, s.nextOffset, std::min<std::size_t>(kPushMaxChunkBytes, pushBudgetLeft_));
+                s.logPtr, s.nextOffset, std::min<std::size_t>(kPushMaxChunkBytes, pushBudgetLeft_), bound);
             if (view.empty()) continue;
 
             std::size_t pos = 0;
@@ -3145,7 +3145,7 @@ private:
         // #65: a pread into the worker's scratch (readNoFault_) — never the
         // segment read mmap.  noexcept (F3): a failed read is an empty view —
         // answered empty, the gateway retries next cycle.
-        const rune::storage::LogReadView v = readNoFault_(log, a.nextOffset, cap);
+        const rune::storage::LogReadView v = readNoFault_(log, a.nextOffset, cap, bound);
         if (v.empty()) return PushChunk::Empty;
         const bool preCarrier = a.isGroup && !a.carrier;
         std::size_t rd = 0, nRuns = 0, total = 0;
@@ -3262,18 +3262,33 @@ private:
     // #65: the worker's push reads.  First-touch page faults on a segment read
     // MMAP take the process mmap_lock for read — queued behind the provisioner /
     // cleaner threads' mmap/munmap holding it for write: ~1 ms off-CPU worker
-    // passes (box perf, briefs/2026-10-07-reads-retention-bisect.md).  So: ONE
-    // pread into the preallocated scratch (no allocation, no fault).  Only a
-    // first batch larger than the whole scratch (near the ring's max message)
-    // falls back to the mapped view — counted.  The view is valid until the
-    // next push read on this thread.
-    rune::storage::LogReadView readNoFault_(rune::storage::Log* log, int64_t offset, std::size_t maxBytes) noexcept {
-        bool tooLarge = false;
+    // passes (box perf, briefs/2026-10-07-reads-retention-bisect.md).  So: a
+    // pread into the preallocated scratch (no allocation, no fault), sized to
+    // the request and stopping near `bound` (the HW / LSO: D26).  Only a first
+    // batch larger than the whole scratch falls back to the mapped view —
+    // counted (pushReadMapFallbacks_), and only after its bytes read cleanly.
+    // An I/O error is answered empty (retried next cycle), counted and logged —
+    // never retried through the mapping (SIGBUS on the same bad page; D26).
+    // The view is valid until the next push read on this thread.
+    rune::storage::LogReadView readNoFault_(rune::storage::Log* log, int64_t offset, std::size_t maxBytes,
+                                            int64_t bound) noexcept {
+        rune::storage::ReadIntoStatus st;
+        int err = 0;
         const rune::storage::LogReadView v = log->readInto(offset, static_cast<int32_t>(maxBytes), pushScratch_.data(),
-                                                           pushScratch_.size(), tooLarge);
-        if (!tooLarge) [[likely]] return v;
+                                                           pushScratch_.size(), st, bound, &err);
+        if (st != rune::storage::ReadIntoStatus::FirstTooLarge) [[likely]] {
+            if (st == rune::storage::ReadIntoStatus::IoError) [[unlikely]] notePushReadError_(log, offset, err);
+            return v;
+        }
         ++pushReadMapFallbacks_;
         return log->readView(offset, static_cast<int32_t>(maxBytes));
+    }
+    [[gnu::cold]] void notePushReadError_(const rune::storage::Log* log, int64_t offset, int err) noexcept {
+        ++pushReadErrors_;
+        if ((pushReadErrors_ & (pushReadErrors_ - 1)) == 0)   // rate-limited: powers of two
+            spdlog::error("Worker {}: push read of {} at offset {} failed (errno={}, errors={}) — answered empty, "
+                          "retried next cycle (never through the read mapping)", workerId_, log->dir(), offset, err,
+                          pushReadErrors_);
     }
 
     [[gnu::cold]] void notePushReadOversize_(int32_t topicId, int32_t partition, int64_t offset) noexcept {
@@ -4396,6 +4411,7 @@ public:
     [[nodiscard]] uint64_t pushReadsDeferredForTest() const noexcept { return pushReadsDeferred_; }
     /// #65: push reads that fell back to the segment read mmap (first batch > scratch).
     [[nodiscard]] uint64_t pushReadMapFallbacksForTest() const noexcept { return pushReadMapFallbacks_; }
+    [[nodiscard]] uint64_t pushReadErrorsForTest() const noexcept { return pushReadErrors_; }
     [[nodiscard]] std::size_t deferredPushReadsForTest() const noexcept { return deferredPushCount_; }
 private:
     std::size_t                           pushBudgetLeft_ = kPushPassBudgetBytes;
@@ -4406,6 +4422,7 @@ private:
     /// batches fall back to the mapped view (pushReadMapFallbacks_).
     std::vector<uint8_t>                  pushScratch_ = std::vector<uint8_t>(2 * kPushPassBudgetBytes + 64 * 1024);
     uint64_t                              pushReadMapFallbacks_ = 0;
+    uint64_t                              pushReadErrors_ = 0;   ///< D26: push-read pread failures (answered empty)
     /// D26: replication read scratch — a fetch serve / owed re-serve / push of
     /// an owned replica preads into it (PartitionReplica::setReadScratch), never
     /// faulting through the segment read map.  maxFetchBytes (1 MiB) + the

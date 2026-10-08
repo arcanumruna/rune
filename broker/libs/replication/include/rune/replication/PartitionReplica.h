@@ -1305,6 +1305,7 @@ private:
     uint8_t*                    readScratch_ = nullptr;     ///< D26: see setReadScratch()
     std::size_t                 readScratchCap_ = 0;
     uint64_t                    readMapFallbacks_ = 0;
+    uint64_t                    readErrors_ = 0;            ///< D26: pread failures (answered empty)
     /// D26: a whole-batch read of the active log — a pread into readScratch_
     /// when set (disk log), else the mapped view.  The view lives until the next
     /// read through this helper on the same thread.
