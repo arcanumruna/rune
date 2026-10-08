@@ -713,6 +713,23 @@ ConfigResult parseNodeConfig(
         }
     }
 
+    // Task 9 (RUNE_TLS toggle, spec §11): cert/key file paths + require_tls.
+    // Only consulted in a RUNE_TLS build (RUNE_TLS_ENABLED) — a RUNE_TLS=OFF
+    // build never reads these env vars, so it stays byte-identical plaintext
+    // no matter what an operator sets (the CMake gate, not just a runtime
+    // default, is the safety net here).
+#ifdef RUNE_TLS_ENABLED
+    if (const char* cf = getenv_fn("RUNE_TLS_CERT_FILE"); cf && *cf) cfg.tlsCertFile = cf;
+    if (const char* kf = getenv_fn("RUNE_TLS_KEY_FILE");  kf && *kf) cfg.tlsKeyFile  = kf;
+    {
+        const char* raw = getenv_fn("RUNE_REQUIRE_TLS");
+        if (raw) {
+            const std::string_view sv(raw);
+            cfg.requireTls = (sv == "1" || sv == "true" || sv == "TRUE");
+        }
+    }
+#endif
+
     // --- RUNE_TOPICS (optional) ---
     // Format: comma-separated entries, each of the form:
     //   name:partitionCount[:policy[:segmentRollBytes[:deleteRetentionMs

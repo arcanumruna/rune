@@ -89,6 +89,28 @@ if(BUILD_TESTING)
     gtest_discover_tests(rune_gateway_crypto_tests)
 
     # -------------------------------------------------------------------------
+    # Task 9: require_tls / shard-mode downgrade-safety decision logic
+    # (ConnectDowngradePolicy.h) + cert/key FILE PATH -> PEM TEXT loading
+    # (rune/node/PemFile.{h,cpp}). Aeron-free for the same reason as
+    # rune_gateway_crypto_tests above: compiles PemFile.cpp directly (NOT
+    # rune_node, which would drag in Worker.h -> RecordsPush.h -> Aeron) +
+    # rune_crypto + GTest only.
+    # -------------------------------------------------------------------------
+    add_executable(rune_gateway_require_tls_tests
+        tests/RequireTlsDowngradeTest.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../node/src/PemFile.cpp)
+    target_include_directories(rune_gateway_require_tls_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../node/include
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_gateway_require_tls_tests PRIVATE
+        rune_crypto
+        GTest::gtest_main)
+    target_compile_definitions(rune_gateway_require_tls_tests PRIVATE
+        RUNE_CRYPTO_TESTDATA_DIR="${RUNE_CRYPTO_ROOT}/tests/testdata")
+    gtest_discover_tests(rune_gateway_require_tls_tests)
+
+    # -------------------------------------------------------------------------
     # TopicRegistry unit tests (GB-1) — no Aeron, real filesystem + rune_storage.
     # -------------------------------------------------------------------------
     add_executable(rune_gateway_topic_registry_tests

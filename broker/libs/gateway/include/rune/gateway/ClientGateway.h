@@ -207,9 +207,16 @@ public:
     //                                 loaded once, at construction.  Both empty (the default) =
     //                                 crypto disabled: a Connect that offers cipherList/handshakeBytes
     //                                 silently degrades to the pre-Task-7 plaintext path, byte-
-    //                                 identical to today.  Task 9 owns the RUNE_TLS toggle / actual
-    //                                 file loading + SIGHUP reload / require_tls hard-reject; this
-    //                                 constructor only takes the PEM text it's handed.
+    //                                 identical to today (unless requireTls is set below).  Task 9
+    //                                 owns the RUNE_TLS toggle / the file loading (BrokerNode) /
+    //                                 SIGHUP reload (reloadTlsCert()); this constructor only takes
+    //                                 the PEM text it's handed.
+    // @param requireTls               Task 9 (downgrade safety, spec §11): when true, a Connect
+    //                                 that does NOT end up with an established crypto session
+    //                                 (plaintext client, no broker cert/key, or shard mode refusing
+    //                                 the crypto offer — see shouldEngageCrypto()'s ★ gating note)
+    //                                 is hard-rejected with ConnectResponse{HandshakeFailed} —
+    //                                 NEVER served plaintext.  Default false (back-compat).
     ClientGateway(std::shared_ptr<aeron::Aeron>       aeron,
                   std::string                         clientChannel,
                   int32_t                             clientStreamId,
@@ -219,7 +226,8 @@ public:
                   int64_t                             connectResolveTimeoutNs  = kDefaultConnectResolveTimeoutNs,
                   rune::aeronutil::AeronPump          pump                     = {},
                   std::string                         tlsCertPem               = {},
-                  std::string                         tlsKeyPem                = {});
+                  std::string                         tlsKeyPem                = {},
+                  bool                                requireTls               = false);
 
     ~ClientGateway() = default;
 
@@ -1512,9 +1520,13 @@ private:
     std::function<LeaderView()>          leaderView_;
     // client<->broker TLS/AEAD (Task 7): this broker's TLS server cert/key,
     // as PEM text, loaded once at construction.  Both empty = crypto disabled
-    // (see the ctor's tlsCertPem/tlsKeyPem doc comment).
+    // (see the ctor's tlsCertPem/tlsKeyPem doc comment).  Task 9: ALSO swapped
+    // by reloadTlsCert() on SIGHUP renewal — single-writer, duty-cycle thread
+    // only (see reloadTlsCert()'s precondition).
     std::string                          tlsCertPem_;
     std::string                          tlsKeyPem_;
+    // Task 9 (require_tls, spec §11 downgrade safety): see the ctor doc comment.
+    bool                                  requireTls_ = false;
 
     std::shared_ptr<aeron::Subscription> sub_;
     rune::aeronutil::FragmentAssembler   assembler_;
@@ -1978,6 +1990,31 @@ public:
     // answers), worker psm_ authority for user partitions, SessionClose on every
     // worker at Disconnect / reap / connect timeout.  Set before the runtime runs.
     void setShardMode(bool on) noexcept { shardMode_ = on; }
+
+    // Task 9 (require_tls, spec §11 downgrade safety). Set before the runtime
+    // runs (mirrors setShardMode); also usable from makeForTest()-built
+    // gateways where the ctor's requireTls param isn't reachable.
+    void setRequireTls(bool on) noexcept { requireTls_ = on; }
+    [[nodiscard]] bool requireTls() const noexcept { return requireTls_; }
+
+    // Task 9 (SIGHUP cert/key reload — Let's Encrypt renewal): swap in newly
+    // re-read PEM text so the NEXT handshake uses the renewed cert; any
+    // session already mid-handshake or established keeps its existing keys
+    // (tlsCertPem_/tlsKeyPem_ are read only at a NEW Connect's
+    // TlsSession::makeServer() call in handleConnect).
+    //
+    // Shared-nothing precondition: call ONLY from this gateway's own
+    // duty-cycle thread (the same thread that calls doWork() /
+    // handleConnect()) — e.g. BrokerNode::serviceAdminControl_(), which
+    // already runs there, polling a trigger-only ControlRing a signal/main
+    // thread offered on SIGHUP.  Never call this from a signal handler or
+    // any other thread: there is no lock here, by design (rule 1 — the
+    // gateway's state is single-writer, and the cross-thread boundary is
+    // the ring, not this setter).
+    void reloadTlsCert(std::string certPem, std::string keyPem) noexcept {
+        tlsCertPem_ = std::move(certPem);
+        tlsKeyPem_  = std::move(keyPem);
+    }
 
     /// DR-15 fix round 2 (LOW-4): a client's reply-channel HOSTNAME is resolved
     /// by the cold resolver thread through `port` and the egress publication is

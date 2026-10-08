@@ -117,6 +117,16 @@ add_library(rune_codec STATIC
 target_include_directories(rune_codec PUBLIC ${RUNE_CODEC_ROOT}/include)
 target_compile_features(rune_codec PUBLIC cxx_std_23)
 
+# Task 9 / spec §11: RUNE_TLS — the client<->broker TLS/AEAD enablement gate.
+# OFF (default): NodeConfig.cpp never reads RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE/
+# RUNE_REQUIRE_TLS from the environment (guarded by the RUNE_TLS_ENABLED compile
+# definition below) — tlsCertFile/tlsKeyFile/requireTls stay at their empty/false
+# defaults no matter what an operator sets, so a RUNE_TLS=OFF build is
+# byte-identical plaintext (the crypto core itself, Tasks 5-8/8b, is already
+# always compiled in — this option gates ONLY the config path that could ever
+# arm it). ON: the broker can be deployed with cert/key files + require_tls.
+option(RUNE_TLS "Enable the RUNE_TLS client<->broker TLS/AEAD config path (cert/key file loading, require_tls, SIGHUP reload)" OFF)
+
 option(ENABLE_COVERAGE "Enable coverage instrumentation" OFF)
 if(ENABLE_COVERAGE)
     add_compile_options(--coverage -O0 -g)
@@ -208,6 +218,9 @@ add_subdirectory(libs/replication)
 add_subdirectory(libs/coordination)
 add_subdirectory(libs/transaction)
 add_subdirectory(libs/node)
+if(RUNE_TLS)
+    target_compile_definitions(rune_node PRIVATE RUNE_TLS_ENABLED)
+endif()
 add_subdirectory(libs/gateway)
 
 # Flight-recorder instrumentation: link rune_fr PUBLIC into every instrumented

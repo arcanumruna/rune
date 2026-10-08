@@ -1,6 +1,7 @@
 // ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 
 #include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/ConnectDowngradePolicy.h>
 #include <rune/gateway/CryptoFrame.h>
 #include <cassert>
 #include <rune_fr/FlightRecorder.h>
@@ -86,7 +87,8 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
                              int64_t                         connectResolveTimeoutNs,
                              rune::aeronutil::AeronPump      pump,
                              std::string                     tlsCertPem,
-                             std::string                     tlsKeyPem)
+                             std::string                     tlsKeyPem,
+                             bool                            requireTls)
     : aeron_(std::move(aeron))
     , clientChannel_(std::move(clientChannel))
     , clientStreamId_(clientStreamId)
@@ -96,6 +98,7 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
     , leaderView_(std::move(leaderView))
     , tlsCertPem_(std::move(tlsCertPem))
     , tlsKeyPem_(std::move(tlsKeyPem))
+    , requireTls_(requireTls)
 {
     // Pre-allocate the draining-release vector (bounded by kMaxPendingConnects).
     // pendingConnects_ is a deque — no reserve() needed; O(1) front push/pop.
@@ -1494,29 +1497,36 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // client<->broker TLS/AEAD (Task 7): drive the server-role handshake's
     // FIRST leg right here, synchronously, off the client's ClientHello
     // bytes carried on this very ConnectRequest.  Skipped entirely for a
-    // redirect (this node will create no session either way) and when this
-    // gateway has no cert/key configured (silent plaintext degrade — Task 9
-    // owns require_tls's hard rejection of that case).
+    // redirect (this node will create no session either way).
     // NOTE: capturedLeaderEndpoint was already std::move()'d into
     // pc_entry.leaderClientEndpoint above — read the redirect decision back
     // off pc_entry, not the now-moved-from local.
     const bool isRedirectCapture = (!pc_entry.isLeader && !pc_entry.leaderClientEndpoint.empty());
     const bool clientOffersCrypto = !req.cipherList.empty() && !req.handshakeBytes.empty();
     const bool brokerHasTls       = !tlsCertPem_.empty() && !tlsKeyPem_.empty();
-    if (!isRedirectCapture && clientOffersCrypto && brokerHasTls) {
+    if (!isRedirectCapture && shardModeRefusesCryptoOffer(shardMode_, clientOffersCrypto, brokerHasTls)) {
+        // Task 9 ★ gating note (see ConnectDowngradePolicy.h): never let an
+        // encrypted session be served by a shard-mode worker — Worker.h's
+        // per-worker Records egress is still plaintext until Task 14.
+        spdlog::warn("ClientGateway: refusing an encrypted Connect in SHARD mode (per-worker "
+                     "Records egress is plaintext until Task 14); session={}", sessionId);
+        pc_entry.cryptoFailed = true;
+    } else if (!isRedirectCapture && shouldEngageCrypto(shardMode_, clientOffersCrypto, brokerHasTls)) {
         pc_entry.tls.emplace(rune::crypto::TlsSession::makeServer(tlsCertPem_.c_str(), tlsKeyPem_.c_str()));
         if (!pc_entry.tls->valid()) {
             // Local TLS init failure (e.g. a misconfigured cert/key on THIS
             // broker) — degrade to plaintext rather than hard-fail a connect
             // over a broker-side problem the client had no part in (mirrors
             // the client's own beginCryptoHandshake_ degrade-on-local-failure).
+            // require_tls (below) still catches this and rejects rather than
+            // serving it plaintext when the operator asked for mandatory TLS.
             pc_entry.tls.reset();
         } else {
             // The broker's chosen cipher: the client's first preference.
             // (A real negotiation policy — e.g. intersecting with a broker
-            // allow-list — is Task 9's RUNE_TLS/require_tls scope; here we
-            // mirror the client reference test's own driveHandshake(), which
-            // takes cipherList[0] verbatim.)
+            // allow-list — is future scope; here we mirror the client
+            // reference test's own driveHandshake(), which takes
+            // cipherList[0] verbatim.)
             pc_entry.chosenCipher = static_cast<rune::crypto::Cipher>(req.cipherList[0]);
             const auto hs = pc_entry.tls->readInbound(
                 reinterpret_cast<const uint8_t*>(req.handshakeBytes.data()),
@@ -1532,6 +1542,20 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
                 drainHandshakeOutbound_(pc_entry);
             }
         }
+    }
+
+    // require_tls (Task 9, downgrade safety — spec §11): once the above has
+    // resolved whether this connect established crypto, hard-reject any
+    // case that would otherwise be served plaintext.  Covers: a plaintext
+    // client, this broker having no cert/key, a local TLS init failure
+    // degrading to plaintext above, AND a shard-mode-refused crypto offer
+    // (already cryptoFailed=true, so this is a no-op there — it stays
+    // HandshakeFailed either way, never silently plaintext).
+    if (!isRedirectCapture && !pc_entry.cryptoFailed &&
+        mustRejectForRequireTls(requireTls_, pc_entry.tls.has_value())) {
+        spdlog::warn("ClientGateway: require_tls rejecting a plaintext Connect "
+                     "(session={})", sessionId);
+        pc_entry.cryptoFailed = true;
     }
 
     // DR-15 fix round 2 (LOW-4): a reply HOSTNAME is resolved off-thread by the

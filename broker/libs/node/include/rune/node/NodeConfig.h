@@ -41,6 +41,7 @@
 // All Aeron channels use the aeron:udp transport (container transport).
 
 #include <rune/node/IdleShape.h>
+#include <rune/node/PemFile.h>   // Task 9: loadPemFile() — re-exported here for config callers
 
 #include <algorithm>
 #include <cstddef>
@@ -415,6 +416,28 @@ struct NodeConfig {
     // it only to recover a cluster whose metadata ISR members are gone for
     // good, then turn it off again.
     bool uncleanConsensusElection = false;
+
+    // Task 9 (RUNE_TLS — client<->broker TLS/AEAD enablement, spec §11):
+    // cert/key FILE PATHS (PEM), loaded once at BrokerNode startup and on
+    // every SIGHUP (renewal reload) — the ClientGateway ctor itself still
+    // wants PEM TEXT, never a path (Task 7's contract); BrokerNode reads
+    // these files and passes the text through.  Both empty (the default) =
+    // crypto disabled for this node, byte-identical to pre-Task-7/9
+    // behaviour.  Only read from the environment when compiled with the
+    // RUNE_TLS CMake option ON (RUNE_TLS_ENABLED); OFF ⇒ these stay empty
+    // regardless of the environment, so a RUNE_TLS=OFF build can never
+    // negotiate TLS no matter what an operator sets.
+    //   RUNE_TLS_CERT_FILE — PEM cert file path (RUNE_TLS build only).
+    //   RUNE_TLS_KEY_FILE  — PEM private-key file path (RUNE_TLS build only).
+    std::string tlsCertFile;
+    std::string tlsKeyFile;
+
+    // Task 9 / spec §11 require_tls: when true, the broker's ClientGateway
+    // hard-rejects (ConnectResponse{HandshakeFailed}) any Connect that does
+    // not establish an encrypted session — never silently serves it
+    // plaintext.  Default false (back-compat: plaintext clients are served
+    // plaintext).  RUNE_REQUIRE_TLS env var (RUNE_TLS build only).
+    bool requireTls = false;
 
     // Milestone E1: number of in-process partition workers. Each owned shard is
     // assigned to worker = hash(shardId) % workerCount (ShardRouter). Default 1
