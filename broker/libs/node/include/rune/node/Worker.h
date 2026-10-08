@@ -2616,15 +2616,16 @@ private:
 
     // -------------------------------------------------------------------
     // read-rework T3/T4 (I3): in-worker push loop.  For each active owned
-    // subscription, zero-copy read whole batches from the cursor (Log::readView),
+    // subscription, read whole batches from the cursor (#65: a pread into the
+    // worker's push scratch, readNoFault_ — never the segment read mmap),
     // encode each as a Records frame into egressScratch_, and push it directly on
     // THIS worker's dynamic-MDC egress publication (workerEgress_).  Advance the
     // cursor only on a successful send (back-pressure preserves at-least/exactly-
     // once, same invariant as the gateway push path).
     //
     // Shared-nothing: reads only worker-owned state (subs_, the owned Log/replica,
-    // workerEgress_).  Zero heap alloc on the hot path (readView span + preallocated
-    // egressScratch_).  No locks/atomics.
+    // workerEgress_).  Zero heap alloc on the hot path (preallocated push scratch +
+    // egressScratch_; one pread per subscription read).  No locks/atomics.
     //
     // Bound: read_uncommitted → HW (replica->highWatermark(), or LEO passthrough).
     // read_committed → the LSO of this worker's own RC state (F15 §2.4, K1);
@@ -2781,8 +2782,9 @@ private:
 
             const bool freshPass = pushBudgetLeft_ == kPushPassBudgetBytes;
             // #65 (review MAJOR-1): a pread into the worker's scratch — never the
-            // segment read mmap.  noexcept (F3): a failed read is an empty view
-            // (retry next pass).
+            // segment read mmap — stopping near the bound (D26).  noexcept (F3):
+            // a failed read is an empty view (retry next pass; an I/O error is
+            // counted + logged, never retried through the mapping).
             const rune::storage::LogReadView view = readNoFault_(
                 s.logPtr, s.nextOffset, std::min<std::size_t>(kPushMaxChunkBytes, pushBudgetLeft_), bound);
             if (view.empty()) continue;
@@ -3089,10 +3091,11 @@ private:
         ret.setPushEffectiveBound(bound);
 
         // Only read if there are records available (within the bound).
-        // F5 (hot-path B): zero allocation, one copy — the chunk is gathered
-        // from the segment's read mmap (Log::readView) straight into the
-        // claimed return-ring slot, clamped on the fly (bound, markers,
-        // aborted batches), within this pass's push byte budget.
+        // F5 (hot-path B) + #65: zero allocation — the chunk is pread into the
+        // worker's push scratch (readNoFault_: one pread, no page fault), then
+        // gathered into the claimed return-ring slot (two copies in all),
+        // clamped on the fly (bound, markers, aborted batches), within this
+        // pass's push byte budget.
         if (nextOffset < bound) {
             switch (readPushChunk_(a, ret, log, bound, rc)) {
             case PushChunk::Written:
@@ -3121,11 +3124,13 @@ private:
         enqueueReturn_(std::move(ret));   // no chunk: a fixed-size answer
     }
 
-    // F5: one PushRead's chunk.  Walks the whole batches of a zero-copy
-    // readView once, applying the F15 §2.4 / R-2 clamp (bound, control markers
-    // never delivered, read_committed aborted batches stripped / cut pre-carrier)
-    // and collects the kept bytes as runs; then claims ONE ret_ slot and gathers
-    // the runs into it.  No allocation, no syscall (the read map exists), one copy.
+    // F5: one PushRead's chunk.  Walks the whole batches of one read (#65: a
+    // pread into the push scratch — readNoFault_) once, applying the F15 §2.4 /
+    // R-2 clamp (bound, control markers never delivered, read_committed aborted
+    // batches stripped / cut pre-carrier) and collects the kept bytes as runs;
+    // then claims ONE ret_ slot and gathers the runs into it.  No allocation;
+    // one pread syscall (rarely two: a first batch the window cut) and two
+    // copies (kernel -> scratch, scratch -> ring).
     //   Written  — answered in ret_ (budget charged);
     //   Empty    — no deliverable batch; ret.newNextOffset is past what was
     //              examined (answer it — R-1);
@@ -3143,8 +3148,9 @@ private:
         const std::size_t fit = pushReadChunkFit_();
         const std::size_t cap = std::min({static_cast<std::size_t>(kMaxPushReadChunkBytes), fit, pushBudgetLeft_});
         // #65: a pread into the worker's scratch (readNoFault_) — never the
-        // segment read mmap.  noexcept (F3): a failed read is an empty view —
-        // answered empty, the gateway retries next cycle.
+        // segment read mmap — stopping near the bound (D26).  noexcept (F3): a
+        // failed read is an empty view — answered empty, the gateway retries
+        // next cycle.
         const rune::storage::LogReadView v = readNoFault_(log, a.nextOffset, cap, bound);
         if (v.empty()) return PushChunk::Empty;
         const bool preCarrier = a.isGroup && !a.carrier;
@@ -3186,7 +3192,7 @@ private:
             next = last + 1;
         }
         // A pass that already pushed never takes a batch past its budget (the
-        // view's first batch is always included — readView's progress rule).
+        // view's first batch is always included — the read's progress rule).
         if (total > pushBudgetLeft_ && !freshPass) return PushChunk::Deferred;
         if (total == 0) {
             if (cutBound >= 0) ret.setPushEffectiveBound(cutBound);
@@ -4385,7 +4391,7 @@ private:
     static constexpr std::size_t kEgressScratchSize = 68 * 1024;
     // Max whole batches pushed per subscription per doWork cycle (fairness).
     static constexpr int         kPushBatchesPerSubPerCycle = 1024;
-    // Max bytes fetched per subscription per cycle via readView (matches gateway).
+    // Max bytes read per subscription per cycle (matches gateway).
     static constexpr int32_t     kPushMaxChunkBytes = static_cast<int32_t>(512 * 1024);
     std::vector<uint8_t> egressScratch_;
     // Task 23 (egress audit, 3rd path): sendPushTooLarge_'s ENCRYPTED-session
