@@ -76,6 +76,7 @@
 //   min(activeSegmentBase, highWatermark) — segments at or above HW are
 //   never included in cleanableBytes and are never passed to produceCleanedFile.
 
+#include <atomic>
 #include <rune/consensus/ConsensusAgent.h>
 #include <rune/node/CleanerViewChannel.h>
 #include <rune/node/ReplicaRegistry.h>
@@ -199,7 +200,12 @@ public:
     /// of doWork, so an owner accept can land right before a compaction pass.
     void setSkipCycleFileOpsForTest(bool v) noexcept { skipCycleFileOpsForTest_ = v; }
 
+    /// Completed doWork cycles (D25: tests wait on cleaner progress, never on
+    /// wall-clock sleeps).  Read from any thread (CLEANER-category atomic).
+    [[nodiscard]] uint64_t cyclesDoneForTest() const noexcept { return cyclesDone_.load(std::memory_order_acquire); }
+
     int doWork(int64_t nowNs) override {
+        struct CycleDone { LogCleanerAgent& a; ~CycleDone() { a.cyclesDone_.fetch_add(1, std::memory_order_release); } } cycleDone{*this};
         if (channel_) applyViewUpdates_();
         if (!registry_ && !channel_) return 0;
 
@@ -951,6 +957,7 @@ private:
     rune::storage::SkimpyOffsetMap dedupeMap_;
     std::vector<int64_t> scratchBases_;
     bool skipCycleFileOpsForTest_ = false;   ///< test seam: skip the top-of-cycle file ops
+    std::atomic<uint64_t> cyclesDone_{0};    ///< D25: completed cycles (cyclesDoneForTest)
     bool externalProvisioner_ = false;       ///< hotpath-A F2: see setExternalProvisioner
     rune::storage::Log* boundaryExclude_ = nullptr;   ///< the log a pass is compacting (fix round 6)
     int64_t boundaryNowMs_ = 0;

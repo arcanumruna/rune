@@ -660,6 +660,11 @@ public:
         if (!cleanerAgent_) return -2; // -2 = no cleaner (sentinel for test)
         return cleanerAgent_->throttleRateForTest();
     }
+    /// D25: completed log-cleaner cycles (0 when there is no cleaner) — tests
+    /// wait on cleaner progress instead of sleeping.
+    [[nodiscard]] uint64_t cleanerCyclesForTest() const noexcept {
+        return cleanerAgent_ ? cleanerAgent_->cyclesDoneForTest() : 0;
+    }
 
     /// Test-only: worker id owning (topicId, partition) per the WorkerPool router.
     /// Returns -1 if workerPool_ is null (no topics configured or E1 not wired).

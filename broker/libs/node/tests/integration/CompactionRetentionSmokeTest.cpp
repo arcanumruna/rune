@@ -517,43 +517,42 @@ TEST(CompactionRetentionSmoke, TombstoneLifecycle_KIP534) {
     // tombstone's segment in Phase A; with the watermark fix the cleaner now
     // correctly reaches and stamps it, so a 1-day horizon would never expire and
     // Phase C could never drop it.)
-    constexpr int64_t kTombRetentionMs = 1'500LL; // short: expires between A and C
-    {
-        auto cfg2 = makeSmokeConfig(tmp.path);
-        rune::node::TopicSpec ts;
-        ts.name                   = "tomb-topic";
-        ts.partitionCount         = 1;
-        ts.topicId                = 0;
-        ts.cleanupPolicy          = rune::node::TopicSpec::CleanupPolicy::Compact;
-        ts.minCleanableDirtyRatio = 0.0;
-        ts.deleteRetentionMs      = kTombRetentionMs;
-        ts.segmentRollBytes       = kRoll;
-        cfg2.topics               = {ts};
-        // Coalescing ON so the cleaner coalesces the small segments and reaches
-        // the tombstone's segment (the converged, production-default behavior).
-        cfg2.enableCompactionCoalescing = true;
-
-        rune::node::BrokerNode node{cfg2};
-        node.start();
-        ASSERT_TRUE(node.awaitLeader(3s)) << "Smoke2: must self-elect";
-        ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s))
-            << "Smoke2: replication bridge must propagate within 2 s";
-        // HW is advanced to LEO by becomeLeader() on duty-cycle thread.
-        // No test-thread replica calls (duty-thread-only invariant).
-
-        // Check the tombstone PROMPTLY after the first compaction pass, BEFORE
-        // the short horizon expires: a couple hundred ms is enough for the
-        // cleaner to run one pass but well under kTombRetentionMs.
-        std::this_thread::sleep_for(300ms);
-        node.stop();
-    }
-
-    {
+    constexpr int64_t kTombRetentionMs = 3'000LL; // short: expires between A and C (D25: room for slow cleaners)
+    // D25: Phase A runs until the cleaner has STAMPED the tombstone's delete
+    // horizon (KIP-534 attribute bit, verified on disk after a clean stop) —
+    // a cleaner cycle is not necessarily a compaction pass over that segment,
+    // and an unstamped tombstone would be stamped (not dropped) by Phase C's
+    // first pass.  Bounded attempts; no wall-clock sleeps.
+    int64_t stampedHorizonMs = -1;
+    bool victimFound = false, victimIsEmpty = false;
+    for (int attempt = 0; attempt < 5 && stampedHorizonMs < 0; ++attempt) {
+        {
+            auto cfg2 = makeSmokeConfig(tmp.path);
+            rune::node::TopicSpec ts;
+            ts.name                   = "tomb-topic";
+            ts.partitionCount         = 1;
+            ts.topicId                = 0;
+            ts.cleanupPolicy          = rune::node::TopicSpec::CleanupPolicy::Compact;
+            ts.minCleanableDirtyRatio = 0.0;
+            ts.deleteRetentionMs      = kTombRetentionMs;
+            ts.segmentRollBytes       = kRoll;
+            cfg2.topics               = {ts};
+            // Coalescing ON so the cleaner coalesces the small segments and reaches
+            // the tombstone's segment (the converged, production-default behavior).
+            cfg2.enableCompactionCoalescing = true;
+            rune::node::BrokerNode node{cfg2};
+            node.start();
+            ASSERT_TRUE(node.awaitLeader(3s)) << "Smoke2: must self-elect";
+            ASSERT_TRUE(waitFor([&] { return node.replicationIsLeaderForTest(); }, 2s))
+                << "Smoke2: replication bridge must propagate within 2 s";
+            const uint64_t c0 = node.cleanerCyclesForTest();
+            ASSERT_TRUE(waitFor([&] { return node.cleanerCyclesForTest() >= c0 + 3; }, 10s))
+                << "Smoke2 Phase A: the cleaner never completed a cycle";
+            node.stop();
+        }
         Log phaseALog(logDir, kRoll);
         phaseALog.recover();
-
-        bool victimFound = false;
-        bool victimIsEmpty = false;
+        victimFound = victimIsEmpty = false;
         auto bases = phaseALog.segmentBaseOffsets();
         int64_t cursor = 0;
         for (size_t si = 0; si < bases.size(); ++si) {
@@ -566,11 +565,13 @@ TEST(CompactionRetentionSmoke, TombstoneLifecycle_KIP534) {
                 if (bytes.empty()) break;
                 RecordBatchReader r(bytes.data(), bytes.size());
                 if (!r.ensureValid()) break;
+                const bool stamped = (r.attributes() & rune::protocol::batch::kAttrDeleteHorizon) != 0;
                 bool advanced = false;
                 r.forEach([&](std::string_view k, std::string_view v, int64_t off, int64_t) {
                     if (k == "victim") {
                         victimFound   = true;
                         victimIsEmpty = v.empty();
+                        if (stamped && v.empty()) stampedHorizonMs = r.baseTimestamp();
                     }
                     cursor = off + 1;
                     advanced = true;
@@ -578,20 +579,24 @@ TEST(CompactionRetentionSmoke, TombstoneLifecycle_KIP534) {
                 if (!advanced || cursor >= segEnd) break;
             }
         }
-
-        EXPECT_TRUE(victimFound)
-            << "Smoke2 Phase A: tombstone for 'victim' must be RETAINED "
-               "while its delete-horizon has not yet expired";
-        EXPECT_TRUE(victimIsEmpty)
-            << "Smoke2 Phase A: the 'victim' record must be a tombstone (empty value)";
     }
+    EXPECT_TRUE(victimFound)
+        << "Smoke2 Phase A: tombstone for 'victim' must be RETAINED "
+           "while its delete-horizon has not yet expired";
+    EXPECT_TRUE(victimIsEmpty)
+        << "Smoke2 Phase A: the 'victim' record must be a tombstone (empty value)";
+    ASSERT_GE(stampedHorizonMs, 0) << "Smoke2 Phase A: the cleaner never stamped the tombstone's delete horizon";
 
     // Wait for the delete-horizon stamped in Phase A to expire.  The horizon is
     // nowA + kTombRetentionMs; after this sleep the wall clock is well past it,
     // so the next compaction pass drops the tombstone (KIP-534).  The horizon is
     // NOT re-stamped — Phase C reuses the SAME kTombRetentionMs and simply runs
     // after expiry.
-    std::this_thread::sleep_for(std::chrono::milliseconds(kTombRetentionMs + 500));
+    // (KIP-534 is wall-clock by definition: the only time-based wait left, and
+    // it is a condition of the feature — the STAMPED horizon has passed.)
+    auto nowMs = [] { return std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch()).count(); };
+    while (nowMs() <= stampedHorizonMs + 100) std::this_thread::sleep_for(10ms);
 
     // Phase C: drop the tombstone (horizon expired).  Fresh checkpoint so the
     // cleaner re-scans the whole log and reaches the tombstone's segment.
@@ -621,7 +626,12 @@ TEST(CompactionRetentionSmoke, TombstoneLifecycle_KIP534) {
             << "Smoke2 Phase C: replication bridge must propagate within 2 s";
         // HW advanced by becomeLeader() on duty-cycle thread.
 
-        std::this_thread::sleep_for(2000ms);
+        // D25: event-driven — the stamped horizon has already expired, so the
+        // first full pass (fresh checkpoint) drops the tombstone; wait for three
+        // completed cleaner cycles.
+        const uint64_t c3 = node3.cleanerCyclesForTest();
+        ASSERT_TRUE(waitFor([&] { return node3.cleanerCyclesForTest() >= c3 + 3; }, 10s))
+            << "Smoke2 Phase C: the cleaner never completed a cycle";
         node3.stop();
     }
 
