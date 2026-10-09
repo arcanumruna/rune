@@ -787,13 +787,25 @@ TEST(AeronPartitionTransportRegression, DrainOversizedFrameCountedNotHeldRegress
         }
         ASSERT_GT(live.fragments, 0);
     }
+    {   // D31 box run: FetchRequests the connect loop sent before the link came up are HELD (that is the F27
+        // contract) and a new frame queues behind them — flush that backlog first (bounded) and measure the
+        // oversized frame by deltas, not by setup's cumulative counters.
+        const auto deadline = steady_clock::now() + seconds(10);
+        while (t.heldFramesForTest(2) > 0 && steady_clock::now() < deadline) { (void)t.poll(1); (void)live.poll(); }
+        ASSERT_EQ(t.heldFramesForTest(2), 0u) << "the connect loop's held frames never flushed";
+    }
+    const auto before = t.holdStatsForTest();
+    const uint64_t droppedBefore = t.oversizedFrameDropped();
     const std::vector<uint8_t> records(20 * 1024, 0x5A);   // > 8 KiB publication max
     FetchResponseMsg resp{};
     resp.leaderEpoch = 1;
     resp.records = std::span<const uint8_t>(records);
     ASSERT_TRUE(t.sendFetchResponse(2, resp)) << "the ring accepts it";
-    for (int i = 0; i < 5; ++i) (void)t.poll(1);
-    EXPECT_EQ(t.holdStatsForTest().oversizeDropped, 1u);
-    EXPECT_EQ(t.holdStatsForTest().held, 0u) << "an unsendable frame is never held";
-    EXPECT_EQ(t.oversizedFrameDropped(), 1u);
+    const auto deadline = steady_clock::now() + seconds(10);
+    while (t.holdStatsForTest().oversizeDropped == before.oversizeDropped && steady_clock::now() < deadline)
+        (void)t.poll(1);
+    EXPECT_EQ(t.holdStatsForTest().oversizeDropped - before.oversizeDropped, 1u);
+    EXPECT_EQ(t.holdStatsForTest().held - before.held, 0u) << "an unsendable frame is never held";
+    EXPECT_EQ(t.heldFramesForTest(2), 0u);
+    EXPECT_EQ(t.oversizedFrameDropped() - droppedBefore, 1u);
 }
