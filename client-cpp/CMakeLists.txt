@@ -90,6 +90,13 @@ if(BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics_or_mutexes.py --futures
             ${CMAKE_CURRENT_SOURCE_DIR})
+    # C-F32: the test tree (tests/** minus the shipped tests/e2e probes) adds no
+    # atomics / mutexes / futures / sleeps — the existing sites are an exact
+    # baseline (scripts/test_tree_sync_baseline.json) that only shrinks.
+    add_test(NAME NoNewSyncOrSleepsInTestTreeRegression
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_atomics_or_mutexes.py --tests
+            ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME NoSharedPtrHandlesGuardRegression
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_shared_ptr_handles.py --handles

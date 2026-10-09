@@ -1,0 +1,146 @@
+{
+ "tests/RuneCliLiveTest.cpp": {
+  "atomic|std::atomic": 4,
+  "future|#include <future>": 1,
+  "future|std::async": 1,
+  "future|std::future_status": 1,
+  "future|std::launch": 1,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 8
+ },
+ "tests/agent/ClientAgentTest.cpp": {
+  "atomic|std::atomic": 12,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 38
+ },
+ "tests/agent/InvokerAgentTest.cpp": {
+  "atomic|std::atomic": 1,
+  "include|#include <atomic>": 1
+ },
+ "tests/client/ClientNotLeaderRetryTest.cpp": {
+  "atomic|std::atomic": 5,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 6
+ },
+ "tests/client/ClientSchemaTest.cpp": {
+  "atomic|std::atomic": 7,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 4
+ },
+ "tests/client/ClientTest.cpp": {
+  "atomic|std::atomic": 14,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 7
+ },
+ "tests/client/CompletionsClientTest.cpp": {
+  "atomic|std::atomic": 11,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 1
+ },
+ "tests/client/HandleLifetimeTest.cpp": {
+  "atomic|std::atomic": 17,
+  "include|#include <atomic>": 1
+ },
+ "tests/client/HubCommandClientTest.cpp": {
+  "atomic|std::atomic": 12,
+  "include|#include <atomic>": 1,
+  "sync|barrier": 2
+ },
+ "tests/client/InvokerClientTest.cpp": {
+  "atomic|std::atomic": 4,
+  "future|#include <future>": 1,
+  "future|std::future": 1,
+  "future|std::future_status": 1,
+  "future|std::promise": 1,
+  "include|#include <atomic>": 1
+ },
+ "tests/client/MetadataRoutingTest.cpp": {
+  "atomic|std::atomic": 4,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 6
+ },
+ "tests/client/OpenTopicGateTest.cpp": {
+  "atomic|std::atomic": 2,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 5
+ },
+ "tests/client/RedirectTest.cpp": {
+  "atomic|std::atomic": 12,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 24
+ },
+ "tests/detail/OneToOneRingBufferTest.cpp": {
+  "atomic|std::atomic": 1,
+  "include|#include <atomic>": 1
+ },
+ "tests/group/GroupConsumerTest.cpp": {
+  "atomic|std::atomic": 6,
+  "include|#include <atomic>": 1
+ },
+ "tests/producer/BatchBuilderTest.cpp": {
+  "atomic|std::atomic": 3,
+  "future|#include <future>": 1,
+  "future|std::future_status": 16,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 20
+ },
+ "tests/producer/ClientPerWorkerRoutingTest.cpp": {
+  "include|#include <atomic>": 1
+ },
+ "tests/producer/DirectIngressTest.cpp": {
+  "atomic|std::atomic": 2,
+  "include|#include <atomic>": 1
+ },
+ "tests/producer/ProducerAckPathTest.cpp": {
+  "include|#include <atomic>": 1
+ },
+ "tests/producer/ProducerAckTokenTest.cpp": {
+  "atomic|std::atomic": 1,
+  "include|#include <atomic>": 1
+ },
+ "tests/producer/ProducerAllocRegressionTest.cpp": {
+  "include|#include <atomic>": 1
+ },
+ "tests/producer/ProducerBatchingTest.cpp": {
+  "atomic|std::atomic": 3,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 16
+ },
+ "tests/producer/ProducerCloseTest.cpp": {
+  "atomic|std::atomic": 10,
+  "include|#include <atomic>": 1
+ },
+ "tests/producer/ProducerFlushDirtyTest.cpp": {
+  "include|#include <atomic>": 1
+ },
+ "tests/producer/ProducerRaceTest.cpp": {
+  "atomic|std::atomic": 3,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 6
+ },
+ "tests/producer/ProducerSendTest.cpp": {
+  "atomic|std::atomic": 4,
+  "include|#include <atomic>": 1
+ },
+ "tests/producer/ProducerSinkTest.cpp": {
+  "include|#include <atomic>": 1
+ },
+ "tests/producer/ProducerTest.cpp": {
+  "atomic|std::atomic": 5,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 18
+ },
+ "tests/subscriber/SubscriberHubCommandTest.cpp": {
+  "atomic|std::atomic": 2,
+  "include|#include <atomic>": 1
+ },
+ "tests/transport/AeronTransportTest.cpp": {
+  "atomic|std::atomic": 1,
+  "include|#include <atomic>": 1,
+  "sleep|std::this_thread::sleep_for": 5
+ },
+ "tests/transport/InvokerTransportTest.cpp": {
+  "atomic|std::atomic": 1,
+  "include|#include <atomic>": 1
+ }
+}
