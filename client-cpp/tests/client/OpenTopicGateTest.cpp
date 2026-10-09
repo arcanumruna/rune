@@ -643,3 +643,238 @@ TEST(OpenTopicGate, SendStampsBoundVersionNotCodegenVersionRegression) {
         << "regression: the stamped version must never be the codegen-baked "
            "kVersion once a different version is bound";
 }
+
+// ===========================================================================
+// GC6 — typed-client binding across a full schema lineage (test-matrix D3-D11)
+//
+// A single topic ("characters") evolved through FOUR versions. v3 DROPS a
+// field present at v1/v2 ("name"); v4 re-adds a field in its place
+// ("displayName") — the drop/rename-successor lineage member required by
+// GC6. A client compiled against EACH vK must fingerprint-select and bind
+// EXACTLY vK (never "latest"), and every send() must stamp the BOUND
+// version K into the record header, not the stub's own (deliberately
+// different) codegen-baked kVersion.
+// ===========================================================================
+static Descriptor makeLineageV1Descriptor() {
+    return DescriptorBuilder("characters", 1)
+        .add("id",     PrimType::Int64)
+        .add("userId", PrimType::Int64, 1, /*isKey=*/true)
+        .add("name",   PrimType::String)
+        .build();
+}
+static Descriptor makeLineageV2Descriptor() {
+    return DescriptorBuilder("characters", 2)
+        .add("id",     PrimType::Int64)
+        .add("userId", PrimType::Int64, 1, /*isKey=*/true)
+        .add("name",   PrimType::String)
+        .add("level",  PrimType::Int32)
+        .build();
+}
+// v3 DROPS "name" (present at v1/v2) — the dropped-field lineage member.
+static Descriptor makeLineageV3Descriptor() {
+    return DescriptorBuilder("characters", 3)
+        .add("id",     PrimType::Int64)
+        .add("userId", PrimType::Int64, 1, /*isKey=*/true)
+        .add("level",  PrimType::Int32)
+        .build();
+}
+// v4 adds "displayName" in place of the dropped "name" — the
+// rename-successor lineage member.
+static Descriptor makeLineageV4Descriptor() {
+    return DescriptorBuilder("characters", 4)
+        .add("id",          PrimType::Int64)
+        .add("userId",      PrimType::Int64, 1, /*isKey=*/true)
+        .add("level",       PrimType::Int32)
+        .add("displayName", PrimType::String)
+        .build();
+}
+
+// Each StubLineageVK is "what a client compiled against schema version K
+// looks like": kFingerprint comes from that version's own descriptor
+// (distinct per K), and kVersion is DELIBERATELY not K (and distinct from
+// every other stub's kVersion), exactly like StubV1 above — so a stamp
+// assertion that accidentally checked the codegen-baked kVersion instead of
+// the broker-bound version would fail loudly for every K.
+struct StubLineageV1 {
+    static const uint64_t kFingerprint;
+    static constexpr std::string_view kSchemaName = "characters";
+    static constexpr uint16_t kVersion = 101;
+    size_t encodedSize() const noexcept { return 4; }
+    size_t encode(uint8_t* buf) const noexcept {
+        buf[0] = 0x04; buf[1] = 0x00;
+        buf[2] = static_cast<uint8_t>(kVersion & 0xffu);
+        buf[3] = static_cast<uint8_t>((kVersion >> 8) & 0xffu);
+        return 4;
+    }
+};
+const uint64_t StubLineageV1::kFingerprint = fingerprint(makeLineageV1Descriptor());
+
+struct StubLineageV2 {
+    static const uint64_t kFingerprint;
+    static constexpr std::string_view kSchemaName = "characters";
+    static constexpr uint16_t kVersion = 102;
+    size_t encodedSize() const noexcept { return 4; }
+    size_t encode(uint8_t* buf) const noexcept {
+        buf[0] = 0x04; buf[1] = 0x00;
+        buf[2] = static_cast<uint8_t>(kVersion & 0xffu);
+        buf[3] = static_cast<uint8_t>((kVersion >> 8) & 0xffu);
+        return 4;
+    }
+};
+const uint64_t StubLineageV2::kFingerprint = fingerprint(makeLineageV2Descriptor());
+
+// The dropped-field version's compiled client.
+struct StubLineageV3 {
+    static const uint64_t kFingerprint;
+    static constexpr std::string_view kSchemaName = "characters";
+    static constexpr uint16_t kVersion = 103;
+    size_t encodedSize() const noexcept { return 4; }
+    size_t encode(uint8_t* buf) const noexcept {
+        buf[0] = 0x04; buf[1] = 0x00;
+        buf[2] = static_cast<uint8_t>(kVersion & 0xffu);
+        buf[3] = static_cast<uint8_t>((kVersion >> 8) & 0xffu);
+        return 4;
+    }
+};
+const uint64_t StubLineageV3::kFingerprint = fingerprint(makeLineageV3Descriptor());
+
+struct StubLineageV4 {
+    static const uint64_t kFingerprint;
+    static constexpr std::string_view kSchemaName = "characters";
+    static constexpr uint16_t kVersion = 104;
+    size_t encodedSize() const noexcept { return 4; }
+    size_t encode(uint8_t* buf) const noexcept {
+        buf[0] = 0x04; buf[1] = 0x00;
+        buf[2] = static_cast<uint8_t>(kVersion & 0xffu);
+        buf[3] = static_cast<uint8_t>((kVersion >> 8) & 0xffu);
+        return 4;
+    }
+};
+const uint64_t StubLineageV4::kFingerprint = fingerprint(makeLineageV4Descriptor());
+
+// A descriptor that was NEVER part of this lineage (never served at any
+// version, not even latest) — used to prove the stale-schema error is a
+// genuine "not found" even when the broker's table carries a long history.
+static Descriptor makeLineageUnknownDescriptor() {
+    return DescriptorBuilder("characters", 999)
+        .add("id",     PrimType::Int64)
+        .add("userId", PrimType::Int64, 1, /*isKey=*/true)
+        .add("bogus",  PrimType::Int32)
+        .build();
+}
+struct StubLineageUnknown {
+    static const uint64_t kFingerprint;
+    static constexpr std::string_view kSchemaName = "characters";
+    static constexpr uint16_t kVersion = 999;
+    size_t encodedSize() const noexcept { return 4; }
+    size_t encode(uint8_t* buf) const noexcept {
+        buf[0] = 0x04; buf[1] = 0x00;
+        buf[2] = static_cast<uint8_t>(kVersion & 0xffu);
+        buf[3] = static_cast<uint8_t>((kVersion >> 8) & 0xffu);
+        return 4;
+    }
+};
+const uint64_t StubLineageUnknown::kFingerprint = fingerprint(makeLineageUnknownDescriptor());
+
+// Opens "characters" as StubT against an already-connected harness, asserts
+// the bind lands on EXACTLY expectedVersion (never "latest"), then asserts
+// send() stamps expectedVersion — not StubT::kVersion — into header
+// bytes [2..3].
+template <typename StubT>
+static void expectLineageClientBindsExactVersionAndStamps(GateHarness& h, uint16_t expectedVersion) {
+    TypedTopic<StubT> tt = [&] {
+        GateGatewayPump pump(*h.gw);
+        return h.client->openTopicAndWait<StubT>("characters");
+    }();
+
+    EXPECT_EQ(tt.boundVersion(), expectedVersion)
+        << "a client compiled against v" << expectedVersion
+        << " must bind exactly v" << expectedVersion << ", never latest";
+
+    StubT rec;
+    ASSERT_NO_THROW(tt.send(rec)) << "send() must not throw for v" << expectedVersion;
+
+    // Capture the exact bytes send() hands the producer, bound to the SAME
+    // version openTopicAndWait returned above.
+    std::vector<uint8_t> captured;
+    TypedTopic<StubT, StubCaptureProducer> stampTopic(
+        StubCaptureProducer{&captured}, /*topicId=*/0x40000010, tt.boundVersion());
+    stampTopic.send(rec);
+
+    ASSERT_GE(captured.size(), 4u);
+    const uint16_t stampedVersion =
+        static_cast<uint16_t>(captured[2]) | (static_cast<uint16_t>(captured[3]) << 8);
+    EXPECT_EQ(stampedVersion, expectedVersion)
+        << "send() must stamp the broker-bound version (" << expectedVersion
+        << "), not the codegen-baked kVersion (" << StubT::kVersion << ")";
+    EXPECT_NE(stampedVersion, StubT::kVersion)
+        << "stamped version must never equal the (deliberately different) "
+           "codegen-baked kVersion for v" << expectedVersion;
+}
+
+// ===========================================================================
+// GC6 / D3-D8, D11: a topic currently at "latest" = v4 still answers
+// fingerprint-selecting GetTopicSchema for EVERY historical version in its
+// lineage. Clients compiled against v1, v2, v3 (the dropped-field version)
+// and v4 (== latest here) each bind their own K and stamp K, never latest
+// and never each other's K.
+// ===========================================================================
+TEST(OpenTopicGate, LineageBindsExactVersionForEachCompiledClientRegression) {
+    GateHarness h(1312, 1313);
+    h.build();
+    h.connectAndWait();
+
+    // "Latest" is v4.
+    h.gw->getTopicId   = 0x40000010;
+    h.gw->getVersion   = 4;
+    h.gw->getBlob      = serialize(makeLineageV4Descriptor());
+    h.gw->getErrorCode = 0;
+
+    // The broker's fingerprint-selecting GetTopicSchema answers for every
+    // historical version in the lineage (the broker-side per-version
+    // resolution itself is covered by other tasks; this harness only needs
+    // to emulate its observable behavior).
+    h.gw->fingerprintOverrides[StubLineageV1::kFingerprint] = GateGateway::FingerprintOverride{
+        0x40000010, 1, serialize(makeLineageV1Descriptor())};
+    h.gw->fingerprintOverrides[StubLineageV2::kFingerprint] = GateGateway::FingerprintOverride{
+        0x40000010, 2, serialize(makeLineageV2Descriptor())};
+    h.gw->fingerprintOverrides[StubLineageV3::kFingerprint] = GateGateway::FingerprintOverride{
+        0x40000010, 3, serialize(makeLineageV3Descriptor())};
+    h.gw->fingerprintOverrides[StubLineageV4::kFingerprint] = GateGateway::FingerprintOverride{
+        0x40000010, 4, serialize(makeLineageV4Descriptor())};
+
+    expectLineageClientBindsExactVersionAndStamps<StubLineageV1>(h, 1);
+    expectLineageClientBindsExactVersionAndStamps<StubLineageV2>(h, 2);
+    expectLineageClientBindsExactVersionAndStamps<StubLineageV3>(h, 3); // dropped-field version
+    expectLineageClientBindsExactVersionAndStamps<StubLineageV4>(h, 4); // == latest here
+}
+
+// ===========================================================================
+// GC6 / D9: a client whose fingerprint matches NO version the broker has
+// ever served — even though the broker's table carries a full 4-version
+// lineage, not an empty one — must still throw the stale-schema error.
+// ===========================================================================
+TEST(OpenTopicGate, LineageUnknownFingerprintStillThrowsRegression) {
+    GateHarness h(1314, 1315);
+    h.build();
+    h.connectAndWait();
+
+    h.gw->getTopicId   = 0x40000010;
+    h.gw->getVersion   = 4;
+    h.gw->getBlob      = serialize(makeLineageV4Descriptor());
+    h.gw->getErrorCode = 0;
+
+    h.gw->fingerprintOverrides[StubLineageV1::kFingerprint] = GateGateway::FingerprintOverride{
+        0x40000010, 1, serialize(makeLineageV1Descriptor())};
+    h.gw->fingerprintOverrides[StubLineageV2::kFingerprint] = GateGateway::FingerprintOverride{
+        0x40000010, 2, serialize(makeLineageV2Descriptor())};
+    h.gw->fingerprintOverrides[StubLineageV3::kFingerprint] = GateGateway::FingerprintOverride{
+        0x40000010, 3, serialize(makeLineageV3Descriptor())};
+    h.gw->fingerprintOverrides[StubLineageV4::kFingerprint] = GateGateway::FingerprintOverride{
+        0x40000010, 4, serialize(makeLineageV4Descriptor())};
+
+    GateGatewayPump pump(*h.gw);
+    EXPECT_THROW((void)h.client->openTopicAndWait<StubLineageUnknown>("characters"), std::runtime_error)
+        << "openTopicAndWait must throw when the broker's full lineage table "
+           "still has no version matching T::kFingerprint";
+}
