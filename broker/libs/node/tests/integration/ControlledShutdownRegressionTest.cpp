@@ -1,3 +1,4 @@
+#include <spdlog/spdlog.h>
 // ControlledShutdownRegressionTest.cpp — Kafka-parity controlled shutdown.
 //
 // Ground truth (dockerized DR-15 SIGTERM, 2026-10-05): on SIGTERM a node exited
@@ -346,8 +347,14 @@ TEST(ControlledShutdownRegression, NonControllerGracefulStopHandsEveryPartitionO
     }
     // The stop signal's moment: a client is never sent to the stopping node.
     expectNeverSentToVictim(c, ports, sid, victim, produced, "after the controlled shutdown, before exit");
+    c.diagDump("before-stop");
+    spdlog::set_level(spdlog::level::debug);   // DIAG-D31 (temporary)
+    spdlog::warn("DIAG-D31: stopping victim {}", victim);
     ns[static_cast<std::size_t>(victim)]->stop();
+    spdlog::warn("DIAG-D31: victim stopped");
+    c.diagDump("after-stop");
     expectNeverSentToVictim(c, ports, sid, victim, produced, "right after the stop");
+    c.diagDump("after-check");
     std::map<int, int64_t> sid2;
     for (auto& [k, v] : sid) if (k != victim) sid2[k] = v;
     ASSERT_TRUE(produceAll(c, ports, (victim + 1) % 3, sid2, 2, produced)) << "post-stop produce failed";

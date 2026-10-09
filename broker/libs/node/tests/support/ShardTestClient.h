@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdio>
 // ShardTestClient.h — a minimal REAL wire client for shard-mode integration
 // tests: its own (threaded) embedded driver + Aeron client, raw Rune protocol
 // frames over UDP.  Every wait is a bounded poll of a real condition (hard
@@ -385,6 +386,20 @@ private:
         driver_.doWork();
         if (aeron_) aeron_->conductorAgentInvoker().invoke();
     }
+public:
+    // DIAG-D31 (temporary): egress images + publication connection state.
+    void diagDump(const char* when) {
+        std::fprintf(stderr, "[D31] %s egress=%s imageCount=%d\n", when, egressChannel_.c_str(),
+                     egress_ ? egress_->imageCount() : -1);
+        if (egress_) egress_->forEachImage([](aeron::Image& im) {
+            std::fprintf(stderr, "[D31]   image session=%d src=%s pos=%lld closed=%d eos=%d\n", im.sessionId(),
+                         im.sourceIdentity().c_str(), (long long)im.position(), (int)im.isClosed(), (int)im.isEndOfStream());
+        });
+        for (auto& [k, pub] : pubs_)
+            std::fprintf(stderr, "[D31]   pub %s/%d connected=%d closed=%d\n", k.first.c_str(), k.second,
+                         pub ? (int)pub->isConnected() : -1, pub ? (int)pub->isClosed() : -1);
+    }
+private:
     void pause_() {
         pump_();
         std::this_thread::sleep_for(std::chrono::microseconds{100});
