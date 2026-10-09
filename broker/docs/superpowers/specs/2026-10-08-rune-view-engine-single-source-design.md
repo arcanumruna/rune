@@ -19,7 +19,7 @@ A view, concretely, is a **keyed table** derived from a source log by a declarat
 - **Joins / multi-source views.** The model is designed so a join is additive (§8, §12), but join execution, co-partitioning, and gather semantics are a separate follow-on spec.
 - **Secondary indexes, range scans, filters, aggregations beyond per-field merge.** Point-key lookup only here; richer query surface is deferred.
 - **Cross-node view placement / replication of the view table itself.** Views are rebuilt deterministically from the (already-replicated) source log on each node that hosts the partition (§11), so the view table is node-local derived state, not independently replicated. Multi-node placement/failover policy is a follow-on.
-- **The query language surface** for defining views in Rune QL. This spec defines the engine and the `DefineView` control-plane API; the QL `create view …` syntax is a thin follow-on over `DefineView` (mirrors how 0c QL layered over `DefineTopic`).
+- **The query language surface** for defining views in Rune QL. This spec defines the engine and the `CreateView` control-plane API; the QL `create view …` syntax is a thin follow-on over `CreateView` (mirrors how 0c QL layered over `DefineTopic`).
 
 ## 3. Engineering-philosophy alignment (binding)
 
@@ -101,7 +101,7 @@ A view definition compiles to a flat, declarative plan. The per-field merge rule
 
 Topics in Rune are **typed** (0b): every topic has a registered `Descriptor` in `__topic_schemas`, and the Descriptor is the authority for field names — `Descriptor::find(name)` maps a name to `{ id (uint16), type, offset, fixedLen }`. **The field names a view references are only meaningful against the source topic's Descriptor.** A view cannot name a field the source schema does not declare.
 
-**Canonical field identity = `(topicId, fieldId)`.** The name a view writes is a *human alias* resolved to this pair at `DefineView`; it is not the identity. Reasoning:
+**Canonical field identity = `(topicId, fieldId)`.** The name a view writes is a *human alias* resolved to this pair at `CreateView`; it is not the identity. Reasoning:
 
 - **`topicId`** is the broker-unique outer key (RULING-1: `TopicRegistry` is the sole sequential id allocator). A view sources from a specific topic/stream, so this is the right outer coordinate. It persists even if the topic's schema is replaced by a new lineage.
 - **`fieldId`** is the field's id *within that topic's schema*. It must be a **durable logical tag** — assigned once, **never reused**, retired/reserved when a field is removed, a fresh tag for each new field (Protobuf/Thrift/Avro discipline). With durable tags, `(topicId, fieldId)` is a stable *logical* identity across **arbitrary** schema evolution, additive or breaking: tag *N* always denotes "the field that was tag *N*"; a version that dropped it simply reports it absent, and a view referencing it stays coherent with no version qualifier.
@@ -111,29 +111,29 @@ Topics in Rune are **typed** (0b): every topic has a registered `Descriptor` in 
 
 **Version-aware decode (where `schemaVersion` actually lives).** For each committed record, the fold resolves `(topicId, tag) → physical accessor` using the Descriptor **for that record's schema version** (is the field live per `sinceVersion ≤ V < untilVersion`? what offset/type/width in *this* version?). This is now realized by the shipped schema-evolution foundation: the registry keeps **per-version materialized descriptors** (`materializeAsOf(evolving, V)` recomputes offsets for the fields live at `V`), looked up via `byIdVersion`/`byFingerprint`, and `readFieldByTag` decodes a record against its own stamped writer version. The fold reads each record against its writer version's materialized descriptor — the per-record decode cost that the <10µs fold budget (§14.0) must absorb.
 
-**Uniqueness of the human alias at resolution time.** Since name is only an alias, the resolver must map it unambiguously to one `(topicId, fieldId)`: `DescriptorBuilder::add` does not reject duplicate names, `build()` has no dup check, and `find()` returns **first match**; duplicate names are rejected only at the Rune QL layer (`rune-ql Parser.cpp:241`). So at `DefineView` the resolver **asserts uniqueness** (a name resolving to >1 field is a define-time error) rather than trusting first-match.
+**Uniqueness of the human alias at resolution time.** Since name is only an alias, the resolver must map it unambiguously to one `(topicId, fieldId)`: `DescriptorBuilder::add` does not reject duplicate names, `build()` has no dup check, and `find()` returns **first match**; duplicate names are rejected only at the Rune QL layer (`rune-ql Parser.cpp:241`). So at `CreateView` the resolver **asserts uniqueness** (a name resolving to >1 field is a define-time error) rather than trusting first-match.
 
 **Across sources (a join), the alias is scoped per source.** Two source topics may each declare `id`/`name`; the identity is still `(topicId, fieldId)`, and the compiled plan's `sourceIdx` is just the local index into its source list (each entry = a `(topicId, Descriptor)`), so `(sourceIdx, srcFieldId)` is the compact local form of `(topicId, fieldId)`. Each source has its own key field resolved to its own `(topicId, keyFieldId)`, mapping to the shared join key.
 
 **Output/alias side.** The view's **output** field names (aliases used in the projection) are a separate namespace, must be unique within the view's own result schema (the view is itself a typed topic), and live on `CompiledField.outSlot` — never on source identity.
 
-Critically, name resolution happens **once, at `DefineView` time on the AdminWorker — never on the fold path**:
+Critically, name resolution happens **once, at `CreateView` time on the AdminWorker — never on the fold path**:
 
 - The codec read primitive is `readField(descriptor, record, uint16_t fieldId)` — it reads **by field id**, not by name. Resolving a *name* costs a linear `find()` scan; doing that per record per field on the fold path would be a hot-path string scan, violating #4 / ultra-low-latency.
-- So at `DefineView` the AdminWorker fetches the source topic's `Descriptor` from `__topic_schemas` and, for the `key` and every `srcField`, calls `find()` → resolves to `{ fieldId, type, width }`. This is also where it **validates**: the name exists, its type is numeric for `Sum/Min/Max`, the key field exists, and output types resolve.
+- So at `CreateView` the AdminWorker fetches the source topic's `Descriptor` from `__topic_schemas` and, for the `key` and every `srcField`, calls `find()` → resolves to `{ fieldId, type, width }`. This is also where it **validates**: the name exists, its type is numeric for `Sum/Min/Max`, the key field exists, and output types resolve.
 - Because field identity is a **durable never-reused tag** (schema-evolution foundation, SHIPPED), a resolved `(topicId, tag)` stays valid across **arbitrary** later evolution — additive or breaking — with no re-resolution: a version that dropped the tag simply reports it absent at fold time (§11.1 / §15 #9), and per-record decode uses that record's version-materialized descriptor (§6).
 
-This gives **two plan forms** — the authoring plan (string names, the Rune QL / `DefineView` wire form) and the compiled plan (resolved ids) installed into the worker's Reactor:
+This gives **two plan forms** — the authoring plan (string names, the Rune QL / `CreateView` wire form) and the compiled plan (resolved ids) installed into the worker's Reactor:
 
 ```cpp
 enum class MergeRule : uint8_t { Replace, Sum, Min, Max, First };
 
-// ---- Authoring plan: string names, produced by Rune QL / the DefineView wire op ----
+// ---- Authoring plan: string names, produced by Rune QL / the CreateView wire op ----
 struct AuthoredField {
     std::string name;      // output field name
     PrimType    type;      // output type (incl. FixedStr from 0c)
     uint16_t    sourceIdx; // which source this field is drawn from (0 single-source; >0 join)
-    std::string srcField;  // field NAME in the source record — resolved at DefineView
+    std::string srcField;  // field NAME in the source record — resolved at CreateView
     MergeRule   rule;      // how repeated keys merge for this field
 };
 struct SourceSpec   { int32_t topicId; std::string keyField; };
@@ -176,7 +176,7 @@ FieldValue mergeField(MergeRule rule, bool has_cur, FieldValue cur, FieldValue i
 }
 ```
 
-`Sum/Min/Max` require a numeric `PrimType` (validated at `DefineView` time against the source Descriptor, §6.0 — never on the fold path). `Replace` is the default and the single-source upsert semantics.
+`Sum/Min/Max` require a numeric `PrimType` (validated at `CreateView` time against the source Descriptor, §6.0 — never on the fold path). `Replace` is the default and the single-source upsert semantics.
 
 ### 6.1 `foldRecord` (the fold path, per committed record)
 
@@ -309,7 +309,7 @@ The **mechanism** is unchanged by this choice: the worker copies the batch's dir
 
 ### 9.7 Persisted (default) vs transient views
 
-View persistence is a **per-view property**, set at `DefineView`, stored in the `__views` registry entry (§10). **Persisted is the default.**
+View persistence is a **per-view property**, set at `CreateView`, stored in the `__views` registry entry (§10). **Persisted is the default.**
 
 - **Persisted** — checkpointed per §9.2 (dirty tracking + batch-boundary differential deltas + base). Restart loads the checkpoint `{O}` and replays `(O, LSO]` (§9.4) — fast, bounded. Costs steady-state checkpoint IO + disk.
 - **Transient** (keyword; "not persisted" — mirrors Java's `transient` = not serialized, and avoids the `volatile` C++/Postgres collision) — **no checkpoint at all**: no `dirty` tracking (slightly cheaper hot path — no bit-set per write), no deltas, no base, no view-snapshot IO, **zero disk footprint**. It loses nothing, because durability is the replicated log's job (§9.2), not the view's. On restart a transient view is **rebuilt by replaying the source from its retained floor to `LSO`** — the cost is **bounded by the source's retention, not "all history"**: a short-retention or `InMemoryLog`-backed (transient-topic, see the transient-topics spec) source replays little or, after a full restart that emptied an in-memory source, **nothing (instantly ready/empty)**. Only a transient view over a long-retention *persisted* topic would replay a lot — a pairing to avoid.
@@ -318,16 +318,16 @@ The **readiness gate (§9.4.1) applies to both** — the node stays not-ready fo
 
 Transient suits views that are cheap to recompute, short-window, or whose source is itself transient — trading a disk checkpoint for zero persistence IO.
 
-## 10. Control plane — `DefineView`, `__views` registry, AdminWorker
+## 10. Control plane — `CreateView`, `__views` registry, AdminWorker
 
 Mirrors the 0b `DefineTopic`/`__topic_schemas`/`AdminWorker` design (shared-nothing DDL on a dedicated thread, off the hot path):
 
-- **`DefineView`** wire op: carries the authoring `ViewPlan` (string field names, §6). On the **AdminWorker** (never a produce worker) it fetches each source topic's `Descriptor` from `__topic_schemas` and **resolves + validates** (§6.0): every `srcField`/`key` name exists in the source schema, merge rules are numeric-only where required, output types resolve. The output is the `CompiledViewPlan` with resolved `(topicId, tag)` references, **plus a derived output `Descriptor`** — the view's row layout (the `output` columns, canonical ascending-tag order), each output column carrying a durable never-reused `(viewId, tag)`.
+- **`CreateView`** wire op: carries the authoring `ViewPlan` (string field names, §6). On the **AdminWorker** (never a produce worker) it fetches each source topic's `Descriptor` from `__topic_schemas` and **resolves + validates** (§6.0): every `srcField`/`key` name exists in the source schema, merge rules are numeric-only where required, output types resolve. The output is the `CompiledViewPlan` with resolved `(topicId, tag)` references, **plus a derived output `Descriptor`** — the view's row layout (the `output` columns, canonical ascending-tag order), each output column carrying a durable never-reused `(viewId, tag)`.
 - **`__views` is a versioned schema registry** (reuses the `SchemaRegistry` shape verbatim, parallel to `__topic_schemas`). Each view version stores: the authoring `ViewPlan` (source of truth for rebuild), the **materialized output `Descriptor` blob**, its **fingerprint** (`fingerprintAsOf`), `nextTag`, and `compatMode`. Keyed `(viewId, version)` so compaction preserves history. Replay on boot reconstructs every view and every retained version.
 - **`openView` handshake (identical to `openTopic`).** A typed client presents `RowT::kFingerprint`; the broker matches it against the view's registered schema versions and returns the matching version's materialized descriptor, which the client re-verifies before binding (§12.1). **No match → `SchemaMismatch` at open** — a drifted client is rejected up front, never served a wrongly-shaped row (contract §3.1). Prepared-query result fingerprints (§12.3) are likewise computed against the view's schema version, so the same guard covers ad-hoc queries.
-- **Persistence property (persisted default | transient).** `DefineView` carries a `persistence` flag stored in the `__views` entry (§9.7). Rune QL: `DEFINE TRANSIENT VIEW …` (keyword) or `DEFINE VIEW … WITH (persistence = transient)`; programmatic builder `.transient()`. A transient view installs no checkpoint path on its worker (no dirty tracking / no view-snapshot IO).
+- **Persistence property (persisted default | transient).** `CreateView` carries a `persistence` flag stored in the `__views` entry (§9.7). Rune QL: `CREATE TRANSIENT VIEW …` (keyword) or `CREATE VIEW … WITH (persistence = transient)`; programmatic builder `.transient()`. A transient view installs no checkpoint path on its worker (no dirty tracking / no view-snapshot IO).
 - **`ALTER VIEW` (add/drop/rename output column, change a merge rule, add a source)** runs on the **same AdminWorker-serialized DDL path as `ALTER TOPIC`**: single in-flight, `expectedVersion` CAS, atomic multi-op, contiguous versions; output columns get fresh never-reused `(viewId, tag)`s; each alter bumps the view version + fingerprint. **The one difference from a topic alter:** a topic alter is pure metadata, but a view alter that changes **fold semantics** (new aggregation, changed merge, new source) changes the view's *contents* → it triggers a **background rebuild** — replay the source log through the new fold (§9.4 replay-from-checkpoint) into the new version while the **old version keeps serving reads** until the new one catches up to the live offset, then cut over. Output-only/additive changes that expose already-maintained substate skip the rebuild. **Phasing (decision §15 #13):** versioned view schemas + `openView` handshake land in the first cut; `ALTER VIEW` + live rebuild is the immediately-following increment (the rebuild/cut-over is the one genuinely new mechanism and earns its own tasks + tests).
-- **Distribution.** On a successful `DefineView`/`ALTER VIEW`, the AdminWorker publishes the `CompiledViewPlan` + output descriptor + subscription edges to each worker's Reactor **via ring** (no shared registry read on the hot path). Each worker installs the plan into its per-worker subscription index (§4.1) for the partitions it owns.
+- **Distribution.** On a successful `CreateView`/`ALTER VIEW`, the AdminWorker publishes the `CompiledViewPlan` + output descriptor + subscription edges to each worker's Reactor **via ring** (no shared registry read on the hot path). Each worker installs the plan into its per-worker subscription index (§4.1) for the partitions it owns.
 - **Multi-node replication of `__views`** inherits the same deferral as 0b's `__topic_schemas` (RULING-4): single-node authoritative now; admin-owned transport replication is a follow-on.
 
 ## 11. Fold ownership & deterministic convergence
@@ -463,11 +463,11 @@ The schema-evolution prerequisite's decode path (`readField`-by-tag against a ma
 3. **Snapshot granularity:** one artifact per (view, partition) (proposed) vs one per view across its partitions. Per-(view,partition) matches worker ownership and parallel IO; confirm.
 4. **Very large views (RESOLVED into §9.2):** no stop-the-world bulk-copy at any size — persistence is the **batch-boundary differential checkpoint** (copy only a batch's dirty chunks), so cost scales with churn, not view size. The "accept the pause / defer chunked" proposal is retired.
 5. **Slab compaction timing (folded into §7 re-optimize):** delete holes are recycled via the row-id free-list on the hot path (no inline compaction); physical hole reclaim + hot-row page clustering + dense index rebuild happen at the deliberate **re-optimize** pass (restart / on-request), never inline.
-6. **`DefineView` field defaults:** default `MergeRule` = `Replace`; key field must appear in `output`; reject non-numeric `Sum/Min/Max` at define time — confirm.
+6. **`CreateView` field defaults:** default `MergeRule` = `Replace`; key field must appear in `output`; reject non-numeric `Sum/Min/Max` at define time — confirm.
 7. **Field-name uniqueness enforcement point (RESOLVED — fix-on-sight, rule #8):** enforce duplicate-name rejection at schema **registration** — `DescriptorBuilder::build()` (codec) and broker `DefineTopic` — so every consumer (views, typed clients, QL), not just Rune QL's parser (`Parser.cpp:241`), is protected and `Descriptor::find()`'s first-match is always safe. The view resolver additionally asserts uniqueness defensively. This codec/broker enforcement lands as part of this work (a small, bounded scope addition), with its own `*Regression*` test.
 8. **Durable field tags vs positional ids (RESOLVED — promoted to prerequisite spec):** `(topicId, fieldId)` identity requires `fieldId` to be a durable never-reused tag. This is now its own prerequisite foundation sub-project: **`docs/superpowers/specs/2026-10-08-rune-schema-evolution-durable-tags-design.md`** (durable numeric per-topic tags + versioned descriptor + compatibility modes + `ALTER TOPIC`). The view engine **depends on** it and lands after it (**prerequisite SHIPPED 2026-10-09** — see header). The view spec's field identity is concretely `(topicId, tag)` from that spec; this spec's §6.0 is realized there.
-9. **View-vs-schema-evolution compatibility policy (RESOLVED):** **graceful-absent at runtime + validation at `DefineView` time.** The schema layer stays one-way independent — a DROP of a view-bound tag degrades the tag to **absent** rather than being blocked at the schema layer (prerequisite spec §11, decision #6). On top of that, the view side:
-   - **At `DefineView`:** the AdminWorker validates every referenced `(topicId, name→tag)` against the source topic's current Descriptor and **rejects** obvious errors — a name that does not resolve, or a tag already dropped at the bound version. (A later-defined view over an already-evolved topic cannot silently reference a field that no longer exists.)
+9. **View-vs-schema-evolution compatibility policy (RESOLVED):** **graceful-absent at runtime + validation at `CreateView` time.** The schema layer stays one-way independent — a DROP of a view-bound tag degrades the tag to **absent** rather than being blocked at the schema layer (prerequisite spec §11, decision #6). On top of that, the view side:
+   - **At `CreateView`:** the AdminWorker validates every referenced `(topicId, name→tag)` against the source topic's current Descriptor and **rejects** obvious errors — a name that does not resolve, or a tag already dropped at the bound version. (A later-defined view over an already-evolved topic cannot silently reference a field that no longer exists.)
    - **At runtime:** a field dropped by a *later* `ALTER TOPIC DROP` degrades to **null/absent** in the view column for records written after the drop; the fold never wedges and the view stays coherent (`(topicId, tag)` identity + `isLiveAt` per writer version). No view invalidation, no coupling of `ALTER TOPIC` to view lifecycle.
    - Retype is treated as drop-old-tag + add-new-tag at the schema layer, so a view bound to the old tag sees it go absent (same runtime rule); a view wanting the new field is redefined to reference the new tag.
 
@@ -482,7 +482,7 @@ The schema-evolution prerequisite's decode path (`readField`-by-tag against a ma
 15. **Checkpoint model (RESOLVED 2026-10-09, §9.2 — spike-validated):** batch-boundary **differential** checkpoint — `dirty[C]` bit (set in the fold write-path) over **row-sized chunks** (page-sized chunks rejected: 4–16× write amplification, spike-shown); flush on `min(~1–2 s interval, dirtyCap)` (both configurable) at a batch boundary — copy only the interval's dirty chunks (coalesced: a hot row written once per flush) into a ping-pong handoff buffer tagged `{O}`, ring to the dedicated view-snapshot IO thread, which appends an `{O, chunks, CRC}` delta with grouped fsync; base + periodic compaction. Offset-atomic (exact `O`, never ±1), no full-view copy, no COW, no memory doubling; reads unmoved through p99.9 (measured). Constraint: node disk bandwidth ≥ aggregate dirty rate across its view-partitions. Rejected: stop-the-world full copy, incremental-COW sweep, mmap-of-record, log-structured/FASTER store, OS-page chunk granularity (§9.6).
 16. **Restart readiness (RESOLVED 2026-10-09, §9.4.1):** `RECOVERING → REBUILDING_VIEWS → READY`; a node is not election-eligible and serves no view reads / view-apply acks until every hosted view is loaded + replayed `(O, committedTail]`; folds never touch an unseeded view. Guaranteeable + deadlock-free (local-only rebuild) + bounded (checkpoint cadence). Composes with consensus's current-log rule so a partition is led/served only when log *and* views are current.
 
-17. **View persistence property (RESOLVED 2026-10-09, §9.7):** per-view `persistence ∈ {persisted (default), transient}`; **transient** = no checkpoint / no persistence IO / zero disk (durability stays the log's job), rebuilt on restart by replaying the source from its retained floor (cheap/empty for bounded or `InMemoryLog`-backed sources — not inherently slower). Word is **`transient`** (not `volatile` — avoids the C++/Postgres collision; matches Java `transient`). QL `DEFINE TRANSIENT VIEW`. Typing + readiness gate unchanged. Pairs with **transient topics** (own spec: `2026-10-09-rune-transient-topics-design.md`).
+17. **View persistence property (RESOLVED 2026-10-09, §9.7):** per-view `persistence ∈ {persisted (default), transient}`; **transient** = no checkpoint / no persistence IO / zero disk (durability stays the log's job), rebuilt on restart by replaying the source from its retained floor (cheap/empty for bounded or `InMemoryLog`-backed sources — not inherently slower). Word is **`transient`** (not `volatile` — avoids the C++/Postgres collision; matches Java `transient`). QL `CREATE TRANSIENT VIEW`. Typing + readiness gate unchanged. Pairs with **transient topics** (own spec: `2026-10-09-rune-transient-topics-design.md`).
 
 ## 16. Deferred follow-ons (program-level)
 - **Read-time query engine** — `WHERE` / `GROUP BY` / aggregation *beyond* the view's maintained per-field merge: the Filter/Aggregate operators (§5) applied at read time (the §12.3 example's shape). The result-typing/decode mechanism is already defined; the query *operators* are the follow-on.
@@ -490,6 +490,6 @@ The schema-evolution prerequisite's decode path (`readField`-by-tag against a ma
 - **Formal BACKWARD/FORWARD compatibility modes for view output schemas** — beyond the versioning + fingerprint-handshake guard (which suffices for correctness now).
 - **Join / multi-source views** (§8) — own spec: co-partitioning, gather semantics, outer/inner policy.
 - **Secondary indexes & range scans** over the view table.
-- **Rune QL `create view …`** surface over `DefineView` (thin, mirrors 0c).
+- **Rune QL `create view …`** surface over `CreateView` (thin, mirrors 0c).
 - **Multi-node `__views` replication** + view placement/failover policy (inherits RULING-4).
 - **Chunked/COW snapshot** for very large views (§9.6).

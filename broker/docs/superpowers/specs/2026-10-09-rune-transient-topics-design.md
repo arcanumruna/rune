@@ -39,7 +39,7 @@ EOS/transaction markers (§ transaction libs) assume a durable log + `__transact
 ## 6. Control plane — DDL & metadata
 
 - **Persistence is a per-topic property** set at create, stored in topic metadata (the `TopicRegistry`/`__topic_schemas`-adjacent metadata), default **persisted**.
-- **Rune QL:** `DEFINE TRANSIENT TOPIC name (…) ` (keyword) or `DEFINE TOPIC name (…) WITH (persistence = transient [, maxBytes=…, maxRecords=…, onFull = dropOldest|backPressure])`. The ring caps + full-policy are transient-only knobs.
+- **Rune QL:** `CREATE TRANSIENT TOPIC name (…) ` (keyword) or `CREATE TOPIC name (…) WITH (persistence = transient [, maxBytes=…, maxRecords=…, onFull = dropOldest|backPressure])`. The ring caps + full-policy are transient-only knobs. (Rune QL standardizes on the SQL-style **`CREATE`** verb for both topics and views — `CREATE TOPIC` / `CREATE VIEW`, mirroring `CREATE TABLE`. The shipped 0c QL currently uses a verb-less `topic NAME { … } partitions N key k;` form, so adopting `CREATE TOPIC` is a small 0c grammar addition.)
 - **AlterTopic:** flipping persisted↔transient is **not** a metadata-only change (it changes the storage backing); treat as create-new + migrate, or disallow in v1 (confirm). Schema evolution (`ALTER TOPIC ADD/DROP/…`) is orthogonal and unchanged.
 
 ## 7. Interaction with views
