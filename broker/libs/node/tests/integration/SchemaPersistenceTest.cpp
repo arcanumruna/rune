@@ -40,6 +40,7 @@
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
 #include <rune/codec/AlterOps.h>
+#include <rune/codec/Record.h>
 
 #include <atomic>
 #include <chrono>
@@ -48,6 +49,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace rune::node;
@@ -118,6 +120,10 @@ static AlterOp addOp(const std::string& name, PrimType t) {
 }
 static AlterOp setCompatOp(CompatMode m) {
     AlterOp op{}; op.type = AlterOpType::SetCompatibility; op.mode = m;
+    return op;
+}
+static AlterOp dropOp(const std::string& name) {
+    AlterOp op{}; op.type = AlterOpType::Drop; op.name = name;
     return op;
 }
 
@@ -868,6 +874,116 @@ TEST(TopicSchemaDeserializeRegression, CompatMode2RejectedRegression) {
 }
 
 // ---------------------------------------------------------------------------
+// GC4 (crash-recovery matrix): truncation points -- unit level.
+//
+// CompatMode2RejectedRegression above proves a MALFORMED trailing byte is
+// rejected; these three prove deserialize() rejects a record TRUNCATED at
+// each of the three distinct variable-length regions of the wire layout
+// (see the header comment on TopicSchema in SchemaRegistry.h) -- inside the
+// keyField bytes, inside the descriptorBlob bytes, and inside the trailing
+// (nextTag, compatMode) tail -- not just the gross few-byte garbage payload
+// the integration-level CorruptRecordAbortsRebuildRegression/
+// CorruptRecordAbortsBootReplayRegression tests use (that garbage is
+// truncated inside the very FIRST field, topicId). Each case must recover
+// NOTHING (nullopt), never a partial/garbled TopicSchema.
+// ---------------------------------------------------------------------------
+TEST(TopicSchemaDeserializeRegression, TruncatedInsideKeyFieldRejectedRegression) {
+    TopicSchema ts;
+    ts.topicId        = 7;
+    ts.version        = 1;
+    ts.partitionCount = 4;
+    ts.validate       = false;
+    ts.keyField       = "userId";  // 6 bytes
+    ts.descriptorBlob = serialize(DescriptorBuilder("t", 1).add("id", PrimType::Int64).build());
+    ts.nextTag        = 1;
+    ts.compatMode     = CompatMode::Backward;
+
+    const std::vector<uint8_t> full = ts.serialize();
+
+    // Fixed header (topicId+version+partitionCount+validate) = 11 bytes,
+    // + u16 keyLen prefix = 13 -- keyField bytes start there and run for
+    // keyField.size() (6) bytes. Truncate to 3 of the 6 keyField bytes: the
+    // keyLen prefix promises 6 bytes but only 3 are actually present.
+    constexpr size_t kKeyFieldStart = 13;
+    const size_t truncateLen = kKeyFieldStart + 3;
+    ASSERT_LT(truncateLen, full.size()) << "vacuousness guard: must actually truncate";
+
+    const std::vector<uint8_t> truncated(full.begin(), full.begin() + truncateLen);
+    const auto decoded = TopicSchema::deserialize(
+        std::span<const uint8_t>(truncated.data(), truncated.size()));
+    EXPECT_FALSE(decoded.has_value())
+        << "Regression: a record truncated MID-keyField (keyLen prefix promises more "
+           "bytes than are present) must be rejected, never partially decoded";
+}
+
+TEST(TopicSchemaDeserializeRegression, TruncatedInsideDescriptorBlobRejectedRegression) {
+    TopicSchema ts;
+    ts.topicId        = 7;
+    ts.version        = 1;
+    ts.partitionCount = 4;
+    ts.validate       = false;
+    ts.keyField       = "userId";
+    ts.descriptorBlob = serialize(DescriptorBuilder("characters", 1)
+        .add("id",     PrimType::Int64)
+        .add("userId", PrimType::Int64, 1, true)
+        .add("name",   PrimType::String)
+        .build());
+    ts.nextTag        = 3;
+    ts.compatMode     = CompatMode::Backward;
+
+    const std::vector<uint8_t> full = ts.serialize();
+
+    constexpr size_t kKeyFieldStart = 13;
+    const size_t descLenPos    = kKeyFieldStart + ts.keyField.size();      // 19
+    const size_t descBlobStart = descLenPos + 4;                          // 23
+    ASSERT_GT(ts.descriptorBlob.size(), 4u)
+        << "vacuousness guard: need a descriptorBlob big enough to truncate mid-blob";
+    const size_t truncateLen = descBlobStart + (ts.descriptorBlob.size() / 2);
+    ASSERT_LT(truncateLen, full.size()) << "vacuousness guard: must actually truncate";
+
+    const std::vector<uint8_t> truncated(full.begin(), full.begin() + truncateLen);
+    const auto decoded = TopicSchema::deserialize(
+        std::span<const uint8_t>(truncated.data(), truncated.size()));
+    EXPECT_FALSE(decoded.has_value())
+        << "Regression: a record truncated MID-descriptorBlob (descLen prefix promises "
+           "more bytes than are present) must be rejected, never partially decoded";
+}
+
+TEST(TopicSchemaDeserializeRegression, TruncatedInsideTrailingTailRejectedRegression) {
+    TopicSchema ts;
+    ts.topicId        = 7;
+    ts.version        = 1;
+    ts.partitionCount = 4;
+    ts.validate       = false;
+    ts.keyField       = "userId";
+    ts.descriptorBlob = serialize(DescriptorBuilder("t", 1).add("id", PrimType::Int64).build());
+    ts.nextTag        = 1;
+    ts.compatMode     = CompatMode::Forward;  // non-default, so a wrong decode would be visible
+
+    const std::vector<uint8_t> full = ts.serialize();
+    ASSERT_GE(full.size(), 3u);
+    const size_t tailStart = full.size() - 3;  // nextTag(2) + compatMode(1)
+
+    // remaining == 1: only nextTag's first byte present.
+    {
+        const std::vector<uint8_t> truncated(full.begin(), full.begin() + tailStart + 1);
+        const auto decoded = TopicSchema::deserialize(
+            std::span<const uint8_t>(truncated.data(), truncated.size()));
+        EXPECT_FALSE(decoded.has_value())
+            << "Regression: a tail truncated to 1 leftover byte (mid-nextTag) must be rejected";
+    }
+    // remaining == 2: nextTag fully present, compatMode byte missing.
+    {
+        const std::vector<uint8_t> truncated(full.begin(), full.begin() + tailStart + 2);
+        const auto decoded = TopicSchema::deserialize(
+            std::span<const uint8_t>(truncated.data(), truncated.size()));
+        EXPECT_FALSE(decoded.has_value())
+            << "Regression: a tail truncated to 2 leftover bytes (nextTag present, "
+               "compatMode byte missing) must be rejected";
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Task 15b regression: OldVersionsSurviveCompactionRegression
 //
 // __topic_schemas is a Compact-policy log (BrokerNode.cpp:2825-2828).  Before
@@ -1076,4 +1192,604 @@ TEST(SchemaPersistenceCompaction, OldVersionsSurviveCompactionRegression) {
     EXPECT_EQ(postCompactReg.byFingerprint(topicId, v1Fingerprint), v1)
         << "byFingerprint for the OLD v1 fingerprint must still resolve after "
            "compaction (old-fingerprint client binding depends on this)";
+}
+
+// ===========================================================================
+// GC4: crash-recovery matrix (truncation points, HW-gating, mixed data+
+// schema replay, idempotence). Extends the corrupt-record/compaction
+// regressions above with the remaining `[GAP]` scenarios from the
+// G3-G32 range of docs/superpowers/specs/2026-10-08-rune-schema-evolution-
+// test-matrix.md:
+//   - G39-44 (truncation at each distinct field boundary, not just the
+//     gross garbage CorruptRecordAbortsRebuildRegression/
+//     CorruptRecordAbortsBootReplayRegression already cover)
+//   - G9-14 (HW-gated application: a record past HW is never applied)
+//   - G27-32 (mixed data-log + schema-log replay: every data record still
+//     decodes per its own writer version)
+//   - G51-56 (replay idempotence / time-independence)
+// ===========================================================================
+
+// A byte-for-byte valid v2 TopicSchema serialization for `topicId` (ADD
+// "score" over the v1 "characters" schema from charsBlob()) -- appended
+// WHOLE by the HW-gating test below, and TRUNCATED at varying byte offsets
+// by the three truncation-point tests that follow it.
+static std::vector<uint8_t> wouldBeV2SchemaBuf(int32_t topicId) {
+    TopicSchema ts;
+    ts.topicId        = topicId;
+    ts.version        = 2;
+    ts.partitionCount = 4;
+    ts.validate       = false;
+    ts.keyField       = "userId";
+    ts.descriptorBlob = serialize(DescriptorBuilder("characters", 1)
+        .add("id",     PrimType::Int64)
+        .add("userId", PrimType::Int64, 1, true)
+        .add("name",   PrimType::String)
+        .add("score",  PrimType::Int64)
+        .build());
+    ts.nextTag    = 4;
+    ts.compatMode = CompatMode::Backward;
+    return ts.serialize();
+}
+
+// Append `payload` as a RAW record directly onto `replica` (bypassing
+// AdminWorker's commit path) -- same raw-append primitive
+// CorruptRecordAbortsRebuildRegression/CorruptRecordAbortsBootReplayRegression
+// use for their sandwiched-corruption setup, generalized to take an
+// arbitrary (possibly truncated, possibly whole) byte span so callers
+// control exactly what lands in the log.
+static void appendRawSchemaRecord(PartitionReplica* replica, std::span<const uint8_t> payload) {
+    const uint8_t keyBuf[6] = {0, 0, 0, 0, 0, 0};
+    const Offset base = replica->appendKeyed(
+        std::span<const uint8_t>(keyBuf, 6), payload, /*acksAll=*/true);
+    ASSERT_GE(base, 0) << "Precondition: the raw record must land in the log";
+    replica->onLeaderLogAppended();
+}
+
+// [blockLength:u16][version:u16][fixed block] -- the record wire shape
+// readField() expects, and the same shape WorkerReplicationValidatorTest.cpp's
+// encodeFixedRecord uses for the validator-side mixed-version tests
+// (duplicated locally to keep this file self-contained). `fields` is
+// (byteOffsetFromBlockStart, byteWidth, value).
+static std::vector<uint8_t> encodeFixedRecord(
+    uint16_t version, uint32_t blockLength,
+    const std::vector<std::tuple<uint32_t, uint32_t, uint64_t>>& fields)
+{
+    std::vector<uint8_t> b(4 + blockLength, 0);
+    b[0] = static_cast<uint8_t>(blockLength); b[1] = static_cast<uint8_t>(blockLength >> 8);
+    b[2] = static_cast<uint8_t>(version);     b[3] = static_cast<uint8_t>(version >> 8);
+    for (const auto& [offset, width, value] : fields) {
+        for (uint32_t i = 0; i < width; ++i)
+            b[4 + offset + i] = static_cast<uint8_t>(value >> (8 * i));
+    }
+    return b;
+}
+
+// Generic reader for ANY replica's [0,HW) committed records -- returns each
+// record's raw VALUE bytes in log order. Same batch-walking shape as
+// rebuildSchemaRegistryFromLog above, generalized to a plain data topic
+// (used by the mixed data+schema replay test to pull the data log's
+// records back after a simulated restart).
+static std::vector<std::vector<uint8_t>> readAllRecordValues(const PartitionReplica* replica) {
+    std::vector<std::vector<uint8_t>> out;
+    const Offset hw = replica->highWatermark();
+    if (hw <= 0) return out;
+
+    static constexpr int32_t kChunk = 64 * 1024 * 1024;
+    Offset fetchOffset = 0;
+
+    while (fetchOffset < hw) {
+        std::vector<uint8_t> data =
+            const_cast<PartitionReplica*>(replica)->read(fetchOffset, kChunk);
+        if (data.empty()) break;
+
+        std::size_t pos     = 0;
+        Offset lastBatchEnd = fetchOffset;
+
+        while (pos < data.size()) {
+            const uint8_t*    bs  = data.data() + pos;
+            const std::size_t rem = data.size() - pos;
+
+            if (rem < static_cast<std::size_t>(
+                    rune::protocol::batch::kRecordBatchOverhead))
+                break;
+
+            rune::protocol::RecordBatchReader reader(bs, rem);
+            if (!reader.ensureValid()) break;
+
+            const int32_t tl = reader.totalLength();
+            if (tl <= 0 || static_cast<std::size_t>(tl) > rem) break;
+
+            reader.forEach([&out](std::string_view /*key*/, std::string_view val,
+                                   int64_t /*offset*/, int64_t /*ts*/) {
+                out.emplace_back(val.begin(), val.end());
+            });
+
+            const Offset bne = reader.baseOffset() + reader.lastOffsetDelta() + 1;
+            if (bne > lastBatchEnd) lastBatchEnd = bne;
+            pos += static_cast<std::size_t>(tl);
+        }
+
+        if (lastBatchEnd <= fetchOffset) break;
+        fetchOffset = lastBatchEnd;
+    }
+    return out;
+}
+
+// Compare two independently-rebuilt SchemaRegistry instances for identical
+// state of EVERY version 1..maxVersion of `topicId` -- same version number,
+// nextTag, compatMode, fingerprint, keyField, partitionCount,
+// descriptorBlob bytes, and the exact materialized field layout
+// (name/tag/offset/type per field, in order). Used by the idempotence/
+// time-independence regression below: replaying the identical
+// __topic_schemas log twice must produce IDENTICAL registry state, not
+// merely "equivalent enough".
+static void expectRegistriesByteIdenticalForAllVersions(
+    const SchemaRegistry& a, const SchemaRegistry& b,
+    int32_t topicId, uint16_t maxVersion)
+{
+    for (uint16_t v = 1; v <= maxVersion; ++v) {
+        const RegistryEntry* ea = a.byIdVersion(topicId, v);
+        const RegistryEntry* eb = b.byIdVersion(topicId, v);
+        ASSERT_NE(ea, nullptr) << "registry A missing version " << v;
+        ASSERT_NE(eb, nullptr) << "registry B missing version " << v;
+
+        EXPECT_EQ(ea->version, eb->version) << "version mismatch at v" << v;
+        EXPECT_EQ(ea->nextTag, eb->nextTag) << "nextTag mismatch at v" << v;
+        EXPECT_EQ(static_cast<int>(ea->compatMode), static_cast<int>(eb->compatMode))
+            << "compatMode mismatch at v" << v;
+        EXPECT_EQ(ea->fingerprint, eb->fingerprint) << "fingerprint mismatch at v" << v;
+        EXPECT_EQ(ea->keyField, eb->keyField) << "keyField mismatch at v" << v;
+        EXPECT_EQ(ea->partitionCount, eb->partitionCount) << "partitionCount mismatch at v" << v;
+        EXPECT_EQ(ea->descriptorBlob, eb->descriptorBlob) << "descriptorBlob mismatch at v" << v;
+
+        ASSERT_EQ(ea->descriptor.fields.size(), eb->descriptor.fields.size())
+            << "materialized field count mismatch at v" << v;
+        for (std::size_t i = 0; i < ea->descriptor.fields.size(); ++i) {
+            const auto& fa = ea->descriptor.fields[i];
+            const auto& fb = eb->descriptor.fields[i];
+            EXPECT_EQ(fa.name, fb.name) << "field[" << i << "].name mismatch at v" << v;
+            EXPECT_EQ(fa.id,   fb.id)   << "field[" << i << "].id mismatch at v" << v;
+            EXPECT_EQ(fa.offset, fb.offset) << "field[" << i << "].offset mismatch at v" << v;
+            EXPECT_EQ(static_cast<int>(fa.type), static_cast<int>(fb.type))
+                << "field[" << i << "].type mismatch at v" << v;
+        }
+    }
+
+    const RegistryEntry* la = a.latest(topicId);
+    const RegistryEntry* lb = b.latest(topicId);
+    ASSERT_NE(la, nullptr);
+    ASSERT_NE(lb, nullptr);
+    EXPECT_EQ(la->version, lb->version) << "latest() version mismatch between two replays";
+}
+
+// ---------------------------------------------------------------------------
+// GC4 (G39-44): truncation-point matrix -- boot replay.
+//
+// CorruptRecordAbortsBootReplayRegression above proves a GROSS 2-byte
+// garbage payload (truncated inside the very first field, topicId) is
+// rejected. These three vary WHERE a record is torn instead: a record that
+// is otherwise a byte-for-byte valid v2 TopicSchema serialization, cut off
+// mid-keyField, mid-descriptorBlob, and mid-trailing-tail respectively.
+// Each must abort the boot replay exactly like the gross-garbage case (fail
+// loud, v1 survives, nothing past the torn record is applied) -- recovery
+// must recover EXACTLY the complete-version prefix, never a partial/
+// garbled version, regardless of where inside the record the tear lands.
+// ---------------------------------------------------------------------------
+TEST_F(SchemaPersistenceTest, TruncationInsideKeyFieldAbortsBootReplayRegression) {
+    DefineTopicMsg def;
+    def.session = 1; def.corr = 2; def.name = "characters";
+    def.keyField = "userId"; def.partitionCount = 4; def.validate = false;
+    def.blob = charsBlob();
+    driveDefine(def);
+    ASSERT_EQ(lastDefineError_, 0u) << "Precondition: DefineTopic (v1) must succeed";
+    const int32_t topicId = lastDefineTopicId_;
+    tick(5);
+
+    const std::vector<uint8_t> v2Buf = wouldBeV2SchemaBuf(topicId);
+    // Fixed header (11) + keyLen prefix (2) = 13; keyField "userId" is 6
+    // bytes -- truncate to 3 of them (keyLen prefix promises 6, only 3 land).
+    const size_t truncateLen = 13 + 3;
+    ASSERT_LT(truncateLen, v2Buf.size());
+    appendRawSchemaRecord(replica_.get(),
+                           std::span<const uint8_t>(v2Buf.data(), truncateLen));
+    tick(5);
+
+    SchemaRegistry bootReg;
+    const bool ok = rebuildSchemaRegistryFromLog(replica_.get(), bootReg);
+    EXPECT_FALSE(ok) << "Regression: a record torn mid-keyField must abort boot replay, "
+                         "not silently recover a partial version";
+
+    const RegistryEntry* v1 = bootReg.byIdVersion(topicId, 1);
+    ASSERT_NE(v1, nullptr) << "v1 (committed before the tear) must still be reconstructed";
+    EXPECT_EQ(bootReg.byIdVersion(topicId, 2), nullptr)
+        << "the torn v2 record must NOT be partially/garbled-applied";
+}
+
+TEST_F(SchemaPersistenceTest, TruncationInsideDescriptorBlobAbortsBootReplayRegression) {
+    DefineTopicMsg def;
+    def.session = 1; def.corr = 2; def.name = "characters";
+    def.keyField = "userId"; def.partitionCount = 4; def.validate = false;
+    def.blob = charsBlob();
+    driveDefine(def);
+    ASSERT_EQ(lastDefineError_, 0u) << "Precondition: DefineTopic (v1) must succeed";
+    const int32_t topicId = lastDefineTopicId_;
+    tick(5);
+
+    const std::vector<uint8_t> v2Buf = wouldBeV2SchemaBuf(topicId);
+    const size_t keyFieldStart = 13;
+    const size_t descLenPos    = keyFieldStart + std::string("userId").size();  // 19
+    const size_t descBlobStart = descLenPos + 4;                                // 23
+    const size_t descBlobLen   = v2Buf.size() - 3 /*tail*/ - descBlobStart;
+    ASSERT_GT(descBlobLen, 2u)
+        << "vacuousness guard: need a descriptorBlob big enough to truncate mid-blob";
+    const size_t truncateLen = descBlobStart + (descBlobLen / 2);
+    ASSERT_LT(truncateLen, v2Buf.size());
+    appendRawSchemaRecord(replica_.get(),
+                           std::span<const uint8_t>(v2Buf.data(), truncateLen));
+    tick(5);
+
+    SchemaRegistry bootReg;
+    const bool ok = rebuildSchemaRegistryFromLog(replica_.get(), bootReg);
+    EXPECT_FALSE(ok) << "Regression: a record torn mid-descriptorBlob must abort boot replay";
+
+    const RegistryEntry* v1 = bootReg.byIdVersion(topicId, 1);
+    ASSERT_NE(v1, nullptr) << "v1 (committed before the tear) must still be reconstructed";
+    EXPECT_EQ(bootReg.byIdVersion(topicId, 2), nullptr)
+        << "the torn v2 record must NOT be partially/garbled-applied";
+}
+
+TEST_F(SchemaPersistenceTest, TruncationInsideTrailingTailAbortsBootReplayRegression) {
+    DefineTopicMsg def;
+    def.session = 1; def.corr = 2; def.name = "characters";
+    def.keyField = "userId"; def.partitionCount = 4; def.validate = false;
+    def.blob = charsBlob();
+    driveDefine(def);
+    ASSERT_EQ(lastDefineError_, 0u) << "Precondition: DefineTopic (v1) must succeed";
+    const int32_t topicId = lastDefineTopicId_;
+    tick(5);
+
+    const std::vector<uint8_t> v2Buf = wouldBeV2SchemaBuf(topicId);
+    ASSERT_GE(v2Buf.size(), 3u);
+    const size_t tailStart   = v2Buf.size() - 3;
+    const size_t truncateLen = tailStart + 1;  // nextTag's first byte only present
+    appendRawSchemaRecord(replica_.get(),
+                           std::span<const uint8_t>(v2Buf.data(), truncateLen));
+    tick(5);
+
+    SchemaRegistry bootReg;
+    const bool ok = rebuildSchemaRegistryFromLog(replica_.get(), bootReg);
+    EXPECT_FALSE(ok) << "Regression: a record torn mid-trailing-tail must abort boot replay";
+
+    const RegistryEntry* v1 = bootReg.byIdVersion(topicId, 1);
+    ASSERT_NE(v1, nullptr) << "v1 (committed before the tear) must still be reconstructed";
+    EXPECT_EQ(bootReg.byIdVersion(topicId, 2), nullptr)
+        << "the torn v2 record must NOT be partially/garbled-applied";
+}
+
+// ---------------------------------------------------------------------------
+// GC4 (G9-14): HW-gating.
+//
+// A record present in the log but beyond the applied/high-watermark
+// boundary must NOT be applied on replay -- only [0, HW) is ever read by
+// rebuildSchemaRegistryFromLog (mirroring BrokerNode::buildAdminWorker's
+// boot-time [0,HW) forEachRecord loop, and PartitionReplica::read()'s own
+// "committed read (<= highWatermark)" contract).
+//
+// IMPORTANT MIRROR-HARNESS LIMITATION (documented per the task's own
+// allowance): on a SINGLE-NODE leader with minIsr=1, this harness's
+// PartitionReplica advances HW EAGERLY on every append once the (trivial,
+// self-only) ISR is synced -- there is no reachable "appended but HW
+// hasn't caught up yet" timing window to race against, because a
+// single-node ISR of {self} satisfies minIsr=1 immediately. That window
+// only exists for a REAL multi-node ISR waiting on follower acks, which
+// needs the Aeron media driver + real follower replicas -- explicitly
+// out of scope for this on-host mirror (see this file's own top-of-file
+// comment re: "Majority-durable commit path").
+//
+// This test instead exercises the SAME underlying HW-gating mechanism
+// (PartitionReplica::computeServedHw()/highWatermark(): HW stays clamped
+// at the frozen lastHealthyHw_ floor while |ISR| < minIsr -- see
+// PartitionReplica.cpp) via a STRUCTURALLY unreachable quorum: minIsr=2
+// configured over a SINGLE replica node. The ISR can therefore never
+// reach minIsr, so HW is pinned at 0 forever -- deterministic, not a
+// timing race -- while appendKeyed(acksAll=false) still lands records in
+// the log (acksAll=false bypasses only the APPEND-time ISR gate; HW
+// computation is unaffected and still clamps). This proves exactly the
+// scenario G9-14 calls for: a record present in the log past the
+// committed/HW boundary is excluded from [0,HW) replay.
+// ---------------------------------------------------------------------------
+TEST(SchemaPersistenceHwGating, RecordPastHighWatermarkExcludedFromReplayRegression) {
+    TmpSchemaDir dir("hwgate");
+    rune::storage::Log log(dir.path);
+    log.recover();
+    auto transport = std::make_unique<NullPartitionTransport>();
+
+    PartitionConfig cfg = makeSingleNodeSchemaConfig();
+    cfg.minIsr = 2;   // UNREACHABLE: only 1 replica node is configured below.
+
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, /*epoch=*/1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1},
+        &log, transport.get());
+
+    // Drive doWork a bunch BEFORE the append -- this is exactly what would
+    // advance HW if the ISR could ever satisfy minIsr; it must not.
+    {
+        int64_t nowNs = 0;
+        for (int i = 0; i < 50; ++i) { nowNs += 1'000'000LL; replica->doWork(nowNs); }
+    }
+    ASSERT_EQ(replica->highWatermark(), 0)
+        << "Precondition: HW starts at 0 (nothing appended yet)";
+
+    // A byte-for-byte VALID v1 TopicSchema record, appended directly with
+    // acksAll=false (bypasses the APPEND-time ISR gate -- with acksAll=true
+    // and an unmet minIsr, committedIsrMeetsMinIsr_ would refuse the append
+    // outright, so nothing would land in the log at all; acksAll=false is
+    // what gets a record INTO the log without the ISR's blessing, exactly
+    // the "appended, not yet committed" state G9-14 describes).
+    TopicSchema ts;
+    ts.topicId        = 99;
+    ts.version        = 1;
+    ts.partitionCount = 1;
+    ts.validate       = false;
+    ts.keyField       = "id";
+    ts.descriptorBlob = serialize(DescriptorBuilder("hwgate", 1)
+        .add("id", PrimType::Int64, 1, true).build());
+    ts.nextTag        = 1;
+    ts.compatMode     = CompatMode::Backward;
+    const std::vector<uint8_t> buf = ts.serialize();
+
+    const uint8_t keyBuf[6] = {0, 0, 0, 0, 0, 0};
+    const Offset base = replica->appendKeyed(
+        std::span<const uint8_t>(keyBuf, 6),
+        std::span<const uint8_t>(buf.data(), buf.size()),
+        /*acksAll=*/false);
+    ASSERT_GE(base, 0) << "Precondition: acksAll=false must land the record in the log "
+                           "even though minIsr is unmet";
+    replica->onLeaderLogAppended();
+
+    ASSERT_GT(replica->logEndOffset(), 0)
+        << "Precondition: the record is actually present in the log";
+
+    // Vacuousness guard: HW must stay pinned at 0 (unmet minIsr), or this
+    // test exercises nothing.
+    ASSERT_EQ(replica->highWatermark(), 0)
+        << "Vacuousness guard: HW must stay pinned at 0 (unmet minIsr) for this test to "
+           "actually exercise the gate; if this fails, PartitionReplica's HW-gating "
+           "semantics changed and this test needs rethinking, not deleting";
+
+    // More ticks -- still must not advance; the ISR requirement is
+    // structurally unmet, not merely "hasn't caught up yet".
+    {
+        int64_t nowNs = 0;
+        for (int i = 0; i < 50; ++i) { nowNs += 1'000'000LL; replica->doWork(nowNs); }
+    }
+    EXPECT_EQ(replica->highWatermark(), 0)
+        << "HW must remain pinned regardless of how many doWork ticks run";
+
+    // --- The actual G9-14 assertion: replay of [0,HW) must see NOTHING --
+    //     the record is physically present in the log but excluded from
+    //     replay because it is beyond (in fact, at-or-past) HW. ---
+    SchemaRegistry reg;
+    const bool ok = rebuildSchemaRegistryFromLog(replica.get(), reg);
+    EXPECT_TRUE(ok) << "an empty (hw<=0) replay must report success, not failure";
+    EXPECT_EQ(reg.byIdVersion(99, 1), nullptr)
+        << "Regression: a record PAST the high-watermark must NOT be applied on replay "
+           "-- only [0,HW) is ever committed/replayed, even though the record is "
+           "physically present in the log";
+}
+
+// ---------------------------------------------------------------------------
+// GC4 (G27-32): mixed data+schema replay.
+//
+// Builds a __topic_schemas lineage of 3 versions (v1 {id,amount}; v2 ADD
+// bonus; v3 DROP amount) via the PRODUCTION AdminWorker commit path, AND a
+// separate plain data-topic log containing one record PER version, each
+// encoded against THAT version's own materialized layout (offsets shift:
+// v1 blockLength=16 {id@0,amount@8}; v2 blockLength=24 {id@0,amount@8,
+// bonus@16}; v3 blockLength=16 {id@0,bonus@8} -- amount's retirement
+// reclaims its offset, same as the J1 DROP offset-reclaim rule). Simulates
+// a restart (rebuild BOTH logs from scratch) and asserts every data record
+// still decodes correctly using ITS OWN writer version's materialized
+// descriptor (RegistryEntry::descriptor via byIdVersion) -- never a
+// different version's descriptor, which would misread the wrong bytes as
+// the wrong field (demonstrated by the final cross-version assertion).
+// ---------------------------------------------------------------------------
+TEST_F(SchemaPersistenceTest, MixedDataAndSchemaReplay_RecordsDecodePerWriterVersionRegression) {
+    // --- Schema side: v1 {id(tag0,key), amount(tag1)} -> v2 ADD bonus(tag2)
+    //     -> v3 DROP amount. ---
+    DefineTopicMsg def;
+    def.session        = 1;
+    def.corr           = 2;
+    def.name           = "events";
+    def.keyField       = "id";
+    def.partitionCount = 1;
+    def.validate       = false;
+    def.blob           = serialize(DescriptorBuilder("events", 1)
+        .add("id",     PrimType::Int64, 1, true)
+        .add("amount", PrimType::Int64)
+        .build());
+    driveDefine(def);
+    ASSERT_EQ(lastDefineError_, 0u) << "Precondition: DefineTopic (v1) must succeed";
+    const int32_t topicId = lastDefineTopicId_;
+
+    AlterTopicMsg alterAdd;
+    alterAdd.session         = 10;
+    alterAdd.corr            = 11;
+    alterAdd.topicName       = "events";
+    alterAdd.expectedVersion = 0;
+    alterAdd.opsBlob         = altersOpsBlob({addOp("bonus", PrimType::Int64)});
+    driveAlter(alterAdd);
+    ASSERT_EQ(lastAlterError_, 0u) << "Precondition: ALTER (ADD bonus, v2) must succeed";
+    ASSERT_EQ(lastAlterVersion_, 2u);
+
+    AlterTopicMsg alterDrop;
+    alterDrop.session         = 12;
+    alterDrop.corr            = 13;
+    alterDrop.topicName       = "events";
+    alterDrop.expectedVersion = 0;
+    alterDrop.opsBlob         = altersOpsBlob({dropOp("amount")});
+    driveAlter(alterDrop);
+    ASSERT_EQ(lastAlterError_, 0u) << "Precondition: ALTER (DROP amount, v3) must succeed";
+    ASSERT_EQ(lastAlterVersion_, 3u);
+
+    tick(5);
+
+    // --- Data side: a SEPARATE plain-topic log, one record per version,
+    //     each encoded against that version's OWN layout. ---
+    TmpSchemaDir dataDir("events_data");
+    rune::storage::Log dataLog(dataDir.path);
+    dataLog.recover();
+    auto dataTransport = std::make_unique<NullPartitionTransport>();
+    PartitionConfig dataCfg = makeSingleNodeSchemaConfig();
+    dataCfg.topicId         = topicId;
+    dataCfg.cleanupPolicy   = CleanupPolicy::Delete;
+    auto dataReplica = std::make_unique<PartitionReplica>(
+        dataCfg, Role::Leader, /*epoch=*/1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1},
+        &dataLog, dataTransport.get());
+
+    constexpr uint16_t kIdTag = 0, kAmountTag = 1, kBonusTag = 2;
+
+    // v1 record: id=111, amount=222. blockLength=16 {id@0(8), amount@8(8)}.
+    const std::vector<uint8_t> r1 =
+        encodeFixedRecord(1, 16, {{0, 8, 111}, {8, 8, 222}});
+    // v2 record: id=333, amount=444, bonus=555. blockLength=24.
+    const std::vector<uint8_t> r2 =
+        encodeFixedRecord(2, 24, {{0, 8, 333}, {8, 8, 444}, {16, 8, 555}});
+    // v3 record: id=777, bonus=888 (amount dropped -> bonus's offset
+    // reclaims amount's old slot). blockLength=16 {id@0(8), bonus@8(8)}.
+    const std::vector<uint8_t> r3 =
+        encodeFixedRecord(3, 16, {{0, 8, 777}, {8, 8, 888}});
+
+    for (const auto& rec : {r1, r2, r3}) {
+        appendRawSchemaRecord(dataReplica.get(),
+                               std::span<const uint8_t>(rec.data(), rec.size()));
+    }
+    {
+        int64_t nowNs = 0;
+        for (int i = 0; i < 5; ++i) { nowNs += 1'000'000LL; dataReplica->doWork(nowNs); }
+    }
+
+    // --- Simulate a restart: rebuild BOTH logs from scratch. ---
+    SchemaRegistry freshSchemaReg;
+    ASSERT_TRUE(rebuildSchemaRegistryFromLog(replica_.get(), freshSchemaReg));
+
+    const RegistryEntry* e1 = freshSchemaReg.byIdVersion(topicId, 1);
+    const RegistryEntry* e2 = freshSchemaReg.byIdVersion(topicId, 2);
+    const RegistryEntry* e3 = freshSchemaReg.byIdVersion(topicId, 3);
+    ASSERT_NE(e1, nullptr); ASSERT_NE(e2, nullptr); ASSERT_NE(e3, nullptr);
+
+    const std::vector<std::vector<uint8_t>> dataRecords = readAllRecordValues(dataReplica.get());
+    ASSERT_EQ(dataRecords.size(), 3u) << "all 3 data records must survive replay";
+
+    // --- Each record decodes correctly using ITS OWN writer version's
+    //     materialized descriptor (read from the embedded header version,
+    //     dispatched via byIdVersion -- exactly how a real consumer would). ---
+    auto headerVersion = [](const std::vector<uint8_t>& rec) -> uint16_t {
+        return static_cast<uint16_t>(rec[2] | (rec[3] << 8));
+    };
+
+    const RegistryEntry* entries[3] = {e1, e2, e3};
+    for (const auto& rec : dataRecords) {
+        const uint16_t v = headerVersion(rec);
+        ASSERT_GE(v, 1); ASSERT_LE(v, 3);
+        const RegistryEntry* e = entries[v - 1];
+        const std::span<const uint8_t> span(rec.data(), rec.size());
+
+        const auto id = readField(e->descriptor, span, kIdTag);
+        ASSERT_TRUE(id.present) << "id must decode at v" << v;
+
+        if (v == 1) {
+            EXPECT_EQ(id.i, 111);
+            const auto amount = readField(e->descriptor, span, kAmountTag);
+            ASSERT_TRUE(amount.present) << "amount must be present at v1";
+            EXPECT_EQ(amount.i, 222);
+            EXPECT_FALSE(readField(e->descriptor, span, kBonusTag).present)
+                << "bonus does not exist yet at v1";
+        } else if (v == 2) {
+            EXPECT_EQ(id.i, 333);
+            const auto amount = readField(e->descriptor, span, kAmountTag);
+            ASSERT_TRUE(amount.present) << "amount must still be present at v2";
+            EXPECT_EQ(amount.i, 444);
+            const auto bonus = readField(e->descriptor, span, kBonusTag);
+            ASSERT_TRUE(bonus.present) << "bonus must be present at v2";
+            EXPECT_EQ(bonus.i, 555);
+        } else {
+            EXPECT_EQ(id.i, 777);
+            EXPECT_FALSE(readField(e->descriptor, span, kAmountTag).present)
+                << "amount was dropped at v3 -- must decode as absent, never garbage";
+            const auto bonus = readField(e->descriptor, span, kBonusTag);
+            ASSERT_TRUE(bonus.present) << "bonus must be present at v3";
+            EXPECT_EQ(bonus.i, 888);
+        }
+    }
+
+    // --- Contrast: decoding the v3 record with the WRONG (v2) descriptor
+    //     does NOT fail loud -- it silently returns bonus's byte range
+    //     mislabeled as "amount" (888, bonus's real value) instead of the
+    //     correct v3 answer (amount is retired -> absent, asserted above
+    //     via e3->descriptor). This is exactly why decode must always use
+    //     the WRITER's own version's materialized descriptor. ---
+    const auto wrongDecode = readField(e2->descriptor,
+                                        std::span<const uint8_t>(r3.data(), r3.size()),
+                                        kAmountTag);
+    ASSERT_TRUE(wrongDecode.present);
+    EXPECT_EQ(wrongDecode.i, 888)
+        << "cross-version misread: the v2 descriptor's 'amount' offset lands on what is "
+           "actually r3's 'bonus' bytes -- proving correctness depends on decoding each "
+           "record against ITS OWN writer version, never a different version's descriptor";
+}
+
+// ---------------------------------------------------------------------------
+// GC4 (G51-56): replay idempotence / time-independence.
+//
+// Replaying the identical __topic_schemas log TWICE (two independent FRESH
+// SchemaRegistry instances, same boot-replay mirror) must yield
+// byte-identical registry state: same versions, nextTag, compatMode,
+// fingerprints, and materialized field layout for every version -- not
+// merely "equivalent", but IDENTICAL, regardless of how many times or in
+// what order replay runs against the same [0,HW) byte range.
+// ---------------------------------------------------------------------------
+TEST_F(SchemaPersistenceTest, ReplayTwiceYieldsByteIdenticalRegistryStateRegression) {
+    DefineTopicMsg def;
+    def.session = 1; def.corr = 2; def.name = "characters";
+    def.keyField = "userId"; def.partitionCount = 4; def.validate = false;
+    def.blob = charsBlob();
+    driveDefine(def);
+    ASSERT_EQ(lastDefineError_, 0u) << "Precondition: DefineTopic (v1) must succeed";
+    const int32_t topicId = lastDefineTopicId_;
+
+    AlterTopicMsg alter1;
+    alter1.session = 10; alter1.corr = 11; alter1.topicName = "characters";
+    alter1.expectedVersion = 0;
+    alter1.opsBlob = altersOpsBlob({addOp("score", PrimType::Int64)});
+    driveAlter(alter1);
+    ASSERT_EQ(lastAlterError_, 0u);
+    ASSERT_EQ(lastAlterVersion_, 2u);
+
+    AlterTopicMsg alter2;
+    alter2.session = 12; alter2.corr = 13; alter2.topicName = "characters";
+    alter2.expectedVersion = 0;
+    alter2.opsBlob = altersOpsBlob({setCompatOp(CompatMode::Forward)});
+    driveAlter(alter2);
+    ASSERT_EQ(lastAlterError_, 0u);
+    ASSERT_EQ(lastAlterVersion_, 3u);
+
+    tick(5);
+
+    SchemaRegistry replayA;
+    SchemaRegistry replayB;
+    ASSERT_TRUE(rebuildSchemaRegistryFromLog(replica_.get(), replayA));
+    ASSERT_TRUE(rebuildSchemaRegistryFromLog(replica_.get(), replayB));
+
+    expectRegistriesByteIdenticalForAllVersions(replayA, replayB, topicId, /*maxVersion=*/3);
+
+    // A third replay, after an intervening read() on the same replica (a
+    // read must never mutate state) -- must agree too: replay order/count
+    // never changes the outcome.
+    (void)replica_->read(0, 1 << 20);
+    SchemaRegistry replayC;
+    ASSERT_TRUE(rebuildSchemaRegistryFromLog(replica_.get(), replayC));
+    expectRegistriesByteIdenticalForAllVersions(replayA, replayC, topicId, /*maxVersion=*/3);
 }
