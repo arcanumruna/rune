@@ -1417,14 +1417,31 @@ TEST(ShardModeRegression, AdvertisedIngressRoutesAreLiveForEndpointUnawareAndAwa
             sidOn[l] = c.connect(gatewayChannel(ports, l), kClientStream);
             ASSERT_GT(sidOn[l], 0) << "connect to leader " << l;
         }
+        // D31 (box -j3): leadership may still move after the first multi-leader snapshot (the spread rebalance
+        // lands ~40 ms later), so a route is re-read from the metadata whenever a batch is not acked — as a real
+        // client does on a Redirect.  Every route still comes ONLY from the MetadataResponse.
+        const auto advertised = [&](int32_t partition) -> std::optional<PartitionInfo> {
+            for (const auto& pi : c.metadata(gatewayChannel(ports, 0), kClientStream, sid0))
+                if (pi.topicId == 0 && pi.partition == partition && pi.leaderId >= 0) return pi;
+            return std::nullopt;
+        };
         for (const bool endpointAware : {false, true}) {
-            for (const auto& pi : parts) {
-                if (endpointAware) ASSERT_FALSE(pi.ingressEndpoint.empty()) << "partition " << pi.partition;
-                const std::string ch = endpointAware ? "aeron:udp?endpoint=" + pi.ingressEndpoint
-                                                     : gatewayChannel(ports, pi.leaderId);
+            for (const auto& first : parts) {
+                PartitionInfo pi = first;
                 for (int b = 0; b < kBatches; ++b) {
-                    auto ack = c.produceUntilOk(ch, pi.ingressStreamId, sidOn[pi.leaderId], 0, pi.partition,
-                                                /*acks=all*/1, makeBatch(2), /*maxAttempts=*/3);
+                    std::optional<pc::ProduceResponse> ack;
+                    for (int attempt = 0; attempt < 5 && !ack; ++attempt) {
+                        if (attempt > 0) if (auto fresh = advertised(pi.partition)) pi = *fresh;
+                        if (endpointAware) ASSERT_FALSE(pi.ingressEndpoint.empty()) << "partition " << pi.partition;
+                        if (!sidOn.count(pi.leaderId)) {
+                            sidOn[pi.leaderId] = c.connect(gatewayChannel(ports, pi.leaderId), kClientStream);
+                            ASSERT_GT(sidOn[pi.leaderId], 0) << "connect to leader " << pi.leaderId;
+                        }
+                        const std::string ch = endpointAware ? "aeron:udp?endpoint=" + pi.ingressEndpoint
+                                                             : gatewayChannel(ports, pi.leaderId);
+                        ack = c.produceUntilOk(ch, pi.ingressStreamId, sidOn[pi.leaderId], 0, pi.partition,
+                                               /*acks=all*/1, makeBatch(2), /*maxAttempts=*/3);
+                    }
                     ASSERT_TRUE(ack.has_value())
                         << (endpointAware ? "endpoint-aware" : "endpoint-UNAWARE") << " client: partition "
                         << pi.partition << " (leader " << pi.leaderId << ", advertised stream "
