@@ -936,3 +936,8 @@ per hop × ~4 hops).
   `/root/.conan2/p/b/aeron5913a5b3cc7e3/p/lib/` and the driver sources from `driver-c-src`.
 - iptables: `/root/rune-e5/iptables-lo-revert.sh`.
 - `perf_event_paranoid` back to 4; `systemctl start k3s` (regenerates kube chains).
+
+### 2026-10-09 — latency-gate A/B, main 5cc6b16 vs 6ee164d (box, fresh fs per run)
+Parity across all 36 scenario/fs cells (n=3; FollowerTruncation ext4 confirmed with ABAB n=10: median 614 vs 647 µs).
+Improvement: FollowerFetchDuringRetention tmpfs p99.9 802 → 115 µs (D26 HW-bounded pread, no read-map provisioning
+for unread logs).  Report: briefs/2026-10-09-gate-ab-5cc6b16.md.
