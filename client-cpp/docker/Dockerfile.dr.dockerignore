@@ -26,6 +26,9 @@ tests/*
 !tests/e2e
 tests/e2e/*
 !tests/e2e/rune_ql_probe.cpp
+# schema-evolution evo_probe_vN targets are configured (EXCLUDE_FROM_ALL) whenever
+# examples are on — their sources must be in the context or cmake configure fails.
+!tests/e2e/evo_probe_v*.cpp
 benchmark/
 bench/
 
