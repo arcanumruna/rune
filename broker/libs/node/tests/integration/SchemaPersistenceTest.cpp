@@ -42,6 +42,7 @@
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/Record.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -124,6 +125,13 @@ static AlterOp setCompatOp(CompatMode m) {
 }
 static AlterOp dropOp(const std::string& name) {
     AlterOp op{}; op.type = AlterOpType::Drop; op.name = name;
+    return op;
+}
+// Used by the GC5 long-lineage compaction test (renames the live display
+// name while preserving the field's durable tag -- decode-by-tag must be
+// unaffected by a rename chain).
+static AlterOp renameOp(const std::string& oldName, const std::string& newName) {
+    AlterOp op{}; op.type = AlterOpType::Rename; op.name = oldName; op.newName = newName;
     return op;
 }
 
@@ -1792,4 +1800,364 @@ TEST_F(SchemaPersistenceTest, ReplayTwiceYieldsByteIdenticalRegistryStateRegress
     SchemaRegistry replayC;
     ASSERT_TRUE(rebuildSchemaRegistryFromLog(replica_.get(), replayC));
     expectRegistriesByteIdenticalForAllVersions(replayA, replayC, topicId, /*maxVersion=*/3);
+}
+
+// ===========================================================================
+// GC5: compaction x long-lineage mixed-read (H3-H14, C71-78 of
+// docs/superpowers/specs/2026-10-08-rune-schema-evolution-test-matrix.md).
+//
+// Extends OldVersionsSurviveCompactionRegression (3-version lineage, v1
+// fingerprint-only check) to a LONG 12-version lineage with a genuine MIX of
+// ADD/DROP/RENAME, run through the exact same production machinery:
+//   - real AdminWorker DefineTopic + 11x ALTER commits (never a hand-rolled
+//     TopicSchema/registry poke),
+//   - a Log configured with segmentRollBytes=1 (every append rolls a fresh
+//     segment, so all 12 versions are individually compactable -- not stuck
+//     together in one never-compacted active segment),
+//   - the REAL duty-cycle compaction path (rune::node::NodeRuntimeAgent::
+//     runBoundedCompaction over a rune::node::ReplicaRegistry) -- the exact
+//     harness OldVersionsSurviveCompactionRegression and
+//     CompactionCorrectnessTest.cpp use, NOT a fake.
+//
+// Lineage (tags assigned in ADD order; a dash under "op" means "unchanged
+// from the previous version"):
+//   v1  DEFINE   id(tag0,key) amount(tag1) label(tag2)
+//   v2  ADD      score(tag3)
+//   v3  ADD      bonus(tag4)
+//   v4  DROP     amount (tag1 retired)
+//   v5  RENAME   label -> title            (tag2 unchanged)
+//   v6  ADD      flag(tag5)
+//   v7  DROP     score (tag3 retired)
+//   v8  RENAME   title -> caption          (tag2 unchanged)
+//   v9  ADD      extra(tag6)
+//   v10 DROP     bonus (tag4 retired)
+//   v11 RENAME   caption -> headline       (tag2 unchanged)
+//   v12 ADD      final(tag7)
+//
+// Assertions (H3-H8): EVERY version 1..12 survives compaction --
+// byIdVersion(topicId,K) present for all K, AND byFingerprint(topicId,fp(vK))
+// resolves to that same entry for all K (fp captured from an independent
+// PRE-compaction replay, exactly like the old-fingerprint-client-binding
+// rationale the base regression documents, but for the FULL lineage, not
+// just v1).
+//
+// Edge (H1/H9-H14 tie-in): the compaction key is (topicId,version), so
+// distinct versions are distinct keys and none are evicted -- confirmed by
+// re-reading the raw post-compaction log and asserting exactly 12 distinct
+// (topicId,version) records survive (none lost, none duplicated).
+//
+// Mixed read (C71-78): after compaction, synthetic data records written
+// under v1, v5, v9, and v12 (spanning the full ADD/DROP/RENAME history) are
+// decoded EACH against its own writer version's surviving materialized
+// descriptor (postCompactReg.byIdVersion(topicId, writerVersion)->descriptor)
+// -- every live field at that version decodes to its expected value, and
+// every tag NOT live at that version (retired before it, or not yet added)
+// reads definitively absent, never garbage from a neighboring version's
+// offset table.
+// ===========================================================================
+
+// Build a raw fixed-block test record for one post-compaction RegistryEntry:
+// every field LIVE at `entry.version` gets a distinct deterministic value
+// (version*1000 + durable tag), laid out at that field's OWN materialized
+// offset (rune::codec::materializeAsOf's real output, read back from the
+// registry -- never hand-computed), so the record is byte-correct for
+// exactly the schema version it claims in its header. Reuses
+// encodeFixedRecord (defined above for MixedDataAndSchemaReplay_*).
+static std::vector<uint8_t> encodeRecordForEntry(const RegistryEntry& entry) {
+    std::vector<std::tuple<uint32_t, uint32_t, uint64_t>> fields;
+    fields.reserve(entry.descriptor.fields.size());
+    for (const auto& f : entry.descriptor.fields) {
+        const uint64_t value = static_cast<uint64_t>(entry.version) * 1000ULL
+                              + static_cast<uint64_t>(f.id);
+        fields.emplace_back(f.offset, 8u, value);
+    }
+    return encodeFixedRecord(entry.version, entry.descriptor.blockLength, fields);
+}
+
+TEST(SchemaPersistenceCompaction, LongLineageSurvivesCompactionAndMixedReadRegression) {
+    TmpSchemaDir dir("compact_long_lineage");
+
+    // segmentRollBytes=1: every append rolls a fresh segment (same trick
+    // OldVersionsSurviveCompactionRegression uses), so all 12 appends land
+    // in up to 12 distinct segments -- every version except the very last
+    // ends up sealed/compactable.
+    rune::storage::Log log(dir.path, /*segmentRollBytes=*/1);
+    log.recover();
+
+    auto transport = std::make_unique<NullPartitionTransport>();
+
+    PartitionConfig cfg = makeSingleNodeSchemaConfig();
+    cfg.minCleanableDirtyRatio = 0.0;  // compact eagerly regardless of dirty fraction
+
+    auto replica = std::make_unique<PartitionReplica>(
+        cfg, Role::Leader, /*epoch=*/1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1},
+        &log, transport.get());
+
+    SchemaRegistry registry;
+
+    int64_t  pendingTicket     = -1;
+    int32_t  nextTopicId       = 0;
+    int32_t  lastDefineTopicId = -1;
+    uint16_t lastDefineError   = 0xffff;
+    uint16_t lastAlterVersion  = 0;
+    uint16_t lastAlterError    = 0xffff;
+
+    AdminDeps deps;
+    deps.requestCreateTopic = [&](int64_t ticket, int32_t, const std::string&) -> bool {
+        pendingTicket = ticket;
+        return true;
+    };
+    deps.pushValidators = [](const RegistryEntry&, int32_t) {};
+    deps.respondDefine  = [&](int64_t, int64_t, int32_t topicId, uint16_t,
+                             uint16_t errorCode) {
+        lastDefineTopicId = topicId;
+        lastDefineError   = errorCode;
+    };
+    deps.respondGet = [](int64_t, int64_t, int32_t, uint16_t,
+                         const std::vector<uint8_t>&, uint16_t) {};
+    deps.respondAlter = [&](int64_t, int64_t, int32_t, uint16_t newVersion,
+                           uint16_t errorCode) {
+        lastAlterVersion = newVersion;
+        lastAlterError   = errorCode;
+    };
+
+    AdminWorker worker(registry, replica.get(), /*selfId=*/1,
+                       std::vector<int32_t>{1}, std::move(deps));
+    worker.onRole(AdminRoleMsg{/*leader=*/true, /*epoch=*/1, /*leaderId=*/1});
+
+    auto driveDefineLocal = [&](const DefineTopicMsg& msg) {
+        worker.submitDefineTopic(msg);
+        pendingTicket = -1;
+        int64_t nowNs = 0;
+        for (int i = 0; i < 50; ++i) {
+            nowNs += 1'000'000LL;
+            worker.doWork(nowNs);
+            if (pendingTicket >= 0) {
+                CreateTopicReplyMsg reply;
+                reply.ticket   = pendingTicket;
+                reply.topicId  = nextTopicId++;
+                pendingTicket  = -1;
+                worker.onCreateTopicReply(reply);
+            }
+        }
+    };
+    auto driveAlterLocal = [&](const std::string& topicName,
+                                const std::vector<AlterOp>& ops,
+                                uint16_t expectedNewVersion) {
+        AlterTopicMsg alter;
+        alter.session         = 100 + expectedNewVersion;
+        alter.corr            = 200 + expectedNewVersion;
+        alter.topicName       = topicName;
+        alter.expectedVersion = 0;
+        alter.opsBlob         = altersOpsBlob(ops);
+        worker.submitAlterTopic(alter);
+        int64_t nowNs = 0;
+        for (int i = 0; i < 50; ++i) {
+            nowNs += 1'000'000LL;
+            worker.doWork(nowNs);
+        }
+        ASSERT_EQ(lastAlterError, 0u)
+            << "Precondition: ALTER -> v" << expectedNewVersion << " must succeed";
+        ASSERT_EQ(lastAlterVersion, expectedNewVersion);
+    };
+
+    // v1: DEFINE "ledger" {id(key), amount, label} -- all Int64 for a
+    // uniform fixed-block encode/decode in the mixed-read phase below (the
+    // per-type matrix (C31-40) is covered elsewhere; this test's job is the
+    // long-lineage x compaction interaction, not type coverage).
+    DefineTopicMsg def;
+    def.session        = 1;
+    def.corr            = 2;
+    def.name           = "ledger";
+    def.keyField       = "id";
+    def.partitionCount = 4;
+    def.validate       = false;
+    def.blob           = serialize(DescriptorBuilder("ledger", 1)
+        .add("id",     PrimType::Int64, 1, true)
+        .add("amount", PrimType::Int64)
+        .add("label",  PrimType::Int64)
+        .build());
+    driveDefineLocal(def);
+    ASSERT_EQ(lastDefineError, 0u) << "Precondition: DefineTopic (v1) must succeed";
+    const int32_t topicId = lastDefineTopicId;
+
+    // v2..v12: the ADD/DROP/RENAME mix documented in the header comment above.
+    driveAlterLocal("ledger", {addOp("score", PrimType::Int64)}, 2);
+    driveAlterLocal("ledger", {addOp("bonus", PrimType::Int64)}, 3);
+    driveAlterLocal("ledger", {dropOp("amount")}, 4);
+    driveAlterLocal("ledger", {renameOp("label", "title")}, 5);
+    driveAlterLocal("ledger", {addOp("flag", PrimType::Int64)}, 6);
+    driveAlterLocal("ledger", {dropOp("score")}, 7);
+    driveAlterLocal("ledger", {renameOp("title", "caption")}, 8);
+    driveAlterLocal("ledger", {addOp("extra", PrimType::Int64)}, 9);
+    driveAlterLocal("ledger", {dropOp("bonus")}, 10);
+    driveAlterLocal("ledger", {renameOp("caption", "headline")}, 11);
+    driveAlterLocal("ledger", {addOp("final", PrimType::Int64)}, 12);
+
+    constexpr uint16_t kLineageLength = 12;
+
+    // Belt-and-suspenders HW advance (same pattern as the base regression).
+    {
+        int64_t nowNs = 0;
+        for (int i = 0; i < 5; ++i) { nowNs += 1'000'000LL; replica->doWork(nowNs); }
+    }
+
+    // Capture every version's fingerprint BEFORE compaction, from an
+    // independent replay -- these are the values an old client's typed gate
+    // would have compiled against at each point in the lineage, and every
+    // one of them must still resolve via byFingerprint() AFTER compaction.
+    SchemaRegistry preCompactReg;
+    ASSERT_TRUE(rebuildSchemaRegistryFromLog(replica.get(), preCompactReg));
+    std::vector<uint64_t> fingerprintByVersion(kLineageLength + 1, 0);
+    for (uint16_t v = 1; v <= kLineageLength; ++v) {
+        const RegistryEntry* e = preCompactReg.byIdVersion(topicId, v);
+        ASSERT_NE(e, nullptr) << "Precondition: v" << v << " must be present before compaction";
+        fingerprintByVersion[v] = e->fingerprint;
+    }
+
+    // Sanity: rollBytes=1 must have produced one segment per append (11
+    // sealed + 1 active) -- or this test would not exercise compaction of
+    // the FULL lineage (vacuousness guard, same intent as the base
+    // regression's >=2u check, scaled to 12 versions).
+    const auto basesBefore = log.segmentBaseOffsets();
+    ASSERT_GE(basesBefore.size(), static_cast<std::size_t>(kLineageLength))
+        << "Need >= 12 segments (11 sealed + active) to exercise compaction "
+           "across the ENTIRE long lineage -- vacuousness guard";
+
+    // --- Run REAL compaction via the production duty-cycle mechanism. ---
+    rune::node::ReplicaRegistry replicaRegistry;
+    PartitionReplica* rawReplica = replica.get();
+    replicaRegistry.add(kSchemaTopicId, /*partition=*/0, std::move(replica));
+
+    class NoopConsensusAgent : public rune::consensus::Agent {
+    public:
+        int doWork(int64_t) override { return 0; }
+    };
+    NoopConsensusAgent consensusAgent;
+    rune::node::NodeRuntimeAgent runtimeAgent(
+        consensusAgent, /*election=*/nullptr, /*bridge=*/nullptr,
+        /*transport=*/nullptr, &replicaRegistry, /*gateway=*/nullptr);
+
+    const std::size_t sealedCount = basesBefore.size() - 1;
+    for (std::size_t i = 0; i < sealedCount + 20; ++i) {
+        runtimeAgent.runBoundedCompaction(static_cast<int64_t>(i) * 1'000'000LL);
+    }
+    log.reloadSegments();
+
+    // --- Rebuild a FRESH SchemaRegistry from the (now compacted) log. ---
+    SchemaRegistry postCompactReg;
+    ASSERT_TRUE(rebuildSchemaRegistryFromLog(rawReplica, postCompactReg));
+
+    // H3-H8: EVERY version 1..12 survives, latest()==12, and EVERY version's
+    // PRE-compaction fingerprint still resolves post-compaction.
+    const RegistryEntry* entryByVersion[kLineageLength + 1] = {};
+    for (uint16_t v = 1; v <= kLineageLength; ++v) {
+        const RegistryEntry* e = postCompactReg.byIdVersion(topicId, v);
+        ASSERT_NE(e, nullptr)
+            << "v" << v << " must survive compaction of the full 12-version lineage -- "
+               "the (topicId,version) compaction key must keep every version distinct";
+        EXPECT_EQ(e->version, v);
+        entryByVersion[v] = e;
+
+        EXPECT_EQ(postCompactReg.byFingerprint(topicId, fingerprintByVersion[v]), e)
+            << "byFingerprint for v" << v << "'s PRE-compaction fingerprint must still "
+               "resolve to the SAME entry after compaction";
+    }
+
+    const RegistryEntry* lat = postCompactReg.latest(topicId);
+    ASSERT_NE(lat, nullptr);
+    EXPECT_EQ(lat->version, kLineageLength) << "latest() must be v12 after compaction + rebuild";
+
+    // Edge (H1/H9-H14 tie-in): the compacted __topic_schemas log itself still
+    // contains exactly 12 distinct (topicId,version) records for this topic
+    // -- none evicted (would show < 12), none duplicated (would show >12 or
+    // a repeated version), confirming the compaction key really is
+    // (topicId,version), not topicId alone.
+    {
+        const std::vector<std::vector<uint8_t>> rawSchemaRecords = readAllRecordValues(rawReplica);
+        std::vector<uint16_t> versionsSeen;
+        for (const auto& raw : rawSchemaRecords) {
+            const auto ts = TopicSchema::deserialize(
+                std::span<const uint8_t>(raw.data(), raw.size()));
+            ASSERT_TRUE(ts.has_value()) << "every surviving raw schema record must deserialize";
+            if (ts->topicId == topicId) versionsSeen.push_back(ts->version);
+        }
+        ASSERT_EQ(versionsSeen.size(), static_cast<std::size_t>(kLineageLength))
+            << "the compacted log must retain exactly 12 distinct records for this topic "
+               "-- (topicId,version) keying means none of the 12 versions collide";
+        std::sort(versionsSeen.begin(), versionsSeen.end());
+        for (uint16_t v = 1; v <= kLineageLength; ++v) {
+            EXPECT_EQ(versionsSeen[v - 1], v)
+                << "surviving record set must be EXACTLY {1..12}, no gaps/dupes";
+        }
+    }
+
+    // --- C71-78: mixed read AFTER compaction. Synthetic data records
+    //     written under v1, v5, v9, and v12 (spanning the full ADD/DROP/
+    //     RENAME history) must each decode correctly against ITS OWN
+    //     writer version's surviving post-compaction descriptor. ---
+    TmpSchemaDir dataDir("ledger_data");
+    rune::storage::Log dataLog(dataDir.path);
+    dataLog.recover();
+    auto dataTransport = std::make_unique<NullPartitionTransport>();
+    PartitionConfig dataCfg = makeSingleNodeSchemaConfig();
+    dataCfg.topicId         = topicId;
+    dataCfg.cleanupPolicy   = CleanupPolicy::Delete;
+    auto dataReplica = std::make_unique<PartitionReplica>(
+        dataCfg, Role::Leader, /*epoch=*/1,
+        std::vector<NodeId>{1}, std::vector<NodeId>{1},
+        &dataLog, dataTransport.get());
+
+    const uint16_t mixedVersions[] = {1, 5, 9, 12};
+    for (const uint16_t v : mixedVersions) {
+        const std::vector<uint8_t> rec = encodeRecordForEntry(*entryByVersion[v]);
+        appendRawSchemaRecord(dataReplica.get(),
+                               std::span<const uint8_t>(rec.data(), rec.size()));
+    }
+    {
+        int64_t nowNs = 0;
+        for (int i = 0; i < 5; ++i) { nowNs += 1'000'000LL; dataReplica->doWork(nowNs); }
+    }
+
+    const std::vector<std::vector<uint8_t>> dataRecords = readAllRecordValues(dataReplica.get());
+    ASSERT_EQ(dataRecords.size(), 4u) << "all 4 mixed-version data records must survive replay";
+
+    auto headerVersion = [](const std::vector<uint8_t>& rec) -> uint16_t {
+        return static_cast<uint16_t>(rec[2] | (rec[3] << 8));
+    };
+
+    // Every durable tag ever allocated across the lineage (tags 0..7) --
+    // used below to assert BOTH presence (live fields decode to their
+    // expected value) and absence (retired-or-not-yet-added fields decode
+    // as absent, never garbage) for each record's writer version.
+    constexpr uint16_t kMaxTagExclusive = 8;
+
+    for (const auto& rec : dataRecords) {
+        const uint16_t v = headerVersion(rec);
+        const RegistryEntry* e = postCompactReg.byIdVersion(topicId, v);
+        ASSERT_NE(e, nullptr) << "writer version v" << v << " must resolve post-compaction";
+        EXPECT_EQ(e, entryByVersion[v])
+            << "mixed-read decode must dispatch to the SAME surviving entry captured above";
+
+        std::vector<bool> liveTag(kMaxTagExclusive, false);
+        for (const auto& f : e->descriptor.fields) liveTag[f.id] = true;
+
+        const std::span<const uint8_t> span(rec.data(), rec.size());
+        for (uint16_t tag = 0; tag < kMaxTagExclusive; ++tag) {
+            const auto fv = readField(e->descriptor, span, tag);
+            if (liveTag[tag]) {
+                ASSERT_TRUE(fv.present)
+                    << "tag " << tag << " is live at v" << v << " and must decode present";
+                EXPECT_EQ(fv.i, static_cast<int64_t>(v) * 1000 + tag)
+                    << "tag " << tag << " at v" << v << " decoded the wrong value -- "
+                       "likely decoded against the wrong version's descriptor";
+            } else {
+                EXPECT_FALSE(fv.present)
+                    << "tag " << tag << " is NOT live at v" << v << " (retired before it or "
+                       "not yet added) and must decode absent, never garbage from a "
+                       "neighboring version's offset table";
+            }
+        }
+    }
 }
