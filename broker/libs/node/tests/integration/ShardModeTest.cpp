@@ -1402,6 +1402,10 @@ TEST(ShardModeRegression, AdvertisedIngressRoutesAreLiveForEndpointUnawareAndAwa
     }
     {
         ShardTestClient c(cdir.path);
+        // D31 box run: an ACTIVE client (not the silent-client model) — a re-route that waits out a stale
+        // leader must not cross the 10 s session lease, or its metadata session is reaped and the route can
+        // never be refreshed.
+        c.keepSessionsAlive(true);
         const int64_t sid0 = c.connect(gatewayChannel(ports, 0), kClientStream);
         ASSERT_GT(sid0, 0);
         std::vector<PartitionInfo> parts;
