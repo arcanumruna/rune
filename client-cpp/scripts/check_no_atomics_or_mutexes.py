@@ -42,6 +42,7 @@ The script self-tests its detector and the allowlist logic against synthetic
 fixtures before scanning (--selftest runs only that), so a regex change that
 opens a bypass or a false positive fails loudly on its own.
 """
+import json
 import re
 import sys
 from pathlib import Path
@@ -99,6 +100,33 @@ PATTERNS = [
     ("stdns",     r"\busing\s+namespace\s+(?:::\s*)?std\s*;"),
     ("stdns",     r"\bnamespace\s+\w+\s*=\s*(?:::\s*)?std\s*(?:::\s*experimental\s*)?;"),
 ]
+# C-F32 (2026-10-09): the TEST tree (tests/** minus the shipped tests/e2e probes)
+# is under the same law plus a SLEEP kind — a wall-clock sleep is a timing
+# assumption, not a progress condition (flakes under TSan / load: C-F24).
+# Progress-driven waits instead: drive loops bounded by a failure-only deadline,
+# pipes, join, Completions.  `--tests` checks it.  Existing sites are a
+# RATCHET (scripts/test_tree_sync_baseline.json, exact multiset per file): a
+# new site fails, and a removed one must be dropped from the baseline (it only
+# shrinks).  TEST_PERMANENT: test infrastructure whose sync is the point.
+TESTS_DIR = "tests"
+TESTS_EXCLUDE_PREFIX = "tests/e2e/"  # shipped probe apps: FUTURE_ONLY_DIRS rules
+SLEEP_PATTERNS = [
+    ("sleep", r"\bstd\s*::\s*this_thread\s*::\s*sleep_(?:for|until)\b"),
+    ("sleep", r"(?<![\w.:])(?<!->)(?:this_thread\s*::\s*)?sleep_(?:for|until)\s*\("),
+    ("sleep", r"(?<![\w.])(?<!->)(?:::\s*)?(?:usleep|nanosleep|clock_nanosleep)\s*\("),
+    ("sleep", r"(?<![\w.])(?<!->)::\s*sleep\s*\("),
+]
+COMPILED_SLEEP = [(k, re.compile(p)) for k, p in SLEEP_PATTERNS]
+TEST_PERMANENT = {
+    # Allocation counter: operator new hooks run on every thread (the counters
+    # are the instrument; the client's own law is about src/ + include/).
+    "tests/support/AllocCounter.cpp",
+    # Aeron's error handler runs on Aeron's conductor thread (a test client's
+    # embedded-driver shutdown error): counted, never acted on.
+    "tests/support/AeronTestErrors.h",
+}
+TESTS_BASELINE_FILE = "scripts/test_tree_sync_baseline.json"
+
 # Kinds enforced in FUTURE_ONLY_DIRS too (a namespace escape there would hide a future).
 FUTURE_SCOPE_KINDS = {"future", "stdns"}
 COMPILED = [(k, re.compile(p)) for k, p in PATTERNS]
@@ -217,6 +245,50 @@ def find_matches(raw: str):
         line = clean.count("\n", 0, s) + 1
         out.append((line, kind, normalize(raw[s:e])))
     return out
+
+
+def find_test_matches(raw: str):
+    """find_matches + the SLEEP kind (test tree only)."""
+    out = find_matches(raw)
+    clean = strip_comments_and_strings(raw)
+    spans = []
+    for kind, rx in COMPILED_SLEEP:
+        for m in rx.finditer(clean):
+            if any(s <= m.start() < e for (s, e) in spans):
+                continue
+            spans.append((m.start(), m.end()))
+            out.append((clean.count("\n", 0, m.start()) + 1, kind, normalize(raw[m.start():m.end()])))
+    return sorted(out)
+
+
+def test_multiset(raw: str):
+    return {f"{k}|{sn}": c for (k, sn), c in multiset(find_test_matches(raw)).items()}
+
+
+def evaluate_tests(files: dict, baseline: dict, permanent: set):
+    """files: {relpath: text} of the test tree.  baseline: {relpath: {"kind|snippet": count}}."""
+    violations = []
+    for rel in sorted(files):
+        if rel in permanent:
+            continue
+        got = test_multiset(files[rel])
+        allowed = baseline.get(rel, {})
+        for key in sorted(set(got) | set(allowed)):
+            g, a = got.get(key, 0), allowed.get(key, 0)
+            kind, snip = key.split("|", 1)
+            if g > a:
+                lines = ", ".join(str(l) for l, k, sn in find_test_matches(files[rel]) if (k, sn) == (kind, snip))
+                violations.append(f"{rel}: NEW test-tree {kind} site `{snip}` x{g - a} (lines {lines}) — "
+                                  f"use a progress-driven wait (drive loop + failure-only deadline, pipe, "
+                                  f"join, Completions), not a sleep / shared sync")
+            elif g < a:
+                violations.append(f"{rel}: baselined {kind} site `{snip}` x{a - g} is GONE — shrink "
+                                  f"{TESTS_BASELINE_FILE} (run --tests --write-baseline)")
+    for rel in sorted(set(baseline) - set(files)):
+        violations.append(f"{rel}: in {TESTS_BASELINE_FILE} but not found (stale baseline entry)")
+    for rel in sorted(set(baseline) & permanent):
+        violations.append(f"{rel}: both TEST_PERMANENT and baselined")
+    return violations
 
 
 def multiset(matches):
@@ -406,8 +478,29 @@ SELFTEST_FUTURES = [
 ]
 
 
+SELFTEST_TESTS = [
+    # (name, files, baseline, expected violations) for evaluate_tests
+    ("tests_new_sleep_fails", {"tests/a.cpp": "std::this_thread::sleep_for(10ms);"}, {}, 1),
+    ("tests_new_atomic_fails", {"tests/a.cpp": "std::atomic<int> n{0};"}, {}, 1),
+    ("tests_baselined_ok", {"tests/a.cpp": "std::this_thread::sleep_for(10ms); std::mutex m;"},
+     {"tests/a.cpp": {"sleep|std::this_thread::sleep_for": 1, "mutex|std::mutex": 1}}, 0),
+    ("tests_grown_fails", {"tests/a.cpp": "sleep_for(1ms); sleep_for(2ms);"},
+     {"tests/a.cpp": {"sleep|sleep_for(": 1}}, 1),
+    ("tests_shrunk_fails", {"tests/a.cpp": "int x;"}, {"tests/a.cpp": {"sleep|sleep_for(": 1}}, 1),
+    ("tests_stale_fails", {}, {"tests/gone.cpp": {"sleep|sleep_for(": 1}}, 1),
+    ("tests_usleep_nanosleep", {"tests/a.cpp": "usleep(10); ::nanosleep(&ts, nullptr); ::sleep(1);"}, {}, 3),
+    ("tests_sleep_lookalikes_ok", {"tests/a.cpp": "idle.sleep(1); sleepNs_ = 2; obj->usleep(3); "
+                                                  "// sleep_for(1ms)\nint sleep_for_count = 0;"}, {}, 0),
+    ("tests_permanent_ok", {"tests/support/AllocCounter.cpp": "std::atomic<long> n;"}, {}, 0),
+]
+
+
 def run_selftest():
     failures = []
+    for name, files, base, want_v in SELFTEST_TESTS:
+        v = evaluate_tests(files, base, TEST_PERMANENT)
+        if len(v) != want_v:
+            failures.append(f"tests '{name}': expected {want_v} violation(s), got {len(v)}: {v}")
     for name, snippet, want in SELFTEST_DETECT:
         got = len(find_matches(snippet))
         if got != want:
@@ -447,7 +540,7 @@ def main(argv):
     if "--selftest" in argv:
         print(f"check_no_atomics_or_mutexes: self-test OK "
               f"({len(SELFTEST_DETECT)} detector + {len(SELFTEST_ALLOW)} allowlist + "
-              f"{len(SELFTEST_FUTURES)} futures-scope fixtures)")
+              f"{len(SELFTEST_FUTURES)} futures-scope + {len(SELFTEST_TESTS)} test-tree fixtures)")
         return 0
     args = [a for a in argv if not a.startswith("--")]
     root = Path(args[0]) if args else Path(__file__).resolve().parent.parent
@@ -463,6 +556,29 @@ def main(argv):
     if "--dump" in argv:
         for rel in args[1:]:
             print(rel, dict(sorted(multiset(find_matches(files[rel])).items())))
+        return 0
+    if "--tests" in argv:
+        # C-F32: NoNewSyncOrSleepsInTestTreeRegression — the ratchet.
+        tfiles = {rel: txt for rel, txt in collect(root, (TESTS_DIR,)).items()
+                  if not rel.startswith(TESTS_EXCLUDE_PREFIX)}
+        bpath = root / TESTS_BASELINE_FILE
+        if "--write-baseline" in argv:
+            base = {rel: dict(sorted(test_multiset(txt).items())) for rel, txt in sorted(tfiles.items())
+                    if rel not in TEST_PERMANENT and test_multiset(txt)}
+            bpath.write_text(json.dumps(base, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+            print(f"check_no_atomics_or_mutexes --tests: wrote {TESTS_BASELINE_FILE} "
+                  f"({len(base)} files, {sum(sum(m.values()) for m in base.values())} sites)")
+            return 0
+        baseline = json.loads(bpath.read_text(encoding="utf-8")) if bpath.is_file() else {}
+        violations = evaluate_tests(tfiles, baseline, TEST_PERMANENT)
+        if violations:
+            print(f"check_no_atomics_or_mutexes --tests: {len(violations)} violation(s)")
+            for v in violations:
+                print("  " + v)
+            return 1
+        print(f"check_no_atomics_or_mutexes --tests: OK ({len(tfiles)} test files; baseline debt "
+              f"{sum(sum(m.values()) for m in baseline.values())} sites in {len(baseline)} files, "
+              f"never growing)")
         return 0
     if "--futures" in argv:
         # NoFuturesOrPromisesGuardRegression: the FUTURE kind only, everywhere
