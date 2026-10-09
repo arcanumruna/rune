@@ -1,6 +1,6 @@
 # Rune View Engine (single-source materialized views) — Design Spec
 
-**Status:** DRAFT — open decisions resolved 2026-10-09 (§15 #1/#7/#9); prerequisite shipped; ready for spec-review → plan
+**Status:** DRAFT — all §15 decisions resolved 2026-10-09 (#1–#24; #2/#3/#6 were proposed-defaults, now confirmed into §9.2/§6.0); prerequisite shipped; ready for spec-review → plan
 **Date:** 2026-10-08 (decisions updated 2026-10-09)
 **Program:** Rune materialized-views foundation (follows 0a rune-codec ✅, 0b schema registry + typed transport ✅, 0c Rune QL & CLI ✅)
 **Depends on (prerequisite — SHIPPED 2026-10-09):** `2026-10-08-rune-schema-evolution-durable-tags-design.md` — durable per-topic field tags + versioned descriptors + compatibility modes. Implemented across rune-codec/protocol/broker/ql/client-cpp, merged locally into `feature/materialized-views`, e2e-green on real Aeron (k3s-node-01). The view engine's field identity `(topicId, tag)` and version-aware fold are now concrete: `FieldDescriptor::id` is a durable never-reused per-topic tag; the registry keeps versioned descriptors (`byIdVersion`/`byFingerprint`/`materializeAsOf`/`fingerprintAsOf`) and a per-record version-aware `readFieldByTag`.
@@ -33,8 +33,6 @@ Every design choice below is checked against the Rune HARD RULES. The load-beari
 - **Off the produce critical path.** The fold runs in the worker's duty cycle over its own read-committed log `[cursor, LSO)` (§11 — LSO, not raw HW, so aborted/in-flight transactions never materialize), bounded per cycle — never on the produce ack path. Serialize + fsync runs on a background thread, never the worker (§9). A produce may optionally hold its ack until dependent views have folded it (§11.1), but that is an opt-in per-produce acknowledgement, not the fold path moving onto the produce path.
 - **Deterministic / time-independent convergence (#16).** The fold is a pure function of the committed log prefix; replica and leader converge to the identical view table at the same offset regardless of timing (§11).
 - **Test + benchmark everything (#5), regression-test every fix (#6), fix-on-sight (#8).** §14.
-
-> **Review note:** confirm this section is complete against the canonical 16-point philosophy; add any point you want explicitly gated here.
 
 ### 3.1 Typing & safety contract (binding — stronger than a typical RDBMS client)
 
@@ -106,7 +104,7 @@ A view definition compiles to a flat, declarative plan. Each output field has a 
 | `Replace` (1:1 / per-source field) | the value (in the row) | set | overwrite | clear / null |
 | `Count` | scalar `n` (in the row) | `n++` | — | `n--` |
 | `Sum` (and `Avg` = `Sum`/`Count`) | scalar `s` (in the row) + a **pre-image** | `s += v` | `s += new − old` | `s −= old` |
-| `Min`/`Max` | **multiset `value→count` + cached extreme** (aux, §7 side-structure) | `cnt[v]++`, refresh extreme | retract old + insert new | `cnt[old]--`; if the extreme was removed, rescan for the next |
+| `Min`/`Max` | **multiset `value→count` + cached extreme** (aux — this §6; persisted via §9.2) | `cnt[v]++`, refresh extreme | retract old + insert new | `cnt[old]--`; if the extreme was removed, rescan for the next |
 | `Last` (grouped last-writer) | **contributors ordered by offset/recency + cached last** (aux — same family as `Min`/`Max`, ordered by recency not value) | record `(offset, value)`, update cached-last if newer | update the contributor's entry | drop it; if it was the cached-last, surface the next-most-recent |
 
 Two facts drive the cost:
@@ -131,7 +129,7 @@ Topics in Rune are **typed** (0b): every topic has a registered `Descriptor` in 
 **Canonical field identity = `(topicId, fieldId)`.** The name a view writes is a *human alias* resolved to this pair at `CreateView`; it is not the identity. Reasoning:
 
 - **`topicId`** is the broker-unique outer key (RULING-1: `TopicRegistry` is the sole sequential id allocator). A view sources from a specific topic/stream, so this is the right outer coordinate. It persists even if the topic's schema is replaced by a new lineage.
-- **`fieldId`** is the field's id *within that topic's schema*. It must be a **durable logical tag** — assigned once, **never reused**, retired/reserved when a field is removed, a fresh tag for each new field (Protobuf/Thrift/Avro discipline). With durable tags, `(topicId, fieldId)` is a stable *logical* identity across **arbitrary** schema evolution, additive or breaking: tag *N* always denotes "the field that was tag *N*"; a version that dropped it simply reports it absent, and a view referencing it stays coherent with no version qualifier.
+- **`fieldId`** is the field's id *within that topic's schema*. It must be a **durable logical tag** — assigned once, **never reused**, retired/reserved when a field is removed, a fresh tag for each new field (Protobuf/Thrift/Avro discipline). With durable tags, `(topicId, fieldId)` is a stable *logical* identity across **arbitrary** schema evolution, additive or breaking: tag *N* always denotes "the field that was tag *N*"; a version that dropped it simply reports it absent (§6.3 graceful-absent / §15 #9), and a view referencing it stays coherent with no version qualifier.
 - **`schemaId` and `schemaVersion` are deliberately NOT part of the identity.** `schemaId` (fingerprint) is redundant with `topicId` for sourcing (the registry binds topic→schema). `schemaVersion` is a **per-record decode concern, not an identity component** — folding it into identity would give the same field a *new* identity every version, re-breaking compatibility and version-pinning every view. (The one world where you'd be forced to version-qualify identity is if tags were *reused* — which is exactly the discipline we reject.)
 
 > **Prerequisite (SHIPPED 2026-10-09):** `FieldDescriptor::id` is now a **durable never-reused per-topic tag** (identity = `(topicId, tag)`, never name/position), delivered by the schema-evolution foundation. Field identity is therefore stable under **arbitrary** evolution (additive or breaking), not just additive-only. See resolved decisions #8 and #9.
@@ -148,12 +146,12 @@ Critically, name resolution happens **once, at `CreateView` time on the AdminWor
 
 - The codec read primitive is `readField(descriptor, record, uint16_t fieldId)` — it reads **by field id**, not by name. Resolving a *name* costs a linear `find()` scan; doing that per record per field on the fold path would be a hot-path string scan, violating #4 / ultra-low-latency.
 - So at `CreateView` the AdminWorker fetches the source topic's `Descriptor` from `__topic_schemas` and, for the `key` and every `srcField`, calls `find()` → resolves to `{ fieldId, type, width }`. This is also where it **validates**: the name exists, its type is numeric for `Sum/Min/Max`, the key field exists, and output types resolve.
-- Because field identity is a **durable never-reused tag** (schema-evolution foundation, SHIPPED), a resolved `(topicId, tag)` stays valid across **arbitrary** later evolution — additive or breaking — with no re-resolution: a version that dropped the tag simply reports it absent at fold time (§11.1 / §15 #9), and per-record decode uses that record's version-materialized descriptor (§6).
+- Because field identity is a **durable never-reused tag** (schema-evolution foundation, SHIPPED), a resolved `(topicId, tag)` stays valid across **arbitrary** later evolution — additive or breaking — with no re-resolution: a version that dropped the tag simply reports it absent at fold time (§6.3 graceful-absent / §15 #9), and per-record decode uses that record's version-materialized descriptor (§6).
 
 This gives **two plan forms** — the authoring plan (string names, the Rune QL / `CreateView` wire form) and the compiled plan (resolved ids) installed into the worker's Reactor:
 
 ```cpp
-enum class MergeRule : uint8_t { Replace, Sum, Min, Max, First };
+enum class MergeRule : uint8_t { Replace, Count, Sum, Avg, Min, Max, Last };  // the §6 operator set
 
 // ---- Authoring plan: string names, produced by Rune QL / the CreateView wire op ----
 struct AuthoredField {
@@ -181,7 +179,7 @@ struct CompiledField {
 };
 struct CompiledViewPlan {
     std::string                viewName;
-    uint16_t                   keyFieldId;   // RESOLVED key field id, per source
+    std::vector<uint16_t>      keyFieldId;   // RESOLVED key field id, ONE PER SOURCE (index-aligned with srcDesc)
     std::vector<const Descriptor*> srcDesc;  // source Descriptor(s) — already resident per 0b per-worker validation
     std::vector<CompiledField> output;
 };
@@ -191,19 +189,26 @@ struct CompiledViewPlan {
 - **Merge** = per-field `MergeRule`, applied when a new record arrives for a key already present:
 
 ```cpp
-// Pure, no-alloc, no-virtual. Called per output field during fold.
+// Pure, no-alloc, no-virtual SCALAR fast path — the invertible / cached-extreme cases.
+// Count, Avg, and *retractable* Min/Max/Last are NOT a pure (cur,in) binary merge:
+// they run through the aux-state path (§6 table) — the running counter, the pre-image,
+// the value→count multiset, or the recency-ordered contributors — so they are driven by
+// the fold with their side-structure, not by this function. The switch below is the
+// append-only / scalar realization the fold calls when no aux state is required.
 FieldValue mergeField(MergeRule rule, bool has_cur, FieldValue cur, FieldValue in, PrimType t) {
     switch (rule) {
         case MergeRule::Replace: return in;                       // upsert / last-write-wins
-        case MergeRule::First:   return has_cur ? cur : in;       // keep earliest
-        case MergeRule::Sum:     return has_cur ? numAdd(cur,in,t) : in;
-        case MergeRule::Min:     return has_cur ? numMin(cur,in,t) : in;
-        case MergeRule::Max:     return has_cur ? numMax(cur,in,t) : in;
+        case MergeRule::Sum:     return has_cur ? numAdd(cur,in,t) : in;  // scalar; delete/update use pre-image (§6)
+        case MergeRule::Min:     return has_cur ? numMin(cur,in,t) : in;  // append-only cached extreme
+        case MergeRule::Max:     return has_cur ? numMax(cur,in,t) : in;  // (retractable Min/Max use the aux multiset)
+        case MergeRule::Count:                                     // scalar n++/n--, driven by the fold
+        case MergeRule::Avg:                                       // = Sum / Count, derived from the two scalars
+        case MergeRule::Last:    return in;                        // recency-ordered aux (§6); latest wins here
     }
 }
 ```
 
-`Sum/Min/Max` require a numeric `PrimType` (validated at `CreateView` time against the source Descriptor, §6.0 — never on the fold path). `Replace` is the default and the single-source upsert semantics.
+`Sum/Avg/Min/Max` require a numeric `PrimType` (validated at `CreateView` time against the source Descriptor, §6.0 — never on the fold path). `Replace` is the default and the single-source upsert semantics. `Count/Last` and retractable `Min/Max` carry the aux state described in the §6 table.
 
 ### 6.1 `foldRecord` (the fold path, per committed record)
 
@@ -212,7 +217,7 @@ Reads go **by resolved field id** against the source Descriptor the compiled pla
 ```
 desc = plan.srcDesc[thisSource]                        // resident Descriptor
 for each committed record r in [cursor, LSO) for an interested view:   // read-committed; §11
-    k = readField(desc, r, plan.keyFieldId)            // codec zero-copy read BY ID (0a)
+    k = readField(desc, r, plan.keyFieldId[thisSource]) // codec zero-copy read BY ID (0a), key tag of this source
     if r is a tombstone (zero-length value):           // §6.2
         erase substate[k]; viewTable.erase(k); continue
     for each CompiledField f in plan.output where f.sourceIdx == thisSource:
@@ -261,7 +266,7 @@ A **null** is a typed "missing value," stored in the row's **null bitmap** (§7)
 The `viewTable` for a (view, partition) is the view's **primary storage** keyed by the view's key field — not a secondary structure over something else. It is split into a compact **index** and a stable **row slab**, a layout validated by a standalone benchmark (64/256/1024 B rows, 15 M rows, mixed create/update/delete churn — see §7.1 results) against a naive inline-row table.
 
 - **Index = separated control + key + row-id (not `std::unordered_map`, not inline rows).** Flat, power-of-two, open-addressing arrays: a 1-byte **tag** per slot (top hash bits + empty marker, Swiss/F14-style — probed word-at-a-time), the 8-byte **key**, and a 4-byte dense **row-id**. The fat row payload is deliberately **kept out of the probe path** — the probe scans tiny tags/keys, touching a row only on a confirmed hit. (A naive inline-row table drags the whole 256 B/1 KB row through every probe step and through every resize; the benchmark showed that is pathological — see §7.1.)
-- **Row slab = a chunked arena, row-id-addressed.** The slab is a **list of fixed, page-aligned chunks** (e.g. 32 MB, configurable), addressed `rowid → (chunk = rowid >> shift, offset = (rowid & mask) * rowLen)` with `rowsPerChunk` a power of two (one shift + mask + a chunk-pointer load — a few ns, negligible vs §14.0). `rowLen` is fixed (§6.0 capped-width model). **Rows never move** and **the slab grows by *appending a chunk*, never by reallocating/migrating** — so growth touches no existing row (this is what makes "rows never move" actually hold; a single contiguous slab could not grow without moving every row). Dense row-ids come from a free-list (recycled on delete) → no fragmentation holes; whole emptied chunks can be released at re-optimize. Chunks are anonymous RAM (not mmap'd files — §9.6), each independently dirty-tracked for the differential checkpoint (§9.2).
+- **Row slab = a chunked arena, row-id-addressed.** The slab is a **list of fixed, page-aligned chunks** (e.g. 32 MB, configurable), addressed `rowid → (chunk = rowid >> shift, offset = (rowid & mask) * rowLen)` with `rowsPerChunk` a power of two (one shift + mask + a chunk-pointer load — a few ns, negligible vs §14.0). `rowLen` is fixed (§3 capped-width `FixedStr`/`VarChar(N)` model). **Rows never move** and **the slab grows by *appending a chunk*, never by reallocating/migrating** — so growth touches no existing row (this is what makes "rows never move" actually hold; a single contiguous slab could not grow without moving every row). Dense row-ids come from a free-list (recycled on delete) → no fragmentation holes; whole emptied chunks can be released at re-optimize. Chunks are anonymous RAM (not mmap'd files — §9.6), each independently dirty-tracked for the differential checkpoint (§9.2).
 - **Fixed-width rows carry a null bitmap.** Each row reserves a small **presence/null bitmap** (one bit per nullable column) so "absent" is representable *in place* — a column that degrades to absent (a dropped source field, an unpopulated outer-join side, a not-yet-arrived source) is set null **without changing the row width**. So `rowLen` is constant and slot-skipping is unaffected, and "absence is explicit and typed" (§3.1) rather than a sentinel or a width change.
 - **Deletes are O(1) and tombstone-free.** `erase` clears the index slot (backward-shift within the index — 13-byte entries, never payloads) and frees the row-id to the free-list. No payload move, no tombstone accumulation, no delete-driven compaction. (Benchmark: delete p99 flat at ~300 ns across all row sizes; the inline design degraded to ~1.2 µs at 1 KB because backshift memcpy'd kilobyte rows.)
 - **Growth never blocks.** Two independent, both-cheap mechanisms: **(slab)** when the active chunk fills, **append a new chunk** (an anonymous-RAM allocation, O(1), existing rows untouched — pre-provision the next chunk in the background so even the allocation is off the hot path); **(index)** when its load factor crosses the threshold, grow it by **de-amortized incremental rehash** — a background thread pre-allocates+zeroes the next 2× index (the slab is untouched — only tiny `(tag,key,rowid)` entries migrate), `startGrow` is an **O(1) pointer swap** (~0.5 µs), each op migrates ≤ `MIGK` entries (reads/writes consult new-then-old during the window). Worst per-op growth tax stays **< 50 µs, independent of row size** (§7.1). A stop-the-world rehash (20 ms–4.2 s) is categorically forbidden on the hot path. **No accurate up-front capacity is required** — the view grows on demand (more chunks + index rehash); `capacity` is an optional pre-size hint (§10).
@@ -580,6 +585,8 @@ These are binding pass/fail budgets, measured firsthand under default config (AB
 
 The schema-evolution prerequisite's decode path (`readFieldByTag` against a materialized per-version descriptor) is part of the **< 5 µs/record** pipeline budget — its own plan carries a derived sub-budget so it cannot erode it. The join gather (§8) and projection/merge (§6) are likewise *inside* the 5 µs — the whole fold→merge→join chain for one record is gated together, not per-stage.
 
+### 14.1 Test suites
+
 - **Unit:** `mergeField` per rule × type; projection select/rename; tombstone erase; open-addressing index probe/erase(backshift)/incremental-resize; row-id free-list alloc/recycle; re-optimize compaction.
 - **Fold determinism:** same log prefix → identical table byte-for-byte, across orderings that preserve per-key commit order; leader vs replica table equality at equal offset.
 - **Persistence round-trip:** snapshot → kill → load+replay `[O+1, HW)` → table equals the never-restarted table (time-independent, #16). Crash-mid-write leaves prior complete snapshot usable (CRC fallback). Offset in artifact exactly matches table.
@@ -602,7 +609,7 @@ The schema-evolution prerequisite's decode path (`readFieldByTag` against a mate
 - **Chunked slab growth (§7/§10):** a view with no `capacity` grows from a small default to far beyond it (e.g. 1M→30M rows) purely by **appending chunks** — existing rows never move (stable `rowid`→address), read latency is unchanged across growth, and the only migration is the small index's incremental rehash. With `maxRows` set, exceeding it raises a capacity-exceeded event instead of growing.
 - **Regression suite:** every fix gets a `*Regression*` test; full regression suite runs first on every change (#6/#7).
 
-## 14.2 Observability (metrics)
+### 14.2 Observability (metrics)
 
 The §14.0 gates and the overload/flow-control policy (§11.3) are only enforceable if the engine exports, **per (view, partition)**:
 
@@ -617,14 +624,14 @@ Per-node rollups (aggregate dirty rate vs disk bandwidth, §9.2) gate the disk-p
 
 ## 15. Decisions
 
-**Load-bearing decisions #1, #7, #9 resolved 2026-10-09** (bodies updated in §9.5, §6.0, §9 below). Items #2–#6 carry sound proposed defaults and are confirmed at plan time; #8 was already resolved into the prerequisite spec.
+**All decisions below are resolved as of 2026-10-09.** The load-bearing ones (#1/#7/#9) and the full #10–#24 batch are marked `RESOLVED` inline with their section. The three that were proposed-defaults — #2 (snapshot trigger), #3 (snapshot granularity), #6 (`CreateView` field defaults) — are now confirmed into §9.2/§6.0 and marked below. #8 was resolved into the prerequisite spec.
 
 1. **§9.5 — snapshot-IO thread ownership (RESOLVED):** a **dedicated per-node view-snapshot IO thread** (own `AgentRunner`). Rejected: extending `LogCleanerAgent`. See §9.5.
-2. **Snapshot trigger policy:** time *T* only, offset-delta *N* only, or both (whichever first)? Default proposal: both, whichever fires first, with *T* and *N* configurable per view.
-3. **Snapshot granularity:** one artifact per (view, partition) (proposed) vs one per view across its partitions. Per-(view,partition) matches worker ownership and parallel IO; confirm.
-4. **Very large views (RESOLVED into §9.2):** no stop-the-world bulk-copy at any size — persistence is the **batch-boundary differential checkpoint** (copy only a batch's dirty chunks), so cost scales with churn, not view size. The "accept the pause / defer chunked" proposal is retired.
+2. **Snapshot trigger policy (RESOLVED 2026-10-09, §9.2):** **both, whichever fires first** — `min(interval ~1–2 s, dirtyCap)`, each configurable per view. Stated unconditionally in §9.2.
+3. **Snapshot granularity (RESOLVED 2026-10-09, §9.2):** **one artifact per (view, partition)**, owned by the worker that owns the partition — matches shared-nothing ownership and gives parallel IO. (Not one-per-view-across-partitions.)
+4. **Very large views (RESOLVED into §9.2; see #15 for the full dated checkpoint model):** no stop-the-world bulk-copy at any size — persistence is the **batch-boundary differential checkpoint** (copy only a batch's dirty chunks), so cost scales with churn, not view size. The "accept the pause / defer chunked" proposal is retired.
 5. **Slab compaction timing (folded into §7 re-optimize):** delete holes are recycled via the row-id free-list on the hot path (no inline compaction); physical hole reclaim + hot-row page clustering + dense index rebuild happen at the deliberate **re-optimize** pass (restart / on-request), never inline.
-6. **`CreateView` field defaults:** default `MergeRule` = `Replace`; key field must appear in `output`; reject non-numeric `Sum/Min/Max` at define time — confirm.
+6. **`CreateView` field defaults (RESOLVED 2026-10-09, §6.0):** default `MergeRule` = `Replace`; the key field must appear in `output`; non-numeric `Sum/Avg/Min/Max` is **rejected at define time** against the source Descriptor (§6.0 validation), never on the fold path.
 7. **Field-name uniqueness enforcement point (RESOLVED — fix-on-sight, rule #8):** enforce duplicate-name rejection at schema **registration** — `DescriptorBuilder::build()` (codec) and broker `DefineTopic` — so every consumer (views, typed clients, QL), not just Rune QL's parser (`Parser.cpp:241`), is protected and `Descriptor::find()`'s first-match is always safe. The view resolver additionally asserts uniqueness defensively. This codec/broker enforcement lands as part of this work (a small, bounded scope addition), with its own `*Regression*` test.
 8. **Durable field tags vs positional ids (RESOLVED — promoted to prerequisite spec):** `(topicId, fieldId)` identity requires `fieldId` to be a durable never-reused tag. This is now its own prerequisite foundation sub-project: **`docs/superpowers/specs/2026-10-08-rune-schema-evolution-durable-tags-design.md`** (durable numeric per-topic tags + versioned descriptor + compatibility modes + `ALTER TOPIC`). The view engine **depends on** it and lands after it (**prerequisite SHIPPED 2026-10-09** — see header). The view spec's field identity is concretely `(topicId, tag)` from that spec; this spec's §6.0 is realized there.
 9. **View-vs-schema-evolution compatibility policy (RESOLVED):** **graceful-absent at runtime + validation at `CreateView` time.** The schema layer stays one-way independent — a DROP of a view-bound tag degrades the tag to **absent** rather than being blocked at the schema layer (prerequisite spec §11, decision #6). On top of that, the view side:
@@ -640,7 +647,7 @@ Per-node rollups (aggregate dirty rate vs disk bandwidth, §9.2) gate the disk-p
 12. **Typing & safety contract (RESOLVED 2026-10-09, §3.1):** the seven binding invariants (verified-before-decode, durable-tag identity, no implicit coercion, explicit typed absence, queries-as-values, drift-caught-up-front, deterministic read-committed + all-or-nothing visibility) — strictly stronger than a typical RDBMS client. §14 pins each.
 13. **`ALTER VIEW` phasing (RESOLVED 2026-10-09, §10):** versioned view schemas + the `openView` handshake land in the **first cut**; `ALTER VIEW` + **live background rebuild/cut-over** is the **immediately-following increment** (its own tasks + tests). Views alter on the same AdminWorker DDL path as topics; the rebuild-on-fold-semantics-change is the only genuinely new mechanism.
 
-14. **View-table storage model (RESOLVED 2026-10-09, §7 — benchmark-validated):** compact open-addressing **index** (1-byte tag + key + dense row-id; Swiss/F14-style tag probe, fat rows kept out of the probe path) over a **stable row-id slab** (`slab + rowid*rowLen`, fixed `rowLen`). Deletes clear the index slot + free the row-id (O(1), tombstone-free, no payload move). Growth is **de-amortized**: incremental migration of ≤ `MIGK` index entries/op (slab shared, never copied) + a **background-pre-provisioned** next index buffer so `startGrow` is an O(1) swap → worst per-op rehash tax < 50 µs, flat across 64/256/1024 B. Snapshot = memcpy of flat index+slab + atomic `{offset,CRC}` marker (in-RAM, **not** mmap-of-record — page-fault tails + non-atomic `msync`). Rows move only at a deliberate **re-optimize** pass (hole reclaim + hot-row page clustering + index rebuild). Rejected: inline-row combined buffer (resize scales with `rows×rowSize` → 0.9–4.2 s stop-the-world spikes); tombstone deletes (rot/compaction); mmap-of-record. Validated by a standalone spike (§7.1).
+14. **View-table storage model (RESOLVED 2026-10-09, §7 — benchmark-validated):** compact open-addressing **index** (1-byte tag + key + dense row-id; Swiss/F14-style tag probe, fat rows kept out of the probe path) over a **stable row-id chunked-arena slab** (a list of fixed page-aligned chunks addressed `rowid → (chunk, offset)`, fixed `rowLen`; grows by appending a chunk, rows never move — see #24, not a single contiguous buffer). Deletes clear the index slot + free the row-id (O(1), tombstone-free, no payload move). Growth is **de-amortized**: incremental migration of ≤ `MIGK` index entries/op (slab shared, never copied) + a **background-pre-provisioned** next index buffer so `startGrow` is an O(1) swap → worst per-op rehash tax < 50 µs, flat across 64/256/1024 B. Snapshot = memcpy of flat index+slab + atomic `{offset,CRC}` marker (in-RAM, **not** mmap-of-record — page-fault tails + non-atomic `msync`). Rows move only at a deliberate **re-optimize** pass (hole reclaim + hot-row page clustering + index rebuild). Rejected: inline-row combined buffer (resize scales with `rows×rowSize` → 0.9–4.2 s stop-the-world spikes); tombstone deletes (rot/compaction); mmap-of-record. Validated by a standalone spike (§7.1).
 
 15. **Checkpoint model (RESOLVED 2026-10-09, §9.2 — spike-validated):** batch-boundary **differential** checkpoint — `dirty[C]` bit (set in the fold write-path) over **row-sized chunks** (page-sized chunks rejected: 4–16× write amplification, spike-shown); flush on `min(~1–2 s interval, dirtyCap)` (both configurable) at a batch boundary — copy only the interval's dirty chunks (coalesced: a hot row written once per flush) into a ping-pong handoff buffer tagged `{O}`, ring to the dedicated view-snapshot IO thread, which appends an `{O, chunks, CRC}` delta with grouped fsync; base + periodic compaction. Offset-atomic (exact `O`, never ±1), no full-view copy, no COW, no memory doubling; reads unmoved through p99.9 (measured). Constraint: node disk bandwidth ≥ aggregate dirty rate across its view-partitions. Rejected: stop-the-world full copy, incremental-COW sweep, mmap-of-record, log-structured/FASTER store, OS-page chunk granularity (§9.6).
 16. **Restart readiness (RESOLVED 2026-10-09, §9.4.1):** `RECOVERING → REBUILDING_VIEWS → READY`; a node is not election-eligible and serves no view reads / view-apply acks until every hosted view is loaded + replayed `(O, committedTail]`; folds never touch an unseeded view. Guaranteeable + deadlock-free (local-only rebuild) + bounded (checkpoint cadence). Composes with consensus's current-log rule so a partition is led/served only when log *and* views are current.
