@@ -10,6 +10,16 @@
 #include <stdexcept>
 #include <system_error>
 
+#include <arpa/inet.h>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <ifaddrs.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <optional>
+#include <sys/socket.h>
+
 #if defined(__linux__)
 #include <sched.h>
 #elif defined(__APPLE__)
@@ -38,6 +48,112 @@ bool contains(const CpuSet& s, int32_t core) {
 std::string normalizeHost(const std::string& h) {
     if (h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "[::1]") return "127.0.0.1";
     return h;
+}
+
+std::string stripBrackets(std::string h) {
+    if (h.size() >= 2 && h.front() == '[' && h.back() == ']') h = h.substr(1, h.size() - 2);
+    return h;
+}
+
+bool isWildcard(const std::string& h) { return h == "0.0.0.0" || h == "::" || h == "*"; }
+
+/// Every address `host` names (numeric or resolved); empty when it does not resolve.  Cold path.
+std::vector<sockaddr_storage> addressesOf(const std::string& host) {
+    std::vector<sockaddr_storage> out;
+    addrinfo hints{};
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    addrinfo* res     = nullptr;
+    if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0) return out;
+    for (addrinfo* a = res; a != nullptr; a = a->ai_next) {
+        if (a->ai_addrlen > sizeof(sockaddr_storage)) continue;
+        sockaddr_storage ss{};
+        std::memcpy(&ss, a->ai_addr, a->ai_addrlen);
+        out.push_back(ss);
+    }
+    ::freeaddrinfo(res);
+    return out;
+}
+
+bool sameAddress(const sockaddr_storage& a, const sockaddr_storage& b) {
+    if (a.ss_family != b.ss_family) return false;
+    if (a.ss_family == AF_INET) {
+        return reinterpret_cast<const sockaddr_in&>(a).sin_addr.s_addr ==
+               reinterpret_cast<const sockaddr_in&>(b).sin_addr.s_addr;
+    }
+    if (a.ss_family == AF_INET6) {
+        return std::memcmp(&reinterpret_cast<const sockaddr_in6&>(a).sin6_addr,
+                           &reinterpret_cast<const sockaddr_in6&>(b).sin6_addr, sizeof(in6_addr)) == 0;
+    }
+    return false;
+}
+
+bool isLoopback(const sockaddr_storage& a) {
+    if (a.ss_family == AF_INET) {
+        return (ntohl(reinterpret_cast<const sockaddr_in&>(a).sin_addr.s_addr) >> 24) == 127;
+    }
+    if (a.ss_family == AF_INET6) {
+        const in6_addr& v6 = reinterpret_cast<const sockaddr_in6&>(a).sin6_addr;
+        return IN6_IS_ADDR_LOOPBACK(&v6) != 0;
+    }
+    return false;
+}
+
+/// An address of one of this host's interfaces (or loopback).
+bool isLocal(const sockaddr_storage& a) {
+    if (isLoopback(a)) return true;
+    ifaddrs* ifs = nullptr;
+    if (::getifaddrs(&ifs) != 0) return false;
+    bool local = false;
+    for (ifaddrs* i = ifs; i != nullptr && !local; i = i->ifa_next) {
+        if (i->ifa_addr == nullptr) continue;
+        sockaddr_storage ss{};
+        const std::size_t len = i->ifa_addr->sa_family == AF_INET    ? sizeof(sockaddr_in)
+                              : i->ifa_addr->sa_family == AF_INET6 ? sizeof(sockaddr_in6)
+                                                                    : 0;
+        if (len == 0) continue;
+        std::memcpy(&ss, i->ifa_addr, len);
+        local = sameAddress(ss, a);
+    }
+    ::freeifaddrs(ifs);
+    return local;
+}
+
+/// Would a local bind of `egressHost` take the same socket as the gateway at `gatewayHost` (same port)?
+/// Same name (localhost == 127.0.0.1 == ::1); a wildcard egress (0.0.0.0 / [::]) against a gateway on this
+/// host; or two names / an alias resolving to a common address (C-F31 / review m3).
+bool sameLocalBind(const std::string& egressHost, const std::string& gatewayHost) {
+    const std::string e = stripBrackets(egressHost);
+    const std::string g = stripBrackets(gatewayHost);
+    if (normalizeHost(e) == normalizeHost(g)) return true;
+    const auto gAddrs = addressesOf(g);
+    if (isWildcard(e)) {
+        for (const auto& ga : gAddrs)
+            if (isLocal(ga)) return true;
+        return false;
+    }
+    for (const auto& ea : addressesOf(e))
+        for (const auto& ga : gAddrs)
+            if (sameAddress(ea, ga)) return true;
+    return false;
+}
+
+/// The gateway channel's endpoint=, else its MDC control= endpoint, else nullopt (aeron:ipc).
+std::optional<ChannelEndpoint> gatewayEndpoint(const std::string& channel) {
+    if (auto ep = parseChannelEndpoint(channel)) return ep;
+    const std::string_view ch(channel);
+    std::size_t pos = ch.find('?');
+    while (pos != std::string_view::npos) {
+        const std::size_t keyStart = pos + 1;
+        if (ch.substr(keyStart, 8) == "control=") {
+            const std::size_t vb = keyStart + 8;
+            std::size_t       ve = ch.find('|', vb);
+            if (ve == std::string_view::npos) ve = ch.size();
+            return detail::splitEndpoint(ch.substr(vb, ve - vb), ch);
+        }
+        pos = ch.find('|', keyStart);
+    }
+    return std::nullopt;
 }
 
 bool parseInt64(std::string_view s, int64_t& out) noexcept {
@@ -76,6 +192,37 @@ int32_t parseCgroupV2CpuMax(std::string_view text) noexcept {
     int64_t p = 0;
     if (!parseInt64(quota, q) || !parseInt64(period, p)) return kNoCpuQuota;
     return quotaCpusFromCfs(q, p);
+}
+
+int32_t cgroupV2QuotaCpus(const std::string& cgroupRoot, std::string_view procSelfCgroup) {
+    // The unified-hierarchy line of /proc/self/cgroup: "0::<path>".
+    std::string_view path;
+    bool             found = false;
+    while (!procSelfCgroup.empty()) {
+        const std::size_t nl   = procSelfCgroup.find('\n');
+        const std::string_view line = trim(procSelfCgroup.substr(0, nl));
+        procSelfCgroup.remove_prefix(nl == std::string_view::npos ? procSelfCgroup.size() : nl + 1);
+        if (line.substr(0, 3) == "0::") {
+            path  = line.substr(3);
+            found = true;
+            break;
+        }
+    }
+    if (!found) return kNoCpuQuota;
+    while (!path.empty() && path.back() == '/') path.remove_suffix(1);  // "/" -> "" (the root)
+    int32_t tightest = kNoCpuQuota;
+    for (;;) {
+        std::ifstream f(cgroupRoot + std::string(path) + "/cpu.max");
+        std::string   line;
+        if (f && std::getline(f, line)) {
+            const int32_t q = parseCgroupV2CpuMax(line);
+            if (q != kNoCpuQuota && (tightest == kNoCpuQuota || q < tightest)) tightest = q;
+        }
+        if (path.empty()) break;  // the root was read
+        const std::size_t slash = path.rfind('/');
+        path = slash == std::string_view::npos ? std::string_view() : path.substr(0, slash);
+    }
+    return tightest;
 }
 
 ShardCount resolveShardCount(const ShardGroupConfig& g, const CpuSet& allowed, int32_t quotaCpus) {
@@ -153,7 +300,8 @@ void validateShardGroupConfig(const ShardGroupConfig& g, uint32_t count) {
 
     // Egress: shard i listens on base port + i.  Every port must fit, and none may
     // be the gateway's own endpoint on the same host.
-    const auto gateway = parseChannelEndpoint(g.base.gatewayChannel);
+    // The gateway's endpoint=, or its MDC control= endpoint (C-F31 / review m3).
+    const auto gateway = gatewayEndpoint(g.base.gatewayChannel);
     for (uint32_t i = 0; i < count; ++i) {
         std::string ch;
         try {
@@ -163,8 +311,7 @@ void validateShardGroupConfig(const ShardGroupConfig& g, uint32_t count) {
                                         " egress channel: " + e.what());
         }
         const auto ep = parseChannelEndpoint(ch);
-        if (ep && gateway && ep->port == gateway->port &&
-            normalizeHost(ep->host) == normalizeHost(gateway->host)) {
+        if (ep && gateway && ep->port == gateway->port && sameLocalBind(ep->host, gateway->host)) {
             throw std::invalid_argument("ShardGroupConfig: shard " + std::to_string(i) +
                                         " egress endpoint " + ep->host + ":" + std::to_string(ep->port) +
                                         " collides with the gateway endpoint " + g.base.gatewayChannel);
@@ -264,13 +411,25 @@ ProducerConfig shardProducerConfig(const ShardGroupConfig& g) {
 CpuSet platformAllowedCpus() {
     CpuSet out;
 #if defined(__linux__)
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
-        for (int c = 0; c < CPU_SETSIZE; ++c) {
-            if (CPU_ISSET(c, &set)) out.push_back(c);
+    // C-F31 (review m2): a fixed cpu_set_t holds CPU_SETSIZE (1024) CPUs and sched_getaffinity fails EINVAL
+    // on a larger host — size the set dynamically and grow it until the kernel's mask fits.
+    for (int ncpus = CPU_SETSIZE; ncpus <= (1 << 20); ncpus *= 2) {
+        cpu_set_t* set = CPU_ALLOC(ncpus);
+        if (set == nullptr) break;
+        const std::size_t bytes = CPU_ALLOC_SIZE(ncpus);
+        CPU_ZERO_S(bytes, set);
+        if (sched_getaffinity(0, bytes, set) == 0) {
+            for (int c = 0; c < ncpus; ++c) {
+                if (CPU_ISSET_S(c, bytes, set)) out.push_back(c);
+            }
+            CPU_FREE(set);
+            break;
         }
+        const int err = errno;
+        CPU_FREE(set);
+        if (err != EINVAL) break;
     }
+    if (out.empty()) std::fprintf(stderr, "rune-client: sched_getaffinity failed; allowed CPUs fall back to {0}\n");
 #elif defined(__APPLE__)
     int    active = 0;
     size_t len    = sizeof(active);
@@ -284,13 +443,13 @@ CpuSet platformAllowedCpus() {
 
 int32_t platformQuotaCpus() {
 #if defined(__linux__)
-    {
-        std::ifstream v2("/sys/fs/cgroup/cpu.max");
-        if (v2) {
-            std::string line;
-            std::getline(v2, line);
-            return parseCgroupV2CpuMax(line);
-        }
+    // cgroup v2 (the root cpu.max exists only on the unified hierarchy): the process's own cgroup and its
+    // ancestors (C-F31 / review m1 — a systemd CPUQuota= service, a container without cgroupns).
+    if (std::ifstream("/sys/fs/cgroup/cgroup.controllers")) {
+        std::ifstream      self("/proc/self/cgroup");
+        std::ostringstream text;
+        text << self.rdbuf();
+        return cgroupV2QuotaCpus("/sys/fs/cgroup", text.str());
     }
     std::ifstream q("/sys/fs/cgroup/cpu/cpu.cfs_quota_us");
     std::ifstream p("/sys/fs/cgroup/cpu/cpu.cfs_period_us");
