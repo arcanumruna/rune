@@ -1360,3 +1360,39 @@ TEST(HubCommandClient, UnsentPingWhoseSessionWasLostIsSentOnTheNewSessionRegress
     EXPECT_EQ(r.cq.timesCompleted(ping.token()), 1);
     EXPECT_EQ(r.gw.droppedUnknownSession, 0) << "the ping went out stamped with the new session's id";
 }
+
+// C-F21: the broker fails a push subscription whose next batch it cannot
+// deliver (F19 / F15 S3: a Records frame over the egress max message, or a
+// batch over the worker return ring) with ONE ErrorResponse{MessageTooLarge,
+// correlationId = 0, "subscription S topic T partition P offset O: ..."} and
+// parks it.  The client routes it to THAT subscription: it finishes with
+// failReason() == UndeliverableBatch and is unsubscribed (the parked broker
+// subscription is released); other subscriptions and pending ops are
+// untouched; the app's onError still hears it.  RED (pre-fix): the error only
+// reached onError — the subscription stayed active forever with nothing
+// arriving.
+TEST(HubCommandClient, SubscriptionScopedErrorFailsThatSubscriptionRegression) {
+    HubRig r(3990);
+    r.gw.replyPongs = true;
+    std::string lastError;
+    r.client.onError([&](const std::string& m) { lastError = m; });
+    r.connect();
+    auto a = subscribeT(r.client);
+    auto b = subscribeT(r.client);
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribed.size() == 2 && a.subscriptionId() > 0 && b.subscriptionId() > 0; }));
+    const int64_t aId = a.subscriptionId();
+    const std::string msg = "subscription " + std::to_string(aId) +
+                            " topic 1 partition 0 offset 0: Records frame 70000 B exceeds the egress max message 65536 B";
+    r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::MessageTooLarge), msg,
+                   r.gw.subscribed[0].sessionId, /*corrId=*/0);
+    ASSERT_TRUE(r.drive([&] { return a.finished(); }, 200'000)) << "the subscription-scoped error never reached it";
+    EXPECT_EQ(a.failReason(), rc::SubscriptionFailReason::UndeliverableBatch);
+    EXPECT_TRUE(b.active()) << "another subscription was failed";
+    EXPECT_EQ(b.failReason(), rc::SubscriptionFailReason::None);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.unsubscribed.empty(); }));
+    EXPECT_EQ(r.gw.unsubscribed[0], aId) << "the parked broker subscription was not released";
+    EXPECT_EQ(lastError, msg);
+    auto p = r.pingOp(rc::Bytes{1, 2});
+    ASSERT_TRUE(r.drive([&] { return p.ready(); }));
+    EXPECT_TRUE(p.ok()) << "the session survives a subscription-scoped error";
+}

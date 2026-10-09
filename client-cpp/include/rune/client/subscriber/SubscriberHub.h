@@ -318,6 +318,13 @@ public:
     /// exhausted or the corr is not pending (caller fails it explicitly).
     bool chargeNotLeaderRetry(int64_t correlationId, int maxRetries);
 
+    /// C-F21: the broker failed the BOUND subscription `subscriptionId` (a
+    /// subscription-scoped ErrorResponse, correlationId 0): it finishes with
+    /// `reason` and is unsubscribed like unsubscribe() (the broker parked it).
+    /// False if no active subscription has that id.  Duty thread.
+    bool failActiveSubscription(int64_t subscriptionId, SubscriptionFailReason reason, int64_t unsubCorrId,
+                                int64_t sessionId, const SendFn& submitFn);
+
     /// M2 FIX [CB-5]: Sweep pending subscriptions whose subscribe-request
     /// deadline has expired.  Mirrors the produce-ack timeout sweep.
     /// Called from Client::sweepTimeouts() on the runner thread.

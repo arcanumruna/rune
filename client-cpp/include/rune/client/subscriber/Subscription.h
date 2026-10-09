@@ -163,6 +163,12 @@ enum class SubscriptionFailReason : int32_t {
     /// subscription's correlation id, or as the session-level notice that ends everything of the session.
     /// The session is closed and not reconnected.  brokerErrorCode() is 46.
     SessionRevoked = 7,
+    /// C-F21: the broker cannot deliver the subscription's next batch (it is
+    /// larger than the egress max message or the broker's return ring —
+    /// ErrorResponse{MessageTooLarge} naming this subscription) and parked it;
+    /// the client released it.  Re-subscribing from the same offset meets the
+    /// same batch: raise the broker's / client's term (max message) size.
+    UndeliverableBatch = 8,
 };
 
 struct SubscriptionStatus {
