@@ -28,7 +28,7 @@ Every design choice below is checked against the Rune HARD RULES. The load-beari
 - **Shared-nothing (#1).** The view table for a (view, partition) is owned outright by the single worker that owns that partition's log. No other thread reads or writes it. Persistence does **not** violate this: the worker publishes an **immutable** snapshot and a background thread reads only that (§9).
 - **Ring buffers are the only cross-thread passing (#2).** Worker→snapshot-IO handoff and IO→worker completion go through SPSC rings, modeled on the existing `LogCleanerAgent` `swapRing_` + atomic-`shared_ptr` snapshot pattern. No shared mutable state, no locks.
 - **Rich-state state machines (#3).** Per-key fold state and the snapshot lifecycle are explicit states (§7, §9), not scattered booleans.
-- **Zero steady-state allocation (#4).** The view table is a preallocated open-addressing flat table with inline fixed-width rows (the `FixedStr` payoff from 0c) + a reused arena for variable-width payloads. The fold reuses buffers. Snapshot buffers are ping-pong-reused, not per-snapshot allocated.
+- **Zero steady-state allocation (#4).** The view table is a preallocated open-addressing **index** (tag+key+row-id) over a **stable row-id slab** of fixed-width rows (`FixedStr`/bounded `VarChar(N)` from 0c), §7. The fold reuses buffers; deletes recycle row-ids via a free-list (no alloc); the next index buffer is background-pre-provisioned (no alloc on the triggering op); snapshot buffers are ping-pong-reused. No steady-state heap allocation.
 - **No virtual calls on the hot path.** The fold dispatches per-field merge by a compiled `MergeRule` enum + `switch`, not virtual operator objects (§6). The dataflow "operators" are a *design* abstraction compiled to a flat plan, not a runtime object graph on the fold path.
 - **Off the produce critical path.** The fold runs in the worker's duty cycle over its own read-committed log `[cursor, LSO)` (§11 — LSO, not raw HW, so aborted/in-flight transactions never materialize), bounded per cycle — never on the produce ack path. Serialize + fsync runs on a background thread, never the worker (§9). A produce may optionally hold its ack until dependent views have folded it (§11.1), but that is an opt-in per-produce acknowledgement, not the fold path moving onto the produce path.
 - **Deterministic / time-independent convergence (#16).** The fold is a pure function of the committed log prefix; replica and leader converge to the identical view table at the same offset regardless of timing (§11).
@@ -88,7 +88,7 @@ On each advance of `[cursor, LSO)` for a partition (read-committed; §11), the w
 | **Source** | this spec | bind topic + key field; register in subscription index |
 | **Project** | this spec | field select/rename = projection into output fields |
 | **Fold** | this spec | keyed per-field merge into substate → reemit row |
-| **Sink** | this spec | clustered primary index `viewTable` (§7) |
+| **Sink** | this spec | `viewTable` = compact index + stable row-id slab (§7) |
 | **Join** | follow-on | additive gather over per-source substates sharing the key (§8) |
 | **Filter** | follow-on | predicate drop before fold |
 | **Aggregate** | follow-on | windowed/grouped aggregation beyond per-field merge |
@@ -201,15 +201,31 @@ for each committed record r in [cursor, LSO) for an interested view:   // read-c
 
 A source record whose value is zero-length is a **tombstone** for its key: erase the substate and the view row. This matches Kafka compaction semantics and agrees with the broker's existing `Compact` cleaner (a tombstone both deletes the view row and is the signal the log cleaner eventually removes the key). Chosen over an explicit delete op for log/cleaner parity.
 
-## 7. The sink: `viewTable` as a clustered primary index
+## 7. The sink: `viewTable` — compact index + stable row-id slab
 
-The `viewTable` for a (view, partition) is a **clustered primary index** keyed by the view's key field — effectively the view's primary storage, not a secondary structure over something else.
+The `viewTable` for a (view, partition) is the view's **primary storage** keyed by the view's key field — not a secondary structure over something else. It is split into a compact **index** and a stable **row slab**, a layout validated by a standalone benchmark (64/256/1024 B rows, 15 M rows, mixed create/update/delete churn — see §7.1 results) against a naive inline-row table.
 
-- **Open-addressing flat hash table** (not `std::unordered_map`): one contiguous allocation, linear-probe, power-of-two capacity, Robin-Hood or tombstone-aware deletion. Cache-friendly, no per-entry node allocation (#4, #16 compact structures).
-- **Inline fixed-width rows.** Fixed-width fields (ints, `FixedStr(N)` from 0c) are stored inline in the slot — the whole point of adding `FixedStr` in 0c. A point lookup is one probe + one memcpy-able row, no pointer chase.
-- **Arena for variable-width payloads.** Variable `string` fields spill into a per-table arena; the slot holds (offset, len). The arena is compacted/rebuilt at snapshot or on load, never grown on the hot path beyond amortized reserve.
-- **Point-lookup only.** `GetViewRow(viewId, key)` → probe → row. No secondary indexes, no scans in this spec.
-- **Memcpy-able bulk cut.** The flat table + arena are designed so a consistent snapshot is a bulk copy of two contiguous regions + the applied offset (§9), not a structure walk.
+- **Index = separated control + key + row-id (not `std::unordered_map`, not inline rows).** Flat, power-of-two, open-addressing arrays: a 1-byte **tag** per slot (top hash bits + empty marker, Swiss/F14-style — probed word-at-a-time), the 8-byte **key**, and a 4-byte dense **row-id**. The fat row payload is deliberately **kept out of the probe path** — the probe scans tiny tags/keys, touching a row only on a confirmed hit. (A naive inline-row table drags the whole 256 B/1 KB row through every probe step and through every resize; the benchmark showed that is pathological — see §7.1.)
+- **Row slab = stable, row-id-addressed.** Rows live at `slab + rowid*rowLen` (fixed `rowLen` from §6.0's capped-width model — ints, `FixedStr(N)`, bounded `VarChar(N)`). Offsets are **stable**: a row never moves during normal operation, so the index's `rowid`s stay valid. Dense row-ids come from a free-list (recycled on delete) → no fragmentation holes to chase.
+- **Deletes are O(1) and tombstone-free.** `erase` clears the index slot (backward-shift within the index — 13-byte entries, never payloads) and frees the row-id to the free-list. No payload move, no tombstone accumulation, no delete-driven compaction. (Benchmark: delete p99 flat at ~300 ns across all row sizes; the inline design degraded to ~1.2 µs at 1 KB because backshift memcpy'd kilobyte rows.)
+- **Growth never blocks: incremental rehash + background-pre-provisioned buffer.** The index is pre-sized to the view's declared cardinality so it rarely grows. When load factor does cross the threshold, growth is **de-amortized**: a background thread pre-allocates+zeroes the next 2× index (the row slab is untouched — only tiny `(tag,key,rowid)` entries ever migrate), so `startGrow` is an **O(1) pointer swap** (~0.5 µs), and each subsequent op migrates a bounded `MIGK` entries old→new (reads/writes consult new-then-old during the window). Worst per-op rehash tax stays **< 50 µs, independent of row size** (§7.1). This is the only shape that meets the §14.0 budget — a stop-the-world rehash is 20 ms–4.2 s and is categorically forbidden on the hot path.
+- **Point-lookup only.** `GetViewRow(viewId, key)` → index probe → `slab[rowid]`. No secondary indexes, no range scans in this spec (ordered access is a follow-on; the hash index is unordered).
+- **Memcpy-able snapshot, no mmap.** Index arrays + slab are flat and pointer-free, so a consistent snapshot is a **bulk copy of those regions + an explicit atomic `{appliedOffset, CRC}` marker** (§9). The live table is **in-RAM, never an mmap'd file-of-record** — `msync` is non-atomic/not-offset-consistent (§9.6) and a mapped hot region risks page-fault latency tails, both disqualifying here.
+- **Re-optimize pass (restart / on-request).** The only time rows move: a deliberate, batched pass reclaims free-list holes, **clusters hot rows into shared pages** (locality), and rebuilds the index dense. Off the hot path.
+
+### 7.1 Storage-model benchmark results (validated 2026-10-09)
+
+A throwaway spike compared the inline-row table vs. this index+slab design under the target workload (15 M rows @ 64/256 B, 8 M @ 1 KB; 60/25/15 create/update/delete):
+
+| metric | inline rows | **index + slab (this design)** |
+|---|---|---|
+| worst rehash (256 B) | 935 ms | — |
+| worst rehash (1 KB) | 4.2 s | — |
+| **worst per-op rehash tax (incremental + pre-provisioned)** | n/a (blocking) | **< 50 µs, flat across 64/256/1024 B** (≈20–30 µs at MIGK=256; `startGrow` ≈0.5 µs; 0 fallbacks) |
+| delete p99 @ 1 KB | ~1.2 µs | ~0.3 µs |
+| point-find (steady) | ~25 ns | ~27 ns (the row-id indirection adds ~2–3 ns) |
+
+The inline design's resize cost scales with `rows × rowSize` (unbounded, multi-second); this design's scales only with the tiny index, so it is pre-sizeable and incrementally migratable within budget. `MIGK` (entries migrated per op) is the tuning knob: 128–256 keeps the worst tax well under 50 µs while finishing a migration in ~10⁵ steps.
 
 ## 8. Join (follow-on — shape locked so it drops in)
 
@@ -242,10 +258,10 @@ Per (view, partition), owned by the worker:
    ```cpp
    struct ViewSnapshot {               // immutable once published
        int64_t   appliedOffset;        // fold cursor: the view == source log applied through here
-       /* bulk copy of the flat table region + arena region */
+       /* bulk copy of the index arrays (tags/keys/rowid) + the row slab (§7) */
    };
    ```
-   The worker **bulk-copies** the flat table + arena + current fold cursor into a `ViewSnapshot`, capturing offset and data **together** in one cut, and publishes `std::shared_ptr<const ViewSnapshot>` via `std::atomic_store` (exactly `publishSealedSnapshot`). The worker's only cost is the **memcpy** of two contiguous regions; it keeps folding immediately — the published snapshot is frozen and refcounted alive.
+   The worker **bulk-copies** the index arrays (tags/keys/rowid) + the row slab + current fold cursor into a `ViewSnapshot`, capturing offset and data **together** in one cut, and publishes `std::shared_ptr<const ViewSnapshot>` via `std::atomic_store` (exactly `publishSealedSnapshot`). The worker's only cost is the **memcpy** of those flat, pointer-free regions; it keeps folding immediately — the published snapshot is frozen and refcounted alive. (If a resize is mid-flight, the cut copies the primary index; the snapshot records a complete state at `appliedOffset` regardless of migration progress, since both index generations resolve the same slab.)
 2. **Background serialize (off the worker).** A background snapshot-IO thread (ownership = **dedicated per-node view-snapshot IO thread**, resolved §9.5) takes the published `shared_ptr`, serializes it, and writes it **atomically**: `view-<id>-<partition>.snap.tmp` → `fsync` → `rename` → `fsync` dir, with `appliedOffset` + CRC32C in the header (the `ProducerStateManager`/`LeaderEpochCache` pattern). It touches only the immutable snapshot, never the live table.
 3. **Ack / reclaim (ring).** On completion the IO thread signals back over an SPSC ring; the worker drops/reuses the snapshot buffer in its duty cycle. **Ping-pong two snapshot buffers** per (view, partition) so steady-state snapshotting is allocation-free (#4) — the worker refills buffer B next interval while the IO thread may still hold buffer A until its ack.
 
@@ -269,7 +285,8 @@ The **mechanism** is unchanged by this choice: immutable `shared_ptr` publish (w
 ### 9.6 Rejected alternatives (recorded)
 
 - **Redis `fork()` + COW** — rejected. Redis forks safely because it is single-threaded; rune-broker is many threads + Aeron shared memory + mmaps + open fds + io_uring. `fork()` here is unsafe (whole-address-space COW, fd/lock hazards).
-- **Persistent/immutable view table (HAMT/CHAMP) for O(1) snapshot** — rejected for steady state. Copy-free snapshot, but per-update indirection + allocation on every fold fights the flat inline table (the `FixedStr` design) and #4. The flat table + periodic bulk-copy wins for an ultra-low-latency fold.
+- **Persistent/immutable view table (HAMT/CHAMP) for O(1) snapshot** — rejected for steady state. Copy-free snapshot, but per-update indirection + allocation on every fold fights the flat index+slab layout (§7) and #4. The flat regions + periodic bulk-copy win for an ultra-low-latency fold.
+- **mmap'd file-of-record (mutate the mapped view file in place; rely on `msync` for persistence)** — rejected. `msync` is page-granular and **not** atomic or offset-consistent (the OS may flush dirty pages at any time; a crash mid-flush leaves a torn file matching no clean `appliedOffset` — violates §9.3), and a mapped hot region risks **page-fault latency tails** incompatible with the §14.0 budget. The live table stays in RAM; persistence is the explicit atomic bulk-copy snapshot above.
 - **Separate changelog topic** — unnecessary; the source log already is the changelog.
 - **Chunked/incremental COW snapshot** — a future optimization for very large views where even the bulk-copy pause matters; benchmark-gated (#5/#16), not now.
 
@@ -383,7 +400,7 @@ End-to-end, single source (the join generalization is the §8 gather):
 
 ### 14.0 Latency NFRs (HARD GATES — the reason this engine exists)
 
-These are binding pass/fail budgets, measured firsthand under default config (ABAB, n ≥ 15, report p50 **and** p99; a gate fails if p99 exceeds the budget). They drive the design (flat inline table, O(1) by-tag decode, zero steady-state allocation, shared-nothing fold):
+These are binding pass/fail budgets, measured firsthand under default config (ABAB, n ≥ 15, report p50 **and** p99; a gate fails if p99 exceeds the budget). They drive the design (flat index + row-id slab with fat rows out of the probe path, O(1) by-tag decode, zero steady-state allocation, shared-nothing fold):
 
 | Path | Budget | Notes |
 |---|---|---|
@@ -393,7 +410,7 @@ These are binding pass/fail budgets, measured firsthand under default config (AB
 
 The schema-evolution prerequisite's decode path (`readField`-by-tag against a materialized per-version descriptor) is part of the <10µs fold budget — its own plan carries a derived sub-budget so it cannot erode this.
 
-- **Unit:** `mergeField` per rule × type; projection select/rename; tombstone erase; open-addressing table probe/erase/resize; arena spill/compaction.
+- **Unit:** `mergeField` per rule × type; projection select/rename; tombstone erase; open-addressing index probe/erase(backshift)/incremental-resize; row-id free-list alloc/recycle; re-optimize compaction.
 - **Fold determinism:** same log prefix → identical table byte-for-byte, across orderings that preserve per-key commit order; leader vs replica table equality at equal offset.
 - **Persistence round-trip:** snapshot → kill → load+replay `[O+1, HW)` → table equals the never-restarted table (time-independent, #16). Crash-mid-write leaves prior complete snapshot usable (CRC fallback). Offset in artifact exactly matches table.
 - **Shared-nothing audit:** no other thread touches a live `viewTable`; worker→IO handoff is ring + immutable snapshot only (extend the existing no-atomics / single-driver checker scripts).
@@ -402,6 +419,7 @@ The schema-evolution prerequisite's decode path (`readField`-by-tag against a ma
 - **Benchmarks (gated against §14.0):** fold update latency per event batch **< 10 µs** p99 (zero-alloc verified); `GetViewRow` single-node **< 50 µs** p99; multi-node query **< 200 µs** p99; plus snapshot cut pause (worker memcpy time vs table size) and produce-path regression (fold off the critical path must not move produce latency — ABAB n≥15, #12). A benchmark that exceeds its §14.0 budget is a failing gate, not a note.
 - **Typed result decoding & safety contract (§3.1, §12):** (a) **decode speed** — `RowView`/`Row` field access matches hand-written SBE positional access within noise (benchmark, zero-alloc); (b) **`SchemaMismatch` on wrong structure** — a result stamped with a non-matching fingerprint/version (view altered between prepare/execute; buffer from a different view/topic; truncated buffer failing the length check) **throws at accessor construction**, never returns a value (regression); (c) **`openView` handshake** — a client whose `kFingerprint` matches no registered version is rejected at open, and one matching a retained older version binds that version; (d) **type check at handle acquisition** — `col<i64>()` on a non-i64 column throws at `prepare`, and the per-row `get(handle)` path does no per-field check; (e) **projection** — `SELECT`-subset fingerprint is canonical-order + salted (two field orders dedupe to one `Fr`; `SELECT *` fingerprint == full-view fingerprint); (f) **no untyped escape hatch** — there is no accessor returning an unchecked/any value (audit).
 - **`ALTER VIEW` rebuild/cut-over (when that increment lands):** an alter that changes fold semantics rebuilds the new version from the source log while the **old version keeps serving** reads correctly until the new version reaches the live offset, then cuts over atomically; a reader bound to the old version is never served a wrongly-shaped row across the cut (regression).
+- **Storage model — rehash within budget (§7):** under a mixed create/update/delete workload that crosses several load-factor thresholds, the **worst per-op rehash tax stays < 50 µs, independent of row size** (64/256/1024 B) — `startGrow` is an O(1) swap of a background-pre-provisioned buffer (no inline allocation on the triggering op; **zero fallbacks** under the expected insert rate), and incremental migration moves ≤ `MIGK` index entries/op. A stop-the-world rehash on the hot path is a **failing gate**. Also: delete is O(1) tombstone-free (p99 flat across row sizes, no payload move); point-find is cache-dense (fat rows out of the probe path); snapshot is a memcpy of flat index+slab regions + atomic marker (no mmap-of-record).
 - **Regression suite:** every fix gets a `*Regression*` test; full regression suite runs first on every change (#6/#7).
 
 ## 15. Decisions
@@ -412,7 +430,7 @@ The schema-evolution prerequisite's decode path (`readField`-by-tag against a ma
 2. **Snapshot trigger policy:** time *T* only, offset-delta *N* only, or both (whichever first)? Default proposal: both, whichever fires first, with *T* and *N* configurable per view.
 3. **Snapshot granularity:** one artifact per (view, partition) (proposed) vs one per view across its partitions. Per-(view,partition) matches worker ownership and parallel IO; confirm.
 4. **Very large views:** accept the bulk-copy pause now + benchmark, defer chunked/COW (proposed) — confirm the threshold at which we'd revisit.
-5. **Arena compaction timing:** at snapshot cut vs on load vs incremental — proposed: rebuilt dense at load, amortized-reserve on the hot path, compacted during the snapshot copy.
+5. **Slab compaction timing (folded into §7 re-optimize):** delete holes are recycled via the row-id free-list on the hot path (no inline compaction); physical hole reclaim + hot-row page clustering + dense index rebuild happen at the deliberate **re-optimize** pass (restart / on-request), never inline.
 6. **`DefineView` field defaults:** default `MergeRule` = `Replace`; key field must appear in `output`; reject non-numeric `Sum/Min/Max` at define time — confirm.
 7. **Field-name uniqueness enforcement point (RESOLVED — fix-on-sight, rule #8):** enforce duplicate-name rejection at schema **registration** — `DescriptorBuilder::build()` (codec) and broker `DefineTopic` — so every consumer (views, typed clients, QL), not just Rune QL's parser (`Parser.cpp:241`), is protected and `Descriptor::find()`'s first-match is always safe. The view resolver additionally asserts uniqueness defensively. This codec/broker enforcement lands as part of this work (a small, bounded scope addition), with its own `*Regression*` test.
 8. **Durable field tags vs positional ids (RESOLVED — promoted to prerequisite spec):** `(topicId, fieldId)` identity requires `fieldId` to be a durable never-reused tag. This is now its own prerequisite foundation sub-project: **`docs/superpowers/specs/2026-10-08-rune-schema-evolution-durable-tags-design.md`** (durable numeric per-topic tags + versioned descriptor + compatibility modes + `ALTER TOPIC`). The view engine **depends on** it and lands after it (**prerequisite SHIPPED 2026-10-09** — see header). The view spec's field identity is concretely `(topicId, tag)` from that spec; this spec's §6.0 is realized there.
@@ -426,6 +444,8 @@ The schema-evolution prerequisite's decode path (`readField`-by-tag against a ma
 11. **Views are typed; results are typed (RESOLVED 2026-10-09, §12, §3.1):** a view has a derived, registered, **versioned output `Descriptor` + fingerprint**; a client consumes it as a read-only typed topic (`openView` fingerprint handshake). Query results are typed via two tiers — **prepared** (broker returns a result descriptor + fingerprint at `prepare`; generic `Row` + `col<T>()` handles) and **static** (`TypedView<RowT>` codegen as an opt-in fast path) — both passing one checked-construction fingerprint+length gate (SBE-speed reads, hard `SchemaMismatch` on mismatch). Projections are derived typed subsets (canonical tag order, salted fingerprint; `SELECT *` = identity). No untyped access path.
 12. **Typing & safety contract (RESOLVED 2026-10-09, §3.1):** the seven binding invariants (verified-before-decode, durable-tag identity, no implicit coercion, explicit typed absence, queries-as-values, drift-caught-up-front, deterministic read-committed + all-or-nothing visibility) — strictly stronger than a typical RDBMS client. §14 pins each.
 13. **`ALTER VIEW` phasing (RESOLVED 2026-10-09, §10):** versioned view schemas + the `openView` handshake land in the **first cut**; `ALTER VIEW` + **live background rebuild/cut-over** is the **immediately-following increment** (its own tasks + tests). Views alter on the same AdminWorker DDL path as topics; the rebuild-on-fold-semantics-change is the only genuinely new mechanism.
+
+14. **View-table storage model (RESOLVED 2026-10-09, §7 — benchmark-validated):** compact open-addressing **index** (1-byte tag + key + dense row-id; Swiss/F14-style tag probe, fat rows kept out of the probe path) over a **stable row-id slab** (`slab + rowid*rowLen`, fixed `rowLen`). Deletes clear the index slot + free the row-id (O(1), tombstone-free, no payload move). Growth is **de-amortized**: incremental migration of ≤ `MIGK` index entries/op (slab shared, never copied) + a **background-pre-provisioned** next index buffer so `startGrow` is an O(1) swap → worst per-op rehash tax < 50 µs, flat across 64/256/1024 B. Snapshot = memcpy of flat index+slab + atomic `{offset,CRC}` marker (in-RAM, **not** mmap-of-record — page-fault tails + non-atomic `msync`). Rows move only at a deliberate **re-optimize** pass (hole reclaim + hot-row page clustering + index rebuild). Rejected: inline-row combined buffer (resize scales with `rows×rowSize` → 0.9–4.2 s stop-the-world spikes); tombstone deletes (rot/compaction); mmap-of-record. Validated by a standalone spike (§7.1).
 
 ## 16. Deferred follow-ons (program-level)
 - **Read-time query engine** — `WHERE` / `GROUP BY` / aggregation *beyond* the view's maintained per-field merge: the Filter/Aggregate operators (§5) applied at read time (the §12.3 example's shape). The result-typing/decode mechanism is already defined; the query *operators* are the follow-on.
