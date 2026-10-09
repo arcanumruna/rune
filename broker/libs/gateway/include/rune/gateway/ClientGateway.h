@@ -1402,8 +1402,12 @@ private:
     /// Fix round 2 (finding 1) + D8c: a Produce frame of a session some worker
     /// holds acks for (Held) or that has no produce credit left — the
     /// shard-mode poll ABORTs it (that client's image only).
-    enum class ProducePause : uint8_t { None, Held, NoCredit };
-    [[nodiscard]] ProducePause produceFramePause_(const uint8_t* buf, std::size_t len);
+    /// Lows batch C (D8c R3): WorkerCap* = the session's head Produce was
+    /// deferred by a full worker share and that worker (`*capWorker`) still
+    /// refuses it — ABORTed before decrypt / decode (Session::capDeferredOn).
+    enum class ProducePause : uint8_t { None, Held, NoCredit, WorkerCapFull, WorkerCapBand };
+    [[nodiscard]] ProducePause produceFramePause_(const uint8_t* buf, std::size_t len, int32_t* capWorker = nullptr);
+    void clearCapDeferred_(Session& s) noexcept;
     [[nodiscard]] bool produceFrameHeld_(const uint8_t* buf, std::size_t len) {
         return produceFramePause_(buf, len) != ProducePause::None;
     }
@@ -1558,12 +1562,14 @@ private:
     // D8c: per-session produce credits (shard mode).
     uint32_t                                     sessionProduceCredits_ = kDefaultSessionProduceCredits;
     std::size_t                                  creditBlockedSessions_ = 0;   // sessions with produceInFlight >= budget
+    std::size_t                                  capDeferredSessions_ = 0;     // sessions with capDeferredOn >= 0 (R3)
     uint64_t                                     creditProduceAborts_   = 0;   // ABORTs for want of credit
     uint64_t                                     produceCreditUnderflows_ = 0; // Credit beyond in-flight (invariant breach; clamped)
     // D8c fix round 1 (MAJOR-1): forwarded, unclaimed produces per worker (all sessions).
     std::array<uint32_t, kMaxHeldMaskWorkers>    routedInFlight_{};
     uint32_t                                     workerRoutedCap_ = kWorkerRoutedCap;
     uint64_t                                     workerCapProduceAborts_ = 0;  // produces deferred by the per-worker cap
+    uint64_t                                     capDeferMemoAborts_ = 0;      // ... of them ABORTed by the memo (R3)
     // D8c fix round 2: per-worker cap-full episode (rich state: Idle = tag 0;
     // Congested{tag, deferredPolls}).  An episode ends below the congested band
     // or with its (single) expiry.
@@ -2062,6 +2068,11 @@ public:
         const Session* s = sessions_.find(sid);
         return s && s->lostByWorkers != 0;
     }
+    /// D8b: some worker reports `sid` Held (acks queued its publication refuses).
+    [[nodiscard]] bool sessionHeldForTest(int64_t sid) noexcept {
+        const Session* s = sessions_.find(sid);
+        return s && s->heldByWorkers != 0;
+    }
     // Fix round 1 (I2) seams: a resolved-or-not pending connect with the given
     // announce state (no Aeron publication), the cap accounting, eviction.
     void injectPendingConnectForTest(int64_t sessionId, bool announceBegun) {
@@ -2109,6 +2120,14 @@ public:
         return i - from;
     }
     bool clientFrameHeldForTest(const uint8_t* buf, std::size_t len) { return produceFrameHeld_(buf, len); }
+    /// Test-only: a session's crypto state (install a c2b key to drive encrypted ingress); null = unknown.
+    [[nodiscard]] CryptoState* sessionCryptoForTest(int64_t sid) noexcept {
+        Session* s = sessions_.find(sid);
+        return s ? &s->crypto : nullptr;
+    }
+    /// Lows batch C (D8c R3): redeliveries of a cap-deferred Produce ABORTed by the per-session memo, before any
+    /// decrypt / decode (control thread).
+    [[nodiscard]] uint64_t capDeferMemoAbortsForTest() const noexcept { return capDeferMemoAborts_; }
     void injectPendingRecordEgressForTest(int64_t sid, int32_t worker) { pendingRecordEgress_[{sid, worker}]; }
     [[nodiscard]] std::size_t pendingRecordEgressCountForTest() const noexcept { return pendingRecordEgress_.size(); }
 private:

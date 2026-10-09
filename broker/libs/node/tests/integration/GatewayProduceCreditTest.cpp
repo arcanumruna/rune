@@ -17,7 +17,9 @@
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerPool.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/crypto/Aead.h>
 #include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/CryptoEnvelope.h>
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/replication/PartitionReplica.h>
@@ -31,6 +33,7 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <algorithm>
 #include <set>
 #include <unistd.h>
@@ -608,4 +611,263 @@ TEST(GatewayProduceCreditRegression, CapExpiryOnlyHitsAHeldSessionOncePerEpisode
     EXPECT_EQ(r.gw.lastCapEvictedSessionForTest(), l2) << "n credited in this episode: skipped although larger";
     EXPECT_GE(r.gw.produceInFlightForTest(n), 0);
     EXPECT_EQ(r.gw.produceCreditUnderflowsForTest(), 0u);
+}
+
+// D8c/D8d follow-up (lows batch C): the gateway's reader marks count Credits of the LAST scan window only (D8d's
+// 64-pass window) — a fresh tag per window when a scan finds no victim.  A held session that credited once early in a
+// long cap-full episode and then stalled is expired at the next scan.  (Was: a single Credit marked it a reader for
+// the whole episode — the episode, and the full share, could only end by draining below the band.)
+TEST(GatewayProduceCreditRegression, CapExpiryReaderMarksCoverTheLastScanWindowOnlyRegression) {
+    Rig r(/*withAcks=*/false);
+    r.gw.setWorkerRoutedCapForTest(400);                                  // band [300, 400)
+    const int64_t h = r.gw.injectTestSession(r.now), l1 = r.gw.injectTestSession(r.now),
+                  l2 = r.gw.injectTestSession(r.now), n = r.gw.injectTestSession(r.now),
+                  m = r.gw.injectTestSession(r.now);
+    auto frames = [](int64_t sid, int k) {
+        std::vector<std::vector<uint8_t>> f;
+        for (int i = 0; i < k; ++i) f.push_back(produceFrame(sid, i, 0));
+        return f;
+    };
+    const auto fh = frames(h, 300), f1 = frames(l1, 64), f2 = frames(l2, 36), fn = frames(n, 4), fm = frames(m, 1);
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fh), 300u);
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(f1), 64u);
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(f2), 36u);
+    ASSERT_EQ(r.gw.routedInFlightForTest(0), 400u);
+    rune::node::WorkerReturn s;
+    s.type = rune::node::WorkerReturn::Type::SessionSignal; s.sessionId = l1; s.partition = 0;
+    s.lastOffset = static_cast<int64_t>(SessionSignalKind::Held);
+    r.gw.handleWorkerReturnForTest(s);                                    // only l1 is held
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fn), 0u);                  // deferred poll 1: the episode starts
+    r.gw.handleWorkerReturnForTest(creditSignal(l1, 1));                  // l1 reads once (399, in the band)
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fm), 1u);                  // back to 400
+    constexpr uint32_t N = 64;                                            // kCapEvictAfterDeferredPolls
+    for (uint32_t i = 1; i < N; ++i) ASSERT_EQ(r.gw.controlledPollFramesForTest(fn), 0u);
+    ASSERT_EQ(r.gw.workerCapEvictionsForTest(), 0u) << "window 1: l1 credited — a reader, not expired";
+    for (uint32_t i = 0; i < N && r.gw.workerCapEvictionsForTest() == 0; ++i)
+        EXPECT_EQ(r.gw.controlledPollFramesForTest(fn), 0u);
+    EXPECT_EQ(r.gw.workerCapEvictionsForTest(), 1u) << "window 2: l1 stalled since its one Credit — expired";
+    EXPECT_EQ(r.gw.lastCapEvictedSessionForTest(), l1);
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(fn), 4u) << "its share is freed: the deferred session is served";
+    EXPECT_EQ(r.gw.produceCreditUnderflowsForTest(), 0u);
+}
+
+namespace {
+// An encrypted gateway session: c2b key installed exactly as handleHandshakeContinue_ does; `client` seals as the
+// client would (same key + prefix, its own monotonic seq).
+struct EncryptedSession {
+    rune::crypto::AeadKey key{};
+    uint8_t prefix[4] = {1, 2, 3, 4};
+    std::optional<rune::crypto::AeadCipher> client;
+    uint64_t seq = 0;
+    void install(rune::gateway::CryptoState& c) {
+        for (std::size_t i = 0; i < sizeof(key.bytes); ++i) key.bytes[i] = static_cast<uint8_t>(i * 7 + 3);
+        c.encrypted = true;
+        c.cipher = rune::crypto::Cipher::Aes256Gcm;
+        c.recv.emplace(rune::crypto::Cipher::Aes256Gcm, key, prefix);
+        client.emplace(rune::crypto::Cipher::Aes256Gcm, key, prefix);
+    }
+    std::vector<uint8_t> seal(const std::vector<uint8_t>& plain) {
+        const uint64_t s = ++seq;
+        std::vector<uint8_t> out(plain.size() + pc::kCryptoOverhead);
+        std::memcpy(out.data(), plain.data(), pc::MessageHeader::ENCODED_SIZE);
+        pc::CryptoSubHeader sub;
+        sub.version = 1;
+        sub.seq = s;
+        sub.encode(out.data() + pc::MessageHeader::ENCODED_SIZE);
+        const std::size_t n = client->seal(s, out.data(), pc::kCryptoHeaderBytes,
+                                           plain.data() + pc::MessageHeader::ENCODED_SIZE,
+                                           plain.size() - pc::MessageHeader::ENCODED_SIZE,
+                                           out.data() + pc::kCryptoHeaderBytes);
+        out.resize(pc::kCryptoHeaderBytes + n);
+        return out;
+    }
+};
+} // namespace
+
+// Lows batch C (D8c R3, found with it): an ENCRYPTED Produce deferred by a full worker share was decrypted — its seq
+// committed to the session's anti-replay window — then ABORTed; its redelivery failed the replay check and was
+// silently DROPPED (consumed, never forwarded or answered).  The seq is now committed only when the frame is consumed.
+TEST(GatewayProduceCreditRegression, EncryptedProduceDeferredByAFullWorkerShareIsForwardedNotDroppedRegression) {
+    Rig r(/*withAcks=*/false);
+    r.gw.setWorkerRoutedCapForTest(4);
+    const int64_t h = r.gw.injectTestSession(r.now), e = r.gw.injectTestSession(r.now);
+    EncryptedSession es;
+    es.install(*r.gw.sessionCryptoForTest(e));
+    std::vector<std::vector<uint8_t>> fh;
+    for (int i = 0; i < 4; ++i) fh.push_back(produceFrame(h, i, 0));
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fh), 4u);                  // h fills the worker's share
+    const std::vector<std::vector<uint8_t>> fe{es.seal(produceFrame(e, 42, 0))};
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fe), 0u) << "deferred by the full share";
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fe), 0u) << "still deferred on redelivery";
+    r.gw.handleWorkerReturnForTest(creditSignal(h, 4));                   // the share frees
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(fe), 1u);
+    EXPECT_EQ(r.gw.produceInFlightForTest(e), 1) << "the redelivered encrypted produce was forwarded (not a replay)";
+    EXPECT_EQ(r.gw.routedInFlightForTest(0), 1u);
+    // A real replay of a CONSUMED frame is still refused (dropped, never forwarded twice).
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(fe), 1u);
+    EXPECT_EQ(r.gw.produceInFlightForTest(e), 1) << "a consumed seq is committed: its replay is dropped";
+}
+
+// Lows batch C (D8c R3): a cap-deferred Produce is redelivered every gateway duty cycle until the share frees.  Each
+// redelivery is now ABORTed by the session's deferral memo (one probe) — never decrypted / decoded / looked up again —
+// and still counts as a deferred poll of the episode (expiry pacing unchanged).
+TEST(GatewayProduceCreditRegression, CapDeferredProduceIsNotReDecodedOnRedeliveryRegression) {
+    Rig r(/*withAcks=*/false);
+    r.gw.setWorkerRoutedCapForTest(4);
+    const int64_t h = r.gw.injectTestSession(r.now), e = r.gw.injectTestSession(r.now);
+    std::vector<std::vector<uint8_t>> fh;
+    for (int i = 0; i < 4; ++i) fh.push_back(produceFrame(h, i, 0));
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fh), 4u);
+    const std::vector<std::vector<uint8_t>> fe{produceFrame(e, 1, 0)};
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fe), 0u);                  // the first deferral decodes it
+    for (int i = 0; i < 10; ++i) ASSERT_EQ(r.gw.controlledPollFramesForTest(fe), 0u);
+    EXPECT_EQ(r.gw.capDeferMemoAbortsForTest(), 10u) << "every redelivery is ABORTed before decode";
+    EXPECT_EQ(r.gw.workerCapProduceAbortsForTest(), 11u) << "each still counts as a deferred produce";
+    r.gw.handleWorkerReturnForTest(creditSignal(h, 1));
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(fe), 1u) << "served once the worker admits it";
+    EXPECT_EQ(r.gw.produceInFlightForTest(e), 1);
+    // The memo is gone with the deferral: the session's next frames take the fast path.
+    std::vector<std::vector<uint8_t>> more{produceFrame(h, 9, 0)};
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(more), 0u) << "the share is full again (h)";
+    r.gw.handleWorkerReturnForTest(creditSignal(h, 3));
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(more), 1u);
+    EXPECT_EQ(r.gw.capDeferMemoAbortsForTest(), 10u);
+}
+
+// D8c re-review LOW-R5 (lows batch C): the per-worker routed counters with TWO workers — produces forwarded to both
+// are counted on their owning worker; a Credit naming worker 1 returns only worker 1's share (and only the session's
+// share there — a Credit beyond it is clamped and counted, never taken from worker 0); a close returns the session's
+// share on EVERY worker at once.
+TEST(GatewayProduceCreditRegression, CreditsAndCloseAreAttributedPerWorkerWithTwoWorkersRegression) {
+    TmpDir d{"log2w"};
+    constexpr int32_t kParts = 8;
+    rune::gateway::TopicRegistry topics{{rune::node::TopicSpec{"t", kParts}}, d.path.string()};
+    NullTransport t;
+    ReplicaRegistry reg;
+    rune::metadata::ShardRouter router(2);
+    int32_t pOn[2] = {-1, -1};                                       // one partition owned by each worker
+    for (int32_t p = 0; p < kParts; ++p) {
+        PartitionConfig c = cfg();
+        c.partitionId = p;
+        reg.add(0, p, std::make_unique<PartitionReplica>(c, Role::Leader, 1, std::vector<NodeId>{1},
+                                                         std::vector<NodeId>{1}, topics.log(0, p), &t));
+        const int32_t w = router.workerForPartition(0, p);
+        if (pOn[w] < 0) pOn[w] = p;
+    }
+    ASSERT_GE(pOn[0], 0);
+    ASSERT_GE(pOn[1], 0);
+    WorkerPool pool{2, router, 32u << 20, 32u << 20, 16, 16};
+    pool.assignFromRegistry(reg);
+    pool.setRegistry(&reg);
+    pool.setRunnersStartedForTest(true);
+    auto gw = rune::gateway::ClientGateway::makeForTest([](const uint8_t*, std::size_t) -> int64_t { return 1; });
+    gw.setTopicRegistry(&topics);
+    gw.setReplicaRegistry(&reg);
+    gw.setWorkerPool(&pool);
+    gw.setPerWorkerIngressActive(true);
+    gw.setCommittedMetadataReady(true);
+    gw.setShardMode(true);
+    ASSERT_EQ(pool.ownerWorkerId(0, pOn[0]), 0);
+    ASSERT_EQ(pool.ownerWorkerId(0, pOn[1]), 1);
+    auto frame = [](int64_t sid, int64_t corr, int32_t partition) {
+        auto f = produceFrame(sid, corr, 0);
+        pc::Produce m = *pc::Produce::decode(f.data(), f.size());
+        m.partition = partition;
+        std::vector<uint8_t> out(m.encodedSize());
+        m.encode(out.data());
+        return out;
+    };
+    auto credit = [](int64_t sid, int32_t worker, int64_t n) {
+        auto r = creditSignal(sid, n);
+        r.partition = worker;
+        return r;
+    };
+    const int64_t a = gw.injectTestSession(0), b = gw.injectTestSession(0);
+    std::vector<std::vector<uint8_t>> fa, fb;
+    for (int i = 0; i < 5; ++i) fa.push_back(frame(a, i, pOn[0]));
+    for (int i = 0; i < 3; ++i) fa.push_back(frame(a, 10 + i, pOn[1]));
+    for (int i = 0; i < 2; ++i) fb.push_back(frame(b, i, pOn[1]));
+    ASSERT_EQ(gw.controlledPollFramesForTest(fa), 8u);
+    ASSERT_EQ(gw.controlledPollFramesForTest(fb), 2u);
+    EXPECT_EQ(gw.routedInFlightForTest(0), 5u) << "a's produces to worker 0";
+    EXPECT_EQ(gw.routedInFlightForTest(1), 5u) << "a's 3 + b's 2 to worker 1";
+    gw.handleWorkerReturnForTest(credit(a, 1, 2));                    // worker 1 claimed 2 of a's acks
+    EXPECT_EQ(gw.routedInFlightForTest(0), 5u) << "worker 0's share untouched";
+    EXPECT_EQ(gw.routedInFlightForTest(1), 3u);
+    EXPECT_EQ(gw.produceInFlightForTest(a), 6);
+    gw.handleWorkerReturnForTest(credit(a, 1, 4));                    // beyond a's share on worker 1 (1 left)
+    EXPECT_EQ(gw.produceCreditUnderflowsForTest(), 1u) << "clamped and counted";
+    EXPECT_EQ(gw.routedInFlightForTest(0), 5u) << "never taken from another worker";
+    EXPECT_EQ(gw.routedInFlightForTest(1), 2u) << "only a's last one there: b's 2 remain";
+    EXPECT_EQ(gw.produceInFlightForTest(a), 5);
+    pc::Disconnect dc; dc.sessionId = a; dc.correlationId = 1;
+    std::vector<uint8_t> buf(pc::Disconnect::ENCODED_SIZE);
+    dc.encode(buf.data());
+    gw.applyDisconnectForTest(buf.data(), buf.size());
+    EXPECT_EQ(gw.routedInFlightForTest(0), 0u) << "the close returned a's share on worker 0 ...";
+    EXPECT_EQ(gw.routedInFlightForTest(1), 2u) << "... and on worker 1, leaving b's";
+    gw.handleWorkerReturnForTest(credit(b, 1, 2));
+    EXPECT_EQ(gw.routedInFlightForTest(1), 0u);
+    EXPECT_EQ(gw.produceInFlightForTest(b), 0);
+    EXPECT_EQ(gw.produceCreditUnderflowsForTest(), 1u);
+}
+
+// D10-L (egress-pub-lifetime review LOW-4, lows batch C): retire-on-ack with a REAL record-egress publication that
+// the worker actually PUSHES Records through (the gateway rig used an inert fake whose push never sent).  The pub
+// carries pushes while the session lives and after its close until the worker executes the release; it is destroyed
+// only on the worker's acknowledgement; after the release the worker never references it again (later appends to
+// the partition push nothing more to it) — no write through a released publication.
+TEST(RecordEgressLifetimeRealPubRegression, PushesThroughARealPubUntilTheReleaseThenNever) {
+    Rig r(/*withAcks=*/true);
+    ASSERT_TRUE(r.egB);
+    r.gw.setPerWorkerEgressActive(true);
+    constexpr int32_t kRecStream = 7700;
+    const int64_t subReg = r.client->addSubscription("aeron:ipc", kRecStream);
+    const int64_t pubReg = r.client->addExclusivePublication("aeron:ipc", kRecStream);
+    std::shared_ptr<aeron::Subscription> recSub;
+    std::shared_ptr<aeron::ExclusivePublication> pub;
+    for (int i = 0; i < kCap && !(recSub && pub && pub->isConnected()); ++i) {
+        r.pump();
+        if (!recSub) recSub = r.client->findSubscription(subReg);
+        if (!pub) pub = r.client->findExclusivePublication(pubReg);
+    }
+    ASSERT_TRUE(recSub && pub && pub->isConnected());
+    int records = 0;
+    auto pollRecords = [&] {
+        recSub->poll([&](aeron::concurrent::AtomicBuffer& b, aeron::util::index_t o, aeron::util::index_t l, aeron::Header&) {
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + o);
+            if (auto h = pc::MessageHeader::decode(p, static_cast<std::size_t>(l));
+                h && h->templateId == static_cast<uint16_t>(pc::TemplateId::Records)) ++records;
+        }, 64);
+    };
+    const int64_t sid = r.session(kEgressA), b = r.session(kEgressB);
+    std::weak_ptr<aeron::ExclusivePublication> probe = pub;
+    r.gw.injectRecordEgressForTest(sid, 0, std::move(pub));          // the gateway now owns the only reference
+    auto produceFromB = [&](int64_t corr) {
+        std::vector<std::vector<uint8_t>> f{produceFrame(b, corr, 0)};
+        ASSERT_EQ(r.gw.controlledPollFramesForTest(f), 1u);
+        for (int i = 0; i < 2'000 && !r.acks.count(corr); ++i) r.runWorker();
+        ASSERT_EQ(r.acks.count(corr), 1u);
+    };
+    produceFromB(1);
+    pc::Subscribe s;
+    s.sessionId = sid; s.correlationId = 77; s.topicId = 0; s.partition = 0; s.partitionKnown = 1;
+    s.fromOffset = 0; s.isolation = 0;
+    std::vector<uint8_t> sf(s.encodedSize());
+    sf.resize(s.encode(sf.data()));
+    r.gw.applySubscribeForTest(sf.data(), sf.size());
+    for (int i = 0; i < 2'000 && records == 0; ++i) { r.runWorker(); pollRecords(); }
+    ASSERT_GT(records, 0) << "the worker pushes Records through the session's real record-egress pub";
+
+    r.gw.closeSessionForTest(sid);                                   // retire: kept alive for the worker
+    EXPECT_FALSE(probe.expired()) << "destroyed before the worker released it";
+    for (int i = 0; i < 64 && !probe.expired(); ++i) { r.runWorker(); pollRecords(); }
+    EXPECT_TRUE(probe.expired()) << "destroyed on the worker's acknowledgement (no leak)";
+    EXPECT_EQ(r.gw.retiringRecordEgressCountForTest(), 0u);
+    for (const auto& ws : r.w().subscriptionsForTest())
+        EXPECT_NE(ws.sessionId, sid) << "a cursor of the closed session outlived the release";
+    const int before = records;
+    produceFromB(2);                                                 // new data on the partition
+    for (int i = 0; i < 64; ++i) { r.runWorker(); pollRecords(); }
+    EXPECT_EQ(records, before) << "nothing is pushed for the closed session after its release";
 }

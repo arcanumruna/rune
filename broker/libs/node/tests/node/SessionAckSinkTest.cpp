@@ -1128,3 +1128,31 @@ TEST(SessionAckSinkRegression, ChannelSlotsAreAllReturned) {
     EXPECT_EQ(s.freeChannelSlotsForTest(), Sink::kMaxChannelSlots);
     EXPECT_EQ(s.drainingRegistrations(), 0u) << "errored registrations are never drained";
 }
+
+// Lows batch C (D8d follow-up: tombstone limit).  A mass close of EVERY session the worker can know (the gateway
+// reaps them in one cycle — e.g. after a network partition) must keep every closed session's buffered direct frames
+// out of the log: the tombstones cover kMaxSessions closes.  (Was: a 1024-entry ring — the 1025th close overwrote
+// the first, whose backlog was then appended unanswered and duplicated by the client's resend.)
+TEST(SessionAckSinkRegression, MassCloseOfEverySessionKeepsEveryTombstoneRegression) {
+    FakePolicy pol; Sink s(pol);
+    constexpr int64_t kN = static_cast<int64_t>(Sink::kMaxSessions) - 1;   // the table's whole capacity
+    for (int64_t sid = 1; sid <= kN; ++sid) ASSERT_TRUE(s.announce(sid, "aeron:udp?endpoint=127.0.0.1:1", 7));
+    pass(s);
+    pass(s);
+    for (int64_t sid = 1; sid <= kN; ++sid) s.close(sid);
+    for (int64_t sid = 1; sid <= kN; ++sid)
+        ASSERT_EQ(s.admitDirect(sid), Sink::kDirectDropClosed) << "closed session " << sid << " lost its tombstone";
+    EXPECT_EQ(s.directInFlight(), 0u);
+    EXPECT_EQ(s.admitDirect(kN + 1), Sink::kDirectTotalOnly) << "a session never seen here is admitted (I1)";
+    // FIFO: the oldest tombstone goes only after kClosedTombstones newer closes.
+    for (int64_t sid = kN + 100; sid < kN + 100 + static_cast<int64_t>(Sink::kClosedTombstones) - kN; ++sid) {
+        ASSERT_TRUE(s.announce(sid, "aeron:udp?endpoint=127.0.0.1:1", 7));
+        s.close(sid);
+    }
+    EXPECT_EQ(s.admitDirect(1), Sink::kDirectDropClosed) << "still within the last kClosedTombstones closes";
+    ASSERT_TRUE(s.announce(kN + 50, "aeron:udp?endpoint=127.0.0.1:1", 7));
+    s.close(kN + 50);
+    EXPECT_EQ(s.admitDirect(1), Sink::kDirectTotalOnly) << "the oldest tombstone is evicted first";
+    EXPECT_EQ(s.admitDirect(2), Sink::kDirectDropClosed);
+    EXPECT_EQ(s.admitDirect(kN + 50), Sink::kDirectDropClosed);
+}

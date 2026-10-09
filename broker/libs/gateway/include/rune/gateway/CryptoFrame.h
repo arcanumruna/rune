@@ -135,10 +135,17 @@ inline void replayWindowCommit(uint64_t& recvSeq, uint64_t& recvWindow,
 /// auth failure (tampered ciphertext OR tampered header — the header is part
 /// of the AAD).  The window is committed ONLY after the tag verifies, so a
 /// forged seq can never poison it against a later legitimate frame.
-[[nodiscard]] inline std::size_t openIngressFrame(
+/// Lows batch C (D8c R3): open WITHOUT committing `seq` to the anti-replay
+/// window (`seqOut` = the frame's seq).  For a frame the caller may NOT consume
+/// (a Produce the shard-mode controlled poll ABORTs and redelivers): the window
+/// takes the seq only via commitIngressSeq once the frame is consumed — a
+/// committed-then-ABORTed frame would fail its own redelivery as a replay and
+/// be silently dropped.  The window check is read-only, so re-opening an
+/// uncommitted frame is accepted (still exactly once once committed).
+[[nodiscard]] inline std::size_t openIngressFrameUncommitted(
     CryptoState& crypto,
     const uint8_t* wire, std::size_t wireLen,
-    uint8_t* scratch, std::size_t scratchCap) noexcept {
+    uint8_t* scratch, std::size_t scratchCap, uint64_t& seqOut) noexcept {
     namespace rpc = rune::protocol::client;
     constexpr std::size_t kMinWire = rpc::kCryptoHeaderBytes + rune::crypto::kTagSize;
     if (wireLen < kMinWire || !crypto.recv.has_value()) return 0;
@@ -165,10 +172,25 @@ inline void replayWindowCommit(uint64_t& recvSeq, uint64_t& recvWindow,
         scratch + rpc::MessageHeader::ENCODED_SIZE);
     if (plainLen < 0) return 0;  // auth failure — discard; window NOT updated
 
-    detail_crypto::replayWindowCommit(crypto.recvSeq, crypto.recvWindow, seq);
-
     std::memcpy(scratch, wire, rpc::MessageHeader::ENCODED_SIZE);  // clear header, unchanged
+    seqOut = seq;
     return rpc::MessageHeader::ENCODED_SIZE + static_cast<std::size_t>(plainLen);
+}
+
+/// Commit an opened frame's seq (openIngressFrameUncommitted) once it is consumed.
+inline void commitIngressSeq(CryptoState& crypto, uint64_t seq) noexcept {
+    detail_crypto::replayWindowCommit(crypto.recvSeq, crypto.recvWindow, seq);
+}
+
+/// Open and commit at once (a frame that is always consumed).
+[[nodiscard]] inline std::size_t openIngressFrame(
+    CryptoState& crypto,
+    const uint8_t* wire, std::size_t wireLen,
+    uint8_t* scratch, std::size_t scratchCap) noexcept {
+    uint64_t seq = 0;
+    const std::size_t n = openIngressFrameUncommitted(crypto, wire, wireLen, scratch, scratchCap, seq);
+    if (n != 0) commitIngressSeq(crypto, seq);   // ONLY after the tag verified
+    return n;
 }
 
 }  // namespace rune::gateway::codec

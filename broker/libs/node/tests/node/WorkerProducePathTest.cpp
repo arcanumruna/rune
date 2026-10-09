@@ -39,7 +39,9 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/CryptoEnvelope.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/crypto/Aead.h>
 #include <rune/protocol/client/Protocol.h>
 
 #include <Aeron.h>
@@ -874,6 +876,86 @@ TEST(WorkerProduceRegression, DeferredRollHoldsIngressFrameRegression) {
     EXPECT_EQ(log.logEndOffset(), leo + 1);
     EXPECT_EQ(log.segmentBaseOffsets().size(), segs + 1);
     EXPECT_EQ(demands, 1);
+    (void)log.finalizeStagingRenames();
+    (void)log.drainStagingRenamesDone();
+}
+
+// Lows batch C (D8c R3, found with it): the same hold for an ENCRYPTED session.  The frame was decrypted — its seq
+// committed to the worker's anti-replay window — then held (ABORTed); its redelivery failed the replay check and was
+// DROPPED (never appended or answered).  The seq is now committed only when the frame is consumed.
+TEST(WorkerProduceRegression, EncryptedFrameHeldByADeferredRollIsAppendedOnRedeliveryRegression) {
+    TempDir dir("hotpatha_hold_tls_");
+    rune::storage::Log log(dir.path.string(), /*rollBytes=*/256);
+    log.recover();
+    struct Hook { static bool fn(void*, rune::storage::Log*, rune::storage::Log::ProvisionDemand) noexcept { return true; } };
+    rune::storage::testing::DemandChannelForTest demandCh{&Hook::fn, nullptr};
+    log.setProvisioning(&demandCh);
+    NullTransport transport;
+    auto replica = WorkerProduceFixture::makeLeaderReplica(0, 0, log, transport);
+    Worker worker(0);
+    worker.setOwnedDirect({replica.get()});
+
+    // An encrypted session (announce with its c2b key, as the gateway's SessionAnnouncer sends it).
+    constexpr int64_t kSid = 1;
+    rune::crypto::AeadKey key{};
+    for (std::size_t i = 0; i < sizeof(key.bytes); ++i) key.bytes[i] = static_cast<uint8_t>(i * 5 + 1);
+    const uint8_t prefix[4] = {9, 8, 7, 6};
+    WorkerOp ann;
+    ann.type = WorkerOp::Type::SessionAnnounce;
+    ann.sessionId = kSid;
+    ann.egressStreamId = 7;
+    ann.egressChannel = "aeron:ipc";
+    ann.sessionEncrypted = true;
+    ann.senderCipher = static_cast<uint8_t>(rune::crypto::Cipher::Aes256Gcm);
+    ann.c2bKeyValid = true;
+    std::memcpy(ann.c2bKey, key.bytes, sizeof(ann.c2bKey));
+    std::memcpy(ann.c2bKeyPrefix, prefix, sizeof(ann.c2bKeyPrefix));
+    ASSERT_TRUE(worker.tryEnqueueOp(std::move(ann)));
+    for (int i = 0; i < 4 && worker.sessionCryptoEntriesForTest() == 0; ++i) worker.doWork(1'000 + i);
+    ASSERT_EQ(worker.sessionCryptoEntriesForTest(), 1u);
+    rune::crypto::AeadCipher client(rune::crypto::Cipher::Aes256Gcm, key, prefix);
+    uint64_t seq = 0;
+    auto seal = [&](const std::vector<uint8_t>& plain) {
+        const uint64_t sq = ++seq;
+        std::vector<uint8_t> out(plain.size() + pc::kCryptoOverhead);
+        std::memcpy(out.data(), plain.data(), pc::MessageHeader::ENCODED_SIZE);
+        pc::CryptoSubHeader sub;
+        sub.version = 1;
+        sub.seq = sq;
+        sub.encode(out.data() + pc::MessageHeader::ENCODED_SIZE);
+        const std::size_t n = client.seal(sq, out.data(), pc::kCryptoHeaderBytes,
+                                          plain.data() + pc::MessageHeader::ENCODED_SIZE,
+                                          plain.size() - pc::MessageHeader::ENCODED_SIZE,
+                                          out.data() + pc::kCryptoHeaderBytes);
+        out.resize(pc::kCryptoHeaderBytes + n);
+        return out;
+    };
+
+    int answers = 0;
+    auto drain = [&] {
+        worker.drainReturn([&](const WorkerReturn& ret) {
+            if (ret.type == WorkerReturn::Type::ProduceResult) { EXPECT_EQ(ret.errorCode, 0); ++answers; }
+        });
+    };
+    int64_t corr = 0;
+    while (!log.rollDeferred()) {
+        const auto f = seal(encodeProduceFrame(kSid, ++corr, 0, 0, /*acks=*/0, makeBatch()));
+        ASSERT_GE(worker.handleIngressFrameForTest(f.data(), f.size(), 1), 0);
+        drain();
+        ASSERT_EQ(answers, corr) << "encrypted produce " << corr << " was not answered (decrypt?)";
+    }
+    const int64_t leo = log.logEndOffset();
+    const auto held = seal(encodeProduceFrame(kSid, ++corr, 0, 0, 0, makeBatch()));
+    ASSERT_LT(worker.handleIngressFrameForTest(held.data(), held.size(), 1), 0) << "the frame must be held";
+    ASSERT_EQ(log.provisionReady(1), 1);
+    EXPECT_GE(worker.handleIngressFrameForTest(held.data(), held.size(), 1), 0);
+    drain();
+    EXPECT_EQ(answers, corr) << "the redelivered encrypted frame was dropped as a replay";
+    EXPECT_EQ(log.logEndOffset(), leo + 1) << "the redelivered encrypted frame was not appended";
+    // A replay of the CONSUMED frame is still refused: never appended twice.
+    EXPECT_EQ(worker.handleIngressFrameForTest(held.data(), held.size(), 1), 0);
+    drain();
+    EXPECT_EQ(log.logEndOffset(), leo + 1) << "a replay of a consumed frame must be dropped";
     (void)log.finalizeStagingRenames();
     (void)log.drainStagingRenamesDone();
 }

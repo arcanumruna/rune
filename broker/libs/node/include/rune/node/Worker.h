@@ -686,6 +686,8 @@ public:
     [[nodiscard]] uint64_t intakePausedFramesForTest() const noexcept { return intakePausedFrames_; }
     /// hotpath-A: frames held (ABORT) because their partition's roll was deferred.
     [[nodiscard]] uint64_t intakeRollHoldsForTest() const noexcept { return intakeRollHolds_; }
+    /// Test-only: per-session crypto entries (encrypted sessions announced here).
+    [[nodiscard]] std::size_t sessionCryptoEntriesForTest() const noexcept { return sessionCrypto_.size(); }
     [[nodiscard]] uint64_t ackRoomOpPausesForTest() const noexcept { return ackRoomOpPauses_; }
     /// Fix round 2 (finding 9): session signals (Failed / Held / Released) the
     /// return ring could not take at once — deferred to a later pass, never lost.
@@ -6094,10 +6096,14 @@ private:
         // entry is found.
         const uint8_t* decData = data;
         std::size_t    decLen  = len;
+        // Lows batch C (D8c R3): the seq of a decrypted frame is committed to
+        // the replay window only once the frame is CONSUMED — a frame HELD
+        // below (deferred roll: ABORT + redelivery) must re-open on redelivery.
+        RecordsOpenCtx openCtx;
+        uint64_t       openSeq = 0;
         if (!sessionCrypto_.empty() && len >= kProduceSessionIdEnd) [[unlikely]] {
             WorkerSessionCrypto* cr = findSessionCrypto_(produceSessionIdOf_(data));
             if (cr) [[unlikely]] {
-                RecordsOpenCtx openCtx;
                 openCtx.recv       = cr->recv.has_value() ? &*cr->recv : nullptr;
                 openCtx.recvSeq    = &cr->recvSeq;
                 openCtx.recvWindow = &cr->recvWindow;
@@ -6105,9 +6111,9 @@ private:
                 // bytes SHORTER than the wire frame — sizing to `len` is
                 // always enough. Grow-once (capacity persists across calls).
                 if (workerIngressOpenScratch_.size() < len) workerIngressOpenScratch_.resize(len);
-                const std::size_t n = openProduceFrame(openCtx, data, len,
-                                                        workerIngressOpenScratch_.data(),
-                                                        workerIngressOpenScratch_.size());
+                const std::size_t n = openProduceFrameUncommitted(openCtx, data, len,
+                                                                   workerIngressOpenScratch_.data(),
+                                                                   workerIngressOpenScratch_.size(), openSeq);
                 if (n == 0) [[unlikely]] {
                     // Fail-closed: no key yet / tamper / replay / too-old —
                     // NEVER decode the ciphertext as plaintext. Same drop
@@ -6129,6 +6135,7 @@ private:
         auto msgOpt = pc::Produce::decode(decData, decLen);
         if (!msgOpt) {
             if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
+            if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (dropped)
             spdlog::warn("Worker {}: WorkerIngress: failed to decode Produce frame "
                          "len={}; dropping", workerId_, decLen);
             return 0;
@@ -6152,8 +6159,9 @@ private:
             msg.recordBatch.size() <= maxIntakeBatchBytes()) [[unlikely]] {
             if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
             ++intakeRollHolds_;
-            return kIngressHeld;
+            return kIngressHeld;                                     // seq NOT committed: it re-opens
         }
+        if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed from here on
 
         // E5.1.3 review fix #3: acksAll = (acks != 0).
         // The Produce wire field carries 0=NoAck, 1=Leader, -1 (0xFF)=All.

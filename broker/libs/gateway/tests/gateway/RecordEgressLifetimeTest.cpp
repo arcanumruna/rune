@@ -359,3 +359,28 @@ TEST(RecordEgressLifetimeRegression, AQueuedSubscribeOfTheClosedSessionNeverCarr
     EXPECT_EQ(r.gw.retiringRecordEgressCountForTest(), 0u);
     EXPECT_EQ(pub.destroyed, 1);
 }
+
+// D10-L (review LOW-4, lows batch C): the NON-shard runtime (per-worker egress without worker-side acks) closes
+// sessions through the same closeSession_: the pub a worker pushes through is retired on ack there too.
+TEST(RecordEgressLifetimeRegression, NonShardModeCloseKeepsThePubAliveUntilTheWorkerReleasesIt) {
+    Rig r(1);
+    r.gw.setShardMode(false);
+    FakePub pub;
+    const int64_t sid = r.gw.injectTestSession(0);
+    r.gw.injectRecordEgressForTest(sid, r.owner(0), pub.make());
+    r.subscribe(sid, 0);
+    auto& w = r.pool.worker(r.owner(0));
+    w.doWork(1);
+    ASSERT_TRUE(workerReferences(w, pub.ptr()));
+    r.gw.closeSessionForTest(sid);
+    EXPECT_TRUE(workerReferences(w, pub.ptr()));
+    EXPECT_EQ(pub.destroyed, 0) << "use-after-free in the non-shard runtime";
+    r.gw.drainWorkerReturnsForTest(2);
+    EXPECT_EQ(pub.destroyed, 0);
+    w.doWork(3);
+    EXPECT_FALSE(workerReferences(w, pub.ptr()));
+    EXPECT_EQ(pub.destroyed, 0) << "freed only on the acknowledgement";
+    r.gw.drainWorkerReturnsForTest(4);
+    EXPECT_EQ(pub.destroyed, 1);
+    EXPECT_EQ(r.gw.retiringRecordEgressCountForTest(), 0u);
+}
