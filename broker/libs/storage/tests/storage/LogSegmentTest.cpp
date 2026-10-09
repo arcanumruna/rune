@@ -1046,6 +1046,53 @@ TEST(LogSegmentRegression, ReadIntoIoErrorIsNeverTooLargeRegression) {
     std::filesystem::remove_all(dir);
 }
 
+// Lows A/B/C review M1: a pread I/O error was answered empty and retried on
+// EVERY worker pass (a bad sector can block each pread for tens of ms -- on the
+// duty pass) and nothing escalated: the log was never failed, so the
+// log-dir-offline / broker-halt path never ran and acks=all HW pinned at the
+// bad batch.  Kafka: a read IOException takes the log dir offline.  A read I/O
+// error now marks the log storage-failed (sticky, like a write / fsync
+// failure; the owner's checkStorageFailure_ routes it to the halt) and a
+// failed log is never pread again.
+TEST(LogSegmentRegression, ReadIntoIoErrorFailsTheLogStickyAndIsNotRetriedRegression) {
+    auto dir = makeTempDir("rune_log_readinto_eio_sticky");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    rune::storage::Log log(dir.string());
+    log.recover();
+    RecordBatchBuilder b(0, 1000);
+    b.append("k", std::string(100 * 1024, 'x'), 1000);
+    log.append(b.build(), 0);
+    const auto segPath = dir / "00000000000000000000.log";
+    std::vector<char> saved;
+    {
+        std::ifstream f(segPath, std::ios::binary);
+        saved.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    ASSERT_GT(saved.size(), 30u * 1024);
+    ASSERT_EQ(::truncate(segPath.c_str(), 30 * 1024), 0);   // the bad sector
+    std::vector<uint8_t> buf(256 * 1024);
+    ReadIntoStatus st = ReadIntoStatus::Ok;
+    int err = 0;
+    EXPECT_TRUE(log.readInto(0, 4096, buf.data(), buf.size(), st, INT64_MAX, &err).empty());
+    ASSERT_EQ(st, ReadIntoStatus::IoError);
+    EXPECT_TRUE(log.storageFailed()) << "a read I/O error did not fail the log (no escalation, retried every pass)";
+    EXPECT_NE(log.storageErrno(), 0);
+    // The bytes come back (the "drive" recovers): a failed log is still never
+    // read again -- sticky, no pread on the next pass.
+    {
+        std::ofstream f(segPath, std::ios::binary | std::ios::trunc);
+        f.write(saved.data(), static_cast<std::streamsize>(saved.size()));
+    }
+    const uint64_t bytesBefore = log.segmentForTest(0)->readIntoBytes();
+    st = ReadIntoStatus::Ok;
+    err = 0;
+    EXPECT_TRUE(log.readInto(0, 4096, buf.data(), buf.size(), st, INT64_MAX, &err).empty());
+    EXPECT_EQ(st, ReadIntoStatus::IoError) << "a failed log was read again";
+    EXPECT_NE(err, 0);
+    EXPECT_EQ(log.segmentForTest(0)->readIntoBytes(), bytesBefore) << "a failed log was pread again";
+    std::filesystem::remove_all(dir);
+}
+
 // D26 (fix65 review LOW-4): a read bounded by the HW / LSO a little past the
 // cursor (an acks=all leader whose LEO runs ahead) preads about one index
 // interval past the bound — not maxBytes.

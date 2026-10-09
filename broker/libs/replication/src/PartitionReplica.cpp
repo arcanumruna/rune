@@ -3330,8 +3330,10 @@ rune::storage::LogReadView PartitionReplica::readLog_(Offset from, int32_t maxBy
         const rune::storage::LogReadView v =
             diskLog_->readInto(from, maxBytes, readScratch_, readScratchCap_, st, INT64_MAX, &err);
         if (st != rune::storage::ReadIntoStatus::FirstTooLarge) [[likely]] {
-            // D26: an I/O error is answered empty (the fetch / push retries) —
-            // never retried through the read mapping (SIGBUS on the bad page).
+            // D26: an I/O error is answered empty — never retried through the
+            // read mapping (SIGBUS on the bad page).  Review M1: it failed the
+            // log (sticky); the owner's storage-failure check halts / takes
+            // the log dir offline, and the log is never pread again.
             if (st == rune::storage::ReadIntoStatus::IoError) [[unlikely]] {
                 ++readErrors_;
                 if ((readErrors_ & (readErrors_ - 1)) == 0)

@@ -635,6 +635,14 @@ LogReadView LogSegment::readInto(int64_t startOffset, int32_t maxBytes, uint8_t*
     st = ReadIntoStatus::Absent;
     if (logSize_ <= 0) return {};                                     // nothing written: absent
     if (fd_ < 0 || buf == nullptr || bufCap == 0) { st = ReadIntoStatus::Unreadable; return {}; }
+    // Lows A/B/C review M1: a failed log is never pread again (a bad sector
+    // re-read on every worker pass blocks the duty pass for the drive's retry
+    // time) — IoError, at once.
+    if (storage_ != nullptr && storage_->failedErrno != 0) [[unlikely]] {
+        st = ReadIntoStatus::IoError;
+        if (errOut != nullptr) *errOut = storage_->failedErrno;
+        return {};
+    }
     using rune::protocol::RecordBatchReader;
     const std::size_t kOverhead = static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead);
     const std::size_t interval = static_cast<std::size_t>(indexIntervalBytes_);
@@ -675,9 +683,15 @@ LogReadView LogSegment::readInto(int64_t startOffset, int32_t maxBytes, uint8_t*
         }
         return true;
     };
+    // Lows A/B/C review M1: a read I/O error fails the log like a write /
+    // fsync error (sticky failedErrno; first error wins).  The owner's
+    // checkStorageFailure_ routes it to the log-dir-failure path (D15
+    // LogDirOffline / broker halt) — Kafka: a read IOException takes the log
+    // dir offline.  Never an empty answer retried on every pass.
     auto failed = [&]() noexcept -> LogReadView {
         st = ReadIntoStatus::IoError;
         ++readIntoErrors_;
+        if (storage_ != nullptr && storage_->failedErrno == 0) storage_->failedErrno = ioErr != 0 ? ioErr : EIO;
         if (errOut != nullptr) *errOut = ioErr;
         return {};
     };

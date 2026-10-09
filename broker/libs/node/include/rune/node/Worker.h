@@ -3275,8 +3275,10 @@ private:
     // the request and stopping near `bound` (the HW / LSO: D26).  Only a first
     // batch larger than the whole scratch falls back to the mapped view —
     // counted (pushReadMapFallbacks_), and only after its bytes read cleanly.
-    // An I/O error is answered empty (retried next cycle), counted and logged —
-    // never retried through the mapping (SIGBUS on the same bad page; D26).
+    // An I/O error is answered empty, counted and logged — never retried
+    // through the mapping (SIGBUS on the same bad page; D26) — and it fails the
+    // log (sticky, review M1): checkStorageFailure_ routes it to the
+    // log-dir-failure path this pass; the log is never pread again.
     // The view is valid until the next push read on this thread.
     rune::storage::LogReadView readNoFault_(rune::storage::Log* log, int64_t offset, std::size_t maxBytes,
                                             int64_t bound) noexcept {
@@ -3295,7 +3297,7 @@ private:
         ++pushReadErrors_;
         if ((pushReadErrors_ & (pushReadErrors_ - 1)) == 0)   // rate-limited: powers of two
             spdlog::error("Worker {}: push read of {} at offset {} failed (errno={}, errors={}) — answered empty, "
-                          "retried next cycle (never through the read mapping)", workerId_, log->dir(), offset, err,
+                          "the log is FAILED (never read again; log-dir-failure path)", workerId_, log->dir(), offset, err,
                           pushReadErrors_);
     }
 

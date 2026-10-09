@@ -18,7 +18,8 @@ namespace rune::storage {
 ///   syncCalls      — every inline LogSegment::sync (test visibility: a shard loop
 ///                    must make none).
 ///   failedErrno    — fsyncgate fail-stop: the FIRST fsync/msync error of any kind
-///                    on this log (inline or async).  Sticky — never clears; a later
+///                    on this log (inline or async), or a readInto pread I/O error
+///                    (lows A/B/C review M1).  Sticky — never clears; a later
 ///                    "successful" fsync cannot vouch for pages the kernel dropped.
 ///   faultForTest   — test-only: while non-zero every inline sync fails with it.
 ///   writeFaultForTest — test-only: while non-zero every data write (pwrite /
@@ -206,7 +207,8 @@ public:
     /// `st`: Ok / Absent (nothing at/after startOffset here — the caller may
     /// continue at the next segment) / FirstTooLarge (the first deliverable
     /// batch does not fit `bufCap`: the caller may fall back) / Unreadable /
-    /// IoError (`*errOut` = errno; never retried through the mapping).
+    /// IoError (`*errOut` = errno; never retried through the mapping; the log
+    /// is marked storage-failed — sticky — and never pread again: review M1).
     LogReadView readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
                          ReadIntoStatus& st, int64_t boundOffset = INT64_MAX, int* errOut = nullptr) noexcept;
     /// Same; `firstTooLarge` = (st == FirstTooLarge).
