@@ -4,124 +4,58 @@
 // offset tracking, unsubscribe, no-crosstalk.
 //
 // Test matrix:
-//   1.  SubscribeFromEarliest
-//         Gateway produces N records before subscribe; client subscribes
-//         Earliest; receives all N in order (correct offset/key/value,
-//         binary-safe).
-//
-//   2.  SubscribeFromLatest
-//         Gateway produces records BEFORE subscribe (with Latest), then
-//         records AFTER.  Client receives only the records produced AFTER.
-//
-//   3.  SubscribeFromOffset
-//         Client subscribes with From::offset(k); verify delivery starts at
-//         offset >= k (whole-batch semantics: batch containing k is delivered).
-//
-//   4.  OffsetTracking
-//         position() advances correctly as records are delivered; matches
-//         last delivered offset + 1 after the batch.
-//
-//   5.  UnsubscribeStopsDelivery
-//         Produce records; unsubscribe; produce more; handler not called for
-//         post-unsubscribe records.
-//
-//   6.  RaiiDtorUnsubscribes
-//         Subscription goes out of scope (dtor); produce after scope exit;
-//         handler not called.
-//
+//   1.  SubscribeFromEarliest     — every pushed record arrives in order
+//                                    (offset / key / value, binary-safe); the
+//                                    Subscribe carries the Earliest sentinel.
+//   2.  SubscribeFromLatest       — records pushed after the bind arrive; the
+//                                    Subscribe carries the Latest sentinel.
+//   3.  SubscribeFromOffset       — the Subscribe carries k; delivery starts at k.
+//   4.  OffsetTracking            — position() == last delivered + 1.
+//   5.  UnsubscribeStopsDelivery  — no handler call after unsubscribe().
+//   6.  RaiiDtorUnsubscribes      — the handle's destructor unsubscribes.
 //   7.  TwoSubscriptionsNoCrosstalk
-//         Two subscriptions on different (topic/partition); each handler
-//         receives only its own records.
+//   8.  ZeroCopyHandlerValidity   — binary key / value copied in the callback.
+//   9.  ReconnectResumeScaffold   — position() is the resume point.
+//  10.  MultiRecordBatchInOrder
+//  11.  UnsubscribeResponseRace   — unsubscribe() before the SubscribeResponse:
+//                                    the late response sends the real
+//                                    Unsubscribe, nothing is delivered.
 //
-//   8.  ZeroCopyHandlerValidity
-//         Handler copies key/value during callback; verifies the values match
-//         what the gateway sent (proves zero-copy path works correctly).
-//
-//   9.  ReconnectResumeScaffold
-//         After receiving records, position() holds the resume point.
-//
-// Gateway harness: reuses the CC-5/CC-6 shared-driver pattern.
-// Rules:
-//   - Bounded pumps (kPumpMax iterations, kPumpSleep between) — no busy-spin.
-//   - Unique temp dirs: getpid() + atomic counter.
-//   - Handler fires on the agent thread; all shared data accessed via atomics.
-//   - Keep all CB/CC tests green.
-//
-// Design note: the test gateway drives the fake broker logic:
-//   - ConnectRequest  → ConnectResponse{OK}
-//   - Subscribe       → SubscribeResponse{subscriptionId=<auto>}
-//                       then immediately push Records with the requested batch
-//   - Unsubscribe     → drop (no server-side ack needed)
-//
-// The gateway intercepts Subscribe messages and immediately pushes one or more
-// Records{subscriptionId} back.  This keeps the test self-contained.
-
+// C-F24 (2026-10-09): rebuilt on the Invoker runner + the single-threaded
+// InvokerGateway.  The test thread is the client's duty thread AND the fake
+// broker: no gateway thread, no sleeps, no atomics, no mutex.  Every wait is a
+// drive loop bounded by a deadline only a FAILING test reaches; an "absence"
+// check (no record after unsubscribe) runs a fixed number of full client +
+// gateway cycles after the frame that would carry the record was sent.
+#include "../support/InvokerGateway.h"
 #include "../support/TestCompletions.h"
-#include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
-#include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/subscriber/Subscription.h>
-#include <rune/client/codec/Codec.h>
-#include <rune/client/codec/DataCodec.h>
 
-#include <rune/protocol/PartitionHash.h>
 #include <rune/protocol/RecordBatch.h>
-
-#include <Aeron.h>
-#include <Subscription.h>
-#include <ExclusivePublication.h>
-#include <FragmentAssembler.h>
 
 #include <gtest/gtest.h>
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
-#include <functional>
-#include <memory>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <unistd.h>
 #include <vector>
 
-using namespace std::chrono_literals;
 using namespace rune::client;
-
-namespace rcc = rune::client::codec;
-namespace rcs = rune::client::session;
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-static constexpr int  kPumpMax   = 5'000;
-static constexpr auto kPumpSleep = 2ms;
-static constexpr auto kFutureTimeout = 10s;
-
-// ---------------------------------------------------------------------------
-// Unique temp directory helper
-// ---------------------------------------------------------------------------
 
 namespace {
 
-static std::atomic<int> g_dirCtr{0};
+int g_dirCtr = 0;  // the gtest main thread only
 
-std::string uniqueDir(const char* prefix = "cb4_test") {
-    const int c = g_dirCtr.fetch_add(1, std::memory_order_relaxed);
-    return std::string("/tmp/") + prefix + "_" +
-           std::to_string(static_cast<long>(::getpid())) + "_" +
-           std::to_string(c);
+std::string uniqueDir() {
+    return std::string("/tmp/cb4_test_") + std::to_string(static_cast<long>(::getpid())) + "_" +
+           std::to_string(g_dirCtr++);
 }
 
-} // anonymous namespace
-
-// ---------------------------------------------------------------------------
-// RecordData — a snapshot of a delivered Record (safe to store across callback)
-// ---------------------------------------------------------------------------
-
+/// A snapshot of a delivered Record (safe to keep after the callback).
 struct RecordData {
     int64_t              offset    = 0;
     int64_t              timestamp = 0;
@@ -129,1087 +63,370 @@ struct RecordData {
     std::vector<uint8_t> value;
 };
 
-// ---------------------------------------------------------------------------
-// Helper: build a RecordBatch with N identical records
-// ---------------------------------------------------------------------------
-
-static std::vector<uint8_t> buildBatch(int64_t baseOffset,
-                                        int64_t baseTimestamp,
-                                        std::string_view key,
-                                        std::string_view value,
-                                        int32_t          count = 1)
-{
+std::vector<uint8_t> buildBatch(int64_t baseOffset, int64_t baseTimestamp, std::string_view key,
+                                std::string_view value, int32_t count = 1) {
     rune::protocol::RecordBatchBuilder builder(baseOffset, baseTimestamp);
-    for (int i = 0; i < count; ++i) {
-        builder.append(key, value, baseTimestamp + i);
-    }
+    for (int i = 0; i < count; ++i) builder.append(key, value, baseTimestamp + i);
     return builder.build();
 }
 
-// ---------------------------------------------------------------------------
-// SubscribeGateway — fake broker that handles Connect/Subscribe/Unsubscribe
-//
-// Behaviour:
-//   - ConnectRequest  → ConnectResponse{OK, assignedSessionId=42}
-//   - Subscribe       → stores the subscribe, replies SubscribeResponse,
-//                       then immediately pushes any pre-queued Records.
-//   - pushRecords()   — caller queues a RecordBatch to be pushed on next Subscribe
-//                       OR immediately to a known subscriptionId.
-// ---------------------------------------------------------------------------
-
-struct SubscribeGateway {
-    struct SubscriptionRecord {
-        int64_t  subscriptionId;
-        int64_t  sessionId;
-        int64_t  correlationId;
-        int32_t  topicId;
-        int32_t  partition;
-        int64_t  fromOffset;
-    };
-
-    struct PendingPush {
-        int32_t  topicId;
-        int32_t  partition;
-        int64_t  baseOffset;
-        std::vector<uint8_t> batch;
-    };
-
-    std::atomic<int64_t> nextSubscriptionId{1};
-    std::atomic<int>     subscribesSeen{0};
-    std::atomic<int>     unsubscribesSeen{0};
-    // No-hang wave: when non-zero, the SubscribeResponse carries this error
-    // (subscriptionId 0, nothing registered) — as the broker answers an
-    // UnknownTopic / InvalidRequest Subscribe.
-    std::atomic<int16_t> subscribeErrorCode{0};
-
-    // Subscriptions active: subscriptionId → session/corr for egress routing.
-    std::mutex subsMtx_;
-    std::vector<SubscriptionRecord> activeSubs_;
-    // Phase 2b C: the wire routing inputs of the LAST Subscribe (subsMtx_).
-    uint8_t              lastPartitionKnown_ = 0xFF;
-    int32_t              lastWirePartition_  = -1;
-    std::vector<uint8_t> lastKey_;
-
-    // Pre-queued pushes: delivered when a Subscribe is received (or explicitly).
-    std::mutex pendingMtx_;
-    std::vector<PendingPush> pendingPushes_;
-
-    std::shared_ptr<aeron::Aeron>                gwAeron;
-    std::shared_ptr<aeron::Subscription>         gwSub;
-    std::shared_ptr<aeron::ExclusivePublication> gwPub;
-    std::unique_ptr<aeron::FragmentAssembler>    gwAsm;
-
-    uint8_t replyBuf[8192]{};
-
-    explicit SubscribeGateway(const std::string& aeronDir,
-                               int32_t ingressStream,
-                               int32_t egressStream)
-    {
-        aeron::Context ctx;
-        // Aeron's default handler ::exit(-1)s the test process when the client's
-        // embedded driver stops before this test-side client is closed.
-        ctx.errorHandler(test_support::countAeronError);
-        ctx.aeronDir(aeronDir);
-        gwAeron = aeron::Aeron::connect(ctx);
-        if (!gwAeron) throw std::runtime_error("SubscribeGateway: connect failed");
-
-        int64_t subId = gwAeron->addSubscription("aeron:ipc", ingressStream);
-        int64_t pubId = gwAeron->addExclusivePublication("aeron:ipc", egressStream);
-
-        const auto dl = std::chrono::steady_clock::now() + 5s;
-        while (std::chrono::steady_clock::now() < dl) {
-            if (!gwSub) gwSub = gwAeron->findSubscription(subId);
-            if (!gwPub) gwPub = gwAeron->findExclusivePublication(pubId);
-            if (gwSub && gwPub) break;
-            std::this_thread::sleep_for(kPumpSleep);
-        }
-        if (!gwSub || !gwPub)
-            throw std::runtime_error("SubscribeGateway: sub/pub timed out");
-
-        gwAsm = std::make_unique<aeron::FragmentAssembler>(
-            [this](aeron::concurrent::AtomicBuffer& buf,
-                   aeron::util::index_t off, aeron::util::index_t len,
-                   aeron::Header&) {
-                onFrame(reinterpret_cast<const uint8_t*>(buf.buffer() + off),
-                        static_cast<std::size_t>(len));
-            });
-    }
-
-    ~SubscribeGateway() {
-        gwAsm.reset(); gwPub.reset(); gwSub.reset(); gwAeron.reset();
-    }
-
-    int poll(int limit = 16) {
-        if (!gwSub || !gwAsm) return 0;
-        return gwSub->poll(gwAsm->handler(), limit);
-    }
-
-    bool send(const uint8_t* buf, std::size_t len) {
-        if (!gwPub) return false;
-        const auto ilen = static_cast<aeron::util::index_t>(len);
-        aeron::concurrent::AtomicBuffer ab(const_cast<uint8_t*>(buf), ilen);
-        for (int i = 0; i < 500; ++i) {
-            if (gwPub->offer(ab, 0, ilen) > 0) return true;
-            std::this_thread::sleep_for(1ms);
-        }
-        return false;
-    }
-
-    /// Queue a batch to be pushed when the next Subscribe is received,
-    /// or immediately if subsId >= 0 (push to existing subscription).
-    void queuePush(int32_t topicId, int32_t partition,
-                   int64_t baseOffset, std::vector<uint8_t> batch,
-                   int64_t subsId = -1)
-    {
-        if (subsId >= 0) {
-            // Immediate push to existing subscription.
-            sendRecords(subsId, topicId, partition, baseOffset, batch);
-        } else {
-            std::lock_guard<std::mutex> lk(pendingMtx_);
-            pendingPushes_.push_back({topicId, partition, baseOffset, std::move(batch)});
-        }
-    }
-
-    void sendRecords(int64_t subscriptionId,
-                     int32_t topicId, int32_t partition,
-                     int64_t baseOffset,
-                     const std::vector<uint8_t>& batch)
-    {
-        // Find a session/corr for this subscriptionId.
-        int64_t sessId = 42;
-        {
-            std::lock_guard<std::mutex> lk(subsMtx_);
-            for (const auto& s : activeSubs_) {
-                if (s.subscriptionId == subscriptionId) {
-                    sessId = s.sessionId;
-                    break;
-                }
-            }
-        }
-
-        const std::size_t n = rcc::encodeRecords(
-            replyBuf, sizeof(replyBuf),
-            subscriptionId,
-            topicId,
-            partition,
-            baseOffset,
-            std::span<const uint8_t>(batch.data(), batch.size()),
-            sessId,
-            /*correlationId=*/0); // push has no correlationId
-        if (n > 0) send(replyBuf, n);
-    }
-
-    void onFrame(const uint8_t* buf, std::size_t len) {
-        auto tidOpt = rcc::peekTemplate(buf, len);
-        if (!tidOpt) return;
-
-        const auto tid = static_cast<rcc::TemplateId>(*tidOpt);
-
-        // ---- ConnectRequest ----
-        if (tid == rcc::TemplateId::Connect) {
-            auto opt = rcc::decodeConnectRequest(buf, len);
-            if (!opt) return;
-            std::size_t n = rcc::encodeConnectResponse(
-                replyBuf, sizeof(replyBuf),
-                static_cast<int16_t>(rcc::ErrorCode::OK),
-                /*leaderMemberId=*/0,
-                /*assignedSessionId=*/42,
-                opt->sessionId,
-                opt->correlationId);
-            if (n > 0) send(replyBuf, n);
-            return;
-        }
-
-        // ---- Subscribe ----
-        if (tid == rcc::TemplateId::Subscribe) {
-            auto opt = rcc::decodeSubscribe(buf, len);
-            if (!opt) return;
-
-            subscribesSeen.fetch_add(1, std::memory_order_relaxed);
-            if (const int16_t ec = subscribeErrorCode.load(std::memory_order_relaxed); ec != 0) {
-                const std::size_t n = rcc::encodeSubscribeResponse(
-                    replyBuf, sizeof(replyBuf), ec, /*partition=*/-1, /*subscriptionId=*/0,
-                    opt->sessionId, opt->correlationId);
-                if (n > 0) send(replyBuf, n);
-                return;
-            }
-            const int64_t subId = nextSubscriptionId.fetch_add(1, std::memory_order_relaxed);
-
-            // Register subscription.
-            {
-                std::lock_guard<std::mutex> lk(subsMtx_);
-                activeSubs_.push_back({
-                    subId,
-                    opt->sessionId,
-                    opt->correlationId,
-                    opt->topicId,
-                    opt->partition,
-                    opt->fromOffset
-                });
-                lastPartitionKnown_ = opt->partitionKnown;
-                lastWirePartition_  = opt->partition;
-                lastKey_.assign(opt->key.begin(), opt->key.end());
-            }
-
-            // Send SubscribeResponse.
-            {
-                std::size_t n = rcc::encodeSubscribeResponse(
-                    replyBuf, sizeof(replyBuf),
-                    static_cast<int16_t>(rcc::ErrorCode::OK),
-                    opt->partition,
-                    subId,
-                    opt->sessionId,
-                    opt->correlationId);
-                if (n > 0) send(replyBuf, n);
-            }
-
-            // Deliver any pending pushes for this (topicId, partition).
-            std::vector<PendingPush> toDeliver;
-            {
-                std::lock_guard<std::mutex> lk(pendingMtx_);
-                for (auto it = pendingPushes_.begin(); it != pendingPushes_.end(); ) {
-                    if (it->topicId == opt->topicId && it->partition == opt->partition) {
-                        toDeliver.push_back(std::move(*it));
-                        it = pendingPushes_.erase(it);
-                    } else {
-                        ++it;
-                    }
-                }
-            }
-            for (auto& p : toDeliver) {
-                sendRecords(subId, p.topicId, p.partition, p.baseOffset, p.batch);
-            }
-            return;
-        }
-
-        // ---- Unsubscribe ----
-        if (tid == rcc::TemplateId::Unsubscribe) {
-            auto opt = rcc::decodeUnsubscribe(buf, len);
-            if (!opt) return;
-            unsubscribesSeen.fetch_add(1, std::memory_order_relaxed);
-            std::lock_guard<std::mutex> lk(subsMtx_);
-            activeSubs_.erase(
-                std::remove_if(activeSubs_.begin(), activeSubs_.end(),
-                    [&](const SubscriptionRecord& s) {
-                        return s.subscriptionId == opt->subscriptionId;
-                    }),
-                activeSubs_.end());
-            return;
-        }
-
-        // Other frames: ignore.
-    }
-
-    /// Return the subscriptionId assigned to the most recently processed Subscribe.
-    [[nodiscard]] int64_t lastSubscriptionId() const noexcept {
-        return nextSubscriptionId.load(std::memory_order_acquire) - 1;
-    }
-};
-
-// ---------------------------------------------------------------------------
-// SubscriberHarness — RAII wrapper: Client + SubscribeGateway + pump loop.
-// ---------------------------------------------------------------------------
-
-struct SubscriberHarness {
-    static constexpr int32_t kIngressStream = 3000;
-    static constexpr int32_t kEgressStream  = 3001;
-
-    std::string agentDir;
-    std::string aeronDir;
-
-    std::unique_ptr<Client>          client;
-    std::unique_ptr<SubscribeGateway> gw;
-
-    int32_t ingressStream;
-    int32_t egressStream;
-
-    explicit SubscriberHarness(int32_t inStr = kIngressStream,
-                                int32_t egStr = kEgressStream)
-        : ingressStream(inStr), egressStream(egStr)
-    {
-        agentDir = uniqueDir();
-        aeronDir = agentDir + "/aeron";
-    }
-
-    ~SubscriberHarness() {
-        if (gw)     { gw.reset(); }
-        if (client) { client->close(); }
-        try { std::filesystem::remove_all(agentDir); } catch (...) {}
-    }
-
-    void build() {
-        ClientConfig cfg;
-        cfg.gatewayChannel   = "aeron:ipc";
-        cfg.gatewayStreamId  = ingressStream;
-        cfg.egressChannel    = "aeron:ipc";
-        cfg.egressStreamId   = egressStream;
-        cfg.dataDir          = agentDir;
-        cfg.connectTimeoutMs = 5000;
-        cfg.pingTimeoutMs    = 5000;
-
-        client = std::make_unique<Client>(cfg);
-
-        // Wait for embedded driver to initialise.
-        std::this_thread::sleep_for(150ms);
-
-        gw = std::make_unique<SubscribeGateway>(aeronDir, ingressStream, egressStream);
-    }
-
-    int pollGw(int limit = 16) {
-        return gw ? gw->poll(limit) : 0;
-    }
-
-    template<typename Pred>
-    bool pumpUntil(Pred pred, int limit = kPumpMax) {
-        for (int i = 0; i < limit; ++i) {
-            if (gw) gw->poll(16);
-            if (pred()) return true;
-            std::this_thread::sleep_for(kPumpSleep);
-        }
-        return false;
-    }
-
-    /// Connect and wait until Connected.
-    bool connect() {
-        test_support::TestCq futCq(*client);
-        auto fut = futCq.issue([&](rune::client::Completions& q, rune::client::Token t) { return client->connect(q, t); });
-        return pumpUntil([&]() {
-            return client->state() == rcs::SessionState::Connected;
-        }) && (fut.ready());
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Convenience: build a single-record batch and return it as a vector.
-// ---------------------------------------------------------------------------
-
-static std::vector<uint8_t> oneBatch(int64_t offset,
-                                      const std::string& key,
-                                      const std::string& value)
-{
-    return buildBatch(offset, 1000000LL, key, value, 1);
+std::vector<uint8_t> oneBatch(int64_t offset, const std::string& key, const std::string& value) {
+    return buildBatch(offset, 1'000'000LL, key, value, 1);
 }
 
-// ===========================================================================
-// Test 1: SubscribeFromEarliest
-//
-// N records are queued in the gateway BEFORE the subscribe (Earliest semantic).
-// The gateway delivers them immediately after sending SubscribeResponse.
-// Assert: handler called N times, in order, with correct offset/key/value.
-// ===========================================================================
-TEST(Subscriber, SubscribeFromEarliest) {
-    SubscriberHarness h(3010, 3011);
-    h.build();
-    ASSERT_TRUE(h.connect()) << "Failed to connect";
+/// Client (Invoker runner: the test thread drives it) + the fake broker.
+struct SubscriberHarness {
+    std::string                  dir;
+    ClientConfig                 cfg;
+    Client                       client;
+    test_support::InvokerGateway gw;
 
-    static constexpr int N = 5;
-    static constexpr int32_t kTopic = 1;
-    static constexpr int32_t kPart  = 0;
-
-    // Queue N records BEFORE subscribe.
-    for (int i = 0; i < N; ++i) {
-        auto batch = oneBatch(/*offset=*/i, "k" + std::to_string(i), "v" + std::to_string(i));
-        h.gw->queuePush(kTopic, kPart, /*baseOffset=*/i, std::move(batch));
+    static ClientConfig makeCfg(const std::string& dir, int32_t in, int32_t eg) {
+        ClientConfig c;
+        c.gatewayChannel   = "aeron:ipc";
+        c.gatewayStreamId  = in;
+        c.egressChannel    = "aeron:ipc";
+        c.egressStreamId   = eg;
+        c.dataDir          = dir;
+        c.connectTimeoutMs = 5000;
+        c.pingTimeoutMs    = 5000;
+        c.runnerMode       = RunnerMode::Invoker;
+        return c;
     }
 
-    // Subscribe from Earliest.
-    std::vector<RecordData> received;
-    std::mutex              recMtx;
-    std::atomic<int>        recCount{0};
+    SubscriberHarness(int32_t in, int32_t eg)
+        : dir(uniqueDir()), cfg(makeCfg(dir, in, eg)), client(cfg),
+          gw(dir + "/aeron", cfg.gatewayChannel, cfg.gatewayStreamId, cfg.egressChannel, cfg.egressStreamId) {}
 
-    TopicHandle topic{kTopic, 1};
-    auto sub = h.client->subscribe(
-        topic,
-        /*partition=*/kPart,
-        SubscribeOptions{From::earliest()},
-        [&](const Record& r) {
+    ~SubscriberHarness() {
+        client.close();
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+
+    /// Drive client + gateway until pred holds; the 10 s deadline only ends a FAILING test.
+    template <class P>
+    bool drive(P&& pred) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            client.doWork();
+            gw.pump();
+            if (pred()) return true;
+        }
+        return false;
+    }
+    /// A fixed number of full client + gateway cycles (lets in-flight frames land).
+    void settle(int cycles = 2'000) {
+        for (int i = 0; i < cycles; ++i) {
+            client.doWork();
+            gw.pump();
+        }
+    }
+
+    test_support::TestCq cq{client};
+    void connect() {
+        ASSERT_TRUE(drive([&] { return gw.ready(); }));
+        auto f = cq.issue([&](Completions& q, Token t) { return client.connect(q, t); });
+        ASSERT_TRUE(drive([&] { return f.ready(); }));
+        ASSERT_TRUE(f.ok()) << f.describe();
+    }
+
+    /// The broker-side record of the n-th Subscribe (waits until it arrived).
+    const test_support::InvokerGateway::Subscribed& subscribed(std::size_t n) {
+        EXPECT_TRUE(drive([&] { return gw.subscribed.size() > n; })) << "Subscribe #" << n << " never arrived";
+        return gw.subscribed.at(n);
+    }
+};
+
+/// Records collected by a handler (it runs on this thread: the Invoker owner).
+struct Collector {
+    std::vector<RecordData> got;
+    RecordHandler handler() {
+        return [this](const Record& r) {
             RecordData rd;
             rd.offset    = r.offset;
             rd.timestamp = r.timestamp;
             rd.key.assign(r.key.begin(), r.key.end());
             rd.value.assign(r.value.begin(), r.value.end());
-            {
-                std::lock_guard<std::mutex> lk(recMtx);
-                received.push_back(rd);
-            }
-            recCount.fetch_add(1, std::memory_order_release);
-        });
+            got.push_back(std::move(rd));
+        };
+    }
+    [[nodiscard]] int count() const { return static_cast<int>(got.size()); }
+};
 
-    // Pump until N records arrive.
-    ASSERT_TRUE(h.pumpUntil([&]() {
-        return recCount.load(std::memory_order_acquire) >= N;
-    })) << "Expected " << N << " records from Earliest";
+std::string str(const std::vector<uint8_t>& v) { return std::string(v.begin(), v.end()); }
 
-    std::lock_guard<std::mutex> lk(recMtx);
-    ASSERT_EQ(static_cast<int>(received.size()), N);
+constexpr int64_t kWireEarliest = -2;
+constexpr int64_t kWireLatest   = -1;
 
-    // In-order check.
+} // namespace
+
+// ===========================================================================
+// 1. SubscribeFromEarliest — the broker pushes N single-record batches right
+// after the Subscribe; all arrive in order with the right offset / value.
+// ===========================================================================
+TEST(Subscriber, SubscribeFromEarliest) {
+    SubscriberHarness h(3010, 3011);
+    h.connect();
+    constexpr int N = 5;
+    Collector c;
+    auto sub = h.client.subscribe(TopicHandle{1, 1}, 0, SubscribeOptions{From::earliest()}, c.handler());
+    const auto s = h.subscribed(0);
+    EXPECT_EQ(s.fromOffset, kWireEarliest);
+    for (int i = 0; i < N; ++i) h.gw.pushBatch(s, i, oneBatch(i, "k" + std::to_string(i), "v" + std::to_string(i)));
+
+    ASSERT_TRUE(h.drive([&] { return c.count() >= N; })) << "expected " << N << " records from Earliest";
+    ASSERT_EQ(c.count(), N);
     for (int i = 0; i < N; ++i) {
-        EXPECT_EQ(received[i].offset, static_cast<int64_t>(i))
-            << "Wrong offset at position " << i;
-        const std::string expectedVal = "v" + std::to_string(i);
-        EXPECT_EQ(std::string(received[i].value.begin(), received[i].value.end()),
-                  expectedVal)
-            << "Wrong value at position " << i;
+        EXPECT_EQ(c.got[i].offset, i) << "wrong offset at " << i;
+        EXPECT_EQ(str(c.got[i].key), "k" + std::to_string(i));
+        EXPECT_EQ(str(c.got[i].value), "v" + std::to_string(i)) << "wrong value at " << i;
     }
 }
 
 // ===========================================================================
-// Test 2: SubscribeFromLatest
-//
-// Subscribe with Latest; gateway then pushes records.
-// Only records pushed AFTER subscribe arrive (none from before).
+// 2. SubscribeFromLatest — records pushed after the bind arrive.
 // ===========================================================================
 TEST(Subscriber, SubscribeFromLatest) {
     SubscriberHarness h(3020, 3021);
-    h.build();
-    ASSERT_TRUE(h.connect()) << "Failed to connect";
+    h.connect();
+    Collector c;
+    auto sub = h.client.subscribe(TopicHandle{2, 1}, 0, SubscribeOptions{From::latest()}, c.handler());
+    ASSERT_TRUE(h.drive([&] { return sub.subscriptionId() > 0; })) << "SubscribeResponse not received";
+    const auto s = h.subscribed(0);
+    EXPECT_EQ(s.fromOffset, kWireLatest);
+    constexpr int M = 3;
+    for (int i = 0; i < M; ++i) h.gw.pushBatch(s, 100 + i, oneBatch(100 + i, "k", "post" + std::to_string(i)));
 
-    static constexpr int32_t kTopic = 2;
-    static constexpr int32_t kPart  = 0;
-
-    std::atomic<int> recCount{0};
-    std::vector<RecordData> received;
-    std::mutex recMtx;
-
-    // Subscribe with Latest — no pre-queued records.
-    TopicHandle topic{kTopic, 1};
-    auto sub = h.client->subscribe(
-        topic,
-        /*partition=*/kPart,
-        SubscribeOptions{From::latest()},
-        [&](const Record& r) {
-            RecordData rd;
-            rd.offset = r.offset;
-            rd.value.assign(r.value.begin(), r.value.end());
-            {
-                std::lock_guard<std::mutex> lk(recMtx);
-                received.push_back(rd);
-            }
-            recCount.fetch_add(1, std::memory_order_release);
-        });
-
-    // Wait for the subscribe to be acknowledged (subscriptionId is bound).
-    ASSERT_TRUE(h.pumpUntil([&]() {
-        return sub.subscriptionId() > 0;
-    })) << "SubscribeResponse not received";
-
-    // Now push records AFTER subscribe.
-    const int64_t subId = sub.subscriptionId();
-    static constexpr int M = 3;
+    ASSERT_TRUE(h.drive([&] { return c.count() >= M; })) << "expected " << M << " post-subscribe records";
+    ASSERT_EQ(c.count(), M);
     for (int i = 0; i < M; ++i) {
-        auto batch = oneBatch(100 + i, "k", "post" + std::to_string(i));
-        h.gw->queuePush(kTopic, kPart, 100 + i, std::move(batch), subId);
-    }
-
-    // Pump until M records arrive.
-    ASSERT_TRUE(h.pumpUntil([&]() {
-        return recCount.load(std::memory_order_acquire) >= M;
-    })) << "Expected " << M << " post-subscribe records";
-
-    std::lock_guard<std::mutex> lk(recMtx);
-    ASSERT_EQ(static_cast<int>(received.size()), M);
-
-    // Verify records are at offset 100..102.
-    for (int i = 0; i < M; ++i) {
-        EXPECT_EQ(received[i].offset, 100 + i)
-            << "Wrong offset at position " << i;
-        const std::string expected = "post" + std::to_string(i);
-        EXPECT_EQ(std::string(received[i].value.begin(), received[i].value.end()), expected);
+        EXPECT_EQ(c.got[i].offset, 100 + i);
+        EXPECT_EQ(str(c.got[i].value), "post" + std::to_string(i));
     }
 }
 
 // ===========================================================================
-// Test 3: SubscribeFromOffset
-//
-// Subscribe with From::offset(k); gateway pre-queues a batch starting before k.
-// Delivery must start at or after k (whole-batch semantics).
+// 3. SubscribeFromOffset — the Subscribe carries k; a batch starting at k is
+// delivered from k, in order.
 // ===========================================================================
 TEST(Subscriber, SubscribeFromOffset) {
     SubscriberHarness h(3030, 3031);
-    h.build();
-    ASSERT_TRUE(h.connect()) << "Failed to connect";
+    h.connect();
+    constexpr int64_t kResumeAt = 5;
+    Collector c;
+    auto sub = h.client.subscribe(TopicHandle{3, 1}, 0, SubscribeOptions{From::offset(kResumeAt)}, c.handler());
+    const auto s = h.subscribed(0);
+    EXPECT_EQ(s.fromOffset, kResumeAt);
+    h.gw.pushBatch(s, kResumeAt, buildBatch(kResumeAt, 2'000'000LL, "k", "v", 10));
 
-    static constexpr int32_t kTopic   = 3;
-    static constexpr int32_t kPart    = 0;
-    static constexpr int64_t kResumeAt = 5;
-
-    // Queue a batch of 10 records starting at offset 5 (simulating Offset(5) from broker).
-    auto batch = buildBatch(kResumeAt, 2000000LL, "k", "v", 10);
-    h.gw->queuePush(kTopic, kPart, kResumeAt, std::move(batch));
-
-    std::atomic<int>         recCount{0};
-    std::atomic<int64_t>     firstOffset{-1};
-    std::mutex               recMtx;
-    std::vector<RecordData>  received;
-
-    TopicHandle topic{kTopic, 1};
-    auto sub = h.client->subscribe(
-        topic,
-        /*partition=*/kPart,
-        SubscribeOptions{From::offset(kResumeAt)},
-        [&](const Record& r) {
-            if (firstOffset.load(std::memory_order_acquire) < 0) {
-                firstOffset.store(r.offset, std::memory_order_release);
-            }
-            RecordData rd;
-            rd.offset = r.offset;
-            rd.value.assign(r.value.begin(), r.value.end());
-            {
-                std::lock_guard<std::mutex> lk(recMtx);
-                received.push_back(rd);
-            }
-            recCount.fetch_add(1, std::memory_order_release);
-        });
-
-    ASSERT_TRUE(h.pumpUntil([&]() {
-        return recCount.load(std::memory_order_acquire) >= 10;
-    })) << "Expected 10 records from Offset(5)";
-
-    // The batch starts at baseOffset == kResumeAt, so first record must be >= kResumeAt.
-    EXPECT_GE(firstOffset.load(), kResumeAt)
-        << "First delivered offset must be >= kResumeAt";
-
-    // Verify in-order (offsets 5, 6, ..., 14).
-    std::lock_guard<std::mutex> lk(recMtx);
-    for (int i = 0; i < 10; ++i) {
-        EXPECT_EQ(received[i].offset, kResumeAt + i);
-    }
+    ASSERT_TRUE(h.drive([&] { return c.count() >= 10; })) << "expected 10 records from Offset(5)";
+    for (int i = 0; i < 10; ++i) EXPECT_EQ(c.got[i].offset, kResumeAt + i);
 }
 
 // ===========================================================================
-// Test 4: OffsetTracking
-//
-// After records are delivered, position() reflects last delivered + 1.
+// 4. OffsetTracking — position() == last delivered offset + 1.
 // ===========================================================================
 TEST(Subscriber, OffsetTracking) {
     SubscriberHarness h(3040, 3041);
-    h.build();
-    ASSERT_TRUE(h.connect()) << "Failed to connect";
+    h.connect();
+    constexpr int N = 7;
+    Collector c;
+    auto sub = h.client.subscribe(TopicHandle{4, 1}, 0, SubscribeOptions{From::earliest()}, c.handler());
+    const auto s = h.subscribed(0);
+    for (int i = 0; i < N; ++i) h.gw.pushBatch(s, i, oneBatch(i, "k", "v"));
 
-    static constexpr int32_t kTopic = 4;
-    static constexpr int32_t kPart  = 0;
-    static constexpr int      N     = 7;
-
-    // Queue N records.
-    for (int i = 0; i < N; ++i) {
-        auto batch = oneBatch(i, "k", "v");
-        h.gw->queuePush(kTopic, kPart, i, std::move(batch));
-    }
-
-    std::atomic<int> recCount{0};
-
-    TopicHandle topic{kTopic, 1};
-    auto sub = h.client->subscribe(
-        topic,
-        /*partition=*/kPart,
-        SubscribeOptions{From::earliest()},
-        [&](const Record& /*r*/) {
-            recCount.fetch_add(1, std::memory_order_release);
-        });
-
-    ASSERT_TRUE(h.pumpUntil([&]() {
-        return recCount.load(std::memory_order_acquire) >= N;
-    })) << "Expected " << N << " records";
-
-    // position() == last offset + 1 == N-1 + 1 == N.
-    // Wait a bit to let the final store propagate.
-    std::this_thread::sleep_for(10ms);
-    EXPECT_EQ(sub.position(), static_cast<int64_t>(N))
-        << "position() must equal last offset + 1 after " << N << " records";
+    ASSERT_TRUE(h.drive([&] { return c.count() >= N; }));
+    // Read on the duty thread (this one): the duty side's own value, no lag.
+    EXPECT_EQ(sub.position(), static_cast<int64_t>(N));
 }
 
 // ===========================================================================
-// Test 5: UnsubscribeStopsDelivery
-//
-// Produce N records, receive them, unsubscribe, produce M more.
-// Handler must NOT be called for the M post-unsubscribe records.
+// 5. UnsubscribeStopsDelivery — after unsubscribe() the handler never fires,
+// even for records the broker still pushes to the old subscription.
 // ===========================================================================
 TEST(Subscriber, UnsubscribeStopsDelivery) {
     SubscriberHarness h(3050, 3051);
-    h.build();
-    ASSERT_TRUE(h.connect()) << "Failed to connect";
+    h.connect();
+    constexpr int N = 3;
+    Collector c;
+    auto sub = h.client.subscribe(TopicHandle{5, 1}, 0, SubscribeOptions{From::earliest()}, c.handler());
+    const auto s = h.subscribed(0);
+    for (int i = 0; i < N; ++i) h.gw.pushBatch(s, i, oneBatch(i, "k", "v"));
+    ASSERT_TRUE(h.drive([&] { return c.count() >= N; }));
 
-    static constexpr int32_t kTopic = 5;
-    static constexpr int32_t kPart  = 0;
-    static constexpr int      N     = 3;  // pre-unsubscribe records
-
-    // Queue N pre-unsubscribe records.
-    for (int i = 0; i < N; ++i) {
-        auto batch = oneBatch(i, "k", "v");
-        h.gw->queuePush(kTopic, kPart, i, std::move(batch));
-    }
-
-    std::atomic<int> recCount{0};
-
-    TopicHandle topic{kTopic, 1};
-    auto sub = h.client->subscribe(
-        topic,
-        /*partition=*/kPart,
-        SubscribeOptions{From::earliest()},
-        [&](const Record& /*r*/) {
-            recCount.fetch_add(1, std::memory_order_release);
-        });
-
-    // Receive the N pre-unsubscribe records.
-    ASSERT_TRUE(h.pumpUntil([&]() {
-        return recCount.load(std::memory_order_acquire) >= N;
-    })) << "Expected " << N << " pre-unsubscribe records";
-
-    // Unsubscribe.
     sub.unsubscribe();
-    EXPECT_FALSE(sub.active()) << "After unsubscribe, active() must be false";
+    EXPECT_FALSE(sub.active()) << "after unsubscribe(), active() must be false";
+    ASSERT_TRUE(h.drive([&] { return !h.gw.unsubscribed.empty(); })) << "no Unsubscribe reached the broker";
+    EXPECT_EQ(h.gw.unsubscribed[0], s.subscriptionId);
 
-    // Brief pause to let the Unsubscribe frame be processed.
-    std::this_thread::sleep_for(50ms);
-    h.pumpUntil([&]() { return false; }, 50); // drain a bit
-
-    const int countAfterUnsub = recCount.load(std::memory_order_acquire);
-
-    // Push M more records — they must NOT arrive at the handler.
-    static constexpr int M = 3;
-    for (int i = 0; i < M; ++i) {
-        auto batch = oneBatch(N + i, "k", "extra");
-        // We don't know if the gateway still has an active entry, so queue
-        // to the subscription id if known (may be 0 if already removed).
-        h.gw->queuePush(kTopic, kPart, N + i, std::move(batch));
-    }
-
-    // Poll for a bit and verify no extra records arrive.
-    h.pumpUntil([&]() { return false; }, 200);
-    std::this_thread::sleep_for(50ms);
-
-    EXPECT_EQ(recCount.load(std::memory_order_acquire), countAfterUnsub)
-        << "Handler must not be called after unsubscribe()";
+    for (int i = 0; i < 3; ++i) h.gw.pushBatch(s, N + i, oneBatch(N + i, "k", "extra"));
+    h.settle();
+    EXPECT_EQ(c.count(), N) << "handler called after unsubscribe()";
 }
 
 // ===========================================================================
-// Test 6: RaiiDtorUnsubscribes
-//
-// Subscription goes out of scope; produce after scope exit; no handler call.
+// 6. RaiiDtorUnsubscribes — the handle's destructor unsubscribes.
 // ===========================================================================
 TEST(Subscriber, RaiiDtorUnsubscribes) {
     SubscriberHarness h(3060, 3061);
-    h.build();
-    ASSERT_TRUE(h.connect()) << "Failed to connect";
-
-    static constexpr int32_t kTopic = 6;
-    static constexpr int32_t kPart  = 0;
-
-    std::atomic<int> recCount{0};
-    int64_t          subsId = 0;
-
+    h.connect();
+    Collector c;
+    int64_t subsId = 0;
     {
-        TopicHandle topic{kTopic, 1};
-        auto sub = h.client->subscribe(
-            topic,
-            /*partition=*/kPart,
-            SubscribeOptions{From::latest()},
-            [&](const Record& /*r*/) {
-                recCount.fetch_add(1, std::memory_order_release);
-            });
-
-        // Wait for SubscribeResponse so we know the subscriptionId.
-        ASSERT_TRUE(h.pumpUntil([&]() {
-            return sub.subscriptionId() > 0;
-        })) << "SubscribeResponse not received before scope exit";
-
+        auto sub = h.client.subscribe(TopicHandle{6, 1}, 0, SubscribeOptions{From::latest()}, c.handler());
+        ASSERT_TRUE(h.drive([&] { return sub.subscriptionId() > 0; })) << "SubscribeResponse not received";
         subsId = sub.subscriptionId();
-        // sub goes out of scope here → dtor → unsubscribe()
-    }
+    }  // dtor -> unsubscribe
+    ASSERT_TRUE(h.drive([&] { return !h.gw.unsubscribed.empty(); })) << "the destructor sent no Unsubscribe";
+    EXPECT_EQ(h.gw.unsubscribed[0], subsId);
 
-    // Let Unsubscribe frame propagate.
-    h.pumpUntil([&]() { return false; }, 100);
-    std::this_thread::sleep_for(50ms);
-
-    const int beforeExtra = recCount.load(std::memory_order_acquire);
-
-    // Push a record to the old subscriptionId.
-    if (subsId > 0) {
-        auto batch = oneBatch(0, "k", "after-dtor");
-        h.gw->queuePush(kTopic, kPart, 0, std::move(batch), subsId);
-    }
-
-    // Poll and verify no records arrive.
-    h.pumpUntil([&]() { return false; }, 200);
-    std::this_thread::sleep_for(50ms);
-
-    EXPECT_EQ(recCount.load(std::memory_order_acquire), beforeExtra)
-        << "Handler must not fire after RAII dtor unsubscribed";
+    h.gw.pushBatch(h.gw.subscribed.at(0), 0, oneBatch(0, "k", "after-dtor"));
+    h.settle();
+    EXPECT_EQ(c.count(), 0) << "handler fired after the destructor unsubscribed";
 }
 
 // ===========================================================================
-// Test 7: TwoSubscriptionsNoCrosstalk
-//
-// Two subscriptions on different partitions; each handler gets only its own
-// records (no cross-talk).
+// 7. TwoSubscriptionsNoCrosstalk — each handler gets only its own partition.
 // ===========================================================================
 TEST(Subscriber, TwoSubscriptionsNoCrosstalk) {
     SubscriberHarness h(3070, 3071);
-    h.build();
-    ASSERT_TRUE(h.connect()) << "Failed to connect";
-
-    static constexpr int32_t kTopic  = 7;
-    static constexpr int32_t kPartA  = 0;
-    static constexpr int32_t kPartB  = 1;
-    static constexpr int      N      = 4;
-
-    // Queue N records for partition A and N for partition B.
+    h.connect();
+    constexpr int N = 4;
+    const TopicHandle topic{7, 2};
+    Collector a, b;
+    auto subA = h.client.subscribe(topic, 0, SubscribeOptions{From::earliest()}, a.handler());
+    auto subB = h.client.subscribe(topic, 1, SubscribeOptions{From::earliest()}, b.handler());
+    const auto s0 = h.subscribed(0);
+    const auto s1 = h.subscribed(1);
+    const auto& sA = s0.partition == 0 ? s0 : s1;
+    const auto& sB = s0.partition == 0 ? s1 : s0;
+    ASSERT_EQ(sA.partition, 0);
+    ASSERT_EQ(sB.partition, 1);
     for (int i = 0; i < N; ++i) {
-        h.gw->queuePush(kTopic, kPartA, i, oneBatch(i, "kA", "A" + std::to_string(i)));
-        h.gw->queuePush(kTopic, kPartB, i, oneBatch(i, "kB", "B" + std::to_string(i)));
+        h.gw.pushBatch(sA, i, oneBatch(i, "kA", "A" + std::to_string(i)));
+        h.gw.pushBatch(sB, i, oneBatch(i, "kB", "B" + std::to_string(i)));
     }
 
-    std::atomic<int> recA{0}, recB{0};
-    std::atomic<bool> crossTalkA{false}, crossTalkB{false};
-
-    TopicHandle topic{kTopic, 2}; // 2 partitions
-
-    auto subA = h.client->subscribe(
-        topic, kPartA, SubscribeOptions{From::earliest()},
-        [&](const Record& r) {
-            // Any "B" value in A's handler is cross-talk.
-            if (!r.value.empty() && r.value[0] == 'B') {
-                crossTalkA.store(true, std::memory_order_relaxed);
-            }
-            recA.fetch_add(1, std::memory_order_release);
-        });
-
-    auto subB = h.client->subscribe(
-        topic, kPartB, SubscribeOptions{From::earliest()},
-        [&](const Record& r) {
-            if (!r.value.empty() && r.value[0] == 'A') {
-                crossTalkB.store(true, std::memory_order_relaxed);
-            }
-            recB.fetch_add(1, std::memory_order_release);
-        });
-
-    ASSERT_TRUE(h.pumpUntil([&]() {
-        return recA.load(std::memory_order_acquire) >= N &&
-               recB.load(std::memory_order_acquire) >= N;
-    })) << "Expected " << N << " records on each subscription";
-
-    EXPECT_FALSE(crossTalkA.load()) << "Partition A handler received partition B records";
-    EXPECT_FALSE(crossTalkB.load()) << "Partition B handler received partition A records";
-
-    EXPECT_GE(recA.load(), N);
-    EXPECT_GE(recB.load(), N);
+    ASSERT_TRUE(h.drive([&] { return a.count() >= N && b.count() >= N; }))
+        << "expected " << N << " records on each subscription";
+    h.settle(200);
+    EXPECT_EQ(a.count(), N);
+    EXPECT_EQ(b.count(), N);
+    for (const auto& r : a.got) EXPECT_EQ(r.value.at(0), 'A') << "partition A handler got partition B records";
+    for (const auto& r : b.got) EXPECT_EQ(r.value.at(0), 'B') << "partition B handler got partition A records";
 }
 
 // ===========================================================================
-// Test 8: ZeroCopyHandlerValidity
-//
-// Handler copies key/value during callback; verifies binary-safe copy.
-// The key and value contain NUL bytes and 0xFF — proves binary safety.
+// 8. ZeroCopyHandlerValidity — binary key / value (NUL, 0xFF) copied inside
+// the callback match what the broker sent.
 // ===========================================================================
 TEST(Subscriber, ZeroCopyHandlerValidity) {
     SubscriberHarness h(3080, 3081);
-    h.build();
-    ASSERT_TRUE(h.connect()) << "Failed to connect";
+    h.connect();
+    const std::string binaryKey = {'\x00', '\xFF', '\xAB'};
+    const std::string binaryVal = {'\x00', '\x01', '\xFF', '\x00'};
+    Collector c;
+    auto sub = h.client.subscribe(TopicHandle{8, 1}, 0, SubscribeOptions{From::earliest()}, c.handler());
+    h.gw.pushBatch(h.subscribed(0), 0, buildBatch(0, 3'000'000LL, binaryKey, binaryVal, 1));
 
-    static constexpr int32_t kTopic = 8;
-    static constexpr int32_t kPart  = 0;
-
-    // Build a batch with binary key and value.
-    const std::string binaryKey  = {'\x00', '\xFF', '\xAB'};
-    const std::string binaryVal  = {'\x00', '\x01', '\xFF', '\x00'};
-    auto batch = buildBatch(0, 3000000LL, binaryKey, binaryVal, 1);
-    h.gw->queuePush(kTopic, kPart, 0, std::move(batch));
-
-    std::atomic<int> recCount{0};
-    std::vector<uint8_t> copiedKey, copiedVal;
-    std::mutex copyMtx;
-
-    TopicHandle topic{kTopic, 1};
-    auto sub = h.client->subscribe(
-        topic, kPart, SubscribeOptions{From::earliest()},
-        [&](const Record& r) {
-            // Copy during callback (zero-copy spans only valid here).
-            std::lock_guard<std::mutex> lk(copyMtx);
-            copiedKey.assign(r.key.begin(), r.key.end());
-            copiedVal.assign(r.value.begin(), r.value.end());
-            recCount.fetch_add(1, std::memory_order_release);
-        });
-
-    ASSERT_TRUE(h.pumpUntil([&]() {
-        return recCount.load(std::memory_order_acquire) >= 1;
-    })) << "Expected 1 record";
-
-    std::lock_guard<std::mutex> lk(copyMtx);
-
-    // Verify binary key.
-    ASSERT_EQ(copiedKey.size(), 3u);
-    EXPECT_EQ(copiedKey[0], 0x00u);
-    EXPECT_EQ(copiedKey[1], 0xFFu);
-    EXPECT_EQ(copiedKey[2], 0xABu);
-
-    // Verify binary value.
-    ASSERT_EQ(copiedVal.size(), 4u);
-    EXPECT_EQ(copiedVal[0], 0x00u);
-    EXPECT_EQ(copiedVal[1], 0x01u);
-    EXPECT_EQ(copiedVal[2], 0xFFu);
-    EXPECT_EQ(copiedVal[3], 0x00u);
+    ASSERT_TRUE(h.drive([&] { return c.count() >= 1; })) << "expected 1 record";
+    EXPECT_EQ(c.got[0].key, (std::vector<uint8_t>{0x00, 0xFF, 0xAB}));
+    EXPECT_EQ(c.got[0].value, (std::vector<uint8_t>{0x00, 0x01, 0xFF, 0x00}));
 }
 
 // ===========================================================================
-// Test 9: ReconnectResumeScaffold
-//
-// After receiving records, position() == lastOffset + 1.
-// This value is the resume point for CB-5 reconnect-resume.
+// 9. ReconnectResumeScaffold — position() == kBase + N (the resume point).
 // ===========================================================================
 TEST(Subscriber, ReconnectResumeScaffold) {
     SubscriberHarness h(3090, 3091);
-    h.build();
-    ASSERT_TRUE(h.connect()) << "Failed to connect";
+    h.connect();
+    constexpr int64_t kBase = 42;
+    constexpr int     N     = 5;
+    Collector c;
+    auto sub = h.client.subscribe(TopicHandle{9, 1}, 0, SubscribeOptions{From::earliest()}, c.handler());
+    h.gw.pushBatch(h.subscribed(0), kBase, buildBatch(kBase, 4'000'000LL, "k", "v", N));
 
-    static constexpr int32_t kTopic = 9;
-    static constexpr int32_t kPart  = 0;
-    static constexpr int64_t kBase  = 42;
-    static constexpr int      N     = 5;
-
-    auto batch = buildBatch(kBase, 4000000LL, "k", "v", N);
-    h.gw->queuePush(kTopic, kPart, kBase, std::move(batch));
-
-    std::atomic<int> recCount{0};
-
-    TopicHandle topic{kTopic, 1};
-    auto sub = h.client->subscribe(
-        topic, kPart, SubscribeOptions{From::earliest()},
-        [&](const Record& /*r*/) {
-            recCount.fetch_add(1, std::memory_order_release);
-        });
-
-    ASSERT_TRUE(h.pumpUntil([&]() {
-        return recCount.load(std::memory_order_acquire) >= N;
-    })) << "Expected " << N << " records";
-
-    // Wait briefly for the final store.
-    std::this_thread::sleep_for(10ms);
-
-    // Expected position: last delivered offset = kBase + N - 1, position = kBase + N.
-    const int64_t expectedPosition = kBase + N;
-    EXPECT_EQ(sub.position(), expectedPosition)
-        << "position() must be kBase + N = " << expectedPosition;
-
-    // CB-5 scaffold: the resume offset would be sub.position().
-    // (Full reconnect-resume is implemented in CB-5.)
-    EXPECT_GT(sub.position(), 0LL)
-        << "position() > 0 after delivery (resume point is set)";
+    ASSERT_TRUE(h.drive([&] { return c.count() >= N; }));
+    EXPECT_EQ(sub.position(), kBase + N) << "position() must be kBase + N";
 }
 
 // ===========================================================================
-// Test 10: MultiRecordBatchInOrder
-//
-// A single batch with multiple records is decoded in offset order.
-// Verifies RecordBatchReader iterates correctly.
+// 10. MultiRecordBatchInOrder — one batch of N records decodes in offset order.
 // ===========================================================================
 TEST(Subscriber, MultiRecordBatchInOrder) {
     SubscriberHarness h(3100, 3101);
-    h.build();
-    ASSERT_TRUE(h.connect()) << "Failed to connect";
+    h.connect();
+    constexpr int N = 8;
+    rune::protocol::RecordBatchBuilder builder(0, 5'000'000LL);
+    for (int i = 0; i < N; ++i) builder.append("", "record" + std::to_string(i), 5'000'000LL + i);
+    Collector c;
+    auto sub = h.client.subscribe(TopicHandle{10, 1}, 0, SubscribeOptions{From::earliest()}, c.handler());
+    h.gw.pushBatch(h.subscribed(0), 0, builder.build());
 
-    static constexpr int32_t kTopic = 10;
-    static constexpr int32_t kPart  = 0;
-    static constexpr int      N     = 8;
-    static constexpr int64_t kBase  = 0;
-
-    // Build a single batch with N records, distinct values.
-    rune::protocol::RecordBatchBuilder builder(kBase, 5000000LL);
+    ASSERT_TRUE(h.drive([&] { return c.count() >= N; })) << "expected " << N << " records";
+    ASSERT_EQ(c.count(), N);
     for (int i = 0; i < N; ++i) {
-        builder.append("", "record" + std::to_string(i), 5000000LL + i);
-    }
-    h.gw->queuePush(kTopic, kPart, kBase, builder.build());
-
-    std::vector<RecordData> received;
-    std::mutex recMtx;
-    std::atomic<int> recCount{0};
-
-    TopicHandle topic{kTopic, 1};
-    auto sub = h.client->subscribe(
-        topic, kPart, SubscribeOptions{From::earliest()},
-        [&](const Record& r) {
-            RecordData rd;
-            rd.offset = r.offset;
-            rd.value.assign(r.value.begin(), r.value.end());
-            {
-                std::lock_guard<std::mutex> lk(recMtx);
-                received.push_back(rd);
-            }
-            recCount.fetch_add(1, std::memory_order_release);
-        });
-
-    ASSERT_TRUE(h.pumpUntil([&]() {
-        return recCount.load(std::memory_order_acquire) >= N;
-    })) << "Expected " << N << " records from multi-record batch";
-
-    std::lock_guard<std::mutex> lk(recMtx);
-    ASSERT_EQ(static_cast<int>(received.size()), N);
-    for (int i = 0; i < N; ++i) {
-        EXPECT_EQ(received[i].offset, kBase + i)
-            << "Record " << i << " has wrong offset";
-        const std::string expected = "record" + std::to_string(i);
-        EXPECT_EQ(std::string(received[i].value.begin(), received[i].value.end()),
-                  expected)
-            << "Record " << i << " has wrong value";
+        EXPECT_EQ(c.got[i].offset, i);
+        EXPECT_EQ(str(c.got[i].value), "record" + std::to_string(i));
     }
 }
 
 // ===========================================================================
-// CB-5 A2: UnsubscribeResponseRace
-//
-// Verifies that if unsubscribe() is called BEFORE the SubscribeResponse
-// arrives (the "late response" race), the SubscriberHub:
-//   1. Does NOT insert the impl into activeById_ (no zombie entry).
-//   2. Sends a proper Unsubscribe frame with the now-known subscriptionId.
-//   3. No records are delivered after the race.
-//
-// Mechanism:
-//   - The SubscribeGateway is configured with a delay before sending the
-//     SubscribeResponse.  The test calls unsubscribe() during that window.
-//   - After the delayed SubscribeResponse arrives, no entry must be in
-//     activeById_ (hub.activeCount() == 0) and unsubscribesSeen must be 1.
+// 11. CB-5 A2: UnsubscribeResponseRace — unsubscribe() BEFORE the broker even
+// saw the Subscribe (deterministic here: nothing ran in between).  The late
+// SubscribeResponse must not resurrect the subscription: the client sends an
+// Unsubscribe with the real subscriptionId and delivers nothing.
 // ===========================================================================
 TEST(Subscriber, UnsubscribeResponseRace) {
-    // Use streams that won't clash with other tests.
     SubscriberHarness h(3110, 3111);
-    h.build();
-    ASSERT_TRUE(h.connect()) << "Failed to connect";
-
-    static constexpr int32_t kTopic = 11;
-    static constexpr int32_t kPart  = 0;
-
-    std::atomic<int> recCount{0};
-
-    TopicHandle topic{kTopic, 1};
-
-    // Subscribe — the gateway will receive the Subscribe and HOLD the
-    // SubscribeResponse until we trigger it.
-    // We use the gateway's hold mechanism: set nextSubscriptionId very high
-    // and detect the subscribe via subscribesSeen.
-    // To simulate the delay, we prevent the gateway from processing the
-    // Subscribe before unsubscribe() runs by polling the gateway AFTER
-    // unsubscribe() is called.
-
-    // 1. Set up a subscription but don't poll the gateway yet.
-    auto sub = h.client->subscribe(
-        topic, kPart, SubscribeOptions{From::latest()},
-        [&](const Record& /*r*/) {
-            recCount.fetch_add(1, std::memory_order_release);
-        });
-
-    // 2. Immediately unsubscribe (before the gateway processes the Subscribe).
-    //    The hub sets active=false and sends Unsubscribe(id=0) [no-op on broker].
+    h.connect();
+    Collector c;
+    auto sub = h.client.subscribe(TopicHandle{11, 1}, 0, SubscribeOptions{From::latest()}, c.handler());
     sub.unsubscribe();
-    EXPECT_FALSE(sub.active()) << "Sub must be inactive after unsubscribe()";
+    EXPECT_FALSE(sub.active()) << "sub must be inactive after unsubscribe()";
+    EXPECT_TRUE(h.gw.subscribed.empty()) << "the race needs the Subscribe still unanswered";
 
-    // 3. NOW pump the gateway so it processes Subscribe AND sends SubscribeResponse.
-    //    The SubscribeResponse arrives on the client side while active=false.
-    //    The CB-5 A2 fix should:
-    //      a) NOT add to activeById_ (entry is dead).
-    //      b) Send a proper Unsubscribe with the real subscriptionId.
-    bool sawSubscribeResponse = false;
-    for (int i = 0; i < kPumpMax; ++i) {
-        if (h.gw) h.gw->poll(16);
-        // Pump the client runner via pumpUntil (it drives the background runner).
-        std::this_thread::sleep_for(kPumpSleep);
+    const auto s = h.subscribed(0);  // the broker answers it now: the late SubscribeResponse
+    ASSERT_TRUE(h.drive([&] { return !h.gw.unsubscribed.empty(); }))
+        << "the late SubscribeResponse sent no Unsubscribe (CB-5 A2)";
+    EXPECT_EQ(h.gw.unsubscribed[0], s.subscriptionId) << "the Unsubscribe must carry the real id";
 
-        // Check: if the gateway saw a subscribe, it will have sent a SubscribeResponse.
-        // We wait until the client runner processes the SubscribeResponse.
-        // The runner thread handles it asynchronously; after it does, the hub's
-        // activeCount should remain 0 (not added, then removed = 0).
-        if (h.gw && h.gw->subscribesSeen.load(std::memory_order_acquire) >= 1) {
-            // Give the response time to travel back to the client.
-            for (int j = 0; j < 100; ++j) {
-                if (h.gw) h.gw->poll(16);
-                std::this_thread::sleep_for(kPumpSleep);
-            }
-            sawSubscribeResponse = true;
-            break;
-        }
-    }
-
-    ASSERT_TRUE(sawSubscribeResponse) << "Gateway must process the Subscribe";
-
-    // After the SubscribeResponse is processed by the client, activeCount must be 0.
-    // The fix: onSubscribeResponse detects active=false, skips activeById_ insert,
-    // and sends a real Unsubscribe.
-    // Small extra delay to let the runner thread fully process the response.
-    std::this_thread::sleep_for(50ms);
-
-    // The client's subscriberHub should have activeCount==0 (no zombie entry).
-    // We can't directly access the hub, but we can verify:
-    // 1. No records are delivered (recCount == 0).
-    // 2. The gateway saw an Unsubscribe (with a valid subscriptionId > 0).
-    EXPECT_EQ(recCount.load(std::memory_order_acquire), 0)
-        << "No records must be delivered after early unsubscribe()";
-
-    // Push a record to the subscription — it must NOT arrive.
-    if (h.gw && h.gw->subscribesSeen.load() >= 1) {
-        const int64_t subId = h.gw->lastSubscriptionId();
-        if (subId > 0) {
-            auto batch = oneBatch(0, "k", "should-not-arrive");
-            h.gw->queuePush(kTopic, kPart, 0, std::move(batch), subId);
-        }
-    }
-
-    // Poll and verify no records arrive.
-    for (int i = 0; i < 200; ++i) {
-        if (h.gw) h.gw->poll(16);
-        std::this_thread::sleep_for(kPumpSleep);
-    }
-    std::this_thread::sleep_for(50ms);
-
-    EXPECT_EQ(recCount.load(std::memory_order_acquire), 0)
-        << "Handler must not fire after unsubscribe() even with late SubscribeResponse";
-
-    // Assert: the gateway saw an Unsubscribe (the CB-5 A2 fix sends one with
-    // the real subscriptionId after detecting active=false in onSubscribeResponse).
-    // Note: the Unsubscribe with id=0 from the original unsubscribe() is a no-op;
-    // the fix sends a second one with the real id. Total unsubscribes >= 1.
-    EXPECT_GE(h.gw->unsubscribesSeen.load(std::memory_order_acquire), 1)
-        << "At least one Unsubscribe must be sent (the late real-id one from A2 fix)";
+    h.gw.pushBatch(s, 0, oneBatch(0, "k", "should-not-arrive"));
+    h.settle();
+    EXPECT_EQ(c.count(), 0) << "handler fired after unsubscribe() with a late SubscribeResponse";
+    EXPECT_TRUE(sub.finished());
 }
 
 // ===========================================================================
 // Phase 2b Part C regression: subscribe(h8, Key{}) binds to the SAME partition
 // Producer::send(h8, Key{}) writes to.
 //
-// Producer::send routes client-side: key.partition(h.partitionCount)
-// (src/producer/Producer.cpp).  subscribe(TopicHandle, const Key&) sends
-// partitionKnown=0 + the key bytes and the BROKER resolves the partition via
-// TopicRegistry::partitionForKey -> rune::protocol::partitionForKey
-// (rune-broker libs/gateway/src/TopicRegistry.cpp).  This fixture is a fake
-// gateway (no TopicRegistry), so the broker step is applied here at the
-// gateway boundary with the very function the broker calls.  The first Task 5
-// cut special-cased the empty key in Key::partition only: produce -> 0,
-// broker-resolved subscribe -> fnv1a64("") % 8 = 5.
+// Producer::send routes client-side: key.partition(h.partitionCount).
+// subscribe(TopicHandle, const Key&) sends partitionKnown=0 + the key bytes and
+// the BROKER resolves the partition via TopicRegistry::partitionForKey ->
+// rune::protocol::partitionForKey.  This fixture is a fake gateway (no
+// TopicRegistry), so the broker step is applied here at the gateway boundary
+// with the very function the broker calls.  The first Task 5 cut special-cased
+// the empty key in Key::partition only: produce -> 0, broker-resolved
+// subscribe -> fnv1a64("") % 8 = 5.
 // ===========================================================================
 TEST(SubscriberKeyRoutingRegression, EmptyKeySubscribeBindsToProducerSendPartition) {
     SubscriberHarness h(3130, 3131);
-    h.build();
-    ASSERT_TRUE(h.connect()) << "Failed to connect";
+    h.connect();
 
     const TopicHandle h8{1, 8};
     const Key         empty{};
-    auto sub = h.client->subscribe(h8, empty, SubscribeOptions{From::earliest()},
-                                   [](const Record&) {});
-    ASSERT_TRUE(h.pumpUntil([&]() {
-        return h.gw->subscribesSeen.load(std::memory_order_acquire) >= 1;
-    })) << "Subscribe frame never reached the gateway";
+    Collector         c;
+    auto sub = h.client.subscribe(h8, empty, SubscribeOptions{From::earliest()}, c.handler());
+    const auto s = h.subscribed(0);
 
-    uint8_t              partitionKnown;
-    std::vector<uint8_t> wireKey;
-    {
-        std::lock_guard<std::mutex> lk(h.gw->subsMtx_);
-        partitionKnown = h.gw->lastPartitionKnown_;
-        wireKey        = h.gw->lastKey_;
-    }
-    ASSERT_EQ(partitionKnown, 0u) << "a keyed subscribe leaves partition resolution to the broker";
-    EXPECT_TRUE(wireKey.empty());
+    ASSERT_EQ(s.partitionKnown, 0u) << "a keyed subscribe leaves partition resolution to the broker";
+    EXPECT_TRUE(s.key.empty());
 
     // What the broker binds (TopicRegistry::partitionForKey's body) ...
     const int32_t brokerBound = rune::protocol::partitionForKey(
-        std::span<const uint8_t>(wireKey.data(), wireKey.size()), h8.partitionCount);
+        std::span<const uint8_t>(s.key.data(), s.key.size()), h8.partitionCount);
     // ... and what Producer::send(h8, Key{}) writes to.
     const int32_t producerWrites = empty.partition(h8.partitionCount);
     EXPECT_EQ(brokerBound, producerWrites);
@@ -1218,19 +435,20 @@ TEST(SubscriberKeyRoutingRegression, EmptyKeySubscribeBindsToProducerSendPartiti
 
 // No-hang wave: a SubscribeResponse carrying an error (InvalidRequest 39 for a
 // Subscribe the broker could not decode; UnknownTopic; UnknownPartition) binds
-// NOTHING broker-side.  The client used to bind it like an OK — subscriptionId 0,
+// NOTHING broker-side.  The client used to bind it like an OK - subscriptionId 0,
 // active forever, never delivering: a silent hang.  It must finish with
 // RejectedByBroker and the broker's code.
 TEST(SubscriberRegression, SubscribeErrorResponseFinishesTheSubscriptionRegression) {
+    namespace rcc = rune::client::codec;
     for (const auto code : {rcc::ErrorCode::InvalidRequest, rcc::ErrorCode::UnknownTopic}) {
         const int32_t base = code == rcc::ErrorCode::InvalidRequest ? 3190 : 3192;
         SubscriberHarness h(base, base + 1);
-        h.build();
-        ASSERT_TRUE(h.connect());
-        h.gw->subscribeErrorCode.store(static_cast<int16_t>(code));
-        auto sub = h.client->subscribe(TopicHandle{9, 1}, /*partition=*/0, SubscribeOptions{From::earliest()},
-                                       [](const Record&) {});
-        ASSERT_TRUE(h.pumpUntil([&] { return sub.finished(); }))
+        h.connect();
+        h.gw.subscribeErrorCode = static_cast<int16_t>(code);
+        Collector c;
+        auto sub = h.client.subscribe(TopicHandle{9, 1}, /*partition=*/0, SubscribeOptions{From::earliest()},
+                                      c.handler());
+        ASSERT_TRUE(h.drive([&] { return sub.finished(); }))
             << "an error SubscribeResponse left the subscription pending/active";
         EXPECT_FALSE(sub.active());
         EXPECT_EQ(sub.failReason(), SubscriptionFailReason::RejectedByBroker);

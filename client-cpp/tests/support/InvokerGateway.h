@@ -145,8 +145,13 @@ struct InvokerGateway {
         int     endpoint   = 0;   // index of the endpoint that received the Subscribe
         int64_t fromOffset = 0;   // the Subscribe's wire fromOffset
         int64_t corrId     = 0;
+        uint8_t partitionKnown = 0;       // the Subscribe's wire partitionKnown (0: the broker resolves by key)
+        std::vector<uint8_t> key;         // the Subscribe's wire key bytes
     };
     std::vector<Subscribed> subscribed;
+    // A nonzero code answers every Subscribe with a SubscribeResponse carrying it (nothing is bound, as the
+    // broker does for UnknownTopic / UnknownPartition / InvalidRequest).
+    int16_t subscribeErrorCode = 0;
     // E2 round 6 (F1): a TRANSIENT partition's current data lineage (partition ->
     // token).  A Subscribe carrying a lineage CLAIM (partitionKnown, 8-byte key)
     // for a partition listed here with another token is answered
@@ -769,6 +774,18 @@ struct InvokerGateway {
         std::vector<uint8_t> out(256);
         const std::size_t n = rcc::encodeRecords(out.data(), out.size(), sub.subscriptionId, sub.topicId,
                                                  sub.partition, -1, std::span<const uint8_t>(t, 8), sub.sessionId,
+                                                 stampSubscribeCorr ? sub.corrId : 0);
+        send(replyFromArrival ? sub.endpoint : 0, out.data(), n);
+    }
+
+    /// Push one Records frame carrying a caller-built RecordBatch (any keys /
+    /// values / record count) at baseOffset to a subscription.
+    void pushBatch(const Subscribed& sub, int64_t baseOffset, const std::vector<uint8_t>& batch) {
+        namespace rcc = rune::client::codec;
+        std::vector<uint8_t> out(batch.size() + 256);
+        const std::size_t n = rcc::encodeRecords(out.data(), out.size(), sub.subscriptionId,
+                                                 sub.topicId, sub.partition, baseOffset,
+                                                 std::span<const uint8_t>(batch), sub.sessionId,
                                                  stampSubscribeCorr ? sub.corrId : 0);
         send(replyFromArrival ? sub.endpoint : 0, out.data(), n);
     }
@@ -1493,6 +1510,14 @@ private:
                     return;
                 }
             }
+            if (subscribeErrorCode != 0) {
+                uint8_t eout[64];
+                const std::size_t en = rcc::encodeSubscribeResponse(
+                    eout, sizeof eout, subscribeErrorCode, /*partition=*/-1, /*subscriptionId=*/0, sv->sessionId,
+                    sv->correlationId);
+                if (en > 0) send(replyFromArrival ? endpoint : 0, eout, en);
+                return;
+            }
             int64_t subId = nextSubscriptionId++;
             if (perEndpointSubIds) {
                 // Like the broker: each node's own counter, cluster-unique
@@ -1501,7 +1526,8 @@ private:
                 subId = (static_cast<int64_t>(endpoint + 1) << 40) | (fresh ? it->second : ++it->second);
             }
             const Subscribed sub{subId, sv->topicId, sv->partition, sv->sessionId,
-                                 endpoint, sv->fromOffset, sv->correlationId};
+                                 endpoint, sv->fromOffset, sv->correlationId, sv->partitionKnown,
+                                 std::vector<uint8_t>(sv->key.begin(), sv->key.end())};
             subscribed.push_back(sub);
             uint8_t out[64];
             const std::size_t n = rcc::encodeSubscribeResponse(
