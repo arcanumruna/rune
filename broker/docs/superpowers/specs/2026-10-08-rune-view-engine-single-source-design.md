@@ -103,23 +103,24 @@ A view definition compiles to a flat, declarative plan. Each output field has a 
 
 | Rule | Per-key state | Insert | Update (old→new) | Delete |
 |---|---|---|---|---|
-| `Last`/`Replace` | the value (in the row) | set | overwrite | clear / null |
+| `Replace` (1:1 / per-source field) | the value (in the row) | set | overwrite | clear / null |
 | `Count` | scalar `n` (in the row) | `n++` | — | `n--` |
 | `Sum` (and `Avg` = `Sum`/`Count`) | scalar `s` (in the row) + a **pre-image** | `s += v` | `s += new − old` | `s −= old` |
 | `Min`/`Max` | **multiset `value→count` + cached extreme** (aux, §7 side-structure) | `cnt[v]++`, refresh extreme | retract old + insert new | `cnt[old]--`; if the extreme was removed, rescan for the next |
+| `Last` (grouped last-writer) | **contributors ordered by offset/recency + cached last** (aux — same family as `Min`/`Max`, ordered by recency not value) | record `(offset, value)`, update cached-last if newer | update the contributor's entry | drop it; if it was the cached-last, surface the next-most-recent |
 
 Two facts drive the cost:
 
-1. **Invertibility.** `Sum`/`Count`/`Avg` are **invertible given the pre-image** → the aggregate is a **scalar**. `Min`/`Max` are **not invertible** → they must retain the **multiset** of contributing values (removing the current extreme needs the next-largest). Intrinsic — Flink's retract-min/max keeps the identical `value→count` state.
+1. **Invertibility.** `Replace`/`Count`/`Sum`/`Avg` are **invertible / scalar** (given the pre-image). `Min`/`Max` **and `Last`** are **not invertible** → they retain an aux structure of contributors (removing the current extreme/most-recent needs the *next* one): `Min`/`Max` a **multiset `value→count`**; `Last` the **contributors ordered by offset/recency**. Intrinsic — Flink's retract-min/max/last-value keeps the identical kind of state.
 
 2. **Where the pre-image comes from** (needed by Sum/Count/Min/Max on update & delete):
    - **Append-only source** (contributors never change) → **no pre-image**: `Sum`/`Count` are a pure running scalar; `Min`/`Max` keep only a **cached extreme** (new vs cached), **no multiset**. Cheapest — `Max(x) append` or inferred from an append-only source.
    - **Changelog source** (event carries before+after) → pre-image is in the event; `Sum`/`Count` stay scalar, no per-contributor retention; `Min`/`Max` still keep the multiset.
    - **Compacted-update source** (update = a new record for a contributor key, no before-image delivered) → the fold retains a **per-contributor value map** (`contributorKey → value`) to recover the old value; all of Sum/Count/Min/Max derive from that one per-key map. Aux state **∝ contributors per key**.
 
-So the operators that carry **aux state beyond the output row** are **retractable `Min`/`Max`** (always — the multiset) and **`Sum`/`Count` over a compacted-update source** (the per-contributor map for pre-images). Append-only and changelog sources keep `Sum`/`Count` to a scalar. Aux state is **∝ distinct values / contributors per key**, never total record count.
+So the operators that carry **aux state beyond the output row** are **retractable `Min`/`Max`/`Last`** (always — the multiset / recency-ordered contributors) and **`Sum`/`Count` over a compacted-update source** (the per-contributor map for pre-images). Append-only and changelog sources keep `Sum`/`Count` to a scalar, and append-only `Min`/`Max`/`Last` keep only a cached extreme/last (no aux). Aux state is **∝ distinct values / contributors per key**, never total record count.
 
-**Low-latency realization (zero-alloc, `<5µs/record` — §14.0).** `Last`/`Replace`/`Count`/`Sum` are O(1) scalar ops inline in the row. `Min`/`Max` use a **preallocated flat count-map (`value→count`, open-addressed) + a cached `min`/`max`** per key: insert/update O(1) (+refresh cache); delete O(1) **except** when the cached extreme is removed → an O(d) rescan for the next (rare → amortized O(1)). **Not a heap/tree** (a heap tracks one extreme and arbitrary delete is O(n); trees allocate + pointer-chase) — a flat count-map + cached extreme instead.
+**Low-latency realization (zero-alloc, `<5µs/record` — §14.0).** `Replace`/`Count`/`Sum` are O(1) scalar ops inline in the row. `Min`/`Max`/`Last` use a **preallocated flat count-map + a cached extreme/last** per key (`value→count` for `Min`/`Max`; contributors keyed by `(offset)` for `Last`): insert/update O(1) (+refresh cache); delete O(1) **except** when the cached extreme/last is removed → an O(d) rescan for the next (rare → amortized O(1)). **Not a heap/tree** (a heap tracks one extreme and arbitrary delete is O(n); trees allocate + pointer-chase) — a flat count-map + cached extreme instead.
 
 **Persistence — the restart answer.** All of it — scalars, the per-contributor map, the `Min`/`Max` multiset — is **view fold state**, persisted by the **differential checkpoint** (§9.2): its chunks are dirty-tracked and flushed exactly like the output rows, so restart **loses nothing**. This is mandatory, not optional: you **cannot** rebuild a pre-`O` multiset from the `(O, LSO]` tail (its contributors were folded before `O` and the log may be trimmed). A **transient** view (§9.7) instead rebuilds it by re-folding the retained source (bounded by retention). Retractable `Min`/`Max` views therefore carry heavier durable state than scalar aggregates — the intrinsic price of exact retractable extremes; a **compacted** source may opt to rebuild the multiset from the source on restart rather than persist it.
 
@@ -234,6 +235,26 @@ A source topic can evolve (`ALTER TOPIC`) while a view depends on it; the fixed-
 - **A dropped source field → a null column, not a width change.** The fold resolves each source field by its durable `(topicId, tag)` against **the record's own stamped writer version** (§6, §schema-evolution). So for records *before* the drop offset the tag is live → decoded; for records *at/after* it, `isLiveAt(writerVersion)==false` → it reads **absent**, and the view's column for it is set **null** (via the null bitmap, §7) for keys whose latest contributing record is post-drop. The **row width never changes**; slot-skipping is unaffected (decision §15 #9, graceful-absent). A **retype** is drop-old-tag + add-new-tag, so the old column simply goes null unless the view is redefined to project the new tag.
 - **Only an `ALTER VIEW` changes the row width** — adding/dropping/retyping an *output* column produces a **new view schema version** with a new `rowLen`, handled by the §10 background rebuild + atomic cut-over into a fresh fixed-width slab; **two row widths never coexist in one slab.**
 - **The one breaking edge — a source drops/retypes a field the view *keys* on.** Graceful-absent can't save this: a post-drop record has **no key** → nothing to attach a null to. Policy (decision §15 #9): **`CREATE VIEW` validates the key tag exists, and an `ALTER TOPIC DROP` of a tag a live view uses as its key is rejected** (dropping it would silently orphan keyed records). (A projected/merged field is fine to drop — it just goes null.)
+
+### 6.4 Null handling (missing values)
+
+A **null** is a typed "missing value," stored in the row's **null bitmap** (§7) — distinct from zero/empty (§3.1). Nulls arise from: a **schema-dropped** source field (§6.3), an **outer-join** side with no match yet (§8, held null until a match arrives), a not-yet-arrived source, or an explicitly-null field. Per-operator semantics are **SQL-aligned**:
+
+| Operator | Null handling |
+|---|---|
+| `Sum` / `Avg` | **ignore nulls** — aggregate over non-null contributors; `Avg = Sum(non-null)/Count(non-null)` |
+| `Min` / `Max` | **ignore nulls** — the multiset holds only non-null values |
+| `Count(col)` | counts **non-null** values of `col` |
+| `Count(*)` | counts **rows/contributors**, nulls included |
+| `Replace` | latest value wins **including null** (a null-valued latest record → the column is null — reflects actual latest state) |
+| `Last` | the most-recent contributor's value **including null**; `LastNonNull` variant takes the most-recent *non-null* |
+| `Project` | **pass-through** — null source field → null output column |
+| Outer join | the unmatched side's columns are **null** until a match arrives (§8) |
+
+- **All-null / empty group:** `Sum`/`Min`/`Max`/`Last` over no non-null contributors → **null** (SQL); `Count` → `0`. (`Sum` empty = `0` is an opt-in alternative per field.)
+- **Retraction composes cleanly:** since `Sum`/`Min`/`Max`/`Count(col)` only ever incorporated non-null values, retracting a null contributor is a **no-op** for them, and the `Min`/`Max` multiset never held nulls — so null + retraction need no special case.
+- **Key columns are non-nullable** (a null key can't be placed — tied to the §6.3 view-key-drop rule); aggregate/projection outputs *can* be null.
+- **Filters / three-valued logic** (`predicate(null) → unknown → row excluded`) ride with the deferred filter operator — noted, not specced here.
 
 ## 7. The sink: `viewTable` — compact index + stable row-id slab
 
@@ -609,7 +630,7 @@ The schema-evolution prerequisite's decode path (`readFieldByTag` against a mate
 
 18. **Co-partitioned joins — 1:1 and 1:N fan-out (RESOLVED 2026-10-09, §8):** co-partitioning ⟂ cardinality. **§8.0 co-partitioned 1:1** (`K` = key = partition key; local gather over `substate[source][k]`) **and §8.1 co-partitioned 1:N fan-out** (sources share an *ancestor* partition key that's a prefix of finer PKs — e.g. all by `userId`; **flattened row per child**; parent row + child rows + an **FK-index `ancestor→{child keys}`**; a child event re-emits one row, a parent event fans out to re-emit all its child rows; retraction on deletes; FK-index is checkpointed fold state) are **both in scope** — both fully local (no shuffle). Per-view join type default `FULL OUTER` (INNER/LEFT); determinism free (commutative gather + deterministic FK-index fan-out); checkpoint `O` = per-source offset vector; co-partition validated at `CreateView`. Only **non-co-partitioned** (shuffle/broadcast) + windowed joins are deferred to `rune-view-joins`.
 
-19. **Merge/aggregate operators + retraction (RESOLVED 2026-10-09, §6):** `Last`/`Replace`/`Count`/`Sum`/`Avg`/`Min`/`Max`, maintained incrementally with retraction on update/delete. `Sum`/`Count`/`Avg` are invertible → scalar state (+ a pre-image: free for append-only/changelog sources, else a per-contributor value map). `Min`/`Max` are **non-invertible** → a per-key **multiset (`value→count`) + cached extreme** (flat count-map, not a heap/tree; O(1) amortized, O(d) rescan only when the extreme is retracted). Append-only `Min`/`Max` keep only a cached extreme (no multiset). **All aggregate aux state is persisted via the differential checkpoint (§9.2)** — mandatory, since a pre-`O` multiset can't be rebuilt from the `(O, LSO]` tail; transient views re-fold from the retained source. Grouped aggregation is in scope only when the group key = partition key (co-partitioned); non-partition-key grouping + windowed deferred.
+19. **Merge/aggregate operators + retraction + nulls (RESOLVED 2026-10-09, §6/§6.4):** `Replace`/`Count`/`Sum`/`Avg`/`Min`/`Max`/`Last`, maintained incrementally with retraction. **`Replace`** = 1:1/per-source scalar overwrite; **`Sum`/`Count`/`Avg`** invertible → scalar (+ pre-image: free for append-only/changelog, else a per-contributor value map); **`Min`/`Max`/`Last`** non-invertible → aux state (`Min`/`Max` a `value→count` multiset; `Last` contributors ordered by recency) + cached extreme/last — flat count-map, not a heap/tree, O(1) amortized, O(d) rescan only when the extreme/last is retracted; append-only variants keep only a cached extreme/last (no aux). **All aggregate aux state is persisted via the differential checkpoint (§9.2)** — mandatory (a pre-`O` multiset can't be rebuilt from the tail); transient views re-fold from the retained source. **Null semantics (§6.4, SQL-aligned):** aggregates ignore nulls, all-null→null, `Count`→0, `Replace`/`Last` take latest incl. null (`LastNonNull` variant), outer-join null side, null in the §7 null bitmap. Grouped aggregation in scope only when group key = partition key (co-partitioned); non-partition-key grouping + windowed deferred.
 
 20. **Placement, failover & availability (RESOLVED 2026-10-09, §11.2):** a view partition is co-located with (pinned to) its anchor source partition's leadership/ISR; **every in-sync replica folds its own view instance**, so a promoted replica serves on failover with **no rebuild** (readiness-confirm only). View-read availability = the partition having a leader on a live in-sync replica → tolerates **`RF − minIsr`** losses (baseline 3-node/RF=3/minIsr=2 → 1 loss). The only gap is the sub-second election window on just-failed-over partitions (retriable "not ready", never stale/half state); a rejoining node serves only behind the readiness gate.
 
