@@ -520,3 +520,59 @@ TEST(ProducerRoutePark, TransientLogFullIsRetriedAfterBackoffWithoutParkingRegre
     EXPECT_EQ(t.okRecords, 1);
     EXPECT_EQ(t.failed, 0);
 }
+
+// Re-review 2 R2-n1 (coverage, green before this batch): a D path that releases
+// the batch holding the last earlier-lane attempt ends the C2b wait at once —
+// every D path releases through releaseResolved_, which re-arms the parked head
+// once nothing older is unresolved — so the head goes out on the next pass, not
+// on its attempt timer.
+TEST(ProducerRoutePark, DFailureOfTheLastOldLaneHolderEndsTheLaneWait) {
+    ProducerConfig cfg = ackedCfg();
+    cfg.produceTimeoutMs  = 30'000;   // the attempt timer never fires within this test
+    cfg.deliveryTimeoutMs = 30'000;
+    ProducerImpl impl(cfg);
+    Wire w;
+    const auto sink = w.fn();
+    BatchTally t;
+    impl.setOnBatchAck(&BatchTally::on, &t);
+    sendThree(impl, w, sink);              // A, B, C on lane 0
+    ASSERT_EQ(impl.resendPartitionViaRoute(1, 0), 3);  // the route moved: lane 1
+    pump(impl, sink);
+    ASSERT_EQ(w.frames.size(), 6u);
+    impl.onProduceResponse(w.frames[3].corrId, -1, kOos);        // A (lane 1): OOS -> waits (C2b)
+    impl.onProduceResponse(w.frames[0].corrId, -1, kNotLeader);  // A's lane-0 attempt answered
+    impl.onProduceResponse(w.frames[2].corrId, -1, kNotLeader);  // C's lane-0 attempt answered
+    pump(impl, sink);
+    ASSERT_EQ(w.frames.size(), 6u) << "B's lane-0 attempt is still out: the head waits";
+    // B's CURRENT attempt is rejected outright (D: outcome unknown, released).
+    impl.onProduceResponse(w.frames[4].corrId, -1,
+                           static_cast<int16_t>(rune::protocol::client::ErrorCode::StorageError));
+    EXPECT_EQ(t.failed, 1);
+    pump(impl, sink);
+    ASSERT_EQ(w.frames.size(), 7u) << "the waiting head was left to its attempt timer";
+    EXPECT_EQ(batchcorr::base(w.frames[6].corrId), batchcorr::base(w.frames[0].corrId));
+}
+
+// Re-review 2 R2-n5: a follower's OutOfOrderSequence never cuts short the
+// MinIsrViolation backoff of the gap batch (the fast retransmit skips a batch
+// in a retriable backoff).  RED (pre-fix): the follower's OOS zeroed the gap's
+// attempt deadline and it was re-sent at once.
+TEST(ProducerRoutePark, FollowerOosNeverSkipsTheMinIsrBackoffRegression) {
+    ProducerImpl impl(ackedCfg());
+    Wire w;
+    const auto sink = w.fn();
+    const std::vector<uint8_t> v(8, 1);
+    for (int i = 0; i < 2; ++i) {
+        ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), v, false, 0));
+        pump(impl, sink);
+    }
+    ASSERT_EQ(w.frames.size(), 2u);
+    impl.onProduceResponse(w.frames[0].corrId, -1,
+                           static_cast<int16_t>(rune::protocol::client::ErrorCode::MinIsrViolation));
+    impl.onProduceResponse(w.frames[1].corrId, -1, kOos);  // the follower meets the gap (C1)
+    impl.retransmitStalled(kNow + 1'000'000LL, sink);       // inside the 100 ms backoff
+    EXPECT_EQ(w.frames.size(), 2u) << "the follower's OOS skipped the MinIsrViolation backoff";
+    impl.retransmitStalled(kNow + 200'000'000LL, sink);     // past the backoff: the gap goes out
+    ASSERT_GE(w.frames.size(), 3u);
+    EXPECT_EQ(batchcorr::base(w.frames[2].corrId), batchcorr::base(w.frames[0].corrId));
+}
