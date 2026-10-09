@@ -61,9 +61,14 @@ struct Rig {
         c.topics.push_back(ts);
         return c;
     }
+    // cap < 0 (default): drive until pred holds, bounded by a 10 s deadline that only a FAILING test
+    // reaches — real UDP setup / the SessionMachine's connect retry need real time, which a fixed
+    // iteration count does not give on a fast CPU (2026-10-09: 7 UDP tests failed their connect on an
+    // arm64 Linux Release build at 200k iterations).  cap >= 0: exactly that many cycles (bounded checks).
     template <class P>
-    bool drive(P&& pred, int cap = 200'000) {
-        for (int i = 0; i < cap; ++i) {
+    bool drive(P&& pred, int cap = -1) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        for (int i = 0; cap < 0 ? std::chrono::steady_clock::now() < deadline : i < cap; ++i) {
             client.doWork();
             gw.pump();
             if (pred()) return true;
