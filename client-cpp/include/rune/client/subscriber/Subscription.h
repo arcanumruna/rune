@@ -121,6 +121,12 @@ enum class SubscriptionFailReason : int32_t {
     /// redirect then; subscribe on a Client without a group consumer (or wait
     /// for per-partition routing of plain subscriptions).
     LeaderElsewhereWhileGroupActive = 1,
+    /// C-F21: the broker cannot deliver the subscription's next batch (it is
+    /// larger than the egress max message or the broker's return ring —
+    /// ErrorResponse{MessageTooLarge} naming this subscription) and parked it;
+    /// the client released it.  Re-subscribing from the same offset meets the
+    /// same batch: raise the broker's / client's term (max message) size.
+    UndeliverableBatch = 2,
 };
 
 struct SubscriptionStatus {

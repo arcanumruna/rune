@@ -628,6 +628,15 @@ bool SubscriberHub::failPendingSubscribe(int64_t correlationId, SubscriptionFail
     return true;
 }
 
+bool SubscriberHub::failActiveSubscription(int64_t subscriptionId, SubscriptionFailReason reason,
+                                           int64_t unsubCorrId, int64_t sessionId, const SendFn& submitFn)
+{
+    const auto it = activeById_.find(subscriptionId);
+    if (it == activeById_.end() || !it->second->active) return false;
+    it->second->failReason = reason;  // before the finish: the final snapshot carries it
+    return unsubscribe(it->second->correlationId, unsubCorrId, sessionId, submitFn);
+}
+
 void SubscriberHub::failPendingSubscribes(const std::string& reason)
 {
     // Finishing the impl (inactive + closed status ring) is the error signal:

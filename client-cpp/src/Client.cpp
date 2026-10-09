@@ -62,6 +62,22 @@ constexpr std::int32_t  kStartLatchMsgType  = 1;
 std::string toChannel(const std::string& endpoint) {
     return endpoint.rfind("aeron:", 0) == 0 ? endpoint : ("aeron:udp?endpoint=" + endpoint);
 }
+// C-F21: the subscription a subscription-scoped ErrorResponse names (the
+// broker's F15 S3 / F19 message "subscription S topic T partition P offset O:
+// ..."), else 0.  Cold path (one error per parked subscription); no allocation.
+int64_t subscriptionOfScopedError(std::string_view m) noexcept {
+    constexpr std::string_view kPrefix = "subscription ";
+    if (m.substr(0, kPrefix.size()) != kPrefix) return 0;
+    int64_t id = 0;
+    std::size_t i = kPrefix.size();
+    const std::size_t digits0 = i;
+    for (; i < m.size() && m[i] >= '0' && m[i] <= '9'; ++i) {
+        if (id > (INT64_MAX - 9) / 10) return 0;  // not an id this client could hold
+        id = id * 10 + (m[i] - '0');
+    }
+    if (i == digits0 || i >= m.size() || m[i] != ' ') return 0;
+    return id;
+}
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -2375,6 +2391,22 @@ void Client::onEgressFrame(codec::TemplateId tid,
             producerHub_.retryRedirectedProduce(opt->correlationId, sendFn);
 
             break; // bare NotLeader handled: refreshed + retried (or budget-failed).
+        }
+
+        // C-F21: a subscription-scoped error (F15 S3 convention: correlationId 0
+        // — a subscription id shares no namespace with correlation ids — and the
+        // subscription named in the message, "subscription S topic T ...": the
+        // broker parked a push subscription whose next batch it cannot deliver)
+        // fails THAT subscription; the app's onError still hears it below.
+        if (opt->correlationId == 0 && ec == rpc::ErrorCode::MessageTooLarge) {
+            if (const int64_t subId = subscriptionOfScopedError(opt->message); subId > 0) {
+                const auto snap = agent_.stateAndSessionId();
+                (void)subscriberHub_.failActiveSubscription(
+                    subId, SubscriptionFailReason::UndeliverableBatch, nextCorrId_++, snap.sessionId,
+                    [this](int32_t /*streamId*/, const uint8_t* fbuf, std::size_t flen) -> bool {
+                        return agent_.submitSend(fbuf, flen);
+                    });
+            }
         }
 
         std::string msg(opt->message);

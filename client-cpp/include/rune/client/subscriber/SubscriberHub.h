@@ -171,6 +171,12 @@ public:
     /// Fail the ONE pending subscription whose Subscribe carried
     /// `correlationId` (its handle sees finished()).  False if none.
     bool failPendingSubscribe(int64_t correlationId, SubscriptionFailReason reason);
+    /// C-F21: the broker failed the BOUND subscription `subscriptionId` (a
+    /// subscription-scoped ErrorResponse, correlationId 0): it finishes with
+    /// `reason` and is unsubscribed like unsubscribe() (the broker parked it).
+    /// False if no active subscription has that id.  Duty thread.
+    bool failActiveSubscription(int64_t subscriptionId, SubscriptionFailReason reason, int64_t unsubCorrId,
+                                int64_t sessionId, const SendFn& submitFn);
 
     /// M2 FIX [CB-5]: Sweep pending subscriptions whose subscribe-request
     /// deadline has expired.  Mirrors the produce-ack timeout sweep.
