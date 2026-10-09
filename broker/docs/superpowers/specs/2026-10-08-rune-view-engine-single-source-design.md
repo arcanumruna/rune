@@ -16,7 +16,7 @@ A view, concretely, is a **keyed table** derived from a source log by a declarat
 
 ## 2. Non-goals (this spec)
 
-- **Joins / multi-source views.** The model is designed so a join is additive (§8, §12), but join execution, co-partitioning, and gather semantics are a separate follow-on spec.
+- **Non-co-partitioned joins.** Co-partitioned **key⋈key (PK⋈PK)** joins *are* in scope (§8). Foreign-key (1:N), repartition/shuffle, broadcast-dimension, and windowed stream⋈stream joins are deferred to the `rune-view-joins` follow-on spec.
 - **Secondary indexes, range scans, filters, aggregations beyond per-field merge.** Point-key lookup only here; richer query surface is deferred.
 - **Cross-node view placement / replication of the view table itself.** Views are rebuilt deterministically from the (already-replicated) source log on each node that hosts the partition (§11), so the view table is node-local derived state, not independently replicated. Multi-node placement/failover policy is a follow-on.
 - **The query language surface** for defining views in Rune QL. This spec defines the engine and the `CreateView` control-plane API; the QL `create view …` syntax is a thin follow-on over `CreateView` (mirrors how 0c QL layered over `DefineTopic`).
@@ -89,7 +89,7 @@ On each advance of `[cursor, LSO)` for a partition (read-committed; §11), the w
 | **Project** | this spec | field select/rename = projection into output fields |
 | **Fold** | this spec | keyed per-field merge into substate → reemit row |
 | **Sink** | this spec | `viewTable` = compact index + stable row-id slab (§7) |
-| **Join** | follow-on | additive gather over per-source substates sharing the key (§8) |
+| **Join** | this spec (co-partitioned key⋈key) | gather over per-source substates sharing the partition key (§8); FK/shuffle/windowed deferred |
 | **Filter** | follow-on | predicate drop before fold |
 | **Aggregate** | follow-on | windowed/grouped aggregation beyond per-field merge |
 
@@ -227,14 +227,19 @@ A throwaway spike compared the inline-row table vs. this index+slab design under
 
 The inline design's resize cost scales with `rows × rowSize` (unbounded, multi-second); this design's scales only with the tiny index, so it is pre-sizeable and incrementally migratable within budget. `MIGK` (entries migrated per op) is the tuning knob: 128–256 keeps the worst tax well under 50 µs while finishing a migration in ~10⁵ steps.
 
-## 8. Join (follow-on — shape locked so it drops in)
+## 8. Join — co-partitioned key⋈key (this spec)
 
-Not built here, but the model is chosen so the join is **additive**:
+**Scope:** an equi-join of N source topics on a shared key `K` where `K` is each source's **key = partition key**, so the sources are **co-partitioned** (a given `k`'s row in every source hashes to the same partition). This is the **1:1 (PK⋈PK)** case — at most one row per source per key — and it is fully **local**: one worker owns `k`'s state across all sources, no shuffle, shared-nothing intact. Foreign-key (1:N), repartition/shuffle, broadcast, and windowed stream⋈stream joins are **deferred to the joins spec** (`rune-view-joins`, follow-on).
 
-- Each source folds into its own `substate[sourceIdx][k]` (§6.1 already keys substate by source).
-- Sources for a join are **co-partitioned on the shared key** onto one worker (shared-nothing preserved: one worker owns the joined view's partition and all its source substates).
-- A pure **gather** `Join` operator: on any upstream change to key `k`, `reemit(k)` gathers the latest field from each source substate and writes the row. **Outer-join by default** (missing source substate → null/absent fields), so a row appears as soon as any source has the key.
-- No fold-path redesign: single-source is the `sources.size()==1` special case of the same `reemit`.
+- **Co-partition precondition, validated at `CreateView`.** Every join source must be partitioned by `K` with the **same partition count/scheme**. `CreateView` rejects otherwise (no shuffle in this scope). This is what lets one worker own all of a key's state.
+- **State:** per (join-view, partition) the worker keeps `substate[sourceIdx][k]` — the latest row of each source for key `k` (§6.1 already keys substate by source); one row per source (the 1:1 property).
+- **Fold = gather.** An event on source `s` for `k` updates `substate[s][k]`, then `reemit(k)` gathers the latest row from each source's substate, projects into the joined output, and writes (or retracts) `viewTable[k]`. Single-source is exactly `sources.size()==1` of this same `reemit` — no fold-path redesign.
+- **Join type: per-view, default `FULL OUTER`.** `INNER` (row only when **all** sources have `k`), `LEFT`/driving-source outer, or `FULL OUTER` (default — row present as soon as **any** source has `k`; missing sources → null/absent fields). The type is stored in the view definition and governs `reemit`'s emit-vs-retract decision.
+- **Retraction (required, even at 1:1).** A tombstone on source `s` for `k` removes `substate[s][k]` and `reemit(k)`: for `FULL OUTER` the row stays with `s`'s fields null; for `INNER`/`LEFT` where a required source is now absent, the output row **retracts** (`erase viewTable[k]`). When all sources' `k` are gone, erase.
+- **Determinism is free across sources.** `reemit(k)` writes "latest of each source," so the joined row depends only on each source's *latest* value for `k`, not on how the sources' events interleaved; per-source order is preserved by each source's own log. The gather is therefore commutative across sources → leader and followers converge on the identical table (§11) **without coordinating cross-source fold order.**
+- **Checkpoint offset is a vector.** A join folds N source logs, each with its own offset, so a delta's `O` is the **vector of per-source committed offsets** captured at one consistent batch boundary (§9.2/§9.3), with the substates + viewTable. Restart replays each source from its own checkpointed offset; the readiness gate (§9.4.1) waits until all sources reach their tails.
+- **Typing & reads unchanged.** The join output has a derived output `Descriptor` + fingerprint over the projected columns from each source (§10/§12) — a join view is typed and read exactly like a single-source view; `GetViewRow(joinView, k)` routes to the one co-partitioned worker (§12).
+- **DDL:** `CREATE VIEW v AS SELECT a.x, b.y FROM topicA a [FULL OUTER|INNER|LEFT] JOIN topicB b ON a.K = b.K` (`K` = both topics' partition key); programmatic builder equivalently. `CreateView` validates co-partitioning and resolves the projection across the sources' schemas (§6.0).
 
 ## 9. Persistence — periodic atomic snapshot + replay-from-offset
 
@@ -452,6 +457,7 @@ The schema-evolution prerequisite's decode path (`readField`-by-tag against a ma
 - **Storage model — rehash within budget (§7):** under a mixed create/update/delete workload that crosses several load-factor thresholds, the **worst per-op rehash tax stays < 50 µs, independent of row size** (64/256/1024 B) — `startGrow` is an O(1) swap of a background-pre-provisioned buffer (no inline allocation on the triggering op; **zero fallbacks** under the expected insert rate), and incremental migration moves ≤ `MIGK` index entries/op. A stop-the-world rehash on the hot path is a **failing gate**. Also: delete is O(1) tombstone-free (p99 flat across row sizes, no payload move); point-find is cache-dense (fat rows out of the probe path); snapshot is a memcpy of flat index+slab regions + atomic marker (no mmap-of-record).
 - **Checkpoint — batch-boundary differential (§9.2, spike-validated):** with **row-sized chunks** and a **~1–2 s / `dirtyCap` flush cadence**, read latency with checkpointing ON must stay **on the OFF baseline through p99.9** (measured: `125/292/375 ns` ON vs `125/291/375 ns` OFF) — the per-flush copy is bounded and touches only p99.99+ reads. **No full-view copy, no COW, no memory doubling** (handoff buffers + `dirty` bitmap only). **Chunk = row-size is mandatory** — an OS-page chunk (4 KB) is 4–16× write amplification that saturates IO and stalls the worker (a failing config, spike-shown). **Aggregate dirty rate across a node's view-partitions must be ≤ disk bandwidth** or backpressure stalls the worker — gate the dirty rate (cadence/cap/coalescing) against the target disk. **Offset-atomicity:** every delta carries `O`+CRC at a batch boundary; a crash-injection/replay test shows the recovered offset is always exactly the last fsync'd delta's `O`, and replay `(O, LSO]` reproduces the byte-identical view (deterministic, #16).
 - **Restart readiness gate (§9.4.1):** a node is **not election-eligible and does not serve `GetViewRow` / ack `OnViewApply`** until every hosted view is loaded + replayed to the committed tail (`RECOVERING → REBUILDING_VIEWS → READY`); a fold never touches an unseeded view; the gate reaches READY using only local state (no cluster dependency — test a cold all-node restart) within a bound set by the checkpoint cadence. A half-built view must never be observable (regression).
+- **Co-partitioned join (§8):** `CreateView` **rejects** sources not co-partitioned on the join key (same partition count/scheme). Gather correctness across join types: `FULL OUTER` shows partial rows (null for absent sources) and fills them when the other source's key arrives; `INNER` emits only when all sources present and **retracts** when a required source's key is tombstoned; a delete on any source drives the right update/retract. **Determinism:** feeding the same per-source committed prefixes in different cross-source interleavings yields the byte-identical view table (commutative gather, #16). **Vector-offset checkpoint/restart:** a join view recovers each source from its own checkpointed offset and the readiness gate waits for all sources (§9.4.1).
 - **Regression suite:** every fix gets a `*Regression*` test; full regression suite runs first on every change (#6/#7).
 
 ## 15. Decisions
@@ -484,11 +490,13 @@ The schema-evolution prerequisite's decode path (`readField`-by-tag against a ma
 
 17. **View persistence property (RESOLVED 2026-10-09, §9.7):** per-view `persistence ∈ {persisted (default), transient}`; **transient** = no checkpoint / no persistence IO / zero disk (durability stays the log's job), rebuilt on restart by replaying the source from its retained floor (cheap/empty for bounded or `InMemoryLog`-backed sources — not inherently slower). Word is **`transient`** (not `volatile` — avoids the C++/Postgres collision; matches Java `transient`). QL `CREATE TRANSIENT VIEW`. Typing + readiness gate unchanged. Pairs with **transient topics** (own spec: `2026-10-09-rune-transient-topics-design.md`).
 
+18. **Co-partitioned key⋈key join (RESOLVED 2026-10-09, §8):** in scope — N sources co-partitioned on a shared key `K` that is each source's key=partition-key (1:1 PK⋈PK), local gather over `substate[sourceIdx][k]`, `reemit(k)` writes/retracts; per-view join type default **`FULL OUTER`** (INNER/LEFT also supported); determinism free (commutative cross-source gather); checkpoint `O` = per-source offset vector; co-partition validated at `CreateView`. FK/1:N, shuffle, broadcast, windowed joins deferred to `rune-view-joins`.
+
 ## 16. Deferred follow-ons (program-level)
 - **Read-time query engine** — `WHERE` / `GROUP BY` / aggregation *beyond* the view's maintained per-field merge: the Filter/Aggregate operators (§5) applied at read time (the §12.3 example's shape). The result-typing/decode mechanism is already defined; the query *operators* are the follow-on.
 - **SQL → programmatic-plan translator** — SQL compatibility as a front-end that emits the same query-builder plan (Rune QL stays programmatic-first).
 - **Formal BACKWARD/FORWARD compatibility modes for view output schemas** — beyond the versioning + fingerprint-handshake guard (which suffices for correctness now).
-- **Join / multi-source views** (§8) — own spec: co-partitioning, gather semantics, outer/inner policy.
+- **Non-co-partitioned joins** — foreign-key (1:N), repartition/shuffle, broadcast-dimension, windowed stream⋈stream (own `rune-view-joins` spec). The co-partitioned key⋈key join is done in §8.
 - **Secondary indexes & range scans** over the view table.
 - **Rune QL `create view …`** surface over `CreateView` (thin, mirrors 0c).
 - **Multi-node `__views` replication** + view placement/failover policy (inherits RULING-4).
