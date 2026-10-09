@@ -10,6 +10,7 @@
 // stay in the permitted set, so restoring needs no privilege.  A non-root
 // process has none of them effective: construction and destruction are no-ops.
 // Linux only; elsewhere a no-op (non-root dev hosts honour permissions anyway).
+#include <initializer_list>
 #if defined(__linux__)
 #include <linux/capability.h>
 #include <sys/syscall.h>

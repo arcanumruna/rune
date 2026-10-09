@@ -23,6 +23,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <future>
 #include <map>
 #include <memory>
 #include <optional>
@@ -106,6 +107,15 @@ public:
     /// Off by default: tests that model a SILENT client (paused, no keepalive)
     /// rely on the gateway's lease.
     void keepSessionsAlive(bool on) noexcept { keepalive_ = on; }
+
+    /// Run a blocking call (a node's controlledShutdown / stop) on another
+    /// thread while THIS thread keeps pumping the client (keepalives, egress):
+    /// a real client's runtime keeps running while the broker does work.
+    template <class F> auto whilePumping(F&& f) {
+        auto fut = std::async(std::launch::async, std::forward<F>(f));
+        while (fut.wait_for(std::chrono::seconds{0}) != std::future_status::ready) { poll_(); pause_(); }
+        return fut.get();
+    }
 
     const std::string& egressChannel() const noexcept { return egressChannel_; }
     /// Advertise the reply channel under `host` (the subscription stays bound on

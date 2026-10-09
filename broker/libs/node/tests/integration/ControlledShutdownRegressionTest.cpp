@@ -325,7 +325,7 @@ TEST(ControlledShutdownRegression, NonControllerGracefulStopHandsEveryPartitionO
     std::array<int, kParts> produced{};
     ASSERT_TRUE(produceAll(c, ports, controller, sid, 3, produced)) << "pre-stop produce failed";
 
-    EXPECT_TRUE(ns[static_cast<std::size_t>(victim)]->controlledShutdown(20'000ms))
+    EXPECT_TRUE(c.whilePumping([&] { return ns[static_cast<std::size_t>(victim)]->controlledShutdown(20'000ms); }))
         << "controlled shutdown did not complete within its budget";
 
     // BEFORE the process exits: every survivor routes the victim's partitions
@@ -348,7 +348,7 @@ TEST(ControlledShutdownRegression, NonControllerGracefulStopHandsEveryPartitionO
     }
     // The stop signal's moment: a client is never sent to the stopping node.
     expectNeverSentToVictim(c, ports, sid, victim, produced, "after the controlled shutdown, before exit");
-    ns[static_cast<std::size_t>(victim)]->stop();
+    c.whilePumping([&] { ns[static_cast<std::size_t>(victim)]->stop(); });
     expectNeverSentToVictim(c, ports, sid, victim, produced, "right after the stop");
     std::map<int, int64_t> sid2;
     for (auto& [k, v] : sid) if (k != victim) sid2[k] = v;
@@ -400,7 +400,7 @@ TEST(ControlledShutdownRegression, ControllerGracefulStopHandsConsensusAndPartit
     std::array<int, kParts> produced{};
     ASSERT_TRUE(produceAll(c, ports, victim, sid, 3, produced)) << "pre-stop produce failed";
 
-    EXPECT_TRUE(ns[static_cast<std::size_t>(victim)]->controlledShutdown(20'000ms))
+    EXPECT_TRUE(c.whilePumping([&] { return ns[static_cast<std::size_t>(victim)]->controlledShutdown(20'000ms); }))
         << "controlled shutdown did not complete within its budget";
 
     // BEFORE exit: a survivor is the consensus leader (it says so itself), and
@@ -422,7 +422,7 @@ TEST(ControlledShutdownRegression, ControllerGracefulStopHandsConsensusAndPartit
     }
     expectNeverSentToVictim(c, ports, sid, victim, produced, "after the controlled shutdown, before exit");
     const auto stopAt = std::chrono::steady_clock::now();
-    ns[static_cast<std::size_t>(victim)]->stop();
+    c.whilePumping([&] { ns[static_cast<std::size_t>(victim)]->stop(); });
     expectNeverSentToVictim(c, ports, sid, victim, produced, "right after the stop");
     std::map<int, int64_t> sid2;
     for (auto& [k, v] : sid) if (k != victim) sid2[k] = v;
