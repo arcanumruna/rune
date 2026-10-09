@@ -36,6 +36,24 @@ Every design choice below is checked against the Rune HARD RULES. The load-beari
 
 > **Review note:** confirm this section is complete against the canonical 16-point philosophy; add any point you want explicitly gated here.
 
+### 3.1 Typing & safety contract (binding — stronger than a typical RDBMS client)
+
+The data-access surface (reads, view rows, projections, query results) is **strongly typed with no untyped escape hatch**. The defining property vs. a typical RDBMS client — whose dynamic path (`ResultSet.getInt(3)` / `getString("col")`) is untyped and silently coercing — is that **every access path here is late-bound-but-verified, never unchecked.** The following are binding invariants; §14 tests pin each one.
+
+1. **Nothing decodes without a verified schema.** Every result — topic record, view row, projection, prepared-query row — passes a **fingerprint + length gate** at the accessor boundary (§12). On mismatch it **throws `SchemaMismatch`**; it never returns a value. There is no weakly-typed result object in the API.
+2. **Identity is a durable never-reused tag, never name or position.** `ALTER` cannot silently remap a field under a client (an RDBMS column reorder/retype can). Old clients stay coherent against their retained schema version.
+3. **No implicit coercion.** A column has exactly one type; the getter's type is checked **once** (at `TypedView` bind or `PreparedQuery::col<T>()` handle acquisition) and enforced structurally by the fingerprint. No int↔string, no truncation, no silent cast.
+4. **Absence is explicit and typed.** A dropped / not-yet-live field surfaces as a typed absent at the boundary (decision §15 #9) — never a silent NULL flowing into arithmetic.
+5. **Queries are values, not strings.** A query is a programmatic builder value → wire plan; structurally injection-free. SQL compatibility is a translator onto the *same* plan, not the primary surface.
+6. **Drift is caught up front.** A client/broker schema-version mismatch fails at `openView` / `prepare`, not mid-scan (§10, §12).
+7. **Deterministic read-committed + all-or-nothing visibility.** Reads observe the LSO-folded, read-committed view (§11); transactional writes are all-or-nothing in views (§11.1). No partial/aborted data leaks into a read.
+
+**Two typing tiers, one mechanism, no hole:**
+- **Compile-time** (`TypedView<RowT>`): a query known at build time — the C++ compiler itself rejects a missing/mistyped field; fully inlined, zero runtime type cost.
+- **Runtime** (`PreparedQuery` + `col<T>()` handles): the result layout comes from the broker's result descriptor (§12.3); type is verified at handle acquisition; the per-row read is positional and safe-by-construction. Late-bound, still verified — and there is deliberately **no** `get(name)`-returns-any accessor that would bypass the check.
+
+Compile-time where the query is static, fail-at-open/prepare otherwise, and **never a silent wrong value** anywhere.
+
 ## 4. Core model — a view is a dataflow topology
 
 A view is defined as a small, **declarative dataflow plan**, conceptually a topology of operators:
@@ -259,9 +277,11 @@ The **mechanism** is unchanged by this choice: immutable `shared_ptr` publish (w
 
 Mirrors the 0b `DefineTopic`/`__topic_schemas`/`AdminWorker` design (shared-nothing DDL on a dedicated thread, off the hot path):
 
-- **`DefineView`** wire op: carries the authoring `ViewPlan` (string field names, §6). On the **AdminWorker** (never a produce worker) it fetches each source topic's `Descriptor` from `__topic_schemas` and **resolves + validates** (§6.0): every `srcField`/`key` name exists in the source schema, merge rules are numeric-only where required, output types resolve. The output is the `CompiledViewPlan` with resolved field ids.
-- **`__views`** — a broker-local registry topic (parallels `__topic_schemas`), the durable record of defined views (stores the authoring `ViewPlan`; the compiled form is re-derived from the then-current source Descriptor on install, so additive schema evolution is picked up). Replay on boot reconstructs the set of views.
-- **Distribution.** On a successful `DefineView`, the AdminWorker publishes the `CompiledViewPlan` + subscription edges to each worker's Reactor **via ring** (no shared registry read on the hot path). Each worker installs the plan into its per-worker subscription index (§4.1) for the partitions it owns. The source `Descriptor` the compiled plan references is already resident on the worker from 0b per-worker validation.
+- **`DefineView`** wire op: carries the authoring `ViewPlan` (string field names, §6). On the **AdminWorker** (never a produce worker) it fetches each source topic's `Descriptor` from `__topic_schemas` and **resolves + validates** (§6.0): every `srcField`/`key` name exists in the source schema, merge rules are numeric-only where required, output types resolve. The output is the `CompiledViewPlan` with resolved `(topicId, tag)` references, **plus a derived output `Descriptor`** — the view's row layout (the `output` columns, canonical ascending-tag order), each output column carrying a durable never-reused `(viewId, tag)`.
+- **`__views` is a versioned schema registry** (reuses the `SchemaRegistry` shape verbatim, parallel to `__topic_schemas`). Each view version stores: the authoring `ViewPlan` (source of truth for rebuild), the **materialized output `Descriptor` blob**, its **fingerprint** (`fingerprintAsOf`), `nextTag`, and `compatMode`. Keyed `(viewId, version)` so compaction preserves history. Replay on boot reconstructs every view and every retained version.
+- **`openView` handshake (identical to `openTopic`).** A typed client presents `RowT::kFingerprint`; the broker matches it against the view's registered schema versions and returns the matching version's materialized descriptor, which the client re-verifies before binding (§12.1). **No match → `SchemaMismatch` at open** — a drifted client is rejected up front, never served a wrongly-shaped row (contract §3.1). Prepared-query result fingerprints (§12.3) are likewise computed against the view's schema version, so the same guard covers ad-hoc queries.
+- **`ALTER VIEW` (add/drop/rename output column, change a merge rule, add a source)** runs on the **same AdminWorker-serialized DDL path as `ALTER TOPIC`**: single in-flight, `expectedVersion` CAS, atomic multi-op, contiguous versions; output columns get fresh never-reused `(viewId, tag)`s; each alter bumps the view version + fingerprint. **The one difference from a topic alter:** a topic alter is pure metadata, but a view alter that changes **fold semantics** (new aggregation, changed merge, new source) changes the view's *contents* → it triggers a **background rebuild** — replay the source log through the new fold (§9.4 replay-from-checkpoint) into the new version while the **old version keeps serving reads** until the new one catches up to the live offset, then cut over. Output-only/additive changes that expose already-maintained substate skip the rebuild. **Phasing (decision §15 #13):** versioned view schemas + `openView` handshake land in the first cut; `ALTER VIEW` + live rebuild is the immediately-following increment (the rebuild/cut-over is the one genuinely new mechanism and earns its own tasks + tests).
+- **Distribution.** On a successful `DefineView`/`ALTER VIEW`, the AdminWorker publishes the `CompiledViewPlan` + output descriptor + subscription edges to each worker's Reactor **via ring** (no shared registry read on the hot path). Each worker installs the plan into its per-worker subscription index (§4.1) for the partitions it owns.
 - **Multi-node replication of `__views`** inherits the same deferral as 0b's `__topic_schemas` (RULING-4): single-node authoritative now; admin-owned transport replication is a follow-on.
 
 ## 11. Fold ownership & deterministic convergence
@@ -301,7 +321,9 @@ One value `Ack{ Durability durability; ApplyPoint applyPoint = OnCommit; }`; `.a
 
 **Transactions.** The apply-point of a **transactional** produce is its **commit marker**, not the individual records. Because the fold only crosses a transaction at its commit marker (LSO, above), a view never shows a *partial* transaction — it jumps from "none of the txn" to "all of it." So `commitTransaction(Ack::majority().afterViews())` means: the commit marker is majority-durable **and** the dependent views across the ISR quorum reflect the **whole** committed transaction before the commit returns — EOS/all-or-nothing extended to derived views, composing with the existing D9 cross-node markers. The composed guarantee is: **durability(commit marker) × apply(dependent views folded past the commit marker, at the durability scope).**
 
-## 12. Read path — `GetViewRow`
+## 12. Read path & query-result typing
+
+### 12.0 Routing — `GetViewRow`
 
 Route a read **exactly like a produce**, so no new routing plane is introduced:
 
@@ -309,9 +331,42 @@ Route a read **exactly like a produce**, so no new routing plane is introduced:
 2. Resolve the leader via `RoutingImage`.
 3. On the node, resolve the owning worker via `ShardRouter`.
 4. Enqueue the read op via `WorkerPool::tryEnqueueOp` (same mechanism as produce).
-5. The worker does a **point lookup** in its `viewTable` (§7) and returns the row.
+5. The worker does a **point lookup** in its `viewTable` (§7) and returns the row bytes.
 
 No cross-thread read of the table, no lock — the read executes on the owning worker (#1). For a join view, the read routes on the shared key to the single co-partitioned worker (§8).
+
+### 12.1 A view is a read-only typed topic
+
+A view's result is a structured record in its **output `Descriptor`** layout (§10), encoded with the same SBE-style header every record carries — `[blockLength:u16][version:u16] …` — version stamped like `TypedTopic::send` already does. So a client consumes a view exactly like a read-only typed topic: `openView<RowT>("…")` performs the `openTopic` fingerprint handshake (§10), binding the version whose fingerprint equals `RowT::kFingerprint`.
+
+### 12.2 Projection = a derived typed subset (identity = `SELECT *`)
+
+Selecting a subset of columns yields a **projection**, itself a well-defined typed layout: the chosen `(viewId, tag)`s in canonical ascending-tag order. Its fingerprint is a deterministic function of `(view schema version, ordered tag set)`, **salted by the view's full-schema fingerprint** so two views' same-named projections never collide. The broker serves a projection by copying just the selected fixed-width fields from the stored flat row into a packed buffer (O(selected fields), no full deserialize) and stamping the projection fingerprint/version. `SELECT *` is the **identity projection** — its fingerprint equals the view's full-schema fingerprint — so full-row and projection are one mechanism, not a special case.
+
+### 12.3 Query-result typing — two tiers, no untyped path (contract §3.1)
+
+Queries on a view are formed **at runtime**, so a client cannot in general bind a codegen'd type. The result layout therefore comes from the **broker at prepare time**, the runtime analog of codegen:
+
+- **Prepared (generic, runtime).** The client builds a query programmatically (a value, not SQL text) and `prepare`s it. The broker compiles it against the view's registered schema into a **result `Descriptor` + fingerprint `Fr`** — reusing the same `toDescriptor → serialize → fingerprint` machinery `DefineTopic` uses — and returns it in the prepare response. The client resolves typed **column handles once** (`col<i64>("customers")` → `{offset,type}`, type checked here, throwing at prepare on a type/column error), then iterates results: each row's accessor construction does the **one O(1) fingerprint+length gate** against `Fr`, after which `r.get(handle)` is a bare positional read at SBE speed. If the view is altered between prepare and execute, `Fr` changes, the stamped result no longer matches, and the gate **throws** (client re-prepares) — never a wrong value.
+- **Typed (static optimization).** A query known at build time is a `TypedView<RowT>` whose `kFingerprint` the client computes at codegen. If it matches the broker's result fingerprint the client may skip the prepare round-trip and use fully-inlined getters. Same wire format, same stamp, same gate.
+
+```cpp
+auto q = query(view("rev_by_customer"))
+           .select(col("customerId"), count().as("customers"))
+           .where(col("totalAmount").gt(10))
+           .groupBy("customerId");          // a VALUE; SQL compiles to the same plan
+PreparedQuery pq = client.prepare(q);        // broker → result Descriptor + fingerprint Fr
+auto cCid = pq.col<i64>("customerId");       // resolve offset+type ONCE (throws at prepare on mismatch)
+auto cCnt = pq.col<i64>("customers");
+for (Row r : pq.execute())                   // Row{} GATE: stamped==Fr && len ok → else throw SchemaMismatch
+    use(r.get(cCid), r.get(cCnt));           // positional, SBE-speed, no per-field check
+```
+
+### 12.4 The decode gate — "checked construction, unchecked access"
+
+SBE speed comes from bare positional reads; its danger is that the wrong buffer yields silent garbage. We keep the bare reads but make them provably safe by a single gate the type system makes **unskippable**: a result accessor (`RowView<RowT>` or `Row` over a `PreparedQuery`) **cannot be constructed** without the `[blockLength][version]`/fingerprint check passing. Match → SBE-speed positional reads; mismatch → `SchemaMismatch`, never a fall-through read. The flat `FixedStr` layout (§7) keeps even string fields fixed-width inline, so the single length check bounds the whole row — no offset-chasing that could run off the end.
+
+*(The richer read-query surface — read-time `WHERE`/`GROUP BY`/aggregation beyond the view's maintained merge — is a deferred query engine (§2, §16); the result-typing + decode mechanism above is identical regardless of a query's complexity.)*
 
 ## 13. Data flow walkthrough (event → updated view)
 
@@ -345,6 +400,8 @@ The schema-evolution prerequisite's decode path (`readField`-by-tag against a ma
 - **Apply-point acknowledgement (§11.1):** (a) `OnCommit` acks before the fold runs (ack offset ≤ any view apply-watermark) — and its latency is **unchanged** vs today's `acks` (ABAB regression, #12). (b) `Leader + OnViewApply` ack arrives only after every dependent view's apply-watermark ≥ the record offset (fan-out to multiple views waits for all). (c) `Majority + OnViewApply` ack arrives only after the ISR quorum's view-apply watermarks ≥ the offset; a non-quorum of applied followers does **not** ack. (d) **Transactional:** with `commitTransaction(... .afterViews())`, a `GetViewRow` observed by any acked reader shows **all-or-nothing** of the txn — never a partial transaction; an aborted txn never appears in the view (read-committed/LSO, §11). (e) `None + OnViewApply` is rejected at the API boundary.
 - **E2E (real Aeron, default config):** define a view over a topic, produce, `GetViewRow`, restart broker, confirm view recovered to latest — firsthand green before "done" (#16), via a `docker/view-engine-e2e.sh` mirroring 0b/0c e2e scripts.
 - **Benchmarks (gated against §14.0):** fold update latency per event batch **< 10 µs** p99 (zero-alloc verified); `GetViewRow` single-node **< 50 µs** p99; multi-node query **< 200 µs** p99; plus snapshot cut pause (worker memcpy time vs table size) and produce-path regression (fold off the critical path must not move produce latency — ABAB n≥15, #12). A benchmark that exceeds its §14.0 budget is a failing gate, not a note.
+- **Typed result decoding & safety contract (§3.1, §12):** (a) **decode speed** — `RowView`/`Row` field access matches hand-written SBE positional access within noise (benchmark, zero-alloc); (b) **`SchemaMismatch` on wrong structure** — a result stamped with a non-matching fingerprint/version (view altered between prepare/execute; buffer from a different view/topic; truncated buffer failing the length check) **throws at accessor construction**, never returns a value (regression); (c) **`openView` handshake** — a client whose `kFingerprint` matches no registered version is rejected at open, and one matching a retained older version binds that version; (d) **type check at handle acquisition** — `col<i64>()` on a non-i64 column throws at `prepare`, and the per-row `get(handle)` path does no per-field check; (e) **projection** — `SELECT`-subset fingerprint is canonical-order + salted (two field orders dedupe to one `Fr`; `SELECT *` fingerprint == full-view fingerprint); (f) **no untyped escape hatch** — there is no accessor returning an unchecked/any value (audit).
+- **`ALTER VIEW` rebuild/cut-over (when that increment lands):** an alter that changes fold semantics rebuilds the new version from the source log while the **old version keeps serving** reads correctly until the new version reaches the live offset, then cuts over atomically; a reader bound to the old version is never served a wrongly-shaped row across the cut (regression).
 - **Regression suite:** every fix gets a `*Regression*` test; full regression suite runs first on every change (#6/#7).
 
 ## 15. Decisions
@@ -366,10 +423,15 @@ The schema-evolution prerequisite's decode path (`readField`-by-tag against a ma
 
 10. **View-apply acknowledgement (RESOLVED 2026-10-09, §11.1):** two orthogonal per-produce axes — Durability `{None, Leader, Majority}` × Apply-point `{OnCommit (default), OnViewApply}` — with `OnViewApply` scoped to the durability level (leader-local dependent views, or the same ISR/majority quorum), selected per-produce via `Ack::…().afterViews()`. `None + OnViewApply` invalid. Fold is read-committed (`[cursor, LSO)`); a transactional write's apply-point is its commit marker, giving all-or-nothing view visibility (EOS extended to derived state).
 
-## 16. Deferred follow-ons (program-level)
+11. **Views are typed; results are typed (RESOLVED 2026-10-09, §12, §3.1):** a view has a derived, registered, **versioned output `Descriptor` + fingerprint**; a client consumes it as a read-only typed topic (`openView` fingerprint handshake). Query results are typed via two tiers — **prepared** (broker returns a result descriptor + fingerprint at `prepare`; generic `Row` + `col<T>()` handles) and **static** (`TypedView<RowT>` codegen as an opt-in fast path) — both passing one checked-construction fingerprint+length gate (SBE-speed reads, hard `SchemaMismatch` on mismatch). Projections are derived typed subsets (canonical tag order, salted fingerprint; `SELECT *` = identity). No untyped access path.
+12. **Typing & safety contract (RESOLVED 2026-10-09, §3.1):** the seven binding invariants (verified-before-decode, durable-tag identity, no implicit coercion, explicit typed absence, queries-as-values, drift-caught-up-front, deterministic read-committed + all-or-nothing visibility) — strictly stronger than a typical RDBMS client. §14 pins each.
+13. **`ALTER VIEW` phasing (RESOLVED 2026-10-09, §10):** versioned view schemas + the `openView` handshake land in the **first cut**; `ALTER VIEW` + **live background rebuild/cut-over** is the **immediately-following increment** (its own tasks + tests). Views alter on the same AdminWorker DDL path as topics; the rebuild-on-fold-semantics-change is the only genuinely new mechanism.
 
+## 16. Deferred follow-ons (program-level)
+- **Read-time query engine** — `WHERE` / `GROUP BY` / aggregation *beyond* the view's maintained per-field merge: the Filter/Aggregate operators (§5) applied at read time (the §12.3 example's shape). The result-typing/decode mechanism is already defined; the query *operators* are the follow-on.
+- **SQL → programmatic-plan translator** — SQL compatibility as a front-end that emits the same query-builder plan (Rune QL stays programmatic-first).
+- **Formal BACKWARD/FORWARD compatibility modes for view output schemas** — beyond the versioning + fingerprint-handshake guard (which suffices for correctness now).
 - **Join / multi-source views** (§8) — own spec: co-partitioning, gather semantics, outer/inner policy.
-- **Filter / Aggregate operators** (§5).
 - **Secondary indexes & range scans** over the view table.
 - **Rune QL `create view …`** surface over `DefineView` (thin, mirrors 0c).
 - **Multi-node `__views` replication** + view placement/failover policy (inherits RULING-4).
