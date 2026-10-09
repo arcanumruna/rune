@@ -32,6 +32,10 @@ tests/e2e/*
 !tests/e2e/evo_probe_v2.cpp
 !tests/e2e/evo_probe_v3.cpp
 !tests/e2e/evo_probe_v4.cpp
+# GC7 — multi-producer-different-versions + long-lineage-reopen probe. This
+# allowlist excludes tests/e2e/* by default, so a newly-added probe source must
+# be re-included explicitly or `COPY . .` silently omits it from the context.
+!tests/e2e/evo_probe_multi.cpp
 !tests/e2e/schema_evolution
 
 # Editor / OS

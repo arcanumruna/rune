@@ -65,6 +65,14 @@ COPY --from=rune-ql include /rune-ql/include
 # rune-fr: compiled sibling (src + include); rune_client_api links it.
 COPY --from=rune-fr src     /rune-fr/src
 COPY --from=rune-fr include /rune-fr/include
+# rune-crypto (client<->broker TLS/AEAD, Task 5/7): compiled sibling (src + include).
+# The TLS/crypto merge from origin/main made the client CMake hard-require this:
+# add_library(rune_crypto ...) from ${RUNE_CRYPTO_ROOT}/src/{Caps,Aead,TlsSession}.cpp,
+# linked PUBLIC into rune_client_transport/rune_client_agent (and thus the probe).
+# OpenSSL::SSL/Crypto come from conan (openssl/3.3.2 in conandata.yml); the configure
+# below passes -DRUNE_CRYPTO_ROOT=/rune-crypto so the sibling path resolves.
+COPY --from=rune-crypto src     /rune-crypto/src
+COPY --from=rune-crypto include /rune-crypto/include
 
 # ── Application sources (last; edits do not bust the conan cache) ─────────────
 COPY . .
@@ -84,6 +92,7 @@ RUN cmake -S . -B build -G Ninja \
         -DRUNE_CODEC_ROOT=/rune-codec \
         -DRUNE_QL_ROOT=/rune-ql \
         -DRUNE_FR_DIR=/rune-fr \
+        -DRUNE_CRYPTO_ROOT=/rune-crypto \
         -DRUNE_GEN_DIR=/build/build/e2e-gen \
     && cmake --build build --target rune \
     && cmake --build build --target rune_client_api rune_client_producer rune_client_subscriber rune_codec

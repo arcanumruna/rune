@@ -625,6 +625,32 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
             endif()
         endif()
     endforeach()
+
+    # GC7 multi-producer-different-versions + long-lineage-reopen probe. Links
+    # BOTH the v1 and v3 generated snapshots (chars_evo_v1.gen.h / _v3.gen.h,
+    # staged by docker/schema-evolution-e2e.sh in phases 1 and 3) in one TU to
+    # drive two producers bound to DIFFERENT versions against the evolved topic.
+    # EXCLUDE_FROM_ALL like the evo_probe_vN targets: the script builds it by
+    # name (cmake --build . --target evo_probe_multi) after the snapshots exist.
+    add_executable(evo_probe_multi EXCLUDE_FROM_ALL
+        tests/e2e/evo_probe_multi.cpp
+    )
+    target_include_directories(evo_probe_multi PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+        "${RUNE_EVO_GEN_DIR}"
+    )
+    target_link_libraries(evo_probe_multi PRIVATE
+        rune_client_api
+        rune_client_producer
+        rune_client_subscriber
+        rune_codec
+    )
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB_EVO_MULTI uuid)
+        if(UUID_LIB_EVO_MULTI)
+            target_link_libraries(evo_probe_multi PRIVATE ${UUID_LIB_EVO_MULTI})
+        endif()
+    endif()
 endif()
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────
