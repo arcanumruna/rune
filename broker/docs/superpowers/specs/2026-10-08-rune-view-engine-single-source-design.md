@@ -285,6 +285,12 @@ The inline design's resize cost scales with `rows × rowSize` (unbounded, multi-
 
 ## 8. Join — co-partitioned (this spec)
 
+**A view join is a changelog (upsert) join over keyed tables — NOT a relational cross-join over event logs.** This is the model that makes all the DDL behave predictably:
+
+- A **keyed/compacted** source is a **table**: exactly **one *current* row per key**; a new event **upserts** that key's row. A **non-keyed** source (retention log of all events) is a **stream**. Table-vs-stream follows from the topic's **keying/cleanup policy** (`Compact`+keyed = table; `Delete`/retention = stream).
+- A join **matches tables by key and emits one row per *output key* (the view's grain), updated in place on upserts** — it **never appends a duplicate per event.** The grain decides cardinality: sources **at the same grain** → **1:1** (one row per key, §8.0); a **coarser** source joined to a **finer** one → **1:N fan-out** (one row per fine key, the coarser row attached, §8.1). *Example:* `character ⋈ position` (both keyed `(userId, characterId)`) → one row, position replaced in place; `user ⋈ character` (user coarse, character fine) → one row per character with the user repeated.
+- **A join never reduces.** To collapse a **stream** to "latest/one per key," you first **aggregate it into a table** (`GROUP BY key` + `Last`/`Replace`/`Sum`/…, §6) — *that* reduction is the aggregation (merge), a separate operation. (So you never write per-field `Replace` in a join; "latest per key" is the source *table*'s keying.)
+
 **Co-partitioning and cardinality are orthogonal.** A join is **local** (no shuffle) when all sources are partitioned on the shared key — independent of whether the join is 1:1 or 1:N. This spec covers the two **co-partitioned** tiers; only the non-co-partitioned (shuffle) case is deferred:
 
 | Tier | Shape | Status |
@@ -570,7 +576,7 @@ These are binding pass/fail budgets, measured firsthand under default config (AB
 | **Fold → merge → join stream pipeline, per processed record** (version-aware decode → project → per-field merge → join gather `reemit` → viewTable upsert/retract) | **< 5 µs / record** | steady state, zero-alloc; off the produce ack path; **the binding hot-path gate** — the entire dataflow a committed record traverses, *including* the join cross-source gather |
 | **View update per event batch** (the above × the batch's records, amortized) | **< 10 µs / batch** | bounded per duty cycle; a batch stays within budget given the < 5 µs/record pipeline |
 | **Point select spanning a single node** (`GetViewRow`: route → worker point lookup → reply) | **< 50 µs** | end-to-end incl. in-node hop |
-| **Query spanning multiple nodes** | **< 200 µs** | end-to-end incl. cross-node fan-out/gather (query surface; follow-on) |
+| **Query spanning multiple nodes** | **< 200 µs** | **deferred** — the read-time query engine (range/scatter-gather, §16); *no in-scope multi-node query yet* (point reads route to one partition, §12). The budget is the target for that follow-on. |
 
 The schema-evolution prerequisite's decode path (`readFieldByTag` against a materialized per-version descriptor) is part of the **< 5 µs/record** pipeline budget — its own plan carries a derived sub-budget so it cannot erode it. The join gather (§8) and projection/merge (§6) are likewise *inside* the 5 µs — the whole fold→merge→join chain for one record is gated together, not per-stage.
 
@@ -595,6 +601,19 @@ The schema-evolution prerequisite's decode path (`readFieldByTag` against a mate
 - **Overload / flow control (§11.3):** under a fold that can't keep up, a `backpressure` view's source produce starts returning `BackPressured` once the unfolded backlog crosses the high-watermark and resumes after it drains (bounded lag, hysteresis, no unbounded growth); a `best_effort` view lags **without** throttling its source. A poison record is skipped + dead-lettered (the view does not wedge). External-consumer slowness does not backpressure producers.
 - **Chunked slab growth (§7/§10):** a view with no `capacity` grows from a small default to far beyond it (e.g. 1M→30M rows) purely by **appending chunks** — existing rows never move (stable `rowid`→address), read latency is unchanged across growth, and the only migration is the small index's incremental rehash. With `maxRows` set, exceeding it raises a capacity-exceeded event instead of growing.
 - **Regression suite:** every fix gets a `*Regression*` test; full regression suite runs first on every change (#6/#7).
+
+## 14.2 Observability (metrics)
+
+The §14.0 gates and the overload/flow-control policy (§11.3) are only enforceable if the engine exports, **per (view, partition)**:
+
+- **Fold lag** = `LSO − foldCursor` (the unfolded backlog that drives backpressure, §11.3) — per source for a join;
+- **View-apply-watermark lag** (how far the apply-watermark trails committed, §11.1) — bounds `OnViewApply` ack latency;
+- **Checkpoint age / last durable `O`** and bytes-since-checkpoint (§9.2);
+- **Cardinality & memory** — live rows, slab chunks allocated, index load factor, aggregate aux-state size (§6/§7);
+- **Growth/maintenance events** — index rehashes, chunk appends, re-optimize passes, dead-lettered poison records (§11.3);
+- **Backpressure** — time/ops spent `BackPressured` on each source (§11.3), IO-thread handoff-pool stalls (§9.2).
+
+Per-node rollups (aggregate dirty rate vs disk bandwidth, §9.2) gate the disk-provisioning constraint. These are reused by the §14 test gates (e.g. "CPU ≈ 0 while a `Balanced` `sendAndWait` parks", "fold lag bounded under backpressure").
 
 ## 15. Decisions
 
@@ -641,6 +660,9 @@ The schema-evolution prerequisite's decode path (`readFieldByTag` against a mate
 24. **Chunked-arena slab + optional sizing (RESOLVED 2026-10-09, §7/§10):** the slab is a **list of fixed page-aligned chunks** (default 32 MB, `chunkBytes` configurable); grows by **appending a chunk** (O(1), rows never move, no migration) — this is what makes "rows never move" hold. `CreateView` sizing is **optional**: `capacity` is a pre-size hint (not a cap; exceeding it grows on demand), `maxRows` an optional hard ceiling (→ capacity-exceeded event). Only the small index rehashes (incremental, §7). No accurate up-front capacity required.
 
 ## 16. Deferred follow-ons (program-level)
+- **Access control & multi-tenancy** — authz for `CREATE VIEW` / view reads, tenant isolation of views. **A separate future project**, out of scope here.
+- **Resource isolation** — bounding a heavy view's fold/checkpoint share of a shared worker + the per-node view-snapshot IO thread so it can't starve others (quota/scheduling). Noted; follow-on.
+- **Read-time multi-node query** — the `<200 µs` scatter-gather query surface (range/filter/windowed/ad-hoc `GROUP BY`) over views; point reads are single-partition today.
 - **Read-time query engine** — `WHERE` / `GROUP BY` / aggregation applied *at read time* over a view, beyond the aggregation the view already maintains at fold time (§6): Filter + ad-hoc/windowed/non-partition-key aggregation (the §12.3 example's shape). The result-typing/decode mechanism is already defined; the query *operators* are the follow-on.
 - **SQL → programmatic-plan translator** — SQL compatibility as a front-end that emits the same query-builder plan (Rune QL stays programmatic-first).
 - **Formal BACKWARD/FORWARD compatibility modes for view output schemas** — beyond the versioning + fingerprint-handshake guard (which suffices for correctness now).
