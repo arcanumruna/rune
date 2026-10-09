@@ -274,7 +274,10 @@ TEST(UringDurabilityTest, IoWorkerAffinityBindsTheSubmittingThreadsIoWqRegressio
         const auto tok = be.submit(fd, 1);
         submitted = tok != rune::node::kNoToken;
         if (!submitted) return;
-        const std::string want = "iou-wrk-" + std::to_string(static_cast<pid_t>(::syscall(SYS_gettid)));
+        // The worker is named "iou-wrk-<submitter tid>" with the tid as the INIT pid namespace sees it, not
+        // gettid() here (they differ in a container: its own pid namespace).  This thread is the process's
+        // only io_uring submitter, so any io-wq worker in /proc/self/task is its own.
+        const std::string want = "iou-wrk-";
         bool done = false;
         for (int i = 0; i < 200000 && !(done && !allowedOut.empty()); ++i) {   // bounded poll (no sleep)
             (void)be.reap([&](const rune::node::FlushCompletion&) { done = true; });
@@ -282,7 +285,7 @@ TEST(UringDurabilityTest, IoWorkerAffinityBindsTheSubmittingThreadsIoWqRegressio
                 for (const auto& e : std::filesystem::directory_iterator("/proc/self/task")) {
                     std::ifstream comm(e.path() / "comm");
                     std::string name; std::getline(comm, name);
-                    if (name != want) continue;
+                    if (name.rfind(want, 0) != 0) continue;
                     std::ifstream st(e.path() / "status");
                     for (std::string line; std::getline(st, line);)
                         if (line.rfind("Cpus_allowed_list:", 0) == 0) allowedOut = line.substr(line.find_last_of(" \t") + 1);
