@@ -98,6 +98,23 @@ rune::codec::AlterOp addColumnOp(const std::string& name, PrimType t) {
     return op;
 }
 
+// GC6b: a DROP op (for the long-lineage fingerprint-select test below).
+rune::codec::AlterOp dropColumnOp(const std::string& name) {
+    rune::codec::AlterOp op{};
+    op.type = rune::codec::AlterOpType::Drop;
+    op.name = name;
+    return op;
+}
+
+// GC6b: a RENAME op (for the long-lineage fingerprint-select test below).
+rune::codec::AlterOp renameColumnOp(const std::string& oldName, const std::string& newName) {
+    rune::codec::AlterOp op{};
+    op.type = rune::codec::AlterOpType::Rename;
+    op.name = oldName;
+    op.newName = newName;
+    return op;
+}
+
 // A minimal record batch (for the produce regression test).
 std::vector<uint8_t> makeBatch() {
     rune::protocol::RecordBatchBuilder b(0, 0);
@@ -594,6 +611,160 @@ TEST(SchemaGatewayRegression, GetTopicSchemaUnknownFingerprintReturnsError) {
     EXPECT_EQ(resp->errorCode, 7u)
         << "UnknownTopic for a fingerprint that matches no version of a known topic";
     EXPECT_EQ(resp->descriptorLen, 0u);
+}
+
+// ---------------------------------------------------------------------------
+// SchemaGatewayRegression.GetTopicSchemaByFingerprintAcrossLongLineage
+//
+// GC6b (closes F2 from the GC6 review): GetTopicSchemaByFingerprintReturns-
+// BoundVersion (above) only covers a 2-version lineage (v1 -> v2, one ADD).
+// The test matrix's D3-D8 want GetTopicSchema(requestedFingerprint) proven
+// to resolve EVERY version of a LONGER lineage mixing ADD/DROP/RENAME,
+// broker-side, through the real gateway rings + AdminWorker (no faking).
+//
+// Lineage (6 versions, 5 ALTERs over the v1 DefineTopic), chosen so every
+// version's LIVE field set is distinct (deliberately avoiding I10-14's
+// open question — ADD-then-DROP returning to a PRIOR live set — which the
+// test matrix flags as an undecided fingerprint-equality edge case, not
+// this task's ask):
+//   v1 DefineTopic : id, userId(key), name                  [charsBlob]
+//   v2 ADD    email  : + email           -> {id,userId,name,email}
+//   v3 ADD    age    : + age             -> {..,email,age}
+//   v4 DROP   email  : - email           -> {id,userId,name,age}
+//   v5 RENAME age->years                 -> {id,userId,name,years}
+//   v6 ADD    score  : + score           -> {..,years,score}
+//
+// For each K in 1..6: GetTopicSchema(requestedFingerprint=fp(vK)) must
+// return version==K and a descriptor blob whose fingerprint(deserialize(.))
+// == fp(vK) — i.e. the MATERIALIZED-as-of-vK blob, exactly what a client
+// compiled at vK needs to bind. Also: requestedFingerprint=0 -> latest (v6);
+// an unknown fingerprint -> UnknownTopic, never a silent fallback to latest.
+// ---------------------------------------------------------------------------
+TEST(SchemaGatewayRegression, GetTopicSchemaByFingerprintAcrossLongLineage) {
+    SgHarness h;
+    auto v1Blob = charsBlob();
+    h.gw.applyDefineTopicForTest(
+        encodeDefineFrame(1, 1, "characters", 4, "userId", false, v1Blob).data(),
+        encodeDefineFrame(1, 1, "characters", 4, "userId", false, v1Blob).size());
+    h.pump();
+
+    const RegistryEntry* v1 = h.schemaReg.byName("characters");
+    ASSERT_NE(v1, nullptr);
+    ASSERT_EQ(v1->version, 1u);
+    const int32_t topicId = v1->topicId;
+
+    // Drive the lineage through the real admin request ring: mirrors Task
+    // 13's fingerprint test — the gateway only routes DefineTopic/GetSchema
+    // today, so AlterTopic is injected on the SAME ring AdminWorker drains,
+    // exercising the identical dispatch/state-machine path as a gateway-
+    // routed ALTER would.
+    auto applyAlter = [&](const std::vector<rune::codec::AlterOp>& ops, int64_t corr) {
+        AlterTopicMsg am;
+        am.session = 1; am.corr = corr; am.topicName = "characters";
+        am.expectedVersion = 0;  // unconditional
+        am.opsBlob = rune::codec::encodeAlterOps(ops);
+        ASSERT_TRUE(encodeAlterTopic(h.requestRing, am));
+        h.pump();
+    };
+
+    applyAlter({addColumnOp("email", PrimType::String)}, 201);    // v2
+    applyAlter({addColumnOp("age", PrimType::Int32)}, 202);        // v3
+    applyAlter({dropColumnOp("email")}, 203);                      // v4
+    applyAlter({renameColumnOp("age", "years")}, 204);              // v5
+    applyAlter({addColumnOp("score", PrimType::Int64)}, 205);      // v6
+
+    const RegistryEntry* latest = h.schemaReg.byName("characters");
+    ASSERT_NE(latest, nullptr);
+    ASSERT_EQ(latest->version, 6u) << "5 ALTERs over a v1 DefineTopic must land on v6";
+
+    // Snapshot fp(vK) for K=1..6 directly from the (admin-owned) registry —
+    // the SAME source of truth GetTopicSchema's resolver consults.
+    std::vector<uint64_t> fpByVersion(7, 0);  // index by version (1-based; [0] unused)
+    for (uint16_t k = 1; k <= 6; ++k) {
+        const RegistryEntry* e = h.schemaReg.byIdVersion(topicId, k);
+        ASSERT_NE(e, nullptr) << "version " << k << " must be materialized in the registry";
+        fpByVersion[k] = e->fingerprint;
+    }
+    // All 6 fingerprints must be pairwise distinct (I1): every ADD/DROP/
+    // RENAME in this lineage changes the materialized descriptor.
+    for (uint16_t a = 1; a <= 6; ++a)
+        for (uint16_t b = a + 1; b <= 6; ++b)
+            EXPECT_NE(fpByVersion[a], fpByVersion[b])
+                << "fp(v" << a << ") must differ from fp(v" << b << ")";
+
+    // For each K, GetTopicSchema(requestedFingerprint=fp(vK)) must resolve
+    // to EXACTLY version K with a blob that re-fingerprints to fp(vK).
+    for (uint16_t k = 1; k <= 6; ++k) {
+        h.captured.clear();
+        const int64_t corr = 300 + k;
+        pc::GetTopicSchema g; g.sessionId = 1; g.correlationId = corr;
+        g.topicName = "characters"; g.requestedFingerprint = fpByVersion[k];
+        std::vector<uint8_t> gf(g.encodedSize()); g.encode(gf.data());
+        h.gw.applyGetTopicSchemaForTest(gf.data(), gf.size());
+        h.pump();
+
+        std::optional<pc::TopicSchemaResponse> resp;
+        for (auto& [sid, bytes] : h.captured) {
+            auto d = pc::TopicSchemaResponse::decode(bytes.data(), bytes.size());
+            if (d && d->correlationId == corr) { resp = d; break; }
+        }
+        ASSERT_TRUE(resp.has_value()) << "no response for fp(v" << k << ")";
+        EXPECT_EQ(resp->errorCode, 0u) << "fp(v" << k << ") must resolve (OK)";
+        EXPECT_EQ(resp->version, k)
+            << "requestedFingerprint=fp(v" << k << ") must bind version " << k
+            << ", not some other version in the lineage";
+        ASSERT_GT(resp->descriptorLen, 0u);
+
+        const Descriptor dk = rune::codec::deserialize(
+            std::span<const uint8_t>(resp->descriptorBlob, resp->descriptorLen));
+        EXPECT_EQ(rune::codec::fingerprint(dk), fpByVersion[k])
+            << "the returned blob must be the MATERIALIZED-as-of-v" << k
+            << " descriptor (a client compiled at v" << k << " must bind)";
+    }
+
+    // requestedFingerprint=0 -> latest (v6), even across a long lineage.
+    {
+        h.captured.clear();
+        pc::GetTopicSchema g; g.sessionId = 1; g.correlationId = 400;
+        g.topicName = "characters"; g.requestedFingerprint = 0;
+        std::vector<uint8_t> gf(g.encodedSize()); g.encode(gf.data());
+        h.gw.applyGetTopicSchemaForTest(gf.data(), gf.size());
+        h.pump();
+
+        std::optional<pc::TopicSchemaResponse> resp;
+        for (auto& [sid, bytes] : h.captured) {
+            auto d = pc::TopicSchemaResponse::decode(bytes.data(), bytes.size());
+            if (d && d->correlationId == 400) { resp = d; break; }
+        }
+        ASSERT_TRUE(resp.has_value());
+        EXPECT_EQ(resp->errorCode, 0u);
+        EXPECT_EQ(resp->version, 6u)
+            << "requestedFingerprint==0 must return latest across a long lineage";
+        const Descriptor dLatest = rune::codec::deserialize(
+            std::span<const uint8_t>(resp->descriptorBlob, resp->descriptorLen));
+        EXPECT_EQ(rune::codec::fingerprint(dLatest), fpByVersion[6]);
+    }
+
+    // An unknown fingerprint (matches no version across the 6-version
+    // lineage) -> UnknownTopic, never a silent fallback to latest.
+    {
+        h.captured.clear();
+        pc::GetTopicSchema g; g.sessionId = 1; g.correlationId = 401;
+        g.topicName = "characters"; g.requestedFingerprint = 0xabadcafeULL;
+        std::vector<uint8_t> gf(g.encodedSize()); g.encode(gf.data());
+        h.gw.applyGetTopicSchemaForTest(gf.data(), gf.size());
+        h.pump();
+
+        std::optional<pc::TopicSchemaResponse> resp;
+        for (auto& [sid, bytes] : h.captured) {
+            auto d = pc::TopicSchemaResponse::decode(bytes.data(), bytes.size());
+            if (d && d->correlationId == 401) { resp = d; break; }
+        }
+        ASSERT_TRUE(resp.has_value());
+        EXPECT_EQ(resp->errorCode, 7u)
+            << "UnknownTopic for a fingerprint matching no version across a long lineage";
+        EXPECT_EQ(resp->descriptorLen, 0u);
+    }
 }
 
 // ---------------------------------------------------------------------------
