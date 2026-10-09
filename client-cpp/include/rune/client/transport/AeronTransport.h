@@ -350,6 +350,15 @@ public:
     [[nodiscard]] rune_gso_totals_t gsoTotals() const noexcept { return gsoTotals_; }
     /// A7: the embedded driver polls its transports epoll-first (rune_driver_wake.h).
     [[nodiscard]] bool epollPollActive() const noexcept { return epollPollActive_; }
+    /// A7 review L2: rune_driver_wake.c reads Aeron driver INTERNALS (the transport poller's epoll fd, its
+    /// bindings clientd epoll_event[] array, the receiver / sender poller fields), verified against exactly
+    /// this Aeron release.  Any other runtime Aeron keeps Aeron's stock polling (no wake fds: the owner
+    /// backs off as before A7) and logs why — re-verify rune_driver_wake.c, then move the pin.  Same pin as
+    /// the broker (rune-broker 3763230).
+    static constexpr int kEpollPollAeronPin[3] = {1, 41, 4};
+    [[nodiscard]] static constexpr bool epollPollSupportsAeron(int major, int minor, int patch) noexcept {
+        return major == kEpollPollAeronPin[0] && minor == kEpollPollAeronPin[1] && patch == kEpollPollAeronPin[2];
+    }
     /// TEST SEAM — call before start(): the driver's next `count` GSO sendmsg calls fail with errno `err`.
     void injectGsoSendErrorsForTest(int err, int count) noexcept { gsoInjectErr_ = err; gsoInjectCount_ = count; }
 
