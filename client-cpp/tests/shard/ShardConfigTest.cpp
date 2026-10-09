@@ -20,6 +20,10 @@
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -200,6 +204,73 @@ TEST(ShardConfigRegression, DerivedPortCollisionRejectedBeforeAnyDriverStarts) {
     g.base.egressChannel = "aeron:ipc";
     EXPECT_NO_THROW(rs::validateShardGroupConfig(g, 64));
     EXPECT_THROW(rs::validateShardGroupConfig(g, 0), std::invalid_argument);
+}
+
+// C-F31 (T15a review m3): the collision check also catches a wildcard egress bind (0.0.0.0 / [::]) against a
+// gateway on this host, and a gateway named by its MDC control= endpoint.  RED (pre-fix): both passed — the
+// egress subscription would then fail to bind (or steal the gateway's port) at runtime.
+TEST(ShardConfigRegression, WildcardEgressOrMdcControlGatewayCollisionRejectedRegression) {
+    rs::ShardGroupConfig g;
+    g.base.dataDir        = uniqueDir("shard_collide2");
+    g.base.gatewayChannel = "aeron:udp?endpoint=127.0.0.1:40402";
+    g.base.egressChannel  = "aeron:udp?endpoint=0.0.0.0:40400";
+    g.shardCount          = 4;
+    EXPECT_THROW(rs::validateShardGroupConfig(g, 4), std::invalid_argument) << "0.0.0.0 binds the loopback port too";
+    EXPECT_NO_THROW(rs::validateShardGroupConfig(g, 2)) << "40400..40401 only";
+    g.base.egressChannel = "aeron:udp?endpoint=[::]:40400";
+    g.base.gatewayChannel = "aeron:udp?endpoint=localhost:40402";
+    EXPECT_THROW(rs::validateShardGroupConfig(g, 4), std::invalid_argument) << "[::] binds every local address";
+    // A gateway on another host never collides with a local wildcard bind.
+    g.base.gatewayChannel = "aeron:udp?endpoint=10.1.2.3:40402";
+    EXPECT_NO_THROW(rs::validateShardGroupConfig(g, 4));
+    // ... but one on this host's own (non-loopback) interface address does.
+    {
+        std::string local;
+        ifaddrs* ifs = nullptr;
+        if (::getifaddrs(&ifs) == 0) {
+            for (ifaddrs* i = ifs; i != nullptr && local.empty(); i = i->ifa_next) {
+                if (i->ifa_addr == nullptr || i->ifa_addr->sa_family != AF_INET) continue;
+                char buf[INET_ADDRSTRLEN] = {};
+                ::inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(i->ifa_addr)->sin_addr, buf, sizeof buf);
+                if (std::string(buf).rfind("127.", 0) != 0) local = buf;
+            }
+            ::freeifaddrs(ifs);
+        }
+        if (!local.empty()) {
+            g.base.egressChannel  = "aeron:udp?endpoint=0.0.0.0:40400";
+            g.base.gatewayChannel = "aeron:udp?endpoint=" + local + ":40402";
+            EXPECT_THROW(rs::validateShardGroupConfig(g, 4), std::invalid_argument) << "this host's " << local;
+        }
+    }
+    // MDC: the gateway named by control= (no endpoint=).
+    g.base.egressChannel  = "aeron:udp?endpoint=127.0.0.1:40400";
+    g.base.gatewayChannel = "aeron:udp?control=127.0.0.1:40402|control-mode=dynamic";
+    EXPECT_THROW(rs::validateShardGroupConfig(g, 4), std::invalid_argument) << "the MDC control port";
+    EXPECT_FALSE(std::filesystem::exists(g.base.dataDir)) << "nothing was started";
+}
+
+// C-F31 (T15a review m1): cgroup v2 limits come from the process's OWN cgroup and every ancestor up to the
+// root (a systemd CPUQuota= service, a container without cgroupns) — the tightest wins.  RED (pre-fix): only
+// <root>/cpu.max was read, so a sub-cgroup quota was ignored.
+TEST(ShardCountAutoRegression, CgroupV2QuotaIsTheTightestOverTheProcessCgroupAndItsAncestorsRegression) {
+    const std::string root = uniqueDir("cgroup_root");
+    namespace fs = std::filesystem;
+    auto put = [&](const std::string& rel, const char* text) {
+        fs::create_directories(root + rel);
+        std::ofstream(root + rel + "/cpu.max") << text;
+    };
+    put("", "max 100000\n");
+    put("/system.slice", "400000 100000\n");
+    put("/system.slice/app.service", "max 100000\n");
+    put("/system.slice/app.service/inner", "150000 100000\n");
+    EXPECT_EQ(rs::cgroupV2QuotaCpus(root, "0::/system.slice/app.service\n"), 4) << "the ancestor's quota";
+    EXPECT_EQ(rs::cgroupV2QuotaCpus(root, "0::/system.slice/app.service/inner\n"), 2) << "the tightest (ceil 1.5)";
+    EXPECT_EQ(rs::cgroupV2QuotaCpus(root, "0::/\n"), rs::kNoCpuQuota) << "a cgroup namespace root: unlimited";
+    EXPECT_EQ(rs::cgroupV2QuotaCpus(root, "12:cpu,cpuacct:/x\n1:name=systemd:/y\n0::/system.slice\n"), 4)
+        << "the v2 line among v1 ones";
+    EXPECT_EQ(rs::cgroupV2QuotaCpus(root, "12:cpu,cpuacct:/x\n"), rs::kNoCpuQuota) << "no v2 entry";
+    EXPECT_EQ(rs::cgroupV2QuotaCpus(root, "0::/system.slice/gone.service\n"), 4)
+        << "a missing cpu.max (not delegated) is no limit; the ancestors still are";
 }
 
 TEST(ShardConfigRegression, CoresOutsideAffinityMaskRejected) {

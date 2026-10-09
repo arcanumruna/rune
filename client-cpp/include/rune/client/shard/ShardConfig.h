@@ -110,6 +110,11 @@ struct ShardCount {
 /// kNoCpuQuota for "max" or anything malformed.
 [[nodiscard]] int32_t parseCgroupV2CpuMax(std::string_view text) noexcept;
 
+/// C-F31 (review m1): the cgroup v2 CPU quota of the process whose /proc/self/cgroup text is `procSelfCgroup`
+/// under the cgroup2 mount `cgroupRoot`: the tightest of <root><path>/cpu.max and every ancestor's up to the
+/// root (a missing file = no limit at that level).  kNoCpuQuota when unlimited or there is no v2 ("0::") entry.
+[[nodiscard]] int32_t cgroupV2QuotaCpus(const std::string& cgroupRoot, std::string_view procSelfCgroup);
+
 /// N, resolved once on the control thread before any driver starts (§2a):
 ///   explicit shardCount >= 1      -> shardCount
 ///   AUTO, Invoker mode            -> std::invalid_argument (N = number of app
@@ -134,7 +139,10 @@ struct ShardCount {
 /// Checks, before any driver starts, that N shards can be built (throws
 /// std::invalid_argument naming the shard and the cause):
 ///   count >= 1; every derived egress port fits (base + N - 1 <= 65535) and none
-///   equals the gateway endpoint (same host, localhost == 127.0.0.1); the
+///   equals the gateway endpoint (its endpoint=, or its MDC control=) on the same
+///   local bind: localhost == 127.0.0.1 == ::1, a wildcard egress (0.0.0.0 / [::])
+///   against a gateway on this host, names / aliases resolving to a common
+///   address (C-F31); the
 ///   transport config AFTER the RUNE_* env overrides passes transport::validate;
 ///   producer.maxFrameBytes <= term / 8; the receive window <= term / 2.
 void validateShardGroupConfig(const ShardGroupConfig& g, uint32_t count);
@@ -160,11 +168,13 @@ void validateShardGroupConfig(const ShardGroupConfig& g, uint32_t count);
 
 // ---- platform (control thread, before any shard thread exists) -------------
 
-/// Linux: the calling thread's sched_getaffinity mask.  macOS: hw.activecpu,
+/// Linux: the calling thread's sched_getaffinity mask (sized for any CPU count,
+/// C-F31).  macOS: hw.activecpu,
 /// as cores 0 .. n-1 (no affinity API).  Never empty (falls back to {0}).
 [[nodiscard]] CpuSet platformAllowedCpus();
 
-/// Linux: cgroup v2 /sys/fs/cgroup/cpu.max, else cgroup v1 cpu.cfs_quota_us /
+/// Linux: cgroup v2 — the tightest cpu.max of the process's own cgroup and its
+/// ancestors (cgroupV2QuotaCpus) — else cgroup v1 cpu.cfs_quota_us /
 /// cpu.cfs_period_us.  kNoCpuQuota when unlimited, absent, or not Linux.
 [[nodiscard]] int32_t platformQuotaCpus();
 
