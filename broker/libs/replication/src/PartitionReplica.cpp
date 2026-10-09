@@ -1778,17 +1778,19 @@ void PartitionReplica::enableEpochState_() noexcept
             es_.seq = st.seq;
             // D23: a file from an earlier build may be sparse at the slots'
             // heads — allocate them now (cold, this thread), so the worker's
-            // in-place writes never allocate.  Failed: nothing is reserved and
-            // the next write re-creates the file (cold, counted; fail-closed).
+            // in-place writes never allocate.  Failed: nothing is reserved; the
+            // worker then writes in place (pre-D23, review M2) and an inline
+            // write re-creates the file (cold, counted; fail-closed).
             {
                 const std::size_t want = ES::reserveFor(std::max(n, st.entries.size()), st.stride);
                 const int fd = ES::openExisting(dir);
-                const int rerr = fd < 0 ? -fd : ES::reserve(fd, st.stride, want, st.slot, ES::imageBytes(st.entries.size()));
+                const int rerr = reserveFaultForTest_ != 0 ? reserveFaultForTest_
+                               : fd < 0 ? -fd : ES::reserve(fd, st.stride, want, st.slot, ES::imageBytes(st.entries.size()));
                 if (fd >= 0) ::close(fd);
                 es_.reserved = rerr == 0 ? want : 0;
                 if (rerr != 0)
-                    spdlog::error("PartitionReplica[topic={} part={}]: reserving {} failed (errno={}) — the next "
-                                  "epoch-state write re-creates it", cfg_.topicId, cfg_.partitionId, ES::path(dir), rerr);
+                    spdlog::error("PartitionReplica[topic={} part={}]: reserving {} failed (errno={}) — the worker writes "
+                                  "it in place (unreserved); an inline write re-creates it", cfg_.topicId, cfg_.partitionId, ES::path(dir), rerr);
             }
             rune::storage::LeaderEpochCache onDisk;
             onDisk.replaceAll(st.entries);
@@ -1877,7 +1879,7 @@ bool PartitionReplica::writeEpochStateInline_() noexcept
             if (es_.fd >= 0) { ::close(es_.fd); es_.fd = -1; }
             const int fd = ES::create(esDir_, stride, seq, fence, ents.begin(), ents.end());
             ++es_.recreates;
-            if (fd < 0) { ++es_.errors; return false; }
+            if (fd < 0) { ++es_.errors; es_.lastErr = -fd; return false; }
             ::close(fd);
             es_.stride = stride;
             es_.reserved = ES::reserveFor(ents.size(), stride);
@@ -1916,6 +1918,7 @@ bool PartitionReplica::writeEpochStateInline_() noexcept
         return true;
     } catch (...) {
         ++es_.errors;
+        es_.lastErr = EIO;
         return false;
     }
 }
@@ -1926,22 +1929,26 @@ bool PartitionReplica::prepareEpochStateWrite(uint8_t* buf, std::size_t cap, Epo
     need = 0;
     if (!epochStateWriteDue()) return false;
     const std::size_t entries = epochImageEntries_();
-    if (!epochImageFitsInPlace_(entries)) [[unlikely]] {
-        // Cold, counted: the history outgrew the slot or its allocated head
-        // (D23) — re-created larger, once per doubling.  The head holds twice
-        // the history at creation (>= 338 entries), the slot 4096+ (D21 L1).
-        if (writeEpochStateInline_()) completePendingLeadershipIfDurable_();
+    if (ES::capacityOf(es_.stride) < entries) [[unlikely]] {
+        // Cold, counted: the history outgrew the SLOT (4096+ entries, D21 L1)
+        // — re-created larger (tmp + fsync + rename + dir fsync), once per
+        // doubling.  Lows A/B/C review M2: only this pre-D23 threshold runs a
+        // re-create on the worker pass — an image past the allocated head
+        // (D23; reserved = 0 after a failed reservation at enable) but inside
+        // the slot is written in place below, async, through the io backend
+        // (pre-D23 behaviour: that write may allocate a block — a failure goes
+        // through the regular async failure path, with its backoff).
+        if (writeEpochStateInline_()) { completePendingLeadershipIfDurable_(); return false; }
+        // Review M2: a failed re-create fails through the regular failure path
+        // (backoff, counted + logged, fail-closed for a pending leadership,
+        // fail-stop after kMaxEpochStateFailures) — never retried every pass.
+        failEpochStateWriteNow_(es_.lastErr != 0 ? es_.lastErr : EIO);
         return false;
     }
     need = ES::imageBytes(entries);
     if (cap < need) return false;
     if (const int openErr = openEpochStateFd_(); openErr != 0) {
-        es_.stage = EsStage::InFlight;              // fail through the regular failure path
-        es_.inflightSeq = ++es_.seq;
-        es_.inflightMin = es_.pendingMin;
-        es_.pendingMin = INT64_MAX;
-        es_.due = false;
-        (void)epochStateWriteCompleted(es_.inflightSeq, openErr);
+        failEpochStateWriteNow_(openErr);
         return false;
     }
     const int slot = es_.activeSlot < 0 ? 0 : 1 - es_.activeSlot;
@@ -1962,6 +1969,16 @@ bool PartitionReplica::prepareEpochStateWrite(uint8_t* buf, std::size_t cap, Epo
     out.offset = static_cast<int64_t>(slot) * static_cast<int64_t>(es_.stride);
     out.seq = seq;
     return true;
+}
+
+void PartitionReplica::failEpochStateWriteNow_(int err)
+{
+    es_.stage = EsStage::InFlight;              // fail through the regular failure path
+    es_.inflightSeq = ++es_.seq;
+    es_.inflightMin = es_.pendingMin;
+    es_.pendingMin = INT64_MAX;
+    es_.due = false;
+    (void)epochStateWriteCompleted(es_.inflightSeq, err);
 }
 
 void PartitionReplica::epochStateWriteSubmitted() noexcept

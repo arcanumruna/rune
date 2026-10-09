@@ -242,3 +242,121 @@ TEST(LeaderEpochFenceRegression, SparseEpochStateFileIsReservedOnEnableRegressio
     EXPECT_TRUE(r->writeEpochStateInlineForTest());
     EXPECT_EQ(r->epochStateRecreatesForTest(), recreates);
 }
+
+// Lows A/B/C review M2: D23 made the inline epoch-state re-create (tmp write +
+// fsync + rename + dir fsync: milliseconds) reachable from the WORKER duty
+// pass (prepareEpochStateWrite) whenever an image outgrew the reserved head —
+// and at ONCE when reserving failed at enable (reserved = 0: ENOSPC / EIO at
+// startup, the very disk-full case D23 L4 targets).  Fix: the worker re-creates
+// only when the image outgrows the SLOT (> 4096 entries, the pre-D23
+// threshold); past the reserved head it writes in place, async, through the
+// io backend.  Hot-path budget: prepareEpochStateWrite on the duty pass stays
+// an encode into the caller's buffer (no syscall beyond the lazy open) — well
+// under the 100 us pass budget; the ms re-create is off the common path.
+TEST(LeaderEpochFenceRegression, FailedReserveAtEnableNeverRecreatesOnTheWorkerPassRegression) {
+    Dir d;
+    const std::string stateDir = (d.path / "0-0.state").string();
+    const std::string legacy = (d.path / "0-0").string();
+    {   // first incarnation: creates the state file
+        rune::storage::InMemoryLog log(1 << 20, 10'000);
+        CapturingTransport t;
+        auto r = memReplica(log, t);
+        r->setExternalFollowerFlush(true);
+        r->setMemoryEpochStateDir(stateDir, legacy);
+        ASSERT_TRUE(r->epochStateEnabledForTest());
+    }
+    rune::storage::InMemoryLog log(1 << 20, 10'000);
+    CapturingTransport t;
+    auto r = memReplica(log, t);
+    r->setExternalFollowerFlush(true);
+    PartitionReplica::failEpochStateReserveForTest(ENOSPC);   // the disk is full at startup
+    r->setMemoryEpochStateDir(stateDir, legacy);
+    PartitionReplica::failEpochStateReserveForTest(0);
+    ASSERT_TRUE(r->epochStateEnabledForTest());
+    ASSERT_EQ(r->epochStateReservedForTest(), 0u) << "precondition: the reservation failed";
+    r->becomeLeader(7, kAll);
+    ASSERT_TRUE(r->leadershipPendingForTest());
+    const uint64_t recreates = r->epochStateRecreatesForTest();
+    const uint64_t inlineWrites = r->epochStateInlineWritesForTest();
+    std::vector<uint8_t> buf(64 * 1024);
+    PartitionReplica::EpochStateWrite w;
+    std::size_t need = 0;
+    // The owning worker's duty pass.
+    ASSERT_TRUE(r->prepareEpochStateWrite(buf.data(), buf.size(), w, need))
+        << "the worker pass did not get an async in-place write";
+    EXPECT_EQ(r->epochStateRecreatesForTest(), recreates) << "the worker pass re-created the file (fsync x2)";
+    EXPECT_EQ(r->epochStateInlineWritesForTest(), inlineWrites) << "synchronous epoch-state write on the worker";
+    r->epochStateWriteSubmitted();
+    ASSERT_EQ(::pwrite(w.fd, w.data, w.len, w.offset), static_cast<ssize_t>(w.len));
+    (void)r->epochStateWriteCompleted(w.seq, 0);
+    EXPECT_EQ(r->role(), Role::Leader);
+}
+
+// Lows A/B/C review M2: a FAILED re-create on the worker pass (the history
+// outgrew the slot, the disk is full / the dir gone) left the replica due with
+// no backoff: open(O_TRUNC) + pwrite + fsync retried on EVERY pass.  It now
+// fails through the async failure path: backoff (retryNotBeforeNs), counted,
+// logged, fail-closed for a pending leadership.
+TEST(LeaderEpochFenceRegression, FailedWorkerRecreateBacksOffRegression) {
+    using ES = rune::storage::LeaderEpochState;
+    Dir d;
+    const std::string stateDir = (d.path / "0-0.state").string();
+    const std::string legacy = (d.path / "0-0").string();
+    fs::create_directories(stateDir);
+    {   // a valid file with ONE-block slots: ~338 entries before the slot is outgrown
+        const std::vector<std::pair<int32_t, int64_t>> e;
+        const int fd = ES::create(stateDir, 4096, 1, 0, e.begin(), e.end());
+        ASSERT_GE(fd, 0);
+        ::close(fd);
+    }
+    rune::storage::InMemoryLog log(1 << 20, 100'000);
+    CapturingTransport t;
+    auto r = memReplica(log, t);
+    r->setExternalFollowerFlush(true);
+    r->setMemoryEpochStateDir(stateDir, legacy);
+    ASSERT_TRUE(r->epochStateEnabledForTest());
+    std::vector<uint8_t> buf(64 * 1024);
+    const std::vector<uint8_t> rec(64, 0x5a);
+    int64_t now = 1'000'000'000;
+    Epoch e = 1;
+    bool outgrown = false;
+    for (; e < 1000 && !outgrown; ++e) {
+        r->doWork(now);
+        r->becomeLeader(e, kAll);
+        ASSERT_TRUE(r->leadershipPendingForTest()) << "epoch " << e;
+        PartitionReplica::EpochStateWrite w;
+        std::size_t need = 0;
+        if (ES::imageBytes(r->leaderEpochCacheForTest().size() + 1) > 4096) {
+            outgrown = true;
+            break;
+        }
+        ASSERT_TRUE(r->prepareEpochStateWrite(buf.data(), buf.size(), w, need)) << "epoch " << e;
+        r->epochStateWriteSubmitted();
+        ASSERT_EQ(::pwrite(w.fd, w.data, w.len, w.offset), static_cast<ssize_t>(w.len));
+        (void)r->epochStateWriteCompleted(w.seq, 0);
+        ASSERT_EQ(r->role(), Role::Leader) << "epoch " << e;
+        ASSERT_GE(r->append(rec, false), 0);   // the next epoch starts later (a new entry)
+    }
+    ASSERT_TRUE(outgrown) << "precondition: the history outgrew the slot";
+    fs::remove_all(stateDir);   // the re-create fails (the dir is gone)
+    const uint64_t recreates = r->epochStateRecreatesForTest();
+    PartitionReplica::EpochStateWrite w;
+    std::size_t need = 0;
+    EXPECT_FALSE(r->prepareEpochStateWrite(buf.data(), buf.size(), w, need));
+    EXPECT_EQ(r->epochStateRecreatesForTest(), recreates + 1) << "precondition: the worker pass tried the re-create";
+    const uint64_t errors = r->epochStateErrorsForTest();
+    // The next passes (same time) must not retry it.
+    for (int i = 0; i < 5; ++i) {
+        r->doWork(now);
+        EXPECT_FALSE(r->prepareEpochStateWrite(buf.data(), buf.size(), w, need));
+    }
+    EXPECT_EQ(r->epochStateRecreatesForTest(), recreates + 1)
+        << "a failed re-create was retried on every pass (no backoff)";
+    EXPECT_EQ(r->epochStateErrorsForTest(), errors) << "the failed write was retried within its backoff";
+    EXPECT_FALSE(r->leadershipPendingForTest()) << "a failed fence write must fail closed";
+    EXPECT_FALSE(r->epochStateDurable()) << "the change was dropped (must stay due)";
+    // After the backoff it is retried (still due, never dropped).
+    r->doWork(now + 1'000'000'000);
+    (void)r->prepareEpochStateWrite(buf.data(), buf.size(), w, need);
+    EXPECT_GT(r->epochStateErrorsForTest(), errors) << "never retried after the backoff";
+}

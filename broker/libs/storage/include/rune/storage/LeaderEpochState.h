@@ -84,9 +84,12 @@ struct LeaderEpochState {
     }
     /// D23 (D21 review L4): the head of each slot whose blocks are ALLOCATED
     /// (written with zeros at create / enable) — room for twice `entries` (at
-    /// least one block), block-aligned, never past the slot.  An in-place slot
-    /// write must fit it (else the cold re-create), so the worker's write +
-    /// fdatasync never allocates a block (no ENOSPC on a full disk).
+    /// least one block), block-aligned, never past the slot.  An inline slot
+    /// write must fit it (else the cold re-create); the worker's async write
+    /// fits it until the history doubles past its creation-time size — past it
+    /// (or with nothing reserved) it writes in place and may allocate a block
+    /// (pre-D23 behaviour; lows A/B/C review M2: no ms re-create on the worker
+    /// pass short of outgrowing the slot).
     [[nodiscard]] static constexpr std::size_t reserveFor(std::size_t entries, std::size_t stride) noexcept {
         const std::size_t want = (imageBytes(2 * entries + 2) + 4095u) & ~static_cast<std::size_t>(4095u);
         const std::size_t r = want < 4096u ? 4096u : want;

@@ -1026,6 +1026,9 @@ public:
     bool writeEpochStateInlineForTest() noexcept { return writeEpochStateInline_(); }
     /// Tests (re-review N6): the next `n` inline epoch-state writes fail (process-wide, single-threaded tests).
     static void failInlineEpochStateWritesForTest(int n) noexcept { inlineFailN_ = n; }
+    /// Tests (review M2): while non-zero, reserving the slots' heads at enable
+    /// fails with it (process-wide, single-threaded tests).
+    static void failEpochStateReserveForTest(int err) noexcept { reserveFaultForTest_ = err; }
     /// Tests: deliver a held completion now.
     void releaseHeldEpochStateForTest() {
         esHoldForTest_ = false;
@@ -1450,6 +1453,7 @@ private:
         int64_t     inflightMin = INT64_MAX;
         int         failures = 0;       ///< consecutive failed writes (Md2)
         int64_t     retryNotBeforeNs = 0;
+        int         lastErr = 0;        ///< errno of the last failed inline re-create (review M2)
         uint64_t    writes = 0, inlineWrites = 0, errors = 0, recreates = 0, notRouted = 0;
     };
     EpochStateIo es_;
@@ -1467,8 +1471,13 @@ private:
     uint64_t leadGenSeq_ = 0;
     void enableEpochState_() noexcept;
     bool writeEpochStateInline_() noexcept;
+    /// Review M2: an owner-pass write that failed before submission (open /
+    /// re-create) — through the regular completion failure path (backoff).
+    void failEpochStateWriteNow_(int err);
     /// D23: an image of `entries` entries can be written in place — inside the
-    /// slot AND its allocated head (never a block allocation on the worker).
+    /// slot AND its allocated head (never a block allocation).  Used by the
+    /// cold inline writer only; the worker's async writer re-creates only past
+    /// the slot (review M2) and writes past the head in place.
     [[nodiscard]] bool epochImageFitsInPlace_(std::size_t entries) const noexcept;
     int  openEpochStateFd_() noexcept;   ///< 0 or errno
     void closeEpochStateFdIfIdle_() noexcept;
@@ -1487,6 +1496,7 @@ private:
     bool esHoldForTest_ = false;
     int  esFailN_ = 0, esFailErr_ = 0;
     static inline int inlineFailN_ = 0;
+    static inline int reserveFaultForTest_ = 0;
     uint64_t esHeldSeq_ = 0;  int esHeldErr_ = 0;  bool esHeld_ = false;
     uint64_t appliesDroppedAwaitEs_ = 0;
     void cancelPendingLeadership_() noexcept;
