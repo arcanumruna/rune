@@ -62,7 +62,7 @@ was restored and the test passed.
 **readInto status (d2ecf6e).**
 - `LogSegment::readInto` and `Log::readInto` now report a `ReadIntoStatus`: Ok, Absent, FirstTooLarge, Unreadable or IoError. The `bool firstTooLarge` overloads remain.
 - **Tail gap.** An Absent answer continues at the next segment's base, below the bound. It never continues past torn or unreadable bytes or an I/O error.
-- **I/O errors.** Any pread failure, including a file shorter than its written size, is IoError and is sticky. It is never reported as FirstTooLarge.
+- **I/O errors.** Any pread failure, including a file shorter than its written size, is IoError. It is never reported as FirstTooLarge. ("Sticky" here meant within one `readInto` call only; nothing persisted across calls. Since the lows A/B/C mediums round (review M1), a read I/O error fails the log, sticky, like a write failure.)
 - **Too-large batches.** A first batch that is genuinely too large is read through once (cold) before FirstTooLarge is reported, so a bad page there also answers IoError instead of SIGBUS in the mapped fallback.
 - **Bound.** The read stops one index interval past the index entry for the bound. The batch holding the bound starts less than one interval after that entry, and the first batch is still always read whole.
 - Counters added: `readIntoErrors`, `readIntoBytes`.
@@ -75,10 +75,10 @@ was restored and the test passed.
 
 **Provisioner read maps (d8aee26).**
 - `prepareStaging` no longer maps by default. Before, every staged segment got a 1 MiB mmap on the provisioner and an munmap at seal.
-- The half-full growth request in `maybeRoll` is now only posted for a log that has a mapped reader. A log has one once `readView` has been called on it; the flag is sticky.
+- The half-full growth request in `maybeRoll` is now only posted for a log that has a mapped reader. A log has one once `readView` has been called on it; the flag was sticky (since review M3 it decays at a roll with no `readView` since the previous one).
 - The proof is a counter: `readMapGrowRequestsForTest`, together with `hasReadMapForTest` on every staged segment, in the test above.
 - Owner cost: one bool test per append.
-- Cold mapped readers (RC / PSM rebuild, truncation prep, the rare too-large fallback) now map a new active segment lazily on their first `readView`: one 1 MiB mmap on the owner.
+- Cold mapped readers (RC / PSM rebuild, truncation prep, the rare too-large fallback) now map a new active segment lazily on their first `readView`: an owner mmap sized to cover the active segment (1 MiB doubled until it covers the written bytes), not "one 1 MiB mmap". (Corrected by review L9 / M3; since M3 the provisioner maps it off the owner again, requested at the first append after the roll.)
 - `LateReadMapForSupersededRequestIsDiscardedRegression` now issues a mapped read first, because growth is only provisioned for mapped readers.
 
 ## 3. A7-L — transport lows from 2026-10-04-a7-review.md
@@ -154,4 +154,4 @@ The Linux-only assertions were compiled but not run here: the C1 positive contro
 
 - **A7 L1 and the client halves of LOW-1 / LOW-2 / L5** live in rune-protocol and rune-client-cpp, which this brief keeps out of scope. They need a follow-up there. The client also carries its own copy of the epoll-first install and needs the same Aeron pin as L2.
 - **Legacy gateway path.** `readView` (used by the legacy inline gateway push path without a WorkerPool, `ClientGateway.cpp:3963`) does not continue past a compacted tail gap. Only `readInto` does. The RC and PSM rebuilds already skip gaps themselves.
-- **D26 LOW-1 trade-off.** Cold mapped readers now map a new active segment on the owner at their first read (one 1 MiB mmap). Previously the provisioner pre-mapped it.
+- **D26 LOW-1 trade-off.** Cold mapped readers now map a new active segment on the owner at their first read (an mmap sized to cover the active segment — up to the whole segment, not one 1 MiB mmap). Previously the provisioner pre-mapped it. Fixed by review M3 (the provisioner maps it again for logs with a mapped reader).
