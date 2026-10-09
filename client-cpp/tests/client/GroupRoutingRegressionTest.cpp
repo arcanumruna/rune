@@ -1468,13 +1468,20 @@ TEST(GroupRoutingRegression, NotCoordinatorWithAConnectCorrIdNeverFailsTheConnec
     EXPECT_NE(r.client.testSessionStateAt(0), rc::session::SessionState::Disconnected)
         << "a NotCoordinator answer failed the seed's connect";
     r.gw.replyConnects = true;
-    bool ok = false;
-    ASSERT_TRUE(r.drive([&] {
-        r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
-            if (cc.token == t) ok = cc.status == rc::OpStatus::Ok;
-        });
-        return ok;
-    }, 4'000'000)) << "the seed never connected";
+    // r3 MEDIUM-2: the property is that the seed CONNECTS (it was never failed);
+    // the app's connect() op itself may race its own deadline (the seed's retry
+    // and connect() both fire at 5 s), so it is not the oracle.
+    // Bounded by wall time, not a pump count: the seed's connect retry is a
+    // 5 s timer, which a fast host's pump loop can outrun.
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    bool connected = false;
+    while (!connected && std::chrono::steady_clock::now() < until) {
+        r.client.doWork();
+        r.gw.pump();
+        r.cq.poll([](const rc::Completion&, std::span<const uint8_t>) {});
+        connected = r.client.testSessionStateAt(0) == rc::session::SessionState::Connected;
+    }
+    ASSERT_TRUE(connected) << "the seed never connected";
 }
 
 // D4 fallback: the named coordinator is unreachable — its session gives up
@@ -1612,9 +1619,12 @@ TEST(GroupRoutingRegression, SessionExpiredForTheCoordinatorSessionNeverHitsTheS
     rc::GroupConfig gcfg;
     gcfg.sessionTimeoutMs = 600;
     auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    int appErrors = 0;   // r3 MEDIUM-1: the app sees no error for the coordinator session's expiry
+    r.client.onError([&](const std::string&) { ++appErrors; });
     r.connect();
     ASSERT_TRUE(r.drive([&] { return gc.generation() == 1 && r.gw.heartbeats >= 1; }, 4'000'000));
     const int64_t coordSid = r.gw.groupSessionIds.back();
+    const int errorsBefore = appErrors;
     ASSERT_NE(coordSid, r.seedSid);
     ASSERT_EQ(r.gw.connectsAt[0], 1);
     ASSERT_EQ(r.gw.connectsAt[n1], 1);
@@ -1624,6 +1634,7 @@ TEST(GroupRoutingRegression, SessionExpiredForTheCoordinatorSessionNeverHitsTheS
     EXPECT_EQ(r.gw.connectsAt[n1], 2) << "the coordinator session did not resume";
     EXPECT_EQ(r.gw.connectsAt[0], 1) << "the SessionExpired of the coordinator session hit the seed";
     EXPECT_EQ(r.client.testSessionStateAt(0), rc::session::SessionState::Connected);
+    EXPECT_EQ(appErrors, errorsBefore) << "the seed's ops / onError were failed for another session's expiry";
 }
 
 // r2 LOW-5: a commitSync of a member whose coordinator is a session of its own

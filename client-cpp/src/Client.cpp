@@ -2351,6 +2351,14 @@ void Client::onEgressFrame(codec::TemplateId tid,
         const bool sessionFatal =
             (ec == rpc::ErrorCode::SessionExpired ||
              ec == rpc::ErrorCode::UnknownSession);
+        // D4 r3 MEDIUM-1: a session-fatal answer for ANOTHER session (the
+        // coordinator session — the agent routes it there by its cluster-unique
+        // header sessionId) is not the seed's: the seed's pending connect /
+        // control ops and the app's onError stay untouched.
+        if (sessionFatal && opt->sessionId != 0) {
+            const int64_t seedSid = agent_.seedSession().machine.sessionId();
+            if (seedSid != 0 && opt->sessionId != seedSid) break;
+        }
         const auto ecode = static_cast<uint16_t>(opt->code);
         const auto text  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(msg.data()), msg.size());
         completeConnect_(OpStatus::BrokerError, 0, ecode, msg);
