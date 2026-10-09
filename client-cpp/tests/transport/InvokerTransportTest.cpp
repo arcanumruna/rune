@@ -668,9 +668,13 @@ TEST(InvokerTransportWakeRegression, PeerDownNeverLeavesWakeFdsReadyAfterAnIdleP
         const timespec zero{0, 0};
         return ::ppoll(pf, static_cast<nfds_t>(n), &zero, nullptr) > 0;
     };
-    // A7 re-review LOW-1: the positive control — an ICMP error was actually pending at least once (a wake fd
-    // readable between passes: the only readiness these send-only sockets can have).  Without it the quiet-park
-    // assertions below would pass vacuously if setup frames / ICMP stopped (an Aeron upgrade, a sysctl, a route).
+    // A7 re-review LOW-1: the positive control — an ICMP error was actually delivered at least once.  Without it
+    // the quiet-park assertions below would pass vacuously if setup frames / ICMP stopped (an Aeron upgrade, a
+    // sysctl, a route).  Two witnesses: a wake fd readable between passes (the error pending), or an epoll_wait of
+    // the SENDER poller that selected a socket (epollSelectedForTest: these send-only sockets have no peer, so a
+    // selection is an EPOLLERR the pass consumed).  The second does not depend on catching the error between two
+    // sub-microsecond passes — the next pass's poll usually consumes it first (seen in a Linux container).
+    (void)t.epollSelectedForTest(/*reset=*/true);
     int pendingSeen = 0;
     for (int round = 0; round < 3; ++round) {
         // an ICMP error pending, or 350 ms (>= 3 setup frames per publication)
@@ -682,10 +686,11 @@ TEST(InvokerTransportWakeRegression, PeerDownNeverLeavesWakeFdsReadyAfterAnIdleP
         EXPECT_EQ(::ppoll(pf, static_cast<nfds_t>(n), &park, nullptr), 0)
             << "round " << round << ": wake fd left ready by an unconsumed EPOLLERR";
     }
+    const int errorsConsumed = t.epollSelectedForTest(/*reset=*/false);
     t.stop();
-    // Some network namespaces (Docker bridge / container CI) never deliver the port-unreachable error to the
-    // sender — that environment cannot exercise the path, so it SKIPS (loudly) instead of passing vacuously.
-    if (pendingSeen == 0)
+    // Some network namespaces never deliver the port-unreachable error to the sender — that environment cannot
+    // exercise the path, so it SKIPS (loudly) instead of passing vacuously.
+    if (pendingSeen == 0 && errorsConsumed == 0)
         GTEST_SKIP() << "no ICMP port-unreachable error was ever pending in this network namespace — "
                         "the peer-down path cannot be exercised here";
 #endif
