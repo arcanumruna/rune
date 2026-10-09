@@ -423,12 +423,15 @@ TEST(ControlledShutdownRegression, ControllerGracefulStopHandsConsensusAndPartit
     expectNeverSentToVictim(c, ports, sid, victim, produced, "after the controlled shutdown, before exit");
     const auto stopAt = std::chrono::steady_clock::now();
     c.whilePumping([&] { ns[static_cast<std::size_t>(victim)]->stop(); });
+    const auto stopTook = std::chrono::steady_clock::now() - stopAt;
     expectNeverSentToVictim(c, ports, sid, victim, produced, "right after the stop");
     std::map<int, int64_t> sid2;
     for (auto& [k, v] : sid) if (k != victim) sid2[k] = v;
+    const auto produceAt = std::chrono::steady_clock::now();
     ASSERT_TRUE(produceAll(c, ports, newController, sid2, 2, produced)) << "post-stop produce failed";
-    // The whole post-stop round trip ran without a ~2 s failover window.
-    EXPECT_LT(std::chrono::steady_clock::now() - stopAt, 10s);
+    // The post-stop round trip (the stop + the first produces) ran without a ~2 s failover window.  D31 box
+    // run: NOT measured across expectNeverSentToVictim, whose drain waits a fixed poll cap (~5-10 s loaded).
+    EXPECT_LT(stopTook + (std::chrono::steady_clock::now() - produceAt), 10s);
     // The consensus never left the new controller (no timeout re-election).
     for (int i = 0; i < 3; ++i)
         if (i != victim) EXPECT_EQ(consensusLeaderOnControl(*ns[static_cast<std::size_t>(i)]), newController);

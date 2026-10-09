@@ -30,6 +30,8 @@
 #include <set>
 #include <string_view>
 #include <thread>
+#include <pthread.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 using namespace rune::node;
@@ -339,10 +341,17 @@ TEST(ShardModeRegression, NonWorkerThreadsPinnedOffTheWorkerCoresRegression) {
     EXPECT_EQ(currentThreadCpus(), allowed) << "start() must restore the caller's mask";
     ASSERT_TRUE(node.awaitLeader(10'000ms));
     // Runs on worker 0 (owner of st/0) after its pass prologue re-pinned it.
-    const auto workerCpus = node.onOwnerThreadForTest(0, 0, [](rune::replication::PartitionReplica&) {
+    // D34: the box saw the full mask here once (1 of 4 -j3 runs, not reproduced locally) — name the
+    // executing thread so the next failure says WHERE the task ran.
+    std::string ranOn;
+    const auto workerCpus = node.onOwnerThreadForTest(0, 0, [&ranOn](rune::replication::PartitionReplica&) {
+        char name[32] = {0};
+        (void)pthread_getname_np(pthread_self(), name, sizeof name);
+        ranOn = std::string(name) + " tid " + std::to_string(static_cast<long>(::syscall(SYS_gettid)));
         return currentThreadCpus();
     });
-    EXPECT_EQ(workerCpus, std::vector<int32_t>{allowed.back()}) << "the worker runs on exactly its own core";
+    EXPECT_EQ(workerCpus, std::vector<int32_t>{allowed.back()}) << "the worker runs on exactly its own core (ran on "
+                                                               << ranOn << ")";
 
     std::set<std::string> named;
     int brokerThreads = 0;
