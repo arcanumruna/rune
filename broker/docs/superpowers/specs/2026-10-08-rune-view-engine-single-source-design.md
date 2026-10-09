@@ -30,7 +30,7 @@ Every design choice below is checked against the Rune HARD RULES. The load-beari
 - **Rich-state state machines (#3).** Per-key fold state and the snapshot lifecycle are explicit states (§7, §9), not scattered booleans.
 - **Zero steady-state allocation (#4).** The view table is a preallocated open-addressing flat table with inline fixed-width rows (the `FixedStr` payoff from 0c) + a reused arena for variable-width payloads. The fold reuses buffers. Snapshot buffers are ping-pong-reused, not per-snapshot allocated.
 - **No virtual calls on the hot path.** The fold dispatches per-field merge by a compiled `MergeRule` enum + `switch`, not virtual operator objects (§6). The dataflow "operators" are a *design* abstraction compiled to a flat plan, not a runtime object graph on the fold path.
-- **Off the produce critical path.** The fold runs in the worker's duty cycle over its own committed log `[cursor, HW)`, bounded per cycle — never on the produce ack path. Serialize + fsync runs on a background thread, never the worker (§9).
+- **Off the produce critical path.** The fold runs in the worker's duty cycle over its own read-committed log `[cursor, LSO)` (§11 — LSO, not raw HW, so aborted/in-flight transactions never materialize), bounded per cycle — never on the produce ack path. Serialize + fsync runs on a background thread, never the worker (§9). A produce may optionally hold its ack until dependent views have folded it (§11.1), but that is an opt-in per-produce acknowledgement, not the fold path moving onto the produce path.
 - **Deterministic / time-independent convergence (#16).** The fold is a pure function of the committed log prefix; replica and leader converge to the identical view table at the same offset regardless of timing (§11).
 - **Test + benchmark everything (#5), regression-test every fix (#6), fix-on-sight (#8).** §14.
 
@@ -59,7 +59,7 @@ A view is a **sink**, not a puller. When a batch commits on a topic-partition, t
 subscriptionIndex : (topicId, partition) → [viewId, …]   // views interested in this source
 ```
 
-On commit of `[cursor, HW)` for a partition, the worker's Reactor looks up the interested views and drives each view's fold over the newly committed records. The source topic carries the list of its subscriber views; the view does not scan topics. This keeps the dispatch O(interested views), co-located on the worker that already owns the log — no cross-thread hop to update a view.
+On each advance of `[cursor, LSO)` for a partition (read-committed; §11), the worker's Reactor looks up the interested views and drives each view's fold over the newly committed records. The source topic carries the list of its subscriber views; the view does not scan topics. This keeps the dispatch O(interested views), co-located on the worker that already owns the log — no cross-thread hop to update a view.
 
 > **Why this shape (recorded from design dialogue):** we do not make the *view* know its sources for pull; we make the *source* know its subscriber views for push. A reactor dealing in sinks collects the interested views on commit and applies the plan's transformations/merges/projections. For a join, the same index simply maps one worker's co-partitioned sources to the shared view (§8).
 
@@ -103,7 +103,7 @@ Critically, name resolution happens **once, at `DefineView` time on the AdminWor
 
 - The codec read primitive is `readField(descriptor, record, uint16_t fieldId)` — it reads **by field id**, not by name. Resolving a *name* costs a linear `find()` scan; doing that per record per field on the fold path would be a hot-path string scan, violating #4 / ultra-low-latency.
 - So at `DefineView` the AdminWorker fetches the source topic's `Descriptor` from `__topic_schemas` and, for the `key` and every `srcField`, calls `find()` → resolves to `{ fieldId, type, width }`. This is also where it **validates**: the name exists, its type is numeric for `Sum/Min/Max`, the key field exists, and output types resolve.
-- Because 0b schemas are **additive-only with stable field ids**, a resolved `fieldId` stays valid across later additive schema versions — no re-resolution on evolution.
+- Because field identity is a **durable never-reused tag** (schema-evolution foundation, SHIPPED), a resolved `(topicId, tag)` stays valid across **arbitrary** later evolution — additive or breaking — with no re-resolution: a version that dropped the tag simply reports it absent at fold time (§11.1 / §15 #9), and per-record decode uses that record's version-materialized descriptor (§6).
 
 This gives **two plan forms** — the authoring plan (string names, the Rune QL / `DefineView` wire form) and the compiled plan (resolved ids) installed into the worker's Reactor:
 
@@ -166,7 +166,7 @@ Reads go **by resolved field id** against the source Descriptor the compiled pla
 
 ```
 desc = plan.srcDesc[thisSource]                        // resident Descriptor
-for each committed record r in [cursor, HW) for an interested view:
+for each committed record r in [cursor, LSO) for an interested view:   // read-committed; §11
     k = readField(desc, r, plan.keyFieldId)            // codec zero-copy read BY ID (0a)
     if r is a tombstone (zero-length value):           // §6.2
         erase substate[k]; viewTable.erase(k); continue
@@ -267,8 +267,39 @@ Mirrors the 0b `DefineTopic`/`__topic_schemas`/`AdminWorker` design (shared-noth
 ## 11. Fold ownership & deterministic convergence
 
 - The worker owns the partition's log on **both roles**: leader (produce → `appendNoSyncRestamp`) and follower (`ApplyReplicated` → `applyReplicated`), both on the worker thread.
-- The worker folds its **own committed log `[cursor, HW)`** in its duty cycle, **bounded per cycle**, off the produce critical path.
+- The worker folds its **own committed, read-committed log `[cursor, LSO)`** in its duty cycle, **bounded per cycle**, off the produce critical path. **The fold cursor advances to the `LSO` (last stable offset), not raw `HW`** — derived state must be read-committed: an aborted transaction's records must never materialize, and an in-flight transaction must not leak into a view. Records inside an open transaction fold only once its **commit marker** lands and the LSO crosses them; an abort marker skips them entirely. (A non-transactional record's LSO == its commit offset, so the common path is unchanged.)
 - Because the fold is a **pure function of the committed log prefix**, leader and every follower converge to the **identical view table at the same offset**, independent of timing (#16). Failover is ~free: the new leader already has the folded view (or rebuilds it deterministically from its replicated log via §9.4).
+
+### 11.1 View-apply acknowledgement — durability × apply-point (per-produce)
+
+A produce (or transaction commit) carries **two orthogonal acknowledgement axes**, selected **per-produce** (exactly like `acks` today):
+
+- **Durability (existing):** `None` (fire-and-forget) / `Leader` (`acksAll=false`) / `Majority` (`acksAll=true`, the ISR quorum). *How many log copies hold the record before the ack.*
+- **Apply-point (new):** `OnCommit` (**default** — ack as soon as durability is met, before views) / `OnViewApply` (ack only after **every** view that depends on this event has folded it). *Whether the ack waits for derived state.*
+
+`OnViewApply` is **scoped to the durability level**, which is exactly the leader-vs-majority distinction:
+- `Leader + OnViewApply` → the **leader's** dependent views have applied this offset.
+- `Majority + OnViewApply` → the **same ISR/majority quorum** that satisfied durability has folded it into their view replicas.
+
+`OnViewApply` is monotonic over durability (you cannot fold what is not committed), so it is always "durable **and then** applied," never weaker. `None + OnViewApply` is invalid (no ack to delay) and rejected at the API boundary.
+
+**API shape (elegant: durability is the base, applying-after-views is a modifier).**
+```cpp
+Ack::none()                   // fire-and-forget
+Ack::leader()                 // legacy: leader-durable, ack before views
+Ack::leader().afterViews()    // leader-durable AND the leader's dependent views applied
+Ack::majority()               // legacy: majority-durable, ack before views
+Ack::majority().afterViews()  // majority-durable AND dependent views applied across the ISR quorum
+```
+One value `Ack{ Durability durability; ApplyPoint applyPoint = OnCommit; }`; `.afterViews()` flips `applyPoint`. A produce that fans out to several dependent views waits for **all** of them. Leaves room for future apply-points (`.afterIndexed()`, …) without a new top-level enum.
+
+**Mechanism (shared-nothing, ring-only — #1/#2).** Each `(view, partition)` fold publishes an **apply-watermark** = "view *V* applied through source offset *O*" (monotone). The produce ack is held pending until the required watermarks reach the record's commit offset:
+- **Leader scope:** the leader waits until every dependent view's apply-watermark ≥ `O`. Views may live on other workers of this node; their watermarks reach the ack site over a ring (no shared mutable state, no cross-thread callback).
+- **Majority scope:** each follower piggybacks its view-apply watermark on the **existing replication ack feedback** — no new transport. The leader acks when the ISR quorum's view-apply watermarks ≥ `O`.
+
+**Cost (honest, opt-in).** `OnViewApply` adds up to one fold duty-cycle of latency (bounded per cycle), and for `Majority` a follower fold + feedback RTT. It is a per-produce read-your-writes-on-views guarantee, never the default, so the `OnCommit` fast path carries zero new cost.
+
+**Transactions.** The apply-point of a **transactional** produce is its **commit marker**, not the individual records. Because the fold only crosses a transaction at its commit marker (LSO, above), a view never shows a *partial* transaction — it jumps from "none of the txn" to "all of it." So `commitTransaction(Ack::majority().afterViews())` means: the commit marker is majority-durable **and** the dependent views across the ISR quorum reflect the **whole** committed transaction before the commit returns — EOS/all-or-nothing extended to derived views, composing with the existing D9 cross-node markers. The composed guarantee is: **durability(commit marker) × apply(dependent views folded past the commit marker, at the durability scope).**
 
 ## 12. Read path — `GetViewRow`
 
@@ -311,6 +342,7 @@ The schema-evolution prerequisite's decode path (`readField`-by-tag against a ma
 - **Fold determinism:** same log prefix → identical table byte-for-byte, across orderings that preserve per-key commit order; leader vs replica table equality at equal offset.
 - **Persistence round-trip:** snapshot → kill → load+replay `[O+1, HW)` → table equals the never-restarted table (time-independent, #16). Crash-mid-write leaves prior complete snapshot usable (CRC fallback). Offset in artifact exactly matches table.
 - **Shared-nothing audit:** no other thread touches a live `viewTable`; worker→IO handoff is ring + immutable snapshot only (extend the existing no-atomics / single-driver checker scripts).
+- **Apply-point acknowledgement (§11.1):** (a) `OnCommit` acks before the fold runs (ack offset ≤ any view apply-watermark) — and its latency is **unchanged** vs today's `acks` (ABAB regression, #12). (b) `Leader + OnViewApply` ack arrives only after every dependent view's apply-watermark ≥ the record offset (fan-out to multiple views waits for all). (c) `Majority + OnViewApply` ack arrives only after the ISR quorum's view-apply watermarks ≥ the offset; a non-quorum of applied followers does **not** ack. (d) **Transactional:** with `commitTransaction(... .afterViews())`, a `GetViewRow` observed by any acked reader shows **all-or-nothing** of the txn — never a partial transaction; an aborted txn never appears in the view (read-committed/LSO, §11). (e) `None + OnViewApply` is rejected at the API boundary.
 - **E2E (real Aeron, default config):** define a view over a topic, produce, `GetViewRow`, restart broker, confirm view recovered to latest — firsthand green before "done" (#16), via a `docker/view-engine-e2e.sh` mirroring 0b/0c e2e scripts.
 - **Benchmarks (gated against §14.0):** fold update latency per event batch **< 10 µs** p99 (zero-alloc verified); `GetViewRow` single-node **< 50 µs** p99; multi-node query **< 200 µs** p99; plus snapshot cut pause (worker memcpy time vs table size) and produce-path regression (fold off the critical path must not move produce latency — ABAB n≥15, #12). A benchmark that exceeds its §14.0 budget is a failing gate, not a note.
 - **Regression suite:** every fix gets a `*Regression*` test; full regression suite runs first on every change (#6/#7).
@@ -331,6 +363,8 @@ The schema-evolution prerequisite's decode path (`readField`-by-tag against a ma
    - **At `DefineView`:** the AdminWorker validates every referenced `(topicId, name→tag)` against the source topic's current Descriptor and **rejects** obvious errors — a name that does not resolve, or a tag already dropped at the bound version. (A later-defined view over an already-evolved topic cannot silently reference a field that no longer exists.)
    - **At runtime:** a field dropped by a *later* `ALTER TOPIC DROP` degrades to **null/absent** in the view column for records written after the drop; the fold never wedges and the view stays coherent (`(topicId, tag)` identity + `isLiveAt` per writer version). No view invalidation, no coupling of `ALTER TOPIC` to view lifecycle.
    - Retype is treated as drop-old-tag + add-new-tag at the schema layer, so a view bound to the old tag sees it go absent (same runtime rule); a view wanting the new field is redefined to reference the new tag.
+
+10. **View-apply acknowledgement (RESOLVED 2026-10-09, §11.1):** two orthogonal per-produce axes — Durability `{None, Leader, Majority}` × Apply-point `{OnCommit (default), OnViewApply}` — with `OnViewApply` scoped to the durability level (leader-local dependent views, or the same ISR/majority quorum), selected per-produce via `Ack::…().afterViews()`. `None + OnViewApply` invalid. Fold is read-committed (`[cursor, LSO)`); a transactional write's apply-point is its commit marker, giving all-or-nothing view visibility (EOS extended to derived state).
 
 ## 16. Deferred follow-ons (program-level)
 
