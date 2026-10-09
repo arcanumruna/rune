@@ -101,6 +101,12 @@ public:
     }
     ~ShardTestClient() { pubs_.clear(); exclusivePubs_.clear(); egress_.reset(); aeron_.reset(); }
 
+    /// Keep every session this client connected alive like a real client does
+    /// (rune-client-cpp SessionMachine: a Keepalive every 1 s) while it waits.
+    /// Off by default: tests that model a SILENT client (paused, no keepalive)
+    /// rely on the gateway's lease.
+    void keepSessionsAlive(bool on) noexcept { keepalive_ = on; }
+
     const std::string& egressChannel() const noexcept { return egressChannel_; }
     /// Advertise the reply channel under `host` (the subscription stays bound on
     /// 127.0.0.1) — a client that sends a HOSTNAME in its ConnectRequest.
@@ -128,7 +134,9 @@ public:
         const std::size_t len = req.encode(buf.data());
         if (!send(gatewayChannel, stream, buf.data(), len)) return -1;
         for (int i = 0; i < kMaxIters && !connect_; ++i) { poll_(); pause_(); }
-        return connect_ && connect_->code == 0 ? connect_->assignedSessionId : -1;
+        if (!connect_ || connect_->code != 0) return -1;
+        sessions_.push_back({gatewayChannel, stream, connect_->assignedSessionId});
+        return connect_->assignedSessionId;
     }
 
     bool produce(const std::string& channel, int32_t stream, int64_t sessionId, int64_t corr,
@@ -387,7 +395,26 @@ private:
     }
     void pause_() {
         pump_();
+        keepalive_tick_();
         std::this_thread::sleep_for(std::chrono::microseconds{100});
+    }
+
+    /// keepSessionsAlive: one Keepalive per connected session every 1 s (the
+    /// real client's interval) — a single non-blocking offer, never a wait.
+    void keepalive_tick_() {
+        if (!keepalive_ || sessions_.empty()) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now < nextKeepalive_) return;
+        nextKeepalive_ = now + std::chrono::seconds{1};
+        for (const auto& [channel, stream, sid] : sessions_) {
+            auto it = pubs_.find({channel, stream});
+            if (it == pubs_.end() || !it->second) continue;
+            pc::Keepalive k; k.sessionId = sid; k.correlationId = ++corr_;
+            uint8_t buf[pc::Keepalive::ENCODED_SIZE];
+            const std::size_t len = k.encode(buf);
+            aeron::concurrent::AtomicBuffer ab(buf, static_cast<aeron::util::index_t>(len));
+            (void)it->second->offer(ab, 0, static_cast<aeron::util::index_t>(len));
+        }
     }
 
     void poll_() {
@@ -439,6 +466,10 @@ private:
     bool                                             invoker_ = false;
     std::shared_ptr<aeron::Aeron>                    aeron_;
     std::string                                      egressChannel_;
+    bool                                             keepalive_ = false;   // keepSessionsAlive
+    struct ConnectedSession { std::string channel; int32_t stream; int64_t sessionId; };
+    std::vector<ConnectedSession>                    sessions_;
+    std::chrono::steady_clock::time_point            nextKeepalive_{};
     std::shared_ptr<aeron::Subscription>             egress_;
     std::map<std::pair<std::string, int32_t>, std::shared_ptr<aeron::Publication>> pubs_;
     std::map<int, std::shared_ptr<aeron::ExclusivePublication>> exclusivePubs_;   // D8d: offerUntilPausedExclusive

@@ -27,6 +27,7 @@
 #include "support/OwnerThreadTestHelpers.h"
 #include "support/ShardTestClient.h"
 
+#include <rune/gateway/ClientGateway.h>
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/protocol/RecordBatch.h>
@@ -319,6 +320,7 @@ TEST(ControlledShutdownRegression, NonControllerGracefulStopHandsEveryPartitionO
     ASSERT_FALSE(victimParts.empty());
 
     ShardTestClient c(cd.path);
+    c.keepSessionsAlive(true);   // D31: a real client keeps its session alive across idle rounds
     std::map<int, int64_t> sid;
     std::array<int, kParts> produced{};
     ASSERT_TRUE(produceAll(c, ports, controller, sid, 3, produced)) << "pre-stop produce failed";
@@ -393,6 +395,7 @@ TEST(ControlledShutdownRegression, ControllerGracefulStopHandsConsensusAndPartit
     ASSERT_FALSE(oldEpoch.empty());
 
     ShardTestClient c(cd.path);
+    c.keepSessionsAlive(true);   // D31: a real client keeps its session alive across idle rounds
     std::map<int, int64_t> sid;
     std::array<int, kParts> produced{};
     ASSERT_TRUE(produceAll(c, ports, victim, sid, 3, produced)) << "pre-stop produce failed";
@@ -625,4 +628,40 @@ TEST(ControlledShutdownRegression, ControllerPlainStopHaltsDecisionsAndHandsOffR
     }, 20'000ms)) << "the stopped controller's partitions never moved to the survivors";
     ns[static_cast<std::size_t>(s1)]->stop();
     ns[static_cast<std::size_t>(s2)]->stop();
+}
+
+// ===========================================================================
+// D31: the graceful-stop tests above idle their test client between rounds
+// (a bounded drain + the stop).  The test client sent nothing while idle, so on
+// a loaded host the gap crossed the gateway's 10 s session lease and every
+// survivor reaped the session (survivors "answered no metadata").  A real
+// client keeps its session alive (SessionMachine: Keepalive every 1 s); the
+// test client does too once its keepalive is on.  Proof: a client idle for
+// longer than the lease still gets its metadata answered on the SAME session.
+// ===========================================================================
+TEST(ControlledShutdownRegression, TestClientIdleBeyondTheSessionLeaseKeepsItsSessionRegression) {
+    TmpDir d0{"k0"}, d1{"k1"}, d2{"k2"}, cd{"kcl"};
+    const auto ports = Ports::discover(3);
+    std::array<std::unique_ptr<BrokerNode>, 3> ns;
+    for (int i = 0; i < 3; ++i) {
+        const fs::path& d = i == 0 ? d0.path : i == 1 ? d1.path : d2.path;
+        ns[static_cast<std::size_t>(i)] = std::make_unique<BrokerNode>(makeConfig(i, d, ports));
+        ns[static_cast<std::size_t>(i)]->start();
+    }
+    for (auto& n : ns) ASSERT_TRUE(n->awaitLeader(30s));
+
+    ShardTestClient c(cd.path);
+    c.keepSessionsAlive(true);
+    const int64_t sid = c.connect(gatewayChannel(ports, 0), kClientStream);
+    ASSERT_GT(sid, 0);
+    ASSERT_FALSE(c.metadata(gatewayChannel(ports, 0), kClientStream, sid).empty());
+
+    constexpr auto kLease = std::chrono::nanoseconds{rune::gateway::ClientGateway::kDefaultSessionTimeoutNs};
+    const auto idleUntil = std::chrono::steady_clock::now() + kLease + 2s;
+    while (std::chrono::steady_clock::now() < idleUntil)
+        (void)c.pollUntil([&] { return std::chrono::steady_clock::now() >= idleUntil; });
+
+    EXPECT_FALSE(c.metadata(gatewayChannel(ports, 0), kClientStream, sid).empty())
+        << "the session was reaped while its client was idle but alive";
+    for (auto& n : ns) n->stop();
 }
