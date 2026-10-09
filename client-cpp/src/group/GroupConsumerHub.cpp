@@ -373,7 +373,7 @@ void GroupConsumerHub::sendJoinGroup(GroupConsumerImpl& impl,
                                         std::span<const int32_t>(impl.topicIds));
     if (len == 0) return;
 
-    sendFn(0, impl.sendBuf.data(), len);
+    impl.joinSessionId = sendFn(0, impl.sendBuf.data(), len) ? sessionId : 0;  // D4
 
     impl.state = GroupConsumerState::Joining;
     impl.joinDeadline = tpNow() + std::chrono::milliseconds(impl.cfg.sessionTimeoutMs);
@@ -408,7 +408,7 @@ void GroupConsumerHub::sendSyncGroup(GroupConsumerImpl& impl,
     const std::size_t len = msg.encode(impl.sendBuf.data());
     if (len == 0) return;
 
-    sendFn(0, impl.sendBuf.data(), len);
+    impl.joinSessionId = sendFn(0, impl.sendBuf.data(), len) ? sessionId : 0;  // D4
 
     impl.state = GroupConsumerState::Syncing;
 }
@@ -1071,7 +1071,9 @@ int GroupConsumerHub::doWork(int64_t nowNs,
 
         case GroupConsumerState::Joining:
             // Awaiting JoinGroupResponse. Guard against stale join (timeout).
-            if (now >= impl->joinDeadline) {
+            // D4: a Join the coordinator session refused (back-pressure) is
+            // re-offered on the next pass once that session is connected.
+            if (now >= impl->joinDeadline || (impl->joinSessionId == 0 && sessionConnected_ && sessionId != 0)) {
                 // Re-send JoinGroup (rejoin guard expired).
                 sendJoinGroup(*impl, sessionId, sendFn);
                 ++work;
@@ -1079,8 +1081,9 @@ int GroupConsumerHub::doWork(int64_t nowNs,
             break;
 
         case GroupConsumerState::Syncing:
-            // Awaiting SyncGroupResponse. Guard with join deadline.
-            if (now >= impl->joinDeadline) {
+            // Awaiting SyncGroupResponse. Guard with join deadline (D4: or the
+            // Sync was refused — re-join at once once connected).
+            if (now >= impl->joinDeadline || (impl->joinSessionId == 0 && sessionConnected_ && sessionId != 0)) {
                 toRejoining_(*impl);
             }
             break;
@@ -1561,7 +1564,40 @@ void GroupConsumerHub::onConnected(int64_t sessionId, const SendFn& sendFn)
         if (impl->state == GroupConsumerState::Unjoined  ||
             impl->state == GroupConsumerState::Rejoining) {
             sendJoinGroup(*impl, sessionId, sendFn);
+        } else if ((impl->state == GroupConsumerState::Joining ||
+                    impl->state == GroupConsumerState::Syncing) &&
+                   impl->joinSessionId != sessionId) {
+            // D4 (first review MAJOR-1): a Join / Sync in flight on ANOTHER
+            // session (a coordinator move, a reconnect mid-join, or held — never
+            // sent — while this session connected) is never answered here:
+            // re-join on this one now instead of idling until the join deadline.
+            // One that went out on THIS session (a resume that kept its id) is
+            // left alone: the coordinator may hold it (a rebalance), and a
+            // second JoinGroup with an empty memberId would register a ghost
+            // member (review MEDIUM-3).  After a session id change the held
+            // join's answer is addressed to the old session (lost, or taken by
+            // the re-join); a ghost from the old join costs one rebalance after
+            // sessionTimeoutMs — the same as waiting out the join deadline (the
+            // broker reaps members by sessionTimeoutMs, not with the client
+            // session; KIP-394 MEMBER_ID_REQUIRED is the real fix — ticket).
+            toRejoining_(*impl);
+            sendJoinGroup(*impl, sessionId, sendFn);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// onCoordinatorMoved — D4: the coordinator is now on another session (the
+// client's coordinator route moved); the seed session never moves for it
+// ---------------------------------------------------------------------------
+
+void GroupConsumerHub::onCoordinatorMoved()
+{
+    for (std::size_t ix = 0, nx = impls_.size(); ix < nx; ++ix) {  // re-entrancy safe (I-3)
+        GroupConsumerImpl* const impl = impls_[ix];
+        if (!impl->active) continue;
+        if (impl->state == GroupConsumerState::Unjoined || impl->state == GroupConsumerState::Rejoining) continue;
+        toRejoining_(*impl);   // Joining / Syncing / Stable: re-join on the coordinator session (doWork / onConnected)
     }
 }
 

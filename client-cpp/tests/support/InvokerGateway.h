@@ -166,6 +166,7 @@ struct InvokerGateway {
     }
     // ConnectRequests received per endpoint (answered or not).
     std::map<int, int> connectsAt;
+    std::vector<int64_t> connectCorrIds;  // D4: the correlationId of every ConnectRequest
     bool                   subscribeNotLeader = false;
     int                    subscribeRefusals  = 0;
     // Consumer-group coordinator model (off by default = the historical gateway,
@@ -186,6 +187,22 @@ struct InvokerGateway {
     // NotCoordinator (the broker's isLocalCoordinator() fence).
     int  coordinatorEndpoint = -1;
     int  notCoordinatorAnswers = 0;
+    // D4 (broker 2026-10-08): a follower answers a coordinator request with
+    // ErrorResponse{NotCoordinator, coordinator endpoint} ("host:port") when it
+    // knows the coordinator.  Empty = the typed NotCoordinator answer.
+    std::string coordinatorRedirectTo;
+    // D4: the endpoint every txn COORDINATOR request (InitProducerId /
+    // AddPartitionsToTxn / EndTxn) arrived on; with coordinatorRedirectTo set, one
+    // arriving on a node that is not coordinatorEndpoint is answered
+    // ErrorResponse{NotCoordinator, coordinatorRedirectTo, its corrId}.
+    std::vector<int> coordinatorEndpoints;
+    /// An ErrorResponse from endpoint `from` (a late / unsolicited answer).
+    void sendError(int from, int16_t code, const std::string& message, int64_t sessionId, int64_t corrId) {
+        namespace rcc = rune::client::codec;
+        std::vector<uint8_t> e(256 + message.size());
+        const std::size_t en = rcc::encodeErrorResponse(e.data(), e.size(), code, message, sessionId, corrId);
+        send(from, e.data(), en);
+    }
     // A rebalance in progress: Heartbeats are answered RebalanceInProgress
     // until the next JoinGroup (which completes it at groupGeneration).
     bool rebalancing = false;
@@ -637,9 +654,17 @@ struct InvokerGateway {
 private:
     // NotCoordinator fence: true (and answered) when `endpoint` is not the coordinator.
     template <class Resp>
-    bool notCoordinator_(int endpoint, int64_t sessionId, Resp r) {
+    bool notCoordinator_(int endpoint, int64_t sessionId, Resp r, int64_t corrId = 0) {
         if (coordinatorEndpoint < 0 || endpoint == coordinatorEndpoint) return false;
         ++notCoordinatorAnswers;
+        if (!coordinatorRedirectTo.empty()) {
+            // The real broker (review LOW-5): the request's own correlationId,
+            // answered on the session's own node.
+            sendError(replyFromArrival ? endpoint : 0,
+                      static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator),
+                      coordinatorRedirectTo, sessionId, corrId);
+            return true;
+        }
         r.sessionId     = sessionId;
         r.correlationId = 0;
         r.errorCode     = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator);
@@ -651,6 +676,17 @@ private:
             n = r.encode(out.data(), {});
         }
         send(0, out.data(), n);
+        return true;
+    }
+
+    // D4: the txn coordinator fence (only with coordinatorRedirectTo set).
+    bool txnNotCoordinator_(int endpoint, int64_t sessionId, int64_t corrId) {
+        coordinatorEndpoints.push_back(endpoint);
+        if (coordinatorRedirectTo.empty() || coordinatorEndpoint < 0 || endpoint == coordinatorEndpoint) return false;
+        ++notCoordinatorAnswers;
+        sendError(replyFromArrival ? endpoint : 0,
+                  static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator),
+                  coordinatorRedirectTo, sessionId, corrId);
         return true;
     }
 
@@ -888,6 +924,7 @@ private:
             }
             ++connects;
             ++connectsAt[endpoint];
+            connectCorrIds.push_back(c->correlationId);
             if (!replyConnects || silentEndpoints.count(endpoint) != 0) return;
             for (const Produced& pr : ackBeforeNextConnect) ack(pr);
             ackBeforeNextConnect.clear();
@@ -1103,6 +1140,7 @@ private:
             ++initPids;
             const auto ip = rp::InitProducerId::decode(buf, len);
             if (ip) coordinatorSessionIds.push_back(ip->sessionId);
+            if (ip && txnNotCoordinator_(endpoint, ip->sessionId, ip->correlationId)) return;
             if (!ip || !initPidReply) return;
             rp::InitProducerIdResponse rsp;
             rsp.sessionId     = ip->sessionId;
@@ -1122,6 +1160,7 @@ private:
             ++addPartitions;
             const auto ap = rp::AddPartitionsToTxn::decode(buf, len);
             if (ap) coordinatorSessionIds.push_back(ap->sessionId);
+            if (ap && txnNotCoordinator_(endpoint, ap->sessionId, ap->correlationId)) return;
             if (!ap || !replyTxn) return;
             rp::AddPartitionsToTxnResponse rsp;
             rsp.sessionId     = ap->sessionId;
@@ -1138,6 +1177,7 @@ private:
             const auto et = rp::EndTxn::decode(buf, len);
             if (!et) return;
             coordinatorSessionIds.push_back(et->sessionId);
+            if (txnNotCoordinator_(endpoint, et->sessionId, et->correlationId)) return;
             endTxnCommits.push_back(et->commit);
             if (!replyTxn) return;
             rp::EndTxnResponse rsp;
@@ -1163,7 +1203,7 @@ private:
             groupSessionIds.push_back(j->sessionId);
             groupEndpoints.push_back(endpoint);
             if (!groupProtocol) return;
-            if (notCoordinator_(endpoint, j->sessionId, rp::JoinGroupResponse{})) return;
+            if (notCoordinator_(endpoint, j->sessionId, rp::JoinGroupResponse{}, j->correlationId)) return;
             rebalancing = false;
             if (holdJoins) {
                 pendingJoins.push_back(j->sessionId);
@@ -1179,7 +1219,7 @@ private:
             groupSessionIds.push_back(sg->sessionId);
             groupEndpoints.push_back(endpoint);
             if (!groupProtocol) return;
-            if (notCoordinator_(endpoint, sg->sessionId, rp::SyncGroupResponse{})) return;
+            if (notCoordinator_(endpoint, sg->sessionId, rp::SyncGroupResponse{}, sg->correlationId)) return;
             std::vector<rp::TopicPartition32> asgn;
             for (const auto& [t, p] : groupAssignment) {
                 rp::TopicPartition32 tp;
@@ -1203,7 +1243,7 @@ private:
             groupSessionIds.push_back(hb->sessionId);
             groupEndpoints.push_back(endpoint);
             if (!groupProtocol) return;
-            if (notCoordinator_(endpoint, hb->sessionId, rp::HeartbeatResponse{})) return;
+            if (notCoordinator_(endpoint, hb->sessionId, rp::HeartbeatResponse{}, hb->correlationId)) return;
             rp::HeartbeatResponse r;
             r.sessionId     = hb->sessionId;
             r.correlationId = 0;

@@ -231,6 +231,11 @@ struct GroupConsumerImpl {
     std::chrono::steady_clock::time_point nextHeartbeat;
     std::chrono::steady_clock::time_point nextAutoCommit;
     std::chrono::steady_clock::time_point joinDeadline;  // for rejoin backoff guard
+    // D4: the session id the Join / Sync in flight went out on (0 = refused /
+    // not sent: held while the coordinator session connects).  A connect of THAT
+    // session (a resume keeping its id) keeps the in-flight join — re-sending it
+    // with an empty memberId would register a ghost member (review MEDIUM-3).
+    int64_t joinSessionId = 0;
 
     // ---- Send scratch buffers (duty thread, zero-alloc hot path) --------------
     std::vector<uint8_t> sendBuf;
