@@ -728,6 +728,17 @@ void Log::installNextSegment(int64_t base) {
     // reconciles — so the entry is durable once a directory fsync issued
     // after this point completes.
     segments_.rbegin()->second->setDirEntryGen(++dirMutGen_);
+    // Lows A/B/C review M3: mapReaders_ decays — a log with no readView since
+    // the previous roll (a finished rebuild walk) stops provisioning read maps
+    // for its new active segments (each an off-owner mmap nobody reads).  The
+    // next readView sets it again.
+    if (readViewCalls_ == readViewsAtRoll_) mapReaders_ = false;
+    readViewsAtRoll_ = readViewCalls_;
+    // An outstanding growth request was for the segment just sealed (its
+    // answer is discarded as superseded — seq-matched, re-review N2): the new
+    // active segment may request its own mapping at once.
+    growOutstanding_ = false;
+    growWaits_ = 0;
     // Review M3: the new active segment demands its successor at the threshold.
     thresholdPosted_ = false;
     holdChecks_ = 0;            // a hold episode ends with the roll
@@ -1071,6 +1082,9 @@ LogReadView Log::readView(int64_t startOffset, int32_t maxBytes) noexcept {
         LogSegment& seg = *it->second;
         const bool active = std::next(it) == segments_.end();
         maybeGrowReadMap_(seg, it->first, active);
+        // Review M3: the provisioner has not answered the active segment's
+        // map request yet — the owner maps it now (counted, cold).
+        if (active && seg.readMapBytes() == 0 && seg.sizeBytes() > 0) [[unlikely]] ++ownerFallbackRemaps_;
         // Re-review N3: never stall readers on the provisioner — data already
         // past the mapping is served by a (counted, cold) owner remap.
         const bool beyond = seg.readMapBytes() != 0 && static_cast<std::size_t>(seg.sizeBytes()) > seg.readMapBytes();
@@ -1085,7 +1099,12 @@ LogReadView Log::readView(int64_t startOffset, int32_t maxBytes) noexcept {
 
 void Log::maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept {
     const std::size_t mapped = seg.readMapBytes();
-    if (mapped == 0) return;                                        // no mapping yet: readView creates it
+    // Lows A/B/C review M3: an UNMAPPED active segment of a log with a mapped
+    // reader (D26: staged segments carry no read map) is mapped off the owner
+    // too — requested from 0 at the first append after the roll — so the next
+    // readView finds it mapped instead of mmapping the whole active segment on
+    // the owner.  A sealed one is mapped lazily by readView (D30).
+    if (mapped == 0 && (!active || !mapReaders_)) return;
     // D21 re-review-2 low: a SEALED segment never grows off the owner — it
     // wants growth only when read beyond its mapping, and readView remaps it
     // on the owner in that same call (re-review N3), so an async answer could

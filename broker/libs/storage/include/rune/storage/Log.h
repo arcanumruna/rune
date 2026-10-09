@@ -1058,7 +1058,8 @@ private:
     MapRing  mapRing_;                    ///< provisioner → owner: grown mappings
     bool     asyncReadGrowth_ = false;
     bool     growOutstanding_ = false;
-    bool     mapReaders_ = false;         ///< D26: readView was ever called (owner; sticky)
+    bool     mapReaders_ = false;         ///< D26: readView called since the previous roll (owner; review M3 decay)
+    uint64_t readViewsAtRoll_ = 0;        ///< readViewCalls_ at the last roll (review M3 decay)
     int64_t  growBase_ = -1;
     uint64_t growGen_ = 0;
     uint32_t growWaits_ = 0;

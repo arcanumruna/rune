@@ -96,9 +96,13 @@ std::unique_ptr<LogSegment> LogSegment::prepareStaging(
                                                 /*prefault*/true);
     // D26 (fix65 review LOW-1): no read mapping by default.  Push / fetch
     // reads pread (#65 / D26); only the cold mapped readers (RC rebuild, PSM
-    // rebuild, truncation prep, the rare too-large fallback) map — lazily on
-    // first readView — so a staged segment's mmap (+ its munmap at seal) was
-    // dead mmap_lock work for every push-only log.
+    // rebuild, truncation prep, the rare too-large fallback) map — so a
+    // staged segment's mmap (+ its munmap at seal) was dead mmap_lock work for
+    // every push-only log.  For a log WITH a mapped reader the provisioner
+    // maps the new active segment off the owner, requested at the first
+    // append after the roll (lows A/B/C review M3); only a readView that beats
+    // that answer maps on the owner (an mmap sized to cover the active
+    // segment — counted in ownerFallbackRemaps).
     if (readMapBytes > 0) seg->openReadMap(readMapBytes);
     return seg;
 }

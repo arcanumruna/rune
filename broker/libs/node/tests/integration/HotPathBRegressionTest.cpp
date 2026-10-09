@@ -947,6 +947,31 @@ TEST(HotPathBRegression, LateReadMapForSupersededRequestIsDiscardedRegression) {
     EXPECT_EQ(w.baseOffset, p.next - 2);
 }
 
+// Lows A/B/C review M3 (D26 LOW-1): with D26 a staged segment carries no read
+// map, and maybeGrowReadMap_ returned while the ACTIVE segment was unmapped —
+// so on a log with a mapped reader (RC / PSM rebuild, truncation prep, the
+// too-large fallback) the first readView after EVERY roll mmapped on the owner
+// (sized to cover the whole active segment; mmap_lock held for write).  The
+// first append after the roll now posts a provisioner map request for the new
+// active segment, so the reader finds it mapped: the owner never maps.
+TEST(HotPathBRegression, ActiveSegmentOfAMappedReaderLogIsMappedOffOwnerAfterARollRegression) {
+    ProvLog p(2LL << 20);
+    (void)p.log->readView(0, 1);            // a mapped reader
+    p.appendBytes(2200 * 1024);             // past the roll size
+    for (int i = 0; i < 64 && p.log->segmentBaseOffsets().size() < 2; ++i) { (void)p.prov.doWork(0); p.appendBytes(16 * 1024); }
+    ASSERT_GE(p.log->segmentBaseOffsets().size(), 2u) << "precondition: rolled";
+    const int64_t bBase = p.log->segmentBaseOffsets().back();
+    p.appendBytes(64 * 1024);               // the new active segment fills a little
+    for (int i = 0; i < 4; ++i) (void)p.prov.doWork(0);   // the provisioner serves what was posted
+    ASSERT_EQ(p.log->activeReadMapRemapsForTest(), 0u) << "precondition: nothing mapped on the owner yet";
+    const auto v = p.log->readView(bBase, 1);
+    ASSERT_FALSE(v.empty());
+    EXPECT_EQ(v.baseOffset, bBase);
+    EXPECT_EQ(p.log->activeReadMapRemapsForTest(), 0u)
+        << "the first mapped read after a roll mmapped the active segment on the owner";
+    EXPECT_GE(p.log->readMapGrowthsForTest(), 1u) << "the active segment's mapping did not come from the provisioner";
+}
+
 // N3: readers never stall on the provisioner — data past the mapping is served.
 TEST(HotPathBRegression, ReadsPastTheMappingNeverStallOnTheProvisionerRegression) {
     ProvLog p;
