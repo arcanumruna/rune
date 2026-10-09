@@ -1333,6 +1333,10 @@ ClientGateway::WorkerAdmit ClientGateway::workerAdmitsProduce_(int32_t worker, c
 //   * Event-driven (deferred polls, credits, closes), no timer.
 // The scan over sessions is cold: at most once per kCapEvictAfterDeferredPolls
 // deferred polls of a full worker.
+// Tags (uint16, global) are issued per episode AND per scan window (lows batch
+// C), so they wrap after 65535 WINDOWS — about 4M deferred polls (~80 s at 50k
+// polls/s), not 65536 episodes.  A wrap can alias a stale creditTagOn with a
+// fresh window: at worst one window's delay to an eviction (harmless).
 void ClientGateway::onWorkerCapFull_(int32_t worker)
 {
     CapEpisode& ep = capEpisode_[static_cast<std::size_t>(worker)];

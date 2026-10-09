@@ -1583,7 +1583,7 @@ private:
         uint32_t deferredPolls = 0;  ///< frames deferred by the FULL share in this episode
     };
     std::array<CapEpisode, kMaxHeldMaskWorkers>  capEpisode_{};
-    uint16_t                                     capEpisodeTags_ = 0;          // global, never 0 when issued
+    uint16_t                                     capEpisodeTags_ = 0;          // global, never 0 when issued; one per episode / scan window (wraps per 65535 windows)
     uint64_t                                     workerCapEvictions_ = 0;
     uint64_t                                     directShareExpiries_ = 0;   // D8d: worker Expire signals acted on
     int64_t                                      lastCapEvictedSid_ = 0;
