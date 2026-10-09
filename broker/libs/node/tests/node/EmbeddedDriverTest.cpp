@@ -780,7 +780,17 @@ TEST(EmbeddedDriverWakeRegression, PeerDownNeverLeavesWakeFdsReadyAfterAnIdlePas
         EXPECT_GE(msSinceWake(t0), 20) << "round " << round << ": a peer-down error must not end the park";
         EXPECT_EQ(idle.readinessWakes(), 0u) << "round " << round << ": wake fd left ready by an unconsumed EPOLLERR";
     }
-    EXPECT_GE(pendingSeen, 1) << "positive control: no ICMP error was ever pending — the test exercised nothing";
+    // Positive control: without a pending ICMP error the test exercised nothing.
+    // Some network namespaces (Docker bridge / container CI) never deliver the
+    // port-unreachable error to the sender — that environment cannot exercise
+    // the path, so it SKIPS (loudly) instead of passing vacuously or failing.
+    if (pendingSeen == 0) {
+        p1.reset();
+        p2.reset();
+        a.reset();
+        GTEST_SKIP() << "no ICMP port-unreachable error was ever pending in this network namespace — "
+                        "the peer-down path cannot be exercised here";
+    }
     p1.reset();
     p2.reset();
     a.reset();
