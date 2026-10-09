@@ -734,6 +734,34 @@ TEST(GatewayProduceCreditRegression, CapDeferredProduceIsNotReDecodedOnRedeliver
     EXPECT_EQ(r.gw.capDeferMemoAbortsForTest(), 10u);
 }
 
+// Lows A/B/C review L1: a cap-deferral memo was cleared only by a later Produce of its session or the session's close.
+// When the deferred frame never comes back (the client's image went away; the session is reaped ~10 s later),
+// capDeferredSessions_ stayed > 0 and every frame of every session left admitClientFrame_'s [[likely]] fast path
+// until then.  An image loss on the controlled subscription now clears the memos (cold; a memo is only a fast-path
+// hint — a frame that does come back re-runs the full check and re-memoizes).
+TEST(GatewayProduceCreditRegression, CapDeferralMemoIsClearedWhenAClientImageIsLostRegression) {
+    Rig r(/*withAcks=*/false);
+    r.gw.setWorkerRoutedCapForTest(4);
+    const int64_t h = r.gw.injectTestSession(r.now), e = r.gw.injectTestSession(r.now);
+    r.gw.noteControlledImagesForTest(2);
+    std::vector<std::vector<uint8_t>> fh;
+    for (int i = 0; i < 4; ++i) fh.push_back(produceFrame(h, i, 0));
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fh), 4u);
+    const std::vector<std::vector<uint8_t>> fe{produceFrame(e, 1, 0)};
+    ASSERT_EQ(r.gw.controlledPollFramesForTest(fe), 0u);
+    ASSERT_EQ(r.gw.capDeferredSessionsForTest(), 1u) << "precondition: e's deferral is memoized";
+    r.gw.noteControlledImagesForTest(2);   // no change: the memo stays
+    EXPECT_EQ(r.gw.capDeferredSessionsForTest(), 1u);
+    r.gw.noteControlledImagesForTest(1);   // e's image is gone: its frame never comes back
+    EXPECT_EQ(r.gw.capDeferredSessionsForTest(), 0u) << "a stale deferral memo keeps every frame off the fast path";
+    // A frame that does come back is still deferred correctly (full check, re-memoized).
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(fe), 0u);
+    EXPECT_EQ(r.gw.capDeferredSessionsForTest(), 1u);
+    r.gw.handleWorkerReturnForTest(creditSignal(h, 1));
+    EXPECT_EQ(r.gw.controlledPollFramesForTest(fe), 1u);
+    EXPECT_EQ(r.gw.capDeferredSessionsForTest(), 0u);
+}
+
 // D8c re-review LOW-R5 (lows batch C): the per-worker routed counters with TWO workers — produces forwarded to both
 // are counted on their owning worker; a Credit naming worker 1 returns only worker 1's share (and only the session's
 // share there — a Credit beyond it is clamped and counted, never taken from worker 0); a close returns the session's

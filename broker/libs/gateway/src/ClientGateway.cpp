@@ -580,6 +580,7 @@ int ClientGateway::doWork(int64_t nowNs) {
             },
             fragmentLimit_);
         controlledImageWatch_.afterPoll(*sub_, controlledAssembler_);
+        noteControlledImages_(sub_->imageCount());   // review L1: a lost image's deferral memo
     } else {
         // Task 11 fix 2 (B3): templated assembler + handler — no std::function.
         work += sub_->poll(
@@ -1268,6 +1269,18 @@ void ClientGateway::clearCapDeferred_(Session& s) noexcept
 {
     s.capDeferredOn = -1;
     --capDeferredSessions_;
+}
+
+void ClientGateway::noteControlledImages_(int images) noexcept
+{
+    // A memo is only a fast-path hint: a frame that does come back runs the
+    // full check (handleProduce) and is re-memoized while still refused.
+    if (images < lastControlledImages_ && capDeferredSessions_ != 0) [[unlikely]] {
+        sessions_.forEach([this](Session& s) {
+            if (s.capDeferredOn >= 0) clearCapDeferred_(s);
+        });
+    }
+    lastControlledImages_ = images;
 }
 
 // D8c: credits are counted only in shard mode (worker-side acks — the only mode

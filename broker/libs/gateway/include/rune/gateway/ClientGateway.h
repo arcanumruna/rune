@@ -1408,6 +1408,11 @@ private:
     enum class ProducePause : uint8_t { None, Held, NoCredit, WorkerCapFull, WorkerCapBand };
     [[nodiscard]] ProducePause produceFramePause_(const uint8_t* buf, std::size_t len, int32_t* capWorker = nullptr);
     void clearCapDeferred_(Session& s) noexcept;
+    /// Lows A/B/C review L1: the controlled subscription's image count after a
+    /// poll.  A drop (a client image lost) clears every cap-deferral memo —
+    /// a lost image's deferred frame never comes back to clear its own.  Cold.
+    void noteControlledImages_(int images) noexcept;
+    int  lastControlledImages_ = 0;
     [[nodiscard]] bool produceFrameHeld_(const uint8_t* buf, std::size_t len) {
         return produceFramePause_(buf, len) != ProducePause::None;
     }
@@ -2128,6 +2133,10 @@ public:
     /// Lows batch C (D8c R3): redeliveries of a cap-deferred Produce ABORTed by the per-session memo, before any
     /// decrypt / decode (control thread).
     [[nodiscard]] uint64_t capDeferMemoAbortsForTest() const noexcept { return capDeferMemoAborts_; }
+    /// Lows A/B/C review L1: sessions holding a cap-deferral memo; the controlled
+    /// subscription's image count after a poll (what the poll loop reports).
+    [[nodiscard]] std::size_t capDeferredSessionsForTest() const noexcept { return capDeferredSessions_; }
+    void noteControlledImagesForTest(int images) noexcept { noteControlledImages_(images); }
     void injectPendingRecordEgressForTest(int64_t sid, int32_t worker) { pendingRecordEgress_[{sid, worker}]; }
     [[nodiscard]] std::size_t pendingRecordEgressCountForTest() const noexcept { return pendingRecordEgress_.size(); }
 private:
