@@ -27,6 +27,13 @@
 #      GetTopicSchema binds it to its own v1, not latest).
 #   7. Two concurrent `rune schema alter` calls with the SAME --expected-version
 #      -> exactly one succeeds, the other returns SchemaConflict.
+#   8. (GC7) multi-producer-different-versions + long-lineage reopen: AFTER the
+#      full v1..v5 lineage, evo_probe_multi drives a v1-bound AND a v3-bound
+#      producer against the SAME evolved topic; both writes land; the mixed log
+#      is re-read and each sentinel record decodes per its OWN writer version
+#      (v1 keeps the original tag field, v3 reflects the drop/rename lineage) with
+#      no cross-version read; both producers fingerprint-select their OWN version
+#      (1 and 3), not latest (v5).
 #
 # Usage:  bash docker/schema-evolution-e2e.sh
 # Run from the rune-broker repo root (this worktree).  Requires the sibling
@@ -54,6 +61,7 @@ RECORDS_V1="${RECORDS_V1:-5}"
 RECORDS_V2="${RECORDS_V2:-5}"
 RECORDS_V3="${RECORDS_V3:-5}"
 RECORDS_V4="${RECORDS_V4:-5}"
+RECORDS_MULTI="${RECORDS_MULTI:-3}"   # GC7 phase 8: records PER producer (v1 + v3)
 
 # docker-compose.single.yml hardcodes `name: rune-broker-single` (also used,
 # unmodified, by docker/schema-e2e.sh).  Running under that SHARED project
@@ -85,6 +93,7 @@ fail() { echo "[schema-evolution-e2e] FAIL: $*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 [ -d "${PROJECTS}/rune-protocol" ] || fail "missing ../rune-protocol"
 [ -d "${PROJECTS}/rune-codec" ]    || fail "missing ../rune-codec"
+[ -d "${PROJECTS}/rune-crypto" ]   || fail "missing ../rune-crypto"
 [ -d "${PROJECTS}/rune-ql" ]       || fail "missing ../rune-ql"
 [ -d "${PROJECTS}/rune-fr" ]       || fail "missing ../rune-fr (symlink it to the canonical rune-fr checkout if not worktreed)"
 [ -d "${CLIENT_REPO}" ]            || fail "missing ../rune-client-cpp"
@@ -93,7 +102,7 @@ for f in v1.rql v2_add.rql v3_drop.rql v4_rename.rql v5_set_compat_forward.rql \
          v6_drop_reject.rql race_a.rql race_b.rql; do
     [ -f "${CLIENT_REPO}/tests/e2e/schema_evolution/${f}" ] || fail "missing tests/e2e/schema_evolution/${f}"
 done
-for f in evo_probe_v1.cpp evo_probe_v2.cpp evo_probe_v3.cpp evo_probe_v4.cpp; do
+for f in evo_probe_v1.cpp evo_probe_v2.cpp evo_probe_v3.cpp evo_probe_v4.cpp evo_probe_multi.cpp; do
     [ -f "${CLIENT_REPO}/tests/e2e/${f}" ] || fail "missing tests/e2e/${f}"
 done
 
@@ -137,16 +146,30 @@ docker image inspect "rune-broker-node:${RUNE_IMAGE_TAG}" >/dev/null 2>&1 \
     || fail "broker image not built: rune-broker-node:${RUNE_IMAGE_TAG}"
 
 log "Step 1b: Building client image (${CLIENT_IMAGE})..."
-docker build \
+# IMPORTANT: capture `docker build`'s OWN exit status directly (NOT through a
+# `| grep ... || true` pipe under `set -o pipefail`, which reports the grep's
+# exit and would unconditionally mask a genuinely broken build — the exact bug
+# the broker-build block above documents and guards). Filter for display only
+# AFTER the real rc is captured and checked, BEFORE the docker image inspect
+# defense-in-depth check. (GC7 fix-on-sight, philosophy #5/#16 test-masking.)
+set +e
+client_build_out=$(docker build \
     --platform linux/amd64 \
     -f "${CLIENT_DOCKERFILE}" \
     --build-context rune-protocol="${PROJECTS}/rune-protocol" \
     --build-context rune-codec="${PROJECTS}/rune-codec" \
     --build-context rune-ql="${PROJECTS}/rune-ql" \
     --build-context rune-fr="${PROJECTS}/rune-fr" \
+    --build-context rune-crypto="${PROJECTS}/rune-crypto" \
     -t "${CLIENT_IMAGE}" \
-    "${CLIENT_REPO}" 2>&1 \
-    | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+    "${CLIENT_REPO}" 2>&1)
+client_build_rc=$?
+set -e
+echo "${client_build_out}" | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
+if [ "${client_build_rc}" -ne 0 ]; then
+    echo "${client_build_out}" >&2
+    fail "client image build failed (exit ${client_build_rc}) — see full output above"
+fi
 docker image inspect "${CLIENT_IMAGE}" >/dev/null 2>&1 || fail "client image not built: ${CLIENT_IMAGE}"
 log "Build complete."
 
@@ -321,6 +344,21 @@ if [ "${successes}" -ne 1 ] || [ "${conflicts}" -ne 1 ]; then
 fi
 echo "[in] concurrent-alter race OK: exactly one success, one SchemaConflict"
 
+echo "[in] ===== PHASE 8 (GC7): multi-producer-different-versions + long-lineage reopen ====="
+# The topic is now at v5 (phase 5), the full v1->v2->v3->v4->v5 lineage behind
+# it.  evo_probe_multi links BOTH the v1 and v3 generated snapshots already
+# staged (phases 1 and 3) and, in ONE run against the evolved topic:
+#   (a) opens two producers bound to DIFFERENT versions (v1 and v3) and both
+#       write chars_evo;
+#   (b) re-reads the mixed log and decodes EACH of its sentinel records per its
+#       OWN writer version (v1 carries the original `name` tag; v3 reflects the
+#       drop/rename lineage) — no record cross-reads another version's layout;
+#   (c) asserts the v1-bound producer binds v1 and the v3-bound producer binds v3
+#       (fingerprint-select binds each to its OWN version, NOT latest v5).
+# Non-zero exit on ANY mismatch (handled by the container's set -e).
+cmake --build /build/build --target evo_probe_multi
+RUNE_RECORDS_MULTI="${RECORDS_MULTI}" /build/build/evo_probe_multi
+
 echo "SCHEMA-EVOLUTION-E2E: OK"
 EOS
 
@@ -345,6 +383,8 @@ client_out=$(docker run --rm \
     -e RECORDS_V2="${RECORDS_V2}" \
     -e RECORDS_V3="${RECORDS_V3}" \
     -e RECORDS_V4="${RECORDS_V4}" \
+    -e RECORDS_MULTI="${RECORDS_MULTI}" \
+    -e RUNE_RECORDS_MULTI="${RECORDS_MULTI}" \
     "${CLIENT_IMAGE}" \
     bash -c "${IN_CONTAINER}" 2>&1)
 client_rc=$?
@@ -371,5 +411,7 @@ log "  Single node self-elected: ${leader}"
 log "  v1 apply -> v2 add -> v3 drop (BACKWARD) -> v4 rename -> v5 set-forward"
 log "  -> drop REJECTED (SchemaIncompatible) -> v1-bound reopen at v5 OK"
 log "  -> concurrent same-version alter: 1 success + 1 SchemaConflict"
+log "  -> GC7: multi-producer v1+v3 both write evolved topic; mixed-log"
+log "         decode per writer version; v1/v3 reopen bind own version"
 log "  SCHEMA-EVOLUTION-E2E: OK, exit 0."
 log "========================================"

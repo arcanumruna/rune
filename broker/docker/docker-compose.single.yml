@@ -39,6 +39,12 @@ services:
         rune-fr: ../../rune-fr
         # rune-codec (0a): compiled sibling lib (src/ + include/) linked into rune_node
         rune-codec: ../../rune-codec
+        # rune-crypto (client<->broker TLS/AEAD, Task 5/7): compiled sibling lib
+        # (src/ + include/). The TLS/crypto merge from origin/main made the broker
+        # Dockerfile hard-require this via `COPY --from=rune-crypto …` +
+        # -DRUNE_CRYPTO_ROOT=/rune-crypto; without this named context the broker
+        # image build fails with "COPY --from=rune-crypto: context not found".
+        rune-crypto: ../../rune-crypto
     image: rune-broker-node:${RUNE_IMAGE_TAG:-single}
     platform: linux/amd64
     hostname: rune-1
