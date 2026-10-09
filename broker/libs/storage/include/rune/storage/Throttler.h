@@ -17,6 +17,7 @@
 // by I/O throttling.
 // ---------------------------------------------------------------------------
 
+#include <algorithm>
 #include <cstdint>
 #include <thread>
 #include <chrono>
@@ -54,10 +55,10 @@ public:
         const auto now = std::chrono::steady_clock::now();
         const auto elapsed = std::chrono::duration<double>(now - windowStart_).count();
 
-        if (elapsed <= 0.0) return;
-
-        const double rate = static_cast<double>(bytesInWindow_) / elapsed;
-        if (rate > static_cast<double>(maxBytesPerSec_)) {
+        // rate > max, without dividing: a burst within one clock tick of the
+        // window start (elapsed == 0 on a coarse clock) used to return here
+        // unthrottled (Throttler.BurstOverLimitSleeps flaked at 0 ms).
+        if (static_cast<double>(bytesInWindow_) > static_cast<double>(maxBytesPerSec_) * std::max(elapsed, 0.0)) {
             // Compute the sleep needed to bring the average rate down to the limit.
             // targetDuration = bytesInWindow / maxBytesPerSec
             // sleepMs = (targetDuration - elapsed) * 1000
