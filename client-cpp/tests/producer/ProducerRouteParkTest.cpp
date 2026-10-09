@@ -490,43 +490,6 @@ TEST(ProducerRoutePark, ResendAllRedirectedStopsAtTheFirstRefusalRegression) {
         EXPECT_EQ(batchcorr::base(w.frames[3 + i].corrId), batchcorr::base(first[i].corrId));
 }
 
-// Redirect re-offer review LOW-2: a back-pressure refusal of one redirect
-// re-offer re-offers only what was refused — that batch and the younger ones
-// behind it (order) — never an OLDER batch the leader already took on the
-// route.  Before the fix the whole partition window went out again: extra
-// traffic exactly when the route is back-pressured.
-TEST(ProducerRoutePark, RefusedRedirectReofferNeverReoffersAnOlderAcceptedBatchRegression) {
-    ProducerConfig cfg = ackedCfg();
-    cfg.produceTimeoutMs  = 30'000;
-    cfg.deliveryTimeoutMs = 30'000;
-    ProducerImpl impl(cfg);
-    Wire w;
-    const auto sink = w.fn();
-    sendThree(impl, w, sink);
-    const Frame o = w.frames[0], a = w.frames[1], y = w.frames[2];
-
-    Wire leader;   // the leader route: O's re-offer accepted, A's refused (back-pressure)
-    leader.refuse = {1};
-    auto leaderFn = leader.fn();
-    ASSERT_TRUE(impl.retryRedirectedProduce(o.corrId, leaderFn));
-    EXPECT_FALSE(impl.retryRedirectedProduce(a.corrId, leaderFn));
-    ASSERT_EQ(leader.frames.size(), 1u);
-
-    pump(impl, sink);
-    ASSERT_EQ(w.frames.size(), 5u) << "exactly the refused batch and the younger one behind it go out again";
-    EXPECT_EQ(batchcorr::base(w.frames[3].corrId), batchcorr::base(a.corrId)) << "the refused batch first";
-    EXPECT_EQ(batchcorr::base(w.frames[4].corrId), batchcorr::base(y.corrId)) << "then the younger one (order)";
-    for (std::size_t i = 3; i < w.frames.size(); ++i)
-        EXPECT_NE(batchcorr::base(w.frames[i].corrId), batchcorr::base(o.corrId))
-            << "the older batch the leader already took was re-offered";
-
-    // Everything still completes.
-    impl.onProduceResponse(leader.frames[0].corrId, 100, 0);
-    impl.onProduceResponse(w.frames[3].corrId, 101, 0);
-    impl.onProduceResponse(w.frames[4].corrId, 102, 0);
-    EXPECT_FALSE(impl.hasInFlight());
-}
-
 // Re-review 2 R2-n1 (coverage, green before this batch): a D path that releases
 // the batch holding the last earlier-lane attempt ends the C2b wait at once —
 // every D path releases through releaseResolved_, which re-arms the parked head

@@ -1183,11 +1183,6 @@ private:
     template <class Sink>
     bool resendRoute_(PartitionState& ps, int64_t nowNs, const Sink& sink);
     void queueRouteResend_(PartitionState& ps) noexcept;
-    /// Redirect review LOW-2: a refused redirect re-offer of `from` queues only
-    /// `from` and the batches younger than it (order) — not the older ones the
-    /// route already took.  A NotLeader-parked partition queues everything
-    /// (queueRouteResend_: the re-offer consumes the park).
-    void queueRouteResendFrom_(PartitionState& ps, const InFlightBatch& from) noexcept;
 
     [[nodiscard]] bool canFlight_(const PartitionState& ps) const noexcept {
         return static_cast<int32_t>(ps.inflight.live()) < cfg_.maxInFlight && !ps.inflight.full();

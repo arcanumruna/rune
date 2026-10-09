@@ -2811,9 +2811,7 @@ bool ProducerImpl::retryRedirectedProduce(int64_t corrId, SendFn& sendFn)
     // DR-2 (2026-10-05): refused (the leader's publication is still connecting —
     // its session may already be Connected, so no connect event follows): the
     // per-pass route re-offer drives it as soon as the publication accepts.
-    // Review LOW-2: only this batch and the younger ones behind it — an older
-    // batch is either already on the route or joins on its own Redirect.
-    queueRouteResendFrom_(ps, *b);
+    queueRouteResend_(ps);
     return false;
 }
 
@@ -2879,23 +2877,6 @@ void ProducerImpl::queueRouteResend_(PartitionState& ps) noexcept
     // N-b: this re-offer consumes the park; a NotLeader arriving while it drains
     // (for an attempt it already re-offered) parks the partition anew.
     ps.routeParked = false;
-    markDirty_(ps);
-}
-
-void ProducerImpl::queueRouteResendFrom_(PartitionState& ps, const InFlightBatch& from) noexcept
-{
-    if (ps.routeParked) {  // the re-offer consumes a NotLeader park: every stored batch goes again
-        queueRouteResend_(ps);
-        return;
-    }
-    bool reached = false;
-    ps.inflight.forEachLive([&](InFlightBatch& b) {  // oldest first
-        if (&b == &from) reached = true;
-        if (!reached) return;
-        if (ps.ingressStreamId != 0) b.ingressStreamId = ps.ingressStreamId;  // the new owner's stream
-        b.routeResendPending = true;
-    });
-    ps.routeResend = true;
     markDirty_(ps);
 }
 
