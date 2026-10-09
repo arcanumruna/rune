@@ -277,19 +277,20 @@ enum PassFlag : uint32_t {
     kDiverge      = 1u << 9,   ///< diverging-epoch response applied
     kInlineFsync  = 1u << 10,  ///< an inline LogSegment::sync ran on the owner (Log::syncCallsForTest)
     kSyncCreate   = 1u << 11,  ///< a roll created the next segment inline (no pre-provisioned one)
+    kFetch        = 1u << 12,  ///< a follower FetchRequest served (D26)
 };
 constexpr uint32_t kColdFlags = kRoleOp | kTruncate;
 /// Background operations: a pass with exactly ONE of these is attributable to
 /// it ("solo" maxima — e.g. roll alone = the adopt path, no inline create/fsync).
 constexpr uint32_t kBgFlags = kRoll | kInstall | kRetention | kRoleOp | kTruncate | kTruncPending | kDiverge |
-                              kInlineFsync | kSyncCreate | kRead;
+                              kInlineFsync | kSyncCreate | kRead | kFetch;
 
 std::string flagsStr(uint32_t f) {
     static constexpr std::pair<uint32_t, const char*> names[] = {
         {kProduce, "produce"}, {kRoll, "roll"}, {kInstall, "install"}, {kRetention, "retention"},
         {kRoleOp, "role-op"}, {kTruncate, "truncate"}, {kTruncPending, "trunc-pending"},
         {kRead, "read"}, {kMarker, "marker"}, {kDiverge, "diverge"}, {kInlineFsync, "INLINE-FSYNC"},
-        {kSyncCreate, "SYNC-CREATE"}};
+        {kSyncCreate, "SYNC-CREATE"}, {kFetch, "fetch"}};
     std::string s;
     for (const auto& [bit, n] : names)
         if (f & bit) { if (!s.empty()) s += '+'; s += n; }
@@ -431,6 +432,7 @@ struct PartSpec {
     int64_t       retentionBytes = -1;
     int64_t       retentionMs    = -1;
     bool          controllerManaged = false;   ///< multi-node: ISR channel + leader-epoch fence
+    bool          follower       = false;      ///< D26: replica set / ISR {1, 2, 3} — nodes 2, 3 fetch
 };
 
 struct Part {
@@ -497,8 +499,8 @@ public:
         c.retentionCheckMs = 1;     // retention every cleaner cycle (test cadence)
         c.fileDeleteDelayMs = 0;
         c.followerFlushIntervalNs = 0;   // BrokerNode default (durability via replication)
-        auto r = std::make_unique<PartitionReplica>(c, Role::Leader, 1, std::vector<int32_t>{1},
-                                                    std::vector<int32_t>{1}, p->log.get(), &transport_);
+        const std::vector<int32_t> set = s.follower ? std::vector<int32_t>{1, 2, 3} : std::vector<int32_t>{1};
+        auto r = std::make_unique<PartitionReplica>(c, Role::Leader, 1, set, set, p->log.get(), &transport_);
         r->setExternalFollowerFlush(true);          // BrokerNode::applyWorkerDrivenDurability
         p->log->setProvisioning(provisioner_.channel(),
                                 rune::node::NodeConfig{}.segmentProvisionThresholdPct);   // ... + hotpath-A F2 / M3
@@ -592,7 +594,7 @@ public:
     uint32_t observe(uint32_t extra) {
         uint32_t f = extra;
         for (auto& p : parts_) {
-            const auto snap = p->log->sealedSegmentSnapshot();
+            const auto snap = p->log->ownerSealedSnapshot();
             const std::size_t segs = snap ? snap->size() : 0;
             const int64_t active = (snap && !snap->empty()) ? snap->back().endOffset : 0;   // active base
             const uint64_t gen = p->log->installGeneration();
@@ -663,7 +665,8 @@ public:
     void becomeLeader(Part& p) {
         WorkerOp op;
         op.type = WorkerOp::Type::BecomeLeader; op.topicId = p.spec.topicId; op.partition = p.spec.part;
-        op.roleEpoch = ++p.epoch; op.isr = {1};
+        op.roleEpoch = ++p.epoch;
+        op.isr = p.spec.follower ? std::vector<int32_t>{1, 2, 3} : std::vector<int32_t>{1};
         ASSERT_TRUE(enqueue(std::move(op)));
     }
     void pushRead(const Part& p, int64_t fromOffset, int64_t subId) {
@@ -671,6 +674,23 @@ public:
         op.type = WorkerOp::Type::PushRead; op.topicId = p.spec.topicId; op.partition = p.spec.part;
         op.subscriptionId = subId; op.sessionId = 1; op.nextOffset = fromOffset;
         op.hwBound = INT64_MAX; op.isolation = 0; op.logPtr = p.log.get();
+        ASSERT_TRUE(enqueue(std::move(op)));
+    }
+
+    /// D26: follower 2's FetchRequest as the replication transport hands it to
+    /// the owning worker (served by PartitionReplica::onFetchRequest).
+    /// Stamped with the rig clock (the worker's ISR lag / resend clocks).
+    void fetch(const Part& p, int64_t fromOffset, int32_t followerId) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::FetchRequest; op.topicId = p.spec.topicId; op.partition = p.spec.part;
+        op.replica = p.rep;
+        op.fetchRequestPayload.leaderEpoch = p.epoch;
+        op.fetchRequestPayload.partition   = p.spec.part;
+        op.fetchRequestPayload.followerId  = followerId;
+        op.fetchRequestPayload.fetchOffset = fromOffset;
+        op.fetchRequestPayload.maxBytes    = 512 * 1024;
+        op.fetchRequestPayload.topicId     = p.spec.topicId;
+        op.fetchRequestPayload.nowNs       = clock_.nowNs();
         ASSERT_TRUE(enqueue(std::move(op)));
     }
 
@@ -1011,6 +1031,53 @@ Outcome retention(bool reads) {
     return o;
 }
 
+// ---- 3b. follower fetches during retention (D26) -----------------------------
+// As Reads+Retention, but the reads are a FOLLOWER's FetchRequests served on the
+// worker (PartitionReplica::onFetchRequest) — alternately from the log start
+// (catch-up over sealed segments) and near the tail — while segments roll
+// every 8 KiB and retention drops them (provisioner / cleaner mmap+munmap).
+Outcome fetchDuringRetention() {
+    Outcome o;
+    GateRig rig;
+    rig.add(PartSpec{.topicId = 1, .part = 0, .rollBytes = 8 * 1024, .retentionMs = 1, .follower = true});
+    rig.add(PartSpec{.topicId = 1, .part = 1, .rollBytes = 8 * 1024, .retentionBytes = 64 * 1024, .follower = true});
+    rig.start();
+    // A real leadership: becomeLeader arms the follower-lag clock reset
+    // (DR-BUG-6) — a replica constructed as Leader would evict both followers on
+    // its first ISR check against the monotonic clock.
+    for (auto& p : rig.parts()) rig.becomeLeader(*p);
+    FrameSet fset;
+    {
+        int64_t k = 0;
+        fset.frames.push_back(produceFrame(1, buildBatch(BatchShape{.oldTimestamps = true}, k), 1, 0));
+        fset.frames.push_back(produceFrame(1, buildBatch(BatchShape{}, k), 1, 1));
+    }
+    std::function<uint32_t(uint64_t)> perPass = [&rig](uint64_t i) -> uint32_t {
+        // Follower 2 is in sync — it fetches at the LEO and receives the data by
+        // PUSH (pushToFollowers' reads); follower 3 catches up from the log
+        // start (fetch-serve reads racing retention; out of the ISR, as a
+        // follower below the HW is).
+        Part& p = *rig.parts()[i % 2];
+        if (i & 2) rig.fetch(p, p.log->logStartOffset(), 3);
+        else       rig.fetch(p, p.log->logEndOffset(), 2);
+        return kFetch | (i < 2 ? kRoleOp : 0u);   // the two becomeLeader ops land in the first passes
+    };
+    const uint64_t n = passes(20'000);
+    produceLoop(rig, o.stats, fset, {.minPasses = n, .maxPasses = n * 20}, perPass,
+                [&rig] { return rig.parts()[0]->logStart > 0 && rig.parts()[1]->logStart > 0; });
+    EXPECT_GT(rig.parts()[0]->logStart, 0) << "precondition: time retention deleted segments";
+    EXPECT_GT(rig.parts()[1]->logStart, 0) << "precondition: size retention deleted segments";
+    EXPECT_EQ(rig.produceErrors, 0u) << "last error " << rig.lastProduceError;
+    for (const auto& p : rig.parts()) {
+        EXPECT_GT(p->rep->fetchDataServesForTest(), 0u) << "precondition: fetches served data (part " << p->spec.part << ")";
+        const auto isr = p->rep->isr();
+        EXPECT_NE(std::find(isr.begin(), isr.end(), 2), isr.end()) << "precondition: the tailing follower stayed in the ISR";
+        EXPECT_EQ(p->rep->readMapFallbacksForTest(), 0u) << "a fetch read fell back to the segment read map";
+    }
+    o.extra = counters(rig);
+    return o;
+}
+
 // ---- 4. compaction (+ 6. reads) -------------------------------------------
 Outcome compaction(int64_t groupBytes, int nParts, bool reads) {
     Outcome o;
@@ -1038,7 +1105,7 @@ Outcome compaction(int64_t groupBytes, int nParts, bool reads) {
     auto filled = [&] {
         int64_t minBytes = INT64_MAX;
         for (auto& p : rig.parts()) {
-            const auto snap = p->log->sealedSegmentSnapshot();
+            const auto snap = p->log->ownerSealedSnapshot();
             int64_t b = 0;
             if (snap) for (const auto& si : *snap) b += si.sizeBytes;
             minBytes = std::min(minBytes, b);
@@ -1382,6 +1449,9 @@ TEST(DutyPassLatencyGateRegression, ConsumerReadsDuringSegmentRoll) {
 }
 TEST(DutyPassLatencyGateRegression, ConsumerReadsDuringRetention) {
     gate("Reads+Retention/2p", [] { return retention(true); });
+}
+TEST(DutyPassLatencyGateRegression, FollowerFetchDuringRetention) {
+    gate("Fetch+Retention/2p", [] { return fetchDuringRetention(); });
 }
 TEST(DutyPassLatencyGateRegression, ConsumerReadsDuringCompaction) {
     gate("Reads+Compaction/16MiB/1p", [] { return compaction(16 * kMiB, 1, true); });

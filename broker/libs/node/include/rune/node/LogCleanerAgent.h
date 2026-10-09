@@ -8,7 +8,8 @@
 // Each doWork() cycle:
 //   1. Scan all eligible leader logs in the ReplicaRegistry.
 //   2. Compute byte-based dirty ratio for each log using the SEALED SEGMENT SNAPSHOT
-//      (atomic shared_ptr published by the append thread — no direct access to
+//      (Log::cleanerSnapshot(): the append thread's latest publish via a lock-free
+//       triple buffer (D22) — no direct access to
 //       Log::segments_ which would be a data race).
 //   3. Select the SINGLE filthiest log above minCleanableDirtyRatio (global max).
 //   4. Compact one sealed segment.  The cycle budget (cycleBudgetBytes_) is
@@ -76,6 +77,7 @@
 //   min(activeSegmentBase, highWatermark) — segments at or above HW are
 //   never included in cleanableBytes and are never passed to produceCleanedFile.
 
+#include <atomic>
 #include <rune/consensus/ConsensusAgent.h>
 #include <rune/node/CleanerViewChannel.h>
 #include <rune/node/ReplicaRegistry.h>
@@ -180,7 +182,7 @@ public:
     // Agent::doWork — one cleaner cycle.
     //
     // Selects the filthiest eligible leader log (global max byte-dirty-ratio)
-    // using the IMMUTABLE SEALED SEGMENT SNAPSHOT (atomic shared_ptr, no data
+    // using the IMMUTABLE SEALED SEGMENT SNAPSHOT (Log::cleanerSnapshot(), no data
     // race with the append thread that mutates segments_).
     // Compacts one sealed segment per cycle. The cycle byte budget is checked
     // BEFORE processing: once bytesUsed_ >= cycleBudgetBytes_ (across cycles
@@ -199,7 +201,12 @@ public:
     /// of doWork, so an owner accept can land right before a compaction pass.
     void setSkipCycleFileOpsForTest(bool v) noexcept { skipCycleFileOpsForTest_ = v; }
 
+    /// Completed doWork cycles (D25: tests wait on cleaner progress, never on
+    /// wall-clock sleeps).  Read from any thread (CLEANER-category atomic).
+    [[nodiscard]] uint64_t cyclesDoneForTest() const noexcept { return cyclesDone_.load(std::memory_order_acquire); }
+
     int doWork(int64_t nowNs) override {
+        struct CycleDone { LogCleanerAgent& a; ~CycleDone() { a.cyclesDone_.fetch_add(1, std::memory_order_release); } } cycleDone{*this};
         if (channel_) applyViewUpdates_();
         if (!registry_ && !channel_) return 0;
 
@@ -327,8 +334,8 @@ public:
             // into the cleaner-owned watermark before reading it.
             replica->applyCleanerRewind();
 
-            // Load the immutable snapshot (atomic acquire — no race with append thread).
-            auto snap = log->sealedSegmentSnapshot();
+            // The latest immutable snapshot (D22 triple buffer — no race with the append thread).
+            auto snap = log->cleanerSnapshot();
             if (!snap || snap->size() < 1) continue;  // need at least one sealed segment
 
             const int64_t firstDirtyOffset = replica->lastCleanOffset();
@@ -740,7 +747,7 @@ private:
             if (retentionMs < 0 && retentionBytes < 0 && logStartOffset <= 0) continue;
 
             // Load the immutable sealed-segment snapshot (no segments_ access).
-            auto snap = log->sealedSegmentSnapshot();
+            auto snap = log->cleanerSnapshot();
             if (!snap || snap->empty()) continue;
 
             // High-watermark: never delete the active segment or segments that
@@ -951,6 +958,7 @@ private:
     rune::storage::SkimpyOffsetMap dedupeMap_;
     std::vector<int64_t> scratchBases_;
     bool skipCycleFileOpsForTest_ = false;   ///< test seam: skip the top-of-cycle file ops
+    std::atomic<uint64_t> cyclesDone_{0};    ///< D25: completed cycles (cyclesDoneForTest)
     bool externalProvisioner_ = false;       ///< hotpath-A F2: see setExternalProvisioner
     rune::storage::Log* boundaryExclude_ = nullptr;   ///< the log a pass is compacting (fix round 6)
     int64_t boundaryNowMs_ = 0;

@@ -1,6 +1,7 @@
 #include <rune/node/BrokerNode.h>
 #include <rune/node/HostDefaults.h>
 #include <rune/node/ThreadAffinity.h>
+#include <rune/node/TlsStartupPolicy.h>
 #include <rune/replication/ReplicationFrameLimits.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/RoleCounter.h>
@@ -1804,6 +1805,68 @@ void BrokerNode::buildGateway() {
         };
     };
 
+    // Task 9 (RUNE_TLS): load the broker's TLS cert/key PEM TEXT from the
+    // configured file paths now, at construction, exactly once — the
+    // ClientGateway ctor wants PEM text, never a path (Task 7's contract).
+    // Both paths empty (no RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE, or a
+    // RUNE_TLS=OFF build where the fields are never populated — see
+    // NodeConfig.cpp) = crypto disabled, byte-identical to pre-Task-7/9
+    // behaviour.
+    //
+    // Review fix round 2 (Important): a configured-but-unreadable cert used
+    // to log and silently clear to plaintext whenever require_tls was off —
+    // a fail-open footgun.  rune::node::mustRefuseStartForUnloadableTls
+    // (TlsStartupPolicy.h) now refuses to start whenever TLS was configured
+    // at all (either path non-empty — including a PARTIAL config, only one
+    // of the two paths set) but didn't both load — independent of
+    // require_tls.  Only when NEITHER path is set does the broker proceed
+    // plaintext (TLS genuinely not configured).
+    std::string tlsCertPem, tlsKeyPem;
+    const bool tlsCertLoaded   = rune::node::loadPemFile(config_.tlsCertFile, tlsCertPem);
+    const bool tlsKeyLoaded    = rune::node::loadPemFile(config_.tlsKeyFile, tlsKeyPem);
+    const bool tlsIsConfigured = rune::node::tlsConfigured(config_.tlsCertFile, config_.tlsKeyFile);
+    if (rune::node::mustRefuseStartForUnloadableTls(tlsIsConfigured, tlsCertLoaded, tlsKeyLoaded)) {
+        throw std::runtime_error(
+            "BrokerNode[" + std::to_string(nodeId) + "]: TLS is configured (RUNE_TLS_CERT_FILE='" +
+            config_.tlsCertFile + "', RUNE_TLS_KEY_FILE='" + config_.tlsKeyFile +
+            "') but could not be fully loaded (cert loaded=" + (tlsCertLoaded ? "yes" : "no") +
+            ", key loaded=" + (tlsKeyLoaded ? "yes" : "no") +
+            ") — refusing to start rather than silently degrade to plaintext");
+    }
+    if (config_.requireTls && (tlsCertPem.empty() || tlsKeyPem.empty())) {
+        // require_tls with no usable cert would hard-reject every Connect
+        // (never a silent plaintext fleet) — refuse to start instead of
+        // bricking the broker at runtime on the first client connect.  The
+        // check above already covers "TLS configured but unloadable"; this
+        // one remains for "require_tls set but TLS not configured at all"
+        // (both paths empty).
+        throw std::runtime_error("BrokerNode: RUNE_REQUIRE_TLS is set but no usable TLS cert/key "
+                                  "was loaded (RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE) — refusing to "
+                                  "start (every Connect would be rejected)");
+    }
+    // Task 19 (per-worker egress crypto addendum): shard mode + require_tls
+    // used to be refused at startup here (the shard worker's Records egress
+    // was plaintext-only, so the combination could never serve a client).
+    // Now that the shard worker seals its own Records egress with its own
+    // per-sender key (RecordsSeal.h / SessionAnnounce key handoff), shard
+    // mode serves encrypted sessions exactly like legacy mode — this
+    // startup refusal is gone (see rune::node::TlsStartupPolicy.h's header
+    // note for the removed mustRefuseShardWithRequireTls).
+    //
+    // Task 19 review fix (Important): NON-shard per-worker egress has no
+    // such key handoff at all (SessionAnnouncer only runs in shard mode) —
+    // a worker there would push an encrypted session's Records in the
+    // clear. Refuse to start rather than fail open.
+    const bool brokerHasTlsAtStartup = !tlsCertPem.empty() && !tlsKeyPem.empty();
+    if (rune::node::mustRefuseNonShardPerWorkerEgressTls(
+            config_.perWorkerEgressEnabled, config_.shardMode(), config_.requireTls,
+            brokerHasTlsAtStartup)) {
+        throw std::runtime_error(
+            "BrokerNode[" + std::to_string(nodeId) + "]: non-shard per-worker-egress has no "
+            "Records crypto handoff; it cannot serve TLS — use shard mode or disable "
+            "per-worker egress");
+    }
+
     // Build the gateway (subscribes on clientChannel).
     try {
         gateway_ = std::make_unique<rune::gateway::ClientGateway>(
@@ -1812,7 +1875,12 @@ void BrokerNode::buildGateway() {
             clientStreamId,
             nodeId,
             rune::gateway::ClientGateway::kDefaultSessionTimeoutNs,
-            std::move(leaderViewFn)
+            std::move(leaderViewFn),
+            rune::gateway::ClientGateway::kDefaultConnectResolveTimeoutNs,
+            rune::aeronutil::AeronPump{},
+            tlsCertPem,
+            tlsKeyPem,
+            config_.requireTls
         );
         if (config_.maxHeldIdleMs > 0) gateway_->setMaxHeldIdleNs(config_.maxHeldIdleMs * 1'000'000LL);   // D8b
         static_assert(NodeConfig::kMaxGatewayProduceCredits == rune::gateway::ClientGateway::kMaxSessionProduceCredits);
@@ -3336,8 +3404,37 @@ void BrokerNode::startEmbeddedDriver() {
 // ---------------------------------------------------------------------------
 int BrokerNode::serviceAdminControl_() {
     int work = 0;
+
+    // Task 9 (RUNE_TLS SIGHUP reload): polled FIRST, unconditionally — must
+    // work even on a deployment with no admin worker configured (the early
+    // `if (!agent) return 0;` below would otherwise skip it entirely).
+    // requestTlsCertReload() (any thread, e.g. main() on SIGHUP) only offered
+    // a trigger; the actual file re-read + swap happen HERE, on the control
+    // thread, so gateway_'s tlsCertPem_/tlsKeyPem_ are only ever mutated on
+    // their own single-writer thread (shared-nothing).
+    work += tlsReloadRing_.poll([this](std::int32_t type, std::int64_t, std::int64_t) {
+        if (type != kTlsReloadTrigger) return;
+        if (!gateway_ || config_.tlsCertFile.empty() || config_.tlsKeyFile.empty()) {
+            spdlog::warn("BrokerNode[{}]: TLS reload requested but no cert/key file is "
+                         "configured — ignored", config_.nodeId);
+            return;
+        }
+        std::string certPem, keyPem;
+        const bool certOk = loadPemFile(config_.tlsCertFile, certPem);
+        const bool keyOk  = loadPemFile(config_.tlsKeyFile, keyPem);
+        if (!certOk || !keyOk) {
+            spdlog::error("BrokerNode[{}]: TLS reload FAILED reading {} / {} — keeping the "
+                          "previous cert/key (in-flight and future handshakes unaffected)",
+                          config_.nodeId, config_.tlsCertFile, config_.tlsKeyFile);
+            return;
+        }
+        gateway_->reloadTlsCert(std::move(certPem), std::move(keyPem));
+        spdlog::info("BrokerNode[{}]: TLS cert/key reloaded from {} / {}",
+                     config_.nodeId, config_.tlsCertFile, config_.tlsKeyFile);
+    });
+
     auto* agent = adminWorkerAgent_.get();
-    if (!agent) return 0;
+    if (!agent) return work;
 
     // (1) Post a role event on a leadership-state change.
     // Control thread: owner-state view (F9a — never the observer ring, whose

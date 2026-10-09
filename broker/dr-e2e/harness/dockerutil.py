@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import uuid
 from dataclasses import dataclass
 
 
@@ -47,6 +48,69 @@ def _git_sha(repo_root: str) -> str:
 
 
 DEFAULT_TIMEOUT = 120  # seconds — generous but hard cap for any single CLI call
+
+# D10-L (D2-10): every container the harness starts with `docker run` is labelled
+#   rune.dr.owner=<harness pid>   — which harness process owns it (session sweep);
+#   rune.dr.run=<uuid>            — this one invocation (timeout cleanup, named or not).
+LABEL_OWNER = "rune.dr.owner"
+LABEL_RUN = "rune.dr.run"
+
+
+def _with_labels(args: list[str]) -> tuple[list[str], str | None]:
+    """A `docker run` command with the owner + invocation labels; other commands unchanged."""
+    if len(args) < 2 or args[0] != "docker" or args[1] != "run":
+        return args, None
+    tag = uuid.uuid4().hex
+    return [args[0], args[1], "--label", f"{LABEL_OWNER}={os.getpid()}",
+            "--label", f"{LABEL_RUN}={tag}", *args[2:]], tag
+
+
+def _remove_labelled(label: str, timeout: int = 60) -> list[str]:
+    """`docker rm -f` every container (running or not) carrying `label`; returns their ids."""
+    ps = subprocess.run(["docker", "ps", "-aq", "--filter", f"label={label}"],
+                        capture_output=True, text=True, timeout=timeout)
+    ids = [c for c in ps.stdout.split() if c]
+    for cid in ids:
+        subprocess.run(["docker", "rm", "-f", cid], capture_output=True, text=True, timeout=timeout)
+    return ids
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                    # exists, owned by someone else
+    return True
+
+
+def sweep_orphaned_containers(timeout: int = 60) -> list[str]:
+    """Remove harness containers whose owning harness process is gone.
+
+    pytest-timeout (timeout_method = thread) ends a hung session with os._exit:
+    no `finally`, no TimeoutExpired — its client containers keep running (and
+    producing) into the next session.  Called at session start (conftest).
+    Containers of a LIVE harness process (a concurrent run) are never touched.
+    Docker unavailable → nothing to do.  Returns the removed container ids.
+    """
+    try:
+        ps = subprocess.run(["docker", "ps", "-a", "--filter", f"label={LABEL_OWNER}",
+                             "--format", '{{.ID}} {{.Label "' + LABEL_OWNER + '"}}'],
+                            capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    removed: list[str] = []
+    for line in ps.stdout.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        owner = parts[1] if len(parts) > 1 else ""
+        if owner.isdigit() and _pid_alive(int(owner)):
+            continue
+        subprocess.run(["docker", "rm", "-f", parts[0]], capture_output=True, text=True, timeout=timeout)
+        removed.append(parts[0])
+    return removed
 
 
 @dataclass
@@ -81,6 +145,7 @@ def run(args: list[str], *, timeout: int = DEFAULT_TIMEOUT, check: bool = False,
     the current process environment.  Pass ``os.environ.copy()`` with mutations
     to extend the current environment rather than replace it.
     """
+    args, run_tag = _with_labels(args)
     try:
         proc = subprocess.run(
             args,
@@ -100,8 +165,12 @@ def run(args: list[str], *, timeout: int = DEFAULT_TIMEOUT, check: bool = False,
                 for part in (exc.stdout, exc.stderr):
                     if part:
                         fh.write(part.decode(errors="replace") if isinstance(part, bytes) else part)
-        if name:
-            subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True, timeout=60)
+        # D10-L (D2-10): found by its invocation label — named or not (netem / volume sidecars are unnamed).
+        if run_tag:
+            try:
+                _remove_labelled(f"{LABEL_RUN}={run_tag}")
+            except (OSError, subprocess.SubprocessError):
+                pass                   # best effort; the next session's sweep catches it
         raise TimeoutError(
             f"command timed out after {timeout}s: {' '.join(args)}\n"
             f"stdout so far:\n{exc.stdout}\nstderr so far:\n{exc.stderr}"

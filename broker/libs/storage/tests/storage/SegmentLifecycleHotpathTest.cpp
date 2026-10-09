@@ -31,6 +31,7 @@
 #include <fstream>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 #include <unistd.h>
 
@@ -296,7 +297,7 @@ TEST(SegmentLifecycleRegression, RollAndRetentionPublishSnapshotInConstantTimeRe
         const uint64_t rebuilds0 = log.snapshotRebuildsForTest();
         int64_t off = 0;
         while (log.segmentBaseOffsets().size() < 40) off = put(log, off, 5000 + off);
-        const auto held = log.sealedSegmentSnapshot();
+        const auto held = log.ownerSealedSnapshot();
         const std::vector<SegInfo> heldCopy(held->begin(), held->end());
         // Roll across several chunk boundaries and header-pool directories.
         const std::size_t target = 3 * kSnapChunkEntries + 50;
@@ -307,7 +308,7 @@ TEST(SegmentLifecycleRegression, RollAndRetentionPublishSnapshotInConstantTimeRe
         for (std::size_t i = 0; i < heldCopy.size(); ++i) EXPECT_EQ((*held)[i], heldCopy[i]) << i;
         // Retention: drop a prefix — O(1) (no rebuild).
         const auto bases = log.segmentBaseOffsets();
-        const auto snap = log.sealedSegmentSnapshot();
+        const auto snap = log.ownerSealedSnapshot();
         const std::size_t kDrop = target / 2;   // spans whole chunks
         std::size_t next = 0;
         int dropped = 0;
@@ -337,7 +338,7 @@ TEST(SegmentLifecycleRegression, TruncationRebuildsOnlyTheSnapshotTailRegression
         log.recover();
         int64_t off = 0;
         while (log.segmentBaseOffsets().size() < 2 * kSnapChunkEntries + 30) off = put(log, off);
-        const auto before = log.sealedSegmentSnapshot();
+        const auto before = log.ownerSealedSnapshot();
         const std::vector<SegInfo> beforeCopy(before->begin(), before->end());
         const auto bases = log.segmentBaseOffsets();
         const int64_t cut = bases[bases.size() - 6] + 1;   // into a late segment
@@ -375,7 +376,7 @@ TEST(SegmentLifecycleRegression, SnapshotMatchesSegmentsUnderRandomOpsRegression
                 off = put(log, off, 1000 + off);
             } else if (op < 88) {
                 const auto bases = log.segmentBaseOffsets();
-                const auto snap = log.sealedSegmentSnapshot();
+                const auto snap = log.ownerSealedSnapshot();
                 if (bases.size() > 3) {
                     const std::size_t k = 1 + rng() % 3;
                     for (std::size_t i = 0; i < k && i < snap->size(); ++i)
@@ -396,7 +397,7 @@ TEST(SegmentLifecycleRegression, SnapshotMatchesSegmentsUnderRandomOpsRegression
             (void)log.runCleanerFileOps(0, 0);
             ASSERT_TRUE(log.snapshotMatchesSegmentsForTest()) << "step " << step << " op " << op;
             if (step % 50 == 0) {
-                auto s = log.sealedSegmentSnapshot();
+                auto s = log.ownerSealedSnapshot();
                 held.emplace_back(s, std::vector<SegInfo>(s->begin(), s->end()));
             }
         }
@@ -446,7 +447,7 @@ TEST(SegmentLifecycleRegression, FullRenameRingDefersRollNeverDropsRenameRegress
         EXPECT_EQ(countSuffix(dir, ".stlog"), log.readyCountForTest()) << "only never-adopted ready segments";
         EXPECT_EQ(countSuffix(dir, ".log"), log.segmentBaseOffsets().size());
         // Retention can drop every sealed segment (none stuck pathPending).
-        const auto snap = log.sealedSegmentSnapshot();
+        const auto snap = log.ownerSealedSnapshot();
         std::size_t next = 0;
         int dropped = 0;
         for (int guard = 0; next < snap->size() && guard < 100000; ++guard) {
@@ -496,7 +497,7 @@ TEST(SegmentLifecycleRegression, SteadyStateRollAllocatesNothingOnOwnerRegressio
             tCount = true;
             (void)log.drainStagingRenamesDone();
             tCount = false;
-            const auto snap = log.sealedSegmentSnapshot();
+            const auto snap = log.ownerSealedSnapshot();
             if (snap->size() > 8) {
                 (void)log.enqueueDeletedSegment((*snap)[0].baseOffset, (*snap)[0].lineage);
                 tCount = true;
@@ -1105,4 +1106,86 @@ TEST(SegmentLifecycleRegression, SealedSegmentBeyondItsMapPostsNoGrowthRequestRe
         EXPECT_EQ(ch.ring().pendingBytes(), queued0) << "a growth request was posted for a sealed segment";
     }
     fs::remove_all(dir);
+}
+
+// D22: the sealed snapshot crosses owner → cleaner through a lock-free
+// latest-value triple buffer (was std::atomic_store/load on a shared_ptr — a
+// hidden libstdc++ mutex pool on the owner's roll; scripts/check_no_atomics.py
+// now rejects those).  The one consumer only ever sees whole published
+// snapshots, never older than one it already saw, and finally the latest.
+TEST(SegmentLifecycleHotpathRegression, CleanerSnapshotTripleBufferCrossThreadRegression) {
+    const fs::path d = freshDir("d22_mailbox");
+    Log log(d.string(), 1024);   // ~1 roll every few single-record batches
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> seen{0}, regressions{0};
+    std::thread cleaner([&] {
+        std::size_t last = 0;
+        while (!stop.load(std::memory_order_acquire)) {
+            const auto s = log.cleanerSnapshot();
+            if (!s) { regressions.fetch_add(1); continue; }
+            if (s->size() < last) regressions.fetch_add(1);
+            last = s->size();
+            seen.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    int64_t off = 0;
+    for (int i = 0; i < 4000; ++i) off = put(log, off);
+    stop.store(true, std::memory_order_release);
+    cleaner.join();
+    EXPECT_EQ(regressions.load(), 0u) << "the cleaner saw a null or OLDER snapshot";
+    EXPECT_GT(seen.load(), 0u);
+    const auto owner = log.ownerSealedSnapshot();
+    ASSERT_GT(owner->size(), 10u) << "precondition: many rolls";
+    const auto fin = log.cleanerSnapshot();   // the cleaner is quiescent: this thread is now its consumer
+    EXPECT_EQ(fin.get(), owner.get()) << "the cleaner never receives the latest publish";
+    fs::remove_all(d);
+}
+
+// D30 (box 2026-10-08): every sealed segment kept its read mapping (+ its
+// index) — 2 mappings per segment, so a broker died at ~32k segments on a
+// default Linux host (vm.max_map_count 65530: "mmap failed ... .index",
+// std::bad_alloc; gate SegmentRoll/8p).  Sealed bytes are read with pread
+// (#65 / D26); the read map retires at seal and a later readView remaps lazily.
+TEST(SegmentLifecycleHotpathRegression, SealedSegmentsKeepNoReadMapRegression) {
+    const fs::path d = freshDir("d30_sealed_maps");
+    Log log(d.string(), 1024);
+    int64_t off = 0;
+    for (int i = 0; i < 600; ++i) off = put(log, off);
+    const auto bases = log.segmentBaseOffsets();
+    ASSERT_GT(bases.size(), 40u) << "precondition: many rolls";
+    std::size_t mapped = 0;
+    for (std::size_t i = 0; i + 1 < bases.size(); ++i)
+        if (log.segmentForTest(bases[i])->hasReadMapForTest()) ++mapped;
+    EXPECT_EQ(mapped, 0u) << "sealed segments still hold their read mapping (" << mapped << " of " << bases.size() - 1 << ")";
+    // A later read of a sealed segment still works (lazy remap).
+    const auto v = log.readView(bases[1], 4096);
+    ASSERT_FALSE(v.empty());
+    EXPECT_EQ(v.baseOffset, bases[1]);
+    fs::remove_all(d);
+}
+
+// D30 review MAJOR-1 / MEDIUM-2: a walk of old data through the mapping (RC
+// build, readView consumers, fallbacks) maps sealed segments again — bounded:
+// at most mappedSealedCapForTest() stay mapped, the oldest retires; a second
+// read of a still-mapped sealed segment does not remap it.
+TEST(SegmentLifecycleHotpathRegression, LazilyMappedSealedSegmentsAreCappedRegression) {
+    const fs::path d = freshDir("d30_sealed_cap");
+    Log log(d.string(), 1024);
+    int64_t off = 0;
+    for (int i = 0; i < 600; ++i) off = put(log, off);
+    const auto bases = log.segmentBaseOffsets();
+    ASSERT_GT(bases.size(), 40u);
+    for (std::size_t i = 0; i + 1 < bases.size(); ++i) ASSERT_FALSE(log.readView(bases[i], 4096).empty());
+    std::size_t mapped = 0;
+    for (std::size_t i = 0; i + 1 < bases.size(); ++i)
+        if (log.segmentForTest(bases[i])->hasReadMapForTest()) ++mapped;
+    EXPECT_LE(mapped, Log::mappedSealedCapForTest()) << "a walk of old data left every sealed segment mapped";
+    EXPECT_GT(log.sealedMapsEvictedForTest(), 0u);
+    // The last-walked sealed segment is still mapped: reading it again costs no remap.
+    const int64_t last = bases[bases.size() - 2];
+    ASSERT_TRUE(log.segmentForTest(last)->hasReadMapForTest());
+    const uint64_t remaps = log.sealedLazyRemapsForTest();
+    ASSERT_FALSE(log.readView(last, 4096).empty());
+    EXPECT_EQ(log.sealedLazyRemapsForTest(), remaps) << "a still-mapped sealed segment was remapped";
+    fs::remove_all(d);
 }

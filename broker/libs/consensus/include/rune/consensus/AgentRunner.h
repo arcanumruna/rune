@@ -70,26 +70,32 @@ inline void setCurrentThreadName(const char* name) noexcept {
 // headers lean).
 struct Agent;
 
-class AgentRunner {
+/// A7 review L3 (no virtual calls on the hot path): the runner is templated on
+/// the agent, idle strategy and clock TYPES.  With final classes (the shard
+/// runner: ShardAgent, ShardIdle, MonotonicNanoClock) every call of the duty
+/// loop is direct; AgentRunner (the Agrona-style interfaces) stays the
+/// virtual flavour for the cold / control-plane threads.
+template <class AgentT, class IdleT, class ClockT>
+class BasicAgentRunner {
 public:
-    // @param agent    The agent to drive (must outlive AgentRunner).
-    // @param idle     IdleStrategy to use (must outlive AgentRunner).
-    // @param clock    NanoClock providing nowNs() (must outlive AgentRunner).
-    AgentRunner(Agent&       agent,
-                IdleStrategy& idle,
-                NanoClock&   clock) noexcept
+    // @param agent    The agent to drive (must outlive the runner).
+    // @param idle     Idle strategy to use (must outlive the runner).
+    // @param clock    Clock providing nowNs() (must outlive the runner).
+    BasicAgentRunner(AgentT& agent,
+                     IdleT&  idle,
+                     ClockT& clock) noexcept
         : agent_{agent}, idle_{idle}, clock_{clock}
     {}
 
-    ~AgentRunner() {
+    ~BasicAgentRunner() {
         stop();
         if (thread_.joinable()) {
             thread_.join();
         }
     }
 
-    AgentRunner(const AgentRunner&)            = delete;
-    AgentRunner& operator=(const AgentRunner&) = delete;
+    BasicAgentRunner(const BasicAgentRunner&)            = delete;
+    BasicAgentRunner& operator=(const BasicAgentRunner&) = delete;
 
     // -----------------------------------------------------------------------
     // Lifecycle
@@ -158,9 +164,9 @@ private:
         }
     }
 
-    Agent&        agent_;
-    IdleStrategy& idle_;
-    NanoClock&    clock_;
+    AgentT& agent_;
+    IdleT&  idle_;
+    ClockT& clock_;
 
     // Controller-owned (see header comment).
     bool started_  = false;
@@ -170,5 +176,8 @@ private:
     ControlRing<256> stopRing_;
     std::thread      thread_;
 };
+
+/// The virtual (interface) runner — control-plane / cold agents.
+using AgentRunner = BasicAgentRunner<Agent, IdleStrategy, NanoClock>;
 
 } // namespace rune::consensus

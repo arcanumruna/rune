@@ -86,6 +86,10 @@
 #include <rune/node/WorkerIngress.h>
 #include <rune/node/WorkerEgress.h>
 #include <rune/node/RecordsPush.h>
+#include <rune/node/SessionAnnounceKeyTail.h>
+#include <rune/node/RecordsOpen.h>
+#include <rune/crypto/Aead.h>
+#include <rune/crypto/Cipher.h>
 #include <rune/replication/ReplicationFrameLimits.h>   // F18 frame limits (maxAcceptableBatchBytes)
 #include <rune/node/WorkerReplicationTransport.h>
 #include <rune/node/IoBackend.h>
@@ -605,6 +609,13 @@ public:
     // stable c_str().
     const char* name() const noexcept override { return threadName_.c_str(); }
 
+    // D23: in-flight epoch-state fsync dups are closed after io_ is gone
+    // (teardownSyncFds_), never leaked and never closed under the fsync.
+    ~Worker() override {
+        for (const TokenRoute& r : routes_)
+            if (r.token != kNoToken && r.syncFd >= 0) teardownSyncFds_.fds.push_back(r.syncFd);
+    }
+
     // Non-copyable and non-movable (two OneToOneByteRing members are not movable).
     Worker(const Worker&)            = delete;
     Worker& operator=(const Worker&) = delete;
@@ -677,6 +688,8 @@ public:
     [[nodiscard]] uint64_t intakePausedFramesForTest() const noexcept { return intakePausedFrames_; }
     /// hotpath-A: frames held (ABORT) because their partition's roll was deferred.
     [[nodiscard]] uint64_t intakeRollHoldsForTest() const noexcept { return intakeRollHolds_; }
+    /// Test-only: per-session crypto entries (encrypted sessions announced here).
+    [[nodiscard]] std::size_t sessionCryptoEntriesForTest() const noexcept { return sessionCrypto_.size(); }
     [[nodiscard]] uint64_t ackRoomOpPausesForTest() const noexcept { return ackRoomOpPauses_; }
     /// Fix round 2 (finding 9): session signals (Failed / Held / Released) the
     /// return ring could not take at once — deferred to a later pass, never lost.
@@ -793,6 +806,54 @@ public:
         /// F15 S4: the partition's RC state (this worker's), re-resolved on every
         /// ownership apply and Subscribe — null when not owned / internal.
         RcState* rc = nullptr;
+    };
+
+    // -----------------------------------------------------------------------
+    // Task 19 (per-worker egress crypto addendum, 2026-10-08): this worker's
+    // OWN Records-egress crypto state for one encrypted session (Rule 3 — a
+    // dedicated state holding exactly what sealing ITS OWN Records pushes for
+    // that session needs). Built ONCE, off the hot path, when a SessionAnnounce
+    // for the session arrives (executeSessionAnnounceWire_); reused by every
+    // subscription of that session on this worker — `sendSeq` is a single
+    // per-(worker,session) counter, NEVER per-subscription (two subscriptions
+    // of the same session sealing under independently-incrementing sendSeqs
+    // would reuse nonces under the same key — exactly the bug class this
+    // feature exists to prevent).
+    //
+    // An entry exists here IFF the session is encrypted (sessionEncrypted was
+    // true on its SessionAnnounce) — a plaintext session never gets one, so
+    // pushOwnedSubscriptions_'s lookup is a no-op (empty vector) for an
+    // all-plaintext deployment: zero impact on plaintext sessions.
+    //
+    // `send` may be nullopt even though an entry exists: this worker's
+    // specific key failed to derive (SessionAnnouncer::announce's fail-closed
+    // path) or hasn't arrived yet — sendRecordsFrame's RecordsSealCtx
+    // contract (a present ctx with a null `send`) then fails closed
+    // (sealRecordsFrame returns 0, nothing is ever transmitted), never a
+    // plaintext fallback.
+    // Task 22 (shard worker decrypts produce / per-worker ingress,
+    // 2026-10-08): `recv`/`recvSeq`/`recvWindow` are this worker's OWN c2b
+    // ingress open context + anti-replay window for the session — built
+    // alongside `send` above (same struct, same install site:
+    // executeSessionAnnounceWire_), but a SEPARATE cipher/counter/window:
+    // ingress (client->worker) and egress (worker->client) are independent
+    // AEAD directions under independent keys, and this worker's own c2b
+    // window is independent of the gateway's (and every other worker's) —
+    // see RecordsOpen.h's doc comment for why that is safe (the client's
+    // single monotonic c2b sendSeq is never split between receivers; each
+    // receiver just sees its own subset with forward gaps, never a nonce
+    // hazard). `recv` may be nullopt even though an entry exists (no key
+    // yet, or the gateway never shipped one) — RecordsOpenCtx's own
+    // null-`recv` contract then fails closed (openProduceFrame returns 0,
+    // the frame is dropped), never a plaintext fallback.
+    struct WorkerSessionCrypto {
+        int64_t                                  sessionId = 0;
+        std::optional<rune::crypto::AeadCipher>  send;      ///< this worker's own per-sender b2c cipher (egress)
+        uint64_t                                 sendSeq   = 0;   ///< this worker's OWN counter (independent of the gateway's / other workers')
+        uint8_t                                  cipher    = 0;   ///< rune::crypto::Cipher value (shared by both directions)
+        std::optional<rune::crypto::AeadCipher>  recv;      ///< this session's c2b ingress cipher (shared across every worker; one sender)
+        uint64_t                                 recvSeq    = 0;  ///< this worker's OWN replay-window high-water seq (ingress)
+        uint64_t                                 recvWindow = 0;  ///< this worker's OWN replay-window bitmap (ingress)
     };
 
     /// Test-only: the worker-local subscription table (worker-thread state).
@@ -961,10 +1022,34 @@ public:
             tailLen  = op.schemaUpdateBlob.size();
             break;
         case WorkerOp::Type::SessionAnnounce:
-            // Task 13: the client session's egress channel (view, copied once).
             tailKind = sbe::TailKind::Value::EGRESS_CHANNEL;
-            tailSrc  = reinterpret_cast<const uint8_t*>(op.egressChannel.data());
-            tailLen  = op.egressChannel.size();
+            if (op.sessionEncrypted) [[unlikely]] {
+                // Task 19: cold, once per (session, worker) — stamp the
+                // [cipher|prefix|key] crypto header ahead of the channel
+                // bytes into this worker's own reused scratch (zero heap
+                // allocation). PLAINTEXT SessionAnnounce (the common case,
+                // op.sessionEncrypted == false by default) takes the
+                // untouched branch below — byte-identical to pre-Task-19.
+                const std::size_t n = encodeSessionAnnounceCryptoTail(
+                    sessionAnnounceTailScratch_.data(), sessionAnnounceTailScratch_.size(),
+                    op.senderCipher, op.senderKeyPrefix, op.senderKey,
+                    op.c2bKeyPrefix, op.c2bKey,
+                    op.egressChannel.data(), op.egressChannel.size());
+                if (n == 0) [[unlikely]] {
+                    // Unreachable by construction (the egress channel is
+                    // already bounded to SessionAckSink::kMaxChannelBytes at
+                    // Connect time) — halt rather than enqueue a truncated
+                    // crypto tail a worker could misparse.
+                    haltInvariant_("SessionAnnounce crypto tail too large for scratch",
+                                    "Task 19: egress channel exceeded kMaxChannelBytes", 0);
+                }
+                tailSrc = sessionAnnounceTailScratch_.data();
+                tailLen = n;
+            } else {
+                // Task 13: the client session's egress channel (view, copied once).
+                tailSrc = reinterpret_cast<const uint8_t*>(op.egressChannel.data());
+                tailLen = op.egressChannel.size();
+            }
             break;
         default:
             break;  // NONE tail
@@ -994,6 +1079,26 @@ public:
             ring.tryClaim(sbe::WorkerOp::sbeTemplateId(), n);
         if (idx < 0) return EnqueueResult::Full;  // ring full — back-pressure
 
+        // Task 19: SessionAnnounce reuses the `isolation` wire byte for
+        // sessionEncrypted and the `durabilityTier` wire byte for
+        // senderKeyValid (see WorkerOp::sessionEncrypted's doc comment) —
+        // every OTHER op type keeps its own field's value unchanged. A
+        // plaintext SessionAnnounce (op.sessionEncrypted/senderKeyValid both
+        // default false) writes 0/0 here, exactly what op.isolation/
+        // op.durabilityTier already default to — byte-identical to every
+        // pre-Task-19 SessionAnnounce.
+        //
+        // Task 22: SessionAnnounce additionally reuses the `isGroup` wire
+        // byte for c2bKeyValid (isGroup is otherwise Subscribe-only — unused
+        // for SessionAnnounce, same "reuse what's already on the wire"
+        // discipline). Every OTHER op type keeps op.isGroup unchanged.
+        const std::uint8_t wireIsolation = (op.type == WorkerOp::Type::SessionAnnounce)
+            ? (op.sessionEncrypted ? 1u : 0u) : op.isolation;
+        const std::uint8_t wireDurabilityTier = (op.type == WorkerOp::Type::SessionAnnounce)
+            ? (op.senderKeyValid ? 1u : 0u) : op.durabilityTier;
+        const bool wireIsGroup = (op.type == WorkerOp::Type::SessionAnnounce)
+            ? op.c2bKeyValid : op.isGroup;
+
         sbe::WorkerOp enc;
         enc.wrapAndApplyHeader(reinterpret_cast<char*>(ring.base() + idx), 0, n);
         enc.opType(static_cast<sbe::OpType::Value>(static_cast<std::uint8_t>(op.type)))
@@ -1012,13 +1117,13 @@ public:
            .batchAttrs(op.batchAttrs)
            .deferAck(static_cast<std::uint8_t>((op.deferAck ? kOpFlagDeferAck : 0u) |
                                                (op.crcValidated ? kOpFlagCrcValidated : 0u)))
-           .durabilityTier(op.durabilityTier)
+           .durabilityTier(wireDurabilityTier)
            .enqueuedAtNs(op.enqueuedAtNs)
            .subscriptionId(op.subscriptionId)
            .nextOffset(op.nextOffset)
            .hwBound(op.hwBound)
-           .isolation(op.isolation)
-           .isGroup(op.isGroup ? 1 : 0)
+           .isolation(wireIsolation)
+           .isGroup(wireIsGroup ? 1 : 0)
            .groupCarrierReceived(op.groupCarrierReceived ? 1 : 0)
            .roleEpoch(static_cast<std::int64_t>(op.roleEpoch))
            .roleLeaderId(static_cast<std::int32_t>(op.roleLeaderId))
@@ -1235,6 +1340,8 @@ public:
     /// The fd the last leader-epoch-state fsync was submitted on.
     [[nodiscard]] int lastEpochStateSyncFdForTest() const noexcept { return lastEpochStateSyncFd_; }
     [[nodiscard]] uint64_t    epochStateNotRoutedForTest() const noexcept { return epochStateNotRouted_; }
+    /// D23: epoch-state fsync dups currently open (dup'd, not yet closed).
+    [[nodiscard]] int         epochStateSyncFdsOpenForTest() const noexcept { return epochStateSyncFdsOpen_; }
     [[nodiscard]] uint64_t    bgFlushSubmitsCountForTest() const noexcept { return bgFlushSubmits_; }
     /// Review Md3 seam: the next `n` epoch-state route inserts fail.
     void forceRouteFailForTest(int n) noexcept { forceRouteFailForTest_ = n; }
@@ -1433,6 +1540,7 @@ public:
             RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerReplicaDoWorkStage, 0);
             for (auto* replica : owned_) {
                 if (!replica) continue;
+                const ReplReadScope rs(*replica, replScratch_);
                 work += replica->doWork(nowNs);
             }
             work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
@@ -1531,7 +1639,9 @@ private:
         else if (replTransportCtx_) [[unlikely]]
             work += replTransportPollFn_(replTransportCtx_, kReplFetchLimit, this, nowNs);   // test seam
         for (auto* replica : owned_) {
-            if (replica) work += replica->doWork(nowNs);
+            if (!replica) continue;
+            const ReplReadScope rs(*replica, replScratch_);
+            work += replica->doWork(nowNs);
         }
         work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
         if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
@@ -1561,7 +1671,26 @@ private:
         // observed (consumer first: consumer <= producer) — I1 hold rule.
         if (ackSink_) {
             const int64_t consumed = sessionRing_.consumerPosition();
-            work += ackSink_->flush(sessionRing_.producerPosition(), consumed);
+            // Task 23 (★★ shared sendSeq — CRITICAL nonce safety): the sink
+            // owns no crypto table of its own (shared-nothing); this lookup
+            // hands it THIS worker's per-session WorkerSessionCrypto entry —
+            // the EXACT SAME entry (and therefore the exact same `sendSeq`
+            // counter and `send` cipher) pushOwnedSubscriptions_ uses to seal
+            // Records for this session. Acks and Records therefore draw from
+            // ONE monotonic seq under ONE key — never a separate ack counter
+            // (that would reuse nonces, catastrophic for AES-GCM). nullptr
+            // (no entry: plaintext session) takes the exact pre-Task-23
+            // in-place-encode claim, unchanged.
+            work += ackSink_->flush(sessionRing_.producerPosition(), consumed,
+                [this](int64_t sid) -> const RecordsSealCtx* {
+                    WorkerSessionCrypto* cr = findSessionCrypto_(sid);
+                    if (!cr) return nullptr;
+                    ackSealCtx_.send     = cr->send.has_value() ? &*cr->send : nullptr;
+                    ackSealCtx_.sendSeq  = &cr->sendSeq;
+                    ackSealCtx_.cipher   = cr->cipher;
+                    ackSealCtx_.senderId = static_cast<uint8_t>(workerId_ + 1);
+                    return &ackSealCtx_;
+                });
             work += reportSessionSignals_();
         }
         if (work == 0) work += prepareIdle_();   // A9: only a pass that may park pays for it
@@ -1940,7 +2069,7 @@ private:
         // the log dir goes offline — the synchronous fence's semantics), never
         // the log's fail-stop.
         if (routed && r.kind == RouteKind::EpochState) {
-            if (r.syncFd >= 0) ::close(r.syncFd);
+            if (r.syncFd >= 0) { ::close(r.syncFd); --epochStateSyncFdsOpen_; }
             if (gate && sameReplica_(r, gate->replica))
                 (void)gate->replica->epochStateWriteCompleted(static_cast<uint64_t>(r.aux), c.errorCode);
             return 1;
@@ -1949,7 +2078,7 @@ private:
         // next owner rewrites it: rebuildFlushSlots_) and still the SAME
         // replica (an owned replica at a reused address is another one).
         if (routed && r.kind == RouteKind::MemEpochState) {
-            if (r.syncFd >= 0) ::close(r.syncFd);
+            if (r.syncFd >= 0) { ::close(r.syncFd); --epochStateSyncFdsOpen_; }
             if (std::find(owned_.begin(), owned_.end(), r.replica) != owned_.end() && sameReplica_(r, r.replica))
                 (void)r.replica->epochStateWriteCompleted(static_cast<uint64_t>(r.aux), c.errorCode);
             return 1;
@@ -2237,6 +2366,7 @@ private:
         case WorkerOp::Type::SessionClose:
             ++sessionClosesSeen_;
             if (ackSink_) ackSink_->close(op.sessionId());
+            eraseSessionCrypto_(op.sessionId());   // Task 19: no-op if the session was never encrypted
             break;
         }
     }
@@ -2254,15 +2384,87 @@ private:
         lastAnnouncedClientVersion_ = version;
         const std::uint32_t len = op.tailLength();
         const char* p           = op.tail();
+
+        // Task 19: see WorkerOp::sessionEncrypted's doc comment for the wire
+        // reuse (isolation/durabilityTier bytes + the tail's crypto prefix).
+        const bool sessionEncrypted = op.isolation() != 0;
+        std::string_view channel(p, len);
+        if (sessionEncrypted) [[unlikely]] {
+            const bool senderKeyValid = op.durabilityTier() != 0;
+            // Task 22: c2bKeyValid rides the `isGroup` wire byte for
+            // SessionAnnounce (see enqueueOp's wireIsGroup comment).
+            const bool c2bKeyValid    = op.isGroup() != 0;
+            const auto decoded = rune::node::decodeSessionAnnounceCryptoTail(p, len);
+            WorkerSessionCrypto* cr = findSessionCrypto_(sid);
+            if (!cr) { sessionCrypto_.push_back(WorkerSessionCrypto{}); cr = &sessionCrypto_.back(); }
+            cr->sessionId  = sid;
+            cr->sendSeq    = 0;    // fresh counter for THIS session on THIS worker (egress)
+            cr->send.reset();      // fail closed by default: no cipher until proven valid below
+            cr->recvSeq    = 0;    // fresh replay window for THIS session on THIS worker (ingress)
+            cr->recvWindow = 0;
+            cr->recv.reset();      // fail closed by default: no cipher until proven valid below
+            if (!decoded) [[unlikely]] {
+                // Fail closed: a truncated/garbage tail must never be treated
+                // as "this session is fine, push plaintext" — the entry stays
+                // present (sessionEncrypted known) with no cipher installed,
+                // so the push path parks/drops (RecordsSealCtx's own
+                // null-`send` contract) rather than leaking.
+                //
+                // Review fix (Minor, robustness): `channel` was initialized
+                // above to the RAW tail (p, len) — which here still includes
+                // the would-be 37-byte crypto header, since decoding it
+                // failed. Reset it to empty rather than handing
+                // ackSink_->announce() that garbage as if it were a channel
+                // string. Unreachable by construction (the gateway never
+                // sends a truncated tail), but a malformed tail must fail
+                // clean, not mis-announce.
+                channel = std::string_view{};
+                spdlog::critical("Worker {}: session {} SessionAnnounce crypto tail too short "
+                                  "({} B) — Records egress for this session will be parked "
+                                  "(fail-closed)", workerId_, sid, len);
+            } else {
+                channel = decoded->channel;
+                cr->cipher = decoded->cipher;
+                if (senderKeyValid) {
+                    // This worker's OWN per-sender key + its OWN sendSeq
+                    // (independent of the gateway's and every other
+                    // worker's — see RecordsSealCtx::senderId's doc comment).
+                    rune::crypto::AeadKey key{};
+                    std::memcpy(key.bytes, decoded->b2cKey, sizeof(key.bytes));
+                    cr->send.emplace(static_cast<rune::crypto::Cipher>(decoded->cipher),
+                                      key, decoded->b2cPrefix);
+                }
+                // else: the gateway's own deriveSenderKey() failed for this
+                // worker (SessionAnnouncer's fail-closed path) — leave
+                // cr->send empty; the push path parks, never plaintext.
+
+                // Task 22: the session's c2b ingress key — the SAME bytes on
+                // every worker (no per-worker derivation; see
+                // SessionAnnounceKeyTail.h's doc comment). `c2bKeyValid`
+                // mirrors `senderKeyValid`'s fail-closed contract.
+                if (c2bKeyValid) {
+                    rune::crypto::AeadKey ingressKey{};
+                    std::memcpy(ingressKey.bytes, decoded->c2bKey, sizeof(ingressKey.bytes));
+                    cr->recv.emplace(static_cast<rune::crypto::Cipher>(decoded->cipher),
+                                      ingressKey, decoded->c2bPrefix);
+                }
+                // else: the first (parked) wave, or the gateway never shipped
+                // a valid c2b key — leave cr->recv empty; the produce-ingress
+                // decrypt path parks/drops, never plaintext.
+            }
+        } else {
+            eraseSessionCrypto_(sid);   // re-announced as plaintext (should not happen, but never stale)
+        }
+
         if (!ackSink_) return;
         // Fix round 1 (I2): unreachable by construction — the runtime counts
         // every session a worker table can hold (accepted + announced-pending +
         // closes not yet queued everywhere) against kMaxSessions − 1, and
         // refuses longer channels at Connect.  A refusal would leave an
         // accepted session that is never acked: halt, never a silent drop.
-        if (!ackSink_->announce(sid, std::string_view(p, len), stream, version)) [[unlikely]] {
+        if (!ackSink_->announce(sid, channel, stream, version)) [[unlikely]] {
             spdlog::critical("Worker {}: session {} announcement refused (sessions {}, channel {} B, max {})",
-                             workerId_, sid, ackSink_->sessionCount(), len, SessionAckSink::kMaxChannelBytes);
+                             workerId_, sid, ackSink_->sessionCount(), channel.size(), SessionAckSink::kMaxChannelBytes);
             haltInvariant_("session announcement refused", "Task 13 I2: runtime session cap violated", 0);
         }
     }
@@ -2428,15 +2630,16 @@ private:
 
     // -------------------------------------------------------------------
     // read-rework T3/T4 (I3): in-worker push loop.  For each active owned
-    // subscription, zero-copy read whole batches from the cursor (Log::readView),
+    // subscription, read whole batches from the cursor (#65: a pread into the
+    // worker's push scratch, readNoFault_ — never the segment read mmap),
     // encode each as a Records frame into egressScratch_, and push it directly on
     // THIS worker's dynamic-MDC egress publication (workerEgress_).  Advance the
     // cursor only on a successful send (back-pressure preserves at-least/exactly-
     // once, same invariant as the gateway push path).
     //
     // Shared-nothing: reads only worker-owned state (subs_, the owned Log/replica,
-    // workerEgress_).  Zero heap alloc on the hot path (readView span + preallocated
-    // egressScratch_).  No locks/atomics.
+    // workerEgress_).  Zero heap alloc on the hot path (preallocated push scratch +
+    // egressScratch_; one pread per subscription read).  No locks/atomics.
     //
     // Bound: read_uncommitted → HW (replica->highWatermark(), or LEO passthrough).
     // read_committed → the LSO of this worker's own RC state (F15 §2.4, K1);
@@ -2477,11 +2680,38 @@ private:
     // as back-pressured Records) otherwise.  Returns 1 if sent.  Cold path.
     // correlationId 0 + a message naming subscription/topic/partition/offset
     // (encodePushTooLargeError — the F15 S3 m-f convention).
-    int sendPushTooLarge_(WorkerSubscription& s, aeron::ExclusivePublication* pub) {
+    //
+    // Task 23 (mandatory egress audit — 3rd worker->client path found): this
+    // frame goes straight to the client on `pub` (the same per-consumer /
+    // shared-MDC egress Records uses), via sendEncodedToPub_ — NOT through
+    // sendTo/sendRecordsFrame, so it was NEVER sealed even after Task 19
+    // sealed Records. Mirrors the gateway's own analogous path exactly:
+    // ClientGateway::trySendOwedPushError_ already seals (its sendTo() is
+    // the single chokepoint every gateway->client send funnels through —
+    // see sendTo's doc comment), but the worker has no such chokepoint, so
+    // it must seal here explicitly. `seal` non-null ⇒ encrypted session:
+    // seal BEFORE sending (same ordering as sendRecordsFrame/the ack path —
+    // never claim/offer on an unsealed buffer), using the SAME per-session
+    // cr->send/sendSeq/senderId `pushOwnedSubscriptions_` built for Records
+    // (one shared monotonic seq across every worker->client frame type under
+    // this session's one b2c key). Fail-closed: seal==0 (no key yet / AEAD
+    // error) ⇒ return 0 — s.pushState stays ErrorOwed, retried next pass,
+    // exactly like back-pressure; NEVER a plaintext send on an encrypted
+    // session.
+    int sendPushTooLarge_(WorkerSubscription& s, aeron::ExclusivePublication* pub,
+                          const RecordsSealCtx* seal = nullptr) {
         static_assert(kPushTooLargeErrorMaxBytes <= kEgressScratchSize);
         const std::size_t n = encodePushTooLargeError(
             egressScratch_.data(), s.sessionId, s.subscriptionId, s.topicId, s.partition,
             s.nextOffset, s.failedFrameLen, pub->maxMessageLength());
+        if (seal) [[unlikely]] {
+            const std::size_t sn = sealRecordsFrame(*seal, egressScratch_.data(), n,
+                                                    pushTooLargeSealScratch_.data(), pushTooLargeSealScratch_.size());
+            if (sn == 0) [[unlikely]] return 0;   // fail-closed — never transmit, retried next pass
+            if (sendEncodedToPub_(pub, pushTooLargeSealScratch_.data(), sn) <= 0) return 0;
+            s.pushState = WorkerSubscription::PushState::Failed;
+            return 1;
+        }
         if (sendEncodedToPub_(pub, egressScratch_.data(), n) <= 0) return 0;
         s.pushState = WorkerSubscription::PushState::Failed;
         return 1;
@@ -2510,9 +2740,40 @@ private:
             if (!egressPub && workerEgress_) egressPub = workerEgress_->pub();
             if (!egressPub) continue;  // nowhere to send yet
 
+            // Task 19 (per-worker egress crypto addendum): looked up ONCE per
+            // subscription-drain call (not per batch) — `cr` is shared across
+            // every batch pushed for `s` in this pass, so they all seal under
+            // the SAME AeadCipher + the SAME monotonic sendSeq (never a
+            // per-batch-reset counter: that would reuse nonces under this
+            // worker's key). nullptr == plaintext session (the common case;
+            // sessionCrypto_ is empty for an all-plaintext deployment) — takes
+            // the exact pre-Task-19 zero-copy path below, untouched.
+            // Task 23 audit fix: moved ABOVE the pushState/ErrorOwed check
+            // (was below it) so sendPushTooLarge_'s retry call site (just
+            // below) ALSO gets `sealPtr` — this frame is worker->client
+            // egress too (the audit's 3rd path; see sendPushTooLarge_'s own
+            // comment) and MUST seal under the exact same cr/sendSeq as
+            // Records for this session.
+            WorkerSessionCrypto* cr = findSessionCrypto_(s.sessionId);
+            RecordsSealCtx seal;
+            const RecordsSealCtx* sealPtr = nullptr;
+            if (cr) [[unlikely]] {
+                // Fail closed (RecordsSealCtx/sealRecordsFrame's own
+                // contract): cr->send may be nullopt (this worker's key
+                // failed to derive, or hasn't arrived yet) — seal.send stays
+                // null, sealRecordsFrame returns 0, sendRecordsFrame/
+                // sendPushTooLarge_ never transmit. NEVER a plaintext
+                // fallback once `cr` exists.
+                seal.send     = cr->send.has_value() ? &*cr->send : nullptr;
+                seal.sendSeq  = &cr->sendSeq;
+                seal.cipher   = cr->cipher;
+                seal.senderId = static_cast<uint8_t>(workerId_ + 1);   // unique per worker; gateway == 0
+                sealPtr = &seal;
+            }
+
             if (s.pushState != WorkerSubscription::PushState::Live) [[unlikely]] {
                 if (s.pushState == WorkerSubscription::PushState::ErrorOwed)
-                    work += sendPushTooLarge_(s, egressPub);
+                    work += sendPushTooLarge_(s, egressPub, sealPtr);
                 continue;   // parked AT the undeliverable batch
             }
 
@@ -2535,10 +2796,11 @@ private:
 
             const bool freshPass = pushBudgetLeft_ == kPushPassBudgetBytes;
             // #65 (review MAJOR-1): a pread into the worker's scratch — never the
-            // segment read mmap.  noexcept (F3): a failed read is an empty view
-            // (retry next pass).
+            // segment read mmap — stopping near the bound (D26).  noexcept (F3):
+            // a failed read is an empty view (retry next pass; an I/O error is
+            // counted + logged, never retried through the mapping).
             const rune::storage::LogReadView view = readNoFault_(
-                s.logPtr, s.nextOffset, std::min<std::size_t>(kPushMaxChunkBytes, pushBudgetLeft_));
+                s.logPtr, s.nextOffset, std::min<std::size_t>(kPushMaxChunkBytes, pushBudgetLeft_), bound);
             if (view.empty()) continue;
 
             std::size_t pos = 0;
@@ -2618,8 +2880,13 @@ private:
                 // (tryClaim fast path / vectored [fixed | batch] offer — zero
                 // copy of the batch).  Above it: fail this subscription
                 // explicitly and park AT the batch — never skip forward.
+                // Task 19: `sealPtr` is null for a plaintext session (the
+                // exact pre-Task-19 call, unchanged); non-null seals via this
+                // worker's own per-sender key/sendSeq (or fails closed —
+                // Retry, never a plaintext frame — if the key never arrived).
                 const RecordsSendResult sent =
-                    sendRecordsFrame(*egressPub, rec, egressScratch_.data(), egressScratch_.size());
+                    sendRecordsFrame(*egressPub, rec, egressScratch_.data(), egressScratch_.size(),
+                                      sealPtr, sealPtr ? &recordsSealScratch_ : nullptr);
                 if (sent.kind == RecordsSendKind::TooLarge) [[unlikely]] {
                     spdlog::error("Worker {}: push sub={} (topicId={} partition={}) failed at "
                                   "offset={}: Records frame {} B exceeds the egress "
@@ -2629,7 +2896,7 @@ private:
                                   rec.encodedSize(), egressPub->maxMessageLength());
                     s.pushState      = WorkerSubscription::PushState::ErrorOwed;
                     s.failedFrameLen = rec.encodedSize();
-                    work += sendPushTooLarge_(s, egressPub);
+                    work += sendPushTooLarge_(s, egressPub, sealPtr);
                     break;
                 }
                 const int64_t r = sent.position;
@@ -2857,10 +3124,11 @@ private:
         ret.setPushEffectiveBound(bound);
 
         // Only read if there are records available (within the bound).
-        // F5 (hot-path B): zero allocation, one copy — the chunk is gathered
-        // from the segment's read mmap (Log::readView) straight into the
-        // claimed return-ring slot, clamped on the fly (bound, markers,
-        // aborted batches), within this pass's push byte budget.
+        // F5 (hot-path B) + #65: zero allocation — the chunk is pread into the
+        // worker's push scratch (readNoFault_: one pread, no page fault), then
+        // gathered into the claimed return-ring slot (two copies in all),
+        // clamped on the fly (bound, markers, aborted batches), within this
+        // pass's push byte budget.
         if (nextOffset < bound) {
             switch (readPushChunk_(a, ret, log, bound, rc)) {
             case PushChunk::Written:
@@ -2889,11 +3157,13 @@ private:
         enqueueReturn_(std::move(ret));   // no chunk: a fixed-size answer
     }
 
-    // F5: one PushRead's chunk.  Walks the whole batches of a zero-copy
-    // readView once, applying the F15 §2.4 / R-2 clamp (bound, control markers
-    // never delivered, read_committed aborted batches stripped / cut pre-carrier)
-    // and collects the kept bytes as runs; then claims ONE ret_ slot and gathers
-    // the runs into it.  No allocation, no syscall (the read map exists), one copy.
+    // F5: one PushRead's chunk.  Walks the whole batches of one read (#65: a
+    // pread into the push scratch — readNoFault_) once, applying the F15 §2.4 /
+    // R-2 clamp (bound, control markers never delivered, read_committed aborted
+    // batches stripped / cut pre-carrier) and collects the kept bytes as runs;
+    // then claims ONE ret_ slot and gathers the runs into it.  No allocation;
+    // one pread syscall (rarely two: a first batch the window cut) and two
+    // copies (kernel -> scratch, scratch -> ring).
     //   Written  — answered in ret_ (budget charged);
     //   Empty    — no deliverable batch; ret.newNextOffset is past what was
     //              examined (answer it — R-1);
@@ -2911,9 +3181,10 @@ private:
         const std::size_t fit = pushReadChunkFit_();
         const std::size_t cap = std::min({static_cast<std::size_t>(kMaxPushReadChunkBytes), fit, pushBudgetLeft_});
         // #65: a pread into the worker's scratch (readNoFault_) — never the
-        // segment read mmap.  noexcept (F3): a failed read is an empty view —
-        // answered empty, the gateway retries next cycle.
-        const rune::storage::LogReadView v = readNoFault_(log, a.nextOffset, cap);
+        // segment read mmap — stopping near the bound (D26).  noexcept (F3): a
+        // failed read is an empty view — answered empty, the gateway retries
+        // next cycle.
+        const rune::storage::LogReadView v = readNoFault_(log, a.nextOffset, cap, bound);
         if (v.empty()) return PushChunk::Empty;
         const bool preCarrier = a.isGroup && !a.carrier;
         std::size_t rd = 0, nRuns = 0, total = 0;
@@ -2954,7 +3225,7 @@ private:
             next = last + 1;
         }
         // A pass that already pushed never takes a batch past its budget (the
-        // view's first batch is always included — readView's progress rule).
+        // view's first batch is always included — the read's progress rule).
         if (total > pushBudgetLeft_ && !freshPass) return PushChunk::Deferred;
         if (total == 0) {
             if (cutBound >= 0) ret.setPushEffectiveBound(cutBound);
@@ -3030,18 +3301,35 @@ private:
     // #65: the worker's push reads.  First-touch page faults on a segment read
     // MMAP take the process mmap_lock for read — queued behind the provisioner /
     // cleaner threads' mmap/munmap holding it for write: ~1 ms off-CPU worker
-    // passes (box perf, briefs/2026-10-07-reads-retention-bisect.md).  So: ONE
-    // pread into the preallocated scratch (no allocation, no fault).  Only a
-    // first batch larger than the whole scratch (near the ring's max message)
-    // falls back to the mapped view — counted.  The view is valid until the
-    // next push read on this thread.
-    rune::storage::LogReadView readNoFault_(rune::storage::Log* log, int64_t offset, std::size_t maxBytes) noexcept {
-        bool tooLarge = false;
+    // passes (box perf, briefs/2026-10-07-reads-retention-bisect.md).  So: a
+    // pread into the preallocated scratch (no allocation, no fault), sized to
+    // the request and stopping near `bound` (the HW / LSO: D26).  Only a first
+    // batch larger than the whole scratch falls back to the mapped view —
+    // counted (pushReadMapFallbacks_), and only after its bytes read cleanly.
+    // An I/O error is answered empty, counted and logged — never retried
+    // through the mapping (SIGBUS on the same bad page; D26) — and it fails the
+    // log (sticky, review M1): checkStorageFailure_ routes it to the
+    // log-dir-failure path this pass; the log is never pread again.
+    // The view is valid until the next push read on this thread.
+    rune::storage::LogReadView readNoFault_(rune::storage::Log* log, int64_t offset, std::size_t maxBytes,
+                                            int64_t bound) noexcept {
+        rune::storage::ReadIntoStatus st;
+        int err = 0;
         const rune::storage::LogReadView v = log->readInto(offset, static_cast<int32_t>(maxBytes), pushScratch_.data(),
-                                                           pushScratch_.size(), tooLarge);
-        if (!tooLarge) [[likely]] return v;
+                                                           pushScratch_.size(), st, bound, &err);
+        if (st != rune::storage::ReadIntoStatus::FirstTooLarge) [[likely]] {
+            if (st == rune::storage::ReadIntoStatus::IoError) [[unlikely]] notePushReadError_(log, offset, err);
+            return v;
+        }
         ++pushReadMapFallbacks_;
         return log->readView(offset, static_cast<int32_t>(maxBytes));
+    }
+    [[gnu::cold]] void notePushReadError_(const rune::storage::Log* log, int64_t offset, int err) noexcept {
+        ++pushReadErrors_;
+        if ((pushReadErrors_ & (pushReadErrors_ - 1)) == 0)   // rate-limited: powers of two
+            spdlog::error("Worker {}: push read of {} at offset {} failed (errno={}, errors={}) — answered empty, "
+                          "the log is FAILED (never read again; log-dir-failure path)", workerId_, log->dir(), offset, err,
+                          pushReadErrors_);
     }
 
     [[gnu::cold]] void notePushReadOversize_(int32_t topicId, int32_t partition, int64_t offset) noexcept {
@@ -3244,6 +3532,7 @@ private:
         req.lastFetchedEpoch = op.frLastFetchedEpoch();
         req.incarnation      = op.frIncarnation();
 
+        const ReplReadScope rs(*replica, replScratch_);
         try {
             replica->onFetchRequest(req, op.frNowNs(),
                                     static_cast<uint32_t>(op.ownershipGen()));   // F27 R1
@@ -3458,6 +3747,7 @@ private:
         try {
             // F15 N2: the marker lands AS a control batch (restamped in place),
             // with the replica's own role gate (NotLeader, retriable) and min-ISR gate.
+            const ReplReadScope rs(*replica, replScratch_);   // D26: its push reads into the scratch
             const rune::replication::Offset base = replica->appendControlBatch(markerSpan, /*acksAll=*/true);
             if (base >= 0) {
                 ret.baseOffset = base;
@@ -3623,6 +3913,7 @@ private:
         // Mirrors executeFetchRequestWire_ (~1664).
         case static_cast<uint16_t>(rr::ReplicationTemplateId::FetchRequest): {
             const rr::FetchRequestMsg req = rr::FetchRequestMsg::decode(frame, 0);
+            const ReplReadScope rs(*replica, replScratch_);
             try {
                 replica->onFetchRequest(req, nowNs);
             } catch (const std::exception& ex) {
@@ -3801,6 +4092,17 @@ private:
     // executeSetOwnershipWire_ on this worker's own thread). The control thread
     // NEVER touches it.
     OwnedSet owned_{};
+
+    // D23 (D21 review L1b): the dup fds of epoch-state fsyncs still in flight
+    // when the worker is destroyed.  Declared BEFORE io_, so it is destroyed
+    // AFTER it: the fds are closed only once the backend is gone (portable:
+    // flusher joined; io_uring: ring closed — the kernel holds its own file
+    // reference), never under an in-flight fsync.  Filled by ~Worker (cold).
+    struct DeferredFdClose {
+        std::vector<int> fds;
+        ~DeferredFdClose() { for (const int fd : fds) ::close(fd); }
+    };
+    DeferredFdClose teardownSyncFds_;
 
     // E3: per-worker async I/O backend.
     // Owned exclusively by this worker thread — submit()/reap() are called ONLY
@@ -4052,6 +4354,69 @@ private:
     std::vector<WorkerSubscription> subs_;
     uint64_t egressReleases_ = 0;   ///< release ops executed (record-egress retire-on-ack)
 
+    // Task 19: this worker's per-session Records-egress crypto state — see
+    // WorkerSessionCrypto's doc comment. Entries exist ONLY for encrypted
+    // sessions (never for plaintext ones): empty for an all-plaintext
+    // deployment. Linear scan (bounded by this worker's own concurrently
+    // encrypted sessions, not the whole shard) — same style already used for
+    // subs_; a hash-by-sessionId is a known follow-up if that count ever
+    // gets large enough to matter.
+    std::vector<WorkerSessionCrypto> sessionCrypto_;
+    [[nodiscard]] WorkerSessionCrypto* findSessionCrypto_(int64_t sid) noexcept {
+        for (auto& e : sessionCrypto_) if (e.sessionId == sid) return &e;
+        return nullptr;
+    }
+    void eraseSessionCrypto_(int64_t sid) noexcept {
+        for (std::size_t i = 0; i < sessionCrypto_.size(); ++i) {
+            if (sessionCrypto_[i].sessionId == sid) {
+                sessionCrypto_[i] = std::move(sessionCrypto_.back());
+                sessionCrypto_.pop_back();
+                return;
+            }
+        }
+    }
+    /// Test-only: whether this worker holds (any) crypto state for a session.
+    [[nodiscard]] bool sessionCryptoInstalledForTest(int64_t sid) const noexcept {
+        for (const auto& e : sessionCrypto_) if (e.sessionId == sid) return e.send.has_value();
+        return false;
+    }
+    [[nodiscard]] std::size_t sessionCryptoCountForTest() const noexcept { return sessionCrypto_.size(); }
+
+    // Task 19: this worker's OWN RecordsSealScratch for its Records-egress
+    // seal path (shared-nothing: never shared across threads — mirrors
+    // ClientGateway::recordsSealScratch_). Grow-once, reused every push.
+    RecordsSealScratch recordsSealScratch_;
+
+    // Task 23: scratch RecordsSealCtx handed to SessionAckSink::flush's
+    // crypto-lookup callback (built fresh per lookup call, consumed
+    // synchronously inside that same flush() call — never held across
+    // passes). Deliberately a SEPARATE instance from pushOwnedSubscriptions_'s
+    // local `seal` (Records): the two run at different points of one doWork()
+    // pass on the same thread, never concurrently, but keeping them distinct
+    // avoids any accidental aliasing between the Records egress call site and
+    // the ack-flush call site. Both still point at the SAME WorkerSessionCrypto
+    // entry's `send`/`sendSeq`/`cipher` for a given session — the shared
+    // counter lives in sessionCrypto_, not here.
+    RecordsSealCtx ackSealCtx_;
+
+    // Task 22 (shard worker decrypts produce / per-worker ingress): this
+    // worker's OWN scratch for openProduceFrame()'s decrypted output
+    // (RecordsOpen.h). Grow-once (capacity persists; resize() only ever
+    // grows), reused every encrypted produce frame — never a per-frame heap
+    // allocation on the hot path. The decrypted frame is always
+    // kCryptoOverhead (28) bytes SHORTER than the wire frame it came from,
+    // so sizing it to the wire frame's own length is always enough.
+    std::vector<uint8_t> workerIngressOpenScratch_;
+
+    // Task 19: cold scratch for assembling an encrypted SessionAnnounce's
+    // combined [cipher|prefix|key|channel] tail (see SessionAnnounceKeyTail.h).
+    // Sized for the fixed crypto header + the largest egress channel the
+    // runtime will ever announce (SessionAckSink::kMaxChannelBytes). A
+    // worker-owned member (not a per-call stack buffer) so enqueueOp's hot
+    // Produce/PushRead/etc. callers never pay for it on their stack frame.
+    std::array<uint8_t, kSessionAnnounceCryptoHeaderBytes + SessionAckSink::kMaxChannelBytes>
+        sessionAnnounceTailScratch_{};
+
     // read-rework T3/T4 (I3): per-worker encode scratch for the in-worker push
     // loop.  Holds one encoded single-fragment Records frame (tryClaim fast
     // path), or just the 52-byte fixed part of a larger frame whose batch bytes
@@ -4061,9 +4426,16 @@ private:
     static constexpr std::size_t kEgressScratchSize = 68 * 1024;
     // Max whole batches pushed per subscription per doWork cycle (fairness).
     static constexpr int         kPushBatchesPerSubPerCycle = 1024;
-    // Max bytes fetched per subscription per cycle via readView (matches gateway).
+    // Max bytes read per subscription per cycle (matches gateway).
     static constexpr int32_t     kPushMaxChunkBytes = static_cast<int32_t>(512 * 1024);
     std::vector<uint8_t> egressScratch_;
+    // Task 23 (egress audit, 3rd path): sendPushTooLarge_'s ENCRYPTED-session
+    // seal output. kPushTooLargeErrorMaxBytes is a compile-time bound (the
+    // ErrorResponse message is a fixed-format snprintf, never user data), so
+    // — like the ack path's scratch — a fixed array is strictly simpler than
+    // a grow-once vector and still zero-allocation (Rule 4).
+    std::array<uint8_t, kPushTooLargeErrorMaxBytes + rune::protocol::client::kCryptoOverhead>
+        pushTooLargeSealScratch_{};
 public:
     /// F5 (hot-path B): the consumer-push byte budget of ONE worker pass, shared
     /// by gateway PushRead answers and in-worker egress pushes: every pushed
@@ -4080,6 +4452,7 @@ public:
     [[nodiscard]] uint64_t pushReadsDeferredForTest() const noexcept { return pushReadsDeferred_; }
     /// #65: push reads that fell back to the segment read mmap (first batch > scratch).
     [[nodiscard]] uint64_t pushReadMapFallbacksForTest() const noexcept { return pushReadMapFallbacks_; }
+    [[nodiscard]] uint64_t pushReadErrorsForTest() const noexcept { return pushReadErrors_; }
     [[nodiscard]] std::size_t deferredPushReadsForTest() const noexcept { return deferredPushCount_; }
 private:
     std::size_t                           pushBudgetLeft_ = kPushPassBudgetBytes;
@@ -4090,6 +4463,23 @@ private:
     /// batches fall back to the mapped view (pushReadMapFallbacks_).
     std::vector<uint8_t>                  pushScratch_ = std::vector<uint8_t>(2 * kPushPassBudgetBytes + 64 * 1024);
     uint64_t                              pushReadMapFallbacks_ = 0;
+    uint64_t                              pushReadErrors_ = 0;   ///< D26: push-read pread failures (answered empty)
+    /// D26: replication read scratch — a fetch serve / owed re-serve / push of
+    /// an owned replica preads into it (PartitionReplica::setReadScratch), never
+    /// faulting through the segment read map.  maxFetchBytes (1 MiB) + the
+    /// sparse-index skip slack; larger reads fall back to the mapped view.
+    std::vector<uint8_t>                  replScratch_ = std::vector<uint8_t>((1u << 20) + 64 * 1024);
+    /// Sets the replica's read scratch for one call from this thread, cleared
+    /// after: a replica handed to another owner never keeps this worker's buffer.
+    struct ReplReadScope {
+        rune::replication::PartitionReplica& r;
+        ReplReadScope(rune::replication::PartitionReplica& rep, std::vector<uint8_t>& buf) noexcept : r(rep) {
+            r.setReadScratch(buf.data(), buf.size());
+        }
+        ~ReplReadScope() { r.setReadScratch(nullptr, 0); }
+        ReplReadScope(const ReplReadScope&) = delete;
+        ReplReadScope& operator=(const ReplReadScope&) = delete;
+    };
     std::size_t                           pushRotor_ = 0;   ///< in-worker push: first sub served next pass
     uint64_t                              pushReadChunks_ = 0, pushReadBytes_ = 0, pushReadsDeferred_ = 0;
 
@@ -4331,6 +4721,7 @@ private:
     CompletionToken lastEpochStateToken_ = kNoToken;   ///< tests (lastEpochStateTokenForTest)
     int             lastEpochStateSyncFd_ = -1;        ///< tests (lastEpochStateSyncFdForTest)
     uint64_t    epochStateNotRouted_ = 0; ///< review Md3
+    int         epochStateSyncFdsOpen_ = 0;   ///< D23: open epoch-state fsync dups (tests)
     int         forceRouteFailForTest_ = 0;
     std::vector<uint8_t> esScratch_ = std::vector<uint8_t>(4096);   ///< review Md4: one image buffer per worker
     std::vector<rune::storage::Log*> rpQueue_;   ///< E1d F8: logs whose checkpoint is due
@@ -4920,6 +5311,11 @@ private:
         routes_.assign(cap, TokenRoute{});
         routeMask_ = cap - 1;
     }
+    /// D23: a route slot is free (cold — a scan of <= 2x the io depth).
+    [[nodiscard]] bool routeHasRoom_() const noexcept {
+        for (const TokenRoute& r : routes_) if (r.token == kNoToken) return true;
+        return false;
+    }
     bool routeInsert_(const TokenRoute& r) noexcept {
         for (std::size_t n = 0, i = static_cast<std::size_t>(r.token) & routeMask_; n <= routeMask_;
              ++n, i = (i + 1) & routeMask_) {
@@ -5015,6 +5411,16 @@ private:
             esScratch_.resize(need);                       // cold: the history outgrew the scratch
             if (!r.prepareEpochStateWrite(esScratch_.data(), esScratch_.size(), w, need)) return 0;
         }
+        // D23 (D21 review L1a): its completion must be routable, so the room
+        // is checked BEFORE the slot write and its fsync (cold: a scan of the route
+        // table) — a full table refuses the write (rewritten next pass), never
+        // an unobservable completion whose dup would be left open.
+        if (forceRouteFailForTest_ > 0 || !routeHasRoom_()) [[unlikely]] {
+            if (forceRouteFailForTest_ > 0) --forceRouteFailForTest_;
+            r.epochStateWriteNotSubmitted();   // Prepared -> Idle, still due
+            ++epochStateNotRouted_;
+            return 0;                          // back-pressure (like a refused submit)
+        }
         // The image is copied into the page cache here: the worker's scratch is
         // free again when pwrite returns (review Md4: no per-replica image).
         if (::pwrite(w.fd, w.data, w.len, static_cast<off_t>(w.offset)) != static_cast<ssize_t>(w.len)) {
@@ -5028,6 +5434,7 @@ private:
         // the replica may close / reopen its own fd at any time — an fd number
         // is never closed under an in-flight fsync (and then reused).
         const int syncFd = ::fcntl(w.fd, F_DUPFD_CLOEXEC, 0);
+        if (syncFd >= 0) ++epochStateSyncFdsOpen_;
         if (syncFd < 0) {
             const int err = errno != 0 ? errno : EMFILE;
             r.epochStateWriteSubmitted();
@@ -5038,6 +5445,7 @@ private:
         const CompletionToken t = io_.submit(syncFd, 0);
         if (t == kNoToken) {                               // back-pressure: retry next pass
             ::close(syncFd);                               // never submitted
+            --epochStateSyncFdsOpen_;
             r.epochStateWriteNotSubmitted();
             return 0;
         }
@@ -5055,15 +5463,10 @@ private:
         } else {
             route.kind = RouteKind::MemEpochState;
         }
-        const bool routed = forceRouteFailForTest_ == 0 && routeInsert_(route);
-        if (!routed) [[unlikely]] {
-            if (forceRouteFailForTest_ > 0) --forceRouteFailForTest_;
-            // Its completion is never observed, so its dup is never known to be
-            // idle: deliberately left open (unreachable in production — the
-            // route table holds 2x the io depth) rather than closed under the
-            // in-flight fsync.
-            // Review Md3: an unroutable completion is never observed — the write
-            // is treated as not done and rewritten next pass (never wedged).
+        // Cannot fail: the room was checked above and nothing ran in between
+        // on this thread (D23).  Defensive only — its dup is then left open
+        // (never closed under the in-flight fsync) and the write is redone.
+        if (!routeInsert_(route)) [[unlikely]] {
             spdlog::critical("Worker {}: io token route table full (token={}) — epoch-state write re-queued",
                              workerId_, t);
             r.epochStateWriteNotRouted();
@@ -5726,12 +6129,62 @@ private:
         RUNE_FR_SPAN_PRODUCE(rune_fr::Site::WorkerIngressRecv, 0);
         namespace pc = rune::protocol::client;
 
-        // Decode the produce frame.
-        auto msgOpt = pc::Produce::decode(data, len);
+        // Task 22 (shard worker decrypts produce / per-worker ingress,
+        // 2026-10-08): peek the CLEAR sessionId (the MessageHeader is always
+        // plaintext — it forms part of the AEAD AAD) and look up this
+        // session's c2b ingress ctx BEFORE touching the rest of the frame.
+        // An entry here exists IFF the session is encrypted (see
+        // executeSessionAnnounceWire_ / eraseSessionCrypto_: a plaintext
+        // session never gets one, and SessionClose/re-announce-as-plaintext
+        // erase it) — so a hit means "decrypt or drop", NEVER "maybe
+        // plaintext". sessionCrypto_ is empty for an all-plaintext
+        // deployment, so this is a cheap no-op scan for the common case:
+        // the decode path below is byte-identical to pre-Task-22 when no
+        // entry is found.
+        const uint8_t* decData = data;
+        std::size_t    decLen  = len;
+        // Lows batch C (D8c R3): the seq of a decrypted frame is committed to
+        // the replay window only once the frame is CONSUMED — a frame HELD
+        // below (deferred roll: ABORT + redelivery) must re-open on redelivery.
+        RecordsOpenCtx openCtx;
+        uint64_t       openSeq = 0;
+        if (!sessionCrypto_.empty() && len >= kProduceSessionIdEnd) [[unlikely]] {
+            WorkerSessionCrypto* cr = findSessionCrypto_(produceSessionIdOf_(data));
+            if (cr) [[unlikely]] {
+                openCtx.recv       = cr->recv.has_value() ? &*cr->recv : nullptr;
+                openCtx.recvSeq    = &cr->recvSeq;
+                openCtx.recvWindow = &cr->recvWindow;
+                // The reconstructed plaintext frame is always kCryptoOverhead
+                // bytes SHORTER than the wire frame — sizing to `len` is
+                // always enough. Grow-once (capacity persists across calls).
+                if (workerIngressOpenScratch_.size() < len) workerIngressOpenScratch_.resize(len);
+                const std::size_t n = openProduceFrameUncommitted(openCtx, data, len,
+                                                                   workerIngressOpenScratch_.data(),
+                                                                   workerIngressOpenScratch_.size(), openSeq);
+                if (n == 0) [[unlikely]] {
+                    // Fail-closed: no key yet / tamper / replay / too-old —
+                    // NEVER decode the ciphertext as plaintext. Same drop
+                    // contract as an undecodable plaintext frame below.
+                    if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
+                    spdlog::warn("Worker {}: WorkerIngress: produce decrypt failed (session={}, "
+                                 "len={}); dropping (fail-closed)",
+                                 workerId_, produceSessionIdOf_(data), len);
+                    return 0;
+                }
+                decData = workerIngressOpenScratch_.data();
+                decLen  = n;
+            }
+        }
+
+        // Decode the produce frame (plaintext path: decData/decLen ==
+        // data/len, byte-identical to pre-Task-22; encrypted path: the
+        // reconstructed [24B header][plaintext body] from above).
+        auto msgOpt = pc::Produce::decode(decData, decLen);
         if (!msgOpt) {
             if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
+            if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (dropped)
             spdlog::warn("Worker {}: WorkerIngress: failed to decode Produce frame "
-                         "len={}; dropping", workerId_, len);
+                         "len={}; dropping", workerId_, decLen);
             return 0;
         }
         const pc::Produce& msg = *msgOpt;
@@ -5753,8 +6206,9 @@ private:
             msg.recordBatch.size() <= maxIntakeBatchBytes()) [[unlikely]] {
             if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
             ++intakeRollHolds_;
-            return kIngressHeld;
+            return kIngressHeld;                                     // seq NOT committed: it re-opens
         }
+        if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed from here on
 
         // E5.1.3 review fix #3: acksAll = (acks != 0).
         // The Produce wire field carries 0=NoAck, 1=Leader, -1 (0xFF)=All.

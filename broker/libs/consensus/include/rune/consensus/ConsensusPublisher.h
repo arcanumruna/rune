@@ -27,6 +27,14 @@ struct ConsensusPublisher {
     /// (test doubles that do not model the exchange).
     virtual void candidacyState(NodeId /*toMember*/, NodeId /*fromMember*/,
                                 const CandidacyState& /*state*/) {}
+    // D29 PreVote (templates 60 / 61) + TermFloorNotice (62).
+    virtual void preVoteRequest(NodeId /*toMember*/, Term /*term*/, Term /*logLeadershipTermId*/,
+                                int64_t /*logPosition*/, NodeId /*candidateId*/) {}
+    virtual void preVoteResponse(NodeId /*toMember*/, Term /*term*/, NodeId /*voterId*/, bool /*granted*/,
+                                 Term /*voterTermId*/) {}
+    virtual void termFloorNotice(NodeId /*toMember*/, NodeId /*fromMember*/,
+                                 Term /*floorTermId*/, Term /*refusedTermId*/) {}
+
 
     /// Controlled shutdown (Raft leadership transfer / Aeron graceful leader
     /// close): the leader `leaderMemberId` of `leadershipTermId` resigns —

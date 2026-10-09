@@ -2308,7 +2308,7 @@ TEST(LogCleanerRegression, DeferredOutputCarriesIndexAndNextOffsetAndInstallsReg
         std::ifstream f(log.segmentForTest(b)->logPath(), std::ios::binary);
         EXPECT_EQ(std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()), before[b]);
     }
-    const auto snap = log.sealedSegmentSnapshot();
+    const auto snap = log.ownerSealedSnapshot();
     for (const auto& g : res.groups) {
         ASSERT_TRUE(g.hasOutput);
         EXPECT_TRUE(std::filesystem::exists(Log::cleanedLogPath(log.dir(), g.bases.front(), g.seq)));

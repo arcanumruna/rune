@@ -1012,6 +1012,8 @@ public:
     [[nodiscard]] uint64_t epochStateErrorsForTest() const noexcept { return es_.errors; }
     [[nodiscard]] bool epochStateEnabledForTest() const noexcept { return es_.enabled; }
     [[nodiscard]] bool epochStateFdOpenForTest() const noexcept { return es_.fd >= 0; }
+    [[nodiscard]] uint64_t epochStateRecreatesForTest() const noexcept { return es_.recreates; }
+    [[nodiscard]] std::size_t epochStateReservedForTest() const noexcept { return es_.reserved; }
     [[nodiscard]] bool refetchAwaitsEpochStateForTest() const noexcept { return awaitEsFetch_; }
     /// Tests (power-loss seam): completions of epoch-state writes are held —
     /// the write stays InFlight (never confirmed) until released.
@@ -1024,6 +1026,9 @@ public:
     bool writeEpochStateInlineForTest() noexcept { return writeEpochStateInline_(); }
     /// Tests (re-review N6): the next `n` inline epoch-state writes fail (process-wide, single-threaded tests).
     static void failInlineEpochStateWritesForTest(int n) noexcept { inlineFailN_ = n; }
+    /// Tests (review M2): while non-zero, reserving the slots' heads at enable
+    /// fails with it (process-wide, single-threaded tests).
+    static void failEpochStateReserveForTest(int err) noexcept { reserveFaultForTest_ = err; }
     /// Tests: deliver a held completion now.
     void releaseHeldEpochStateForTest() {
         esHoldForTest_ = false;
@@ -1083,6 +1088,18 @@ public:
     /// push on, a non-zero count means the follower had to be re-served
     /// (lost/dropped push → 20 ms resend window).
     [[nodiscard]] uint64_t fetchDataServesForTest() const noexcept { return fetchDataServes_; }
+    /// D26: the calling thread's log-read scratch (non-owning).  The owning
+    /// worker sets it around each call into this replica (onFetchRequest /
+    /// doWork) and clears it after, so a fetch serve, owed re-serve or push
+    /// reads the disk log with a pread into it — never through the segment read
+    /// mmap, whose first-touch page faults wait on the process mmap_lock behind
+    /// the provisioner / cleaner.  Null (control thread, tests): the mapped view.
+    void setReadScratch(uint8_t* buf, std::size_t cap) noexcept { readScratch_ = buf; readScratchCap_ = cap; }
+    /// D26: reads that fell back to the mapped view with a scratch set (a first
+    /// batch larger than the scratch).
+    [[nodiscard]] uint64_t readMapFallbacksForTest() const noexcept { return readMapFallbacks_; }
+    /// Leader pushes that read a chunk (pushToFollowers).
+    [[nodiscard]] int64_t pushesForTest() const noexcept { return rtPushes_; }
     /// Test seam: a follower-side log truncation (KIP-279), bumping logGeneration().
     void truncateLogForTest(Offset truncateOffset) { truncateLog(truncateOffset); }
     /// F27: replication sends this replica had REFUSED by its transport (pushes,
@@ -1288,6 +1305,14 @@ private:
     rune::storage::Log*         diskLog_ = nullptr;  ///< non-null iff !memoryBacked_
     rune::storage::InMemoryLog* memLog_  = nullptr;  ///< non-null iff  memoryBacked_
     bool                        memoryBacked_ = false;
+    uint8_t*                    readScratch_ = nullptr;     ///< D26: see setReadScratch()
+    std::size_t                 readScratchCap_ = 0;
+    uint64_t                    readMapFallbacks_ = 0;
+    uint64_t                    readErrors_ = 0;            ///< D26: pread failures (answered empty)
+    /// D26: a whole-batch read of the active log — a pread into readScratch_
+    /// when set (disk log), else the mapped view.  The view lives until the next
+    /// read through this helper on the same thread.
+    rune::storage::LogReadView readLog_(Offset from, int32_t maxBytes) noexcept;
     PartitionTransport*         transport_;   ///< non-owning
     using PerWorkerTransport = WorkerReplicationTransportImpl<AeronPubRegistry>;
     TransportKind       tkind_     = TransportKind::Generic;  ///< fixed at construction
@@ -1410,6 +1435,7 @@ private:
         bool        enabled = false;    ///< leader-epoch-state is the authoritative copy
         int         fd = -1;            ///< open only while a write is due / in flight (review Md4)
         std::size_t stride = 0;         ///< slot stride (file size / 2)
+        std::size_t reserved = 0;       ///< D23: allocated head of each slot (an in-place image must fit)
         int         activeSlot = -1;    ///< slot of the newest CONFIRMED image (-1: none)
         uint64_t    seq = 0;            ///< last sequence used
         EsStage     stage = EsStage::Idle;
@@ -1427,6 +1453,7 @@ private:
         int64_t     inflightMin = INT64_MAX;
         int         failures = 0;       ///< consecutive failed writes (Md2)
         int64_t     retryNotBeforeNs = 0;
+        int         lastErr = 0;        ///< errno of the last failed inline re-create (review M2)
         uint64_t    writes = 0, inlineWrites = 0, errors = 0, recreates = 0, notRouted = 0;
     };
     EpochStateIo es_;
@@ -1444,6 +1471,14 @@ private:
     uint64_t leadGenSeq_ = 0;
     void enableEpochState_() noexcept;
     bool writeEpochStateInline_() noexcept;
+    /// Review M2: an owner-pass write that failed before submission (open /
+    /// re-create) — through the regular completion failure path (backoff).
+    void failEpochStateWriteNow_(int err);
+    /// D23: an image of `entries` entries can be written in place — inside the
+    /// slot AND its allocated head (never a block allocation).  Used by the
+    /// cold inline writer only; the worker's async writer re-creates only past
+    /// the slot (review M2) and writes past the head in place.
+    [[nodiscard]] bool epochImageFitsInPlace_(std::size_t entries) const noexcept;
     int  openEpochStateFd_() noexcept;   ///< 0 or errno
     void closeEpochStateFdIfIdle_() noexcept;
     /// Review C1: the epoch history from `x` on changed (not yet durable).
@@ -1461,6 +1496,7 @@ private:
     bool esHoldForTest_ = false;
     int  esFailN_ = 0, esFailErr_ = 0;
     static inline int inlineFailN_ = 0;
+    static inline int reserveFaultForTest_ = 0;
     uint64_t esHeldSeq_ = 0;  int esHeldErr_ = 0;  bool esHeld_ = false;
     uint64_t appliesDroppedAwaitEs_ = 0;
     void cancelPendingLeadership_() noexcept;

@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+#include <csignal>
+#include <sys/resource.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 #include <filesystem>
@@ -735,7 +737,7 @@ TEST(Log, SealedSnapshotLargestTimestampIncrementalA) {
     }
     // Verify: before a roll there is only 1 segment, sealed snapshot is empty.
     {
-        auto snap = log.sealedSegmentSnapshot();
+        auto snap = log.ownerSealedSnapshot();
         // May have 0 or more sealed segments already (if a roll happened).
         // We'll check after the explicit roll below.
     }
@@ -748,7 +750,7 @@ TEST(Log, SealedSnapshotLargestTimestampIncrementalA) {
         if (ts > expectedMaxTs) expectedMaxTs = ts;
     }
     // After the writes, some segments should be sealed.
-    auto snap = log.sealedSegmentSnapshot();
+    auto snap = log.ownerSealedSnapshot();
     ASSERT_GE(snap->size(), 1u) << "Must have at least one sealed segment after roll";
 
     // For every sealed segment, verify largestTimestamp is positive and reasonable.
@@ -786,7 +788,7 @@ TEST(Log, SealedSnapshotLargestTimestampIncrementalB) {
         off = log.append(b.build(), off);
     }
 
-    auto snap = log.sealedSegmentSnapshot();
+    auto snap = log.ownerSealedSnapshot();
     ASSERT_GE(snap->size(), 2u) << "Multiple rolls expected with rollBytes=128 and 30 records";
 
     // Verify each sealed segment's largestTimestamp by re-scanning the file.
@@ -850,7 +852,7 @@ TEST(Log, SealedSnapshotLargestTimestampHorizonBatch) {
         log.append(bp.build(), 2 + i);
     }
 
-    auto snap = log.sealedSegmentSnapshot();
+    auto snap = log.ownerSealedSnapshot();
     ASSERT_GE(snap->size(), 1u) << "Need at least 1 sealed segment";
 
     // The first sealed segment contains the normal + horizon batches.
@@ -1856,7 +1858,7 @@ TEST(LogRegression, SealedSnapshotKeepsEachSegmentsTimestampAcrossManyRollsRegre
         b.append("k", "v", 100'000 + i);
         log.append(b.build(), static_cast<int64_t>(i));
     }
-    const auto snap = log.sealedSegmentSnapshot();
+    const auto snap = log.ownerSealedSnapshot();
     ASSERT_NE(snap, nullptr);
     ASSERT_GE(snap->size(), static_cast<std::size_t>(kBatches - 2));
     for (std::size_t i = 0; i < snap->size(); ++i) {
@@ -1881,7 +1883,7 @@ void appendTs(Log& log, int64_t off, int64_t ts) {
 // The published snapshot must describe exactly segments_ minus the active one.
 void expectSnapshotMatchesSegments(Log& log) {
     const auto bases = log.segmentBaseOffsets();
-    const auto snap  = log.sealedSegmentSnapshot();
+    const auto snap  = log.ownerSealedSnapshot();
     ASSERT_NE(snap, nullptr);
     ASSERT_EQ(snap->size(), bases.size() - 1);
     for (std::size_t i = 0; i < snap->size(); ++i) {
@@ -1902,7 +1904,7 @@ TEST(LogRegression, TruncateToRepublishesSealedSnapshotRegression) {
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     Log log(dir.string(), /*rollBytes=*/100);
     for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
-    ASSERT_GE(log.sealedSegmentSnapshot()->size(), 3u);
+    ASSERT_GE(log.ownerSealedSnapshot()->size(), 3u);
     EXPECT_TRUE(log.truncateTo(3));
     EXPECT_EQ(log.logEndOffset(), 3);
     expectSnapshotMatchesSegments(log);
@@ -1929,7 +1931,7 @@ TEST(LogRegression, TruncatedSegmentResealGetsItsOwnTimestampRegression) {
     const int64_t activeBase = log.segmentBaseOffsets().back();
     ASSERT_LT(activeBase, 3);
     for (int64_t i = 3; i < 12; ++i) appendTs(log, i, 9'000'000 + i);
-    const auto snap = log.sealedSegmentSnapshot();
+    const auto snap = log.ownerSealedSnapshot();
     const SegInfo* si = findSeg(*snap, activeBase);
     ASSERT_NE(si, nullptr);
     EXPECT_EQ(si->largestTimestamp, 9'000'003) << "base " << activeBase;
@@ -1948,7 +1950,7 @@ TEST(LogRegression, TruncateRecomputesActiveSegmentMaxTimestampRegression) {
     EXPECT_TRUE(log.truncateTo(3));
     const int64_t activeBase = log.segmentBaseOffsets().back();
     for (int64_t i = 3; i < 12; ++i) appendTs(log, i, 2000 + i);
-    const SegInfo* si = findSeg(*log.sealedSegmentSnapshot(), activeBase);
+    const SegInfo* si = findSeg(*log.ownerSealedSnapshot(), activeBase);
     ASSERT_NE(si, nullptr);
     EXPECT_EQ(si->largestTimestamp, 2003) << "base " << activeBase;
     std::filesystem::remove_all(dir);
@@ -1971,7 +1973,7 @@ TEST(LogRegression, RecoverSeedsActiveSegmentMaxTimestampRegression) {
     log.recover();
     ASSERT_EQ(log.segmentBaseOffsets().back(), activeBase);
     for (int64_t i = 7; i < 14; ++i) appendTs(log, i, 1000 + i);
-    const SegInfo* si = findSeg(*log.sealedSegmentSnapshot(), activeBase);
+    const SegInfo* si = findSeg(*log.ownerSealedSnapshot(), activeBase);
     ASSERT_NE(si, nullptr);
     EXPECT_EQ(si->largestTimestamp, 9'000'006) << "base " << activeBase;
     std::filesystem::remove_all(dir);
@@ -2005,7 +2007,7 @@ TEST(LogRegression, ZeroTimestampSegmentKeepsZeroAcrossRollsRegression) {
     Log log(dir.string(), /*rollBytes=*/100);
     for (int64_t i = 0; i < 3; ++i) appendTs(log, i, 0);          // seals segment 0 with max ts 0
     for (int64_t i = 3; i < 9; ++i) appendTs(log, i, 5'000'000 + i);
-    const auto snap = log.sealedSegmentSnapshot();
+    const auto snap = log.ownerSealedSnapshot();
     ASSERT_GE(snap->size(), 2u);
     EXPECT_EQ((*snap)[0].baseOffset, 0);
     EXPECT_EQ((*snap)[0].largestTimestamp, 0);
@@ -2027,7 +2029,7 @@ TEST(LogRegression, SnapshotTimestampsSurviveRetentionDeletesThenRollsRegression
     // proposal is refused; the middle segment leaves via a compaction drop.
     ASSERT_TRUE(log.enqueueDeletedSegment(bases[10]));
     EXPECT_EQ(log.drainRetentionDeletes(), 5);
-    EXPECT_NE(findSeg(*log.sealedSegmentSnapshot(), bases[10]), nullptr) << "no hole below HW";
+    EXPECT_NE(findSeg(*log.ownerSealedSnapshot(), bases[10]), nullptr) << "no hole below HW";
     {
         std::string b10 = std::to_string(bases[10]);
         b10 = std::string(20 - b10.size(), '0') + b10;
@@ -2038,7 +2040,7 @@ TEST(LogRegression, SnapshotTimestampsSurviveRetentionDeletesThenRollsRegression
     expectSnapshotMatchesSegments(log);
     for (int64_t i = 22; i < 24; ++i) appendTs(log, i, 100'000 + i);   // two more rolls
     expectSnapshotMatchesSegments(log);
-    const auto snap = log.sealedSegmentSnapshot();
+    const auto snap = log.ownerSealedSnapshot();
     for (const auto& si : *snap) {
         // bases[9] took bases[10]'s offsets (and conservatively its timestamp).
         const int64_t expected = si.baseOffset == bases[9] ? 100'000 + bases[10] : 100'000 + si.baseOffset;
@@ -2058,7 +2060,7 @@ TEST(LogRegression, DeleteOldSegmentsRepublishesSealedSnapshotRegression) {
     for (int64_t i = 0; i < 12; ++i) appendTs(log, i, 100'000 + i);
     ASSERT_GT(log.deleteOldSegments(/*retainBytes=*/200), 0);
     expectSnapshotMatchesSegments(log);
-    for (const auto& si : *log.sealedSegmentSnapshot())
+    for (const auto& si : *log.ownerSealedSnapshot())
         EXPECT_EQ(si.largestTimestamp, 100'000 + si.baseOffset);
     std::filesystem::remove_all(dir);
 }
@@ -2080,12 +2082,12 @@ TEST(LogRegression, ReloadSegmentsRepublishesSealedSnapshotRegression) {
     std::filesystem::remove(dir / (s + ".index"));
     log.reloadSegments();
     expectSnapshotMatchesSegments(log);
-    EXPECT_EQ(findSeg(*log.sealedSegmentSnapshot(), bases[1]), nullptr);
+    EXPECT_EQ(findSeg(*log.ownerSealedSnapshot(), bases[1]), nullptr);
     for (int64_t i = 8; i < 10; ++i) appendTs(log, i, 100'000 + i);
     // The vanished segment's offsets are now covered by its predecessor, which
     // (conservatively — it may be a coalesced merge) takes its timestamp too
     // (fix round 1 CRITICAL-1); every other survivor keeps its own.
-    for (const auto& si : *log.sealedSegmentSnapshot()) {
+    for (const auto& si : *log.ownerSealedSnapshot()) {
         const int64_t expected = si.baseOffset == bases[0] ? 100'000 + bases[1] : 100'000 + si.baseOffset;
         EXPECT_EQ(si.largestTimestamp, expected) << "segment base " << si.baseOffset;
     }
@@ -2145,13 +2147,13 @@ TEST(LogRegression, MergedGroupTakesMaxTimestampOfMembersRegression) {
         ASSERT_TRUE(log.enqueueCleanedSegment(2));
         log.drainCleanerSwaps();
         ASSERT_EQ(log.segmentBaseOffsets(), (std::vector<int64_t>{0, 4}));
-        const auto snap = log.sealedSegmentSnapshot();
+        const auto snap = log.ownerSealedSnapshot();
         ASSERT_EQ(snap->size(), 1u);
         EXPECT_EQ((*snap)[0].endOffset, 4);
         EXPECT_GE((*snap)[0].largestTimestamp, 9'000'003) << "split=" << splitAcrossDrains;
         // ...and it stays after later rolls (the cache must keep the merged max).
         for (int64_t i = 5; i < 9; ++i) appendTs(log, i, 9'000'000 + i);
-        const SegInfo* si = findSeg(*log.sealedSegmentSnapshot(), 0);
+        const SegInfo* si = findSeg(*log.ownerSealedSnapshot(), 0);
         ASSERT_NE(si, nullptr);
         EXPECT_GE(si->largestTimestamp, 9'000'003) << "split=" << splitAcrossDrains;
         std::filesystem::remove_all(dir);
@@ -2168,7 +2170,7 @@ TEST(LogRegression, CompactionRewriteKeepsSegmentTimestampRegression) {
     ASSERT_TRUE(log.enqueueCleanedSegment(2));
     EXPECT_EQ(log.drainCleanerSwaps(), 1);
     for (int64_t i = 7; i < 10; ++i) appendTs(log, i, 100'000 + i);
-    for (const auto& si : *log.sealedSegmentSnapshot())
+    for (const auto& si : *log.ownerSealedSnapshot())
         EXPECT_EQ(si.largestTimestamp, 100'000 + si.baseOffset + 1) << "segment base " << si.baseOffset;
     std::filesystem::remove_all(dir);
 }
@@ -2188,7 +2190,7 @@ TEST(LogRegression, MultiBatchAppendTracksMaxOfAllBatchesRegression) {
         if (variant == 0) log.appendNoSync(chunk.data(), chunk.size(), 1);
         else              log.append(chunk.data(), chunk.size(), 1);
         appendTs(log, 2, 1002);   // rolls: segment 0 seals
-        const SegInfo* si = findSeg(*log.sealedSegmentSnapshot(), 0);
+        const SegInfo* si = findSeg(*log.ownerSealedSnapshot(), 0);
         ASSERT_NE(si, nullptr);
         EXPECT_EQ(si->largestTimestamp, 9'000'000) << "variant " << variant;
         std::filesystem::remove_all(dir);
@@ -2249,7 +2251,7 @@ TEST(LogRegression, SyncReloadSegmentRepublishesSealedSnapshotRegression) {
     std::filesystem::remove(segFile(dir, 2, ".index"));
     log.reloadSegment(2);
     expectSnapshotMatchesSegments(log);
-    EXPECT_EQ(findSeg(*log.sealedSegmentSnapshot(), 2), nullptr);
+    EXPECT_EQ(findSeg(*log.ownerSealedSnapshot(), 2), nullptr);
     std::filesystem::remove_all(dir);
 }
 
@@ -2262,13 +2264,13 @@ TEST(LogRegression, StaleLineageCleanerWorkIsDroppedRegression) {
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     Log log(dir.string(), /*rollBytes=*/100);
     for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
-    const SegInfo* before = findSeg(*log.sealedSegmentSnapshot(), 2);
+    const SegInfo* before = findSeg(*log.ownerSealedSnapshot(), 2);
     ASSERT_NE(before, nullptr);
     const uint64_t staleLineage = before->lineage;
     ASSERT_NE(staleLineage, Log::kAnyLineage);
     EXPECT_TRUE(log.truncateTo(3));
     for (int64_t i = 3; i < 7; ++i) appendTs(log, i, 9'000'000 + i);   // segment 2 sealed again
-    const SegInfo* now = findSeg(*log.sealedSegmentSnapshot(), 2);
+    const SegInfo* now = findSeg(*log.ownerSealedSnapshot(), 2);
     ASSERT_NE(now, nullptr);
     ASSERT_NE(now->lineage, staleLineage);
     // Stale retention proposal: dropped, nothing on disk touched.
@@ -2288,11 +2290,11 @@ TEST(LogRegression, StaleLineageCleanerWorkIsDroppedRegression) {
         EXPECT_EQ(RecordBatchReader(bytes.data(), bytes.size()).baseOffset(), 3);
     }
     // The CURRENT lineage still applies (retention deletes a prefix: 0 first).
-    const uint64_t cur = findSeg(*log.sealedSegmentSnapshot(), 2)->lineage;
-    ASSERT_TRUE(log.enqueueDeletedSegment(0, findSeg(*log.sealedSegmentSnapshot(), 0)->lineage));
+    const uint64_t cur = findSeg(*log.ownerSealedSnapshot(), 2)->lineage;
+    ASSERT_TRUE(log.enqueueDeletedSegment(0, findSeg(*log.ownerSealedSnapshot(), 0)->lineage));
     ASSERT_TRUE(log.enqueueDeletedSegment(2, cur));
     EXPECT_EQ(log.drainRetentionDeletes(), 2);
-    EXPECT_EQ(findSeg(*log.sealedSegmentSnapshot(), 2), nullptr);
+    EXPECT_EQ(findSeg(*log.ownerSealedSnapshot(), 2), nullptr);
     // Fix round 4: the owner touched no file; the cleaner renames both away.
     EXPECT_TRUE(std::filesystem::exists(segFile(dir, 2, ".log")));
     log.runCleanerFileOps(/*nowMs=*/0, /*fileDeleteDelayMs=*/1'000'000);
@@ -2347,7 +2349,7 @@ TEST(LogRegression, DeferredCleanedGroupIsInstalledByOwnerRegression) {
     appendTs(log, 0, 1000); appendTs(log, 1, 1001);
     appendTs(log, 2, 9'000'002); appendTs(log, 3, 9'000'003);
     appendTs(log, 4, 9'000'004);
-    const auto snap = log.sealedSegmentSnapshot();
+    const auto snap = log.ownerSealedSnapshot();
     writeBytes(Log::cleanedLogPath(dir.string(), 0, 7), concatSegs(dir, {0, 2}));
     writeBytes(Log::cleanedIndexPath(dir.string(), 0, 7), std::vector<uint8_t>(8, 0));   // entry (0, 0)
     // Nothing on disk changed yet: the originals are intact.
@@ -2369,7 +2371,7 @@ TEST(LogRegression, DeferredCleanedGroupIsInstalledByOwnerRegression) {
     EXPECT_EQ(log.cleanerGroupsRejected(), 0u);
     EXPECT_EQ(log.segmentForTest(0)->nextOffset(), 4);
     for (int64_t o = 0; o < 4; ++o) EXPECT_EQ(firstOffsetAt(log, o), o);
-    const SegInfo* si = findSeg(*log.sealedSegmentSnapshot(), 0);
+    const SegInfo* si = findSeg(*log.ownerSealedSnapshot(), 0);
     ASSERT_NE(si, nullptr);
     EXPECT_EQ(si->endOffset, 4);
     EXPECT_GE(si->largestTimestamp, 9'000'003);
@@ -2383,7 +2385,7 @@ TEST(LogRegression, RejectedCleanedGroupLeavesOriginalsUntouchedRegression) {
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     Log log(dir.string(), /*rollBytes=*/100);
     for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
-    const auto snap = log.sealedSegmentSnapshot();
+    const auto snap = log.ownerSealedSnapshot();
     const auto before0 = readAll(segFile(dir, 0, ".log"));
     const auto before2 = readAll(segFile(dir, 2, ".log"));
     auto output = [&](int64_t base, uint64_t seq, std::initializer_list<int64_t> from) {
@@ -2482,7 +2484,7 @@ InstallCost measureInstall(int64_t segMiB, int reps) {
             const uint64_t seq = 100 + static_cast<uint64_t>(r);
             copyFile(segFile(dir, 0, ".log"), Log::cleanedLogPath(dir.string(), 0, seq));
             copyFile(segFile(dir, 0, ".index"), Log::cleanedIndexPath(dir.string(), 0, seq));
-            const auto snap = log.sealedSegmentSnapshot();
+            const auto snap = log.ownerSealedSnapshot();
             const Log::CleanedMember m[] = {{0, (*snap)[0].lineage}};
             EXPECT_TRUE(log.enqueueCleanedGroup(m, 1, seq, true, segMiB, log.openCleanedOutput(0, seq, segMiB).release()));
             const uint64_t syncsBefore = log.roleChangeSyncCallsForTest();
@@ -2506,7 +2508,7 @@ InstallCost measureInstall(int64_t segMiB, int reps) {
         log.drainCleanerSwaps();
         c.legacyUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
         // Owner-side retention drop of the same (sealed) segment.
-        const auto snap = log.sealedSegmentSnapshot();
+        const auto snap = log.ownerSealedSnapshot();
         EXPECT_TRUE(log.enqueueDeletedSegment(0, (*snap)[0].lineage));
         t0 = std::chrono::steady_clock::now();
         EXPECT_EQ(log.drainRetentionDeletes(), 1);
@@ -2538,7 +2540,7 @@ TEST(LogRegression, DrainInstallsAtMostOneGroupPerCallRegression) {
     std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
     Log log(dir.string(), /*rollBytes=*/100);
     for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);   // 0,2,4 sealed; 6 active
-    const auto snap = log.sealedSegmentSnapshot();
+    const auto snap = log.ownerSealedSnapshot();
     for (int k = 0; k < 2; ++k) {
         const int64_t b = (*snap)[k].baseOffset;
         copyFile(segFile(dir, b, ".log"), Log::cleanedLogPath(dir.string(), b, 10 + k));
@@ -2568,7 +2570,7 @@ TEST(LogRegression, RetentionProposalIsCrashSafeRegression) {
         Log log(dir.string(), /*rollBytes=*/100);
         log.recover();
         for (int64_t i = 0; i < 7; ++i) appendTs(log, i, 1000 + i);
-        const auto snap = log.sealedSegmentSnapshot();
+        const auto snap = log.ownerSealedSnapshot();
         ASSERT_TRUE(log.enqueueDeletedSegment(0, (*snap)[0].lineage));   // proposed, never drained
         ASSERT_TRUE(log.enqueueDeletedSegment(2, (*snap)[1].lineage));
         EXPECT_EQ(log.drainRetentionDeletes(/*maxEndBound=*/3), 1) << "segment [2,4) ends above HW 3";
@@ -2599,7 +2601,7 @@ void acceptOutputWithoutFileOps(Log& log, const std::filesystem::path& dir, std:
     const int64_t end = *std::upper_bound(bases.begin(), bases.end(), last);
     writeBytes(Log::cleanedLogPath(dir.string(), b1, seq), concatSegs(dir, from));
     copyFile(segFile(dir, b1, ".index"), Log::cleanedIndexPath(dir.string(), b1, seq));
-    const auto snap = log.sealedSegmentSnapshot();
+    const auto snap = log.ownerSealedSnapshot();
     std::vector<Log::CleanedMember> m;
     for (int64_t b : from) m.push_back({b, findSeg(*snap, b)->lineage});
     ASSERT_TRUE(log.enqueueCleanedGroup(m.data(), m.size(), seq, true, end, log.openCleanedOutput(b1, seq, end).release()));
@@ -2674,7 +2676,7 @@ TEST(LogRegression, RetentionCrashWindowsRecoverRegression) {
         // Window 1: the owner dropped segment 0 in memory, the cleaner never ran
         // (no checkpoint, no rename) → the segment simply reappears (retention
         // re-runs; nothing is lost).
-        auto snap = log.sealedSegmentSnapshot();
+        auto snap = log.ownerSealedSnapshot();
         ASSERT_TRUE(log.enqueueDeletedSegment(0, (*snap)[0].lineage));
         ASSERT_EQ(log.drainRetentionDeletes(), 1);
         EXPECT_EQ(log.logStartOffset(), 2);
@@ -2687,7 +2689,7 @@ TEST(LogRegression, RetentionCrashWindowsRecoverRegression) {
         EXPECT_EQ(log.logStartOffset(), 0) << "window 1: reappears (not durable yet)";
         // Window 2: the cleaner persisted the new log start, then the crash hit
         // before its rename became durable (simulated: the rename is undone).
-        auto snap = log.sealedSegmentSnapshot();
+        auto snap = log.ownerSealedSnapshot();
         ASSERT_TRUE(log.enqueueDeletedSegment(0, (*snap)[0].lineage));
         ASSERT_TRUE(log.enqueueDeletedSegment(2, (*snap)[1].lineage));
         ASSERT_EQ(log.drainRetentionDeletes(), 2);
@@ -2728,7 +2730,7 @@ TEST(LogRegression, ColdPathDefersWithoutWaitingAndSurvivesCleanerExceptionRegre
     EXPECT_FALSE(log.fileOpsQuiescent());
     EXPECT_FALSE(log.truncateTo(5)) << "deferred, never waited";
     // While the cold path waits, the owner posts nothing new (no starvation).
-    const auto snap = log.sealedSegmentSnapshot();
+    const auto snap = log.ownerSealedSnapshot();
     ASSERT_TRUE(log.enqueueDeletedSegment(0, findSeg(*snap, 0)->lineage));
     EXPECT_EQ(log.drainRetentionDeletes(), 0);
     // The cleaner throws mid-cycle: nothing is held; the work is retried.
@@ -2751,7 +2753,7 @@ TEST(LogRegression, FailedLogStartCheckpointNeverRenamesAndFailsTheLogRegression
     Log log(dir.string(), /*rollBytes=*/100);
     log.recover();
     for (int64_t i = 0; i < 9; ++i) appendTs(log, i, 1000 + i);
-    ASSERT_TRUE(log.enqueueDeletedSegment(0, (*log.sealedSegmentSnapshot())[0].lineage));
+    ASSERT_TRUE(log.enqueueDeletedSegment(0, (*log.ownerSealedSnapshot())[0].lineage));
     ASSERT_EQ(log.drainRetentionDeletes(), 1);
     std::filesystem::create_directories(dir / "log-start-offset-checkpoint.tmp");   // the write fails
     (void)log.runCleanerFileOps(0, 1'000'000);
@@ -2765,4 +2767,48 @@ TEST(LogRegression, FailedLogStartCheckpointNeverRenamesAndFailsTheLogRegression
     EXPECT_FALSE(std::filesystem::exists(segFile(dir, 0, ".log")));
     EXPECT_TRUE(log.fileOpsQuiescent());
     std::filesystem::remove_all(dir);
+}
+
+// E1 low (backlog): the fault seam above injects BEFORE the syscall.  This drives a REAL short / failed
+// write through the kernel: RLIMIT_FSIZE (SIGXFSZ ignored -> write/pwritev return EFBIG or write
+// short).  In a forked child (the limit is per process).  Every append path must end sticky-failed with
+// the kernel's errno — never a torn "healthy" log, never a crash.
+TEST(LogWriteFailStopRegression, RealKernelShortWriteIsFailStopRegression) {
+    for (int path = 0; path < 3; ++path) {
+        auto dir = makeTempDir("rune_log_e1_fsize");
+        std::filesystem::create_directories(dir);
+        auto child = [&] {
+            std::signal(SIGXFSZ, SIG_IGN);
+            Log log(dir.string(), 64LL * 1024 * 1024); log.recover();
+            const auto ok = e1Batch(0);
+            log.appendNoSync(ok.data(), ok.size(), 0);
+            const auto active = std::filesystem::path(dir) / "00000000000000000000.log";
+            const auto have = static_cast<rlim_t>(std::filesystem::file_size(active));
+            rlimit lim{have + 4096, have + 4096};            // room for a few batches, then EFBIG
+            if (::setrlimit(RLIMIT_FSIZE, &lim) != 0) std::_Exit(10);
+            int64_t next = 1, base = -1;
+            int err = 0;
+            for (int i = 0; i < 100'000 && err == 0; ++i) {
+                const auto b = e1Batch(next);
+                try {
+                    if (path == 0) log.appendNoSync(b.data(), b.size(), next);
+                    else if (path == 1) log.appendNoSyncRestamp(b.data(), b.size(), 0, base);
+                    else log.append(b, next);
+                    ++next;
+                } catch (const std::system_error& e) {
+                    err = e.code().value();
+                } catch (...) {
+                    std::_Exit(11);                           // anything but system_error
+                }
+            }
+            if (err == 0) std::_Exit(12);                     // the limit never bit
+            if (!log.storageFailed()) std::_Exit(13);         // not fail-stop
+            if (log.logEndOffset() != next) std::_Exit(14);   // the failed batch is part of the log
+            try { const auto b = e1Batch(next); log.appendNoSync(b.data(), b.size(), next); std::_Exit(15); }
+            catch (const std::system_error&) {}               // sticky
+            std::_Exit(err == EFBIG || err == ENOSPC || err == EIO ? 0 : 16);
+        };
+        EXPECT_EXIT(child(), ::testing::ExitedWithCode(0), "") << "append path " << path;
+        std::filesystem::remove_all(dir);
+    }
 }

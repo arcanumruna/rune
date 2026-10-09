@@ -993,7 +993,12 @@ public:
                 members.push_back(View{k, pa, &reps, -1});
             }
             if (!ready || members.empty()) continue;
-            if (static_cast<int>(recs.size() + members.size()) > maxRecords) continue;   // next tick, as a unit
+            // Over the remaining budget: the next tick decides it, as a unit (the
+            // runtime re-ticks on the very next cycle after any emit — SlowTick).
+            // D15b l2: an EMPTY tick always admits it — a unit larger than the
+            // whole budget otherwise never fit and stayed leaderless forever
+            // (the drain stays bounded by kMaxRecordsPerBatch).
+            if (!recs.empty() && static_cast<int>(recs.size() + members.size()) > maxRecords) continue;
             auto avail = [&](const View& v, int32_t n, int32_t* leo) {
                 if (!isEligible_(n) || isShutting_(n)) return false;
                 if (std::find(v.pa->replicas.begin(), v.pa->replicas.end(), n) == v.pa->replicas.end()) return false;
@@ -1445,6 +1450,21 @@ public:
         if (!inflight_.empty()) {
             std::erase_if(recs, [this](const rune::metadata::BalancerRecord& br) {
                 return inflight_.count(partitionKey_(br.rec.topicId, br.rec.partition)) != 0;
+            });
+        }
+        // D15b l1: nor on a key whose record is still QUEUED (not appended yet)
+        // — e.g. the claim restored more leaderless marks than one drain emits:
+        // a decision now would repeat the queued record's leaderEpoch (a wasted
+        // record the MSM rejects).  Decided next tick, on the committed state.
+        // Control thread, cold (a non-empty queue); scratch capacity persists.
+        if (!pendingDynamicRecords_.empty() && !recs.empty()) {
+            pendingKeysScratch_.clear();
+            for (const auto& q : pendingDynamicRecords_)
+                pendingKeysScratch_.push_back(partitionKey_(q.rec.topicId, q.rec.partition));
+            std::sort(pendingKeysScratch_.begin(), pendingKeysScratch_.end());
+            std::erase_if(recs, [this](const rune::metadata::BalancerRecord& br) {
+                return std::binary_search(pendingKeysScratch_.begin(), pendingKeysScratch_.end(),
+                                          partitionKey_(br.rec.topicId, br.rec.partition));
             });
         }
         // D15 m3: the LEADERLESS members of a co-partition unit with an
@@ -1967,6 +1987,12 @@ private:
     /// reports to THIS controller again (the reports the predecessor
     /// collected — and answered — died with it).  One record per marked
     /// partition per controller change; deterministic from replicated state.
+    /// D15b l5 (ruling): a NO_LEADER record written by a pre-D15 controller
+    /// carries no mark — its reason died with that controller.  It is left to
+    /// the balancer on the committed ISR, exactly as on main (never re-armed,
+    /// no mark invented): re-deciding every unmarked leaderless partition on
+    /// fresh reports would hold one whose ISR member trails a non-ISR replica,
+    /// where Kafka (and main) elect the ISR member.
     void restoreLeaderlessMarks_() {
         namespace rm = rune::metadata;
         msm_.committedMap().forEach([&](int32_t topicId, int32_t partition, const rm::PartitionAssignment& pa) {
@@ -2152,6 +2178,7 @@ private:
     int16_t featureInflightLevel_  = -1;   ///< appended under this leadership, not applied yet
     /// D15 item 2: decideLeaderless_ scratch (capacity persists).
     std::vector<int64_t> unitScratch_, unitVisited_, unitDecided_;
+    std::vector<int64_t> pendingKeysScratch_;   ///< D15b l1: queued keys at a rebalance (sorted)
     struct FreshReport { int32_t leo = -1; bool logDirFailed = false; int32_t epoch = -1; };
     std::unordered_map<int64_t, std::unordered_map<int32_t, FreshReport>> leaderlessReports_;
     uint64_t leaderlessHeld_ = 0;   ///< partitions held leaderless (log dir failed / unclean needed)

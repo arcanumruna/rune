@@ -208,7 +208,12 @@ public:
     /// view rather than throwing — see LogSegment::readView.
     LogReadView readView(int64_t startOffset, int32_t maxBytes) noexcept;
     /// #65: LogSegment::readInto on the segment holding startOffset (pread into
-    /// `buf`; never counted as a readView, never maps).
+    /// `buf`; never counted as a readView, never maps).  D26: an Absent answer
+    /// (a compacted tail gap of a sealed segment) continues at the next
+    /// segment, so a cursor in the gap advances.  See LogSegment::readInto.
+    LogReadView readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
+                         ReadIntoStatus& st, int64_t boundOffset = INT64_MAX, int* errOut = nullptr) noexcept;
+    /// Same; `firstTooLarge` = (st == FirstTooLarge).
     LogReadView readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
                          bool& firstTooLarge) noexcept;
 
@@ -472,10 +477,21 @@ public:
     [[nodiscard]] static int64_t requestMiB(int64_t p) noexcept { return (p >> 24) & 0xFFFFF; }
     [[nodiscard]] static int64_t requestSeq(int64_t p) noexcept { return (p >> 44) & 0x7FFFF; }
     [[nodiscard]] uint64_t readMapsDiscardedForTest() const noexcept { return readMapsDiscarded_; }
+    /// D30: read mappings retired when their segment sealed.
+    [[nodiscard]] uint64_t readMapsRetiredAtSealForTest() const noexcept { return readMapsRetiredAtSeal_; }
+    /// D30: retire every lazily mapped sealed segment (a finished walk of old data).
+    void releaseLazySealedMaps() noexcept;
+    [[nodiscard]] std::size_t lazySealedMappedForTest() const noexcept { return mappedSealedCount_; }
+    [[nodiscard]] uint64_t sealedLazyRemapsForTest() const noexcept { return sealedLazyRemaps_; }
+    [[nodiscard]] uint64_t sealedMapsEvictedForTest() const noexcept { return sealedMapsEvicted_; }
+    [[nodiscard]] uint64_t readMapsDisposedInlineForTest() const noexcept { return readMapsDisposedInline_; }
+    [[nodiscard]] static constexpr std::size_t mappedSealedCapForTest() noexcept { return kMappedSealedCap; }
     [[nodiscard]] uint64_t ownerFallbackRemapsForTest() const noexcept { return ownerFallbackRemaps_; }
     /// Tests (re-review N2): force the count-based re-request on the next need.
     void expireReadMapRequestForTest() noexcept { growWaits_ = 1u << 30; }
     [[nodiscard]] uint64_t readMapGrowthsForTest() const noexcept { return readMapGrowths_; }
+    /// D26: read-map growth requests posted (each one an off-owner mmap).
+    [[nodiscard]] uint64_t readMapGrowRequestsForTest() const noexcept { return readMapGrowRequests_; }
     [[nodiscard]] uint64_t readMapGrowthFailuresForTest() const noexcept { return readMapGrowthFailures_; }
     /// Cleaner-thread fsyncs / directory fsyncs (retention log-start
     /// checkpoints, posted renames).  Read only after the cleaner stopped.
@@ -588,6 +604,9 @@ public:
         std::size_t    size = 0;
         uint64_t       gen  = 0;
         int            fd   = -1;
+        /// The segment's written bytes: data == nullptr with written > 0 is an
+        /// UNREADABLE segment (its mapping failed) — never "walked" (D30 MAJOR-2).
+        std::size_t    written = 0;
     };
     [[nodiscard]] SegmentBytes segmentBytesAt(int64_t segmentBase);
     int64_t totalBytes() const;
@@ -612,21 +631,24 @@ public:
     /// segment rewrites never move the LEO).
     void reloadSegment(int64_t baseOffset);
 
-    /// CP-6/race-fix: Load the latest immutable snapshot of sealed segments.
-    ///
-    /// The snapshot is a std::shared_ptr<const SealedSegmentSnapshot> published
-    /// via std::atomic on the single-writer append thread whenever segments_ changes
-    /// (in maybeRoll or after drainCleanerSwaps).  Sealed-segment sizes are fixed
-    /// once sealed so the snapshot is stable.
-    ///
-    /// The cleaner thread MUST use this accessor instead of calling segmentSize()
-    /// or segmentBaseOffsets() directly, which would race with the append thread's
-    /// mutations to segments_ (UB confirmed by TSan).
-    ///
-    /// Thread-safe: std::atomic_load provides seq_cst barrier between the
-    /// append-thread store (publishSealedSnapshot) and the cleaner-thread load.
-    std::shared_ptr<const SealedSegmentSnapshot> sealedSegmentSnapshot() const noexcept {
-        return std::atomic_load(&sealedSnapshot_);
+    /// CP-6/race-fix: the latest immutable snapshot of sealed segments, as the
+    /// OWNER (single-writer append thread) last published it — owner thread /
+    /// owner-driven tests only.  Sealed-segment sizes are fixed once sealed so
+    /// the snapshot is stable.
+    std::shared_ptr<const SealedSegmentSnapshot> ownerSealedSnapshot() const noexcept { return ownerSnap_; }
+
+    /// The latest published snapshot for THE cleaner thread (its one consumer):
+    /// a latest-value triple buffer (D22) — no lock, no allocation.  The cleaner
+    /// MUST use this instead of segmentSize() / segmentBaseOffsets(), which race
+    /// with the append thread's mutations to segments_ (UB confirmed by TSan).
+    /// (Was std::atomic_load on a shared_ptr: a hidden libstdc++ mutex pool on the
+    /// owner's roll.)
+    std::shared_ptr<const SealedSegmentSnapshot> cleanerSnapshot() const noexcept {
+        if (snapMiddle_.load(std::memory_order_relaxed) & kSnapFresh) {
+            const uint8_t prev = snapMiddle_.exchange(snapFront_, std::memory_order_acq_rel);
+            snapFront_ = static_cast<uint8_t>(prev & kSnapIndex);
+        }
+        return snapSlot_[snapFront_];
     }
 
     /// CP-6: Enqueue a cleaner-rewritten segment base for atomic swap on the
@@ -957,6 +979,10 @@ private:
     /// nothing and keeps spdlog out of this header).
     LogSegment& activeSegment();
     void maybeRoll();
+public:
+    /// D28 test seam: the active segment's offset index.
+    [[nodiscard]] const OffsetIndex* activeIndexForTest() { return activeSegment().indexForTest(); }
+private:
 
     /// Rebuild and atomically publish a new sealed-segment snapshot.
     /// MUST be called on the single-writer append thread whenever segments_ changes:
@@ -1032,10 +1058,21 @@ private:
     MapRing  mapRing_;                    ///< provisioner → owner: grown mappings
     bool     asyncReadGrowth_ = false;
     bool     growOutstanding_ = false;
+    bool     mapReaders_ = false;         ///< D26: readView called since the previous roll (owner; review M3 decay)
+    uint64_t readViewsAtRoll_ = 0;        ///< readViewCalls_ at the last roll (review M3 decay)
     int64_t  growBase_ = -1;
     uint64_t growGen_ = 0;
     uint32_t growWaits_ = 0;
     uint64_t readMapGrowths_ = 0, readMapGrowthFailures_ = 0, readMapsDiscarded_ = 0, ownerFallbackRemaps_ = 0;
+    uint64_t readMapGrowRequests_ = 0;   ///< D26: growth requests posted to the provisioner
+    uint64_t readMapsRetiredAtSeal_ = 0;   ///< D30
+    void retireSealedReadMap_(int64_t base, LogSegment& seg) noexcept;
+    void disposeReadMap_(std::unique_ptr<MappedFile> m) noexcept;
+    void noteSealedMapped_(int64_t base) noexcept;
+    static constexpr std::size_t kMappedSealedCap = 8;   ///< D30 MAJOR-1: lazily mapped sealed segments kept
+    std::array<int64_t, kMappedSealedCap> mappedSealed_{};
+    std::size_t mappedSealedHead_ = 0, mappedSealedCount_ = 0;
+    uint64_t sealedLazyRemaps_ = 0, sealedMapsEvicted_ = 0, readMapsDisposedInline_ = 0;   ///< D30 MEDIUM-3
     int64_t  growSeq_ = 0;   ///< re-review N2: the outstanding request's identity
     /// Owner: request a larger mapping for `seg` (keyed `base`) when it needs one.
     void maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept;
@@ -1118,19 +1155,21 @@ private:
     SegMap::iterator eraseKeepNode_(SegMap::iterator it) noexcept;
     uint64_t segInstallGen_ = 0;   ///< F15 S4 N1: segment install generation
 
-    // CP-6/race-fix: atomic snapshot of sealed segment {baseOffset, sizeBytes}.
-    // Written exclusively on the append thread; read safely on the cleaner thread
-    // via std::atomic_store / std::atomic_load (deprecated C++20 free-function
-    // API, but the only portable form available on Apple clang/libc++ 17 where
-    // std::atomic<shared_ptr<T>> is not yet fully supported).
-    //
-    // Correctness: atomic_store/load use an internal spinlock in libc++, providing
-    // a full happens-before between the store on the writer and the load on the
-    // cleaner — equivalent in strength to a mutex-protected assignment.  The
-    // spinlock is per-pointer-address (not global), so the append hot path is
-    // only affected when a roll occurs (infrequent).
-    mutable std::shared_ptr<const SealedSegmentSnapshot> sealedSnapshot_{
-        std::make_shared<SealedSegmentSnapshot>()};
+    // CP-6/race-fix: snapshot of sealed segment {baseOffset, sizeBytes}, written
+    // exclusively on the append (owner) thread.  ownerSnap_ is the owner's view
+    // (ownerSealedSnapshot()); the cleaner receives it through the D22 triple
+    // buffer below (cleanerSnapshot()) — no lock (the former std::atomic_store /
+    // atomic_load on a shared_ptr used libstdc++'s mutex pool on every roll).
+    std::shared_ptr<const SealedSegmentSnapshot> ownerSnap_{std::make_shared<SealedSegmentSnapshot>()};
+    // D22: owner → cleaner latest-value triple buffer.  slot snapBack_ is the
+    // owner's, snapFront_ the cleaner's, the third is "middle" (index in
+    // snapMiddle_, kSnapFresh = published since the cleaner last took it); a
+    // slot changes hands only through the exchange.
+    static constexpr uint8_t kSnapIndex = 3, kSnapFresh = 4;
+    mutable std::shared_ptr<const SealedSegmentSnapshot> snapSlot_[3]{ownerSnap_, ownerSnap_, ownerSnap_};
+    alignas(64) mutable std::atomic<uint8_t> snapMiddle_{1};
+    uint8_t         snapBack_  = 0;   ///< owner thread
+    mutable uint8_t snapFront_ = 2;   ///< cleaner thread
     // hotpath-A F4: the owner's side of the chunked snapshot (see
     // kSnapChunkEntries).  Live entries are the absolute indices
     // [snapBegin_, snapEnd_) of snapDir_; every published snapshot of any

@@ -21,6 +21,7 @@
 // Both paths now serve clients via ClientGateway (single-writer duty-cycle).
 
 #include <rune/node/NodeConfig.h>
+#include <rune/consensus/ControlRing.h>   // Task 9: tlsReloadRing_ (SIGHUP trigger)
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/PeerResolverHub.h>
 #include <rune/node/DriverPumpAgent.h>
@@ -605,6 +606,20 @@ public:
         if (gateway_) gateway_->setMinIsr(minIsr);
     }
 
+    /// Task 9 (RUNE_TLS SIGHUP reload — Let's Encrypt renewal): request a
+    /// cert/key reload. Callable from ANY thread (main(), from the signal
+    /// thread's kTlsReloadEvent) — this only offers a TRIGGER onto
+    /// tlsReloadRing_; the actual file re-read (config_.tlsCertFile/
+    /// tlsKeyFile) and the gateway_->reloadTlsCert() swap happen on the
+    /// control thread's next serviceAdminControl_() cycle (shared-nothing:
+    /// only the trigger crosses threads, never the PEM text or gateway
+    /// state). Returns false if the ring is momentarily full — harmless,
+    /// since main()'s 100 ms poll loop re-delivers on the next SIGHUP or a
+    /// caller may retry.
+    bool requestTlsCertReload() noexcept {
+        return tlsReloadRing_.offer(kTlsReloadTrigger);
+    }
+
     /// Return this node's ClientGateway (or nullptr).  Test-only: reaches into
     /// duty-cycle-owned state (e.g. pendingAckCount()); call only from a
     /// synchronized test context that knows the duty cycle is between doWork
@@ -684,6 +699,11 @@ public:
     [[nodiscard]] int64_t cleanerThrottleRateForTest() const noexcept {
         if (!cleanerAgent_) return -2; // -2 = no cleaner (sentinel for test)
         return cleanerAgent_->throttleRateForTest();
+    }
+    /// D25: completed log-cleaner cycles (0 when there is no cleaner) — tests
+    /// wait on cleaner progress instead of sleeping.
+    [[nodiscard]] uint64_t cleanerCyclesForTest() const noexcept {
+        return cleanerAgent_ ? cleanerAgent_->cyclesDoneForTest() : 0;
     }
 
     /// Test-only: worker id owning (topicId, partition) per the WorkerPool router.
@@ -822,6 +842,14 @@ private:
     // Configuration (immutable after construction)
     // -----------------------------------------------------------------------
     NodeConfig config_;
+
+    // Task 9 (RUNE_TLS SIGHUP reload): the trigger-only cross-thread ring —
+    // requestTlsCertReload() (any thread) offers kTlsReloadTrigger;
+    // serviceAdminControl_() (control thread) polls it and performs the
+    // actual file re-read + gateway_->reloadTlsCert() swap itself, on its
+    // own thread.  No PEM text or gateway state ever crosses the ring.
+    static constexpr std::int32_t kTlsReloadTrigger = 1;
+    rune::consensus::ControlRing<256> tlsReloadRing_;
     // DR-15 fix round 1: the cold peer-hostname resolver thread + the rings it
     // feeds (driver name caches, peer-publication owners).  Declared FIRST so
     // it is destroyed LAST — after every consumer of its rings.

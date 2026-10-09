@@ -3139,8 +3139,8 @@ TEST_P(StrictPlacementRegression, RecoveryPointCheckpointIsAsyncAfterSealComplet
     ASSERT_EQ(s.log->recoveryCheckpointStage(), RpStage::InFlight);
     EXPECT_EQ(s.w.recoveryPointSubmitsForTest(), 1u) << "ONE write+fdatasync request";
     EXPECT_EQ(s.log->persistedRecoveryPoint(), 0) << "the persisted R moved at submit";
-    ASSERT_FALSE(s.log->sealedSegmentSnapshot()->empty());
-    EXPECT_FALSE(s.log->cleanerCompactionAllowedThrough(s.log->sealedSegmentSnapshot()->front().endOffset))
+    ASSERT_FALSE(s.log->ownerSealedSnapshot()->empty());
+    EXPECT_FALSE(s.log->cleanerCompactionAllowedThrough(s.log->ownerSealedSnapshot()->front().endOffset))
         << "the cleaner gate opened before the checkpoint was durable";
     s.w.setReapPausedForTest(false);
     for (int i = 0; i < kCap && s.log->persistedRecoveryPoint() < bBase; ++i) {
@@ -3151,7 +3151,7 @@ TEST_P(StrictPlacementRegression, RecoveryPointCheckpointIsAsyncAfterSealComplet
     EXPECT_EQ(s.w.recoveryPointSubmitsForTest(), 1u);
     EXPECT_EQ(s.log->recoveryCheckpointStage(), RpStage::Idle);
     EXPECT_EQ(s.log->syncCallsForTest(), 0u) << "no inline fsync on the worker loop";
-    EXPECT_TRUE(s.log->cleanerCompactionAllowedThrough(s.log->sealedSegmentSnapshot()->front().endOffset))
+    EXPECT_TRUE(s.log->cleanerCompactionAllowedThrough(s.log->ownerSealedSnapshot()->front().endOffset))
         << "the cleaner may now compact the durable sealed segment";
     // Steady state: no further checkpoint without a new boundary crossing.
     const uint64_t settled = s.w.recoveryPointSubmitsForTest();
@@ -3532,4 +3532,32 @@ TEST(SegmentProvisionerRegression, BrokerNodeRefusesToStartWithAnUnwiredProvisio
     EXPECT_THROW(requireProvisionerRunner(/*agentBuilt=*/true, /*runnerBuilt=*/false), std::logic_error);
     EXPECT_NO_THROW(requireProvisionerRunner(true, true));
     EXPECT_NO_THROW(requireProvisionerRunner(false, false));
+}
+
+// E1 low (backlog): an INTERNAL partition's follower apply runs inline on the
+// control thread inside the Aeron fragment handler.  A storage write error there
+// threw std::system_error out of the poll (the worker path catches it).  Now it
+// is contained like the worker path: the log is sticky-failed (the broker's
+// storage scan halts it) and the fragment is consumed — nothing escapes.
+TEST(InternalApplyRegression, InlineInternalApplyWriteErrorNeverEscapesThePollRegression) {
+    TmpDir ad;
+    EmbeddedDriverConfig dc; dc.dir = ad.path.string(); dc.termBufferBytes = 64 * 1024;
+    EmbeddedDriver drv(dc, DriverMode::Threaded);
+    aeron::Context ctx; ctx.aeronDir(ad.path.string());
+    auto client = aeron::Aeron::connect(ctx);
+    rune::replication::AeronPartitionTransport tr(client, "aeron:ipc", 7311, /*self*/1, 1 << 20);
+    TmpDir ld;
+    Log log(ld.path.string(), 64LL * 1024 * 1024); log.recover();
+    NullTransport nt;
+    PartitionReplica follower(cfg(1, 1, /*topicId=*/-3, 0), Role::Follower, /*epoch=*/1,
+                              std::vector<rune::replication::NodeId>{1, 2}, std::vector<rune::replication::NodeId>{1, 2},
+                              &log, &nt);
+    tr.registerReplica(-3, 0, &follower);
+    log.setWriteFaultForTest(EIO);
+    const auto resp = encodeFetchRespOf(-3, 0, batchAt(0));
+    bool consumed = false;
+    EXPECT_NO_THROW(consumed = tr.deliverFrameForTest(resp.data(), resp.size(), 1))
+        << "a storage error escaped the replication poll";
+    EXPECT_TRUE(consumed) << "the fragment must be consumed (the log is failed; redelivery cannot help)";
+    EXPECT_TRUE(log.storageFailed()) << "the write error must leave the log sticky-failed (halt path)";
 }

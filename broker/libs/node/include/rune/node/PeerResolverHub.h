@@ -40,7 +40,19 @@ class PeerResolverHub {
 public:
     /// Blocking resolve of `host` to an IPv4 address (network order).  Called
     /// on the hub thread (and on the startup thread by resolveAllNow) only.
+    /// `ipv4` is in/out: in = the address the hub holds for `host` (0 = none),
+    /// out = the address to use.  D24(c): a resolver keeps the current address
+    /// while it is still one of the host's records (pickAddress) — round-robin
+    /// DNS must not move a peer on every re-check.
     using ResolveFn = std::function<bool(const std::string& host, std::uint32_t& ipv4)>;
+    /// D24(c): `current` if it is one of `addrs[0..n)`, else addrs[0]; false if n == 0.
+    static bool pickAddress(const std::uint32_t* addrs, std::size_t n, std::uint32_t& current) noexcept {
+        if (n == 0) return false;
+        for (std::size_t i = 0; i < n; ++i)
+            if (current != 0 && addrs[i] == current) return true;
+        current = addrs[0];
+        return true;
+    }
 
     /// getaddrinfo(AF_INET, SOCK_DGRAM) — Aeron's default resolver semantics.
     static bool resolveWithGetaddrinfo(const std::string& host, std::uint32_t& ipv4);

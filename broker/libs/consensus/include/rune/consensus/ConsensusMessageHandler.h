@@ -19,6 +19,13 @@ struct ConsensusMessageHandler {
     // CRITICAL-R3).  Default: ignored.
     virtual void onCandidacyState(int64_t /*nowNs*/, NodeId /*fromMember*/,
                                   const CandidacyState& /*state*/) {}
+    // D29: templates 60 (PreVoteRequest), 61 (PreVoteResponse), 62 (TermFloorNotice).
+    virtual void onPreVoteRequest(int64_t /*nowNs*/, Term /*term*/, Term /*logLeadershipTermId*/,
+                                  int64_t /*logPosition*/, NodeId /*candidateId*/) {}
+    virtual void onPreVoteResponse(int64_t /*nowNs*/, Term /*term*/, NodeId /*voterId*/, bool /*granted*/,
+                                   Term /*voterTermId*/) {}
+    virtual void onTermFloorNotice(int64_t /*nowNs*/, NodeId /*fromMember*/,
+                                   Term /*floorTermId*/, Term /*refusedTermId*/) {}
 
     // Dispatched from templateId=50 (CanvassPosition)
     virtual void onCanvassPosition(

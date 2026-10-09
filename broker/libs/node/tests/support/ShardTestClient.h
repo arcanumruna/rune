@@ -258,6 +258,9 @@ public:
     }
 
     int64_t nextCorrelationId() noexcept { return ++corr_; }
+    /// Invoker mode: one duty cycle of this client's driver + conductor WITHOUT reading the egress (a client that
+    /// pumps its Aeron runtime — status messages flow — but does not consume its acks).  No-op when threaded.
+    void pumpWithoutReading() { pump_(); }
 
     /// DefineTopic (DDL) → the authoritative DefineTopicResponse (nullopt on timeout).
     std::optional<pc::DefineTopicResponse> defineTopic(const std::string& gatewayChannel, int32_t stream,

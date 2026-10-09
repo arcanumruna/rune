@@ -41,6 +41,10 @@ public:
 
     void candidacyState(NodeId toMember, NodeId fromMember,
                         const CandidacyState& state) override;
+    void preVoteRequest(NodeId toMember, Term term, Term logLeadershipTermId, int64_t logPosition,
+                        NodeId candidateId) override;
+    void preVoteResponse(NodeId toMember, Term term, NodeId voterId, bool granted, Term voterTermId) override;
+    void termFloorNotice(NodeId toMember, NodeId fromMember, Term floorTermId, Term refusedTermId) override;
 
     void canvassPosition(
         NodeId  toMember,

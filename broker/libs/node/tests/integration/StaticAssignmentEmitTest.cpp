@@ -2437,3 +2437,147 @@ TEST(D15MemoryEpochRegression, HeldUnitMemberNeverBlocksSiblingFailoverRegressio
     EXPECT_EQ(c.svc->assignment(1, 0)->leaderNode, A)
         << "the sibling's dead leader was never failed over while a unit member is held";
 }
+
+// D15b l1: a successor controller restores MORE marks at its claim than the
+// claim cycle drains (kMaxRecordsPerBatch = 256 per drain; the claim cycle
+// drains twice): the re-arms past those are still QUEUED when the first
+// rebalance (recheckOnCatchUp_) runs.  RED at 4b0b6a6: 188 duplicates.  That
+// rebalance filtered only inflight_, so the balancer elected a leader for a
+// still-queued key at the SAME leaderEpoch as its queued re-arm — a wasted
+// record the MSM rejects.  Keys in the pending queue are decided next tick.
+TEST(D15MemoryEpochRegression, MoreMarksThanOneBatchFirstRebalanceSkipsQueuedKeysRegression) {
+    constexpr int32_t kParts = 700;   // > the claim cycle's drains (2 x kMaxRecordsPerBatch)
+    static_assert(kParts > 2 * static_cast<int32_t>(MetadataService::kMaxRecordsPerBatch));
+    CtlRig c(true, {TopicSpec{0, kParts, 3, "", "t"}});
+    for (int32_t p = 0; p < kParts; ++p) ASSERT_NE(c.svc->assignment(0, p), nullptr);
+    // The predecessor made every partition leaderless: its leader's log dir is
+    // offline (mark committed with the record), the ISR lineage kept.
+    std::vector<BalancerRecord> recs;
+    for (int32_t p = 0; p < kParts; ++p) {
+        const PartitionAssignment a = *c.svc->assignment(0, p);
+        BalancerRecord br;
+        br.isr      = a.isr;
+        br.replicas = a.replicas;
+        br.mark     = LeaderlessMark{LeaderlessMark::Kind::LogDirOffline, a.leaderNode, 5};
+        br.rec.topicId        = 0;
+        br.rec.partition      = p;
+        br.rec.leaderNode     = NO_LEADER;
+        br.rec.leaderEpoch    = a.leaderEpoch + 1;
+        br.rec.partitionEpoch = std::max(a.partitionEpoch + 1, br.rec.leaderEpoch);
+        br.rec.isr      = rune::protocol::metadata::Int32ArrayView{br.isr.data(), static_cast<uint16_t>(br.isr.size())};
+        br.rec.replicas = rune::protocol::metadata::Int32ArrayView{br.replicas.data(), static_cast<uint16_t>(br.replicas.size())};
+        recs.push_back(std::move(br));
+    }
+    c.svc->emitDynamicAssignment(recs);
+    c.drive(50);
+    for (int32_t p = 0; p < kParts; ++p) ASSERT_EQ(c.svc->assignment(0, p)->leaderNode, NO_LEADER);
+    // The controller moves to node 2; drive ONLY until it caught up (the claim
+    // restores the marks and drains the first batch).
+    MetadataService svc2(c.r2.get(), 2);
+    c.r1->becomeFollower(2, 2);
+    c.r3->becomeFollower(2, 2);
+    c.r2->becomeLeader(2, c.all);
+    c.transport.removeFollower(2);
+    c.transport.setLeader(c.r2.get());
+    c.transport.addFollower(1, c.r1.get());
+    svc2.configure(c.topics, c.all);
+    for (int i = 0; i < kDriveCap; ++i) {   // (caught-up reads true before the first cycle)
+        c.clock += 1'000'000LL;
+        (void)svc2.doWork(c.clock);
+        if (svc2.controllerCaughtUpForTest()) break;
+        c.r1->doWork(c.clock); c.r2->doWork(c.clock); c.r3->doWork(c.clock);
+        c.transport.pump(c.clock);
+    }
+    ASSERT_TRUE(svc2.controllerCaughtUpForTest());
+    // The first rebalance, while kParts - 256 re-arms are still queued: every
+    // key has a record in flight or queued — nothing to decide on it now.
+    ASSERT_TRUE(svc2.takePreferredRecheck());
+    EXPECT_EQ(svc2.reassignDeadPartitionLeaders({1, 2, 3}), 0u)
+        << "the first rebalance re-decided keys whose re-arm is still queued (same-epoch duplicate)";
+    // Then the partitions are decided normally on the committed state.
+    for (int i = 0; i < 4; ++i) {
+        for (int k = 0; k < 50; ++k) {
+            c.clock += 1'000'000LL;
+            (void)svc2.doWork(c.clock);
+            c.r1->doWork(c.clock); c.r2->doWork(c.clock); c.r3->doWork(c.clock);
+            c.transport.pump(c.clock);
+        }
+        (void)svc2.reassignDeadPartitionLeaders({1, 2, 3});
+    }
+    for (int k = 0; k < 50; ++k) {
+        c.clock += 1'000'000LL;
+        (void)svc2.doWork(c.clock);
+        c.r1->doWork(c.clock); c.r2->doWork(c.clock); c.r3->doWork(c.clock);
+        c.transport.pump(c.clock);
+    }
+    for (int32_t p = 0; p < kParts; ++p) {
+        const auto* pa = svc2.assignment(0, p);
+        ASSERT_NE(pa, nullptr);
+        EXPECT_NE(pa->leaderNode, NO_LEADER) << "partition " << p << " never decided";
+    }
+}
+
+// D15b l2: a co-partition unit is decided as ONE unit, so a unit whose
+// leaderless members exceed the remaining per-tick record budget waits for the
+// next tick (the runtime re-ticks on the very next cycle after any emit:
+// SlowTick::done).  But a unit LARGER than the whole budget never fit — not
+// even on an empty tick — and stayed leaderless forever.  An empty tick now
+// always admits the unit (the drain stays bounded by kMaxRecordsPerBatch).
+TEST(D15MemoryEpochRegression, UnitLargerThanTheRecordBudgetIsStillDecidedRegression) {
+    CtlRig c(true, {TopicSpec{0, 1, 3, "g", "k"}, TopicSpec{1, 1, 3, "g", "k"}});
+    const int32_t L = c.svc->assignment(0, 0)->leaderNode;
+    ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, L);
+    (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(0, 0), 0, 2, /*memory=*/true));
+    (void)c.svc->onAlterIsr(bumpOf(*c.svc->assignment(1, 0), 1, 2, /*memory=*/true));
+    c.tick({L});   // the data holders are not live: both members go leaderless
+    ASSERT_EQ(c.svc->assignment(0, 0)->leaderNode, NO_LEADER);
+    ASSERT_EQ(c.svc->assignment(1, 0)->leaderNode, NO_LEADER);
+    const int32_t e0 = c.svc->assignment(0, 0)->leaderEpoch, e1 = c.svc->assignment(1, 0)->leaderEpoch;
+    for (int32_t n : {1, 2, 3}) {
+        (void)c.svc->onAlterIsr(reportOf(0, n, e0, n == L ? 0 : 10, n == L ? 2 : 1));
+        (void)c.svc->onAlterIsr(reportOf(1, n, e1, n == L ? 0 : 10, n == L ? 2 : 1));
+    }
+    // A record budget of 1 per tick: the 2-member unit never fits a tick.
+    for (int i = 0; i < 4; ++i) {
+        (void)c.svc->runDynamicRebalanceOnTick({1, 2, 3}, nullptr, 0, /*maxRecordsPerCycle=*/1);
+        c.drive(50);
+    }
+    const int32_t l0 = c.svc->assignment(0, 0)->leaderNode, l1 = c.svc->assignment(1, 0)->leaderNode;
+    EXPECT_NE(l0, NO_LEADER) << "a unit larger than the per-tick record budget was never decided";
+    EXPECT_EQ(l0, l1) << "the unit was split";
+    EXPECT_NE(l0, L) << "the empty memory leader was elected over the replicas holding the data";
+}
+
+// D15b l5 (ruling pinned): a NO_LEADER record written by a pre-D15 (main)
+// controller carries no mark.  The successor has nothing to restore: it
+// invents no mark and does not re-arm the partition (no extra record) — the
+// balancer decides it on the committed ISR exactly as main does.
+TEST(D15MemoryEpochRegression, UnmarkedLegacyLeaderlessRecordDecidedAsOnMainRegression) {
+    CtlRig c;
+    const PartitionAssignment a = c.pa();
+    {
+        std::vector<BalancerRecord> recs(1);
+        BalancerRecord& br = recs[0];
+        br.isr      = a.isr;
+        br.replicas = a.replicas;   // br.mark: Kind::None — no trailer, as main writes it
+        br.rec.topicId        = 0;
+        br.rec.partition      = 0;
+        br.rec.leaderNode     = NO_LEADER;
+        br.rec.leaderEpoch    = a.leaderEpoch + 1;
+        br.rec.partitionEpoch = std::max(a.partitionEpoch + 1, br.rec.leaderEpoch);
+        br.rec.isr      = rune::protocol::metadata::Int32ArrayView{br.isr.data(), static_cast<uint16_t>(br.isr.size())};
+        br.rec.replicas = rune::protocol::metadata::Int32ArrayView{br.replicas.data(), static_cast<uint16_t>(br.replicas.size())};
+        c.svc->emitDynamicAssignment(recs);
+        c.drive(50);
+    }
+    ASSERT_EQ(c.pa().leaderNode, NO_LEADER);
+    ASSERT_EQ(c.pa().mark.kind, LeaderlessMark::Kind::None);
+    const int32_t lle = c.pa().leaderEpoch;
+    Failover f(c);
+    ASSERT_TRUE(f.svc2.controllerCaughtUpForTest());
+    EXPECT_EQ(f.pa().leaderEpoch, lle) << "an unmarked leaderless partition was re-armed at the claim";
+    EXPECT_EQ(f.pa().mark.kind, LeaderlessMark::Kind::None);
+    f.tick();
+    EXPECT_NE(f.pa().leaderNode, NO_LEADER) << "the balancer did not decide the legacy leaderless partition";
+    EXPECT_EQ(f.pa().leaderEpoch, lle + 1);
+}

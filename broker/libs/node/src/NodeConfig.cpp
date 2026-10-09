@@ -713,6 +713,23 @@ ConfigResult parseNodeConfig(
         }
     }
 
+    // Task 9 (RUNE_TLS toggle, spec §11): cert/key file paths + require_tls.
+    // Only consulted in a RUNE_TLS build (RUNE_TLS_ENABLED) — a RUNE_TLS=OFF
+    // build never reads these env vars, so it stays byte-identical plaintext
+    // no matter what an operator sets (the CMake gate, not just a runtime
+    // default, is the safety net here).
+#ifdef RUNE_TLS_ENABLED
+    if (const char* cf = getenv_fn("RUNE_TLS_CERT_FILE"); cf && *cf) cfg.tlsCertFile = cf;
+    if (const char* kf = getenv_fn("RUNE_TLS_KEY_FILE");  kf && *kf) cfg.tlsKeyFile  = kf;
+    {
+        const char* raw = getenv_fn("RUNE_REQUIRE_TLS");
+        if (raw) {
+            const std::string_view sv(raw);
+            cfg.requireTls = (sv == "1" || sv == "true" || sv == "TRUE");
+        }
+    }
+#endif
+
     // --- RUNE_TOPICS (optional) ---
     // Format: comma-separated entries, each of the form:
     //   name:partitionCount[:policy[:segmentRollBytes[:deleteRetentionMs
@@ -1320,12 +1337,16 @@ ConfigResult parseNodeConfig(
     // --- RUNE_IDLE_MAX_PARK_US (optional, default 200µs) ---
     // Backoff idle max park for runtime + worker AgentRunners; caps per-hop wake
     // latency on the replication round-trip.  Lower = lower latency, more idle CPU.
-    if (const char* imp = getenv_fn("RUNE_IDLE_MAX_PARK_US")) {
-        if (imp && !std::string_view(imp).empty()) {
-            char* end = nullptr;
-            long long us = std::strtoll(imp, &end, 10);
-            if (end != imp && us > 0) { cfg.idleMaxParkUs = us; cfg.idleMaxParkUsExplicit = true; }
-        }
+    // A7 review L7: it also bounds every fd-less wake of a parked shard worker (ring hops, Aeron timers) — an
+    // integer in [1, 1000000] us, anything else refuses startup (garbage was silently ignored, unbounded).
+    if (const char* imp = getenv_fn("RUNE_IDLE_MAX_PARK_US"); imp && *imp) {
+        char* end = nullptr;
+        errno = 0;
+        const long long us = std::strtoll(imp, &end, 10);
+        if (end == imp || *end != '\0' || errno == ERANGE || us < 1 || us > 1'000'000)
+            return {{}, std::string("RUNE_IDLE_MAX_PARK_US must be an integer in [1, 1000000] us, got '") + imp + "'"};
+        cfg.idleMaxParkUs = us;
+        cfg.idleMaxParkUsExplicit = true;   // above 10 ms: a startup warning (HostDefaults)
     }
 
     // --- A7: RUNE_IDLE_WAKE (default on) / RUNE_IDLE_SPINS / RUNE_IDLE_YIELDS (default auto) ---

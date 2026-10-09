@@ -56,6 +56,10 @@
 #include <rune/gateway/IGroupRequestHandler.h>
 #include <rune/gateway/ITxnRequestHandler.h>
 #include <rune/gateway/IAdminRequestSink.h>
+// client<->broker TLS/AEAD (Task 7): server-role handshake driver. SessionTable.h
+// (above) already pulls in rune/crypto/Aead.h + Cipher.h for CryptoState; this
+// adds TlsSession itself for PendingConnect's in-flight handshake.
+#include <rune/crypto/TlsSession.h>
 
 // Forward-declared to avoid pulling the full WorkerPool header (and its heavy
 // chain: Worker → SpscRing → WorkerOp → ReplicationMessages) into the gateway
@@ -198,6 +202,24 @@ public:
     //                                 constructing thread; the default pump sleep-polls a threaded driver.
     //                                 Production fused placement uses the default pump (BrokerNode's
     //                                 interim runner services the runtime driver during start()).
+    // @param tlsCertPem / tlsKeyPem   client<->broker TLS/AEAD (Task 7): the broker's own TLS
+    //                                 server cert + private key, as PEM TEXT (not file paths) —
+    //                                 loaded once, at construction.  Both empty (the default) =
+    //                                 crypto disabled: a Connect that offers cipherList/handshakeBytes
+    //                                 silently degrades to the pre-Task-7 plaintext path, byte-
+    //                                 identical to today (unless requireTls is set below).  Task 9
+    //                                 owns the RUNE_TLS toggle / the file loading (BrokerNode) /
+    //                                 SIGHUP reload (reloadTlsCert()); this constructor only takes
+    //                                 the PEM text it's handed.
+    // @param requireTls               Task 9 (downgrade safety, spec §11): when true, a Connect
+    //                                 that does NOT end up with an established crypto session
+    //                                 (plaintext client, no broker cert/key, or a local TLS init
+    //                                 failure degrading to plaintext — see shouldEngageCrypto())
+    //                                 is hard-rejected with ConnectResponse{HandshakeFailed} —
+    //                                 NEVER served plaintext.  Default false (back-compat).  Task
+    //                                 19: shard mode no longer refuses crypto outright (it seals
+    //                                 its own per-worker Records egress now), so it is no longer
+    //                                 part of this list.
     ClientGateway(std::shared_ptr<aeron::Aeron>       aeron,
                   std::string                         clientChannel,
                   int32_t                             clientStreamId,
@@ -205,7 +227,10 @@ public:
                   int64_t                             sessionTimeoutNs         = kDefaultSessionTimeoutNs,
                   std::function<LeaderView()>         leaderView               = nullptr,
                   int64_t                             connectResolveTimeoutNs  = kDefaultConnectResolveTimeoutNs,
-                  rune::aeronutil::AeronPump          pump                     = {});
+                  rune::aeronutil::AeronPump          pump                     = {},
+                  std::string                         tlsCertPem               = {},
+                  std::string                         tlsKeyPem                = {},
+                  bool                                requireTls               = false);
 
     ~ClientGateway() = default;
 
@@ -948,6 +973,13 @@ public:
     // Single-writer: call only on the duty-cycle thread or before doWork().
     // -----------------------------------------------------------------------
     void applyDisconnectForTest(const uint8_t* buf, std::size_t len) { handleDisconnect(buf, len); }
+    void applyGroupForTest(const uint8_t* buf, std::size_t len, uint16_t tid, int64_t nowNs = 0) {
+        handleGroupMessage(buf, len, nowNs, tid);
+    }
+    void applyTxnForTest(const uint8_t* buf, std::size_t len, uint16_t tid, int64_t nowNs = 0) {
+        handleTxnMessage(buf, len, nowNs, tid);
+    }
+    [[nodiscard]] uint64_t coordinatorRedirectsForTest() const noexcept { return coordinatorRedirects_; }
     void applyMetadataForTest(const uint8_t* buf, std::size_t len) {
         handleMetadata(buf, len);
     }
@@ -1165,6 +1197,37 @@ private:
         // the duty thread (PeerResolverHub); no publication registered yet
         // (registrationId unused) until the numeric endpoint is known.
         bool        awaitingResolve = false;
+
+        // ---------------------------------------------------------------
+        // client<->broker TLS/AEAD (Task 7) — server-role handshake state.
+        // Engaged only when the client's ConnectRequest offered crypto
+        // (non-empty cipherList + handshakeBytes) AND this gateway was
+        // configured with a cert/key; nullopt for the whole plaintext path
+        // (byte-identical to pre-Task-7).  `chosenCipher`/`hsBytes` mirror
+        // the client's own SessionMachine fields (task-7-interfaces.md
+        // points at them as the canonical shape): hsBytes holds the
+        // server's own pending outbound handshake bytes, drained into the
+        // NEXT ConnectResponse/HandshakeContinueResponse leg and cleared
+        // right after — never grows unbounded across legs.
+        // ---------------------------------------------------------------
+        std::optional<rune::crypto::TlsSession> tls;
+        rune::crypto::Cipher                    chosenCipher = rune::crypto::Cipher::None;
+        std::vector<uint8_t>                    hsBytes;
+        // Set once the first ConnectResponse (carrying chosenCipher +
+        // the server's first flight) has been sent: this entry stays alive
+        // in pendingConnects_ (not erased, no Session yet) until the
+        // client's HandshakeContinue legs drive tls->done() — see
+        // handleHandshakeContinue_.  Mutually exclusive with `tls ==
+        // nullopt` being erased immediately (plaintext path, unchanged).
+        bool        awaitingHandshake = false;
+        // Set when the server-role TlsSession rejected the client's
+        // opening handshake bytes (malformed/invalid ClientHello, a bad
+        // token embedded in it, cert/SNI mismatch, ...) or (later, in
+        // handleHandshakeContinue_) exportKeys() returned the
+        // Cipher::None fail-closed sentinel.  pollPendingConnects answers
+        // ConnectResponse{HandshakeFailed} and creates no session — never
+        // installs all-zero keys.
+        bool        cryptoFailed = false;
     };
 
     // -----------------------------------------------------------------------
@@ -1179,6 +1242,17 @@ private:
     // Dispatch helpers
     // -----------------------------------------------------------------------
     void handleConnect   (const uint8_t* buf, std::size_t len, int64_t nowNs);
+    // client<->broker TLS/AEAD (Task 7): a later leg of a multi-round TLS
+    // handshake, after the initial Connect/ConnectResponse leg (handleConnect)
+    // started it.  Looks up the in-flight PendingConnect by sessionId (not yet
+    // promoted to sessions_), drives TlsSession::readInbound/writeOutbound, and
+    // on done() exports keys (direction-mirrored — see task-7-interfaces.md)
+    // and promotes the session.  Unknown sessionId / decode failure → drop.
+    void handleHandshakeContinue_(const uint8_t* buf, std::size_t len, int64_t nowNs);
+    // Pull every pending outbound handshake byte out of pending.tls into
+    // pending.hsBytes (growable — cold path, once per handshake leg; clears
+    // first).  No-op if pending.tls is empty.
+    static void drainHandshakeOutbound_(PendingConnect& pending);
     void handleKeepalive (const uint8_t* buf, std::size_t len, int64_t nowNs);
     void handlePing      (const uint8_t* buf, std::size_t len, int64_t nowNs);
     void handleDisconnect(const uint8_t* buf, std::size_t len);
@@ -1270,6 +1344,9 @@ private:
     // TX-3: Transaction coordination handler — routes templateIds 45,47,49,51,53
     // to TransactionCoordinationService.
     void handleTxnMessage   (const uint8_t* buf, std::size_t len, int64_t nowNs, uint16_t tid);
+    // D4: a follower redirects a group / txn coordinator request to the leader.
+    bool redirectToCoordinator_(Session& session, int64_t correlationId);
+    uint64_t coordinatorRedirects_ = 0;
     // Task 8a: schema DDL handlers — route DefineTopic (64) / GetTopicSchema (66)
     // to the admin sink (ring hand-off).  Validate frame + require known session,
     // decode, copy fields into the sink, RETURN immediately (no hot-path blocking).
@@ -1322,14 +1399,28 @@ private:
     [[nodiscard]] std::size_t shardSessionSlotsInUse_() const noexcept;
     /// A dropped pending connect whose announcement began → close everywhere.
     void closeDroppedPendingConnect_(const PendingConnect& pending);
+    /// Task 19: retry the per-worker crypto-key SessionAnnounce (second
+    /// wave) for every session in pendingCryptoAnnounces_ a full worker ring
+    /// refused earlier. A session closed/expired in the meantime is dropped
+    /// from the list (nothing to announce). Returns work done.
+    int retryPendingCryptoAnnounces_();
     /// Close an accepted session (Disconnect / SessionFailed): table, workers,
     /// subscriptions, group-member tracking.  False = unknown session (no-op).
     bool closeSession_(int64_t sid, bool notifyExpired = false);
     /// Fix round 2 (finding 1) + D8c: a Produce frame of a session some worker
     /// holds acks for (Held) or that has no produce credit left — the
     /// shard-mode poll ABORTs it (that client's image only).
-    enum class ProducePause : uint8_t { None, Held, NoCredit };
-    [[nodiscard]] ProducePause produceFramePause_(const uint8_t* buf, std::size_t len);
+    /// Lows batch C (D8c R3): WorkerCap* = the session's head Produce was
+    /// deferred by a full worker share and that worker (`*capWorker`) still
+    /// refuses it — ABORTed before decrypt / decode (Session::capDeferredOn).
+    enum class ProducePause : uint8_t { None, Held, NoCredit, WorkerCapFull, WorkerCapBand };
+    [[nodiscard]] ProducePause produceFramePause_(const uint8_t* buf, std::size_t len, int32_t* capWorker = nullptr);
+    void clearCapDeferred_(Session& s) noexcept;
+    /// Lows A/B/C review L1: the controlled subscription's image count after a
+    /// poll.  A drop (a client image lost) clears every cap-deferral memo —
+    /// a lost image's deferred frame never comes back to clear its own.  Cold.
+    void noteControlledImages_(int images) noexcept;
+    int  lastControlledImages_ = 0;
     [[nodiscard]] bool produceFrameHeld_(const uint8_t* buf, std::size_t len) {
         return produceFramePause_(buf, len) != ProducePause::None;
     }
@@ -1462,6 +1553,15 @@ private:
     int64_t                              maxHeldIdleNs_ = kDefaultMaxHeldIdleNs;
     int64_t                              connectResolveTimeoutNs_;
     std::function<LeaderView()>          leaderView_;
+    // client<->broker TLS/AEAD (Task 7): this broker's TLS server cert/key,
+    // as PEM text, loaded once at construction.  Both empty = crypto disabled
+    // (see the ctor's tlsCertPem/tlsKeyPem doc comment).  Task 9: ALSO swapped
+    // by reloadTlsCert() on SIGHUP renewal — single-writer, duty-cycle thread
+    // only (see reloadTlsCert()'s precondition).
+    std::string                          tlsCertPem_;
+    std::string                          tlsKeyPem_;
+    // Task 9 (require_tls, spec §11 downgrade safety): see the ctor doc comment.
+    bool                                  requireTls_ = false;
 
     std::shared_ptr<aeron::Subscription> sub_;
     rune::aeronutil::FragmentAssembler   assembler_;
@@ -1475,12 +1575,14 @@ private:
     // D8c: per-session produce credits (shard mode).
     uint32_t                                     sessionProduceCredits_ = kDefaultSessionProduceCredits;
     std::size_t                                  creditBlockedSessions_ = 0;   // sessions with produceInFlight >= budget
+    std::size_t                                  capDeferredSessions_ = 0;     // sessions with capDeferredOn >= 0 (R3)
     uint64_t                                     creditProduceAborts_   = 0;   // ABORTs for want of credit
     uint64_t                                     produceCreditUnderflows_ = 0; // Credit beyond in-flight (invariant breach; clamped)
     // D8c fix round 1 (MAJOR-1): forwarded, unclaimed produces per worker (all sessions).
     std::array<uint32_t, kMaxHeldMaskWorkers>    routedInFlight_{};
     uint32_t                                     workerRoutedCap_ = kWorkerRoutedCap;
     uint64_t                                     workerCapProduceAborts_ = 0;  // produces deferred by the per-worker cap
+    uint64_t                                     capDeferMemoAborts_ = 0;      // ... of them ABORTed by the memo (R3)
     // D8c fix round 2: per-worker cap-full episode (rich state: Idle = tag 0;
     // Congested{tag, deferredPolls}).  An episode ends below the congested band
     // or with its (single) expiry.
@@ -1489,7 +1591,7 @@ private:
         uint32_t deferredPolls = 0;  ///< frames deferred by the FULL share in this episode
     };
     std::array<CapEpisode, kMaxHeldMaskWorkers>  capEpisode_{};
-    uint16_t                                     capEpisodeTags_ = 0;          // global, never 0 when issued
+    uint16_t                                     capEpisodeTags_ = 0;          // global, never 0 when issued; one per episode / scan window (wraps per 65535 windows)
     uint64_t                                     workerCapEvictions_ = 0;
     uint64_t                                     directShareExpiries_ = 0;   // D8d: worker Expire signals acted on
     int64_t                                      lastCapEvictedSid_ = 0;
@@ -1541,6 +1643,32 @@ private:
     static constexpr std::size_t kScratchSize = 68 * 1024;
     std::array<uint8_t, kScratchSize>    scratch_{};
 
+    // client<->broker TLS/AEAD (Task 8): reusable, grow-once scratch buffers
+    // for the data-plane AEAD codec (rune/gateway/CryptoFrame.h) — single-
+    // writer (duty-cycle thread only), never shrink, resize() is contained in
+    // a try/catch at the call site so a bad_alloc drops the frame instead of
+    // throwing out of a noexcept-adjacent hot path (mirrors the client's
+    // egressDecryptScratch_ / AeronTransport::sealScratch).
+    //   decryptScratch_ — onClientFrame_'s openIngressFrame() destination.
+    //     Always sized to the wire frame's length: the reconstructed
+    //     plaintext frame is kCryptoOverhead (28) bytes SHORTER than the
+    //     wire frame it came from, so `len` bytes of capacity is always enough.
+    //   sealScratch_    — sendTo()'s sealResponseFrame() destination. Sized
+    //     to plainLen + kCryptoOverhead on demand.
+    std::vector<uint8_t>                 decryptScratch_;
+    std::vector<uint8_t>                 sealScratch_;
+
+    // client<->broker TLS/AEAD (Task 8b): pushRecords_'s own grow-once seal
+    // scratch for an ENCRYPTED session's Records push (rune::node::
+    // RecordsSealScratch — see RecordsPush.h's file header comment for the
+    // encrypted path). Separate from sealScratch_ above (that one is
+    // sendTo()'s, sized plainLen + kCryptoOverhead for ordinary responses;
+    // Records frames can be far larger — up to maxMessageLength — and need
+    // their own contiguous plaintext-assembly buffer too, which ordinary
+    // responses never do). Single-writer (duty-cycle thread only), never
+    // shared across threads (shared-nothing).
+    rune::node::RecordsSealScratch       recordsSealScratch_;
+
     // Max accepted produce-batch WIRE size.  A batch above this is rejected LOUDLY
     // with MessageTooLarge (never silently dropped).  The zero-copy append path no
     // longer needs a fixed restamp scratch — the base offset is patched into the
@@ -1585,6 +1713,14 @@ private:
     bool perWorkerIngressActive_ = false;
     bool shardMode_ = false;   // Task 13 (spec §3.4); set before the runtime runs
     rune::node::SessionAnnouncer sessionAnnouncer_;   // Task 13: runtime thread only
+    // Task 19: sessions whose per-worker crypto-key SessionAnnounce (second
+    // wave) didn't fully land on every worker on the first attempt (a ring
+    // was momentarily full) — retried each doWork() cycle
+    // (retryPendingCryptoAnnounces_) until every worker has the real key.
+    // Bounded by concurrently-connecting encrypted shard sessions (cold,
+    // connect-time only); empty in legacy mode and for every plaintext
+    // session.
+    std::vector<int64_t> pendingCryptoAnnounces_;
     std::vector<ShardIngressEndpoint> shardIngressEndpoints_;  // spec §3.3; empty = legacy
 
     // read-rework T3/T4 (I3b): when true, Subscribe/Unsubscribe for user partitions
@@ -1900,6 +2036,31 @@ public:
     // worker at Disconnect / reap / connect timeout.  Set before the runtime runs.
     void setShardMode(bool on) noexcept { shardMode_ = on; }
 
+    // Task 9 (require_tls, spec §11 downgrade safety). Set before the runtime
+    // runs (mirrors setShardMode); also usable from makeForTest()-built
+    // gateways where the ctor's requireTls param isn't reachable.
+    void setRequireTls(bool on) noexcept { requireTls_ = on; }
+    [[nodiscard]] bool requireTls() const noexcept { return requireTls_; }
+
+    // Task 9 (SIGHUP cert/key reload — Let's Encrypt renewal): swap in newly
+    // re-read PEM text so the NEXT handshake uses the renewed cert; any
+    // session already mid-handshake or established keeps its existing keys
+    // (tlsCertPem_/tlsKeyPem_ are read only at a NEW Connect's
+    // TlsSession::makeServer() call in handleConnect).
+    //
+    // Shared-nothing precondition: call ONLY from this gateway's own
+    // duty-cycle thread (the same thread that calls doWork() /
+    // handleConnect()) — e.g. BrokerNode::serviceAdminControl_(), which
+    // already runs there, polling a trigger-only ControlRing a signal/main
+    // thread offered on SIGHUP.  Never call this from a signal handler or
+    // any other thread: there is no lock here, by design (rule 1 — the
+    // gateway's state is single-writer, and the cross-thread boundary is
+    // the ring, not this setter).
+    void reloadTlsCert(std::string certPem, std::string keyPem) noexcept {
+        tlsCertPem_ = std::move(certPem);
+        tlsKeyPem_  = std::move(keyPem);
+    }
+
     /// DR-15 fix round 2 (LOW-4): a client's reply-channel HOSTNAME is resolved
     /// by the cold resolver thread through `port` and the egress publication is
     /// added on the numeric endpoint — no driver conductor (worker 0's thread
@@ -1919,6 +2080,11 @@ public:
     [[nodiscard]] bool sessionLostForTest(int64_t sid) noexcept {
         const Session* s = sessions_.find(sid);
         return s && s->lostByWorkers != 0;
+    }
+    /// D8b: some worker reports `sid` Held (acks queued its publication refuses).
+    [[nodiscard]] bool sessionHeldForTest(int64_t sid) noexcept {
+        const Session* s = sessions_.find(sid);
+        return s && s->heldByWorkers != 0;
     }
     // Fix round 1 (I2) seams: a resolved-or-not pending connect with the given
     // announce state (no Aeron publication), the cap accounting, eviction.
@@ -1967,6 +2133,18 @@ public:
         return i - from;
     }
     bool clientFrameHeldForTest(const uint8_t* buf, std::size_t len) { return produceFrameHeld_(buf, len); }
+    /// Test-only: a session's crypto state (install a c2b key to drive encrypted ingress); null = unknown.
+    [[nodiscard]] CryptoState* sessionCryptoForTest(int64_t sid) noexcept {
+        Session* s = sessions_.find(sid);
+        return s ? &s->crypto : nullptr;
+    }
+    /// Lows batch C (D8c R3): redeliveries of a cap-deferred Produce ABORTed by the per-session memo, before any
+    /// decrypt / decode (control thread).
+    [[nodiscard]] uint64_t capDeferMemoAbortsForTest() const noexcept { return capDeferMemoAborts_; }
+    /// Lows A/B/C review L1: sessions holding a cap-deferral memo; the controlled
+    /// subscription's image count after a poll (what the poll loop reports).
+    [[nodiscard]] std::size_t capDeferredSessionsForTest() const noexcept { return capDeferredSessions_; }
+    void noteControlledImagesForTest(int images) noexcept { noteControlledImages_(images); }
     void injectPendingRecordEgressForTest(int64_t sid, int32_t worker) { pendingRecordEgress_[{sid, worker}]; }
     [[nodiscard]] std::size_t pendingRecordEgressCountForTest() const noexcept { return pendingRecordEgress_.size(); }
 private:

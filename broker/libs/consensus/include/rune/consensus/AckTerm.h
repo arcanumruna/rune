@@ -13,9 +13,10 @@
 // also a Closed leader and its followers, which never step down for it — so
 // one denied candidacy would make the live leader refuse its own metadata ISR
 // states forever (a dead member pinning the HW).  An own candidacy does not
-// raise it either: a node that stood at T+1 ignores T's NewLeadershipTerm
-// (Election onNewLeadershipTerm "stale ballot"), and an abandoned candidacy
-// must not freeze the live leader.
+// raise it either: an abandoned candidacy helped no leader, so a node whose
+// only newer term is its own failed candidacy may follow T's leader again
+// (D24), and it must not freeze the live leader.  A node that GRANTED, led,
+// followed or adopted T+1 never follows T (Election's durable follow floor).
 // ---------------------------------------------------------------------------
 #include <algorithm>
 #include <cstdint>

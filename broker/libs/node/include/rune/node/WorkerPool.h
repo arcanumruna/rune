@@ -49,6 +49,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -105,6 +106,55 @@ inline std::string describeShardIdle(const rune::consensus::IdleStrategy& idle) 
     if (dynamic_cast<const rune::consensus::BusySpinIdleStrategy*>(&idle) != nullptr) return "busy-spin";
     return "backoff{spins=10 yields=20 (legacy Aeron)}";
 }
+
+/// A7 review L3: the shard runner's idle strategy as a CONCRETE type — the strategy makeShardIdle picked,
+/// dispatched by a well-predicted branch on its kind to the final class (a direct call), never a virtual call
+/// per duty pass.  `strategy()` exposes it for describeShardIdle / tests.
+class ShardIdle final {
+public:
+    explicit ShardIdle(std::unique_ptr<rune::consensus::IdleStrategy> s) noexcept : owned_(std::move(s)) {
+        if ((park_ = dynamic_cast<ParkUntilWorkIdle*>(owned_.get())) != nullptr) kind_ = Kind::Park;
+        else if ((backoff_ = dynamic_cast<rune::consensus::BackoffIdleStrategy*>(owned_.get())) != nullptr)
+            kind_ = Kind::Backoff;
+        else if ((spin_ = dynamic_cast<rune::consensus::BusySpinIdleStrategy*>(owned_.get())) != nullptr)
+            kind_ = Kind::Spin;
+    }
+    void idle(int workCount) noexcept {
+        switch (kind_) {
+        case Kind::Park:    park_->idle(workCount); return;      // final classes: direct calls
+        case Kind::Backoff: backoff_->idle(workCount); return;
+        case Kind::Spin:    spin_->idle(workCount); return;
+        case Kind::Other:   owned_->idle(workCount); return;     // never produced by makeShardIdle
+        }
+    }
+    void reset() noexcept {
+        switch (kind_) {
+        case Kind::Park:    park_->reset(); return;
+        case Kind::Backoff: backoff_->reset(); return;
+        case Kind::Spin:    spin_->reset(); return;
+        case Kind::Other:   owned_->reset(); return;
+        }
+    }
+    [[nodiscard]] const rune::consensus::IdleStrategy& strategy() const noexcept { return *owned_; }
+    /// Tests: the strategy is dispatched without a virtual call.
+    [[nodiscard]] bool devirtualizedForTest() const noexcept { return kind_ != Kind::Other; }
+
+private:
+    enum class Kind : uint8_t { Park, Backoff, Spin, Other };
+    std::unique_ptr<rune::consensus::IdleStrategy> owned_;
+    Kind                                     kind_    = Kind::Other;
+    ParkUntilWorkIdle*                       park_    = nullptr;
+    rune::consensus::BackoffIdleStrategy*    backoff_ = nullptr;
+    rune::consensus::BusySpinIdleStrategy*   spin_    = nullptr;
+};
+
+/// A7 review L3: the shard duty loop — every call direct (final agent, idle and clock).
+using ShardRunner = rune::consensus::BasicAgentRunner<ShardAgent, ShardIdle, rune::consensus::MonotonicNanoClock>;
+static_assert(std::is_final_v<ShardAgent> && std::is_final_v<ShardIdle> &&
+                  std::is_final_v<rune::consensus::MonotonicNanoClock> && std::is_final_v<ParkUntilWorkIdle> &&
+                  std::is_final_v<rune::consensus::BackoffIdleStrategy> &&
+                  std::is_final_v<rune::consensus::BusySpinIdleStrategy>,
+              "the shard runner's calls are direct only through final classes");
 
 class WorkerPool {
 public:
@@ -543,7 +593,7 @@ public:
     void startRunners(NodeConfig::WorkerIdleStrategy strategy,
                       rune::consensus::NanoClock&    clock,
                       int64_t                        maxParkUs = 200) {
-        if (!runners_.empty()) return; // idempotent
+        if (!runners_.empty() || !shardRunners_.empty()) return; // idempotent
 
         const std::size_t n = workers_.size();
         idles_.reserve(n);
@@ -586,24 +636,25 @@ public:
     // Idempotent (no-op if runners are already started).  Throws (startup
     // refusal) when there is not exactly one agent per worker.
     void startShardRunners(std::vector<std::unique_ptr<ShardAgent>>& agents,
-                           rune::consensus::NanoClock& clock,
+                           rune::consensus::MonotonicNanoClock& clock,
                            const NodeConfig& cfg) {
-        if (!runners_.empty()) return;
+        if (!runners_.empty() || !shardRunners_.empty()) return;
         if (agents.size() != workers_.size())      // hard check in release too (startup refusal)
             throw std::logic_error("WorkerPool::startShardRunners: " + std::to_string(agents.size()) +
                                    " ShardAgent(s) for " + std::to_string(workers_.size()) + " worker(s)");
-        idles_.reserve(agents.size());
-        runners_.reserve(agents.size());
+        shardIdles_.reserve(agents.size());
+        shardRunners_.reserve(agents.size());
         for (std::size_t i = 0; i < agents.size(); ++i) {
             auto& a = agents[i];
             // A7: park on this shard's driver readiness (read here, before its runner owns the pump).
             int fds[ParkUntilWorkIdle::kMaxWakeFds];
             const int nfds = a->wakeFds(fds, ParkUntilWorkIdle::kMaxWakeFds - 1);   // one slot for the doorbell
-            idles_.emplace_back(makeShardIdle(cfg, fds, nfds, a->doorbellEnabled() ? &a->doorbell() : nullptr));
+            shardIdles_.emplace_back(std::make_unique<ShardIdle>(
+                makeShardIdle(cfg, fds, nfds, a->doorbellEnabled() ? &a->doorbell() : nullptr)));
             // WARN: visible in perf runs (RUNE_LOG_LEVEL=warn) — the RESOLVED idle of this worker.
-            spdlog::warn("WorkerPool: shard worker {} idle={}", i, describeShardIdle(*idles_.back()));
-            runners_.emplace_back(std::make_unique<rune::consensus::AgentRunner>(*a, *idles_.back(), clock));
-            runners_.back()->start();
+            spdlog::warn("WorkerPool: shard worker {} idle={}", i, describeShardIdle(shardIdles_.back()->strategy()));
+            shardRunners_.emplace_back(std::make_unique<ShardRunner>(*a, *shardIdles_.back(), clock));
+            shardRunners_.back()->start();
         }
         if (!runnersStarted_) runnersStarted_ = true;   // see startRunners (P2)
     }
@@ -650,8 +701,13 @@ public:
         for (auto& r : runners_) {
             if (r) r->stopAndJoin();
         }
+        for (auto& r : shardRunners_) {
+            if (r) r->stopAndJoin();
+        }
         runners_.clear();
         idles_.clear();
+        shardRunners_.clear();
+        shardIdles_.clear();
         // P2: runnersStarted_ is NOT written here — the control thread may still
         // be running (BrokerNode stops workers first).  disarmAfterControlJoined()
         // resets it once the control thread is joined.
@@ -697,6 +753,8 @@ private:
     // Populated by startRunners(); cleared by stopAndJoinRunners().
     std::vector<std::unique_ptr<rune::consensus::IdleStrategy>>  idles_;
     std::vector<std::unique_ptr<rune::consensus::AgentRunner>>   runners_;
+    std::vector<std::unique_ptr<ShardIdle>>                      shardIdles_;     ///< A7 L3: shard mode
+    std::vector<std::unique_ptr<ShardRunner>>                    shardRunners_;   ///< A7 L3: shard mode
 };
 
 } // namespace rune::node

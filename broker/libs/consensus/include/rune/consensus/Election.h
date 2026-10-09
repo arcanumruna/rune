@@ -261,6 +261,25 @@ public:
         return ackTerm(candidateTermId_, votedTermId_, leadershipTermId_);
     }
     [[nodiscard]] Term votedTermId() const noexcept { return votedTermId_; }
+    /// D24: the durable follow floor (see followFloorTermId_).
+    [[nodiscard]] Term followFloorTermId() const noexcept { return followFloorTermId_; }
+    /// D29 PreVote (templates 60 / 61): a would-be candidate's non-binding ballot.
+    void onPreVoteRequest(int64_t nowNs, Term term, Term logLeadershipTermId, int64_t logPosition,
+                          NodeId candidateId);
+    void onPreVoteResponse(Term term, NodeId voterId, bool granted, Term voterTermId = -1,
+                           int64_t nowNs = INT64_MIN);
+    /// D29/D24: a member refused our NewLeadershipTerm for `refusedTermId` because its
+    /// follow floor `floorTermId` is above it — the leader steps down (template 62).
+    void onTermFloorNotice(int64_t nowNs, NodeId fromMember, Term floorTermId, Term refusedTermId);
+    [[nodiscard]] bool     preBallotActiveForTest() const noexcept { return preBallot_.active; }
+    [[nodiscard]] Term     preBallotTermForTest() const noexcept { return preBallot_.term; }
+    [[nodiscard]] uint64_t preBallotsLostForTest() const noexcept { return preBallotsLost_; }
+    [[nodiscard]] uint64_t preVotesGrantedForTest() const noexcept { return preVotesGranted_; }
+    [[nodiscard]] uint64_t preVotesDeniedForTest() const noexcept { return preVotesDenied_; }
+    [[nodiscard]] uint64_t termFloorStepDownsForTest() const noexcept { return termFloorStepDowns_; }
+    [[nodiscard]] uint64_t leaderStateStandDownsForTest() const noexcept { return leaderStateStandDowns_; }
+    [[nodiscard]] uint64_t preBallotTermCatchUpsForTest() const noexcept { return preBallotTermCatchUps_; }
+
 
     /// Re-review round 3 CRITICAL-R3 — knowledge exchange.  `src(ctx, out)`
     /// fills this node's newest durable metadata-ISR state (false = none /
@@ -387,6 +406,9 @@ private:
         RUNE_ELECTION_PUB_FWD(appendPosition)
         RUNE_ELECTION_PUB_FWD(commitPosition)
         RUNE_ELECTION_PUB_FWD(standDown)
+        RUNE_ELECTION_PUB_FWD(preVoteRequest)
+        RUNE_ELECTION_PUB_FWD(preVoteResponse)
+        RUNE_ELECTION_PUB_FWD(termFloorNotice)
 #undef RUNE_ELECTION_PUB_FWD
     };
     static_assert(std::is_final_v<SbeConsensusPublisher>);
@@ -447,25 +469,55 @@ private:
     /// ConsensusModuleAgent.leadershipTermId is recovered from the RecordingLog
     /// (here: the TermLog, appended at electionComplete) and whose only durable
     /// election term is the NodeStateFile candidate term.  Safe: the adoption
-    /// first persists candidateTermId (proposeMaxCandidateTermId, fsync), and a
-    /// restarted node's init() starts from max(persisted candidate term, this),
-    /// so it never votes at or below the adopted term nor re-follows the deposed
-    /// leader's older term (ClosedLeaderStepDownRegression_RestartAfter...).  The
-    /// ack term may fall back below it after a crash — same reasoning as
-    /// votedTermId_ below: knowledge persisted, never acked.
+    /// first raises the durable follow floor + candidate term (raiseFollowFloor_,
+    /// NodeStateFile slot 24, one sync), and a restarted node's init() starts
+    /// from max(persisted candidate term, floor, this), so it never votes at or
+    /// below the adopted term nor re-follows the deposed leader's older term
+    /// (ClosedLeaderStepDownRegression_RestartAfter...).  Since D24 the ack term
+    /// does not fall back either: init() restores votedTermId_ from the floor,
+    /// so ackTermId() >= the adopted term after a crash (LOW-6 re-evaluated;
+    /// ClosedLeaderStepDownRegression_AdoptedTermAckTermSurvivesRestart).
     Term leadershipTermId_    = 0;
     Term logLeadershipTermId_ = 0;
     Term candidateTermId_     = 0;
     /// Highest term this node GRANTED a vote in (MAJOR-R3) — a denial or an
-    /// own (abandoned) candidacy never raises it.  Not persisted (round-4
-    /// LOW-R4-4): after a restart the ack term can be BELOW a term this node
-    /// granted in before the crash, so the knowledge store may PERSIST a
-    /// deposed leader's internal ISR state — knowledge only, exactly what
-    /// adopt() does.  It never ACKS one: the internal replica restarts as
-    /// Follower at epoch 0 with no leader, and the durable candidateTermId_
-    /// makes the election ignore the stale term's NewLeadershipTerm (a node
-    /// never re-follows a deposed leader).
+    /// own (abandoned) candidacy never raises it.  After a restart it starts at
+    /// the durable follow floor (D24; round-4 LOW-R4-4 closed): a grant before
+    /// the crash still refuses an older term's internal ISR states.
     Term votedTermId_         = 0;
+    /// D24: the durable FOLLOW FLOOR (NodeStateFile) — the highest term this
+    /// node granted a vote in, led, followed, or adopted from a leader's
+    /// NLT / CommitPosition.  It never follows a leader below it; it MAY follow
+    /// one below candidateTermId_ when only its own failed candidacies (or
+    /// denials) raised that — they helped no leader (DR-4 review MAJOR-1).
+    Term followFloorTermId_   = -1;
+    /// Raises the follow floor and the candidate term to `term`, durably (one sync).
+    void raiseFollowFloor_(Term term);
+    // D29 PreVote state (a sub-phase of NOMINATE; Aeron's state ordinals unchanged).
+    struct PreBallot {
+        bool     active     = false;
+        Term     term       = -1;
+        int64_t  deadlineNs = 0;
+        uint32_t grantedMask = 0;   ///< bit i = clusterMembers_[i] granted
+        bool     denied      = false;   ///< an explicit denial at our term: the real ballot would fail
+    };
+    PreBallot preBallot_{};
+    NodeId    leaderHeardId_ = -1;          ///< the last member whose NLT / CommitPosition we heard
+    int64_t   leaderHeardNs_ = 0;
+    uint64_t  preBallotsStarted_ = 0, preBallotsLost_ = 0, preVotesGranted_ = 0, preVotesDenied_ = 0;
+    uint64_t  termFloorStepDowns_ = 0, preBallotTermCatchUps_ = 0;
+    [[nodiscard]] uint32_t selfBit_() const noexcept;
+    // D29b: leader-state CheckQuorum (see Election.cpp).
+    [[nodiscard]] bool leaderStatesTimedOut_(int64_t nowNs) const noexcept;
+    void standDownFromLeaderStates_(int64_t nowNs);
+    uint64_t leaderStateStandDowns_ = 0;
+    Term     deferredForTerm_ = -1;   // D29b LOW-1: the peer term our candidacy last deferred to
+    void noteLeaderHeard_(NodeId leaderId, Term term, int64_t nowNs) noexcept;
+    [[nodiscard]] bool leaderLeaseLive_(int64_t nowNs, NodeId candidateId) const noexcept;
+    void startPreBallot_(int64_t nowNs);
+    void sendPreVoteRequests_();
+    void markPreVote_(NodeId voterId) noexcept;
+    [[nodiscard]] bool preBallotWon_() const noexcept;
 
     // Election config — Election.java:80
     bool isNodeStartup_     = false;

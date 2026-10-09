@@ -34,6 +34,8 @@ public:
     /// msync the ENTIRE mapping (MS_SYNC).
     /// msync the whole mapping.  Returns 0 or the errno of a failed msync.
     int sync();
+    /// Write-touch every page of a writable mapping (D28; no-op otherwise).
+    void prefaultWrite() noexcept;
     /// TEST-ONLY: the POSIX fd currently held for this mapping.  For a read-only
     /// mapping (writable == false) this is -1 once the mapping is established
     /// (F3: the fd is closed right after mmap — dead weight for a read-only

@@ -908,7 +908,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // fails per min-ISR) instead of re-fetching forever behind silent drops.
     rune::storage::LogReadView view{};
     if (serve == FetchServe::Data && req.fetchOffset < logEndOffset_()) {
-        view = onLog([&](auto& L) { return L.readView(req.fetchOffset, req.maxBytes); });
+        view = readLog_(req.fetchOffset, req.maxBytes);
         if (view.len > static_cast<std::size_t>(req.maxBytes)) [[unlikely]] {
             int64_t frame = std::numeric_limits<int64_t>::max();
             onTransport([&](auto& t) { frame = t.maxFetchRecordsBytes(); });
@@ -1082,12 +1082,17 @@ int PartitionReplica::retryOwedFetchAnswers_() noexcept
         if (owed.data && owed.fetchOffset < leo) {
             // The view itself is re-taken every attempt (cheap; never cached across
             // passes — a cleaner swap may remap the segment between them).
-            view = onLog([&](auto& L) { return L.readView(owed.fetchOffset, owed.maxBytes); });
+            view = readLog_(owed.fetchOffset, owed.maxBytes);
             if (view.empty()) [[unlikely]] continue;   // transient read-map failure: next pass
             // F7 / R2: the whole-batch walk is memoised only while the LEO, the
             // view (same mapping, same length) AND the log's segment install
             // generation are unchanged — a compaction swap at the same LEO
             // rewrites the bytes below it and must rebuild (never a torn batch).
+            // (D26: with a read scratch the view pointer is constant; the memo
+            // still holds — an owed entry's fetchOffset is fixed (a new one
+            // resets the memo), a leader's log never truncates within its
+            // leadership, and every segment (re)install bumps the install
+            // generation: the same offset/LEO/len/install gen = the same bytes.)
             const uint64_t installGen = onLog([&](auto& L) { return L.installGeneration(); });
             if (s.owed.builtLeo != leo || s.owed.builtView != view.data ||
                 s.owed.builtLen != view.len || s.owed.builtInstallGen != installGen) {
@@ -1771,6 +1776,22 @@ void PartitionReplica::enableEpochState_() noexcept
             es_.stride = st.stride;
             es_.activeSlot = st.slot;
             es_.seq = st.seq;
+            // D23: a file from an earlier build may be sparse at the slots'
+            // heads — allocate them now (cold, this thread), so the worker's
+            // in-place writes never allocate.  Failed: nothing is reserved; the
+            // worker then writes in place (pre-D23, review M2) and an inline
+            // write re-creates the file (cold, counted; fail-closed).
+            {
+                const std::size_t want = ES::reserveFor(std::max(n, st.entries.size()), st.stride);
+                const int fd = ES::openExisting(dir);
+                const int rerr = reserveFaultForTest_ != 0 ? reserveFaultForTest_
+                               : fd < 0 ? -fd : ES::reserve(fd, st.stride, want, st.slot, ES::imageBytes(st.entries.size()));
+                if (fd >= 0) ::close(fd);
+                es_.reserved = rerr == 0 ? want : 0;
+                if (rerr != 0)
+                    spdlog::error("PartitionReplica[topic={} part={}]: reserving {} failed (errno={}) — the worker writes "
+                                  "it in place (unreserved); an inline write re-creates it", cfg_.topicId, cfg_.partitionId, ES::path(dir), rerr);
+            }
             rune::storage::LeaderEpochCache onDisk;
             onDisk.replaceAll(st.entries);
             if (static_cast<Epoch>(st.fence) > fencePersisted_) fencePersisted_ = static_cast<Epoch>(st.fence);
@@ -1804,6 +1825,7 @@ void PartitionReplica::enableEpochState_() noexcept
             ::close(fd);
             es_.enabled = true;
             es_.stride = stride;
+            es_.reserved = ES::reserveFor(m.size(), stride);
             es_.activeSlot = 0;
             es_.seq = seq;
             if (es_.fenceTarget > fencePersisted_) fencePersisted_ = es_.fenceTarget;
@@ -1823,6 +1845,12 @@ void PartitionReplica::enableEpochState_() noexcept
     }
 }
 
+bool PartitionReplica::epochImageFitsInPlace_(std::size_t entries) const noexcept
+{
+    using ES = rune::storage::LeaderEpochState;
+    return ES::capacityOf(es_.stride) >= entries && ES::imageBytes(entries) <= es_.reserved;
+}
+
 bool PartitionReplica::writeEpochStateInline_() noexcept
 {
     // Cold: control-thread replicas / tests / construction, or a re-create.
@@ -1837,8 +1865,9 @@ bool PartitionReplica::writeEpochStateInline_() noexcept
     try {
         const Epoch fence = imageFence_();
         const std::size_t entries = epochImageEntries_();
-        if (ES::capacityOf(es_.stride) < entries) {
-            // Outgrew the slot: re-create larger (tmp + fsync + rename + dir fsync).
+        if (!epochImageFitsInPlace_(entries)) {
+            // Outgrew the slot or its allocated head (D23): re-create larger
+            // (tmp + fsync + rename + dir fsync).
             const std::size_t stride = ES::strideFor(std::max<std::size_t>(ES::kMinEntries, 2 * entries));
             std::vector<uint8_t> img(ES::imageBytes(entries));
             const uint64_t seq = ++es_.seq;
@@ -1850,9 +1879,10 @@ bool PartitionReplica::writeEpochStateInline_() noexcept
             if (es_.fd >= 0) { ::close(es_.fd); es_.fd = -1; }
             const int fd = ES::create(esDir_, stride, seq, fence, ents.begin(), ents.end());
             ++es_.recreates;
-            if (fd < 0) { ++es_.errors; return false; }
+            if (fd < 0) { ++es_.errors; es_.lastErr = -fd; return false; }
             ::close(fd);
             es_.stride = stride;
+            es_.reserved = ES::reserveFor(ents.size(), stride);
             es_.activeSlot = 0;
         } else {
             if (openEpochStateFd_() != 0) { ++es_.errors; return false; }
@@ -1888,6 +1918,7 @@ bool PartitionReplica::writeEpochStateInline_() noexcept
         return true;
     } catch (...) {
         ++es_.errors;
+        es_.lastErr = EIO;
         return false;
     }
 }
@@ -1899,21 +1930,25 @@ bool PartitionReplica::prepareEpochStateWrite(uint8_t* buf, std::size_t cap, Epo
     if (!epochStateWriteDue()) return false;
     const std::size_t entries = epochImageEntries_();
     if (ES::capacityOf(es_.stride) < entries) [[unlikely]] {
-        // Cold, counted: the history outgrew the slot — re-created larger,
-        // once per doubling.  D21 L1: slots are pre-sized for kMinEntries
-        // (4096) epochs, so this needs thousands of RETAINED epochs.
-        if (writeEpochStateInline_()) completePendingLeadershipIfDurable_();
+        // Cold, counted: the history outgrew the SLOT (4096+ entries, D21 L1)
+        // — re-created larger (tmp + fsync + rename + dir fsync), once per
+        // doubling.  Lows A/B/C review M2: only this pre-D23 threshold runs a
+        // re-create on the worker pass — an image past the allocated head
+        // (D23; reserved = 0 after a failed reservation at enable) but inside
+        // the slot is written in place below, async, through the io backend
+        // (pre-D23 behaviour: that write may allocate a block — a failure goes
+        // through the regular async failure path, with its backoff).
+        if (writeEpochStateInline_()) { completePendingLeadershipIfDurable_(); return false; }
+        // Review M2: a failed re-create fails through the regular failure path
+        // (backoff, counted + logged, fail-closed for a pending leadership,
+        // fail-stop after kMaxEpochStateFailures) — never retried every pass.
+        failEpochStateWriteNow_(es_.lastErr != 0 ? es_.lastErr : EIO);
         return false;
     }
     need = ES::imageBytes(entries);
     if (cap < need) return false;
     if (const int openErr = openEpochStateFd_(); openErr != 0) {
-        es_.stage = EsStage::InFlight;              // fail through the regular failure path
-        es_.inflightSeq = ++es_.seq;
-        es_.inflightMin = es_.pendingMin;
-        es_.pendingMin = INT64_MAX;
-        es_.due = false;
-        (void)epochStateWriteCompleted(es_.inflightSeq, openErr);
+        failEpochStateWriteNow_(openErr);
         return false;
     }
     const int slot = es_.activeSlot < 0 ? 0 : 1 - es_.activeSlot;
@@ -1934,6 +1969,16 @@ bool PartitionReplica::prepareEpochStateWrite(uint8_t* buf, std::size_t cap, Epo
     out.offset = static_cast<int64_t>(slot) * static_cast<int64_t>(es_.stride);
     out.seq = seq;
     return true;
+}
+
+void PartitionReplica::failEpochStateWriteNow_(int err)
+{
+    es_.stage = EsStage::InFlight;              // fail through the regular failure path
+    es_.inflightSeq = ++es_.seq;
+    es_.inflightMin = es_.pendingMin;
+    es_.pendingMin = INT64_MAX;
+    es_.due = false;
+    (void)epochStateWriteCompleted(es_.inflightSeq, err);
 }
 
 void PartitionReplica::epochStateWriteSubmitted() noexcept
@@ -3294,6 +3339,31 @@ Offset PartitionReplica::pushFloor_() const noexcept
     return floor;
 }
 
+rune::storage::LogReadView PartitionReplica::readLog_(Offset from, int32_t maxBytes) noexcept
+{
+    if (!memoryBacked_ && readScratch_ != nullptr) [[likely]] {
+        rune::storage::ReadIntoStatus st;
+        int err = 0;
+        const rune::storage::LogReadView v =
+            diskLog_->readInto(from, maxBytes, readScratch_, readScratchCap_, st, INT64_MAX, &err);
+        if (st != rune::storage::ReadIntoStatus::FirstTooLarge) [[likely]] {
+            // D26: an I/O error is answered empty — never retried through the
+            // read mapping (SIGBUS on the bad page).  Review M1: it failed the
+            // log (sticky); the owner's storage-failure check halts / takes
+            // the log dir offline, and the log is never pread again.
+            if (st == rune::storage::ReadIntoStatus::IoError) [[unlikely]] {
+                ++readErrors_;
+                if ((readErrors_ & (readErrors_ - 1)) == 0)
+                    spdlog::error("PartitionReplica[topic={} part={}]: log read at {} failed (errno={}, errors={})",
+                                  cfg_.topicId, cfg_.partitionId, from, err, readErrors_);
+            }
+            return v;
+        }
+        ++readMapFallbacks_;
+    }
+    return onLog([&](auto& L) { return L.readView(from, maxBytes); });
+}
+
 int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexcept
 {
     RUNE_FR_SPAN_REPLICATION(rune_fr::Site::ReplPushToFollowers,
@@ -3344,7 +3414,7 @@ int PartitionReplica::pushToFollowers(Offset pushCeiling, Offset floorIn) noexce
             // transport copies the bytes once, straight into the follower's term.
             // (F3 round 6 item 1: chunk capped at the transport's LIVE ceiling —
             // F18 m-3's pushCap; one ceiling: maxFetchRecordsBytes().)
-            v = onLog([&](auto& L) { return L.readView(from, static_cast<int32_t>(pushCap)); });
+            v = readLog_(from, static_cast<int32_t>(pushCap));
             // F18 / KIP-74: a first batch larger than maxFetchBytes is still pushed
             // whole (never stuck).  FLOW CONTROL: no batch that begins at or beyond
             // pushCeiling is pushed (in-flight <= kPushFlowWindow).

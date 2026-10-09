@@ -1,6 +1,8 @@
 // ClientGateway.cpp — implementation of the client-facing session gateway (BR-4 / BR-5 / BR-7a / GR-4 / GR-5).
 
 #include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/ConnectDowngradePolicy.h>
+#include <rune/gateway/CryptoFrame.h>
 #include <cassert>
 #include <rune_fr/FlightRecorder.h>
 #include <rune/gateway/TopicRegistry.h>
@@ -83,7 +85,10 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
                              int64_t                         sessionTimeoutNs,
                              std::function<LeaderView()>     leaderView,
                              int64_t                         connectResolveTimeoutNs,
-                             rune::aeronutil::AeronPump      pump)
+                             rune::aeronutil::AeronPump      pump,
+                             std::string                     tlsCertPem,
+                             std::string                     tlsKeyPem,
+                             bool                            requireTls)
     : aeron_(std::move(aeron))
     , clientChannel_(std::move(clientChannel))
     , clientStreamId_(clientStreamId)
@@ -91,6 +96,9 @@ ClientGateway::ClientGateway(std::shared_ptr<aeron::Aeron>   aeron,
     , sessionTimeoutNs_(sessionTimeoutNs)
     , connectResolveTimeoutNs_(connectResolveTimeoutNs)
     , leaderView_(std::move(leaderView))
+    , tlsCertPem_(std::move(tlsCertPem))
+    , tlsKeyPem_(std::move(tlsKeyPem))
+    , requireTls_(requireTls)
 {
     // Pre-allocate the draining-release vector (bounded by kMaxPendingConnects).
     // pendingConnects_ is a deque — no reserve() needed; O(1) front push/pop.
@@ -269,16 +277,44 @@ void ClientGateway::enqueueOrBestEffort_(Session&       session,
 }
 
 // ---------------------------------------------------------------------------
-// F19: pushRecords_ — send one Records push frame on the session's egress.
-// Real egress → rune::node::sendRecordsFrame (tryClaim fast path for one-MTU
-// frames, unchanged; vectored [fixed | batch] offer above it; TooLarge above
-// maxMessageLength).  Null egress (injectTestSession) → the test capture hook
-// (treated as sent); no hook → Retry.
+// F19 / Task 8b: pushRecords_ — send one Records push frame on the session's
+// egress.  Real egress, PLAINTEXT session → rune::node::sendRecordsFrame's
+// unchanged path (tryClaim fast path for one-MTU frames; vectored
+// [fixed | batch] offer above it; TooLarge above maxMessageLength).
+//
+// Real egress, ENCRYPTED session (session.crypto.encrypted): the Records
+// push is the highest-volume broker->client traffic and was bypassing
+// sendTo's Task 8 sealing entirely — sent in the clear, dropped by the
+// client's decrypt-everything-but-handshake dispatch. Build a
+// rune::node::RecordsSealCtx from the session's OWN crypto fields (raw
+// params — never rune::gateway::CryptoState itself; RecordsPush.h/
+// RecordsSeal.h must not depend on libs/gateway, see RecordsSeal.h's file
+// header comment) and pass it + this gateway's own recordsSealScratch_ to
+// sendRecordsFrame, which assembles the contiguous plaintext, seals it, and
+// publishes the single contiguous sealed buffer (see RecordsPush.h's
+// ENCRYPTED-path comment). Gated on `encrypted` alone (not
+// `session.crypto.send.has_value()`), exactly like sendTo — a null `send`
+// (key not installed) is still passed through as a RecordsSealCtx with a
+// null `send`, so sealRecordsFrame fails closed instead of ever falling
+// back to plaintext.
+//
+// Null egress (injectTestSession) → the test capture hook (treated as
+// sent); no hook → Retry.
 // ---------------------------------------------------------------------------
 rune::node::RecordsSendResult ClientGateway::pushRecords_(Session& session, const pc::Records& rec)
 {
-    if (session.egress) [[likely]]
+    if (session.egress) [[likely]] {
+        if (session.crypto.encrypted) {
+            rune::node::RecordsSealCtx seal;
+            seal.send    = session.crypto.send.has_value() ? &*session.crypto.send : nullptr;
+            seal.sendSeq = &session.crypto.sendSeq;
+            seal.cipher  = static_cast<uint8_t>(session.crypto.cipher);
+            seal.epoch   = session.crypto.epoch;
+            return rune::node::sendRecordsFrame(*session.egress, rec, scratch_.data(), scratch_.size(),
+                                                &seal, &recordsSealScratch_);
+        }
         return rune::node::sendRecordsFrame(*session.egress, rec, scratch_.data(), scratch_.size());
+    }
     if (!onEgressFrame_) return {rune::node::RecordsSendKind::Retry, -1};
     captureTestRecordsFrame_(session, rec);
     return {rune::node::RecordsSendKind::Sent, 1};
@@ -544,6 +580,7 @@ int ClientGateway::doWork(int64_t nowNs) {
             },
             fragmentLimit_);
         controlledImageWatch_.afterPoll(*sub_, controlledAssembler_);
+        noteControlledImages_(sub_->imageCount());   // review L1: a lost image's deferral memo
     } else {
         // Task 11 fix 2 (B3): templated assembler + handler — no std::function.
         work += sub_->poll(
@@ -563,6 +600,13 @@ int ClientGateway::doWork(int64_t nowNs) {
     work += advanceInlinePsmScans_();   // I3: budgeted inline producer-state rebuilds
     // Task 13: SessionClose ops a full worker ring refused earlier — never dropped.
     if (shardMode_ && workerPool_) work += sessionAnnouncer_.retryCloses(*workerPool_);
+    // Task 19: the per-worker crypto-key SessionAnnounce (second wave) a
+    // full worker ring refused earlier — retried until every worker has the
+    // real key. Never a safety concern while this is in flight (every
+    // worker already has a "parked" entry from the first, announce-before-
+    // accept wave — see pollPendingConnects), only a liveness one.
+    if (shardMode_ && workerPool_ && !pendingCryptoAnnounces_.empty())
+        work += retryPendingCryptoAnnounces_();
     pollPendingRecordEgress_(nowNs);  // hybrid egress: resolve unicast pubs + drain deferred subscribes
     reapExpired(nowNs);
     // GB-5p2: group-commit flush — time-based cadence (kGroupCommitIntervalNs).
@@ -843,6 +887,65 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
 
 bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
 {
+    // client<->broker TLS/AEAD (Task 8): decrypt BEFORE checkFrame — mirrors
+    // the client's dispatchEgressFrame (Task 6). templateId/sessionId are
+    // always plaintext (they form the AEAD AAD), so peek them via
+    // MessageHeader::decode without validating anything else. Connect /
+    // HandshakeContinue legs are exempt: they precede or complete key
+    // establishment itself and must stay plaintext even on a session that is
+    // otherwise `encrypted` (e.g. a stray HandshakeContinue retry delivered
+    // after done() must still be readable in the clear). Plaintext path
+    // (crypto off, or session not found/not encrypted) is byte-identical to
+    // before Task 8 — buf/len are reassigned only on a successful decrypt.
+    //
+    // Cross-node sessionId collision (task-8-interfaces.md): NOT reachable
+    // here. `sessions_` (SessionTable.h) is a flat unordered_map<sessionId,
+    // Session> that is this NODE's OWN table — find() returns at most one
+    // Session by construction of the map (a plain hash-map key lookup), and
+    // SessionTable::nextSessionId() ORs in this node's own idPrefix_, so ids
+    // are cluster-unique by construction in production. This differs from
+    // the client's own ambiguity (ClientAgent::dispatchEgressFrame): the
+    // client holds one Session PER NODE in one local collection, so the same
+    // numeric sessionId can legitimately be claimed by two different nodes'
+    // Sessions in that single collection, and the client must therefore try
+    // every encrypted candidate. The gateway never holds another node's
+    // sessions at all — a single find() + single open() is correct here, no
+    // multi-candidate AEAD-disambiguation loop is needed.
+    // Lows batch C (D8c R3): a Produce's seq is committed to the replay window
+    // only once the frame is CONSUMED — handleProduce may defer it (full worker
+    // share: ABORT + redelivery), and a committed seq would make the redelivery
+    // a "replay" that is silently dropped.  Every other frame is always consumed.
+    int64_t  produceOpenSid = 0;
+    uint64_t produceOpenSeq = 0;
+    if (const auto hdrOpt = pc::MessageHeader::decode(buf, len)) {
+        const auto peekedTid = static_cast<pc::TemplateId>(hdrOpt->templateId);
+        if (peekedTid != pc::TemplateId::Connect &&
+            peekedTid != pc::TemplateId::HandshakeContinue) {
+            if (Session* s = sessions_.find(hdrOpt->sessionId); s != nullptr && s->crypto.encrypted) {
+                // Plaintext is always kCryptoOverhead (28) bytes SHORTER than
+                // the wire frame — `len` bytes of capacity is always enough.
+                // noexcept-adjacent hot path: vector::resize can throw
+                // (bad_alloc) — contained here so a failed grow drops the
+                // frame instead of propagating out of onFragment's callback.
+                if (decryptScratch_.size() < len) {
+                    try {
+                        decryptScratch_.resize(len);
+                    } catch (...) {
+                        return true;  // scratch exhausted — drop, never crash
+                    }
+                }
+                uint64_t seq = 0;
+                const std::size_t plainLen = rune::gateway::codec::openIngressFrameUncommitted(
+                    s->crypto, buf, len, decryptScratch_.data(), decryptScratch_.size(), seq);
+                if (plainLen == 0) return true;  // tamper/replay/truncation — drop
+                if (peekedTid == pc::TemplateId::Produce) { produceOpenSid = hdrOpt->sessionId; produceOpenSeq = seq; }
+                else rune::gateway::codec::commitIngressSeq(s->crypto, seq);
+                buf = decryptScratch_.data();
+                len = plainLen;
+            }
+        }
+    }
+
     // Step 1: validate frame with checkFrame — reject anything non-conformant.
     const auto fc = pc::checkFrame(buf, len);
     if (fc.status != pc::FrameStatus::Ok) {
@@ -888,6 +991,11 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::Connect:
             handleConnect(buf, len, nowNs_);
             break;
+        // client<->broker TLS/AEAD (Task 7): a later leg of a multi-round TLS
+        // handshake started on the Connect/ConnectResponse leg above.
+        case pc::TemplateId::HandshakeContinue:
+            handleHandshakeContinue_(buf, len, nowNs_);
+            break;
         case pc::TemplateId::Keepalive:
             handleKeepalive(buf, len, nowNs_);
             break;
@@ -901,8 +1009,12 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::MetadataRequest:
             handleMetadata(buf, len);
             break;
-        case pc::TemplateId::Produce:
-            return handleProduce(buf, len);
+        case pc::TemplateId::Produce: {
+            const bool consumed = handleProduce(buf, len);
+            if (produceOpenSid != 0 && consumed) [[unlikely]]
+                if (Session* s = sessions_.find(produceOpenSid)) rune::gateway::codec::commitIngressSeq(s->crypto, produceOpenSeq);
+            return consumed;
+        }
         case pc::TemplateId::Subscribe:
             handleSubscribe(buf, len);
             break;
@@ -1014,6 +1126,45 @@ void ClientGateway::closeDroppedPendingConnect_(const PendingConnect& pending)
         sessionAnnouncer_.close(*workerPool_, pending.sessionId);
 }
 
+// ---------------------------------------------------------------------------
+// Task 19 (per-worker egress crypto addendum): retry the second-wave,
+// crypto-key-bearing SessionAnnounce for sessions a full worker ring
+// refused on an earlier attempt (handleHandshakeContinue_'s best-effort
+// first try, or a previous call to this function). Re-reads session.crypto
+// fresh each attempt (the Session, not the long-gone PendingConnect, is the
+// only thing that outlives the original attempt). A session already closed
+// (closeSession_/reapExpired) in the meantime is simply dropped from the
+// list — SessionClose will have already reached every worker via the
+// normal close path, so there is nothing left to announce.
+// ---------------------------------------------------------------------------
+int ClientGateway::retryPendingCryptoAnnounces_()
+{
+    if (!workerPool_) return 0;
+    int work = 0;
+    for (std::size_t i = 0; i < pendingCryptoAnnounces_.size(); ) {
+        const int64_t sid = pendingCryptoAnnounces_[i];
+        Session* s = sessions_.find(sid);
+        if (!s || !s->crypto.encrypted) {
+            // Closed/expired, or (defensively) somehow not encrypted anymore
+            // — nothing to retry.
+            pendingCryptoAnnounces_[i] = pendingCryptoAnnounces_.back();
+            pendingCryptoAnnounces_.pop_back();
+            continue;
+        }
+        if (sessionAnnouncer_.announce(*workerPool_, sid, s->egressChannel, s->egressStreamId,
+                                        s->clientVersion, /*sessionEncrypted=*/true, /*keyReady=*/true,
+                                        s->crypto.b2c, s->crypto.b2cPrefix, s->crypto.cipher,
+                                        s->crypto.c2b, s->crypto.c2bPrefix)) {
+            ++work;
+            pendingCryptoAnnounces_[i] = pendingCryptoAnnounces_.back();
+            pendingCryptoAnnounces_.pop_back();
+            continue;
+        }
+        ++i;   // still full on at least one worker — retry next cycle
+    }
+    return work;
+}
+
 bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
 {
     Session* s = sessions_.find(sid);
@@ -1023,6 +1174,7 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     if (notifyExpired) sendSessionExpired_(nullptr, s, sid);
     if (s->heldByWorkers != 0) --heldSessions_;
     if (s->produceInFlight >= sessionProduceCredits_) --creditBlockedSessions_;   // D8c: its budget dies with it
+    if (s->capDeferredOn >= 0) --capDeferredSessions_;                              // R3: its deferral memo too
     for (int w = 0; w < Session::kMaxWorkers; ++w) {                               // ... and its share of each worker's cap
         if (s->produceInFlightOn[static_cast<std::size_t>(w)] == 0) continue;
         routedInFlight_[static_cast<std::size_t>(w)] -= s->produceInFlightOn[static_cast<std::size_t>(w)];
@@ -1066,17 +1218,30 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     return true;
 }
 
-ClientGateway::ProducePause ClientGateway::produceFramePause_(const uint8_t* buf, std::size_t len)
+ClientGateway::ProducePause ClientGateway::produceFramePause_(const uint8_t* buf, std::size_t len, int32_t* capWorker)
 {
     if (len < pc::MessageHeader::ENCODED_SIZE) return ProducePause::None;
     const uint16_t templateId = static_cast<uint16_t>(buf[2] | (buf[3] << 8));
     if (templateId != pc::Produce::TEMPLATE_ID) return ProducePause::None;   // only produce intake is paused
     uint64_t sid = 0;
     for (int i = 7; i >= 0; --i) sid = (sid << 8) | buf[8 + i];
-    const Session* s = sessions_.find(static_cast<int64_t>(sid));
+    Session* s = sessions_.find(static_cast<int64_t>(sid));
     if (!s) return ProducePause::None;
     if (s->heldByWorkers != 0) return ProducePause::Held;
     if (s->produceInFlight >= sessionProduceCredits_) return ProducePause::NoCredit;
+    if (s->capDeferredOn >= 0) [[unlikely]] {
+        // Lows batch C (D8c R3): this session's head Produce was deferred by a
+        // full worker share (one image per session: the redelivered frame IS
+        // it).  While that worker still refuses it, ABORT here — before the
+        // decrypt, decode and lookups handleProduce would redo every cycle.
+        const int32_t w = s->capDeferredOn;
+        const WorkerAdmit a = workerAdmitsProduce_(w, *s);
+        if (a != WorkerAdmit::Admit) {
+            if (capWorker) *capWorker = w;
+            return a == WorkerAdmit::Full ? ProducePause::WorkerCapFull : ProducePause::WorkerCapBand;
+        }
+        clearCapDeferred_(*s);                                    // admitted now: the full path runs
+    }
     return ProducePause::None;
 }
 
@@ -1089,12 +1254,37 @@ void ClientGateway::logProducePauseStats() const
 
 bool ClientGateway::admitClientFrame_(const uint8_t* buf, std::size_t len)
 {
-    if ((heldSessions_ | creditBlockedSessions_) == 0) [[likely]] return true;
-    const ProducePause p = produceFramePause_(buf, len);
+    if ((heldSessions_ | creditBlockedSessions_ | capDeferredSessions_) == 0) [[likely]] return true;
+    int32_t capWorker = -1;
+    const ProducePause p = produceFramePause_(buf, len, &capWorker);
     if (p == ProducePause::None) return true;
     ++heldProduceAborts_;
     if (p == ProducePause::NoCredit) ++creditProduceAborts_;
+    else if (p == ProducePause::WorkerCapFull || p == ProducePause::WorkerCapBand) {
+        // Exactly what handleProduce's deferral counts (expiry pacing unchanged).
+        ++workerCapProduceAborts_;
+        ++capDeferMemoAborts_;
+        if (p == ProducePause::WorkerCapFull) onWorkerCapFull_(capWorker);   // may expire this very session
+    }
     return false;
+}
+
+void ClientGateway::clearCapDeferred_(Session& s) noexcept
+{
+    s.capDeferredOn = -1;
+    --capDeferredSessions_;
+}
+
+void ClientGateway::noteControlledImages_(int images) noexcept
+{
+    // A memo is only a fast-path hint: a frame that does come back runs the
+    // full check (handleProduce) and is re-memoized while still refused.
+    if (images < lastControlledImages_ && capDeferredSessions_ != 0) [[unlikely]] {
+        sessions_.forEach([this](Session& s) {
+            if (s.capDeferredOn >= 0) clearCapDeferred_(s);
+        });
+    }
+    lastControlledImages_ = images;
 }
 
 // D8c: credits are counted only in shard mode (worker-side acks — the only mode
@@ -1130,8 +1320,10 @@ ClientGateway::WorkerAdmit ClientGateway::workerAdmitsProduce_(int32_t worker, c
 // which frees that share at once.
 //   * Never a session that is not Held by that worker: a busy reader whose
 //     acks drain is never evicted.
-//   * Never a session that returned a Credit from that worker during this
-//     episode (it is reading, just slowly), and only after
+//   * Never a session that returned a Credit from that worker during the
+//     current scan window — the last kCapEvictAfterDeferredPolls deferred
+//     polls (it is reading, just slowly; a fresh window tag after each scan
+//     that finds no victim, as D8d's direct episodes) — and only after
 //     kCapEvictAfterDeferredPolls deferred polls in the episode, so such a
 //     reader has had its chance to show it.
 //   * No cascade / thrash: at most ONE expiry per episode.  An episode starts
@@ -1145,6 +1337,10 @@ ClientGateway::WorkerAdmit ClientGateway::workerAdmitsProduce_(int32_t worker, c
 //   * Event-driven (deferred polls, credits, closes), no timer.
 // The scan over sessions is cold: at most once per kCapEvictAfterDeferredPolls
 // deferred polls of a full worker.
+// Tags (uint16, global) are issued per episode AND per scan window (lows batch
+// C), so they wrap after 65535 WINDOWS — about 4M deferred polls (~80 s at 50k
+// polls/s), not 65536 episodes.  A wrap can alias a stale creditTagOn with a
+// fresh window: at worst one window's delay to an eviction (harmless).
 void ClientGateway::onWorkerCapFull_(int32_t worker)
 {
     CapEpisode& ep = capEpisode_[static_cast<std::size_t>(worker)];
@@ -1159,10 +1355,18 @@ void ClientGateway::onWorkerCapFull_(int32_t worker)
     uint16_t share = 0;
     sessions_.forEach([&](const Session& s) {
         if ((s.heldByWorkers & bit) == 0) return;                 // not held by this worker: a reader
-        if (s.creditTagOn[w] == ep.tag) return;                   // credited in this episode: a (slow) reader
+        if (s.creditTagOn[w] == ep.tag) return;                   // credited in this scan window: a (slow) reader
         if (s.produceInFlightOn[w] > share) { share = s.produceInFlightOn[w]; victim = s.sessionId; }
     });
-    if (victim == 0) return;                                      // no held session to blame: keep deferring
+    if (victim == 0) {                                            // no held session to blame: keep deferring
+        // Lows batch C (aligned with D8d's directEpisode_): reader marks count
+        // Credits of the LAST scan window only — a fresh tag per window.  A
+        // session that credited once early in a long episode and then stalled
+        // is judged by what it does now, not marked a reader forever.
+        if (++capEpisodeTags_ == 0) ++capEpisodeTags_;
+        ep.tag = capEpisodeTags_;
+        return;
+    }
     ep = CapEpisode{};                                            // the episode ends with its one expiry
     ++workerCapEvictions_;
     lastCapEvictedSid_ = victim;
@@ -1407,6 +1611,70 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     pc_entry.egressStreamId        = req.egressStreamId;
     pc_entry.clientVersion         = req.clientVersion;   // D6
 
+    // client<->broker TLS/AEAD (Task 7): drive the server-role handshake's
+    // FIRST leg right here, synchronously, off the client's ClientHello
+    // bytes carried on this very ConnectRequest.  Skipped entirely for a
+    // redirect (this node will create no session either way).
+    // NOTE: capturedLeaderEndpoint was already std::move()'d into
+    // pc_entry.leaderClientEndpoint above — read the redirect decision back
+    // off pc_entry, not the now-moved-from local.
+    const bool isRedirectCapture = (!pc_entry.isLeader && !pc_entry.leaderClientEndpoint.empty());
+    const bool clientOffersCrypto = !req.cipherList.empty() && !req.handshakeBytes.empty();
+    const bool brokerHasTls       = !tlsCertPem_.empty() && !tlsKeyPem_.empty();
+    // Task 19 (per-worker egress crypto addendum): shard mode used to refuse
+    // every crypto offer here (ConnectDowngradePolicy.h's now-removed
+    // shardModeRefusesCryptoOffer) because a shard-mode worker's Records
+    // egress was plaintext-only. The shard worker now seals its own Records
+    // egress with its own per-sender key (see
+    // handleHandshakeContinue_/pollPendingConnects' deferred crypto-key
+    // SessionAnnounce), so shard mode engages crypto exactly like legacy mode.
+    if (!isRedirectCapture && shouldEngageCrypto(clientOffersCrypto, brokerHasTls)) {
+        pc_entry.tls.emplace(rune::crypto::TlsSession::makeServer(tlsCertPem_.c_str(), tlsKeyPem_.c_str()));
+        if (!pc_entry.tls->valid()) {
+            // Local TLS init failure (e.g. a misconfigured cert/key on THIS
+            // broker) — degrade to plaintext rather than hard-fail a connect
+            // over a broker-side problem the client had no part in (mirrors
+            // the client's own beginCryptoHandshake_ degrade-on-local-failure).
+            // require_tls (below) still catches this and rejects rather than
+            // serving it plaintext when the operator asked for mandatory TLS.
+            pc_entry.tls.reset();
+        } else {
+            // The broker's chosen cipher: the client's first preference.
+            // (A real negotiation policy — e.g. intersecting with a broker
+            // allow-list — is future scope; here we mirror the client
+            // reference test's own driveHandshake(), which takes
+            // cipherList[0] verbatim.)
+            pc_entry.chosenCipher = static_cast<rune::crypto::Cipher>(req.cipherList[0]);
+            const auto hs = pc_entry.tls->readInbound(
+                reinterpret_cast<const uint8_t*>(req.handshakeBytes.data()),
+                req.handshakeBytes.size());
+            if (hs == rune::crypto::HsState::Failed) {
+                // Malformed/invalid ClientHello (bad token embedded in it,
+                // cert/SNI mismatch, protocol error, ...) — fail the connect
+                // non-retriably; pollPendingConnects answers
+                // ConnectResponse{HandshakeFailed} and creates no session.
+                pc_entry.cryptoFailed = true;
+                pc_entry.tls.reset();
+            } else {
+                drainHandshakeOutbound_(pc_entry);
+            }
+        }
+    }
+
+    // require_tls (Task 9, downgrade safety — spec §11): once the above has
+    // resolved whether this connect established crypto, hard-reject any
+    // case that would otherwise be served plaintext.  Covers: a plaintext
+    // client, this broker having no cert/key, a local TLS init failure
+    // degrading to plaintext above, AND a shard-mode-refused crypto offer
+    // (already cryptoFailed=true, so this is a no-op there — it stays
+    // HandshakeFailed either way, never silently plaintext).
+    if (!isRedirectCapture && !pc_entry.cryptoFailed &&
+        mustRejectForRequireTls(requireTls_, pc_entry.tls.has_value())) {
+        spdlog::warn("ClientGateway: require_tls rejecting a plaintext Connect "
+                     "(session={})", sessionId);
+        pc_entry.cryptoFailed = true;
+    }
+
     // DR-15 fix round 2 (LOW-4): a reply HOSTNAME is resolved off-thread by the
     // cold resolver (never by a driver conductor on a duty thread); the session
     // stays pending — bounded by the connect timeout — until the hub answers.
@@ -1428,6 +1696,26 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // Kick off the egress publication registration (returns immediately).
     if (!registerConnectEgress_(pc_entry)) return;
     pendingConnects_.push_back(std::move(pc_entry));
+}
+
+// ---------------------------------------------------------------------------
+// client<->broker TLS/AEAD (Task 7): drain every pending outbound handshake
+// byte out of pending.tls into pending.hsBytes.  Mirrors the client's own
+// SessionMachine::drainHandshakeOutbound_() exactly (cold path — once per
+// handshake leg; the growable vector is explicitly out of the zero-alloc
+// hot-path rule, same reasoning as the client side). No-op if pending.tls is
+// empty (callers only invoke this with tls engaged).
+// ---------------------------------------------------------------------------
+void ClientGateway::drainHandshakeOutbound_(PendingConnect& pending)
+{
+    pending.hsBytes.clear();
+    if (!pending.tls) return;
+    uint8_t chunk[4096];
+    for (;;) {
+        const std::size_t n = pending.tls->writeOutbound(chunk, sizeof(chunk));
+        if (n == 0) break;
+        pending.hsBytes.insert(pending.hsBytes.end(), chunk, chunk + n);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1549,6 +1837,13 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
         }
 
         if (pending.awaitingResolve) { ++it; continue; }   // reply host not resolved yet (LOW-4)
+        // client<->broker TLS/AEAD (Task 7): the first ConnectResponse (with
+        // the chosen cipher + server's first flight) was already sent; this
+        // entry now waits for the client's HandshakeContinue legs
+        // (handleHandshakeContinue_) to drive tls->done() — never re-sent nor
+        // erased here.  The generic timeout check above still bounds a
+        // client that never continues the handshake.
+        if (pending.awaitingHandshake) { ++it; continue; }
 
         // Try to find the publication (non-blocking).
         std::shared_ptr<aeron::ExclusivePublication> pub;
@@ -1623,6 +1918,17 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
                 continue;
             }
             encoded = err.encode(scratch_.data());
+        } else if (pending.cryptoFailed) {
+            // client<->broker TLS/AEAD (Task 7): the server-role TlsSession
+            // rejected the client's opening handshake bytes (handleConnect).
+            // Fail the connect non-retriably — mirrors the redirect branch
+            // above in creating NO session (Invariant FIX A extends to this
+            // path too: never add a session the client wasn't told about).
+            pc::ConnectResponse resp;
+            resp.sessionId     = 0;
+            resp.correlationId = pending.correlationId;
+            resp.code          = static_cast<int16_t>(pc::ErrorCode::HandshakeFailed);
+            encoded = resp.encode(scratch_.data());
         } else {
             // Task 13 (spec §3.4) announce-before-accept: every worker must know
             // this session's reply destination before the client can learn its
@@ -1643,9 +1949,22 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
                     continue;
                 }
                 pending.announceBegun = true;
+                // Task 19 ★: mark `sessionEncrypted` here too (keyReady=false
+                // — the real b2c key doesn't exist yet; it is derived only
+                // once pending.tls->done(), in handleHandshakeContinue_'s own
+                // second announce wave). This FIRST wave is what the client's
+                // own ConnectResponse (sent right below, once `announced`)
+                // is gated on — i.e. every worker is guaranteed to already
+                // have a "parked" (fail-closed) entry for this session
+                // BEFORE the client can possibly learn its sessionId and
+                // Subscribe, closing the race against the second wave's own
+                // retry (see pending.tls.has_value() below: true only for a
+                // connect still attempting crypto — see shouldEngageCrypto).
                 if (!sessionAnnouncer_.announce(*workerPool_, pending.sessionId,
                                                 pending.egressChannel, pending.egressStreamId,
-                                                pending.clientVersion)) {
+                                                pending.clientVersion,
+                                                /*sessionEncrypted=*/pending.tls.has_value(),
+                                                /*keyReady=*/false)) {
                     ++it;
                     continue;   // a worker ring is full — retry next cycle
                 }
@@ -1660,6 +1979,15 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             resp.code              = static_cast<int16_t>(pc::ErrorCode::OK);
             resp.leaderMemberId    = thisNodeId_;
             resp.assignedSessionId = pending.sessionId;
+            if (pending.tls) {
+                // client<->broker TLS/AEAD (Task 7): offer the chosen cipher +
+                // the server's first handshake flight (ServerHello/cert/
+                // Finished) on this SAME leg — mirrors the client's Task-5
+                // first-leg shape (ConnectResponse v4's additive fields).
+                resp.chosenCipher   = static_cast<uint8_t>(pending.chosenCipher);
+                resp.handshakeBytes = std::string_view(
+                    reinterpret_cast<const char*>(pending.hsBytes.data()), pending.hsBytes.size());
+            }
             encoded = resp.encode(scratch_.data());
         }
 
@@ -1677,19 +2005,170 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             continue;
         }
 
-        // Send succeeded.  Redirect entries create NO session (the resolvedPub
-        // shared_ptr release on erase frees the transient egress registration).
-        if (!isRedirect) {
-            // Only now is it safe to add the session (leader-accept path).
-            // Carry the client's egress endpoint so a per-consumer unicast Records
-            // publication can be lazily created on the first subscribe.
-            sessions_.add(pending.sessionId, std::move(pub), nowNs,
-                          pending.egressChannel, pending.egressStreamId,
-                          pending.clientVersion);
+        // Send succeeded.  Redirect / handshake-failure entries create NO
+        // session (the resolvedPub shared_ptr release on erase frees the
+        // transient egress registration).
+        if (isRedirect || pending.cryptoFailed) {
+            it = pendingConnects_.erase(it);
+            continue;
         }
+        if (pending.tls) {
+            // client<->broker TLS/AEAD (Task 7): the client now has its
+            // sessionId and the server's first flight; it drives the rest
+            // over HandshakeContinue/HandshakeContinueResponse
+            // (handleHandshakeContinue_).  Do NOT promote to SessionTable yet
+            // (Invariant FIX A: no session without a completed, keyed
+            // handshake) and do NOT erase — this entry keeps the in-flight
+            // TlsSession (and the now-resolved, Aeron-connected pub) alive,
+            // keyed by sessionId.
+            pending.awaitingHandshake = true;
+            ++it;
+            continue;
+        }
+        // Only now is it safe to add the session (leader-accept, plaintext
+        // path).  Carry the client's egress endpoint so a per-consumer
+        // unicast Records publication can be lazily created on the first
+        // subscribe.
+        sessions_.add(pending.sessionId, std::move(pub), nowNs,
+                      pending.egressChannel, pending.egressStreamId,
+                      pending.clientVersion);
 
         it = pendingConnects_.erase(it);
     }
+}
+
+// ---------------------------------------------------------------------------
+// client<->broker TLS/AEAD (Task 7): handleHandshakeContinue_ — a later leg
+// of a multi-round TLS handshake, after handleConnect/pollPendingConnects
+// started it on the ConnectResponse leg.  The session this concerns has NOT
+// been promoted to sessions_ yet (it's still a PendingConnect with
+// awaitingHandshake==true) — this is the ONLY other place besides
+// pollPendingConnects that may promote one.  Linear scan over pendingConnects_
+// (a deque bounded by kMaxPendingConnects==64) keyed by sessionId.  Unknown
+// sessionId / decode failure / no matching awaiting-handshake entry → drop,
+// never crash (same contract as every other dispatch handler).
+// ---------------------------------------------------------------------------
+void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len, int64_t nowNs)
+{
+    auto hcOpt = pc::HandshakeContinue::decode(buf, len);
+    if (!hcOpt) return;  // truncated — drop
+    const auto& hc = *hcOpt;
+
+    auto it = pendingConnects_.begin();
+    for (; it != pendingConnects_.end(); ++it) {
+        if (it->sessionId == hc.sessionId && it->awaitingHandshake) break;
+    }
+    if (it == pendingConnects_.end()) return;  // stale/unknown — drop (client retries are safe: no-op)
+
+    PendingConnect& pending = *it;
+    // Defensive: awaitingHandshake is only ever set together with tls
+    // engaged (pollPendingConnects); a missing tls here would be a logic bug
+    // elsewhere, not a peer-triggerable condition — drop rather than crash.
+    if (!pending.tls || !pending.resolvedPub) return;
+
+    const auto hs = pending.tls->readInbound(
+        reinterpret_cast<const uint8_t*>(hc.handshakeBytes.data()), hc.handshakeBytes.size());
+    if (hs == rune::crypto::HsState::Failed) {
+        pc::HandshakeContinueResponse fail;
+        fail.sessionId     = pending.sessionId;
+        fail.correlationId = hc.correlationId;
+        fail.code          = static_cast<int16_t>(pc::ErrorCode::HandshakeFailed);
+        const std::size_t need = fail.encodedSize();
+        if (need <= scratch_.size()) {
+            (void)sendOnPub(*pending.resolvedPub, scratch_.data(), fail.encode(scratch_.data()));
+        }
+        closeDroppedPendingConnect_(pending);  // Task 13: close-everywhere for an announced-but-never-accepted session
+        pendingConnects_.erase(it);
+        return;
+    }
+
+    drainHandshakeOutbound_(pending);
+    if (!pending.hsBytes.empty()) {
+        pc::HandshakeContinueResponse cont;
+        cont.sessionId     = pending.sessionId;
+        cont.correlationId = hc.correlationId;
+        cont.code          = static_cast<int16_t>(pc::ErrorCode::OK);
+        cont.handshakeBytes = std::string_view(
+            reinterpret_cast<const char*>(pending.hsBytes.data()), pending.hsBytes.size());
+        const std::size_t need = cont.encodedSize();
+        if (need <= scratch_.size()) {
+            // Best-effort (matches the rest of the connect-leg sends in this
+            // file, which stash-and-retry via pollPendingConnects; a dropped
+            // HandshakeContinueResponse here just means the client's own
+            // connect-timeout retries the leg — bounded, never silent data
+            // corruption, since no keys are installed until done() below).
+            (void)sendOnPub(*pending.resolvedPub, scratch_.data(), cont.encode(scratch_.data()));
+        } else {
+            spdlog::warn("ClientGateway: HandshakeContinueResponse too large ({}B) for session={}; dropping leg",
+                         need, pending.sessionId);
+        }
+    }
+
+    if (!pending.tls->done()) return;  // more legs to come
+
+    // client<->broker TLS/AEAD (Task 7): exportKeys's documented fail-closed
+    // sentinel — Cipher::None means "do not trust these keys", never install
+    // an all-zero AeadCipher.
+    const rune::crypto::SessionKeys keys = pending.tls->exportKeys(pending.chosenCipher, pending.sessionId);
+    if (keys.cipher == rune::crypto::Cipher::None) {
+        pc::HandshakeContinueResponse fail;
+        fail.sessionId     = pending.sessionId;
+        fail.correlationId = hc.correlationId;
+        fail.code          = static_cast<int16_t>(pc::ErrorCode::HandshakeFailed);
+        const std::size_t need = fail.encodedSize();
+        if (need <= scratch_.size()) {
+            (void)sendOnPub(*pending.resolvedPub, scratch_.data(), fail.encode(scratch_.data()));
+        }
+        closeDroppedPendingConnect_(pending);
+        pendingConnects_.erase(it);
+        return;
+    }
+
+    // ★ DIRECTION MAPPING (task-7-interfaces.md) — the broker is the mirror
+    // of the client: recv OPENS client->broker ingress (c2b/c2bPrefix), send
+    // SEALS broker->client egress (b2c/b2cPrefix).  Getting this backwards
+    // makes the handshake "succeed" with matching keys while every data-plane
+    // AEAD op fails.
+    Session& session = sessions_.add(pending.sessionId, std::move(pending.resolvedPub), nowNs,
+                                      pending.egressChannel, pending.egressStreamId,
+                                      pending.clientVersion);
+    session.crypto.cipher = keys.cipher;
+    session.crypto.recv.emplace(keys.cipher, keys.c2b, keys.c2bPrefix);  // OPENs client->broker
+    session.crypto.send.emplace(keys.cipher, keys.b2c, keys.b2cPrefix);  // SEALs broker->client
+    session.crypto.encrypted = true;
+    // Task 19 (per-worker egress crypto addendum): retain the RAW b2c key +
+    // prefix (session.crypto.send above already holds the AeadCipher built
+    // from these same bytes) so the gateway can derive each shard worker's
+    // own per-sender key (shard mode only; unread in legacy mode).
+    session.crypto.b2c = keys.b2c;
+    std::memcpy(session.crypto.b2cPrefix, keys.b2cPrefix, 4);
+    // Task 22 (shard worker decrypts produce / per-worker ingress): retain
+    // the RAW c2b key + prefix the same way (session.crypto.recv above
+    // already holds the AeadCipher built from these same bytes) so the
+    // gateway can ship this session's SINGLE ingress key to every shard
+    // worker (shard mode only; unread in legacy mode).
+    session.crypto.c2b = keys.c2b;
+    std::memcpy(session.crypto.c2bPrefix, keys.c2bPrefix, 4);
+
+    // Task 19 ★: ship the real per-worker key now. Every worker ALREADY has
+    // a "parked" entry for this session from the FIRST (announce-before-
+    // accept, pollPendingConnects) wave — sent while sessionEncrypted was
+    // known but no real key existed yet — so even if THIS second wave can't
+    // fully land on every worker in one shot (a ring momentarily full), no
+    // worker can ever mistake this session for plaintext: the first wave's
+    // entry already makes it fail-closed (park) until this one lands.
+    // Retried from doWork() (retryPendingCryptoAnnounces_) until complete —
+    // a liveness concern only, never a safety one, by the above invariant.
+    if (shardMode_ && workerPool_ &&
+        !sessionAnnouncer_.announce(*workerPool_, pending.sessionId, pending.egressChannel,
+                                     pending.egressStreamId, pending.clientVersion,
+                                     /*sessionEncrypted=*/true, /*keyReady=*/true,
+                                     session.crypto.b2c, session.crypto.b2cPrefix, session.crypto.cipher,
+                                     session.crypto.c2b, session.crypto.c2bPrefix)) {
+        pendingCryptoAnnounces_.push_back(pending.sessionId);
+    }
+
+    pendingConnects_.erase(it);
 }
 
 // ---------------------------------------------------------------------------
@@ -1809,6 +2288,44 @@ void ClientGateway::handleDisconnect(const uint8_t* buf, std::size_t len)
 // ---------------------------------------------------------------------------
 bool ClientGateway::sendTo(Session& session, const uint8_t* buf, std::size_t len)
 {
+    // client<->broker TLS/AEAD (Task 8): encrypt AFTER the response body is
+    // encoded (every caller already encoded into scratch_/its own buffer),
+    // BEFORE handing bytes to the egress. sendTo is the single chokepoint
+    // every Session-aware broker->client send path funnels through
+    // (sendRespReliable_/enqueueOrBestEffort_/offerBytes_, sendControlFrame,
+    // sendSubscribeAnswer_, drainPendingResponses, trySendOwedPushError_,
+    // handlePing, sendSessionExpired_) — so sealing here, once, covers all of
+    // them with no per-caller duplication (Rule 3: one state, one code path).
+    // `seq=++crypto.sendSeq`, encode CryptoSubHeader, seal into a reusable
+    // grow-once scratch, emit [24B header][12B subheader][ciphertext][16B
+    // tag]. Drop (never transmit) on seal failure (sealResponseFrame
+    // returns 0). Plaintext path (crypto off) is byte-identical to before
+    // Task 8 — buf/len are reassigned only on a successful seal.
+    //
+    // NOTE: the raw sendOnPub() call sites that do NOT go through sendTo
+    // (handleConnect/handleHandshakeContinue_'s ConnectResponse/
+    // HandshakeContinueResponse/HandshakeFailed legs, and the redirect/
+    // sendSessionExpired_ fallback when no Session exists yet) are
+    // intentionally left untouched: those are either the handshake legs
+    // themselves (must stay plaintext — keys are not yet installed, or are
+    // being installed by this very frame) or genuinely session-less (no
+    // CryptoState to seal under).
+    if (session.crypto.encrypted) {
+        const std::size_t need = len + rune::protocol::client::kCryptoOverhead;
+        if (sealScratch_.size() < need) {
+            try {
+                sealScratch_.resize(need);
+            } catch (...) {
+                return false;  // scratch exhausted — drop, never transmit
+            }
+        }
+        const std::size_t sealedLen = rune::gateway::codec::sealResponseFrame(
+            session.crypto, buf, len, sealScratch_.data(), sealScratch_.size());
+        if (sealedLen == 0) return false;  // seal failure — never transmit
+        buf = sealScratch_.data();
+        len = sealedLen;
+    }
+
     // Guard against null egress (test sessions injected via injectTestSession
     // have no real ExclusivePublication).
     if (!session.egress) {
@@ -2142,6 +2659,9 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         if (const WorkerAdmit a = workerAdmitsProduce_(routedWorker, *session); a != WorkerAdmit::Admit) [[unlikely]] {
             ++heldProduceAborts_;
             ++workerCapProduceAborts_;
+            // Lows batch C (R3): remember the deferral — the redeliveries are
+            // ABORTed in admitClientFrame_ before any decrypt / decode.
+            if (session->capDeferredOn < 0) { session->capDeferredOn = static_cast<int8_t>(routedWorker); ++capDeferredSessions_; }
             // May expire a held session — possibly this one: `session` is not used after this.
             if (a == WorkerAdmit::Full) onWorkerCapFull_(routedWorker);
             return false;
@@ -4926,6 +5446,7 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
                       tid, hdrOpt->sessionId);
         return;
     }
+    if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
 
     // Dispatch to the service.  The service encodes the response into scratch_.
     // Capacity is passed so handlers bound-check BEFORE writing each element;
@@ -4968,6 +5489,44 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
 }
 
 // ---------------------------------------------------------------------------
+// D4 (backlog "group subscribe redirect"): the group / transaction coordinator
+// is the consensus leader (GroupCoordinationService / TransactionCoordination-
+// Service coordinatorFor: v1 seam).  A follower used to answer every group /
+// txn request NotCoordinator — but Rune has no FindCoordinator, and the client
+// re-sends coordinator requests on its seed session, so a member bootstrapped
+// against a follower re-joined that follower forever (dockerized repro:
+// test_cg_members_on_a_follower_find_the_coordinator consumed 0 of 80).  Like
+// a data op on a follower, the answer names the coordinator:
+// ErrorResponse{NotCoordinator, leader endpoint}.  NotCoordinator (not Redirect)
+// so the client tells it from a data-op redirect — while a group is active the
+// client never moves its seed on a data-op Redirect, but a coordinator answer
+// moves the seed (the coordinator's session by design) and the member re-joins
+// there (rune-client-cpp Client::onCoordinatorRedirect_).  Unknown leader
+// endpoint (election in progress): fall through — the service answers the typed
+// NotCoordinator (retriable).
+// ---------------------------------------------------------------------------
+bool ClientGateway::redirectToCoordinator_(Session& session, int64_t correlationId)
+{
+    if (!leaderView_) return false;
+    const LeaderView lv = leaderView_();
+    if (lv.isLeader || lv.leaderClientEndpoint.empty()) return false;
+    pc::ErrorResponse errResp;
+    errResp.sessionId     = session.sessionId;
+    errResp.correlationId = correlationId;
+    errResp.code          = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
+    errResp.message       = lv.leaderClientEndpoint;
+    const std::size_t needed = pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 +
+                               errResp.message.size();
+    if (needed > scratch_.size()) return false;
+    const std::size_t encoded = errResp.encode(scratch_.data());
+    ++coordinatorRedirects_;
+    spdlog::debug("ClientGateway: coordinator request on a follower sessionId={} corr={} → NotCoordinator {}",
+                  session.sessionId, correlationId, lv.leaderClientEndpoint);
+    sendTo(session, scratch_.data(), encoded);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // handleTxnMessage (TX-3) — route transaction frames to the
 // TransactionCoordinationService.
 //
@@ -4996,6 +5555,7 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
                       tid, hdrOpt->sessionId);
         return;
     }
+    if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
 
     std::size_t encoded = 0;
     const std::size_t cap = scratch_.size();

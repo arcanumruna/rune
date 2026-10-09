@@ -60,6 +60,27 @@ TEST(SignalControlRegression, SignalsArriveAsRingEventsInOrder) {
     EXPECT_TRUE(pollEvents(ring, 1, 200ms).empty()) << "shutdown posts no event";
 }
 
+// Task 9 (RUNE_TLS SIGHUP reload): SIGHUP must become kTlsReloadEvent, not
+// kStopEvent — a renewal signal must never stop the broker.
+TEST(SignalControlRegression, SighupArrivesAsTlsReloadEvent) {
+    MaskGuard mask;
+    ControlEventRing ring;
+    {
+        SignalThread sig(ring);
+        ASSERT_EQ(::pthread_kill(sig.nativeHandle(), SIGHUP), 0);
+        auto ev = pollEvents(ring, 1);
+        ASSERT_EQ(ev.size(), 1u);
+        EXPECT_EQ(ev[0].type, kTlsReloadEvent);
+
+        // The signal thread must keep servicing SIGINT/SIGTERM afterwards —
+        // SIGHUP must not have left it in some special reload-only state.
+        ASSERT_EQ(::pthread_kill(sig.nativeHandle(), SIGTERM), 0);
+        auto ev2 = pollEvents(ring, 1);
+        ASSERT_EQ(ev2.size(), 1u);
+        EXPECT_EQ(ev2[0].type, kStopEvent);
+    }
+}
+
 // The halt exit code travels by ring (from any thread), not a global atomic.
 TEST(SignalControlRegression, HaltCarriesExitCodeOverTheRing) {
     ControlEventRing ring;

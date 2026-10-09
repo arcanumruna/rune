@@ -981,3 +981,179 @@ TEST(LogSegmentRegression, ReadIntoLargeBatchesMultiSegmentAndBufferLimitRegress
     }
     std::filesystem::remove_all(dir);
 }
+
+// D26 (fix65 review observation): a start offset inside a compacted TAIL gap
+// of a sealed segment (the cleaner dropped the segment's last records; the next
+// segment starts above them) found no batch in the segment holding it, and
+// Log::readInto answered empty without moving to the next segment — a
+// consumer / follower cursor there never advanced (the worker answered Empty
+// with the same cursor, every cycle).  The read continues at the next segment.
+TEST(LogSegmentRegression, ReadIntoInACompactedTailGapContinuesAtTheNextSegmentRegression) {
+    auto dir = makeTempDir("rune_log_tailgap");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    auto put = [&](int64_t base, const std::vector<std::vector<uint8_t>>& batches) {
+        char name[32];
+        std::snprintf(name, sizeof name, "%020lld.log", static_cast<long long>(base));
+        std::ofstream f(dir / name, std::ios::binary);
+        for (const auto& b : batches) f.write(reinterpret_cast<const char*>(b.data()), static_cast<std::streamsize>(b.size()));
+    };
+    // Segment 0 kept [0, 4] (its [5, 9] compacted away); segment 10 holds [10, 11].
+    put(0, {makeBatch(0, 1000, 5)});
+    put(10, {makeBatch(10, 2000, 2)});
+    rune::storage::Log log(dir.string());
+    log.recover();
+    ASSERT_EQ(log.segmentBaseOffsets().size(), 2u) << "precondition: two segments";
+    ASSERT_EQ(log.logEndOffset(), 12);
+    std::vector<uint8_t> buf(64 * 1024);
+    for (int64_t start : {5, 7, 9}) {
+        bool tooLarge = true;
+        const auto v = log.readInto(start, 4096, buf.data(), buf.size(), tooLarge);
+        EXPECT_FALSE(tooLarge);
+        ASSERT_FALSE(v.empty()) << "start " << start << " in the tail gap: empty (cursor stuck)";
+        EXPECT_EQ(v.baseOffset, 10);
+        EXPECT_EQ(v.nextOffset, 12);
+    }
+    bool tooLarge = true;
+    EXPECT_TRUE(log.readInto(12, 4096, buf.data(), buf.size(), tooLarge).empty()) << "past the end";
+    std::filesystem::remove_all(dir);
+}
+
+// D26 (fix65 review LOW-2): a pread that fails (here: the file is shorter than
+// its written size — a mapping of the same bytes would SIGBUS) is an IoError
+// answer: empty, never "first batch too large" — the callers then never retry
+// it through the read mapping.
+TEST(LogSegmentRegression, ReadIntoIoErrorIsNeverTooLargeRegression) {
+    auto dir = makeTempDir("rune_log_readinto_eio");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    rune::storage::Log log(dir.string());
+    log.recover();
+    RecordBatchBuilder b(0, 1000);
+    b.append("k", std::string(100 * 1024, 'x'), 1000);   // one ~100 KiB batch
+    log.append(b.build(), 0);
+    // The file loses its tail behind the log's back (a failing disk / an
+    // external truncate): bytes [30 KiB, end) are gone.
+    const auto segPath = dir / "00000000000000000000.log";
+    ASSERT_EQ(::truncate(segPath.c_str(), 30 * 1024), 0);
+    std::vector<uint8_t> buf(64 * 1024);   // smaller than the batch
+    bool tooLarge = true;
+    EXPECT_TRUE(log.readInto(0, 4096, buf.data(), buf.size(), tooLarge).empty());
+    EXPECT_FALSE(tooLarge) << "an I/O error was reported as too large (the caller would fault through the mapping)";
+    ReadIntoStatus st = ReadIntoStatus::Ok;
+    int err = 0;
+    EXPECT_TRUE(log.readInto(0, 4096, buf.data(), buf.size(), st, INT64_MAX, &err).empty());
+    EXPECT_EQ(st, ReadIntoStatus::IoError);
+    EXPECT_NE(err, 0);
+    std::filesystem::remove_all(dir);
+}
+
+// Lows A/B/C review M1: a pread I/O error was answered empty and retried on
+// EVERY worker pass (a bad sector can block each pread for tens of ms -- on the
+// duty pass) and nothing escalated: the log was never failed, so the
+// log-dir-offline / broker-halt path never ran and acks=all HW pinned at the
+// bad batch.  Kafka: a read IOException takes the log dir offline.  A read I/O
+// error now marks the log storage-failed (sticky, like a write / fsync
+// failure; the owner's checkStorageFailure_ routes it to the halt) and a
+// failed log is never pread again.
+TEST(LogSegmentRegression, ReadIntoIoErrorFailsTheLogStickyAndIsNotRetriedRegression) {
+    auto dir = makeTempDir("rune_log_readinto_eio_sticky");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    rune::storage::Log log(dir.string());
+    log.recover();
+    RecordBatchBuilder b(0, 1000);
+    b.append("k", std::string(100 * 1024, 'x'), 1000);
+    log.append(b.build(), 0);
+    const auto segPath = dir / "00000000000000000000.log";
+    std::vector<char> saved;
+    {
+        std::ifstream f(segPath, std::ios::binary);
+        saved.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    ASSERT_GT(saved.size(), 30u * 1024);
+    ASSERT_EQ(::truncate(segPath.c_str(), 30 * 1024), 0);   // the bad sector
+    std::vector<uint8_t> buf(256 * 1024);
+    ReadIntoStatus st = ReadIntoStatus::Ok;
+    int err = 0;
+    EXPECT_TRUE(log.readInto(0, 4096, buf.data(), buf.size(), st, INT64_MAX, &err).empty());
+    ASSERT_EQ(st, ReadIntoStatus::IoError);
+    EXPECT_TRUE(log.storageFailed()) << "a read I/O error did not fail the log (no escalation, retried every pass)";
+    EXPECT_NE(log.storageErrno(), 0);
+    // The bytes come back (the "drive" recovers): a failed log is still never
+    // read again -- sticky, no pread on the next pass.
+    {
+        std::ofstream f(segPath, std::ios::binary | std::ios::trunc);
+        f.write(saved.data(), static_cast<std::streamsize>(saved.size()));
+    }
+    const uint64_t bytesBefore = log.segmentForTest(0)->readIntoBytes();
+    st = ReadIntoStatus::Ok;
+    err = 0;
+    EXPECT_TRUE(log.readInto(0, 4096, buf.data(), buf.size(), st, INT64_MAX, &err).empty());
+    EXPECT_EQ(st, ReadIntoStatus::IoError) << "a failed log was read again";
+    EXPECT_NE(err, 0);
+    EXPECT_EQ(log.segmentForTest(0)->readIntoBytes(), bytesBefore) << "a failed log was pread again";
+    std::filesystem::remove_all(dir);
+}
+
+// Lows A/B/C review L6: a first batch too large for the caller's buffer is read
+// through once (to surface EIO before the mapped fallback) — on EVERY attempt:
+// a retrying follower / back-pressured consumer re-read the whole batch each
+// time (twice its size of I/O with the mapped read).  A batch already read
+// through cleanly is not read through again (until a truncate / recover).
+TEST(LogSegmentRegression, TooLargeFirstBatchIsReadThroughOnceRegression) {
+    auto dir = makeTempDir("rune_log_readinto_toolarge_once");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    rune::storage::Log log(dir.string());
+    log.recover();
+    RecordBatchBuilder b(0, 1000);
+    b.append("k", std::string(100 * 1024, 'x'), 1000);   // one ~100 KiB batch
+    log.append(b.build(), 0);
+    std::vector<uint8_t> buf(64 * 1024);                  // smaller than the batch
+    LogSegment& seg = *log.segmentForTest(0);
+    ReadIntoStatus st = ReadIntoStatus::Ok;
+    const uint64_t b0 = seg.readIntoBytes();
+    (void)log.readInto(0, 4096, buf.data(), buf.size(), st);
+    ASSERT_EQ(st, ReadIntoStatus::FirstTooLarge);
+    const uint64_t first = seg.readIntoBytes() - b0;
+    ASSERT_GE(first, 100u * 1024) << "precondition: the first attempt reads the batch through (counted)";
+    (void)log.readInto(0, 4096, buf.data(), buf.size(), st);
+    ASSERT_EQ(st, ReadIntoStatus::FirstTooLarge);
+    const uint64_t second = seg.readIntoBytes() - b0 - first;
+    EXPECT_LT(second, 100u * 1024) << "the validated too-large batch was read through again";
+    // A truncate (the bytes at that position may change) forgets it.
+    ASSERT_TRUE(log.truncateTo(0));
+    RecordBatchBuilder c(0, 2000);
+    c.append("k", std::string(100 * 1024, 'y'), 2000);
+    log.append(c.build(), 0);
+    LogSegment& seg2 = *log.segmentForTest(0);
+    const uint64_t b2 = seg2.readIntoBytes();
+    (void)log.readInto(0, 4096, buf.data(), buf.size(), st);
+    ASSERT_EQ(st, ReadIntoStatus::FirstTooLarge);
+    EXPECT_GE(seg2.readIntoBytes() - b2, 100u * 1024) << "a truncated position stayed validated";
+    std::filesystem::remove_all(dir);
+}
+
+// D26 (fix65 review LOW-4): a read bounded by the HW / LSO a little past the
+// cursor (an acks=all leader whose LEO runs ahead) preads about one index
+// interval past the bound — not maxBytes.
+TEST(LogSegmentRegression, ReadIntoStopsNearTheBoundRegression) {
+    auto dir = makeTempDir("rune_log_readinto_bound");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    rune::storage::Log log(dir.string());
+    log.recover();
+    for (int64_t off = 0; off < 3000; ++off) log.append(makeBatch(off, 1000 + off, 1), off);   // ~70 B batches
+    std::vector<uint8_t> buf(256 * 1024);
+    LogSegment& seg = *log.segmentForTest(0);
+    for (int64_t start : {0, 1000, 2500}) {
+        const uint64_t before = seg.readIntoBytes();
+        ReadIntoStatus st;
+        const auto v = log.readInto(start, 128 * 1024, buf.data(), buf.size(), st, /*bound=*/start + 10);
+        ASSERT_EQ(st, ReadIntoStatus::Ok);
+        ASSERT_FALSE(v.empty());
+        EXPECT_EQ(v.baseOffset, start);
+        EXPECT_GE(v.nextOffset, start + 10) << "a batch below the bound is missing";
+        EXPECT_LE(seg.readIntoBytes() - before, 3u * 4096u) << "start " << start << ": read far past the bound";
+        // Unbounded: the whole request.
+        const auto w = log.readInto(start, 128 * 1024, buf.data(), buf.size(), st);
+        EXPECT_GT(w.len, v.len);
+    }
+    std::filesystem::remove_all(dir);
+}

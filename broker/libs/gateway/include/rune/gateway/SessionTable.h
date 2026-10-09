@@ -12,16 +12,36 @@
 #include <Aeron.h>
 #include <ExclusivePublication.h>
 
+// client<->broker TLS/AEAD (Task 7): Session's own CryptoState holds the two
+// directional AeadCiphers once a server-role TLS handshake completes
+// (ClientGateway::handleHandshakeContinue_).  NOTE (build/linkage trap,
+// task-7-interfaces.md): this header is already part of rune_gateway's
+// PUBLIC interface (it includes <Aeron.h>) — pulling rune/crypto/Aead.h in
+// here means every downstream target that compiles a TU including
+// SessionTable.h now needs rune_crypto's include dir transitively.  rune_crypto
+// + OpenSSL must be linked PUBLIC on rune_gateway (mirroring rune_fr / the
+// client's Task-5 fix-round-1), not PRIVATE as the brief's literal text says.
+//
+// CryptoState itself (Task 8) lives in its own aeron-free header —
+// rune/gateway/CryptoState.h — so the data-plane codec (CryptoFrame.h) that
+// seals/opens frames under it can be unit-tested standalone without ever
+// touching <Aeron.h>.
+#include <rune/gateway/CryptoState.h>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
 namespace rune::gateway {
 
+// ---------------------------------------------------------------------------
+// CryptoState — see rune/gateway/CryptoState.h (extracted there in Task 8 so
+// the aeron-free data-plane codec can use it without pulling in <Aeron.h>).
 // ---------------------------------------------------------------------------
 // Session — one connected client.
 // ---------------------------------------------------------------------------
@@ -60,15 +80,25 @@ struct Session {
     // claimed yet (SessionSignal Credit).  At ClientGateway::sessionProduceCredits()
     // the gateway ABORTs this session's Produce frames.  Dies with the session.
     uint32_t                                       produceInFlight = 0;
+    // Lows batch C (D8c R3): the worker whose full routed share deferred this
+    // session's head Produce (-1 = none).  While set, the redelivered frame is
+    // ABORTed by ClientGateway::admitClientFrame_ (one probe) instead of being
+    // decrypted / decoded / looked up again every duty cycle; cleared once that
+    // worker admits it.  A session's frames arrive on one image, so the head
+    // frame is the deferred one (a second image of the same session would only
+    // wait behind it — the LOW-R4 head-of-line, never a loss).
+    int8_t                                         capDeferredOn = -1;
     // D8c fix round 1: produceInFlight split by the owning worker it was
     // forwarded to (Credit signals name their worker) — kept so a close returns
     // the session's share of every worker's routed cap.  Cold (close / credit).
     static constexpr int                           kMaxWorkers = 64;   // == ClientGateway::kMaxHeldMaskWorkers
     std::array<uint16_t, kMaxWorkers>              produceInFlightOn{};   // <= the per-session budget (4096)
-    // D8c fix round 2: tag of the worker's cap-full episode during which this
-    // session last returned a Credit from that worker (a reader — never evicted
-    // in that episode).  uint16 tags wrap after 65536 episodes (harmless: at
-    // worst one reading session is considered for eviction once more).
+    // D8c fix round 2: tag of the worker's cap-full scan window (a fresh tag per
+    // kCapEvictAfterDeferredPolls deferred polls without a victim — lows batch C,
+    // as D8d) during which this session last returned a Credit from that worker
+    // (a reader — never evicted in that window).  uint16 tags wrap after 65536
+    // windows (harmless: at worst one reading session is considered for
+    // eviction once more).
     std::array<uint16_t, kMaxWorkers>              creditTagOn{};
     // Subscribe dedupe (2026-10-05; last — review L-5: off the produce-path fields' lines): a Subscribe is identified by (session,
     // correlationId, topicId, resolved partition) — the client binds exactly one
@@ -93,6 +123,11 @@ struct Session {
         }
     };
     std::unordered_map<SubKey, int64_t, SubKeyHash> subIdByKey;
+
+    // client<->broker TLS/AEAD (Task 7): this session's crypto state.
+    // `crypto.encrypted` is false (default CryptoState) for a plaintext
+    // session — byte-identical to every pre-Task-7 Session.
+    CryptoState crypto;
 };
 
 // ---------------------------------------------------------------------------

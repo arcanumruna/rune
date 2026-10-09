@@ -20,7 +20,16 @@ import os
 import pytest
 
 from harness.cluster import Cluster
-from harness import faults
+from harness import dockerutil, faults
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _sweep_orphaned_containers():
+    """D10-L (D2-10): containers left by a harness process that died without cleanup
+    (pytest-timeout's thread method os._exit()s a hung session) are removed before
+    this session starts — they would keep producing into its tests."""
+    dockerutil.sweep_orphaned_containers()
+    yield
 
 
 def _build_flag() -> bool:

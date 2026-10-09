@@ -979,8 +979,16 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
             // Control-clock: apply op enqueued to the worker ring (corr=recvSeq).
             RUNE_FR_MARK_REPLICATION(rune_fr::Site::ReplFragRecv, inRecvSeq_++);
         } else {
-            // INLINE path (no WorkerPool): call applyReplicated synchronously.
-            rep->applyReplicated(resp);
+            // INLINE path (internal partitions / no WorkerPool): call applyReplicated
+            // synchronously.  E1 low: contained like the worker path (Worker.h
+            // ApplyReplicated) — a storage error never escapes the Aeron poll; the
+            // log is already sticky-failed, so the broker's storage scan halts it.
+            try {
+                rep->applyReplicated(resp);
+            } catch (const std::exception& ex) {
+                spdlog::error("AeronPartitionTransport: inline apply topic={} partition={} failed: {}",
+                              resp.topicId, resp.partition, ex.what());
+            }
         }
 
     } else if (tid == OffsetsForLeaderEpochReqMsg::TEMPLATE_ID) {

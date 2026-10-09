@@ -86,6 +86,7 @@
 // delete), no node containers.  std::string only inside the policy's add()
 // (announcement, cold path).  Owner: the worker thread only.
 #include <rune/node/AeronChannel.h>
+#include <rune/node/RecordsSeal.h>
 #include <rune/node/SessionSignalKind.h>
 #include <rune/protocol/client/DataMessages.h>
 
@@ -168,10 +169,16 @@ public:
     /// gateway path's UnknownSession drop — so a client that resends after
     /// SessionExpired cannot duplicate its buffered backlog.
     static constexpr uint8_t     kDirectDropClosed = 3;
-    /// Review MEDIUM-2: recently closed session ids remembered (FIFO ring) —
-    /// sized for every close burst between a close and the drain of the closed
-    /// client's image (a client's term window drains in a few passes).
-    static constexpr std::size_t kClosedTombstones = 1024;
+    /// Review MEDIUM-2: recently closed session ids remembered (FIFO ring +
+    /// open-addressing set: O(1) per frame of an unknown session).  Lows batch C
+    /// (was 1024): kMaxSessions — a mass close of EVERY session this worker can
+    /// know (one gateway reap cycle, e.g. after a partition) keeps every
+    /// tombstone.  A tombstone is evicted only after kMaxSessions NEWER closes;
+    /// each needs a session announced first (a client Connect round trip), while
+    /// the closed client's image — at most its term window — drains in a few
+    /// passes (its frames are consumed, never appended).  Memory: 32 KiB ring +
+    /// 64 KiB set per worker (the sink is heap-allocated once).
+    static constexpr std::size_t kClosedTombstones = kMaxSessions;
     /// D8d: default per-session direct budget — the owed-return cap default
     /// (Worker::kMaxOwedReturns): one session may keep a full pipeline of
     /// parked acks=all on a worker; a stalled one holds at most this.
@@ -245,7 +252,7 @@ public:
         const std::size_t idx = find_(sessionId);
         if (idx == kNone) return;
         erase_(idx);
-        closed_[closedNext_++ & (kClosedTombstones - 1)] = sessionId;   // MEDIUM-2 tombstone (overwrites the oldest)
+        tombstone_(sessionId);                                       // MEDIUM-2 (evicts the oldest when full)
     }
 
     /// Queue one ack for this pass's flush.  False only when the queue is full
@@ -256,13 +263,34 @@ public:
         return true;
     }
 
+    /// Task 23: every session is plaintext unless `lookupCrypto` says
+    /// otherwise — the default keeps flush()'s old 2-arg signature and
+    /// behavior byte-identical for every pre-Task-23 caller (this header's
+    /// own 1000+-line test file calls `s.flush(a, b)` throughout; a defaulted
+    /// template parameter means none of those call sites change).
+    struct NoSealLookup {
+        const RecordsSealCtx* operator()(int64_t /*sessionId*/) const noexcept { return nullptr; }
+    };
+
     /// One pass: advance announcements, then claim every queued ack on its
     /// session publication in order.  `ringProducerPos` / `ringConsumerPos`:
     /// the worker's session-lifecycle ring, sampled now (after every frame of
     /// this pass was observed) — they decide when an unknown session's ack is
-    /// truly orphaned (I1).  Returns work done.
-    int flush(int64_t ringProducerPos, int64_t ringConsumerPos) noexcept {
-        const int work = flushAcks_(ringProducerPos, ringConsumerPos);
+    /// truly orphaned (I1).
+    /// Task 23: `lookupCrypto(sessionId) -> const RecordsSealCtx*` — null for
+    /// a plaintext session (the default, and every existing caller); non-null
+    /// means "seal this session's ack under the worker's OWN per-sender b2c
+    /// cipher and sendSeq" (the SAME ctx/sendSeq Records sealing uses for that
+    /// session — see SessionAckSink.h's file header and flushAcks_'s seal
+    /// branch). The sink has no sessionId<->crypto table of its own (Rule 1:
+    /// shared-nothing — the worker already owns that table, sessionCrypto_);
+    /// this is the seam that lets the worker hand it over at flush time
+    /// without SessionAckSink depending on Worker.h's types.
+    /// Returns work done.
+    template <class CryptoLookup = NoSealLookup>
+    int flush(int64_t ringProducerPos, int64_t ringConsumerPos,
+              CryptoLookup&& lookupCrypto = CryptoLookup{}) noexcept {
+        const int work = flushAcks_(ringProducerPos, ringConsumerPos, lookupCrypto);
         if ((directDeferredThisPass_ | directEp_.tag) != 0) [[unlikely]] directEpisode_();
         return work;
     }
@@ -277,7 +305,8 @@ public:
     }
 
 private:
-    int flushAcks_(int64_t ringProducerPos, int64_t ringConsumerPos) noexcept {
+    template <class CryptoLookup>
+    int flushAcks_(int64_t ringProducerPos, int64_t ringConsumerPos, CryptoLookup& lookupCrypto) noexcept {
         ++pass_;
         int work = unresolvedCount_ ? resolvePending_() : 0;
         if (drainCount_) [[unlikely]] work += drainRegistrations_();
@@ -308,8 +337,44 @@ private:
                 if (r->blockedPass != pass_) {                      // per-session order kept
                     const int32_t ver = clientVersion_[idx];
                     // D6 review M4: the pre-D6 38 B frame below clientVersion 2.
-                    const int64_t pos = policy_.claim(r->pub, rune::protocol::client::ProduceResponse::encodedSizeFor(ver),
-                                                      [&](uint8_t* dst) { encode_(a, ver, dst); });
+                    const RecordsSealCtx* sealCtx = lookupCrypto(a.sessionId);
+                    int64_t pos;
+                    if (sealCtx) [[unlikely]] {
+                        // Task 23: this session is ENCRYPTED — seal BEFORE
+                        // claiming (mirrors sendRecordsFrame's ordering
+                        // exactly: RecordsPush.h's file header explains why
+                        // the zero-copy in-claim encode cannot survive AEAD
+                        // sealing). `sealCtx->sendSeq` is the worker's ONE
+                        // shared per-session counter (the SAME one Records
+                        // sealing increments for this session, Worker.h Task
+                        // 19/23) — ++*sendSeq happens inside sealRecordsFrame,
+                        // so acks and Records draw from one monotonic
+                        // sequence under the one b2c key, never two.
+                        const std::size_t plainLen = rune::protocol::client::ProduceResponse::encodedSizeFor(ver);
+                        encode_(a, ver, ackPlainScratch_.data());
+                        const std::size_t n = sealRecordsFrame(*sealCtx, ackPlainScratch_.data(), plainLen,
+                                                               ackSealedScratch_.data(), ackSealedScratch_.size());
+                        if (n == 0) [[unlikely]] {
+                            // Fail-closed (G-A6 never-drop + Task 23 ★★): no
+                            // send key installed yet, or an AEAD seal error —
+                            // NEVER fall back to a plaintext claim. Hold this
+                            // ack exactly like a back-pressured one (retried
+                            // next pass, in order) without touching Lost/
+                            // blockedPass — a missing key is not an Aeron
+                            // connectivity signal.
+                            if (heldPass_[idx] != pass_) {
+                                heldPass_[idx] = pass_;
+                                heldNow_[heldNowCount_++] = a.sessionId;
+                            }
+                            acks_[keep++] = a;
+                            continue;
+                        }
+                        pos = policy_.claim(r->pub, n,
+                                            [&](uint8_t* dst) { std::memcpy(dst, ackSealedScratch_.data(), n); });
+                    } else {
+                        pos = policy_.claim(r->pub, rune::protocol::client::ProduceResponse::encodedSizeFor(ver),
+                                            [&](uint8_t* dst) { encode_(a, ver, dst); });
+                    }
                     if (pos > 0) [[likely]] {
                         if (const Edges& e = edges_[idx];
                             ((e.lost | e.reportedHeld) != 0) | ((e.dflags & (kDfDelivered | kDfExpiring)) != kDfDelivered))
@@ -765,12 +830,49 @@ private:
         return heldAfterFlush_ != 0 && heldPass_[i] == pass_ && (edges_[i].dflags & kDfDelivered) != 0 &&
                std::holds_alternative<PubReady>(states_[i]);
     }
-    /// MEDIUM-2: was `sid` closed here recently?  Cold: consulted only for a
-    /// frame whose session is not in the table.
-    [[nodiscard]] bool closedRecently_(int64_t sid) const noexcept {
-        const std::size_t n = closedNext_ < kClosedTombstones ? closedNext_ : kClosedTombstones;
-        for (std::size_t k = 0; k < n; ++k) if (closed_[k] == sid) return true;
-        return false;
+    /// MEDIUM-2: was `sid` closed here recently?  Consulted only for a frame
+    /// whose session is not in the table — one O(1) probe (lows batch C: was a
+    /// scan of every tombstone per frame, ~1k compares for each frame of a
+    /// closed client's backlog or of a not-yet-announced session).
+    [[nodiscard]] bool closedRecently_(int64_t sid) const noexcept { return tombFind_(sid) != kNone; }
+    static std::size_t tombHash_(int64_t sid) noexcept {
+        return static_cast<std::size_t>((static_cast<uint64_t>(sid) * 0x9E3779B97F4A7C15ULL) >> (64 - kTombBits));
+    }
+    std::size_t tombFind_(int64_t sid) const noexcept {
+        for (std::size_t i = tombHash_(sid);; i = (i + 1) & kTombMask) {   // load <= 1/2: always an empty slot
+            if (tombSet_[i] == 0)   return kNone;
+            if (tombSet_[i] == sid) return i;
+        }
+    }
+    /// Remember a closed session (FIFO): when full, the oldest tombstone is
+    /// evicted from the set first.  A session closed again (re-announced in
+    /// between) keeps its older tombstone.
+    void tombstone_(int64_t sid) noexcept {
+        if (tombFind_(sid) != kNone) return;
+        if (tombCount_ == kClosedTombstones) {
+            tombErase_(tombFind_(closed_[tombHead_]));
+            tombHead_ = (tombHead_ + 1) & (kClosedTombstones - 1);
+            --tombCount_;
+        }
+        closed_[(tombHead_ + tombCount_) & (kClosedTombstones - 1)] = sid;
+        ++tombCount_;
+        std::size_t i = tombHash_(sid);
+        while (tombSet_[i] != 0) i = (i + 1) & kTombMask;
+        tombSet_[i] = sid;
+    }
+    void tombErase_(std::size_t i) noexcept {                        // backward-shift deletion
+        if (i == kNone) [[unlikely]] return;                         // unreachable: ring and set agree
+        tombSet_[i] = 0;
+        for (std::size_t j = i;;) {
+            j = (j + 1) & kTombMask;
+            if (tombSet_[j] == 0) return;
+            const std::size_t home = tombHash_(tombSet_[j]);
+            const bool stays = (i <= j) ? (i < home && home <= j) : (i < home || home <= j);
+            if (stays) continue;
+            tombSet_[i] = tombSet_[j];
+            tombSet_[j] = 0;
+            i = j;
+        }
     }
     void markDirty_(std::size_t idx) noexcept {
         if (edges_[idx].dirty) return;
@@ -908,6 +1010,9 @@ private:
     static constexpr uint8_t kDfExpiring        = 2;   ///< chosen for expiry; the runtime's close is awaited
     static constexpr uint8_t kDfReadSinceChosen = 4;   ///< claimed an ack after it was chosen (LOW-1: cancel)
     static_assert(std::has_single_bit(kClosedTombstones));
+    static constexpr std::size_t kTombSlots = 2 * kClosedTombstones;   // load factor <= 1/2
+    static constexpr std::size_t kTombMask  = kTombSlots - 1;
+    static constexpr int         kTombBits  = std::countr_zero(kTombSlots);
     std::array<Edges, kMaxSessions>                                  edges_{};
     std::array<int32_t, kMaxSessions>                                clientVersion_{}; // D6: per session
     std::array<int64_t, kMaxSessions>                                dirty_{};         // edges to report
@@ -929,6 +1034,18 @@ private:
     std::size_t                                                      freeChanCount_ = 0;
     std::array<AckEntry, kAckCapacity>                               acks_{};
     std::size_t                                                      ackCount_ = 0;
+    // Task 23: fixed scratch for the ENCRYPTED ack-seal path (flushAcks_'s
+    // seal branch). Unlike Records (RecordsSealScratch, a GROW-ONCE vector —
+    // batches are unbounded), a ProduceResponse has a compile-time-bounded
+    // max size (ENCODED_SIZE, 46 B — no record batch), so a fixed
+    // std::array is strictly simpler than grow-once here and still Rule-4
+    // zero-allocation (no vector, no resize, ever). One instance per sink
+    // (one per worker — shared-nothing); reused for every sealed ack, one at
+    // a time (the seal result is consumed synchronously before the next ack
+    // is processed, never held across iterations).
+    std::array<uint8_t, rune::protocol::client::ProduceResponse::ENCODED_SIZE>                     ackPlainScratch_{};
+    std::array<uint8_t, rune::protocol::client::ProduceResponse::ENCODED_SIZE +
+                             rune::protocol::client::kCryptoOverhead>                               ackSealedScratch_{};
     std::size_t                                                      heldAfterFlush_ = 0;
     std::size_t                                                      unreported_ = 0;
     uint64_t                                                         pass_    = 0;
@@ -950,8 +1067,9 @@ private:
     uint64_t                                                         directUnderflows_ = 0;
     uint64_t                                                         directDroppedClosed_ = 0;
     uint64_t                                                         directExpiryCancels_ = 0;
-    std::array<int64_t, kClosedTombstones>                           closed_{};        // MEDIUM-2 tombstones
-    std::size_t                                                      closedNext_ = 0;
+    std::array<int64_t, kClosedTombstones>                           closed_{};        // MEDIUM-2 tombstones (FIFO)
+    std::size_t                                                      tombHead_ = 0, tombCount_ = 0;
+    std::array<int64_t, kTombSlots>                                  tombSet_{};       // the same ids, O(1) lookup
 };
 
 /// Production policy: the worker's own invoker-mode Aeron client (spec §3.1).

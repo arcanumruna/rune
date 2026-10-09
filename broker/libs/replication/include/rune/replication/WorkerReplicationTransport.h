@@ -438,10 +438,11 @@ private:
         bool                                         blocked = false;   // shard plane refusal
     };
     static constexpr std::size_t kMaxPeers = FollowerSlots::kMaxReplicas;
-    // LOW-7: one outstanding broker request per peer always fits the request
-    // ring (ControlRing<1024>: 1024 / 24-byte records = 42), so requestAdd never
-    // fails for capacity.
-    static_assert(kMaxPeers <= 1024 / 24, "PubAddBroker request ring must hold one request per peer");
+    // LOW-7: the outstanding broker requests per peer — at most one kRelease +
+    // one kAdd (D24(b) IP-change re-add) — always fit the request ring
+    // (ControlRing<1024>: 1024 / 24-byte records = 42), so requestAdd never
+    // fails for capacity (a full ring on release keeps the stale pub; retried).
+    static_assert(2 * kMaxPeers <= 1024 / 24, "PubAddBroker request ring must hold two requests per peer");
 
     [[nodiscard]] aeron::ExclusivePublication* findPub_(rune::replication::NodeId id) const noexcept
     {
@@ -472,8 +473,9 @@ private:
         if (retry) ++reAdds_;
         r.addGen = inbox_.generation(r.hostIdx);
         cold_[r.slot].boundKnown = inbox_.addressOf(r.hostIdx, cold_[r.slot].boundIp);
-        if (broker_ != nullptr) {
-            r.regId = broker_->requestAdd(pubs_[r.slot].id) ? kBrokered : kWaiting;
+        if (broker_ != nullptr) {   // D24(b): on the numeric address this inbox holds
+            r.regId = broker_->requestAdd(pubs_[r.slot].id, cold_[r.slot].boundIp, cold_[r.slot].boundKnown)
+                          ? kBrokered : kWaiting;
             return;
         }
         const auto aeron = aeron_.lock();
@@ -511,10 +513,9 @@ private:
         // An add still in flight is never superseded (the Aeron client releases
         // only a publication it has FOUND): once it completes on a stale
         // address, the hub's next confirmation (~1 s) re-adds it here.  Legacy
-        // planes (broker_) are left to the control thread: releasing their pub
-        // here would take the node client's admin lock on the worker (backlog).
-        // Cold path.
-        if (broker_ != nullptr) return;
+        // planes (broker_, D24(b)): the stale pub is handed to the control
+        // thread to drop (releasing it here would take the node client's admin
+        // lock on the worker) and the re-add is made there too.  Cold path.
         for (std::size_t i = 0; i < pubCount_; ++i) {
             PeerCold& c = cold_[i];
             if (c.hostIdx != idx || !pubs_[i].pub) continue;
@@ -529,7 +530,14 @@ private:
             } catch (...) {
                 continue;   // allocation failure: keep the (stale) pub; retried on the next confirmation
             }
-            pubs_[i].pub.reset();
+            if (broker_ != nullptr) {
+                if (!broker_->release(pubs_[i].pub)) {   // ring full: keep the stale pub, retried next confirmation
+                    resolving_.pop_back();
+                    continue;
+                }
+            } else {
+                pubs_[i].pub.reset();
+            }
             allResolved_ = false;
             addNow_(resolving_.back(), /*retry=*/true);
         }

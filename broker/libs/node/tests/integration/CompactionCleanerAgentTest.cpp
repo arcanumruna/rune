@@ -3293,7 +3293,7 @@ TEST(CompactionCleanerAgentRegression, DivergenceTruncationDefersToTruncatePendi
     follower.becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
     // An accepted compaction output whose renames are still posted.
     {
-        const auto snap = log.sealedSegmentSnapshot();
+        const auto snap = log.ownerSealedSnapshot();
         const int64_t b = (*snap)[1].baseOffset;   // segment 2 = [2,4)
         std::filesystem::copy_file(log.segmentForTest(b)->logPath(), Log::cleanedLogPath(log.dir(), b, 51));
         std::string idx = log.segmentForTest(b)->logPath();
@@ -3360,7 +3360,7 @@ TEST(CompactionCleanerAgentRegression, TruncatePendingFollowerPostsNoNewCleanerW
     }
     // One posted file op pending: the divergence truncation defers.
     {
-        const auto snap = log.sealedSegmentSnapshot();
+        const auto snap = log.ownerSealedSnapshot();
         ASSERT_TRUE(log.enqueueDeletedSegment((*snap)[0].baseOffset, (*snap)[0].lineage));
         ASSERT_EQ(follower.drainRetentionDeletesOnOwner(), 1);
         ASSERT_TRUE(log.cleanerFileOpsPending());
@@ -3378,7 +3378,7 @@ TEST(CompactionCleanerAgentRegression, TruncatePendingFollowerPostsNoNewCleanerW
     for (int pass = 0; pass < 50 && follower.truncatePendingForTest(); ++pass) {
         (void)follower.doWork(t += 1'000'000);
         (void)log.runCleanerFileOps(0);
-        const auto snap = log.sealedSegmentSnapshot();
+        const auto snap = log.ownerSealedSnapshot();
         if (!snap->empty()) (void)log.enqueueDeletedSegment((*snap)[0].baseOffset, (*snap)[0].lineage);
         (void)follower.drainRetentionDeletesOnOwner();
     }
@@ -3414,7 +3414,7 @@ TEST(CompactionCleanerAgentRegression, TruncateOfOtherLogCompletesDuringThrottle
     PartitionReplica* B = ownedB.get();
     B->becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
     {
-        const auto snap = logB.sealedSegmentSnapshot();
+        const auto snap = logB.ownerSealedSnapshot();
         const int64_t b = (*snap)[1].baseOffset;
         std::filesystem::copy_file(logB.segmentForTest(b)->logPath(), Log::cleanedLogPath(logB.dir(), b, 61));
         std::string idx = logB.segmentForTest(b)->logPath();

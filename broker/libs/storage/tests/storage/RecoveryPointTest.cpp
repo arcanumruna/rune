@@ -389,7 +389,7 @@ TEST(RecoveryPointRegression, CleanerNeverCompactsAboveRecoveryPoint) {
     completeFrontSeal(*log);            // seg1 durable in memory, NOT persisted
     EXPECT_EQ(log->recoveryPoint(), bases[2]);
 
-    const auto snap = log->sealedSegmentSnapshot();
+    const auto snap = log->ownerSealedSnapshot();
     ASSERT_EQ(snap->size(), bases.size() - 1);
     EXPECT_TRUE(log->cleanerCompactionAllowedThrough((*snap)[0].endOffset));
     EXPECT_FALSE(log->cleanerCompactionAllowedThrough((*snap)[1].endOffset)) << "seg1 ends above the persisted R";
