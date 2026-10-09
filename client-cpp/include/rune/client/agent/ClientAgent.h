@@ -615,6 +615,9 @@ public:
     }
     /// T15b: the seed session's machine (read-only; duty thread only).
     [[nodiscard]] const session::SessionMachine& seedMachine() const noexcept { return seedSession().machine; }
+    /// A7 park-until-work: the invoker driver's socket-readiness fds (AeronTransport::wakeFds) — the
+    /// production accessor behind Client::wakeFds (review L5: not through the testTransport() seam).
+    [[nodiscard]] int wakeFds(int* out, int max) const noexcept { return transport_.wakeFds(out, max); }
     /// Test hook (T15a): read-only access to the transport's thread-model observers.
     [[nodiscard]] const transport::AeronTransport& testTransport() const noexcept { return transport_; }
     /// Test hook (T15a fix1): retarget the seed's default ingress publication, as

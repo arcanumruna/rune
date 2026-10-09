@@ -549,7 +549,8 @@ TEST(InvokerTransportWake, ThreadModeExposesNoWakeFds) {
     t.stop();
 }
 
-TEST(InvokerTransportWakeRegression, ParkedOwnerWakesOnInboundDatagram) {
+// A7 re-review LOW-2: coverage (the wake worked before the C1 fix) — not a regression test.
+TEST(InvokerTransportWake, ParkedOwnerWakesOnInboundDatagram) {
 #if !defined(__linux__)
     GTEST_SKIP() << "driver wake fds are Linux-only (Aeron's transport pollers use epoll there)";
 #else
@@ -611,6 +612,17 @@ TEST(InvokerTransportEpollPoll, InstalledWhereSupportedAndConfigured) {
     s.stop();
 }
 
+// A7 review L2: epoll-first polling reads Aeron internals — pinned to the verified release.  An Aeron upgrade
+// fails HERE (re-verify rune_driver_wake.c against the new poller / bindings layout, then move the pin); at
+// runtime any other release keeps the stock polling.
+TEST(InvokerTransportEpollPoll, AeronIsTheReleaseEpollFirstWasVerifiedAgainst) {
+    EXPECT_TRUE(Transport::epollPollSupportsAeron(aeron_version_major(), aeron_version_minor(), aeron_version_patch()))
+        << "runtime Aeron " << aeron_version_full() << " is not the epoll-first pin";
+    EXPECT_FALSE(Transport::epollPollSupportsAeron(1, 42, 0));
+    EXPECT_FALSE(Transport::epollPollSupportsAeron(1, 41, 5));
+    EXPECT_FALSE(Transport::epollPollSupportsAeron(2, 41, 4));
+}
+
 // A7 review C1: publications to a peer that is down (closed port, host up) get ICMP port-unreachable on their
 // CONNECTED send sockets; the kernel parks the error (EPOLLERR without EPOLLIN).  Epoll-first polling must consume
 // it in the pass, or the owner parked on wakeFds() wakes at once forever (100% CPU while a broker node is down).
@@ -656,8 +668,13 @@ TEST(InvokerTransportWakeRegression, PeerDownNeverLeavesWakeFdsReadyAfterAnIdleP
         const timespec zero{0, 0};
         return ::ppoll(pf, static_cast<nfds_t>(n), &zero, nullptr) > 0;
     };
+    // A7 re-review LOW-1: the positive control — an ICMP error was actually pending at least once (a wake fd
+    // readable between passes: the only readiness these send-only sockets can have).  Without it the quiet-park
+    // assertions below would pass vacuously if setup frames / ICMP stopped (an Aeron upgrade, a sysctl, a route).
+    int pendingSeen = 0;
     for (int round = 0; round < 3; ++round) {
-        (void)pumpFor(t, std::chrono::milliseconds(350), wakeReady);   // an ICMP error pending, or >= 3 setups
+        // an ICMP error pending, or 350 ms (>= 3 setup frames per publication)
+        if (pumpFor(t, std::chrono::milliseconds(350), wakeReady)) ++pendingSeen;
         ASSERT_TRUE(pumpFor(t, std::chrono::seconds(5), [&] { return t.dutyCycle() == 0; }));
         pollfd pf[4];
         for (int i = 0; i < n; ++i) pf[i] = pollfd{fds[i], POLLIN, 0};
@@ -666,13 +683,19 @@ TEST(InvokerTransportWakeRegression, PeerDownNeverLeavesWakeFdsReadyAfterAnIdleP
             << "round " << round << ": wake fd left ready by an unconsumed EPOLLERR";
     }
     t.stop();
+    // Some network namespaces (Docker bridge / container CI) never deliver the port-unreachable error to the
+    // sender — that environment cannot exercise the path, so it SKIPS (loudly) instead of passing vacuously.
+    if (pendingSeen == 0)
+        GTEST_SKIP() << "no ICMP port-unreachable error was ever pending in this network namespace — "
+                        "the peer-down path cannot be exercised here";
 #endif
 }
 
 // Review M2: a client driver whose receiver poller holds > 1 UDP transport (the egress subscription plus two
 // more) delivers everything AND the epoll-first branch demonstrably ran (an epoll_wait selected a socket); the
 // stock arm delivers the same without it.
-TEST(InvokerTransportEpollPollRegression, MultiTransportReceiverDeliversThroughEpollFirstRegression) {
+// A7 re-review LOW-2: coverage (delivery worked before the fix) — not a regression test.
+TEST(InvokerTransportEpollPoll, MultiTransportReceiverDeliversThroughEpollFirst) {
     for (bool epoll : {true, false}) {
         const uint16_t p0 = closedUdpPort(), p1 = closedUdpPort(), p2 = closedUdpPort();
         const std::string c0 = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(p0);
