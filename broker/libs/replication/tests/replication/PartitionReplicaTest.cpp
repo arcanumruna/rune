@@ -14,6 +14,7 @@
 #include <gtest/gtest.h>
 
 #include <rune/replication/PartitionReplica.h>
+#include <rune/storage/testing/ScopedNoDacOverride.h>
 #include <rune/replication/PartitionFailoverCoordinator.h>
 #include <rune/replication/FileRecordingStore.h>
 #include <rune/replication/IsrManager.h>
@@ -4820,11 +4821,15 @@ TEST(InternalIsrRegression, DirectoryFsyncFailureIsNotAcked) {
     InternalIsrKnowledge k(dir + "/internal-isr.state");
     // write+search but no read: files can be created/renamed in it, but the
     // directory cannot be opened for the fsync.
-    std::filesystem::permissions(dir, std::filesystem::perms::owner_write | std::filesystem::perms::owner_exec);
     InternalIsrState a{};
     a.topicId = -3; a.partition = 0; a.leaderEpoch = 1; a.version = 1; a.count = 1; a.members[0] = 1;
-    const bool ok = k.offer(a);
-    std::filesystem::permissions(dir, std::filesystem::perms::owner_all);
+    bool ok = false;
+    {
+        rune::storage::testing::ScopedNoDacOverride asNonRoot;   // root ignores the chmod otherwise
+        std::filesystem::permissions(dir, std::filesystem::perms::owner_write | std::filesystem::perms::owner_exec);
+        ok = k.offer(a);
+        std::filesystem::permissions(dir, std::filesystem::perms::owner_all);
+    }
     EXPECT_FALSE(ok) << "acked a state whose directory entry was never fsynced";
     EXPECT_EQ(k.latest(-3, 0), nullptr);
 }

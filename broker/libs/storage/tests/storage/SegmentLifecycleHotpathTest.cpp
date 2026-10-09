@@ -18,6 +18,7 @@
 // Every test here is a regression test (name contains "Regression").
 #include <gtest/gtest.h>
 #include <rune/storage/testing/DemandChannelForTest.h>
+#include <rune/storage/testing/ScopedNoDacOverride.h>
 #include <rune/storage/Log.h>
 #include <rune/storage/MappedFile.h>
 #include <fcntl.h>
@@ -617,9 +618,12 @@ TEST(SegmentLifecycleRegression, ProvisionerFailureThenInlineFailureFailsTheLogR
         log.setProvisionFaultForTest(EACCES, 1);
         (void)log.provisionReady(1);
         // The directory becomes unwritable: the inline create fails as well.
-        fs::permissions(dir, fs::perms::owner_read | fs::perms::owner_exec);
-        EXPECT_THROW((void)put(log, off), std::exception);
-        fs::permissions(dir, fs::perms::owner_all);
+        {
+            rune::storage::testing::ScopedNoDacOverride asNonRoot;   // root ignores the chmod otherwise
+            fs::permissions(dir, fs::perms::owner_read | fs::perms::owner_exec);
+            EXPECT_THROW((void)put(log, off), std::exception);
+            fs::permissions(dir, fs::perms::owner_all);
+        }
         EXPECT_TRUE(log.storageFailed()) << "a failed inline create fails the log (E1 fail-stop)";
     }
     fs::remove_all(dir);
