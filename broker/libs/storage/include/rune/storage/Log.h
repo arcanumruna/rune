@@ -208,7 +208,12 @@ public:
     /// view rather than throwing — see LogSegment::readView.
     LogReadView readView(int64_t startOffset, int32_t maxBytes) noexcept;
     /// #65: LogSegment::readInto on the segment holding startOffset (pread into
-    /// `buf`; never counted as a readView, never maps).
+    /// `buf`; never counted as a readView, never maps).  D26: an Absent answer
+    /// (a compacted tail gap of a sealed segment) continues at the next
+    /// segment, so a cursor in the gap advances.  See LogSegment::readInto.
+    LogReadView readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
+                         ReadIntoStatus& st, int64_t boundOffset = INT64_MAX, int* errOut = nullptr) noexcept;
+    /// Same; `firstTooLarge` = (st == FirstTooLarge).
     LogReadView readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
                          bool& firstTooLarge) noexcept;
 
@@ -485,6 +490,8 @@ public:
     /// Tests (re-review N2): force the count-based re-request on the next need.
     void expireReadMapRequestForTest() noexcept { growWaits_ = 1u << 30; }
     [[nodiscard]] uint64_t readMapGrowthsForTest() const noexcept { return readMapGrowths_; }
+    /// D26: read-map growth requests posted (each one an off-owner mmap).
+    [[nodiscard]] uint64_t readMapGrowRequestsForTest() const noexcept { return readMapGrowRequests_; }
     [[nodiscard]] uint64_t readMapGrowthFailuresForTest() const noexcept { return readMapGrowthFailures_; }
     /// Cleaner-thread fsyncs / directory fsyncs (retention log-start
     /// checkpoints, posted renames).  Read only after the cleaner stopped.
@@ -1051,10 +1058,12 @@ private:
     MapRing  mapRing_;                    ///< provisioner → owner: grown mappings
     bool     asyncReadGrowth_ = false;
     bool     growOutstanding_ = false;
+    bool     mapReaders_ = false;         ///< D26: readView was ever called (owner; sticky)
     int64_t  growBase_ = -1;
     uint64_t growGen_ = 0;
     uint32_t growWaits_ = 0;
     uint64_t readMapGrowths_ = 0, readMapGrowthFailures_ = 0, readMapsDiscarded_ = 0, ownerFallbackRemaps_ = 0;
+    uint64_t readMapGrowRequests_ = 0;   ///< D26: growth requests posted to the provisioner
     uint64_t readMapsRetiredAtSeal_ = 0;   ///< D30
     void retireSealedReadMap_(int64_t base, LogSegment& seg) noexcept;
     void disposeReadMap_(std::unique_ptr<MappedFile> m) noexcept;

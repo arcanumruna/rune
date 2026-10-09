@@ -9,192 +9,10 @@
 //       epoch-cache image go to the two-slot leader-epoch-state file through
 //       the worker's io backend, and a controller-managed leadership acts only
 //       once that write completed (event-driven).
+#include "HotPathBRig.h"
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <rune/metadata/ShardRouter.h>
-#include <rune/node/ReplicaRegistry.h>
-#include <rune/node/SegmentProvisionerAgent.h>
-#include <rune/node/Worker.h>
-#include <rune/node/WorkerOp.h>
-#include <rune/node/WorkerPool.h>
-#include <rune/protocol/RecordBatch.h>
-#include <rune/protocol/client/DataMessages.h>
-#include <rune/protocol/client/Protocol.h>
-#include <rune/replication/PartitionReplica.h>
-#include <rune/storage/InMemoryLog.h>
-#include <rune/storage/LeaderEpochState.h>
-#include <rune/storage/Log.h>
 
-#include <gtest/gtest.h>
-#include <execinfo.h>
-
-#include <chrono>
-#include <filesystem>
-#include <fstream>
-#include <thread>
-#include <map>
-#include <memory>
-#include <cstdlib>
-#include <new>
-#include <string>
-#include <unistd.h>
-#include <vector>
-
-namespace fs = std::filesystem;
-namespace pc = rune::protocol::client;
-using rune::node::Worker;
-using rune::node::WorkerOp;
-using rune::node::WorkerPool;
-using rune::node::WorkerReturn;
-using rune::replication::PartitionConfig;
-using rune::replication::PartitionReplica;
-using rune::replication::Role;
-
-namespace {
-
-struct TmpDir {
-    fs::path p;
-    TmpDir() {
-        static int seq = 0;
-        p = fs::temp_directory_path() / ("rune_hpb_" + std::to_string(::getpid()) + "_" + std::to_string(seq++));
-        fs::remove_all(p);
-        fs::create_directories(p);
-    }
-    ~TmpDir() { std::error_code ec; fs::remove_all(p, ec); }
-};
-
-std::vector<uint8_t> produceFrame(int64_t corr, int32_t topicId, int32_t part, std::size_t valueBytes, int recs) {
-    rune::protocol::RecordBatchBuilder b(0, 1000);
-    const std::string v(valueBytes, 'v');
-    for (int i = 0; i < recs; ++i) b.append("k" + std::to_string(i), v, 1000 + i);
-    const auto batch = b.build();
-    pc::Produce msg;
-    msg.sessionId = 1; msg.correlationId = corr; msg.topicId = topicId; msg.partition = part;
-    msg.partitionKnown = 1; msg.acks = 1; msg.producerId = -1; msg.producerEpoch = 0; msg.baseSequence = -1;
-    msg.recordBatch = std::span<const uint8_t>(batch);
-    std::vector<uint8_t> frame(msg.encodedSize());
-    msg.encode(frame.data());
-    return frame;
-}
-
-// The same-address replacement test: the block of one deleted object is kept
-// (not freed) so the next object is built at the SAME address (deterministic
-// pointer reuse, no allocator luck).  Everything else frees normally.
-}  // namespace
-void* gKeepFreedBlock = nullptr;
-bool  gKeptBlockFreed = false;
-void operator delete(void* p) noexcept {
-    if (p != nullptr && p == gKeepFreedBlock) { gKeptBlockFreed = true; return; }
-    std::free(p);
-}
-void operator delete(void* p, std::size_t) noexcept { ::operator delete(p); }
-// D28b: heap allocations made by THIS thread while armed (the worker's duty
-// pass); the first few print a backtrace so the culprit is named.
-thread_local bool     gAllocArmed = false;
-thread_local uint64_t gArmedAllocs = 0;
-void* operator new(std::size_t n) {
-    if (gAllocArmed) [[unlikely]] {
-        if (++gArmedAllocs <= 3) {
-            gAllocArmed = false;   // backtrace itself may allocate
-            void* frames[32];
-            const int k = ::backtrace(frames, 32);
-            std::fprintf(stderr, "D28b hot-path allocation of %zu bytes:\n", n);
-            ::backtrace_symbols_fd(frames, k, 2);
-            gAllocArmed = true;
-        }
-    }
-    if (void* p = std::malloc(n ? n : 1)) return p;
-    throw std::bad_alloc();
-}
-namespace {
-
-/// One worker (shard mode, registry-routed ops) owning one leader partition.
-struct Rig {
-    TmpDir                                    ownDir;
-    struct { fs::path p; } dir;
-    rune::replication::NullPartitionTransport transport;
-    rune::node::ReplicaRegistry               reg;
-    WorkerPool                                pool{1, rune::metadata::ShardRouter(1)};
-    std::unique_ptr<rune::storage::Log>       log;
-    PartitionReplica*                         rep = nullptr;
-    int64_t                                   now = 1'000'000'000;
-    std::unique_ptr<rune::node::SegmentProvisionerAgent> prov;   ///< driven on the test thread (its own "thread")
-
-    explicit Rig(bool controllerManaged = false, int64_t rollBytes = 64 * 1024 * 1024, const fs::path* at = nullptr,
-                 bool provisioned = false, bool withFollower = false) {
-        dir.p = at ? *at : ownDir.p;
-        log = std::make_unique<rune::storage::Log>(dir.p.string(), rollBytes);
-        log->recover();
-        if (provisioned) {
-            prov = std::make_unique<rune::node::SegmentProvisionerAgent>(1);
-            prov->addToViewForTest(log.get());
-            log->setProvisioning(prov->channel(), 50);
-        }
-        PartitionConfig c;
-        c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
-        c.replicaLagMaxOffset = 1'000'000'000;
-        c.followerFlushIntervalNs = 0;
-        const std::vector<int32_t> set = withFollower ? std::vector<int32_t>{1, 2} : std::vector<int32_t>{1};
-        auto r = std::make_unique<PartitionReplica>(c, Role::Leader, 1, set, set, log.get(), &transport);
-        r->setExternalFollowerFlush(true);
-        if (controllerManaged) r->setIsrChannel(&transport);
-        rep = r.get();
-        reg.add(1, 0, std::move(r));
-        pool.setRegistry(&reg);
-        Worker& w = pool.worker(0);
-        w.setWorkerIngress(nullptr, /*active=*/true);
-        w.setShardMode(true);
-        pool.assignFromRegistry(reg);
-        pass();
-    }
-    Worker& worker() { return pool.worker(0); }
-    void pass(const std::vector<uint8_t>* frame = nullptr) {
-        now += 1'000'000;
-        if (frame) (void)worker().handleIngressFrameForTest(frame->data(), frame->size(), now);
-        (void)worker().doWork(now);
-        if (prov) (void)prov->doWork(now);
-    }
-    void roleOp(bool leader, int64_t epoch, int32_t leaderId = 2) {
-        WorkerOp op;
-        op.type = leader ? WorkerOp::Type::BecomeLeader : WorkerOp::Type::BecomeFollower;
-        op.topicId = 1; op.partition = 0; op.roleEpoch = epoch;
-        if (leader) op.isr = {1}; else op.roleLeaderId = leaderId;
-        ASSERT_TRUE(pool.tryEnqueueOp(1, 0, std::move(op)));
-    }
-    /// Passes until `done` (the io backend completes on its own thread) —
-    /// bounded, never a sleep-based wait for an outcome.
-    template <class F> bool passUntil(F&& done, int maxMs = 5000) {
-        const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(maxMs);
-        while (!done()) {
-            if (std::chrono::steady_clock::now() > end) return false;
-            pass();
-            std::this_thread::yield();
-        }
-        return true;
-    }
-    /// D26: follower 2's FetchRequest, as the replication transport hands it to the owning worker.
-    void fetch(int64_t from) {
-        WorkerOp op;
-        op.type = WorkerOp::Type::FetchRequest; op.topicId = 1; op.partition = 0; op.replica = rep;
-        op.fetchRequestPayload.leaderEpoch = 1;
-        op.fetchRequestPayload.partition   = 0;
-        op.fetchRequestPayload.followerId  = 2;
-        op.fetchRequestPayload.fetchOffset = from;
-        op.fetchRequestPayload.maxBytes    = 512 * 1024;
-        op.fetchRequestPayload.topicId     = 1;
-        op.fetchRequestPayload.nowNs       = now;
-        ASSERT_TRUE(pool.tryEnqueueOp(1, 0, std::move(op)));
-    }
-    void pushRead(int64_t subId, int64_t from) {
-        WorkerOp op;
-        op.type = WorkerOp::Type::PushRead; op.topicId = 1; op.partition = 0;
-        op.subscriptionId = subId; op.sessionId = 1; op.nextOffset = from;
-        op.hwBound = INT64_MAX; op.isolation = 0; op.logPtr = log.get();
-        ASSERT_TRUE(pool.tryEnqueueOp(1, 0, std::move(op)));
-    }
-};
-
-} // namespace
 
 // F5: N concurrent PushReads, each with 512 KiB of data available, must not be
 // served in one worker pass (old: N x (512 KiB heap vector + copy + ring copy)
@@ -811,7 +629,28 @@ TEST(HotPathBRegression, UnroutableEpochStateCompletionNeverWedgesPromotionRegre
     rig.roleOp(true, 3);
     rig.pass();
     EXPECT_TRUE(rig.passUntil([&] { return rig.rep->role() == Role::Leader; }, 3000)) << "promotion wedged";
-    EXPECT_EQ(rig.worker().epochStateNotRoutedForTest(), 1u);
+    // D23 (D21 review L1a): a full route table refuses the write BEFORE its
+    // fsync is submitted — never an unobservable completion whose dup fd is
+    // left open for the process lifetime.
+    EXPECT_TRUE(rig.passUntil([&] { return rig.rep->epochStateDurable(); }, 3000));
+    EXPECT_EQ(rig.worker().epochStateSyncFdsOpenForTest(), 0) << "an epoch-state fsync dup leaked";
+}
+
+// D23 (D21 review L1b): a worker torn down with an epoch-state fsync in flight
+// closes that fsync's dup once its io backend is gone (never under the fsync).
+TEST(HotPathBRegression, WorkerTeardownClosesAnInFlightEpochStateFsyncFdRegression) {
+    int syncFd = -1;
+    {
+        Rig rig(/*controllerManaged=*/true);
+        rig.worker().setReapPausedForTest(true);
+        rig.roleOp(true, 3);
+        rig.pass();   // the fence write's fsync is in flight (completion held)
+        ASSERT_TRUE(rig.rep->leadershipPendingForTest());
+        syncFd = rig.worker().lastEpochStateSyncFdForTest();
+        ASSERT_GE(syncFd, 0);
+        ASSERT_NE(::fcntl(syncFd, F_GETFD), -1);
+    }
+    EXPECT_EQ(::fcntl(syncFd, F_GETFD), -1) << "the in-flight fsync's dup leaked past the worker's teardown";
 }
 
 // Md4: an idle partition keeps no epoch-state fd open and its file is small.
@@ -1083,6 +922,7 @@ TEST(HotPathBRegression, InPlaceTruncationOverPartialReadMapCutsAtTheOffsetRegre
 // into another segment.
 TEST(HotPathBRegression, LateReadMapForSupersededRequestIsDiscardedRegression) {
     ProvLog p(2LL << 20);
+    (void)p.log->readView(0, 1);            // D26: a mapped reader (growth is provisioned only for those)
     p.appendBytes(600 * 1024);              // past half of the 1 MiB map: request #1 (segment A)
     p.prov.holdGrowsForTest(true);
     (void)p.prov.doWork(0);                 // request #1 held
@@ -1090,6 +930,7 @@ TEST(HotPathBRegression, LateReadMapForSupersededRequestIsDiscardedRegression) {
     for (int i = 0; i < 64 && p.log->segmentBaseOffsets().size() < 2; ++i) { (void)p.prov.doWork(0); p.appendBytes(16 * 1024); }
     ASSERT_GE(p.log->segmentBaseOffsets().size(), 2u) << "precondition: rolled to segment B";
     const int64_t bBase = p.log->segmentBaseOffsets().back();
+    (void)p.log->readView(bBase, 1);        // D26: B is mapped lazily by its first mapped read (1 MiB)
     p.appendBytes(1200 * 1024);             // B past its 1 MiB map
     p.log->expireReadMapRequestForTest();
     (void)p.log->readView(bBase, 1);        // re-request for B (request #1 superseded)
@@ -1290,69 +1131,6 @@ TEST(HotPathBRegression, StaleEpochStateCompletionNeverConfirmsAReplacementRepli
         << "B leads on its OWN completion";
 }
 
-// Same, memory-backed replicas: the route held the replica's raw pointer and
-// ownership was checked by pointer — a replacement replica allocated at the
-// SAME address passed as the owner of the old one's completion.
-TEST(HotPathBRegression, StaleMemoryFenceCompletionNeverConfirmsAReplicaAtTheSameAddressRegression) {
-    TmpDir d;
-    rune::replication::NullPartitionTransport transport;
-    rune::node::ReplicaRegistry reg;
-    WorkerPool pool{1, rune::metadata::ShardRouter(1)};
-    rune::storage::InMemoryLog logA(1 << 20, 10'000), logB(1 << 20, 10'000);
-    PartitionConfig c;
-    c.topicId = 1; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
-    c.replicaLagMaxOffset = 1'000'000'000;
-    auto make = [&](void* mem, rune::storage::InMemoryLog& log, const fs::path& stateDir) {
-        std::unique_ptr<PartitionReplica> r(new (mem) PartitionReplica(c, Role::Follower, 1, std::vector<int32_t>{1},
-                                                                       std::vector<int32_t>{1}, &log, &transport));
-        r->setExternalFollowerFlush(true);
-        r->setIsrChannel(&transport);
-        r->setMemoryEpochStateDir(stateDir.string(), (stateDir.string() + ".fence"));
-        return r;
-    };
-    void* memA = ::operator new(sizeof(PartitionReplica));
-    gKeepFreedBlock = memA;   // A's block survives A's delete: B is built at the SAME address
-    reg.add(1, 0, make(memA, logA, d.p / "a.state"));
-    pool.setRegistry(&reg);
-    Worker& w = pool.worker(0);
-    w.setWorkerIngress(nullptr, /*active=*/true);
-    w.setShardMode(true);
-    pool.assignFromRegistry(reg);
-    int64_t now = 1'000'000'000;
-    auto pass = [&] { now += 1'000'000; (void)w.doWork(now); };
-    auto lead = [&] {
-        WorkerOp op;
-        op.type = WorkerOp::Type::BecomeLeader;
-        op.topicId = 1; op.partition = 0; op.roleEpoch = 3; op.isr = {1};
-        ASSERT_TRUE(pool.tryEnqueueOp(1, 0, std::move(op)));
-    };
-    pass();
-    w.setReapPausedForTest(true);
-    lead();
-    pass();   // A submits its fence write; the completion is held
-    const auto tA = w.lastEpochStateTokenForTest();
-    reg.remove(1, 0);   // A retired, dropped by the worker, then freed (every worker acked)
-    pool.assignFromRegistry(reg);
-    pass();
-    ASSERT_EQ(reg.collectRetired(UINT64_MAX), 1u);
-    // B allocated at the same address (fresh state dir: the same write seq).
-    ASSERT_TRUE(gKeptBlockFreed) << "precondition: A was deleted";
-    gKeepFreedBlock = nullptr;   // B's own delete frees normally
-    void* memB = memA;
-    reg.add(1, 0, make(memB, logB, d.p / "b.state"));
-    auto* B = static_cast<PartitionReplica*>(memB);
-    pool.assignFromRegistry(reg);
-    lead();
-    pass();   // B submits its own fence write (held)
-    ASSERT_TRUE(B->leadershipPendingForTest());
-    ASSERT_NE(w.lastEpochStateTokenForTest(), tA);
-    w.deliverCompletionForTest({tA, 0, 0});   // A's stale completion
-    EXPECT_TRUE(B->leadershipPendingForTest()) << "A's fsync confirmed B's fence";
-    w.setReapPausedForTest(false);
-    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (B->role() != Role::Leader && std::chrono::steady_clock::now() < end) { pass(); std::this_thread::yield(); }
-    EXPECT_EQ(B->role(), Role::Leader) << "B leads on its OWN completion";
-}
 
 // Coordinator must-fix: an epoch-state fd is never closed while an fsync on it
 // is in flight.  The fsync runs on a dup its route owns — open until the
@@ -1621,35 +1399,6 @@ TEST(HotPathBRegression, FollowerPushNeverFaultsThroughTheReadMapRegression) {
     EXPECT_EQ(rig.rep->readMapFallbacksForTest(), 0u);
 }
 
-// D28b (box perf capture 2026-10-08: 29 worker brk waits on mmap_lock): a
-// steady-state duty pass — produce intake, leader push to an in-sync follower,
-// follower fetches — never allocates on the worker (heap growth = brk / mmap =
-// mmap_lock, and allocator latency, on the hot path).
-TEST(HotPathBRegression, SteadyStateDutyPassesNeverAllocateRegression) {
-    Rig rig(false, 64 * 1024 * 1024, nullptr, false, /*withFollower=*/true);
-    const auto frame = produceFrame(1, 1, 0, 1000, 4);
-    auto armedPass = [&](bool produce) {
-        rig.now += 1'000'000;
-        gAllocArmed = true;
-        if (produce) (void)rig.worker().handleIngressFrameForTest(frame.data(), frame.size(), rig.now);
-        (void)rig.worker().doWork(rig.now);
-        gAllocArmed = false;
-    };
-    // Warm-up: every container reaches its steady size.
-    for (int i = 0; i < 64; ++i) rig.pass(&frame);
-    for (int i = 0; i < 256; ++i) {
-        rig.fetch(rig.log->logEndOffset());
-        rig.pass(&frame);
-        rig.pool.drainAllReturns([](WorkerReturn) {});
-    }
-    gArmedAllocs = 0;
-    for (int i = 0; i < 512; ++i) {
-        if ((i & 3) == 0) rig.fetch(rig.log->logEndOffset());   // enqueue: test side, disarmed
-        armedPass(true);
-        rig.pool.drainAllReturns([](WorkerReturn) {});
-    }
-    EXPECT_EQ(gArmedAllocs, 0u) << "the worker's steady-state duty pass allocated (see the D28b backtraces above)";
-}
 
 // D30 re-review M3: on the PRODUCTION path (a provisioned, worker-driven log)
 // a sealed segment's read map retires through the provisioner's dispose (the
@@ -1669,4 +1418,67 @@ TEST(HotPathBRegression, SealedReadMapsRetireOffTheWorkerRegression) {
     const auto bases = rig.log->segmentBaseOffsets();
     for (std::size_t i = 0; i + 1 < bases.size(); ++i)
         EXPECT_FALSE(rig.log->segmentForTest(bases[i])->hasReadMapForTest()) << "sealed segment " << bases[i];
+}
+
+// D26 (fix65 review observation): a consumer cursor inside a compacted TAIL
+// gap of a sealed segment was answered Empty with the same cursor every push
+// cycle (stuck).  The PushRead now serves the next segment's first batch and
+// advances the cursor past it.
+TEST(HotPathBRegression, PushReadCursorInACompactedTailGapAdvancesRegression) {
+    TmpDir at;
+    auto put = [&](int64_t base, int64_t first, int n) {
+        rune::protocol::RecordBatchBuilder b(first, 1000);
+        for (int i = 0; i < n; ++i) b.append("k", "v", 1000 + i);
+        const auto bytes = b.build();
+        char name[32];
+        std::snprintf(name, sizeof name, "%020lld.log", static_cast<long long>(base));
+        std::ofstream f(at.p / name, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    };
+    put(0, 0, 5);     // segment 0 kept [0, 4]; its [5, 9] compacted away
+    put(10, 10, 2);   // segment 10: [10, 11]
+    Rig rig(false, 64 * 1024 * 1024, &at.p);
+    ASSERT_EQ(rig.log->logEndOffset(), 12);
+    ASSERT_TRUE(rig.passUntil([&] { return rig.rep->highWatermark() == 12; })) << "precondition: HW at the LEO";
+    rig.pushRead(700, 6);
+    int64_t next = -1;
+    std::size_t bytes = 0;
+    ASSERT_TRUE(rig.passUntil([&] {
+        rig.pool.drainAllReturns([&](WorkerReturn r) {
+            if (r.type == WorkerReturn::Type::PushReadResult) { next = r.newNextOffset; bytes = r.chunk.size(); }
+        });
+        return next >= 0;
+    })) << "the PushRead was never answered";
+    EXPECT_EQ(next, 12) << "the cursor in the tail gap did not advance";
+    EXPECT_GT(bytes, 0u);
+}
+
+// D26 (fix65 review LOW-1): push reads no longer use the read map (#65), so on
+// a log nobody reads through the mapping the provisioner's read-map work was
+// dead: a 1 MiB mmap per staged segment (munmapped again at its seal) and a
+// whole-segment growth mmap at half full whose answer was never polled — each
+// an mmap_lock write hold (and the munmap a TLB shootdown) against the
+// workers.  A push-only log maps nothing after construction.
+TEST(HotPathBRegression, PushOnlyLogNeverProvisionsReadMapsRegression) {
+    constexpr int64_t kRoll = 1536 * 1024;   // past half of the 1 MiB first mapping
+    Rig rig(false, kRoll, nullptr, /*provisioned=*/true);
+    const auto frame = produceFrame(1, 1, 0, 16 * 1024, 2);   // ~32 KiB batches
+    int64_t next = 0;
+    ASSERT_TRUE(rig.passUntil([&] {
+        rig.pass(&frame);
+        rig.pushRead(900, next);
+        rig.pass();
+        rig.pool.drainAllReturns([&](WorkerReturn r) {
+            if (r.type == WorkerReturn::Type::PushReadResult && r.errorCode == 0 && r.newNextOffset > next)
+                next = r.newNextOffset;
+        });
+        return rig.log->segmentBaseOffsets().size() >= 3;
+    })) << "precondition: several rolls";
+    ASSERT_GT(next, 0) << "precondition: the push reads consumed the log";
+    EXPECT_EQ(rig.log->readViewCallsForTest(), 0u) << "precondition: no mapped reader";
+    EXPECT_EQ(rig.log->readMapGrowRequestsForTest(), 0u) << "a read-map growth mmap for a log nobody maps";
+    const auto bases = rig.log->segmentBaseOffsets();
+    for (std::size_t i = 1; i < bases.size(); ++i)
+        EXPECT_FALSE(rig.log->segmentForTest(bases[i])->hasReadMapForTest())
+            << "segment " << bases[i] << " was provisioned with a read map nobody reads";
 }

@@ -2786,3 +2786,22 @@ TEST(NodeConfigTest, SegmentProvisionDepthClampedToOneEight) {
     }
 }
 }  // namespace rune::node
+
+// A7 review L7: RUNE_IDLE_MAX_PARK_US bounds every fd-less wake on a parked worker (cross-thread ring hops,
+// Aeron NAK / SM / heartbeat timers, a held-back intake).  It was unbounded and garbage was silently ignored
+// (a typo measured the default).  Now: an integer in [1, 1000000] us, anything else refuses startup.
+TEST(NodeConfigRegression, IdleMaxParkUsIsBoundedAndStrictRegression) {
+    auto env = rune::node::base1node();
+    env["RUNE_IDLE_MAX_PARK_US"] = "500";
+    auto ok = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+    ASSERT_TRUE(ok.config.has_value()) << ok.error;
+    EXPECT_EQ(ok.config->idleMaxParkUs, 500);
+    env["RUNE_IDLE_MAX_PARK_US"] = "1000000";
+    EXPECT_TRUE(rune::node::parseNodeConfig(rune::node::fakeEnv(env)).config.has_value());
+    for (const char* bad : {"0", "-5", "fast", "10ms", "1000001", "5000000000"}) {
+        env["RUNE_IDLE_MAX_PARK_US"] = bad;
+        const auto r = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+        EXPECT_FALSE(r.config.has_value()) << "RUNE_IDLE_MAX_PARK_US=" << bad << " was accepted";
+        if (!r.config.has_value()) EXPECT_NE(r.error.find("RUNE_IDLE_MAX_PARK_US"), std::string::npos) << r.error;
+    }
+}

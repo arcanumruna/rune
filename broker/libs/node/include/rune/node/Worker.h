@@ -607,6 +607,13 @@ public:
     // stable c_str().
     const char* name() const noexcept override { return threadName_.c_str(); }
 
+    // D23: in-flight epoch-state fsync dups are closed after io_ is gone
+    // (teardownSyncFds_), never leaked and never closed under the fsync.
+    ~Worker() override {
+        for (const TokenRoute& r : routes_)
+            if (r.token != kNoToken && r.syncFd >= 0) teardownSyncFds_.fds.push_back(r.syncFd);
+    }
+
     // Non-copyable and non-movable (two OneToOneByteRing members are not movable).
     Worker(const Worker&)            = delete;
     Worker& operator=(const Worker&) = delete;
@@ -1329,6 +1336,8 @@ public:
     /// The fd the last leader-epoch-state fsync was submitted on.
     [[nodiscard]] int lastEpochStateSyncFdForTest() const noexcept { return lastEpochStateSyncFd_; }
     [[nodiscard]] uint64_t    epochStateNotRoutedForTest() const noexcept { return epochStateNotRouted_; }
+    /// D23: epoch-state fsync dups currently open (dup'd, not yet closed).
+    [[nodiscard]] int         epochStateSyncFdsOpenForTest() const noexcept { return epochStateSyncFdsOpen_; }
     [[nodiscard]] uint64_t    bgFlushSubmitsCountForTest() const noexcept { return bgFlushSubmits_; }
     /// Review Md3 seam: the next `n` epoch-state route inserts fail.
     void forceRouteFailForTest(int n) noexcept { forceRouteFailForTest_ = n; }
@@ -2053,7 +2062,7 @@ private:
         // the log dir goes offline — the synchronous fence's semantics), never
         // the log's fail-stop.
         if (routed && r.kind == RouteKind::EpochState) {
-            if (r.syncFd >= 0) ::close(r.syncFd);
+            if (r.syncFd >= 0) { ::close(r.syncFd); --epochStateSyncFdsOpen_; }
             if (gate && sameReplica_(r, gate->replica))
                 (void)gate->replica->epochStateWriteCompleted(static_cast<uint64_t>(r.aux), c.errorCode);
             return 1;
@@ -2062,7 +2071,7 @@ private:
         // next owner rewrites it: rebuildFlushSlots_) and still the SAME
         // replica (an owned replica at a reused address is another one).
         if (routed && r.kind == RouteKind::MemEpochState) {
-            if (r.syncFd >= 0) ::close(r.syncFd);
+            if (r.syncFd >= 0) { ::close(r.syncFd); --epochStateSyncFdsOpen_; }
             if (std::find(owned_.begin(), owned_.end(), r.replica) != owned_.end() && sameReplica_(r, r.replica))
                 (void)r.replica->epochStateWriteCompleted(static_cast<uint64_t>(r.aux), c.errorCode);
             return 1;
@@ -2607,15 +2616,16 @@ private:
 
     // -------------------------------------------------------------------
     // read-rework T3/T4 (I3): in-worker push loop.  For each active owned
-    // subscription, zero-copy read whole batches from the cursor (Log::readView),
+    // subscription, read whole batches from the cursor (#65: a pread into the
+    // worker's push scratch, readNoFault_ — never the segment read mmap),
     // encode each as a Records frame into egressScratch_, and push it directly on
     // THIS worker's dynamic-MDC egress publication (workerEgress_).  Advance the
     // cursor only on a successful send (back-pressure preserves at-least/exactly-
     // once, same invariant as the gateway push path).
     //
     // Shared-nothing: reads only worker-owned state (subs_, the owned Log/replica,
-    // workerEgress_).  Zero heap alloc on the hot path (readView span + preallocated
-    // egressScratch_).  No locks/atomics.
+    // workerEgress_).  Zero heap alloc on the hot path (preallocated push scratch +
+    // egressScratch_; one pread per subscription read).  No locks/atomics.
     //
     // Bound: read_uncommitted → HW (replica->highWatermark(), or LEO passthrough).
     // read_committed → the LSO of this worker's own RC state (F15 §2.4, K1);
@@ -2772,10 +2782,11 @@ private:
 
             const bool freshPass = pushBudgetLeft_ == kPushPassBudgetBytes;
             // #65 (review MAJOR-1): a pread into the worker's scratch — never the
-            // segment read mmap.  noexcept (F3): a failed read is an empty view
-            // (retry next pass).
+            // segment read mmap — stopping near the bound (D26).  noexcept (F3):
+            // a failed read is an empty view (retry next pass; an I/O error is
+            // counted + logged, never retried through the mapping).
             const rune::storage::LogReadView view = readNoFault_(
-                s.logPtr, s.nextOffset, std::min<std::size_t>(kPushMaxChunkBytes, pushBudgetLeft_));
+                s.logPtr, s.nextOffset, std::min<std::size_t>(kPushMaxChunkBytes, pushBudgetLeft_), bound);
             if (view.empty()) continue;
 
             std::size_t pos = 0;
@@ -3080,10 +3091,11 @@ private:
         ret.setPushEffectiveBound(bound);
 
         // Only read if there are records available (within the bound).
-        // F5 (hot-path B): zero allocation, one copy — the chunk is gathered
-        // from the segment's read mmap (Log::readView) straight into the
-        // claimed return-ring slot, clamped on the fly (bound, markers,
-        // aborted batches), within this pass's push byte budget.
+        // F5 (hot-path B) + #65: zero allocation — the chunk is pread into the
+        // worker's push scratch (readNoFault_: one pread, no page fault), then
+        // gathered into the claimed return-ring slot (two copies in all),
+        // clamped on the fly (bound, markers, aborted batches), within this
+        // pass's push byte budget.
         if (nextOffset < bound) {
             switch (readPushChunk_(a, ret, log, bound, rc)) {
             case PushChunk::Written:
@@ -3112,11 +3124,13 @@ private:
         enqueueReturn_(std::move(ret));   // no chunk: a fixed-size answer
     }
 
-    // F5: one PushRead's chunk.  Walks the whole batches of a zero-copy
-    // readView once, applying the F15 §2.4 / R-2 clamp (bound, control markers
-    // never delivered, read_committed aborted batches stripped / cut pre-carrier)
-    // and collects the kept bytes as runs; then claims ONE ret_ slot and gathers
-    // the runs into it.  No allocation, no syscall (the read map exists), one copy.
+    // F5: one PushRead's chunk.  Walks the whole batches of one read (#65: a
+    // pread into the push scratch — readNoFault_) once, applying the F15 §2.4 /
+    // R-2 clamp (bound, control markers never delivered, read_committed aborted
+    // batches stripped / cut pre-carrier) and collects the kept bytes as runs;
+    // then claims ONE ret_ slot and gathers the runs into it.  No allocation;
+    // one pread syscall (rarely two: a first batch the window cut) and two
+    // copies (kernel -> scratch, scratch -> ring).
     //   Written  — answered in ret_ (budget charged);
     //   Empty    — no deliverable batch; ret.newNextOffset is past what was
     //              examined (answer it — R-1);
@@ -3134,9 +3148,10 @@ private:
         const std::size_t fit = pushReadChunkFit_();
         const std::size_t cap = std::min({static_cast<std::size_t>(kMaxPushReadChunkBytes), fit, pushBudgetLeft_});
         // #65: a pread into the worker's scratch (readNoFault_) — never the
-        // segment read mmap.  noexcept (F3): a failed read is an empty view —
-        // answered empty, the gateway retries next cycle.
-        const rune::storage::LogReadView v = readNoFault_(log, a.nextOffset, cap);
+        // segment read mmap — stopping near the bound (D26).  noexcept (F3): a
+        // failed read is an empty view — answered empty, the gateway retries
+        // next cycle.
+        const rune::storage::LogReadView v = readNoFault_(log, a.nextOffset, cap, bound);
         if (v.empty()) return PushChunk::Empty;
         const bool preCarrier = a.isGroup && !a.carrier;
         std::size_t rd = 0, nRuns = 0, total = 0;
@@ -3177,7 +3192,7 @@ private:
             next = last + 1;
         }
         // A pass that already pushed never takes a batch past its budget (the
-        // view's first batch is always included — readView's progress rule).
+        // view's first batch is always included — the read's progress rule).
         if (total > pushBudgetLeft_ && !freshPass) return PushChunk::Deferred;
         if (total == 0) {
             if (cutBound >= 0) ret.setPushEffectiveBound(cutBound);
@@ -3253,18 +3268,33 @@ private:
     // #65: the worker's push reads.  First-touch page faults on a segment read
     // MMAP take the process mmap_lock for read — queued behind the provisioner /
     // cleaner threads' mmap/munmap holding it for write: ~1 ms off-CPU worker
-    // passes (box perf, briefs/2026-10-07-reads-retention-bisect.md).  So: ONE
-    // pread into the preallocated scratch (no allocation, no fault).  Only a
-    // first batch larger than the whole scratch (near the ring's max message)
-    // falls back to the mapped view — counted.  The view is valid until the
-    // next push read on this thread.
-    rune::storage::LogReadView readNoFault_(rune::storage::Log* log, int64_t offset, std::size_t maxBytes) noexcept {
-        bool tooLarge = false;
+    // passes (box perf, briefs/2026-10-07-reads-retention-bisect.md).  So: a
+    // pread into the preallocated scratch (no allocation, no fault), sized to
+    // the request and stopping near `bound` (the HW / LSO: D26).  Only a first
+    // batch larger than the whole scratch falls back to the mapped view —
+    // counted (pushReadMapFallbacks_), and only after its bytes read cleanly.
+    // An I/O error is answered empty (retried next cycle), counted and logged —
+    // never retried through the mapping (SIGBUS on the same bad page; D26).
+    // The view is valid until the next push read on this thread.
+    rune::storage::LogReadView readNoFault_(rune::storage::Log* log, int64_t offset, std::size_t maxBytes,
+                                            int64_t bound) noexcept {
+        rune::storage::ReadIntoStatus st;
+        int err = 0;
         const rune::storage::LogReadView v = log->readInto(offset, static_cast<int32_t>(maxBytes), pushScratch_.data(),
-                                                           pushScratch_.size(), tooLarge);
-        if (!tooLarge) [[likely]] return v;
+                                                           pushScratch_.size(), st, bound, &err);
+        if (st != rune::storage::ReadIntoStatus::FirstTooLarge) [[likely]] {
+            if (st == rune::storage::ReadIntoStatus::IoError) [[unlikely]] notePushReadError_(log, offset, err);
+            return v;
+        }
         ++pushReadMapFallbacks_;
         return log->readView(offset, static_cast<int32_t>(maxBytes));
+    }
+    [[gnu::cold]] void notePushReadError_(const rune::storage::Log* log, int64_t offset, int err) noexcept {
+        ++pushReadErrors_;
+        if ((pushReadErrors_ & (pushReadErrors_ - 1)) == 0)   // rate-limited: powers of two
+            spdlog::error("Worker {}: push read of {} at offset {} failed (errno={}, errors={}) — answered empty, "
+                          "retried next cycle (never through the read mapping)", workerId_, log->dir(), offset, err,
+                          pushReadErrors_);
     }
 
     [[gnu::cold]] void notePushReadOversize_(int32_t topicId, int32_t partition, int64_t offset) noexcept {
@@ -4028,6 +4058,17 @@ private:
     // NEVER touches it.
     OwnedSet owned_{};
 
+    // D23 (D21 review L1b): the dup fds of epoch-state fsyncs still in flight
+    // when the worker is destroyed.  Declared BEFORE io_, so it is destroyed
+    // AFTER it: the fds are closed only once the backend is gone (portable:
+    // flusher joined; io_uring: ring closed — the kernel holds its own file
+    // reference), never under an in-flight fsync.  Filled by ~Worker (cold).
+    struct DeferredFdClose {
+        std::vector<int> fds;
+        ~DeferredFdClose() { for (const int fd : fds) ::close(fd); }
+    };
+    DeferredFdClose teardownSyncFds_;
+
     // E3: per-worker async I/O backend.
     // Owned exclusively by this worker thread — submit()/reap() are called ONLY
     // from executeProduce_() and reapDurableCompletions_() which both run on
@@ -4350,7 +4391,7 @@ private:
     static constexpr std::size_t kEgressScratchSize = 68 * 1024;
     // Max whole batches pushed per subscription per doWork cycle (fairness).
     static constexpr int         kPushBatchesPerSubPerCycle = 1024;
-    // Max bytes fetched per subscription per cycle via readView (matches gateway).
+    // Max bytes read per subscription per cycle (matches gateway).
     static constexpr int32_t     kPushMaxChunkBytes = static_cast<int32_t>(512 * 1024);
     std::vector<uint8_t> egressScratch_;
     // Task 23 (egress audit, 3rd path): sendPushTooLarge_'s ENCRYPTED-session
@@ -4376,6 +4417,7 @@ public:
     [[nodiscard]] uint64_t pushReadsDeferredForTest() const noexcept { return pushReadsDeferred_; }
     /// #65: push reads that fell back to the segment read mmap (first batch > scratch).
     [[nodiscard]] uint64_t pushReadMapFallbacksForTest() const noexcept { return pushReadMapFallbacks_; }
+    [[nodiscard]] uint64_t pushReadErrorsForTest() const noexcept { return pushReadErrors_; }
     [[nodiscard]] std::size_t deferredPushReadsForTest() const noexcept { return deferredPushCount_; }
 private:
     std::size_t                           pushBudgetLeft_ = kPushPassBudgetBytes;
@@ -4386,6 +4428,7 @@ private:
     /// batches fall back to the mapped view (pushReadMapFallbacks_).
     std::vector<uint8_t>                  pushScratch_ = std::vector<uint8_t>(2 * kPushPassBudgetBytes + 64 * 1024);
     uint64_t                              pushReadMapFallbacks_ = 0;
+    uint64_t                              pushReadErrors_ = 0;   ///< D26: push-read pread failures (answered empty)
     /// D26: replication read scratch — a fetch serve / owed re-serve / push of
     /// an owned replica preads into it (PartitionReplica::setReadScratch), never
     /// faulting through the segment read map.  maxFetchBytes (1 MiB) + the
@@ -4629,6 +4672,7 @@ private:
     CompletionToken lastEpochStateToken_ = kNoToken;   ///< tests (lastEpochStateTokenForTest)
     int             lastEpochStateSyncFd_ = -1;        ///< tests (lastEpochStateSyncFdForTest)
     uint64_t    epochStateNotRouted_ = 0; ///< review Md3
+    int         epochStateSyncFdsOpen_ = 0;   ///< D23: open epoch-state fsync dups (tests)
     int         forceRouteFailForTest_ = 0;
     std::vector<uint8_t> esScratch_ = std::vector<uint8_t>(4096);   ///< review Md4: one image buffer per worker
     std::vector<rune::storage::Log*> rpQueue_;   ///< E1d F8: logs whose checkpoint is due
@@ -5218,6 +5262,11 @@ private:
         routes_.assign(cap, TokenRoute{});
         routeMask_ = cap - 1;
     }
+    /// D23: a route slot is free (cold — a scan of <= 2x the io depth).
+    [[nodiscard]] bool routeHasRoom_() const noexcept {
+        for (const TokenRoute& r : routes_) if (r.token == kNoToken) return true;
+        return false;
+    }
     bool routeInsert_(const TokenRoute& r) noexcept {
         for (std::size_t n = 0, i = static_cast<std::size_t>(r.token) & routeMask_; n <= routeMask_;
              ++n, i = (i + 1) & routeMask_) {
@@ -5313,6 +5362,16 @@ private:
             esScratch_.resize(need);                       // cold: the history outgrew the scratch
             if (!r.prepareEpochStateWrite(esScratch_.data(), esScratch_.size(), w, need)) return 0;
         }
+        // D23 (D21 review L1a): its completion must be routable, so the room
+        // is checked BEFORE the slot write and its fsync (cold: a scan of the route
+        // table) — a full table refuses the write (rewritten next pass), never
+        // an unobservable completion whose dup would be left open.
+        if (forceRouteFailForTest_ > 0 || !routeHasRoom_()) [[unlikely]] {
+            if (forceRouteFailForTest_ > 0) --forceRouteFailForTest_;
+            r.epochStateWriteNotSubmitted();   // Prepared -> Idle, still due
+            ++epochStateNotRouted_;
+            return 0;                          // back-pressure (like a refused submit)
+        }
         // The image is copied into the page cache here: the worker's scratch is
         // free again when pwrite returns (review Md4: no per-replica image).
         if (::pwrite(w.fd, w.data, w.len, static_cast<off_t>(w.offset)) != static_cast<ssize_t>(w.len)) {
@@ -5326,6 +5385,7 @@ private:
         // the replica may close / reopen its own fd at any time — an fd number
         // is never closed under an in-flight fsync (and then reused).
         const int syncFd = ::fcntl(w.fd, F_DUPFD_CLOEXEC, 0);
+        if (syncFd >= 0) ++epochStateSyncFdsOpen_;
         if (syncFd < 0) {
             const int err = errno != 0 ? errno : EMFILE;
             r.epochStateWriteSubmitted();
@@ -5336,6 +5396,7 @@ private:
         const CompletionToken t = io_.submit(syncFd, 0);
         if (t == kNoToken) {                               // back-pressure: retry next pass
             ::close(syncFd);                               // never submitted
+            --epochStateSyncFdsOpen_;
             r.epochStateWriteNotSubmitted();
             return 0;
         }
@@ -5353,15 +5414,10 @@ private:
         } else {
             route.kind = RouteKind::MemEpochState;
         }
-        const bool routed = forceRouteFailForTest_ == 0 && routeInsert_(route);
-        if (!routed) [[unlikely]] {
-            if (forceRouteFailForTest_ > 0) --forceRouteFailForTest_;
-            // Its completion is never observed, so its dup is never known to be
-            // idle: deliberately left open (unreachable in production — the
-            // route table holds 2x the io depth) rather than closed under the
-            // in-flight fsync.
-            // Review Md3: an unroutable completion is never observed — the write
-            // is treated as not done and rewritten next pass (never wedged).
+        // Cannot fail: the room was checked above and nothing ran in between
+        // on this thread (D23).  Defensive only — its dup is then left open
+        // (never closed under the in-flight fsync) and the write is redone.
+        if (!routeInsert_(route)) [[unlikely]] {
             spdlog::critical("Worker {}: io token route table full (token={}) — epoch-state write re-queued",
                              workerId_, t);
             r.epochStateWriteNotRouted();

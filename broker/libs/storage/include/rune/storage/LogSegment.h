@@ -1,8 +1,9 @@
 #pragma once
+#include <climits>
+#include <cstdint>
 #include <rune/storage/LogReadView.h>
 #include <rune/storage/OffsetIndex.h>
 #include <cstddef>
-#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -191,12 +192,29 @@ public:
     /// treat empty as "nothing now; retry next cycle".  See readMapFailures().
     LogReadView readView(int64_t startOffset, int32_t maxBytes) noexcept;
     /// #65: readView's batch semantics (first batch whole, then whole batches up
-    /// to maxBytes) served by ONE pread into the caller's buffer — no mapping,
-    /// so no page fault (and no process mmap_lock) on the caller's thread, no
-    /// allocation.  The view points into `buf`.  `firstTooLarge` is set when the
-    /// first deliverable batch does not fit `bufCap` (caller falls back).
+    /// to maxBytes) served by pread into the caller's buffer — no mapping, so
+    /// no page fault (and no process mmap_lock) on the caller's thread, no
+    /// allocation.  The view points into `buf`.  The read is sized to the
+    /// request (maxBytes + the sparse-index skip, <= two index intervals),
+    /// reading on (a second pread) only for a first batch the window cut.
+    ///  - With `bufCap < maxBytes + 2 * interval + overhead` the answer is a
+    ///    whole-batch PREFIX of readView's (the first batch always whole).
+    ///  - A start offset at a compaction gap may skip one interval + the batch
+    ///    before the first survivor; still a prefix, never a wrong batch.
+    ///  - `boundOffset` (D26): nothing at/after it is wanted (the HW / LSO) —
+    ///    the read stops one index interval past the bound's index entry.
+    /// `st`: Ok / Absent (nothing at/after startOffset here — the caller may
+    /// continue at the next segment) / FirstTooLarge (the first deliverable
+    /// batch does not fit `bufCap`: the caller may fall back) / Unreadable /
+    /// IoError (`*errOut` = errno; never retried through the mapping).
+    LogReadView readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
+                         ReadIntoStatus& st, int64_t boundOffset = INT64_MAX, int* errOut = nullptr) noexcept;
+    /// Same; `firstTooLarge` = (st == FirstTooLarge).
     LogReadView readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
                          bool& firstTooLarge) noexcept;
+    /// D26: pread failures (IoError answers) / bytes pread by readInto.
+    [[nodiscard]] uint64_t readIntoErrors() const noexcept { return readIntoErrors_; }
+    [[nodiscard]] uint64_t readIntoBytes() const noexcept { return readIntoBytes_; }
     /// F15 S4 fix round 1 (cold-cache build): the read-only mapping of the
     /// written bytes [0, sizeBytes()) WITHOUT touching any page (an mmap /
     /// remap syscall at most; no index lookup, no header read).  The caller
@@ -314,17 +332,19 @@ public:
                                                     const std::string& indexFile,
                                                     int64_t nextOffset, int32_t indexIntervalBytes,
                                                     int32_t indexMaxBytes);
+    /// `readMapBytes` 0 (the default, D26): no read mapping — a later
+    /// readView maps lazily (push / fetch reads pread and never map).
     static std::unique_ptr<LogSegment> prepareStaging(
         const std::string& stagingLogPath, const std::string& stagingIndexPath,
         int64_t stagingSeq, int32_t indexIntervalBytes, int32_t indexMaxBytes,
         std::size_t readMapBytes = 0);
     /// Hot-path B F5 + review Md5: the read mapping a segment that grows to
     /// `rollBytes` ends with — page-rounded rollBytes + one maximal batch (never
-    /// a power of two).  Segments start with kReadMapMinBytes (an idle
-    /// partition costs 1 MiB of address space) and a provisioned log grows the
-    /// mapping OFF the owner (SegmentProvisionerAgent; Log::readView never
-    /// remaps on the owner — a munmap + mmap of tens of MiB measured 100-260 us
-    /// on the worker).
+    /// a power of two).  A mapping starts at kReadMapMinBytes and a provisioned
+    /// log that is read through it grows it OFF the owner
+    /// (SegmentProvisionerAgent; a munmap + mmap of tens of MiB measured
+    /// 100-260 us on the worker).  D26: only mapped readers (readView) cause
+    /// any of this — push / fetch reads pread (#65).
     [[nodiscard]] static std::size_t readMapBytesFor(int64_t rollBytes) noexcept;
     static constexpr std::size_t kReadMapSlackBytes = 1u << 20;
     /// Bytes currently mapped for readView.
@@ -402,7 +422,12 @@ private:
     /// D20 review L2 (cold): finish a page-cache append whose first pwrite /
     /// pwritev returned `first` (< total) — resume a short write / EINTR at
     /// logSize_ + done like writeAll_.  0 or errno (ENOSPC for no progress).
-    int finishShortWrite_(const struct ::iovec* iov, int cnt, std::size_t total, ssize_t first) noexcept;
+    /// `firstErr`: the errno of a failed first attempt (first < 0), captured
+    /// by the caller right after its syscall.
+    int finishShortWrite_(const struct ::iovec* iov, int cnt, std::size_t total, ssize_t first,
+                          int firstErr) noexcept;
+    /// `first` for "no attempt made yet" (writeAll_): write from byte 0.
+    static constexpr ssize_t kNotWrittenYet = -2;
     [[noreturn]] void failWrite_(int err, const char* what);   ///< E1: sticky fail-stop + throw
 
     /// (Re)map the .log read-only to cover the currently-written logSize_ bytes so
@@ -439,15 +464,19 @@ private:
     int64_t stagingSeq_ = -1; // pre-provision staging sequence (see stagingSeq())
     LogSegmentMap::node_type spareMapNode_;   // see setSpareMapNode (empty when none)
 
-    // Read-only mmap of the .log for zero-copy readView().  Created WITH the
-    // segment (openReadMap; lazily only if that failed) with headroom past EOF,
-    // grow-remapped (geometrically) only when the active segment outgrows it.  Separate O_RDONLY fd from the writer's fd_, but
-    // the same inode → shared page cache, so it observes committed appends.
+    // Read-only mmap of the .log for zero-copy readView().  Created lazily by
+    // the first readView (D26: never for a segment only pread — push / fetch
+    // reads), or eagerly for the recovered active segment, with headroom past
+    // EOF; grown geometrically (off the owner on a provisioned log) only when
+    // the active segment outgrows it.  Maps through the segment's own fd_ (the
+    // same inode → shared page cache, so it observes committed appends).
     std::unique_ptr<MappedFile> readMap_;
     std::size_t readMapSize_ = 0;   // bytes currently mapped by readMap_ (>= logSize_ headroom)
     static constexpr std::size_t kReadMapMinBytes = 1u << 20;   // first read mapping: 1 MiB
     bool     readMapFaultForTest_ = false;   // D3b r2 test seam (setReadMapFaultForTest)
     uint64_t readMapRemaps_ = 0;
+    uint64_t readIntoErrors_ = 0;   ///< D26: readInto pread failures
+    uint64_t readIntoBytes_ = 0;    ///< D26: bytes readInto pread
     bool     ownerRemap_ = true;
     uint64_t readMapFailures_ = 0;  // count of failed ensureReadMap() calls — see readMapFailures()
 };

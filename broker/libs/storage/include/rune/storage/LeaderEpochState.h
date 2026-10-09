@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <iterator>
 #include <fcntl.h>
@@ -49,8 +50,10 @@ struct LeaderEpochState {
     /// Per slot.  D21 review L1: pre-sized so a history practically never
     /// outgrows it (outgrowing re-creates the file — fsync + rename + dir fsync
     /// — on whichever thread writes next, possibly a worker): 52 KiB stride,
-    /// 4434 entries.  The file is SPARSE (create() writes slot 0's image only),
-    /// so the pre-size costs address space, not blocks (review Md4).
+    /// 4434 entries.  The file is SPARSE past each slot's reserved head
+    /// (reserveFor: one block for a short history), so the pre-size costs
+    /// address space, not blocks (review Md4), while an in-place write only
+    /// ever lands on allocated blocks (D23).
     static constexpr std::size_t   kMinEntries  = 4096;
 
     using Entries = std::vector<std::pair<int32_t, int64_t>>;
@@ -78,6 +81,16 @@ struct LeaderEpochState {
     /// Bytes of an encoded slot holding `count` entries.
     [[nodiscard]] static constexpr std::size_t imageBytes(std::size_t count) noexcept {
         return kHeaderBytes + count * kEntryBytes;
+    }
+    /// D23 (D21 review L4): the head of each slot whose blocks are ALLOCATED
+    /// (written with zeros at create / enable) — room for twice `entries` (at
+    /// least one block), block-aligned, never past the slot.  An in-place slot
+    /// write must fit it (else the cold re-create), so the worker's write +
+    /// fdatasync never allocates a block (no ENOSPC on a full disk).
+    [[nodiscard]] static constexpr std::size_t reserveFor(std::size_t entries, std::size_t stride) noexcept {
+        const std::size_t want = (imageBytes(2 * entries + 2) + 4095u) & ~static_cast<std::size_t>(4095u);
+        const std::size_t r = want < 4096u ? 4096u : want;
+        return r < stride ? r : stride;
     }
 
     /// Encode a slot into `out` (at least imageBytes(n) bytes).  No allocation.
@@ -170,17 +183,28 @@ struct LeaderEpochState {
     /// Cold — never on a worker duty pass in steady state.
     template <class It>
     static int create(const std::string& dir, std::size_t stride, uint64_t seq, int64_t fence, It first, It last) {
-        std::vector<uint8_t> img(imageBytes(static_cast<std::size_t>(std::distance(first, last))), 0);
-        const std::size_t len = encode(img.data(), seq, fence, first, last);
+        const auto count = static_cast<std::size_t>(std::distance(first, last));
+        // D23: slot 0's image + zeros, then slot 1's head: the reserved head
+        // of both slots is written (allocated) here, off the worker.
+        const std::size_t reserved = reserveFor(count, stride);
+        std::vector<uint8_t> img(std::max(imageBytes(count), reserved), 0);
+        (void)encode(img.data(), seq, fence, first, last);
+        const std::size_t len = img.size();
         const std::string tmp = dir + "/" + kTmpFileName;
         const std::string dst = path(dir);
         int err = 0;
         const int fd = ::open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) return -(errno != 0 ? errno : EIO);
-        // Sparse (D21 L1): the size first (slot 1 reads as zeros = empty), then
-        // slot 0's image only.
+        // Sparse past the reserved heads (D21 L1): the size first (slot 1 reads
+        // as zeros = empty), then slot 0's head (image + zeros) and slot 1's
+        // head (zeros) — D23: the blocks an in-place write can reach.
         if (::ftruncate(fd, static_cast<off_t>(2 * stride)) != 0) err = errno != 0 ? errno : EIO;
         if (err == 0 && ::pwrite(fd, img.data(), len, 0) != static_cast<ssize_t>(len)) err = errno != 0 ? errno : ENOSPC;
+        if (err == 0) {
+            std::fill(img.begin(), img.end(), uint8_t{0});
+            if (::pwrite(fd, img.data(), reserved, static_cast<off_t>(stride)) != static_cast<ssize_t>(reserved))
+                err = errno != 0 ? errno : ENOSPC;
+        }
         if (err == 0 && ::fsync(fd) != 0) err = errno != 0 ? errno : EIO;
         if (err == 0 && ::rename(tmp.c_str(), dst.c_str()) != 0) err = errno != 0 ? errno : EIO;
         if (err == 0) {
@@ -213,6 +237,39 @@ struct LeaderEpochState {
         if (dfd < 0 || ::fsync(dfd) != 0) err = errno != 0 ? errno : EIO;
         if (dfd >= 0) ::close(dfd);
         return err != 0 ? -err : removed;
+    }
+
+    /// D23: allocate the reserved head (`bytes`) of both slots of an EXISTING
+    /// file (one created sparse by an earlier build): zeros over the slot NOT
+    /// holding the newest image (`keepSlot`, -1: none) and over the newest
+    /// slot past its image (`keepLen` bytes kept), then fdatasync.  The newest
+    /// image is never touched, so a crash here loses nothing.  0 or errno.
+    /// Cold (construction / enable — never a worker duty pass).
+    static int reserve(int fd, std::size_t stride, std::size_t bytes, int keepSlot, std::size_t keepLen) {
+        if (bytes > stride) bytes = stride;
+        std::vector<uint8_t> zeros;
+        bool wrote = false;
+        for (int slot = 0; slot < 2; ++slot) {
+            const off_t head = static_cast<off_t>(slot) * static_cast<off_t>(stride);
+            // Already allocated (this build's create, or a written slot): no
+            // write, no sync — a restart of N partitions costs N lseeks.
+            const off_t hole = ::lseek(fd, head, SEEK_HOLE);
+            if (hole >= head + static_cast<off_t>(bytes)) continue;
+            const std::size_t from = slot == keepSlot ? std::min(keepLen, bytes) : 0;
+            if (from >= bytes) continue;
+            const std::size_t n = bytes - from;
+            if (zeros.empty()) zeros.assign(bytes, 0);
+            if (::pwrite(fd, zeros.data(), n, head + static_cast<off_t>(from)) != static_cast<ssize_t>(n))
+                return errno != 0 ? errno : ENOSPC;
+            wrote = true;
+        }
+        if (!wrote) return 0;
+#if defined(__APPLE__)
+        if (::fsync(fd) != 0) return errno != 0 ? errno : EIO;
+#else
+        if (::fdatasync(fd) != 0) return errno != 0 ? errno : EIO;
+#endif
+        return 0;
     }
 
     /// Open the existing file for slot writes.  -errno on failure.  Cold.

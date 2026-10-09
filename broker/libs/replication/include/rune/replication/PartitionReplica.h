@@ -1012,6 +1012,8 @@ public:
     [[nodiscard]] uint64_t epochStateErrorsForTest() const noexcept { return es_.errors; }
     [[nodiscard]] bool epochStateEnabledForTest() const noexcept { return es_.enabled; }
     [[nodiscard]] bool epochStateFdOpenForTest() const noexcept { return es_.fd >= 0; }
+    [[nodiscard]] uint64_t epochStateRecreatesForTest() const noexcept { return es_.recreates; }
+    [[nodiscard]] std::size_t epochStateReservedForTest() const noexcept { return es_.reserved; }
     [[nodiscard]] bool refetchAwaitsEpochStateForTest() const noexcept { return awaitEsFetch_; }
     /// Tests (power-loss seam): completions of epoch-state writes are held —
     /// the write stays InFlight (never confirmed) until released.
@@ -1303,6 +1305,7 @@ private:
     uint8_t*                    readScratch_ = nullptr;     ///< D26: see setReadScratch()
     std::size_t                 readScratchCap_ = 0;
     uint64_t                    readMapFallbacks_ = 0;
+    uint64_t                    readErrors_ = 0;            ///< D26: pread failures (answered empty)
     /// D26: a whole-batch read of the active log — a pread into readScratch_
     /// when set (disk log), else the mapped view.  The view lives until the next
     /// read through this helper on the same thread.
@@ -1429,6 +1432,7 @@ private:
         bool        enabled = false;    ///< leader-epoch-state is the authoritative copy
         int         fd = -1;            ///< open only while a write is due / in flight (review Md4)
         std::size_t stride = 0;         ///< slot stride (file size / 2)
+        std::size_t reserved = 0;       ///< D23: allocated head of each slot (an in-place image must fit)
         int         activeSlot = -1;    ///< slot of the newest CONFIRMED image (-1: none)
         uint64_t    seq = 0;            ///< last sequence used
         EsStage     stage = EsStage::Idle;
@@ -1463,6 +1467,9 @@ private:
     uint64_t leadGenSeq_ = 0;
     void enableEpochState_() noexcept;
     bool writeEpochStateInline_() noexcept;
+    /// D23: an image of `entries` entries can be written in place — inside the
+    /// slot AND its allocated head (never a block allocation on the worker).
+    [[nodiscard]] bool epochImageFitsInPlace_(std::size_t entries) const noexcept;
     int  openEpochStateFd_() noexcept;   ///< 0 or errno
     void closeEpochStateFdIfIdle_() noexcept;
     /// Review C1: the epoch history from `x` on changed (not yet durable).

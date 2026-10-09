@@ -273,6 +273,24 @@ TEST(ShardIdle, BusySpinOnlyOnExplicitOptIn) {
     EXPECT_NE(dynamic_cast<rune::consensus::BusySpinIdleStrategy*>(idle.get()), nullptr);
 }
 
+// A7 review L3: every strategy makeShardIdle produces is dispatched by the shard runner's ShardIdle without a
+// virtual call (the runner itself is BasicAgentRunner<ShardAgent, ShardIdle, MonotonicNanoClock>, all final).
+TEST(ShardIdle, EveryShardStrategyIsDispatchedWithoutAVirtualCall) {
+    FakeFds f;
+    NodeConfig park;                                   // park-until-work
+    NodeConfig legacy; legacy.idleWake = false;        // legacy Aeron backoff
+    NodeConfig timed;  timed.idleWake = false; timed.idleSpins = 1; timed.idleYields = 2;   // timed park
+    NodeConfig spin;   spin.workerIdleStrategy = NodeConfig::WorkerIdleStrategy::BusySpin;
+    for (const NodeConfig* c : {&park, &legacy, &timed, &spin}) {
+        ShardIdle idle(makeShardIdle(*c, f.p, 1));
+        EXPECT_TRUE(idle.devirtualizedForTest()) << describeShardIdle(idle.strategy());
+        idle.idle(1);   // work: a reset, never a park
+        idle.reset();
+    }
+    ShardIdle none(makeShardIdle(park, nullptr, 0));   // no fds: the legacy backoff
+    EXPECT_TRUE(none.devirtualizedForTest());
+}
+
 #if defined(__linux__)
 TEST(ShardAgentTimerSlack, OnlyTheReadinessParkLowersTimerSlackRegression) {
     FakeFds f;

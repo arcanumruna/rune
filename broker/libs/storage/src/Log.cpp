@@ -268,8 +268,10 @@ void Log::maybeRoll() {
         // provisionThresholdBytes_ full (one compare per append otherwise).
         if (provisioned_ && activeBytes >= provisionThresholdBytes_ && (!thresholdPosted_ || adoptedPostPending_))
             [[unlikely]] postProvisionDemands_(activeBytes);
-        // Review Md5: request the full-segment read mapping off the owner at half full.
-        if (asyncReadGrowth_ && !growOutstanding_ &&
+        // Review Md5: request the full-segment read mapping off the owner at
+        // half full — D26: only for a log that has a mapped reader (a push-only
+        // log's answer was never polled: a dead off-owner mmap).
+        if (asyncReadGrowth_ && mapReaders_ && !growOutstanding_ &&
             static_cast<std::size_t>(activeBytes) * 2 > activeSegment().readMapBytes()) [[unlikely]] {
             auto last = std::prev(segments_.end());
             maybeGrowReadMap_(*last->second, last->first, true);
@@ -1032,16 +1034,34 @@ std::vector<uint8_t> Log::read(int64_t startOffset, int32_t maxBytes) {
 }
 LogReadView Log::readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
                           bool& firstTooLarge) noexcept {
+    ReadIntoStatus st;
+    const LogReadView v = readInto(startOffset, maxBytes, buf, bufCap, st);
+    firstTooLarge = st == ReadIntoStatus::FirstTooLarge;
+    return v;
+}
+LogReadView Log::readInto(int64_t startOffset, int32_t maxBytes, uint8_t* buf, std::size_t bufCap,
+                          ReadIntoStatus& st, int64_t boundOffset, int* errOut) noexcept {
     RUNE_FR_SPAN_READ(rune_fr::Site::ReadLogRead, 0);
-    firstTooLarge = false;
+    st = ReadIntoStatus::Absent;
     auto it = segments_.upper_bound(startOffset);
     if (it == segments_.begin()) return {};
     --it;
-    return it->second->readInto(startOffset, maxBytes, buf, bufCap, firstTooLarge);
+    LogReadView v = it->second->readInto(startOffset, maxBytes, buf, bufCap, st, boundOffset, errOut);
+    // D26: nothing at/after startOffset in its segment — a compacted TAIL gap
+    // of a sealed segment (or an emptied one): continue at the next segment's
+    // base (below the bound), else a cursor there is answered empty forever.
+    // Never past torn / unreadable bytes or an I/O error.  One compare when found.
+    while (st == ReadIntoStatus::Absent && std::next(it) != segments_.end()) [[unlikely]] {
+        ++it;
+        if (it->first >= boundOffset) break;
+        v = it->second->readInto(std::max(startOffset, it->first), maxBytes, buf, bufCap, st, boundOffset, errOut);
+    }
+    return v;
 }
 LogReadView Log::readView(int64_t startOffset, int32_t maxBytes) noexcept {
     RUNE_FR_SPAN_READ(rune_fr::Site::ReadLogRead, 0);
     ++readViewCalls_;
+    mapReaders_ = true;   // D26: growth is provisioned only for logs read through the mapping
     auto it = segments_.upper_bound(startOffset);
     if (it == segments_.begin()) return {};
     --it;
@@ -1094,6 +1114,7 @@ void Log::maybeGrowReadMap_(LogSegment& seg, int64_t base, bool active) noexcept
         return;
     }
     growSeq_ = seq;
+    ++readMapGrowRequests_;
     growOutstanding_ = true;
     growBase_ = base;
     growGen_ = seg.installGen();
