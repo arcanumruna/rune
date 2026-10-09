@@ -479,6 +479,8 @@ private:
     uint64_t readMapRemaps_ = 0;
     uint64_t readIntoErrors_ = 0;   ///< D26: readInto pread failures
     uint64_t readIntoBytes_ = 0;    ///< D26: bytes readInto pread
+    int64_t     tooLargeOkPos_ = -1;   ///< review L6: a too-large batch read through cleanly (file position)
+    std::size_t tooLargeOkLen_ = 0;    ///< ... and its length
     bool     ownerRemap_ = true;
     uint64_t readMapFailures_ = 0;  // count of failed ensureReadMap() calls — see readMapFailures()
 };

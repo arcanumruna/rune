@@ -702,8 +702,13 @@ LogReadView LogSegment::readInto(int64_t startOffset, int32_t maxBytes, uint8_t*
     // A first batch too large for `buf` (rare: the caller may then serve it
     // through the read mapping).  Its bytes are read through once (into `buf`,
     // discarded) first: a bad / missing page answers IoError here instead of a
-    // SIGBUS in the mapped fallback (D26, fix65 review LOW-2).  Cold.
+    // SIGBUS in the mapped fallback (D26, fix65 review LOW-2).  Cold.  Lows
+    // A/B/C review L6: once per batch — a batch read through cleanly is
+    // remembered (position + length; forgotten at a truncate / recover) and a
+    // retry goes straight to the fallback (no second full read per attempt).
     auto tooLarge = [&](std::size_t at, std::size_t len) noexcept -> LogReadView {
+        const int64_t abs = pos0 + static_cast<int64_t>(at);
+        if (abs == tooLargeOkPos_ && len == tooLargeOkLen_) { st = ReadIntoStatus::FirstTooLarge; return {}; }
         for (std::size_t off = 0; off < len;) {
             const std::size_t n = std::min(bufCap, len - off);
             const ssize_t r = ::pread(fd_, buf, n, static_cast<off_t>(pos0) + static_cast<off_t>(at + off));
@@ -714,7 +719,10 @@ LogReadView LogSegment::readInto(int64_t startOffset, int32_t maxBytes, uint8_t*
             }
             if (r == 0) { ioErr = EIO; return failed(); }
             off += static_cast<std::size_t>(r);
+            readIntoBytes_ += static_cast<uint64_t>(r);
         }
+        tooLargeOkPos_ = abs;
+        tooLargeOkLen_ = len;
         st = ReadIntoStatus::FirstTooLarge;
         return {};
     };
@@ -897,6 +905,7 @@ int LogSegment::truncateInPlace(int64_t truncateOffset, int64_t& keptMaxTs) noex
     if (::ftruncate(fd_, static_cast<off_t>(pos)) != 0) return errno != 0 ? errno : EIO;
     const int64_t lastIdx = index_->truncateToPosition(static_cast<int64_t>(pos));
     logSize_ = static_cast<int64_t>(pos);
+    tooLargeOkPos_ = -1;   // review L6: the bytes past the cut may be rewritten
     // Walked the whole segment without reaching truncateOffset (pos == size):
     // nothing is cut.  A compacted segment's logical end can lie past its last
     // surviving batch, so keep it, capped at the requested offset (re-review-2
@@ -984,6 +993,7 @@ int64_t LogSegment::recover(bool syncIndex) {
         failSticky(errno);
     }
     logSize_ = validBytes; nextOffset_ = next;
+    tooLargeOkPos_ = -1;   // review L6
     if (syncedBytes_ > validBytes) syncedBytes_ = validBytes;   // E2 crash seam
     // E1d: recover() itself proves nothing durable — the owning Log decides
     // (trusted below the recovery point, fsynced in the validated region).

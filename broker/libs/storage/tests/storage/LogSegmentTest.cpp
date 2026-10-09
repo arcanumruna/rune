@@ -1093,6 +1093,44 @@ TEST(LogSegmentRegression, ReadIntoIoErrorFailsTheLogStickyAndIsNotRetriedRegres
     std::filesystem::remove_all(dir);
 }
 
+// Lows A/B/C review L6: a first batch too large for the caller's buffer is read
+// through once (to surface EIO before the mapped fallback) — on EVERY attempt:
+// a retrying follower / back-pressured consumer re-read the whole batch each
+// time (twice its size of I/O with the mapped read).  A batch already read
+// through cleanly is not read through again (until a truncate / recover).
+TEST(LogSegmentRegression, TooLargeFirstBatchIsReadThroughOnceRegression) {
+    auto dir = makeTempDir("rune_log_readinto_toolarge_once");
+    std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+    rune::storage::Log log(dir.string());
+    log.recover();
+    RecordBatchBuilder b(0, 1000);
+    b.append("k", std::string(100 * 1024, 'x'), 1000);   // one ~100 KiB batch
+    log.append(b.build(), 0);
+    std::vector<uint8_t> buf(64 * 1024);                  // smaller than the batch
+    LogSegment& seg = *log.segmentForTest(0);
+    ReadIntoStatus st = ReadIntoStatus::Ok;
+    const uint64_t b0 = seg.readIntoBytes();
+    (void)log.readInto(0, 4096, buf.data(), buf.size(), st);
+    ASSERT_EQ(st, ReadIntoStatus::FirstTooLarge);
+    const uint64_t first = seg.readIntoBytes() - b0;
+    ASSERT_GE(first, 100u * 1024) << "precondition: the first attempt reads the batch through (counted)";
+    (void)log.readInto(0, 4096, buf.data(), buf.size(), st);
+    ASSERT_EQ(st, ReadIntoStatus::FirstTooLarge);
+    const uint64_t second = seg.readIntoBytes() - b0 - first;
+    EXPECT_LT(second, 100u * 1024) << "the validated too-large batch was read through again";
+    // A truncate (the bytes at that position may change) forgets it.
+    ASSERT_TRUE(log.truncateTo(0));
+    RecordBatchBuilder c(0, 2000);
+    c.append("k", std::string(100 * 1024, 'y'), 2000);
+    log.append(c.build(), 0);
+    LogSegment& seg2 = *log.segmentForTest(0);
+    const uint64_t b2 = seg2.readIntoBytes();
+    (void)log.readInto(0, 4096, buf.data(), buf.size(), st);
+    ASSERT_EQ(st, ReadIntoStatus::FirstTooLarge);
+    EXPECT_GE(seg2.readIntoBytes() - b2, 100u * 1024) << "a truncated position stayed validated";
+    std::filesystem::remove_all(dir);
+}
+
 // D26 (fix65 review LOW-4): a read bounded by the HW / LSO a little past the
 // cursor (an acks=all leader whose LEO runs ahead) preads about one index
 // interval past the bound — not maxBytes.
