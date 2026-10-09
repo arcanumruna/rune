@@ -1862,6 +1862,7 @@ bool ProducerImpl::offerAttempt_(PartitionState& ps, InFlightBatch& b, int64_t n
         return false;
     }
     b.attemptTag   = next;
+    b.retriableBackoff = false;  // R2-n5: the backoff ended with this offer
     b.lastSendNs   = nowNs;
     b.lastSendTick = ++sendTick_;
     ++b.attempts;
@@ -2134,6 +2135,10 @@ int ProducerImpl::flushBatches(
 //         completes its batch), then re-sent on the current lane — that
 //         attempt's answer decides (C again).  Bounded by the attempt timer
 //         and the delivery timeout (D) when an old lane never answers.
+//         (R2-n2: an old-lane attempt that is never answered — e.g. its route
+//         publication was closed under it — keeps C2b in force: the head is
+//         re-parked every produceTimeoutMs until the delivery timeout fails it
+//         as outcome UNKNOWN (D).  Bounded and honest, never "not stored".)
 //     C3. b is the oldest and b.baseSequence != lastAckedSeq + 1 -> a failed
 //         predecessor left a gap; the OOS proves it was never written (else b
 //         would have been accepted), so b was not either: the partition is
@@ -2325,6 +2330,7 @@ void ProducerImpl::onProduceResponse(int64_t correlationId, int64_t baseOffset, 
                                      static_cast<uint16_t>(ec), 0.0);
         const int64_t backoffNs = std::min<int64_t>(kRetriableBackoffNs, cfg_.produceTimeoutMs * 1'000'000LL);
         b->attemptDeadlineNs = lastNowNs_ + backoffNs;
+        b->retriableBackoff  = true;  // R2-n5: a follower's OOS fast retransmit never cuts it short
         if (b->attemptDeadlineNs < earliestAttemptDeadlineNs_) earliestAttemptDeadlineNs_ = b->attemptDeadlineNs;
         return;
     }
@@ -2349,14 +2355,16 @@ void ProducerImpl::parkOutOfOrder_(PartitionState& ps, InFlightBatch& b) noexcep
     // NEWEST older batch of its identity, unless a parked batch lies between
     // (then the gap is upstream of that parked batch: already being handled).
     // Re-sent only if that frame's latest offer went out before this batch's
-    // (a stale OOS of a batch sent before the resend leaves it alone).
+    // (a stale OOS of a batch sent before the resend leaves it alone), and
+    // never while the gap waits out a retriable-error backoff (R2-n5: the
+    // MinIsrViolation backoff re-sends it; the follower's OOS proves nothing new).
     InFlightBatch* gap = nullptr;
     ps.inflight.anyOlderLive(b, [&](InFlightBatch& o) {
         if (o.producerId != b.producerId || o.producerEpoch != b.producerEpoch) return false;
         gap = o.oosParked ? nullptr : &o;
         return false;
     });
-    if (gap != nullptr && gap->lastSendTick <= b.lastSendTick) {
+    if (gap != nullptr && !gap->retriableBackoff && gap->lastSendTick <= b.lastSendTick) {
         gap->attemptDeadlineNs     = 0;
         earliestAttemptDeadlineNs_ = 0;
     }
@@ -2383,9 +2391,13 @@ bool ProducerImpl::staleLaneInFlight_(PartitionState& ps, const InFlightBatch& b
 
 void ProducerImpl::maybeEndLaneWait_(PartitionState& ps) noexcept {
     if (!ps.laneWait) return;
-    bool stale = false;
-    ps.inflight.forEachLive([&](InFlightBatch& o) { stale |= o.staleLaneOut != 0; });
-    if (stale) return;
+    // R2-n3: the same test that started the wait (staleLaneInFlight_, by the
+    // waiting head's identity) ends it — the head is the oldest parked batch.
+    const InFlightBatch* head = nullptr;
+    ps.inflight.forEachLive([&](InFlightBatch& o) {
+        if (head == nullptr && o.oosParked) head = &o;
+    });
+    if (head != nullptr && staleLaneInFlight_(ps, *head)) return;
     ps.laneWait = false;
     if (ps.parkedCount != 0) {  // the waiting head goes out again; its answer decides
         ps.resendParked = true;

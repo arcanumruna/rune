@@ -97,6 +97,10 @@ struct InFlightBatch {
     /// Task 16: queued for an in-order re-offer on the partition's new route
     /// (PartitionState::routeResend); the attempt timer leaves it to that pass.
     bool     routeResendPending = false;
+    /// Re-review 2 R2-n5: answered with a retriable error (MinIsrViolation) and
+    /// waiting out kRetriableBackoffNs; a follower's OOS fast retransmit leaves
+    /// it to that backoff.  Cleared by the next offer.
+    bool     retriableBackoff  = false;
     /// Re-review 1 NEW-4(b): the lane (PartitionState::laneGen) of the latest
     /// offer, the attempt tag of the first offer on it, and the attempts not yet
     /// answered on it / on EARLIER lanes.  Attempts on one lane reach the broker
@@ -163,6 +167,7 @@ public:
         if (b.corrId == 0) return;
         b.corrId = 0;
         b.routeResendPending = false;  // Task 16: never carried into the slot's next batch
+        b.retriableBackoff   = false;  // R2-n5: likewise
         --live_;
         while (tail_ != head_ && slots_[tail_ & mask_].corrId == 0) ++tail_;
     }
