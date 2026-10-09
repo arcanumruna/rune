@@ -1,9 +1,9 @@
 # Rune View Engine (single-source materialized views) — Design Spec
 
-**Status:** DRAFT — for review & enhancement
-**Date:** 2026-10-08
+**Status:** DRAFT — open decisions resolved 2026-10-09 (§15 #1/#7/#9); prerequisite shipped; ready for spec-review → plan
+**Date:** 2026-10-08 (decisions updated 2026-10-09)
 **Program:** Rune materialized-views foundation (follows 0a rune-codec ✅, 0b schema registry + typed transport ✅, 0c Rune QL & CLI ✅)
-**Depends on (prerequisite, lands first):** `2026-10-08-rune-schema-evolution-durable-tags-design.md` — durable per-topic field tags + versioned descriptors + compatibility modes. The view engine's field identity `(topicId, tag)` and version-aware fold come from it.
+**Depends on (prerequisite — SHIPPED 2026-10-09):** `2026-10-08-rune-schema-evolution-durable-tags-design.md` — durable per-topic field tags + versioned descriptors + compatibility modes. Implemented across rune-codec/protocol/broker/ql/client-cpp, merged locally into `feature/materialized-views`, e2e-green on real Aeron (k3s-node-01). The view engine's field identity `(topicId, tag)` and version-aware fold are now concrete: `FieldDescriptor::id` is a durable never-reused per-topic tag; the registry keeps versioned descriptors (`byIdVersion`/`byFingerprint`/`materializeAsOf`/`fingerprintAsOf`) and a per-record version-aware `readFieldByTag`.
 **Prior art in this program:** `docs/superpowers/specs/2026-09-29-rune-materialized-views-typed-topics-design.md`, `…-0b-…`, `…-0c-…`
 
 ---
@@ -89,9 +89,9 @@ Topics in Rune are **typed** (0b): every topic has a registered `Descriptor` in 
 - **`fieldId`** is the field's id *within that topic's schema*. It must be a **durable logical tag** — assigned once, **never reused**, retired/reserved when a field is removed, a fresh tag for each new field (Protobuf/Thrift/Avro discipline). With durable tags, `(topicId, fieldId)` is a stable *logical* identity across **arbitrary** schema evolution, additive or breaking: tag *N* always denotes "the field that was tag *N*"; a version that dropped it simply reports it absent, and a view referencing it stays coherent with no version qualifier.
 - **`schemaId` and `schemaVersion` are deliberately NOT part of the identity.** `schemaId` (fingerprint) is redundant with `topicId` for sourcing (the registry binds topic→schema). `schemaVersion` is a **per-record decode concern, not an identity component** — folding it into identity would give the same field a *new* identity every version, re-breaking compatibility and version-pinning every view. (The one world where you'd be forced to version-qualify identity is if tags were *reused* — which is exactly the discipline we reject.)
 
-> **Prerequisite / dependency (fix-on-sight on 0a/0b):** `FieldDescriptor::id` is currently a **positional index** (`f.id = fields_.size()`), stable only under append-only. The `(topicId, fieldId)` identity requires migrating it to a **durable never-reused tag**. Until that lands, field identity is only stable under additive-only evolution. See open decisions #8 and #9.
+> **Prerequisite (SHIPPED 2026-10-09):** `FieldDescriptor::id` is now a **durable never-reused per-topic tag** (identity = `(topicId, tag)`, never name/position), delivered by the schema-evolution foundation. Field identity is therefore stable under **arbitrary** evolution (additive or breaking), not just additive-only. See resolved decisions #8 and #9.
 
-**Version-aware decode (where `schemaVersion` actually lives).** For each committed record, the fold resolves `(topicId, fieldId) → physical accessor` using the Descriptor **for that record's schema version** (is the field present per `sinceVersion`? what offset/type/width in *this* version?). Under today's 0b **"single latest IR, additive-only"** this degenerates to one latest Descriptor reading all history; **non-additive evolution breaks "single latest IR"** — the registry must then keep a **versioned Descriptor history** (or upcast on write) and `readField` must become version-aware. That is a 0b/codec evolution item the view engine depends on, not one it can paper over.
+**Version-aware decode (where `schemaVersion` actually lives).** For each committed record, the fold resolves `(topicId, tag) → physical accessor` using the Descriptor **for that record's schema version** (is the field live per `sinceVersion ≤ V < untilVersion`? what offset/type/width in *this* version?). This is now realized by the shipped schema-evolution foundation: the registry keeps **per-version materialized descriptors** (`materializeAsOf(evolving, V)` recomputes offsets for the fields live at `V`), looked up via `byIdVersion`/`byFingerprint`, and `readFieldByTag` decodes a record against its own stamped writer version. The fold reads each record against its writer version's materialized descriptor — the per-record decode cost that the <10µs fold budget (§14.0) must absorb.
 
 **Uniqueness of the human alias at resolution time.** Since name is only an alias, the resolver must map it unambiguously to one `(topicId, fieldId)`: `DescriptorBuilder::add` does not reject duplicate names, `build()` has no dup check, and `find()` returns **first match**; duplicate names are rejected only at the Rune QL layer (`rune-ql Parser.cpp:241`). So at `DefineView` the resolver **asserts uniqueness** (a name resolving to >1 field is a define-time error) rather than trusting first-match.
 
@@ -228,7 +228,7 @@ Per (view, partition), owned by the worker:
    };
    ```
    The worker **bulk-copies** the flat table + arena + current fold cursor into a `ViewSnapshot`, capturing offset and data **together** in one cut, and publishes `std::shared_ptr<const ViewSnapshot>` via `std::atomic_store` (exactly `publishSealedSnapshot`). The worker's only cost is the **memcpy** of two contiguous regions; it keeps folding immediately — the published snapshot is frozen and refcounted alive.
-2. **Background serialize (off the worker).** A background snapshot-IO thread (ownership = **OPEN DECISION, §9.5**) takes the published `shared_ptr`, serializes it, and writes it **atomically**: `view-<id>-<partition>.snap.tmp` → `fsync` → `rename` → `fsync` dir, with `appliedOffset` + CRC32C in the header (the `ProducerStateManager`/`LeaderEpochCache` pattern). It touches only the immutable snapshot, never the live table.
+2. **Background serialize (off the worker).** A background snapshot-IO thread (ownership = **dedicated per-node view-snapshot IO thread**, resolved §9.5) takes the published `shared_ptr`, serializes it, and writes it **atomically**: `view-<id>-<partition>.snap.tmp` → `fsync` → `rename` → `fsync` dir, with `appliedOffset` + CRC32C in the header (the `ProducerStateManager`/`LeaderEpochCache` pattern). It touches only the immutable snapshot, never the live table.
 3. **Ack / reclaim (ring).** On completion the IO thread signals back over an SPSC ring; the worker drops/reuses the snapshot buffer in its duty cycle. **Ping-pong two snapshot buffers** per (view, partition) so steady-state snapshotting is allocation-free (#4) — the worker refills buffer B next interval while the IO thread may still hold buffer A until its ack.
 
 ### 9.3 Atomicity guarantee (the core requirement)
@@ -242,14 +242,11 @@ The snapshot file is **one artifact** with `appliedOffset` in its header, writte
 3. Replay the **source log `[O+1, HW)`** through the same `foldRecord` (§6.1) — the `rebuildFromLog` scan, but **starting at `O`** (the checkpoint-offset skip that is new, §9.1 gap b).
 4. Result: the exact latest view. Deterministic (§11) — the fold is a pure function of the log prefix, so replay reproduces the identical table.
 
-### 9.5 OPEN DECISION — which thread runs the background serialize+write?
+### 9.5 RESOLVED (2026-10-09) — a dedicated per-node view-snapshot IO thread
 
-> **Needs your call on the file.** Two options:
->
-> - **(a) Dedicated per-node "view-snapshot" IO thread** (its own `AgentRunner`, like `AdminWorker`). Clean separation of concerns; owns only view-snapshot serialization. One more thread. **← my recommendation** (the cleaner is compaction-focused and already busy pre-provisioning segments; mixing view-snapshot IO widens its responsibility).
-> - **(b) Extend `LogCleanerAgent`** into a general "background storage maintenance" thread. Reuses the exact atomic-`shared_ptr` + ring machinery with zero new thread; widens the cleaner's remit.
->
-> Either way the **mechanism** (immutable `shared_ptr` publish + background serialize + atomic temp-rename + ring ack + replay-from-checkpoint) is identical. Pin this at plan time.
+**Decision:** the background serialize+write runs on a **dedicated per-node "view-snapshot" IO thread** — its own `AgentRunner` (like `AdminWorker`), owning only view-snapshot serialization. Clean separation of concerns at the cost of one more thread per node. Rejected: extending `LogCleanerAgent` into a general "background storage maintenance" thread — the cleaner is compaction-focused and already busy pre-provisioning segments, so mixing view-snapshot IO would widen its remit.
+
+The **mechanism** is unchanged by this choice: immutable `shared_ptr` publish (worker) → background serialize on the view-snapshot thread → atomic temp→`fsync`→rename → SPSC ring ack → replay-from-checkpoint on restart.
 
 ### 9.6 Rejected alternatives (recorded)
 
@@ -318,17 +315,22 @@ The schema-evolution prerequisite's decode path (`readField`-by-tag against a ma
 - **Benchmarks (gated against §14.0):** fold update latency per event batch **< 10 µs** p99 (zero-alloc verified); `GetViewRow` single-node **< 50 µs** p99; multi-node query **< 200 µs** p99; plus snapshot cut pause (worker memcpy time vs table size) and produce-path regression (fold off the critical path must not move produce latency — ABAB n≥15, #12). A benchmark that exceeds its §14.0 budget is a failing gate, not a note.
 - **Regression suite:** every fix gets a `*Regression*` test; full regression suite runs first on every change (#6/#7).
 
-## 15. Open decisions for review
+## 15. Decisions
 
-1. **§9.5 — snapshot-IO thread ownership:** dedicated view-snapshot thread (recommended) vs extend `LogCleanerAgent`.
+**Load-bearing decisions #1, #7, #9 resolved 2026-10-09** (bodies updated in §9.5, §6.0, §9 below). Items #2–#6 carry sound proposed defaults and are confirmed at plan time; #8 was already resolved into the prerequisite spec.
+
+1. **§9.5 — snapshot-IO thread ownership (RESOLVED):** a **dedicated per-node view-snapshot IO thread** (own `AgentRunner`). Rejected: extending `LogCleanerAgent`. See §9.5.
 2. **Snapshot trigger policy:** time *T* only, offset-delta *N* only, or both (whichever first)? Default proposal: both, whichever fires first, with *T* and *N* configurable per view.
 3. **Snapshot granularity:** one artifact per (view, partition) (proposed) vs one per view across its partitions. Per-(view,partition) matches worker ownership and parallel IO; confirm.
 4. **Very large views:** accept the bulk-copy pause now + benchmark, defer chunked/COW (proposed) — confirm the threshold at which we'd revisit.
 5. **Arena compaction timing:** at snapshot cut vs on load vs incremental — proposed: rebuilt dense at load, amortized-reserve on the hot path, compacted during the snapshot copy.
 6. **`DefineView` field defaults:** default `MergeRule` = `Replace`; key field must appear in `output`; reject non-numeric `Sum/Min/Max` at define time — confirm.
-7. **Field-name uniqueness enforcement point (fix-on-sight candidate, §6.0):** today duplicate field names are rejected only by Rune QL (`Parser.cpp:241`); the codec `DescriptorBuilder`/`build()` and broker `DefineTopic` do not. The view resolver will assert uniqueness defensively, but the *sound* fix is to enforce it at schema **registration** (`DefineTopic`/registry or `DescriptorBuilder::build`), so every consumer — not just views — is protected and `find()`'s first-match is always safe. Decide whether to land that broker/codec enforcement as part of this work (recommended) or defer it with the view-side assertion as the stopgap.
-8. **Durable field tags vs positional ids (RESOLVED — promoted to prerequisite spec):** `(topicId, fieldId)` identity requires `fieldId` to be a durable never-reused tag. This is now its own prerequisite foundation sub-project: **`docs/superpowers/specs/2026-10-08-rune-schema-evolution-durable-tags-design.md`** (durable numeric per-topic tags + versioned descriptor + compatibility modes + `ALTER TOPIC`). The view engine **depends on** it and lands after it. The view spec's field identity is concretely `(topicId, tag)` from that spec; this spec's §6.0 is realized there.
-9. **View-vs-schema-evolution compatibility policy (still open, this spec):** when a field a view references is dropped/retyped, what happens? The prerequisite spec decided the schema layer stays **one-way independent** — a DROP of a view-bound tag degrades to **absent** (nullable) rather than being blocked at the schema layer (see that spec §11 and its decision #6). This spec must still choose the *view-side* policy: (a) accept graceful-absent, (b) validate view references and warn/reject at `DefineView`-time against a version range, or (c) require view redefinition on a breaking change. Pick the view-side policy.
+7. **Field-name uniqueness enforcement point (RESOLVED — fix-on-sight, rule #8):** enforce duplicate-name rejection at schema **registration** — `DescriptorBuilder::build()` (codec) and broker `DefineTopic` — so every consumer (views, typed clients, QL), not just Rune QL's parser (`Parser.cpp:241`), is protected and `Descriptor::find()`'s first-match is always safe. The view resolver additionally asserts uniqueness defensively. This codec/broker enforcement lands as part of this work (a small, bounded scope addition), with its own `*Regression*` test.
+8. **Durable field tags vs positional ids (RESOLVED — promoted to prerequisite spec):** `(topicId, fieldId)` identity requires `fieldId` to be a durable never-reused tag. This is now its own prerequisite foundation sub-project: **`docs/superpowers/specs/2026-10-08-rune-schema-evolution-durable-tags-design.md`** (durable numeric per-topic tags + versioned descriptor + compatibility modes + `ALTER TOPIC`). The view engine **depends on** it and lands after it (**prerequisite SHIPPED 2026-10-09** — see header). The view spec's field identity is concretely `(topicId, tag)` from that spec; this spec's §6.0 is realized there.
+9. **View-vs-schema-evolution compatibility policy (RESOLVED):** **graceful-absent at runtime + validation at `DefineView` time.** The schema layer stays one-way independent — a DROP of a view-bound tag degrades the tag to **absent** rather than being blocked at the schema layer (prerequisite spec §11, decision #6). On top of that, the view side:
+   - **At `DefineView`:** the AdminWorker validates every referenced `(topicId, name→tag)` against the source topic's current Descriptor and **rejects** obvious errors — a name that does not resolve, or a tag already dropped at the bound version. (A later-defined view over an already-evolved topic cannot silently reference a field that no longer exists.)
+   - **At runtime:** a field dropped by a *later* `ALTER TOPIC DROP` degrades to **null/absent** in the view column for records written after the drop; the fold never wedges and the view stays coherent (`(topicId, tag)` identity + `isLiveAt` per writer version). No view invalidation, no coupling of `ALTER TOPIC` to view lifecycle.
+   - Retype is treated as drop-old-tag + add-new-tag at the schema layer, so a view bound to the old tag sees it go absent (same runtime rule); a view wanting the new field is redefined to reference the new tag.
 
 ## 16. Deferred follow-ons (program-level)
 
