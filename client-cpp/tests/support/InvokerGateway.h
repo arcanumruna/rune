@@ -645,6 +645,18 @@ struct InvokerGateway {
         send(from, out.data(), n);
     }
 
+    /// Push one Records frame carrying a caller-built RecordBatch (any keys /
+    /// values / record count) at baseOffset to a subscription.
+    void pushBatch(const Subscribed& sub, int64_t baseOffset, const std::vector<uint8_t>& batch) {
+        namespace rcc = rune::client::codec;
+        std::vector<uint8_t> out(batch.size() + 256);
+        const std::size_t n = rcc::encodeRecords(out.data(), out.size(), sub.subscriptionId,
+                                                 sub.topicId, sub.partition, baseOffset,
+                                                 std::span<const uint8_t>(batch), sub.sessionId,
+                                                 stampSubscribeCorr ? sub.corrId : 0);
+        send(replyFromArrival ? sub.endpoint : 0, out.data(), n);
+    }
+
     void releaseHeld() {
         std::vector<Produced> h;
         h.swap(held);
