@@ -150,6 +150,20 @@ static std::vector<uint8_t> makeBatchWithValue(const std::vector<uint8_t>& recVa
     return b.build();
 }
 
+/// Build a record batch containing MULTIPLE records, one per entry of
+/// `values` -- used to simulate a producer that evolved mid-batch (GC3 /
+/// C51-55): a single RecordBatch whose records carry different schema
+/// versions.
+static std::vector<uint8_t> makeBatchWithValues(const std::vector<std::vector<uint8_t>>& values) {
+    RecordBatchBuilder b(0, /*baseTimestamp=*/1000);
+    std::string_view key{};
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        std::string_view val(reinterpret_cast<const char*>(values[i].data()), values[i].size());
+        b.append(key, val, 1000 + static_cast<int64_t>(i));
+    }
+    return b.build();
+}
+
 /// An EMPTY record value (too short to satisfy any descriptor).
 static std::vector<uint8_t> makeEmptyValue() { return {}; }
 
@@ -538,6 +552,108 @@ TEST(ProduceValidationRegression, UnknownSchemaVersionRejectedRegression) {
            "whichever other version happens to be installed";
     EXPECT_EQ(h.log->logEndOffset(), leoBefore)
         << "no append for an unknown schema version";
+}
+
+// ---------------------------------------------------------------------------
+// GC3 (C51-55, N14-18): hot-path mixed-version batch -- a SINGLE RecordBatch
+// containing records of DIFFERENT writer versions (a producer that evolved
+// mid-batch, or a replay that stitches versions together). Each record must
+// be validated against its OWN stamped version's validator -- the per-record
+// (topicId, version) lookup in schemaRejects_ (Worker.h), never a single
+// topic-wide/latest validator.
+// ---------------------------------------------------------------------------
+TEST(ProduceValidation, MixedVersionBatch_Regression_EachRecordValidatesAgainstItsOwnVersion) {
+    WorkerHarness h;
+    const int32_t topicId = 1;
+
+    const Descriptor evolving = makePeopleEvolvingDescriptor();
+    const Descriptor v1 = rune::codec::materializeAsOf(evolving, 1);   // {id, age}
+    const Descriptor v2 = rune::codec::materializeAsOf(evolving, 2);   // {id, score}
+    h.enqueueSchemaUpdate(topicId, rune::codec::serialize(v1), /*version=*/1);
+    h.enqueueSchemaUpdate(topicId, rune::codec::serialize(v2), /*version=*/2);
+    h.tick();
+    ASSERT_TRUE(h.worker->hasValidatorForTest(topicId, 1));
+    ASSERT_TRUE(h.worker->hasValidatorForTest(topicId, 2));
+
+    // A single batch mixing a valid v1 record and a valid v2 record. No
+    // cross-version false reject: both are well-formed under their OWN
+    // stamped version, so the whole batch must be accepted and appended.
+    {
+        const int64_t leoBefore = h.log->logEndOffset();
+        auto v1rec = makePeopleRecordValue(/*version=*/1, /*id=*/1, /*extra=*/30, /*extraIsI64=*/false);
+        auto v2rec = makePeopleRecordValue(/*version=*/2, /*id=*/2, /*extra=*/99, /*extraIsI64=*/true);
+        auto batch = makeBatchWithValues({v1rec, v2rec});
+        h.enqueueProduceBatch(topicId, /*partition=*/0, std::move(batch));
+        h.tick();
+        EXPECT_EQ(h.lastErrorCode, static_cast<int16_t>(0))
+            << "a batch mixing valid v1 and v2 records must not be rejected";
+        EXPECT_EQ(h.log->logEndOffset(), leoBefore + 2)
+            << "both records of the mixed-version batch must be appended";
+    }
+
+    // Same batch shape, but the v2-stamped record carries the RETIRED v1
+    // (age) layout. The v-keyed lookup must catch THIS specific record even
+    // though the other (v1) record in the SAME batch is perfectly valid --
+    // proof the per-record version key is actually used, not a single
+    // version check hoisted for the whole batch. The batch is atomic: one
+    // bad record rejects the whole batch, nothing partially appends.
+    {
+        const int64_t leoBefore = h.log->logEndOffset();
+        auto v1rec   = makePeopleRecordValue(/*version=*/1, /*id=*/3, /*extra=*/31, /*extraIsI64=*/false);
+        auto badV2rec = makePeopleRecordValue(/*version=*/2, /*id=*/4, /*extra=*/32, /*extraIsI64=*/false);
+        auto batch = makeBatchWithValues({v1rec, badV2rec});
+        h.enqueueProduceBatch(topicId, /*partition=*/0, std::move(batch));
+        h.tick();
+        static constexpr int16_t kSchemaValidationFailed = 24;
+        EXPECT_EQ(h.lastErrorCode, kSchemaValidationFailed)
+            << "a mixed-version batch with one mis-versioned record must be rejected as a whole";
+        EXPECT_EQ(h.log->logEndOffset(), leoBefore)
+            << "no partial append -- batch validation is atomic";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GC3 (N9-13): forward-read at the worker. A worker has installed the
+// validator for vK ONLY (v(K+1)'s ALTER has not yet been fanned out to this
+// worker). It is handed a genuinely well-formed v(K+1) record -- a field
+// ("score") that was added AFTER vK. Per schemaRejects_ (Worker.h, the
+// per-record lookup keyed by the record's own stamped (topicId, version)):
+// an unknown version is a HARD REJECT ("unknown schema version") -- it is
+// NEVER validated against whichever OTHER version happens to be installed
+// for the same topic, even a strict-prefix older one. This matches (and
+// pins) the exact production behavior read from Worker.h's schemaRejects_.
+// ---------------------------------------------------------------------------
+TEST(ProduceValidationRegression, ForwardReadRecordNewerThanInstalledValidatorRejectedRegression) {
+    WorkerHarness h;
+    const int32_t topicId = 1;
+
+    const Descriptor evolving = makePeopleEvolvingDescriptor();
+    const Descriptor v1 = rune::codec::materializeAsOf(evolving, 1);   // {id, age}
+
+    // Only v1 is installed -- the worker has not received v2's (id+score)
+    // validator fan-out yet.
+    h.enqueueSchemaUpdate(topicId, rune::codec::serialize(v1), /*version=*/1);
+    h.tick();
+    ASSERT_TRUE(h.worker->hasValidatorForTest(topicId, 1));
+    ASSERT_FALSE(h.worker->hasValidatorForTest(topicId, 2));
+
+    const int64_t leoBefore = h.log->logEndOffset();
+
+    // A record stamped v2, using v2's OWN (id+score, 16-byte) layout -- a
+    // genuinely well-formed v2 record; it simply arrives at a worker that
+    // doesn't know v2 yet.
+    auto batch = makeBatchWithValue(
+        makePeopleRecordValue(/*version=*/2, /*id=*/9, /*extra=*/42, /*extraIsI64=*/true));
+    h.enqueueProduceBatch(topicId, /*partition=*/0, std::move(batch));
+    h.tick();
+
+    static constexpr int16_t kSchemaValidationFailed = 24;
+    EXPECT_EQ(h.lastErrorCode, kSchemaValidationFailed)
+        << "forward-read: a well-formed v2 record at a worker with only the v1 validator "
+           "installed must be rejected as an unknown schema version, never accepted or "
+           "mis-validated against the v1 validator";
+    EXPECT_EQ(h.log->logEndOffset(), leoBefore)
+        << "no append for a record whose stamped version has no installed validator";
 }
 
 } // namespace
