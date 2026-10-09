@@ -768,6 +768,10 @@ TEST(EmbeddedDriverWakeRegression, PeerDownNeverLeavesWakeFdsReadyAfterAnIdlePas
     // readable between passes: the only readiness these send-only sockets can have).  Without it the quiet-park
     // assertions below would pass vacuously if setup frames / ICMP stopped (an Aeron upgrade, a sysctl, a route).
     int pendingSeen = 0;
+    // Second witness (client 35924fb): an epoll_wait of the SENDER poller that selected a socket — these
+    // send-only sockets have no peer, so a selection is an EPOLLERR the pass consumed.  It does not depend on
+    // catching the error between two sub-microsecond passes (the next poll usually consumes it first).
+    (void)drv.epollSelectedForTest(/*reset=*/true);
     for (int round = 0; round < 3; ++round) {
         // Setup frames go out every ~100 ms: pump until an ICMP error is pending (a wake fd readable after a
         // pass) or 350 ms (>= 3 setup frames per publication) have passed.
@@ -784,11 +788,12 @@ TEST(EmbeddedDriverWakeRegression, PeerDownNeverLeavesWakeFdsReadyAfterAnIdlePas
     // Some network namespaces (Docker bridge / container CI) never deliver the
     // port-unreachable error to the sender — that environment cannot exercise
     // the path, so it SKIPS (loudly) instead of passing vacuously or failing.
-    if (pendingSeen == 0) {
+    const int errorsConsumed = drv.epollSelectedForTest(/*reset=*/false);
+    if (pendingSeen == 0 && errorsConsumed == 0) {
         p1.reset();
         p2.reset();
         a.reset();
-        GTEST_SKIP() << "no ICMP port-unreachable error was ever pending in this network namespace — "
+        GTEST_SKIP() << "no ICMP port-unreachable error was ever delivered in this network namespace — "
                         "the peer-down path cannot be exercised here";
     }
     p1.reset();
