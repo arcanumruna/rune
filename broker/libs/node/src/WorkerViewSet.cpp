@@ -77,18 +77,66 @@ ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition
     return &ins->second;
 }
 
+void WorkerViewSet::installViewForRecovery(
+    rune::view::CompiledViewPlan plan, rune::view::RowLayout layout,
+    rune::codec::Descriptor evolvingSrc, bool persisted, int32_t partition,
+    std::span<const uint8_t> base,
+    std::span<const std::span<const uint8_t>> deltasInOrder, int64_t committedTail) {
+    const int32_t viewTopicId = plan.viewTopicId;
+
+    // Register the plan template + reactor index exactly as the normal path does
+    // (moves plan/layout/evolvingSrc into templates_).
+    installView(std::move(plan), std::move(layout), std::move(evolvingSrc), persisted);
+
+    // Eagerly build the (view, partition) instance from the just-installed
+    // template (recovery is partition-specific; it must not wait for a lazy
+    // first driveFolds).
+    ViewInstance* inst = getOrCreate_(viewTopicId, partition);
+    if (inst == nullptr) return;  // defensive: template must exist (just installed)
+
+    // RECOVERING: load this instance's on-disk checkpoint into its table.  O is
+    // the highest applied checkpoint offset (the cursor that WAS persisted — the
+    // exclusive "resume from" offset, see buildAndPushCheckpoint_), or -1 when
+    // nothing applied (empty/missing checkpoint) -> foldCursor starts at 0.
+    const int64_t recoveredO = rune::view::replay(inst->table, inst->layout, base, deltasInOrder);
+    inst->foldCursor   = std::max<int64_t>(recoveredO, 0);
+    inst->lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
+
+    // REBUILDING_VIEWS unless the source is already caught up (then Ready now:
+    // e.g. a brand-new view over an empty source, committedTail == 0).  Local
+    // decision only — no peer/cluster input.
+    inst->readiness = (inst->foldCursor >= committedTail) ? ViewReadiness::Ready
+                                                          : ViewReadiness::RebuildingViews;
+}
+
+ViewReadiness WorkerViewSet::readiness(int32_t viewTopicId, int32_t partition) const {
+    auto it = views_.find(instKey(viewTopicId, partition));
+    if (it == views_.end()) return ViewReadiness::Ready;  // nothing hosted => nothing to gate
+    return it->second.readiness;
+}
+
 const uint8_t* WorkerViewSet::getRow(int32_t viewTopicId, int32_t partition, uint64_t key,
-                                     const rune::view::RowLayout*& outLayout) const {
+                                     const rune::view::RowLayout*& outLayout,
+                                     RowStatus* outStatus) const {
     auto it = views_.find(instKey(viewTopicId, partition));
     if (it == views_.end()) {
         // Serve the layout from the template if the view is installed but this
         // partition has not folded yet; row is still absent.
         auto tit = templates_.find(viewTopicId);
         outLayout = tit != templates_.end() ? &tit->second.layout : nullptr;
+        if (outStatus != nullptr) *outStatus = RowStatus::NotFound;
         return nullptr;
     }
     outLayout = &it->second.layout;
-    return it->second.table.get(key);
+    // SERVE-GUARD: a view still rebuilding after a restart must NEVER serve a
+    // half-built row — surface a RETRIABLE not-ready instead (Review-focus #5).
+    if (it->second.readiness != ViewReadiness::Ready) {
+        if (outStatus != nullptr) *outStatus = RowStatus::NotReady;
+        return nullptr;
+    }
+    const uint8_t* row = it->second.table.get(key);
+    if (outStatus != nullptr) *outStatus = (row != nullptr) ? RowStatus::Ok : RowStatus::NotFound;
+    return row;
 }
 
 int WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst) {

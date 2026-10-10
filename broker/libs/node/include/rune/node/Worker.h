@@ -645,6 +645,16 @@ public:
     void setViewSet(WorkerViewSet* vs) noexcept { viewSet_ = vs; }
     [[nodiscard]] WorkerViewSet* viewSet() const noexcept { return viewSet_; }
 
+    // Task 16: this worker's view restart-readiness, for the GetViewRow serve
+    // gate (Task 20) and the node election-eligibility gate (BrokerNode, Task
+    // 19).  INERT (true) when no view set is attached — exactly like the T15
+    // nullptr guard — so the no-views case never gates serving/elections closed.
+    // True iff every (view, partition) this worker hosts-for-recovery is Ready;
+    // reaches true purely from local checkpoint + log replay (no cluster input).
+    [[nodiscard]] bool viewsReady() const noexcept {
+        return viewSet_ == nullptr || viewSet_->allViewsReady();
+    }
+
     // Self-contained worker shard (spec §3.1).  Set before the runner starts.
     void setShardMode(bool on) noexcept { shardMode_ = on; }
     [[nodiscard]] bool shardMode() const noexcept { return shardMode_; }

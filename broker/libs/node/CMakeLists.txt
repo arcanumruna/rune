@@ -146,6 +146,7 @@ if(BUILD_TESTING)
         tests/node/RingDoorbellTest.cpp
         tests/node/ViewSnapshotIoAgentTest.cpp
         tests/node/WorkerViewSetTest.cpp
+        tests/node/ViewReadinessRegressionTest.cpp
         )
     target_link_libraries(rune_node_tests PRIVATE
         rune_node

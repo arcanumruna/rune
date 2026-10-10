@@ -36,8 +36,10 @@
 // return a real progress count (records folded + deltas pushed/held) so the
 // node's idle strategy never backs off while view work is pending.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -53,6 +55,26 @@
 #include <rune/node/ViewSnapshotChannel.h>
 
 namespace rune::node {
+
+// Task 16: restart readiness of ONE (view, partition) instance.
+//
+//   Recovering       — transient: loading this instance's on-disk checkpoint
+//                      (base + deltas) via rune::view::replay.  Not observed at
+//                      rest: installViewForRecovery performs the load inline and
+//                      leaves the instance in RebuildingViews (or Ready).
+//   RebuildingViews  — checkpoint loaded (foldCursor = recovered O); the
+//                      committed source tail (foldCursor, committedTail] still
+//                      has to be folded.  A GetViewRow here is a RETRIABLE
+//                      not-ready — NEVER a half-built row (Review-focus #5).
+//   Ready            — foldCursor >= committedTail; the table is fully caught up
+//                      and may be served.
+//
+// The machine is LOCAL-ONLY: it reaches Ready purely from this node's own
+// checkpoint + a replay of its own committed source log — no cluster/peer
+// dependency, no cross-thread coordination.  It is bounded by the checkpoint
+// cadence (each rebuild pass folds a bounded committed range), deadlock-free,
+// and monotone (Recovering -> RebuildingViews -> Ready, never backwards).
+enum class ViewReadiness : uint8_t { Recovering, RebuildingViews, Ready };
 
 // One installed materialized view on this worker, for ONE partition.  MOVABLE
 // (lives by value in `views_`): it declares only a converting constructor, so
@@ -73,6 +95,13 @@ struct ViewInstance {
     // Task 19).  Never mistake it for a durable/recoverable offset.
     int64_t                            lastEncodedO    = -1;
     bool                               persisted       = true;
+
+    // Task 16 restart readiness of THIS (view, partition).  Defaults to Ready:
+    // an instance created on the normal (non-recovery) driveFolds path is
+    // serve-ready immediately, so the serve-guard is INERT for every existing
+    // path.  installViewForRecovery is the ONLY writer that lowers it to
+    // RebuildingViews; driveRebuild is the only one that raises it back to Ready.
+    ViewReadiness                      readiness       = ViewReadiness::Ready;
 
     // A checkpoint delta encoded but not yet pushed (ring back-pressure).  Held
     // and retried next pass — the fold is NEVER re-run for already-drained
@@ -105,6 +134,79 @@ public:
     // for that partition (the stored template has everything lazy-create needs).
     void installView(rune::view::CompiledViewPlan plan, rune::view::RowLayout layout,
                      rune::codec::Descriptor evolvingSrc, bool persisted);
+
+    // Task 16: install a view FOR RECOVERY for ONE partition.  Registers the
+    // plan template (like installView) AND eagerly creates the (view, partition)
+    // instance, then loads its on-disk checkpoint into the partition's table via
+    // rune::view::replay(base, deltasInOrder) — setting foldCursor to the
+    // recovered O (the highest applied checkpoint offset; 0 for an empty/missing
+    // checkpoint, since replay returns -1).  The instance is left:
+    //   * Ready            if foldCursor >= committedTail (source already caught
+    //                      up — e.g. a brand-new view over an empty source,
+    //                      committedTail == 0), or
+    //   * RebuildingViews  otherwise — the committed tail (foldCursor,
+    //                      committedTail] must be folded by driveRebuild before
+    //                      the instance serves.
+    // `base` may be empty (no checkpoint); `deltasInOrder` are the differential
+    // deltas after the base, oldest first.  Caller supplies both from disk (the
+    // ViewSnapshotIoAgent / BrokerNode startup load); this core is agnostic to
+    // where the bytes came from, which keeps it deterministically testable.
+    void installViewForRecovery(rune::view::CompiledViewPlan plan,
+                                rune::view::RowLayout layout,
+                                rune::codec::Descriptor evolvingSrc, bool persisted,
+                                int32_t partition, std::span<const uint8_t> base,
+                                std::span<const std::span<const uint8_t>> deltasInOrder,
+                                int64_t committedTail);
+
+    // Status of a getRow probe — lets the serve path (Task 20) distinguish an
+    // absent key (terminal NotFound) from a view still rebuilding (RETRIABLE
+    // NotReady) from a served row (Ok).  getRow returns the row pointer; this is
+    // the out-of-band reason when it returns nullptr.
+    enum class RowStatus : uint8_t { Ok, NotFound, NotReady };
+
+    // Readiness of the (view, partition) instance.  Returns Ready when no such
+    // instance is hosted here (nothing to gate — consistent with allViewsReady
+    // over an empty hosted set).
+    [[nodiscard]] ViewReadiness readiness(int32_t viewTopicId, int32_t partition) const;
+
+    // True iff EVERY hosted (view, partition) instance is Ready.  Empty hosted
+    // set => true, so the serve/election gate is INERT when no view is
+    // installed-for-recovery (never gates the no-views case closed).  noexcept:
+    // a pure read over worker-owned state.
+    [[nodiscard]] bool allViewsReady() const noexcept {
+        for (const auto& kv : views_) {
+            if (kv.second.readiness != ViewReadiness::Ready) return false;
+        }
+        return true;
+    }
+
+    // Drive the restart rebuild for every view interested in (srcTopicId,
+    // partition) that is still RebuildingViews: fold the committed range
+    // [foldCursor, committedTail) through the SAME driveFolds machinery (same
+    // readRange idiom), then flip that instance RebuildingViews -> Ready once
+    // foldCursor >= committedTail.  committedTail is the source partition's LSO
+    // (passed in by the caller, exactly as driveFolds' `bound`).  Templated so
+    // readRange inlines (no std::function).  Returns the progress count (records
+    // folded + deltas handled this pass) so the idle strategy stays hot while a
+    // rebuild is pending.  Bounded: each pass folds at most one committed range;
+    // the loop is driven under a hard cap by the caller, never `while(!ready)`.
+    template <class ReadRangeFn>
+    int driveRebuild(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange,
+                     int64_t committedTail, int64_t nowNs) {
+        (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
+        auto it = subscriptionIndex_.find(srcTopicId);
+        if (it == subscriptionIndex_.end()) return 0;
+        int work = 0;
+        for (int32_t viewTopicId : it->second) {
+            auto vit = views_.find(instKey(viewTopicId, partition));
+            if (vit == views_.end()) continue;  // not hosted-for-recovery here
+            ViewInstance& inst = vit->second;
+            if (inst.readiness == ViewReadiness::Ready) continue;  // already caught up
+            work += driveView_(inst, readRange, committedTail);
+            if (inst.foldCursor >= committedTail) inst.readiness = ViewReadiness::Ready;
+        }
+        return work;
+    }
 
     // True when at least one installed view is interested in `srcTopicId`.  The
     // Worker uses this to skip the rc/bound computation for an owned partition
@@ -140,8 +242,16 @@ public:
     // outLayout to the view's RowLayout.  The caller (Task 20's GetViewRow
     // handler) knows the owning partition for the key.  const: a pure read of
     // worker-owned state.
+    //
+    // SERVE-GUARD (Task 16, Review-focus #5): when the hosted instance is NOT
+    // Ready (still RebuildingViews/Recovering after a restart) getRow returns
+    // nullptr with `*outStatus = NotReady` — a RETRIABLE not-ready that the
+    // GetViewRow serve path surfaces so a probe never sees a half-built row.
+    // `outStatus` is optional (nullptr ignores it), keeping every existing
+    // 4-arg caller unchanged.
     const uint8_t* getRow(int32_t viewTopicId, int32_t partition, uint64_t key,
-                          const rune::view::RowLayout*& outLayout) const;
+                          const rune::view::RowLayout*& outLayout,
+                          RowStatus* outStatus = nullptr) const;
 
     // Number of times a fold was refused because a (view, partition) was
     // already at its §10 maxRows hard ceiling (observable capacity signal).
