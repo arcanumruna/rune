@@ -1,12 +1,13 @@
-add_library(rune_view INTERFACE)   # header-only until Task 2 adds a .cpp; switch to STATIC then
-target_include_directories(rune_view INTERFACE
+add_library(rune_view STATIC
+    src/ViewRow.cpp)
+target_include_directories(rune_view PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     ${RUNE_PROTOCOL_INCLUDE})
-target_link_libraries(rune_view INTERFACE rune_codec)
+target_link_libraries(rune_view PUBLIC rune_codec)
 
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
-    add_executable(rune_view_tests tests/view/ViewTypesTest.cpp)
+    add_executable(rune_view_tests tests/view/ViewTypesTest.cpp tests/view/ViewRowTest.cpp)
     target_link_libraries(rune_view_tests PRIVATE rune_view rune_codec GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_view_tests)
