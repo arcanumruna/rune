@@ -35,17 +35,7 @@ void WorkerViewSet::installView(rune::view::CompiledViewPlan plan,
                                 rune::codec::Descriptor evolvingSrc, bool persisted) {
     const int32_t viewTopicId = plan.viewTopicId;
 
-    // ViewTable sizing from the WITH-clause knobs: capacity -> initial index
-    // slots (rounded up to a power of two; 0 => the table's own default),
-    // chunkBytes -> row-slab chunk size.
-    const std::size_t indexSlots = plan.sizing.capacity != 0
-                                       ? ceilPow2(plan.sizing.capacity)
-                                       : std::size_t{4096};
-    const std::size_t chunkBytes = plan.sizing.chunkBytes != 0
-                                       ? static_cast<std::size_t>(plan.sizing.chunkBytes)
-                                       : (std::size_t{32} << 20);
-
-    // Reactor index: every source topic of this view points at it.  Register
+    // Reactor index: every source topic of this view points at it.  Registered
     // before the move so plan.sourceTopicId is still readable.
     for (int32_t srcTopicId : plan.sourceTopicId) {
         auto& ids = subscriptionIndex_[srcTopicId];
@@ -54,24 +44,54 @@ void WorkerViewSet::installView(rune::view::CompiledViewPlan plan,
         if (!present) ids.push_back(viewTopicId);
     }
 
-    views_.emplace(std::piecewise_construct, std::forward_as_tuple(viewTopicId),
-                   std::forward_as_tuple(std::move(plan), std::move(layout),
-                                         std::move(evolvingSrc), persisted,
-                                         indexSlots, chunkBytes));
+    templates_.insert_or_assign(
+        viewTopicId,
+        ViewTemplate{std::move(plan), std::move(layout), std::move(evolvingSrc), persisted});
 }
 
-const uint8_t* WorkerViewSet::getRow(int32_t viewTopicId, uint64_t key,
+ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition) {
+    const uint64_t key = instKey(viewTopicId, partition);
+    auto it = views_.find(key);
+    if (it != views_.end()) return &it->second;
+
+    auto tit = templates_.find(viewTopicId);
+    if (tit == templates_.end()) return nullptr;  // defensive: no plan installed
+    const ViewTemplate& tpl = tit->second;
+
+    // ViewTable sizing from the WITH-clause knobs: capacity -> initial index
+    // slots (rounded up to a power of two; 0 => the table's own default),
+    // chunkBytes -> row-slab chunk size.  A fresh table + fresh foldCursor PER
+    // partition (independent of every other partition of this view).
+    const std::size_t indexSlots = tpl.plan.sizing.capacity != 0
+                                       ? ceilPow2(tpl.plan.sizing.capacity)
+                                       : std::size_t{4096};
+    const std::size_t chunkBytes = tpl.plan.sizing.chunkBytes != 0
+                                       ? static_cast<std::size_t>(tpl.plan.sizing.chunkBytes)
+                                       : (std::size_t{32} << 20);
+
+    auto [ins, inserted] = views_.emplace(
+        std::piecewise_construct, std::forward_as_tuple(key),
+        std::forward_as_tuple(tpl.plan, tpl.layout, tpl.evolvingSrc, tpl.persisted,
+                              partition, indexSlots, chunkBytes));
+    (void)inserted;
+    return &ins->second;
+}
+
+const uint8_t* WorkerViewSet::getRow(int32_t viewTopicId, int32_t partition, uint64_t key,
                                      const rune::view::RowLayout*& outLayout) const {
-    auto it = views_.find(viewTopicId);
+    auto it = views_.find(instKey(viewTopicId, partition));
     if (it == views_.end()) {
-        outLayout = nullptr;
+        // Serve the layout from the template if the view is installed but this
+        // partition has not folded yet; row is still absent.
+        auto tit = templates_.find(viewTopicId);
+        outLayout = tit != templates_.end() ? &tit->second.layout : nullptr;
         return nullptr;
     }
     outLayout = &it->second.layout;
     return it->second.table.get(key);
 }
 
-void WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst, int32_t partition) {
+int WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst) {
     const uint32_t rowLen = inst.layout.rowLen;
 
     dirtyEntries_.clear();
@@ -95,7 +115,7 @@ void WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst, int32_t partitio
         dirtyEntries_.push_back(e);
     });
 
-    if (dirtyEntries_.empty()) return;  // nothing changed this batch — no delta
+    if (dirtyEntries_.empty()) return 0;  // nothing changed this batch — no delta
 
     // Fixup: rowScratch_ is now stable; point each upsert entry at its bytes.
     for (std::size_t i = 0; i < dirtyEntries_.size(); ++i) {
@@ -107,11 +127,11 @@ void WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst, int32_t partitio
     // Encode the delta at this batch's snapshot offset O == the folded cursor.
     inst.pendingDelta.clear();
     rune::view::encodeDelta(dirtyEntries_, inst.foldCursor, rowLen, inst.pendingDelta);
-    inst.lastCheckpointO  = inst.foldCursor;
-    inst.pendingPartition = partition;
-    inst.pendingValid     = true;
+    inst.lastEncodedO = inst.foldCursor;  // attempted/encoded offset, NOT durable
+    inst.pendingValid = true;
 
     (void)tryPushDelta_(inst);  // on back-pressure the delta is held for next pass
+    return 1;                   // a delta was encoded this pass (real work)
 }
 
 bool WorkerViewSet::tryPushDelta_(ViewInstance& inst) {
@@ -124,7 +144,7 @@ bool WorkerViewSet::tryPushDelta_(ViewInstance& inst) {
 
     uint8_t* dst = channel_.deltas.base() + claim;
     writeI32LE(dst, inst.plan.viewTopicId);
-    writeI32LE(dst + 4, inst.pendingPartition);
+    writeI32LE(dst + 4, inst.partition);
     std::memcpy(dst + ViewSnapshotChannel::kDeltaHeaderBytes,
                 inst.pendingDelta.data(), inst.pendingDelta.size());
     channel_.deltas.commit(claim);

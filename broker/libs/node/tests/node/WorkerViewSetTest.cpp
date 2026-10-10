@@ -77,6 +77,15 @@ std::vector<uint8_t> twoUpsertsKey7() {
     return b.build();
 }
 
+// One upsert (key, hp) in a single-record batch at offset [0,1).
+std::vector<uint8_t> oneUpsert(int64_t key, int32_t hp) {
+    rune::protocol::RecordBatchBuilder b(/*baseOffset*/ 0, /*baseTimestamp*/ 0);
+    const auto k = keyBytes(key);
+    const auto v = encodeCharacter(key, hp, 1);
+    b.append(asSv(k), asSv(v), 0);
+    return b.build();
+}
+
 } // namespace
 
 // Gate test (brief Step 1): a committed range of two upserts for key 7 folds,
@@ -97,7 +106,7 @@ TEST(WorkerViewSet, FoldsCommittedRangeAndServesRow) {
     vs.driveFolds(/*srcTopicId*/ 5, /*partition*/ 0, readRange, /*bound*/ 2, /*nowNs*/ 0);
 
     const rune::view::RowLayout* L = nullptr;
-    const uint8_t* row = vs.getRow(0x40000007, 7, L);
+    const uint8_t* row = vs.getRow(0x40000007, /*partition*/ 0, 7, L);
     ASSERT_NE(row, nullptr);
     ASSERT_NE(L, nullptr);
     EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 20);
@@ -155,7 +164,7 @@ TEST(WorkerViewSet, TransientViewSkipsCheckpoint) {
     vs.driveFolds(5, 0, readRange, 2, 0);
 
     const rune::view::RowLayout* L = nullptr;
-    const uint8_t* row = vs.getRow(0x40000007, 7, L);
+    const uint8_t* row = vs.getRow(0x40000007, /*partition*/ 0, 7, L);
     ASSERT_NE(row, nullptr);
     EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 20);
 
@@ -178,4 +187,53 @@ TEST(WorkerViewSet, UninterestedSourceIsNoOp) {
     };
     vs.driveFolds(/*srcTopicId*/ 99, /*partition*/ 0, readRange, /*bound*/ 5, /*nowNs*/ 0);
     EXPECT_FALSE(called);
+}
+
+// *Regression* (review IMPORTANT 1): a single WorkerViewSet drives partition 0
+// and partition 1 of the SAME source topic into ONE view.  Offsets are
+// partition-local, so each (view, partition) MUST carry its own foldCursor +
+// its own ViewTable.  Pre-fix (one ViewInstance per view, keyed by viewTopicId
+// alone): the p1 drive resumes at p0's advanced cursor and folds p1's records
+// into p0's shared table — key 8 bleeds into partition 0, and the two
+// partitions' rows collide in one table.  Post-fix: each partition's table
+// reflects ONLY its own partition's records; cursors are independent.
+TEST(WorkerViewSetRegression, PerPartitionFoldCursorsAreIndependent) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(0), srcs, 0x40000007).value();
+
+    rune::node::ViewSnapshotChannel channel;
+    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-test");
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+
+    // DIFFERENT committed ranges per partition: p0 => key 7 hp=10 (1 record);
+    // p1 => key 8 hp=99 (1 record).  p0 is driven first so its cursor advances.
+    const auto p0 = oneUpsert(7, 10);
+    const auto p1 = oneUpsert(8, 99);
+    auto readP0 = [&](int64_t, int64_t) -> rune::storage::LogReadView {
+        return rune::storage::LogReadView{p0.data(), p0.size(), 0, 1};
+    };
+    auto readP1 = [&](int64_t, int64_t) -> rune::storage::LogReadView {
+        return rune::storage::LogReadView{p1.data(), p1.size(), 0, 1};
+    };
+    vs.driveFolds(/*srcTopicId*/ 5, /*partition*/ 0, readP0, /*bound*/ 1, 0);
+    vs.driveFolds(/*srcTopicId*/ 5, /*partition*/ 1, readP1, /*bound*/ 1, 0);
+
+    EXPECT_EQ(vs.instanceCount(), 2u);  // one ViewInstance per (view, partition)
+
+    const rune::view::RowLayout* L = nullptr;
+
+    // Partition 0's table: key 7 (hp=10) only — NOT key 8.
+    const uint8_t* p0k7 = vs.getRow(0x40000007, /*partition*/ 0, 7, L);
+    ASSERT_NE(p0k7, nullptr);
+    EXPECT_EQ(rune::view::readSlot(p0k7, *L, 1).i, 10);
+    EXPECT_EQ(vs.getRow(0x40000007, /*partition*/ 0, 8, L), nullptr)
+        << "partition 1's key 8 must NOT bleed into partition 0's table";
+
+    // Partition 1's table: key 8 (hp=99) only — NOT key 7.
+    const uint8_t* p1k8 = vs.getRow(0x40000007, /*partition*/ 1, 8, L);
+    ASSERT_NE(p1k8, nullptr);
+    EXPECT_EQ(rune::view::readSlot(p1k8, *L, 1).i, 99);
+    EXPECT_EQ(vs.getRow(0x40000007, /*partition*/ 1, 7, L), nullptr)
+        << "partition 0's key 7 must NOT bleed into partition 1's table";
 }

@@ -5009,11 +5009,19 @@ private:
     // the push path uses (Worker.h ~2788-2793) — so a view never folds an
     // uncommitted (open-txn) batch.  Phase 1: disk-backed sources only (the
     // fold reads the committed log via readNoFault_ into the worker's push
-    // scratch, one pread, no page fault).  Returns 0 (the fold's own progress
-    // shows up as RC/replica work on the passes that advanced the log).
+    // scratch, one pread, no page fault).  Returns the REAL progress count
+    // (records folded + checkpoint deltas pushed/held across every driven
+    // view) so the node's idle strategy never backs off while view work — a
+    // fold that advanced, or a back-pressured delta still awaiting ring space —
+    // is pending.
     int driveViews_(int64_t nowNs) {
+        int work = 0;
         for (auto* replica : owned_) {
             if (replica == nullptr || replica->topicId() < 0) continue;
+            const int32_t topicId = replica->topicId();
+            // Short-circuit: skip the rc/bound computation for an owned
+            // partition no installed view is interested in.
+            if (!viewSet_->interestedIn(topicId)) continue;
             if (replica->role() != rune::replication::Role::Leader) continue;
             if (!replica->isDiskBacked()) continue;  // Phase 1: committed disk log only
             const RcState* rcState = rcServe_(replica, rcOf_(replica));
@@ -5022,16 +5030,15 @@ private:
             const int64_t bound  = rcState->lso(liveHw);
             rune::storage::Log* log = replica->log();
             if (log == nullptr) continue;
-            const int32_t topicId   = replica->topicId();
             const int32_t partition = static_cast<int32_t>(replica->partitionId());
-            viewSet_->driveFolds(
+            work += viewSet_->driveFolds(
                 topicId, partition,
                 [this, log](int64_t from, int64_t to) -> rune::storage::LogReadView {
                     return readNoFault_(log, from, kPushMaxChunkBytes, to);
                 },
                 bound, nowNs);
         }
-        return 0;
+        return work;
     }
 
     // One §2.3 driver step for one partition.
