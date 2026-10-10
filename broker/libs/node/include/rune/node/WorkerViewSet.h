@@ -255,7 +255,15 @@ public:
             ViewInstance& inst = vit->second;
             if (inst.readiness == ViewReadiness::Ready) continue;  // already caught up
             work += driveView_(inst, readRange, committedTail);
-            if (inst.foldCursor >= committedTail) inst.readiness = ViewReadiness::Ready;
+            if (inst.foldCursor >= committedTail) {
+                inst.readiness = ViewReadiness::Ready;
+                // Task 19b: once EVERY hosted instance of this view is Ready, drop
+                // it from recoveryViews_ so hasRecovery() latches back to false —
+                // otherwise driveViews_ would pay the recovery-materialize +
+                // driveRebuild lookups forever, long after only steady-state
+                // folding remains.  Runs only on a flip (cold), never per pass.
+                pruneRecoveryIfAllReady_(viewTopicId);
+            }
         }
         return work;
     }
@@ -349,6 +357,12 @@ private:
     // Look up the (viewTopicId, partition) instance, lazily creating it from the
     // installed template on first use.  nullptr only if no template is installed.
     ViewInstance* getOrCreate_(int32_t viewTopicId, int32_t partition);
+
+    // Task 19b: if every hosted (viewTopicId, *) instance is Ready, erase
+    // viewTopicId from recoveryViews_ (so hasRecovery() returns to false once a
+    // view's restart recovery is complete).  No-op if the view is not a recovery
+    // view, or any hosted instance of it is still rebuilding.
+    void pruneRecoveryIfAllReady_(int32_t viewTopicId);
 
     // Drive ONE (view, partition) instance.  Flushes any held pending delta
     // first (never drop); folds the committed range (ALWAYS advancing foldCursor

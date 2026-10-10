@@ -79,6 +79,10 @@ splitViewCheckpointRecords(std::span<const uint8_t> bytes) {
     std::size_t pos = 0;
     while (pos + kHdr <= total) {
         const std::size_t recStart = pos;
+        // Defense in depth: reject early on a bad magic (a non-record tail /
+        // misaligned stream) with a clean boundary, rather than walking garbage
+        // entry lengths and leaning solely on applyDelta's pass-1 CRC reject.
+        if (readU32LE(bytes.data() + pos) != rune::view::kViewCheckpointMagic) break;
         const uint32_t rowLen = readU32LE(bytes.data() + pos + 12);
         const uint32_t count  = readU32LE(bytes.data() + pos + 16);
         std::size_t p = pos + kHdr;
@@ -266,6 +270,16 @@ void WorkerViewSet::installViewForRecovery(
     // decision only — no peer/cluster input.
     inst->readiness = (inst->foldCursor >= committedTail) ? ViewReadiness::Ready
                                                           : ViewReadiness::RebuildingViews;
+}
+
+void WorkerViewSet::pruneRecoveryIfAllReady_(int32_t viewTopicId) {
+    if (recoveryViews_.find(viewTopicId) == recoveryViews_.end()) return;  // not a recovery view
+    for (const auto& kv : views_) {
+        // instKey packs viewTopicId in the high 32 bits (see instKey()).
+        if (static_cast<int32_t>(static_cast<uint32_t>(kv.first >> 32)) != viewTopicId) continue;
+        if (kv.second.readiness != ViewReadiness::Ready) return;  // still rebuilding somewhere
+    }
+    recoveryViews_.erase(viewTopicId);
 }
 
 ViewReadiness WorkerViewSet::readiness(int32_t viewTopicId, int32_t partition) const {

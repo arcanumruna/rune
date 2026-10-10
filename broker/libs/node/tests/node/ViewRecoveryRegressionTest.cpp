@@ -200,6 +200,11 @@ TEST(ViewRecoveryRegression, SplitCheckpointRecordsRoundTrips) {
     torn.pop_back();  // chop the last byte of the trailing record's CRC
     const auto recs2 = rune::node::splitViewCheckpointRecords(torn);
     EXPECT_EQ(recs2.size(), 1u) << "a torn trailing record must be dropped, not over-read";
+
+    // Early magic reject: a non-record / misaligned head yields zero records.
+    std::vector<uint8_t> garbage(64, 0xAB);
+    EXPECT_TRUE(rune::node::splitViewCheckpointRecords(garbage).empty())
+        << "a bad magic must reject early, never walk garbage lengths";
 }
 
 // (2) End-to-end worker recovery install: a recovery-flagged install off the
@@ -245,15 +250,20 @@ TEST(ViewRecoveryRegression, RecoverFromCheckpointFileThenServe) {
     auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
         return rune::storage::LogReadView{tail.data(), tail.size(), 2, 4};
     };
+    EXPECT_TRUE(vs.hasRecovery()) << "still recovering: the extra duty-cycle work is live";
     for (int i = 0; i < 64 && !vs.allViewsReady(); ++i)
         vs.driveRebuild(kSrcId, 0, readRange, /*committedTail*/ 4, i);
 
     EXPECT_TRUE(vs.allViewsReady());
     EXPECT_EQ(vs.readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+    // Prune: recovery complete -> hasRecovery() latches back to false so
+    // driveViews_ drops the extra materialize/driveRebuild lookups.
+    EXPECT_FALSE(vs.hasRecovery())
+        << "recoveryViews_ must be pruned once every instance of the view is Ready";
 
     status = rune::node::WorkerViewSet::RowStatus::NotReady;
     const uint8_t* row = vs.getRow(kViewId, 0, 7, L, &status);
-    ASSERT_NE(row, nullptr);
+    ASSERT_NE(row, nullptr) << "pruning must NOT lose the view — it still serves";
     EXPECT_EQ(status, rune::node::WorkerViewSet::RowStatus::Ok);
     EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 31);  // recovered from ckpt + tail
 
