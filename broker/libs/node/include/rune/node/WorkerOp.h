@@ -102,6 +102,17 @@ struct WorkerOp {
         // MEDIUM-2: the controller's AlterIsr answer for a USER partition leader
         // (roleEpoch = leaderEpoch, rolePartitionEpoch, replicatedPayload.errorCode).
         AlterIsrResponse          = 18, ///< transport → worker: PartitionReplica::onAlterIsrResponse
+        // Task 20 (view engine phase 1): a point read into a materialized view's
+        // table, routed to the worker that owns (viewTopicId, partition) — the
+        // view-table owner.  ADDITIVE: it rides the SAME op/return plumbing as
+        // PushRead, reusing existing scalar wire fields (no new SBE field): the
+        // gateway stamps topicId = viewTopicId, nextOffset = keyU64, hwBound =
+        // requestedFingerprint.  The worker probes WorkerViewSet::getRow (a
+        // zero-alloc index probe + copy the row bytes into the return) and answers
+        // WorkerReturn::ViewRowResult.  Not ownership-gated (views are not in the
+        // ReplicaRegistry): incarnation stays 0, so executeFromWire_'s guard is
+        // inert and WorkerPool routing never stamps a replica identity.
+        GetViewRow                = 19, ///< gateway → worker: point read of a view row
         // F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
         // control → owning worker: run a test-owned OwnerThreadTestTask against
         // `replica` on the worker's OWN thread.  The opaque task ref travels in the
@@ -443,6 +454,16 @@ struct WorkerReturn {
         /// token, baseOffset = where the marker ACTUALLY landed (authoritative),
         /// or errorCode != 0 when the append failed.  Task 10 round 4 (P1).
         ControlRecordAppended = 6,
+        /// Task 20: the answer to a GetViewRow op.  ADDITIVE: it rides the SAME
+        /// return plumbing as PushReadResult and reuses existing scalar fields
+        /// (the WorkerReturn layout is pinned, ProtocolRegression.
+        /// WorkerReturnLayoutUnchanged): errorCode = viewStatus
+        /// (0=OK,1=AbsentKey,2=NotReady,3=SchemaMismatch,4=UnknownView),
+        /// recordCount = rowLen (informational — the chunk's varbytes prefix is
+        /// the ground-truth length), readTopicId = viewTopicId, and the chunk
+        /// tail carries the row bytes on OK (empty otherwise).  sessionId /
+        /// correlationId are echoed from the op so the gateway can reply.
+        ViewRowResult = 7,
     };
 
     Type    type = Type::ProduceResult;

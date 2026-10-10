@@ -1361,6 +1361,10 @@ private:
     // on the session egress via the admin→control egress ring (respondAlter).
     void handleAlterTopic   (const uint8_t* buf, std::size_t len);
     void handleCreateView   (const uint8_t* buf, std::size_t len);
+    // Task 20: GetViewRow (72) — build a GetViewRow WorkerOp routed to the
+    // owning worker (same op/return plumbing as PushRead); the worker's
+    // ViewRowResult is encoded as a ViewRowResponse (73) in drainWorkerReturns_.
+    void handleGetViewRow   (const uint8_t* buf, std::size_t len);
     // GB-3: Push delivery — called from doWork after ingress poll.
     void pushSubscriptions  ();
     // GB-5p2: Group-commit flush — called from doWork() once per cycle AFTER all

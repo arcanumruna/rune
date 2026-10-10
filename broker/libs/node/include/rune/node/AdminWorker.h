@@ -129,6 +129,42 @@ public:
     void submitAlterTopic(AlterTopicMsg msg);
 
     // -----------------------------------------------------------------------
+    // Task 20: openView — resolve an open-for-read handshake for a view NAME.
+    // A pure read of the admin-owned catalogs (no round-trip), mirroring the
+    // GetTopicSchema byFingerprint handshake: the view's output is a registered
+    // typed topic (CreateView registered its output descriptor in the
+    // SchemaRegistry under viewTopicId), so we resolve name -> viewTopicId via
+    // the __views catalog, then confirm the client's pinned fingerprint against
+    // the view's CURRENT output schema — drift is caught UP FRONT at open.
+    //
+    // Returns a ViewRowResponse status code:
+    //   0 = OK            (outViewTopicId + outFingerprint carry the resolved id
+    //                      and the current output fingerprint the client pins)
+    //   3 = SchemaMismatch (a non-zero requestedFingerprint matches no live
+    //                      version of the view's output schema)
+    //   4 = UnknownView   (no __views catalog, name not found, or the view's
+    //                      output descriptor is not registered)
+    // -----------------------------------------------------------------------
+    [[nodiscard]] uint16_t openView(std::string_view name, uint64_t requestedFingerprint,
+                                    int32_t& outViewTopicId, uint64_t& outFingerprint) const {
+        outViewTopicId = -1;
+        outFingerprint = 0;
+        if (viewRegistry_ == nullptr) return 4;                 // UnknownView
+        const ViewRecord* vrec = viewRegistry_->byName(name);
+        if (vrec == nullptr) return 4;                          // UnknownView
+        outViewTopicId = vrec->viewTopicId;
+        // Reuse GetTopicSchema's handshake against the view's output topic id.
+        const RegistryEntry* latest = reg_.latest(vrec->viewTopicId);
+        if (latest == nullptr) return 4;                        // output not registered
+        outFingerprint = latest->fingerprint;
+        if (requestedFingerprint != 0 && requestedFingerprint != latest->fingerprint &&
+            reg_.byFingerprint(vrec->viewTopicId, requestedFingerprint) == nullptr) {
+            return 3;                                           // SchemaMismatch (drift)
+        }
+        return 0;                                               // OK
+    }
+
+    // -----------------------------------------------------------------------
     // control → admin: create-topic reply.  Matches the ticket of the in-flight
     // DefineTopic and advances the state machine (AWAITING_ID → AWAITING_COMMIT).
     // -----------------------------------------------------------------------

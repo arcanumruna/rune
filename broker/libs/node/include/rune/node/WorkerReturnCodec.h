@@ -32,6 +32,11 @@ static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::SessionSignal) ==
                   static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::RESERVED_2),
               "WorkerReturn::SessionSignal must stay on sbe ReturnType::RESERVED_2");
 
+// Task 20: ViewRowResult rides sbe ReturnType::VIEW_ROW_RESULT (value 7).
+static_assert(static_cast<std::uint8_t>(WorkerReturn::Type::ViewRowResult) ==
+                  static_cast<std::uint8_t>(rune::protocol::internal::sbe::ReturnType::VIEW_ROW_RESULT),
+              "WorkerReturn::ViewRowResult must stay on sbe ReturnType::VIEW_ROW_RESULT");
+
 
 // ---------------------------------------------------------------------------
 // WorkerReturn (template id 2)

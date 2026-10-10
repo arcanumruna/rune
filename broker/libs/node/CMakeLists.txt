@@ -534,6 +534,25 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # Task 20: GetViewRowRegressionTest — the GetViewRow point-read path (real
+    # Worker op/return + WorkerViewSet) + the openView fingerprint handshake
+    # (real AdminWorker + __topic_schemas/__views).  On-host (no Aeron / media
+    # driver), deterministic.
+    # ---------------------------------------------------------------------------
+    add_executable(rune_get_view_row_tests
+        tests/integration/GetViewRowRegressionTest.cpp)
+    target_include_directories(rune_get_view_row_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_get_view_row_tests PRIVATE
+        rune_node
+        rune_view
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_get_view_row_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
     # Task 7: ProduceValidationTest — per-worker schema validation hook.
     #
     # Tests (on-host, no Aeron / media driver):

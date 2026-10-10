@@ -549,6 +549,7 @@ public:
     [[nodiscard]] uint64_t rcHintsSubmittedForTest() const noexcept { return rcHintsSubmitted_; }
     /// PushRead ops executed by this worker (both answers and refusals).
     [[nodiscard]] uint64_t pushReadsForTest() const noexcept { return pushReads_; }
+    [[nodiscard]] uint64_t getViewRowsForTest() const noexcept { return getViewRows_; }
 
     // Default acks=all commit-wait timeout: 30 s. Accounts for the extra fetch-
     // handling latency (fetch waits a worker cycle, E5.1.2c Note B) so the
@@ -2318,6 +2319,10 @@ private:
         case WorkerOp::Type::PushRead:
             executePushReadWire_(op);
             break;
+        // Task 20: point read of a materialized view row (view-table owner).
+        case WorkerOp::Type::GetViewRow:
+            executeGetViewRowWire_(op);
+            break;
         case WorkerOp::Type::ApplyReplicated:
             // Worker-clock: dequeued a routed apply op.  corr=runSeq pairs 1:1 (FIFO)
             // with the control thread's ReplFragRecv → EXACT control→worker handoff.
@@ -3030,6 +3035,77 @@ private:
     }
 
     // -------------------------------------------------------------------
+    // -------------------------------------------------------------------
+    // executeGetViewRowWire_ — Task 20: a point read of a materialized view
+    // row, served on the worker that OWNS the view table (shared-nothing: a
+    // pure read of this worker's own WorkerViewSet; no lock, no atomic).
+    //
+    // The op was routed to this worker for (viewTopicId, partition); the gateway
+    // reused existing scalar wire fields (topicId = viewTopicId, nextOffset =
+    // keyU64, hwBound = requestedFingerprint — see WorkerOp.h).  The probe is
+    // zero-alloc: WorkerViewSet::getRow is an index probe, and on a hit we copy
+    // exactly layout.rowLen bytes into the return's chunk.
+    //
+    // Status mapping (ViewRowResponse wire codes):
+    //   UnknownView=4   — no WorkerViewSet, or no view plan installed for this id
+    //   SchemaMismatch=3 — a non-zero requestedFingerprint != the view's output fp
+    //   NotReady=2      — the (view, partition) instance is still rebuilding
+    //                     (Task 16 serve-guard): a RETRIABLE not-ready, never a
+    //                     half-built row (Review-focus #5)
+    //   AbsentKey=1     — the view is Ready but the key is not present (typed
+    //                     absent, never a zero row)
+    //   OK=0            — the row bytes (layout.rowLen) copied into the chunk
+    // -------------------------------------------------------------------
+    void executeGetViewRowWire_(sbe::WorkerOp& op) {
+        ++getViewRows_;
+        const int32_t  viewTopicId = op.topicId();
+        const int32_t  partition   = op.partition();
+        const uint64_t keyU64      = static_cast<uint64_t>(op.nextOffset());
+        const uint64_t requestedFp = static_cast<uint64_t>(op.hwBound());
+
+        WorkerReturn ret;
+        ret.type          = WorkerReturn::Type::ViewRowResult;
+        ret.sessionId     = op.sessionId();
+        ret.correlationId = op.correlationId();
+        ret.readTopicId   = viewTopicId;   // echoed for gateway correlation
+        ret.readPartition = partition;
+        ret.recordCount   = 0;             // rowLen (informational)
+
+        using RS = rune::protocol::client::ViewRowResponse;
+
+        // 1. No view set on this worker, or no view installed for this id.
+        uint64_t outputFp = 0;
+        if (viewSet_ == nullptr || !viewSet_->viewOutputFingerprint(viewTopicId, outputFp)) {
+            ret.errorCode = static_cast<int16_t>(RS::kUnknownView);
+            enqueueReturn_(std::move(ret));
+            return;
+        }
+
+        // 2. Schema drift: a pinned (non-zero) fingerprint that no longer matches
+        //    the view's current output schema → SchemaMismatch (caught up front).
+        if (requestedFp != 0 && requestedFp != outputFp) {
+            ret.errorCode = static_cast<int16_t>(RS::kSchemaMismatch);
+            enqueueReturn_(std::move(ret));
+            return;
+        }
+
+        // 3. Probe the view table.  getRow applies the Task 16 serve-guard
+        //    (NotReady while rebuilding) and distinguishes a genuinely absent key.
+        const rune::view::RowLayout*  layout = nullptr;
+        WorkerViewSet::RowStatus      rs     = WorkerViewSet::RowStatus::NotFound;
+        const uint8_t* row = viewSet_->getRow(viewTopicId, partition, keyU64, layout, &rs);
+        if (row != nullptr && layout != nullptr) {
+            ret.errorCode   = static_cast<int16_t>(RS::kOk);
+            ret.recordCount = static_cast<int32_t>(layout->rowLen);
+            ret.chunk.assign(row, row + layout->rowLen);   // copy the row bytes
+        } else if (rs == WorkerViewSet::RowStatus::NotReady) {
+            ret.errorCode = static_cast<int16_t>(RS::kNotReady);
+        } else {
+            ret.errorCode = static_cast<int16_t>(RS::kAbsentKey);
+        }
+        enqueueReturn_(std::move(ret));
+    }
+
     // executePushReadWire_ — read a chunk from the log for a push subscription.
     //
     // Returns WorkerReturn::PushReadResult carrying the chunk + context.
@@ -4564,6 +4640,7 @@ private:
     // batch is larger than this worker's return ring's max message.
     uint64_t    pushReadOversize_ = 0;
     uint64_t    pushReads_ = 0;            // F15 S4: PushRead ops executed (R-1 / R-3 tests)
+    uint64_t    getViewRows_ = 0;          // Task 20: GetViewRow ops executed
     // Largest client batch the shard intake stores: min(the gateway's max
     // produce batch, one PushReadResult chunk of this worker's ret_).  Set in
     // the ctor (ret_ is fixed).

@@ -979,6 +979,7 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::DefineTopic:
         case pc::TemplateId::GetTopicSchema:
         case pc::TemplateId::AlterTopic:
+        case pc::TemplateId::GetViewRow:
             if (const auto hdr = pc::MessageHeader::decode(buf, len)) {
                 sessions_.touch(hdr->sessionId, nowNs_);
             }
@@ -1050,6 +1051,11 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
             break;
         case pc::TemplateId::CreateView:
             handleCreateView(buf, len);
+            break;
+        // Task 20: point read of a materialized view row — routed to the owning
+        // worker via the same op/return plumbing as PushRead.
+        case pc::TemplateId::GetViewRow:
+            handleGetViewRow(buf, len);
             break;
         default:
             // ConnectResponse, ErrorResponse, Pong, MetadataResponse (broker→client),
@@ -4833,6 +4839,37 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
         }
 
         // ===================================================================
+        // Task 20: ViewRowResult — a worker's answer to a GetViewRow point read.
+        // Encode a ViewRowResponse (status + row bytes) and send it to the
+        // session on the gateway egress.  The row bytes travel in the return
+        // chunk (empty unless status == OK); recordCount carries rowLen.
+        // ===================================================================
+        if (ret.type == rune::node::WorkerReturn::Type::ViewRowResult) {
+            Session* session = sessions_.find(ret.sessionId);
+            if (!session) return;   // session gone — drop (point read is idempotent)
+            const std::span<const uint8_t> rowBytes = ret.chunkBytes();
+            pc::ViewRowResponse resp;
+            resp.sessionId     = ret.sessionId;
+            resp.correlationId = ret.correlationId;
+            resp.status        = static_cast<uint16_t>(ret.errorCode);
+            resp.rowLen        = static_cast<uint32_t>(ret.recordCount);
+            resp.rowBytes      = rowBytes.data();
+            resp.rowBytesLen   = static_cast<uint32_t>(rowBytes.size());
+            const std::size_t need = resp.encodedSize();
+            if (need > kScratchSize) [[unlikely]] {
+                // A view row larger than the egress scratch (not expected in
+                // Phase 1's small rows): answer SchemaMismatch-free MessageTooLarge
+                // is out of scope; drop loudly rather than overrun scratch_.
+                spdlog::error("ClientGateway: ViewRowResponse {} B exceeds scratch ({} B) — dropped "
+                              "(viewTopicId={})", need, kScratchSize, ret.readTopicId);
+                return;
+            }
+            const std::size_t encoded = resp.encode(scratch_.data());
+            enqueueOrBestEffort_(*session, scratch_.data(), encoded);
+            return;
+        }
+
+        // ===================================================================
         // ProduceResult
         // ===================================================================
         if (ret.type == rune::node::WorkerReturn::Type::ProduceResult) {
@@ -5728,6 +5765,70 @@ void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
                                        m.planBlob, m.planLen);
     // Return immediately — the AdminWorker produces the CreateViewResponse
     // asynchronously on the session egress (via the admin→control egress ring).
+}
+
+// ---------------------------------------------------------------------------
+// Task 20: handleGetViewRow — a point read of a materialized view row.
+//
+// Routed to the worker that OWNS (viewTopicId, partition) through the SAME
+// op/return plumbing as PushRead: build a GetViewRow WorkerOp (reusing the
+// scalar wire fields — topicId = viewTopicId, nextOffset = keyU64, hwBound =
+// requestedFingerprint; see WorkerOp.h) and tryEnqueueOp it.  The worker probes
+// its WorkerViewSet and answers a ViewRowResult that drainWorkerReturns_ encodes
+// as a ViewRowResponse on the session egress.  No registry round-trip, no
+// blocking on the gateway hot path.
+//
+// The view key space is the wire record-key (Phase 1 integer key): keyU64 is
+// hashed to a partition via the view's output topic, encoding it as the
+// canonical fixed-width (8-byte little-endian) key bytes — the same form the
+// source rows were produced with.
+// ---------------------------------------------------------------------------
+void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
+{
+    if (!workerPool_) {
+        spdlog::debug("ClientGateway: GetViewRow received but workerPool_ not set — dropped");
+        return;
+    }
+    auto msgOpt = pc::GetViewRow::decode(buf, len);
+    if (!msgOpt) {
+        spdlog::debug("ClientGateway: GetViewRow decode failed — dropped");
+        return;
+    }
+    const pc::GetViewRow& m = *msgOpt;
+
+    Session* session = sessions_.find(m.sessionId);
+    if (!session) {
+        spdlog::debug("ClientGateway: GetViewRow for unknown sessionId={} — dropped", m.sessionId);
+        return;
+    }
+
+    // Resolve the owning partition from the key (canonical 8-byte LE key bytes).
+    // partitionForKey needs the view's output topic in the registry; an unknown
+    // view id yields partition 0 and the worker answers UnknownView.
+    uint8_t keyLe[8];
+    for (int i = 0; i < 8; ++i) keyLe[i] = static_cast<uint8_t>(m.keyU64 >> (8 * i));
+    int32_t partition = 0;
+    if (topicRegistry_) {
+        const int32_t p = topicRegistry_->partitionForKey(
+            m.viewTopicId, std::span<const uint8_t>(keyLe, sizeof keyLe));
+        if (p >= 0) partition = p;
+    }
+
+    rune::node::WorkerOp op;
+    op.type          = rune::node::WorkerOp::Type::GetViewRow;
+    op.topicId       = m.viewTopicId;                        // routing + viewTopicId
+    op.partition     = partition;
+    op.sessionId     = m.sessionId;
+    op.correlationId = m.correlationId;
+    op.nextOffset    = static_cast<int64_t>(m.keyU64);               // keyU64 (reused field)
+    op.hwBound       = static_cast<int64_t>(m.requestedFingerprint); // requestedFingerprint (reused field)
+
+    if (!workerPool_->tryEnqueueOp(m.viewTopicId, partition, std::move(op))) {
+        // Back-pressure: the worker ingress ring is full this cycle.  The client
+        // re-issues the read (a point read is idempotent); nothing is parked.
+        spdlog::debug("ClientGateway: GetViewRow enqueue back-pressured (viewTopicId={} partition={})",
+                      m.viewTopicId, partition);
+    }
 }
 
 // ---------------------------------------------------------------------------

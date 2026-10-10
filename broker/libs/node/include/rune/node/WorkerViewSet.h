@@ -261,6 +261,18 @@ public:
                           const rune::view::RowLayout*& outLayout,
                           RowStatus* outStatus = nullptr) const;
 
+    // Task 20: the output-schema fingerprint of the view `viewTopicId` (the
+    // fingerprint CreateView published for the view's typed output topic, stored
+    // on the partition-independent plan template).  Returns false when no view
+    // plan is installed here for that id — the GetViewRow serve path maps that to
+    // UnknownView.  A pure read of worker-owned state (no allocation).
+    [[nodiscard]] bool viewOutputFingerprint(int32_t viewTopicId, uint64_t& out) const {
+        const auto it = templates_.find(viewTopicId);
+        if (it == templates_.end()) return false;
+        out = it->second.plan.outputFingerprint;
+        return true;
+    }
+
     // Number of fold passes that ran with a (view, partition) at/over its §15
     // maxRows ceiling — an OBSERVABLE capacity-exceeded metric only.  It does
     // NOT mean any fold was refused: crossing maxRows never blocks folding or
