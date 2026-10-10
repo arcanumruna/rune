@@ -133,3 +133,74 @@ TEST(ViewPlan, TruncatedBufferReturnsNullopt) {
     }
     EXPECT_TRUE(rune::view::deserializeAuthored(abytes).has_value());
 }
+
+namespace {
+// Overwrites the 4-byte little-endian u32 at `offset` with `value`.
+void pokeU32LE(std::vector<uint8_t>& buf, size_t offset, uint32_t value) {
+    ASSERT_LE(offset + 4, buf.size());
+    buf[offset]     = static_cast<uint8_t>(value & 0xff);
+    buf[offset + 1] = static_cast<uint8_t>((value >> 8) & 0xff);
+    buf[offset + 2] = static_cast<uint8_t>((value >> 16) & 0xff);
+    buf[offset + 3] = static_cast<uint8_t>((value >> 24) & 0xff);
+}
+} // namespace
+
+// Regression (bounds-safety review finding): a VALID version/header
+// followed by a BOGUS LARGE element-count prefix (0xFFFFFFFF) must be
+// rejected with std::nullopt -- it must NOT attempt a huge .reserve()
+// and crash with std::bad_alloc/std::length_error, and must not read out
+// of bounds or hang. Covers every count field on both wire forms.
+TEST(ViewPlan, BogusLargeCountRegression) {
+    constexpr uint32_t kBogusCount = 0xFFFFFFFFu;
+
+    // --- CompiledViewPlan: keyFieldId count, sourceTopicId count, output count ---
+    rune::view::CompiledViewPlan cp;
+    cp.viewName = "v"; cp.viewTopicId = 1;
+    cp.keyFieldId = {0}; cp.sourceTopicId = {5};
+    cp.output = {{0, rune::codec::PrimType::Int64, 0, 0, rune::view::MergeRule::Replace}};
+    auto cbytes = rune::view::serialize(cp);
+
+    size_t pos = 0;
+    pos += 1;                              // version
+    pos += 4 + cp.viewName.size();         // viewName (len + bytes)
+    pos += 4;                              // viewTopicId
+    const size_t keyCountOffset = pos;
+    pos += 4 + cp.keyFieldId.size() * 2;   // keyCount (len + u16 each)
+    const size_t srcCountOffset = pos;
+    pos += 4 + cp.sourceTopicId.size() * 4; // srcCount (len + i32 each)
+    pos += 8;                              // outputFingerprint
+    const size_t outCountOffset = pos;
+
+    for (size_t offset : {keyCountOffset, srcCountOffset, outCountOffset}) {
+        auto corrupt = cbytes;
+        pokeU32LE(corrupt, offset, kBogusCount);
+        auto back = rune::view::deserializeCompiledViewPlan(corrupt);
+        EXPECT_FALSE(back.has_value()) << "offset=" << offset;
+    }
+    // Sanity: the uncorrupted buffer still parses (proves the pokes above
+    // actually landed on the count fields, not somewhere inert).
+    EXPECT_TRUE(rune::view::deserializeCompiledViewPlan(cbytes).has_value());
+
+    // --- ViewPlan (authored): sources count, output count ---
+    rune::view::ViewPlan ap;
+    ap.viewName = "v"; ap.key = "k";
+    ap.sources = {{1, "id"}};
+    ap.output = {{"f", rune::codec::PrimType::Int32, 0, "f", rune::view::MergeRule::Replace}};
+    auto abytes = rune::view::serializeAuthored(ap);
+
+    size_t apos = 0;
+    apos += 1;                       // version
+    apos += 4 + ap.viewName.size();  // viewName
+    apos += 4 + ap.key.size();       // key
+    const size_t srcCountOffsetA = apos;
+    apos += 4 + (4 + ap.sources[0].keyField.size());  // sources: count + (topicId + keyField str)
+    const size_t outCountOffsetA = apos;
+
+    for (size_t offset : {srcCountOffsetA, outCountOffsetA}) {
+        auto corrupt = abytes;
+        pokeU32LE(corrupt, offset, kBogusCount);
+        auto back = rune::view::deserializeAuthored(corrupt);
+        EXPECT_FALSE(back.has_value()) << "offset=" << offset;
+    }
+    EXPECT_TRUE(rune::view::deserializeAuthored(abytes).has_value());
+}

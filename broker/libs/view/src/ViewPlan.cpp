@@ -197,9 +197,14 @@ std::optional<CompiledViewPlan> deserializeCompiledViewPlan(std::span<const uint
     if (!readString(buf, pos, p.viewName))   return std::nullopt;
     if (!readI32LE(buf, pos, p.viewTopicId)) return std::nullopt;
 
+    // NOTE: counts below are untrusted wire data -- do NOT .reserve(count)
+    // before the loop (an adversarial/corrupt count like 0xFFFFFFFF would
+    // attempt a multi-GB allocation and crash with std::bad_alloc/
+    // length_error instead of returning nullopt). push_back grows safely,
+    // and each loop's per-element bounds check already rejects a count
+    // that doesn't fit the remaining bytes.
     uint32_t keyCount = 0;
     if (!readU32LE(buf, pos, keyCount))      return std::nullopt;
-    p.keyFieldId.reserve(keyCount);
     for (uint32_t i = 0; i < keyCount; ++i) {
         uint16_t k = 0;
         if (!readU16LE(buf, pos, k)) return std::nullopt;
@@ -208,7 +213,6 @@ std::optional<CompiledViewPlan> deserializeCompiledViewPlan(std::span<const uint
 
     uint32_t srcCount = 0;
     if (!readU32LE(buf, pos, srcCount))      return std::nullopt;
-    p.sourceTopicId.reserve(srcCount);
     for (uint32_t i = 0; i < srcCount; ++i) {
         int32_t t = 0;
         if (!readI32LE(buf, pos, t)) return std::nullopt;
@@ -219,7 +223,6 @@ std::optional<CompiledViewPlan> deserializeCompiledViewPlan(std::span<const uint
 
     uint32_t outCount = 0;
     if (!readU32LE(buf, pos, outCount))      return std::nullopt;
-    p.output.reserve(outCount);
     for (uint32_t i = 0; i < outCount; ++i) {
         CompiledField f{};
         if (!readU16LE(buf, pos, f.outSlot))      return std::nullopt;
@@ -285,9 +288,11 @@ std::optional<ViewPlan> deserializeAuthored(std::span<const uint8_t> buf) {
     if (!readString(buf, pos, p.viewName)) return std::nullopt;
     if (!readString(buf, pos, p.key))      return std::nullopt;
 
+    // NOTE: see the matching NOTE in deserializeCompiledViewPlan above --
+    // these counts are untrusted wire data (deserializeAuthored decodes the
+    // client-supplied CreateView planBlob), so no .reserve(count) here.
     uint32_t srcCount = 0;
     if (!readU32LE(buf, pos, srcCount))    return std::nullopt;
-    p.sources.reserve(srcCount);
     for (uint32_t i = 0; i < srcCount; ++i) {
         SourceSpec s{};
         if (!readI32LE(buf, pos, s.topicId))   return std::nullopt;
@@ -297,7 +302,6 @@ std::optional<ViewPlan> deserializeAuthored(std::span<const uint8_t> buf) {
 
     uint32_t outCount = 0;
     if (!readU32LE(buf, pos, outCount))    return std::nullopt;
-    p.output.reserve(outCount);
     for (uint32_t i = 0; i < outCount; ++i) {
         AuthoredField f{};
         if (!readString(buf, pos, f.name))       return std::nullopt;
