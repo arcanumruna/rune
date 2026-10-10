@@ -1668,7 +1668,14 @@ private:
             work += replica->doWork(nowNs);
         }
         work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
-        if (viewSet_ != nullptr) [[unlikely]] work += driveViews_(nowNs);   // Task 15: view folds, right after RC advance
+        if (viewSet_ != nullptr) [[unlikely]] {
+            // Task 19: drain runtime-created/recovery view-plan installs off the
+            // control→worker ring FIRST (same as the classic doWork_ pass) — a
+            // shard worker that skipped this folded views it had never installed,
+            // so every CreateView stayed UnknownView on the live path.
+            work += viewSet_->drainInstalls();
+            work += driveViews_(nowNs);          // Task 15: view folds, right after RC advance
+        }
         if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
         work += serveHeldPushReads_();
         // 4b. background disk work → io backend, never an inline fsync
