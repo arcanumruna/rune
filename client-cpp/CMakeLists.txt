@@ -546,6 +546,33 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
         endif()
     endif()
 
+    # ── Task 21 — view-engine client API probe (docker/view-engine-e2e.sh) ───
+    #
+    # Unlike rune_schema_probe above, view_probe needs no build-time codegen:
+    # Phase 1 has no open-by-name / descriptor-fetch wire for a view's output,
+    # so the probe decodes rowBytes positionally (rune/client/view/
+    # ViewRowCodec.h) against a RowLayout it builds itself from the SAME
+    # (name, PrimType) list it authored into the CreateView planBlob
+    # (rune/client/view/ViewPlanAuthor.h) — both header-only client additions.
+    add_executable(view_probe
+        examples/view_probe.cpp
+    )
+    target_include_directories(view_probe PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+    )
+    target_link_libraries(view_probe PRIVATE
+        rune_client_api
+        rune_client_producer
+        rune_client_subscriber
+        rune_codec
+    )
+    if(UNIX AND NOT APPLE)
+        find_library(UUID_LIB_VIEW_PROBE uuid)
+        if(UUID_LIB_VIEW_PROBE)
+            target_link_libraries(view_probe PRIVATE ${UUID_LIB_VIEW_PROBE})
+        endif()
+    endif()
+
     # ── Task 10 (0c #11 gate) — CLI-driven rune-ql typed probe ────────────────
     #
     # tests/e2e/rune_ql_probe.cpp is the 0c single-node real-Aeron probe.  Unlike

@@ -120,6 +120,32 @@ public:
         r.errorCode  = outcome().c.errorCode;
         return r;
     }
+    /// Task 21: CreateView — as defineResult(), with (viewTopicId,
+    /// outputFingerprint, errorCode).
+    [[nodiscard]] rune::client::CreateViewResult createViewResult() const {
+        if (!ready() || (status() != rune::client::OpStatus::Ok &&
+                         status() != rune::client::OpStatus::BrokerError)) {
+            throw std::runtime_error("createView did not complete: " + describe());
+        }
+        rune::client::CreateViewResult r;
+        r.viewTopicId       = static_cast<int32_t>(outcome().c.value);
+        r.outputFingerprint = static_cast<uint64_t>(outcome().c.aux);
+        r.errorCode         = outcome().c.errorCode;
+        return r;
+    }
+    /// Task 21: GetViewRow — status (0=OK..4=UnknownView) rides errorCode;
+    /// rowBytes only populated when status == kOk.
+    [[nodiscard]] rune::client::ViewRowResult getViewRowResult() const {
+        if (!ready() || (status() != rune::client::OpStatus::Ok &&
+                         status() != rune::client::OpStatus::BrokerError)) {
+            throw std::runtime_error("getViewRow did not complete: " + describe());
+        }
+        rune::client::ViewRowResult r;
+        r.status = (status() == rune::client::OpStatus::Ok) ? rune::client::ViewRowResult::kOk
+                                                             : outcome().c.errorCode;
+        if (r.status == rune::client::ViewRowResult::kOk) r.rowBytes = outcome().payload;
+        return r;
+    }
 
 private:
     TestCq*                  cq_ = nullptr;

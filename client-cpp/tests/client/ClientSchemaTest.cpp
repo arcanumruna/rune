@@ -54,6 +54,7 @@
 #include "../support/AeronTestErrors.h"
 #include <rune/client/Client.h>
 #include <rune/client/codec/Codec.h>
+#include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/SchemaMessages.h>
 
 #include <Aeron.h>
@@ -130,6 +131,8 @@ struct SchemaTestGateway {
     bool replyDefineTopic    = true;   // respond to DefineTopic
     bool replyGetTopicSchema = true;   // respond to GetTopicSchema
     bool replyAlterTopic     = true;   // respond to AlterTopic
+    bool replyCreateView     = true;   // Task 21: respond to CreateView
+    bool replyGetViewRow     = true;   // Task 21: respond to GetViewRow
 
     // Canned DefineTopic response fields (applied to every response).
     int32_t  defineTopicId   = 0x40000001;
@@ -154,6 +157,21 @@ struct SchemaTestGateway {
     std::atomic<uint16_t> lastAlterExpectedVersion{0};
     std::vector<uint8_t>  lastAlterOpsBlob;
 
+    // Task 21: canned CreateView response fields.
+    int32_t  viewTopicId        = 0x40000007;
+    uint64_t viewOutputFinger   = 0xABCDEF0123456789ULL;
+    uint16_t viewCreateError    = 0;  // 0 == OK
+    std::string lastCreateViewName;
+    std::string lastCreateViewKeyField;
+    uint8_t     lastCreateViewPersistence = 0xff;
+    std::vector<uint8_t> lastCreateViewPlanBlob;
+
+    // Task 21: canned GetViewRow response fields.
+    uint16_t             viewRowStatus = 0;  // 0 == OK
+    std::vector<uint8_t> viewRowBytes  = {0x11, 0x22, 0x33, 0x44};
+    std::atomic<uint64_t> lastViewRowKeyU64{0};
+    std::atomic<uint64_t> lastRequestedViewFingerprint{0};
+
     // Per-op response overrides (set before the call).
     // If non-negative, override canned response per-correlationId.
     // Map from correlationId → custom fields.  Used for multi-op tests.
@@ -172,6 +190,8 @@ struct SchemaTestGateway {
     std::atomic<int> getsSeen{0};
     std::atomic<int> connectsSeen{0};
     std::atomic<int> altersSeen{0};
+    std::atomic<int> createViewsSeen{0};
+    std::atomic<int> getViewRowsSeen{0};
 
     uint8_t replyBuf[4096]{};
 
@@ -342,6 +362,58 @@ struct SchemaTestGateway {
             break;
         }
 
+        // ---- Task 21: CreateView (70) -> CreateViewResponse (71) ----
+        case rcc::TemplateId::CreateView: {
+            auto opt = rpc::CreateView::decode(buf, len);
+            if (!opt) return;
+            createViewsSeen.fetch_add(1, std::memory_order_relaxed);
+            lastCreateViewName        = std::string(opt->viewName);
+            lastCreateViewKeyField    = std::string(opt->keyField);
+            lastCreateViewPersistence = opt->persistence;
+            lastCreateViewPlanBlob.assign(opt->planBlob, opt->planBlob + opt->planLen);
+            if (!replyCreateView) break;
+
+            rpc::CreateViewResponse resp;
+            resp.sessionId         = opt->sessionId;
+            resp.correlationId     = opt->correlationId;
+            resp.viewTopicId       = viewTopicId;
+            resp.outputFingerprint = viewOutputFinger;
+            resp.errorCode         = viewCreateError;
+
+            const std::size_t n = resp.encode(replyBuf);
+            if (n > 0) send(replyBuf, n);
+            break;
+        }
+
+        // ---- Task 21: GetViewRow (72) -> ViewRowResponse (73) ----
+        case rcc::TemplateId::GetViewRow: {
+            auto opt = rpc::GetViewRow::decode(buf, len);
+            if (!opt) return;
+            getViewRowsSeen.fetch_add(1, std::memory_order_relaxed);
+            lastViewRowKeyU64.store(opt->keyU64, std::memory_order_relaxed);
+            lastRequestedViewFingerprint.store(opt->requestedFingerprint, std::memory_order_relaxed);
+            if (!replyGetViewRow) break;
+
+            rpc::ViewRowResponse resp;
+            resp.sessionId     = opt->sessionId;
+            resp.correlationId = opt->correlationId;
+            resp.status        = viewRowStatus;
+            if (viewRowStatus == 0) {
+                resp.rowLen     = static_cast<uint32_t>(viewRowBytes.size());
+                resp.rowBytes   = viewRowBytes.data();
+                resp.rowBytesLen = static_cast<uint32_t>(viewRowBytes.size());
+            } else {
+                resp.rowLen = 0;
+                resp.rowBytes = nullptr;
+                resp.rowBytesLen = 0;
+            }
+
+            std::vector<uint8_t> scratch(resp.encodedSize() + 32u);
+            const std::size_t n = resp.encode(scratch.data());
+            if (n > 0) send(scratch.data(), n);
+            break;
+        }
+
         default:
             break;
         }
@@ -385,6 +457,19 @@ struct SchemaHarness {
                                         std::span<const uint8_t> opsBlob) {
         return cq->issue([&](Completions& q, Token t) {
             return client->alterTopic(name, expectedVersion, opsBlob, q, t);
+        });
+    }
+    /// Task 21.
+    test_support::PendingOp createViewOp(std::string_view viewName, std::string_view keyField,
+                                         uint8_t persistence, std::span<const uint8_t> planBlob) {
+        return cq->issue([&](Completions& q, Token t) {
+            return client->createView(viewName, keyField, persistence, planBlob, q, t);
+        });
+    }
+    /// Task 21.
+    test_support::PendingOp getViewRowOp(int32_t viewTopicId, uint64_t keyU64, uint64_t requestedFingerprint) {
+        return cq->issue([&](Completions& q, Token t) {
+            return client->getViewRow(viewTopicId, keyU64, requestedFingerprint, q, t);
         });
     }
 
@@ -874,4 +959,158 @@ TEST(ClientSchema, GetTopicSchemaAndWaitThreadsRequestedFingerprintRegression) {
     ASSERT_NO_THROW(fut2.schemaResult());
     EXPECT_EQ(h.gw->lastRequestedFingerprint.load(), 0u)
         << "regression: fp=0 must mean latest on the wire";
+}
+
+// ===========================================================================
+// Task 21: Client::createView / Client::getViewRow
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Test 14: CreateViewFutureResolvesOnOK
+//
+// A CreateView frame (viewName/keyField/persistence/planBlob) is encoded and
+// an injected CreateViewResponse surfaces as CreateViewResult{viewTopicId,
+// outputFingerprint, errorCode}. The gateway's decode of the request also
+// pins that the frame carried the right fields (not reinvented plumbing).
+// ---------------------------------------------------------------------------
+TEST(ClientSchema, CreateViewFutureResolvesOnOK) {
+    SchemaHarness h(1126, 1127);
+    h.build();
+    h.connectAndWait();
+
+    h.gw->viewTopicId      = 0x40000007;
+    h.gw->viewOutputFinger = 0xABCDEF0123456789ULL;
+    h.gw->viewCreateError  = 0;
+
+    std::vector<uint8_t> planBlob = {0x01, 0xDE, 0xAD, 0xBE, 0xEF};
+    auto fut = h.createViewOp("char_hp", "id", /*persistence=*/0, std::span<const uint8_t>(planBlob));
+
+    h.pumpGwUntil([&]() { return fut.ready(); });
+
+    ASSERT_TRUE(fut.waitReady()) << "createView() future did not resolve";
+
+    CreateViewResult r;
+    ASSERT_NO_THROW(r = fut.createViewResult()) << "createView() threw";
+    EXPECT_EQ(r.viewTopicId,       0x40000007);
+    EXPECT_EQ(r.outputFingerprint, 0xABCDEF0123456789ULL);
+    EXPECT_EQ(r.errorCode,         0u);
+
+    EXPECT_EQ(h.gw->createViewsSeen.load(), 1) << "gateway should have seen exactly one CreateView";
+    EXPECT_EQ(h.gw->lastCreateViewName,        "char_hp");
+    EXPECT_EQ(h.gw->lastCreateViewKeyField,    "id");
+    EXPECT_EQ(h.gw->lastCreateViewPersistence, 0u);
+    EXPECT_EQ(h.gw->lastCreateViewPlanBlob,    planBlob) << "planBlob mismatch on the wire";
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: CreateViewResponseErrorCodePropagates
+//
+// CreateView on an existing view name -> ViewExists (broker errorCode 32).
+// The result carries the errorCode without throwing (same contract as
+// DefineTopic/AlterTopic broker errors).
+// ---------------------------------------------------------------------------
+TEST(ClientSchema, CreateViewResponseErrorCodePropagates) {
+    SchemaHarness h(1128, 1129);
+    h.build();
+    h.connectAndWait();
+
+    h.gw->viewTopicId      = -1;
+    h.gw->viewOutputFinger = 0;
+    h.gw->viewCreateError  = static_cast<uint16_t>(rpc::ErrorCode::ViewExists);
+
+    std::vector<uint8_t> planBlob = {0x01};
+    auto fut = h.createViewOp("existing_view", "id", /*persistence=*/1, std::span<const uint8_t>(planBlob));
+
+    h.pumpGwUntil([&]() { return fut.ready(); });
+
+    ASSERT_TRUE(fut.waitReady()) << "createView() future did not resolve with error code";
+
+    CreateViewResult r;
+    ASSERT_NO_THROW(r = fut.createViewResult())
+        << "createView() with non-OK errorCode must NOT throw — errorCode is in the result";
+    EXPECT_EQ(r.errorCode, static_cast<uint16_t>(rpc::ErrorCode::ViewExists));
+    EXPECT_EQ(r.viewTopicId, -1);
+}
+
+// ---------------------------------------------------------------------------
+// Test 16: GetViewRowFutureResolvesWithRowBytes
+//
+// A GetViewRow frame (viewTopicId/keyU64/requestedFingerprint) is encoded and
+// an injected ViewRowResponse{status=OK, rowBytes} surfaces as
+// ViewRowResult{status=kOk, rowBytes}. rowBytes' OWN length (not the wire's
+// informational rowLen) is what the client trusts — ViewRowResult::rowBytes
+// matches exactly what the gateway put on the wire.
+// ---------------------------------------------------------------------------
+TEST(ClientSchema, GetViewRowFutureResolvesWithRowBytes) {
+    SchemaHarness h(1130, 1131);
+    h.build();
+    h.connectAndWait();
+
+    h.gw->viewRowStatus = 0;  // OK
+    h.gw->viewRowBytes  = {0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x11};
+
+    constexpr uint64_t kFingerprint = 0xABCDEF0123456789ULL;
+    auto fut = h.getViewRowOp(0x40000007, /*keyU64=*/7, kFingerprint);
+
+    h.pumpGwUntil([&]() { return fut.ready(); });
+
+    ASSERT_TRUE(fut.waitReady()) << "getViewRow() future did not resolve";
+
+    ViewRowResult r;
+    ASSERT_NO_THROW(r = fut.getViewRowResult()) << "getViewRow() threw";
+    EXPECT_EQ(r.status, ViewRowResult::kOk);
+    EXPECT_EQ(r.rowBytes, h.gw->viewRowBytes) << "rowBytes mismatch — rowBytes' own length must be ground truth";
+
+    EXPECT_EQ(h.gw->getViewRowsSeen.load(), 1) << "gateway should have seen exactly one GetViewRow";
+    EXPECT_EQ(h.gw->lastViewRowKeyU64.load(), 7u);
+    EXPECT_EQ(h.gw->lastRequestedViewFingerprint.load(), kFingerprint)
+        << "regression: requestedFingerprint was not threaded onto the GetViewRow frame";
+}
+
+// ---------------------------------------------------------------------------
+// Test 17: GetViewRowAbsentKeyPropagatesTypedStatus
+//
+// An AbsentKey ViewRowResponse (status=1) surfaces as ViewRowResult{status=
+// kAbsentKey} — NOT as a thrown exception, and NOT as an empty-but-"OK" row
+// (the status/rowBytes distinction is exactly what lets a caller tell
+// "absent key" apart from "a zero-valued row").
+// ---------------------------------------------------------------------------
+TEST(ClientSchema, GetViewRowAbsentKeyPropagatesTypedStatus) {
+    SchemaHarness h(1132, 1133);
+    h.build();
+    h.connectAndWait();
+
+    h.gw->viewRowStatus = static_cast<uint16_t>(rpc::ViewRowResponse::kAbsentKey);
+    h.gw->viewRowBytes  = {};  // AbsentKey carries no row bytes
+
+    auto fut = h.getViewRowOp(0x40000007, /*keyU64=*/424242, /*requestedFingerprint=*/0);
+
+    h.pumpGwUntil([&]() { return fut.ready(); });
+
+    ASSERT_TRUE(fut.waitReady()) << "getViewRow() future did not resolve with AbsentKey";
+
+    ViewRowResult r;
+    ASSERT_NO_THROW(r = fut.getViewRowResult())
+        << "getViewRow() with AbsentKey must NOT throw — status is in the result";
+    EXPECT_EQ(r.status, ViewRowResult::kAbsentKey);
+    EXPECT_TRUE(r.rowBytes.empty()) << "AbsentKey must carry no row bytes";
+}
+
+// ---------------------------------------------------------------------------
+// Test 18: GetViewRowTimeoutFailsPromise
+// ---------------------------------------------------------------------------
+TEST(ClientSchema, GetViewRowTimeoutFailsPromise) {
+    SchemaHarness h(1134, 1135);
+    h.pingTimeoutMs = 500;
+    h.build();
+    h.connectAndWait();
+
+    h.gw->replyGetViewRow = false;
+
+    auto fut = h.getViewRowOp(0x40000007, /*keyU64=*/1, /*requestedFingerprint=*/0);
+
+    ASSERT_TRUE(fut.waitReady())
+        << "getViewRow() future did not fail within timeout — potential hang";
+    EXPECT_THROW(fut.getViewRowResult(), std::exception)
+        << "getViewRow() must throw on timeout, not return a value";
 }

@@ -1163,6 +1163,37 @@ OpResult Client::listTopics(CompletionTarget target, Token token) {
     return issueControl_(OpKind::ListTopics, target, token, {}, 0);
 }
 
+OpResult Client::createView(std::string_view viewName, std::string_view keyField, uint8_t persistence,
+                            std::span<const uint8_t> planBlob, CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::CreateView msg;
+    msg.sessionId     = 0;
+    msg.correlationId = 0;
+    msg.viewName      = viewName;
+    msg.keyField      = keyField;
+    msg.persistence   = persistence;
+    msg.planBlob      = planBlob.data();
+    msg.planLen       = static_cast<uint32_t>(planBlob.size());
+    std::vector<uint8_t> frame(msg.encodedSize() + 32u);
+    const std::size_t n = msg.encode(frame.data());
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueControl_(OpKind::CreateView, target, token, std::span<const uint8_t>(frame.data(), n), 0);
+}
+
+OpResult Client::getViewRow(int32_t viewTopicId, uint64_t keyU64, uint64_t requestedFingerprint,
+                            CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::GetViewRow msg;
+    msg.sessionId            = 0;
+    msg.correlationId        = 0;
+    msg.viewTopicId          = viewTopicId;
+    msg.keyU64               = keyU64;
+    msg.requestedFingerprint = requestedFingerprint;
+    uint8_t frame[rpc::GetViewRow::ENCODED_SIZE];
+    const std::size_t n = msg.encode(frame);
+    return issueControl_(OpKind::GetViewRow, target, token, std::span<const uint8_t>(frame, n), 0);
+}
+
 std::vector<std::pair<std::string, int32_t>> Client::decodeTopicList(std::span<const uint8_t> p) {
     std::vector<std::pair<std::string, int32_t>> out;
     std::size_t at = 0;
@@ -1523,6 +1554,38 @@ AlterTopicResult Client::alterTopicAndWait(std::string_view name, uint16_t expec
                  result.topicId    = static_cast<int32_t>(c.value);
                  result.newVersion = static_cast<uint16_t>(c.aux);
                  result.errorCode  = c.errorCode;
+             });
+    return result;
+}
+
+CreateViewResult Client::createViewAndWait(std::string_view viewName, std::string_view keyField,
+                                           uint8_t persistence, std::span<const uint8_t> planBlob,
+                                           std::chrono::nanoseconds timeout) {
+    CreateViewResult result;
+    andWait_("createView()", timeout, 0,
+             [&](Completions& q, Token t) { return createView(viewName, keyField, persistence, planBlob, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError) throwForStatus_("createView()", c, p);
+                 result.viewTopicId       = static_cast<int32_t>(c.value);
+                 result.outputFingerprint = static_cast<uint64_t>(c.aux);
+                 result.errorCode         = c.errorCode;
+             });
+    return result;
+}
+
+ViewRowResult Client::getViewRowAndWait(int32_t viewTopicId, uint64_t keyU64, uint64_t requestedFingerprint,
+                                        std::chrono::nanoseconds timeout) {
+    ViewRowResult result;
+    andWait_("getViewRow()", timeout, 64u << 10,
+             [&](Completions& q, Token t) { return getViewRow(viewTopicId, keyU64, requestedFingerprint, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 // A ViewRowResponse status != OK rides as BrokerError/errorCode
+                 // (see the dispatch case below) — never thrown; only a real
+                 // transport-level failure (Timeout/NotConnected/SessionLost/
+                 // Closed) is.
+                 if (c.status != OpStatus::BrokerError) throwForStatus_("getViewRow()", c, p);
+                 result.status = (c.status == OpStatus::Ok) ? ViewRowResult::kOk : c.errorCode;
+                 if (result.status == ViewRowResult::kOk) result.rowBytes.assign(p.begin(), p.end());
              });
     return result;
 }
@@ -2624,6 +2687,46 @@ void Client::onEgressFrame(codec::TemplateId tid,
             PendingCtl p = takeCtl_(i);
             completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
                          opt->topicId, opt->newVersion, opt->errorCode);
+        }
+        break;
+    }
+
+    // ---- Task 21: CreateViewResponse (71) ----
+    case codec::TemplateId::CreateViewResponse: {
+        namespace rpc = rune::protocol::client;
+        auto opt = rpc::CreateViewResponse::decode(buf, len);
+        if (!opt) break;
+
+        if (const std::size_t i = findCtl_(opt->correlationId);
+            i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::CreateView) {
+            PendingCtl p = takeCtl_(i);
+            completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
+                         opt->viewTopicId, static_cast<int64_t>(opt->outputFingerprint), opt->errorCode);
+        }
+        break;
+    }
+
+    // ---- Task 21: ViewRowResponse (73) ----
+    case codec::TemplateId::ViewRowResponse: {
+        namespace rpc = rune::protocol::client;
+        auto opt = rpc::ViewRowResponse::decode(buf, len);
+        if (!opt) break;
+
+        if (const std::size_t i = findCtl_(opt->correlationId);
+            i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::GetViewRow) {
+            PendingCtl p = takeCtl_(i);
+            // status is a ViewRowResponse-specific outcome, not a broker
+            // ErrorCode — reuse the errorCode field as its carrier (same
+            // convention DefineTopic/AlterTopic use for their own errorCode).
+            // rowBytes' OWN length (opt->rowBytesLen) is ground truth for the
+            // row length (opt->rowLen is informational only, per the wire
+            // comment in DataMessages.h) — the payload below carries exactly
+            // rowBytesLen bytes, never opt->rowLen.
+            const std::span<const uint8_t> row(
+                opt->rowBytes, (opt->rowBytes != nullptr) ? opt->rowBytesLen : 0u);
+            completeCtl_(p, opt->status == 0 ? OpStatus::Ok : OpStatus::BrokerError,
+                         opt->rowLen, 0, opt->status, row,
+                         detail::CompletionRing::Overflow::TooLarge);
         }
         break;
     }

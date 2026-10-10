@@ -36,6 +36,8 @@ enum class OpKind : uint8_t {
     TxnClose,       ///< C7: TransactionalProducer::close(target, token)
     ClientDrain,    ///< C7: Client::close()'s producer drain (internal)
     AlterTopic,     ///< Task 18: Client::alterTopic() / alterTopicAndWait()
+    CreateView,     ///< Task 21: Client::createView() / createViewAndWait()
+    GetViewRow,     ///< Task 21: Client::getViewRow() / getViewRowAndWait()
 };
 
 enum class OpStatus : uint8_t {
@@ -58,10 +60,14 @@ struct Completion {
     Token    token = 0;          ///< as passed at issue
     int64_t  value = 0;          ///< Send/Tier2: baseOffset (-1 if none); Connect: sessionId;
                                  ///< DefineTopic/GetTopicSchema/AlterTopic: topicId; ResultTooLarge: real size
+                                 ///< CreateView: viewTopicId; GetViewRow: rowLen (informational; the payload's
+                                 ///< own length is ground truth)
     int64_t  aux   = 0;          ///< GetTopicSchema/DefineTopic: version; AlterTopic: newVersion; Tier2: recordCount
+                                 ///< CreateView: outputFingerprint (bit-cast uint64_t)
     OpKind   op{};
     OpStatus status = OpStatus::Ok;
-    uint16_t errorCode = 0;      ///< broker ErrorCode when status == BrokerError
+    uint16_t errorCode = 0;      ///< broker ErrorCode when status == BrokerError; for GetViewRow carries the
+                                 ///< ViewRowResponse::Status (1=AbsentKey,2=NotReady,3=SchemaMismatch,4=UnknownView)
     uint32_t payloadLen = 0;     ///< bytes of inline payload
     uint32_t reservedBytes = 0;  ///< credit returned to the Completions on consume (§2.2)
     uint32_t reserved0 = 0;

@@ -106,6 +106,37 @@ struct AlterTopicResult {
 };
 
 // ---------------------------------------------------------------------------
+// View-engine result types (Task 21: Client::createView / Client::getViewRow)
+// ---------------------------------------------------------------------------
+
+/// Result of CreateView (wire 70/71). errorCode is a broker ErrorCode (e.g.
+/// ViewExists=32, ViewSourceNotFound=33, ViewFieldUnresolved=34).
+struct CreateViewResult {
+    int32_t  viewTopicId       = -1;
+    uint64_t outputFingerprint = 0;
+    uint16_t errorCode         = 0;
+};
+
+/// Result of GetViewRow (wire 72/73). `status` is ViewRowResponse::Status
+/// (0=OK, 1=AbsentKey, 2=NotReady, 3=SchemaMismatch, 4=UnknownView, matching
+/// rune::protocol::client::ViewRowResponse's enum values exactly — duplicated
+/// here as plain uint16_t constants so Client.h need not include
+/// DataMessages.h). `rowBytes`'s OWN size is ground truth for the row length
+/// (rowLen on the wire is informational only); empty unless status == kOk.
+/// Decode positionally with rune::client::view::readSlot (ViewRowCodec.h)
+/// against a RowLayout built from the view's own authored output field types.
+struct ViewRowResult {
+    static constexpr uint16_t kOk              = 0;
+    static constexpr uint16_t kAbsentKey       = 1;
+    static constexpr uint16_t kNotReady        = 2;
+    static constexpr uint16_t kSchemaMismatch  = 3;
+    static constexpr uint16_t kUnknownView     = 4;
+
+    uint16_t              status = kUnknownView;
+    std::vector<uint8_t>  rowBytes;
+};
+
+// ---------------------------------------------------------------------------
 // IdleMode — controls the runner-thread idle strategy.
 //
 // LowLatency: YieldingIdleStrategy — on each idle cycle the runner calls
@@ -551,6 +582,26 @@ public:
                         std::span<const uint8_t> opsBlob, CompletionTarget target, Token token);
     OpResult listTopics(CompletionTarget target, Token token);
 
+    /// Task 21: CreateView (wire 70) — authors a materialized view over an
+    /// already-defined source topic. `planBlob` is the serialized authored
+    /// ViewPlan (rune::client::view::serializeAuthored, ViewPlanAuthor.h) —
+    /// the single source's topicId/keyField, output fields and sizing knobs.
+    /// Completion: value = viewTopicId, aux = outputFingerprint (bit-cast
+    /// uint64_t); a broker errorCode (e.g. ViewExists) -> BrokerError.
+    /// Phase 1 has NO open-by-name wire: the caller must remember the
+    /// returned viewTopicId/outputFingerprint for every later getViewRow().
+    OpResult createView(std::string_view viewName, std::string_view keyField, uint8_t persistence,
+                        std::span<const uint8_t> planBlob, CompletionTarget target, Token token);
+    /// Task 21: GetViewRow (wire 72) — a point lookup into a materialized
+    /// view's output by its folded uint64 key. `requestedFingerprint` pins
+    /// the caller to the output shape it was given at CreateView time (0 =
+    /// latest); a drifted fingerprint is rejected with SchemaMismatch BEFORE
+    /// any row bytes are read. Completion: value = rowLen (informational),
+    /// errorCode = ViewRowResponse::Status (0=OK..4=UnknownView; status != OK
+    /// -> BrokerError), payload = rowBytes (empty unless status == OK).
+    OpResult getViewRow(int32_t viewTopicId, uint64_t keyU64, uint64_t requestedFingerprint,
+                        CompletionTarget target, Token token);
+
     /// Decoded ListTopics payload: (name, topicId) in definition order.
     [[nodiscard]] static std::vector<std::pair<std::string, int32_t>>
     decodeTopicList(std::span<const uint8_t> payload);
@@ -583,6 +634,19 @@ public:
     AlterTopicResult alterTopicAndWait(std::string_view name, uint16_t expectedVersion,
                                        std::span<const uint8_t> opsBlob,
                                        std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+
+    /// Task 21: createView(), blocking. A broker errorCode (e.g. ViewExists,
+    /// ViewSourceNotFound, ViewFieldUnresolved) is returned in the result
+    /// (not thrown).
+    CreateViewResult createViewAndWait(std::string_view viewName, std::string_view keyField,
+                                       uint8_t persistence, std::span<const uint8_t> planBlob,
+                                       std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+    /// Task 21: getViewRow(), blocking. A non-OK ViewRowResponse status (e.g.
+    /// AbsentKey, NotReady) is returned in the result (not thrown) — only a
+    /// transport-level failure (Timeout, NotConnected, SessionLost, Closed)
+    /// throws.
+    ViewRowResult getViewRowAndWait(int32_t viewTopicId, uint64_t keyU64, uint64_t requestedFingerprint,
+                                    std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
 
     /// Topics successfully defined through this Client (Task 9 CLI), in
     /// definition order.  Duty-owned registry, read through a ListTopics op.

@@ -151,6 +151,7 @@ public:
                 payloadBytes > cfg_.maxErrorText ? payloadBytes : cfg_.maxErrorText);
         case OpKind::GetTopicSchema:
         case OpKind::ListTopics:
+        case OpKind::GetViewRow:  // Task 21: response carries a variable rowBytes payload
             return detail::CompletionRing::completionRecordBytes(cfg_.maxResultBytes);
         default:
             return detail::CompletionRing::completionRecordBytes(cfg_.maxErrorText);
