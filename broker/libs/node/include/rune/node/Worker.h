@@ -71,6 +71,7 @@
 #include <rune/node/OrderedWaitQueue.h>
 #include <rune/node/RcState.h>
 #include <rune/node/ReturnFifo.h>
+#include <rune/node/WorkerViewSet.h>
 #include <rune/node/SessionAckSink.h>
 #include <limits>
 #include <rune/node/WorkerOp.h>
@@ -635,6 +636,14 @@ public:
     }
 
     [[nodiscard]] int workerId() const noexcept { return workerId_; }
+
+    // Task 15: attach THIS worker's view-fold set (its own per-worker
+    // ViewSnapshotChannel is owned by the set).  Wired at STARTUP by
+    // BrokerNode (Task 19), before the runner starts — single-threaded, like
+    // setOwnedDirect().  nullptr (the default) => the view-fold drive in
+    // doWork is skipped entirely; the duty cycle is bit-for-bit unchanged.
+    void setViewSet(WorkerViewSet* vs) noexcept { viewSet_ = vs; }
+    [[nodiscard]] WorkerViewSet* viewSet() const noexcept { return viewSet_; }
 
     // Self-contained worker shard (spec §3.1).  Set before the runner starts.
     void setShardMode(bool on) noexcept { shardMode_ = on; }
@@ -1544,6 +1553,7 @@ public:
                 work += replica->doWork(nowNs);
             }
             work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
+            if (viewSet_ != nullptr) [[unlikely]] work += driveViews_(nowNs);   // Task 15: view folds, right after RC advance
             if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
             work += serveHeldPushReads_();
         }
@@ -1644,6 +1654,7 @@ private:
             work += replica->doWork(nowNs);
         }
         work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
+        if (viewSet_ != nullptr) [[unlikely]] work += driveViews_(nowNs);   // Task 15: view folds, right after RC advance
         if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
         work += serveHeldPushReads_();
         // 4b. background disk work → io backend, never an inline fsync
@@ -4093,6 +4104,12 @@ private:
     // NEVER touches it.
     OwnedSet owned_{};
 
+    // Task 15: this worker's view-fold set (its ViewSnapshotChannel + installed
+    // views).  Owned/wired by BrokerNode (Task 19); a non-owning pointer here —
+    // nullptr means no views on this worker (the common case) and the view
+    // drive in doWork is skipped.  Shared-nothing: touched only by this thread.
+    WorkerViewSet* viewSet_ = nullptr;
+
     // D23 (D21 review L1b): the dup fds of epoch-state fsyncs still in flight
     // when the worker is destroyed.  Declared BEFORE io_, so it is destroyed
     // AFTER it: the fds are closed only once the backend is gone (portable:
@@ -4985,6 +5002,38 @@ private:
         f.epoch                = static_cast<int32_t>(r->epoch());
         return f;
     }
+    // Task 15: drive the installed views over every owned LEADER source
+    // partition whose committed range may have advanced.  Additive and
+    // non-disruptive: runs right after rcAdvanceAll_(), only when a view set is
+    // attached.  The read-committed bound is rc->lso(liveHw) — the SAME idiom
+    // the push path uses (Worker.h ~2788-2793) — so a view never folds an
+    // uncommitted (open-txn) batch.  Phase 1: disk-backed sources only (the
+    // fold reads the committed log via readNoFault_ into the worker's push
+    // scratch, one pread, no page fault).  Returns 0 (the fold's own progress
+    // shows up as RC/replica work on the passes that advanced the log).
+    int driveViews_(int64_t nowNs) {
+        for (auto* replica : owned_) {
+            if (replica == nullptr || replica->topicId() < 0) continue;
+            if (replica->role() != rune::replication::Role::Leader) continue;
+            if (!replica->isDiskBacked()) continue;  // Phase 1: committed disk log only
+            const RcState* rcState = rcServe_(replica, rcOf_(replica));
+            if (rcState == nullptr) continue;         // RC not Ready: fail closed, no bound
+            const int64_t liveHw = replica->highWatermark();
+            const int64_t bound  = rcState->lso(liveHw);
+            rune::storage::Log* log = replica->log();
+            if (log == nullptr) continue;
+            const int32_t topicId   = replica->topicId();
+            const int32_t partition = static_cast<int32_t>(replica->partitionId());
+            viewSet_->driveFolds(
+                topicId, partition,
+                [this, log](int64_t from, int64_t to) -> rune::storage::LogReadView {
+                    return readNoFault_(log, from, kPushMaxChunkBytes, to);
+                },
+                bound, nowNs);
+        }
+        return 0;
+    }
+
     // One §2.3 driver step for one partition.
     // D3b fix round 1 (cleaner invariant): the cleaner-visible LSO is 0 (clean
     // nothing) whenever the RC state is not Ready — it is published BEFORE any

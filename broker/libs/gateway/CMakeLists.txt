@@ -34,6 +34,12 @@ target_link_libraries(rune_gateway PUBLIC rune_crypto)
 # includes rune/codec/Validator.h for the Task 7 per-worker schema validation
 # hook.  Consumers that include Worker.h via RUNE_NODE_INCLUDE need rune_codec headers.
 target_link_libraries(rune_gateway PUBLIC rune_codec)
+# rune_view PUBLIC: Worker.h (included transitively via WorkerPool.h) now
+# includes rune/node/WorkerViewSet.h (Task 15 view-fold integration), which
+# pulls rune/view/* headers.  Consumers that include Worker.h via
+# RUNE_NODE_INCLUDE need rune_view headers.  rune_view is a leaf lib (depends
+# only on rune_codec) so this introduces no circular dependency.
+target_link_libraries(rune_gateway PUBLIC rune_view)
 
 if(aeron_FOUND)
     target_link_libraries(rune_gateway PUBLIC aeron::aeron)

@@ -12,7 +12,8 @@ add_library(rune_node
     src/TransactionCoordinationService.cpp
     src/SchemaRegistry.cpp
     src/AdminWorker.cpp
-    src/ViewSnapshotIoAgent.cpp)
+    src/ViewSnapshotIoAgent.cpp
+    src/WorkerViewSet.cpp)
 
 # The worker's io backends, as their own leaf library: Worker.h's header-inline
 # code (instantiated by rune_replication's AeronPartitionTransport.cpp too) calls
@@ -144,6 +145,7 @@ if(BUILD_TESTING)
         tests/node/ParkUntilWorkIdleTest.cpp
         tests/node/RingDoorbellTest.cpp
         tests/node/ViewSnapshotIoAgentTest.cpp
+        tests/node/WorkerViewSetTest.cpp
         )
     target_link_libraries(rune_node_tests PRIVATE
         rune_node

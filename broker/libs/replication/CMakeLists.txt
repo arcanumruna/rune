@@ -34,12 +34,15 @@ if(aeron_FOUND)
     # Its .cpp only needs node HEADERS (all header-inline; no node link deps).
     target_sources(rune_replication PRIVATE src/AeronPartitionTransport.cpp)
     target_include_directories(rune_replication PRIVATE ${RUNE_NODE_INCLUDE})
-    target_link_libraries(rune_replication PUBLIC rune_consensus rune_metadata rune_codec)
+    # rune_view: Worker.h (reached via the node headers above) now includes
+    # rune/node/WorkerViewSet.h (Task 15), pulling rune/view/* headers.  rune_view
+    # is a leaf lib (depends only on rune_codec) so this adds no circular dep.
+    target_link_libraries(rune_replication PUBLIC rune_consensus rune_metadata rune_codec rune_view)
     # Kept as the consumer-facing name (same usage requirements as before).
     add_library(rune_replication_aeron INTERFACE)
     target_include_directories(rune_replication_aeron INTERFACE ${RUNE_NODE_INCLUDE})
     target_link_libraries(rune_replication_aeron INTERFACE
-        rune_replication rune_consensus rune_metadata aeron::aeron spdlog::spdlog rune_codec)
+        rune_replication rune_consensus rune_metadata aeron::aeron spdlog::spdlog rune_codec rune_view)
     # F15 S4 (merged with T11 fix 2 in integration wave 2): Worker.h (reached via
     # the node headers above) holds the worker-owned read_committed state
     # (LsoTracker + AbortedTxnIndex, rune/transaction/ReadCommittedView.h), and
