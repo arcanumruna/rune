@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -53,6 +54,35 @@ int64_t peekDeltaOffset(const uint8_t* p, std::size_t len) noexcept {
     return static_cast<int64_t>(readLE64(p + 4));
 }
 
+// Review round 1 (IMPORTANT 2): loop ::write() until every byte lands, so
+// the only way this returns false is a REAL I/O error -- EINTR and a
+// legitimate short write (the kernel accepted fewer bytes than requested,
+// no error) just resume from the new offset. Without this loop a short
+// write would leave a torn/partial record on disk with no resync marker
+// between records, permanently misaligning every later record's CRC on
+// replay -- see handleDeltaFrame_'s FATAL handling of a `false` return.
+bool writeFull(int fd, const uint8_t* data, std::size_t len) noexcept {
+    std::size_t written = 0;
+    while (written < len) {
+        const ssize_t n = ::write(fd, data + written, len - written);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false; // real error
+        }
+        if (n == 0) return false; // defensive: no forward progress -- never spin
+        written += static_cast<std::size_t>(n);
+    }
+    return true;
+}
+
+// Shared 16-byte [viewTopicId i32][partition i32][O i64] ack encode (fix-on-
+// sight DRY: was duplicated in postDone_ and drainPendingAcks_).
+void encodeAck(uint8_t* buf, int32_t viewTopicId, int32_t partition, int64_t O) noexcept {
+    writeLE32(buf, static_cast<uint32_t>(viewTopicId));
+    writeLE32(buf + 4, static_cast<uint32_t>(partition));
+    writeLE64(buf + 8, static_cast<uint64_t>(O));
+}
+
 } // namespace
 
 ViewSnapshotIoAgent::ViewSnapshotIoAgent(ViewSnapshotChannel& channel,
@@ -85,20 +115,31 @@ std::string ViewSnapshotIoAgent::deltaFilePathForTest(int32_t viewTopicId, int32
     return deltaFilePath_(Key{viewTopicId, partition});
 }
 
-ViewSnapshotIoAgent::FileState& ViewSnapshotIoAgent::fileFor_(const Key& key) {
+ViewSnapshotIoAgent::FileState* ViewSnapshotIoAgent::fileFor_(const Key& key) {
     auto it = files_.find(key);
-    if (it != files_.end()) return it->second;
+    if (it != files_.end()) return &it->second;
 
-    FileState fs;
     const std::string path = deltaFilePath_(key);
-    fs.fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0644);
-    if (fs.fd < 0) {
-        spdlog::warn("ViewSnapshotIoAgent: failed to open delta file {} (viewTopicId={}, partition={}): {}",
+    const int fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0644);
+    if (fd < 0) {
+        // Review round 1 (IMPORTANT 1): do NOT emplace a FileState for a
+        // failed open -- caching fd=-1 here would permanently blackhole
+        // every future delta for this key behind one log line, even for a
+        // purely transient failure (dir not yet created, fd-ulimit,
+        // momentary ENOSPC/EACCES). Leaving no entry means the NEXT delta
+        // for this key retries open() from scratch. openFailures_ makes a
+        // PERSISTENT failure observable beyond this one log line.
+        ++openFailures_;
+        spdlog::warn("ViewSnapshotIoAgent: failed to open delta file {} (viewTopicId={}, partition={}): {} "
+                     "-- not cached, will retry on the next delta for this key",
                      path, key.viewTopicId, key.partition, std::strerror(errno));
+        return nullptr;
     }
+    FileState fs;
+    fs.fd = fd;
     auto [ins, inserted] = files_.emplace(key, fs);
     (void)inserted;
-    return ins->second;
+    return &ins->second;
 }
 
 void ViewSnapshotIoAgent::handleDeltaFrame_(const uint8_t* p, std::size_t len) {
@@ -112,32 +153,46 @@ void ViewSnapshotIoAgent::handleDeltaFrame_(const uint8_t* p, std::size_t len) {
     const int64_t O = peekDeltaOffset(deltaBytes, deltaLen);
     if (O < 0) return; // malformed/truncated Task-12 record -- drop, never corrupt the file
 
-    Key key{viewTopicId, partition};
-    FileState& fs = fileFor_(key);
-    if (fs.fd < 0) return; // open failed (already logged) -- drop
+    const Key key{viewTopicId, partition};
+
+    // Review round 1 (IMPORTANT 2): once a file has hit a FATAL write error
+    // it must NEVER accept another delta -- a torn/partial record with no
+    // resync marker would otherwise misalign every later record's CRC on
+    // replay. fileFor_() below would happily return the SAME (already open)
+    // FileState for this key, so the errored check must come first.
+    if (auto it = files_.find(key); it != files_.end() && it->second.errored) return;
+
+    FileState* fs = fileFor_(key);
+    if (fs == nullptr) return; // open failed this cycle (transient, NOT cached) -- drop, retried next delta
 
     // appendNoSync-style: a plain write(), no fsync here -- fsyncs are
     // GROUPED in flushDue_ (offset-atomic: see file header).
-    const ssize_t written = ::write(fs.fd, deltaBytes, deltaLen);
-    if (written < 0 || static_cast<std::size_t>(written) != deltaLen) {
-        spdlog::warn("ViewSnapshotIoAgent: short/failed write for viewTopicId={} partition={}: {}",
-                     viewTopicId, partition, std::strerror(errno));
-        return; // do not advance pendingO on a torn write
+    if (!writeFull(fs->fd, deltaBytes, deltaLen)) {
+        // FATAL: writeFull() only fails on a real I/O error (not EINTR, not
+        // a legitimate short write -- those are retried internally), which
+        // means the file may now hold a torn/partial record. Stop trusting
+        // it forever: never advance pendingO/lastDurableO past this point,
+        // and never accept another delta for this key (the `errored` check
+        // above enforces that from here on).
+        fs->errored = true;
+        spdlog::error("ViewSnapshotIoAgent: FATAL write failure for viewTopicId={} partition={} at O={}: {} "
+                      "-- this delta stream is now stopped (hasError() will report true)",
+                      viewTopicId, partition, O, std::strerror(errno));
+        return;
     }
 
     // Deltas for a given (view,partition) arrive in increasing O order (the
-    // worker drains its own ViewTable dirty set in order), so a plain
-    // overwrite -- not a max() -- is correct and matches the file's
-    // append-only ordering.
-    fs.pendingO       = O;
-    fs.dirtySinceSync = true;
+    // worker drains its own ViewTable dirty set in order); std::max is a
+    // cheap defense against a latent offset-regression if that invariant is
+    // ever violated (e.g. a redelivery) -- never silently moves pendingO
+    // backward.
+    fs->pendingO       = std::max(fs->pendingO, O);
+    fs->dirtySinceSync = true;
 }
 
 void ViewSnapshotIoAgent::postDone_(int32_t viewTopicId, int32_t partition, int64_t O) {
     uint8_t buf[ViewSnapshotChannel::kDoneMsgBytes];
-    writeLE32(buf, static_cast<uint32_t>(viewTopicId));
-    writeLE32(buf + 4, static_cast<uint32_t>(partition));
-    writeLE64(buf + 8, static_cast<uint64_t>(O));
+    encodeAck(buf, viewTopicId, partition, O);
     if (!channel_.done.write(buf, sizeof(buf), ViewSnapshotChannel::kDoneMsgType)) {
         // Ring momentarily full -- retry next cycle (never dropped). The
         // in-process lastDurableOffset() is already correct regardless of
@@ -152,9 +207,7 @@ void ViewSnapshotIoAgent::drainPendingAcks_() {
     for (std::size_t i = 0; i < pendingAcks_.size(); ++i) {
         const auto& ack = pendingAcks_[i];
         uint8_t buf[ViewSnapshotChannel::kDoneMsgBytes];
-        writeLE32(buf, static_cast<uint32_t>(ack.viewTopicId));
-        writeLE32(buf + 4, static_cast<uint32_t>(ack.partition));
-        writeLE64(buf + 8, static_cast<uint64_t>(ack.O));
+        encodeAck(buf, ack.viewTopicId, ack.partition, ack.O);
         if (!channel_.done.write(buf, sizeof(buf), ViewSnapshotChannel::kDoneMsgType)) {
             if (keep != i) pendingAcks_[keep] = pendingAcks_[i];
             ++keep;
@@ -220,6 +273,22 @@ int ViewSnapshotIoAgent::doWork(int64_t nowNs) {
 int64_t ViewSnapshotIoAgent::lastDurableOffset(int32_t viewTopicId, int32_t partition) const noexcept {
     auto it = files_.find(Key{viewTopicId, partition});
     return it == files_.end() ? -1 : it->second.lastDurableO;
+}
+
+bool ViewSnapshotIoAgent::hasError(int32_t viewTopicId, int32_t partition) const noexcept {
+    auto it = files_.find(Key{viewTopicId, partition});
+    return it != files_.end() && it->second.errored;
+}
+
+void ViewSnapshotIoAgent::forceWriteFailureForTest(int32_t viewTopicId, int32_t partition) {
+    const Key key{viewTopicId, partition};
+    FileState* fs = fileFor_(key);
+    if (fs == nullptr) return; // open failed -- nothing to break (already "not durable")
+    if (fs->fd >= 0) ::close(fs->fd);
+    // Reopen read-only: any ::write() to this fd fails with EBADF -- a
+    // portable, deterministic stand-in for a real short/failed write (no
+    // reliance on an OS-specific partial-write race window).
+    fs->fd = ::open(deltaFilePath_(key).c_str(), O_RDONLY);
 }
 
 } // namespace rune::node

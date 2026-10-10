@@ -155,3 +155,105 @@ TEST(ViewSnapshotIoAgentRegression, DurableOffsetDoesNotAdvanceBeforeFsyncWindow
     agent.doWork(clk.nowNs());
     EXPECT_EQ(agent.lastDurableOffset(kViewTopicId, kPartition), 10);
 }
+
+// Review round 1, IMPORTANT 2: a FATAL write failure must (a) never advance
+// lastDurableOffset past the failed delta, (b) surface via hasError(), and
+// (c) permanently stop the stream (no later delta for the same key is ever
+// appended again -- a torn record with no resync marker would otherwise
+// silently misalign every later record's CRC on replay).
+TEST(ViewSnapshotIoAgentRegression, FatalWriteFailureStopsStreamAndNeverAdvancesOffset) {
+    TempDir dir;
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), /*fsyncMs=*/50);
+    rune::consensus::ManualNanoClock clk(0);
+    const RowLayout layout = testLayout();
+
+    // First delta lands and becomes durable normally.
+    auto frame1 = frameDelta(kViewTopicId, kPartition, /*O=*/10, /*hp=*/1, layout);
+    ASSERT_TRUE(ch.deltas.write(frame1.data(), frame1.size(), rune::node::ViewSnapshotChannel::kDeltaMsgType));
+    for (int i = 0; i < kHardCap && agent.lastDurableOffset(kViewTopicId, kPartition) < 10; ++i) {
+        agent.doWork(clk.nowNs());
+        clk.advance(60LL * 1'000'000LL);
+    }
+    ASSERT_EQ(agent.lastDurableOffset(kViewTopicId, kPartition), 10);
+    ASSERT_FALSE(agent.hasError(kViewTopicId, kPartition));
+
+    // Force the NEXT write for this key to fail deterministically (reopens
+    // the fd O_RDONLY -- a portable stand-in for a real short/failed write).
+    agent.forceWriteFailureForTest(kViewTopicId, kPartition);
+
+    auto frame2 = frameDelta(kViewTopicId, kPartition, /*O=*/20, /*hp=*/2, layout);
+    ASSERT_TRUE(ch.deltas.write(frame2.data(), frame2.size(), rune::node::ViewSnapshotChannel::kDeltaMsgType));
+    for (int i = 0; i < kHardCap; ++i) {
+        agent.doWork(clk.nowNs());
+        clk.advance(60LL * 1'000'000LL);
+    }
+
+    // The failed delta's O never becomes durable; the error is surfaced.
+    EXPECT_EQ(agent.lastDurableOffset(kViewTopicId, kPartition), 10);
+    EXPECT_TRUE(agent.hasError(kViewTopicId, kPartition));
+
+    // A THIRD delta for the SAME key, pushed after the error, must also be
+    // rejected -- no further appends to a permanently-stopped stream.
+    auto frame3 = frameDelta(kViewTopicId, kPartition, /*O=*/30, /*hp=*/3, layout);
+    ASSERT_TRUE(ch.deltas.write(frame3.data(), frame3.size(), rune::node::ViewSnapshotChannel::kDeltaMsgType));
+    for (int i = 0; i < kHardCap; ++i) {
+        agent.doWork(clk.nowNs());
+        clk.advance(60LL * 1'000'000LL);
+    }
+    EXPECT_EQ(agent.lastDurableOffset(kViewTopicId, kPartition), 10);
+
+    // What IS on disk is still exactly the first, fully-durable record --
+    // replay recovers precisely up to it (CRC-validated), nothing more.
+    const std::string path = agent.deltaFilePathForTest(kViewTopicId, kPartition);
+    const auto bytes = readFile(path);
+    ViewTable replayed(layout);
+    auto applied = applyDelta(replayed, layout, bytes);
+    ASSERT_TRUE(applied.has_value());
+    EXPECT_EQ(applied->O, 10);
+}
+
+// Review round 1, IMPORTANT 1: a transient ::open() failure must be retried,
+// never permanently cached. Uses a FILE sitting where the view-data
+// directory should be, so every ::open() of the per-key delta file fails
+// with ENOTDIR until the obstruction is removed -- a portable stand-in for a
+// real transient failure (fd-ulimit, momentary ENOSPC/EACCES, ...).
+TEST(ViewSnapshotIoAgentRegression, OpenFailureIsRetriedNotPermanentlyBlackholed) {
+    TempDir parent;
+    const std::string badDir = parent.path() + "/viewdata";
+    {
+        std::ofstream blocker(badDir, std::ios::binary);
+        blocker << "not a directory";
+    }
+    ASSERT_TRUE(fs::exists(badDir));
+    ASSERT_FALSE(fs::is_directory(badDir));
+
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::ViewSnapshotIoAgent agent(ch, badDir, /*fsyncMs=*/50);
+    rune::consensus::ManualNanoClock clk(0);
+    const RowLayout layout = testLayout();
+
+    auto frame1 = frameDelta(kViewTopicId, kPartition, /*O=*/10, /*hp=*/1, layout);
+    ASSERT_TRUE(ch.deltas.write(frame1.data(), frame1.size(), rune::node::ViewSnapshotChannel::kDeltaMsgType));
+
+    agent.doWork(clk.nowNs()); // ::open() fails (ENOTDIR) -- must NOT be cached
+    EXPECT_EQ(agent.lastDurableOffset(kViewTopicId, kPartition), -1);
+    EXPECT_FALSE(agent.hasError(kViewTopicId, kPartition)) << "an open failure is transient, not FATAL";
+    EXPECT_GE(agent.openFailureCount(), 1) << "a persistent open failure must be observable, not silent";
+    clk.advance(60LL * 1'000'000LL);
+
+    // Clear the obstruction: remove the blocking file, create the real dir.
+    ASSERT_TRUE(fs::remove(badDir));
+    fs::create_directories(badDir);
+
+    // Re-push the same delta (stand-in for a real worker's retry-on-back-
+    // pressure) and prove the key is NOT blackholed: it converges normally.
+    auto frame1b = frameDelta(kViewTopicId, kPartition, /*O=*/10, /*hp=*/1, layout);
+    ASSERT_TRUE(ch.deltas.write(frame1b.data(), frame1b.size(), rune::node::ViewSnapshotChannel::kDeltaMsgType));
+    for (int i = 0; i < kHardCap && agent.lastDurableOffset(kViewTopicId, kPartition) < 10; ++i) {
+        agent.doWork(clk.nowNs());
+        clk.advance(60LL * 1'000'000LL);
+    }
+    EXPECT_EQ(agent.lastDurableOffset(kViewTopicId, kPartition), 10);
+    EXPECT_FALSE(agent.hasError(kViewTopicId, kPartition));
+}

@@ -31,6 +31,23 @@
 // dropped, and lastDurableOffset() is already correct in-process regardless
 // (the ack is only a worker-side notification; readers of this agent, e.g.
 // the Task 16 readiness gate, call lastDurableOffset() directly).
+//
+// Failure handling (review round 1 fixes):
+//   - A transient ::open() failure (fd-ulimit, momentary ENOSPC/EACCES, dir
+//     not yet created, ...) is NEVER cached: fileFor_() does not insert a
+//     FileState for a key whose open() failed, so the very next delta for
+//     that key retries open() from scratch. openFailureCount() exposes a
+//     running total so a PERSISTENT failure is observable beyond one log
+//     line (never silently blackholes a key forever).
+//   - A short/failed ::write() is handled by looping to completion
+//     (writeFull(): EINTR and legitimate partial writes just resume from the
+//     new offset) so the only way handleDeltaFrame_ sees a write failure is
+//     a REAL I/O error. That is treated as FATAL for the (view,partition)'s
+//     file: pendingO/lastDurableO are never advanced past it, the file is
+//     marked `errored` (hasError()) and permanently stops accepting further
+//     deltas (a torn/partial record with no resync marker would otherwise
+//     silently misalign every later record's CRC on replay) -- the stream
+//     is never again presented as durable past the corruption.
 
 #include <rune/consensus/ConsensusAgent.h>
 #include <rune/node/ViewSnapshotChannel.h>
@@ -66,9 +83,31 @@ public:
     /// this key (used by the Task 16 readiness gate + this task's own test).
     [[nodiscard]] int64_t lastDurableOffset(int32_t viewTopicId, int32_t partition) const noexcept;
 
+    /// True iff this (viewTopicId, partition)'s delta file hit a FATAL write
+    /// error and permanently stopped accepting further deltas (see file
+    /// header). The Task 16 readiness gate should treat this as "this
+    /// partition's snapshot stream needs recovery/rebuild", never as merely
+    /// "durability paused". False for a key that has never errored (whether
+    /// or not it has ever been seen at all).
+    [[nodiscard]] bool hasError(int32_t viewTopicId, int32_t partition) const noexcept;
+
+    /// Running total of ::open() failures observed across every key, for the
+    /// agent's whole lifetime. A transient failure is retried automatically
+    /// (never cached -- see file header); this counter is what makes a
+    /// PERSISTENT open failure observable (e.g. an ops alert on "still > 0
+    /// N cycles later") instead of silently stalling behind a single log line.
+    [[nodiscard]] int64_t openFailureCount() const noexcept { return openFailures_; }
+
     /// Path of the delta file for (viewTopicId, partition) -- test seam (also
     /// usable by recovery code that needs to reopen + replay the file).
     [[nodiscard]] std::string deltaFilePathForTest(int32_t viewTopicId, int32_t partition) const;
+
+    /// Test-only failure injection: force the NEXT write to this key's file
+    /// to fail deterministically (reopens its fd O_RDONLY, so ::write()
+    /// fails with EBADF) -- a portable stand-in for a real short/failed
+    /// write, without relying on an OS-specific partial-write race window.
+    /// Opens the file first (via fileFor_) if it doesn't exist yet.
+    void forceWriteFailureForTest(int32_t viewTopicId, int32_t partition);
 
 private:
     struct Key {
@@ -92,10 +131,14 @@ private:
         int64_t pendingO        = -1;  // highest O appended since the last fsync (-1 = none pending)
         int64_t lastDurableO    = -1;  // highest O CONFIRMED fdatasync'd
         bool    dirtySinceSync  = false;
+        bool    errored         = false; // FATAL write error: stream stopped (see hasError())
     };
 
     void handleDeltaFrame_(const uint8_t* p, std::size_t len);
-    FileState& fileFor_(const Key& key);
+    // Returns nullptr on an ::open() failure -- NOT cached in files_, so the
+    // next call for the same key retries open() (review-round-1 fix: a
+    // transient failure must never permanently blackhole a key).
+    FileState* fileFor_(const Key& key);
     std::string deltaFilePath_(const Key& key) const;
     void flushDue_(int64_t nowNs, bool idle);
     void postDone_(int32_t viewTopicId, int32_t partition, int64_t O);
@@ -105,6 +148,7 @@ private:
     std::string          viewDataDir_;
     int64_t              fsyncMs_;
     int64_t              lastFsyncNs_   = 0;
+    int64_t              openFailures_  = 0; // running total across every key (see openFailureCount())
 
     std::unordered_map<Key, FileState, KeyHash> files_;
 
