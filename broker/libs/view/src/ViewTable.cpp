@@ -3,9 +3,21 @@
 #include <algorithm>
 #include <bit>
 #include <cassert>
+#include <chrono>
 #include <utility>
 
 namespace rune::view {
+
+namespace {
+// Monotonic clock read used ONLY to measure the de-amortized rehash
+// machinery's own cost (maybePrezero/migrateStep/startGrow) — never on the
+// steady-state find/insert path, so a normal put()/get()/erase() that
+// triggers none of that machinery pays zero clock reads for it.
+inline uint64_t nowNs() noexcept {
+    using namespace std::chrono;
+    return static_cast<uint64_t>(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
+}
+} // namespace
 
 uint64_t ViewTable::mix(uint64_t x) noexcept {
     x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
@@ -40,10 +52,13 @@ ViewTable::ViewTable(RowLayout layout, size_t initialIndexSlots, size_t chunkByt
     tags_.assign(cap_, kEmpty);
     keys_.assign(cap_, 0);
     rid_.assign(cap_, 0);
-    // free_ can never hold more than the index's own cap_ row-ids (index
-    // capacity bounds live keys until Task 5's index rehash), so reserving
-    // up front makes erase()'s push_back() allocation-free for the
-    // table's entire lifetime (not just after an amortized-growth warm-up).
+    // free_ can never hold more than the LIVE key count, which (thanks to
+    // incremental rehash) is itself unbounded over the table's lifetime —
+    // but growth only ever happens via startGrow()/migrateStep(), never by
+    // reallocating free_ on the hot path, so reserving the initial
+    // capacity up front just gives erase()'s push_back() a warm start;
+    // free_ may reallocate (amortized, standard vector growth) past that
+    // if the table grows far beyond its initial capacity.
     free_.reserve(cap_);
 
     appendChunk(); // start with one chunk so rid 0 is always addressable
@@ -53,7 +68,7 @@ void ViewTable::appendChunk() {
     chunks_.emplace_back(rowsPerChunk_ * static_cast<size_t>(layout_.rowLen), uint8_t{0});
 }
 
-size_t ViewTable::findSlot(uint64_t key) const noexcept {
+size_t ViewTable::findP(uint64_t key) const noexcept {
     const uint64_t h  = mix(key);
     const uint8_t  ft = fullTag(h);
     size_t i = h & mask_;
@@ -66,58 +81,21 @@ size_t ViewTable::findSlot(uint64_t key) const noexcept {
     return static_cast<size_t>(-1);
 }
 
-uint8_t* ViewTable::put(uint64_t key) {
+size_t ViewTable::findO(uint64_t key) const noexcept {
+    if (!migrating_) return static_cast<size_t>(-1);
     const uint64_t h  = mix(key);
     const uint8_t  ft = fullTag(h);
-    size_t i = h & mask_;
-    for (size_t probes = 0; probes < cap_; ++probes) {
-        const uint8_t t = tags_[i];
-        if (t == ft && keys_[i] == key) {
-            return rowAddr(rid_[i]); // idempotent upsert: existing key, no dup
-        }
-        if (t == kEmpty) {
-            uint32_t rid;
-            if (!free_.empty()) {
-                rid = free_.back();
-                free_.pop_back();
-            } else {
-                // Row-id space is the chunked arena's total capacity so
-                // far: append one more chunk (the deliberate growth
-                // allocation) whenever the next never-used rid would fall
-                // past it. Existing rids/pointers are unaffected — rows
-                // never move.
-                if (nextRid_ >= chunks_.size() * rowsPerChunk_) {
-                    appendChunk();
-                }
-                rid = nextRid_++;
-            }
-            tags_[i] = ft;
-            keys_[i] = key;
-            rid_[i]  = rid;
-            uint8_t* row = rowAddr(rid);
-            std::fill(row, row + layout_.rowLen, uint8_t{0});
-            ++sz_;
-            return row;
-        }
-        i = (i + 1) & mask_;
+    size_t i = h & omask_;
+    for (size_t probes = 0; probes < ocap_; ++probes) {
+        const uint8_t t = ot_[i];
+        if (t == kEmpty) return static_cast<size_t>(-1);
+        if (t == ft && ok_[i] == key) return i;
+        i = (i + 1) & omask_;
     }
-    assert(false && "ViewTable: index full (Task 3 scope — growth is Task 4/5)");
-    return nullptr; // unreachable under the capacity guard above
+    return static_cast<size_t>(-1);
 }
 
-const uint8_t* ViewTable::get(uint64_t key) const noexcept {
-    const size_t i = findSlot(key);
-    if (i == static_cast<size_t>(-1)) return nullptr;
-    return rowAddr(rid_[i]);
-}
-
-bool ViewTable::erase(uint64_t key) noexcept {
-    const size_t i = findSlot(key);
-    if (i == static_cast<size_t>(-1)) return false;
-
-    free_.push_back(rid_[i]);
-    tags_[i] = kEmpty;
-
+void ViewTable::backshiftPrimary(size_t i) noexcept {
     // Backward-shift deletion (standard open-addressing linear-probing
     // delete, e.g. Wikipedia "Open addressing" / Knuth 6.4): walk forward
     // from the freed slot `hole`, pulling back any entry at `j` whose home
@@ -126,6 +104,7 @@ bool ViewTable::erase(uint64_t key) noexcept {
     // occupied, so it is safe to move it into the hole, vacating `j` as the
     // new hole. Stops at the first slot that was already EMPTY (that marks
     // the end of this probe run).
+    tags_[i] = kEmpty;
     size_t hole = i;
     size_t j    = i;
     for (;;) {
@@ -147,9 +126,213 @@ bool ViewTable::erase(uint64_t key) noexcept {
         tags_[j]    = kEmpty;
         hole        = j;
     }
+}
 
-    --sz_;
-    return true;
+void ViewTable::maybePrezero() noexcept {
+    if (migrating_) return; // finish the in-flight grow before provisioning the next one
+    const size_t nc = cap_ * 2;
+    if (prezeroCap_ == nc && prezeroCur_ >= prezeroCap_) return; // already fully provisioned
+    if (sz_ < static_cast<size_t>(cap_ * kPrezeroLoad)) return;  // not yet time
+
+    const uint64_t t0 = nowNs();
+
+    if (prezeroCap_ != nc) {
+        // (Re)start provisioning for the NEXT grow generation. reserve()
+        // only claims raw address space (a single fast, non-zeroing
+        // allocation) — the expensive part, actually ZEROING nc entries,
+        // happens incrementally below, kPrezero at a time, spread across
+        // many put()/erase() calls instead of paid in one lump sum here.
+        nextTags_.clear();    nextTags_.reserve(nc);
+        nextKeys_.clear();    nextKeys_.reserve(nc);
+        nextRid_buf_.clear(); nextRid_buf_.reserve(nc);
+        prezeroCap_ = nc;
+        prezeroCur_ = 0;
+    }
+
+    const size_t remain = prezeroCap_ - prezeroCur_;
+    const size_t slice  = remain < kPrezero ? remain : kPrezero;
+    nextTags_.insert(nextTags_.end(), slice, kEmpty);
+    nextKeys_.insert(nextKeys_.end(), slice, uint64_t{0});
+    nextRid_buf_.insert(nextRid_buf_.end(), slice, uint32_t{0});
+    prezeroCur_ += slice;
+
+    const double ns = static_cast<double>(nowNs() - t0);
+    if (ns > maxRehashNs_) maxRehashNs_ = ns;
+}
+
+void ViewTable::startGrow() {
+    const uint64_t t0 = nowNs();
+
+    ot_.swap(tags_); ok_.swap(keys_); orid_.swap(rid_);
+    ocap_ = cap_; omask_ = mask_; ocur_ = 0; migrating_ = true;
+
+    const size_t nc = cap_ * 2;
+    if (prezeroCap_ == nc && prezeroCur_ >= prezeroCap_) {
+        // Pre-provisioning finished in time: O(1) swap, no zero-fill here.
+        tags_.swap(nextTags_);
+        keys_.swap(nextKeys_);
+        rid_.swap(nextRid_buf_);
+    } else {
+        // The write burst outran pre-provisioning: finish the zero-fill
+        // inline right now (the bounded fallback) and count it.
+        tags_.assign(nc, kEmpty);
+        keys_.assign(nc, 0);
+        rid_.assign(nc, 0);
+        ++fallbacks_;
+    }
+
+    // Whatever was (partially) provisioned belonged to this just-consumed
+    // generation. The NEXT grow (cap_ is now nc) provisions its own next
+    // buffer from scratch once load crosses kPrezeroLoad again.
+    nextTags_.clear();    nextTags_.shrink_to_fit();
+    nextKeys_.clear();    nextKeys_.shrink_to_fit();
+    nextRid_buf_.clear(); nextRid_buf_.shrink_to_fit();
+    prezeroCap_ = 0;
+    prezeroCur_ = 0;
+
+    cap_  = nc;
+    mask_ = nc - 1;
+
+    const double ns = static_cast<double>(nowNs() - t0);
+    if (ns > maxRehashNs_) maxRehashNs_ = ns;
+}
+
+void ViewTable::migrateStep() noexcept {
+    if (!migrating_) return;
+    const uint64_t t0 = nowNs();
+
+    // Bounded on entries SCANNED (ocur_ advanced), not just entries MOVED:
+    // if the OLD index has been heavily churned (erase() during the
+    // migration window tombstones OLD-only entries rather than moving
+    // them), most slots here can be kEmpty/kTomb. Bounding only on "live
+    // entries moved" would let a single call scan arbitrarily far through
+    // a mostly-dead OLD index (up to the full ocap_) looking for kMigK
+    // live ones to move — silently reintroducing an unbounded single-op
+    // cost, which is exactly what incremental/de-amortized rehash exists
+    // to prevent. Scanned-bound guarantees every call does O(kMigK) work,
+    // and the OLD index still fully drains in exactly ceil(ocap_/kMigK)
+    // calls regardless of its live/dead mix.
+    size_t scanned = 0;
+    while (scanned < kMigK && ocur_ < ocap_) {
+        const uint8_t t = ot_[ocur_];
+        if (t >= 0x80) { // live entry; kEmpty(0)/kTomb(1) are both < 0x80 (fullTag() is always >= 0x82)
+            const uint64_t k = ok_[ocur_];
+            size_t i = mix(k) & mask_;
+            for (size_t probes = 0; probes < cap_ && tags_[i] != kEmpty; ++probes) {
+                i = (i + 1) & mask_;
+            }
+            assert(tags_[i] == kEmpty && "ViewTable: migrateStep found no empty slot in NEW index");
+            tags_[i] = t;
+            keys_[i] = k;
+            rid_[i]  = orid_[ocur_];
+        }
+        ++ocur_;
+        ++scanned;
+    }
+
+    if (ocur_ >= ocap_) {
+        migrating_ = false;
+        ot_.clear();   ot_.shrink_to_fit();
+        ok_.clear();   ok_.shrink_to_fit();
+        orid_.clear(); orid_.shrink_to_fit();
+        ocap_ = 0; omask_ = 0; ocur_ = 0;
+    }
+
+    const double ns = static_cast<double>(nowNs() - t0);
+    if (ns > maxRehashNs_) maxRehashNs_ = ns;
+}
+
+uint8_t* ViewTable::put(uint64_t key) {
+    maybePrezero();
+    if (migrating_) {
+        migrateStep();
+    } else if (sz_ + 1 > static_cast<size_t>(cap_ * kGrowLoad)) {
+        startGrow();
+    }
+
+    const size_t pi = findP(key);
+    if (pi != static_cast<size_t>(-1)) {
+        return rowAddr(rid_[pi]); // idempotent upsert: existing key in NEW/primary, no dup
+    }
+    if (migrating_) {
+        const size_t oi = findO(key);
+        if (oi != static_cast<size_t>(-1)) {
+            return rowAddr(orid_[oi]); // idempotent upsert: existing key still only in OLD
+        }
+    }
+
+    uint32_t rid;
+    if (!free_.empty()) {
+        rid = free_.back();
+        free_.pop_back();
+    } else {
+        // Row-id space is the chunked arena's total capacity so far:
+        // append one more chunk (the deliberate growth allocation)
+        // whenever the next never-used rid would fall past it. Existing
+        // rids/pointers are unaffected because rows never move.
+        if (nextRid_ >= chunks_.size() * rowsPerChunk_) {
+            appendChunk();
+        }
+        rid = nextRid_++;
+    }
+
+    const uint64_t h  = mix(key);
+    const uint8_t  ft = fullTag(h);
+    size_t i = h & mask_;
+    // Hard-bounded (never loops more than cap_ times, even in a release
+    // build with asserts compiled out): the load-factor policy above
+    // guarantees an empty slot exists, but this guards against ever
+    // spinning forever instead of just corrupting state if that invariant
+    // is somehow broken.
+    for (size_t probes = 0; probes < cap_ && tags_[i] != kEmpty; ++probes) {
+        i = (i + 1) & mask_;
+    }
+    assert(tags_[i] == kEmpty && "ViewTable: primary index unexpectedly full (load-factor invariant broken)");
+    tags_[i] = ft;
+    keys_[i] = key;
+    rid_[i]  = rid;
+
+    uint8_t* row = rowAddr(rid);
+    std::fill(row, row + layout_.rowLen, uint8_t{0});
+    ++sz_;
+    return row;
+}
+
+const uint8_t* ViewTable::get(uint64_t key) const noexcept {
+    const size_t pi = findP(key);
+    if (pi != static_cast<size_t>(-1)) return rowAddr(rid_[pi]);
+    if (migrating_) {
+        const size_t oi = findO(key);
+        if (oi != static_cast<size_t>(-1)) return rowAddr(orid_[oi]);
+    }
+    return nullptr;
+}
+
+bool ViewTable::erase(uint64_t key) noexcept {
+    maybePrezero();
+    if (migrating_) migrateStep();
+
+    const size_t pi = findP(key);
+    if (pi != static_cast<size_t>(-1)) {
+        free_.push_back(rid_[pi]);
+        backshiftPrimary(pi);
+        --sz_;
+        return true;
+    }
+
+    if (migrating_) {
+        const size_t oi = findO(key);
+        if (oi != static_cast<size_t>(-1)) {
+            free_.push_back(orid_[oi]);
+            // OLD is draining, not steady-state: tombstone rather than
+            // backward-shift. migrateStep() skips kTomb entries (< 0x80)
+            // when it later walks past this slot.
+            ot_[oi] = kTomb;
+            --sz_;
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace rune::view

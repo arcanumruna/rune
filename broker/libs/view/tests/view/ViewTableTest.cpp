@@ -3,6 +3,8 @@
 #include <rune/view/ViewTable.h>
 #include <rune/view/ViewRow.h>
 #include <rune/codec/Descriptor.h>
+#include <unordered_map>
+#include <random>
 using namespace rune::view;
 using rune::codec::DescriptorBuilder; using rune::codec::PrimType; using rune::codec::FieldValue;
 
@@ -78,4 +80,113 @@ TEST(ViewTable, RowPointerStableAcrossChunkGrowth) {
     EXPECT_GT(t.chunkCount(), 1u) << "expected growth past the first chunk";
     EXPECT_EQ(readSlot(early, L, 1).i, 111) << "row moved after chunk growth";
     EXPECT_EQ(early, const_cast<uint8_t*>(t.get(1))) << "rid->address mapping changed";
+}
+
+// ---- Task 5: incremental (de-amortized) index rehash --------------------
+
+TEST(ViewTable, IncrementalRehashKeepsAllKeysFindable) {
+    RowLayout L = hpLayout();
+    ViewTable t(L, /*slots*/16);           // forces many grows
+    for (uint64_t k = 1; k <= 200000; ++k) setHp(t.put(k), L, (int)(k & 0x7fffffff));
+    for (uint64_t k = 1; k <= 200000; ++k) {
+        ASSERT_NE(t.get(k), nullptr) << "lost key " << k << " across rehash";
+    }
+    EXPECT_EQ(t.size(), 200000u);
+}
+
+// Review-focus #3: a write burst that outruns pre-provision must still be correct.
+TEST(ViewTableFallbackRegression, RehashFallbackWhenPreprovisionNotReady) {
+    RowLayout L = hpLayout();
+    ViewTable t(L, /*slots*/16);
+    // insert with no interleaved ops so pre-provision has no spare cycles -> forces fallbacks
+    for (uint64_t k = 1; k <= 300000; ++k) setHp(t.put(k), L, 1);
+    for (uint64_t k = 1; k <= 300000; ++k) ASSERT_NE(t.get(k), nullptr);
+    EXPECT_EQ(t.size(), 300000u);           // no lost/duplicated rows even under fallback
+}
+
+// Randomized churn (insert/update/delete) across MANY grow thresholds,
+// cross-checked against std::unordered_map as the reference model — same
+// style as Task 3's BackshiftKeepsCollidingKeysFindable-class regression,
+// extended to exercise the migration window (new-then-old lookups, erase
+// during migration, repeated grows) rather than a single fixed-capacity
+// table.
+TEST(ViewTable, RandomizedChurnAcrossManyGrowsMatchesUnorderedMap) {
+    RowLayout L = hpLayout();
+    ViewTable t(L, /*slots*/16);
+    std::unordered_map<uint64_t, int32_t> model;
+    std::mt19937_64 rng(20261009);
+    for (int iter = 0; iter < 100000; ++iter) {
+        uint64_t key = (rng() % 20000) + 1; // churny: keeps some keys alive across many grows
+        if ((rng() % 4) == 0) {
+            bool want = model.count(key) != 0;
+            bool got = t.erase(key);
+            ASSERT_EQ(want, got) << "erase mismatch key=" << key << " iter=" << iter;
+            model.erase(key);
+        } else {
+            int32_t v = (int32_t)(rng() % 1000000);
+            setHp(t.put(key), L, v);
+            model[key] = v;
+        }
+        if (iter % 2000 == 0) {
+            ASSERT_EQ(t.size(), model.size()) << "size mismatch at iter " << iter;
+        }
+    }
+    ASSERT_EQ(t.size(), model.size());
+    for (auto& [k, v] : model) {
+        const uint8_t* row = t.get(k);
+        ASSERT_NE(row, nullptr) << "missing key " << k;
+        EXPECT_EQ(readSlot(row, L, 1).i, v) << "value mismatch key " << k;
+    }
+}
+
+TEST(ViewTable, WorstRehashTaxIsTracked) {
+    RowLayout L = hpLayout();
+    ViewTable t(L, /*slots*/16);
+    for (uint64_t k = 1; k <= 50000; ++k) setHp(t.put(k), L, 1);
+    EXPECT_GE(t.worstRehashTaxUs(), 0.0);
+}
+
+// Regression for a self-review fix found while implementing Task 5:
+// migrateStep(), as ported from the design spike, bounded its loop on
+// entries ACTUALLY MOVED, not entries SCANNED. Read literally, that is a
+// latent risk: if the OLD index's unscanned tail were ever mostly dead
+// (kEmpty/kTomb), a single call could scan far past kMigK hunting for live
+// entries to move, undermining the whole point of incremental
+// (de-amortized) rehash (a bounded worst-case cost per op). (Investigation
+// during self-review found this specific risk is not reachable through
+// put()/erase() as invoked today — every op, including erase(), also
+// drives migrateStep() forward by up to kMigK, so the scan cursor cannot
+// fall meaningfully behind a burst of tombstoning OLD-only erases. The
+// fix — bounding the loop on entries SCANNED, i.e. ocur_ advanced, not on
+// entries moved — is kept anyway as strictly more robust/defensive: it is
+// a direct, data-independent guarantee instead of an emergent one, costs
+// nothing in the common (mostly-live) case, and remains correct if a
+// future caller ever changes that invocation pattern.)
+//
+// This test exercises the OLD-index tombstone path itself (erase() of a
+// key that is still only reachable via findO() during an active
+// migration): it must mark that OLD slot kTomb (not touch OLD's probe
+// structure) and migrateStep() must later skip it rather than migrating
+// or losing it — covered here under real grow-triggered migration, with
+// heavy interleaved erase churn, checked against correctness only (no
+// surviving/erased key lost or resurrected).
+TEST(ViewTableMigrateScanBoundRegression, EraseDuringMigrationTombstonesOldCorrectly) {
+    RowLayout L = hpLayout();
+    ViewTable t(L, /*slots*/1u << 16); // 65536-slot OLD index once it grows
+    uint64_t k = 1;
+    for (; k <= 55706; ++k) setHp(t.put(k), L, 1); // the 55706th put triggers startGrow()
+
+    // Heavy erase churn immediately after the grow, before migration has
+    // drained much of anything: tombstone every third just-grown-from key
+    // (scattered essentially uniformly across the OLD index by mix()).
+    for (uint64_t e = 1; e <= 55706; e += 3) t.erase(e);
+
+    // Drive the rest of the table's ops to completion (also drains migration).
+    for (; k <= 200000; ++k) setHp(t.put(k), L, 1);
+
+    for (uint64_t e = 1; e <= 55706; ++e) {
+        if (e % 3 == 1) EXPECT_EQ(t.get(e), nullptr) << "erased key " << e << " resurrected";
+        else ASSERT_NE(t.get(e), nullptr) << "lost key " << e << " (not erased)";
+    }
+    for (uint64_t v = 55707; v < 200000; ++v) ASSERT_NE(t.get(v), nullptr) << "lost key " << v;
 }

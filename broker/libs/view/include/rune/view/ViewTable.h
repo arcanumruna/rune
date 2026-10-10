@@ -14,11 +14,46 @@ namespace rune::view {
 // (`chunks_`, a `std::vector` of fixed-size `rowsPerChunk_`-row pages) that
 // grows by APPENDING a new chunk when the current one fills — rows never
 // move, so a `rid` (and any pointer previously returned for it by `put`/
-// `get`) stays valid for the table's entire lifetime. ONE preallocated
-// open-addressing index (`tags_`/`keys_`/`rid_`, `initialIndexSlots`
-// slots) still backs key lookup; incremental rehash/growth of the index
-// itself is Task 5 — this type still asserts index capacity instead of
-// growing it.
+// `get`) stays valid for the table's entire lifetime.
+//
+// Task 5: the open-addressing INDEX (`tags_`/`keys_`/`rid_`) also grows,
+// incrementally and de-amortized, instead of asserting when full:
+//
+//  - When the primary index's load factor crosses `kGrowLoad` (0.85),
+//    `startGrow()` makes the current (tags_/keys_/rid_) the OLD index
+//    (`ot_`/`ok_`/`orid_`, `ocap_`/`omask_`, drain cursor `ocur_`) and a
+//    fresh 2x-capacity buffer becomes the NEW/primary index. `migrating_`
+//    is true for the rest of the migration window.
+//  - Each subsequent `put`/`erase` call then performs one bounded
+//    `migrateStep()`: it copies at most `kMigK` (256) still-live OLD index
+//    entries into the NEW index. No single op ever moves the whole table.
+//  - During the window, `get`/`put`/`erase` consult the NEW index first
+//    (`findP`) then, if absent, the OLD index (`findO`) — a key is always
+//    findable via exactly one of the two, never duplicated in both.
+//    `erase` on an OLD-only entry marks it `kTomb` (tombstoned, discarded
+//    when `migrateStep` later walks past it) rather than mutating OLD's
+//    probe structure (OLD is draining, not steady-state, so no
+//    backward-shift is needed there).
+//  - The slab (`chunks_`) is NEVER touched by rehash: only the tiny
+//    `(tag,key,rid)` index entries migrate; a `rid` means the same row
+//    address whether it is reachable via the NEW or the OLD index.
+//
+// De-amortized pre-provision (the ONE deliberate divergence from the
+// design-spike algorithm this was ported from): the spike pre-provisioned
+// the next 2x index buffer on a BACKGROUND THREAD with a mutex/condition
+// variable. `libs/**` forbids atomics/mutexes/threads
+// (scripts/check_no_atomics.py), so instead, once the primary index's load
+// crosses `kPrezeroLoad` (0.65), each `put`/`erase` calls `maybePrezero()`,
+// which zero-fills a bounded slice (`kPrezero`, 1024 entries) of the next
+// 2x `nextTags_`/`nextKeys_`/`nextRid_buf_` buffers — spreading the cost
+// of preparing the next grow across many ordinary ops instead of paying
+// for it all at once. When `startGrow()` fires, if pre-provisioning
+// finished in time it swaps the ready buffers in O(1); if the write burst
+// outran it, `startGrow()` finishes the zero-fill inline right there (the
+// bounded fallback) and counts it via `rehashFallbacks()`. The single
+// worst per-op cost paid by any of `maybePrezero`/`migrateStep`/
+// `startGrow` is tracked in `maxRehashNs_` and reported via
+// `worstRehashTaxUs()`.
 //
 // The index key is the EXACT uint64_t view key (not a hash): `get`/`erase`
 // compare `keys_[slot] == key` directly. `mix()` is used only to pick the
@@ -27,18 +62,21 @@ namespace rune::view {
 // compare.
 //
 // Deletes are O(1) and tombstone-free in the row PAYLOAD: `erase` performs
-// backward-shift deletion over the index arrays (tags_/keys_/rid_) to keep
-// the probe sequence for every other key intact, and returns the freed
-// row-id to a free-list. It never moves or clears a row's payload bytes.
+// backward-shift deletion over the PRIMARY index arrays (tags_/keys_/rid_)
+// to keep the probe sequence for every other key intact, and returns the
+// freed row-id to a free-list. It never moves or clears a row's payload
+// bytes.
 //
 // Shared-nothing: ViewTable has no cross-thread state, no atomics, no
 // locks, no thread_local. It is owned and driven by exactly one worker
 // thread; nothing here is safe (or intended) to touch from a second thread.
-// Zero heap allocation in put()/get()/erase() steady state, EXCEPT the
+// Zero heap allocation in put()/get()/erase() steady state, EXCEPT: (a) the
 // deliberate chunk allocation inside appendChunk() when `put` needs a row
-// beyond the current chunk capacity — that IS the growth path. get()/
-// erase() never allocate. The row-id free-list only grows (via erase())
-// so its own push_back() never (re)allocates once reserve()'d.
+// beyond the current chunk capacity, and (b) the deliberate, bounded index
+// growth machinery above (`maybePrezero`/`startGrow`/`migrateStep`) — those
+// ARE the growth path. get() never allocates. The row-id free-list only
+// grows (via erase()) so its own push_back() never (re)allocates once
+// reserve()'d.
 class ViewTable {
 public:
     // `initialIndexSlots` must be a power of two (capacity of the
@@ -68,14 +106,62 @@ public:
     // `put` needs a row-id beyond the current total chunk capacity.
     size_t chunkCount() const noexcept { return chunks_.size(); }
 
+    // Task 5 test/bench hooks (Task 7's benchmark depends on these):
+    //
+    // Worst single-op cost (microseconds) any one put()/erase() call ever
+    // paid for incremental-rehash maintenance (pre-provision zero-fill
+    // slice, migrate step, or a startGrow — including its inline fallback
+    // zero-fill when pre-provisioning wasn't ready in time). 0.0 if the
+    // index never grew.
+    double worstRehashTaxUs() const noexcept { return maxRehashNs_ / 1000.0; }
+
+    // Number of times startGrow() had to finish the next index buffer's
+    // zero-fill inline because de-amortized pre-provisioning had not
+    // completed yet (a write burst outran it). 0 means every grow swapped
+    // in a fully pre-zeroed buffer in O(1).
+    uint64_t rehashFallbacks() const noexcept { return fallbacks_; }
+
 private:
     static constexpr uint8_t kEmpty = 0; // tag value for a never-used / vacated slot
+    static constexpr uint8_t kTomb  = 1; // OLD-index tombstone: erased mid-migration, not re-migrated
+
+    static constexpr double kGrowLoad    = 0.85; // primary load factor that triggers startGrow()
+    static constexpr double kPrezeroLoad = 0.65; // primary load factor that starts pre-provisioning
+    static constexpr size_t kMigK        = 256;  // max OLD entries migrated per migrateStep()
+    static constexpr size_t kPrezero     = 1024; // max next-buffer entries zero-filled per maybePrezero()
 
     static uint64_t mix(uint64_t x) noexcept;
     static uint8_t  fullTag(uint64_t h) noexcept;
 
-    // Returns the index slot holding `key`, or SIZE_MAX if absent.
-    size_t findSlot(uint64_t key) const noexcept;
+    // Returns the PRIMARY (NEW) index slot holding `key`, or SIZE_MAX if absent.
+    size_t findP(uint64_t key) const noexcept;
+
+    // Returns the OLD index slot holding `key`, or SIZE_MAX if absent or
+    // not currently migrating. Only ever non-empty while `migrating_`.
+    size_t findO(uint64_t key) const noexcept;
+
+    // Backward-shift deletion (see erase()'s doc) over the PRIMARY index
+    // arrays only, starting at the already-found slot `i`.
+    void backshiftPrimary(size_t i) noexcept;
+
+    // Once the primary index's load factor crosses kPrezeroLoad (and no
+    // grow is currently in flight), zero-fills up to kPrezero more entries
+    // of the next 2x-capacity nextTags_/nextKeys_/nextRid_buf_ buffers
+    // (reserving their backing storage, a fast non-zeroing allocation, on
+    // the first call for a given target capacity). A no-op once the next
+    // buffer is fully provisioned, or while `migrating_` is true.
+    void maybePrezero() noexcept;
+
+    // Promotes the current primary index to OLD and installs a fresh 2x
+    // primary: swaps in the pre-provisioned next buffer in O(1) if
+    // maybePrezero() finished it in time, otherwise finishes the zero-fill
+    // inline right here (counted via fallbacks_). Sets migrating_ = true.
+    void startGrow();
+
+    // Moves up to kMigK still-live OLD index entries into the PRIMARY
+    // index. Clears migrating_ (and frees the OLD arrays) once the OLD
+    // index has been fully drained. A no-op if not currently migrating.
+    void migrateStep() noexcept;
 
     // Allocates one more chunk (rowsPerChunk_ * layout_.rowLen bytes,
     // zero-initialized) and appends it. This is the ONE deliberate
@@ -120,6 +206,40 @@ private:
     size_t rowsPerChunk_ = 0;  // power of two: floor_pow2(chunkBytes / rowLen), min 1
     size_t chunkShift_   = 0;  // log2(rowsPerChunk_); rid >> chunkShift_ == chunk index
     size_t chunkMask_    = 0;  // rowsPerChunk_ - 1; rid & chunkMask_ == in-chunk row slot
+
+    // --- Task 5: incremental index rehash -----------------------------
+    // OLD index: the pre-grow (tags_/keys_/rid_), kept around only for the
+    // duration of the migration window (migrating_ == true). Entries with
+    // tags_[.] >= 0x80 (fullTag()'s range) at ot_[ocur_.. ) are still live
+    // and not yet migrated; kEmpty/kTomb entries are skipped by
+    // migrateStep(). ocur_ is the drain cursor: everything before it has
+    // already been visited (migrated or discarded).
+    std::vector<uint8_t>  ot_;
+    std::vector<uint64_t> ok_;
+    std::vector<uint32_t> orid_;
+    size_t ocap_      = 0;
+    size_t omask_     = 0;
+    size_t ocur_      = 0;
+    bool   migrating_ = false;
+
+    // De-amortized pre-provision buffers for the NEXT 2x primary index,
+    // filled kPrezero entries at a time by maybePrezero(). prezeroCap_ == 0
+    // means no provisioning is in flight/pending; otherwise it is the
+    // target capacity (always cap_*2 for the cap_ generation that started
+    // it) and prezeroCur_ (== nextTags_.size()) is how much of it has been
+    // zero-filled so far. Fully provisioned once prezeroCur_ == prezeroCap_.
+    std::vector<uint8_t>  nextTags_;
+    std::vector<uint64_t> nextKeys_;
+    std::vector<uint32_t> nextRid_buf_;
+    size_t prezeroCap_ = 0;
+    size_t prezeroCur_ = 0;
+
+    // Diagnostics (Task 7 benchmark hooks): worst single-op rehash-upkeep
+    // cost ever paid (ns; see worstRehashTaxUs()), and how many startGrow()
+    // calls had to finish the next buffer's zero-fill inline because
+    // pre-provisioning wasn't ready (see rehashFallbacks()).
+    double   maxRehashNs_ = 0.0;
+    uint64_t fallbacks_   = 0;
 };
 
 } // namespace rune::view
