@@ -10,14 +10,23 @@
 //                  = p50/p99/p99.9 of the per-OP (every put() and erase()
 //                    call, not just the ones that happen to trigger
 //                    maybePrezero/migrateStep/startGrow) wall-clock
-//                    latency distribution. §14.0 defines every latency
-//                    gate as "report p50 AND p99; a gate fails if p99
-//                    exceeds the budget" — so **rehash_tax_p99_us < 50us is
-//                    THE gate statistic**, not a running max. The rehash
-//                    tax shows up as the elevated tail on whichever ops
-//                    happen to run the index-maintenance machinery; the
-//                    full per-op p99 (rather than isolating just those
-//                    ops) is what §14.0 means by "per processed record".
+//                    latency distribution. §14.0 defines every latency gate
+//                    as "report p50 AND p99" with a percentile as the
+//                    pass/fail cut — but the rehash-triggering ops here are
+//                    only ~0.5-0.8% of all put()/erase() calls, so the p99
+//                    cut (top 1%) falls AT OR BELOW the rehash group's own
+//                    boundary and reports an ordinary op's latency, not a
+//                    rehash-tax event: p99 is a WEAK detector of a future
+//                    regression in the rehash machinery. p999 (top 0.1%)
+//                    lands INSIDE the rehash tail (observed 3-5x p99) while
+//                    still being jitter-robust over a ~25M-op population (a
+//                    handful of rare OS-preempted samples land in the top
+//                    ~0.001%, affecting only max/p9999, not p999). So:
+//                    **rehash_tax_p999_us < 50us is THE BINDING gate
+//                    statistic.** rehash_tax_p50_us/rehash_tax_p99_us are
+//                    still reported, as informational context only (and to
+//                    satisfy §14.0's "report p50 AND p99" framing) — they do
+//                    NOT gate.
 //   rehash_tax_max_us (informational only, NOT the gate statistic)
 //                  = ViewTable::worstRehashTaxUs(): a running MAX over
 //                    every put()/erase() call across a 15-25M-op run, i.e.
@@ -99,11 +108,20 @@ void setVal(uint8_t* row, const RowLayout& L, int32_t v) {
     writeSlot(row, L, 1, fv);
 }
 
-// Rows-at-target scaled down from the brief's 15M/15M/8M so the suite stays
-// fast under normal `--benchmark_filter` CI runs; pass a larger value via
-// --benchmark_min_time / a custom Arg sweep for the full §7.1 gate run.
+// The brief's full §7.1 gate row counts: 15M rows at 64/256B, 8M at 1024B.
 uint64_t targetRowsFor(size_t rowSize) {
     return rowSize >= 1024 ? 8'000'000 : 15'000'000;
+}
+
+// Returns the `frac`-th percentile (e.g. 0.99 for p99) of `v`, sorting it in
+// place. Shared by the per-op rehash-tax distribution and the erase-only
+// delete-latency distribution below.
+double percentileUs(std::vector<uint32_t>& v, double frac) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    size_t i = static_cast<size_t>(v.size() * frac);
+    if (i >= v.size()) i = v.size() - 1;
+    return v[i] / 1000.0; // ns -> us
 }
 
 } // namespace
@@ -131,6 +149,10 @@ static void BM_ViewTableChurn(benchmark::State& st) {
 
         std::mt19937_64 rng(0xD00DF00Dull ^ rowSize);
         std::uniform_int_distribution<int> opDist(0, 99);
+        // Hoisted and re-parameterized per use (alive.size() changes every
+        // op) rather than reconstructed, to keep the harness's own RNG
+        // overhead out of the way of what's being measured.
+        std::uniform_int_distribution<size_t> pick;
 
         uint64_t nextKey = 1;
 
@@ -150,7 +172,7 @@ static void BM_ViewTableChurn(benchmark::State& st) {
                 opLatNs.push_back(static_cast<uint32_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
             } else if (doUpdate) {
-                std::uniform_int_distribution<size_t> pick(0, alive.size() - 1);
+                pick.param(std::uniform_int_distribution<size_t>::param_type(0, alive.size() - 1));
                 const uint64_t key = alive[pick(rng)];
                 const auto t0 = std::chrono::steady_clock::now();
                 uint8_t* row = t.put(key);
@@ -159,7 +181,7 @@ static void BM_ViewTableChurn(benchmark::State& st) {
                 opLatNs.push_back(static_cast<uint32_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
             } else {
-                std::uniform_int_distribution<size_t> pick(0, alive.size() - 1);
+                pick.param(std::uniform_int_distribution<size_t>::param_type(0, alive.size() - 1));
                 const size_t pos = pick(rng);
                 const uint64_t key = alive[pos];
 
@@ -208,29 +230,26 @@ static void BM_ViewTableChurn(benchmark::State& st) {
             std::chrono::duration_cast<std::chrono::nanoseconds>(fs1 - fs0).count()) /
             static_cast<double>(findIters);
 
-        std::sort(deleteLatNs.begin(), deleteLatNs.end());
-        const double deleteP99Ns = deleteLatNs.empty() ? 0.0
-            : static_cast<double>(deleteLatNs[static_cast<size_t>(deleteLatNs.size() * 0.99)]);
+        // deleteP99Ns reuses percentileUs() on the erase-only distribution
+        // (in us; convert back to ns for the counter, to match its existing
+        // name/units).
+        const double deleteP99Ns = percentileUs(deleteLatNs, 0.99) * 1000.0;
 
-        // §14.0 gate statistic: p50/p99/p99.9 of the per-op (put+erase)
-        // latency distribution, in microseconds. p99 < 50us is THE gate;
-        // worstRehashTaxUs() (below) is informational only -- see file
-        // header comment and task-7-report.md for why the raw max is
-        // noise-dominated on shared/non-pinned hardware.
-        std::sort(opLatNs.begin(), opLatNs.end());
-        auto pctUs = [&](double frac) -> double {
-            if (opLatNs.empty()) return 0.0;
-            size_t i = static_cast<size_t>(opLatNs.size() * frac);
-            if (i >= opLatNs.size()) i = opLatNs.size() - 1;
-            return opLatNs[i] / 1000.0; // ns -> us
-        };
-        const double rehashTaxP50Us  = pctUs(0.50);
-        const double rehashTaxP99Us  = pctUs(0.99);
-        const double rehashTaxP999Us = pctUs(0.999);
+        // §14.0 gate: p50/p99/p99.9 of the per-op (put+erase) latency
+        // distribution, in microseconds. rehash_tax_p999_us < 50us is THE
+        // BINDING gate statistic (see file header comment for why p99 is
+        // too weak a cut to land inside the rehash-tax tail); p50/p99 are
+        // informational context only. worstRehashTaxUs() (below) is also
+        // informational only -- see file header + task-7-report.md for why
+        // the raw running max is noise-dominated on shared/non-pinned
+        // hardware.
+        const double rehashTaxP50Us  = percentileUs(opLatNs, 0.50);
+        const double rehashTaxP99Us  = percentileUs(opLatNs, 0.99);
+        const double rehashTaxP999Us = percentileUs(opLatNs, 0.999);
 
-        st.counters["rehash_tax_p50_us"]  = rehashTaxP50Us;
-        st.counters["rehash_tax_p99_us"]  = rehashTaxP99Us;   // THE gate: < 50us
-        st.counters["rehash_tax_p999_us"] = rehashTaxP999Us;
+        st.counters["rehash_tax_p50_us"]  = rehashTaxP50Us;  // informational
+        st.counters["rehash_tax_p99_us"]  = rehashTaxP99Us;  // informational
+        st.counters["rehash_tax_p999_us"] = rehashTaxP999Us; // THE gate: < 50us
         st.counters["rehash_tax_max_us"]  = t.worstRehashTaxUs(); // informational only
         st.counters["delete_p99_ns"] = deleteP99Ns;
         st.counters["find_steady_ns"] = findSteadyNs;
