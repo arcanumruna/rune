@@ -117,6 +117,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <spdlog/spdlog.h>
@@ -581,6 +582,7 @@ public:
         pendingAcksAll_.reserve(kMaxOwedReturns);   // F15 S3: capped → never grows
         subs_.reserve(kSubsReserve);
         validators_.reserve(kValidatorsReserve);
+        validatedTopics_.reserve(kValidatorsReserve);
         egressScratch_.resize(kEgressScratchSize);
         maxIntakeBatchBytes_ = ringBatchFit_();   // BrokerNode narrows it: setMaxBatchBytes
         threadName_ = "rune-wrk-" + std::to_string(workerId_);
@@ -1150,7 +1152,7 @@ public:
            .targetReplicaId(op.targetReplicaId)
            .incarnation(op.incarnation)
            .minIsr(op.minIsr)
-           .clientVersion(op.clientVersion)   // D6: SessionAnnounce
+           .clientVersion(op.clientVersion)   // D6: SessionAnnounce; Task 12: SchemaUpdate's version
            // F27 R1: a FetchRequest op carries the follower's connection
            // generation in ownershipGen (SetOwnership is the field's only other user).
            .ownershipGen(op.type == WorkerOp::Type::FetchRequest
@@ -1411,10 +1413,13 @@ public:
     /// Startup-only: the auto-selected io_uring fell back to portable ("" = no).
     [[nodiscard]] const std::string& ioFallbackReason() const noexcept { return io_.fallbackReason(); }
 
-    // Task 7: test accessor — true if a Validator is installed for the given topic.
-    // Worker-thread only; call only from single-threaded tests.
-    [[nodiscard]] bool hasValidatorForTest(int32_t topicId) const noexcept {
-        return validators_.count(topicId) > 0;
+    // Task 7 / Task 12: test accessor — true if a Validator is installed for
+    // the given topic.  version < 0 (default) = "any version installed for
+    // this topic" (the original Task 7 semantics); version >= 0 = exactly
+    // that (topicId, version) pair.  Worker-thread only; single-threaded tests.
+    [[nodiscard]] bool hasValidatorForTest(int32_t topicId, int32_t version = -1) const noexcept {
+        if (version < 0) return validatedTopics_.count(topicId) > 0;
+        return validators_.count(packValidatorKey_(topicId, static_cast<uint16_t>(version))) > 0;
     }
 
     // -----------------------------------------------------------------------
@@ -2573,14 +2578,18 @@ private:
     }
 
     // -------------------------------------------------------------------
-    // Task 7: executeSchemaUpdateWire_ — install a Validator for a topic on
-    // this worker's own thread (shared-nothing).
+    // Task 7 / Task 12: executeSchemaUpdateWire_ — install a per-(topic,version)
+    // Validator on this worker's own thread (shared-nothing).
     //
-    // The descriptor blob arrives in the ring tail (TailKind = DESCRIPTOR_BLOB).
-    // We deserialize it here (off-hot-path, admin/control-plane) and store the
-    // resulting Validator in validators_ keyed by topicId.  The hot path
-    // (executeProduceWire_) does a single-branch lookup; if no entry exists
-    // (validation off / not yet pushed) it falls through with zero overhead.
+    // The descriptor blob arrives in the ring tail (TailKind = DESCRIPTOR_BLOB)
+    // as the MATERIALIZED-as-of-version descriptor (the fan-out source sends
+    // RegistryEntry.descriptor, already materializeAsOf(evolving, version) —
+    // never the raw evolving blob).  The version itself rides the wire's
+    // clientVersion field (reused by SchemaUpdate; see WorkerOp.h).  We
+    // deserialize it here (off-hot-path, admin/control-plane) and store the
+    // resulting Validator in validators_ keyed by (topicId, version).  The hot
+    // path (schemaRejects_) does a single-branch lookup; if the topic has no
+    // validated version installed at all it falls through with zero overhead.
     //
     // Shared-nothing: validators_ is a plain member touched ONLY by this worker
     // thread — no lock, no atomic, no cross-thread mutation.  The blob is copied
@@ -2591,28 +2600,31 @@ private:
     // allocate on the WORKER thread (not in the produce path) — HARD RULE 4 is met.
     // -------------------------------------------------------------------
     void executeSchemaUpdateWire_(sbe::WorkerOp& op) {
-        const int32_t topicId  = op.topicId();
-        const uint32_t tailLen = op.tailLength();
-        const uint8_t* tail    = reinterpret_cast<const uint8_t*>(op.tail());
+        const int32_t  topicId  = op.topicId();
+        const uint16_t version  = static_cast<uint16_t>(op.clientVersion());
+        const uint32_t tailLen  = op.tailLength();
+        const uint8_t* tail     = reinterpret_cast<const uint8_t*>(op.tail());
 
         if (!tail || tailLen == 0) {
-            spdlog::warn("Worker {}: executeSchemaUpdateWire_ — empty blob for topicId={}; "
-                         "validator not installed", workerId_, topicId);
+            spdlog::warn("Worker {}: executeSchemaUpdateWire_ — empty blob for topicId={} "
+                         "version={}; validator not installed", workerId_, topicId, version);
             return;
         }
 
         try {
             rune::codec::Descriptor desc =
                 rune::codec::deserialize(std::span<const uint8_t>(tail, tailLen));
-            validators_.insert_or_assign(topicId, rune::codec::Validator(desc));
-            spdlog::debug("Worker {}: SchemaUpdate installed validator for topicId={}",
-                          workerId_, topicId);
+            validators_.insert_or_assign(packValidatorKey_(topicId, version),
+                                         rune::codec::Validator(desc));
+            validatedTopics_.insert(topicId);
+            spdlog::debug("Worker {}: SchemaUpdate installed validator for topicId={} version={}",
+                          workerId_, topicId, version);
         } catch (const std::exception& ex) {
             spdlog::error("Worker {}: executeSchemaUpdateWire_ — deserialize failed "
-                          "for topicId={}: {}", workerId_, topicId, ex.what());
+                          "for topicId={} version={}: {}", workerId_, topicId, version, ex.what());
         } catch (...) {
             spdlog::error("Worker {}: executeSchemaUpdateWire_ — unknown exception "
-                          "for topicId={}", workerId_, topicId);
+                          "for topicId={} version={}", workerId_, topicId, version);
         }
     }
 
@@ -2903,18 +2915,27 @@ private:
     }
 
     // -------------------------------------------------------------------
-    // Task 7 per-worker schema validation (shared by both produce paths).
-    // HARD RULE 4 (zero hot-path alloc): validators_ was built off-hot-path by
-    // executeSchemaUpdateWire_; validate() runs on a zero-copy span.  I1 fast-
-    // out: no validator ever installed → one load + one predicted branch.
+    // Task 7 / Task 12 per-worker schema validation (shared by both produce
+    // paths).
+    // HARD RULE 4 (zero hot-path alloc): validators_/validatedTopics_ were
+    // built off-hot-path by executeSchemaUpdateWire_; validate() runs on a
+    // zero-copy span; the per-record version-keyed lookup is a single
+    // unordered_map::find on a precomputed uint64_t key — no allocation.
+    // I1 fast-out: no validator ever installed for this topic → one load +
+    // one predicted branch (validatedTopics_ empty/miss), same cost as before.
     // HARD RULE 5: concrete calls; HARD RULE 1: validators_ is worker-owned.
     // True = reject the batch (SchemaValidationFailed, never appended).
+    //
+    // Task 12: each record carries its OWN writer version (wire bytes [2..3]
+    // of the record value, per rune::codec's [blockLength:u16][version:u16]
+    // record header).  The validator is selected by the EXACT (topicId,
+    // recVersion) pair; an installed-but-different-version validator is NEVER
+    // substituted — an unknown version is a hard reject ("unknown schema
+    // version"), not a fall-through to a wrong-version validator.
     // -------------------------------------------------------------------
     [[nodiscard]] bool schemaRejects_(int32_t topicId, const uint8_t* tail, std::size_t tailLen) const {
-        if (validators_.empty()) [[likely]] return false;
-        auto it = validators_.find(topicId);
-        if (it == validators_.end()) return false;
-        const rune::codec::Validator& v = it->second;
+        if (validatedTopics_.empty()) [[likely]] return false;
+        if (validatedTopics_.find(topicId) == validatedTopics_.end()) return false;
         if (tailLen < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead))
             return true;   // batch too short to parse header — malformed
         bool validationFailed = false;
@@ -2928,8 +2949,18 @@ private:
                                                               int64_t /*offset*/,
                                                               int64_t /*ts*/) {
             if (validationFailed) return;
-            const rune::codec::ValResult res = v.validate(
-                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(val.data()), val.size()));
+            // Record header: [blockLength:u16 LE][version:u16 LE][fixed block][var data].
+            if (val.size() < 4) { validationFailed = true; return; }   // too short to carry a version
+            const auto* vb = reinterpret_cast<const uint8_t*>(val.data());
+            const uint16_t recVersion = static_cast<uint16_t>(vb[2]) |
+                                       (static_cast<uint16_t>(vb[3]) << 8);
+            auto it = validators_.find(packValidatorKey_(topicId, recVersion));
+            if (it == validators_.end()) {
+                validationFailed = true;   // unknown schema version — never guess
+                return;
+            }
+            const rune::codec::ValResult res = it->second.validate(
+                std::span<const uint8_t>(vb, val.size()));
             if (!res.ok) validationFailed = true;
         });
         if (validationFailed)
@@ -4523,15 +4554,18 @@ private:
     // Per-log LEO at its last successful sync lives in LogFlushSlot::lastSyncedLeo
     // (Task 10 fix 1 / I3: fixed per-owned-log slots, no hot-path map insert).
 
-    // Task 7: per-worker topic → Validator map.
+    // Task 7 / Task 12: per-worker (topic, version) → Validator map.
     //
     // Populated via SchemaUpdate ring ops (executeSchemaUpdateWire_), which
     // arrive from the admin thread as ring messages and are applied on THIS
     // worker's own thread (shared-nothing — no lock, no atomic).
     //
-    // Looked up in executeProduceWire_ BEFORE appendNoSyncRestamp.  The lookup
-    // is a single unordered_map::find (O(1) expected) with a single conditional
-    // branch when empty (most topics have no schema validator installed).
+    // Looked up in schemaRejects_ BEFORE appendNoSyncRestamp, once per record
+    // (keyed by that record's OWN writer version — Task 12).  The lookup is a
+    // single unordered_map::find (O(1) expected) on a packed uint64_t key (no
+    // allocation, no pair hashing) with a single conditional branch when no
+    // version of the topic is validated (most topics have no schema validator
+    // installed at all — see validatedTopics_).
     //
     // HARD RULE 1 (shared-nothing): validators_ is ONLY ever touched by the
     // worker thread — the admin thread copies the blob into the ring, the worker
@@ -4541,10 +4575,21 @@ private:
     // validate (no allocation).
     //
     // Reserved capacity is intentionally small (16): most deployments have
-    // O(10s) of topics per worker; the map is rarely rebuilt.
+    // O(10s) of (topic, version) pairs per worker; the map is rarely rebuilt.
     // TODO(T9): benchmark flat vs unordered_map for typical topic counts.
     static constexpr std::size_t kValidatorsReserve = 16;
-    std::unordered_map<int32_t, rune::codec::Validator> validators_;
+    [[nodiscard]] static constexpr uint64_t packValidatorKey_(int32_t topicId, uint16_t version) noexcept {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(topicId)) << 16) |
+               static_cast<uint64_t>(version);
+    }
+    std::unordered_map<uint64_t, rune::codec::Validator> validators_;
+    // Task 12: fast "does this topic have ANY validated version installed"
+    // pre-check — independent of which exact version — so a topic that never
+    // had validate=true (no entries in validators_ for any version) is never
+    // mistaken for one whose exact record version is simply unknown (which
+    // IS a hard reject; see schemaRejects_).  Grows only (versions are never
+    // un-validated), so a topicId inserted once stays a cheap O(1) hit.
+    std::unordered_set<int32_t> validatedTopics_;
 
     // E5.1.3: desired fragment poll limit for reservation-before-poll (see
     // ingressPollBudget_).  Source: NodeConfig::gatewayFragmentLimit

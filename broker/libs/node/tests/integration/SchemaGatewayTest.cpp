@@ -40,6 +40,8 @@
 
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
+#include <rune/codec/Fingerprint.h>
+#include <rune/codec/AlterOps.h>
 
 #include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -85,6 +87,34 @@ public:
     bool sendFetchResponse(NodeId, const FetchResponseMsg&) override { return true; }
 };
 
+// Build an ALTER ops blob (ADD a column) — Task 13's fingerprint-selecting
+// GetTopicSchema test ALTERs v1 → v2 and must still be able to fetch v1.
+rune::codec::AlterOp addColumnOp(const std::string& name, PrimType t) {
+    rune::codec::AlterOp op{};
+    op.type = rune::codec::AlterOpType::Add;
+    op.name = name;
+    op.primType = t;
+    op.fixedLen = 0;
+    return op;
+}
+
+// GC6b: a DROP op (for the long-lineage fingerprint-select test below).
+rune::codec::AlterOp dropColumnOp(const std::string& name) {
+    rune::codec::AlterOp op{};
+    op.type = rune::codec::AlterOpType::Drop;
+    op.name = name;
+    return op;
+}
+
+// GC6b: a RENAME op (for the long-lineage fingerprint-select test below).
+rune::codec::AlterOp renameColumnOp(const std::string& oldName, const std::string& newName) {
+    rune::codec::AlterOp op{};
+    op.type = rune::codec::AlterOpType::Rename;
+    op.name = oldName;
+    op.newName = newName;
+    return op;
+}
+
 // A minimal record batch (for the produce regression test).
 std::vector<uint8_t> makeBatch() {
     rune::protocol::RecordBatchBuilder b(0, 0);
@@ -124,9 +154,21 @@ struct SgHarness {
             if (blob && blen) m.blob.assign(blob, blob+blen);
             return encodeDefineTopic(*ring, m);
         }
-        bool submitGetSchema(int64_t s, int64_t c, std::string_view name) override {
+        bool submitGetSchema(int64_t s, int64_t c, std::string_view name,
+                             uint64_t requestedFingerprint) override {
             GetSchemaMsg m; m.session=s; m.corr=c; m.name.assign(name);
+            m.requestedFingerprint = requestedFingerprint;
             return encodeGetSchema(*ring, m);
+        }
+        // Task 14: AlterTopic (68) — mirrors AdminWorkerAgent::submitAlterTopic
+        // (BrokerNode.h), encoding onto the same requestRing.
+        bool submitAlterTopic(int64_t s, int64_t c, std::string_view topicName,
+                              uint16_t expectedVersion,
+                              const uint8_t* opsBlob, uint32_t opsLen) override {
+            AlterTopicMsg m; m.session=s; m.corr=c; m.expectedVersion=expectedVersion;
+            m.topicName.assign(topicName);
+            if (opsBlob && opsLen) m.opsBlob.assign(opsBlob, opsBlob+opsLen);
+            return encodeAlterTopic(*ring, m);
         }
     } sink;
 
@@ -193,6 +235,24 @@ struct SgHarness {
             std::memcpy(p, &session, 8); std::memcpy(p+8, f.data(), n);
             egressRing.commit(idx);
         };
+        // respondAlter (Task 13 test harness fix-on-sight): this harness never
+        // wired AlterTopic responses, so an ALTER driven through it would call
+        // an EMPTY std::function (deps_.respondAlter) and crash with
+        // std::bad_function_call. GetTopicSchemaByFingerprintReturnsBoundVersion
+        // drives a real ALTER through these rings, so wire it the same way as
+        // respondDefine/respondGet (encode + egressRing).
+        deps.respondAlter = [this](int64_t session, int64_t corr, int32_t tid,
+                                   uint16_t newVer, uint16_t err) {
+            pc::AlterTopicResponse r; r.sessionId=session; r.correlationId=corr;
+            r.topicId=tid; r.newVersion=newVer; r.errorCode=err;
+            uint8_t f[pc::MessageHeader::ENCODED_SIZE + pc::AlterTopicResponse::BODY_FIXED];
+            std::size_t n = r.encode(f);
+            auto idx = egressRing.tryClaim(kMsgEgressFrame, 8+n);
+            if (idx < 0) return;
+            uint8_t* p = egressRing.base()+idx;
+            std::memcpy(p, &session, 8); std::memcpy(p+8, f, n);
+            egressRing.commit(idx);
+        };
         admin = std::make_unique<AdminWorker>(schemaReg, schemaReplica.get(), 1,
                                               std::vector<int32_t>{1}, std::move(deps));
         admin->onRole(AdminRoleMsg{true, 1, 1});
@@ -246,6 +306,13 @@ struct SgHarness {
             const auto n = (std::size_t)len;
             if (tid == kMsgDefineTopic) admin->submitDefineTopic(decodeDefineTopic(p, n));
             else if (tid == kMsgGetSchema) admin->submitGetSchema(decodeGetSchema(p, n));
+            // Task 13 fix-on-sight: this hand-rolled mirror of the
+            // AdminWorkerAgent (BrokerNode.h) was missing the ALTER branch —
+            // an AlterTopic frame on requestRing was silently consumed
+            // (ring position advanced) and dropped (never reached
+            // submitAlterTopic), so no ALTER driven directly through this
+            // harness's ring ever took effect.
+            else if (tid == kMsgAlterTopic) admin->submitAlterTopic(decodeAlterTopic(p, n));
         }, 16);
     }
 
@@ -276,6 +343,20 @@ std::vector<uint8_t> encodeDefineFrame(int64_t session, int64_t corr,
     m.sessionId = session; m.correlationId = corr; m.topicName = name;
     m.partitionCount = parts; m.keyField = keyField; m.validate = validate;
     m.descriptorBlob = blob.data(); m.descriptorLen = (uint32_t)blob.size();
+    std::vector<uint8_t> frame(m.encodedSize());
+    m.encode(frame.data());
+    return frame;
+}
+
+// Encode an AlterTopic client frame (Task 14).
+std::vector<uint8_t> encodeAlterFrame(int64_t session, int64_t corr,
+                                      const std::string& name,
+                                      uint16_t expectedVersion,
+                                      const std::vector<uint8_t>& opsBlob) {
+    pc::AlterTopic m;
+    m.sessionId = session; m.correlationId = corr; m.topicName = name;
+    m.expectedVersion = expectedVersion;
+    m.opsBlob = opsBlob.data(); m.opsLen = (uint32_t)opsBlob.size();
     std::vector<uint8_t> frame(m.encodedSize());
     m.encode(frame.data());
     return frame;
@@ -345,6 +426,345 @@ TEST(SchemaGateway, GetTopicSchemaRoundTrip) {
     EXPECT_EQ(resp->correlationId, 7);
     EXPECT_EQ(resp->errorCode, 0u);
     EXPECT_GT(resp->descriptorLen, 0u) << "the descriptor blob must be returned";
+}
+
+// ---------------------------------------------------------------------------
+// SchemaGatewayRegression.AlterTopicRoundTripThroughGatewayRings
+//
+// Task 14: an AlterTopic frame fed through the GATEWAY (not injected directly
+// on the admin ring, unlike Task 13's fingerprint test) must route via
+// handleAlterTopic → IAdminRequestSink::submitAlterTopic → requestRing →
+// AdminWorker, and the AlterTopicResponse (69) must come back on the session
+// egress with the new version.  Mirrors DefineTopicRoundTripThroughRings.
+//
+// define v1 (gateway frame) → ALTER add column "email" (gateway frame) →
+// response newVersion==2 → GetTopicSchema (gateway frame) confirms v2.
+// ---------------------------------------------------------------------------
+TEST(SchemaGatewayRegression, AlterTopicRoundTripThroughGatewayRings) {
+    SgHarness h;
+    auto v1Blob = charsBlob();
+    h.gw.applyDefineTopicForTest(
+        encodeDefineFrame(1, 1, "characters", 4, "userId", false, v1Blob).data(),
+        encodeDefineFrame(1, 1, "characters", 4, "userId", false, v1Blob).size());
+    h.pump();
+
+    ASSERT_NE(h.schemaReg.byName("characters"), nullptr);
+    ASSERT_EQ(h.schemaReg.byName("characters")->version, 1u);
+    h.captured.clear();
+
+    // ALTER through the GATEWAY (not a direct ring injection): proves
+    // handleAlterTopic actually routes the client frame.
+    auto opsBlob = rune::codec::encodeAlterOps({addColumnOp("email", PrimType::String)});
+    auto alterFrame = encodeAlterFrame(/*session=*/1, /*corr=*/42, "characters",
+                                       /*expectedVersion=*/0, opsBlob);
+    h.gw.applyAlterTopicForTest(alterFrame.data(), alterFrame.size());
+    h.pump();
+
+    // 1. The registry committed v2.
+    const RegistryEntry* v2 = h.schemaReg.byName("characters");
+    ASSERT_NE(v2, nullptr);
+    EXPECT_EQ(v2->version, 2u) << "ALTER routed through the gateway must commit v2";
+
+    // 2. An AlterTopicResponse (69) was produced on the session egress with OK
+    //    and the new version.
+    std::optional<pc::AlterTopicResponse> resp;
+    for (auto& [sid, bytes] : h.captured) {
+        auto d = pc::AlterTopicResponse::decode(bytes.data(), bytes.size());
+        if (d) { resp = d; break; }
+    }
+    ASSERT_TRUE(resp.has_value())
+        << "an AlterTopicResponse must be produced on the session egress";
+    EXPECT_EQ(resp->correlationId, 42);
+    EXPECT_EQ(resp->errorCode, 0u) << "ALTER must succeed (OK)";
+    EXPECT_EQ(resp->topicId, 0);
+    EXPECT_EQ(resp->newVersion, 2u);
+
+    h.captured.clear();
+
+    // 3. GetTopicSchema (gateway frame) confirms the latest is v2.
+    pc::GetTopicSchema g; g.sessionId = 1; g.correlationId = 77; g.topicName = "characters";
+    std::vector<uint8_t> gf(g.encodedSize()); g.encode(gf.data());
+    h.gw.applyGetTopicSchemaForTest(gf.data(), gf.size());
+    h.pump();
+
+    std::optional<pc::TopicSchemaResponse> getResp;
+    for (auto& [sid, bytes] : h.captured) {
+        auto d = pc::TopicSchemaResponse::decode(bytes.data(), bytes.size());
+        if (d) { getResp = d; break; }
+    }
+    ASSERT_TRUE(getResp.has_value());
+    EXPECT_EQ(getResp->errorCode, 0u);
+    EXPECT_EQ(getResp->version, 2u) << "GetTopicSchema must confirm v2 after the gateway ALTER";
+}
+
+// ---------------------------------------------------------------------------
+// Task 13: GetTopicSchema(requestedFingerprint) selects a SPECIFIC version —
+// define v1, ALTER to v2 (ADD a column), then:
+//   requestedFingerprint = fp(v1) → version==1, blob decodes to fp==fp(v1).
+//   requestedFingerprint = 0      → latest (version==2).
+// ---------------------------------------------------------------------------
+TEST(SchemaGateway, GetTopicSchemaByFingerprintReturnsBoundVersion) {
+    SgHarness h;
+    auto v1Blob = charsBlob();
+    h.gw.applyDefineTopicForTest(
+        encodeDefineFrame(1, 1, "characters", 4, "userId", false, v1Blob).data(),
+        encodeDefineFrame(1, 1, "characters", 4, "userId", false, v1Blob).size());
+    h.pump();
+    h.captured.clear();
+
+    const RegistryEntry* v1 = h.schemaReg.byName("characters");
+    ASSERT_NE(v1, nullptr);
+    ASSERT_EQ(v1->version, 1u);
+    const uint64_t fpV1 = v1->fingerprint;
+
+    // ALTER: ADD a column ("email") → bumps to v2. Submitted directly on the
+    // admin request ring (the gateway doesn't yet route AlterTopic — only
+    // DefineTopic/GetTopicSchema, per IAdminRequestSink); h.pump() drains it
+    // exactly like a gateway-routed DDL op (same requestRing, same dispatch).
+    AlterTopicMsg am;
+    am.session = 1; am.corr = 42; am.topicName = "characters";
+    am.expectedVersion = 0;  // unconditional
+    am.opsBlob = rune::codec::encodeAlterOps({addColumnOp("email", PrimType::String)});
+    ASSERT_TRUE(encodeAlterTopic(h.requestRing, am));
+    h.pump();
+
+    const RegistryEntry* v2 = h.schemaReg.byName("characters");
+    ASSERT_NE(v2, nullptr);
+    ASSERT_EQ(v2->version, 2u) << "ALTER must have committed v2";
+    ASSERT_NE(v2->fingerprint, fpV1) << "ADD changes the materialized fingerprint";
+
+    h.captured.clear();
+
+    // requestedFingerprint = fp(v1) → must resolve back to v1, not latest.
+    pc::GetTopicSchema g1; g1.sessionId = 1; g1.correlationId = 101;
+    g1.topicName = "characters"; g1.requestedFingerprint = fpV1;
+    std::vector<uint8_t> gf1(g1.encodedSize()); g1.encode(gf1.data());
+    h.gw.applyGetTopicSchemaForTest(gf1.data(), gf1.size());
+    h.pump();
+
+    std::optional<pc::TopicSchemaResponse> r1;
+    for (auto& [sid, bytes] : h.captured) {
+        auto d = pc::TopicSchemaResponse::decode(bytes.data(), bytes.size());
+        if (d && d->correlationId == 101) { r1 = d; break; }
+    }
+    ASSERT_TRUE(r1.has_value());
+    EXPECT_EQ(r1->errorCode, 0u);
+    EXPECT_EQ(r1->version, 1u) << "the BOUND version of the requested fingerprint";
+    ASSERT_GT(r1->descriptorLen, 0u);
+    // The client-side typed-gate check: fingerprint(deserialize(blob)) == requested.
+    const Descriptor d1 = rune::codec::deserialize(
+        std::span<const uint8_t>(r1->descriptorBlob, r1->descriptorLen));
+    EXPECT_EQ(rune::codec::fingerprint(d1), fpV1)
+        << "returned blob must deserialize to the MATERIALIZED v1 descriptor";
+
+    h.captured.clear();
+
+    // requestedFingerprint = 0 → latest (v2).
+    pc::GetTopicSchema g2; g2.sessionId = 1; g2.correlationId = 102;
+    g2.topicName = "characters"; g2.requestedFingerprint = 0;
+    std::vector<uint8_t> gf2(g2.encodedSize()); g2.encode(gf2.data());
+    h.gw.applyGetTopicSchemaForTest(gf2.data(), gf2.size());
+    h.pump();
+
+    std::optional<pc::TopicSchemaResponse> r2;
+    for (auto& [sid, bytes] : h.captured) {
+        auto d = pc::TopicSchemaResponse::decode(bytes.data(), bytes.size());
+        if (d && d->correlationId == 102) { r2 = d; break; }
+    }
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(r2->errorCode, 0u);
+    EXPECT_EQ(r2->version, 2u) << "requestedFingerprint==0 must return latest";
+    ASSERT_GT(r2->descriptorLen, 0u);
+    const Descriptor d2 = rune::codec::deserialize(
+        std::span<const uint8_t>(r2->descriptorBlob, r2->descriptorLen));
+    EXPECT_EQ(rune::codec::fingerprint(d2), v2->fingerprint);
+}
+
+// ---------------------------------------------------------------------------
+// SchemaGatewayRegression.GetTopicSchemaUnknownFingerprintReturnsError
+//
+// Task 13 regression (rule #6): a requestedFingerprint that matches NO version
+// of a KNOWN topic must come back as an error (UnknownTopic), not silently
+// fall back to latest and not crash.
+// ---------------------------------------------------------------------------
+TEST(SchemaGatewayRegression, GetTopicSchemaUnknownFingerprintReturnsError) {
+    SgHarness h;
+    auto blob = charsBlob();
+    h.gw.applyDefineTopicForTest(
+        encodeDefineFrame(1, 1, "characters", 4, "userId", false, blob).data(),
+        encodeDefineFrame(1, 1, "characters", 4, "userId", false, blob).size());
+    h.pump();
+    h.captured.clear();
+
+    pc::GetTopicSchema g; g.sessionId = 1; g.correlationId = 55;
+    g.topicName = "characters"; g.requestedFingerprint = 0xdeadbeefULL;
+    std::vector<uint8_t> gf(g.encodedSize()); g.encode(gf.data());
+    h.gw.applyGetTopicSchemaForTest(gf.data(), gf.size());
+    h.pump();
+
+    std::optional<pc::TopicSchemaResponse> resp;
+    for (auto& [sid, bytes] : h.captured) {
+        auto d = pc::TopicSchemaResponse::decode(bytes.data(), bytes.size());
+        if (d) { resp = d; break; }
+    }
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->errorCode, 7u)
+        << "UnknownTopic for a fingerprint that matches no version of a known topic";
+    EXPECT_EQ(resp->descriptorLen, 0u);
+}
+
+// ---------------------------------------------------------------------------
+// SchemaGatewayRegression.GetTopicSchemaByFingerprintAcrossLongLineage
+//
+// GC6b (closes F2 from the GC6 review): GetTopicSchemaByFingerprintReturns-
+// BoundVersion (above) only covers a 2-version lineage (v1 -> v2, one ADD).
+// The test matrix's D3-D8 want GetTopicSchema(requestedFingerprint) proven
+// to resolve EVERY version of a LONGER lineage mixing ADD/DROP/RENAME,
+// broker-side, through the real gateway rings + AdminWorker (no faking).
+//
+// Lineage (6 versions, 5 ALTERs over the v1 DefineTopic), chosen so every
+// version's LIVE field set is distinct (deliberately avoiding I10-14's
+// open question — ADD-then-DROP returning to a PRIOR live set — which the
+// test matrix flags as an undecided fingerprint-equality edge case, not
+// this task's ask):
+//   v1 DefineTopic : id, userId(key), name                  [charsBlob]
+//   v2 ADD    email  : + email           -> {id,userId,name,email}
+//   v3 ADD    age    : + age             -> {..,email,age}
+//   v4 DROP   email  : - email           -> {id,userId,name,age}
+//   v5 RENAME age->years                 -> {id,userId,name,years}
+//   v6 ADD    score  : + score           -> {..,years,score}
+//
+// For each K in 1..6: GetTopicSchema(requestedFingerprint=fp(vK)) must
+// return version==K and a descriptor blob whose fingerprint(deserialize(.))
+// == fp(vK) — i.e. the MATERIALIZED-as-of-vK blob, exactly what a client
+// compiled at vK needs to bind. Also: requestedFingerprint=0 -> latest (v6);
+// an unknown fingerprint -> UnknownTopic, never a silent fallback to latest.
+// ---------------------------------------------------------------------------
+TEST(SchemaGatewayRegression, GetTopicSchemaByFingerprintAcrossLongLineage) {
+    SgHarness h;
+    auto v1Blob = charsBlob();
+    h.gw.applyDefineTopicForTest(
+        encodeDefineFrame(1, 1, "characters", 4, "userId", false, v1Blob).data(),
+        encodeDefineFrame(1, 1, "characters", 4, "userId", false, v1Blob).size());
+    h.pump();
+
+    const RegistryEntry* v1 = h.schemaReg.byName("characters");
+    ASSERT_NE(v1, nullptr);
+    ASSERT_EQ(v1->version, 1u);
+    const int32_t topicId = v1->topicId;
+
+    // Drive the lineage through the real admin request ring: mirrors Task
+    // 13's fingerprint test — the gateway only routes DefineTopic/GetSchema
+    // today, so AlterTopic is injected on the SAME ring AdminWorker drains,
+    // exercising the identical dispatch/state-machine path as a gateway-
+    // routed ALTER would.
+    auto applyAlter = [&](const std::vector<rune::codec::AlterOp>& ops, int64_t corr) {
+        AlterTopicMsg am;
+        am.session = 1; am.corr = corr; am.topicName = "characters";
+        am.expectedVersion = 0;  // unconditional
+        am.opsBlob = rune::codec::encodeAlterOps(ops);
+        ASSERT_TRUE(encodeAlterTopic(h.requestRing, am));
+        h.pump();
+    };
+
+    applyAlter({addColumnOp("email", PrimType::String)}, 201);    // v2
+    applyAlter({addColumnOp("age", PrimType::Int32)}, 202);        // v3
+    applyAlter({dropColumnOp("email")}, 203);                      // v4
+    applyAlter({renameColumnOp("age", "years")}, 204);              // v5
+    applyAlter({addColumnOp("score", PrimType::Int64)}, 205);      // v6
+
+    const RegistryEntry* latest = h.schemaReg.byName("characters");
+    ASSERT_NE(latest, nullptr);
+    ASSERT_EQ(latest->version, 6u) << "5 ALTERs over a v1 DefineTopic must land on v6";
+
+    // Snapshot fp(vK) for K=1..6 directly from the (admin-owned) registry —
+    // the SAME source of truth GetTopicSchema's resolver consults.
+    std::vector<uint64_t> fpByVersion(7, 0);  // index by version (1-based; [0] unused)
+    for (uint16_t k = 1; k <= 6; ++k) {
+        const RegistryEntry* e = h.schemaReg.byIdVersion(topicId, k);
+        ASSERT_NE(e, nullptr) << "version " << k << " must be materialized in the registry";
+        fpByVersion[k] = e->fingerprint;
+    }
+    // All 6 fingerprints must be pairwise distinct (I1): every ADD/DROP/
+    // RENAME in this lineage changes the materialized descriptor.
+    for (uint16_t a = 1; a <= 6; ++a)
+        for (uint16_t b = a + 1; b <= 6; ++b)
+            EXPECT_NE(fpByVersion[a], fpByVersion[b])
+                << "fp(v" << a << ") must differ from fp(v" << b << ")";
+
+    // For each K, GetTopicSchema(requestedFingerprint=fp(vK)) must resolve
+    // to EXACTLY version K with a blob that re-fingerprints to fp(vK).
+    for (uint16_t k = 1; k <= 6; ++k) {
+        h.captured.clear();
+        const int64_t corr = 300 + k;
+        pc::GetTopicSchema g; g.sessionId = 1; g.correlationId = corr;
+        g.topicName = "characters"; g.requestedFingerprint = fpByVersion[k];
+        std::vector<uint8_t> gf(g.encodedSize()); g.encode(gf.data());
+        h.gw.applyGetTopicSchemaForTest(gf.data(), gf.size());
+        h.pump();
+
+        std::optional<pc::TopicSchemaResponse> resp;
+        for (auto& [sid, bytes] : h.captured) {
+            auto d = pc::TopicSchemaResponse::decode(bytes.data(), bytes.size());
+            if (d && d->correlationId == corr) { resp = d; break; }
+        }
+        ASSERT_TRUE(resp.has_value()) << "no response for fp(v" << k << ")";
+        EXPECT_EQ(resp->errorCode, 0u) << "fp(v" << k << ") must resolve (OK)";
+        EXPECT_EQ(resp->version, k)
+            << "requestedFingerprint=fp(v" << k << ") must bind version " << k
+            << ", not some other version in the lineage";
+        ASSERT_GT(resp->descriptorLen, 0u);
+
+        const Descriptor dk = rune::codec::deserialize(
+            std::span<const uint8_t>(resp->descriptorBlob, resp->descriptorLen));
+        EXPECT_EQ(rune::codec::fingerprint(dk), fpByVersion[k])
+            << "the returned blob must be the MATERIALIZED-as-of-v" << k
+            << " descriptor (a client compiled at v" << k << " must bind)";
+    }
+
+    // requestedFingerprint=0 -> latest (v6), even across a long lineage.
+    {
+        h.captured.clear();
+        pc::GetTopicSchema g; g.sessionId = 1; g.correlationId = 400;
+        g.topicName = "characters"; g.requestedFingerprint = 0;
+        std::vector<uint8_t> gf(g.encodedSize()); g.encode(gf.data());
+        h.gw.applyGetTopicSchemaForTest(gf.data(), gf.size());
+        h.pump();
+
+        std::optional<pc::TopicSchemaResponse> resp;
+        for (auto& [sid, bytes] : h.captured) {
+            auto d = pc::TopicSchemaResponse::decode(bytes.data(), bytes.size());
+            if (d && d->correlationId == 400) { resp = d; break; }
+        }
+        ASSERT_TRUE(resp.has_value());
+        EXPECT_EQ(resp->errorCode, 0u);
+        EXPECT_EQ(resp->version, 6u)
+            << "requestedFingerprint==0 must return latest across a long lineage";
+        const Descriptor dLatest = rune::codec::deserialize(
+            std::span<const uint8_t>(resp->descriptorBlob, resp->descriptorLen));
+        EXPECT_EQ(rune::codec::fingerprint(dLatest), fpByVersion[6]);
+    }
+
+    // An unknown fingerprint (matches no version across the 6-version
+    // lineage) -> UnknownTopic, never a silent fallback to latest.
+    {
+        h.captured.clear();
+        pc::GetTopicSchema g; g.sessionId = 1; g.correlationId = 401;
+        g.topicName = "characters"; g.requestedFingerprint = 0xabadcafeULL;
+        std::vector<uint8_t> gf(g.encodedSize()); g.encode(gf.data());
+        h.gw.applyGetTopicSchemaForTest(gf.data(), gf.size());
+        h.pump();
+
+        std::optional<pc::TopicSchemaResponse> resp;
+        for (auto& [sid, bytes] : h.captured) {
+            auto d = pc::TopicSchemaResponse::decode(bytes.data(), bytes.size());
+            if (d && d->correlationId == 401) { resp = d; break; }
+        }
+        ASSERT_TRUE(resp.has_value());
+        EXPECT_EQ(resp->errorCode, 7u)
+            << "UnknownTopic for a fingerprint matching no version across a long lineage";
+        EXPECT_EQ(resp->descriptorLen, 0u);
+    }
 }
 
 // ---------------------------------------------------------------------------

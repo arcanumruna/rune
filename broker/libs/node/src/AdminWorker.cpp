@@ -1,5 +1,7 @@
 #include "rune/node/AdminWorker.h"
-#include <rune/codec/Serialize.h>  // rune::codec::deserialize (throws on bad input)
+#include <rune/codec/Serialize.h>  // rune::codec::deserialize/serialize (throws on bad input)
+#include <rune/codec/Evolve.h>     // checkCompatibility / applyOps (Task 11)
+#include <rune/codec/AlterOps.h>   // decodeAlterOps
 #include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/RecordBatch.h>
 #include <spdlog/spdlog.h>
@@ -12,6 +14,8 @@ static constexpr uint16_t kInternal       =  6;
 static constexpr uint16_t kUnknownTopic   =  7;
 static constexpr uint16_t kInvalidSchema  = 23;
 static constexpr uint16_t kTopicExists    = 25;
+static constexpr uint16_t kSchemaIncompatible = 30;  // ALTER compat gate reject
+static constexpr uint16_t kSchemaConflict     = 31;  // ALTER stale expectedVersion (CAS)
 
 AdminWorker::AdminWorker(SchemaRegistry& reg,
                          rune::replication::PartitionReplica* replica,
@@ -23,6 +27,14 @@ AdminWorker::AdminWorker(SchemaRegistry& reg,
     , selfId_(selfId)
     , replicaSet_(std::move(replicaSet))
     , deps_(std::move(deps)) {}
+
+// ─── nextSchemaVersion_ — single source of truth for CONTIGUOUS versions ────
+// (Task 10). DefineTopic (create, this task) and ALTER (Task 11) both route
+// their commit's version through this one helper.
+uint16_t AdminWorker::nextSchemaVersion_(int32_t topicId) const {
+    const RegistryEntry* latest = reg_.latest(topicId);
+    return latest ? static_cast<uint16_t>(latest->version + 1) : kInitialSchemaVersion;
+}
 
 // ─── Role events (control → admin) ──────────────────────────────────────────
 //
@@ -45,6 +57,17 @@ void AdminWorker::onRole(const AdminRoleMsg& role) {
         if (!wasLeader_) {
             // Follower→Leader edge: rebuild registry from the replicated log.
             rebuildFromLog_();
+            if (rebuildFailed_) [[unlikely]] {
+                // Surfaced loudly (see rebuildFromLog_ + rebuildFailed()):
+                // this node is now serving DDL as leader on top of a
+                // registry rebuild that detected and aborted on a corrupt
+                // __topic_schemas record — never silently treated as healthy.
+                spdlog::critical(
+                    "AdminWorker: promoted to LEADER (epoch={}) with a FAILED "
+                    "__topic_schemas rebuild — the SchemaRegistry may be "
+                    "missing versions past the corrupt record. See the prior "
+                    "CORRUPT __topic_schemas record log line.", role.epoch);
+            }
             wasLeader_ = true;
         }
     } else {
@@ -60,18 +83,52 @@ void AdminWorker::onRole(const AdminRoleMsg& role) {
 
 // ─── Ingress ────────────────────────────────────────────────────────────────
 void AdminWorker::submitDefineTopic(DefineTopicMsg msg) {
-    pending_.push_back(std::move(msg));
+    PendingDdl pd;
+    pd.kind   = DdlKind::Create;
+    pd.define = std::move(msg);
+    pending_.push_back(std::move(pd));
+}
+
+void AdminWorker::submitAlterTopic(AlterTopicMsg msg) {
+    PendingDdl pd;
+    pd.kind  = DdlKind::Alter;
+    pd.alter = std::move(msg);
+    pending_.push_back(std::move(pd));
 }
 
 void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
     // GetSchema is a pure read of the admin-owned registry — no round-trip.
-    const auto* e = reg_.byName(msg.name);
-    if (!e) {
+    //
+    // Task 13: `msg.requestedFingerprint` selects WHICH version is returned —
+    // 0 means latest; non-zero resolves the exact historical version whose
+    // per-version (materialized-as-of) fingerprint matches, so a typed client
+    // compiled against an older schema can fetch the descriptor it needs.
+    const auto* named = reg_.byName(msg.name);
+    if (!named) {
         deps_.respondGet(msg.session, msg.corr, -1, 0, {}, kUnknownTopic);
         return;
     }
+    const RegistryEntry* e = (msg.requestedFingerprint == 0)
+                                 ? named
+                                 : reg_.byFingerprint(named->topicId, msg.requestedFingerprint);
+    if (!e) {
+        // No version of this (known) topic has the requested fingerprint —
+        // same wire error as an unknown topic (no dedicated "stale fingerprint"
+        // code on the wire yet).
+        deps_.respondGet(msg.session, msg.corr, -1, 0, {}, kUnknownTopic);
+        return;
+    }
+    // IMPORTANT: `e->descriptorBlob` is the raw EVOLVING blob (every field ever
+    // declared, live or retired) — NOT what a client should rehash. The client
+    // typed-gate recomputes fingerprint(deserialize(responseBlob)) and compares
+    // it to the fingerprint it compiled against, so the wire blob MUST
+    // deserialize to the MATERIALIZED-as-of-`e->version` descriptor (whose
+    // fingerprint is exactly `e->fingerprint`, by construction in
+    // SchemaRegistry::applyRecord). Serialize `e->descriptor` (materialized),
+    // never `e->descriptorBlob` (evolving).
     deps_.respondGet(msg.session, msg.corr,
-                     e->topicId, e->version, e->descriptorBlob, kOK);
+                     e->topicId, e->version,
+                     rune::codec::serialize(e->descriptor), kOK);
 }
 
 // ─── control → admin reply ──────────────────────────────────────────────────
@@ -94,11 +151,15 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
     // ── AWAITING_COMMIT ── append the durable TopicSchema record.
     TopicSchema ts;
     ts.topicId        = reply.topicId;
-    ts.version        = 1;
+    ts.version        = nextSchemaVersion_(reply.topicId);
     ts.partitionCount = inFlight_->msg.partitionCount;
     ts.keyField       = inFlight_->msg.keyField;
     ts.validate       = inFlight_->msg.validate;
     ts.descriptorBlob = inFlight_->msg.blob;
+    // DefineTopic (create): nextTag starts past every field the fresh schema
+    // already declares, so the first ALTER ADD (Task 11) allocates a tag that
+    // doesn't collide with an existing one.
+    ts.nextTag        = inFlight_->fieldCount;
 
     // D: leader guard.  If we are not the leader, DDL cannot be committed here.
     if (!leader_ || !replica_) {
@@ -110,15 +171,27 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
     }
 
     const std::vector<uint8_t> payload = ts.serialize();
-    uint8_t keyBuf[4];
+    // Task 15b: the __topic_schemas log is CleanupPolicy::Compact, and the
+    // Kafka-style LogCleaner compacts on EXACTLY the key stored here via
+    // appendKeyed (it has no separate key-extractor for this log) — so a
+    // topicId-only key would make every version of a topic collide on the
+    // SAME compaction key and the cleaner would physically delete all but the
+    // latest version.  Key by the COMPOSITE (topicId:i32 LE, version:u16 LE)
+    // = 6 bytes instead, so every version is its own distinct compaction key
+    // and survives compaction (old-fingerprint client binding + multi-version
+    // replay depend on every version staying durable).
+    uint8_t keyBuf[6];
     const uint32_t u = static_cast<uint32_t>(reply.topicId);
     keyBuf[0] = static_cast<uint8_t>(u & 0xff);
     keyBuf[1] = static_cast<uint8_t>((u >> 8) & 0xff);
     keyBuf[2] = static_cast<uint8_t>((u >> 16) & 0xff);
     keyBuf[3] = static_cast<uint8_t>((u >> 24) & 0xff);
+    const uint16_t v = ts.version;
+    keyBuf[4] = static_cast<uint8_t>(v & 0xff);
+    keyBuf[5] = static_cast<uint8_t>((v >> 8) & 0xff);
 
     const rune::replication::Offset base =
-        replica_->appendKeyed(std::span<const uint8_t>(keyBuf, 4),
+        replica_->appendKeyed(std::span<const uint8_t>(keyBuf, 6),
                               std::span<const uint8_t>(payload.data(), payload.size()),
                               /*acksAll=*/true);
     if (base < 0) {
@@ -156,13 +229,25 @@ int AdminWorker::doWork(int64_t nowNs) {
 
 // ─── startNext_ — PARSING → name-lookup → CREATING (request id) ──────────────
 void AdminWorker::startNext_(int64_t nowNs) {
-    DefineTopicMsg msg = std::move(pending_.front());
+    PendingDdl pd = std::move(pending_.front());
     pending_.pop_front();
 
-    // ── PARSING ── validate the descriptor blob is well-formed.
+    if (pd.kind == DdlKind::Alter) {
+        startAlter_(std::move(pd.alter), nowNs);
+        return;
+    }
+
+    DefineTopicMsg msg = std::move(pd.define);
+
+    // ── PARSING ── validate the descriptor blob is well-formed, and capture
+    // its field count in the same pass (seeds nextTag for the create path —
+    // see DdlOp::fieldCount — avoiding a second deserialize of the same blob
+    // later).
+    std::size_t fieldCount = 0;
     try {
-        [[maybe_unused]] auto _ = rune::codec::deserialize(
+        const rune::codec::Descriptor parsed = rune::codec::deserialize(
             std::span<const uint8_t>(msg.blob.data(), msg.blob.size()));
+        fieldCount = parsed.fields.size();
     } catch (...) {
         deps_.respondDefine(msg.session, msg.corr, -1, 0, kInvalidSchema);
         return;
@@ -183,9 +268,10 @@ void AdminWorker::startNext_(int64_t nowNs) {
 
     // ── CREATING ── post a create-topic request to the control thread (ring).
     DdlOp op;
-    op.ticket    = nextTicket_++;
-    op.startedNs = nowNs;
-    op.msg       = std::move(msg);
+    op.ticket     = nextTicket_++;
+    op.startedNs  = nowNs;
+    op.fieldCount = static_cast<uint16_t>(fieldCount);
+    op.msg        = std::move(msg);
 
     if (!deps_.requestCreateTopic(op.ticket, op.msg.partitionCount, op.msg.name)) {
         // Ring full (should not happen for rare DDL) → Internal; requeue would risk
@@ -197,14 +283,140 @@ void AdminWorker::startNext_(int64_t nowNs) {
     state_    = DdlState::AwaitingId;
 }
 
+// ─── startAlter_ — serialized ALTER TOPIC (CAS + compat gate + atomic apply) ──
+//
+// Runs on the admin thread, reusing the DDL state machine so an ALTER is
+// serialized with CREATE and other ALTERs (single inFlight_).  Unlike CREATE it
+// SKIPS AwaitingId — the topic already exists, so there is no id round-trip to
+// the control thread; it commits synchronously to the append/AwaitingCommit path.
+void AdminWorker::startAlter_(AlterTopicMsg msg, int64_t nowNs) {
+    // ── leader guard (D) ── DDL is leader-only.
+    if (!leader_ || !replica_) {
+        deps_.respondAlter(msg.session, msg.corr, -1, 0, kInternal);
+        return;
+    }
+
+    // a. resolve the topic's LATEST applied schema.
+    const RegistryEntry* latest = reg_.byName(msg.topicName);
+    if (!latest) {
+        deps_.respondAlter(msg.session, msg.corr, -1, 0, kUnknownTopic);
+        return;
+    }
+    const int32_t  topicId    = latest->topicId;
+    const uint16_t curVersion = latest->version;
+
+    // b. optimistic CAS — a non-zero expectedVersion that no longer matches the
+    //    latest version means another ALTER landed first; reject (NO lost update).
+    if (msg.expectedVersion != 0 && msg.expectedVersion != curVersion) {
+        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kSchemaConflict);
+        return;
+    }
+
+    // c. decode the ops blob (bounds-checked; nullopt on any truncation).
+    auto ops = rune::codec::decodeAlterOps(
+        std::span<const uint8_t>(msg.opsBlob.data(), msg.opsBlob.size()));
+    if (!ops) {
+        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kInvalidSchema);
+        return;
+    }
+
+    // d. effective compatibility mode: a SET_COMPATIBILITY op (if present) sets
+    //    both the mode the gate checks AND the mode persisted on the new record;
+    //    otherwise the current mode carries forward.
+    rune::codec::CompatMode mode = latest->compatMode;
+    for (const auto& op : *ops)
+        if (op.type == rune::codec::AlterOpType::SetCompatibility) mode = op.mode;
+
+    // e. compatibility gate (e.g. DROP is rejected under Forward).
+    if (!rune::codec::checkCompatibility(*ops, mode)) {
+        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kSchemaIncompatible);
+        return;
+    }
+
+    // f. apply the ops to the CURRENT EVOLVING descriptor (all fields incl.
+    //    retired), bumping a fresh contiguous version.  applyOps is atomic: on
+    //    any failed op it returns an error and leaves `nextTag` untouched, so a
+    //    rejected ALTER appends nothing and does not bump the version.
+    rune::codec::Descriptor evolving;
+    try {
+        evolving = rune::codec::deserialize(std::span<const uint8_t>(
+            latest->descriptorBlob.data(), latest->descriptorBlob.size()));
+    } catch (...) {
+        // The stored evolving blob must be well-formed (it was validated on the
+        // way in); a throw here is an internal invariant breach, not client error.
+        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kInternal);
+        return;
+    }
+    uint16_t       nextTag    = latest->nextTag;
+    const uint16_t newVersion = static_cast<uint16_t>(curVersion + 1);  // contiguous, computed ONCE
+    auto res = rune::codec::applyOps(evolving, *ops, nextTag, newVersion);
+    if (!res) {
+        // Surface the EvolveError as InvalidSchema (message available in res.error()).
+        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kInvalidSchema);
+        return;
+    }
+
+    // g. build the new durable TopicSchema (same id/partitions/validate/keyField;
+    //    NEW evolving descriptor + post-applyOps nextTag + effective compatMode).
+    TopicSchema ts;
+    ts.topicId        = topicId;
+    ts.version        = newVersion;
+    ts.partitionCount = latest->partitionCount;
+    ts.keyField       = latest->keyField;
+    ts.validate       = latest->validator.has_value();   // same as current
+    ts.descriptorBlob = rune::codec::serialize(*res);     // the NEW evolving descriptor
+    ts.nextTag        = nextTag;                           // advanced by applyOps
+    ts.compatMode     = mode;
+
+    const std::vector<uint8_t> payload = ts.serialize();
+    // Task 15b: composite (topicId, version) compaction key — see the matching
+    // comment at the DefineTopic append site in onCreateTopicReply above.
+    uint8_t keyBuf[6];
+    const uint32_t u = static_cast<uint32_t>(topicId);
+    keyBuf[0] = static_cast<uint8_t>(u & 0xff);
+    keyBuf[1] = static_cast<uint8_t>((u >> 8) & 0xff);
+    keyBuf[2] = static_cast<uint8_t>((u >> 16) & 0xff);
+    keyBuf[3] = static_cast<uint8_t>((u >> 24) & 0xff);
+    const uint16_t v = ts.version;
+    keyBuf[4] = static_cast<uint8_t>(v & 0xff);
+    keyBuf[5] = static_cast<uint8_t>((v >> 8) & 0xff);
+
+    const rune::replication::Offset base =
+        replica_->appendKeyed(std::span<const uint8_t>(keyBuf, 6),
+                              std::span<const uint8_t>(payload.data(), payload.size()),
+                              /*acksAll=*/true);
+    if (base < 0) {
+        // Gated (minIsr not met) → Internal; nothing committed, version unchanged.
+        deps_.respondAlter(msg.session, msg.corr, topicId, curVersion, kInternal);
+        return;
+    }
+
+    DdlOp op;
+    op.kind         = DdlKind::Alter;
+    op.alter        = std::move(msg);
+    op.topicId      = topicId;
+    op.newVersion   = newVersion;
+    op.alterSchema  = std::move(ts);
+    op.appendedBase = base;
+    op.appendedLast = base;   // single-record keyed batch → last == base
+    op.startedNs    = nowNs;
+    replica_->onLeaderLogAppended();  // reconcile LEO/HW + push to followers
+    inFlight_ = std::move(op);
+    state_    = DdlState::AwaitingCommit;
+}
+
 // ─── advance_ — AWAITING_COMMIT (HW gate) + timeout ──────────────────────────
 bool AdminWorker::advance_(int64_t nowNs) {
     if (state_ == DdlState::Idle || !inFlight_) return false;
 
     // Timeout guard (error path only — not a convergence gate).
     if (nowNs - inFlight_->startedNs > kDdlTimeoutNs) {
-        deps_.respondDefine(inFlight_->msg.session, inFlight_->msg.corr,
-                            -1, 0, kInternal);
+        if (inFlight_->kind == DdlKind::Alter)
+            deps_.respondAlter(inFlight_->alter.session, inFlight_->alter.corr,
+                               inFlight_->topicId, 0, kInternal);
+        else
+            deps_.respondDefine(inFlight_->msg.session, inFlight_->msg.corr,
+                                -1, 0, kInternal);
         inFlight_.reset();
         state_ = DdlState::Idle;
         return true;
@@ -213,22 +425,48 @@ bool AdminWorker::advance_(int64_t nowNs) {
     if (state_ == DdlState::AwaitingCommit) {
         if (!replica_) { inFlight_.reset(); state_ = DdlState::Idle; return true; }
         // D: true majority-durable — HW must cover the appended offset.
-        if (replica_->highWatermark() > inFlight_->appendedLast) {
-            // ── on-commit ── apply to registry, push validators, respond OK.
+        if (replica_->highWatermark() <= inFlight_->appendedLast) return false;
+
+        // ── ALTER on-commit ── apply the (pre-built, version computed ONCE in
+        //    startAlter_) record to the registry and respond OK.
+        if (inFlight_->kind == DdlKind::Alter) {
+            reg_.applyRecord(inFlight_->alterSchema);
+            // Task 12: fan out the evolved schema to the produce/consume workers
+            // (validator refresh for the new version) now that the worker side
+            // keys validators_ by (topicId, version) — each writer version gets
+            // its own Validator, so this never clobbers the still-live older
+            // version's validator.  byIdVersion (not byId/latest) pins exactly
+            // the version this ALTER just committed, independent of any later
+            // concurrent commit (single-threaded admin worker, but explicit).
+            if (inFlight_->alterSchema.validate) {
+                if (const RegistryEntry* entry =
+                        reg_.byIdVersion(inFlight_->topicId, inFlight_->newVersion))
+                    deps_.pushValidators(*entry, inFlight_->topicId);
+            }
+            deps_.respondAlter(inFlight_->alter.session, inFlight_->alter.corr,
+                               inFlight_->topicId, inFlight_->newVersion, kOK);
+            inFlight_.reset();
+            state_ = DdlState::Idle;
+            return true;
+        }
+
+        {
+            // ── CREATE on-commit ── apply to registry, push validators, respond OK.
             TopicSchema ts;
             ts.topicId        = inFlight_->topicId;
-            ts.version        = 1;
+            ts.version        = nextSchemaVersion_(inFlight_->topicId);
             ts.partitionCount = inFlight_->msg.partitionCount;
             ts.keyField       = inFlight_->msg.keyField;
             ts.validate       = inFlight_->msg.validate;
             ts.descriptorBlob = inFlight_->msg.blob;
+            ts.nextTag        = inFlight_->fieldCount;
             reg_.applyRecord(ts);
             if (inFlight_->msg.validate) {
                 if (const RegistryEntry* entry = reg_.byId(inFlight_->topicId))
                     deps_.pushValidators(*entry, inFlight_->topicId);
             }
             deps_.respondDefine(inFlight_->msg.session, inFlight_->msg.corr,
-                                inFlight_->topicId, 1, kOK);
+                                inFlight_->topicId, ts.version, kOK);
             inFlight_.reset();
             state_ = DdlState::Idle;
             return true;
@@ -239,6 +477,7 @@ bool AdminWorker::advance_(int64_t nowNs) {
 
 // ─── rebuildFromLog_ — C: replay [0, HW) into the registry on promotion ──────
 void AdminWorker::rebuildFromLog_() {
+    rebuildFailed_ = false;  // fresh attempt on every Follower→Leader edge
     if (!replica_) return;
     const rune::replication::Offset hw = replica_->highWatermark();
     if (hw <= 0) return;
@@ -260,12 +499,29 @@ void AdminWorker::rebuildFromLog_() {
             if (!reader.ensureValid()) break;
             const int32_t tl = reader.totalLength();
             if (tl <= 0 || static_cast<std::size_t>(tl) > rem) break;
-            reader.forEachRecord([this](std::string_view /*key*/, std::string_view val,
+            const rune::replication::Offset batchBase = reader.baseOffset();
+            reader.forEachRecord([this, batchBase](std::string_view /*key*/, std::string_view val,
                                   int64_t /*offset*/, int64_t /*ts*/) {
                 auto ts = TopicSchema::deserialize(std::span<const uint8_t>(
                     reinterpret_cast<const uint8_t*>(val.data()), val.size()));
-                if (ts) reg_.applyRecord(*ts);
+                if (ts) {
+                    reg_.applyRecord(*ts);
+                    return;
+                }
+                // FAIL LOUD (never a silent skip): SchemaRegistry stores
+                // versions in a per-topic deque indexed by (version-1); a
+                // silently-dropped record here would leave an UNDETECTED gap
+                // and serve wrong/missing schema versions after recovery.
+                rebuildFailed_ = true;
+                spdlog::critical(
+                    "AdminWorker: CORRUPT __topic_schemas record at batch "
+                    "baseOffset={} — TopicSchema::deserialize failed "
+                    "(truncated/corrupt payload). ABORTING rebuildFromLog_ "
+                    "rather than silently skipping it (would leave an "
+                    "undetected schema-version gap).",
+                    batchBase);
             });
+            if (rebuildFailed_) return;  // abort: no further batches applied
             const rune::replication::Offset bne =
                 reader.baseOffset() + reader.lastOffsetDelta() + 1;
             if (bne > lastBatchEnd) lastBatchEnd = bne;

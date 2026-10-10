@@ -55,6 +55,7 @@
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/codec/Descriptor.h>
+#include <rune/codec/Evolve.h>
 #include <rune/codec/Serialize.h>
 #include <rune/codec/Validator.h>
 
@@ -149,6 +150,20 @@ static std::vector<uint8_t> makeBatchWithValue(const std::vector<uint8_t>& recVa
     return b.build();
 }
 
+/// Build a record batch containing MULTIPLE records, one per entry of
+/// `values` -- used to simulate a producer that evolved mid-batch (GC3 /
+/// C51-55): a single RecordBatch whose records carry different schema
+/// versions.
+static std::vector<uint8_t> makeBatchWithValues(const std::vector<std::vector<uint8_t>>& values) {
+    RecordBatchBuilder b(0, /*baseTimestamp=*/1000);
+    std::string_view key{};
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        std::string_view val(reinterpret_cast<const char*>(values[i].data()), values[i].size());
+        b.append(key, val, 1000 + static_cast<int64_t>(i));
+    }
+    return b.build();
+}
+
 /// An EMPTY record value (too short to satisfy any descriptor).
 static std::vector<uint8_t> makeEmptyValue() { return {}; }
 
@@ -156,6 +171,42 @@ static std::vector<uint8_t> makeEmptyValue() { return {}; }
 static std::vector<uint8_t> makeTruncatedValue() {
     // blockLength=12, version=1, then only 3 bytes (too short for the 12-byte block).
     return {12, 0, 1, 0, 0xFF, 0xFF, 0xFF};
+}
+
+// ---------------------------------------------------------------------------
+// Task 12: an EVOLVING "people" descriptor —
+//   id    : Int64  (since v1, never retired)
+//   age   : Int32  (since v1, RETIRED at v2 — untilVersion=2)
+//   score : Int64  (since v2)
+// materializeAsOf(evolving, 1) == {id, age}  (blockLength 12).
+// materializeAsOf(evolving, 2) == {id, score} (blockLength 16).
+// ---------------------------------------------------------------------------
+static Descriptor makePeopleEvolvingDescriptor() {
+    return DescriptorBuilder("people", /*version=*/2)
+        .addTagged("id",    0, PrimType::Int64, /*since=*/1, /*until=*/0xFFFF, false, {})
+        .addTagged("age",   1, PrimType::Int32, /*since=*/1, /*until=*/2,      false, {})
+        .addTagged("score", 2, PrimType::Int64, /*since=*/2, /*until=*/0xFFFF, false, {})
+        .build();
+}
+
+/// A record whose fixed block is EXACTLY (blockLength, version, id, extra:i64-or-i32).
+/// `extraIsI64` selects whether the second fixed field is written as 8 bytes
+/// (the v2 "score" layout) or 4 bytes (the v1 "age" layout) — the caller picks
+/// `version` independently so a MISMATCHED (version, layout) pair can be built
+/// (the "dropped-age layout stamped as v2" regression case).
+static std::vector<uint8_t> makePeopleRecordValue(uint16_t version, int64_t id,
+                                                  int64_t extra, bool extraIsI64) {
+    std::vector<uint8_t> b;
+    auto le16 = [&](uint16_t v) { b.push_back(uint8_t(v)); b.push_back(uint8_t(v >> 8)); };
+    auto le32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) b.push_back(uint8_t(v >> (8*i))); };
+    auto le64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) b.push_back(uint8_t(v >> (8*i))); };
+    const uint16_t blockLength = extraIsI64 ? 16 : 12;   // id(8) + extra(8 or 4)
+    le16(blockLength);
+    le16(version);
+    le64(static_cast<uint64_t>(id));
+    if (extraIsI64) le64(static_cast<uint64_t>(extra));
+    else            le32(static_cast<uint32_t>(extra));
+    return b;
 }
 
 // ---------------------------------------------------------------------------
@@ -220,12 +271,16 @@ struct WorkerHarness {
         worker->setOwnedDirect(Worker::OwnedSet{replica.get()});
     }
 
-    /// Enqueue a SchemaUpdate op for the given topicId + descriptor blob.
+    /// Enqueue a SchemaUpdate op for the given topicId + descriptor blob,
+    /// installing a validator for `version` (Task 12; default 1 — every
+    /// pre-Task-12 test descriptor is version 1).
     void enqueueSchemaUpdate(int32_t topicId,
-                             const std::vector<uint8_t>& blob) {
+                             const std::vector<uint8_t>& blob,
+                             uint16_t version = 1) {
         WorkerOp op;
         op.type             = WorkerOp::Type::SchemaUpdate;
         op.topicId          = topicId;
+        op.clientVersion    = static_cast<int32_t>(version);   // Task 12 (see WorkerOp.h)
         op.schemaUpdateBlob = blob;
         ASSERT_TRUE(worker->tryEnqueueOp(std::move(op)))
             << "SchemaUpdate enqueue failed (ring full)";
@@ -400,6 +455,207 @@ TEST(ProduceValidation, SchemaUpdate_Regression_NoValidator_FallsThrough) {
         << "Log must advance when no validator is installed";
 }
 
+// ---------------------------------------------------------------------------
+// Task 12: version-keyed validators_ — a record validates against the
+// Validator matching ITS OWN writer version (bytes [2..3] of the record
+// value), never the topic's other installed version.
+// ---------------------------------------------------------------------------
+
+/// Install v1 (id+age) and v2 (id+score, age dropped) validators for the SAME
+/// topic.  A v1-stamped record (age layout) validates against v1; a
+/// v2-stamped record (score layout) validates against v2; a record stamped
+/// v2 but still carrying the RETIRED v1 (age) layout is rejected — the
+/// selection is by the record's OWN version, never a same-topic fallback.
+TEST(WorkerValidator, ValidatesRecordAgainstItsOwnSchemaVersion) {
+    WorkerHarness h;
+    const int32_t topicId = 1;
+
+    const Descriptor evolving = makePeopleEvolvingDescriptor();
+    const Descriptor v1 = rune::codec::materializeAsOf(evolving, 1);   // {id, age}
+    const Descriptor v2 = rune::codec::materializeAsOf(evolving, 2);   // {id, score}
+
+    h.enqueueSchemaUpdate(topicId, rune::codec::serialize(v1), /*version=*/1);
+    h.enqueueSchemaUpdate(topicId, rune::codec::serialize(v2), /*version=*/2);
+    h.tick();
+    ASSERT_TRUE(h.worker->hasValidatorForTest(topicId, /*version=*/1));
+    ASSERT_TRUE(h.worker->hasValidatorForTest(topicId, /*version=*/2));
+
+    // A v1 record (id + age, 12-byte block) stamped version=1 validates OK.
+    {
+        const int64_t leoBefore = h.log->logEndOffset();
+        auto batch = makeBatchWithValue(
+            makePeopleRecordValue(/*version=*/1, /*id=*/1, /*extra=*/30, /*extraIsI64=*/false));
+        h.enqueueProduceBatch(topicId, /*partition=*/0, std::move(batch));
+        h.tick();
+        EXPECT_EQ(h.lastErrorCode, static_cast<int16_t>(0))
+            << "a v1 record must validate against the v1 (id+age) validator";
+        EXPECT_GT(h.log->logEndOffset(), leoBefore);
+    }
+
+    // A v2 record (id + score, 16-byte block) stamped version=2 validates OK.
+    {
+        const int64_t leoBefore = h.log->logEndOffset();
+        auto batch = makeBatchWithValue(
+            makePeopleRecordValue(/*version=*/2, /*id=*/2, /*extra=*/99, /*extraIsI64=*/true));
+        h.enqueueProduceBatch(topicId, /*partition=*/0, std::move(batch));
+        h.tick();
+        EXPECT_EQ(h.lastErrorCode, static_cast<int16_t>(0))
+            << "a v2 record must validate against the v2 (id+score) validator";
+        EXPECT_GT(h.log->logEndOffset(), leoBefore);
+    }
+
+    // A record stamped version=2 but still carrying the RETIRED v1 (age,
+    // 12-byte block) layout is rejected — the v2 validator (blockLength=16)
+    // must NOT accept it, and the worker must NOT fall back to the v1
+    // validator just because it happens to be installed for the same topic.
+    {
+        const int64_t leoBefore = h.log->logEndOffset();
+        auto batch = makeBatchWithValue(
+            makePeopleRecordValue(/*version=*/2, /*id=*/3, /*extra=*/30, /*extraIsI64=*/false));
+        h.enqueueProduceBatch(topicId, /*partition=*/0, std::move(batch));
+        h.tick();
+        static constexpr int16_t kSchemaValidationFailed = 24;
+        EXPECT_EQ(h.lastErrorCode, kSchemaValidationFailed)
+            << "a v2-stamped record with the dropped-age v1 layout must be rejected";
+        EXPECT_EQ(h.log->logEndOffset(), leoBefore)
+            << "no append when the stamped version's own validator rejects the record";
+    }
+}
+
+// Regression: a record stamped with a version that has NO installed validator
+// (even though OTHER versions of the same topic DO have one) is rejected as
+// an unknown schema version — never validated against whichever version
+// happens to be installed.
+TEST(ProduceValidationRegression, UnknownSchemaVersionRejectedRegression) {
+    WorkerHarness h;
+    const int32_t topicId = 1;
+
+    // Only v1 is installed.
+    h.enqueueSchemaUpdate(topicId, rune::codec::serialize(makeCharactersDescriptor()),
+                         /*version=*/1);
+    h.tick();
+    ASSERT_TRUE(h.worker->hasValidatorForTest(topicId, /*version=*/1));
+    ASSERT_FALSE(h.worker->hasValidatorForTest(topicId, /*version=*/2));
+
+    const int64_t leoBefore = h.log->logEndOffset();
+
+    // A record stamped version=2 — no v2 validator was ever pushed.
+    std::vector<uint8_t> recVal = makeValidRecordValue(/*id=*/1, /*type=*/1, "Eve");
+    recVal[2] = 2; recVal[3] = 0;   // overwrite the version header field: 1 -> 2
+    auto batch = makeBatchWithValue(recVal);
+    h.enqueueProduceBatch(topicId, /*partition=*/0, std::move(batch));
+    h.tick();
+
+    static constexpr int16_t kSchemaValidationFailed = 24;
+    EXPECT_EQ(h.lastErrorCode, kSchemaValidationFailed)
+        << "an unknown schema version must be rejected, never validated against "
+           "whichever other version happens to be installed";
+    EXPECT_EQ(h.log->logEndOffset(), leoBefore)
+        << "no append for an unknown schema version";
+}
+
+// ---------------------------------------------------------------------------
+// GC3 (C51-55, N14-18): hot-path mixed-version batch -- a SINGLE RecordBatch
+// containing records of DIFFERENT writer versions (a producer that evolved
+// mid-batch, or a replay that stitches versions together). Each record must
+// be validated against its OWN stamped version's validator -- the per-record
+// (topicId, version) lookup in schemaRejects_ (Worker.h), never a single
+// topic-wide/latest validator.
+// ---------------------------------------------------------------------------
+TEST(ProduceValidation, MixedVersionBatch_Regression_EachRecordValidatesAgainstItsOwnVersion) {
+    WorkerHarness h;
+    const int32_t topicId = 1;
+
+    const Descriptor evolving = makePeopleEvolvingDescriptor();
+    const Descriptor v1 = rune::codec::materializeAsOf(evolving, 1);   // {id, age}
+    const Descriptor v2 = rune::codec::materializeAsOf(evolving, 2);   // {id, score}
+    h.enqueueSchemaUpdate(topicId, rune::codec::serialize(v1), /*version=*/1);
+    h.enqueueSchemaUpdate(topicId, rune::codec::serialize(v2), /*version=*/2);
+    h.tick();
+    ASSERT_TRUE(h.worker->hasValidatorForTest(topicId, 1));
+    ASSERT_TRUE(h.worker->hasValidatorForTest(topicId, 2));
+
+    // A single batch mixing a valid v1 record and a valid v2 record. No
+    // cross-version false reject: both are well-formed under their OWN
+    // stamped version, so the whole batch must be accepted and appended.
+    {
+        const int64_t leoBefore = h.log->logEndOffset();
+        auto v1rec = makePeopleRecordValue(/*version=*/1, /*id=*/1, /*extra=*/30, /*extraIsI64=*/false);
+        auto v2rec = makePeopleRecordValue(/*version=*/2, /*id=*/2, /*extra=*/99, /*extraIsI64=*/true);
+        auto batch = makeBatchWithValues({v1rec, v2rec});
+        h.enqueueProduceBatch(topicId, /*partition=*/0, std::move(batch));
+        h.tick();
+        EXPECT_EQ(h.lastErrorCode, static_cast<int16_t>(0))
+            << "a batch mixing valid v1 and v2 records must not be rejected";
+        EXPECT_EQ(h.log->logEndOffset(), leoBefore + 2)
+            << "both records of the mixed-version batch must be appended";
+    }
+
+    // Same batch shape, but the v2-stamped record carries the RETIRED v1
+    // (age) layout. The v-keyed lookup must catch THIS specific record even
+    // though the other (v1) record in the SAME batch is perfectly valid --
+    // proof the per-record version key is actually used, not a single
+    // version check hoisted for the whole batch. The batch is atomic: one
+    // bad record rejects the whole batch, nothing partially appends.
+    {
+        const int64_t leoBefore = h.log->logEndOffset();
+        auto v1rec   = makePeopleRecordValue(/*version=*/1, /*id=*/3, /*extra=*/31, /*extraIsI64=*/false);
+        auto badV2rec = makePeopleRecordValue(/*version=*/2, /*id=*/4, /*extra=*/32, /*extraIsI64=*/false);
+        auto batch = makeBatchWithValues({v1rec, badV2rec});
+        h.enqueueProduceBatch(topicId, /*partition=*/0, std::move(batch));
+        h.tick();
+        static constexpr int16_t kSchemaValidationFailed = 24;
+        EXPECT_EQ(h.lastErrorCode, kSchemaValidationFailed)
+            << "a mixed-version batch with one mis-versioned record must be rejected as a whole";
+        EXPECT_EQ(h.log->logEndOffset(), leoBefore)
+            << "no partial append -- batch validation is atomic";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GC3 (N9-13): forward-read at the worker. A worker has installed the
+// validator for vK ONLY (v(K+1)'s ALTER has not yet been fanned out to this
+// worker). It is handed a genuinely well-formed v(K+1) record -- a field
+// ("score") that was added AFTER vK. Per schemaRejects_ (Worker.h, the
+// per-record lookup keyed by the record's own stamped (topicId, version)):
+// an unknown version is a HARD REJECT ("unknown schema version") -- it is
+// NEVER validated against whichever OTHER version happens to be installed
+// for the same topic, even a strict-prefix older one. This matches (and
+// pins) the exact production behavior read from Worker.h's schemaRejects_.
+// ---------------------------------------------------------------------------
+TEST(ProduceValidationRegression, ForwardReadRecordNewerThanInstalledValidatorRejectedRegression) {
+    WorkerHarness h;
+    const int32_t topicId = 1;
+
+    const Descriptor evolving = makePeopleEvolvingDescriptor();
+    const Descriptor v1 = rune::codec::materializeAsOf(evolving, 1);   // {id, age}
+
+    // Only v1 is installed -- the worker has not received v2's (id+score)
+    // validator fan-out yet.
+    h.enqueueSchemaUpdate(topicId, rune::codec::serialize(v1), /*version=*/1);
+    h.tick();
+    ASSERT_TRUE(h.worker->hasValidatorForTest(topicId, 1));
+    ASSERT_FALSE(h.worker->hasValidatorForTest(topicId, 2));
+
+    const int64_t leoBefore = h.log->logEndOffset();
+
+    // A record stamped v2, using v2's OWN (id+score, 16-byte) layout -- a
+    // genuinely well-formed v2 record; it simply arrives at a worker that
+    // doesn't know v2 yet.
+    auto batch = makeBatchWithValue(
+        makePeopleRecordValue(/*version=*/2, /*id=*/9, /*extra=*/42, /*extraIsI64=*/true));
+    h.enqueueProduceBatch(topicId, /*partition=*/0, std::move(batch));
+    h.tick();
+
+    static constexpr int16_t kSchemaValidationFailed = 24;
+    EXPECT_EQ(h.lastErrorCode, kSchemaValidationFailed)
+        << "forward-read: a well-formed v2 record at a worker with only the v1 validator "
+           "installed must be rejected as an unknown schema version, never accepted or "
+           "mis-validated against the v1 validator";
+    EXPECT_EQ(h.log->logEndOffset(), leoBefore)
+        << "no append for a record whose stamped version has no installed validator";
+}
+
 } // namespace
 // ===========================================================================
 // F3 round 6, item 3: CONFIRMED data race fix.  The AdminWorker (ADMIN thread)
@@ -443,7 +699,7 @@ TEST(ProduceValidationRegression, SchemaUpdateEnqueuedOnlyByControlThreadRegress
     std::thread::id adminId, controlId;
     std::thread admin([&] {
         adminId = std::this_thread::get_id();
-        for (int t = 0; t < kTopics; ++t) agent.postSchemaUpdate(100 + t, blob);
+        for (int t = 0; t < kTopics; ++t) agent.postSchemaUpdate(100 + t, /*version=*/1, blob);
         while (agent.schemaBacklogForTest() != 0) agent.flushSchemaBacklogForTest();
     });
     std::thread control([&] {
@@ -456,7 +712,7 @@ TEST(ProduceValidationRegression, SchemaUpdateEnqueuedOnlyByControlThreadRegress
                 ASSERT_EQ(tid, rune::node::kA2cSchemaUpdate);
                 const auto m = rune::node::decodeSchemaUpdate(
                     reinterpret_cast<const uint8_t*>(b.buffer() + off), static_cast<std::size_t>(len));
-                fanout.post(m.topicId, m.blob);
+                fanout.post(m.topicId, m.version, m.blob);
             }, 16);
             (void)fanout.pump(pool);
             if (received == kTopics && fanout.pendingForTest() == 0) break;
@@ -513,7 +769,7 @@ TEST(ProduceValidationRegression, SchemaFanoutRetriesOnFullDropsTooLargeRegressi
         op.recordBatchBytes.assign(blob.size(), 0x1);
         if (!pool.worker(0).tryEnqueueOp(std::move(op))) break;
     }
-    fanout.post(7, blob);
+    fanout.post(7, /*version=*/1, blob);
     (void)fanout.pump(pool);
     EXPECT_EQ(fanout.pendingForTest(), 1u) << "ring full → kept pending (retry), not dropped";
     auto drainWorker = [&] {   // bounded: the ring holds a finite number of ops
@@ -528,7 +784,7 @@ TEST(ProduceValidationRegression, SchemaFanoutRetriesOnFullDropsTooLargeRegressi
     drainWorker();
     EXPECT_TRUE(pool.worker(0).hasValidatorForTest(7));
 
-    fanout.post(8, std::vector<uint8_t>(pool.maxIngressTail() + 1, 0x2));
+    fanout.post(8, /*version=*/1, std::vector<uint8_t>(pool.maxIngressTail() + 1, 0x2));
     (void)fanout.pump(pool);
     EXPECT_EQ(fanout.pendingForTest(), 0u) << "TooLarge is dropped (error names the size)";
     EXPECT_EQ(fanout.tooLargeDropsForTest(), 1u);
@@ -579,7 +835,7 @@ TEST(ProduceValidationRegression, MaxDescriptorFitsBothAdminRingsRegression) {
     rune::node::DefineTopicMsg m;
     m.blob.assign(rune::node::kMaxDescriptorViaRequestRing, 0x5A);
     EXPECT_TRUE(rune::node::encodeDefineTopic(request, m));
-    EXPECT_TRUE(rune::node::encodeSchemaUpdate(a2c, 1, m.blob))
+    EXPECT_TRUE(rune::node::encodeSchemaUpdate(a2c, 1, /*version=*/1, m.blob))
         << "a descriptor accepted by the request ring must fit the admin->control ring";
 }
 

@@ -54,6 +54,7 @@ enum : int32_t {
     kMsgCreateTopicReply  = 4,
     kMsgAdminRole         = 5,
     kMsgEgressFrame       = 6,   // admin → control: [sessionId:i64][response frame]
+    kMsgAlterTopic        = 7,   // gateway → admin: ALTER TOPIC (Task 11)
 };
 
 // ---------------------------------------------------------------------------
@@ -109,12 +110,34 @@ struct DefineTopicMsg {
 };
 
 // ---------------------------------------------------------------------------
+// AlterTopic request (gateway → admin).  Owning form after drain (Task 11).
+// Carries the client's CAS expectation (expectedVersion; 0 = don't check) and
+// the opaque ALTER ops blob (rune::codec::encodeAlterOps wire format) that the
+// admin thread decodes + applies against the topic's current evolving schema.
+// ---------------------------------------------------------------------------
+struct AlterTopicMsg {
+    int64_t              session         = 0;
+    int64_t              corr            = 0;
+    uint16_t             expectedVersion = 0;   // 0 = unconditional (no CAS)
+    std::string          topicName;
+    std::vector<uint8_t> opsBlob;               // encodeAlterOps() wire bytes
+};
+
+// ---------------------------------------------------------------------------
 // GetSchema request (gateway → admin).  Owning form after drain.
+//
+// requestedFingerprint (Task 13): 0 = latest (AdminWorker resolves via
+// reg_.latest); non-zero = resolve the SPECIFIC version whose per-version
+// fingerprint matches (reg_.byFingerprint) — lets a typed client fetch the
+// older descriptor it was compiled against.  Appended as the LAST member so
+// existing 3-arg aggregate inits (`GetSchemaMsg{session, corr, name}`) still
+// compile and default to 0 (latest).
 // ---------------------------------------------------------------------------
 struct GetSchemaMsg {
     int64_t     session = 0;
     int64_t     corr    = 0;
     std::string name;
+    uint64_t    requestedFingerprint = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -200,15 +223,56 @@ inline DefineTopicMsg decodeDefineTopic(const uint8_t* buf, std::size_t len) {
     return m;
 }
 
+// ---- AlterTopic (Task 11) ----
+inline bool encodeAlterTopic(OneToOneByteRing& ring, const AlterTopicMsg& m) {
+    using namespace admin_wire;
+    const std::size_t len = 8 + 8 + 2
+                          + 2 + m.topicName.size()
+                          + 4 + m.opsBlob.size();
+    const auto idx = ring.tryClaim(kMsgAlterTopic, len);
+    if (idx < 0) return false;
+    uint8_t* p = ring.base() + idx;
+    putI64(p, m.session);         p += 8;
+    putI64(p, m.corr);            p += 8;
+    putU16(p, m.expectedVersion); p += 2;
+    putU16(p, static_cast<uint16_t>(m.topicName.size())); p += 2;
+    std::memcpy(p, m.topicName.data(), m.topicName.size()); p += m.topicName.size();
+    putI32(p, static_cast<int32_t>(m.opsBlob.size())); p += 4;
+    if (!m.opsBlob.empty()) std::memcpy(p, m.opsBlob.data(), m.opsBlob.size());
+    ring.commit(idx);
+    return true;
+}
+
+inline AlterTopicMsg decodeAlterTopic(const uint8_t* buf, std::size_t len) {
+    using namespace admin_wire;
+    AlterTopicMsg m;
+    std::size_t pos = 0;
+    if (len < 20) return m;  // session(8)+corr(8)+expectedVersion(2)+nameLen(2)
+    m.session = getI64(buf + pos); pos += 8;
+    m.corr    = getI64(buf + pos); pos += 8;
+    m.expectedVersion = getU16(buf + pos); pos += 2;
+    const uint16_t nl = getU16(buf + pos); pos += 2;
+    if (pos + nl > len) return m;
+    m.topicName.assign(reinterpret_cast<const char*>(buf + pos), nl); pos += nl;
+    if (pos + 4 > len) return m;
+    const int32_t bl = getI32(buf + pos); pos += 4;
+    if (bl > 0 && pos + static_cast<std::size_t>(bl) <= len)
+        m.opsBlob.assign(buf + pos, buf + pos + bl);
+    return m;
+}
+
 // ---- GetSchema ----
+// Wire layout: session:i64, corr:i64, requestedFingerprint:u64 (0=latest),
+// nameLen:u16 + name bytes.
 inline bool encodeGetSchema(OneToOneByteRing& ring, const GetSchemaMsg& m) {
     using namespace admin_wire;
-    const std::size_t len = 8 + 8 + 2 + m.name.size();
+    const std::size_t len = 8 + 8 + 8 + 2 + m.name.size();
     const auto idx = ring.tryClaim(kMsgGetSchema, len);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
     putI64(p, m.session); p += 8;
     putI64(p, m.corr);    p += 8;
+    putI64(p, static_cast<int64_t>(m.requestedFingerprint)); p += 8;
     putU16(p, static_cast<uint16_t>(m.name.size())); p += 2;
     std::memcpy(p, m.name.data(), m.name.size());
     ring.commit(idx);
@@ -218,12 +282,13 @@ inline bool encodeGetSchema(OneToOneByteRing& ring, const GetSchemaMsg& m) {
 inline GetSchemaMsg decodeGetSchema(const uint8_t* buf, std::size_t len) {
     using namespace admin_wire;
     GetSchemaMsg m;
-    if (len < 18) return m;
+    if (len < 26) return m;
     m.session = getI64(buf);
     m.corr    = getI64(buf + 8);
-    const uint16_t nl = getU16(buf + 16);
-    if (18 + static_cast<std::size_t>(nl) <= len)
-        m.name.assign(reinterpret_cast<const char*>(buf + 18), nl);
+    m.requestedFingerprint = static_cast<uint64_t>(getI64(buf + 16));
+    const uint16_t nl = getU16(buf + 24);
+    if (26 + static_cast<std::size_t>(nl) <= len)
+        m.name.assign(reinterpret_cast<const char*>(buf + 26), nl);
     return m;
 }
 
@@ -300,25 +365,29 @@ inline AdminRoleMsg decodeAdminRole(const uint8_t* buf, std::size_t len) {
     return m;
 }
 
-// ---- SchemaUpdate (admin → control; F3 round 6, item 3) ----
+// ---- SchemaUpdate (admin → control; F3 round 6, item 3; Task 12: +version) ----
 struct SchemaUpdateMsg {
     int32_t              topicId = -1;
+    uint16_t              version = 0;
     std::vector<uint8_t> blob;
 };
 
 /// Wire size of a SchemaUpdate message for `blobLen` descriptor bytes.
+/// Layout: [topicId:i32][version:u16][blob...].
 [[nodiscard]] inline constexpr std::size_t schemaUpdateWireLen(std::size_t blobLen) noexcept {
-    return 4 + blobLen;
+    return 4 + 2 + blobLen;
 }
 
-inline bool encodeSchemaUpdate(OneToOneByteRing& ring, int32_t topicId,
+inline bool encodeSchemaUpdate(OneToOneByteRing& ring, int32_t topicId, uint16_t version,
                                std::span<const uint8_t> blob) {
     using namespace admin_wire;
     const auto idx = ring.tryClaim(kA2cSchemaUpdate, schemaUpdateWireLen(blob.size()));
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
     putI32(p, topicId);
-    if (!blob.empty()) std::memcpy(p + 4, blob.data(), blob.size());
+    p[4] = static_cast<uint8_t>(version & 0xff);
+    p[5] = static_cast<uint8_t>((version >> 8) & 0xff);
+    if (!blob.empty()) std::memcpy(p + 6, blob.data(), blob.size());
     ring.commit(idx);
     return true;
 }
@@ -326,9 +395,10 @@ inline bool encodeSchemaUpdate(OneToOneByteRing& ring, int32_t topicId,
 inline SchemaUpdateMsg decodeSchemaUpdate(const uint8_t* buf, std::size_t len) {
     using namespace admin_wire;
     SchemaUpdateMsg m;
-    if (len < 4) return m;
+    if (len < 6) return m;
     m.topicId = getI32(buf);
-    m.blob.assign(buf + 4, buf + len);
+    m.version = static_cast<uint16_t>(buf[4]) | (static_cast<uint16_t>(buf[5]) << 8);
+    m.blob.assign(buf + 6, buf + len);
     return m;
 }
 
@@ -366,7 +436,7 @@ A2cDispatch dispatchAdminToControl(int32_t typeId, const uint8_t* p, std::size_t
         return A2cDispatch::StorageFailure;
     }
     case kA2cSchemaUpdate:
-        if (n < 4) return A2cDispatch::Malformed;
+        if (n < 6) return A2cDispatch::Malformed;
         onSchemaUpdate(decodeSchemaUpdate(p, n));
         return A2cDispatch::SchemaUpdate;
     default:

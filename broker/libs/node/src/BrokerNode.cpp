@@ -33,6 +33,7 @@
 // Task 6: AdminWorker + SchemaRegistry + __topic_schemas persistence.
 #include <rune/node/AdminWorker.h>
 #include <rune/node/SchemaRegistry.h>
+#include <rune/codec/Serialize.h>
 // Task 6: RecordBatch reader for rebuildFromLog (same as TxnStateStore).
 #include <rune/protocol/RecordBatch.h>
 // Task 8a: protocol response frames for DDL egress (respondDefine/respondGet).
@@ -2943,6 +2944,14 @@ void BrokerNode::buildAdminWorker() {
             if (hw > 0) {
                 static constexpr int32_t kChunkBytes = 64 * 1024 * 1024;
                 rune::replication::Offset fetchOffset = 0;
+                // Fail-loud regression fix (mirrors AdminWorker::rebuildFromLog_):
+                // a corrupt/truncated TopicSchema record here would previously be
+                // SILENTLY SKIPPED, leaving an UNDETECTED version gap in
+                // SchemaRegistry's per-topic deque (indexed by version-1) — and
+                // this boot replay is the PRIMARY schema-recovery path, hit on
+                // every single boot. Abort the replay loudly instead.
+                bool bootReplayFailed = false;
+                rune::replication::Offset failedBatchBase = 0;
                 while (fetchOffset < hw) {
                     std::vector<uint8_t> data = schemaReplicaRaw->read(fetchOffset, kChunkBytes);
                     if (data.empty()) break;
@@ -2964,8 +2973,10 @@ void BrokerNode::buildAdminWorker() {
                         const int32_t tl = reader.totalLength();
                         if (tl <= 0 || static_cast<std::size_t>(tl) > remaining) break;
 
+                        const rune::replication::Offset batchBase = reader.baseOffset();
                         // Each record: key=topicId(4 bytes LE), value=TopicSchema payload.
-                        reader.forEachRecord([this](std::string_view /*key*/,
+                        reader.forEachRecord([this, nodeId, batchBase, &bootReplayFailed,
+                                              &failedBatchBase](std::string_view /*key*/,
                                               std::string_view val,
                                               int64_t /*offset*/,
                                               int64_t /*ts*/) {
@@ -2975,8 +2986,20 @@ void BrokerNode::buildAdminWorker() {
                                     val.size()));
                             if (ts) {
                                 schemaRegistry_->applyRecord(*ts);
+                                return;
                             }
+                            bootReplayFailed = true;
+                            failedBatchBase  = batchBase;
+                            spdlog::critical(
+                                "BrokerNode[{}]: CORRUPT __topic_schemas record at "
+                                "batch baseOffset={} — TopicSchema::deserialize "
+                                "failed during BOOT replay (truncated/corrupt "
+                                "payload). ABORTING the replay rather than silently "
+                                "skipping it (would leave an undetected schema-"
+                                "version gap on the PRIMARY recovery path).",
+                                nodeId, batchBase);
                         });
+                        if (bootReplayFailed) break;  // abort: inner (per-chunk) loop
 
                         const rune::replication::Offset batchNextOffset =
                             reader.baseOffset() + reader.lastOffsetDelta() + 1;
@@ -2985,9 +3008,19 @@ void BrokerNode::buildAdminWorker() {
 
                         pos += static_cast<std::size_t>(tl);
                     }
+                    if (bootReplayFailed) break;  // abort: outer (chunk-fetch) loop
 
                     if (lastBatchEnd <= fetchOffset) break;
                     fetchOffset = lastBatchEnd;
+                }
+                if (bootReplayFailed) {
+                    throw std::runtime_error(
+                        "BrokerNode[" + std::to_string(nodeId) + "]: __topic_schemas "
+                        "boot replay found a corrupt/truncated record at batch "
+                        "baseOffset=" + std::to_string(failedBatchBase) +
+                        " — refusing to silently continue with a possibly-"
+                        "incomplete SchemaRegistry (caught below: schema DDL will "
+                        "not work, same as any other AdminWorker setup failure)");
                 }
                 spdlog::info(
                     "BrokerNode[{}]: __topic_schemas rebuilt from log ({} entries, hw={})",
@@ -3027,7 +3060,16 @@ void BrokerNode::buildAdminWorker() {
         // retry-on-full (each worker builds its Validator on ITS OWN thread).
         deps.pushValidators = [this](const RegistryEntry& entry, int32_t topicId) {
             if (!adminWorkerAgent_) return;
-            adminWorkerAgent_->postSchemaUpdate(topicId, entry.descriptorBlob);
+            // Task 12: fan out the PER-VERSION MATERIALIZED descriptor.
+            // entry.descriptor is already materializeAsOf(evolving, entry.version)
+            // (SchemaRegistry::applyRecord) — i.e. exactly the live field set a
+            // record written at entry.version was encoded with.  entry.descriptorBlob
+            // is the raw CUMULATIVE evolving descriptor (every field ever declared,
+            // live or retired) and must never be sent as-is: a worker building a
+            // Validator from it would validate against the WRONG (latest-evolving)
+            // layout for any version older than the current one.
+            adminWorkerAgent_->postSchemaUpdate(topicId, entry.version,
+                                                rune::codec::serialize(entry.descriptor));
         };
 
         // respondDefine / respondGet (RULING-2 F): encode the protocol response
@@ -3047,6 +3089,28 @@ void BrokerNode::buildAdminWorker() {
             resp.version       = version;
             resp.errorCode     = errorCode;
             uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::DefineTopicResponse::BODY_FIXED];
+            const std::size_t n = resp.encode(frame);
+            auto& ring = adminWorkerAgent_->egressRing();
+            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + n);
+            if (idx < 0) return;  // ring full — DDL response dropped (rare); client retries
+            uint8_t* p = ring.base() + idx;
+            std::memcpy(p, &session, 8);
+            std::memcpy(p + 8, frame, n);
+            ring.commit(idx);
+        };
+        // respondAlter (Task 11): encode the AlterTopicResponse frame and push it
+        // on egressRing_ exactly like respondDefine (same single-writer egress path).
+        deps.respondAlter = [this](int64_t session, int64_t corr, int32_t topicId,
+                                   uint16_t newVersion, uint16_t errorCode) {
+            if (!adminWorkerAgent_) return;
+            namespace pc = rune::protocol::client;
+            pc::AlterTopicResponse resp;
+            resp.sessionId     = session;
+            resp.correlationId = corr;
+            resp.topicId       = topicId;
+            resp.newVersion    = newVersion;
+            resp.errorCode     = errorCode;
+            uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::AlterTopicResponse::BODY_FIXED];
             const std::size_t n = resp.encode(frame);
             auto& ring = adminWorkerAgent_->egressRing();
             const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + n);
@@ -3409,7 +3473,7 @@ int BrokerNode::serviceAdminControl_() {
                     onStorageFailure_(std::string(dir), e);
                 },
                 [this](SchemaUpdateMsg m) {
-                    schemaFanout_.post(m.topicId, std::move(m.blob));
+                    schemaFanout_.post(m.topicId, m.version, std::move(m.blob));
                 });
             if ((d == A2cDispatch::Unknown || d == A2cDispatch::Malformed) &&
                 adminToControlRejects_++ % 1024 == 0) [[unlikely]] {

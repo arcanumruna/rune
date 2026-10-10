@@ -14,7 +14,9 @@
 #include <rune/storage/Log.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
+#include <rune/codec/AlterOps.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -63,6 +65,11 @@ struct Harness {
     int32_t lastTopicId = -1;
     uint16_t lastErr = 0xffff;
     int getCount = 0;
+    // ALTER response capture (Task 11).
+    int      alterResponses  = 0;
+    uint16_t lastAlterErr     = 0xffff;
+    uint16_t lastAlterVersion = 0;
+    int32_t  lastAlterTopicId = -1;
     // Pending createTopic request (ticket, partitionCount) awaiting a reply.
     int64_t pendingTicket = -1;
     bool    failCreate = false;
@@ -90,6 +97,9 @@ struct Harness {
         };
         d.respondGet = [this](int64_t,int64_t,int32_t,uint16_t,const std::vector<uint8_t>&,uint16_t e) {
             ++getCount; lastErr = e;
+        };
+        d.respondAlter = [this](int64_t,int64_t,int32_t tid,uint16_t v,uint16_t e) {
+            ++alterResponses; lastAlterTopicId = tid; lastAlterVersion = v; lastAlterErr = e;
         };
         w = std::make_unique<AdminWorker>(reg, replica.get(), 1,
                                           std::vector<int32_t>{1}, std::move(d));
@@ -124,7 +134,35 @@ struct Harness {
             }
         }
     }
+
+    // Drive one ALTER to completion.  ALTER skips the createTopic round-trip, so
+    // we just submit and pump doWork() until the single-node HW gate resolves.
+    void runAlter(int64_t session, int64_t corr, const std::string& name,
+                  uint16_t expectedVersion, std::vector<uint8_t> opsBlob) {
+        AlterTopicMsg m;
+        m.session = session; m.corr = corr; m.topicName = name;
+        m.expectedVersion = expectedVersion; m.opsBlob = std::move(opsBlob);
+        w->submitAlterTopic(std::move(m));
+        int64_t nowNs = 0;
+        for (int i = 0; i < 50; ++i) { nowNs += 1'000'000LL; w->doWork(nowNs); }
+    }
 };
+
+// Build an ALTER ops blob (shared rune-ql/broker wire format) from `ops`.
+std::vector<uint8_t> opsBlob(const std::vector<AlterOp>& ops) {
+    return encodeAlterOps(ops);
+}
+
+AlterOp addOp(const std::string& name, PrimType t) {
+    AlterOp op{}; op.type = AlterOpType::Add; op.name = name; op.primType = t; op.fixedLen = 0;
+    return op;
+}
+AlterOp dropOp(const std::string& name) {
+    AlterOp op{}; op.type = AlterOpType::Drop; op.name = name; return op;
+}
+AlterOp setCompatOp(CompatMode m) {
+    AlterOp op{}; op.type = AlterOpType::SetCompatibility; op.mode = m; return op;
+}
 
 } // namespace
 
@@ -204,4 +242,134 @@ TEST(AdminWorkerRegression, FollowerRejectsDefine) {
     h.runDefine(1,2,"characters","userId",16,false,charsBlob());
     EXPECT_EQ(h.lastErr,6);                          // Internal (not leader)
     EXPECT_EQ(h.creates,0);
+}
+
+// Regression (Task 10): the create path must route version/nextTag through a
+// single contiguous-version helper rather than a hardcoded literal. A freshly
+// defined topic is still version 1 (no behavior change), and nextTag starts
+// past every field the schema already declares (fieldCount) so Task 11's
+// ALTER allocates a fresh tag instead of colliding with an existing one.
+TEST(AdminWorkerRegression, DefineTopicVersionOneAndNextTagEqualsFieldCount) {
+    Harness h;
+    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
+    ASSERT_EQ(h.lastErr,0);
+    EXPECT_EQ(h.lastTopicId, 0);
+    const RegistryEntry* e = h.reg.byName("characters");
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(e->version, 1);
+    // charsBlob(): id, userId, name == 3 fields.
+    EXPECT_EQ(h.reg.nextTagFor(e->topicId), 3);
+}
+
+// ── Task 11: ALTER TOPIC ─────────────────────────────────────────────────────
+
+// Happy path: ADD a column bumps the version contiguously (v1 → v2) and the new
+// field is allocated a fresh durable tag == the pre-ALTER field count (3).
+TEST(AdminWorker, AlterAddColumnBumpsVersionAndAllocatesTag) {
+    Harness h;
+    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
+    ASSERT_EQ(h.lastErr,0);
+    const int32_t tid = h.reg.byName("characters")->topicId;
+
+    h.runAlter(10,11,"characters",/*expected=*/0, opsBlob({addOp("score",PrimType::Int64)}));
+    EXPECT_EQ(h.lastAlterErr, 0);
+    EXPECT_EQ(h.lastAlterVersion, 2);
+
+    const RegistryEntry* e = h.reg.byName("characters");
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(e->version, 2);
+    // nextTag advanced past the newly allocated tag (3 → 4).
+    EXPECT_EQ(h.reg.nextTagFor(tid), 4);
+    // The new field is live at v2 and carries durable tag 3 (== old fieldCount).
+    const auto& fields = e->descriptor.fields;
+    auto it = std::find_if(fields.begin(), fields.end(),
+                           [](const auto& f){ return f.name == "score"; });
+    ASSERT_NE(it, fields.end());
+    EXPECT_EQ(it->id, 3);
+}
+
+// Regression (compat gate): DROP under FORWARD compatibility is rejected with
+// SchemaIncompatible and the version is NOT bumped.  Also pins that the compat
+// mode set by a prior ALTER persists into the next ALTER's gate.
+TEST(AdminWorkerRegression, AlterDropUnderForwardRejected) {
+    Harness h;
+    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
+    ASSERT_EQ(h.lastErr,0);
+
+    // ALTER #1: switch to FORWARD compatibility → v2.
+    h.runAlter(10,11,"characters",0, opsBlob({setCompatOp(CompatMode::Forward)}));
+    ASSERT_EQ(h.lastAlterErr, 0);
+    ASSERT_EQ(h.reg.byName("characters")->version, 2);
+
+    // ALTER #2: DROP a live field under the now-persisted FORWARD mode → reject.
+    h.runAlter(12,13,"characters",0, opsBlob({dropOp("name")}));
+    EXPECT_EQ(h.lastAlterErr, 30);                       // SchemaIncompatible
+    EXPECT_EQ(h.reg.byName("characters")->version, 2);   // version unchanged
+}
+
+// Regression (optimistic CAS): a stale expectedVersion must be rejected with
+// SchemaConflict and must NOT clobber the newer committed version (no lost update).
+TEST(AdminWorkerRegression, AlterWithStaleExpectedVersionConflicts) {
+    Harness h;
+    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
+    ASSERT_EQ(h.lastErr,0);
+
+    // Unconditional ALTER → v2.
+    h.runAlter(10,11,"characters",0, opsBlob({addOp("score",PrimType::Int64)}));
+    ASSERT_EQ(h.lastAlterErr, 0);
+    ASSERT_EQ(h.reg.byName("characters")->version, 2);
+
+    // Now a client that still thinks the topic is v1 tries to ALTER with
+    // expectedVersion=1 → stale → SchemaConflict, registry stays v2.
+    h.runAlter(12,13,"characters",/*expected=*/1, opsBlob({addOp("extra",PrimType::Int64)}));
+    EXPECT_EQ(h.lastAlterErr, 31);                       // SchemaConflict
+    EXPECT_EQ(h.lastAlterVersion, 2);                    // response carries current version
+    EXPECT_EQ(h.reg.byName("characters")->version, 2);   // no lost update
+}
+
+// Regression (atomicity): a multi-op ALTER where a later op fails rejects the
+// WHOLE statement — nothing is committed and the version is not bumped.
+TEST(AdminWorkerRegression, MultiOpAlterIsAtomicOnFailure) {
+    Harness h;
+    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
+    ASSERT_EQ(h.lastErr,0);
+    const int32_t tid = h.reg.byName("characters")->topicId;
+
+    // ADD (valid) then DROP a field that does not exist → applyOps fails on the
+    // DROP, so the ADD is rolled back too (atomic).
+    h.runAlter(10,11,"characters",0,
+               opsBlob({addOp("score",PrimType::Int64), dropOp("ghost")}));
+    EXPECT_EQ(h.lastAlterErr, 23);                       // InvalidSchema
+    EXPECT_EQ(h.reg.byName("characters")->version, 1);   // version unchanged
+    EXPECT_EQ(h.reg.nextTagFor(tid), 3);                 // no tag burned
+}
+
+// Task 12 regression: AdminWorker::advance_'s ALTER-commit seam must push the
+// freshly-committed version's validator (validate=true) — not just DefineTopic
+// — so worker validators_ stays in sync with every committed ALTER.
+TEST(AdminWorkerRegression, AlterPushesValidatorForNewVersionWhenValidateOnRegression) {
+    Harness h;
+    h.runDefine(1,2,"characters","userId",16,/*validate=*/true,charsBlob());
+    ASSERT_EQ(h.lastErr,0);
+    EXPECT_EQ(h.pushes, 1);                               // CREATE pushed v1
+
+    h.runAlter(10,11,"characters",0, opsBlob({addOp("score",PrimType::Int64)}));
+    EXPECT_EQ(h.lastAlterErr, 0);
+    EXPECT_EQ(h.lastAlterVersion, 2);
+    EXPECT_EQ(h.pushes, 2)
+        << "ALTER must ALSO push a validator for the newly committed version";
+}
+
+// Task 12 regression: an ALTER on a validate=false topic must NOT push a
+// validator (no validator was ever installed for v1 either — nothing to
+// refresh).
+TEST(AdminWorkerRegression, AlterDoesNotPushValidatorWhenValidateOffRegression) {
+    Harness h;
+    h.runDefine(1,2,"characters","userId",16,/*validate=*/false,charsBlob());
+    ASSERT_EQ(h.lastErr,0);
+    EXPECT_EQ(h.pushes, 0);
+
+    h.runAlter(10,11,"characters",0, opsBlob({addOp("score",PrimType::Int64)}));
+    EXPECT_EQ(h.lastAlterErr, 0);
+    EXPECT_EQ(h.pushes, 0);
 }

@@ -978,6 +978,7 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::EndTxn:
         case pc::TemplateId::DefineTopic:
         case pc::TemplateId::GetTopicSchema:
+        case pc::TemplateId::AlterTopic:
             if (const auto hdr = pc::MessageHeader::decode(buf, len)) {
                 sessions_.touch(hdr->sessionId, nowNs_);
             }
@@ -1043,6 +1044,9 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
             break;
         case pc::TemplateId::GetTopicSchema:
             handleGetTopicSchema(buf, len);
+            break;
+        case pc::TemplateId::AlterTopic:
+            handleAlterTopic(buf, len);
             break;
         default:
             // ConnectResponse, ErrorResponse, Pong, MetadataResponse (broker→client),
@@ -5644,7 +5648,45 @@ void ClientGateway::handleGetTopicSchema(const uint8_t* buf, std::size_t len)
         spdlog::debug("ClientGateway: GetTopicSchema for unknown sessionId={} — dropped", m.sessionId);
         return;
     }
-    (void)adminSink_->submitGetSchema(m.sessionId, m.correlationId, m.topicName);
+    (void)adminSink_->submitGetSchema(m.sessionId, m.correlationId, m.topicName,
+                                      m.requestedFingerprint);
+}
+
+// ---------------------------------------------------------------------------
+// Task 14: handleAlterTopic (RULING-2 F) — route AlterTopic (68) to the admin
+// sink via a ring hand-off (same discipline as handleDefineTopic/
+// handleGetTopicSchema).  Validate + require known session + decode, then
+// copy the fields into the sink and RETURN immediately.  NO registry access,
+// NO blocking on the gateway hot path — a stalled AdminWorker never delays
+// produce.  The AlterTopicResponse (69) is produced asynchronously on the
+// session egress via the admin→control egress ring (respondAlter, Task 11).
+// ---------------------------------------------------------------------------
+void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
+{
+    if (!adminSink_) {
+        spdlog::debug("ClientGateway: AlterTopic received but adminSink_ not set — dropped");
+        return;
+    }
+    auto msgOpt = pc::AlterTopic::decode(buf, len);
+    if (!msgOpt) {
+        spdlog::debug("ClientGateway: AlterTopic decode failed — dropped");
+        return;
+    }
+    const pc::AlterTopic& m = *msgOpt;
+
+    // Require a known session (mirror handleDefineTopic).
+    Session* session = sessions_.find(m.sessionId);
+    if (!session) {
+        spdlog::debug("ClientGateway: AlterTopic for unknown sessionId={} — dropped", m.sessionId);
+        return;
+    }
+
+    // Copy-and-return: the sink OWNS the copied bytes (topicName/opsBlob views
+    // point into the ingress buffer and are copied by the sink before return).
+    (void)adminSink_->submitAlterTopic(m.sessionId, m.correlationId, m.topicName,
+                                       m.expectedVersion, m.opsBlob, m.opsLen);
+    // Return immediately — the AdminWorker produces the AlterTopicResponse
+    // asynchronously on the session egress (via the admin→control egress ring).
 }
 
 // ---------------------------------------------------------------------------

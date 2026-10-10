@@ -28,8 +28,11 @@ namespace rune::node {
 class SchemaFanout {
 public:
     /// Control thread: queue an update for every worker.
-    void post(int32_t topicId, std::vector<uint8_t> blob) {
-        pending_.push_back(Pending{topicId, std::move(blob), 0});
+    /// `version` (Task 12) is the schema version `blob` was materialized as
+    /// of (the fan-out source sends RegistryEntry.descriptor — already
+    /// materializeAsOf(evolving, version) — never the raw evolving blob).
+    void post(int32_t topicId, uint16_t version, std::vector<uint8_t> blob) {
+        pending_.push_back(Pending{topicId, version, std::move(blob), 0});
     }
 
     /// Control thread, every duty cycle: deliver as much as the rings accept.
@@ -41,9 +44,10 @@ public:
             const int32_t n = pool.workerCount();
             while (p.nextWorker < n) {
                 WorkerOp op;
-                op.type             = WorkerOp::Type::SchemaUpdate;
-                op.topicId          = p.topicId;
-                op.schemaUpdateBlob = p.blob;   // copy: one per worker (cold path)
+                op.type                = WorkerOp::Type::SchemaUpdate;
+                op.topicId             = p.topicId;
+                op.clientVersion       = static_cast<int32_t>(p.version);   // Task 12 (see WorkerOp.h)
+                op.schemaUpdateBlob    = p.blob;   // copy: one per worker (cold path)
                 if (enqueueHookForTest_) [[unlikely]] enqueueHookForTest_(enqueueHookCtx_);
                 const EnqueueResult r = pool.worker(p.nextWorker).enqueueOp(std::move(op));
                 if (r == EnqueueResult::Full) break;   // back-pressure: retry next cycle
@@ -79,6 +83,7 @@ public:
 private:
     struct Pending {
         int32_t              topicId;
+        uint16_t             version;
         std::vector<uint8_t> blob;
         int32_t              nextWorker;
     };

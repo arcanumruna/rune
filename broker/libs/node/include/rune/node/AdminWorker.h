@@ -20,6 +20,8 @@ namespace rune::node {
 //   InvalidSchema         = 23
 //   SchemaValidationFailed= 24  (not used in this task)
 //   TopicExists           = 25
+//   SchemaIncompatible    = 30  (ALTER: ops rejected by the compatibility gate)
+//   SchemaConflict        = 31  (ALTER: stale expectedVersion — optimistic CAS)
 
 // ---------------------------------------------------------------------------
 // AdminDeps — effects the AdminWorker needs, all resolved on the admin thread.
@@ -56,6 +58,12 @@ struct AdminDeps {
     std::function<void(int64_t session, int64_t corr, int32_t topicId,
                        uint16_t version, const std::vector<uint8_t>& blob,
                        uint16_t errorCode)> respondGet;
+
+    // Send the AlterTopic response back to the client (encode + egress).  On OK,
+    // `newVersion` is the freshly committed contiguous version; on any error it
+    // carries the current version (so the client can re-read and retry CAS).
+    std::function<void(int64_t session, int64_t corr, int32_t topicId,
+                       uint16_t newVersion, uint16_t errorCode)> respondAlter;
 };
 
 /// Single-threaded, AdminWorker-owned DDL state machine (RULING-2).
@@ -89,6 +97,10 @@ public:
     void submitDefineTopic(DefineTopicMsg msg);
     void submitGetSchema(const GetSchemaMsg& msg);
 
+    // ALTER TOPIC (Task 11).  Queued onto the SAME pending_ deque as DefineTopic
+    // so it is SERIALIZED with CREATE and other ALTERs (one inFlight_ at a time).
+    void submitAlterTopic(AlterTopicMsg msg);
+
     // -----------------------------------------------------------------------
     // control → admin: create-topic reply.  Matches the ticket of the in-flight
     // DefineTopic and advances the state machine (AWAITING_ID → AWAITING_COMMIT).
@@ -116,6 +128,16 @@ public:
     [[nodiscard]] bool isLeader() const noexcept { return leader_; }
     [[nodiscard]] std::size_t pendingCount() const noexcept { return pending_.size(); }
 
+    // Fail-loud recovery signal (regression fix): true iff the most recent
+    // rebuildFromLog_() (Follower->Leader promotion replay) hit a corrupt or
+    // truncated __topic_schemas record and ABORTED rather than silently
+    // skipping it. A silent skip would leave an UNDETECTED version gap in
+    // SchemaRegistry's per-topic deque (indexed by version-1) — wrong/missing
+    // schema versions served after recovery. Callers (tests, and any future
+    // control-plane wiring) poll this to detect/halt instead of trusting a
+    // silently-incomplete registry.
+    [[nodiscard]] bool rebuildFailed() const noexcept { return rebuildFailed_; }
+
 private:
     // Rebuild the SchemaRegistry from [0, HW) of the schema replica.
     void rebuildFromLog_();
@@ -123,23 +145,64 @@ private:
     // Advance the in-flight DDL if possible.  Returns true if work was done.
     bool advance_(int64_t nowNs);
 
-    // Start the next queued DefineTopic (if idle).
+    // Start the next queued DDL op (if idle).
     void startNext_(int64_t nowNs);
+
+    // ALTER branch of startNext_ (admin thread, leader-guarded).  Resolves the
+    // topic, runs the optimistic-CAS + compatibility gate, applies the ops to
+    // the current evolving descriptor and appends the new durable TopicSchema —
+    // ATOMIC: on any failure nothing is appended and the version is not bumped.
+    void startAlter_(AlterTopicMsg msg, int64_t nowNs);
+
+    // ── Version-assignment helper (Task 10) ─────────────────────────────────
+    // SOURCE OF TRUTH for the version assigned to a schema commit on
+    // `topicId`, shared by DefineTopic (create, this task) and ALTER's own
+    // commit path (Task 11). Versions MUST be CONTIGUOUS: SchemaRegistry
+    // indexes a topic's versions by (version - 1) in a per-topic std::deque
+    // (see SchemaRegistry.h), so skipping ahead leaves an unfilled gap slot.
+    // No prior version for `topicId` (always true for DefineTopic, which only
+    // ever targets a brand-new topicId just allocated by the control thread)
+    // → the topic is being created for the first time → kInitialSchemaVersion.
+    [[nodiscard]] uint16_t nextSchemaVersion_(int32_t topicId) const;
+
+    static constexpr uint16_t kInitialSchemaVersion = 1;
 
     enum class DdlState {
         Idle,             // nothing in flight
-        AwaitingId,       // requested createTopic; waiting for reply ring
+        AwaitingId,       // requested createTopic; waiting for reply ring (CREATE only)
         AwaitingCommit,   // appended durable record; waiting for HW to cover it
     };
 
-    // One queued/in-flight DefineTopic.  Each state uses exactly its own fields.
+    // Which kind of DDL an op (queued or in-flight) is.  CREATE goes through the
+    // createTopic round-trip (AwaitingId); ALTER skips it (topic already exists)
+    // and commits straight to AwaitingCommit.
+    enum class DdlKind { Create, Alter };
+
+    // A queued DDL op, discriminated by `kind`.  Exactly one of the two message
+    // members is meaningful (shared-nothing cold-path struct; DDL is rare).
+    struct PendingDdl {
+        DdlKind        kind = DdlKind::Create;
+        DefineTopicMsg define;   // kind == Create
+        AlterTopicMsg  alter;    // kind == Alter
+    };
+
+    // One queued/in-flight DDL op.  Each state uses exactly its own fields.
     struct DdlOp {
-        DefineTopicMsg msg;
+        DdlKind        kind          = DdlKind::Create;
+        DefineTopicMsg msg;                  // CREATE
+        AlterTopicMsg  alter;                // ALTER (session/corr for the response)
         int64_t        ticket        = 0;
         int32_t        topicId       = -1;   // set on AwaitingId → AwaitingCommit
         int64_t        appendedBase  = -1;   // set on AwaitingCommit (HW must reach it)
         int64_t        appendedLast  = -1;
         int64_t        startedNs     = 0;    // for timeout
+        uint16_t       fieldCount    = 0;    // field count of msg.blob's descriptor,
+                                              // captured once during PARSING
+                                              // (startNext_) — seeds nextTag on create.
+        // ── ALTER-only (computed ONCE in startAlter_; Task 10 review note: the
+        //    contiguous version is NOT recomputed later) ──────────────────────
+        uint16_t       newVersion    = 0;    // latest.version + 1
+        TopicSchema    alterSchema;          // the record applied on the HW gate
     };
 
     SchemaRegistry&                       reg_;
@@ -153,10 +216,14 @@ private:
     int32_t  epoch_       = 0;
     bool     wasLeader_   = false;   // C: Follower→Leader edge detection
 
+    // Set by rebuildFromLog_() on a corrupt/truncated TopicSchema record; see
+    // rebuildFailed() above. Admin-thread-owned (no atomics — shared-nothing).
+    bool     rebuildFailed_ = false;
+
     // In-flight DDL state machine.
     DdlState        state_ = DdlState::Idle;
     std::optional<DdlOp> inFlight_;
-    std::deque<DefineTopicMsg> pending_;   // queued DefineTopics (>1 in flight rare)
+    std::deque<PendingDdl> pending_;        // queued DDL ops (CREATE + ALTER, serialized)
     int64_t         nextTicket_ = 1;
 
     // Timeout for a stuck in-flight op (createTopic reply lost, or HW never
