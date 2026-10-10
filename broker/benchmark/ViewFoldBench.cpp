@@ -24,15 +24,23 @@
 //
 // Batches in this workload are SMALL but not all size 1 (cycling through
 // {1,2,1,3,2,1,4,2}, avg 2 records/batch -- the brief's own "single-record
-// (or small) batches" wording), so record_p* and batch_p* are genuine,
-// distinct populations, not forced-identical by a single-record-only
-// design:
-//   - batchLatNs holds ONE sample per foldBatch() call (its full wall-clock
-//     latency) -- batch_p50/p99's population.
-//   - recordLatNs holds N samples per batch (the batch's latency divided
-//     evenly by its record count), pushed once per record so its
-//     population size equals the number of records actually folded
-//     (matching the gate's "per processed record" framing).
+// (or small) batches" wording). record_p50/p99 is a TRUE per-record order
+// statistic, not a batch-amortized estimate: dividing a multi-record
+// batch's wall-clock latency by its record count and counting that
+// quotient once per record would smooth genuine per-record tail variance
+// evenly across the batch, understating the real single-record tail by up
+// to ~the max batch size -- a counter gated and named "per record" has to
+// actually BE one. So:
+//   - trueRecordLatNs holds ONE sample per foldBatch() call whose batch
+//     size is EXACTLY 1 (the size-1 slots in the cycle above: 3 of 8, ~37%
+//     of batches) -- for those calls the whole call IS one record's
+//     pipeline cost, with zero batch-overhead amortization to divide out.
+//     This is record_p50/p99's population (~375K samples over the 2M-record
+//     measured pass -- see counts below).
+//   - batchLatNs holds ONE sample per foldBatch() call of ANY size (1-4) --
+//     batch_p50/p99's population, representing the real per-call cost a
+//     caller actually pays regardless of how many records land in that
+//     batch.
 //
 // Unlike the ViewTable storage gate (rehash events are ~0.5-0.8% of ops,
 // so p999 is needed to land inside that tail -- see ViewTableBench.cpp),
@@ -312,11 +320,19 @@ static void BM_ViewFoldReplace(benchmark::State& st) {
         }
 
         // --- Phase 2: MEASURED LATENCY pass (timed, NOT alloc-tracked):
-        //     record_p50/p99, batch_p50/p99. ------------------------------
+        //     record_p50/p99 (TRUE per-record, size-1-batch calls only),
+        //     batch_p50/p99 (every foldBatch() call, any size). ------------
         std::vector<uint32_t> batchLatNs;
         batchLatNs.reserve(kMeasuredOps / 2 + 16);
-        std::vector<uint32_t> recordLatNs;
-        recordLatNs.reserve(kMeasuredOps + 16);
+        // Only size-1-batch calls are pushed here -- see file header: a
+        // size-1 foldBatch() call's whole latency IS one record's pipeline
+        // cost, with no batch-overhead amortization to divide out. ~37% of
+        // batches are size 1 (the kBatchSizes cycle below), so this is a
+        // large (~375K over a 2M-record pass), genuinely single-record
+        // subpopulation -- not a quotient smoothed across a multi-record
+        // batch.
+        std::vector<uint32_t> trueRecordLatNs;
+        trueRecordLatNs.reserve(kMeasuredOps / 2 + 16);
 
         uint64_t appliedTotal = 0, deletedTotal = 0, skippedTotal = 0;
         uint64_t measuredRecFolded = 0;
@@ -330,8 +346,10 @@ static void BM_ViewFoldReplace(benchmark::State& st) {
             const uint64_t ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
             batchLatNs.push_back(static_cast<uint32_t>(ns));
-            const uint32_t perRecNs = static_cast<uint32_t>(ns / n);
-            for (uint32_t j = 0; j < n; ++j) recordLatNs.push_back(perRecNs);
+            if (n == 1) {
+                // Genuine single-record fold: no division, no amortization.
+                trueRecordLatNs.push_back(static_cast<uint32_t>(ns));
+            }
 
             appliedTotal += stats.applied;
             deletedTotal += stats.deleted;
@@ -373,12 +391,15 @@ static void BM_ViewFoldReplace(benchmark::State& st) {
 
         benchmark::DoNotOptimize(table.size());
 
-        st.counters["record_p50_us"] = percentileUs(recordLatNs, 0.50);
-        st.counters["record_p99_us"] = percentileUs(recordLatNs, 0.99); // GATE: < 5us
+        // record_p50/p99: TRUE per-record order statistic (size-1-batch
+        // calls only -- see file header and phase-2 loop comment above; NOT
+        // a batch-latency/n quotient).
+        st.counters["record_p50_us"] = percentileUs(trueRecordLatNs, 0.50);
+        st.counters["record_p99_us"] = percentileUs(trueRecordLatNs, 0.99); // GATE: < 5us
         st.counters["batch_p50_us"]  = percentileUs(batchLatNs, 0.50);
         st.counters["batch_p99_us"]  = percentileUs(batchLatNs, 0.99);  // GATE: < 10us
         st.counters["steady_alloc"]  = static_cast<double>(steadyAlloc); // GATE: == 0
-        st.counters["measured_records"] = static_cast<double>(recordLatNs.size());
+        st.counters["true_record_samples"] = static_cast<double>(trueRecordLatNs.size());
         st.counters["measured_batches"] = static_cast<double>(batchLatNs.size());
         st.counters["alloc_probe_records"] = static_cast<double>(probeRecFolded);
         st.counters["applied_total"]    = static_cast<double>(appliedTotal);
