@@ -814,6 +814,22 @@ public:
         return workerPool_ && w >= 0 && w < workerPool_->workerCount() ? &workerPool_->worker(w) : nullptr;
     }
 
+    /// Task 19b: node-level view readiness — true iff EVERY worker's views are
+    /// ready (Worker::viewsReady(): no view set, or all hosted (view, partition)
+    /// instances Ready).  A thin, INERT wrapper over the per-instance serve-guard
+    /// (which is what the Phase-1 single-node restart e2e actually relies on):
+    /// true when no durable view is installed-for-recovery anywhere, so it never
+    /// gates the no-views case closed.  Read-only; call off the hot path.  NOT
+    /// wired into the election path (see loadViewsForRecovery_ / the Task-19b
+    /// report: election-eligibility gating is a multi-node concern, DEFERRED).
+    [[nodiscard]] bool viewsReady() const noexcept {
+        if (!workerPool_) return true;
+        for (int32_t w = 0; w < workerPool_->workerCount(); ++w) {
+            if (!workerPool_->worker(w).viewsReady()) return false;
+        }
+        return true;
+    }
+
     /// Test-only fault injection: called (on the start() thread) at named startup
     /// phases ("build-gateway" = offset/txn/metadata rebuilds + admin build).
     /// Set before start().
@@ -1111,6 +1127,13 @@ private:
     std::vector<ViewFanoutPending>                        viewFanoutBacklog_;  // control-thread-owned
     void fanoutViewPlan_(ViewPlanUpdateMsg msg);   // control thread
     int  pumpViewFanout_();                        // control thread (every cycle)
+    // Task 19b (restart recovery): on startup, AFTER viewRegistry_ is replayed
+    // from __views and the workers/channels/IO-agent are built, re-register
+    // each durable view's OUTPUT descriptor in schemaRegistry_ and fan out a
+    // RECOVERY install (installViewForRecovery on the owning worker) + co-locate
+    // its sink with its source.  Single-threaded (called from buildGateway()
+    // before any duty thread starts); inert when there are no durable views.
+    void loadViewsForRecovery_();
 
     // Runtime-cycle DDL control plane (direct call; see AdminControlPlane.h).
     friend class AdminControlPlane;

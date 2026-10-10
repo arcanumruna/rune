@@ -5154,12 +5154,24 @@ private:
             rune::storage::Log* log = replica->log();
             if (log == nullptr) continue;
             const int32_t partition = static_cast<int32_t>(replica->partitionId());
-            work += viewSet_->driveFolds(
-                topicId, partition,
-                [this, log](int64_t from, int64_t to) -> rune::storage::LogReadView {
-                    return readNoFault_(log, from, kPushMaxChunkBytes, to);
-                },
-                bound, nowNs);
+            auto readRange = [this, log](int64_t from, int64_t to) -> rune::storage::LogReadView {
+                return readNoFault_(log, from, kPushMaxChunkBytes, to);
+            };
+            // Task 19b (restart recovery): BEFORE the normal fold, for a worker
+            // that hosts any restart-recovery view, (1) materialize this owned
+            // (view, partition)'s instance from its on-disk checkpoint (once,
+            // cold — RebuildingViews + serve-guard, NOT a fresh Ready instance),
+            // then (2) driveRebuild the committed tail [foldCursor, bound) and
+            // flip RebuildingViews -> Ready once foldCursor >= bound (the T16
+            // readiness flip — driveFolds alone never raises readiness, so a
+            // recovered instance would otherwise stay NotReady forever).  Both
+            // are gated on hasRecovery(): a broker with no durable views runs
+            // this path not at all (unchanged).
+            if (viewSet_->hasRecovery()) [[unlikely]] {
+                viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
+                work += viewSet_->driveRebuild(topicId, partition, readRange, bound, nowNs);
+            }
+            work += viewSet_->driveFolds(topicId, partition, readRange, bound, nowNs);
         }
         return work;
     }

@@ -19,12 +19,23 @@ namespace rune::node {
 ///   viewNameLen:u16 + viewName bytes,
 ///   compiledPlanLen:u32 + compiledPlanBlob bytes (= Task 8's
 ///     rune::view::serialize(CompiledViewPlan)),
-///   persistence:u8  (0 = persisted, 1 = transient).
+///   persistence:u8  (0 = persisted, 1 = transient),
+///   [OPTIONAL, appended Task 19b] outDescLen:u32 + outputDescriptorBlob bytes
+///     (= rune::codec::serialize(outputDescriptor)).
+///
+/// Task 19b: the view's OUTPUT descriptor is persisted here so a cold restart
+/// can re-register the view's typed output topic in the SchemaRegistry
+/// (GetTopicSchema / openView) EXACTLY as created — the compiled plan drops
+/// field names + FixedStr widths, so the descriptor (and thus its fingerprint)
+/// cannot be reconstructed from compiledPlanBlob alone.  The field is an
+/// OPTIONAL trailing blob: a pre-19b record (none appended) deserializes with
+/// an empty outputDescriptorBlob, unchanged.
 struct ViewRecord {
     int32_t              viewTopicId = -1;
     std::string           viewName;
     std::vector<uint8_t>  compiledPlanBlob;
     uint8_t               persistence = 0;
+    std::vector<uint8_t>  outputDescriptorBlob;  // Task 19b: rune::codec::serialize(outputDescriptor)
 
     [[nodiscard]] std::vector<uint8_t> serialize() const;
     [[nodiscard]] static std::optional<ViewRecord> deserialize(std::span<const uint8_t> buf);

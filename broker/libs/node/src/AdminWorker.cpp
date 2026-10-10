@@ -280,6 +280,11 @@ void AdminWorker::onCreateViewReply_(const CreateTopicReplyMsg& reply) {
     rec.viewName        = inFlight_->view.viewName;
     rec.compiledPlanBlob = rune::view::serialize(inFlight_->compiledPlan);
     rec.persistence     = inFlight_->view.persistence;
+    // Task 19b: persist the OUTPUT descriptor so a cold restart can re-register
+    // the view's typed output topic (GetTopicSchema / openView) EXACTLY as
+    // created — its field names + FixedStr widths (hence its fingerprint) are
+    // NOT reconstructable from the compiled plan alone.
+    rec.outputDescriptorBlob = rune::codec::serialize(inFlight_->viewOutDesc);
     inFlight_->viewRecord = rec;  // applied on the HW gate (advance_)
 
     const std::vector<uint8_t> payload = rec.serialize();

@@ -2513,6 +2513,14 @@ void BrokerNode::buildGateway() {
         gateway_->setAdminSink(adminWorkerAgent_.get());
     }
 
+    // Task 19b (restart recovery): now that viewRegistry_ is replayed from
+    // __views (buildAdminWorker) AND the workers/view channels/IO-agent are
+    // built (buildWorkerPool), re-register each durable view's output schema
+    // and fan out a RECOVERY install so a restarted broker reloads, recovers,
+    // and rebuilds its views before serving.  Single-threaded here (no duty
+    // thread has started yet) and inert when there are no durable views.
+    loadViewsForRecovery_();
+
     // Build the composite runtime agent:
     //   single-node: wraps agent_    (ConsensusAgent)
     //   multi-node:  wraps nodeAgent_ (NodeConsensusAgent)
@@ -3687,6 +3695,110 @@ void BrokerNode::fanoutViewPlan_(ViewPlanUpdateMsg msg) {
     }
     viewFanoutBacklog_.push_back(ViewFanoutPending{std::move(msg), 0});
     (void)pumpViewFanout_();
+}
+
+// ---------------------------------------------------------------------------
+// BrokerNode::loadViewsForRecovery_ (Task 19b) — startup, single-threaded.
+//
+// Runs once from buildGateway(), AFTER viewRegistry_ is replayed from __views
+// and AFTER the workers / per-worker ViewSnapshotChannels / view IO agent are
+// built — but BEFORE any duty thread (control, worker, IO) starts.  So every
+// touch of workerPool_ / viewSnapshotChannels_ / schemaRegistry_ here is on
+// the single startup thread with no concurrent reader (shared-nothing holds:
+// the install rings merely BUFFER the frames until the workers drain them).
+//
+// For each durable ViewRecord: re-register its OUTPUT descriptor in
+// schemaRegistry_ (so GetTopicSchema / openView keep working on a cold restart
+// — Task 19 registered it in-memory only at CREATE time) and fan out a
+// RECOVERY install (recovery=true) via the SAME path CreateView uses, which
+// also co-locates the view sink with its source so GetViewRow routes correctly.
+// Inert when there are no durable views, or when the view subsystem failed to
+// build (guards below).
+// ---------------------------------------------------------------------------
+void BrokerNode::loadViewsForRecovery_() {
+    if (!viewRegistry_ || !workerPool_ || viewSnapshotChannels_.empty()) return;
+
+    const std::vector<const ViewRecord*> recs = viewRegistry_->all();
+    if (recs.empty()) return;  // no durable views — nothing to recover (common case)
+
+    int recovered = 0;
+    for (const ViewRecord* rec : recs) {
+        if (rec == nullptr) continue;
+
+        // 1. Deserialize the compiled plan (needed for the source topic id +
+        //    the fan-out blob).  A corrupt plan is logged and skipped — never a
+        //    silent half-install.
+        auto plan = rune::view::deserializeCompiledViewPlan(
+            std::span<const uint8_t>(rec->compiledPlanBlob.data(), rec->compiledPlanBlob.size()));
+        if (!plan || plan->sourceTopicId.empty()) {
+            spdlog::error("BrokerNode[{}]: view '{}' (id={}) skipped on recovery — compiled plan "
+                          "missing/un-deserializable", config_.nodeId, rec->viewName, rec->viewTopicId);
+            continue;
+        }
+        const int32_t sourceTopicId = plan->sourceTopicId[0];
+
+        // 2. Re-materialize the SOURCE evolving descriptor (the fold needs it).
+        //    The source schema was replayed from __topic_schemas before this
+        //    loop (buildAdminWorker), so byId must resolve it.
+        const RegistryEntry* srcEntry =
+            schemaRegistry_ ? schemaRegistry_->byId(sourceTopicId) : nullptr;
+        if (srcEntry == nullptr) {
+            spdlog::error("BrokerNode[{}]: view '{}' (id={}) skipped on recovery — source topic {} "
+                          "not found in SchemaRegistry", config_.nodeId, rec->viewName,
+                          rec->viewTopicId, sourceTopicId);
+            continue;
+        }
+
+        // 3. Re-register the view's OUTPUT descriptor in schemaRegistry_ from the
+        //    durable blob (exact bytes → exact fingerprint), so the view stays a
+        //    typed topic after restart.  Rebuild the TopicSchema metadata the
+        //    way commitCreateView_ did: keyField + nextTag come from the output
+        //    descriptor itself; partitionCount mirrors the source.
+        if (schemaRegistry_ && !rec->outputDescriptorBlob.empty() &&
+            schemaRegistry_->byId(rec->viewTopicId) == nullptr) {
+            try {
+                const rune::codec::Descriptor outDesc = rune::codec::deserialize(
+                    std::span<const uint8_t>(rec->outputDescriptorBlob.data(),
+                                             rec->outputDescriptorBlob.size()));
+                TopicSchema ts;
+                ts.topicId        = rec->viewTopicId;
+                ts.version        = 1;  // kInitialSchemaVersion (views are not versioned)
+                ts.partitionCount = srcEntry->partitionCount;
+                ts.validate       = false;
+                ts.descriptorBlob = rec->outputDescriptorBlob;
+                ts.nextTag        = static_cast<uint16_t>(outDesc.fields.size());
+                for (const auto& f : outDesc.fields) {
+                    if (f.isKey) { ts.keyField = f.name; break; }
+                }
+                schemaRegistry_->applyRecord(ts);
+            } catch (const std::exception& ex) {
+                spdlog::error("BrokerNode[{}]: view '{}' (id={}) output descriptor failed to "
+                              "re-register on recovery: {}", config_.nodeId, rec->viewName,
+                              rec->viewTopicId, ex.what());
+                // Continue: the worker still serves rows (its fingerprint + row
+                // layout come from the plan); only GetTopicSchema is affected.
+            }
+        }
+
+        // 4. Fan out a RECOVERY install (recovery=true).  fanoutViewPlan_ also
+        //    co-locates the view sink with its source (GetViewRow routing) — the
+        //    SAME path CreateView uses, just with the recovery flag set.  The
+        //    source descriptor is serialized from the live SchemaRegistry entry
+        //    (materialized current version), mirroring the create path.
+        ViewPlanUpdateMsg vp;
+        vp.viewTopicId = rec->viewTopicId;
+        vp.persistence = rec->persistence;
+        vp.recovery    = true;
+        vp.planBlob    = rec->compiledPlanBlob;  // reuse the durable compiled plan
+        vp.outDescBlob = rec->outputDescriptorBlob;
+        vp.srcDescBlob = rune::codec::serialize(srcEntry->descriptor);
+        fanoutViewPlan_(std::move(vp));
+        ++recovered;
+    }
+
+    if (recovered > 0)
+        spdlog::info("BrokerNode[{}]: restart recovery fanned out {} durable view(s) for "
+                     "checkpoint recovery + rebuild", config_.nodeId, recovered);
 }
 
 int BrokerNode::pumpViewFanout_() {

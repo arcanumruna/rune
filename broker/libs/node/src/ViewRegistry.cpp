@@ -95,6 +95,14 @@ std::vector<uint8_t> ViewRecord::serialize() const {
 
     writeU8(buf, persistence);
 
+    // Task 19b: OPTIONAL trailing output-descriptor blob.  Appended ONLY when
+    // present so a record WITHOUT it serializes byte-for-byte as pre-19b did
+    // (keeps existing round-trip expectations intact).
+    if (!outputDescriptorBlob.empty()) {
+        writeU32LE(buf, static_cast<uint32_t>(outputDescriptorBlob.size()));
+        buf.insert(buf.end(), outputDescriptorBlob.begin(), outputDescriptorBlob.end());
+    }
+
     return buf;
 }
 
@@ -125,8 +133,17 @@ std::optional<ViewRecord> ViewRecord::deserialize(std::span<const uint8_t> buf) 
 
     if (!readU8(buf, pos, v.persistence)) return std::nullopt;
 
-    // Reject any unexpected trailing bytes — an exact, fully-consumed buffer
-    // only (no silent acceptance of a longer-than-expected record).
+    // Task 19b: an OPTIONAL trailing output-descriptor blob.  A pre-19b record
+    // ends exactly here (pos == size) and leaves outputDescriptorBlob empty; a
+    // 19b record carries outDescLen:u32 + bytes.  Either way the buffer must be
+    // EXACTLY consumed (no silent acceptance of unexpected trailing bytes).
+    if (pos < buf.size()) {
+        uint32_t outLen = 0;
+        if (!readU32LE(buf, pos, outLen)) return std::nullopt;
+        if (pos + outLen > buf.size())    return std::nullopt;
+        v.outputDescriptorBlob.assign(buf.data() + pos, buf.data() + pos + outLen);
+        pos += outLen;
+    }
     if (pos != buf.size()) return std::nullopt;
 
     return v;

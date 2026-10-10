@@ -42,6 +42,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <rune/codec/Descriptor.h>
@@ -75,6 +76,22 @@ namespace rune::node {
 // cadence (each rebuild pass folds a bounded committed range), deadlock-free,
 // and monotone (Recovering -> RebuildingViews -> Ready, never backwards).
 enum class ViewReadiness : uint8_t { Recovering, RebuildingViews, Ready };
+
+// Task 19b: split an on-disk view checkpoint file into its individual Task-12
+// records.  The file a ViewSnapshotIoAgent writes is a BARE concatenation of
+// rune::view::encodeDelta() wire records (the 8-byte routing header is stripped
+// before the bytes hit the file — see ViewSnapshotIoAgent::handleDeltaFrame_),
+// so recovery must split it back into the per-record spans
+// rune::view::replay() expects.  Each record is self-describing:
+//   [magic u32][O i64][rowLen u32][count u32] then count × {rid u32, flags u8,
+//   key u64, [rowLen bytes iff flags==0 (upsert)]} then [crc u32].
+// Bounds-safe (Task 8 lesson): never trusts a length/count field to over-read;
+// a torn/truncated TRAILING record is DROPPED (the returned spans stop before
+// it) rather than over-read — exactly what replay() then treats as the
+// recoverable append-only tail.  The returned spans point INTO `bytes`, which
+// must outlive them.
+[[nodiscard]] std::vector<std::span<const uint8_t>>
+splitViewCheckpointRecords(std::span<const uint8_t> bytes);
 
 // One installed materialized view on this worker, for ONE partition.  MOVABLE
 // (lives by value in `views_`): it declares only a converting constructor, so
@@ -141,7 +158,34 @@ public:
     // worker-owned maps.  Decodes a rune::node::ViewPlanUpdateMsg per frame,
     // rebuilds the RowLayout from the output descriptor, and calls installView.
     // Returns the number of plans installed this pass (a progress count).
+    //
+    // Task 19b: a frame whose ViewPlanUpdateMsg.recovery is set registers the
+    // plan template AND marks the view for RESTART recovery (recoveryViews_) —
+    // its per-(view, partition) instances are then materialized by
+    // materializeRecoveryInstancesFor (checkpoint load + RebuildingViews +
+    // serve-guard), NOT lazily created Ready by the plain driveFolds path.
     int drainInstalls();
+
+    // Task 19b: true iff at least one view here was installed for RESTART
+    // recovery (recoveryViews_ non-empty).  The worker duty cycle gates the
+    // extra recovery-materialize + driveRebuild work on this, so a broker with
+    // NO durable views runs exactly as before (never gated, never charged).
+    [[nodiscard]] bool hasRecovery() const noexcept { return !recoveryViews_.empty(); }
+
+    // Task 19b: for an OWNED source (srcTopicId, partition), materialize — once,
+    // cold — the (view, partition) instance of every recovery-marked view
+    // interested in srcTopicId that is not yet hosted here, by loading THIS
+    // (view, partition)'s checkpoint FILE from viewDataDir_ (split via
+    // splitViewCheckpointRecords, replayed by installViewForRecovery).  A
+    // missing/empty file is a valid COLD start (empty checkpoint → foldCursor 0
+    // → full rebuild from the committed log).  `committedTail` is the source
+    // partition's current LSO — the same bound driveFolds/driveRebuild use — so
+    // a view already caught up is Ready at once.  No-op once the instance
+    // exists (idempotent; the file read happens once per instance).  The worker
+    // calls this BEFORE driveRebuild/driveFolds so a recovery view never gets a
+    // fresh Ready instance that would bypass its checkpoint + serve-guard.
+    void materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t partition,
+                                         int64_t committedTail);
 
     // Task 16: install a view FOR RECOVERY for ONE partition.  Registers the
     // plan template (like installView) AND eagerly creates the (view, partition)
@@ -370,6 +414,14 @@ private:
     std::unordered_map<int32_t, ViewTemplate>         templates_;        // viewTopicId -> plan template
     std::unordered_map<uint64_t, ViewInstance>        views_;            // (viewTopicId,partition) -> instance
     std::unordered_map<int32_t, std::vector<int32_t>> subscriptionIndex_; // srcTopicId -> [viewTopicId]
+
+    // Task 19b: viewTopicIds installed for RESTART recovery.  A view here has
+    // its per-(view, partition) instances materialized from the on-disk
+    // checkpoint via materializeRecoveryInstancesFor (RebuildingViews +
+    // serve-guard) rather than lazily created Ready by driveFolds.  Plain
+    // (Task-19 create-time) installs never touch this set — the no-recovery
+    // path is unchanged.
+    std::unordered_set<int32_t> recoveryViews_;
 
     // Reused checkpoint scratch (capacity persists; no per-batch allocation in
     // steady state).  rowScratch_ holds the copied row bytes; rowOffsets_ their

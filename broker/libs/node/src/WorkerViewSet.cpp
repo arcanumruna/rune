@@ -9,6 +9,7 @@
 #include <spdlog/spdlog.h>
 
 #include <cstring>
+#include <fstream>
 #include <optional>
 #include <span>
 #include <utility>
@@ -34,7 +35,71 @@ void writeI32LE(uint8_t* dst, int32_t v) noexcept {
     dst[3] = static_cast<uint8_t>(u >> 24);
 }
 
+uint32_t readU32LE(const uint8_t* p) noexcept {
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+}
+
+// Task 19b: this worker's checkpoint delta-file path for (view, partition).
+// MUST match ViewSnapshotIoAgent::deltaFilePath_ exactly (same viewDataDir_,
+// same name) so recovery reopens the very file the IO agent appended to.
+std::string deltaFilePath(const std::string& dir, int32_t viewTopicId, int32_t partition) {
+    return dir + "/view-" + std::to_string(static_cast<uint32_t>(viewTopicId)) +
+           "-p" + std::to_string(partition) + ".delta";
+}
+
+// Read a whole file into a byte vector; returns empty on any error (a missing
+// checkpoint is a valid cold start, not a failure).
+std::vector<uint8_t> readWholeFile(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return {};
+    const std::streamoff n = f.tellg();
+    if (n <= 0) return {};
+    std::vector<uint8_t> out(static_cast<std::size_t>(n));
+    f.seekg(0);
+    f.read(reinterpret_cast<char*>(out.data()), n);
+    if (!f) return {};
+    return out;
+}
+
 } // namespace
+
+// ---------------------------------------------------------------------------
+// splitViewCheckpointRecords — see the header for the contract + wire format.
+// ---------------------------------------------------------------------------
+std::vector<std::span<const uint8_t>>
+splitViewCheckpointRecords(std::span<const uint8_t> bytes) {
+    // Per-record fixed header = magic u32 + O i64 + rowLen u32 + count u32.
+    static constexpr std::size_t kHdr      = 4 + 8 + 4 + 4;
+    static constexpr std::size_t kEntryHdr = 4 + 1 + 8;  // rid u32 + flags u8 + key u64
+    static constexpr std::size_t kCrc      = 4;
+
+    std::vector<std::span<const uint8_t>> out;
+    const std::size_t total = bytes.size();
+    std::size_t pos = 0;
+    while (pos + kHdr <= total) {
+        const std::size_t recStart = pos;
+        const uint32_t rowLen = readU32LE(bytes.data() + pos + 12);
+        const uint32_t count  = readU32LE(bytes.data() + pos + 16);
+        std::size_t p = pos + kHdr;
+        bool ok = true;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (p + kEntryHdr > total) { ok = false; break; }
+            const uint8_t flags = bytes[p + 4];
+            p += kEntryHdr;
+            if (flags == 0) {  // upsert carries rowLen payload bytes; a delete does not
+                if (p + rowLen > total) { ok = false; break; }
+                p += rowLen;
+            }
+        }
+        if (!ok) break;                 // truncated entries → drop this trailing record
+        if (p + kCrc > total) break;    // truncated CRC → drop this trailing record
+        p += kCrc;
+        out.push_back(bytes.subspan(recStart, p - recStart));
+        pos = p;
+    }
+    return out;
+}
 
 WorkerViewSet::WorkerViewSet(ViewSnapshotChannel& channel, std::string viewDataDir)
     : channel_(channel), viewDataDir_(std::move(viewDataDir)) {}
@@ -95,10 +160,52 @@ int WorkerViewSet::drainInstalls() {
                               "buildRowLayout failed: {}", m.viewTopicId, ex.what());
                 return;
             }
+            const int32_t viewTopicId = plan->viewTopicId;
             installView(std::move(*plan), std::move(layout), std::move(srcDesc),
                         /*persisted=*/m.persistence == 0);
+            // Task 19b: a RESTART-recovery install registers the template here
+            // but defers the per-(view, partition) instance to
+            // materializeRecoveryInstancesFor (checkpoint load + serve-guard),
+            // driven once this worker knows which partitions it owns.  A plain
+            // (create-time) install never marks the view, so its instances are
+            // created serve-ready by driveFolds exactly as before.
+            if (m.recovery) recoveryViews_.insert(viewTopicId);
         },
         /*limit=*/8);
+}
+
+void WorkerViewSet::materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t partition,
+                                                    int64_t committedTail) {
+    if (recoveryViews_.empty()) return;  // no recovery view installed — nothing to do
+    auto sit = subscriptionIndex_.find(srcTopicId);
+    if (sit == subscriptionIndex_.end()) return;
+
+    // Copy the interested-view id list: installViewForRecovery → installView may
+    // touch subscriptionIndex_ (a new source key could rehash it, invalidating
+    // `sit`), so iterate a stable snapshot.
+    const std::vector<int32_t> interested = sit->second;
+    for (int32_t viewTopicId : interested) {
+        if (recoveryViews_.find(viewTopicId) == recoveryViews_.end()) continue;  // not a recovery view
+        if (views_.find(instKey(viewTopicId, partition)) != views_.end()) continue;  // already hosted
+        auto tit = templates_.find(viewTopicId);
+        if (tit == templates_.end()) continue;  // defensive: template must exist
+
+        // COLD, once-per-instance: load this (view, partition)'s checkpoint
+        // file (base + deltas, concatenated by the IO agent) from disk and
+        // split it back into Task-12 records.  A missing/empty file is a valid
+        // cold start — installViewForRecovery then starts at foldCursor 0 and
+        // the committed log is replayed in full by driveRebuild.
+        const std::vector<uint8_t> file =
+            readWholeFile(deltaFilePath(viewDataDir_, viewTopicId, partition));
+        const std::vector<std::span<const uint8_t>> records =
+            splitViewCheckpointRecords(std::span<const uint8_t>(file));
+
+        const ViewTemplate& tpl = tit->second;
+        installViewForRecovery(tpl.plan, tpl.layout, tpl.evolvingSrc, tpl.persisted, partition,
+                               /*base=*/std::span<const uint8_t>{},
+                               std::span<const std::span<const uint8_t>>(records.data(), records.size()),
+                               committedTail);
+    }
 }
 
 ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition) {

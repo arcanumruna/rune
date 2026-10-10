@@ -495,18 +495,27 @@ inline SchemaUpdateMsg decodeSchemaUpdate(const uint8_t* buf, std::size_t len) {
 //                     delivers it to each worker, whose WorkerViewSet installs it
 //                     on its OWN thread (shared-nothing — installView is never
 //                     called cross-thread).
-// Wire layout: viewTopicId:i32, persistence:u8,
+// Wire layout: viewTopicId:i32, persistence:u8, recovery:u8,
 //   planLen:i32 + plan, outDescLen:i32 + outDesc, srcDescLen:i32 + srcDesc.
+//
+// Task 19b: `recovery` distinguishes a RESTART-RECOVERY install (the startup-
+// load loop, BrokerNode::loadViewsForRecovery_) from the Task-19 CREATE-time
+// install.  On recovery the worker registers the plan template AND marks it so
+// each owned (view, partition) instance is materialized via
+// WorkerViewSet::installViewForRecovery (checkpoint load + RebuildingViews +
+// serve-guard) instead of the plain-install lazy path (which would serve
+// immediately).  Default false => the create path is byte-for-byte unchanged.
 struct ViewPlanUpdateMsg {
     int32_t              viewTopicId = -1;
     uint8_t              persistence = 0;
+    bool                 recovery    = false;  // Task 19b: restart-recovery install
     std::vector<uint8_t> planBlob;      // rune::view::serialize(CompiledViewPlan)
     std::vector<uint8_t> outDescBlob;   // rune::codec::serialize(outputDescriptor)
     std::vector<uint8_t> srcDescBlob;   // rune::codec::serialize(sourceDescriptor)
 };
 
 [[nodiscard]] inline std::size_t viewPlanUpdateWireLen(const ViewPlanUpdateMsg& m) noexcept {
-    return 4 + 1 + 4 + m.planBlob.size() + 4 + m.outDescBlob.size() + 4 + m.srcDescBlob.size();
+    return 4 + 1 + 1 + 4 + m.planBlob.size() + 4 + m.outDescBlob.size() + 4 + m.srcDescBlob.size();
 }
 
 inline bool encodeViewPlanUpdate(OneToOneByteRing& ring, int32_t msgType,
@@ -517,6 +526,7 @@ inline bool encodeViewPlanUpdate(OneToOneByteRing& ring, int32_t msgType,
     uint8_t* p = ring.base() + idx;
     putI32(p, m.viewTopicId); p += 4;
     *p++ = m.persistence;
+    *p++ = m.recovery ? uint8_t{1} : uint8_t{0};
     putI32(p, static_cast<int32_t>(m.planBlob.size())); p += 4;
     std::memcpy(p, m.planBlob.data(), m.planBlob.size()); p += m.planBlob.size();
     putI32(p, static_cast<int32_t>(m.outDescBlob.size())); p += 4;
@@ -531,9 +541,10 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
     using namespace admin_wire;
     ViewPlanUpdateMsg m;
     std::size_t pos = 0;
-    if (len < 9) return m;  // viewTopicId(4) + persistence(1) + planLen(4)
+    if (len < 10) return m;  // viewTopicId(4) + persistence(1) + recovery(1) + planLen(4)
     m.viewTopicId = getI32(buf + pos); pos += 4;
     m.persistence = buf[pos++];
+    m.recovery    = buf[pos++] != 0;
     auto readBlob = [&](std::vector<uint8_t>& out) -> bool {
         if (pos + 4 > len) return false;
         const int32_t bl = getI32(buf + pos); pos += 4;
