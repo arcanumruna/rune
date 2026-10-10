@@ -75,6 +75,12 @@
            USER partition leader: roleEpoch = leaderEpoch, rolePartitionEpoch,
            replErrorCode = the controller's error code. -->
       <validValue name="ALTER_ISR_RESPONSE">18</validValue>
+      <!-- Task 20 (view engine phase 1): GetViewRow point-read routed to the
+           worker that owns the view (viewTopicId, partition).  Reuses existing
+           scalar fields (no new wire field): topicId = viewTopicId, nextOffset =
+           keyU64, hwBound = requestedFingerprint.  The worker probes
+           WorkerViewSet::getRow and answers ReturnType::VIEW_ROW_RESULT. -->
+      <validValue name="GET_VIEW_ROW">19</validValue>
       <!-- F1: TEST-ONLY owner-thread hook (BrokerNode::onOwnerThreadForTest).
            runtime -> owning worker: run a test-owned task (opaque in-process
            pointer carried in the egressPub uint64 slot) against the replica
@@ -123,6 +129,12 @@
            marker ACTUALLY landed at (authoritative; never pre-computed), or
            errorCode != 0 when the append itself failed (e.g. min-ISR gate). -->
       <validValue name="CONTROL_RECORD_APPENDED">6</validValue>
+      <!-- Task 20: the answer to a GET_VIEW_ROW op.  Reuses existing scalar
+           fields (the WorkerReturn layout is pinned): errorCode = status
+           (0=OK,1=AbsentKey,2=NotReady,3=SchemaMismatch,4=UnknownView),
+           recordCount = rowLen (informational), readTopicId = viewTopicId;
+           the chunk tail carries the row bytes on OK. -->
+      <validValue name="VIEW_ROW_RESULT">7</validValue>
     </enum>
 
     <!-- F15: TxnReturn::kind -->

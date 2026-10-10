@@ -40,6 +40,7 @@ public:
         OWNERSHIP_ACK = static_cast<std::uint8_t>(4),
         CONTROL_RECORD_REFUSED = static_cast<std::uint8_t>(5),
         CONTROL_RECORD_APPENDED = static_cast<std::uint8_t>(6),
+        VIEW_ROW_RESULT = static_cast<std::uint8_t>(7),
         NULL_VALUE = static_cast<std::uint8_t>(255)
     };
 
@@ -54,6 +55,7 @@ public:
             case static_cast<std::uint8_t>(4): return OWNERSHIP_ACK;
             case static_cast<std::uint8_t>(5): return CONTROL_RECORD_REFUSED;
             case static_cast<std::uint8_t>(6): return CONTROL_RECORD_APPENDED;
+            case static_cast<std::uint8_t>(7): return VIEW_ROW_RESULT;
             case static_cast<std::uint8_t>(255): return NULL_VALUE;
         }
 
@@ -71,6 +73,7 @@ public:
             case OWNERSHIP_ACK: return "OWNERSHIP_ACK";
             case CONTROL_RECORD_REFUSED: return "CONTROL_RECORD_REFUSED";
             case CONTROL_RECORD_APPENDED: return "CONTROL_RECORD_APPENDED";
+            case VIEW_ROW_RESULT: return "VIEW_ROW_RESULT";
             case NULL_VALUE: return "NULL_VALUE";
         }
 
