@@ -194,31 +194,6 @@ TEST(ViewTableMigrateScanBoundRegression, EraseDuringMigrationTombstonesOldCorre
     for (uint64_t v = 55707; v < 200000; ++v) ASSERT_NE(t.get(v), nullptr) << "lost key " << v;
 }
 
-// CRITICAL regression (found by external code review, NOT caught by this
-// agent's own self-review): migrateStep()'s live-entry copy branch must
-// tombstone the OLD slot the instant it copies that entry into NEW.
-// Without that, findO() has no notion of "already migrated" — it only
-// stops its linear probe at a true kEmpty — so the OLD "ghost" of an
-// already-migrated key stays matchable for the rest of the migration
-// window. Failure sequence: (1) key K is migrated OLD->NEW by
-// migrateStep(); (2) erase(K) succeeds via findP (NEW), backshifts K out
-// of NEW, and returns K's rid to the free-list — but never touches OLD;
-// (3) put(K), still mid-migration: findP(K) fails (removed from NEW),
-// findO(K) matches the stale OLD ghost, and put() returns
-// rowAddr(orid_[oi]) treating it as an idempotent update of an "existing"
-// key — no write to tags_/keys_/rid_, no ++sz_, and K's rid is now
-// dangling in BOTH the free-list and the stale ghost (a future put() for
-// some unrelated new key can pop that same rid from the free-list and
-// silently alias/overwrite K's row). Once migration later fully drains
-// (ot_/ok_/orid_ freed), K is permanently un-gettable and size() stays
-// off by one per key that hit this path.
-//
-// This test deterministically reproduces that exact precondition — rather
-// than hoping a loop statistically triggers it — by duplicating
-// ViewTable's internal mix() (a fixed, documented SplitMix64-style
-// finalizer) to PREDICT each key's OLD-index slot and select a batch of
-// keys guaranteed to already be migrated to NEW (slot < the migration
-// cursor) before running erase()+put() on them mid-migration.
 // ---- Task 6: row-sized dirty tracking for differential checkpoint -------
 
 TEST(ViewTable, DirtyTrackingCoalescesAndClears) {
@@ -258,6 +233,71 @@ TEST(ViewTable, EraseSurfacesDeletedEntryWithKey) {
     EXPECT_TRUE(again.empty());
 }
 
+// Regression (found by code review): drainDirty() must emit deletes BEFORE
+// upserts. A delete-then-reinsert of the SAME key within one drain interval
+// (put(A); erase(A); put(A) again with a different row value) frees A's rid,
+// clears its dirty bit and records a {rid,key} delete entry, then re-marks
+// the SAME rid dirty on reinsert. If drainDirty emitted the upsert first and
+// the delete second (the original, buggy order), a Task-12-style replay that
+// applies entries in emit order would do put(A)+copy-new-row then erase(A),
+// leaving A permanently ABSENT -- silent data loss of a key that is actually
+// still live. Delete-first is safe in every case: a delete for a key NOT
+// reinserted this interval is a correct no-op replay against existing
+// checkpoint state, and a delete immediately followed by its own reinsert's
+// upsert correctly leaves the key present with the latest row.
+//
+// This test does not just check emit order -- it performs an actual
+// mini-replay onto a second, independent ViewTable (as Task 12's checkpoint
+// consumer will) and asserts the REPLAYED table's final state is correct.
+TEST(ViewTableDirtyTrackingRegression, DeleteThenReinsertSameKeyWithinIntervalReplaysCorrectly) {
+    RowLayout L = hpLayout();
+    ViewTable t(L);
+    constexpr uint64_t A = 777;
+    setHp(t.put(A), L, 111);   // put(A) -> rid R, dirty
+    ASSERT_TRUE(t.erase(A));   // erase(A) -> frees R, dirty cleared, deleted_={R,A}
+    setHp(t.put(A), L, 222);   // put(A) again, same key -> reuses rid R, dirty again
+
+    ViewTable replay(L); // independent second table; drainDirty's entries are replayed onto it
+    t.drainDirty([&](uint32_t, const uint8_t* row, bool deleted, uint64_t key){
+        if (deleted) {
+            replay.erase(key);
+        } else {
+            uint8_t* r = replay.put(key);
+            std::copy(row, row + L.rowLen, r);
+        }
+    });
+
+    const uint8_t* got = replay.get(A);
+    ASSERT_NE(got, nullptr) << "key " << A << " must be PRESENT after replay (delete-then-reinsert "
+                                "in one interval must not be lost)";
+    EXPECT_EQ(readSlot(got, L, 1).i, 222) << "replayed row must carry the LATEST (second put's) value";
+}
+
+// CRITICAL regression (found by external code review, NOT caught by this
+// agent's own self-review): migrateStep()'s live-entry copy branch must
+// tombstone the OLD slot the instant it copies that entry into NEW.
+// Without that, findO() has no notion of "already migrated" — it only
+// stops its linear probe at a true kEmpty — so the OLD "ghost" of an
+// already-migrated key stays matchable for the rest of the migration
+// window. Failure sequence: (1) key K is migrated OLD->NEW by
+// migrateStep(); (2) erase(K) succeeds via findP (NEW), backshifts K out
+// of NEW, and returns K's rid to the free-list — but never touches OLD;
+// (3) put(K), still mid-migration: findP(K) fails (removed from NEW),
+// findO(K) matches the stale OLD ghost, and put() returns
+// rowAddr(orid_[oi]) treating it as an idempotent update of an "existing"
+// key — no write to tags_/keys_/rid_, no ++sz_, and K's rid is now
+// dangling in BOTH the free-list and the stale ghost (a future put() for
+// some unrelated new key can pop that same rid from the free-list and
+// silently alias/overwrite K's row). Once migration later fully drains
+// (ot_/ok_/orid_ freed), K is permanently un-gettable and size() stays
+// off by one per key that hit this path.
+//
+// This test deterministically reproduces that exact precondition — rather
+// than hoping a loop statistically triggers it — by duplicating
+// ViewTable's internal mix() (a fixed, documented SplitMix64-style
+// finalizer) to PREDICT each key's OLD-index slot and select a batch of
+// keys guaranteed to already be migrated to NEW (slot < the migration
+// cursor) before running erase()+put() on them mid-migration.
 TEST(ViewTableMigrationRegression, EraseThenReinsertAlreadyMigratedKeyDuringMigrationIsNotLost) {
     auto mixLikeViewTable = [](uint64_t x) -> uint64_t {
         x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;

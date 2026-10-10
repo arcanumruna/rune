@@ -147,24 +147,41 @@ public:
     // 12's checkpoint replay needs the key since there is no row to copy)
     // since the last drainDirty() call, then clears both the dirty set and
     // the deleted list. O(dirty count); no allocation.
+    //
+    // ORDER: deletes are emitted BEFORE upserts. This matters for a same-key
+    // delete-then-reinsert within one interval (put(A); erase(A); put(A)
+    // again — erase() frees and clears A's old rid's dirty bit, then the
+    // reinsert re-marks that SAME rid dirty): emitting the upsert first and
+    // the delete second would let a replay-in-emit-order consumer (Task 12)
+    // apply put(A)+copy-new-row then erase(A), permanently losing a key that
+    // is actually still live. Delete-first is correct in every case: a
+    // delete for a key NOT reinserted this interval is a safe no-op replay
+    // against existing checkpoint state, and a delete immediately followed
+    // by its own reinsert's upsert correctly leaves the key present with the
+    // latest row. (See ViewTableDirtyTrackingRegression.
+    // DeleteThenReinsertSameKeyWithinIntervalReplaysCorrectly.)
     template<class Fn>
     void drainDirty(Fn&& emit) {
+        for (const auto& d : deleted_) {
+            emit(d.rid, nullptr, /*deleted*/true, d.key);
+        }
+        deleted_.clear();
         for (uint32_t rid : dirtyList_) {
             // dirty_[rid] may have been cleared by an intervening erase()
             // (the row no longer exists) -- skip it then; the deleted_
-            // list below already carries that rid's one true entry.
+            // loop above already carried that rid's one true entry.
             if (!dirty_[rid]) continue;
             dirty_[rid] = 0;
             emit(rid, rowAddr(rid), /*deleted*/false, dirtyKeys_[rid]);
         }
         dirtyList_.clear();
-        for (const auto& d : deleted_) {
-            emit(d.rid, nullptr, /*deleted*/true, d.key);
-        }
-        deleted_.clear();
     }
 
-    // Test hook: the rids currently pending in the dirty set (pre-drain).
+    // Test hook: candidate rids pending in the dirty set (NOT an exact
+    // pending-dirty snapshot) as of the last mark/drain. May contain stale
+    // or duplicate rids: a rid cleared by an intervening erase() (see
+    // drainDirty()'s guard) or re-pushed after free-list reuse both leave
+    // extra entries here that drainDirty() itself knows how to skip/resolve.
     std::span<const uint32_t> dirtyRids() const noexcept { return dirtyList_; }
 
 private:
