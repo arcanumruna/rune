@@ -61,11 +61,31 @@ ViewTable::ViewTable(RowLayout layout, size_t initialIndexSlots, size_t chunkByt
     // if the table grows far beyond its initial capacity.
     free_.reserve(cap_);
 
+    // Task 6: dirty-tracking side arrays. dirtyList_/deleted_ only ever
+    // grow in steady state (a reserve() here just gives them a warm start
+    // so the first interval's push_backs don't reallocate); dirty_/
+    // dirtyKeys_ are sized to the rid space by appendChunk(), below.
+    dirtyList_.reserve(cap_);
+    deleted_.reserve(256);
+
     appendChunk(); // start with one chunk so rid 0 is always addressable
 }
 
 void ViewTable::appendChunk() {
     chunks_.emplace_back(rowsPerChunk_ * static_cast<size_t>(layout_.rowLen), uint8_t{0});
+    // dirty_/dirtyKeys_ are indexed by rid and must cover every valid rid.
+    // Grown here (alongside the row slab) rather than on index rehash:
+    // rehash relocates (tag,key,rid) index entries but never changes a
+    // row's rid, so dirty_[rid] must stay keyed to the SAME space the slab
+    // uses, not the index's.
+    dirty_.resize(chunks_.size() * rowsPerChunk_, uint8_t{0});
+    dirtyKeys_.resize(chunks_.size() * rowsPerChunk_, uint64_t{0});
+}
+
+void ViewTable::markDirty(uint32_t rid) noexcept {
+    if (dirty_[rid]) return; // already pending this interval -- coalesce
+    dirty_[rid] = 1;
+    dirtyList_.push_back(rid);
 }
 
 size_t ViewTable::findP(uint64_t key) const noexcept {
@@ -273,12 +293,18 @@ uint8_t* ViewTable::put(uint64_t key) {
 
     const size_t pi = findP(key);
     if (pi != static_cast<size_t>(-1)) {
-        return rowAddr(rid_[pi]); // idempotent upsert: existing key in NEW/primary, no dup
+        const uint32_t rid = rid_[pi];
+        dirtyKeys_[rid] = key;
+        markDirty(rid);
+        return rowAddr(rid); // idempotent upsert: existing key in NEW/primary, no dup
     }
     if (migrating_) {
         const size_t oi = findO(key);
         if (oi != static_cast<size_t>(-1)) {
-            return rowAddr(orid_[oi]); // idempotent upsert: existing key still only in OLD
+            const uint32_t rid = orid_[oi];
+            dirtyKeys_[rid] = key;
+            markDirty(rid);
+            return rowAddr(rid); // idempotent upsert: existing key still only in OLD
         }
     }
 
@@ -316,6 +342,8 @@ uint8_t* ViewTable::put(uint64_t key) {
     uint8_t* row = rowAddr(rid);
     std::fill(row, row + layout_.rowLen, uint8_t{0});
     ++sz_;
+    dirtyKeys_[rid] = key;
+    markDirty(rid);
     return row;
 }
 
@@ -335,21 +363,32 @@ bool ViewTable::erase(uint64_t key) noexcept {
 
     const size_t pi = findP(key);
     if (pi != static_cast<size_t>(-1)) {
-        free_.push_back(rid_[pi]);
+        const uint32_t rid = rid_[pi];
+        free_.push_back(rid);
         backshiftPrimary(pi);
         --sz_;
+        // The row at `rid` no longer exists: clear any pending dirty bit
+        // (drainDirty()'s dirtyList_ loop guards on dirty_[rid] still being
+        // set, so a stale dirtyList_ entry for this rid is harmlessly
+        // skipped) and record the delete tombstone -- keyed, since a
+        // delete has no row for the checkpoint fold to copy.
+        dirty_[rid] = 0;
+        deleted_.push_back({rid, key});
         return true;
     }
 
     if (migrating_) {
         const size_t oi = findO(key);
         if (oi != static_cast<size_t>(-1)) {
-            free_.push_back(orid_[oi]);
+            const uint32_t rid = orid_[oi];
+            free_.push_back(rid);
             // OLD is draining, not steady-state: tombstone rather than
             // backward-shift. migrateStep() skips kTomb entries (< 0x80)
             // when it later walks past this slot.
             ot_[oi] = kTomb;
             --sz_;
+            dirty_[rid] = 0;
+            deleted_.push_back({rid, key});
             return true;
         }
     }

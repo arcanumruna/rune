@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <random>
 #include <vector>
+#include <algorithm>
+#include <utility>
 using namespace rune::view;
 using rune::codec::DescriptorBuilder; using rune::codec::PrimType; using rune::codec::FieldValue;
 
@@ -217,6 +219,45 @@ TEST(ViewTableMigrateScanBoundRegression, EraseDuringMigrationTombstonesOldCorre
 // finalizer) to PREDICT each key's OLD-index slot and select a batch of
 // keys guaranteed to already be migrated to NEW (slot < the migration
 // cursor) before running erase()+put() on them mid-migration.
+// ---- Task 6: row-sized dirty tracking for differential checkpoint -------
+
+TEST(ViewTable, DirtyTrackingCoalescesAndClears) {
+    RowLayout L = hpLayout();
+    ViewTable t(L);
+    setHp(t.put(1), L, 1);
+    setHp(t.put(1), L, 2);   // same row twice in interval
+    setHp(t.put(2), L, 9);
+    std::vector<uint64_t> seenKeys;
+    t.drainDirty([&](uint32_t, const uint8_t*, bool del, uint64_t key){ if(!del) seenKeys.push_back(key); });
+    std::sort(seenKeys.begin(), seenKeys.end());
+    EXPECT_EQ(seenKeys.size(), 2u);          // key 1 coalesced to one entry
+    EXPECT_EQ(seenKeys[0], 1u); EXPECT_EQ(seenKeys[1], 2u);
+    std::vector<uint32_t> again;
+    t.drainDirty([&](uint32_t rid, const uint8_t*, bool, uint64_t){ again.push_back(rid); });
+    EXPECT_TRUE(again.empty());              // cleared after drain
+}
+
+TEST(ViewTable, EraseSurfacesDeletedEntryWithKey) {
+    RowLayout L = hpLayout();
+    ViewTable t(L);
+    setHp(t.put(42), L, 7);
+    t.drainDirty([](uint32_t, const uint8_t*, bool, uint64_t){}); // clear the put's dirty entry first
+    EXPECT_TRUE(t.erase(42));
+
+    std::vector<std::pair<uint64_t,bool>> seen;
+    t.drainDirty([&](uint32_t, const uint8_t* row, bool del, uint64_t key){
+        seen.emplace_back(key, del);
+        if (del) EXPECT_EQ(row, nullptr);
+    });
+    ASSERT_EQ(seen.size(), 1u);
+    EXPECT_EQ(seen[0].first, 42u);
+    EXPECT_TRUE(seen[0].second);
+
+    std::vector<uint32_t> again;
+    t.drainDirty([&](uint32_t rid, const uint8_t*, bool, uint64_t){ again.push_back(rid); });
+    EXPECT_TRUE(again.empty());
+}
+
 TEST(ViewTableMigrationRegression, EraseThenReinsertAlreadyMigratedKeyDuringMigrationIsNotLost) {
     auto mixLikeViewTable = [](uint64_t x) -> uint64_t {
         x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;

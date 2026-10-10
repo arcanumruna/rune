@@ -2,6 +2,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 #include <rune/view/ViewRow.h>
 
@@ -120,6 +121,51 @@ public:
     // completed yet (a write burst outran it). 0 means every grow swapped
     // in a fully pre-zeroed buffer in O(1).
     uint64_t rehashFallbacks() const noexcept { return fallbacks_; }
+
+    // --- Task 6: row-sized dirty tracking for the differential checkpoint ---
+    //
+    // Checkpoint unit is row-sized (one dirty row == one {rid, rowBytes}
+    // entry), per the §9.2 gate — NOT OS pages. `dirty_` is a per-rid bit
+    // (grown alongside the row-slab chunks, NOT the index — a rehash moves
+    // index entries, never rids, so a row's rid and its dirty bit stay
+    // correct across any rehash). `put()` marks the rid it returns dirty;
+    // `markDirty()` is also exposed publicly so the fold that writes
+    // through the returned pointer can (redundantly/idempotently) flag it
+    // too. `dirtyList_` records each rid the FIRST time it is marked dirty
+    // in the current interval (coalescing repeats — a row put/written many
+    // times between drains still emits exactly once).
+
+    // Marks `rid`'s row dirty. O(1): a single bit test to avoid pushing a
+    // duplicate `rid` onto dirtyList_ if it is already pending for this
+    // interval. noexcept, no allocation beyond dirtyList_'s own
+    // (amortized, reserve()'d) growth.
+    void markDirty(uint32_t rid) noexcept;
+
+    // Calls `emit(rid, row, deleted, key)` once for every row dirtied (an
+    // upsert: `row` is the live row pointer, `deleted` is false) or deleted
+    // (`row` is nullptr, `deleted` is true, `key` is the erased key — Task
+    // 12's checkpoint replay needs the key since there is no row to copy)
+    // since the last drainDirty() call, then clears both the dirty set and
+    // the deleted list. O(dirty count); no allocation.
+    template<class Fn>
+    void drainDirty(Fn&& emit) {
+        for (uint32_t rid : dirtyList_) {
+            // dirty_[rid] may have been cleared by an intervening erase()
+            // (the row no longer exists) -- skip it then; the deleted_
+            // list below already carries that rid's one true entry.
+            if (!dirty_[rid]) continue;
+            dirty_[rid] = 0;
+            emit(rid, rowAddr(rid), /*deleted*/false, dirtyKeys_[rid]);
+        }
+        dirtyList_.clear();
+        for (const auto& d : deleted_) {
+            emit(d.rid, nullptr, /*deleted*/true, d.key);
+        }
+        deleted_.clear();
+    }
+
+    // Test hook: the rids currently pending in the dirty set (pre-drain).
+    std::span<const uint32_t> dirtyRids() const noexcept { return dirtyList_; }
 
 private:
     static constexpr uint8_t kEmpty = 0; // tag value for a never-used / vacated slot
@@ -254,6 +300,22 @@ private:
     // pre-provisioning wasn't ready (see rehashFallbacks()).
     double   maxRehashNs_ = 0.0;
     uint64_t fallbacks_   = 0;
+
+    // --- Task 6: row-sized dirty tracking -------------------------------
+    // `dirty_`/`dirtyKeys_` are indexed by `rid` and sized to the rid space
+    // (grown in appendChunk(), i.e. alongside chunk growth — NEVER touched
+    // by index rehash, since a rehash relocates (tag,key,rid) index
+    // entries but a row's rid itself never changes). `dirty_[rid]` is the
+    // per-row dirty bit; `dirtyKeys_[rid]` is the key last written to that
+    // rid via put() (recorded there, not inside markDirty(), because
+    // markDirty() only takes a rid per its public signature) so
+    // drainDirty() can emit `key` for upserts too, not just deletes.
+    std::vector<uint8_t>  dirty_;
+    std::vector<uint64_t> dirtyKeys_;
+    std::vector<uint32_t> dirtyList_; // rids marked dirty this interval, each pushed once (coalesced)
+
+    struct DeletedEntry { uint32_t rid; uint64_t key; };
+    std::vector<DeletedEntry> deleted_; // erase()'d {rid,key} pairs pending drainDirty()
 };
 
 } // namespace rune::view
