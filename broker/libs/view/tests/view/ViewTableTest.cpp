@@ -5,6 +5,7 @@
 #include <rune/codec/Descriptor.h>
 #include <unordered_map>
 #include <random>
+#include <vector>
 using namespace rune::view;
 using rune::codec::DescriptorBuilder; using rune::codec::PrimType; using rune::codec::FieldValue;
 
@@ -189,4 +190,88 @@ TEST(ViewTableMigrateScanBoundRegression, EraseDuringMigrationTombstonesOldCorre
         else ASSERT_NE(t.get(e), nullptr) << "lost key " << e << " (not erased)";
     }
     for (uint64_t v = 55707; v < 200000; ++v) ASSERT_NE(t.get(v), nullptr) << "lost key " << v;
+}
+
+// CRITICAL regression (found by external code review, NOT caught by this
+// agent's own self-review): migrateStep()'s live-entry copy branch must
+// tombstone the OLD slot the instant it copies that entry into NEW.
+// Without that, findO() has no notion of "already migrated" — it only
+// stops its linear probe at a true kEmpty — so the OLD "ghost" of an
+// already-migrated key stays matchable for the rest of the migration
+// window. Failure sequence: (1) key K is migrated OLD->NEW by
+// migrateStep(); (2) erase(K) succeeds via findP (NEW), backshifts K out
+// of NEW, and returns K's rid to the free-list — but never touches OLD;
+// (3) put(K), still mid-migration: findP(K) fails (removed from NEW),
+// findO(K) matches the stale OLD ghost, and put() returns
+// rowAddr(orid_[oi]) treating it as an idempotent update of an "existing"
+// key — no write to tags_/keys_/rid_, no ++sz_, and K's rid is now
+// dangling in BOTH the free-list and the stale ghost (a future put() for
+// some unrelated new key can pop that same rid from the free-list and
+// silently alias/overwrite K's row). Once migration later fully drains
+// (ot_/ok_/orid_ freed), K is permanently un-gettable and size() stays
+// off by one per key that hit this path.
+//
+// This test deterministically reproduces that exact precondition — rather
+// than hoping a loop statistically triggers it — by duplicating
+// ViewTable's internal mix() (a fixed, documented SplitMix64-style
+// finalizer) to PREDICT each key's OLD-index slot and select a batch of
+// keys guaranteed to already be migrated to NEW (slot < the migration
+// cursor) before running erase()+put() on them mid-migration.
+TEST(ViewTableMigrationRegression, EraseThenReinsertAlreadyMigratedKeyDuringMigrationIsNotLost) {
+    auto mixLikeViewTable = [](uint64_t x) -> uint64_t {
+        x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+        x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+        x ^= x >> 31;
+        return x;
+    };
+    constexpr size_t kMigKMirror = 256; // ViewTable::kMigK is private; mirrored here for prediction only
+
+    RowLayout L = hpLayout();
+    ViewTable t(L, /*slots*/1u << 16); // 65536: this becomes OLD once it grows
+    const size_t omask = (1u << 16) - 1;
+
+    uint64_t k = 1;
+    for (; k <= 55706; ++k) setHp(t.put(k), L, 1); // the 55706th put triggers startGrow()
+
+    // Advance migration partway (50 more ops => the drain cursor has swept
+    // past kMigKMirror*50 == 12800 of the 65536 OLD slots) without letting
+    // it fully drain (65536/256 == 256 ops would be needed for that).
+    constexpr int kAdvanceOps = 50;
+    for (int i = 0; i < kAdvanceOps; ++i) { setHp(t.put(k), L, 1); ++k; }
+    const size_t scannedSoFar = kAdvanceOps * kMigKMirror;
+
+    // Any key whose predicted OLD slot already lies behind the drain
+    // cursor is guaranteed already migrated: migrateStep() sweeps the
+    // cursor strictly forward over the OLD slot array and never revisits
+    // a slot once passed.
+    std::vector<uint64_t> migratedKeys;
+    for (uint64_t cand = 1; cand <= 55706 && migratedKeys.size() < 200; ++cand) {
+        if ((mixLikeViewTable(cand) & omask) < scannedSoFar) migratedKeys.push_back(cand);
+    }
+    ASSERT_GE(migratedKeys.size(), 50u) << "test setup: not enough predicted-migrated keys found";
+
+    const size_t sizeBefore = t.size();
+    for (uint64_t mk : migratedKeys) {
+        ASSERT_TRUE(t.erase(mk)) << "erase of already-migrated key " << mk << " should succeed";
+        setHp(t.put(mk), L, 777); // reinsert while (for the earlier keys in this batch) still mid-migration
+    }
+
+    // The direct, immediate symptom: each lost erase+put pair silently
+    // skips ++sz_, so size() drifts low by however many keys hit the bug.
+    EXPECT_EQ(t.size(), sizeBefore)
+        << "erase()+put() pairs on already-migrated keys must be size-neutral";
+
+    // Drive the rest of the table's ops to completion (also fully drains
+    // migration, freeing ot_/ok_/orid_) with a disjoint key range, so a
+    // reused/aliased rid would show up as wrong content on an unrelated key.
+    for (; k <= 120000; ++k) setHp(t.put(k), L, 2);
+
+    for (uint64_t mk : migratedKeys) {
+        ASSERT_NE(t.get(mk), nullptr) << "key " << mk << " permanently LOST after migration fully drained";
+        EXPECT_EQ(readSlot(t.get(mk), L, 1).i, 777) << "key " << mk << " corrupted (possible rid aliasing)";
+    }
+    for (uint64_t v = 55757; v < 120000; ++v) {
+        ASSERT_NE(t.get(v), nullptr) << "lost key " << v;
+        EXPECT_EQ(readSlot(t.get(v), L, 1).i, 2) << "key " << v << " corrupted (possible rid aliasing)";
+    }
 }

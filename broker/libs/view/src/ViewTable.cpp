@@ -225,6 +225,20 @@ void ViewTable::migrateStep() noexcept {
             tags_[i] = t;
             keys_[i] = k;
             rid_[i]  = orid_[ocur_];
+            // CRITICAL: tombstone the OLD slot now that this key lives in
+            // NEW. findO() only stops its probe at a true kEmpty, so a
+            // migrated-but-not-tombstoned OLD slot stays matchable for the
+            // rest of the migration window — a later erase(key) (found via
+            // findP, since it's in NEW) followed by put(key) while still
+            // migrating would hit this stale OLD "ghost" entry in findO()
+            // and treat it as an idempotent update of an existing key,
+            // silently dropping the reinsertion (no write to
+            // tags_/keys_/rid_, no ++sz_) and permanently losing the key
+            // once OLD is later freed. kTomb does not terminate findO's
+            // probe (so later, not-yet-migrated keys in this OLD probe
+            // chain are still reachable), but it does stop this slot from
+            // ever matching again.
+            ot_[ocur_] = kTomb;
         }
         ++ocur_;
         ++scanned;
@@ -245,6 +259,13 @@ void ViewTable::migrateStep() noexcept {
 uint8_t* ViewTable::put(uint64_t key) {
     maybePrezero();
     if (migrating_) {
+        // Deferring the grow-check while already migrating is safe: NEW
+        // was sized to 2x the OLD capacity that triggered this migration,
+        // so even in the worst case (every op during the whole drain
+        // window is a brand-new distinct key) the window closes within
+        // ceil(ocap_/kMigK) ops — far too few new keys to approach NEW's
+        // own 0.85 threshold before migrateStep() finishes draining OLD
+        // and the next startGrow() becomes eligible again.
         migrateStep();
     } else if (sz_ + 1 > static_cast<size_t>(cap_ * kGrowLoad)) {
         startGrow();

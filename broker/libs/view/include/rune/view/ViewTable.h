@@ -130,6 +130,20 @@ private:
     static constexpr size_t kMigK        = 256;  // max OLD entries migrated per migrateStep()
     static constexpr size_t kPrezero     = 1024; // max next-buffer entries zero-filled per maybePrezero()
 
+    // Pre-provision must structurally outpace the grow cadence: between
+    // crossing kPrezeroLoad and kGrowLoad there are (kGrowLoad-kPrezeroLoad)
+    // * cap_ ops, each zero-filling up to kPrezero of the needed 2*cap_
+    // next-buffer entries — so the margin (ops-available * kPrezero vs.
+    // entries-needed) is the cap_-independent ratio below. This is WHY
+    // rehashFallbacks() was observed to stay at 0 under every workload
+    // tried (see task-5-report.md): with the constants above it holds with
+    // ~100x headroom. If either constant above is ever changed, this catches
+    // a regression to "pre-provisioning can't structurally keep up" at
+    // compile time rather than as a silent, load-dependent perf cliff.
+    static_assert(static_cast<double>(kPrezero) * (kGrowLoad - kPrezeroLoad) >= 2.0,
+                  "pre-provision must outpace grow cadence: kPrezero * (kGrowLoad - kPrezeroLoad) must be >= 2.0 "
+                  "(entries zero-filled per op * ops available in the pre-provision window >= 2x capacity needed)");
+
     static uint64_t mix(uint64_t x) noexcept;
     static uint8_t  fullTag(uint64_t h) noexcept;
 
