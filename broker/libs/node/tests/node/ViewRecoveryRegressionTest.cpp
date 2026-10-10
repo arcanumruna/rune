@@ -28,6 +28,26 @@
 //      materialize, then driveRebuild (flip to Ready), then driveFolds (steady
 //      state). Proves the serve-guard holds until Ready and that the ordering
 //      never bypasses the checkpoint with a fresh Ready instance.
+//
+//   4. TwoOwnedPartitionsLazyRecoveryNeverServesHalfBuilt (whole-branch review
+//      Bug A): reproduces the EXACT single-driveViews_-pass ordering over a
+//      worker's two owned partitions {0,1} of the SAME recovery view.
+//      Partition 0 is fully materialized + rebuilt to Ready, which PRUNES the
+//      view out of recoveryViews_ (hasRecovery() -> false) BEFORE partition 1
+//      has ever been hosted. Partition 1 is then driven via driveFolds ONLY
+//      (exactly what Worker::driveViews_ does once hasRecovery() is false --
+//      materializeRecoveryInstancesFor/driveRebuild are skipped entirely for
+//      every later partition). Pre-fix, getOrCreate_ would lazily build
+//      partition 1 as a DEFAULT-READY empty ViewInstance (no checkpoint load),
+//      so a real row would read back terminally NotFound. Post-fix, the
+//      ViewTemplate's underRecovery latch (set by installViewForRecovery,
+//      never reset by the prune) makes getOrCreate_ load partition 1's OWN
+//      checkpoint and start RebuildingViews; a bounded single driveFolds pass
+//      that cannot yet reach the full committed tail leaves it RebuildingViews
+//      (serve-guard: NotReady, retriable) rather than Ready; a further
+//      driveFolds pass (driveRebuild is NEVER called again for this view) must
+//      still reach Ready and serve the fully-recovered row -- proving the
+//      Ready-flip no longer depends on driveRebuild/hasRecovery() either.
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -316,6 +336,128 @@ TEST(ViewRecoveryRegression, DutyCycleOrderingReachesReadyAndServes) {
     ASSERT_NE(row, nullptr);
     EXPECT_EQ(status, rune::node::WorkerViewSet::RowStatus::Ok);
     EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 52);  // hp 50,51,52 -> last 52
+
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+// (4) Whole-branch review Bug A regression -- see the file-level doc comment.
+TEST(ViewRecoveryRegression, TwoOwnedPartitionsLazyRecoveryNeverServesHalfBuilt) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(0), srcs, kViewId).value();
+
+    const std::string dir = uniqueDir("rune-view-bugA-");
+
+    // Partition 0's checkpoint: key 7, hp climbs 10->11, base at O=2.
+    const auto base0 = makeBaseCheckpoint(comp.plan, comp.rowLayout, src, upsertRun(7, 10, 2, 0), 2);
+    // Partition 1's checkpoint: a DIFFERENT key (20), hp climbs 100->101, base
+    // at O=2 -- distinguishable from partition 0's data so a wrong/empty
+    // partition-1 table can never be confused with a correct one.
+    const auto base1 = makeBaseCheckpoint(comp.plan, comp.rowLayout, src, upsertRun(20, 100, 2, 0), 2);
+    const std::string path0 =
+        dir + "/view-" + std::to_string(static_cast<uint32_t>(kViewId)) + "-p0.delta";
+    const std::string path1 =
+        dir + "/view-" + std::to_string(static_cast<uint32_t>(kViewId)) + "-p1.delta";
+    { std::ofstream f(path0, std::ios::binary); f.write(reinterpret_cast<const char*>(base0.data()),
+                                                        static_cast<std::streamsize>(base0.size())); }
+    { std::ofstream f(path1, std::ios::binary); f.write(reinterpret_cast<const char*>(base1.data()),
+                                                        static_cast<std::streamsize>(base1.size())); }
+
+    rune::node::ViewSnapshotChannel channel;
+    rune::node::WorkerViewSet vs(channel, dir);
+
+    pushRecoveryInstall(channel, comp.plan, comp.outputDescriptor, src, /*persistence*/ 0);
+    ASSERT_EQ(vs.drainInstalls(), 1);
+    ASSERT_TRUE(vs.hasRecovery());
+    ASSERT_EQ(vs.instanceCount(), 0u);
+
+    const rune::view::RowLayout* L = nullptr;
+    rune::node::WorkerViewSet::RowStatus status = rune::node::WorkerViewSet::RowStatus::Ok;
+
+    // ── Partition 0: the EXACT Worker::driveViews_ ordering for a recovery
+    // view (materialize -> driveRebuild to Ready). Its committed tail (2,4]
+    // is fully known up front, so this converges to Ready.
+    const auto tail0 = upsertRun(7, 30, 2, /*baseOffset*/ 2);  // offsets [2,4), hp 30,31
+    auto readRange0 = [&](int64_t, int64_t) -> rune::storage::LogReadView {
+        return rune::storage::LogReadView{tail0.data(), tail0.size(), 2, 4};
+    };
+    vs.materializeRecoveryInstancesFor(kSrcId, /*partition*/ 0, /*committedTail*/ 4);
+    ASSERT_EQ(vs.instanceCount(), 1u);
+    ASSERT_EQ(vs.readiness(kViewId, 0), rune::node::ViewReadiness::RebuildingViews);
+    for (int i = 0; i < 64 && vs.readiness(kViewId, 0) != rune::node::ViewReadiness::Ready; ++i)
+        vs.driveRebuild(kSrcId, 0, readRange0, /*committedTail*/ 4, i);
+    ASSERT_EQ(vs.readiness(kViewId, 0), rune::node::ViewReadiness::Ready);
+
+    // The prune fires: partition 0 is the ONLY hosted instance of this view,
+    // and it just reached Ready -- recoveryViews_ drops viewId even though
+    // partition 1 has never been hosted. This is the exact precondition of
+    // Bug A.
+    EXPECT_FALSE(vs.hasRecovery())
+        << "precondition: the prune must fire before partition 1 is ever hosted";
+
+    // ── Partition 1: because hasRecovery() is now false, Worker::driveViews_
+    // would skip materializeRecoveryInstancesFor/driveRebuild ENTIRELY for
+    // this (and every later) owned partition -- only driveFolds ever touches
+    // partition 1. readRange1 returns only a BOUNDED prefix [2,4) of the true
+    // committed tail (2,6] this pass (mirrors a real reader's chunk cap), so
+    // one driveFolds call cannot fully catch partition 1 up.
+    ASSERT_EQ(vs.instanceCount(), 1u) << "partition 1 must not be hosted yet";
+    const auto tail1a = upsertRun(20, 130, 2, /*baseOffset*/ 2);  // offsets [2,4), hp 130,131
+    auto readRange1Partial = [&](int64_t, int64_t) -> rune::storage::LogReadView {
+        return rune::storage::LogReadView{tail1a.data(), tail1a.size(), 2, 4};
+    };
+    vs.driveFolds(kSrcId, /*partition*/ 1, readRange1Partial, /*bound*/ 6, /*nowNs*/ 0);
+
+    ASSERT_EQ(vs.instanceCount(), 2u) << "driveFolds must have lazily created partition 1";
+    // THE Bug A assertion: partition 1 must have loaded ITS OWN checkpoint and
+    // started RebuildingViews -- pre-fix, getOrCreate_ built a fresh
+    // ViewInstance defaulting to Ready (WorkerViewSet.h's ViewInstance::
+    // readiness default) with an EMPTY table, so this would read Ready here.
+    EXPECT_EQ(vs.readiness(kViewId, 1), rune::node::ViewReadiness::RebuildingViews)
+        << "a lazily-created recovery instance must NOT default to Ready "
+           "after its view was pruned from recoveryViews_ by a sibling partition";
+
+    // Serve-guard: still rebuilding -> retriable not-ready, NEVER a terminal
+    // AbsentKey for a key that genuinely exists in partition 1's checkpoint.
+    status = rune::node::WorkerViewSet::RowStatus::Ok;
+    EXPECT_EQ(vs.getRow(kViewId, 1, 20, L, &status), nullptr);
+    EXPECT_EQ(status, rune::node::WorkerViewSet::RowStatus::NotReady)
+        << "pre-fix this reads NotFound -- a REAL row silently served as absent";
+
+    // ── Drive partition 1's remaining committed tail (4,6] via driveFolds
+    // ONLY (driveRebuild is NEVER called again for this view -- hasRecovery()
+    // stays latched false). Proves the Ready-flip no longer depends on
+    // driveRebuild/hasRecovery() either (see driveView_'s Bug-A robustness
+    // check).
+    const auto tail1b = upsertRun(20, 150, 2, /*baseOffset*/ 4);  // offsets [4,6), hp 150,151
+    auto readRange1Rest = [&](int64_t, int64_t) -> rune::storage::LogReadView {
+        return rune::storage::LogReadView{tail1b.data(), tail1b.size(), 4, 6};
+    };
+    vs.driveFolds(kSrcId, /*partition*/ 1, readRange1Rest, /*bound*/ 6, /*nowNs*/ 1);
+
+    EXPECT_EQ(vs.readiness(kViewId, 1), rune::node::ViewReadiness::Ready);
+    EXPECT_TRUE(vs.allViewsReady());
+
+    status = rune::node::WorkerViewSet::RowStatus::NotReady;
+    const uint8_t* row1 = vs.getRow(kViewId, 1, 20, L, &status);
+    ASSERT_NE(row1, nullptr);
+    EXPECT_EQ(status, rune::node::WorkerViewSet::RowStatus::Ok);
+    EXPECT_EQ(rune::view::readSlot(row1, *L, 1).i, 151)  // ckpt 101 -> 130,131 -> 150,151
+        << "partition 1 must serve its OWN fully-recovered row, not an empty/wrong one";
+
+    // A genuinely-absent key now reads terminal NotFound (not NotReady) --
+    // the serve-guard is not masking normal absent-key behavior once Ready.
+    status = rune::node::WorkerViewSet::RowStatus::NotReady;
+    EXPECT_EQ(vs.getRow(kViewId, 1, 999, L, &status), nullptr);
+    EXPECT_EQ(status, rune::node::WorkerViewSet::RowStatus::NotFound);
+
+    // Partition 0 is unaffected by any of partition 1's handling.
+    status = rune::node::WorkerViewSet::RowStatus::NotReady;
+    const uint8_t* row0 = vs.getRow(kViewId, 0, 7, L, &status);
+    ASSERT_NE(row0, nullptr);
+    EXPECT_EQ(status, rune::node::WorkerViewSet::RowStatus::Ok);
+    EXPECT_EQ(rune::view::readSlot(row0, *L, 1).i, 31);
 
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);

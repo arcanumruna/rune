@@ -149,8 +149,16 @@ public:
     // in the reactor `subscriptionIndex_` for each of the plan's source topics.
     // Per-partition ViewInstances are created LAZILY on the first driveFolds
     // for that partition (the stored template has everything lazy-create needs).
+    // `underRecovery` (whole-branch review Bug A): true iff this view's
+    // template was installed for RESTART recovery. It is latched on the
+    // TEMPLATE (never reset by pruneRecoveryIfAllReady_'s recoveryViews_
+    // erase), so getOrCreate_ can keep loading a lazily-created instance's
+    // on-disk checkpoint even after SOME other partition of this view already
+    // pruned the view out of recoveryViews_ in the very same driveViews_ pass.
+    // Defaults false — every existing (non-recovery) call site is unaffected.
     void installView(rune::view::CompiledViewPlan plan, rune::view::RowLayout layout,
-                     rune::codec::Descriptor evolvingSrc, bool persisted);
+                     rune::codec::Descriptor evolvingSrc, bool persisted,
+                     bool underRecovery = false);
 
     // Task 19: drain the control->worker install ring (channel_.install) and
     // install each compiled view plan ON THIS (the worker's OWN) thread — so a
@@ -290,7 +298,10 @@ public:
         if (it == subscriptionIndex_.end()) return 0;
         int work = 0;
         for (int32_t viewTopicId : it->second) {
-            ViewInstance* inst = getOrCreate_(viewTopicId, partition);
+            // `bound` doubles as this pass's committedTail for a lazily-created
+            // recovery instance (Bug A) — it is the SAME source-partition LSO
+            // driveRebuild/materializeRecoveryInstancesFor already use.
+            ViewInstance* inst = getOrCreate_(viewTopicId, partition, bound);
             if (inst == nullptr) continue;  // defensive: template must exist
             work += driveView_(*inst, readRange, bound);
         }
@@ -346,6 +357,16 @@ private:
         rune::view::RowLayout        layout;
         rune::codec::Descriptor      evolvingSrc;
         bool                         persisted;
+        // Whole-branch review Bug A: true iff this view is under RESTART
+        // recovery. Set true by installViewForRecovery / a recovery-flagged
+        // drainInstalls() frame; read by getOrCreate_ so a lazily-created
+        // instance (even one created AFTER recoveryViews_ already pruned this
+        // viewTopicId) still loads its own checkpoint + starts NotReady,
+        // instead of defaulting to a half-built Ready instance. Intentionally
+        // NEVER cleared back to false (see getOrCreate_'s doc comment) — a
+        // re-recovered Ready partition reloading its checkpoint once more is
+        // benign; prematurely clearing it is not.
+        bool                         underRecovery = false;
     };
 
     // (viewTopicId, partition) -> dense composite map key.
@@ -356,7 +377,30 @@ private:
 
     // Look up the (viewTopicId, partition) instance, lazily creating it from the
     // installed template on first use.  nullptr only if no template is installed.
-    ViewInstance* getOrCreate_(int32_t viewTopicId, int32_t partition);
+    //
+    // Whole-branch review Bug A fix: if the template's underRecovery is true,
+    // a freshly-created instance does NOT default to Ready — it loads its own
+    // on-disk checkpoint (same file materializeRecoveryInstancesFor reads) and
+    // sets its readiness from ITS OWN foldCursor vs. `committedTail`, exactly
+    // as a pre-materialized recovery instance would. This makes correctness
+    // independent of recoveryViews_'s prune timing: within one driveViews_
+    // pass over a worker's owned partitions of the SAME recovery view,
+    // partition 0 reaching Ready can prune the view out of recoveryViews_
+    // (hasRecovery() goes false) before partition 1's instance has even been
+    // created — the underRecovery latch on the TEMPLATE (never cleared, see
+    // ViewTemplate's doc comment) still gates this path for partition 1.
+    // `committedTail` is unused when underRecovery is false (every existing
+    // non-recovery call site is unaffected — callers just pass their `bound`).
+    ViewInstance* getOrCreate_(int32_t viewTopicId, int32_t partition, int64_t committedTail);
+
+    // Whole-branch review Bug A: load (view=viewTopicId, partition)'s on-disk
+    // checkpoint file from viewDataDir_ (same path/format
+    // materializeRecoveryInstancesFor uses) into `inst.table`, set foldCursor
+    // to the recovered offset, and set readiness RebuildingViews/Ready from
+    // foldCursor vs. committedTail. Used by getOrCreate_ for a lazily-created
+    // instance of a still-underRecovery template.
+    void loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopicId, int32_t partition,
+                                 int64_t committedTail);
 
     // Task 19b: if every hosted (viewTopicId, *) instance is Ready, erase
     // viewTopicId from recoveryViews_ (so hasRecovery() returns to false once a
@@ -378,6 +422,20 @@ private:
         if (inst.pendingValid) {
             ++work;
             if (!tryPushDelta_(inst)) return work;
+        }
+        // 1b. Bug A (whole-branch review) robustness: flip a not-yet-Ready
+        //     instance to Ready the moment its OWN foldCursor has already
+        //     caught up to `bound` — checked here, BEFORE the "nothing new"
+        //     early return below, so an instance that reached `bound` on an
+        //     EARLIER pass (and was never flipped because that pass's driver
+        //     was driveFolds, not driveRebuild — e.g. a getOrCreate_ lazy
+        //     recovery instance created after hasRecovery() had already
+        //     latched false) still reaches Ready here.  This makes the
+        //     Recovering/RebuildingViews -> Ready transition correct
+        //     independent of which caller (driveFolds vs. driveRebuild) drives
+        //     a given pass, and independent of recoveryViews_'s prune timing.
+        if (inst.readiness != ViewReadiness::Ready && inst.foldCursor >= bound) {
+            inst.readiness = ViewReadiness::Ready;
         }
         // 2. Nothing new committed for this partition — caught up (checked before
         //    the capacity event so capacityExceeded_ counts folds that actually
@@ -404,6 +462,13 @@ private:
             rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view, bound, cursor);
         inst.foldCursor = cursor;
         work += static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedMalformed);
+
+        // Bug A: this pass's OWN fold may be what just caught the instance up
+        // to `bound` — flip it here too (see 1b's doc comment for why this
+        // cannot be left to driveRebuild alone).
+        if (inst.readiness != ViewReadiness::Ready && inst.foldCursor >= bound) {
+            inst.readiness = ViewReadiness::Ready;
+        }
 
         // 4. Transient views stop here — no checkpoint handoff.
         if (!inst.persisted) return work;

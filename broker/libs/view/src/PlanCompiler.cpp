@@ -65,6 +65,19 @@ std::expected<CompileResult, CompileError> compileView(
         return std::unexpected(CompileError{"view '" + authored.viewName +
                                              "' must declare at least one source"});
     }
+    // Whole-branch review Bug C: the rest of the Phase 1 pipeline is
+    // single-source only (fold uses source[0], co-location uses
+    // sourceTopicId[0], one foldCursor per (view, partition)). Accepting 2+
+    // sources here would silently compile a plan the rest of the engine
+    // cannot correctly drive -- reject fail-closed instead. Join/multi-source
+    // resolution is Phase 3 (the per-source vectors below are already sized
+    // for it, but are not yet exercised with more than one entry).
+    if (authored.sources.size() != 1) {
+        return std::unexpected(CompileError{
+            "view '" + authored.viewName + "' must declare exactly one source " +
+            "(Phase 1 views are single-source; got " +
+            std::to_string(authored.sources.size()) + ")"});
+    }
     if (authored.output.empty()) {
         return std::unexpected(CompileError{"view '" + authored.viewName +
                                              "' must declare at least one output field"});
@@ -173,11 +186,19 @@ std::expected<CompileResult, CompileError> compileView(
                 "view '" + authored.viewName + "': source " + std::to_string(i) +
                 " key field '" + src.keyField + "' is var-len; keys must be fixed-width"});
         }
-        if (!isIntegerKeyType(fd->type)) {
+        // Whole-branch review Bug B: restrict VIEW KEY fields to 8-byte integer
+        // types only (Int64/UInt64) -- see isEightByteKeyType's doc comment in
+        // ViewTypes.h for why. Narrow-key (Int32/UInt32/UInt16) support is
+        // DEFERRED until the GetViewRow wire carries the key's native width.
+        // This check is scoped to the KEY field only: non-key integer output
+        // columns still use the unrestricted isIntegerKeyType/isNumeric checks
+        // above.
+        if (!isEightByteKeyType(fd->type)) {
             return std::unexpected(CompileError{
                 "view '" + authored.viewName + "': source " + std::to_string(i) +
                 " key field '" + src.keyField +
-                "' is not a Phase 1 integer key type (Int32/Int64/UInt16/UInt32/UInt64)"});
+                "' is not an 8-byte Phase 1 key type (Int64/UInt64 only -- narrow "
+                "integer keys are deferred, see isEightByteKeyType)"});
         }
 
         keyFieldIds.push_back(fd->id);

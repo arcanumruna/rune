@@ -110,7 +110,8 @@ WorkerViewSet::WorkerViewSet(ViewSnapshotChannel& channel, std::string viewDataD
 
 void WorkerViewSet::installView(rune::view::CompiledViewPlan plan,
                                 rune::view::RowLayout layout,
-                                rune::codec::Descriptor evolvingSrc, bool persisted) {
+                                rune::codec::Descriptor evolvingSrc, bool persisted,
+                                bool underRecovery) {
     const int32_t viewTopicId = plan.viewTopicId;
 
     // Reactor index: every source topic of this view points at it.  Registered
@@ -122,9 +123,15 @@ void WorkerViewSet::installView(rune::view::CompiledViewPlan plan,
         if (!present) ids.push_back(viewTopicId);
     }
 
+    // Bug A: insert_or_assign would otherwise RESET a previously-latched
+    // underRecovery back to its default (false) on a re-install (e.g.
+    // installViewForRecovery re-registering the same template for a second
+    // partition) unless the caller re-asserts it — every recovery call site
+    // below does.
     templates_.insert_or_assign(
         viewTopicId,
-        ViewTemplate{std::move(plan), std::move(layout), std::move(evolvingSrc), persisted});
+        ViewTemplate{std::move(plan), std::move(layout), std::move(evolvingSrc), persisted,
+                     underRecovery});
 }
 
 int WorkerViewSet::drainInstalls() {
@@ -166,7 +173,7 @@ int WorkerViewSet::drainInstalls() {
             }
             const int32_t viewTopicId = plan->viewTopicId;
             installView(std::move(*plan), std::move(layout), std::move(srcDesc),
-                        /*persisted=*/m.persistence == 0);
+                        /*persisted=*/m.persistence == 0, /*underRecovery=*/m.recovery);
             // Task 19b: a RESTART-recovery install registers the template here
             // but defers the per-(view, partition) instance to
             // materializeRecoveryInstancesFor (checkpoint load + serve-guard),
@@ -212,7 +219,8 @@ void WorkerViewSet::materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t 
     }
 }
 
-ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition) {
+ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition,
+                                          int64_t committedTail) {
     const uint64_t key = instKey(viewTopicId, partition);
     auto it = views_.find(key);
     if (it != views_.end()) return &it->second;
@@ -237,7 +245,41 @@ ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition
         std::forward_as_tuple(tpl.plan, tpl.layout, tpl.evolvingSrc, tpl.persisted,
                               partition, indexSlots, chunkBytes));
     (void)inserted;
-    return &ins->second;
+    ViewInstance& inst = ins->second;
+
+    // Bug A fix (whole-branch re-review): a view installed FOR RESTART
+    // RECOVERY must never serve a lazily-created DEFAULT-READY instance, even
+    // after pruneRecoveryIfAllReady_ already erased viewTopicId from
+    // recoveryViews_ because some OTHER partition of this same view reached
+    // Ready earlier in this very driveViews_ pass (hasRecovery() can go false
+    // before every owned partition has even been materialized once). The
+    // underRecovery latch lives on the TEMPLATE — independent of, and never
+    // reset by, that prune — so this path is correct regardless of prune
+    // timing. Load this instance's own on-disk checkpoint (same file
+    // materializeRecoveryInstancesFor would have read) and set readiness from
+    // ITS OWN foldCursor vs. committedTail; a view with no cold checkpoint
+    // file is a valid cold start (foldCursor 0, RebuildingViews) exactly as it
+    // would be via the pre-materialized path.
+    if (tpl.underRecovery) {
+        loadRecoveryCheckpoint_(inst, viewTopicId, partition, committedTail);
+    }
+    return &inst;
+}
+
+void WorkerViewSet::loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopicId,
+                                            int32_t partition, int64_t committedTail) {
+    const std::vector<uint8_t> file =
+        readWholeFile(deltaFilePath(viewDataDir_, viewTopicId, partition));
+    const std::vector<std::span<const uint8_t>> records =
+        splitViewCheckpointRecords(std::span<const uint8_t>(file));
+
+    const int64_t recoveredO = rune::view::replay(
+        inst.table, inst.layout, /*base=*/std::span<const uint8_t>{},
+        std::span<const std::span<const uint8_t>>(records.data(), records.size()));
+    inst.foldCursor   = std::max<int64_t>(recoveredO, 0);
+    inst.lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
+    inst.readiness = (inst.foldCursor >= committedTail) ? ViewReadiness::Ready
+                                                        : ViewReadiness::RebuildingViews;
 }
 
 void WorkerViewSet::installViewForRecovery(
@@ -247,15 +289,36 @@ void WorkerViewSet::installViewForRecovery(
     std::span<const std::span<const uint8_t>> deltasInOrder, int64_t committedTail) {
     const int32_t viewTopicId = plan.viewTopicId;
 
-    // Register the plan template + reactor index exactly as the normal path does
-    // (moves plan/layout/evolvingSrc into templates_).
+    // Register the plan template + reactor index exactly as the normal path
+    // does (moves plan/layout/evolvingSrc into templates_).  underRecovery is
+    // deliberately left FALSE on this call: this function constructs + loads
+    // THIS (view, partition) instance explicitly below, from the CALLER-
+    // supplied base/deltasInOrder (which may be synthetic test spans, not
+    // necessarily this worker's on-disk file) — latching underRecovery=true
+    // before the getOrCreate_ below would make it redundantly re-read +
+    // re-apply viewDataDir_'s on-disk file for this SAME instance via
+    // loadRecoveryCheckpoint_.  The latch is set true right after (below),
+    // so it is in place before this call returns.
     installView(std::move(plan), std::move(layout), std::move(evolvingSrc), persisted);
 
     // Eagerly build the (view, partition) instance from the just-installed
     // template (recovery is partition-specific; it must not wait for a lazy
-    // first driveFolds).
-    ViewInstance* inst = getOrCreate_(viewTopicId, partition);
+    // first driveFolds).  underRecovery is still false at this point, so
+    // getOrCreate_ default-constructs a plain Ready instance (no auto-load);
+    // its readiness is set definitively by the explicit replay() below.
+    ViewInstance* inst = getOrCreate_(viewTopicId, partition, committedTail);
     if (inst == nullptr) return;  // defensive: template must exist (just installed)
+
+    // Bug A (whole-branch review): latch the template's underRecovery=true
+    // NOW, so that a LATER getOrCreate_ for a SIBLING partition of this same
+    // view (not yet hosted here) still loads its own checkpoint instead of
+    // defaulting to a half-built Ready instance — correctness independent of
+    // pruneRecoveryIfAllReady_'s prune timing (recoveryViews_ may already have
+    // dropped this viewTopicId by the time that sibling partition is driven).
+    {
+        auto tit = templates_.find(viewTopicId);
+        if (tit != templates_.end()) tit->second.underRecovery = true;
+    }
 
     // RECOVERING: load this instance's on-disk checkpoint into its table.  O is
     // the highest applied checkpoint offset (the cursor that WAS persisted — the
