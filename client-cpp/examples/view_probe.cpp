@@ -200,7 +200,9 @@ static bool decodeAndCheck(const ViewRowResult& r, int64_t wantId, int64_t wantH
     const rcv::RowLayout layout = charHpRowLayout();
     if (r.rowBytes.size() != layout.rowLen) {
         std::cerr << "PROBE: FAIL " << who << " row size=" << r.rowBytes.size()
-                  << " want=" << layout.rowLen << "\n";
+                  << " want=" << layout.rowLen
+                  << " status=" << static_cast<int>(r.status)
+                  << " (0=Ok 1=AbsentKey 2=NotReady 3=SchemaMismatch 4=UnknownView)\n";
         return false;
     }
     const auto idF = rcv::readSlot(std::span<const uint8_t>(r.rowBytes), layout, 0);
