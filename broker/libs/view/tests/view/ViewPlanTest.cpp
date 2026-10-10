@@ -193,7 +193,13 @@ TEST(ViewPlan, BogusLargeCountRegression) {
     apos += 4 + ap.viewName.size();  // viewName
     apos += 4 + ap.key.size();       // key
     const size_t srcCountOffsetA = apos;
-    apos += 4 + (4 + ap.sources[0].keyField.size());  // sources: count + (topicId + keyField str)
+    // sources: u32 count, then per-source { topicId:i32, keyField:str }
+    // (writeI32LE THEN writeString -- see serializeAuthored). That's
+    // 4 (count) + 4 (topicId i32) + 4 (keyField len prefix) + keyField
+    // bytes = 12 + size, NOT 8 + size (there are two separate 4-byte
+    // fields -- topicId and the keyField length prefix -- between the
+    // sources count and the keyField bytes, not one).
+    apos += 4 + 4 + 4 + ap.sources[0].keyField.size();
     const size_t outCountOffsetA = apos;
 
     for (size_t offset : {srcCountOffsetA, outCountOffsetA}) {
