@@ -55,6 +55,7 @@ enum : int32_t {
     kMsgAdminRole         = 5,
     kMsgEgressFrame       = 6,   // admin → control: [sessionId:i64][response frame]
     kMsgAlterTopic        = 7,   // gateway → admin: ALTER TOPIC (Task 11)
+    kMsgCreateView        = 8,   // gateway → admin: CREATE VIEW (Task 19)
 };
 
 // ---------------------------------------------------------------------------
@@ -68,6 +69,7 @@ enum : int32_t {
 enum : int32_t {
     kA2cStorageFailure = 1,
     kA2cSchemaUpdate   = 2,
+    kA2cViewPlanUpdate = 3,   // Task 19: admin → control, fan out a compiled view plan
 };
 
 // ---------------------------------------------------------------------------
@@ -124,6 +126,20 @@ struct AlterTopicMsg {
 };
 
 // ---------------------------------------------------------------------------
+// CreateView request (gateway → admin).  Owning form after drain (Task 19).
+// `planBlob` is the authored rune::view::ViewPlan (rune::view::serializeAuthored);
+// the admin thread deserializes + compiles it against the source descriptor(s).
+// ---------------------------------------------------------------------------
+struct CreateViewMsg {
+    int64_t              session     = 0;
+    int64_t              corr        = 0;
+    uint8_t              persistence = 0;   // 0 = persisted, 1 = transient
+    std::string          viewName;
+    std::string          keyField;
+    std::vector<uint8_t> planBlob;          // authored ViewPlan (serializeAuthored)
+};
+
+// ---------------------------------------------------------------------------
 // GetSchema request (gateway → admin).  Owning form after drain.
 //
 // requestedFingerprint (Task 13): 0 = latest (AdminWorker resolves via
@@ -144,10 +160,16 @@ struct GetSchemaMsg {
 // CreateTopicRequest (admin → control).  Carries the pending DefineTopic corr
 // so the control-thread reply can be matched back to the admin-side pending op.
 // ---------------------------------------------------------------------------
+// Task 19: `keyField` + `cleanupPolicy` extend the request so the control thread
+// can create a VIEW SINK as a keyed + Compact "table" (not the default Delete
+// topic).  DefineTopic leaves them default (empty keyField, cleanupPolicy 0 =
+// Delete) — byte-compatible with the pre-Task-19 behaviour.
 struct CreateTopicReqMsg {
     int64_t     ticket         = 0;   // admin-assigned monotone id (matches reply)
     int32_t     partitionCount = 1;
     std::string name;
+    std::string keyField;             // Task 19: view sink key field (empty = none)
+    uint8_t     cleanupPolicy  = 0;   // Task 19: 0=Delete, 1=Compact, 2=CompactDelete
 };
 
 // ---------------------------------------------------------------------------
@@ -261,6 +283,53 @@ inline AlterTopicMsg decodeAlterTopic(const uint8_t* buf, std::size_t len) {
     return m;
 }
 
+// ---- CreateView (Task 19) ----
+// Wire layout: session:i64, corr:i64, persistence:u8,
+//   viewNameLen:u16 + name, keyFieldLen:u16 + keyField, planLen:i32 + planBlob.
+inline bool encodeCreateView(OneToOneByteRing& ring, const CreateViewMsg& m) {
+    using namespace admin_wire;
+    const std::size_t len = 8 + 8 + 1
+                          + 2 + m.viewName.size()
+                          + 2 + m.keyField.size()
+                          + 4 + m.planBlob.size();
+    const auto idx = ring.tryClaim(kMsgCreateView, len);
+    if (idx < 0) return false;
+    uint8_t* p = ring.base() + idx;
+    putI64(p, m.session); p += 8;
+    putI64(p, m.corr);    p += 8;
+    *p++ = m.persistence;
+    putU16(p, static_cast<uint16_t>(m.viewName.size())); p += 2;
+    std::memcpy(p, m.viewName.data(), m.viewName.size()); p += m.viewName.size();
+    putU16(p, static_cast<uint16_t>(m.keyField.size())); p += 2;
+    std::memcpy(p, m.keyField.data(), m.keyField.size()); p += m.keyField.size();
+    putI32(p, static_cast<int32_t>(m.planBlob.size())); p += 4;
+    if (!m.planBlob.empty()) std::memcpy(p, m.planBlob.data(), m.planBlob.size());
+    ring.commit(idx);
+    return true;
+}
+
+inline CreateViewMsg decodeCreateView(const uint8_t* buf, std::size_t len) {
+    using namespace admin_wire;
+    CreateViewMsg m;
+    std::size_t pos = 0;
+    if (len < 19) return m;  // session(8)+corr(8)+persistence(1)+viewNameLen(2)
+    m.session = getI64(buf + pos); pos += 8;
+    m.corr    = getI64(buf + pos); pos += 8;
+    m.persistence = buf[pos++];
+    const uint16_t nl = getU16(buf + pos); pos += 2;
+    if (pos + nl > len) return m;
+    m.viewName.assign(reinterpret_cast<const char*>(buf + pos), nl); pos += nl;
+    if (pos + 2 > len) return m;
+    const uint16_t kl = getU16(buf + pos); pos += 2;
+    if (pos + kl > len) return m;
+    m.keyField.assign(reinterpret_cast<const char*>(buf + pos), kl); pos += kl;
+    if (pos + 4 > len) return m;
+    const int32_t bl = getI32(buf + pos); pos += 4;
+    if (bl > 0 && pos + static_cast<std::size_t>(bl) <= len)
+        m.planBlob.assign(buf + pos, buf + pos + bl);
+    return m;
+}
+
 // ---- GetSchema ----
 // Wire layout: session:i64, corr:i64, requestedFingerprint:u64 (0=latest),
 // nameLen:u16 + name bytes.
@@ -293,16 +362,22 @@ inline GetSchemaMsg decodeGetSchema(const uint8_t* buf, std::size_t len) {
 }
 
 // ---- CreateTopicReq ----
+// Layout: ticket:i64, partitionCount:i32, nameLen:u16 + name,
+//         keyFieldLen:u16 + keyField, cleanupPolicy:u8   (Task 19 trailer).
 inline bool encodeCreateTopicReq(OneToOneByteRing& ring, const CreateTopicReqMsg& m) {
     using namespace admin_wire;
-    const std::size_t len = 8 + 4 + 2 + m.name.size();
+    const std::size_t len = 8 + 4 + 2 + m.name.size()
+                          + 2 + m.keyField.size() + 1;
     const auto idx = ring.tryClaim(kMsgCreateTopicReq, len);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
     putI64(p, m.ticket);         p += 8;
     putI32(p, m.partitionCount); p += 4;
     putU16(p, static_cast<uint16_t>(m.name.size())); p += 2;
-    std::memcpy(p, m.name.data(), m.name.size());
+    std::memcpy(p, m.name.data(), m.name.size()); p += m.name.size();
+    putU16(p, static_cast<uint16_t>(m.keyField.size())); p += 2;
+    std::memcpy(p, m.keyField.data(), m.keyField.size()); p += m.keyField.size();
+    *p++ = m.cleanupPolicy;
     ring.commit(idx);
     return true;
 }
@@ -314,8 +389,17 @@ inline CreateTopicReqMsg decodeCreateTopicReq(const uint8_t* buf, std::size_t le
     m.ticket = getI64(buf);
     m.partitionCount = getI32(buf + 8);
     const uint16_t nl = getU16(buf + 12);
-    if (14 + static_cast<std::size_t>(nl) <= len)
-        m.name.assign(reinterpret_cast<const char*>(buf + 14), nl);
+    std::size_t pos = 14;
+    if (pos + nl > len) return m;
+    m.name.assign(reinterpret_cast<const char*>(buf + pos), nl); pos += nl;
+    // Task 19 trailer (keyField + cleanupPolicy) — tolerate its absence so a
+    // decode of a legacy frame still yields name (defaults: empty / Delete).
+    if (pos + 2 > len) return m;
+    const uint16_t kl = getU16(buf + pos); pos += 2;
+    if (pos + kl > len) return m;
+    m.keyField.assign(reinterpret_cast<const char*>(buf + pos), kl); pos += kl;
+    if (pos + 1 > len) return m;
+    m.cleanupPolicy = buf[pos];
     return m;
 }
 
@@ -399,6 +483,68 @@ inline SchemaUpdateMsg decodeSchemaUpdate(const uint8_t* buf, std::size_t len) {
     m.topicId = getI32(buf);
     m.version = static_cast<uint16_t>(buf[4]) | (static_cast<uint16_t>(buf[5]) << 8);
     m.blob.assign(buf + 6, buf + len);
+    return m;
+}
+
+// ---- ViewPlanUpdate (Task 19) ----
+// Carries a compiled view plan + its output + source descriptors to install on a
+// worker's WorkerViewSet.  Used on TWO rings with the SAME wire layout:
+//   admin → control  (kA2cViewPlanUpdate): the admin thread, after commit, hands
+//                     the compiled plan to the control thread for fan-out;
+//   control → worker (ViewSnapshotChannel::kInstallMsgType): the control thread
+//                     delivers it to each worker, whose WorkerViewSet installs it
+//                     on its OWN thread (shared-nothing — installView is never
+//                     called cross-thread).
+// Wire layout: viewTopicId:i32, persistence:u8,
+//   planLen:i32 + plan, outDescLen:i32 + outDesc, srcDescLen:i32 + srcDesc.
+struct ViewPlanUpdateMsg {
+    int32_t              viewTopicId = -1;
+    uint8_t              persistence = 0;
+    std::vector<uint8_t> planBlob;      // rune::view::serialize(CompiledViewPlan)
+    std::vector<uint8_t> outDescBlob;   // rune::codec::serialize(outputDescriptor)
+    std::vector<uint8_t> srcDescBlob;   // rune::codec::serialize(sourceDescriptor)
+};
+
+[[nodiscard]] inline std::size_t viewPlanUpdateWireLen(const ViewPlanUpdateMsg& m) noexcept {
+    return 4 + 1 + 4 + m.planBlob.size() + 4 + m.outDescBlob.size() + 4 + m.srcDescBlob.size();
+}
+
+inline bool encodeViewPlanUpdate(OneToOneByteRing& ring, int32_t msgType,
+                                 const ViewPlanUpdateMsg& m) {
+    using namespace admin_wire;
+    const auto idx = ring.tryClaim(msgType, viewPlanUpdateWireLen(m));
+    if (idx < 0) return false;
+    uint8_t* p = ring.base() + idx;
+    putI32(p, m.viewTopicId); p += 4;
+    *p++ = m.persistence;
+    putI32(p, static_cast<int32_t>(m.planBlob.size())); p += 4;
+    std::memcpy(p, m.planBlob.data(), m.planBlob.size()); p += m.planBlob.size();
+    putI32(p, static_cast<int32_t>(m.outDescBlob.size())); p += 4;
+    std::memcpy(p, m.outDescBlob.data(), m.outDescBlob.size()); p += m.outDescBlob.size();
+    putI32(p, static_cast<int32_t>(m.srcDescBlob.size())); p += 4;
+    std::memcpy(p, m.srcDescBlob.data(), m.srcDescBlob.size());
+    ring.commit(idx);
+    return true;
+}
+
+inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t len) {
+    using namespace admin_wire;
+    ViewPlanUpdateMsg m;
+    std::size_t pos = 0;
+    if (len < 9) return m;  // viewTopicId(4) + persistence(1) + planLen(4)
+    m.viewTopicId = getI32(buf + pos); pos += 4;
+    m.persistence = buf[pos++];
+    auto readBlob = [&](std::vector<uint8_t>& out) -> bool {
+        if (pos + 4 > len) return false;
+        const int32_t bl = getI32(buf + pos); pos += 4;
+        if (bl < 0 || pos + static_cast<std::size_t>(bl) > len) return false;
+        if (bl > 0) out.assign(buf + pos, buf + pos + bl);
+        pos += static_cast<std::size_t>(bl);
+        return true;
+    };
+    if (!readBlob(m.planBlob))    return m;
+    if (!readBlob(m.outDescBlob)) return m;
+    (void)readBlob(m.srcDescBlob);
     return m;
 }
 

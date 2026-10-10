@@ -516,6 +516,24 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # Task 19: CreateViewRegressionTest — CREATE VIEW control plane (create-and-run
+    # path): compile + validate + keyed/Compact sink + __views persist + respond +
+    # fan-out install onto a real WorkerViewSet.  On-host (no Aeron / media driver).
+    # ---------------------------------------------------------------------------
+    add_executable(rune_create_view_tests
+        tests/integration/CreateViewRegressionTest.cpp)
+    target_include_directories(rune_create_view_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_create_view_tests PRIVATE
+        rune_node
+        rune_view
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_create_view_tests
+        PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
     # Task 7: ProduceValidationTest — per-worker schema validation hook.
     #
     # Tests (on-host, no Aeron / media driver):

@@ -135,6 +135,14 @@ public:
     void installView(rune::view::CompiledViewPlan plan, rune::view::RowLayout layout,
                      rune::codec::Descriptor evolvingSrc, bool persisted);
 
+    // Task 19: drain the control->worker install ring (channel_.install) and
+    // install each compiled view plan ON THIS (the worker's OWN) thread — so a
+    // view created at runtime folds live without any cross-thread write into the
+    // worker-owned maps.  Decodes a rune::node::ViewPlanUpdateMsg per frame,
+    // rebuilds the RowLayout from the output descriptor, and calls installView.
+    // Returns the number of plans installed this pass (a progress count).
+    int drainInstalls();
+
     // Task 16: install a view FOR RECOVERY for ONE partition.  Registers the
     // plan template (like installView) AND eagerly creates the (view, partition)
     // instance, then loads its on-disk checkpoint into the partition's table via

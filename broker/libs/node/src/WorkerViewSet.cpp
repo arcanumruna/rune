@@ -1,7 +1,16 @@
 // libs/node/src/WorkerViewSet.cpp — Task 15.
 #include <rune/node/WorkerViewSet.h>
+#include <rune/node/AdminChannels.h>   // Task 19: ViewPlanUpdateMsg + decodeViewPlanUpdate
+
+#include <rune/codec/Serialize.h>      // rune::codec::deserialize
+#include <rune/view/ViewPlan.h>        // rune::view::deserializeCompiledViewPlan
+#include <rune/view/ViewRow.h>         // rune::view::buildRowLayout
+
+#include <spdlog/spdlog.h>
 
 #include <cstring>
+#include <optional>
+#include <span>
 #include <utility>
 
 namespace rune::node {
@@ -47,6 +56,49 @@ void WorkerViewSet::installView(rune::view::CompiledViewPlan plan,
     templates_.insert_or_assign(
         viewTopicId,
         ViewTemplate{std::move(plan), std::move(layout), std::move(evolvingSrc), persisted});
+}
+
+int WorkerViewSet::drainInstalls() {
+    // Single consumer (this worker thread) of the control->worker install ring.
+    return channel_.install.drain(
+        [this](int32_t tid, aeron::concurrent::AtomicBuffer& b,
+               aeron::util::index_t off, aeron::util::index_t len) {
+            if (tid != ViewSnapshotChannel::kInstallMsgType) return;
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            const ViewPlanUpdateMsg m = decodeViewPlanUpdate(p, static_cast<std::size_t>(len));
+
+            std::optional<rune::view::CompiledViewPlan> plan =
+                rune::view::deserializeCompiledViewPlan(
+                    std::span<const uint8_t>(m.planBlob.data(), m.planBlob.size()));
+            if (!plan) {
+                spdlog::error("WorkerViewSet: install for viewTopicId={} dropped — "
+                              "compiled plan failed to deserialize", m.viewTopicId);
+                return;
+            }
+            rune::codec::Descriptor outDesc;
+            rune::codec::Descriptor srcDesc;
+            try {
+                outDesc = rune::codec::deserialize(
+                    std::span<const uint8_t>(m.outDescBlob.data(), m.outDescBlob.size()));
+                srcDesc = rune::codec::deserialize(
+                    std::span<const uint8_t>(m.srcDescBlob.data(), m.srcDescBlob.size()));
+            } catch (const std::exception& ex) {
+                spdlog::error("WorkerViewSet: install for viewTopicId={} dropped — "
+                              "descriptor deserialize failed: {}", m.viewTopicId, ex.what());
+                return;
+            }
+            rune::view::RowLayout layout;
+            try {
+                layout = rune::view::buildRowLayout(outDesc);
+            } catch (const std::exception& ex) {
+                spdlog::error("WorkerViewSet: install for viewTopicId={} dropped — "
+                              "buildRowLayout failed: {}", m.viewTopicId, ex.what());
+                return;
+            }
+            installView(std::move(*plan), std::move(layout), std::move(srcDesc),
+                        /*persisted=*/m.persistence == 0);
+        },
+        /*limit=*/8);
 }
 
 ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition) {

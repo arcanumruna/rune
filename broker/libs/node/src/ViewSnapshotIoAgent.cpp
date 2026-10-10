@@ -88,7 +88,13 @@ void encodeAck(uint8_t* buf, int32_t viewTopicId, int32_t partition, int64_t O) 
 ViewSnapshotIoAgent::ViewSnapshotIoAgent(ViewSnapshotChannel& channel,
                                          std::string viewDataDir,
                                          int64_t fsyncMs)
-    : channel_(channel)
+    : ViewSnapshotIoAgent(std::vector<ViewSnapshotChannel*>{&channel},
+                          std::move(viewDataDir), fsyncMs) {}
+
+ViewSnapshotIoAgent::ViewSnapshotIoAgent(std::vector<ViewSnapshotChannel*> channels,
+                                         std::string viewDataDir,
+                                         int64_t fsyncMs)
+    : channels_(std::move(channels))
     , viewDataDir_(std::move(viewDataDir))
     , fsyncMs_(fsyncMs)
 {
@@ -142,7 +148,7 @@ ViewSnapshotIoAgent::FileState* ViewSnapshotIoAgent::fileFor_(const Key& key) {
     return &ins->second;
 }
 
-void ViewSnapshotIoAgent::handleDeltaFrame_(const uint8_t* p, std::size_t len) {
+void ViewSnapshotIoAgent::handleDeltaFrame_(const uint8_t* p, std::size_t len, int channelIdx) {
     if (len < ViewSnapshotChannel::kDeltaHeaderBytes) return; // malformed frame -- drop
 
     const int32_t viewTopicId = static_cast<int32_t>(readLE32(p));
@@ -164,6 +170,7 @@ void ViewSnapshotIoAgent::handleDeltaFrame_(const uint8_t* p, std::size_t len) {
 
     FileState* fs = fileFor_(key);
     if (fs == nullptr) return; // open failed this cycle (transient, NOT cached) -- drop, retried next delta
+    fs->channelIdx = channelIdx;  // Task 19: route this key's done acks back to its channel
 
     // appendNoSync-style: a plain write(), no fsync here -- fsyncs are
     // GROUPED in flushDue_ (offset-atomic: see file header).
@@ -190,14 +197,16 @@ void ViewSnapshotIoAgent::handleDeltaFrame_(const uint8_t* p, std::size_t len) {
     fs->dirtySinceSync = true;
 }
 
-void ViewSnapshotIoAgent::postDone_(int32_t viewTopicId, int32_t partition, int64_t O) {
+void ViewSnapshotIoAgent::postDone_(int32_t viewTopicId, int32_t partition, int64_t O, int channelIdx) {
     uint8_t buf[ViewSnapshotChannel::kDoneMsgBytes];
     encodeAck(buf, viewTopicId, partition, O);
-    if (!channel_.done.write(buf, sizeof(buf), ViewSnapshotChannel::kDoneMsgType)) {
+    auto* ch = (channelIdx >= 0 && channelIdx < static_cast<int>(channels_.size()))
+                   ? channels_[channelIdx] : nullptr;
+    if (!ch || !ch->done.write(buf, sizeof(buf), ViewSnapshotChannel::kDoneMsgType)) {
         // Ring momentarily full -- retry next cycle (never dropped). The
         // in-process lastDurableOffset() is already correct regardless of
         // whether this notification lands; see file header.
-        pendingAcks_.push_back(PendingAck{viewTopicId, partition, O});
+        pendingAcks_.push_back(PendingAck{viewTopicId, partition, O, channelIdx});
     }
 }
 
@@ -208,7 +217,9 @@ void ViewSnapshotIoAgent::drainPendingAcks_() {
         const auto& ack = pendingAcks_[i];
         uint8_t buf[ViewSnapshotChannel::kDoneMsgBytes];
         encodeAck(buf, ack.viewTopicId, ack.partition, ack.O);
-        if (!channel_.done.write(buf, sizeof(buf), ViewSnapshotChannel::kDoneMsgType)) {
+        auto* ch = (ack.channelIdx >= 0 && ack.channelIdx < static_cast<int>(channels_.size()))
+                       ? channels_[ack.channelIdx] : nullptr;
+        if (!ch || !ch->done.write(buf, sizeof(buf), ViewSnapshotChannel::kDoneMsgType)) {
             if (keep != i) pendingAcks_[keep] = pendingAcks_[i];
             ++keep;
         }
@@ -247,7 +258,7 @@ void ViewSnapshotIoAgent::flushDue_(int64_t nowNs, bool idle) {
         }
         fs.lastDurableO    = fs.pendingO;
         fs.dirtySinceSync  = false;
-        postDone_(key.viewTopicId, key.partition, fs.lastDurableO);
+        postDone_(key.viewTopicId, key.partition, fs.lastDurableO, fs.channelIdx);
     }
     lastFsyncNs_ = nowNs;
 }
@@ -255,14 +266,19 @@ void ViewSnapshotIoAgent::flushDue_(int64_t nowNs, bool idle) {
 int ViewSnapshotIoAgent::doWork(int64_t nowNs) {
     drainPendingAcks_();
 
-    int drained = channel_.deltas.drain(
-        [this](int32_t type, aeron::concurrent::AtomicBuffer& buf,
-               aeron::util::index_t off, aeron::util::index_t len) {
-            if (type != ViewSnapshotChannel::kDeltaMsgType) return;
-            handleDeltaFrame_(reinterpret_cast<const uint8_t*>(buf.buffer() + off),
-                              static_cast<std::size_t>(len));
-        },
-        /*limit=*/64);
+    int drained = 0;
+    for (int ci = 0; ci < static_cast<int>(channels_.size()); ++ci) {
+        ViewSnapshotChannel* ch = channels_[ci];
+        if (!ch) continue;
+        drained += ch->deltas.drain(
+            [this, ci](int32_t type, aeron::concurrent::AtomicBuffer& buf,
+                       aeron::util::index_t off, aeron::util::index_t len) {
+                if (type != ViewSnapshotChannel::kDeltaMsgType) return;
+                handleDeltaFrame_(reinterpret_cast<const uint8_t*>(buf.buffer() + off),
+                                  static_cast<std::size_t>(len), ci);
+            },
+            /*limit=*/64);
+    }
 
     flushDue_(nowNs, /*idle=*/drained == 0);
     drainPendingAcks_();

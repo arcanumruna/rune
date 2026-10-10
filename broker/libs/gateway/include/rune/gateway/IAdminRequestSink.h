@@ -60,6 +60,23 @@ struct IAdminRequestSink {
                                   uint16_t expectedVersion,
                                   const uint8_t* opsBlob,
                                   uint32_t opsLen) = 0;
+
+    // CreateView (templateId 70) — Task 19: the gateway has decoded the frame
+    // (viewName + keyField + persistence + the authored ViewPlan planBlob) and
+    // copies the fields into the sink, which OWNS the copy; RETURNS IMMEDIATELY
+    // (copy-and-return, same discipline as the other DDL submits — no registry
+    // access, no blocking on the gateway hot path).  The admin thread
+    // deserializes + compiles + validates the plan asynchronously and produces
+    // the CreateViewResponse on the session egress.
+    //
+    // Returns true if the request was accepted (enqueued on the admin ring);
+    // false on back-pressure (ring full) — the caller may drop (client retries).
+    virtual bool submitCreateView(int64_t sessionId, int64_t correlationId,
+                                  std::string_view viewName,
+                                  std::string_view keyField,
+                                  uint8_t persistence,
+                                  const uint8_t* planBlob,
+                                  uint32_t planLen) = 0;
 };
 
 } // namespace rune::gateway

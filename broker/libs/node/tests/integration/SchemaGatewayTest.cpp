@@ -170,6 +170,15 @@ struct SgHarness {
             if (opsBlob && opsLen) m.opsBlob.assign(opsBlob, opsBlob+opsLen);
             return encodeAlterTopic(*ring, m);
         }
+        // Task 19: CreateView (70) — mirrors AdminWorkerAgent::submitCreateView.
+        bool submitCreateView(int64_t s, int64_t c, std::string_view viewName,
+                              std::string_view keyField, uint8_t persistence,
+                              const uint8_t* planBlob, uint32_t planLen) override {
+            CreateViewMsg m; m.session=s; m.corr=c; m.persistence=persistence;
+            m.viewName.assign(viewName); m.keyField.assign(keyField);
+            if (planBlob && planLen) m.planBlob.assign(planBlob, planBlob+planLen);
+            return encodeCreateView(*ring, m);
+        }
     } sink;
 
     // Captured egress frames (sessionId, bytes) via onControlFrame_.
@@ -204,8 +213,11 @@ struct SgHarness {
         // AdminDeps: requestCreateTopic → createReqRing; respond* → egressRing.
         AdminDeps deps;
         deps.requestCreateTopic = [this](int64_t ticket, int32_t parts,
-                                         const std::string& name) -> bool {
+                                         const std::string& name,
+                                         const std::string& keyField,
+                                         uint8_t cleanupPolicy) -> bool {
             CreateTopicReqMsg m; m.ticket=ticket; m.partitionCount=parts; m.name=name;
+            m.keyField=keyField; m.cleanupPolicy=cleanupPolicy;
             return encodeCreateTopicReq(createReqRing, m);
         };
         deps.pushValidators = [](const RegistryEntry&, int32_t) {};

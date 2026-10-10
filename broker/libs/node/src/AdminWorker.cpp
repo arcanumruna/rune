@@ -2,9 +2,13 @@
 #include <rune/codec/Serialize.h>  // rune::codec::deserialize/serialize (throws on bad input)
 #include <rune/codec/Evolve.h>     // checkCompatibility / applyOps (Task 11)
 #include <rune/codec/AlterOps.h>   // decodeAlterOps
+#include <rune/view/PlanCompiler.h> // rune::view::compileView (Task 19)
 #include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/RecordBatch.h>
 #include <spdlog/spdlog.h>
+
+#include <algorithm>
+#include <cctype>
 
 namespace rune::node {
 
@@ -16,17 +20,26 @@ static constexpr uint16_t kInvalidSchema  = 23;
 static constexpr uint16_t kTopicExists    = 25;
 static constexpr uint16_t kSchemaIncompatible = 30;  // ALTER compat gate reject
 static constexpr uint16_t kSchemaConflict     = 31;  // ALTER stale expectedVersion (CAS)
+// Task 19 view-engine error codes (rune::protocol::client::ErrorCode).
+static constexpr uint16_t kViewExists         = 32;  // CreateView on an existing name
+static constexpr uint16_t kViewSourceNotFound = 33;  // plan references a missing source topic
+static constexpr uint16_t kViewFieldUnresolved= 34;  // plan references an unresolved field
+static constexpr uint16_t kViewKeyInvalid     = 35;  // key field invalid under the source schema
 
 AdminWorker::AdminWorker(SchemaRegistry& reg,
                          rune::replication::PartitionReplica* replica,
                          int32_t selfId,
                          std::vector<int32_t> replicaSet,
-                         AdminDeps deps)
+                         AdminDeps deps,
+                         rune::replication::PartitionReplica* viewsReplica,
+                         ViewRegistry* viewRegistry)
     : reg_(reg)
     , replica_(replica)
     , selfId_(selfId)
     , replicaSet_(std::move(replicaSet))
-    , deps_(std::move(deps)) {}
+    , deps_(std::move(deps))
+    , viewsReplica_(viewsReplica)
+    , viewRegistry_(viewRegistry) {}
 
 // ─── nextSchemaVersion_ — single source of truth for CONTIGUOUS versions ────
 // (Task 10). DefineTopic (create, this task) and ALTER (Task 11) both route
@@ -53,6 +66,16 @@ void AdminWorker::onRole(const AdminRoleMsg& role) {
             replica_->becomeLeader(static_cast<rune::replication::Epoch>(role.epoch),
                                    std::move(isr));
         }
+        // Task 19: the __views replica is admin-owned too — drive its role on the
+        // SAME edge (so CreateView's appendKeyed sees a leader replica).
+        if (viewsReplica_) {
+            std::vector<rune::replication::NodeId> visr;
+            visr.reserve(replicaSet_.size());
+            for (int32_t id : replicaSet_)
+                visr.push_back(static_cast<rune::replication::NodeId>(id));
+            viewsReplica_->becomeLeader(static_cast<rune::replication::Epoch>(role.epoch),
+                                        std::move(visr));
+        }
         leader_ = true;
         if (!wasLeader_) {
             // Follower→Leader edge: rebuild registry from the replicated log.
@@ -76,6 +99,11 @@ void AdminWorker::onRole(const AdminRoleMsg& role) {
                 static_cast<rune::replication::Epoch>(role.epoch),
                 static_cast<rune::replication::NodeId>(role.leaderId));
         }
+        if (viewsReplica_) {
+            viewsReplica_->becomeFollower(
+                static_cast<rune::replication::Epoch>(role.epoch),
+                static_cast<rune::replication::NodeId>(role.leaderId));
+        }
         leader_    = false;
         wasLeader_ = false;  // next promotion re-triggers rebuild
     }
@@ -86,6 +114,13 @@ void AdminWorker::submitDefineTopic(DefineTopicMsg msg) {
     PendingDdl pd;
     pd.kind   = DdlKind::Create;
     pd.define = std::move(msg);
+    pending_.push_back(std::move(pd));
+}
+
+void AdminWorker::submitCreateView(CreateViewMsg msg) {
+    PendingDdl pd;
+    pd.kind = DdlKind::CreateView;
+    pd.view = std::move(msg);
     pending_.push_back(std::move(pd));
 }
 
@@ -138,6 +173,14 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
         // Stale/mismatched reply — ignore (the op may have timed out).
         return;
     }
+    // ── CREATE VIEW branch (Task 19): the reply carries the view's SINK topicId,
+    //    which is ALSO the view's own topic id.  Append the durable ViewRecord to
+    //    __views and gate on viewsReplica_'s HW (not the schema replica's).
+    if (inFlight_->kind == DdlKind::CreateView) {
+        onCreateViewReply_(reply);
+        return;
+    }
+
     if (reply.topicId < 0) {
         // Control thread failed to create the topic → Internal error.
         deps_.respondDefine(inFlight_->msg.session, inFlight_->msg.corr,
@@ -209,12 +252,71 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
     state_ = DdlState::AwaitingCommit;
 }
 
+// ─── onCreateViewReply_ — CREATE VIEW sink id came back; append the ViewRecord ─
+void AdminWorker::onCreateViewReply_(const CreateTopicReplyMsg& reply) {
+    if (reply.topicId < 0) {
+        deps_.respondCreateView(inFlight_->view.session, inFlight_->view.corr,
+                                -1, 0, kInternal);
+        inFlight_.reset();
+        state_ = DdlState::Idle;
+        return;
+    }
+    // D: leader guard + views catalog wired.
+    if (!leader_ || !viewsReplica_ || !viewRegistry_) {
+        deps_.respondCreateView(inFlight_->view.session, inFlight_->view.corr,
+                                -1, 0, kInternal);
+        inFlight_.reset();
+        state_ = DdlState::Idle;
+        return;
+    }
+
+    inFlight_->topicId = reply.topicId;
+    // Stamp the authoritative sink id onto the compiled plan (it is the view's
+    // own topic id) BEFORE serializing it into the durable ViewRecord.
+    inFlight_->compiledPlan.viewTopicId = reply.topicId;
+
+    ViewRecord rec;
+    rec.viewTopicId     = reply.topicId;
+    rec.viewName        = inFlight_->view.viewName;
+    rec.compiledPlanBlob = rune::view::serialize(inFlight_->compiledPlan);
+    rec.persistence     = inFlight_->view.persistence;
+    inFlight_->viewRecord = rec;  // applied on the HW gate (advance_)
+
+    const std::vector<uint8_t> payload = rec.serialize();
+    // __views is CleanupPolicy::Compact and keyed by the viewTopicId (4-byte LE
+    // int32) — the compaction key the cleaner uses — so the latest record per
+    // view survives compaction (views are not versioned: one record per view id).
+    uint8_t keyBuf[4];
+    const uint32_t u = static_cast<uint32_t>(reply.topicId);
+    keyBuf[0] = static_cast<uint8_t>(u & 0xff);
+    keyBuf[1] = static_cast<uint8_t>((u >> 8) & 0xff);
+    keyBuf[2] = static_cast<uint8_t>((u >> 16) & 0xff);
+    keyBuf[3] = static_cast<uint8_t>((u >> 24) & 0xff);
+
+    const rune::replication::Offset base =
+        viewsReplica_->appendKeyed(std::span<const uint8_t>(keyBuf, 4),
+                                   std::span<const uint8_t>(payload.data(), payload.size()),
+                                   /*acksAll=*/true);
+    if (base < 0) {
+        deps_.respondCreateView(inFlight_->view.session, inFlight_->view.corr,
+                                -1, 0, kInternal);
+        inFlight_.reset();
+        state_ = DdlState::Idle;
+        return;
+    }
+    inFlight_->appendedBase = base;
+    inFlight_->appendedLast = base;
+    viewsReplica_->onLeaderLogAppended();
+    state_ = DdlState::AwaitingCommit;
+}
+
 // ─── doWork ─────────────────────────────────────────────────────────────────
 int AdminWorker::doWork(int64_t nowNs) {
     int work = 0;
 
-    // 1. Drive the replica (RULING-2 A: admin thread SOLELY drives doWork).
-    if (replica_) work += replica_->doWork(nowNs);
+    // 1. Drive the replica(s) (RULING-2 A: admin thread SOLELY drives doWork).
+    if (replica_)      work += replica_->doWork(nowNs);
+    if (viewsReplica_) work += viewsReplica_->doWork(nowNs);   // Task 19: __views
 
     // 2. Advance the in-flight DDL (HW check / commit).
     if (advance_(nowNs)) ++work;
@@ -234,6 +336,10 @@ void AdminWorker::startNext_(int64_t nowNs) {
 
     if (pd.kind == DdlKind::Alter) {
         startAlter_(std::move(pd.alter), nowNs);
+        return;
+    }
+    if (pd.kind == DdlKind::CreateView) {
+        startCreateView_(std::move(pd.view), nowNs);
         return;
     }
 
@@ -273,10 +379,98 @@ void AdminWorker::startNext_(int64_t nowNs) {
     op.fieldCount = static_cast<uint16_t>(fieldCount);
     op.msg        = std::move(msg);
 
-    if (!deps_.requestCreateTopic(op.ticket, op.msg.partitionCount, op.msg.name)) {
+    if (!deps_.requestCreateTopic(op.ticket, op.msg.partitionCount, op.msg.name,
+                                  /*keyField=*/"", /*cleanupPolicy=*/0)) {
         // Ring full (should not happen for rare DDL) → Internal; requeue would risk
         // reordering, so fail fast and let the client retry.
         deps_.respondDefine(op.msg.session, op.msg.corr, -1, 0, kInternal);
+        return;
+    }
+    inFlight_ = std::move(op);
+    state_    = DdlState::AwaitingId;
+}
+
+// ─── startCreateView_ — serialized CREATE VIEW (compile + validate + sink) ────
+//
+// Runs on the admin thread, reusing the DDL state machine so a CREATE VIEW is
+// serialized with every other DDL op (single inFlight_).  Like DefineTopic it
+// goes through the createTopic id round-trip (the view's keyed+Compact SINK
+// topic) → AwaitingId; the durable ViewRecord is appended when the sink id comes
+// back (onCreateTopicReply), and commit (advance_) applies it to the registry,
+// registers the view's output descriptor and fans the compiled plan to workers.
+void AdminWorker::startCreateView_(CreateViewMsg msg, int64_t nowNs) {
+    namespace rv = rune::view;
+
+    // ── leader guard (D) ── DDL is leader-only; views catalog must be wired.
+    if (!leader_ || !viewsReplica_ || !viewRegistry_) {
+        deps_.respondCreateView(msg.session, msg.corr, -1, 0, kInternal);
+        return;
+    }
+
+    // ── ViewExists ── a view with this name already committed.
+    if (const ViewRecord* ex = viewRegistry_->byName(msg.viewName)) {
+        deps_.respondCreateView(msg.session, msg.corr, ex->viewTopicId, 0, kViewExists);
+        return;
+    }
+
+    // ── deserialize the authored plan ──
+    std::optional<rv::ViewPlan> authored =
+        rv::deserializeAuthored(std::span<const uint8_t>(msg.planBlob.data(), msg.planBlob.size()));
+    if (!authored || authored->sources.empty()) {
+        deps_.respondCreateView(msg.session, msg.corr, -1, 0, kViewFieldUnresolved);
+        return;
+    }
+
+    // ── resolve each source topic's current descriptor from the schema registry ──
+    // A missing source => ViewSourceNotFound (resolved HERE, not via CompileError,
+    // so the wire code is exact — compileView only sees descriptors that exist).
+    std::vector<const rune::codec::Descriptor*> srcDescs;
+    srcDescs.reserve(authored->sources.size());
+    for (const auto& s : authored->sources) {
+        const RegistryEntry* e = reg_.byId(s.topicId);
+        if (!e) {
+            deps_.respondCreateView(msg.session, msg.corr, -1, 0, kViewSourceNotFound);
+            return;
+        }
+        srcDescs.push_back(&e->descriptor);
+    }
+
+    // ── compile + validate ── (viewTopicId stamped later, on the sink reply) ──
+    std::expected<rv::CompileResult, rv::CompileError> compiled =
+        rv::compileView(*authored,
+                        std::span<const rune::codec::Descriptor* const>(srcDescs.data(), srcDescs.size()),
+                        /*viewTopicId=*/-1);
+    if (!compiled) {
+        // CompileError is a human-readable message, not an enum — classify the
+        // common categories to the right wire error code (key-related → KeyInvalid,
+        // otherwise field/column resolution → FieldUnresolved).
+        std::string lc = compiled.error().message;
+        std::transform(lc.begin(), lc.end(), lc.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const uint16_t code = (lc.find("key") != std::string::npos)
+                                  ? kViewKeyInvalid : kViewFieldUnresolved;
+        deps_.respondCreateView(msg.session, msg.corr, -1, 0, code);
+        return;
+    }
+
+    // ── CREATING ── post a keyed+Compact SINK create request to the control
+    // thread; the view sink is co-partitioned with its (single) source (spec §11.2).
+    DdlOp op;
+    op.kind              = DdlKind::CreateView;
+    op.ticket            = nextTicket_++;
+    op.startedNs         = nowNs;
+    op.view              = std::move(msg);
+    op.compiledPlan      = std::move(compiled->plan);
+    op.viewOutDesc       = std::move(compiled->outputDescriptor);
+    op.viewSrcDesc       = *srcDescs[0];   // single-source (co-partition-trivial)
+    op.outputFingerprint = op.compiledPlan.outputFingerprint;
+
+    const RegistryEntry* srcEntry = reg_.byId(authored->sources[0].topicId);
+    const int32_t sinkPartitions  = srcEntry ? srcEntry->partitionCount : 1;
+
+    if (!deps_.requestCreateTopic(op.ticket, sinkPartitions, op.view.viewName,
+                                  op.view.keyField, /*cleanupPolicy=*/1 /*Compact*/)) {
+        deps_.respondCreateView(op.view.session, op.view.corr, -1, 0, kInternal);
         return;
     }
     inFlight_ = std::move(op);
@@ -414,6 +608,9 @@ bool AdminWorker::advance_(int64_t nowNs) {
         if (inFlight_->kind == DdlKind::Alter)
             deps_.respondAlter(inFlight_->alter.session, inFlight_->alter.corr,
                                inFlight_->topicId, 0, kInternal);
+        else if (inFlight_->kind == DdlKind::CreateView)
+            deps_.respondCreateView(inFlight_->view.session, inFlight_->view.corr,
+                                    -1, 0, kInternal);
         else
             deps_.respondDefine(inFlight_->msg.session, inFlight_->msg.corr,
                                 -1, 0, kInternal);
@@ -423,6 +620,19 @@ bool AdminWorker::advance_(int64_t nowNs) {
     }
 
     if (state_ == DdlState::AwaitingCommit) {
+        // Task 19: CREATE VIEW's durable record lives on the __views replica, so
+        // its HW gate (and commit) use viewsReplica_, not the schema replica_.
+        if (inFlight_->kind == DdlKind::CreateView) {
+            if (!viewsReplica_ || !viewRegistry_) {
+                inFlight_.reset(); state_ = DdlState::Idle; return true;
+            }
+            if (viewsReplica_->highWatermark() <= inFlight_->appendedLast) return false;
+            commitCreateView_();
+            inFlight_.reset();
+            state_ = DdlState::Idle;
+            return true;
+        }
+
         if (!replica_) { inFlight_.reset(); state_ = DdlState::Idle; return true; }
         // D: true majority-durable — HW must cover the appended offset.
         if (replica_->highWatermark() <= inFlight_->appendedLast) return false;
@@ -473,6 +683,49 @@ bool AdminWorker::advance_(int64_t nowNs) {
         }
     }
     return false;
+}
+
+// ─── commitCreateView_ — CREATE VIEW on-commit (HW gate passed) ──────────────
+void AdminWorker::commitCreateView_() {
+    const int32_t viewTopicId = inFlight_->topicId;
+
+    // 1. Apply the durable ViewRecord to the in-memory catalog.
+    viewRegistry_->applyRecord(inFlight_->viewRecord);
+
+    // 2. Register the view's OUTPUT descriptor in the SchemaRegistry so the view
+    //    is a typed topic (GetTopicSchema / openView handshake).  In-memory only
+    //    here (create-and-run); restart recovery (Task 19b) re-registers it from
+    //    the ViewRecord's compiled plan.
+    int32_t sinkPartitions = 1;
+    if (!inFlight_->compiledPlan.sourceTopicId.empty()) {
+        if (const RegistryEntry* se = reg_.byId(inFlight_->compiledPlan.sourceTopicId[0]))
+            sinkPartitions = se->partitionCount;
+    }
+    TopicSchema ts;
+    ts.topicId        = viewTopicId;
+    ts.version        = kInitialSchemaVersion;
+    ts.partitionCount = sinkPartitions;
+    ts.keyField       = inFlight_->view.keyField;
+    ts.validate       = false;
+    ts.descriptorBlob = rune::codec::serialize(inFlight_->viewOutDesc);
+    ts.nextTag        = static_cast<uint16_t>(inFlight_->viewOutDesc.fields.size());
+    reg_.applyRecord(ts);
+
+    // 3. Respond OK with the view's topic id + output fingerprint.
+    deps_.respondCreateView(inFlight_->view.session, inFlight_->view.corr,
+                            viewTopicId, inFlight_->outputFingerprint, kOK);
+
+    // 4. Fan the compiled plan out to the workers (installView on each worker's
+    //    OWN thread, via the control thread — never cross-thread here).
+    if (deps_.pushViewPlan) {
+        ViewPlanUpdateMsg vp;
+        vp.viewTopicId = viewTopicId;
+        vp.persistence = inFlight_->view.persistence;
+        vp.planBlob    = rune::view::serialize(inFlight_->compiledPlan);
+        vp.outDescBlob = rune::codec::serialize(inFlight_->viewOutDesc);
+        vp.srcDescBlob = rune::codec::serialize(inFlight_->viewSrcDesc);
+        deps_.pushViewPlan(vp);
+    }
 }
 
 // ─── rebuildFromLog_ — C: replay [0, HW) into the registry on promotion ──────

@@ -49,6 +49,8 @@
 #include <rune/node/AdminChannels.h>
 #include <rune/node/AdminControlPlane.h>
 #include <rune/node/SchemaFanout.h>
+#include <rune/node/ViewSnapshotChannel.h>
+#include <rune/node/ViewSnapshotIoAgent.h>
 #include <rune/node/OwnerThreadTestTask.h>
 #include <rune/node/LeaderObserver.h>
 #include <rune/gateway/ClientGateway.h>
@@ -199,8 +201,11 @@ public:
                      rune::replication::PartitionReplica* replica,
                      int32_t selfId,
                      std::vector<int32_t> replicaSet,
-                     AdminDeps deps)
-        : worker_(reg, replica, selfId, std::move(replicaSet), std::move(deps))
+                     AdminDeps deps,
+                     rune::replication::PartitionReplica* viewsReplica = nullptr,
+                     ViewRegistry* viewRegistry = nullptr)
+        : worker_(reg, replica, selfId, std::move(replicaSet), std::move(deps),
+                  viewsReplica, viewRegistry)
         , requestRing_(kAdminRequestRingBytes)
         , replyRing_(kCreateTopicRingBytes)
         , roleRing_(kAdminRoleRingBytes) {}
@@ -254,6 +259,23 @@ public:
         return encodeAlterTopic(requestRing_, m);
     }
 
+    // Task 19: CreateView (templateId 70) — gateway → admin ring hand-off, same
+    // discipline as the other DDL submits above.
+    bool submitCreateView(int64_t sessionId, int64_t correlationId,
+                          std::string_view viewName, std::string_view keyField,
+                          uint8_t persistence, const uint8_t* planBlob,
+                          uint32_t planLen) override {
+        CreateViewMsg m;
+        m.session     = sessionId;
+        m.corr        = correlationId;
+        m.persistence = persistence;
+        m.viewName.assign(viewName);
+        m.keyField.assign(keyField);
+        if (planBlob && planLen)
+            m.planBlob.assign(planBlob, planBlob + planLen);
+        return encodeCreateView(requestRing_, m);
+    }
+
     int doWork(int64_t nowNs) noexcept override {
         int work = 0;
 
@@ -289,6 +311,8 @@ public:
                 worker_.submitGetSchema(decodeGetSchema(p, n));
             } else if (tid == kMsgAlterTopic) {
                 worker_.submitAlterTopic(decodeAlterTopic(p, n));
+            } else if (tid == kMsgCreateView) {
+                worker_.submitCreateView(decodeCreateView(p, n));
             }
         }, 16);
 
@@ -298,6 +322,7 @@ public:
         // 4b. F3 round 6, item 3: retry SchemaUpdates the admin→control ring
         //     could not take (full) — retry-on-full, never a drop.
         if (!schemaBacklog_.empty()) [[unlikely]] work += flushSchemaBacklog_();
+        if (!viewPlanBacklog_.empty()) [[unlikely]] work += flushViewPlanBacklog_();  // Task 19
 
         // 5. fsyncgate (Task 10 fix 3 / I1): the schema log this thread drives
         //    failed an fsync → hand it to the control thread (ring, no shared
@@ -355,6 +380,24 @@ public:
     [[nodiscard]] std::size_t schemaBacklogForTest() const noexcept { return schemaBacklog_.size(); }
     int flushSchemaBacklogForTest() { return flushSchemaBacklog_(); }
 
+    /// Task 19 — ADMIN thread only (called from deps.pushViewPlan inside
+    /// AdminWorker::commitCreateView_).  Post a compiled view plan on the
+    /// admin→control ring (kA2cViewPlanUpdate); the control thread fans it out to
+    /// every worker's install ring.  Ring full → admin-owned backlog, retried
+    /// every doWork (FIFO, never dropped).
+    void postViewPlan(const ViewPlanUpdateMsg& vp) {
+        if (viewPlanUpdateWireLen(vp) > static_cast<std::size_t>(failureRing_.maxMsgLength()))
+            [[unlikely]] {
+            spdlog::error("AdminWorkerAgent: ViewPlanUpdate for viewTopicId={} ({} B) exceeds "
+                          "the admin→control ring max message ({} B); view NOT installed",
+                          vp.viewTopicId, viewPlanUpdateWireLen(vp), failureRing_.maxMsgLength());
+            return;
+        }
+        if (!viewPlanBacklog_.empty() ||
+            !encodeViewPlanUpdate(failureRing_, kA2cViewPlanUpdate, vp))
+            viewPlanBacklog_.push_back(vp);   // keep FIFO order
+    }
+
     // -----------------------------------------------------------------------
     // Producer-side accessors — the gateway/control thread enqueues here.
     // requestRing_ producer = gateway/control duty-cycle thread.
@@ -381,6 +424,7 @@ private:
     OneToOneByteRing failureRing_{kAdminToControlRingBytes};
     bool             storageFailureSignalled_ = false;
     std::vector<SchemaUpdateMsg> schemaBacklog_;   // admin-thread-owned (ring-full retry)
+    std::vector<ViewPlanUpdateMsg> viewPlanBacklog_; // Task 19: admin-owned (ring-full retry)
 
     int flushSchemaBacklog_() {
         std::size_t sent = 0;
@@ -390,6 +434,16 @@ private:
             ++sent;
         schemaBacklog_.erase(schemaBacklog_.begin(),
                              schemaBacklog_.begin() + static_cast<std::ptrdiff_t>(sent));
+        return static_cast<int>(sent);
+    }
+
+    int flushViewPlanBacklog_() {
+        std::size_t sent = 0;
+        while (sent < viewPlanBacklog_.size() &&
+               encodeViewPlanUpdate(failureRing_, kA2cViewPlanUpdate, viewPlanBacklog_[sent]))
+            ++sent;
+        viewPlanBacklog_.erase(viewPlanBacklog_.begin(),
+                               viewPlanBacklog_.begin() + static_cast<std::ptrdiff_t>(sent));
         return static_cast<int>(sent);
     }
 };
@@ -1036,6 +1090,28 @@ private:
     std::unique_ptr<rune::storage::Log>                   viewsLog_;
     std::unique_ptr<rune::replication::PartitionReplica>  viewsReplica_;
     std::unique_ptr<ViewRegistry>                         viewRegistry_;
+
+    // -----------------------------------------------------------------------
+    // Task 19: live view-fold wiring.  One ViewSnapshotChannel + one
+    // WorkerViewSet per worker (index = worker id); the WorkerViewSet is wired
+    // into the worker via setViewSet() before the runners start (single-
+    // threaded, like setOwnedDirect).  A single per-NODE ViewSnapshotIoAgent
+    // drains EVERY worker's channel on its own thread (mirrors the cleaner
+    // agent).  fanoutViewPlan_/pumpViewFanout_ deliver a committed compiled plan
+    // (admin→control) to each worker's install ring (control→worker) with
+    // retry-on-full held in viewFanoutBacklog_ (never dropped).
+    // -----------------------------------------------------------------------
+    std::vector<std::unique_ptr<ViewSnapshotChannel>>     viewSnapshotChannels_;
+    std::vector<std::unique_ptr<WorkerViewSet>>           workerViewSets_;
+    std::unique_ptr<ViewSnapshotIoAgent>                  viewSnapshotIoAgent_;
+    std::unique_ptr<rune::consensus::BackoffIdleStrategy> viewSnapshotIoIdleStrategy_;
+    rune::consensus::MonotonicNanoClock                   viewSnapshotIoClock_;
+    std::unique_ptr<rune::consensus::AgentRunner>         viewSnapshotIoRunner_;
+    struct ViewFanoutPending { ViewPlanUpdateMsg msg; int32_t nextWorker = 0; };
+    std::vector<ViewFanoutPending>                        viewFanoutBacklog_;  // control-thread-owned
+    void fanoutViewPlan_(ViewPlanUpdateMsg msg);   // control thread
+    int  pumpViewFanout_();                        // control thread (every cycle)
+
     // Runtime-cycle DDL control plane (direct call; see AdminControlPlane.h).
     friend class AdminControlPlane;
     void attachFusedRuntimeDoorbell_();   // A9: runtime's cross-thread rings → worker 0's doorbell (fused)

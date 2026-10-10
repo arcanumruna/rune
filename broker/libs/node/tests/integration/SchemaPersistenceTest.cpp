@@ -234,7 +234,9 @@ protected:
         // performs appendDurable + HW-gated commit internally (RULING-2 D).
         AdminDeps deps;
         deps.requestCreateTopic = [this](int64_t ticket, int32_t /*partitionCount*/,
-                                         const std::string& /*name*/) -> bool {
+                                         const std::string& /*name*/,
+                                         const std::string& /*keyField*/,
+                                         uint8_t /*cleanupPolicy*/) -> bool {
             pendingTicket_ = ticket;
             return true;
         };
@@ -490,7 +492,8 @@ TEST_F(SchemaPersistenceTest, Regression_RULING1_TopicIdIsReturnedByCreateTopic)
     int64_t ticket = -1;
 
     AdminDeps deps;
-    deps.requestCreateTopic = [&ticket](int64_t t, int32_t, const std::string&) -> bool {
+    deps.requestCreateTopic = [&ticket](int64_t t, int32_t, const std::string&,
+                                        const std::string&, uint8_t) -> bool {
         ticket = t; return true;
     };
     deps.pushValidators = [](const RegistryEntry&, int32_t) {};
@@ -623,7 +626,7 @@ TEST_F(SchemaPersistenceTest, ReplayReconstructsAllVersionsAndNextTag) {
     // ── Path B: AdminWorker::rebuildFromLog_ (follower -> leader promotion). ─
     SchemaRegistry promotedReg;
     AdminDeps noopDeps;
-    noopDeps.requestCreateTopic = [](int64_t, int32_t, const std::string&) { return true; };
+    noopDeps.requestCreateTopic = [](int64_t, int32_t, const std::string&, const std::string&, uint8_t) { return true; };
     noopDeps.pushValidators     = [](const RegistryEntry&, int32_t) {};
     noopDeps.respondDefine      = [](int64_t, int64_t, int32_t, uint16_t, uint16_t) {};
     noopDeps.respondGet         = [](int64_t, int64_t, int32_t, uint16_t,
@@ -733,7 +736,7 @@ TEST_F(SchemaPersistenceTest, CorruptRecordAbortsRebuildRegression) {
     //    recovering node would.
     SchemaRegistry promotedReg;
     AdminDeps noopDeps;
-    noopDeps.requestCreateTopic = [](int64_t, int32_t, const std::string&) { return true; };
+    noopDeps.requestCreateTopic = [](int64_t, int32_t, const std::string&, const std::string&, uint8_t) { return true; };
     noopDeps.pushValidators     = [](const RegistryEntry&, int32_t) {};
     noopDeps.respondDefine      = [](int64_t, int64_t, int32_t, uint16_t, uint16_t) {};
     noopDeps.respondGet         = [](int64_t, int64_t, int32_t, uint16_t,
@@ -1050,7 +1053,7 @@ TEST(SchemaPersistenceCompaction, OldVersionsSurviveCompactionRegression) {
     uint16_t lastAlterError    = 0xffff;
 
     AdminDeps deps;
-    deps.requestCreateTopic = [&](int64_t ticket, int32_t, const std::string&) -> bool {
+    deps.requestCreateTopic = [&](int64_t ticket, int32_t, const std::string&, const std::string&, uint8_t) -> bool {
         pendingTicket = ticket;
         return true;
     };
@@ -1904,7 +1907,7 @@ TEST(SchemaPersistenceCompaction, LongLineageSurvivesCompactionAndMixedReadRegre
     uint16_t lastAlterError    = 0xffff;
 
     AdminDeps deps;
-    deps.requestCreateTopic = [&](int64_t ticket, int32_t, const std::string&) -> bool {
+    deps.requestCreateTopic = [&](int64_t ticket, int32_t, const std::string&, const std::string&, uint8_t) -> bool {
         pendingTicket = ticket;
         return true;
     };

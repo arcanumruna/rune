@@ -70,6 +70,13 @@ public:
     explicit ViewSnapshotIoAgent(ViewSnapshotChannel& channel,
                                  std::string viewDataDir,
                                  int64_t fsyncMs = 50);
+    // Task 19: per-NODE agent draining EVERY worker's channel.  Each pointer must
+    // outlive this agent (same lifetime discipline as the single-channel ctor).
+    // A delta's `done` ack is routed back to the channel it arrived on (so each
+    // worker learns the durable offset of its OWN deltas).
+    explicit ViewSnapshotIoAgent(std::vector<ViewSnapshotChannel*> channels,
+                                 std::string viewDataDir,
+                                 int64_t fsyncMs = 50);
     ~ViewSnapshotIoAgent() override;
 
     ViewSnapshotIoAgent(const ViewSnapshotIoAgent&)            = delete;
@@ -132,19 +139,20 @@ private:
         int64_t lastDurableO    = -1;  // highest O CONFIRMED fdatasync'd
         bool    dirtySinceSync  = false;
         bool    errored         = false; // FATAL write error: stream stopped (see hasError())
+        int     channelIdx      = 0;    // Task 19: which channel this (view,part) arrived on
     };
 
-    void handleDeltaFrame_(const uint8_t* p, std::size_t len);
+    void handleDeltaFrame_(const uint8_t* p, std::size_t len, int channelIdx);
     // Returns nullptr on an ::open() failure -- NOT cached in files_, so the
     // next call for the same key retries open() (review-round-1 fix: a
     // transient failure must never permanently blackhole a key).
     FileState* fileFor_(const Key& key);
     std::string deltaFilePath_(const Key& key) const;
     void flushDue_(int64_t nowNs, bool idle);
-    void postDone_(int32_t viewTopicId, int32_t partition, int64_t O);
+    void postDone_(int32_t viewTopicId, int32_t partition, int64_t O, int channelIdx);
     void drainPendingAcks_();
 
-    ViewSnapshotChannel& channel_;
+    std::vector<ViewSnapshotChannel*> channels_;   // Task 19: one or more worker channels
     std::string          viewDataDir_;
     int64_t              fsyncMs_;
     int64_t              lastFsyncNs_   = 0;
@@ -156,7 +164,7 @@ private:
     // cycle before any new acks (never lost, never reordered ahead of a
     // newer ack for the SAME key since flushDue_ only ever queues the
     // latest durable O per key per pass).
-    struct PendingAck { int32_t viewTopicId; int32_t partition; int64_t O; };
+    struct PendingAck { int32_t viewTopicId; int32_t partition; int64_t O; int channelIdx; };
     std::vector<PendingAck> pendingAcks_;
 };
 

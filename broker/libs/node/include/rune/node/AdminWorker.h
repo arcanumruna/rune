@@ -7,6 +7,9 @@
 #include <vector>
 #include "rune/node/SchemaRegistry.h"
 #include "rune/node/AdminChannels.h"
+#include "rune/node/ViewRegistry.h"
+#include <rune/view/ViewPlan.h>
+#include <rune/codec/Descriptor.h>
 
 namespace rune::replication { class PartitionReplica; }
 
@@ -44,11 +47,24 @@ struct AdminDeps {
     // CREATING: post a create-topic request to the control thread.  Returns true
     // if the request was enqueued on the ring (false = ring full / no channel).
     // The authoritative topicId arrives later via CreateTopicReplyMsg.
+    // Task 19: `keyField` + `cleanupPolicy` let the control thread create a VIEW
+    // SINK as a keyed + Compact "table".  DefineTopic passes ("", 0) — the
+    // pre-Task-19 Delete topic.
     std::function<bool(int64_t ticket, int32_t partitionCount,
-                       const std::string& name)> requestCreateTopic;
+                       const std::string& name, const std::string& keyField,
+                       uint8_t cleanupPolicy)> requestCreateTopic;
 
     // PUBLISHING: push validators to each produce worker after commit (validate=true).
     std::function<void(const RegistryEntry&, int32_t topicId)> pushValidators;
+
+    // Task 19: fan out a committed compiled view plan to the control thread,
+    // which delivers it to each worker's WorkerViewSet (installView on the
+    // worker's OWN thread — never cross-thread).  Admin → control ring hand-off.
+    std::function<void(const ViewPlanUpdateMsg&)> pushViewPlan;
+
+    // Task 19: send the CreateView response back to the client (encode + egress).
+    std::function<void(int64_t session, int64_t corr, int32_t viewTopicId,
+                       uint64_t outputFingerprint, uint16_t errorCode)> respondCreateView;
 
     // Send the DefineTopic response back to the client (encode + egress).
     std::function<void(int64_t session, int64_t corr, int32_t topicId,
@@ -88,7 +104,14 @@ public:
                 rune::replication::PartitionReplica* replica,
                 int32_t selfId,
                 std::vector<int32_t> replicaSet,
-                AdminDeps deps);
+                AdminDeps deps,
+                // Task 19: the __views catalog + its replica.  Both admin-thread-
+                // owned (the admin thread is the ONLY thread that drives/append
+                // the views replica + mutates the ViewRegistry).  Null in pure
+                // unit tests / deployments with no view catalog (CreateView then
+                // responds kInternal).
+                rune::replication::PartitionReplica* viewsReplica = nullptr,
+                ViewRegistry* viewRegistry = nullptr);
 
     // -----------------------------------------------------------------------
     // Ingress — enqueue an op (called on the ADMIN thread by AdminWorkerAgent
@@ -96,6 +119,10 @@ public:
     // -----------------------------------------------------------------------
     void submitDefineTopic(DefineTopicMsg msg);
     void submitGetSchema(const GetSchemaMsg& msg);
+
+    // CREATE VIEW (Task 19).  Queued onto the SAME pending_ deque as DefineTopic
+    // so it is SERIALIZED with every other DDL op (one inFlight_ at a time).
+    void submitCreateView(CreateViewMsg msg);
 
     // ALTER TOPIC (Task 11).  Queued onto the SAME pending_ deque as DefineTopic
     // so it is SERIALIZED with CREATE and other ALTERs (one inFlight_ at a time).
@@ -148,6 +175,24 @@ private:
     // Start the next queued DDL op (if idle).
     void startNext_(int64_t nowNs);
 
+    // CREATE VIEW branch of startNext_ (admin thread, leader-guarded; Task 19).
+    // Deserializes + compiles + validates the authored plan against the source
+    // descriptor(s) in `reg_`, maps a CompileError to the right view error code,
+    // ViewExists-guards against `viewRegistry_`, then posts a keyed+Compact sink
+    // create request → AwaitingId.  On failure nothing is appended.
+    void startCreateView_(CreateViewMsg msg, int64_t nowNs);
+
+    // CREATE VIEW branch of onCreateTopicReply (Task 19): the sink id came back;
+    // stamp it onto the compiled plan, append the durable ViewRecord to __views,
+    // and move to AwaitingCommit (gated on the views replica's HW).
+    void onCreateViewReply_(const CreateTopicReplyMsg& reply);
+
+    // CREATE VIEW commit (Task 19), on the HW gate: apply the ViewRecord to the
+    // ViewRegistry, register the view's output descriptor in the SchemaRegistry
+    // (so GetTopicSchema/openView works — the view is a typed topic), respond OK,
+    // and fan the compiled plan out to the workers (pushViewPlan).
+    void commitCreateView_();
+
     // ALTER branch of startNext_ (admin thread, leader-guarded).  Resolves the
     // topic, runs the optimistic-CAS + compatibility gate, applies the ops to
     // the current evolving descriptor and appends the new durable TopicSchema —
@@ -176,14 +221,15 @@ private:
     // Which kind of DDL an op (queued or in-flight) is.  CREATE goes through the
     // createTopic round-trip (AwaitingId); ALTER skips it (topic already exists)
     // and commits straight to AwaitingCommit.
-    enum class DdlKind { Create, Alter };
+    enum class DdlKind { Create, Alter, CreateView };
 
-    // A queued DDL op, discriminated by `kind`.  Exactly one of the two message
+    // A queued DDL op, discriminated by `kind`.  Exactly one of the message
     // members is meaningful (shared-nothing cold-path struct; DDL is rare).
     struct PendingDdl {
         DdlKind        kind = DdlKind::Create;
         DefineTopicMsg define;   // kind == Create
         AlterTopicMsg  alter;    // kind == Alter
+        CreateViewMsg  view;     // kind == CreateView
     };
 
     // One queued/in-flight DDL op.  Each state uses exactly its own fields.
@@ -203,6 +249,14 @@ private:
         //    contiguous version is NOT recomputed later) ──────────────────────
         uint16_t       newVersion    = 0;    // latest.version + 1
         TopicSchema    alterSchema;          // the record applied on the HW gate
+
+        // ── CREATE VIEW-only (Task 19; compiled ONCE in startCreateView_) ──────
+        CreateViewMsg                view;              // the request (session/corr/persistence)
+        rune::view::CompiledViewPlan compiledPlan;      // viewTopicId stamped on the reply
+        rune::codec::Descriptor      viewOutDesc;       // output descriptor (registered in reg_)
+        rune::codec::Descriptor      viewSrcDesc;       // source descriptor (fan-out evolvingSrc)
+        uint64_t                     outputFingerprint = 0;
+        ViewRecord                   viewRecord;        // the record applied on the HW gate
     };
 
     SchemaRegistry&                       reg_;
@@ -210,6 +264,10 @@ private:
     int32_t                               selfId_;
     std::vector<int32_t>                  replicaSet_;
     AdminDeps                             deps_;
+
+    // Task 19: the __views durable catalog (admin-thread-owned, like replica_).
+    rune::replication::PartitionReplica*  viewsReplica_  = nullptr;
+    ViewRegistry*                         viewRegistry_  = nullptr;
 
     // Leadership (admin-thread-owned; driven only by onRole()).
     bool     leader_      = false;

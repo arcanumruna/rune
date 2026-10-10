@@ -564,6 +564,12 @@ void BrokerNode::start() {
     if (provisionerRunner_) {
         provisionerRunner_->start();
     }
+    // 8c. Task 19: the per-node view-snapshot IO thread — drains every worker's
+    //     checkpoint-delta ring to disk off the produce/consume hot path.
+    if (viewSnapshotIoRunner_) {
+        viewSnapshotIoRunner_->start();
+        spdlog::info("BrokerNode[{}]: ViewSnapshotIoAgent thread started", config_.nodeId);
+    }
 
     // 9. DR-15 fix round 1: the cold peer-hostname resolver thread — every
     //    consumer ring is subscribed by now (subscribe*() is startup-only).
@@ -1677,6 +1683,37 @@ void BrokerNode::buildWorkerPool() {
         }
         spdlog::info("BrokerNode[{}]: per-worker replication transport wired to {} worker(s)",
                      config_.nodeId, wc);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 19: live view-fold wiring.  One ViewSnapshotChannel + WorkerViewSet
+    // per worker; wire each into its worker via setViewSet() HERE — single-
+    // threaded, before the runners start (like setOwnedDirect).  A single
+    // per-NODE ViewSnapshotIoAgent drains every worker's checkpoint-delta ring
+    // (started in start(), stopped in stop() — mirrors the cleaner agent).
+    {
+        const std::string viewSnapDir =
+            (fs::path{config_.dataDir} / "__view_snapshots").string();
+        viewSnapshotChannels_.clear();
+        workerViewSets_.clear();
+        viewSnapshotChannels_.reserve(static_cast<std::size_t>(wc));
+        workerViewSets_.reserve(static_cast<std::size_t>(wc));
+        std::vector<ViewSnapshotChannel*> chPtrs;
+        chPtrs.reserve(static_cast<std::size_t>(wc));
+        for (int32_t i = 0; i < wc; ++i) {
+            viewSnapshotChannels_.push_back(std::make_unique<ViewSnapshotChannel>());
+            ViewSnapshotChannel* ch = viewSnapshotChannels_.back().get();
+            chPtrs.push_back(ch);
+            workerViewSets_.push_back(std::make_unique<WorkerViewSet>(*ch, viewSnapDir));
+            workerPool_->worker(i).setViewSet(workerViewSets_.back().get());
+        }
+        viewSnapshotIoAgent_ = std::make_unique<ViewSnapshotIoAgent>(
+            std::move(chPtrs), viewSnapDir, /*fsyncMs=*/50);
+        viewSnapshotIoIdleStrategy_ = makeShapedBackoff(config_.adminIdleShape());
+        viewSnapshotIoRunner_ = std::make_unique<rune::consensus::AgentRunner>(
+            *viewSnapshotIoAgent_, *viewSnapshotIoIdleStrategy_, viewSnapshotIoClock_);
+        spdlog::info("BrokerNode[{}]: view-fold wiring built ({} worker view sets, snapshot dir={})",
+                     config_.nodeId, wc, viewSnapDir);
     }
 
     spdlog::info("BrokerNode[{}]: WorkerPool built ({} workers, {} replicas assigned)",
@@ -3200,12 +3237,16 @@ void BrokerNode::buildAdminWorker() {
         AdminDeps deps;
 
         deps.requestCreateTopic = [this](int64_t ticket, int32_t partitionCount,
-                                         const std::string& name) -> bool {
+                                         const std::string& name,
+                                         const std::string& keyField,
+                                         uint8_t cleanupPolicy) -> bool {
             if (!adminWorkerAgent_) return false;
             CreateTopicReqMsg m;
             m.ticket         = ticket;
             m.partitionCount = partitionCount;
             m.name           = name;
+            m.keyField       = keyField;         // Task 19: view sink key field
+            m.cleanupPolicy  = cleanupPolicy;    // Task 19: Compact for a view sink table
             return encodeCreateTopicReq(adminWorkerAgent_->createReqRing(), m);
         };
 
@@ -3304,11 +3345,48 @@ void BrokerNode::buildAdminWorker() {
             ring.commit(idx);
         };
 
+        // respondCreateView (Task 19): encode the CreateViewResponse frame and
+        // push it on egressRing_ exactly like respondDefine (single-writer egress).
+        deps.respondCreateView = [this](int64_t session, int64_t corr, int32_t viewTopicId,
+                                        uint64_t outputFingerprint, uint16_t errorCode) {
+            if (!adminWorkerAgent_) return;
+            namespace pc = rune::protocol::client;
+            pc::CreateViewResponse resp;
+            resp.sessionId         = session;
+            resp.correlationId     = corr;
+            resp.viewTopicId       = viewTopicId;
+            resp.outputFingerprint = outputFingerprint;
+            resp.errorCode         = errorCode;
+            uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::CreateViewResponse::BODY_FIXED];
+            const std::size_t n = resp.encode(frame);
+            auto& ring = adminWorkerAgent_->egressRing();
+            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + n);
+            if (idx < 0) return;  // ring full — DDL response dropped (rare); client retries
+            uint8_t* p = ring.base() + idx;
+            std::memcpy(p, &session, 8);
+            std::memcpy(p + 8, frame, n);
+            ring.commit(idx);
+        };
+
+        // pushViewPlan (Task 19): post a compiled view plan on the admin→control
+        // ring (failureRing_, kA2cViewPlanUpdate).  The control thread fans it out
+        // to every worker's install ring (serviceAdminControl_), where each worker
+        // installs it on its OWN thread — never a cross-thread installView.  The
+        // admin thread is the ring's single producer; a full ring is retried (the
+        // backlog is admin-owned) rather than dropped.
+        deps.pushViewPlan = [this](const ViewPlanUpdateMsg& vp) {
+            if (!adminWorkerAgent_) return;
+            adminWorkerAgent_->postViewPlan(vp);
+        };
+
         // Construct AdminWorkerAgent (owns AdminWorker + the __topic_schemas
         // replica by raw ptr; the replica stays owned by BrokerNode::schemaReplica_).
+        // Task 19: also hand it the __views replica + ViewRegistry (both
+        // admin-thread-owned) so CreateView can append durable ViewRecords.
         adminWorkerAgent_ = std::make_unique<AdminWorkerAgent>(
             *schemaRegistry_, schemaReplica_.get(), config_.nodeId,
-            std::move(replicaSetIds), std::move(deps));
+            std::move(replicaSetIds), std::move(deps),
+            viewsReplica_.get(), viewRegistry_.get());
 
         // Dedicated thread (separate from gateway and produce workers).
         // D2 round 2: shard mode parks without yields (NodeConfig::adminIdleShape); legacy: Agrona defaults.
@@ -3384,6 +3462,13 @@ void BrokerNode::stop() {
     if (workerPool_) {
         workerPool_->stopAndJoinRunners();
         spdlog::info("BrokerNode[{}]: worker AgentRunner threads stopped", config_.nodeId);
+    }
+    // Task 19: stop the view-snapshot IO thread AFTER the workers (so no worker
+    // pushes a delta after the IO thread is gone; its WorkerViewSet producers are
+    // now quiesced) and BEFORE the WorkerViewSets/channels are destroyed.
+    if (viewSnapshotIoRunner_) {
+        viewSnapshotIoRunner_->stopAndJoin();
+        spdlog::info("BrokerNode[{}]: ViewSnapshotIoAgent thread stopped", config_.nodeId);
     }
     // Shard agents reference workers + their drivers/clients; the runners that
     // drove them are joined, so nothing pumps a shard driver any more.
@@ -3577,6 +3662,41 @@ void BrokerNode::startEmbeddedDriver() {
 }
 
 // ---------------------------------------------------------------------------
+// BrokerNode::fanoutViewPlan_ / pumpViewFanout_ (Task 19) — control thread.
+//
+// The control thread is the SINGLE producer of every worker channel's install
+// ring (shared-nothing).  A committed compiled view plan is queued (nextWorker
+// cursor) and delivered to each worker; a worker whose install ring is momentarily
+// full stops the pass and is retried next cycle (held, never dropped — a dropped
+// install would leave a view that never folds on that worker).
+// ---------------------------------------------------------------------------
+void BrokerNode::fanoutViewPlan_(ViewPlanUpdateMsg msg) {
+    viewFanoutBacklog_.push_back(ViewFanoutPending{std::move(msg), 0});
+    (void)pumpViewFanout_();
+}
+
+int BrokerNode::pumpViewFanout_() {
+    int work = 0;
+    std::size_t done = 0;
+    const int32_t n = static_cast<int32_t>(viewSnapshotChannels_.size());
+    for (auto& pend : viewFanoutBacklog_) {
+        while (pend.nextWorker < n) {
+            ViewSnapshotChannel* ch = viewSnapshotChannels_[pend.nextWorker].get();
+            if (ch && !encodeViewPlanUpdate(ch->install,
+                                            ViewSnapshotChannel::kInstallMsgType, pend.msg))
+                break;   // ring full → retry next cycle (FIFO: later plans wait)
+            ++pend.nextWorker;
+            ++work;
+        }
+        if (pend.nextWorker < n) break;   // FIFO back-pressure
+        ++done;
+    }
+    if (done)
+        viewFanoutBacklog_.erase(viewFanoutBacklog_.begin(),
+                                 viewFanoutBacklog_.begin() + static_cast<std::ptrdiff_t>(done));
+    return work;
+}
+
 // BrokerNode::serviceAdminControl_ — the schema DDL control plane, one runtime
 // duty cycle (Task 8a RULING-2 B).  Runs on the CONTROL (runtime) thread via
 // AdminControlPlane::doWork — a direct call, never std::function / virtual.
@@ -3647,6 +3767,13 @@ int BrokerNode::serviceAdminControl_() {
                aeron::util::index_t off, aeron::util::index_t len) {
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
             const auto  n = static_cast<std::size_t>(len);
+            // Task 19: a compiled view plan fans out to every worker's install
+            // ring (handled here, before the 2-callback dispatcher — the control
+            // thread is the single producer of each worker channel's install ring).
+            if (tid == kA2cViewPlanUpdate) {
+                fanoutViewPlan_(decodeViewPlanUpdate(p, n));
+                return;
+            }
             const A2cDispatch d = dispatchAdminToControl(tid, p, n,
                 [this](int32_t e, std::string_view dir) {
                     onStorageFailure_(std::string(dir), e);
@@ -3664,6 +3791,8 @@ int BrokerNode::serviceAdminControl_() {
         }, 16);
     // Control (runtime) thread = the single producer of every worker ring.
     if (workerPool_) work += schemaFanout_.pump(*workerPool_);
+    // Task 19: retry any view-plan install frames a worker ring could not take.
+    if (!viewFanoutBacklog_.empty()) work += pumpViewFanout_();
 
     // (2) Drain create-topic requests (admin → control).
     work += agent->createReqRing().drain(
@@ -3680,6 +3809,12 @@ int BrokerNode::serviceAdminControl_() {
                 spec.name           = req.name;
                 spec.partitionCount = req.partitionCount;
                 spec.topicId        = -1;  // registry assigns
+                // Task 19: a view SINK is a keyed + Compact "table" — carry the
+                // cleanup policy + key field the admin thread resolved (DefineTopic
+                // leaves them default: Delete, empty).
+                spec.cleanupPolicy  = static_cast<rune::node::TopicSpec::CleanupPolicy>(
+                                          req.cleanupPolicy);
+                if (!req.keyField.empty()) spec.partitionKey = req.keyField;
                 try {
                     id = topicRegistry_->createTopic(spec);
                     // Task 8b (SINGLE-NODE): make the runtime topic

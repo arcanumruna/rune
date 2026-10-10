@@ -1048,6 +1048,9 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         case pc::TemplateId::AlterTopic:
             handleAlterTopic(buf, len);
             break;
+        case pc::TemplateId::CreateView:
+            handleCreateView(buf, len);
+            break;
         default:
             // ConnectResponse, ErrorResponse, Pong, MetadataResponse (broker→client),
             // ProduceResponse, SubscribeResponse, Records, Assign,
@@ -5686,6 +5689,44 @@ void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
     (void)adminSink_->submitAlterTopic(m.sessionId, m.correlationId, m.topicName,
                                        m.expectedVersion, m.opsBlob, m.opsLen);
     // Return immediately — the AdminWorker produces the AlterTopicResponse
+    // asynchronously on the session egress (via the admin→control egress ring).
+}
+
+// ---------------------------------------------------------------------------
+// Task 19: handleCreateView (RULING-2 F) — route CreateView (70) to the admin
+// sink via a ring hand-off (same discipline as handleDefineTopic).  Validate +
+// require known session + decode, then copy the fields into the sink and RETURN
+// immediately.  NO registry access, NO blocking on the gateway hot path — a
+// stalled AdminWorker never delays produce.  The CreateViewResponse (71) is
+// produced asynchronously on the session egress via the admin→control egress
+// ring (respondCreateView).
+// ---------------------------------------------------------------------------
+void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
+{
+    if (!adminSink_) {
+        spdlog::debug("ClientGateway: CreateView received but adminSink_ not set — dropped");
+        return;
+    }
+    auto msgOpt = pc::CreateView::decode(buf, len);
+    if (!msgOpt) {
+        spdlog::debug("ClientGateway: CreateView decode failed — dropped");
+        return;
+    }
+    const pc::CreateView& m = *msgOpt;
+
+    // Require a known session (mirror handleDefineTopic).
+    Session* session = sessions_.find(m.sessionId);
+    if (!session) {
+        spdlog::debug("ClientGateway: CreateView for unknown sessionId={} — dropped", m.sessionId);
+        return;
+    }
+
+    // Copy-and-return: the sink OWNS the copied bytes (viewName/keyField/planBlob
+    // views point into the ingress buffer and are copied by the sink before return).
+    (void)adminSink_->submitCreateView(m.sessionId, m.correlationId,
+                                       m.viewName, m.keyField, m.persistence,
+                                       m.planBlob, m.planLen);
+    // Return immediately — the AdminWorker produces the CreateViewResponse
     // asynchronously on the session egress (via the admin→control egress ring).
 }
 

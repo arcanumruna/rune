@@ -88,7 +88,8 @@ struct Harness {
             std::vector<NodeId>{1}, std::vector<NodeId>{1}, &log, transport.get());
 
         AdminDeps d;
-        d.requestCreateTopic = [this](int64_t ticket, int32_t, const std::string&) -> bool {
+        d.requestCreateTopic = [this](int64_t ticket, int32_t, const std::string&,
+                                      const std::string&, uint8_t) -> bool {
             ++creates; pendingTicket = ticket; return true;
         };
         d.pushValidators = [this](const RegistryEntry&, int32_t) { ++pushes; };

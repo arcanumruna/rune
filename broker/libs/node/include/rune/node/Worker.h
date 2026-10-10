@@ -1563,7 +1563,10 @@ public:
                 work += replica->doWork(nowNs);
             }
             work += rcAdvanceAll_();   // F15 §2.3: per-pass RC build driver
-            if (viewSet_ != nullptr) [[unlikely]] work += driveViews_(nowNs);   // Task 15: view folds, right after RC advance
+            if (viewSet_ != nullptr) [[unlikely]] {
+                work += viewSet_->drainInstalls();   // Task 19: install runtime-created view plans (own thread)
+                work += driveViews_(nowNs);          // Task 15: view folds, right after RC advance
+            }
             if (!passthroughPsm_.empty()) [[unlikely]] work += advancePassthroughPsm_();
             work += serveHeldPushReads_();
         }

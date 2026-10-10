@@ -38,11 +38,18 @@ namespace rune::node {
 struct ViewSnapshotChannel {
     static constexpr int32_t     kDeltaMsgType     = 1;
     static constexpr int32_t     kDoneMsgType      = 2;
+    // Task 19: control -> worker compiled-view-plan install.  One frame = one
+    // rune::node::ViewPlanUpdateMsg (AdminChannels.h) encoded via
+    // encodeViewPlanUpdate(install, kInstallMsgType, msg).  The worker drains it
+    // in its own doWork (WorkerViewSet::drainInstalls) and calls installView on
+    // ITS OWN thread — shared-nothing (installView is never called cross-thread).
+    static constexpr int32_t     kInstallMsgType   = 3;
     static constexpr std::size_t kDeltaHeaderBytes = 8;  // viewTopicId i32 + partition i32
     static constexpr std::size_t kDoneMsgBytes      = 16; // viewTopicId i32 + partition i32 + O i64
 
     OneToOneByteRing deltas{1 << 20};  // worker -> IO
     OneToOneByteRing done{4096};       // IO -> worker (durable-offset acks)
+    OneToOneByteRing install{1 << 20}; // control -> worker (compiled view plans; Task 19)
 };
 
 } // namespace rune::node
