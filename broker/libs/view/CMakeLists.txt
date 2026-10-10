@@ -3,7 +3,8 @@ add_library(rune_view STATIC
     src/ViewTable.cpp
     src/ViewPlan.cpp
     src/PlanCompiler.cpp
-    src/ViewFold.cpp)
+    src/ViewFold.cpp
+    src/ViewCheckpoint.cpp)
 target_include_directories(rune_view PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     ${RUNE_PROTOCOL_INCLUDE}
@@ -16,7 +17,7 @@ if(BUILD_TESTING)
     find_package(GTest REQUIRED)
     add_executable(rune_view_tests tests/view/ViewTypesTest.cpp tests/view/ViewRowTest.cpp
         tests/view/ViewTableTest.cpp tests/view/ViewPlanTest.cpp tests/view/PlanCompilerTest.cpp
-        tests/view/ViewFoldTest.cpp)
+        tests/view/ViewFoldTest.cpp tests/view/ViewCheckpointTest.cpp)
     target_link_libraries(rune_view_tests PRIVATE rune_view rune_codec GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_view_tests)
