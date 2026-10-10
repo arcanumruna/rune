@@ -11,6 +11,7 @@ add_library(rune_node
     src/GroupCoordinationService.cpp
     src/TransactionCoordinationService.cpp
     src/SchemaRegistry.cpp
+    src/ViewRegistry.cpp
     src/AdminWorker.cpp
     src/ViewSnapshotIoAgent.cpp
     src/WorkerViewSet.cpp)
@@ -137,6 +138,7 @@ if(BUILD_TESTING)
         tests/node/OneToOneByteRingTest.cpp
         tests/node/SchemaCodecSmokeTest.cpp
         tests/node/SchemaRegistryTest.cpp
+        tests/node/ViewRegistryTest.cpp
         tests/node/AdminWorkerTest.cpp
         tests/node/SignalControlTest.cpp
         tests/node/LeaderObserverTest.cpp

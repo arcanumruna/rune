@@ -44,6 +44,7 @@
 #include <rune/node/WorkerReplicationTransport.h>
 #include <rune/node/WorkerReplicationValidator.h>
 #include <rune/node/SchemaRegistry.h>
+#include <rune/node/ViewRegistry.h>
 #include <rune/node/AdminWorker.h>
 #include <rune/node/AdminChannels.h>
 #include <rune/node/AdminControlPlane.h>
@@ -687,6 +688,20 @@ public:
         return schemaLog_.get();
     }
 
+    /// Test-only: return the ViewRegistry (for byName/byViewTopicId queries in
+    /// tests). Non-null after start() if __views persistence construction
+    /// succeeded. NOT safe for concurrent use — call only when the admin
+    /// thread is quiesced or the node is stopped (mirrors schemaRegistryForTest).
+    ViewRegistry* viewRegistryForTest() const noexcept {
+        return viewRegistry_.get();
+    }
+
+    /// Test-only: return raw pointer to the __views Log (for record-count
+    /// assertions), mirrors schemaLogForTest.
+    rune::storage::Log* viewsLogForTest() const noexcept {
+        return viewsLog_.get();
+    }
+
     /// Test-only: return the AdminWorkerAgent (for direct onDefineTopic calls).
     /// Used by SchemaPersistenceTest to drive the AdminWorker without going
     /// through the gateway (Task 8).
@@ -1000,6 +1015,27 @@ private:
     std::unique_ptr<rune::replication::PartitionReplica>  schemaReplica_;
     std::unique_ptr<SchemaRegistry>                       schemaRegistry_;
     std::unique_ptr<AdminWorkerAgent>                     adminWorkerAgent_;
+
+    // -----------------------------------------------------------------------
+    // View catalog (Task 17 — __views persistence, mirrors __topic_schemas).
+    // viewsLog_         — durable Log for __views (one partition).
+    // viewsReplica_     — PartitionReplica wrapping the views Log.
+    //                      topicId=-5 (kViewsTopicId), cleanupPolicy=Compact.
+    //                      Admin-thread-owned only (same RULING-2 A rationale
+    //                      as schemaReplica_ above): NOT registered in
+    //                      replicaRegistry_/replTransport_, backed by its own
+    //                      NullPartitionTransport.
+    // viewRegistry_     — In-memory view catalog (ViewRegistry), rebuilt from
+    //                      viewsLog_ on startup. The CreateView DDL path that
+    //                      APPENDS records to viewsReplica_ is Task 19 — this
+    //                      wiring only creates the partition + replays it.
+    //
+    // Destruction order (reverse of construction, in stop()):
+    //   viewRegistry_ → viewsReplica_ → viewsLog_ → …
+    // -----------------------------------------------------------------------
+    std::unique_ptr<rune::storage::Log>                   viewsLog_;
+    std::unique_ptr<rune::replication::PartitionReplica>  viewsReplica_;
+    std::unique_ptr<ViewRegistry>                         viewRegistry_;
     // Runtime-cycle DDL control plane (direct call; see AdminControlPlane.h).
     friend class AdminControlPlane;
     void attachFusedRuntimeDoorbell_();   // A9: runtime's cross-thread rings → worker 0's doorbell (fused)

@@ -3030,6 +3030,165 @@ void BrokerNode::buildAdminWorker() {
 
         (void)schemaReplicaRaw;  // replica handed to the AdminWorker below
 
+        // ── Task 17: __views internal partition + startup replay ────────────
+        // Durable view catalog (ViewRegistry), mirroring the __topic_schemas
+        // block above (log + PartitionReplica + boot replay) exactly. Scoped
+        // in its OWN try/catch: a __views setup failure must not also tear
+        // down the already-successful schema persistence + AdminWorker wiring
+        // above. The CreateView DDL path that APPENDS records to
+        // viewsReplica_ is Task 19 — not yet reachable, so only the
+        // partition + startup replay + registry are wired here.
+        try {
+            const fs::path viewsDir = fs::path{config_.dataDir} / "__views";
+            fs::create_directories(viewsDir);
+
+            viewsLog_ = std::make_unique<rune::storage::Log>(viewsDir.string());
+            viewsLog_->recover();
+
+            rune::replication::PartitionConfig vcfg;
+            vcfg.topicId              = kViewsTopicId;  // -5: sentinel for __views
+            vcfg.partitionId          = 0;
+            vcfg.selfId               = selfId;
+            // Majority-durable (same as __topic_schemas): view definitions must
+            // survive leader failover without data loss.
+            vcfg.minIsr               = std::min(2, static_cast<int>(allNodeIds.size()));
+            vcfg.replicaLagMaxMs      = config_.replicaLagMaxMs;
+            vcfg.replicaLagMaxOffset  = 1'000'000'000;  // TIME-based lag only
+            vcfg.fetchIntervalNs      = config_.fetchIntervalNs;
+            vcfg.isrCheckIntervalNs   = 10'000'000LL;
+            vcfg.maxFetchBytes        = rune::replication::kDefaultMaxFetchBytes;
+            // Compacted: keep latest view record per viewTopicId (key = viewTopicId bytes).
+            vcfg.cleanupPolicy        = rune::replication::CleanupPolicy::Compact;
+            vcfg.minCleanableDirtyRatio = 0.5;
+            vcfg.deleteRetentionMs      = 86'400'000LL;  // 1 day tombstone retention
+            vcfg.segmentRollBytes       = config_.offsetLogSegmentRollBytes;
+
+            // RULING-2 A (same rationale as schemaReplica_ above): the views
+            // replica is SOLELY owned + driven by the admin thread, so it is
+            // NOT registered with replTransport_ and NOT added to
+            // replicaRegistry_ — keeping it out of both the control thread's
+            // allReplicas() doWork loop and the bridge's role-flip loop.
+            // A dedicated NullPartitionTransport backs it so no cross-thread
+            // transport poll ever touches it.
+            nullTransports_.push_back(
+                std::make_unique<rune::replication::NullPartitionTransport>());
+            rune::replication::PartitionTransport* viewsTransport =
+                nullTransports_.back().get();
+
+            viewsReplica_ = std::make_unique<rune::replication::PartitionReplica>(
+                vcfg,
+                rune::replication::Role::Follower,
+                /*epoch=*/0,
+                allNodeIds,
+                allNodeIds,
+                viewsLog_.get(),
+                viewsTransport);
+
+            viewRegistry_ = std::make_unique<ViewRegistry>();
+
+            // ── rebuildFromLog ───────────────────────────────────────────────
+            // Replay the compacted __views log [0, HW) and reconstruct the
+            // in-memory ViewRegistry.  Mirrors the __topic_schemas replay above:
+            //   key   = viewTopicId bytes (4 bytes, LE int32, used by the compactor)
+            //   value = ViewRecord::serialize() payload
+            // ──────────────────────────────────────────────────────────────────
+            const rune::replication::Offset viewsHw = viewsReplica_->highWatermark();
+            if (viewsHw > 0) {
+                static constexpr int32_t kChunkBytes = 64 * 1024 * 1024;
+                rune::replication::Offset fetchOffset = 0;
+                // Fail-loud (mirrors the __topic_schemas boot replay above): a
+                // corrupt/truncated ViewRecord here would otherwise be silently
+                // skipped, leaving an undetected gap in ViewRegistry on the
+                // PRIMARY recovery path. Abort the replay loudly instead.
+                bool viewsBootReplayFailed = false;
+                rune::replication::Offset viewsFailedBatchBase = 0;
+                while (fetchOffset < viewsHw) {
+                    std::vector<uint8_t> data = viewsReplica_->read(fetchOffset, kChunkBytes);
+                    if (data.empty()) break;
+
+                    std::size_t pos = 0;
+                    rune::replication::Offset lastBatchEnd = fetchOffset;
+
+                    while (pos < data.size()) {
+                        const uint8_t*    batchStart = data.data() + pos;
+                        const std::size_t remaining  = data.size() - pos;
+
+                        if (remaining < static_cast<std::size_t>(
+                                rune::protocol::batch::kRecordBatchOverhead))
+                            break;
+
+                        rune::protocol::RecordBatchReader reader(batchStart, remaining);
+                        if (!reader.ensureValid()) break;
+
+                        const int32_t tl = reader.totalLength();
+                        if (tl <= 0 || static_cast<std::size_t>(tl) > remaining) break;
+
+                        const rune::replication::Offset batchBase = reader.baseOffset();
+                        // Each record: key=viewTopicId(4 bytes LE), value=ViewRecord payload.
+                        reader.forEachRecord([this, nodeId, batchBase, &viewsBootReplayFailed,
+                                              &viewsFailedBatchBase](std::string_view /*key*/,
+                                              std::string_view val,
+                                              int64_t /*offset*/,
+                                              int64_t /*ts*/) {
+                            auto vr = ViewRecord::deserialize(
+                                std::span<const uint8_t>(
+                                    reinterpret_cast<const uint8_t*>(val.data()),
+                                    val.size()));
+                            if (vr) {
+                                viewRegistry_->applyRecord(*vr);
+                                return;
+                            }
+                            viewsBootReplayFailed = true;
+                            viewsFailedBatchBase  = batchBase;
+                            spdlog::critical(
+                                "BrokerNode[{}]: CORRUPT __views record at "
+                                "batch baseOffset={} — ViewRecord::deserialize "
+                                "failed during BOOT replay (truncated/corrupt "
+                                "payload). ABORTING the replay rather than silently "
+                                "skipping it (would leave an undetected view-"
+                                "catalog gap on the PRIMARY recovery path).",
+                                nodeId, batchBase);
+                        });
+                        if (viewsBootReplayFailed) break;  // abort: inner (per-chunk) loop
+
+                        const rune::replication::Offset batchNextOffset =
+                            reader.baseOffset() + reader.lastOffsetDelta() + 1;
+                        if (batchNextOffset > lastBatchEnd)
+                            lastBatchEnd = batchNextOffset;
+
+                        pos += static_cast<std::size_t>(tl);
+                    }
+                    if (viewsBootReplayFailed) break;  // abort: outer (chunk-fetch) loop
+
+                    if (lastBatchEnd <= fetchOffset) break;
+                    fetchOffset = lastBatchEnd;
+                }
+                if (viewsBootReplayFailed) {
+                    throw std::runtime_error(
+                        "BrokerNode[" + std::to_string(nodeId) + "]: __views "
+                        "boot replay found a corrupt/truncated record at batch "
+                        "baseOffset=" + std::to_string(viewsFailedBatchBase) +
+                        " — refusing to silently continue with a possibly-"
+                        "incomplete ViewRegistry");
+                }
+                spdlog::info(
+                    "BrokerNode[{}]: __views rebuilt from log (hw={})",
+                    nodeId, viewsHw);
+            }
+
+            spdlog::info(
+                "BrokerNode[{}]: __views persistence wired (dir={})",
+                nodeId, viewsDir.string());
+        } catch (const std::exception& ex) {
+            spdlog::error(
+                "BrokerNode[{}]: __views setup failed: {}; view catalog will not be "
+                "durable (CreateView DDL — Task 19 — would be affected, not this build)",
+                nodeId, ex.what());
+            viewRegistry_.reset();
+            viewsReplica_.reset();
+            viewsLog_.reset();
+        }
+
         // ── Wire AdminDeps ───────────────────────────────────────────────────
         // RULING-2 B: createTopic is NOT called on the admin thread.  Instead the
         // admin thread posts a CreateTopicRequest on createReqRing_ (admin →
@@ -3170,6 +3329,12 @@ void BrokerNode::buildAdminWorker() {
         schemaRegistry_.reset();
         schemaReplica_.reset();
         schemaLog_.reset();
+        // Task 17: __views has its own inner try/catch above, so on a schema-
+        // setup failure (before that block even runs) these are already null;
+        // reset here too for defensive symmetry if that ordering ever changes.
+        viewRegistry_.reset();
+        viewsReplica_.reset();
+        viewsLog_.reset();
     }
 }
 
@@ -3309,6 +3474,12 @@ void BrokerNode::stop() {
     schemaRegistry_.reset();  // SchemaRegistry (no raw ptrs to replicas — safe to reset here)
     schemaReplica_.reset();   // no-op: ownership transferred to replicaRegistry_ in buildAdminWorker
     schemaLog_.reset();       // Log for __topic_schemas (file flush on dtor)
+    // Task 17: destroy view registry before its replica/log (viewsReplica_ is
+    // admin-thread-owned only, same as schemaReplica_ — never transferred to
+    // replicaRegistry_, but reset here in the same relative order for symmetry).
+    viewRegistry_.reset();    // ViewRegistry (no raw ptrs to replicas — safe to reset here)
+    viewsReplica_.reset();    // admin-thread-owned only (RULING-2 A) — not in replicaRegistry_
+    viewsLog_.reset();        // Log for __views (file flush on dtor)
     // TX-3: destroy txn state store before replicaRegistry_ (holds raw ptr to txn replica).
     txnState_.reset();        // ReplicatedTxnStateStore (holds raw ptr to txn replica in registry)
     txnReplica_.reset();      // no-op: ownership transferred to replicaRegistry_ in buildGateway

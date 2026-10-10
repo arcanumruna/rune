@@ -14,6 +14,7 @@
 namespace rune::node {
 
 inline constexpr int32_t  kSchemaTopicId        = -4;
+inline constexpr int32_t  kViewsTopicId         = -5;
 inline constexpr uint32_t RUNTIME_TOPIC_ID_BASE  = 0x40000000u;
 
 /// Wire record stored on the __topic_schemas internal topic.
