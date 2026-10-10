@@ -49,3 +49,33 @@ TEST(ViewTable, FreeListRecyclesRowIds) {
     EXPECT_EQ(t.size(), 1u);
     EXPECT_EQ(readSlot(t.get(2), L, 1).i, 2);
 }
+
+TEST(ViewTable, GrowsByAppendingChunksRowsNeverMove) {
+    RowLayout L = hpLayout();
+    // Index slots sized generously (128, power of two) so this test exercises
+    // ONLY row-slab chunk growth (Task 4), not index growth (deferred to
+    // Task 5 — index rehash is out of scope here). Tiny chunkBytes (4 rows
+    // per chunk) forces many chunk boundaries over 100 inserts.
+    ViewTable t(L, /*slots*/128, /*chunkBytes*/ L.rowLen * 4);
+    for (uint64_t k = 1; k <= 100; ++k) { uint8_t* r = t.put(k); setHp(r, L, (int)k); }
+    EXPECT_GT(t.chunkCount(), 1u);
+    for (uint64_t k = 1; k <= 100; ++k) {
+        ASSERT_NE(t.get(k), nullptr);
+        EXPECT_EQ(readSlot(t.get(k), L, 1).i, (int)k);   // all survive growth
+    }
+}
+
+TEST(ViewTable, RowPointerStableAcrossChunkGrowth) {
+    // Regression: a row pointer captured BEFORE a chunk-growth event must
+    // still be valid (and point at the same row) AFTER growth, because rows
+    // never move once allocated — only new chunks are appended.
+    RowLayout L = hpLayout();
+    ViewTable t(L, /*slots*/128, /*chunkBytes*/ L.rowLen * 4); // 4 rows/chunk
+    uint8_t* early = t.put(1);
+    setHp(early, L, 111);
+    EXPECT_EQ(t.chunkCount(), 1u);
+    for (uint64_t k = 2; k <= 50; ++k) setHp(t.put(k), L, (int)k);
+    EXPECT_GT(t.chunkCount(), 1u) << "expected growth past the first chunk";
+    EXPECT_EQ(readSlot(early, L, 1).i, 111) << "row moved after chunk growth";
+    EXPECT_EQ(early, const_cast<uint8_t*>(t.get(1))) << "rid->address mapping changed";
+}
