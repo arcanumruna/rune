@@ -211,3 +211,118 @@ TEST(ViewFold, DeterministicAcrossBatchBoundaries) {
         EXPECT_EQ(std::memcmp(rowA, rowB, comp.rowLayout.rowLen), 0);
     }
 }
+
+// Post-review ruling: the merge/table key MUST be the record's WIRE
+// (compaction) key, never the value's codec key-field -- those are two
+// different key spaces that only agree under an unenforced producer
+// contract. This proves the unification: an upsert whose VALUE key-field
+// (9999) deliberately diverges from its WIRE key (2002) is still addressed
+// -- and later erased -- by the WIRE key. Pre-fix (value-field key for
+// upsert, wire key for tombstone), the upsert would have landed at row 9999
+// instead of 2002, so `t.get(2002)` would already be null right after the
+// upsert -- this test fails loudly under the old code instead of silently
+// leaking a row.
+TEST(ViewFoldKeyUnificationRegression, TombstoneErasesByWireKeyEvenWhenValueKeyFieldDiffers) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(), srcs, 0x40000007).value();
+
+    rune::view::ViewTable t(comp.rowLayout);
+    rune::view::VersionDescriptorCache vdc(src);
+
+    // Wire (compaction) key = 2002; the VALUE's key-field claims a DIFFERENT
+    // id (9999) -- this divergence must NOT matter for merge identity.
+    const auto wireKey = keyBytes(2002);
+    const auto val = encodeCharacter(/*value key-field*/ 9999, /*hp*/ 77, 1);
+    const auto b0 = makeBatch(0, asSv(wireKey), asSv(val), /*tomb*/ false);
+    rune::storage::LogReadView v0{b0.data(), b0.size(), 0, 1};
+    int64_t cur = 0;
+    auto s0 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v0, 1, cur);
+    EXPECT_EQ(s0.applied, 1u);
+
+    // The row must be addressable by the WIRE key -- not by the value's
+    // key-field, which is only a display/projection column.
+    ASSERT_NE(t.get(2002), nullptr) << "row must be keyed by the wire/compaction key";
+    EXPECT_EQ(rune::view::readSlot(t.get(2002), comp.rowLayout, 1).i, 77);
+    // Its key OUTPUT column still reflects the value's key-field (a plain
+    // projection), even though it differs from the merge key.
+    EXPECT_EQ(rune::view::readSlot(t.get(2002), comp.rowLayout, 0).i, 9999);
+    EXPECT_EQ(t.get(9999), nullptr) << "must not have created a second row at the value key-field";
+
+    // A tombstone keyed by the SAME wire key must erase exactly that row.
+    const auto b1 = makeBatch(1, asSv(wireKey), std::string_view{}, /*tomb*/ true);
+    rune::storage::LogReadView v1{b1.data(), b1.size(), 1, 2};
+    auto s1 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v1, 2, cur);
+    EXPECT_EQ(s1.deleted, 1u);
+    EXPECT_EQ(t.get(2002), nullptr) << "tombstone keyed by the wire key must erase the row it keys";
+    EXPECT_EQ(t.get(9999), nullptr);
+}
+
+// A wire key that is not exactly the view key column's byte width (here: 4
+// bytes for an Int64 key, which needs 8) must be rejected -- never silently
+// zero-padded, which could otherwise mis-key a row under a truncated/corrupt
+// producer-side key.
+TEST(ViewFoldMalformedKeyRegression, WrongWidthWireKeySkippedNotZeroPadded) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(), srcs, 0x40000007).value();
+
+    rune::view::ViewTable t(comp.rowLayout);
+    rune::view::VersionDescriptorCache vdc(src);
+
+    const std::vector<uint8_t> shortKey(4, 0x07); // Int64 key needs 8 bytes, not 4
+    const auto val = encodeCharacter(1001, 50, 1);
+    const auto b = makeBatch(0, std::string_view(reinterpret_cast<const char*>(shortKey.data()), shortKey.size()),
+                              asSv(val), /*tomb*/ false);
+    rune::storage::LogReadView v{b.data(), b.size(), 0, 1};
+    int64_t cur = 0;
+    auto stats = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, 1, cur);
+
+    EXPECT_EQ(stats.skippedMalformed, 1u);
+    EXPECT_EQ(stats.applied, 0u);
+    EXPECT_EQ(t.size(), 0u);
+}
+
+// The LogReadView contract is WHOLE batches only. If the walk breaks early
+// because a later batch is torn/corrupt (fails ensureValid()), the cursor
+// must stop at the last FULLY folded batch -- never jump ahead to
+// min(view.nextOffset, bound), which would silently skip the unfolded
+// (corrupt) batch's records on the next fold.
+TEST(ViewFoldCorruptBreakRegression, CursorNeverAdvancesPastAnUnfoldedCorruptBatch) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(), srcs, 0x40000007).value();
+
+    rune::view::ViewTable t(comp.rowLayout);
+    rune::view::VersionDescriptorCache vdc(src);
+
+    // Batch 0: one valid record at offset 0.
+    const auto kb0 = keyBytes(1001);
+    const auto val0 = encodeCharacter(1001, 50, 1);
+    auto batch0 = makeBatch(0, asSv(kb0), asSv(val0), /*tomb*/ false);
+
+    // Batch 1: an otherwise-valid batch whose bytes are corrupted (flipping
+    // the last byte breaks only the stored CRC, not the size/length checks)
+    // -- simulates a torn/corrupt tail the reader must stop at.
+    const auto kb1 = keyBytes(1002);
+    const auto val1 = encodeCharacter(1002, 60, 1);
+    auto batch1 = makeBatch(1, asSv(kb1), asSv(val1), /*tomb*/ false);
+    batch1.back() ^= 0xFF;
+
+    std::vector<uint8_t> data;
+    data.insert(data.end(), batch0.begin(), batch0.end());
+    data.insert(data.end(), batch1.begin(), batch1.end());
+
+    // The view claims committed data through offset 5, as if a caller's LSO
+    // tracker believed more batches existed past the corrupt one -- the bug
+    // this guards against is trusting that claim and skipping straight to it.
+    rune::storage::LogReadView v{data.data(), data.size(), 0, 5};
+    int64_t cur = 0;
+    auto stats = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, v, /*bound*/ 5, cur);
+
+    EXPECT_EQ(stats.applied, 1u);     // only batch 0's record folded
+    ASSERT_NE(t.get(1001), nullptr);
+    EXPECT_EQ(t.get(1002), nullptr);  // batch 1 never folded (corrupt)
+    EXPECT_EQ(cur, 1) << "cursor must stop at the last FULLY folded batch, "
+                          "not jump to min(nextOffset, bound)";
+}

@@ -48,18 +48,30 @@ private:
 };
 
 struct FoldStats {
-    uint64_t applied        = 0;
-    uint64_t deleted        = 0;
-    uint64_t skippedControl = 0;
+    uint64_t applied          = 0;
+    uint64_t deleted          = 0;
+    uint64_t skippedControl   = 0;
+    // A record whose WIRE key is not exactly the view key column's byte
+    // width (e.g. a truncated/corrupt producer-side key). Never silently
+    // zero-padded -- counted and skipped instead, so a malformed key is
+    // observable rather than silently mis-keying a row.
+    uint64_t skippedMalformed = 0;
 };
 
 // Folds every COMMITTED record (offset < bound) in `view` -- a LogReadView
 // over whole batches -- into `table`, per `plan`/`layout`. Control batches
-// are skipped (counted in skippedControl). A live (non-tombstone) record is
-// decoded against the writer's OWN schema version (never the latest) and
-// upserted (Phase 1: all CompiledFields are Replace); a tombstone (empty
-// value) erases its key. Sets `cursor` to the batch offset the caller should
-// resume from next time: min(view.nextOffset, bound) -- never past `bound`.
+// are skipped (counted in skippedControl). Merge-key model: the row's
+// identity (table `put`/`erase` key) is the record's WIRE/compaction key --
+// the same bytes the log's own compaction (OffsetMap) already keys "one
+// current row per key" on -- NEVER the value's key-field. The value's
+// key-field is a plain display/projection output column, decoded and
+// written like any other CompiledField on upsert, and is NOT consulted for
+// merge identity. A live (non-tombstone) record is decoded against the
+// writer's OWN schema version (never the latest) and upserted (Phase 1: all
+// CompiledFields are Replace); a tombstone (empty value) erases its wire key.
+// Sets `cursor` to the offset the caller should resume from next time: the
+// highest offset actually folded, capped at `bound` -- NEVER past a batch
+// this call did not fully fold (see ViewFold.cpp for the early-break case).
 FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
                      VersionDescriptorCache& vdc, ViewTable& table,
                      const rune::storage::LogReadView& view, int64_t bound,
