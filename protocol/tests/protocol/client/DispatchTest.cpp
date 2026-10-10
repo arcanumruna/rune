@@ -745,12 +745,20 @@ TEST(DispatchCheckFrame, KnownTemplateSixtyNine) {
     EXPECT_EQ(fc.templateId, 69u);
 }
 
-TEST(DispatchCheckFrame, UnknownTemplateSeventy) {
-    // 70 = first unassigned id in schema/view range after AlterTopicResponse=69
-    auto buf = makeValidHeaderBuf(70);
+TEST(DispatchCheckFrame, KnownTemplateSeventyThree) {
+    // 70..73 = CreateView..ViewRowResponse (Task 18 — now assigned)
+    auto buf = makeValidHeaderBuf(73);
+    const auto fc = rpc::checkFrame(buf.data(), buf.size());
+    EXPECT_EQ(fc.status, rpc::FrameStatus::Ok);
+    EXPECT_EQ(fc.templateId, 73u);
+}
+
+TEST(DispatchCheckFrame, UnknownTemplateSeventyFour) {
+    // 74 = first unassigned id in schema/view range after ViewRowResponse=73
+    auto buf = makeValidHeaderBuf(74);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
-    EXPECT_EQ(fc.templateId, 70u);
+    EXPECT_EQ(fc.templateId, 74u);
 }
 
 TEST(DispatchCheckFrame, UnknownTemplateNinetyNine) {
@@ -916,14 +924,15 @@ TEST(DispatchIsKnownTemplate, KnownBoundaries) {
     EXPECT_TRUE(rpc::isKnownTemplate(10));
     EXPECT_TRUE(rpc::isKnownTemplate(11));
 
-    // 0b/0c schema range: 64..69 must all be known.
-    for (uint16_t tid = 64; tid <= 69; ++tid) {
+    // 0b/0c schema + view-engine range: 64..73 must all be known
+    // (DefineTopic..AlterTopicResponse 64..69; CreateView..ViewRowResponse 70..73, Task 18).
+    for (uint16_t tid = 64; tid <= 73; ++tid) {
         EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
     }
 
     // Not known: 0, 12..15 (unassigned control gap after HandshakeContinue{,Response}),
     //            22..31 (unassigned produce/consume gap),
-    //            55..63 (unassigned groups/txn gap after TX-1), 70+ (unassigned schema/view gap),
+    //            55..63 (unassigned groups/txn gap after TX-1), 74+ (unassigned schema/view gap),
     //            65535.
     EXPECT_FALSE(rpc::isKnownTemplate(0));
     EXPECT_FALSE(rpc::isKnownTemplate(12));
@@ -931,6 +940,6 @@ TEST(DispatchIsKnownTemplate, KnownBoundaries) {
     EXPECT_FALSE(rpc::isKnownTemplate(22));
     EXPECT_FALSE(rpc::isKnownTemplate(31));
     EXPECT_FALSE(rpc::isKnownTemplate(55));
-    EXPECT_FALSE(rpc::isKnownTemplate(70));
+    EXPECT_FALSE(rpc::isKnownTemplate(74));
     EXPECT_FALSE(rpc::isKnownTemplate(65535));
 }

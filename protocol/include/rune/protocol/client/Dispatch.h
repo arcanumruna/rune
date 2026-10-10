@@ -61,7 +61,8 @@ struct FrameCheck {
 //                            10-15 gap → UnknownTemplate)
 //   produce/consume 16-31  (Produce=16 .. Unsubscribe=21 assigned; 22-31 gap → UnknownTemplate)
 //   groups/txn      32-63  (JoinGroup=32 .. Assign=44; InitProducerId=45..EndTxnResponse=54)
-//   view            64-95  (DefineTopic=64..TopicSchemaResponse=67; AlterTopic=68, AlterTopicResponse=69)
+//   view            64-95  (DefineTopic=64..TopicSchemaResponse=67; AlterTopic=68, AlterTopicResponse=69;
+//                            CreateView=70, CreateViewResponse=71, GetViewRow=72, ViewRowResponse=73)
 //
 // Extend this function when future tickets add template ids.
 // ---------------------------------------------------------------------------
@@ -100,9 +101,9 @@ struct FrameCheck {
         tid <= static_cast<uint16_t>(TemplateId::EndTxnResponse)) {
         return true;
     }
-    // 0b/0c schema range: 64..69
+    // 0b/0c schema + view-engine range: 64..73
     if (tid >= static_cast<uint16_t>(TemplateId::DefineTopic) &&
-        tid <= static_cast<uint16_t>(TemplateId::AlterTopicResponse)) {
+        tid <= static_cast<uint16_t>(TemplateId::ViewRowResponse)) {
         return true;
     }
     return false;

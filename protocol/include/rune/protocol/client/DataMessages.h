@@ -616,4 +616,157 @@ struct Unsubscribe {
     }
 };
 
+// ---------------------------------------------------------------------------
+// GetViewRow  (templateId 72)  client->broker — point lookup into a
+// materialized view's output topic by key.
+//
+// Frame layout (all little-endian):
+//   [0..23]   MessageHeader (24 bytes)
+//     blockLength = BODY_FIXED (20)
+//     templateId  = 72
+//   [24..27]  viewTopicId          : int32
+//   [28..35]  keyU64               : uint64
+//   [36..43]  requestedFingerprint : uint64  (0 = latest; non-zero pins the
+//                                              caller to a specific output
+//                                              schema fingerprint)
+//   BODY_FIXED = 20 (4+8+8)
+//
+// Total = 24 + 20 = 44 bytes (no var fields)
+// ---------------------------------------------------------------------------
+struct GetViewRow {
+    int64_t  sessionId           = 0;
+    int64_t  correlationId       = 0;
+    int32_t  viewTopicId         = -1;
+    uint64_t keyU64              = 0;
+    uint64_t requestedFingerprint = 0;  // 0 = latest
+
+    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::GetViewRow); // 72
+    static constexpr uint16_t BODY_FIXED  = 20; // viewTopicId(4)+keyU64(8)+requestedFingerprint(8)
+
+    static constexpr std::size_t ENCODED_SIZE = MessageHeader::ENCODED_SIZE + BODY_FIXED; // 44
+
+    /// Encode the full frame (44 bytes) into buf.  Returns 44.
+    std::size_t encode(uint8_t* buf) const noexcept {
+        MessageHeader hdr;
+        hdr.blockLength   = BODY_FIXED;
+        hdr.templateId    = TEMPLATE_ID;
+        hdr.schemaId      = kSchemaId;
+        hdr.version       = kProtocolVersion;
+        hdr.sessionId     = sessionId;
+        hdr.correlationId = correlationId;
+        hdr.encode(buf);
+
+        constexpr int fixedBase = static_cast<int>(MessageHeader::ENCODED_SIZE);
+        detail::putLE32(buf, fixedBase + 0,  viewTopicId);
+        detail::putLE64(buf, fixedBase + 4,  static_cast<int64_t>(keyU64));
+        detail::putLE64(buf, fixedBase + 12, static_cast<int64_t>(requestedFingerprint));
+
+        return ENCODED_SIZE;
+    }
+
+    /// Decode a full frame from buf[0..avail-1].
+    /// Returns nullopt on any truncation or header mismatch.
+    static std::optional<GetViewRow> decode(const uint8_t* buf, std::size_t avail) noexcept {
+        if (avail < ENCODED_SIZE) return std::nullopt;
+
+        auto hdrOpt = MessageHeader::decode(buf, avail);
+        if (!hdrOpt) return std::nullopt;
+        const MessageHeader& hdr = *hdrOpt;
+        if (hdr.schemaId   != kSchemaId)   return std::nullopt;
+        if (hdr.templateId != TEMPLATE_ID) return std::nullopt;
+
+        GetViewRow msg;
+        msg.sessionId     = hdr.sessionId;
+        msg.correlationId = hdr.correlationId;
+
+        constexpr int fixedBase = static_cast<int>(MessageHeader::ENCODED_SIZE);
+        msg.viewTopicId          = detail::getLE32(buf, fixedBase + 0);
+        msg.keyU64               = static_cast<uint64_t>(detail::getLE64(buf, fixedBase + 4));
+        msg.requestedFingerprint = static_cast<uint64_t>(detail::getLE64(buf, fixedBase + 12));
+
+        return msg;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// ViewRowResponse  (templateId 73)  broker->client
+//
+// Frame layout (all little-endian):
+//   [0..23]   MessageHeader (24 bytes)
+//     blockLength = BODY_FIXED (6)
+//     templateId  = 73
+//   [24..25]  status   : uint16  (0=OK,1=AbsentKey,2=NotReady,3=SchemaMismatch,4=UnknownView)
+//   [26..29]  rowLen   : uint32  (== rowBytes.size(); 0 when status != OK)
+//   BODY_FIXED = 6 (2+4), var field starts at offset 30 (header 24 + 6)
+//   [30..33]  rowBytes length : uint32  (var prefix)
+//   [34..]    rowBytes bytes   (opaque row payload; empty when status != OK)
+//
+// Total = 24 + 6 + 4 + rowBytes.size() = 34 + rowBytes.size()
+// ---------------------------------------------------------------------------
+struct ViewRowResponse {
+    int64_t sessionId      = 0;
+    int64_t correlationId  = 0;
+    uint16_t status        = 0;   // 0=OK,1=AbsentKey,2=NotReady,3=SchemaMismatch,4=UnknownView
+    uint32_t rowLen        = 0;   // == rowBytes.size()
+    const uint8_t* rowBytes = nullptr;
+    uint32_t rowBytesLen    = 0;
+
+    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::ViewRowResponse); // 73
+    static constexpr uint16_t BODY_FIXED  = 6; // status(2)+rowLen(4)
+
+    enum Status : uint16_t { kOk = 0, kAbsentKey = 1, kNotReady = 2, kSchemaMismatch = 3, kUnknownView = 4 };
+
+    /// Total encoded size accounting for the var field.
+    std::size_t encodedSize() const noexcept {
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 4u + rowBytesLen;
+    }
+
+    /// Encode the full frame into buf.  buf must be >= encodedSize() bytes.
+    /// Returns total bytes written.
+    std::size_t encode(uint8_t* buf) const noexcept {
+        MessageHeader hdr;
+        hdr.blockLength   = BODY_FIXED;
+        hdr.templateId    = TEMPLATE_ID;
+        hdr.schemaId      = kSchemaId;
+        hdr.version       = kProtocolVersion;
+        hdr.sessionId     = sessionId;
+        hdr.correlationId = correlationId;
+        hdr.encode(buf);
+
+        constexpr int fixedBase = static_cast<int>(MessageHeader::ENCODED_SIZE);
+        detail::putLE16(buf, fixedBase + 0, status);
+        detail::putLE32(buf, fixedBase + 2, static_cast<int32_t>(rowLen));
+
+        std::size_t pos = static_cast<std::size_t>(fixedBase) + BODY_FIXED;
+        pos += putVarBytes32(buf + pos, rowBytes, rowBytesLen);
+        return pos;
+    }
+
+    /// Decode a full frame from buf[0..avail-1].
+    /// Returns nullopt on any truncation or header mismatch.
+    /// The returned span (rowBytes/rowBytesLen) is a zero-copy view into buf —
+    /// buf must outlive the result.
+    static std::optional<ViewRowResponse> decode(const uint8_t* buf, std::size_t avail) noexcept {
+        auto hdrOpt = MessageHeader::decode(buf, avail);
+        if (!hdrOpt) return std::nullopt;
+        const MessageHeader& hdr = *hdrOpt;
+        if (hdr.schemaId   != kSchemaId)   return std::nullopt;
+        if (hdr.templateId != TEMPLATE_ID) return std::nullopt;
+
+        constexpr std::size_t fixedBase = MessageHeader::ENCODED_SIZE;
+        if (avail < fixedBase + BODY_FIXED) return std::nullopt;
+
+        ViewRowResponse msg;
+        msg.sessionId     = hdr.sessionId;
+        msg.correlationId = hdr.correlationId;
+        msg.status = detail::getLE16(buf, static_cast<int>(fixedBase) + 0);
+        msg.rowLen = static_cast<uint32_t>(detail::getLE32(buf, static_cast<int>(fixedBase) + 2));
+
+        std::size_t pos = fixedBase + BODY_FIXED;
+        if (!getVarBytes32(buf, avail, pos, msg.rowBytes, msg.rowBytesLen)) return std::nullopt;
+
+        return msg;
+    }
+};
+
 } // namespace rune::protocol::client

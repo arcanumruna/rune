@@ -226,4 +226,82 @@ struct AlterTopicResponse {
     }
 };
 
+// CreateView (70): body = persistence:u8, then var fields
+//   viewName(varstr), keyField(varstr), planBlob(varbytes32).
+// planBlob carries the authored ViewPlan (serializeAuthored): the single
+// source's topicId+keyField, the output fields, and the ViewSizing knobs
+// (chunkBytes/capacity/maxRows) all ride inside it — this message only
+// carries the view's own name/keyField/persistence plus the opaque plan.
+struct CreateView {
+    int64_t sessionId = 0, correlationId = 0;
+    std::string_view viewName;
+    std::string_view keyField;
+    uint8_t persistence = 0;
+    const uint8_t* planBlob = nullptr;
+    uint32_t planLen = 0;
+
+    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::CreateView);
+    static constexpr uint16_t BODY_FIXED  = 1;  // u8 persistence
+
+    std::size_t encodedSize() const noexcept {
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED
+             + 2u + viewName.size()
+             + 2u + keyField.size()
+             + 4u + planLen;
+    }
+    std::size_t encode(uint8_t* buf) const noexcept {
+        MessageHeader hdr; hdr.blockLength = BODY_FIXED; hdr.templateId = TEMPLATE_ID;
+        hdr.schemaId = kSchemaId; hdr.version = kProtocolVersion;
+        hdr.sessionId = sessionId; hdr.correlationId = correlationId; hdr.encode(buf);
+        std::size_t pos = MessageHeader::ENCODED_SIZE;
+        buf[pos++] = persistence;
+        pos += putVarStr(buf + pos, viewName);
+        pos += putVarStr(buf + pos, keyField);
+        pos += putVarBytes32(buf + pos, planBlob, planLen);
+        return pos;
+    }
+    static std::optional<CreateView> decode(const uint8_t* buf, std::size_t avail) noexcept {
+        auto h = MessageHeader::decode(buf, avail);
+        if (!h || h->schemaId != kSchemaId || h->templateId != TEMPLATE_ID) return std::nullopt;
+        std::size_t pos = MessageHeader::ENCODED_SIZE;
+        if (avail < pos + BODY_FIXED) return std::nullopt;
+        CreateView m; m.sessionId = h->sessionId; m.correlationId = h->correlationId;
+        m.persistence = buf[pos++];
+        if (!getVarStr(buf, avail, pos, m.viewName)) return std::nullopt;
+        if (!getVarStr(buf, avail, pos, m.keyField)) return std::nullopt;
+        if (!getVarBytes32(buf, avail, pos, m.planBlob, m.planLen)) return std::nullopt;
+        return m;
+    }
+};
+
+// CreateViewResponse (71): body = viewTopicId:i32, outputFingerprint:u64, errorCode:u16.
+struct CreateViewResponse {
+    int64_t sessionId = 0, correlationId = 0;
+    int32_t viewTopicId = -1; uint64_t outputFingerprint = 0; uint16_t errorCode = 0;
+    static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::CreateViewResponse);
+    static constexpr uint16_t BODY_FIXED  = 14;  // viewTopicId(4) + outputFingerprint(8) + errorCode(2)
+    std::size_t encodedSize() const noexcept { return MessageHeader::ENCODED_SIZE + BODY_FIXED; }
+    std::size_t encode(uint8_t* buf) const noexcept {
+        MessageHeader hdr; hdr.blockLength = BODY_FIXED; hdr.templateId = TEMPLATE_ID;
+        hdr.schemaId = kSchemaId; hdr.version = kProtocolVersion;
+        hdr.sessionId = sessionId; hdr.correlationId = correlationId; hdr.encode(buf);
+        std::size_t pos = MessageHeader::ENCODED_SIZE;
+        detail::putLE32(buf, static_cast<int>(pos), viewTopicId); pos += 4;
+        detail::putLE64(buf, static_cast<int>(pos), static_cast<int64_t>(outputFingerprint)); pos += 8;
+        detail::putLE16(buf, static_cast<int>(pos), errorCode); pos += 2;
+        return pos;
+    }
+    static std::optional<CreateViewResponse> decode(const uint8_t* buf, std::size_t avail) noexcept {
+        auto h = MessageHeader::decode(buf, avail);
+        if (!h || h->schemaId != kSchemaId || h->templateId != TEMPLATE_ID) return std::nullopt;
+        std::size_t pos = MessageHeader::ENCODED_SIZE;
+        if (avail < pos + BODY_FIXED) return std::nullopt;
+        CreateViewResponse m; m.sessionId = h->sessionId; m.correlationId = h->correlationId;
+        m.viewTopicId = detail::getLE32(buf, static_cast<int>(pos)); pos += 4;
+        m.outputFingerprint = static_cast<uint64_t>(detail::getLE64(buf, static_cast<int>(pos))); pos += 8;
+        m.errorCode = detail::getLE16(buf, static_cast<int>(pos)); pos += 2;
+        return m;
+    }
+};
+
 } // namespace rune::protocol::client

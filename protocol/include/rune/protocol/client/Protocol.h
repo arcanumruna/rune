@@ -81,6 +81,11 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     TopicSchemaResponse  = 67,
     AlterTopic           = 68,
     AlterTopicResponse   = 69,
+    // view-engine range (0c follow-on, Task 18): CreateView/GetViewRow
+    CreateView           = 70,
+    CreateViewResponse   = 71,
+    GetViewRow           = 72,
+    ViewRowResponse      = 73,
 };
 
 enum class ErrorCode : uint16_t {
@@ -134,6 +139,11 @@ enum class ErrorCode : uint16_t {
     // schema-evolution error codes (AlterTopic, 0c)
     SchemaIncompatible     = 30,  // proposed AlterTopic ops are incompatible with existing data/consumers
     SchemaConflict         = 31,  // AlterTopic.expectedVersion stale — topic schema changed since the caller last read it
+    // view-engine error codes (Task 18): CreateView/GetViewRow
+    ViewExists             = 32,  // CreateView on an existing view name
+    ViewSourceNotFound     = 33,  // CreateView's planBlob references a source topic that does not exist
+    ViewFieldUnresolved    = 34,  // CreateView's planBlob references an output/key field the source schema does not have
+    ViewKeyInvalid         = 35,  // GetViewRow.keyU64 does not resolve under the view's keyField type
 };
 
 // ---------------------------------------------------------------------------
