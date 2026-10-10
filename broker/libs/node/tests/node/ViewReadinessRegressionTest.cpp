@@ -88,6 +88,48 @@ std::vector<uint8_t> upsertRun(int64_t key, int32_t hpBase, int count, int64_t b
     return b.build();
 }
 
+// A committed batch of two DISTINCT keys at [baseOffset, baseOffset+2) — used
+// to grow a table past a small maxRows ceiling (proving grow-on-demand).
+std::vector<uint8_t> twoKeyBatch(int64_t k1, int32_t hp1, int64_t k2, int32_t hp2,
+                                 int64_t baseOffset) {
+    rune::protocol::RecordBatchBuilder b(baseOffset, /*baseTimestamp*/ 0);
+    b.append(asSv(keyBytes(k1)), asSv(encodeCharacter(k1, hp1, 1)), 0);
+    b.append(asSv(keyBytes(k2)), asSv(encodeCharacter(k2, hp2, 1)), 0);
+    return b.build();
+}
+
+// Encode a BASE checkpoint record capturing every live row produced by folding
+// `src` over [0, foldTo), at O == foldTo (the exclusive cursor, matching how
+// WorkerViewSet persists O == foldCursor).
+std::vector<uint8_t> makeBaseCheckpoint(const rune::view::CompiledViewPlan& plan,
+                                        const rune::view::RowLayout& layout,
+                                        const rune::codec::Descriptor& src,
+                                        const std::vector<uint8_t>& srcBatch, int64_t foldTo) {
+    rune::view::ViewTable tmp(layout, 16, 1u << 16);
+    rune::view::VersionDescriptorCache vdc(src);
+    rune::storage::LogReadView v{srcBatch.data(), srcBatch.size(), 0, foldTo};
+    int64_t cursor = 0;
+    rune::view::foldBatch(plan, layout, vdc, tmp, v, foldTo, cursor);
+    std::vector<rune::view::DirtyEntry> entries;
+    std::vector<uint8_t> rowScratch;
+    std::vector<std::size_t> offs;
+    tmp.drainDirty([&](uint32_t rid, const uint8_t* row, bool deleted, uint64_t key) {
+        rune::view::DirtyEntry e{rid, deleted, key, nullptr};
+        if (!deleted && row != nullptr) {
+            offs.push_back(rowScratch.size());
+            rowScratch.insert(rowScratch.end(), row, row + layout.rowLen);
+        } else {
+            offs.push_back(SIZE_MAX);
+        }
+        entries.push_back(e);
+    });
+    for (std::size_t i = 0; i < entries.size(); ++i)
+        if (offs[i] != SIZE_MAX) entries[i].row = rowScratch.data() + offs[i];
+    std::vector<uint8_t> out;
+    rune::view::encodeDelta(entries, foldTo, layout.rowLen, out);
+    return out;
+}
+
 } // namespace
 
 // Review-focus #5 gate: install-for-recovery with checkpointO < committedTail
@@ -102,33 +144,8 @@ TEST(ViewReadinessRegression, GetViewRowNotReadyIsRetriable) {
 
     // Build an on-disk checkpoint state by folding offsets [0,2) (hp climbs to
     // 11) into a throwaway table, then encoding that as a BASE record at O=2.
-    std::vector<uint8_t> baseRec;
-    {
-        rune::view::ViewTable tmp(comp.rowLayout, 16, 1u << 16);
-        rune::view::VersionDescriptorCache vdc(src);
-        const auto pre = upsertRun(7, 10, /*count*/ 2, /*baseOffset*/ 0);  // offsets [0,2)
-        rune::storage::LogReadView v{pre.data(), pre.size(), 0, 2};
-        int64_t cursor = 0;
-        rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, tmp, v, /*bound*/ 2, cursor);
-        ASSERT_EQ(cursor, 2);
-        // Drain the live rows into a base record at O == folded cursor (== 2).
-        std::vector<rune::view::DirtyEntry> entries;
-        std::vector<uint8_t> rowScratch;
-        std::vector<std::size_t> offs;
-        tmp.drainDirty([&](uint32_t rid, const uint8_t* row, bool deleted, uint64_t key) {
-            rune::view::DirtyEntry e{rid, deleted, key, nullptr};
-            if (!deleted && row != nullptr) {
-                offs.push_back(rowScratch.size());
-                rowScratch.insert(rowScratch.end(), row, row + comp.rowLayout.rowLen);
-            } else {
-                offs.push_back(SIZE_MAX);
-            }
-            entries.push_back(e);
-        });
-        for (std::size_t i = 0; i < entries.size(); ++i)
-            if (offs[i] != SIZE_MAX) entries[i].row = rowScratch.data() + offs[i];
-        rune::view::encodeDelta(entries, /*O*/ 2, comp.rowLayout.rowLen, baseRec);
-    }
+    const auto baseRec =
+        makeBaseCheckpoint(comp.plan, comp.rowLayout, src, upsertRun(7, 10, 2, 0), /*foldTo*/ 2);
 
     rune::node::ViewSnapshotChannel channel;
     rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-test");
@@ -243,4 +260,98 @@ TEST(ViewReadinessRegression, NoInstancesIsReady) {
     rune::node::ViewSnapshotChannel channel;
     rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-test");
     EXPECT_TRUE(vs.allViewsReady());
+}
+
+// §15 #24: maxRows is an OBSERVABLE capacity-exceeded EVENT, NOT a fold-stop.
+// Crossing the ceiling MUST increment the capacity-exceeded counter AND keep
+// folding (the table grows on demand) — it must never refuse the fold or freeze
+// the cursor.  Two sequential driveFolds passes with maxRows=1: pass 1 (table
+// empty at start) folds key 7 (no event); pass 2 (table already at the ceiling)
+// fires the event AND still folds key 8, so the table grows to size 2 (> 1).
+TEST(ViewReadinessRegression, CapacityExceededEventDoesNotStopFolding) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(0), srcs, 0x40000007).value();
+    comp.plan.sizing.maxRows = 1;  // capacity-bounded view
+
+    rune::node::ViewSnapshotChannel channel;
+    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-test");
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+
+    const auto b0 = upsertRun(7, 10, /*count*/ 1, /*baseOffset*/ 0);  // key 7 @ [0,1)
+    const auto b1 = upsertRun(8, 20, /*count*/ 1, /*baseOffset*/ 1);  // key 8 @ [1,2)
+    auto readRange = [&](int64_t from, int64_t /*to*/) -> rune::storage::LogReadView {
+        return from == 0 ? rune::storage::LogReadView{b0.data(), b0.size(), 0, 1}
+                         : rune::storage::LogReadView{b1.data(), b1.size(), 1, 2};
+    };
+
+    vs.driveFolds(/*srcTopicId*/ 5, /*partition*/ 0, readRange, /*bound*/ 1, 0);
+    EXPECT_EQ(vs.capacityExceededCount(), 0u) << "table was empty at pass 1 start";
+
+    vs.driveFolds(/*srcTopicId*/ 5, /*partition*/ 0, readRange, /*bound*/ 2, 0);
+    EXPECT_GE(vs.capacityExceededCount(), 1u)
+        << "crossing maxRows must FIRE the capacity-exceeded event";
+
+    // The fold was NOT refused — both keys are present (table grew past maxRows).
+    const rune::view::RowLayout* L = nullptr;
+    EXPECT_NE(vs.getRow(0x40000007, 0, 7, L, nullptr), nullptr);
+    EXPECT_NE(vs.getRow(0x40000007, 0, 8, L, nullptr), nullptr)
+        << "fold must CONTINUE past maxRows (grow-on-demand), not stop";
+}
+
+// *Regression* (coordinator IMPORTANT, Task 16 liveness): a capacity-bounded
+// view that RECOVERS already AT its maxRows ceiling must still reach Ready via
+// driveRebuild — it must NOT stall in RebuildingViews forever.
+//
+// Pre-fix (maxRows as a hard fold-STOP): driveRebuild's driveView_ returns
+// BEFORE foldBatch whenever table.size() >= maxRows, so foldCursor never
+// advances past the recovered checkpoint O, never reaches committedTail, and
+// the instance is stuck in RebuildingViews — allViewsReady() is NEVER true
+// under the hard cap (the whole node would never become ready/serve/elect).
+//
+// Post-fix (maxRows downgraded to an observable event): the rebuild folds the
+// committed tail regardless, growing the table past maxRows, foldCursor reaches
+// committedTail, and the instance flips to Ready — allViewsReady() becomes true.
+TEST(ViewReadinessRegression, RecoverAtMaxRowsStillReachesReadyNoStall) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(0), srcs, 0x40000007).value();
+    comp.plan.sizing.maxRows = 1;  // recovers AT this ceiling (1 live row)
+
+    // Checkpoint: one live row (key 7) at O=1 — table recovers AT maxRows.
+    const auto baseRec =
+        makeBaseCheckpoint(comp.plan, comp.rowLayout, src, upsertRun(7, 10, 1, 0), /*foldTo*/ 1);
+
+    rune::node::ViewSnapshotChannel channel;
+    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-test");
+
+    const std::span<const std::span<const uint8_t>> noDeltas{};
+    vs.installViewForRecovery(comp.plan, comp.rowLayout, src, /*persisted*/ true,
+                              /*partition*/ 0, std::span<const uint8_t>(baseRec), noDeltas,
+                              /*committedTail*/ 3);
+
+    EXPECT_EQ(vs.readiness(0x40000007, 0), rune::node::ViewReadiness::RebuildingViews);
+    EXPECT_FALSE(vs.allViewsReady());
+
+    // Committed tail (1,3]: two NEW keys (8,9) that would grow the table OVER
+    // maxRows — the exact case the old hard ceiling refused to fold.
+    const auto tail = twoKeyBatch(8, 80, 9, 90, /*baseOffset*/ 1);  // offsets [1,3)
+    auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
+        return rune::storage::LogReadView{tail.data(), tail.size(), 1, 3};
+    };
+
+    // Drive the rebuild under a HARD cap.  Pre-fix this loop exhausts without
+    // ever reaching Ready (stall); post-fix it reaches Ready.
+    for (int i = 0; i < 64 && !vs.allViewsReady(); ++i)
+        vs.driveRebuild(/*srcTopicId*/ 5, /*partition*/ 0, readRange, /*committedTail*/ 3, i);
+
+    EXPECT_TRUE(vs.allViewsReady()) << "a view recovered at maxRows must NOT stall in RebuildingViews";
+    EXPECT_EQ(vs.readiness(0x40000007, 0), rune::node::ViewReadiness::Ready);
+
+    // Grow-on-demand: the table grew past maxRows, and the capacity event fired.
+    EXPECT_GE(vs.capacityExceededCount(), 1u);
+    const rune::view::RowLayout* L = nullptr;
+    EXPECT_NE(vs.getRow(0x40000007, 0, 7, L, nullptr), nullptr);
+    EXPECT_NE(vs.getRow(0x40000007, 0, 8, L, nullptr), nullptr);
+    EXPECT_NE(vs.getRow(0x40000007, 0, 9, L, nullptr), nullptr);
 }

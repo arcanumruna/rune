@@ -253,8 +253,12 @@ public:
                           const rune::view::RowLayout*& outLayout,
                           RowStatus* outStatus = nullptr) const;
 
-    // Number of times a fold was refused because a (view, partition) was
-    // already at its §10 maxRows hard ceiling (observable capacity signal).
+    // Number of fold passes that ran with a (view, partition) at/over its §15
+    // maxRows ceiling — an OBSERVABLE capacity-exceeded metric only.  It does
+    // NOT mean any fold was refused: crossing maxRows never blocks folding or
+    // freezes foldCursor (the table grows on demand), it is surfaced here so a
+    // capacity-bounded view's overflow is monitorable rather than a liveness
+    // trap.
     [[nodiscard]] uint64_t capacityExceededCount() const noexcept { return capacityExceeded_; }
 
     // Count of live per-(view, partition) instances.
@@ -283,9 +287,10 @@ private:
     ViewInstance* getOrCreate_(int32_t viewTopicId, int32_t partition);
 
     // Drive ONE (view, partition) instance.  Flushes any held pending delta
-    // first (never drop); folds the committed range; enforces the maxRows
-    // ceiling; and, for a persisted view, drains + encodes + pushes a
-    // checkpoint delta.  Returns this pass's progress count for the instance.
+    // first (never drop); folds the committed range (ALWAYS advancing foldCursor
+    // — maxRows is an observable event, not a fold-stop); and, for a persisted
+    // view, drains + encodes + pushes a checkpoint delta.  Returns this pass's
+    // progress count for the instance.
     template <class ReadRangeFn>
     int driveView_(ViewInstance& inst, ReadRangeFn&& readRange, int64_t bound) {
         int work = 0;
@@ -297,13 +302,21 @@ private:
             if (!tryPushDelta_(inst)) return work;
         }
         // 2. Nothing new committed for this partition — caught up (checked before
-        //    the ceiling so capacityExceeded_ counts REFUSED folds, not idle passes).
+        //    the capacity event so capacityExceeded_ counts folds that actually
+        //    crossed the ceiling, not idle passes).
         if (inst.foldCursor >= bound) return work;
-        // 3. §10 hard ceiling: refuse to grow a view past maxRows (0 = unbounded).
+        // 3. §15 #24: maxRows is an OBSERVABLE capacity-exceeded EVENT, NOT a
+        //    fold-stop.  Crossing it increments capacityExceeded_ (the metric) but
+        //    MUST NOT refuse the fold or freeze foldCursor — the table grows on
+        //    demand (chunk chaining).  A hard early-return here was a liveness
+        //    trap: a view that recovered already at its ceiling would never
+        //    advance foldCursor, so driveRebuild could never reach foldCursor >=
+        //    committedTail and the instance (hence the whole node via
+        //    allViewsReady) would stall in RebuildingViews forever.  So: observe
+        //    and continue (0 == unbounded, never counted).
         if (inst.plan.sizing.maxRows != 0 &&
             inst.table.size() >= inst.plan.sizing.maxRows) {
             ++capacityExceeded_;
-            return work;
         }
         const rune::storage::LogReadView view = readRange(inst.foldCursor, bound);
         if (view.empty()) return work;
