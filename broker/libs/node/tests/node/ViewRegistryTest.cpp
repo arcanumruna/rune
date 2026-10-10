@@ -93,6 +93,24 @@ TEST(ViewRegistry, RebuildClearsPriorState) {
     EXPECT_EQ(r.all().size(), size_t{1});
 }
 
+// Regression: re-applying a record for the SAME viewTopicId under a DIFFERENT
+// viewName must erase the OLD name's nameToId_ mapping — otherwise byName on
+// the stale name would keep resolving to the renamed slot forever.
+TEST(ViewRegistryRegression, ApplyRecordRenameErasesStaleNameMapping) {
+    ViewRegistry r;
+    r.applyRecord(ViewRecord{1, "a", makeCompiledPlanBlob(1, "a"), 0});
+    ASSERT_NE(r.byName("a"), nullptr);
+
+    r.applyRecord(ViewRecord{1, "b", makeCompiledPlanBlob(1, "b"), 0});
+
+    EXPECT_EQ(r.byName("a"), nullptr);
+    ASSERT_NE(r.byName("b"), nullptr);
+    EXPECT_EQ(r.byName("b")->viewTopicId, 1);
+    ASSERT_NE(r.byViewTopicId(1), nullptr);
+    EXPECT_EQ(r.byViewTopicId(1)->viewName, "b");
+    EXPECT_EQ(r.all().size(), size_t{1});
+}
+
 // Task 8 lesson: a truncated/malformed buffer must return nullopt, never UB
 // and never an unvalidated huge allocation from a bogus length prefix.
 TEST(ViewRegistryRegression, DeserializeTruncatedBufferReturnsNullopt) {

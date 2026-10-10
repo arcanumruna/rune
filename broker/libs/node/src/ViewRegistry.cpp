@@ -136,10 +136,24 @@ std::optional<ViewRecord> ViewRecord::deserialize(std::span<const uint8_t> buf) 
 // ViewRegistry
 // ---------------------------------------------------------------------------
 void ViewRegistry::applyRecord(const ViewRecord& v) {
-    nameToId_[v.viewName] = v.viewTopicId;
-
     const auto it = idToIndex_.find(v.viewTopicId);
     if (it != idToIndex_.end()) {
+        // Re-apply for an EXISTING viewTopicId: if the incoming record
+        // renamed the view (viewName differs from what's currently stored),
+        // the OLD name's nameToId_ entry must be erased first — otherwise
+        // byName(oldName) would keep resolving to this (now-renamed) slot
+        // forever, a stale-mapping hole in the by-name lookup contract.
+        // (Phase 1 never actually renames a view, but the registry must not
+        // silently corrupt its own index if a future DDL path does.)
+        const ViewRecord& existing = records_[it->second];
+        if (existing.viewName != v.viewName) {
+            const auto staleIt = nameToId_.find(existing.viewName);
+            if (staleIt != nameToId_.end() && staleIt->second == v.viewTopicId) {
+                nameToId_.erase(staleIt);
+            }
+        }
+        nameToId_[v.viewName] = v.viewTopicId;
+
         // Overwrite the existing slot in place — records_ (a deque) never
         // moves existing elements on assignment, so any `const ViewRecord*`
         // a caller already holds into this slot now simply observes the
@@ -149,6 +163,7 @@ void ViewRegistry::applyRecord(const ViewRecord& v) {
         return;
     }
 
+    nameToId_[v.viewName] = v.viewTopicId;
     idToIndex_[v.viewTopicId] = records_.size();
     records_.push_back(v);
 }

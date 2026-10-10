@@ -3329,9 +3329,17 @@ void BrokerNode::buildAdminWorker() {
         schemaRegistry_.reset();
         schemaReplica_.reset();
         schemaLog_.reset();
-        // Task 17: __views has its own inner try/catch above, so on a schema-
-        // setup failure (before that block even runs) these are already null;
-        // reset here too for defensive symmetry if that ordering ever changes.
+        // Task 17: the __views block (its own inner try/catch, above) runs
+        // BEFORE this function's AdminDeps/adminWorkerAgent_/adminWorkerRunner_
+        // construction. So this outer catch IS reachable with an already-
+        // successful views*_ trio still set — e.g. adminWorkerAgent_'s or
+        // adminWorkerRunner_'s constructor throwing after __views succeeded.
+        // Resetting views*_ here too is intentional, not defensive-only
+        // dead code: without a live adminWorkerAgent_ there is no DDL control
+        // plane at all in this phase (Task 19's CreateView path is routed
+        // through AdminWorker), so there is nothing useful views*_ could do
+        // standing alone — treat the whole admin subsystem (schema + views)
+        // as one failure unit and tear it down together.
         viewRegistry_.reset();
         viewsReplica_.reset();
         viewsLog_.reset();

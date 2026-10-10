@@ -37,6 +37,9 @@ public:
     /// Apply (leader-commit or replica-apply) one view record. Overwrites any
     /// existing record for the same viewTopicId (views are not versioned —
     /// unlike TopicSchema — a re-apply replaces the prior definition in place).
+    /// If the re-applied record renames the view (viewName differs from the
+    /// stored one), the OLD name's byName() mapping is erased so it does not
+    /// keep stale-resolving to the renamed slot.
     void applyRecord(const ViewRecord& v);
 
     /// Look up by view name. Returns nullptr if absent.
