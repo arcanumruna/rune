@@ -11,7 +11,8 @@ add_library(rune_node
     src/GroupCoordinationService.cpp
     src/TransactionCoordinationService.cpp
     src/SchemaRegistry.cpp
-    src/AdminWorker.cpp)
+    src/AdminWorker.cpp
+    src/ViewSnapshotIoAgent.cpp)
 
 # The worker's io backends, as their own leaf library: Worker.h's header-inline
 # code (instantiated by rune_replication's AeronPartitionTransport.cpp too) calls
@@ -43,6 +44,10 @@ target_include_directories(rune_node PUBLIC
 # rune_dynamic_balancer: DynamicBalancer + FailoverElection (GR-7 dead-leader reassign,
 #   now ODR-used via MetadataService::reassignDeadPartitionLeaders from NodeRuntimeAgent)
 target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordination rune_transaction rune_metadata_msm rune_static_balancer rune_dynamic_balancer)
+# Task 13: ViewSnapshotIoAgent peeks the Task-12 delta wire header's O field
+# (rune::view::kViewCheckpointMagic) -- node -> view is the sanctioned
+# dependency direction (libs/view must NEVER depend on libs/node).
+target_link_libraries(rune_node PUBLIC rune_view)
 if(aeron_FOUND)
     target_link_libraries(rune_node PUBLIC aeron::aeron rune_replication_aeron rune_aeron_util)
     # Aeron's embedded media driver calls uuid_generate() from libuuid on Linux;
@@ -138,10 +143,12 @@ if(BUILD_TESTING)
         tests/node/ThreadAffinityTest.cpp
         tests/node/ParkUntilWorkIdleTest.cpp
         tests/node/RingDoorbellTest.cpp
+        tests/node/ViewSnapshotIoAgentTest.cpp
         )
     target_link_libraries(rune_node_tests PRIVATE
         rune_node
         rune_codec
+        rune_view
         GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_node_tests)
