@@ -3097,12 +3097,45 @@ private:
         if (row != nullptr && layout != nullptr) {
             ret.errorCode   = static_cast<int16_t>(RS::kOk);
             ret.recordCount = static_cast<int32_t>(layout->rowLen);
-            ret.chunk.assign(row, row + layout->rowLen);   // copy the row bytes
+            enqueueViewRowResult_(ret, row, layout->rowLen);   // zero-copy gather (hot path)
+            return;
         } else if (rs == WorkerViewSet::RowStatus::NotReady) {
             ret.errorCode = static_cast<int16_t>(RS::kNotReady);
         } else {
             ret.errorCode = static_cast<int16_t>(RS::kAbsentKey);
         }
+        enqueueReturn_(std::move(ret));   // no chunk: a fixed-size answer
+    }
+
+    // Zero-alloc OK answer for GetViewRow (Review-focus: no per-query heap alloc
+    // on the read hot path).  The view row lives in STABLE worker-owned table
+    // memory (only this thread folds it, and no fold runs between here and the
+    // commit below), so — exactly as PushRead's readPushChunk_ does — we GATHER
+    // the row bytes straight into the claimed return-ring slot (the single copy
+    // between the table and the consumer; no intermediate std::vector).  The
+    // back-pressure fallback (a return already queued, or the ring momentarily
+    // full) copies into the owned chunk and queues it — never dropped, never
+    // reordered; the common case never allocates.
+    void enqueueViewRowResult_(WorkerReturn& ret, const uint8_t* row, uint32_t rowLen) {
+        if (retFifo_.empty()) [[likely]] {
+            const std::size_t n = workerReturnEncodedLength(static_cast<std::size_t>(rowLen));
+            aeron::util::index_t idx = -1;
+            try {
+                idx = ret_.tryClaim(sbe::WorkerReturn::sbeTemplateId(), n);
+            } catch (const std::exception& ex) {
+                haltInvariant_("return-ring tryClaim threw (ViewRowResult)", ex.what(), rowLen);
+            } catch (...) {
+                haltInvariant_("return-ring tryClaim threw (ViewRowResult)", "non-std exception", rowLen);
+            }
+            if (idx >= 0) {
+                const ChunkRun run{row, rowLen};
+                encodeWorkerReturnGather(reinterpret_cast<char*>(ret_.base() + idx), n, ret,
+                                         &run, 1, rowLen);
+                ret_.commit(idx);
+                return;
+            }
+        }
+        ret.chunk.assign(row, row + rowLen);   // back-pressure fallback (rare): copy + queue
         enqueueReturn_(std::move(ret));
     }
 

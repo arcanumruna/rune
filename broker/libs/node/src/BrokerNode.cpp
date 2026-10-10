@@ -34,6 +34,7 @@
 #include <rune/node/AdminWorker.h>
 #include <rune/node/SchemaRegistry.h>
 #include <rune/codec/Serialize.h>
+#include <rune/view/ViewPlan.h>   // Task 20: deserializeCompiledViewPlan (view->source co-location)
 // Task 6: RecordBatch reader for rebuildFromLog (same as TxnStateStore).
 #include <rune/protocol/RecordBatch.h>
 // Task 8a: protocol response frames for DDL egress (respondDefine/respondGet).
@@ -3671,6 +3672,19 @@ void BrokerNode::startEmbeddedDriver() {
 // install would leave a view that never folds on that worker).
 // ---------------------------------------------------------------------------
 void BrokerNode::fanoutViewPlan_(ViewPlanUpdateMsg msg) {
+    // Task 20 (spec §11.2): co-locate the view sink with its SOURCE's shard group
+    // so a GetViewRow routed by viewTopicId lands on the worker that actually
+    // folded the view partition (the source-partition owner).  Control-thread
+    // only — the ShardRouter group map is written here and read only by routing
+    // on this same thread.  Decode the compiled plan's first source once (cold,
+    // per view creation); an unresolvable plan leaves the view a singleton group
+    // (correct for a single-worker broker).
+    if (workerPool_) {
+        if (auto plan = rune::view::deserializeCompiledViewPlan(msg.planBlob);
+            plan && !plan->sourceTopicId.empty()) {
+            workerPool_->coLocateViewWithSource(msg.viewTopicId, plan->sourceTopicId[0]);
+        }
+    }
     viewFanoutBacklog_.push_back(ViewFanoutPending{std::move(msg), 0});
     (void)pumpViewFanout_();
 }

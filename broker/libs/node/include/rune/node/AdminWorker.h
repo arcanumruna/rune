@@ -157,8 +157,12 @@ public:
         const RegistryEntry* latest = reg_.latest(vrec->viewTopicId);
         if (latest == nullptr) return 4;                        // output not registered
         outFingerprint = latest->fingerprint;
-        if (requestedFingerprint != 0 && requestedFingerprint != latest->fingerprint &&
-            reg_.byFingerprint(vrec->viewTopicId, requestedFingerprint) == nullptr) {
+        // CURRENT-only contract: a view row is served encoded in the view's
+        // CURRENT output layout, and executeGetViewRowWire_ accepts only the
+        // current output fingerprint.  So a pin to any non-current fingerprint
+        // (even a registered historical one) MUST be rejected here — otherwise a
+        // client would pass open but fail every GetViewRow with SchemaMismatch.
+        if (requestedFingerprint != 0 && requestedFingerprint != latest->fingerprint) {
             return 3;                                           // SchemaMismatch (drift)
         }
         return 0;                                               // OK

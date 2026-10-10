@@ -221,6 +221,24 @@ public:
         return router_;
     }
 
+    // Task 20 (spec §11.2 co-location): pin a materialized view's sink topic to
+    // its SOURCE's co-partition group, so workerForPartition(viewTopicId, p) ==
+    // workerForPartition(sourceTopicId, p).  The per-worker WorkerViewSet folds a
+    // view PARTITION from the worker that OWNS that source partition (driveViews_
+    // iterates owned source replicas), so the view table for (viewTopicId, p)
+    // lives on workerForPartition(sourceTopicId, p).  Without this mapping a
+    // runtime-created view sink is a singleton group (groupKey == viewTopicId),
+    // and a GetViewRow routed by viewTopicId would land on a worker that folded
+    // nothing for the view — a SILENT AbsentKey for a live key when workerCount>1.
+    //
+    // Control-thread only: the ShardRouter's group map is written here (at view
+    // creation / fan-out) and read only by routing (ownerWorkerId / tryEnqueueOp)
+    // on the SAME thread; workers never read the router at runtime (doWork
+    // iterates already-assigned replicas).  Shared-nothing preserved.
+    void coLocateViewWithSource(int32_t viewTopicId, int32_t sourceTopicId) noexcept {
+        router_.mapTopicToGroupKey(viewTopicId, router_.groupKeyForTopic(sourceTopicId));
+    }
+
     /// F18: does an op with a `tailLen`-byte tail fit ONE frame of the owning
     /// worker's ingress ring?  (See Worker::opTailFits.)  Called once per follower
     /// FetchResponse on the control thread: the router lookup is pure arithmetic

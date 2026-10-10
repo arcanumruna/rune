@@ -27,8 +27,10 @@
 
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
+#include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerViewSet.h>
 #include <rune/node/ViewSnapshotChannel.h>
+#include <rune/metadata/ShardRouter.h>
 
 #include <rune/node/AdminWorker.h>
 #include <rune/node/AdminChannels.h>
@@ -211,6 +213,91 @@ TEST(GetViewRowRegression, GetViewRowReturnsCurrentRowAfterFold) {
         << "recordCount carries rowLen (informational)";
     // Decode hp (slot 1) straight out of the returned row bytes.
     EXPECT_EQ(rv::readSlot(ret.chunk.data(), comp.rowLayout, 1).i, 50);
+}
+
+// ---------------------------------------------------------------------------
+// MULTI-WORKER routing (IMPORTANT 1): the view-partition table for
+// (viewTopicId, p) is folded on the worker that owns the SOURCE partition p
+// (driveViews_ iterates owned source replicas).  A GetViewRow is routed by
+// viewTopicId through WorkerPool::tryEnqueueOp, so on a >1-worker broker it must
+// land on that same source-owner — else it hits a worker that folded nothing and
+// answers a SILENT AbsentKey for a live key.  WorkerPool::coLocateViewWithSource
+// pins the view's shard group to the source's group so routing agrees.
+//
+// RED (no co-location): routing by viewTopicId lands on a DIFFERENT worker than
+//   the source owner -> AbsentKey.
+// GREEN (after coLocateViewWithSource): routes to the source owner -> OK + row.
+// ---------------------------------------------------------------------------
+TEST(GetViewRowRegression, MultiWorkerRoutesToSourceOwnerViaCoLocation) {
+    namespace rm = rune::metadata;
+    constexpr int32_t kWorkers = 2;
+
+    // Pick a viewTopicId whose NAIVE (singleton-group) partition-0 owner differs
+    // from the source owner — the exact mis-route the fix prevents.
+    rm::ShardRouter probe(kWorkers);
+    const int32_t srcOwner = probe.workerForPartition(kSrcTopicId, 0);
+    int32_t viewTopicId = 0x40000010;
+    while (probe.workerForPartition(viewTopicId, 0) == srcOwner) ++viewTopicId;
+    ASSERT_NE(probe.workerForPartition(viewTopicId, 0), srcOwner)
+        << "need a view id that naively mis-routes to prove the fix";
+
+    auto src = charSourceV1();
+    const Descriptor* srcs[] = {&src};
+    auto comp = rv::compileView(hpView(), srcs, viewTopicId).value();
+
+    WorkerPool pool(kWorkers, rm::ShardRouter(kWorkers));
+
+    // Fan-out installs the TEMPLATE on every worker; only the source-owner folds
+    // a row for (viewTopicId, partition 0) — exactly as production driveViews_.
+    ViewSnapshotChannel ch0, ch1;
+    WorkerViewSet vs0(ch0, "/tmp/rune-views-gvr-mw0");
+    WorkerViewSet vs1(ch1, "/tmp/rune-views-gvr-mw1");
+    vs0.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+    vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+    WorkerViewSet* vsByWorker[kWorkers] = {&vs0, &vs1};
+
+    const auto batch = oneUpsert(7, 50);
+    auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
+        return rune::storage::LogReadView{batch.data(), batch.size(), 0, 1};
+    };
+    vsByWorker[srcOwner]->driveFolds(kSrcTopicId, /*partition*/ 0, readRange, /*bound*/ 1, 0);
+
+    pool.worker(0).setViewSet(&vs0);
+    pool.worker(1).setViewSet(&vs1);
+
+    // Route by viewTopicId (exactly as the gateway's handleGetViewRow does).
+    auto query = [&]() -> WorkerReturn {
+        WorkerOp op;
+        op.type          = WorkerOp::Type::GetViewRow;
+        op.topicId       = viewTopicId;
+        op.partition     = 0;
+        op.sessionId     = 1;
+        op.correlationId = 99;
+        op.nextOffset    = 7;   // keyU64
+        op.hwBound       = 0;   // requestedFingerprint = latest
+        EXPECT_TRUE(pool.tryEnqueueOp(viewTopicId, /*partition*/ 0, std::move(op)));
+        for (int32_t i = 0; i < kWorkers; ++i) pool.worker(i).doWork(1'000'000LL);
+        WorkerReturn captured{};
+        int n = 0;
+        pool.drainAllReturns([&](WorkerReturn r) { captured = std::move(r); ++n; });
+        EXPECT_EQ(n, 1);
+        return captured;
+    };
+
+    // RED: without co-location, viewTopicId routes to the wrong worker.
+    const WorkerReturn pre = query();
+    EXPECT_EQ(pre.errorCode, static_cast<int16_t>(pc::ViewRowResponse::kAbsentKey))
+        << "pre-fix: a GetViewRow mis-routed to a non-folding worker answers AbsentKey";
+
+    // GREEN: co-locate the view's shard group with its source; routing agrees.
+    pool.coLocateViewWithSource(viewTopicId, kSrcTopicId);
+    ASSERT_EQ(pool.ownerWorkerId(viewTopicId, 0), srcOwner)
+        << "co-location must route viewTopicId to the source owner";
+    const WorkerReturn post = query();
+    ASSERT_EQ(post.errorCode, static_cast<int16_t>(pc::ViewRowResponse::kOk))
+        << "post-fix: GetViewRow lands on the source owner (which folded the row)";
+    ASSERT_EQ(post.chunk.size(), comp.rowLayout.rowLen);
+    EXPECT_EQ(rv::readSlot(post.chunk.data(), comp.rowLayout, 1).i, 50);
 }
 
 // ---------------------------------------------------------------------------
