@@ -36,9 +36,11 @@
 namespace rune::client::view {
 
 // Mirrors rune::view::MergeRule (libs/view/include/rune/view/ViewTypes.h).
-// Phase 1 clients only ever author Replace (single-source projection; no
-// aggregates until Phase 2), but the full set is carried so a plan authored
-// here round-trips byte-identically through the broker's deserializeAuthored.
+// Phase 2a brokers accept Replace plus the invertible aggregates CountAll
+// (Count(*)), Count(col), Sum and Avg (GROUP BY the view key, single source of
+// one partition); Min/Max/Last are not accepted until Phase 2b. The full set is
+// carried so a plan authored here round-trips byte-identically through the
+// broker's deserializeAuthored.
 enum class MergeRule : uint8_t { Replace, Count, Sum, Avg, Min, Max, Last, CountAll };  // CountAll=7 (Count(*))
 
 // WITH-clause sizing knobs (rune::view::ViewSizing). 0 fields take the
