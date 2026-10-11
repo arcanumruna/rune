@@ -124,3 +124,94 @@ TEST(PlanCompilerRejectRegression, RejectsMultiSourcePlan_BugC) {
     const rune::codec::Descriptor* single[] = {&d1};
     EXPECT_TRUE(rune::view::compileView(hpView(), single, 1).has_value());
 }
+
+namespace {
+rune::codec::Descriptor orderSourceForCompile() {
+    return rune::codec::DescriptorBuilder("order", 1)
+        .add("orderId", rune::codec::PrimType::Int64, 1, /*isKey*/ true)
+        .add("userId", rune::codec::PrimType::Int64)
+        .add("amount", rune::codec::PrimType::Int32)
+        .add("qty", rune::codec::PrimType::UInt32)
+        .add("price", rune::codec::PrimType::Float64)
+        .add("note", rune::codec::PrimType::Bool)
+        .build();
+}
+rune::view::ViewPlan aggPlan(std::vector<rune::view::AuthoredField> rest) {
+    rune::view::ViewPlan v;
+    v.viewName = "user_totals";
+    v.key      = "userId";
+    v.sources  = {{5, "userId"}};
+    v.output   = {{"userId", rune::codec::PrimType::Int64, 0, "userId", rune::view::MergeRule::Replace}};
+    for (auto& f : rest) v.output.push_back(std::move(f));
+    return v;
+}
+std::expected<rune::view::CompileResult, rune::view::CompileError> compileAgg(const rune::view::ViewPlan& v) {
+    static const auto src = orderSourceForCompile();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    return rune::view::compileView(v, srcs, 77);
+}
+using P = rune::codec::PrimType;
+using R = rune::view::MergeRule;
+} // namespace
+
+TEST(PlanCompilerAggregateRegression, ValidAggregateViewCompilesWithRuleOutputTypes) {
+    auto r = compileAgg(aggPlan({{"n", P::Int64, 0, "", R::CountAll},
+                                 {"notes", P::Int64, 0, "note", R::Count},
+                                 {"total", P::Int64, 0, "amount", R::Sum},
+                                 {"qtySum", P::UInt64, 0, "qty", R::Sum},
+                                 {"priceSum", P::Float64, 0, "price", R::Sum},
+                                 {"avg", P::Float64, 0, "amount", R::Avg}}));
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    const auto& out = r->plan.output;
+    ASSERT_EQ(out.size(), 7u);
+    EXPECT_EQ(out[1].rule, R::CountAll);
+    EXPECT_EQ(out[1].srcFieldId, rune::view::kNoSourceField);
+    EXPECT_EQ(out[3].type, P::Int64);     // Sum(Int32) -> Int64
+    EXPECT_EQ(out[4].type, P::UInt64);    // Sum(UInt32) -> UInt64
+    EXPECT_EQ(out[6].type, P::Float64);   // Avg -> Float64
+}
+
+TEST(PlanCompilerAggregateRegression, SumDeclaredWithSourceTypeIsRejected) {
+    auto r = compileAgg(aggPlan({{"total", P::Int32, 0, "amount", R::Sum}}));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find("produces Int64"), std::string::npos) << r.error().message;
+    EXPECT_EQ(r.error().message.find("key"), std::string::npos) << "must not classify as KeyInvalid";
+}
+
+TEST(PlanCompilerAggregateRegression, MinMaxLastAreRejectedUntilPhase2b) {
+    for (R rule : {R::Min, R::Max, R::Last}) {
+        auto r = compileAgg(aggPlan({{"x", P::Int32, 0, "amount", rule}}));
+        ASSERT_FALSE(r.has_value());
+        EXPECT_NE(r.error().message.find("Phase 2b"), std::string::npos) << r.error().message;
+    }
+}
+
+TEST(PlanCompilerAggregateRegression, CountAllWithSourceFieldIsRejected) {
+    auto r = compileAgg(aggPlan({{"n", P::Int64, 0, "amount", R::CountAll}}));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find("Count(*)"), std::string::npos);
+}
+
+TEST(PlanCompilerAggregateRegression, NonGroupReplaceColumnInAggregateViewIsRejected) {
+    auto r = compileAgg(aggPlan({{"total", P::Int64, 0, "amount", R::Sum},
+                                 {"price", P::Float64, 0, "price", R::Replace}}));
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find("must be an aggregate"), std::string::npos);
+    EXPECT_EQ(r.error().message.find("key"), std::string::npos);
+}
+
+TEST(PlanCompilerAggregateRegression, GroupColumnMustProjectTheGroupByField) {
+    auto v = aggPlan({{"total", P::Int64, 0, "amount", R::Sum}});
+    v.output[0].srcField = "orderId";   // view key column projects a different field than sources[0].keyField
+    auto r = compileAgg(v);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find("group-by"), std::string::npos);
+}
+
+TEST(PlanCompilerAggregateRegression, ReplaceOnlyViewIsUnchanged) {
+    rune::view::ViewPlan v;
+    v.viewName = "orders"; v.key = "orderId"; v.sources = {{5, "orderId"}};
+    v.output = {{"orderId", P::Int64, 0, "orderId", R::Replace},
+                {"amount", P::Int32, 0, "amount", R::Replace}};
+    EXPECT_TRUE(compileAgg(v).has_value());
+}

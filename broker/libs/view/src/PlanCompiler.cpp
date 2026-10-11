@@ -9,6 +9,7 @@
 #include <rune/view/PlanCompiler.h>
 
 #include <algorithm>
+#include <optional>
 #include <rune/codec/Fingerprint.h>
 
 namespace rune::view {
@@ -44,6 +45,44 @@ bool requiresNumeric(MergeRule rule) {
             return true;
         default:
             return false;
+    }
+}
+
+bool isAggregateRule(MergeRule r) {
+    return r == MergeRule::Count || r == MergeRule::CountAll || r == MergeRule::Sum ||
+           r == MergeRule::Avg;
+}
+
+bool isPhase2bRule(MergeRule r) {
+    return r == MergeRule::Min || r == MergeRule::Max || r == MergeRule::Last;
+}
+
+const char* primName(rune::codec::PrimType t) {
+    using P = rune::codec::PrimType;
+    switch (t) {
+        case P::Int32: return "Int32";   case P::Int64: return "Int64";
+        case P::UInt16: return "UInt16"; case P::UInt32: return "UInt32";
+        case P::UInt64: return "UInt64"; case P::Float64: return "Float64";
+        default: return "a non-numeric type";
+    }
+}
+
+// The output type an aggregate rule produces from a source field of type `src`
+// (Global Constraints: fixed by rule, never cast). nullopt = not aggregatable.
+std::optional<rune::codec::PrimType> aggregateOutputType(MergeRule r, rune::codec::PrimType src) {
+    using P = rune::codec::PrimType;
+    switch (r) {
+        case MergeRule::Count:
+        case MergeRule::CountAll: return P::Int64;
+        case MergeRule::Avg:      return isNumeric(src) ? std::optional<P>(P::Float64) : std::nullopt;
+        case MergeRule::Sum:
+            switch (src) {
+                case P::Int32: case P::Int64:                    return P::Int64;
+                case P::UInt16: case P::UInt32: case P::UInt64:  return P::UInt64;
+                case P::Float64:                                 return P::Float64;
+                default:                                         return std::nullopt;
+            }
+        default: return std::nullopt;
     }
 }
 
@@ -99,6 +138,27 @@ std::expected<CompileResult, CompileError> compileView(
     resolved.reserve(authored.output.size());
 
     for (const auto& af : authored.output) {
+        if (isPhase2bRule(af.rule)) {
+            return std::unexpected(CompileError{
+                "view '" + authored.viewName + "': output field '" + af.name +
+                "' uses Min/Max/Last, which are not supported until Phase 2b"});
+        }
+        if (af.rule == MergeRule::CountAll) {
+            if (!af.srcField.empty()) {
+                return std::unexpected(CompileError{
+                    "view '" + authored.viewName + "': output field '" + af.name +
+                    "' is Count(*), which takes no source field"});
+            }
+            if (af.type != rune::codec::PrimType::Int64) {
+                return std::unexpected(CompileError{
+                    "view '" + authored.viewName + "': output field '" + af.name +
+                    "' is Count(*), which produces Int64; declare output type Int64"});
+            }
+            ResolvedOutputField rof;
+            rof.srcFieldId = kNoSourceField;
+            resolved.push_back(rof);
+            continue;
+        }
         if (af.sourceIdx >= sourceDescriptors.size()) {
             return std::unexpected(CompileError{
                 "view '" + authored.viewName + "': output field '" + af.name +
@@ -134,11 +194,25 @@ std::expected<CompileResult, CompileError> compileView(
                 "' is not numeric"});
         }
 
-        if (af.type != fd->type) {
+        if (isAggregateRule(af.rule)) {
+            const auto out = aggregateOutputType(af.rule, fd->type);
+            if (!out) {
+                return std::unexpected(CompileError{
+                    "view '" + authored.viewName + "': output field '" + af.name +
+                    "' cannot aggregate source field '" + af.srcField + "' of " +
+                    primName(fd->type)});
+            }
+            if (af.type != *out) {
+                return std::unexpected(CompileError{
+                    "view '" + authored.viewName + "': output field '" + af.name +
+                    "' aggregates " + primName(fd->type) + ", which produces " +
+                    primName(*out) + "; declare output type " + primName(*out)});
+            }
+        } else if (af.type != fd->type) {
             return std::unexpected(CompileError{
                 "view '" + authored.viewName + "': output field '" + af.name +
                 "' declared type does not match resolved source field '" + af.srcField +
-                "' type (Phase 1 Replace does not cast)"});
+                "' type (Replace does not cast)"});
         }
 
         ResolvedOutputField rof;
@@ -216,6 +290,31 @@ std::expected<CompileResult, CompileError> compileView(
     }
     const size_t keyOutIdx =
         static_cast<size_t>(std::distance(authored.output.begin(), keyIt));
+
+    // --- 3b. Aggregate views (Phase 2a, table semantics): the view key column is
+    //         the GROUP BY column -- Replace, projecting sources[0].keyField -- and
+    //         every other column is an aggregate (SQL: no bare non-grouped column).
+    const bool aggregate = std::any_of(authored.output.begin(), authored.output.end(),
+                                       [](const AuthoredField& af) {
+                                           return af.rule != MergeRule::Replace;
+                                       });
+    if (aggregate) {
+        if (keyIt->rule != MergeRule::Replace ||
+            keyIt->srcField != authored.sources[0].keyField) {
+            return std::unexpected(CompileError{
+                "view '" + authored.viewName + "': the group-by column '" + authored.key +
+                "' must use Replace and project the group-by source field '" +
+                authored.sources[0].keyField + "'"});
+        }
+        for (size_t i = 0; i < authored.output.size(); ++i) {
+            if (i != keyOutIdx && authored.output[i].rule == MergeRule::Replace) {
+                return std::unexpected(CompileError{
+                    "view '" + authored.viewName + "': column '" + authored.output[i].name +
+                    "' in an aggregate view must be an aggregate (Count, Count(*), Sum, Avg); "
+                    "only the group-by column may use Replace"});
+            }
+        }
+    }
 
     // --- 4. Build the output ordering: key field first, then the rest in ---
     //        their original relative order.
