@@ -12,6 +12,8 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -25,6 +27,8 @@
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/WorkerViewSet.h>
 
+#include <spdlog/sinks/ringbuffer_sink.h>
+#include <spdlog/spdlog.h>
 
 namespace {
 
@@ -690,6 +694,108 @@ TEST(WorkerViewSetRegression, PersistedReplaceLargeRangeDeltasFitTheRing) {
         const uint8_t* row = vs.getRow(0x40000007, 0, uint64_t(i), L);
         ASSERT_NE(row, nullptr) << i;
         EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, i);
+    }
+}
+
+namespace {
+// Captures spdlog output into a ring for the scope's lifetime (restores the
+// previous default logger on exit).
+struct LogCapture {
+    std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> sink =
+        std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(256);
+    std::shared_ptr<spdlog::logger> prev = spdlog::default_logger();
+    LogCapture() {
+        auto lg = std::make_shared<spdlog::logger>("capture", sink);
+        lg->set_level(spdlog::level::trace);
+        lg->set_pattern("%v");
+        spdlog::set_default_logger(lg);
+    }
+    ~LogCapture() { spdlog::set_default_logger(prev); }
+    std::vector<std::string> lines() const { return sink->last_formatted(); }
+    std::vector<std::string> grep(const std::string& needle) const {
+        std::vector<std::string> out;
+        for (auto& l : lines()) if (l.find(needle) != std::string::npos) out.push_back(l);
+        return out;
+    }
+};
+} // namespace
+
+// REGRESSION (final review I2): a successful recovery replay logs ONE stable,
+// greppable VIEW-RECOVERED line (view, partition, recovered O, records applied,
+// checkpoint format) so the e2e can PROVE a v2-checkpoint recovery happened
+// (and was not just a cold re-fold of the source).  Both recovery entry
+// points: the explicit-span installViewForRecovery and the lazy file load.
+TEST(WorkerViewSetRegression, RecoveryLogsViewRecoveredLineRegression) {
+    const auto src = orderSrc();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(userTotalsPlan(0), srcs, 0x40000009).value();
+    const std::string dir = freshDir("rune-views-recovered-log");
+
+    rune::node::ViewSnapshotChannel ch1;
+    rune::node::WorkerViewSet vs1(ch1, dir);
+    vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    const auto b1 = orderBatch(0, {{1, 100, 10}, {2, 100, 30}});
+    auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b1.data(), b1.size(), 0, 2}; };
+    vs1.driveFolds(6, 0, rr1, 2, 0);
+    const auto deltas = drainDeltas(ch1);
+    ASSERT_EQ(deltas.size(), 1u);
+
+    {   // explicit-span path
+        LogCapture cap;
+        rune::node::ViewSnapshotChannel ch2;
+        rune::node::WorkerViewSet vs2(ch2, dir);
+        const std::span<const uint8_t> recs[] = {deltas[0]};
+        vs2.installViewForRecovery(comp.plan, comp.rowLayout, src, true, 0, {}, recs, 2);
+        const auto hits = cap.grep("VIEW-RECOVERED ");
+        ASSERT_EQ(hits.size(), 1u);
+        EXPECT_NE(hits[0].find("view=" + std::to_string(0x40000009)), std::string::npos) << hits[0];
+        EXPECT_NE(hits[0].find("partition=0"), std::string::npos) << hits[0];
+        EXPECT_NE(hits[0].find("O=2"), std::string::npos) << hits[0];
+        EXPECT_NE(hits[0].find("records=1"), std::string::npos) << hits[0];
+        EXPECT_NE(hits[0].find("format=v2"), std::string::npos) << hits[0];
+    }
+    {   // lazy on-disk path (getOrCreate_ -> loadRecoveryCheckpoint_)
+        {
+            std::ofstream f(dir + "/view-" + std::to_string(0x40000009u) + "-p0.delta", std::ios::binary);
+            f.write(reinterpret_cast<const char*>(deltas[0].data()),
+                    static_cast<std::streamsize>(deltas[0].size()));
+        }
+        LogCapture cap;
+        rune::node::ViewSnapshotChannel ch3;
+        rune::node::WorkerViewSet vs3(ch3, dir);
+        vs3.installView(comp.plan, comp.rowLayout, src, true, /*underRecovery*/ true);
+        vs3.driveFolds(6, 0, rr1, 2, 0);
+        const auto hits = cap.grep("VIEW-RECOVERED ");
+        ASSERT_EQ(hits.size(), 1u);
+        EXPECT_NE(hits[0].find("O=2 records=1 format=v2"), std::string::npos) << hits[0];
+    }
+    {   // a cold start (nothing to replay) is NOT a recovery: no line
+        LogCapture cap;
+        rune::node::ViewSnapshotChannel ch4;
+        rune::node::WorkerViewSet vs4(ch4, freshDir("rune-views-recovered-log-cold"));
+        vs4.installViewForRecovery(comp.plan, comp.rowLayout, src, true, 0, {}, {}, 2);
+        EXPECT_TRUE(cap.grep("VIEW-RECOVERED ").empty());
+    }
+    {   // a Replace view's v1 recovery reports format=v1
+        auto csrc = charSourceV1();
+        const rune::codec::Descriptor* csrcs[] = {&csrc};
+        auto rcomp = rune::view::compileView(hpView(0), csrcs, 0x40000007).value();
+        rune::node::ViewSnapshotChannel ch5;
+        rune::node::WorkerViewSet vs5(ch5, "/tmp/rune-views-recovered-log-v1");
+        vs5.installView(rcomp.plan, rcomp.rowLayout, csrc, true);
+        const auto b = oneUpsert(7, 10);
+        auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{b.data(), b.size(), 0, 1}; };
+        vs5.driveFolds(5, 0, rr, 1, 0);
+        const auto d = drainDeltas(ch5);
+        ASSERT_EQ(d.size(), 1u);
+        LogCapture cap;
+        rune::node::ViewSnapshotChannel ch6;
+        rune::node::WorkerViewSet vs6(ch6, "/tmp/rune-views-recovered-log-v1");
+        const std::span<const uint8_t> recs[] = {d[0]};
+        vs6.installViewForRecovery(rcomp.plan, rcomp.rowLayout, csrc, true, 0, {}, recs, 1);
+        const auto hits = cap.grep("VIEW-RECOVERED ");
+        ASSERT_EQ(hits.size(), 1u);
+        EXPECT_NE(hits[0].find("O=1 records=1 format=v1"), std::string::npos) << hits[0];
     }
 }
 

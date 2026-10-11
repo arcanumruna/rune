@@ -79,7 +79,21 @@ WAIT_BOUND_MS="${WAIT_BOUND_MS:-60000}"  # ms the probe itself polls a view read
 # collide with / tear down this one's live broker.
 COMPOSE_PROJECT="rune-view-engine21"
 BROKER_NETWORK="${COMPOSE_PROJECT}_default"
-CLIENT_IMAGE="rune-view-probe:$(cd "${CLIENT_REPO}" && git rev-parse --short HEAD)"
+
+# Image-tag source for a repo: its short HEAD sha when it is a git checkout;
+# otherwise (e.g. a `git archive` staging copy, which has no .git) a content
+# hash of its files, so a staged tree needs no `git init` and two different
+# staged trees never share a tag.
+sha256_stdin() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
+repo_tag() {
+    local d="$1"
+    if [ -e "${d}/.git" ]; then
+        git -C "${d}" rev-parse --short HEAD
+        return
+    fi
+    (cd "${d}" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 cat | sha256_stdin) | cut -c1-12
+}
+CLIENT_IMAGE="rune-view-probe:$(repo_tag "${CLIENT_REPO}")"
 CLIENT_HOSTNAME="rune-view-probe"
 CLIENT_EGRESS_PORT="40500"
 
@@ -87,7 +101,7 @@ CLIENT_EGRESS_PORT="40500"
 # specifically, on top of the commit sha, so it cannot collide with another
 # concurrent worktree/task scenario's "rune-broker-node:*" image even if two
 # happen to share a commit sha.
-export RUNE_IMAGE_TAG="$(cd "${BROKER_REPO}" && git rev-parse --short HEAD)-view-engine21"
+export RUNE_IMAGE_TAG="$(repo_tag "${BROKER_REPO}")-view-engine21"
 
 log()  { echo "[view-engine-e2e] $*" >&2; }
 fail() { echo "[view-engine-e2e] FAIL: $*" >&2; exit 1; }
@@ -356,6 +370,25 @@ if ! echo "${restart_out}" | grep -q "VIEW-ENGINE-E2E: OK"; then
     fail "verify_restart client did not print the final 'VIEW-ENGINE-E2E: OK' sentinel"
 fi
 
+# ---------------------------------------------------------------------------
+# Step 8: prove user_totals was restored from its v2 CHECKPOINT (not merely
+# re-folded from the retained source, which would also yield correct rows).
+# The broker logs ONE "VIEW-RECOVERED view=<id> partition=<p> O=<O>
+# records=<n> format=<v1|v2>" line per successful recovery replay; require one
+# for the aggregate view with format=v2 and O > 0.
+# ---------------------------------------------------------------------------
+log "Step 8: Checking broker logs for user_totals' v2 checkpoint recovery..."
+recovered_lines="$(docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" logs --no-log-prefix rune-1 2>/dev/null \
+    | grep -oE "VIEW-RECOVERED view=${VIEW_TOPIC_ID_AGG} partition=[0-9]+ O=-?[0-9]+ records=[0-9]+ format=v[12]" || true)"
+echo "----- VIEW-RECOVERED (user_totals) -----" >&2
+echo "${recovered_lines:-<none>}" >&2
+echo "----------------------------------------" >&2
+[ -n "${recovered_lines}" ] \
+    || fail "no VIEW-RECOVERED line for user_totals (view=${VIEW_TOPIC_ID_AGG}) — not recovered from a checkpoint"
+echo "${recovered_lines}" | grep -qE " O=[1-9][0-9]* records=[1-9][0-9]* format=v2$" \
+    || fail "user_totals VIEW-RECOVERED line lacks format=v2 with O>0: ${recovered_lines}"
+log "user_totals recovered from a v2 checkpoint: $(echo "${recovered_lines}" | tail -1)"
+
 log ""
 log "========================================"
 log "  VIEW-ENGINE E2E (full, incl. restart) PASSED"
@@ -366,6 +399,7 @@ log "  -> restart -> re-elected: ${leader2}"
 log "  -> char_persisted recovered OK (readiness gate replay)"
 log "  -> char_transient re-folded from the retained source OK"
 log "  -> reproduce -> both views fold the new value live OK"
-log "  -> user_totals (Count(*)/Sum/Avg) recovered + post-restart update retracts OK"
+log "  -> user_totals (Count(*)/Sum/Avg) recovered from its v2 checkpoint (VIEW-RECOVERED format=v2, O>0)"
+log "     + post-restart update retracts OK"
 log "  VIEW-ENGINE-E2E: OK, exit 0."
 log "========================================"

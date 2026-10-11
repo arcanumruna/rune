@@ -72,7 +72,9 @@ std::vector<uint8_t> readWholeFile(const std::string& path) {
 // record (v1 in an aggregate file, v2 in a Replace file) or mid-file
 // corruption is visible rather than a silent shorter recovery.
 int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
-                       std::span<const std::span<const uint8_t>> deltas) {
+                       std::span<const std::span<const uint8_t>> deltas,
+                       std::size_t& appliedOut) {
+    appliedOut = 0;
     rune::view::ViewTable* tables[3];
     uint32_t lens[3];
     if (inst.agg) {
@@ -97,6 +99,7 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
             return -1;
         }
         last = a->O;
+        ++appliedOut;
     }
     for (std::size_t i = 0; i < deltas.size(); ++i) {
         const auto a = apply(deltas[i]);
@@ -108,8 +111,20 @@ int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
             break;
         }
         last = a->O;
+        ++appliedOut;
     }
     return last;
+}
+
+// ONE stable, greppable line per successful recovery replay (control plane —
+// once per (view, partition) restart, never on the fold hot path).  The e2e
+// greps "VIEW-RECOVERED view=<id>" to prove a checkpoint (not a cold re-fold)
+// restored the view.  Nothing applied (cold start) is not a recovery: no line.
+void logRecovered(const ViewInstance& inst, int64_t recoveredO, std::size_t applied) {
+    if (applied == 0) return;
+    spdlog::info("VIEW-RECOVERED view={} partition={} O={} records={} format={}",
+                 inst.plan.viewTopicId, inst.partition, recoveredO, applied,
+                 inst.agg ? "v2" : "v1");
 }
 
 // Most source records one fold pass may cover so the pass's checkpoint delta
@@ -391,9 +406,11 @@ void WorkerViewSet::loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopi
     const std::vector<std::span<const uint8_t>> records =
         splitViewCheckpointRecords(std::span<const uint8_t>(file));
 
+    std::size_t applied = 0;
     const int64_t recoveredO = replayInstance(
         inst, /*base=*/std::span<const uint8_t>{},
-        std::span<const std::span<const uint8_t>>(records.data(), records.size()));
+        std::span<const std::span<const uint8_t>>(records.data(), records.size()), applied);
+    logRecovered(inst, recoveredO, applied);
     discardDirty_(inst);  // restored rows == the durable checkpoint: nothing to re-send
     inst.foldCursor   = std::max<int64_t>(recoveredO, 0);
     inst.lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
@@ -443,7 +460,9 @@ void WorkerViewSet::installViewForRecovery(
     // the highest applied checkpoint offset (the cursor that WAS persisted — the
     // exclusive "resume from" offset, see buildAndPushCheckpoint_), or -1 when
     // nothing applied (empty/missing checkpoint) -> foldCursor starts at 0.
-    const int64_t recoveredO = replayInstance(*inst, base, deltasInOrder);
+    std::size_t applied = 0;
+    const int64_t recoveredO = replayInstance(*inst, base, deltasInOrder, applied);
+    logRecovered(*inst, recoveredO, applied);
     discardDirty_(*inst);  // restored rows == the durable checkpoint: nothing to re-send
     inst->foldCursor   = std::max<int64_t>(recoveredO, 0);
     inst->lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
