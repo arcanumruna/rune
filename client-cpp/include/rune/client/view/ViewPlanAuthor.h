@@ -39,7 +39,7 @@ namespace rune::client::view {
 // Phase 1 clients only ever author Replace (single-source projection; no
 // aggregates until Phase 2), but the full set is carried so a plan authored
 // here round-trips byte-identically through the broker's deserializeAuthored.
-enum class MergeRule : uint8_t { Replace, Count, Sum, Avg, Min, Max, Last };
+enum class MergeRule : uint8_t { Replace, Count, Sum, Avg, Min, Max, Last, CountAll };  // CountAll=7 (Count(*))
 
 // WITH-clause sizing knobs (rune::view::ViewSizing). 0 fields take the
 // broker's own defaults.
