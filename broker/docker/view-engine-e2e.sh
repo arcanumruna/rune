@@ -305,6 +305,11 @@ log "Setup OK: srcTopicId=${VIEW_SRC_TOPIC_ID}" \
     "key=${VIEW_KEY_ID} hp0=${VIEW_HP_INITIAL}" \
     "orderTopicId=${VIEW_ORDER_TOPIC_ID} viewAgg={id=${VIEW_TOPIC_ID_AGG},fp=${VIEW_FP_AGG}}"
 
+# Phase 2b Part C: typed_route (8 partitions) — typed records routed by key.
+echo "${setup_out}" | grep -q "^TYPED-ROUTING: OK" \
+    || fail "setup client did not print 'TYPED-ROUTING: OK' (typed topics must route by key)"
+log "Typed routing OK: $(echo "${setup_out}" | grep -E '^TYPED-ROUTING: OK' | tail -1)"
+
 # ---------------------------------------------------------------------------
 # The CREATE path above (define -> createView x2 -> produce -> getViewRow x2 OK)
 # has passed.  The restart -> recover leg below runs by default; set
@@ -401,5 +406,6 @@ log "  -> char_transient re-folded from the retained source OK"
 log "  -> reproduce -> both views fold the new value live OK"
 log "  -> user_totals (Count(*)/Sum/Avg) recovered from its v2 checkpoint (VIEW-RECOVERED format=v2, O>0)"
 log "     + post-restart update retracts OK"
+log "  -> typed_route: 8-partition typed topic routed by key (Phase 2b C)"
 log "  VIEW-ENGINE-E2E: OK, exit 0."
 log "========================================"
