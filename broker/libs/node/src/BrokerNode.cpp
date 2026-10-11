@@ -3355,7 +3355,8 @@ void BrokerNode::buildAdminWorker() {
             ring.commit(idx);
         };
         deps.respondGet = [this](int64_t session, int64_t corr, int32_t topicId,
-                                 uint16_t version, const std::vector<uint8_t>& blob,
+                                 uint16_t version, int32_t partitionCount,
+                                 const std::vector<uint8_t>& blob,
                                  uint16_t errorCode) {
             if (!adminWorkerAgent_) return;
             namespace pc = rune::protocol::client;
@@ -3365,17 +3366,18 @@ void BrokerNode::buildAdminWorker() {
             resp.topicId        = topicId;
             resp.version        = version;
             resp.errorCode      = errorCode;
+            resp.partitionCount = partitionCount;   // Phase 2b Part C
             resp.descriptorBlob = blob.empty() ? nullptr : blob.data();
             resp.descriptorLen  = static_cast<uint32_t>(blob.size());
+            // Encode IN PLACE in the claimed egress slot (no per-response frame
+            // vector; encodedSize() == encode()'s return by construction).
             const std::size_t sz = resp.encodedSize();
-            std::vector<uint8_t> frame(sz);
-            const std::size_t n = resp.encode(frame.data());
             auto& ring = adminWorkerAgent_->egressRing();
-            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + n);
-            if (idx < 0) return;
+            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + sz);
+            if (idx < 0) return;  // ring full — DDL response dropped (rare); client retries
             uint8_t* p = ring.base() + idx;
             std::memcpy(p, &session, 8);
-            std::memcpy(p + 8, frame.data(), n);
+            (void)resp.encode(p + 8);
             ring.commit(idx);
         };
 

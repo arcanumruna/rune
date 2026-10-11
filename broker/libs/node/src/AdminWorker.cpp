@@ -145,7 +145,7 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
     // compiled against an older schema can fetch the descriptor it needs.
     const auto* named = reg_.byName(msg.name);
     if (!named) {
-        deps_.respondGet(msg.session, msg.corr, -1, 0, {}, kUnknownTopic);
+        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic);
         return;
     }
     const RegistryEntry* e = (msg.requestedFingerprint == 0)
@@ -155,7 +155,7 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
         // No version of this (known) topic has the requested fingerprint —
         // same wire error as an unknown topic (no dedicated "stale fingerprint"
         // code on the wire yet).
-        deps_.respondGet(msg.session, msg.corr, -1, 0, {}, kUnknownTopic);
+        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic);
         return;
     }
     // IMPORTANT: `e->descriptorBlob` is the raw EVOLVING blob (every field ever
@@ -166,8 +166,12 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
     // fingerprint is exactly `e->fingerprint`, by construction in
     // SchemaRegistry::applyRecord). Serialize `e->descriptor` (materialized),
     // never `e->descriptorBlob` (evolving).
+    // Phase 2b Part C: report the TOPIC's partition count (`named`, the latest
+    // entry — partition count is a topic property, carried unchanged by every
+    // ALTER), so a typed client bound to ANY version routes records by key
+    // across every partition instead of all to partition 0.
     deps_.respondGet(msg.session, msg.corr,
-                     e->topicId, e->version,
+                     e->topicId, e->version, named->partitionCount,
                      rune::codec::serialize(e->descriptor), kOK);
 }
 

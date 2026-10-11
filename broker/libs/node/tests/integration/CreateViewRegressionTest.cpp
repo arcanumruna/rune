@@ -151,7 +151,7 @@ protected:
         deps.respondDefine  = [this](int64_t, int64_t, int32_t topicId, uint16_t, uint16_t err) {
             lastDefineTopicId_ = topicId; lastDefineError_ = err;
         };
-        deps.respondGet   = [](int64_t, int64_t, int32_t, uint16_t, const std::vector<uint8_t>&, uint16_t) {};
+        deps.respondGet   = [](int64_t, int64_t, int32_t, uint16_t, int32_t, const std::vector<uint8_t>&, uint16_t) {};
         deps.respondAlter = [](int64_t, int64_t, int32_t, uint16_t, uint16_t) {};
         deps.respondCreateView = [this](int64_t, int64_t, int32_t viewTopicId,
                                         uint64_t fp, uint16_t err) {

@@ -71,8 +71,11 @@ struct AdminDeps {
                        uint16_t version, uint16_t errorCode)> respondDefine;
 
     // Send the GetTopicSchema response back to the client (encode + egress).
+    // `partitionCount` (Phase 2b Part C) is the TOPIC's partition count — the
+    // typed client routes records by key over it; 0 on any error response.
     std::function<void(int64_t session, int64_t corr, int32_t topicId,
-                       uint16_t version, const std::vector<uint8_t>& blob,
+                       uint16_t version, int32_t partitionCount,
+                       const std::vector<uint8_t>& blob,
                        uint16_t errorCode)> respondGet;
 
     // Send the AlterTopic response back to the client (encode + egress).  On OK,

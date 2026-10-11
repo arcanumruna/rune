@@ -253,6 +253,7 @@ protected:
         };
         deps.respondGet = [this](int64_t /*session*/, int64_t /*corr*/,
                                  int32_t topicId, uint16_t /*version*/,
+                                 int32_t /*partitionCount*/,
                                  const std::vector<uint8_t>& /*blob*/,
                                  uint16_t errorCode) {
             lastGetTopicId_ = topicId;
@@ -500,7 +501,7 @@ TEST_F(SchemaPersistenceTest, Regression_RULING1_TopicIdIsReturnedByCreateTopic)
     deps.pushValidators = [](const RegistryEntry&, int32_t) {};
     deps.respondDefine = [&returnedId](int64_t, int64_t, int32_t tid,
                                        uint16_t, uint16_t) { returnedId = tid; };
-    deps.respondGet = [](int64_t, int64_t, int32_t, uint16_t,
+    deps.respondGet = [](int64_t, int64_t, int32_t, uint16_t, int32_t,
                           const std::vector<uint8_t>&, uint16_t) {};
 
     AdminWorker w(reg2, replica_.get(), /*selfId=*/1,
@@ -630,7 +631,7 @@ TEST_F(SchemaPersistenceTest, ReplayReconstructsAllVersionsAndNextTag) {
     noopDeps.requestCreateTopic = [](int64_t, int32_t, const std::string&, const std::string&, uint8_t) { return true; };
     noopDeps.pushValidators     = [](const RegistryEntry&, int32_t) {};
     noopDeps.respondDefine      = [](int64_t, int64_t, int32_t, uint16_t, uint16_t) {};
-    noopDeps.respondGet         = [](int64_t, int64_t, int32_t, uint16_t,
+    noopDeps.respondGet         = [](int64_t, int64_t, int32_t, uint16_t, int32_t,
                                      const std::vector<uint8_t>&, uint16_t) {};
     noopDeps.respondAlter       = [](int64_t, int64_t, int32_t, uint16_t, uint16_t) {};
 
@@ -740,7 +741,7 @@ TEST_F(SchemaPersistenceTest, CorruptRecordAbortsRebuildRegression) {
     noopDeps.requestCreateTopic = [](int64_t, int32_t, const std::string&, const std::string&, uint8_t) { return true; };
     noopDeps.pushValidators     = [](const RegistryEntry&, int32_t) {};
     noopDeps.respondDefine      = [](int64_t, int64_t, int32_t, uint16_t, uint16_t) {};
-    noopDeps.respondGet         = [](int64_t, int64_t, int32_t, uint16_t,
+    noopDeps.respondGet         = [](int64_t, int64_t, int32_t, uint16_t, int32_t,
                                      const std::vector<uint8_t>&, uint16_t) {};
     noopDeps.respondAlter       = [](int64_t, int64_t, int32_t, uint16_t, uint16_t) {};
 
@@ -1064,7 +1065,7 @@ TEST(SchemaPersistenceCompaction, OldVersionsSurviveCompactionRegression) {
         lastDefineTopicId = topicId;
         lastDefineError   = errorCode;
     };
-    deps.respondGet = [](int64_t, int64_t, int32_t, uint16_t,
+    deps.respondGet = [](int64_t, int64_t, int32_t, uint16_t, int32_t,
                          const std::vector<uint8_t>&, uint16_t) {};
     deps.respondAlter = [&](int64_t, int64_t, int32_t, uint16_t newVersion,
                            uint16_t errorCode) {
@@ -1918,7 +1919,7 @@ TEST(SchemaPersistenceCompaction, LongLineageSurvivesCompactionAndMixedReadRegre
         lastDefineTopicId = topicId;
         lastDefineError   = errorCode;
     };
-    deps.respondGet = [](int64_t, int64_t, int32_t, uint16_t,
+    deps.respondGet = [](int64_t, int64_t, int32_t, uint16_t, int32_t,
                          const std::vector<uint8_t>&, uint16_t) {};
     deps.respondAlter = [&](int64_t, int64_t, int32_t, uint16_t newVersion,
                            uint16_t errorCode) {

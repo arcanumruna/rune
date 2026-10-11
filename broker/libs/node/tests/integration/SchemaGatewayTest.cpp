@@ -234,17 +234,18 @@ struct SgHarness {
             egressRing.commit(idx);
         };
         deps.respondGet = [this](int64_t session, int64_t corr, int32_t tid,
-                                 uint16_t ver, const std::vector<uint8_t>& blob, uint16_t err) {
+                                 uint16_t ver, int32_t parts,
+                                 const std::vector<uint8_t>& blob, uint16_t err) {
             pc::TopicSchemaResponse r; r.sessionId=session; r.correlationId=corr;
-            r.topicId=tid; r.version=ver; r.errorCode=err;
+            r.topicId=tid; r.version=ver; r.errorCode=err; r.partitionCount=parts;
             r.descriptorBlob = blob.empty()?nullptr:blob.data();
             r.descriptorLen = (uint32_t)blob.size();
-            std::vector<uint8_t> f(r.encodedSize());
-            std::size_t n = r.encode(f.data());
-            auto idx = egressRing.tryClaim(kMsgEgressFrame, 8+n);
+            const std::size_t sz = r.encodedSize();
+            auto idx = egressRing.tryClaim(kMsgEgressFrame, 8+sz);
             if (idx < 0) return;
             uint8_t* p = egressRing.base()+idx;
-            std::memcpy(p, &session, 8); std::memcpy(p+8, f.data(), n);
+            std::memcpy(p, &session, 8);
+            (void)r.encode(p+8);
             egressRing.commit(idx);
         };
         // respondAlter (Task 13 test harness fix-on-sight): this harness never
@@ -438,6 +439,37 @@ TEST(SchemaGateway, GetTopicSchemaRoundTrip) {
     EXPECT_EQ(resp->correlationId, 7);
     EXPECT_EQ(resp->errorCode, 0u);
     EXPECT_GT(resp->descriptorLen, 0u) << "the descriptor blob must be returned";
+}
+
+// ---------------------------------------------------------------------------
+// SchemaGatewayRegression.GetTopicSchemaCarriesPartitionCount — Phase 2b
+// Part C: a topic defined with 8 partitions through the gateway answers
+// GetTopicSchema with partitionCount == 8 on the session egress (the typed
+// client routes by key over it; pre-2b every typed record hit partition 0).
+// ---------------------------------------------------------------------------
+TEST(SchemaGatewayRegression, GetTopicSchemaCarriesPartitionCount) {
+    SgHarness h;
+    auto blob = charsBlob();
+    const auto def = encodeDefineFrame(1, 1, "characters", 8, "userId", false, blob);
+    h.gw.applyDefineTopicForTest(def.data(), def.size());
+    h.pump();
+    h.captured.clear();
+
+    pc::GetTopicSchema g; g.sessionId=1; g.correlationId=7; g.topicName="characters";
+    std::vector<uint8_t> gf(g.encodedSize()); g.encode(gf.data());
+    h.gw.applyGetTopicSchemaForTest(gf.data(), gf.size());
+    h.pump();
+
+    std::optional<pc::TopicSchemaResponse> resp;
+    for (auto& [sid, bytes] : h.captured) {
+        auto d = pc::TopicSchemaResponse::decode(bytes.data(), bytes.size());
+        if (d) { resp = d; break; }
+    }
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->correlationId, 7);
+    EXPECT_EQ(resp->errorCode, 0u);
+    EXPECT_GT(resp->descriptorLen, 0u);
+    EXPECT_EQ(resp->partitionCount, 8);
 }
 
 // ---------------------------------------------------------------------------

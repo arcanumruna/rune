@@ -65,6 +65,7 @@ struct Harness {
     int32_t lastTopicId = -1;
     uint16_t lastErr = 0xffff;
     int getCount = 0;
+    int32_t lastGetPartitionCount = -1;   // Phase 2b C: respondGet's partitionCount
     // ALTER response capture (Task 11).
     int      alterResponses  = 0;
     uint16_t lastAlterErr     = 0xffff;
@@ -96,8 +97,9 @@ struct Harness {
         d.respondDefine = [this](int64_t,int64_t,int32_t tid,uint16_t,uint16_t e) {
             lastTopicId = tid; lastErr = e;
         };
-        d.respondGet = [this](int64_t,int64_t,int32_t,uint16_t,const std::vector<uint8_t>&,uint16_t e) {
-            ++getCount; lastErr = e;
+        d.respondGet = [this](int64_t,int64_t,int32_t,uint16_t,int32_t parts,
+                              const std::vector<uint8_t>&,uint16_t e) {
+            ++getCount; lastErr = e; lastGetPartitionCount = parts;
         };
         d.respondAlter = [this](int64_t,int64_t,int32_t tid,uint16_t v,uint16_t e) {
             ++alterResponses; lastAlterTopicId = tid; lastAlterVersion = v; lastAlterErr = e;
@@ -373,4 +375,45 @@ TEST(AdminWorkerRegression, AlterDoesNotPushValidatorWhenValidateOffRegression) 
     h.runAlter(10,11,"characters",0, opsBlob({addOp("score",PrimType::Int64)}));
     EXPECT_EQ(h.lastAlterErr, 0);
     EXPECT_EQ(h.pushes, 0);
+}
+
+// Regression (Phase 2b Part C): GetTopicSchema must report the topic's
+// partition count — the typed client routes records by key over it.  Before
+// 2b the response carried none and TypedTopic sent every record to partition 0.
+TEST(AdminWorkerRegression, GetSchemaReportsRegistryPartitionCount) {
+    Harness h;
+    h.runDefine(1,2,"characters","userId",8,false,charsBlob());
+    ASSERT_EQ(h.lastErr,0);
+    h.lastErr = 0xffff;
+    h.w->submitGetSchema(GetSchemaMsg{1,3,"characters"});
+    EXPECT_EQ(h.lastErr,0);
+    EXPECT_EQ(h.lastGetPartitionCount, 8);
+}
+
+// Regression (Phase 2b Part C): a client bound to a HISTORICAL version
+// (fingerprint-selected GetTopicSchema) routes over the same partitions —
+// partition count is a property of the topic, not of a schema version.
+TEST(AdminWorkerRegression, GetSchemaByFingerprintReportsPartitionCount) {
+    Harness h;
+    h.runDefine(1,2,"characters","userId",8,false,charsBlob());
+    ASSERT_EQ(h.lastErr,0);
+    const uint64_t v1Fp = h.reg.byName("characters")->fingerprint;
+    h.runAlter(10,11,"characters",/*expected=*/0, opsBlob({addOp("score",PrimType::Int64)}));
+    ASSERT_EQ(h.lastAlterErr, 0);
+    ASSERT_EQ(h.lastAlterVersion, 2);
+
+    h.lastErr = 0xffff;
+    h.lastGetPartitionCount = -1;
+    h.w->submitGetSchema(GetSchemaMsg{1,4,"characters", v1Fp});
+    EXPECT_EQ(h.lastErr,0) << "v1's fingerprint must resolve to the v1 descriptor";
+    EXPECT_EQ(h.lastGetPartitionCount, 8);
+}
+
+// Regression (Phase 2b Part C): an error response reports 0 ("not reported"),
+// never a stale or default-1 count.
+TEST(AdminWorkerRegression, GetSchemaUnknownTopicReportsZeroPartitions) {
+    Harness h;
+    h.w->submitGetSchema(GetSchemaMsg{1,2,"nope"});
+    EXPECT_EQ(h.lastErr,7);                         // UnknownTopic
+    EXPECT_EQ(h.lastGetPartitionCount, 0);
 }
