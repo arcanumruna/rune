@@ -122,6 +122,7 @@ For schemas whose fields are **all fixed-size** (approved scope), the generator 
 ---
 
 ## Out of scope for 2b (Phase 3)
+Views are **persisted by default** (checkpointed fold state, recovered on restart — unchanged from Phase 1/2a); when `create view` lands in Rune QL, persistence is the default and `transient` is the opt-in.
 Composite keys with a partition prefix (`key (userId, characterId) partition by userId`), co-partitioned 1:1 and 1:N joins, `create view` / `get` in Rune QL and the console, generated view decoders, broker-side topic listing, multi-partition aggregates (unlocked by composite keys).
 
 ## Global constraints
