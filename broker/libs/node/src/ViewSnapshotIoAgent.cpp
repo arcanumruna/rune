@@ -48,9 +48,20 @@ constexpr std::size_t kViewCrcLen    = 4;
 // replays the file. A frame too short to hold the header, or whose magic
 // does not match, is malformed: returns -1 (dropped by the caller) rather
 // than ever being misread as a real offset.
+constexpr std::size_t kViewHeaderLenV2 = 4 + 8 + 1; // magic,O,tableCount (multi-table v2)
+
+// Peek O out of a v1 (single-table) or v2 (multi-table, aggregate views) record
+// header -- O is at byte 4 in both. No CRC/bounds validation here (see above).
 int64_t peekDeltaOffset(const uint8_t* p, std::size_t len) noexcept {
-    if (len < kViewHeaderLen + kViewCrcLen) return -1;
-    if (readLE32(p) != rune::view::kViewCheckpointMagic) return -1;
+    if (len < 4) return -1;
+    const uint32_t magic = readLE32(p);
+    if (magic == rune::view::kViewCheckpointMagic) {
+        if (len < kViewHeaderLen + kViewCrcLen) return -1;
+    } else if (magic == rune::view::kViewCheckpointMagicV2) {
+        if (len < kViewHeaderLenV2 + kViewCrcLen) return -1;
+    } else {
+        return -1;
+    }
     return static_cast<int64_t>(readLE64(p + 4));
 }
 

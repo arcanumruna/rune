@@ -257,3 +257,32 @@ TEST(ViewSnapshotIoAgentRegression, OpenFailureIsRetriedNotPermanentlyBlackholed
     EXPECT_EQ(agent.lastDurableOffset(kViewTopicId, kPartition), 10);
     EXPECT_FALSE(agent.hasError(kViewTopicId, kPartition));
 }
+
+// REGRESSION (Phase 2a): an aggregate view's checkpoint is a v2 multi-table
+// record. The agent used to drop any non-v1 magic, so aggregate state never
+// reached disk and silently reset on restart.
+TEST(ViewSnapshotIoAgentRegression, MultiTableDeltaIsPersistedNotDropped) {
+    TempDir dir;
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::ViewSnapshotIoAgent agent(ch, dir.path(), /*fsyncMs=*/50);
+    rune::consensus::ManualNanoClock clk(0);
+
+    uint8_t row[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    const DirtyEntry e{0, false, 5, row};
+    const TableDelta tds[] = {{0, 8, {&e, 1}}, {1, 8, {&e, 1}}};
+    std::vector<uint8_t> delta;
+    encodeMultiDelta(tds, /*O=*/12, delta);
+    std::vector<uint8_t> frame(rune::node::ViewSnapshotChannel::kDeltaHeaderBytes + delta.size());
+    for (int i = 0; i < 4; ++i) frame[i]     = uint8_t(uint32_t(kViewTopicId) >> (i * 8));
+    for (int i = 0; i < 4; ++i) frame[4 + i] = uint8_t(uint32_t(kPartition) >> (i * 8));
+    std::memcpy(frame.data() + rune::node::ViewSnapshotChannel::kDeltaHeaderBytes, delta.data(), delta.size());
+    ASSERT_TRUE(ch.deltas.write(frame.data(), frame.size(), rune::node::ViewSnapshotChannel::kDeltaMsgType));
+
+    int it = 0;
+    for (; it < kHardCap && agent.lastDurableOffset(kViewTopicId, kPartition) < 12; ++it) {
+        agent.doWork(clk.nowNs());
+        clk.advance(60LL * 1'000'000LL);
+    }
+    ASSERT_LT(it, kHardCap) << "v2 delta was dropped: durable offset never reached 12";
+    EXPECT_EQ(readFile(agent.deltaFilePathForTest(kViewTopicId, kPartition)), delta);
+}

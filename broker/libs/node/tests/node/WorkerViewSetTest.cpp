@@ -16,6 +16,7 @@
 #include <rune/storage/LogReadView.h>
 #include <rune/view/PlanCompiler.h>
 #include <rune/view/ViewRow.h>
+#include <rune/view/ViewCheckpoint.h>
 
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/WorkerViewSet.h>
@@ -283,4 +284,24 @@ TEST(WorkerViewSetRegression, PlainViewNoInstanceServesNotFound) {
     EXPECT_EQ(row, nullptr);
     EXPECT_EQ(rs, rune::node::WorkerViewSet::RowStatus::NotFound)
         << "plain view with no instance is a genuine miss (AbsentKey), not NotReady";
+}
+
+TEST(WorkerViewSetRegression, SplitterReturnsV1AndV2RecordsInFileOrder) {
+    uint8_t row[8] = {};
+    const rune::view::DirtyEntry e{0, false, 1, row};
+    std::vector<uint8_t> file;
+    rune::view::encodeDelta(std::span<const rune::view::DirtyEntry>(&e, 1), 1, 8, file);
+    const size_t v1Len = file.size();
+    const rune::view::TableDelta tds[] = {{0, 8, {&e, 1}}};
+    rune::view::encodeMultiDelta(tds, 2, file);
+    rune::view::encodeDelta(std::span<const rune::view::DirtyEntry>(&e, 1), 3, 8, file);
+
+    const auto recs = rune::node::splitViewCheckpointRecords(file);
+    ASSERT_EQ(recs.size(), 3u);
+    EXPECT_EQ(recs[0].size(), v1Len);
+    uint32_t magic; std::memcpy(&magic, recs[1].data(), 4);
+    EXPECT_EQ(magic, rune::view::kViewCheckpointMagicV2);
+
+    auto torn = file; torn.resize(torn.size() - 2);
+    EXPECT_EQ(rune::node::splitViewCheckpointRecords(torn).size(), 2u) << "torn trailing record dropped";
 }

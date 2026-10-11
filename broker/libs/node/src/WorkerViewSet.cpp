@@ -5,6 +5,7 @@
 #include <rune/codec/Serialize.h>      // rune::codec::deserialize
 #include <rune/view/ViewPlan.h>        // rune::view::deserializeCompiledViewPlan
 #include <rune/view/ViewRow.h>         // rune::view::buildRowLayout
+#include <rune/view/ViewCheckpoint.h>  // v1/v2 checkpoint magics
 
 #include <spdlog/spdlog.h>
 
@@ -69,38 +70,55 @@ std::vector<uint8_t> readWholeFile(const std::string& path) {
 // ---------------------------------------------------------------------------
 std::vector<std::span<const uint8_t>>
 splitViewCheckpointRecords(std::span<const uint8_t> bytes) {
-    // Per-record fixed header = magic u32 + O i64 + rowLen u32 + count u32.
-    static constexpr std::size_t kHdr      = 4 + 8 + 4 + 4;
     static constexpr std::size_t kEntryHdr = 4 + 1 + 8;  // rid u32 + flags u8 + key u64
     static constexpr std::size_t kCrc      = 4;
-
-    std::vector<std::span<const uint8_t>> out;
     const std::size_t total = bytes.size();
-    std::size_t pos = 0;
-    while (pos + kHdr <= total) {
-        const std::size_t recStart = pos;
-        // Defense in depth: reject early on a bad magic (a non-record tail /
-        // misaligned stream) with a clean boundary, rather than walking garbage
-        // entry lengths and leaning solely on applyDelta's pass-1 CRC reject.
-        if (readU32LE(bytes.data() + pos) != rune::view::kViewCheckpointMagic) break;
-        const uint32_t rowLen = readU32LE(bytes.data() + pos + 12);
-        const uint32_t count  = readU32LE(bytes.data() + pos + 16);
-        std::size_t p = pos + kHdr;
-        bool ok = true;
+
+    // Walks `count` entries of `rowLen` from `p`; 0 on truncation, else the end.
+    auto walkEntries = [&](std::size_t p, uint32_t count, uint32_t rowLen) -> std::size_t {
         for (uint32_t i = 0; i < count; ++i) {
-            if (p + kEntryHdr > total) { ok = false; break; }
+            if (p + kEntryHdr > total) return 0;
             const uint8_t flags = bytes[p + 4];
             p += kEntryHdr;
             if (flags == 0) {  // upsert carries rowLen payload bytes; a delete does not
-                if (p + rowLen > total) { ok = false; break; }
+                if (p + rowLen > total) return 0;
                 p += rowLen;
             }
         }
-        if (!ok) break;                 // truncated entries → drop this trailing record
-        if (p + kCrc > total) break;    // truncated CRC → drop this trailing record
-        p += kCrc;
-        out.push_back(bytes.subspan(recStart, p - recStart));
-        pos = p;
+        return p;
+    };
+    // v1: [magic][O i64][rowLen u32][count u32] entries [crc]
+    auto v1End = [&](std::size_t pos) -> std::size_t {
+        if (pos + 20 > total) return 0;
+        const std::size_t p = walkEntries(pos + 20, readU32LE(bytes.data() + pos + 16),
+                                          readU32LE(bytes.data() + pos + 12));
+        return (p == 0 || p + kCrc > total) ? 0 : p + kCrc;
+    };
+    // v2: [magic][O i64][tableCount u8] { [id u8][rowLen u32][count u32] entries }* [crc]
+    auto v2End = [&](std::size_t pos) -> std::size_t {
+        if (pos + 13 > total) return 0;
+        const uint8_t tableCount = bytes[pos + 12];
+        std::size_t p = pos + 13;
+        for (uint8_t t = 0; t < tableCount; ++t) {
+            if (p + 9 > total) return 0;
+            const uint32_t rowLen = readU32LE(bytes.data() + p + 1);
+            const uint32_t count  = readU32LE(bytes.data() + p + 5);
+            p = walkEntries(p + 9, count, rowLen);
+            if (p == 0) return 0;
+        }
+        return p + kCrc > total ? 0 : p + kCrc;
+    };
+
+    std::vector<std::span<const uint8_t>> out;
+    std::size_t pos = 0;
+    while (pos + 4 <= total) {
+        const uint32_t magic = readU32LE(bytes.data() + pos);
+        std::size_t end = 0;
+        if (magic == rune::view::kViewCheckpointMagic)        end = v1End(pos);
+        else if (magic == rune::view::kViewCheckpointMagicV2) end = v2End(pos);
+        if (end == 0) break;   // unknown magic or truncated trailing record
+        out.push_back(bytes.subspan(pos, end - pos));
+        pos = end;
     }
     return out;
 }
