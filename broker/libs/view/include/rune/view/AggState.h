@@ -28,6 +28,12 @@ bool isAggregateView(const CompiledViewPlan& plan) noexcept;
 // cancellation is possible when magnitudes are mixed); the accumulator resets
 // to 0.0 when the last non-null input leaves, and NaN/+-Inf inputs are treated
 // as NULL so accumulators stay finite.
+//
+// That NaN/+-Inf -> NULL rule applies ONLY to the accumulating kinds (Sum/Avg
+// over a Float input, AccKind::Float). Count(col) has AccKind::None and only
+// tests presence, so a NaN/+-Inf Float value is NON-null for Count(col) and is
+// counted, while the same value is NULL (excluded, counted in aggNonFinite) for
+// a Sum/Avg over that column.
 
 // The numeric domain a Sum/Avg input accumulates in.
 enum class AccKind : uint8_t { None, Signed, Unsigned, Float };

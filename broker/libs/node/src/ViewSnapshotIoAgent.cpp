@@ -40,18 +40,18 @@ inline void writeLE64(uint8_t* p, uint64_t v) noexcept {
 constexpr std::size_t kViewHeaderLen = 4 + 8 + 4 + 4; // magic,O,rowLen,count (rune::view::ViewCheckpoint.h)
 constexpr std::size_t kViewCrcLen    = 4;
 
-// Peek the O field out of a Task-12 delta/base record's header. This does
-// NOT validate the record's CRC or per-entry bounds -- this agent only
-// appends raw bytes to the per-(view,partition) delta file; the format's own
-// CRC + bounds checks (rune::view::applyDelta) are what prove the bytes are
-// intact, and are performed later by whichever recovery path reopens and
-// replays the file. A frame too short to hold the header, or whose magic
-// does not match, is malformed: returns -1 (dropped by the caller) rather
-// than ever being misread as a real offset.
 constexpr std::size_t kViewHeaderLenV2 = 4 + 8 + 1; // magic,O,tableCount (multi-table v2)
 
-// Peek O out of a v1 (single-table) or v2 (multi-table, aggregate views) record
-// header -- O is at byte 4 in both. No CRC/bounds validation here (see above).
+// Peek the O field out of a delta/base record's header: a v1 (single-table,
+// Replace views) or v2 (multi-table, aggregate views) record -- O is at byte 4
+// in both. This does NOT validate the record's CRC or per-entry bounds -- this
+// agent only appends raw bytes to the per-(view,partition) delta file; the
+// format's own CRC + bounds checks (rune::view::applyDelta / applyMultiDelta)
+// are what prove the bytes are intact, and are performed later by whichever
+// recovery path reopens and replays the file. A frame too short to hold its
+// version's header + CRC, or whose magic is neither v1 nor v2, is malformed:
+// returns -1 (dropped by the caller) rather than ever being misread as a real
+// offset.
 int64_t peekDeltaOffset(const uint8_t* p, std::size_t len) noexcept {
     if (len < 4) return -1;
     const uint32_t magic = readLE32(p);
