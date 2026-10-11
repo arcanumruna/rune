@@ -31,6 +31,9 @@
 //     VIEW_FP_TRANSIENT=<fp>
 //     VIEW_KEY_ID=<id>
 //     VIEW_HP_INITIAL=<hp>
+//     VIEW_ORDER_TOPIC_ID=<id>
+//     VIEW_TOPIC_ID_AGG=<id>
+//     VIEW_FP_AGG=<fp>
 //     VIEW-PROBE-SETUP: OK
 //   to stdout — the e2e script scrapes these into env vars for mode 2.
 //
@@ -45,7 +48,13 @@
 //         retained source log from its floor (spec §9.7) — the source topic
 //         is persisted, so the row comes back;
 //     (c) re-producing the SAME key with a NEW hp value is folded live by
-//         BOTH views after the restart — each converges to the NEW value.
+//         BOTH views after the restart — each converges to the NEW value;
+//     (d) Phase 2a: the PERSISTED aggregate view user_totals (GROUP BY userId:
+//         Count(*), Sum(amount), Avg(amount) over "order") recovers its rows
+//         AND its contributor map from the v2 checkpoint: u100 = {3, 85, 85/3},
+//         u200 absent (emptied by a pre-restart group move), and a post-restart
+//         update of a PRE-restart contributor (o3 5 -> 25) retracts the old
+//         contribution -> u100 = {3, 105, 35} (a lost map would give n 4).
 //   Prints "VIEW-ENGINE-E2E: OK" on success.
 //
 // Environment (both modes):
@@ -68,6 +77,7 @@
 #include <rune/codec/Serialize.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -238,6 +248,94 @@ static bool decodeAndCheck(const ViewRowResult& r, int64_t wantId, int64_t wantH
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2a: "order" source {orderId: Int64 (key), userId: Int64, amount: Int64}
+// and the aggregate view user_totals = GROUP BY userId: Count(*), Sum, Avg.
+// ---------------------------------------------------------------------------
+static rune::codec::Descriptor orderDescriptor() {
+    return rune::codec::DescriptorBuilder("order", 1)
+        .add("orderId", rune::codec::PrimType::Int64, 1, /*isKey=*/true)
+        .add("userId", rune::codec::PrimType::Int64)
+        .add("amount", rune::codec::PrimType::Int64)
+        .build();
+}
+// [blockLength u16 = 24][version u16 = 1][orderId i64][userId i64][amount i64]
+static std::vector<uint8_t> encodeOrder(int64_t orderId, int64_t userId, int64_t amount) {
+    std::vector<uint8_t> b;
+    auto le16 = [&](uint16_t v) { b.push_back(uint8_t(v)); b.push_back(uint8_t(v >> 8)); };
+    auto le64 = [&](int64_t v) { for (int i = 0; i < 8; ++i) b.push_back(uint8_t(uint64_t(v) >> (8 * i))); };
+    le16(24); le16(1); le64(orderId); le64(userId); le64(amount);
+    return b;
+}
+static rcv::ViewPlan userTotalsPlan(int32_t srcTopicId) {
+    using P = rune::codec::PrimType;
+    rcv::ViewPlan p;
+    p.viewName = "user_totals"; p.key = "userId"; p.persistence = 0;
+    p.sources.push_back(rcv::SourceSpec{srcTopicId, "userId"});
+    p.output.push_back(rcv::AuthoredField{"userId", P::Int64, 0, "userId", rcv::MergeRule::Replace});
+    p.output.push_back(rcv::AuthoredField{"n", P::Int64, 0, "", rcv::MergeRule::CountAll});
+    p.output.push_back(rcv::AuthoredField{"total", P::Int64, 0, "amount", rcv::MergeRule::Sum});
+    p.output.push_back(rcv::AuthoredField{"avg", P::Float64, 0, "amount", rcv::MergeRule::Avg});
+    return p;
+}
+// Slot order == userTotalsPlan output order: userId, n, total, avg.
+static rcv::RowLayout userTotalsRowLayout() {
+    const rune::codec::PrimType types[] = {rune::codec::PrimType::Int64, rune::codec::PrimType::Int64,
+                                           rune::codec::PrimType::Int64, rune::codec::PrimType::Float64};
+    return rcv::buildRowLayout(types);
+}
+// Sends one order (acked); false + message on failure.
+static bool sendOrder(Client& c, const TopicHandle& th, int64_t o, int64_t u, int64_t amt, int timeoutMs) {
+    ProducerConfig pcfg; pcfg.acks = Acks::Leader; pcfg.produceTimeoutMs = timeoutMs;
+    auto p = c.producer(pcfg);
+    Completions cq(c); Completion done;
+    const auto v = encodeOrder(o, u, amt);
+    if (!sendAndWaitAck(cq, p, th, Key(static_cast<uint64_t>(o)), std::span<const uint8_t>(v), 1, timeoutMs, done) ||
+        done.status != OpStatus::Ok) {
+        std::cerr << "PROBE: FAIL produce(order " << o << ") status=" << static_cast<int>(done.status) << "\n";
+        return false;
+    }
+    return true;
+}
+// Polls user `u` until {n, total, avg} match (avg within 1e-9) or the bound expires.
+static bool waitForTotals(Client& c, int32_t viewId, uint64_t fp, int64_t u, int64_t n, int64_t total,
+                          double avg, int boundMs, int timeoutMs, const char* who) {
+    const rcv::RowLayout L = userTotalsRowLayout();
+    const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(boundMs);
+    ViewRowResult r;
+    for (;;) {
+        r = c.getViewRowAndWait(viewId, static_cast<uint64_t>(u), fp, std::chrono::milliseconds(timeoutMs));
+        if (r.status == ViewRowResult::kOk && r.rowBytes.size() == L.rowLen) {
+            const auto row = std::span<const uint8_t>(r.rowBytes);
+            const auto nf = rcv::readSlot(row, L, 1), tf = rcv::readSlot(row, L, 2), af = rcv::readSlot(row, L, 3);
+            if (nf.i == n && tf.i == total && std::abs(af.f - avg) < 1e-9) {
+                std::cerr << "PROBE: " << who << " OK n=" << n << " total=" << total << " avg=" << avg << "\n";
+                return true;
+            }
+            if (std::chrono::steady_clock::now() >= dl) {
+                std::cerr << "PROBE: FAIL " << who << " got n=" << nf.i << " total=" << tf.i << " avg=" << af.f
+                          << " want n=" << n << " total=" << total << " avg=" << avg << "\n";
+                return false;
+            }
+        } else if (std::chrono::steady_clock::now() >= dl) {
+            std::cerr << "PROBE: FAIL " << who << " status=" << r.status << "\n";
+            return false;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+}
+// Polls until user `u` reads AbsentKey (group emptied) or the bound expires.
+static bool waitForAbsent(Client& c, int32_t viewId, uint64_t fp, int64_t u, int boundMs, int timeoutMs,
+                          const char* who) {
+    const ViewRowResult r = waitResolved(c, viewId, static_cast<uint64_t>(u), fp, boundMs, timeoutMs);
+    if (r.status != ViewRowResult::kAbsentKey) {
+        std::cerr << "PROBE: FAIL " << who << " status=" << r.status << " (want AbsentKey)\n";
+        return false;
+    }
+    std::cerr << "PROBE: " << who << " correctly AbsentKey\n";
+    return true;
+}
+
 int main() {
     const std::string mode        = getEnvStr("RUNE_MODE", "setup");
     const std::string target      = getEnvStr("RUNE_TARGET");
@@ -343,6 +441,24 @@ int main() {
                                                 boundMs, timeoutMs);
             if (!decodeAndCheck(rt, keyId, hp0, "char_transient (initial)")) return 7;
 
+            // ---- 5. Phase 2a: aggregate view user_totals over 'order' -------
+            const auto oblob = rune::codec::serialize(orderDescriptor());
+            DefineTopicResult ord = c.defineTopicAndWait("order", /*partitions=*/1, /*keyField=*/"orderId",
+                                                         /*validate=*/false, std::span<const uint8_t>(oblob), wait);
+            if (ord.errorCode != 0) { std::cerr << "PROBE: FAIL defineTopic(order) errorCode=" << ord.errorCode << "\n"; return 30; }
+            const auto aggBlob = rcv::serializeAuthored(userTotalsPlan(ord.topicId));
+            CreateViewResult viewA = c.createViewAndWait("user_totals", "userId", /*persistence=*/0,
+                                                         std::span<const uint8_t>(aggBlob), wait);
+            if (viewA.errorCode != 0) { std::cerr << "PROBE: FAIL createView(user_totals) errorCode=" << viewA.errorCode << "\n"; return 31; }
+            const TopicHandle ordTh{ord.topicId, 1};
+            if (!sendOrder(c, ordTh, 1, 100, 10, timeoutMs) || !sendOrder(c, ordTh, 2, 100, 30, timeoutMs) ||
+                !sendOrder(c, ordTh, 3, 200, 5, timeoutMs)  || !sendOrder(c, ordTh, 1, 100, 50, timeoutMs) ||
+                !sendOrder(c, ordTh, 3, 100, 5, timeoutMs)) return 32;
+            if (!waitForTotals(c, viewA.viewTopicId, viewA.outputFingerprint, 100, 3, 85, 85.0 / 3,
+                               boundMs, timeoutMs, "user_totals u100 (initial)")) return 33;
+            if (!waitForAbsent(c, viewA.viewTopicId, viewA.outputFingerprint, 200, boundMs, timeoutMs,
+                               "user_totals u200 (emptied by group move)")) return 34;
+
             // ---- Handoff for the restart leg (scraped by the e2e script) ----
             std::cout << "VIEW_SRC_TOPIC_ID="       << def.topicId            << "\n";
             std::cout << "VIEW_TOPIC_ID_PERSISTED=" << viewP.viewTopicId      << "\n";
@@ -351,6 +467,9 @@ int main() {
             std::cout << "VIEW_FP_TRANSIENT="       << viewT.outputFingerprint << "\n";
             std::cout << "VIEW_KEY_ID="             << keyId                  << "\n";
             std::cout << "VIEW_HP_INITIAL="         << hp0                   << "\n";
+            std::cout << "VIEW_ORDER_TOPIC_ID=" << ord.topicId              << "\n";
+            std::cout << "VIEW_TOPIC_ID_AGG="   << viewA.viewTopicId        << "\n";
+            std::cout << "VIEW_FP_AGG="         << viewA.outputFingerprint  << "\n";
             std::cout << "VIEW-PROBE-SETUP: OK\n";
             std::cout.flush();
             c.close();
@@ -366,6 +485,9 @@ int main() {
             const int64_t  keyId          = getEnvI64("RUNE_VIEW_KEY_ID", -1);
             const int64_t  hpInitial      = getEnvI64("RUNE_VIEW_HP_INITIAL", -1);
             const int64_t  hpRefill       = getEnvI64("RUNE_VIEW_HP_REFILL", hpInitial + 1);
+            const int32_t  orderTopic     = static_cast<int32_t>(getEnvI64("RUNE_VIEW_ORDER_TOPIC_ID", -1));
+            const int32_t  viewIdA        = static_cast<int32_t>(getEnvI64("RUNE_VIEW_TOPIC_ID_AGG", -1));
+            const uint64_t fpA            = getEnvU64("RUNE_VIEW_FP_AGG", 0);
 
             if (srcTopicId < 0 || viewIdP < 0 || viewIdT < 0 || keyId < 0) {
                 std::cerr << "PROBE: FAIL verify_restart requires RUNE_VIEW_SRC_TOPIC_ID / "
@@ -423,6 +545,17 @@ int main() {
             if (!decodeAndCheck(rp1, keyId, hpRefill, "char_persisted (live after restart)")) return 15;
             const ViewRowResult rt1 = waitForHp(c, viewIdT, keyU64, fpT, keyId, hpRefill, boundMs, timeoutMs);
             if (!decodeAndCheck(rt1, keyId, hpRefill, "char_transient (live after restart)")) return 17;
+
+            // ---- (d) aggregate view recovered: rows AND contributor map --------
+            if (orderTopic < 0 || viewIdA < 0) { std::cerr << "PROBE: FAIL missing aggregate handoff env\n"; return 40; }
+            if (!waitForTotals(c, viewIdA, fpA, 100, 3, 85, 85.0 / 3, boundMs, timeoutMs,
+                               "user_totals u100 (post-restart, recovered)")) return 41;
+            if (!waitForAbsent(c, viewIdA, fpA, 200, boundMs, timeoutMs, "user_totals u200 (post-restart)")) return 42;
+            // Update a PRE-restart contributor: o3 5 -> 25. Correct only if its
+            // pre-image survived the restart (lost map => n 4, total 110).
+            if (!sendOrder(c, TopicHandle{orderTopic, 1}, 3, 100, 25, timeoutMs)) return 43;
+            if (!waitForTotals(c, viewIdA, fpA, 100, 3, 105, 35.0, boundMs, timeoutMs,
+                               "user_totals u100 (post-restart update retracts pre-image)")) return 44;
 
             std::cout << "VIEW-ENGINE-E2E: OK\n";
             std::cout.flush();
