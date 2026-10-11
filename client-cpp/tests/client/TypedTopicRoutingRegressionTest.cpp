@@ -18,6 +18,7 @@
 #include <rune/client/Key.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/TypedTopic.h>
+#include <rune/protocol/PartitionHash.h>
 
 #include <algorithm>
 #include <array>
@@ -206,18 +207,18 @@ TEST(TypedTopicRoutingRegression, NonPositiveReportedPartitionCountFallsBackToOn
     EXPECT_EQ(rc::typedPartitionCount(-7), 1);
 }
 
-// Found while landing Phase 2b C: Key{} is documented "Partition = 0 for any
-// partitionCount", but Key::partition hashed the empty byte string (FNV offset
-// basis % n -> partition 5 of 8).  A no-key-field typed topic (and any
-// Producer::send(handle, Key{}, ...)) must land on partition 0.
-TEST(KeyRegression, EmptyKeyIsPartitionZeroForAnyPartitionCount) {
-    const rc::Key emptyDefault{};
-    const rc::Key emptySpan(std::span<const uint8_t>{});
-    for (int32_t n = 1; n <= 64; ++n) {
-        EXPECT_EQ(emptyDefault.partition(n), 0) << "partitionCount=" << n;
-        EXPECT_EQ(emptySpan.partition(n), 0) << "partitionCount=" << n;
-    }
-    // Non-empty keys still use the shared FNV-1a hash.
-    const rc::Key k(int64_t{100});
-    EXPECT_EQ(k.partition(8), rune::protocol::partitionForKey(k.bytes(), 8));
+// A var-len key field that is EMPTY (length 0) is the empty record key, which
+// rune::protocol::partitionForKey maps to partition 0 — the same partition the
+// broker resolves for that key (partitionKnown=0 paths).
+TEST(TypedTopicRoutingRegression, EmptyStringKeyFieldLandsOnPartitionZero) {
+    std::vector<Sent> sent;
+    sent.reserve(2);
+    rc::TypedTopic<StrKeyRecord, RecordingProducer> topic(
+        RecordingProducer{&sent}, rc::TopicHandle{7, 8}, /*version=*/1);
+    topic.send(StrKeyRecord{std::string_view{}});
+    ASSERT_EQ(sent.size(), 1u);
+    EXPECT_EQ(sent[0].handle.partitionCount, 8);
+    EXPECT_EQ(sent[0].keyLen, 0u);
+    EXPECT_EQ(sent[0].partition, 0);
+    EXPECT_EQ(sent[0].partition, rune::protocol::partitionForKey(std::span<const uint8_t>{}, 8));
 }

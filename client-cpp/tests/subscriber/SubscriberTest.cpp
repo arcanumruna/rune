@@ -65,6 +65,7 @@
 #include <rune/client/codec/Codec.h>
 #include <rune/client/codec/DataCodec.h>
 
+#include <rune/protocol/PartitionHash.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <Aeron.h>
@@ -180,6 +181,10 @@ struct SubscribeGateway {
     // Subscriptions active: subscriptionId → session/corr for egress routing.
     std::mutex subsMtx_;
     std::vector<SubscriptionRecord> activeSubs_;
+    // Phase 2b C: the wire routing inputs of the LAST Subscribe (subsMtx_).
+    uint8_t              lastPartitionKnown_ = 0xFF;
+    int32_t              lastWirePartition_  = -1;
+    std::vector<uint8_t> lastKey_;
 
     // Pre-queued pushes: delivered when a Subscribe is received (or explicitly).
     std::mutex pendingMtx_;
@@ -330,6 +335,9 @@ struct SubscribeGateway {
                     opt->partition,
                     opt->fromOffset
                 });
+                lastPartitionKnown_ = opt->partitionKnown;
+                lastWirePartition_  = opt->partition;
+                lastKey_.assign(opt->key.begin(), opt->key.end());
             }
 
             // Send SubscribeResponse.
@@ -1149,4 +1157,50 @@ TEST(Subscriber, UnsubscribeResponseRace) {
     // the fix sends a second one with the real id. Total unsubscribes >= 1.
     EXPECT_GE(h.gw->unsubscribesSeen.load(std::memory_order_acquire), 1)
         << "At least one Unsubscribe must be sent (the late real-id one from A2 fix)";
+}
+
+// ===========================================================================
+// Phase 2b Part C regression: subscribe(h8, Key{}) binds to the SAME partition
+// Producer::send(h8, Key{}) writes to.
+//
+// Producer::send routes client-side: key.partition(h.partitionCount)
+// (src/producer/Producer.cpp).  subscribe(TopicHandle, const Key&) sends
+// partitionKnown=0 + the key bytes and the BROKER resolves the partition via
+// TopicRegistry::partitionForKey -> rune::protocol::partitionForKey
+// (rune-broker libs/gateway/src/TopicRegistry.cpp).  This fixture is a fake
+// gateway (no TopicRegistry), so the broker step is applied here at the
+// gateway boundary with the very function the broker calls.  The first Task 5
+// cut special-cased the empty key in Key::partition only: produce -> 0,
+// broker-resolved subscribe -> fnv1a64("") % 8 = 5.
+// ===========================================================================
+TEST(SubscriberKeyRoutingRegression, EmptyKeySubscribeBindsToProducerSendPartition) {
+    SubscriberHarness h(3130, 3131);
+    h.build();
+    ASSERT_TRUE(h.connect()) << "Failed to connect";
+
+    const TopicHandle h8{1, 8};
+    const Key         empty{};
+    auto sub = h.client->subscribe(h8, empty, SubscribeOptions{From::earliest()},
+                                   [](const Record&) {});
+    ASSERT_TRUE(h.pumpUntil([&]() {
+        return h.gw->subscribesSeen.load(std::memory_order_acquire) >= 1;
+    })) << "Subscribe frame never reached the gateway";
+
+    uint8_t              partitionKnown;
+    std::vector<uint8_t> wireKey;
+    {
+        std::lock_guard<std::mutex> lk(h.gw->subsMtx_);
+        partitionKnown = h.gw->lastPartitionKnown_;
+        wireKey        = h.gw->lastKey_;
+    }
+    ASSERT_EQ(partitionKnown, 0u) << "a keyed subscribe leaves partition resolution to the broker";
+    EXPECT_TRUE(wireKey.empty());
+
+    // What the broker binds (TopicRegistry::partitionForKey's body) ...
+    const int32_t brokerBound = rune::protocol::partitionForKey(
+        std::span<const uint8_t>(wireKey.data(), wireKey.size()), h8.partitionCount);
+    // ... and what Producer::send(h8, Key{}) writes to.
+    const int32_t producerWrites = empty.partition(h8.partitionCount);
+    EXPECT_EQ(brokerBound, producerWrites);
+    EXPECT_EQ(brokerBound, 0);
 }

@@ -871,6 +871,7 @@ if(BUILD_TESTING)
     add_executable(rune_open_topic_tests
         tests/client/OpenTopicTest.cpp
         tests/client/TypedTopicRoutingRegressionTest.cpp   # Phase 2b C
+        tests/client/KeyRoutingRegressionTest.cpp          # Phase 2b C: Key == protocol hash
         tests/support/AllocCounter.cpp                     # zero-alloc send check
     )
     add_dependencies(rune_open_topic_tests generate_characters_header)

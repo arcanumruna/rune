@@ -9,7 +9,8 @@
 //               any trivially-copyable POD via hashing its raw bytes.
 //   - ZERO per-construction heap allocation for payloads ≤ kMaxInline bytes.
 //   - Partition = rune::protocol::partitionForKey(bytes(), partitionCount)
-//     — the SAME FNV-1a hash the broker (GB-1) uses.
+//     — the SAME function the broker (GB-1, TopicRegistry::partitionForKey)
+//     calls; an empty key is partition 0 (rule lives in PartitionHash.h).
 //   - Copyable and movable (trivial for small keys).
 
 #pragma once
@@ -88,12 +89,13 @@ public:
     // ---- Partition resolution ------------------------------------------------
 
     /// Compute the partition for this key given partitionCount (≥ 1).
-    /// Uses the shared FNV-1a hash — identical to the broker (GB-1).
-    /// An EMPTY key is partition 0 for any partitionCount (the documented
-    /// Key{} contract; Phase 2b C fix — it used to hash the empty byte string,
-    /// i.e. FNV offset basis % n, e.g. partition 5 of 8).
+    /// Exactly rune::protocol::partitionForKey(bytes(), partitionCount) — the
+    /// one rule the broker (TopicRegistry::partitionForKey, used whenever a
+    /// request carries partitionKnown=0) also applies, so a client-routed
+    /// produce and a broker-resolved subscribe of the same Key always agree.
+    /// No client-side special cases: an empty key is partition 0 because
+    /// partitionForKey says so (Phase 2b C).
     [[nodiscard]] int32_t partition(int32_t partitionCount) const noexcept {
-        if (partitionCount <= 1 || len_ == 0) return 0;
         return rune::protocol::partitionForKey(bytes(), partitionCount);
     }
 
