@@ -254,3 +254,60 @@ TEST(ViewCheckpointMulti, OffsetIsAtByteFourLikeV1) {
     uint32_t magic; std::memcpy(&magic, rec.data(), 4);
     EXPECT_EQ(magic, rune::view::kViewCheckpointMagicV2);
 }
+
+// REGRESSION (final review T5): validate-all-then-apply atomicity.  A v2 record
+// whose table 0 section is VALID but whose table 1 section is invalid (rowLen
+// disagrees with rowLens, or table 1 appears twice) — with a correct CRC, so
+// only the per-section validation can catch it — must be rejected as a whole
+// and leave table 0 untouched (a section-by-section apply would already have
+// written table 0's row).
+TEST(ViewCheckpointMultiRegression, InvalidLaterSectionLeavesEarlierTableUntouchedRegression) {
+    uint8_t vrow[16]; std::memset(vrow, 0x11, 16);
+    uint8_t crow25[25]; std::memset(crow25, 0x22, 25);
+    uint8_t crow24[24]; std::memset(crow24, 0x33, 24);
+    const rune::view::DirtyEntry ve{0, false, 7, vrow};
+    const rune::view::DirtyEntry ce25{0, false, 8, crow25};
+    const rune::view::DirtyEntry ce24{0, false, 8, crow24};
+    const uint32_t lens[] = {16, 24, 32};
+
+    {   // table 1's rowLen (25) != rowLens[1] (24)
+        rune::view::ViewTable v(rawLayout(16)), c(rawLayout(24)), g(rawLayout(32));
+        rune::view::ViewTable* tables[] = {&v, &c, &g};
+        const rune::view::TableDelta tds[] = {{rune::view::kAggTableView, 16, {&ve, 1}},
+                                              {rune::view::kAggTableContributors, 25, {&ce25, 1}}};
+        std::vector<uint8_t> rec;
+        rune::view::encodeMultiDelta(tds, 3, rec);
+        EXPECT_FALSE(rune::view::applyMultiDelta(tables, lens, rec).has_value());
+        EXPECT_EQ(v.size(), 0u) << "table 0 must not be mutated";
+        EXPECT_EQ(v.get(7), nullptr);
+        EXPECT_EQ(c.size(), 0u);
+    }
+    {   // table 1 appears twice
+        rune::view::ViewTable v(rawLayout(16)), c(rawLayout(24)), g(rawLayout(32));
+        rune::view::ViewTable* tables[] = {&v, &c, &g};
+        const rune::view::TableDelta tds[] = {{rune::view::kAggTableView, 16, {&ve, 1}},
+                                              {rune::view::kAggTableContributors, 24, {&ce24, 1}},
+                                              {rune::view::kAggTableContributors, 24, {&ce24, 1}}};
+        std::vector<uint8_t> rec;
+        rune::view::encodeMultiDelta(tds, 3, rec);
+        EXPECT_FALSE(rune::view::applyMultiDelta(tables, lens, rec).has_value());
+        EXPECT_EQ(v.size(), 0u) << "table 0 must not be mutated";
+        EXPECT_EQ(c.size(), 0u);
+    }
+    {   // table 1 section truncated (torn tail: its row bytes + CRC cut short)
+        rune::view::ViewTable v(rawLayout(16)), c(rawLayout(24)), g(rawLayout(32));
+        std::memset(v.put(99), 0x77, 16);   // pre-existing row must survive unchanged
+        rune::view::ViewTable* tables[] = {&v, &c, &g};
+        const rune::view::TableDelta tds[] = {{rune::view::kAggTableView, 16, {&ve, 1}},
+                                              {rune::view::kAggTableContributors, 24, {&ce24, 1}}};
+        std::vector<uint8_t> rec;
+        rune::view::encodeMultiDelta(tds, 3, rec);
+        rec.resize(rec.size() - 10);
+        EXPECT_FALSE(rune::view::applyMultiDelta(tables, lens, rec).has_value());
+        EXPECT_EQ(v.size(), 1u);
+        EXPECT_EQ(v.get(7), nullptr) << "table 0's upsert must not be applied";
+        ASSERT_NE(v.get(99), nullptr);
+        EXPECT_EQ(v.get(99)[0], 0x77);
+        EXPECT_EQ(c.size(), 0u);
+    }
+}
