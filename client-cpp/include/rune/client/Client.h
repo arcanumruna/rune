@@ -95,7 +95,8 @@ struct TopicSchemaResult {
     std::vector<uint8_t> descriptorBlob;
     uint16_t             errorCode = 0;
     /// Phase 2b Part C: the topic's partition count as reported by the broker
-    /// (TopicSchemaResponse trailing field); 0 = not reported (pre-2b broker).
+    /// (TopicSchemaResponse trailing field); <= 0 = not reported (pre-2b broker)
+    /// — typed topics then route over 1 partition (typedPartitionCount).
     int32_t              partitionCount = 0;
 };
 
@@ -558,8 +559,8 @@ public:
     //   GetTopicSchema value = topicId, aux = version, payload = descriptor
     //                  blob (polled form: up to maxResultBytes, else
     //                  ResultTooLarge with value = the real size),
-    //                  reserved0 = the topic's partitionCount (Phase 2b; 0 =
-    //                  not reported by a pre-2b broker).
+    //                  reserved0 = the topic's partitionCount (Phase 2b; <= 0
+    //                  = not reported, e.g. a pre-2b broker).
     //   ListTopics     payload = encodeTopicList() of the topics defined
     //                  through this Client (decodeTopicList()).
     // A not-Connected session is decided on the duty thread: NotConnected.
@@ -692,7 +693,10 @@ public:
         if (!schemaMatches(T::kFingerprint, std::span<const uint8_t>(r.descriptorBlob))) {
             throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
         }
-        return TypedTopic<T>(producer(), r.topicId, r.version);
+        // Phase 2b Part C: route over the topic's partitions (broker-reported;
+        // a pre-2b broker reports 0 -> 1, the pre-2b partition-0 behaviour).
+        return TypedTopic<T>(producer(), TopicHandle{r.topicId, typedPartitionCount(r.partitionCount)},
+                             r.version);
     }
 
     /// Test hooks (duty thread only, or after close): completions addressed to

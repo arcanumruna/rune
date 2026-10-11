@@ -1,6 +1,8 @@
 // include/rune/client/TypedTopic.h
 //
 // Task 11 — TypedTopic<T>: typed, zero-per-send-alloc producer wrapper.
+// Phase 2b Part C — routes each record by its key field over the topic's
+// partitions (was: always partition 0, empty key).
 //
 // schemaMatches(expected, blob):
 //   Deserialises `blob` and computes its fingerprint; returns true iff it
@@ -8,15 +10,26 @@
 //   Unit-testable without a live broker.
 //
 // TypedTopic<T, ProducerT>:
-//   Wraps a producer handle and a topicId.  send(rec) encodes `rec` into a
-//   REUSED buffer (buf_ capacity persists; never freed per send — RULE #4),
-//   then routes the encoded bytes through ProducerT::send.
+//   Wraps a producer handle and the topic's TopicHandle{topicId,
+//   partitionCount} (partitionCount as reported by the broker's GetTopicSchema
+//   response).  send(rec) encodes `rec` into a REUSED buffer (buf_ capacity
+//   persists; never freed per send — RULE #4) and routes it EXACTLY like
+//   ProducerT::send(handle, Key(rec.key()), bytes): same partition, real
+//   record key.
 //
 //   T contract (generated struct):
 //     static constexpr uint64_t     kFingerprint
 //     static constexpr std::string_view kSchemaName
 //     size_t encodedSize() const noexcept
 //     size_t encode(uint8_t*)  const noexcept
+//     key() const noexcept     — OPTIONAL: generated only when the schema has a
+//                                key field (rune-codec generateHeader).  A
+//                                schema with NO key field keeps the pre-2b
+//                                behaviour: partition 0, empty record key.
+//
+//   Keys are at most Key::kMaxInline (16) bytes and are NEVER truncated: a
+//   fixed key type wider than that fails to compile; a string/bytes key longer
+//   than that makes send() throw std::invalid_argument (nothing is sent).
 //
 //   ProducerT contract (default = Producer):
 //     void send(TopicHandle, const Key&, std::span<const uint8_t>)
@@ -33,6 +46,7 @@
 #pragma once
 
 #include <rune/client/Completion.h>
+#include <rune/client/Key.h>
 #include <rune/client/producer/Producer.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/codec/Fingerprint.h>
@@ -42,6 +56,8 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace rune::client {
@@ -65,6 +81,20 @@ namespace rune::client {
     }
 }
 
+/// Phase 2b Part C: true iff the generated record type exposes its key field
+/// (rune-codec emits key() only for schemas with an isKey field).
+template <class R>
+concept HasRecordKey = requires(const R& r) { r.key(); };
+
+/// Phase 2b Part C: the partition count a typed topic routes over, from the
+/// broker-reported value (TopicSchemaResult::partitionCount /
+/// Completion::reserved0).  Any value <= 0 means "not reported" (a pre-2b
+/// broker reports nothing: 0): fall back to 1 — every record lands on
+/// partition 0 exactly as before 2b, never on an out-of-range partition.
+[[nodiscard]] constexpr int32_t typedPartitionCount(int32_t reported) noexcept {
+    return reported > 0 ? reported : 1;
+}
+
 // ---------------------------------------------------------------------------
 // TypedTopic<T, ProducerT>
 //
@@ -75,17 +105,19 @@ namespace rune::client {
 template <class T, class ProducerT = Producer>
 class TypedTopic {
 public:
-    /// Construct from an existing producer handle, topicId, and the schema
-    /// VERSION this topic is bound to (Task 19).  `version` is the version
-    /// whose fingerprint matched T::kFingerprint when the broker answered the
-    /// open gate (Client::openTopicAndWait / TypedTopic::fromSchema) — NOT
+    /// Construct from an existing producer handle, the topic's handle
+    /// {topicId, partitionCount} (Phase 2b Part C: partitionCount as reported
+    /// by the broker — see typedPartitionCount), and the schema VERSION this
+    /// topic is bound to (Task 19).  `version` is the version whose
+    /// fingerprint matched T::kFingerprint when the broker answered the open
+    /// gate (Client::openTopicAndWait / TypedTopic::fromSchema) — NOT
     /// necessarily T::kVersion (the codegen-baked compile-time version): an
     /// old generated client stays bound to the version it compiled against
     /// even after the topic evolves.  Every send() stamps this bound version
     /// onto the encoded record, overwriting the codegen-baked kVersion.
-    TypedTopic(ProducerT producer, int32_t topicId, uint16_t version)
+    TypedTopic(ProducerT producer, TopicHandle topic, uint16_t version)
         : producer_(std::move(producer))
-        , topicId_(topicId)
+        , topic_(topic)
         , version_(version)
     {}
 
@@ -115,26 +147,73 @@ public:
         if (!schemaMatches(T::kFingerprint, descriptorBlob)) {
             throw std::runtime_error("openTopic: generated type is stale — rerun rune schema generate");
         }
-        // c.aux carries the schema version bound to this descriptor (Task 18
-        // wire contract: GetTopicSchema completion value=topicId, aux=version).
-        return TypedTopic(client.producer(), static_cast<int32_t>(c.value),
+        // GetTopicSchema completion wire contract: value = topicId, aux =
+        // version (Task 18), reserved0 = partitionCount (Phase 2b Part C).
+        return TypedTopic(client.producer(),
+                          TopicHandle{static_cast<int32_t>(c.value),
+                                      typedPartitionCount(static_cast<int32_t>(c.reserved0))},
                           static_cast<uint16_t>(c.aux));
     }
 
     // ---- Hot path — ZERO per-send heap allocation ----------------------------
 
-    /// Encode `rec` into the reused buffer, then route through the producer.
+    /// Encode `rec` into the reused buffer, then route it like
+    /// ProducerT::send(handle(), Key(rec.key()), bytes) — or with an empty key
+    /// (partition 0) when the schema has no key field.
     ///
-    /// RULE #4: buf_ capacity is never freed between sends.  resize() only
-    /// grows the buffer (never shrinks below its current capacity because we
-    /// only call resize to the max of current size and needed size, so the
-    /// underlying storage always stays at the high-water mark).
+    /// RULE #4: buf_ capacity is never freed between sends (it only grows to
+    /// the high-water mark); the Key is a 17-byte inline value.
     ///
-    /// The encoded bytes are passed to ProducerT::send as a fire-and-forget
-    /// void send (zero-alloc path).  The topicId is used to build a
-    /// TopicHandle{topicId, 1} — partition routing on typed topics uses an
-    /// empty key (partition 0).  T13 (e2e) will exercise the actual routing.
+    /// Throws std::invalid_argument (nothing sent) when a string/bytes key is
+    /// longer than Key::kMaxInline — a record key is never truncated.
     void send(const T& rec) {
+        if constexpr (HasRecordKey<T>) {
+            sendWithKey_(rec, recordKey_(rec));
+        } else {
+            // No key field in the schema: partition 0, empty record key
+            // (documented pre-2b behaviour, kept by spec §C).
+            sendWithKey_(rec, Key{});
+        }
+    }
+
+    // ---- Accessors / test seams ------------------------------------------------
+
+    /// The topic handle every send routes over: {topicId, partitionCount}.
+    [[nodiscard]] TopicHandle handle() const noexcept { return topic_; }
+
+    /// Returns the current capacity of the reuse buffer.
+    /// Used in unit tests to assert that buf_ does not reallocate across sends
+    /// (capacity must be non-decreasing — proves RULE #4 on the zero-alloc path).
+    [[nodiscard]] std::size_t bufCapacity() const noexcept { return buf_.capacity(); }
+
+    /// The schema version this topic is bound to (Task 19 test seam).
+    [[nodiscard]] uint16_t boundVersion() const noexcept { return version_; }
+
+private:
+    /// Phase 2b Part C: the record key, exactly as a Producer::send caller
+    /// would build it from the key field — never truncated.
+    [[nodiscard]] static Key recordKey_(const T& rec) {
+        using KeyT = std::remove_cvref_t<decltype(rec.key())>;
+        if constexpr (std::is_same_v<KeyT, std::span<const uint8_t>>) {
+            const std::span<const uint8_t> kb = rec.key();
+            if (kb.size() > Key::kMaxInline) [[unlikely]] {
+                throw std::invalid_argument(
+                    "TypedTopic::send: key field is " + std::to_string(kb.size()) +
+                    " bytes; a record key holds at most " + std::to_string(Key::kMaxInline) +
+                    " (it is never truncated)");
+            }
+            return Key(kb);
+        } else {
+            static_assert(std::is_trivially_copyable_v<KeyT>,
+                          "TypedTopic: key() must return a trivially-copyable value or a byte span");
+            static_assert(sizeof(KeyT) <= Key::kMaxInline,
+                          "TypedTopic: the key field is wider than Key::kMaxInline (16 bytes) and "
+                          "cannot be a record key without truncation");
+            return Key(rec.key());
+        }
+    }
+
+    void sendWithKey_(const T& rec, const Key& key) {
         const std::size_t needed = rec.encodedSize();
         // Grow buf_ if needed but never shrink (capacity persists — RULE #4).
         if (needed > buf_.size()) {
@@ -154,31 +233,13 @@ public:
             buf_[3] = static_cast<uint8_t>((version_ >> 8) & 0xffu);
         }
 
-        // Route through the existing ProducerT::send (TopicHandle + empty key).
-        // TopicHandle{topicId_, 1}: partitionCount=1 → partition=0.
-        // For a real deployment with multiple partitions the caller should
-        // obtain the TopicHandle from Client::topic() and use a keyed send;
-        // this default covers the single-partition / T13 e2e case.
-        producer_.send(TopicHandle{topicId_, 1},
-                       Key{},
-                       std::span<const uint8_t>(buf_.data(), n));
+        producer_.send(topic_, key, std::span<const uint8_t>(buf_.data(), n));
     }
 
-    // ---- Test seam -----------------------------------------------------------
-
-    /// Returns the current capacity of the reuse buffer.
-    /// Used in unit tests to assert that buf_ does not reallocate across sends
-    /// (capacity must be non-decreasing — proves RULE #4 on the zero-alloc path).
-    [[nodiscard]] std::size_t bufCapacity() const noexcept { return buf_.capacity(); }
-
-    /// The schema version this topic is bound to (Task 19 test seam).
-    [[nodiscard]] uint16_t boundVersion() const noexcept { return version_; }
-
-private:
     ProducerT              producer_;
-    int32_t                topicId_;
-    uint16_t               version_ = 0;  // bound schema version; stamped onto every send()
-    std::vector<uint8_t>   buf_;   // reused; grown to high-water mark, never freed per send
+    TopicHandle            topic_;         // {topicId, partitionCount} — Phase 2b Part C
+    uint16_t               version_ = 0;   // bound schema version; stamped onto every send()
+    std::vector<uint8_t>   buf_;           // reused; grown to high-water mark, never freed per send
 };
 
 } // namespace rune::client

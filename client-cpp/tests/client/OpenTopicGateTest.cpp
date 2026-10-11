@@ -556,7 +556,7 @@ TEST(OpenTopicGate, BindsToVersionWhoseFingerprintMatchesAndStamps) {
     // deliberately different — see the stub's definition).
     std::vector<uint8_t> captured;
     TypedTopic<StubV1, StubCaptureProducer> stampTopic(
-        StubCaptureProducer{&captured}, /*topicId=*/0x40000001, tt.boundVersion());
+        StubCaptureProducer{&captured}, TopicHandle{0x40000001, 1}, tt.boundVersion());
     stampTopic.send(rec);
 
     ASSERT_GE(captured.size(), 4u);
@@ -634,7 +634,7 @@ TEST(OpenTopicGate, BrokerMisselectedBlobStillThrowsRegression) {
 TEST(OpenTopicGate, SendStampsBoundVersionNotCodegenVersionRegression) {
     std::vector<uint8_t> captured;
     TypedTopic<StubV1, StubCaptureProducer> topic(
-        StubCaptureProducer{&captured}, /*topicId=*/1, /*version=*/7);
+        StubCaptureProducer{&captured}, TopicHandle{1, 1}, /*version=*/7);
 
     StubV1 rec;
     topic.send(rec);
@@ -804,7 +804,7 @@ static void expectLineageClientBindsExactVersionAndStamps(GateHarness& h, uint16
     // version openTopicAndWait returned above.
     std::vector<uint8_t> captured;
     TypedTopic<StubT, StubCaptureProducer> stampTopic(
-        StubCaptureProducer{&captured}, /*topicId=*/0x40000010, tt.boundVersion());
+        StubCaptureProducer{&captured}, TopicHandle{0x40000010, 1}, tt.boundVersion());
     stampTopic.send(rec);
 
     ASSERT_GE(captured.size(), 4u);
@@ -937,4 +937,109 @@ TEST(OpenTopicGateRegression, PreTwoBBrokerReportsZeroPartitionCount) {
     EXPECT_EQ(r.errorCode, 0u);
     EXPECT_FALSE(r.descriptorBlob.empty()) << "the pre-2b frame must still decode fully";
     EXPECT_EQ(r.partitionCount, 0) << "not reported -> 0, never garbage";
+}
+
+// ===========================================================================
+// Phase 2b Part C — the typed topic binds the broker-reported partition count
+// (both open paths), and falls back to 1 against a pre-2b broker.
+// ===========================================================================
+TEST(OpenTopicGateRegression, OpenTopicAndWaitBindsBrokerPartitionCount) {
+    GateHarness h(1320, 1321);
+    h.build();
+    h.connectAndWait();
+
+    h.gw->getTopicId        = 0x40000002;
+    h.gw->getVersion        = 2;
+    h.gw->getBlob           = serialize(makeCharsV2Descriptor());
+    h.gw->getErrorCode      = 0;
+    h.gw->getPartitionCount = 8;
+    GateGateway::FingerprintOverride ov{/*topicId=*/0x40000001, /*version=*/1,
+                                        serialize(makeCharsV1Descriptor())};
+    ov.partitionCount = 8;
+    h.gw->fingerprintOverrides[StubV1::kFingerprint] = ov;
+
+    GateGatewayPump pump(*h.gw);
+    TypedTopic<StubV1> tt = h.client->openTopicAndWait<StubV1>("characters");
+    EXPECT_EQ(tt.handle().topicId, 0x40000001);
+    EXPECT_EQ(tt.handle().partitionCount, 8)
+        << "regression: TypedTopic was hard-wired to TopicHandle{id, 1}";
+    EXPECT_EQ(tt.boundVersion(), 1u);
+}
+
+TEST(OpenTopicGateRegression, FromSchemaBindsBrokerPartitionCount) {
+    GateHarness h(1322, 1323);
+    h.build();
+    h.connectAndWait();
+
+    h.gw->getBlob           = serialize(makeCharsDescriptor());
+    h.gw->getTopicId        = 0x40000001;
+    h.gw->getVersion        = 1;
+    h.gw->getErrorCode      = 0;
+    h.gw->getPartitionCount = 8;
+
+    test_support::TestCq cq(*h.client);
+    auto fut = cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
+        return h.client->getTopicSchema("characters", q, t);
+    });
+    h.pumpUntil([&]() { return fut.ready(); });
+    ASSERT_TRUE(fut.waitReady());
+
+    TypedTopic<StubT_Match> tt =
+        TypedTopic<StubT_Match>::fromSchema(*h.client, fut.outcome().c, fut.outcome().payload);
+    EXPECT_EQ(tt.handle().topicId, 0x40000001);
+    EXPECT_EQ(tt.handle().partitionCount, 8);
+}
+
+TEST(OpenTopicGateRegression, PreTwoBBrokerTypedTopicFallsBackToOnePartition) {
+    GateHarness h(1324, 1325);
+    h.build();
+    h.connectAndWait();
+
+    h.gw->getTopicId         = 0x40000001;
+    h.gw->getVersion         = 1;
+    h.gw->getBlob            = serialize(makeCharsDescriptor());
+    h.gw->getErrorCode       = 0;
+    h.gw->omitPartitionCount = true;   // pre-2b frame: no trailing partitionCount
+    h.gw->fingerprintOverrides[StubT_Match::kFingerprint] = GateGateway::FingerprintOverride{
+        /*topicId=*/0x40000001, /*version=*/1, serialize(makeCharsDescriptor())};
+
+    GateGatewayPump pump(*h.gw);
+    TypedTopic<StubT_Match> tt = h.client->openTopicAndWait<StubT_Match>("characters");
+    EXPECT_EQ(tt.handle().partitionCount, 1)
+        << "unreported (0) must become 1 — partition 0 as before 2b, never an out-of-range partition";
+}
+
+// Review carry-over: ANY non-positive reported count (not only 0) is "not
+// reported" — a negative count must never reach Key::partition() (modulo by a
+// negative / out-of-range partition).  Falls back to 1, like a pre-2b broker.
+TEST(OpenTopicGateRegression, NegativeReportedPartitionCountFallsBackToOnePartition) {
+    GateHarness h(1326, 1327);
+    h.build();
+    h.connectAndWait();
+
+    h.gw->getTopicId        = 0x40000001;
+    h.gw->getVersion        = 1;
+    h.gw->getBlob           = serialize(makeCharsDescriptor());
+    h.gw->getErrorCode      = 0;
+    h.gw->getPartitionCount = -3;
+    GateGateway::FingerprintOverride ov{/*topicId=*/0x40000001, /*version=*/1,
+                                        serialize(makeCharsDescriptor())};
+    ov.partitionCount = -3;
+    h.gw->fingerprintOverrides[StubT_Match::kFingerprint] = ov;
+
+    {
+        GateGatewayPump pump(*h.gw);
+        TypedTopic<StubT_Match> tt = h.client->openTopicAndWait<StubT_Match>("characters");
+        EXPECT_EQ(tt.handle().partitionCount, 1) << "openTopicAndWait: negative reported count -> 1";
+    }
+
+    test_support::TestCq cq(*h.client);
+    auto fut = cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
+        return h.client->getTopicSchema("characters", q, t);
+    });
+    h.pumpUntil([&]() { return fut.ready(); });
+    ASSERT_TRUE(fut.waitReady());
+    TypedTopic<StubT_Match> tt2 =
+        TypedTopic<StubT_Match>::fromSchema(*h.client, fut.outcome().c, fut.outcome().payload);
+    EXPECT_EQ(tt2.handle().partitionCount, 1) << "fromSchema: negative reported count -> 1";
 }

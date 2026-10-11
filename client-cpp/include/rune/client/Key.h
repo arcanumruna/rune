@@ -89,8 +89,11 @@ public:
 
     /// Compute the partition for this key given partitionCount (≥ 1).
     /// Uses the shared FNV-1a hash — identical to the broker (GB-1).
+    /// An EMPTY key is partition 0 for any partitionCount (the documented
+    /// Key{} contract; Phase 2b C fix — it used to hash the empty byte string,
+    /// i.e. FNV offset basis % n, e.g. partition 5 of 8).
     [[nodiscard]] int32_t partition(int32_t partitionCount) const noexcept {
-        if (partitionCount <= 1) return 0;
+        if (partitionCount <= 1 || len_ == 0) return 0;
         return rune::protocol::partitionForKey(bytes(), partitionCount);
     }
 

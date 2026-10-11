@@ -680,6 +680,26 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
     endif()
 endif()
 
+# ── Phase 2b Part C: characters.gen.h for tests/benches too ──────────────────
+# The typed-routing regression and the TypedTopic send bench compile against
+# the REAL generated rune::gen::Characters (userId is the isKey field -> key()).
+# The examples block above defines this codegen when BUILD_EXAMPLES is on;
+# define the identical rule here when it is not.
+if((BUILD_TESTING OR BUILD_BENCHMARKS) AND NOT TARGET generate_characters_header)
+    add_executable(rune_codec_gen "${RUNE_CODEC_ROOT}/tools/rune_codec_gen_main.cpp")
+    target_link_libraries(rune_codec_gen PRIVATE rune_codec)
+    set(CHARACTERS_BLOB  "${CMAKE_CURRENT_SOURCE_DIR}/tests/generated/characters.blob")
+    set(CHARACTERS_GEN_H "${CMAKE_CURRENT_BINARY_DIR}/gen/characters.gen.h")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/gen")
+    add_custom_command(
+        OUTPUT  "${CHARACTERS_GEN_H}"
+        COMMAND $<TARGET_FILE:rune_codec_gen> "${CHARACTERS_BLOB}" "${CHARACTERS_GEN_H}"
+        DEPENDS rune_codec_gen "${CHARACTERS_BLOB}"
+        COMMENT "Phase 2b C: generating characters.gen.h from characters.blob"
+    )
+    add_custom_target(generate_characters_header DEPENDS "${CHARACTERS_GEN_H}")
+endif()
+
 # ── Benchmarks ────────────────────────────────────────────────────────────────
 if(BUILD_BENCHMARKS AND aeron_FOUND)
     add_executable(rune_client_bench
@@ -756,6 +776,16 @@ if(BUILD_BENCHMARKS AND aeron_FOUND)
     target_include_directories(rune_producer_encode_bench PRIVATE ${RUNE_PROTOCOL_INCLUDE})
     target_link_libraries(rune_producer_encode_bench PRIVATE
         rune_client_api rune_client_producer benchmark::benchmark)
+
+    # Phase 2b Part C — TypedTopic::send keyed-routing cost (in-process, no Aeron)
+    add_executable(rune_typed_topic_send_bench bench/TypedTopicSendBench.cpp)
+    add_dependencies(rune_typed_topic_send_bench generate_characters_header)
+    target_include_directories(rune_typed_topic_send_bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${RUNE_CODEC_ROOT}/include
+        ${RUNE_PROTOCOL_INCLUDE}
+        "${CMAKE_CURRENT_BINARY_DIR}/gen")
+    target_link_libraries(rune_typed_topic_send_bench PRIVATE rune_codec benchmark::benchmark)
 
     # F8c C1(a) — M2ORingBuffer tryClaim/commit micro-bench (producer hot path)
     add_executable(rune_m2o_claim_bench
@@ -840,11 +870,15 @@ if(BUILD_TESTING)
     # Tests schemaMatches() / fingerprint gate logic without a live broker.
     add_executable(rune_open_topic_tests
         tests/client/OpenTopicTest.cpp
+        tests/client/TypedTopicRoutingRegressionTest.cpp   # Phase 2b C
+        tests/support/AllocCounter.cpp                     # zero-alloc send check
     )
+    add_dependencies(rune_open_topic_tests generate_characters_header)
     target_include_directories(rune_open_topic_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${RUNE_CODEC_ROOT}/include
         ${RUNE_PROTOCOL_INCLUDE}
+        "${CMAKE_CURRENT_BINARY_DIR}/gen"                  # characters.gen.h
     )
     target_link_libraries(rune_open_topic_tests PRIVATE rune_codec GTest::gtest_main)
     gtest_discover_tests(rune_open_topic_tests)
