@@ -2,6 +2,7 @@
 #include <rune/codec/Serialize.h>  // rune::codec::deserialize/serialize (throws on bad input)
 #include <rune/codec/Evolve.h>     // checkCompatibility / applyOps (Task 11)
 #include <rune/codec/AlterOps.h>   // decodeAlterOps
+#include <rune/view/AggState.h>     // rune::view::isAggregateView (Phase 2a)
 #include <rune/view/PlanCompiler.h> // rune::view::compileView (Task 19)
 #include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/RecordBatch.h>
@@ -25,6 +26,7 @@ static constexpr uint16_t kViewExists         = 32;  // CreateView on an existin
 static constexpr uint16_t kViewSourceNotFound = 33;  // plan references a missing source topic
 static constexpr uint16_t kViewFieldUnresolved= 34;  // plan references an unresolved field
 static constexpr uint16_t kViewKeyInvalid     = 35;  // key field invalid under the source schema
+static constexpr uint16_t kViewNotCoPartitioned = 36;  // aggregate group-by not co-partitioned
 
 AdminWorker::AdminWorker(SchemaRegistry& reg,
                          rune::replication::PartitionReplica* replica,
@@ -462,6 +464,19 @@ void AdminWorker::startCreateView_(CreateViewMsg msg, int64_t nowNs) {
                                   ? kViewKeyInvalid : kViewFieldUnresolved;
         deps_.respondCreateView(msg.session, msg.corr, -1, 0, code);
         return;
+    }
+
+    // Phase 2a co-partitioning: an aggregate view groups by a VALUE field, but
+    // records are partitioned by their wire key — every contributor of a group
+    // is only guaranteed to land on one partition when the source has exactly
+    // one, or when the group-by field IS the source's declared key field.
+    if (rv::isAggregateView(compiled->plan)) {
+        const RegistryEntry* coSrc = reg_.byId(authored->sources[0].topicId);
+        if (coSrc != nullptr && coSrc->partitionCount > 1 &&
+            authored->sources[0].keyField != coSrc->keyField) {
+            deps_.respondCreateView(msg.session, msg.corr, -1, 0, kViewNotCoPartitioned);
+            return;
+        }
     }
 
     // ── CREATING ── post a keyed+Compact SINK create request to the control

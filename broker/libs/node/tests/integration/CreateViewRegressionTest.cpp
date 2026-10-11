@@ -274,3 +274,57 @@ TEST_F(CreateViewRegression, CreateViewPersistsCompilesAndInstalls) {
     driveCreateView(cv2);
     EXPECT_EQ(lastViewError_, static_cast<uint16_t>(pc::ErrorCode::ViewExists));
 }
+
+namespace {
+std::vector<uint8_t> orderBlob() {
+    return serialize(DescriptorBuilder("order", 1)
+        .add("orderId", PrimType::Int64, 1, /*isKey=*/true)
+        .add("userId", PrimType::Int64)
+        .add("amount", PrimType::Int64)
+        .build());
+}
+std::vector<uint8_t> totalsPlanBlob(int32_t srcTopicId, const std::string& groupField) {
+    rv::ViewPlan p;
+    p.viewName = "totals_" + groupField; p.key = groupField; p.persistence = 0;
+    p.sources.push_back(rv::SourceSpec{srcTopicId, groupField});
+    p.output.push_back(rv::AuthoredField{groupField, PrimType::Int64, 0, groupField, rv::MergeRule::Replace});
+    p.output.push_back(rv::AuthoredField{"total", PrimType::Int64, 0, "amount", rv::MergeRule::Sum});
+    return rv::serializeAuthored(p);
+}
+} // namespace
+
+TEST_F(CreateViewRegression, AggregateOverMultiPartitionSourceIsNotCoPartitioned) {
+    DefineTopicMsg d;
+    d.session = 1; d.corr = 30; d.partitionCount = 2; d.name = "order";
+    d.keyField = "orderId"; d.validate = false; d.blob = orderBlob();
+    driveDefine(d);
+    ASSERT_EQ(lastDefineError_, 0u);
+    const int32_t src = lastDefineTopicId_;
+
+    CreateViewMsg cv;
+    cv.session = 1; cv.corr = 31; cv.persistence = 0;
+    cv.viewName = "totals_userId"; cv.keyField = "userId"; cv.planBlob = totalsPlanBlob(src, "userId");
+    driveCreateView(cv);
+    EXPECT_EQ(lastViewError_, 36u) << "group-by userId over a 2-partition source keyed by orderId";
+
+    // Grouping by the source's own key field is co-partitioned by construction.
+    lastViewError_ = 0xffff;
+    cv.corr = 32; cv.viewName = "totals_orderId"; cv.keyField = "orderId";
+    cv.planBlob = totalsPlanBlob(src, "orderId");
+    driveCreateView(cv);
+    EXPECT_EQ(lastViewError_, static_cast<uint16_t>(pc::ErrorCode::OK));
+}
+
+TEST_F(CreateViewRegression, AggregateOverSinglePartitionSourceIsAllowed) {
+    DefineTopicMsg d;
+    d.session = 1; d.corr = 40; d.partitionCount = 1; d.name = "order1";
+    d.keyField = "orderId"; d.validate = false; d.blob = orderBlob();
+    driveDefine(d);
+    ASSERT_EQ(lastDefineError_, 0u);
+    CreateViewMsg cv;
+    cv.session = 1; cv.corr = 41; cv.persistence = 0;
+    cv.viewName = "totals_userId"; cv.keyField = "userId";
+    cv.planBlob = totalsPlanBlob(lastDefineTopicId_, "userId");
+    driveCreateView(cv);
+    EXPECT_EQ(lastViewError_, static_cast<uint16_t>(pc::ErrorCode::OK));
+}
