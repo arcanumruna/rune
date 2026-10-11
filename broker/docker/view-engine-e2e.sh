@@ -20,6 +20,10 @@
 #        response for the rest of its life (and hands them to RUN 2 below).
 #     3. produce one "character" record (id=4242, hp=100)
 #     4. getViewRow on BOTH views -> OK, decoded row == {id=4242, hp=100}
+#     5. Phase 2a: defineTopic "order" {orderId key, userId, amount}; createView
+#        "user_totals" (persistence=0; GROUP BY userId: Count(*), Sum, Avg);
+#        produce o1(u100,10) o2(u100,30) o3(u200,5), update o1->50, move
+#        o3->(u100,5) -> u100 = {3, 85, 85/3}, u200 AbsentKey (emptied group).
 #     Prints VIEW_* KEY=VALUE handoff lines + "VIEW-PROBE-SETUP: OK".
 #
 #   RESTART: `docker compose restart rune-1` (same named volume — the
@@ -37,6 +41,10 @@
 #         runtime-topic recovery.
 #     (c) re-produce the SAME key with a NEW hp value -> BOTH views converge to
 #         the NEW value (live folding resumes after the restart).
+#     (d) user_totals recovered from its v2 checkpoint: u100 = {3, 85, 85/3},
+#         u200 AbsentKey; then o3 5->25 (a PRE-restart contributor) ->
+#         u100 = {3, 105, 35} — proves the contributor map survived (a lost
+#         map would give n 4, total 110).
 #     Prints "VIEW-ENGINE-E2E: OK" on success.
 #
 # Usage:  bash docker/view-engine-e2e.sh
@@ -268,15 +276,20 @@ VIEW_TOPIC_ID_TRANSIENT="$(extract VIEW_TOPIC_ID_TRANSIENT)"
 VIEW_FP_TRANSIENT="$(extract VIEW_FP_TRANSIENT)"
 VIEW_KEY_ID="$(extract VIEW_KEY_ID)"
 VIEW_HP_INITIAL="$(extract VIEW_HP_INITIAL)"
+VIEW_ORDER_TOPIC_ID="$(extract VIEW_ORDER_TOPIC_ID)"
+VIEW_TOPIC_ID_AGG="$(extract VIEW_TOPIC_ID_AGG)"
+VIEW_FP_AGG="$(extract VIEW_FP_AGG)"
 
 for v in VIEW_SRC_TOPIC_ID VIEW_TOPIC_ID_PERSISTED VIEW_FP_PERSISTED \
-         VIEW_TOPIC_ID_TRANSIENT VIEW_FP_TRANSIENT VIEW_KEY_ID VIEW_HP_INITIAL; do
+         VIEW_TOPIC_ID_TRANSIENT VIEW_FP_TRANSIENT VIEW_KEY_ID VIEW_HP_INITIAL \
+         VIEW_ORDER_TOPIC_ID VIEW_TOPIC_ID_AGG VIEW_FP_AGG; do
     [ -n "${!v:-}" ] || fail "setup output did not carry ${v}= (handoff parse failed)"
 done
 log "Setup OK: srcTopicId=${VIEW_SRC_TOPIC_ID}" \
     "viewPersisted={id=${VIEW_TOPIC_ID_PERSISTED},fp=${VIEW_FP_PERSISTED}}" \
     "viewTransient={id=${VIEW_TOPIC_ID_TRANSIENT},fp=${VIEW_FP_TRANSIENT}}" \
-    "key=${VIEW_KEY_ID} hp0=${VIEW_HP_INITIAL}"
+    "key=${VIEW_KEY_ID} hp0=${VIEW_HP_INITIAL}" \
+    "orderTopicId=${VIEW_ORDER_TOPIC_ID} viewAgg={id=${VIEW_TOPIC_ID_AGG},fp=${VIEW_FP_AGG}}"
 
 # ---------------------------------------------------------------------------
 # The CREATE path above (define -> createView x2 -> produce -> getViewRow x2 OK)
@@ -322,6 +335,9 @@ restart_out=$(run_client verify_restart \
     -e RUNE_VIEW_FP_TRANSIENT="${VIEW_FP_TRANSIENT}" \
     -e RUNE_VIEW_KEY_ID="${VIEW_KEY_ID}" \
     -e RUNE_VIEW_HP_INITIAL="${VIEW_HP_INITIAL}" \
+    -e RUNE_VIEW_ORDER_TOPIC_ID="${VIEW_ORDER_TOPIC_ID}" \
+    -e RUNE_VIEW_TOPIC_ID_AGG="${VIEW_TOPIC_ID_AGG}" \
+    -e RUNE_VIEW_FP_AGG="${VIEW_FP_AGG}" \
     2>&1)
 restart_rc=$?
 set -e
@@ -350,5 +366,6 @@ log "  -> restart -> re-elected: ${leader2}"
 log "  -> char_persisted recovered OK (readiness gate replay)"
 log "  -> char_transient re-folded from the retained source OK"
 log "  -> reproduce -> both views fold the new value live OK"
+log "  -> user_totals (Count(*)/Sum/Avg) recovered + post-restart update retracts OK"
 log "  VIEW-ENGINE-E2E: OK, exit 0."
 log "========================================"
