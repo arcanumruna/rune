@@ -216,6 +216,57 @@ TEST(GetViewRowRegression, GetViewRowReturnsCurrentRowAfterFold) {
 }
 
 // ---------------------------------------------------------------------------
+// REGRESSION (shard duty-cycle install drain). The live broker runs the SHARD
+// worker pass (Worker::doWorkShard_).  Before the fix that pass drove view
+// folds but NEVER drained the control->worker view-plan install ring, which
+// only the classic doWork_ pass did.  A view plan fanned out by
+// BrokerNode::pumpViewFanout_ then sat undrained: templates_ stayed empty,
+// viewOutputFingerprint() returned false, and every GetViewRow answered
+// UnknownView forever on the live sharded broker.  The in-process tests all
+// pre-seed installView() DIRECTLY (bypassing the ring), so they missed it; the
+// first real docker/view-engine-e2e.sh caught it.
+//
+// This drives the install through the ring (exactly as pumpViewFanout_ does)
+// and ticks ONE shard duty-cycle pass.
+//   RED  (pre-fix):  viewCount()==0 — the shard pass never drained the ring.
+//   GREEN (post-fix): viewCount()==1 — doWorkShard_ drains it, like doWork_.
+// ---------------------------------------------------------------------------
+TEST(GetViewRowRegression, ShardDutyCyclePassDrainsViewInstallRing) {
+    auto src = charSourceV1();
+    const Descriptor* srcs[] = {&src};
+    auto comp = rv::compileView(hpView(), srcs, kViewTopicId).value();
+
+    ViewSnapshotChannel channel;
+    WorkerViewSet vs(channel, "/tmp/rune-views-shard-install");
+
+    // Seed the install ring EXACTLY as BrokerNode::pumpViewFanout_ does.
+    ViewPlanUpdateMsg vp;
+    vp.viewTopicId = kViewTopicId;
+    vp.persistence = 1;       // transient — install is persistence-independent
+    vp.recovery    = false;   // plain create-time install
+    vp.planBlob    = rv::serialize(comp.plan);
+    vp.outDescBlob = rune::codec::serialize(comp.outputDescriptor);
+    vp.srcDescBlob = rune::codec::serialize(src);
+    ASSERT_TRUE(encodeViewPlanUpdate(channel.install,
+                                     ViewSnapshotChannel::kInstallMsgType, vp))
+        << "precondition: install frame must encode into the ring";
+
+    Worker w(/*workerId*/ 0);
+    w.setShardMode(true);     // the duty-cycle pass the live sharded broker runs
+    w.setViewSet(&vs);
+    ASSERT_EQ(vs.viewCount(), 0u) << "precondition: nothing installed yet";
+
+    w.doWork(/*nowNs*/ 1'000'000LL);   // one shard duty-cycle pass
+
+    EXPECT_EQ(vs.viewCount(), 1u)
+        << "doWorkShard_ must drain the view-plan install ring (else UnknownView)";
+    uint64_t fp = 0;
+    EXPECT_TRUE(vs.viewOutputFingerprint(kViewTopicId, fp))
+        << "installed view's output fingerprint must resolve";
+    EXPECT_EQ(fp, comp.plan.outputFingerprint);
+}
+
+// ---------------------------------------------------------------------------
 // MULTI-WORKER routing (IMPORTANT 1): the view-partition table for
 // (viewTopicId, p) is folded on the worker that owns the SOURCE partition p
 // (driveViews_ iterates owned source replicas).  A GetViewRow is routed by
