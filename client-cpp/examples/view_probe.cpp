@@ -40,11 +40,12 @@
 //     (a) the PERSISTED view still answers OK with the ORIGINAL row (the
 //         broker's readiness gate replayed it from the source log / its own
 //         checkpoint across the restart — no reproduce needed);
-//     (b) the TRANSIENT view answers AbsentKey (no checkpoint survives a
-//         transient view's restart — "empty" per spec);
-//     (c) re-producing the SAME key with a NEW hp value refills the
-//         transient view (it folds live off the source log, which IS
-//         persisted) — getViewRow eventually returns OK with the NEW value.
+//     (b) the TRANSIENT view ALSO answers OK with the ORIGINAL row: it has
+//         no checkpoint, so the readiness gate rebuilds it by re-folding the
+//         retained source log from its floor (spec §9.7) — the source topic
+//         is persisted, so the row comes back;
+//     (c) re-producing the SAME key with a NEW hp value is folded live by
+//         BOTH views after the restart — each converges to the NEW value.
 //   Prints "VIEW-ENGINE-E2E: OK" on success.
 //
 // Environment (both modes):
@@ -191,6 +192,26 @@ static ViewRowResult waitForRow(Client& c, int32_t viewTopicId, uint64_t key, ui
     for (;;) {
         r = c.getViewRowAndWait(viewTopicId, key, fp, std::chrono::milliseconds(perCallTimeoutMs));
         if (r.status == ViewRowResult::kOk) return r;
+        if (std::chrono::steady_clock::now() >= dl) return r;
+        std::this_thread::sleep_for(50ms);
+    }
+}
+
+// Poll getViewRow until the row decodes to (wantId, wantHp) or the bound
+// expires — used after a re-produce, where the view first still serves the
+// OLD row (a plain waitForRow would return on that stale OK).
+static ViewRowResult waitForHp(Client& c, int32_t viewTopicId, uint64_t key, uint64_t fp,
+                               int64_t wantId, int64_t wantHp, int boundMs, int perCallTimeoutMs) {
+    const rcv::RowLayout layout = charHpRowLayout();
+    const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(boundMs);
+    ViewRowResult r;
+    for (;;) {
+        r = c.getViewRowAndWait(viewTopicId, key, fp, std::chrono::milliseconds(perCallTimeoutMs));
+        if (r.status == ViewRowResult::kOk && r.rowBytes.size() == layout.rowLen) {
+            const auto idF = rcv::readSlot(std::span<const uint8_t>(r.rowBytes), layout, 0);
+            const auto hpF = rcv::readSlot(std::span<const uint8_t>(r.rowBytes), layout, 1);
+            if (idF.present && hpF.present && idF.i == wantId && hpF.i == wantHp) return r;
+        }
         if (std::chrono::steady_clock::now() >= dl) return r;
         std::this_thread::sleep_for(50ms);
     }
@@ -363,17 +384,21 @@ int main() {
             }
             if (!decodeAndCheck(rp, keyId, hpInitial, "char_persisted (post-restart, recovered)")) return 12;
 
-            // ---- (b) transient view: AbsentKey (no checkpoint survives) -----
+            // ---- (b) transient view: rebuilt from the retained source --------
+            //     No checkpoint — the readiness gate re-folds the source log from
+            //     its floor (spec §9.7); the source is persisted, so the ORIGINAL
+            //     row comes back.  waitResolved rides through NotReady while the
+            //     rebuild runs.
             const ViewRowResult rt0 = waitResolved(c, viewIdT, keyU64, fpT, boundMs, timeoutMs);
-            if (rt0.status != ViewRowResult::kAbsentKey) {
+            if (rt0.status != ViewRowResult::kOk) {
                 std::cerr << "PROBE: FAIL char_transient post-restart status=" << rt0.status
-                          << " (want kAbsentKey — a transient view must NOT survive a restart)\n";
+                          << " (want kOk — a transient view is rebuilt by re-folding the "
+                             "retained source on restart)\n";
                 return 13;
             }
-            std::cerr << "PROBE: char_transient post-restart correctly AbsentKey (empty)\n";
+            if (!decodeAndCheck(rt0, keyId, hpInitial, "char_transient (post-restart, re-folded)")) return 16;
 
-            // ---- (c) re-produce -> transient refills (folds live off the ----
-            //          source log, which IS persisted) --------------------------
+            // ---- (c) re-produce -> BOTH views fold it live after the restart ---
             {
                 ProducerConfig pcfg;
                 pcfg.acks             = Acks::Leader;
@@ -394,8 +419,10 @@ int main() {
                           << " offset=" << done.value << "\n";
             }
 
-            const ViewRowResult rt1 = waitForRow(c, viewIdT, keyU64, fpT, boundMs, timeoutMs);
-            if (!decodeAndCheck(rt1, keyId, hpRefill, "char_transient (refilled)")) return 15;
+            const ViewRowResult rp1 = waitForHp(c, viewIdP, keyU64, fpP, keyId, hpRefill, boundMs, timeoutMs);
+            if (!decodeAndCheck(rp1, keyId, hpRefill, "char_persisted (live after restart)")) return 15;
+            const ViewRowResult rt1 = waitForHp(c, viewIdT, keyU64, fpT, keyId, hpRefill, boundMs, timeoutMs);
+            if (!decodeAndCheck(rt1, keyId, hpRefill, "char_transient (live after restart)")) return 17;
 
             std::cout << "VIEW-ENGINE-E2E: OK\n";
             std::cout.flush();
