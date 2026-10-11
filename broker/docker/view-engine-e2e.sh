@@ -232,13 +232,22 @@ run_client() {
 }
 
 log "Step 4: RUN 1 (setup) — define/createView x2/produce/getViewRow..."
+# Capture stdout (the machine-readable handoff: VIEW_*=... lines + the
+# VIEW-PROBE-SETUP sentinel) SEPARATELY from stderr (the human PROBE: log).
+# Merging them with 2>&1 let an unbuffered stderr PROBE: line race onto the
+# start of a stdout handoff line ("PROBE: VIEW_SRC_TOPIC_ID=0"), which broke
+# the ^-anchored extract below — a racy correctness gate.  Keep streams split.
 set +e
-setup_out=$(run_client setup 2>&1)
+setup_err="$(mktemp)"
+setup_out=$(run_client setup 2>"${setup_err}")
 setup_rc=$?
 set -e
+setup_err_text="$(cat "${setup_err}" 2>/dev/null || true)"; rm -f "${setup_err}"
 
-echo "----- setup output -----" >&2
+echo "----- setup stdout (handoff) -----" >&2
 echo "${setup_out}" >&2
+echo "----- setup stderr (PROBE log) ---" >&2
+echo "${setup_err_text}" >&2
 echo "-------------------------" >&2
 
 if [ "${setup_rc}" -ne 0 ]; then
