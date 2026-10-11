@@ -290,7 +290,7 @@ void BM_RcBuildStep(benchmark::State& state) {
         }
     }
     log.sync();
-    const RcFacts f{true, true, 0, 0, 1};
+    const RcFacts f{/*leader*/ true, /*logGeneration*/ 0, /*leadershipGeneration*/ 0, /*epoch*/ 1};
     rune::node::IoBackend io(1024, 1024);
     BenchHints hints;
     hints.io = &io;

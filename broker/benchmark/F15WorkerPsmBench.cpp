@@ -57,8 +57,8 @@ using rune::replication::Role;
 
 class NullTransport final : public rune::replication::PartitionTransport {
 public:
-    void sendFetchRequest(const rune::replication::FetchRequestMsg&) override {}
-    void sendFetchResponse(NodeId, const rune::replication::FetchResponseMsg&) override {}
+    bool sendFetchRequest(const rune::replication::FetchRequestMsg&) override { return true; }
+    bool sendFetchResponse(NodeId, const rune::replication::FetchResponseMsg&) override { return true; }
 };
 
 // Hot-path logging off for every arm (house rule: benchmarks run with
