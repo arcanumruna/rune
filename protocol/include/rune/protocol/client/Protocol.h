@@ -144,8 +144,10 @@ enum class ErrorCode : uint16_t {
     ViewSourceNotFound     = 33,  // CreateView's planBlob references a source topic that does not exist
     ViewFieldUnresolved    = 34,  // CreateView's planBlob references an output/key field the source schema does not have
     ViewKeyInvalid         = 35,  // GetViewRow.keyU64 does not resolve under the view's keyField type
-    ViewNotCoPartitioned   = 36,  // CreateView: an aggregate view's group-by field is not the source's
-                                  // partitioning key and the source has >1 partition (Phase 2a)
+    ViewNotCoPartitioned   = 36,  // CreateView: an aggregate view over a source with >1 partition
+                                  // (Phase 2a: contributors are partitioned by wire key, which the
+                                  // broker does not tie to the group-by field, so any aggregate over
+                                  // a multi-partition source is rejected)
 };
 
 // ---------------------------------------------------------------------------
