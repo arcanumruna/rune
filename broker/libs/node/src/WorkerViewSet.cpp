@@ -357,10 +357,25 @@ const uint8_t* WorkerViewSet::getRow(int32_t viewTopicId, int32_t partition, uin
     auto it = views_.find(instKey(viewTopicId, partition));
     if (it == views_.end()) {
         // Serve the layout from the template if the view is installed but this
-        // partition has not folded yet; row is still absent.
+        // (view, partition) instance does not exist yet.
         auto tit = templates_.find(viewTopicId);
         outLayout = tit != templates_.end() ? &tit->second.layout : nullptr;
-        if (outStatus != nullptr) *outStatus = RowStatus::NotFound;
+        // SERVE-GUARD (restart recovery): a view installed FOR RECOVERY whose
+        // instance has not been materialized yet (e.g. this worker's owned source
+        // replica is still being re-assigned post-restart, so driveViews_ has not
+        // run materializeRecoveryInstancesFor for it) must answer a RETRIABLE
+        // NotReady — NOT a terminal AbsentKey.  Otherwise a restarted broker
+        // reports "key absent" for a durable row that is merely not reloaded yet,
+        // and a client waiting for recovery gives up early.  A plain (non-recovery)
+        // view keeps the AbsentKey/NotFound answer: its instance is created
+        // serve-ready on the first driveFolds, so a missing instance there means
+        // the partition simply has not folded and the key is genuinely absent.
+        const bool underRecovery =
+            tit != templates_.end() &&
+            (tit->second.underRecovery ||
+             recoveryViews_.find(viewTopicId) != recoveryViews_.end());
+        if (outStatus != nullptr)
+            *outStatus = underRecovery ? RowStatus::NotReady : RowStatus::NotFound;
         return nullptr;
     }
     outLayout = &it->second.layout;

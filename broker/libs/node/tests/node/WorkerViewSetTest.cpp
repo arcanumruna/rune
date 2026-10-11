@@ -237,3 +237,50 @@ TEST(WorkerViewSetRegression, PerPartitionFoldCursorsAreIndependent) {
     EXPECT_EQ(vs.getRow(0x40000007, /*partition*/ 1, 7, L), nullptr)
         << "partition 0's key 7 must NOT bleed into partition 1's table";
 }
+
+// REGRESSION (restart-recovery serve-guard). A view installed FOR RECOVERY
+// (underRecovery) whose per-partition instance has NOT been materialized yet —
+// e.g. the owned source replica is still being re-assigned post-restart, so
+// driveViews_ has not yet run materializeRecoveryInstancesFor for it — must
+// answer a RETRIABLE NotReady, never a terminal AbsentKey/NotFound. The live
+// docker e2e caught this: a restarted broker reported a durable row "absent"
+// before it was reloaded, and the client (waiting for recovery) gave up early.
+// The existing serve-guard only covered an EXISTING RebuildingViews instance;
+// with no instance at all it was bypassed and getRow fell through to NotFound.
+TEST(WorkerViewSetRegression, UnderRecoveryViewNoInstanceServesNotReady) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(/*persistence*/ 0), srcs, 0x40000007).value();
+
+    rune::node::ViewSnapshotChannel channel;
+    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-recovery-notready");
+    // Install FOR RECOVERY; deliberately do NOT materialize the instance.
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true, /*underRecovery*/ true);
+
+    const rune::view::RowLayout* layout = nullptr;
+    auto rs = rune::node::WorkerViewSet::RowStatus::Ok;
+    const uint8_t* row = vs.getRow(comp.plan.viewTopicId, /*partition*/ 0, /*key*/ 4242, layout, &rs);
+    EXPECT_EQ(row, nullptr);
+    EXPECT_EQ(rs, rune::node::WorkerViewSet::RowStatus::NotReady)
+        << "under-recovery view with no materialized instance must be NotReady, not AbsentKey";
+}
+
+// A PLAIN (non-recovery) view with no instance keeps the terminal NotFound
+// answer: its instance is created serve-ready on the first driveFolds, so a
+// missing instance means the key is genuinely absent (AbsentKey), not recovery.
+TEST(WorkerViewSetRegression, PlainViewNoInstanceServesNotFound) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(/*persistence*/ 0), srcs, 0x40000007).value();
+
+    rune::node::ViewSnapshotChannel channel;
+    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-plain-notfound");
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);  // underRecovery defaults false
+
+    const rune::view::RowLayout* layout = nullptr;
+    auto rs = rune::node::WorkerViewSet::RowStatus::Ok;
+    const uint8_t* row = vs.getRow(comp.plan.viewTopicId, /*partition*/ 0, /*key*/ 4242, layout, &rs);
+    EXPECT_EQ(row, nullptr);
+    EXPECT_EQ(rs, rune::node::WorkerViewSet::RowStatus::NotFound)
+        << "plain view with no instance is a genuine miss (AbsentKey), not NotReady";
+}
