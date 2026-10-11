@@ -171,3 +171,19 @@ TEST(PartitionHash, StabilityMultiByteSequence) {
     EXPECT_EQ(h1, h2);
     EXPECT_NE(h1, 0ULL);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2b Part C regression: an EMPTY key maps to partition 0 for any
+// partitionCount.  This header is the single source broker + client share
+// (TopicRegistry::partitionForKey, rune::client::Key::partition), so the rule
+// lives here — a client-only special case split producer (client-hashed) and
+// subscriber (broker-hashed, partitionKnown=0) on the same Key{}.  Before:
+// fnv1a64("") % 8 == 5.  fnv1a64 itself is unchanged (EmptyKeyVector above).
+// ---------------------------------------------------------------------------
+TEST(PartitionHashRegression, EmptyKeyIsPartitionZero) {
+    const std::span<const uint8_t> empty{};
+    for (int32_t n : {1, 2, 8, 64}) {
+        EXPECT_EQ(partitionForKey(empty, n), 0) << "partitionCount=" << n;
+    }
+    static_assert(partitionForKey(std::span<const uint8_t>{}, 8) == 0);
+}

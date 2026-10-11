@@ -8,7 +8,8 @@
 //
 // API:
 //   fnv1a64(data, len) → uint64_t   — raw hash of arbitrary bytes
-//   partitionForKey(keyBytes, partitionCount) → int32_t   — [0, partitionCount)
+//   partitionForKey(keyBytes, partitionCount) → int32_t   — [0, partitionCount);
+//                                                          empty key → 0
 //
 // Stability guarantee: the FNV-1a offset basis and prime are fixed constants;
 // the result is fully determined by the byte content of the key — no platform-
@@ -46,11 +47,19 @@ fnv1a64(const uint8_t* data, std::size_t len) noexcept
 // partitionForKey — map an opaque key to a partition index in [0, partitionCount).
 //
 // The formula is:   fnv1a64(key) % partitionCount
+//                   — except an EMPTY key (or partitionCount <= 1) is
+//                   partition 0 (Phase 2b Part C: Key{} = "no key" lands on
+//                   partition 0 for broker and client alike).
 // Precondition:     partitionCount >= 1  (caller must validate from TopicSpec)
+//
+// This is the ONE routing rule broker (TopicRegistry::partitionForKey) and
+// client (rune::client::Key::partition) share — never special-case it on one
+// side only.
 // ---------------------------------------------------------------------------
 [[nodiscard]] inline constexpr int32_t
 partitionForKey(std::span<const uint8_t> key, int32_t partitionCount) noexcept
 {
+    if (key.empty() || partitionCount <= 1) return 0;
     const uint64_t h = fnv1a64(key.data(), key.size());
     return static_cast<int32_t>(h % static_cast<uint64_t>(partitionCount));
 }
