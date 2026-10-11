@@ -105,6 +105,7 @@ public:
         r.topicId   = static_cast<int32_t>(outcome().c.value);
         r.version   = static_cast<uint16_t>(outcome().c.aux);
         r.errorCode = outcome().c.errorCode;
+        r.partitionCount = static_cast<int32_t>(outcome().c.reserved0);  // Phase 2b C
         if (status() == rune::client::OpStatus::Ok) r.descriptorBlob = outcome().payload;
         return r;
     }

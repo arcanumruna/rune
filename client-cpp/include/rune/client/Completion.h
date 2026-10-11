@@ -70,7 +70,8 @@ struct Completion {
                                  ///< ViewRowResponse::Status (1=AbsentKey,2=NotReady,3=SchemaMismatch,4=UnknownView)
     uint32_t payloadLen = 0;     ///< bytes of inline payload
     uint32_t reservedBytes = 0;  ///< credit returned to the Completions on consume (§2.2)
-    uint32_t reserved0 = 0;
+    uint32_t reserved0 = 0;      ///< BatchAck: producerEpoch; GetTopicSchema: the topic's partitionCount
+                                 ///< (Phase 2b Part C; 0 = a pre-2b broker that does not report it)
 };
 static_assert(sizeof(Completion) == 40);
 

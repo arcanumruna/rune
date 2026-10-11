@@ -1309,7 +1309,8 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
 }
 
 void Client::completeCtl_(PendingCtl& p, OpStatus st, int64_t value, int64_t aux, uint16_t errorCode,
-                          std::span<const uint8_t> payload, detail::CompletionRing::Overflow ov) {
+                          std::span<const uint8_t> payload, detail::CompletionRing::Overflow ov,
+                          uint32_t reserved0) {
     Completion c;
     c.token     = p.token;
     c.value     = value;
@@ -1317,6 +1318,7 @@ void Client::completeCtl_(PendingCtl& p, OpStatus st, int64_t value, int64_t aux
     c.op        = p.op;
     c.status    = st;
     c.errorCode = errorCode;
+    c.reserved0 = reserved0;   // GetTopicSchema: partitionCount (Phase 2b C)
     deliver_(p.target, c, payload, ov);
 }
 
@@ -1535,9 +1537,10 @@ TopicSchemaResult Client::getTopicSchemaAndWait(std::string_view name, uint64_t 
              [&](Completions& q, Token t) { return getTopicSchema(name, requestedFingerprint, q, t); },
              [&](const Completion& c, std::span<const uint8_t> p) {
                  if (c.status != OpStatus::BrokerError) throwForStatus_("getTopicSchema()", c, p);
-                 result.topicId   = static_cast<int32_t>(c.value);
-                 result.version   = static_cast<uint16_t>(c.aux);
-                 result.errorCode = c.errorCode;
+                 result.topicId        = static_cast<int32_t>(c.value);
+                 result.version        = static_cast<uint16_t>(c.aux);
+                 result.errorCode      = c.errorCode;
+                 result.partitionCount = static_cast<int32_t>(c.reserved0);  // Phase 2b C
                  if (c.status == OpStatus::Ok) result.descriptorBlob.assign(p.begin(), p.end());
              });
     return result;
@@ -2671,7 +2674,8 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 opt->descriptorBlob, (opt->descriptorBlob != nullptr) ? opt->descriptorLen : 0u);
             completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
                          opt->topicId, opt->version, opt->errorCode, blob,
-                         detail::CompletionRing::Overflow::TooLarge);
+                         detail::CompletionRing::Overflow::TooLarge,
+                         static_cast<uint32_t>(opt->partitionCount));  // Phase 2b C (<=0 = not reported)
         }
         break;
     }

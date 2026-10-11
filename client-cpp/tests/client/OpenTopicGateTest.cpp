@@ -82,6 +82,8 @@ struct GateGateway {
     uint16_t             getVersion   = 1;
     uint16_t             getErrorCode = 0;
     std::vector<uint8_t> getBlob;
+    int32_t              getPartitionCount = 0;    // Phase 2b C: trailing partitionCount
+    bool                 omitPartitionCount = false; // simulate a pre-2b broker (no trailing i32)
 
     // Task 19: fingerprint-selecting GetTopicSchema responses (the broker's
     // Task 13/18 behavior).  A nonzero requestedFingerprint is looked up in
@@ -93,6 +95,7 @@ struct GateGateway {
         int32_t               topicId;
         uint16_t              version;
         std::vector<uint8_t>  blob;
+        int32_t               partitionCount = 0;   // Phase 2b C
     };
     std::map<uint64_t, FingerprintOverride> fingerprintOverrides;
     uint16_t unknownFingerprintErrorCode = 1;  // any nonzero "not found" code
@@ -194,6 +197,7 @@ struct GateGateway {
                     resp.errorCode      = 0;
                     resp.descriptorBlob = it->second.blob.data();
                     resp.descriptorLen  = static_cast<uint32_t>(it->second.blob.size());
+                    resp.partitionCount = it->second.partitionCount;
                 } else {
                     resp.topicId        = -1;
                     resp.version        = 0;
@@ -207,11 +211,13 @@ struct GateGateway {
                 resp.errorCode      = getErrorCode;
                 resp.descriptorBlob = getBlob.data();
                 resp.descriptorLen  = static_cast<uint32_t>(getBlob.size());
+                resp.partitionCount = getPartitionCount;
             }
 
             std::vector<uint8_t> scratch(resp.encodedSize() + 32u);
             const std::size_t n = resp.encode(scratch.data());
-            if (n > 0) sendFrame(scratch.data(), n);
+            // A pre-2b broker's frame stops after the descriptor blob.
+            if (n > 0) sendFrame(scratch.data(), omitPartitionCount ? n - 4u : n);
             break;
         }
 
@@ -877,4 +883,58 @@ TEST(OpenTopicGate, LineageUnknownFingerprintStillThrowsRegression) {
     EXPECT_THROW((void)h.client->openTopicAndWait<StubLineageUnknown>("characters"), std::runtime_error)
         << "openTopicAndWait must throw when the broker's full lineage table "
            "still has no version matching T::kFingerprint";
+}
+
+// ===========================================================================
+// Phase 2b Part C — the broker-reported partition count reaches the client:
+// TopicSchemaResponse trailing partitionCount -> Completion.reserved0 ->
+// TopicSchemaResult.partitionCount.
+// ===========================================================================
+TEST(OpenTopicGateRegression, GetTopicSchemaReportsBrokerPartitionCount) {
+    GateHarness h(1316, 1317);
+    h.build();
+    h.connectAndWait();
+
+    h.gw->getBlob           = serialize(makeCharsDescriptor());
+    h.gw->getTopicId        = 0x40000001;
+    h.gw->getVersion        = 1;
+    h.gw->getErrorCode      = 0;
+    h.gw->getPartitionCount = 8;
+
+    // Token form: the completion itself carries it in reserved0.
+    test_support::TestCq cq(*h.client);
+    auto fut = cq.issue([&](rune::client::Completions& q, rune::client::Token t) {
+        return h.client->getTopicSchema("characters", q, t);
+    });
+    h.pumpUntil([&]() { return fut.ready(); });
+    ASSERT_TRUE(fut.waitReady());
+    ASSERT_TRUE(fut.ok()) << fut.describe();
+    EXPECT_EQ(fut.outcome().c.reserved0, 8u);
+    EXPECT_EQ(fut.schemaResult().partitionCount, 8);
+
+    // *AndWait form.
+    GateGatewayPump pump(*h.gw);
+    const TopicSchemaResult r = h.client->getTopicSchemaAndWait("characters");
+    EXPECT_EQ(r.errorCode, 0u);
+    EXPECT_EQ(r.topicId, 0x40000001);
+    EXPECT_EQ(r.partitionCount, 8);
+}
+
+TEST(OpenTopicGateRegression, PreTwoBBrokerReportsZeroPartitionCount) {
+    GateHarness h(1318, 1319);
+    h.build();
+    h.connectAndWait();
+
+    h.gw->getBlob            = serialize(makeCharsDescriptor());
+    h.gw->getTopicId         = 0x40000001;
+    h.gw->getVersion         = 1;
+    h.gw->getErrorCode       = 0;
+    h.gw->getPartitionCount  = 8;      // encoded, then cut off below
+    h.gw->omitPartitionCount = true;   // the 40-byte pre-2b frame
+
+    GateGatewayPump pump(*h.gw);
+    const TopicSchemaResult r = h.client->getTopicSchemaAndWait("characters");
+    EXPECT_EQ(r.errorCode, 0u);
+    EXPECT_FALSE(r.descriptorBlob.empty()) << "the pre-2b frame must still decode fully";
+    EXPECT_EQ(r.partitionCount, 0) << "not reported -> 0, never garbage";
 }

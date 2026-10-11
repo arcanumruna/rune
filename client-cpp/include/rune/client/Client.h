@@ -94,6 +94,9 @@ struct TopicSchemaResult {
     uint16_t             version   = 0;
     std::vector<uint8_t> descriptorBlob;
     uint16_t             errorCode = 0;
+    /// Phase 2b Part C: the topic's partition count as reported by the broker
+    /// (TopicSchemaResponse trailing field); 0 = not reported (pre-2b broker).
+    int32_t              partitionCount = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -554,7 +557,9 @@ public:
     //                  response -> BrokerError (errorCode, value/aux kept).
     //   GetTopicSchema value = topicId, aux = version, payload = descriptor
     //                  blob (polled form: up to maxResultBytes, else
-    //                  ResultTooLarge with value = the real size).
+    //                  ResultTooLarge with value = the real size),
+    //                  reserved0 = the topic's partitionCount (Phase 2b; 0 =
+    //                  not reported by a pre-2b broker).
     //   ListTopics     payload = encodeTopicList() of the topics defined
     //                  through this Client (decodeTopicList()).
     // A not-Connected session is decided on the duty thread: NotConnected.
@@ -987,7 +992,8 @@ private:
     void applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> frame);
     void completeCtl_(PendingCtl& p, OpStatus st, int64_t value = 0, int64_t aux = 0,
                       uint16_t errorCode = 0, std::span<const uint8_t> payload = {},
-                      detail::CompletionRing::Overflow ov = detail::CompletionRing::Overflow::Truncate);
+                      detail::CompletionRing::Overflow ov = detail::CompletionRing::Overflow::Truncate,
+                      uint32_t reserved0 = 0);
     /// Remove pendingCtl_[i] (swap-remove) and return it (delivery happens
     /// after removal: a handler may issue a new op).
     PendingCtl takeCtl_(std::size_t i);
