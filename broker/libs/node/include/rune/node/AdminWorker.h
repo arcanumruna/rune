@@ -209,6 +209,15 @@ private:
     // Rebuild the SchemaRegistry from [0, HW) of the schema replica.
     void rebuildFromLog_();
 
+    // Task 19b (restart recovery): the view counterpart of rebuildFromLog_, on
+    // the SAME Follower->Leader edge.  Rebuild the ViewRegistry from [0, HW) of
+    // the __views replica, then — for every durable view — re-register its
+    // output schema in reg_ and fan out a RECOVERY install to the workers via
+    // deps_.pushViewPlan (the SAME admin->control->worker path CreateView uses).
+    // __views has no other recovery hook (unlike __topic_schemas), and this runs
+    // AFTER rebuildFromLog_ so the source descriptors already resolve in reg_.
+    void recoverViewsOnPromotion_();
+
     // Advance the in-flight DDL if possible.  Returns true if work was done.
     bool advance_(int64_t nowNs);
 

@@ -91,6 +91,9 @@ void AdminWorker::onRole(const AdminRoleMsg& role) {
                     "missing versions past the corrupt record. See the prior "
                     "CORRUPT __topic_schemas record log line.", role.epoch);
             }
+            // Task 19b: now that reg_ is rebuilt (sources resolve), recover the
+            // durable view catalog from __views and fan out recovery installs.
+            recoverViewsOnPromotion_();
             wasLeader_ = true;
         }
     } else {
@@ -789,6 +792,129 @@ void AdminWorker::rebuildFromLog_() {
         fetchOffset = lastBatchEnd;
     }
     spdlog::info("AdminWorker: rebuilt SchemaRegistry from __topic_schemas log (hw={})", hw);
+}
+
+// ─── recoverViewsOnPromotion_ — rebuild ViewRegistry + fan out recovery ───────
+// The view counterpart of rebuildFromLog_, on the SAME Follower->Leader edge.
+void AdminWorker::recoverViewsOnPromotion_() {
+    if (!viewsReplica_ || !viewRegistry_) return;
+
+    // 1. Rebuild the ViewRegistry from the committed __views log [0, HW).
+    //    HW is now > 0 (the views replica was promoted on this same edge, just
+    //    above in onRole), unlike at construction where a fresh Follower is 0.
+    const rune::replication::Offset hw = viewsReplica_->highWatermark();
+    if (hw > 0) {
+        static constexpr int32_t kChunk = 64 * 1024 * 1024;
+        rune::replication::Offset fetchOffset = 0;
+        bool failed = false;
+        while (fetchOffset < hw && !failed) {
+            std::vector<uint8_t> data = viewsReplica_->read(fetchOffset, kChunk);
+            if (data.empty()) break;
+            std::size_t pos = 0;
+            rune::replication::Offset lastBatchEnd = fetchOffset;
+            while (pos < data.size()) {
+                const uint8_t*    bs  = data.data() + pos;
+                const std::size_t rem = data.size() - pos;
+                if (rem < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead))
+                    break;
+                rune::protocol::RecordBatchReader reader(bs, rem);
+                if (!reader.ensureValid()) break;
+                const int32_t tl = reader.totalLength();
+                if (tl <= 0 || static_cast<std::size_t>(tl) > rem) break;
+                const rune::replication::Offset batchBase = reader.baseOffset();
+                reader.forEachRecord([this, batchBase, &failed](std::string_view /*key*/,
+                                      std::string_view val, int64_t /*off*/, int64_t /*ts*/) {
+                    auto vr = ViewRecord::deserialize(std::span<const uint8_t>(
+                        reinterpret_cast<const uint8_t*>(val.data()), val.size()));
+                    if (vr) { viewRegistry_->applyRecord(*vr); return; }
+                    // FAIL LOUD (mirrors rebuildFromLog_): a corrupt __views record
+                    // would otherwise leave an undetected catalog gap.
+                    failed = true;
+                    spdlog::critical(
+                        "AdminWorker: CORRUPT __views record at batch baseOffset={} — "
+                        "ViewRecord::deserialize failed; ABORTING __views rebuild "
+                        "rather than silently skipping (would leave a view-catalog gap).",
+                        batchBase);
+                });
+                if (failed) break;
+                const rune::replication::Offset bne =
+                    reader.baseOffset() + reader.lastOffsetDelta() + 1;
+                if (bne > lastBatchEnd) lastBatchEnd = bne;
+                pos += static_cast<std::size_t>(tl);
+            }
+            if (lastBatchEnd <= fetchOffset) break;
+            fetchOffset = lastBatchEnd;
+        }
+        if (failed) return;  // surfaced loudly above; do not fan out a partial catalog
+    }
+
+    // 2. For each recovered durable view: re-register its OUTPUT schema in reg_
+    //    (so GetTopicSchema / openView keep working after restart) and fan out a
+    //    RECOVERY install (recovery=true) via the SAME path CreateView uses.
+    int recovered = 0;
+    for (const ViewRecord* rec : viewRegistry_->all()) {
+        if (rec == nullptr) continue;
+
+        auto plan = rune::view::deserializeCompiledViewPlan(
+            std::span<const uint8_t>(rec->compiledPlanBlob.data(), rec->compiledPlanBlob.size()));
+        if (!plan || plan->sourceTopicId.empty()) {
+            spdlog::error("AdminWorker: view '{}' (id={}) skipped on recovery — compiled "
+                          "plan missing/un-deserializable", rec->viewName, rec->viewTopicId);
+            continue;
+        }
+        const int32_t sourceTopicId = plan->sourceTopicId[0];
+        const RegistryEntry* srcEntry = reg_.byId(sourceTopicId);
+        if (srcEntry == nullptr) {
+            spdlog::error("AdminWorker: view '{}' (id={}) skipped on recovery — source topic "
+                          "{} not found in SchemaRegistry", rec->viewName, rec->viewTopicId,
+                          sourceTopicId);
+            continue;
+        }
+
+        // Re-register the view's typed OUTPUT topic from the durable blob (exact
+        // bytes -> exact fingerprint), mirroring commitCreateView_.
+        if (!rec->outputDescriptorBlob.empty() && reg_.byId(rec->viewTopicId) == nullptr) {
+            try {
+                const rune::codec::Descriptor outDesc = rune::codec::deserialize(
+                    std::span<const uint8_t>(rec->outputDescriptorBlob.data(),
+                                             rec->outputDescriptorBlob.size()));
+                TopicSchema ts;
+                ts.topicId        = rec->viewTopicId;
+                ts.version        = kInitialSchemaVersion;
+                ts.partitionCount = srcEntry->partitionCount;
+                ts.validate       = false;
+                ts.descriptorBlob = rec->outputDescriptorBlob;
+                ts.nextTag        = static_cast<uint16_t>(outDesc.fields.size());
+                for (const auto& f : outDesc.fields) {
+                    if (f.isKey) { ts.keyField = f.name; break; }
+                }
+                reg_.applyRecord(ts);
+            } catch (const std::exception& ex) {
+                spdlog::error("AdminWorker: view '{}' (id={}) output descriptor failed to "
+                              "re-register on recovery: {}", rec->viewName, rec->viewTopicId,
+                              ex.what());
+                // Continue: the worker still serves rows (fingerprint + layout come
+                // from the plan); only GetTopicSchema is affected.
+            }
+        }
+
+        // Fan out a RECOVERY install — installViewForRecovery on each worker's own
+        // thread, which loads the checkpoint + rebuilds to the committed tail.
+        if (deps_.pushViewPlan) {
+            ViewPlanUpdateMsg vp;
+            vp.viewTopicId = rec->viewTopicId;
+            vp.persistence = rec->persistence;
+            vp.recovery    = true;
+            vp.planBlob    = rec->compiledPlanBlob;
+            vp.outDescBlob = rec->outputDescriptorBlob;
+            vp.srcDescBlob = rune::codec::serialize(srcEntry->descriptor);
+            deps_.pushViewPlan(vp);
+        }
+        ++recovered;
+    }
+    if (recovered > 0)
+        spdlog::info("AdminWorker: recovered {} durable view(s) on promotion "
+                     "(ViewRegistry rebuild + recovery fanout)", recovered);
 }
 
 } // namespace rune::node
