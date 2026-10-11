@@ -56,6 +56,11 @@ struct FoldStats {
     // zero-padded -- counted and skipped instead, so a malformed key is
     // observable rather than silently mis-keying a row.
     uint64_t skippedMalformed = 0;
+    // Phase 2a aggregate views: a live record whose group-by value is absent
+    // (its old contribution, if any, is retracted; nothing is added).
+    uint64_t skippedNoGroup   = 0;
+    // An output Sum that did not fit its type was written NULL (never wrapped).
+    uint64_t aggOverflow      = 0;
 };
 
 // Folds every COMMITTED record (offset < bound) in `view` -- a LogReadView
