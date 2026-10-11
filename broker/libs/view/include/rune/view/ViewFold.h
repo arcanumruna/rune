@@ -62,7 +62,7 @@ struct FoldStats {
     // Output values written NULL because a Sum did not fit its type (never
     // wrapped). Counted per emit, not per overflow event.
     uint64_t aggOverflow      = 0;
-    uint64_t aggNonFinite     = 0;  // a NaN/+-Inf Float aggregate input was treated as NULL
+    uint64_t aggNonFinite     = 0;  // a NaN/+-Inf Float aggregate input was treated as NULL (counted per Float input)
     // A retraction found missing/zero state (group row absent or a count already
     // 0): counted and skipped with no mutation, never masked.
     uint64_t aggInconsistent  = 0;

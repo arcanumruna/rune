@@ -2,8 +2,8 @@
 
 #include <climits>
 #include <cmath>
-#include <limits>
 #include <cstring>
+#include <limits>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -290,17 +290,19 @@ TEST(AggFoldRegression, UnsignedSumRetractsOnUpdateAndTombstoneRegression) {
 }
 
 TEST(AggFoldRegression, FloatAccumulatorResetsWhenLastNonNullLeavesRegression) {
+    // 1e16 + 1.0 == 1e16 in double (ulp is 2), so retracting 1e16 then 1.0
+    // leaves -1.0 without the reset; a later +1.0 would then read 0.0, not 1.0.
     Harness h;
-    h.put(9, orderV2(9, 100, 1, 1));            // keeps group alive; price 1.0 ...
-    h.put(9, orderV1(9, 100, 1, 1, std::nan(""))); // ... replaced by NULL price (NaN -> NULL)
-    h.put(1, orderV1(1, 100, 1, 1, 0.1));
-    h.put(2, orderV1(2, 100, 1, 1, 0.2));
+    h.put(9, orderV1(9, 100, 1, 1, std::nan("")));   // NULL price: keeps the group alive
+    h.put(1, orderV1(1, 100, 1, 1, 1e16));
+    h.put(2, orderV1(2, 100, 1, 1, 1.0));
     h.put(1, tombstone());
     h.put(2, tombstone());
+    EXPECT_EQ(h.col(100, kN).i, 1);
     EXPECT_FALSE(h.col(100, kPriceAvg).present);
-    h.put(3, orderV1(3, 100, 1, 1, 5.0));
+    h.put(3, orderV1(3, 100, 1, 1, 1.0));
     EXPECT_TRUE(h.col(100, kPriceAvg).present);
-    EXPECT_EQ(h.col(100, kPriceAvg).f, 5.0) << "no 0.1+0.2-0.1-0.2 residual";
+    EXPECT_EQ(h.col(100, kPriceAvg).f, 1.0) << "accumulator must restart at exactly 0.0";
 }
 
 TEST(AggFoldRegression, NonFiniteFloatInputIsNullAndCountedRegression) {
