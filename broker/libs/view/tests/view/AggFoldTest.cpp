@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <climits>
+#include <cmath>
+#include <limits>
 #include <cstring>
 #include <string_view>
 #include <utility>
@@ -269,4 +271,86 @@ TEST(AggFoldRegression, MissingGroupValueRetractsAndSkips) {
     EXPECT_EQ(st.skippedNoGroup, 1u);
     EXPECT_EQ(view.get(100), nullptr) << "the contributor left its group, which is now empty";
     EXPECT_EQ(contributors.size(), 0u);
+}
+
+// ---- Task 4 fix round 1 ----
+
+TEST(AggFoldRegression, UnsignedSumRetractsOnUpdateAndTombstoneRegression) {
+    // u64 overflow-then-recover is not covered here: qty is UInt32, so no
+    // realistic contributor count can overflow the u64 output; the Unsigned
+    // int128 path is exercised for exact retraction instead.
+    Harness h;
+    h.put(1, orderV1(1, 100, 1, 4000000000u));
+    h.put(2, orderV1(2, 100, 1, 4000000000u));
+    EXPECT_EQ(h.col(100, kQtySum).u, 8000000000ull);
+    h.put(2, orderV1(2, 100, 1, 7u));
+    EXPECT_EQ(h.col(100, kQtySum).u, 4000000007ull);
+    h.put(1, tombstone());
+    EXPECT_EQ(h.col(100, kQtySum).u, 7u);
+}
+
+TEST(AggFoldRegression, FloatAccumulatorResetsWhenLastNonNullLeavesRegression) {
+    Harness h;
+    h.put(9, orderV2(9, 100, 1, 1));            // keeps group alive; price 1.0 ...
+    h.put(9, orderV1(9, 100, 1, 1, std::nan(""))); // ... replaced by NULL price (NaN -> NULL)
+    h.put(1, orderV1(1, 100, 1, 1, 0.1));
+    h.put(2, orderV1(2, 100, 1, 1, 0.2));
+    h.put(1, tombstone());
+    h.put(2, tombstone());
+    EXPECT_FALSE(h.col(100, kPriceAvg).present);
+    h.put(3, orderV1(3, 100, 1, 1, 5.0));
+    EXPECT_TRUE(h.col(100, kPriceAvg).present);
+    EXPECT_EQ(h.col(100, kPriceAvg).f, 5.0) << "no 0.1+0.2-0.1-0.2 residual";
+}
+
+TEST(AggFoldRegression, NonFiniteFloatInputIsNullAndCountedRegression) {
+    Harness h;
+    h.put(1, orderV1(1, 100, 1, 1, 2.0));
+    h.put(2, orderV1(2, 100, 1, 1, std::numeric_limits<double>::quiet_NaN()));
+    EXPECT_GT(h.last.aggNonFinite, 0u);
+    h.put(4, orderV1(4, 100, 1, 1, std::numeric_limits<double>::infinity()));
+    EXPECT_GT(h.last.aggNonFinite, 0u);
+    h.put(3, orderV1(3, 100, 1, 1, 4.0));
+    EXPECT_DOUBLE_EQ(h.col(100, kPriceAvg).f, 3.0);
+    EXPECT_TRUE(std::isfinite(h.col(100, kPriceAvg).f));
+    h.put(1, tombstone());
+    EXPECT_DOUBLE_EQ(h.col(100, kPriceAvg).f, 4.0);
+    EXPECT_EQ(h.col(100, kN).i, 3);
+}
+
+TEST(AggFoldRegression, UpdateTogglesBonusNullAndNonNullRegression) {
+    Harness h;
+    h.put(1, orderV1(1, 100, 10));                 // bonus NULL
+    EXPECT_EQ(h.col(100, kBonusCnt).i, 0);
+    EXPECT_FALSE(h.col(100, kBonusSum).present);
+    h.put(1, orderV2(1, 100, 10, 7));              // NULL -> 7
+    EXPECT_EQ(h.col(100, kBonusCnt).i, 1);
+    EXPECT_EQ(h.col(100, kBonusSum).i, 7);
+    EXPECT_EQ(h.col(100, kN).i, 1);
+    h.put(1, orderV1(1, 100, 10));                 // 7 -> NULL
+    EXPECT_EQ(h.col(100, kBonusCnt).i, 0);
+    EXPECT_FALSE(h.col(100, kBonusSum).present);
+    EXPECT_EQ(h.col(100, kN).i, 1);
+}
+
+TEST(AggFoldRegression, InconsistentRetractionIsCountedNotMaskedRegression) {
+    {
+        Harness h;
+        h.put(1, orderV1(1, 100, 10));
+        ASSERT_TRUE(h.groups.erase(100));
+        h.put(1, tombstone());
+        EXPECT_EQ(h.last.aggInconsistent, 1u);
+        EXPECT_EQ(h.groups.get(100), nullptr) << "no phantom group row";
+        EXPECT_EQ(h.groups.size(), 0u);
+        EXPECT_EQ(h.contributors.size(), 0u) << "the contributor is still erased";
+    }
+    {
+        Harness h;
+        h.put(1, orderV1(1, 100, 10));
+        ASSERT_TRUE(h.groups.erase(100));
+        h.put(1, orderV1(1, 100, 50));              // update: bad retract, then clean add
+        EXPECT_EQ(h.last.aggInconsistent, 1u);
+        EXPECT_EQ(h.col(100, kN).i, 1);
+        EXPECT_EQ(h.col(100, kTotal).i, 50);
+    }
 }

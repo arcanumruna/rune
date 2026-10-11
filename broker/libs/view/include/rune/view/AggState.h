@@ -23,6 +23,12 @@ namespace rune::view {
 // True iff any output column is an aggregate (anything but Replace).
 bool isAggregateView(const CompiledViewPlan& plan) noexcept;
 
+// Precision: integer Sum/Avg accumulate in int128 and are exact under
+// retraction. Float Sum/Avg under retraction are approximate (catastrophic
+// cancellation is possible when magnitudes are mixed); the accumulator resets
+// to 0.0 when the last non-null input leaves, and NaN/+-Inf inputs are treated
+// as NULL so accumulators stay finite.
+
 // The numeric domain a Sum/Avg input accumulates in.
 enum class AccKind : uint8_t { None, Signed, Unsigned, Float };
 

@@ -59,8 +59,13 @@ struct FoldStats {
     // Phase 2a aggregate views: a live record whose group-by value is absent
     // (its old contribution, if any, is retracted; nothing is added).
     uint64_t skippedNoGroup   = 0;
-    // An output Sum that did not fit its type was written NULL (never wrapped).
+    // Output values written NULL because a Sum did not fit its type (never
+    // wrapped). Counted per emit, not per overflow event.
     uint64_t aggOverflow      = 0;
+    uint64_t aggNonFinite     = 0;  // a NaN/+-Inf Float aggregate input was treated as NULL
+    // A retraction found missing/zero state (group row absent or a count already
+    // 0): counted and skipped with no mutation, never masked.
+    uint64_t aggInconsistent  = 0;
 };
 
 // Folds every COMMITTED record (offset < bound) in `view` -- a LogReadView

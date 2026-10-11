@@ -2,6 +2,7 @@
 #include <rune/view/AggFold.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <span>
@@ -44,18 +45,31 @@ struct Ctx {
     }
 
     // Applies one contributor row to its group: sign = +1 add, -1 retract.
-    // Returns the group row (never null).
+    // Add: returns the group row (created if new). Retract: returns nullptr and
+    // counts aggInconsistent -- touching nothing -- if the group row is missing
+    // or any count would underflow (checked BEFORE mutating).
     uint8_t* applyContribution(const uint8_t* c, int sign) noexcept {
         const uint64_t g = loadU64(c);
-        uint8_t* gr = groups.put(g);
+        if (sign < 0) {
+            const uint8_t* cur = groups.get(g);
+            bool bad = cur == nullptr || loadU64(cur) == 0;
+            for (size_t i = 0; !bad && i < agg.fields.size(); ++i) {
+                const AggField& f = agg.fields[i];
+                if (f.input == kNoSourceField || nullBit(c, agg.contribNullOff, f.input)) continue;
+                if (loadU64(cur + agg.groupNonNullOff + 8 * i) == 0) bad = true;
+            }
+            if (bad) { ++stats.aggInconsistent; return nullptr; }
+        }
+        uint8_t* gr = groups.put(g);   // retract: returns the existing row
         const uint64_t n = loadU64(gr);
-        storeU64(gr, sign > 0 ? n + 1 : (n > 0 ? n - 1 : 0));
+        storeU64(gr, sign > 0 ? n + 1 : n - 1);
         for (size_t i = 0; i < agg.fields.size(); ++i) {
             const AggField& f = agg.fields[i];
             if (f.input == kNoSourceField) continue;                 // CountAll
             if (nullBit(c, agg.contribNullOff, f.input)) continue;   // nulls contribute nothing
             const uint64_t nnv = loadU64(nn(gr, i));
-            storeU64(nn(gr, i), sign > 0 ? nnv + 1 : (nnv > 0 ? nnv - 1 : 0));
+            const uint64_t nnNew = sign > 0 ? nnv + 1 : nnv - 1;
+            storeU64(nn(gr, i), nnNew);
             const uint8_t* v = val(c, f.input);
             switch (f.kind) {
                 case AccKind::Signed: {
@@ -73,7 +87,9 @@ struct Ctx {
                 case AccKind::Float: {
                     const double x = loadF64(v);
                     const double a = loadF64(acc(gr, i));
-                    storeF64(acc(gr, i), sign > 0 ? a + x : a - x);
+                    // Last non-null contributor gone: reset to exactly 0.0 (no
+                    // cancellation residual carried into the next contributor).
+                    storeF64(acc(gr, i), nnNew == 0 ? 0.0 : (sign > 0 ? a + x : a - x));
                     break;
                 }
                 case AccKind::None: break;   // Count(col): non-null count only
@@ -152,6 +168,7 @@ struct Ctx {
     uint64_t retract(const uint8_t* c, bool dropIfEmpty) noexcept {
         const uint64_t g = loadU64(c);
         uint8_t* gr = applyContribution(c, -1);
+        if (gr == nullptr) return g;   // inconsistent: counted, nothing changed
         if (loadU64(gr) == 0) {
             if (dropIfEmpty) dropGroup(g);
         } else {
@@ -222,7 +239,11 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
             storeU64(cr, g);
             for (const AggField& f : agg.fields) {
                 if (f.input == kNoSourceField) continue;
-                const FieldValue in = rune::codec::readField(d, asBytes(value), f.srcFieldId);
+                FieldValue in = rune::codec::readField(d, asBytes(value), f.srcFieldId);
+                if (in.present && f.kind == AccKind::Float && !std::isfinite(in.f)) {
+                    in.present = false;   // NaN/Inf is treated as NULL
+                    ++stats.aggNonFinite;
+                }
                 setNullBit(cr, agg.contribNullOff, f.input, !in.present);
                 uint8_t* dst = cr + agg.contribValOff + 8u * f.input;
                 if (!in.present)                  { storeU64(dst, 0); }
