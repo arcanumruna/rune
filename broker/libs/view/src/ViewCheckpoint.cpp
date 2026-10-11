@@ -135,4 +135,99 @@ int64_t replay(ViewTable& table, const RowLayout& layout, std::span<const uint8_
     return recovered;
 }
 
+size_t encodeMultiDelta(std::span<const TableDelta> tables, int64_t O,
+                        std::vector<uint8_t>& out) {
+    const size_t start = out.size();
+    appendLE32(out, kViewCheckpointMagicV2);
+    appendLE64(out, static_cast<uint64_t>(O));
+    out.push_back(static_cast<uint8_t>(tables.size()));
+    for (const TableDelta& t : tables) {
+        out.push_back(t.tableId);
+        appendLE32(out, t.rowLen);
+        appendLE32(out, static_cast<uint32_t>(t.entries.size()));
+        for (const DirtyEntry& e : t.entries) {
+            appendLE32(out, e.rid);
+            out.push_back(e.deleted ? uint8_t{1} : uint8_t{0});
+            appendLE64(out, e.key);
+            if (!e.deleted) out.insert(out.end(), e.row, e.row + t.rowLen);
+        }
+    }
+    appendLE32(out, rune::protocol::crc32c(out.data() + start, out.size() - start));
+    return out.size() - start;
+}
+
+std::optional<AppliedDelta> applyMultiDelta(std::span<ViewTable* const> tables,
+                                            std::span<const uint32_t> rowLens,
+                                            std::span<const uint8_t> b) {
+    constexpr size_t kHdr = 4 + 8 + 1, kTbl = 1 + 4 + 4, kEnt = 4 + 1 + 8, kCrc = 4;
+    if (tables.size() != rowLens.size() || tables.size() > 64) return std::nullopt;
+    if (b.size() < kHdr + kCrc) return std::nullopt;
+    const uint8_t* p = b.data();
+    if (readLE32(p) != kViewCheckpointMagicV2) return std::nullopt;
+    const int64_t O = static_cast<int64_t>(readLE64(p + 4));
+    const uint8_t tableCount = p[12];
+
+    // Pass 1: validate, never mutating.
+    size_t pos = kHdr;
+    uint64_t seen = 0;
+    uint32_t total = 0;
+    for (uint8_t t = 0; t < tableCount; ++t) {
+        if (pos + kTbl > b.size()) return std::nullopt;
+        const uint8_t  id     = p[pos];
+        const uint32_t rowLen = readLE32(p + pos + 1);
+        const uint32_t count  = readLE32(p + pos + 5);
+        if (id >= tables.size() || rowLens[id] != rowLen || ((seen >> id) & 1u) != 0) {
+            return std::nullopt;
+        }
+        seen |= uint64_t{1} << id;
+        pos += kTbl;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (pos + kEnt > b.size()) return std::nullopt;
+            const uint8_t flags = p[pos + 4];
+            if (flags > 1) return std::nullopt;
+            pos += kEnt;
+            if (flags == 0) {
+                if (pos + rowLen > b.size()) return std::nullopt;
+                pos += rowLen;
+            }
+        }
+        total += count;
+    }
+    if (pos + kCrc != b.size()) return std::nullopt;
+    if (readLE32(p + pos) != rune::protocol::crc32c(p, pos)) return std::nullopt;
+
+    // Pass 2: apply.
+    pos = kHdr;
+    for (uint8_t t = 0; t < tableCount; ++t) {
+        const uint8_t  id     = p[pos];
+        const uint32_t rowLen = readLE32(p + pos + 1);
+        const uint32_t count  = readLE32(p + pos + 5);
+        pos += kTbl;
+        ViewTable& tbl = *tables[id];
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint8_t  flags = p[pos + 4];
+            const uint64_t key   = readLE64(p + pos + 5);
+            pos += kEnt;
+            if (flags == 1) {
+                tbl.erase(key);
+            } else {
+                std::memcpy(tbl.put(key), p + pos, rowLen);
+                pos += rowLen;
+            }
+        }
+    }
+    return AppliedDelta{O, total};
+}
+
+int64_t replayMulti(std::span<ViewTable* const> tables, std::span<const uint32_t> rowLens,
+                    std::span<const std::span<const uint8_t>> recordsInOrder) {
+    int64_t last = -1;
+    for (const auto& rec : recordsInOrder) {
+        const auto applied = applyMultiDelta(tables, rowLens, rec);
+        if (!applied) break;
+        last = applied->O;
+    }
+    return last;
+}
+
 } // namespace rune::view

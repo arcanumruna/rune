@@ -1,6 +1,7 @@
 // libs/view/tests/view/ViewCheckpointTest.cpp
 #include <gtest/gtest.h>
 #include <rune/view/ViewCheckpoint.h>
+#include <rune/view/AggState.h>
 #include <rune/view/ViewTable.h>
 #include <rune/view/ViewRow.h>
 #include <rune/codec/Descriptor.h>
@@ -166,4 +167,90 @@ TEST(ViewCheckpoint, TruncatedOrBogusCountRejectedSafely) {
     EXPECT_FALSE(applyDelta(t2, L, badMagic).has_value());
 
     EXPECT_EQ(t2.get(1), nullptr) << "no rejected buffer may have mutated the table";
+}
+
+// ---- Phase 2a: multi-table (v2) record ----
+namespace {
+rune::view::RowLayout rawLayout(uint32_t rowLen) { rune::view::RowLayout l; l.rowLen = rowLen; return l; }
+
+std::vector<uint8_t> threeTableRecord(int64_t O, uint64_t viewKey, uint8_t viewByte,
+                                      uint64_t contribKey, uint8_t contribByte) {
+    uint8_t vrow[16]; std::memset(vrow, viewByte, 16);
+    uint8_t crow[24]; std::memset(crow, contribByte, 24);
+    const rune::view::DirtyEntry ve{0, false, viewKey, vrow};
+    const rune::view::DirtyEntry ce{0, false, contribKey, crow};
+    const rune::view::DirtyEntry gdel{0, true, 9, nullptr};
+    const rune::view::TableDelta tds[] = {
+        {rune::view::kAggTableView, 16, {&ve, 1}},
+        {rune::view::kAggTableContributors, 24, {&ce, 1}},
+        {rune::view::kAggTableGroups, 32, {&gdel, 1}}};
+    std::vector<uint8_t> out;
+    rune::view::encodeMultiDelta(tds, O, out);
+    return out;
+}
+} // namespace
+
+TEST(ViewCheckpointMulti, ThreeTableRecordRoundTrips) {
+    rune::view::ViewTable v(rawLayout(16)), c(rawLayout(24)), g(rawLayout(32));
+    std::memset(g.put(9), 0x5A, 32);   // pre-existing group row the record deletes
+    rune::view::ViewTable* tables[] = {&v, &c, &g};
+    const uint32_t lens[] = {16, 24, 32};
+    const auto rec = threeTableRecord(42, 7, 0x11, 8, 0x22);
+    const auto applied = rune::view::applyMultiDelta(tables, lens, rec);
+    ASSERT_TRUE(applied.has_value());
+    EXPECT_EQ(applied->O, 42);
+    EXPECT_EQ(applied->count, 3u);
+    ASSERT_NE(v.get(7), nullptr); EXPECT_EQ(v.get(7)[0], 0x11);
+    ASSERT_NE(c.get(8), nullptr); EXPECT_EQ(c.get(8)[23], 0x22);
+    EXPECT_EQ(g.get(9), nullptr);
+}
+
+TEST(ViewCheckpointMultiRegression, CorruptRecordMutatesNoTable) {
+    rune::view::ViewTable v(rawLayout(16)), c(rawLayout(24)), g(rawLayout(32));
+    rune::view::ViewTable* tables[] = {&v, &c, &g};
+    const uint32_t lens[] = {16, 24, 32};
+    auto rec = threeTableRecord(42, 7, 0x11, 8, 0x22);
+    rec[rec.size() - 1] ^= 0xFF;   // break the CRC
+    EXPECT_FALSE(rune::view::applyMultiDelta(tables, lens, rec).has_value());
+    EXPECT_EQ(v.size(), 0u); EXPECT_EQ(c.size(), 0u);
+}
+
+TEST(ViewCheckpointMultiRegression, RowLenMismatchUnknownOrDuplicateTableIsRejected) {
+    rune::view::ViewTable v(rawLayout(16)), c(rawLayout(24)), g(rawLayout(32));
+    rune::view::ViewTable* tables[] = {&v, &c, &g};
+    const auto rec = threeTableRecord(1, 1, 1, 1, 1);
+    const uint32_t wrongLens[] = {16, 25, 32};
+    EXPECT_FALSE(rune::view::applyMultiDelta(tables, wrongLens, rec).has_value());
+    rune::view::ViewTable* two[] = {&v, &c};          // table id 2 unknown here
+    const uint32_t twoLens[] = {16, 24};
+    EXPECT_FALSE(rune::view::applyMultiDelta(two, twoLens, rec).has_value());
+
+    uint8_t row[16] = {};
+    const rune::view::DirtyEntry e{0, false, 1, row};
+    const rune::view::TableDelta dup[] = {{0, 16, {&e, 1}}, {0, 16, {&e, 1}}};
+    std::vector<uint8_t> out;
+    rune::view::encodeMultiDelta(dup, 5, out);
+    const uint32_t lens[] = {16, 24, 32};
+    EXPECT_FALSE(rune::view::applyMultiDelta(tables, lens, out).has_value());
+}
+
+TEST(ViewCheckpointMultiRegression, ReplayStopsAtTornTailAllTablesAtSameOffset) {
+    rune::view::ViewTable v(rawLayout(16)), c(rawLayout(24)), g(rawLayout(32));
+    rune::view::ViewTable* tables[] = {&v, &c, &g};
+    const uint32_t lens[] = {16, 24, 32};
+    const auto r1 = threeTableRecord(10, 7, 0x11, 8, 0x22);
+    auto r2 = threeTableRecord(20, 7, 0x33, 8, 0x44);
+    r2.resize(r2.size() - 3);   // torn tail
+    const std::span<const uint8_t> recs[] = {r1, r2};
+    EXPECT_EQ(rune::view::replayMulti(tables, lens, recs), 10);
+    EXPECT_EQ(v.get(7)[0], 0x11) << "view table at O=10";
+    EXPECT_EQ(c.get(8)[0], 0x22) << "contributor table at the SAME O=10";
+}
+
+TEST(ViewCheckpointMulti, OffsetIsAtByteFourLikeV1) {
+    const auto rec = threeTableRecord(0x0102030405060708LL, 1, 1, 1, 1);
+    int64_t O; std::memcpy(&O, rec.data() + 4, 8);
+    EXPECT_EQ(O, 0x0102030405060708LL);
+    uint32_t magic; std::memcpy(&magic, rec.data(), 4);
+    EXPECT_EQ(magic, rune::view::kViewCheckpointMagicV2);
 }

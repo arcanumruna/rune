@@ -97,4 +97,34 @@ std::optional<AppliedDelta> applyDelta(ViewTable& table, const RowLayout& layout
 int64_t replay(ViewTable& table, const RowLayout& layout, std::span<const uint8_t> base,
                std::span<const std::span<const uint8_t>> deltasInOrder);
 
+// Phase 2a: multi-table record (aggregate views checkpoint their output rows,
+// contributor map and group accumulators together, offset-atomic). Layout:
+//   [magic2 u32][O i64][tableCount u8]
+//   tableCount x { [tableId u8][rowLen u32][count u32]
+//                  count x { rid u32, flags u8, key u64, [rowLen bytes iff upsert] } }
+//   [crc32c u32]   -- over every preceding byte
+// O sits at byte 4 exactly like v1 (the snapshot IO agent peeks it there).
+inline constexpr uint32_t kViewCheckpointMagicV2 = 0x564B4332u; // "2CKV" little-endian ASCII
+
+struct TableDelta {
+    uint8_t                     tableId;
+    uint32_t                    rowLen;
+    std::span<const DirtyEntry> entries;
+};
+
+size_t encodeMultiDelta(std::span<const TableDelta> tables, int64_t O,
+                        std::vector<uint8_t>& out);
+
+// `record` must be exactly one v2 record. Validates everything (bounds, table
+// ids < tables.size(), each id at most once, rowLen == rowLens[id], CRC) BEFORE
+// mutating any table; then applies every table's entries. {O, total entries}.
+std::optional<AppliedDelta> applyMultiDelta(std::span<ViewTable* const> tables,
+                                            std::span<const uint32_t> rowLens,
+                                            std::span<const uint8_t> record);
+
+// Applies records in order, stopping at the first that fails; returns the last
+// applied O, or -1. All tables always reflect the SAME offset.
+int64_t replayMulti(std::span<ViewTable* const> tables, std::span<const uint32_t> rowLens,
+                    std::span<const std::span<const uint8_t>> recordsInOrder);
+
 } // namespace rune::view
