@@ -326,3 +326,37 @@ TEST(ViewFoldCorruptBreakRegression, CursorNeverAdvancesPastAnUnfoldedCorruptBat
     EXPECT_EQ(cur, 1) << "cursor must stop at the last FULLY folded batch, "
                           "not jump to min(nextOffset, bound)";
 }
+
+// REGRESSION (Task 7 fix round 1): a capped worker pass may stop at a bound
+// INSIDE a batch; the next pass reads the whole batch again (LogReadView is
+// whole batches) with cursor mid-batch.  Records below the cursor were already
+// folded and must be skipped, not re-applied (re-applying would also re-dirty
+// rows beyond the pass's delta-size budget).
+TEST(ViewFoldResumeRegression, MidBatchCursorSkipsAlreadyFoldedRecords) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(), srcs, 0x40000007).value();
+    rune::view::ViewTable t(comp.rowLayout);
+    rune::view::VersionDescriptorCache vdc(src);
+
+    rune::protocol::RecordBatchBuilder b(0, 0);
+    const auto k1 = keyBytes(1), k2 = keyBytes(2);
+    const auto v1 = encodeCharacter(1, 10, 1), v2 = encodeCharacter(2, 20, 1);
+    b.append(asSv(k1), asSv(v1), 0);
+    b.append(asSv(k2), asSv(v2), 0);
+    const auto batch = b.build();
+    const rune::storage::LogReadView lv{batch.data(), batch.size(), 0, 2};
+
+    int64_t cur = 0;
+    auto s0 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, lv, /*bound*/ 1, cur);
+    EXPECT_EQ(s0.applied, 1u);
+    EXPECT_EQ(cur, 1);
+    t.drainDirty([](uint32_t, const uint8_t*, bool, uint64_t) {});
+
+    auto s1 = rune::view::foldBatch(comp.plan, comp.rowLayout, vdc, t, lv, /*bound*/ 2, cur);
+    EXPECT_EQ(s1.applied, 1u) << "record 0 (below the cursor) must not be re-folded";
+    EXPECT_EQ(cur, 2);
+    int dirty = 0;
+    t.drainDirty([&](uint32_t, const uint8_t*, bool, uint64_t key) { ++dirty; EXPECT_EQ(key, 2u); });
+    EXPECT_EQ(dirty, 1);
+}

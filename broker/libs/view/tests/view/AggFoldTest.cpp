@@ -356,3 +356,31 @@ TEST(AggFoldRegression, InconsistentRetractionIsCountedNotMaskedRegression) {
         EXPECT_EQ(h.col(100, kTotal).i, 50);
     }
 }
+
+// REGRESSION (Task 7 fix round 1): resuming with the cursor INSIDE a batch must
+// skip the batch's already-folded records (see ViewFoldResumeRegression).
+TEST(AggFoldRegression, MidBatchCursorSkipsAlreadyFoldedRecordsRegression) {
+    Harness h;
+    rune::protocol::RecordBatchBuilder b(0, 0);
+    const auto k1 = Harness::key(1), k2 = Harness::key(2);
+    const auto v1 = orderV1(1, 100, 10), v2 = orderV1(2, 100, 30);
+    auto sv = [](const std::vector<uint8_t>& x) {
+        return std::string_view(reinterpret_cast<const char*>(x.data()), x.size());
+    };
+    b.append(sv(k1), sv(v1), 0);
+    b.append(sv(k2), sv(v2), 0);
+    const auto batch = b.build();
+    const rune::storage::LogReadView lv{batch.data(), batch.size(), 0, 2};
+
+    int64_t cur = 0;
+    auto s0 = rune::view::foldAggregateBatch(h.comp.plan, h.comp.rowLayout, h.agg, h.vdc, h.view,
+                                             h.contributors, h.groups, lv, /*bound*/ 1, cur);
+    EXPECT_EQ(s0.applied, 1u);
+    EXPECT_EQ(cur, 1);
+    auto s1 = rune::view::foldAggregateBatch(h.comp.plan, h.comp.rowLayout, h.agg, h.vdc, h.view,
+                                             h.contributors, h.groups, lv, /*bound*/ 2, cur);
+    EXPECT_EQ(s1.applied, 1u) << "record 0 (below the cursor) must not be re-folded";
+    EXPECT_EQ(cur, 2);
+    EXPECT_EQ(h.col(100, kN).i, 2);
+    EXPECT_EQ(h.col(100, kTotal).i, 40);
+}

@@ -184,6 +184,9 @@ public:
     // extra entries here that drainDirty() itself knows how to skip/resolve.
     std::span<const uint32_t> dirtyRids() const noexcept { return dirtyList_; }
 
+    // Observability/test hook: erase()'d rows pending the next drainDirty().
+    std::size_t pendingDeleteCount() const noexcept { return deleted_.size(); }
+
 private:
     static constexpr uint8_t kEmpty = 0; // tag value for a never-used / vacated slot
     static constexpr uint8_t kTomb  = 1; // OLD-index tombstone: erased mid-migration, not re-migrated

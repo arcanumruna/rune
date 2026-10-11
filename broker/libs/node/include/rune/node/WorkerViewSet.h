@@ -129,6 +129,12 @@ struct ViewInstance {
     // Task 19).  Never mistake it for a durable/recoverable offset.
     int64_t                            lastEncodedO    = -1;
     bool                               persisted       = true;
+    // PERSISTED instances only: the most source records one fold pass may cover
+    // (bound' = min(bound, foldCursor + maxRecordsPerPass)), derived at creation
+    // from the delta ring's max message length so the pass's checkpoint delta
+    // ALWAYS fits one ring message (an oversized claim throws — it is not
+    // back-pressure).  0 == uncapped (transient: never checkpoints).
+    int64_t                            maxRecordsPerPass = 0;
 
     // Task 16 restart readiness of THIS (view, partition).  Defaults to Ready:
     // an instance created on the normal (non-recovery) driveFolds path is
@@ -366,17 +372,19 @@ public:
     // Count of installed view plans (partition-independent).
     [[nodiscard]] std::size_t viewCount() const noexcept { return templates_.size(); }
 
-    // Observability/test hook: pending dirty-tracking candidates across every
-    // table of the (view, partition) instance (0 if not hosted).  A transient
-    // instance must report 0 after each pass (its dirty state is discarded).
+    // Observability/test hook: pending dirty-tracking candidates (dirty rids +
+    // pending deletes) across every table of the (view, partition) instance (0
+    // if not hosted).  A transient instance must report 0 after each pass (its
+    // dirty state is discarded), as must any instance right after recovery.
     [[nodiscard]] std::size_t dirtyBacklog(int32_t viewTopicId, int32_t partition) const {
         auto it = views_.find(instKey(viewTopicId, partition));
         if (it == views_.end()) return 0;
         const ViewInstance& inst = it->second;
-        std::size_t n = inst.table.dirtyRids().size();
-        if (inst.agg) {
-            n += inst.agg->contributors.dirtyRids().size() + inst.agg->groups.dirtyRids().size();
-        }
+        auto pending = [](const rune::view::ViewTable& t) {
+            return t.dirtyRids().size() + t.pendingDeleteCount();
+        };
+        std::size_t n = pending(inst.table);
+        if (inst.agg) n += pending(inst.agg->contributors) + pending(inst.agg->groups);
         return n;
     }
 
@@ -485,16 +493,23 @@ private:
             inst.table.size() >= inst.plan.sizing.maxRows) {
             ++capacityExceeded_;
         }
-        const rune::storage::LogReadView view = readRange(inst.foldCursor, bound);
+        // Persisted: cap the pass so its delta fits one ring message (offsets
+        // are dense; control batches only make the cap conservative).  The
+        // fold resumes mid-batch correctly (records below foldCursor skipped).
+        const int64_t passBound =
+            inst.maxRecordsPerPass > 0
+                ? std::min(bound, inst.foldCursor + inst.maxRecordsPerPass)
+                : bound;
+        const rune::storage::LogReadView view = readRange(inst.foldCursor, passBound);
         if (view.empty()) return work;
 
         int64_t cursor = inst.foldCursor;
         const rune::view::FoldStats st =
             inst.agg ? rune::view::foldAggregateBatch(inst.plan, inst.layout, inst.agg->layout,
                                                       inst.vdc, inst.table, inst.agg->contributors,
-                                                      inst.agg->groups, view, bound, cursor)
+                                                      inst.agg->groups, view, passBound, cursor)
                      : rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view,
-                                             bound, cursor);
+                                             passBound, cursor);
         inst.foldCursor = cursor;
         work += static_cast<int>(st.applied + st.deleted + st.skippedControl +
                                  st.skippedMalformed + st.skippedNoGroup);
@@ -526,8 +541,11 @@ private:
     // Returns 1 if a delta was encoded this pass (changed rows), else 0.
     int buildAndPushCheckpoint_(ViewInstance& inst);
 
-    // Clear the dirty/deleted tracking of every table of a transient instance
-    // (nothing will ever encode it).  No allocation.
+    // Clear the dirty/deleted tracking of every table of an instance: every
+    // pass for a transient instance (nothing will ever encode it), and once
+    // after a recovery replay (the restored rows ARE the durable checkpoint —
+    // re-sending them would be a needless, possibly oversized delta).  No
+    // allocation.
     static void discardDirty_(ViewInstance& inst) noexcept {
         auto drop = [](uint32_t, const uint8_t*, bool, uint64_t) noexcept {};
         inst.table.drainDirty(drop);

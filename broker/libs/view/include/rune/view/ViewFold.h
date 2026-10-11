@@ -79,9 +79,12 @@ struct FoldStats {
 // merge identity. A live (non-tombstone) record is decoded against the
 // writer's OWN schema version (never the latest) and upserted (Phase 1: all
 // CompiledFields are Replace); a tombstone (empty value) erases its wire key.
-// Sets `cursor` to the offset the caller should resume from next time: the
-// highest offset actually folded, capped at `bound` -- NEVER past a batch
-// this call did not fully fold (see ViewFold.cpp for the early-break case).
+// `cursor` is IN/OUT: on entry, records with offset < cursor are skipped
+// (already folded -- `view` is whole batches, so a pass that stopped at a
+// mid-batch `bound` resumes inside that batch); on exit it is the offset the
+// caller should resume from next time: the highest offset actually folded,
+// capped at `bound` -- NEVER past a batch this call did not fully fold (see
+// ViewFold.cpp for the early-break case). foldAggregateBatch: same contract.
 FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
                      VersionDescriptorCache& vdc, ViewTable& table,
                      const rune::storage::LogReadView& view, int64_t bound,

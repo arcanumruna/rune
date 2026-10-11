@@ -48,6 +48,15 @@ namespace rune::view {
 
 inline constexpr uint32_t kViewCheckpointMagic = 0x564B4331u; // "1CKV" little-endian ASCII
 
+// Encoded-size constants (single source of truth for the codec AND for callers
+// that must bound a record's size before encoding it, e.g. the worker's
+// per-pass fold cap that keeps a delta within its ring's max message length).
+inline constexpr std::size_t kCheckpointEntryHeaderBytes   = 4 + 1 + 8;      // rid, flags, key
+inline constexpr std::size_t kCheckpointCrcBytes           = 4;
+inline constexpr std::size_t kCheckpointV1HeaderBytes      = 4 + 8 + 4 + 4;  // magic, O, rowLen, count
+inline constexpr std::size_t kCheckpointV2HeaderBytes      = 4 + 8 + 1;      // magic, O, tableCount
+inline constexpr std::size_t kCheckpointV2TableHeaderBytes = 1 + 4 + 4;      // tableId, rowLen, count
+
 // One dirty-row entry destined for encodeDelta(). Shape mirrors
 // ViewTable::drainDirty()'s callback arguments 1:1 ({rid, row, deleted, key}
 // there; same fields here, `row` nullptr for a delete). drainDirty()'s `row`

@@ -524,6 +524,18 @@ TEST(WorkerViewSetRegression, TransientViewDiscardsDirtyStateEachPass) {
         auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, 2}; };
         vs.driveFolds(5, 0, rr, 2, 0);
         EXPECT_EQ(vs.dirtyBacklog(0x40000007, 0), 0u);
+        // Tombstone then re-upsert of key 7, one record per pass: each erase
+        // appends to the table's pending-delete list, which only a drain clears.
+        for (int64_t off = 2; off < 34; ++off) {
+            rune::protocol::RecordBatchBuilder bb(off, 0);
+            const auto k = keyBytes(7);
+            const auto v = encodeCharacter(7, 30, 1);
+            bb.append(asSv(k), (off % 2) ? asSv(v) : std::string_view{}, 0);
+            const auto b = bb.build();
+            auto rr2 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b.data(), b.size(), off, off + 1}; };
+            vs.driveFolds(5, 0, rr2, off + 1, 0);
+            ASSERT_EQ(vs.dirtyBacklog(0x40000007, 0), 0u) << "pass " << off;
+        }
     }
     {   // Aggregate view: contributor 1 hops between groups 100 and 200, so a
         // group empties (erase) and is recreated (reinsert) every pass.
@@ -544,5 +556,137 @@ TEST(WorkerViewSetRegression, TransientViewDiscardsDirtyStateEachPass) {
         ASSERT_NE(row, nullptr);
         EXPECT_EQ(rune::view::readSlot(row, *L, 2).i, 10);
         EXPECT_EQ(vs.getRow(0x40000009, 0, 100, L), nullptr);
+    }
+}
+
+namespace {
+// Drives (src, partition 0) until caught up to `bound`, draining the delta ring
+// between passes (the IO agent's role) and collecting every delta payload.
+template <class RR>
+void driveToEnd(rune::node::WorkerViewSet& vs, rune::node::ViewSnapshotChannel& ch, int32_t src,
+                RR& rr, int64_t bound, std::vector<std::vector<uint8_t>>& out) {
+    for (int pass = 0; pass < 10000; ++pass) {
+        const int w = vs.driveFolds(src, 0, rr, bound, 0);
+        for (;;) {
+            auto d = drainDeltas(ch);
+            if (d.empty()) break;
+            for (auto& x : d) out.push_back(std::move(x));
+        }
+        if (w == 0) return;
+    }
+    FAIL() << "never caught up";
+}
+} // namespace
+
+// REGRESSION (Task 7 fix round 1, Important): one fold pass over a large
+// committed range used to encode ONE unbounded checkpoint delta; above the
+// delta ring's max message length (capacity/8 = 128 KiB) tryClaim THROWS on the
+// worker thread.  An aggregate dirties up to 5 rows per record, so ~3K
+// contributors crashed the worker.  Each persisted pass is now capped so its
+// delta always fits; the view still reaches the end with correct aggregates.
+TEST(WorkerViewSetRegression, PersistedAggregateLargeRangeDeltasFitTheRing) {
+    const auto src = orderSrc();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(userTotalsPlan(0), srcs, 0x40000009).value();
+    constexpr int64_t kN = 5000;
+    std::vector<std::array<int64_t, 3>> recs;
+    for (int64_t i = 1; i <= kN; ++i) recs.push_back({i, i % 10, i});
+    const auto batch = orderBatch(0, recs);
+    auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, kN}; };
+
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-agg-large");
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    std::vector<std::vector<uint8_t>> deltas;
+    ASSERT_NO_THROW(driveToEnd(vs, ch, 6, rr, kN, deltas));
+    EXPECT_GT(deltas.size(), 1u) << "the range must have been split across capped passes";
+
+    const rune::view::RowLayout* L = nullptr;
+    for (int64_t g = 0; g < 10; ++g) {
+        int64_t total = 0;
+        for (int64_t i = 1; i <= kN; ++i) if (i % 10 == g) total += i;
+        const uint8_t* row = vs.getRow(0x40000009, 0, uint64_t(g), L);
+        ASSERT_NE(row, nullptr) << "group " << g;
+        EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, kN / 10) << "group " << g;
+        EXPECT_EQ(rune::view::readSlot(row, *L, 2).i, total) << "group " << g;
+    }
+}
+
+// REGRESSION (Task 7 fix round 1): recovery used to leave every restored row
+// dirty, so the first post-recovery checkpoint re-sent the WHOLE contributor
+// map (oversized → throw).  Restored rows equal the durable checkpoint, so the
+// first delta after recovery carries only what that pass changed.
+TEST(WorkerViewSetRegression, AggregateRecoveryOfLargeCheckpointDoesNotResendRows) {
+    const auto src = orderSrc();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(userTotalsPlan(0), srcs, 0x40000009).value();
+    constexpr int64_t kN = 5000;
+    std::vector<std::array<int64_t, 3>> recs;
+    for (int64_t i = 1; i <= kN; ++i) recs.push_back({i, i % 10, i});
+    const auto batch = orderBatch(0, recs);
+    auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, kN}; };
+
+    rune::node::ViewSnapshotChannel ch1;
+    rune::node::WorkerViewSet vs1(ch1, "/tmp/rune-views-agg-large-rec");
+    vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    std::vector<std::vector<uint8_t>> deltas;
+    driveToEnd(vs1, ch1, 6, rr, kN, deltas);
+    std::vector<std::span<const uint8_t>> spans(deltas.begin(), deltas.end());
+
+    rune::node::ViewSnapshotChannel ch2;
+    rune::node::WorkerViewSet vs2(ch2, "/tmp/rune-views-agg-large-rec");
+    vs2.installViewForRecovery(comp.plan, comp.rowLayout, src, /*persisted*/ true, 0, {},
+                               std::span<const std::span<const uint8_t>>(spans.data(), spans.size()),
+                               /*committedTail*/ kN);
+    EXPECT_EQ(vs2.dirtyBacklog(0x40000009, 0), 0u) << "restored rows must not be dirty";
+
+    // One post-recovery pass: contributor 1 (group 1, amount 1) -> amount 1001.
+    const auto b2 = orderBatch(kN, {{1, 1, 1001}});
+    auto rr2 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b2.data(), b2.size(), kN, kN + 1}; };
+    ASSERT_NO_THROW(vs2.driveFolds(6, 0, rr2, kN + 1, 0));
+    const auto post = drainDeltas(ch2);
+    ASSERT_EQ(post.size(), 1u);
+    EXPECT_LT(post[0].size(), 512u) << "first post-recovery delta must carry only this pass's rows";
+
+    int64_t total = 1000;
+    for (int64_t i = 1; i <= kN; ++i) if (i % 10 == 1) total += i;
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = vs2.getRow(0x40000009, 0, 1, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, kN / 10);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 2).i, total);
+}
+
+// REGRESSION (Task 7 fix round 1): the same unbounded-delta throw existed for a
+// Phase 1 persisted Replace view (one dirty row per distinct key).
+TEST(WorkerViewSetRegression, PersistedReplaceLargeRangeDeltasFitTheRing) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(0), srcs, 0x40000007).value();
+    // ~5K keys of this narrow row only just fit one 128 KiB message; 20K keys
+    // (≈4x over) make the unbounded single delta throw.
+    constexpr int64_t kN = 20000;
+    rune::protocol::RecordBatchBuilder bb(0, 0);
+    for (int64_t i = 1; i <= kN; ++i) {
+        const auto k = keyBytes(i);
+        const auto v = encodeCharacter(i, static_cast<int32_t>(i), 1);
+        bb.append(asSv(k), asSv(v), 0);
+    }
+    const auto batch = bb.build();
+    auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, kN}; };
+
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-replace-large");
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    std::vector<std::vector<uint8_t>> deltas;
+    ASSERT_NO_THROW(driveToEnd(vs, ch, 5, rr, kN, deltas));
+    uint32_t magic; std::memcpy(&magic, deltas.front().data(), 4);
+    EXPECT_EQ(magic, rune::view::kViewCheckpointMagic) << "Replace views still write v1";
+
+    const rune::view::RowLayout* L = nullptr;
+    for (int64_t i : {int64_t{1}, kN / 2, kN}) {
+        const uint8_t* row = vs.getRow(0x40000007, 0, uint64_t(i), L);
+        ASSERT_NE(row, nullptr) << i;
+        EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, i);
     }
 }

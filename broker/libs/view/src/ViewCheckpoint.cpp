@@ -7,9 +7,9 @@ namespace rune::view {
 
 namespace {
 
-constexpr size_t kHeaderLen = 4 + 8 + 4 + 4; // magic, O, rowLen, count
-constexpr size_t kCrcLen    = 4;
-constexpr size_t kEntryHeaderLen = 4 + 1 + 8; // rid, flags, key
+constexpr size_t kHeaderLen      = kCheckpointV1HeaderBytes;    // magic, O, rowLen, count
+constexpr size_t kCrcLen         = kCheckpointCrcBytes;
+constexpr size_t kEntryHeaderLen = kCheckpointEntryHeaderBytes; // rid, flags, key
 constexpr uint8_t kFlagUpsert = 0;
 constexpr uint8_t kFlagDelete = 1;
 
@@ -159,7 +159,8 @@ size_t encodeMultiDelta(std::span<const TableDelta> tables, int64_t O,
 std::optional<AppliedDelta> applyMultiDelta(std::span<ViewTable* const> tables,
                                             std::span<const uint32_t> rowLens,
                                             std::span<const uint8_t> b) {
-    constexpr size_t kHdr = 4 + 8 + 1, kTbl = 1 + 4 + 4, kEnt = 4 + 1 + 8, kCrc = 4;
+    constexpr size_t kHdr = kCheckpointV2HeaderBytes, kTbl = kCheckpointV2TableHeaderBytes,
+                     kEnt = kCheckpointEntryHeaderBytes, kCrc = kCheckpointCrcBytes;
     if (tables.size() != rowLens.size() || tables.size() > 64) return std::nullopt;
     if (b.size() < kHdr + kCrc) return std::nullopt;
     const uint8_t* p = b.data();

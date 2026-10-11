@@ -117,6 +117,10 @@ FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
                      int64_t& cursor) {
     FoldStats stats{};
     const PrimType keyType = resolveKeyType(plan);
+    // Resume point: a LogReadView is WHOLE batches, so when the caller's cursor
+    // sits mid-batch (a capped pass stopped there) the batch's records below it
+    // were already folded and must not be re-applied.
+    const int64_t from = cursor;
     bool stopped = false;
     bool corrupt = false;
 
@@ -149,6 +153,9 @@ FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
             if (offset >= bound) {
                 stopped = true; // don't fold uncommitted records
                 return;
+            }
+            if (offset < from) {
+                return; // already folded by a previous (mid-batch-stopped) pass
             }
 
             uint64_t k = 0;
@@ -196,7 +203,8 @@ FoldStats foldBatch(const CompiledViewPlan& plan, const RowLayout& layout,
     // consumed the whole view or stopped exactly at a committed boundary, so
     // the existing min(nextOffset, bound) cap is correct and tighter than
     // walkedUpto would be when bound < nextOffset.
-    cursor = corrupt ? walkedUpto : std::min(view.nextOffset, bound);
+    // Never move the resume point backwards (a corrupt batch at/after `from`).
+    cursor = std::max(from, corrupt ? walkedUpto : std::min(view.nextOffset, bound));
     return stats;
 }
 

@@ -66,25 +66,71 @@ std::vector<uint8_t> readWholeFile(const std::string& path) {
 
 // Replays checkpoint records into one instance: v1 into the output table for a
 // Replace view; v2 (all three tables, offset-atomic) for an aggregate view.
+// Same semantics as rune::view::replay/replayMulti (a bad base => -1; stop at
+// the first bad record; return the last applied O), plus ONE warning when the
+// replay stops before the end of the supplied records — so a wrong-version
+// record (v1 in an aggregate file, v2 in a Replace file) or mid-file
+// corruption is visible rather than a silent shorter recovery.
 int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
                        std::span<const std::span<const uint8_t>> deltas) {
-    if (!inst.agg) return rune::view::replay(inst.table, inst.layout, base, deltas);
     rune::view::ViewTable* tables[3];
-    tables[rune::view::kAggTableView]         = &inst.table;
-    tables[rune::view::kAggTableContributors] = &inst.agg->contributors;
-    tables[rune::view::kAggTableGroups]       = &inst.agg->groups;
     uint32_t lens[3];
-    lens[rune::view::kAggTableView]         = inst.layout.rowLen;
-    lens[rune::view::kAggTableContributors] = inst.agg->layout.contributorRow.rowLen;
-    lens[rune::view::kAggTableGroups]       = inst.agg->layout.groupRow.rowLen;
+    if (inst.agg) {
+        tables[rune::view::kAggTableView]         = &inst.table;
+        tables[rune::view::kAggTableContributors] = &inst.agg->contributors;
+        tables[rune::view::kAggTableGroups]       = &inst.agg->groups;
+        lens[rune::view::kAggTableView]         = inst.layout.rowLen;
+        lens[rune::view::kAggTableContributors] = inst.agg->layout.contributorRow.rowLen;
+        lens[rune::view::kAggTableGroups]       = inst.agg->layout.groupRow.rowLen;
+    }
+    auto apply = [&](std::span<const uint8_t> rec) -> std::optional<rune::view::AppliedDelta> {
+        if (inst.agg) return rune::view::applyMultiDelta(tables, lens, rec);
+        return rune::view::applyDelta(inst.table, inst.layout, rec);
+    };
     int64_t last = -1;
     if (!base.empty()) {
-        const auto a = rune::view::applyMultiDelta(tables, lens, base);
-        if (!a) return -1;
+        const auto a = apply(base);
+        if (!a) {
+            spdlog::warn("WorkerViewSet: view {} partition {} checkpoint BASE rejected ({} "
+                         "record expected) — recovering from an empty table",
+                         inst.plan.viewTopicId, inst.partition, inst.agg ? "v2" : "v1");
+            return -1;
+        }
         last = a->O;
     }
-    const int64_t r = rune::view::replayMulti(tables, lens, deltas);
-    return r >= 0 ? r : last;
+    for (std::size_t i = 0; i < deltas.size(); ++i) {
+        const auto a = apply(deltas[i]);
+        if (!a) {
+            spdlog::warn("WorkerViewSet: view {} partition {} checkpoint replay stopped at "
+                         "record {} of {} ({} record expected) — recovered O {}",
+                         inst.plan.viewTopicId, inst.partition, i, deltas.size(),
+                         inst.agg ? "v2" : "v1", last);
+            break;
+        }
+        last = a->O;
+    }
+    return last;
+}
+
+// Most source records one fold pass may cover so the pass's checkpoint delta
+// (worst case) fits ONE ring message of `maxMsg` payload bytes; 0 if not even
+// one record fits.  Worst case per source record: Replace dirties 1 output row;
+// an aggregate dirties its contributor + old/new group + old/new output row.
+int64_t maxRecordsPerPassFor(const ViewInstance& inst, std::size_t maxMsg) {
+    using namespace rune::view;
+    std::size_t fixed = ViewSnapshotChannel::kDeltaHeaderBytes + kCheckpointCrcBytes;
+    std::size_t perRecord = 0;
+    if (inst.agg) {
+        fixed += kCheckpointV2HeaderBytes + 3 * kCheckpointV2TableHeaderBytes;
+        perRecord = 1 * (kCheckpointEntryHeaderBytes + inst.agg->layout.contributorRow.rowLen) +
+                    2 * (kCheckpointEntryHeaderBytes + inst.agg->layout.groupRow.rowLen) +
+                    2 * (kCheckpointEntryHeaderBytes + inst.layout.rowLen);
+    } else {
+        fixed += kCheckpointV1HeaderBytes;
+        perRecord = kCheckpointEntryHeaderBytes + inst.layout.rowLen;
+    }
+    if (maxMsg <= fixed) return 0;
+    return static_cast<int64_t>((maxMsg - fixed) / perRecord);
 }
 
 } // namespace
@@ -304,6 +350,21 @@ ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition
         inst.agg.emplace(std::move(*al), indexSlots, chunkBytes);
     }
 
+    // Persisted: bound each fold pass so its checkpoint delta always fits one
+    // delta-ring message (an oversized claim THROWS on this worker thread).
+    if (inst.persisted) {
+        inst.maxRecordsPerPass = maxRecordsPerPassFor(
+            inst, static_cast<std::size_t>(channel_.deltas.maxMsgLength()));
+        if (inst.maxRecordsPerPass < 1) {
+            spdlog::error("WorkerViewSet: persisted view {} partition {} not hosted — one source "
+                          "record's worst-case checkpoint delta exceeds the delta ring's max "
+                          "message length ({} bytes)",
+                          viewTopicId, partition, channel_.deltas.maxMsgLength());
+            views_.erase(ins);
+            return nullptr;
+        }
+    }
+
     // Bug A fix (whole-branch re-review): a view installed FOR RESTART
     // RECOVERY must never serve a lazily-created DEFAULT-READY instance, even
     // after pruneRecoveryIfAllReady_ already erased viewTopicId from
@@ -333,6 +394,7 @@ void WorkerViewSet::loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopi
     const int64_t recoveredO = replayInstance(
         inst, /*base=*/std::span<const uint8_t>{},
         std::span<const std::span<const uint8_t>>(records.data(), records.size()));
+    discardDirty_(inst);  // restored rows == the durable checkpoint: nothing to re-send
     inst.foldCursor   = std::max<int64_t>(recoveredO, 0);
     inst.lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
     inst.readiness = (inst.foldCursor >= committedTail) ? ViewReadiness::Ready
@@ -382,6 +444,7 @@ void WorkerViewSet::installViewForRecovery(
     // exclusive "resume from" offset, see buildAndPushCheckpoint_), or -1 when
     // nothing applied (empty/missing checkpoint) -> foldCursor starts at 0.
     const int64_t recoveredO = replayInstance(*inst, base, deltasInOrder);
+    discardDirty_(*inst);  // restored rows == the durable checkpoint: nothing to re-send
     inst->foldCursor   = std::max<int64_t>(recoveredO, 0);
     inst->lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
 

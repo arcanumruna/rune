@@ -187,6 +187,7 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
                              int64_t& cursor) {
     FoldStats stats{};
     Ctx cx{layout, agg, view, contributors, groups, stats};
+    const int64_t from = cursor;   // records below it were folded by a prior (mid-batch) pass
     bool stopped = false;
     bool corrupt = false;
     int64_t walkedUpto = lv.baseOffset;
@@ -205,6 +206,7 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
                             int64_t /*ts*/) {
             if (stopped) return;
             if (offset >= bound) { stopped = true; return; }
+            if (offset < from) return;         // already folded (resume mid-batch)
             if (key.size() != 8) { ++stats.skippedMalformed; return; }
             uint64_t c = 0;
             std::memcpy(&c, key.data(), 8);   // little-endian identity bytes
@@ -264,7 +266,8 @@ FoldStats foldAggregateBatch(const CompiledViewPlan& /*plan*/, const RowLayout& 
         pos += static_cast<size_t>(r.totalLength());
         walkedUpto = r.baseOffset() + r.lastOffsetDelta() + 1;
     }
-    cursor = corrupt ? walkedUpto : std::min(lv.nextOffset, bound);
+    // Never move the resume point backwards (a corrupt batch at/after `from`).
+    cursor = std::max(from, corrupt ? walkedUpto : std::min(lv.nextOffset, bound));
     return stats;
 }
 
