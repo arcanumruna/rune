@@ -417,3 +417,23 @@ TEST(TopicRegistry, CP1_OutOfRangeTopicIdReturnsSafeDefaults) {
     EXPECT_DOUBLE_EQ(reg.dirtyRatioThresholdOf(0),  0.5);
     EXPECT_EQ(reg.deleteRetentionMsOf(0), 86'400'000LL);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2b Part C regression: the broker resolves an EMPTY key (a request with
+// partitionKnown=0 — produce / subscribe / GetViewRow) to partition 0, the
+// same partition the client's Key{}.partition(n) picks.  Before, the broker
+// hashed fnv1a64("") % 8 = 5; a client-only rule split a Key{} producer from a
+// Key{} subscriber.  Both now use rune::protocol::partitionForKey's rule.
+// ---------------------------------------------------------------------------
+TEST(TopicRegistryRegression, EmptyKeyPartitionZero) {
+    auto dir = makeTempDir("pfk_empty");
+    std::filesystem::create_directories(dir);
+    std::vector<TopicSpec> specs = {makeSpec("p1", 1, 0), makeSpec("p2", 2, 1),
+                                    makeSpec("p8", 8, 2), makeSpec("p64", 64, 3)};
+    TopicRegistry reg(specs, dir.string());
+
+    const std::span<const uint8_t> empty{};
+    for (int32_t id = 0; id < 4; ++id) {
+        EXPECT_EQ(reg.partitionForKey(id, empty), 0) << "topicId=" << id;
+    }
+}
