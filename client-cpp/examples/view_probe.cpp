@@ -297,7 +297,8 @@ static bool sendOrder(Client& c, const TopicHandle& th, int64_t o, int64_t u, in
     }
     return true;
 }
-// Polls user `u` until {n, total, avg} match (avg within 1e-9) or the bound expires.
+// Polls user `u` until the row is {userId=u, n, total, avg} with every slot
+// present (non-null; avg within 1e-9) or the bound expires.
 static bool waitForTotals(Client& c, int32_t viewId, uint64_t fp, int64_t u, int64_t n, int64_t total,
                           double avg, int boundMs, int timeoutMs, const char* who) {
     const rcv::RowLayout L = userTotalsRowLayout();
@@ -307,14 +308,19 @@ static bool waitForTotals(Client& c, int32_t viewId, uint64_t fp, int64_t u, int
         r = c.getViewRowAndWait(viewId, static_cast<uint64_t>(u), fp, std::chrono::milliseconds(timeoutMs));
         if (r.status == ViewRowResult::kOk && r.rowBytes.size() == L.rowLen) {
             const auto row = std::span<const uint8_t>(r.rowBytes);
+            const auto uf = rcv::readSlot(row, L, 0);
             const auto nf = rcv::readSlot(row, L, 1), tf = rcv::readSlot(row, L, 2), af = rcv::readSlot(row, L, 3);
-            if (nf.i == n && tf.i == total && std::abs(af.f - avg) < 1e-9) {
-                std::cerr << "PROBE: " << who << " OK n=" << n << " total=" << total << " avg=" << avg << "\n";
+            const bool allPresent = uf.present && nf.present && tf.present && af.present;
+            if (allPresent && uf.i == u && nf.i == n && tf.i == total && std::abs(af.f - avg) < 1e-9) {
+                std::cerr << "PROBE: " << who << " OK userId=" << u << " n=" << n << " total=" << total
+                          << " avg=" << avg << "\n";
                 return true;
             }
             if (std::chrono::steady_clock::now() >= dl) {
-                std::cerr << "PROBE: FAIL " << who << " got n=" << nf.i << " total=" << tf.i << " avg=" << af.f
-                          << " want n=" << n << " total=" << total << " avg=" << avg << "\n";
+                std::cerr << "PROBE: FAIL " << who << " got userId=" << uf.i << " n=" << nf.i << " total=" << tf.i
+                          << " avg=" << af.f << " (present userId=" << uf.present << " n=" << nf.present
+                          << " total=" << tf.present << " avg=" << af.present << ")"
+                          << " want userId=" << u << " n=" << n << " total=" << total << " avg=" << avg << "\n";
                 return false;
             }
         } else if (std::chrono::steady_clock::now() >= dl) {
