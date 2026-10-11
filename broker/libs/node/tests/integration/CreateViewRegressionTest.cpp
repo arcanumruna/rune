@@ -307,12 +307,37 @@ TEST_F(CreateViewRegression, AggregateOverMultiPartitionSourceIsNotCoPartitioned
     driveCreateView(cv);
     EXPECT_EQ(lastViewError_, 36u) << "group-by userId over a 2-partition source keyed by orderId";
 
-    // Grouping by the source's own key field is co-partitioned by construction.
+    // Grouping by the source's declared key field is ALSO rejected: a contributor
+    // is its 8-byte wire key, the client partitions by wire key, and the broker
+    // never enforces wire key == declared keyField — so "group-by == keyField"
+    // does not guarantee every contributor of a group lands on one partition.
     lastViewError_ = 0xffff;
     cv.corr = 32; cv.viewName = "totals_orderId"; cv.keyField = "orderId";
     cv.planBlob = totalsPlanBlob(src, "orderId");
     driveCreateView(cv);
-    EXPECT_EQ(lastViewError_, static_cast<uint16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(lastViewError_, 36u)
+        << "group-by == source keyField over a 2-partition source must be rejected too";
+}
+
+TEST_F(CreateViewRegression, ReplaceOnlyViewOverMultiPartitionSourceIsAllowed) {
+    DefineTopicMsg d;
+    d.session = 1; d.corr = 50; d.partitionCount = 2; d.name = "order2";
+    d.keyField = "orderId"; d.validate = false; d.blob = orderBlob();
+    driveDefine(d);
+    ASSERT_EQ(lastDefineError_, 0u);
+
+    rv::ViewPlan p;
+    p.viewName = "order_amount"; p.key = "orderId"; p.persistence = 0;
+    p.sources.push_back(rv::SourceSpec{lastDefineTopicId_, "orderId"});
+    p.output.push_back(rv::AuthoredField{"orderId", PrimType::Int64, 0, "orderId", rv::MergeRule::Replace});
+    p.output.push_back(rv::AuthoredField{"amount", PrimType::Int64, 0, "amount", rv::MergeRule::Replace});
+
+    CreateViewMsg cv;
+    cv.session = 1; cv.corr = 51; cv.persistence = 0;
+    cv.viewName = "order_amount"; cv.keyField = "orderId"; cv.planBlob = rv::serializeAuthored(p);
+    driveCreateView(cv);
+    EXPECT_EQ(lastViewError_, static_cast<uint16_t>(pc::ErrorCode::OK))
+        << "the co-partition gate applies to aggregate views only";
 }
 
 TEST_F(CreateViewRegression, AggregateOverSinglePartitionSourceIsAllowed) {

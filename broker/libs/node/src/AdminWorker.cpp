@@ -467,13 +467,15 @@ void AdminWorker::startCreateView_(CreateViewMsg msg, int64_t nowNs) {
     }
 
     // Phase 2a co-partitioning: an aggregate view groups by a VALUE field, but
-    // records are partitioned by their wire key — every contributor of a group
-    // is only guaranteed to land on one partition when the source has exactly
-    // one, or when the group-by field IS the source's declared key field.
+    // records are partitioned by their 8-byte wire key, and under table semantics
+    // a contributor IS its wire key. The broker never enforces wire key ==
+    // declared keyField, so even "group-by == source keyField" does not keep a
+    // group's contributors on one partition (it either makes every group
+    // single-contributor or silently splits groups). Every aggregate view over
+    // a source with more than one partition is therefore rejected.
     if (rv::isAggregateView(compiled->plan)) {
         const RegistryEntry* coSrc = reg_.byId(authored->sources[0].topicId);
-        if (coSrc != nullptr && coSrc->partitionCount > 1 &&
-            authored->sources[0].keyField != coSrc->keyField) {
+        if (coSrc != nullptr && coSrc->partitionCount > 1) {
             deps_.respondCreateView(msg.session, msg.corr, -1, 0, kViewNotCoPartitioned);
             return;
         }
