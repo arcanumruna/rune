@@ -210,3 +210,37 @@ TEST(ViewPlan, BogusLargeCountRegression) {
     }
     EXPECT_TRUE(rune::view::deserializeAuthored(abytes).has_value());
 }
+
+// Phase 2a: Count(*) is a new MergeRule value appended at 7 so existing plan
+// blobs (rules 0-6) keep their meaning.
+TEST(ViewPlanRegression, CountAllRuleRoundTripsAuthoredAndCompiled) {
+    rune::view::ViewPlan a;
+    a.viewName = "user_totals";
+    a.key      = "userId";
+    a.sources  = {{5, "userId"}};
+    a.output   = {{"userId", rune::codec::PrimType::Int64, 0, "userId", rune::view::MergeRule::Replace},
+                  {"n", rune::codec::PrimType::Int64, 0, "", rune::view::MergeRule::CountAll}};
+    auto back = rune::view::deserializeAuthored(rune::view::serializeAuthored(a));
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(back->output[1].rule, rune::view::MergeRule::CountAll);
+    EXPECT_EQ(static_cast<uint8_t>(rune::view::MergeRule::CountAll), 7u);
+
+    rune::view::CompiledViewPlan c;
+    c.viewName = "user_totals"; c.viewTopicId = 9; c.keyFieldId = {1}; c.sourceTopicId = {5};
+    c.outputFingerprint = 1;
+    c.output = {{0, rune::codec::PrimType::Int64, 0, 1, rune::view::MergeRule::Replace},
+                {1, rune::codec::PrimType::Int64, 0, rune::view::kNoSourceField,
+                 rune::view::MergeRule::CountAll}};
+    auto cback = rune::view::deserializeCompiledViewPlan(rune::view::serialize(c));
+    ASSERT_TRUE(cback.has_value());
+    EXPECT_EQ(cback->output[1].rule, rune::view::MergeRule::CountAll);
+    EXPECT_EQ(cback->output[1].srcFieldId, rune::view::kNoSourceField);
+}
+
+TEST(ViewPlanRegression, UnknownRuleValueIsRejected) {
+    rune::view::ViewPlan a;
+    a.viewName = "v"; a.key = "k"; a.sources = {{5, "k"}};
+    a.output = {{"k", rune::codec::PrimType::Int64, 0, "k", static_cast<rune::view::MergeRule>(8)}};
+    EXPECT_FALSE(rune::view::deserializeAuthored(rune::view::serializeAuthored(a)).has_value())
+        << "rule byte 8 (one past CountAll) must be rejected, never cast";
+}

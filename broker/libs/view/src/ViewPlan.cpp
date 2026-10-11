@@ -122,7 +122,7 @@ bool isValidPrimType(uint8_t v) {
 }
 
 bool isValidMergeRule(uint8_t v) {
-    return v <= static_cast<uint8_t>(MergeRule::Last);
+    return v <= static_cast<uint8_t>(MergeRule::CountAll);
 }
 
 bool readPrimType(std::span<const uint8_t> buf, size_t& pos, rune::codec::PrimType& out) {
