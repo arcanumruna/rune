@@ -29,13 +29,14 @@
 #   election is distinguished from the pre-restart one still in the log).
 #
 #   RUN 2 (RUNE_MODE=verify_restart, fed the RUN 1 handoff as env vars):
-#     (a) char_persisted -> OK with the ORIGINAL row (the readiness gate
-#         replayed it across the restart — no reproduce needed).
-#     (b) char_transient -> AbsentKey (no checkpoint survives a transient
-#         view's restart).
-#     (c) re-produce the SAME key with a NEW hp value -> char_transient
-#         eventually answers OK with the NEW value (it folds live off the
-#         source log, which IS persisted).
+#     (a) char_persisted -> OK with the ORIGINAL row (checkpoint + tail replay
+#         behind the readiness gate — no reproduce needed).
+#     (b) char_transient -> OK with the ORIGINAL row too: it has no checkpoint,
+#         so the readiness gate rebuilds it by re-folding the retained source
+#         log (spec §9.7) — the source topic itself survives the restart via
+#         runtime-topic recovery.
+#     (c) re-produce the SAME key with a NEW hp value -> BOTH views converge to
+#         the NEW value (live folding resumes after the restart).
 #     Prints "VIEW-ENGINE-E2E: OK" on success.
 #
 # Usage:  bash docker/view-engine-e2e.sh
@@ -279,28 +280,17 @@ log "Setup OK: srcTopicId=${VIEW_SRC_TOPIC_ID}" \
 
 # ---------------------------------------------------------------------------
 # The CREATE path above (define -> createView x2 -> produce -> getViewRow x2 OK)
-# is the asserted Phase-1 gate and has passed.
-#
-# The restart -> recover leg below is GATED behind RUN_RESTART_LEG (default off).
-# It depends on a broker-wide capability that is NOT yet wired: recovering USER
-# TOPICS into runtime replicas on restart.  A restarted broker currently rebuilds
-# read_committed from 0 user topics and never re-creates the source 'character'
-# replica, so a view cannot re-fold its source and stays (correctly) NotReady.
-# The VIEW-side restart recovery IS in place and verified in-process (ViewRegistry
-# rebuild on AdminWorker promotion + checkpoint load + retriable-NotReady
-# serve-guard); it is blocked only on that upstream gap.  Flip RUN_RESTART_LEG=1
-# once user-topic restart recovery lands.  Tracked: SDD ledger + memory
-# "rune-view-restart-blocked-on-user-topic-recovery".
+# has passed.  The restart -> recover leg below runs by default; set
+# RUN_RESTART_LEG=0 for a quick create-path-only run.
 # ---------------------------------------------------------------------------
-if [ "${RUN_RESTART_LEG:-0}" != "1" ]; then
+if [ "${RUN_RESTART_LEG:-1}" != "1" ]; then
     log ""
     log "========================================"
-    log "  VIEW-ENGINE E2E (create path) PASSED"
+    log "  VIEW-ENGINE E2E (create path only) PASSED"
     log "  Single node self-elected: ${leader1}"
     log "  define(character) -> createView(char_persisted, char_transient)"
     log "  -> produce -> getViewRow x2 OK"
-    log "  restart->recover leg SKIPPED (set RUN_RESTART_LEG=1 to run it);"
-    log "  pending broker user-topic restart recovery (tracked)."
+    log "  restart->recover leg SKIPPED (RUN_RESTART_LEG=0)."
     log "  VIEW-ENGINE-E2E: OK, exit 0."
     log "========================================"
     exit 0
@@ -358,6 +348,7 @@ log "  define(character) -> createView(char_persisted, char_transient)"
 log "  -> produce -> getViewRow x2 OK"
 log "  -> restart -> re-elected: ${leader2}"
 log "  -> char_persisted recovered OK (readiness gate replay)"
-log "  -> char_transient AbsentKey (empty) -> reproduce -> refilled OK"
+log "  -> char_transient re-folded from the retained source OK"
+log "  -> reproduce -> both views fold the new value live OK"
 log "  VIEW-ENGINE-E2E: OK, exit 0."
 log "========================================"
