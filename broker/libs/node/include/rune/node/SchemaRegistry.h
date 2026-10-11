@@ -40,6 +40,11 @@ struct TopicSchema {
     std::vector<uint8_t>  descriptorBlob;
     uint16_t              nextTag        = 0;    // next durable tag to allocate on ADD
     rune::codec::CompatMode compatMode   = rune::codec::CompatMode::Backward;
+    // The TOPIC name this schema belongs to (Client::defineTopic takes it
+    // independently of the descriptor's name).  Optional trailer — empty on
+    // records written before it existed; boot recovery recreates the topic
+    // under this name (RuntimeTopicRecovery).
+    std::string           topicName;
 
     [[nodiscard]] std::vector<uint8_t> serialize() const;
     [[nodiscard]] static std::optional<TopicSchema> deserialize(std::span<const uint8_t> buf);
@@ -62,6 +67,7 @@ struct RegistryEntry {
     int32_t                          partitionCount = 1;
     uint16_t                         nextTag        = 0;
     rune::codec::CompatMode          compatMode     = rune::codec::CompatMode::Backward;
+    std::string                      topicName;        // durable topic name (may be empty: legacy record)
 };
 
 /// Single-threaded, AdminWorker-owned schema registry.

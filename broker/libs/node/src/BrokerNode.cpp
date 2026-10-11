@@ -33,6 +33,7 @@
 // Task 6: AdminWorker + SchemaRegistry + __topic_schemas persistence.
 #include <rune/node/AdminWorker.h>
 #include <rune/node/SchemaRegistry.h>
+#include <rune/node/RuntimeTopicRecovery.h>
 #include <rune/codec/Serialize.h>
 #include <rune/view/ViewPlan.h>   // Task 20: deserializeCompiledViewPlan (view->source co-location)
 // Task 6: RecordBatch reader for rebuildFromLog (same as TxnStateStore).
@@ -365,6 +366,27 @@ void BrokerNode::start() {
         if (ec) {
             throw std::runtime_error("BrokerNode: cannot create parent of aeronDir '" +
                                      config_.effectiveAeronDir() + "': " + ec.message());
+        }
+    }
+
+    // 1b. Restart recovery of RUNTIME-defined topics (DefineTopic + CreateView
+    //     sinks).  Boot only ever builds config_.topics; a runtime topic exists
+    //     solely because the admin createTopic path built it, so after a restart
+    //     its log survives but the topic itself would vanish (no replica, no
+    //     produce/consume, views can never re-fold their source).  Read the
+    //     durable admin catalogs now — single startup thread, before ANY boot
+    //     builder consumes config_.topics — and append the recovered specs so
+    //     TopicRegistry / buildReplication / worker placement / MetadataService /
+    //     read-committed rebuild treat them exactly like static topics.  Throws
+    //     (refusing to boot) on a damaged catalog or a non-contiguous id sequence.
+    {
+        std::vector<TopicSpec> recovered = recoverRuntimeTopicSpecs(
+            config_.dataDir, static_cast<int32_t>(config_.topics.size()));
+        if (!recovered.empty()) {
+            spdlog::info("BrokerNode[{}]: recovered {} runtime topic(s) from the admin "
+                         "catalogs (ids {}..{})", config_.nodeId, recovered.size(),
+                         recovered.front().topicId, recovered.back().topicId);
+            for (auto& spec : recovered) config_.topics.push_back(std::move(spec));
         }
     }
 

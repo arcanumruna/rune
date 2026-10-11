@@ -107,6 +107,14 @@ std::vector<uint8_t> TopicSchema::serialize() const {
     writeU16LE(buf, nextTag);
     writeU8(buf, static_cast<uint8_t>(compatMode));
 
+    // [restart recovery] optional topicName trailer: u16 length + bytes, written
+    // ONLY when a name is set, so a nameless record stays byte-identical to the
+    // pre-name layout (exact 3-byte tail).
+    if (!topicName.empty()) {
+        writeU16LE(buf, static_cast<uint16_t>(topicName.size()));
+        for (unsigned char c : topicName) buf.push_back(c);
+    }
+
     return buf;
 }
 
@@ -156,7 +164,7 @@ std::optional<TopicSchema> TopicSchema::deserialize(std::span<const uint8_t> buf
         } catch (const std::exception&) {
             ts.nextTag = 0;
         }
-    } else if (remaining == 3) {
+    } else if (remaining == 3 || remaining >= 5) {
         uint8_t compatByte = 0;
         if (!readU16LE(buf, pos, ts.nextTag))   return std::nullopt;
         if (!readU8(buf, pos, compatByte))      return std::nullopt;
@@ -170,8 +178,19 @@ std::optional<TopicSchema> TopicSchema::deserialize(std::span<const uint8_t> buf
             return std::nullopt;
         }
         ts.compatMode = static_cast<rune::codec::CompatMode>(compatByte);
+
+        // [restart recovery] optional topicName trailer.  Accepted only when the
+        // length prefix and EXACTLY that many name bytes are present — a
+        // partial/oversized tail is malformed, same as every other check here.
+        if (remaining >= 5) {
+            uint16_t nameLen = 0;
+            if (!readU16LE(buf, pos, nameLen))          return std::nullopt;
+            if (buf.size() - pos != nameLen)            return std::nullopt;
+            ts.topicName.assign(reinterpret_cast<const char*>(buf.data() + pos), nameLen);
+            pos += nameLen;
+        }
     } else {
-        return std::nullopt;  // truncated (1-2 bytes) or unrecognized (>3 bytes) tail
+        return std::nullopt;  // truncated tail (1, 2 or 4 bytes)
     }
 
     return ts;
@@ -202,6 +221,7 @@ void SchemaRegistry::applyRecord(const TopicSchema& ts) {
     e.partitionCount = ts.partitionCount;
     e.nextTag        = ts.nextTag;
     e.compatMode     = ts.compatMode;
+    e.topicName      = ts.topicName;
 
     const std::string& schemaName = e.descriptor.name;
     nameToId_[schemaName] = ts.topicId;

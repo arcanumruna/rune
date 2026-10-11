@@ -206,6 +206,9 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
     // already declares, so the first ALTER ADD (Task 11) allocates a tag that
     // doesn't collide with an existing one.
     ts.nextTag        = inFlight_->fieldCount;
+    // Durable topic name (independent of the descriptor's name): boot recovery
+    // recreates the topic under it (RuntimeTopicRecovery).
+    ts.topicName      = inFlight_->msg.name;
 
     // D: leader guard.  If we are not the leader, DDL cannot be committed here.
     if (!leader_ || !replica_) {
@@ -569,6 +572,7 @@ void AdminWorker::startAlter_(AlterTopicMsg msg, int64_t nowNs) {
     ts.descriptorBlob = rune::codec::serialize(*res);     // the NEW evolving descriptor
     ts.nextTag        = nextTag;                           // advanced by applyOps
     ts.compatMode     = mode;
+    ts.topicName      = latest->topicName;                 // carried forward unchanged
 
     const std::vector<uint8_t> payload = ts.serialize();
     // Task 15b: composite (topicId, version) compaction key — see the matching
@@ -678,6 +682,7 @@ bool AdminWorker::advance_(int64_t nowNs) {
             ts.validate       = inFlight_->msg.validate;
             ts.descriptorBlob = inFlight_->msg.blob;
             ts.nextTag        = inFlight_->fieldCount;
+            ts.topicName      = inFlight_->msg.name;   // same as the durable record
             reg_.applyRecord(ts);
             if (inFlight_->msg.validate) {
                 if (const RegistryEntry* entry = reg_.byId(inFlight_->topicId))

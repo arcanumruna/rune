@@ -321,3 +321,64 @@ TEST(SchemaRegistry, LongLineageWithDropAndRenameResolvesEveryVersionByIdAndFing
         << "the pre-rename name must no longer resolve in the live set";
     EXPECT_EQ(reg.byIdVersion(topicId, 5)->descriptor.fields.size(), 3u);   // id, rating, level
 }
+
+// ---------------------------------------------------------------------------
+// REGRESSION (user-topic restart recovery). A DefineTopic topic's NAME is
+// independent of its descriptor's name — Client::defineTopic takes both — so the
+// broker must persist it in the schema record; boot recovery recreates the topic
+// under exactly this name (a wrong name would open the wrong on-disk log).
+// ---------------------------------------------------------------------------
+TEST(SchemaRegistryRegression, TopicNameTrailerRoundTrips) {
+    TopicSchema ts = makeSchema(0x40000010, "descriptor_name", false);
+    ts.nextTag    = 5;
+    ts.compatMode = CompatMode::Forward;
+    ts.topicName  = "orders_topic";
+
+    auto back = TopicSchema::deserialize(ts.serialize());
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(back->topicName, "orders_topic");
+    EXPECT_EQ(back->nextTag, 5u);
+    EXPECT_EQ(back->compatMode, CompatMode::Forward);
+}
+
+// A record written before the name trailer existed (exact 3-byte tail) still
+// parses, with an empty topicName — recovery then falls back to the descriptor name.
+TEST(SchemaRegistryRegression, PreNameRecordParsesWithEmptyTopicName) {
+    TopicSchema ts = makeSchema(0x40000011, "pre_name", false);
+    ts.nextTag = 9;
+    const auto bytes = ts.serialize();   // no topicName -> byte-identical pre-name layout
+
+    auto back = TopicSchema::deserialize(bytes);
+    ASSERT_TRUE(back.has_value());
+    EXPECT_TRUE(back->topicName.empty());
+    EXPECT_EQ(back->nextTag, 9u);
+}
+
+// A present-but-truncated name trailer is malformed and must be rejected, never
+// silently read as a shorter name or as a pre-name record.
+TEST(SchemaRegistryRegression, TruncatedTopicNameTrailerIsRejected) {
+    TopicSchema ts = makeSchema(0x40000012, "trunc", false);
+    ts.topicName = "abcdef";
+    const auto bytes = ts.serialize();
+
+    auto minusOne = bytes;              // name bytes short by one
+    minusOne.resize(minusOne.size() - 1);
+    EXPECT_FALSE(TopicSchema::deserialize(minusOne).has_value());
+
+    auto halfLen = bytes;               // only 1 of the 2 length-prefix bytes present
+    halfLen.resize(halfLen.size() - ts.topicName.size() - 1);
+    EXPECT_FALSE(TopicSchema::deserialize(halfLen).has_value());
+
+    auto extra = bytes;                 // an unknown byte after the name
+    extra.push_back(0x7F);
+    EXPECT_FALSE(TopicSchema::deserialize(extra).has_value());
+}
+
+TEST(SchemaRegistryRegression, ApplyRecordCarriesTopicNameToEntry) {
+    SchemaRegistry reg;
+    TopicSchema ts = makeSchema(0x40000013, "desc", false);
+    ts.topicName = "the_topic";
+    reg.applyRecord(ts);
+    ASSERT_NE(reg.byId(0x40000013), nullptr);
+    EXPECT_EQ(reg.byId(0x40000013)->topicName, "the_topic");
+}

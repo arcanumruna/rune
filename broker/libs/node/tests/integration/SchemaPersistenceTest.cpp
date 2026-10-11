@@ -32,6 +32,7 @@
 #include <rune/node/NodeRuntimeAgent.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/SchemaRegistry.h>
+#include <rune/node/RuntimeTopicRecovery.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/Types.h>
 #include <rune/storage/Log.h>
@@ -2163,4 +2164,39 @@ TEST(SchemaPersistenceCompaction, LongLineageSurvivesCompactionAndMixedReadRegre
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// REGRESSION (user-topic restart recovery) — writer/reader contract on the REAL
+// DDL path.  A restarted broker recreates runtime topics from __topic_schemas
+// (recoverRuntimeTopicSpecs); the topic must come back under the name the client
+// gave DefineTopic — which is independent of the descriptor's name — or boot
+// opens the wrong on-disk log.  Drive the real AdminWorker, then run boot
+// recovery over a data dir holding exactly the catalog it wrote.
+// ---------------------------------------------------------------------------
+TEST_F(SchemaPersistenceTest, DefineTopicRecordRecoversTopicUnderItsOwnNameRegression) {
+    DefineTopicMsg args;
+    args.session        = 30;
+    args.corr           = 31;
+    args.name           = "orders_topic";   // descriptor (charsBlob) is named "characters"
+    args.keyField       = "userId";
+    args.partitionCount = 6;
+    args.validate       = false;
+    args.blob           = charsBlob();
+
+    driveDefine(args);
+    ASSERT_EQ(lastDefineError_, 0u) << "Precondition: DefineTopic must succeed";
+    tick(5);
+
+    TmpSchemaDir dataDir("rtr_data");
+    std::filesystem::copy(schemaDir_.path,
+                          std::filesystem::path(dataDir.path) / "__topic_schemas",
+                          std::filesystem::copy_options::recursive);
+
+    const auto specs = rune::node::recoverRuntimeTopicSpecs(dataDir.path, /*firstRuntimeId*/ 0);
+    ASSERT_EQ(specs.size(), 1u);
+    EXPECT_EQ(specs[0].topicId, lastDefineTopicId_);
+    EXPECT_EQ(specs[0].name, "orders_topic") << "must be the TOPIC name, not the descriptor name";
+    EXPECT_EQ(specs[0].partitionCount, 6);
+    EXPECT_EQ(specs[0].cleanupPolicy, rune::node::TopicSpec::CleanupPolicy::Delete);
 }

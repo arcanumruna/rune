@@ -14,7 +14,8 @@ add_library(rune_node
     src/ViewRegistry.cpp
     src/AdminWorker.cpp
     src/ViewSnapshotIoAgent.cpp
-    src/WorkerViewSet.cpp)
+    src/WorkerViewSet.cpp
+    src/RuntimeTopicRecovery.cpp)
 
 # The worker's io backends, as their own leaf library: Worker.h's header-inline
 # code (instantiated by rune_replication's AeronPartitionTransport.cpp too) calls
@@ -148,6 +149,7 @@ if(BUILD_TESTING)
         tests/node/RingDoorbellTest.cpp
         tests/node/ViewSnapshotIoAgentTest.cpp
         tests/node/WorkerViewSetTest.cpp
+        tests/node/RuntimeTopicRecoveryTest.cpp
         tests/node/ViewReadinessRegressionTest.cpp
         tests/node/ViewRecoveryRegressionTest.cpp
         )
