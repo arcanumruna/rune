@@ -5,6 +5,7 @@
 #include <rune/codec/Serialize.h>      // rune::codec::deserialize
 #include <rune/view/ViewPlan.h>        // rune::view::deserializeCompiledViewPlan
 #include <rune/view/ViewRow.h>         // rune::view::buildRowLayout
+#include <rune/view/AggState.h>        // isAggregateView, buildAggLayout, kAggTable*
 #include <rune/view/ViewCheckpoint.h>  // v1/v2 checkpoint magics
 
 #include <spdlog/spdlog.h>
@@ -61,6 +62,29 @@ std::vector<uint8_t> readWholeFile(const std::string& path) {
     f.read(reinterpret_cast<char*>(out.data()), n);
     if (!f) return {};
     return out;
+}
+
+// Replays checkpoint records into one instance: v1 into the output table for a
+// Replace view; v2 (all three tables, offset-atomic) for an aggregate view.
+int64_t replayInstance(ViewInstance& inst, std::span<const uint8_t> base,
+                       std::span<const std::span<const uint8_t>> deltas) {
+    if (!inst.agg) return rune::view::replay(inst.table, inst.layout, base, deltas);
+    rune::view::ViewTable* tables[3];
+    tables[rune::view::kAggTableView]         = &inst.table;
+    tables[rune::view::kAggTableContributors] = &inst.agg->contributors;
+    tables[rune::view::kAggTableGroups]       = &inst.agg->groups;
+    uint32_t lens[3];
+    lens[rune::view::kAggTableView]         = inst.layout.rowLen;
+    lens[rune::view::kAggTableContributors] = inst.agg->layout.contributorRow.rowLen;
+    lens[rune::view::kAggTableGroups]       = inst.agg->layout.groupRow.rowLen;
+    int64_t last = -1;
+    if (!base.empty()) {
+        const auto a = rune::view::applyMultiDelta(tables, lens, base);
+        if (!a) return -1;
+        last = a->O;
+    }
+    const int64_t r = rune::view::replayMulti(tables, lens, deltas);
+    return r >= 0 ? r : last;
 }
 
 } // namespace
@@ -265,6 +289,21 @@ ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition
     (void)inserted;
     ViewInstance& inst = ins->second;
 
+    // Phase 2a: an aggregate view also owns its contributor + group aux tables.
+    // Built BEFORE any recovery load below, so a checkpoint (v2) restores all
+    // three tables, and a transient re-fold starts from EMPTY aux tables.
+    if (rune::view::isAggregateView(inst.plan)) {
+        auto al = rune::view::buildAggLayout(inst.plan, inst.evolvingSrc);
+        if (!al) {
+            spdlog::error("WorkerViewSet: aggregate view {} partition {} not hosted — a compiled "
+                          "aggregate references a field missing from its source descriptor",
+                          viewTopicId, partition);
+            views_.erase(ins);
+            return nullptr;
+        }
+        inst.agg.emplace(std::move(*al), indexSlots, chunkBytes);
+    }
+
     // Bug A fix (whole-branch re-review): a view installed FOR RESTART
     // RECOVERY must never serve a lazily-created DEFAULT-READY instance, even
     // after pruneRecoveryIfAllReady_ already erased viewTopicId from
@@ -291,8 +330,8 @@ void WorkerViewSet::loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopi
     const std::vector<std::span<const uint8_t>> records =
         splitViewCheckpointRecords(std::span<const uint8_t>(file));
 
-    const int64_t recoveredO = rune::view::replay(
-        inst.table, inst.layout, /*base=*/std::span<const uint8_t>{},
+    const int64_t recoveredO = replayInstance(
+        inst, /*base=*/std::span<const uint8_t>{},
         std::span<const std::span<const uint8_t>>(records.data(), records.size()));
     inst.foldCursor   = std::max<int64_t>(recoveredO, 0);
     inst.lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
@@ -342,7 +381,7 @@ void WorkerViewSet::installViewForRecovery(
     // the highest applied checkpoint offset (the cursor that WAS persisted — the
     // exclusive "resume from" offset, see buildAndPushCheckpoint_), or -1 when
     // nothing applied (empty/missing checkpoint) -> foldCursor starts at 0.
-    const int64_t recoveredO = rune::view::replay(inst->table, inst->layout, base, deltasInOrder);
+    const int64_t recoveredO = replayInstance(*inst, base, deltasInOrder);
     inst->foldCursor   = std::max<int64_t>(recoveredO, 0);
     inst->lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
 
@@ -409,46 +448,70 @@ const uint8_t* WorkerViewSet::getRow(int32_t viewTopicId, int32_t partition, uin
 }
 
 int WorkerViewSet::buildAndPushCheckpoint_(ViewInstance& inst) {
-    const uint32_t rowLen = inst.layout.rowLen;
-
     dirtyEntries_.clear();
     rowOffsets_.clear();
     rowScratch_.clear();
 
-    // First pass: drain, copying upsert row bytes into rowScratch_ and recording
-    // their offsets (rowScratch_ may reallocate, so defer pointer fixup).
-    inst.table.drainDirty([&](uint32_t rid, const uint8_t* row, bool deleted, uint64_t key) {
-        rune::view::DirtyEntry e;
-        e.rid     = rid;
-        e.deleted = deleted;
-        e.key     = key;
-        e.row     = nullptr;  // fixed up after rowScratch_ stops growing
-        if (!deleted && row != nullptr) {
-            rowOffsets_.push_back(rowScratch_.size());
-            rowScratch_.insert(rowScratch_.end(), row, row + rowLen);
-        } else {
-            rowOffsets_.push_back(SIZE_MAX);
+    // Drain one table into the shared scratch (row bytes copied — drainDirty's
+    // pointer is only valid inside the callback; rowScratch_ may reallocate, so
+    // pointers are fixed up below once it stops growing).
+    auto drainInto = [&](rune::view::ViewTable& t, uint32_t rowLen) {
+        t.drainDirty([&](uint32_t rid, const uint8_t* row, bool deleted, uint64_t key) {
+            rune::view::DirtyEntry e;
+            e.rid     = rid;
+            e.deleted = deleted;
+            e.key     = key;
+            e.row     = nullptr;
+            if (!deleted && row != nullptr) {
+                rowOffsets_.push_back(rowScratch_.size());
+                rowScratch_.insert(rowScratch_.end(), row, row + rowLen);
+            } else {
+                rowOffsets_.push_back(SIZE_MAX);
+            }
+            dirtyEntries_.push_back(e);
+        });
+    };
+    auto fixup = [&] {
+        for (std::size_t i = 0; i < dirtyEntries_.size(); ++i) {
+            if (rowOffsets_[i] != SIZE_MAX) dirtyEntries_[i].row = rowScratch_.data() + rowOffsets_[i];
         }
-        dirtyEntries_.push_back(e);
-    });
+    };
 
-    if (dirtyEntries_.empty()) return 0;  // nothing changed this batch — no delta
-
-    // Fixup: rowScratch_ is now stable; point each upsert entry at its bytes.
-    for (std::size_t i = 0; i < dirtyEntries_.size(); ++i) {
-        if (rowOffsets_[i] != SIZE_MAX) {
-            dirtyEntries_[i].row = rowScratch_.data() + rowOffsets_[i];
-        }
-    }
-
-    // Encode the delta at this batch's snapshot offset O == the folded cursor.
     inst.pendingDelta.clear();
-    rune::view::encodeDelta(dirtyEntries_, inst.foldCursor, rowLen, inst.pendingDelta);
+    if (!inst.agg) {
+        // Replace view: unchanged Phase 1 v1 record over the output table.
+        drainInto(inst.table, inst.layout.rowLen);
+        if (dirtyEntries_.empty()) return 0;  // nothing changed this batch — no delta
+        fixup();
+        rune::view::encodeDelta(dirtyEntries_, inst.foldCursor, inst.layout.rowLen,
+                                inst.pendingDelta);
+    } else {
+        // Aggregate view: output rows + contributor map + group accumulators in
+        // ONE v2 record, so recovery always restores all three at the same O.
+        std::size_t b[4];
+        b[0] = 0;
+        drainInto(inst.table, inst.layout.rowLen);
+        b[1] = dirtyEntries_.size();
+        drainInto(inst.agg->contributors, inst.agg->layout.contributorRow.rowLen);
+        b[2] = dirtyEntries_.size();
+        drainInto(inst.agg->groups, inst.agg->layout.groupRow.rowLen);
+        b[3] = dirtyEntries_.size();
+        if (dirtyEntries_.empty()) return 0;
+        fixup();
+        auto sub = [&](int i) {
+            return std::span<const rune::view::DirtyEntry>(dirtyEntries_.data() + b[i],
+                                                          b[i + 1] - b[i]);
+        };
+        const rune::view::TableDelta tds[3] = {
+            {rune::view::kAggTableView, inst.layout.rowLen, sub(0)},
+            {rune::view::kAggTableContributors, inst.agg->layout.contributorRow.rowLen, sub(1)},
+            {rune::view::kAggTableGroups, inst.agg->layout.groupRow.rowLen, sub(2)}};
+        rune::view::encodeMultiDelta(tds, inst.foldCursor, inst.pendingDelta);
+    }
     inst.lastEncodedO = inst.foldCursor;  // attempted/encoded offset, NOT durable
     inst.pendingValid = true;
-
-    (void)tryPushDelta_(inst);  // on back-pressure the delta is held for next pass
-    return 1;                   // a delta was encoded this pass (real work)
+    (void)tryPushDelta_(inst);            // on back-pressure the delta is held for next pass
+    return 1;                             // a delta was encoded this pass (real work)
 }
 
 bool WorkerViewSet::tryPushDelta_(ViewInstance& inst) {

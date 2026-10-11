@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -47,6 +48,8 @@
 
 #include <rune/codec/Descriptor.h>
 #include <rune/storage/LogReadView.h>
+#include <rune/view/AggFold.h>
+#include <rune/view/AggState.h>
 #include <rune/view/ViewCheckpoint.h>
 #include <rune/view/ViewFold.h>
 #include <rune/view/ViewPlan.h>
@@ -93,6 +96,17 @@ enum class ViewReadiness : uint8_t { Recovering, RebuildingViews, Ready };
 [[nodiscard]] std::vector<std::span<const uint8_t>>
 splitViewCheckpointRecords(std::span<const uint8_t> bytes);
 
+// Phase 2a: the two auxiliary tables of an aggregate (view, partition).
+struct AggInstance {
+    rune::view::AggLayout layout;        // declared first: the tables are built from it
+    rune::view::ViewTable contributors;  // contributorKey -> pre-image (retraction)
+    rune::view::ViewTable groups;        // groupKey -> accumulators
+    AggInstance(rune::view::AggLayout l, std::size_t indexSlots, std::size_t chunkBytes)
+        : layout(std::move(l)),
+          contributors(layout.contributorRow, indexSlots, chunkBytes),
+          groups(layout.groupRow, indexSlots, chunkBytes) {}
+};
+
 // One installed materialized view on this worker, for ONE partition.  MOVABLE
 // (lives by value in `views_`): it declares only a converting constructor, so
 // the implicit move ctor/assignment are still generated (ViewTable and
@@ -104,6 +118,9 @@ struct ViewInstance {
     rune::codec::Descriptor            evolvingSrc;
     rune::view::VersionDescriptorCache vdc;
     rune::view::ViewTable              table;
+    // Engaged iff isAggregateView(plan) (Phase 2a); empty for Replace views,
+    // whose fold/checkpoint/recovery paths are unchanged.
+    std::optional<AggInstance>         agg;
     int32_t                            partition       = 0;
     int64_t                            foldCursor      = 0;
     // The offset O of the most recently ENCODED checkpoint delta.  This is the
@@ -349,6 +366,20 @@ public:
     // Count of installed view plans (partition-independent).
     [[nodiscard]] std::size_t viewCount() const noexcept { return templates_.size(); }
 
+    // Observability/test hook: pending dirty-tracking candidates across every
+    // table of the (view, partition) instance (0 if not hosted).  A transient
+    // instance must report 0 after each pass (its dirty state is discarded).
+    [[nodiscard]] std::size_t dirtyBacklog(int32_t viewTopicId, int32_t partition) const {
+        auto it = views_.find(instKey(viewTopicId, partition));
+        if (it == views_.end()) return 0;
+        const ViewInstance& inst = it->second;
+        std::size_t n = inst.table.dirtyRids().size();
+        if (inst.agg) {
+            n += inst.agg->contributors.dirtyRids().size() + inst.agg->groups.dirtyRids().size();
+        }
+        return n;
+    }
+
 private:
     // The installed, partition-independent plan for a view — the template every
     // per-partition ViewInstance is lazily built from.
@@ -459,9 +490,14 @@ private:
 
         int64_t cursor = inst.foldCursor;
         const rune::view::FoldStats st =
-            rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view, bound, cursor);
+            inst.agg ? rune::view::foldAggregateBatch(inst.plan, inst.layout, inst.agg->layout,
+                                                      inst.vdc, inst.table, inst.agg->contributors,
+                                                      inst.agg->groups, view, bound, cursor)
+                     : rune::view::foldBatch(inst.plan, inst.layout, inst.vdc, inst.table, view,
+                                             bound, cursor);
         inst.foldCursor = cursor;
-        work += static_cast<int>(st.applied + st.deleted + st.skippedControl + st.skippedMalformed);
+        work += static_cast<int>(st.applied + st.deleted + st.skippedControl +
+                                 st.skippedMalformed + st.skippedNoGroup);
 
         // Bug A: this pass's OWN fold may be what just caught the instance up
         // to `bound` — flip it here too (see 1b's doc comment for why this
@@ -470,8 +506,16 @@ private:
             inst.readiness = ViewReadiness::Ready;
         }
 
-        // 4. Transient views stop here — no checkpoint handoff.
-        if (!inst.persisted) return work;
+        // 4. Transient views stop here — no checkpoint handoff.  Their dirty
+        //    tracking is never drained into a delta, so DISCARD it every pass
+        //    (every table, aux tables included): otherwise each erase grows the
+        //    deleted list and each erase+reinsert re-pushes a rid onto the dirty
+        //    list without bound (zero-alloc steady state).  O(rows dirtied this
+        //    pass), no allocation.
+        if (!inst.persisted) {
+            discardDirty_(inst);
+            return work;
+        }
         work += buildAndPushCheckpoint_(inst);
         return work;
     }
@@ -481,6 +525,17 @@ private:
     // callback), encode it, and push it; holds it on ring back-pressure.
     // Returns 1 if a delta was encoded this pass (changed rows), else 0.
     int buildAndPushCheckpoint_(ViewInstance& inst);
+
+    // Clear the dirty/deleted tracking of every table of a transient instance
+    // (nothing will ever encode it).  No allocation.
+    static void discardDirty_(ViewInstance& inst) noexcept {
+        auto drop = [](uint32_t, const uint8_t*, bool, uint64_t) noexcept {};
+        inst.table.drainDirty(drop);
+        if (inst.agg) {
+            inst.agg->contributors.drainDirty(drop);
+            inst.agg->groups.drainDirty(drop);
+        }
+    }
 
     // Push inst.pendingDelta onto channel_.deltas as
     // [viewTopicId i32][partition i32][delta bytes].  Returns false (and keeps

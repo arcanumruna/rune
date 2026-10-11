@@ -6,8 +6,11 @@
 // the in-memory table and getRow() serves the latest row.
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string_view>
 #include <vector>
 
@@ -304,4 +307,242 @@ TEST(WorkerViewSetRegression, SplitterReturnsV1AndV2RecordsInFileOrder) {
 
     auto torn = file; torn.resize(torn.size() - 2);
     EXPECT_EQ(rune::node::splitViewCheckpointRecords(torn).size(), 2u) << "torn trailing record dropped";
+}
+
+namespace {
+// "order": {orderId Int64 (key), userId Int64, amount Int64} — the e2e shape.
+rune::codec::Descriptor orderSrc() {
+    return rune::codec::DescriptorBuilder("order", 1)
+        .add("orderId", rune::codec::PrimType::Int64, 1, true)
+        .add("userId", rune::codec::PrimType::Int64)
+        .add("amount", rune::codec::PrimType::Int64)
+        .build();
+}
+rune::view::ViewPlan userTotalsPlan(uint8_t persistence) {
+    using P = rune::codec::PrimType; using R = rune::view::MergeRule;
+    rune::view::ViewPlan v;
+    v.viewName = "user_totals"; v.key = "userId"; v.sources = {{6, "userId"}};
+    v.output = {{"userId", P::Int64, 0, "userId", R::Replace},
+                {"n", P::Int64, 0, "", R::CountAll},
+                {"total", P::Int64, 0, "amount", R::Sum}};
+    v.persistence = persistence;
+    return v;
+}
+std::vector<uint8_t> orderValue(int64_t orderId, int64_t userId, int64_t amount) {
+    std::vector<uint8_t> b;
+    auto le16 = [&](uint16_t v) { b.push_back(uint8_t(v)); b.push_back(uint8_t(v >> 8)); };
+    auto le64 = [&](int64_t v) { for (int i = 0; i < 8; ++i) b.push_back(uint8_t(uint64_t(v) >> (8 * i))); };
+    le16(24); le16(1); le64(orderId); le64(userId); le64(amount);
+    return b;
+}
+// One batch of (orderId, userId, amount) at `base`.
+std::vector<uint8_t> orderBatch(int64_t base, std::vector<std::array<int64_t, 3>> recs) {
+    rune::protocol::RecordBatchBuilder b(base, 0);
+    for (const auto& r : recs) {
+        const auto k = keyBytes(r[0]);
+        const auto v = orderValue(r[0], r[1], r[2]);
+        b.append(asSv(k), asSv(v), 0);
+    }
+    return b.build();
+}
+// Drains every delta frame on `ch` into payload byte vectors (header stripped).
+std::vector<std::vector<uint8_t>> drainDeltas(rune::node::ViewSnapshotChannel& ch) {
+    std::vector<std::vector<uint8_t>> deltas;
+    ch.deltas.drain([&](int32_t, aeron::concurrent::AtomicBuffer& buf,
+                        rune::node::OneToOneByteRing::index_t off,
+                        rune::node::OneToOneByteRing::index_t len) {
+        const uint8_t* p = buf.buffer() + off + rune::node::ViewSnapshotChannel::kDeltaHeaderBytes;
+        deltas.emplace_back(p, p + (len - rune::node::ViewSnapshotChannel::kDeltaHeaderBytes));
+    });
+    return deltas;
+}
+// A fresh, empty per-test view data directory.
+std::string freshDir(const std::string& name) {
+    const std::string d = "/tmp/" + name;
+    std::filesystem::remove_all(d);
+    std::filesystem::create_directories(d);
+    return d;
+}
+} // namespace
+
+TEST(WorkerViewSet, AggregateViewFoldsAndServesGroupRow) {
+    const auto src = orderSrc();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(userTotalsPlan(1), srcs, 0x40000009).value();
+    rune::node::ViewSnapshotChannel channel;
+    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-agg");
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+
+    const auto batch = orderBatch(0, {{1, 100, 10}, {2, 100, 30}, {3, 200, 5}});
+    auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, 3}; };
+    vs.driveFolds(6, 0, rr, 3, 0);
+
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = vs.getRow(0x40000009, 0, 100, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 2);    // n
+    EXPECT_EQ(rune::view::readSlot(row, *L, 2).i, 40);   // total
+}
+
+// REGRESSION (Review Focus #4): after recovery, an UPDATE to a pre-restart
+// contributor must retract its pre-restart contribution — only possible if the
+// contributor map (not just the output rows) was checkpointed and restored.
+TEST(WorkerViewSetRegression, AggregateRecoveryRestoresContributorMap) {
+    const auto src = orderSrc();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(userTotalsPlan(0), srcs, 0x40000009).value();
+
+    // 1. Fold on a persisted view and capture the checkpoint delta it pushes.
+    rune::node::ViewSnapshotChannel ch1;
+    rune::node::WorkerViewSet vs1(ch1, "/tmp/rune-views-agg-rec");
+    vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    const auto b1 = orderBatch(0, {{1, 100, 10}, {2, 100, 30}});
+    auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b1.data(), b1.size(), 0, 2}; };
+    vs1.driveFolds(6, 0, rr1, 2, 0);
+
+    const auto deltas = drainDeltas(ch1);
+    ASSERT_EQ(deltas.size(), 1u);
+    uint32_t magic; std::memcpy(&magic, deltas[0].data(), 4);
+    EXPECT_EQ(magic, rune::view::kViewCheckpointMagicV2) << "aggregate views write v2";
+
+    // 2. Recover into a fresh worker view set from that checkpoint.
+    rune::node::ViewSnapshotChannel ch2;
+    rune::node::WorkerViewSet vs2(ch2, "/tmp/rune-views-agg-rec");
+    const std::span<const uint8_t> recs[] = {deltas[0]};
+    vs2.installViewForRecovery(comp.plan, comp.rowLayout, src, /*persisted*/ true, /*partition*/ 0,
+                               /*base*/ {}, recs, /*committedTail*/ 2);
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = vs2.getRow(0x40000009, 0, 100, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 2).i, 40);
+
+    // 3. Post-recovery update of contributor 1: 10 -> 25. Correct: total 55, n 2.
+    //    A lost contributor map would give n 3, total 65.
+    const auto b2 = orderBatch(2, {{1, 100, 25}});
+    auto rr2 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b2.data(), b2.size(), 2, 3}; };
+    vs2.driveFolds(6, 0, rr2, 3, 0);
+    row = vs2.getRow(0x40000009, 0, 100, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 2);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 2).i, 55);
+}
+
+// REGRESSION: the LAZY recovery path (getOrCreate_ -> loadRecoveryCheckpoint_,
+// reading the on-disk delta file) must also restore all three aggregate tables
+// from a v2 record — not just installViewForRecovery's explicit-span path.
+TEST(WorkerViewSetRegression, AggregateLazyRecoveryLoadsV2CheckpointFile) {
+    const auto src = orderSrc();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(userTotalsPlan(0), srcs, 0x40000009).value();
+    const std::string dir = freshDir("rune-views-agg-lazy-rec");
+
+    rune::node::ViewSnapshotChannel ch1;
+    rune::node::WorkerViewSet vs1(ch1, dir);
+    vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    const auto b1 = orderBatch(0, {{1, 100, 10}, {2, 100, 30}});
+    auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b1.data(), b1.size(), 0, 2}; };
+    vs1.driveFolds(6, 0, rr1, 2, 0);
+    const auto deltas = drainDeltas(ch1);
+    ASSERT_EQ(deltas.size(), 1u);
+    {   // Exactly what the snapshot IO agent appends (same file name scheme).
+        std::ofstream f(dir + "/view-" + std::to_string(0x40000009u) + "-p0.delta", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(deltas[0].data()),
+                static_cast<std::streamsize>(deltas[0].size()));
+    }
+
+    // Restart: template installed for recovery; the instance is created lazily
+    // by driveFolds, which loads the file (O=2) then folds [2,3).
+    rune::node::ViewSnapshotChannel ch2;
+    rune::node::WorkerViewSet vs2(ch2, dir);
+    vs2.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true, /*underRecovery*/ true);
+    const auto b2 = orderBatch(2, {{1, 100, 25}});
+    auto rr2 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b2.data(), b2.size(), 2, 3}; };
+    vs2.driveFolds(6, 0, rr2, 3, 0);
+
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = vs2.getRow(0x40000009, 0, 100, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 2);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 2).i, 55);
+}
+
+// §9.7: a TRANSIENT aggregate view re-folds from the retained source on
+// restart, starting from EMPTY aux tables (no checkpoint file exists).
+TEST(WorkerViewSet, TransientAggregateRefoldsFromEmptyOnRestart) {
+    const auto src = orderSrc();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(userTotalsPlan(1), srcs, 0x40000009).value();
+    const std::string dir = freshDir("rune-views-agg-transient-refold");
+
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, dir);
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false, /*underRecovery*/ true);
+    const auto b = orderBatch(0, {{1, 100, 10}, {2, 100, 30}, {1, 100, 25}});
+    auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{b.data(), b.size(), 0, 3}; };
+    vs.driveFolds(6, 0, rr, 3, 0);
+
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = vs.getRow(0x40000009, 0, 100, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 2);
+    EXPECT_EQ(rune::view::readSlot(row, *L, 2).i, 55);
+    EXPECT_TRUE(drainDeltas(ch).empty()) << "transient views never checkpoint";
+}
+
+// Phase 1 Replace views are unchanged: still a v1 checkpoint record.
+TEST(WorkerViewSet, ReplaceViewStillWritesV1Checkpoint) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(0), srcs, 0x40000007).value();
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-test");
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    const auto batch = twoUpsertsKey7();
+    auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, 2}; };
+    vs.driveFolds(5, 0, rr, 2, 0);
+    const auto deltas = drainDeltas(ch);
+    ASSERT_EQ(deltas.size(), 1u);
+    uint32_t magic; std::memcpy(&magic, deltas[0].data(), 4);
+    EXPECT_EQ(magic, rune::view::kViewCheckpointMagic);
+}
+
+// REGRESSION (zero-alloc steady state): a TRANSIENT view never checkpoints, so
+// nothing drained its tables' dirty tracking — every erase appended to the
+// deleted list and every erase+reinsert re-pushed a rid onto the dirty list,
+// growing both without bound (an aggregate erases contributors on tombstones
+// and empty groups on moves, so it churns far more than a Replace view).  Each
+// pass must discard the dirty state of every table of a transient instance.
+TEST(WorkerViewSetRegression, TransientViewDiscardsDirtyStateEachPass) {
+    {   // Replace view.
+        auto src = charSourceV1();
+        const rune::codec::Descriptor* srcs[] = {&src};
+        auto comp = rune::view::compileView(hpView(1), srcs, 0x40000007).value();
+        rune::node::ViewSnapshotChannel ch;
+        rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-test");
+        vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+        const auto batch = twoUpsertsKey7();
+        auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, 2}; };
+        vs.driveFolds(5, 0, rr, 2, 0);
+        EXPECT_EQ(vs.dirtyBacklog(0x40000007, 0), 0u);
+    }
+    {   // Aggregate view: contributor 1 hops between groups 100 and 200, so a
+        // group empties (erase) and is recreated (reinsert) every pass.
+        const auto src = orderSrc();
+        const rune::codec::Descriptor* srcs[] = {&src};
+        auto comp = rune::view::compileView(userTotalsPlan(1), srcs, 0x40000009).value();
+        rune::node::ViewSnapshotChannel ch;
+        rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-agg");
+        vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+        for (int64_t off = 0; off < 64; ++off) {
+            const auto b = orderBatch(off, {{1, (off % 2) ? 200 : 100, 10}});
+            auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{b.data(), b.size(), off, off + 1}; };
+            vs.driveFolds(6, 0, rr, off + 1, 0);
+            ASSERT_EQ(vs.dirtyBacklog(0x40000009, 0), 0u) << "pass " << off;
+        }
+        const rune::view::RowLayout* L = nullptr;
+        const uint8_t* row = vs.getRow(0x40000009, 0, 200, L);   // off 63 -> group 200
+        ASSERT_NE(row, nullptr);
+        EXPECT_EQ(rune::view::readSlot(row, *L, 2).i, 10);
+        EXPECT_EQ(vs.getRow(0x40000009, 0, 100, L), nullptr);
+    }
 }
