@@ -72,16 +72,23 @@
 #include <rune/client/producer/Producer.h>
 #include <rune/client/view/ViewPlanAuthor.h>
 #include <rune/client/view/ViewRowCodec.h>
+#include <rune/client/TypedTopic.h>
+#include <rune/client/subscriber/Subscription.h>
+
+#include "characters.gen.h"   // Phase 2b C: build-time codegen (tests/generated/characters.blob)
 
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -342,6 +349,117 @@ static bool waitForAbsent(Client& c, int32_t viewId, uint64_t fp, int64_t u, int
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2b Part C: typed topics route by key (real broker, real Aeron).
+//
+// defineTopic "typed_route" with 8 partitions and the generated Characters
+// schema (userId is the key field) -> GetTopicSchema must report
+// partitionCount 8 -> openTopicAndWait<Characters> binds TopicHandle{id, 8}
+// -> 64 typed sends -> subscribe to EVERY partition from earliest -> every
+// record must sit on Key(userId).partition(8) with record key == Key(userId)
+// bytes, and the set of partitions hit must equal the expected set (>1).
+// Pre-2b every typed record landed on partition 0 with an empty key.
+// Returns 0 on success, else a probe exit code (40..47).
+// ---------------------------------------------------------------------------
+static int typedRoutingLeg(Client& c, std::chrono::milliseconds wait, int boundMs) {
+    constexpr int32_t kParts   = 8;
+    constexpr int     kRecords = 64;
+
+    const auto blob = rune::codec::serialize(rune::gen::Characters::descriptor());
+    DefineTopicResult def = c.defineTopicAndWait("typed_route", kParts, /*keyField=*/"userId",
+                                                 /*validate=*/false, std::span<const uint8_t>(blob), wait);
+    if (def.errorCode != 0) {
+        std::cerr << "PROBE: FAIL defineTopic(typed_route) errorCode=" << def.errorCode << "\n";
+        return 40;
+    }
+
+    const TopicSchemaResult sr = c.getTopicSchemaAndWait("typed_route", wait);
+    if (sr.errorCode != 0 || sr.partitionCount != kParts) {
+        std::cerr << "PROBE: FAIL getTopicSchema(typed_route) errorCode=" << sr.errorCode
+                  << " partitionCount=" << sr.partitionCount << " (want " << kParts << ")\n";
+        return 41;
+    }
+
+    TypedTopic<rune::gen::Characters> topic =
+        c.openTopicAndWait<rune::gen::Characters>("typed_route", wait);
+    if (topic.handle().topicId != def.topicId || topic.handle().partitionCount != kParts) {
+        std::cerr << "PROBE: FAIL typed handle {" << topic.handle().topicId << ","
+                  << topic.handle().partitionCount << "} want {" << def.topicId << "," << kParts << "}\n";
+        return 42;
+    }
+
+    std::set<int32_t> expectedParts;
+    for (int i = 0; i < kRecords; ++i) {
+        rune::gen::Characters rec;
+        rec.id       = 9000 + i;
+        rec.userId   = 1000 + i;
+        rec.strength = i;
+        rec.name     = "typed";
+        topic.send(rec);
+        expectedParts.insert(Key(static_cast<int64_t>(rec.userId)).partition(kParts));
+    }
+
+    struct Seen { int32_t partition; int64_t userId; bool keyMatches; };
+    std::mutex        mtx;
+    std::vector<Seen> seen;
+    seen.reserve(static_cast<std::size_t>(kRecords));
+
+    SubscribeOptions opts;
+    opts.from      = From::earliest();
+    opts.isolation = Isolation::ReadUncommitted;
+    const TopicHandle th{def.topicId, kParts};
+    std::vector<Subscription> subs;
+    subs.reserve(static_cast<std::size_t>(kParts));
+    for (int32_t p = 0; p < kParts; ++p) {
+        subs.push_back(c.subscribe(th, p, opts, [&, p](const Record& r) {
+            rune::gen::Characters d;
+            d.decode(r.value);
+            const Key want(static_cast<int64_t>(d.userId));
+            const bool keyOk = r.key.size() == want.size() &&
+                               std::equal(r.key.begin(), r.key.end(), want.bytes().begin());
+            std::lock_guard<std::mutex> lk(mtx);
+            seen.push_back(Seen{p, d.userId, keyOk});
+        }));
+    }
+
+    const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(boundMs);
+    while (std::chrono::steady_clock::now() < dl) {
+        { std::lock_guard<std::mutex> lk(mtx); if (static_cast<int>(seen.size()) >= kRecords) break; }
+        std::this_thread::sleep_for(10ms);   // poll to a deadline — the count decides, not the sleep
+    }
+    for (auto& s : subs) s.unsubscribe();
+
+    std::lock_guard<std::mutex> lk(mtx);
+    if (static_cast<int>(seen.size()) != kRecords) {
+        std::cerr << "PROBE: FAIL typed_route consumed " << seen.size() << " / " << kRecords << "\n";
+        return 43;
+    }
+    std::set<int32_t> gotParts;
+    for (const Seen& s : seen) {
+        const int32_t want = Key(static_cast<int64_t>(s.userId)).partition(kParts);
+        if (!s.keyMatches) {
+            std::cerr << "PROBE: FAIL typed_route userId=" << s.userId << " record key != Key(userId)\n";
+            return 44;
+        }
+        if (s.partition != want) {
+            std::cerr << "PROBE: FAIL typed_route userId=" << s.userId << " on partition " << s.partition
+                      << " want " << want << "\n";
+            return 45;
+        }
+        gotParts.insert(s.partition);
+    }
+    if (gotParts != expectedParts || gotParts.size() < 2) {
+        std::cerr << "PROBE: FAIL typed_route partitions hit=" << gotParts.size()
+                  << " expected=" << expectedParts.size() << "\n";
+        return 46;
+    }
+    std::cerr << "PROBE: typed_route OK — " << kRecords << " records over " << gotParts.size()
+              << " partitions, each on Key(userId).partition(8) with record key == Key(userId)\n";
+    std::cout << "TYPED-ROUTING: OK parts=" << kParts << " records=" << kRecords
+              << " partitionsHit=" << gotParts.size() << "\n";
+    return 0;
+}
+
 int main() {
     const std::string mode        = getEnvStr("RUNE_MODE", "setup");
     const std::string target      = getEnvStr("RUNE_TARGET");
@@ -464,6 +582,9 @@ int main() {
                                boundMs, timeoutMs, "user_totals u100 (initial)")) return 33;
             if (!waitForAbsent(c, viewA.viewTopicId, viewA.outputFingerprint, 200, boundMs, timeoutMs,
                                "user_totals u200 (emptied by group move)")) return 34;
+
+            // ---- 6. Phase 2b Part C: typed topics route by key -------------
+            if (const int rc = typedRoutingLeg(c, wait, boundMs); rc != 0) return rc;
 
             // ---- Handoff for the restart leg (scraped by the e2e script) ----
             std::cout << "VIEW_SRC_TOPIC_ID="       << def.topicId            << "\n";

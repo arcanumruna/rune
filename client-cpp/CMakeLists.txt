@@ -548,7 +548,7 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
 
     # ── Task 21 — view-engine client API probe (docker/view-engine-e2e.sh) ───
     #
-    # Unlike rune_schema_probe above, view_probe needs no build-time codegen:
+    # view_probe's VIEW legs need no build-time codegen (its Phase 2b C typed_route leg uses characters.gen.h):
     # Phase 1 has no open-by-name / descriptor-fetch wire for a view's output,
     # so the probe decodes rowBytes positionally (rune/client/view/
     # ViewRowCodec.h) against a RowLayout it builds itself from the SAME
@@ -557,8 +557,10 @@ if(BUILD_EXAMPLES AND aeron_FOUND)
     add_executable(view_probe
         examples/view_probe.cpp
     )
+    add_dependencies(view_probe generate_characters_header)   # Phase 2b C typed_route leg
     target_include_directories(view_probe PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
+        "${CMAKE_CURRENT_BINARY_DIR}/gen"   # for characters.gen.h
     )
     target_link_libraries(view_probe PRIVATE
         rune_client_api
