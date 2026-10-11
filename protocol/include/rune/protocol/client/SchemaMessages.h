@@ -118,18 +118,24 @@ struct GetTopicSchema {
     }
 };
 
-// TopicSchemaResponse (67): body = topicId:i32, version:u16, errorCode:u16, then descriptorBlob(varbytes32).
+// TopicSchemaResponse (67): body = topicId:i32, version:u16, errorCode:u16, then
+//   descriptorBlob(varbytes32), then (Phase 2b Part C, APPENDED) partitionCount:i32.
 // `version` is the schema version bound to the returned descriptorBlob (the
 // requested fingerprint's version, or latest when requestedFingerprint was 0).
-// Wire layout is unchanged.
+// `partitionCount` is the TOPIC's partition count (typed clients route records
+// by key over it).  It is a TRAILING field after the var data, so blockLength /
+// BODY_FIXED are unchanged: a pre-2b decoder stops after the blob and ignores
+// it, and a pre-2b frame (no trailing bytes) decodes here with
+// partitionCount = 0 ("not reported").
 struct TopicSchemaResponse {
     int64_t sessionId = 0, correlationId = 0;
     int32_t topicId = -1; uint16_t version = 0; uint16_t errorCode = 0;
     const uint8_t* descriptorBlob = nullptr; uint32_t descriptorLen = 0;
+    int32_t partitionCount = 0;  // Phase 2b Part C; 0 = not reported (pre-2b broker)
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::TopicSchemaResponse);
     static constexpr uint16_t BODY_FIXED  = 8;
     std::size_t encodedSize() const noexcept {
-        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 4u + descriptorLen;
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 4u + descriptorLen + 4u;
     }
     std::size_t encode(uint8_t* buf) const noexcept {
         MessageHeader hdr; hdr.blockLength = BODY_FIXED; hdr.templateId = TEMPLATE_ID;
@@ -140,6 +146,7 @@ struct TopicSchemaResponse {
         detail::putLE16(buf, static_cast<int>(pos), version); pos += 2;
         detail::putLE16(buf, static_cast<int>(pos), errorCode); pos += 2;
         pos += putVarBytes32(buf + pos, descriptorBlob, descriptorLen);
+        detail::putLE32(buf, static_cast<int>(pos), partitionCount); pos += 4;
         return pos;
     }
     static std::optional<TopicSchemaResponse> decode(const uint8_t* buf, std::size_t avail) noexcept {
@@ -152,6 +159,10 @@ struct TopicSchemaResponse {
         m.version = detail::getLE16(buf, static_cast<int>(pos)); pos += 2;
         m.errorCode = detail::getLE16(buf, static_cast<int>(pos)); pos += 2;
         if (!getVarBytes32(buf, avail, pos, m.descriptorBlob, m.descriptorLen)) return std::nullopt;
+        // Trailing (Phase 2b): absent / cut short on a pre-2b frame -> 0.
+        if (avail >= pos + 4) {
+            m.partitionCount = detail::getLE32(buf, static_cast<int>(pos)); pos += 4;
+        }
         return m;
     }
 };

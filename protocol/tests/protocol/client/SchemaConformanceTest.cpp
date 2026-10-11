@@ -227,15 +227,20 @@ TEST(SchemaConformance, GetTopicSchemaFrameCheck) {
 }
 
 // ===========================================================================
-// TopicSchemaResponse golden vector
+// TopicSchemaResponse golden vectors
+//
+// V1 = the pre-2b frame (no trailing partitionCount) — still what an old
+// broker sends; must keep decoding (partitionCount = 0, "not reported").
+// V2 = Phase 2b Part C: V1 byte-for-byte + a trailing partitionCount:i32.
 //
 // Fields:
 //   topicId        = 42
 //   version        = 1
 //   errorCode      = 0 (OK)
 //   descriptorBlob = {0xDE, 0xAD, 0xBE, 0xEF}  (4 bytes)
+//   partitionCount = 8   (V2 only)
 //
-// Wire layout (40 bytes total):
+// Wire layout (V1 40 bytes, V2 44 bytes):
 //   [0..1]   blockLength=8         : 08 00
 //   [2..3]   templateId=67         : 43 00
 //   [4..5]   schemaId=120          : 78 00
@@ -247,6 +252,7 @@ TEST(SchemaConformance, GetTopicSchemaFrameCheck) {
 //   [30..31] errorCode=0 (LE16)    : 00 00
 //   [32..35] descriptorLen=4(LE32) : 04 00 00 00
 //   [36..39] DE AD BE EF
+//   [40..43] partitionCount=8 (LE32, V2 only) : 08 00 00 00
 // ===========================================================================
 
 static constexpr uint8_t kTopicSchemaResponseGolden[] = {
@@ -267,6 +273,26 @@ static constexpr uint8_t kTopicSchemaResponseGolden[] = {
 };
 static constexpr std::size_t kTopicSchemaResponseGoldenSize = sizeof(kTopicSchemaResponseGolden);  // 40
 
+static constexpr uint8_t kTopicSchemaResponseGoldenV2[] = {
+    // header
+    0x08, 0x00,              // blockLength = 8 (unchanged: the new field is trailing)
+    0x43, 0x00,              // templateId  = 67
+    0x78, 0x00,              // schemaId    = 120
+    0x03, 0x00,              // version     = 3
+    0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,  // sessionId
+    0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A,  // correlationId
+    // body fixed (8 bytes)
+    0x2A, 0x00, 0x00, 0x00,  // topicId = 42
+    0x01, 0x00,              // version = 1
+    0x00, 0x00,              // errorCode = 0
+    // descriptorBlob varbytes32
+    0x04, 0x00, 0x00, 0x00,  // len = 4
+    0xDE, 0xAD, 0xBE, 0xEF,
+    // Phase 2b Part C: trailing partitionCount
+    0x08, 0x00, 0x00, 0x00,  // partitionCount = 8
+};
+static constexpr std::size_t kTopicSchemaResponseGoldenV2Size = sizeof(kTopicSchemaResponseGoldenV2);  // 44
+
 TEST(SchemaConformance, TopicSchemaResponseDecodeGolden) {
     ASSERT_EQ(kTopicSchemaResponseGoldenSize, 40u);
 
@@ -283,6 +309,7 @@ TEST(SchemaConformance, TopicSchemaResponseDecodeGolden) {
     ASSERT_EQ(msgOpt->descriptorLen, 4u);
     static constexpr uint8_t kBlob[] = {0xDE, 0xAD, 0xBE, 0xEF};
     EXPECT_EQ(std::memcmp(msgOpt->descriptorBlob, kBlob, 4), 0);
+    EXPECT_EQ(msgOpt->partitionCount, 0) << "a pre-2b (V1) frame reports no partition count";
 }
 
 TEST(SchemaConformance, TopicSchemaResponseEncodeGolden) {
@@ -296,14 +323,34 @@ TEST(SchemaConformance, TopicSchemaResponseEncodeGolden) {
     msg.errorCode      = 0;
     msg.descriptorBlob = kBlob;
     msg.descriptorLen  = 4;
+    msg.partitionCount = 8;
 
-    ASSERT_EQ(msg.encodedSize(), kTopicSchemaResponseGoldenSize);
+    ASSERT_EQ(msg.encodedSize(), kTopicSchemaResponseGoldenV2Size);
 
     std::array<uint8_t, 64> enc{};
     const std::size_t n = msg.encode(enc.data());
-    ASSERT_EQ(n, kTopicSchemaResponseGoldenSize);
-    EXPECT_EQ(std::memcmp(enc.data(), kTopicSchemaResponseGolden, n), 0)
-        << "Encoded TopicSchemaResponse bytes differ from golden";
+    ASSERT_EQ(n, kTopicSchemaResponseGoldenV2Size);
+    EXPECT_EQ(std::memcmp(enc.data(), kTopicSchemaResponseGoldenV2, n), 0)
+        << "Encoded TopicSchemaResponse bytes differ from the V2 golden";
+}
+
+// Phase 2b Part C (append-only wire): the V2 frame is the V1 golden
+// byte-for-byte plus 4 trailing bytes — so a pre-2b decoder (reads the fixed
+// block + blob, never past it) decodes a V2 frame to exactly the V1 fields.
+TEST(SchemaConformanceRegression, TopicSchemaResponseV2IsV1GoldenPlusTrailingPartitionCount) {
+    ASSERT_EQ(kTopicSchemaResponseGoldenV2Size, kTopicSchemaResponseGoldenSize + 4u);
+    EXPECT_EQ(std::memcmp(kTopicSchemaResponseGoldenV2, kTopicSchemaResponseGolden,
+                          kTopicSchemaResponseGoldenSize), 0)
+        << "the V2 prefix must equal the V1 frame — old decoders depend on it";
+
+    assertHeader(kTopicSchemaResponseGoldenV2, kTopicSchemaResponseGoldenV2Size,
+                 rpc::TopicSchemaResponse::TEMPLATE_ID, rpc::TopicSchemaResponse::BODY_FIXED);
+    auto v2 = rpc::TopicSchemaResponse::decode(kTopicSchemaResponseGoldenV2, kTopicSchemaResponseGoldenV2Size);
+    ASSERT_TRUE(v2.has_value());
+    EXPECT_EQ(v2->topicId, 42);
+    EXPECT_EQ(v2->version, 1u);
+    ASSERT_EQ(v2->descriptorLen, 4u);
+    EXPECT_EQ(v2->partitionCount, 8);
 }
 
 // Also verify checkFrame/peekTemplateId accept the golden bytes.
