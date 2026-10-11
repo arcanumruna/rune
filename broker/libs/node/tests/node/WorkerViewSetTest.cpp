@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string_view>
 #include <vector>
 
@@ -23,6 +24,7 @@
 
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/WorkerViewSet.h>
+
 
 namespace {
 
@@ -689,4 +691,88 @@ TEST(WorkerViewSetRegression, PersistedReplaceLargeRangeDeltasFitTheRing) {
         ASSERT_NE(row, nullptr) << i;
         EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, i);
     }
+}
+
+namespace {
+// "order_f": {orderId Int64 (key), userId Int64, amount Int64, price Float64}.
+rune::codec::Descriptor orderFSrc() {
+    return rune::codec::DescriptorBuilder("order_f", 1)
+        .add("orderId", rune::codec::PrimType::Int64, 1, true)
+        .add("userId", rune::codec::PrimType::Int64)
+        .add("amount", rune::codec::PrimType::Int64)
+        .add("price", rune::codec::PrimType::Float64)
+        .build();
+}
+rune::view::ViewPlan userSumsPlan() {
+    using P = rune::codec::PrimType; using R = rune::view::MergeRule;
+    rune::view::ViewPlan v;
+    v.viewName = "user_sums"; v.key = "userId"; v.sources = {{8, "userId"}};
+    v.output = {{"userId", P::Int64, 0, "userId", R::Replace},
+                {"total", P::Int64, 0, "amount", R::Sum},
+                {"ptotal", P::Float64, 0, "price", R::Sum}};
+    v.persistence = 0;
+    return v;
+}
+std::vector<uint8_t> orderFValue(int64_t orderId, int64_t userId, int64_t amount, double price) {
+    std::vector<uint8_t> b;
+    auto le16 = [&](uint16_t v) { b.push_back(uint8_t(v)); b.push_back(uint8_t(v >> 8)); };
+    auto le64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) b.push_back(uint8_t(v >> (8 * i))); };
+    uint64_t pbits; std::memcpy(&pbits, &price, 8);
+    le16(32); le16(1); le64(uint64_t(orderId)); le64(uint64_t(userId)); le64(uint64_t(amount)); le64(pbits);
+    return b;
+}
+} // namespace
+
+// REGRESSION (final review I3): driveView_ used to discard every FoldStats
+// counter beyond the work count, so a Sum overflow, a non-finite Float input or
+// a malformed wire key was invisible.  They now accumulate per (view,
+// partition) and are readable via foldCounters().
+TEST(WorkerViewSetRegression, FoldCountersAccumulatePerInstanceRegression) {
+    const auto src = orderFSrc();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(userSumsPlan(), srcs, 0x4000000B).value();
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-fold-counters");
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+    EXPECT_EQ(vs.foldCounters(0x4000000B, 0), nullptr) << "no instance hosted yet";
+
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    rune::protocol::RecordBatchBuilder bb(0, 0);
+    const int64_t big = std::numeric_limits<int64_t>::max();
+    const std::array<std::vector<uint8_t>, 3> vals = {orderFValue(1, 100, big, 1.5),
+                                                      orderFValue(2, 100, big, nan),
+                                                      orderFValue(3, 200, 5, 2.0)};
+    for (int i = 0; i < 3; ++i) {
+        const auto k = keyBytes(i + 1);
+        bb.append(asSv(k), asSv(vals[size_t(i)]), 0);
+    }
+    const std::vector<uint8_t> shortKey = {1, 2, 3, 4};           // 4-byte wire key
+    bb.append(asSv(shortKey), asSv(vals[2]), 0);
+    const auto batch = bb.build();
+    auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, 4}; };
+    vs.driveFolds(8, 0, rr, 4, 0);
+
+    const rune::node::ViewFoldCounters* c = vs.foldCounters(0x4000000B, 0);
+    ASSERT_NE(c, nullptr);
+    EXPECT_GE(c->aggOverflow, 1u) << "INT64_MAX + INT64_MAX overflowed the Int64 Sum";
+    EXPECT_EQ(c->aggNonFinite, 1u) << "one NaN Float input";
+    EXPECT_EQ(c->skippedMalformed, 1u) << "one 4-byte wire key";
+    EXPECT_EQ(c->skippedNoGroup, 0u);
+    EXPECT_EQ(c->aggInconsistent, 0u);
+
+    // Counters ACCUMULATE across passes (not overwritten by the last pass).
+    const auto b2 = [&] {
+        rune::protocol::RecordBatchBuilder b(4, 0);
+        const auto v = orderFValue(9, 300, 1, std::numeric_limits<double>::infinity());
+        const auto k = keyBytes(9);
+        b.append(asSv(k), asSv(v), 0);
+        return b.build();
+    }();
+    auto rr2 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b2.data(), b2.size(), 4, 5}; };
+    vs.driveFolds(8, 0, rr2, 5, 0);
+    c = vs.foldCounters(0x4000000B, 0);
+    ASSERT_NE(c, nullptr);
+    EXPECT_EQ(c->aggNonFinite, 2u);
+    EXPECT_EQ(c->skippedMalformed, 1u);
+    EXPECT_EQ(vs.foldCounters(0x4000000B, 1), nullptr) << "per partition";
 }

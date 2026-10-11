@@ -107,6 +107,18 @@ struct AggInstance {
           groups(layout.groupRow, indexSlots, chunkBytes) {}
 };
 
+// Per-(view, partition) fold-anomaly counters, accumulated from every pass's
+// rune::view::FoldStats (cumulative since the instance was created; reset on
+// restart).  Plain worker-owned integers — no allocation, no atomics; read on
+// the owning worker thread via WorkerViewSet::foldCounters().
+struct ViewFoldCounters {
+    uint64_t skippedMalformed = 0;   // wire key not exactly the view key width
+    uint64_t skippedNoGroup   = 0;   // aggregate: live record with a NULL group-by value
+    uint64_t aggOverflow      = 0;   // aggregate: Sum emitted NULL (did not fit its type)
+    uint64_t aggNonFinite     = 0;   // aggregate: NaN/+-Inf Float input treated as NULL
+    uint64_t aggInconsistent  = 0;   // aggregate: retraction found missing/zero state
+};
+
 // One installed materialized view on this worker, for ONE partition.  MOVABLE
 // (lives by value in `views_`): it declares only a converting constructor, so
 // the implicit move ctor/assignment are still generated (ViewTable and
@@ -142,6 +154,9 @@ struct ViewInstance {
     // path.  installViewForRecovery is the ONLY writer that lowers it to
     // RebuildingViews; driveRebuild is the only one that raises it back to Ready.
     ViewReadiness                      readiness       = ViewReadiness::Ready;
+
+    // Cumulative fold-anomaly counters (see ViewFoldCounters).
+    ViewFoldCounters                   counters;
 
     // A checkpoint delta encoded but not yet pushed (ring back-pressure).  Held
     // and retried next pass — the fold is NEVER re-run for already-drained
@@ -367,6 +382,15 @@ public:
     // trap.
     [[nodiscard]] uint64_t capacityExceededCount() const noexcept { return capacityExceeded_; }
 
+    // Cumulative fold-anomaly counters of the (view, partition) instance, or
+    // nullptr when no such instance is hosted here.  A pure read of
+    // worker-owned state (no allocation).
+    [[nodiscard]] const ViewFoldCounters* foldCounters(int32_t viewTopicId,
+                                                       int32_t partition) const {
+        auto it = views_.find(instKey(viewTopicId, partition));
+        return it == views_.end() ? nullptr : &it->second.counters;
+    }
+
     // Count of live per-(view, partition) instances.
     [[nodiscard]] std::size_t instanceCount() const noexcept { return views_.size(); }
     // Count of installed view plans (partition-independent).
@@ -513,6 +537,11 @@ private:
         inst.foldCursor = cursor;
         work += static_cast<int>(st.applied + st.deleted + st.skippedControl +
                                  st.skippedMalformed + st.skippedNoGroup);
+        inst.counters.skippedMalformed += st.skippedMalformed;
+        inst.counters.skippedNoGroup   += st.skippedNoGroup;
+        inst.counters.aggOverflow      += st.aggOverflow;
+        inst.counters.aggNonFinite     += st.aggNonFinite;
+        inst.counters.aggInconsistent  += st.aggInconsistent;
 
         // Bug A: this pass's OWN fold may be what just caught the instance up
         // to `bound` — flip it here too (see 1b's doc comment for why this
