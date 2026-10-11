@@ -24,6 +24,12 @@ target_link_libraries(make_characters_blob PRIVATE rune_codec)
 add_executable(make_fixedstr_sample_blob tools/make_fixedstr_sample_blob.cpp)
 target_link_libraries(make_fixedstr_sample_blob PRIVATE rune_codec)
 
+# ── Helper: make_str_keyed_blob (generates tests/generated/str_keyed.blob) ──
+# Phase 2b Part C: a string-KEYED schema so the generated key() byte-span
+# accessor is compiled and exercised (tests/GeneratedKeyTest.cpp).
+add_executable(make_str_keyed_blob tools/make_str_keyed_blob.cpp)
+target_link_libraries(make_str_keyed_blob PRIVATE rune_codec)
+
 # ── Custom command: generate characters.gen.h from characters.blob ───────────
 set(CHARACTERS_BLOB "${CMAKE_CURRENT_SOURCE_DIR}/tests/generated/characters.blob")
 set(CHARACTERS_GEN_H "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/characters.gen.h")
@@ -50,6 +56,18 @@ add_custom_command(
 )
 add_custom_target(generate_fixedstr_sample_header DEPENDS "${FIXEDSTR_SAMPLE_GEN_H}")
 
+# ── Custom command: generate str_keyed.gen.h from str_keyed.blob (Phase 2b C) ─
+set(STR_KEYED_BLOB "${CMAKE_CURRENT_SOURCE_DIR}/tests/generated/str_keyed.blob")
+set(STR_KEYED_GEN_H "${CMAKE_CURRENT_BINARY_DIR}/tests/generated/str_keyed.gen.h")
+
+add_custom_command(
+    OUTPUT  "${STR_KEYED_GEN_H}"
+    COMMAND rune_codec_gen "${STR_KEYED_BLOB}" "${STR_KEYED_GEN_H}"
+    DEPENDS rune_codec_gen "${STR_KEYED_BLOB}"
+    COMMENT "Generating str_keyed.gen.h from str_keyed.blob"
+)
+add_custom_target(generate_str_keyed_header DEPENDS "${STR_KEYED_GEN_H}")
+
 enable_testing()
 add_executable(rune_codec_tests
     tests/SmokeTest.cpp
@@ -69,11 +87,13 @@ add_executable(rune_codec_tests
     tests/EvolveTest.cpp
     tests/AlterOpsTest.cpp
     tests/MixedVersionReadTest.cpp
-    tests/DecodeBoundaryMatrixTest.cpp)
+    tests/DecodeBoundaryMatrixTest.cpp
+    tests/GeneratedKeyTest.cpp)
 target_include_directories(rune_codec_tests PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/tests")
 target_link_libraries(rune_codec_tests PRIVATE rune_codec GTest::gtest_main)
-add_dependencies(rune_codec_tests generate_characters_header generate_fixedstr_sample_header)
+add_dependencies(rune_codec_tests generate_characters_header generate_fixedstr_sample_header
+                 generate_str_keyed_header)
 include(GoogleTest)
 gtest_discover_tests(rune_codec_tests)
 

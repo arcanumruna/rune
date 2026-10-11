@@ -4,6 +4,7 @@
 #include <sstream>
 #include <cctype>
 #include <algorithm>
+#include <stdexcept>
 
 namespace rune::codec {
 
@@ -121,6 +122,43 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
         }
     }
     o << "\n";
+
+    // ── key() — Phase 2b Part C ─────────────────────────────────────────────
+    // The isKey field's value in the exact form rune::client::Key consumes, so
+    // TypedTopic::send(rec) routes like Producer::send(h, Key(rec.key()), ...):
+    //   scalar      -> by value  (Key(int64_t)/Key(uint64_t) = 8 LE bytes;
+    //                             other scalars = their raw bytes)
+    //   string(N)   -> const std::array<char, N>&  (its N raw bytes)
+    //   string/bytes-> std::span<const uint8_t> over the CONTENT — never a
+    //                  std::string_view: that is trivially copyable, so Key
+    //                  would hash the view object (pointer + length) instead.
+    // No isKey field -> no key(): TypedTopic sends partition 0 + empty key.
+    {
+        const FieldDescriptor* kf = nullptr;
+        for (const auto& f : d.fields) {
+            if (f.isKey) { kf = &f; break; }
+        }
+        if (kf != nullptr) {
+            if (d.find("key") != nullptr) {
+                throw std::invalid_argument(
+                    "generateHeader: schema '" + d.name + "' has a field named 'key', which "
+                    "collides with the generated key() accessor of its key field '" + kf->name +
+                    "' — rename the field");
+            }
+            if (isVarLen(kf->type)) {
+                o << "    [[nodiscard]] std::span<const uint8_t> key() const noexcept {\n";
+                o << "        return {reinterpret_cast<const uint8_t*>(" << kf->name << ".data()), "
+                  << kf->name << ".size()};\n";
+                o << "    }\n\n";
+            } else if (kf->type == PrimType::FixedStr) {
+                o << "    [[nodiscard]] const std::array<char, " << kf->fixedLen
+                  << ">& key() const noexcept { return " << kf->name << "; }\n\n";
+            } else {
+                o << "    [[nodiscard]] " << cppType(kf->type)
+                  << " key() const noexcept { return " << kf->name << "; }\n\n";
+            }
+        }
+    }
 
     // ── encodedSize() ────────────────────────────────────────────────────────
     // total = 4 (header) + blockLength + sum(4 + len) for each var field
