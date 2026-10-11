@@ -882,3 +882,53 @@ TEST(WorkerViewSetRegression, FoldCountersAccumulatePerInstanceRegression) {
     EXPECT_EQ(c->skippedMalformed, 1u);
     EXPECT_EQ(vs.foldCounters(0x4000000B, 1), nullptr) << "per partition";
 }
+
+// REGRESSION (final review I4): recovery from a checkpoint whose O lies in the
+// MIDDLE of a source batch (a capped pass ended mid-batch), then continued
+// folding over that SAME whole batch, must skip every offset below O — exact
+// final totals, no double counting.
+TEST(WorkerViewSetRegression, RecoveryFromMidBatchOffsetThenContinuedFoldIsExactRegression) {
+    const auto src = orderSrc();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(userTotalsPlan(0), srcs, 0x40000009).value();
+    constexpr int64_t kN = 5000;
+    std::vector<std::array<int64_t, 3>> recs;
+    for (int64_t i = 1; i <= kN; ++i) recs.push_back({i, i % 10, i});
+    const auto batch = orderBatch(0, recs);   // ONE batch [0, kN)
+    auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, kN}; };
+
+    rune::node::ViewSnapshotChannel ch1;
+    rune::node::WorkerViewSet vs1(ch1, "/tmp/rune-views-agg-midbatch");
+    vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    std::vector<std::vector<uint8_t>> deltas;
+    driveToEnd(vs1, ch1, 6, rr, kN, deltas);
+    ASSERT_GE(deltas.size(), 3u) << "the single batch must be split across capped passes";
+
+    // Recover from a PREFIX only: its last O is strictly inside the batch.
+    const std::size_t prefix = deltas.size() / 2;
+    std::vector<std::span<const uint8_t>> spans(deltas.begin(), deltas.begin() + std::ptrdiff_t(prefix));
+    uint64_t prefixO = 0;
+    std::memcpy(&prefixO, deltas[prefix - 1].data() + 4, 8);   // v2 header: magic u32, O i64, tableCount u8
+    ASSERT_GT(int64_t(prefixO), 0);
+    ASSERT_LT(int64_t(prefixO), kN) << "recovered O must be mid-batch";
+
+    rune::node::ViewSnapshotChannel ch2;
+    rune::node::WorkerViewSet vs2(ch2, "/tmp/rune-views-agg-midbatch");
+    vs2.installViewForRecovery(comp.plan, comp.rowLayout, src, /*persisted*/ true, 0, {},
+                               std::span<const std::span<const uint8_t>>(spans.data(), spans.size()),
+                               /*committedTail*/ kN);
+    EXPECT_EQ(vs2.readiness(0x40000009, 0), rune::node::ViewReadiness::RebuildingViews);
+    std::vector<std::vector<uint8_t>> more;
+    driveToEnd(vs2, ch2, 6, rr, kN, more);   // the reader hands back the WHOLE batch each pass
+    EXPECT_EQ(vs2.readiness(0x40000009, 0), rune::node::ViewReadiness::Ready);
+
+    const rune::view::RowLayout* L = nullptr;
+    for (int64_t g = 0; g < 10; ++g) {
+        int64_t total = 0;
+        for (int64_t i = 1; i <= kN; ++i) if (i % 10 == g) total += i;
+        const uint8_t* row = vs2.getRow(0x40000009, 0, uint64_t(g), L);
+        ASSERT_NE(row, nullptr) << "group " << g;
+        EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, kN / 10) << "group " << g;
+        EXPECT_EQ(rune::view::readSlot(row, *L, 2).i, total) << "group " << g;
+    }
+}
