@@ -98,12 +98,15 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/LogReadView.h>
 #include <rune/view/PlanCompiler.h>
+#include <rune/view/AggFold.h>
+#include <rune/view/AggState.h>
 #include <rune/view/ViewFold.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <random>
 #include <string_view>
@@ -185,6 +188,38 @@ double percentileUs(std::vector<uint32_t>& v, double frac) {
     size_t i = static_cast<size_t>(v.size() * frac);
     if (i >= v.size()) i = v.size() - 1;
     return v[i] / 1000.0; // ns -> us
+}
+
+
+// --- Aggregate fixtures (Phase 2a) ---
+// {orderId Int64 (key), userId Int64, amount Int64}
+rune::codec::Descriptor orderSourceV1() {
+    return rune::codec::DescriptorBuilder("order", 1)
+        .add("orderId", PrimType::Int64, 1, /*isKey*/ true)
+        .add("userId", PrimType::Int64)
+        .add("amount", PrimType::Int64)
+        .build();
+}
+
+rune::view::ViewPlan userTotalsView() {
+    rune::view::ViewPlan v;
+    v.viewName = "user_totals";
+    v.key      = "userId";
+    v.sources  = {{5, "userId"}};
+    v.output   = {{"userId", PrimType::Int64, 0, "userId", rune::view::MergeRule::Replace},
+                  {"n", PrimType::Int64, 0, "", rune::view::MergeRule::CountAll},
+                  {"total", PrimType::Int64, 0, "amount", rune::view::MergeRule::Sum},
+                  {"avg", PrimType::Float64, 0, "amount", rune::view::MergeRule::Avg}};
+    return v;
+}
+
+// [blockLength u16 = 24][version u16][orderId i64][userId i64][amount i64]
+std::vector<uint8_t> encodeOrder(int64_t id, int64_t user, int64_t amount, uint16_t version) {
+    std::vector<uint8_t> b;
+    auto le16 = [&](uint16_t v) { b.push_back(uint8_t(v)); b.push_back(uint8_t(v >> 8)); };
+    auto le64 = [&](int64_t v) { for (int i = 0; i < 8; ++i) b.push_back(uint8_t(uint64_t(v) >> (8 * i))); };
+    le16(24); le16(version); le64(id); le64(user); le64(amount);
+    return b;
 }
 
 } // namespace
@@ -409,6 +444,245 @@ static void BM_ViewFoldReplace(benchmark::State& st) {
     }
 }
 BENCHMARK(BM_ViewFoldReplace)
+    ->Unit(benchmark::kMicrosecond)
+    ->Iterations(1)
+    ->UseRealTime();
+
+static void BM_ViewFoldAggregate(benchmark::State& st) {
+    constexpr uint64_t kWarmupOps     = 20'000;
+    constexpr uint64_t kMeasuredOps   = 2'000'000;
+    constexpr uint64_t kAllocProbeOps = 100'000;
+    constexpr uint64_t kTotalOps      = kWarmupOps + kMeasuredOps + kAllocProbeOps;
+    // Small-batch cycle (avg 2 records/batch) -- "single-record (or small)
+    // batches" per the brief -- so record_p* and batch_p* are genuinely
+    // distinct populations (see file header).
+    constexpr int kBatchSizes[] = {1, 2, 1, 3, 2, 1, 4, 2};
+    constexpr size_t kBatchSizesLen = sizeof(kBatchSizes) / sizeof(kBatchSizes[0]);
+
+    for (auto _ : st) {
+        auto src = orderSourceV1();
+        const rune::codec::Descriptor* srcs[] = {&src};
+        auto comp = compileView(userTotalsView(), srcs, 0x51000002).value();
+        auto agg = rune::view::buildAggLayout(comp.plan, src).value();
+
+        ViewTable view(comp.rowLayout);
+        ViewTable contributors(agg.contributorRow), groups(agg.groupRow);
+        VersionDescriptorCache vdc(src);
+
+        // --- Pre-generate the churn op stream (NOT timed) -----------------
+        std::vector<uint64_t> alive;
+        alive.reserve(static_cast<size_t>(kTotalOps * 0.65) + 16);
+        std::unordered_map<uint64_t, uint32_t> idx;
+        idx.reserve(static_cast<size_t>(kTotalOps * 1.3));
+
+        std::mt19937_64 rng(0xF01DF01Dull);
+        std::uniform_int_distribution<int> opDist(0, 99);
+        std::uniform_int_distribution<size_t> pick;
+
+        uint64_t nextKey = 1;
+        std::vector<Op> ops;
+        ops.reserve(kTotalOps);
+
+        for (uint64_t i = 0; i < kTotalOps; ++i) {
+            const int r = opDist(rng);
+            const bool doCreate = (r < 60) || alive.empty();
+            const bool doUpdate = !doCreate && (r < 85);
+
+            if (doCreate) {
+                const uint64_t key = nextKey++;
+                idx[key] = static_cast<uint32_t>(alive.size());
+                alive.push_back(key);
+                ops.push_back(Op{key, static_cast<int32_t>(key), false});
+            } else if (doUpdate) {
+                pick.param(std::uniform_int_distribution<size_t>::param_type(0, alive.size() - 1));
+                const uint64_t key = alive[pick(rng)];
+                ops.push_back(Op{key, static_cast<int32_t>(key ^ i), false});
+            } else {
+                pick.param(std::uniform_int_distribution<size_t>::param_type(0, alive.size() - 1));
+                const size_t pos = pick(rng);
+                const uint64_t key = alive[pos];
+                const uint32_t lastIdx = static_cast<uint32_t>(alive.size() - 1);
+                const uint64_t lastKey = alive[lastIdx];
+                alive[pos] = lastKey;
+                idx[lastKey] = static_cast<uint32_t>(pos);
+                alive.pop_back();
+                idx.erase(key);
+                ops.push_back(Op{key, 0, true});
+            }
+        }
+
+        // --- Group ops into small committed batches; build real,
+        //     CRC-stamped wire bytes (NOT timed). -----------------------
+        std::vector<uint8_t> allBytes;
+        allBytes.reserve(ops.size() * 48);
+        std::vector<size_t>  batchByteOffset;
+        std::vector<uint32_t> batchByteLen;
+        std::vector<uint32_t> batchRecCount;
+        std::vector<int64_t>  batchBaseOffset;
+        batchByteOffset.reserve(ops.size());
+        batchByteLen.reserve(ops.size());
+        batchRecCount.reserve(ops.size());
+        batchBaseOffset.reserve(ops.size());
+
+        {
+            size_t opIdx = 0;
+            size_t sizeIdx = 0;
+            int64_t nextOffset = 0;
+            while (opIdx < ops.size()) {
+                const uint32_t want = static_cast<uint32_t>(kBatchSizes[sizeIdx % kBatchSizesLen]);
+                ++sizeIdx;
+                const uint32_t n = static_cast<uint32_t>(std::min<size_t>(want, ops.size() - opIdx));
+
+                rune::protocol::RecordBatchBuilder bb(nextOffset, 0);
+                for (uint32_t j = 0; j < n; ++j) {
+                    const Op& op = ops[opIdx + j];
+                    // Contributor id c in [0, 1M); group fixed per c.
+                    const int64_t c = static_cast<int64_t>(op.key % 1'000'000ull);
+                    const auto kb = keyBytes(c);
+                    if (op.tombstone) {
+                        bb.append(asSv(kb), std::string_view{}, 0);
+                    } else {
+                        const auto val = encodeOrder(c, c % 10'000, static_cast<int64_t>(op.hp), 1);
+                        bb.append(asSv(kb), asSv(val), 0);
+                    }
+                }
+
+                const size_t byteOff = allBytes.size();
+                auto bytes = bb.build();
+                allBytes.insert(allBytes.end(), bytes.begin(), bytes.end());
+
+                batchBaseOffset.push_back(nextOffset);
+                batchByteOffset.push_back(byteOff);
+                batchByteLen.push_back(static_cast<uint32_t>(bytes.size()));
+                batchRecCount.push_back(n);
+
+                nextOffset += n;
+                opIdx += n;
+            }
+        }
+
+        const size_t numBatches = batchBaseOffset.size();
+
+        auto foldOneBatch = [&](size_t i) {
+            const uint32_t n = batchRecCount[i];
+            rune::storage::LogReadView lv{
+                allBytes.data() + batchByteOffset[i], batchByteLen[i],
+                batchBaseOffset[i], batchBaseOffset[i] + n};
+            int64_t cur = 0;
+            return foldAggregateBatch(comp.plan, comp.rowLayout, agg, vdc, view, contributors, groups,
+                                      lv, batchBaseOffset[i] + n, cur);
+        };
+
+        // --- Phase 1: WARMUP (NOT timed, NOT alloc-tracked). See file
+        //     header for why. -------------------------------------------
+        size_t bi = 0;
+        uint64_t recFolded = 0;
+        while (bi < numBatches && recFolded < kWarmupOps) {
+            foldOneBatch(bi);
+            recFolded += batchRecCount[bi];
+            ++bi;
+        }
+
+        // --- Phase 2: MEASURED LATENCY pass (timed, NOT alloc-tracked):
+        //     record_p50/p99 (TRUE per-record, size-1-batch calls only),
+        //     batch_p50/p99 (every foldBatch() call, any size). ------------
+        std::vector<uint32_t> batchLatNs;
+        batchLatNs.reserve(kMeasuredOps / 2 + 16);
+        // Only size-1-batch calls are pushed here -- see file header: a
+        // size-1 foldBatch() call's whole latency IS one record's pipeline
+        // cost, with no batch-overhead amortization to divide out. ~37% of
+        // batches are size 1 (the kBatchSizes cycle below), so this is a
+        // large (~375K over a 2M-record pass), genuinely single-record
+        // subpopulation -- not a quotient smoothed across a multi-record
+        // batch.
+        std::vector<uint32_t> trueRecordLatNs;
+        trueRecordLatNs.reserve(kMeasuredOps / 2 + 16);
+
+        uint64_t appliedTotal = 0, deletedTotal = 0, skippedTotal = 0;
+        uint64_t measuredRecFolded = 0;
+        while (bi < numBatches && measuredRecFolded < kMeasuredOps) {
+            const uint32_t n = batchRecCount[bi];
+
+            const auto t0 = std::chrono::steady_clock::now();
+            auto stats = foldOneBatch(bi);
+            const auto t1 = std::chrono::steady_clock::now();
+
+            const uint64_t ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+            batchLatNs.push_back(static_cast<uint32_t>(ns));
+            if (n == 1) {
+                // Genuine single-record fold: no division, no amortization.
+                trueRecordLatNs.push_back(static_cast<uint32_t>(ns));
+            }
+
+            appliedTotal += stats.applied;
+            deletedTotal += stats.deleted;
+            skippedTotal += stats.skippedMalformed + stats.skippedControl;
+
+            measuredRecFolded += n;
+            ++bi;
+        }
+
+        // Flush the per-rid dirty-tracking side vectors (dirtyList_/
+        // deleted_) back to size 0 at their already-large retained
+        // capacity -- itself alloc-free (two clear() calls) -- so the
+        // alloc-check window below cannot see one of their own (ordinary,
+        // non-pre-provisioned) amortized growth reallocations. See file
+        // header.
+        view.drainDirty([](uint32_t, const uint8_t*, bool, uint64_t) {});
+
+        // --- Phase 3: STEADY ALLOC-CHECK pass. By this point the index's
+        //     capacity has already grown (via its de-amortized,
+        //     pre-provisioned doubling machinery) far past this probe's
+        //     own modest net growth -- see file header for the headroom
+        //     arithmetic -- so this window is genuinely allocation-free
+        //     BY DESIGN, not by luck. -------------------------------------
+        g_allocCount.store(0, std::memory_order_relaxed);
+        g_allocEnabled.store(true, std::memory_order_relaxed);
+
+        uint64_t probeRecFolded = 0;
+        while (bi < numBatches && probeRecFolded < kAllocProbeOps) {
+            auto stats = foldOneBatch(bi);
+            appliedTotal += stats.applied;
+            deletedTotal += stats.deleted;
+            skippedTotal += stats.skippedMalformed + stats.skippedControl;
+            probeRecFolded += batchRecCount[bi];
+            ++bi;
+        }
+
+        g_allocEnabled.store(false, std::memory_order_relaxed);
+        const int64_t steadyAlloc = g_allocCount.load(std::memory_order_relaxed);
+
+        benchmark::DoNotOptimize(view.size());
+        benchmark::DoNotOptimize(groups.size());
+
+        // record_p50/p99: TRUE per-record order statistic (size-1-batch
+        // calls only -- see file header and phase-2 loop comment above; NOT
+        // a batch-latency/n quotient).
+        st.counters["agg_record_p50_us"] = percentileUs(trueRecordLatNs, 0.50);
+        st.counters["agg_record_p99_us"] = percentileUs(trueRecordLatNs, 0.99); // GATE: < 5us
+        st.counters["agg_batch_p50_us"]  = percentileUs(batchLatNs, 0.50);
+        st.counters["agg_batch_p99_us"]  = percentileUs(batchLatNs, 0.99);  // GATE: < 10us
+        st.counters["agg_steady_alloc"]  = static_cast<double>(steadyAlloc); // GATE: == 0
+        st.counters["agg_true_record_samples"] = static_cast<double>(trueRecordLatNs.size());
+        st.counters["agg_measured_batches"] = static_cast<double>(batchLatNs.size());
+        st.counters["agg_alloc_probe_records"] = static_cast<double>(probeRecFolded);
+        st.counters["agg_applied_total"]    = static_cast<double>(appliedTotal);
+        st.counters["agg_deleted_total"]    = static_cast<double>(deletedTotal);
+        st.counters["agg_skipped_total"]    = static_cast<double>(skippedTotal);
+        st.counters["agg_final_size"]       = static_cast<double>(view.size());
+
+        const double recP99 = st.counters["agg_record_p99_us"];
+        const double batP99 = st.counters["agg_batch_p99_us"];
+        const bool pass = recP99 < 5.0 && batP99 < 10.0 && steadyAlloc == 0;
+        st.counters["agg_gate_pass"] = pass ? 1.0 : 0.0;
+        std::fprintf(stderr,
+                     "[ViewFoldAggregate gate] agg_record_p99_us=%.3f (<5) agg_batch_p99_us=%.3f (<10) "
+                     "steady_alloc=%lld (==0) => %s\n",
+                     recP99, batP99, static_cast<long long>(steadyAlloc), pass ? "PASS" : "FAIL");
+    }
+}
+BENCHMARK(BM_ViewFoldAggregate)
     ->Unit(benchmark::kMicrosecond)
     ->Iterations(1)
     ->UseRealTime();
