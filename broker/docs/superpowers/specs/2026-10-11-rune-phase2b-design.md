@@ -12,8 +12,9 @@ Four parts, four independent implementation plans:
 | **B** | Zero-copy produce: `tryClaim`, `claimBatch`, SBE-style flyweights | client, codec |
 | **C** | Typed topics route by key (fix: always partition 0) | client, protocol, broker |
 | **D** | `rune console` (Rune QL); `rune schema` read-only | ql, client |
+| **E** | Transient topics: rename memory topics, definable from Rune QL and the client | broker, protocol, client, ql |
 
-Order: **C → D → B → A**, with A runnable in parallel with B/D (disjoint repos/files). C first because it is a correctness bug and B's typed claim builds on it.
+Order: **C → E → D → B → A**, with A runnable in parallel with B/D (disjoint repos/files). C first because it is a correctness bug and B's typed claim builds on it.
 
 ---
 
@@ -110,7 +111,7 @@ For schemas whose fields are **all fixed-size** (approved scope), the generator 
 - `rune console [--broker <aeron channel>] [--cli-egress <ch>] [-f script.rql]`; broker also from `RUNE_BROKER` / `RUNE_EGRESS` (existing `buildClientConfig`).
 - Interactive: prompt `rune> `, continuation `   ...> ` until a `;` outside comments; executes each statement with one connected client for the whole session; prints `ok topic player v1 (8 partitions)` / `ok topic player v2` or the error (`line:col: message` for parse errors, the broker error name for broker errors); an error never ends the session. `exit` / `quit` / EOF leaves.
 - `-f script.rql`: same execution over a file; stops at the first error, exit code non-zero.
-- Statements in 2b: `topic …;`, `alter topic …;`. (`create view`, `get` arrive with Phase 3.)
+- Statements in 2b: `topic …;`, `transient topic …;`, `alter topic …;`. (`create view`, `get` arrive with Phase 3.)
 
 ### `rune schema`
 - Keeps `list`, `get`, `generate`. **Removes `apply` and `alter`**; their offline/live tests are migrated to console tests (same assertions through the console).
@@ -121,9 +122,23 @@ For schemas whose fields are **all fixed-size** (approved scope), the generator 
 
 ---
 
+## E. Transient topics
+
+**Today:** a topic can be memory-backed (`PersistenceMode::Memory`, `InMemoryLog`): replicated to a majority before ack, never written to disk. It can only be declared in the broker's static `RUNE_TOPICS` config (`persistence=memory`), not from Rune QL, `defineTopic`, or the console.
+
+**2b (user decision 2026-10-11): memory topics are renamed transient topics and become definable at runtime.**
+- **Rename everywhere:** `PersistenceMode::Memory` → `PersistenceMode::Transient`; `RUNE_TOPICS … persistence=transient`; docs, logs, metrics labels. `persistence=memory` stays accepted as an alias that logs a one-line deprecation warning (existing compose files keep working).
+- **Rune QL:** `transient topic <name> { … } partitions N key K;` → `TopicDef.persistence`. `alter topic` cannot change persistence (rejected with a clear error).
+- **Wire:** `DefineTopic` gains an appended `persistence` byte (0 = disk, 1 = transient; old clients send nothing → disk). `Client::defineTopicAndWait(..., Persistence::Transient)` overload.
+- **Broker:** `AdminWorker` creates the runtime topic on `InMemoryLog` when transient. `TopicSchema` records the mode (appended trailer field, same pattern as Phase 1's `topicName`) so restart recovery (`recoverRuntimeTopicSpecs`) recreates the topic as transient: metadata survives, data does not (a restarted node rejoins empty and catches up from peers that still hold it; after a full-cluster restart a transient topic is empty — documented).
+- **Views over transient topics:** allowed. A persisted view over a transient topic keeps its checkpoint; a transient view over a transient topic is empty after a full restart. Documented, no special casing.
+- **Gates:** Rune QL parse/backend tests; DefineTopic round-trip with and without the byte (old-client compatibility, `*Regression*`); broker test that a transient runtime topic is created on `InMemoryLog`, survives node restart as a transient (empty) topic, and is replicated before ack under `acks=All`; e2e: console defines a transient topic, produce + subscribe work, restart → topic exists and is empty.
+
+---
+
 ## Out of scope for 2b (Phase 3)
 Views are **persisted by default** (checkpointed fold state, recovered on restart — unchanged from Phase 1/2a); when `create view` lands in Rune QL, persistence is the default and `transient` is the opt-in.
-Composite keys with a partition prefix (`key (userId, characterId) partition by userId`), co-partitioned 1:1 and 1:N joins, `create view` / `get` in Rune QL and the console, generated view decoders, broker-side topic listing, multi-partition aggregates (unlocked by composite keys).
+`create transient view` syntax (transient views themselves already exist via the API), composite keys with a partition prefix (`key (userId, characterId) partition by userId`), co-partitioned 1:1 and 1:N joins, `create view` / `get` in Rune QL and the console, generated view decoders, broker-side topic listing, multi-partition aggregates (unlocked by composite keys).
 
 ## Global constraints
 CLAUDE.md hard rules (shared-nothing, rings only, state machines, zero steady-state allocation, test + benchmark everything, `*Regression*` test per fix, full Regression suite first, fix-on-sight). Wire enums append-only. Nothing pushed without consent. Commit attribution `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
