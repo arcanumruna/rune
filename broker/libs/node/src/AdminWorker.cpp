@@ -832,6 +832,18 @@ void AdminWorker::answerInFlight_(uint16_t code, int32_t topicId) {
     state_ = DdlState::Idle;
 }
 
+// ─── answerMissingCommitReplica_ — AwaitingCommit with no replica to gate on ──
+// B4 fix round 1: never a silent drop (the client would hang).  Unreachable in
+// production — an op reaches AwaitingCommit only after appending to that very
+// replica — so it is loud: logged, counted, answered Internal (outcome unknown).
+void AdminWorker::answerMissingCommitReplica_(const char* catalog) {
+    ++commitReplicaMissing_;
+    spdlog::error("AdminWorker: in-flight DDL op (ticket={}) in AwaitingCommit has no {} "
+                  "replica / catalog to commit on; answering Internal (count={})",
+                  inFlight_->ticket, catalog, commitReplicaMissing_);
+    answerInFlight_(kInternal, inFlight_->kind == DdlKind::Alter ? inFlight_->topicId : -1);
+}
+
 // ─── advance_ — AWAITING_COMMIT (HW gate) + timeout ──────────────────────────
 bool AdminWorker::advance_(int64_t nowNs) {
     if (state_ == DdlState::Idle || !inFlight_) return false;
@@ -846,8 +858,9 @@ bool AdminWorker::advance_(int64_t nowNs) {
         // Task 19: CREATE VIEW's durable record lives on the __views replica, so
         // its HW gate (and commit) use viewsReplica_, not the schema replica_.
         if (inFlight_->kind == DdlKind::CreateView) {
-            if (!viewsReplica_ || !viewRegistry_) {
-                inFlight_.reset(); state_ = DdlState::Idle; return true;
+            if (!viewsReplica_ || !viewRegistry_) [[unlikely]] {
+                answerMissingCommitReplica_("__views");
+                return true;
             }
             if (viewsReplica_->highWatermark() <= inFlight_->appendedLast) return false;
             commitCreateView_();
@@ -856,7 +869,10 @@ bool AdminWorker::advance_(int64_t nowNs) {
             return true;
         }
 
-        if (!replica_) { inFlight_.reset(); state_ = DdlState::Idle; return true; }
+        if (!replica_) [[unlikely]] {
+            answerMissingCommitReplica_("__topic_schemas");
+            return true;
+        }
         // D: true majority-durable — HW must cover the appended offset.
         if (replica_->highWatermark() <= inFlight_->appendedLast) return false;
 

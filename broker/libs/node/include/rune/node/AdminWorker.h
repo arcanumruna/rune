@@ -217,6 +217,21 @@ public:
     /// No-hang fix round 3: the DDL queue bound; a request beyond it is answered Internal.
     static constexpr std::size_t kMaxPendingDdl = 256;
     [[nodiscard]] uint64_t pendingDdlRefused() const noexcept { return pendingDdlRefused_; }
+    /// B4 fix round 1: in-flight ops answered Internal because their commit
+    /// replica (or the view catalog) was missing in AwaitingCommit — never dropped.
+    [[nodiscard]] uint64_t commitReplicaMissing() const noexcept { return commitReplicaMissing_; }
+    /// Test-only: swap the schema / __views replica pointers (nullptr forces the
+    /// missing-replica AwaitingCommit branch).  Returns the previous pair.
+    struct ReplicasForTest {
+        rune::replication::PartitionReplica* schema = nullptr;
+        rune::replication::PartitionReplica* views  = nullptr;
+    };
+    ReplicasForTest swapReplicasForTest(ReplicasForTest r) noexcept {
+        const ReplicasForTest old{replica_, viewsReplica_};
+        replica_ = r.schema;
+        viewsReplica_ = r.views;
+        return old;
+    }
 
     // Fail-loud recovery signal (regression fix): true iff the most recent
     // rebuildFromLog_() (Follower->Leader promotion replay) hit a corrupt or
@@ -240,6 +255,8 @@ public:
 private:
     // Rebuild the SchemaRegistry from [0, HW) of the schema replica.
     void rebuildFromLog_();
+    // B4 fix round 1: AwaitingCommit with no replica/catalog -> log, count, answer Internal.
+    void answerMissingCommitReplica_(const char* catalog);
 
     // Task 19b (restart recovery): the view counterpart of rebuildFromLog_, on
     // the SAME Follower->Leader edge.  Rebuild the ViewRegistry from [0, HW) of
@@ -373,6 +390,7 @@ private:
     std::optional<DdlOp> inFlight_;
     std::deque<PendingDdl> pending_;        // queued DDL ops (CREATE + ALTER, serialized); <= kMaxPendingDdl
     uint64_t pendingDdlRefused_ = 0;        // fix round 3: answered Internal because the queue was full
+    uint64_t commitReplicaMissing_ = 0;     // B4 fix round 1: AwaitingCommit with no commit replica
     int64_t         nextTicket_ = 1;
     uint64_t        started_    = 0;    // ops dequeued by startNext_ (startedCount())
 

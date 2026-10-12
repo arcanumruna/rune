@@ -1275,3 +1275,61 @@ TEST(DdlFixRegression, B9_AViewOutputAsALaterSourceIsViewSourceIsView) {
     EXPECT_EQ(h.catalog(), before);
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
+
+// ── B4 fix round 1: AwaitingCommit with its commit replica missing answers the
+//    op Internal (never a silent drop: the client would hang), logs, counts, and
+//    the next queued op starts.  Unreachable in production (an op reaches
+//    AwaitingCommit only after appending to that replica); forced via the
+//    test-only swapReplicasForTest hook.
+TEST(DdlFixRegression, B4_MissingSchemaReplicaInAwaitingCommitAnswersInternal) {
+    for (const Op op : {Op::AlterAdd, Op::DefineDisk}) {
+        SCOPED_TRACE(opName(op));
+        DdlHarnessOptions o;
+        o.holdCommits = true;
+        DdlHarness h(o);
+        const int64_t a = h.submit(op, op == Op::AlterAdd ? "src" : "n");
+        ASSERT_TRUE(h.tickUntilAppended());
+        ASSERT_TRUE(h.worker().hasInFlight());
+        const int64_t next = h.submit(Op::ViewPersisted, "v");   // uses only the __views replica
+        const auto saved = h.worker().swapReplicasForTest({});
+        (void)h.worker().swapReplicasForTest({nullptr, saved.views});
+        h.tick();
+        ASSERT_TRUE(h.response(a).has_value()) << "answered, never silently dropped";
+        EXPECT_EQ(h.response(a)->err, kInternal);
+        EXPECT_EQ(h.worker().commitReplicaMissing(), 1u);
+        EXPECT_EQ(h.worker().startedCount(), 4u) << "the next queued op started (2 setup defines + a + next)";
+        (void)h.worker().swapReplicasForTest(saved);
+        h.settle();
+        ASSERT_TRUE(h.response(next).has_value());
+        EXPECT_EQ(h.response(next)->err, kOk);
+        EXPECT_EQ(h.schemas().byName("n"), nullptr);
+        EXPECT_EQ(h.schemas().byName("src")->version, 1u) << "never applied live";
+        EXPECT_TRUE(h.violations().empty()) << h.violationText();
+    }
+}
+
+TEST(DdlFixRegression, B4_MissingViewsReplicaInAwaitingCommitAnswersInternal) {
+    DdlHarnessOptions o;
+    o.holdCommits = true;
+    DdlHarness h(o);
+    const int pushes0 = h.viewPlanPushes();
+    const int64_t v = h.submit(Op::ViewPersisted, "v");
+    ASSERT_TRUE(h.tickUntilAppended());
+    ASSERT_TRUE(h.worker().hasInFlight());
+    const int64_t next = h.submit(Op::AlterAdd, "src");   // uses only the schema replica
+    const auto saved = h.worker().swapReplicasForTest({});
+    (void)h.worker().swapReplicasForTest({saved.schema, nullptr});
+    h.tick();
+    ASSERT_TRUE(h.response(v).has_value()) << "answered, never silently dropped";
+    EXPECT_EQ(h.response(v)->err, kInternal);
+    EXPECT_EQ(h.worker().commitReplicaMissing(), 1u);
+    EXPECT_TRUE(h.worker().hasInFlight()) << "the next queued op (the ALTER) started on the same tick";
+    (void)h.worker().swapReplicasForTest(saved);
+    h.settle();
+    ASSERT_TRUE(h.response(next).has_value());
+    EXPECT_EQ(h.response(next)->err, kOk);
+    EXPECT_EQ(h.response(next)->version, 2u);
+    EXPECT_EQ(h.views().byName("v"), nullptr) << "never applied live";
+    EXPECT_EQ(h.viewPlanPushes(), pushes0);
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
