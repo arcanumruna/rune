@@ -156,6 +156,11 @@ enum class ErrorCode : uint16_t {
                                   // (truncated / malformed / unknown enum byte) — answered on the
                                   // header's correlationId so the client never waits out a timeout.
                                   // Non-retriable: re-sending the same bytes fails the same way.
+    InvalidTopicName       = 40,  // DefineTopic/CreateView: the topic/view name is empty, longer than
+                                  // 249 bytes, "." or "..", has a byte outside [A-Za-z0-9._-], or
+                                  // starts with the reserved "__" prefix (internal topics)
+    ViewSourceIsView       = 41,  // CreateView: a source is another view's output (a view sink carries
+                                  // no change events yet, so the view would stay empty; until Phase 3)
 };
 
 // ---------------------------------------------------------------------------
