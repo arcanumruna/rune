@@ -103,7 +103,7 @@ Each bug was found by reading the code on `feat/phase2b-e-transient-topics` (fou
 
 `requestCreateTopic` count per cell is 1 for every successful create and every † cell, and 0 otherwise (alters and reads never call it).
 
-### Occupant rows exercised (37 rows × 12 ops = 456 cells)
+### Occupant rows exercised (38 rows × 12 ops = 456 cells)
 
 `Free`, `TypedDisk`, `TypedTransient`, `ViewPersisted`, `ViewTransient`, `StaticSchemaLessDisk`, `StaticSchemaLessTransient`, `RecoveredRuntimeTopic` (→TypedDisk), `RecoveredView` (→ViewPersisted), `OrphanDefineDisk` (→SchemaLessDisk), `OrphanDefineTransient` (→SchemaLessTransient), `OrphanSink_KnownLimitation`, `OrphanSinkAfterRestart` (→Free, B5), `CaseVariantOfTyped`, `CaseVariantOfView`, `CaseVariantOfStatic`, `CaseVariantOfOrphan`.
 
@@ -2893,7 +2893,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```cpp
 // DdlOccupantMatrixRegressionTest.cpp — DDL conformance plan Task 8.
 //
-// One op against a name in every occupancy state (37 rows x 12 ops), driven
+// One op against a name in every occupancy state (38 rows x 12 ops), driven
 // through DdlHarness.  Expectations come ONLY from DdlExpectations.h.  Every cell
 // asserts the exact code, the requestCreateTopic count, no half-creation, the
 // final catalog delta, the serialization invariant, and the catalog after a restart.
