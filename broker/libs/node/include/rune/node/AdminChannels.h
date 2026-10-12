@@ -190,6 +190,11 @@ struct CreateTopicReplyMsg {
     int32_t topicId        = -1;    // >=0 on success; -1 on failure
     int32_t partitionCount = 0;     // authoritative; <= 0 = not reported (keep requested)
     bool    existed        = false; // true = the name already named a topic (not created)
+    // Phase 2b E: the topic's REAL persistence wire byte (0/1), read back from the
+    // registry — an existing schema-less topic keeps ITS mode, not the request's.
+    // kPersistenceNotReported = frame without it (caller keeps the requested mode).
+    static constexpr uint8_t kPersistenceNotReported = 0xff;
+    uint8_t persistence    = kPersistenceNotReported;
 };
 
 // ---------------------------------------------------------------------------
@@ -217,10 +222,8 @@ inline bool encodeDefineTopic(OneToOneByteRing& ring, const DefineTopicMsg& m) {
                           + 2 + m.name.size()
                           + 2 + m.keyField.size()
                           + 4 + m.blob.size()
-                          // Phase 2b E: trailing persistence byte, only when non-zero —
-                          // a disk frame stays byte-identical (a max-size descriptor
-                          // still fits the ring: ProduceValidationRegression).
-                          + (m.persistence != 0 ? 1 : 0);
+                          + 1;   // Phase 2b E: trailing persistence byte (always written;
+                                 // accounted for in kDefineTopicFixedBytes)
     const auto idx = ring.tryClaim(kMsgDefineTopic, len);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
@@ -234,7 +237,7 @@ inline bool encodeDefineTopic(OneToOneByteRing& ring, const DefineTopicMsg& m) {
     std::memcpy(p, m.keyField.data(), m.keyField.size()); p += m.keyField.size();
     putI32(p, static_cast<int32_t>(m.blob.size())); p += 4;
     std::memcpy(p, m.blob.data(), m.blob.size()); p += m.blob.size();
-    if (m.persistence != 0) *p = m.persistence;   // trailing; decode tolerates absence (=> disk)
+    *p = m.persistence;   // trailing; decode tolerates absence (=> disk)
     ring.commit(idx);
     return true;
 }
@@ -441,14 +444,15 @@ inline CreateTopicReqMsg decodeCreateTopicReq(const uint8_t* buf, std::size_t le
 // ---- CreateTopicReply ----
 inline bool encodeCreateTopicReply(OneToOneByteRing& ring, const CreateTopicReplyMsg& m) {
     using namespace admin_wire;
-    const std::size_t len = 8 + 4 + 4 + 1;
+    const std::size_t len = 8 + 4 + 4 + 1 + 1;
     const auto idx = ring.tryClaim(kMsgCreateTopicReply, len);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
     putI64(p, m.ticket);  p += 8;
     putI32(p, m.topicId); p += 4;
     putI32(p, m.partitionCount); p += 4;
-    *p = m.existed ? 1 : 0;
+    *p++ = m.existed ? 1 : 0;
+    *p   = m.persistence;
     ring.commit(idx);
     return true;
 }
@@ -462,6 +466,13 @@ inline CreateTopicReplyMsg decodeCreateTopicReply(const uint8_t* buf, std::size_
     if (len < 17) return m;   // pre-I1 frame: count not reported, not existed
     m.partitionCount = getI32(buf + 12);
     m.existed        = buf[16] != 0;
+    if (len < 18) return m;   // pre-2b-E frame: persistence not reported
+    if (buf[17] == CreateTopicReplyMsg::kPersistenceNotReported) return m;
+    if (buf[17] > 1) {        // unknown mode: never cast — fail the create
+        m.topicId = -1;
+        return m;
+    }
+    m.persistence = buf[17];
     return m;
 }
 
@@ -602,12 +613,14 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
 // ---- F3 round 7, item 4: descriptor size is bounded BY CONSTRUCTION ----
 // A descriptor reaches the admin thread only inside a DefineTopic on the
 // request ring (O2O ring: maxMsgLength = capacity / 8), whose fixed framing is
-// session(8)+corr(8)+partitions(4)+validate(1)+nameLen(2)+keyLen(2)+blobLen(4).
+// session(8)+corr(8)+partitions(4)+validate(1)+nameLen(2)+keyLen(2)+blobLen(4)
+// + the trailing persistence byte (1, Phase 2b E: always written on this in-process
+// ring, so a transient DefineTopic with a max-size descriptor still fits).
 // The SchemaUpdate that re-posts it on the admin→control ring carries only a
 // 4-byte topicId in front, so every committed descriptor fits — the
 // "descriptor too large → validator not pushed" path in
 // AdminWorkerAgent::postSchemaUpdate is unreachable.
-inline constexpr std::size_t kDefineTopicFixedBytes = 8 + 8 + 4 + 1 + 2 + 2 + 4;
+inline constexpr std::size_t kDefineTopicFixedBytes = 8 + 8 + 4 + 1 + 2 + 2 + 4 + 1;
 inline constexpr std::size_t kMaxDescriptorViaRequestRing =
     static_cast<std::size_t>(kAdminRequestRingBytes) / 8 - kDefineTopicFixedBytes;
 static_assert(schemaUpdateWireLen(kMaxDescriptorViaRequestRing) <=

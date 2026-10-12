@@ -221,7 +221,6 @@ public:
                            uint32_t descriptorLen,
                            uint8_t persistence) override {
         DefineTopicMsg m;
-        m.persistence    = persistence;
         m.session        = sessionId;
         m.corr           = correlationId;
         m.partitionCount = static_cast<int32_t>(partitionCount);
@@ -230,6 +229,7 @@ public:
         m.keyField.assign(keyField);
         if (descriptorBlob && descriptorLen)
             m.blob.assign(descriptorBlob, descriptorBlob + descriptorLen);
+        m.persistence = persistence;
         return encodeDefineTopic(requestRing_, m);
     }
 

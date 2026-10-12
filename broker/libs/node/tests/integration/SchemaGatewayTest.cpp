@@ -153,9 +153,10 @@ struct SgHarness {
                                uint32_t parts, std::string_view keyField, bool validate,
                                const uint8_t* blob, uint32_t blen,
                                uint8_t persistence) override {
-            DefineTopicMsg m; m.persistence=persistence; m.session=s; m.corr=c; m.partitionCount=(int32_t)parts;
+            DefineTopicMsg m; m.session=s; m.corr=c; m.partitionCount=(int32_t)parts;
             m.validate=validate; m.name.assign(name); m.keyField.assign(keyField);
             if (blob && blen) m.blob.assign(blob, blob+blen);
+            m.persistence=persistence;
             return encodeDefineTopic(*ring, m);
         }
         bool submitGetSchema(int64_t s, int64_t c, std::string_view name,
@@ -588,6 +589,66 @@ TEST(SchemaGatewayRegression, DefineTopicOverExistingTopicRecordsAuthoritativePa
         EXPECT_LT(client, 3) << "key " << k << " routed to a nonexistent partition";
         EXPECT_EQ(client, h.topicReg->partitionForKey(ordersId, ks)) << "key " << k;
     }
+}
+
+// Phase 2b E review I1: createTopic is idempotent by name and ignores the requested
+// spec for an existing schema-less topic.  The recorded persistence must be the
+// topic's REAL one (what restart recovery reads), never the request's.
+static void expectRecordedModeMatchesTopic(SgHarness& h, const std::string& name,
+                                           int32_t id, PersistenceMode expected) {
+    ASSERT_NE(h.topicReg->topic(id), nullptr);
+    EXPECT_EQ(h.topicReg->topic(id)->persistence, expected) << "the live topic is unchanged";
+    const RegistryEntry* e = h.schemaReg.byName(name);
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(e->persistence, expected) << "the schema record must match the live topic";
+}
+
+TEST(SchemaGatewayRegression, DiskDefineOverExistingTransientTopicRecordsTransient) {
+    SgHarness h;
+    h.realControl = true;
+    rune::node::TopicSpec boot; boot.name = "orders"; boot.partitionCount = 2;
+    boot.persistence = PersistenceMode::Transient;
+    const int32_t id = h.topicReg->createTopic(boot);   // pre-existing, schema-less
+
+    const auto def = encodeDefineFrame(1, 1, "orders", 2, "userId", false, charsBlob());   // disk
+    h.gw.applyDefineTopicForTest(def.data(), def.size());
+    h.pump();
+    const auto r = firstFrame<pc::DefineTopicResponse>(h);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, 0u);
+    expectRecordedModeMatchesTopic(h, "orders", id, PersistenceMode::Transient);
+}
+
+TEST(SchemaGatewayRegression, TransientDefineOverExistingDiskTopicRecordsDisk) {
+    SgHarness h;
+    h.realControl = true;
+    rune::node::TopicSpec boot; boot.name = "orders"; boot.partitionCount = 2;
+    const int32_t id = h.topicReg->createTopic(boot);   // disk, schema-less
+
+    const auto def = encodeDefineFrame(1, 1, "orders", 2, "userId", false, charsBlob(),
+                                       pc::DefineTopic::kPersistenceTransient);
+    h.gw.applyDefineTopicForTest(def.data(), def.size());
+    h.pump();
+    const auto r = firstFrame<pc::DefineTopicResponse>(h);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, 0u);
+    expectRecordedModeMatchesTopic(h, "orders", id, PersistenceMode::Disk);
+}
+
+// The control-thread `spec.persistence` line really creates a transient topic:
+// no disk log objects, mode recorded in both the live topic and the schema.
+TEST(SchemaGatewayRegression, NewTransientDefineCreatesTransientTopicOnControl) {
+    SgHarness h;
+    h.realControl = true;
+    const auto def = encodeDefineFrame(1, 1, "orders", 2, "userId", false, charsBlob(),
+                                       pc::DefineTopic::kPersistenceTransient);
+    h.gw.applyDefineTopicForTest(def.data(), def.size());
+    h.pump();
+    const auto r = firstFrame<pc::DefineTopicResponse>(h);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->errorCode, 0u);
+    expectRecordedModeMatchesTopic(h, "orders", r->topicId, PersistenceMode::Transient);
+    EXPECT_EQ(h.topicReg->log(r->topicId, 0), nullptr) << "transient: no disk Log";
 }
 
 // ---------------------------------------------------------------------------

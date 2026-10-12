@@ -216,6 +216,11 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
     inFlight_->topicId        = reply.topicId;
     inFlight_->partitionCount = reply.partitionCount > 0 ? reply.partitionCount
                                                          : inFlight_->msg.partitionCount;
+    // Phase 2b E: AUTHORITATIVE mode from the control thread (same bug class as the
+    // partition count): a schema-less existing topic keeps its own log backend.
+    inFlight_->persistence = reply.persistence != CreateTopicReplyMsg::kPersistenceNotReported
+                                 ? persistenceFromWire(reply.persistence)
+                                 : persistenceFromWire(inFlight_->msg.persistence);
 
     // ── AWAITING_COMMIT ── append the durable TopicSchema record.
     TopicSchema ts;
@@ -232,7 +237,7 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
     // Durable topic name (independent of the descriptor's name): boot recovery
     // recreates the topic under it (RuntimeTopicRecovery).
     ts.topicName      = inFlight_->msg.name;
-    ts.persistence    = persistenceFromWire(inFlight_->msg.persistence);
+    ts.persistence    = inFlight_->persistence;   // authoritative (reply)
 
     // D: leader guard.  If we are not the leader, DDL cannot be committed here.
     if (!leader_ || !replica_) {
@@ -748,7 +753,7 @@ bool AdminWorker::advance_(int64_t nowNs) {
             ts.descriptorBlob = inFlight_->msg.blob;
             ts.nextTag        = inFlight_->fieldCount;
             ts.topicName      = inFlight_->msg.name;   // same as the durable record
-            ts.persistence    = persistenceFromWire(inFlight_->msg.persistence);   // ditto
+            ts.persistence    = inFlight_->persistence;   // same as the durable record
             reg_.applyRecord(ts);
             if (inFlight_->msg.validate) {
                 if (const RegistryEntry* entry = reg_.byId(inFlight_->topicId))

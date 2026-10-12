@@ -53,8 +53,13 @@ createTopicForAdmin(rune::gateway::TopicRegistry& reg, const CreateTopicReqMsg& 
         return reply;
     }
     if (reply.topicId >= 0) {
-        if (const TopicSpec* auth = reg.topic(reply.topicId))
+        if (const TopicSpec* auth = reg.topic(reply.topicId)) {
             reply.partitionCount = auth->partitionCount;
+            // Phase 2b E: an existing topic keeps ITS mode (createTopic ignores the
+            // requested spec) — report the real one so the schema record never
+            // contradicts the log backend the topic actually runs on.
+            reply.persistence    = persistenceToWire(auth->persistence);
+        }
     }
     return reply;
 }

@@ -49,12 +49,12 @@ struct AdminDeps {
     // The authoritative topicId arrives later via CreateTopicReplyMsg.
     // Task 19: `keyField` + `cleanupPolicy` let the control thread create a VIEW
     // SINK as a keyed + Compact "table".  DefineTopic passes ("", 0) — the
-    // pre-Task-19 Delete topic.
+    // pre-Task-19 Delete topic.  Phase 2b E: `persistence` (0 = disk, 1 = transient)
+    // selects the topic's log backend on the control thread; a view sink is always
+    // disk (0).
     std::function<bool(int64_t ticket, int32_t partitionCount,
                        const std::string& name, const std::string& keyField,
                        uint8_t cleanupPolicy, uint8_t persistence)> requestCreateTopic;
-    // Phase 2b E: `persistence` (0 = disk, 1 = transient) selects the topic's log
-    // backend on the control thread.  A view sink is always disk (0).
 
     // PUBLISHING: push validators to each produce worker after commit (validate=true).
     std::function<void(const RegistryEntry&, int32_t topicId)> pushValidators;
@@ -296,6 +296,8 @@ private:
         int32_t        partitionCount = 0;   // AUTHORITATIVE count from the create
                                               // reply (final review I1) — what the
                                               // schema registry records
+        PersistenceMode persistence  = PersistenceMode::Disk;   // AUTHORITATIVE mode from
+                                              // the create reply (Phase 2b E)
         int64_t        appendedBase  = -1;   // set on AwaitingCommit (HW must reach it)
         int64_t        appendedLast  = -1;
         int64_t        startedNs     = 0;    // for timeout

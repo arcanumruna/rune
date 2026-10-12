@@ -546,15 +546,6 @@ TEST(AdminWorkerRegression, AdminRingFramesCarryPersistence) {
     DefineTopicMsg m; m.session = 7; m.corr = 8; m.name = "p"; m.blob = {1, 2}; m.persistence = 1;
     ASSERT_TRUE(encodeDefineTopic(ring, m));
     DefineTopicMsg got;
-    {   // a disk frame carries NO persistence byte (byte-identical to pre-2b)
-        OneToOneByteRing dring{kAdminRequestRingBytes};
-        DefineTopicMsg d; d.name = "p"; d.blob = {1, 2};
-        ASSERT_TRUE(encodeDefineTopic(dring, d));
-        std::size_t diskLen = 0;
-        dring.drain([&](int32_t, aeron::concurrent::AtomicBuffer&, aeron::util::index_t,
-                        aeron::util::index_t len) { diskLen = static_cast<std::size_t>(len); }, 1);
-        EXPECT_EQ(diskLen, 8u + 8 + 4 + 1 + 2 + 1 + 2 + 0 + 4 + 2);
-    }
     ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
                    aeron::util::index_t len) {
         const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
