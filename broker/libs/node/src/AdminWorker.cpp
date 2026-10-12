@@ -115,6 +115,14 @@ void AdminWorker::onRole(const AdminRoleMsg& role) {
         }
         leader_    = false;
         wasLeader_ = false;  // next promotion re-triggers rebuild
+        // DDL conformance B4: a DDL op cannot commit on a follower — the HW it would
+        // poll is the new leader's, and its appended record may be truncated.
+        // Answer it now (Internal: outcome unknown, the client retries on the new
+        // leader) instead of riding the 30 s timeout or committing off a follower HW.
+        // An op demoted in AwaitingCommit is in doubt (KL2): never applied live, its
+        // record replays on a restart if it survives.
+        if (inFlight_)
+            answerInFlight_(kInternal, inFlight_->kind == DdlKind::Alter ? inFlight_->topicId : -1);
     }
 }
 
@@ -812,17 +820,7 @@ bool AdminWorker::advance_(int64_t nowNs) {
 
     // Timeout guard (error path only — not a convergence gate).
     if (nowNs - inFlight_->startedNs > kDdlTimeoutNs) {
-        if (inFlight_->kind == DdlKind::Alter)
-            deps_.respondAlter(inFlight_->alter.session, inFlight_->alter.corr,
-                               inFlight_->topicId, 0, kInternal);
-        else if (inFlight_->kind == DdlKind::CreateView)
-            deps_.respondCreateView(inFlight_->view.session, inFlight_->view.corr,
-                                    -1, 0, kInternal);
-        else
-            deps_.respondDefine(inFlight_->msg.session, inFlight_->msg.corr,
-                                -1, 0, kInternal);
-        inFlight_.reset();
-        state_ = DdlState::Idle;
+        answerInFlight_(kInternal, inFlight_->kind == DdlKind::Alter ? inFlight_->topicId : -1);
         return true;
     }
 

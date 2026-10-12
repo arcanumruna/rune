@@ -892,3 +892,253 @@ TEST(DdlFixRegression, LogEscape_ForgedLogLineStaysOnTheRejectionLine) {
     }
     std::error_code ec; fs::remove_all(dir, ec);
 }
+
+// ── B4 / KL2 / re-promotion ──────────────────────────────────────────────────
+TEST(DdlFixRegression, B4_DemotionAnswersAnInFlightCreateImmediately) {
+    DdlHarness h;
+    h.setControl(ControlMode::Hold);
+    const int64_t a = h.submit(Op::DefineDisk, "n");
+    ASSERT_TRUE(h.tickUntilCreatePending());
+    h.demote();
+    ASSERT_TRUE(h.response(a).has_value()) << "answered on demotion, not after the 30 s timeout";
+    EXPECT_EQ(h.response(a)->err, kInternal);
+    EXPECT_FALSE(h.worker().hasInFlight());
+    h.deliverCreate();   // the control thread's reply arrives late: a stale ticket
+    EXPECT_EQ(h.schemas().byName("n"), nullptr) << "never applied";
+    h.promote();
+    h.setControl(ControlMode::Auto);
+    const int64_t b = h.submit(Op::DefineDisk, "n");
+    h.settle();
+    EXPECT_EQ(h.response(b)->err, kOk) << "the retry adopts the orphan (SchemaLessDisk row)";
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+TEST(DdlFixRegression, B4_DemotionAnswersAnInFlightCommitAndNeverAppliesIt) {
+    DdlHarnessOptions o;
+    o.holdCommits = true;
+    DdlHarness h(o);
+    const int64_t a = h.submit(Op::AlterAdd, "src");
+    ASSERT_TRUE(h.tickUntilAppended());
+    h.demote();
+    ASSERT_TRUE(h.response(a).has_value());
+    EXPECT_EQ(h.response(a)->err, kInternal);
+    for (int i = 0; i < 10; ++i) h.tick();
+    EXPECT_EQ(h.schemas().byName("src")->version, 1u) << "a follower never commits an op off its own HW";
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+TEST(DdlFixRegression, B4_RepromotionKeepsTheCatalogExact) {
+    DdlHarness h;
+    const int64_t v = h.submit(Op::ViewPersisted, "v");
+    h.settle();
+    ASSERT_EQ(h.response(v)->err, kOk);
+    const Catalog before = h.catalog();
+    const std::size_t views = h.views().all().size();
+    h.demote();
+    h.promote();
+    EXPECT_EQ(h.catalog(), before) << "promotion replays onto un-cleared registries: no duplicates, no loss";
+    EXPECT_EQ(h.views().all().size(), views);
+    const int64_t d = h.submit(Op::DefineDisk, "after");
+    h.settle();
+    EXPECT_EQ(h.response(d)->err, kOk);
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+// KNOWN LIMITATION KL2: an op answered Internal after its record was appended is in
+// doubt.  The live registry never applies it; its committed record is replayed on
+// restart.  Pinned so any change to this behaviour is deliberate.
+TEST(DdlFixRegression, KL2_TimeoutInAwaitingCommitIsInDoubtAndReplayedOnRestart) {
+    DdlHarnessOptions o;
+    o.holdCommits = true;
+    DdlHarness h(o);
+    const int64_t a = h.submit(Op::AlterAdd, "src");
+    ASSERT_TRUE(h.tickUntilAppended());
+    h.advance(AdminWorker::ddlTimeoutNs() + 1'000'000);
+    h.tick();
+    ASSERT_TRUE(h.response(a).has_value());
+    EXPECT_EQ(h.response(a)->err, kInternal);
+    h.releaseCommits();
+    for (int i = 0; i < 5; ++i) h.tick();
+    EXPECT_EQ(h.schemas().byName("src")->version, 1u) << "KL2: the live registry never applies it";
+    h.restart();
+    EXPECT_EQ(h.schemas().byName("src")->version, 2u) << "KL2: its committed record is replayed on restart";
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+// ── B4 matrix: demotion at EVERY async state of an in-flight DDL op ───────────
+// Define / CreateView AwaitingId (the id / sink request is with the control
+// thread), Define / CreateView / Alter AwaitingCommit (the record is appended,
+// the HW does not cover it yet).  For each: an immediate Internal; nothing
+// applied live (not on the late reply, not after the HW later covers the
+// record, not on re-promotion); a demoted worker starts nothing (every op it
+// dequeues is refused Internal at the leader guard: no create request, no
+// append); after re-promotion the queue runs in FIFO order.  After a restart an
+// AwaitingId op is still absent; an AwaitingCommit op is in doubt (KL2): its
+// appended record is replayed.
+enum class B4State : uint8_t {
+    DefineAwaitingId, ViewAwaitingId, DefineAwaitingCommit, ViewAwaitingCommit, AlterAwaitingCommit,
+};
+
+[[nodiscard]] static const char* b4StateName(B4State s) noexcept {
+    switch (s) {
+        case B4State::DefineAwaitingId:     return "DefineAwaitingId";
+        case B4State::ViewAwaitingId:       return "ViewAwaitingId";
+        case B4State::DefineAwaitingCommit: return "DefineAwaitingCommit";
+        case B4State::ViewAwaitingCommit:   return "ViewAwaitingCommit";
+        case B4State::AlterAwaitingCommit:  return "AlterAwaitingCommit";
+    }
+    return "?";
+}
+static void PrintTo(B4State s, std::ostream* os) { *os << b4StateName(s); }
+[[nodiscard]] static bool b4AwaitingCommit(B4State s) noexcept {
+    return s == B4State::DefineAwaitingCommit || s == B4State::ViewAwaitingCommit ||
+           s == B4State::AlterAwaitingCommit;
+}
+[[nodiscard]] static bool b4AwaitingId(B4State s) noexcept { return !b4AwaitingCommit(s); }
+
+class DdlDemotionRegression : public ::testing::TestWithParam<B4State> {
+protected:
+    static DdlHarnessOptions options(B4State s) {
+        DdlHarnessOptions o;
+        o.holdCommits = b4AwaitingCommit(s);
+        return o;
+    }
+    /// Submit the op and drive it into state `s`; returns its corr.
+    static int64_t driveInto(DdlHarness& h, B4State s) {
+        int64_t c = -1;
+        switch (s) {
+            case B4State::DefineAwaitingId:
+                h.setControl(ControlMode::Hold);
+                c = h.submit(Op::DefineDisk, "n");
+                EXPECT_TRUE(h.tickUntilCreatePending());
+                break;
+            case B4State::ViewAwaitingId:
+                h.setControl(ControlMode::Hold);
+                c = h.submit(Op::ViewPersisted, "v");
+                EXPECT_TRUE(h.tickUntilCreatePending());
+                break;
+            case B4State::DefineAwaitingCommit:
+                c = h.submit(Op::DefineDisk, "n");
+                EXPECT_TRUE(h.tickUntilAppended());
+                break;
+            case B4State::ViewAwaitingCommit:
+                c = h.submit(Op::ViewPersisted, "v");
+                EXPECT_TRUE(h.tickUntilAppended());
+                break;
+            case B4State::AlterAwaitingCommit:
+                c = h.submit(Op::AlterAdd, "src");
+                EXPECT_TRUE(h.tickUntilAppended());
+                break;
+        }
+        EXPECT_TRUE(h.worker().hasInFlight());
+        EXPECT_FALSE(h.response(c).has_value());
+        return c;
+    }
+    /// Did the in-flight op's effect reach the admin catalogs?
+    static bool applied(DdlHarness& h, B4State s) {
+        switch (s) {
+            case B4State::DefineAwaitingId:
+            case B4State::DefineAwaitingCommit:
+                return h.schemas().byName("n") != nullptr;
+            case B4State::ViewAwaitingId:
+            case B4State::ViewAwaitingCommit:
+                return h.views().byName("v") != nullptr || h.schemas().byName("v") != nullptr;
+            case B4State::AlterAwaitingCommit:
+                return h.schemas().byName("src")->version != 1u;
+        }
+        return true;
+    }
+};
+
+TEST_P(DdlDemotionRegression, DemotionAnswersInternalAtOnceStartsNothingAndAppliesNothing) {
+    const B4State s = GetParam();
+    DdlHarness h(options(s));
+    const int pushes0 = h.viewPlanPushes(), validators0 = h.validatorPushes();
+    const int64_t x = driveInto(h, s);
+    const int64_t y = h.submit(Op::AlterAdd, "src2");       // queued behind x
+    const int64_t w = h.submit(Op::DefineDisk, "queued");   // queued behind y
+
+    h.demote();
+    ASSERT_TRUE(h.response(x).has_value()) << "answered inside onRole(follower), not on a tick or the timeout";
+    EXPECT_EQ(h.response(x)->err, kInternal);
+    EXPECT_FALSE(h.worker().hasInFlight());
+    EXPECT_FALSE(h.response(y).has_value()) << "demotion answers only the in-flight op";
+
+    // A demoted worker starts nothing: every queued op is refused at the leader
+    // guard (FIFO, checked by the harness), no create request, no append.
+    const int reqs = h.createRequests();
+    const int64_t schemaEnd = h.schemaLogEnd(), viewsEnd = h.viewsLogEnd();
+    for (int i = 0; i < 10; ++i) h.tick();
+    ASSERT_TRUE(h.response(y).has_value());
+    ASSERT_TRUE(h.response(w).has_value());
+    EXPECT_EQ(h.response(y)->err, kInternal);
+    EXPECT_EQ(h.response(w)->err, kInternal);
+    EXPECT_EQ(h.createRequests(), reqs) << "no create request while demoted";
+    EXPECT_EQ(h.schemaLogEnd(), schemaEnd) << "no __topic_schemas append while demoted";
+    EXPECT_EQ(h.viewsLogEnd(), viewsEnd) << "no __views append while demoted";
+    EXPECT_EQ(h.schemas().byName("src2")->version, 1u);
+    EXPECT_EQ(h.schemas().byName("queued"), nullptr);
+
+    if (b4AwaitingId(s)) h.deliverCreate();   // the late reply: a stale ticket (an orphan)
+    for (int i = 0; i < 5; ++i) h.tick();
+    EXPECT_FALSE(applied(h, s)) << "never applied off a follower";
+
+    h.promote();
+    h.setControl(ControlMode::Auto);
+    h.settle();   // releases held commits: the HW now covers x's record
+    EXPECT_FALSE(applied(h, s)) << "re-promotion never applies an answered op";
+    EXPECT_EQ(h.viewPlanPushes(), pushes0);
+    EXPECT_EQ(h.validatorPushes(), validators0);
+
+    const int64_t z = h.submit(Op::DefineDisk, "after");
+    h.settle();
+    ASSERT_TRUE(h.response(z).has_value());
+    EXPECT_EQ(h.response(z)->err, kOk) << "the re-promoted leader serves DDL";
+
+    h.restart();
+    if (b4AwaitingId(s))
+        EXPECT_FALSE(applied(h, s)) << "nothing was appended: still absent after a restart";
+    else
+        EXPECT_TRUE(applied(h, s)) << "KL2: an op demoted in AwaitingCommit is in doubt; its record replays";
+    EXPECT_NE(h.schemas().byName("after"), nullptr);
+    EXPECT_EQ(h.schemas().byName("queued"), nullptr);
+    EXPECT_EQ(h.schemas().byName("src2")->version, 1u);
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+TEST_P(DdlDemotionRegression, RepromotionRunsTheQueuedOpsInFifoOrder) {
+    const B4State s = GetParam();
+    DdlHarness h(options(s));
+    const int64_t x = driveInto(h, s);
+    const int64_t y = h.submit(Op::DefineDisk, "q1");
+    const int64_t w = h.submit(Op::AlterAdd, "src2");
+    const int64_t u = h.submit(Op::ViewTransient, "q3");
+
+    h.demote();
+    ASSERT_TRUE(h.response(x).has_value());
+    EXPECT_EQ(h.response(x)->err, kInternal);
+    h.promote();   // no tick while demoted: the queue survives into the new term
+    if (b4AwaitingId(s)) h.deliverCreate();   // x's stale reply
+    h.setControl(ControlMode::Auto);
+    h.settle();
+
+    ASSERT_TRUE(h.response(y).has_value());
+    ASSERT_TRUE(h.response(w).has_value());
+    ASSERT_TRUE(h.response(u).has_value());
+    EXPECT_EQ(h.response(y)->err, kOk);
+    EXPECT_EQ(h.response(w)->err, kOk);
+    EXPECT_EQ(h.response(w)->version, 2u);
+    EXPECT_EQ(h.response(u)->err, kOk);
+    std::vector<int64_t> order;
+    for (const Response& r : h.responses())
+        if (r.corr == y || r.corr == w || r.corr == u) order.push_back(r.corr);
+    EXPECT_EQ(order, (std::vector<int64_t>{y, w, u})) << "FIFO after re-promotion";
+    EXPECT_FALSE(applied(h, s));
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+INSTANTIATE_TEST_SUITE_P(EveryAsyncState, DdlDemotionRegression,
+                         ::testing::Values(B4State::DefineAwaitingId, B4State::ViewAwaitingId,
+                                           B4State::DefineAwaitingCommit, B4State::ViewAwaitingCommit,
+                                           B4State::AlterAwaitingCommit),
+                         [](const ::testing::TestParamInfo<B4State>& i) { return std::string(b4StateName(i.param)); });

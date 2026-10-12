@@ -195,6 +195,8 @@ public:
     // control → admin: role transition for the schema replica.  Applied on the
     // admin thread (becomeLeader/becomeFollower) — no cross-thread role_ write.
     // C: on a Follower→Leader edge, rebuild the SchemaRegistry from the log.
+    // B4: demotion answers an in-flight DDL op Internal at once (never applied
+    // live; an op demoted in AwaitingCommit is in doubt — KL2).
     // -----------------------------------------------------------------------
     void onRole(const AdminRoleMsg& role);
 
