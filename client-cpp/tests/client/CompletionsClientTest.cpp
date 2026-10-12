@@ -1212,3 +1212,25 @@ TEST(CompletionsClient, InCycleReleaseWithAnOpHeldAcrossTwoCyclesNeverMisdeliver
     // (record 301) is applied in the third.
     runInCycleRelease(5272, /*backlog=*/300, /*releaseAt=*/100, /*churn=*/127);
 }
+
+// No-hang fix round 3 (I1, client side): the broker's EXPIRING state delivers an
+// unsolicited SessionExpired (correlationId 0) once the spill could not hold the
+// session's answers — every pending control op completes SessionLost.
+TEST(CompletionsClient, UnsolicitedSessionExpiredCompletesEveryPendingOpSessionLostRegression) {
+    Rig r(cfgFor(5454));
+    TestCq cq(r.client);
+    r.connect(cq);
+    std::vector<uint8_t> blob{9};
+    auto d = cq.issue([&](rc::Completions& q, rc::Token t) {
+        return r.client.defineTopic("x", 1, "", false, blob, q, t);
+    });
+    auto g = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getTopicSchema("x", q, t); });
+    ASSERT_TRUE(r.drive([&] { return r.gw.defines == 1 && r.gw.schemaGets == 1; }));
+    r.gw.sendError(0, static_cast<int16_t>(rune::client::codec::ErrorCode::SessionExpired), "", /*sid=*/0,
+                   /*corrId=*/0);
+    ASSERT_TRUE(r.drive([&] { return d.ready() && g.ready(); }));
+    EXPECT_EQ(d.status(), rc::OpStatus::SessionLost);
+    EXPECT_EQ(g.status(), rc::OpStatus::SessionLost);
+    r.settle();
+    EXPECT_EQ(r.client.testPendingControlOps(), 0u);
+}

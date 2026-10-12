@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.31)
 project(rune_client_cpp)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# clangd / tooling: export compile_commands.json (C++23 flags reach the IDE).
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # rune-protocol is header-only; consumed via the sibling source include path.
 set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include"

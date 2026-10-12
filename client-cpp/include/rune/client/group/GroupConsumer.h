@@ -159,9 +159,14 @@ enum class GroupFailReason : int32_t {
     /// partitions whose leader is a not-yet-upgraded node are only skipped
     /// (logged once) until that node is upgraded and reconnects.
     BrokerTooOld = 1,
-    /// The broker coordinator refused this client's JoinGroup (ProtocolVersion,
-    /// or InvalidRequest: the broker could not decode it).
+    /// The broker coordinator refused this consumer's request non-retriably
+    /// (ProtocolVersion, or InvalidRequest: the broker could not decode it).
+    /// Recreating the consumer will be refused again.
     RefusedByBroker = 2,
+    /// No-hang fix round 3: a retriable failure persisted past its retry budget
+    /// (Internal / unclassified coordinator answers, or OffsetFetch per-entry
+    /// errors).  A transient cause: the application may recreate the consumer.
+    RetryBudgetExhausted = 3,
 };
 
 struct GroupConsumerStatus {
@@ -232,6 +237,7 @@ struct GroupConsumerImpl {
     // retriable per-entry error (budget: GroupConsumerHub::kMaxOffsetFetchAttempts).
     int64_t  offsetFetchCorrId   = 0;
     uint32_t offsetFetchAttempts = 0;
+    int64_t  offsetFetchCountedCorr = 0;   // fix round 3: the fetch whose failure was already counted
     // C1: consecutive backoff rejoins (Internal / unclassified errors) and the
     // earliest time the next JoinGroup may go out.
     uint32_t backoffRejoins = 0;

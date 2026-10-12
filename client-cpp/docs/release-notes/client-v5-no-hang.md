@@ -13,7 +13,7 @@ completes with that error.
 | Answer | Meaning | Client 5 behaviour |
 |---|---|---|
 | `InvalidRequest` (39) | the broker could not decode the request | non-retriable: the operation fails; a group consumer is refused (`GroupFailReason::RefusedByBroker`); a transaction op fails without a retry |
-| `Internal` (6) on JoinGroup / SyncGroup / Heartbeat | the coordinator could not serve it | re-join with backoff (20 ms doubling to 1 s), refused after 8 attempts |
+| `Internal` (6) on JoinGroup / SyncGroup / Heartbeat | the coordinator could not serve it | re-join with backoff (20 ms doubling to 1 s); after 8 such re-joins without a healthy Heartbeat in between the consumer finishes with `GroupFailReason::RetryBudgetExhausted` |
 | ViewRow status 5 / 6 / 7 | InvalidRequest / Busy / RowTooLarge | the read completes with that status; only Busy is retriable |
 
 Older clients (< 5) re-join forever on InvalidRequest / Internal JoinGroup and
@@ -42,8 +42,13 @@ includes `rune/client/subscriber/Subscription.h`.
 ## 4. Other behaviour changes
 
 - A consumer group's OffsetFetch answer is matched by correlation id. A
-  whole-request rejection refuses the consumer. A retriable per-entry error is
-  re-fetched (paced) at most 8 times, then the consumer is refused.
+  whole-request rejection refuses the consumer (`RefusedByBroker`). A
+  retriable per-entry error is re-fetched (paced) at most 8 times, then the
+  consumer finishes with `RetryBudgetExhausted`. A per-entry `NotCoordinator`
+  (a coordinator failover) is re-fetched without spending that budget.
+- `GroupFailReason::RetryBudgetExhausted` (3) is new. It marks a transient
+  cause, so the application may recreate the consumer. `RefusedByBroker` marks
+  a non-retriable answer; recreating that consumer will be refused again.
 - A Heartbeat error outside the rebalance set no longer leaves the member
   Stable: the member re-joins with backoff, or is refused on InvalidRequest.
 - An ErrorResponse fails a pending `connect()` only when it answers that

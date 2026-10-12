@@ -1021,7 +1021,7 @@ TEST(GroupRoutingRegression, JoinGroupInternalBacksOffThenRefusesRegression) {
     r.connect();
     ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 40'000'000)) << "joins: " << r.gw.joinGroups;
     const auto took = std::chrono::steady_clock::now() - t0;
-    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker);
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RetryBudgetExhausted);
     EXPECT_EQ(r.gw.joinGroups, 9) << "1 join + kMaxBackoffRejoins (8) paced re-joins, then refused";
     EXPECT_GE(took, std::chrono::milliseconds(2000)) << "the re-joins were not paced (a storm)";
 }
@@ -1033,7 +1033,7 @@ TEST(GroupRoutingRegression, SyncGroupInternalBacksOffThenRefusesRegression) {
     auto gc = r.client.subscribeGroup("g", {"t"});
     r.connect();
     ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 40'000'000)) << "syncs: " << r.gw.syncGroups;
-    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker);
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RetryBudgetExhausted);
     EXPECT_EQ(r.gw.syncGroups, 9);
 }
 
@@ -1096,7 +1096,7 @@ TEST(GroupRoutingRegression, OffsetFetchRetriableErrorIsBoundedRegression) {
     ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
     r.gw.releaseJoins();
     ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 80'000'000)) << "fetches: " << r.gw.offsetFetches;
-    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker);
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RetryBudgetExhausted);
     EXPECT_EQ(r.gw.offsetFetches, 9) << "1 fetch + kMaxOffsetFetchAttempts (8) re-fetches";
 }
 
@@ -1133,6 +1133,46 @@ TEST(GroupRoutingRegression, OffsetCommitRejectionCompletesCommitSyncRegression)
         EXPECT_EQ(got.status, rc::OpStatus::BrokerError);
         EXPECT_EQ(got.errorCode, static_cast<uint16_t>(code));
     }
+}
+
+// Fix round 3 (C1): a coordinator that answers EVERY Heartbeat Internal no
+// longer cycles Stable → rejoin → Stable forever — only a Heartbeat OK resets
+// the backoff budget, so the consumer finishes RetryBudgetExhausted after a
+// bounded number of rejoins.
+TEST(GroupRoutingRegression, HeartbeatInternalForeverIsRefusedAfterTheBudgetRegression) {
+    GroupRig r(4215, 4216);
+    r.gw.holdJoins          = false;
+    r.gw.groupAssignment    = {{1, 0}};
+    r.gw.heartbeatErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
+    rc::GroupConfig gcfg;
+    gcfg.sessionTimeoutMs = 300;   // a heartbeat every 100 ms
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 80'000'000)) << "joins: " << r.gw.joinGroups;
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RetryBudgetExhausted);
+    EXPECT_LE(r.gw.joinGroups, 9) << "more than 1 + kMaxBackoffRejoins joins";
+}
+
+// Fix round 3 (C1 failover): a per-entry NotCoordinator in OffsetFetch makes the
+// member rediscover the coordinator by re-joining — it never spends the re-fetch
+// budget (a failover longer than the budget must not kill a healthy consumer).
+TEST(GroupRoutingRegression, OffsetFetchNotCoordinatorIsRetriedWithoutSpendingTheBudgetRegression) {
+    GroupRig r(4217, 4218);
+    const auto [n1, p1port] = r.addNode(4217);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions            = {{1, 0, 0, 1, 4217, ""}, {1, 1, 1, 1, 4217, ""}};
+    r.gw.subscribeLeader       = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment       = {{1, 1}};
+    r.gw.offsetFetchErrorCode  = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator);
+    r.gw.offsetFetchErrorsNext = 10;   // > kMaxOffsetFetchAttempts (8)
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr; }, 80'000'000))
+        << "fetches: " << r.gw.offsetFetches << (gc.finished() ? " (the consumer was refused)" : "");
+    EXPECT_FALSE(gc.finished()) << "a coordinator failover exhausted the re-fetch budget";
+    EXPECT_GE(r.gw.offsetFetches, 11);
 }
 
 // CG round 4 (A-MEDIUM-3): a rolling upgrade — the seed / coordinator runs v3

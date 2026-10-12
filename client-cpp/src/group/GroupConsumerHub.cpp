@@ -202,8 +202,11 @@ GroupVerdict classifyGroupAnswer_(rpc::ErrorCode ec) noexcept {
 } // namespace
 
 void GroupConsumerHub::rejoinWithBackoff_(GroupConsumerImpl& impl) {
+    // Fix round 3: only a Heartbeat OK (a proven-healthy Stable period) resets
+    // this budget — a coordinator answering every Heartbeat Internal can no
+    // longer cycle Stable → rejoin → Stable forever.
     if (++impl.backoffRejoins > kMaxBackoffRejoins) {
-        refuse_(impl, GroupFailReason::RefusedByBroker);
+        refuse_(impl, GroupFailReason::RetryBudgetExhausted);
         return;
     }
     // 20 ms doubling, capped at 1 s: the whole budget spends ~3.3 s.
@@ -1357,7 +1360,7 @@ void GroupConsumerHub::onSyncGroupResponse(const uint8_t* buf, std::size_t len,
         const GroupVerdict v = classifyGroupAnswer_(ec);
 
         if (v == GroupVerdict::Ok) {
-            impl->backoffRejoins = 0;   // C1: a completed join resets the backoff budget
+            impl->offsetFetchAttempts = 0;   // fix round 3: a new generation starts a fresh fetch budget
             // Build new assignment from SyncGroupResponse.
             std::vector<TP> newAsgn;
             for (const auto& tp : opt->assignment) {
@@ -1432,7 +1435,7 @@ void GroupConsumerHub::onHeartbeatResponse(const uint8_t* buf, std::size_t len,
             static_cast<uint16_t>(opt->errorCode));
 
         switch (classifyGroupAnswer_(ec)) {
-        case GroupVerdict::Ok:      break;                     // next heartbeat already armed by doWork
+        case GroupVerdict::Ok:      impl->backoffRejoins = 0; break;   // fix round 3: proven healthy — budget reset
         case GroupVerdict::Rejoin:  toRejoining_(*impl); break;
         case GroupVerdict::Refuse:  refuse_(*impl, GroupFailReason::RefusedByBroker); break;
         // C1: never stay Stable on an error the broker could not serve — the
@@ -1498,6 +1501,7 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
         if (impl->offsetFetchCorrId == 0 || opt->correlationId != impl->offsetFetchCorrId) continue;
 
         bool refused = false;
+        bool rejoin = false;
         bool retriableError = false;
         // (#1a) Seed positions from committed offsets.
         // We seed unconditionally for partitions that are still at the sentinel
@@ -1512,7 +1516,15 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
                 // finishes the consumer; any other per-entry error is re-sent
                 // (paced by retryOffsetFetch) within kMaxOffsetFetchAttempts.
                 const auto ec = static_cast<rpc::ErrorCode>(static_cast<uint16_t>(r.errorCode));
-                if (r.topicId < 0 || classifyGroupAnswer_(ec) == GroupVerdict::Refuse) refused = true;
+                const GroupVerdict v = classifyGroupAnswer_(ec);
+                if (r.topicId < 0 || v == GroupVerdict::Refuse) refused = true;
+                // Fix round 3: NotCoordinator (& the rebalance set) = the coordinator
+                // moved / the group is rebalancing — re-fetched (paced by
+                // retryOffsetFetch) WITHOUT spending the budget: the coordinator is
+                // rediscovered by the next Heartbeat / Join answer (NotCoordinator →
+                // rejoin, D4 redirect), so a failover longer than the budget never
+                // kills a healthy consumer.
+                else if (v == GroupVerdict::Rejoin) rejoin = true;
                 else retriableError = true;
                 continue;
             }
@@ -1537,12 +1549,16 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
             refuse_(*impl, GroupFailReason::RefusedByBroker);
             break;
         }
-        if (retriableError) {
+        (void)rejoin;   // not budgeted: its re-fetch is paced by retryOffsetFetch
+        if (retriableError && impl->offsetFetchCountedCorr != opt->correlationId) {
+            // Fix round 3: one budget attempt per OffsetFetch (a duplicate answer
+            // of the same fetch is not counted twice; seeding stays idempotent).
+            impl->offsetFetchCountedCorr = opt->correlationId;
             if (++impl->offsetFetchAttempts > kMaxOffsetFetchAttempts) {
-                refuse_(*impl, GroupFailReason::RefusedByBroker);
+                refuse_(*impl, GroupFailReason::RetryBudgetExhausted);
                 break;
             }
-        } else {
+        } else if (!retriableError) {
             impl->offsetFetchAttempts = 0;
         }
         // Leader-node subscriptions waiting for their start offset go now.
@@ -1602,12 +1618,14 @@ void GroupConsumerHub::refuse_(GroupConsumerImpl& impl, GroupFailReason why)
 {
     if (!impl.active) return;
     std::fprintf(stderr,
-        "rune-client: group '%s' cannot run: %s — the consumer is finished "
-        "(client and broker must both be version >= 3: explicit group subscriptions)\n",
+        "rune-client: group '%s' cannot run: %s — the consumer is finished\n",
         impl.groupId.c_str(),
-        why == GroupFailReason::BrokerTooOld ? "the broker does not advertise explicit group subscriptions"
-                                             : "the broker coordinator refused this consumer's request "
-                                               "(non-retriable answer or retry budget exhausted)");
+        why == GroupFailReason::BrokerTooOld
+            ? "the broker does not advertise explicit group subscriptions (client and broker must both be "
+              "version >= 3)"
+        : why == GroupFailReason::RetryBudgetExhausted
+            ? "a retriable coordinator failure persisted past its retry budget (transient: recreate the consumer)"
+            : "the broker coordinator refused this consumer's request (non-retriable answer)");
     if (routed_()) dropAllFetch_(impl);
     impl.failReason = why;
     finish_(impl);
