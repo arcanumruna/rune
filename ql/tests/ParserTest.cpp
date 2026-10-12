@@ -143,3 +143,66 @@ TEST(ParserRegression, AlterUnknownOpIsLocatedError) {
     ASSERT_FALSE(r.has_value());
     EXPECT_GT(r.error().line, 0u);
 }
+
+// ── Phase 2b E: transient topics ─────────────────────────────────────────────
+TEST(Parser, TransientTopicSetsPersistence) {
+    auto r = rune::ql::parse(
+        "transient topic presence { userId int64, online bool } partitions 4 key userId;");
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    const auto* t = std::get_if<rune::ql::TopicDef>(&*r);
+    ASSERT_NE(t, nullptr);
+    EXPECT_EQ(t->name, "presence");
+    EXPECT_EQ(t->partitions, 4u);
+    EXPECT_EQ(t->keyField, "userId");
+    EXPECT_EQ(t->persistence, rune::ql::Persistence::Transient);
+}
+
+TEST(Parser, PlainTopicDefaultsToDisk) {
+    auto r = rune::ql::parse("topic users { id int64 } partitions 4 key id;");
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(std::get<rune::ql::TopicDef>(*r).persistence, rune::ql::Persistence::Disk);
+    EXPECT_EQ(static_cast<uint8_t>(rune::ql::Persistence::Disk), 0u);
+    EXPECT_EQ(static_cast<uint8_t>(rune::ql::Persistence::Transient), 1u);
+}
+
+TEST(ParserRegression, TransientWithoutTopicIsLocatedError) {
+    auto r = rune::ql::parse("transient presence { a int32 } partitions 1 key a;");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find("'topic' after 'transient'"), std::string::npos)
+        << r.error().message;
+    EXPECT_EQ(r.error().line, 1u);
+    EXPECT_EQ(r.error().col, 11u) << "error points at the token after 'transient'";
+}
+
+// 'transient' is a statement keyword only in statement-leading position: a topic
+// or a field literally named "transient" must keep parsing.
+TEST(ParserRegression, TopicNamedTransientStillParses) {
+    auto r = rune::ql::parse("topic transient { transient int32 } partitions 1 key transient;");
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    const auto& t = std::get<rune::ql::TopicDef>(*r);
+    EXPECT_EQ(t.name, "transient");
+    EXPECT_EQ(t.fields[0].name, "transient");
+    EXPECT_EQ(t.persistence, rune::ql::Persistence::Disk);
+}
+
+// Spec E: alter topic cannot change persistence — both spellings a user would
+// try are rejected with an explicit message (not a generic syntax error).
+TEST(ParserRegression, AlterCannotChangePersistence) {
+    auto a = rune::ql::parse("alter topic presence set persistence transient;");
+    ASSERT_FALSE(a.has_value());
+    EXPECT_NE(a.error().message.find("cannot change persistence"), std::string::npos)
+        << a.error().message;
+    EXPECT_EQ(a.error().col, 26u) << "points at 'persistence'";
+
+    auto b = rune::ql::parse("alter transient topic presence add column x int32;");
+    ASSERT_FALSE(b.has_value());
+    EXPECT_NE(b.error().message.find("cannot change persistence"), std::string::npos)
+        << b.error().message;
+    EXPECT_EQ(b.error().col, 7u) << "points at 'transient'";
+}
+
+TEST(ParserRegression, UnknownStatementMentionsTransient) {
+    auto r = rune::ql::parse("drop topic users;");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find("'transient'"), std::string::npos) << r.error().message;
+}

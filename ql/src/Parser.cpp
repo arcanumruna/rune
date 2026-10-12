@@ -1,8 +1,11 @@
 // rune-ql parser — tokenizer + recursive-descent DDL parser
 // Grammar:
-//   statement   := topicStmt | alterStmt
+//   statement   := topicStmt | transientStmt | alterStmt
+//   transientStmt := "transient" topicStmt                 (Phase 2b E: persistence = Transient)
 //   topicStmt   := "topic" IDENT "{" field ("," field)* ","? "}" "partitions" INT "key" IDENT ";"
 //   alterStmt   := "alter" "topic" IDENT alterOp ("," alterOp)* ";"
+//                  ("alter transient …" and "set persistence …" are rejected:
+//                   a topic's persistence is fixed when it is defined)
 //   alterOp     := "add" "column" field
 //                | "drop" "column" IDENT
 //                | "rename" "column" IDENT "to" IDENT
@@ -393,6 +396,13 @@ struct Parser {
 
         if (cur.text == "set") {
             advance();
+            // Spec E: persistence is fixed at definition — reject the spelling a
+            // user would try with an explicit message, not "expected 'compatibility'".
+            if (cur.kind == TK::Ident && cur.text == "persistence") {
+                return std::unexpected(err(
+                    "alter topic cannot change persistence: a topic is transient or "
+                    "durable for life (define a new topic instead)"));
+            }
             auto compat = expectKeyword("compatibility");
             if (!compat) return std::unexpected(std::move(compat.error()));
 
@@ -423,6 +433,13 @@ struct Parser {
         // "alter"
         auto alterTok = expectKeyword("alter");
         if (!alterTok) return std::unexpected(std::move(alterTok.error()));
+
+        // Spec E: "alter transient topic …" would read as changing persistence.
+        if (cur.kind == TK::Ident && cur.text == "transient") {
+            return std::unexpected(err(
+                "alter topic cannot change persistence: a topic is transient or "
+                "durable for life (define a new topic instead)"));
+        }
 
         // "topic"
         auto topicTok = expectKeyword("topic");
@@ -458,31 +475,46 @@ struct Parser {
 
         return ad;
     }
+
+    // ---- statement dispatch (Phase 2b E; Part D's parseScript reuses this) ----
+    //   "topic" … | "transient" "topic" … | "alter" "topic" …
+    std::expected<std::variant<TopicDef, AlterTopicDef>, ParseError> parseStatement() noexcept {
+        if (cur.kind != TK::Ident) {
+            return std::unexpected(err("expected 'topic', 'transient' or 'alter'"));
+        }
+        if (cur.text == "topic") {
+            auto r = parseTopicStatement();
+            if (!r) return std::unexpected(std::move(r.error()));
+            return std::variant<TopicDef, AlterTopicDef>(std::in_place_type<TopicDef>, std::move(*r));
+        }
+        if (cur.text == "transient") {
+            advance();
+            if (cur.kind != TK::Ident || cur.text != "topic") {
+                return std::unexpected(err(
+                    std::string("expected 'topic' after 'transient', got '") +
+                    std::string(cur.text) + "'"));
+            }
+            auto r = parseTopicStatement();
+            if (!r) return std::unexpected(std::move(r.error()));
+            r->persistence = Persistence::Transient;
+            return std::variant<TopicDef, AlterTopicDef>(std::in_place_type<TopicDef>, std::move(*r));
+        }
+        if (cur.text == "alter") {
+            auto r = parseAlterStatement();
+            if (!r) return std::unexpected(std::move(r.error()));
+            return std::variant<TopicDef, AlterTopicDef>(std::in_place_type<AlterTopicDef>, std::move(*r));
+        }
+        return std::unexpected(err(
+            std::string("expected 'topic', 'transient' or 'alter', got '") +
+            std::string(cur.text) + "'"));
+    }
 };
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
 std::expected<std::variant<TopicDef, AlterTopicDef>, ParseError> parse(std::string_view src) noexcept {
     Parser p{src};
-
-    if (p.cur.kind != TK::Ident) {
-        return std::unexpected(p.err("expected 'topic' or 'alter'"));
-    }
-
-    if (p.cur.text == "topic") {
-        auto r = p.parseTopicStatement();
-        if (!r) return std::unexpected(std::move(r.error()));
-        return std::variant<TopicDef, AlterTopicDef>(std::in_place_type<TopicDef>, std::move(*r));
-    }
-
-    if (p.cur.text == "alter") {
-        auto r = p.parseAlterStatement();
-        if (!r) return std::unexpected(std::move(r.error()));
-        return std::variant<TopicDef, AlterTopicDef>(std::in_place_type<AlterTopicDef>, std::move(*r));
-    }
-
-    return std::unexpected(p.err(
-        std::string("expected 'topic' or 'alter', got '") + std::string(p.cur.text) + "'"));
+    return p.parseStatement();
 }
 
 } // namespace rune::ql

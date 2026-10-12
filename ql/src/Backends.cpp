@@ -22,7 +22,8 @@ DefineTopicPlan applyPlan(const TopicDef& td) {
         td.name,
         td.partitions,
         td.keyField,
-        rune::codec::serialize(toDescriptor(td))
+        rune::codec::serialize(toDescriptor(td)),
+        td.persistence
     };
 }
 

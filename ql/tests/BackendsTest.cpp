@@ -137,3 +137,11 @@ TEST(BackendsRegression, ApplyAlterPlanAllOpKindsRoundTrip) {
     EXPECT_EQ(plan.expectedVersion, 42u);
     EXPECT_EQ(plan.name, "users");
 }
+
+TEST(BackendsRegression, ApplyPlanCarriesPersistence) {
+    auto t = std::get<TopicDef>(
+        parse("transient topic p { id int64 } partitions 2 key id;").value());
+    EXPECT_EQ(applyPlan(t).persistence, Persistence::Transient);
+    auto d = std::get<TopicDef>(parse("topic q { id int64 } partitions 2 key id;").value());
+    EXPECT_EQ(applyPlan(d).persistence, Persistence::Disk);
+}

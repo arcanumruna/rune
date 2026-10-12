@@ -15,6 +15,7 @@ struct DefineTopicPlan {
     uint32_t             partitions;
     std::string          keyField;
     std::vector<uint8_t> descriptorBlob;
+    Persistence          persistence = Persistence::Disk;   // Phase 2b E
 };
 
 [[nodiscard]] DefineTopicPlan applyPlan(const TopicDef&);

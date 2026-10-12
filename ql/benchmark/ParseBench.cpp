@@ -14,3 +14,15 @@ static void BM_ParseCharacters(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations());
 }
 BENCHMARK(BM_ParseCharacters);
+
+static constexpr std::string_view kTransientDDL =
+    "transient topic presence { userId int64, online bool } partitions 8 key userId;";
+
+static void BM_ParseTransientTopic(benchmark::State& state) {
+    for (auto _ : state) {
+        auto result = rune::ql::parse(kTransientDDL);
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_ParseTransientTopic);
