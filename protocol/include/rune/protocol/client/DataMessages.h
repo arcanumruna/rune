@@ -134,6 +134,10 @@ struct Produce {
         msg.partitionKnown = buf[fixedBase + 8];
         // acks field only present in v1+ (declaredFixed >= 10)
         msg.acks = (declaredFixed >= BODY_FIXED_V1) ? buf[fixedBase + 9] : uint8_t{0};
+        // No-hang wave: an unknown acks byte is rejected, never read as one of
+        // the two modes (the gateway tested == 1, the worker != 0 — a 2 was a
+        // silent durability downgrade on one path).  Answered InvalidRequest.
+        if (msg.acks > 1) return std::nullopt;
         // idempotent fields only present in v2 (declaredFixed >= 24)
         if (declaredFixed >= BODY_FIXED) {
             msg.producerId    = detail::getLE64(buf, static_cast<int>(fixedBase) + 10);
@@ -374,6 +378,9 @@ struct Subscribe {
         msg.partitionKnown = buf[fixedBase + 8];
         msg.fromOffset     = detail::getLE64(buf, static_cast<int>(fixedBase) + 9);
         msg.isolation      = buf[fixedBase + 17];
+        // No-hang wave: an unknown isolation byte is rejected, never read as
+        // read_uncommitted (every consumer tests == read_committed).
+        if (msg.isolation > 1) return std::nullopt;
 
         std::size_t pos = fixedBase + BODY_FIXED;
 

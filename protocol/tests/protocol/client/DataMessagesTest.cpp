@@ -1825,3 +1825,31 @@ TEST(UnsubscribeConformance, Golden) {
     EXPECT_EQ(leU16(buf.data(), 2), 21u);   // templateId
     EXPECT_EQ(leU16(buf.data(), 4), 120u);  // schemaId
 }
+
+// No-hang wave: unknown acks / isolation bytes are rejected by decode (the
+// broker answers InvalidRequest) — never read as one of the two valid modes.
+TEST(DataMessagesRegression, ProduceUnknownAcksByteIsRejectedRegression) {
+    const std::vector<uint8_t> batch(64, 0xAB);
+    rpc::Produce p;
+    p.sessionId = 5; p.correlationId = 6; p.topicId = 1; p.partition = 0; p.partitionKnown = 1;
+    p.acks = 1;
+    p.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
+    std::vector<uint8_t> buf(p.encodedSize());
+    const std::size_t n = p.encode(buf.data());
+    ASSERT_TRUE(rpc::Produce::decode(buf.data(), n).has_value());
+    buf[rpc::MessageHeader::ENCODED_SIZE + 9] = 2;   // acks byte
+    EXPECT_FALSE(rpc::Produce::decode(buf.data(), n).has_value());
+    buf[rpc::MessageHeader::ENCODED_SIZE + 9] = 0;
+    EXPECT_TRUE(rpc::Produce::decode(buf.data(), n).has_value());
+}
+
+TEST(DataMessagesRegression, SubscribeUnknownIsolationByteIsRejectedRegression) {
+    rpc::Subscribe s;
+    s.sessionId = 5; s.correlationId = 6; s.topicId = 1; s.partition = 0; s.partitionKnown = 1;
+    s.isolation = 1;
+    std::vector<uint8_t> buf(s.encodedSize());
+    const std::size_t n = s.encode(buf.data());
+    ASSERT_TRUE(rpc::Subscribe::decode(buf.data(), n).has_value());
+    buf[rpc::MessageHeader::ENCODED_SIZE + 17] = 2;   // isolation byte
+    EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), n).has_value());
+}
