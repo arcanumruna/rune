@@ -1162,10 +1162,11 @@ TEST(ClientSchemaRegression, DefineTopicDefaultOverloadIsDisk) {
 TEST(ClientSchemaRegression, GetViewRowInvalidRequestAndBusyStatusesCompleteTheReadRegression) {
     static_assert(ViewRowResult::kInvalidRequest == rpc::ViewRowResponse::kInvalidRequest);
     static_assert(ViewRowResult::kBusy == rpc::ViewRowResponse::kBusy);
+    static_assert(ViewRowResult::kRowTooLarge == rpc::ViewRowResponse::kRowTooLarge);
     SchemaHarness h(1144, 1145);
     h.build();
     h.connectAndWait();
-    for (const uint16_t st : {ViewRowResult::kInvalidRequest, ViewRowResult::kBusy}) {
+    for (const uint16_t st : {ViewRowResult::kInvalidRequest, ViewRowResult::kBusy, ViewRowResult::kRowTooLarge}) {
         h.gw->viewRowStatus = st;
         auto fut = h.getViewRowOp(0x40000007, /*keyU64=*/7, /*requestedFingerprint=*/0);
         h.pumpGwUntil([&]() { return fut.ready(); });

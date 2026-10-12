@@ -153,6 +153,15 @@ struct InvokerGateway {
     int dropSubscribeResponsesNext = 0;
     // JoinGroup answers carry this error code (0 = the normal answer).
     int16_t joinErrorCode = 0;
+    // No-hang fix round 2: SyncGroup / Heartbeat answers carry these codes
+    // (0 = normal); OffsetFetch: the code of offsetFetchErrorsNext answers, and
+    // the next N OffsetFetch answers are the broker's whole-request rejection
+    // {topicId -1, partition -1, offsetFetchRejectCode}.
+    int16_t syncErrorCode        = 0;
+    int16_t heartbeatErrorCode   = 0;
+    int16_t offsetFetchErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator);
+    int     offsetFetchRejectNext = 0;
+    int16_t offsetFetchRejectCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::InvalidRequest);
     // ConnectResponse.brokerVersion advertised (-1 = an older broker's 38-byte frame).
     int32_t advertisedBrokerVersion = rune::protocol::client::kBrokerVersion;
     std::map<int, int32_t> advertisedBrokerVersionAt;  // per endpoint (a rolling upgrade)
@@ -243,6 +252,7 @@ struct InvokerGateway {
     int  pings        = 0;
     std::vector<std::vector<uint8_t>> offsetCommits;  // raw OffsetCommit frames received
     bool replyOffsetCommits = true;
+    int16_t offsetCommitErrorCode = 0;   // != 0: the broker's rejection {-1, -1, code}
     // F8c C3: control-op replies (all off by default = the historical gateway).
     bool    replyConnects   = true;   // false: ConnectRequests are counted, never answered
     bool    replyPongs      = false;  // Ping -> Pong{echo}
@@ -1131,8 +1141,10 @@ private:
             rp::OffsetCommitResponse rsp;
             rsp.sessionId     = oc->sessionId;
             rsp.correlationId = oc->correlationId;
-            std::vector<uint8_t> out(rp::OffsetCommitResponse::encodedSizeFor(0));
-            const std::size_t n = rsp.encode(out.data(), {});
+            std::vector<rp::OffsetCommitResult> res;
+            if (offsetCommitErrorCode != 0) res.push_back(rp::OffsetCommitResult{-1, -1, offsetCommitErrorCode});
+            std::vector<uint8_t> out(rp::OffsetCommitResponse::encodedSizeFor(res.size()));
+            const std::size_t n = rsp.encode(out.data(), std::span<const rp::OffsetCommitResult>(res));
             send(0, out.data(), n);
             return;
         }
@@ -1230,7 +1242,8 @@ private:
             rp::SyncGroupResponse r;
             r.sessionId     = sg->sessionId;
             r.correlationId = 0;
-            r.errorCode     = 0;
+            r.errorCode     = syncErrorCode;
+            if (syncErrorCode != 0) asgn.clear();
             std::vector<uint8_t> out(rp::SyncGroupResponse::encodedSizeFor(asgn.size()));
             const std::size_t n = r.encode(out.data(), asgn);
             send(0, out.data(), n);
@@ -1247,7 +1260,8 @@ private:
             rp::HeartbeatResponse r;
             r.sessionId     = hb->sessionId;
             r.correlationId = 0;
-            r.errorCode     = rebalancing ? static_cast<int16_t>(rp::ErrorCode::RebalanceInProgress) : int16_t{0};
+            r.errorCode     = heartbeatErrorCode != 0 ? heartbeatErrorCode
+                            : rebalancing ? static_cast<int16_t>(rp::ErrorCode::RebalanceInProgress) : int16_t{0};
             std::vector<uint8_t> out(rp::HeartbeatResponse::ENCODED_SIZE);
             const std::size_t n = r.encode(out.data());
             send(0, out.data(), n);
@@ -1263,11 +1277,16 @@ private:
             std::vector<rp::OffsetFetchResult> res;
             const bool failAll = offsetFetchErrorsNext > 0;
             if (failAll) --offsetFetchErrorsNext;
-            for (const auto& e : of->entries) {
+            if (offsetFetchRejectNext > 0) {
+                --offsetFetchRejectNext;
+                rp::OffsetFetchResult r;
+                r.topicId = -1; r.partition = -1; r.offset = -1; r.errorCode = offsetFetchRejectCode;
+                res.push_back(r);
+            } else for (const auto& e : of->entries) {
                 rp::OffsetFetchResult r;
                 r.topicId   = e.topicId;
                 r.partition = e.partition;
-                r.errorCode = failAll ? static_cast<int16_t>(rp::ErrorCode::NotCoordinator) : int16_t{0};
+                r.errorCode = failAll ? offsetFetchErrorCode : int16_t{0};
                 const auto it = committedOffsets.find({e.topicId, e.partition});
                 r.offset = it == committedOffsets.end() ? -1 : it->second;
                 res.push_back(r);

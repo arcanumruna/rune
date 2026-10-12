@@ -180,6 +180,39 @@ void GroupConsumerHub::finish_(GroupConsumerImpl& impl) {
     closeStatus_(impl);
 }
 
+namespace {
+// No-hang fix round 2 (C1): the coordinator's error codes, classified
+// EXPLICITLY (the old "else" branch rejoined at once on anything — a tight
+// JoinGroup <-> Internal storm — and a Heartbeat error outside the rebalance
+// set left the member Stable while the broker had evicted it).
+enum class GroupVerdict : uint8_t { Ok, Rejoin, Backoff, Refuse };
+GroupVerdict classifyGroupAnswer_(rpc::ErrorCode ec) noexcept {
+    switch (ec) {
+    case rpc::ErrorCode::OK:                  return GroupVerdict::Ok;
+    case rpc::ErrorCode::NotCoordinator:
+    case rpc::ErrorCode::RebalanceInProgress:
+    case rpc::ErrorCode::UnknownMember:
+    case rpc::ErrorCode::IllegalGeneration:
+    case rpc::ErrorCode::StaleGeneration:     return GroupVerdict::Rejoin;    // the rebalance protocol
+    case rpc::ErrorCode::ProtocolVersion:
+    case rpc::ErrorCode::InvalidRequest:      return GroupVerdict::Refuse;    // re-sending fails the same way
+    default:                                  return GroupVerdict::Backoff;   // Internal, NotLeader, unknown, ...
+    }
+}
+} // namespace
+
+void GroupConsumerHub::rejoinWithBackoff_(GroupConsumerImpl& impl) {
+    if (++impl.backoffRejoins > kMaxBackoffRejoins) {
+        refuse_(impl, GroupFailReason::RefusedByBroker);
+        return;
+    }
+    // 20 ms doubling, capped at 1 s: the whole budget spends ~3.3 s.
+    const auto shift = std::min<uint32_t>(impl.backoffRejoins - 1, 6u);
+    const auto delay = std::chrono::milliseconds(std::min<int64_t>(int64_t{20} << shift, 1000));
+    impl.rejoinNotBefore = tpNow() + delay;
+    toRejoining_(impl);
+}
+
 void GroupConsumerHub::toRejoining_(GroupConsumerImpl& impl) {
     // C1: the old generation's subscriptions are dead at once — their records
     // are dropped (retired) and ours unsubscribed.
@@ -507,7 +540,6 @@ GroupConsumerHub::CommitSend GroupConsumerHub::sendOffsetCommit(GroupConsumerImp
 // and after applyAssignment adds new partitions.
 // ---------------------------------------------------------------------------
 
-/*static*/
 void GroupConsumerHub::sendOffsetFetch(GroupConsumerImpl& impl,
                                         int64_t sessionId,
                                         const SendFn& sendFn)
@@ -530,8 +562,9 @@ void GroupConsumerHub::sendOffsetFetch(GroupConsumerImpl& impl,
 
     rpc::OffsetFetch msg;
     msg.sessionId     = sessionId;
-    msg.correlationId = 0;
+    msg.correlationId = kOffsetFetchCorrTag | nextOffsetFetchCorr_++;   // I2: only ITS answer seeds
     msg.groupId       = grpSpan;
+    impl.offsetFetchCorrId = msg.correlationId;
 
     const std::size_t len = msg.encode(impl.sendBuf.data(), entries);
     if (len == 0) return;
@@ -559,8 +592,9 @@ void GroupConsumerHub::sendOffsetFetchFor_(GroupConsumerImpl& impl, int64_t sess
     ensureBuf(impl, rpc::OffsetFetch::encodedSizeFor(grpSpan, entries.size()));
     rpc::OffsetFetch msg;
     msg.sessionId     = sessionId;
-    msg.correlationId = 0;
+    msg.correlationId = kOffsetFetchCorrTag | nextOffsetFetchCorr_++;   // I2
     msg.groupId       = grpSpan;
+    impl.offsetFetchCorrId = msg.correlationId;
     const std::size_t len = msg.encode(impl.sendBuf.data(), entries);
     if (len > 0 && sendFn) (void)sendFn(0, impl.sendBuf.data(), len);  // refused: the next retry pass
 }
@@ -1108,7 +1142,9 @@ int GroupConsumerHub::doWork(int64_t nowNs,
         }
 
         case GroupConsumerState::Rejoining:
-            // Re-send JoinGroup immediately.
+            // Re-send JoinGroup — at once for a rebalance signal, after the
+            // backoff for an Internal / unclassified error (C1).
+            if (now < impl->rejoinNotBefore) break;
             sendJoinGroup(*impl, sessionId, sendFn);
             ++work;
             break;
@@ -1277,8 +1313,9 @@ void GroupConsumerHub::onJoinGroupResponse(const uint8_t* buf, std::size_t len,
         // once JoinGroup carries a per-consumer correlationId — for now we
         // support one group per connection, matching Kafka client convention.)
         const auto ec = static_cast<rpc::ErrorCode>(opt->errorCode);
+        const GroupVerdict v = classifyGroupAnswer_(ec);
 
-        if (ec == rpc::ErrorCode::OK) {
+        if (v == GroupVerdict::Ok) {
             // Store memberId and generationId.
             impl->memberId    = std::string(
                 reinterpret_cast<const char*>(opt->memberId.data()),
@@ -1287,17 +1324,15 @@ void GroupConsumerHub::onJoinGroupResponse(const uint8_t* buf, std::size_t len,
             publishGeneration_(*impl);
 
             sendSyncGroup(*impl, sessionId, sendFn);
-        } else if (ec == rpc::ErrorCode::ProtocolVersion || ec == rpc::ErrorCode::InvalidRequest) {
-            // MAJOR-2 (round 3): non-retriable — this client is too old for the broker.
-            // No-hang wave: InvalidRequest (the broker could not decode the JoinGroup)
-            // is non-retriable too — re-joining re-sends the same bytes (a join storm).
+        } else if (v == GroupVerdict::Refuse) {
+            // MAJOR-2 (round 3): ProtocolVersion — this client is too old for the
+            // broker.  No-hang wave: InvalidRequest (the broker could not decode
+            // the JoinGroup) — re-joining re-sends the same bytes (a join storm).
             refuse_(*impl, GroupFailReason::RefusedByBroker);
-        } else if (ec == rpc::ErrorCode::NotCoordinator ||
-                   ec == rpc::ErrorCode::RebalanceInProgress) {
+        } else if (v == GroupVerdict::Rejoin) {
             toRejoining_(*impl);
         } else {
-            // Other error (UnknownMember, GroupDead, etc.) — rejoin.
-            toRejoining_(*impl);
+            rejoinWithBackoff_(*impl);   // C1: Internal / unclassified — paced + bounded
         }
         break;  // only one Joining consumer handled per response
     }
@@ -1319,8 +1354,10 @@ void GroupConsumerHub::onSyncGroupResponse(const uint8_t* buf, std::size_t len,
         if (impl->state != GroupConsumerState::Syncing) continue;
 
         const auto ec = static_cast<rpc::ErrorCode>(opt->errorCode);
+        const GroupVerdict v = classifyGroupAnswer_(ec);
 
-        if (ec == rpc::ErrorCode::OK) {
+        if (v == GroupVerdict::Ok) {
+            impl->backoffRejoins = 0;   // C1: a completed join resets the backoff budget
             // Build new assignment from SyncGroupResponse.
             std::vector<TP> newAsgn;
             for (const auto& tp : opt->assignment) {
@@ -1365,8 +1402,12 @@ void GroupConsumerHub::onSyncGroupResponse(const uint8_t* buf, std::size_t len,
             // (#1a) Seed positions from broker-committed offsets immediately.
             // All assigned partitions have sentinel -1 until this response arrives.
             sendOffsetFetch(*impl, sessionId, sendFn);
-        } else {
+        } else if (v == GroupVerdict::Refuse) {
+            refuse_(*impl, GroupFailReason::RefusedByBroker);   // C1: never a SyncGroup loop
+        } else if (v == GroupVerdict::Rejoin) {
             toRejoining_(*impl);
+        } else {
+            rejoinWithBackoff_(*impl);
         }
         break;
     }
@@ -1390,17 +1431,14 @@ void GroupConsumerHub::onHeartbeatResponse(const uint8_t* buf, std::size_t len,
         const auto ec = static_cast<rpc::ErrorCode>(
             static_cast<uint16_t>(opt->errorCode));
 
-        if (ec == rpc::ErrorCode::OK) {
-            // Nothing to do — next heartbeat already armed by doWork.
-        } else if (ec == rpc::ErrorCode::RebalanceInProgress ||
-                   ec == rpc::ErrorCode::NotCoordinator       ||
-                   ec == rpc::ErrorCode::IllegalGeneration     ||
-                   ec == rpc::ErrorCode::StaleGeneration       ||
-                   ec == rpc::ErrorCode::UnknownMember) {
-            // Trigger rejoin.
-            toRejoining_(*impl);
+        switch (classifyGroupAnswer_(ec)) {
+        case GroupVerdict::Ok:      break;                     // next heartbeat already armed by doWork
+        case GroupVerdict::Rejoin:  toRejoining_(*impl); break;
+        case GroupVerdict::Refuse:  refuse_(*impl, GroupFailReason::RefusedByBroker); break;
+        // C1: never stay Stable on an error the broker could not serve — the
+        // broker may have evicted this member (split-brain): rejoin, paced.
+        case GroupVerdict::Backoff: rejoinWithBackoff_(*impl); break;
         }
-        // Other errors: stay Stable, let next heartbeat cycle handle it.
         break;
     }
 
@@ -1454,7 +1492,13 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
         GroupConsumerImpl* const impl = impls_[ix];
         if (!impl->active) continue;
         if (impl->state != GroupConsumerState::Stable) continue;
+        // No-hang fix round 2 (I2): only the answer to THIS consumer's latest
+        // OffsetFetch (echoed correlationId) — never the first Stable consumer's
+        // by accident, never a stale answer.
+        if (impl->offsetFetchCorrId == 0 || opt->correlationId != impl->offsetFetchCorrId) continue;
 
+        bool refused = false;
+        bool retriableError = false;
         // (#1a) Seed positions from committed offsets.
         // We seed unconditionally for partitions that are still at the sentinel
         // (-1 = never seeded) OR that haven't received any Records yet (still
@@ -1462,7 +1506,16 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
         // partitions that already have a position advanced past the committed
         // offset by delivered Records — that would regress the position.
         for (const auto& r : opt->results) {
-            if (r.errorCode != 0) continue;  // skip errored entries
+            if (r.errorCode != 0) {
+                // I2: a whole-request rejection ({-1, -1, code}: the broker could
+                // not decode / serve the OffsetFetch) or a non-retriable code
+                // finishes the consumer; any other per-entry error is re-sent
+                // (paced by retryOffsetFetch) within kMaxOffsetFetchAttempts.
+                const auto ec = static_cast<rpc::ErrorCode>(static_cast<uint16_t>(r.errorCode));
+                if (r.topicId < 0 || classifyGroupAnswer_(ec) == GroupVerdict::Refuse) refused = true;
+                else retriableError = true;
+                continue;
+            }
             const TP tp{r.topicId, r.partition};
             auto it = impl->assignment.find(tp);
             if (it == impl->assignment.end()) continue;
@@ -1479,6 +1532,18 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
                 it->second = 0;
             }
             if (routed_()) impl->fetch[tp].offsetKnown = true;
+        }
+        if (refused) {
+            refuse_(*impl, GroupFailReason::RefusedByBroker);
+            break;
+        }
+        if (retriableError) {
+            if (++impl->offsetFetchAttempts > kMaxOffsetFetchAttempts) {
+                refuse_(*impl, GroupFailReason::RefusedByBroker);
+                break;
+            }
+        } else {
+            impl->offsetFetchAttempts = 0;
         }
         // Leader-node subscriptions waiting for their start offset go now.
         if (routed_()) (void)reconcileImpl_(*impl);
@@ -1541,7 +1606,8 @@ void GroupConsumerHub::refuse_(GroupConsumerImpl& impl, GroupFailReason why)
         "(client and broker must both be version >= 3: explicit group subscriptions)\n",
         impl.groupId.c_str(),
         why == GroupFailReason::BrokerTooOld ? "the broker does not advertise explicit group subscriptions"
-                                             : "the broker coordinator refused this client's JoinGroup");
+                                             : "the broker coordinator refused this consumer's request "
+                                               "(non-retriable answer or retry budget exhausted)");
     if (routed_()) dropAllFetch_(impl);
     impl.failReason = why;
     finish_(impl);

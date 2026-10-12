@@ -2489,7 +2489,11 @@ void Client::onEgressFrame(codec::TemplateId tid,
         }
         const auto ecode = static_cast<uint16_t>(opt->code);
         const auto text  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(msg.data()), msg.size());
-        completeConnect_(OpStatus::BrokerError, 0, ecode, msg);
+        // No-hang fix round 2: only an answer to THE connect (its correlationId)
+        // or a session-fatal one fails a pending connect — an error answering
+        // some other request (e.g. an InvalidRequest Ping) no longer does.
+        if (sessionFatal || opt->correlationId == agent_.seedSession().machine.correlationId())
+            completeConnect_(OpStatus::BrokerError, 0, ecode, msg);
         if (sessionFatal) {
             while (!pendingCtl_.empty()) {
                 PendingCtl p = takeCtl_(pendingCtl_.size() - 1);

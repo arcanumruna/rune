@@ -451,6 +451,48 @@ TEST(CompletionsClient, SessionFatalErrorCompletesAllPendingSessionLostRegressio
     EXPECT_EQ(r.client.testPendingControlOps(), 0u);
 }
 
+// No-hang fix round 2: the broker answers a Ping it could not decode with
+// ErrorResponse{InvalidRequest (39)} on the ping's correlationId — the ping
+// completes BrokerError with that code at once; other pending ops are untouched.
+TEST(CompletionsClient, PingInvalidRequestErrorCompletesThatPingRegression) {
+    Rig r(cfgFor(5450));
+    TestCq cq(r.client);
+    r.connect(cq);
+    std::vector<uint8_t> blob{9};
+    auto d = cq.issue([&](rc::Completions& q, rc::Token t) {
+        return r.client.defineTopic("z", 1, "", false, blob, q, t);
+    });
+    ASSERT_TRUE(r.drive([&] { return r.gw.defines == 1; }));
+    r.gw.pingErrorCode = static_cast<int16_t>(rune::client::codec::ErrorCode::InvalidRequest);
+    auto p = pingOn(cq, r.client, {1});
+    ASSERT_TRUE(r.drive([&] { return p.ready(); }));
+    EXPECT_EQ(p.status(), rc::OpStatus::BrokerError);
+    EXPECT_EQ(p.outcome().c.errorCode, static_cast<uint16_t>(rune::client::codec::ErrorCode::InvalidRequest));
+    r.settle();
+    EXPECT_FALSE(d.ready()) << "a non-fatal error answering another request completed this op";
+}
+
+// No-hang fix round 2: an ErrorResponse answering ANOTHER request no longer
+// fails a pending connect (it used to: any ErrorResponse completed the connect
+// BrokerError); only the connect's own correlationId or a session-fatal one does.
+TEST(CompletionsClient, ForeignErrorResponseDoesNotFailAPendingConnectRegression) {
+    Rig r(cfgFor(5452));
+    r.gw.replyConnects = false;
+    TestCq cq(r.client);
+    ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
+    auto c = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.connect(q, t); });
+    ASSERT_TRUE(r.drive([&] { return r.gw.connects >= 1; }));
+    ASSERT_FALSE(r.gw.connectCorrIds.empty());
+    r.gw.sendError(0, static_cast<int16_t>(rune::client::codec::ErrorCode::InvalidRequest), "", 0,
+                   r.gw.connectCorrIds.back() + 777);
+    r.settle();
+    EXPECT_FALSE(c.ready()) << "an error answering another request failed the pending connect";
+    r.gw.sendError(0, static_cast<int16_t>(rune::client::codec::ErrorCode::InvalidRequest), "", 0,
+                   r.gw.connectCorrIds.back());
+    ASSERT_TRUE(r.drive([&] { return c.ready(); }));
+    EXPECT_EQ(c.status(), rc::OpStatus::BrokerError);
+}
+
 // A second connect() while one is pending completes the older one Superseded
 // (it used to throw "connect() called while another connect is pending" into
 // the old future); the newer one completes exactly once (here: Closed).

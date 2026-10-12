@@ -2562,3 +2562,57 @@ TEST(TransactionalProducerRegression, InitProducerIdInvalidRequestCompletesWithE
     EXPECT_EQ(op.status(), OpStatus::BrokerError);
     EXPECT_EQ(r.cycles(64, rpc::TemplateId::InitProducerId), 0);
 }
+
+// No-hang fix round 2: AddPartitionsToTxn / AddOffsetsToTxn / TxnOffsetCommit
+// answered InvalidRequest (the broker could not decode them) complete their
+// operation with that error at once — never pending, never re-sent.
+TEST(TransactionalProducerRegression, AddOffsetsAndTxnOffsetCommitInvalidRequestCompleteRegression) {
+    constexpr int16_t kInv = static_cast<int16_t>(rpc::ErrorCode::InvalidRequest);
+    for (const bool atAddOffsets : {true, false}) {
+        SCOPED_TRACE(atAddOffsets ? "AddOffsetsToTxn" : "TxnOffsetCommit");
+        TxnRig r;
+        r.acquire(77, 0);
+        r.tp.beginTransaction();
+        auto op = r.sendOffsets({{{42, 0}, 100}}, "g");
+        ASSERT_EQ(op.r, OpResult::Accepted);
+        r.doWork();
+        const auto ao = r.sink.last(rpc::TemplateId::AddOffsetsToTxn);
+        ASSERT_FALSE(ao.empty());
+        if (atAddOffsets) {
+            auto resp = makeAddOffsetsToTxnResponse(corrIdOf(ao), kInv);
+            r.impl->onAddOffsetsToTxnResponse(resp.data(), resp.size());
+            ASSERT_TRUE(op.ready());
+            EXPECT_EQ(op.status(), OpStatus::BrokerError);
+            EXPECT_EQ(r.cycles(64, rpc::TemplateId::AddOffsetsToTxn), 0);
+            continue;
+        }
+        auto ok = makeAddOffsetsToTxnResponse(corrIdOf(ao));
+        r.impl->onAddOffsetsToTxnResponse(ok.data(), ok.size());
+        r.doWork();
+        const auto oc = r.sink.last(rpc::TemplateId::TxnOffsetCommit);
+        ASSERT_FALSE(oc.empty());
+        auto resp = makeTxnOffsetCommitResponse(corrIdOf(oc), kInv);
+        r.impl->onTxnOffsetCommitResponse(resp.data(), resp.size());
+        ASSERT_TRUE(op.ready());
+        EXPECT_EQ(op.status(), OpStatus::BrokerError);
+        EXPECT_EQ(r.cycles(64, rpc::TemplateId::TxnOffsetCommit), 0);
+    }
+}
+
+TEST(TransactionalProducerRegression, AddPartitionsInvalidRequestPoisonsNotRetriedRegression) {
+    TxnRig r;
+    r.acquire();
+    r.tp.beginTransaction();
+    const std::vector<uint8_t> v{0x5A};
+    r.tp.send(TopicHandle{5, 1}, Key(uint64_t{0}), std::span<const uint8_t>(v));
+    r.doWork();
+    const auto ap = r.sink.last(rpc::TemplateId::AddPartitionsToTxn);
+    ASSERT_FALSE(ap.empty());
+    auto resp = makeAddPartitionsToTxnResponse(corrIdOf(ap), static_cast<int16_t>(rpc::ErrorCode::InvalidRequest));
+    r.impl->onAddPartitionsToTxnResponse(resp.data(), resp.size());
+    EXPECT_EQ(r.cycles(64, rpc::TemplateId::AddPartitionsToTxn), 0) << "re-sent a request the broker cannot decode";
+    auto commit = r.commit();
+    r.doWork();
+    ASSERT_TRUE(commit.ready()) << "a commit over a poisoned transaction stayed pending";
+    EXPECT_NE(commit.status(), OpStatus::Ok);
+}

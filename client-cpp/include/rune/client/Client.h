@@ -135,7 +135,8 @@ struct CreateViewResult {
 /// Result of GetViewRow (wire 72/73). `status` is ViewRowResponse::Status
 /// (0=OK, 1=AbsentKey, 2=NotReady, 3=SchemaMismatch, 4=UnknownView,
 /// 5=InvalidRequest — the broker could not decode the request, non-retriable,
-/// 6=Busy — the owning worker was full, the read was not performed, retry; matching
+/// 6=Busy — the owning worker was full, the read was not performed, retry,
+/// 7=RowTooLarge — the row exceeds the broker's egress frame, non-retriable; matching
 /// rune::protocol::client::ViewRowResponse's enum values exactly — duplicated
 /// here as plain uint16_t constants so Client.h need not include
 /// DataMessages.h). `rowBytes`'s OWN size is ground truth for the row length
@@ -150,6 +151,7 @@ struct ViewRowResult {
     static constexpr uint16_t kUnknownView     = 4;
     static constexpr uint16_t kInvalidRequest  = 5;
     static constexpr uint16_t kBusy            = 6;
+    static constexpr uint16_t kRowTooLarge     = 7;   ///< the row exceeds the broker's egress frame (no bytes)
 
     uint16_t              status = kUnknownView;
     std::vector<uint8_t>  rowBytes;

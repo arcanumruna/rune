@@ -227,6 +227,15 @@ struct GroupConsumerImpl {
     // MEDIUM-2: OffsetFetch re-send pacing (duty-clock ns; 0 = due).
     int64_t offsetFetchDueNs     = 0;
     int64_t offsetFetchBackoffNs = 0;
+    // No-hang fix round 2 (I2): the correlationId of the latest OffsetFetch
+    // (only ITS answer seeds positions) and consecutive answers carrying a
+    // retriable per-entry error (budget: GroupConsumerHub::kMaxOffsetFetchAttempts).
+    int64_t  offsetFetchCorrId   = 0;
+    uint32_t offsetFetchAttempts = 0;
+    // C1: consecutive backoff rejoins (Internal / unclassified errors) and the
+    // earliest time the next JoinGroup may go out.
+    uint32_t backoffRejoins = 0;
+    std::chrono::steady_clock::time_point rejoinNotBefore{};
 
     // ---- Timers (duty thread) -------------------------------------------------
     std::chrono::steady_clock::time_point nextHeartbeat;

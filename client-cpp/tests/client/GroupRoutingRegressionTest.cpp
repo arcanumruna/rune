@@ -987,6 +987,154 @@ TEST(GroupRoutingRegression, JoinGroupInvalidRequestFinishesTheConsumerRegressio
     EXPECT_EQ(r.gw.joinGroups, 1);
 }
 
+// ===========================================================================
+// No-hang fix round 2 (C1 / I2): the group state machine never loops forever,
+// never storms, never stays Stable on an error the broker could not serve.
+// ===========================================================================
+namespace {
+// Reach Stable with one assigned partition (single-node routing).
+void reachStable(GroupRig& r, rc::GroupConsumer& gc) {
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return gc.generation() == 1; }, 4'000'000)) << "precondition: Stable";
+}
+} // namespace
+
+TEST(GroupRoutingRegression, SyncGroupInvalidRequestFinishesTheConsumerRegression) {
+    GroupRig r(4183, 4184);
+    r.gw.holdJoins     = false;
+    r.gw.syncErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::InvalidRequest);
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 400'000)) << "syncs: " << r.gw.syncGroups;
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker);
+    EXPECT_EQ(r.gw.syncGroups, 1) << "re-synced a request the broker cannot decode";
+}
+
+// Internal on JoinGroup: re-joined with an exponential backoff, and refused
+// once the budget is spent — never a tight JoinGroup <-> Internal storm.
+TEST(GroupRoutingRegression, JoinGroupInternalBacksOffThenRefusesRegression) {
+    GroupRig r(4185, 4186);
+    r.gw.holdJoins     = false;
+    r.gw.joinErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    const auto t0 = std::chrono::steady_clock::now();
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 40'000'000)) << "joins: " << r.gw.joinGroups;
+    const auto took = std::chrono::steady_clock::now() - t0;
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker);
+    EXPECT_EQ(r.gw.joinGroups, 9) << "1 join + kMaxBackoffRejoins (8) paced re-joins, then refused";
+    EXPECT_GE(took, std::chrono::milliseconds(2000)) << "the re-joins were not paced (a storm)";
+}
+
+TEST(GroupRoutingRegression, SyncGroupInternalBacksOffThenRefusesRegression) {
+    GroupRig r(4187, 4188);
+    r.gw.holdJoins     = false;
+    r.gw.syncErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 40'000'000)) << "syncs: " << r.gw.syncGroups;
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker);
+    EXPECT_EQ(r.gw.syncGroups, 9);
+}
+
+// A Heartbeat the broker could not serve (Internal): the member re-joins (the
+// broker may have evicted it) — it used to stay Stable (silent split-brain).
+TEST(GroupRoutingRegression, HeartbeatInternalRejoinsNeverStaysStableRegression) {
+    GroupRig r(4189, 4190);
+    r.gw.holdJoins       = false;
+    r.gw.groupAssignment = {{1, 0}};
+    rc::GroupConfig gcfg;
+    gcfg.sessionTimeoutMs = 600;   // a heartbeat every 200 ms
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    reachStable(r, gc);
+    const int joins = r.gw.joinGroups;
+    r.gw.heartbeatErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
+    ASSERT_TRUE(r.drive([&] { return r.gw.joinGroups > joins; }, 4'000'000))
+        << "an Internal heartbeat answer left the member Stable";
+}
+
+TEST(GroupRoutingRegression, HeartbeatInvalidRequestFinishesTheConsumerRegression) {
+    GroupRig r(4191, 4192);
+    r.gw.holdJoins       = false;
+    r.gw.groupAssignment = {{1, 0}};
+    rc::GroupConfig gcfg;
+    gcfg.sessionTimeoutMs = 600;
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    reachStable(r, gc);
+    r.gw.heartbeatErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::InvalidRequest);
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 4'000'000));
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker);
+}
+
+// I2: the broker could not decode the OffsetFetch ({-1, -1, InvalidRequest}):
+// the consumer is refused — it used to skip the entry and wait forever for a
+// start offset that never came.
+TEST(GroupRoutingRegression, OffsetFetchRejectedFinishesTheConsumerRegression) {
+    GroupRig r(4193, 4194);
+    r.gw.holdJoins             = false;
+    r.gw.groupAssignment       = {{1, 0}};
+    r.gw.offsetFetchRejectNext = 1;
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 4'000'000)) << "fetches: " << r.gw.offsetFetches;
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker);
+}
+
+// I2: a retriable per-entry error is re-fetched (paced) — but within a budget:
+// a broker that never serves it finishes the consumer instead of looping forever.
+TEST(GroupRoutingRegression, OffsetFetchRetriableErrorIsBoundedRegression) {
+    GroupRig r(4195, 4196);
+    const auto [n1, p1port] = r.addNode(4195);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions            = {{1, 0, 0, 1, 4195, ""}, {1, 1, 1, 1, 4195, ""}};
+    r.gw.subscribeLeader       = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment       = {{1, 1}};
+    r.gw.offsetFetchErrorCode  = static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal);
+    r.gw.offsetFetchErrorsNext = 1'000;
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 80'000'000)) << "fetches: " << r.gw.offsetFetches;
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker);
+    EXPECT_EQ(r.gw.offsetFetches, 9) << "1 fetch + kMaxOffsetFetchAttempts (8) re-fetches";
+}
+
+// No-hang fix round 2: an OffsetCommit the broker rejects (InvalidRequest /
+// Internal as its {-1, -1, code} entry) completes the pending commitSync with
+// BrokerError and that code — never left pending.
+TEST(GroupRoutingRegression, OffsetCommitRejectionCompletesCommitSyncRegression) {
+    for (const auto code : {rune::protocol::client::ErrorCode::InvalidRequest,
+                            rune::protocol::client::ErrorCode::Internal}) {
+        const int32_t base = code == rune::protocol::client::ErrorCode::InvalidRequest ? 4211 : 4213;
+        GroupRig r(base, base + 1);
+        r.gw.holdJoins             = false;
+        r.gw.groupAssignment       = {{1, 0}};
+        r.gw.offsetCommitErrorCode = static_cast<int16_t>(code);
+        auto gc = r.client.subscribeGroup("g", {"t"});
+        Consumed got0;
+        wire(gc, got0);
+        reachStable(r, gc);
+        ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr; }, 4'000'000));
+        r.gw.pushRecords(*r.subAt(0, 0), 0, 2);
+        ASSERT_TRUE(r.drive([&] { return got0.records[0] >= 2; }, 4'000'000));   // a position to commit
+        const std::size_t before = r.gw.offsetCommits.size();
+        const rc::Token t = r.nextToken++;
+        ASSERT_EQ(gc.commitSync(r.cq, t), rc::OpResult::Accepted);
+        rc::Completion got{};
+        bool done = false;
+        ASSERT_TRUE(r.drive([&] {
+            r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) {
+                if (cc.token == t) { done = true; got = cc; }
+            });
+            return done;
+        }, 4'000'000)) << "a rejected OffsetCommit left commitSync pending";
+        EXPECT_GT(r.gw.offsetCommits.size(), before);
+        EXPECT_EQ(got.status, rc::OpStatus::BrokerError);
+        EXPECT_EQ(got.errorCode, static_cast<uint16_t>(code));
+    }
+}
+
 // CG round 4 (A-MEDIUM-3): a rolling upgrade — the seed / coordinator runs v3
 // but p1's leader node still runs an older broker (its pushes would carry no
 // Subscribe correlationId: every batch dropped, a silent stall).  The member

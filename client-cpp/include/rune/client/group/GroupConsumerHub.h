@@ -428,6 +428,18 @@ private:
     int drainCommit_(GroupConsumerImpl& impl, int64_t sessionId, const SendFn& sendFn);
     static void closeStatus_(GroupConsumerImpl& impl);
     void toRejoining_(GroupConsumerImpl& impl);
+    /// No-hang fix round 2 (C1): an error that is neither a known rebalance
+    /// signal nor non-retriable (Internal, NotLeader, unknown codes): rejoin
+    /// after an exponential backoff (20 ms doubling, cap 1 s); after
+    /// kMaxBackoffRejoins consecutive such failures the consumer is refused.
+    void rejoinWithBackoff_(GroupConsumerImpl& impl);
+    static constexpr uint32_t kMaxBackoffRejoins       = 8;
+    /// I2: consecutive OffsetFetch answers with a retriable per-entry error
+    /// before the consumer is refused (each re-send is paced by retryOffsetFetch).
+    static constexpr uint32_t kMaxOffsetFetchAttempts  = 8;
+    /// I2: OffsetFetch correlationIds (bit 60 tag; disjoint from fetch ids).
+    static constexpr int64_t  kOffsetFetchCorrTag      = int64_t{1} << 60;
+    int64_t nextOffsetFetchCorr_ = 1;
     void publishGeneration_(GroupConsumerImpl& impl);
 
     // ---- Internal helpers (runner thread only) ------------------------------
@@ -456,7 +468,7 @@ private:
 
     /// Send OffsetFetch for all currently-assigned partitions to seed positions
     /// from the broker's committed offsets.  Called after entering Stable.
-    static void sendOffsetFetch(GroupConsumerImpl& impl,
+    void sendOffsetFetch(GroupConsumerImpl& impl,
                                 int64_t sessionId,
                                 const SendFn& sendFn);
 

@@ -315,6 +315,11 @@ struct CapturedFrame {
 };
 
 /// Capture sent frames via SendFn.
+// No-hang fix round 2 (I2): only the answer to a consumer's latest OffsetFetch
+// (echoed correlationId) seeds positions — the test broker echoes the last one
+// any CaptureSink saw (single-threaded test file).
+static int64_t g_lastOffsetFetchCorr = 0;
+
 struct CaptureSink {
     std::vector<CapturedFrame> frames;
 
@@ -322,6 +327,7 @@ struct CaptureSink {
         return [this](int32_t /*streamId*/, const uint8_t* buf, std::size_t len) -> bool {
             CapturedFrame f;
             f.data.assign(buf, buf + len);
+            if (auto of = rpc::OffsetFetch::decode(buf, len)) g_lastOffsetFetchCorr = of->correlationId;
             frames.push_back(std::move(f));
             return true;
         };
@@ -982,7 +988,7 @@ static std::vector<uint8_t> makeOffsetFetchResponse(int32_t topicId, int32_t par
 
     rpc::OffsetFetchResponse msg;
     msg.sessionId     = kSessionId;
-    msg.correlationId = 0;
+    msg.correlationId = g_lastOffsetFetchCorr;   // I2: answers the latest OffsetFetch
 
     const std::size_t sz = rpc::OffsetFetchResponse::encodedSizeFor(1);
     std::vector<uint8_t> buf(sz);
