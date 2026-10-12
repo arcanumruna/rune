@@ -19,7 +19,7 @@
 //      decoded positionally via rune::client::view::readSlot (ViewRowCodec.h)
 //      against a RowLayout built from the view's own authored output fields.
 //
-// Two modes (RUNE_MODE), driving the docker/view-engine-e2e.sh restart leg
+// Modes (RUNE_MODE); setup + verify_restart drive the docker/view-engine-e2e.sh restart leg
 // across TWO separate container runs (a `docker run --rm` container cannot
 // itself survive `docker compose restart rune-1` on the broker side):
 //
@@ -57,7 +57,14 @@
 //         contribution -> u100 = {3, 105, 35} (a lost map would give n 4).
 //   Prints "VIEW-ENGINE-E2E: OK" on success.
 //
-// Environment (both modes):
+//   RUNE_MODE=ddl_race (DDL conformance): connect, print "DDL-RACE: READY role=<a|b>",
+//     wait for <RUNE_BARRIER_DIR>/go, then race the other container: define
+//     "race_topic" (a: disk, b: transient), createView "race_view", and a/b define vs
+//     createView "race_mixed".  Prints one "DDL_RACE leg=<leg> role=<r> code=<n>" per leg.
+//   RUNE_MODE=catalog_dump: getTopicSchema for each RUNE_CATALOG_NAMES entry, one
+//     "CATALOG name=… code=… topicId=… version=… parts=… fp=…" line each.
+//
+// Environment (all modes):
 //   RUNE_TARGET / RUNE_TARGET_STREAM / RUNE_EGRESS / RUNE_EGRESS_STREAM /
 //   RUNE_DATA_DIR / RUNE_TIMEOUT_MS — same as rune_schema_probe.cpp.
 //
@@ -77,6 +84,7 @@
 
 #include "characters.gen.h"   // Phase 2b C: build-time codegen (tests/generated/characters.blob)
 
+#include <rune/codec/AlterOps.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
 
@@ -85,6 +93,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -461,6 +470,78 @@ static int typedRoutingLeg(Client& c, std::chrono::milliseconds wait, int boundM
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// DDL conformance legs (rune-broker DDL conformance plan, Task 13).
+// ---------------------------------------------------------------------------
+static uint64_t fnv1a64(const std::vector<uint8_t>& b) {
+    uint64_t h = 1469598103934665603ULL;
+    for (const uint8_t x : b) { h ^= x; h *= 1099511628211ULL; }
+    return h;
+}
+
+static bool waitForGo(const std::string& dir, int boundMs) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(boundMs);
+    while (std::chrono::steady_clock::now() < deadline) {
+        std::error_code ec;
+        if (std::filesystem::exists(dir + "/go", ec)) return true;
+        std::this_thread::sleep_for(10ms);   // poll interval, not a correctness gate
+    }
+    return false;
+}
+
+static int ddlRaceMode(Client& c, const std::string& role, std::chrono::milliseconds wait, int boundMs) {
+    const std::string barrier = getEnvStr("RUNE_BARRIER_DIR", "/barrier");
+    const TopicSchemaResult src = c.getTopicSchemaAndWait("character", wait);
+    if (src.errorCode != 0) {
+        std::cerr << "PROBE: FAIL ddl_race getTopicSchema(character) errorCode=" << src.errorCode << "\n";
+        return 70;
+    }
+    std::cout << "DDL-RACE: READY role=" << role << "\n";
+    std::cout.flush();
+    if (!waitForGo(barrier, boundMs)) { std::cerr << "PROBE: FAIL ddl_race no go signal\n"; return 71; }
+
+    const auto blob = rune::codec::serialize(characterDescriptor());
+    const DefineTopicResult t = c.defineTopicAndWait(
+        "race_topic", 1, "id", false, std::span<const uint8_t>(blob),
+        role == "a" ? Persistence::Disk : Persistence::Transient, wait);
+    std::cout << "DDL_RACE leg=topic role=" << role << " code=" << t.errorCode << "\n";
+
+    const auto plan = rcv::serializeAuthored(charHpPlan("race_view", src.topicId, 0));
+    const CreateViewResult v = c.createViewAndWait("race_view", "id", 0, std::span<const uint8_t>(plan), wait);
+    std::cout << "DDL_RACE leg=view role=" << role << " code=" << v.errorCode << "\n";
+
+    uint16_t mixed = 0;
+    if (role == "a") {
+        mixed = c.defineTopicAndWait("race_mixed", 1, "id", false, std::span<const uint8_t>(blob), wait).errorCode;
+    } else {
+        const auto mplan = rcv::serializeAuthored(charHpPlan("race_mixed", src.topicId, 0));
+        mixed = c.createViewAndWait("race_mixed", "id", 0, std::span<const uint8_t>(mplan), wait).errorCode;
+    }
+    std::cout << "DDL_RACE leg=mixed role=" << role << " code=" << mixed << "\n";
+    std::cout << "DDL-RACE: DONE role=" << role << "\n";
+    std::cout.flush();
+    return 0;
+}
+
+static int catalogDumpMode(Client& c, std::chrono::milliseconds wait) {
+    const std::string names = getEnvStr("RUNE_CATALOG_NAMES");
+    if (names.empty()) { std::cerr << "PROBE: FAIL catalog_dump needs RUNE_CATALOG_NAMES\n"; return 73; }
+    std::size_t start = 0;
+    while (start <= names.size()) {
+        const std::size_t comma = names.find(',', start);
+        const std::string name = names.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        const TopicSchemaResult r = c.getTopicSchemaAndWait(name, wait);
+        std::cout << "CATALOG name=" << name << " code=" << r.errorCode << " topicId=" << r.topicId
+                  << " version=" << r.version << " parts=" << r.partitionCount
+                  << " fp=" << fnv1a64(r.descriptorBlob) << "\n";
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    std::cout << "CATALOG-DUMP: OK\n";
+    std::cout.flush();
+    return 0;
+}
+
 int main() {
     const std::string mode        = getEnvStr("RUNE_MODE", "setup");
     const std::string target      = getEnvStr("RUNE_TARGET");
@@ -533,6 +614,22 @@ int main() {
             std::cerr << "PROBE: createView(char_transient) OK viewTopicId=" << viewT.viewTopicId
                       << " fp=" << viewT.outputFingerprint << "\n";
 
+            // ---- 2b. DDL conformance: ALTER on a view's output -> ViewNotAlterable (38)
+            {
+                rune::codec::AlterOp add{};
+                add.type = rune::codec::AlterOpType::Add; add.name = "extra";
+                add.primType = rune::codec::PrimType::Int64; add.fixedLen = 0;
+                const auto ops = rune::codec::encodeAlterOps({add});
+                const AlterTopicResult ar = c.alterTopicAndWait("char_persisted", 0,
+                                                                std::span<const uint8_t>(ops), wait);
+                if (ar.errorCode != 38) {
+                    std::cerr << "PROBE: FAIL alterTopic(char_persisted) errorCode=" << ar.errorCode
+                              << " (want 38 ViewNotAlterable)\n";
+                    return 60;
+                }
+                std::cout << "ALTER-VIEW: OK code=38\n";
+            }
+
             // ---- 3. produce one "character" record -------------------------
             const int64_t keyId = 4242;
             const int64_t hp0   = 100;
@@ -602,6 +699,17 @@ int main() {
             std::cout.flush();
             c.close();
             return 0;
+        }
+
+        if (mode == "ddl_race") {
+            const int rc = ddlRaceMode(c, getEnvStr("RUNE_RACE_ROLE", "a"), wait, boundMs);
+            c.close();
+            return rc;
+        }
+        if (mode == "catalog_dump") {
+            const int rc = catalogDumpMode(c, wait);
+            c.close();
+            return rc;
         }
 
         if (mode == "verify_restart") {
@@ -691,7 +799,7 @@ int main() {
             return 0;
         }
 
-        std::cerr << "PROBE: FAIL unknown RUNE_MODE='" << mode << "' (want setup|verify_restart)\n";
+        std::cerr << "PROBE: FAIL unknown RUNE_MODE='" << mode << "' (want setup|verify_restart|ddl_race|catalog_dump)\n";
         c.close();
         return 20;
     } catch (const std::exception& ex) {
