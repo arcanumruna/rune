@@ -13,8 +13,9 @@ Four parts, four independent implementation plans:
 | **C** | Typed topics route by key (fix: always partition 0) | client, protocol, broker |
 | **D** | `rune console` (Rune QL); `rune schema` read-only | ql, client |
 | **E** | Transient topics: rename memory topics, definable from Rune QL and the client | broker, protocol, client, ql |
+| **F** | One producer: transactions on `Producer` (every produce path), broker-assigned producer ids, consumer-group rewind after abort | client (+ broker only if a gap is found) |
 
-Order: **C → E → D → B → A**, with A runnable in parallel with B/D (disjoint repos/files). C first because it is a correctness bug and B's typed claim builds on it.
+Order: **C → E → E2 → D → B → F → A** (F added 2026-10-12, after B because transactional claims reuse B's claim paths), with A runnable in parallel with B/D (disjoint repos/files). C first because it is a correctness bug and B's typed claim builds on it.
 
 ---
 
@@ -133,6 +134,41 @@ For schemas whose fields are **all fixed-size** (approved scope), the generator 
 - **Broker:** `AdminWorker` creates the runtime topic on `InMemoryLog` when transient. `TopicSchema` records the mode (appended trailer field, same pattern as Phase 1's `topicName`) so restart recovery (`recoverRuntimeTopicSpecs`) recreates the topic as transient: metadata survives, data does not (a restarted node rejoins empty and catches up from peers that still hold it; after a full-cluster restart a transient topic is empty — documented).
 - **Views over transient topics:** allowed. A persisted view over a transient topic keeps its checkpoint; a transient view over a transient topic is empty after a full restart. Documented, no special casing.
 - **Gates:** Rune QL parse/backend tests; DefineTopic round-trip with and without the byte (old-client compatibility, `*Regression*`); broker test that a transient runtime topic is created on `InMemoryLog`, survives node restart as a transient (empty) topic, and is replicated before ack under `acks=All`; e2e: console defines a transient topic, produce + subscribe work, restart → topic exists and is empty.
+
+---
+
+## F. One producer: transactions everywhere; rewind after abort (added 2026-10-12)
+
+User decision: a transaction must not need a separate producer type, and every produce path must work inside a transaction. Today `TransactionalProducer` is a second implementation (`TransactionalProducerImpl`, plain `send()` only), so batching, `batch()`, `tryClaim`, `claimBatch` and typed `claim` are unavailable in a transaction. The plain producer also draws its producer id client-side (random, no fencing across restarts — `ProducerImpl.cpp` TODO milestone-c), and a consumer group cannot re-read the inputs of an aborted transaction without a process restart (no rewind API).
+
+### F1. Transactions on `Producer`
+```cpp
+auto p = client.producer({.acks = Acks::All, .transactionalId = "trade-worker-1"});
+client.connectAndWait();
+p.initTransactionsAndWait();
+p.beginTransaction();
+p.send(...); p.batch(...).send(); p.tryClaim(...)->commit(); p.claimBatch(...)->commit(); typed.claim(k).commit();
+p.sendOffsetsToTransactionAndWait(offsets, "economy");
+p.commitTransactionAndWait();          // or p.abortTransactionAndWait()
+```
+- `ProducerConfig::transactionalId` (empty = non-transactional, today's behaviour). Producer gains the full lifecycle now on `TransactionalProducer`, same names and semantics: `initTransactions`, `beginTransaction`, `sendOffsetsToTransaction`, `commitTransaction`, `abortTransaction`, `flush`, their `*AndWait` forms, `state()` (`TxnState`), `producerId()`, `producerEpoch()`, `transactionActive()`.
+- Every produce path participates while `InTransaction`: records carry the transactional bit; the first record to a partition in a transaction emits `AddPartitionsToTxn` and that partition's records are held until it is OK (today's F14 gating, now in `ProducerImpl`); the added-partition set is a preallocated per-partition flag (zero steady-state allocation).
+- Misuse is explicit: lifecycle calls on a producer without `transactionalId` → token forms `OpResult::InvalidArgument`, `*AndWait` `std::logic_error`; a produce on a transactional producer outside `InTransaction` is refused (`trySend`/`tryClaim`/`claimBatch` return the refusal, `send` throws `std::logic_error`) — never silently dropped.
+- `acks` on a transactional producer: `None` is rejected at creation (a transaction needs acks); `Leader`/`All` as configured.
+- `TransactionalProducer` and `Client::transactionalProducer()` are **removed** (pre-1.0; no alias). Their tests migrate to `Producer`. The transaction state machine moves into `ProducerImpl` as explicit states (CLAUDE.md rule 3); `TransactionalProducerImpl` is deleted, not wrapped.
+
+### F2. Broker-assigned producer ids for every acked producer
+A non-transactional producer with `acks = Leader|All` obtains its id from the broker (`InitProducerId` with no transactional id, as Kafka's idempotent producer) on connect, replacing the client-drawn random id; retries stay deduplicated across reconnects. `acks = None` keeps `-1/-1/-1` (non-idempotent).
+
+### F3. Consumer-group rewind
+- `GroupConsumer::seekToCommitted()` (+ `seekToCommittedAndWait`, token form): for every assigned partition, re-fetch the committed offset (the existing OffsetFetch-on-assign path) and restart its push subscription there; records after it are delivered again.
+- `GroupConsumer::seek(TopicPartition, int64_t offset)`: restart one assigned partition's subscription at `offset` (not assigned → `InvalidArgument`).
+- Exactly-once loop on failure: `abortTransaction` → `seekToCommitted` → `beginTransaction` (no restart).
+
+### Gates
+- Tests (client, real broker integration where the path crosses the wire): each produce path (send, batch, tryClaim, claimBatch, typed claim) inside a committed transaction is visible to a ReadCommitted reader and invisible after abort; mixed paths in one transaction; produce outside a transaction refused; lifecycle on a non-transactional producer refused; fencing by a second producer with the same `transactionalId`; in-doubt commit retry; plain acked producer gets a broker id and dedups a retried batch across a reconnect; `seekToCommitted` redelivers exactly the uncommitted records after an aborted consume→produce transaction (exactly-once e2e: output count == input count after an injected abort).
+- Benchmarks: transactional `send` / `tryClaim` throughput and per-record p50/p99 vs non-transactional; 0 allocations steady state on every path.
+- Docs: site Transaction / Delivery guarantees sections use `Producer` with `transactionalId` and `seekToCommitted`.
 
 ---
 
