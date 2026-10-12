@@ -6908,8 +6908,9 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
     //   partition = gpid % kMaxGpidPartitions
     //
     // If topicRegistry_ is set, we only include partitions whose topicId is in
-    // range [0, topicRegistry_->topicCount()).  This prevents ghost partitions
-    // from a stale routing image that refers to topics no longer registered.
+    // range [0, topicRegistry_->topicCount()) and whose partition is below that
+    // topic's registered partitionCount.  This prevents ghost partitions from a
+    // stale routing image that refers to topics/partitions no longer registered.
     //
     // If the request carries specific topicIds (topicIds non-empty), filter
     // to only those topics.
@@ -6946,9 +6947,15 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
             const int32_t topicId   = gpid / kMaxGpidPartitions;
             const int32_t partition = gpid % kMaxGpidPartitions;
 
-            // Filter: known topics only (when topicRegistry_ is wired).
-            if (topicRegistry_ && topicId >= topicRegistry_->topicCount()) {
-                continue;
+            // Filter: known topics only (when topicRegistry_ is wired) — and only
+            // the partitions the registry has: the replicated image can still
+            // assign a partition the registry no longer holds (DDL conformance
+            // D1: a ZERO-partition __orphan.<id> placeholder recovered at boot
+            // keeps its pre-restart assignment in __cluster_metadata).
+            if (topicRegistry_) {
+                if (topicId >= topicRegistry_->topicCount()) continue;
+                const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
+                if (spec == nullptr || partition >= spec->partitionCount) continue;
             }
 
             // Filter: requested topics only (when non-empty topic list in request).
