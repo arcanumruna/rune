@@ -1065,3 +1065,38 @@ TEST(GroupErrorMappingRegression, UnknownCoordinatorResultIsInternalNotOkRegress
         EXPECT_EQ(syncErrorToProto(unknown), kInt) << unknown;
     }
 }
+
+// No-hang fix round 4 (item 8, ruling): the gateway answers a pre-v5 client
+// UnknownMember instead of an Internal / InvalidRequest it would ignore — and
+// evicts the members on that session so the answer is TRUE: a later Heartbeat
+// of that member is UnknownMember (the v4 client re-joins on it).  Members on
+// other sessions are untouched.
+TEST_F(CG3ServiceTest, EvictSessionMembersMakesUnknownMemberTrueRegression) {
+    const std::string groupId = "g-evict";
+    auto joinAs = [&](int64_t sid, int64_t corr) {
+        const auto n = encodeJoinGroup(req_, sid, corr, groupId, "", 5000);
+        const auto o = service_->handleJoinGroup(req_, n, clock_, out_, kBufSize);
+        const auto r = pc::JoinGroupResponse::decode(out_, o);
+        EXPECT_TRUE(r.has_value());
+        return std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size());
+    };
+    const std::string oldMember = joinAs(/*sid=*/7, 900);
+    const std::string newMember = joinAs(/*sid=*/8, 901);
+    ASSERT_EQ(service_->coordinator(groupId).memberCount(), 2u);
+
+    service_->evictSessionMembers(/*sessionId=*/7, clock_);
+    EXPECT_EQ(service_->coordinator(groupId).memberCount(), 1u) << "the old client's member was not evicted";
+
+    const int32_t gen = service_->coordinator(groupId).generationId();
+    auto hb = encodeHeartbeat(req_, 7, 902, groupId, oldMember, gen);
+    auto o = service_->handleHeartbeat(req_, hb, clock_, out_, kBufSize);
+    ASSERT_GT(o, 0u);
+    EXPECT_EQ(decodeHBErrorCode(out_, o), static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+    hb = encodeHeartbeat(req_, 8, 903, groupId, newMember, gen);
+    o = service_->handleHeartbeat(req_, hb, clock_, out_, kBufSize);
+    ASSERT_GT(o, 0u);
+    EXPECT_NE(decodeHBErrorCode(out_, o), static_cast<int16_t>(pc::ErrorCode::UnknownMember))
+        << "a member on another session was evicted";
+    service_->evictSessionMembers(/*sessionId=*/7, clock_);   // idempotent: nothing left to evict
+    EXPECT_EQ(service_->coordinator(groupId).memberCount(), 1u);
+}

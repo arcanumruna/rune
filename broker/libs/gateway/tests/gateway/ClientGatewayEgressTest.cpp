@@ -32,6 +32,9 @@
 #include <rune/protocol/RecordBatch.h>
 
 #include <rune/gateway/SpillFifo.h>
+#include <rune/gateway/SpillPool.h>
+#include <rune/protocol/client/OffsetMessages.h>
+#include <array>
 #include <rune/consensus/PeerResolution.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/gateway/RequestRejection.h>
@@ -956,23 +959,26 @@ TEST(ClientGatewayEgressRegression, GlobalSpillFullExpiresTheLargestHolderRegres
     const int64_t pusher = gw.injectReliableTestSessionForTest(0);
     cap.blockedSids = holders;
     cap.blockedSids.push_back(pusher);
+    // 8 holders under quota each (holder 3 the largest), together just under the pool.
+    const std::size_t unit = SpillPool::bytesFor(bigAnswer(0, 0, 8 * 1024).size());
     int64_t corr = 0;
-    for (std::size_t i = 0; i < holders.size(); ++i) {   // 8 x ~490 KiB: under quota each, ~3.9 MiB total
-        const std::size_t blob = (i == 3) ? 62 * 1024 : 60 * 1024;   // holder 3 is the largest
-        for (int k = 0; k < 8; ++k) {
-            const auto f = bigAnswer(holders[i], ++corr, blob);
+    for (std::size_t i = 0; i < holders.size(); ++i) {
+        const std::size_t target = ClientGateway::spillSizing().sessionQuota - ((i == 3) ? 1 : 5) * unit;
+        while (gw.spilledBytesForTest(holders[i]) + unit <= target) {
+            const auto f = bigAnswer(holders[i], ++corr, 8 * 1024);
             ASSERT_TRUE(gw.sendControlFrame(holders[i], f.data(), f.size()));
         }
     }
     ASSERT_EQ(gw.noHangStats().spillExpiries, 0u);
-    for (int k = 0; k < 10; ++k) {                       // 10 x 40 KiB (under quota) overflow the spill
+    for (int k = 0; k < 10; ++k) {                       // 10 x 40 KiB (under quota) overflow the pool
         const auto f = bigAnswer(pusher, 9000 + k, 40 * 1024);
         ASSERT_TRUE(gw.sendControlFrame(pusher, f.data(), f.size()));
     }
     EXPECT_GE(gw.noHangStats().spillExpiries, 1u);
+    EXPECT_EQ(gw.spillStateForTest(holders[3]), SpillState::Expiring) << "the largest holder was not the one expired";
     cap.blockedSids.clear();
     gw.drainPendingResponses(nowNs());
-    EXPECT_FALSE(gw.sessionExistsForTest(holders[3])) << "the largest holder was not the one expired";
+    EXPECT_FALSE(gw.sessionExistsForTest(holders[3]));
     EXPECT_TRUE(gw.sessionExistsForTest(pusher)) << "the pusher was expired instead of the largest holder";
     std::vector<int64_t> want;
     for (int64_t k = 0; k < 10; ++k) want.push_back(9000 + k);
@@ -1028,57 +1034,202 @@ TEST(ClientGatewayEgressRegression, ExpiringSessionIsClosedAtTheLeaseDeadlineReg
 }
 
 
-// Fix round 3: SpillFifo scan (skip / consume out of FIFO position), discard and
-// compact against a model — live records always come back in push order.
-TEST(ClientGatewayEgressRegression, SpillFifoScanDiscardCompactMatchModelRegression)
+// Fix round 4 (N8): SpillPool — per-owner chains against a model: random
+// appends (one-block and multi-block records), head consumes and whole-chain
+// frees; every record comes back intact in its owner's push order, and the
+// block accounting is exact (free + held == capacity) — nothing leaks.
+TEST(ClientGatewayEgressRegression, SpillPoolChainsMatchAPerOwnerModelRegression)
 {
-    SpillFifo f(8192, /*compactable=*/true);
-    std::vector<std::pair<int64_t, std::vector<uint8_t>>> model;   // live records, push order
+    SpillPool pool(64 * 1024);
+    constexpr int kOwners = 5;
+    std::array<SpillPool::Chain, kOwners> chains{};
+    std::array<std::deque<std::vector<uint8_t>>, kOwners> model;
+    std::vector<uint8_t> stage(8 * 1024);
     std::mt19937 rng(11);
-    int64_t seq = 0;
-    for (int step = 0; step < 20000; ++step) {
-        const unsigned op = rng() % 6;
-        if (op <= 2) {
-            std::vector<uint8_t> v(rng() % 300);
+    for (int step = 0; step < 40000; ++step) {
+        const int o = static_cast<int>(rng() % kOwners);
+        const unsigned op = rng() % 8;
+        if (op <= 3) {
+            const std::size_t len = (rng() % 4 == 0) ? rng() % 4000 : rng() % 120;   // multi- and one-block
+            std::vector<uint8_t> v(len);
             for (auto& b : v) b = static_cast<uint8_t>(rng());
-            const int64_t key = (++seq << 4) | static_cast<int64_t>(rng() % 4);   // 4 "sessions"
-            if (f.push(key, v.data(), v.size())) model.emplace_back(key, std::move(v));
-            else if (f.compact() && f.push(key, v.data(), v.size())) model.emplace_back(key, std::move(v));
-        } else if (op == 3) {                     // consume every other record of one session
-            const int64_t sess = static_cast<int64_t>(rng() % 4);
-            bool take = true;
-            std::vector<std::pair<int64_t, std::vector<uint8_t>>> keep;
-            std::size_t idx = 0;
-            f.scan([&](const SpillFifo::Record& r) {
-                EXPECT_EQ(r.key, model[idx].first);
-                EXPECT_EQ(std::vector<uint8_t>(r.data, r.data + r.len), model[idx].second);
-                const bool consume = (r.key & 0xF) == sess && take;
-                if ((r.key & 0xF) == sess) take = !take;
-                if (!consume) keep.push_back(model[idx]);
-                ++idx;
-                return consume;
-            });
-            model.swap(keep);
-        } else if (op == 4) {
-            const int64_t sess = static_cast<int64_t>(rng() % 4);
-            std::size_t n = 0;
-            std::vector<std::pair<int64_t, std::vector<uint8_t>>> keep;
-            for (auto& m : model) { if ((m.first & 0xF) == sess) ++n; else keep.push_back(std::move(m)); }
-            std::size_t gone = 0;
-            f.scan([&](const SpillFifo::Record& r) { if ((r.key & 0xF) == sess) { ++gone; return true; } return false; });
-            EXPECT_EQ(gone, n);
-            model.swap(keep);
+            const std::size_t freeBefore = pool.freeBlocks();
+            if (pool.append(chains[o], v.data(), v.size())) {
+                model[o].push_back(std::move(v));
+            } else {
+                ASSERT_LT(freeBefore, SpillPool::blocksFor(len)) << "a record that fits was refused";
+                ASSERT_EQ(pool.freeBlocks(), freeBefore) << "a refused append changed the pool";
+            }
+        } else if (op <= 6) {
+            if (model[o].empty()) { ASSERT_TRUE(chains[o].empty()); continue; }
+            const std::size_t len = pool.headLen(chains[o]);
+            const uint8_t* d = pool.headData(chains[o], stage.data());
+            ASSERT_EQ(std::vector<uint8_t>(d, d + len), model[o].front()) << "owner " << o << " out of order";
+            pool.popHead(chains[o]);
+            model[o].pop_front();
         } else {
-            ASSERT_TRUE(f.compact());
+            EXPECT_EQ(pool.freeAll(chains[o]), model[o].size());
+            model[o].clear();
         }
-        ASSERT_EQ(f.count(), model.size());
-        if (!model.empty()) {
-            const auto r = f.front();
-            ASSERT_EQ(r.key, model.front().first);
+        std::size_t held = 0, recs = 0;
+        for (int k = 0; k < kOwners; ++k) {
+            held += chains[k].blocks;
+            recs += model[k].size();
+            ASSERT_EQ(chains[k].records, model[k].size());
         }
+        ASSERT_EQ(pool.freeBlocks() + held, pool.capacityBlocks()) << "blocks leaked";
+        ASSERT_EQ(pool.records(), recs);
     }
 }
 
+// Fix round 4 (N10): the per-session quota counts POOL bytes (blocks, headers
+// included) — not the answer's payload length.
+TEST(ClientGatewayEgressRegression, SpillQuotaCountsPoolBytesRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    const int64_t a = gw.injectReliableTestSessionForTest(0);
+    cap.blockedSids = {a};
+    const auto f = defineAnswer(a, 1);
+    ASSERT_TRUE(gw.sendControlFrame(a, f.data(), f.size()));
+    EXPECT_EQ(gw.spilledBytesForTest(a), SpillPool::bytesFor(f.size()));
+    EXPECT_EQ(gw.egressSpillUsedBytesForTest(), SpillPool::bytesFor(f.size()));
+    EXPECT_EQ(gw.spillStateForTest(a), SpillState::Spilled);
+    constexpr auto z = ClientGateway::spillSizing();
+    static_assert(z.sessionQuota * 8 == z.pool, "8 sessions at quota == the pool");
+    static_assert(z.pool + z.stage == z.total && z.total == (4u << 20), "the spill is 4 MiB in total (no twin buffer)");
+}
+
+// Fix round 4 (N8): a drain costs one offer per SPILLING SESSION, not one visit
+// per spilled record: a stalled session holding thousands of answers is offered
+// its head answer once per duty cycle, and a session with nothing spilled is
+// never visited.
+TEST(ClientGatewayEgressRegression, DrainOffersOncePerStalledSessionNotPerRecordRegression)
+{
+    CaptureAll cap;
+    int offers = 0;
+    auto inner = cap.fn();
+    ClientGateway gw = ClientGateway::makeForTest(
+        [&](const uint8_t* b, std::size_t n) -> int64_t { ++offers; return inner(b, n); }, /*sessionId=*/1);
+    const int64_t a = gw.injectReliableTestSessionForTest(0);
+    for (int i = 0; i < 16; ++i) (void)gw.injectReliableTestSessionForTest(0);   // idle sessions
+    cap.blockedSids = {a};
+    for (int64_t c = 1; c <= 5000; ++c) {
+        const auto f = defineAnswer(a, c);
+        ASSERT_TRUE(gw.sendControlFrame(a, f.data(), f.size()));
+    }
+    ASSERT_EQ(gw.pendingResponseCount(), 5000u);
+    ASSERT_EQ(gw.spillReadySessionsForTest(), 1u);
+    offers = 0;
+    for (int pass = 0; pass < 10; ++pass) gw.drainPendingResponses(nowNs());
+    EXPECT_EQ(offers, 10) << "a stalled session must cost one refused offer per cycle";
+    cap.blockedSids.clear();
+    gw.drainPendingResponses(nowNs());
+    EXPECT_EQ(corrsOf(cap, a).size(), 5000u);
+    EXPECT_EQ(gw.pendingResponseCount(), 0u);
+    EXPECT_EQ(gw.spillReadySessionsForTest(), 0u);
+    EXPECT_EQ(gw.spillStateForTest(a), SpillState::Normal);
+    EXPECT_EQ(gw.egressSpillUsedBytesForTest(), 0u);
+}
+
+// Fix round 4 (N16): a session closed while it holds spilled answers releases
+// them at once (O(1)) and leaves the ready list — the space is never held by a
+// dead session, so the next pusher is not the one expired.
+TEST(ClientGatewayEgressRegression, ClosedSessionReleasesItsSpillAtOnceRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    const int64_t a = gw.injectReliableTestSessionForTest(0);
+    cap.blockedSids = {a};
+    for (int64_t c = 1; c <= 6; ++c) {
+        const auto f = bigAnswer(a, c, 60 * 1024);
+        ASSERT_TRUE(gw.sendControlFrame(a, f.data(), f.size()));
+    }
+    ASSERT_GT(gw.egressSpillUsedBytesForTest(), 0u);
+    gw.closeSessionForTest(a);
+    EXPECT_EQ(gw.egressSpillUsedBytesForTest(), 0u) << "a closed session's spilled answers kept their space";
+    EXPECT_EQ(gw.pendingResponseCount(), 0u);
+    EXPECT_EQ(gw.spillReadySessionsForTest(), 0u);
+    gw.drainPendingResponses(nowNs());   // the ready list holds no dangling session
+    EXPECT_EQ(gw.noHangStats().spillExpiries, 0u);
+}
+
+// Fix round 4 (N15): an Expiring session reaped (or disconnected) before its
+// SessionExpired could be delivered is counted notify-LOST — never vanishes
+// from the counters.
+TEST(ClientGatewayEgressRegression, ReapedExpiringSessionIsCountedNotifyLostRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.setNowForTest(1'000);
+    const int64_t a = gw.injectReliableTestSessionForTest(0);
+    cap.blockedSids = {a};
+    gw.expireSessionForSpillForTest(a);
+    ASSERT_EQ(gw.noHangStats().spillExpiring, 1u);
+    gw.closeSessionForTest(a);   // the reaper / a Disconnect got there first
+    EXPECT_EQ(gw.noHangStats().spillExpiring, 0u);
+    gw.drainPendingResponses(2'000);
+    EXPECT_EQ(gw.noHangStats().spillExpiryNotifyLost, 1u);
+    EXPECT_EQ(gw.noHangStats().spillExpiryNotified, 0u);
+}
+
+// Fix round 4 (N9): once the broker decided a session is dead (Expiring), its
+// requests are never executed — a Produce is not appended (consumed, counted,
+// unanswered: the client is owed SessionExpired → SessionLost) — and it receives
+// no Records; its subscriptions end when the Expiring state is serviced.
+TEST(ClientGatewayEgressRegression, ExpiringSessionIngressIsNotExecutedAndGetsNoRecordsRegression)
+{
+    CaptureAll cap;
+    const fs::path dir = makeTempDir();
+    std::vector<TopicSpec> specs;
+    { TopicSpec ts; ts.name = "events"; ts.partitionCount = 1; ts.topicId = 0; specs.push_back(ts); }
+    TopicRegistry registry(specs, dir.string());
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.setTopicRegistry(&registry);
+    std::vector<std::pair<int64_t, std::vector<uint8_t>>> pushed;
+    gw.setOnEgressFrame([&](int64_t sid, const uint8_t* b, std::size_t n) { pushed.emplace_back(sid, std::vector<uint8_t>(b, b + n)); });
+    const int64_t producer = gw.injectTestSession(0);
+    const int64_t victim   = gw.injectTestSession(0);
+    pc::Subscribe sub;
+    sub.sessionId = victim; sub.correlationId = 5; sub.topicId = 0; sub.partition = 0; sub.partitionKnown = 1;
+    std::vector<uint8_t> sf(sub.encodedSize());
+    sf.resize(sub.encode(sf.data()));
+    gw.applySubscribeForTest(sf.data(), sf.size());
+    ASSERT_EQ(gw.subscriptionCount(), 1u);
+    auto batch = makeBatch();
+    auto produceFrame = [&](int64_t sid, int64_t corr) {
+        pc::Produce prod;
+        prod.sessionId = sid; prod.correlationId = corr; prod.topicId = 0; prod.partition = 0;
+        prod.partitionKnown = 1; prod.acks = 0; prod.producerId = -1;
+        prod.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
+        std::vector<uint8_t> f(prod.encodedSize());
+        f.resize(prod.encode(f.data()));
+        return f;
+    };
+
+    gw.expireSessionForSpillForTest(victim);
+    ASSERT_EQ(gw.spillStateForTest(victim), SpillState::Expiring);
+    const auto pf = produceFrame(producer, 1);
+    (void)gw.applyClientFrameForTest(pf.data(), pf.size());
+    ASSERT_EQ(registry.log(0, 0)->logEndOffset(), 1) << "precondition: a healthy session's produce appends";
+    const std::size_t framesBefore = cap.frames.size();
+    const auto vf = produceFrame(victim, 2);
+    EXPECT_TRUE(gw.applyClientFrameForTest(vf.data(), vf.size())) << "the frame must be consumed (never ABORTed)";
+    EXPECT_EQ(registry.log(0, 0)->logEndOffset(), 1) << "an Expiring session's Produce was appended";
+    EXPECT_EQ(cap.frames.size(), framesBefore) << "an Expiring session's request was executed / answered";
+    EXPECT_EQ(gw.noHangStats().expiringIngressDrops, 1u);
+
+    pushed.clear();
+    gw.pushSubscriptionsForTest();
+    for (const auto& [sid, f] : pushed)
+        EXPECT_FALSE(pc::Records::decode(f.data(), f.size()).has_value()) << "Records pushed to an Expiring session";
+
+    gw.drainPendingResponses(nowNs());   // services Expiring: subscriptions end, SessionExpired delivered (hook)
+    EXPECT_EQ(gw.subscriptionCount(), 0u) << "an Expiring session's subscription kept its cursor";
+    EXPECT_FALSE(gw.sessionExistsForTest(victim));
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
 
 // ===========================================================================
 // Fix round 3: pre-session paths (host-resolve ring full, HandshakeFailed
@@ -1109,8 +1260,11 @@ TEST(ClientGatewayEgressRegression, FullHostResolveRingKeepsTheConnectPendingAnd
     const auto f = connectFrame(77, "aeron:udp?endpoint=client-host.example:40123");
     (void)gw.applyClientFrameForTest(f.data(), f.size());
     ASSERT_EQ(gw.pendingConnectCount(), 1u) << "a full resolve ring dropped the Connect";
+    const void* const ownedHost = gw.pendingResolveHostForTest(0);
+    ASSERT_NE(ownedHost, nullptr);
     gw.pollPendingConnectsForTest(1);                     // still full: stays pending
     ASSERT_EQ(gw.pendingConnectCount(), 1u);
+    EXPECT_EQ(gw.pendingResolveHostForTest(0), ownedHost) << "fix round 4 (N12): a refused retry allocated a new host";
     int drained = 0, ours = 0;
     req.poll([&](std::int32_t, std::int64_t id, std::int64_t host) {
         ++drained;
@@ -1119,12 +1273,16 @@ TEST(ClientGatewayEgressRegression, FullHostResolveRingKeepsTheConnectPendingAnd
     EXPECT_EQ(ours, 0);
     gw.pollPendingConnectsForTest(2);                     // the retry is accepted now
     std::string offeredHost;
+    const void* offeredPtr = nullptr;
     req.poll([&](std::int32_t type, std::int64_t, std::int64_t host) {
         if (type != rune::consensus::kHostResolveRequest) return;
         auto* h = reinterpret_cast<std::string*>(static_cast<std::intptr_t>(host));
         offeredHost = *h;
+        offeredPtr  = h;
         delete h;
     });
+    EXPECT_EQ(offeredPtr, ownedHost) << "the accepted offer is the one allocation";
+    EXPECT_EQ(gw.pendingResolveHostForTest(0), nullptr) << "the ring owns the host once accepted";
     EXPECT_EQ(offeredHost, "client-host.example") << "the refused resolve offer was never retried";
     EXPECT_EQ(gw.pendingConnectCount(), 1u) << "the connect must stay pending for its resolution";
 }
@@ -1186,6 +1344,132 @@ TEST(ClientGatewayEgressRegression, NoHangStatsAreLoggedPeriodicallyOnChangeRegr
     EXPECT_TRUE(gw.logNoHangStatsForTest(2)) << "a rejected request was not reported";
     EXPECT_EQ(gw.nextNoHangStatsLogNsForTest(), 2 + ClientGateway::kNoHangStatsLogNs);
     EXPECT_FALSE(gw.logNoHangStatsForTest(3)) << "unchanged counters logged again";
+}
+
+// Fix round 4 (N11): the periodic line's change detector compares the
+// counters one by one — the round-3 XOR signature missed rejected 0→2 together
+// with unanswerable 0→1 (2 ^ (1 << 1) == 0).
+TEST(ClientGatewayEgressRegression, NoHangChangeDetectorNeverMissesCancellingChangesRegression)
+{
+    using NH = ClientGateway::NoHangStats;
+    NH before{};
+    NH after{};
+    after.rejectedRequests   = 2;
+    after.unanswerableFrames = 1;
+    EXPECT_TRUE(ClientGateway::noHangCountersDiffer(before, after));
+    NH gaugeOnly{};
+    gaugeOnly.spilledAnswers = 7; gaugeOnly.spillUsedBytes = 448; gaugeOnly.spillExpiring = 1;
+    EXPECT_FALSE(ClientGateway::noHangCountersDiffer(before, gaugeOnly)) << "a gauge is not a counter change";
+    // Every counter alone is a change.
+    for (int f = 0; f < 7; ++f) {
+        NH x{};
+        uint64_t* fields[] = {&x.rejectedRequests, &x.unanswerableFrames, &x.spillExpiries, &x.spillExpiryDrops,
+                              &x.spillExpiryNotified, &x.spillExpiryNotifyLost, &x.expiringIngressDrops};
+        *fields[f] = 1;
+        EXPECT_TRUE(ClientGateway::noHangCountersDiffer(before, x)) << "field " << f;
+    }
+}
+
+// Fix round 4 (item 8, ruling): a pre-v5 client stays Stable on a Heartbeat
+// answer outside the rebalance set — a Heartbeat / SyncGroup the coordinator
+// answers Internal, and a Heartbeat / OffsetFetch the gateway rejects Internal /
+// InvalidRequest, are answered UnknownMember to it and its members are evicted
+// (the v4 client re-joins on UnknownMember).  A v5 client keeps the real code.
+TEST(ClientGatewayEgressRegression, OldClientGroupErrorIsAnsweredUnknownMemberAndEvictsRegression)
+{
+    struct InternalGroup final : IGroupRequestHandler {
+        std::vector<int64_t> evicted;
+        size_t handleJoinGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+        size_t handleSyncGroup(const uint8_t* b, size_t, int64_t, uint8_t* o, size_t) override {
+            const auto h = pc::MessageHeader::decode(b, pc::MessageHeader::ENCODED_SIZE);
+            pc::SyncGroupResponse r;
+            r.sessionId = h->sessionId; r.correlationId = h->correlationId;
+            r.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
+            return r.encode(o, {});
+        }
+        size_t handleHeartbeat(const uint8_t* b, size_t, int64_t, uint8_t* o, size_t) override {
+            const auto h = pc::MessageHeader::decode(b, pc::MessageHeader::ENCODED_SIZE);
+            pc::HeartbeatResponse r;
+            r.sessionId = h->sessionId; r.correlationId = h->correlationId;
+            r.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);   // an unknown coordinator result
+            return r.encode(o);
+        }
+        size_t handleLeaveGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+        size_t handleOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+        size_t handleOffsetFetch(const uint8_t* b, size_t n, int64_t, uint8_t* o, size_t c) override {
+            return encodeRejectionFor(b, n, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), o, c);
+        }
+        void evictSessionMembers(int64_t sid, int64_t) override { evicted.push_back(sid); }
+    } svc;
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.setGroupService(&svc);
+    const int64_t v4 = gw.injectReliableTestSessionForTest(0, /*clientVersion=*/4);
+    const int64_t v5 = gw.injectReliableTestSessionForTest(0, pc::kClientVersion);
+    auto heartbeat = [](int64_t sid, int64_t corr) {
+        pc::Heartbeat hb;
+        const std::string g = "g", m = "g-1";
+        hb.sessionId = sid; hb.correlationId = corr; hb.generationId = 1;
+        hb.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(g.data()), g.size());
+        hb.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(m.data()), m.size());
+        std::vector<uint8_t> f(256);
+        f.resize(hb.encode(f.data()));
+        return f;
+    };
+    // (1) Heartbeat answered Internal by the coordinator.
+    auto f = heartbeat(v4, 71);
+    gw.applyGroupForTest(f.data(), f.size(), pc::Heartbeat::TEMPLATE_ID);
+    auto h = cap.last<pc::HeartbeatResponse>();
+    ASSERT_TRUE(h.has_value());
+    EXPECT_EQ(h->correlationId, 71);
+    EXPECT_EQ(h->errorCode, static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+    ASSERT_EQ(svc.evicted, (std::vector<int64_t>{v4})) << "UnknownMember answered without evicting the member";
+    f = heartbeat(v5, 72);
+    gw.applyGroupForTest(f.data(), f.size(), pc::Heartbeat::TEMPLATE_ID);
+    h = cap.last<pc::HeartbeatResponse>();
+    ASSERT_TRUE(h.has_value());
+    EXPECT_EQ(h->errorCode, static_cast<int16_t>(pc::ErrorCode::Internal)) << "a v5 client must see the real code";
+    EXPECT_EQ(svc.evicted.size(), 1u);
+    // (2) SyncGroup answered Internal by the coordinator.
+    auto sf = headerOnlyFrame(pc::TemplateId::SyncGroup, v4, 73, 0);
+    {
+        pc::SyncGroup sg;
+        const std::string g = "g", m = "g-1";
+        sg.sessionId = v4; sg.correlationId = 73; sg.generationId = 1;
+        sg.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(g.data()), g.size());
+        sg.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(m.data()), m.size());
+        sf.assign(256, 0);
+        sf.resize(sg.encode(sf.data()));
+    }
+    gw.applyGroupForTest(sf.data(), sf.size(), pc::SyncGroup::TEMPLATE_ID);
+    const auto s = cap.last<pc::SyncGroupResponse>();
+    ASSERT_TRUE(s.has_value());
+    EXPECT_EQ(s->correlationId, 73);
+    EXPECT_EQ(s->errorCode, static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+    EXPECT_EQ(svc.evicted.size(), 2u);
+    // (3) Undecodable Heartbeat / OffsetFetch (the gateway's InvalidRequest).
+    auto bad = headerOnlyFrame(pc::TemplateId::Heartbeat, v4, 74, 32);
+    gw.applyGroupForTest(bad.data(), bad.size(), pc::Heartbeat::TEMPLATE_ID);
+    h = cap.last<pc::HeartbeatResponse>();
+    ASSERT_TRUE(h.has_value());
+    EXPECT_EQ(h->correlationId, 74);
+    EXPECT_EQ(h->errorCode, static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+    bad = headerOnlyFrame(pc::TemplateId::OffsetFetch, v4, 75, 32);
+    gw.applyGroupForTest(bad.data(), bad.size(), pc::OffsetFetch::TEMPLATE_ID);
+    const auto of = cap.last<pc::OffsetFetchResponse>();
+    ASSERT_TRUE(of.has_value());
+    EXPECT_EQ(of->correlationId, 75);
+    ASSERT_FALSE(of->results.empty());
+    EXPECT_EQ(of->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+    EXPECT_EQ(svc.evicted.size(), 4u);
+    bad = headerOnlyFrame(pc::TemplateId::OffsetFetch, v5, 76, 32);
+    gw.applyGroupForTest(bad.data(), bad.size(), pc::OffsetFetch::TEMPLATE_ID);
+    const auto of5 = cap.last<pc::OffsetFetchResponse>();
+    ASSERT_TRUE(of5.has_value());
+    ASSERT_FALSE(of5->results.empty());
+    EXPECT_EQ(of5->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(svc.evicted.size(), 4u);
+    EXPECT_EQ(gw.oldClientUnknownMemberAnswersForTest(), 4u);
 }
 
 } // namespace

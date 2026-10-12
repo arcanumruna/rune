@@ -1042,9 +1042,6 @@ TEST(WorkerProduceRegression, RefusedFrameIsAnsweredNotHeldWhileRollDeferredRegr
     EXPECT_EQ(worker.intakeRollHoldsForTest(), 0u);
 }
 
-} // namespace
-} // namespace rune::node
-
 // DUR-1 (B1, Kafka model): the worker's produce role gate is
 // PartitionReplica::acceptsProduce (shared with the gateway + DR harness) — a
 // follower is refused (retriable NotLeader); a leader, user or internal, is
@@ -1075,3 +1072,36 @@ TEST(WorkerProduceGateRegression, FollowerRefusedLeaderWritableAtOnce) {
     std::filesystem::remove_all(dir, ec);
 }
 
+
+// No-hang fix round 4 (item 6): each worker logs its OWN no-hang counters (incl.
+// undecodableProduceAnswers) from its own duty pass every kNoHangStatsLogNs when
+// one changed — the change detector compares the counters one by one.
+TEST(WorkerProduceRegression, WorkerLogsItsNoHangCountersPeriodicallyOnChangeRegression) {
+    TempDir dir("nohang_wstats_");
+    rune::storage::Log log(dir.path.string());
+    NullTransport transport;
+    auto replica = WorkerProduceFixture::makeLeaderReplica(0, 0, log, transport);
+    Worker worker(0);
+    worker.setOwnedDirect({replica.get()});
+    EXPECT_FALSE(worker.maybeLogNoHangStatsForTest(1)) << "nothing changed: no line";
+    EXPECT_EQ(worker.nextNoHangStatsLogNsForTest(), 1 + Worker::kNoHangStatsLogNs);
+    auto frame = encodeProduceFrameIdem(4244, makeBatchOfExactSize(128), -1);
+    frame[pc::MessageHeader::ENCODED_SIZE + 9] = 2;   // undecodable body → answered InvalidRequest
+    (void)worker.handleIngressFrameForTest(frame.data(), frame.size(), /*nowNs=*/2);
+    worker.drainReturn([](const WorkerReturn&) {});
+    ASSERT_EQ(worker.undecodableProduceAnswersForTest(), 1u);
+    EXPECT_FALSE(worker.maybeLogNoHangStatsForTest(3)) << "logged before its 10 s cadence";
+    EXPECT_TRUE(worker.maybeLogNoHangStatsForTest(1 + Worker::kNoHangStatsLogNs)) << "a changed counter was not logged";
+    EXPECT_FALSE(worker.maybeLogNoHangStatsForTest(1 + 2 * Worker::kNoHangStatsLogNs)) << "unchanged counters logged again";
+    // Field-by-field: changes that would cancel out in an XOR signature are still changes.
+    Worker::NoHangStats a{}, b{};
+    b.undecodableProduceAnswers = 1; b.acksAllRefusedNoReservation = 1;
+    EXPECT_NE(a, b);
+    a.undecodableProduceAnswers = 2;
+    b = Worker::NoHangStats{};
+    b.acksAllRefusedNoReservation = 2;
+    EXPECT_NE(a, b);
+}
+
+} // namespace
+} // namespace rune::node

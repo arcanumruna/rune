@@ -983,6 +983,38 @@ public:
     [[nodiscard]] uint64_t undecodableProduceAnswers() const noexcept { return undecodableProduceAnswers_; }
     [[nodiscard]] uint64_t undecodableProduceAnswersForTest() const noexcept { return undecodableProduceAnswers_; }
 
+    // No-hang fix round 4 (item 6): this worker's no-hang counters, logged by
+    // the worker ITSELF (its own thread — shared-nothing: no other thread ever
+    // reads them while it runs) every kNoHangStatsLogNs when any changed.
+    // The change detector compares the counters one by one (no signature).
+    struct NoHangStats {
+        uint64_t undecodableProduceAnswers   = 0;   // worker-ingress Produce answered InvalidRequest
+        uint64_t acksAllRefusedNoReservation = 0;   // gateway-routed acks=all refused (no reservation)
+        uint64_t sessionSignalsDeferred      = 0;   // session signals a full ring deferred
+        bool operator==(const NoHangStats&) const = default;
+    };
+    [[nodiscard]] NoHangStats noHangStats() const noexcept {
+        return NoHangStats{undecodableProduceAnswers_, acksAllRefusedNoReservation_, sessionSignalsDeferred_};
+    }
+    static constexpr int64_t kNoHangStatsLogNs = 10'000'000'000LL;   // 10 s
+    /// Logs the line when a counter changed since the last one; returns whether it logged.
+    bool logNoHangStatsIfChanged_(int64_t nowNs) {
+        nextNoHangStatsLogNs_ = nowNs + kNoHangStatsLogNs;
+        const NoHangStats nh = noHangStats();
+        if (nh == lastNoHangStats_) return false;
+        lastNoHangStats_ = nh;
+        spdlog::info("Worker {}: no-hang stats — worker-ingress Produce answered InvalidRequest={} "
+                     "acks=all refused (no reservation)={} session signals deferred={}", workerId_,
+                     nh.undecodableProduceAnswers, nh.acksAllRefusedNoReservation, nh.sessionSignalsDeferred);
+        return true;
+    }
+    bool logNoHangStatsForTest(int64_t nowNs) { return logNoHangStatsIfChanged_(nowNs); }
+    [[nodiscard]] int64_t nextNoHangStatsLogNsForTest() const noexcept { return nextNoHangStatsLogNs_; }
+    /// Test seam: one duty pass's periodic check exactly as doWork runs it.
+    bool maybeLogNoHangStatsForTest(int64_t nowNs) {
+        return nowNs >= nextNoHangStatsLogNs_ && logNoHangStatsIfChanged_(nowNs);
+    }
+
     /// Task 13 fix round 1 (C1a): ops that ride the session-lifecycle ring.
     [[nodiscard]] static constexpr bool isSessionLifecycleOp(WorkerOp::Type t) noexcept {
         return t == WorkerOp::Type::SessionAnnounce || t == WorkerOp::Type::SessionClose;
@@ -1499,6 +1531,9 @@ public:
         }
 
         passNowNs_ = nowNs;   // this pass's clock (acks=all deadlines on the op path)
+        // No-hang fix round 4 (item 6): this worker's counters, logged from its
+        // own thread on change — one compare per pass.
+        if (nowNs >= nextNoHangStatsLogNs_) [[unlikely]] (void)logNoHangStatsIfChanged_(nowNs);
         // Task 13 fix round 1 (C1a): session lifecycle first, in full, every
         // pass and every mode — never behind data ops or any backlog.
         work += drainSessionOps_();
@@ -6807,6 +6842,8 @@ private:
     // No-hang wave (R2): undecodable worker-ingress Produce frames answered
     // InvalidRequest (worker-thread owned; kept LAST so no hot member moves).
     uint64_t undecodableProduceAnswers_ = 0;
+    int64_t     nextNoHangStatsLogNs_ = 0;   // fix round 4 (item 6): periodic no-hang line
+    NoHangStats lastNoHangStats_{};
 };
 
 } // namespace rune::node

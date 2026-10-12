@@ -634,6 +634,42 @@ size_t GroupCoordinationService::handleLeaveGroup(
 }
 
 // ---------------------------------------------------------------------------
+// evictSessionMembers — no-hang fix round 4 (item 8, pre-v5 clients).
+//
+// A v4 client stays Stable on a Heartbeat answer outside the rebalance set
+// (Internal / InvalidRequest): the gateway answers it UnknownMember instead and
+// calls this, so the answer is true — the member is gone (as on LeaveGroup),
+// the v4 member re-joins, and any split-brain ends with that paced re-join.
+// Cold (an error answer to an old client only).
+// ---------------------------------------------------------------------------
+void GroupCoordinationService::evictSessionMembers(int64_t sessionId, int64_t nowNs)
+{
+    for (auto& [groupId, coord] : coordinators_) {
+        evictScratch_.clear();
+        for (const auto& member : coord.members()) {
+            memberKeyScratch_.clear();
+            memberKeyScratch_.append(groupId);
+            memberKeyScratch_ += ':';
+            memberKeyScratch_.append(member.memberId);
+            const auto it = memberSessionMap_.find(memberKeyScratch_);
+            if (it != memberSessionMap_.end() && it->second == sessionId) evictScratch_.push_back(member.memberId);
+        }
+        if (evictScratch_.empty()) continue;
+        if (gateway_) gateway_->revokeGroupSubscriptions(sessionId);
+        for (const auto& memberId : evictScratch_) {
+            spdlog::warn("GroupCoordinationService: old client (session {}) member '{}' of group '{}' evicted — "
+                         "answered UnknownMember instead of an error it would ignore", sessionId, memberId, groupId);
+            coord.leave(memberId, coord.generationId(), nowNs);
+            memberKeyScratch_.clear();
+            memberKeyScratch_.append(groupId);
+            memberKeyScratch_ += ':';
+            memberKeyScratch_.append(memberId);
+            memberSessionMap_.erase(memberKeyScratch_);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // handleOffsetCommit (templateId 40)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleOffsetCommit(

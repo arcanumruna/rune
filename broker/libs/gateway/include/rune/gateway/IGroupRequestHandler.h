@@ -53,6 +53,12 @@ struct IGroupRequestHandler {
     virtual size_t handleOffsetFetch (const uint8_t* buf, size_t len,
                                       int64_t nowNs,
                                       uint8_t* out, size_t outCap) = 0;
+
+    // No-hang fix round 4 (item 8, pre-v5 clients): evict every group member
+    // whose requests arrive on `sessionId`, so the UnknownMember the gateway
+    // answers an old client in place of Internal / InvalidRequest is TRUE (the
+    // old client re-joins on it).  Cold path.  Default: nothing to evict.
+    virtual void evictSessionMembers(int64_t sessionId, int64_t nowNs) { (void)sessionId; (void)nowNs; }
 };
 
 } // namespace rune::gateway

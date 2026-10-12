@@ -1017,3 +1017,175 @@ BENCHMARK_REGISTER_F(GatewayDataFixture, ProduceWithRouting)
     ->UseManualTime()
     ->MinTime(2.0)
     ->Unit(benchmark::kMicrosecond);
+
+// ===========================================================================
+// No-hang fix round 4 (N8): duty-cycle cost while STALLED sessions hold a
+// spill.  range(0) = stalled sessions: 0 = baseline, 1 = one session holding
+// kSpilledPerStalled spilled answers, 8 = eight of them (the spill ~90% full).
+// A stalled session is a real connected session whose client never reads its
+// egress: its publication window fills, then every answer spills.  Measured on
+// the healthy session of GatewayDataFixture:
+//   ProduceStalled — Produce → ProduceResponse round trip (as Produce), µs.
+//   IdleDutyPass   — one gateway doWork with no ingress, ns.
+// Target: indistinguishable from range(0) within noise (the round-3 drain
+// scanned every spilled record each duty cycle: ~17.6 µs / ~190 µs).
+// Uses only APIs present before the fix (pendingResponseCount, sendControlFrame,
+// noHangStats) so the same bench runs against the base commit.
+// ===========================================================================
+class GatewayStalledSpillFixture : public GatewayDataFixture {
+public:
+    static constexpr int kSpilledPerStalled = 7000;   // ProduceResponse-sized answers per stalled session
+
+    void SetUp(::benchmark::State& state) override
+    {
+        GatewayDataFixture::SetUp(state);
+        if (state.skipped()) return;
+        const int n = static_cast<int>(state.range(0));
+        for (int k = 0; k < n; ++k)
+            if (!stallOne(state, 960 + k)) return;
+    }
+    void TearDown(::benchmark::State& state) override
+    {
+        stalledSubs_.clear();
+        GatewayDataFixture::TearDown(state);
+    }
+
+private:
+    std::vector<std::shared_ptr<aeron::Subscription>> stalledSubs_;
+
+    bool stallOne(::benchmark::State& state, int32_t stream)
+    {
+        const int64_t regId = aeron_->addSubscription("aeron:ipc", stream);
+        std::shared_ptr<aeron::Subscription> sub;
+        for (int i = 0; i < kPumpCapSetup && !sub; ++i) {
+            sub = aeron_->findSubscription(regId);
+            if (!sub) std::this_thread::sleep_for(std::chrono::microseconds{100});
+        }
+        if (!sub) { state.SkipWithError("stalled egress subscription not resolved"); return false; }
+
+        pc::ConnectRequest req;
+        req.correlationId  = 100 + stream;
+        req.egressStreamId = stream;
+        req.clientVersion  = 1;
+        req.egressChannel  = "aeron:ipc";
+        const std::size_t reqLen = req.encode(scratch_.data());
+        if (!offerBounded(*ingressPub_, scratch_.data(), reqLen)) {
+            state.SkipWithError("stalled ConnectRequest offer timed out");
+            return false;
+        }
+        int64_t sid = 0;
+        aeron::FragmentAssembler connAsm([&](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
+                                             aeron::util::index_t len, aeron::Header&) {
+            if (auto d = pc::ConnectResponse::decode(reinterpret_cast<const uint8_t*>(buf.buffer() + off),
+                                                     static_cast<std::size_t>(len)))
+                sid = d->assignedSessionId;
+        });
+        for (int i = 0; i < kPumpCapSetup && sid == 0; ++i) {
+            gw_->doWork(nowNs());
+            sub->poll(connAsm.handler(), 16);
+            egressSub_->poll(egressAsm_->handler(), 16);
+            if (sid == 0) std::this_thread::sleep_for(std::chrono::microseconds{100});
+        }
+        if (sid <= 0) { state.SkipWithError("stalled ConnectResponse missing"); return false; }
+
+        // From here the stalled client never reads: its window fills, then spills.
+        pc::ProduceResponse r;
+        r.sessionId = sid;
+        r.partition = kPartition;
+        const std::size_t base = gw_->pendingResponseCount();
+        for (int64_t c = 1; gw_->pendingResponseCount() < base + kSpilledPerStalled; ++c) {
+            if (c > 10'000'000) { state.SkipWithError("the stalled session never spilled"); return false; }
+            r.correlationId = c;
+            r.baseOffset    = c;
+            const std::size_t n = r.encodeFor(scratch_.data(), pc::kClientVersion);
+            (void)gw_->sendControlFrame(sid, scratch_.data(), n);
+        }
+        if (gw_->noHangStats().spillExpiries != 0) {
+            state.SkipWithError("a stalled session was expired while filling (over quota)");
+            return false;
+        }
+        stalledSubs_.push_back(std::move(sub));
+        return true;
+    }
+};
+
+BENCHMARK_DEFINE_F(GatewayStalledSpillFixture, ProduceStalled)(benchmark::State& state)
+{
+    if (state.skipped()) return;
+    auto batchData = makeOneBatch(1, 0);
+    std::array<uint8_t, kScratchSize> produceBuf{};
+    pc::Produce prod;
+    prod.sessionId      = sessionId_;
+    prod.topicId        = kTopicId;
+    prod.partition      = kPartition;
+    prod.partitionKnown = 1;
+    prod.recordBatch    = std::span<const uint8_t>(batchData.data(), batchData.size());
+
+    std::vector<double> samples;
+    samples.reserve(std::min(static_cast<std::size_t>(state.max_iterations), std::size_t{2'000'000}));
+    const std::size_t spilled = gw_->pendingResponseCount();
+    int64_t corrId = 1;
+    auto roundTrip = [&](int64_t corr) -> int64_t {
+        prod.correlationId = corr;
+        const std::size_t encLen = prod.encode(produceBuf.data());
+        lastProdCorrId_.store(-1, std::memory_order_release);
+        aeron::concurrent::AtomicBuffer ab(produceBuf.data(), static_cast<aeron::util::index_t>(encLen));
+        bool sent = false;
+        for (int i = 0; i < kPumpCapMeasure && !sent; ++i) {
+            if (ingressPub_->offer(ab, 0, static_cast<aeron::util::index_t>(encLen)) > 0) sent = true;
+            else std::this_thread::yield();
+        }
+        if (!sent) return -1;
+        const int64_t t0 = nowNs();
+        for (int i = 0; i < kPumpCapMeasure; ++i) {
+            gw_->doWork(nowNs());
+            egressSub_->poll(egressAsm_->handler(), 16);
+            if (lastProdCorrId_.load(std::memory_order_acquire) == corr) return nowNs() - t0;
+            std::this_thread::yield();
+        }
+        return -1;
+    };
+    for (int w = 0; w < kWarmupIter; ++w) (void)roundTrip(-(w + 1));
+    for (auto _ : state) {
+        const int64_t elapsed = roundTrip(corrId++);
+        if (elapsed < 0) { state.SkipWithError("ProduceStalled round trip timed out"); return; }
+        state.SetIterationTime(static_cast<double>(elapsed) / 1e9);
+        samples.push_back(static_cast<double>(elapsed) / 1'000.0);
+    }
+    if (gw_->pendingResponseCount() != spilled) {
+        state.SkipWithError("the stalled sessions' spill changed during the run (expired / reaped?)");
+        return;
+    }
+    if (!samples.empty()) {
+        std::sort(samples.begin(), samples.end());
+        const auto at = [&](double p) { return samples[static_cast<std::size_t>(p * static_cast<double>(samples.size() - 1))]; };
+        state.counters["p50_us"]   = at(0.50);
+        state.counters["p99_us"]   = at(0.99);
+        state.counters["spilled"]  = static_cast<double>(spilled);
+    }
+}
+BENCHMARK_REGISTER_F(GatewayStalledSpillFixture, ProduceStalled)
+    ->Arg(0)->Arg(1)->Arg(8)
+    ->UseManualTime()
+    ->MinTime(2.0)
+    ->Unit(benchmark::kMicrosecond);
+
+BENCHMARK_DEFINE_F(GatewayStalledSpillFixture, IdleDutyPass)(benchmark::State& state)
+{
+    if (state.skipped()) return;
+    const std::size_t spilled = gw_->pendingResponseCount();
+    for (int w = 0; w < 1000; ++w) gw_->doWork(nowNs());
+    for (auto _ : state) {
+        const int64_t t0 = nowNs();
+        gw_->doWork(t0);
+        state.SetIterationTime(static_cast<double>(nowNs() - t0) / 1e9);
+    }
+    if (gw_->pendingResponseCount() != spilled)
+        state.SkipWithError("the stalled sessions' spill changed during the run (expired / reaped?)");
+    state.counters["spilled"] = static_cast<double>(spilled);
+}
+BENCHMARK_REGISTER_F(GatewayStalledSpillFixture, IdleDutyPass)
+    ->Arg(0)->Arg(1)->Arg(8)
+    ->UseManualTime()
+    ->MinTime(1.0)
+    ->Unit(benchmark::kNanosecond);

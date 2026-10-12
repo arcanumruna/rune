@@ -1,31 +1,22 @@
 #pragma once
 // ---------------------------------------------------------------------------
-// SpillFifo.h — no-hang fix rounds 2/3: a preallocated, bounded, single-thread
+// SpillFifo.h — no-hang fix round 2: a preallocated, bounded, single-thread
 // byte FIFO of variable-length records [key:i64][len:u32][flags:u32][bytes]
 // (8-aligned).
 //
-// Used where an answer that cannot be delivered NOW must be kept, in order,
-// instead of being dropped or sent best-effort:
-//   - ClientGateway's egress spill (back-pressured client answers of any size;
-//     per-session order, drained per session — scan() — so one stalled
-//     publication never blocks another session's answers);
-//   - AdminWorkerAgent's admin→control egress backlog (DDL answers on a full
-//     ring; strict FIFO — front() / pop()).
+// Used where an answer that cannot be delivered NOW must be kept, in strict
+// FIFO order, instead of being dropped or sent best-effort: AdminWorkerAgent's
+// admin→control egress backlog (DDL answers on a full ring — front() / pop()).
+// (The gateway's per-session egress spill is SpillPool — fix round 4.)
 //
 // One owner thread (shared-nothing; no atomics).  All storage is allocated
-// once in the constructor (a second, equal buffer when `compactable`, used by
-// compact()); push / front / pop / scan / discard / compact never allocate.
-// push returns false when the record does not fit — the caller then takes its
-// EXPLICIT full path (never a silent drop).
-//
-// A record is LIVE until a scan() visitor or pop() / discard() marks it done;
-// done records are reclaimed as soon as they form the head prefix, and
-// compact() reclaims done records anywhere (moving the live ones, in order).
+// once in the constructor; push / front / pop never allocate.  push returns
+// false when the record does not fit — the caller then takes its EXPLICIT
+// full path (never a silent drop).
 // ---------------------------------------------------------------------------
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <utility>
 #include <vector>
 
 namespace rune::gateway {
@@ -38,9 +29,8 @@ public:
         std::size_t    len  = 0;
     };
 
-    explicit SpillFifo(std::size_t capacityBytes, bool compactable = false)
-        : buf_(alignUp_(capacityBytes < 64 ? 64 : capacityBytes)),
-          spare_(compactable ? buf_.size() : 0) {}
+    explicit SpillFifo(std::size_t capacityBytes)
+        : buf_(alignUp_(capacityBytes < 64 ? 64 : capacityBytes)) {}
 
     SpillFifo(const SpillFifo&)            = delete;
     SpillFifo& operator=(const SpillFifo&) = delete;
@@ -106,49 +96,6 @@ public:
         reclaimPrefix_();
     }
 
-    /// Visit every LIVE record, oldest first.  `visit(const Record&)` returns
-    /// true = done (the record is consumed), false = keep it.  Done records are
-    /// reclaimed when they form the head prefix.
-    template <class Visit>
-    void scan(Visit&& visit) {
-        std::size_t p = head_;
-        const std::size_t n = records_;
-        for (std::size_t i = 0; i < n; ++i) {
-            p = wrapPos_(p);
-            const std::size_t rs = recordSize_(getLen_(buf_.data(), p));
-            if (!isDone_(p) && visit(recordAt_(p))) markDone_(p);
-            p += rs;
-        }
-        reclaimPrefix_();
-    }
-
-    /// Mark every live record of `key` done (returns how many).
-    std::size_t discard(int64_t key) noexcept {
-        std::size_t n = 0;
-        scan([&](const Record& r) { if (r.key == key) { ++n; return true; } return false; });
-        return n;
-    }
-
-    /// Reclaim every done record (moves the live ones to the front, in order).
-    /// False when this FIFO was not built compactable.  Never allocates.
-    bool compact() noexcept {
-        if (spare_.empty()) return false;
-        std::size_t out = 0, p = head_;
-        for (std::size_t i = 0; i < records_; ++i) {
-            p = wrapPos_(p);
-            const std::size_t rs = recordSize_(getLen_(buf_.data(), p));
-            if (!isDone_(p)) { std::memcpy(spare_.data() + out, buf_.data() + p, rs); out += rs; }
-            p += rs;
-        }
-        std::swap(buf_, spare_);
-        records_ = live_;
-        head_ = 0;
-        tail_ = out;
-        used_ = out;
-        if (records_ == 0) tail_ = 0;
-        return true;
-    }
-
 private:
     static constexpr std::size_t kHeader = 16;          // key(8) + len(4) + flags(4)
     static constexpr uint32_t    kWrap   = UINT32_MAX;  // "continue at offset 0"
@@ -207,7 +154,6 @@ private:
     }
 
     std::vector<uint8_t> buf_;
-    std::vector<uint8_t> spare_;     // compact() target (empty = not compactable)
     std::size_t head_    = 0;
     std::size_t tail_    = 0;
     std::size_t used_    = 0;
