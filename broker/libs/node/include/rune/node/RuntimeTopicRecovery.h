@@ -76,6 +76,7 @@ struct RecoveredRuntimeTopics {
 struct TopicDirReconciliation {
     std::vector<std::filesystem::path> deleted;       // orphan-placeholder dirs (canonical paths)
     std::vector<std::filesystem::path> quarantined;   // destinations under dataDir/quarantine/
+    std::vector<std::filesystem::path> promoted;      // claimed dirs whose marker went pending -> committed
 };
 
 /// B10 / user decision D4 (fix round 1): reconcile dataDir/topics/ against the
@@ -92,6 +93,10 @@ struct TopicDirReconciliation {
 ///     marker (its record committed, so an unclaimed one means CATALOG DAMAGE —
 ///     a CRC-truncated or missing catalog; logged at error), any other id, and
 ///     an unreadable or malformed marker.
+/// FIRST (fix round 1b), before any delete decision: every catalog-claimed runtime
+/// topic dir (exact name, non-placeholder) whose marker reads "pending <its id>" is
+/// rewritten "committed <id>" (atomic) — a crash between the record's commit and
+/// the control thread's marker rewrite heals at the next boot.
 /// Symlinks are never followed (a symlinked topics/ or quarantine/ root, child,
 /// partition dir or file makes the entry "not ours": left alone).  Each action is
 /// logged at warn with its path(s).  Never throws.  Call on the startup thread

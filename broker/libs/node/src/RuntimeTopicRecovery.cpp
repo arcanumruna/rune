@@ -176,12 +176,49 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
         return false;
     };
 
+    // ── Fix round 1b: promote claimed dirs' markers, during the scan below — i.e.
+    // BEFORE any delete decision (deletes happen only after the scan).
+    // The admin thread posts kA2cTopicCommitted only after the record committed,
+    // and the control thread rewrites the marker asynchronously; a crash in between
+    // leaves "pending" on a topic whose record IS in the catalog.  The catalog
+    // claims it now, so its record committed: promote it, atomically, so a LATER
+    // loss of that record (CRC truncation, a missing catalog dir) quarantines the
+    // dir instead of deleting it.  Residual (not healable here): the record is lost
+    // in the SAME crash that lost the rewrite — since a DDL is acked only after its
+    // record is HW-committed, that needs a committed-then-lost catalog record.
+    // Guards: the on-disk entry name must EQUAL the topic's name (a fold-only match
+    // may be another topic's dir — and a path lookup would fold on a
+    // case-insensitive filesystem), the dir and the marker are not symlinks, and
+    // the marker id equals the claiming topic's id.  Placeholders have no dir.
+    auto promoteIfPending = [&](const fs::path& entry) {
+        const std::string n = entry.filename().string();
+        const TopicSpec* owner = nullptr;
+        for (const TopicSpec& t : topics)
+            if (t.name == n) { owner = &t; break; }
+        if (owner == nullptr || placeholders.count(owner->topicId) != 0) return;
+        std::error_code pec;
+        const fs::file_status mst = fs::symlink_status(entry / rune::gateway::kTopicIdMarkerFile, pec);
+        if (pec || !fs::is_regular_file(mst)) return;   // no marker, or a symlinked one
+        const fs::path c = fs::canonical(entry, pec);
+        if (pec || c.parent_path() != canonicalRoot) return;
+        const TopicIdMarker m = readTopicIdMarker(c);
+        if (m.kind != MarkerKind::Pending || m.id != owner->topicId) return;
+        if (rune::gateway::writeTopicIdMarker(c.string(), rune::gateway::kTopicIdMarkerCommitted, m.id)) {
+            spdlog::info("topic-dir reconcile: '{}' marker promoted pending -> committed (topic id {} "
+                         "is in the catalog)", c.string(), m.id);
+            result.promoted.push_back(c);
+        }
+    };
+
     std::vector<fs::path> candidates;
     for (fs::directory_iterator it(topicsRoot, ec), end; !ec && it != end; it.increment(ec)) {
         std::error_code sec;
         const fs::file_status st = it->symlink_status(sec);
         if (sec || fs::is_symlink(st) || !fs::is_directory(st)) continue;   // not a topic dir: left alone
-        if (claimed(it->path().filename().string())) continue;
+        if (claimed(it->path().filename().string())) {
+            promoteIfPending(it->path());   // fix round 1b (see above)
+            continue;
+        }
         if (!isTopicDirLayout(it->path())) {
             spdlog::info("topic-dir reconcile: leaving '{}' alone (not a recognised topic dir layout)",
                          it->path().string());

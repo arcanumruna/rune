@@ -524,6 +524,76 @@ TEST(RuntimeTopicRecoveryRegression, MissingSchemaCatalogWithSurvivingViewsDelet
     EXPECT_TRUE(fs::exists(d.path / "topics" / "v3" / "0"));
 }
 
+// Fix round 1b: a crash between the record's commit and the control thread's marker
+// rewrite leaves "pending" on a CLAIMED topic.  Boot promotes it to "committed"
+// before any delete decision, so a later loss of that record quarantines the dir
+// instead of deleting it.
+TEST(RuntimeTopicRecoveryRegression, BootPromotesAClaimedPendingMarkerSoALaterCatalogLossQuarantinesRegression) {
+    TempDataDir d("promote");
+    {   // boot 1: static "src" (0); runtime "t1" (1) whose record commits, but the
+        // broker crashes before kA2cTopicCommitted is applied (marker stays pending);
+        // view sink "v2" (2) committed normally.
+        rune::gateway::TopicRegistry reg({spec("src", 0)}, d.path.string());
+        ASSERT_EQ(reg.createTopic(spec("t1", -1)), 1);
+        ASSERT_EQ(reg.createTopic(spec("v2", -1)), 2);
+        reg.log(1, 0)->append(oneRecordBatch("acked-t1"), 0);
+        appendRecords(d.path / "__topic_schemas", {schemaRecord(1, 1, 1, "t1", "d1")});
+        appendRecords(d.path / "__views", {viewRecord(2, "v2", /*source*/ 0)});
+        ASSERT_TRUE(reg.markTopicCommitted(2));
+    }
+    ASSERT_EQ(readMarker(d.path / "topics" / "t1"), "pending 1\n");
+    {   // boot 2: the catalog claims t1 -> its marker is promoted; nothing else moves
+        const Boot b = recoverBoot(d.path, {spec("src", 0)});
+        ASSERT_TRUE(b.placeholderIds.empty());
+        const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow);
+        ASSERT_EQ(r.promoted.size(), 1u);
+        EXPECT_EQ(r.promoted[0], fs::canonical(d.path / "topics" / "t1"));
+        EXPECT_TRUE(r.deleted.empty());
+        EXPECT_TRUE(r.quarantined.empty());
+        EXPECT_EQ(readMarker(d.path / "topics" / "t1"), "committed 1\n");
+        EXPECT_EQ(readMarker(d.path / "topics" / "v2"), "committed 2\n") << "already committed: untouched";
+        EXPECT_FALSE(fs::exists(d.path / "topics" / "t1" / rune::gateway::kTopicIdMarkerTmpFile));
+    }
+    fs::remove_all(d.path / "__topic_schemas");   // the record is later lost
+    {   // boot 3: id 1 is a placeholder; t1's dir is QUARANTINED, never deleted
+        const Boot b = recoverBoot(d.path, {spec("src", 0)});
+        ASSERT_EQ(b.placeholderIds, (std::vector<int32_t>{1}));
+        const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow + 1);
+        EXPECT_TRUE(r.deleted.empty()) << "a promoted (committed) topic is never deleted";
+        ASSERT_EQ(r.quarantined.size(), 1u);
+        const fs::path q = d.path / "quarantine" / ("t1-" + std::to_string(kNow + 1));
+        EXPECT_TRUE(fs::exists(q / "0"));
+        EXPECT_EQ(readMarker(q), "committed 1\n");
+    }
+}
+
+// Promotion guards: only an EXACT claimed name, a regular (non-symlinked) marker,
+// a non-symlinked dir, and a marker id equal to the claiming topic's id.
+TEST(RuntimeTopicRecoveryRegression, PromotionNeverTouchesAMismatchedOrSymlinkedMarkerRegression) {
+    TempDataDir d("promote-guards");
+    TempDataDir outside("promote-guards-outside");
+    touchFile(d.path / "topics" / "wrong_id" / "topic-id", "pending 9\n");     // claimed as id 1
+    touchFile(d.path / "topics" / "wrong_id" / "0" / "seg.log");
+    touchFile(d.path / "topics" / "Folded" / "topic-id", "pending 2\n");       // claimed only by fold
+    touchFile(d.path / "topics" / "Folded" / "0" / "seg.log");
+    touchFile(outside.path / "marker", "pending 3\n");
+    touchFile(d.path / "topics" / "linked_marker" / "0" / "seg.log");
+    fs::create_symlink(outside.path / "marker", d.path / "topics" / "linked_marker" / "topic-id");
+    touchFile(outside.path / "victim" / "topic-id", "pending 4\n");
+    touchFile(outside.path / "victim" / "0" / "seg.log");
+    fs::create_directory_symlink(outside.path / "victim", d.path / "topics" / "linked_dir");
+    const auto r = rune::node::reconcileTopicDirs(
+        d.path.string(),
+        {spec("wrong_id", 1), spec("folded", 2), spec("linked_marker", 3), spec("linked_dir", 4)}, {}, kNow);
+    EXPECT_TRUE(r.promoted.empty());
+    EXPECT_TRUE(r.deleted.empty());
+    EXPECT_TRUE(r.quarantined.empty());
+    EXPECT_EQ(readMarker(d.path / "topics" / "wrong_id"), "pending 9\n");
+    EXPECT_EQ(readMarker(d.path / "topics" / "Folded"), "pending 2\n");
+    EXPECT_EQ(readAll(outside.path / "marker"), "pending 3\n") << "never written through a symlink";
+    EXPECT_EQ(readAll(outside.path / "victim" / "topic-id"), "pending 4\n");
+}
+
 // Fix round 1, I2: a placeholder is what RECOVERY created, never a name.  A STATIC
 // topic literally named "__orphan.1" (names are unvalidated until Task 5a) next to a
 // runtime topic with marker id 1 that is no longer claimed: nothing is deleted —

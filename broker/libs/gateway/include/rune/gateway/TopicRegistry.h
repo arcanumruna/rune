@@ -63,6 +63,12 @@ inline constexpr const char* kTopicIdMarkerTmpFile = "topic-id.tmp";
 inline constexpr std::string_view kTopicIdMarkerPending   = "pending";
 inline constexpr std::string_view kTopicIdMarkerCommitted = "committed";
 
+/// Atomically (kTopicIdMarkerTmpFile + rename) writes "<state> <id>\n" as
+/// topicDir/kTopicIdMarkerFile.  Returns false (logged, temp removed) on failure.
+/// Used by TopicRegistry (create / markTopicCommitted) and by boot's
+/// reconcileTopicDirs (promotion of a claimed dir's pending marker).
+bool writeTopicIdMarker(const std::string& topicDir, std::string_view state, int32_t id);
+
 class TopicRegistry {
 public:
     // Construct the registry from a topic list + data root directory.
@@ -189,8 +195,7 @@ private:
         MarkerState                       marker = MarkerState::None;
     };
 
-    // Atomically (temp + rename) writes "<state> <id>\n" into topicDir.
-    static bool writeMarker_(const std::string& topicDir, std::string_view state, int32_t id);
+
 
     std::string                            dataDir_;       // root data directory (for createTopic)
     std::vector<TopicEntry>               topics_;        // indexed by topicId

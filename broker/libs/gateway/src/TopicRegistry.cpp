@@ -116,7 +116,7 @@ TopicRegistry::createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin o
     // unclaimed dir (quarantined).  Runtime creates only — see kTopicIdMarkerFile.
     if (origin == CreateOrigin::Runtime && !topicDirPreexisted &&
         spec.persistence != rune::node::PersistenceMode::Transient && spec.partitionCount > 0) {
-        if (writeMarker_(topicDir.string(), kTopicIdMarkerPending, assignedId))
+        if (writeTopicIdMarker(topicDir.string(), kTopicIdMarkerPending, assignedId))
             entry.marker = MarkerState::Pending;
     }
 
@@ -131,10 +131,10 @@ TopicRegistry::createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin o
 }
 
 // ---------------------------------------------------------------------------
-// TopicRegistry::writeMarker_ / markTopicCommitted (B10 / D4, fix round 1)
+// writeTopicIdMarker / TopicRegistry::markTopicCommitted (B10 / D4, fix round 1)
 // ---------------------------------------------------------------------------
 bool
-TopicRegistry::writeMarker_(const std::string& topicDir, std::string_view state, int32_t id)
+writeTopicIdMarker(const std::string& topicDir, std::string_view state, int32_t id)
 {
     const fs::path dir{topicDir};
     const fs::path tmp    = dir / kTopicIdMarkerTmpFile;
@@ -169,7 +169,7 @@ TopicRegistry::markTopicCommitted(int32_t topicId)
     TopicEntry& e = topics_[static_cast<std::size_t>(topicId)];
     if (e.marker != MarkerState::Pending) return false;
     const fs::path topicDir = fs::path(dataDir_) / "topics" / e.spec.name;
-    if (!writeMarker_(topicDir.string(), kTopicIdMarkerCommitted, topicId)) return false;
+    if (!writeTopicIdMarker(topicDir.string(), kTopicIdMarkerCommitted, topicId)) return false;
     e.marker = MarkerState::Committed;
     return true;
 }
