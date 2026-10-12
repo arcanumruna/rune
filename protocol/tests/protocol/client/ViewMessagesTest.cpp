@@ -53,6 +53,17 @@ TEST(ViewMessages, CreateViewDecodeRejectsTruncated) {
     EXPECT_FALSE(CreateView::decode(buf.data(), buf.size() - 1).has_value());
 }
 
+TEST(ViewMessagesRegression, CreateViewUnknownPersistenceValueIsRejected) {
+    std::vector<uint8_t> blob = {1, 2, 3};
+    CreateView in; in.viewName = "v"; in.keyField = "k"; in.persistence = 1;
+    in.planBlob = blob.data(); in.planLen = static_cast<uint32_t>(blob.size());
+    std::vector<uint8_t> buf(in.encodedSize());
+    in.encode(buf.data());
+    ASSERT_TRUE(CreateView::decode(buf.data(), buf.size()).has_value());
+    buf[MessageHeader::ENCODED_SIZE] = 2;   // one past Transient: never cast
+    EXPECT_FALSE(CreateView::decode(buf.data(), buf.size()).has_value());
+}
+
 TEST(ViewMessages, CreateViewResponseRoundTrip) {
     CreateViewResponse in;
     in.sessionId = 7; in.correlationId = 99;
@@ -180,4 +191,10 @@ TEST(ViewMessages, ViewRowResponseDecodeRejectsTruncated) {
     std::vector<uint8_t> buf(in.encodedSize());
     in.encode(buf.data());
     EXPECT_FALSE(ViewRowResponse::decode(buf.data(), buf.size() - 1).has_value());
+}
+
+// U1: ErrorCode values are append-only wire constants.
+TEST(ViewMessagesRegression, ViewErrorCodesArePinned) {
+    EXPECT_EQ(static_cast<uint16_t>(ErrorCode::ViewSourceTransient), 37u);
+    EXPECT_EQ(static_cast<uint16_t>(ErrorCode::ViewNotAlterable), 38u);
 }

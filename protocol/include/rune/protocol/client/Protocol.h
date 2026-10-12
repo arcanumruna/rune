@@ -150,6 +150,8 @@ enum class ErrorCode : uint16_t {
                                   // a multi-partition source is rejected)
     ViewSourceTransient    = 37,  // CreateView: a persisted view over a transient source topic
                                   // (a view that reads a transient topic must itself be transient)
+    ViewNotAlterable       = 38,  // AlterTopic on a VIEW's output topic (a view's schema is derived
+                                  // from its plan and is never altered directly)
 };
 
 // ---------------------------------------------------------------------------

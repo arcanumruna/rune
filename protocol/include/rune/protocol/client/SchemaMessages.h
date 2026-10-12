@@ -293,6 +293,7 @@ struct CreateView {
         if (avail < pos + BODY_FIXED) return std::nullopt;
         CreateView m; m.sessionId = h->sessionId; m.correlationId = h->correlationId;
         m.persistence = buf[pos++];
+        if (m.persistence > 1) return std::nullopt;   // append-only: 0 = persisted, 1 = transient
         if (!getVarStr(buf, avail, pos, m.viewName)) return std::nullopt;
         if (!getVarStr(buf, avail, pos, m.keyField)) return std::nullopt;
         if (!getVarBytes32(buf, avail, pos, m.planBlob, m.planLen)) return std::nullopt;
