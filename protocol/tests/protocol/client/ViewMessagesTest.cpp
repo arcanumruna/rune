@@ -198,3 +198,20 @@ TEST(ViewMessagesRegression, ViewErrorCodesArePinned) {
     EXPECT_EQ(static_cast<uint16_t>(ErrorCode::ViewSourceTransient), 37u);
     EXPECT_EQ(static_cast<uint16_t>(ErrorCode::ViewNotAlterable), 38u);
 }
+
+// No-hang wave: InvalidRequest (39) answers a header-decodable request whose
+// body did not decode; ViewRowResponse gains InvalidRequest (5) and Busy (6).
+// Append-only wire constants.
+TEST(ViewMessagesRegression, InvalidRequestAndViewRowStatusesArePinnedRegression) {
+    EXPECT_EQ(static_cast<uint16_t>(ErrorCode::InvalidRequest), 39u);
+    EXPECT_EQ(static_cast<uint16_t>(ViewRowResponse::kInvalidRequest), 5u);
+    EXPECT_EQ(static_cast<uint16_t>(ViewRowResponse::kBusy), 6u);
+    EXPECT_EQ(static_cast<uint16_t>(ViewRowResponse::kUnknownView), 4u);
+    ViewRowResponse in; in.sessionId = 3; in.correlationId = 9; in.status = ViewRowResponse::kBusy;
+    std::vector<uint8_t> buf(in.encodedSize());
+    in.encode(buf.data());
+    const auto out = ViewRowResponse::decode(buf.data(), buf.size());
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->status, ViewRowResponse::kBusy);
+    EXPECT_EQ(out->correlationId, 9);
+}

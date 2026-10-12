@@ -714,7 +714,11 @@ struct ViewRowResponse {
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::ViewRowResponse); // 73
     static constexpr uint16_t BODY_FIXED  = 6; // status(2)+rowLen(4)
 
-    enum Status : uint16_t { kOk = 0, kAbsentKey = 1, kNotReady = 2, kSchemaMismatch = 3, kUnknownView = 4 };
+    // Append-only.  5 = the GetViewRow body did not decode (non-retriable);
+    // 6 = the owning worker's ingress ring was full this cycle (retriable —
+    // the read was not performed; re-issue it).
+    enum Status : uint16_t { kOk = 0, kAbsentKey = 1, kNotReady = 2, kSchemaMismatch = 3, kUnknownView = 4,
+                             kInvalidRequest = 5, kBusy = 6 };
 
     /// Total encoded size accounting for the var field.
     std::size_t encodedSize() const noexcept {

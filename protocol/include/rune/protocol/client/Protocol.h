@@ -152,6 +152,10 @@ enum class ErrorCode : uint16_t {
                                   // (a view that reads a transient topic must itself be transient)
     ViewNotAlterable       = 38,  // AlterTopic on a VIEW's output topic (a view's schema is derived
                                   // from its plan and is never altered directly)
+    InvalidRequest         = 39,  // the request's MessageHeader decoded but its body did not
+                                  // (truncated / malformed / unknown enum byte) — answered on the
+                                  // header's correlationId so the client never waits out a timeout.
+                                  // Non-retriable: re-sending the same bytes fails the same way.
 };
 
 // ---------------------------------------------------------------------------
