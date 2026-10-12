@@ -598,7 +598,8 @@ public:
                             CompletionTarget target, Token token);
     /// Task 18: propose an AlterTopic (expectedVersion is the optimistic-
     /// concurrency gate — stale -> SchemaConflict; incompatible ops ->
-    /// SchemaIncompatible).  Completion: value = topicId, aux = newVersion; a
+    /// SchemaIncompatible; naming a VIEW's output topic -> ViewNotAlterable=38).
+    /// Completion: value = topicId, aux = newVersion; a
     /// broker errorCode in the response -> BrokerError (errorCode, value/aux kept).
     OpResult alterTopic(std::string_view name, uint16_t expectedVersion,
                         std::span<const uint8_t> opsBlob, CompletionTarget target, Token token);
@@ -658,7 +659,7 @@ public:
     TopicSchemaResult getTopicSchemaAndWait(std::string_view name, uint64_t requestedFingerprint,
                                             std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
     /// Task 18: alterTopic(), blocking.  A broker errorCode (e.g.
-    /// SchemaIncompatible / SchemaConflict) is returned in the result (not thrown).
+    /// SchemaIncompatible / SchemaConflict / ViewNotAlterable=38) is returned in the result (not thrown).
     AlterTopicResult alterTopicAndWait(std::string_view name, uint16_t expectedVersion,
                                        std::span<const uint8_t> opsBlob,
                                        std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
