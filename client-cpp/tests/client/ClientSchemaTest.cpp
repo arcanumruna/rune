@@ -187,6 +187,7 @@ struct SchemaTestGateway {
 
     // Observed counts.
     std::atomic<int> definesSeen{0};
+    uint8_t     lastDefinePersistence = 0xff;
     std::atomic<int> getsSeen{0};
     std::atomic<int> connectsSeen{0};
     std::atomic<int> altersSeen{0};
@@ -283,6 +284,7 @@ struct SchemaTestGateway {
             auto opt = rpc::DefineTopic::decode(buf, len);
             if (!opt) return;
             definesSeen.fetch_add(1, std::memory_order_relaxed);
+            lastDefinePersistence = opt->persistence;
             if (!replyDefineTopic) break;
 
             // Encode DefineTopicResponse.
@@ -441,6 +443,13 @@ struct SchemaHarness {
                                           std::span<const uint8_t> blob) {
         return cq->issue([&](Completions& q, Token t) {
             return client->defineTopic(name, partitions, keyField, validate, blob, q, t);
+        });
+    }
+    test_support::PendingOp defineTopicOp(std::string_view name, uint32_t partitions,
+                                          std::string_view keyField, bool validate,
+                                          std::span<const uint8_t> blob, Persistence persistence) {
+        return cq->issue([&](Completions& q, Token t) {
+            return client->defineTopic(name, partitions, keyField, validate, blob, persistence, q, t);
         });
     }
     test_support::PendingOp getTopicSchemaOp(std::string_view name) {
@@ -1113,4 +1122,33 @@ TEST(ClientSchema, GetViewRowTimeoutFailsPromise) {
         << "getViewRow() future did not fail within timeout — potential hang";
     EXPECT_THROW(fut.getViewRowResult(), std::exception)
         << "getViewRow() must throw on timeout, not return a value";
+}
+
+// ===========================================================================
+// Phase 2b E: Persistence on DefineTopic.
+// ===========================================================================
+TEST(ClientSchemaRegression, DefineTopicTransientSendsPersistenceByte) {
+    SchemaHarness h(1140, 1141);
+    h.build();
+    h.connectAndWait();
+    std::vector<uint8_t> blob = {0x01};
+    auto fut = h.defineTopicOp("presence", 4, "userId", false, std::span<const uint8_t>(blob),
+                               Persistence::Transient);
+    h.pumpGwUntil([&]() { return fut.ready(); });
+    ASSERT_TRUE(fut.waitReady());
+    EXPECT_EQ(fut.defineResult().errorCode, 0u);
+    EXPECT_EQ(h.gw->lastDefinePersistence, rpc::DefineTopic::kPersistenceTransient);
+}
+
+TEST(ClientSchemaRegression, DefineTopicDefaultOverloadIsDisk) {
+    SchemaHarness h(1142, 1143);
+    h.build();
+    h.connectAndWait();
+    std::vector<uint8_t> blob = {0x01};
+    auto fut = h.defineTopicOp("orders", 4, "id", false, std::span<const uint8_t>(blob));
+    h.pumpGwUntil([&]() { return fut.ready(); });
+    ASSERT_TRUE(fut.waitReady());
+    EXPECT_EQ(h.gw->lastDefinePersistence, rpc::DefineTopic::kPersistenceDisk);
+    EXPECT_EQ(static_cast<uint8_t>(Persistence::Disk), 0u);
+    EXPECT_EQ(static_cast<uint8_t>(Persistence::Transient), 1u);
 }

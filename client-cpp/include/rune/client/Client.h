@@ -83,6 +83,15 @@ using Bytes = std::vector<uint8_t>;
 // ---------------------------------------------------------------------------
 // Schema DDL result types (Task 10)
 // ---------------------------------------------------------------------------
+// Topic persistence for defineTopic (Phase 2b E).  The DefineTopic wire byte;
+// values are APPEND-ONLY.
+//   Disk      - durable log (default; what the overloads without it send).
+//   Transient - replicated to the ISR before ack, never written to disk.  The
+//               topic's metadata survives a broker restart, its data does not
+//               (a restarted node rejoins empty; after a full-cluster restart
+//               the topic is empty).
+enum class Persistence : uint8_t { Disk = 0, Transient = 1 };
+
 struct DefineTopicResult {
     int32_t  topicId   = -1;
     uint16_t version   = 0;
@@ -114,7 +123,9 @@ struct AlterTopicResult {
 // ---------------------------------------------------------------------------
 
 /// Result of CreateView (wire 70/71). errorCode is a broker ErrorCode (e.g.
-/// ViewExists=32, ViewSourceNotFound=33, ViewFieldUnresolved=34).
+/// ViewExists=32, ViewSourceNotFound=33, ViewFieldUnresolved=34,
+/// ViewSourceTransient=37: a view that reads a transient topic must itself be
+/// transient).
 struct CreateViewResult {
     int32_t  viewTopicId       = -1;
     uint64_t outputFingerprint = 0;
@@ -575,6 +586,11 @@ public:
     OpResult defineTopic(std::string_view name, uint32_t partitions, std::string_view keyField,
                          bool validate, std::span<const uint8_t> descriptorBlob,
                          CompletionTarget target, Token token);
+    /// Phase 2b E: as above, with an explicit Persistence (Transient = a
+    /// transient topic).  The overload without it is Persistence::Disk.
+    OpResult defineTopic(std::string_view name, uint32_t partitions, std::string_view keyField,
+                         bool validate, std::span<const uint8_t> descriptorBlob,
+                         Persistence persistence, CompletionTarget target, Token token);
     OpResult getTopicSchema(std::string_view name, CompletionTarget target, Token token);
     /// As above, selecting a specific schema fingerprint (0 = latest; same as
     /// the 3-arg overload).  Task 18.
@@ -629,6 +645,12 @@ public:
                                          std::string_view keyField, bool validate,
                                          std::span<const uint8_t> descriptorBlob,
                                          std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+    /// Phase 2b E: defineTopic(..., persistence), blocking.  Same result contract.
+    DefineTopicResult defineTopicAndWait(std::string_view name, uint32_t partitions,
+                                         std::string_view keyField, bool validate,
+                                         std::span<const uint8_t> descriptorBlob,
+                                         Persistence persistence,
+                                         std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
     /// A broker errorCode (e.g. UnknownTopic) is returned in the result.
     TopicSchemaResult getTopicSchemaAndWait(std::string_view name,
                                             std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
@@ -642,7 +664,8 @@ public:
                                        std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
 
     /// Task 21: createView(), blocking. A broker errorCode (e.g. ViewExists,
-    /// ViewSourceNotFound, ViewFieldUnresolved) is returned in the result
+    /// ViewSourceNotFound, ViewFieldUnresolved, ViewSourceTransient=37 - a view
+    /// over a transient topic must itself be transient) is returned in the result
     /// (not thrown).
     CreateViewResult createViewAndWait(std::string_view viewName, std::string_view keyField,
                                        uint8_t persistence, std::span<const uint8_t> planBlob,

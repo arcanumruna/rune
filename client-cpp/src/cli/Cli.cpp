@@ -367,6 +367,10 @@ int cmdSchemaApply(const std::vector<std::string>& args,
         // Build the apply plan (parse → blob).
         rune::ql::DefineTopicPlan plan = rune::ql::applyPlan(std::get<rune::ql::TopicDef>(*result));
 
+        const rune::client::Persistence persistence =
+            plan.persistence == rune::ql::Persistence::Transient
+                ? rune::client::Persistence::Transient
+                : rune::client::Persistence::Disk;
         DefineTopicResult r;
         try {
             r = client.defineTopicAndWait(
@@ -376,6 +380,7 @@ int cmdSchemaApply(const std::vector<std::string>& args,
                 validate,
                 std::span<const uint8_t>(plan.descriptorBlob.data(),
                                          plan.descriptorBlob.size()),
+                persistence,
                 kCliWait);
         } catch (const std::exception& e) {
             if (isWaitTimeout(e)) {

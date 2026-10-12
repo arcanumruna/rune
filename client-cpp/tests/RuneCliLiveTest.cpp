@@ -152,6 +152,7 @@ struct CliTestGateway {
     std::string          lastDefineName;
     uint32_t             lastDefinePartitions = 0;
     std::string          lastDefineKeyField;
+    uint8_t              lastDefinePersistence = 0xff;
     std::vector<uint8_t> lastDefineBlob;
     std::string          lastAlterName;
     uint16_t             lastAlterExpectedVersion = 0;
@@ -250,6 +251,7 @@ struct CliTestGateway {
             lastDefineName       = std::string(opt->topicName);
             lastDefinePartitions = opt->partitionCount;
             lastDefineKeyField   = std::string(opt->keyField);
+            lastDefinePersistence = opt->persistence;
             if (opt->descriptorBlob && opt->descriptorLen > 0) {
                 lastDefineBlob.assign(opt->descriptorBlob,
                                       opt->descriptorBlob + opt->descriptorLen);
@@ -1147,6 +1149,31 @@ TEST(CliLiveRegression, AlterLive_NewVersionInOutput) {
         << "regression: output must contain 'newVersion=7'; got: " << r.out;
     EXPECT_EQ(gw.altersSeen.load(), 1) << "regression: gateway must see exactly one AlterTopic";
 
+    gw.stop();
+    try { std::filesystem::remove_all(baseDir); } catch (...) {}
+}
+
+// Phase 2b E: `transient topic ...;` through `rune schema apply` must reach the
+// broker as a TRANSIENT DefineTopic (silently creating a disk topic would be a bug).
+TEST(CliLiveRegression, ApplyTransientTopicSendsTransientPersistence) {
+    static constexpr int32_t kIn = 1240, kOut = 1241;
+    const std::string baseDir = cliUniqueDir();
+    const std::string aeronDir = baseDir + "/aeron";
+    const std::string rqlPath = writeTmpRql(
+        baseDir, "transient topic presence { userId int64, online bool } partitions 4 key userId;");
+    CliTestGateway gw(aeronDir, kIn, kOut);
+    gw.defineTopicId = 0x40000002; gw.defineVersion = 1; gw.defineErrorCode = 0;
+    std::vector<std::string> args = {
+        "schema", "apply", rqlPath,
+        "--cli-data-dir", baseDir,
+        "--cli-stream-in",  std::to_string(kIn),
+        "--cli-stream-out", std::to_string(kOut),
+    };
+    auto r = runCli(gw, aeronDir, args);
+    EXPECT_EQ(r.rc, 0) << r.err;
+    EXPECT_EQ(gw.definesSeen.load(), 1);
+    EXPECT_EQ(gw.lastDefineName, "presence");
+    EXPECT_EQ(gw.lastDefinePersistence, rpc::DefineTopic::kPersistenceTransient);
     gw.stop();
     try { std::filesystem::remove_all(baseDir); } catch (...) {}
 }

@@ -1109,7 +1109,16 @@ OpResult Client::ping(std::span<const uint8_t> payload, CompletionTarget target,
 OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::string_view keyField,
                              bool validate, std::span<const uint8_t> descriptorBlob,
                              CompletionTarget target, Token token) {
+    return defineTopic(name, partitions, keyField, validate, descriptorBlob,
+                       Persistence::Disk, target, token);
+}
+
+OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::string_view keyField,
+                             bool validate, std::span<const uint8_t> descriptorBlob,
+                             Persistence persistence, CompletionTarget target, Token token) {
     namespace rpc = rune::protocol::client;
+    if (persistence != Persistence::Disk && persistence != Persistence::Transient)
+        return OpResult::InvalidArgument;   // wire decode rejects >1; never cast garbage
     rpc::DefineTopic msg;
     msg.sessionId      = 0;
     msg.correlationId  = 0;
@@ -1119,6 +1128,7 @@ OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::st
     msg.validate       = validate;
     msg.descriptorBlob = descriptorBlob.data();
     msg.descriptorLen  = static_cast<uint32_t>(descriptorBlob.size());
+    msg.persistence    = static_cast<uint8_t>(persistence);   // Disk writes no byte (old layout)
     std::vector<uint8_t> frame(msg.encodedSize() + 32u);
     const std::size_t n = msg.encode(frame.data());
     if (n == 0) return OpResult::InvalidArgument;
@@ -1512,10 +1522,20 @@ DefineTopicResult Client::defineTopicAndWait(std::string_view name, uint32_t par
                                              std::string_view keyField, bool validate,
                                              std::span<const uint8_t> descriptorBlob,
                                              std::chrono::nanoseconds timeout) {
+    return defineTopicAndWait(name, partitions, keyField, validate, descriptorBlob,
+                              Persistence::Disk, timeout);
+}
+
+DefineTopicResult Client::defineTopicAndWait(std::string_view name, uint32_t partitions,
+                                             std::string_view keyField, bool validate,
+                                             std::span<const uint8_t> descriptorBlob,
+                                             Persistence persistence,
+                                             std::chrono::nanoseconds timeout) {
     DefineTopicResult result;
     andWait_("defineTopic()", timeout, 0,
              [&](Completions& q, Token t) {
-                 return defineTopic(name, partitions, keyField, validate, descriptorBlob, q, t);
+                 return defineTopic(name, partitions, keyField, validate, descriptorBlob,
+                                    persistence, q, t);
              },
              [&](const Completion& c, std::span<const uint8_t> p) {
                  if (c.status != OpStatus::BrokerError) throwForStatus_("defineTopic()", c, p);
