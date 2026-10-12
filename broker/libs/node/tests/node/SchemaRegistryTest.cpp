@@ -424,3 +424,36 @@ TEST(SchemaRegistryRegression, PreNameRecordResolvesByDescriptorName) {
     ASSERT_NE(reg.byName("legacy_chars"), nullptr);
     EXPECT_EQ(reg.byName("legacy_chars")->topicId, 0x40000023);
 }
+
+// ---------------------------------------------------------------------------
+// SchemaRegistryRegression.RebuildFromRecordsIndexesTopicNameNotDescriptorName
+// — Phase 2b C final review I2: the e044159 fix (index by the topic's defined
+// name) must survive a restart.  The durable record goes through its real wire
+// form (serialize → deserialize, as boot replay / rebuildFromLog_ read it from
+// __topic_schemas) and a FRESH registry is rebuilt from it: "typed_route"
+// resolves, the descriptor name "characters" does not.
+// ---------------------------------------------------------------------------
+TEST(SchemaRegistryRegression, RebuildFromRecordsIndexesTopicNameNotDescriptorName) {
+    TopicSchema ts = makeSchema(0x40000030, "characters", false);
+    ts.topicName      = "typed_route";
+    ts.partitionCount = 8;
+    const std::vector<uint8_t> wire = ts.serialize();
+
+    const std::optional<TopicSchema> replayed = TopicSchema::deserialize(
+        std::span<const uint8_t>(wire.data(), wire.size()));
+    ASSERT_TRUE(replayed.has_value());
+    EXPECT_EQ(replayed->topicName, "typed_route");
+
+    SchemaRegistry reg;
+    // A stale pre-restart index must not leak into the rebuild.
+    reg.applyRecord(makeSchema(0x40000031, "characters", false));
+    const std::vector<TopicSchema> records{*replayed};
+    reg.rebuildFromRecords(std::span<const TopicSchema>(records.data(), records.size()));
+
+    const RegistryEntry* e = reg.byName("typed_route");
+    ASSERT_NE(e, nullptr) << "after restart the topic resolves by its defined name";
+    EXPECT_EQ(e->topicId, 0x40000030);
+    EXPECT_EQ(e->partitionCount, 8);
+    EXPECT_EQ(reg.byName("characters"), nullptr)
+        << "after restart the descriptor name is not a topic name";
+}
