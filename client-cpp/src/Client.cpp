@@ -1837,6 +1837,20 @@ void Client::syncSeedSession_() noexcept {
     // completion or callback this transition triggers (ring order on this
     // thread: status first).
     if (st != lastSeedState_ || sid != lastSeedSessionId_) publishSeedStatus_(st, sid);
+    // No-hang fix round 4 (item 6): the client's OWN liveness check (response
+    // timeout / own stall) declared the seed session lost — its in-flight
+    // control ops can never be answered (the broker allocates a new session on
+    // resume), so they complete SessionLost NOW, exactly as on a SessionExpired
+    // from the broker — never later as Timeout by their per-op deadlines.
+    if (const uint64_t losses = m.staleSessionLosses(); losses != lastSeedStaleLosses_) [[unlikely]] {
+        lastSeedStaleLosses_ = losses;
+        static constexpr std::string_view kWhy = "session lost: no answer within the response timeout";
+        const auto text = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kWhy.data()), kWhy.size());
+        while (!pendingCtl_.empty()) {
+            PendingCtl p = takeCtl_(pendingCtl_.size() - 1);
+            completeCtl_(p, OpStatus::SessionLost, 0, 0, 0, text);
+        }
+    }
     const bool connected = st == session::SessionState::Connected;
     subscriberHub_.setSessionConnected(connected);
     lastSeedState_     = st;

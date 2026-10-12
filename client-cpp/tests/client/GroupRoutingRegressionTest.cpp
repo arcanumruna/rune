@@ -572,6 +572,7 @@ TEST(GroupRoutingRegression, ErroredOffsetFetchIsRetriedRegression) {
     wire(gc, led);
     r.connect();
     ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.holdJoins = false;   // fix round 4: the NotCoordinator re-joins — answered at once
     r.gw.releaseJoins();
     ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr; }, 4'000'000))
         << "an errored OffsetFetch left the partition unsubscribed (" << r.gw.offsetFetches << " fetches)";
@@ -1153,10 +1154,13 @@ TEST(GroupRoutingRegression, HeartbeatInternalForeverIsRefusedAfterTheBudgetRegr
     EXPECT_LE(r.gw.joinGroups, 9) << "more than 1 + kMaxBackoffRejoins joins";
 }
 
-// Fix round 3 (C1 failover): a per-entry NotCoordinator in OffsetFetch makes the
-// member rediscover the coordinator by re-joining — it never spends the re-fetch
-// budget (a failover longer than the budget must not kill a healthy consumer).
-TEST(GroupRoutingRegression, OffsetFetchNotCoordinatorIsRetriedWithoutSpendingTheBudgetRegression) {
+// Fix round 4 (item 2a): a node that answers every Heartbeat OK but every
+// OffsetFetch NotCoordinator can no longer keep the member Stable and
+// unsubscribed forever: each NotCoordinator re-joins (rediscovery, paced) and
+// kMaxOffsetFetchRejoins consecutive ones finish the consumer explicitly
+// (RetryBudgetExhausted).  RED (round 3): re-fetched every 2 s forever, Stable,
+// never finished, no signal.
+TEST(GroupRoutingRegression, OffsetFetchNotCoordinatorForeverWithHeartbeatOkTerminatesRegression) {
     GroupRig r(4217, 4218);
     const auto [n1, p1port] = r.addNode(4217);
     r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
@@ -1164,15 +1168,61 @@ TEST(GroupRoutingRegression, OffsetFetchNotCoordinatorIsRetriedWithoutSpendingTh
     r.gw.subscribeLeader       = {{0, 0}, {1, n1}};
     r.gw.groupAssignment       = {{1, 1}};
     r.gw.offsetFetchErrorCode  = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator);
-    r.gw.offsetFetchErrorsNext = 10;   // > kMaxOffsetFetchAttempts (8)
-    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.gw.offsetFetchErrorsNext = 1'000'000;   // forever; heartbeats answer OK
+    rc::GroupConfig gcfg;
+    gcfg.sessionTimeoutMs = 300;   // a heartbeat every 100 ms (they stay OK)
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
     r.connect();
     ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.holdJoins = false;   // every re-join is answered at once from now on
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 80'000'000))
+        << "fetches: " << r.gw.offsetFetches << " joins: " << r.gw.joinGroups
+        << " — OffsetFetch NotCoordinator kept the member Stable forever";
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RetryBudgetExhausted);
+    EXPECT_EQ(r.gw.offsetFetches, 9) << "1 fetch + kMaxOffsetFetchRejoins (8) re-joined fetches";
+    EXPECT_EQ(r.gw.joinGroups, 9) << "each NotCoordinator must re-join (rediscovery), exactly once";
+    EXPECT_EQ(r.subAt(1, n1), nullptr);
+}
+
+// Fix round 4 (item 2b): ONE failover — OffsetFetch NotCoordinator, then OK at
+// the rediscovered coordinator — recovers through a single re-join, spending
+// neither the OffsetFetch budget nor the Internal backoff budget: a second
+// failover later recovers the same way.
+TEST(GroupRoutingRegression, OffsetFetchNotCoordinatorFailoverRejoinsWithoutSpendingTheBudgetRegression) {
+    GroupRig r(4219, 4220);
+    const auto [n1, p1port] = r.addNode(4219);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions            = {{1, 0, 0, 1, 4219, ""}, {1, 1, 1, 1, 4219, ""}};
+    r.gw.subscribeLeader       = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment       = {{1, 1}};
+    r.gw.offsetFetchErrorCode  = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotCoordinator);
+    r.gw.offsetFetchErrorsNext = 1;
+    rc::GroupConfig gcfg;
+    gcfg.sessionTimeoutMs = 300;   // a heartbeat every 100 ms
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.holdJoins = false;
     r.gw.releaseJoins();
     ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr; }, 80'000'000))
         << "fetches: " << r.gw.offsetFetches << (gc.finished() ? " (the consumer was refused)" : "");
-    EXPECT_FALSE(gc.finished()) << "a coordinator failover exhausted the re-fetch budget";
-    EXPECT_GE(r.gw.offsetFetches, 11);
+    EXPECT_FALSE(gc.finished());
+    EXPECT_EQ(r.gw.joinGroups, 2) << "the NotCoordinator must trigger exactly one re-join";
+    EXPECT_EQ(r.gw.offsetFetches, 2);
+    // A later failover: the streak was reset by the served fetch.  Eight more
+    // single failovers in a row each recover — none is charged to a budget.
+    for (int k = 0; k < 8; ++k) {
+        const int joins = r.gw.joinGroups;
+        const int fetches = r.gw.offsetFetches;
+        r.gw.offsetFetchErrorsNext = 1;
+        r.gw.heartbeatErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::RebalanceInProgress);
+        ASSERT_TRUE(r.drive([&] { return r.gw.joinGroups > joins; }, 80'000'000));
+        r.gw.heartbeatErrorCode = 0;
+        ASSERT_TRUE(r.drive([&] { return r.gw.offsetFetches >= fetches + 2 && r.subAt(1, n1) != nullptr; },
+                            80'000'000)) << "failover " << k;
+        EXPECT_FALSE(gc.finished()) << "failover " << k << " spent a budget";
+    }
 }
 
 // CG round 4 (A-MEDIUM-3): a rolling upgrade — the seed / coordinator runs v3

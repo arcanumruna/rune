@@ -289,6 +289,10 @@ public:
     /// DR-7: connect attempts that ended without a session (timed out / refused);
     /// monotonic — each increment is an event (the owner asks for fresh metadata).
     [[nodiscard]] uint64_t connectFailures() const noexcept { return connectFailures_; }
+    /// No-hang fix round 4 (item 6): Connected → Resuming edges caused by THIS
+    /// client's own liveness check (response timeout / own stall) — the session
+    /// is treated as lost, exactly as if the broker had sent SessionExpired.
+    [[nodiscard]] uint64_t staleSessionLosses() const noexcept { return staleSessionLosses_; }
     /// Backoff state: injected-clock time of the next attempt.
     [[nodiscard]] int64_t nextAttemptNs()  const noexcept { return backoff_.nextAttemptNs; }
     /// Rejected state: the non-retriable error code (0 otherwise).
@@ -615,6 +619,7 @@ public:
         const bool ownStall = lastTickNs_ != 0 && nowNs - lastTickNs_ > cfg_.responseTimeoutNs;
         lastTickNs_ = nowNs;
         if (ownStall && state_ == SessionState::Connected) [[unlikely]] {
+            ++staleSessionLosses_;
             transitionTo(SessionState::Resuming);
             resumeEntryNs_ = nowNs;
             return;
@@ -1023,6 +1028,7 @@ private:
     void tickConnected(int64_t nowNs) noexcept {
         // Check for stale session first.
         if (nowNs - lastActivityNs_ > cfg_.responseTimeoutNs) {
+            ++staleSessionLosses_;
             transitionTo(SessionState::Resuming);
             // FIX D: enter Resuming as a real state; doResume fires on next tick.
             resumeEntryNs_ = nowNs;
@@ -1078,6 +1084,7 @@ private:
     int64_t resumeEntryNs_       = 0;  // FIX D: timestamp when Resuming was entered
     // DR-BUG-2: fast-retry state for the connect path.
     uint64_t connectFailures_ = 0;   // DR-7: see connectFailures()
+    uint64_t staleSessionLosses_ = 0;   // fix round 4: see staleSessionLosses()
     int64_t lastConnectSentNs_   = 0;  // when the last ConnectRequest was offered
     bool    connectSentOk_       = false; // true if the last offer() succeeded
 

@@ -45,12 +45,25 @@ includes `rune/client/subscriber/Subscription.h`.
   whole-request rejection refuses the consumer (`RefusedByBroker`). A
   retriable per-entry error is re-fetched (paced) at most 8 times, then the
   consumer finishes with `RetryBudgetExhausted`. A per-entry `NotCoordinator`
-  (a coordinator failover) is re-fetched without spending that budget.
+  (or another rebalance code: a coordinator failover) makes the member re-join,
+  which rediscovers the coordinator, without spending that budget. After 8
+  such re-joins in a row with no OffsetFetch served in between, the consumer
+  finishes with `RetryBudgetExhausted`.
 - `GroupFailReason::RetryBudgetExhausted` (3) is new. It marks a transient
   cause, so the application may recreate the consumer. `RefusedByBroker` marks
   a non-retriable answer; recreating that consumer will be refused again.
 - A Heartbeat error outside the rebalance set no longer leaves the member
   Stable: the member re-joins with backoff, or is refused on InvalidRequest.
+- When the client's own response timeout declares the session lost (no
+  answer and no Pong within `responseTimeoutNs`), every pending control
+  operation completes `SessionLost` at once, as on a broker `SessionExpired`.
+  Before, those operations waited for their own deadline and completed
+  `Timeout`.
+- Older clients (< 5) stay Stable on a Heartbeat answer outside the rebalance
+  set. The broker therefore answers them `UnknownMember` instead of `Internal`
+  or `InvalidRequest` on Heartbeat, SyncGroup and OffsetFetch, and evicts their
+  member, so they re-join. A JoinGroup or SyncGroup the broker cannot decode
+  is still answered `ProtocolVersion` to them, as above.
 - An ErrorResponse fails a pending `connect()` only when it answers that
   connect (or ends the session); an error answering another request no longer
   fails the connect.

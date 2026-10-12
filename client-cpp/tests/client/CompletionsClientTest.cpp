@@ -1234,3 +1234,33 @@ TEST(CompletionsClient, UnsolicitedSessionExpiredCompletesEveryPendingOpSessionL
     r.settle();
     EXPECT_EQ(r.client.testPendingControlOps(), 0u);
 }
+
+// No-hang fix round 4 (item 6): the CLIENT's own liveness check (no answer
+// within responseTimeoutNs — e.g. the broker's SessionExpired was lost at the
+// lease deadline) declares the session lost: every in-flight control op
+// completes SessionLost at that edge, exactly as on a broker SessionExpired —
+// never later as Timeout through its per-op deadline.  RED (round 3): they
+// stayed pending until pingTimeoutMs and completed Timeout.
+TEST(CompletionsClient, OwnResponseTimeoutCompletesInFlightOpsSessionLostRegression) {
+    rc::ClientConfig c = cfgFor(5458, rc::RunnerMode::Invoker, &fakeNow);
+    c.responseTimeoutNs = 1'000'000'000LL;   // 1 s of silence = the session is lost
+    c.pingTimeoutMs     = 60'000;            // the per-op deadline is far later
+    Rig r(std::move(c));
+    TestCq cq(r.client);
+    r.connect(cq);
+    std::vector<uint8_t> blob{9};
+    auto d = cq.issue([&](rc::Completions& q, rc::Token t) {
+        return r.client.defineTopic("x", 1, "", false, blob, q, t);
+    });
+    auto g = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getTopicSchema("x", q, t); });
+    ASSERT_TRUE(r.drive([&] { return r.gw.defines == 1 && r.gw.schemaGets == 1; }));
+    ASSERT_FALSE(d.ready());
+    const int64_t t0 = g_now;
+    // 1 ms per duty cycle; the broker answers nothing (no Pongs either).
+    ASSERT_TRUE(r.drive([&] { return d.ready() && g.ready(); }, 200'000, 1'000'000));
+    EXPECT_EQ(d.status(), rc::OpStatus::SessionLost) << d.describe();
+    EXPECT_EQ(g.status(), rc::OpStatus::SessionLost) << g.describe();
+    EXPECT_LT(g_now - t0, 5'000'000'000LL) << "completed by the per-op deadline, not the session-loss edge";
+    r.settle();
+    EXPECT_EQ(r.client.testPendingControlOps(), 0u);
+}

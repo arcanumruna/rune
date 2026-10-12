@@ -1180,6 +1180,9 @@ private:
     // the hubs were told about (duty thread only).
     int64_t lastSeedSessionId_ = 0;
     int64_t lastSeedEpisode_   = 0;
+    /// No-hang fix round 4 (item 6): the seed machine's staleSessionLosses() the
+    /// duty thread last acted on (duty thread only).
+    uint64_t lastSeedStaleLosses_ = 0;
     /// fix4 I-1/M5: tell both hubs the seed session's current (connected,
     /// sessionId, episode) if it changed since the last call.  Called AT the
     /// transition points: the ConnectResponse / ErrorResponse handlers (before

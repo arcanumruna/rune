@@ -437,6 +437,12 @@ private:
     /// I2: consecutive OffsetFetch answers with a retriable per-entry error
     /// before the consumer is refused (each re-send is paced by retryOffsetFetch).
     static constexpr uint32_t kMaxOffsetFetchAttempts  = 8;
+    /// Fix round 4 (item 2): an OffsetFetch answered NotCoordinator (or another
+    /// rebalance-set code) re-joins (paced, 20 ms doubling to 1 s); after
+    /// kMaxOffsetFetchRejoins consecutive such answers (no fetch served in
+    /// between) the consumer is refused RetryBudgetExhausted.
+    void rejoinForOffsetFetch_(GroupConsumerImpl& impl);
+    static constexpr uint32_t kMaxOffsetFetchRejoins   = 8;
     /// I2: OffsetFetch correlationIds (bit 60 tag; disjoint from fetch ids).
     static constexpr int64_t  kOffsetFetchCorrTag      = int64_t{1} << 60;
     int64_t nextOffsetFetchCorr_ = 1;

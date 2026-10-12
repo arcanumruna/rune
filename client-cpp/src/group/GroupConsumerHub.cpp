@@ -216,6 +216,25 @@ void GroupConsumerHub::rejoinWithBackoff_(GroupConsumerImpl& impl) {
     toRejoining_(impl);
 }
 
+void GroupConsumerHub::rejoinForOffsetFetch_(GroupConsumerImpl& impl) {
+    // Fix round 4 (item 2): an OffsetFetch answered NotCoordinator (or another
+    // rebalance-set code) means THIS node no longer serves the group — re-join
+    // (the Join path rediscovers the coordinator: NotCoordinator → D4 redirect).
+    // Not charged to the Internal backoff budget (a failover is not an error),
+    // but capped on its own: kMaxOffsetFetchRejoins consecutive such answers
+    // with no fetch served in between end in an explicit RetryBudgetExhausted
+    // — a node that keeps answering Heartbeat OK but OffsetFetch NotCoordinator
+    // can no longer keep the member Stable-and-unsubscribed forever.
+    if (++impl.offsetFetchRejoins > kMaxOffsetFetchRejoins) {
+        refuse_(impl, GroupFailReason::RetryBudgetExhausted);
+        return;
+    }
+    // 20 ms doubling, capped at 1 s (as rejoinWithBackoff_).
+    const auto shift = std::min<uint32_t>(impl.offsetFetchRejoins - 1, 6u);
+    impl.rejoinNotBefore = tpNow() + std::chrono::milliseconds(std::min<int64_t>(int64_t{20} << shift, 1000));
+    toRejoining_(impl);
+}
+
 void GroupConsumerHub::toRejoining_(GroupConsumerImpl& impl) {
     // C1: the old generation's subscriptions are dead at once — their records
     // are dropped (retired) and ours unsubscribed.
@@ -1518,12 +1537,10 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
                 const auto ec = static_cast<rpc::ErrorCode>(static_cast<uint16_t>(r.errorCode));
                 const GroupVerdict v = classifyGroupAnswer_(ec);
                 if (r.topicId < 0 || v == GroupVerdict::Refuse) refused = true;
-                // Fix round 3: NotCoordinator (& the rebalance set) = the coordinator
-                // moved / the group is rebalancing — re-fetched (paced by
-                // retryOffsetFetch) WITHOUT spending the budget: the coordinator is
-                // rediscovered by the next Heartbeat / Join answer (NotCoordinator →
-                // rejoin, D4 redirect), so a failover longer than the budget never
-                // kills a healthy consumer.
+                // Fix round 4: NotCoordinator (& the rebalance set) = the coordinator
+                // moved / the group is rebalancing — the member REDISCOVERS the
+                // coordinator by re-joining (paced, capped: rejoinForOffsetFetch_),
+                // never by re-fetching from the same node while Stable.
                 else if (v == GroupVerdict::Rejoin) rejoin = true;
                 else retriableError = true;
                 continue;
@@ -1549,17 +1566,22 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
             refuse_(*impl, GroupFailReason::RefusedByBroker);
             break;
         }
-        (void)rejoin;   // not budgeted: its re-fetch is paced by retryOffsetFetch
+        if (rejoin) {
+            rejoinForOffsetFetch_(*impl);
+            break;
+        }
+        // The coordinator served this fetch: the NotCoordinator streak ends.
+        impl->offsetFetchRejoins = 0;
         if (retriableError && impl->offsetFetchCountedCorr != opt->correlationId) {
             // Fix round 3: one budget attempt per OffsetFetch (a duplicate answer
             // of the same fetch is not counted twice; seeding stays idempotent).
+            // Fix round 4: the budget is per generation (reset by SyncGroup OK
+            // only) — no answer resets it, so no answer mix can loop forever.
             impl->offsetFetchCountedCorr = opt->correlationId;
             if (++impl->offsetFetchAttempts > kMaxOffsetFetchAttempts) {
                 refuse_(*impl, GroupFailReason::RetryBudgetExhausted);
                 break;
             }
-        } else if (!retriableError) {
-            impl->offsetFetchAttempts = 0;
         }
         // Leader-node subscriptions waiting for their start offset go now.
         if (routed_()) (void)reconcileImpl_(*impl);
