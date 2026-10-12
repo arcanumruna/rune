@@ -22,6 +22,7 @@
 // decision D2d, NodeConfig.cpp — Task 5a).
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 namespace rune::node {
@@ -58,6 +59,29 @@ enum class TopicNameError : uint8_t { None, Empty, TooLong, DotSegment, BadChar,
     for (std::size_t i = 0; i < a.size(); ++i)
         if (asciiLower(a[i]) != asciiLower(b[i])) return false;
     return true;
+}
+
+/// `n` made safe to embed in one log line or error message.  A REJECTED name is
+/// client- (or env-) supplied and may hold newlines / ANSI escapes / NUL — logged
+/// raw it could forge log lines.  Printable ASCII is kept (a backslash doubled);
+/// every other byte becomes \xHH.  Cold path (rejections, config errors) only.
+[[nodiscard]] inline std::string escapeNameForLog(std::string_view n) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(n.size());
+    for (const char ch : n) {
+        const auto c = static_cast<unsigned char>(ch);
+        if (c == '\\') {
+            out += "\\\\";
+        } else if (c >= 0x20 && c < 0x7f) {
+            out += ch;
+        } else {
+            out += "\\x";
+            out += kHex[c >> 4];
+            out += kHex[c & 0xf];
+        }
+    }
+    return out;
 }
 
 /// A short reason for config errors ("RUNE_TOPICS topic name 'x' is invalid (<text>)").

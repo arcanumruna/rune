@@ -30,7 +30,35 @@
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
 
+#include <unistd.h>
+
 namespace {
+
+// Every view data dir is per PROCESS: "<temp>/<name>-<pid>".  ctest runs each
+// test as its own process (-j6) and other checkouts on this machine run the same
+// suite concurrently; with a fixed /tmp/<name> one process's freshDir remove_all
+// wiped another's checkpoint file mid-test (the
+// WorkerViewSetRegression.AggregateLazyRecoveryLoadsV2CheckpointFile flake).
+// Every dir handed out is removed when the process's tests finish.
+std::vector<std::string>& createdTmpDirs() {
+    static std::vector<std::string> dirs;
+    return dirs;
+}
+std::string tmpDir(const std::string& name) {
+    std::string d = (std::filesystem::temp_directory_path() /
+                     (name + "-" + std::to_string(::getpid()))).string();
+    createdTmpDirs().push_back(d);
+    return d;
+}
+class TmpDirCleanup : public ::testing::Environment {
+public:
+    void TearDown() override {
+        std::error_code ec;
+        for (const std::string& d : createdTmpDirs()) std::filesystem::remove_all(d, ec);
+    }
+};
+[[maybe_unused]] ::testing::Environment* const kTmpDirCleanup =
+    ::testing::AddGlobalTestEnvironment(new TmpDirCleanup);
 
 // v1 "character" source: {characterId: Int64 key (tag 0), hp: Int32 (tag 1)}.
 rune::codec::Descriptor charSourceV1() {
@@ -106,7 +134,7 @@ TEST(WorkerViewSet, FoldsCommittedRangeAndServesRow) {
     auto comp = rune::view::compileView(hpView(), srcs, 0x40000007).value();
 
     rune::node::ViewSnapshotChannel channel;
-    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-test");
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-test"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
 
     const auto batch = twoUpsertsKey7();
@@ -130,7 +158,7 @@ TEST(WorkerViewSet, PersistedViewPushesCheckpointDelta) {
     auto comp = rune::view::compileView(hpView(0), srcs, 0x40000007).value();
 
     rune::node::ViewSnapshotChannel channel;
-    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-test");
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-test"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
 
     const auto batch = twoUpsertsKey7();
@@ -164,7 +192,7 @@ TEST(WorkerViewSet, TransientViewSkipsCheckpoint) {
     auto comp = rune::view::compileView(hpView(1), srcs, 0x40000007).value();
 
     rune::node::ViewSnapshotChannel channel;
-    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-test");
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-test"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
 
     const auto batch = twoUpsertsKey7();
@@ -189,7 +217,7 @@ TEST(WorkerViewSet, TransientViewSkipsCheckpoint) {
 // no fold, no push).
 TEST(WorkerViewSet, UninterestedSourceIsNoOp) {
     rune::node::ViewSnapshotChannel channel;
-    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-test");
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-test"));
     bool called = false;
     auto readRange = [&](int64_t, int64_t) -> rune::storage::LogReadView {
         called = true;
@@ -213,7 +241,7 @@ TEST(WorkerViewSetRegression, PerPartitionFoldCursorsAreIndependent) {
     auto comp = rune::view::compileView(hpView(0), srcs, 0x40000007).value();
 
     rune::node::ViewSnapshotChannel channel;
-    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-test");
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-test"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
 
     // DIFFERENT committed ranges per partition: p0 => key 7 hp=10 (1 record);
@@ -263,7 +291,7 @@ TEST(WorkerViewSetRegression, UnderRecoveryViewNoInstanceServesNotReady) {
     auto comp = rune::view::compileView(hpView(/*persistence*/ 0), srcs, 0x40000007).value();
 
     rune::node::ViewSnapshotChannel channel;
-    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-recovery-notready");
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-recovery-notready"));
     // Install FOR RECOVERY; deliberately do NOT materialize the instance.
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true, /*underRecovery*/ true);
 
@@ -284,7 +312,7 @@ TEST(WorkerViewSetRegression, PlainViewNoInstanceServesNotFound) {
     auto comp = rune::view::compileView(hpView(/*persistence*/ 0), srcs, 0x40000007).value();
 
     rune::node::ViewSnapshotChannel channel;
-    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-plain-notfound");
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-plain-notfound"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);  // underRecovery defaults false
 
     const rune::view::RowLayout* layout = nullptr;
@@ -364,7 +392,7 @@ std::vector<std::vector<uint8_t>> drainDeltas(rune::node::ViewSnapshotChannel& c
 }
 // A fresh, empty per-test view data directory.
 std::string freshDir(const std::string& name) {
-    const std::string d = "/tmp/" + name;
+    const std::string d = tmpDir(name);
     std::filesystem::remove_all(d);
     std::filesystem::create_directories(d);
     return d;
@@ -376,7 +404,7 @@ TEST(WorkerViewSet, AggregateViewFoldsAndServesGroupRow) {
     const rune::codec::Descriptor* srcs[] = {&src};
     auto comp = rune::view::compileView(userTotalsPlan(1), srcs, 0x40000009).value();
     rune::node::ViewSnapshotChannel channel;
-    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-agg");
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-agg"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
 
     const auto batch = orderBatch(0, {{1, 100, 10}, {2, 100, 30}, {3, 200, 5}});
@@ -400,7 +428,7 @@ TEST(WorkerViewSetRegression, AggregateRecoveryRestoresContributorMap) {
 
     // 1. Fold on a persisted view and capture the checkpoint delta it pushes.
     rune::node::ViewSnapshotChannel ch1;
-    rune::node::WorkerViewSet vs1(ch1, "/tmp/rune-views-agg-rec");
+    rune::node::WorkerViewSet vs1(ch1, tmpDir("rune-views-agg-rec"));
     vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
     const auto b1 = orderBatch(0, {{1, 100, 10}, {2, 100, 30}});
     auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b1.data(), b1.size(), 0, 2}; };
@@ -413,7 +441,7 @@ TEST(WorkerViewSetRegression, AggregateRecoveryRestoresContributorMap) {
 
     // 2. Recover into a fresh worker view set from that checkpoint.
     rune::node::ViewSnapshotChannel ch2;
-    rune::node::WorkerViewSet vs2(ch2, "/tmp/rune-views-agg-rec");
+    rune::node::WorkerViewSet vs2(ch2, tmpDir("rune-views-agg-rec"));
     const std::span<const uint8_t> recs[] = {deltas[0]};
     vs2.installViewForRecovery(comp.plan, comp.rowLayout, src, /*persisted*/ true, /*partition*/ 0,
                                /*base*/ {}, recs, /*committedTail*/ 2);
@@ -501,7 +529,7 @@ TEST(WorkerViewSet, ReplaceViewStillWritesV1Checkpoint) {
     const rune::codec::Descriptor* srcs[] = {&src};
     auto comp = rune::view::compileView(hpView(0), srcs, 0x40000007).value();
     rune::node::ViewSnapshotChannel ch;
-    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-test");
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-test"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
     const auto batch = twoUpsertsKey7();
     auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, 2}; };
@@ -524,7 +552,7 @@ TEST(WorkerViewSetRegression, TransientViewDiscardsDirtyStateEachPass) {
         const rune::codec::Descriptor* srcs[] = {&src};
         auto comp = rune::view::compileView(hpView(1), srcs, 0x40000007).value();
         rune::node::ViewSnapshotChannel ch;
-        rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-test");
+        rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-test"));
         vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
         const auto batch = twoUpsertsKey7();
         auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, 2}; };
@@ -549,7 +577,7 @@ TEST(WorkerViewSetRegression, TransientViewDiscardsDirtyStateEachPass) {
         const rune::codec::Descriptor* srcs[] = {&src};
         auto comp = rune::view::compileView(userTotalsPlan(1), srcs, 0x40000009).value();
         rune::node::ViewSnapshotChannel ch;
-        rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-agg");
+        rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-agg"));
         vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
         for (int64_t off = 0; off < 64; ++off) {
             const auto b = orderBatch(off, {{1, (off % 2) ? 200 : 100, 10}});
@@ -601,7 +629,7 @@ TEST(WorkerViewSetRegression, PersistedAggregateLargeRangeDeltasFitTheRing) {
     auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, kN}; };
 
     rune::node::ViewSnapshotChannel ch;
-    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-agg-large");
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-agg-large"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
     std::vector<std::vector<uint8_t>> deltas;
     ASSERT_NO_THROW(driveToEnd(vs, ch, 6, rr, kN, deltas));
@@ -633,14 +661,14 @@ TEST(WorkerViewSetRegression, AggregateRecoveryOfLargeCheckpointDoesNotResendRow
     auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, kN}; };
 
     rune::node::ViewSnapshotChannel ch1;
-    rune::node::WorkerViewSet vs1(ch1, "/tmp/rune-views-agg-large-rec");
+    rune::node::WorkerViewSet vs1(ch1, tmpDir("rune-views-agg-large-rec"));
     vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
     std::vector<std::vector<uint8_t>> deltas;
     driveToEnd(vs1, ch1, 6, rr, kN, deltas);
     std::vector<std::span<const uint8_t>> spans(deltas.begin(), deltas.end());
 
     rune::node::ViewSnapshotChannel ch2;
-    rune::node::WorkerViewSet vs2(ch2, "/tmp/rune-views-agg-large-rec");
+    rune::node::WorkerViewSet vs2(ch2, tmpDir("rune-views-agg-large-rec"));
     vs2.installViewForRecovery(comp.plan, comp.rowLayout, src, /*persisted*/ true, 0, {},
                                std::span<const std::span<const uint8_t>>(spans.data(), spans.size()),
                                /*committedTail*/ kN);
@@ -682,7 +710,7 @@ TEST(WorkerViewSetRegression, PersistedReplaceLargeRangeDeltasFitTheRing) {
     auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, kN}; };
 
     rune::node::ViewSnapshotChannel ch;
-    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-replace-large");
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-replace-large"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
     std::vector<std::vector<uint8_t>> deltas;
     ASSERT_NO_THROW(driveToEnd(vs, ch, 5, rr, kN, deltas));
@@ -781,7 +809,7 @@ TEST(WorkerViewSetRegression, RecoveryLogsViewRecoveredLineRegression) {
         const rune::codec::Descriptor* csrcs[] = {&csrc};
         auto rcomp = rune::view::compileView(hpView(0), csrcs, 0x40000007).value();
         rune::node::ViewSnapshotChannel ch5;
-        rune::node::WorkerViewSet vs5(ch5, "/tmp/rune-views-recovered-log-v1");
+        rune::node::WorkerViewSet vs5(ch5, tmpDir("rune-views-recovered-log-v1"));
         vs5.installView(rcomp.plan, rcomp.rowLayout, csrc, true);
         const auto b = oneUpsert(7, 10);
         auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{b.data(), b.size(), 0, 1}; };
@@ -790,7 +818,7 @@ TEST(WorkerViewSetRegression, RecoveryLogsViewRecoveredLineRegression) {
         ASSERT_EQ(d.size(), 1u);
         LogCapture cap;
         rune::node::ViewSnapshotChannel ch6;
-        rune::node::WorkerViewSet vs6(ch6, "/tmp/rune-views-recovered-log-v1");
+        rune::node::WorkerViewSet vs6(ch6, tmpDir("rune-views-recovered-log-v1"));
         const std::span<const uint8_t> recs[] = {d[0]};
         vs6.installViewForRecovery(rcomp.plan, rcomp.rowLayout, csrc, true, 0, {}, recs, 1);
         const auto hits = cap.grep("VIEW-RECOVERED ");
@@ -838,7 +866,7 @@ TEST(WorkerViewSetRegression, FoldCountersAccumulatePerInstanceRegression) {
     const rune::codec::Descriptor* srcs[] = {&src};
     auto comp = rune::view::compileView(userSumsPlan(), srcs, 0x4000000B).value();
     rune::node::ViewSnapshotChannel ch;
-    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-fold-counters");
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-fold-counters"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
     EXPECT_EQ(vs.foldCounters(0x4000000B, 0), nullptr) << "no instance hosted yet";
 
@@ -898,7 +926,7 @@ TEST(WorkerViewSetRegression, RecoveryFromMidBatchOffsetThenContinuedFoldIsExact
     auto rr = [&](int64_t, int64_t) { return rune::storage::LogReadView{batch.data(), batch.size(), 0, kN}; };
 
     rune::node::ViewSnapshotChannel ch1;
-    rune::node::WorkerViewSet vs1(ch1, "/tmp/rune-views-agg-midbatch");
+    rune::node::WorkerViewSet vs1(ch1, tmpDir("rune-views-agg-midbatch"));
     vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
     std::vector<std::vector<uint8_t>> deltas;
     driveToEnd(vs1, ch1, 6, rr, kN, deltas);
@@ -913,7 +941,7 @@ TEST(WorkerViewSetRegression, RecoveryFromMidBatchOffsetThenContinuedFoldIsExact
     ASSERT_LT(int64_t(prefixO), kN) << "recovered O must be mid-batch";
 
     rune::node::ViewSnapshotChannel ch2;
-    rune::node::WorkerViewSet vs2(ch2, "/tmp/rune-views-agg-midbatch");
+    rune::node::WorkerViewSet vs2(ch2, tmpDir("rune-views-agg-midbatch"));
     vs2.installViewForRecovery(comp.plan, comp.rowLayout, src, /*persisted*/ true, 0, {},
                                std::span<const std::span<const uint8_t>>(spans.data(), spans.size()),
                                /*committedTail*/ kN);
@@ -969,7 +997,7 @@ TEST(WorkerViewSetRegression, TransientSourceCursorAboveLogEndIsInvariantBreachR
     const rune::codec::Descriptor* srcs[] = {&src};
     auto comp = rune::view::compileView(hpView(1), srcs, 0x40000031).value();
     rune::node::ViewSnapshotChannel ch;
-    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-transient-reset");
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-transient-reset"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
 
     const auto before = twoUpsertsKey7();                                    // offsets [0,2)
@@ -1000,7 +1028,7 @@ TEST(WorkerViewSetRegression, TransientSourceEvictionAheadOfCursorSkipsAndCounts
     const rune::codec::Descriptor* srcs[] = {&src};
     auto comp = rune::view::compileView(hpView(1), srcs, 0x40000032).value();
     rune::node::ViewSnapshotChannel ch;
-    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-transient-evict");
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-transient-evict"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
 
     auto empty = [](int64_t, int64_t) { return rune::storage::LogReadView{}; };
@@ -1028,7 +1056,7 @@ TEST(WorkerViewSetRegression, TransientFreshInstanceStartsAtLogStartWithoutCount
     const rune::codec::Descriptor* srcs[] = {&src};
     auto comp = rune::view::compileView(hpView(1), srcs, 0x40000034).value();
     rune::node::ViewSnapshotChannel ch;
-    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-transient-fresh");
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-transient-fresh"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
 
     const auto b = upsertAt(5, 12, 9);
@@ -1053,7 +1081,7 @@ TEST(WorkerViewSetRegression, TransientRecoveredCursorIsReconciledEvenWhenSource
     auto comp = rune::view::compileView(hpView(0), srcs, 0x40000033).value();
 
     rune::node::ViewSnapshotChannel ch1;
-    rune::node::WorkerViewSet vs1(ch1, "/tmp/rune-views-transient-rec1");
+    rune::node::WorkerViewSet vs1(ch1, tmpDir("rune-views-transient-rec1"));
     vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
     const auto b1 = twoUpsertsKey7();                                        // checkpoint O = 2
     auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b1.data(), b1.size(), 0, 2}; };
@@ -1062,7 +1090,7 @@ TEST(WorkerViewSetRegression, TransientRecoveredCursorIsReconciledEvenWhenSource
     ASSERT_EQ(deltas.size(), 1u);
 
     rune::node::ViewSnapshotChannel ch2;
-    rune::node::WorkerViewSet vs2(ch2, "/tmp/rune-views-transient-rec2");
+    rune::node::WorkerViewSet vs2(ch2, tmpDir("rune-views-transient-rec2"));
     const std::span<const uint8_t> recs[] = {deltas[0]};
     vs2.installViewForRecovery(comp.plan, comp.rowLayout, src, /*persisted*/ true, 0, {}, recs,
                                /*committedTail*/ 5);
@@ -1081,4 +1109,14 @@ TEST(WorkerViewSetRegression, TransientRecoveredCursorIsReconciledEvenWhenSource
     ASSERT_NE(vs2.getRow(0x40000033, 0, 1, L), nullptr) << "offset 1 (< recovered O) must fold";
     ASSERT_NE(vs2.getRow(0x40000033, 0, 4, L), nullptr);
     EXPECT_NE(vs2.getRow(0x40000033, 0, 7, L), nullptr) << "checkpoint rows are kept";
+}
+
+// REGRESSION: view data dirs are per process (no cross-process temp-dir collision
+// under ctest -j / concurrent checkouts).
+TEST(WorkerViewSetRegression, ViewDataDirsArePerProcess) {
+    const std::string d = freshDir("rune-views-per-process");
+    EXPECT_EQ(d, (std::filesystem::temp_directory_path() /
+                  ("rune-views-per-process-" + std::to_string(::getpid()))).string());
+    EXPECT_TRUE(std::filesystem::is_directory(d));
+    EXPECT_EQ(tmpDir("rune-views-test"), tmpDir("rune-views-test")) << "stable within a process";
 }

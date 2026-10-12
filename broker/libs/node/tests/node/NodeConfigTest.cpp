@@ -2942,14 +2942,39 @@ TEST_P(RuneTopicsNameRegression, InvalidNameIsAConfigErrorNamingTheEntry) {
         SCOPED_TRACE(list);
         const auto res = parseWithTopics(list.c_str());
         ASSERT_FALSE(res.config.has_value()) << "must refuse to boot";
-        EXPECT_NE(res.error.find("RUNE_TOPICS topic name '" + b.name + "' is invalid"), std::string::npos) << res.error;
+        // The name and entry are escaped (fix-on-sight: no raw control bytes in the error).
+        const std::string shown = rune::node::escapeNameForLog(b.name);
+        EXPECT_NE(res.error.find("RUNE_TOPICS topic name '" + shown + "' is invalid"), std::string::npos) << res.error;
         EXPECT_NE(res.error.find(reason), std::string::npos) << res.error;
-        EXPECT_NE(res.error.find("in entry: " + b.name + ":"), std::string::npos) << "names the entry: " << res.error;
+        EXPECT_NE(res.error.find("in entry: " + shown + ":"), std::string::npos) << "names the entry: " << res.error;
     }
 }
 
 INSTANTIATE_TEST_SUITE_P(EveryKind, RuneTopicsNameRegression, ::testing::ValuesIn(badStaticNames()),
                          [](const ::testing::TestParamInfo<BadStaticName>& i) { return std::string(i.param.label); });
+
+TEST(NodeConfigRegression, RuneTopicsInvalidNameIsEscapedInTheConfigErrorRegression) {
+    struct Case { const char* list; const char* shown; };
+    const Case cases[] = {
+        {"bad\nname:1",       "'bad\\x0aname'"},
+        {"ok:1,esc\x1b[2J:2",  "'esc\\x1b[2J'"},
+        {"back\\slash:1",     "'back\\\\slash'"},
+    };
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.shown);
+        const auto res = parseWithTopics(c.list);
+        ASSERT_FALSE(res.config.has_value());
+        EXPECT_NE(res.error.find(c.shown), std::string::npos) << res.error;
+        for (const char ch : res.error) {
+            const auto u = static_cast<unsigned char>(ch);
+            EXPECT_TRUE(u >= 0x20 && u < 0x7f) << "raw byte " << static_cast<int>(u);
+        }
+    }
+    // A name-less / colon-less entry is echoed escaped too.
+    const auto noColon = parseWithTopics("ok:1,x\ny");
+    ASSERT_FALSE(noColon.config.has_value());
+    EXPECT_NE(noColon.error.find("x\\x0ay"), std::string::npos) << noColon.error;
+}
 
 TEST(NodeConfigRegression, RuneTopicsEmptyNameStillAConfigErrorNamingTheEntryRegression) {
     const auto res = parseWithTopics("ok:1,:2");

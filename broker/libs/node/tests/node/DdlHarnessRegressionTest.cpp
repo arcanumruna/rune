@@ -6,6 +6,10 @@
 
 #include <rune/node/TopicName.h>
 
+#include <spdlog/sinks/ringbuffer_sink.h>
+#include <spdlog/spdlog.h>
+
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <filesystem>
@@ -791,4 +795,100 @@ TEST(DdlFixRegression, B3_FailedCreateAfterAFoldCheckIsInternalNotTopicExists) {
         EXPECT_EQ(h.idOf("orders"), -1);
     }
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+// ── fix-on-sight: a REJECTED name is logged escaped (no log-line injection) ────
+namespace {
+struct EscapeCase { std::string raw; std::string logged; const char* label; };
+std::vector<EscapeCase> escapeCases() {
+    return {
+        {"orders", "orders", "validNameUnchanged"},
+        {"a-b_c.D9", "a-b_c.D9", "validPunctuationUnchanged"},
+        {"has space", "has space", "spaceIsPrintable"},
+        {"new\nline", "new\\x0aline", "newline"},
+        {"cr\rlf", "cr\\x0dlf", "carriageReturn"},
+        {"tab\tname", "tab\\x09name", "tab"},
+        {std::string("nul\0byte", 8), "nul\\x00byte", "nul"},
+        {"\x1b[31mred", "\\x1b[31mred", "ansiEscape"},
+        {"del\x7f", "del\\x7f", "del"},
+        {"caf\xc3\xa9", "caf\\xc3\\xa9", "nonAscii"},
+        {"a\\b", "a\\\\b", "backslashDoubled"},
+        {"a\\x0ab", "a\\\\x0ab", "literalEscapeTextIsNotAmbiguous"},
+        {"", "", "empty"},
+    };
+}
+void PrintTo(const EscapeCase& c, std::ostream* os) { *os << c.label; }
+
+struct LogCapture {
+    std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> sink =
+        std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(64);
+    std::shared_ptr<spdlog::logger> prev = spdlog::default_logger();
+    LogCapture() {
+        auto lg = std::make_shared<spdlog::logger>("capture", sink);
+        lg->set_level(spdlog::level::trace);
+        lg->set_pattern("%v");
+        spdlog::set_default_logger(lg);
+    }
+    ~LogCapture() { spdlog::set_default_logger(prev); }
+    LogCapture(const LogCapture&) = delete;
+    LogCapture& operator=(const LogCapture&) = delete;
+};
+} // namespace
+
+class DdlLogEscapeRegression : public ::testing::TestWithParam<EscapeCase> {};
+
+TEST_P(DdlLogEscapeRegression, EscapedNameIsPrintableAsciiOnly) {
+    const EscapeCase& c = GetParam();
+    const std::string got = escapeNameForLog(c.raw);
+    EXPECT_EQ(got, c.logged);
+    for (const char ch : got) {
+        const auto u = static_cast<unsigned char>(ch);
+        EXPECT_TRUE(u >= 0x20 && u < 0x7f) << "byte " << static_cast<int>(u);
+    }
+}
+
+TEST_P(DdlLogEscapeRegression, ControlThreadLogsTheRejectedNameOnOneEscapedLine) {
+    const EscapeCase& c = GetParam();
+    if (isValidTopicName(c.raw)) GTEST_SKIP() << "only rejected names are logged here";
+    const fs::path dir = fs::temp_directory_path() / ("rune_ddl_logesc_" + std::to_string(::getpid()));
+    fs::create_directories(dir);
+    {
+        rune::gateway::TopicRegistry reg({}, dir.string());
+        CreateTopicReqMsg req; req.ticket = 1; req.partitionCount = 1; req.name = c.raw;
+        std::vector<std::string> lines;
+        {
+            LogCapture cap;
+            EXPECT_EQ(createTopicForAdmin(reg, req).topicId, -1);
+            lines = cap.sink->last_formatted();
+        }
+        ASSERT_EQ(lines.size(), 1u);
+        const std::string& line = lines[0];
+        EXPECT_NE(line.find("name='" + c.logged + "'"), std::string::npos) << line;
+        const std::string body = line.substr(0, line.find_last_not_of("\r\n") + 1);
+        for (const char ch : body) {
+            const auto u = static_cast<unsigned char>(ch);
+            EXPECT_TRUE(u >= 0x20 && u < 0x7f) << "raw byte " << static_cast<int>(u) << " in: " << body;
+        }
+    }
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+INSTANTIATE_TEST_SUITE_P(EveryByteClass, DdlLogEscapeRegression, ::testing::ValuesIn(escapeCases()),
+                         [](const ::testing::TestParamInfo<EscapeCase>& i) { return std::string(i.param.label); });
+
+TEST(DdlFixRegression, LogEscape_ForgedLogLineStaysOnTheRejectionLine) {
+    const fs::path dir = fs::temp_directory_path() / ("rune_ddl_logforge_" + std::to_string(::getpid()));
+    fs::create_directories(dir);
+    {
+        rune::gateway::TopicRegistry reg({}, dir.string());
+        CreateTopicReqMsg req; req.ticket = 1; req.partitionCount = 1;
+        req.name = "x\n[2026-10-12 00:00:00.000] [info] admin: granted superuser";
+        LogCapture cap;
+        (void)createTopicForAdmin(reg, req);
+        const std::vector<std::string> lines = cap.sink->last_formatted();
+        ASSERT_EQ(lines.size(), 1u);
+        EXPECT_EQ(std::count(lines[0].begin(), lines[0].end(), '\n'), 1) << "only the line terminator: " << lines[0];
+        EXPECT_NE(lines[0].find("x\\x0a[2026-10-12"), std::string::npos) << lines[0];
+    }
+    std::error_code ec; fs::remove_all(dir, ec);
 }

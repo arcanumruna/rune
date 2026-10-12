@@ -36,7 +36,7 @@ createTopicForAdmin(rune::gateway::TopicRegistry& reg, const CreateTopicReqMsg& 
     // thread — the one that builds dataDir/topics/<name>/ — never creates them either.
     if (!isValidTopicName(req.name) || req.partitionCount < 1) {
         spdlog::error("createTopicForAdmin: refusing invalid request name='{}' partitions={}",
-                      req.name, req.partitionCount);
+                      escapeNameForLog(req.name), req.partitionCount);
         reply.topicId = -1;
         reply.existed = false;
         return reply;

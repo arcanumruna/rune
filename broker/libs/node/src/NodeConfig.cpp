@@ -796,20 +796,20 @@ ConfigResult parseNodeConfig(
                 }
 
                 if (fields.size() < 2)
-                    return {{}, std::string("RUNE_TOPICS entry missing ':' in: ") + std::string(entry)};
+                    return {{}, std::string("RUNE_TOPICS entry missing ':' in: ") + escapeNameForLog(entry)};
 
                 std::string_view namePart  = fields[0];
                 std::string_view countPart = fields[1];
 
                 if (namePart.empty())
-                    return {{}, std::string("RUNE_TOPICS entry has empty name in: ") + std::string(entry)};
+                    return {{}, std::string("RUNE_TOPICS entry has empty name in: ") + escapeNameForLog(entry)};
 
                 std::string name(namePart);
                 // DDL conformance B7 / D2d: a static name obeys the DDL name rule — it is
                 // the directory dataDir/topics/<name>/ too.
                 if (const TopicNameError ne = checkTopicName(name); ne != TopicNameError::None)
-                    return {{}, "RUNE_TOPICS topic name '" + name + "' is invalid (" +
-                                std::string(topicNameErrorText(ne)) + ") in entry: " + std::string(entry)};
+                    return {{}, "RUNE_TOPICS topic name '" + escapeNameForLog(name) + "' is invalid (" +
+                                std::string(topicNameErrorText(ne)) + ") in entry: " + escapeNameForLog(entry)};
                 if (!seenNames.insert(name).second)
                     return {{}, "RUNE_TOPICS has duplicate topic name: " + name};
                 for (const std::string& seen : seenNames) {
