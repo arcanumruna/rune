@@ -1,4 +1,5 @@
 #include <rune/node/NodeConfig.h>
+#include <rune/node/TopicName.h>
 #include <rune/consensus/PeerResolution.h>
 #include <rune/node/Worker.h>
 #include <rune/storage/Log.h>                       // Log::kMaxRollBytes                         // Worker::maxAcceptableBatchBytes (THE batch limit)
@@ -804,8 +805,19 @@ ConfigResult parseNodeConfig(
                     return {{}, std::string("RUNE_TOPICS entry has empty name in: ") + std::string(entry)};
 
                 std::string name(namePart);
+                // DDL conformance B7 / D2d: a static name obeys the DDL name rule — it is
+                // the directory dataDir/topics/<name>/ too.
+                if (const TopicNameError ne = checkTopicName(name); ne != TopicNameError::None)
+                    return {{}, "RUNE_TOPICS topic name '" + name + "' is invalid (" +
+                                std::string(topicNameErrorText(ne)) + ") in entry: " + std::string(entry)};
                 if (!seenNames.insert(name).second)
                     return {{}, "RUNE_TOPICS has duplicate topic name: " + name};
+                for (const std::string& seen : seenNames) {
+                    if (seen != name && topicNamesFoldEqual(seen, name))
+                        return {{}, "RUNE_TOPICS topic names '" + seen + "' and '" + name +
+                                    "' differ only by letter case (they would share one data "
+                                    "directory) in entry: " + std::string(entry)};
+                }
 
                 int32_t partCount{};
                 if (!parseInt32(countPart, partCount) || partCount < 1)

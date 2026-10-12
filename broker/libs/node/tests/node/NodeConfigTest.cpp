@@ -1,4 +1,5 @@
 #include <rune/node/NodeConfig.h>
+#include <rune/node/TopicName.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/HostDefaults.h>
 #include <rune/node/EmbeddedDriver.h>
@@ -2898,4 +2899,102 @@ TEST(NodeConfigRegression, TransientLogRingBytesWinsOverAlias) {
     ASSERT_TRUE(res.config.has_value()) << res.error;
     EXPECT_EQ(res.config->memoryLogRingBytes, 16 * 1024 * 1024);
     EXPECT_EQ(res.warnings.size(), 1u) << "the alias still warns";
+}
+
+// ── DDL conformance B7 / user decision D2d: static RUNE_TOPICS names obey the DDL
+//    name rule (TopicName.h) — a bad name is a boot config error naming the entry.
+namespace {
+struct BadStaticName { std::string name; rune::node::TopicNameError kind; const char* label; };
+std::vector<BadStaticName> badStaticNames() {
+    using rune::node::TopicNameError;
+    return {
+        {std::string(250, 'x'), TopicNameError::TooLong, "len250"},
+        {std::string(600, 'y'), TopicNameError::TooLong, "len600"},
+        {".", TopicNameError::DotSegment, "dot"},
+        {"..", TopicNameError::DotSegment, "dotdot"},
+        {"../escape", TopicNameError::BadChar, "traversal"},
+        {"a/b", TopicNameError::BadChar, "slash"},
+        {"/abs", TopicNameError::BadChar, "absolute"},
+        {"a\\b", TopicNameError::BadChar, "backslash"},
+        {"has space", TopicNameError::BadChar, "space"},
+        {"tab\tname", TopicNameError::BadChar, "tab"},
+        {"caf\xc3\xa9", TopicNameError::BadChar, "nonascii"},
+        {"__topic_schemas", TopicNameError::Reserved, "topic_schemas"},
+        {"__views", TopicNameError::Reserved, "views"},
+        {"__consumer_offsets", TopicNameError::Reserved, "consumer_offsets"},
+        {"__transaction_state", TopicNameError::Reserved, "transaction_state"},
+        {"__cluster_metadata", TopicNameError::Reserved, "cluster_metadata"},
+        {"__view_snapshots", TopicNameError::Reserved, "view_snapshots"},
+        {"__orphan.1", TopicNameError::Reserved, "orphan"},
+        {"__x", TopicNameError::Reserved, "x"},
+    };
+}
+} // namespace
+
+class RuneTopicsNameRegression : public ::testing::TestWithParam<BadStaticName> {};
+
+TEST_P(RuneTopicsNameRegression, InvalidNameIsAConfigErrorNamingTheEntry) {
+    const BadStaticName& b = GetParam();
+    ASSERT_EQ(rune::node::checkTopicName(b.name), b.kind) << "table sanity";
+    const std::string reason(rune::node::topicNameErrorText(b.kind));
+    // First, in the middle (after a valid entry), and last.
+    for (const std::string& list : {b.name + ":1", "ok:1," + b.name + ":2", b.name + ":1,ok:2"}) {
+        SCOPED_TRACE(list);
+        const auto res = parseWithTopics(list.c_str());
+        ASSERT_FALSE(res.config.has_value()) << "must refuse to boot";
+        EXPECT_NE(res.error.find("RUNE_TOPICS topic name '" + b.name + "' is invalid"), std::string::npos) << res.error;
+        EXPECT_NE(res.error.find(reason), std::string::npos) << res.error;
+        EXPECT_NE(res.error.find("in entry: " + b.name + ":"), std::string::npos) << "names the entry: " << res.error;
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(EveryKind, RuneTopicsNameRegression, ::testing::ValuesIn(badStaticNames()),
+                         [](const ::testing::TestParamInfo<BadStaticName>& i) { return std::string(i.param.label); });
+
+TEST(NodeConfigRegression, RuneTopicsEmptyNameStillAConfigErrorNamingTheEntryRegression) {
+    const auto res = parseWithTopics("ok:1,:2");
+    ASSERT_FALSE(res.config.has_value());
+    EXPECT_NE(res.error.find("empty name"), std::string::npos) << res.error;
+    EXPECT_NE(res.error.find(":2"), std::string::npos) << res.error;
+}
+
+TEST(NodeConfigRegression, RuneTopicsInvalidNameWithExtendedFieldsIsStillRefusedRegression) {
+    const auto res = parseWithTopics("__views:1:persistence=transient");
+    ASSERT_FALSE(res.config.has_value());
+    EXPECT_NE(res.error.find("topic name '__views' is invalid"), std::string::npos) << res.error;
+}
+
+TEST(NodeConfigRegression, RuneTopicsCaseOnlyDuplicateIsAConfigErrorRegression) {
+    struct Case { const char* list; const char* a; const char* b; };
+    const Case cases[] = {
+        {"Orders:1,orders:4",               "Orders", "orders"},
+        {"Orders:1,chat:2,orders:4",        "Orders", "orders"},
+        {"chat:1,CHAT:1",                   "chat",   "CHAT"},
+        {"aB:1,x:1,Ab:1",                   "aB",     "Ab"},
+        {"orders.V2:1,ORDERS.v2:1",         "orders.V2", "ORDERS.v2"},
+    };
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.list);
+        const auto res = parseWithTopics(c.list);
+        ASSERT_FALSE(res.config.has_value());
+        EXPECT_NE(res.error.find(std::string("'") + c.a + "'"), std::string::npos) << res.error;
+        EXPECT_NE(res.error.find(std::string("'") + c.b + "'"), std::string::npos) << res.error;
+        EXPECT_NE(res.error.find("differ only by letter case"), std::string::npos) << res.error;
+        EXPECT_NE(res.error.find("in entry:"), std::string::npos) << res.error;
+    }
+}
+
+TEST(NodeConfigRegression, RuneTopicsExactDuplicateKeepsItsOwnMessageRegression) {
+    const auto res = parseWithTopics("orders:1,orders:2");
+    ASSERT_FALSE(res.config.has_value());
+    EXPECT_NE(res.error.find("duplicate topic name: orders"), std::string::npos) << res.error;
+}
+
+TEST(NodeConfigRegression, RuneTopicsValidNamesStillParseRegression) {
+    const std::string maxLen(249, 'x');
+    const std::string topics = "orders.v2:1,_private:1,a-b_c:2,Orders2:1,x__y:1," + maxLen + ":1";
+    const auto res = parseWithTopics(topics.c_str());
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    ASSERT_EQ(res.config->topics.size(), 6u);
+    EXPECT_EQ(res.config->topics[5].name, maxLen);
 }
