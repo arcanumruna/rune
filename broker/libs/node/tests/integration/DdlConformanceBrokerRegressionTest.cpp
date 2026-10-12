@@ -50,6 +50,16 @@ fs::path makeTempDataDir(std::string_view tag) {
                                         std::to_string(::getpid()) + "_" + std::to_string(seq.fetch_add(1)));
 }
 
+/// The test's data dir, removed on scope exit — also when an ASSERT returns early
+/// (declared first in each test, so it outlives every BrokerNode / client in it).
+struct TempDataDir {
+    fs::path path;
+    explicit TempDataDir(std::string_view tag) : path(makeTempDataDir(tag)) {}
+    ~TempDataDir() { std::error_code ec; fs::remove_all(path, ec); }
+    TempDataDir(const TempDataDir&) = delete;
+    TempDataDir& operator=(const TempDataDir&) = delete;
+};
+
 NodeConfig makeSingleNodeConfig(const fs::path& dataDir) {
     NodeConfig cfg;
     pinLegacyRuntime(cfg);
@@ -117,7 +127,8 @@ struct Wire {
 } // namespace
 
 TEST(DdlConformanceBrokerRegression, T1_SequentialCollisionsAnswerExactCodes) {
-    const fs::path dir = makeTempDataDir("t1_");
+    const TempDataDir tmp("t1_");
+    const fs::path& dir = tmp.path;
     const NodeConfig cfg = makeSingleNodeConfig(dir);
     {
         BrokerNode node{cfg};
@@ -158,11 +169,11 @@ TEST(DdlConformanceBrokerRegression, T1_SequentialCollisionsAnswerExactCodes) {
         EXPECT_NE(node.viewRegistryForTest()->byName("char_hp"), nullptr);
     }
     EXPECT_FALSE(fs::exists(dir / "topics" / "a")) << "no directory for a rejected name";
-    std::error_code ec; fs::remove_all(dir, ec);
 }
 
 TEST(DdlConformanceBrokerRegression, T2_PipelinedSameNameFromTwoSessionsExactlyOneWins) {
-    const fs::path dir = makeTempDataDir("t2_");
+    const TempDataDir tmp("t2_");
+    const fs::path& dir = tmp.path;
     const NodeConfig cfg = makeSingleNodeConfig(dir);
     BrokerNode node{cfg};
     node.start();
@@ -198,11 +209,11 @@ TEST(DdlConformanceBrokerRegression, T2_PipelinedSameNameFromTwoSessionsExactlyO
     node.stop();
     EXPECT_EQ(node.schemaRegistryForTest()->byName("race")->persistence, PersistenceMode::Disk)
         << "the winner's mode, never flipped by the loser";
-    std::error_code ec; fs::remove_all(dir, ec);
 }
 
 TEST(DdlConformanceBrokerRegression, T3T4_InterleavedBurstMatchesTheTable) {
-    const fs::path dir = makeTempDataDir("burst_");
+    const TempDataDir tmp("burst_");
+    const fs::path& dir = tmp.path;
     const NodeConfig cfg = makeSingleNodeConfig(dir);
     BrokerNode node{cfg};
     node.start();
@@ -247,11 +258,11 @@ TEST(DdlConformanceBrokerRegression, T3T4_InterleavedBurstMatchesTheTable) {
         if (got == kOk) model[s.name] = occupantAfterSuccess(o, s.op);
     }
     node.stop();
-    std::error_code ec; fs::remove_all(dir, ec);
 }
 
 TEST(DdlConformanceBrokerRegression, T5_FailedCreateLeavesAnOrphanAndTheBrokerStillRestarts) {
-    const fs::path dir = makeTempDataDir("t5_");
+    const TempDataDir tmp("t5_");
+    const fs::path& dir = tmp.path;
     const NodeConfig cfg = makeSingleNodeConfig(dir);
     int32_t laterId = -1;
     {
@@ -315,14 +326,14 @@ TEST(DdlConformanceBrokerRegression, T5_FailedCreateLeavesAnOrphanAndTheBrokerSt
         EXPECT_EQ(w.define(sid, "character"), kTopicExists);
         node.stop();
     }
-    std::error_code ec; fs::remove_all(dir, ec);
 }
 
 // Task 14 (KL1 follow-up): the same failed-after-create CREATE VIEW, then a retry
 // on the real broker — it adopts its own orphan sink (same id), the adopting commit
 // promotes the dir marker, and the view survives a restart (never a placeholder).
 TEST(DdlConformanceBrokerRegression, T5_RetryAdoptsItsOwnOrphanSinkAndSurvivesRestart) {
-    const fs::path dir = makeTempDataDir("t5adopt_");
+    const TempDataDir tmp("t5adopt_");
+    const fs::path& dir = tmp.path;
     const NodeConfig cfg = makeSingleNodeConfig(dir);
     int32_t sinkId = -1;
     {
@@ -370,11 +381,11 @@ TEST(DdlConformanceBrokerRegression, T5_RetryAdoptsItsOwnOrphanSinkAndSurvivesRe
         EXPECT_EQ(w.view(sid, "orphan_v", "character"), kViewExists);
         node.stop();
     }
-    std::error_code ec; fs::remove_all(dir, ec);
 }
 
 TEST(DdlConformanceBrokerRegression, T5a_ReplyFailsBeforeCreatingThenRetrySucceeds) {
-    const fs::path dir = makeTempDataDir("t5a_");
+    const TempDataDir tmp("t5a_");
+    const fs::path& dir = tmp.path;
     const NodeConfig cfg = makeSingleNodeConfig(dir);
     BrokerNode node{cfg};
     node.setAdminCreateFaultForTest("x", /*afterCreate=*/false);
@@ -388,11 +399,11 @@ TEST(DdlConformanceBrokerRegression, T5a_ReplyFailsBeforeCreatingThenRetrySuccee
     EXPECT_EQ(w.define(sid, "x"), kInternal);
     EXPECT_EQ(w.define(sid, "x"), kOk) << "nothing was created; the retry creates it";
     node.stop();
-    std::error_code ec; fs::remove_all(dir, ec);
 }
 
 TEST(DdlConformanceBrokerRegression, T7_RestartPreservesTheCatalogAndTheCollisions) {
-    const fs::path dir = makeTempDataDir("t7_");
+    const TempDataDir tmp("t7_");
+    const fs::path& dir = tmp.path;
     const NodeConfig cfg = makeSingleNodeConfig(dir);
     const std::vector<std::string> names = {"t_disk", "t_tr", "v_p", "v_t"};
     std::map<std::string, ShardTestClient::SchemaAnswer> before;
@@ -436,14 +447,14 @@ TEST(DdlConformanceBrokerRegression, T7_RestartPreservesTheCatalogAndTheCollisio
         node.stop();
         EXPECT_EQ(node.schemaRegistryForTest()->byName("t_tr")->keyField, "pk") << "B8 survives the restart";
     }
-    std::error_code ec; fs::remove_all(dir, ec);
 }
 
 // D4 (amended): a static topic removed from RUNE_TOPICS is QUARANTINED at boot —
 // moved to dataDir/quarantine/<name>-<ts>/ with its data intact and readable — and
 // re-adding it starts EMPTY (no automatic restore; the restore is a manual move).
 TEST(DdlConformanceBrokerRegression, T8_RemovedStaticTopicIsQuarantinedNotDeleted) {
-    const fs::path dir = makeTempDataDir("t8_");
+    const TempDataDir tmp("t8_");
+    const fs::path& dir = tmp.path;
     NodeConfig cfg = makeSingleNodeConfig(dir);
     TopicSpec events; events.name = "events"; events.partitionCount = 1; events.topicId = 0;
     cfg.topics = {events};
@@ -487,5 +498,4 @@ TEST(DdlConformanceBrokerRegression, T8_RemovedStaticTopicIsQuarantinedNotDelete
         node.stop();
         EXPECT_TRUE(fs::exists(quarantined / "0")) << "the quarantined copy stays until restored by hand";
     }
-    std::error_code ec; fs::remove_all(dir, ec);
 }
