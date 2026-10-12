@@ -138,6 +138,37 @@ TEST(SchemaConformance, DefineTopicEncodeGolden) {
         << "Encoded DefineTopic bytes differ from golden";
 }
 
+// Phase 2b E: the transient form is the disk golden + ONE trailing 0x01 byte.
+TEST(SchemaConformance, DefineTopicTransientGoldenIsDiskGoldenPlusOneByte) {
+    static constexpr uint8_t kBlob[] = {0xAA, 0xBB, 0xCC};
+    rpc::DefineTopic msg;
+    msg.sessionId      = kSessionId;
+    msg.correlationId  = kCorrelationId;
+    msg.topicName      = "schema_test";
+    msg.partitionCount = 4;
+    msg.keyField       = "id";
+    msg.validate       = true;
+    msg.descriptorBlob = kBlob;
+    msg.descriptorLen  = 3;
+    msg.persistence    = rpc::DefineTopic::kPersistenceTransient;
+
+    ASSERT_EQ(msg.encodedSize(), kDefineTopicGoldenSize + 1);
+    std::array<uint8_t, 64> enc{};
+    const std::size_t n = msg.encode(enc.data());
+    ASSERT_EQ(n, kDefineTopicGoldenSize + 1);
+    EXPECT_EQ(std::memcmp(enc.data(), kDefineTopicGolden, kDefineTopicGoldenSize), 0)
+        << "everything before the persistence byte is the unchanged disk golden";
+    EXPECT_EQ(enc[kDefineTopicGoldenSize], 0x01);
+
+    auto back = rpc::DefineTopic::decode(enc.data(), n);
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(back->persistence, 1u);
+    // The unchanged 53-byte golden still decodes, as disk.
+    auto old = rpc::DefineTopic::decode(kDefineTopicGolden, kDefineTopicGoldenSize);
+    ASSERT_TRUE(old.has_value());
+    EXPECT_EQ(old->persistence, 0u);
+}
+
 // Also verify checkFrame/peekTemplateId accept the golden bytes.
 TEST(SchemaConformance, DefineTopicFrameCheck) {
     const auto fc = rpc::checkFrame(kDefineTopicGolden, kDefineTopicGoldenSize);

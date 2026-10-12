@@ -10,7 +10,11 @@
 namespace rune::protocol::client {
 
 // DefineTopic (64): body = partitionCount:u32, validate:u8, then var fields
-//   topicName(varstr), keyField(varstr), descriptorBlob(varbytes32).
+//   topicName(varstr), keyField(varstr), descriptorBlob(varbytes32),
+//   [persistence:u8]  - Phase 2b E, OPTIONAL trailing byte: written only when
+//   non-zero (a disk frame is byte-identical to the pre-2b layout); absent on
+//   decode => disk (old clients).  Values are append-only: 0 = disk,
+//   1 = transient; anything else is rejected.
 struct DefineTopic {
     int64_t sessionId = 0, correlationId = 0;
     std::string_view topicName;
@@ -19,6 +23,10 @@ struct DefineTopic {
     bool validate = false;
     const uint8_t* descriptorBlob = nullptr;
     uint32_t descriptorLen = 0;
+    uint8_t persistence = 0;   // kPersistenceDisk | kPersistenceTransient
+
+    static constexpr uint8_t kPersistenceDisk      = 0;
+    static constexpr uint8_t kPersistenceTransient = 1;
 
     static constexpr uint16_t TEMPLATE_ID = static_cast<uint16_t>(TemplateId::DefineTopic);
     static constexpr uint16_t BODY_FIXED  = 5;  // u32 partitionCount + u8 validate
@@ -27,7 +35,8 @@ struct DefineTopic {
         return MessageHeader::ENCODED_SIZE + BODY_FIXED
              + 2u + topicName.size()
              + 2u + keyField.size()
-             + 4u + descriptorLen;
+             + 4u + descriptorLen
+             + (persistence != kPersistenceDisk ? 1u : 0u);
     }
     std::size_t encode(uint8_t* buf) const noexcept {
         MessageHeader hdr; hdr.blockLength = BODY_FIXED; hdr.templateId = TEMPLATE_ID;
@@ -39,6 +48,7 @@ struct DefineTopic {
         pos += putVarStr(buf + pos, topicName);
         pos += putVarStr(buf + pos, keyField);
         pos += putVarBytes32(buf + pos, descriptorBlob, descriptorLen);
+        if (persistence != kPersistenceDisk) buf[pos++] = persistence;
         return pos;
     }
     static std::optional<DefineTopic> decode(const uint8_t* buf, std::size_t avail) noexcept {
@@ -52,6 +62,11 @@ struct DefineTopic {
         if (!getVarStr(buf, avail, pos, m.topicName)) return std::nullopt;
         if (!getVarStr(buf, avail, pos, m.keyField)) return std::nullopt;
         if (!getVarBytes32(buf, avail, pos, m.descriptorBlob, m.descriptorLen)) return std::nullopt;
+        if (pos < avail) {
+            const uint8_t p = buf[pos++];
+            if (p > kPersistenceTransient) return std::nullopt;   // append-only: never cast
+            m.persistence = p;
+        }
         return m;
     }
 };

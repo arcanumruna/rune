@@ -197,3 +197,50 @@ TEST(SchemaMessagesRegression, TopicSchemaResponseWithoutTrailingPartitionCountD
     ASSERT_TRUE(cut.has_value());
     EXPECT_EQ(cut->partitionCount, 0);
 }
+
+// ── Phase 2b E: appended persistence byte ────────────────────────────────────
+TEST(SchemaMessagesRegression, DefineTopicPersistenceRoundTrips) {
+    std::vector<uint8_t> blob = {9, 8, 7};
+    DefineTopic in;
+    in.sessionId = 1; in.correlationId = 2;
+    in.topicName = "presence"; in.partitionCount = 4; in.keyField = "userId";
+    in.descriptorBlob = blob.data(); in.descriptorLen = 3;
+    in.persistence = DefineTopic::kPersistenceTransient;
+
+    std::vector<uint8_t> buf(in.encodedSize());
+    ASSERT_EQ(in.encode(buf.data()), buf.size());
+    auto out = DefineTopic::decode(buf.data(), buf.size());
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->persistence, DefineTopic::kPersistenceTransient);
+    EXPECT_EQ(out->topicName, "presence");
+    ASSERT_EQ(out->descriptorLen, 3u);
+}
+
+// Old clients send nothing after the blob: that is a DISK topic, and a disk frame
+// from a new client is byte-identical to an old one (no trailing byte written).
+TEST(SchemaMessagesRegression, DefineTopicWithoutPersistenceByteDecodesAsDisk) {
+    std::vector<uint8_t> blob = {1};
+    DefineTopic disk;
+    disk.topicName = "t"; disk.descriptorBlob = blob.data(); disk.descriptorLen = 1;
+    DefineTopic transientMsg = disk;
+    transientMsg.persistence = DefineTopic::kPersistenceTransient;
+    EXPECT_EQ(transientMsg.encodedSize(), disk.encodedSize() + 1)
+        << "the persistence byte is written only for a non-disk topic";
+
+    std::vector<uint8_t> buf(disk.encodedSize());
+    disk.encode(buf.data());
+    auto out = DefineTopic::decode(buf.data(), buf.size());
+    ASSERT_TRUE(out.has_value());
+    EXPECT_EQ(out->persistence, DefineTopic::kPersistenceDisk);
+}
+
+TEST(SchemaMessagesRegression, DefineTopicUnknownPersistenceValueIsRejected) {
+    std::vector<uint8_t> blob = {1};
+    DefineTopic in;
+    in.topicName = "t"; in.descriptorBlob = blob.data(); in.descriptorLen = 1;
+    in.persistence = DefineTopic::kPersistenceTransient;
+    std::vector<uint8_t> buf(in.encodedSize());
+    in.encode(buf.data());
+    buf.back() = 2;   // one past Transient: append-only enum, never cast
+    EXPECT_FALSE(DefineTopic::decode(buf.data(), buf.size()).has_value());
+}
