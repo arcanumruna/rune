@@ -148,6 +148,8 @@ enum class ErrorCode : uint16_t {
                                   // (Phase 2a: contributors are partitioned by wire key, which the
                                   // broker does not tie to the group-by field, so any aggregate over
                                   // a multi-partition source is rejected)
+    ViewSourceTransient    = 37,  // CreateView: a persisted view over a transient source topic
+                                  // (a view that reads a transient topic must itself be transient)
 };
 
 // ---------------------------------------------------------------------------
