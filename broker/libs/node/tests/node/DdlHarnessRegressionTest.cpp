@@ -14,6 +14,8 @@
 #include <cctype>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <type_traits>
 #include <variant>
@@ -763,7 +765,7 @@ TEST(DdlFixRegression, B3_CaseConflictCrossesTheReplyRing) {
                    aeron::util::index_t len) {
         const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
         const std::size_t n = static_cast<std::size_t>(len);
-        ASSERT_EQ(n, 19u) << "the B3 trailer is byte 18";
+        ASSERT_EQ(n, 20u) << "the B3 trailer is byte 18 (Task 14's sinkSpecMatches is byte 19)";
         const CreateTopicReplyMsg got = decodeCreateTopicReply(p, n);
         EXPECT_EQ(got.caseConflict, frames == 0);
         EXPECT_EQ(got.ticket, 5);
@@ -771,7 +773,9 @@ TEST(DdlFixRegression, B3_CaseConflictCrossesTheReplyRing) {
         EXPECT_EQ(got.partitionCount, 2);
         EXPECT_TRUE(got.existed);
         EXPECT_EQ(got.persistence, 0);
-        const CreateTopicReplyMsg old = decodeCreateTopicReply(p, n - 1);
+        EXPECT_EQ(decodeCreateTopicReply(p, n - 1).caseConflict, frames == 0)
+            << "a pre-Task-14 (19-byte) frame still carries the B3 trailer";
+        const CreateTopicReplyMsg old = decodeCreateTopicReply(p, n - 2);
         EXPECT_FALSE(old.caseConflict) << "a pre-B3 frame decodes as no conflict";
         EXPECT_EQ(old.persistence, 0) << "and keeps every earlier field";
         ++frames;
@@ -1506,5 +1510,230 @@ TEST(InFlightStateRegression, EveryUncommittedExitEndsIdle) {
     expectIdle(h, "alter demoted in AwaitingCommit");
     h.promote();
     expectIdle(h, "after re-promotion");
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+// ── OPTIONAL KL1 follow-up ────────────────────────────────────────────────────
+TEST(DdlFixRegression, Optional_CreateViewRetryAdoptsItsOwnOrphanSink) {
+    DdlHarness h;
+    h.setControl(ControlMode::Hold);
+    const int64_t a = h.submit(Op::ViewPersisted, "v");
+    ASSERT_TRUE(h.tickUntilCreatePending());
+    h.failCreate(/*afterCreate=*/true);
+    h.setControl(ControlMode::Auto);
+    h.settle();
+    ASSERT_EQ(h.response(a)->err, kInternal);
+    const int32_t sink = h.idOf("v");
+    const int64_t b = h.submit(Op::ViewPersisted, "v");
+    h.settle();
+    EXPECT_EQ(h.response(b)->err, kOk) << "the retry adopts the identical orphan sink";
+    EXPECT_EQ(h.response(b)->id, sink);
+    EXPECT_NE(h.views().byName("v"), nullptr);
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+TEST(DdlFixRegression, Optional_AViewNeverAdoptsAnOrphanDefineOrAStaticCompactTopic) {
+    DdlHarnessOptions o;
+    TopicSpec s; s.name = "stat_sink"; s.partitionCount = 1; s.cleanupPolicy = TopicSpec::CleanupPolicy::Compact;
+    s.partitionKey = "id";
+    o.statics.push_back(s);
+    DdlHarness h(o);
+    const int64_t st = h.submit(Op::ViewPersisted, "stat_sink");
+    h.settle();
+    EXPECT_EQ(h.response(st)->err, kTopicExists) << "a static topic is never a sink";
+    h.setControl(ControlMode::Hold);
+    const int64_t d = h.submit(Op::DefineDisk, "orph_def");
+    ASSERT_TRUE(h.tickUntilCreatePending());
+    h.failCreate(true);
+    h.setControl(ControlMode::Auto);
+    h.settle();
+    ASSERT_EQ(h.response(d)->err, kInternal);
+    const int64_t v = h.submit(Op::ViewPersisted, "orph_def");
+    h.settle();
+    EXPECT_EQ(h.response(v)->err, kTopicExists) << "a Delete-policy orphan is not a view sink";
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+namespace {
+/// A fresh temp dir removed on scope exit — even when an ASSERT returns early.
+struct OptionalTempDir {
+    fs::path path;
+    explicit OptionalTempDir(const char* tag)
+        : path(fs::temp_directory_path() / (std::string(tag) + std::to_string(::getpid()))) {
+        std::error_code ec; fs::remove_all(path, ec);
+        fs::create_directories(path);
+    }
+    ~OptionalTempDir() { std::error_code ec; fs::remove_all(path, ec); }
+    OptionalTempDir(const OptionalTempDir&) = delete;
+    OptionalTempDir& operator=(const OptionalTempDir&) = delete;
+};
+
+std::string optionalReadFile(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+CreateTopicReqMsg sinkReq(const std::string& name) {
+    CreateTopicReqMsg r;
+    r.ticket = 1; r.name = name; r.partitionCount = 2; r.keyField = "id";
+    r.cleanupPolicy = static_cast<uint8_t>(TopicSpec::CleanupPolicy::Compact); r.persistence = 0;
+    return r;
+}
+} // namespace
+
+// The control-thread half: sinkSpecMatches is set iff the name already names a
+// RUNTIME topic whose spec is exactly the requested sink's (Compact, key,
+// partitions, mode) — every other existing / created topic leaves it false.
+TEST(DdlFixRegression, Optional_SinkSpecMatchesOnlyForAnIdenticalRuntimeCompactTopic) {
+    OptionalTempDir dir("rune_ddl_sinkspec_");
+    TopicSpec stat; stat.name = "stat"; stat.partitionCount = 2; stat.partitionKey = "id";
+    stat.cleanupPolicy = TopicSpec::CleanupPolicy::Compact;
+    rune::gateway::TopicRegistry reg({stat}, dir.path.string());
+    constexpr int32_t kFirstRuntime = 1;
+
+    const CreateTopicReplyMsg fresh = createTopicForAdmin(reg, sinkReq("sink"), kFirstRuntime);
+    ASSERT_GE(fresh.topicId, kFirstRuntime);
+    EXPECT_FALSE(fresh.existed);
+    EXPECT_FALSE(fresh.sinkSpecMatches) << "a freshly created sink is not an existing one";
+
+    const CreateTopicReplyMsg again = createTopicForAdmin(reg, sinkReq("sink"), kFirstRuntime);
+    EXPECT_TRUE(again.existed);
+    EXPECT_EQ(again.topicId, fresh.topicId);
+    EXPECT_TRUE(again.sinkSpecMatches) << "an identical runtime Compact topic matches";
+    EXPECT_FALSE(createTopicForAdmin(reg, sinkReq("sink")).sinkSpecMatches)
+        << "the default firstRuntimeId never matches (existing callers keep today's behaviour)";
+
+    struct Mismatch { const char* what; CreateTopicReqMsg req; };
+    std::vector<Mismatch> ms;
+    { CreateTopicReqMsg r = sinkReq("sink"); r.keyField = "hp";       ms.push_back({"key", r}); }
+    { CreateTopicReqMsg r = sinkReq("sink"); r.keyField = "";         ms.push_back({"no key", r}); }
+    { CreateTopicReqMsg r = sinkReq("sink"); r.partitionCount = 3;    ms.push_back({"partitions", r}); }
+    { CreateTopicReqMsg r = sinkReq("sink"); r.persistence = 1;       ms.push_back({"mode", r}); }
+    { CreateTopicReqMsg r = sinkReq("sink"); r.cleanupPolicy = 0;     ms.push_back({"policy Delete", r}); }
+    { CreateTopicReqMsg r = sinkReq("sink"); r.cleanupPolicy = 2;     ms.push_back({"policy CompactDelete", r}); }
+    for (const Mismatch& m : ms) {
+        SCOPED_TRACE(m.what);
+        const CreateTopicReplyMsg r = createTopicForAdmin(reg, m.req, kFirstRuntime);
+        EXPECT_TRUE(r.existed);
+        EXPECT_FALSE(r.sinkSpecMatches);
+    }
+
+    const CreateTopicReplyMsg st = createTopicForAdmin(reg, sinkReq("stat"), kFirstRuntime);
+    EXPECT_TRUE(st.existed);
+    EXPECT_EQ(st.topicId, 0);
+    EXPECT_FALSE(st.sinkSpecMatches) << "a static topic never matches, even when spec-identical";
+
+    // A runtime Delete-policy topic (an orphan DefineTopic) never matches a sink.
+    CreateTopicReqMsg def = sinkReq("def"); def.cleanupPolicy = 0;
+    ASSERT_GE(createTopicForAdmin(reg, def, kFirstRuntime).topicId, kFirstRuntime);
+    EXPECT_FALSE(createTopicForAdmin(reg, def, kFirstRuntime).sinkSpecMatches)
+        << "only a Compact request can match";
+    EXPECT_FALSE(createTopicForAdmin(reg, sinkReq("def"), kFirstRuntime).sinkSpecMatches);
+
+    // A case variant is a conflict (B3), never a match.
+    const CreateTopicReplyMsg cv = createTopicForAdmin(reg, sinkReq("SINK"), kFirstRuntime);
+    EXPECT_TRUE(cv.caseConflict);
+    EXPECT_FALSE(cv.sinkSpecMatches);
+}
+
+TEST(DdlFixRegression, Optional_SinkSpecMatchesCrossesTheReplyRing) {
+    OneToOneByteRing ring{kCreateTopicRingBytes};
+    CreateTopicReplyMsg m;
+    m.ticket = 9; m.topicId = 4; m.partitionCount = 1; m.existed = true; m.persistence = 0;
+    m.sinkSpecMatches = true;
+    ASSERT_TRUE(encodeCreateTopicReply(ring, m));
+    CreateTopicReplyMsg plain = m;
+    plain.sinkSpecMatches = false;
+    ASSERT_TRUE(encodeCreateTopicReply(ring, plain));
+    int frames = 0;
+    ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                   aeron::util::index_t len) {
+        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+        const std::size_t n = static_cast<std::size_t>(len);
+        ASSERT_EQ(n, 20u) << "the sinkSpecMatches trailer is byte 19";
+        const CreateTopicReplyMsg got = decodeCreateTopicReply(p, n);
+        EXPECT_EQ(got.sinkSpecMatches, frames == 0);
+        EXPECT_FALSE(got.caseConflict);
+        EXPECT_EQ(got.ticket, 9);
+        EXPECT_EQ(got.topicId, 4);
+        EXPECT_TRUE(got.existed);
+        const CreateTopicReplyMsg old = decodeCreateTopicReply(p, n - 1);
+        EXPECT_FALSE(old.sinkSpecMatches) << "a pre-Task-14 frame decodes as no match";
+        EXPECT_EQ(old.topicId, 4) << "and keeps every earlier field";
+        ++frames;
+    }, 4);
+    EXPECT_EQ(frames, 2);
+
+    // An unknown mode byte fails the create: a stale match flag must not survive it.
+    uint8_t raw[20] = {};
+    raw[8] = 4;          // topicId 4
+    raw[16] = 1;         // existed
+    raw[17] = 7;         // unknown persistence
+    raw[19] = 1;         // sinkSpecMatches
+    const CreateTopicReplyMsg bad = decodeCreateTopicReply(raw, sizeof raw);
+    EXPECT_EQ(bad.topicId, -1);
+    EXPECT_FALSE(bad.sinkSpecMatches);
+}
+
+// The admin-thread guard: a spec-matching reply is adopted ONLY when no catalog
+// record claims the id — a TopicSchema (typed topic) or a ViewRecord never is.
+TEST(DdlFixRegression, Optional_AMatchingReplyForAClaimedTopicIsStillTopicExists) {
+    DdlHarness h;
+    const int64_t v1 = h.submit(Op::ViewPersisted, "v1");
+    h.settle();
+    ASSERT_EQ(h.response(v1)->err, kOk);
+    const int32_t srcId = h.idOf("src");
+    const int32_t v1Id  = h.idOf("v1");
+    const int topicsBefore = h.topicCount();
+    for (const int32_t claimed : {srcId, v1Id}) {
+        SCOPED_TRACE(claimed);
+        h.setControl(ControlMode::Hold);
+        const int64_t x = h.submit(Op::ViewPersisted, "x");
+        ASSERT_TRUE(h.tickUntilCreatePending());
+        h.deliverForgedReply(claimed, /*existed=*/true, /*sinkSpecMatches=*/true);
+        h.setControl(ControlMode::Auto);
+        h.settle();
+        ASSERT_TRUE(h.response(x).has_value());
+        EXPECT_EQ(h.response(x)->err, kTopicExists);
+        EXPECT_EQ(h.views().byName("x"), nullptr);
+    }
+    EXPECT_EQ(h.topicCount(), topicsBefore);
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+// The adopting commit promotes the sink's dir marker pending -> committed, and the
+// adopted view survives a restart exactly as created (never an __orphan placeholder).
+TEST(DdlFixRegression, Optional_AnAdoptedSinkIsCommittedAndSurvivesRestart) {
+    DdlHarness h;
+    h.setControl(ControlMode::Hold);
+    const int64_t a = h.submit(Op::ViewPersisted, "v");
+    ASSERT_TRUE(h.tickUntilCreatePending());
+    h.failCreate(/*afterCreate=*/true);
+    h.setControl(ControlMode::Auto);
+    h.settle();
+    ASSERT_EQ(h.response(a)->err, kInternal);
+    const int32_t sink = h.idOf("v");
+    ASSERT_GE(sink, 0);
+    const fs::path marker = h.root() / "topics" / "v" / rune::gateway::kTopicIdMarkerFile;
+    EXPECT_EQ(optionalReadFile(marker), "pending " + std::to_string(sink) + "\n")
+        << "the orphan sink's record never committed";
+    const int64_t b = h.submit(Op::ViewPersisted, "v");
+    h.settle();
+    ASSERT_EQ(h.response(b)->err, kOk);
+    EXPECT_EQ(optionalReadFile(marker), "committed " + std::to_string(sink) + "\n")
+        << "the adopting commit promotes the marker";
+    EXPECT_EQ(h.createRequests(), 2 + 2) << "src, src2, then one request per attempt";
+
+    const Catalog before = h.catalog();
+    ASSERT_NE(findEntry(before, "v"), nullptr);
+    EXPECT_EQ(findEntry(before, "v")->kind, EntryKind::View);
+    h.restart();
+    EXPECT_EQ(h.catalog(), h.expectedAfterRestart(before));
+    EXPECT_EQ(h.idOf("v"), sink);
+    ASSERT_NE(h.views().byName("v"), nullptr);
+    EXPECT_EQ(h.views().byName("v")->viewTopicId, sink);
+    const int64_t c = h.submit(Op::ViewPersisted, "v");
+    h.settle();
+    EXPECT_EQ(h.response(c)->err, kViewExists);
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }

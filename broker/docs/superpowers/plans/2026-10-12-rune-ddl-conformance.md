@@ -59,7 +59,7 @@ Each bug was found by reading the code on `feat/phase2b-e-transient-topics` (fou
 
 ## Known limitations pinned (NOT fixed by this plan; each cell is labelled `KnownLimitation`)
 
-- **KL1 (parked Part C ruling): orphan sink.** A CREATE VIEW that fails after its sink topic exists leaves the sink behind. A retry under the same view name gets `TopicExists (25)` until a restart; after a restart the name is free (B5 makes that true). Occupant row `OrphanSink_KnownLimitation`. The OPTIONAL Task 14 lets the retry adopt its own orphan sink.
+- **KL1 (parked Part C ruling): orphan sink.** A CREATE VIEW that fails after its sink topic exists leaves the sink behind. A retry under the same view name gets `TopicExists (25)` until a restart; after a restart the name is free (B5 makes that true). Occupant row `OrphanSink_KnownLimitation`. **Resolved by Task 14 (2026-10-13):** a CREATE VIEW retry adopts its own orphan sink (a runtime topic with exactly the sink's spec that no TopicSchema / ViewRecord claims), so the `ViewPersisted` / `ViewTransient` cells of this row are now 0.
 - **KL1b: DefineTopic adopts an orphan sink.** A disk `DefineTopic` over an orphan sink adopts it: a keyed, Compact topic becomes a plain typed topic. The broker cannot tell an orphan sink from a schema-less compact `RUNE_TOPICS` topic. Same row, column `DefineDisk`.
 - **KL2: in-doubt after an AwaitingCommit timeout.** The op is answered `Internal`, but its appended record can still commit and is replayed on restart. The live registry does not apply it before then. Pinned by `DdlFixRegression.KL2_TimeoutInAwaitingCommitIsInDoubtAndReplayedOnRestart` (Task 7).
 - **KL3: reads bypass the DDL queue (by design).** `GetTopicSchema` is answered at once from the committed registry. It never waits behind a queued or in-flight DDL op, so a read issued while a create is in flight answers `UnknownTopic`. The pair matrix pins this for timings T2–T4.
@@ -97,7 +97,7 @@ Each bug was found by reading the code on `feat/phase2b-e-transient-topics` (fou
 | **ViewTransient** | 25 | 25 | 32 | 32 | 38 | 38 | 38 | 38 | 38 | 38 | 38 | 0 |
 | **SchemaLessDisk** (static `RUNE_TOPICS`; orphan from a failed define) | 0 (adopt) | 25† | 25† | 25† | 7 | 7 | 7 | 7 | 7 | 7 | 7 | 7 |
 | **SchemaLessTransient** | 0 (adopt, records Transient) | 0 (adopt) | 25† | 25† | 7 | 7 | 7 | 7 | 7 | 7 | 7 | 7 |
-| **OrphanSink** — KnownLimitation KL1/KL1b | 0 (adopt, KL1b) | 25† | 25† (KL1) | 25† (KL1) | 7 | 7 | 7 | 7 | 7 | 7 | 7 | 7 |
+| **OrphanSink** — KL1 resolved by Task 14; KL1b | 0 (adopt, KL1b) | 25† | 0 (adopt, Task 14) | 0 (adopt, Task 14) | 7 | 7 | 7 | 7 | 7 | 7 | 7 | 7 |
 | **CaseVariant** (folds onto a different existing name) — B3 | 25† | 25† | 25† | 25† | 7 | 7 | 7 | 7 | 7 | 7 | 7 | 7 |
 | **BadName** (invalid or `__` reserved) — B1/B2 | 40 | 40 | 40 | 40 | 7 | 7 | 7 | 7 | 7 | 7 | 7 | 7 |
 
@@ -1434,7 +1434,7 @@ inline constexpr uint16_t kExpectedCode[kOccupantCount][kOpCount] = {
     /* ViewTransient       */ {25, 25, 32, 32, 38, 38, 38, 38, 38, 38, 38,  0},
     /* SchemaLessDisk      */ { 0, 25, 25, 25,  7,  7,  7,  7,  7,  7,  7,  7},
     /* SchemaLessTransient */ { 0,  0, 25, 25,  7,  7,  7,  7,  7,  7,  7,  7},
-    /* OrphanSink (KL1)    */ { 0, 25, 25, 25,  7,  7,  7,  7,  7,  7,  7,  7},
+    /* OrphanSink (KL1)    */ { 0, 25,  0,  0,  7,  7,  7,  7,  7,  7,  7,  7},   // Task 14: a view retry adopts its orphan sink
     /* CaseVariant (B3)    */ {25, 25, 25, 25,  7,  7,  7,  7,  7,  7,  7,  7},
     /* BadName (B1/B2)     */ {40, 40, 40, 40,  7,  7,  7,  7,  7,  7,  7,  7},
 };

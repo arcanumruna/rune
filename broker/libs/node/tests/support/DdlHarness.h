@@ -297,7 +297,7 @@ public:
     /// worker ignores the reply, but the topic IS created (an orphan).
     void deliverCreate() {
         const CreateTopicReqMsg req = popCreate_();
-        w_->onCreateTopicReply(createTopicForAdmin(*topics_, req));
+        w_->onCreateTopicReply(createTopicForAdmin(*topics_, req, firstRuntimeId_()));
         checkInvariant_("create reply");
     }
     /// Answer the oldest create request with a failure.  afterCreate=true runs the
@@ -305,11 +305,12 @@ public:
     void failCreate(bool afterCreate) {
         const CreateTopicReqMsg req = popCreate_();
         CreateTopicReplyMsg reply;
-        if (afterCreate) reply = createTopicForAdmin(*topics_, req);
+        if (afterCreate) reply = createTopicForAdmin(*topics_, req, firstRuntimeId_());
         reply.ticket  = req.ticket;
         reply.topicId = -1;
         reply.existed = false;
         reply.caseConflict = false;   // B3: a failed create is Internal, never TopicExists
+        reply.sinkSpecMatches = false;   // Task 14: nor an adoptable sink
         w_->onCreateTopicReply(reply);
         checkInvariant_("failed create reply");
     }
@@ -317,10 +318,22 @@ public:
     /// persistence byte replaced by `persistence` (malformed-reply cells).
     void deliverCreateWithPersistence(uint8_t persistence) {
         const CreateTopicReqMsg req = popCreate_();
-        CreateTopicReplyMsg reply = createTopicForAdmin(*topics_, req);
+        CreateTopicReplyMsg reply = createTopicForAdmin(*topics_, req, firstRuntimeId_());
         reply.persistence = persistence;
         w_->onCreateTopicReply(reply);
         checkInvariant_("malformed create reply");
+    }
+
+    /// Answer the oldest create request with a hand-built reply (nothing is created):
+    /// proves the admin thread's own guards, independent of the control thread.
+    void deliverForgedReply(int32_t topicId, bool existed, bool sinkSpecMatches) {
+        const CreateTopicReqMsg req = popCreate_();
+        CreateTopicReplyMsg reply;
+        reply.ticket = req.ticket; reply.topicId = topicId; reply.existed = existed;
+        reply.partitionCount = req.partitionCount; reply.persistence = req.persistence;
+        reply.sinkSpecMatches = sinkSpecMatches;
+        w_->onCreateTopicReply(reply);
+        checkInvariant_("forged create reply");
     }
 
     // ── commits / time / leadership / restart ───────────────────────────────
@@ -590,6 +603,10 @@ private:
         opByCorr_[corr] = op;
         return corr;
     }
+
+    /// The first runtime topic id: statics are ids 0..statics-1 (BrokerNode's
+    /// firstRuntimeTopicId_, the RUNE_TOPICS count before the recovery append).
+    [[nodiscard]] int32_t firstRuntimeId_() const noexcept { return static_cast<int32_t>(opt_.statics.size()); }
 
     CreateTopicReqMsg popCreate_() {
         CreateTopicReqMsg req = creates_.front();

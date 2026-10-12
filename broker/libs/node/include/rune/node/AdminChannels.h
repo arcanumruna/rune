@@ -207,6 +207,11 @@ struct CreateTopicReplyMsg {
     // existing topic `topicId` (existed = true): nothing was created and the admin
     // thread answers TopicExists.  Ring trailer byte 18; absent => false.
     bool    caseConflict   = false;
+    // OPTIONAL KL1 follow-up: the existing topic is a RUNTIME topic whose spec is
+    // exactly the requested view sink's (Compact, key, partitions, mode) — the admin
+    // thread may adopt it when no catalog record claims it (its own orphan sink).
+    // Ring trailer byte 19; absent => false.
+    bool    sinkSpecMatches = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -461,7 +466,7 @@ inline CreateTopicReqMsg decodeCreateTopicReq(const uint8_t* buf, std::size_t le
 // ---- CreateTopicReply ----
 inline bool encodeCreateTopicReply(OneToOneByteRing& ring, const CreateTopicReplyMsg& m) {
     using namespace admin_wire;
-    const std::size_t len = 8 + 4 + 4 + 1 + 1 + 1;
+    const std::size_t len = 8 + 4 + 4 + 1 + 1 + 1 + 1;
     const auto idx = ring.tryClaim(kMsgCreateTopicReply, len);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
@@ -470,7 +475,8 @@ inline bool encodeCreateTopicReply(OneToOneByteRing& ring, const CreateTopicRepl
     putI32(p, m.partitionCount); p += 4;
     *p++ = m.existed ? 1 : 0;
     *p++ = m.persistence;
-    *p   = m.caseConflict ? 1 : 0;   // DDL conformance B3 trailer
+    *p++ = m.caseConflict ? 1 : 0;      // DDL conformance B3 trailer
+    *p   = m.sinkSpecMatches ? 1 : 0;   // Task 14 (KL1 follow-up) trailer
     ring.commit(idx);
     return true;
 }
@@ -486,10 +492,12 @@ inline CreateTopicReplyMsg decodeCreateTopicReply(const uint8_t* buf, std::size_
     m.existed        = buf[16] != 0;
     if (len < 18) return m;   // pre-2b-E frame: persistence not reported
     if (len >= 19) m.caseConflict = buf[18] != 0;   // DDL conformance B3 trailer
+    if (len >= 20) m.sinkSpecMatches = buf[19] != 0;   // Task 14 (KL1 follow-up) trailer
     if (buf[17] == CreateTopicReplyMsg::kPersistenceNotReported) return m;
     if (buf[17] > 1) {        // unknown mode: never cast — fail the create
         m.topicId      = -1;
         m.caseConflict = false;   // a failed create is Internal, never TopicExists
+        m.sinkSpecMatches = false;   // nor an adoptable sink
         return m;
     }
     m.persistence = buf[17];

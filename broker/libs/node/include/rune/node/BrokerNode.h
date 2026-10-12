@@ -24,6 +24,7 @@
 #include <cassert>
 #include <rune/protocol/client/SchemaMessages.h>
 #include <cstdlib>
+#include <limits>
 #include <rune/gateway/SpillFifo.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/consensus/ControlRing.h>   // Task 9: tlsReloadRing_ (SIGHUP trigger)
@@ -1290,6 +1291,11 @@ private:
     // Task 8a: last leadership state posted to the admin role ring (control thread).
     bool                                                  adminLastLeader_ = false;
     int32_t                                               adminLastEpoch_  = -1;
+    // Task 14: the static RUNE_TOPICS count, set once on the startup thread before the
+    // recovery append (ids >= it are runtime topics); read by the control thread's
+    // create drain (createTopicForAdmin's firstRuntimeId).  Immutable after start.
+    // Defaults to "never matches" (fail-closed) until start() sets it.
+    int32_t                                               firstRuntimeTopicId_ = std::numeric_limits<int32_t>::max();
     std::unique_ptr<rune::consensus::BackoffIdleStrategy> adminWorkerIdleStrategy_;   // NodeConfig::adminIdleShape
     rune::consensus::MonotonicNanoClock                   adminWorkerClock_;
     std::unique_ptr<rune::consensus::AgentRunner>         adminWorkerRunner_;

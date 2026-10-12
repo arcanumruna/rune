@@ -382,8 +382,9 @@ void BrokerNode::start() {
     //     (refusing to boot) on a damaged catalog; an id gap (an orphan whose DDL
     //     never committed) becomes a hidden zero-partition __orphan.<id> (B5).
     {
+        firstRuntimeTopicId_ = static_cast<int32_t>(config_.topics.size());   // Task 14
         RecoveredRuntimeTopics recoveredTopics = recoverRuntimeTopics(
-            config_.dataDir, static_cast<int32_t>(config_.topics.size()));
+            config_.dataDir, firstRuntimeTopicId_);
         std::vector<TopicSpec>& recovered = recoveredTopics.specs;
         if (!recovered.empty()) {
             spdlog::info("BrokerNode[{}]: recovered {} runtime topic(s) from the admin "
@@ -3878,7 +3879,7 @@ int BrokerNode::serviceAdminControl_() {
                 // createTopicForAdmin (AdminCreateTopic.h): createTopic + the
                 // AUTHORITATIVE partition count + `existed` (final review I1 —
                 // an existing name returns that topic, never the requested spec).
-                reply = createTopicForAdmin(*topicRegistry_, req);
+                reply = createTopicForAdmin(*topicRegistry_, req, firstRuntimeTopicId_);
                 // Task 8b (SINGLE-NODE): make the runtime topic
                 // produce/consume-capable by creating its user
                 // PartitionReplica(s) NOW, on this same control
@@ -3900,7 +3901,10 @@ int BrokerNode::serviceAdminControl_() {
                         reply.topicId = -1;
                     }
                 }
-                if (inject) { reply.topicId = -1; reply.existed = false; reply.caseConflict = false; }
+                if (inject) {
+                    reply.topicId = -1; reply.existed = false; reply.caseConflict = false;
+                    reply.sinkSpecMatches = false;
+                }
             }
             // Reply ring is 1-deep in flight (one DDL at a time) → never full.
             (void)encodeCreateTopicReply(agent->replyRing(), reply);

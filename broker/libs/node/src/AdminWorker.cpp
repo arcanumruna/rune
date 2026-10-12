@@ -358,7 +358,15 @@ void AdminWorker::onCreateViewReply_(ViewAwaitingId& op, const CreateTopicReplyM
     // untyped boot topic): createTopic handed back THAT topic, not a fresh sink.
     // Adopting it would fold the view's output into an unrelated (or its own
     // source) topic — reject; nothing was created, so nothing to undo.
-    if (reply.existed) {
+    // Task 14 (KL1 follow-up): EXCEPT a retry's own orphan sink — a runtime topic
+    // with exactly this sink's spec (sinkSpecMatches, decided by the control thread)
+    // that no TopicSchema / ViewRecord claims.  It is adopted: the ViewRecord below
+    // claims it, and its commit promotes the dir marker (topicCommitted).
+    const bool adoptOrphanSink = reply.existed && reply.sinkSpecMatches &&
+                                 reg_.byId(reply.topicId) == nullptr &&
+                                 viewRegistry_ != nullptr &&
+                                 viewRegistry_->byViewTopicId(reply.topicId) == nullptr;
+    if (reply.existed && !adoptOrphanSink) {
         deps_.respondCreateView(op.view.session, op.view.corr, reply.topicId, 0, kTopicExists);
         inFlight_ = Idle{};
         return;

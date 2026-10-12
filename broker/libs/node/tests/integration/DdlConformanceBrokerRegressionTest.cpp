@@ -28,6 +28,8 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
@@ -266,7 +268,9 @@ TEST(DdlConformanceBrokerRegression, T5_FailedCreateLeavesAnOrphanAndTheBrokerSt
         EXPECT_EQ(w.view(sid, "orphan_v", "character"), kInternal);
         ASSERT_EQ(w.define(sid, "later"), kOk);   // a later recorded id: the orphan is a gap
         laterId = w.schema(sid, "later")->topicId;
-        EXPECT_EQ(w.view(sid, "orphan_v", "character"), kTopicExists) << "KL1: the orphan sink blocks the name";
+        // Task 14: no retry here — a retry would adopt the orphan sink (see
+        // T5_RetryAdoptsItsOwnOrphanSinkAndSurvivesRestart); this test keeps the orphan
+        // unclaimed across the restart to prove the placeholder + dir deletion.
         node.stop();
     }
     {
@@ -309,6 +313,61 @@ TEST(DdlConformanceBrokerRegression, T5_FailedCreateLeavesAnOrphanAndTheBrokerSt
 
         EXPECT_EQ(w.view(sid, "orphan_v", "character"), kOk) << "the orphan's name is free after restart";
         EXPECT_EQ(w.define(sid, "character"), kTopicExists);
+        node.stop();
+    }
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// Task 14 (KL1 follow-up): the same failed-after-create CREATE VIEW, then a retry
+// on the real broker — it adopts its own orphan sink (same id), the adopting commit
+// promotes the dir marker, and the view survives a restart (never a placeholder).
+TEST(DdlConformanceBrokerRegression, T5_RetryAdoptsItsOwnOrphanSinkAndSurvivesRestart) {
+    const fs::path dir = makeTempDataDir("t5adopt_");
+    const NodeConfig cfg = makeSingleNodeConfig(dir);
+    int32_t sinkId = -1;
+    {
+        BrokerNode node{cfg};
+        node.setAdminCreateFaultForTest("orphan_v", /*afterCreate=*/true);   // T5b: sink created, reply fails
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ShardTestClient client(dir / "client-aeron");
+        client.keepSessionsAlive(true);
+        Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+        const int64_t sid = client.connect(w.gw, w.stream);
+        ASSERT_TRUE(w.awaitDdlReady(sid));
+        ASSERT_EQ(w.define(sid, "character"), kOk);
+        EXPECT_EQ(w.view(sid, "orphan_v", "character"), kInternal);
+        EXPECT_TRUE(fs::exists(dir / "topics" / "orphan_v")) << "the failed create left its sink behind";
+        EXPECT_EQ(w.view(sid, "orphan_v", "character"), kOk) << "the retry adopts its own orphan sink";
+        const auto s = w.schema(sid, "orphan_v");
+        ASSERT_TRUE(s.has_value());
+        ASSERT_EQ(s->errorCode, kOk);
+        sinkId = s->topicId;
+        ASSERT_EQ(w.define(sid, "later"), kOk);
+        EXPECT_EQ(w.schema(sid, "later")->topicId, sinkId + 1) << "the adopted sink kept its id; no new topic";
+        EXPECT_EQ(w.view(sid, "orphan_v", "character"), kViewExists);
+        node.stop();
+    }
+    {
+        std::ifstream in(dir / "topics" / "orphan_v" / rune::gateway::kTopicIdMarkerFile, std::ios::binary);
+        const std::string marker((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        EXPECT_EQ(marker, "committed " + std::to_string(sinkId) + "\n") << "the adopting commit promoted the marker";
+    }
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ShardTestClient client(dir / "client-aeron2");
+        client.keepSessionsAlive(true);
+        Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+        const int64_t sid = client.connect(w.gw, w.stream);
+        ASSERT_TRUE(w.awaitDdlReady(sid));
+        EXPECT_TRUE(fs::exists(dir / "topics" / "orphan_v")) << "an adopted sink's dir is never reclaimed at boot";
+        const auto s = w.schema(sid, "orphan_v");
+        ASSERT_TRUE(s.has_value());
+        EXPECT_EQ(s->errorCode, kOk);
+        EXPECT_EQ(s->topicId, sinkId) << "the view keeps its sink id across the restart";
+        EXPECT_EQ(w.view(sid, "orphan_v", "character"), kViewExists);
         node.stop();
     }
     std::error_code ec; fs::remove_all(dir, ec);

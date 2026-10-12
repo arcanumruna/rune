@@ -93,7 +93,7 @@ inline constexpr uint16_t kExpectedCode[kOccupantCount][kOpCount] = {
     /* ViewTransient       */ {25, 25, 32, 32, 38, 38, 38, 38, 38, 38, 38,  0},
     /* SchemaLessDisk      */ { 0, 25, 25, 25,  7,  7,  7,  7,  7,  7,  7,  7},
     /* SchemaLessTransient */ { 0,  0, 25, 25,  7,  7,  7,  7,  7,  7,  7,  7},
-    /* OrphanSink (KL1)    */ { 0, 25, 25, 25,  7,  7,  7,  7,  7,  7,  7,  7},
+    /* OrphanSink (KL1)    */ { 0, 25,  0,  0,  7,  7,  7,  7,  7,  7,  7,  7},
     /* CaseVariant (B3)    */ {25, 25, 25, 25,  7,  7,  7,  7,  7,  7,  7,  7},
     /* BadName (B1/B2)     */ {40, 40, 40, 40,  7,  7,  7,  7,  7,  7,  7,  7},
 };

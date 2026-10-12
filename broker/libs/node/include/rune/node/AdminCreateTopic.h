@@ -12,7 +12,11 @@
 // requested spec.  The reply therefore reports the authoritative partition count
 // (read back from the registry's spec) and whether the topic already existed, so
 // the admin thread never records the client's requested count for a topic that
-// really has a different one, and never adopts an existing topic as a view sink.
+// really has a different one, and never adopts an existing topic as a view sink —
+// except (Task 14) a RUNTIME topic whose spec is exactly the requested sink's
+// (sinkSpecMatches), which the admin thread adopts only when no catalog record
+// claims it.  `firstRuntimeId` is the static (RUNE_TOPICS) topic count; the default
+// never matches.
 // ---------------------------------------------------------------------------
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/AdminChannels.h>
@@ -22,12 +26,14 @@
 #include <spdlog/spdlog.h>
 
 #include <exception>
+#include <limits>
 #include <optional>
 
 namespace rune::node {
 
 inline CreateTopicReplyMsg
-createTopicForAdmin(rune::gateway::TopicRegistry& reg, const CreateTopicReqMsg& req) {
+createTopicForAdmin(rune::gateway::TopicRegistry& reg, const CreateTopicReqMsg& req,
+                    int32_t firstRuntimeId = std::numeric_limits<int32_t>::max()) {
     CreateTopicReplyMsg reply;
     reply.ticket  = req.ticket;
     reply.existed = reg.topicIdForName(req.name).has_value();
@@ -108,6 +114,20 @@ createTopicForAdmin(rune::gateway::TopicRegistry& reg, const CreateTopicReqMsg& 
             // requested spec) — report the real one so the schema record never
             // contradicts the log backend the topic actually runs on.
             reply.persistence    = persistenceToWire(auth->persistence);
+        }
+        // Task 14 (KL1 follow-up): an EXISTING runtime topic whose spec is exactly the
+        // requested view sink's — the admin thread may adopt it as the sink when no
+        // catalog record claims it (a failed CREATE VIEW's own orphan sink).  A static
+        // (RUNE_TOPICS) topic — id < firstRuntimeId — never matches.
+        if (reply.existed && reply.topicId >= firstRuntimeId) {
+            if (const TopicSpec* s = reg.topic(reply.topicId)) {
+                reply.sinkSpecMatches =
+                    req.cleanupPolicy == static_cast<uint8_t>(TopicSpec::CleanupPolicy::Compact) &&
+                    static_cast<uint8_t>(s->cleanupPolicy) == req.cleanupPolicy &&
+                    s->partitionKey == req.keyField &&
+                    s->partitionCount == req.partitionCount &&
+                    persistenceToWire(s->persistence) == req.persistence;
+            }
         }
     }
     return reply;
