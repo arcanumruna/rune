@@ -227,8 +227,13 @@ void SchemaRegistry::applyRecord(const TopicSchema& ts) {
     // DefineTopic's TopicExists check, AlterTopic) passes the name the client
     // defined the topic under, which is independent of the descriptor's name
     // (Phase 2b C regression: "typed_route" with the "characters" descriptor
-    // answered UnknownTopic).  A pre-name-trailer record has no topic name; the
-    // descriptor name is the only name it can be found under.
+    // answered UnknownTopic).  The descriptor name is only the FALLBACK for a
+    // record applied with an empty topicName: a pre-name-trailer durable record
+    // (where it is the only name the topic can be found under), or any in-memory
+    // caller that leaves it unset.  It is NOT legacy-only by construction — every
+    // in-tree caller must set topicName (DefineTopic commit + replay, ALTER's
+    // carry-forward, CREATE VIEW's commitCreateView_ and view recovery all do),
+    // or the entry lands under its descriptor name and can shadow a real topic.
     const std::string& indexName = e.topicName.empty() ? e.descriptor.name : e.topicName;
     nameToId_[indexName] = ts.topicId;
 

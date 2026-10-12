@@ -26,6 +26,8 @@
 
 #include <rune/node/AdminWorker.h>
 #include <rune/node/AdminChannels.h>
+#include <rune/node/AdminCreateTopic.h>
+#include <rune/gateway/TopicRegistry.h>
 #include <rune/node/SchemaRegistry.h>
 #include <rune/node/ViewRegistry.h>
 #include <rune/node/WorkerViewSet.h>
@@ -136,13 +138,21 @@ protected:
             singleNodeCfg(kViewsTopicId), Role::Leader, /*epoch=*/1,
             std::vector<NodeId>{1}, std::vector<NodeId>{1}, &viewsLog_, viewsTransport_.get());
 
+        buildAdmin_();
+    }
+
+    // Build the admin side (registries + AdminWorker) over the CURRENT replicas
+    // and promote it — on a restart (restartAdmin_) the promotion edge replays
+    // __topic_schemas + __views exactly as a broker boot does.
+    void buildAdmin_() {
         schemaRegistry_ = std::make_unique<SchemaRegistry>();
         viewRegistry_   = std::make_unique<ViewRegistry>();
 
         AdminDeps deps;
-        deps.requestCreateTopic = [this](int64_t ticket, int32_t, const std::string&,
+        deps.requestCreateTopic = [this](int64_t ticket, int32_t parts, const std::string& name,
                                          const std::string& keyField, uint8_t cleanupPolicy) -> bool {
             pendingTicket_ = ticket;
+            pendingReq_ = CreateTopicReqMsg{ticket, parts, name, keyField, cleanupPolicy};
             lastSinkKeyField_      = keyField;       // capture: a view sink is keyed...
             lastSinkCleanupPolicy_ = cleanupPolicy;  // ...and Compact.
             return true;
@@ -173,6 +183,27 @@ protected:
         adminWorker_->onRole(AdminRoleMsg{/*leader=*/true, /*epoch=*/1, /*leaderId=*/1});
     }
 
+    // Simulated broker restart: fresh replicas (Follower, as at boot) over the
+    // SAME durable logs, fresh registries, fresh AdminWorker, promoted to leader
+    // (rebuildFromLog_ + recoverViewsOnPromotion_ run on that edge).
+    void restartAdmin_() {
+        adminWorker_.reset();
+        schemaReplica_ = std::make_unique<PartitionReplica>(
+            singleNodeCfg(kSchemaTopicId), Role::Follower, /*epoch=*/0,
+            std::vector<NodeId>{1}, std::vector<NodeId>{1}, &schemaLog_, schemaTransport_.get());
+        viewsReplica_ = std::make_unique<PartitionReplica>(
+            singleNodeCfg(kViewsTopicId), Role::Follower, /*epoch=*/0,
+            std::vector<NodeId>{1}, std::vector<NodeId>{1}, &viewsLog_, viewsTransport_.get());
+        buildAdmin_();
+    }
+
+    // Final review I1: answer create-topic requests like BrokerNode's control
+    // thread (createTopicForAdmin over a REAL TopicRegistry — idempotent by
+    // name, authoritative count, `existed`) instead of a fresh fake id.
+    void useRealTopicRegistry_(const std::vector<rune::node::TopicSpec>& bootTopics) {
+        topicReg_ = std::make_unique<rune::gateway::TopicRegistry>(bootTopics, topicsDir_.path);
+    }
+
     void driveDefine(const DefineTopicMsg& msg) {
         adminWorker_->submitDefineTopic(msg);
         pump_();
@@ -191,8 +222,13 @@ protected:
             adminWorker_->doWork(nowNs);
             if (pendingTicket_ >= 0) {
                 CreateTopicReplyMsg reply;
-                reply.ticket  = pendingTicket_;
-                reply.topicId = nextTopicId_++;
+                if (topicReg_) {
+                    reply = createTopicForAdmin(*topicReg_, pendingReq_);
+                } else {
+                    reply.ticket         = pendingTicket_;
+                    reply.topicId        = nextTopicId_++;
+                    reply.partitionCount = pendingReq_.partitionCount;
+                }
                 pendingTicket_ = -1;
                 adminWorker_->onCreateTopicReply(reply);
             }
@@ -207,6 +243,9 @@ protected:
     }
 
     TmpDir schemaDir_, viewsDir_;
+    TmpDir topicsDir_{"topics"};
+    std::unique_ptr<rune::gateway::TopicRegistry> topicReg_;   // null = fake control ids
+    CreateTopicReqMsg pendingReq_;
     rune::storage::Log schemaLog_, viewsLog_;
     ViewSnapshotChannel installChannel_;        // the worker's own channel (install ring used here)
     WorkerViewSet       viewSet_;               // a real per-worker view set
@@ -352,4 +391,104 @@ TEST_F(CreateViewRegression, AggregateOverSinglePartitionSourceIsAllowed) {
     cv.planBlob = totalsPlanBlob(lastDefineTopicId_, "userId");
     driveCreateView(cv);
     EXPECT_EQ(lastViewError_, static_cast<uint16_t>(pc::ErrorCode::OK));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b C final review — a view named like an existing topic.
+//
+// startCreateView_ only checked the VIEW registry, and the control thread's
+// createTopic is idempotent by name: `CREATE VIEW character ... FROM character`
+// got the SOURCE topic's id back as its "sink" — the view folded its own output
+// into its source (feedback loop) and re-registered the source's schema.  Both
+// a typed existing topic (schema registry hit, checked up front) and an untyped
+// one (only the control thread knows it — the reply's `existed` flag) must be
+// rejected with TopicExists, leaving the topic and its schema untouched.
+// ---------------------------------------------------------------------------
+TEST_F(CreateViewRegression, ViewNamedLikeExistingTypedTopicIsRejectedRegression) {
+    useRealTopicRegistry_({});
+    driveDefine(defineCharacter());
+    ASSERT_EQ(lastDefineError_, 0u);
+    const int32_t srcTopicId = lastDefineTopicId_;
+    const RegistryEntry* before = schemaRegistry_->byName("character");
+    ASSERT_NE(before, nullptr);
+    const uint64_t srcFp = before->fingerprint;
+
+    CreateViewMsg cv;
+    cv.session = 1; cv.corr = 60; cv.persistence = 0;
+    cv.viewName = "character"; cv.keyField = "id"; cv.planBlob = charHpPlanBlob(srcTopicId);
+    driveCreateView(cv);
+
+    EXPECT_EQ(lastViewError_, static_cast<uint16_t>(pc::ErrorCode::TopicExists));
+    EXPECT_EQ(viewRegistry_->byName("character"), nullptr) << "no view may be persisted";
+    EXPECT_EQ(viewSet_.drainInstalls(), 0) << "no view plan may be installed";
+    const RegistryEntry* after = schemaRegistry_->byName("character");
+    ASSERT_NE(after, nullptr);
+    EXPECT_EQ(after->topicId, srcTopicId);
+    EXPECT_EQ(after->fingerprint, srcFp) << "the source topic's schema is untouched";
+}
+
+TEST_F(CreateViewRegression, ViewNamedLikeExistingUntypedTopicIsRejectedRegression) {
+    rune::node::TopicSpec boot; boot.name = "raw_events"; boot.partitionCount = 1; boot.topicId = 0;
+    useRealTopicRegistry_({boot});   // a RUNE_TOPICS boot topic: no schema
+    driveDefine(defineCharacter());
+    ASSERT_EQ(lastDefineError_, 0u);
+    const int32_t srcTopicId = lastDefineTopicId_;
+
+    CreateViewMsg cv;
+    cv.session = 1; cv.corr = 61; cv.persistence = 0;
+    cv.viewName = "raw_events"; cv.keyField = "id"; cv.planBlob = charHpPlanBlob(srcTopicId);
+    driveCreateView(cv);
+
+    EXPECT_EQ(lastViewError_, static_cast<uint16_t>(pc::ErrorCode::TopicExists));
+    EXPECT_EQ(viewRegistry_->byName("raw_events"), nullptr) << "no view may be persisted";
+    EXPECT_EQ(viewSet_.drainInstalls(), 0) << "no view plan may be installed";
+    EXPECT_EQ(schemaRegistry_->byName("raw_events"), nullptr)
+        << "the existing topic must not acquire the view's output schema";
+    EXPECT_EQ(topicReg_->topic(0)->cleanupPolicy, rune::node::TopicSpec::CleanupPolicy::Delete)
+        << "the existing topic is not turned into a view sink";
+}
+
+// ---------------------------------------------------------------------------
+// The view's typed output topic resolves by the VIEW name — before and after a
+// restart — not by its output descriptor's name (the authored plan name).  The
+// view TopicSchema used to carry an empty topicName, so it was indexed under
+// the descriptor name (here "char_hp", which names nothing the client created)
+// and GetTopicSchema("hp_by_char") answered UnknownTopic.  The restart leg also
+// covers final review I2 through the AdminWorker rebuildFromLog_ path: the
+// source topic "chars_src" (descriptor "character") resolves by its own name.
+// ---------------------------------------------------------------------------
+TEST_F(CreateViewRegression, ViewSinkResolvesByViewNameAcrossRestartRegression) {
+    DefineTopicMsg d = defineCharacter();
+    d.name = "chars_src";                     // descriptor is named "character"
+    driveDefine(d);
+    ASSERT_EQ(lastDefineError_, 0u);
+    const int32_t srcTopicId = lastDefineTopicId_;
+
+    CreateViewMsg cv;
+    cv.session = 1; cv.corr = 62; cv.persistence = 0;
+    cv.viewName = "hp_by_char";               // plan (output descriptor) is named "char_hp"
+    cv.keyField = "id"; cv.planBlob = charHpPlanBlob(srcTopicId);
+    driveCreateView(cv);
+    ASSERT_EQ(lastViewError_, static_cast<uint16_t>(pc::ErrorCode::OK));
+    const int32_t viewTopicId = lastViewTopicId_;
+
+    auto check = [&](const char* when) {
+        const RegistryEntry* v = schemaRegistry_->byName("hp_by_char");
+        ASSERT_NE(v, nullptr) << when << ": the view resolves by its view name";
+        EXPECT_EQ(v->topicId, viewTopicId) << when;
+        EXPECT_EQ(v->topicName, "hp_by_char") << when;
+        EXPECT_EQ(schemaRegistry_->byName("char_hp"), nullptr)
+            << when << ": the output descriptor name is not a topic name";
+        const RegistryEntry* s = schemaRegistry_->byName("chars_src");
+        ASSERT_NE(s, nullptr) << when << ": the source resolves by its defined name";
+        EXPECT_EQ(s->topicId, srcTopicId) << when;
+        EXPECT_EQ(schemaRegistry_->byName("character"), nullptr)
+            << when << ": the source descriptor name is not a topic name";
+    };
+    check("before restart");
+
+    restartAdmin_();
+    ASSERT_FALSE(adminWorker_->rebuildFailed());
+    ASSERT_NE(viewRegistry_->byName("hp_by_char"), nullptr) << "the view catalog recovered";
+    check("after restart");
 }
