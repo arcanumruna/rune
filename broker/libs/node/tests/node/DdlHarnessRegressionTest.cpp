@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include "support/DdlHarness.h"
 
+#include <rune/codec/AlterOps.h>
 #include <rune/node/TopicName.h>
 
 #include <spdlog/sinks/ringbuffer_sink.h>
@@ -1142,3 +1143,70 @@ INSTANTIATE_TEST_SUITE_P(EveryAsyncState, DdlDemotionRegression,
                                            B4State::DefineAwaitingCommit, B4State::ViewAwaitingCommit,
                                            B4State::AlterAwaitingCommit),
                          [](const ::testing::TestParamInfo<B4State>& i) { return std::string(b4StateName(i.param)); });
+
+// ── B8 / user decision D3a: renaming the key field moves TopicSchema.keyField ────
+TEST(DdlFixRegression, B8_RenamingTheKeyFieldMovesKeyFieldAndSurvivesRestart) {
+    DdlHarness h;
+    ASSERT_EQ(h.schemas().byName("src")->keyField, "id");
+    const int64_t a = h.submit(Op::AlterRenameKey, "src");   // RENAME id -> pk
+    h.settle();
+    ASSERT_EQ(h.response(a)->err, kOk);
+    EXPECT_EQ(h.schemas().byName("src")->keyField, "pk") << "live";
+    EXPECT_EQ(h.schemas().byName("src")->version, 2u);
+    h.restart();
+    EXPECT_EQ(h.schemas().byName("src")->keyField, "pk") << "replayed from the durable record";
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+TEST(DdlFixRegression, B8_ChainedRenamesEndAtTheLastName) {
+    DdlHarness h;
+    rune::codec::AlterOp r1{}; r1.type = rune::codec::AlterOpType::Rename; r1.name = "id"; r1.newName = "a";
+    rune::codec::AlterOp r2{}; r2.type = rune::codec::AlterOpType::Rename; r2.name = "a";  r2.newName = "b";
+    AlterTopicMsg m; m.topicName = "src"; m.opsBlob = rune::codec::encodeAlterOps({r1, r2});
+    const int64_t c = h.submitRawAlter(std::move(m));
+    h.settle();
+    ASSERT_EQ(h.response(c)->err, kOk);
+    EXPECT_EQ(h.schemas().byName("src")->keyField, "b");
+    h.restart();
+    EXPECT_EQ(h.schemas().byName("src")->keyField, "b") << "replayed from the durable record";
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+TEST(DdlFixRegression, B8_RenamingANonKeyFieldKeepsKeyField) {
+    DdlHarness h;
+    const int64_t c = h.submit(Op::AlterRename, "src");   // RENAME hp -> health
+    h.settle();
+    ASSERT_EQ(h.response(c)->err, kOk);
+    EXPECT_EQ(h.schemas().byName("src")->keyField, "id");
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+TEST(DdlFixRegression, B8_ARejectedAlterNeverMovesKeyField) {
+    DdlHarness h;
+    rune::codec::AlterOp r{}; r.type = rune::codec::AlterOpType::Rename; r.name = "id"; r.newName = "pk";
+    rune::codec::AlterOp d{}; d.type = rune::codec::AlterOpType::Drop; d.name = "nosuch";
+    AlterTopicMsg m; m.topicName = "src"; m.opsBlob = rune::codec::encodeAlterOps({r, d});
+    const int64_t c = h.submitRawAlter(std::move(m));
+    h.settle();
+    EXPECT_EQ(h.response(c)->err, kInvalidSchema) << "applyOps is atomic";
+    EXPECT_EQ(h.schemas().byName("src")->keyField, "id");
+    EXPECT_EQ(h.schemas().byName("src")->version, 1u);
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+TEST(DdlFixRegression, B8_RenamingTheKeyBackRestoresIt) {
+    DdlHarness h;
+    const int64_t a = h.submit(Op::AlterRenameKey, "src");   // id -> pk
+    h.settle();
+    rune::codec::AlterOp r{}; r.type = rune::codec::AlterOpType::Rename; r.name = "pk"; r.newName = "id";
+    AlterTopicMsg m; m.topicName = "src"; m.opsBlob = rune::codec::encodeAlterOps({r});
+    const int64_t b = h.submitRawAlter(std::move(m));
+    h.settle();
+    ASSERT_EQ(h.response(a)->err, kOk);
+    ASSERT_EQ(h.response(b)->err, kOk);
+    EXPECT_EQ(h.schemas().byName("src")->keyField, "id");
+    EXPECT_EQ(h.schemas().byName("src")->version, 3u);
+    h.restart();
+    EXPECT_EQ(h.schemas().byName("src")->keyField, "id");
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}

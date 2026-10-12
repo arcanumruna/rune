@@ -746,13 +746,23 @@ void AdminWorker::startAlter_(AlterTopicMsg msg, int64_t nowNs) {
         return;
     }
 
-    // g. build the new durable TopicSchema (same id/partitions/validate/keyField;
+    // DDL conformance B8 / D3a: a RENAME of the key field moves keyField with it.
+    // Ops apply in order, so a chain (id -> a, a -> b) ends at b.  Only reached when
+    // applyOps succeeded (a rejected ALTER changes nothing).
+    std::string keyField = latest->keyField;
+    for (const auto& op : *ops) {
+        if (op.type == rune::codec::AlterOpType::Rename && !keyField.empty() && op.name == keyField)
+            keyField = op.newName;
+    }
+
+    // g. build the new durable TopicSchema (same id/partitions/validate; keyField
+    //    follows a key-field RENAME (B8);
     //    NEW evolving descriptor + post-applyOps nextTag + effective compatMode).
     TopicSchema ts;
     ts.topicId        = topicId;
     ts.version        = newVersion;
     ts.partitionCount = latest->partitionCount;
-    ts.keyField       = latest->keyField;
+    ts.keyField       = keyField;                          // follows a key-field RENAME (B8)
     ts.validate       = latest->validator.has_value();   // same as current
     ts.descriptorBlob = rune::codec::serialize(*res);     // the NEW evolving descriptor
     ts.nextTag        = nextTag;                           // advanced by applyOps
