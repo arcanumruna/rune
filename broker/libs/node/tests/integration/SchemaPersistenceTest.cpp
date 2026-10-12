@@ -530,7 +530,7 @@ TEST_F(SchemaPersistenceTest, Regression_RULING1_TopicIdIsReturnedByCreateTopic)
 
     EXPECT_EQ(returnedId, 42)
         << "RULING-1 regression: topicId must be the value the control thread REPLIED (42)";
-    const RegistryEntry* e = reg2.byName("characters");  // blob encodes "characters"
+    const RegistryEntry* e = reg2.byName("items");  // the TOPIC name (blob encodes "characters")
     ASSERT_NE(e, nullptr);
     EXPECT_EQ(e->topicId, 42)
         << "Registry entry topicId must match the replied create-topic id (42)";

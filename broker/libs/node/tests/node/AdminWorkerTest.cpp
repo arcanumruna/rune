@@ -417,3 +417,57 @@ TEST(AdminWorkerRegression, GetSchemaUnknownTopicReportsZeroPartitions) {
     EXPECT_EQ(h.lastErr,7);                         // UnknownTopic
     EXPECT_EQ(h.lastGetPartitionCount, 0);
 }
+
+// Regression (Phase 2b C real-broker e2e): a topic's name is independent of its
+// descriptor's name.  DefineTopic("typed_route", <"characters" descriptor>) then
+// GetTopicSchema("typed_route") returned UnknownTopic (7) because the registry
+// indexed the descriptor name — the e2e's typed_route leg failed with exit 41.
+TEST(AdminWorkerRegression, GetSchemaByTopicNameWhenItDiffersFromDescriptorName) {
+    Harness h;
+    h.runDefine(1,2,"typed_route","userId",8,false,charsBlob());
+    ASSERT_EQ(h.lastErr,0);
+    h.lastErr = 0xffff;
+    h.lastGetPartitionCount = -1;
+    h.w->submitGetSchema(GetSchemaMsg{1,3,"typed_route"});
+    EXPECT_EQ(h.lastErr,0) << "GetTopicSchema must resolve the DEFINED topic name";
+    EXPECT_EQ(h.lastGetPartitionCount, 8);
+
+    h.lastErr = 0xffff;
+    h.w->submitGetSchema(GetSchemaMsg{1,4,"characters"});
+    EXPECT_EQ(h.lastErr,7) << "the descriptor name was never defined as a topic";
+}
+
+// Regression: two topics may share one descriptor; the second define is not a
+// TopicExists, and each name resolves to its own topic.  Re-defining an
+// existing topic NAME still reports TopicExists (25).
+TEST(AdminWorkerRegression, TwoTopicsSharingADescriptorAreDistinctTopics) {
+    Harness h;
+    h.runDefine(1,2,"chars_a","userId",1,false,charsBlob());
+    ASSERT_EQ(h.lastErr,0);
+    const int32_t idA = h.lastTopicId;
+    h.runDefine(1,3,"chars_b","userId",4,false,charsBlob());
+    ASSERT_EQ(h.lastErr,0) << "a second topic with the same descriptor is not TopicExists";
+    const int32_t idB = h.lastTopicId;
+    EXPECT_NE(idA, idB);
+    ASSERT_NE(h.reg.byName("chars_a"), nullptr);
+    ASSERT_NE(h.reg.byName("chars_b"), nullptr);
+    EXPECT_EQ(h.reg.byName("chars_a")->topicId, idA);
+    EXPECT_EQ(h.reg.byName("chars_b")->topicId, idB);
+    EXPECT_EQ(h.reg.byName("chars_b")->partitionCount, 4);
+
+    h.runDefine(1,4,"chars_a","userId",1,false,charsBlob());
+    EXPECT_EQ(h.lastErr,25) << "re-defining an existing topic name is TopicExists";
+}
+
+// Regression: ALTER resolves the topic by its defined name too.
+TEST(AdminWorkerRegression, AlterByTopicNameWhenItDiffersFromDescriptorName) {
+    Harness h;
+    h.runDefine(1,2,"typed_route","userId",8,false,charsBlob());
+    ASSERT_EQ(h.lastErr,0);
+    h.runAlter(10,11,"typed_route",/*expected=*/0, opsBlob({addOp("score",PrimType::Int64)}));
+    EXPECT_EQ(h.lastAlterErr, 0);
+    EXPECT_EQ(h.lastAlterVersion, 2);
+    ASSERT_NE(h.reg.byName("typed_route"), nullptr);
+    EXPECT_EQ(h.reg.byName("typed_route")->version, 2);
+    EXPECT_EQ(h.reg.byName("typed_route")->partitionCount, 8);
+}

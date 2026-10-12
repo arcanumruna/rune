@@ -382,3 +382,45 @@ TEST(SchemaRegistryRegression, ApplyRecordCarriesTopicNameToEntry) {
     ASSERT_NE(reg.byId(0x40000013), nullptr);
     EXPECT_EQ(reg.byId(0x40000013)->topicName, "the_topic");
 }
+
+// ---------------------------------------------------------------------------
+// REGRESSION (Phase 2b C real-broker e2e): byName() is looked up with the TOPIC
+// name (GetTopicSchema, DefineTopic's TopicExists check, AlterTopic), but the
+// registry indexed the DESCRIPTOR name.  A topic defined as "typed_route" with
+// the "characters" descriptor answered GetTopicSchema("typed_route") with
+// UnknownTopic, and two topics sharing one descriptor collided on one name.
+// The index key is the durable topic name; a legacy record without one falls
+// back to the descriptor name (which is what the client named it pre-trailer).
+// ---------------------------------------------------------------------------
+TEST(SchemaRegistryRegression, ByNameResolvesTheTopicNameNotTheDescriptorName) {
+    SchemaRegistry reg;
+    TopicSchema ts = makeSchema(0x40000020, "characters", false);
+    ts.topicName = "typed_route";
+    reg.applyRecord(ts);
+    const RegistryEntry* e = reg.byName("typed_route");
+    ASSERT_NE(e, nullptr) << "the topic must resolve by the name it was defined under";
+    EXPECT_EQ(e->topicId, 0x40000020);
+    EXPECT_EQ(reg.byName("characters"), nullptr)
+        << "the descriptor name is not a topic name";
+}
+
+TEST(SchemaRegistryRegression, TwoTopicsSharingADescriptorStayDistinct) {
+    SchemaRegistry reg;
+    TopicSchema a = makeSchema(0x40000021, "characters", false);
+    a.topicName = "chars_a";
+    TopicSchema b = makeSchema(0x40000022, "characters", false);
+    b.topicName = "chars_b";
+    reg.applyRecord(a);
+    reg.applyRecord(b);
+    ASSERT_NE(reg.byName("chars_a"), nullptr);
+    ASSERT_NE(reg.byName("chars_b"), nullptr);
+    EXPECT_EQ(reg.byName("chars_a")->topicId, 0x40000021);
+    EXPECT_EQ(reg.byName("chars_b")->topicId, 0x40000022);
+}
+
+TEST(SchemaRegistryRegression, PreNameRecordResolvesByDescriptorName) {
+    SchemaRegistry reg;
+    reg.applyRecord(makeSchema(0x40000023, "legacy_chars", false));   // empty topicName
+    ASSERT_NE(reg.byName("legacy_chars"), nullptr);
+    EXPECT_EQ(reg.byName("legacy_chars")->topicId, 0x40000023);
+}

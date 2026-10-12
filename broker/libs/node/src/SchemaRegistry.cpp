@@ -223,8 +223,14 @@ void SchemaRegistry::applyRecord(const TopicSchema& ts) {
     e.compatMode     = ts.compatMode;
     e.topicName      = ts.topicName;
 
-    const std::string& schemaName = e.descriptor.name;
-    nameToId_[schemaName] = ts.topicId;
+    // Index by the TOPIC name — every byName() caller (GetTopicSchema,
+    // DefineTopic's TopicExists check, AlterTopic) passes the name the client
+    // defined the topic under, which is independent of the descriptor's name
+    // (Phase 2b C regression: "typed_route" with the "characters" descriptor
+    // answered UnknownTopic).  A pre-name-trailer record has no topic name; the
+    // descriptor name is the only name it can be found under.
+    const std::string& indexName = e.topicName.empty() ? e.descriptor.name : e.topicName;
+    nameToId_[indexName] = ts.topicId;
 
     // Keep ALL versions: append (never overwrite) by version, 1-based index.
     // byId_'s per-topic container is a deque (not a vector) specifically so
