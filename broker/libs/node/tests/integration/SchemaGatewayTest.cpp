@@ -251,7 +251,8 @@ struct SgHarness {
             if (idx < 0) return;
             uint8_t* p = egressRing.base()+idx;
             std::memcpy(p, &session, 8);
-            (void)r.encode(p+8);
+            // Mirrors BrokerNode's debug guard: encode() fills exactly the slot.
+            EXPECT_EQ(r.encode(p+8), sz);
             egressRing.commit(idx);
         };
         // respondAlter (Task 13 test harness fix-on-sight): this harness never

@@ -3378,7 +3378,11 @@ void BrokerNode::buildAdminWorker() {
             if (idx < 0) return;  // ring full — DDL response dropped (rare); client retries
             uint8_t* p = ring.base() + idx;
             std::memcpy(p, &session, 8);
-            (void)resp.encode(p + 8);
+            // Debug guard: encode() must fill exactly the claimed slot — a
+            // drift between encodedSize() and encode() would ship a short
+            // frame or overrun the slot.  Release keeps the unchecked encode.
+            [[maybe_unused]] const std::size_t written = resp.encode(p + 8);
+            assert(written == sz && "TopicSchemaResponse encode() != encodedSize()");
             ring.commit(idx);
         };
 
