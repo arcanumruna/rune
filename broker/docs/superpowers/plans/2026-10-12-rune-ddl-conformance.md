@@ -3289,7 +3289,7 @@ Add to `DdlHarness` (public, next to `failCreate`). `CreateReplyWithUnknownPersi
 
 - [ ] **Step 3: Build and run.**
   Run: `cmake /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='Ddl/DdlOccupantMatrixRegression.*:DdlMalformedRequestRegression.*:Ddl/DdlViewSourceRegression.*' --gtest_brief=1`
-  Expected: 444 + 10 + 12 = 466 PASS. B1–B10 are fixed, and the `_R1` cells pin the no-hang wave's R1 behaviour.
+  Expected: 456 + 10 + 12 = 478 PASS. B1–B10 are fixed, and the `_R1` cells pin the no-hang wave's R1 behaviour.
   **If any cell fails:** that cell is a new finding. Run superpowers:systematic-debugging on it, then add the cell to "Bugs this matrix is expected to expose" with a fix task. Never edit the expectation table to make a cell pass unless the plan's markdown table is wrong too, and say so in the commit message.
 
 - [ ] **Step 4: Regression gate, then commit.**
@@ -5515,7 +5515,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 | unit | `NodeConfigRegression.RuneTopics*` (B7) | 3 |
 | unit | `DdlHarnessRegression` | 4 |
 | unit | `DdlFixRegression` (B1–B4, B6, B8, B9, KL2) | 18 |
-| unit | `Ddl/DdlOccupantMatrixRegression` (37 rows × 12 ops) | 444 |
+| unit | `Ddl/DdlOccupantMatrixRegression` (38 rows × 12 ops) | 456 |
 | unit | `DdlMalformedRequestRegression` | 10 |
 | unit | `Ddl/DdlViewSourceRegression` (incl. 4 view-over-view cells) | 12 |
 | unit | `Ddl/DdlPairTimingMatrixRegression` | 560 |
