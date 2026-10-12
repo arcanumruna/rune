@@ -1879,6 +1879,12 @@ TEST(GroupRoutingRegression, SessionExpiredForTheCoordinatorSessionNeverHitsTheS
     ASSERT_NE(coordSid, r.seedSid);
     ASSERT_EQ(r.gw.connectsAt[0], 1);
     ASSERT_EQ(r.gw.connectsAt[n1], 1);
+    // Fix round 5 (N14): a control op pending on the SEED (unanswered: the rig
+    // does not reply to DefineTopic) must survive the coordinator's expiry.
+    const std::vector<uint8_t> blob{9};
+    const rc::Token defTok = r.nextToken++;
+    ASSERT_EQ(r.client.defineTopic("x", 1, "", false, blob, r.cq, defTok), rc::OpResult::Accepted);
+    ASSERT_TRUE(r.drive([&] { return r.client.testPendingControlOps() == 1; }, 400'000));
     r.gw.sendError(n1, static_cast<int16_t>(rune::protocol::client::ErrorCode::SessionExpired), "", coordSid, 0);
     ASSERT_TRUE(r.drive([&] { return r.gw.connectsAt[n1] >= 2 || r.gw.connectsAt[0] >= 2; }, 4'000'000))
         << "nobody reacted to the SessionExpired";
@@ -1886,6 +1892,10 @@ TEST(GroupRoutingRegression, SessionExpiredForTheCoordinatorSessionNeverHitsTheS
     EXPECT_EQ(r.gw.connectsAt[0], 1) << "the SessionExpired of the coordinator session hit the seed";
     EXPECT_EQ(r.client.testSessionStateAt(0), rc::session::SessionState::Connected);
     EXPECT_EQ(appErrors, errorsBefore) << "the seed's ops / onError were failed for another session's expiry";
+    bool defCompleted = false;
+    r.cq.poll([&](const rc::Completion& cc, std::span<const uint8_t>) { defCompleted |= cc.token == defTok; });
+    EXPECT_FALSE(defCompleted) << "a seed control op was completed by the coordinator session's expiry";
+    EXPECT_EQ(r.client.testPendingControlOps(), 1u);
 }
 
 // r2 LOW-5: a commitSync of a member whose coordinator is a session of its own

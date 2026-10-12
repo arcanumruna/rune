@@ -621,3 +621,51 @@ TEST(ClientCryptoRegression, HandshakeBlobLargerThanOld512ByteScratchHandled) {
         << "a real TLS 1.3 handshake flight must exceed the old fixed 512-byte scratch bound "
            "and still complete (asserted above) without truncation";
 }
+
+// ===========================================================================
+// No-hang fix round 5 (N17): a HandshakeContinueResponse with a code other than
+// HandshakeFailed (the broker evicted this handshake from its full
+// pending-connect table and answered Internal) is a retriable CONNECT failure —
+// never a terminal, mislabelled Rejected(HandshakeFailed).  HandshakeFailed
+// itself stays terminal.
+// ===========================================================================
+namespace {
+// Drives the machine into Handshaking (first leg answered); returns the connect corrId.
+int64_t intoHandshaking(FrameFixture& f, int64_t nowNs) {
+    f.m.connect(nowNs);
+    auto req = cc::decodeConnectRequest(f.io.last().data(), f.io.last().size());
+    EXPECT_TRUE(req.has_value());
+    const auto& hb = req->handshakeBytes;
+    EXPECT_NE(f.srv.readInbound(reinterpret_cast<const uint8_t*>(hb.data()), hb.size()), cr::HsState::Failed);
+    uint8_t out[16384];
+    const std::size_t n = f.srv.writeOutbound(out, sizeof out);
+    // Only the first half of the server's flight: the client's TLS needs more —
+    // it stays Handshaking, awaiting a HandshakeContinueResponse.
+    f.m.onConnectResponse(/*code=*/0, /*leaderMemberId=*/-1, FrameFixture::kSessionId, req->correlationId,
+                          nowNs + 1, req->cipherList[0], std::string_view(reinterpret_cast<const char*>(out), n / 2));
+    return req->correlationId;
+}
+}  // namespace
+
+TEST(ClientCryptoRegression, HandshakeContinueInternalIsARetriableConnectFailureRegression) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    const int64_t corr = intoHandshaking(f, 1'000'000'000LL);
+    ASSERT_EQ(f.m.state(), sm::SessionState::Handshaking);
+    f.m.onHandshakeContinueResponse(static_cast<int16_t>(rune::protocol::client::ErrorCode::Internal), {}, corr,
+                                    1'000'000'010LL);
+    EXPECT_NE(f.m.state(), sm::SessionState::Rejected)
+        << "a full broker table turned into a terminal TLS failure";
+    EXPECT_NE(f.m.rejectCode(), static_cast<int16_t>(rune::protocol::client::ErrorCode::HandshakeFailed));
+    EXPECT_FALSE(f.m.cryptoState().encrypted);
+}
+
+TEST(ClientCryptoRegression, HandshakeContinueHandshakeFailedStaysTerminalRegression) {
+    FrameFixture f;
+    ASSERT_TRUE(f.srv.valid());
+    const int64_t corr = intoHandshaking(f, 1'000'000'000LL);
+    ASSERT_EQ(f.m.state(), sm::SessionState::Handshaking);
+    f.m.onHandshakeContinueResponse(static_cast<int16_t>(rune::protocol::client::ErrorCode::HandshakeFailed), {},
+                                    corr, 1'000'000'010LL);
+    EXPECT_EQ(f.m.state(), sm::SessionState::Rejected);
+}

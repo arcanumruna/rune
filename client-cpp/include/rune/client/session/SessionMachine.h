@@ -504,8 +504,19 @@ public:
 
         namespace rpc = rune::protocol::client;
         const auto ec = static_cast<rpc::ErrorCode>(static_cast<uint16_t>(code));
+        if (ec == rpc::ErrorCode::HandshakeFailed) {
+            onHandshakeFailed_(nowNs);   // a TLS failure: non-retriable
+            return;
+        }
         if (ec != rpc::ErrorCode::OK) {
-            onHandshakeFailed_(nowNs);
+            // No-hang fix round 5 (N17): any other code (e.g. Internal: the
+            // broker's pending-connect table was full and evicted this
+            // handshake) is a CONNECT failure, not a TLS one — the same path
+            // as a ConnectResponse error in Connecting (retriable unless
+            // ProtocolVersion), never a terminal mislabelled HandshakeFailed.
+            tls_.reset();
+            hsBytes_.clear();
+            onConnectError_(ec, nowNs);
             return;
         }
         onHandshakeBytes(reinterpret_cast<const uint8_t*>(handshakeBytes.data()),

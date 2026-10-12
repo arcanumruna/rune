@@ -1264,3 +1264,32 @@ TEST(CompletionsClient, OwnResponseTimeoutCompletesInFlightOpsSessionLostRegress
     r.settle();
     EXPECT_EQ(r.client.testPendingControlOps(), 0u);
 }
+
+// No-hang fix round 5 (N14): the broker's REAL unsolicited SessionExpired names
+// the session in its header (ClientGateway sends sessionId = the expiring
+// session's id, correlationId 0).  For the seed session's own id, every pending
+// control op completes SessionLost — the `opt->sessionId != 0` branch, which
+// the sid-0 test above never took.
+TEST(CompletionsClient, SessionExpiredWithTheSeedsRealSessionIdCompletesPendingOpsSessionLostRegression) {
+    Rig r(cfgFor(5460));
+    TestCq cq(r.client);
+    ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
+    auto c = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.connect(q, t); });
+    ASSERT_TRUE(r.drive([&] { return c.ready(); }));
+    ASSERT_TRUE(c.ok()) << c.describe();
+    const int64_t seedSid = c.outcome().c.value;
+    ASSERT_NE(seedSid, 0);
+    std::vector<uint8_t> blob{9};
+    auto d = cq.issue([&](rc::Completions& q, rc::Token t) {
+        return r.client.defineTopic("x", 1, "", false, blob, q, t);
+    });
+    auto g = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.getTopicSchema("x", q, t); });
+    ASSERT_TRUE(r.drive([&] { return r.gw.defines == 1 && r.gw.schemaGets == 1; }));
+    r.gw.sendError(0, static_cast<int16_t>(rune::client::codec::ErrorCode::SessionExpired), "", seedSid,
+                   /*corrId=*/0);
+    ASSERT_TRUE(r.drive([&] { return d.ready() && g.ready(); }));
+    EXPECT_EQ(d.status(), rc::OpStatus::SessionLost) << d.describe();
+    EXPECT_EQ(g.status(), rc::OpStatus::SessionLost) << g.describe();
+    r.settle();
+    EXPECT_EQ(r.client.testPendingControlOps(), 0u);
+}

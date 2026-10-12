@@ -64,6 +64,10 @@ includes `rune/client/subscriber/Subscription.h`.
   or `InvalidRequest` on Heartbeat, SyncGroup and OffsetFetch, and evicts their
   member, so they re-join. A JoinGroup or SyncGroup the broker cannot decode
   is still answered `ProtocolVersion` to them, as above.
+- In a TLS handshake, a `HandshakeContinueResponse` with a code other than
+  `HandshakeFailed` (for example `Internal`, when the broker's pending-connect
+  table was full) is a retriable connect failure. Before, every non-OK code
+  ended the session as a terminal `HandshakeFailed`.
 - An ErrorResponse fails a pending `connect()` only when it answers that
   connect (or ends the session); an error answering another request no longer
   fails the connect.
