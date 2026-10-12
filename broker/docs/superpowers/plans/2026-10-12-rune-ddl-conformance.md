@@ -103,7 +103,7 @@ Each bug was found by reading the code on `feat/phase2b-e-transient-topics` (fou
 
 `requestCreateTopic` count per cell is 1 for every successful create and every † cell, and 0 otherwise (alters and reads never call it).
 
-### Occupant rows exercised (37 rows × 12 ops = 444 cells)
+### Occupant rows exercised (37 rows × 12 ops = 456 cells)
 
 `Free`, `TypedDisk`, `TypedTransient`, `ViewPersisted`, `ViewTransient`, `StaticSchemaLessDisk`, `StaticSchemaLessTransient`, `RecoveredRuntimeTopic` (→TypedDisk), `RecoveredView` (→ViewPersisted), `OrphanDefineDisk` (→SchemaLessDisk), `OrphanDefineTransient` (→SchemaLessTransient), `OrphanSink_KnownLimitation`, `OrphanSinkAfterRestart` (→Free, B5), `CaseVariantOfTyped`, `CaseVariantOfView`, `CaseVariantOfStatic`, `CaseVariantOfOrphan`.
 
@@ -2875,7 +2875,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 8: The Occupant × Op matrix (444 cells) + malformed admin requests + view-source cells
+### Task 8: The Occupant × Op matrix (456 cells) + malformed admin requests + view-source cells
 
 **Files:**
 - Create: `libs/node/tests/node/DdlOccupantMatrixRegressionTest.cpp`
@@ -3297,7 +3297,7 @@ Add to `DdlHarness` (public, next to `failCreate`). `CreateReplyWithUnknownPersi
 ```bash
 ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
 git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/node/tests/node/DdlOccupantMatrixRegressionTest.cpp libs/node/tests/support/DdlHarness.h libs/node/CMakeLists.txt
-git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "test(ddl): Occupant x Op conformance matrix (444 cells) + malformed admin requests + view-source cells (incl. view over view = 41)
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "test(ddl): Occupant x Op conformance matrix (456 cells) + malformed admin requests + view-source cells (incl. view over view = 41)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
