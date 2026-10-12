@@ -215,3 +215,13 @@ TEST(ViewMessagesRegression, InvalidRequestAndViewRowStatusesArePinnedRegression
     EXPECT_EQ(out->status, ViewRowResponse::kBusy);
     EXPECT_EQ(out->correlationId, 9);
 }
+
+// No-hang fix round 2: kRowTooLarge (7) appended; client version 5 is the
+// InvalidRequest gate.
+TEST(ViewMessagesRegression, RowTooLargeStatusAndInvalidRequestClientGateArePinnedRegression) {
+    EXPECT_EQ(static_cast<uint16_t>(ViewRowResponse::kRowTooLarge), 7u);
+    EXPECT_EQ(kClientVersionInvalidRequest, 5);
+    EXPECT_EQ(kClientVersion, 5);
+    EXPECT_FALSE(clientUnderstandsInvalidRequest(4));
+    EXPECT_TRUE(clientUnderstandsInvalidRequest(5));
+}

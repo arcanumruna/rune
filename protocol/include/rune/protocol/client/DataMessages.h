@@ -723,9 +723,11 @@ struct ViewRowResponse {
 
     // Append-only.  5 = the GetViewRow body did not decode (non-retriable);
     // 6 = the owning worker's ingress ring was full this cycle (retriable —
-    // the read was not performed; re-issue it).
+    // the read was not performed; re-issue it); 7 = the row exists but its
+    // ViewRowResponse would exceed the broker's egress frame (non-retriable;
+    // no row bytes are carried).
     enum Status : uint16_t { kOk = 0, kAbsentKey = 1, kNotReady = 2, kSchemaMismatch = 3, kUnknownView = 4,
-                             kInvalidRequest = 5, kBusy = 6 };
+                             kInvalidRequest = 5, kBusy = 6, kRowTooLarge = 7 };
 
     /// Total encoded size accounting for the var field.
     std::size_t encodedSize() const noexcept {

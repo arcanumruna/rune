@@ -174,10 +174,19 @@ enum class ErrorCode : uint16_t {
 //   4 — client<->broker TLS/AEAD (Task 4): offers crypto fields on Connect
 //       (cipherList/handshakeBytes/authToken) and understands
 //       HandshakeContinue/HandshakeContinueResponse. See kClientVersionCrypto.
+//   5 — no-hang wave: understands ErrorCode::InvalidRequest (39) on every
+//       response type (non-retriable: the request fails / the group consumer
+//       is refused, never re-sent), ViewRowResponse statuses 5..7, and
+//       finishes a subscription whose SubscribeResponse carries an error.  A
+//       broker answers a malformed JoinGroup / SyncGroup from a client below 5
+//       with ProtocolVersion (which those clients already treat as
+//       non-retriable) instead of InvalidRequest / Internal (which they would
+//       re-join on, forever).
 // ---------------------------------------------------------------------------
 inline constexpr int32_t kClientVersionUnknownProducerId          = 2;
 inline constexpr int32_t kClientVersionExplicitGroupSubscriptions = 3;
-inline constexpr int32_t kClientVersion                           = 4;   // what this protocol's client announces
+inline constexpr int32_t kClientVersionInvalidRequest             = 5;
+inline constexpr int32_t kClientVersion                           = 5;   // what this protocol's client announces
 
 // ---------------------------------------------------------------------------
 // Broker versions (ConnectResponse.brokerVersion, an additive trailing field;
@@ -191,6 +200,12 @@ inline constexpr int32_t kClientVersion                           = 4;   // what
 // ---------------------------------------------------------------------------
 inline constexpr int32_t kBrokerVersionExplicitGroupSubscriptions = 3;
 inline constexpr int32_t kBrokerVersion                           = 4;   // what this protocol's broker announces
+
+/// True when a session that connected with `clientVersion` handles
+/// InvalidRequest (39) as non-retriable on every response type (see version 5).
+[[nodiscard]] constexpr bool clientUnderstandsInvalidRequest(int32_t clientVersion) noexcept {
+    return clientVersion >= kClientVersionInvalidRequest;
+}
 
 /// True when a session that connected with `clientVersion` may be answered
 /// UnknownProducerId (else the broker answers OutOfOrderSequence, as before).
