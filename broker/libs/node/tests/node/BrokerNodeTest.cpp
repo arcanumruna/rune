@@ -2066,4 +2066,79 @@ TEST(BrokerNodeRegression, DefineTopicMarksTheTopicDirCommittedOverTheAdminRingR
     std::error_code ec; fs::remove_all(dir, ec);
 }
 
+// ---------------------------------------------------------------------------
+// DDL conformance B3 end to end on a live single-node BrokerNode: a DefineTopic
+// whose name differs only in letter case from an existing topic (runtime or
+// RUNE_TOPICS static) is TopicExists carrying the existing topic's id, and the
+// control thread creates NOTHING for it (no topic id consumed, no replica) —
+// the caseConflict trailer crosses the real CreateTopicReply ring.
+// ---------------------------------------------------------------------------
+TEST(BrokerNodeRegression, CaseVariantDefineTopicIsTopicExistsEndToEndRegression) {
+    const fs::path dir = makeTempDataDir("case_fold_e2e_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    TopicSpec stat; stat.name = "Stat"; stat.partitionCount = 1; stat.topicId = 0;
+    cfg.topics = {stat};
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(30s));
+
+    rune::node::test::ShardTestClient client(dir / "client-aeron");
+    const std::string& gw = cfg.clientEndpoint.channel;
+    const int32_t stream  = cfg.clientEndpoint.streamId;
+    const int64_t sid = client.connect(gw, stream);
+    ASSERT_GT(sid, 0);
+
+    const std::vector<uint8_t> blob = rune::codec::serialize(
+        rune::codec::DescriptorBuilder("orders").add("id", rune::codec::PrimType::Int64).build());
+    namespace pc = rune::protocol::client;
+    using Clock = std::chrono::steady_clock;
+    constexpr uint16_t kInternal = static_cast<uint16_t>(pc::ErrorCode::Internal);
+    constexpr uint16_t kExists   = static_cast<uint16_t>(pc::ErrorCode::TopicExists);
+    const auto testDeadline = Clock::now() + 30s;
+    // One DefineTopic; Internal (admin leadership still settling) is retried.
+    auto define = [&](std::string_view name, uint8_t persistence) -> std::optional<pc::DefineTopicResponse> {
+        while (Clock::now() < testDeadline) {
+            auto r = client.defineTopicUntil(gw, stream, sid, name, 1, /*validate=*/false, blob,
+                                             std::min(testDeadline, Clock::now() + 5s), persistence);
+            if (!r || r->errorCode != kInternal) return r;
+            std::this_thread::sleep_for(20ms);
+        }
+        return std::nullopt;
+    };
+
+    const auto orders = define("Orders", 0);
+    ASSERT_TRUE(orders.has_value());
+    ASSERT_EQ(orders->errorCode, 0);
+    const int32_t ordersId = orders->topicId;
+    ASSERT_GE(ordersId, 0);
+
+    for (const auto& [name, persistence] : std::vector<std::pair<std::string, uint8_t>>{
+             {"orders", 0}, {"ORDERS", 1}, {"oRdErS", 0}}) {
+        SCOPED_TRACE(name);
+        const auto r = define(name, persistence);
+        ASSERT_TRUE(r.has_value()) << "no DefineTopicResponse";
+        EXPECT_EQ(r->errorCode, kExists);
+        EXPECT_EQ(r->topicId, ordersId) << "answers the colliding topic's id";
+    }
+    for (const std::string name : {"stat", "STAT"}) {
+        SCOPED_TRACE(name);
+        const auto r = define(name, 0);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->errorCode, kExists);
+        EXPECT_EQ(r->topicId, 0) << "the static topic's id";
+    }
+
+    // Nothing was created for any refused variant: the next topic takes the very
+    // next id, and no replica exists past it.
+    const auto next = define("next", 0);
+    ASSERT_TRUE(next.has_value());
+    ASSERT_EQ(next->errorCode, 0);
+    EXPECT_EQ(next->topicId, ordersId + 1) << "a refused variant consumed a topic id";
+    EXPECT_TRUE(rune::node::test::hasReplica(node, ordersId, 0));
+    EXPECT_FALSE(rune::node::test::hasReplica(node, next->topicId + 1, 0));
+
+    node.stop();
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
 } // namespace rune::node
