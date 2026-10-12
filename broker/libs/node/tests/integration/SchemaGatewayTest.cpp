@@ -140,6 +140,7 @@ struct SgHarness {
     OneToOneByteRing egressRing{kAdminRequestRingBytes};
 
     std::unique_ptr<AdminWorker> admin;
+    std::optional<CreateTopicReqMsg> lastCreateReq;   // Phase 2b E: last request the control thread saw
 
     // Gateway + its user topic registry.
     std::string topicDirPath;
@@ -150,8 +151,9 @@ struct SgHarness {
         OneToOneByteRing* ring;
         bool submitDefineTopic(int64_t s, int64_t c, std::string_view name,
                                uint32_t parts, std::string_view keyField, bool validate,
-                               const uint8_t* blob, uint32_t blen) override {
-            DefineTopicMsg m; m.session=s; m.corr=c; m.partitionCount=(int32_t)parts;
+                               const uint8_t* blob, uint32_t blen,
+                               uint8_t persistence) override {
+            DefineTopicMsg m; m.persistence=persistence; m.session=s; m.corr=c; m.partitionCount=(int32_t)parts;
             m.validate=validate; m.name.assign(name); m.keyField.assign(keyField);
             if (blob && blen) m.blob.assign(blob, blob+blen);
             return encodeDefineTopic(*ring, m);
@@ -221,9 +223,10 @@ struct SgHarness {
         deps.requestCreateTopic = [this](int64_t ticket, int32_t parts,
                                          const std::string& name,
                                          const std::string& keyField,
-                                         uint8_t cleanupPolicy) -> bool {
+                                         uint8_t cleanupPolicy,
+                                         uint8_t persistence) -> bool {
             CreateTopicReqMsg m; m.ticket=ticket; m.partitionCount=parts; m.name=name;
-            m.keyField=keyField; m.cleanupPolicy=cleanupPolicy;
+            m.keyField=keyField; m.cleanupPolicy=cleanupPolicy; m.persistence=persistence;
             return encodeCreateTopicReq(createReqRing, m);
         };
         deps.pushValidators = [](const RegistryEntry&, int32_t) {};
@@ -304,6 +307,7 @@ struct SgHarness {
                                            aeron::util::index_t off, aeron::util::index_t len) {
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer()+off);
             CreateTopicReqMsg req = decodeCreateTopicReq(p, (std::size_t)len);
+            lastCreateReq = req;
             CreateTopicReplyMsg reply; reply.ticket = req.ticket;
             if (realControl) {
                 reply = createTopicForAdmin(*topicReg, req);
@@ -363,8 +367,10 @@ struct SgHarness {
 std::vector<uint8_t> encodeDefineFrame(int64_t session, int64_t corr,
                                        const std::string& name, uint32_t parts,
                                        const std::string& keyField, bool validate,
-                                       const std::vector<uint8_t>& blob) {
+                                       const std::vector<uint8_t>& blob,
+                                       uint8_t persistence = 0) {
     pc::DefineTopic m;
+    m.persistence = persistence;
     m.sessionId = session; m.correlationId = corr; m.topicName = name;
     m.partitionCount = parts; m.keyField = keyField; m.validate = validate;
     m.descriptorBlob = blob.data(); m.descriptorLen = (uint32_t)blob.size();
@@ -388,6 +394,38 @@ std::vector<uint8_t> encodeAlterFrame(int64_t session, int64_t corr,
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Phase 2b E: the wire persistence byte reaches the control thread's
+// create-topic request and the durable registry entry — and an OLD client's
+// frame (no byte) still creates a disk topic.
+// ---------------------------------------------------------------------------
+TEST(SchemaGatewayRegression, DefineTopicTransientByteReachesControlAndRegistry) {
+    SgHarness h;
+    auto blob = charsBlob();
+    auto frame = encodeDefineFrame(1, 5, "characters", 2, "userId", false, blob,
+                                   pc::DefineTopic::kPersistenceTransient);
+    h.gw.applyDefineTopicForTest(frame.data(), frame.size());
+    h.pump();
+    ASSERT_TRUE(h.lastCreateReq.has_value());
+    EXPECT_EQ(h.lastCreateReq->persistence, 1u);
+    ASSERT_NE(h.schemaReg.byName("characters"), nullptr);
+    EXPECT_EQ(h.schemaReg.byName("characters")->persistence, PersistenceMode::Transient);
+}
+
+TEST(SchemaGatewayRegression, DefineTopicWithoutPersistenceByteCreatesDiskTopic) {
+    SgHarness h;
+    auto blob = charsBlob();
+    auto frame = encodeDefineFrame(1, 6, "characters", 2, "userId", false, blob);   // old client
+    ASSERT_EQ(frame.size(), pc::MessageHeader::ENCODED_SIZE + pc::DefineTopic::BODY_FIXED
+                                + 2 + 10 + 2 + 6 + 4 + blob.size())
+        << "precondition: a disk frame carries no persistence byte";
+    h.gw.applyDefineTopicForTest(frame.data(), frame.size());
+    h.pump();
+    ASSERT_TRUE(h.lastCreateReq.has_value());
+    EXPECT_EQ(h.lastCreateReq->persistence, 0u);
+    EXPECT_EQ(h.schemaReg.byName("characters")->persistence, PersistenceMode::Disk);
+}
 
 // ---------------------------------------------------------------------------
 // End-to-end: DefineTopic through the gateway → admin ring → replica → response.

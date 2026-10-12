@@ -232,6 +232,7 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
     // Durable topic name (independent of the descriptor's name): boot recovery
     // recreates the topic under it (RuntimeTopicRecovery).
     ts.topicName      = inFlight_->msg.name;
+    ts.persistence    = persistenceFromWire(inFlight_->msg.persistence);
 
     // D: leader guard.  If we are not the leader, DDL cannot be committed here.
     if (!leader_ || !replica_) {
@@ -426,7 +427,8 @@ void AdminWorker::startNext_(int64_t nowNs) {
     op.msg        = std::move(msg);
 
     if (!deps_.requestCreateTopic(op.ticket, op.msg.partitionCount, op.msg.name,
-                                  /*keyField=*/"", /*cleanupPolicy=*/0)) {
+                                  /*keyField=*/"", /*cleanupPolicy=*/0,
+                                  op.msg.persistence)) {
         // Ring full (should not happen for rare DDL) → Internal; requeue would risk
         // reordering, so fail fast and let the client retry.
         deps_.respondDefine(op.msg.session, op.msg.corr, -1, 0, kInternal);
@@ -541,7 +543,8 @@ void AdminWorker::startCreateView_(CreateViewMsg msg, int64_t nowNs) {
     const int32_t sinkPartitions  = srcEntry ? srcEntry->partitionCount : 1;
 
     if (!deps_.requestCreateTopic(op.ticket, sinkPartitions, op.view.viewName,
-                                  op.view.keyField, /*cleanupPolicy=*/1 /*Compact*/)) {
+                                  op.view.keyField, /*cleanupPolicy=*/1 /*Compact*/,
+                                  /*persistence=*/0 /*a view sink is durable*/)) {
         deps_.respondCreateView(op.view.session, op.view.corr, -1, 0, kInternal);
         return;
     }
@@ -634,6 +637,7 @@ void AdminWorker::startAlter_(AlterTopicMsg msg, int64_t nowNs) {
     ts.nextTag        = nextTag;                           // advanced by applyOps
     ts.compatMode     = mode;
     ts.topicName      = latest->topicName;                 // carried forward unchanged
+    ts.persistence    = latest->persistence;               // carried forward unchanged (Phase 2b E)
 
     const std::vector<uint8_t> payload = ts.serialize();
     // Task 15b: composite (topicId, version) compaction key — see the matching
@@ -744,6 +748,7 @@ bool AdminWorker::advance_(int64_t nowNs) {
             ts.descriptorBlob = inFlight_->msg.blob;
             ts.nextTag        = inFlight_->fieldCount;
             ts.topicName      = inFlight_->msg.name;   // same as the durable record
+            ts.persistence    = persistenceFromWire(inFlight_->msg.persistence);   // ditto
             reg_.applyRecord(ts);
             if (inFlight_->msg.validate) {
                 if (const RegistryEntry* entry = reg_.byId(inFlight_->topicId))

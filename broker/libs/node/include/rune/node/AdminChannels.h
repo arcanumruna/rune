@@ -109,6 +109,7 @@ struct DefineTopicMsg {
     std::string          name;
     std::string          keyField;
     std::vector<uint8_t> blob;
+    uint8_t              persistence    = 0;   // Phase 2b E: 0 = disk, 1 = transient
 };
 
 // ---------------------------------------------------------------------------
@@ -170,6 +171,7 @@ struct CreateTopicReqMsg {
     std::string name;
     std::string keyField;             // Task 19: view sink key field (empty = none)
     uint8_t     cleanupPolicy  = 0;   // Task 19: 0=Delete, 1=Compact, 2=CompactDelete
+    uint8_t     persistence    = 0;   // Phase 2b E: 0 = disk, 1 = transient (InMemoryLog)
 };
 
 // ---------------------------------------------------------------------------
@@ -214,7 +216,11 @@ inline bool encodeDefineTopic(OneToOneByteRing& ring, const DefineTopicMsg& m) {
     const std::size_t len = 8 + 8 + 4 + 1
                           + 2 + m.name.size()
                           + 2 + m.keyField.size()
-                          + 4 + m.blob.size();
+                          + 4 + m.blob.size()
+                          // Phase 2b E: trailing persistence byte, only when non-zero —
+                          // a disk frame stays byte-identical (a max-size descriptor
+                          // still fits the ring: ProduceValidationRegression).
+                          + (m.persistence != 0 ? 1 : 0);
     const auto idx = ring.tryClaim(kMsgDefineTopic, len);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
@@ -227,7 +233,8 @@ inline bool encodeDefineTopic(OneToOneByteRing& ring, const DefineTopicMsg& m) {
     putU16(p, static_cast<uint16_t>(m.keyField.size())); p += 2;
     std::memcpy(p, m.keyField.data(), m.keyField.size()); p += m.keyField.size();
     putI32(p, static_cast<int32_t>(m.blob.size())); p += 4;
-    std::memcpy(p, m.blob.data(), m.blob.size());
+    std::memcpy(p, m.blob.data(), m.blob.size()); p += m.blob.size();
+    if (m.persistence != 0) *p = m.persistence;   // trailing; decode tolerates absence (=> disk)
     ring.commit(idx);
     return true;
 }
@@ -250,8 +257,16 @@ inline DefineTopicMsg decodeDefineTopic(const uint8_t* buf, std::size_t len) {
     m.keyField.assign(reinterpret_cast<const char*>(buf + pos), kl); pos += kl;
     if (pos + 4 > len) return m;
     const int32_t bl = getI32(buf + pos); pos += 4;
-    if (bl > 0 && pos + static_cast<std::size_t>(bl) <= len)
-        m.blob.assign(buf + pos, buf + pos + bl);
+    if (bl < 0 || pos + static_cast<std::size_t>(bl) > len) return m;
+    if (bl > 0) m.blob.assign(buf + pos, buf + pos + bl);
+    pos += static_cast<std::size_t>(bl);
+    if (pos < len) {   // Phase 2b E; absent => disk
+        if (buf[pos] > 1) {   // unknown mode: never cast it — drop the blob so the
+            m.blob.clear();   // worker answers InvalidSchema (session/corr survive)
+            return m;
+        }
+        m.persistence = buf[pos];
+    }
     return m;
 }
 
@@ -373,11 +388,12 @@ inline GetSchemaMsg decodeGetSchema(const uint8_t* buf, std::size_t len) {
 
 // ---- CreateTopicReq ----
 // Layout: ticket:i64, partitionCount:i32, nameLen:u16 + name,
-//         keyFieldLen:u16 + keyField, cleanupPolicy:u8   (Task 19 trailer).
+//         keyFieldLen:u16 + keyField, cleanupPolicy:u8   (Task 19 trailer),
+//         persistence:u8 (Phase 2b E trailer; absent => disk).
 inline bool encodeCreateTopicReq(OneToOneByteRing& ring, const CreateTopicReqMsg& m) {
     using namespace admin_wire;
     const std::size_t len = 8 + 4 + 2 + m.name.size()
-                          + 2 + m.keyField.size() + 1;
+                          + 2 + m.keyField.size() + 1 + 1;
     const auto idx = ring.tryClaim(kMsgCreateTopicReq, len);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
@@ -388,6 +404,7 @@ inline bool encodeCreateTopicReq(OneToOneByteRing& ring, const CreateTopicReqMsg
     putU16(p, static_cast<uint16_t>(m.keyField.size())); p += 2;
     std::memcpy(p, m.keyField.data(), m.keyField.size()); p += m.keyField.size();
     *p++ = m.cleanupPolicy;
+    *p   = m.persistence;
     ring.commit(idx);
     return true;
 }
@@ -409,7 +426,15 @@ inline CreateTopicReqMsg decodeCreateTopicReq(const uint8_t* buf, std::size_t le
     if (pos + kl > len) return m;
     m.keyField.assign(reinterpret_cast<const char*>(buf + pos), kl); pos += kl;
     if (pos + 1 > len) return m;
-    m.cleanupPolicy = buf[pos];
+    m.cleanupPolicy = buf[pos++];
+    if (pos < len) {   // Phase 2b E; absent => disk
+        if (buf[pos] > 1) {   // unknown mode: never cast it — a nameless request fails
+            m.name.clear();   // on the control thread (createTopic rejects "")
+            m.partitionCount = 0;
+            return m;
+        }
+        m.persistence = buf[pos];
+    }
     return m;
 }
 

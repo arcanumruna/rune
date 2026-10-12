@@ -3274,7 +3274,8 @@ void BrokerNode::buildAdminWorker() {
         deps.requestCreateTopic = [this](int64_t ticket, int32_t partitionCount,
                                          const std::string& name,
                                          const std::string& keyField,
-                                         uint8_t cleanupPolicy) -> bool {
+                                         uint8_t cleanupPolicy,
+                                         uint8_t persistence) -> bool {
             if (!adminWorkerAgent_) return false;
             CreateTopicReqMsg m;
             m.ticket         = ticket;
@@ -3282,6 +3283,7 @@ void BrokerNode::buildAdminWorker() {
             m.name           = name;
             m.keyField       = keyField;         // Task 19: view sink key field
             m.cleanupPolicy  = cleanupPolicy;    // Task 19: Compact for a view sink table
+            m.persistence    = persistence;      // Phase 2b E: 1 = transient (InMemoryLog)
             return encodeCreateTopicReq(adminWorkerAgent_->createReqRing(), m);
         };
 

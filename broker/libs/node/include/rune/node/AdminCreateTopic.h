@@ -39,6 +39,10 @@ createTopicForAdmin(rune::gateway::TopicRegistry& reg, const CreateTopicReqMsg& 
     // default: Delete, empty).
     spec.cleanupPolicy  = static_cast<TopicSpec::CleanupPolicy>(req.cleanupPolicy);
     if (!req.keyField.empty()) spec.partitionKey = req.keyField;
+    // Phase 2b E: a transient runtime topic is created exactly like a static
+    // persistence=transient one — TopicRegistry skips its disk dirs and
+    // createRuntimeUserReplicas builds it on an InMemoryLog.
+    spec.persistence    = persistenceFromWire(req.persistence);
 
     try {
         reply.topicId = reg.createTopic(spec);

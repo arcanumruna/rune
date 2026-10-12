@@ -150,7 +150,8 @@ protected:
 
         AdminDeps deps;
         deps.requestCreateTopic = [this](int64_t ticket, int32_t parts, const std::string& name,
-                                         const std::string& keyField, uint8_t cleanupPolicy) -> bool {
+                                         const std::string& keyField, uint8_t cleanupPolicy,
+                                         uint8_t /*persistence*/) -> bool {
             pendingTicket_ = ticket;
             pendingReq_ = CreateTopicReqMsg{ticket, parts, name, keyField, cleanupPolicy};
             lastSinkKeyField_      = keyField;       // capture: a view sink is keyed...

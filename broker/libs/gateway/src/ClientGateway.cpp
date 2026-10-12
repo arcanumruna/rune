@@ -5661,7 +5661,8 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
     (void)adminSink_->submitDefineTopic(m.sessionId, m.correlationId,
                                         m.topicName, m.partitionCount,
                                         m.keyField, m.validate,
-                                        m.descriptorBlob, m.descriptorLen);
+                                        m.descriptorBlob, m.descriptorLen,
+                                        m.persistence);
     // Return immediately — the AdminWorker produces the DefineTopicResponse
     // asynchronously on the session egress (via the admin→control egress ring).
 }

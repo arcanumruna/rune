@@ -9,6 +9,8 @@
 
 #include <gtest/gtest.h>
 #include "rune/node/AdminWorker.h"
+#include <rune/node/AdminChannels.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/Types.h>
 #include <rune/storage/Log.h>
@@ -21,6 +23,7 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 
 using namespace rune::node;
 using namespace rune::codec;
@@ -74,6 +77,7 @@ struct Harness {
     // Pending createTopic request (ticket, partitionCount) awaiting a reply.
     int64_t pendingTicket = -1;
     bool    failCreate = false;
+    uint8_t lastCreatePersistence = 0xff;
 
     explicit Harness()
         : dir(uniqDir("h")), log(dir) {
@@ -90,8 +94,8 @@ struct Harness {
 
         AdminDeps d;
         d.requestCreateTopic = [this](int64_t ticket, int32_t, const std::string&,
-                                      const std::string&, uint8_t) -> bool {
-            ++creates; pendingTicket = ticket; return true;
+                                      const std::string&, uint8_t, uint8_t persistence) -> bool {
+            ++creates; pendingTicket = ticket; lastCreatePersistence = persistence; return true;
         };
         d.pushValidators = [this](const RegistryEntry&, int32_t) { ++pushes; };
         d.respondDefine = [this](int64_t,int64_t,int32_t tid,uint16_t,uint16_t e) {
@@ -114,8 +118,9 @@ struct Harness {
     // control reply → doWork loop until the state machine settles.
     void runDefine(int64_t session, int64_t corr, const std::string& name,
                    const std::string& keyField, int32_t parts, bool validate,
-                   std::vector<uint8_t> blob) {
+                   std::vector<uint8_t> blob, uint8_t persistence = 0) {
         DefineTopicMsg m;
+        m.persistence = persistence;
         m.session = session; m.corr = corr; m.name = name; m.keyField = keyField;
         m.partitionCount = parts; m.validate = validate; m.blob = std::move(blob);
         w->submitDefineTopic(std::move(m));
@@ -470,4 +475,122 @@ TEST(AdminWorkerRegression, AlterByTopicNameWhenItDiffersFromDescriptorName) {
     ASSERT_NE(h.reg.byName("typed_route"), nullptr);
     EXPECT_EQ(h.reg.byName("typed_route")->version, 2);
     EXPECT_EQ(h.reg.byName("typed_route")->partitionCount, 8);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b E: transient topics through the DDL state machine.
+// ---------------------------------------------------------------------------
+TEST(AdminWorkerRegression, TransientDefineRequestsTransientTopicAndRecordsMode) {
+    Harness h;
+    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob(), /*persistence=*/1);
+    ASSERT_EQ(h.lastErr, 0);
+    EXPECT_EQ(h.lastCreatePersistence, 1u) << "control thread must be asked for a transient topic";
+    const RegistryEntry* e = h.reg.byName("characters");
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(e->persistence, PersistenceMode::Transient);
+
+    // The DURABLE record (what boot recovery reads) carries the mode too.
+    const std::vector<uint8_t> raw = h.log.read(0, 1 << 20);
+    ASSERT_FALSE(raw.empty());
+    rune::protocol::RecordBatchReader rd(raw.data(), raw.size());
+    ASSERT_TRUE(rd.ensureValid());
+    std::optional<TopicSchema> rec;
+    rd.forEachRecord([&](std::string_view, std::string_view v, int64_t, int64_t) {
+        rec = TopicSchema::deserialize(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(v.data()), v.size()));
+    });
+    ASSERT_TRUE(rec.has_value());
+    EXPECT_EQ(rec->persistence, PersistenceMode::Transient);
+}
+
+TEST(AdminWorkerRegression, DiskDefineRequestsDiskTopic) {
+    Harness h;
+    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob());
+    ASSERT_EQ(h.lastErr, 0);
+    EXPECT_EQ(h.lastCreatePersistence, 0u);
+    EXPECT_EQ(h.reg.byName("characters")->persistence, PersistenceMode::Disk);
+}
+
+// ALTER writes a NEW TopicSchema version — the one recovery reads.  It must
+// carry the mode forward or a restart would recreate the topic on disk.
+TEST(AdminWorkerRegression, AlterCarriesTransientPersistenceForward) {
+    Harness h;
+    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob(), /*persistence=*/1);
+    ASSERT_EQ(h.lastErr, 0);
+    h.runAlter(1, 3, "characters", /*expectedVersion=*/1, opsBlob({addOp("email", PrimType::String)}));
+    ASSERT_EQ(h.lastAlterErr, 0);
+    ASSERT_EQ(h.lastAlterVersion, 2u);
+    const RegistryEntry* v2 = h.reg.byName("characters");
+    ASSERT_NE(v2, nullptr);
+    EXPECT_EQ(v2->version, 2u);
+    EXPECT_EQ(v2->persistence, PersistenceMode::Transient);
+}
+
+// Re-defining an existing name with the OTHER persistence is TopicExists and
+// never flips the mode (no second create, registry unchanged).
+TEST(AdminWorkerRegression, RedefineExistingTopicWithOtherPersistenceIsTopicExists) {
+    Harness h;
+    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob(), /*persistence=*/0);
+    ASSERT_EQ(h.lastErr, 0);
+    h.lastErr = 0xffff;
+    h.runDefine(1, 3, "characters", "userId", 4, false, charsBlob(), /*persistence=*/1);
+    EXPECT_EQ(h.lastErr, 25) << "TopicExists";
+    EXPECT_EQ(h.creates, 1);
+    EXPECT_EQ(h.reg.byName("characters")->persistence, PersistenceMode::Disk);
+}
+
+// The in-process ring frames carry the byte; a frame without it decodes as disk;
+// an unknown value is never cast into the enum.
+TEST(AdminWorkerRegression, AdminRingFramesCarryPersistence) {
+    OneToOneByteRing ring{kAdminRequestRingBytes};
+    DefineTopicMsg m; m.session = 7; m.corr = 8; m.name = "p"; m.blob = {1, 2}; m.persistence = 1;
+    ASSERT_TRUE(encodeDefineTopic(ring, m));
+    DefineTopicMsg got;
+    {   // a disk frame carries NO persistence byte (byte-identical to pre-2b)
+        OneToOneByteRing dring{kAdminRequestRingBytes};
+        DefineTopicMsg d; d.name = "p"; d.blob = {1, 2};
+        ASSERT_TRUE(encodeDefineTopic(dring, d));
+        std::size_t diskLen = 0;
+        dring.drain([&](int32_t, aeron::concurrent::AtomicBuffer&, aeron::util::index_t,
+                        aeron::util::index_t len) { diskLen = static_cast<std::size_t>(len); }, 1);
+        EXPECT_EQ(diskLen, 8u + 8 + 4 + 1 + 2 + 1 + 2 + 0 + 4 + 2);
+    }
+    ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                   aeron::util::index_t len) {
+        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+        const std::size_t n = static_cast<std::size_t>(len);
+        got = decodeDefineTopic(p, n);
+        // Same frame minus the trailing persistence byte = a pre-2b frame -> disk.
+        const DefineTopicMsg legacy = decodeDefineTopic(p, n - 1);
+        EXPECT_EQ(legacy.persistence, 0u);
+        EXPECT_EQ(legacy.blob, (std::vector<uint8_t>{1, 2}));
+        // Unknown value: rejected (blob dropped => InvalidSchema), never cast.
+        std::vector<uint8_t> bad(p, p + n);
+        bad.back() = 2;
+        const DefineTopicMsg rej = decodeDefineTopic(bad.data(), bad.size());
+        EXPECT_EQ(rej.persistence, 0u);
+        EXPECT_TRUE(rej.blob.empty());
+        EXPECT_EQ(rej.corr, 8);
+    }, 1);
+    EXPECT_EQ(got.persistence, 1u);
+    EXPECT_EQ(got.blob, (std::vector<uint8_t>{1, 2}));
+
+    OneToOneByteRing creq{kCreateTopicRingBytes};
+    CreateTopicReqMsg c; c.ticket = 3; c.partitionCount = 2; c.name = "p"; c.persistence = 1;
+    ASSERT_TRUE(encodeCreateTopicReq(creq, c));
+    CreateTopicReqMsg cgot;
+    creq.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                   aeron::util::index_t len) {
+        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+        const std::size_t n = static_cast<std::size_t>(len);
+        cgot = decodeCreateTopicReq(p, n);
+        EXPECT_EQ(decodeCreateTopicReq(p, n - 1).persistence, 0u);
+        std::vector<uint8_t> bad(p, p + n);
+        bad.back() = 2;
+        const CreateTopicReqMsg rej = decodeCreateTopicReq(bad.data(), bad.size());
+        EXPECT_EQ(rej.persistence, 0u);
+        EXPECT_TRUE(rej.name.empty());
+    }, 1);
+    EXPECT_EQ(cgot.persistence, 1u);
+    EXPECT_EQ(cgot.cleanupPolicy, 0u);
 }

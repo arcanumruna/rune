@@ -52,7 +52,9 @@ struct AdminDeps {
     // pre-Task-19 Delete topic.
     std::function<bool(int64_t ticket, int32_t partitionCount,
                        const std::string& name, const std::string& keyField,
-                       uint8_t cleanupPolicy)> requestCreateTopic;
+                       uint8_t cleanupPolicy, uint8_t persistence)> requestCreateTopic;
+    // Phase 2b E: `persistence` (0 = disk, 1 = transient) selects the topic's log
+    // backend on the control thread.  A view sink is always disk (0).
 
     // PUBLISHING: push validators to each produce worker after commit (validate=true).
     std::function<void(const RegistryEntry&, int32_t topicId)> pushValidators;

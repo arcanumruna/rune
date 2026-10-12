@@ -33,7 +33,8 @@ struct IAdminRequestSink {
                                    std::string_view keyField,
                                    bool validate,
                                    const uint8_t* descriptorBlob,
-                                   uint32_t descriptorLen) = 0;
+                                   uint32_t descriptorLen,
+                                   uint8_t persistence) = 0;   // Phase 2b E: 0 disk, 1 transient
 
     // GetTopicSchema (templateId 66) — likewise, copy-and-return.
     // requestedFingerprint (Task 13): 0 = latest; non-zero = the SPECIFIC

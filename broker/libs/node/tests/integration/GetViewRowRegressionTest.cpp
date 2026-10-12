@@ -433,7 +433,7 @@ protected:
 
         AdminDeps deps;
         deps.requestCreateTopic = [this](int64_t ticket, int32_t, const std::string&,
-                                         const std::string&, uint8_t) -> bool {
+                                         const std::string&, uint8_t, uint8_t) -> bool {
             pendingTicket_ = ticket;
             return true;
         };
