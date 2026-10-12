@@ -317,6 +317,16 @@ public:
         boot_();
     }
 
+    // ── checker self-test ───────────────────────────────────────────────────
+    /// Feed the invariant checker an answer the AdminWorker did NOT produce (a
+    /// duplicate, spurious or misordered DDL answer), then run the post-step check
+    /// — proves the checker CAN fail.  Only DdlHarnessRegression's negative tests
+    /// call this; a matrix test that calls it is wrong by construction.
+    void injectAnswerForCheckerSelfTest(int64_t corr, uint16_t err) {
+        onDdlAnswer_(corr, -1, 0, err);
+        checkInvariant_("injected answer");
+    }
+
     // ── observation ─────────────────────────────────────────────────────────
     [[nodiscard]] Catalog catalog() const {
         Catalog c;
@@ -525,7 +535,7 @@ private:
             responses_.push_back(Response{op, corr, id, version, err});
             return;
         }
-        const uint64_t unanswered = w_->startedCount() - answeredSinceBoot_;
+        const int64_t unanswered = unanswered_();
         if (unanswered != 1)
             violations_.push_back("answer for corr " + std::to_string(corr) + " with " +
                                   std::to_string(unanswered) + " ops started-but-unanswered (want 1)");
@@ -537,9 +547,13 @@ private:
         responses_.push_back(Response{op, corr, id, version, err});
     }
 
+    [[nodiscard]] int64_t unanswered_() const noexcept {
+        return static_cast<int64_t>(w_->startedCount()) - static_cast<int64_t>(answeredSinceBoot_);
+    }
+
     void checkInvariant_(const char* where) {
-        const uint64_t unanswered = w_->startedCount() - answeredSinceBoot_;
-        const uint64_t inFlight   = w_->hasInFlight() ? 1u : 0u;
+        const int64_t unanswered = unanswered_();
+        const int64_t inFlight   = w_->hasInFlight() ? 1 : 0;
         if (unanswered != inFlight)
             violations_.push_back(std::string(where) + ": " + std::to_string(unanswered) +
                                   " DDL ops started-but-unanswered, in flight " + std::to_string(inFlight));

@@ -105,3 +105,64 @@ TEST(DdlHarnessRegression, QueueCapRefusalCoexistsWithTheSerializationInvariant)
     EXPECT_EQ(h.idOf("over"), -1);
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
+
+// ── negative tests: the serialization invariant checker CAN fail ────────────
+namespace {
+bool anyViolationContains(const DdlHarness& h, const std::string& needle) {
+    for (const std::string& v : h.violations())
+        if (v.find(needle) != std::string::npos) return true;
+    return false;
+}
+} // namespace
+
+TEST(DdlHarnessRegression, InvariantFlagsAnAnswerWithNoOpInFlight) {
+    DdlHarness h;
+    ASSERT_TRUE(h.violations().empty()) << h.violationText();
+    ASSERT_FALSE(h.worker().hasInFlight());
+    // A second answer for an already-answered op: nothing is started-but-unanswered.
+    const int64_t d = h.submit(Op::DefineDisk, "t");
+    h.settle();
+    ASSERT_EQ(h.response(d)->err, kOk);
+    h.injectAnswerForCheckerSelfTest(d + 1000, kOk);
+    ASSERT_FALSE(h.violations().empty()) << "a spurious answer must be flagged";
+    EXPECT_TRUE(anyViolationContains(h, "with 0 ops started-but-unanswered (want 1)")) << h.violationText();
+    EXPECT_TRUE(anyViolationContains(h, "injected answer: -1 DDL ops started-but-unanswered, in flight 0"))
+        << h.violationText();
+}
+
+TEST(DdlHarnessRegression, InvariantFlagsAnOutOfOrderAnswer) {
+    DdlHarness h;
+    const int64_t a = h.submit(Op::DefineDisk, "a");
+    const int64_t b = h.submit(Op::DefineDisk, "b");
+    h.settle();
+    ASSERT_EQ(h.response(a)->err, kOk);
+    ASSERT_EQ(h.response(b)->err, kOk);
+    ASSERT_TRUE(h.violations().empty()) << h.violationText();
+    // An answer for an EARLIER submission after a later one was answered.
+    h.injectAnswerForCheckerSelfTest(a, kOk);
+    ASSERT_FALSE(h.violations().empty()) << "a misordered answer must be flagged";
+    EXPECT_TRUE(anyViolationContains(h, "answer for corr " + std::to_string(a) + " out of FIFO order (previous " +
+                                         std::to_string(b) + ")")) << h.violationText();
+}
+
+TEST(DdlHarnessRegression, InvariantFlagsAnAnswerWhileAnotherOpIsInFlight) {
+    DdlHarness h;
+    h.setControl(ControlMode::Hold);
+    const int64_t x = h.submit(Op::DefineDisk, "x");
+    ASSERT_TRUE(h.tickUntilCreatePending());
+    ASSERT_TRUE(h.worker().hasInFlight());
+    ASSERT_TRUE(h.violations().empty()) << h.violationText();
+    // x is AwaitingId; an answer that is not x's leaves x started-but-unanswered
+    // while the worker still reports it in flight: a second, phantom op.
+    h.injectAnswerForCheckerSelfTest(x + 1000, kOk);
+    h.injectAnswerForCheckerSelfTest(x + 1001, kOk);
+    ASSERT_FALSE(h.violations().empty());
+    EXPECT_TRUE(anyViolationContains(h, "injected answer: 0 DDL ops started-but-unanswered, in flight 1"))
+        << "the post-step check catches what the per-answer check cannot: " << h.violationText();
+    EXPECT_TRUE(anyViolationContains(h, "injected answer: -1 DDL ops started-but-unanswered, in flight 1"))
+        << h.violationText();
+    EXPECT_TRUE(anyViolationContains(h, "with 0 ops started-but-unanswered (want 1)")) << h.violationText();
+    h.deliverCreate();   // let x finish so the harness tears down cleanly
+    h.setControl(ControlMode::Auto);
+    h.settle();
+}
