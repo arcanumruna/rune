@@ -304,6 +304,81 @@ public:
         return std::nullopt;
     }
 
+    // ── DDL conformance (Task 12): pipelined DDL — send now, await by corr later ──
+    struct SchemaAnswer {
+        int32_t topicId = -1; uint16_t version = 0; uint16_t errorCode = 0; int32_t partitionCount = 0;
+        std::vector<uint8_t> blob;
+        bool operator==(const SchemaAnswer&) const = default;
+    };
+    int64_t sendDefineTopic(const std::string& ch, int32_t stream, int64_t sid, std::string_view name,
+                            uint32_t partitions, const std::vector<uint8_t>& descriptor, uint8_t persistence = 0) {
+        pc::DefineTopic m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.topicName = name; m.partitionCount = partitions;
+        m.keyField = "id"; m.validate = false; m.persistence = persistence;
+        m.descriptorBlob = descriptor.data(); m.descriptorLen = static_cast<uint32_t>(descriptor.size());
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
+    int64_t sendCreateView(const std::string& ch, int32_t stream, int64_t sid, std::string_view viewName,
+                           std::string_view keyField, uint8_t persistence, const std::vector<uint8_t>& plan) {
+        pc::CreateView m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.viewName = viewName; m.keyField = keyField;
+        m.persistence = persistence; m.planBlob = plan.data(); m.planLen = static_cast<uint32_t>(plan.size());
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
+    int64_t sendAlterTopic(const std::string& ch, int32_t stream, int64_t sid, std::string_view name,
+                           uint16_t expectedVersion, const std::vector<uint8_t>& ops) {
+        pc::AlterTopic m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.topicName = name; m.expectedVersion = expectedVersion;
+        m.opsBlob = ops.data(); m.opsLen = static_cast<uint32_t>(ops.size());
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
+    int64_t sendGetTopicSchema(const std::string& ch, int32_t stream, int64_t sid, std::string_view name) {
+        pc::GetTopicSchema m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.topicName = name; m.requestedFingerprint = 0;
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
+    std::optional<pc::DefineTopicResponse> awaitDefine(int64_t corr, Clock::time_point deadline) {
+        return awaitIn_(defines_, corr, deadline);
+    }
+    std::optional<pc::CreateViewResponse> awaitCreateView(int64_t corr, Clock::time_point deadline) {
+        return awaitIn_(views_, corr, deadline);
+    }
+    std::optional<pc::AlterTopicResponse> awaitAlter(int64_t corr, Clock::time_point deadline) {
+        return awaitIn_(alters_, corr, deadline);
+    }
+    std::optional<SchemaAnswer> awaitSchema(int64_t corr, Clock::time_point deadline) {
+        return awaitIn_(schemas_, corr, deadline);
+    }
+    /// Subscribe and return its correlation id (0 = not sent).
+    int64_t sendSubscribe(const std::string& ch, int32_t stream, int64_t sid, int32_t topicId, int32_t partition) {
+        pc::Subscribe m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.topicId = topicId; m.partition = partition;
+        m.partitionKnown = 1; m.fromOffset = 0; m.isolation = 0;
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
+    /// The answer to a subscribe: its SubscribeResponse errorCode, or the code of an
+    /// ErrorResponse on that correlation id (NotLeader / Redirect paths).
+    std::optional<int16_t> awaitSubscribeCode(int64_t corr, Clock::time_point deadline) {
+        if (corr == 0) return std::nullopt;
+        while (Clock::now() < deadline) {
+            poll_();
+            if (auto it = subscribes_.find(corr); it != subscribes_.end()) return it->second;
+            for (const ErrorSeen& e : errors_) if (e.correlationId == corr) return e.code;
+            pause_();
+        }
+        return std::nullopt;
+    }
+
     bool disconnect(const std::string& gatewayChannel, int32_t stream, int64_t sessionId) {
         pc::Disconnect d; d.sessionId = sessionId; d.correlationId = ++corr_;
         std::vector<uint8_t> buf(pc::Disconnect::ENCODED_SIZE);
@@ -399,6 +474,16 @@ private:
         c.rcvWindowBytes = 128 * 1024;
         return c;
     }
+    template <class M>
+    std::optional<typename M::mapped_type> awaitIn_(M& m, int64_t corr, Clock::time_point deadline) {
+        if (corr == 0) return std::nullopt;
+        while (Clock::now() < deadline) {
+            poll_();
+            if (auto it = m.find(corr); it != m.end()) return it->second;
+            pause_();
+        }
+        return std::nullopt;
+    }
     /// Invoker mode: run the client's driver + conductor duty cycle (no-op when threaded).
     void pump_() {
         if (!invoker_) return;
@@ -449,6 +534,21 @@ private:
             case pc::TemplateId::DefineTopicResponse:
                 if (auto r = pc::DefineTopicResponse::decode(p, n)) defines_[r->correlationId] = *r;
                 break;
+            case pc::TemplateId::SubscribeResponse:
+                if (auto r = pc::SubscribeResponse::decode(p, n)) subscribes_[r->correlationId] = r->errorCode;
+                break;
+            case pc::TemplateId::CreateViewResponse:
+                if (auto r = pc::CreateViewResponse::decode(p, n)) views_[r->correlationId] = *r;
+                break;
+            case pc::TemplateId::AlterTopicResponse:
+                if (auto r = pc::AlterTopicResponse::decode(p, n)) alters_[r->correlationId] = *r;
+                break;
+            case pc::TemplateId::TopicSchemaResponse:
+                if (auto r = pc::TopicSchemaResponse::decode(p, n))
+                    schemas_[r->correlationId] = SchemaAnswer{
+                        r->topicId, r->version, r->errorCode, r->partitionCount,
+                        std::vector<uint8_t>(r->descriptorBlob, r->descriptorBlob + r->descriptorLen)};
+                break;
             case pc::TemplateId::MetadataResponse:
                 if (auto r = pc::MetadataResponse::decode(p, n)) {
                     std::vector<PartitionInfo> v;
@@ -496,6 +596,10 @@ private:
     std::optional<pc::ConnectResponse>              connect_;
     std::map<int64_t, pc::ProduceResponse>          acks_;
     std::map<int64_t, pc::DefineTopicResponse>      defines_;
+    std::map<int64_t, pc::CreateViewResponse>       views_;
+    std::map<int64_t, pc::AlterTopicResponse>       alters_;
+    std::map<int64_t, SchemaAnswer>                 schemas_;
+    std::map<int64_t, int16_t>                      subscribes_;   // SubscribeResponse errorCode by corr
     std::optional<std::vector<PartitionInfo>>       metadata_;
     std::vector<PushedRecords>                      records_;
     std::vector<ErrorSeen>                          errors_;

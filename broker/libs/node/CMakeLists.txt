@@ -960,6 +960,21 @@ if(BUILD_TESTING)
                 PROPERTIES TIMEOUT 60 RESOURCE_LOCK rune_udp_ports
                 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
+            # DDL conformance plan Task 12: DDL serialization + name collisions over
+            # a REAL single-node BrokerNode and real Aeron (T1/T2/T3-T4/T5/T7).
+            add_executable(rune_ddl_broker_tests
+                tests/integration/DdlConformanceBrokerRegressionTest.cpp)
+            target_include_directories(rune_ddl_broker_tests PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+            target_link_libraries(rune_ddl_broker_tests PRIVATE
+                rune_node
+                rune_view
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_ddl_broker_tests
+                PROPERTIES TIMEOUT 180 RESOURCE_LOCK rune_udp_ports
+                ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
             # EmbeddedDriver: one driver, one pumping thread (spec §3.6).
             add_executable(rune_embedded_driver_tests tests/node/EmbeddedDriverTest.cpp)
             target_link_libraries(rune_embedded_driver_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)

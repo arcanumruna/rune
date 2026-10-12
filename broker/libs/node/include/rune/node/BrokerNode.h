@@ -666,6 +666,15 @@ public:
     void skipProvisionerRunnerForTest() noexcept { skipProvisionerRunnerForTest_ = true; }
     /// Test-only: during start(), re-run the SCHEMA log's recovery with this msync errno.
     void setSchemaRecoveryFaultForTest(int err) noexcept { schemaRecoveryFaultForTest_ = err; }
+    /// Test-only (DDL conformance): the control thread answers the FIRST admin
+    /// create-topic request for `name` with a failure.  afterCreate=false fails
+    /// before creating; true creates the topic first (the reply is lost after the
+    /// work — an orphan).  Set before start(); afterwards only the control thread
+    /// reads/writes it (single owner).
+    void setAdminCreateFaultForTest(std::string name, bool afterCreate) {
+        adminCreateFaultName_ = std::move(name);
+        adminCreateFaultAfterCreate_ = afterCreate;
+    }
 
     // -----------------------------------------------------------------------
     // Observers (F9a: ring-fed, no atomics)
@@ -1319,6 +1328,9 @@ private:
     int  recoveryFaultForTest_ = 0;
     bool skipProvisionerRunnerForTest_ = false;
     int  schemaRecoveryFaultForTest_ = 0;
+    std::string adminCreateFaultName_;              // control thread after start()
+    bool        adminCreateFaultAfterCreate_ = false;
+    bool        adminCreateFaultFired_       = false;
     int32_t                                      shardResolveStallWorkerForTest_ = -1;
     std::chrono::milliseconds                    shardResolveStallForTest_{0};
     void buildShardRuntimes_();

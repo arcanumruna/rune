@@ -3867,7 +3867,14 @@ int BrokerNode::serviceAdminControl_() {
                 decodeCreateTopicReq(p, static_cast<std::size_t>(len));
             CreateTopicReplyMsg reply;
             reply.ticket = req.ticket;
-            if (topicRegistry_) {
+            // Test-only fault (setAdminCreateFaultForTest): the first request for the
+            // configured name fails, before or after the topic is created.
+            const bool inject = !adminCreateFaultFired_ && !adminCreateFaultName_.empty() &&
+                                req.name == adminCreateFaultName_;
+            if (inject) adminCreateFaultFired_ = true;
+            if (inject && !adminCreateFaultAfterCreate_) {
+                reply.topicId = -1;
+            } else if (topicRegistry_) {
                 // createTopicForAdmin (AdminCreateTopic.h): createTopic + the
                 // AUTHORITATIVE partition count + `existed` (final review I1 —
                 // an existing name returns that topic, never the requested spec).
@@ -3893,6 +3900,7 @@ int BrokerNode::serviceAdminControl_() {
                         reply.topicId = -1;
                     }
                 }
+                if (inject) { reply.topicId = -1; reply.existed = false; reply.caseConflict = false; }
             }
             // Reply ring is 1-deep in flight (one DDL at a time) → never full.
             (void)encodeCreateTopicReply(agent->replyRing(), reply);
