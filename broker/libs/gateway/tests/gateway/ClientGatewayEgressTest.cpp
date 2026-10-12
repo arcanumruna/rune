@@ -31,7 +31,14 @@
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/RecordBatch.h>
 
+#include <rune/gateway/SpillFifo.h>
+#include <rune/gateway/RequestRejection.h>
+#include <rune/gateway/IGroupRequestHandler.h>
+#include <rune/node/WorkerOp.h>
+#include <rune/protocol/client/GroupMessages.h>
 #include <gtest/gtest.h>
+#include <deque>
+#include <random>
 
 #include <atomic>
 #include <chrono>
@@ -239,7 +246,7 @@ TEST(ClientGatewayEgress, DrainStopsOnBackpressure)
 // handleProduce() (inline path, no WorkerPool) with a back-pressured egress and
 // assert the OK ack is enqueued (not dropped) and later delivered by
 // drainPendingResponses().  If handleProduce's sendResp lambda ever stops
-// routing through enqueueOrBestEffort_, this test fails.
+// routing through sendReliable_, this test fails.
 // ===========================================================================
 
 namespace fs = std::filesystem;
@@ -450,8 +457,7 @@ TEST(ClientGatewayEgressRegression, MalformedPingIsAnsweredErrorResponseRegressi
 {
     CaptureAll cap;
     ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
-    gw.setReliableEgressForTest(true);
-    const int64_t sid = gw.injectTestSession(0);
+    const int64_t sid = gw.injectReliableTestSessionForTest(0);
     const auto f = headerOnlyFrame(pc::TemplateId::Ping, sid, 4321, 0);
     ASSERT_FALSE(pc::Ping::decode(f.data(), f.size()).has_value());
     (void)gw.applyClientFrameForTest(f.data(), f.size());
@@ -467,11 +473,10 @@ TEST(ClientGatewayEgressRegression, CheckFrameRejectIsAnsweredProtocolVersionReg
 {
     CaptureAll cap;
     ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
-    gw.setReliableEgressForTest(true);
-    const int64_t sid = gw.injectTestSession(0);
+    const int64_t sid = gw.injectReliableTestSessionForTest(0);
 
     pc::MessageHeader h;
-    h.blockLength = 0; h.templateId = static_cast<uint16_t>(pc::TemplateId::Produce);
+    h.blockLength = 0; h.templateId = static_cast<uint16_t>(pc::TemplateId::Keepalive);   // no response type
     h.version = static_cast<uint16_t>(pc::kProtocolVersion + 1);
     h.sessionId = sid; h.correlationId = 55;
     std::vector<uint8_t> f(pc::MessageHeader::ENCODED_SIZE);
@@ -489,6 +494,105 @@ TEST(ClientGatewayEgressRegression, CheckFrameRejectIsAnsweredProtocolVersionReg
     ASSERT_TRUE(e.has_value());
     EXPECT_EQ(e->correlationId, 56);
     EXPECT_EQ(e->code, static_cast<int16_t>(pc::ErrorCode::ProtocolVersion));
+
+    // Fix round 2 (I6): a KNOWN request template with a newer version is
+    // answered with ITS OWN response type (an ErrorResponse completes only
+    // control ops on the client): a Produce → ProduceResponse{ProtocolVersion}.
+    h.version = static_cast<uint16_t>(pc::kProtocolVersion + 1);
+    h.templateId = static_cast<uint16_t>(pc::TemplateId::Produce); h.correlationId = 57;
+    h.encode(f.data());
+    (void)gw.applyClientFrameForTest(f.data(), f.size());
+    const auto pr = cap.last<pc::ProduceResponse>();
+    ASSERT_TRUE(pr.has_value()) << "a newer-version Produce was not answered with a ProduceResponse";
+    EXPECT_EQ(pr->correlationId, 57);
+    EXPECT_EQ(pr->errorCode, static_cast<int16_t>(pc::ErrorCode::ProtocolVersion));
+    // ... and a JoinGroup → JoinGroupResponse{ProtocolVersion}.
+    h.templateId = static_cast<uint16_t>(pc::TemplateId::JoinGroup); h.correlationId = 58;
+    h.encode(f.data());
+    (void)gw.applyClientFrameForTest(f.data(), f.size());
+    const auto jr = cap.last<pc::JoinGroupResponse>();
+    ASSERT_TRUE(jr.has_value());
+    EXPECT_EQ(jr->correlationId, 58);
+    EXPECT_EQ(jr->errorCode, static_cast<int16_t>(pc::ErrorCode::ProtocolVersion));
+}
+
+// Fix round 2 (I3): a txn handler returning 0 for anything but EndTxn (its only
+// legal "deferred") is answered Internal, never read as "deferred".
+// (CoordinatorRedirectTest's CountingTxn returns 0 for every request.)
+
+// Fix round 2 (I4): a ViewRowResult whose response would exceed the egress
+// frame is answered ViewRowResponse{RowTooLarge (7)} with no row bytes.
+TEST(ClientGatewayEgressRegression, OversizedViewRowIsAnsweredRowTooLargeRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    const int64_t sid = gw.injectReliableTestSessionForTest(0);
+    rune::node::WorkerReturn ret;
+    ret.type          = rune::node::WorkerReturn::Type::ViewRowResult;
+    ret.sessionId     = sid;
+    ret.correlationId = 707;
+    ret.errorCode     = 0;
+    ret.chunk.assign(200 * 1024, 0x42);   // > the 68 KiB egress scratch
+    ret.recordCount   = static_cast<int32_t>(ret.chunk.size());
+    gw.handleWorkerReturnForTest(ret);
+    const auto v = cap.last<pc::ViewRowResponse>();
+    ASSERT_TRUE(v.has_value()) << "an oversized view row was dropped";
+    EXPECT_EQ(v->correlationId, 707);
+    EXPECT_EQ(v->status, pc::ViewRowResponse::kRowTooLarge);
+    EXPECT_EQ(v->rowBytesLen, 0u);
+}
+
+// Fix round 2 (I5): a HandshakeContinue whose body does not decode fails the
+// handshake in progress (HandshakeFailed on its correlationId, pending connect
+// closed) instead of leaving the client waiting out its connect deadline.
+TEST(ClientGatewayEgressRegression, UndecodableHandshakeContinueFailsTheHandshakeRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.injectPendingHandshakeForTest(/*sessionId=*/4242);
+    ASSERT_EQ(gw.pendingConnectCount(), 1u);
+    const auto f = headerOnlyFrame(pc::TemplateId::HandshakeContinue, 4242, 515, 32);
+    ASSERT_FALSE(pc::HandshakeContinue::decode(f.data(), f.size()).has_value());
+    (void)gw.applyClientFrameForTest(f.data(), f.size());
+    const auto r = cap.last<pc::HandshakeContinueResponse>();
+    ASSERT_TRUE(r.has_value()) << "an undecodable HandshakeContinue left the handshake pending";
+    EXPECT_EQ(r->correlationId, 515);
+    EXPECT_EQ(r->code, static_cast<int16_t>(pc::ErrorCode::HandshakeFailed));
+    EXPECT_EQ(gw.pendingConnectCount(), 0u) << "the failed handshake was not closed";
+}
+
+// Old clients (< kClientVersionInvalidRequest) re-join forever on InvalidRequest /
+// Internal: their malformed JoinGroup is answered ProtocolVersion (non-retriable
+// for them); a current client gets InvalidRequest.
+TEST(ClientGatewayEgressRegression, OldClientMalformedJoinGroupIsAnsweredProtocolVersionRegression)
+{
+    struct NoGroup final : IGroupRequestHandler {
+        size_t handleJoinGroup(const uint8_t* b, size_t n, int64_t, uint8_t* o, size_t c) override {
+            return encodeRejectionFor(b, n, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), o, c);
+        }
+        size_t handleSyncGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+        size_t handleHeartbeat(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+        size_t handleLeaveGroup(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+        size_t handleOffsetCommit(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+        size_t handleOffsetFetch(const uint8_t*, size_t, int64_t, uint8_t*, size_t) override { return 0; }
+    } svc;
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.setGroupService(&svc);
+    const int64_t oldSid = gw.injectReliableTestSessionForTest(0, /*clientVersion=*/4);
+    const int64_t newSid = gw.injectReliableTestSessionForTest(0, pc::kClientVersion);
+    auto f = headerOnlyFrame(pc::TemplateId::JoinGroup, oldSid, 61, 32);
+    gw.applyGroupForTest(f.data(), f.size(), pc::JoinGroup::TEMPLATE_ID);
+    auto j = cap.last<pc::JoinGroupResponse>();
+    ASSERT_TRUE(j.has_value());
+    EXPECT_EQ(j->correlationId, 61);
+    EXPECT_EQ(j->errorCode, static_cast<int16_t>(pc::ErrorCode::ProtocolVersion));
+    f = headerOnlyFrame(pc::TemplateId::JoinGroup, newSid, 62, 32);
+    gw.applyGroupForTest(f.data(), f.size(), pc::JoinGroup::TEMPLATE_ID);
+    j = cap.last<pc::JoinGroupResponse>();
+    ASSERT_TRUE(j.has_value());
+    EXPECT_EQ(j->correlationId, 62);
+    EXPECT_EQ(j->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
 }
 
 // sendControlFrame (DDL answers from the admin thread, deferred EndTxn, Assign)
@@ -498,8 +602,7 @@ TEST(ClientGatewayEgressRegression, ControlFrameIsQueuedUnderBackpressureRegress
     CaptureAll cap;
     cap.backpressure = 1;
     ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
-    gw.setReliableEgressForTest(true);
-    const int64_t sid = gw.injectTestSession(0);
+    const int64_t sid = gw.injectReliableTestSessionForTest(0);
     pc::DefineTopicResponse resp;
     resp.sessionId = sid; resp.correlationId = 12; resp.topicId = 3; resp.version = 1;
     std::vector<uint8_t> f(resp.encodedSize());
@@ -521,8 +624,7 @@ TEST(ClientGatewayEgressRegression, PongIsQueuedUnderBackpressureRegression)
     CaptureAll cap;
     cap.backpressure = 1;
     ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
-    gw.setReliableEgressForTest(true);
-    const int64_t sid = gw.injectTestSession(0);
+    const int64_t sid = gw.injectReliableTestSessionForTest(0);
     pc::Ping ping;
     ping.sessionId = sid; ping.correlationId = 606; ping.echo = "hi";
     std::vector<uint8_t> f(pc::MessageHeader::ENCODED_SIZE + 2 + ping.echo.size());
@@ -544,8 +646,7 @@ TEST(ClientGatewayEgressRegression, UnanswerableMalformedFramesAreCountedRegress
 {
     CaptureAll cap;
     ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
-    gw.setReliableEgressForTest(true);
-    const int64_t sid = gw.injectTestSession(0);
+    const int64_t sid = gw.injectReliableTestSessionForTest(0);
     uint64_t expect = 0;
     for (const auto tid : {pc::TemplateId::Disconnect,
                            pc::TemplateId::Connect, pc::TemplateId::HandshakeContinue}) {
@@ -555,6 +656,190 @@ TEST(ClientGatewayEgressRegression, UnanswerableMalformedFramesAreCountedRegress
     }
     EXPECT_TRUE(cap.frames.empty());
     EXPECT_EQ(gw.sessionCount(), 1u) << "a malformed Disconnect closes nothing";
+}
+
+
+// ===========================================================================
+// No-hang fix round 2 (I1): the egress spill — no best-effort fallback.
+// ===========================================================================
+
+// SpillFifo against a std::deque model: wraps, variable sizes, full → false.
+TEST(ClientGatewayEgressRegression, SpillFifoMatchesAFifoModelAcrossWrapsRegression)
+{
+    SpillFifo f(4096);
+    std::deque<std::pair<int64_t, std::vector<uint8_t>>> model;
+    std::mt19937 rng(7);
+    int64_t key = 0;
+    for (int step = 0; step < 20000; ++step) {
+        if (model.empty() || rng() % 3 != 0) {
+            std::vector<uint8_t> v(rng() % 700);
+            for (auto& b : v) b = static_cast<uint8_t>(rng());
+            if (f.push(++key, v.data(), v.size())) model.emplace_back(key, std::move(v));
+            else ASSERT_FALSE(model.empty()) << "an empty spill refused a record that fits";
+        } else {
+            const auto r = f.front();
+            ASSERT_EQ(r.key, model.front().first);
+            ASSERT_EQ(std::vector<uint8_t>(r.data, r.data + r.len), model.front().second);
+            f.pop();
+            model.pop_front();
+        }
+        ASSERT_EQ(f.count(), model.size());
+    }
+    const std::vector<uint8_t> huge(5000, 1);
+    EXPECT_FALSE(f.push(1, huge.data(), huge.size())) << "a record larger than the spill must be refused";
+}
+
+// A back-pressured 4 KiB answer (larger than the old 512 B slot, which fell back
+// to best-effort) is spilled and delivered once the publication clears; answers
+// behind it keep their per-session order even when the offer would succeed.
+TEST(ClientGatewayEgressRegression, LargeAnswerIsSpilledInOrderNotBestEffortRegression)
+{
+    CaptureAll cap;
+    cap.backpressure = 1;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    const int64_t sid = gw.injectReliableTestSessionForTest(0);
+    const std::vector<uint8_t> blob(4096, 0x5A);
+    pc::TopicSchemaResponse big;
+    big.sessionId = sid; big.correlationId = 1; big.topicId = 7; big.version = 1;
+    big.descriptorBlob = blob.data(); big.descriptorLen = static_cast<uint32_t>(blob.size());
+    std::vector<uint8_t> f1(big.encodedSize());
+    big.encode(f1.data());
+    pc::DefineTopicResponse small;
+    small.sessionId = sid; small.correlationId = 2;
+    std::vector<uint8_t> f2(small.encodedSize());
+    small.encode(f2.data());
+
+    EXPECT_TRUE(gw.sendControlFrame(sid, f1.data(), f1.size()));
+    EXPECT_TRUE(gw.sendControlFrame(sid, f2.data(), f2.size()));   // the egress is clear again
+    EXPECT_TRUE(cap.frames.empty()) << "the second answer overtook the spilled first one";
+    ASSERT_EQ(gw.pendingResponseCount(), 2u);
+    gw.drainPendingResponses(nowNs());
+    ASSERT_EQ(cap.frames.size(), 2u);
+    const auto r1 = pc::TopicSchemaResponse::decode(cap.frames[0].data(), cap.frames[0].size());
+    ASSERT_TRUE(r1.has_value()) << "the 4 KiB answer was lost";
+    EXPECT_EQ(r1->correlationId, 1);
+    EXPECT_EQ(r1->descriptorLen, 4096u);
+    const auto r2 = pc::DefineTopicResponse::decode(cap.frames[1].data(), cap.frames[1].size());
+    ASSERT_TRUE(r2.has_value());
+    EXPECT_EQ(r2->correlationId, 2);
+    EXPECT_EQ(gw.pendingResponseCount(), 0u);
+}
+
+// The spill is full: the session is EXPIRED explicitly (SessionExpired + closed
+// at the next drain — the client fails every pending op SessionLost); its
+// spilled answers are discarded with it, other sessions' answers survive.
+TEST(ClientGatewayEgressRegression, SpillFullExpiresTheSessionExplicitlyRegression)
+{
+    CaptureAll cap;
+    cap.backpressure = 1 << 30;   // the publication never clears
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    const int64_t other = gw.injectReliableTestSessionForTest(0);
+    const int64_t sid   = gw.injectReliableTestSessionForTest(0);
+    pc::DefineTopicResponse o;
+    o.sessionId = other; o.correlationId = 99;
+    std::vector<uint8_t> fo(o.encodedSize());
+    o.encode(fo.data());
+    EXPECT_TRUE(gw.sendControlFrame(other, fo.data(), fo.size()));   // spilled first
+
+    const std::vector<uint8_t> blob(64 * 1024, 0x11);
+    pc::TopicSchemaResponse big;
+    big.sessionId = sid; big.topicId = 7; big.version = 1;
+    big.descriptorBlob = blob.data(); big.descriptorLen = static_cast<uint32_t>(blob.size());
+    std::vector<uint8_t> f(big.encodedSize());
+    for (int64_t corr = 1; corr <= 200; ++corr) {   // 200 x 64 KiB > the 4 MiB spill
+        big.correlationId = corr;
+        big.encode(f.data());
+        (void)gw.sendControlFrame(sid, f.data(), f.size());
+    }
+    EXPECT_TRUE(gw.sessionExistsForTest(sid)) << "closed inside a handler (a caller may still hold it)";
+    cap.backpressure = 0;
+    gw.drainPendingResponses(nowNs());
+    EXPECT_FALSE(gw.sessionExistsForTest(sid)) << "a session the spill could not hold was not expired";
+    EXPECT_TRUE(gw.sessionExistsForTest(other));
+    bool expiredSent = false, otherDelivered = false;
+    for (const auto& fr : cap.frames) {
+        if (auto e = pc::ErrorResponse::decode(fr.data(), fr.size()))
+            expiredSent |= (e->sessionId == sid && e->code == static_cast<int16_t>(pc::ErrorCode::SessionExpired));
+        if (auto d = pc::DefineTopicResponse::decode(fr.data(), fr.size())) otherDelivered |= d->correlationId == 99;
+        if (auto t = pc::TopicSchemaResponse::decode(fr.data(), fr.size()))
+            EXPECT_NE(t->sessionId, sid) << "an expired session's spilled answer was still sent";
+    }
+    EXPECT_TRUE(expiredSent) << "no SessionExpired for the expired session";
+    EXPECT_TRUE(otherDelivered) << "another session's spilled answer was lost";
+    EXPECT_EQ(gw.pendingResponseCount(), 0u);
+}
+
+
+// Fix round 2: a redirect endpoint too long for the frame is never dropped —
+// the produce / subscribe is answered the bare NotLeader (client refreshes).
+TEST(ClientGatewayEgressRegression, OversizedRedirectEndpointFallsBackToNotLeaderRegression)
+{
+    CaptureAll cap;
+    const std::string hugeEndpoint(80 * 1024, 'h');   // > the 68 KiB egress scratch
+    ClientGateway gw = ClientGateway::makeForTestWithLeaderView(
+        cap.fn(), [&] { return LeaderView{/*isLeader=*/false, hugeEndpoint}; }, /*sessionId=*/1);
+    std::vector<std::vector<uint8_t>> direct;
+    gw.setOnEgressFrame([&](int64_t, const uint8_t* b, std::size_t n) { direct.emplace_back(b, b + n); });
+    const int64_t sid = gw.injectReliableTestSessionForTest(0);
+    auto batch = makeBatch();
+    pc::Produce prod;
+    prod.sessionId = sid; prod.correlationId = 71; prod.topicId = 0; prod.partition = 0;
+    prod.partitionKnown = 1; prod.acks = 0; prod.producerId = -1;
+    prod.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
+    std::vector<uint8_t> frame(64 * 1024, 0);
+    gw.applyProduceForTest(frame.data(), prod.encode(frame.data()));
+    auto e = cap.last<pc::ErrorResponse>();
+    ASSERT_TRUE(e.has_value()) << "a produce redirect with an oversized endpoint was dropped";
+    EXPECT_EQ(e->correlationId, 71);
+    EXPECT_EQ(e->code, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_TRUE(e->message.empty());
+
+    pc::Subscribe sub;
+    sub.sessionId = sid; sub.correlationId = 72; sub.topicId = 0; sub.partition = 0; sub.partitionKnown = 1;
+    std::vector<uint8_t> sf(sub.encodedSize());
+    sf.resize(sub.encode(sf.data()));
+    gw.applySubscribeForTest(sf.data(), sf.size());
+    e = cap.last<pc::ErrorResponse>();
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->correlationId, 72) << "a subscribe redirect with an oversized endpoint was dropped";
+    EXPECT_EQ(e->code, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+}
+
+// Fix round 2: an empty / too-short Produce batch is a malformed request —
+// InvalidRequest (39, non-retriable), not Internal; the no-hang stats count
+// the rejected and unanswerable frames.
+TEST(ClientGatewayEgressRegression, EmptyProduceBatchIsInvalidRequestAndStatsCountRegression)
+{
+    CaptureAll cap;
+    const fs::path dir = makeTempDir();
+    std::vector<TopicSpec> specs;
+    { TopicSpec ts; ts.name = "events"; ts.partitionCount = 1; ts.topicId = 0; specs.push_back(ts); }
+    TopicRegistry registry(specs, dir.string());
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.setTopicRegistry(&registry);
+    const int64_t sid = gw.injectReliableTestSessionForTest(0);
+    const std::vector<uint8_t> shortBatch(8, 0);
+    for (const std::size_t n : {std::size_t{0}, shortBatch.size()}) {
+        pc::Produce prod;
+        prod.sessionId = sid; prod.correlationId = 80 + static_cast<int64_t>(n); prod.topicId = 0;
+        prod.partition = 0; prod.partitionKnown = 1; prod.acks = 0; prod.producerId = -1;
+        prod.recordBatch = std::span<const uint8_t>(shortBatch.data(), n);
+        std::vector<uint8_t> frame(1024, 0);
+        gw.applyProduceForTest(frame.data(), prod.encode(frame.data()));
+        const auto r = cap.last<pc::ProduceResponse>();
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->correlationId, 80 + static_cast<int64_t>(n));
+        EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    }
+    const auto f = headerOnlyFrame(pc::TemplateId::Produce, sid, 90, 24);
+    gw.applyProduceForTest(f.data(), f.size());
+    const auto u = headerOnlyFrame(pc::TemplateId::Produce, /*unknown sid=*/999999, 91, 24);
+    gw.applyProduceForTest(u.data(), u.size());
+    const auto st = gw.noHangStats();
+    EXPECT_EQ(st.rejectedRequests, 1u);
+    EXPECT_EQ(st.unanswerableFrames, 1u);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }
 
 } // namespace

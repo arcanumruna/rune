@@ -32,6 +32,7 @@
 //       Pongs echo each id correctly (BR-4 coverage top-up)
 
 #include <rune/gateway/ClientGateway.h>
+#include <rune/node/SessionAckSink.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/PingMessages.h>
 #include <rune/protocol/client/Protocol.h>
@@ -1176,4 +1177,21 @@ TEST_F(GatewayLoopbackFixture, CorrelationId_Distinctness_TwoPings) {
 }
 
 } // namespace
+// No-hang fix round 2: in shard mode a reply channel longer than the workers'
+// fixed ack slot cannot be served — the Connect is REFUSED explicitly
+// (ConnectResponse{InvalidRequest}, no session), not dropped while the client
+// waits out its connect deadline.
+TEST_F(GatewayLoopbackFixture, ShardModeOversizedEgressChannelConnectIsRefusedRegression) {
+    gw_->setShardMode(true);
+    auto client = makeClient(kEgressBase + 40);
+    const std::string longCh = "aeron:ipc?alias=" +
+        std::string(rune::node::SessionAckSink::kMaxChannelBytes, 'a');
+    ASSERT_GT(longCh.size(), rune::node::SessionAckSink::kMaxChannelBytes);
+    auto resp = doConnect(*client.ingressPub, *client.egressSub,
+                          client.egressStreamId, longCh, 41, scratch_);
+    EXPECT_EQ(resp.correlationId, 41);
+    EXPECT_EQ(resp.code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(gw_->sessionCount(), 0u) << "a refused connect created a session";
+}
+
 } // namespace rune::gateway

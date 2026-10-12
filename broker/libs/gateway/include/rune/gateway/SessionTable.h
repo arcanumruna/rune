@@ -80,6 +80,11 @@ struct Session {
     // claimed yet (SessionSignal Credit).  At ClientGateway::sessionProduceCredits()
     // the gateway ABORTs this session's Produce frames.  Dies with the session.
     uint32_t                                       produceInFlight = 0;
+    // No-hang fix round 2 (I1): this session's answers waiting in the gateway's
+    // egress spill (new answers queue behind them: per-session FIFO).
+    // ClientGateway::kSpillExpiring = the spill was full → the session is being
+    // expired (SessionExpired + close at the next drain).
+    uint32_t                                       spilledAnswers = 0;
     // Lows batch C (D8c R3): the worker whose full routed share deferred this
     // session's head Produce (-1 = none).  While set, the redelivered frame is
     // ABORTed by ClientGateway::admitClientFrame_ (one probe) instead of being

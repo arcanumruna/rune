@@ -37,6 +37,15 @@ createTopicForAdmin(rune::gateway::TopicRegistry& reg, const CreateTopicReqMsg& 
     // Task 19: a view SINK is a keyed + Compact "table" — carry the cleanup
     // policy + key field the admin thread resolved (DefineTopic leaves them
     // default: Delete, empty).
+    // Fix round 2: an unknown cleanup-policy byte is refused, never cast into
+    // the enum (Delete 0, Compact 1, CompactDelete 2).
+    if (req.cleanupPolicy > static_cast<uint8_t>(TopicSpec::CleanupPolicy::CompactDelete)) {
+        spdlog::error("createTopicForAdmin('{}'): unknown cleanup-policy byte {} — create refused",
+                      req.name, static_cast<unsigned>(req.cleanupPolicy));
+        reply.topicId = -1;
+        reply.existed = false;
+        return reply;
+    }
     spec.cleanupPolicy  = static_cast<TopicSpec::CleanupPolicy>(req.cleanupPolicy);
     if (!req.keyField.empty()) spec.partitionKey = req.keyField;
     // Phase 2b E: a transient runtime topic is created exactly like a static

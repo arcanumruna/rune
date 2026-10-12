@@ -289,6 +289,18 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
 }
 
 // ---------------------------------------------------------------------------
+// No-hang fix round 2 (I3): a handler returns 0 ONLY for a deferred answer
+// (EndTxn waiting for its markers — ITxnRequestHandler contract).  A response
+// that does not fit the caller's buffer is answered MessageTooLarge (its own
+// response type, encodeRejectionFor) — never a 0 the gateway would read as
+// "deferred" and never answer.
+// ---------------------------------------------------------------------------
+static size_t answerCannotFit_(const uint8_t* buf, size_t len, uint8_t* out, size_t outCap) noexcept {
+    return rune::gateway::encodeRejectionFor(
+        buf, len, static_cast<uint16_t>(rune::protocol::client::ErrorCode::MessageTooLarge), out, outCap);
+}
+
+// ---------------------------------------------------------------------------
 // handleInitProducerId (templateId 45)
 // ---------------------------------------------------------------------------
 size_t TransactionCoordinationService::handleInitProducerId(
@@ -313,7 +325,7 @@ size_t TransactionCoordinationService::handleInitProducerId(
         resp.producerId    = -1;
         resp.producerEpoch = -1;
         resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
-        if (outCap < pc::InitProducerIdResponse::ENCODED_SIZE) return 0;
+        if (outCap < pc::InitProducerIdResponse::ENCODED_SIZE) return answerCannotFit_(buf, len, out, outCap);
         return resp.encode(out);
     }
 
@@ -333,7 +345,7 @@ size_t TransactionCoordinationService::handleInitProducerId(
         resp.producerId    = -1;
         resp.producerEpoch = -1;
         resp.errorCode     = static_cast<int16_t>(pc::ErrorCode::InvalidTxnState);
-        if (outCap < pc::InitProducerIdResponse::ENCODED_SIZE) return 0;
+        if (outCap < pc::InitProducerIdResponse::ENCODED_SIZE) return answerCannotFit_(buf, len, out, outCap);
         return resp.encode(out);
     }
 
@@ -358,7 +370,7 @@ size_t TransactionCoordinationService::handleInitProducerId(
     resp.producerId    = result.producerId;
     resp.producerEpoch = result.producerEpoch;
     resp.errorCode     = txnErrorToProtocol(result.errorCode);
-    if (outCap < pc::InitProducerIdResponse::ENCODED_SIZE) return 0;
+    if (outCap < pc::InitProducerIdResponse::ENCODED_SIZE) return answerCannotFit_(buf, len, out, outCap);
     return resp.encode(out);
 }
 
@@ -383,7 +395,7 @@ size_t TransactionCoordinationService::handleAddPartitions(
         // (no per-call vector alloc — member scratch cleared+refilled).
         const size_t partCount = msg.partitions.size();
         const size_t needed = pc::AddPartitionsToTxnResponse::encodedSizeFor(partCount);
-        if (outCap < needed) return 0;
+        if (outCap < needed) return answerCannotFit_(buf, len, out, outCap);
 
         partResultScratch_.clear();
         for (size_t i = 0; i < partCount; ++i) {
@@ -452,7 +464,7 @@ size_t TransactionCoordinationService::handleAddPartitions(
     // Reuse partResultScratch_ (pre-reserved member) — no per-call alloc.
     const int16_t errCode = txnErrorToProtocol(concurrentIfPreparing_(result.errorCode));
     const size_t needed = pc::AddPartitionsToTxnResponse::encodedSizeFor(partCount);
-    if (outCap < needed) return 0;
+    if (outCap < needed) return answerCannotFit_(buf, len, out, outCap);
 
     partResultScratch_.clear();
     for (size_t i = 0; i < partCount; ++i) {
@@ -487,7 +499,7 @@ size_t TransactionCoordinationService::handleAddOffsets(
 
     if (!ensureLoaded_(nowNs)) {
         resp.errorCode = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
-        if (outCap < pc::AddOffsetsToTxnResponse::ENCODED_SIZE) return 0;
+        if (outCap < pc::AddOffsetsToTxnResponse::ENCODED_SIZE) return answerCannotFit_(buf, len, out, outCap);
         return resp.encode(out);
     }
 
@@ -519,7 +531,7 @@ size_t TransactionCoordinationService::handleAddOffsets(
     }
 
     resp.errorCode = txnErrorToProtocol(concurrentIfPreparing_(result.errorCode));
-    if (outCap < pc::AddOffsetsToTxnResponse::ENCODED_SIZE) return 0;
+    if (outCap < pc::AddOffsetsToTxnResponse::ENCODED_SIZE) return answerCannotFit_(buf, len, out, outCap);
     return resp.encode(out);
 }
 
@@ -543,7 +555,7 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit(
     if (!ensureLoaded_(nowNs)) {
         const size_t entryCount = msg.entries.size();
         const size_t needed = pc::TxnOffsetCommitResponse::encodedSizeFor(entryCount);
-        if (outCap < needed) return 0;
+        if (outCap < needed) return answerCannotFit_(buf, len, out, outCap);
 
         partResultScratch_.clear();
         for (const auto& e : msg.entries) {
@@ -607,7 +619,7 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit(
     const int16_t errCode = txnErrorToProtocol(concurrentIfPreparing_(result.errorCode));
     const size_t entryCount = msg.entries.size();
     const size_t needed = pc::TxnOffsetCommitResponse::encodedSizeFor(entryCount);
-    if (outCap < needed) return 0;
+    if (outCap < needed) return answerCannotFit_(buf, len, out, outCap);
 
     partResultScratch_.clear();
     for (const auto& e : msg.entries) {
@@ -641,7 +653,7 @@ size_t TransactionCoordinationService::handleEndTxn(
 
     if (!ensureLoaded_(nowNs)) {
         resp.errorCode = static_cast<int16_t>(pc::ErrorCode::NotCoordinator);
-        if (outCap < pc::EndTxnResponse::ENCODED_SIZE) return 0;
+        if (outCap < pc::EndTxnResponse::ENCODED_SIZE) return answerCannotFit_(buf, len, out, outCap);
         return resp.encode(out);
     }
 
@@ -688,7 +700,7 @@ size_t TransactionCoordinationService::handleEndTxn(
     // (Prepare* same direction 27 / opposite 19, Complete* same direction 0 /
     // opposite 19 or 18) — no InvalidTxnState→27 remapping here.
     resp.errorCode = txnErrorToProtocol(result.errorCode);
-    if (outCap < pc::EndTxnResponse::ENCODED_SIZE) return 0;
+    if (outCap < pc::EndTxnResponse::ENCODED_SIZE) return answerCannotFit_(buf, len, out, outCap);
     return resp.encode(out);
 }
 

@@ -374,7 +374,7 @@ TEST(SubscribeDedupeRegression, MalformedGetViewRowIsAnsweredInvalidRequestStatu
     EXPECT_EQ(rows[0].status, pc::ViewRowResponse::kInvalidRequest);
 }
 
-TEST(SubscribeDedupeRegression, GetViewRowWithoutWorkersIsAnsweredNotReadyRegression) {
+TEST(SubscribeDedupeRegression, GetViewRowWithoutWorkersIsAnsweredUnknownViewRegression) {
     Rig r(/*workers=*/false);
     std::vector<pc::ViewRowResponse> rows;
     r.gw.setOnEgressFrame([&](int64_t, const uint8_t* b, std::size_t n) {
@@ -385,7 +385,7 @@ TEST(SubscribeDedupeRegression, GetViewRowWithoutWorkersIsAnsweredNotReadyRegres
     r.gw.applyGetViewRowForTest(f.data(), f.size());
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_EQ(rows[0].correlationId, 7071);
-    EXPECT_EQ(rows[0].status, pc::ViewRowResponse::kNotReady);
+    EXPECT_EQ(rows[0].status, pc::ViewRowResponse::kUnknownView) << "a permanent condition is not retriable";
 }
 
 // The owning worker's op ring is full: the read is answered Busy (retriable),

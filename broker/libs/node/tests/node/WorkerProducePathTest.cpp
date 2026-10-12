@@ -768,6 +768,18 @@ TEST(WorkerProduceRegression, UndecodableIngressProduceIsAnsweredInvalidRequestR
     EXPECT_EQ(log.logEndOffset(), 0) << "never appended";
     EXPECT_EQ(worker.undecodableProduceAnswersForTest(), 1u);
 
+    // Fix round 2: an EMPTY batch is a malformed request too — InvalidRequest, not Internal.
+    {
+        const auto emptyFrame = encodeProduceFrameIdem(4243, std::vector<uint8_t>{}, -1);
+        int m = 0; int16_t code = -1;
+        (void)worker.handleIngressFrameForTest(emptyFrame.data(), emptyFrame.size(), 1);
+        worker.drainReturn([&](const WorkerReturn& ret) {
+            if (ret.type == WorkerReturn::Type::ProduceResult) { code = ret.errorCode; ++m; }
+        });
+        ASSERT_EQ(m, 1);
+        EXPECT_EQ(code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    }
+
     const std::vector<uint8_t> noHeader(12, 0);   // < MessageHeader: nothing to answer on
     n = 0;
     (void)worker.handleIngressFrameForTest(noHeader.data(), noHeader.size(), 1);

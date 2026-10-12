@@ -1259,12 +1259,12 @@ TEST(SchemaGatewayRegression, DdlAnswerOnAFullEgressRingIsBackloggedNotDroppedRe
     int64_t posted = 0;
     while (agent.egressBacklogForTest() == 0 && posted < 1'000'000) {
         resp.correlationId = ++posted;
-        agent.postEgressFrame(1, frame, resp.encode(frame));
+        ASSERT_TRUE(agent.postEgressFrame(1, frame, resp.encode(frame)));
     }
     ASSERT_EQ(agent.egressBacklogForTest(), 1u) << "the ring never filled";
     for (int extra = 0; extra < 3; ++extra) {   // FIFO behind the backlog, even if the ring has room
         resp.correlationId = ++posted;
-        agent.postEgressFrame(1, frame, resp.encode(frame));
+        ASSERT_TRUE(agent.postEgressFrame(1, frame, resp.encode(frame)));
     }
     int64_t expect = 1;
     auto drain = [&] {
@@ -1284,4 +1284,48 @@ TEST(SchemaGatewayRegression, DdlAnswerOnAFullEgressRingIsBackloggedNotDroppedRe
     drain();
     EXPECT_EQ(expect, posted + 1) << "every DDL answer delivered exactly once";
     EXPECT_EQ(agent.egressBacklogForTest(), 0u);
+}
+
+// Fix round 2: the admin egress backlog is bounded by construction — while it
+// holds answers, the agent takes NO new DDL request (the request ring fills and
+// the gateway answers Internal); a frame that can never fit one ring message is
+// refused (the caller answers MessageTooLarge) instead of parking forever.
+TEST(SchemaGatewayRegression, AdminEgressBacklogPausesIntakeAndRefusesUnfittableFramesRegression) {
+    SchemaRegistry sreg;
+    rune::node::AdminWorkerAgent agent(sreg, /*replica=*/nullptr, /*selfId=*/1, {1},
+                                       rune::node::AdminDeps{});
+    std::vector<uint8_t> huge(agent.maxEgressFrameBytes() + 1, 0);
+    EXPECT_FALSE(agent.postEgressFrame(1, huge.data(), huge.size()));
+    EXPECT_EQ(agent.egressBacklogForTest(), 0u);
+
+    pc::DefineTopicResponse resp; resp.sessionId = 1;
+    uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::DefineTopicResponse::BODY_FIXED];
+    int64_t corr = 0;
+    while (agent.egressBacklogForTest() == 0 && corr < 1'000'000) {
+        resp.correlationId = ++corr;
+        ASSERT_TRUE(agent.postEgressFrame(1, frame, resp.encode(frame)));
+    }
+    ASSERT_GT(agent.egressBacklogForTest(), 0u);
+    // A DDL request waiting in the request ring is NOT taken while answers wait.
+    GetSchemaMsg g; g.session = 1; g.corr = 7; g.name = "x";
+    ASSERT_TRUE(encodeGetSchema(agent.requestRing(), g));
+    (void)agent.doWork(1);   // the egress ring is still full (nobody drains it)
+    std::size_t pendingRequests = 0;
+    agent.requestRing().drain([&](int32_t, aeron::concurrent::AtomicBuffer&, aeron::util::index_t,
+                                  aeron::util::index_t) { ++pendingRequests; }, 16);
+    EXPECT_EQ(pendingRequests, 1u) << "intake continued while DDL answers were backlogged";
+}
+
+// Fix round 2: an unknown cleanup-policy byte on a create request is refused,
+// never cast into the enum.
+TEST(SchemaGatewayRegression, CreateTopicForAdminRefusesUnknownCleanupPolicyRegression) {
+    const std::string dir = uniqDir("ctc");
+    rune::gateway::TopicRegistry reg(std::vector<rune::node::TopicSpec>{}, dir);
+    CreateTopicReqMsg req; req.ticket = 8; req.partitionCount = 1; req.name = "orders";
+    req.cleanupPolicy = 3;
+    const CreateTopicReplyMsg r = createTopicForAdmin(reg, req);
+    EXPECT_EQ(r.topicId, -1);
+    EXPECT_FALSE(reg.topicIdForName("orders").has_value());
+    req.cleanupPolicy = 2;   // CompactDelete is valid
+    EXPECT_GE(createTopicForAdmin(reg, req).topicId, 0);
 }

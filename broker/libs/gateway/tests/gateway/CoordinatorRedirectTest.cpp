@@ -174,10 +174,9 @@ TEST(CoordinatorRedirectRegression, CoordinatorAnswerIsQueuedUnderBackpressureRe
             return 1;
         },
         [] { return LeaderView{/*isLeader=*/false, "rune-1:40200"}; });
-    gw.setReliableEgressForTest(true);
     CountingGroup group;
     gw.setGroupService(&group);
-    const int64_t sid = gw.injectTestSession();
+    const int64_t sid = gw.injectReliableTestSessionForTest(0);
     const std::string g = "g1";
     pc::JoinGroup q; q.sessionId = sid; q.correlationId = 45; q.sessionTimeoutMs = 10'000;
     q.groupId = {reinterpret_cast<const uint8_t*>(g.data()), g.size()};
@@ -193,6 +192,27 @@ TEST(CoordinatorRedirectRegression, CoordinatorAnswerIsQueuedUnderBackpressureRe
     ASSERT_TRUE(e.has_value());
     EXPECT_EQ(e->correlationId, 45);
     EXPECT_EQ(e->code, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+}
+
+
+// Fix round 2 (I3): 0 is "deferred" ONLY for EndTxn; a 0 from any other txn
+// handler is answered Internal, never silently treated as deferred.
+TEST(CoordinatorRedirectRegression, NonEndTxnZeroAnswerIsAnsweredInternalRegression) {
+    Rig r(LeaderView{/*isLeader=*/true, ""});
+    pc::AddOffsetsToTxn q; q.sessionId = r.sid; q.correlationId = 47; q.producerId = 1; q.producerEpoch = 0;
+    const std::string t = "tx", g = "g";
+    q.transactionalId = {reinterpret_cast<const uint8_t*>(t.data()), t.size()};
+    q.groupId = {reinterpret_cast<const uint8_t*>(g.data()), g.size()};
+    std::vector<uint8_t> f(256);
+    f.resize(q.encode(f.data()));
+    r.gw.applyTxnForTest(f.data(), f.size(), static_cast<uint16_t>(pc::TemplateId::AddOffsetsToTxn));
+    EXPECT_EQ(r.txn.calls, 1);
+    std::optional<pc::AddOffsetsToTxnResponse> resp;
+    for (auto it = r.out.rbegin(); it != r.out.rend() && !resp; ++it)
+        resp = pc::AddOffsetsToTxnResponse::decode(it->data(), it->size());
+    ASSERT_TRUE(resp.has_value()) << "a non-EndTxn 0 was read as deferred and never answered";
+    EXPECT_EQ(resp->correlationId, 47);
+    EXPECT_EQ(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::Internal));
 }
 
 } // namespace

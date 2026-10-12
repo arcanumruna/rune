@@ -22,8 +22,14 @@ struct ITxnRequestHandler {
     virtual ~ITxnRequestHandler() = default;
 
     // Each method decodes the request from buf[0..len-1], acts, encodes the
-    // response into out[0..outCap-1], and returns the number of bytes written
-    // (0 on decode error or unrecoverable failure).
+    // response into out[0..outCap-1], and returns the number of bytes written.
+    //
+    // No-hang contract (fix round 2, I3): EVERY outcome writes an answer — a
+    // body that does not decode answers InvalidRequest, a response that does
+    // not fit outCap answers MessageTooLarge (RequestRejection.h).  0 means
+    // exactly one thing: the answer is DEFERRED (handleEndTxn only: sent via
+    // ClientGateway::sendControlFrame when the transaction's last marker
+    // lands).  The gateway answers Internal for a 0 from any other handler.
     //
     // buf and out MUST NOT overlap.
     // outCap is the capacity of out[] in bytes.

@@ -589,3 +589,26 @@ TEST_F(TransactionCoordinationServiceTest, MalformedTxnRequestsAreAnsweredInvali
     auto et = pc::EndTxnResponse::decode(outBuf_.data(), o);
     ASSERT_TRUE(et.has_value()); EXPECT_EQ(et->correlationId, 5); EXPECT_EQ(et->errorCode, kInv);
 }
+
+// No-hang fix round 2 (I3): a response that does not fit the caller's buffer is
+// answered MessageTooLarge (its own response type) — it used to return 0, which
+// the gateway reads as "deferred" and never answers.
+TEST_F(TransactionCoordinationServiceTest, ResponseThatCannotFitIsAnsweredMessageTooLargeRegression) {
+    std::size_t reqLen = encodeInitProducerId(reqBuf_.data(), reqBuf_.size(), 1, 1, 30'000, "txnBig");
+    std::size_t outLen = svc_->handleInitProducerId(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
+    const auto init = pc::InitProducerIdResponse::decode(outBuf_.data(), outLen);
+    ASSERT_TRUE(init);
+    std::vector<pc::TxnTopicPartition> parts;
+    for (int32_t p = 0; p < 20; ++p) parts.push_back({0, p});   // 24 + 2 + 20*10 B > 64 B
+    reqLen = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, 9, init->producerId, init->producerEpoch,
+                                 "txnBig", parts);
+    ASSERT_GT(reqLen, 0u);
+    constexpr std::size_t kSmallCap = 64;   // kMaxRejectionBytes: room for the rejection only
+    outLen = svc_->handleAddPartitions(reqBuf_.data(), reqLen, 0, outBuf_.data(), kSmallCap);
+    ASSERT_GT(outLen, 0u) << "a response that cannot fit returned 0 (= 'deferred', never answered)";
+    const auto r = pc::AddPartitionsToTxnResponse::decode(outBuf_.data(), outLen);
+    ASSERT_TRUE(r);
+    EXPECT_EQ(r->correlationId, 9);
+    ASSERT_EQ(r->results.size(), 1u);
+    EXPECT_EQ(r->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+}

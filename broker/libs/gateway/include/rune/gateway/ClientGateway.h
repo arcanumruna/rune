@@ -53,6 +53,7 @@
 
 #include <rune/aeronutil/AeronPump.h>
 #include <rune/gateway/SessionTable.h>
+#include <rune/gateway/SpillFifo.h>
 #include <rune/gateway/IGroupRequestHandler.h>
 #include <rune/gateway/ITxnRequestHandler.h>
 #include <rune/gateway/IAdminRequestSink.h>
@@ -83,6 +84,7 @@ namespace rune::node { class WorkerPool; struct WorkerReturn; }
 #include <rune/node/SessionAnnouncer.h>
 // G0.1: ErrorCode enum for sendRespReliable() signature.
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/client/MessageHeader.h>
 
 #include <algorithm>
 #include <array>
@@ -678,7 +680,7 @@ public:
     // ring.  For tests and monitoring.
     // -----------------------------------------------------------------------
     [[nodiscard]] std::size_t pendingResponseCount() const noexcept {
-        return pendingRespCount_;
+        return egressSpill_.count();
     }
 
     // -----------------------------------------------------------------------
@@ -985,11 +987,17 @@ public:
     bool applyClientFrameForTest(const uint8_t* buf, std::size_t len) { return onClientFrame_(buf, len); }
     void applyGetViewRowForTest(const uint8_t* buf, std::size_t len) { handleGetViewRow(buf, len); }
     [[nodiscard]] uint64_t rejectedRequestsForTest() const noexcept { return rejectedRequests_; }
-    // Treat injected (egress-less) test sessions like real ones on the reliable
-    // answer paths (sendSubscribeAnswer_ / sendControlFrame): the answer goes
-    // through enqueueOrBestEffort_ → the TestEgressFn, so a test can apply
-    // back-pressure and see it queued + retried instead of dropped.
-    void setReliableEgressForTest(bool on) noexcept { reliableEgressForTest_ = on; }
+    // No-hang fix round 2: inject a session with a NON-NULL placeholder egress
+    // (never dereferenced: makeForTest's TestEgressFn intercepts every offer of
+    // the reliable answer path), so tests exercise the production answer path
+    // (spill, per-session FIFO, spill-full expiry) — no test flag on it.
+    // Fix round 2 (I5): a handshake in progress (awaitingHandshake, placeholder
+    // reply publication intercepted by the TestEgressFn).
+    void injectPendingHandshakeForTest(int64_t sessionId);
+    int64_t injectReliableTestSessionForTest(int64_t nowNs = 0,
+                                             int32_t clientVersion = rune::protocol::client::kClientVersion);
+    [[nodiscard]] std::size_t egressSpillUsedBytesForTest() const noexcept { return egressSpill_.usedBytes(); }
+    [[nodiscard]] bool sessionExistsForTest(int64_t sid) noexcept { return sessions_.find(sid) != nullptr; }
     [[nodiscard]] uint64_t unanswerableFramesForTest() const noexcept { return unanswerableFrames_; }
     void applyMetadataForTest(const uint8_t* buf, std::size_t len) {
         handleMetadata(buf, len);
@@ -1083,27 +1091,16 @@ private:
     };
 
     // -----------------------------------------------------------------------
-    // G0.1: PendingResp — one already-encoded response frame waiting for the
-    // egress publication to clear back-pressure.
-    //
-    // Pre-allocated inline (no hot-path heap alloc).  The encoded bytes are
-    // copied into `bytes` at enqueue time (encode-once strategy); `sessionId`
-    // identifies the egress session on drain.
-    //
-    // kMaxBytes = 512 covers ProduceResponse (46 B, D6) and ErrorResponse with a
-    // typical redirect URL (< ~450 B).  Responses that exceed kMaxBytes are
-    // sent best-effort and NOT enqueued (same as pre-fix behaviour for those
-    // rare oversized frames).  A static_assert in sendRespReliable_ ensures the
-    // produce-ack path (ProduceResponse::ENCODED_SIZE = 46) always fits.
-    //
-    // Single-writer: all accesses are on the duty-cycle thread only.
+    // No-hang fix round 2 (I1): the egress SPILL — every back-pressured client
+    // answer of any size is kept, in order, in a preallocated byte FIFO
+    // (SpillFifo, kEgressSpillBytes) and re-offered by drainPendingResponses.
+    // There is NO best-effort fallback any more: a session whose answer does
+    // not fit the spill is EXPIRED explicitly (SessionExpired + closeSession_,
+    // so every pending client op completes SessionLost), never silently short
+    // of an answer.
     // -----------------------------------------------------------------------
-    struct PendingResp {
-        static constexpr std::size_t kMaxBytes = 512;
-        std::array<uint8_t, kMaxBytes> bytes{};
-        std::size_t len       = 0;
-        int64_t     sessionId = 0;
-    };
+    static constexpr std::size_t kEgressSpillBytes = 4u << 20;   // 4 MiB
+    static constexpr uint32_t    kSpillExpiring    = UINT32_MAX; // Session::spilledAnswers sentinel
 
     // -----------------------------------------------------------------------
     // Subscription — per-session push subscription (GB-3 / GR-6).
@@ -1243,6 +1240,9 @@ private:
         // ConnectResponse{HandshakeFailed} and creates no session — never
         // installs all-zero keys.
         bool        cryptoFailed = false;
+        // Fix round 2: non-zero = answer ConnectResponse{refuseCode} on the
+        // resolved reply publication and create NO session (explicit refusal).
+        uint16_t    refuseCode = 0;
     };
 
     // -----------------------------------------------------------------------
@@ -1393,7 +1393,7 @@ private:
     void drainPendingAcks();
 
     // -----------------------------------------------------------------------
-    // G0.1: enqueueOrBestEffort_ — THE single reliable-egress primitive.
+    // G0.1: sendReliable_ — THE single reliable-egress primitive.
     //
     // Tries to deliver already-encoded bytes via offerBytes_(session).  On
     // back-pressure (offer <= 0) copies the bytes onto the pendingResponses_
@@ -1405,22 +1405,30 @@ private:
     // this function so the "no silent drop on back-pressure" invariant holds on
     // all paths (inline, worker, deferred acks=All, redirects).
     //
-    // `len` must be <= PendingResp::kMaxBytes; oversized frames (rare long
-    // redirect URLs) are sent best-effort (they cannot fit the fixed ring slot).
+    // No-hang fix round 2 (I1): any size; per-session FIFO (a session with
+    // spilled answers spills every new one behind them); spill full → the
+    // session is expired explicitly (expireForSpill_), never best-effort.
     //
     // Single-writer: duty-cycle thread only.
     // -----------------------------------------------------------------------
-    void enqueueOrBestEffort_(Session& session, const uint8_t* buf, std::size_t len);
-    void sendSubscribeAnswer_(Session& session, const uint8_t* buf, std::size_t len);
+    void sendReliable_(Session& session, const uint8_t* buf, std::size_t len);
+    void expireForSpill_(Session& session);
+    void closeSpillExpiredSessions_();
+    // An answer to a client request: reliable (sendReliable_) on a real
+    // session; an egress-less injected test session goes through sendTo (its
+    // capture hook).
+    void sendAnswer_(Session& session, const uint8_t* buf, std::size_t len);
     // No-hang wave (R2): answer the request in buf[0..len) with its OWN
     // response type carrying `code` (RequestRejection.h) on the header's
     // correlationId — a header-decodable request on a known session is never
     // dropped.  Produce goes through sendRespReliable_ (version-gated frame);
-    // every other answer through sendSubscribeAnswer_ (queued under
+    // every other answer through sendAnswer_ (queued under
     // back-pressure).  Returns false — after noteUnanswerable_ — only when the
     // header does not decode, the session is unknown, or the request type has
     // no response (fire-and-forget).  Cold path; zero allocation.
     bool rejectRequest_(const uint8_t* buf, std::size_t len, uint16_t code, const char* why);
+    bool answerRejection_(Session& session, const rune::protocol::client::MessageHeader& hdr,
+                          uint16_t code, const char* why);
     // The only frames that may go unanswered (undecodable header, unknown
     // session, no response type): counted, warn-logged rate-limited (first,
     // then every 1024th — never a per-frame log on the produce path).
@@ -1432,6 +1440,8 @@ private:
     [[nodiscard]] std::size_t shardSessionSlotsInUse_() const noexcept;
     /// A dropped pending connect whose announcement began → close everywhere.
     void closeDroppedPendingConnect_(const PendingConnect& pending);
+    void failPendingHandshake_(std::deque<PendingConnect>::iterator it, int64_t correlationId);
+    bool offerOnPub_(aeron::ExclusivePublication& pub, const uint8_t* buf, std::size_t len);
     /// Task 19: retry the per-worker crypto-key SessionAnnounce (second
     /// wave) for every session in pendingCryptoAnnounces_ a full worker ring
     /// refused earlier. A session closed/expired in the meantime is dropped
@@ -1518,7 +1528,7 @@ private:
     // -----------------------------------------------------------------------
     // G0.1: sendRespReliable_ — private production implementation.
     // Encodes a ProduceResponse into scratch_ and routes it through
-    // enqueueOrBestEffort_.  Always returns true (never silently drops).
+    // sendReliable_.  Always returns true (never silently drops).
     // Returns false only on encode error (shouldn't happen given static_assert).
     //
     // NOTE: The public 4-param sendRespReliable() delegates here using
@@ -2139,6 +2149,21 @@ public:
     /// pause happened; warn so it shows at the perf log level).  Call once the
     /// control thread is joined.
     void logProducePauseStats() const;
+    // No-hang wave stats (fix round 2): requests answered with an error instead
+    // of dropped, frames that could not be answered, spill expiries.  Read on
+    // the duty thread (or after it joined); logged with logProducePauseStats.
+    struct NoHangStats {
+        uint64_t    rejectedRequests   = 0;
+        uint64_t    unanswerableFrames = 0;
+        uint64_t    spillExpiries      = 0;
+        uint64_t    spillExpiryDrops   = 0;
+        std::size_t spilledAnswers     = 0;
+        std::size_t spillUsedBytes     = 0;
+    };
+    [[nodiscard]] NoHangStats noHangStats() const noexcept {
+        return NoHangStats{rejectedRequests_, unanswerableFrames_, spillExpiries_, spillExpiryDrops_,
+                           egressSpill_.count(), egressSpill_.usedBytes()};
+    }
     /// D8c test seams (control thread only).
     [[nodiscard]] uint64_t creditProduceAbortsForTest() const noexcept { return creditProduceAborts_; }
     [[nodiscard]] uint64_t produceCreditUnderflowsForTest() const noexcept { return produceCreditUnderflows_; }
@@ -2453,27 +2478,10 @@ private:
     // Single-writer: only accessed on the duty-cycle thread.
     std::unordered_map<int64_t, PartitionTxnState> partitionTxnStates_;
 
-    // -----------------------------------------------------------------------
-    // G0.1: Egress retry queue — bounded, pre-allocated, no hot-path alloc.
-    //
-    // pendingResponses_: ring buffer of encoded frames waiting for back-pressure
-    //   to clear.  Head/tail/count are maintained as plain indices (single-writer,
-    //   no CAS/atomics needed).  Capacity: kMaxPendingResponses.
-    //
-    // pendingRespHead_:  index of the first (oldest) entry; popped on drain.
-    // pendingRespCount_: number of live entries (0 = empty).
-    //
-    // When the ring is full and a new response must be enqueued, the frame is
-    // sent best-effort via sendTo (same as pre-fix behaviour) and a warning is
-    // logged.  This is a hard-stop guard — the ring should never fill in practice
-    // (back-pressure clears within a few doWork cycles under normal conditions).
-    //
-    // Single-writer: all accesses on the duty-cycle thread.
-    // -----------------------------------------------------------------------
-    static constexpr std::size_t kMaxPendingResponses = 64;
-    std::array<PendingResp, kMaxPendingResponses> pendingResponses_{};
-    std::size_t pendingRespHead_  = 0;
-    std::size_t pendingRespCount_ = 0;
+    // No-hang fix round 2 (I1): the egress spill (see kEgressSpillBytes).
+    // Single-writer: duty-cycle thread only.  Allocated once at construction.
+    rune::gateway::SpillFifo egressSpill_{kEgressSpillBytes};
+    uint32_t spillExpiriesPending_ = 0;   // sessions marked kSpillExpiring, not yet closed
 
     // G0.1: session id captured at the start of handleProduce; used by the
     // public 4-param sendRespReliable() (test seam) to locate the session.
@@ -2490,7 +2498,8 @@ private:
     // END of the object so no hot member's offset moves.
     uint64_t rejectedRequests_      = 0;       // answered with an error instead of dropped
     uint64_t unanswerableFrames_    = 0;       // dropped: no header / no session / no response type
-    bool     reliableEgressForTest_ = false;   // see setReliableEgressForTest
+    uint64_t spillExpiries_         = 0;       // sessions expired because the egress spill was full
+    uint64_t spillExpiryDrops_      = 0;       // answers to an expiring session (it gets SessionExpired)
 
     // G0.1: Private test constructor (skips Aeron setup).
     // Accessed via makeForTest() only.

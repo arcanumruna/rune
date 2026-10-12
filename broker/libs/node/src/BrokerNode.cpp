@@ -3327,8 +3327,10 @@ void BrokerNode::buildAdminWorker() {
             resp.errorCode     = errorCode;
             uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::DefineTopicResponse::BODY_FIXED];
             const std::size_t n = resp.encode(frame);
-            // No-hang (R2): ring full → admin-owned backlog, retried (never dropped).
-            adminWorkerAgent_->postEgressFrame(session, frame, n);
+            // No-hang (R2): ring full → admin-owned bounded backlog, retried
+            // (never dropped).  A fixed-size answer always fits one ring message.
+            [[maybe_unused]] const bool posted = adminWorkerAgent_->postEgressFrame(session, frame, n);
+            assert(posted && "a fixed-size DDL answer always fits one admin egress message");
         };
         // respondAlter (Task 11): encode the AlterTopicResponse frame and push it
         // on egressRing_ exactly like respondDefine (same single-writer egress path).
@@ -3344,8 +3346,10 @@ void BrokerNode::buildAdminWorker() {
             resp.errorCode     = errorCode;
             uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::AlterTopicResponse::BODY_FIXED];
             const std::size_t n = resp.encode(frame);
-            // No-hang (R2): ring full → admin-owned backlog, retried (never dropped).
-            adminWorkerAgent_->postEgressFrame(session, frame, n);
+            // No-hang (R2): ring full → admin-owned bounded backlog, retried
+            // (never dropped).  A fixed-size answer always fits one ring message.
+            [[maybe_unused]] const bool posted = adminWorkerAgent_->postEgressFrame(session, frame, n);
+            assert(posted && "a fixed-size DDL answer always fits one admin egress message");
         };
         deps.respondGet = [this](int64_t session, int64_t corr, int32_t topicId,
                                  uint16_t version, int32_t partitionCount,
@@ -3364,6 +3368,14 @@ void BrokerNode::buildAdminWorker() {
             resp.descriptorLen  = static_cast<uint32_t>(blob.size());
             // Encode IN PLACE in the claimed egress slot (no per-response frame
             // vector; encodedSize() == encode()'s return by construction).
+            if (resp.encodedSize() > adminWorkerAgent_->maxEgressFrameBytes()) [[unlikely]] {
+                // Fix round 2: a descriptor that can never fit one admin egress
+                // message is answered MessageTooLarge (no blob) — never parked
+                // in the backlog forever, never dropped.
+                resp.descriptorBlob = nullptr;
+                resp.descriptorLen  = 0;
+                resp.errorCode      = static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge);
+            }
             const std::size_t sz = resp.encodedSize();
             auto& ring = adminWorkerAgent_->egressRing();
             const auto idx = adminWorkerAgent_->egressBacklogEmpty()
@@ -3371,10 +3383,13 @@ void BrokerNode::buildAdminWorker() {
             if (idx < 0) [[unlikely]] {
                 // No-hang (R2): ring full (or a backlog ahead, FIFO) → encode
                 // off-ring into the admin-owned backlog, retried — never dropped.
-                std::vector<uint8_t> frame(sz);
-                [[maybe_unused]] const std::size_t w = resp.encode(frame.data());
+                // The frame is staged in the agent's preallocated scratch (no
+                // per-answer allocation) and copied into the backlog.
+                uint8_t* stage = adminWorkerAgent_->egressStage(sz);
+                [[maybe_unused]] const std::size_t w = resp.encode(stage);
                 assert(w == sz && "TopicSchemaResponse encode() != encodedSize()");
-                adminWorkerAgent_->postEgressFrame(session, frame.data(), sz);
+                [[maybe_unused]] const bool posted = adminWorkerAgent_->postEgressFrame(session, stage, sz);
+                assert(posted);
                 return;
             }
             uint8_t* p = ring.base() + idx;
@@ -3401,8 +3416,10 @@ void BrokerNode::buildAdminWorker() {
             resp.errorCode         = errorCode;
             uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::CreateViewResponse::BODY_FIXED];
             const std::size_t n = resp.encode(frame);
-            // No-hang (R2): ring full → admin-owned backlog, retried (never dropped).
-            adminWorkerAgent_->postEgressFrame(session, frame, n);
+            // No-hang (R2): ring full → admin-owned bounded backlog, retried
+            // (never dropped).  A fixed-size answer always fits one ring message.
+            [[maybe_unused]] const bool posted = adminWorkerAgent_->postEgressFrame(session, frame, n);
+            assert(posted && "a fixed-size DDL answer always fits one admin egress message");
         };
 
         // pushViewPlan (Task 19): post a compiled view plan on the admin→control

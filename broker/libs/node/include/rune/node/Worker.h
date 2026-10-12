@@ -979,6 +979,8 @@ public:
     /// disagreed with the RecordBatch header.
     [[nodiscard]] uint64_t identityMismatchRejects() const noexcept { return identityMismatchRejects_; }
     [[nodiscard]] uint64_t oversizeProduceRejectLogsForTest() const noexcept { return oversizeProduceRejectLogs_; }
+    /// No-hang wave: undecodable worker-ingress Produce frames answered InvalidRequest (worker thread).
+    [[nodiscard]] uint64_t undecodableProduceAnswers() const noexcept { return undecodableProduceAnswers_; }
     [[nodiscard]] uint64_t undecodableProduceAnswersForTest() const noexcept { return undecodableProduceAnswers_; }
 
     /// Task 13 fix round 1 (C1a): ops that ride the session-lifecycle ring.
@@ -6337,11 +6339,10 @@ private:
     //
     // E5.1.3 review fixes applied here:
     //   #2: All error-code literals replaced with pc::ErrorCode enum values.
-    //   #3: acksAll derivation: acks != 0 (broader than gateway's acks == 1, but
-    //       safer — catches both acks=Leader (1) and any future all-in-sync flag).
-    //       Gateway uses acks == 1; we use acks != 0 here for defensive correctness:
-    //       the Produce wire field carries 0=NoAck, 1=Leader, -1=All; treating any
-    //       non-zero value as "acks requested" prevents silent false-durability.
+    //   #3: acksAll derivation.  The Produce wire acks byte is two-valued:
+    //       0 = Leader/None (immediate ack), 1 = All (deferred until the ISR HW);
+    //       Produce::decode rejects any other value (no-hang wave), so acks != 0
+    //       and the gateway's acks == 1 agree.
     // -----------------------------------------------------------------------
     // `directAck` (D8d): the admission (SessionAckSink::admitDirect) of this
     // frame — carried by its answer (exactly one: produceCore_ answers every
@@ -6449,10 +6450,8 @@ private:
         if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed from here on
 
         // E5.1.3 review fix #3: acksAll = (acks != 0).
-        // The Produce wire field carries 0=NoAck, 1=Leader, -1 (0xFF)=All.
-        // Using acks != 0 is safer than acks == 1 (the gateway's rule) because
-        // it covers any non-zero acks field including potential future extension
-        // values, preventing silent false-durability on unknown acks values.
+        // The Produce wire acks byte is 0 (Leader/None) or 1 (All); decode
+        // rejects anything else (answered InvalidRequest above).
         ProduceFields f;
         f.sessionId     = msg.sessionId;
         f.correlationId = msg.correlationId;
@@ -6610,10 +6609,10 @@ private:
         // restamps the base offset in place via pwritev — no mutable local copy.
         if (rbSpan.empty()) {
             spdlog::warn("Worker {}: WorkerIngress: empty recordBatch topicId={} "
-                         "partition={}; Internal error ack",
+                         "partition={}; answered InvalidRequest",
                          workerId_, f.topicId, f.partition);
-            // E5.1.3 review fix #2: use enum, not magic literal.
-            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
+            // Fix round 2: a malformed request is InvalidRequest (39), not Internal.
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
             enqueueReturn_(ret);
             return 1;
         }
