@@ -42,7 +42,9 @@ createTopicForAdmin(rune::gateway::TopicRegistry& reg, const CreateTopicReqMsg& 
     // Phase 2b E: a transient runtime topic is created exactly like a static
     // persistence=transient one — TopicRegistry skips its disk dirs and
     // createRuntimeUserReplicas builds it on an InMemoryLog.
-    spec.persistence    = persistenceFromWire(req.persistence);
+    // The ring decode already rejected any byte > 1; an unreachable nullopt
+    // (a hand-built request) falls back to the default (Disk).
+    spec.persistence    = persistenceFromWire(req.persistence).value_or(PersistenceMode::Disk);
 
     try {
         reply.topicId = reg.createTopic(spec);

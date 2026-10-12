@@ -5,6 +5,7 @@
 //
 // Values equal the DefineTopic / TopicSchema wire byte and are APPEND-ONLY.
 #include <cstdint>
+#include <optional>
 
 namespace rune::node {
 
@@ -17,9 +18,12 @@ enum class PersistenceMode : uint8_t {
                      ///  must use majority or all-in-sync durability.
 };
 
-/// Wire byte → mode.  Only 1 is Transient; callers reject values > 1 at decode.
-[[nodiscard]] constexpr PersistenceMode persistenceFromWire(uint8_t b) noexcept {
-    return b == 1 ? PersistenceMode::Transient : PersistenceMode::Disk;
+/// Wire byte → mode.  0 = Disk, 1 = Transient; anything else is nullopt (an
+/// unknown mode is never cast or silently mapped to Disk — decoders reject it).
+[[nodiscard]] constexpr std::optional<PersistenceMode> persistenceFromWire(uint8_t b) noexcept {
+    if (b == 0) return PersistenceMode::Disk;
+    if (b == 1) return PersistenceMode::Transient;
+    return std::nullopt;
 }
 [[nodiscard]] constexpr uint8_t persistenceToWire(PersistenceMode m) noexcept {
     return static_cast<uint8_t>(m);

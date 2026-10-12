@@ -26,6 +26,7 @@ namespace rune::node {
 //   SchemaIncompatible    = 30  (ALTER: ops rejected by the compatibility gate)
 //   SchemaConflict        = 31  (ALTER: stale expectedVersion — optimistic CAS)
 //   ViewSourceTransient   = 37  (CREATE VIEW: persisted view over a transient source)
+//   ViewNotAlterable      = 38  (ALTER TOPIC naming a view's output topic)
 
 // ---------------------------------------------------------------------------
 // AdminDeps — effects the AdminWorker needs, all resolved on the admin thread.
@@ -51,8 +52,9 @@ struct AdminDeps {
     // Task 19: `keyField` + `cleanupPolicy` let the control thread create a VIEW
     // SINK as a keyed + Compact "table".  DefineTopic passes ("", 0) — the
     // pre-Task-19 Delete topic.  Phase 2b E: `persistence` (0 = disk, 1 = transient)
-    // selects the topic's log backend on the control thread; a view sink is always
-    // disk (0).
+    // selects the topic's log backend on the control thread; a view sink is
+    // Disk (0) in Part E; it follows the view's persistence once sinks carry change
+    // events (parked).
     std::function<bool(int64_t ticket, int32_t partitionCount,
                        const std::string& name, const std::string& keyField,
                        uint8_t cleanupPolicy, uint8_t persistence)> requestCreateTopic;

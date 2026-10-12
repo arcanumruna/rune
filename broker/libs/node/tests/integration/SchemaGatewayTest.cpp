@@ -619,11 +619,15 @@ TEST(SchemaGatewayRegression, DiskDefineOverExistingTransientTopicRecordsTransie
     expectRecordedModeMatchesTopic(h, "orders", id, PersistenceMode::Transient);
 }
 
-TEST(SchemaGatewayRegression, TransientDefineOverExistingDiskTopicRecordsDisk) {
+// Final review I1: the client EXPLICITLY asked for a transient topic over an existing
+// schema-less DISK topic.  The topic keeps its log backend, so answering OK would
+// hand back a topic that silently is not transient -> TopicExists, nothing recorded.
+TEST(SchemaGatewayRegression, TransientDefineOverExistingDiskTopicIsTopicExistsRegression) {
     SgHarness h;
     h.realControl = true;
     rune::node::TopicSpec boot; boot.name = "orders"; boot.partitionCount = 2;
     const int32_t id = h.topicReg->createTopic(boot);   // disk, schema-less
+    const int64_t schemaEndBefore = h.schemaLog.logEndOffset();
 
     const auto def = encodeDefineFrame(1, 1, "orders", 2, "userId", false, charsBlob(),
                                        pc::DefineTopic::kPersistenceTransient);
@@ -631,8 +635,29 @@ TEST(SchemaGatewayRegression, TransientDefineOverExistingDiskTopicRecordsDisk) {
     h.pump();
     const auto r = firstFrame<pc::DefineTopicResponse>(h);
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->errorCode, 0u);
-    expectRecordedModeMatchesTopic(h, "orders", id, PersistenceMode::Disk);
+    EXPECT_EQ(r->errorCode, 25u) << "TopicExists";
+    EXPECT_EQ(h.schemaReg.byName("orders"), nullptr) << "no schema recorded";
+    EXPECT_EQ(h.schemaLog.logEndOffset(), schemaEndBefore) << "no TopicSchema record appended";
+    ASSERT_NE(h.topicReg->topic(id), nullptr);
+    EXPECT_EQ(h.topicReg->topic(id)->persistence, PersistenceMode::Disk) << "live topic still Disk";
+}
+
+// Final review M3: a DefineTopic whose body fails protocol decode (unknown
+// persistence byte) must be answered, not dropped (the client would wait its
+// full timeout).
+TEST(SchemaGatewayRegression, DefineTopicUnknownPersistenceByteIsAnsweredInvalidSchemaRegression) {
+    SgHarness h;
+    auto def = encodeDefineFrame(1, 77, "orders", 2, "userId", false, charsBlob(),
+                                 pc::DefineTopic::kPersistenceTransient);
+    def.back() = 2;   // one past Transient
+    ASSERT_FALSE(pc::DefineTopic::decode(def.data(), def.size()).has_value());
+    h.gw.applyDefineTopicForTest(def.data(), def.size());
+    h.pump();
+    const auto r = firstFrame<pc::DefineTopicResponse>(h);
+    ASSERT_TRUE(r.has_value()) << "a malformed DefineTopic must get a response";
+    EXPECT_EQ(r->correlationId, 77);
+    EXPECT_EQ(r->errorCode, 23u) << "InvalidSchema";
+    EXPECT_EQ(h.schemaReg.byName("orders"), nullptr);
 }
 
 // The control-thread `spec.persistence` line really creates a transient topic:

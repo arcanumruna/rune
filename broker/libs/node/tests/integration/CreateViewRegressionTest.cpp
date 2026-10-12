@@ -38,6 +38,7 @@
 
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
+#include <rune/codec/AlterOps.h>
 
 #include <rune/view/ViewPlan.h>
 #include <rune/view/ViewTypes.h>
@@ -47,6 +48,7 @@
 #include <rune/view/ViewRow.h>
 #include <rune/storage/LogReadView.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -156,6 +158,8 @@ protected:
                                          const std::string& keyField, uint8_t cleanupPolicy,
                                          uint8_t /*persistence*/) -> bool {
             pendingTicket_ = ticket;
+            ++createRequests_;
+            maxOutstanding_ = std::max(maxOutstanding_, ++outstandingCreates_);
             pendingReq_ = CreateTopicReqMsg{ticket, parts, name, keyField, cleanupPolicy};
             lastSinkKeyField_      = keyField;       // capture: a view sink is keyed...
             lastSinkCleanupPolicy_ = cleanupPolicy;  // ...and Compact.
@@ -164,14 +168,18 @@ protected:
         deps.pushValidators = [](const RegistryEntry&, int32_t) {};
         deps.respondDefine  = [this](int64_t, int64_t, int32_t topicId, uint16_t, uint16_t err) {
             lastDefineTopicId_ = topicId; lastDefineError_ = err;
+            defineResults_.push_back(err);
         };
         deps.respondGet   = [](int64_t, int64_t, int32_t, uint16_t, int32_t, const std::vector<uint8_t>&, uint16_t) {};
-        deps.respondAlter = [](int64_t, int64_t, int32_t, uint16_t, uint16_t) {};
+        deps.respondAlter = [this](int64_t, int64_t, int32_t topicId, uint16_t version, uint16_t err) {
+            alterResults_.push_back(AlterResult{topicId, version, err});
+        };
         deps.respondCreateView = [this](int64_t, int64_t, int32_t viewTopicId,
                                         uint64_t fp, uint16_t err) {
             lastViewTopicId_  = viewTopicId;
             lastViewFinger_   = fp;
             lastViewError_    = err;
+            viewResults_.push_back(err);
         };
         // Fan the compiled plan out exactly as the control thread does: encode it
         // onto the worker's REAL install ring (the worker drains it on its own
@@ -234,6 +242,7 @@ protected:
                     reply.partitionCount = pendingReq_.partitionCount;
                 }
                 pendingTicket_ = -1;
+                --outstandingCreates_;
                 adminWorker_->onCreateTopicReply(reply);
             }
         }
@@ -261,6 +270,14 @@ protected:
 
     int32_t nextTopicId_   = 0;
     int64_t pendingTicket_ = -1;
+
+    // U2: per-op response capture + create-request accounting.
+    struct AlterResult { int32_t topicId; uint16_t version; uint16_t err; };
+    std::vector<uint16_t>    defineResults_, viewResults_;
+    std::vector<AlterResult> alterResults_;
+    int createRequests_    = 0;   // requestCreateTopic calls
+    int outstandingCreates_ = 0;  // requested, reply not yet delivered
+    int maxOutstanding_     = 0;  // must never exceed 1 (single in-flight DDL op)
 
     int32_t  lastDefineTopicId_ = -1;
     uint16_t lastDefineError_   = 0xffff;
@@ -535,6 +552,168 @@ TEST_F(CreateViewRegression, PersistedViewOverTransientSourceIsRejectedRegressio
     EXPECT_EQ(schemaRegistry_->byName("char_hp"), nullptr) << "no sink topic schema";
     EXPECT_TRUE(lastSinkKeyField_.empty()) << "no sink topic was requested";
     EXPECT_EQ(viewSet_.drainInstalls(), 0);
+}
+
+// Final review M5: an unknown persistence byte on the CreateView ring frame is
+// never cast; the decode marks the message malformed and the worker answers
+// InvalidSchema (23) with the frame's session/corr.
+TEST_F(CreateViewRegression, RingDecodeRejectsUnknownPersistenceByteRegression) {
+    std::vector<uint8_t> raw(8 + 8 + 1 + 2 + 2 + 4, 0);
+    raw[0] = 1;            // session = 1
+    raw[8] = 71;           // corr = 71
+    raw[16] = 2;           // persistence: one past Transient
+    const CreateViewMsg cv = decodeCreateView(raw.data(), raw.size());
+    EXPECT_TRUE(cv.malformed);
+    EXPECT_EQ(cv.session, 1);
+    EXPECT_EQ(cv.corr, 71);
+
+    pendingTicket_ = -1;
+    driveCreateView(cv);
+    EXPECT_EQ(lastViewError_, 23u);
+    EXPECT_EQ(lastViewTopicId_, -1);
+
+    raw[16] = 1;           // a known mode is not flagged
+    EXPECT_FALSE(decodeCreateView(raw.data(), raw.size()).malformed);
+}
+
+// ===========================================================================
+// Final review U1/U2 — DDL serialization + name collisions + view not alterable.
+// Every test enqueues the ops back to back BEFORE any reply is delivered.
+// ===========================================================================
+namespace {
+DefineTopicMsg defineNamed(int64_t corr, const std::string& name, uint8_t persistence = 0) {
+    DefineTopicMsg d;
+    d.session = 1; d.corr = corr; d.partitionCount = 1; d.name = name;
+    d.keyField = "id"; d.validate = false; d.blob = characterBlob(); d.persistence = persistence;
+    return d;
+}
+CreateViewMsg viewNamed(int64_t corr, const std::string& name, int32_t srcTopicId) {
+    CreateViewMsg cv;
+    cv.session = 1; cv.corr = corr; cv.persistence = 0;
+    cv.viewName = name; cv.keyField = "id"; cv.planBlob = charHpPlanBlob(srcTopicId);
+    return cv;
+}
+std::vector<uint8_t> addColumnOps() {
+    rune::codec::AlterOp op{}; op.type = rune::codec::AlterOpType::Add;
+    op.name = "extra"; op.primType = PrimType::Int64; op.fixedLen = 0;
+    return rune::codec::encodeAlterOps({op});
+}
+} // namespace
+
+TEST_F(CreateViewRegression, U1_AlterTopicOnAViewIsViewNotAlterableRegression) {
+    driveDefine(defineNamed(1, "character"));
+    ASSERT_EQ(lastDefineError_, 0u);
+    driveCreateView(viewNamed(2, "char_hp", lastDefineTopicId_));
+    ASSERT_EQ(lastViewError_, 0u);
+    const int64_t schemaEnd = schemaLog_.logEndOffset();
+    const uint16_t versionBefore = schemaRegistry_->byName("char_hp")->version;
+
+    AlterTopicMsg a; a.session = 1; a.corr = 3; a.topicName = "char_hp";
+    a.expectedVersion = 0; a.opsBlob = addColumnOps();
+    adminWorker_->submitAlterTopic(a);
+    pump_();
+
+    ASSERT_EQ(alterResults_.size(), 1u);
+    EXPECT_EQ(alterResults_[0].err, 38u) << "ViewNotAlterable";
+    EXPECT_EQ(schemaLog_.logEndOffset(), schemaEnd) << "nothing appended";
+    EXPECT_EQ(schemaRegistry_->byName("char_hp")->version, versionBefore);
+}
+
+TEST_F(CreateViewRegression, U2_SameNameTopicsBackToBackExactlyOneWinsRegression) {
+    for (const uint8_t secondPersistence : {uint8_t{0}, uint8_t{1}}) {
+        SCOPED_TRACE(secondPersistence);
+        const std::string name = secondPersistence ? "dup_t" : "dup_d";
+        defineResults_.clear(); createRequests_ = 0;
+        const int64_t before = schemaLog_.logEndOffset();
+        adminWorker_->submitDefineTopic(defineNamed(1, name, 0));
+        adminWorker_->submitDefineTopic(defineNamed(2, name, secondPersistence));
+        pump_();
+        ASSERT_EQ(defineResults_.size(), 2u);
+        EXPECT_EQ(defineResults_[0], 0u) << "FIFO: the first define wins";
+        EXPECT_EQ(defineResults_[1], 25u) << "TopicExists";
+        EXPECT_EQ(createRequests_, 1) << "the loser never reaches the control thread";
+        EXPECT_EQ(schemaRegistry_->byName(name)->version, 1u);
+        EXPECT_EQ(schemaLog_.logEndOffset() - before, 1) << "exactly one TopicSchema record";
+        EXPECT_EQ(adminWorker_->pendingCount(), 0u);
+    }
+    EXPECT_EQ(maxOutstanding_, 1);
+}
+
+TEST_F(CreateViewRegression, U2_ViewThenTopicAndTopicThenViewSameNameRegression) {
+    driveDefine(defineNamed(1, "character"));
+    ASSERT_EQ(lastDefineError_, 0u);
+    const int32_t src = lastDefineTopicId_;
+
+    // view X then topic X
+    defineResults_.clear(); viewResults_.clear(); createRequests_ = 0;
+    adminWorker_->submitCreateView(viewNamed(10, "X", src));
+    adminWorker_->submitDefineTopic(defineNamed(11, "X"));
+    pump_();
+    ASSERT_EQ(viewResults_.size(), 1u);
+    ASSERT_EQ(defineResults_.size(), 1u);
+    EXPECT_EQ(viewResults_[0], 0u);
+    EXPECT_EQ(defineResults_[0], 25u) << "topic over a view's name: TopicExists";
+    EXPECT_EQ(createRequests_, 1) << "nothing created for the loser";
+
+    // topic Y then view Y
+    defineResults_.clear(); viewResults_.clear(); createRequests_ = 0;
+    adminWorker_->submitDefineTopic(defineNamed(20, "Y"));
+    adminWorker_->submitCreateView(viewNamed(21, "Y", src));
+    pump_();
+    ASSERT_EQ(defineResults_.size(), 1u);
+    ASSERT_EQ(viewResults_.size(), 1u);
+    EXPECT_EQ(defineResults_[0], 0u);
+    EXPECT_EQ(viewResults_[0], 25u) << "view over a topic's name: TopicExists";
+    EXPECT_EQ(createRequests_, 1);
+    EXPECT_EQ(viewRegistry_->byName("Y"), nullptr);
+    EXPECT_EQ(maxOutstanding_, 1);
+}
+
+TEST_F(CreateViewRegression, U2_SameNameViewsBackToBackOneViewExistsRegression) {
+    driveDefine(defineNamed(1, "character"));
+    ASSERT_EQ(lastDefineError_, 0u);
+    viewResults_.clear(); createRequests_ = 0;
+    adminWorker_->submitCreateView(viewNamed(10, "X", lastDefineTopicId_));
+    adminWorker_->submitCreateView(viewNamed(11, "X", lastDefineTopicId_));
+    pump_();
+    ASSERT_EQ(viewResults_.size(), 2u);
+    EXPECT_EQ(viewResults_[0], 0u);
+    EXPECT_EQ(viewResults_[1], 32u) << "ViewExists";
+    EXPECT_EQ(createRequests_, 1);
+    EXPECT_EQ(viewRegistry_->all().size(), 1u);
+    EXPECT_EQ(maxOutstanding_, 1);
+}
+
+TEST_F(CreateViewRegression, U2_AlterQueuedBehindCreateRunsAfterCommitRegression) {
+    adminWorker_->submitDefineTopic(defineNamed(1, "t"));
+    AlterTopicMsg a; a.session = 1; a.corr = 2; a.topicName = "t";
+    a.expectedVersion = 0; a.opsBlob = addColumnOps();
+    adminWorker_->submitAlterTopic(a);
+
+    // Tick until the create's id request is out; the control reply is withheld.
+    int64_t now = 0;
+    while (pendingTicket_ < 0 && now < 50'000'000LL) { now += 1'000'000LL; adminWorker_->doWork(now); }
+    ASSERT_GE(pendingTicket_, 0);
+    for (int i = 0; i < 5; ++i) { now += 1'000'000LL; adminWorker_->doWork(now); }
+    EXPECT_TRUE(alterResults_.empty()) << "ALTER must not start while the CREATE is in flight";
+    EXPECT_TRUE(defineResults_.empty());
+    EXPECT_EQ(adminWorker_->pendingCount(), 1u) << "the ALTER waits in the FIFO";
+    EXPECT_EQ(schemaRegistry_->byName("t"), nullptr);
+
+    // Deliver the reply; CREATE commits, THEN the ALTER runs and succeeds at v2.
+    CreateTopicReplyMsg reply; reply.ticket = pendingTicket_; reply.topicId = nextTopicId_++;
+    pendingTicket_ = -1; --outstandingCreates_;
+    adminWorker_->onCreateTopicReply(reply);
+    for (int i = 0; i < 100; ++i) { now += 1'000'000LL; adminWorker_->doWork(now); }
+
+    ASSERT_EQ(defineResults_.size(), 1u);
+    EXPECT_EQ(defineResults_[0], 0u);
+    ASSERT_EQ(alterResults_.size(), 1u);
+    EXPECT_EQ(alterResults_[0].err, 0u);
+    EXPECT_EQ(alterResults_[0].version, 2u);
+    EXPECT_EQ(schemaRegistry_->byName("t")->version, 2u);
+    EXPECT_EQ(adminWorker_->pendingCount(), 0u);
+    EXPECT_EQ(maxOutstanding_, 1);
 }
 
 TEST_F(CreateViewRegression, TransientViewOverTransientSourceIsAcceptedAndFoldsRegression) {

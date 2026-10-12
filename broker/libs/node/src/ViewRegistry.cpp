@@ -132,6 +132,7 @@ std::optional<ViewRecord> ViewRecord::deserialize(std::span<const uint8_t> buf) 
     pos += planLen;
 
     if (!readU8(buf, pos, v.persistence)) return std::nullopt;
+    if (v.persistence > 1) return std::nullopt;   // append-only: 0 = persisted, 1 = transient
 
     // Task 19b: an OPTIONAL trailing output-descriptor blob.  A pre-19b record
     // ends exactly here (pos == size) and leaves outputDescriptorBlob empty; a

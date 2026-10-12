@@ -27,6 +27,7 @@ static constexpr uint16_t kViewSourceNotFound = 33;  // plan references a missin
 static constexpr uint16_t kViewFieldUnresolved= 34;  // plan references an unresolved field
 static constexpr uint16_t kViewKeyInvalid     = 35;  // key field invalid under the source schema
 static constexpr uint16_t kViewNotCoPartitioned = 36;  // aggregate group-by not co-partitioned
+static constexpr uint16_t kViewNotAlterable     = 38;  // AlterTopic on a view's output topic
 static constexpr uint16_t kViewSourceTransient  = 37;  // persisted view over a transient source (Phase 2b E)
 
 AdminWorker::AdminWorker(SchemaRegistry& reg,
@@ -219,9 +220,27 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
                                                          : inFlight_->msg.partitionCount;
     // Phase 2b E: AUTHORITATIVE mode from the control thread (same bug class as the
     // partition count): a schema-less existing topic keeps its own log backend.
-    inFlight_->persistence = reply.persistence != CreateTopicReplyMsg::kPersistenceNotReported
+    // (Both bytes were validated <= 1 at ring decode; nullopt is unreachable.)
+    inFlight_->persistence = (reply.persistence != CreateTopicReplyMsg::kPersistenceNotReported
                                  ? persistenceFromWire(reply.persistence)
-                                 : persistenceFromWire(inFlight_->msg.persistence);
+                                 : persistenceFromWire(inFlight_->msg.persistence))
+                                 .value_or(PersistenceMode::Disk);
+
+    // Final review I1: an EXPLICIT `transient topic` define over an existing
+    // schema-less DISK topic cannot be honoured (the topic keeps its log backend);
+    // answering OK would hand the client a topic that silently is not transient.
+    // TopicExists, nothing recorded.  The reverse (no byte / disk request over a
+    // transient topic) stays accepted and records Transient: old clients send no
+    // byte and must keep adopting static persistence=transient topics.
+    if (reply.existed &&
+        inFlight_->msg.persistence == static_cast<uint8_t>(PersistenceMode::Transient) &&
+        inFlight_->persistence == PersistenceMode::Disk) {
+        deps_.respondDefine(inFlight_->msg.session, inFlight_->msg.corr,
+                            reply.topicId, 0, kTopicExists);
+        inFlight_.reset();
+        state_ = DdlState::Idle;
+        return;
+    }
 
     // ── AWAITING_COMMIT ── append the durable TopicSchema record.
     TopicSchema ts;
@@ -455,6 +474,12 @@ void AdminWorker::startNext_(int64_t nowNs) {
 void AdminWorker::startCreateView_(CreateViewMsg msg, int64_t nowNs) {
     namespace rv = rune::view;
 
+    // ── malformed ── the ring decode rejected an unknown persistence byte.
+    if (msg.malformed) {
+        deps_.respondCreateView(msg.session, msg.corr, -1, 0, kInvalidSchema);
+        return;
+    }
+
     // ── leader guard (D) ── DDL is leader-only; views catalog must be wired.
     if (!leader_ || !viewsReplica_ || !viewRegistry_) {
         deps_.respondCreateView(msg.session, msg.corr, -1, 0, kInternal);
@@ -559,7 +584,7 @@ void AdminWorker::startCreateView_(CreateViewMsg msg, int64_t nowNs) {
 
     if (!deps_.requestCreateTopic(op.ticket, sinkPartitions, op.view.viewName,
                                   op.view.keyField, /*cleanupPolicy=*/1 /*Compact*/,
-                                  /*persistence=*/0 /*a view sink is durable*/)) {
+                                  /*persistence=*/0 /*Disk in Part E; follows the view's persistence once sinks carry change events (parked)*/)) {
         deps_.respondCreateView(op.view.session, op.view.corr, -1, 0, kInternal);
         return;
     }
@@ -577,6 +602,13 @@ void AdminWorker::startAlter_(AlterTopicMsg msg, int64_t nowNs) {
     // ── leader guard (D) ── DDL is leader-only.
     if (!leader_ || !replica_) {
         deps_.respondAlter(msg.session, msg.corr, -1, 0, kInternal);
+        return;
+    }
+
+    // U1: a view's output schema is registered in reg_ under the view's name but is
+    //     derived from its plan — never altered directly.  Nothing appended.
+    if (viewRegistry_ && viewRegistry_->byName(msg.topicName)) {
+        deps_.respondAlter(msg.session, msg.corr, -1, 0, kViewNotAlterable);
         return;
     }
 

@@ -67,8 +67,13 @@ before a produce is acknowledged but is **never written to disk**.
 - Its *data* does not: a restarted node rejoins with the topic empty; after a **full-cluster**
   restart the topic is empty. Offsets restart from 0.
 - Persistence is fixed at definition: `alter topic` cannot change it.
-- A view that reads from a transient topic must itself be transient. `create view` over one is
-  rejected with error 37 (`ViewSourceTransient`); use a transient view.
+- Changing a `RUNE_TOPICS` topic's `persistence=` between restarts is unsupported: the schema and
+  view checks keep the mode recorded when the topic was defined.
+- A view that reads from a transient topic must itself be transient. `Client::createView(...,
+  persistence)` (the `CreateView` persistence byte) with a persisted view over a transient source is
+  rejected with error 37 (`ViewSourceTransient`); use a transient view. Rune QL `create view`
+  arrives later.
+- `alter topic` naming a view is rejected with error 38 (`ViewNotAlterable`).
 - Use `durability=majority` (default) or `all-in-sync` if a transient topic must survive a node death.
 - `persistence=memory` in `RUNE_TOPICS` is a deprecated alias of `persistence=transient` and logs
   one warning per entry.

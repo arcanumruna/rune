@@ -145,3 +145,15 @@ TEST(ViewRegistryRegression, DeserializeBogusLengthPrefixReturnsNullopt) {
 
     EXPECT_FALSE(ViewRecord::deserialize(buf).has_value());
 }
+
+// Final review M5: a ViewRecord with an unknown persistence byte is rejected on
+// deserialize (never cast / adopted), a known one still round-trips.
+TEST(ViewRegistryRegression, DeserializeRejectsUnknownPersistenceByte) {
+    ViewRecord v{0x40000007, "char_hp", makeCompiledPlanBlob(0x40000007, "char_hp"), 1};
+    auto bytes = v.serialize();
+    ASSERT_TRUE(ViewRecord::deserialize(bytes).has_value());
+    EXPECT_EQ(ViewRecord::deserialize(bytes)->persistence, 1);
+    // persistence is the byte right after the plan blob (no output-descriptor trailer here).
+    bytes.back() = 2;
+    EXPECT_FALSE(ViewRecord::deserialize(bytes).has_value());
+}

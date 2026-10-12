@@ -52,8 +52,14 @@ transient topic.
 
 ## 5. A view over a transient topic must be transient
 
-`create view` over a transient source is rejected with error 37
-(`ViewSourceTransient`). Use a transient view.
+A persisted view over a transient source (`Client::createView(..., persistence)` / the
+`CreateView` persistence byte) is rejected with error 37 (`ViewSourceTransient`). Use a
+transient view. Rune QL `create view` arrives later.
+
+`alter topic` naming a view is rejected with error 38 (`ViewNotAlterable`).
+
+Changing a `RUNE_TOPICS` topic's `persistence=` between restarts is unsupported: the schema and
+view checks keep the mode recorded when the topic was defined.
 
 ## 6. Upgrade order
 

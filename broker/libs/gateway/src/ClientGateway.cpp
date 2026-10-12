@@ -5644,6 +5644,23 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
     }
     auto msgOpt = pc::DefineTopic::decode(buf, len);
     if (!msgOpt) {
+        // Final review M3: a malformed body (e.g. an unknown persistence byte) must
+        // not leave the client waiting out its timeout.  When the frame header is
+        // readable and the session known, answer InvalidSchema (23) on the
+        // header's correlationId.
+        if (const auto hdr = pc::MessageHeader::decode(buf, len)) {
+            if (Session* es = sessions_.find(hdr->sessionId)) {
+                pc::DefineTopicResponse resp;
+                resp.sessionId     = hdr->sessionId;
+                resp.correlationId = hdr->correlationId;
+                resp.errorCode     = static_cast<uint16_t>(pc::ErrorCode::InvalidSchema);
+                if (resp.encodedSize() <= scratch_.size()) {
+                    const std::size_t n = resp.encode(scratch_.data());
+                    sendTo(*es, scratch_.data(), n);
+                    return;
+                }
+            }
+        }
         spdlog::debug("ClientGateway: DefineTopic decode failed — dropped");
         return;
     }

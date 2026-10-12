@@ -2859,6 +2859,15 @@ TEST(NodeConfig, PersistenceModeWireMapping) {
     EXPECT_EQ(rune::node::persistenceFromWire(1), PersistenceMode::Transient);
 }
 
+TEST(NodeConfigRegression, PersistenceFromWireRejectsUnknownByte) {
+    using rune::node::PersistenceMode;
+    EXPECT_FALSE(rune::node::persistenceFromWire(2).has_value());
+    EXPECT_FALSE(rune::node::persistenceFromWire(0x7f).has_value());
+    EXPECT_FALSE(rune::node::persistenceFromWire(0xff).has_value());
+    EXPECT_TRUE(rune::node::persistenceFromWire(0).has_value());
+    EXPECT_TRUE(rune::node::persistenceFromWire(1).has_value());
+}
+
 // Controller ruling SQ5: RUNE_TRANSIENT_LOG_RING_BYTES is canonical;
 // RUNE_MEMORY_LOG_RING_BYTES is a deprecated alias (one warning).
 TEST(NodeConfigRegression, TransientLogRingBytesCanonical) {

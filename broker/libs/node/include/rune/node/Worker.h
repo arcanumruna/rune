@@ -5140,7 +5140,7 @@ private:
     // uncommitted (open-txn) batch.  Disk sources fold through readNoFault_ (one
     // pread, no page fault); TRANSIENT sources (Phase 2b E) fold through the
     // replica's InMemoryLog::readView (zero-copy, same thread) after
-    // reconcileTransientSource.  Returns the REAL progress count
+    // WorkerViewSet::driveView_ / reconcileTransient_.  Returns the REAL progress count
     // (records folded + checkpoint deltas pushed/held across every driven
     // view) so the node's idle strategy never backs off while view work — a
     // fold that advanced, or a back-pressured delta still awaiting ring space —

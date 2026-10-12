@@ -135,6 +135,7 @@ struct CreateViewMsg {
     int64_t              session     = 0;
     int64_t              corr        = 0;
     uint8_t              persistence = 0;   // 0 = persisted, 1 = transient
+    bool                 malformed   = false;   // ring decode saw an unknown persistence byte
     std::string          viewName;
     std::string          keyField;
     std::vector<uint8_t> planBlob;          // authored ViewPlan (serializeAuthored)
@@ -343,6 +344,11 @@ inline CreateViewMsg decodeCreateView(const uint8_t* buf, std::size_t len) {
     if (len < 19) return m;  // session(8)+corr(8)+persistence(1)+viewNameLen(2)
     m.session = getI64(buf + pos); pos += 8;
     m.corr    = getI64(buf + pos); pos += 8;
+    if (buf[pos] > 1) {   // unknown mode: never cast it — session/corr survive so the
+                          // worker answers InvalidSchema (see startCreateView_)
+        m.malformed = true;
+        return m;
+    }
     m.persistence = buf[pos++];
     const uint16_t nl = getU16(buf + pos); pos += 2;
     if (pos + nl > len) return m;
