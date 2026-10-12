@@ -15,6 +15,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <type_traits>
+#include <variant>
 #include <vector>
 
 using namespace rune::node;
@@ -1388,5 +1390,121 @@ TEST(DdlHarnessRegression, RecoveryViewInstallsAreCountedApartFromCommitInstalls
     h.demote();
     h.promote();
     EXPECT_EQ(h.recoveryViewInstalls(), 4) << "every promotion edge re-recovers the views";
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+// ── Task 10b (hard rule 3): the in-flight DDL op is ONE std::variant of explicit
+//    per-state structs; Idle holds nothing, so no stale op field survives an answer.
+static_assert(std::variant_size_v<AdminWorker::InFlight> == 6,
+              "Idle + Define{AwaitingId,AwaitingCommit} + AlterAwaitingCommit + "
+              "View{AwaitingId,AwaitingCommit}");
+static_assert(std::is_same_v<std::variant_alternative_t<0, AdminWorker::InFlight>, AdminWorker::Idle>,
+              "a default-constructed worker is Idle");
+static_assert(std::is_empty_v<AdminWorker::Idle>, "Idle holds no op variables");
+
+namespace {
+// Tick until `corr` is answered; releases held commits only when asked.
+bool tickUntilAnswered(DdlHarness& h, int64_t corr, bool releaseCommits) {
+    for (int i = 0; i < 50 && !h.response(corr).has_value(); ++i) {
+        if (releaseCommits) h.releaseCommits();
+        h.tick();
+    }
+    return h.response(corr).has_value();
+}
+void expectIdle(DdlHarness& h, const char* where) {
+    EXPECT_EQ(h.worker().inFlightStateName(), "Idle") << where;
+    EXPECT_FALSE(h.worker().hasInFlight()) << where;
+}
+DdlHarnessOptions heldCommits() {
+    DdlHarnessOptions o;
+    o.holdCommits = true;
+    return o;
+}
+}  // namespace
+
+TEST(InFlightStateRegression, IdleWorkerHoldsNoOp) {
+    DdlHarness h;
+    expectIdle(h, "after boot");
+}
+
+TEST(InFlightStateRegression, CommittedOpsWalkTheirStatesAndEndIdle) {
+    DdlHarness h(heldCommits());
+    h.setControl(ControlMode::Hold);
+
+    const int64_t d = h.submit(Op::DefineDisk, "d");
+    ASSERT_TRUE(h.tickUntilCreatePending());
+    EXPECT_EQ(h.worker().inFlightStateName(), "DefineAwaitingId");
+    h.deliverCreate();
+    EXPECT_EQ(h.worker().inFlightStateName(), "DefineAwaitingCommit");
+    for (int i = 0; i < 3; ++i) h.tick();
+    EXPECT_FALSE(h.response(d).has_value());
+    ASSERT_TRUE(tickUntilAnswered(h, d, /*releaseCommits=*/true));
+    EXPECT_EQ(h.response(d)->err, kOk);
+    expectIdle(h, "define committed");
+
+    const int64_t a = h.submit(Op::AlterAdd, "d");
+    ASSERT_TRUE(h.tickUntilAppended());
+    EXPECT_EQ(h.worker().inFlightStateName(), "AlterAwaitingCommit");
+    ASSERT_TRUE(tickUntilAnswered(h, a, /*releaseCommits=*/true));
+    EXPECT_EQ(h.response(a)->err, kOk);
+    EXPECT_EQ(h.response(a)->version, 2u);
+    expectIdle(h, "alter committed");
+
+    const int64_t v = h.submit(Op::ViewPersisted, "v");
+    ASSERT_TRUE(h.tickUntilCreatePending());
+    EXPECT_EQ(h.worker().inFlightStateName(), "ViewAwaitingId");
+    h.deliverCreate();
+    EXPECT_EQ(h.worker().inFlightStateName(), "ViewAwaitingCommit");
+    ASSERT_TRUE(tickUntilAnswered(h, v, /*releaseCommits=*/true));
+    EXPECT_EQ(h.response(v)->err, kOk);
+    expectIdle(h, "view committed");
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+TEST(InFlightStateRegression, EveryUncommittedExitEndsIdle) {
+    DdlHarness h(heldCommits());
+    h.setControl(ControlMode::Hold);
+
+    // AwaitingId -> failed create reply.
+    const int64_t f = h.submit(Op::DefineDisk, "f");
+    ASSERT_TRUE(h.tickUntilCreatePending());
+    h.failCreate(/*afterCreate=*/false);
+    ASSERT_TRUE(h.response(f).has_value());
+    EXPECT_EQ(h.response(f)->err, kInternal);
+    expectIdle(h, "failed create");
+
+    // ViewAwaitingId -> timeout; the late reply is a stale ticket and changes nothing.
+    const int64_t vt = h.submit(Op::ViewPersisted, "vt");
+    ASSERT_TRUE(h.tickUntilCreatePending());
+    EXPECT_EQ(h.worker().inFlightStateName(), "ViewAwaitingId");
+    h.advance(AdminWorker::ddlTimeoutNs() + 1);
+    ASSERT_TRUE(tickUntilAnswered(h, vt, /*releaseCommits=*/false));
+    EXPECT_EQ(h.response(vt)->err, kInternal);
+    expectIdle(h, "view timed out in AwaitingId");
+    h.deliverCreate();
+    expectIdle(h, "stale reply after timeout");
+
+    // DefineAwaitingCommit -> timeout on the held HW gate.
+    const int64_t dt = h.submit(Op::DefineDisk, "dt");
+    ASSERT_TRUE(h.tickUntilCreatePending());
+    h.deliverCreate();
+    EXPECT_EQ(h.worker().inFlightStateName(), "DefineAwaitingCommit");
+    h.advance(AdminWorker::ddlTimeoutNs() + 1);
+    ASSERT_TRUE(tickUntilAnswered(h, dt, /*releaseCommits=*/false));
+    EXPECT_EQ(h.response(dt)->err, kInternal);
+    expectIdle(h, "define timed out in AwaitingCommit");
+
+    // AlterAwaitingCommit -> demotion answers it at once with the ALTER's topic id.
+    const int32_t srcId = h.schemas().byName("src")->topicId;
+    const int64_t a = h.submit(Op::AlterAdd, "src");
+    ASSERT_TRUE(h.tickUntilAppended());
+    EXPECT_EQ(h.worker().inFlightStateName(), "AlterAwaitingCommit");
+    h.demote();
+    ASSERT_TRUE(h.response(a).has_value());
+    EXPECT_EQ(h.response(a)->err, kInternal);
+    EXPECT_EQ(h.response(a)->id, srcId);
+    expectIdle(h, "alter demoted in AwaitingCommit");
+    h.promote();
+    expectIdle(h, "after re-promotion");
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
