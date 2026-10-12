@@ -406,7 +406,8 @@ private:
     void dropFetch_(const TopicPartition& tp, GroupConsumerImpl::FetchSub& fs);
     void dropAllFetch_(GroupConsumerImpl& impl);
     void unsubscribe_(uint32_t session, uint64_t epoch, int64_t subscriptionId, const TopicPartition& tp);
-    void sendOffsetFetchFor_(GroupConsumerImpl& impl, int64_t sessionId, const SendFn& sendFn, bool unknownOnly);
+    /// True when the transport took it (phase Sent); false = refused / nothing to fetch (phase Idle).
+    bool sendOffsetFetchFor_(GroupConsumerImpl& impl, int64_t sessionId, const SendFn& sendFn, bool unknownOnly);
 
     /// RAII: marks impl as "callback running"; on exit, if the callback
     /// finished the consumer, closes its status ring (now that no callback runs).

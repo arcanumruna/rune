@@ -233,6 +233,22 @@ struct GroupConsumerImpl {
     // MEDIUM-2: OffsetFetch re-send pacing (duty-clock ns; 0 = due).
     int64_t offsetFetchDueNs     = 0;
     int64_t offsetFetchBackoffNs = 0;
+    // Flake fix (OffsetFetchNotCoordinatorForever): the latest OffsetFetch's
+    // lifecycle.  The retry pass re-sends ONLY in Idle (paced by
+    // offsetFetchDueNs) or once an Awaiting fetch is unanswered past
+    // offsetFetchAnswerByNs (a lost answer) — never a duplicate of a fetch still
+    // in flight (it superseded the in-flight one's correlationId: one extra
+    // OffsetFetch per generation whenever a duty sweep fell between the eager
+    // Stable-entry fetch and its answer).
+    enum class OffsetFetchPhase : uint8_t {
+        Idle,      // none outstanding (answered / refused send): re-send once due
+        Sent,      // out from an event path (no duty clock there): the next retry pass arms its deadline
+        Awaiting,  // out, unanswered: re-sent only if still unanswered at offsetFetchAnswerByNs
+    };
+    OffsetFetchPhase offsetFetchPhase = OffsetFetchPhase::Idle;
+    int64_t offsetFetchAnswerByNs     = 0;   // duty clock; meaningful in Awaiting only
+    // Zero-alloc OffsetFetch encoding (capacity persists; duty thread only).
+    std::vector<rune::protocol::client::OffsetFetchEntry> fetchEntriesScratch;
     // No-hang fix round 2 (I2): the correlationId of the latest OffsetFetch
     // (only ITS answer seeds positions) and consecutive answers carrying a
     // retriable per-entry error (budget: GroupConsumerHub::kMaxOffsetFetchAttempts).

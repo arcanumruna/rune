@@ -1225,6 +1225,45 @@ TEST(GroupRoutingRegression, OffsetFetchNotCoordinatorFailoverRejoinsWithoutSpen
     }
 }
 
+// Flake fix (OffsetFetchNotCoordinatorForever ~2/10: 10 fetches, not 9): the
+// MEDIUM-2 retry pass re-sent the eager Stable-entry OffsetFetch while it was
+// still in flight (its pacing clock was 0 / left over from an earlier
+// generation), superseding the first one's correlationId — one duplicate
+// fetch whenever a duty sweep fell between the fetch and its answer.  Now a
+// fetch in flight is never duplicated; only one unanswered past
+// sessionTimeoutMs (a lost answer) is re-sent — exactly once per deadline.
+TEST(GroupRoutingRegression, OffsetFetchInFlightIsNeverDuplicatedByTheRetryPassRegression) {
+    GroupRig r(4221, 4222);
+    const auto [n1, p1port] = r.addNode(4221);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4221, ""}, {1, 1, 1, 1, 4221, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment = {{1, 1}};
+    r.gw.holdOffsetFetch = true;   // the eager fetch stays in flight
+    rc::GroupConfig gcfg;
+    gcfg.sessionTimeoutMs = 1'500;  // its answer deadline
+    auto gc = r.client.subscribeGroup("g", {"t"}, gcfg);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.gw.offsetFetches == 1; }, 4'000'000));
+    const auto sentAt = std::chrono::steady_clock::now();
+    // Many duty sweeps (100 ms each) while it is in flight: no duplicate.
+    (void)r.drive([&] { return std::chrono::steady_clock::now() - sentAt > std::chrono::milliseconds(700); },
+                  80'000'000);
+    EXPECT_EQ(r.gw.offsetFetches, 1) << "the retry pass duplicated an OffsetFetch still in flight";
+    // Unanswered past sessionTimeoutMs: a lost answer — re-sent, once.
+    ASSERT_TRUE(r.drive([&] { return r.gw.offsetFetches >= 2; }, 80'000'000)) << "a lost answer was never re-sent";
+    EXPECT_LT(std::chrono::steady_clock::now() - sentAt, std::chrono::milliseconds(1'500 + 1'000));
+    EXPECT_EQ(r.gw.offsetFetches, 2);
+    // The (latest) answer seeds the start offset: the leader-node subscription goes out.
+    r.gw.holdOffsetFetch = false;
+    r.gw.releaseOffsetFetches();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr; }, 4'000'000));
+    EXPECT_EQ(r.gw.offsetFetches, 2);
+    EXPECT_FALSE(gc.finished());
+}
+
 // CG round 4 (A-MEDIUM-3): a rolling upgrade — the seed / coordinator runs v3
 // but p1's leader node still runs an older broker (its pushes would carry no
 // Subscribe correlationId: every batch dropped, a silent stall).  The member

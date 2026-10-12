@@ -566,39 +566,17 @@ void GroupConsumerHub::sendOffsetFetch(GroupConsumerImpl& impl,
                                         int64_t sessionId,
                                         const SendFn& sendFn)
 {
-    if (impl.assignment.empty()) return;
-
-    // Build entry list from current assignment.
-    std::vector<rpc::OffsetFetchEntry> entries;
-    entries.reserve(impl.assignment.size());
-    for (const auto& [tp, _] : impl.assignment) {
-        rpc::OffsetFetchEntry e;
-        e.topicId   = tp.topicId;
-        e.partition = tp.partition;
-        entries.push_back(e);
-    }
-
-    const auto grpSpan = strSpan(impl.groupId);
-    const std::size_t needed = rpc::OffsetFetch::encodedSizeFor(grpSpan, entries.size());
-    ensureBuf(impl, needed);
-
-    rpc::OffsetFetch msg;
-    msg.sessionId     = sessionId;
-    msg.correlationId = kOffsetFetchCorrTag | nextOffsetFetchCorr_++;   // I2: only ITS answer seeds
-    msg.groupId       = grpSpan;
-    impl.offsetFetchCorrId = msg.correlationId;
-
-    const std::size_t len = msg.encode(impl.sendBuf.data(), entries);
-    if (len == 0) return;
-
-    sendFn(0, impl.sendBuf.data(), len);
+    (void)sendOffsetFetchFor_(impl, sessionId, sendFn, /*unknownOnly=*/false);
 }
 
-void GroupConsumerHub::sendOffsetFetchFor_(GroupConsumerImpl& impl, int64_t sessionId,
+bool GroupConsumerHub::sendOffsetFetchFor_(GroupConsumerImpl& impl, int64_t sessionId,
                                            const SendFn& sendFn, bool unknownOnly)
 {
-    // Cold (MEDIUM-2 retry): only the partitions whose start offset is unknown.
-    std::vector<rpc::OffsetFetchEntry> entries;
+    // unknownOnly (MEDIUM-2 retry): only the partitions whose start offset is
+    // unknown; otherwise the whole assignment.  Encoded from a scratch whose
+    // capacity persists (zero steady-state allocation).
+    auto& entries = impl.fetchEntriesScratch;
+    entries.clear();
     for (const auto& [tp, _] : impl.assignment) {
         if (unknownOnly) {
             const auto f = impl.fetch.find(tp);
@@ -609,16 +587,21 @@ void GroupConsumerHub::sendOffsetFetchFor_(GroupConsumerImpl& impl, int64_t sess
         e.partition = tp.partition;
         entries.push_back(e);
     }
-    if (entries.empty()) return;
+    if (entries.empty()) return false;
     const auto grpSpan = strSpan(impl.groupId);
     ensureBuf(impl, rpc::OffsetFetch::encodedSizeFor(grpSpan, entries.size()));
     rpc::OffsetFetch msg;
     msg.sessionId     = sessionId;
-    msg.correlationId = kOffsetFetchCorrTag | nextOffsetFetchCorr_++;   // I2
+    msg.correlationId = kOffsetFetchCorrTag | nextOffsetFetchCorr_++;   // I2: only ITS answer seeds
     msg.groupId       = grpSpan;
     impl.offsetFetchCorrId = msg.correlationId;
     const std::size_t len = msg.encode(impl.sendBuf.data(), entries);
-    if (len > 0 && sendFn) (void)sendFn(0, impl.sendBuf.data(), len);  // refused: the next retry pass
+    const bool sent = len > 0 && sendFn && sendFn(0, impl.sendBuf.data(), len);
+    // Refused: Idle (the next retry pass re-offers it, paced).  Sent: awaiting
+    // its answer — the retry pass never duplicates it while it is in flight.
+    impl.offsetFetchPhase = sent ? GroupConsumerImpl::OffsetFetchPhase::Sent
+                                 : GroupConsumerImpl::OffsetFetchPhase::Idle;
+    return sent;
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,8 +984,27 @@ int GroupConsumerHub::retryOffsetFetch(int64_t nowNs, int64_t sessionId, const S
             impl->offsetFetchBackoffNs = 0;
             continue;
         }
-        if (nowNs < impl->offsetFetchDueNs) continue;
-        sendOffsetFetchFor_(*impl, sessionId, sendFn, /*unknownOnly=*/true);
+        // Answer deadline of a fetch in flight: a lost answer is re-sent, a
+        // slow one never duplicated (the coordinator evicts a member silent
+        // for sessionTimeoutMs anyway).
+        const int64_t answerTimeoutNs = int64_t{impl->cfg.sessionTimeoutMs} * 1'000'000LL;
+        using Phase = GroupConsumerImpl::OffsetFetchPhase;
+        switch (impl->offsetFetchPhase) {
+        case Phase::Sent:       // the eager Stable-entry / Assign fetch: arm its deadline
+            impl->offsetFetchPhase      = Phase::Awaiting;
+            impl->offsetFetchAnswerByNs = nowNs + answerTimeoutNs;
+            continue;
+        case Phase::Awaiting:
+            if (nowNs < impl->offsetFetchAnswerByNs) continue;   // still in flight
+            break;                                               // unanswered: re-send
+        case Phase::Idle:
+            if (nowNs < impl->offsetFetchDueNs) continue;        // paced
+            break;
+        }
+        if (sendOffsetFetchFor_(*impl, sessionId, sendFn, /*unknownOnly=*/true)) {
+            impl->offsetFetchPhase      = Phase::Awaiting;
+            impl->offsetFetchAnswerByNs = nowNs + answerTimeoutNs;
+        }
         // Pacing only (the answer, not this clock, decides): 100 ms doubling to 2 s.
         impl->offsetFetchBackoffNs = impl->offsetFetchBackoffNs == 0
             ? 100'000'000LL : std::min<int64_t>(impl->offsetFetchBackoffNs * 2, 2'000'000'000LL);
@@ -1380,6 +1382,11 @@ void GroupConsumerHub::onSyncGroupResponse(const uint8_t* buf, std::size_t len,
 
         if (v == GroupVerdict::Ok) {
             impl->offsetFetchAttempts = 0;   // fix round 3: a new generation starts a fresh fetch budget
+            // A new generation starts fresh OffsetFetch pacing (never a clock
+            // left over from an earlier generation) with nothing in flight.
+            impl->offsetFetchBackoffNs = 0;
+            impl->offsetFetchDueNs     = 0;
+            impl->offsetFetchPhase     = GroupConsumerImpl::OffsetFetchPhase::Idle;
             // Build new assignment from SyncGroupResponse.
             std::vector<TP> newAsgn;
             for (const auto& tp : opt->assignment) {
@@ -1518,6 +1525,7 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
         // OffsetFetch (echoed correlationId) — never the first Stable consumer's
         // by accident, never a stale answer.
         if (impl->offsetFetchCorrId == 0 || opt->correlationId != impl->offsetFetchCorrId) continue;
+        impl->offsetFetchPhase = GroupConsumerImpl::OffsetFetchPhase::Idle;   // answered: none in flight
 
         bool refused = false;
         bool rejoin = false;
