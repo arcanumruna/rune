@@ -252,6 +252,7 @@ TEST_P(DdlPairTimingMatrixRegression, AThenB) {
     const int64_t schemaEnd0 = h.schemaLogEnd();
     const int64_t viewsEnd0 = h.viewsLogEnd();
     const int plans0 = h.viewPlanPushes();
+    const int recovery0 = h.recoveryViewInstalls();
 
     const Ran r = runPair(h, c);
     if (HasFatalFailure()) return;
@@ -279,9 +280,13 @@ TEST_P(DdlPairTimingMatrixRegression, AThenB) {
         << "TopicSchema records appended (A's + B's)";
     EXPECT_EQ(h.viewsLogEnd() - viewsEnd0, (aOk ? viewRecs(c.a) : 0) + (bWrote ? viewRecs(c.b) : 0))
         << "__views records appended (A's + B's)";
-    if (c.t != Timing::T7_RestartBetween)   // a restart re-installs every view (the counter keeps counting)
-        EXPECT_EQ(h.viewPlanPushes() - plans0, (aOk ? viewRecs(c.a) : 0) + (bWrote ? viewRecs(c.b) : 0))
-            << "worker view installs (A's + B's)";
+    EXPECT_EQ(h.viewPlanPushes() - plans0, (aOk ? viewRecs(c.a) : 0) + (bWrote ? viewRecs(c.b) : 0))
+        << "worker view installs (A's + B's)";
+    // A restart re-installs every committed view as a recovery install (T7: A's
+    // view, if A made one); a T6 flap's re-promotion has no committed view to
+    // recover (A failed); no other timing promotes.
+    EXPECT_EQ(h.recoveryViewInstalls() - recovery0, c.t == Timing::T7_RestartBetween ? viewRecs(c.a) : 0)
+        << "recovery view installs";
 
     // Final registry state of both names.
     const Catalog fin = h.catalog();

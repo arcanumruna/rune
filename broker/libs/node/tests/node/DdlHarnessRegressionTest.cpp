@@ -1333,3 +1333,60 @@ TEST(DdlFixRegression, B4_MissingViewsReplicaInAwaitingCommitAnswersInternal) {
     EXPECT_EQ(h.viewPlanPushes(), pushes0);
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
+
+// ── Task 10 fix round 1: harness restart keeps the replica set; restart-aware installs ──
+
+TEST(DdlHarnessRegression, MultiNodeRestartKeepsTheReplicaSetAndHoldsCommitsAgain) {
+    DdlHarnessOptions o;
+    o.holdCommits = true;
+    DdlHarness h(o);
+    const int64_t a = h.submit(Op::DefineTransient, "t");
+    h.settle();
+    ASSERT_TRUE(h.response(a).has_value());
+    ASSERT_EQ(h.response(a)->err, kOk);
+    const Catalog before = h.catalog();
+
+    h.restart();
+    EXPECT_TRUE(h.holdingCommits()) << "replica set {1,2} survives the restart";
+    EXPECT_FALSE(h.commitHeld()) << "the rebooted leader learned the committed HW";
+    EXPECT_EQ(h.catalog(), before) << "promotion replayed both catalogs up to the learned HW";
+
+    // A commit after the restart is held until follower 2 fetches.
+    const int64_t b = h.submit(Op::AlterAdd, "t");
+    ASSERT_TRUE(h.tickUntilAppended());
+    for (int i = 0; i < 20; ++i) h.tick();
+    EXPECT_TRUE(h.commitHeld());
+    EXPECT_FALSE(h.response(b).has_value()) << "held on the HW gate after a restart";
+    h.releaseCommits();
+    h.tick();
+    ASSERT_TRUE(h.response(b).has_value());
+    EXPECT_EQ(h.response(b)->err, kOk);
+    EXPECT_EQ(h.response(b)->version, 2u);
+
+    // A leadership flap after the restart keeps the catalog (rebuild from the HW).
+    h.demote();
+    h.promote();
+    h.settle();
+    EXPECT_EQ(h.schemas().byName("t")->version, 2u);
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+TEST(DdlHarnessRegression, RecoveryViewInstallsAreCountedApartFromCommitInstalls) {
+    DdlHarness h;
+    const int64_t v = h.submit(Op::ViewPersisted, "v");
+    const int64_t tv = h.submit(Op::ViewTransient, "tv");
+    h.settle();
+    ASSERT_EQ(h.response(v)->err, kOk);
+    ASSERT_EQ(h.response(tv)->err, kOk);
+    EXPECT_EQ(h.viewPlanPushes(), 2) << "one commit install per committed CREATE VIEW";
+    EXPECT_EQ(h.recoveryViewInstalls(), 0);
+
+    h.restart();
+    EXPECT_EQ(h.viewPlanPushes(), 2) << "a restart adds no commit install";
+    EXPECT_EQ(h.recoveryViewInstalls(), 2) << "one recovery install per recovered view";
+
+    h.demote();
+    h.promote();
+    EXPECT_EQ(h.recoveryViewInstalls(), 4) << "every promotion edge re-recovers the views";
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}

@@ -20,8 +20,12 @@
 // never thrown: every test asserts violations().empty().
 //
 // restart() runs recoverRuntimeTopics + reconcileTopicDirs exactly as
-// BrokerNode::start does, then always reboots single-node (replica set {1}): promotion replays the
-// catalogs up to the HW, which a single-node leader advances to its LEO.
+// BrokerNode::start does, then reboots with the SAME replica set.  Single-node
+// ({1}): promotion replays the catalogs up to the HW, which a single-node leader
+// advances to its LEO.  Multi-node ({1,2}, holdCommits): the rebooted node first
+// follows node 2 (which holds every appended record) and learns the committed HW
+// from one empty fetch answer, then is promoted — promotion replays up to that HW,
+// and later commits are held again until releaseCommits().
 //
 // Single-threaded, test-only.  Must NOT be included from production code.
 #include "DdlExpectations.h"
@@ -101,6 +105,22 @@ inline std::vector<uint8_t> alterOpsFor(Op op, uint64_t uniq) {
     return rune::codec::encodeAlterOps({o});
 }
 
+/// Authored {id, hp} Replace view keyed by "id" over EVERY id in `srcTopicIds`
+/// (output fields read source 0).  Phase 1 views are single-source: the compiler
+/// rejects 2+ sources fail-closed (ViewFieldUnresolved) AFTER the per-source checks.
+inline std::vector<uint8_t> viewPlanBlob(const std::string& viewName, const std::vector<int32_t>& srcTopicIds,
+                                         uint8_t persistence) {
+    namespace rv = rune::view;
+    rv::ViewPlan p;
+    p.viewName = viewName;
+    p.key = "id";
+    p.persistence = persistence;
+    for (const int32_t id : srcTopicIds) p.sources.push_back(rv::SourceSpec{id, "id"});
+    p.output.push_back(rv::AuthoredField{"id", rune::codec::PrimType::Int64, 0, "id", rv::MergeRule::Replace});
+    p.output.push_back(rv::AuthoredField{"hp", rune::codec::PrimType::Int64, 0, "hp", rv::MergeRule::Replace});
+    return rv::serializeAuthored(p);
+}
+
 // ── catalog snapshot ────────────────────────────────────────────────────────
 enum class EntryKind : uint8_t { SchemaLess, Typed, View };
 
@@ -164,6 +184,7 @@ public:
 
     // ── submit (returns the op's correlation id) ────────────────────────────
     int64_t submit(Op op, const std::string& name, const std::string& viewSource = "src") {
+        if (isView(op)) return submitView(op, name, {viewSource});
         const int64_t corr = nextCorr_(op);
         switch (op) {
             case Op::DefineDisk:
@@ -173,16 +194,6 @@ public:
                 m.name = name; m.keyField = "id"; m.blob = charBlob();
                 m.persistence = op == Op::DefineTransient ? 1 : 0;
                 w_->submitDefineTopic(std::move(m));
-                break;
-            }
-            case Op::ViewPersisted:
-            case Op::ViewTransient: {
-                CreateViewMsg m;
-                m.session = 1; m.corr = corr; m.persistence = op == Op::ViewTransient ? 1 : 0;
-                m.viewName = name; m.keyField = "id";
-                const RegistryEntry* s = schemas_->byName(viewSource);
-                m.planBlob = viewPlanBlob(name, s ? s->topicId : -1, m.persistence);
-                w_->submitCreateView(std::move(m));
                 break;
             }
             case Op::GetSchema: {
@@ -205,6 +216,22 @@ public:
                 break;
             }
         }
+        return corr;
+    }
+    /// CREATE VIEW over several sources, each resolved name -> topic id at SUBMIT
+    /// time exactly like submit() (an unknown name -> id -1).
+    int64_t submitView(Op op, const std::string& name, const std::vector<std::string>& sources) {
+        const int64_t corr = nextCorr_(op);
+        CreateViewMsg m;
+        m.session = 1; m.corr = corr; m.persistence = op == Op::ViewTransient ? 1 : 0;
+        m.viewName = name; m.keyField = "id";
+        std::vector<int32_t> ids;
+        for (const std::string& src : sources) {
+            const RegistryEntry* e = schemas_->byName(src);
+            ids.push_back(e ? e->topicId : -1);
+        }
+        m.planBlob = viewPlanBlob(name, ids, m.persistence);
+        w_->submitCreateView(std::move(m));
         return corr;
     }
     /// Malformed / hand-built requests: the harness only stamps session + corr.
@@ -324,13 +351,13 @@ public:
         w_->onRole(AdminRoleMsg{/*leader=*/true, epoch_, /*leaderId=*/1});
         checkInvariant_("promote");
     }
-    /// A broker restart (only when quiescent): reboot single-node from the same dataDir.
+    /// A broker restart (only when quiescent): reboot from the same dataDir with the
+    /// same replica set ({1,2} stays {1,2}: commits can be held after a restart).
     void restart() {
         if (!quiescent()) violations_.push_back("restart requested while not quiescent");
-        opt_.holdCommits = false;
         startedBeforeBoot_ += w_->startedCount();
         teardown_();
-        boot_();
+        boot_(/*reboot=*/true);
     }
 
     // ── checker self-test ───────────────────────────────────────────────────
@@ -401,7 +428,12 @@ public:
         return s;
     }
     [[nodiscard]] int createRequests() const noexcept { return createRequests_; }
+    /// Worker view installs made by a committed CREATE VIEW (restart-aware: the
+    /// recovery installs a promotion fans out are counted apart, below).
     [[nodiscard]] int viewPlanPushes() const noexcept { return viewPlanPushes_; }
+    /// Recovery installs (ViewPlanUpdateMsg::recovery): one per recovered view on
+    /// every promotion edge — a boot / restart or a demote + promote flap.
+    [[nodiscard]] int recoveryViewInstalls() const noexcept { return recoveryViewInstalls_; }
     [[nodiscard]] int validatorPushes() const noexcept { return validatorPushes_; }
     [[nodiscard]] int64_t schemaLogEnd() const { return schemaLog_->logEndOffset(); }
     [[nodiscard]] int64_t viewsLogEnd() const { return viewsLog_->logEndOffset(); }
@@ -438,7 +470,7 @@ private:
         return c;
     }
 
-    void boot_() {
+    void boot_(bool reboot = false) {
         std::vector<TopicSpec> specs = opt_.statics;
         RecoveredRuntimeTopics recovered =
             recoverRuntimeTopics(root_.string(), static_cast<int32_t>(opt_.statics.size()));
@@ -481,7 +513,9 @@ private:
             return true;
         };
         d.pushValidators = [this](const RegistryEntry&, int32_t) { ++validatorPushes_; };
-        d.pushViewPlan   = [this](const ViewPlanUpdateMsg&) { ++viewPlanPushes_; };
+        d.pushViewPlan   = [this](const ViewPlanUpdateMsg& vp) {
+            if (vp.recovery) ++recoveryViewInstalls_; else ++viewPlanPushes_;
+        };
         // B10 / D4: the admin->control kA2cTopicCommitted hand-off; the simulated
         // control thread rewrites the dir marker pending -> committed in tick().
         d.topicCommitted = [this](int32_t topicId) { committedTopics_.push_back(topicId); };
@@ -505,7 +539,30 @@ private:
         refusedSeen_ = 0;
         creates_.clear();
         committedTopics_.clear();
+        if (reboot && opt_.holdCommits) learnCommittedHwFromPeer_();
         promote();
+    }
+
+    /// Multi-node reboot: follow node 2 (it holds every appended record — a restart
+    /// happens only when quiescent) and learn the committed HW from one empty fetch
+    /// answer, so the promotion that follows replays the catalogs up to it.
+    void learnCommittedHwFromPeer_() {
+        ++epoch_;
+        for (auto [r, topicId] : {std::pair{schemaReplica_.get(), kSchemaTopicId},
+                                  std::pair{viewsReplica_.get(), kViewsTopicId}}) {
+            r->becomeFollower(static_cast<rune::replication::Epoch>(epoch_), /*leaderId=*/2);
+            rune::replication::FetchResponseMsg resp{};
+            resp.leaderEpoch = static_cast<rune::replication::Epoch>(epoch_);
+            resp.partition = 0;
+            resp.highWatermark = r->logEndOffset();
+            resp.logStartOffset = 0;
+            resp.errorCode = rune::replication::kErrNone;
+            resp.topicId = topicId;
+            r->applyReplicated(resp);
+            if (r->highWatermark() != r->logEndOffset())
+                violations_.push_back("reboot: follower did not learn the committed HW (topic " +
+                                      std::to_string(topicId) + ")");
+        }
     }
 
     void teardown_() {
@@ -599,7 +656,7 @@ private:
     uint64_t answeredSinceBoot_ = 0;
     uint64_t refusedSeen_ = 0;          // queue-full refusals already accounted (kMaxPendingDdl)
     uint64_t startedBeforeBoot_ = 0;
-    int      createRequests_ = 0, viewPlanPushes_ = 0, validatorPushes_ = 0;
+    int      createRequests_ = 0, viewPlanPushes_ = 0, recoveryViewInstalls_ = 0, validatorPushes_ = 0;
 };
 
 } // namespace rune::node::test
