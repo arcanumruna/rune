@@ -168,6 +168,10 @@ public:
     /// No-hang fix round 4 (item 8): every member tracked on `sessionId` leaves
     /// its group (subscriptions revoked, session mapping dropped).  Cold.
     void evictSessionMembers(int64_t sessionId, int64_t nowNs) override;
+    /// No-hang fix round 5 (N23): only the request's (group, member) on `sessionId`
+    /// (memberId empty: this session's members of that group).  Cold.
+    void evictMember(std::string_view groupId, std::string_view memberId, int64_t sessionId,
+                     int64_t nowNs) override;
 
 private:
     // -----------------------------------------------------------------------

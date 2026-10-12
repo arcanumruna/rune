@@ -1015,11 +1015,16 @@ public:
     /// Fix round 4: the spill's sizing (tests / benches).
     struct SpillSizing { std::size_t total, pool, stage, sessionQuota; };
     static constexpr SpillSizing spillSizing() noexcept;
+    /// Fix round 5 (N20): a worker reports `sid` Held (as a SessionSignal Held does).
+    void markSessionHeldForTest(int64_t sid) {
+        if (Session* s = sessions_.find(sid); s && s->heldByWorkers == 0) { s->heldByWorkers = 1; ++heldSessions_; }
+    }
     /// Fix round 4 (N9): put a session in the Expiring state exactly as a full spill does.
     void expireSessionForSpillForTest(int64_t sid) {
         if (Session* s = sessions_.find(sid)) expireForSpill_(*s);
     }
     [[nodiscard]] uint64_t oldClientUnknownMemberAnswersForTest() const noexcept { return oldClientUnknownMemberAnswers_; }
+    [[nodiscard]] uint64_t oldClientSessionWideEvictionsForTest() const noexcept { return oldClientSessionWideEvictions_; }
     [[nodiscard]] bool sessionExistsForTest(int64_t sid) noexcept { return sessions_.find(sid) != nullptr; }
     [[nodiscard]] uint64_t unanswerableFramesForTest() const noexcept { return unanswerableFrames_; }
     void applyMetadataForTest(const uint8_t* buf, std::size_t len) {
@@ -1479,7 +1484,7 @@ private:
     [[nodiscard]] bool spillWritable_(const Session& s) const noexcept;
     // Fix round 4 (N9): a frame of an Expiring session is dropped (counted) —
     // never executed; true = dropped.
-    [[nodiscard]] bool dropExpiringFrame_(const uint8_t* buf, std::size_t len) noexcept;
+    [[nodiscard]] bool dropExpiringFrame_(const uint8_t* buf, std::size_t len);
     // GB-3 / fix round 4 (N9): a session's subscriptions (and the owning
     // workers' cursors) end — at close, and once its Expiring state is serviced.
     void dropSessionSubscriptions_(int64_t sid);
@@ -1497,7 +1502,12 @@ private:
     // no response (fire-and-forget).  Cold path; zero allocation.
     bool rejectRequest_(const uint8_t* buf, std::size_t len, uint16_t code, const char* why);
     bool answerRejection_(Session& session, const rune::protocol::client::MessageHeader& hdr,
-                          uint16_t code, const char* why);
+                          uint16_t code, const char* why, const uint8_t* buf, std::size_t len);
+    // No-hang fix rounds 4-5 (item 8 / N23): make a pre-v5 client's
+    // UnknownMember true — evict the request's own (group, member) (the group
+    // for OffsetFetch); session-wide only when the body is undecodable.
+    void evictOldClientMember_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len,
+                               int64_t nowNs);
     // The only frames that may go unanswered (undecodable header, unknown
     // session, no response type): counted, warn-logged rate-limited (first,
     // then every 1024th — never a per-frame log on the produce path).
@@ -1690,6 +1700,7 @@ private:
     uint32_t                                     sessionProduceCredits_ = kDefaultSessionProduceCredits;
     std::size_t                                  creditBlockedSessions_ = 0;   // sessions with produceInFlight >= budget
     std::size_t                                  capDeferredSessions_ = 0;     // sessions with capDeferredOn >= 0 (R3)
+    std::size_t                                  expiringSessions_ = 0;        // fix round 4/5 (N9, N20): sessions Expiring (exact)
     uint64_t                                     creditProduceAborts_   = 0;   // ABORTs for want of credit
     uint64_t                                     produceCreditUnderflows_ = 0; // Credit beyond in-flight (invariant breach; clamped)
     // D8c fix round 1 (MAJOR-1): forwarded, unclaimed produces per worker (all sessions).
@@ -2239,6 +2250,12 @@ public:
         uint64_t    spillExpiryNotifyLost = 0;
         std::size_t spillExpiring         = 0;
         uint64_t    expiringIngressDrops  = 0;   // fix round 4 (N9): frames of an Expiring session dropped
+        // Fix round 5 (N21 / N23 / Disconnect): pre-v5 group errors answered
+        // UnknownMember (+ the session-wide evictions among them), and Expiring
+        // sessions finalized by the client's own Disconnect.
+        uint64_t    oldClientUnknownMember       = 0;
+        uint64_t    oldClientSessionWideEvictions = 0;
+        uint64_t    spillExpiryClientLeft        = 0;
     };
     /// Fix round 4 (item 6 / N11): the periodic line's change detector — the
     /// COUNTERS compared one by one (the round-3 XOR signature missed changes
@@ -2248,12 +2265,16 @@ public:
                a.spillExpiries != b.spillExpiries || a.spillExpiryDrops != b.spillExpiryDrops ||
                a.spillExpiryNotified != b.spillExpiryNotified ||
                a.spillExpiryNotifyLost != b.spillExpiryNotifyLost ||
-               a.expiringIngressDrops != b.expiringIngressDrops;
+               a.expiringIngressDrops != b.expiringIngressDrops ||
+               a.oldClientUnknownMember != b.oldClientUnknownMember ||
+               a.oldClientSessionWideEvictions != b.oldClientSessionWideEvictions ||
+               a.spillExpiryClientLeft != b.spillExpiryClientLeft;
     }
     [[nodiscard]] NoHangStats noHangStats() const noexcept {
         return NoHangStats{rejectedRequests_, unanswerableFrames_, spillExpiries_, spillExpiryDrops_,
                            egressSpill_.records(), egressSpill_.usedBytes(), spillExpiryNotified_,
-                           spillExpiryNotifyLost_, expiringSessions_, expiringIngressDrops_};
+                           spillExpiryNotifyLost_, expiringSessions_, expiringIngressDrops_,
+                           oldClientUnknownMemberAnswers_, oldClientSessionWideEvictions_, spillExpiryClientLeft_};
     }
     /// D8c test seams (control thread only).
     [[nodiscard]] uint64_t creditProduceAbortsForTest() const noexcept { return creditProduceAborts_; }
@@ -2579,7 +2600,6 @@ private:
     std::array<SpillExpiring, kMaxSpillExpiring> spillExpiring_{};
     std::size_t spillExpiringCount_ = 0;
     std::size_t spillExpiringOverflow_ = 0;   // marked sessions not yet in the table (adopted on a free slot)
-    std::size_t expiringSessions_      = 0;   // fix round 4 (N9): sessions in SpillState::Expiring (exact)
 
     // G0.1: session id captured at the start of handleProduce; used by the
     // public 4-param sendRespReliable() (test seam) to locate the session.
@@ -2603,6 +2623,8 @@ private:
     int64_t  nextNoHangStatsLogNs_  = 0;       // fix round 3: periodic no-hang stats line
     uint64_t expiringIngressDrops_  = 0;       // fix round 4 (N9): frames of an Expiring session dropped
     uint64_t oldClientUnknownMemberAnswers_ = 0;   // fix round 4 (item 8): pre-v5 group errors → UnknownMember
+    uint64_t oldClientSessionWideEvictions_ = 0;   // fix round 5 (N23): ... of them with an undecodable body
+    uint64_t spillExpiryClientLeft_         = 0;   // fix round 5: Expiring sessions the client Disconnected
     NoHangStats lastNoHangStats_{};            // fix round 4 (N11): the last logged counters
 
     // G0.1: Private test constructor (skips Aeron setup).

@@ -496,6 +496,11 @@ private:
     OneToOneByteRing roleRing_;        // control → admin (role events)
     OneToOneByteRing createReqRing_{kCreateTopicRingBytes}; // admin → control (createTopic req)
     OneToOneByteRing egressRing_{kAdminRequestRingBytes};   // admin → control (response frames: [sessionId:i64][frame])
+    // Fix round 5: an admin answer (at most the ring's max message, capacity/8)
+    // always fits the gateway spill's staging buffer.
+    static_assert(static_cast<std::size_t>(kAdminRequestRingBytes) / 8 <=
+                      rune::gateway::ClientGateway::spillSizing().stage,
+                  "admin egress answers must be spillable");
     // admin → control (T10 storage failure + F3 r6 SchemaUpdate).  Sized like
     // the other blob-carrying admin rings so a descriptor fits one message.
     OneToOneByteRing failureRing_{kAdminToControlRingBytes};

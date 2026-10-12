@@ -642,6 +642,40 @@ size_t GroupCoordinationService::handleLeaveGroup(
 // the v4 member re-joins, and any split-brain ends with that paced re-join.
 // Cold (an error answer to an old client only).
 // ---------------------------------------------------------------------------
+void GroupCoordinationService::evictMember(std::string_view groupId, std::string_view memberId,
+                                           int64_t sessionId, int64_t nowNs)
+{
+    // No-hang fix round 5 (N23): scoped to the request's group (and member) —
+    // a failing group A on a session never evicts that session's member of a
+    // healthy group B (which would keep B rebalancing for as long as A fails).
+    // Subscriptions are not revoked here: group members subscribe explicitly
+    // (CG routing redesign) and drop their own subscriptions on re-join;
+    // revokeGroupSubscriptions is session-wide and would hit group B.
+    auto cit = coordinators_.find(groupId);
+    if (cit == coordinators_.end()) return;
+    coord::GroupCoordinator& coord = cit->second;
+    evictScratch_.clear();
+    for (const auto& member : coord.members()) {
+        if (!memberId.empty() && member.memberId != memberId) continue;
+        memberKeyScratch_.clear();
+        memberKeyScratch_.append(groupId);
+        memberKeyScratch_ += ':';
+        memberKeyScratch_.append(member.memberId);
+        const auto it = memberSessionMap_.find(memberKeyScratch_);
+        if (it != memberSessionMap_.end() && it->second == sessionId) evictScratch_.push_back(member.memberId);
+    }
+    for (const auto& m : evictScratch_) {
+        spdlog::warn("GroupCoordinationService: old client (session {}) member '{}' of group '{}' evicted — "
+                     "answered UnknownMember instead of an error it would ignore", sessionId, m, groupId);
+        coord.leave(m, coord.generationId(), nowNs);
+        memberKeyScratch_.clear();
+        memberKeyScratch_.append(groupId);
+        memberKeyScratch_ += ':';
+        memberKeyScratch_.append(m);
+        memberSessionMap_.erase(memberKeyScratch_);
+    }
+}
+
 void GroupCoordinationService::evictSessionMembers(int64_t sessionId, int64_t nowNs)
 {
     for (auto& [groupId, coord] : coordinators_) {
@@ -928,6 +962,10 @@ void GroupCoordinationService::onEnterPreparingRebalance(
     const GroupId& groupId,
     rune::coordination::GroupCoordinator& coord)
 {
+    // Fix round 5: an Assign frame (sent reliably through sendControlFrame)
+    // always fits the gateway spill's staging buffer.
+    static_assert(kAssignFrameScratchSize <= rune::gateway::ClientGateway::spillSizing().stage,
+                  "Assign frames must be spillable");
     if (!gateway_) return;  // no push path wired
 
     const int32_t gen = coord.generationId();

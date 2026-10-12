@@ -273,6 +273,9 @@ void ClientGateway::sendReliable_(Session&       session,
                                   const uint8_t* buf,
                                   std::size_t    len)
 {
+    // Fix round 5: every gateway-encoded answer fits the spill's staging buffer
+    // (a larger scratch must fail the build, not expire healthy clients).
+    static_assert(kScratchSize <= kMaxSpillRecordBytes, "gateway scratch answers must be spillable");
     if (session.spill.state == SpillState::Normal) [[likely]] {
         if (offerBytes_(&session, buf, len) > 0) return;   // delivered
     } else if (session.spill.state == SpillState::Expiring) [[unlikely]] {
@@ -424,13 +427,27 @@ void ClientGateway::serviceSpillExpiring_(int64_t nowNs)
 
 // Fix round 4 (N9): one probe of the frame's header session (bytes 8..15, as
 // produceFramePause_) — called only while some session is Expiring.
-bool ClientGateway::dropExpiringFrame_(const uint8_t* buf, std::size_t len) noexcept
+bool ClientGateway::dropExpiringFrame_(const uint8_t* buf, std::size_t len)
 {
     if (len < pc::MessageHeader::ENCODED_SIZE) return false;
     uint64_t sid = 0;
     for (int i = 7; i >= 0; --i) sid = (sid << 8) | buf[8 + i];
     const Session* s = sessions_.find(static_cast<int64_t>(sid));
     if (s == nullptr || s->spill.state != SpillState::Expiring) return false;
+    const uint16_t tid = static_cast<uint16_t>(buf[2] | (buf[3] << 8));
+    if (tid == static_cast<uint16_t>(pc::TemplateId::Disconnect)) {
+        // Fix round 5: the client asked to leave — nobody waits for its
+        // SessionExpired.  Finalize now (no notification), leave the EXPIRING
+        // table, counted apart (never as notify-lost).
+        for (std::size_t i = 0; i < spillExpiringCount_; ++i) {
+            if (spillExpiring_[i].sessionId != s->sessionId) continue;
+            spillExpiring_[i] = spillExpiring_[--spillExpiringCount_];
+            break;
+        }
+        ++spillExpiryClientLeft_;
+        (void)closeSession_(static_cast<int64_t>(sid), /*notifyExpired=*/false);
+        return true;
+    }
     ++expiringIngressDrops_;   // never executed: the client is owed SessionExpired (→ SessionLost)
     return true;
 }
@@ -1137,7 +1154,7 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
         // response type (the client completes that op; an ErrorResponse only
         // completes control ops); ErrorResponse only when the template has none.
         if (s != nullptr && answerRejection_(*s, *hdr, static_cast<uint16_t>(pc::ErrorCode::ProtocolVersion),
-                                             "frame failed checkFrame")) {
+                                             "frame failed checkFrame", buf, len)) {
             // answered
         } else if (s != nullptr) {
             pc::ErrorResponse er;
@@ -1301,12 +1318,27 @@ void ClientGateway::evictOldestPendingConnect_()
     // Fix round 3 (fix-on-sight): an evicted connect whose reply publication is
     // resolved is ANSWERED (ConnectResponse{Internal}, no session) — one offer:
     // the eviction exists to bound this table, so it is not retried (counted).
+    // Fix round 5 (N17): answer the leg the client is WAITING for — a client in
+    // Handshaking ignores a ConnectResponse; it gets HandshakeContinueResponse:
+    // the owed HandshakeFailed for a failing handshake, Internal (retriable)
+    // for one still in progress.
     if (const auto& ev = pendingConnects_.front(); ev.resolvedPub) {
-        pc::ConnectResponse resp;
-        resp.sessionId     = 0;
-        resp.correlationId = ev.correlationId;
-        resp.code          = static_cast<int16_t>(pc::ErrorCode::Internal);
-        if (!offerOnPub_(*ev.resolvedPub, scratch_.data(), resp.encode(scratch_.data()))) ++unanswerableFrames_;
+        std::size_t n = 0;
+        if (ev.failingHandshake || ev.awaitingHandshake) {
+            pc::HandshakeContinueResponse hr;
+            hr.sessionId     = ev.sessionId;
+            hr.correlationId = ev.failingHandshake ? ev.handshakeFailCorr : ev.correlationId;
+            hr.code          = static_cast<int16_t>(ev.failingHandshake ? pc::ErrorCode::HandshakeFailed
+                                                                        : pc::ErrorCode::Internal);
+            n = hr.encode(scratch_.data());
+        } else {
+            pc::ConnectResponse resp;
+            resp.sessionId     = 0;
+            resp.correlationId = ev.correlationId;
+            resp.code          = static_cast<int16_t>(pc::ErrorCode::Internal);
+            n = resp.encode(scratch_.data());
+        }
+        if (!offerOnPub_(*ev.resolvedPub, scratch_.data(), n)) ++unanswerableFrames_;
     } else {
         ++unanswerableFrames_;   // no reply publication yet: nothing to answer on
     }
@@ -1494,9 +1526,11 @@ bool ClientGateway::logNoHangStatsIfChanged_(int64_t nowNs)
     lastNoHangStats_ = nh;
     spdlog::info("ClientGateway: no-hang stats — rejected (answered with an error)={} unanswerable={} "
                  "spillExpiries={} (SessionExpired delivered={} lost={} expiring now={}) spillExpiryDrops={} "
-                 "expiringIngressDrops={} spilledNow={} ({} B)", nh.rejectedRequests, nh.unanswerableFrames,
+                 "expiringIngressDrops={} clientLeftWhileExpiring={} oldClientUnknownMember={} (session-wide={}) "
+                 "spilledNow={} ({} B)", nh.rejectedRequests, nh.unanswerableFrames,
                  nh.spillExpiries, nh.spillExpiryNotified, nh.spillExpiryNotifyLost, nh.spillExpiring,
-                 nh.spillExpiryDrops, nh.expiringIngressDrops, nh.spilledAnswers, nh.spillUsedBytes);
+                 nh.spillExpiryDrops, nh.expiringIngressDrops, nh.spillExpiryClientLeft, nh.oldClientUnknownMember,
+                 nh.oldClientSessionWideEvictions, nh.spilledAnswers, nh.spillUsedBytes);
     return true;
 }
 
@@ -1505,10 +1539,12 @@ void ClientGateway::logProducePauseStats() const
     if (const NoHangStats nh = noHangStats(); noHangCountersDiffer(nh, NoHangStats{}) || nh.spilledAnswers != 0) {
         spdlog::warn("ClientGateway: no-hang stats — rejected (answered with an error)={} unanswerable={} "
                      "spillExpiries={} (SessionExpired delivered={} lost={}) spillExpiryDrops={} "
-                     "expiringIngressDrops={} spilledNow={} ({} B)",
+                     "expiringIngressDrops={} clientLeftWhileExpiring={} oldClientUnknownMember={} "
+                     "(session-wide={}) spilledNow={} ({} B)",
                      nh.rejectedRequests, nh.unanswerableFrames, nh.spillExpiries, nh.spillExpiryNotified,
-                     nh.spillExpiryNotifyLost, nh.spillExpiryDrops, nh.expiringIngressDrops, nh.spilledAnswers,
-                     nh.spillUsedBytes);
+                     nh.spillExpiryNotifyLost, nh.spillExpiryDrops, nh.expiringIngressDrops,
+                     nh.spillExpiryClientLeft, nh.oldClientUnknownMember, nh.oldClientSessionWideEvictions,
+                     nh.spilledAnswers, nh.spillUsedBytes);
     }
     if (heldProduceAborts_ == 0 && produceCreditUnderflows_ == 0) return;
     spdlog::warn("ClientGateway: produce pauses — aborts={} (credit={} workerCap={}) creditUnderflows={}",
@@ -1519,9 +1555,17 @@ bool ClientGateway::admitClientFrame_(const uint8_t* buf, std::size_t len)
 {
     if ((heldSessions_ | creditBlockedSessions_ | capDeferredSessions_ | expiringSessions_) == 0) [[likely]]
         return true;
-    // Fix round 4 (N9): a frame of an Expiring session is consumed WITHOUT being
-    // executed (counted): the client is owed SessionExpired, which completes
-    // every op it sent SessionLost.  Admitted here, dropped by onClientFrame_.
+    // Fix round 4/5 (N9 / N20): a frame of an Expiring session is checked FIRST
+    // and CONSUMED (admitted; onClientFrame_ drops it, counted) — never
+    // ABORTed by a credit / cap pause it can no longer clear.
+    if (expiringSessions_ != 0 && len >= pc::MessageHeader::ENCODED_SIZE) [[unlikely]] {
+        uint64_t sid = 0;
+        for (int i = 7; i >= 0; --i) sid = (sid << 8) | buf[8 + i];
+        if (const Session* s = sessions_.find(static_cast<int64_t>(sid));
+            s != nullptr && s->spill.state == SpillState::Expiring)
+            return true;
+        if ((heldSessions_ | creditBlockedSessions_ | capDeferredSessions_) == 0) return true;
+    }
     int32_t capWorker = -1;
     const ProducePause p = produceFramePause_(buf, len, &capWorker);
     if (p == ProducePause::None) return true;
@@ -2833,7 +2877,7 @@ bool ClientGateway::rejectRequest_(const uint8_t* buf, std::size_t len, uint16_t
     if (!hdr) { noteUnanswerable_(buf, len, why); return false; }
     Session* session = sessions_.find(hdr->sessionId);
     if (!session) { noteUnanswerable_(buf, len, why); return false; }
-    if (!answerRejection_(*session, *hdr, code, why)) { noteUnanswerable_(buf, len, why); return false; }
+    if (!answerRejection_(*session, *hdr, code, why, buf, len)) { noteUnanswerable_(buf, len, why); return false; }
     return true;
 }
 
@@ -2842,7 +2886,7 @@ bool ClientGateway::rejectRequest_(const uint8_t* buf, std::size_t len, uint16_t
 // InvalidRequest / Internal JoinGroup / SyncGroup answer, so they get
 // ProtocolVersion there — which they already treat as non-retriable.
 bool ClientGateway::answerRejection_(Session& session, const pc::MessageHeader& hdr, uint16_t code,
-                                     const char* why)
+                                     const char* why, const uint8_t* buf, std::size_t len)
 {
     const uint16_t tid = hdr.templateId;
     if (!pc::clientUnderstandsInvalidRequest(session.clientVersion) &&
@@ -2859,7 +2903,7 @@ bool ClientGateway::answerRejection_(Session& session, const pc::MessageHeader& 
         (code == static_cast<uint16_t>(pc::ErrorCode::Internal) ||
          code == static_cast<uint16_t>(pc::ErrorCode::InvalidRequest))) [[unlikely]] {
         code = static_cast<uint16_t>(pc::ErrorCode::UnknownMember);
-        if (groupService_) groupService_->evictSessionMembers(session.sessionId, nowNs_);
+        evictOldClientMember_(session, tid, buf, len, nowNs_);
         ++oldClientUnknownMemberAnswers_;
     }
     if (tid == static_cast<uint16_t>(pc::TemplateId::Produce)) {
@@ -2879,6 +2923,34 @@ bool ClientGateway::answerRejection_(Session& session, const pc::MessageHeader& 
     }
     sendAnswer_(session, scratch_.data(), n);
     return true;
+}
+
+void ClientGateway::evictOldClientMember_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len,
+                                          int64_t nowNs)
+{
+    if (!groupService_) return;
+    const auto sv = [](std::span<const uint8_t> b) {
+        return std::string_view(reinterpret_cast<const char*>(b.data()), b.size());
+    };
+    if (tid == static_cast<uint16_t>(pc::TemplateId::Heartbeat)) {
+        if (const auto m = pc::Heartbeat::decode(buf, len)) {
+            groupService_->evictMember(sv(m->groupId), sv(m->memberId), session.sessionId, nowNs);
+            return;
+        }
+    } else if (tid == static_cast<uint16_t>(pc::TemplateId::SyncGroup)) {
+        if (const auto m = pc::SyncGroup::decode(buf, len)) {
+            groupService_->evictMember(sv(m->groupId), sv(m->memberId), session.sessionId, nowNs);
+            return;
+        }
+    } else if (tid == static_cast<uint16_t>(pc::TemplateId::OffsetFetch)) {
+        if (const auto m = pc::OffsetFetch::decode(buf, len)) {
+            groupService_->evictMember(sv(m->groupId), std::string_view{}, session.sessionId, nowNs);
+            return;
+        }
+    }
+    // Undecodable body: the group is unknown — the session's members (counted apart).
+    groupService_->evictSessionMembers(session.sessionId, nowNs);
+    ++oldClientSessionWideEvictions_;
 }
 
 void ClientGateway::noteUnanswerable_(const uint8_t* buf, std::size_t len, const char* why)
@@ -4394,9 +4466,6 @@ void ClientGateway::pushSubscriptions()
             // Session gone — subscription will be reaped; skip this cycle.
             continue;
         }
-        // Fix round 4 (N9): no Records to an Expiring session (its
-        // subscriptions end when its Expiring state is serviced).
-        if (session->spill.state == SpillState::Expiring) [[unlikely]] continue;
 
         // Compute isolation bound (GR-6: HW-bounded delivery).
         // See block comment above for the full rationale.
@@ -4445,6 +4514,10 @@ void ClientGateway::pushSubscriptions()
         }
 
         if (sub.nextOffset >= bound) continue; // nothing committed to push yet
+        // Fix round 4/5 (N9, N24): no Records to an Expiring session (its
+        // subscriptions end when its Expiring state is serviced) — checked only
+        // when there is something to push (the idle pass reads nothing more).
+        if (session->spill.state == SpillState::Expiring) [[unlikely]] continue;
 
         // E2 inc2a: When a WorkerPool is wired, route the log read through the
         // owning worker's SPSC ingress ring.  The chunk is returned via the
@@ -6034,7 +6107,7 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
             const auto um = static_cast<uint16_t>(pc::ErrorCode::UnknownMember);
             ec[0] = static_cast<uint8_t>(um & 0xFF);
             ec[1] = static_cast<uint8_t>(um >> 8);
-            groupService_->evictSessionMembers(session->sessionId, nowNs);
+            evictOldClientMember_(*session, tid, buf, len, nowNs);
             ++oldClientUnknownMemberAnswers_;
         }
     }

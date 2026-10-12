@@ -1100,3 +1100,50 @@ TEST_F(CG3ServiceTest, EvictSessionMembersMakesUnknownMemberTrueRegression) {
     service_->evictSessionMembers(/*sessionId=*/7, clock_);   // idempotent: nothing left to evict
     EXPECT_EQ(service_->coordinator(groupId).memberCount(), 1u);
 }
+
+// No-hang fix round 5 (N23): the pre-v5 eviction is SCOPED.  One (v4) session
+// hosts members of group A and group B; an error in A evicts only A's member —
+// B's member on the same session keeps heartbeating OK (no rebalance thrash of
+// a healthy group).  The OffsetFetch variant (group only, no member) evicts
+// this session's members of A only.  A member mapped to ANOTHER session is
+// never evicted (no spoofing).  RED (round 4): evictSessionMembers took both.
+TEST_F(CG3ServiceTest, OldClientEvictionIsScopedToTheRequestsGroupRegression) {
+    auto joinAs = [&](const std::string& groupId, int64_t sid, int64_t corr) {
+        const auto n = encodeJoinGroup(req_, sid, corr, groupId, "", 5000);
+        const auto o = service_->handleJoinGroup(req_, n, clock_, out_, kBufSize);
+        const auto r = pc::JoinGroupResponse::decode(out_, o);
+        EXPECT_TRUE(r.has_value());
+        return std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size());
+    };
+    auto heartbeatCode = [&](const std::string& groupId, int64_t sid, const std::string& member, int64_t corr) {
+        const int32_t gen = service_->coordinator(groupId).generationId();
+        const auto n = encodeHeartbeat(req_, sid, corr, groupId, member, gen);
+        const auto o = service_->handleHeartbeat(req_, n, clock_, out_, kBufSize);
+        EXPECT_GT(o, 0u);
+        return decodeHBErrorCode(out_, o);
+    };
+    const int64_t v4 = 7;
+    const std::string a = joinAs("grp-A", v4, 910);
+    const std::string b = joinAs("grp-B", v4, 911);
+    const int16_t bBefore = heartbeatCode("grp-B", v4, b, 912);
+    ASSERT_NE(bBefore, static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+
+    // Spoof guard: (grp-A, a) is not mapped to session 99.
+    service_->evictMember("grp-A", a, /*sessionId=*/99, clock_);
+    EXPECT_EQ(service_->coordinator("grp-A").memberCount(), 1u) << "another session's member was evicted";
+
+    service_->evictMember("grp-A", a, v4, clock_);   // Heartbeat / SyncGroup Internal in A
+    EXPECT_EQ(service_->coordinator("grp-A").memberCount(), 0u);
+    EXPECT_EQ(heartbeatCode("grp-A", v4, a, 913), static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+    EXPECT_EQ(service_->coordinator("grp-B").memberCount(), 1u) << "group B's member was evicted for A's error";
+    EXPECT_EQ(heartbeatCode("grp-B", v4, b, 914), bBefore) << "group B was disturbed by A's error";
+
+    // OffsetFetch variant: the group only.
+    const std::string a2 = joinAs("grp-A", v4, 915);
+    ASSERT_EQ(service_->coordinator("grp-A").memberCount(), 1u);
+    service_->evictMember("grp-A", std::string_view{}, v4, clock_);
+    EXPECT_EQ(service_->coordinator("grp-A").memberCount(), 0u);
+    EXPECT_EQ(service_->coordinator("grp-B").memberCount(), 1u);
+    EXPECT_EQ(heartbeatCode("grp-B", v4, b, 916), bBefore);
+    (void)a2;
+}
