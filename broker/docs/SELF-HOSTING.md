@@ -43,8 +43,10 @@ or malformed.
 | `RUNE_ELECTION_TIMEOUT_MS` | no | `150` | int64 ms | Max wait per election round. Raise for slow / cross-datacenter links. |
 | `RUNE_ELECTION_STATUS_INTERVAL_MS` | no | `20` | int64 ms | Canvass / heartbeat cadence. |
 | `RUNE_STARTUP_CANVASS_TIMEOUT_MS` | no | `100` | int64 ms | Extended canvass window on first boot (peer discovery). |
+| `RUNE_TOPICS` | no | — | list | Boot topics, comma-separated `name:partitions[:policy][:key=value…]`. Options: `persistence=disk\|transient` (default `disk`; `memory` is a **deprecated** alias for `transient` and logs one warning line per entry), `durability=majority\|all-in-sync`, `tier=leader\|majority\|strict`, `group=<co-partition group>`, `key=<partition key field>`. Topics can also be defined at runtime (Rune QL `topic …;` / `transient topic …;`, or the client's `defineTopic`). |
+| `RUNE_TRANSIENT_LOG_RING_BYTES` | no | `8388608` (8 MiB) | int32 bytes | Node-wide ring size of every transient partition. Must be a power of two; any other value keeps the default. `RUNE_MEMORY_LOG_RING_BYTES` is a **deprecated** alias that logs one warning; when both are set, the canonical name wins. |
 
-> Not env-configurable (yet): topics/partitions (Milestone B), dynamic membership, TLS/auth.
+> Not env-configurable (yet): dynamic membership.
 > `/dev/shm` size and published ports are **container** settings (`--shm-size`, `-p`), not broker env.
 
 > **Format gotcha:** `RUNE_CLIENT_ENDPOINT` and the `host:port` in `RUNE_PEERS` are **raw**
@@ -54,6 +56,27 @@ or malformed.
 > **`/dev/shm`:** the embedded media driver maps its CnC + log buffers into shared memory.
 > The default container 64 MB is too small — always pass `--shm-size=256m` (or set
 > `shm_size` in compose).
+
+### Transient topics
+
+A **transient** topic (`persistence=transient` in `RUNE_TOPICS`, `transient topic …;` in Rune QL,
+or `Persistence::Transient` on the client's `defineTopic`) is replicated to the in-sync replicas
+before a produce is acknowledged but is **never written to disk**.
+
+- Its *metadata* survives restarts: a runtime-defined transient topic is recreated as transient on boot.
+- Its *data* does not: a restarted node rejoins with the topic empty; after a **full-cluster**
+  restart the topic is empty. Offsets restart from 0.
+- Persistence is fixed at definition: `alter topic` cannot change it.
+- A view that reads from a transient topic must itself be transient. `create view` over one is
+  rejected with error 37 (`ViewSourceTransient`); use a transient view.
+- Use `durability=majority` (default) or `all-in-sync` if a transient topic must survive a node death.
+- `persistence=memory` in `RUNE_TOPICS` is a deprecated alias of `persistence=transient` and logs
+  one warning per entry.
+- **Upgrade brokers before clients.** A new client defining a transient topic against an older
+  broker silently gets a disk topic, because the older broker ignores the persistence byte.
+- Status in this release: a transient topic can be defined, survives restart as an empty topic,
+  and replicates. Produce/subscribe on transient topics is completed by the transient data-path
+  work (Part E2); end-to-end produce/consume is not yet claimed.
 
 ---
 
