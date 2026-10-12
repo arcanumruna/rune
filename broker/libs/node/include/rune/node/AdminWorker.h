@@ -28,6 +28,7 @@ namespace rune::node {
 //   ViewSourceTransient   = 37  (CREATE VIEW: persisted view over a transient source)
 //   ViewNotAlterable      = 38  (ALTER TOPIC naming a view's output topic)
 //   InvalidTopicName      = 40  (DefineTopic/CreateView: name fails TopicName.h)
+//   ViewSourceIsView      = 41  (CREATE VIEW whose source is another view's output)
 //   (InvalidSchema 23 also answers DefineTopic.partitionCount < 1)
 
 // ---------------------------------------------------------------------------

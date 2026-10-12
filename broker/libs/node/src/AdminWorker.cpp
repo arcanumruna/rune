@@ -30,6 +30,7 @@ static constexpr uint16_t kViewKeyInvalid     = 35;  // key field invalid under 
 static constexpr uint16_t kViewNotCoPartitioned = 36;  // aggregate group-by not co-partitioned
 static constexpr uint16_t kViewNotAlterable     = 38;  // AlterTopic on a view's output topic
 static constexpr uint16_t kInvalidTopicName     = 40;  // DefineTopic/CreateView: name fails TopicName.h (B1/B2)
+static constexpr uint16_t kViewSourceIsView     = 41;  // CreateView: a source is another view's output (B9)
 static constexpr uint16_t kViewSourceTransient  = 37;  // persisted view over a transient source (Phase 2b E)
 
 AdminWorker::AdminWorker(SchemaRegistry& reg,
@@ -591,6 +592,13 @@ void AdminWorker::startCreateView_(CreateViewMsg msg, int64_t nowNs) {
     std::vector<const rune::codec::Descriptor*> srcDescs;
     srcDescs.reserve(authored->sources.size());
     for (const auto& s : authored->sources) {
+        // DDL conformance B9 / D3b: a view's output carries no change events (its
+        // sink is a materialised table, not a changelog) until Phase 3 — a view over
+        // it would stay silently empty.  Reject; nothing is created.
+        if (viewRegistry_->byViewTopicId(s.topicId) != nullptr) {
+            deps_.respondCreateView(msg.session, msg.corr, -1, 0, kViewSourceIsView);
+            return;
+        }
         const RegistryEntry* e = reg_.byId(s.topicId);
         if (!e) {
             deps_.respondCreateView(msg.session, msg.corr, -1, 0, kViewSourceNotFound);

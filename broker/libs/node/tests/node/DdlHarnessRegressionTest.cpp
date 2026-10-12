@@ -1210,3 +1210,68 @@ TEST(DdlFixRegression, B8_RenamingTheKeyBackRestoresIt) {
     EXPECT_EQ(h.schemas().byName("src")->keyField, "id");
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
+
+// ── B9 / user decision D3b: a view over a view's output is rejected (it would stay
+//    silently empty — a view sink carries no change events until Phase 3) ──────────
+TEST(DdlFixRegression, B9_ViewOverAViewIsViewSourceIsViewAndCreatesNothing) {
+    DdlHarness h;
+    for (const Op first : {Op::ViewPersisted, Op::ViewTransient}) {
+        const std::string inner = first == Op::ViewPersisted ? "inner_p" : "inner_t";
+        const int64_t c0 = h.submit(first, inner);
+        h.settle();
+        ASSERT_EQ(h.response(c0)->err, kOk);
+        for (const Op outer : {Op::ViewPersisted, Op::ViewTransient}) {
+            SCOPED_TRACE(std::string(opName(first)) + " then " + opName(outer));
+            const Catalog before = h.catalog();
+            const int reqs = h.createRequests();
+            const int64_t viewsEnd = h.viewsLogEnd();
+            const int64_t c = h.submit(outer, "outer", inner);
+            h.settle();
+            EXPECT_EQ(h.response(c)->err, kViewSourceIsView);
+            EXPECT_EQ(h.createRequests(), reqs) << "no sink requested";
+            EXPECT_EQ(h.viewsLogEnd(), viewsEnd) << "no __views record";
+            EXPECT_EQ(h.catalog(), before);
+        }
+    }
+    h.restart();
+    const int64_t again = h.submit(Op::ViewPersisted, "outer", "inner_p");
+    h.settle();
+    EXPECT_EQ(h.response(again)->err, kViewSourceIsView) << "still rejected after a restart";
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+TEST(DdlFixRegression, B9_ViewOverATypedTopicIsStillAccepted) {
+    DdlHarness h;
+    const int64_t c = h.submit(Op::ViewPersisted, "plain", "src");
+    h.settle();
+    EXPECT_EQ(h.response(c)->err, kOk);
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+// Every source is checked, not only the first: a plan whose LATER source is a
+// view's output is ViewSourceIsView, ahead of any compile / co-partition check.
+TEST(DdlFixRegression, B9_AViewOutputAsALaterSourceIsViewSourceIsView) {
+    DdlHarness h;
+    const int64_t c0 = h.submit(Op::ViewPersisted, "inner");
+    h.settle();
+    ASSERT_EQ(h.response(c0)->err, kOk);
+    namespace rv = rune::view;
+    rv::ViewPlan p;
+    p.viewName = "outer";
+    p.key = "id";
+    p.persistence = 0;
+    p.sources.push_back(rv::SourceSpec{h.idOf("src"), "id"});
+    p.sources.push_back(rv::SourceSpec{h.idOf("inner"), "id"});
+    p.output.push_back(rv::AuthoredField{"id", rune::codec::PrimType::Int64, 0, "id", rv::MergeRule::Replace});
+    CreateViewMsg m;
+    m.viewName = "outer"; m.keyField = "id"; m.persistence = 0;
+    m.planBlob = rv::serializeAuthored(p);
+    const Catalog before = h.catalog();
+    const int reqs = h.createRequests();
+    const int64_t c = h.submitRawView(std::move(m));
+    h.settle();
+    EXPECT_EQ(h.response(c)->err, kViewSourceIsView);
+    EXPECT_EQ(h.createRequests(), reqs);
+    EXPECT_EQ(h.catalog(), before);
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
