@@ -305,6 +305,12 @@ public:
         release_(*viewsReplica_, kViewsTopicId);
     }
     [[nodiscard]] bool holdingCommits() const noexcept { return opt_.holdCommits; }
+    /// A held commit is outstanding: some catalog's HW is behind its LEO (the
+    /// in-flight op, if any, is parked on the HW gate until releaseCommits()).
+    [[nodiscard]] bool commitHeld() const noexcept {
+        return schemaReplica_->highWatermark() < schemaReplica_->logEndOffset() ||
+               viewsReplica_->highWatermark() < viewsReplica_->logEndOffset();
+    }
     void advance(int64_t ns) noexcept { now_ += ns; }
     void demote() {
         ++epoch_;

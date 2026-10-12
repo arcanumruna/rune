@@ -561,6 +561,22 @@ if(BUILD_TESTING)
         DISCOVERY_TIMEOUT 120
         PROPERTIES TIMEOUT 120)
 
+    # DDL conformance plan Task 10: seeded model-checked DDL stress + the admin
+    # steady-state zero-alloc gate.  Own executable (replaces global operator new).
+    add_executable(rune_ddl_stress_tests
+        tests/node/DdlStressRegressionTest.cpp)
+    target_include_directories(rune_ddl_stress_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_ddl_stress_tests PRIVATE
+        rune_node
+        rune_view
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_ddl_stress_tests
+        PROPERTIES TIMEOUT 180)
+
     # ---------------------------------------------------------------------------
     # Task 20: GetViewRowRegressionTest — the GetViewRow point-read path (real
     # Worker op/return + WorkerViewSet) + the openView fingerprint handshake
