@@ -1,4 +1,5 @@
 #include "rune/node/AdminWorker.h"
+#include <rune/node/TopicName.h>
 #include <rune/codec/Serialize.h>  // rune::codec::deserialize/serialize (throws on bad input)
 #include <rune/codec/Evolve.h>     // checkCompatibility / applyOps (Task 11)
 #include <rune/codec/AlterOps.h>   // decodeAlterOps
@@ -28,6 +29,7 @@ static constexpr uint16_t kViewFieldUnresolved= 34;  // plan references an unres
 static constexpr uint16_t kViewKeyInvalid     = 35;  // key field invalid under the source schema
 static constexpr uint16_t kViewNotCoPartitioned = 36;  // aggregate group-by not co-partitioned
 static constexpr uint16_t kViewNotAlterable     = 38;  // AlterTopic on a view's output topic
+static constexpr uint16_t kInvalidTopicName     = 40;  // DefineTopic/CreateView: name fails TopicName.h (B1/B2)
 static constexpr uint16_t kViewSourceTransient  = 37;  // persisted view over a transient source (Phase 2b E)
 
 AdminWorker::AdminWorker(SchemaRegistry& reg,
@@ -453,6 +455,18 @@ void AdminWorker::startNext_(int64_t nowNs) {
         return;
     }
 
+    // ── DDL conformance B1/B2 ── the name becomes dataDir/topics/<name>/: one safe
+    //    path segment, never an internal "__" name.  Nothing is created.
+    if (!isValidTopicName(msg.name)) {
+        deps_.respondDefine(msg.session, msg.corr, -1, 0, kInvalidTopicName);
+        return;
+    }
+    // ── DDL conformance B6 ── a topic has at least one partition.
+    if (msg.partitionCount < 1) {
+        deps_.respondDefine(msg.session, msg.corr, -1, 0, kInvalidSchema);
+        return;
+    }
+
     // ── PARSING ── validate the descriptor blob is well-formed, and capture
     // its field count in the same pass (seeds nextTag for the create path —
     // see DdlOp::fieldCount — avoiding a second deserialize of the same blob
@@ -515,6 +529,12 @@ void AdminWorker::startCreateView_(CreateViewMsg msg, int64_t nowNs) {
     // InvalidSchema, never treated as "not disk" / recorded as-is.
     if (msg.malformed || msg.persistence > 1) {
         deps_.respondCreateView(msg.session, msg.corr, -1, 0, kInvalidSchema);
+        return;
+    }
+
+    // ── DDL conformance B1/B2 ── the view name is its sink topic's directory name.
+    if (!isValidTopicName(msg.viewName)) {
+        deps_.respondCreateView(msg.session, msg.corr, -1, 0, kInvalidTopicName);
         return;
     }
 

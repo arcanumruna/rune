@@ -17,6 +17,7 @@
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/AdminChannels.h>
 #include <rune/node/NodeConfig.h>
+#include <rune/node/TopicName.h>
 
 #include <spdlog/spdlog.h>
 
@@ -29,6 +30,16 @@ createTopicForAdmin(rune::gateway::TopicRegistry& reg, const CreateTopicReqMsg& 
     CreateTopicReplyMsg reply;
     reply.ticket  = req.ticket;
     reply.existed = reg.topicIdForName(req.name).has_value();
+
+    // DDL conformance B1/B2/B6: the admin thread already refuses these; the control
+    // thread — the one that builds dataDir/topics/<name>/ — never creates them either.
+    if (!isValidTopicName(req.name) || req.partitionCount < 1) {
+        spdlog::error("createTopicForAdmin: refusing invalid request name='{}' partitions={}",
+                      req.name, req.partitionCount);
+        reply.topicId = -1;
+        reply.existed = false;
+        return reply;
+    }
 
     TopicSpec spec;
     spec.name           = req.name;

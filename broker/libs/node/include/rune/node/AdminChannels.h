@@ -445,7 +445,7 @@ inline CreateTopicReqMsg decodeCreateTopicReq(const uint8_t* buf, std::size_t le
     m.cleanupPolicy = buf[pos++];
     if (pos < len) {   // Phase 2b E; absent => disk
         if (buf[pos] > 1) {   // unknown mode: never cast it — a nameless request fails
-            m.name.clear();   // on the control thread (createTopic rejects "")
+            m.name.clear();   // on the control thread (createTopicForAdmin refuses an invalid name)
             m.partitionCount = 0;
             return m;
         }

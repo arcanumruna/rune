@@ -27,6 +27,8 @@ namespace rune::node {
 //   SchemaConflict        = 31  (ALTER: stale expectedVersion — optimistic CAS)
 //   ViewSourceTransient   = 37  (CREATE VIEW: persisted view over a transient source)
 //   ViewNotAlterable      = 38  (ALTER TOPIC naming a view's output topic)
+//   InvalidTopicName      = 40  (DefineTopic/CreateView: name fails TopicName.h)
+//   (InvalidSchema 23 also answers DefineTopic.partitionCount < 1)
 
 // ---------------------------------------------------------------------------
 // AdminDeps — effects the AdminWorker needs, all resolved on the admin thread.

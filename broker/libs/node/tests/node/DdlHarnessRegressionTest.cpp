@@ -4,6 +4,9 @@
 #include <gtest/gtest.h>
 #include "support/DdlHarness.h"
 
+#include <rune/node/TopicName.h>
+
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -165,4 +168,202 @@ TEST(DdlHarnessRegression, InvariantFlagsAnAnswerWhileAnotherOpIsInFlight) {
     h.deliverCreate();   // let x finish so the harness tears down cleanly
     h.setControl(ControlMode::Auto);
     h.settle();
+}
+
+// ── B1 / B2 / B6 ──────────────────────────────────────────────────────────────
+// Every TopicNameError kind, sampled several ways each, on every path: DefineTopic
+// (disk + transient), CreateView (persisted + transient), createTopicForAdmin (the
+// control thread).  The config-parse path is in NodeConfigTest.cpp (Task 5a).
+namespace {
+struct BadName {
+    std::string   name;
+    TopicNameError kind;
+    const char*   label;
+};
+std::vector<BadName> badNames() {
+    return {
+        {"", TopicNameError::Empty, "empty"},
+        {std::string(250, 'x'), TopicNameError::TooLong, "len250"},
+        {std::string(1000, 'y'), TopicNameError::TooLong, "len1000"},
+        {".", TopicNameError::DotSegment, "dot"},
+        {"..", TopicNameError::DotSegment, "dotdot"},
+        {"../escape", TopicNameError::BadChar, "traversal"},
+        {"a/b", TopicNameError::BadChar, "slash"},
+        {"/abs", TopicNameError::BadChar, "absolute"},
+        {"a\\b", TopicNameError::BadChar, "backslash"},
+        {"has space", TopicNameError::BadChar, "space"},
+        {"tab\tname", TopicNameError::BadChar, "tab"},
+        {"new\nline", TopicNameError::BadChar, "newline"},
+        {std::string("nul\0byte", 8), TopicNameError::BadChar, "nul"},
+        {"caf\xc3\xa9", TopicNameError::BadChar, "nonascii"},
+        {"a:b", TopicNameError::BadChar, "colon"},
+        {"__topic_schemas", TopicNameError::Reserved, "topic_schemas"},
+        {"__views", TopicNameError::Reserved, "views"},
+        {"__consumer_offsets", TopicNameError::Reserved, "consumer_offsets"},
+        {"__transaction_state", TopicNameError::Reserved, "transaction_state"},
+        {"__cluster_metadata", TopicNameError::Reserved, "cluster_metadata"},
+        {"__view_snapshots", TopicNameError::Reserved, "view_snapshots"},
+        {"__orphan.1", TopicNameError::Reserved, "orphan"},
+        {"__x", TopicNameError::Reserved, "x"},
+        {"__", TopicNameError::Reserved, "bare"},
+    };
+}
+} // namespace
+
+class DdlNameRegression : public ::testing::TestWithParam<BadName> {};
+
+TEST_P(DdlNameRegression, TableCoversTheKindItClaims) {
+    EXPECT_EQ(checkTopicName(GetParam().name), GetParam().kind);
+}
+
+TEST_P(DdlNameRegression, AdminPathRejectsEveryOpWithInvalidTopicNameAndCreatesNothing) {
+    const BadName& b = GetParam();
+    DdlHarness h;
+    const int32_t topics = h.topicCount();
+    const int64_t schemaEnd = h.schemaLogEnd(), viewsEnd = h.viewsLogEnd();
+    const int reqs = h.createRequests();
+    int64_t c[4];
+    int i = 0;
+    for (const Op op : {Op::DefineDisk, Op::DefineTransient, Op::ViewPersisted, Op::ViewTransient})
+        c[i++] = h.submit(op, b.name);
+    h.settle();
+    for (const int64_t corr : c) {
+        ASSERT_TRUE(h.response(corr).has_value());
+        EXPECT_EQ(h.response(corr)->err, kInvalidTopicName);
+        EXPECT_EQ(h.response(corr)->id, -1);
+    }
+    EXPECT_EQ(h.topicCount(), topics);
+    EXPECT_EQ(h.createRequests(), reqs) << "never reaches the control thread";
+    EXPECT_EQ(h.schemaLogEnd(), schemaEnd);
+    EXPECT_EQ(h.viewsLogEnd(), viewsEnd);
+    EXPECT_FALSE(fs::exists(h.root() / "escape")) << "nothing written outside dataDir/topics";
+    EXPECT_FALSE(fs::exists(h.root() / "topics" / "a")) << "no partial path";
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+TEST_P(DdlNameRegression, InvalidNameIsCheckedBeforeEveryLaterDefineCheck) {
+    // A bad name AND a zero partition count: the name wins (40, not 23).
+    const BadName& b = GetParam();
+    DdlHarness h;
+    DefineTopicMsg m;
+    m.partitionCount = 0; m.name = b.name; m.keyField = "id"; m.blob = charBlob();
+    const int64_t c = h.submitRawDefine(std::move(m));
+    h.settle();
+    EXPECT_EQ(h.response(c)->err, kInvalidTopicName);
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+TEST_P(DdlNameRegression, ControlThreadRefusesTheNameDefensively) {
+    const BadName& b = GetParam();
+    const fs::path dir = fs::temp_directory_path() / ("rune_ddl_ctl_" + std::to_string(::getpid()));
+    fs::create_directories(dir);
+    {
+        rune::gateway::TopicRegistry reg({}, dir.string());
+        CreateTopicReqMsg req; req.ticket = 1; req.partitionCount = 1; req.name = b.name;
+        for (const uint8_t persistence : {uint8_t{0}, uint8_t{1}}) {
+            req.persistence = persistence;
+            const CreateTopicReplyMsg r = createTopicForAdmin(reg, req);
+            EXPECT_EQ(r.topicId, -1);
+            EXPECT_FALSE(r.existed);
+            EXPECT_EQ(r.ticket, 1);
+        }
+        EXPECT_EQ(reg.topicCount(), 0);
+    }
+    EXPECT_FALSE(fs::exists(dir / "escape"));
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+INSTANTIATE_TEST_SUITE_P(EveryKind, DdlNameRegression, ::testing::ValuesIn(badNames()),
+                         [](const ::testing::TestParamInfo<BadName>& i) { return std::string(i.param.label); });
+
+TEST(DdlFixRegression, B1_EveryTopicNameErrorKindIsCoveredByTheTable) {
+    bool seen[6] = {};
+    for (const BadName& b : badNames()) seen[static_cast<int>(b.kind)] = true;
+    EXPECT_FALSE(seen[static_cast<int>(TopicNameError::None)]);
+    for (const TopicNameError k : {TopicNameError::Empty, TopicNameError::TooLong, TopicNameError::DotSegment,
+                                   TopicNameError::BadChar, TopicNameError::Reserved})
+        EXPECT_TRUE(seen[static_cast<int>(k)]) << static_cast<int>(k);
+}
+
+TEST(DdlFixRegression, B1_ValidBoundaryNamesStillCreate) {
+    DdlHarness h;
+    const std::string maxLen(249, 'm');
+    int n = 0;
+    for (const std::string name : {std::string("orders.v2"), std::string("_private"), std::string("a-b_c"),
+                                   std::string("A1"), std::string("_"), std::string("x__y"), maxLen}) {
+        SCOPED_TRACE(name.substr(0, 20));
+        const int64_t d = h.submit(n++ % 2 ? Op::DefineTransient : Op::DefineDisk, name);
+        h.settle();
+        EXPECT_EQ(h.response(d)->err, kOk);
+    }
+    const int64_t v = h.submit(Op::ViewPersisted, "view.ok-1");
+    h.settle();
+    EXPECT_EQ(h.response(v)->err, kOk);
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+TEST(DdlFixRegression, B1_RejectedNamesDoNotPoisonTheQueueBehindThem) {
+    DdlHarness h;
+    const int64_t bad = h.submit(Op::DefineDisk, "../escape");
+    const int64_t good = h.submit(Op::DefineDisk, "fine");
+    const int64_t bad2 = h.submit(Op::ViewPersisted, "__views");
+    h.settle();
+    EXPECT_EQ(h.response(bad)->err, kInvalidTopicName);
+    EXPECT_EQ(h.response(good)->err, kOk);
+    EXPECT_EQ(h.response(bad2)->err, kInvalidTopicName);
+    EXPECT_NE(h.idOf("fine"), -1);
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+TEST(DdlFixRegression, B6_PartitionCountBelowOneIsInvalidSchemaOnAdminAndControl) {
+    DdlHarness h;
+    const int32_t topicsBefore = h.topicCount();
+    const int reqsBefore = h.createRequests();
+    for (const int32_t parts : {0, -1, -1000, INT32_MIN}) {
+        SCOPED_TRACE(parts);
+        for (const uint8_t persistence : {uint8_t{0}, uint8_t{1}}) {
+            DefineTopicMsg m;
+            m.partitionCount = parts; m.persistence = persistence;
+            m.name = "zero_parts"; m.keyField = "id"; m.blob = charBlob();
+            const int64_t c = h.submitRawDefine(std::move(m));
+            h.settle();
+            EXPECT_EQ(h.response(c)->err, kInvalidSchema);
+        }
+    }
+    EXPECT_EQ(h.topicCount(), topicsBefore);
+    EXPECT_EQ(h.createRequests(), reqsBefore);
+    EXPECT_EQ(h.idOf("zero_parts"), -1);
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+
+    // One partition is the floor and still works.
+    DefineTopicMsg ok;
+    ok.partitionCount = 1; ok.name = "one_part"; ok.keyField = "id"; ok.blob = charBlob();
+    const int64_t c = h.submitRawDefine(std::move(ok));
+    h.settle();
+    EXPECT_EQ(h.response(c)->err, kOk);
+
+    // Control thread: same refusal, nothing created.
+    const fs::path dir = fs::temp_directory_path() / ("rune_ddl_ctl0_" + std::to_string(::getpid()));
+    fs::create_directories(dir);
+    {
+        rune::gateway::TopicRegistry reg({}, dir.string());
+        for (const int32_t parts : {0, -1, INT32_MIN}) {
+            CreateTopicReqMsg zero; zero.ticket = 2; zero.partitionCount = parts; zero.name = "ok";
+            EXPECT_EQ(createTopicForAdmin(reg, zero).topicId, -1) << parts;
+        }
+        EXPECT_EQ(reg.topicCount(), 0);
+    }
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+TEST(DdlFixRegression, B1_RestartAfterRejectedNamesKeepsTheCatalogUnchanged) {
+    DdlHarness h;
+    (void)h.submit(Op::DefineDisk, "../escape");
+    (void)h.submit(Op::ViewTransient, "__orphan.9");
+    h.settle();
+    const Catalog before = h.catalog();
+    h.restart();
+    EXPECT_EQ(h.catalog(), before);
+    EXPECT_EQ(h.idOf("__orphan.9"), -1);
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
