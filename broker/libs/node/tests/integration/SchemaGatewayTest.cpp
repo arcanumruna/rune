@@ -1329,3 +1329,26 @@ TEST(SchemaGatewayRegression, CreateTopicForAdminRefusesUnknownCleanupPolicyRegr
     req.cleanupPolicy = 2;   // CompactDelete is valid
     EXPECT_GE(createTopicForAdmin(reg, req).topicId, 0);
 }
+
+// Fix round 3 (untested error path): a TopicSchemaResponse whose descriptor can
+// never fit one admin egress message is answered MessageTooLarge (no blob) — on
+// the ring and through the backlog — never parked forever, never dropped.
+TEST(SchemaGatewayRegression, OversizedTopicSchemaAnswerIsMessageTooLargeRegression) {
+    SchemaRegistry sreg;
+    rune::node::AdminWorkerAgent agent(sreg, /*replica=*/nullptr, /*selfId=*/1, {1},
+                                       rune::node::AdminDeps{});
+    const std::vector<uint8_t> huge(agent.maxEgressFrameBytes() + 1, 0x7A);
+    agent.postTopicSchemaResponse(/*session=*/1, /*corr=*/55, /*topicId=*/3, /*version=*/1, /*parts=*/2,
+                                  huge, /*errorCode=*/0);
+    std::optional<pc::TopicSchemaResponse> got;
+    agent.egressRing().drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                                 aeron::util::index_t len) {
+        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+        got = pc::TopicSchemaResponse::decode(p + 8, static_cast<std::size_t>(len) - 8);
+    }, 16);
+    ASSERT_TRUE(got.has_value()) << "an oversized TopicSchemaResponse was dropped";
+    EXPECT_EQ(got->correlationId, 55);
+    EXPECT_EQ(got->errorCode, static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge));
+    EXPECT_EQ(got->descriptorLen, 0u);
+    EXPECT_EQ(agent.egressBacklogForTest(), 0u);
+}

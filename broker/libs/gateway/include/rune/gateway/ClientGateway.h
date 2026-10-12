@@ -994,6 +994,7 @@ public:
     // Fix round 2 (I5): a handshake in progress (awaitingHandshake, placeholder
     // reply publication intercepted by the TestEgressFn).
     void injectPendingHandshakeForTest(int64_t sessionId);
+    void pollPendingConnectsForTest(int64_t nowNs) { pollPendingConnects(nowNs); }
     int64_t injectReliableTestSessionForTest(int64_t nowNs = 0,
                                              int32_t clientVersion = rune::protocol::client::kClientVersion);
     [[nodiscard]] std::size_t egressSpillUsedBytesForTest() const noexcept { return egressSpill_.usedBytes(); }
@@ -1099,8 +1100,22 @@ private:
     // so every pending client op completes SessionLost), never silently short
     // of an answer.
     // -----------------------------------------------------------------------
-    static constexpr std::size_t kEgressSpillBytes = 4u << 20;   // 4 MiB
-    static constexpr uint32_t    kSpillExpiring    = UINT32_MAX; // Session::spilledAnswers sentinel
+    static constexpr std::size_t kEgressSpillBytes  = 4u << 20;   // 4 MiB
+    // Fix round 3 (I1 fairness): one session may hold at most this much of the
+    // spill; the session over quota is the one expired (never an innocent pusher).
+    static constexpr std::size_t kSessionSpillQuota = kEgressSpillBytes / 8;
+    static constexpr uint32_t    kSpillExpiring     = UINT32_MAX; // Session::spilledAnswers sentinel
+    // Fix round 3 (I1 SessionExpired delivery): the explicit EXPIRING state of a
+    // session the spill could not hold — only what that state needs.  Its
+    // SessionExpired is re-offered every drain until delivered (then the session
+    // is closed) or until the lease deadline (closed anyway, counted lost).
+    // Preallocated; a full table leaves the session marked (answers refused) and
+    // adopts it as soon as a slot frees.
+    struct SpillExpiring {
+        int64_t sessionId  = 0;
+        int64_t deadlineNs = 0;
+    };
+    static constexpr std::size_t kMaxSpillExpiring = 256;
 
     // -----------------------------------------------------------------------
     // Subscription — per-session push subscription (GB-3 / GR-6).
@@ -1209,6 +1224,13 @@ private:
         // the duty thread (PeerResolverHub); no publication registered yet
         // (registrationId unused) until the numeric endpoint is known.
         bool        awaitingResolve = false;
+        // Fix round 3: the resolve ring refused the reply-host offer — retried
+        // each poll until accepted or the connect timeout (never a silent drop).
+        bool        resolveOfferPending = false;
+        // Fix round 3 (N4): the explicit FailingHandshake state — HandshakeFailed
+        // (on handshakeFailCorr) re-offered each poll until delivered / timeout.
+        bool        failingHandshake  = false;
+        int64_t     handshakeFailCorr = 0;
 
         // ---------------------------------------------------------------
         // client<->broker TLS/AEAD (Task 7) — server-role handshake state.
@@ -1413,7 +1435,8 @@ private:
     // -----------------------------------------------------------------------
     void sendReliable_(Session& session, const uint8_t* buf, std::size_t len);
     void expireForSpill_(Session& session);
-    void closeSpillExpiredSessions_();
+    void serviceSpillExpiring_(int64_t nowNs);
+    [[nodiscard]] Session* largestSpiller_();
     // An answer to a client request: reliable (sendReliable_) on a real
     // session; an egress-less injected test session goes through sendTo (its
     // capture hook).
@@ -1442,6 +1465,8 @@ private:
     void closeDroppedPendingConnect_(const PendingConnect& pending);
     void failPendingHandshake_(std::deque<PendingConnect>::iterator it, int64_t correlationId);
     bool offerOnPub_(aeron::ExclusivePublication& pub, const uint8_t* buf, std::size_t len);
+    bool offerHostResolve_(PendingConnect& pending);
+    bool offerHandshakeFailed_(PendingConnect& pending);
     /// Task 19: retry the per-worker crypto-key SessionAnnounce (second
     /// wave) for every session in pendingCryptoAnnounces_ a full worker ring
     /// refused earlier. A session closed/expired in the meantime is dropped
@@ -2149,6 +2174,11 @@ public:
     /// pause happened; warn so it shows at the perf log level).  Call once the
     /// control thread is joined.
     void logProducePauseStats() const;
+    /// Fix round 3: the periodic no-hang stats line (duty thread; on change).
+    bool logNoHangStatsIfChanged_(int64_t nowNs);
+    bool logNoHangStatsForTest(int64_t nowNs) { return logNoHangStatsIfChanged_(nowNs); }
+    static constexpr int64_t kNoHangStatsLogNs = 10'000'000'000LL;   // 10 s
+    [[nodiscard]] int64_t nextNoHangStatsLogNsForTest() const noexcept { return nextNoHangStatsLogNs_; }
     // No-hang wave stats (fix round 2): requests answered with an error instead
     // of dropped, frames that could not be answered, spill expiries.  Read on
     // the duty thread (or after it joined); logged with logProducePauseStats.
@@ -2159,10 +2189,14 @@ public:
         uint64_t    spillExpiryDrops   = 0;
         std::size_t spilledAnswers     = 0;
         std::size_t spillUsedBytes     = 0;
+        uint64_t    spillExpiryNotified   = 0;
+        uint64_t    spillExpiryNotifyLost = 0;
+        std::size_t spillExpiring         = 0;
     };
     [[nodiscard]] NoHangStats noHangStats() const noexcept {
         return NoHangStats{rejectedRequests_, unanswerableFrames_, spillExpiries_, spillExpiryDrops_,
-                           egressSpill_.count(), egressSpill_.usedBytes()};
+                           egressSpill_.count(), egressSpill_.usedBytes(), spillExpiryNotified_,
+                           spillExpiryNotifyLost_, spillExpiringCount_};
     }
     /// D8c test seams (control thread only).
     [[nodiscard]] uint64_t creditProduceAbortsForTest() const noexcept { return creditProduceAborts_; }
@@ -2480,8 +2514,11 @@ private:
 
     // No-hang fix round 2 (I1): the egress spill (see kEgressSpillBytes).
     // Single-writer: duty-cycle thread only.  Allocated once at construction.
-    rune::gateway::SpillFifo egressSpill_{kEgressSpillBytes};
-    uint32_t spillExpiriesPending_ = 0;   // sessions marked kSpillExpiring, not yet closed
+    rune::gateway::SpillFifo egressSpill_{kEgressSpillBytes, /*compactable=*/true};
+    std::array<SpillExpiring, kMaxSpillExpiring> spillExpiring_{};
+    std::size_t spillExpiringCount_ = 0;
+    std::size_t spillExpiringOverflow_ = 0;   // marked sessions not yet in the table (adopted on a free slot)
+    uint64_t    spillPass_          = 0;   // drain pass id (Session::spillBlockedPass)
 
     // G0.1: session id captured at the start of handleProduce; used by the
     // public 4-param sendRespReliable() (test seam) to locate the session.
@@ -2500,6 +2537,10 @@ private:
     uint64_t unanswerableFrames_    = 0;       // dropped: no header / no session / no response type
     uint64_t spillExpiries_         = 0;       // sessions expired because the egress spill was full
     uint64_t spillExpiryDrops_      = 0;       // answers to an expiring session (it gets SessionExpired)
+    uint64_t spillExpiryNotified_   = 0;       // ... whose SessionExpired was delivered
+    uint64_t spillExpiryNotifyLost_ = 0;       // ... closed at the lease deadline without delivery
+    int64_t  nextNoHangStatsLogNs_  = 0;       // fix round 3: periodic no-hang stats line
+    uint64_t lastNoHangStatsSig_    = 0;
 
     // G0.1: Private test constructor (skips Aeron setup).
     // Accessed via makeForTest() only.

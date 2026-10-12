@@ -117,7 +117,16 @@ void AdminWorker::onRole(const AdminRoleMsg& role) {
 }
 
 // ─── Ingress ────────────────────────────────────────────────────────────────
+// No-hang fix round 3 (fix-on-sight): the serialized DDL queue is BOUNDED
+// (kMaxPendingDdl).  A request beyond it is answered Internal at once — never
+// queued without bound (which could also overflow the bounded DDL-answer
+// backlog: AdminWorkerAgent::haltEgressBacklogFull_).
 void AdminWorker::submitDefineTopic(DefineTopicMsg msg) {
+    if (pending_.size() >= kMaxPendingDdl) [[unlikely]] {
+        ++pendingDdlRefused_;
+        deps_.respondDefine(msg.session, msg.corr, -1, 0, kInternal);
+        return;
+    }
     PendingDdl pd;
     pd.kind   = DdlKind::Create;
     pd.define = std::move(msg);
@@ -125,6 +134,11 @@ void AdminWorker::submitDefineTopic(DefineTopicMsg msg) {
 }
 
 void AdminWorker::submitCreateView(CreateViewMsg msg) {
+    if (pending_.size() >= kMaxPendingDdl) [[unlikely]] {
+        ++pendingDdlRefused_;
+        deps_.respondCreateView(msg.session, msg.corr, -1, 0, kInternal);
+        return;
+    }
     PendingDdl pd;
     pd.kind = DdlKind::CreateView;
     pd.view = std::move(msg);
@@ -132,6 +146,11 @@ void AdminWorker::submitCreateView(CreateViewMsg msg) {
 }
 
 void AdminWorker::submitAlterTopic(AlterTopicMsg msg) {
+    if (pending_.size() >= kMaxPendingDdl) [[unlikely]] {
+        ++pendingDdlRefused_;
+        deps_.respondAlter(msg.session, msg.corr, -1, 0, kInternal);
+        return;
+    }
     PendingDdl pd;
     pd.kind  = DdlKind::Alter;
     pd.alter = std::move(msg);

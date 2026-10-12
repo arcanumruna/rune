@@ -32,6 +32,8 @@
 #include <rune/protocol/RecordBatch.h>
 
 #include <rune/gateway/SpillFifo.h>
+#include <rune/consensus/PeerResolution.h>
+#include <rune/protocol/client/ControlMessages.h>
 #include <rune/gateway/RequestRejection.h>
 #include <rune/gateway/IGroupRequestHandler.h>
 #include <rune/node/WorkerOp.h>
@@ -362,9 +364,13 @@ static std::vector<uint8_t> headerOnlyFrame(pc::TemplateId tid, int64_t sid, int
 struct CaptureAll {
     std::vector<std::vector<uint8_t>> frames;
     int backpressure = 0;
+    std::vector<int64_t> blockedSids;   // fix round 3: per-session back-pressure (header sessionId)
     ClientGateway::TestEgressFn fn() {
         return [this](const uint8_t* b, std::size_t n) -> int64_t {
             if (backpressure > 0) { --backpressure; return -2; }
+            if (const auto h = pc::MessageHeader::decode(b, n)) {
+                for (const int64_t sid : blockedSids) if (sid == h->sessionId) return -2;
+            }
             frames.emplace_back(b, b + n);
             return 1;
         };
@@ -840,6 +846,346 @@ TEST(ClientGatewayEgressRegression, EmptyProduceBatchIsInvalidRequestAndStatsCou
     EXPECT_EQ(st.unanswerableFrames, 1u);
     std::error_code ec;
     fs::remove_all(dir, ec);
+}
+
+
+// ===========================================================================
+// No-hang fix round 3 (I1): per-session spill fairness + explicit EXPIRING.
+// ===========================================================================
+namespace {
+std::vector<uint8_t> defineAnswer(int64_t sid, int64_t corr) {
+    pc::DefineTopicResponse r;
+    r.sessionId = sid; r.correlationId = corr;
+    std::vector<uint8_t> f(r.encodedSize());
+    r.encode(f.data());
+    return f;
+}
+std::vector<uint8_t> bigAnswer(int64_t sid, int64_t corr, std::size_t blobBytes) {
+    static std::vector<uint8_t> blob;
+    blob.assign(blobBytes, 0x33);
+    pc::TopicSchemaResponse r;
+    r.sessionId = sid; r.correlationId = corr; r.topicId = 1; r.version = 1;
+    r.descriptorBlob = blob.data(); r.descriptorLen = static_cast<uint32_t>(blob.size());
+    std::vector<uint8_t> f(r.encodedSize());
+    r.encode(f.data());
+    return f;
+}
+std::vector<int64_t> corrsOf(const CaptureAll& cap, int64_t sid) {
+    std::vector<int64_t> out;
+    for (const auto& f : cap.frames)
+        if (const auto h = pc::MessageHeader::decode(f.data(), f.size()); h && h->sessionId == sid)
+            out.push_back(h->correlationId);
+    return out;
+}
+bool sessionExpiredSentTo(const CaptureAll& cap, int64_t sid) {
+    for (const auto& f : cap.frames)
+        if (auto e = pc::ErrorResponse::decode(f.data(), f.size());
+            e && e->sessionId == sid && e->code == static_cast<int16_t>(pc::ErrorCode::SessionExpired))
+            return true;
+    return false;
+}
+} // namespace
+
+// A permanently stalled session A must not block session B's spilled answers
+// (the round-2 drain was one global FIFO that stopped at A's first refusal).
+TEST(ClientGatewayEgressRegression, StalledSessionDoesNotBlockAnotherSessionsSpillRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    const int64_t a = gw.injectReliableTestSessionForTest(0);
+    const int64_t b = gw.injectReliableTestSessionForTest(0);
+    cap.blockedSids = {a, b};
+    for (int64_t c = 1; c <= 3; ++c) {
+        const auto fa = defineAnswer(a, c);
+        ASSERT_TRUE(gw.sendControlFrame(a, fa.data(), fa.size()));
+        const auto fb = defineAnswer(b, 100 + c);
+        ASSERT_TRUE(gw.sendControlFrame(b, fb.data(), fb.size()));
+    }
+    ASSERT_EQ(gw.pendingResponseCount(), 6u);
+    cap.blockedSids = {a};                     // B's publication clears; A stays stalled
+    gw.drainPendingResponses(nowNs());
+    EXPECT_EQ(corrsOf(cap, b), (std::vector<int64_t>{101, 102, 103})) << "B was blocked behind A (or reordered)";
+    EXPECT_TRUE(corrsOf(cap, a).empty());
+    EXPECT_EQ(gw.pendingResponseCount(), 3u);
+    // A new answer for B goes straight out; a new one for A queues behind A's.
+    const auto fb = defineAnswer(b, 104);
+    ASSERT_TRUE(gw.sendControlFrame(b, fb.data(), fb.size()));
+    const auto fa = defineAnswer(a, 4);
+    ASSERT_TRUE(gw.sendControlFrame(a, fa.data(), fa.size()));
+    cap.blockedSids.clear();
+    gw.drainPendingResponses(nowNs());
+    EXPECT_EQ(corrsOf(cap, a), (std::vector<int64_t>{1, 2, 3, 4})) << "A's per-session order was not preserved";
+    EXPECT_EQ(corrsOf(cap, b), (std::vector<int64_t>{101, 102, 103, 104}));
+    EXPECT_EQ(gw.pendingResponseCount(), 0u);
+}
+
+// The session over its spill quota is the one expired — never the innocent
+// session that happens to push next.
+TEST(ClientGatewayEgressRegression, SpillQuotaExpiresTheHogNotTheNextPusherRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    const int64_t hog = gw.injectReliableTestSessionForTest(0);
+    const int64_t b   = gw.injectReliableTestSessionForTest(0);
+    cap.blockedSids = {hog, b};
+    int64_t corr = 0;
+    while (gw.sessionExistsForTest(hog) && gw.noHangStats().spillExpiries == 0 && corr < 100) {
+        const auto f = bigAnswer(hog, ++corr, 60 * 1024);
+        (void)gw.sendControlFrame(hog, f.data(), f.size());
+    }
+    ASSERT_EQ(gw.noHangStats().spillExpiries, 1u) << "the hog never hit its quota";
+    const auto fb = defineAnswer(b, 7);
+    ASSERT_TRUE(gw.sendControlFrame(b, fb.data(), fb.size()));
+    EXPECT_EQ(gw.noHangStats().spillExpiries, 1u) << "the innocent pusher was expired";
+    cap.blockedSids.clear();
+    gw.drainPendingResponses(nowNs());
+    EXPECT_FALSE(gw.sessionExistsForTest(hog));
+    EXPECT_TRUE(sessionExpiredSentTo(cap, hog));
+    EXPECT_TRUE(gw.sessionExistsForTest(b));
+    EXPECT_EQ(corrsOf(cap, b), (std::vector<int64_t>{7}));
+}
+
+// Globally full with every session under quota: the session holding the MOST
+// spilled bytes is expired (and its space reclaimed), not the pusher.
+TEST(ClientGatewayEgressRegression, GlobalSpillFullExpiresTheLargestHolderRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    std::vector<int64_t> holders;
+    for (int i = 0; i < 8; ++i) holders.push_back(gw.injectReliableTestSessionForTest(0));
+    const int64_t pusher = gw.injectReliableTestSessionForTest(0);
+    cap.blockedSids = holders;
+    cap.blockedSids.push_back(pusher);
+    int64_t corr = 0;
+    for (std::size_t i = 0; i < holders.size(); ++i) {   // 8 x ~490 KiB: under quota each, ~3.9 MiB total
+        const std::size_t blob = (i == 3) ? 62 * 1024 : 60 * 1024;   // holder 3 is the largest
+        for (int k = 0; k < 8; ++k) {
+            const auto f = bigAnswer(holders[i], ++corr, blob);
+            ASSERT_TRUE(gw.sendControlFrame(holders[i], f.data(), f.size()));
+        }
+    }
+    ASSERT_EQ(gw.noHangStats().spillExpiries, 0u);
+    for (int k = 0; k < 10; ++k) {                       // 10 x 40 KiB (under quota) overflow the spill
+        const auto f = bigAnswer(pusher, 9000 + k, 40 * 1024);
+        ASSERT_TRUE(gw.sendControlFrame(pusher, f.data(), f.size()));
+    }
+    EXPECT_GE(gw.noHangStats().spillExpiries, 1u);
+    cap.blockedSids.clear();
+    gw.drainPendingResponses(nowNs());
+    EXPECT_FALSE(gw.sessionExistsForTest(holders[3])) << "the largest holder was not the one expired";
+    EXPECT_TRUE(gw.sessionExistsForTest(pusher)) << "the pusher was expired instead of the largest holder";
+    std::vector<int64_t> want;
+    for (int64_t k = 0; k < 10; ++k) want.push_back(9000 + k);
+    EXPECT_EQ(corrsOf(cap, pusher), want);
+}
+
+// The SessionExpired of an expiring session is RE-OFFERED until delivered (the
+// round-2 close sent it once on the very publication that was back-pressured);
+// the session is closed only once it is delivered.
+TEST(ClientGatewayEgressRegression, ExpiringSessionKeepsOfferingSessionExpiredUntilDeliveredRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.setNowForTest(1'000);
+    const int64_t a = gw.injectReliableTestSessionForTest(0);
+    cap.blockedSids = {a};
+    for (int64_t c = 1; c <= 20; ++c) {                  // over its quota → EXPIRING
+        const auto f = bigAnswer(a, c, 60 * 1024);
+        (void)gw.sendControlFrame(a, f.data(), f.size());
+    }
+    ASSERT_EQ(gw.noHangStats().spillExpiring, 1u);
+    for (int pass = 0; pass < 5; ++pass) gw.drainPendingResponses(2'000 + pass);   // still back-pressured
+    EXPECT_TRUE(gw.sessionExistsForTest(a)) << "closed before its SessionExpired was delivered";
+    EXPECT_FALSE(sessionExpiredSentTo(cap, a));
+    EXPECT_EQ(gw.pendingResponseCount(), 0u) << "an expiring session's spilled answers are discarded";
+    cap.blockedSids.clear();
+    gw.drainPendingResponses(3'000);
+    EXPECT_TRUE(sessionExpiredSentTo(cap, a));
+    EXPECT_FALSE(gw.sessionExistsForTest(a));
+    EXPECT_EQ(gw.noHangStats().spillExpiryNotified, 1u);
+    EXPECT_EQ(gw.noHangStats().spillExpiring, 0u);
+}
+
+// ... and if the publication never clears, the session is closed at the lease
+// deadline (counted as notify-lost: the client's own keepalive timeout fired).
+TEST(ClientGatewayEgressRegression, ExpiringSessionIsClosedAtTheLeaseDeadlineRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.setNowForTest(1'000);
+    const int64_t a = gw.injectReliableTestSessionForTest(0);
+    cap.blockedSids = {a};
+    for (int64_t c = 1; c <= 20; ++c) {
+        const auto f = bigAnswer(a, c, 60 * 1024);
+        (void)gw.sendControlFrame(a, f.data(), f.size());
+    }
+    ASSERT_EQ(gw.noHangStats().spillExpiring, 1u);
+    gw.drainPendingResponses(2'000);
+    EXPECT_TRUE(gw.sessionExistsForTest(a));
+    gw.drainPendingResponses(1'000 + 3'600'000'000'000LL);   // far past any lease
+    EXPECT_FALSE(gw.sessionExistsForTest(a));
+    EXPECT_EQ(gw.noHangStats().spillExpiryNotifyLost, 1u);
+}
+
+
+// Fix round 3: SpillFifo scan (skip / consume out of FIFO position), discard and
+// compact against a model — live records always come back in push order.
+TEST(ClientGatewayEgressRegression, SpillFifoScanDiscardCompactMatchModelRegression)
+{
+    SpillFifo f(8192, /*compactable=*/true);
+    std::vector<std::pair<int64_t, std::vector<uint8_t>>> model;   // live records, push order
+    std::mt19937 rng(11);
+    int64_t seq = 0;
+    for (int step = 0; step < 20000; ++step) {
+        const unsigned op = rng() % 6;
+        if (op <= 2) {
+            std::vector<uint8_t> v(rng() % 300);
+            for (auto& b : v) b = static_cast<uint8_t>(rng());
+            const int64_t key = (++seq << 4) | static_cast<int64_t>(rng() % 4);   // 4 "sessions"
+            if (f.push(key, v.data(), v.size())) model.emplace_back(key, std::move(v));
+            else if (f.compact() && f.push(key, v.data(), v.size())) model.emplace_back(key, std::move(v));
+        } else if (op == 3) {                     // consume every other record of one session
+            const int64_t sess = static_cast<int64_t>(rng() % 4);
+            bool take = true;
+            std::vector<std::pair<int64_t, std::vector<uint8_t>>> keep;
+            std::size_t idx = 0;
+            f.scan([&](const SpillFifo::Record& r) {
+                EXPECT_EQ(r.key, model[idx].first);
+                EXPECT_EQ(std::vector<uint8_t>(r.data, r.data + r.len), model[idx].second);
+                const bool consume = (r.key & 0xF) == sess && take;
+                if ((r.key & 0xF) == sess) take = !take;
+                if (!consume) keep.push_back(model[idx]);
+                ++idx;
+                return consume;
+            });
+            model.swap(keep);
+        } else if (op == 4) {
+            const int64_t sess = static_cast<int64_t>(rng() % 4);
+            std::size_t n = 0;
+            std::vector<std::pair<int64_t, std::vector<uint8_t>>> keep;
+            for (auto& m : model) { if ((m.first & 0xF) == sess) ++n; else keep.push_back(std::move(m)); }
+            std::size_t gone = 0;
+            f.scan([&](const SpillFifo::Record& r) { if ((r.key & 0xF) == sess) { ++gone; return true; } return false; });
+            EXPECT_EQ(gone, n);
+            model.swap(keep);
+        } else {
+            ASSERT_TRUE(f.compact());
+        }
+        ASSERT_EQ(f.count(), model.size());
+        if (!model.empty()) {
+            const auto r = f.front();
+            ASSERT_EQ(r.key, model.front().first);
+        }
+    }
+}
+
+
+// ===========================================================================
+// Fix round 3: pre-session paths (host-resolve ring full, HandshakeFailed
+// delivery, pending-connect eviction).
+// ===========================================================================
+namespace {
+std::vector<uint8_t> connectFrame(int64_t corr, const std::string& channel) {
+    pc::ConnectRequest req;
+    req.correlationId = corr; req.egressStreamId = 9; req.clientVersion = pc::kClientVersion;
+    req.egressChannel = channel;
+    std::vector<uint8_t> f(1024);
+    f.resize(req.encode(f.data()));
+    return f;
+}
+} // namespace
+
+// Concern 2: a momentarily full host-resolve ring kept the Connect pending (it
+// used to be dropped) and the offer is retried until accepted.
+TEST(ClientGatewayEgressRegression, FullHostResolveRingKeepsTheConnectPendingAndRetriesRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    rune::consensus::HostResolveRing req, resp;
+    gw.setHostResolver(rune::consensus::HostResolvePort{&req, &resp});
+    int filled = 0;
+    while (req.offer(rune::consensus::kHostResolveRequest, -1, 0)) ++filled;   // the ring is full
+    ASSERT_GT(filled, 0);
+    const auto f = connectFrame(77, "aeron:udp?endpoint=client-host.example:40123");
+    (void)gw.applyClientFrameForTest(f.data(), f.size());
+    ASSERT_EQ(gw.pendingConnectCount(), 1u) << "a full resolve ring dropped the Connect";
+    gw.pollPendingConnectsForTest(1);                     // still full: stays pending
+    ASSERT_EQ(gw.pendingConnectCount(), 1u);
+    int drained = 0, ours = 0;
+    req.poll([&](std::int32_t, std::int64_t id, std::int64_t host) {
+        ++drained;
+        if (id != -1) { ++ours; delete reinterpret_cast<std::string*>(static_cast<std::intptr_t>(host)); }
+    });
+    EXPECT_EQ(ours, 0);
+    gw.pollPendingConnectsForTest(2);                     // the retry is accepted now
+    std::string offeredHost;
+    req.poll([&](std::int32_t type, std::int64_t, std::int64_t host) {
+        if (type != rune::consensus::kHostResolveRequest) return;
+        auto* h = reinterpret_cast<std::string*>(static_cast<std::intptr_t>(host));
+        offeredHost = *h;
+        delete h;
+    });
+    EXPECT_EQ(offeredHost, "client-host.example") << "the refused resolve offer was never retried";
+    EXPECT_EQ(gw.pendingConnectCount(), 1u) << "the connect must stay pending for its resolution";
+}
+
+// N4: HandshakeFailed is delivered reliably — a back-pressured offer keeps the
+// failing handshake and re-offers it on the next poll.
+TEST(ClientGatewayEgressRegression, HandshakeFailedIsReofferedUntilDeliveredRegression)
+{
+    CaptureAll cap;
+    cap.backpressure = 1;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.injectPendingHandshakeForTest(/*sessionId=*/4343);
+    const auto f = headerOnlyFrame(pc::TemplateId::HandshakeContinue, 4343, 616, 32);
+    (void)gw.applyClientFrameForTest(f.data(), f.size());
+    EXPECT_FALSE(cap.last<pc::HandshakeContinueResponse>().has_value());
+    ASSERT_EQ(gw.pendingConnectCount(), 1u) << "a back-pressured HandshakeFailed was dropped";
+    gw.pollPendingConnectsForTest(1);
+    const auto r = cap.last<pc::HandshakeContinueResponse>();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->correlationId, 616);
+    EXPECT_EQ(r->code, static_cast<int16_t>(pc::ErrorCode::HandshakeFailed));
+    EXPECT_EQ(gw.pendingConnectCount(), 0u);
+}
+
+// Fix-on-sight: a pending connect evicted by the cap is ANSWERED
+// (ConnectResponse{Internal}, no session) when its reply publication is resolved.
+TEST(ClientGatewayEgressRegression, EvictedPendingConnectIsAnsweredRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    rune::consensus::HostResolveRing req, resp;
+    gw.setHostResolver(rune::consensus::HostResolvePort{&req, &resp});
+    gw.injectPendingHandshakeForTest(/*sessionId=*/5001);   // the oldest: resolved reply publication
+    int64_t corr = 1;
+    while (cap.last<pc::ConnectResponse>() == std::nullopt && corr < 10'000) {
+        const auto f = connectFrame(++corr, "aeron:udp?endpoint=client-host.example:40123");
+        (void)gw.applyClientFrameForTest(f.data(), f.size());
+        req.poll([](std::int32_t, std::int64_t, std::int64_t host) {
+            delete reinterpret_cast<std::string*>(static_cast<std::intptr_t>(host));
+        });
+    }
+    const auto r = cap.last<pc::ConnectResponse>();
+    ASSERT_TRUE(r.has_value()) << "an evicted pending connect was dropped without an answer";
+    EXPECT_EQ(r->code, static_cast<int16_t>(pc::ErrorCode::Internal));
+    EXPECT_EQ(gw.sessionCount(), 0u);
+}
+
+
+// Fix round 3 (counter export): the no-hang counters are logged while the broker
+// runs — on change, at most every kNoHangStatsLogNs — not only at shutdown.
+TEST(ClientGatewayEgressRegression, NoHangStatsAreLoggedPeriodicallyOnChangeRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    const int64_t sid = gw.injectReliableTestSessionForTest(0);
+    EXPECT_FALSE(gw.logNoHangStatsForTest(1)) << "nothing changed: no line";
+    const auto f = headerOnlyFrame(pc::TemplateId::Produce, sid, 1, 24);
+    gw.applyProduceForTest(f.data(), f.size());
+    EXPECT_TRUE(gw.logNoHangStatsForTest(2)) << "a rejected request was not reported";
+    EXPECT_EQ(gw.nextNoHangStatsLogNsForTest(), 2 + ClientGateway::kNoHangStatsLogNs);
+    EXPECT_FALSE(gw.logNoHangStatsForTest(3)) << "unchanged counters logged again";
 }
 
 } // namespace

@@ -21,6 +21,8 @@
 // Both paths now serve clients via ClientGateway (single-writer duty-cycle).
 
 #include <cstring>
+#include <cassert>
+#include <rune/protocol/client/SchemaMessages.h>
 #include <cstdlib>
 #include <rune/gateway/SpillFifo.h>
 #include <rune/node/NodeConfig.h>
@@ -405,6 +407,45 @@ public:
         if (!egressBacklog_.push(session, frame, n)) [[unlikely]] haltEgressBacklogFull_();
         return true;
     }
+    /// ADMIN thread only (deps.respondGet).  Encode a TopicSchemaResponse in place
+    /// in the egress ring (or, ring full / backlog ahead, via the preallocated
+    /// stage into the bounded backlog).  A descriptor that can never fit one ring
+    /// message is answered MessageTooLarge with no blob — never parked forever,
+    /// never dropped.
+    void postTopicSchemaResponse(int64_t session, int64_t corr, int32_t topicId, uint16_t version,
+                                 int32_t partitionCount, const std::vector<uint8_t>& blob,
+                                 uint16_t errorCode) {
+        namespace pc = rune::protocol::client;
+        pc::TopicSchemaResponse resp;
+        resp.sessionId      = session;
+        resp.correlationId  = corr;
+        resp.topicId        = topicId;
+        resp.version        = version;
+        resp.errorCode      = errorCode;
+        resp.partitionCount = partitionCount;   // Phase 2b Part C
+        resp.descriptorBlob = blob.empty() ? nullptr : blob.data();
+        resp.descriptorLen  = static_cast<uint32_t>(blob.size());
+        if (resp.encodedSize() > maxEgressFrameBytes()) [[unlikely]] {
+            resp.descriptorBlob = nullptr;
+            resp.descriptorLen  = 0;
+            resp.errorCode      = static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge);
+        }
+        const std::size_t sz = resp.encodedSize();
+        const auto idx = egressBacklog_.empty() ? egressRing_.tryClaim(kMsgEgressFrame, 8 + sz) : -1;
+        if (idx < 0) [[unlikely]] {
+            [[maybe_unused]] const std::size_t w = resp.encode(egressStage_.data());
+            assert(w == sz && "TopicSchemaResponse encode() != encodedSize()");
+            [[maybe_unused]] const bool posted = postEgressFrame(session, egressStage_.data(), sz);
+            assert(posted);
+            return;
+        }
+        uint8_t* p = egressRing_.base() + idx;
+        std::memcpy(p, &session, 8);
+        [[maybe_unused]] const std::size_t written = resp.encode(p + 8);
+        assert(written == sz && "TopicSchemaResponse encode() != encodedSize()");
+        egressRing_.commit(idx);
+    }
+
     /// Admin-thread scratch for an answer encoded off-ring (preallocated to one
     /// ring message; sz <= maxEgressFrameBytes()).
     [[nodiscard]] uint8_t* egressStage(std::size_t /*sz*/) noexcept { return egressStage_.data(); }

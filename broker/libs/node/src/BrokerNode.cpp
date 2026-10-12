@@ -3356,50 +3356,10 @@ void BrokerNode::buildAdminWorker() {
                                  const std::vector<uint8_t>& blob,
                                  uint16_t errorCode) {
             if (!adminWorkerAgent_) return;
-            namespace pc = rune::protocol::client;
-            pc::TopicSchemaResponse resp;
-            resp.sessionId      = session;
-            resp.correlationId  = corr;
-            resp.topicId        = topicId;
-            resp.version        = version;
-            resp.errorCode      = errorCode;
-            resp.partitionCount = partitionCount;   // Phase 2b Part C
-            resp.descriptorBlob = blob.empty() ? nullptr : blob.data();
-            resp.descriptorLen  = static_cast<uint32_t>(blob.size());
-            // Encode IN PLACE in the claimed egress slot (no per-response frame
-            // vector; encodedSize() == encode()'s return by construction).
-            if (resp.encodedSize() > adminWorkerAgent_->maxEgressFrameBytes()) [[unlikely]] {
-                // Fix round 2: a descriptor that can never fit one admin egress
-                // message is answered MessageTooLarge (no blob) — never parked
-                // in the backlog forever, never dropped.
-                resp.descriptorBlob = nullptr;
-                resp.descriptorLen  = 0;
-                resp.errorCode      = static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge);
-            }
-            const std::size_t sz = resp.encodedSize();
-            auto& ring = adminWorkerAgent_->egressRing();
-            const auto idx = adminWorkerAgent_->egressBacklogEmpty()
-                                 ? ring.tryClaim(kMsgEgressFrame, 8 + sz) : -1;
-            if (idx < 0) [[unlikely]] {
-                // No-hang (R2): ring full (or a backlog ahead, FIFO) → encode
-                // off-ring into the admin-owned backlog, retried — never dropped.
-                // The frame is staged in the agent's preallocated scratch (no
-                // per-answer allocation) and copied into the backlog.
-                uint8_t* stage = adminWorkerAgent_->egressStage(sz);
-                [[maybe_unused]] const std::size_t w = resp.encode(stage);
-                assert(w == sz && "TopicSchemaResponse encode() != encodedSize()");
-                [[maybe_unused]] const bool posted = adminWorkerAgent_->postEgressFrame(session, stage, sz);
-                assert(posted);
-                return;
-            }
-            uint8_t* p = ring.base() + idx;
-            std::memcpy(p, &session, 8);
-            // Debug guard: encode() must fill exactly the claimed slot — a
-            // drift between encodedSize() and encode() would ship a short
-            // frame or overrun the slot.  Release keeps the unchecked encode.
-            [[maybe_unused]] const std::size_t written = resp.encode(p + 8);
-            assert(written == sz && "TopicSchemaResponse encode() != encodedSize()");
-            ring.commit(idx);
+            // Fix round 3: the encode / post / MessageTooLarge logic lives in
+            // AdminWorkerAgent::postTopicSchemaResponse (directly testable).
+            adminWorkerAgent_->postTopicSchemaResponse(session, corr, topicId, version, partitionCount,
+                                                       blob, errorCode);
         };
 
         // respondCreateView (Task 19): encode the CreateViewResponse frame and
@@ -3583,6 +3543,16 @@ void BrokerNode::stop() {
     // state (ring-ownership mode) change.
     if (workerPool_) workerPool_->disarmAfterControlJoined();
     if (gateway_) gateway_->logProducePauseStats();   // D8c: control thread joined — single reader
+    // No-hang fix round 3: the per-worker no-hang counters (the worker runners
+    // were joined in 1a — every worker's counter is final and single-reader now).
+    if (workerPool_) {
+        uint64_t undecodable = 0;
+        for (int32_t w = 0; w < workerPool_->workerCount(); ++w)
+            undecodable += workerPool_->worker(w).undecodableProduceAnswers();
+        if (undecodable != 0)
+            spdlog::warn("BrokerNode[{}]: no-hang stats — worker-ingress Produce frames answered "
+                         "InvalidRequest={}", config_.nodeId, undecodable);
+    }
     // F9a: the control thread is joined — skip any owner-thread test task still
     // queued for it (its test thread waits for a decision with no bound).
     if (runtimeAgent_) runtimeAgent_->skipQueuedOwnerThreadTestTasks();

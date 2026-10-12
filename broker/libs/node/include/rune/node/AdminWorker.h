@@ -202,6 +202,9 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] bool isLeader() const noexcept { return leader_; }
     [[nodiscard]] std::size_t pendingCount() const noexcept { return pending_.size(); }
+    /// No-hang fix round 3: the DDL queue bound; a request beyond it is answered Internal.
+    static constexpr std::size_t kMaxPendingDdl = 256;
+    [[nodiscard]] uint64_t pendingDdlRefused() const noexcept { return pendingDdlRefused_; }
 
     // Fail-loud recovery signal (regression fix): true iff the most recent
     // rebuildFromLog_() (Follower->Leader promotion replay) hit a corrupt or
@@ -343,7 +346,8 @@ private:
     // In-flight DDL state machine.
     DdlState        state_ = DdlState::Idle;
     std::optional<DdlOp> inFlight_;
-    std::deque<PendingDdl> pending_;        // queued DDL ops (CREATE + ALTER, serialized)
+    std::deque<PendingDdl> pending_;        // queued DDL ops (CREATE + ALTER, serialized); <= kMaxPendingDdl
+    uint64_t pendingDdlRefused_ = 0;        // fix round 3: answered Internal because the queue was full
     int64_t         nextTicket_ = 1;
 
     // Timeout for a stuck in-flight op (createTopic reply lost, or HW never

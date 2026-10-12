@@ -618,3 +618,26 @@ TEST(AdminWorkerRegression, CreateReplyWithUnknownPersistenceFailsInternalAndGoe
     EXPECT_EQ(h.lastErr, 0u) << "the worker went Idle: the next define completes";
     ASSERT_NE(h.reg.byName("orders"), nullptr);
 }
+
+// No-hang fix round 3 (fix-on-sight): the DDL queue is bounded — a request
+// beyond kMaxPendingDdl is answered Internal at once instead of queued forever.
+TEST(AdminWorkerRegression, DdlQueueIsBoundedAndOverflowIsAnsweredInternalRegression) {
+    Harness h;
+    for (std::size_t i = 0; i < AdminWorker::kMaxPendingDdl; ++i) {
+        DefineTopicMsg m; m.session = 1; m.corr = static_cast<int64_t>(i); m.name = "t" + std::to_string(i);
+        m.partitionCount = 1; m.blob = charsBlob();
+        h.w->submitDefineTopic(std::move(m));
+    }
+    ASSERT_EQ(h.w->pendingCount(), AdminWorker::kMaxPendingDdl);
+    h.lastErr = 0xffff;
+    DefineTopicMsg over; over.session = 1; over.corr = 999; over.name = "over"; over.partitionCount = 1;
+    over.blob = charsBlob();
+    h.w->submitDefineTopic(std::move(over));
+    EXPECT_EQ(h.lastErr, 6u) << "a DDL beyond the bound was queued (or dropped) instead of answered Internal";
+    EXPECT_EQ(h.w->pendingCount(), AdminWorker::kMaxPendingDdl);
+    EXPECT_EQ(h.w->pendingDdlRefused(), 1u);
+    h.lastAlterErr = 0xffff;
+    AlterTopicMsg a; a.session = 1; a.corr = 1000; a.topicName = "t0";
+    h.w->submitAlterTopic(std::move(a));
+    EXPECT_EQ(h.lastAlterErr, 6u);
+}

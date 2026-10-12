@@ -18,6 +18,9 @@
 
 namespace rune::gateway {
 
+/// Fix round 3 (I3): the minimum answer buffer every ITxnRequestHandler call gets.
+inline constexpr std::size_t kTxnMinOutCap = 64;
+
 struct ITxnRequestHandler {
     virtual ~ITxnRequestHandler() = default;
 
@@ -30,6 +33,12 @@ struct ITxnRequestHandler {
     // exactly one thing: the answer is DEFERRED (handleEndTxn only: sent via
     // ClientGateway::sendControlFrame when the transaction's last marker
     // lands).  The gateway answers Internal for a 0 from any other handler.
+    //
+    // Fix round 3 (I3): outCap is ALWAYS >= kTxnMinOutCap (the gateway passes
+    // its 68 KiB scratch — static_assert-ed at the call site), which holds every
+    // fixed-size txn response and every rejection (kMaxRejectionBytes).  A
+    // handler therefore never has to "fail to answer": a smaller outCap is a
+    // caller contract breach and halts loudly (never a silent 0 = "deferred").
     //
     // buf and out MUST NOT overlap.
     // outCap is the capacity of out[] in bytes.

@@ -5968,7 +5968,8 @@ TEST(D4TxnRegression, MalformedEndTxnFramesAreIgnoredRegression) {
     std::vector<uint8_t> f(q.encodedSize()); q.encode(f.data());
     for (std::size_t cut = 1; cut < f.size(); ++cut)
         (void)T.tcs->handleEndTxn(f.data(), cut, 1, T.out.data(), T.out.size());   // must not crash (ASan/UBSan)
-    // Output buffer too small for the answer.
-    EXPECT_EQ(T.tcs->handleEndTxn(f.data(), f.size(), 1, T.out.data(), 1), 0u);
+    // Output buffer below the kTxnMinOutCap contract: no-hang fix round 3 (I3) —
+    // a halt, never the "deferred" 0 the gateway would never answer.
+    EXPECT_DEATH((void)T.tcs->handleEndTxn(f.data(), f.size(), 1, T.out.data(), 1), "kTxnMinOutCap");
     SUCCEED();
 }

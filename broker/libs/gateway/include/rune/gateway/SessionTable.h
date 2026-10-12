@@ -85,6 +85,12 @@ struct Session {
     // ClientGateway::kSpillExpiring = the spill was full → the session is being
     // expired (SessionExpired + close at the next drain).
     uint32_t                                       spilledAnswers = 0;
+    // Fix round 3 (I1 fairness): bytes of this session's answers in the spill
+    // (per-session quota ClientGateway::kSessionSpillQuota), and the drain pass
+    // in which its publication refused an offer (its later spilled answers wait,
+    // other sessions' answers keep draining — per-session order, no HOL block).
+    uint32_t                                       spilledBytes     = 0;
+    uint64_t                                       spillBlockedPass = 0;
     // Lows batch C (D8c R3): the worker whose full routed share deferred this
     // session's head Produce (-1 = none).  While set, the redelivered frame is
     // ABORTed by ClientGateway::admitClientFrame_ (one probe) instead of being

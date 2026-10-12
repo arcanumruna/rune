@@ -41,6 +41,7 @@
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/MessageHeader.h>
+#include <rune/node/GroupErrorMapping.h>
 
 #include <atomic>
 #include <chrono>
@@ -1044,4 +1045,23 @@ TEST_F(CG3ServiceTest, MalformedGroupRequestsAreAnsweredInvalidRequestRegression
     auto of = pc::OffsetFetchResponse::decode(out_, o);
     ASSERT_TRUE(of.has_value()); EXPECT_EQ(of->correlationId, 6);
     ASSERT_EQ(of->results.size(), 1u); EXPECT_EQ(of->results[0].errorCode, kInv);
+}
+
+// No-hang fix round 3 (fix-on-sight): an unknown coordinator result maps to
+// Internal — it used to map to OK (an error silently answered as success).
+TEST(GroupErrorMappingRegression, UnknownCoordinatorResultIsInternalNotOkRegression) {
+    using rune::node::joinErrorToProto;
+    using rune::node::heartbeatErrorToProto;
+    using rune::node::syncErrorToProto;
+    constexpr auto kOk  = static_cast<int16_t>(pc::ErrorCode::OK);
+    constexpr auto kInt = static_cast<int16_t>(pc::ErrorCode::Internal);
+    EXPECT_EQ(joinErrorToProto(0), kOk);
+    EXPECT_EQ(joinErrorToProto(rune::coordination::JoinResult::kErrDead), static_cast<int16_t>(pc::ErrorCode::GroupDead));
+    EXPECT_EQ(heartbeatErrorToProto(rune::coordination::HeartbeatResult::kOk), kOk);
+    EXPECT_EQ(syncErrorToProto(rune::coordination::SyncResult::kOk), kOk);
+    for (const int unknown : {77, -1, 1000}) {
+        EXPECT_EQ(joinErrorToProto(unknown), kInt) << unknown;
+        EXPECT_EQ(heartbeatErrorToProto(unknown), kInt) << unknown;
+        EXPECT_EQ(syncErrorToProto(unknown), kInt) << unknown;
+    }
 }

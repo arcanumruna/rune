@@ -275,41 +275,102 @@ void ClientGateway::sendReliable_(Session&       session,
         ++spillExpiryDrops_;   // the session is being expired: SessionExpired tells the client
         return;
     }
-    if (egressSpill_.push(session.sessionId, buf, len)) {
-        ++session.spilledAnswers;
+    // Fix round 3 (I1 fairness): a session over its spill quota is the one
+    // expired — it is the slow / stalled consumer, never an innocent pusher.
+    if (session.spilledBytes + len > kSessionSpillQuota) {
+        expireForSpill_(session);
         return;
     }
-    expireForSpill_(session);
+    while (!egressSpill_.push(session.sessionId, buf, len)) {
+        // Globally full: reclaim delivered space first, then expire the session
+        // holding the MOST spilled bytes (possibly this one) and retry.
+        if (egressSpill_.compact() && egressSpill_.push(session.sessionId, buf, len)) break;
+        Session* hog = largestSpiller_();
+        if (hog == nullptr || hog == &session || hog->spilledBytes <= session.spilledBytes) {
+            expireForSpill_(session);
+            return;
+        }
+        expireForSpill_(*hog);   // discards the hog's records + compacts
+    }
+    ++session.spilledAnswers;
+    session.spilledBytes += static_cast<uint32_t>(len);
 }
 
-// Spill full (or one answer larger than the whole spill): the session cannot
-// be answered in order any more.  Mark it (closing here could free a Session a
-// caller still holds); closeSpillExpiredSessions_ closes it at the next drain
-// with SessionExpired, so the client fails every pending op SessionLost.
+Session* ClientGateway::largestSpiller_()
+{
+    Session* best = nullptr;
+    sessions_.forEach([&](Session& s) {
+        if (s.spilledAnswers == 0 || s.spilledAnswers == kSpillExpiring) return;
+        if (best == nullptr || s.spilledBytes > best->spilledBytes) best = &s;
+    });
+    return best;
+}
+
+// The spill cannot hold this session's answers any more.  Fix round 3 (I1):
+// the session enters the explicit EXPIRING state — its spilled answers are
+// discarded (space reclaimed), every new answer is refused (counted), and its
+// SessionExpired is re-offered each drain (serviceSpillExpiring_) until it is
+// delivered or the lease deadline passes; only then is the session closed.  The
+// publication stays alive until then (it is the only way to tell the client).
 void ClientGateway::expireForSpill_(Session& session)
 {
     if (spillExpiries_++ % 1024 == 0)
-        spdlog::error("ClientGateway: egress spill full ({} B used of {} B, {} answers); session={} "
-                      "expired (SessionExpired) instead of dropping its answer (expiries={})",
-                      egressSpill_.usedBytes(), egressSpill_.capacity(), egressSpill_.count(),
-                      session.sessionId, spillExpiries_);
+        spdlog::error("ClientGateway: egress spill: session={} holds {} B ({} answers; spill {} B of {} B) — "
+                      "expiring it (SessionExpired) instead of dropping answers (expiries={})",
+                      session.sessionId, session.spilledBytes, session.spilledAnswers, egressSpill_.usedBytes(),
+                      egressSpill_.capacity(), spillExpiries_);
+    (void)egressSpill_.discard(session.sessionId);
+    (void)egressSpill_.compact();
     session.spilledAnswers = kSpillExpiring;
-    ++spillExpiriesPending_;
+    session.spilledBytes   = 0;
+    if (spillExpiringCount_ == spillExpiring_.size()) [[unlikely]] {
+        // The preallocated EXPIRING table is full: the session stays marked
+        // (every answer refused) and is adopted by serviceSpillExpiring_ as soon
+        // as a slot frees — never closed here (a caller may still hold it).
+        ++spillExpiringOverflow_;
+        return;
+    }
+    spillExpiring_[spillExpiringCount_++] = SpillExpiring{session.sessionId, nowNs_ + sessionTimeoutNs_};
 }
 
-void ClientGateway::closeSpillExpiredSessions_()
+void ClientGateway::serviceSpillExpiring_(int64_t nowNs)
 {
-    while (spillExpiriesPending_ != 0) {
-        std::array<int64_t, 64> sids{};
-        std::size_t n = 0;
-        sessions_.forEach([&](Session& s) {
-            if (s.spilledAnswers == kSpillExpiring && n < sids.size()) sids[n++] = s.sessionId;
-        });
-        if (n == 0) { spillExpiriesPending_ = 0; break; }   // closed by another path meanwhile
-        for (std::size_t i = 0; i < n; ++i) {
-            (void)closeSession_(sids[i], /*notifyExpired=*/true);
-            if (spillExpiriesPending_ != 0) --spillExpiriesPending_;
+    pc::ErrorResponse e;
+    e.correlationId = 0;
+    e.code          = static_cast<int16_t>(pc::ErrorCode::SessionExpired);
+    for (std::size_t i = 0; i < spillExpiringCount_;) {
+        const SpillExpiring ex = spillExpiring_[i];
+        Session* s = sessions_.find(ex.sessionId);
+        bool done = (s == nullptr);   // closed meanwhile (reaped / disconnected)
+        if (!done) {
+            e.sessionId = ex.sessionId;
+            const std::size_t n = e.encode(scratch_.data());
+            const bool sent = s->egress ? offerBytes_(s, scratch_.data(), n) > 0
+                                        : sendTo(*s, scratch_.data(), n);   // egress-less test session (hook)
+            if (sent) {
+                ++spillExpiryNotified_;
+                done = true;
+            } else if (nowNs >= ex.deadlineNs) {
+                ++spillExpiryNotifyLost_;   // lease over: the client's own keepalive timeout has fired too
+                done = true;
+            }
+            if (done) (void)closeSession_(ex.sessionId, /*notifyExpired=*/false);
         }
+        if (done) spillExpiring_[i] = spillExpiring_[--spillExpiringCount_];
+        else ++i;
+    }
+    // Marked sessions the full table could not take yet: adopt them now.
+    if (spillExpiringOverflow_ != 0 && spillExpiringCount_ < spillExpiring_.size()) [[unlikely]] {
+        std::size_t adopted = 0;
+        sessions_.forEach([&](Session& s) {
+            if (s.spilledAnswers != kSpillExpiring || spillExpiringCount_ == spillExpiring_.size()) return;
+            for (std::size_t k = 0; k < spillExpiringCount_; ++k)
+                if (spillExpiring_[k].sessionId == s.sessionId) return;
+            spillExpiring_[spillExpiringCount_++] = SpillExpiring{s.sessionId, nowNs + sessionTimeoutNs_};
+            ++adopted;
+        });
+        spillExpiringOverflow_ = (spillExpiringCount_ == spillExpiring_.size()) ? spillExpiringOverflow_ : 0;
+        (void)adopted;
     }
 }
 
@@ -476,25 +537,35 @@ bool ClientGateway::sendRespReliable(rune::protocol::client::ErrorCode ec,
 // nowNs is currently unused (no per-entry aging) — kept in the signature for
 // the doWork() call convention and future deadline/timeout support.
 // ---------------------------------------------------------------------------
-int ClientGateway::drainPendingResponses(int64_t /*nowNs*/)
+int ClientGateway::drainPendingResponses(int64_t nowNs)
 {
-    // No-hang fix round 2 (I1): sessions whose answer did not fit the spill are
-    // closed here (outside any handler holding a Session&), with SessionExpired.
-    if (spillExpiriesPending_ != 0) [[unlikely]] closeSpillExpiredSessions_();
+    // Fix round 3 (I1): sessions in the EXPIRING state get their SessionExpired
+    // re-offered (closed once delivered, or at the lease deadline).
+    if ((spillExpiringCount_ | spillExpiringOverflow_) != 0) [[unlikely]]
+        serviceSpillExpiring_(nowNs != 0 ? nowNs : nowNs_);
+    if (egressSpill_.empty()) [[likely]] return 0;
+    // Fix round 3 (I1 fairness): drain PER SESSION — a session whose publication
+    // refuses an offer is blocked for this pass (its later answers keep their
+    // order behind it); every other session's spilled answers keep flowing.
     int delivered = 0;
-    while (!egressSpill_.empty()) {
-        const SpillFifo::Record r = egressSpill_.front();
-        Session* session = sessions_.find(r.key);
-        // Session closed (reaped / expired) → nothing to answer on: discard.
-        if (!session || session->spilledAnswers == kSpillExpiring) {
-            egressSpill_.pop();
-            continue;
+    ++spillPass_;
+    int64_t  lastKey = 0;
+    Session* last    = nullptr;
+    egressSpill_.scan([&](const SpillFifo::Record& r) -> bool {
+        Session* s = (r.key == lastKey && last != nullptr) ? last : sessions_.find(r.key);
+        lastKey = r.key;
+        last    = s;
+        if (s == nullptr || s->spilledAnswers == kSpillExpiring) return true;   // closed / expiring: discard
+        if (s->spillBlockedPass == spillPass_) return false;                  // order: behind its refused one
+        if (offerBytes_(s, r.data, r.len) <= 0) {
+            s->spillBlockedPass = spillPass_;
+            return false;
         }
-        if (offerBytes_(session, r.data, r.len) <= 0) break;   // still back-pressured — keep FIFO
-        if (session->spilledAnswers > 0) --session->spilledAnswers;
-        egressSpill_.pop();
+        if (s->spilledAnswers > 0) --s->spilledAnswers;
+        s->spilledBytes -= std::min<uint32_t>(s->spilledBytes, static_cast<uint32_t>(r.len));
         ++delivered;
-    }
+        return true;
+    });
     return delivered;
 }
 
@@ -514,7 +585,10 @@ int ClientGateway::doWork(int64_t nowNs) {
     // before worker returns, before everything else.  This ensures a buffered
     // produce ack is sent as soon as the publication clears back-pressure,
     // preserving the "no silent drop on back-pressure" invariant.
-    drainPendingResponses(nowNs);
+drainPendingResponses(nowNs);
+    // No-hang fix round 3: the no-hang counters, logged while the broker runs
+    // (on change, at most every kNoHangStatsLogNs) — one compare per duty cycle.
+    if (nowNs >= nextNoHangStatsLogNs_) [[unlikely]] (void)logNoHangStatsIfChanged_(nowNs);
 
     // E2 inc2a: drain the workers' return rings FIRST — send responses from the
     // previous cycle's produce-appends and push-reads before processing any new
@@ -1155,6 +1229,18 @@ void ClientGateway::evictOldestPendingConnect_()
     // not yet resolved — the conductor still holds it in AWAITING state).
     const bool evictedAlreadyResolved = (pendingConnects_.front().resolvedPub != nullptr) ||
                                         pendingConnects_.front().awaitingResolve;   // nothing registered
+    // Fix round 3 (fix-on-sight): an evicted connect whose reply publication is
+    // resolved is ANSWERED (ConnectResponse{Internal}, no session) — one offer:
+    // the eviction exists to bound this table, so it is not retried (counted).
+    if (const auto& ev = pendingConnects_.front(); ev.resolvedPub) {
+        pc::ConnectResponse resp;
+        resp.sessionId     = 0;
+        resp.correlationId = ev.correlationId;
+        resp.code          = static_cast<int16_t>(pc::ErrorCode::Internal);
+        if (!offerOnPub_(*ev.resolvedPub, scratch_.data(), resp.encode(scratch_.data()))) ++unanswerableFrames_;
+    } else {
+        ++unanswerableFrames_;   // no reply publication yet: nothing to answer on
+    }
     // Fix round 1 (I2): an evicted entry whose announcement began holds
     // worker ack-table slots — close it on every worker (never leaked).
     closeDroppedPendingConnect_(pendingConnects_.front());
@@ -1311,14 +1397,30 @@ ClientGateway::ProducePause ClientGateway::produceFramePause_(const uint8_t* buf
     return ProducePause::None;
 }
 
+bool ClientGateway::logNoHangStatsIfChanged_(int64_t nowNs)
+{
+    nextNoHangStatsLogNs_ = nowNs + kNoHangStatsLogNs;
+    const NoHangStats nh = noHangStats();
+    const uint64_t sig = nh.rejectedRequests ^ (nh.unanswerableFrames << 1) ^ (nh.spillExpiries << 2) ^
+                         (nh.spillExpiryDrops << 3) ^ (nh.spillExpiryNotified << 4) ^ (nh.spillExpiryNotifyLost << 5);
+    if (sig == lastNoHangStatsSig_) return false;
+    lastNoHangStatsSig_ = sig;
+    spdlog::info("ClientGateway: no-hang stats — rejected (answered with an error)={} unanswerable={} "
+                 "spillExpiries={} (SessionExpired delivered={} lost={} expiring now={}) spillExpiryDrops={} "
+                 "spilledNow={} ({} B)", nh.rejectedRequests, nh.unanswerableFrames, nh.spillExpiries,
+                 nh.spillExpiryNotified, nh.spillExpiryNotifyLost, nh.spillExpiring, nh.spillExpiryDrops,
+                 nh.spilledAnswers, nh.spillUsedBytes);
+    return true;
+}
+
 void ClientGateway::logProducePauseStats() const
 {
     if (const NoHangStats nh = noHangStats();
         nh.rejectedRequests | nh.unanswerableFrames | nh.spillExpiries | nh.spilledAnswers) {
         spdlog::warn("ClientGateway: no-hang stats — rejected (answered with an error)={} unanswerable={} "
-                     "spillExpiries={} spillExpiryDrops={} spilledNow={} ({} B)",
-                     nh.rejectedRequests, nh.unanswerableFrames, nh.spillExpiries, nh.spillExpiryDrops,
-                     nh.spilledAnswers, nh.spillUsedBytes);
+                     "spillExpiries={} (SessionExpired delivered={} lost={}) spillExpiryDrops={} spilledNow={} ({} B)",
+                     nh.rejectedRequests, nh.unanswerableFrames, nh.spillExpiries, nh.spillExpiryNotified,
+                     nh.spillExpiryNotifyLost, nh.spillExpiryDrops, nh.spilledAnswers, nh.spillUsedBytes);
     }
     if (heldProduceAborts_ == 0 && produceCreditUnderflows_ == 0) return;
     spdlog::warn("ClientGateway: produce pauses — aborts={} (credit={} workerCap={}) creditUnderflows={}",
@@ -1773,14 +1875,15 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     const std::string_view replyHost = rune::consensus::PeerHostTable::endpointHost(pc_entry.egressChannel);
     if (hostResolver_.valid() && !replyHost.empty() &&
         !rune::consensus::PeerHostTable::isNumericHost(replyHost)) [[unlikely]] {
-        auto* host = new std::string(replyHost);
-        if (!hostResolver_.req->offer(rune::consensus::kHostResolveRequest, sessionId,
-                                      static_cast<int64_t>(reinterpret_cast<std::intptr_t>(host)))) {
-            delete host;
-            spdlog::warn("ClientGateway: host-resolve ring full; dropping Connect (the client retries)");
-            return;
-        }
         pc_entry.awaitingResolve = true;
+        // Fix round 3 (concern 2): a momentarily full resolve ring no longer
+        // drops the Connect — the pending connect is kept (ResolveOfferPending)
+        // and the offer retried every poll until accepted or the connect
+        // timeout (pollPendingConnects).
+        pc_entry.resolveOfferPending = !offerHostResolve_(pc_entry);
+        if (pc_entry.resolveOfferPending)
+            spdlog::warn("ClientGateway: host-resolve ring full; session={} Connect kept pending, offer retried",
+                         sessionId);
         pendingConnects_.push_back(std::move(pc_entry));
         return;
     }
@@ -1831,6 +1934,21 @@ bool ClientGateway::registerConnectEgress_(PendingConnect& pending)
         // Bad channel — drop (never crash).
         spdlog::warn("ClientGateway: addExclusivePublication threw for egress channel '{}'; dropping Connect",
                      pending.egressChannel);
+        return false;
+    }
+    return true;
+}
+
+// Offer the reply host of `pending` to the cold resolver (cold path: the host
+// string is heap-owned by the request until the hub frees it).  False = the
+// ring is full right now (the caller keeps the connect pending and retries).
+bool ClientGateway::offerHostResolve_(PendingConnect& pending)
+{
+    const std::string_view replyHost = rune::consensus::PeerHostTable::endpointHost(pending.egressChannel);
+    auto* host = new std::string(replyHost);
+    if (!hostResolver_.req->offer(rune::consensus::kHostResolveRequest, pending.sessionId,
+                                  static_cast<int64_t>(reinterpret_cast<std::intptr_t>(host)))) {
+        delete host;
         return false;
     }
     return true;
@@ -1928,6 +2046,20 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             continue;
         }
 
+        if (pending.failingHandshake) [[unlikely]] {      // fix round 3 (N4): HandshakeFailed not yet delivered
+            if (offerHandshakeFailed_(pending)) {
+                closeDroppedPendingConnect_(pending);
+                it = pendingConnects_.erase(it);
+            } else {
+                ++it;
+            }
+            continue;
+        }
+        if (pending.resolveOfferPending) [[unlikely]] {   // fix round 3: retry a refused resolve offer
+            pending.resolveOfferPending = !offerHostResolve_(pending);
+            ++it;
+            continue;
+        }
         if (pending.awaitingResolve) { ++it; continue; }   // reply host not resolved yet (LOW-4)
         // client<->broker TLS/AEAD (Task 7): the first ConnectResponse (with
         // the chosen cipher + server's first flight) was already sent; this
@@ -2156,14 +2288,26 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
 void ClientGateway::failPendingHandshake_(std::deque<PendingConnect>::iterator it, int64_t correlationId)
 {
     PendingConnect& pending = *it;
+    // Fix round 3 (N4): delivered reliably — a refused offer leaves the entry in
+    // the explicit FailingHandshake state (awaitingHandshake cleared), re-offered
+    // every poll until delivered or the connect timeout.
+    pending.awaitingHandshake  = false;
+    pending.failingHandshake   = true;
+    pending.handshakeFailCorr  = correlationId;
+    if (offerHandshakeFailed_(pending)) {
+        closeDroppedPendingConnect_(pending);
+        pendingConnects_.erase(it);
+    }
+}
+
+bool ClientGateway::offerHandshakeFailed_(PendingConnect& pending)
+{
     pc::HandshakeContinueResponse fail;
     fail.sessionId     = pending.sessionId;
-    fail.correlationId = correlationId;
+    fail.correlationId = pending.handshakeFailCorr;
     fail.code          = static_cast<int16_t>(pc::ErrorCode::HandshakeFailed);
-    if (fail.encodedSize() <= scratch_.size())
-        (void)offerOnPub_(*pending.resolvedPub, scratch_.data(), fail.encode(scratch_.data()));
-    closeDroppedPendingConnect_(pending);
-    pendingConnects_.erase(it);
+    static_assert(pc::MessageHeader::ENCODED_SIZE + 64 <= kScratchSize);
+    return offerOnPub_(*pending.resolvedPub, scratch_.data(), fail.encode(scratch_.data()));
 }
 
 // Pre-session sends (a pending connect's reply publication): the real
@@ -5840,6 +5984,9 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
 
     std::size_t encoded = 0;
+    // Fix round 3 (I3): the scratch always holds any fixed-size txn answer and
+    // any rejection — a handler's 0 can only mean EndTxn's "deferred".
+    static_assert(kScratchSize >= kTxnMinOutCap, "txn handlers need kTxnMinOutCap");
     const std::size_t cap = scratch_.size();
     const auto templateId = static_cast<pc::TemplateId>(tid);
     switch (templateId) {

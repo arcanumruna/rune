@@ -28,6 +28,9 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/client/TxnMessages.h>
+#include <rune/gateway/ITxnRequestHandler.h>
+#include <rune/protocol/client/MessageHeader.h>
+#include <array>
 #include <rune/protocol/client/Protocol.h>
 
 #include <atomic>
@@ -611,4 +614,33 @@ TEST_F(TransactionCoordinationServiceTest, ResponseThatCannotFitIsAnsweredMessag
     EXPECT_EQ(r->correlationId, 9);
     ASSERT_EQ(r->results.size(), 1u);
     EXPECT_EQ(r->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+}
+
+// Fix round 3 (I3): handleEndTxn never returns the "deferred" 0 for an answer it
+// could not write.  At the contract minimum (kTxnMinOutCap) every EndTxn outcome
+// is written; below it the handler halts loudly instead of returning 0.
+TEST_F(TransactionCoordinationServiceTest, EndTxnAtMinOutCapIsAlwaysAnsweredRegression) {
+    std::array<uint8_t, rune::gateway::kTxnMinOutCap> small{};
+    // A malformed EndTxn (rejection) and a not-coordinator EndTxn, both at the minimum.
+    pc::MessageHeader h;
+    h.blockLength = 32; h.templateId = static_cast<uint16_t>(pc::TemplateId::EndTxn);
+    h.sessionId = 42; h.correlationId = 7;
+    h.encode(reqBuf_.data());
+    std::size_t n = svc_->handleEndTxn(reqBuf_.data(), pc::MessageHeader::ENCODED_SIZE, 0, small.data(), small.size());
+    ASSERT_GT(n, 0u) << "a malformed EndTxn yielded the 'deferred' 0";
+    EXPECT_EQ(pc::EndTxnResponse::decode(small.data(), n)->correlationId, 7);
+    isLeader_ = false;
+    const std::size_t reqLen = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 42, 8, 10, 0, true, "txA");
+    n = svc_->handleEndTxn(reqBuf_.data(), reqLen, 0, small.data(), small.size());
+    ASSERT_GT(n, 0u);
+    EXPECT_EQ(pc::EndTxnResponse::decode(small.data(), n)->errorCode,
+              static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+}
+
+TEST_F(TransactionCoordinationServiceTest, EndTxnBelowMinOutCapHaltsInsteadOfDeferringRegression) {
+    isLeader_ = false;
+    const std::size_t reqLen = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 42, 9, 10, 0, true, "txA");
+    std::array<uint8_t, 8> tiny{};
+    EXPECT_DEATH((void)svc_->handleEndTxn(reqBuf_.data(), reqLen, 0, tiny.data(), tiny.size()),
+                 "kTxnMinOutCap");
 }

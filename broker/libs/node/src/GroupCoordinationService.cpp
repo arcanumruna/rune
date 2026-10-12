@@ -6,6 +6,7 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/node/GroupCoordinationService.h>
+#include <rune/node/GroupErrorMapping.h>
 #include <rune/gateway/RequestRejection.h>
 
 #include <rune/gateway/ClientGateway.h>  // CG-4: addGroupSubscription / revokeGroupSubscriptions / sendControlFrame
@@ -25,36 +26,10 @@ namespace rune::node {
 namespace pc = rune::protocol::client;
 namespace coord = rune::coordination;
 
-// ---------------------------------------------------------------------------
-// Helper: convert coordinator error codes → protocol ErrorCode (int16_t)
-// ---------------------------------------------------------------------------
-static int16_t joinErrorToProto(int coordErr) noexcept {
-    switch (coordErr) {
-        case coord::JoinResult::kErrDead: return static_cast<int16_t>(pc::ErrorCode::GroupDead);
-        default:                          return static_cast<int16_t>(pc::ErrorCode::OK);
-    }
-}
-
-static int16_t heartbeatErrorToProto(int coordErr) noexcept {
-    switch (coordErr) {
-        case coord::HeartbeatResult::kOk:                   return static_cast<int16_t>(pc::ErrorCode::OK);
-        case coord::HeartbeatResult::kErrUnknownMember:     return static_cast<int16_t>(pc::ErrorCode::UnknownMember);
-        case coord::HeartbeatResult::kErrStaleGeneration:   return static_cast<int16_t>(pc::ErrorCode::StaleGeneration);
-        case coord::HeartbeatResult::kErrRebalanceInProgress: return static_cast<int16_t>(pc::ErrorCode::RebalanceInProgress);
-        default:                                            return static_cast<int16_t>(pc::ErrorCode::OK);
-    }
-}
-
-static int16_t syncErrorToProto(int coordErr) noexcept {
-    switch (coordErr) {
-        case coord::SyncResult::kOk:                   return static_cast<int16_t>(pc::ErrorCode::OK);
-        case coord::SyncResult::kErrStaleGeneration:   return static_cast<int16_t>(pc::ErrorCode::StaleGeneration);
-        case coord::SyncResult::kErrUnknownMember:     return static_cast<int16_t>(pc::ErrorCode::UnknownMember);
-        case coord::SyncResult::kErrRebalanceInProgress: return static_cast<int16_t>(pc::ErrorCode::RebalanceInProgress);
-        case coord::SyncResult::kErrWrongState:        return static_cast<int16_t>(pc::ErrorCode::RebalanceInProgress);
-        default:                                       return static_cast<int16_t>(pc::ErrorCode::OK);
-    }
-}
+// Coordinator result → protocol ErrorCode: GroupErrorMapping.h (fix round 3).
+using rune::node::joinErrorToProto;
+using rune::node::heartbeatErrorToProto;
+using rune::node::syncErrorToProto;
 
 // ---------------------------------------------------------------------------
 // Construction

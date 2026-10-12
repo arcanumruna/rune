@@ -24,6 +24,8 @@
 
 #include <rune/node/TransactionCoordinationService.h>
 #include <rune/gateway/RequestRejection.h>
+#include <rune/gateway/ITxnRequestHandler.h>
+#include <cstdlib>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 
@@ -295,9 +297,27 @@ int TransactionCoordinationService::doWork(int64_t nowNs) {
 // response type, encodeRejectionFor) — never a 0 the gateway would read as
 // "deferred" and never answer.
 // ---------------------------------------------------------------------------
+// Fix round 3 (I3): never 0.  outCap >= kTxnMinOutCap is the caller contract
+// (it holds every rejection, kMaxRejectionBytes); a breach halts loudly — a 0
+// here would be read as EndTxn's "deferred" and the request never answered.
+static_assert(rune::gateway::kTxnMinOutCap >= rune::gateway::kMaxRejectionBytes);
+static_assert(rune::gateway::kTxnMinOutCap >= rune::protocol::client::EndTxnResponse::ENCODED_SIZE);
+static_assert(rune::gateway::kTxnMinOutCap >= rune::protocol::client::InitProducerIdResponse::ENCODED_SIZE);
+static_assert(rune::gateway::kTxnMinOutCap >= rune::protocol::client::AddOffsetsToTxnResponse::ENCODED_SIZE);
+[[noreturn]] [[gnu::cold]] static void haltTxnOutCapBreach_(size_t outCap) noexcept {
+    spdlog::critical("TransactionCoordinationService: answer buffer of {} B < kTxnMinOutCap ({} B) — "
+                     "caller contract breach; halting rather than leaving a request unanswered",
+                     outCap, rune::gateway::kTxnMinOutCap);
+    std::fprintf(stderr, "TransactionCoordinationService: answer buffer of %zu B < kTxnMinOutCap — halting\n",
+                 outCap);
+    std::abort();
+}
 static size_t answerCannotFit_(const uint8_t* buf, size_t len, uint8_t* out, size_t outCap) noexcept {
-    return rune::gateway::encodeRejectionFor(
+    if (outCap < rune::gateway::kTxnMinOutCap) [[unlikely]] haltTxnOutCapBreach_(outCap);
+    const size_t n = rune::gateway::encodeRejectionFor(
         buf, len, static_cast<uint16_t>(rune::protocol::client::ErrorCode::MessageTooLarge), out, outCap);
+    if (n == 0) [[unlikely]] haltTxnOutCapBreach_(outCap);   // header undecodable: unreachable (gateway checked it)
+    return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +327,7 @@ size_t TransactionCoordinationService::handleInitProducerId(
     const uint8_t* buf, size_t len, int64_t nowNs,
     uint8_t* out, size_t outCap)
 {
+    if (outCap < rune::gateway::kTxnMinOutCap) [[unlikely]] haltTxnOutCapBreach_(outCap);   // fix round 3 (I3)
     auto msgOpt = pc::InitProducerId::decode(buf, len);
     if (!msgOpt) {
         // No-hang (R2): answered InitProducerIdResponse{InvalidRequest}, never dropped.
@@ -381,6 +402,7 @@ size_t TransactionCoordinationService::handleAddPartitions(
     const uint8_t* buf, size_t len, int64_t nowNs,
     uint8_t* out, size_t outCap)
 {
+    if (outCap < rune::gateway::kTxnMinOutCap) [[unlikely]] haltTxnOutCapBreach_(outCap);   // fix round 3 (I3)
     auto msgOpt = pc::AddPartitionsToTxn::decode(buf, len);
     if (!msgOpt) {
         // No-hang (R2): answered AddPartitionsToTxnResponse{InvalidRequest}, never dropped.
@@ -485,6 +507,7 @@ size_t TransactionCoordinationService::handleAddOffsets(
     const uint8_t* buf, size_t len, int64_t nowNs,
     uint8_t* out, size_t outCap)
 {
+    if (outCap < rune::gateway::kTxnMinOutCap) [[unlikely]] haltTxnOutCapBreach_(outCap);   // fix round 3 (I3)
     auto msgOpt = pc::AddOffsetsToTxn::decode(buf, len);
     if (!msgOpt) {
         // No-hang (R2): answered AddOffsetsToTxnResponse{InvalidRequest}, never dropped.
@@ -542,6 +565,7 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit(
     const uint8_t* buf, size_t len, int64_t nowNs,
     uint8_t* out, size_t outCap)
 {
+    if (outCap < rune::gateway::kTxnMinOutCap) [[unlikely]] haltTxnOutCapBreach_(outCap);   // fix round 3 (I3)
     auto msgOpt = pc::TxnOffsetCommit::decode(buf, len);
     if (!msgOpt) {
         // No-hang (R2): answered TxnOffsetCommitResponse{InvalidRequest}, never dropped.
@@ -639,6 +663,7 @@ size_t TransactionCoordinationService::handleEndTxn(
     const uint8_t* buf, size_t len, int64_t nowNs,
     uint8_t* out, size_t outCap)
 {
+    if (outCap < rune::gateway::kTxnMinOutCap) [[unlikely]] haltTxnOutCapBreach_(outCap);   // fix round 3 (I3)
     auto msgOpt = pc::EndTxn::decode(buf, len);
     if (!msgOpt) {
         // No-hang (R2): answered EndTxnResponse{InvalidRequest}, never dropped.
