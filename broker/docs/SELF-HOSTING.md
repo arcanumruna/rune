@@ -57,6 +57,57 @@ or malformed.
 > The default container 64 MB is too small — always pass `--shm-size=256m` (or set
 > `shm_size` in compose).
 
+### Topic and view names
+
+One rule applies to `RUNE_TOPICS` entries, the client's `defineTopic` and `createView`:
+
+- 1 to 249 bytes of ASCII letters, digits, `.`, `_` and `-`, and not `.` or `..`.
+- Names starting with `__` are reserved for internal topics.
+- Names are case-sensitive, but two names that differ only by ASCII letter case are not allowed,
+  because they would share one data directory on a case-insensitive filesystem.
+- A bad name in `RUNE_TOPICS` is a boot configuration error that names the entry. Two
+  `RUNE_TOPICS` names that differ only by case are a configuration error too.
+- A bad name in DDL is rejected with error 40 (`InvalidTopicName`). A name that differs from an
+  existing topic or view only by case is rejected with error 25 (`TopicExists`). A partition count
+  below 1 is rejected with error 23 (`InvalidSchema`).
+- DDL is serialized: one create or alter runs at a time, so of two colliding requests exactly one
+  wins. If the leader is demoted mid-request, the request in flight is answered error 6
+  (`Internal`; retry on the new leader). Queued requests run after the node is leader again.
+
+### Data directory clean-up at boot
+
+- A topic id whose definition never committed has no catalog record. The usual cause is a
+  `createView` that failed after its output topic was created. Boot keeps the id as a hidden
+  placeholder `__orphan.<id>` with zero partitions, so later topics keep their ids. A placeholder
+  is not listed in metadata, and produce and subscribe to it are refused. Boot logs all
+  placeholders in one warning line.
+- Every runtime-defined disk topic directory holds a `topic-id` marker file. It reads
+  `pending <id>` when the topic is created and is rewritten to `committed <id>` once the catalog
+  record commits. At boot, a `pending` marker on a directory the catalog claims is promoted to
+  `committed`. `RUNE_TOPICS` topics get no marker.
+- At boot the broker reconciles `dataDir/topics/` with the catalog. A directory no topic claims is
+  **deleted** only if all of these hold:
+  - its marker reads `pending <id>`, and boot created the `__orphan.<id>` placeholder for that id
+    (matched by id, never by name);
+  - neither catalog log (`__topic_schemas`, `__views`) was truncated at recovery, and neither is
+    missing while the other exists.
+- Any other unclaimed directory is **moved, never deleted**, to
+  `dataDir/quarantine/<name>-<unix-timestamp>/`, and a warning names both paths. This covers a
+  topic removed from `RUNE_TOPICS`, a misspelt name, and a directory left by another build.
+  With a damaged catalog nothing is deleted that boot, and one warning line says why.
+- Reconcile only considers direct children of `dataDir/topics/` laid out as
+  `<name>/<partition number>/<files>`. It never follows a symlink, and it leaves anything else
+  alone.
+- **Removing a topic from `RUNE_TOPICS` quarantines its data at the next boot.** Adding the
+  topic back starts it **empty**; the broker never restores quarantined data by itself. To restore:
+  1. Stop the broker.
+  2. Make sure `RUNE_TOPICS` lists the topic with the **same partition count**.
+  3. Delete the new, empty `dataDir/topics/<name>/` if it exists.
+  4. Run `mv dataDir/quarantine/<name>-<timestamp> dataDir/topics/<name>`.
+  5. Start the broker.
+- Delete quarantined directories yourself once you no longer need them; the broker never
+  deletes from `dataDir/quarantine/`.
+
 ### Transient topics
 
 A **transient** topic (`persistence=transient` in `RUNE_TOPICS`, `transient topic …;` in Rune QL,
@@ -76,6 +127,10 @@ before a produce is acknowledged but is **never written to disk**.
   rejected with error 37 (`ViewSourceTransient`); use a transient view. Rune QL `create view`
   arrives later.
 - `alter topic` naming a view is rejected with error 38 (`ViewNotAlterable`).
+- A view cannot read another view's output yet: `Client::createView(...)` over a view is rejected
+  with error 41 (`ViewSourceIsView`). Before this release such a view was accepted but stayed
+  empty.
+- Renaming a topic's key field with `alter topic … rename` moves the topic's key to the new name.
 - Use `durability=majority` (default) or `all-in-sync` if a transient topic must survive a node death.
 - `persistence=memory` in `RUNE_TOPICS` is a deprecated alias of `persistence=transient` and logs
   one warning per entry.

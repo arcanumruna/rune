@@ -84,3 +84,28 @@ waits for its timeout.
 - An unknown `acks` or `isolation` byte (anything above 1) is rejected with
   `InvalidRequest`. It is no longer read as one of the two valid modes.
 
+## 8. DDL names, conflicts and boot clean-up
+
+- Topic and view names must be 1–249 bytes of `[A-Za-z0-9._-]`, must not be `.` or `..`, and must
+  not start with `__`.
+  - DDL answers error 40 (`InvalidTopicName`).
+  - A `RUNE_TOPICS` entry with a bad name now refuses to boot and names the entry. **Check
+    your `RUNE_TOPICS` before upgrading.**
+- Two names that differ only by ASCII letter case are rejected: DDL answers 25 (`TopicExists`),
+  and `RUNE_TOPICS` refuses to boot.
+- `createView` over another view's output answers 41 (`ViewSourceIsView`) instead of creating a
+  view that stays empty.
+- `alter topic … rename` of the key field now moves the topic's key with it.
+- A leader demoted mid-DDL answers the request in flight with 6 (`Internal`). Queued requests run
+  after re-promotion.
+- A failed definition can no longer stop the broker from booting. Its topic id becomes a hidden,
+  zero-partition placeholder `__orphan.<id>`: not listed in metadata, produce and subscribe
+  refused.
+- Runtime-defined disk topic directories carry a `topic-id` marker: `pending <id>` at create,
+  `committed <id>` after the catalog commit (or at boot, when the catalog claims the directory).
+- Boot deletes a topic directory only when it belongs to a boot-created `__orphan.<id>` placeholder,
+  its marker reads `pending`, and neither catalog log is truncated or missing on its own. **Any
+  other topic directory no longer in the catalog is moved to
+  `dataDir/quarantine/<name>-<unix-timestamp>/`, never deleted.** That includes a topic removed
+  from `RUNE_TOPICS`. With a damaged catalog nothing is deleted that boot. Re-adding the topic
+  starts it empty; see SELF-HOSTING.md, "Data directory clean-up at boot", for the manual restore.
