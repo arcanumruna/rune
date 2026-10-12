@@ -53,7 +53,7 @@ namespace {
 struct TempDataDir {
     fs::path path;
     explicit TempDataDir(const char* name)
-        : path(fs::temp_directory_path() / ("rune-rtr-" + std::string(name))) {
+        : path(fs::temp_directory_path() / ("rune-rtr-" + std::string(name) + "-" + std::to_string(::getpid()))) {
         fs::remove_all(path);
         fs::create_directories(path);
     }
