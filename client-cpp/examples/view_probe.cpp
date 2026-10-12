@@ -359,7 +359,8 @@ static bool waitForAbsent(Client& c, int32_t viewId, uint64_t fp, int64_t u, int
 // record must sit on Key(userId).partition(8) with record key == Key(userId)
 // bytes, and the set of partitions hit must equal the expected set (>1).
 // Pre-2b every typed record landed on partition 0 with an empty key.
-// Returns 0 on success, else a probe exit code (40..47).
+// Returns 0 on success, else a probe exit code (50..56) — its own range: the
+// verify_restart aggregate leg uses 40..44, so a code names exactly one check.
 // ---------------------------------------------------------------------------
 static int typedRoutingLeg(Client& c, std::chrono::milliseconds wait, int boundMs) {
     constexpr int32_t kParts   = 8;
@@ -370,14 +371,14 @@ static int typedRoutingLeg(Client& c, std::chrono::milliseconds wait, int boundM
                                                  /*validate=*/false, std::span<const uint8_t>(blob), wait);
     if (def.errorCode != 0) {
         std::cerr << "PROBE: FAIL defineTopic(typed_route) errorCode=" << def.errorCode << "\n";
-        return 40;
+        return 50;
     }
 
     const TopicSchemaResult sr = c.getTopicSchemaAndWait("typed_route", wait);
     if (sr.errorCode != 0 || sr.partitionCount != kParts) {
         std::cerr << "PROBE: FAIL getTopicSchema(typed_route) errorCode=" << sr.errorCode
                   << " partitionCount=" << sr.partitionCount << " (want " << kParts << ")\n";
-        return 41;
+        return 51;
     }
 
     TypedTopic<rune::gen::Characters> topic =
@@ -385,7 +386,7 @@ static int typedRoutingLeg(Client& c, std::chrono::milliseconds wait, int boundM
     if (topic.handle().topicId != def.topicId || topic.handle().partitionCount != kParts) {
         std::cerr << "PROBE: FAIL typed handle {" << topic.handle().topicId << ","
                   << topic.handle().partitionCount << "} want {" << def.topicId << "," << kParts << "}\n";
-        return 42;
+        return 52;
     }
 
     std::set<int32_t> expectedParts;
@@ -432,26 +433,26 @@ static int typedRoutingLeg(Client& c, std::chrono::milliseconds wait, int boundM
     std::lock_guard<std::mutex> lk(mtx);
     if (static_cast<int>(seen.size()) != kRecords) {
         std::cerr << "PROBE: FAIL typed_route consumed " << seen.size() << " / " << kRecords << "\n";
-        return 43;
+        return 53;
     }
     std::set<int32_t> gotParts;
     for (const Seen& s : seen) {
         const int32_t want = Key(static_cast<int64_t>(s.userId)).partition(kParts);
         if (!s.keyMatches) {
             std::cerr << "PROBE: FAIL typed_route userId=" << s.userId << " record key != Key(userId)\n";
-            return 44;
+            return 54;
         }
         if (s.partition != want) {
             std::cerr << "PROBE: FAIL typed_route userId=" << s.userId << " on partition " << s.partition
                       << " want " << want << "\n";
-            return 45;
+            return 55;
         }
         gotParts.insert(s.partition);
     }
     if (gotParts != expectedParts || gotParts.size() < 2) {
         std::cerr << "PROBE: FAIL typed_route partitions hit=" << gotParts.size()
                   << " expected=" << expectedParts.size() << "\n";
-        return 46;
+        return 56;
     }
     std::cerr << "PROBE: typed_route OK — " << kRecords << " records over " << gotParts.size()
               << " partitions, each on Key(userId).partition(8) with record key == Key(userId)\n";
