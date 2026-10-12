@@ -457,3 +457,70 @@ TEST(SchemaRegistryRegression, RebuildFromRecordsIndexesTopicNameNotDescriptorNa
     EXPECT_EQ(reg.byName("characters"), nullptr)
         << "after restart the descriptor name is not a topic name";
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2b E: TopicSchema records the persistence mode so boot recovery can
+// recreate a runtime topic as TRANSIENT.  Disk records stay byte-identical.
+// ---------------------------------------------------------------------------
+TEST(SchemaRegistryRegression, TransientPersistenceTrailerRoundTrips) {
+    TopicSchema ts = makeSchema(0x40000020, "desc", false);
+    ts.topicName   = "presence";
+    ts.persistence = PersistenceMode::Transient;
+    auto back = TopicSchema::deserialize(ts.serialize());
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(back->persistence, PersistenceMode::Transient);
+    EXPECT_EQ(back->topicName, "presence");
+}
+
+TEST(SchemaRegistryRegression, DiskRecordIsByteIdenticalToPrePersistenceLayout) {
+    TopicSchema ts = makeSchema(0x40000021, "desc", false);
+    ts.topicName = "orders";
+    const auto disk = ts.serialize();               // persistence defaults to Disk
+    ts.persistence = PersistenceMode::Transient;
+    const auto transientBytes = ts.serialize();
+    ASSERT_EQ(transientBytes.size(), disk.size() + 1);
+    EXPECT_TRUE(std::equal(disk.begin(), disk.end(), transientBytes.begin()));
+    EXPECT_EQ(transientBytes.back(), 1u);
+    auto back = TopicSchema::deserialize(disk);
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(back->persistence, PersistenceMode::Disk);
+}
+
+// A transient record with NO topic name still carries the mode (empty name
+// trailer + the byte), and a pre-name record (3-byte tail) parses as Disk.
+TEST(SchemaRegistryRegression, TransientWithoutNameAndPreNameRecords) {
+    TopicSchema ts = makeSchema(0x40000022, "desc", false);
+    ts.persistence = PersistenceMode::Transient;
+    auto back = TopicSchema::deserialize(ts.serialize());
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(back->persistence, PersistenceMode::Transient);
+    EXPECT_TRUE(back->topicName.empty());
+
+    TopicSchema pre = makeSchema(0x40000023, "desc", false);
+    auto preBack = TopicSchema::deserialize(pre.serialize());
+    ASSERT_TRUE(preBack.has_value());
+    EXPECT_EQ(preBack->persistence, PersistenceMode::Disk);
+}
+
+TEST(SchemaRegistryRegression, UnknownPersistenceByteIsRejected) {
+    TopicSchema ts = makeSchema(0x40000024, "desc", false);
+    ts.topicName   = "p";
+    ts.persistence = PersistenceMode::Transient;
+    auto bytes = ts.serialize();
+    bytes.back() = 2;                                // append-only: never cast
+    EXPECT_FALSE(TopicSchema::deserialize(bytes).has_value());
+    bytes.back() = 0;                                // a writer never emits an explicit 0
+    EXPECT_FALSE(TopicSchema::deserialize(bytes).has_value());
+    bytes.back() = 1;
+    bytes.push_back(1);                              // two bytes after the name: malformed
+    EXPECT_FALSE(TopicSchema::deserialize(bytes).has_value());
+}
+
+TEST(SchemaRegistryRegression, ApplyRecordCarriesPersistenceToEntry) {
+    SchemaRegistry reg;
+    TopicSchema ts = makeSchema(0x40000025, "desc", false);
+    ts.persistence = PersistenceMode::Transient;
+    reg.applyRecord(ts);
+    ASSERT_NE(reg.byId(0x40000025), nullptr);
+    EXPECT_EQ(reg.byId(0x40000025)->persistence, PersistenceMode::Transient);
+}

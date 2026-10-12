@@ -108,11 +108,15 @@ std::vector<uint8_t> TopicSchema::serialize() const {
     writeU8(buf, static_cast<uint8_t>(compatMode));
 
     // [restart recovery] optional topicName trailer: u16 length + bytes, written
-    // ONLY when a name is set, so a nameless record stays byte-identical to the
-    // pre-name layout (exact 3-byte tail).
-    if (!topicName.empty()) {
+    // when a name is set OR the topic is transient (the persistence byte rides
+    // after it), so a nameless disk record stays byte-identical to the pre-name
+    // layout (exact 3-byte tail).
+    const bool transient = (persistence == PersistenceMode::Transient);
+    if (!topicName.empty() || transient) {
         writeU16LE(buf, static_cast<uint16_t>(topicName.size()));
         for (unsigned char c : topicName) buf.push_back(c);
+        // [Phase 2b E] persistence byte -- only for a transient topic.
+        if (transient) writeU8(buf, persistenceToWire(persistence));
     }
 
     return buf;
@@ -179,15 +183,23 @@ std::optional<TopicSchema> TopicSchema::deserialize(std::span<const uint8_t> buf
         }
         ts.compatMode = static_cast<rune::codec::CompatMode>(compatByte);
 
-        // [restart recovery] optional topicName trailer.  Accepted only when the
-        // length prefix and EXACTLY that many name bytes are present — a
-        // partial/oversized tail is malformed, same as every other check here.
+        // [restart recovery] optional topicName trailer, then [Phase 2b E] an
+        // optional persistence byte.  Accepted only as EXACTLY the name bytes
+        // (disk) or the name bytes + ONE byte equal to 1 (transient) -- any other
+        // tail is malformed, same as every other check here.
         if (remaining >= 5) {
             uint16_t nameLen = 0;
             if (!readU16LE(buf, pos, nameLen))          return std::nullopt;
-            if (buf.size() - pos != nameLen)            return std::nullopt;
+            const size_t tail = buf.size() - pos;
+            if (tail != nameLen && tail != static_cast<size_t>(nameLen) + 1) return std::nullopt;
             ts.topicName.assign(reinterpret_cast<const char*>(buf.data() + pos), nameLen);
             pos += nameLen;
+            if (tail == static_cast<size_t>(nameLen) + 1) {
+                uint8_t p = 0;
+                if (!readU8(buf, pos, p))                return std::nullopt;
+                if (p != persistenceToWire(PersistenceMode::Transient)) return std::nullopt;
+                ts.persistence = PersistenceMode::Transient;
+            }
         }
     } else {
         return std::nullopt;  // truncated tail (1, 2 or 4 bytes)
@@ -222,6 +234,7 @@ void SchemaRegistry::applyRecord(const TopicSchema& ts) {
     e.nextTag        = ts.nextTag;
     e.compatMode     = ts.compatMode;
     e.topicName      = ts.topicName;
+    e.persistence    = ts.persistence;
 
     // Index by the TOPIC name — every byName() caller (GetTopicSchema,
     // DefineTopic's TopicExists check, AlterTopic) passes the name the client
