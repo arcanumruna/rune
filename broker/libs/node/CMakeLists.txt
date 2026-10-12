@@ -540,6 +540,26 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 60)
 
     # ---------------------------------------------------------------------------
+    # DDL conformance plan: DdlHarness suites — fix regressions (B1-B4, KL2), the
+    # Occupant x Op matrix and the pair x timing matrix.  On-host (no Aeron),
+    # deterministic.  Every suite name contains "Regression".
+    # ---------------------------------------------------------------------------
+    add_executable(rune_ddl_conformance_tests
+        tests/node/DdlHarnessRegressionTest.cpp)
+    target_include_directories(rune_ddl_conformance_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_ddl_conformance_tests PRIVATE
+        rune_node
+        rune_view
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_ddl_conformance_tests
+        DISCOVERY_TIMEOUT 120
+        PROPERTIES TIMEOUT 120)
+
+    # ---------------------------------------------------------------------------
     # Task 20: GetViewRowRegressionTest — the GetViewRow point-read path (real
     # Worker op/return + WorkerViewSet) + the openView fingerprint handshake
     # (real AdminWorker + __topic_schemas/__views).  On-host (no Aeron / media

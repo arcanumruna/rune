@@ -223,6 +223,15 @@ public:
     // silently-incomplete registry.
     [[nodiscard]] bool rebuildFailed() const noexcept { return rebuildFailed_; }
 
+    // DDL conformance (tests): with startedCount() a test proves AT MOST ONE op is
+    // ever started-but-unanswered — started - answered == (hasInFlight() ? 1 : 0).
+    [[nodiscard]] bool hasInFlight() const noexcept { return inFlight_.has_value(); }
+    /// Queued DDL ops dequeued by startNext_ (each is answered exactly once,
+    /// synchronously or later).  Monotone; admin-thread-owned.
+    [[nodiscard]] uint64_t startedCount() const noexcept { return started_; }
+    /// The in-flight error-path bound (see kDdlTimeoutNs).
+    [[nodiscard]] static constexpr int64_t ddlTimeoutNs() noexcept { return kDdlTimeoutNs; }
+
 private:
     // Rebuild the SchemaRegistry from [0, HW) of the schema replica.
     void rebuildFromLog_();
@@ -356,6 +365,7 @@ private:
     std::deque<PendingDdl> pending_;        // queued DDL ops (CREATE + ALTER, serialized); <= kMaxPendingDdl
     uint64_t pendingDdlRefused_ = 0;        // fix round 3: answered Internal because the queue was full
     int64_t         nextTicket_ = 1;
+    uint64_t        started_    = 0;    // ops dequeued by startNext_ (startedCount())
 
     // Timeout for a stuck in-flight op (createTopic reply lost, or HW never
     // advances because leadership was lost) — respond Internal and move on.

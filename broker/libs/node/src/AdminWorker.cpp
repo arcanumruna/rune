@@ -429,6 +429,7 @@ int AdminWorker::doWork(int64_t nowNs) {
 
 // ─── startNext_ — PARSING → name-lookup → CREATING (request id) ──────────────
 void AdminWorker::startNext_(int64_t nowNs) {
+    ++started_;
     PendingDdl pd = std::move(pending_.front());
     pending_.pop_front();
 
