@@ -932,3 +932,76 @@ TEST(WorkerViewSetRegression, RecoveryFromMidBatchOffsetThenContinuedFoldIsExact
         EXPECT_EQ(rune::view::readSlot(row, *L, 2).i, total) << "group " << g;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2b E: views over a TRANSIENT source.
+// ---------------------------------------------------------------------------
+namespace {
+std::vector<uint8_t> upsertAt(int64_t base, int64_t key, int32_t hp) {
+    rune::protocol::RecordBatchBuilder b(base, 0);
+    const auto k = keyBytes(key);
+    const auto v = encodeCharacter(key, hp, 1);
+    b.append(asSv(k), asSv(v), 0);
+    return b.build();
+}
+} // namespace
+
+// Invariant breach: a view over a transient topic is itself transient, so its
+// cursor can never sit above the source end.  If it does (e.g. a legacy persisted
+// view over a transient source after a restart: the source restarted EMPTY and
+// reuses offsets 0.. below the cursor) the rows are kept, one warn is logged, and every post-restart record must fold (without the reset the
+// cursor 2 would silently skip the new record at offset 0).
+TEST(WorkerViewSetRegression, TransientSourceCursorAboveLogEndIsInvariantBreachRegression) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(1), srcs, 0x40000031).value();
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-transient-reset");
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+
+    const auto before = twoUpsertsKey7();                                    // offsets [0,2)
+    auto rr0 = [&](int64_t, int64_t) { return rune::storage::LogReadView{before.data(), before.size(), 0, 2}; };
+    vs.driveFolds(5, 0, rr0, 2, 0);
+    const rune::view::RowLayout* L = nullptr;
+    ASSERT_NE(vs.getRow(0x40000031, 0, 7, L), nullptr);
+
+    // Source restarted empty: logStart 0, logEnd 0 < cursor 2.
+    EXPECT_EQ(vs.reconcileTransientSource(5, 0, /*logStart*/ 0, /*logEnd*/ 0), 1);
+    ASSERT_NE(vs.foldCounters(0x40000031, 0), nullptr);
+
+    const auto after = upsertAt(0, 9, 77);                                   // reused offset 0
+    auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{after.data(), after.size(), 0, 1}; };
+    vs.driveFolds(5, 0, rr1, 1, 0);
+    const uint8_t* row9 = vs.getRow(0x40000031, 0, 9, L);
+    ASSERT_NE(row9, nullptr) << "a post-restart record at a reused offset must fold";
+    EXPECT_EQ(rune::view::readSlot(row9, *L, 1).i, 77);
+    EXPECT_NE(vs.getRow(0x40000031, 0, 7, L), nullptr) << "pre-restart rows are kept";
+    EXPECT_EQ(vs.reconcileTransientSource(5, 0, 0, 1), 0) << "steady state: nothing to adjust";
+}
+
+// The ring evicted records the view had not folded yet: skip to logStart and
+// count the loss — never stall on an offset the source no longer has.
+TEST(WorkerViewSetRegression, TransientSourceEvictionAheadOfCursorSkipsAndCounts) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(1), srcs, 0x40000032).value();
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-transient-evict");
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+
+    auto empty = [](int64_t, int64_t) { return rune::storage::LogReadView{}; };
+    vs.driveFolds(5, 0, empty, 0, 0);                       // instance exists, cursor 0
+    ASSERT_NE(vs.foldCounters(0x40000032, 0), nullptr);
+
+    EXPECT_EQ(vs.reconcileTransientSource(5, 0, /*logStart*/ 3, /*logEnd*/ 4), 1);
+    EXPECT_EQ(vs.foldCounters(0x40000032, 0)->transientRecordsEvicted, 3u);
+
+    const auto b = upsertAt(3, 11, 5);                      // the surviving record at offset 3
+    auto rr = [&](int64_t from, int64_t) {
+        EXPECT_EQ(from, 3) << "the fold resumes at logStart, not at the evicted cursor";
+        return rune::storage::LogReadView{b.data(), b.size(), 3, 4};
+    };
+    vs.driveFolds(5, 0, rr, 4, 0);
+    const rune::view::RowLayout* L = nullptr;
+    ASSERT_NE(vs.getRow(0x40000032, 0, 11, L), nullptr);
+}

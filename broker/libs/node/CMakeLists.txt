@@ -306,6 +306,8 @@ if(BUILD_TESTING)
     target_link_libraries(rune_worker_tests PRIVATE
         rune_node
         rune_replication
+        rune_view
+        rune_codec
         GTest::gtest_main)
     gtest_discover_tests(rune_worker_tests)
 

@@ -27,6 +27,7 @@ static constexpr uint16_t kViewSourceNotFound = 33;  // plan references a missin
 static constexpr uint16_t kViewFieldUnresolved= 34;  // plan references an unresolved field
 static constexpr uint16_t kViewKeyInvalid     = 35;  // key field invalid under the source schema
 static constexpr uint16_t kViewNotCoPartitioned = 36;  // aggregate group-by not co-partitioned
+static constexpr uint16_t kViewSourceTransient  = 37;  // persisted view over a transient source (Phase 2b E)
 
 AdminWorker::AdminWorker(SchemaRegistry& reg,
                          rune::replication::PartitionReplica* replica,
@@ -494,6 +495,15 @@ void AdminWorker::startCreateView_(CreateViewMsg msg, int64_t nowNs) {
         const RegistryEntry* e = reg_.byId(s.topicId);
         if (!e) {
             deps_.respondCreateView(msg.session, msg.corr, -1, 0, kViewSourceNotFound);
+            return;
+        }
+        // Phase 2b E: a view that reads a transient topic must itself be transient
+        // (msg.persistence == 1) — a persisted view would checkpoint rows whose
+        // source data is gone after a restart.  The error path carries a code
+        // only: "<source> is transient; a view over it must be transient too
+        // (use: create transient view ...)".
+        if (e->persistence == PersistenceMode::Transient && msg.persistence == 0) {
+            deps_.respondCreateView(msg.session, msg.corr, -1, 0, kViewSourceTransient);
             return;
         }
         srcDescs.push_back(&e->descriptor);

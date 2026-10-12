@@ -35,6 +35,12 @@
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerReplicationTransport.h>
+#include <rune/node/WorkerViewSet.h>
+#include <rune/node/ViewSnapshotChannel.h>
+#include <rune/view/PlanCompiler.h>
+#include <rune/view/ViewRow.h>
+#include <rune/codec/Descriptor.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/storage/InMemoryLog.h>
@@ -693,4 +699,53 @@ TEST(Worker, DoWorkReplTransportNullReplicaGuard)
     EXPECT_EQ(follower->logEndOffset(), leoAtStart)
         << "Null-replica guard must drop frames for unowned (topicId=99, partition=88); "
            "LEO of the owned replica (5,7) must be unchanged";
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b E: a view over a TRANSIENT (InMemoryLog) source folds on the real
+// worker pass.  Before the fix driveViews_ skipped every non-disk source, so
+// the row never appeared (and a recovery view would never become Ready).
+// ---------------------------------------------------------------------------
+TEST(WorkerRegression, ViewFoldsOverTransientSourceRegression) {
+    constexpr int32_t kSrc = 21, kView = 0x40000041;
+    ReplicaFixture f(kSrc, 0);
+    ASSERT_TRUE(f.replica->isMemoryBacked());
+
+    const auto src = rune::codec::DescriptorBuilder("character", 1)
+        .add("characterId", rune::codec::PrimType::Int64, 1, /*isKey*/ true)
+        .add("hp", rune::codec::PrimType::Int32)
+        .build();
+    rune::view::ViewPlan v;
+    v.viewName = "char_hp"; v.key = "characterId"; v.sources = {{kSrc, "characterId"}};
+    v.output = {{"characterId", rune::codec::PrimType::Int64, 0, "characterId", rune::view::MergeRule::Replace},
+                {"hp", rune::codec::PrimType::Int32, 0, "hp", rune::view::MergeRule::Replace}};
+    v.persistence = 1;
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(v, srcs, kView).value();
+
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-worker-transient");
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+
+    std::vector<uint8_t> value;
+    auto le = [&](uint64_t x, int n) { for (int i = 0; i < n; ++i) value.push_back(uint8_t(x >> (8 * i))); };
+    le(12, 2); le(1, 2); le(7, 8); le(55, 4);                 // blockLength, version, id=7, hp=55
+    std::vector<uint8_t> key(8, 0); key[0] = 7;
+    // appendKeyed wraps ONE record with a real wire key (append(span) would wrap
+    // the whole span as a single keyless value).
+    ASSERT_GE(f.replica->appendKeyed(std::span<const uint8_t>(key.data(), key.size()),
+                                     std::span<const uint8_t>(value.data(), value.size()),
+                                     /*acksAll=*/false), 0);
+
+    Worker w(/*workerId=*/0);
+    w.setOwnedDirect(Worker::OwnedSet{f.replica.get()});
+    w.setViewSet(&vs);
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = nullptr;
+    for (int i = 0; i < 200 && row == nullptr; ++i) {          // bounded: RC build + HW + fold
+        w.doWork(/*nowNs=*/1'000'000LL * (i + 1));
+        row = vs.getRow(kView, 0, 7, L);
+    }
+    ASSERT_NE(row, nullptr) << "the worker must fold a view over a transient source";
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 55);
 }

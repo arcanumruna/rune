@@ -322,6 +322,33 @@ void WorkerViewSet::materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t 
     }
 }
 
+int WorkerViewSet::reconcileTransientSource(int32_t srcTopicId, int32_t partition,
+                                            int64_t logStart, int64_t logEnd) {
+    auto it = subscriptionIndex_.find(srcTopicId);
+    if (it == subscriptionIndex_.end()) return 0;
+    int adjusted = 0;
+    for (int32_t viewTopicId : it->second) {
+        auto vit = views_.find(instKey(viewTopicId, partition));
+        if (vit == views_.end()) continue;
+        ViewInstance& inst = vit->second;
+        if (inst.foldCursor > logEnd) {                       // INVARIANT BREACH
+            spdlog::warn("WorkerViewSet: view {} partition {}: transient source {} restarted below "
+                         "the view's cursor (cursor={} > source end={}) — invariant breach "
+                         "(a view over a transient source must be transient); keeping the rows, "
+                         "re-folding from offset {}",
+                         viewTopicId, partition, srcTopicId, inst.foldCursor, logEnd, logStart);
+            inst.foldCursor = logStart;
+            ++adjusted;
+        } else if (inst.foldCursor < logStart) {              // EVICTED
+            inst.counters.transientRecordsEvicted +=
+                static_cast<uint64_t>(logStart - inst.foldCursor);
+            inst.foldCursor = logStart;
+            ++adjusted;
+        }
+    }
+    return adjusted;
+}
+
 ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition,
                                           int64_t committedTail) {
     const uint64_t key = instKey(viewTopicId, partition);

@@ -117,6 +117,7 @@ struct ViewFoldCounters {
     uint64_t aggOverflow      = 0;   // aggregate: Sum emitted NULL (did not fit its type)
     uint64_t aggNonFinite     = 0;   // aggregate: NaN/+-Inf Float input treated as NULL
     uint64_t aggInconsistent  = 0;   // aggregate: retraction found missing/zero state
+    uint64_t transientRecordsEvicted = 0;   // transient source ring dropped records not yet folded
 };
 
 // One installed materialized view on this worker, for ONE partition.  MOVABLE
@@ -232,6 +233,20 @@ public:
     // fresh Ready instance that would bypass its checkpoint + serve-guard.
     void materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t partition,
                                          int64_t committedTail);
+
+    // Phase 2b E — TRANSIENT (InMemoryLog) source only; the worker calls it each
+    // pass BEFORE driveRebuild/driveFolds for (srcTopicId, partition), with the
+    // source's current [logStart, logEnd).  A view over a transient source is
+    // itself transient (CreateView rejects otherwise), so it restarts empty
+    // together with its source.  Two cursor states remain, one path each:
+    //   EVICTED (foldCursor < logStart): the ring dropped records not yet folded —
+    //     cursor -> logStart, transientRecordsEvicted += the gap (never a stall).
+    //   INVARIANT BREACH (foldCursor > logEnd): impossible for a transient view
+    //     (e.g. a legacy persisted view over a transient source) — one warn line,
+    //     cursor -> logStart; rows kept, retained records re-fold idempotently.
+    // Returns the number of instances adjusted.  No allocation (hot path).
+    int reconcileTransientSource(int32_t srcTopicId, int32_t partition,
+                                 int64_t logStart, int64_t logEnd);
 
     // Task 16: install a view FOR RECOVERY for ONE partition.  Registers the
     // plan template (like installView) AND eagerly creates the (view, partition)

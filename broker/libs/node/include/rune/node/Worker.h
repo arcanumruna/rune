@@ -5137,9 +5137,10 @@ private:
     // non-disruptive: runs right after rcAdvanceAll_(), only when a view set is
     // attached.  The read-committed bound is rc->lso(liveHw) — the SAME idiom
     // the push path uses (Worker.h ~2788-2793) — so a view never folds an
-    // uncommitted (open-txn) batch.  Phase 1: disk-backed sources only (the
-    // fold reads the committed log via readNoFault_ into the worker's push
-    // scratch, one pread, no page fault).  Returns the REAL progress count
+    // uncommitted (open-txn) batch.  Disk sources fold through readNoFault_ (one
+    // pread, no page fault); TRANSIENT sources (Phase 2b E) fold through the
+    // replica's InMemoryLog::readView (zero-copy, same thread) after
+    // reconcileTransientSource.  Returns the REAL progress count
     // (records folded + checkpoint deltas pushed/held across every driven
     // view) so the node's idle strategy never backs off while view work — a
     // fold that advanced, or a back-pressured delta still awaiting ring space —
@@ -5153,33 +5154,52 @@ private:
             // partition no installed view is interested in.
             if (!viewSet_->interestedIn(topicId)) continue;
             if (replica->role() != rune::replication::Role::Leader) continue;
-            if (!replica->isDiskBacked()) continue;  // Phase 1: committed disk log only
             const RcState* rcState = rcServe_(replica, rcOf_(replica));
             if (rcState == nullptr) continue;         // RC not Ready: fail closed, no bound
             const int64_t liveHw = replica->highWatermark();
             const int64_t bound  = rcState->lso(liveHw);
-            rune::storage::Log* log = replica->log();
-            if (log == nullptr) continue;
             const int32_t partition = static_cast<int32_t>(replica->partitionId());
-            auto readRange = [this, log](int64_t from, int64_t to) -> rune::storage::LogReadView {
-                return readNoFault_(log, from, kPushMaxChunkBytes, to);
-            };
-            // Task 19b (restart recovery): BEFORE the normal fold, for a worker
-            // that hosts any restart-recovery view, (1) materialize this owned
-            // (view, partition)'s instance from its on-disk checkpoint (once,
-            // cold — RebuildingViews + serve-guard, NOT a fresh Ready instance),
-            // then (2) driveRebuild the committed tail [foldCursor, bound) and
-            // flip RebuildingViews -> Ready once foldCursor >= bound (the T16
-            // readiness flip — driveFolds alone never raises readiness, so a
-            // recovered instance would otherwise stay NotReady forever).  Both
-            // are gated on hasRecovery(): a broker with no durable views runs
-            // this path not at all (unchanged).
-            if (viewSet_->hasRecovery()) [[unlikely]] {
-                viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
-                work += viewSet_->driveRebuild(topicId, partition, readRange, bound, nowNs);
+            if (replica->isDiskBacked()) {
+                rune::storage::Log* log = replica->log();
+                if (log == nullptr) continue;
+                auto readRange = [this, log](int64_t from, int64_t to) -> rune::storage::LogReadView {
+                    return readNoFault_(log, from, kPushMaxChunkBytes, to);
+                };
+                work += driveViewsOf_(topicId, partition, readRange, bound, nowNs, nullptr);
+            } else {
+                // Phase 2b E: a TRANSIENT source — zero-copy view into the
+                // replica's own ring (same thread).  The fold itself stops at its
+                // passBound, so the ring's view needs no upper bound.
+                rune::storage::InMemoryLog* mem = replica->memoryLog();
+                if (mem == nullptr) continue;
+                auto readRange = [mem](int64_t from, int64_t /*to*/) -> rune::storage::LogReadView {
+                    return mem->readView(from, kPushMaxChunkBytes);
+                };
+                work += driveViewsOf_(topicId, partition, readRange, bound, nowNs, mem);
             }
-            work += viewSet_->driveFolds(topicId, partition, readRange, bound, nowNs);
         }
+        return work;
+    }
+
+    // One owned source partition's view work.  Order matters: materialize a
+    // recovery instance from its checkpoint FIRST, then (transient source only)
+    // reconcile its cursor against the source's live range, then rebuild/fold.
+    // Task 19b (restart recovery): materializeRecoveryInstancesFor + driveRebuild
+    // are gated on hasRecovery() — a broker with no durable views runs neither.
+    template <class ReadRangeFn>
+    int driveViewsOf_(int32_t topicId, int32_t partition, ReadRangeFn& readRange,
+                      int64_t bound, int64_t nowNs, rune::storage::InMemoryLog* transientSrc) {
+        int work = 0;
+        const bool recovering = viewSet_->hasRecovery();
+        if (recovering) [[unlikely]]
+            viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
+        if (transientSrc != nullptr)
+            work += viewSet_->reconcileTransientSource(topicId, partition,
+                                                       transientSrc->logStartOffset(),
+                                                       transientSrc->logEndOffset());
+        if (recovering) [[unlikely]]
+            work += viewSet_->driveRebuild(topicId, partition, readRange, bound, nowNs);
+        work += viewSet_->driveFolds(topicId, partition, readRange, bound, nowNs);
         return work;
     }
 

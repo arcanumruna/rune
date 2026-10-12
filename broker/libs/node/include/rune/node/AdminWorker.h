@@ -25,6 +25,7 @@ namespace rune::node {
 //   TopicExists           = 25
 //   SchemaIncompatible    = 30  (ALTER: ops rejected by the compatibility gate)
 //   SchemaConflict        = 31  (ALTER: stale expectedVersion — optimistic CAS)
+//   ViewSourceTransient   = 37  (CREATE VIEW: persisted view over a transient source)
 
 // ---------------------------------------------------------------------------
 // AdminDeps — effects the AdminWorker needs, all resolved on the admin thread.

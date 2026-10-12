@@ -43,6 +43,9 @@
 #include <rune/view/ViewTypes.h>
 
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/RecordBatch.h>
+#include <rune/view/ViewRow.h>
+#include <rune/storage/LogReadView.h>
 
 #include <atomic>
 #include <chrono>
@@ -492,4 +495,79 @@ TEST_F(CreateViewRegression, ViewSinkResolvesByViewNameAcrossRestartRegression) 
     ASSERT_FALSE(adminWorker_->rebuildFailed());
     ASSERT_NE(viewRegistry_->byName("hp_by_char"), nullptr) << "the view catalog recovered";
     check("after restart");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b E — a view over a TRANSIENT source must itself be transient.
+// A persisted view would checkpoint rows whose source data is gone after a
+// restart.  Rejected at CREATE VIEW time with ViewSourceTransient (37), before
+// any sink topic or __views record exists.
+// ---------------------------------------------------------------------------
+namespace {
+std::vector<uint8_t> charHpPlanBlobP(int32_t srcTopicId, uint8_t persistence) {
+    rv::ViewPlan p;
+    p.viewName = "char_hp"; p.key = "id"; p.persistence = persistence;
+    p.sources.push_back(rv::SourceSpec{srcTopicId, "id"});
+    p.output.push_back(rv::AuthoredField{"id", PrimType::Int64, 0, "id", rv::MergeRule::Replace});
+    p.output.push_back(rv::AuthoredField{"hp", PrimType::Int64, 0, "hp", rv::MergeRule::Replace});
+    return rv::serializeAuthored(p);
+}
+} // namespace
+
+TEST_F(CreateViewRegression, PersistedViewOverTransientSourceIsRejectedRegression) {
+    DefineTopicMsg d = defineCharacter();
+    d.persistence = 1;   // transient
+    driveDefine(d);
+    ASSERT_EQ(lastDefineError_, 0u);
+    const int32_t src = lastDefineTopicId_;
+    ASSERT_NE(schemaRegistry_->byId(src), nullptr);
+    ASSERT_EQ(schemaRegistry_->byId(src)->persistence, PersistenceMode::Transient);
+
+    CreateViewMsg cv;
+    cv.session = 1; cv.corr = 70; cv.persistence = 0;   // persisted
+    cv.viewName = "char_hp"; cv.keyField = "id"; cv.planBlob = charHpPlanBlobP(src, 0);
+    pendingTicket_ = -1;
+    driveCreateView(cv);
+
+    EXPECT_EQ(lastViewError_, 37u);
+    EXPECT_EQ(lastViewTopicId_, -1);
+    EXPECT_EQ(viewRegistry_->byName("char_hp"), nullptr) << "no __views record";
+    EXPECT_EQ(schemaRegistry_->byName("char_hp"), nullptr) << "no sink topic schema";
+    EXPECT_TRUE(lastSinkKeyField_.empty()) << "no sink topic was requested";
+    EXPECT_EQ(viewSet_.drainInstalls(), 0);
+}
+
+TEST_F(CreateViewRegression, TransientViewOverTransientSourceIsAcceptedAndFoldsRegression) {
+    DefineTopicMsg d = defineCharacter();
+    d.persistence = 1;
+    driveDefine(d);
+    ASSERT_EQ(lastDefineError_, 0u);
+    const int32_t src = lastDefineTopicId_;
+
+    CreateViewMsg cv;
+    cv.session = 1; cv.corr = 71; cv.persistence = 1;   // transient
+    cv.viewName = "char_hp"; cv.keyField = "id"; cv.planBlob = charHpPlanBlobP(src, 1);
+    driveCreateView(cv);
+    ASSERT_EQ(lastViewError_, 0u);
+    ASSERT_GE(lastViewTopicId_, 0);
+    ASSERT_NE(viewRegistry_->byName("char_hp"), nullptr);
+    ASSERT_EQ(viewSet_.drainInstalls(), 1);
+
+    // Fold one record (id 7, hp 55) from the transient source.
+    std::vector<uint8_t> key(8, 0); key[0] = 7;
+    std::vector<uint8_t> value;
+    auto le = [&](uint64_t x, int n) { for (int i = 0; i < n; ++i) value.push_back(uint8_t(x >> (8 * i))); };
+    le(16, 2); le(1, 2); le(7, 8); le(55, 8);
+    rune::protocol::RecordBatchBuilder bb(0, 0);
+    bb.append(std::string_view(reinterpret_cast<const char*>(key.data()), key.size()),
+              std::string_view(reinterpret_cast<const char*>(value.data()), value.size()), 0);
+    const auto batch = bb.build();
+    auto rr = [&](int64_t, int64_t) {
+        return rune::storage::LogReadView{batch.data(), batch.size(), 0, 1};
+    };
+    viewSet_.driveFolds(src, 0, rr, 1, 0);
+    const rv::RowLayout* L = nullptr;
+    const uint8_t* row = viewSet_.getRow(lastViewTopicId_, 0, 7, L);
+    ASSERT_NE(row, nullptr);
+    EXPECT_EQ(rv::readSlot(row, *L, 1).i, 55);
 }
