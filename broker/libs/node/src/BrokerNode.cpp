@@ -3604,15 +3604,15 @@ void BrokerNode::stop() {
     metadataService_.reset(); // MetadataService (holds raw ptr to metadata replica in registry)
     metadataReplica_.reset(); // no-op: ownership transferred to replicaRegistry_ in buildGateway
     metadataLog_.reset();     // Log for __cluster_metadata (file flush on dtor)
-    // Task 6: destroy schema registry before replicaRegistry_ (schema replica in registry).
     // adminWorkerAgent_ is already reset above (in the runner stop block).
-    schemaRegistry_.reset();  // SchemaRegistry (no raw ptrs to replicas — safe to reset here)
+    // schemaRegistry_ is NOT reset: it owns no replica pointers and no thread
+    // touches it once the admin worker is gone, so it stays readable after stop()
+    // (schemaRegistryForTest's contract) and is freed with the node.
     schemaReplica_.reset();   // no-op: ownership transferred to replicaRegistry_ in buildAdminWorker
     schemaLog_.reset();       // Log for __topic_schemas (file flush on dtor)
-    // Task 17: destroy view registry before its replica/log (viewsReplica_ is
-    // admin-thread-owned only, same as schemaReplica_ — never transferred to
-    // replicaRegistry_, but reset here in the same relative order for symmetry).
-    viewRegistry_.reset();    // ViewRegistry (no raw ptrs to replicas — safe to reset here)
+    // Task 17: viewsReplica_ is admin-thread-owned only, same as schemaReplica_ —
+    // never transferred to replicaRegistry_, but reset here for symmetry.
+    // viewRegistry_ is kept for the same reason (viewRegistryForTest after stop()).
     viewsReplica_.reset();    // admin-thread-owned only (RULING-2 A) — not in replicaRegistry_
     viewsLog_.reset();        // Log for __views (file flush on dtor)
     // TX-3: destroy txn state store before replicaRegistry_ (holds raw ptr to txn replica).

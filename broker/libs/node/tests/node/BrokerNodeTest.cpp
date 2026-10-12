@@ -2141,4 +2141,45 @@ TEST(BrokerNodeRegression, CaseVariantDefineTopicIsTopicExistsEndToEndRegression
     std::error_code ec; fs::remove_all(dir, ec);
 }
 
+// DDL conformance Task 12: schemaRegistryForTest() / viewRegistryForTest() are
+// documented as readable "when the node is stopped", but stop() reset both, so
+// every post-stop catalog check dereferenced null (SEGFAULT).  The registries own
+// no replica pointers and no thread touches them after stop(): they now live until
+// the node is destroyed.
+TEST(BrokerNodeStopRegression, CatalogRegistriesReadableAfterStop) {
+    const fs::path dir = makeTempDataDir("regs_after_stop_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(30s));
+
+    rune::node::test::ShardTestClient client(dir / "client-aeron");
+    client.keepSessionsAlive(true);
+    const std::string& gw = cfg.clientEndpoint.channel;
+    const int32_t stream  = cfg.clientEndpoint.streamId;
+    const int64_t sid = client.connect(gw, stream);
+    ASSERT_GT(sid, 0);
+    const std::vector<uint8_t> blob = rune::codec::serialize(
+        rune::codec::DescriptorBuilder("kept").add("id", rune::codec::PrimType::Int64).build());
+    namespace pc = rune::protocol::client;
+    using Clock = std::chrono::steady_clock;
+    const auto deadline = Clock::now() + 30s;
+    std::optional<pc::DefineTopicResponse> r;
+    while (Clock::now() < deadline) {   // Internal while admin leadership settles
+        r = client.defineTopicUntil(gw, stream, sid, "kept", 1, /*validate=*/false, blob,
+                                    std::min(deadline, Clock::now() + 5s), 0);
+        if (!r || r->errorCode != static_cast<uint16_t>(pc::ErrorCode::Internal)) break;
+        std::this_thread::sleep_for(20ms);
+    }
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->errorCode, 0);
+
+    node.stop();
+    ASSERT_NE(node.schemaRegistryForTest(), nullptr) << "readable after stop (documented contract)";
+    ASSERT_NE(node.schemaRegistryForTest()->byName("kept"), nullptr);
+    EXPECT_EQ(node.schemaRegistryForTest()->byName("kept")->version, 1u);
+    EXPECT_NE(node.viewRegistryForTest(), nullptr) << "readable after stop (documented contract)";
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
 } // namespace rune::node
