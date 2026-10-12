@@ -1287,8 +1287,10 @@ void GroupConsumerHub::onJoinGroupResponse(const uint8_t* buf, std::size_t len,
             publishGeneration_(*impl);
 
             sendSyncGroup(*impl, sessionId, sendFn);
-        } else if (ec == rpc::ErrorCode::ProtocolVersion) {
+        } else if (ec == rpc::ErrorCode::ProtocolVersion || ec == rpc::ErrorCode::InvalidRequest) {
             // MAJOR-2 (round 3): non-retriable — this client is too old for the broker.
+            // No-hang wave: InvalidRequest (the broker could not decode the JoinGroup)
+            // is non-retriable too — re-joining re-sends the same bytes (a join storm).
             refuse_(*impl, GroupFailReason::RefusedByBroker);
         } else if (ec == rpc::ErrorCode::NotCoordinator ||
                    ec == rpc::ErrorCode::RebalanceInProgress) {

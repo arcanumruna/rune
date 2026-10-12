@@ -619,6 +619,33 @@ TEST(ProducerAcks, BrokerErrorFailsEveryRecordAndReportsTheCode) {
     EXPECT_EQ(acks[0].baseOffset, -1);
 }
 
+// No-hang wave: the broker answers a Produce it could not decode with
+// ProduceResponse{InvalidRequest (39), partition -1}.  Every record of the
+// batch completes BrokerError with that code at once (never left pending, never
+// re-sent: the same bytes fail the same way).
+TEST(ProducerAcksRegression, InvalidRequestAnswerFailsTheBatchAtOnceRegression) {
+    ProducerImpl impl(ackCfg(8, 1'000'000'000));
+    AckLedger L;
+    L.attach(impl);
+    Capture cap;
+    const auto sink = cap.fn();
+    for (int i = 0; i < 2; ++i) {
+        ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), kVal, true, AckLedger::hi(i + 1)));
+    }
+    flushAsOneBatch(impl, sink);
+    ASSERT_EQ(cap.frames.size(), 1u);
+    constexpr int16_t kInvalidRequest = static_cast<int16_t>(rune::protocol::client::ErrorCode::InvalidRequest);
+    impl.onProduceResponse(cap.frames[0].corrId, 0, kInvalidRequest);
+    ASSERT_EQ(L.recs.size(), 2u);
+    for (int i = 1; i <= 2; ++i) {
+        EXPECT_EQ(L.times(i), 1);
+        EXPECT_EQ(L.status(i), OpStatus::BrokerError);
+        EXPECT_EQ(L.last.at(i).ec, kInvalidRequest);
+    }
+    pump(impl, sink);
+    EXPECT_EQ(cap.frames.size(), 1u) << "a batch the broker could not decode was re-sent";
+}
+
 TEST(ProducerAcks, CloseFailsRecordsStillInTheRing) {
     ProducerImpl impl(ackCfg(8));
     AckLedger L;

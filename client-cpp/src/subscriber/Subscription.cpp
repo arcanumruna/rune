@@ -161,4 +161,10 @@ SubscriptionFailReason Subscription::failReason() const {
     return cache_.failReason;
 }
 
+uint16_t Subscription::brokerErrorCode() const {
+    if (impl_ && onDutyThread_()) return impl_->brokerErrorCode;
+    drainStatus_();
+    return cache_.brokerErrorCode;
+}
+
 } // namespace rune::client

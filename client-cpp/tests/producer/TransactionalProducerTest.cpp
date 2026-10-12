@@ -2523,3 +2523,42 @@ TEST(TransactionalProducerTest, RecordOver16KiBIsRejectedAtAppend) {
     for (int i = 0; i < 8; ++i) r.doWork();
     EXPECT_EQ(r.sink.count(rpc::TemplateId::Produce), 0);
 }
+
+// No-hang wave: an EndTxn the broker could not decode is answered InvalidRequest
+// (39).  Re-sending the same bytes fails the same way, so the commit completes
+// with that error at once — it used to be classified retriable and re-sent
+// until the op deadline.
+TEST(TransactionalProducerRegression, EndTxnInvalidRequestFailsAtOnceNotRetriedRegression) {
+    TxnRig r;
+    r.acquire();
+    r.startTxn();
+    auto op = r.commit();
+    r.doWork();
+    const auto et = r.sink.last(rpc::TemplateId::EndTxn);
+    ASSERT_FALSE(et.empty());
+    auto resp = makeEndTxnResponse(corrIdOf(et), static_cast<int16_t>(rpc::ErrorCode::InvalidRequest));
+    r.impl->onEndTxnResponse(resp.data(), resp.size());
+    ASSERT_TRUE(op.ready()) << "an InvalidRequest EndTxn answer left the commit pending";
+    EXPECT_EQ(op.status(), OpStatus::BrokerError);
+    EXPECT_EQ(r.cycles(64, rpc::TemplateId::EndTxn), 0) << "re-sent a request the broker cannot decode";
+}
+
+// The other txn requests: InvalidRequest completes the pending op / poisons the
+// transaction (never a silent retry loop).
+TEST(TransactionalProducerRegression, InitProducerIdInvalidRequestCompletesWithErrorRegression) {
+    TxnRig r;
+    auto op = r.init();
+    ASSERT_EQ(op.r, OpResult::Accepted);
+    r.doWork();
+    const auto f = r.sink.last(rpc::TemplateId::InitProducerId);
+    ASSERT_FALSE(f.empty());
+    rpc::InitProducerIdResponse m;
+    m.sessionId = kSessionId; m.correlationId = corrIdOf(f);
+    m.errorCode = static_cast<int16_t>(rpc::ErrorCode::InvalidRequest);
+    std::vector<uint8_t> b(rpc::InitProducerIdResponse::ENCODED_SIZE);
+    m.encode(b.data());
+    r.impl->onInitProducerIdResponse(b.data(), b.size());
+    ASSERT_TRUE(op.ready());
+    EXPECT_EQ(op.status(), OpStatus::BrokerError);
+    EXPECT_EQ(r.cycles(64, rpc::TemplateId::InitProducerId), 0);
+}

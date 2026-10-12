@@ -159,7 +159,8 @@ enum class GroupFailReason : int32_t {
     /// partitions whose leader is a not-yet-upgraded node are only skipped
     /// (logged once) until that node is upgraded and reconnects.
     BrokerTooOld = 1,
-    /// The broker coordinator refused this client's JoinGroup (ProtocolVersion).
+    /// The broker coordinator refused this client's JoinGroup (ProtocolVersion,
+    /// or InvalidRequest: the broker could not decode it).
     RefusedByBroker = 2,
 };
 

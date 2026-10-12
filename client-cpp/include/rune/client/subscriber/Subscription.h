@@ -121,12 +121,19 @@ enum class SubscriptionFailReason : int32_t {
     /// redirect then; subscribe on a Client without a group consumer (or wait
     /// for per-partition routing of plain subscriptions).
     LeaderElsewhereWhileGroupActive = 1,
+    /// No-hang wave: the broker answered the Subscribe with an error
+    /// (SubscribeResponse.errorCode != 0 — UnknownTopic, UnknownPartition,
+    /// InvalidRequest, ...).  Nothing was bound broker-side; the code is
+    /// Subscription::brokerErrorCode().  (Such an answer used to BIND the
+    /// subscription with id 0 — active, never delivering: a silent hang.)
+    RejectedByBroker = 2,
 };
 
 struct SubscriptionStatus {
     int64_t subscriptionId = 0;  // broker-assigned id (0 = SubscribeResponse not yet seen)
     int64_t nextOffset     = 0;  // resume position (lastDelivered + 1; 0 = nothing delivered)
     SubscriptionFailReason failReason = SubscriptionFailReason::None;  // final snapshot only
+    uint16_t brokerErrorCode = 0;  // RejectedByBroker: the SubscribeResponse errorCode (final snapshot only)
 };
 
 // ---------------------------------------------------------------------------
@@ -164,6 +171,7 @@ struct SubscriptionImpl {
     int64_t subscriptionId = 0;  // bound by SubscribeResponse (0 = pending)
     int32_t boundPartition = -1; // the partition the SubscribeResponse resolved
     SubscriptionFailReason failReason = SubscriptionFailReason::None;  // set before a failing finish
+    uint16_t brokerErrorCode = 0;  // RejectedByBroker: the broker's error code
     int64_t nextOffset     = 0;  // lastDelivered + 1 (CB-5 resume point)
     bool    active         = true;  // false once unsubscribed / timed out / closed
     bool    statusDirty    = false; // a snapshot newer than the last published one exists
@@ -295,6 +303,10 @@ public:
     /// Why the duty side finished this subscription on its own (None when it
     /// was unsubscribed, timed out or closed — see SubscriptionFailReason).
     [[nodiscard]] SubscriptionFailReason failReason() const;
+
+    /// The broker's error code when failReason() == RejectedByBroker (an
+    /// rune::protocol::client::ErrorCode value), else 0.
+    [[nodiscard]] uint16_t brokerErrorCode() const;
 
 private:
     [[nodiscard]] bool onDutyThread_() const noexcept {

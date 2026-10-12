@@ -1152,3 +1152,56 @@ TEST(ClientSchemaRegression, DefineTopicDefaultOverloadIsDisk) {
     EXPECT_EQ(static_cast<uint8_t>(Persistence::Disk), 0u);
     EXPECT_EQ(static_cast<uint8_t>(Persistence::Transient), 1u);
 }
+
+// ===========================================================================
+// No-hang wave: the broker answers a GetViewRow it could not decode with status
+// 5 (InvalidRequest) and one it could not enqueue with status 6 (Busy) — the
+// pending read completes with that status (never left to time out), and the
+// client's constants match the wire enum.
+// ===========================================================================
+TEST(ClientSchemaRegression, GetViewRowInvalidRequestAndBusyStatusesCompleteTheReadRegression) {
+    static_assert(ViewRowResult::kInvalidRequest == rpc::ViewRowResponse::kInvalidRequest);
+    static_assert(ViewRowResult::kBusy == rpc::ViewRowResponse::kBusy);
+    SchemaHarness h(1144, 1145);
+    h.build();
+    h.connectAndWait();
+    for (const uint16_t st : {ViewRowResult::kInvalidRequest, ViewRowResult::kBusy}) {
+        h.gw->viewRowStatus = st;
+        auto fut = h.getViewRowOp(0x40000007, /*keyU64=*/7, /*requestedFingerprint=*/0);
+        h.pumpGwUntil([&]() { return fut.ready(); });
+        ASSERT_TRUE(fut.waitReady()) << "status " << st << " left the read pending";
+        ViewRowResult r;
+        ASSERT_NO_THROW(r = fut.getViewRowResult());
+        EXPECT_EQ(r.status, st);
+        EXPECT_TRUE(r.rowBytes.empty());
+    }
+}
+
+// The DDL responses answered InvalidSchema (23) for a malformed request complete
+// the pending op with that code (GetTopicSchema / AlterTopic / CreateView).
+TEST(ClientSchemaRegression, DdlInvalidSchemaAnswersCompleteThePendingOpRegression) {
+    SchemaHarness h(1146, 1147);
+    h.build();
+    h.connectAndWait();
+    const auto inv = static_cast<uint16_t>(rpc::ErrorCode::InvalidSchema);
+    h.gw->getErrorCode = inv;
+    h.gw->alterErrorCode = inv;
+    h.gw->viewCreateError = inv;
+
+    auto g = h.getTopicSchemaOp("orders");
+    h.pumpGwUntil([&]() { return g.ready(); });
+    ASSERT_TRUE(g.waitReady());
+    EXPECT_EQ(g.schemaResult().errorCode, inv);
+
+    const std::vector<uint8_t> ops = {0x01};
+    auto a = h.alterTopicOp("orders", 0, std::span<const uint8_t>(ops));
+    h.pumpGwUntil([&]() { return a.ready(); });
+    ASSERT_TRUE(a.waitReady());
+    EXPECT_EQ(a.alterResult().errorCode, inv);
+
+    const std::vector<uint8_t> plan = {0x01};
+    auto c = h.createViewOp("v", "id", 1, std::span<const uint8_t>(plan));
+    h.pumpGwUntil([&]() { return c.ready(); });
+    ASSERT_TRUE(c.waitReady());
+    EXPECT_EQ(c.createViewResult().errorCode, inv);
+}

@@ -53,6 +53,7 @@ constexpr int16_t kInvalidTxnState        = static_cast<int16_t>(rpc::ErrorCode:
 constexpr int16_t kOutOfOrderSequence     = static_cast<int16_t>(rpc::ErrorCode::OutOfOrderSequence);
 constexpr int16_t kConcurrentTransactions = static_cast<int16_t>(rpc::ErrorCode::ConcurrentTransactions);
 constexpr int16_t kNotLeader              = static_cast<int16_t>(rpc::ErrorCode::NotLeader);
+constexpr int16_t kInvalidRequest         = static_cast<int16_t>(rpc::ErrorCode::InvalidRequest);
 
 } // namespace
 
@@ -533,6 +534,10 @@ TransactionalProducerImpl::Verdict TransactionalProducerImpl::classify_(ReqKind 
     if (ec == kConcurrentTransactions) return Verdict::Retry;        // F14: retriable everywhere
     if (ec == kNotCoordinator) return Verdict::Rediscover;           // F14: re-discover, then retry
     if (ec == kProducerFenced || ec == kInvalidProducerEpoch) return Verdict::Fenced;
+    // No-hang wave: the broker could not decode the request — re-sending the
+    // same bytes fails the same way, so it is never retried (an EndTxn used to
+    // retry it until the op deadline).
+    if (ec == kInvalidRequest) return Verdict::Fail;
     if (kind == ReqKind::EndTxn) {
         // F14: EndTxn is retried until 0 / 19 / 17 / 18.
         return ec == kInvalidTxnState ? Verdict::Fail : Verdict::Retry;
@@ -1205,10 +1210,10 @@ void TransactionalProducerImpl::onEndTxnResponse(const uint8_t* buf, std::size_t
         eraseReq_(opt->correlationId);
         enterFatal_(static_cast<uint16_t>(opt->errorCode));
         return;
-    case Verdict::Fail:  // 19 InvalidTxnState: fatal in Kafka
+    case Verdict::Fail:  // 19 InvalidTxnState: fatal in Kafka (and 39 InvalidRequest: never retried)
         eraseReq_(opt->correlationId);
         if (const auto* a = std::get_if<SAborting>(&state_);
-            a != nullptr && a->maybeStarted && !a->started) {
+            opt->errorCode == kInvalidTxnState && a != nullptr && a->maybeStarted && !a->started) {
             // m15: the transaction was only POSSIBLY started (a timed-out
             // AddPartitions / AddOffsets): 19 = nothing open on the broker —
             // the abort is done.
@@ -1217,7 +1222,8 @@ void TransactionalProducerImpl::onEndTxnResponse(const uint8_t* buf, std::size_t
         }
         enterFatal_(static_cast<uint16_t>(opt->errorCode), /*except=*/opId);
         completeAndErase_(opId, OpStatus::BrokerError, static_cast<uint16_t>(opt->errorCode),
-                          "EndTxn failed: InvalidTxnState (fatal)");
+                          opt->errorCode == kInvalidTxnState ? "EndTxn failed: InvalidTxnState (fatal)"
+                                                             : "EndTxn failed: InvalidRequest (fatal)");
         return;
     }
 }

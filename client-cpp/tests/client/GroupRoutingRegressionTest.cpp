@@ -973,6 +973,19 @@ TEST(GroupRoutingRegression, JoinGroupRefusedForVersionFinishesTheConsumerRegres
     EXPECT_EQ(r.gw.joinGroups, 1);
 }
 
+// No-hang wave: a JoinGroup the broker could not decode is answered
+// InvalidRequest (39) — non-retriable, like ProtocolVersion: the consumer
+// finishes RefusedByBroker instead of re-joining with the same bytes forever.
+TEST(GroupRoutingRegression, JoinGroupInvalidRequestFinishesTheConsumerRegression) {
+    GroupRig r(4181, 4182);
+    r.gw.holdJoins     = false;
+    r.gw.joinErrorCode = static_cast<int16_t>(rune::protocol::client::ErrorCode::InvalidRequest);
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return gc.finished(); }, 400'000)) << "joins: " << r.gw.joinGroups;
+    EXPECT_EQ(gc.failReason(), rc::GroupFailReason::RefusedByBroker);
+    EXPECT_EQ(r.gw.joinGroups, 1);
+}
 
 // CG round 4 (A-MEDIUM-3): a rolling upgrade — the seed / coordinator runs v3
 // but p1's leader node still runs an older broker (its pushes would carry no

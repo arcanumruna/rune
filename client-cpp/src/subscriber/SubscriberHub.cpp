@@ -78,7 +78,8 @@ void SubscriberHub::closeStatus_(SubscriptionImpl& impl)
     if (impl.status.producerClosed()) return;
     // Final snapshot (uses the ring's reserve — always fits), THEN close: an
     // app thread that observes finished() and drains afterwards sees it.
-    (void)impl.status.publishFinal(SubscriptionStatus{impl.subscriptionId, impl.nextOffset, impl.failReason});
+    (void)impl.status.publishFinal(
+        SubscriptionStatus{impl.subscriptionId, impl.nextOffset, impl.failReason, impl.brokerErrorCode});
     impl.status.close();
 }
 
@@ -394,6 +395,16 @@ void SubscriberHub::onSubscribeResponse(
     SubscriptionImpl* impl = it->second->impl;
     pendingByCorrelation_.erase(it);
     if (!impl) return;
+
+    // No-hang wave: an error answer binds NOTHING broker-side.  It used to be
+    // bound like an OK (subscriptionId 0, active, never delivering — a silent
+    // hang).  Finish it with the broker's code; no Unsubscribe is owed.
+    if (rsp.errorCode != 0) [[unlikely]] {
+        impl->failReason      = SubscriptionFailReason::RejectedByBroker;
+        impl->brokerErrorCode = static_cast<uint16_t>(rsp.errorCode);
+        finish_(*impl);
+        return;
+    }
 
     // Store the broker-assigned subscriptionId regardless of active state.
     impl->subscriptionId = rsp.subscriptionId;

@@ -177,6 +177,10 @@ struct SubscribeGateway {
     std::atomic<int64_t> nextSubscriptionId{1};
     std::atomic<int>     subscribesSeen{0};
     std::atomic<int>     unsubscribesSeen{0};
+    // No-hang wave: when non-zero, the SubscribeResponse carries this error
+    // (subscriptionId 0, nothing registered) — as the broker answers an
+    // UnknownTopic / InvalidRequest Subscribe.
+    std::atomic<int16_t> subscribeErrorCode{0};
 
     // Subscriptions active: subscriptionId → session/corr for egress routing.
     std::mutex subsMtx_;
@@ -322,6 +326,13 @@ struct SubscribeGateway {
             if (!opt) return;
 
             subscribesSeen.fetch_add(1, std::memory_order_relaxed);
+            if (const int16_t ec = subscribeErrorCode.load(std::memory_order_relaxed); ec != 0) {
+                const std::size_t n = rcc::encodeSubscribeResponse(
+                    replyBuf, sizeof(replyBuf), ec, /*partition=*/-1, /*subscriptionId=*/0,
+                    opt->sessionId, opt->correlationId);
+                if (n > 0) send(replyBuf, n);
+                return;
+            }
             const int64_t subId = nextSubscriptionId.fetch_add(1, std::memory_order_relaxed);
 
             // Register subscription.
@@ -1203,4 +1214,27 @@ TEST(SubscriberKeyRoutingRegression, EmptyKeySubscribeBindsToProducerSendPartiti
     const int32_t producerWrites = empty.partition(h8.partitionCount);
     EXPECT_EQ(brokerBound, producerWrites);
     EXPECT_EQ(brokerBound, 0);
+}
+
+// No-hang wave: a SubscribeResponse carrying an error (InvalidRequest 39 for a
+// Subscribe the broker could not decode; UnknownTopic; UnknownPartition) binds
+// NOTHING broker-side.  The client used to bind it like an OK — subscriptionId 0,
+// active forever, never delivering: a silent hang.  It must finish with
+// RejectedByBroker and the broker's code.
+TEST(SubscriberRegression, SubscribeErrorResponseFinishesTheSubscriptionRegression) {
+    for (const auto code : {rcc::ErrorCode::InvalidRequest, rcc::ErrorCode::UnknownTopic}) {
+        const int32_t base = code == rcc::ErrorCode::InvalidRequest ? 3190 : 3192;
+        SubscriberHarness h(base, base + 1);
+        h.build();
+        ASSERT_TRUE(h.connect());
+        h.gw->subscribeErrorCode.store(static_cast<int16_t>(code));
+        auto sub = h.client->subscribe(TopicHandle{9, 1}, /*partition=*/0, SubscribeOptions{From::earliest()},
+                                       [](const Record&) {});
+        ASSERT_TRUE(h.pumpUntil([&] { return sub.finished(); }))
+            << "an error SubscribeResponse left the subscription pending/active";
+        EXPECT_FALSE(sub.active());
+        EXPECT_EQ(sub.failReason(), SubscriptionFailReason::RejectedByBroker);
+        EXPECT_EQ(sub.brokerErrorCode(), static_cast<uint16_t>(code));
+        EXPECT_EQ(sub.subscriptionId(), 0);
+    }
 }
