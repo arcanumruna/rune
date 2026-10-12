@@ -198,13 +198,30 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
         state_ = DdlState::Idle;
         return;
     }
-    inFlight_->topicId = reply.topicId;
+    // Final review I1: the name already named a topic (createTopic is idempotent
+    // by name — a RUNE_TOPICS boot topic, a recovered runtime topic).  One that
+    // already has a schema (registered under an id this name lookup missed, e.g.
+    // a pre-name-trailer record indexed by its descriptor name) is TopicExists,
+    // exactly like the up-front byName check.  A schema-less one accepts this
+    // schema — with ITS real partition count (below), never the requested one.
+    if (reply.existed) {
+        if (const RegistryEntry* ex = reg_.byId(reply.topicId)) {
+            deps_.respondDefine(inFlight_->msg.session, inFlight_->msg.corr,
+                                ex->topicId, ex->version, kTopicExists);
+            inFlight_.reset();
+            state_ = DdlState::Idle;
+            return;
+        }
+    }
+    inFlight_->topicId        = reply.topicId;
+    inFlight_->partitionCount = reply.partitionCount > 0 ? reply.partitionCount
+                                                         : inFlight_->msg.partitionCount;
 
     // ── AWAITING_COMMIT ── append the durable TopicSchema record.
     TopicSchema ts;
     ts.topicId        = reply.topicId;
     ts.version        = nextSchemaVersion_(reply.topicId);
-    ts.partitionCount = inFlight_->msg.partitionCount;
+    ts.partitionCount = inFlight_->partitionCount;   // authoritative (I1)
     ts.keyField       = inFlight_->msg.keyField;
     ts.validate       = inFlight_->msg.validate;
     ts.descriptorBlob = inFlight_->msg.blob;
@@ -698,7 +715,7 @@ bool AdminWorker::advance_(int64_t nowNs) {
             TopicSchema ts;
             ts.topicId        = inFlight_->topicId;
             ts.version        = nextSchemaVersion_(inFlight_->topicId);
-            ts.partitionCount = inFlight_->msg.partitionCount;
+            ts.partitionCount = inFlight_->partitionCount;   // authoritative (I1)
             ts.keyField       = inFlight_->msg.keyField;
             ts.validate       = inFlight_->msg.validate;
             ts.descriptorBlob = inFlight_->msg.blob;

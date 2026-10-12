@@ -32,6 +32,7 @@
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/AdminWorker.h>
 #include <rune/node/AdminChannels.h>
+#include <rune/node/AdminCreateTopic.h>
 #include <rune/node/SchemaRegistry.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/replication/PartitionReplica.h>
@@ -47,6 +48,7 @@
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/PartitionHash.h>
 
 #include <atomic>
 #include <chrono>
@@ -188,6 +190,10 @@ struct SgHarness {
 
     // Control-thread state.
     int32_t nextTopicId = 0;
+    // Final review I1: when true, serviceControl answers create-topic requests
+    // EXACTLY as BrokerNode's control thread does (createTopicForAdmin over the
+    // REAL topicReg — idempotent by name, authoritative partition count).
+    bool realControl = false;
 
     // Gateway (by value — non-movable; guaranteed-copy-elision init in the list).
     // Declared LAST so egressFnFrames is alive when the egress fn captures it.
@@ -298,7 +304,12 @@ struct SgHarness {
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer()+off);
             CreateTopicReqMsg req = decodeCreateTopicReq(p, (std::size_t)len);
             CreateTopicReplyMsg reply; reply.ticket = req.ticket;
-            reply.topicId = nextTopicId++;  // authoritative id
+            if (realControl) {
+                reply = createTopicForAdmin(*topicReg, req);
+            } else {
+                reply.topicId = nextTopicId++;  // authoritative id
+                reply.partitionCount = req.partitionCount;
+            }
             (void)encodeCreateTopicReply(replyRing, reply);
         }, 8);
         work += egressRing.drain([this](int32_t, aeron::concurrent::AtomicBuffer& b,
@@ -470,6 +481,148 @@ TEST(SchemaGatewayRegression, GetTopicSchemaCarriesPartitionCount) {
     EXPECT_EQ(resp->errorCode, 0u);
     EXPECT_GT(resp->descriptorLen, 0u);
     EXPECT_EQ(resp->partitionCount, 8);
+}
+
+namespace {
+// Collect the first decodable frame of type R from the harness egress capture.
+template <typename R>
+std::optional<R> firstFrame(const SgHarness& h) {
+    for (auto& [sid, bytes] : h.captured) {
+        auto d = R::decode(bytes.data(), bytes.size());
+        if (d) return d;
+    }
+    return std::nullopt;
+}
+
+std::optional<pc::TopicSchemaResponse> getSchema(SgHarness& h, const std::string& name,
+                                                 int64_t corr) {
+    h.captured.clear();
+    pc::GetTopicSchema g; g.sessionId=1; g.correlationId=corr; g.topicName=name;
+    std::vector<uint8_t> gf(g.encodedSize()); g.encode(gf.data());
+    h.gw.applyGetTopicSchemaForTest(gf.data(), gf.size());
+    h.pump();
+    return firstFrame<pc::TopicSchemaResponse>(h);
+}
+} // namespace
+
+// ---------------------------------------------------------------------------
+// SchemaGatewayRegression.DefineTopicOverExistingTopicRecordsAuthoritativePartitionCount
+//
+// Phase 2b C final review I1: TopicRegistry::createTopic is idempotent by name,
+// so DefineTopic("orders", 8, ...) over an EXISTING 3-partition topic (e.g. a
+// RUNE_TOPICS boot topic with no schema) binds the schema to that topic — and
+// the registry used to record the REQUESTED 8.  GetTopicSchema then told typed
+// clients to route over 8 partitions of a 3-partition topic: records to
+// partitions that do not exist, and a producer and subscriber (which uses the
+// broker's own TopicRegistry hash over 3) disagreeing on a key's partition.
+// The schema must record the AUTHORITATIVE count (3), and a typed client routing
+// over the reported count must land every key where the broker routes it.
+// ---------------------------------------------------------------------------
+TEST(SchemaGatewayRegression, DefineTopicOverExistingTopicRecordsAuthoritativePartitionCount) {
+    SgHarness h;
+    h.realControl = true;
+    rune::node::TopicSpec boot; boot.name = "orders"; boot.partitionCount = 3;
+    const int32_t ordersId = h.topicReg->createTopic(boot);   // pre-existing, schema-less
+
+    const auto def = encodeDefineFrame(1, 1, "orders", /*parts=*/8, "userId", false, charsBlob());
+    h.gw.applyDefineTopicForTest(def.data(), def.size());
+    h.pump();
+    const auto dresp = firstFrame<pc::DefineTopicResponse>(h);
+    ASSERT_TRUE(dresp.has_value());
+    EXPECT_EQ(dresp->errorCode, 0u) << "a schema-less existing topic accepts its first schema";
+    EXPECT_EQ(dresp->topicId, ordersId) << "the schema binds to the EXISTING topic";
+
+    const auto resp = getSchema(h, "orders", 7);
+    ASSERT_TRUE(resp.has_value());
+    ASSERT_EQ(resp->errorCode, 0u);
+    EXPECT_EQ(resp->topicId, ordersId);
+    EXPECT_EQ(resp->partitionCount, 3) << "the topic's REAL partition count, not the requested 8";
+    EXPECT_EQ(h.topicReg->topic(ordersId)->partitionCount, 3) << "the topic is not resized";
+
+    // A typed client routes Key(k) over the reported count with the shared hash;
+    // the broker's TopicRegistry routes the same key (subscribe(Key), produce
+    // with no explicit partition) over the real partitions.  They must agree.
+    for (uint64_t k = 0; k < 64; ++k) {
+        uint8_t key[8]; std::memcpy(key, &k, 8);
+        const std::span<const uint8_t> ks(key, 8);
+        const int32_t client = rune::protocol::partitionForKey(ks, resp->partitionCount);
+        EXPECT_LT(client, 3) << "key " << k << " routed to a nonexistent partition";
+        EXPECT_EQ(client, h.topicReg->partitionForKey(ordersId, ks)) << "key " << k;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SchemaGatewayRegression.DefineTopicOverExistingTypedTopicIsTopicExists — the
+// other half of the I1 ruling: an existing topic that ALREADY has a schema
+// answers TopicExists (unchanged), and its schema keeps its partition count.
+// ---------------------------------------------------------------------------
+TEST(SchemaGatewayRegression, DefineTopicOverExistingTypedTopicIsTopicExists) {
+    SgHarness h;
+    h.realControl = true;
+    const auto def1 = encodeDefineFrame(1, 1, "orders", 4, "userId", false, charsBlob());
+    h.gw.applyDefineTopicForTest(def1.data(), def1.size());
+    h.pump();
+    h.captured.clear();
+
+    const auto def2 = encodeDefineFrame(1, 2, "orders", 8, "userId", false, charsBlob());
+    h.gw.applyDefineTopicForTest(def2.data(), def2.size());
+    h.pump();
+    const auto dresp = firstFrame<pc::DefineTopicResponse>(h);
+    ASSERT_TRUE(dresp.has_value());
+    EXPECT_EQ(dresp->errorCode, static_cast<uint16_t>(pc::ErrorCode::TopicExists));
+
+    const auto resp = getSchema(h, "orders", 9);
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->partitionCount, 4);
+}
+
+// ---------------------------------------------------------------------------
+// SchemaGatewayRegression.CreateTopicReplyCarriesCountAndExistedThroughRing —
+// the I1 reply fields survive the real control→admin ring encoding, and the
+// control-thread helper reports `existed` + the authoritative count for a name
+// that is already taken (and a fresh topic's own count otherwise).
+// ---------------------------------------------------------------------------
+TEST(SchemaGatewayRegression, CreateTopicReplyCarriesCountAndExistedThroughRing) {
+    const std::string dir = uniqDir("ctr");
+    rune::node::TopicSpec boot; boot.name = "orders"; boot.partitionCount = 3;
+    rune::gateway::TopicRegistry reg({boot}, dir);
+
+    CreateTopicReqMsg over; over.ticket = 5; over.partitionCount = 8; over.name = "orders";
+    const CreateTopicReplyMsg r1 = createTopicForAdmin(reg, over);
+    EXPECT_EQ(r1.ticket, 5);
+    EXPECT_EQ(r1.topicId, 0);
+    EXPECT_EQ(r1.partitionCount, 3);
+    EXPECT_TRUE(r1.existed);
+
+    CreateTopicReqMsg fresh; fresh.ticket = 6; fresh.partitionCount = 4; fresh.name = "new_topic";
+    const CreateTopicReplyMsg r2 = createTopicForAdmin(reg, fresh);
+    EXPECT_EQ(r2.topicId, 1);
+    EXPECT_EQ(r2.partitionCount, 4);
+    EXPECT_FALSE(r2.existed);
+
+    OneToOneByteRing ring{kCreateTopicRingBytes};
+    ASSERT_TRUE(encodeCreateTopicReply(ring, r1));
+    std::optional<CreateTopicReplyMsg> got;
+    ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b,
+                   aeron::util::index_t off, aeron::util::index_t len) {
+        got = decodeCreateTopicReply(reinterpret_cast<const uint8_t*>(b.buffer() + off),
+                                     static_cast<std::size_t>(len));
+    }, 1);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->ticket, 5);
+    EXPECT_EQ(got->topicId, 0);
+    EXPECT_EQ(got->partitionCount, 3);
+    EXPECT_TRUE(got->existed);
+
+    // A pre-I1 12-byte frame decodes as "count not reported, not existed".
+    uint8_t legacy[12] = {};
+    legacy[0] = 9; legacy[8] = 2;
+    const CreateTopicReplyMsg old = decodeCreateTopicReply(legacy, sizeof legacy);
+    EXPECT_EQ(old.ticket, 9);
+    EXPECT_EQ(old.topicId, 2);
+    EXPECT_EQ(old.partitionCount, 0);
+    EXPECT_FALSE(old.existed);
+    std::error_code ec; fs::remove_all(dir, ec);
 }
 
 // ---------------------------------------------------------------------------

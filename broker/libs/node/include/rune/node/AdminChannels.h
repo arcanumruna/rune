@@ -174,10 +174,20 @@ struct CreateTopicReqMsg {
 
 // ---------------------------------------------------------------------------
 // CreateTopicReply (control → admin).  Authoritative id (or -1 on failure).
+//
+// Phase 2b C final review I1: TopicRegistry::createTopic is idempotent by name —
+// when the name is already taken (a RUNE_TOPICS boot topic, a recovered runtime
+// topic) it returns the EXISTING topic's id and ignores the requested spec.  The
+// reply therefore carries the AUTHORITATIVE partition count (read back from the
+// registry's spec, never the request's) and an `existed` flag, so the admin
+// thread records the real count in the schema registry (typed clients route by
+// it) and can refuse to adopt an existing topic as a view sink.
 // ---------------------------------------------------------------------------
 struct CreateTopicReplyMsg {
-    int64_t ticket  = 0;
-    int32_t topicId = -1;   // >=0 on success; -1 on failure
+    int64_t ticket         = 0;
+    int32_t topicId        = -1;    // >=0 on success; -1 on failure
+    int32_t partitionCount = 0;     // authoritative; <= 0 = not reported (keep requested)
+    bool    existed        = false; // true = the name already named a topic (not created)
 };
 
 // ---------------------------------------------------------------------------
@@ -406,12 +416,14 @@ inline CreateTopicReqMsg decodeCreateTopicReq(const uint8_t* buf, std::size_t le
 // ---- CreateTopicReply ----
 inline bool encodeCreateTopicReply(OneToOneByteRing& ring, const CreateTopicReplyMsg& m) {
     using namespace admin_wire;
-    const std::size_t len = 8 + 4;
+    const std::size_t len = 8 + 4 + 4 + 1;
     const auto idx = ring.tryClaim(kMsgCreateTopicReply, len);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
     putI64(p, m.ticket);  p += 8;
-    putI32(p, m.topicId);
+    putI32(p, m.topicId); p += 4;
+    putI32(p, m.partitionCount); p += 4;
+    *p = m.existed ? 1 : 0;
     ring.commit(idx);
     return true;
 }
@@ -422,6 +434,9 @@ inline CreateTopicReplyMsg decodeCreateTopicReply(const uint8_t* buf, std::size_
     if (len < 12) return m;
     m.ticket  = getI64(buf);
     m.topicId = getI32(buf + 8);
+    if (len < 17) return m;   // pre-I1 frame: count not reported, not existed
+    m.partitionCount = getI32(buf + 12);
+    m.existed        = buf[16] != 0;
     return m;
 }
 

@@ -31,6 +31,7 @@
 // MD1 Task 4: MetadataService for __cluster_metadata.
 #include <rune/node/MetadataService.h>
 // Task 6: AdminWorker + SchemaRegistry + __topic_schemas persistence.
+#include <rune/node/AdminCreateTopic.h>
 #include <rune/node/AdminWorker.h>
 #include <rune/node/SchemaRegistry.h>
 #include <rune/node/RuntimeTopicRecovery.h>
@@ -3852,45 +3853,35 @@ int BrokerNode::serviceAdminControl_() {
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
             CreateTopicReqMsg req =
                 decodeCreateTopicReq(p, static_cast<std::size_t>(len));
-            int32_t id = -1;
+            CreateTopicReplyMsg reply;
+            reply.ticket = req.ticket;
             if (topicRegistry_) {
-                rune::node::TopicSpec spec;
-                spec.name           = req.name;
-                spec.partitionCount = req.partitionCount;
-                spec.topicId        = -1;  // registry assigns
-                // Task 19: a view SINK is a keyed + Compact "table" — carry the
-                // cleanup policy + key field the admin thread resolved (DefineTopic
-                // leaves them default: Delete, empty).
-                spec.cleanupPolicy  = static_cast<rune::node::TopicSpec::CleanupPolicy>(
-                                          req.cleanupPolicy);
-                if (!req.keyField.empty()) spec.partitionKey = req.keyField;
-                try {
-                    id = topicRegistry_->createTopic(spec);
-                    // Task 8b (SINGLE-NODE): make the runtime topic
-                    // produce/consume-capable by creating its user
-                    // PartitionReplica(s) NOW, on this same control
-                    // thread that owns TopicRegistry / replicaRegistry_
-                    // / replTransport_ / MetadataService (no new
-                    // cross-thread mutation).  The authoritative spec
-                    // (assigned id + all fields, dirs/logs already
-                    // created by createTopic) is read back from the
-                    // registry and replayed through the boot path.
-                    if (id >= 0) {
-                        const rune::node::TopicSpec* authSpec =
-                            topicRegistry_->topic(id);
-                        if (authSpec) {
+                // createTopicForAdmin (AdminCreateTopic.h): createTopic + the
+                // AUTHORITATIVE partition count + `existed` (final review I1 —
+                // an existing name returns that topic, never the requested spec).
+                reply = createTopicForAdmin(*topicRegistry_, req);
+                // Task 8b (SINGLE-NODE): make the runtime topic
+                // produce/consume-capable by creating its user
+                // PartitionReplica(s) NOW, on this same control
+                // thread that owns TopicRegistry / replicaRegistry_
+                // / replTransport_ / MetadataService (no new
+                // cross-thread mutation).  The authoritative spec
+                // (assigned id + all fields, dirs/logs already
+                // created by createTopic) is read back from the
+                // registry and replayed through the boot path
+                // (idempotent for an existing topic's replicas).
+                if (reply.topicId >= 0) {
+                    try {
+                        if (const rune::node::TopicSpec* authSpec =
+                                topicRegistry_->topic(reply.topicId))
                             (void)createRuntimeUserReplicas(*authSpec);
-                        }
+                    } catch (const std::exception& ex) {
+                        spdlog::error("BrokerNode: admin createTopic('{}') replicas failed: {}",
+                                      req.name, ex.what());
+                        reply.topicId = -1;
                     }
-                } catch (const std::exception& ex) {
-                    spdlog::error("BrokerNode: admin createTopic('{}') failed: {}",
-                                  req.name, ex.what());
-                    id = -1;
                 }
             }
-            CreateTopicReplyMsg reply;
-            reply.ticket  = req.ticket;
-            reply.topicId = id;
             // Reply ring is 1-deep in flight (one DDL at a time) → never full.
             (void)encodeCreateTopicReply(agent->replyRing(), reply);
         }, 8);

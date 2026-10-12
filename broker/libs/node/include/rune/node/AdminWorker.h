@@ -291,6 +291,9 @@ private:
         AlterTopicMsg  alter;                // ALTER (session/corr for the response)
         int64_t        ticket        = 0;
         int32_t        topicId       = -1;   // set on AwaitingId → AwaitingCommit
+        int32_t        partitionCount = 0;   // AUTHORITATIVE count from the create
+                                              // reply (final review I1) — what the
+                                              // schema registry records
         int64_t        appendedBase  = -1;   // set on AwaitingCommit (HW must reach it)
         int64_t        appendedLast  = -1;
         int64_t        startedNs     = 0;    // for timeout
