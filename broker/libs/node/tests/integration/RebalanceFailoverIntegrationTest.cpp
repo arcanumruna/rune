@@ -29,9 +29,9 @@
 //   RejoinAfterRestart_PreferredLeaderMoveBack
 //   NoIsrSurvivor_GoesNoLeaderAndRecoversOnUnfence
 //   TwoNodeLoss_FenceOneAtATime
-//   MemoryTopic_HandoffKeepsDataWhenReplicaSurvives
-//   MemoryTopic_DataGoneWhenNoneSurvive
-//   MemoryTopic_AllInSyncFollowerCatchUpFromLeaderRing
+//   TransientTopic_HandoffKeepsDataWhenReplicaSurvives
+//   TransientTopic_DataGoneWhenNoneSurvive
+//   TransientTopic_AllInSyncFollowerCatchUpFromLeaderRing
 //
 // All waits are bounded (kDriverCap + ASSERT_TRUE << "stalled…").  No busy-spin.
 // ---------------------------------------------------------------------------
@@ -720,7 +720,7 @@ TEST(RebalanceFailover, TwoNodeLoss_FenceOneAtATime) {
 // (InMemoryLog-backed partition; a survivor holds the committed ring → the new
 // leader serves it.)
 // ---------------------------------------------------------------------------
-TEST(RebalanceFailover, MemoryTopic_HandoffKeepsDataWhenReplicaSurvives) {
+TEST(RebalanceFailover, TransientTopic_HandoffKeepsDataWhenReplicaSurvives) {
     constexpr int32_t kTopic = 120, kPart = 0;
     const std::vector<NodeId> all = {1, 2, 3};
 
@@ -773,7 +773,7 @@ TEST(RebalanceFailover, MemoryTopic_HandoffKeepsDataWhenReplicaSurvives) {
 // A fresh in-memory replica set (all "restarted") has no committed data — the
 // contract is that memory topics do NOT survive a full-replica-set loss.
 // ---------------------------------------------------------------------------
-TEST(RebalanceFailover, MemoryTopic_DataGoneWhenNoneSurvive) {
+TEST(RebalanceFailover, TransientTopic_DataGoneWhenNoneSurvive) {
     constexpr int32_t kTopic = 130, kPart = 0;
     const std::vector<NodeId> all = {1, 2, 3};
 
@@ -816,7 +816,7 @@ TEST(RebalanceFailover, MemoryTopic_DataGoneWhenNoneSurvive) {
 // Memory-topic all-in-sync: a bounded-ring follower catches up from the leader's
 // in-memory ring (AllInSync → every replica must be in sync).
 // ---------------------------------------------------------------------------
-TEST(RebalanceFailover, MemoryTopic_AllInSyncFollowerCatchUpFromLeaderRing) {
+TEST(RebalanceFailover, TransientTopic_AllInSyncFollowerCatchUpFromLeaderRing) {
     constexpr int32_t kTopic = 140, kPart = 0;
     const std::vector<NodeId> all = {1, 2, 3};
 

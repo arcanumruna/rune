@@ -60,12 +60,12 @@ TopicRegistry::createTopic(const rune::node::TopicSpec& spec)
     for (int32_t p = 0; p < spec.partitionCount; ++p) {
         PartitionEntry pe;
 
-        // Memory-backed topics (PersistenceMode::Memory) do NOT create disk
+        // Transient topics (PersistenceMode::Transient) do NOT create disk
         // directories or Log objects.  The PartitionEntry is left with log=nullptr.
         // BrokerNode::buildReplication() detects this and substitutes an InMemoryLog.
-        if (spec.persistence == rune::node::PersistenceMode::Memory) {
+        if (spec.persistence == rune::node::PersistenceMode::Transient) {
             spdlog::debug(
-                "TopicRegistry: topic='{}' partition={} [memory-backed, no disk log]",
+                "TopicRegistry: topic='{}' partition={} [transient, no disk log]",
                 spec.name, p);
             entry.partitions.push_back(std::move(pe));
             continue;

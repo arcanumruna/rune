@@ -6517,8 +6517,8 @@ private:
                               workerId_, f.topicId, f.partition);
                 ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
             } else {
-                // Owned but memory-backed: Internal.
-                spdlog::warn("Worker {}: WorkerIngress: owned but memory-backed log for "
+                // Owned but transient (in-memory log): Internal.
+                spdlog::warn("Worker {}: WorkerIngress: owned but transient (in-memory) log for "
                              "topicId={} partition={}; Internal error ack",
                              workerId_, f.topicId, f.partition);
                 ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);

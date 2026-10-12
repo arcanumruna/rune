@@ -485,6 +485,7 @@ std::optional<std::vector<int32_t>> parseCpuList(std::string_view s) {
 ConfigResult parseNodeConfig(
     const std::function<const char*(const char*)>& getenv_fn)
 {
+    std::vector<std::string> warnings;   // non-fatal (deprecated spellings); returned on success
     // --- RUNE_NODE_ID (required) ---
     const char* rawNodeId = getenv_fn("RUNE_NODE_ID");
     if (!rawNodeId || std::string_view(rawNodeId).empty())
@@ -780,7 +781,7 @@ ConfigResult parseNodeConfig(
                 // Remaining fields can be either:
                 //   (a) Positional legacy fields (no '=' in token): policy, segmentRollBytes, etc.
                 //   (b) Named key=value tokens (contain '='): group=<g>, key=<k>,
-                //       persistence=memory|disk, durability=majority|all-in-sync.
+                //       persistence=disk|transient (memory = deprecated alias), durability=majority|all-in-sync.
                 // Both formats are backward-compatible: a token is key=value iff it
                 // contains '='; otherwise it is a positional legacy field.
                 std::vector<std::string_view> fields;
@@ -850,12 +851,18 @@ ConfigResult parseNodeConfig(
                     } else if (klower == "persistence") {
                         std::string vlow(kval);
                         for (auto& ch : vlow) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-                        if (vlow == "memory") {
-                            ts.persistence = PersistenceMode::Memory;
+                        if (vlow == "transient") {
+                            ts.persistence = PersistenceMode::Transient;
+                        } else if (vlow == "memory") {
+                            // Phase 2b E: memory topics were renamed transient topics.
+                            // Existing compose files keep working; one line per entry.
+                            ts.persistence = PersistenceMode::Transient;
+                            warnings.push_back("RUNE_TOPICS persistence=memory is deprecated — use "
+                                               "persistence=transient (topic '" + ts.name + "')");
                         } else if (vlow == "disk") {
                             ts.persistence = PersistenceMode::Disk;
                         } else {
-                            return {{}, std::string("RUNE_TOPICS persistence must be 'disk' or 'memory', got: ") + std::string(kval) + " in entry: " + std::string(entry)};
+                            return {{}, std::string("RUNE_TOPICS persistence must be 'disk' or 'transient', got: ") + std::string(kval) + " in entry: " + std::string(entry)};
                         }
                     } else if (klower == "durability") {
                         std::string vlow(kval);
@@ -1074,7 +1081,15 @@ ConfigResult parseNodeConfig(
     parsePow2(getenv_fn("RUNE_WORKER_RETURN_RING_BYTES"),  cfg.workerReturnRingBytes);
     parsePow2(getenv_fn("RUNE_IO_SUBMIT_RING_DEPTH"),     cfg.ioSubmitRingDepth);
     parsePow2(getenv_fn("RUNE_IO_COMPLETION_RING_DEPTH"), cfg.ioCompletionRingDepth);
-    parsePow2(getenv_fn("RUNE_MEMORY_LOG_RING_BYTES"),    cfg.memoryLogRingBytes);
+    {
+        // Phase 2b E: RUNE_TRANSIENT_LOG_RING_BYTES is canonical; RUNE_MEMORY_LOG_RING_BYTES
+        // is a deprecated alias (one warning whenever it is set; canonical wins if both).
+        const char* canon = getenv_fn("RUNE_TRANSIENT_LOG_RING_BYTES");
+        const char* alias = getenv_fn("RUNE_MEMORY_LOG_RING_BYTES");
+        if (alias)
+            warnings.push_back("RUNE_MEMORY_LOG_RING_BYTES is deprecated; use RUNE_TRANSIENT_LOG_RING_BYTES");
+        parsePow2(canon ? canon : alias, cfg.memoryLogRingBytes);
+    }
     parsePow2(getenv_fn("RUNE_AERON_TERM_BUFFER_BYTES"),  cfg.aeronTermBufferBytes);
     if (const char* raw = getenv_fn("RUNE_IOWQ_CORES"); raw && *raw) {
         auto cpus = parseCpuList(raw);
@@ -1488,7 +1503,7 @@ ConfigResult parseNodeConfig(
         }
     }
 
-    return {std::move(cfg), {}};
+    return {std::move(cfg), {}, std::move(warnings)};
 }
 
 // ---------------------------------------------------------------------------

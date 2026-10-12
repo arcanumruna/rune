@@ -991,7 +991,7 @@ TEST(BrokerNodeTest, M1_AllInSyncDurabilityWiresEndToEnd) {
 // ===========================================================================
 // Task M1 precondition #2: memory-backed partition skips cleaner / log().
 //
-// A topic declared with persistence=Memory uses an InMemoryLog.
+// A topic declared with persistence=Transient uses an InMemoryLog.
 // The LogCleanerAgent must not call replica->log() (which asserts isDiskBacked())
 // on such a replica.  The test verifies this by:
 //   1. Creating a compact memory-backed topic (normally the cleaner would run).
@@ -1000,7 +1000,7 @@ TEST(BrokerNodeTest, M1_AllInSyncDurabilityWiresEndToEnd) {
 //
 // Also verifies ilog()->isDiskBacked() == false for the memory replica.
 // ===========================================================================
-TEST(BrokerNodeTest, M1_MemoryBackedPartitionSkipsCleaner) {
+TEST(BrokerNodeTest, M1_TransientPartitionSkipsCleaner) {
     TempDir tmp{"m1_mem_"};
     NodeConfig cfg = makeSingleNodeConfig(tmp.path);
 
@@ -1010,7 +1010,7 @@ TEST(BrokerNodeTest, M1_MemoryBackedPartitionSkipsCleaner) {
     ts.topicId               = 0;
     ts.cleanupPolicy         = TopicSpec::CleanupPolicy::Compact;
     ts.minCleanableDirtyRatio = 0.0;  // would fire immediately on disk topics
-    ts.persistence           = PersistenceMode::Memory;
+    ts.persistence           = PersistenceMode::Transient;
 
     cfg.topics = {ts};
 
@@ -1033,9 +1033,9 @@ TEST(BrokerNodeTest, M1_MemoryBackedPartitionSkipsCleaner) {
             return std::pair{r.isMemoryBacked(), r.isDiskBacked()};
         });
     EXPECT_TRUE(memBacked)
-        << "Task M1: persistence=Memory must produce a memory-backed replica (InMemoryLog)";
+        << "Task M1: persistence=Transient must produce a memory-backed replica (InMemoryLog)";
     EXPECT_FALSE(diskBacked)
-        << "Task M1: persistence=Memory replica must not be disk-backed";
+        << "Task M1: persistence=Transient replica must not be disk-backed";
 
     // If we reach here without a crash/assertion, the cleaner correctly skipped
     // the memory-backed replica's log() call.

@@ -1223,7 +1223,7 @@ TEST(NodeConfig, ParsesCoPartitionGroupKeyAndPersistence) {
     EXPECT_EQ(ts[0].coPartitionGroup, "acct");
     EXPECT_EQ(ts[0].partitionKey, "userId");
     EXPECT_EQ(ts[0].durability, 1);
-    EXPECT_EQ(ts[1].persistence, rune::node::PersistenceMode::Memory);
+    EXPECT_EQ(ts[1].persistence, rune::node::PersistenceMode::Transient);
 }
 
 TEST(NodeConfig, LegacyTopicGrammarStillParses) {
@@ -1246,7 +1246,7 @@ TEST(NodeConfig, PersistenceMemoryDurabilityAllInSync) {
         if (s=="RUNE_TOPICS") return "ephemeral:2:persistence=memory:durability=all-in-sync"; return nullptr; };
     auto res=rune::node::parseNodeConfig(env);
     ASSERT_TRUE(res.config.has_value()) << res.error;
-    EXPECT_EQ(res.config->topics[0].persistence, rune::node::PersistenceMode::Memory);
+    EXPECT_EQ(res.config->topics[0].persistence, rune::node::PersistenceMode::Transient);
     EXPECT_EQ(res.config->topics[0].durability, 1u);
 }
 
@@ -1486,14 +1486,14 @@ TEST(NodeConfig, ShardIdleUsesWakeOnlyWhenEnabled) {
 
 // ---------------------------------------------------------------------------
 // E3 Task 7: io-ring depths + memory-log ring bytes (RUNE_IO_SUBMIT_RING_DEPTH,
-// RUNE_IO_COMPLETION_RING_DEPTH, RUNE_MEMORY_LOG_RING_BYTES)
+// RUNE_IO_COMPLETION_RING_DEPTH, RUNE_TRANSIENT_LOG_RING_BYTES)
 // ---------------------------------------------------------------------------
 
 TEST(NodeConfig, IoRingDepthsParseFromEnvPow2) {
     // Override two of the three fields; confirm the third stays at its default.
     auto base = base1node();
     base["RUNE_IO_SUBMIT_RING_DEPTH"]  = "2048";
-    base["RUNE_MEMORY_LOG_RING_BYTES"] = "16777216"; // 16 MiB = 2^24
+    base["RUNE_TRANSIENT_LOG_RING_BYTES"] = "16777216"; // 16 MiB = 2^24
     auto res = rune::node::parseNodeConfig(fakeEnv(base));
     ASSERT_TRUE(res.config.has_value()) << res.error;
     EXPECT_EQ(res.config->ioSubmitRingDepth,    2048);
@@ -1516,7 +1516,7 @@ TEST(NodeConfig, IoRingDepthsNonPow2KeepsDefault) {
     auto base = base1node();
     base["RUNE_IO_SUBMIT_RING_DEPTH"]     = "1000";  // not a power of two
     base["RUNE_IO_COMPLETION_RING_DEPTH"] = "3000";  // not a power of two
-    base["RUNE_MEMORY_LOG_RING_BYTES"]    = "7";     // not a power of two
+    base["RUNE_TRANSIENT_LOG_RING_BYTES"]    = "7";     // not a power of two
     auto res = rune::node::parseNodeConfig(fakeEnv(base));
     ASSERT_TRUE(res.config.has_value()) << res.error;
     EXPECT_EQ(res.config->ioSubmitRingDepth,     1024) << "non-pow2 must keep default";
@@ -1538,7 +1538,7 @@ TEST(NodeConfig, IoRingDepthsAllThreeOverridden) {
     auto base = base1node();
     base["RUNE_IO_SUBMIT_RING_DEPTH"]     = "512";
     base["RUNE_IO_COMPLETION_RING_DEPTH"] = "256";
-    base["RUNE_MEMORY_LOG_RING_BYTES"]    = "4194304"; // 4 MiB = 2^22
+    base["RUNE_TRANSIENT_LOG_RING_BYTES"]    = "4194304"; // 4 MiB = 2^22
     auto res = rune::node::parseNodeConfig(fakeEnv(base));
     ASSERT_TRUE(res.config.has_value()) << res.error;
     EXPECT_EQ(res.config->ioSubmitRingDepth,     512);
@@ -2804,4 +2804,89 @@ TEST(NodeConfigRegression, IdleMaxParkUsIsBoundedAndStrictRegression) {
         EXPECT_FALSE(r.config.has_value()) << "RUNE_IDLE_MAX_PARK_US=" << bad << " was accepted";
         if (!r.config.has_value()) EXPECT_NE(r.error.find("RUNE_IDLE_MAX_PARK_US"), std::string::npos) << r.error;
     }
+}
+
+// ===========================================================================
+// Phase 2b E: transient topics (rename of memory topics)
+// ===========================================================================
+namespace {
+rune::node::ConfigResult parseWithTopics(const char* topics) {
+    return rune::node::parseNodeConfig([topics](const char* k) -> const char* {
+        std::string s = k;
+        if (s == "RUNE_NODE_ID") return "0";
+        if (s == "RUNE_PEERS") return "0@h:1";
+        if (s == "RUNE_CLIENT_ENDPOINT") return "h:2";
+        if (s == "RUNE_DATA_DIR") return "/tmp/x";
+        if (s == "RUNE_TOPICS") return topics;
+        return nullptr;
+    });
+}
+} // namespace
+
+TEST(NodeConfig, PersistenceTransientParses) {
+    auto res = parseWithTopics("presence:2:persistence=transient,orders:4:persistence=disk");
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->topics[0].persistence, rune::node::PersistenceMode::Transient);
+    EXPECT_EQ(res.config->topics[1].persistence, rune::node::PersistenceMode::Disk);
+    EXPECT_TRUE(res.warnings.empty()) << "the canonical spelling never warns";
+}
+
+// Existing compose files say persistence=memory: they must keep booting, as
+// TRANSIENT topics, with exactly one deprecation warning per such entry.
+TEST(NodeConfigRegression, PersistenceMemoryIsDeprecatedAliasForTransient) {
+    auto res = parseWithTopics("presence:2:persistence=MEMORY,chat:1:persistence=memory");
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->topics[0].persistence, rune::node::PersistenceMode::Transient);
+    EXPECT_EQ(res.config->topics[1].persistence, rune::node::PersistenceMode::Transient);
+    ASSERT_EQ(res.warnings.size(), 2u);
+    EXPECT_NE(res.warnings[0].find("deprecated"), std::string::npos) << res.warnings[0];
+    EXPECT_NE(res.warnings[0].find("persistence=transient"), std::string::npos) << res.warnings[0];
+    EXPECT_NE(res.warnings[0].find("presence"), std::string::npos) << res.warnings[0];
+    EXPECT_NE(res.warnings[1].find("chat"), std::string::npos) << res.warnings[1];
+}
+
+TEST(NodeConfig, PersistenceBadValueNamesTransient) {
+    auto res = parseWithTopics("t:1:persistence=ram");
+    ASSERT_FALSE(res.config.has_value());
+    EXPECT_NE(res.error.find("'disk' or 'transient'"), std::string::npos) << res.error;
+}
+
+TEST(NodeConfig, PersistenceModeWireMapping) {
+    using rune::node::PersistenceMode;
+    EXPECT_EQ(rune::node::persistenceToWire(PersistenceMode::Disk), 0u);
+    EXPECT_EQ(rune::node::persistenceToWire(PersistenceMode::Transient), 1u);
+    EXPECT_EQ(rune::node::persistenceFromWire(0), PersistenceMode::Disk);
+    EXPECT_EQ(rune::node::persistenceFromWire(1), PersistenceMode::Transient);
+}
+
+// Controller ruling SQ5: RUNE_TRANSIENT_LOG_RING_BYTES is canonical;
+// RUNE_MEMORY_LOG_RING_BYTES is a deprecated alias (one warning).
+TEST(NodeConfigRegression, TransientLogRingBytesCanonical) {
+    auto base = rune::node::base1node();
+    base["RUNE_TRANSIENT_LOG_RING_BYTES"] = "16777216";
+    auto res = rune::node::parseNodeConfig(rune::node::fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->memoryLogRingBytes, 16 * 1024 * 1024);
+    EXPECT_TRUE(res.warnings.empty());
+}
+
+TEST(NodeConfigRegression, MemoryLogRingBytesIsDeprecatedAlias) {
+    auto base = rune::node::base1node();
+    base["RUNE_MEMORY_LOG_RING_BYTES"] = "4194304";
+    auto res = rune::node::parseNodeConfig(rune::node::fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->memoryLogRingBytes, 4 * 1024 * 1024);
+    ASSERT_EQ(res.warnings.size(), 1u);
+    EXPECT_NE(res.warnings[0].find("RUNE_MEMORY_LOG_RING_BYTES"), std::string::npos) << res.warnings[0];
+    EXPECT_NE(res.warnings[0].find("RUNE_TRANSIENT_LOG_RING_BYTES"), std::string::npos) << res.warnings[0];
+}
+
+TEST(NodeConfigRegression, TransientLogRingBytesWinsOverAlias) {
+    auto base = rune::node::base1node();
+    base["RUNE_TRANSIENT_LOG_RING_BYTES"] = "16777216";
+    base["RUNE_MEMORY_LOG_RING_BYTES"]    = "4194304";
+    auto res = rune::node::parseNodeConfig(rune::node::fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->memoryLogRingBytes, 16 * 1024 * 1024);
+    EXPECT_EQ(res.warnings.size(), 1u) << "the alias still warns";
 }

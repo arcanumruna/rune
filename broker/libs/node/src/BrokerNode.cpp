@@ -1116,18 +1116,18 @@ void BrokerNode::buildReplication() {
 
         for (int32_t part = 0; part < spec->partitionCount; ++part) {
             // Task M1: select log backend by persistence mode.
-            // Memory-backed: create an InMemoryLog (large caps — production-suitable).
+            // Transient: create an InMemoryLog (large caps — production-suitable).
             // Disk-backed: use the Log from TopicRegistry (recovered on startup).
             // De-virtualized seam (Milestone D P2): keep the concrete typed pointer
             // and construct via the matching PartitionReplica overload — no ILog*.
             rune::storage::Log*         diskLogPtr = nullptr;
             rune::storage::InMemoryLog* memLogPtr  = nullptr;
-            const bool isMemory = (spec->persistence == rune::node::PersistenceMode::Memory);
+            const bool isTransient = (spec->persistence == rune::node::PersistenceMode::Transient);
 
-            if (isMemory) {
-                // Memory-backed partition: create an InMemoryLog.
-                // Recovery SKIPS memory partitions — they start empty (precondition #3).
-                // Use config_.memoryLogRingBytes (default 8 MiB, env RUNE_MEMORY_LOG_RING_BYTES)
+            if (isTransient) {
+                // Transient partition: create an InMemoryLog.
+                // Recovery SKIPS transient partitions — they start empty (precondition #3).
+                // Use config_.memoryLogRingBytes (default 8 MiB, env RUNE_TRANSIENT_LOG_RING_BYTES)
                 // as the fixed circular-ring capacity.  Keep DropOldest (not BackPressure)
                 // so existing memory-persistence tests are parity-unchanged.
                 const std::size_t kMemLogMaxBytes =
@@ -1138,7 +1138,7 @@ void BrokerNode::buildReplication() {
                         kMemLogMaxBytes, kMemLogMaxRecords,
                         rune::storage::FullPolicy::DropOldest));
                 memLogPtr = memoryLogs_.back().get();
-                spdlog::debug("BrokerNode[{}]: topic '{}' partition {} using InMemoryLog",
+                spdlog::debug("BrokerNode[{}]: transient topic '{}' partition {} on InMemoryLog",
                               config_.nodeId, spec->name, part);
             } else {
                 diskLogPtr = topicRegistry_->log(topicId, part);
@@ -1225,7 +1225,7 @@ void BrokerNode::buildReplication() {
 
             // De-virtualized seam (Milestone D P2): dispatch to the matching
             // concrete constructor overload so the replica stores a typed pointer.
-            auto replica = isMemory
+            auto replica = isTransient
                 ? std::make_unique<PartitionReplica>(
                       pcfg, Role::Follower, /*epoch=*/0,
                       allNodeIds, allNodeIds, memLogPtr, transport)
@@ -1233,7 +1233,7 @@ void BrokerNode::buildReplication() {
                       pcfg, Role::Follower, /*epoch=*/0,
                       allNodeIds, allNodeIds, diskLogPtr, transport);
             applyWorkerDrivenDurability(*replica, topicId, provisionChannel_(), config_.segmentProvisionThresholdPct);   // Task 10 + F30 + hotpath-A
-            if (isMemory) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
+            if (isTransient) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
             // Kafka AlterPartition: user-partition ISR changes go through the
             // controller (multi-node); internal partitions keep a leader-local ISR.
             if (topicId >= 0 && replTransport_ && !config_.isSingleNode())
@@ -1339,10 +1339,10 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
 
         rune::storage::Log*         diskLogPtr = nullptr;
         rune::storage::InMemoryLog* memLogPtr  = nullptr;
-        const bool isMemory =
-            (spec.persistence == rune::node::PersistenceMode::Memory);
+        const bool isTransient =
+            (spec.persistence == rune::node::PersistenceMode::Transient);
 
-        if (isMemory) {
+        if (isTransient) {
             const std::size_t kMemLogMaxBytes =
                 static_cast<std::size_t>(config_.memoryLogRingBytes);
             constexpr std::size_t kMemLogMaxRecords = 1'000'000UL;
@@ -1401,7 +1401,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
             }
         }
 
-        auto replica = isMemory
+        auto replica = isTransient
             ? std::make_unique<PartitionReplica>(
                   pcfg, Role::Follower, /*epoch=*/0,
                   allNodeIds, allNodeIds, memLogPtr, transport)
@@ -1409,7 +1409,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
                   pcfg, Role::Follower, /*epoch=*/0,
                   allNodeIds, allNodeIds, diskLogPtr, transport);
         applyWorkerDrivenDurability(*replica, topicId, provisionChannel_(), config_.segmentProvisionThresholdPct);   // same policy as boot (F30 fix round 1, F3)
-        if (isMemory) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
+        if (isTransient) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
         if (topicId >= 0 && replTransport_ && !config_.isSingleNode())
             replica->setIsrChannel(replTransport_.get());   // Kafka AlterPartition (see boot)
 
