@@ -42,13 +42,35 @@ constexpr int32_t kChunkBytes = 64 * 1024 * 1024;
 
 // Calls fn(value, batchBaseOffset) for every record value in the log under
 // `dir`, oldest first.  A missing directory is an empty catalog.
-template <class Fn>
-void forEachCatalogValue(const fs::path& dir, const char* catalog, Fn&& fn) {
-    std::error_code ec;
-    if (!fs::is_directory(dir, ec)) return;
+//
+// Fix round 2b: reports what recovery found.  Truncated = Log::recover() cut
+// bytes (a CRC / torn tail, or later segments deleted on a chain gap) — measured
+// as the catalog's total segment bytes before vs after recover() (LogSegment
+// ftruncates to the last valid batch; segments are not preallocated).
+enum class CatalogState : uint8_t { Missing, Intact, Truncated };
 
+int64_t segmentBytes(const fs::path& dir) {
+    int64_t total = 0;
+    std::error_code ec;
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code sec;
+        if (it->path().extension() != ".log" || !it->is_regular_file(sec) || sec) continue;
+        const auto sz = it->file_size(sec);
+        if (!sec) total += static_cast<int64_t>(sz);
+    }
+    return total;
+}
+
+template <class Fn>
+CatalogState forEachCatalogValue(const fs::path& dir, const char* catalog, Fn&& fn) {
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) return CatalogState::Missing;
+
+    const int64_t bytesBefore = segmentBytes(dir);
     rune::storage::Log log(dir.string());
     log.recover();
+    const CatalogState state =
+        segmentBytes(dir) < bytesBefore ? CatalogState::Truncated : CatalogState::Intact;
     int64_t       off = log.logStartOffset();
     const int64_t end = log.logEndOffset();
 
@@ -81,6 +103,7 @@ void forEachCatalogValue(const fs::path& dir, const char* catalog, Fn&& fn) {
         if (next <= off) corrupt(catalog, off, "no readable batch");
         off = next;
     }
+    return state;
 }
 
 bool allDigits(const std::string& s) {
@@ -160,7 +183,8 @@ std::string orphanPlaceholderName(int32_t topicId) {
 TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
                                           const std::vector<TopicSpec>& topics,
                                           const std::vector<int32_t>& placeholderIds,
-                                          int64_t nowUnixSeconds) {
+                                          int64_t nowUnixSeconds,
+                                          std::string_view catalogDamage) {
     TopicDirReconciliation result;
     std::error_code ec;
     const fs::path topicsRoot = fs::path(dataDir) / "topics";
@@ -168,6 +192,14 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
     if (ec || !fs::is_directory(rootSt)) return result;   // absent, or a symlink: never followed
     const fs::path canonicalRoot = fs::canonical(topicsRoot, ec);
     if (ec) return result;
+
+    // Fix round 2b: on a damaged catalog NOTHING is deleted this boot.
+    const bool deletesAllowed = catalogDamage.empty();
+    if (!deletesAllowed) {
+        spdlog::warn("topic-dir reconcile: the topic catalog is damaged ({}) — NO topic dir is "
+                     "deleted this boot; every orphan-placeholder dir is quarantined instead",
+                     catalogDamage);
+    }
 
     // I2: placeholders are what RECOVERY created (structural), never a name match.
     const std::set<int32_t> placeholders(placeholderIds.begin(), placeholderIds.end());
@@ -267,7 +299,7 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
                          "marker rewrite ('{}') — quarantining, NOT deleting", c.string(),
                          rune::gateway::kTopicIdMarkerTmpFile);
         }
-        if (marker.kind == MarkerKind::Pending && isPlaceholderId && !tmpPresent) {
+        if (marker.kind == MarkerKind::Pending && isPlaceholderId && !tmpPresent && deletesAllowed) {
             spdlog::warn("topic-dir reconcile: deleting '{}' — the data dir of orphan placeholder '{}' "
                          "(a runtime create whose catalog record never committed)",
                          c.string(), orphanPlaceholderName(marker.id));
@@ -336,7 +368,7 @@ RecoveredRuntimeTopics recoverRuntimeTopics(const std::string& dataDir,
     // ── __topic_schemas: every DefineTopic topic (ALL ids — a view over a static
     //    source needs that source's partition count too). ──────────────────────
     std::map<int32_t, DefinedTopic> defined;
-    forEachCatalogValue(root / "__topic_schemas", "__topic_schemas",
+    const CatalogState schemasState = forEachCatalogValue(root / "__topic_schemas", "__topic_schemas",
                         [&](std::span<const uint8_t> val, int64_t batchBase) {
         auto ts = TopicSchema::deserialize(val);
         if (!ts) corrupt("__topic_schemas", batchBase, "TopicSchema::deserialize failed");
@@ -379,7 +411,7 @@ RecoveredRuntimeTopics recoverRuntimeTopics(const std::string& dataDir,
     }
 
     // ── __views: every view's sink topic. ────────────────────────────────────
-    forEachCatalogValue(root / "__views", "__views",
+    const CatalogState viewsState = forEachCatalogValue(root / "__views", "__views",
                         [&](std::span<const uint8_t> val, int64_t batchBase) {
         auto rec = ViewRecord::deserialize(val);
         if (!rec) corrupt("__views", batchBase, "ViewRecord::deserialize failed");
@@ -431,6 +463,17 @@ RecoveredRuntimeTopics recoverRuntimeTopics(const std::string& dataDir,
     // Fill it with a hidden, inert, ZERO-partition placeholder so every later topic
     // keeps its id; log all placeholders of this boot ONCE.
     RecoveredRuntimeTopics result;
+    // Fix round 2b: a damaged catalog (cut by recovery, or one catalog missing
+    // while the other exists) means a gap may be a LOST committed record, not an
+    // orphan — reconcile then deletes nothing (quarantines instead).
+    auto stateText = [](CatalogState s) {
+        return s == CatalogState::Missing ? "missing" : s == CatalogState::Truncated ? "truncated by recovery" : "intact";
+    };
+    if (schemasState == CatalogState::Truncated || viewsState == CatalogState::Truncated ||
+        (schemasState == CatalogState::Missing) != (viewsState == CatalogState::Missing)) {
+        result.catalogDamage = std::string("__topic_schemas ") + stateText(schemasState) +
+                               ", __views " + stateText(viewsState);
+    }
     std::vector<TopicSpec>& out = result.specs;
     out.reserve(runtime.size());
     std::string placeholders;   // "__orphan.1, __orphan.2" for the single log line

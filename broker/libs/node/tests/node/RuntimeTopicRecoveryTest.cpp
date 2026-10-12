@@ -333,12 +333,14 @@ std::string readMarker(const fs::path& topicDir) {
 struct Boot {
     std::vector<TopicSpec> all;
     std::vector<int32_t>   placeholderIds;
+    std::string            catalogDamage;   // fix round 2b
 };
 Boot recoverBoot(const fs::path& dataDir, std::vector<TopicSpec> statics) {
     Boot b{std::move(statics), {}};
     auto rec = rune::node::recoverRuntimeTopics(dataDir.string(), static_cast<int32_t>(b.all.size()));
     for (auto& t : rec.specs) b.all.push_back(std::move(t));
     b.placeholderIds = std::move(rec.placeholderIds);
+    b.catalogDamage  = std::move(rec.catalogDamage);
     return b;
 }
 // The single segment file of a one-segment catalog log dir.
@@ -433,6 +435,7 @@ TEST(RuntimeTopicRecoveryRegression, FailedCreateOrphanDirIsDeletedEndToEndRegre
         reg.log(1, 0)->append(oneRecordBatch("orphan-data"), 0);
         reg.log(2, 0)->append(oneRecordBatch("kept-data"), 0);
         appendRecords(d.path / "__topic_schemas", {schemaRecord(2, 1, 1, "kept", "kept_desc")});
+        fs::create_directories(d.path / "__views");   // a real broker always has both catalogs
         ASSERT_TRUE(reg.markTopicCommitted(2));   // the admin thread's kA2cTopicCommitted
     }
     // boot 2
@@ -440,7 +443,8 @@ TEST(RuntimeTopicRecoveryRegression, FailedCreateOrphanDirIsDeletedEndToEndRegre
     ASSERT_EQ(b.all.size(), 3u);
     EXPECT_EQ(b.all[1].name, rune::node::orphanPlaceholderName(1));
     EXPECT_EQ(b.placeholderIds, (std::vector<int32_t>{1}));
-    const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow);
+    EXPECT_EQ(b.catalogDamage, "") << "fix round 2b: a healthy catalog still deletes";
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow, b.catalogDamage);
     ASSERT_EQ(r.deleted.size(), 1u);
     EXPECT_EQ(r.deleted[0].filename(), "orphan_v");
     EXPECT_TRUE(r.quarantined.empty());
@@ -486,7 +490,7 @@ TEST(RuntimeTopicRecoveryRegression, CrcTruncatedSchemaCatalogQuarantinesCommitt
     // boot 2: recovery truncates the damaged record -> id 1 is a gap
     const Boot b = recoverBoot(d.path, {spec("src", 0)});
     ASSERT_EQ(b.placeholderIds, (std::vector<int32_t>{1})) << "precondition: the CRC damage made a gap";
-    const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow);
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow, {} /* isolate the two-phase marker guard; 2b damage guard tested separately */);
     EXPECT_TRUE(r.deleted.empty()) << "a COMMITTED topic is never deleted, whatever the catalog says";
     ASSERT_EQ(r.quarantined.size(), 1u);
     const fs::path q = d.path / "quarantine" / ("t1-" + std::to_string(kNow));
@@ -520,7 +524,7 @@ TEST(RuntimeTopicRecoveryRegression, MissingSchemaCatalogWithSurvivingViewsDelet
     fs::remove_all(d.path / "__topic_schemas");
     const Boot b = recoverBoot(d.path, {spec("src", 0)});
     ASSERT_EQ(b.placeholderIds, (std::vector<int32_t>{1, 2}));
-    const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow);
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow, {} /* isolate the two-phase marker guard; 2b damage guard tested separately */);
     EXPECT_TRUE(r.deleted.empty()) << "nothing is deleted on a missing catalog";
     EXPECT_EQ(r.quarantined.size(), 2u);
     for (const char* n : {"t1", "t2"}) {
@@ -552,7 +556,7 @@ TEST(RuntimeTopicRecoveryRegression, BootPromotesAClaimedPendingMarkerSoALaterCa
     {   // boot 2: the catalog claims t1 -> its marker is promoted; nothing else moves
         const Boot b = recoverBoot(d.path, {spec("src", 0)});
         ASSERT_TRUE(b.placeholderIds.empty());
-        const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow);
+        const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow, b.catalogDamage);
         ASSERT_EQ(r.promoted.size(), 1u);
         EXPECT_EQ(r.promoted[0], fs::canonical(d.path / "topics" / "t1"));
         EXPECT_TRUE(r.deleted.empty());
@@ -565,7 +569,7 @@ TEST(RuntimeTopicRecoveryRegression, BootPromotesAClaimedPendingMarkerSoALaterCa
     {   // boot 3: id 1 is a placeholder; t1's dir is QUARANTINED, never deleted
         const Boot b = recoverBoot(d.path, {spec("src", 0)});
         ASSERT_EQ(b.placeholderIds, (std::vector<int32_t>{1}));
-        const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow + 1);
+        const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow + 1, {} /* isolate the promotion guard; 2b tested separately */);
         EXPECT_TRUE(r.deleted.empty()) << "a promoted (committed) topic is never deleted";
         ASSERT_EQ(r.quarantined.size(), 1u);
         const fs::path q = d.path / "quarantine" / ("t1-" + std::to_string(kNow + 1));
@@ -740,6 +744,103 @@ TEST(RuntimeTopicRecoveryRegression, UncreatableQuarantineLeavesDataInPlaceRegre
     EXPECT_EQ(readAll(d.path / "topics" / "gone" / "0" / "seg.log"), "kept");
 }
 
+// ── Fix round 2b: a damaged catalog disables every delete ────────────────────
+namespace {
+// boot 1 of the 2b scenarios: static "src" (0); runtime "orphan_o" (1, PENDING —
+// its record never committed); "t2" (2, committed); view sink "v3" (3, committed).
+void bootOneWithAnOrphan(const fs::path& dataDir) {
+    rune::gateway::TopicRegistry reg({spec("src", 0)}, dataDir.string());
+    ASSERT_EQ(reg.createTopic(spec("orphan_o", -1)), 1);
+    ASSERT_EQ(reg.createTopic(spec("t2", -1)), 2);
+    ASSERT_EQ(reg.createTopic(spec("v3", -1)), 3);
+    reg.log(1, 0)->append(oneRecordBatch("orphan-bytes"), 0);
+    reg.log(2, 0)->append(oneRecordBatch("acked-t2"), 0);
+    appendRecords(dataDir / "__topic_schemas", {schemaRecord(2, 1, 1, "t2", "d2")});
+    appendRecords(dataDir / "__views", {viewRecord(3, "v3", /*source*/ 0)});
+    ASSERT_TRUE(reg.markTopicCommitted(2));
+    ASSERT_TRUE(reg.markTopicCommitted(3));
+}
+void flipByteNearEnd(const fs::path& seg) {
+    std::fstream f(seg, std::ios::in | std::ios::out | std::ios::binary);
+    f.seekg(0, std::ios::end);
+    const auto size = static_cast<std::streamoff>(f.tellg());
+    f.seekg(size - 8);
+    char c = 0;
+    f.read(&c, 1);
+    c = static_cast<char>(c ^ 0x5a);
+    f.seekp(size - 8);
+    f.write(&c, 1);
+}
+} // namespace
+
+// Healthy catalogs: the pending orphan is deleted exactly as before (2b changes nothing).
+TEST(RuntimeTopicRecoveryRegression, HealthyCatalogStillDeletesThePendingOrphanRegression) {
+    TempDataDir d("2b-healthy");
+    bootOneWithAnOrphan(d.path);
+    const Boot b = recoverBoot(d.path, {spec("src", 0)});
+    ASSERT_EQ(b.placeholderIds, (std::vector<int32_t>{1}));
+    EXPECT_EQ(b.catalogDamage, "");
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow, b.catalogDamage);
+    ASSERT_EQ(r.deleted.size(), 1u);
+    EXPECT_EQ(r.deleted[0].filename(), "orphan_o");
+    EXPECT_TRUE(r.quarantined.empty());
+}
+
+// A catalog cut by recovery (CRC mismatch): even the genuinely PENDING orphan is
+// quarantined, not deleted — and so is the committed topic whose record was cut.
+TEST(RuntimeTopicRecoveryRegression, TruncatedCatalogDeletesNothingRegression) {
+    TempDataDir d("2b-truncated");
+    bootOneWithAnOrphan(d.path);
+    flipByteNearEnd(onlySegment(d.path / "__topic_schemas"));
+    const Boot b = recoverBoot(d.path, {spec("src", 0)});
+    ASSERT_EQ(b.placeholderIds, (std::vector<int32_t>{1, 2}));
+    EXPECT_NE(b.catalogDamage.find("__topic_schemas truncated by recovery"), std::string::npos)
+        << b.catalogDamage;
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow, b.catalogDamage);
+    EXPECT_TRUE(r.deleted.empty()) << "no deletes on a damaged catalog";
+    EXPECT_EQ(r.quarantined.size(), 2u);
+    for (const char* n : {"orphan_o", "t2"})
+        EXPECT_TRUE(fs::exists(d.path / "quarantine" / (std::string(n) + "-" + std::to_string(kNow)) / "0")) << n;
+    EXPECT_TRUE(fs::exists(d.path / "topics" / "v3" / "0"));
+}
+
+// One catalog MISSING while the other exists (a partial restore): same outcome.
+TEST(RuntimeTopicRecoveryRegression, MissingCatalogDeletesNothingRegression) {
+    TempDataDir d("2b-missing");
+    bootOneWithAnOrphan(d.path);
+    fs::remove_all(d.path / "__topic_schemas");
+    const Boot b = recoverBoot(d.path, {spec("src", 0)});
+    ASSERT_EQ(b.placeholderIds, (std::vector<int32_t>{1, 2}));
+    EXPECT_NE(b.catalogDamage.find("__topic_schemas missing"), std::string::npos) << b.catalogDamage;
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow, b.catalogDamage);
+    EXPECT_TRUE(r.deleted.empty());
+    EXPECT_EQ(r.quarantined.size(), 2u);
+    EXPECT_TRUE(fs::exists(d.path / "quarantine" / ("orphan_o-" + std::to_string(kNow)) / "0"));
+}
+
+// The damage flag also covers __views (cut, or missing while __topic_schemas exists),
+// and both catalogs missing (a fresh data dir) is NOT damage.
+TEST(RuntimeTopicRecoveryRegression, CatalogDamageCoversBothCatalogsRegression) {
+    {
+        TempDataDir d("2b-views-cut");
+        bootOneWithAnOrphan(d.path);
+        flipByteNearEnd(onlySegment(d.path / "__views"));
+        EXPECT_NE(recoverBoot(d.path, {spec("src", 0)}).catalogDamage.find("__views truncated by recovery"),
+                  std::string::npos);
+    }
+    {
+        TempDataDir d("2b-views-missing");
+        bootOneWithAnOrphan(d.path);
+        fs::remove_all(d.path / "__views");
+        EXPECT_NE(recoverBoot(d.path, {spec("src", 0)}).catalogDamage.find("__views missing"),
+                  std::string::npos);
+    }
+    {
+        TempDataDir d("2b-fresh");
+        EXPECT_EQ(recoverBoot(d.path, {spec("src", 0)}).catalogDamage, "");
+    }
+}
+
 // Fix round 1, I2: a placeholder is what RECOVERY created, never a name.  A STATIC
 // topic literally named "__orphan.1" (names are unvalidated until Task 5a) next to a
 // runtime topic with marker id 1 that is no longer claimed: nothing is deleted —
@@ -752,6 +853,7 @@ TEST(RuntimeTopicRecoveryRegression, StaticTopicNamedLikeAPlaceholderNeverArmsAD
         ASSERT_EQ(reg.createTopic(spec("x", -1)), 1);
         reg.log(1, 0)->append(oneRecordBatch("x-data"), 0);
         appendRecords(d.path / "__topic_schemas", {schemaRecord(1, 1, 1, "x", "x_desc")});
+        fs::create_directories(d.path / "__views");   // healthy: both catalogs present
         ASSERT_TRUE(reg.markTopicCommitted(1));
     }
     // a second unclaimed dir whose marker is still PENDING id 1 (the stronger case)
@@ -760,7 +862,8 @@ TEST(RuntimeTopicRecoveryRegression, StaticTopicNamedLikeAPlaceholderNeverArmsAD
     // boot 2: RUNE_TOPICS=a,__orphan.1 -> firstRuntimeId 2: x's record is skipped
     const Boot b = recoverBoot(d.path, {spec("a", 0), spec(rune::node::orphanPlaceholderName(1), 1)});
     ASSERT_TRUE(b.placeholderIds.empty()) << "recovery created no placeholder";
-    const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow);
+    ASSERT_EQ(b.catalogDamage, "") << "precondition: a healthy catalog (deletes enabled)";
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow, b.catalogDamage);
     EXPECT_TRUE(r.deleted.empty()) << "a static name spelling __orphan.<id> never arms a delete";
     EXPECT_EQ(r.quarantined.size(), 2u);
     EXPECT_TRUE(fs::exists(d.path / "quarantine" / ("x-" + std::to_string(kNow)) / "0"));
@@ -777,13 +880,15 @@ TEST(RuntimeTopicRecoveryRegression, RemovedLastStaticTopicWithRuntimeTopicsIsQu
         ASSERT_EQ(reg.createTopic(spec("c", -1)), 2);
         reg.log(1, 0)->append(oneRecordBatch("static-b-data"), 0);
         appendRecords(d.path / "__topic_schemas", {schemaRecord(2, 1, 1, "c", "c_desc")});
+        fs::create_directories(d.path / "__views");   // healthy: both catalogs present
         ASSERT_TRUE(reg.markTopicCommitted(2));
     }
     // boot 2: RUNE_TOPICS=a -> firstRuntimeId 1, id 1 is now a gap
     const Boot b = recoverBoot(d.path, {spec("a", 0)});
     ASSERT_EQ(b.all.size(), 3u);
     ASSERT_EQ(b.placeholderIds, (std::vector<int32_t>{1}));
-    const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow);
+    ASSERT_EQ(b.catalogDamage, "") << "precondition: a healthy catalog (deletes enabled)";
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow, b.catalogDamage);
     EXPECT_TRUE(r.deleted.empty()) << "a removed STATIC topic is never deleted";
     ASSERT_EQ(r.quarantined.size(), 1u);
     EXPECT_TRUE(fs::exists(d.path / "quarantine" / ("b-" + std::to_string(kNow)) / "0"));

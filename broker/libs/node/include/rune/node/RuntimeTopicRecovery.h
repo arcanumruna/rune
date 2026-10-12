@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace rune::node {
@@ -65,6 +66,11 @@ struct RecoveredRuntimeTopics {
     /// the ONLY source of truth for "is a placeholder" (B10 fix round 1, I2): never
     /// infer it from a name — a static RUNE_TOPICS name may spell "__orphan.<id>".
     std::vector<int32_t>   placeholderIds;
+    /// Fix round 2b: non-empty (the reason) when a catalog log was cut by
+    /// Log::recover() (CRC / torn tail / chain gap) or exactly one of the two
+    /// catalogs is missing — a gap may then be a LOST committed record, so
+    /// reconcileTopicDirs must delete nothing (pass it through).
+    std::string            catalogDamage;
 };
 [[nodiscard]] RecoveredRuntimeTopics recoverRuntimeTopics(const std::string& dataDir,
                                                           int32_t firstRuntimeId);
@@ -98,6 +104,8 @@ struct TopicDirReconciliation {
 ///     marker (its record committed, so an unclaimed one means CATALOG DAMAGE —
 ///     a CRC-truncated or missing catalog; logged at error), any other id, and
 ///     an unreadable or malformed marker.
+/// Fix round 2b: a non-empty `catalogDamage` (RecoveredRuntimeTopics) disables
+/// EVERY delete this boot — placeholder dirs are quarantined, with one warn line.
 /// FIRST (fix round 1b), before any delete decision: every catalog-claimed runtime
 /// topic dir (exact name, non-placeholder) whose marker reads "pending <its id>" is
 /// rewritten "committed <id>" (atomic) — a crash between the record's commit and
@@ -109,6 +117,7 @@ struct TopicDirReconciliation {
 /// after the recovered specs are appended and BEFORE the TopicRegistry opens logs.
 [[nodiscard]] TopicDirReconciliation
 reconcileTopicDirs(const std::string& dataDir, const std::vector<TopicSpec>& topics,
-                   const std::vector<int32_t>& placeholderIds, int64_t nowUnixSeconds);
+                   const std::vector<int32_t>& placeholderIds, int64_t nowUnixSeconds,
+                   std::string_view catalogDamage = {});
 
 } // namespace rune::node

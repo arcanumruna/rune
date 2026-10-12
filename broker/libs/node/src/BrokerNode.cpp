@@ -395,7 +395,8 @@ void BrokerNode::start() {
         // unclaimed topic dir (never delete it) — BEFORE the TopicRegistry opens logs.
         (void)reconcileTopicDirs(config_.dataDir, config_.topics, recoveredTopics.placeholderIds,
                                  std::chrono::duration_cast<std::chrono::seconds>(
-                                     std::chrono::system_clock::now().time_since_epoch()).count());
+                                     std::chrono::system_clock::now().time_since_epoch()).count(),
+                                 recoveredTopics.catalogDamage);   // fix round 2b: damaged -> no deletes
     }
 
     // 2. Build the TopicRegistry (after dataDir creation, before the gateway).

@@ -26,6 +26,7 @@
 //   - Full client ↔ broker DDL round-trip (requires ClientGateway + Aeron).
 // ---------------------------------------------------------------------------
 
+#include <unistd.h>
 #include <gtest/gtest.h>
 
 #include <rune/node/AdminWorker.h>
@@ -65,7 +66,9 @@ using namespace rune::replication;
 static std::string makeUniqSuffix() {
     static std::atomic<uint64_t> seq{0};
     const auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
-    return std::to_string(seq.fetch_add(1, std::memory_order_relaxed)) + "_" +
+    // The pid keeps ctest -j parallel PROCESSES apart (each starts seq at 0 and the
+    // clock can tick identically in two of them; a shared dir was removed under a peer).
+    return std::to_string(::getpid()) + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed)) + "_" +
            std::to_string(ts);
 }
 
