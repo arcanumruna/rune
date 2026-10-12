@@ -546,7 +546,8 @@ if(BUILD_TESTING)
     # ---------------------------------------------------------------------------
     add_executable(rune_ddl_conformance_tests
         tests/node/DdlHarnessRegressionTest.cpp
-        tests/node/DdlOccupantMatrixRegressionTest.cpp)
+        tests/node/DdlOccupantMatrixRegressionTest.cpp
+        tests/node/DdlPairTimingMatrixRegressionTest.cpp)
     target_include_directories(rune_ddl_conformance_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests)
