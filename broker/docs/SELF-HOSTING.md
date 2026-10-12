@@ -67,6 +67,8 @@ before a produce is acknowledged but is **never written to disk**.
 - Its *data* does not: a restarted node rejoins with the topic empty; after a **full-cluster**
   restart the topic is empty. Offsets restart from 0.
 - Persistence is fixed at definition: `alter topic` cannot change it.
+- An explicit `transient topic X` over an existing disk `RUNE_TOPICS` topic `X` answers
+  `TopicExists` (error 25); the topic stays a disk topic.
 - Changing a `RUNE_TOPICS` topic's `persistence=` between restarts is unsupported: the schema and
   view checks keep the mode recorded when the topic was defined.
 - A view that reads from a transient topic must itself be transient. `Client::createView(...,

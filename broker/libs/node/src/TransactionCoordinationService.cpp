@@ -23,6 +23,7 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/node/TransactionCoordinationService.h>
+#include <rune/gateway/RequestRejection.h>
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 
@@ -295,7 +296,11 @@ size_t TransactionCoordinationService::handleInitProducerId(
     uint8_t* out, size_t outCap)
 {
     auto msgOpt = pc::InitProducerId::decode(buf, len);
-    if (!msgOpt) return 0;
+    if (!msgOpt) {
+        // No-hang (R2): answered InitProducerIdResponse{InvalidRequest}, never dropped.
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
+    }
     const auto& msg = *msgOpt;
 
     // Build response shell (sessionId/correlationId always echoed).
@@ -365,7 +370,11 @@ size_t TransactionCoordinationService::handleAddPartitions(
     uint8_t* out, size_t outCap)
 {
     auto msgOpt = pc::AddPartitionsToTxn::decode(buf, len);
-    if (!msgOpt) return 0;
+    if (!msgOpt) {
+        // No-hang (R2): answered AddPartitionsToTxnResponse{InvalidRequest}, never dropped.
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
+    }
     const auto& msg = *msgOpt;
 
     // NotCoordinator fence — build minimal response (F15 §5.1: only while Loaded).
@@ -465,7 +474,11 @@ size_t TransactionCoordinationService::handleAddOffsets(
     uint8_t* out, size_t outCap)
 {
     auto msgOpt = pc::AddOffsetsToTxn::decode(buf, len);
-    if (!msgOpt) return 0;
+    if (!msgOpt) {
+        // No-hang (R2): answered AddOffsetsToTxnResponse{InvalidRequest}, never dropped.
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
+    }
     const auto& msg = *msgOpt;
 
     pc::AddOffsetsToTxnResponse resp;
@@ -518,7 +531,11 @@ size_t TransactionCoordinationService::handleTxnOffsetCommit(
     uint8_t* out, size_t outCap)
 {
     auto msgOpt = pc::TxnOffsetCommit::decode(buf, len);
-    if (!msgOpt) return 0;
+    if (!msgOpt) {
+        // No-hang (R2): answered TxnOffsetCommitResponse{InvalidRequest}, never dropped.
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
+    }
     const auto& msg = *msgOpt;
 
     // NotCoordinator fence — encode all entries with NotCoordinator using
@@ -611,7 +628,11 @@ size_t TransactionCoordinationService::handleEndTxn(
     uint8_t* out, size_t outCap)
 {
     auto msgOpt = pc::EndTxn::decode(buf, len);
-    if (!msgOpt) return 0;
+    if (!msgOpt) {
+        // No-hang (R2): answered EndTxnResponse{InvalidRequest}, never dropped.
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
+    }
     const auto& msg = *msgOpt;
 
     pc::EndTxnResponse resp;

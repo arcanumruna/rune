@@ -113,5 +113,87 @@ TEST(CoordinatorRedirectRegression, LeaderAndUnknownEndpointReachTheServiceRegre
     EXPECT_EQ(electing.gw.coordinatorRedirectsForTest(), 0u);
 }
 
+
+// No-hang wave (R2): every group / txn request with a decodable header on a
+// known session gets an answer of its own response type.
+TEST(CoordinatorRedirectRegression, GroupRequestWithoutAGroupServiceIsAnsweredInternalRegression) {
+    Rig r(LeaderView{/*isLeader=*/true, ""});
+    r.gw.setGroupService(nullptr);
+    r.joinGroup(41);
+    std::optional<pc::JoinGroupResponse> resp;
+    for (auto it = r.out.rbegin(); it != r.out.rend() && !resp; ++it)
+        resp = pc::JoinGroupResponse::decode(it->data(), it->size());
+    ASSERT_TRUE(resp.has_value()) << "JoinGroup dropped when no group service is wired";
+    EXPECT_EQ(resp->correlationId, 41);
+    EXPECT_EQ(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::Internal));
+}
+
+TEST(CoordinatorRedirectRegression, GroupServiceThatCannotAnswerIsAnsweredInternalRegression) {
+    Rig r(LeaderView{/*isLeader=*/true, ""});   // CountingGroup answers nothing (returns 0)
+    r.joinGroup(42);
+    EXPECT_EQ(r.group.calls, 1);
+    std::optional<pc::JoinGroupResponse> resp;
+    for (auto it = r.out.rbegin(); it != r.out.rend() && !resp; ++it)
+        resp = pc::JoinGroupResponse::decode(it->data(), it->size());
+    ASSERT_TRUE(resp.has_value()) << "a group request the service produced no answer for was dropped";
+    EXPECT_EQ(resp->correlationId, 42);
+    EXPECT_EQ(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::Internal));
+}
+
+TEST(CoordinatorRedirectRegression, TxnRequestWithoutATxnServiceIsAnsweredInternalRegression) {
+    Rig r(LeaderView{/*isLeader=*/true, ""});
+    r.gw.setTxnService(nullptr);
+    r.endTxn(43);
+    std::optional<pc::EndTxnResponse> resp;
+    for (auto it = r.out.rbegin(); it != r.out.rend() && !resp; ++it)
+        resp = pc::EndTxnResponse::decode(it->data(), it->size());
+    ASSERT_TRUE(resp.has_value()) << "EndTxn dropped when no txn service is wired";
+    EXPECT_EQ(resp->correlationId, 43);
+    EXPECT_EQ(resp->errorCode, static_cast<int16_t>(pc::ErrorCode::Internal));
+}
+
+// A txn handler returning 0 DEFERS its answer (EndTxn waits for its markers) —
+// the gateway must not answer for it.
+TEST(CoordinatorRedirectRegression, DeferredTxnAnswerIsNotPreemptedRegression) {
+    Rig r(LeaderView{/*isLeader=*/true, ""});
+    r.endTxn(44);
+    EXPECT_EQ(r.txn.calls, 1);
+    for (const auto& f : r.out) EXPECT_FALSE(pc::EndTxnResponse::decode(f.data(), f.size()).has_value());
+}
+
+
+// A coordinator's answer (here: the follower's NotCoordinator redirect) rides
+// the reliable egress — back-pressured, it is queued + retried, never dropped.
+TEST(CoordinatorRedirectRegression, CoordinatorAnswerIsQueuedUnderBackpressureRegression) {
+    int backpressure = 1;
+    std::vector<std::vector<uint8_t>> out;
+    ClientGateway gw = ClientGateway::makeForTestWithLeaderView(
+        [&](const uint8_t* b, std::size_t n) -> int64_t {
+            if (backpressure > 0) { --backpressure; return -2; }
+            out.emplace_back(b, b + n);
+            return 1;
+        },
+        [] { return LeaderView{/*isLeader=*/false, "rune-1:40200"}; });
+    gw.setReliableEgressForTest(true);
+    CountingGroup group;
+    gw.setGroupService(&group);
+    const int64_t sid = gw.injectTestSession();
+    const std::string g = "g1";
+    pc::JoinGroup q; q.sessionId = sid; q.correlationId = 45; q.sessionTimeoutMs = 10'000;
+    q.groupId = {reinterpret_cast<const uint8_t*>(g.data()), g.size()};
+    const int32_t topics[1] = {2};
+    std::vector<uint8_t> f(pc::JoinGroup::encodedSizeFor(q.groupId, q.memberId, 1));
+    q.encode(f.data(), std::span<const int32_t>(topics, 1));
+    gw.applyGroupForTest(f.data(), f.size(), pc::JoinGroup::TEMPLATE_ID);
+    EXPECT_TRUE(out.empty());
+    ASSERT_EQ(gw.pendingResponseCount(), 1u) << "a back-pressured coordinator answer was dropped";
+    gw.drainPendingResponses(1);
+    ASSERT_EQ(out.size(), 1u);
+    const auto e = pc::ErrorResponse::decode(out[0].data(), out[0].size());
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->correlationId, 45);
+    EXPECT_EQ(e->code, static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+}
+
 } // namespace
 } // namespace rune::gateway

@@ -33,6 +33,7 @@
 #include <rune/node/AdminWorker.h>
 #include <rune/node/AdminChannels.h>
 #include <rune/node/AdminCreateTopic.h>
+#include <rune/node/BrokerNode.h>   // AdminWorkerAgent (no-hang R2 egress backlog)
 #include <rune/node/SchemaRegistry.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/replication/PartitionReplica.h>
@@ -1136,4 +1137,151 @@ TEST(SchemaGatewayRegression, DdlDoesNotBlockProduce) {
     // Draining it now should surface exactly the queued DefineTopic.
     int drained = h.serviceAdminIngress();
     EXPECT_EQ(drained, 1) << "the stalled DefineTopic was still queued on the admin ring";
+}
+
+// ===========================================================================
+// No-hang wave (R2): every DDL request with a decodable header on a known
+// session is answered (its own response type + InvalidSchema / Internal) —
+// never dropped while the client waits out its timeout.
+// ===========================================================================
+namespace {
+std::vector<uint8_t> ddlHeaderOnly(pc::TemplateId tid, int64_t corr) {
+    pc::MessageHeader h;
+    h.blockLength = 32; h.templateId = static_cast<uint16_t>(tid);
+    h.sessionId = 1; h.correlationId = corr;
+    std::vector<uint8_t> f(pc::MessageHeader::ENCODED_SIZE);
+    h.encode(f.data());
+    return f;
+}
+} // namespace
+
+TEST(SchemaGatewayRegression, MalformedGetTopicSchemaIsAnsweredInvalidSchemaRegression) {
+    SgHarness h;
+    const auto f = ddlHeaderOnly(pc::TemplateId::GetTopicSchema, 91);
+    ASSERT_FALSE(pc::GetTopicSchema::decode(f.data(), f.size()).has_value());
+    h.gw.applyGetTopicSchemaForTest(f.data(), f.size());
+    h.pump();
+    const auto r = firstFrame<pc::TopicSchemaResponse>(h);
+    ASSERT_TRUE(r.has_value()) << "a malformed GetTopicSchema must get a response";
+    EXPECT_EQ(r->correlationId, 91);
+    EXPECT_EQ(r->errorCode, 23u) << "InvalidSchema";
+}
+
+TEST(SchemaGatewayRegression, MalformedAlterTopicIsAnsweredInvalidSchemaRegression) {
+    SgHarness h;
+    const auto f = ddlHeaderOnly(pc::TemplateId::AlterTopic, 92);
+    ASSERT_FALSE(pc::AlterTopic::decode(f.data(), f.size()).has_value());
+    h.gw.applyAlterTopicForTest(f.data(), f.size());
+    h.pump();
+    const auto r = firstFrame<pc::AlterTopicResponse>(h);
+    ASSERT_TRUE(r.has_value()) << "a malformed AlterTopic must get a response";
+    EXPECT_EQ(r->correlationId, 92);
+    EXPECT_EQ(r->errorCode, 23u) << "InvalidSchema";
+}
+
+// The finding's original case: a CreateView whose persistence byte is unknown
+// fails CreateView::decode — answered, not dropped.
+TEST(SchemaGatewayRegression, MalformedCreateViewIsAnsweredInvalidSchemaRegression) {
+    SgHarness h;
+    pc::CreateView cv;
+    cv.sessionId = 1; cv.correlationId = 93; cv.viewName = "v"; cv.keyField = "id";
+    cv.persistence = 1;
+    const std::vector<uint8_t> plan = {1, 2, 3};
+    cv.planBlob = plan.data(); cv.planLen = static_cast<uint32_t>(plan.size());
+    std::vector<uint8_t> f(cv.encodedSize());
+    cv.encode(f.data());
+    bool patched = false;
+    for (std::size_t i = pc::MessageHeader::ENCODED_SIZE; i < f.size(); ++i) {
+        std::vector<uint8_t> g = f; g[i] = 2;
+        if (!pc::CreateView::decode(g.data(), g.size()).has_value()) { f = g; patched = true; break; }
+    }
+    ASSERT_TRUE(patched) << "could not locate the persistence byte";
+    h.gw.applyCreateViewForTest(f.data(), f.size());
+    h.pump();
+    const auto r = firstFrame<pc::CreateViewResponse>(h);
+    ASSERT_TRUE(r.has_value()) << "a malformed CreateView must get a response";
+    EXPECT_EQ(r->correlationId, 93);
+    EXPECT_EQ(r->errorCode, 23u) << "InvalidSchema";
+}
+
+// The gateway→admin request ring is full: the DDL is answered Internal at once
+// (it used to be dropped — `(void)adminSink_->submit...`).
+TEST(SchemaGatewayRegression, DdlOnAFullAdminRingIsAnsweredInternalRegression) {
+    SgHarness h;
+    const std::vector<uint8_t> big(4096, 0xAB);   // fills the ring in a few hundred frames
+    int64_t corr = 1;
+    std::optional<pc::DefineTopicResponse> r;
+    for (; corr < 100'000 && !r; ++corr) {
+        const auto def = encodeDefineFrame(1, corr, "t" + std::to_string(corr), 1, "", false, big);
+        h.gw.applyDefineTopicForTest(def.data(), def.size());   // nobody drains requestRing
+        r = firstFrame<pc::DefineTopicResponse>(h);
+    }
+    ASSERT_TRUE(r.has_value()) << "a DefineTopic refused by a full admin ring was dropped";
+    EXPECT_EQ(r->correlationId, corr - 1);
+    EXPECT_EQ(r->errorCode, static_cast<uint16_t>(pc::ErrorCode::Internal));
+}
+
+TEST(SchemaGatewayRegression, DdlWithoutAnAdminSinkIsAnsweredInternalRegression) {
+    SgHarness h;
+    h.gw.setAdminSink(nullptr);
+    const auto def = encodeDefineFrame(1, 94, "orders", 1, "", false, charsBlob());
+    h.gw.applyDefineTopicForTest(def.data(), def.size());
+    const auto r = firstFrame<pc::DefineTopicResponse>(h);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->correlationId, 94);
+    EXPECT_EQ(r->errorCode, static_cast<uint16_t>(pc::ErrorCode::Internal));
+}
+
+// R1: the control-thread create never defaults an unknown mode byte to Disk —
+// it refuses the create (topicId -1 → the admin thread answers Internal).
+TEST(SchemaGatewayRegression, CreateTopicForAdminRefusesUnknownPersistenceRegression) {
+    const std::string dir = uniqDir("ctp");
+    rune::gateway::TopicRegistry reg(std::vector<rune::node::TopicSpec>{}, dir);
+    CreateTopicReqMsg req; req.ticket = 7; req.partitionCount = 2; req.name = "orders";
+    req.persistence = 2;
+    const CreateTopicReplyMsg r = createTopicForAdmin(reg, req);
+    EXPECT_EQ(r.ticket, 7);
+    EXPECT_EQ(r.topicId, -1);
+    EXPECT_FALSE(r.existed);
+    EXPECT_FALSE(reg.topicIdForName("orders").has_value()) << "nothing created";
+}
+
+// The admin→control egress ring is full: a DDL answer goes to the admin-owned
+// FIFO backlog and is delivered once the control thread drains — the respond*
+// callbacks used to `return` on a failed tryClaim (answer lost, client hung).
+TEST(SchemaGatewayRegression, DdlAnswerOnAFullEgressRingIsBackloggedNotDroppedRegression) {
+    SchemaRegistry sreg;
+    rune::node::AdminWorkerAgent agent(sreg, /*replica=*/nullptr, /*selfId=*/1, {1},
+                                       rune::node::AdminDeps{});
+    pc::DefineTopicResponse resp;
+    resp.sessionId = 1; resp.topicId = 3; resp.version = 1;
+    uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::DefineTopicResponse::BODY_FIXED];
+    int64_t posted = 0;
+    while (agent.egressBacklogForTest() == 0 && posted < 1'000'000) {
+        resp.correlationId = ++posted;
+        agent.postEgressFrame(1, frame, resp.encode(frame));
+    }
+    ASSERT_EQ(agent.egressBacklogForTest(), 1u) << "the ring never filled";
+    for (int extra = 0; extra < 3; ++extra) {   // FIFO behind the backlog, even if the ring has room
+        resp.correlationId = ++posted;
+        agent.postEgressFrame(1, frame, resp.encode(frame));
+    }
+    int64_t expect = 1;
+    auto drain = [&] {
+        agent.egressRing().drain([&](int32_t, aeron::concurrent::AtomicBuffer& b,
+                                     aeron::util::index_t off, aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            const auto r = pc::DefineTopicResponse::decode(p + 8, static_cast<std::size_t>(len) - 8);
+            ASSERT_TRUE(r.has_value());
+            EXPECT_EQ(r->correlationId, expect) << "answers out of order";
+            ++expect;
+        }, 1 << 20);
+    };
+    for (int round = 0; round < 64 && expect <= posted; ++round) {
+        drain();
+        (void)agent.flushEgressBacklogForTest();
+    }
+    drain();
+    EXPECT_EQ(expect, posted + 1) << "every DDL answer delivered exactly once";
+    EXPECT_EQ(agent.egressBacklogForTest(), 0u);
 }

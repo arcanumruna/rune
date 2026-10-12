@@ -299,3 +299,110 @@ TEST(SubscribeDedupeRegression, CarrierAfterAStalePlainEntryReachesTheGroupSubsc
     ASSERT_EQ(r.responses.size(), 2u);
     EXPECT_EQ(r.responses[1].subscriptionId, gsub) << "the carrier was swallowed by the stale plain entry";
 }
+
+// ===========================================================================
+// No-hang wave (R2): a Subscribe / GetViewRow whose header decodes on a known
+// session is answered with its own response type + error — never dropped.
+// ===========================================================================
+namespace {
+std::vector<uint8_t> headerOnly(pc::TemplateId tid, int64_t sid, int64_t corr, uint16_t blockLength) {
+    pc::MessageHeader h;
+    h.blockLength = blockLength; h.templateId = static_cast<uint16_t>(tid);
+    h.sessionId = sid; h.correlationId = corr;
+    std::vector<uint8_t> f(pc::MessageHeader::ENCODED_SIZE);
+    h.encode(f.data());
+    return f;
+}
+std::vector<uint8_t> getViewRowFrame(int64_t sid, int64_t corr, int32_t viewTopicId, uint64_t key) {
+    pc::GetViewRow g;
+    g.sessionId = sid; g.correlationId = corr; g.viewTopicId = viewTopicId; g.keyU64 = key;
+    std::vector<uint8_t> f(128);
+    f.resize(g.encode(f.data()));
+    return f;
+}
+} // namespace
+
+TEST(SubscribeDedupeRegression, MalformedSubscribeIsAnsweredInvalidRequestRegression) {
+    Rig r(/*workers=*/false);
+    const int64_t sid = r.gw.injectTestSession(0);
+    const auto f = headerOnly(pc::TemplateId::Subscribe, sid, 6060, pc::Subscribe::BODY_FIXED);
+    ASSERT_FALSE(pc::Subscribe::decode(f.data(), f.size()).has_value());
+    r.gw.applySubscribeForTest(f.data(), f.size());
+    ASSERT_EQ(r.responses.size(), 1u) << "an undecodable Subscribe must be answered";
+    EXPECT_EQ(r.responses[0].correlationId, 6060);
+    EXPECT_EQ(r.responses[0].errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(r.responses[0].subscriptionId, 0);
+    EXPECT_EQ(r.gw.subscriptionCount(), 0u);
+}
+
+// isolation is a two-valued wire byte: 2 used to read as read_uncommitted.
+TEST(SubscribeDedupeRegression, SubscribeUnknownIsolationByteIsAnsweredInvalidRequestRegression) {
+    Rig r(/*workers=*/false);
+    const int64_t sid = r.gw.injectTestSession(0);
+    auto f = subscribeFrame(sid, 6061, 0, 0);
+    f[pc::MessageHeader::ENCODED_SIZE + 17] = 2;   // the isolation byte
+    r.gw.applySubscribeForTest(f.data(), f.size());
+    ASSERT_EQ(r.responses.size(), 1u);
+    EXPECT_EQ(r.responses[0].correlationId, 6061);
+    EXPECT_EQ(r.responses[0].errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(r.gw.subscriptionCount(), 0u) << "nothing registered for a rejected Subscribe";
+}
+
+// Unsubscribe has no response type (nothing waits on it): an undecodable one is
+// counted as unanswerable (warned), never answered with a foreign type.
+TEST(SubscribeDedupeRegression, MalformedUnsubscribeIsCountedUnanswerableRegression) {
+    Rig r(/*workers=*/false);
+    const int64_t sid = r.gw.injectTestSession(0);
+    const auto f = headerOnly(pc::TemplateId::Unsubscribe, sid, 1, 8);
+    r.gw.applyUnsubscribeForTest(f.data(), f.size());
+    EXPECT_TRUE(r.responses.empty());
+    EXPECT_EQ(r.gw.unanswerableFramesForTest(), 1u);
+}
+
+TEST(SubscribeDedupeRegression, MalformedGetViewRowIsAnsweredInvalidRequestStatusRegression) {
+    Rig r(/*workers=*/true);
+    std::vector<pc::ViewRowResponse> rows;
+    r.gw.setOnEgressFrame([&](int64_t, const uint8_t* b, std::size_t n) {
+        if (auto v = pc::ViewRowResponse::decode(b, n)) rows.push_back(*v);
+    });
+    const int64_t sid = r.gw.injectTestSession(0);
+    const auto f = headerOnly(pc::TemplateId::GetViewRow, sid, 7070, 20);
+    ASSERT_FALSE(pc::GetViewRow::decode(f.data(), f.size()).has_value());
+    r.gw.applyGetViewRowForTest(f.data(), f.size());
+    ASSERT_EQ(rows.size(), 1u) << "an undecodable GetViewRow must be answered";
+    EXPECT_EQ(rows[0].correlationId, 7070);
+    EXPECT_EQ(rows[0].status, pc::ViewRowResponse::kInvalidRequest);
+}
+
+TEST(SubscribeDedupeRegression, GetViewRowWithoutWorkersIsAnsweredNotReadyRegression) {
+    Rig r(/*workers=*/false);
+    std::vector<pc::ViewRowResponse> rows;
+    r.gw.setOnEgressFrame([&](int64_t, const uint8_t* b, std::size_t n) {
+        if (auto v = pc::ViewRowResponse::decode(b, n)) rows.push_back(*v);
+    });
+    const int64_t sid = r.gw.injectTestSession(0);
+    const auto f = getViewRowFrame(sid, 7071, 0, 1);
+    r.gw.applyGetViewRowForTest(f.data(), f.size());
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0].correlationId, 7071);
+    EXPECT_EQ(rows[0].status, pc::ViewRowResponse::kNotReady);
+}
+
+// The owning worker's op ring is full: the read is answered Busy (retriable),
+// never dropped (it used to be logged at debug and the client timed out).
+TEST(SubscribeDedupeRegression, GetViewRowOnAFullWorkerRingIsAnsweredBusyRegression) {
+    Rig r(/*workers=*/true, /*ringBytes=*/1 << 12);
+    std::vector<pc::ViewRowResponse> rows;
+    r.gw.setOnEgressFrame([&](int64_t, const uint8_t* b, std::size_t n) {
+        if (auto v = pc::ViewRowResponse::decode(b, n)) rows.push_back(*v);
+    });
+    const int64_t sid = r.gw.injectTestSession(0);
+    int64_t corr = 1;
+    for (; corr < 10'000 && rows.empty(); ++corr) {
+        const auto f = getViewRowFrame(sid, corr, 0, static_cast<uint64_t>(corr));
+        r.gw.applyGetViewRowForTest(f.data(), f.size());   // the worker never drains: the ring fills
+    }
+    ASSERT_EQ(rows.size(), 1u) << "a GetViewRow refused by a full worker ring was dropped";
+    EXPECT_EQ(rows[0].correlationId, corr - 1);
+    EXPECT_EQ(rows[0].status, pc::ViewRowResponse::kBusy);
+}

@@ -547,3 +547,45 @@ TEST(TransactionCoordinationServiceRegression, PushedLeadershipNeverCallsTheLead
     EXPECT_FALSE(svc.isLocalCoordinator());
     EXPECT_EQ(calls, 0) << "isLeaderFn_ called on the duty cycle after a leadership push";
 }
+
+// ===========================================================================
+// No-hang wave (R2): every txn handler answers a request whose body does not
+// decode with its own response type + InvalidRequest (it used to return 0 —
+// indistinguishable from EndTxn's deferred answer, so the gateway dropped it).
+// ===========================================================================
+TEST_F(TransactionCoordinationServiceTest, MalformedTxnRequestsAreAnsweredInvalidRequestRegression) {
+    constexpr auto kInv = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
+    auto headerOnly = [&](pc::TemplateId tid, int64_t corr) {
+        pc::MessageHeader h;
+        h.blockLength = 32; h.templateId = static_cast<uint16_t>(tid);
+        h.sessionId = 42; h.correlationId = corr;
+        h.encode(reqBuf_.data());
+        return pc::MessageHeader::ENCODED_SIZE;
+    };
+    std::size_t o = svc_->handleInitProducerId(reqBuf_.data(), headerOnly(pc::TemplateId::InitProducerId, 1),
+                                               0, outBuf_.data(), outBuf_.size());
+    auto ip = pc::InitProducerIdResponse::decode(outBuf_.data(), o);
+    ASSERT_TRUE(ip.has_value()); EXPECT_EQ(ip->correlationId, 1); EXPECT_EQ(ip->errorCode, kInv);
+
+    o = svc_->handleAddPartitions(reqBuf_.data(), headerOnly(pc::TemplateId::AddPartitionsToTxn, 2),
+                                  0, outBuf_.data(), outBuf_.size());
+    auto ap = pc::AddPartitionsToTxnResponse::decode(outBuf_.data(), o);
+    ASSERT_TRUE(ap.has_value()); EXPECT_EQ(ap->correlationId, 2);
+    ASSERT_EQ(ap->results.size(), 1u); EXPECT_EQ(ap->results[0].errorCode, kInv);
+
+    o = svc_->handleAddOffsets(reqBuf_.data(), headerOnly(pc::TemplateId::AddOffsetsToTxn, 3),
+                               0, outBuf_.data(), outBuf_.size());
+    auto ao = pc::AddOffsetsToTxnResponse::decode(outBuf_.data(), o);
+    ASSERT_TRUE(ao.has_value()); EXPECT_EQ(ao->correlationId, 3); EXPECT_EQ(ao->errorCode, kInv);
+
+    o = svc_->handleTxnOffsetCommit(reqBuf_.data(), headerOnly(pc::TemplateId::TxnOffsetCommit, 4),
+                                    0, outBuf_.data(), outBuf_.size());
+    auto tc = pc::TxnOffsetCommitResponse::decode(outBuf_.data(), o);
+    ASSERT_TRUE(tc.has_value()); EXPECT_EQ(tc->correlationId, 4);
+    ASSERT_EQ(tc->results.size(), 1u); EXPECT_EQ(tc->results[0].errorCode, kInv);
+
+    o = svc_->handleEndTxn(reqBuf_.data(), headerOnly(pc::TemplateId::EndTxn, 5),
+                           0, outBuf_.data(), outBuf_.size());
+    auto et = pc::EndTxnResponse::decode(outBuf_.data(), o);
+    ASSERT_TRUE(et.has_value()); EXPECT_EQ(et->correlationId, 5); EXPECT_EQ(et->errorCode, kInv);
+}

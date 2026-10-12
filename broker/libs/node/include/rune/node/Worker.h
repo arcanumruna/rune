@@ -979,6 +979,7 @@ public:
     /// disagreed with the RecordBatch header.
     [[nodiscard]] uint64_t identityMismatchRejects() const noexcept { return identityMismatchRejects_; }
     [[nodiscard]] uint64_t oversizeProduceRejectLogsForTest() const noexcept { return oversizeProduceRejectLogs_; }
+    [[nodiscard]] uint64_t undecodableProduceAnswersForTest() const noexcept { return undecodableProduceAnswers_; }
 
     /// Task 13 fix round 1 (C1a): ops that ride the session-lifecycle ring.
     [[nodiscard]] static constexpr bool isSessionLifecycleOp(WorkerOp::Type t) noexcept {
@@ -6401,11 +6402,27 @@ private:
         // data/len, byte-identical to pre-Task-22; encrypted path: the
         // reconstructed [24B header][plaintext body] from above).
         auto msgOpt = pc::Produce::decode(decData, decLen);
-        if (!msgOpt) {
+        if (!msgOpt) [[unlikely]] {
+            if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (answered)
+            // No-hang (R2): a frame whose MessageHeader decodes is ANSWERED
+            // ProduceResponse{InvalidRequest} on its correlationId (the answer
+            // carries this frame's direct-budget unit, like every produce
+            // answer) — never dropped while the client waits out its timeout.
+            if (const auto hdr = pc::MessageHeader::decode(decData, decLen)) {
+                if (undecodableProduceAnswers_++ % 1024 == 0)
+                    spdlog::warn("Worker {}: WorkerIngress: Produce body undecodable (len={}, session={}, "
+                                 "corr={}); answered InvalidRequest (total {})", workerId_, decLen,
+                                 hdr->sessionId, hdr->correlationId, undecodableProduceAnswers_);
+                WorkerReturn ret = produceAnswer_(ProduceOrigin::WorkerIngress, hdr->sessionId,
+                                                  hdr->correlationId, /*topicId=*/-1, /*partition=*/-1);
+                ret.directAck = directAck;
+                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
+                enqueueReturn_(ret);
+                return 1;
+            }
             if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
-            if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (dropped)
-            spdlog::warn("Worker {}: WorkerIngress: failed to decode Produce frame "
-                         "len={}; dropping", workerId_, decLen);
+            spdlog::warn("Worker {}: WorkerIngress: Produce frame header undecodable "
+                         "len={}; dropping (unanswerable)", workerId_, decLen);
             return 0;
         }
         const pc::Produce& msg = *msgOpt;
@@ -6787,6 +6804,10 @@ private:
         pendingAcksAll_.push_back(std::move(pending));
         return 1;
     }
+
+    // No-hang wave (R2): undecodable worker-ingress Produce frames answered
+    // InvalidRequest (worker-thread owned; kept LAST so no hot member moves).
+    uint64_t undecodableProduceAnswers_ = 0;
 };
 
 } // namespace rune::node

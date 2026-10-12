@@ -220,11 +220,18 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
                                                          : inFlight_->msg.partitionCount;
     // Phase 2b E: AUTHORITATIVE mode from the control thread (same bug class as the
     // partition count): a schema-less existing topic keeps its own log backend.
-    // (Both bytes were validated <= 1 at ring decode; nullopt is unreachable.)
-    inFlight_->persistence = (reply.persistence != CreateTopicReplyMsg::kPersistenceNotReported
-                                 ? persistenceFromWire(reply.persistence)
-                                 : persistenceFromWire(inFlight_->msg.persistence))
-                                 .value_or(PersistenceMode::Disk);
+    // No-hang wave (R1): an unknown mode byte is never defaulted to Disk — the
+    // define fails explicitly (Internal), nothing is recorded, the worker goes Idle.
+    const auto mode = reply.persistence != CreateTopicReplyMsg::kPersistenceNotReported
+                          ? persistenceFromWire(reply.persistence)
+                          : persistenceFromWire(inFlight_->msg.persistence);
+    if (!mode) {
+        deps_.respondDefine(inFlight_->msg.session, inFlight_->msg.corr, -1, 0, kInternal);
+        inFlight_.reset();
+        state_ = DdlState::Idle;
+        return;
+    }
+    inFlight_->persistence = *mode;
 
     // Final review I1: an EXPLICIT `transient topic` define over an existing
     // schema-less DISK topic cannot be honoured (the topic keeps its log backend);
@@ -417,6 +424,15 @@ void AdminWorker::startNext_(int64_t nowNs) {
 
     DefineTopicMsg msg = std::move(pd.define);
 
+    // ── malformed ── No-hang wave (R1): an unknown persistence byte on a
+    // directly submitted request is rejected InvalidSchema, nothing started —
+    // never cast, never defaulted to Disk.  (The ring decode drops the blob for
+    // the same byte, which the PARSING step below also answers InvalidSchema.)
+    if (!persistenceFromWire(msg.persistence)) {
+        deps_.respondDefine(msg.session, msg.corr, -1, 0, kInvalidSchema);
+        return;
+    }
+
     // ── PARSING ── validate the descriptor blob is well-formed, and capture
     // its field count in the same pass (seeds nextTag for the create path —
     // see DdlOp::fieldCount — avoiding a second deserialize of the same blob
@@ -474,8 +490,10 @@ void AdminWorker::startNext_(int64_t nowNs) {
 void AdminWorker::startCreateView_(CreateViewMsg msg, int64_t nowNs) {
     namespace rv = rune::view;
 
-    // ── malformed ── the ring decode rejected an unknown persistence byte.
-    if (msg.malformed) {
+    // ── malformed ── the ring decode rejected an unknown persistence byte, or
+    // (no-hang wave R1) a directly submitted request carries one: rejected
+    // InvalidSchema, never treated as "not disk" / recorded as-is.
+    if (msg.malformed || msg.persistence > 1) {
         deps_.respondCreateView(msg.session, msg.corr, -1, 0, kInvalidSchema);
         return;
     }

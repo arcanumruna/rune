@@ -994,3 +994,54 @@ TEST_F(CG3ServiceTest, OffsetIndexRebuiltWhenTheLogContentChangesRegression) {
         << "a commit truncated out of the log is still served from the stale index";
     EXPECT_TRUE(store_->fetch("g-new", tp("t", 1)).has_value());
 }
+
+// ===========================================================================
+// No-hang wave (R2): every group handler answers a request whose body does not
+// decode with its own response type + InvalidRequest on the header's
+// correlationId (it used to return 0 — dropped, the member waited out its
+// timeout).
+// ===========================================================================
+namespace {
+std::size_t groupHeaderOnly(uint8_t* buf, pc::TemplateId tid, int64_t corr) {
+    pc::MessageHeader h;
+    h.blockLength = 32; h.templateId = static_cast<uint16_t>(tid);
+    h.sessionId = 5; h.correlationId = corr;
+    h.encode(buf);
+    return pc::MessageHeader::ENCODED_SIZE;
+}
+} // namespace
+
+TEST_F(CG3ServiceTest, MalformedGroupRequestsAreAnsweredInvalidRequestRegression) {
+    constexpr auto kInv = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
+    std::size_t n = groupHeaderOnly(req_, pc::TemplateId::JoinGroup, 1);
+    std::size_t o = service_->handleJoinGroup(req_, n, clock_, out_, kBufSize);
+    auto j = pc::JoinGroupResponse::decode(out_, o);
+    ASSERT_TRUE(j.has_value()); EXPECT_EQ(j->correlationId, 1); EXPECT_EQ(j->errorCode, kInv);
+
+    n = groupHeaderOnly(req_, pc::TemplateId::SyncGroup, 2);
+    o = service_->handleSyncGroup(req_, n, clock_, out_, kBufSize);
+    auto s = pc::SyncGroupResponse::decode(out_, o);
+    ASSERT_TRUE(s.has_value()); EXPECT_EQ(s->correlationId, 2); EXPECT_EQ(s->errorCode, kInv);
+
+    n = groupHeaderOnly(req_, pc::TemplateId::Heartbeat, 3);
+    o = service_->handleHeartbeat(req_, n, clock_, out_, kBufSize);
+    auto hb = pc::HeartbeatResponse::decode(out_, o);
+    ASSERT_TRUE(hb.has_value()); EXPECT_EQ(hb->correlationId, 3); EXPECT_EQ(hb->errorCode, kInv);
+
+    n = groupHeaderOnly(req_, pc::TemplateId::LeaveGroup, 4);
+    o = service_->handleLeaveGroup(req_, n, clock_, out_, kBufSize);
+    auto l = pc::LeaveGroupResponse::decode(out_, o);
+    ASSERT_TRUE(l.has_value()); EXPECT_EQ(l->correlationId, 4); EXPECT_EQ(l->errorCode, kInv);
+
+    n = groupHeaderOnly(req_, pc::TemplateId::OffsetCommit, 5);
+    o = service_->handleOffsetCommit(req_, n, clock_, out_, kBufSize);
+    auto oc = pc::OffsetCommitResponse::decode(out_, o);
+    ASSERT_TRUE(oc.has_value()); EXPECT_EQ(oc->correlationId, 5);
+    ASSERT_EQ(oc->results.size(), 1u); EXPECT_EQ(oc->results[0].errorCode, kInv);
+
+    n = groupHeaderOnly(req_, pc::TemplateId::OffsetFetch, 6);
+    o = service_->handleOffsetFetch(req_, n, clock_, out_, kBufSize);
+    auto of = pc::OffsetFetchResponse::decode(out_, o);
+    ASSERT_TRUE(of.has_value()); EXPECT_EQ(of->correlationId, 6);
+    ASSERT_EQ(of->results.size(), 1u); EXPECT_EQ(of->results[0].errorCode, kInv);
+}

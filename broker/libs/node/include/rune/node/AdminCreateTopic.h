@@ -42,9 +42,19 @@ createTopicForAdmin(rune::gateway::TopicRegistry& reg, const CreateTopicReqMsg& 
     // Phase 2b E: a transient runtime topic is created exactly like a static
     // persistence=transient one — TopicRegistry skips its disk dirs and
     // createRuntimeUserReplicas builds it on an InMemoryLog.
-    // The ring decode already rejected any byte > 1; an unreachable nullopt
-    // (a hand-built request) falls back to the default (Disk).
-    spec.persistence    = persistenceFromWire(req.persistence).value_or(PersistenceMode::Disk);
+    // No-hang wave (R1): an unknown mode byte is NEVER defaulted to Disk — the
+    // create fails explicitly (topicId -1; the admin thread answers Internal).
+    // The ring decode already rejects a byte > 1, so this guards a hand-built /
+    // future request; nothing is created.
+    const auto mode = persistenceFromWire(req.persistence);
+    if (!mode) {
+        spdlog::error("createTopicForAdmin('{}'): unknown persistence byte {} — create refused",
+                      req.name, static_cast<unsigned>(req.persistence));
+        reply.topicId = -1;
+        reply.existed = false;
+        return reply;
+    }
+    spec.persistence    = *mode;
 
     try {
         reply.topicId = reg.createTopic(spec);

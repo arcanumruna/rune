@@ -3327,13 +3327,8 @@ void BrokerNode::buildAdminWorker() {
             resp.errorCode     = errorCode;
             uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::DefineTopicResponse::BODY_FIXED];
             const std::size_t n = resp.encode(frame);
-            auto& ring = adminWorkerAgent_->egressRing();
-            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + n);
-            if (idx < 0) return;  // ring full — DDL response dropped (rare); client retries
-            uint8_t* p = ring.base() + idx;
-            std::memcpy(p, &session, 8);
-            std::memcpy(p + 8, frame, n);
-            ring.commit(idx);
+            // No-hang (R2): ring full → admin-owned backlog, retried (never dropped).
+            adminWorkerAgent_->postEgressFrame(session, frame, n);
         };
         // respondAlter (Task 11): encode the AlterTopicResponse frame and push it
         // on egressRing_ exactly like respondDefine (same single-writer egress path).
@@ -3349,13 +3344,8 @@ void BrokerNode::buildAdminWorker() {
             resp.errorCode     = errorCode;
             uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::AlterTopicResponse::BODY_FIXED];
             const std::size_t n = resp.encode(frame);
-            auto& ring = adminWorkerAgent_->egressRing();
-            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + n);
-            if (idx < 0) return;  // ring full — DDL response dropped (rare); client retries
-            uint8_t* p = ring.base() + idx;
-            std::memcpy(p, &session, 8);
-            std::memcpy(p + 8, frame, n);
-            ring.commit(idx);
+            // No-hang (R2): ring full → admin-owned backlog, retried (never dropped).
+            adminWorkerAgent_->postEgressFrame(session, frame, n);
         };
         deps.respondGet = [this](int64_t session, int64_t corr, int32_t topicId,
                                  uint16_t version, int32_t partitionCount,
@@ -3376,8 +3366,17 @@ void BrokerNode::buildAdminWorker() {
             // vector; encodedSize() == encode()'s return by construction).
             const std::size_t sz = resp.encodedSize();
             auto& ring = adminWorkerAgent_->egressRing();
-            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + sz);
-            if (idx < 0) return;  // ring full — DDL response dropped (rare); client retries
+            const auto idx = adminWorkerAgent_->egressBacklogEmpty()
+                                 ? ring.tryClaim(kMsgEgressFrame, 8 + sz) : -1;
+            if (idx < 0) [[unlikely]] {
+                // No-hang (R2): ring full (or a backlog ahead, FIFO) → encode
+                // off-ring into the admin-owned backlog, retried — never dropped.
+                std::vector<uint8_t> frame(sz);
+                [[maybe_unused]] const std::size_t w = resp.encode(frame.data());
+                assert(w == sz && "TopicSchemaResponse encode() != encodedSize()");
+                adminWorkerAgent_->postEgressFrame(session, frame.data(), sz);
+                return;
+            }
             uint8_t* p = ring.base() + idx;
             std::memcpy(p, &session, 8);
             // Debug guard: encode() must fill exactly the claimed slot — a
@@ -3402,13 +3401,8 @@ void BrokerNode::buildAdminWorker() {
             resp.errorCode         = errorCode;
             uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::CreateViewResponse::BODY_FIXED];
             const std::size_t n = resp.encode(frame);
-            auto& ring = adminWorkerAgent_->egressRing();
-            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + n);
-            if (idx < 0) return;  // ring full — DDL response dropped (rare); client retries
-            uint8_t* p = ring.base() + idx;
-            std::memcpy(p, &session, 8);
-            std::memcpy(p + 8, frame, n);
-            ring.commit(idx);
+            // No-hang (R2): ring full → admin-owned backlog, retried (never dropped).
+            adminWorkerAgent_->postEgressFrame(session, frame, n);
         };
 
         // pushViewPlan (Task 19): post a compiled view plan on the admin→control

@@ -49,6 +49,8 @@ transient topic.
   a full-cluster restart the topic is empty and offsets restart from 0.
 - Persistence is fixed at definition. `alter topic` carries it forward and
   cannot change it.
+- An explicit `transient topic X` over an existing disk `RUNE_TOPICS` topic
+  `X` answers `TopicExists` (error 25); the topic stays a disk topic.
 
 ## 5. A view over a transient topic must be transient
 
@@ -66,3 +68,19 @@ view checks keep the mode recorded when the topic was defined.
 **Upgrade brokers before clients.** A new client that defines a transient
 topic against an older broker silently gets a disk topic, because the older
 broker ignores the persistence byte.
+
+## 7. Malformed requests are answered
+
+A request whose header decodes but whose body does not is answered with its
+own response type and an error, on its correlation id. The client no longer
+waits for its timeout.
+
+- DDL requests answer `InvalidSchema` (23).
+- Data, group and transaction requests answer the new `InvalidRequest` (39).
+- `GetViewRow` answers status 5 (`InvalidRequest`). When the owning worker is
+  busy it answers status 6 (`Busy`, retriable).
+- A request the broker cannot accept answers `Internal` (6). This covers an
+  unwired service and a full admin ring.
+- An unknown `acks` or `isolation` byte (anything above 1) is rejected with
+  `InvalidRequest`. It is no longer read as one of the two valid modes.
+

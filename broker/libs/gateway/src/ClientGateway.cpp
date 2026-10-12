@@ -3,6 +3,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/ConnectDowngradePolicy.h>
 #include <rune/gateway/CryptoFrame.h>
+#include <rune/gateway/RequestRejection.h>
 #include <cassert>
 #include <rune_fr/FlightRecorder.h>
 #include <rune/gateway/TopicRegistry.h>
@@ -217,7 +218,7 @@ int64_t ClientGateway::offerBytes_(Session* session,
 // ---------------------------------------------------------------------------
 void ClientGateway::sendSubscribeAnswer_(Session& session, const uint8_t* buf, std::size_t len)
 {
-    if (!session.egress) {
+    if (!session.egress && !reliableEgressForTest_) {
         (void)sendTo(session, buf, len);
         return;
     }
@@ -948,8 +949,24 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
 
     // Step 1: validate frame with checkFrame — reject anything non-conformant.
     const auto fc = pc::checkFrame(buf, len);
-    if (fc.status != pc::FrameStatus::Ok) {
-        // Drop silently — bad/unknown frame never crashes the gateway.
+    if (fc.status != pc::FrameStatus::Ok) [[unlikely]] {
+        // Never crashes the gateway.  No-hang (R2): a frame whose header decodes
+        // on a known session (wrong schema / newer version / unknown template —
+        // a newer or foreign client) is answered ErrorResponse{ProtocolVersion}
+        // on its correlationId instead of leaving the client waiting.
+        const auto hdr = pc::MessageHeader::decode(buf, len);
+        Session* s = hdr ? sessions_.find(hdr->sessionId) : nullptr;
+        if (s != nullptr) {
+            pc::ErrorResponse er;
+            er.sessionId     = hdr->sessionId;
+            er.correlationId = hdr->correlationId;
+            er.code          = static_cast<int16_t>(pc::ErrorCode::ProtocolVersion);
+            const std::size_t n = er.encode(scratch_.data());
+            ++rejectedRequests_;
+            sendSubscribeAnswer_(*s, scratch_.data(), n);
+        } else {
+            noteUnanswerable_(buf, len, "frame failed checkFrame");
+        }
         return true;
     }
 
@@ -1513,7 +1530,12 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
 void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t nowNs)
 {
     auto reqOpt = pc::ConnectRequest::decode(buf, len);
-    if (!reqOpt) return; // truncated — drop
+    if (!reqOpt) {
+        // No session and no decodable reply channel: nothing to answer on.  The
+        // client's connect deadline bounds it.  Counted + warned (R2).
+        noteUnanswerable_(buf, len, "Connect body undecodable (no reply channel)");
+        return;
+    }
 
     const auto& req = *reqOpt;
     // Task 13 fix round 1 (I2): a worker's ack table stores the reply channel in
@@ -2060,7 +2082,13 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
 void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len, int64_t nowNs)
 {
     auto hcOpt = pc::HandshakeContinue::decode(buf, len);
-    if (!hcOpt) return;  // truncated — drop
+    if (!hcOpt) {
+        // Pre-session leg: the session is not in the session table yet (an
+        // "unknown session" frame), so it is not answered here — the client's
+        // connect deadline bounds the wait.  Counted + warned (R2), never silent.
+        noteUnanswerable_(buf, len, "HandshakeContinue body undecodable (pre-session)");
+        return;
+    }
     const auto& hc = *hcOpt;
 
     auto it = pendingConnects_.begin();
@@ -2245,7 +2273,10 @@ void ClientGateway::drainPendingReleases()
 void ClientGateway::handleKeepalive(const uint8_t* buf, std::size_t len, int64_t nowNs)
 {
     auto msgOpt = pc::Keepalive::decode(buf, len);
-    if (!msgOpt) return;
+    if (!msgOpt) {
+        noteUnanswerable_(buf, len, "Keepalive body undecodable (no response type)");
+        return;
+    }
     sessions_.touch(msgOpt->sessionId, nowNs);
 }
 
@@ -2255,11 +2286,16 @@ void ClientGateway::handleKeepalive(const uint8_t* buf, std::size_t len, int64_t
 void ClientGateway::handlePing(const uint8_t* buf, std::size_t len, int64_t nowNs)
 {
     auto pingOpt = pc::Ping::decode(buf, len);
-    if (!pingOpt) return;
+    if (!pingOpt) {
+        // No-hang (R2): answered ErrorResponse{InvalidRequest} (the client
+        // completes its pending ping with that error).
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "Ping body undecodable");
+        return;
+    }
 
     Session* session = sessions_.find(pingOpt->sessionId);
     if (!session) {
-        // Unknown session — drop (no egress to reply on).
+        noteUnanswerable_(buf, len, "Ping for unknown session");
         return;
     }
 
@@ -2276,10 +2312,16 @@ void ClientGateway::handlePing(const uint8_t* buf, std::size_t len, int64_t nowN
 
     // Guard: echo payload must fit in the scratch buffer.
     const std::size_t needed = pc::MessageHeader::ENCODED_SIZE + 2 + pingOpt->echo.size();
-    if (needed > scratch_.size()) return; // oversized echo — drop
+    if (needed > scratch_.size()) {
+        // No-hang (R2): an echo the Pong cannot carry is answered, not dropped.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge),
+                             "Ping echo exceeds the Pong scratch");
+        return;
+    }
 
     const std::size_t encoded = pong.encode(scratch_.data());
-    sendTo(*session, scratch_.data(), encoded);
+    // No-hang (R2): queued under back-pressure, never a best-effort drop.
+    sendSubscribeAnswer_(*session, scratch_.data(), encoded);
 }
 
 // ---------------------------------------------------------------------------
@@ -2288,7 +2330,10 @@ void ClientGateway::handlePing(const uint8_t* buf, std::size_t len, int64_t nowN
 void ClientGateway::handleDisconnect(const uint8_t* buf, std::size_t len)
 {
     auto msgOpt = pc::Disconnect::decode(buf, len);
-    if (!msgOpt) return;
+    if (!msgOpt) {
+        noteUnanswerable_(buf, len, "Disconnect body undecodable (no response type)");
+        return;
+    }
     (void)closeSession_(msgOpt->sessionId);
 }
 
@@ -2440,12 +2485,57 @@ void ClientGateway::sendErrorResponse_(Session& session, int64_t sessionId, int6
     }
 }
 
+// ---------------------------------------------------------------------------
+// No-hang wave (R2): rejectRequest_ / noteUnanswerable_ — see the declaration.
+// Both run only after a decode / admission failure (cold path).  No
+// allocation: the answer is encoded into scratch_ (or by sendRespReliable_);
+// the log is rate-limited (first, then every 1024th) and formats integers only.
+// ---------------------------------------------------------------------------
+bool ClientGateway::rejectRequest_(const uint8_t* buf, std::size_t len, uint16_t code,
+                                   const char* why)
+{
+    const auto hdr = pc::MessageHeader::decode(buf, len);
+    if (!hdr) { noteUnanswerable_(buf, len, why); return false; }
+    Session* session = sessions_.find(hdr->sessionId);
+    if (!session) { noteUnanswerable_(buf, len, why); return false; }
+    if (hdr->templateId == static_cast<uint16_t>(pc::TemplateId::Produce)) {
+        // Version-gated frame (pre-D6 38 B for old clients), queued under back-pressure.
+        ++rejectedRequests_;
+        (void)sendRespReliable_(*session, static_cast<pc::ErrorCode>(code), /*partition=*/-1,
+                                /*baseOffset=*/0, hdr->correlationId, /*logStartOffset=*/-1);
+        return true;
+    }
+    const std::size_t n = encodeRejection(hdr->templateId, hdr->sessionId, hdr->correlationId, code,
+                                          scratch_.data(), scratch_.size());
+    if (n == 0) { noteUnanswerable_(buf, len, why); return false; }
+    ++rejectedRequests_;
+    if (rejectedRequests_ % 1024 == 1) {
+        spdlog::warn("ClientGateway: request tid={} session={} corr={} rejected ({}): answered code {} "
+                     "(rejections={})", hdr->templateId, hdr->sessionId, hdr->correlationId, why, code,
+                     rejectedRequests_);
+    }
+    sendSubscribeAnswer_(*session, scratch_.data(), n);
+    return true;
+}
+
+void ClientGateway::noteUnanswerable_(const uint8_t* buf, std::size_t len, const char* why)
+{
+    if (unanswerableFrames_++ % 1024 != 0) return;
+    const auto hdr = pc::MessageHeader::decode(buf, len);
+    spdlog::warn("ClientGateway: unanswerable frame dropped ({}): len={} tid={} session={} "
+                 "(header {}; dropped so far={})", why, len, hdr ? hdr->templateId : 0,
+                 hdr ? hdr->sessionId : 0, hdr ? "decoded, no session / no response type" : "undecodable",
+                 unanswerableFrames_);
+}
+
 bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 {
     // 1. Decode Produce.
     auto msgOpt = pc::Produce::decode(buf, len);
-    if (!msgOpt) {
-        spdlog::debug("ClientGateway: Produce decode failed (truncated?) — dropped");
+    if (!msgOpt) [[unlikely]] {
+        // No-hang (R2): answered InvalidRequest on the header's correlationId.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                             "Produce body undecodable");
         return true;
     }
     const pc::Produce& msg = *msgOpt;
@@ -2454,8 +2544,8 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 
     // 2. Require known session.
     Session* session = sessions_.find(msg.sessionId);
-    if (!session) {
-        spdlog::debug("ClientGateway: Produce for unknown sessionId={} — dropped", msg.sessionId);
+    if (!session) [[unlikely]] {
+        noteUnanswerable_(buf, len, "Produce for unknown session");
         return true;
     }
     // F23: any request is liveness (Kafka: idle == no requests).  Reuses the
@@ -3491,16 +3581,18 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
 {
     // 1. Decode.
     auto msgOpt = pc::Subscribe::decode(buf, len);
-    if (!msgOpt) {
-        spdlog::debug("ClientGateway: Subscribe decode failed (truncated?) — dropped");
+    if (!msgOpt) [[unlikely]] {
+        // No-hang (R2): answered SubscribeResponse{InvalidRequest}.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                             "Subscribe body undecodable");
         return;
     }
     const pc::Subscribe& msg = *msgOpt;
 
     // 2. Require known session.
     Session* session = sessions_.find(msg.sessionId);
-    if (!session) {
-        spdlog::debug("ClientGateway: Subscribe for unknown sessionId={} — dropped", msg.sessionId);
+    if (!session) [[unlikely]] {
+        noteUnanswerable_(buf, len, "Subscribe for unknown session");
         return;
     }
 
@@ -3819,7 +3911,10 @@ void ClientGateway::handleUnsubscribe(const uint8_t* buf, std::size_t len)
 {
     auto msgOpt = pc::Unsubscribe::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("ClientGateway: Unsubscribe decode failed — dropped");
+        // No-hang (R2): Unsubscribe has no response type — nothing waits on it
+        // (the client removes its routing entry locally; the broker-side
+        // subscription dies with the session at the latest).  Counted + warned.
+        noteUnanswerable_(buf, len, "Unsubscribe body undecodable (no response type)");
         return;
     }
     // Only the owning session may remove a subscription (an Unsubscribe from
@@ -5465,8 +5560,9 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
                                        int64_t nowNs, uint16_t tid)
 {
     if (!groupService_) {
-        // Group service not wired in — drop silently (configuration choice).
-        spdlog::debug("ClientGateway: group message tid={} received but groupService_ not set — dropped", tid);
+        // No-hang (R2): no group service on this node — answered Internal.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal),
+                             "group service not wired");
         return;
     }
 
@@ -5476,14 +5572,13 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
     // session lookup.
     auto hdrOpt = pc::MessageHeader::decode(buf, len);
     if (!hdrOpt) {
-        spdlog::debug("ClientGateway: group message tid={} header decode failed — dropped", tid);
+        noteUnanswerable_(buf, len, "group message header undecodable");
         return;
     }
 
     Session* session = sessions_.find(hdrOpt->sessionId);
     if (!session) {
-        spdlog::debug("ClientGateway: group message tid={} for unknown sessionId={} — dropped",
-                      tid, hdrOpt->sessionId);
+        noteUnanswerable_(buf, len, "group message for unknown session");
         return;
     }
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
@@ -5514,18 +5609,25 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
             encoded = groupService_->handleOffsetFetch(buf, len, nowNs, scratch_.data(), cap);
             break;
         default:
-            return; // unknown group template — drop
+            // Unreachable: onClientFrame_ routes only the six group request ids here.
+            (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                                 "not a group request");
+            return;
     }
 
-    if (encoded == 0) return; // handler signalled an error (e.g. decode failure)
-    if (encoded > scratch_.size()) {
-        // Should never happen: handlers bound-check before writing.
-        spdlog::error("ClientGateway: group response tid={} encoded size {} > scratch {} — BUG; dropped",
+    // No-hang (R2): the service answers its own decode failures
+    // (InvalidRequest, RequestRejection.h) — a group handler never defers its
+    // answer, so 0 here means it could not answer at all: Internal, never a drop.
+    if (encoded == 0 || encoded > scratch_.size()) [[unlikely]] {
+        spdlog::error("ClientGateway: group response tid={} encoded size {} (scratch {}) — answered Internal",
                       tid, encoded, scratch_.size());
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal),
+                             "group service produced no answer");
         return;
     }
 
-    sendTo(*session, scratch_.data(), encoded);
+    // Queued under back-pressure (never a best-effort drop of a coordinator answer).
+    sendSubscribeAnswer_(*session, scratch_.data(), encoded);
 }
 
 // ---------------------------------------------------------------------------
@@ -5562,7 +5664,8 @@ bool ClientGateway::redirectToCoordinator_(Session& session, int64_t correlation
     ++coordinatorRedirects_;
     spdlog::debug("ClientGateway: coordinator request on a follower sessionId={} corr={} → NotCoordinator {}",
                   session.sessionId, correlationId, lv.leaderClientEndpoint);
-    sendTo(session, scratch_.data(), encoded);
+    // No-hang (R2): queued under back-pressure, never a best-effort drop.
+    sendSubscribeAnswer_(session, scratch_.data(), encoded);
     return true;
 }
 
@@ -5579,20 +5682,21 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
                                      int64_t nowNs, uint16_t tid)
 {
     if (!txnService_) {
-        spdlog::debug("ClientGateway: txn message tid={} received but txnService_ not set — dropped", tid);
+        // No-hang (R2): no txn service on this node — answered Internal.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal),
+                             "txn service not wired");
         return;
     }
 
     auto hdrOpt = pc::MessageHeader::decode(buf, len);
     if (!hdrOpt) {
-        spdlog::debug("ClientGateway: txn message tid={} header decode failed — dropped", tid);
+        noteUnanswerable_(buf, len, "txn message header undecodable");
         return;
     }
 
     Session* session = sessions_.find(hdrOpt->sessionId);
     if (!session) {
-        spdlog::debug("ClientGateway: txn message tid={} for unknown sessionId={} — dropped",
-                      tid, hdrOpt->sessionId);
+        noteUnanswerable_(buf, len, "txn message for unknown session");
         return;
     }
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
@@ -5617,17 +5721,26 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
             encoded = txnService_->handleEndTxn(buf, len, nowNs, scratch_.data(), cap);
             break;
         default:
-            return; // unknown txn template — drop
+            // Unreachable: onClientFrame_ routes only the five txn request ids here.
+            (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                                 "not a txn request");
+            return;
     }
 
+    // 0 = the answer is DEFERRED (EndTxn: sent by completeAwaiting_ when the
+    // last marker lands).  The service answers its own decode failures
+    // (InvalidRequest, RequestRejection.h), so 0 is never a dropped request.
     if (encoded == 0) return;
-    if (encoded > scratch_.size()) {
-        spdlog::error("ClientGateway: txn response tid={} encoded size {} > scratch {} — BUG; dropped",
+    if (encoded > scratch_.size()) [[unlikely]] {
+        spdlog::error("ClientGateway: txn response tid={} encoded size {} > scratch {} — BUG; answered Internal",
                       tid, encoded, scratch_.size());
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal),
+                             "txn response overflow");
         return;
     }
 
-    sendTo(*session, scratch_.data(), encoded);
+    // Queued under back-pressure (never a best-effort drop of a coordinator answer).
+    sendSubscribeAnswer_(*session, scratch_.data(), encoded);
 }
 
 // ---------------------------------------------------------------------------
@@ -5639,29 +5752,16 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
 void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
 {
     if (!adminSink_) {
-        spdlog::debug("ClientGateway: DefineTopic received but adminSink_ not set — dropped");
+        // No-hang (R2): no admin thread wired — answered Internal.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "DefineTopic: admin sink not wired");
         return;
     }
     auto msgOpt = pc::DefineTopic::decode(buf, len);
     if (!msgOpt) {
-        // Final review M3: a malformed body (e.g. an unknown persistence byte) must
-        // not leave the client waiting out its timeout.  When the frame header is
-        // readable and the session known, answer InvalidSchema (23) on the
-        // header's correlationId.
-        if (const auto hdr = pc::MessageHeader::decode(buf, len)) {
-            if (Session* es = sessions_.find(hdr->sessionId)) {
-                pc::DefineTopicResponse resp;
-                resp.sessionId     = hdr->sessionId;
-                resp.correlationId = hdr->correlationId;
-                resp.errorCode     = static_cast<uint16_t>(pc::ErrorCode::InvalidSchema);
-                if (resp.encodedSize() <= scratch_.size()) {
-                    const std::size_t n = resp.encode(scratch_.data());
-                    sendTo(*es, scratch_.data(), n);
-                    return;
-                }
-            }
-        }
-        spdlog::debug("ClientGateway: DefineTopic decode failed — dropped");
+        // Final review M3 / no-hang (R2): a malformed body (e.g. an unknown
+        // persistence byte) is answered InvalidSchema (23) on the header's
+        // correlationId — the client never waits out its timeout.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidSchema), "DefineTopic body undecodable");
         return;
     }
     const pc::DefineTopic& m = *msgOpt;
@@ -5669,17 +5769,21 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
     // Require a known session (mirror handleProduce).
     Session* session = sessions_.find(m.sessionId);
     if (!session) {
-        spdlog::debug("ClientGateway: DefineTopic for unknown sessionId={} — dropped", m.sessionId);
+        noteUnanswerable_(buf, len, "DefineTopic for unknown session");
         return;
     }
 
     // Copy-and-return: the sink OWNS the copied bytes (name/keyField/blob views
     // point into the ingress buffer and are copied by the sink before return).
-    (void)adminSink_->submitDefineTopic(m.sessionId, m.correlationId,
-                                        m.topicName, m.partitionCount,
-                                        m.keyField, m.validate,
-                                        m.descriptorBlob, m.descriptorLen,
-                                        m.persistence);
+    if (!adminSink_->submitDefineTopic(m.sessionId, m.correlationId,
+                                       m.topicName, m.partitionCount,
+                                       m.keyField, m.validate,
+                                       m.descriptorBlob, m.descriptorLen,
+                                       m.persistence)) {
+        // No-hang (R2): admin request ring full — answered Internal (retry later).
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "DefineTopic: admin ring full");
+        return;
+    }
     // Return immediately — the AdminWorker produces the DefineTopicResponse
     // asynchronously on the session egress (via the admin→control egress ring).
 }
@@ -5691,23 +5795,26 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
 void ClientGateway::handleGetTopicSchema(const uint8_t* buf, std::size_t len)
 {
     if (!adminSink_) {
-        spdlog::debug("ClientGateway: GetTopicSchema received but adminSink_ not set — dropped");
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "GetTopicSchema: admin sink not wired");
         return;
     }
     auto msgOpt = pc::GetTopicSchema::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("ClientGateway: GetTopicSchema decode failed — dropped");
+        // No-hang (R2): answered TopicSchemaResponse{InvalidSchema}.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidSchema), "GetTopicSchema body undecodable");
         return;
     }
     const pc::GetTopicSchema& m = *msgOpt;
 
     Session* session = sessions_.find(m.sessionId);
     if (!session) {
-        spdlog::debug("ClientGateway: GetTopicSchema for unknown sessionId={} — dropped", m.sessionId);
+        noteUnanswerable_(buf, len, "GetTopicSchema for unknown session");
         return;
     }
-    (void)adminSink_->submitGetSchema(m.sessionId, m.correlationId, m.topicName,
-                                      m.requestedFingerprint);
+    if (!adminSink_->submitGetSchema(m.sessionId, m.correlationId, m.topicName,
+                                     m.requestedFingerprint)) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "GetTopicSchema: admin ring full");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5722,12 +5829,13 @@ void ClientGateway::handleGetTopicSchema(const uint8_t* buf, std::size_t len)
 void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
 {
     if (!adminSink_) {
-        spdlog::debug("ClientGateway: AlterTopic received but adminSink_ not set — dropped");
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "AlterTopic: admin sink not wired");
         return;
     }
     auto msgOpt = pc::AlterTopic::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("ClientGateway: AlterTopic decode failed — dropped");
+        // No-hang (R2): answered AlterTopicResponse{InvalidSchema}.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidSchema), "AlterTopic body undecodable");
         return;
     }
     const pc::AlterTopic& m = *msgOpt;
@@ -5735,14 +5843,17 @@ void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
     // Require a known session (mirror handleDefineTopic).
     Session* session = sessions_.find(m.sessionId);
     if (!session) {
-        spdlog::debug("ClientGateway: AlterTopic for unknown sessionId={} — dropped", m.sessionId);
+        noteUnanswerable_(buf, len, "AlterTopic for unknown session");
         return;
     }
 
     // Copy-and-return: the sink OWNS the copied bytes (topicName/opsBlob views
     // point into the ingress buffer and are copied by the sink before return).
-    (void)adminSink_->submitAlterTopic(m.sessionId, m.correlationId, m.topicName,
-                                       m.expectedVersion, m.opsBlob, m.opsLen);
+    if (!adminSink_->submitAlterTopic(m.sessionId, m.correlationId, m.topicName,
+                                      m.expectedVersion, m.opsBlob, m.opsLen)) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "AlterTopic: admin ring full");
+        return;
+    }
     // Return immediately — the AdminWorker produces the AlterTopicResponse
     // asynchronously on the session egress (via the admin→control egress ring).
 }
@@ -5759,12 +5870,14 @@ void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
 void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
 {
     if (!adminSink_) {
-        spdlog::debug("ClientGateway: CreateView received but adminSink_ not set — dropped");
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "CreateView: admin sink not wired");
         return;
     }
     auto msgOpt = pc::CreateView::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("ClientGateway: CreateView decode failed — dropped");
+        // No-hang (R2): answered CreateViewResponse{InvalidSchema} (e.g. an
+        // unknown persistence byte — CreateView::decode rejects > 1).
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidSchema), "CreateView body undecodable");
         return;
     }
     const pc::CreateView& m = *msgOpt;
@@ -5772,15 +5885,18 @@ void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
     // Require a known session (mirror handleDefineTopic).
     Session* session = sessions_.find(m.sessionId);
     if (!session) {
-        spdlog::debug("ClientGateway: CreateView for unknown sessionId={} — dropped", m.sessionId);
+        noteUnanswerable_(buf, len, "CreateView for unknown session");
         return;
     }
 
     // Copy-and-return: the sink OWNS the copied bytes (viewName/keyField/planBlob
     // views point into the ingress buffer and are copied by the sink before return).
-    (void)adminSink_->submitCreateView(m.sessionId, m.correlationId,
-                                       m.viewName, m.keyField, m.persistence,
-                                       m.planBlob, m.planLen);
+    if (!adminSink_->submitCreateView(m.sessionId, m.correlationId,
+                                      m.viewName, m.keyField, m.persistence,
+                                      m.planBlob, m.planLen)) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "CreateView: admin ring full");
+        return;
+    }
     // Return immediately — the AdminWorker produces the CreateViewResponse
     // asynchronously on the session egress (via the admin→control egress ring).
 }
@@ -5804,19 +5920,21 @@ void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
 void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
 {
     if (!workerPool_) {
-        spdlog::debug("ClientGateway: GetViewRow received but workerPool_ not set — dropped");
+        // No-hang (R2): no workers on this gateway — no view is servable here.
+        (void)rejectRequest_(buf, len, pc::ViewRowResponse::kNotReady, "GetViewRow: no worker pool");
         return;
     }
     auto msgOpt = pc::GetViewRow::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("ClientGateway: GetViewRow decode failed — dropped");
+        // No-hang (R2): answered ViewRowResponse{InvalidRequest (5)}.
+        (void)rejectRequest_(buf, len, pc::ViewRowResponse::kInvalidRequest, "GetViewRow body undecodable");
         return;
     }
     const pc::GetViewRow& m = *msgOpt;
 
     Session* session = sessions_.find(m.sessionId);
     if (!session) {
-        spdlog::debug("ClientGateway: GetViewRow for unknown sessionId={} — dropped", m.sessionId);
+        noteUnanswerable_(buf, len, "GetViewRow for unknown session");
         return;
     }
 
@@ -5842,10 +5960,10 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
     op.hwBound       = static_cast<int64_t>(m.requestedFingerprint); // requestedFingerprint (reused field)
 
     if (!workerPool_->tryEnqueueOp(m.viewTopicId, partition, std::move(op))) {
-        // Back-pressure: the worker ingress ring is full this cycle.  The client
-        // re-issues the read (a point read is idempotent); nothing is parked.
-        spdlog::debug("ClientGateway: GetViewRow enqueue back-pressured (viewTopicId={} partition={})",
-                      m.viewTopicId, partition);
+        // Back-pressure: the worker ingress ring is full this cycle.  No-hang
+        // (R2): answered ViewRowResponse{Busy (6)} — the read was not performed;
+        // the client re-issues it (a point read is idempotent).  Nothing parked.
+        (void)rejectRequest_(buf, len, pc::ViewRowResponse::kBusy, "GetViewRow: worker ring full");
     }
 }
 
@@ -6000,7 +6118,12 @@ bool ClientGateway::sendControlFrame(int64_t sessionId,
         spdlog::debug("ClientGateway::sendControlFrame: unknown sessionId={} — dropped", sessionId);
         return false;
     }
-    return sendTo(*session, buf, len);
+    // No-hang (R2): every answer delivered through here (DDL responses from the
+    // admin thread, deferred EndTxn answers, Assign) is queued and retried under
+    // back-pressure — a best-effort sendTo lost it and left the client waiting.
+    if (!session->egress && !reliableEgressForTest_) return sendTo(*session, buf, len);   // test sessions (capture hook)
+    enqueueOrBestEffort_(*session, buf, len);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -6286,12 +6409,19 @@ void ClientGateway::notifyControlMarker(int32_t topicId, int32_t partition,
 void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
 {
     auto reqOpt = pc::MetadataRequest::decode(buf, len);
-    if (!reqOpt) return;  // truncated or bad — drop
+    if (!reqOpt) {
+        // No-hang (R2): answered ErrorResponse{InvalidRequest}.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "MetadataRequest body undecodable");
+        return;
+    }
 
     const pc::MetadataRequest& req = *reqOpt;
 
     Session* session = sessions_.find(req.sessionId);
-    if (!session) return;  // unknown session — drop
+    if (!session) {
+        noteUnanswerable_(buf, len, "MetadataRequest for unknown session");
+        return;
+    }
 
     // -----------------------------------------------------------------------
     // Build BrokerEntry list from nodeEndpointMap_.
@@ -6485,10 +6615,13 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
     const std::size_t needed = resp.encodedSize();
     if (needed <= scratch_.size()) {
         const std::size_t encoded = resp.encode(scratch_.data());
-        sendTo(*session, scratch_.data(), encoded);
+        // No-hang (R2): queued under back-pressure (best-effort only above a ring slot).
+        sendSubscribeAnswer_(*session, scratch_.data(), encoded);
     } else {
-        spdlog::warn("ClientGateway: MetadataResponse too large ({} bytes); scratch={} — dropped",
-                     needed, scratch_.size());
+        spdlog::warn("ClientGateway: MetadataResponse too large ({} bytes); scratch={} — answered "
+                     "MessageTooLarge", needed, scratch_.size());
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge),
+                             "MetadataResponse exceeds scratch");
     }
 }
 

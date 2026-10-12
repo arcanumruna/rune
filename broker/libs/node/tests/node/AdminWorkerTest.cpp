@@ -78,6 +78,7 @@ struct Harness {
     int64_t pendingTicket = -1;
     bool    failCreate = false;
     uint8_t lastCreatePersistence = 0xff;
+    uint8_t replyPersistence = CreateTopicReplyMsg::kPersistenceNotReported;   // no-hang R1
 
     explicit Harness()
         : dir(uniqDir("h")), log(dir) {
@@ -134,6 +135,7 @@ struct Harness {
                 CreateTopicReplyMsg reply;
                 reply.ticket  = pendingTicket;
                 reply.topicId = failCreate ? -1 : nextTopicId++;
+                reply.persistence = replyPersistence;
                 pendingTicket = -1;
                 w->onCreateTopicReply(reply);
             }
@@ -584,4 +586,35 @@ TEST(AdminWorkerRegression, AdminRingFramesCarryPersistence) {
     }, 1);
     EXPECT_EQ(cgot.persistence, 1u);
     EXPECT_EQ(cgot.cleanupPolicy, 0u);
+}
+
+// ===========================================================================
+// No-hang wave (R1): an unknown persistence byte is never defaulted to Disk.
+// ===========================================================================
+
+// A directly submitted DefineTopicMsg (no ring decode) with persistence 2 is
+// rejected InvalidSchema before anything starts.
+TEST(AdminWorkerRegression, DirectDefineWithUnknownPersistenceIsInvalidSchemaRegression) {
+    Harness h;
+    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob(), /*persistence=*/2);
+    EXPECT_EQ(h.lastErr, 23u) << "InvalidSchema";
+    EXPECT_EQ(h.creates, 0) << "nothing started";
+    EXPECT_EQ(h.reg.byName("characters"), nullptr);
+}
+
+// The control thread's reply reports an unknown mode: the define fails Internal,
+// nothing is recorded, and the worker is Idle again (the next define runs).
+TEST(AdminWorkerRegression, CreateReplyWithUnknownPersistenceFailsInternalAndGoesIdleRegression) {
+    Harness h;
+    h.replyPersistence = 2;
+    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob());
+    EXPECT_EQ(h.lastErr, 6u) << "Internal";
+    EXPECT_EQ(h.reg.byName("characters"), nullptr) << "nothing recorded";
+    EXPECT_EQ(h.w->pendingCount(), 0u);
+
+    h.replyPersistence = CreateTopicReplyMsg::kPersistenceNotReported;
+    h.lastErr = 0xffff;
+    h.runDefine(1, 3, "orders", "userId", 4, false, charsBlob());
+    EXPECT_EQ(h.lastErr, 0u) << "the worker went Idle: the next define completes";
+    ASSERT_NE(h.reg.byName("orders"), nullptr);
 }

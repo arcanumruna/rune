@@ -980,6 +980,17 @@ public:
         handleTxnMessage(buf, len, nowNs, tid);
     }
     [[nodiscard]] uint64_t coordinatorRedirectsForTest() const noexcept { return coordinatorRedirects_; }
+    // No-hang wave (R2) test seams: the full ingress dispatch (checkFrame +
+    // every handler) and the reject / unanswerable counters.
+    bool applyClientFrameForTest(const uint8_t* buf, std::size_t len) { return onClientFrame_(buf, len); }
+    void applyGetViewRowForTest(const uint8_t* buf, std::size_t len) { handleGetViewRow(buf, len); }
+    [[nodiscard]] uint64_t rejectedRequestsForTest() const noexcept { return rejectedRequests_; }
+    // Treat injected (egress-less) test sessions like real ones on the reliable
+    // answer paths (sendSubscribeAnswer_ / sendControlFrame): the answer goes
+    // through enqueueOrBestEffort_ → the TestEgressFn, so a test can apply
+    // back-pressure and see it queued + retried instead of dropped.
+    void setReliableEgressForTest(bool on) noexcept { reliableEgressForTest_ = on; }
+    [[nodiscard]] uint64_t unanswerableFramesForTest() const noexcept { return unanswerableFrames_; }
     void applyMetadataForTest(const uint8_t* buf, std::size_t len) {
         handleMetadata(buf, len);
     }
@@ -1401,6 +1412,19 @@ private:
     // -----------------------------------------------------------------------
     void enqueueOrBestEffort_(Session& session, const uint8_t* buf, std::size_t len);
     void sendSubscribeAnswer_(Session& session, const uint8_t* buf, std::size_t len);
+    // No-hang wave (R2): answer the request in buf[0..len) with its OWN
+    // response type carrying `code` (RequestRejection.h) on the header's
+    // correlationId — a header-decodable request on a known session is never
+    // dropped.  Produce goes through sendRespReliable_ (version-gated frame);
+    // every other answer through sendSubscribeAnswer_ (queued under
+    // back-pressure).  Returns false — after noteUnanswerable_ — only when the
+    // header does not decode, the session is unknown, or the request type has
+    // no response (fire-and-forget).  Cold path; zero allocation.
+    bool rejectRequest_(const uint8_t* buf, std::size_t len, uint16_t code, const char* why);
+    // The only frames that may go unanswered (undecodable header, unknown
+    // session, no response type): counted, warn-logged rate-limited (first,
+    // then every 1024th — never a per-frame log on the produce path).
+    void noteUnanswerable_(const uint8_t* buf, std::size_t len, const char* why);
     // Task 13 fix round 1: shard-mode session lifecycle helpers.
     /// Worker ack-table slots in use or about to be (I2): accepted sessions +
     /// closes not yet queued on every worker + pending connects whose
@@ -2461,6 +2485,12 @@ private:
     // egress publication.  Null (= nullptr) in production — zero overhead on
     // the hot path (one null-check).
     TestEgressFn testEgressFn_;
+
+    // No-hang wave (R2): cold-path counters + the test seam flag — kept at the
+    // END of the object so no hot member's offset moves.
+    uint64_t rejectedRequests_      = 0;       // answered with an error instead of dropped
+    uint64_t unanswerableFrames_    = 0;       // dropped: no header / no session / no response type
+    bool     reliableEgressForTest_ = false;   // see setReliableEgressForTest
 
     // G0.1: Private test constructor (skips Aeron setup).
     // Accessed via makeForTest() only.

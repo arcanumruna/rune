@@ -6,6 +6,7 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/node/GroupCoordinationService.h>
+#include <rune/gateway/RequestRejection.h>
 
 #include <rune/gateway/ClientGateway.h>  // CG-4: addGroupSubscription / revokeGroupSubscriptions / sendControlFrame
 
@@ -262,12 +263,14 @@ static std::string topicNameForId(rune::gateway::TopicRegistry* topics, int32_t 
 // handleJoinGroup (templateId 32)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleJoinGroup(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t /*outCap*/)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
 {
     auto msgOpt = pc::JoinGroup::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("GroupCoordinationService: JoinGroup decode failed — dropped");
-        return 0;
+        // No-hang (R2): answered JoinGroupResponse{InvalidRequest}, never dropped.
+        spdlog::debug("GroupCoordinationService: JoinGroup decode failed — answered InvalidRequest");
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::JoinGroup& msg = *msgOpt;
 
@@ -423,12 +426,14 @@ size_t GroupCoordinationService::handleJoinGroup(
 // handleSyncGroup (templateId 34)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleSyncGroup(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t /*outCap*/)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
 {
     auto msgOpt = pc::SyncGroup::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("GroupCoordinationService: SyncGroup decode failed — dropped");
-        return 0;
+        // No-hang (R2): answered SyncGroupResponse{InvalidRequest}, never dropped.
+        spdlog::debug("GroupCoordinationService: SyncGroup decode failed — answered InvalidRequest");
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::SyncGroup& msg = *msgOpt;
 
@@ -524,12 +529,14 @@ size_t GroupCoordinationService::handleSyncGroup(
 // handleHeartbeat (templateId 36)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleHeartbeat(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t /*outCap*/)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
 {
     auto msgOpt = pc::Heartbeat::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("GroupCoordinationService: Heartbeat decode failed — dropped");
-        return 0;
+        // No-hang (R2): answered HeartbeatResponse{InvalidRequest}, never dropped.
+        spdlog::debug("GroupCoordinationService: Heartbeat decode failed — answered InvalidRequest");
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::Heartbeat& msg = *msgOpt;
 
@@ -574,12 +581,14 @@ size_t GroupCoordinationService::handleHeartbeat(
 // handleLeaveGroup (templateId 38)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleLeaveGroup(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t /*outCap*/)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
 {
     auto msgOpt = pc::LeaveGroup::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("GroupCoordinationService: LeaveGroup decode failed — dropped");
-        return 0;
+        // No-hang (R2): answered LeaveGroupResponse{InvalidRequest}, never dropped.
+        spdlog::debug("GroupCoordinationService: LeaveGroup decode failed — answered InvalidRequest");
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::LeaveGroup& msg = *msgOpt;
 
@@ -657,8 +666,10 @@ size_t GroupCoordinationService::handleOffsetCommit(
 {
     auto msgOpt = pc::OffsetCommit::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("GroupCoordinationService: OffsetCommit decode failed — dropped");
-        return 0;
+        // No-hang (R2): answered OffsetCommitResponse{InvalidRequest}, never dropped.
+        spdlog::debug("GroupCoordinationService: OffsetCommit decode failed — answered InvalidRequest");
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::OffsetCommit& msg = *msgOpt;
 
@@ -768,8 +779,10 @@ size_t GroupCoordinationService::handleOffsetFetch(
 
     auto msgOpt = pc::OffsetFetch::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("GroupCoordinationService: OffsetFetch decode failed — dropped");
-        return 0;
+        // No-hang (R2): answered OffsetFetchResponse{InvalidRequest}, never dropped.
+        spdlog::debug("GroupCoordinationService: OffsetFetch decode failed — answered InvalidRequest");
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::OffsetFetch& msg = *msgOpt;
 

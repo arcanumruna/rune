@@ -20,6 +20,7 @@
 // Multi-node: real per-peer UDP publications + ingress subscription.
 // Both paths now serve clients via ClientGateway (single-writer duty-cycle).
 
+#include <cstring>
 #include <rune/node/NodeConfig.h>
 #include <rune/consensus/ControlRing.h>   // Task 9: tlsReloadRing_ (SIGHUP trigger)
 #include <rune/node/EmbeddedDriver.h>
@@ -325,6 +326,7 @@ public:
         //     could not take (full) — retry-on-full, never a drop.
         if (!schemaBacklog_.empty()) [[unlikely]] work += flushSchemaBacklog_();
         if (!viewPlanBacklog_.empty()) [[unlikely]] work += flushViewPlanBacklog_();  // Task 19
+        if (!egressBacklog_.empty()) [[unlikely]] work += flushEgressBacklog_();       // no-hang R2
 
         // 5. fsyncgate (Task 10 fix 3 / I1): the schema log this thread drives
         //    failed an fsync → hand it to the control thread (ring, no shared
@@ -380,6 +382,23 @@ public:
             schemaBacklog_.push_back(SchemaUpdateMsg{topicId, version, blob});   // keep FIFO order
     }
     [[nodiscard]] std::size_t schemaBacklogForTest() const noexcept { return schemaBacklog_.size(); }
+
+    /// No-hang wave (R2) — ADMIN thread only (the deps.respond* callbacks).
+    /// Post one DDL response frame for `session` on the admin→control egress
+    /// ring as [sessionId:i64][frame].  Ring full → admin-owned FIFO backlog,
+    /// retried every doWork — a DDL answer is never dropped (the old tryClaim
+    /// failure returned silently and the client waited out its timeout).
+    /// Allocation only on the ring-full path (rare; DDL is not a hot path).
+    void postEgressFrame(int64_t session, const uint8_t* frame, std::size_t n) {
+        if (egressBacklog_.empty() && tryPostEgress_(session, frame, n)) return;
+        std::vector<uint8_t> e(8 + n);
+        std::memcpy(e.data(), &session, 8);
+        std::memcpy(e.data() + 8, frame, n);
+        egressBacklog_.push_back(std::move(e));   // keep FIFO order
+    }
+    [[nodiscard]] bool egressBacklogEmpty() const noexcept { return egressBacklog_.empty(); }
+    [[nodiscard]] std::size_t egressBacklogForTest() const noexcept { return egressBacklog_.size(); }
+    int flushEgressBacklogForTest() { return flushEgressBacklog_(); }
     int flushSchemaBacklogForTest() { return flushSchemaBacklog_(); }
 
     /// Task 19 — ADMIN thread only (called from deps.pushViewPlan inside
@@ -427,6 +446,31 @@ private:
     bool             storageFailureSignalled_ = false;
     std::vector<SchemaUpdateMsg> schemaBacklog_;   // admin-thread-owned (ring-full retry)
     std::vector<ViewPlanUpdateMsg> viewPlanBacklog_; // Task 19: admin-owned (ring-full retry)
+    std::vector<std::vector<uint8_t>> egressBacklog_; // no-hang R2: [sessionId:i64][frame] (ring-full retry)
+
+    bool tryPostEgress_(int64_t session, const uint8_t* frame, std::size_t n) {
+        const auto idx = egressRing_.tryClaim(kMsgEgressFrame, 8 + n);
+        if (idx < 0) return false;
+        uint8_t* p = egressRing_.base() + idx;
+        std::memcpy(p, &session, 8);
+        std::memcpy(p + 8, frame, n);
+        egressRing_.commit(idx);
+        return true;
+    }
+
+    int flushEgressBacklog_() {
+        std::size_t sent = 0;
+        while (sent < egressBacklog_.size()) {
+            const std::vector<uint8_t>& e = egressBacklog_[sent];
+            int64_t session;
+            std::memcpy(&session, e.data(), 8);
+            if (!tryPostEgress_(session, e.data() + 8, e.size() - 8)) break;
+            ++sent;
+        }
+        egressBacklog_.erase(egressBacklog_.begin(),
+                             egressBacklog_.begin() + static_cast<std::ptrdiff_t>(sent));
+        return static_cast<int>(sent);
+    }
 
     int flushSchemaBacklog_() {
         std::size_t sent = 0;

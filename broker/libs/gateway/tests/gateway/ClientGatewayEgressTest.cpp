@@ -24,7 +24,10 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/NodeConfig.h>
+#include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/PingMessages.h>
+#include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/RecordBatch.h>
 
@@ -325,6 +328,233 @@ TEST(ClientGatewayEgress, HandleProduceAckIsRetriedNotDropped)
     // Cleanup temp dir.
     std::error_code ec;
     fs::remove_all(dir, ec);
+}
+
+
+// ===========================================================================
+// No-hang wave (R2): a request whose MessageHeader decodes on a known session
+// is ANSWERED with its own response type + an error code on the header's
+// correlationId — never dropped while the client waits out its timeout.
+// ===========================================================================
+
+// A frame that is a valid MessageHeader (known template, current version) and
+// nothing else: every body decoder rejects it as truncated.
+static std::vector<uint8_t> headerOnlyFrame(pc::TemplateId tid, int64_t sid, int64_t corr,
+                                            uint16_t blockLength = 64)
+{
+    pc::MessageHeader h;
+    h.blockLength   = blockLength;
+    h.templateId    = static_cast<uint16_t>(tid);
+    h.sessionId     = sid;
+    h.correlationId = corr;
+    std::vector<uint8_t> f(pc::MessageHeader::ENCODED_SIZE);
+    h.encode(f.data());
+    return f;
+}
+
+struct CaptureAll {
+    std::vector<std::vector<uint8_t>> frames;
+    int backpressure = 0;
+    ClientGateway::TestEgressFn fn() {
+        return [this](const uint8_t* b, std::size_t n) -> int64_t {
+            if (backpressure > 0) { --backpressure; return -2; }
+            frames.emplace_back(b, b + n);
+            return 1;
+        };
+    }
+    template <class Msg>
+    std::optional<Msg> last() const {
+        for (auto it = frames.rbegin(); it != frames.rend(); ++it)
+            if (auto m = Msg::decode(it->data(), it->size())) return m;
+        return std::nullopt;
+    }
+};
+
+TEST(ClientGatewayEgressRegression, MalformedProduceIsAnsweredInvalidRequestRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    const int64_t sid = gw.injectTestSession(0);
+    const auto f = headerOnlyFrame(pc::TemplateId::Produce, sid, /*corr=*/9001, /*blockLength=*/24);
+    ASSERT_FALSE(pc::Produce::decode(f.data(), f.size()).has_value());
+    gw.applyProduceForTest(f.data(), f.size());
+    const auto r = cap.last<pc::ProduceResponse>();
+    ASSERT_TRUE(r.has_value()) << "an undecodable Produce must be answered, not dropped";
+    EXPECT_EQ(r->correlationId, 9001);
+    EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(gw.rejectedRequestsForTest(), 1u);
+    EXPECT_EQ(gw.unanswerableFramesForTest(), 0u);
+}
+
+// acks is a two-valued wire byte: 2 is rejected by decode and answered (it
+// used to read as acks=Leader on the gateway and acks=All on a worker).
+TEST(ClientGatewayEgressRegression, ProduceUnknownAcksByteIsAnsweredInvalidRequestRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    const int64_t sid = gw.injectTestSession(0);
+    auto batch = makeBatch();
+    pc::Produce prod;
+    prod.sessionId = sid; prod.correlationId = 31; prod.topicId = 0; prod.partition = 0;
+    prod.partitionKnown = 1; prod.acks = 1; prod.producerId = -1;
+    prod.recordBatch = std::span<const uint8_t>(batch.data(), batch.size());
+    std::vector<uint8_t> frame(64 * 1024, 0);
+    const std::size_t n = prod.encode(frame.data());
+    frame[pc::MessageHeader::ENCODED_SIZE + 9] = 2;   // the acks byte
+    gw.applyProduceForTest(frame.data(), n);
+    const auto r = cap.last<pc::ProduceResponse>();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->correlationId, 31);
+    EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+}
+
+// The answer to a malformed Produce rides the reliable egress: back-pressured,
+// it is queued and delivered by the retry drain (never best-effort dropped).
+TEST(ClientGatewayEgressRegression, MalformedProduceAnswerIsQueuedUnderBackpressureRegression)
+{
+    CaptureAll cap;
+    cap.backpressure = 1;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    const int64_t sid = gw.injectTestSession(0);
+    const auto f = headerOnlyFrame(pc::TemplateId::Produce, sid, 77, 24);
+    gw.applyProduceForTest(f.data(), f.size());
+    EXPECT_TRUE(cap.frames.empty());
+    ASSERT_EQ(gw.pendingResponseCount(), 1u);
+    gw.drainPendingResponses(nowNs());
+    const auto r = cap.last<pc::ProduceResponse>();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->correlationId, 77);
+    EXPECT_EQ(r->errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+}
+
+// Only an unknown session (or an undecodable header) may go unanswered — it is
+// counted, never answered on someone else's session.
+TEST(ClientGatewayEgressRegression, MalformedProduceForUnknownSessionIsCountedNotAnsweredRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    (void)gw.injectTestSession(0);
+    const auto f = headerOnlyFrame(pc::TemplateId::Produce, /*sid=*/987654, 5, 24);
+    gw.applyProduceForTest(f.data(), f.size());
+    EXPECT_TRUE(cap.frames.empty());
+    EXPECT_EQ(gw.unanswerableFramesForTest(), 1u);
+    const std::vector<uint8_t> tooShort(10, 0);
+    gw.applyProduceForTest(tooShort.data(), tooShort.size());
+    EXPECT_TRUE(cap.frames.empty());
+    EXPECT_EQ(gw.unanswerableFramesForTest(), 2u);
+}
+
+// Through the real ingress dispatch: a Ping whose body does not decode is
+// answered ErrorResponse{InvalidRequest} (the client completes its pending ping).
+TEST(ClientGatewayEgressRegression, MalformedPingIsAnsweredErrorResponseRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.setReliableEgressForTest(true);
+    const int64_t sid = gw.injectTestSession(0);
+    const auto f = headerOnlyFrame(pc::TemplateId::Ping, sid, 4321, 0);
+    ASSERT_FALSE(pc::Ping::decode(f.data(), f.size()).has_value());
+    (void)gw.applyClientFrameForTest(f.data(), f.size());
+    const auto e = cap.last<pc::ErrorResponse>();
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->correlationId, 4321);
+    EXPECT_EQ(e->code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+}
+
+// A frame checkFrame rejects (a newer protocol version, an unknown template)
+// on a known session is answered ErrorResponse{ProtocolVersion}, not dropped.
+TEST(ClientGatewayEgressRegression, CheckFrameRejectIsAnsweredProtocolVersionRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.setReliableEgressForTest(true);
+    const int64_t sid = gw.injectTestSession(0);
+
+    pc::MessageHeader h;
+    h.blockLength = 0; h.templateId = static_cast<uint16_t>(pc::TemplateId::Produce);
+    h.version = static_cast<uint16_t>(pc::kProtocolVersion + 1);
+    h.sessionId = sid; h.correlationId = 55;
+    std::vector<uint8_t> f(pc::MessageHeader::ENCODED_SIZE);
+    h.encode(f.data());
+    (void)gw.applyClientFrameForTest(f.data(), f.size());
+    auto e = cap.last<pc::ErrorResponse>();
+    ASSERT_TRUE(e.has_value()) << "newer-version frame dropped silently";
+    EXPECT_EQ(e->correlationId, 55);
+    EXPECT_EQ(e->code, static_cast<int16_t>(pc::ErrorCode::ProtocolVersion));
+
+    h.version = pc::kProtocolVersion; h.templateId = 30; h.correlationId = 56;   // unassigned id
+    h.encode(f.data());
+    (void)gw.applyClientFrameForTest(f.data(), f.size());
+    e = cap.last<pc::ErrorResponse>();
+    ASSERT_TRUE(e.has_value());
+    EXPECT_EQ(e->correlationId, 56);
+    EXPECT_EQ(e->code, static_cast<int16_t>(pc::ErrorCode::ProtocolVersion));
+}
+
+// sendControlFrame (DDL answers from the admin thread, deferred EndTxn, Assign)
+// is queued under back-pressure — it used a best-effort send that lost it.
+TEST(ClientGatewayEgressRegression, ControlFrameIsQueuedUnderBackpressureRegression)
+{
+    CaptureAll cap;
+    cap.backpressure = 1;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.setReliableEgressForTest(true);
+    const int64_t sid = gw.injectTestSession(0);
+    pc::DefineTopicResponse resp;
+    resp.sessionId = sid; resp.correlationId = 12; resp.topicId = 3; resp.version = 1;
+    std::vector<uint8_t> f(resp.encodedSize());
+    resp.encode(f.data());
+    EXPECT_TRUE(gw.sendControlFrame(sid, f.data(), f.size()));
+    EXPECT_TRUE(cap.frames.empty());
+    ASSERT_EQ(gw.pendingResponseCount(), 1u) << "a back-pressured DDL answer was dropped";
+    gw.drainPendingResponses(nowNs());
+    const auto r = cap.last<pc::DefineTopicResponse>();
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->correlationId, 12);
+}
+
+
+// Pong rides the reliable egress: back-pressured, it is queued + retried (it
+// used a best-effort send — a lost Pong left the client's ping pending).
+TEST(ClientGatewayEgressRegression, PongIsQueuedUnderBackpressureRegression)
+{
+    CaptureAll cap;
+    cap.backpressure = 1;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.setReliableEgressForTest(true);
+    const int64_t sid = gw.injectTestSession(0);
+    pc::Ping ping;
+    ping.sessionId = sid; ping.correlationId = 606; ping.echo = "hi";
+    std::vector<uint8_t> f(pc::MessageHeader::ENCODED_SIZE + 2 + ping.echo.size());
+    f.resize(ping.encode(f.data()));
+    (void)gw.applyClientFrameForTest(f.data(), f.size());
+    EXPECT_TRUE(cap.frames.empty());
+    ASSERT_EQ(gw.pendingResponseCount(), 1u) << "a back-pressured Pong was dropped";
+    gw.drainPendingResponses(nowNs());
+    const auto pong = cap.last<pc::Pong>();
+    ASSERT_TRUE(pong.has_value());
+    EXPECT_EQ(pong->correlationId, 606);
+}
+
+// Requests with NO response type (Disconnect; a Keepalive has no body to fail)
+// and pre-session legs (Connect, HandshakeContinue) cannot be answered: an
+// undecodable one is counted + warned (rate-limited), never silently dropped
+// and never answered with a foreign type.
+TEST(ClientGatewayEgressRegression, UnanswerableMalformedFramesAreCountedRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.setReliableEgressForTest(true);
+    const int64_t sid = gw.injectTestSession(0);
+    uint64_t expect = 0;
+    for (const auto tid : {pc::TemplateId::Disconnect,
+                           pc::TemplateId::Connect, pc::TemplateId::HandshakeContinue}) {
+        const auto f = headerOnlyFrame(tid, sid, 1, 64);
+        (void)gw.applyClientFrameForTest(f.data(), f.size());
+        EXPECT_EQ(gw.unanswerableFramesForTest(), ++expect) << "tid " << static_cast<int>(tid);
+    }
+    EXPECT_TRUE(cap.frames.empty());
+    EXPECT_EQ(gw.sessionCount(), 1u) << "a malformed Disconnect closes nothing";
 }
 
 } // namespace

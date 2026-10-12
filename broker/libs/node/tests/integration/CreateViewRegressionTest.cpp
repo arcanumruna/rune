@@ -576,6 +576,21 @@ TEST_F(CreateViewRegression, RingDecodeRejectsUnknownPersistenceByteRegression) 
     EXPECT_FALSE(decodeCreateView(raw.data(), raw.size()).malformed);
 }
 
+// No-hang wave (R1): a DIRECTLY submitted CreateViewMsg (not via the ring
+// decode, so `malformed` is false) with an unknown persistence byte is
+// rejected InvalidSchema — it used to pass as "not 0" (transient-like) and be
+// recorded as 2.
+TEST_F(CreateViewRegression, DirectCreateViewWithUnknownPersistenceIsInvalidSchemaRegression) {
+    CreateViewMsg cv;
+    cv.session = 1; cv.corr = 72; cv.persistence = 2; cv.viewName = "v2"; cv.keyField = "id";
+    ASSERT_FALSE(cv.malformed);
+    pendingTicket_ = -1;
+    driveCreateView(cv);
+    EXPECT_EQ(lastViewError_, 23u);
+    EXPECT_EQ(lastViewTopicId_, -1);
+    EXPECT_EQ(pendingTicket_, -1) << "no sink create requested";
+}
+
 // ===========================================================================
 // Final review U1/U2 — DDL serialization + name collisions + view not alterable.
 // Every test enqueues the ops back to back BEFORE any reply is delivered.

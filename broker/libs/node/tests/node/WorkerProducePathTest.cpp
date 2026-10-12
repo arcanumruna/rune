@@ -741,6 +741,40 @@ TEST(WorkerProduceRegression, OversizeRejectLogRateLimitedRegression) {
     EXPECT_EQ(log.logEndOffset(), 0);
 }
 
+// No-hang wave (R2): a per-worker-ingress Produce whose MessageHeader decodes
+// but whose body does not is ANSWERED ProduceResult{InvalidRequest} on its
+// correlationId (it used to be dropped with a warn — the client waited out its
+// timeout).  A frame with no decodable header stays unanswerable.
+TEST(WorkerProduceRegression, UndecodableIngressProduceIsAnsweredInvalidRequestRegression) {
+    TempDir dir("nohang_ingress_");
+    rune::storage::Log log(dir.path.string());
+    NullTransport transport;
+    auto replica = WorkerProduceFixture::makeLeaderReplica(0, 0, log, transport);
+    Worker worker(0);
+    worker.setOwnedDirect({replica.get()});
+
+    auto frame = encodeProduceFrameIdem(4242, makeBatchOfExactSize(128), -1);
+    frame[pc::MessageHeader::ENCODED_SIZE + 9] = 2;   // unknown acks byte → Produce::decode rejects
+    ASSERT_FALSE(pc::Produce::decode(frame.data(), frame.size()).has_value());
+    int n = 0;
+    WorkerReturn got;
+    (void)worker.handleIngressFrameForTest(frame.data(), frame.size(), /*nowNs=*/1);
+    worker.drainReturn([&](const WorkerReturn& ret) {
+        if (ret.type == WorkerReturn::Type::ProduceResult) { got = ret; ++n; }
+    });
+    ASSERT_EQ(n, 1) << "an undecodable ingress Produce must be answered exactly once";
+    EXPECT_EQ(got.errorCode, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
+    EXPECT_EQ(got.correlationId, pc::MessageHeader::decode(frame.data(), frame.size())->correlationId);
+    EXPECT_EQ(log.logEndOffset(), 0) << "never appended";
+    EXPECT_EQ(worker.undecodableProduceAnswersForTest(), 1u);
+
+    const std::vector<uint8_t> noHeader(12, 0);   // < MessageHeader: nothing to answer on
+    n = 0;
+    (void)worker.handleIngressFrameForTest(noHeader.data(), noHeader.size(), 1);
+    worker.drainReturn([&](const WorkerReturn& ret) { if (ret.type == WorkerReturn::Type::ProduceResult) ++n; });
+    EXPECT_EQ(n, 0);
+}
+
 // hotpath-A review m1: the hold through the REAL controlled poll.  A frame
 // whose partition's roll is deferred ABORTs its image: it and every later frame
 // of the SAME publisher wait (image-wide back-pressure, the documented
@@ -1028,3 +1062,4 @@ TEST(WorkerProduceGateRegression, FollowerRefusedLeaderWritableAtOnce) {
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
 }
+
