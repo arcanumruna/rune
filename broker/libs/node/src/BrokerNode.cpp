@@ -379,7 +379,8 @@ void BrokerNode::start() {
     //     builder consumes config_.topics — and append the recovered specs so
     //     TopicRegistry / buildReplication / worker placement / MetadataService /
     //     read-committed rebuild treat them exactly like static topics.  Throws
-    //     (refusing to boot) on a damaged catalog or a non-contiguous id sequence.
+    //     (refusing to boot) on a damaged catalog; an id gap (an orphan whose DDL
+    //     never committed) becomes a hidden zero-partition __orphan.<id> (B5).
     {
         std::vector<TopicSpec> recovered = recoverRuntimeTopicSpecs(
             config_.dataDir, static_cast<int32_t>(config_.topics.size()));

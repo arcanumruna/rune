@@ -38,13 +38,24 @@ namespace rune::node {
 /// Ids below `firstRuntimeId` (the number of static config topics) belong to
 /// static topics and are skipped.  TopicRegistry assigns ids sequentially, so
 /// the recovered ids must be exactly firstRuntimeId, firstRuntimeId+1, ... —
-/// anything else would recreate topics under the wrong ids.
+/// a hole would recreate later topics under the wrong ids, so it is filled (below).
 ///
 /// Missing catalog directories mean "nothing to recover" and are not created.
 ///
-/// @throws std::runtime_error on a record that does not parse, an id claimed by
-///         both catalogs, or a non-contiguous id sequence — boot must not guess.
+/// An id with no catalog record (a DefineTopic/CreateView whose record never
+/// committed — an orphan) is recreated as the inert, hidden placeholder
+/// orphanPlaceholderName(id): ZERO partitions (no replica, no log, no directory,
+/// no metadata entry — produce/subscribe find no partition), transient, and a
+/// reserved "__" name no DDL can address.  Later topics therefore keep their ids,
+/// and the orphan's original name is free again after the restart.  All
+/// placeholders of one boot are logged in a single warn line.
+///
+/// @throws std::runtime_error on a record that does not parse or an id claimed by
+///         both catalogs — boot must not guess.
 [[nodiscard]] std::vector<TopicSpec> recoverRuntimeTopicSpecs(const std::string& dataDir,
                                                               int32_t firstRuntimeId);
+
+/// "__orphan.<topicId>" — the recovery placeholder name for a catalog-less id.
+[[nodiscard]] std::string orphanPlaceholderName(int32_t topicId);
 
 } // namespace rune::node

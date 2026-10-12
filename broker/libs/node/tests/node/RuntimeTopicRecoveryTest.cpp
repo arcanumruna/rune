@@ -12,8 +12,12 @@
 // their source after a restart.
 #include <gtest/gtest.h>
 
+#include <spdlog/sinks/ringbuffer_sink.h>
+#include <spdlog/spdlog.h>
+
 #include <rune/node/RuntimeTopicRecovery.h>
 #include <rune/node/SchemaRegistry.h>
+#include <rune/node/TopicName.h>
 #include <rune/node/ViewRegistry.h>
 
 #include <rune/codec/Descriptor.h>
@@ -174,12 +178,78 @@ TEST(RuntimeTopicRecoveryRegression, StaticTopicIdsAreSkipped) {
     EXPECT_EQ(specs[0].name, "runtime_two");
 }
 
-// TopicRegistry assigns ids sequentially, so a hole would shift every later topic
-// onto another topic's id (wrong log, wrong assignments).  Fail loud instead.
-TEST(RuntimeTopicRecoveryRegression, IdGapFailsLoud) {
+// B5 (DDL conformance, user decision D1): an id with no catalog record is a topic
+// whose DefineTopic/CreateView never committed (an orphan: a failed CREATE VIEW's
+// sink, a create whose reply was lost).  Refusing to boot made a failed CREATE VIEW
+// an outage.  The gap is filled with a hidden, inert placeholder: ZERO partitions
+// (no replica, no log, no metadata, no data path), a reserved "__" name.  Every
+// recorded topic keeps its id and the orphan's name is free again.
+TEST(RuntimeTopicRecoveryRegression, IdGapIsFilledWithInertPlaceholderRegression) {
     TempDataDir d("gap");
     appendRecords(d.path / "__topic_schemas",
-                  {schemaRecord(0, 1, 1, "zero", "d0"), schemaRecord(2, 1, 1, "two", "d2")});
+                  {schemaRecord(0, 1, 1, "zero", "d0"), schemaRecord(3, 1, 2, "three", "d3")});
+    const auto specs = rune::node::recoverRuntimeTopicSpecs(d.path.string(), 0);
+    ASSERT_EQ(specs.size(), 4u);
+    EXPECT_EQ(specs[0].name, "zero");
+    for (int32_t id : {1, 2}) {
+        SCOPED_TRACE(id);
+        EXPECT_EQ(specs[id].topicId, id);
+        EXPECT_EQ(specs[id].name, rune::node::orphanPlaceholderName(id));
+        EXPECT_EQ(specs[id].partitionCount, 0) << "no replica, no log, no metadata entry";
+        EXPECT_EQ(specs[id].persistence, rune::node::PersistenceMode::Transient) << "never a disk dir";
+    }
+    EXPECT_EQ(specs[3].topicId, 3);
+    EXPECT_EQ(specs[3].name, "three");
+    EXPECT_EQ(specs[3].partitionCount, 2);
+}
+
+// A gap that starts at firstRuntimeId (the first runtime topic was the orphan).
+TEST(RuntimeTopicRecoveryRegression, GapAtFirstRuntimeIdIsFilledRegression) {
+    TempDataDir d("gap-first");
+    appendRecords(d.path / "__views", {viewRecord(3, "char_hp", /*source*/ 0)});
+    const auto specs = rune::node::recoverRuntimeTopicSpecs(d.path.string(), /*firstRuntimeId*/ 2);
+    ASSERT_EQ(specs.size(), 2u);
+    EXPECT_EQ(specs[0].topicId, 2);
+    EXPECT_EQ(specs[0].name, rune::node::orphanPlaceholderName(2));
+    EXPECT_EQ(specs[0].partitionCount, 0);
+    EXPECT_EQ(specs[1].topicId, 3);
+    EXPECT_EQ(specs[1].name, "char_hp");
+}
+
+// The placeholder name is reserved: no DDL can ever create or address it.
+TEST(RuntimeTopicRecoveryRegression, PlaceholderNameIsReservedRegression) {
+    EXPECT_EQ(rune::node::orphanPlaceholderName(7), "__orphan.7");
+    EXPECT_FALSE(rune::node::isValidTopicName(rune::node::orphanPlaceholderName(7)));
+}
+
+// D1: placeholders are logged ONCE per boot (one line naming every id), not per id.
+TEST(RuntimeTopicRecoveryRegression, PlaceholdersAreLoggedOnceRegression) {
+    TempDataDir d("gap-log");
+    appendRecords(d.path / "__topic_schemas",
+                  {schemaRecord(0, 1, 1, "zero", "d0"), schemaRecord(4, 1, 1, "four", "d4")});
+    auto sink = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(256);
+    const std::shared_ptr<spdlog::logger> previous = spdlog::default_logger();
+    spdlog::set_default_logger(std::make_shared<spdlog::logger>("rtr-capture", sink));
+    const auto specs = rune::node::recoverRuntimeTopicSpecs(d.path.string(), 0);
+    spdlog::set_default_logger(previous);
+    ASSERT_EQ(specs.size(), 5u);
+    int lines = 0;
+    std::string theLine;
+    for (const std::string& l : sink->last_formatted()) {
+        if (l.find("__orphan.") != std::string::npos) { ++lines; theLine = l; }
+    }
+    EXPECT_EQ(lines, 1) << "one warn line per boot";
+    for (const char* id : {"__orphan.1", "__orphan.2", "__orphan.3"})
+        EXPECT_NE(theLine.find(id), std::string::npos) << id << " named in: " << theLine;
+}
+
+// D1 keeps the loud failure for a catalog DISAGREEMENT: an id claimed by both
+// __topic_schemas and __views is not a gap and must still refuse to boot.
+TEST(RuntimeTopicRecoveryRegression, IdClaimedByBothCatalogsStillFailsLoudRegression) {
+    TempDataDir d("both-catalogs");
+    appendRecords(d.path / "__topic_schemas",
+                  {schemaRecord(0, 1, 1, "zero", "d0"), schemaRecord(1, 1, 1, "one", "d1")});
+    appendRecords(d.path / "__views", {viewRecord(1, "clash", /*source*/ 0)});
     EXPECT_THROW((void)rune::node::recoverRuntimeTopicSpecs(d.path.string(), 0), std::runtime_error);
 }
 

@@ -1,6 +1,7 @@
 // libs/node/src/RuntimeTopicRecovery.cpp — see the header for the contract.
 #include <rune/node/RuntimeTopicRecovery.h>
 
+#include <rune/node/PersistenceMode.h>
 #include <rune/node/SchemaRegistry.h>   // TopicSchema
 #include <rune/node/ViewRegistry.h>     // ViewRecord
 
@@ -84,6 +85,10 @@ struct DefinedTopic {
 };
 
 } // namespace
+
+std::string orphanPlaceholderName(int32_t topicId) {
+    return "__orphan." + std::to_string(topicId);
+}
 
 std::vector<TopicSpec> recoverRuntimeTopicSpecs(const std::string& dataDir,
                                                 int32_t firstRuntimeId) {
@@ -180,20 +185,32 @@ std::vector<TopicSpec> recoverRuntimeTopicSpecs(const std::string& dataDir,
     });
 
     // ── contiguity: TopicRegistry hands out ids sequentially. ────────────────
+    // B5 (DDL conformance, D1): a missing id is an orphan (its DDL never committed a
+    // record).  Fill it with a hidden, inert, ZERO-partition placeholder so every
+    // later topic keeps its id; log all placeholders of this boot ONCE.
     std::vector<TopicSpec> out;
     out.reserve(runtime.size());
+    std::string placeholders;   // "__orphan.1, __orphan.2" for the single log line
     int32_t expected = firstRuntimeId;
     for (auto& [id, spec] : runtime) {
-        if (id != expected) {
-            throw std::runtime_error(
-                "runtime topic recovery: expected topic id " + std::to_string(expected) +
-                " but the catalogs' next runtime topic is id " + std::to_string(id) + " ('" +
-                spec.name + "') — a topic id has no catalog record (e.g. a DefineTopic/"
-                "CreateView whose record never committed), so recreating sequentially "
-                "would put later topics on the wrong ids; refusing to boot");
+        while (expected < id) {
+            TopicSpec ph;
+            ph.topicId        = expected;
+            ph.name           = orphanPlaceholderName(expected);
+            ph.partitionCount = 0;
+            ph.persistence    = PersistenceMode::Transient;
+            if (!placeholders.empty()) placeholders += ", ";
+            placeholders += ph.name;
+            out.push_back(std::move(ph));
+            ++expected;
         }
         out.push_back(std::move(spec));
         ++expected;
+    }
+    if (!placeholders.empty()) {
+        spdlog::warn("runtime topic recovery: topic id(s) with no catalog record (a DefineTopic/"
+                     "CreateView that never committed left them behind) recreated as hidden "
+                     "zero-partition placeholders so later topics keep their ids: {}", placeholders);
     }
     return out;
 }
