@@ -43,6 +43,9 @@ static std::string_view cppType(PrimType t) noexcept {
         case PrimType::Enum:    return "int32_t";
         case PrimType::String:  return "std::string_view";
         case PrimType::Bytes:   return "std::string_view";
+        // string(N) has no width-free spelling: every emitter spells it
+        // std::array<char, fixedLen> itself and never asks cppType for it.
+        case PrimType::FixedStr: return "/* string(N): emitted as std::array<char, N> */";
     }
     return "/* unknown */";
 }
