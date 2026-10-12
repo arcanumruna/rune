@@ -5182,24 +5182,27 @@ private:
     }
 
     // One owned source partition's view work.  Order matters: materialize a
-    // recovery instance from its checkpoint FIRST, then (transient source only)
-    // reconcile its cursor against the source's live range, then rebuild/fold.
+    // recovery instance from its checkpoint FIRST, then rebuild/fold.  For a
+    // TRANSIENT source the per-instance cursor reconcile happens INSIDE the fold
+    // (WorkerViewSet::driveView_) on the instance already held.
     // Task 19b (restart recovery): materializeRecoveryInstancesFor + driveRebuild
     // are gated on hasRecovery() — a broker with no durable views runs neither.
     template <class ReadRangeFn>
     int driveViewsOf_(int32_t topicId, int32_t partition, ReadRangeFn& readRange,
                       int64_t bound, int64_t nowNs, rune::storage::InMemoryLog* transientSrc) {
         int work = 0;
-        const bool recovering = viewSet_->hasRecovery();
-        if (recovering) [[unlikely]]
+        TransientBounds tb;
+        const TransientBounds* tbp = nullptr;
+        if (transientSrc != nullptr) {
+            tb.logStart = transientSrc->logStartOffset();
+            tb.logEnd   = transientSrc->logEndOffset();
+            tbp         = &tb;
+        }
+        if (viewSet_->hasRecovery()) [[unlikely]] {
             viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
-        if (transientSrc != nullptr)
-            work += viewSet_->reconcileTransientSource(topicId, partition,
-                                                       transientSrc->logStartOffset(),
-                                                       transientSrc->logEndOffset());
-        if (recovering) [[unlikely]]
-            work += viewSet_->driveRebuild(topicId, partition, readRange, bound, nowNs);
-        work += viewSet_->driveFolds(topicId, partition, readRange, bound, nowNs);
+            work += viewSet_->driveRebuild(topicId, partition, readRange, bound, nowNs, tbp);
+        }
+        work += viewSet_->driveFolds(topicId, partition, readRange, bound, nowNs, tbp);
         return work;
     }
 

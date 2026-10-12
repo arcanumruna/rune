@@ -37,6 +37,8 @@
 #include <rune/node/WorkerReplicationTransport.h>
 #include <rune/node/WorkerViewSet.h>
 #include <rune/node/ViewSnapshotChannel.h>
+#include <rune/node/AdminChannels.h>
+#include <rune/codec/Serialize.h>
 #include <rune/view/PlanCompiler.h>
 #include <rune/view/ViewRow.h>
 #include <rune/codec/Descriptor.h>
@@ -748,4 +750,68 @@ TEST(WorkerRegression, ViewFoldsOverTransientSourceRegression) {
     }
     ASSERT_NE(row, nullptr) << "the worker must fold a view over a transient source";
     EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 55);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b E (I2): a RECOVERY-installed view over a transient source reaches
+// Ready on the real worker pass (hasRecovery -> materialize -> rebuild -> fold),
+// so Worker::viewsReady() -- the election-eligibility gate -- becomes true.
+// Before the fix driveViews_ skipped the transient source, the instance stayed
+// RebuildingViews forever and the node was never election-eligible.
+// ---------------------------------------------------------------------------
+TEST(WorkerRegression, RecoveryViewOverTransientSourceReachesReadyRegression) {
+    constexpr int32_t kSrc = 22, kView = 0x40000042;
+    ReplicaFixture f(kSrc, 0);
+    ASSERT_TRUE(f.replica->isMemoryBacked());
+
+    const auto src = rune::codec::DescriptorBuilder("character", 1)
+        .add("characterId", rune::codec::PrimType::Int64, 1, /*isKey*/ true)
+        .add("hp", rune::codec::PrimType::Int32)
+        .build();
+    rune::view::ViewPlan v;
+    v.viewName = "char_hp"; v.key = "characterId"; v.sources = {{kSrc, "characterId"}};
+    v.output = {{"characterId", rune::codec::PrimType::Int64, 0, "characterId", rune::view::MergeRule::Replace},
+                {"hp", rune::codec::PrimType::Int32, 0, "hp", rune::view::MergeRule::Replace}};
+    v.persistence = 1;   // transient view over a transient source
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(v, srcs, kView).value();
+
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-worker-transient-recovery");
+    // Push a recovery-flagged install exactly as BrokerNode::fanoutViewPlan_ does.
+    rune::node::ViewPlanUpdateMsg m;
+    m.viewTopicId = kView;
+    m.persistence = 1;
+    m.recovery    = true;
+    m.planBlob    = rune::view::serialize(comp.plan);
+    m.outDescBlob = rune::codec::serialize(comp.outputDescriptor);
+    m.srcDescBlob = rune::codec::serialize(src);
+    ASSERT_TRUE(rune::node::encodeViewPlanUpdate(
+        ch.install, rune::node::ViewSnapshotChannel::kInstallMsgType, m));
+
+    std::vector<uint8_t> value;
+    auto le = [&](uint64_t x, int n) { for (int i = 0; i < n; ++i) value.push_back(uint8_t(x >> (8 * i))); };
+    le(12, 2); le(1, 2); le(7, 8); le(55, 4);
+    std::vector<uint8_t> key(8, 0); key[0] = 7;
+    ASSERT_GE(f.replica->appendKeyed(std::span<const uint8_t>(key.data(), key.size()),
+                                     std::span<const uint8_t>(value.data(), value.size()),
+                                     /*acksAll=*/false), 0);
+
+    Worker w(/*workerId=*/0);
+    w.setOwnedDirect(Worker::OwnedSet{f.replica.get()});
+    w.setViewSet(&vs);
+    EXPECT_TRUE(w.viewsReady()) << "no instance hosted yet: the gate is inert";
+
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = nullptr;
+    for (int i = 0; i < 200 && row == nullptr; ++i) {          // bounded: RC build + HW + rebuild
+        w.doWork(1'000'000LL * (i + 1));
+        row = vs.getRow(kView, 0, 7, L);                       // nullptr until the instance is Ready
+    }
+    ASSERT_NE(row, nullptr) << "the recovery view over a transient source must reach Ready and serve";
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 55);
+    EXPECT_EQ(vs.readiness(kView, 0), rune::node::ViewReadiness::Ready);
+    EXPECT_EQ(vs.viewCount(), 1u) << "the recovery install materialized its instance";
+    EXPECT_FALSE(vs.hasRecovery()) << "recovery latches off once every instance is Ready";
+    EXPECT_TRUE(w.viewsReady()) << "election-eligibility gate must open";
 }

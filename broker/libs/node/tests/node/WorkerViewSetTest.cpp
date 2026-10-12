@@ -946,10 +946,23 @@ std::vector<uint8_t> upsertAt(int64_t base, int64_t key, int32_t hp) {
 }
 } // namespace
 
+namespace {
+// n upserts (keys base..base+n-1, hp = key) in ONE batch at offsets [base,base+n).
+std::vector<uint8_t> upsertRun(int64_t base, int n) {
+    rune::protocol::RecordBatchBuilder b(base, 0);
+    for (int i = 0; i < n; ++i) {
+        const auto k = keyBytes(base + i);
+        const auto v = encodeCharacter(base + i, static_cast<int32_t>(base + i), 1);
+        b.append(asSv(k), asSv(v), 0);
+    }
+    return b.build();
+}
+} // namespace
+
 // Invariant breach: a view over a transient topic is itself transient, so its
-// cursor can never sit above the source end.  If it does (e.g. a legacy persisted
-// view over a transient source after a restart: the source restarted EMPTY and
-// reuses offsets 0.. below the cursor) the rows are kept, one warn is logged, and every post-restart record must fold (without the reset the
+// cursor can never sit above the source end.  If it does (the source restarted
+// EMPTY and reuses offsets 0.. below a live cursor) the rows are kept, one warn
+// is logged, and every post-restart record must fold (without the reset the
 // cursor 2 would silently skip the new record at offset 0).
 TEST(WorkerViewSetRegression, TransientSourceCursorAboveLogEndIsInvariantBreachRegression) {
     auto src = charSourceV1();
@@ -961,27 +974,28 @@ TEST(WorkerViewSetRegression, TransientSourceCursorAboveLogEndIsInvariantBreachR
 
     const auto before = twoUpsertsKey7();                                    // offsets [0,2)
     auto rr0 = [&](int64_t, int64_t) { return rune::storage::LogReadView{before.data(), before.size(), 0, 2}; };
-    vs.driveFolds(5, 0, rr0, 2, 0);
+    const rune::node::TransientBounds tb0{0, 2};
+    vs.driveFolds(5, 0, rr0, 2, 0, &tb0);
     const rune::view::RowLayout* L = nullptr;
     ASSERT_NE(vs.getRow(0x40000031, 0, 7, L), nullptr);
 
     // Source restarted empty: logStart 0, logEnd 0 < cursor 2.
-    EXPECT_EQ(vs.reconcileTransientSource(5, 0, /*logStart*/ 0, /*logEnd*/ 0), 1);
-    ASSERT_NE(vs.foldCounters(0x40000031, 0), nullptr);
-
     const auto after = upsertAt(0, 9, 77);                                   // reused offset 0
     auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{after.data(), after.size(), 0, 1}; };
-    vs.driveFolds(5, 0, rr1, 1, 0);
+    const rune::node::TransientBounds tb1{0, 0};
+    vs.driveFolds(5, 0, rr1, 0, 0, &tb1);                                    // breach: cursor -> 0
+    const rune::node::TransientBounds tb2{0, 1};
+    vs.driveFolds(5, 0, rr1, 1, 0, &tb2);
     const uint8_t* row9 = vs.getRow(0x40000031, 0, 9, L);
     ASSERT_NE(row9, nullptr) << "a post-restart record at a reused offset must fold";
     EXPECT_EQ(rune::view::readSlot(row9, *L, 1).i, 77);
     EXPECT_NE(vs.getRow(0x40000031, 0, 7, L), nullptr) << "pre-restart rows are kept";
-    EXPECT_EQ(vs.reconcileTransientSource(5, 0, 0, 1), 0) << "steady state: nothing to adjust";
+    EXPECT_EQ(vs.foldCounters(0x40000031, 0)->transientRecordsEvicted, 0u);
 }
 
 // The ring evicted records the view had not folded yet: skip to logStart and
-// count the loss — never stall on an offset the source no longer has.
-TEST(WorkerViewSetRegression, TransientSourceEvictionAheadOfCursorSkipsAndCounts) {
+// count the loss -- never stall on an offset the source no longer has.
+TEST(WorkerViewSetRegression, TransientSourceEvictionAheadOfCursorSkipsAndCountsRegression) {
     auto src = charSourceV1();
     const rune::codec::Descriptor* srcs[] = {&src};
     auto comp = rune::view::compileView(hpView(1), srcs, 0x40000032).value();
@@ -990,18 +1004,81 @@ TEST(WorkerViewSetRegression, TransientSourceEvictionAheadOfCursorSkipsAndCounts
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
 
     auto empty = [](int64_t, int64_t) { return rune::storage::LogReadView{}; };
-    vs.driveFolds(5, 0, empty, 0, 0);                       // instance exists, cursor 0
+    const rune::node::TransientBounds tb0{0, 0};
+    vs.driveFolds(5, 0, empty, 0, 0, &tb0);                 // instance exists, Live at cursor 0
     ASSERT_NE(vs.foldCounters(0x40000032, 0), nullptr);
-
-    EXPECT_EQ(vs.reconcileTransientSource(5, 0, /*logStart*/ 3, /*logEnd*/ 4), 1);
-    EXPECT_EQ(vs.foldCounters(0x40000032, 0)->transientRecordsEvicted, 3u);
 
     const auto b = upsertAt(3, 11, 5);                      // the surviving record at offset 3
     auto rr = [&](int64_t from, int64_t) {
         EXPECT_EQ(from, 3) << "the fold resumes at logStart, not at the evicted cursor";
         return rune::storage::LogReadView{b.data(), b.size(), 3, 4};
     };
-    vs.driveFolds(5, 0, rr, 4, 0);
+    const rune::node::TransientBounds tb1{3, 4};
+    vs.driveFolds(5, 0, rr, 4, 0, &tb1);
+    EXPECT_EQ(vs.foldCounters(0x40000032, 0)->transientRecordsEvicted, 3u);
     const rune::view::RowLayout* L = nullptr;
     ASSERT_NE(vs.getRow(0x40000032, 0, 11, L), nullptr);
+}
+
+// M1: an instance created AFTER the ring already evicted records starts at
+// logStart in the SAME pass (no empty pass) and does not count the earlier
+// eviction as a loss -- the view never had those records to lose.
+TEST(WorkerViewSetRegression, TransientFreshInstanceStartsAtLogStartWithoutCountingRegression) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(1), srcs, 0x40000034).value();
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-transient-fresh");
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+
+    const auto b = upsertAt(5, 12, 9);
+    auto rr = [&](int64_t from, int64_t) {
+        EXPECT_EQ(from, 5);
+        return rune::storage::LogReadView{b.data(), b.size(), 5, 6};
+    };
+    const rune::node::TransientBounds tb{5, 6};
+    EXPECT_GT(vs.driveFolds(5, 0, rr, 6, 0, &tb), 0);
+    const rune::view::RowLayout* L = nullptr;
+    ASSERT_NE(vs.getRow(0x40000034, 0, 12, L), nullptr) << "folded on the creating pass";
+    EXPECT_EQ(vs.foldCounters(0x40000034, 0)->transientRecordsEvicted, 0u);
+}
+
+// I1: a RECOVERED cursor (checkpoint of an earlier source incarnation) is
+// meaningless once the source restarted and reuses offsets -- even when the new
+// incarnation has already caught up PAST the cursor (logEnd >= O), where a
+// plain "cursor > logEnd" check would miss it and skip [logStart, O).
+TEST(WorkerViewSetRegression, TransientRecoveredCursorIsReconciledEvenWhenSourceCaughtUpRegression) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(0), srcs, 0x40000033).value();
+
+    rune::node::ViewSnapshotChannel ch1;
+    rune::node::WorkerViewSet vs1(ch1, "/tmp/rune-views-transient-rec1");
+    vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
+    const auto b1 = twoUpsertsKey7();                                        // checkpoint O = 2
+    auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{b1.data(), b1.size(), 0, 2}; };
+    vs1.driveFolds(5, 0, rr1, 2, 0);
+    const auto deltas = drainDeltas(ch1);
+    ASSERT_EQ(deltas.size(), 1u);
+
+    rune::node::ViewSnapshotChannel ch2;
+    rune::node::WorkerViewSet vs2(ch2, "/tmp/rune-views-transient-rec2");
+    const std::span<const uint8_t> recs[] = {deltas[0]};
+    vs2.installViewForRecovery(comp.plan, comp.rowLayout, src, /*persisted*/ true, 0, {}, recs,
+                               /*committedTail*/ 5);
+
+    // The restarted source already holds [0,5) of NEW data (logEnd 5 >= O 2).
+    const auto fresh = upsertRun(0, 5);                                      // keys 0..4
+    auto rr2 = [&](int64_t from, int64_t) {
+        EXPECT_EQ(from, 0) << "recovered cursor must restart at logStart";
+        return rune::storage::LogReadView{fresh.data(), fresh.size(), 0, 5};
+    };
+    const rune::node::TransientBounds tb{0, 5};
+    vs2.driveRebuild(5, 0, rr2, 5, 0, &tb);
+    vs2.driveFolds(5, 0, rr2, 5, 0, &tb);
+    const rune::view::RowLayout* L = nullptr;
+    ASSERT_NE(vs2.getRow(0x40000033, 0, 0, L), nullptr) << "offset 0 (< recovered O) must fold";
+    ASSERT_NE(vs2.getRow(0x40000033, 0, 1, L), nullptr) << "offset 1 (< recovered O) must fold";
+    ASSERT_NE(vs2.getRow(0x40000033, 0, 4, L), nullptr);
+    EXPECT_NE(vs2.getRow(0x40000033, 0, 7, L), nullptr) << "checkpoint rows are kept";
 }

@@ -322,31 +322,42 @@ void WorkerViewSet::materializeRecoveryInstancesFor(int32_t srcTopicId, int32_t 
     }
 }
 
-int WorkerViewSet::reconcileTransientSource(int32_t srcTopicId, int32_t partition,
-                                            int64_t logStart, int64_t logEnd) {
-    auto it = subscriptionIndex_.find(srcTopicId);
-    if (it == subscriptionIndex_.end()) return 0;
-    int adjusted = 0;
-    for (int32_t viewTopicId : it->second) {
-        auto vit = views_.find(instKey(viewTopicId, partition));
-        if (vit == views_.end()) continue;
-        ViewInstance& inst = vit->second;
-        if (inst.foldCursor > logEnd) {                       // INVARIANT BREACH
-            spdlog::warn("WorkerViewSet: view {} partition {}: transient source {} restarted below "
-                         "the view's cursor (cursor={} > source end={}) — invariant breach "
-                         "(a view over a transient source must be transient); keeping the rows, "
-                         "re-folding from offset {}",
-                         viewTopicId, partition, srcTopicId, inst.foldCursor, logEnd, logStart);
-            inst.foldCursor = logStart;
-            ++adjusted;
-        } else if (inst.foldCursor < logStart) {              // EVICTED
-            inst.counters.transientRecordsEvicted +=
-                static_cast<uint64_t>(logStart - inst.foldCursor);
-            inst.foldCursor = logStart;
-            ++adjusted;
+int WorkerViewSet::reconcileTransient_(ViewInstance& inst, const TransientBounds& tb) {
+    const int32_t viewTopicId = inst.plan.viewTopicId;
+    switch (inst.cursorState) {
+    case CursorState::Fresh:                                  // new instance: start at logStart
+        inst.cursorState = CursorState::Live;
+        if (inst.foldCursor == tb.logStart) return 0;
+        inst.foldCursor = tb.logStart;
+        return 1;
+    case CursorState::RecoveredUnreconciled:                  // checkpoint of an older incarnation
+        spdlog::warn("WorkerViewSet: view {} partition {}: recovered checkpoint cursor {} refers to "
+                     "an earlier incarnation of its transient source (now [{}, {})) -- invariant "
+                     "breach (a view over a transient source must be transient); keeping the rows, "
+                     "re-folding from offset {}",
+                     viewTopicId, inst.partition, inst.foldCursor, tb.logStart, tb.logEnd,
+                     tb.logStart);
+        inst.cursorState = CursorState::Live;
+        inst.foldCursor  = tb.logStart;
+        return 1;
+    case CursorState::Live:
+        if (inst.foldCursor > tb.logEnd) {                    // INVARIANT BREACH
+            spdlog::warn("WorkerViewSet: view {} partition {}: cursor {} is above its transient "
+                         "source end {} -- invariant breach (a view over a transient source must "
+                         "be transient); keeping the rows, re-folding from offset {}",
+                         viewTopicId, inst.partition, inst.foldCursor, tb.logEnd, tb.logStart);
+            inst.foldCursor = tb.logStart;
+            return 1;
         }
+        if (inst.foldCursor < tb.logStart) {                  // EVICTED
+            inst.counters.transientRecordsEvicted +=
+                static_cast<uint64_t>(tb.logStart - inst.foldCursor);
+            inst.foldCursor = tb.logStart;
+            return 1;
+        }
+        return 0;
     }
-    return adjusted;
+    return 0;
 }
 
 ViewInstance* WorkerViewSet::getOrCreate_(int32_t viewTopicId, int32_t partition,
@@ -440,6 +451,7 @@ void WorkerViewSet::loadRecoveryCheckpoint_(ViewInstance& inst, int32_t viewTopi
     logRecovered(inst, recoveredO, applied);
     discardDirty_(inst);  // restored rows == the durable checkpoint: nothing to re-send
     inst.foldCursor   = std::max<int64_t>(recoveredO, 0);
+    if (recoveredO >= 0) inst.cursorState = CursorState::RecoveredUnreconciled;
     inst.lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
     inst.readiness = (inst.foldCursor >= committedTail) ? ViewReadiness::Ready
                                                         : ViewReadiness::RebuildingViews;
@@ -492,6 +504,7 @@ void WorkerViewSet::installViewForRecovery(
     logRecovered(*inst, recoveredO, applied);
     discardDirty_(*inst);  // restored rows == the durable checkpoint: nothing to re-send
     inst->foldCursor   = std::max<int64_t>(recoveredO, 0);
+    if (recoveredO >= 0) inst->cursorState = CursorState::RecoveredUnreconciled;
     inst->lastEncodedO = recoveredO;  // the durable offset we recovered from (may be -1)
 
     // REBUILDING_VIEWS unless the source is already caught up (then Ready now:
