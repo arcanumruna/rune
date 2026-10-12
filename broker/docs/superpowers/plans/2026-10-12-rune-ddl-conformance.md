@@ -167,9 +167,9 @@ B's expected cell = `table[stateWhenBExecutes][B]`, with two **concurrency excep
 ## Execution context
 
 - **Repos / branch:** `feat/phase2b-e-transient-topics` in
-  - `/Users/vradu/Projects/se-worktrees/rune-broker`
-  - `/Users/vradu/Projects/se-worktrees/rune-protocol`
-  - `/Users/vradu/Projects/se-worktrees/rune-client-cpp`
+  - `/Users/vradu/Projects/ddl-worktrees/rune-broker`
+  - `/Users/vradu/Projects/ddl-worktrees/rune-protocol`
+  - `/Users/vradu/Projects/ddl-worktrees/rune-client-cpp`
 - **Preconditions:**
   - Base heads: broker `8a693c5`, protocol `4af59b1`, client `46f2ff6`. Both the Part E fix wave and the no-hang wave (R1–R3, plus the gateway-wide "every request is answered" fix) are in. Verify with `git -C <repo> log --oneline -1`.
   - What the no-hang wave changed that this plan builds on:
@@ -178,12 +178,12 @@ B's expected cell = `table[stateWhenBExecutes][B]`, with two **concurrency excep
     - **AdminWorker (R1):** `startNext_` answers `InvalidSchema` for a direct `DefineTopicMsg.persistence > 1` before parsing. `startCreateView_` answers `InvalidSchema` for `malformed || persistence > 1`. `onCreateTopicReply` answers `Internal` for an unknown reply mode. `createTopicForAdmin` refuses an unknown mode (`topicId -1`).
     - **DDL answer backlog:** BrokerNode keeps DDL answers that hit a full admin→control egress ring in a FIFO backlog and retries them every `doWork`. `AdminDeps::respond*` signatures are unchanged. `DdlHarness`'s respond deps model the egress without the backlog, which `SchemaGatewayRegression.DdlAnswerOnAFullEgressRingIsBackloggedNotDroppedRegression` already covers.
   - Before Tasks 5 and 6, re-read `AdminWorker.cpp::startNext_` / `startCreateView_` / `onCreateTopicReply` and `AdminCreateTopic.h` at `8a693c5`, and anchor each edit on the code as it is.
-- **Build (broker):** `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target <target>`. `build-fast` is already configured; `RUNE_PROTOCOL_INCLUDE` resolves to `../rune-protocol/include`. Re-run `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast` after a `CMakeLists.txt` edit.
+- **Build (broker):** `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target <target>`. `build-fast` is already configured; `RUNE_PROTOCOL_INCLUDE` resolves to `../rune-protocol/include`. Re-run `cmake /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast` after a `CMakeLists.txt` edit.
 - **Build (protocol / client):** each repo's `build` dir: `cmake --build build -j --target rune_protocol_tests` / the client's tests.
 - **Regression gate before EVERY commit (CLAUDE.md #7), in every repo the commit touches:**
-  - broker: `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8`
-  - protocol: `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-protocol/build -R Regression --output-on-failure`
-  - client: `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R Regression --output-on-failure -j8`
+  - broker: `ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8`
+  - protocol: `ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-protocol/build -R Regression --output-on-failure`
+  - client: `ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-client-cpp/build -R Regression --output-on-failure -j8`
   - then the touched targets' full `ctest`.
 - Nothing is pushed. Every commit message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
@@ -273,9 +273,9 @@ B's expected cell = `table[stateWhenBExecutes][B]`, with two **concurrency excep
 **Repos:** rune-protocol, rune-client-cpp
 
 **Files:**
-- Modify: `/Users/vradu/Projects/se-worktrees/rune-protocol/include/rune/protocol/client/Protocol.h` (enum `ErrorCode`, after `InvalidRequest = 39`, ~L155-158 at `4af59b1`)
-- Test: `/Users/vradu/Projects/se-worktrees/rune-protocol/tests/protocol/client/ViewMessagesTest.cpp` (after `ViewMessagesRegression.InvalidRequestAndViewRowStatusesArePinnedRegression`, ~L205)
-- Modify: `/Users/vradu/Projects/se-worktrees/rune-client-cpp/include/rune/client/Client.h` (`DefineTopicResult` ~L95, `CreateViewResult` comment ~L124-128)
+- Modify: `/Users/vradu/Projects/ddl-worktrees/rune-protocol/include/rune/protocol/client/Protocol.h` (enum `ErrorCode`, after `InvalidRequest = 39`, ~L155-158 at `4af59b1`)
+- Test: `/Users/vradu/Projects/ddl-worktrees/rune-protocol/tests/protocol/client/ViewMessagesTest.cpp` (after `ViewMessagesRegression.InvalidRequestAndViewRowStatusesArePinnedRegression`, ~L205)
+- Modify: `/Users/vradu/Projects/ddl-worktrees/rune-client-cpp/include/rune/client/Client.h` (`DefineTopicResult` ~L95, `CreateViewResult` comment ~L124-128)
 
 **Interfaces:**
 - Produces:
@@ -301,7 +301,7 @@ TEST(ViewMessagesRegression, ViewSourceIsViewCodeIsPinned) {
 ```
 
 - [ ] **Step 2: Run it and confirm it fails.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-protocol/build -j --target rune_protocol_tests`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-protocol/build -j --target rune_protocol_tests`
   Expected: compile errors `no member named 'InvalidTopicName'` and `no member named 'ViewSourceIsView'` in `rune::protocol::client::ErrorCode`.
 
 - [ ] **Step 3: Implement.** In `Protocol.h`, after the `InvalidRequest = 39, …` entry (keep its four comment lines):
@@ -331,19 +331,19 @@ with
 /// another view's output — not supported until Phase 3),`
 
 - [ ] **Step 4: Run the tests and confirm they pass.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-protocol/build -j --target rune_protocol_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-protocol/build -R Regression --output-on-failure`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-protocol/build -j --target rune_protocol_tests && ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-protocol/build -R Regression --output-on-failure`
   Expected: PASS, including `ViewMessagesRegression.InvalidTopicNameCodeIsPinned` and `ViewMessagesRegression.ViewSourceIsViewCodeIsPinned`.
-  Run the client build: `cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j` → builds; then `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R Regression --output-on-failure -j8` → PASS.
+  Run the client build: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-client-cpp/build -j` → builds; then `ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-client-cpp/build -R Regression --output-on-failure -j8` → PASS.
 
 - [ ] **Step 5: Commit (two repos).**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-protocol add include/rune/protocol/client/Protocol.h tests/protocol/client/ViewMessagesTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-protocol commit -m "feat(protocol): ErrorCode::InvalidTopicName = 40 (DDL name rule), ViewSourceIsView = 41
+git -C /Users/vradu/Projects/ddl-worktrees/rune-protocol add include/rune/protocol/client/Protocol.h tests/protocol/client/ViewMessagesTest.cpp
+git -C /Users/vradu/Projects/ddl-worktrees/rune-protocol commit -m "feat(protocol): ErrorCode::InvalidTopicName = 40 (DDL name rule), ViewSourceIsView = 41
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add include/rune/client/Client.h
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "docs(client): defineTopic/createView may answer InvalidTopicName=40, TopicExists for a case variant, ViewSourceIsView=41
+git -C /Users/vradu/Projects/ddl-worktrees/rune-client-cpp add include/rune/client/Client.h
+git -C /Users/vradu/Projects/ddl-worktrees/rune-client-cpp commit -m "docs(client): defineTopic/createView may answer InvalidTopicName=40, TopicExists for a case variant, ViewSourceIsView=41
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -434,7 +434,7 @@ TEST(TopicNameRegression, EveryErrorHasAHumanReadableText) {
 ```
 
 - [ ] **Step 2: Add the file to CMake and confirm it fails.** In `libs/node/CMakeLists.txt`, in `add_executable(rune_node_tests …)`, add the line `        tests/node/TopicNameTest.cpp` after `        tests/node/RuntimeTopicRecoveryTest.cpp`.
-  Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_node_tests`
+  Run: `cmake /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_node_tests`
   Expected: FAIL, `'rune/node/TopicName.h' file not found`.
 
 - [ ] **Step 3: Implement** `libs/node/include/rune/node/TopicName.h`:
@@ -519,15 +519,15 @@ enum class TopicNameError : uint8_t { None, Empty, TooLong, DotSegment, BadChar,
 ```
 
 - [ ] **Step 4: Run the tests and confirm they pass.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_node_tests && /Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_node_tests --gtest_filter='TopicNameRegression.*'`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_node_tests && /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_node_tests --gtest_filter='TopicNameRegression.*'`
   Expected: 6 PASS.
 
 - [ ] **Step 5: Regression gate, then commit.**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/include/rune/node/TopicName.h libs/node/tests/node/TopicNameTest.cpp libs/node/CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(node): TopicName.h — one safe-path-segment rule for DDL names + ASCII case fold
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/node/include/rune/node/TopicName.h libs/node/tests/node/TopicNameTest.cpp libs/node/CMakeLists.txt
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "feat(node): TopicName.h — one safe-path-segment rule for DDL names + ASCII case fold
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -627,7 +627,7 @@ TEST(RuntimeTopicRecoveryRegression, PlaceholdersAreLoggedOnceRegression) {
 ```
 
 - [ ] **Step 2: Run them and confirm they fail.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_node_tests`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_node_tests`
   Expected: compile error `no member named 'orphanPlaceholderName'`.
 
 - [ ] **Step 3: Implement.** In `RuntimeTopicRecovery.h`, replace the `@throws` paragraph of `recoverRuntimeTopicSpecs` with:
@@ -695,15 +695,15 @@ Replace the contiguity block. It starts at `    // ── contiguity: TopicRegis
 ```
 
 - [ ] **Step 4: Run the tests and confirm they pass.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_node_tests && /Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_node_tests --gtest_filter='RuntimeTopicRecoveryRegression.*'`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_node_tests && /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_node_tests --gtest_filter='RuntimeTopicRecoveryRegression.*'`
   Expected: all PASS. `IdGapFailsLoud` no longer exists.
 
 - [ ] **Step 5: Regression gate, then commit.**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/include/rune/node/RuntimeTopicRecovery.h libs/node/src/RuntimeTopicRecovery.cpp libs/node/tests/node/RuntimeTopicRecoveryTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "fix(recovery): catalog-less topic ids become hidden zero-partition __orphan.<id> placeholders, logged once — boot no longer fails after a failed CREATE VIEW (B5)
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/node/include/rune/node/RuntimeTopicRecovery.h libs/node/src/RuntimeTopicRecovery.cpp libs/node/tests/node/RuntimeTopicRecoveryTest.cpp
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "fix(recovery): catalog-less topic ids become hidden zero-partition __orphan.<id> placeholders, logged once — boot no longer fails after a failed CREATE VIEW (B5)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -946,7 +946,7 @@ TEST(RuntimeTopicRecoveryRegression, MissingTopicsDirIsANoOpRegression) {
 Add `#include <fstream>`, `#include <string_view>`, `#include <rune/gateway/TopicRegistry.h>` and `#include <rune/storage/Log.h>` (if not already present) to the test's includes.
 
 - [ ] **Step 2: Run them and confirm they fail.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_node_tests`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_node_tests`
   Expected: compile errors `no member named 'reconcileTopicDirs'` and `no member named 'kTopicIdMarkerFile'`.
 
 - [ ] **Step 3: Implement.**
@@ -1134,15 +1134,15 @@ Add `#include <climits>` for `INT32_MAX`.
 ```
 
 - [ ] **Step 4: Run the tests and confirm they pass.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_node_tests rune_broker_node_tests && /Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_node_tests --gtest_filter='RuntimeTopicRecoveryRegression.*'`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_node_tests rune_broker_node_tests && /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_node_tests --gtest_filter='RuntimeTopicRecoveryRegression.*'`
   Expected: all PASS, including the 10 new tests.
 
 - [ ] **Step 5: Regression gate, then commit.**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/gateway/include/rune/gateway/TopicRegistry.h libs/gateway/src/TopicRegistry.cpp libs/node/include/rune/node/RuntimeTopicRecovery.h libs/node/src/RuntimeTopicRecovery.cpp libs/node/src/BrokerNode.cpp libs/node/tests/node/RuntimeTopicRecoveryTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "fix(recovery): boot deletes only orphan-placeholder topic dirs and quarantines every other unclaimed dir (never deletes it); topic-id marker (B10)
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/gateway/include/rune/gateway/TopicRegistry.h libs/gateway/src/TopicRegistry.cpp libs/node/include/rune/node/RuntimeTopicRecovery.h libs/node/src/RuntimeTopicRecovery.cpp libs/node/src/BrokerNode.cpp libs/node/tests/node/RuntimeTopicRecoveryTest.cpp
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "fix(recovery): boot deletes only orphan-placeholder topic dirs and quarantines every other unclaimed dir (never deletes it); topic-id marker (B10)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1308,7 +1308,7 @@ TEST(DdlHarnessRegression, OrphanThenLaterTopicRestartsWithAPlaceholder) {
         PROPERTIES TIMEOUT 120)
 ```
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests`
+Run: `cmake /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests`
 Expected: FAIL, `'support/DdlHarness.h' file not found`.
 
 - [ ] **Step 3: AdminWorker introspection.** In `AdminWorker.h`, after the `rebuildFailed()` accessor, add:
@@ -2040,16 +2040,16 @@ private:
 ```
 
 - [ ] **Step 6: Run the tests and confirm they pass.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='DdlHarnessRegression.*'`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='DdlHarnessRegression.*'`
   Expected: 4 PASS.
   If `HeldCommitKeepsTheOpInFlightUntilReleased` never sees the commit, check `release_`: the fetch must carry the leader's current epoch, and its offset must be the leader's LEO.
 
 - [ ] **Step 7: Regression gate, then commit.**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/include/rune/node/AdminWorker.h libs/node/src/AdminWorker.cpp libs/node/tests/support/DdlExpectations.h libs/node/tests/support/DdlHarness.h libs/node/tests/node/DdlHarnessRegressionTest.cpp libs/node/CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(ddl): DdlHarness + expectation table; AdminWorker hasInFlight/startedCount introspection
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/node/include/rune/node/AdminWorker.h libs/node/src/AdminWorker.cpp libs/node/tests/support/DdlExpectations.h libs/node/tests/support/DdlHarness.h libs/node/tests/node/DdlHarnessRegressionTest.cpp libs/node/CMakeLists.txt
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "test(ddl): DdlHarness + expectation table; AdminWorker hasInFlight/startedCount introspection
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2145,7 +2145,7 @@ TEST(DdlFixRegression, B1_ControlThreadRefusesInvalidRequestsDefensively) {
 ```
 
 - [ ] **Step 2: Run them and confirm they fail.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='DdlFixRegression.B1*:DdlFixRegression.B2*:DdlFixRegression.B6*'`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='DdlFixRegression.B1*:DdlFixRegression.B2*:DdlFixRegression.B6*'`
   Expected: FAIL. Today the names reach `createTopic`: codes 0 or 6, `escape` exists, and `zero_parts` answers 0.
 
 - [ ] **Step 3: Implement.**
@@ -2205,14 +2205,14 @@ In `AdminCreateTopic.h`, add `#include <rune/node/TopicName.h>`. Make the start 
 
 In `AdminChannels.h` `decodeCreateTopicReq`, replace the comment `// on the control thread (createTopic rejects "")` with `// on the control thread (createTopicForAdmin refuses an invalid name)`.
 
-- [ ] **Step 4: Run the tests and confirm they pass.** Same command as Step 2 → PASS. Also run `/Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_create_view_tests` and `rune_schema_gateway_tests` → PASS (their names are valid).
+- [ ] **Step 4: Run the tests and confirm they pass.** Same command as Step 2 → PASS. Also run `/Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_create_view_tests` and `rune_schema_gateway_tests` → PASS (their names are valid).
 
 - [ ] **Step 5: Regression gate, then commit.**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/src/AdminWorker.cpp libs/node/include/rune/node/AdminWorker.h libs/node/include/rune/node/AdminCreateTopic.h libs/node/include/rune/node/AdminChannels.h libs/node/tests/node/DdlHarnessRegressionTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "fix(admin): validate DDL names (InvalidTopicName=40; no path traversal, reserved __ names) and partitions>=1 (B1/B2/B6)
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/node/src/AdminWorker.cpp libs/node/include/rune/node/AdminWorker.h libs/node/include/rune/node/AdminCreateTopic.h libs/node/include/rune/node/AdminChannels.h libs/node/tests/node/DdlHarnessRegressionTest.cpp
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "fix(admin): validate DDL names (InvalidTopicName=40; no path traversal, reserved __ names) and partitions>=1 (B1/B2/B6)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2280,7 +2280,7 @@ TEST(NodeConfigRegression, RuneTopicsValidNamesStillParseRegression) {
 ```
 
 - [ ] **Step 2: Run them and confirm they fail.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_node_tests && /Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_node_tests --gtest_filter='NodeConfigRegression.RuneTopics*'`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_node_tests && /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_node_tests --gtest_filter='NodeConfigRegression.RuneTopics*'`
   Expected: the two "is a config error" tests FAIL (today they parse); `RuneTopicsValidNamesStillParseRegression` PASSES.
 
 - [ ] **Step 3: Implement.** In `NodeConfig.cpp`, add `#include <rune/node/TopicName.h>` after `#include <rune/node/NodeConfig.h>`. Replace
@@ -2312,14 +2312,14 @@ with
 
 The existing empty-name check above it is unchanged; it still runs first, with its own message.
 
-- [ ] **Step 4: Run the tests and confirm they pass.** Same command as Step 2 → 3 PASS. Then run the whole binary: `/Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_node_tests --gtest_filter='NodeConfig*'` → all PASS. Every existing RUNE_TOPICS test name (`chat`, `inventory`, `entities`, `presence`, `orders`, `z`, `a`, `m`, …) is valid.
+- [ ] **Step 4: Run the tests and confirm they pass.** Same command as Step 2 → 3 PASS. Then run the whole binary: `/Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_node_tests --gtest_filter='NodeConfig*'` → all PASS. Every existing RUNE_TOPICS test name (`chat`, `inventory`, `entities`, `presence`, `orders`, `z`, `a`, `m`, …) is valid.
 
 - [ ] **Step 5: Regression gate, then commit.**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/src/NodeConfig.cpp libs/node/tests/node/NodeConfigTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "fix(config): RUNE_TOPICS names obey the DDL name rule; case-only duplicates are a config error (B7)
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/node/src/NodeConfig.cpp libs/node/tests/node/NodeConfigTest.cpp
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "fix(config): RUNE_TOPICS names obey the DDL name rule; case-only duplicates are a config error (B7)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2413,7 +2413,7 @@ TEST(DdlFixRegression, B3_CaseConflictCrossesTheReplyRing) {
 ```
 
 - [ ] **Step 2: Run them and confirm they fail.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests`
   Expected: compile errors `no member named 'topicIdForFoldedName'` and `no member named 'caseConflict'`.
 
 - [ ] **Step 3: Implement.**
@@ -2543,15 +2543,15 @@ In `onCreateTopicReply`, immediately after the stale-reply guard `if (state_ != 
 Add `#include <optional>` to `TopicRegistry.h` if it is not already included (it is: `<optional>` is in its include list).
 
 - [ ] **Step 4: Run the tests and confirm they pass.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests rune_create_view_tests rune_schema_gateway_tests rune_node_tests && /Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='DdlFixRegression.B3*'`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests rune_create_view_tests rune_schema_gateway_tests rune_node_tests && /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='DdlFixRegression.B3*'`
   Expected: 4 PASS.
 
 - [ ] **Step 5: Regression gate, then commit.**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/gateway/include/rune/gateway/TopicRegistry.h libs/gateway/src/TopicRegistry.cpp libs/node/include/rune/node/AdminChannels.h libs/node/include/rune/node/AdminCreateTopic.h libs/node/include/rune/node/AdminWorker.h libs/node/src/AdminWorker.cpp libs/node/src/BrokerNode.cpp libs/node/tests/support/DdlHarness.h libs/node/tests/node/DdlHarnessRegressionTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "fix(admin): a name differing only in letter case from an existing topic is TopicExists — no shared log dir (B3)
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/gateway/include/rune/gateway/TopicRegistry.h libs/gateway/src/TopicRegistry.cpp libs/node/include/rune/node/AdminChannels.h libs/node/include/rune/node/AdminCreateTopic.h libs/node/include/rune/node/AdminWorker.h libs/node/src/AdminWorker.cpp libs/node/src/BrokerNode.cpp libs/node/tests/support/DdlHarness.h libs/node/tests/node/DdlHarnessRegressionTest.cpp
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "fix(admin): a name differing only in letter case from an existing topic is TopicExists — no shared log dir (B3)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2645,7 +2645,7 @@ TEST(DdlFixRegression, KL2_TimeoutInAwaitingCommitIsInDoubtAndReplayedOnRestart)
 ```
 
 - [ ] **Step 2: Run them and confirm they fail.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='DdlFixRegression.B4*:DdlFixRegression.KL2*'`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='DdlFixRegression.B4*:DdlFixRegression.KL2*'`
   Expected: both `B4_DemotionAnswers…` tests FAIL (no response after `demote()`). `B4_Repromotion…` and `KL2_…` may already pass, which is expected: they are pins.
 
 - [ ] **Step 3: Implement.** In `AdminWorker::onRole`'s `else` branch, after `wasLeader_ = false;  // next promotion re-triggers rebuild`, add:
@@ -2668,14 +2668,14 @@ In `advance_`, replace the whole timeout `if` block (from `    if (nowNs - inFli
     }
 ```
 
-- [ ] **Step 4: Run the tests and confirm they pass.** Same command as Step 2 → all PASS. Also run `/Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_node_tests --gtest_filter='AdminWorker*'` → PASS, including `FollowerRejectsDefine`.
+- [ ] **Step 4: Run the tests and confirm they pass.** Same command as Step 2 → all PASS. Also run `/Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_node_tests --gtest_filter='AdminWorker*'` → PASS, including `FollowerRejectsDefine`.
 
 - [ ] **Step 5: Regression gate, then commit.**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/src/AdminWorker.cpp libs/node/tests/node/DdlHarnessRegressionTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "fix(admin): demotion answers the in-flight DDL op at once, never commits it off a follower HW (B4); pin KL2 in-doubt
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/node/src/AdminWorker.cpp libs/node/tests/node/DdlHarnessRegressionTest.cpp
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "fix(admin): demotion answers the in-flight DDL op at once, never commits it off a follower HW (B4); pin KL2 in-doubt
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2744,7 +2744,7 @@ TEST(DdlFixRegression, B8_ARejectedAlterNeverMovesKeyField) {
 Add `#include <rune/codec/AlterOps.h>` to the test's includes.
 
 - [ ] **Step 2: Run them and confirm they fail.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='DdlFixRegression.B8*'`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='DdlFixRegression.B8*'`
   Expected: `B8_RenamingTheKeyField…` and `B8_ChainedRenames…` FAIL (keyField stays `id`). The other two PASS as pins.
 
 - [ ] **Step 3: Implement.** In `startAlter_`, immediately before the comment `    // g. build the new durable TopicSchema …`, add:
@@ -2766,14 +2766,14 @@ and in step g replace `    ts.keyField       = latest->keyField;` with:
     ts.keyField       = keyField;                          // follows a key-field RENAME (B8)
 ```
 
-- [ ] **Step 4: Run the tests and confirm they pass.** Same command as Step 2 → 4 PASS. Also run `/Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_node_tests --gtest_filter='AdminWorker*'` → PASS.
+- [ ] **Step 4: Run the tests and confirm they pass.** Same command as Step 2 → 4 PASS. Also run `/Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_node_tests --gtest_filter='AdminWorker*'` → PASS.
 
 - [ ] **Step 5: Regression gate, then commit.**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/src/AdminWorker.cpp libs/node/tests/node/DdlHarnessRegressionTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "fix(admin): ALTER renaming the key field moves TopicSchema.keyField (live and across restart) (B8)
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/node/src/AdminWorker.cpp libs/node/tests/node/DdlHarnessRegressionTest.cpp
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "fix(admin): ALTER renaming the key field moves TopicSchema.keyField (live and across restart) (B8)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2832,7 +2832,7 @@ TEST(DdlFixRegression, B9_ViewOverATypedTopicIsStillAccepted) {
 ```
 
 - [ ] **Step 2: Run them and confirm they fail.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='DdlFixRegression.B9*'`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='DdlFixRegression.B9*'`
   Expected: `B9_ViewOverAView…` FAILS: today it answers 0 and creates an empty view.
 
 - [ ] **Step 3: Implement.** In `AdminWorker.cpp`, after `static constexpr uint16_t kInvalidTopicName     = 40; …`, add:
@@ -2861,14 +2861,14 @@ In `AdminWorker.h`, after the `//   InvalidTopicName      = 40 …` comment line
 //   ViewSourceIsView      = 41  (CREATE VIEW whose source is another view's output)
 ```
 
-- [ ] **Step 4: Run the tests and confirm they pass.** Same command as Step 2 → 2 PASS. Also run `/Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_create_view_tests` and `rune_get_view_row_tests` → PASS.
+- [ ] **Step 4: Run the tests and confirm they pass.** Same command as Step 2 → 2 PASS. Also run `/Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_create_view_tests` and `rune_get_view_row_tests` → PASS.
 
 - [ ] **Step 5: Regression gate, then commit.**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/src/AdminWorker.cpp libs/node/include/rune/node/AdminWorker.h libs/node/tests/node/DdlHarnessRegressionTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "fix(admin): CREATE VIEW over another view's output answers ViewSourceIsView=41 instead of a silently empty view (B9)
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/node/src/AdminWorker.cpp libs/node/include/rune/node/AdminWorker.h libs/node/tests/node/DdlHarnessRegressionTest.cpp
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "fix(admin): CREATE VIEW over another view's output answers ViewSourceIsView=41 instead of a silently empty view (B9)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3288,16 +3288,16 @@ Add to `DdlHarness` (public, next to `failCreate`). `CreateReplyWithUnknownPersi
 - [ ] **Step 2: Add the file to CMake.** In `add_executable(rune_ddl_conformance_tests …)`, add the line `        tests/node/DdlOccupantMatrixRegressionTest.cpp` after `        tests/node/DdlHarnessRegressionTest.cpp`.
 
 - [ ] **Step 3: Build and run.**
-  Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='Ddl/DdlOccupantMatrixRegression.*:DdlMalformedRequestRegression.*:Ddl/DdlViewSourceRegression.*' --gtest_brief=1`
+  Run: `cmake /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='Ddl/DdlOccupantMatrixRegression.*:DdlMalformedRequestRegression.*:Ddl/DdlViewSourceRegression.*' --gtest_brief=1`
   Expected: 444 + 10 + 12 = 466 PASS. B1–B10 are fixed, and the `_R1` cells pin the no-hang wave's R1 behaviour.
   **If any cell fails:** that cell is a new finding. Run superpowers:systematic-debugging on it, then add the cell to "Bugs this matrix is expected to expose" with a fix task. Never edit the expectation table to make a cell pass unless the plan's markdown table is wrong too, and say so in the commit message.
 
 - [ ] **Step 4: Regression gate, then commit.**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/tests/node/DdlOccupantMatrixRegressionTest.cpp libs/node/tests/support/DdlHarness.h libs/node/CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(ddl): Occupant x Op conformance matrix (444 cells) + malformed admin requests + view-source cells (incl. view over view = 41)
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/node/tests/node/DdlOccupantMatrixRegressionTest.cpp libs/node/tests/support/DdlHarness.h libs/node/CMakeLists.txt
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "test(ddl): Occupant x Op conformance matrix (444 cells) + malformed admin requests + view-source cells (incl. view over view = 41)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3622,7 +3622,7 @@ INSTANTIATE_TEST_SUITE_P(Ddl, DdlPairTimingMatrixRegression, ::testing::ValuesIn
 - [ ] **Step 2: Add the file to CMake.** Add `        tests/node/DdlPairTimingMatrixRegressionTest.cpp` to `rune_ddl_conformance_tests`.
 
 - [ ] **Step 3: Build and run.**
-  Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='Ddl/DdlPairTimingMatrixRegression.*' --gtest_brief=1`
+  Run: `cmake /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='Ddl/DdlPairTimingMatrixRegression.*' --gtest_brief=1`
   Expected: 560 PASS.
   - A `*_Different_T5b|T5c|T6` failure in `restart()` means B5 regressed.
   - A `*_T6_*` failure where A was not answered at demotion means B4 regressed.
@@ -3631,9 +3631,9 @@ INSTANTIATE_TEST_SUITE_P(Ddl, DdlPairTimingMatrixRegression, ::testing::ValuesIn
 - [ ] **Step 4: Regression gate, then commit.**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/tests/node/DdlPairTimingMatrixRegressionTest.cpp libs/node/CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(ddl): A-then-B x 9 timing classes conformance matrix (560 cells) with timing-invariance twin
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/node/tests/node/DdlPairTimingMatrixRegressionTest.cpp libs/node/CMakeLists.txt
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "test(ddl): A-then-B x 9 timing classes conformance matrix (560 cells) with timing-invariance twin
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3948,17 +3948,17 @@ TEST(DdlStressEnvRegression, EnvSeed) {
 ```
 
 - [ ] **Step 3: Build and run.**
-  Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_ddl_stress_tests && /Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_ddl_stress_tests --gtest_brief=1`
+  Run: `cmake /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_ddl_stress_tests && /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_ddl_stress_tests --gtest_brief=1`
   Expected: 64 seeds PASS, and EnvSeed is SKIPPED.
   - **If the zero-alloc gate fires:** this is a real finding (CLAUDE.md #4). Find the allocator: set a breakpoint on `operator new` while `gArmed` is set, or temporarily print `__builtin_return_address(0)`. Fix it in the owning component, which is the AdminWorker idle path or `PartitionReplica::doWork`. Add a `*Regression*` test there, and list it under the bugs. Never weaken the gate.
-  - **If a seed fails:** replay it with `RUNE_DDL_STRESS_SEED=<seed> /Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_ddl_stress_tests --gtest_filter=DdlStressEnvRegression.EnvSeed`, then use systematic-debugging.
+  - **If a seed fails:** replay it with `RUNE_DDL_STRESS_SEED=<seed> /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_ddl_stress_tests --gtest_filter=DdlStressEnvRegression.EnvSeed`, then use systematic-debugging.
 
 - [ ] **Step 4: Regression gate, then commit.**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/tests/node/DdlStressRegressionTest.cpp libs/node/CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(ddl): seeded model-checked DDL stress (64 seeds) + admin steady-state zero-alloc gate
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/node/tests/node/DdlStressRegressionTest.cpp libs/node/CMakeLists.txt
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "test(ddl): seeded model-checked DDL stress (64 seeds) + admin steady-state zero-alloc gate
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4249,16 +4249,16 @@ The two plain tests use their own suite name, `SchemaGatewayStaticRegression`, b
 `getSchema` and `firstFrame` live in an anonymous namespace earlier in the file. The new anonymous namespace block can use them because both are in the same TU.
 
 - [ ] **Step 2: Build and run.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_schema_gateway_tests && /Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_schema_gateway_tests --gtest_filter='Ddl/*:SchemaGatewayStaticRegression.*' --gtest_brief=1`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_schema_gateway_tests && /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_schema_gateway_tests --gtest_filter='Ddl/*:SchemaGatewayStaticRegression.*' --gtest_brief=1`
   Expected: 5 + 8 + 14 + 2 = 29 PASS.
   If a cell answers 0 frames or a different code, the no-hang wave's gateway rule has regressed. Run systematic-debugging on `ClientGateway::handle{DefineTopic,GetTopicSchema,AlterTopic,CreateView}` against `RequestRejection.h`; do not edit the cell.
 
 - [ ] **Step 3: Regression gate, then commit.**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/tests/integration/SchemaGatewayTest.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(ddl): wire cells — static-topic adoption, name rule, corrupt DDL frames always answered
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/node/tests/integration/SchemaGatewayTest.cpp
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "test(ddl): wire cells — static-topic adoption, name rule, corrupt DDL frames always answered
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4754,7 +4754,7 @@ TEST(DdlConformanceBrokerRegression, T8_RemovedStaticTopicIsQuarantinedNotDelete
                 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 ```
 
-Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_ddl_broker_tests`
+Run: `cmake /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_ddl_broker_tests`
 Expected: compile errors `no member named 'sendDefineTopic'` and `no member named 'setAdminCreateFaultForTest'`.
 
 - [ ] **Step 3: Implement the ShardTestClient helpers.** In `ShardTestClient.h`, after `defineTopic(...)` (before `bool disconnect(`), add:
@@ -4938,16 +4938,16 @@ In `BrokerNode.cpp`'s create-topic drain lambda, replace the body from `        
 ```
 
 - [ ] **Step 5: Run the tests and confirm they pass.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_ddl_broker_tests rune_broker_node_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R DdlConformanceBrokerRegression --output-on-failure`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_ddl_broker_tests rune_broker_node_tests && ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R DdlConformanceBrokerRegression --output-on-failure`
   Expected: 7 PASS (T1 now also covers B8/B9; T5 covers D1 placeholder hiding and the placeholder-dir deletion; T7 covers B8/B9 across the restart; T8 covers D4 quarantine).
   A live disk partition dir holds only regular files (segments, indexes, `leader-epoch-state`). If T5's or T8's assertion fails because a real partition dir holds another kind of entry, add that exact entry name to `isTopicDirLayout` (Task 3a) together with a `RuntimeTopicRecoveryRegression` test. Never loosen the layout to "anything".
 
 - [ ] **Step 6: Regression gate, then commit.**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/include/rune/node/BrokerNode.h libs/node/src/BrokerNode.cpp libs/node/tests/support/ShardTestClient.h libs/node/tests/integration/DdlConformanceBrokerRegressionTest.cpp libs/node/CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(ddl): real BrokerNode over Aeron — sequential, pipelined, burst, failed-create+restart, restart catalog
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/node/include/rune/node/BrokerNode.h libs/node/src/BrokerNode.cpp libs/node/tests/support/ShardTestClient.h libs/node/tests/integration/DdlConformanceBrokerRegressionTest.cpp libs/node/CMakeLists.txt
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "test(ddl): real BrokerNode over Aeron — sequential, pipelined, burst, failed-create+restart, restart catalog
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -4959,13 +4959,13 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Repos:** rune-client-cpp (probe), rune-broker (script)
 
 **Files:**
-- Modify: `/Users/vradu/Projects/se-worktrees/rune-client-cpp/examples/view_probe.cpp`
+- Modify: `/Users/vradu/Projects/ddl-worktrees/rune-client-cpp/examples/view_probe.cpp`
   - header comment (modes);
   - includes;
   - helpers before `int main()`;
   - the `setup` mode, after the `char_transient` createView block (~L533-535);
   - mode dispatch before `if (mode == "verify_restart")` (~L607).
-- Modify: `/Users/vradu/Projects/se-worktrees/rune-broker/docker/view-engine-e2e.sh`
+- Modify: `/Users/vradu/Projects/ddl-worktrees/rune-broker/docker/view-engine-e2e.sh`
   - `teardown()`;
   - after the typed-routing check (before `if [ "${RUN_RESTART_LEG:-1}" != "1" ]`);
   - before Step 5;
@@ -5107,8 +5107,8 @@ Before `        if (mode == "verify_restart") {`, add:
 Change the unknown-mode message to `(want setup|verify_restart|ddl_race|catalog_dump)`.
 
 - [ ] **Step 2: Build the probe locally** (catches compile errors before docker):
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j --target view_probe`
-  Expected: builds. If the target has another name, find it with `grep -n "view_probe" /Users/vradu/Projects/se-worktrees/rune-client-cpp/CMakeLists.txt /Users/vradu/Projects/se-worktrees/rune-client-cpp/examples/CMakeLists.txt`.
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-client-cpp/build -j --target view_probe`
+  Expected: builds. If the target has another name, find it with `grep -n "view_probe" /Users/vradu/Projects/ddl-worktrees/rune-client-cpp/CMakeLists.txt /Users/vradu/Projects/ddl-worktrees/rune-client-cpp/examples/CMakeLists.txt`.
 
 - [ ] **Step 3: Extend the e2e script** `docker/view-engine-e2e.sh`.
 
@@ -5228,20 +5228,20 @@ log "Catalog identical after restart ($(echo "${catalog_after}" | wc -l | tr -d 
 ```
 
 - [ ] **Step 4: Run the e2e** (takes minutes; Docker required):
-  Run: `cd /Users/vradu/Projects/se-worktrees/rune-broker && bash docker/view-engine-e2e.sh`
+  Run: `cd /Users/vradu/Projects/ddl-worktrees/rune-broker && bash docker/view-engine-e2e.sh`
   Expected: the final banner prints `VIEW-ENGINE-E2E: OK`, and the log contains `ALTER on a view: 38`, three `DDL race leg … exactly one winner` lines and `Catalog identical after restart (9 entries)`.
 
 - [ ] **Step 5: Gates, then commit (two repos).**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R Regression --output-on-failure -j8
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add examples/view_probe.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "test(e2e): view_probe ddl_race / catalog_dump modes + alter-on-view=38 check
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-client-cpp/build -R Regression --output-on-failure -j8
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-client-cpp add examples/view_probe.cpp
+git -C /Users/vradu/Projects/ddl-worktrees/rune-client-cpp commit -m "test(e2e): view_probe ddl_race / catalog_dump modes + alter-on-view=38 check
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add docker/view-engine-e2e.sh
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(e2e): two clients race colliding DDL (exactly one wins); catalog identical across restart
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add docker/view-engine-e2e.sh
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "test(e2e): two clients race colliding DDL (exactly one wins); catalog identical across restart
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -5336,14 +5336,14 @@ After the line ``- `alter topic` naming a view is rejected with error 38 (`ViewN
 ```
 
 - [ ] **Step 3: Verify the codes in the docs match the code.**
-  Run: `grep -n "40\|41\|__orphan\|case" /Users/vradu/Projects/se-worktrees/rune-broker/docs/SELF-HOSTING.md | head -20 && grep -n "InvalidTopicName\|ViewSourceIsView" /Users/vradu/Projects/se-worktrees/rune-protocol/include/rune/protocol/client/Protocol.h`
+  Run: `grep -n "40\|41\|__orphan\|case" /Users/vradu/Projects/ddl-worktrees/rune-broker/docs/SELF-HOSTING.md | head -20 && grep -n "InvalidTopicName\|ViewSourceIsView" /Users/vradu/Projects/ddl-worktrees/rune-protocol/include/rune/protocol/client/Protocol.h`
   Expected: the documented numbers match `InvalidTopicName = 40` and `ViewSourceIsView = 41`.
 
 - [ ] **Step 4: Commit.**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add docs/SELF-HOSTING.md docs/release-notes/phase2b-e-transient-topics.md
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "docs: DDL name rule (40), case conflicts, ViewSourceIsView (41), orphan placeholders, boot dir clean-up and quarantine restore
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add docs/SELF-HOSTING.md docs/release-notes/phase2b-e-transient-topics.md
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "docs: DDL name rule (40), case conflicts, ViewSourceIsView (41), orphan placeholders, boot dir clean-up and quarantine restore
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -5415,7 +5415,7 @@ TEST(DdlFixRegression, Optional_AViewNeverAdoptsAnOrphanDefineOrAStaticCompactTo
 ```
 
 - [ ] **Step 2: Run them and confirm they fail.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/se-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='DdlFixRegression.Optional*'`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests && /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast/libs/node/rune_ddl_conformance_tests --gtest_filter='DdlFixRegression.Optional*'`
   Expected: `Optional_CreateViewRetryAdoptsItsOwnOrphanSink` FAILS (25). The second test passes, as a pin.
 
 - [ ] **Step 3: Implement.**
@@ -5491,15 +5491,15 @@ and leave the create-requests row unchanged (`{1,1,1,1,…}`). Update the plan's
 - change the post-restart line to `EXPECT_EQ(w.view(sid, "orphan_v", "character"), kViewExists);`
 
 - [ ] **Step 4: Run all DDL suites.**
-  Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests rune_ddl_stress_tests rune_ddl_broker_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'Ddl' --output-on-failure -j8`
+  Run: `cmake --build /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast --target rune_ddl_conformance_tests rune_ddl_stress_tests rune_ddl_broker_tests && ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R 'Ddl' --output-on-failure -j8`
   Expected: all PASS. The OrphanSink occupant cells, the pair T5b/T5c/T6 view-then-view cells, the stress model and the broker T5 test all read the updated table.
 
 - [ ] **Step 5: Regression gate, then commit.**
 
 ```bash
-ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/include/rune/node/AdminChannels.h libs/node/include/rune/node/AdminCreateTopic.h libs/node/src/AdminWorker.cpp libs/node/include/rune/node/BrokerNode.h libs/node/src/BrokerNode.cpp libs/node/tests/support/DdlHarness.h libs/node/tests/support/DdlExpectations.h libs/node/tests/node/DdlHarnessRegressionTest.cpp libs/node/tests/integration/DdlConformanceBrokerRegressionTest.cpp docs/superpowers/plans/2026-10-12-rune-ddl-conformance.md
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(admin): a CREATE VIEW retry adopts its own orphan sink (spec-identical, unclaimed runtime topic) — resolves parked KL1
+ctest --test-dir /Users/vradu/Projects/ddl-worktrees/rune-broker/build-fast -R Regression --output-on-failure -j8
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker add libs/node/include/rune/node/AdminChannels.h libs/node/include/rune/node/AdminCreateTopic.h libs/node/src/AdminWorker.cpp libs/node/include/rune/node/BrokerNode.h libs/node/src/BrokerNode.cpp libs/node/tests/support/DdlHarness.h libs/node/tests/support/DdlExpectations.h libs/node/tests/node/DdlHarnessRegressionTest.cpp libs/node/tests/integration/DdlConformanceBrokerRegressionTest.cpp docs/superpowers/plans/2026-10-12-rune-ddl-conformance.md
+git -C /Users/vradu/Projects/ddl-worktrees/rune-broker commit -m "feat(admin): a CREATE VIEW retry adopts its own orphan sink (spec-identical, unclaimed runtime topic) — resolves parked KL1
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
