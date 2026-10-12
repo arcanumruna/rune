@@ -27,6 +27,7 @@
 #include <rune/node/NodeConfig.h>
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -57,5 +58,25 @@ namespace rune::node {
 
 /// "__orphan.<topicId>" — the recovery placeholder name for a catalog-less id.
 [[nodiscard]] std::string orphanPlaceholderName(int32_t topicId);
+
+struct TopicDirReconciliation {
+    std::vector<std::filesystem::path> deleted;       // orphan-placeholder dirs (canonical paths)
+    std::vector<std::filesystem::path> quarantined;   // destinations under dataDir/quarantine/
+};
+
+/// B10 / user decision D4: reconcile dataDir/topics/ against the full catalog
+/// (`topics` = static + recovered, incl. __orphan.<id> placeholders).  For each
+/// direct child of canonical(dataDir/topics) that no topic claims (exactly or
+/// ignoring ASCII case) and that has the recognised layout
+/// <name>/[topic-id] + <digits>/<regular files>:
+///   * its topic-id marker names an __orphan.<id> placeholder -> DELETED;
+///   * otherwise (no marker, other id, unreadable) -> MOVED to
+///     dataDir/quarantine/<name>-<nowUnixSeconds>[-N], never deleted.
+/// Symlinks are never followed (a symlinked topics/ or quarantine/ root, child,
+/// partition dir or file makes the entry "not ours": left alone).  Each action is
+/// logged at warn with its path(s).  Never throws.  Call on the startup thread
+/// after the recovered specs are appended and BEFORE the TopicRegistry opens logs.
+[[nodiscard]] TopicDirReconciliation
+reconcileTopicDirs(const std::string& dataDir, const std::vector<TopicSpec>& topics, int64_t nowUnixSeconds);
 
 } // namespace rune::node

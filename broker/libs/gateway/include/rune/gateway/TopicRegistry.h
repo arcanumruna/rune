@@ -37,6 +37,19 @@
 
 namespace rune::gateway {
 
+/// Written by createTopic into dataDir/topics/<name>/ for a disk topic: the topic id
+/// in decimal.  Boot (rune::node::reconcileTopicDirs) uses it to tie an unclaimed
+/// directory to an __orphan.<id> placeholder — only such a dir is ever deleted.
+///
+/// Written ONLY for a topic created at RUNTIME (DefineTopic / CreateView sink, i.e.
+/// createTopic after construction) — never for the topics the constructor builds
+/// (static RUNE_TOPICS + recovered).  A static topic's id is its position in
+/// RUNE_TOPICS, so removing the last static topic while runtime topics exist turns
+/// its id into a recovery gap (an __orphan.<id> placeholder); were static dirs
+/// marked, boot would DELETE that removed static topic's data instead of
+/// quarantining it (D4: only a never-committed definition is ever deleted).
+inline constexpr const char* kTopicIdMarkerFile = "topic-id";
+
 class TopicRegistry {
 public:
     // Construct the registry from a topic list + data root directory.
@@ -101,6 +114,8 @@ public:
     //
     // Idempotent: if a topic with the same name already exists, returns
     // its existing topicId without recreating any directories or logs.
+    // Writes dataDir/topics/<name>/topic-id (the assigned id) for a disk topic
+    // (B10 / D4 — see kTopicIdMarkerFile; the constructor's topics get none).
     //
     // Returns the assigned topicId (>= 0).
     // Throws std::runtime_error if a directory cannot be created.
@@ -129,6 +144,11 @@ public:
     deleteRetentionMsOf(int32_t topicId) const noexcept;
 
 private:
+    // Which caller built the topic: the constructor (static + recovered topics) or
+    // a runtime DDL create.  Only a runtime create writes the topic-id marker.
+    enum class CreateOrigin : uint8_t { Boot, Runtime };
+    int32_t createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin origin);
+
     // Per-partition entry: the Log and its directory path.
     struct PartitionEntry {
         std::unique_ptr<rune::storage::Log> log;

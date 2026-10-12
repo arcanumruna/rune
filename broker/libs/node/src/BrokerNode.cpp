@@ -390,6 +390,11 @@ void BrokerNode::start() {
                          recovered.front().topicId, recovered.back().topicId);
             for (auto& spec : recovered) config_.topics.push_back(std::move(spec));
         }
+        // B10 / D4: delete only orphan-placeholder topic dirs; quarantine every other
+        // unclaimed topic dir (never delete it) — BEFORE the TopicRegistry opens logs.
+        (void)reconcileTopicDirs(config_.dataDir, config_.topics,
+                                 std::chrono::duration_cast<std::chrono::seconds>(
+                                     std::chrono::system_clock::now().time_since_epoch()).count());
     }
 
     // 2. Build the TopicRegistry (after dataDir creation, before the gateway).

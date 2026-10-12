@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 
@@ -22,7 +23,7 @@ TopicRegistry::TopicRegistry(
     nameIndex_.reserve(topics.size());
 
     for (const auto& spec : topics) {
-        createTopic(spec);
+        createTopicImpl(spec, CreateOrigin::Boot);
     }
 
     spdlog::info("TopicRegistry: {} topic(s) initialised", topics_.size());
@@ -33,6 +34,12 @@ TopicRegistry::TopicRegistry(
 // ---------------------------------------------------------------------------
 int32_t
 TopicRegistry::createTopic(const rune::node::TopicSpec& spec)
+{
+    return createTopicImpl(spec, CreateOrigin::Runtime);
+}
+
+int32_t
+TopicRegistry::createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin origin)
 {
     // Idempotent guard: if a topic with this name already exists, return its id.
     {
@@ -95,6 +102,18 @@ TopicRegistry::createTopic(const rune::node::TopicSpec& spec)
 
         pe.log = std::move(logPtr);
         entry.partitions.push_back(std::move(pe));
+    }
+
+    // B10 / D4: the topic-id marker ties this directory to its id, so boot can tell an
+    // orphan placeholder's dir (deleted) from any other unclaimed dir (quarantined).
+    // Runtime creates only — see kTopicIdMarkerFile for why boot-built topics get none.
+    if (origin == CreateOrigin::Runtime &&
+        spec.persistence != rune::node::PersistenceMode::Transient && spec.partitionCount > 0) {
+        const fs::path marker = root / "topics" / spec.name / kTopicIdMarkerFile;
+        std::ofstream out(marker, std::ios::trunc);
+        out << assignedId << '\n';
+        out.flush();
+        if (!out) spdlog::warn("TopicRegistry: cannot write topic-id marker '{}'", marker.string());
     }
 
     nameIndex_.emplace(spec.name, assignedId);
