@@ -854,3 +854,38 @@ TEST(RebalanceFailover, TransientTopic_AllInSyncFollowerCatchUpFromLeaderRing) {
     EXPECT_GE(r2.logEndOffset(), leo);
     EXPECT_GE(r3.logEndOffset(), leo);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2b E (spec gate): a TRANSIENT (InMemoryLog) partition under acks=All is
+// replicated BEFORE ack — the leader's HW (the ack gate) does not move past
+// what every in-sync follower holds.
+// ---------------------------------------------------------------------------
+TEST(RebalanceFailoverRegression, TransientTopicAcksAllReplicatesBeforeAck) {
+    constexpr int32_t kTopic = 150, kPart = 0;
+    const std::vector<NodeId> all = {1, 2, 3};
+    rune::storage::InMemoryLog mem1(1 << 20, 4096), mem2(1 << 20, 4096), mem3(1 << 20, 4096);
+    InMemoryTransport transport;
+    auto cfg = [&](NodeId s) { return userCfg(s, kTopic, kPart, 3, DurabilityMode::AllInSync); };
+    PartitionReplica r1(cfg(1), Role::Leader,   1, all, all, &mem1, &transport);
+    PartitionReplica r2(cfg(2), Role::Follower, 1, all, all, &mem2, &transport);
+    PartitionReplica r3(cfg(3), Role::Follower, 1, all, all, &mem3, &transport);
+    transport.setLeader(&r1); transport.addFollower(2, &r2); transport.addFollower(3, &r3);
+    ASSERT_TRUE(r1.isMemoryBacked());
+
+    auto p = payload(0x77);
+    ASSERT_GE(r1.append(std::span<const uint8_t>(p.data(), p.size()), /*acksAll=*/true), 0);
+    const Offset leo = r1.logEndOffset();
+    EXPECT_LT(r1.highWatermark(), leo) << "no ack before any follower has the record";
+
+    int64_t clock = 0;
+    for (int i = 0; i < kDriverCap; ++i) {
+        clock += 1'000'000LL;
+        r1.doWork(clock); r2.doWork(clock); r3.doWork(clock);
+        transport.pump(clock);
+        // Invariant at EVERY step: the ack gate never runs ahead of the slowest ISR member.
+        ASSERT_LE(r1.highWatermark(), std::min(r2.logEndOffset(), r3.logEndOffset()))
+            << "HW (ack) advanced past a follower that does not hold the record";
+        if (r1.highWatermark() >= leo) break;
+    }
+    EXPECT_EQ(r1.highWatermark(), leo) << "stalled: all followers must catch up and HW reach LEO";
+}

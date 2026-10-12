@@ -80,6 +80,7 @@ struct DefinedTopic {
     std::string name;
     int32_t     partitionCount = 1;
     uint16_t    version        = 0;   // latest version seen
+    PersistenceMode persistence = PersistenceMode::Disk;   // latest version's (Phase 2b E)
 };
 
 } // namespace
@@ -101,6 +102,7 @@ std::vector<TopicSpec> recoverRuntimeTopicSpecs(const std::string& dataDir,
         if (ts->version < t.version) return;   // keep the latest version's facts
         t.version        = ts->version;
         t.partitionCount = ts->partitionCount;
+        t.persistence    = ts->persistence;
         if (!ts->topicName.empty()) {
             t.name = ts->topicName;
         } else if (t.name.empty()) {
@@ -124,8 +126,11 @@ std::vector<TopicSpec> recoverRuntimeTopicSpecs(const std::string& dataDir,
         spec.topicId        = id;
         spec.name           = t.name;
         spec.partitionCount = t.partitionCount;
+        // Phase 2b E: a transient topic comes back TRANSIENT — TopicRegistry skips
+        // its disk dirs and buildReplication puts it on a fresh (empty) InMemoryLog.
+        spec.persistence    = t.persistence;
         // AdminWorker DefineTopic → requestCreateTopic(name, partitions, keyField="",
-        // cleanupPolicy=Delete): defaults already match.
+        // cleanupPolicy=Delete, persistence): defaults already match otherwise.
         runtime.emplace(id, std::move(spec));
     }
 

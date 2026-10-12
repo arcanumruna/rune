@@ -17,7 +17,8 @@
 // the TopicSpec each original createTopic call used, so the caller can append
 // them to config_.topics and every existing boot path (TopicRegistry,
 // buildReplication, worker placement, MetadataService, read-committed rebuild)
-// recreates them like static topics.
+// recreates them like static topics.  A transient topic (TopicSchema
+// persistence trailer) is recreated transient: metadata survives, data does not.
 //
 // Bound: each catalog is read to its recovered LOG END.  The admin catalogs are
 // single-owner, and every DDL record is HW-gated before the client is acked, so

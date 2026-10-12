@@ -74,7 +74,8 @@ rune::codec::Descriptor charDescriptor(const char* name) {
 
 // A DefineTopic schema record.  topicName may differ from the descriptor name.
 std::vector<uint8_t> schemaRecord(int32_t topicId, uint16_t version, int32_t partitions,
-                                  const char* topicName, const char* descriptorName) {
+                                  const char* topicName, const char* descriptorName,
+                                  rune::node::PersistenceMode persistence = rune::node::PersistenceMode::Disk) {
     TopicSchema ts;
     ts.topicId        = topicId;
     ts.version        = version;
@@ -83,6 +84,7 @@ std::vector<uint8_t> schemaRecord(int32_t topicId, uint16_t version, int32_t par
     ts.descriptorBlob = rune::codec::serialize(charDescriptor(descriptorName));
     ts.nextTag        = 2;
     ts.topicName      = topicName;
+    ts.persistence    = persistence;
     return ts.serialize();
 }
 
@@ -197,4 +199,29 @@ TEST(RuntimeTopicRecoveryRegression, CorruptCatalogRecordFailsLoud) {
     TempDataDir d("corrupt");
     appendRecords(d.path / "__topic_schemas", {std::vector<uint8_t>{0x01, 0x02, 0x03}});
     EXPECT_THROW((void)rune::node::recoverRuntimeTopicSpecs(d.path.string(), 0), std::runtime_error);
+}
+
+// Phase 2b E: a transient runtime topic is recreated TRANSIENT (metadata
+// survives, data does not — the TopicRegistry/InMemoryLog path starts it empty).
+TEST(RuntimeTopicRecoveryRegression, TransientTopicIsRecoveredTransient) {
+    TempDataDir d("transient");
+    appendRecords(d.path / "__topic_schemas",
+                  {schemaRecord(0, 1, 2, "presence", "presence_desc",
+                                rune::node::PersistenceMode::Transient),
+                   schemaRecord(1, 1, 1, "orders", "orders_desc")});
+    const auto specs = rune::node::recoverRuntimeTopicSpecs(d.path.string(), 0);
+    ASSERT_EQ(specs.size(), 2u);
+    EXPECT_EQ(specs[0].name, "presence");
+    EXPECT_EQ(specs[0].persistence, rune::node::PersistenceMode::Transient);
+    EXPECT_EQ(specs[1].persistence, rune::node::PersistenceMode::Disk);
+}
+
+TEST(RuntimeTopicRecoveryRegression, AlteredTransientTopicStaysTransient) {
+    TempDataDir d("transient-altered");
+    appendRecords(d.path / "__topic_schemas",
+                  {schemaRecord(0, 1, 1, "presence", "d1", rune::node::PersistenceMode::Transient),
+                   schemaRecord(0, 2, 1, "presence", "d2", rune::node::PersistenceMode::Transient)});
+    const auto specs = rune::node::recoverRuntimeTopicSpecs(d.path.string(), 0);
+    ASSERT_EQ(specs.size(), 1u);
+    EXPECT_EQ(specs[0].persistence, rune::node::PersistenceMode::Transient);
 }

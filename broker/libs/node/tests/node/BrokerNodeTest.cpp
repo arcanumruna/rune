@@ -1915,4 +1915,92 @@ TEST(BrokerNodeRegression, GatewayConstructionFailureRefusesToStartNotHeadless) 
     node.stop();
     ::close(squat);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2b E (spec gate): a runtime DefineTopic(persistence=transient) creates
+// the topic on an InMemoryLog (no disk partition dir), and after a node restart
+// the topic EXISTS again as a transient topic and is EMPTY (data never on disk).
+// ---------------------------------------------------------------------------
+TEST(BrokerNodeRegression, RuntimeTransientTopicIsInMemoryAndRestartsEmptyRegression) {
+    namespace pc = rune::protocol::client;
+    using Clock = std::chrono::steady_clock;
+    using rune::replication::PartitionReplica;
+    const fs::path dir = makeTempDataDir("transient_rt_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    const uint16_t clientPort = rune::node::test::freeUdpPort();
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
+    const std::string& gw = cfg.clientEndpoint.channel;
+    const int32_t stream  = cfg.clientEndpoint.streamId;
+
+    const auto desc = rune::codec::DescriptorBuilder("presence")
+        .add("userId", rune::codec::PrimType::Int64, 1, /*isKey*/ true)
+        .add("online", rune::codec::PrimType::Bool)
+        .build();
+    const std::vector<uint8_t> blob = rune::codec::serialize(desc);
+
+    auto awaitLeaderReplica = [](BrokerNode& n, int32_t topicId, Clock::time_point deadline) {
+        while (Clock::now() < deadline) {
+            if (rune::node::test::hasReplica(n, topicId, 0) &&
+                rune::node::test::roleOnOwner(n, topicId, 0) == rune::replication::Role::Leader)
+                return true;
+            std::this_thread::sleep_for(5ms);   // poll interval, not correctness
+        }
+        return false;
+    };
+
+    int32_t topicId = -1;
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        rune::node::test::ShardTestClient client(dir / "client-aeron");
+        const int64_t sid = client.connect(gw, stream);
+        ASSERT_GT(sid, 0);
+
+        const auto deadline = Clock::now() + 20s;
+        while (topicId < 0) {
+            ASSERT_LT(Clock::now(), deadline) << "DefineTopic did not commit within the deadline";
+            auto def = client.defineTopicUntil(gw, stream, sid, "presence", 1, /*validate=*/false,
+                                               blob, std::min(deadline, Clock::now() + 5s),
+                                               pc::DefineTopic::kPersistenceTransient);
+            ASSERT_TRUE(def.has_value()) << "no DefineTopicResponse";
+            if (def->errorCode == 0 ||
+                (def->errorCode == static_cast<uint16_t>(pc::ErrorCode::TopicExists) && def->topicId >= 0)) {
+                topicId = def->topicId;
+                break;
+            }
+            ASSERT_EQ(def->errorCode, static_cast<uint16_t>(pc::ErrorCode::Internal))
+                << "non-retryable DefineTopic error " << def->errorCode;
+            std::this_thread::sleep_for(20ms);   // admin leadership settling (short backoff)
+        }
+        ASSERT_TRUE(awaitLeaderReplica(node, topicId, Clock::now() + 10s));
+
+        const auto [mem, disk] = node.onOwnerThreadForTest(topicId, 0,
+            [](PartitionReplica& r) { return std::pair{r.isMemoryBacked(), r.isDiskBacked()}; });
+        EXPECT_TRUE(mem) << "a transient runtime topic must be InMemoryLog-backed";
+        EXPECT_FALSE(disk);
+        EXPECT_FALSE(fs::exists(dir / "topics" / "presence"))
+            << "a transient topic must never create a disk partition directory";
+
+        const std::vector<uint8_t> rec(24, 0x5A);
+        ASSERT_GE(rune::node::test::appendOnOwner(node, rec, /*acksAll=*/false, topicId, 0), 0);
+        ASSERT_GT(rune::node::test::leoOnOwner(node, topicId, 0), 0) << "data present before restart";
+        node.stop();
+    }
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ASSERT_TRUE(awaitLeaderReplica(node, topicId, Clock::now() + 20s))
+            << "the transient topic's metadata must survive the restart (recovered from __topic_schemas)";
+        const auto [mem, leo] = node.onOwnerThreadForTest(topicId, 0,
+            [](PartitionReplica& r) { return std::pair{r.isMemoryBacked(), r.logEndOffset()}; });
+        EXPECT_TRUE(mem) << "recovered as TRANSIENT, not as a disk topic";
+        EXPECT_EQ(leo, 0) << "a transient topic restarts EMPTY — its data was never on disk";
+        EXPECT_FALSE(fs::exists(dir / "topics" / "presence"));
+        node.stop();
+    }
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
 } // namespace rune::node

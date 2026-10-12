@@ -257,10 +257,12 @@ public:
                                                             int64_t sessionId, std::string_view name,
                                                             uint32_t partitions, bool validate,
                                                             const std::vector<uint8_t>& descriptor,
-                                                            Clock::time_point deadline) {
+                                                            Clock::time_point deadline,
+                                                            uint8_t persistence = 0) {
         pc::DefineTopic m;
         m.sessionId = sessionId; m.correlationId = ++corr_;
         m.topicName = name; m.partitionCount = partitions; m.validate = validate;
+        m.persistence = persistence;
         m.descriptorBlob = descriptor.data();
         m.descriptorLen  = static_cast<uint32_t>(descriptor.size());
         std::vector<uint8_t> buf(m.encodedSize());
