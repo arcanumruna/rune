@@ -22,6 +22,7 @@
 #include <spdlog/spdlog.h>
 
 #include <exception>
+#include <optional>
 
 namespace rune::node {
 
@@ -39,6 +40,22 @@ createTopicForAdmin(rune::gateway::TopicRegistry& reg, const CreateTopicReqMsg& 
         reply.topicId = -1;
         reply.existed = false;
         return reply;
+    }
+
+    // DDL conformance B3: names are case-sensitive identifiers, but a name that
+    // differs from an existing one only in ASCII case would share its directory on a
+    // case-insensitive filesystem — refuse it (TopicExists); nothing is created.
+    if (!reply.existed) {
+        if (const std::optional<int32_t> other = reg.topicIdForFoldedName(req.name)) {
+            reply.topicId      = *other;
+            reply.existed      = true;
+            reply.caseConflict = true;
+            if (const TopicSpec* s = reg.topic(*other)) {
+                reply.partitionCount = s->partitionCount;
+                reply.persistence    = persistenceToWire(s->persistence);
+            }
+            return reply;
+        }
     }
 
     TopicSpec spec;

@@ -107,6 +107,15 @@ public:
     topicIdForName(std::string_view name) const;
 
     // -----------------------------------------------------------------------
+    // topicIdForFoldedName — a topic whose name equals `name` ignoring ASCII case
+    // but is NOT exactly `name` (DDL conformance B3: the two would share
+    // dataDir/topics/<name>/ on a case-insensitive filesystem).  Linear scan —
+    // DDL (cold path) only.  Empty optional when there is none.
+    // -----------------------------------------------------------------------
+    [[nodiscard]] std::optional<int32_t>
+    topicIdForFoldedName(std::string_view name) const;
+
+    // -----------------------------------------------------------------------
     // topic — return the TopicSpec for a given topicId.
     // Returns nullptr if topicId is out of range.
     // -----------------------------------------------------------------------

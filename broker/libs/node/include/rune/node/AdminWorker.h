@@ -276,6 +276,10 @@ private:
     // the current evolving descriptor and appends the new durable TopicSchema —
     // ATOMIC: on any failure nothing is appended and the version is not bumped.
     void startAlter_(AlterTopicMsg msg, int64_t nowNs);
+    // Answer the in-flight op with `code` in its own response kind (Define /
+    // CreateView / Alter) carrying `topicId`, then go Idle.  The exit for an
+    // in-flight op that ends without committing (case conflict B3).
+    void answerInFlight_(uint16_t code, int32_t topicId);
 
     // ── Version-assignment helper (Task 10) ─────────────────────────────────
     // SOURCE OF TRUTH for the version assigned to a schema commit on

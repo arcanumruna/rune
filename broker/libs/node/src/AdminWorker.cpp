@@ -205,6 +205,14 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
         // Stale/mismatched reply — ignore (the op may have timed out).
         return;
     }
+    // DDL conformance B3: the name differs only in ASCII case from an existing topic
+    // (they would share one directory on a case-insensitive filesystem).  Nothing
+    // was created; answer TopicExists with the existing topic's id — for DefineTopic
+    // AND CreateView, before either branch could adopt that topic.
+    if (reply.caseConflict && reply.topicId >= 0) {
+        answerInFlight_(kTopicExists, reply.topicId);
+        return;
+    }
     // ── CREATE VIEW branch (Task 19): the reply carries the view's SINK topicId,
     //    which is ALSO the view's own topic id.  Append the durable ViewRecord to
     //    __views and gate on viewsReplica_'s HW (not the schema replica's).
@@ -779,6 +787,23 @@ void AdminWorker::startAlter_(AlterTopicMsg msg, int64_t nowNs) {
     replica_->onLeaderLogAppended();  // reconcile LEO/HW + push to followers
     inFlight_ = std::move(op);
     state_    = DdlState::AwaitingCommit;
+}
+
+// ─── answerInFlight_ — end the in-flight op without committing ──────────────
+void AdminWorker::answerInFlight_(uint16_t code, int32_t topicId) {
+    switch (inFlight_->kind) {
+        case DdlKind::Alter:
+            deps_.respondAlter(inFlight_->alter.session, inFlight_->alter.corr, topicId, 0, code);
+            break;
+        case DdlKind::CreateView:
+            deps_.respondCreateView(inFlight_->view.session, inFlight_->view.corr, topicId, 0, code);
+            break;
+        case DdlKind::Create:
+            deps_.respondDefine(inFlight_->msg.session, inFlight_->msg.corr, topicId, 0, code);
+            break;
+    }
+    inFlight_.reset();
+    state_ = DdlState::Idle;
 }
 
 // ─── advance_ — AWAITING_COMMIT (HW gate) + timeout ──────────────────────────

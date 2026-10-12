@@ -203,6 +203,10 @@ struct CreateTopicReplyMsg {
     // kPersistenceNotReported = frame without it (caller keeps the requested mode).
     static constexpr uint8_t kPersistenceNotReported = 0xff;
     uint8_t persistence    = kPersistenceNotReported;
+    // DDL conformance B3: the requested name differs only in ASCII case from the
+    // existing topic `topicId` (existed = true): nothing was created and the admin
+    // thread answers TopicExists.  Ring trailer byte 18; absent => false.
+    bool    caseConflict   = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -457,7 +461,7 @@ inline CreateTopicReqMsg decodeCreateTopicReq(const uint8_t* buf, std::size_t le
 // ---- CreateTopicReply ----
 inline bool encodeCreateTopicReply(OneToOneByteRing& ring, const CreateTopicReplyMsg& m) {
     using namespace admin_wire;
-    const std::size_t len = 8 + 4 + 4 + 1 + 1;
+    const std::size_t len = 8 + 4 + 4 + 1 + 1 + 1;
     const auto idx = ring.tryClaim(kMsgCreateTopicReply, len);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
@@ -465,7 +469,8 @@ inline bool encodeCreateTopicReply(OneToOneByteRing& ring, const CreateTopicRepl
     putI32(p, m.topicId); p += 4;
     putI32(p, m.partitionCount); p += 4;
     *p++ = m.existed ? 1 : 0;
-    *p   = m.persistence;
+    *p++ = m.persistence;
+    *p   = m.caseConflict ? 1 : 0;   // DDL conformance B3 trailer
     ring.commit(idx);
     return true;
 }
@@ -480,9 +485,11 @@ inline CreateTopicReplyMsg decodeCreateTopicReply(const uint8_t* buf, std::size_
     m.partitionCount = getI32(buf + 12);
     m.existed        = buf[16] != 0;
     if (len < 18) return m;   // pre-2b-E frame: persistence not reported
+    if (len >= 19) m.caseConflict = buf[18] != 0;   // DDL conformance B3 trailer
     if (buf[17] == CreateTopicReplyMsg::kPersistenceNotReported) return m;
     if (buf[17] > 1) {        // unknown mode: never cast — fail the create
-        m.topicId = -1;
+        m.topicId      = -1;
+        m.caseConflict = false;   // a failed create is Internal, never TopicExists
         return m;
     }
     m.persistence = buf[17];

@@ -3882,7 +3882,7 @@ int BrokerNode::serviceAdminControl_() {
                 // created by createTopic) is read back from the
                 // registry and replayed through the boot path
                 // (idempotent for an existing topic's replicas).
-                if (reply.topicId >= 0) {
+                if (reply.topicId >= 0 && !reply.caseConflict) {   // B3: nothing was created
                     try {
                         if (const rune::node::TopicSpec* authSpec =
                                 topicRegistry_->topic(reply.topicId))

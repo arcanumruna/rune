@@ -282,6 +282,7 @@ public:
         reply.ticket  = req.ticket;
         reply.topicId = -1;
         reply.existed = false;
+        reply.caseConflict = false;   // B3: a failed create is Internal, never TopicExists
         w_->onCreateTopicReply(reply);
         checkInvariant_("failed create reply");
     }

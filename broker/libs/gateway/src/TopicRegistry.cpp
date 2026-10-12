@@ -1,4 +1,5 @@
 #include <rune/gateway/TopicRegistry.h>
+#include <rune/node/TopicName.h>
 
 #include <spdlog/spdlog.h>
 
@@ -251,6 +252,18 @@ TopicRegistry::topicIdForName(std::string_view name) const
     auto it = nameIndex_.find(std::string(name));
     if (it == nameIndex_.end()) return std::nullopt;
     return it->second;
+}
+
+// ---------------------------------------------------------------------------
+// TopicRegistry::topicIdForFoldedName (DDL conformance B3)
+// ---------------------------------------------------------------------------
+std::optional<int32_t>
+TopicRegistry::topicIdForFoldedName(std::string_view name) const
+{
+    for (const auto& [n, id] : nameIndex_) {
+        if (n != name && rune::node::topicNamesFoldEqual(n, name)) return id;
+    }
+    return std::nullopt;
 }
 
 // ---------------------------------------------------------------------------
