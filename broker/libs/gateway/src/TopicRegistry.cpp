@@ -64,6 +64,13 @@ TopicRegistry::createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin o
     entry.spec.topicId   = assignedId;   // store the assigned (sequential) id
     entry.partitions.reserve(static_cast<std::size_t>(spec.partitionCount));
 
+    // B10 / D4 (review M1): the marker is only ever written into a topic dir THIS
+    // create made — never stamped onto a pre-existing dir (e.g. one a case-variant
+    // name shares on a case-insensitive filesystem, or a surviving old dir).
+    const fs::path topicDir = root / "topics" / spec.name;
+    std::error_code existEc;
+    const bool topicDirPreexisted = fs::exists(fs::symlink_status(topicDir, existEc));
+
     for (int32_t p = 0; p < spec.partitionCount; ++p) {
         PartitionEntry pe;
 
@@ -104,16 +111,13 @@ TopicRegistry::createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin o
         entry.partitions.push_back(std::move(pe));
     }
 
-    // B10 / D4: the topic-id marker ties this directory to its id, so boot can tell an
-    // orphan placeholder's dir (deleted) from any other unclaimed dir (quarantined).
-    // Runtime creates only — see kTopicIdMarkerFile for why boot-built topics get none.
-    if (origin == CreateOrigin::Runtime &&
+    // B10 / D4: the two-phase topic-id marker ties this directory to its id, so
+    // boot can tell a never-committed orphan's dir (pending: deleted) from any other
+    // unclaimed dir (quarantined).  Runtime creates only — see kTopicIdMarkerFile.
+    if (origin == CreateOrigin::Runtime && !topicDirPreexisted &&
         spec.persistence != rune::node::PersistenceMode::Transient && spec.partitionCount > 0) {
-        const fs::path marker = root / "topics" / spec.name / kTopicIdMarkerFile;
-        std::ofstream out(marker, std::ios::trunc);
-        out << assignedId << '\n';
-        out.flush();
-        if (!out) spdlog::warn("TopicRegistry: cannot write topic-id marker '{}'", marker.string());
+        if (writeMarker_(topicDir.string(), kTopicIdMarkerPending, assignedId))
+            entry.marker = MarkerState::Pending;
     }
 
     nameIndex_.emplace(spec.name, assignedId);
@@ -124,6 +128,50 @@ TopicRegistry::createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin o
         spec.name, assignedId, spec.partitionCount);
 
     return assignedId;
+}
+
+// ---------------------------------------------------------------------------
+// TopicRegistry::writeMarker_ / markTopicCommitted (B10 / D4, fix round 1)
+// ---------------------------------------------------------------------------
+bool
+TopicRegistry::writeMarker_(const std::string& topicDir, std::string_view state, int32_t id)
+{
+    const fs::path dir{topicDir};
+    const fs::path tmp    = dir / kTopicIdMarkerTmpFile;
+    const fs::path marker = dir / kTopicIdMarkerFile;
+    {
+        std::ofstream out(tmp, std::ios::trunc | std::ios::binary);
+        out << state << ' ' << id << '\n';
+        out.flush();
+        if (!out) {
+            spdlog::warn("TopicRegistry: cannot write topic-id marker '{}'", tmp.string());
+            std::error_code rec;
+            fs::remove(tmp, rec);
+            return false;
+        }
+    }
+    std::error_code ec;
+    fs::rename(tmp, marker, ec);   // atomic replace: a reader sees the old or the new marker
+    if (ec) {
+        spdlog::warn("TopicRegistry: cannot install topic-id marker '{}': {}", marker.string(),
+                     ec.message());
+        std::error_code rec;
+        fs::remove(tmp, rec);
+        return false;
+    }
+    return true;
+}
+
+bool
+TopicRegistry::markTopicCommitted(int32_t topicId)
+{
+    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size()) return false;
+    TopicEntry& e = topics_[static_cast<std::size_t>(topicId)];
+    if (e.marker != MarkerState::Pending) return false;
+    const fs::path topicDir = fs::path(dataDir_) / "topics" / e.spec.name;
+    if (!writeMarker_(topicDir.string(), kTopicIdMarkerCommitted, topicId)) return false;
+    e.marker = MarkerState::Committed;
+    return true;
 }
 
 // ---------------------------------------------------------------------------

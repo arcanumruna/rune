@@ -49,10 +49,24 @@ namespace rune::node {
 /// no metadata entry — produce/subscribe find no partition), transient, and a
 /// reserved "__" name no DDL can address.  Later topics therefore keep their ids,
 /// and the orphan's original name is free again after the restart.  All
-/// placeholders of one boot are logged in a single warn line.
+/// placeholders of one boot are logged in a single warn line.  A gap can ALSO come
+/// from a damaged catalog (a CRC-truncated or missing catalog log): the placeholder
+/// is identical, and reconcileTopicDirs keeps such a committed topic's data
+/// (quarantine) — only a "pending"-marked dir is ever deleted.
 ///
 /// @throws std::runtime_error on a record that does not parse or an id claimed by
 ///         both catalogs — boot must not guess.
+struct RecoveredRuntimeTopics {
+    std::vector<TopicSpec> specs;            // sorted by topicId, gaps filled
+    /// The ids recovery filled with an __orphan.<id> placeholder, ascending.  This is
+    /// the ONLY source of truth for "is a placeholder" (B10 fix round 1, I2): never
+    /// infer it from a name — a static RUNE_TOPICS name may spell "__orphan.<id>".
+    std::vector<int32_t>   placeholderIds;
+};
+[[nodiscard]] RecoveredRuntimeTopics recoverRuntimeTopics(const std::string& dataDir,
+                                                          int32_t firstRuntimeId);
+
+/// recoverRuntimeTopics(...).specs — for callers that do not reconcile topic dirs.
 [[nodiscard]] std::vector<TopicSpec> recoverRuntimeTopicSpecs(const std::string& dataDir,
                                                               int32_t firstRuntimeId);
 
@@ -64,19 +78,26 @@ struct TopicDirReconciliation {
     std::vector<std::filesystem::path> quarantined;   // destinations under dataDir/quarantine/
 };
 
-/// B10 / user decision D4: reconcile dataDir/topics/ against the full catalog
-/// (`topics` = static + recovered, incl. __orphan.<id> placeholders).  For each
-/// direct child of canonical(dataDir/topics) that no topic claims (exactly or
-/// ignoring ASCII case) and that has the recognised layout
-/// <name>/[topic-id] + <digits>/<regular files>:
-///   * its topic-id marker names an __orphan.<id> placeholder -> DELETED;
-///   * otherwise (no marker, other id, unreadable) -> MOVED to
-///     dataDir/quarantine/<name>-<nowUnixSeconds>[-N], never deleted.
+/// B10 / user decision D4 (fix round 1): reconcile dataDir/topics/ against the
+/// full catalog (`topics` = static + recovered, incl. placeholders) and the
+/// placeholder ids RECOVERY created (`placeholderIds`, RecoveredRuntimeTopics —
+/// structural, never a name match).  For each direct child of
+/// canonical(dataDir/topics) that no topic claims (exactly or ignoring ASCII case)
+/// and that has the recognised layout
+/// <name>/[topic-id][topic-id.tmp] + <digits>/<regular files>:
+///   * its marker is exactly "pending <id>" and <id> is in placeholderIds — a
+///     runtime create whose catalog record never committed -> DELETED;
+///   * otherwise -> MOVED to dataDir/quarantine/<name>-<nowUnixSeconds>[-N], never
+///     deleted.  That covers no marker (static / older builds), a "committed"
+///     marker (its record committed, so an unclaimed one means CATALOG DAMAGE —
+///     a CRC-truncated or missing catalog; logged at error), any other id, and
+///     an unreadable or malformed marker.
 /// Symlinks are never followed (a symlinked topics/ or quarantine/ root, child,
 /// partition dir or file makes the entry "not ours": left alone).  Each action is
 /// logged at warn with its path(s).  Never throws.  Call on the startup thread
 /// after the recovered specs are appended and BEFORE the TopicRegistry opens logs.
 [[nodiscard]] TopicDirReconciliation
-reconcileTopicDirs(const std::string& dataDir, const std::vector<TopicSpec>& topics, int64_t nowUnixSeconds);
+reconcileTopicDirs(const std::string& dataDir, const std::vector<TopicSpec>& topics,
+                   const std::vector<int32_t>& placeholderIds, int64_t nowUnixSeconds);
 
 } // namespace rune::node

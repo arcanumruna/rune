@@ -382,8 +382,9 @@ void BrokerNode::start() {
     //     (refusing to boot) on a damaged catalog; an id gap (an orphan whose DDL
     //     never committed) becomes a hidden zero-partition __orphan.<id> (B5).
     {
-        std::vector<TopicSpec> recovered = recoverRuntimeTopicSpecs(
+        RecoveredRuntimeTopics recoveredTopics = recoverRuntimeTopics(
             config_.dataDir, static_cast<int32_t>(config_.topics.size()));
+        std::vector<TopicSpec>& recovered = recoveredTopics.specs;
         if (!recovered.empty()) {
             spdlog::info("BrokerNode[{}]: recovered {} runtime topic(s) from the admin "
                          "catalogs (ids {}..{})", config_.nodeId, recovered.size(),
@@ -392,7 +393,7 @@ void BrokerNode::start() {
         }
         // B10 / D4: delete only orphan-placeholder topic dirs; quarantine every other
         // unclaimed topic dir (never delete it) — BEFORE the TopicRegistry opens logs.
-        (void)reconcileTopicDirs(config_.dataDir, config_.topics,
+        (void)reconcileTopicDirs(config_.dataDir, config_.topics, recoveredTopics.placeholderIds,
                                  std::chrono::duration_cast<std::chrono::seconds>(
                                      std::chrono::system_clock::now().time_since_epoch()).count());
     }
@@ -3399,6 +3400,16 @@ void BrokerNode::buildAdminWorker() {
             adminWorkerAgent_->postViewPlan(vp);
         };
 
+        // topicCommitted (B10 / D4 fix round 1): ADMIN thread, after a DefineTopic /
+        // CreateView record commits.  Posted on the admin→control ring
+        // (kA2cTopicCommitted); the control thread — the TopicRegistry's single
+        // writer — rewrites the topic dir's marker pending -> committed.  No
+        // cross-thread filesystem or registry access.
+        deps.topicCommitted = [this](int32_t topicId) {
+            if (!adminWorkerAgent_) return;
+            adminWorkerAgent_->postTopicCommitted(topicId);
+        };
+
         // Construct AdminWorkerAgent (owns AdminWorker + the __topic_schemas
         // replica by raw ptr; the replica stays owned by BrokerNode::schemaReplica_).
         // Task 19: also hand it the __views replica + ViewRegistry (both
@@ -3815,6 +3826,13 @@ int BrokerNode::serviceAdminControl_() {
             // thread is the single producer of each worker channel's install ring).
             if (tid == kA2cViewPlanUpdate) {
                 fanoutViewPlan_(decodeViewPlanUpdate(p, n));
+                return;
+            }
+            // B10 / D4 fix round 1: the topic's catalog record committed — this
+            // (control) thread owns TopicRegistry, so it rewrites the dir marker.
+            if (tid == kA2cTopicCommitted) {
+                const int32_t topicId = decodeTopicCommitted(p, n);
+                if (topicId >= 0 && topicRegistry_) (void)topicRegistry_->markTopicCommitted(topicId);
                 return;
             }
             const A2cDispatch d = dispatchAdminToControl(tid, p, n,

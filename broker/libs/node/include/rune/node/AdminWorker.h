@@ -67,6 +67,13 @@ struct AdminDeps {
     // worker's OWN thread — never cross-thread).  Admin → control ring hand-off.
     std::function<void(const ViewPlanUpdateMsg&)> pushViewPlan;
 
+    // B10 / D4 fix round 1: a runtime topic's catalog record COMMITTED (DefineTopic
+    // schema record / CreateView record past the HW gate).  Posted on the
+    // admin→control ring (kA2cTopicCommitted); the control thread rewrites the
+    // topic's dir marker pending -> committed, so boot never DELETES its data even
+    // if the catalog is later damaged.  Optional (unset = no marker tracking).
+    std::function<void(int32_t topicId)> topicCommitted;
+
     // Task 19: send the CreateView response back to the client (encode + egress).
     std::function<void(int64_t session, int64_t corr, int32_t viewTopicId,
                        uint64_t outputFingerprint, uint16_t errorCode)> respondCreateView;

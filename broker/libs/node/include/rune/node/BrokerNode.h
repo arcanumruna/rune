@@ -336,6 +336,7 @@ public:
         //     could not take (full) — retry-on-full, never a drop.
         if (!schemaBacklog_.empty()) [[unlikely]] work += flushSchemaBacklog_();
         if (!viewPlanBacklog_.empty()) [[unlikely]] work += flushViewPlanBacklog_();  // Task 19
+        if (!topicCommittedBacklog_.empty()) [[unlikely]] work += flushTopicCommittedBacklog_();  // B10
         if (!egressBacklog_.empty()) [[unlikely]] work += flushEgressBacklog_();       // no-hang R2 / fix round 2
 
         // 5. fsyncgate (Task 10 fix 3 / I1): the schema log this thread drives
@@ -475,6 +476,19 @@ public:
             viewPlanBacklog_.push_back(vp);   // keep FIFO order
     }
 
+    /// B10 / D4 fix round 1 — ADMIN thread only (deps.topicCommitted).  Post
+    /// kA2cTopicCommitted on the admin→control ring; the control thread rewrites
+    /// the topic's dir marker pending -> committed.  Ring full → admin-owned
+    /// backlog, retried every doWork (FIFO, never dropped).
+    void postTopicCommitted(int32_t topicId) {
+        if (!topicCommittedBacklog_.empty() || !encodeTopicCommitted(failureRing_, topicId))
+            topicCommittedBacklog_.push_back(topicId);
+    }
+    [[nodiscard]] std::size_t topicCommittedBacklogForTest() const noexcept {
+        return topicCommittedBacklog_.size();
+    }
+    int flushTopicCommittedBacklogForTest() { return flushTopicCommittedBacklog_(); }
+
     // -----------------------------------------------------------------------
     // Producer-side accessors — the gateway/control thread enqueues here.
     // requestRing_ producer = gateway/control duty-cycle thread.
@@ -502,6 +516,7 @@ private:
     bool             storageFailureSignalled_ = false;
     std::vector<SchemaUpdateMsg> schemaBacklog_;   // admin-thread-owned (ring-full retry)
     std::vector<ViewPlanUpdateMsg> viewPlanBacklog_; // Task 19: admin-owned (ring-full retry)
+    std::vector<int32_t> topicCommittedBacklog_;     // B10 fix round 1: admin-owned (ring-full retry)
     // Fix round 2: preallocated, bounded (was an unbounded vector<vector> with
     // O(n) front erase).  4x the ring: one tick's answers fit by construction.
     static constexpr std::size_t kEgressBacklogBytes = 4u * static_cast<std::size_t>(kAdminRequestRingBytes);
@@ -546,6 +561,16 @@ private:
             ++sent;
         schemaBacklog_.erase(schemaBacklog_.begin(),
                              schemaBacklog_.begin() + static_cast<std::ptrdiff_t>(sent));
+        return static_cast<int>(sent);
+    }
+
+    int flushTopicCommittedBacklog_() {
+        std::size_t sent = 0;
+        while (sent < topicCommittedBacklog_.size() &&
+               encodeTopicCommitted(failureRing_, topicCommittedBacklog_[sent]))
+            ++sent;
+        topicCommittedBacklog_.erase(topicCommittedBacklog_.begin(),
+                                     topicCommittedBacklog_.begin() + static_cast<std::ptrdiff_t>(sent));
         return static_cast<int>(sent);
     }
 

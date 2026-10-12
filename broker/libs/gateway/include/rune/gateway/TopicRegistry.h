@@ -37,18 +37,31 @@
 
 namespace rune::gateway {
 
-/// Written by createTopic into dataDir/topics/<name>/ for a disk topic: the topic id
-/// in decimal.  Boot (rune::node::reconcileTopicDirs) uses it to tie an unclaimed
-/// directory to an __orphan.<id> placeholder — only such a dir is ever deleted.
+/// The two-phase topic-id marker in dataDir/topics/<name>/ (B10 / D4, fix round 1).
+/// One line, written atomically (temp file + rename):
+///   "pending <id>\n"   — a runtime create made this dir; its catalog record has
+///                        not been confirmed committed yet;
+///   "committed <id>\n" — the admin thread confirmed the record committed
+///                        (kA2cTopicCommitted on the admin→control ring; the
+///                        control thread, which owns this registry, rewrites it).
+/// Boot (rune::node::reconcileTopicDirs) DELETES an unclaimed dir only when its
+/// marker is "pending" AND recovery created a placeholder for that id.  A
+/// "committed" marker whose id has no catalog record means the CATALOG was damaged
+/// (CRC truncation, a missing catalog dir): that dir is quarantined, never deleted.
 ///
 /// Written ONLY for a topic created at RUNTIME (DefineTopic / CreateView sink, i.e.
-/// createTopic after construction) — never for the topics the constructor builds
-/// (static RUNE_TOPICS + recovered).  A static topic's id is its position in
-/// RUNE_TOPICS, so removing the last static topic while runtime topics exist turns
-/// its id into a recovery gap (an __orphan.<id> placeholder); were static dirs
-/// marked, boot would DELETE that removed static topic's data instead of
-/// quarantining it (D4: only a never-committed definition is ever deleted).
-inline constexpr const char* kTopicIdMarkerFile = "topic-id";
+/// createTopic after construction) into a topic dir THIS call created — never for
+/// the topics the constructor builds (static RUNE_TOPICS + recovered).  A static
+/// topic's id is its position in RUNE_TOPICS, so removing the last static topic
+/// while runtime topics exist turns its id into a recovery gap (an __orphan.<id>
+/// placeholder); were static dirs marked, boot would DELETE that removed static
+/// topic's data instead of quarantining it (D4: only a never-committed definition
+/// is ever deleted).
+inline constexpr const char* kTopicIdMarkerFile    = "topic-id";
+/// The temp file the marker is staged in before the atomic rename.
+inline constexpr const char* kTopicIdMarkerTmpFile = "topic-id.tmp";
+inline constexpr std::string_view kTopicIdMarkerPending   = "pending";
+inline constexpr std::string_view kTopicIdMarkerCommitted = "committed";
 
 class TopicRegistry {
 public:
@@ -114,14 +127,25 @@ public:
     //
     // Idempotent: if a topic with the same name already exists, returns
     // its existing topicId without recreating any directories or logs.
-    // Writes dataDir/topics/<name>/topic-id (the assigned id) for a disk topic
-    // (B10 / D4 — see kTopicIdMarkerFile; the constructor's topics get none).
+    // Writes dataDir/topics/<name>/topic-id = "pending <id>" for a disk topic whose
+    // dir this call created (B10 / D4 — see kTopicIdMarkerFile; the constructor's
+    // topics get none).
     //
     // Returns the assigned topicId (>= 0).
     // Throws std::runtime_error if a directory cannot be created.
     // SINGLE-WRITER: must only be called on the gateway duty-cycle thread.
     // -----------------------------------------------------------------------
     int32_t createTopic(const rune::node::TopicSpec& spec);
+
+    // -----------------------------------------------------------------------
+    // markTopicCommitted — B10 / D4 fix round 1: the topic's catalog record
+    // (DefineTopic schema / CreateView record) has committed.  Rewrites a
+    // "pending <id>" marker as "committed <id>" (atomic temp + rename).  A topic
+    // without a pending marker (boot-built, transient, an existing name) is a
+    // no-op.  Returns true iff the marker moved Pending -> Committed.
+    // SINGLE-WRITER: control thread only (driven by kA2cTopicCommitted).
+    // -----------------------------------------------------------------------
+    bool markTopicCommitted(int32_t topicId);
 
     // -----------------------------------------------------------------------
     // CP-1: per-topic retention + compaction config accessors.
@@ -155,10 +179,18 @@ private:
     };
 
     // Per-topic entry: spec + flattened partition array.
+    // The topic-id marker's state for this topic (see kTopicIdMarkerFile).
+    // None = no marker (boot-built, transient, or a dir this create did not make).
+    enum class MarkerState : uint8_t { None, Pending, Committed };
+
     struct TopicEntry {
         rune::node::TopicSpec             spec;
         std::vector<PartitionEntry>       partitions; // size == spec.partitionCount
+        MarkerState                       marker = MarkerState::None;
     };
+
+    // Atomically (temp + rename) writes "<state> <id>\n" into topicDir.
+    static bool writeMarker_(const std::string& topicDir, std::string_view state, int32_t id);
 
     std::string                            dataDir_;       // root data directory (for createTopic)
     std::vector<TopicEntry>               topics_;        // indexed by topicId

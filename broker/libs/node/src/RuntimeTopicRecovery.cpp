@@ -98,7 +98,9 @@ bool isTopicDirLayout(const fs::path& topicDir) {
         const fs::file_status st = it->symlink_status(ec);
         if (ec) return false;
         const std::string child = it->path().filename().string();
-        if (child == rune::gateway::kTopicIdMarkerFile && fs::is_regular_file(st)) continue;
+        if ((child == rune::gateway::kTopicIdMarkerFile ||
+             child == rune::gateway::kTopicIdMarkerTmpFile) && fs::is_regular_file(st))
+            continue;   // the marker, or a marker write interrupted before its rename
         if (!fs::is_directory(st) || !allDigits(child)) return false;
         std::error_code pec;
         for (fs::directory_iterator pit(it->path(), pec), pend; !pec && pit != pend; pit.increment(pec)) {
@@ -111,18 +113,34 @@ bool isTopicDirLayout(const fs::path& topicDir) {
     return !ec && sawPartition;
 }
 
-/// The id in <topicDir>/topic-id, or -1 when absent / unreadable / not EXACTLY a
-/// decimal number (optionally newline-terminated) — a delete is never decided on a
-/// guess, so "2abc" or " 2" is "no marker" (quarantined, not deleted).
-int32_t readTopicIdMarker(const fs::path& topicDir) {
+/// The parsed topic-id marker (see rune::gateway::kTopicIdMarkerFile).
+enum class MarkerKind : uint8_t { Invalid, Pending, Committed };
+struct TopicIdMarker {
+    MarkerKind kind = MarkerKind::Invalid;
+    int32_t    id   = -1;
+};
+
+/// <topicDir>/topic-id parsed EXACTLY as "pending <digits>[\n]" or
+/// "committed <digits>[\n]" (<= 10 digits, <= INT32_MAX).  Anything else —
+/// absent, unreadable, a bare number, extra spaces/lines, other case — is Invalid:
+/// a delete is never decided on a guess.
+TopicIdMarker readTopicIdMarker(const fs::path& topicDir) {
     std::ifstream in(topicDir / rune::gateway::kTopicIdMarkerFile, std::ios::binary);
-    if (!in) return -1;
+    if (!in) return {};
     std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     if (!text.empty() && text.back() == '\n') text.pop_back();
-    if (!allDigits(text) || text.size() > 10) return -1;
-    const int64_t id = std::stoll(text);
-    if (id > INT32_MAX) return -1;
-    return static_cast<int32_t>(id);
+    const std::size_t sp = text.find(' ');
+    if (sp == std::string::npos) return {};
+    const std::string_view state(text.data(), sp);
+    const std::string digits = text.substr(sp + 1);
+    MarkerKind kind = MarkerKind::Invalid;
+    if (state == rune::gateway::kTopicIdMarkerPending) kind = MarkerKind::Pending;
+    else if (state == rune::gateway::kTopicIdMarkerCommitted) kind = MarkerKind::Committed;
+    else return {};
+    if (!allDigits(digits) || digits.size() > 10) return {};
+    const int64_t id = std::stoll(digits);
+    if (id > INT32_MAX) return {};
+    return {kind, static_cast<int32_t>(id)};
 }
 
 struct DefinedTopic {
@@ -140,6 +158,7 @@ std::string orphanPlaceholderName(int32_t topicId) {
 
 TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
                                           const std::vector<TopicSpec>& topics,
+                                          const std::vector<int32_t>& placeholderIds,
                                           int64_t nowUnixSeconds) {
     TopicDirReconciliation result;
     std::error_code ec;
@@ -149,9 +168,8 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
     const fs::path canonicalRoot = fs::canonical(topicsRoot, ec);
     if (ec) return result;
 
-    std::set<int32_t> placeholderIds;
-    for (const TopicSpec& t : topics)
-        if (t.name == orphanPlaceholderName(t.topicId)) placeholderIds.insert(t.topicId);
+    // I2: placeholders are what RECOVERY created (structural), never a name match.
+    const std::set<int32_t> placeholders(placeholderIds.begin(), placeholderIds.end());
     auto claimed = [&](const std::string& n) {
         for (const TopicSpec& t : topics)
             if (t.name == n || topicNamesFoldEqual(t.name, n)) return true;
@@ -185,15 +203,25 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
                           p.string(), canonicalRoot.string());
             continue;
         }
-        const int32_t markerId = readTopicIdMarker(c);
-        if (markerId >= 0 && placeholderIds.count(markerId) != 0) {
+        const TopicIdMarker marker = readTopicIdMarker(c);
+        const bool isPlaceholderId = marker.id >= 0 && placeholders.count(marker.id) != 0;
+        if (marker.kind == MarkerKind::Pending && isPlaceholderId) {
             spdlog::warn("topic-dir reconcile: deleting '{}' — the data dir of orphan placeholder '{}' "
-                         "(a definition that never committed)", c.string(), orphanPlaceholderName(markerId));
+                         "(a runtime create whose catalog record never committed)",
+                         c.string(), orphanPlaceholderName(marker.id));
             std::error_code rec;
             fs::remove_all(c, rec);   // never follows symlinks; the layout check excluded them anyway
             if (rec) spdlog::error("topic-dir reconcile: deleting '{}' failed: {}", c.string(), rec.message());
             else result.deleted.push_back(c);
             continue;
+        }
+        if (marker.kind == MarkerKind::Committed && isPlaceholderId) {
+            // I1: the record for this id COMMITTED, yet the catalog no longer has it —
+            // the catalog was damaged (CRC truncation, a missing catalog dir).  This is
+            // acknowledged data: quarantine it below, never delete.
+            spdlog::error("topic-dir reconcile: '{}' holds COMMITTED topic id {} but the catalogs "
+                          "have no record for it (damaged / truncated / missing catalog?) — "
+                          "quarantining, NOT deleting", c.string(), marker.id);
         }
         // Everything else is MOVED, never deleted (D4).
         std::error_code qec;
@@ -230,6 +258,11 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
 
 std::vector<TopicSpec> recoverRuntimeTopicSpecs(const std::string& dataDir,
                                                 int32_t firstRuntimeId) {
+    return recoverRuntimeTopics(dataDir, firstRuntimeId).specs;
+}
+
+RecoveredRuntimeTopics recoverRuntimeTopics(const std::string& dataDir,
+                                            int32_t firstRuntimeId) {
     const fs::path root{dataDir};
 
     // ── __topic_schemas: every DefineTopic topic (ALL ids — a view over a static
@@ -323,10 +356,14 @@ std::vector<TopicSpec> recoverRuntimeTopicSpecs(const std::string& dataDir,
     });
 
     // ── contiguity: TopicRegistry hands out ids sequentially. ────────────────
-    // B5 (DDL conformance, D1): a missing id is an orphan (its DDL never committed a
-    // record).  Fill it with a hidden, inert, ZERO-partition placeholder so every
-    // later topic keeps its id; log all placeholders of this boot ONCE.
-    std::vector<TopicSpec> out;
+    // B5 (DDL conformance, D1): a missing id is usually an orphan (its DDL never
+    // committed a record) — but a damaged catalog (CRC truncation, a missing catalog
+    // dir) also leaves gaps, so a placeholder never by itself authorises deleting
+    // data: reconcileTopicDirs deletes only a "pending"-marked dir (fix round 1, I1).
+    // Fill it with a hidden, inert, ZERO-partition placeholder so every later topic
+    // keeps its id; log all placeholders of this boot ONCE.
+    RecoveredRuntimeTopics result;
+    std::vector<TopicSpec>& out = result.specs;
     out.reserve(runtime.size());
     std::string placeholders;   // "__orphan.1, __orphan.2" for the single log line
     int32_t expected = firstRuntimeId;
@@ -340,6 +377,7 @@ std::vector<TopicSpec> recoverRuntimeTopicSpecs(const std::string& dataDir,
             if (!placeholders.empty()) placeholders += ", ";
             placeholders += ph.name;
             out.push_back(std::move(ph));
+            result.placeholderIds.push_back(expected);
             ++expected;
         }
         out.push_back(std::move(spec));
@@ -350,7 +388,7 @@ std::vector<TopicSpec> recoverRuntimeTopicSpecs(const std::string& dataDir,
                      "CreateView that never committed left them behind) recreated as hidden "
                      "zero-partition placeholders so later topics keep their ids: {}", placeholders);
     }
-    return out;
+    return result;
 }
 
 } // namespace rune::node

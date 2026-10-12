@@ -16,6 +16,7 @@
 #include <rune/aeronutil/testing/FreePort.h>
 #include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
+#include <rune/gateway/TopicRegistry.h>
 #include <rune/node/HostDefaults.h>
 #include <rune/node/Worker.h>
 #include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
@@ -2000,6 +2001,68 @@ TEST(BrokerNodeRegression, RuntimeTransientTopicIsInMemoryAndRestartsEmptyRegres
         EXPECT_FALSE(fs::exists(dir / "topics" / "presence"));
         node.stop();
     }
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
+// B10 / D4 fix round 1 (I1): the REAL production path of the two-phase topic-id
+// marker on a live single-node BrokerNode.  A client DefineTopic → the control
+// thread's createTopic writes "pending <id>" → the admin thread commits the
+// __topic_schemas record (HW gate) → deps.topicCommitted → kA2cTopicCommitted on
+// the admin→control ring → the control thread (TopicRegistry's single writer)
+// rewrites the marker "committed <id>".  Condition-driven, bounded.
+// ---------------------------------------------------------------------------
+TEST(BrokerNodeRegression, DefineTopicMarksTheTopicDirCommittedOverTheAdminRingRegression) {
+    const fs::path dir = makeTempDataDir("marker_e2e_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    const uint16_t clientPort = rune::node::test::freeUdpPort();
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(30s));
+
+    rune::node::test::ShardTestClient client(dir / "client-aeron");
+    const std::string& gw = cfg.clientEndpoint.channel;
+    const int32_t stream  = cfg.clientEndpoint.streamId;
+    const int64_t sid = client.connect(gw, stream);
+    ASSERT_GT(sid, 0);
+
+    const std::vector<uint8_t> blob = rune::codec::serialize(
+        rune::codec::DescriptorBuilder("marked").add("id", rune::codec::PrimType::Int64).build());
+    namespace pc = rune::protocol::client;
+    using Clock = std::chrono::steady_clock;
+    const auto deadline = Clock::now() + 20s;
+    constexpr uint16_t kDdlInternal = static_cast<uint16_t>(pc::ErrorCode::Internal);
+    constexpr uint16_t kDdlExists   = static_cast<uint16_t>(pc::ErrorCode::TopicExists);
+
+    int32_t topicId = -1;
+    bool sawInternal = false;
+    while (topicId < 0) {
+        ASSERT_LT(Clock::now(), deadline) << "DefineTopic did not commit within the test deadline";
+        auto def = client.defineTopicUntil(gw, stream, sid, "marked", 1, /*validate=*/false,
+                                           blob, std::min(deadline, Clock::now() + 5s));
+        ASSERT_TRUE(def.has_value()) << "no DefineTopicResponse";
+        if (def->errorCode == 0) { topicId = def->topicId; break; }
+        if (def->errorCode == kDdlExists && sawInternal) { topicId = def->topicId; break; }
+        ASSERT_EQ(def->errorCode, kDdlInternal) << "non-retryable code " << def->errorCode;
+        sawInternal = true;
+        std::this_thread::sleep_for(20ms);   // admin leadership settling
+    }
+    ASSERT_GE(topicId, 0);
+
+    const fs::path marker = dir / "topics" / "marked" / rune::gateway::kTopicIdMarkerFile;
+    const std::string want = "committed " + std::to_string(topicId) + "\n";
+    std::string got;
+    while (Clock::now() < deadline) {
+        std::ifstream in(marker, std::ios::binary);
+        got.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        if (got == want) break;
+        std::this_thread::sleep_for(5ms);
+    }
+    EXPECT_EQ(got, want) << "the control thread must rewrite the marker once the record commits";
+    EXPECT_FALSE(fs::exists(marker.parent_path() / rune::gateway::kTopicIdMarkerTmpFile));
+
+    node.stop();
     std::error_code ec; fs::remove_all(dir, ec);
 }
 

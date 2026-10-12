@@ -834,6 +834,8 @@ bool AdminWorker::advance_(int64_t nowNs) {
             ts.topicName      = inFlight_->msg.name;   // same as the durable record
             ts.persistence    = inFlight_->persistence;   // same as the durable record
             reg_.applyRecord(ts);
+            // B10 / D4 fix round 1: the record is committed -> mark the topic dir.
+            if (deps_.topicCommitted) deps_.topicCommitted(inFlight_->topicId);
             if (inFlight_->msg.validate) {
                 if (const RegistryEntry* entry = reg_.byId(inFlight_->topicId))
                     deps_.pushValidators(*entry, inFlight_->topicId);
@@ -854,6 +856,8 @@ void AdminWorker::commitCreateView_() {
 
     // 1. Apply the durable ViewRecord to the in-memory catalog.
     viewRegistry_->applyRecord(inFlight_->viewRecord);
+    // B10 / D4 fix round 1: the view record is committed -> mark the sink's dir.
+    if (deps_.topicCommitted) deps_.topicCommitted(viewTopicId);
 
     // 2. Register the view's OUTPUT descriptor in the SchemaRegistry so the view
     //    is a typed topic (GetTopicSchema / openView handshake).  In-memory only

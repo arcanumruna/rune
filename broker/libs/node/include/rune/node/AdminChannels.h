@@ -65,11 +65,18 @@ enum : int32_t {
 //   kA2cSchemaUpdate   : [topicId:i32][descriptor blob] (F3 round 6, item 3:
 //                        the control thread — the ONLY producer of the worker
 //                        SPSC ingress rings — fans it out to every worker)
+//   kA2cTopicCommitted : [topicId:i32] (B10 / D4 fix round 1: the topic's catalog
+//                        record committed; the control thread rewrites its
+//                        topic-id marker pending -> committed)
 // ---------------------------------------------------------------------------
 enum : int32_t {
     kA2cStorageFailure = 1,
     kA2cSchemaUpdate   = 2,
     kA2cViewPlanUpdate = 3,   // Task 19: admin → control, fan out a compiled view plan
+    // B10 / D4 fix round 1: [topicId:i32] — a runtime topic's catalog record
+    // (DefineTopic schema / CreateView record) COMMITTED; the control thread (owner
+    // of TopicRegistry) rewrites its topic-id marker pending -> committed.
+    kA2cTopicCommitted = 4,
 };
 
 // ---------------------------------------------------------------------------
@@ -614,6 +621,24 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
     if (!readBlob(m.outDescBlob)) return m;
     (void)readBlob(m.srcDescBlob);
     return m;
+}
+
+// ---- TopicCommitted (admin → control; B10 / D4 fix round 1) ----
+// Layout: [topicId:i32].
+inline constexpr std::size_t kTopicCommittedWireLen = 4;
+
+inline bool encodeTopicCommitted(OneToOneByteRing& ring, int32_t topicId) {
+    const auto idx = ring.tryClaim(kA2cTopicCommitted, kTopicCommittedWireLen);
+    if (idx < 0) return false;
+    admin_wire::putI32(ring.base() + idx, topicId);
+    ring.commit(idx);
+    return true;
+}
+
+/// The committed topic id, or -1 on a malformed (short) frame.
+[[nodiscard]] inline int32_t decodeTopicCommitted(const uint8_t* buf, std::size_t len) {
+    if (len < kTopicCommittedWireLen) return -1;
+    return admin_wire::getI32(buf);
 }
 
 // ---- F3 round 7, item 4: descriptor size is bounded BY CONSTRUCTION ----
