@@ -136,7 +136,15 @@ std::string generateHeader(const Descriptor& d, std::string_view nspace) {
     {
         const FieldDescriptor* kf = nullptr;
         for (const auto& f : d.fields) {
-            if (f.isKey) { kf = &f; break; }
+            if (!f.isKey) continue;
+            if (kf != nullptr) {
+                // Two key fields: which one routes the record is ambiguous —
+                // reject instead of silently routing by the first.
+                throw std::invalid_argument(
+                    "generateHeader: schema '" + d.name + "' declares more than one key field ('" +
+                    kf->name + "' and '" + f.name + "') — a typed topic routes by exactly one key");
+            }
+            kf = &f;
         }
         if (kf != nullptr) {
             if (d.find("key") != nullptr) {

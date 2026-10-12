@@ -56,3 +56,19 @@ TEST(GeneratorRegression, FieldNamedKeyCollidingWithAccessorIsRejected) {
         << "a member named `key` and the key() accessor cannot coexist — fail with a clear error, "
            "never emit a header that does not compile";
 }
+
+// Phase 2b C final review: a descriptor with TWO isKey fields used to emit key()
+// for the first one silently — the record would route by a key the author may
+// not have meant.  It is ambiguous, so it is rejected like the `key` collision.
+TEST(GeneratorRegression, MoreThanOneKeyFieldIsRejected) {
+    auto d = DescriptorBuilder("two_keys").add("userId",PrimType::Int64,1,true)
+               .add("orderId",PrimType::Int64,1,true).add("qty",PrimType::Int32).build();
+    try {
+        (void)generateHeader(d);
+        FAIL() << "a descriptor with two isKey fields must be rejected";
+    } catch (const std::invalid_argument& e) {
+        const std::string msg = e.what();
+        EXPECT_NE(msg.find("userId"), std::string::npos) << msg;
+        EXPECT_NE(msg.find("orderId"), std::string::npos) << msg;
+    }
+}
