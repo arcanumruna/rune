@@ -286,6 +286,15 @@ public:
         w_->onCreateTopicReply(reply);
         checkInvariant_("failed create reply");
     }
+    /// Answer the oldest create request like the control thread, but with the reply's
+    /// persistence byte replaced by `persistence` (malformed-reply cells).
+    void deliverCreateWithPersistence(uint8_t persistence) {
+        const CreateTopicReqMsg req = popCreate_();
+        CreateTopicReplyMsg reply = createTopicForAdmin(*topics_, req);
+        reply.persistence = persistence;
+        w_->onCreateTopicReply(reply);
+        checkInvariant_("malformed create reply");
+    }
 
     // ── commits / time / leadership / restart ───────────────────────────────
     /// holdCommits: follower 2 fetches at the leader's LEO -> the HW covers every
