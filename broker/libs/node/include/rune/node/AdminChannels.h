@@ -82,6 +82,7 @@ inline constexpr int kAdminRoleRingBytes        = 1 << 12;  // 4 KiB
 // every descriptor the request ring can deliver fits ONE SchemaUpdate message
 // (static_assert below, F3 round 7, item 4).
 inline constexpr int kAdminToControlRingBytes   = kAdminRequestRingBytes;
+inline constexpr int kAdminEgressRingBytes     = kAdminRequestRingBytes;  // admin → control answer frames
 
 // ---------------------------------------------------------------------------
 // Wire layout helpers — little-endian fixed fields + length-prefixed byte runs.

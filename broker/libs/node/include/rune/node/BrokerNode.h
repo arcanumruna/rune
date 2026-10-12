@@ -495,10 +495,10 @@ private:
     OneToOneByteRing replyRing_;       // control → admin (createTopic reply)
     OneToOneByteRing roleRing_;        // control → admin (role events)
     OneToOneByteRing createReqRing_{kCreateTopicRingBytes}; // admin → control (createTopic req)
-    OneToOneByteRing egressRing_{kAdminRequestRingBytes};   // admin → control (response frames: [sessionId:i64][frame])
+    OneToOneByteRing egressRing_{kAdminEgressRingBytes};   // admin → control (response frames: [sessionId:i64][frame])
     // Fix round 5: an admin answer (at most the ring's max message, capacity/8)
     // always fits the gateway spill's staging buffer.
-    static_assert(static_cast<std::size_t>(kAdminRequestRingBytes) / 8 <=
+    static_assert(static_cast<std::size_t>(kAdminEgressRingBytes) / 8 <=
                       rune::gateway::ClientGateway::spillSizing().stage,
                   "admin egress answers must be spillable");
     // admin → control (T10 storage failure + F3 r6 SchemaUpdate).  Sized like
@@ -509,9 +509,9 @@ private:
     std::vector<ViewPlanUpdateMsg> viewPlanBacklog_; // Task 19: admin-owned (ring-full retry)
     // Fix round 2: preallocated, bounded (was an unbounded vector<vector> with
     // O(n) front erase).  4x the ring: one tick's answers fit by construction.
-    static constexpr std::size_t kEgressBacklogBytes = 4u * static_cast<std::size_t>(kAdminRequestRingBytes);
+    static constexpr std::size_t kEgressBacklogBytes = 4u * static_cast<std::size_t>(kAdminEgressRingBytes);
     rune::gateway::SpillFifo egressBacklog_{kEgressBacklogBytes};
-    std::vector<uint8_t> egressStage_ = std::vector<uint8_t>(static_cast<std::size_t>(kAdminRequestRingBytes) / 8);
+    std::vector<uint8_t> egressStage_ = std::vector<uint8_t>(static_cast<std::size_t>(kAdminEgressRingBytes) / 8);
 
     // The bound (doWork step 3 pauses intake while the backlog is non-empty) was
     // exceeded: an invariant breach — halt loudly, never drop a DDL answer.

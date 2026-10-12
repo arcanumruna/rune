@@ -435,7 +435,11 @@ bool ClientGateway::dropExpiringFrame_(const uint8_t* buf, std::size_t len)
     const Session* s = sessions_.find(static_cast<int64_t>(sid));
     if (s == nullptr || s->spill.state != SpillState::Expiring) return false;
     const uint16_t tid = static_cast<uint16_t>(buf[2] | (buf[3] << 8));
-    if (tid == static_cast<uint16_t>(pc::TemplateId::Disconnect)) {
+    // Only a PLAINTEXT session's Disconnect finalizes: this probe runs before
+    // the AEAD check, so on an encrypted session the frame is unauthenticated
+    // (session ids are guessable) and must not change its state — it keeps the
+    // counted drop and its lease (final no-hang review B1).
+    if (tid == static_cast<uint16_t>(pc::TemplateId::Disconnect) && !s->crypto.encrypted) {
         // Fix round 5: the client asked to leave — nobody waits for its
         // SessionExpired.  Finalize now (no notification), leave the EXPIRING
         // table, counted apart (never as notify-lost).

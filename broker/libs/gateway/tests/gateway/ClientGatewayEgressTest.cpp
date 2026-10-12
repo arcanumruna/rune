@@ -1557,6 +1557,34 @@ TEST(ClientGatewayEgressRegression, DisconnectFromAnExpiringSessionFinalizesItRe
     EXPECT_EQ(nh.expiringIngressDrops, 0u);
 }
 
+// Final no-hang review B1: the Expiring probe runs BEFORE decryption, so a
+// forged (unauthenticated) Disconnect on an ENCRYPTED Expiring session must not
+// finalize it — it is a counted drop, the session keeps its lease and is still
+// owed SessionExpired.  RED (957ebb9): the forged frame closed the session.
+TEST(ClientGatewayEgressRegression, SpoofedDisconnectNeverFinalizesAnEncryptedExpiringSessionRegression)
+{
+    CaptureAll cap;
+    ClientGateway gw = ClientGateway::makeForTest(cap.fn(), /*sessionId=*/1);
+    gw.setNowForTest(1'000);
+    const int64_t a = gw.injectReliableTestSessionForTest(0);
+    CryptoState* cs = gw.sessionCryptoForTest(a);
+    ASSERT_NE(cs, nullptr);
+    cs->encrypted = true;
+    cap.blockedSids = {a};
+    gw.expireSessionForSpillForTest(a);
+    ASSERT_EQ(gw.noHangStats().spillExpiring, 1u);
+    pc::Disconnect d;
+    d.sessionId = a; d.correlationId = 9;
+    std::vector<uint8_t> f(64);
+    f.resize(d.encode(f.data()));
+    EXPECT_TRUE(gw.applyClientFrameForTest(f.data(), f.size())) << "the frame is consumed (dropped), not deferred";
+    EXPECT_TRUE(gw.sessionExistsForTest(a)) << "a forged plaintext Disconnect finalized an encrypted session";
+    const auto nh = gw.noHangStats();
+    EXPECT_EQ(nh.spillExpiryClientLeft, 0u);
+    EXPECT_EQ(nh.spillExpiring, 1u) << "the session keeps its lease and is still owed SessionExpired";
+    EXPECT_EQ(nh.expiringIngressDrops, 1u);
+}
+
 // Fix round 5 (N20, recommended): an Expiring session's frame is CONSUMED (and
 // dropped) even while a pause (held acks) would ABORT it — it can never clear.
 // RED (round 4): the held pause ABORTed it every poll until the lease.
