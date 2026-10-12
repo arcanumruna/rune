@@ -67,7 +67,18 @@ inline constexpr std::string_view kTopicIdMarkerCommitted = "committed";
 /// topicDir/kTopicIdMarkerFile.  Returns false (logged, temp removed) on failure.
 /// Used by TopicRegistry (create / markTopicCommitted) and by boot's
 /// reconcileTopicDirs (promotion of a claimed dir's pending marker).
+/// Never follows a symlink (fix round 2, N1): refuses when topicDir or the final
+/// marker path is a symlink (or not a dir / not a regular file); unlinks any
+/// existing temp entry (a planted symlink is unlinked itself, never its target)
+/// and creates the temp with O_CREAT|O_EXCL|O_NOFOLLOW, so a symlink re-planted
+/// in between makes the open FAIL rather than write through it.
 bool writeTopicIdMarker(const std::string& topicDir, std::string_view state, int32_t id);
+
+/// Removes topicDir/topic-id and topicDir/topic-id.tmp (unlink only — a symlink
+/// is removed itself, never followed).  Refuses (false) when topicDir is a symlink
+/// or not a directory.  Removing a marker can only turn a future delete into a
+/// quarantine (fix round 2, N2).  Returns true iff a marker entry was removed.
+bool clearTopicIdMarker(const std::string& topicDir);
 
 class TopicRegistry {
 public:
@@ -184,18 +195,16 @@ private:
         std::unique_ptr<rune::storage::Log> log;
     };
 
-    // Per-topic entry: spec + flattened partition array.
     // The topic-id marker's state for this topic (see kTopicIdMarkerFile).
     // None = no marker (boot-built, transient, or a dir this create did not make).
     enum class MarkerState : uint8_t { None, Pending, Committed };
 
+    // Per-topic entry: spec + flattened partition array.
     struct TopicEntry {
         rune::node::TopicSpec             spec;
         std::vector<PartitionEntry>       partitions; // size == spec.partitionCount
         MarkerState                       marker = MarkerState::None;
     };
-
-
 
     std::string                            dataDir_;       // root data directory (for createTopic)
     std::vector<TopicEntry>               topics_;        // indexed by topicId

@@ -2,10 +2,15 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <stdexcept>
 #include <string>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -114,6 +119,15 @@ TopicRegistry::createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin o
     // B10 / D4: the two-phase topic-id marker ties this directory to its id, so
     // boot can tell a never-committed orphan's dir (pending: deleted) from any other
     // unclaimed dir (quarantined).  Runtime creates only — see kTopicIdMarkerFile.
+    // Fix round 2 (N2): a runtime create that REUSES a pre-existing dir (a surviving
+    // orphan's dir) clears any stale marker there, so an old "pending <otherId>"
+    // can never arm a delete of this topic's data.
+    if (origin == CreateOrigin::Runtime && topicDirPreexisted &&
+        spec.persistence != rune::node::PersistenceMode::Transient && spec.partitionCount > 0) {
+        if (clearTopicIdMarker(topicDir.string()))
+            spdlog::warn("TopicRegistry: topic='{}' reuses an existing dir — removed its stale "
+                         "topic-id marker", spec.name);
+    }
     if (origin == CreateOrigin::Runtime && !topicDirPreexisted &&
         spec.persistence != rune::node::PersistenceMode::Transient && spec.partitionCount > 0) {
         if (writeTopicIdMarker(topicDir.string(), kTopicIdMarkerPending, assignedId))
@@ -133,22 +147,63 @@ TopicRegistry::createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin o
 // ---------------------------------------------------------------------------
 // writeTopicIdMarker / TopicRegistry::markTopicCommitted (B10 / D4, fix round 1)
 // ---------------------------------------------------------------------------
+namespace {
+// Ensures `dir` is a real directory (never a symlink).
+bool isPlainDir(const fs::path& dir) {
+    std::error_code ec;
+    const fs::file_status st = fs::symlink_status(dir, ec);
+    return !ec && fs::is_directory(st) && !fs::is_symlink(st);
+}
+} // namespace
+
 bool
 writeTopicIdMarker(const std::string& topicDir, std::string_view state, int32_t id)
 {
     const fs::path dir{topicDir};
     const fs::path tmp    = dir / kTopicIdMarkerTmpFile;
     const fs::path marker = dir / kTopicIdMarkerFile;
-    {
-        std::ofstream out(tmp, std::ios::trunc | std::ios::binary);
-        out << state << ' ' << id << '\n';
-        out.flush();
-        if (!out) {
-            spdlog::warn("TopicRegistry: cannot write topic-id marker '{}'", tmp.string());
-            std::error_code rec;
-            fs::remove(tmp, rec);
+    if (!isPlainDir(dir)) {
+        spdlog::warn("TopicRegistry: not writing topic-id marker — '{}' is not a plain directory",
+                     dir.string());
+        return false;
+    }
+    {   // the final path must be absent or a regular file — never a symlink
+        std::error_code ec;
+        const fs::file_status mst = fs::symlink_status(marker, ec);
+        if (fs::exists(mst) && !fs::is_regular_file(mst)) {
+            spdlog::warn("TopicRegistry: not writing topic-id marker — '{}' is not a regular file",
+                         marker.string());
             return false;
         }
+    }
+    std::error_code rmEc;
+    fs::remove(tmp, rmEc);   // unlinks a leftover/planted entry itself, never a symlink's target
+
+    char buf[48];
+    const int len = std::snprintf(buf, sizeof buf, "%.*s %d\n",
+                                  static_cast<int>(state.size()), state.data(), id);
+    if (len <= 0 || static_cast<std::size_t>(len) >= sizeof buf) return false;
+
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        spdlog::warn("TopicRegistry: cannot create topic-id marker temp '{}': {}", tmp.string(),
+                     std::strerror(errno));
+        return false;
+    }
+    bool ok = true;
+    std::size_t off = 0;
+    while (off < static_cast<std::size_t>(len)) {
+        const ssize_t w = ::write(fd, buf + off, static_cast<std::size_t>(len) - off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) { ok = false; break; }
+        off += static_cast<std::size_t>(w);
+    }
+    if (::close(fd) != 0) ok = false;
+    if (!ok) {
+        spdlog::warn("TopicRegistry: cannot write topic-id marker temp '{}'", tmp.string());
+        std::error_code rec;
+        fs::remove(tmp, rec);
+        return false;
     }
     std::error_code ec;
     fs::rename(tmp, marker, ec);   // atomic replace: a reader sees the old or the new marker
@@ -160,6 +215,19 @@ writeTopicIdMarker(const std::string& topicDir, std::string_view state, int32_t 
         return false;
     }
     return true;
+}
+
+bool
+clearTopicIdMarker(const std::string& topicDir)
+{
+    const fs::path dir{topicDir};
+    if (!isPlainDir(dir)) return false;
+    bool removed = false;
+    std::error_code ec;
+    if (fs::remove(dir / kTopicIdMarkerFile, ec)) removed = true;   // unlink only
+    ec.clear();
+    if (fs::remove(dir / kTopicIdMarkerTmpFile, ec)) removed = true;
+    return removed;
 }
 
 bool

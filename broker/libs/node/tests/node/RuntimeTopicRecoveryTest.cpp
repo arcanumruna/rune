@@ -35,6 +35,8 @@
 #include <iterator>
 #include <set>
 #include <utility>
+
+#include <unistd.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -389,12 +391,17 @@ TEST(RuntimeTopicRecoveryRegression, TopicRegistryWritesTheTopicIdMarkerRegressi
 TEST(RuntimeTopicRecoveryRegression, MarkerIsNeverWrittenIntoAPreexistingDirRegression) {
     TempDataDir d("marker-preexisting");
     touchFile(d.path / "topics" / "old_dir" / "0" / "00000000000000000000.log", "");
+    touchFile(d.path / "topics" / "old_dir" / "topic-id", "pending 7\n");       // a stale orphan's
+    touchFile(d.path / "topics" / "old_dir" / "topic-id.tmp", "committed 7\n");
     {
         rune::gateway::TopicRegistry reg({}, d.path.string());
         ASSERT_EQ(reg.createTopic(spec("old_dir", -1)), 0);
         EXPECT_FALSE(reg.markTopicCommitted(0));
     }
-    EXPECT_FALSE(fs::exists(d.path / "topics" / "old_dir" / rune::gateway::kTopicIdMarkerFile));
+    EXPECT_FALSE(fs::exists(d.path / "topics" / "old_dir" / rune::gateway::kTopicIdMarkerFile))
+        << "fix round 2 (N2): a reused dir's stale marker is removed, never kept";
+    EXPECT_FALSE(fs::exists(d.path / "topics" / "old_dir" / rune::gateway::kTopicIdMarkerTmpFile));
+    EXPECT_TRUE(fs::exists(d.path / "topics" / "old_dir" / "0" / "00000000000000000000.log"));
 }
 
 TEST(RuntimeTopicRecoveryRegression, OrphanPlaceholderDirIsDeletedRegression) {
@@ -588,10 +595,149 @@ TEST(RuntimeTopicRecoveryRegression, PromotionNeverTouchesAMismatchedOrSymlinked
     EXPECT_TRUE(r.promoted.empty());
     EXPECT_TRUE(r.deleted.empty());
     EXPECT_TRUE(r.quarantined.empty());
-    EXPECT_EQ(readMarker(d.path / "topics" / "wrong_id"), "pending 9\n");
+    // Fix round 2 (N2): the exact-claimed dir's marker names ANOTHER id -> removed
+    // (never promoted, never left to arm a later delete).
+    ASSERT_EQ(r.markersCleared.size(), 1u);
+    EXPECT_EQ(r.markersCleared[0].filename(), "wrong_id");
+    EXPECT_FALSE(fs::exists(fs::symlink_status(d.path / "topics" / "wrong_id" / "topic-id")));
     EXPECT_EQ(readMarker(d.path / "topics" / "Folded"), "pending 2\n");
     EXPECT_EQ(readAll(outside.path / "marker"), "pending 3\n") << "never written through a symlink";
     EXPECT_EQ(readAll(outside.path / "victim" / "topic-id"), "pending 4\n");
+}
+
+// ── Fix round 2 ──────────────────────────────────────────────────────────────
+
+// N1: the marker writer never follows a symlink planted at topic-id.tmp — on the
+// runtime path (markTopicCommitted) and the boot path (promotion).  The planted
+// link is unlinked itself; the victim outside dataDir keeps its bytes; the marker
+// is a regular file with the right content.
+TEST(RuntimeTopicRecoveryRegression, MarkerWriterNeverFollowsASymlinkedTmpRegression) {
+    TempDataDir d("tmp-symlink");
+    TempDataDir outside("tmp-symlink-outside");
+    touchFile(outside.path / "victim", "precious");
+    {   // runtime: markTopicCommitted
+        rune::gateway::TopicRegistry reg({}, d.path.string());
+        ASSERT_EQ(reg.createTopic(spec("t", -1)), 0);
+        fs::create_symlink(outside.path / "victim", d.path / "topics" / "t" / "topic-id.tmp");
+        EXPECT_TRUE(reg.markTopicCommitted(0));
+        EXPECT_EQ(readAll(outside.path / "victim"), "precious") << "never written through the link";
+        EXPECT_TRUE(fs::is_regular_file(fs::symlink_status(d.path / "topics" / "t" / "topic-id")));
+        EXPECT_EQ(readMarker(d.path / "topics" / "t"), "committed 0\n");
+        EXPECT_FALSE(fs::exists(fs::symlink_status(d.path / "topics" / "t" / "topic-id.tmp")));
+    }
+    {   // boot: promotion of a claimed pending dir
+        touchFile(d.path / "topics" / "u" / "topic-id", "pending 1\n");
+        touchFile(d.path / "topics" / "u" / "0" / "seg.log");
+        fs::create_symlink(outside.path / "victim", d.path / "topics" / "u" / "topic-id.tmp");
+        const auto r = rune::node::reconcileTopicDirs(d.path.string(), {spec("t", 0), spec("u", 1)}, {}, kNow);
+        EXPECT_EQ(r.promoted.size(), 1u);
+        EXPECT_EQ(readAll(outside.path / "victim"), "precious");
+        EXPECT_TRUE(fs::is_regular_file(fs::symlink_status(d.path / "topics" / "u" / "topic-id")));
+        EXPECT_EQ(readMarker(d.path / "topics" / "u"), "committed 1\n");
+    }
+}
+
+// N1: a symlink AT topic-id (or a symlinked topic dir) makes the writer refuse —
+// runtime (markTopicCommitted) and boot (promotion) — and the target is untouched.
+TEST(RuntimeTopicRecoveryRegression, MarkerWriterRefusesASymlinkedMarkerOrDirRegression) {
+    TempDataDir d("marker-symlink");
+    TempDataDir outside("marker-symlink-outside");
+    touchFile(outside.path / "victim", "pending 0\n");
+    touchFile(outside.path / "dir" / "topic-id", "pending 1\n");
+    rune::gateway::TopicRegistry reg({}, d.path.string());
+    ASSERT_EQ(reg.createTopic(spec("m", -1)), 0);
+    ASSERT_EQ(reg.createTopic(spec("dirlink", -1)), 1);
+    // topic-id replaced by a symlink to a file outside dataDir
+    fs::remove(d.path / "topics" / "m" / "topic-id");
+    fs::create_symlink(outside.path / "victim", d.path / "topics" / "m" / "topic-id");
+    EXPECT_FALSE(reg.markTopicCommitted(0)) << "refused: the final marker path is a symlink";
+    EXPECT_EQ(readAll(outside.path / "victim"), "pending 0\n");
+    EXPECT_TRUE(fs::is_symlink(d.path / "topics" / "m" / "topic-id"));
+    EXPECT_FALSE(fs::exists(fs::symlink_status(d.path / "topics" / "m" / "topic-id.tmp")));
+    // the whole topic dir replaced by a symlink to a dir outside dataDir
+    fs::rename(d.path / "topics" / "dirlink", d.path / "moved_away");
+    fs::create_directory_symlink(outside.path / "dir", d.path / "topics" / "dirlink");
+    EXPECT_FALSE(reg.markTopicCommitted(1)) << "refused: the topic dir is a symlink";
+    EXPECT_EQ(readAll(outside.path / "dir" / "topic-id"), "pending 1\n");
+    EXPECT_FALSE(fs::exists(outside.path / "dir" / "topic-id.tmp"));
+    // boot promotion: neither is touched
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), {spec("m", 0), spec("dirlink", 1)}, {}, kNow);
+    EXPECT_TRUE(r.promoted.empty());
+    EXPECT_TRUE(r.markersCleared.empty());
+    EXPECT_EQ(readAll(outside.path / "victim"), "pending 0\n");
+    EXPECT_EQ(readAll(outside.path / "dir" / "topic-id"), "pending 1\n");
+    // and the direct writer refuses both shapes
+    EXPECT_FALSE(rune::gateway::writeTopicIdMarker((d.path / "topics" / "m").string(), "committed", 0));
+    EXPECT_FALSE(rune::gateway::writeTopicIdMarker((d.path / "topics" / "dirlink").string(), "committed", 1));
+    EXPECT_EQ(readAll(outside.path / "victim"), "pending 0\n");
+}
+
+// N2: a stale "pending <X>" on an exact-claimed (reused) dir is removed at boot, so
+// a later boot where the owner's record is lost and X is a placeholder QUARANTINES
+// the owner's data instead of deleting it.
+TEST(RuntimeTopicRecoveryRegression, StaleOtherIdMarkerOnAClaimedDirNeverArmsADeleteRegression) {
+    TempDataDir d("stale-marker");
+    touchFile(d.path / "topics" / "reused" / "topic-id", "pending 2\n");   // an old orphan's id
+    touchFile(d.path / "topics" / "reused" / "0" / "seg.log", "owner-data");
+    const auto r1 = rune::node::reconcileTopicDirs(d.path.string(), {spec("reused", 5)}, {}, kNow);
+    ASSERT_EQ(r1.markersCleared.size(), 1u);
+    EXPECT_FALSE(fs::exists(fs::symlink_status(d.path / "topics" / "reused" / "topic-id")));
+    // a later boot: the owner's record is gone and id 2 is a placeholder
+    const auto r2 = rune::node::reconcileTopicDirs(d.path.string(), {placeholder(2)}, {2}, kNow + 1);
+    EXPECT_TRUE(r2.deleted.empty());
+    ASSERT_EQ(r2.quarantined.size(), 1u);
+    EXPECT_EQ(readAll(d.path / "quarantine" / ("reused-" + std::to_string(kNow + 1)) / "0" / "seg.log"),
+              "owner-data");
+}
+
+// N3: a pending orphan that also holds topic-id.tmp (an interrupted rewrite to
+// "committed") is evidence the record may have committed: quarantined, never deleted.
+TEST(RuntimeTopicRecoveryRegression, PendingOrphanWithAnInterruptedRewriteIsQuarantinedRegression) {
+    TempDataDir d("pending-plus-tmp");
+    touchFile(d.path / "topics" / "o" / "topic-id", "pending 2\n");
+    touchFile(d.path / "topics" / "o" / "topic-id.tmp", "committed 2\n");
+    touchFile(d.path / "topics" / "o" / "0" / "seg.log");
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), {placeholder(2)}, {2}, kNow);
+    EXPECT_TRUE(r.deleted.empty());
+    ASSERT_EQ(r.quarantined.size(), 1u);
+    EXPECT_TRUE(fs::exists(d.path / "quarantine" / ("o-" + std::to_string(kNow)) / "0" / "seg.log"));
+}
+
+// M2 / M3: a delete that fails part-way (a partition dir the broker cannot empty)
+// never leaves the orphan's dir behind for a same-name create to reuse: what
+// remains is QUARANTINED.
+TEST(RuntimeTopicRecoveryRegression, FailedOrphanDeleteQuarantinesWhatRemainsRegression) {
+    if (::geteuid() == 0) GTEST_SKIP() << "root ignores directory permissions";
+    TempDataDir d("delete-fails");
+    touchFile(d.path / "topics" / "orphan_v" / "topic-id", "pending 2\n");
+    touchFile(d.path / "topics" / "orphan_v" / "0" / "seg.log");
+    const fs::path part = d.path / "topics" / "orphan_v" / "0";
+    fs::permissions(part, fs::perms::owner_read | fs::perms::owner_exec);   // seg.log cannot be unlinked
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), {placeholder(2)}, {2}, kNow);
+    const fs::path q = d.path / "quarantine" / ("orphan_v-" + std::to_string(kNow));
+    std::error_code ec;
+    fs::permissions(q / "0", fs::perms::owner_all, ec);    // restore for cleanup
+    fs::permissions(part, fs::perms::owner_all, ec);
+    EXPECT_TRUE(r.deleted.empty()) << "the delete failed";
+    ASSERT_EQ(r.quarantined.size(), 1u) << "what remains is quarantined";
+    EXPECT_FALSE(fs::exists(d.path / "topics" / "orphan_v")) << "the name's dir is gone";
+    EXPECT_TRUE(fs::exists(q / "0" / "seg.log"));
+}
+
+// M3: a quarantine that cannot be created (read-only dataDir) moves nothing and
+// deletes nothing: the error is logged and the data stays where it is.
+TEST(RuntimeTopicRecoveryRegression, UncreatableQuarantineLeavesDataInPlaceRegression) {
+    if (::geteuid() == 0) GTEST_SKIP() << "root ignores directory permissions";
+    TempDataDir d("q-readonly");
+    touchFile(d.path / "topics" / "gone" / "0" / "seg.log", "kept");
+    fs::permissions(d.path, fs::perms::owner_read | fs::perms::owner_exec);
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), {}, {}, kNow);
+    std::error_code ec;
+    fs::permissions(d.path, fs::perms::owner_all, ec);   // restore for cleanup
+    EXPECT_TRUE(r.deleted.empty());
+    EXPECT_TRUE(r.quarantined.empty());
+    EXPECT_FALSE(fs::exists(d.path / "quarantine"));
+    EXPECT_EQ(readAll(d.path / "topics" / "gone" / "0" / "seg.log"), "kept");
 }
 
 // Fix round 1, I2: a placeholder is what RECOVERY created, never a name.  A STATIC
@@ -706,7 +852,7 @@ TEST(RuntimeTopicRecoveryRegression, MalformedMarkerNeverDeletesRegression) {
         {"double_space", "pending  2"}, {"two_lines", "pending 2\npending 2\n"},
         {"upper_case", "PENDING 2"}, {"negative", "pending -2"},
         {"overflow", "pending 99999999999"}, {"no_id", "pending "}, {"empty_marker", ""},
-        {"crlf", "pending 2\r\n"}};
+        {"crlf", "pending 2\r\n"}, {"leading_zero", "pending 02"}};
     for (const auto& [name, content] : cases) {
         touchFile(d.path / "topics" / name / "topic-id", content);
         touchFile(d.path / "topics" / name / "0" / "seg.log");

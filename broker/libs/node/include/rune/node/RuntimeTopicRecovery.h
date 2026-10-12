@@ -48,7 +48,10 @@ namespace rune::node {
 /// orphanPlaceholderName(id): ZERO partitions (no replica, no log, no directory,
 /// no metadata entry — produce/subscribe find no partition), transient, and a
 /// reserved "__" name no DDL can address.  Later topics therefore keep their ids,
-/// and the orphan's original name is free again after the restart.  All
+/// and the orphan's original name is free again after the restart — once its
+/// directory is gone (deleted, or quarantined when the delete fails); a dir that
+/// reconcile must leave alone (symlinked topics/ root, unrecognised layout) is
+/// reused by a later same-name create, which clears its stale marker.  All
 /// placeholders of one boot are logged in a single warn line.  A gap can ALSO come
 /// from a damaged catalog (a CRC-truncated or missing catalog log): the placeholder
 /// is identical, and reconcileTopicDirs keeps such a committed topic's data
@@ -77,6 +80,7 @@ struct TopicDirReconciliation {
     std::vector<std::filesystem::path> deleted;       // orphan-placeholder dirs (canonical paths)
     std::vector<std::filesystem::path> quarantined;   // destinations under dataDir/quarantine/
     std::vector<std::filesystem::path> promoted;      // claimed dirs whose marker went pending -> committed
+    std::vector<std::filesystem::path> markersCleared; // claimed dirs whose stale (other-id) marker was removed
 };
 
 /// B10 / user decision D4 (fix round 1): reconcile dataDir/topics/ against the
@@ -86,8 +90,9 @@ struct TopicDirReconciliation {
 /// canonical(dataDir/topics) that no topic claims (exactly or ignoring ASCII case)
 /// and that has the recognised layout
 /// <name>/[topic-id][topic-id.tmp] + <digits>/<regular files>:
-///   * its marker is exactly "pending <id>" and <id> is in placeholderIds — a
-///     runtime create whose catalog record never committed -> DELETED;
+///   * its marker is exactly "pending <id>", <id> is in placeholderIds, and no
+///     topic-id.tmp is present — a runtime create whose catalog record never
+///     committed -> DELETED (a failed delete quarantines what remains);
 ///   * otherwise -> MOVED to dataDir/quarantine/<name>-<nowUnixSeconds>[-N], never
 ///     deleted.  That covers no marker (static / older builds), a "committed"
 ///     marker (its record committed, so an unclaimed one means CATALOG DAMAGE —
@@ -96,7 +101,8 @@ struct TopicDirReconciliation {
 /// FIRST (fix round 1b), before any delete decision: every catalog-claimed runtime
 /// topic dir (exact name, non-placeholder) whose marker reads "pending <its id>" is
 /// rewritten "committed <id>" (atomic) — a crash between the record's commit and
-/// the control thread's marker rewrite heals at the next boot.
+/// the control thread's marker rewrite heals at the next boot.  A claimed dir whose
+/// marker names ANOTHER id (stale, from a reused dir) has the marker removed.
 /// Symlinks are never followed (a symlinked topics/ or quarantine/ root, child,
 /// partition dir or file makes the entry "not ours": left alone).  Each action is
 /// logged at warn with its path(s).  Never throws.  Call on the startup thread

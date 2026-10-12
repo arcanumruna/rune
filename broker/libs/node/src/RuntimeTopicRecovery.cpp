@@ -138,6 +138,7 @@ TopicIdMarker readTopicIdMarker(const fs::path& topicDir) {
     else if (state == rune::gateway::kTopicIdMarkerCommitted) kind = MarkerKind::Committed;
     else return {};
     if (!allDigits(digits) || digits.size() > 10) return {};
+    if (digits.size() > 1 && digits[0] == '0') return {};   // the writer never pads: "0002" is not ours
     const int64_t id = std::stoll(digits);
     if (id > INT32_MAX) return {};
     return {kind, static_cast<int32_t>(id)};
@@ -202,7 +203,20 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
         const fs::path c = fs::canonical(entry, pec);
         if (pec || c.parent_path() != canonicalRoot) return;
         const TopicIdMarker m = readTopicIdMarker(c);
-        if (m.kind != MarkerKind::Pending || m.id != owner->topicId) return;
+        if (m.kind != MarkerKind::Invalid && m.id != owner->topicId) {
+            // Fix round 2 (N2): the exact-claimed dir IS the owner's, but its marker
+            // names another id (a stale marker left on a reused orphan dir).  Remove
+            // it: a stale "pending <X>" must never arm a delete of the owner's data
+            // should X be a placeholder at some later boot.  Removal only ever turns
+            // a delete into a quarantine.
+            if (rune::gateway::clearTopicIdMarker(c.string())) {
+                spdlog::warn("topic-dir reconcile: '{}' carried a stale topic-id marker (id {}, owner "
+                             "id {}) — removed", c.string(), m.id, owner->topicId);
+                result.markersCleared.push_back(c);
+            }
+            return;
+        }
+        if (m.kind != MarkerKind::Pending) return;
         if (rune::gateway::writeTopicIdMarker(c.string(), rune::gateway::kTopicIdMarkerCommitted, m.id)) {
             spdlog::info("topic-dir reconcile: '{}' marker promoted pending -> committed (topic id {} "
                          "is in the catalog)", c.string(), m.id);
@@ -242,15 +256,32 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
         }
         const TopicIdMarker marker = readTopicIdMarker(c);
         const bool isPlaceholderId = marker.id >= 0 && placeholders.count(marker.id) != 0;
-        if (marker.kind == MarkerKind::Pending && isPlaceholderId) {
+        // Fix round 2 (N3): a leftover topic-id.tmp means a marker rewrite (to
+        // "committed", from markTopicCommitted or a boot promotion) was interrupted —
+        // on-disk evidence the record may have committed.  Never delete then.
+        std::error_code tec;
+        const bool tmpPresent =
+            fs::exists(fs::symlink_status(c / rune::gateway::kTopicIdMarkerTmpFile, tec));
+        if (marker.kind == MarkerKind::Pending && isPlaceholderId && tmpPresent) {
+            spdlog::warn("topic-dir reconcile: '{}' is a pending orphan but holds an interrupted "
+                         "marker rewrite ('{}') — quarantining, NOT deleting", c.string(),
+                         rune::gateway::kTopicIdMarkerTmpFile);
+        }
+        if (marker.kind == MarkerKind::Pending && isPlaceholderId && !tmpPresent) {
             spdlog::warn("topic-dir reconcile: deleting '{}' — the data dir of orphan placeholder '{}' "
                          "(a runtime create whose catalog record never committed)",
                          c.string(), orphanPlaceholderName(marker.id));
             std::error_code rec;
             fs::remove_all(c, rec);   // never follows symlinks; the layout check excluded them anyway
-            if (rec) spdlog::error("topic-dir reconcile: deleting '{}' failed: {}", c.string(), rec.message());
-            else result.deleted.push_back(c);
-            continue;
+            if (!rec) {
+                result.deleted.push_back(c);
+                continue;
+            }
+            // Fix round 2 (M2/M3): a failed (possibly partial) delete must not leave the
+            // orphan's dir in place for a later same-name create to reuse — quarantine
+            // whatever remains (below).
+            spdlog::error("topic-dir reconcile: deleting '{}' failed: {} — quarantining what remains",
+                          c.string(), rec.message());
         }
         if (marker.kind == MarkerKind::Committed && isPlaceholderId) {
             // I1: the record for this id COMMITTED, yet the catalog no longer has it —
