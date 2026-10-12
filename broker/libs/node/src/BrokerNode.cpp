@@ -31,6 +31,7 @@
 // MD1 Task 4: MetadataService for __cluster_metadata.
 #include <rune/node/MetadataService.h>
 // Task 6: AdminWorker + SchemaRegistry + __topic_schemas persistence.
+#include <rune/node/AdminCreateTopic.h>
 #include <rune/node/AdminWorker.h>
 #include <rune/node/SchemaRegistry.h>
 #include <rune/node/RuntimeTopicRecovery.h>
@@ -3355,7 +3356,8 @@ void BrokerNode::buildAdminWorker() {
             ring.commit(idx);
         };
         deps.respondGet = [this](int64_t session, int64_t corr, int32_t topicId,
-                                 uint16_t version, const std::vector<uint8_t>& blob,
+                                 uint16_t version, int32_t partitionCount,
+                                 const std::vector<uint8_t>& blob,
                                  uint16_t errorCode) {
             if (!adminWorkerAgent_) return;
             namespace pc = rune::protocol::client;
@@ -3365,17 +3367,22 @@ void BrokerNode::buildAdminWorker() {
             resp.topicId        = topicId;
             resp.version        = version;
             resp.errorCode      = errorCode;
+            resp.partitionCount = partitionCount;   // Phase 2b Part C
             resp.descriptorBlob = blob.empty() ? nullptr : blob.data();
             resp.descriptorLen  = static_cast<uint32_t>(blob.size());
+            // Encode IN PLACE in the claimed egress slot (no per-response frame
+            // vector; encodedSize() == encode()'s return by construction).
             const std::size_t sz = resp.encodedSize();
-            std::vector<uint8_t> frame(sz);
-            const std::size_t n = resp.encode(frame.data());
             auto& ring = adminWorkerAgent_->egressRing();
-            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + n);
-            if (idx < 0) return;
+            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + sz);
+            if (idx < 0) return;  // ring full — DDL response dropped (rare); client retries
             uint8_t* p = ring.base() + idx;
             std::memcpy(p, &session, 8);
-            std::memcpy(p + 8, frame.data(), n);
+            // Debug guard: encode() must fill exactly the claimed slot — a
+            // drift between encodedSize() and encode() would ship a short
+            // frame or overrun the slot.  Release keeps the unchecked encode.
+            [[maybe_unused]] const std::size_t written = resp.encode(p + 8);
+            assert(written == sz && "TopicSchemaResponse encode() != encodedSize()");
             ring.commit(idx);
         };
 
@@ -3850,45 +3857,35 @@ int BrokerNode::serviceAdminControl_() {
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
             CreateTopicReqMsg req =
                 decodeCreateTopicReq(p, static_cast<std::size_t>(len));
-            int32_t id = -1;
+            CreateTopicReplyMsg reply;
+            reply.ticket = req.ticket;
             if (topicRegistry_) {
-                rune::node::TopicSpec spec;
-                spec.name           = req.name;
-                spec.partitionCount = req.partitionCount;
-                spec.topicId        = -1;  // registry assigns
-                // Task 19: a view SINK is a keyed + Compact "table" — carry the
-                // cleanup policy + key field the admin thread resolved (DefineTopic
-                // leaves them default: Delete, empty).
-                spec.cleanupPolicy  = static_cast<rune::node::TopicSpec::CleanupPolicy>(
-                                          req.cleanupPolicy);
-                if (!req.keyField.empty()) spec.partitionKey = req.keyField;
-                try {
-                    id = topicRegistry_->createTopic(spec);
-                    // Task 8b (SINGLE-NODE): make the runtime topic
-                    // produce/consume-capable by creating its user
-                    // PartitionReplica(s) NOW, on this same control
-                    // thread that owns TopicRegistry / replicaRegistry_
-                    // / replTransport_ / MetadataService (no new
-                    // cross-thread mutation).  The authoritative spec
-                    // (assigned id + all fields, dirs/logs already
-                    // created by createTopic) is read back from the
-                    // registry and replayed through the boot path.
-                    if (id >= 0) {
-                        const rune::node::TopicSpec* authSpec =
-                            topicRegistry_->topic(id);
-                        if (authSpec) {
+                // createTopicForAdmin (AdminCreateTopic.h): createTopic + the
+                // AUTHORITATIVE partition count + `existed` (final review I1 —
+                // an existing name returns that topic, never the requested spec).
+                reply = createTopicForAdmin(*topicRegistry_, req);
+                // Task 8b (SINGLE-NODE): make the runtime topic
+                // produce/consume-capable by creating its user
+                // PartitionReplica(s) NOW, on this same control
+                // thread that owns TopicRegistry / replicaRegistry_
+                // / replTransport_ / MetadataService (no new
+                // cross-thread mutation).  The authoritative spec
+                // (assigned id + all fields, dirs/logs already
+                // created by createTopic) is read back from the
+                // registry and replayed through the boot path
+                // (idempotent for an existing topic's replicas).
+                if (reply.topicId >= 0) {
+                    try {
+                        if (const rune::node::TopicSpec* authSpec =
+                                topicRegistry_->topic(reply.topicId))
                             (void)createRuntimeUserReplicas(*authSpec);
-                        }
+                    } catch (const std::exception& ex) {
+                        spdlog::error("BrokerNode: admin createTopic('{}') replicas failed: {}",
+                                      req.name, ex.what());
+                        reply.topicId = -1;
                     }
-                } catch (const std::exception& ex) {
-                    spdlog::error("BrokerNode: admin createTopic('{}') failed: {}",
-                                  req.name, ex.what());
-                    id = -1;
                 }
             }
-            CreateTopicReplyMsg reply;
-            reply.ticket  = req.ticket;
-            reply.topicId = id;
             // Reply ring is 1-deep in flight (one DDL at a time) → never full.
             (void)encodeCreateTopicReply(agent->replyRing(), reply);
         }, 8);

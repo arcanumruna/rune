@@ -83,7 +83,11 @@ public:
     /// Look up the LATEST version by numeric topic id. Returns nullptr if absent.
     [[nodiscard]] const RegistryEntry* byId(int32_t topicId) const;
 
-    /// Look up the LATEST version by schema name (descriptor.name). Returns nullptr if absent.
+    /// Look up the LATEST version by TOPIC name (the name DefineTopic / CREATE VIEW
+    /// was given). A record applied with an EMPTY topicName — a pre-name-trailer
+    /// durable record, or any caller that leaves it unset — is indexed by its
+    /// descriptor.name instead, so every caller must set topicName. Returns
+    /// nullptr if absent.
     [[nodiscard]] const RegistryEntry* byName(std::string_view name) const;
 
     /// Look up one specific version of a topic's schema. Returns nullptr if

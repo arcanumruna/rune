@@ -382,3 +382,78 @@ TEST(SchemaRegistryRegression, ApplyRecordCarriesTopicNameToEntry) {
     ASSERT_NE(reg.byId(0x40000013), nullptr);
     EXPECT_EQ(reg.byId(0x40000013)->topicName, "the_topic");
 }
+
+// ---------------------------------------------------------------------------
+// REGRESSION (Phase 2b C real-broker e2e): byName() is looked up with the TOPIC
+// name (GetTopicSchema, DefineTopic's TopicExists check, AlterTopic), but the
+// registry indexed the DESCRIPTOR name.  A topic defined as "typed_route" with
+// the "characters" descriptor answered GetTopicSchema("typed_route") with
+// UnknownTopic, and two topics sharing one descriptor collided on one name.
+// The index key is the durable topic name; a legacy record without one falls
+// back to the descriptor name (which is what the client named it pre-trailer).
+// ---------------------------------------------------------------------------
+TEST(SchemaRegistryRegression, ByNameResolvesTheTopicNameNotTheDescriptorName) {
+    SchemaRegistry reg;
+    TopicSchema ts = makeSchema(0x40000020, "characters", false);
+    ts.topicName = "typed_route";
+    reg.applyRecord(ts);
+    const RegistryEntry* e = reg.byName("typed_route");
+    ASSERT_NE(e, nullptr) << "the topic must resolve by the name it was defined under";
+    EXPECT_EQ(e->topicId, 0x40000020);
+    EXPECT_EQ(reg.byName("characters"), nullptr)
+        << "the descriptor name is not a topic name";
+}
+
+TEST(SchemaRegistryRegression, TwoTopicsSharingADescriptorStayDistinct) {
+    SchemaRegistry reg;
+    TopicSchema a = makeSchema(0x40000021, "characters", false);
+    a.topicName = "chars_a";
+    TopicSchema b = makeSchema(0x40000022, "characters", false);
+    b.topicName = "chars_b";
+    reg.applyRecord(a);
+    reg.applyRecord(b);
+    ASSERT_NE(reg.byName("chars_a"), nullptr);
+    ASSERT_NE(reg.byName("chars_b"), nullptr);
+    EXPECT_EQ(reg.byName("chars_a")->topicId, 0x40000021);
+    EXPECT_EQ(reg.byName("chars_b")->topicId, 0x40000022);
+}
+
+TEST(SchemaRegistryRegression, PreNameRecordResolvesByDescriptorName) {
+    SchemaRegistry reg;
+    reg.applyRecord(makeSchema(0x40000023, "legacy_chars", false));   // empty topicName
+    ASSERT_NE(reg.byName("legacy_chars"), nullptr);
+    EXPECT_EQ(reg.byName("legacy_chars")->topicId, 0x40000023);
+}
+
+// ---------------------------------------------------------------------------
+// SchemaRegistryRegression.RebuildFromRecordsIndexesTopicNameNotDescriptorName
+// — Phase 2b C final review I2: the e044159 fix (index by the topic's defined
+// name) must survive a restart.  The durable record goes through its real wire
+// form (serialize → deserialize, as boot replay / rebuildFromLog_ read it from
+// __topic_schemas) and a FRESH registry is rebuilt from it: "typed_route"
+// resolves, the descriptor name "characters" does not.
+// ---------------------------------------------------------------------------
+TEST(SchemaRegistryRegression, RebuildFromRecordsIndexesTopicNameNotDescriptorName) {
+    TopicSchema ts = makeSchema(0x40000030, "characters", false);
+    ts.topicName      = "typed_route";
+    ts.partitionCount = 8;
+    const std::vector<uint8_t> wire = ts.serialize();
+
+    const std::optional<TopicSchema> replayed = TopicSchema::deserialize(
+        std::span<const uint8_t>(wire.data(), wire.size()));
+    ASSERT_TRUE(replayed.has_value());
+    EXPECT_EQ(replayed->topicName, "typed_route");
+
+    SchemaRegistry reg;
+    // A stale pre-restart index must not leak into the rebuild.
+    reg.applyRecord(makeSchema(0x40000031, "characters", false));
+    const std::vector<TopicSchema> records{*replayed};
+    reg.rebuildFromRecords(std::span<const TopicSchema>(records.data(), records.size()));
+
+    const RegistryEntry* e = reg.byName("typed_route");
+    ASSERT_NE(e, nullptr) << "after restart the topic resolves by its defined name";
+    EXPECT_EQ(e->topicId, 0x40000030);
+    EXPECT_EQ(e->partitionCount, 8);
+    EXPECT_EQ(reg.byName("characters"), nullptr)
+        << "after restart the descriptor name is not a topic name";
+}

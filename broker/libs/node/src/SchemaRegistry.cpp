@@ -223,8 +223,19 @@ void SchemaRegistry::applyRecord(const TopicSchema& ts) {
     e.compatMode     = ts.compatMode;
     e.topicName      = ts.topicName;
 
-    const std::string& schemaName = e.descriptor.name;
-    nameToId_[schemaName] = ts.topicId;
+    // Index by the TOPIC name — every byName() caller (GetTopicSchema,
+    // DefineTopic's TopicExists check, AlterTopic) passes the name the client
+    // defined the topic under, which is independent of the descriptor's name
+    // (Phase 2b C regression: "typed_route" with the "characters" descriptor
+    // answered UnknownTopic).  The descriptor name is only the FALLBACK for a
+    // record applied with an empty topicName: a pre-name-trailer durable record
+    // (where it is the only name the topic can be found under), or any in-memory
+    // caller that leaves it unset.  It is NOT legacy-only by construction — every
+    // in-tree caller must set topicName (DefineTopic commit + replay, ALTER's
+    // carry-forward, CREATE VIEW's commitCreateView_ and view recovery all do),
+    // or the entry lands under its descriptor name and can shadow a real topic.
+    const std::string& indexName = e.topicName.empty() ? e.descriptor.name : e.topicName;
+    nameToId_[indexName] = ts.topicId;
 
     // Keep ALL versions: append (never overwrite) by version, 1-based index.
     // byId_'s per-topic container is a deque (not a vector) specifically so

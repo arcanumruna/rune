@@ -145,7 +145,7 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
     // compiled against an older schema can fetch the descriptor it needs.
     const auto* named = reg_.byName(msg.name);
     if (!named) {
-        deps_.respondGet(msg.session, msg.corr, -1, 0, {}, kUnknownTopic);
+        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic);
         return;
     }
     const RegistryEntry* e = (msg.requestedFingerprint == 0)
@@ -155,7 +155,7 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
         // No version of this (known) topic has the requested fingerprint —
         // same wire error as an unknown topic (no dedicated "stale fingerprint"
         // code on the wire yet).
-        deps_.respondGet(msg.session, msg.corr, -1, 0, {}, kUnknownTopic);
+        deps_.respondGet(msg.session, msg.corr, -1, 0, /*partitionCount=*/0, {}, kUnknownTopic);
         return;
     }
     // IMPORTANT: `e->descriptorBlob` is the raw EVOLVING blob (every field ever
@@ -166,8 +166,12 @@ void AdminWorker::submitGetSchema(const GetSchemaMsg& msg) {
     // fingerprint is exactly `e->fingerprint`, by construction in
     // SchemaRegistry::applyRecord). Serialize `e->descriptor` (materialized),
     // never `e->descriptorBlob` (evolving).
+    // Phase 2b Part C: report the TOPIC's partition count (`named`, the latest
+    // entry — partition count is a topic property, carried unchanged by every
+    // ALTER), so a typed client bound to ANY version routes records by key
+    // across every partition instead of all to partition 0.
     deps_.respondGet(msg.session, msg.corr,
-                     e->topicId, e->version,
+                     e->topicId, e->version, named->partitionCount,
                      rune::codec::serialize(e->descriptor), kOK);
 }
 
@@ -194,13 +198,30 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
         state_ = DdlState::Idle;
         return;
     }
-    inFlight_->topicId = reply.topicId;
+    // Final review I1: the name already named a topic (createTopic is idempotent
+    // by name — a RUNE_TOPICS boot topic, a recovered runtime topic).  One that
+    // already has a schema (registered under an id this name lookup missed, e.g.
+    // a pre-name-trailer record indexed by its descriptor name) is TopicExists,
+    // exactly like the up-front byName check.  A schema-less one accepts this
+    // schema — with ITS real partition count (below), never the requested one.
+    if (reply.existed) {
+        if (const RegistryEntry* ex = reg_.byId(reply.topicId)) {
+            deps_.respondDefine(inFlight_->msg.session, inFlight_->msg.corr,
+                                ex->topicId, ex->version, kTopicExists);
+            inFlight_.reset();
+            state_ = DdlState::Idle;
+            return;
+        }
+    }
+    inFlight_->topicId        = reply.topicId;
+    inFlight_->partitionCount = reply.partitionCount > 0 ? reply.partitionCount
+                                                         : inFlight_->msg.partitionCount;
 
     // ── AWAITING_COMMIT ── append the durable TopicSchema record.
     TopicSchema ts;
     ts.topicId        = reply.topicId;
     ts.version        = nextSchemaVersion_(reply.topicId);
-    ts.partitionCount = inFlight_->msg.partitionCount;
+    ts.partitionCount = inFlight_->partitionCount;   // authoritative (I1)
     ts.keyField       = inFlight_->msg.keyField;
     ts.validate       = inFlight_->msg.validate;
     ts.descriptorBlob = inFlight_->msg.blob;
@@ -269,6 +290,17 @@ void AdminWorker::onCreateViewReply_(const CreateTopicReplyMsg& reply) {
         state_ = DdlState::Idle;
         return;
     }
+    // The view name already named a topic the schema registry does not know (an
+    // untyped boot topic): createTopic handed back THAT topic, not a fresh sink.
+    // Adopting it would fold the view's output into an unrelated (or its own
+    // source) topic — reject; nothing was created, so nothing to undo.
+    if (reply.existed) {
+        deps_.respondCreateView(inFlight_->view.session, inFlight_->view.corr,
+                                reply.topicId, 0, kTopicExists);
+        inFlight_.reset();
+        state_ = DdlState::Idle;
+        return;
+    }
     // D: leader guard + views catalog wired.
     if (!leader_ || !viewsReplica_ || !viewRegistry_) {
         deps_.respondCreateView(inFlight_->view.session, inFlight_->view.corr,
@@ -278,7 +310,8 @@ void AdminWorker::onCreateViewReply_(const CreateTopicReplyMsg& reply) {
         return;
     }
 
-    inFlight_->topicId = reply.topicId;
+    inFlight_->topicId        = reply.topicId;
+    inFlight_->partitionCount = reply.partitionCount;   // authoritative sink count (I1)
     // Stamp the authoritative sink id onto the compiled plan (it is the view's
     // own topic id) BEFORE serializing it into the durable ViewRecord.
     inFlight_->compiledPlan.viewTopicId = reply.topicId;
@@ -423,6 +456,17 @@ void AdminWorker::startCreateView_(CreateViewMsg msg, int64_t nowNs) {
     // ── ViewExists ── a view with this name already committed.
     if (const ViewRecord* ex = viewRegistry_->byName(msg.viewName)) {
         deps_.respondCreateView(msg.session, msg.corr, ex->viewTopicId, 0, kViewExists);
+        return;
+    }
+
+    // ── TopicExists ── the view name already names a TYPED topic (a source, or
+    //    any DefineTopic'd topic).  The view's sink IS a topic of that name, so
+    //    the control thread's idempotent createTopic would hand back the
+    //    existing topic as the sink (`CREATE VIEW characters ... FROM
+    //    characters` → feedback loop + the source's schema overwritten).  An
+    //    UNTYPED existing topic is caught on the reply (`existed`).
+    if (const RegistryEntry* ex = reg_.byName(msg.viewName)) {
+        deps_.respondCreateView(msg.session, msg.corr, ex->topicId, 0, kTopicExists);
         return;
     }
 
@@ -694,7 +738,7 @@ bool AdminWorker::advance_(int64_t nowNs) {
             TopicSchema ts;
             ts.topicId        = inFlight_->topicId;
             ts.version        = nextSchemaVersion_(inFlight_->topicId);
-            ts.partitionCount = inFlight_->msg.partitionCount;
+            ts.partitionCount = inFlight_->partitionCount;   // authoritative (I1)
             ts.keyField       = inFlight_->msg.keyField;
             ts.validate       = inFlight_->msg.validate;
             ts.descriptorBlob = inFlight_->msg.blob;
@@ -726,10 +770,16 @@ void AdminWorker::commitCreateView_() {
     //    is a typed topic (GetTopicSchema / openView handshake).  In-memory only
     //    here (create-and-run); restart recovery (Task 19b) re-registers it from
     //    the ViewRecord's compiled plan.
-    int32_t sinkPartitions = 1;
-    if (!inFlight_->compiledPlan.sourceTopicId.empty()) {
-        if (const RegistryEntry* se = reg_.byId(inFlight_->compiledPlan.sourceTopicId[0]))
-            sinkPartitions = se->partitionCount;
+    //    The sink's partition count is the AUTHORITATIVE one the control thread
+    //    reported (final review I1); a reply that did not report one falls back
+    //    to the source's (the sink is requested co-partitioned with it).
+    int32_t sinkPartitions = inFlight_->partitionCount;
+    if (sinkPartitions <= 0) {
+        sinkPartitions = 1;
+        if (!inFlight_->compiledPlan.sourceTopicId.empty()) {
+            if (const RegistryEntry* se = reg_.byId(inFlight_->compiledPlan.sourceTopicId[0]))
+                sinkPartitions = se->partitionCount;
+        }
     }
     TopicSchema ts;
     ts.topicId        = viewTopicId;
@@ -739,6 +789,9 @@ void AdminWorker::commitCreateView_() {
     ts.validate       = false;
     ts.descriptorBlob = rune::codec::serialize(inFlight_->viewOutDesc);
     ts.nextTag        = static_cast<uint16_t>(inFlight_->viewOutDesc.fields.size());
+    // Index the view's typed output topic by the VIEW name (GetTopicSchema /
+    // openView pass it), never by the output descriptor's name.
+    ts.topicName      = inFlight_->view.viewName;
     reg_.applyRecord(ts);
 
     // 3. Respond OK with the view's topic id + output fingerprint.
@@ -907,6 +960,7 @@ void AdminWorker::recoverViewsOnPromotion_() {
                 ts.validate       = false;
                 ts.descriptorBlob = rec->outputDescriptorBlob;
                 ts.nextTag        = static_cast<uint16_t>(outDesc.fields.size());
+                ts.topicName      = rec->viewName;   // resolve by the view name (as at create)
                 for (const auto& f : outDesc.fields) {
                     if (f.isKey) { ts.keyField = f.name; break; }
                 }
