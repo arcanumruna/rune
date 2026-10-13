@@ -3022,7 +3022,8 @@ void ClientGateway::scanMovedAwaySlice_()
 void ClientGateway::logMovedAwaySummary_()
 {
     spdlog::info("ClientGateway: {} subscription(s) this node can no longer serve (demoted / partition moved "
-                 "away) answered NotLeader and dropped since the last summary ({} in total); the clients "
+                 "away) answered NotLeader (v6: Redirect to a known new leader) and dropped since the last "
+                 "summary ({} in total); the clients "
                  "re-subscribe from their positions on the leaders",
                  movedAwaySinceSummary_, readCommittedMovedAway_);
     movedAwaySinceSummary_     = 0;
@@ -3066,6 +3067,30 @@ bool ClientGateway::retireReadCommittedMovedAway_(int64_t subId, Subscription& s
     err.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
     static_assert(pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 <= kScratchSize,
                   "scratch too small for a bare ErrorResponse");
+    // E2 Task 14 (3-node e2e): a plain subscription rides the client's SEED
+    // session, which followed the subscribe Redirect to this node.  A bare
+    // NotLeader makes the client re-arm it on that same session and wait for
+    // metadata over it — stranded when this node is stopping (controlled
+    // shutdown).  When the routing image already names ANOTHER leader with a
+    // known client endpoint, a v6 session is answered Redirect{endpoint}: the
+    // client follows it (retarget + reconnect + re-subscribe from its
+    // position).  Group-member partition subscriptions (bit-61 correlation ids)
+    // ride per-leader sessions and keep the NotLeader their re-route handles.
+    constexpr int64_t kGroupFetchCorrTag = int64_t{1} << 61;   // rune-client GroupConsumerHub
+    if (pc::clientUnderstandsMovedPositionNote(session->clientVersion) && !sub.isGroup &&
+        (sub.subscribeCorrId & kGroupFetchCorrTag) == 0 && routingImage_) {
+        const auto& entry = routingImage_->lookup(rune::metadata::gpidOf(sub.topicId, sub.partition));
+        if (entry.leaderNodeId != rune::metadata::RoutingImage::NO_LEADER_NODE_ID &&
+            entry.leaderNodeId != thisNodeId_) {
+            if (const auto ep = nodeEndpointMap_.find(entry.leaderNodeId);
+                ep != nodeEndpointMap_.end() && !ep->second.empty() &&
+                pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 + ep->second.size() <=
+                    scratch_.size()) {
+                err.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
+                err.message = ep->second;
+            }
+        }
+    }
     const std::size_t encoded = err.encode(scratch_.data());
     sendAnswer_(*session, scratch_.data(), encoded);   // queued + retried, never best-effort
     if (perWorkerEgressActive_ && workerPool_)
@@ -3077,9 +3102,10 @@ bool ClientGateway::retireReadCommittedMovedAway_(int64_t subId, Subscription& s
     ++readCommittedMovedAway_;
     ++movedAwaySinceSummary_;   // one rate-limited info summary (logMovedAwaySummary_)
     spdlog::debug("ClientGateway: subscription {} (sessionId={} topicId={} partition={} isolation={} "
-                 "nextOffset={}) — this node no longer serves it (demoted / partition moved away): NotLeader, "
+                 "nextOffset={}) — this node no longer serves it (demoted / partition moved away): {}, "
                  "dropped (the client re-subscribes from its position on the leader)",
-                 subId, sub.sessionId, sub.topicId, sub.partition, sub.isolation, sub.nextOffset);
+                 subId, sub.sessionId, sub.topicId, sub.partition, sub.isolation, sub.nextOffset,
+                 err.code == static_cast<int16_t>(pc::ErrorCode::Redirect) ? "Redirect" : "NotLeader");
     return true;
 }
 

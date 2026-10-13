@@ -8,6 +8,8 @@
 // gateway-inline path may touch a worker-owned ring.  Deterministic: no Aeron.
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/TopicRegistry.h>
+#include <rune/metadata/Gpid.h>
+#include <rune/metadata/RoutingImage.h>
 #include <rune/metadata/ShardRouter.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/WorkerOp.h>
@@ -86,6 +88,7 @@ struct Rig {
     std::map<int64_t, pc::ProduceResponse>    produced;      // by correlationId
     std::map<int64_t, pc::SubscribeResponse>  subscribed;    // by correlationId
     std::map<int64_t, int16_t>                errors;        // ErrorResponse code by correlationId
+    std::map<int64_t, std::string>            errorMessages; // ErrorResponse message by correlationId
     std::vector<pc::Records>                  records;       // baseOffset / subscriptionId only
     int64_t                                   now  = 1'000'000'000;
     int64_t                                   corr = 0;
@@ -161,7 +164,10 @@ struct Rig {
             if (auto r = pc::SubscribeResponse::decode(b, n)) subscribed[r->correlationId] = *r;
             break;
         case pc::TemplateId::ErrorResponse:
-            if (auto r = pc::ErrorResponse::decode(b, n)) errors[r->correlationId] = r->code;
+            if (auto r = pc::ErrorResponse::decode(b, n)) {
+                errors[r->correlationId]        = r->code;
+                errorMessages[r->correlationId] = std::string(r->message);
+            }
             break;
         case pc::TemplateId::Records:
             if (sessionEgress) if (auto r = pc::Records::decode(b, n)) records.push_back(*r);
@@ -760,4 +766,63 @@ TEST(TransientGatewayRegression, FallbackScanIsBoundedPerSliceAndCoversEverySubs
         r.gw.pushSubscriptionsForTest();
     EXPECT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), static_cast<uint64_t>(kSubs))
         << "SILENT STALL: the spread scan never reached every subscription";
+}
+
+// ---------------------------------------------------------------------------
+// E2 Task 14 (found by the 3-node transient failover e2e): a client's plain
+// subscriptions ride its SEED session, which follows the subscribe Redirect to
+// the partition leader.  A controlled stop of that leader answered the moved
+// subscriptions a bare NotLeader: the client re-armed them on the same seed
+// session — bound to the node that is about to exit — and waited for fresh
+// metadata over it, which never came.  The subscriptions timed out (explicit,
+// but lost).  The demoted node KNOWS the new leader (the routing image flipped
+// before the routed sweep): a v6 session is now answered Redirect{the new
+// leader's client endpoint} (the client follows it: retarget + reconnect +
+// re-subscribe from its position — the path the v6 client already takes for a
+// Redirect).  Below 6, or with no known other leader: NotLeader as before.
+// ---------------------------------------------------------------------------
+TEST(TransientGatewayRegression, MovedSubscriptionIsRedirectedToTheKnownNewLeaderRegression) {
+    Rig r;
+    r.gw.setNodeIdForTest(1);
+    const std::string kLeaderEndpoint = "aeron:udp?endpoint=rune-3:40200";
+    r.gw.setNodeEndpointMap({{1, "aeron:udp?endpoint=rune-2:40200"}, {2, kLeaderEndpoint}});
+    const int64_t v6 = r.gw.injectTestSession(0);
+    const int64_t v5 = r.gw.injectTestSession(0, /*clientVersion=*/5);
+    r.subscribe(v6, -2, 201, /*read_committed=*/1);
+    r.subscribe(v5, -2, 202, /*read_committed=*/1);
+    ASSERT_TRUE(r.subscribed.count(201));
+    ASSERT_TRUE(r.subscribed.count(202));
+    // The controller moved partition 0 to node 2 (epoch 2); this node is demoted.
+    r.gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build({{rune::metadata::gpidOf(0, 0), 2, 2}}));
+    const auto h = r.reg.lookupHandle(0, 0);
+    r.reg.setIntendedRole(0, 0, h.incarnation, rune::node::ReplicaRegistry::IntendedRole::Follower);
+    r.gw.pushSubscriptionsForTest();
+    ASSERT_TRUE(r.errors.count(201)) << "the moved v6 subscription was never answered";
+    EXPECT_EQ(r.errors[201], static_cast<int16_t>(pc::ErrorCode::Redirect))
+        << "a v6 subscription moved to a KNOWN leader must be redirected there (a bare NotLeader strands a client "
+           "whose seed session sits on this stopping node)";
+    EXPECT_EQ(r.errorMessages[201], kLeaderEndpoint);
+    ASSERT_TRUE(r.errors.count(202));
+    EXPECT_EQ(r.errors[202], kNotLeader) << "a session below 6 keeps the bare NotLeader";
+    EXPECT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), 2u);
+}
+
+// ... and with no known other leader (NO_LEADER, or this node itself in a stale
+// image, or no endpoint for it) the v6 answer stays the bare NotLeader.
+TEST(TransientGatewayRegression, MovedSubscriptionWithNoKnownOtherLeaderStaysNotLeaderRegression) {
+    for (const int32_t leader : {rune::metadata::RoutingImage::NO_LEADER_NODE_ID, 1, 3}) {
+        Rig r;
+        r.gw.setNodeIdForTest(1);
+        r.gw.setNodeEndpointMap({{1, "aeron:udp?endpoint=rune-2:40200"}, {2, "aeron:udp?endpoint=rune-3:40200"}});
+        const int64_t v6 = r.gw.injectTestSession(0);
+        r.subscribe(v6, -2, 211, /*read_committed=*/1);
+        ASSERT_TRUE(r.subscribed.count(211));
+        r.gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build({{rune::metadata::gpidOf(0, 0), leader, 2}}));
+        const auto h = r.reg.lookupHandle(0, 0);
+        r.reg.setIntendedRole(0, 0, h.incarnation, rune::node::ReplicaRegistry::IntendedRole::Follower);
+        r.gw.pushSubscriptionsForTest();
+        ASSERT_TRUE(r.errors.count(211)) << "leader " << leader;
+        EXPECT_EQ(r.errors[211], kNotLeader) << "leader " << leader << " (3 has no endpoint)";
+        EXPECT_TRUE(r.errorMessages[211].empty()) << "leader " << leader;
+    }
 }
