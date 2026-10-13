@@ -133,6 +133,12 @@ private:
     std::size_t pos_ = 0;
 };
 
+/// THE formatVer-1 TopicConfig enum bounds — one definition, used by the event validation
+/// (validateEvent, encode, decode) AND topicConfigError, so the two can never diverge.
+inline constexpr uint8_t kMaxCleanupPolicy  = 2;   // 0 Delete, 1 Compact, 2 CompactDelete
+inline constexpr uint8_t kMaxDurability     = 1;   // 0 Majority, 1 AllInSync
+inline constexpr uint8_t kMaxDurabilityTier = 2;   // 0 Leader, 1 Majority, 2 Strict
+
 /// THE formatVer-1 value validation (CatalogEvent.cpp) — the one rule set encode and decode
 /// run, exported so apply() refuses an in-memory event exactly where encode would
 /// (formatVer, kind, kind/ops agreement, every enum range).  nullopt = valid.

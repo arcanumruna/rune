@@ -727,3 +727,29 @@ TEST(CatalogApplyV1Regression, TopicConfigErrorIsTheOneValidator) {
     ASSERT_FALSE(a.has_value());
     EXPECT_NE(a.error().detail.find("config min.compaction.lag.ms -5 < 0"), std::string::npos) << a.error().detail;
 }
+
+TEST(CatalogApplyV1Regression, ConfigEnumBoundsAreOneDefinitionForEventValidationAndTopicConfigErrorRegression) {
+    // Task 2 re-review N1: cleanup.policy / durability / durability.tier bounds were spelled
+    // twice (the event validation and topicConfigError).  Now one definition: for every byte
+    // value, encode (the event validation) and topicConfigError accept exactly the same set.
+    enum class F { CleanupPolicy, Durability, DurabilityTier };
+    for (F f : {F::CleanupPolicy, F::Durability, F::DurabilityTier}) {
+        int accepted = 0;
+        for (int v = 0; v <= 255; ++v) {
+            rc::TopicConfig c;
+            switch (f) {
+            case F::CleanupPolicy:  c.cleanupPolicy = static_cast<uint8_t>(v); break;
+            case F::Durability:     c.durability = static_cast<uint8_t>(v); break;
+            case F::DurabilityTier: c.durabilityTier = static_cast<uint8_t>(v); break;
+            }
+            rc::CatalogEvent e;
+            rc::CreateTopicOps o; o.topicId = 0; o.config = c;
+            e.kind = rc::EventKind::CreateTopic; e.ops = o; e.objectName = "t"; e.objectId = 1; e.newVersion = 1;
+            const bool encodes = rc::encode(e).has_value();
+            const bool configOk = !rc::topicConfigError(c).has_value();
+            EXPECT_EQ(encodes, configOk) << "field " << static_cast<int>(f) << " value " << v;
+            accepted += configOk ? 1 : 0;
+        }
+        EXPECT_EQ(accepted, f == F::Durability ? 2 : 3) << "field " << static_cast<int>(f);
+    }
+}

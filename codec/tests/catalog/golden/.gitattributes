@@ -1,0 +1,2 @@
+# Golden logs are frozen bytes: never diffed, never EOL-converted.
+*.rcat binary

@@ -23,9 +23,9 @@ static_assert(kMaxStr16Bytes == 0xFFFF && kMaxStr32Bytes == 0xFFFF'FFFF && kMaxL
 enum class Violation : uint8_t { UnknownFormatVer, ReservedKind, UnknownKind, KindOpsMismatch, BadEnum };
 
 constexpr bool validPersistence(Persistence p) noexcept { return static_cast<uint8_t>(p) <= 1; }
-constexpr bool validCleanupPolicy(uint8_t v) noexcept  { return v <= 2; }   // Delete, Compact, CompactDelete
-constexpr bool validDurability(uint8_t v) noexcept     { return v <= 1; }   // Majority, AllInSync
-constexpr bool validDurabilityTier(uint8_t v) noexcept { return v <= 2; }   // Leader, Majority, Strict
+constexpr bool validCleanupPolicy(uint8_t v) noexcept  { return v <= wire::kMaxCleanupPolicy; }
+constexpr bool validDurability(uint8_t v) noexcept     { return v <= wire::kMaxDurability; }
+constexpr bool validDurabilityTier(uint8_t v) noexcept { return v <= wire::kMaxDurabilityTier; }
 constexpr bool validConfigKey(ConfigKey k) noexcept {
     const auto v = static_cast<uint8_t>(k);
     return v >= static_cast<uint8_t>(ConfigKey::RetentionMs) && v <= static_cast<uint8_t>(ConfigKey::MaxCompactionLagMs);

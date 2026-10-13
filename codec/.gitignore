@@ -26,3 +26,4 @@ conan_provider.cmake
 
 # macOS
 .DS_Store
+build-rel/

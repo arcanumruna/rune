@@ -399,7 +399,7 @@ std::optional<std::string> topicConfigError(const TopicConfig& c) {
         if (v > max) return std::string(key) + " " + std::to_string(v) + " > " + std::to_string(max);
         return std::nullopt;
     };
-    if (auto r = byte("cleanup.policy", c.cleanupPolicy, 2)) return r;
+    if (auto r = byte("cleanup.policy", c.cleanupPolicy, wire::kMaxCleanupPolicy)) return r;
     if (auto r = atLeast("retention.ms", c.retentionMs, -1)) return r;
     if (auto r = atLeast("retention.bytes", c.retentionBytes, -1)) return r;
     if (auto r = atLeast("delete.retention.ms", c.deleteRetentionMs, 0)) return r;
@@ -412,8 +412,8 @@ std::optional<std::string> topicConfigError(const TopicConfig& c) {
     if (auto r = atLeast("max.compaction.lag.ms", c.maxCompactionLagMs, -1)) return r;
     if (auto r = atLeast("retention.check.ms", c.retentionCheckMs, 1)) return r;
     if (auto r = atLeast("file.delete.delay.ms", c.fileDeleteDelayMs, 1)) return r;
-    if (auto r = byte("durability", c.durability, 1)) return r;
-    if (auto r = byte("durability.tier", c.durabilityTier, 2)) return r;
+    if (auto r = byte("durability", c.durability, wire::kMaxDurability)) return r;
+    if (auto r = byte("durability.tier", c.durabilityTier, wire::kMaxDurabilityTier)) return r;
     return std::nullopt;   // coPartitionGroup, partitionKey: free-form (bounded by the wire's str16)
 }
 
