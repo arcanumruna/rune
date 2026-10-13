@@ -71,16 +71,26 @@ One rule applies to `RUNE_TOPICS` entries, the client's `defineTopic` and `creat
   existing topic or view only by case is rejected with error 25 (`TopicExists`). A partition count
   below 1 is rejected with error 23 (`InvalidSchema`).
 - DDL is serialized: one create or alter runs at a time, so of two colliding requests exactly one
-  wins. If the leader is demoted mid-request, the request in flight is answered error 6
-  (`Internal`; retry on the new leader). Queued requests run after the node is leader again.
+  wins. If the leader is demoted, the request in flight and every queued request are answered
+  error 6 (`Internal`); retry on the new leader. A request answered 6 after its record was
+  written is *in doubt*: it may still take effect, and does at the latest after a restart.
+- A runtime topic serves only once its definition commits. Until then it is not listed in
+  metadata, and produce and subscribe to it are answered error 2 (`NotLeader`, retriable: the
+  client refreshes metadata and retries). The `defineTopic` / `createView` answer is sent only
+  when the topic serves, so the first produce after it succeeds.
+- `defineTopic` over a view's output topic is rejected with error 25 (`TopicExists`), also when
+  that view's `createView` failed or is in doubt. A `createView` retry with the same name and
+  definition reuses its own failed attempt's output topic, which is always empty because nothing
+  can write to it before its definition commits.
 
 ### Data directory clean-up at boot
 
 - A topic id whose definition never committed has no catalog record. The usual cause is a
-  `createView` that failed after its output topic was created. Boot keeps the id as a hidden
-  placeholder `__orphan.<id>` with zero partitions, so later topics keep their ids. A placeholder
-  is not listed in metadata, and produce and subscribe to it are refused. Boot logs all
-  placeholders in one warning line.
+  `defineTopic` or `createView` that failed after its topic was created and was not retried.
+  Such a topic never held data: it was not writable before its definition committed. Boot keeps
+  the id as a hidden placeholder `__orphan.<id>` with zero partitions, so later topics keep their
+  ids. A placeholder is not listed in metadata, and produce and subscribe to it are refused. Boot
+  logs all placeholders in one warning line.
 - Every runtime-defined disk topic directory holds a `topic-id` marker file. It reads
   `pending <id>` when the topic is created and is rewritten to `committed <id>` once the catalog
   record commits. At boot, a `pending` marker on a directory the catalog claims is promoted to
@@ -89,12 +99,18 @@ One rule applies to `RUNE_TOPICS` entries, the client's `defineTopic` and `creat
   **deleted** only if all of these hold:
   - its marker reads `pending <id>`, and boot created the `__orphan.<id>` placeholder for that id
     (matched by id, never by name);
+  - every `<partition>/*.log` file in it is 0 bytes. A directory whose log holds bytes is
+    quarantined, and an error line names the placeholder;
   - neither catalog log (`__topic_schemas`, `__views`) was truncated at recovery, and neither is
-    missing while the other exists.
+    missing while the other exists — on this boot or an earlier one (see below).
 - Any other unclaimed directory is **moved, never deleted**, to
   `dataDir/quarantine/<name>-<unix-timestamp>/`, and a warning names both paths. This covers a
   topic removed from `RUNE_TOPICS`, a misspelt name, and a directory left by another build.
-  With a damaged catalog nothing is deleted that boot, and one warning line says why.
+  With a damaged catalog nothing is deleted that boot, and one warning line says why. The damage is
+  remembered in `dataDir/.catalog-damaged`, so later boots delete nothing either (recovery cuts
+  the damaged catalog, so a later boot would otherwise read it as intact). The file is removed
+  once a boot leaves no unclaimed topic directory in `dataDir/topics/`; you may also remove it by
+  hand after checking `dataDir/quarantine/`.
 - Reconcile only considers direct children of `dataDir/topics/` laid out as
   `<name>/<partition number>/<files>`. It never follows a symlink, and it leaves anything else
   alone.
@@ -107,6 +123,16 @@ One rule applies to `RUNE_TOPICS` entries, the client's `defineTopic` and `creat
   5. Start the broker.
 - Delete quarantined directories yourself once you no longer need them; the broker never
   deletes from `dataDir/quarantine/`.
+- **A `RUNE_TOPICS` name may not collide with a runtime topic.** If a `RUNE_TOPICS` entry has
+  the same name as a topic or view created at runtime (`defineTopic` / `createView`), or differs
+  from it only by case, boot fails with an error that names both and the runtime topic's id.
+  Nothing on disk is changed. Remove or rename the entry.
+- **Adding or removing `RUNE_TOPICS` entries while runtime topics exist shifts their ids.** A
+  `RUNE_TOPICS` topic's id is its position in the list, and runtime topics are numbered after the
+  last one. A change in the number of entries makes the runtime topic at the boundary lose its
+  identity: its schema attaches to the wrong topic and its directory is quarantined at boot (never
+  deleted). Keep the `RUNE_TOPICS` list fixed once runtime topics exist, or append new static
+  topics only on a fresh data directory.
 
 ### Transient topics
 
