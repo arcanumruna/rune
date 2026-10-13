@@ -216,6 +216,20 @@ TEST(ViewMessagesRegression, InvalidRequestAndViewRowStatusesArePinnedRegression
     EXPECT_EQ(out->correlationId, 9);
 }
 
+// DDL conformance: a DefineTopic/CreateView name that fails the broker's name rule
+// (empty, > 249 bytes, "." / "..", a byte outside [A-Za-z0-9._-], or the reserved
+// "__" prefix) is answered InvalidTopicName.  Append-only wire constant.
+TEST(ViewMessagesRegression, InvalidTopicNameCodeIsPinned) {
+    EXPECT_EQ(static_cast<uint16_t>(ErrorCode::InvalidTopicName), 40u);
+}
+
+// DDL conformance (user decision D3b): a CreateView whose source is another view's
+// output is rejected (a view sink carries no change events until Phase 3, so the
+// view would stay silently empty).  Append-only wire constant.
+TEST(ViewMessagesRegression, ViewSourceIsViewCodeIsPinned) {
+    EXPECT_EQ(static_cast<uint16_t>(ErrorCode::ViewSourceIsView), 41u);
+}
+
 // No-hang fix round 2: kRowTooLarge (7) appended; client version 5 is the
 // InvalidRequest gate.
 TEST(ViewMessagesRegression, RowTooLargeStatusAndInvalidRequestClientGateArePinnedRegression) {
