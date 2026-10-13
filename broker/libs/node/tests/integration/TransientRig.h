@@ -69,7 +69,10 @@ struct Rig {
     int64_t                                   now  = 1'000'000'000;
     int64_t                                   corr = 0;
 
-    explicit Rig(std::size_t ringBytes = 4u << 20, std::size_t maxBatches = 100'000, bool withFollower = false)
+    /// `leaderTransport` (optional): receives the leader's FetchResponses / pushes
+    /// (the seeded stress drives a real follower from them); default: dropped.
+    explicit Rig(std::size_t ringBytes = 4u << 20, std::size_t maxBatches = 100'000, bool withFollower = false,
+                 rune::replication::PartitionTransport* leaderTransport = nullptr)
         : mem(ringBytes, maxBatches) {
         PartitionConfig c;
         c.topicId = kTopic; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
@@ -77,7 +80,8 @@ struct Rig {
         c.replicaLagMaxMs = 600'000;
         c.followerFlushIntervalNs = 0;
         const std::vector<int32_t> set = withFollower ? std::vector<int32_t>{1, 2} : std::vector<int32_t>{1};
-        auto r = std::make_unique<PartitionReplica>(c, Role::Leader, 1, set, set, &mem, &transport);
+        auto r = std::make_unique<PartitionReplica>(c, Role::Leader, 1, set, set, &mem,
+                                                    leaderTransport != nullptr ? leaderTransport : &transport);
         r->setExternalFollowerFlush(true);
         rep = r.get();
         reg.add(kTopic, 0, std::move(r));

@@ -937,6 +937,17 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     gtest_discover_tests(rune_transient_alloc_regression_tests)
 
+    # Phase 2b E2: seeded model-checked stress over a transient partition's shared ring.
+    add_executable(rune_transient_stress_tests tests/integration/TransientDataPathStressTest.cpp)
+    target_include_directories(rune_transient_stress_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_transient_stress_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        rune_transaction
+        GTest::gtest_main)
+    gtest_discover_tests(rune_transient_stress_tests PROPERTIES TIMEOUT 300)
+
     # ---------------------------------------------------------------------------
     # CP-9: RetentionCleanerAgent integration tests — separate cleaner-cadence
     #   retention: time (largestTimestamp), size, log-start-offset; async delete
