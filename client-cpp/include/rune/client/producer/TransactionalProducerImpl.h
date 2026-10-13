@@ -143,6 +143,10 @@ public:
     static constexpr int64_t  kNoPid = -1;
     /// F14: the retry backoff cap, in duty cycles.
     static constexpr uint32_t kRetryBackoffCapCycles = 1024;
+    /// E2 final fix wave (M3): a batch answered TransientLogFull (42) is
+    /// re-offered after this much duty-clock time (capped by the produce
+    /// timeout) — the plain producer's ProducerImpl::kRetriableBackoffNs.
+    static constexpr int64_t kTransientLogFullBackoffNs = 100'000'000LL;
 
     using SendFn = std::function<bool(int32_t, const uint8_t*, std::size_t)>;
     /// Asks the Client to re-discover the transaction coordinator (send a
@@ -332,12 +336,13 @@ private:
         bool                 awaitRoute = false;
         uint64_t             awaitGen   = 0;
         uint64_t             sendTick = 0;      // TransactionalProducerImpl::sendTick_ at the latest offer
-        // Phase 2b E2 (ruling 2): answered TransientLogFull — not re-offered for
-        // this many more duty cycles (exponential, capped at
-        // kRetryBackoffCapCycles); logFullStreak = consecutive 42 answers.  Never
-        // spends retryCount; bounded by deadlineNs (sweep_).
-        uint32_t             backoffCycles = 0;
-        uint32_t             logFullStreak = 0;
+        // Phase 2b E2 (ruling 2): answered TransientLogFull — not re-offered
+        // before this duty-clock time (E2 final fix wave M3: a WALL-CLOCK
+        // backoff, kTransientLogFullBackoffNs — the plain producer's
+        // kRetriableBackoffNs — never a cycle count, which a busy-spin idle
+        // strategy burns through in about a millisecond).  Never spends
+        // retryCount; bounded by deadlineNs (sweep_).  0 = not backing off.
+        int64_t              notBeforeNs = 0;
         std::vector<int64_t> priorCorrIds;      // the superseded attempts' ids
     };
 

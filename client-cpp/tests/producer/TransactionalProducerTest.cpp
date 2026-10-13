@@ -2641,8 +2641,12 @@ TEST(TransactionalProducerTest, TransientLogFullBacksOffWithoutSpendingRetriesRe
         r.sink.clear();
         r.doWork();
         ASSERT_EQ(r.sink.count(rpc::TemplateId::Produce), 0) << "re-sent on the very next cycle (no backoff)";
-        int waited = 0;
-        while (r.sink.count(rpc::TemplateId::Produce) == 0) { r.doWork(); ASSERT_LE(++waited, 2048); }
+        int waited = 0;   // the backoff is wall-clock (final fix wave M3): 10 ms duty-clock steps
+        while (r.sink.count(rpc::TemplateId::Produce) == 0) {
+            r.now += 10'000'000;
+            r.doWork();
+            ASSERT_LE(++waited, 64);
+        }
         cur = r.sink.last(rpc::TemplateId::Produce);
         EXPECT_EQ(decodeBaseSeqFromProduce(cur), seq0) << "same identity";
         ASSERT_EQ(r.tp.state(), TxnState::InTransaction) << "42 poisoned the transaction";
@@ -2650,5 +2654,46 @@ TEST(TransactionalProducerTest, TransientLogFullBacksOffWithoutSpendingRetriesRe
     auto ok = makeProduceResponse(corrIdOf(cur), 0, 7);
     r.impl->onProduceResponse(ok.data(), ok.size());
     EXPECT_EQ(r.tp.state(), TxnState::InTransaction);
+    EXPECT_EQ(r.impl->testInFlightBatches(), 0u);
+}
+
+// E2 final fix wave (M3): the transactional producer's TransientLogFull backoff
+// is WALL-CLOCK time (the plain producer's 100 ms), not a duty-cycle count —
+// under a busy-spin idle strategy 1024 cycles last about a millisecond, so a
+// long full ring was re-offered ~1000 times a second per batch.  Here 5000
+// cycles 1 us apart (5 ms of duty clock) must not re-offer it; 100 ms must.
+// RED (cycle-count backoff): re-sent within the first 1024 cycles.
+TEST(TransactionalProducerTest, TransientLogFullBackoffIsWallClockTimeRegression) {
+    TxnRig r;
+    r.acquire(77, 0);
+    r.tp.beginTransaction();
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.doWork();
+    r.addPartitionsOk();
+    r.sink.clear();
+    r.doWork();
+    auto cur = r.sink.last(rpc::TemplateId::Produce);
+    ASSERT_FALSE(cur.empty());
+    for (int answer = 0; answer < 12; ++answer) {   // a long full ring: answered 42 again and again
+        SCOPED_TRACE(answer);
+        auto err = makeProduceResponse(corrIdOf(cur), ecOf(rpc::ErrorCode::TransientLogFull));
+        r.impl->onProduceResponse(err.data(), err.size());
+        r.sink.clear();
+        const int64_t answeredAt = r.now;
+        for (int c = 0; c < 5000; ++c) {
+            r.now += 1'000;   // 1 us per duty cycle (busy spin)
+            r.doWork();
+            ASSERT_EQ(r.sink.count(rpc::TemplateId::Produce), 0)
+                << "re-offered after " << c + 1 << " cycles / " << (r.now - answeredAt) / 1000
+                << " us: a cycle-count backoff, not the 100 ms wall-clock one";
+        }
+        r.now = answeredAt + TransactionalProducerImpl::kTransientLogFullBackoffNs;
+        r.doWork();
+        ASSERT_EQ(r.sink.count(rpc::TemplateId::Produce), 1) << "not re-offered once the backoff elapsed";
+        cur = r.sink.last(rpc::TemplateId::Produce);
+        ASSERT_EQ(r.tp.state(), TxnState::InTransaction);
+    }
+    auto ok = makeProduceResponse(corrIdOf(cur), 0, 7);
+    r.impl->onProduceResponse(ok.data(), ok.size());
     EXPECT_EQ(r.impl->testInFlightBatches(), 0u);
 }

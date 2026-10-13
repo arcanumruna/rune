@@ -991,7 +991,7 @@ int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const Se
                 }
             }
             if (b.sentSessionId == 0 && !b.parked && !b.awaitRoute) {
-                if (b.backoffCycles > 0) { --b.backoffCycles; continue; }   // E2: TransientLogFull backoff
+                if (nowNs < b.notBeforeNs) continue;   // E2: TransientLogFull wall-clock backoff (M3)
                 due.push_back(corr);
             }
         }
@@ -1399,13 +1399,14 @@ void TransactionalProducerImpl::onProduceResponse(const uint8_t* buf, std::size_
     if (ec == kTransientLogFull) {
         // Phase 2b E2 (ruling 2): the partition's transient ring is full of
         // not-yet-replicated records — definitely NOT appended, and the leader is
-        // right (no re-discovery, no metadata).  Re-offered after a duty-cycle
-        // backoff with the same identity; the retry budget is not spent (a slow
-        // follower can keep the ring full longer than kMaxRetries cycles); the
-        // batch deadline (sweep_) still bounds it.
-        const uint32_t shift = std::min<uint32_t>(ib.logFullStreak, 30u);
-        ib.backoffCycles = std::min<uint32_t>(1u << shift, kRetryBackoffCapCycles);
-        ++ib.logFullStreak;
+        // right (no re-discovery, no metadata).  Re-offered with the same
+        // identity after the plain producer's wall-clock backoff (final fix
+        // wave M3; capped by the produce timeout); the retry budget is not
+        // spent (a slow follower can keep the ring full for long); the batch
+        // deadline (sweep_) still bounds it.
+        const int64_t backoffNs = std::min<int64_t>(kTransientLogFullBackoffNs,
+                                                    cfg_.produceTimeoutMs * 1'000'000LL);
+        ib.notBeforeNs   = lastNowNs_ + backoffNs;
         ib.sentSessionId = 0;
         return;
     }
