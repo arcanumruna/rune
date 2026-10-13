@@ -391,6 +391,13 @@ struct OffsetFetch {
 // survive (a restart emptied the ring): an offset is a data position, and
 // resuming at it would skip the refilled records.  A fetch-all response omits
 // such an entry.  No format change.
+// (E2 final fix wave, C1 multi-node) The broker knows a transient partition's
+// data LINEAGE from the cluster metadata, confirmed per leadership.  Until the
+// partition's current leadership has confirmed it (briefly after a restart or
+// a leader move), an OffsetFetch entry is answered errorCode NotLeader (2),
+// offset -1, and an OffsetCommit entry NotLeader: neither the offset nor
+// "none" can be answered yet.  NotLeader is the existing RETRIABLE code — a
+// client re-fetches / re-commits after a backoff, within its budget.
 // ---------------------------------------------------------------------------
 struct OffsetFetchResult {
     int32_t topicId   = 0;
