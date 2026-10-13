@@ -400,6 +400,11 @@ struct OffsetFetch {
 // offset -1, and an OffsetCommit entry NotLeader: neither the offset nor
 // "none" can be answered yet.  NotLeader is the existing RETRIABLE code — a
 // client re-fetches / re-commits after a backoff, within its budget.
+// (E2 residual round 4) The same answer, for EVERY entry (disk and transient),
+// while the coordinator has not loaded the committed offsets of its
+// __consumer_offsets partition yet (after a restart or a coordinator move, until
+// the whole log is replayed): an answer then would be a guess.  A fetch-all
+// (no entries) gets one sentinel {-1, -1, offset -1, NotLeader}.  No format change.
 // ---------------------------------------------------------------------------
 struct OffsetFetchResult {
     int32_t topicId   = 0;
