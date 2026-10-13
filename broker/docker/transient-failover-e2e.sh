@@ -34,6 +34,15 @@
 #        (c) no record was delivered twice.
 #      Exit 0 + "TRANSIENT-FAILOVER-E2E: OK".
 #
+# Variants (both by default; FAILOVER_VARIANTS selects): each on a fresh cluster.
+# The partition leader is deterministic (StaticBalancer: node 2 = rune-3):
+#   seed-follows-redirect  the probe's seed is rune-1: its Subscribe is
+#                          redirected to rune-3 and the seed session follows;
+#   seed-is-leader         the probe's seed is rune-3 itself.
+# Each variant also asserts: the leader is node 2; the seed did / did not
+# redirect; the demoted node logged the moved-away summary and answered both
+# subscriptions Redirect; the probe saw acked=200 inDoubt=0 and a new leader.
+#
 # Usage:  bash docker/transient-failover-e2e.sh   (from the rune-broker repo
 # root; sibling layout ../rune-protocol ../rune-codec ../rune-crypto ../rune-fr
 # ../rune-ql ../rune-client-cpp, as docker/view-engine-e2e.sh).
@@ -79,6 +88,10 @@ repo_tag() {
 CLIENT_IMAGE="rune-view-probe:$(repo_tag "${CLIENT_REPO}")"
 export RUNE_IMAGE_TAG="$(repo_tag "${BROKER_REPO}")-transient-failover"
 
+# The variant checks read the gateway's debug lines (Subscribe redirect,
+# moved-away Redirect): debug by default for this leg.
+export RUNE_LOG_LEVEL=debug
+
 log()  { echo "[transient-failover-e2e] $*" >&2; }
 fail() { echo "[transient-failover-e2e] FAIL: $*" >&2; exit 1; }
 dc()   { docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" -f "${COMPOSE_OVERRIDE}" "$@"; }
@@ -93,9 +106,10 @@ dc()   { docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" -f "${COMPO
 teardown() {
     log "Tearing down (probe rm + compose down -v)..."
     if [ -n "${E2E_LOG_DIR:-}" ]; then   # keep the evidence (broker + probe logs)
-        mkdir -p "${E2E_LOG_DIR}"
-        dc logs --no-color --timestamps rune-1 rune-2 rune-3 > "${E2E_LOG_DIR}/brokers.log" 2>&1 || true
-        docker logs --timestamps "${PROBE_NAME}" > "${E2E_LOG_DIR}/probe.log" 2>&1 || true
+        local d="${E2E_LOG_DIR}/${VARIANT:-none}"
+        mkdir -p "${d}"
+        dc logs --no-color --timestamps rune-1 rune-2 rune-3 > "${d}/brokers.log" 2>&1 || true
+        docker logs --timestamps "${PROBE_NAME}" > "${d}/probe.log" 2>&1 || true
     fi
     docker rm -f "${PROBE_NAME}" >/dev/null 2>&1 || true
     dc down -v --remove-orphans >/dev/null 2>&1 || true
@@ -142,106 +156,160 @@ echo "${out}" | grep -E "^( Image|ERROR|#[0-9]+ (DONE|ERROR))" || true
 docker image inspect "${CLIENT_IMAGE}" >/dev/null 2>&1 || fail "client image not built: ${CLIENT_IMAGE}"
 
 # ---------------------------------------------------------------------------
-# Step 2: the 3-node cluster + a consensus leader.
+# One variant = a fresh cluster (Steps 2-5), torn down afterwards.
+#   $1 label   $2 the probe's seed service
+# The partition leader is DETERMINISTIC: StaticBalancer stripes partition
+# leaders over the nodes in RUNE_TOPICS declaration order (events 1 + multi 3 +
+# cg 4 partitions before it) -> presence_failover:0 -> node (8 % 3) = 2 =
+# rune-3 (the dr-e2e harness relies on the same rule).  The seed choice gives
+# the two client paths:
+#   seed-is-leader         seed rune-3: plain subscriptions bind on the seed
+#                          session directly;
+#   seed-follows-redirect  seed rune-1: the Subscribe is redirected to rune-3
+#                          and the seed session follows it there.
 # ---------------------------------------------------------------------------
-log "Step 2: Starting rune-1, rune-2, rune-3..."
-dc up -d rune-1 rune-2 rune-3
-deadline=$(( $(date +%s) + LEADER_WAIT_S ))
-consensus_leader=""
-while [ "$(date +%s)" -lt "${deadline}" ]; do
-    consensus_leader=$(dc logs --no-log-prefix rune-1 rune-2 rune-3 2>/dev/null \
-        | grep -oE 'node [0-9]+ is LEADER' | grep -oE '[0-9]+' | head -1) || true
-    [ -n "${consensus_leader}" ] && break
-    sleep 2
-done
-if [ -z "${consensus_leader}" ]; then
-    dc logs --tail=60 rune-1 rune-2 rune-3 >&2 2>/dev/null || true
-    fail "no consensus leader within ${LEADER_WAIT_S}s"
-fi
-log "Consensus leader: node ${consensus_leader}"
-
-# ---------------------------------------------------------------------------
-# Step 3: the probe — bound subscriptions, then READY.
-# ---------------------------------------------------------------------------
-log "Step 3: Starting the probe (RUNE_MODE=transient_failover)..."
-docker rm -f "${PROBE_NAME}" >/dev/null 2>&1 || true
-docker run -d \
-    --name "${PROBE_NAME}" --hostname "${PROBE_NAME}" --network "${BROKER_NETWORK}" \
-    --platform linux/amd64 --shm-size=256m --security-opt seccomp=unconfined \
-    -e RUNE_MODE=transient_failover -e RUNE_FAILOVER_TOPIC_ID="${TOPIC_ID}" \
-    -e RUNE_TARGET="aeron:udp?endpoint=rune-1:40200" -e RUNE_TARGET_STREAM=1 \
-    -e RUNE_EGRESS="aeron:udp?endpoint=${PROBE_NAME}:${PROBE_EGRESS_PORT}" -e RUNE_EGRESS_STREAM=2 \
-    -e RUNE_DATA_DIR="/tmp/rune_tt_failover" \
-    -e RUNE_TIMEOUT_MS="${PROBE_TIMEOUT_MS}" \
-    -e RUNE_WAIT_BOUND_MS="${WAIT_BOUND_MS}" \
-    -e RUNE_MOVE_BOUND_MS="${MOVE_BOUND_MS}" \
-    "${CLIENT_IMAGE}" >/dev/null
-
+EXPECTED_LEADER=2
 probe_running() { [ "$(docker inspect -f '{{.State.Running}}' "${PROBE_NAME}" 2>/dev/null)" = "true" ]; }
 dump_probe() { echo "----- probe output -----" >&2; docker logs "${PROBE_NAME}" >&2 2>&1 || true; echo "------------------------" >&2; }
 
-deadline=$(( $(date +%s) + READY_WAIT_S ))
-ready=0
-while [ "$(date +%s)" -lt "${deadline}" ]; do
-    if docker logs "${PROBE_NAME}" 2>/dev/null | grep -q "^FAILOVER: READY"; then ready=1; break; fi
-    probe_running || { dump_probe; fail "the probe exited before READY"; }
-    sleep 1
-done
-[ "${ready}" = 1 ] || { dump_probe; fail "the probe did not print READY within ${READY_WAIT_S}s"; }
-leader_id=$(docker logs "${PROBE_NAME}" 2>/dev/null | grep -oE '^FAILOVER_LEADER=-?[0-9]+' | tail -1 | cut -d= -f2) || true
-[ -n "${leader_id}" ] || { dump_probe; fail "the probe did not report the partition leader"; }
-leader_svc=$(node_id_to_service "${leader_id}")
-log "presence_failover partition 0 is led by node ${leader_id} (${leader_svc}); consensus leader node ${consensus_leader}"
+run_variant() {
+    local label="$1" seed_svc="$2"
+    VARIANT="${label}"
+    log "======== variant ${label} (probe seed ${seed_svc}) ========"
 
-# ---------------------------------------------------------------------------
-# Step 4: controlled stop (SIGTERM -> controlled shutdown) + restart.
-# ---------------------------------------------------------------------------
-log "Step 4: Controlled stop of ${leader_svc} (SIGTERM, grace ${STOP_TIMEOUT_S}s)..."
-t_stop=$(date +%s)
-dc stop -t "${STOP_TIMEOUT_S}" "${leader_svc}"
-log "${leader_svc} stopped after $(( $(date +%s) - t_stop ))s"
-stopped_log="$(dc logs --no-log-prefix "${leader_svc}" 2>/dev/null || true)"
-echo "${stopped_log}" | grep -q "controlled shutdown — handing partition leadership off" \
-    || { echo "${stopped_log}" | tail -60 >&2; fail "${leader_svc} did not run a controlled shutdown"; }
-shutdown_line="$(echo "${stopped_log}" | grep -E "controlled shutdown (complete|budget)" | tail -1 || true)"
-log "  ${shutdown_line:-<no completion line>}"
-moved_line="$(echo "${stopped_log}" | grep -E "subscription\(s\) this node can no longer serve" | tail -1 || true)"
-log "  ${moved_line:-<no moved-away summary logged before exit>}"
-if [ "${RESTART_DURING_MOVE:-0}" = 1 ]; then
-    log "Restarting ${leader_svc} now (RESTART_DURING_MOVE=1)..."
-    dc start "${leader_svc}"
-fi
+    # ---- Step 2: the 3-node cluster + a consensus leader.
+    log "Step 2: Starting rune-1, rune-2, rune-3..."
+    dc up -d rune-1 rune-2 rune-3
+    local deadline consensus_leader=""
+    deadline=$(( $(date +%s) + LEADER_WAIT_S ))
+    while [ "$(date +%s)" -lt "${deadline}" ]; do
+        consensus_leader=$(dc logs --no-log-prefix rune-1 rune-2 rune-3 2>/dev/null \
+            | grep -oE 'node [0-9]+ is LEADER' | grep -oE '[0-9]+' | head -1) || true
+        [ -n "${consensus_leader}" ] && break
+        sleep 2
+    done
+    if [ -z "${consensus_leader}" ]; then
+        dc logs --tail=60 rune-1 rune-2 rune-3 >&2 2>/dev/null || true
+        fail "[${label}] no consensus leader within ${LEADER_WAIT_S}s"
+    fi
+    log "Consensus leader: node ${consensus_leader}"
 
-# ---------------------------------------------------------------------------
-# Step 5: the probe's verdict.
-# ---------------------------------------------------------------------------
-deadline=$(( $(date +%s) + PROBE_DONE_WAIT_S ))
-while probe_running && [ "$(date +%s)" -lt "${deadline}" ]; do sleep 2; done
-if probe_running; then
+    # ---- Step 3: the probe — bound subscriptions, an open txn, then READY.
+    log "Step 3: Starting the probe (RUNE_MODE=transient_failover, seed ${seed_svc})..."
+    docker rm -f "${PROBE_NAME}" >/dev/null 2>&1 || true
+    docker run -d \
+        --name "${PROBE_NAME}" --hostname "${PROBE_NAME}" --network "${BROKER_NETWORK}" \
+        --platform linux/amd64 --shm-size=256m --security-opt seccomp=unconfined \
+        -e RUNE_MODE=transient_failover -e RUNE_FAILOVER_TOPIC_ID="${TOPIC_ID}" \
+        -e RUNE_TARGET="aeron:udp?endpoint=${seed_svc}:40200" -e RUNE_TARGET_STREAM=1 \
+        -e RUNE_EGRESS="aeron:udp?endpoint=${PROBE_NAME}:${PROBE_EGRESS_PORT}" -e RUNE_EGRESS_STREAM=2 \
+        -e RUNE_DATA_DIR="/tmp/rune_tt_failover" \
+        -e RUNE_TIMEOUT_MS="${PROBE_TIMEOUT_MS}" \
+        -e RUNE_WAIT_BOUND_MS="${WAIT_BOUND_MS}" \
+        -e RUNE_MOVE_BOUND_MS="${MOVE_BOUND_MS}" \
+        -e RUNE_EXPECT_LEADER_CHANGE="$([ "${RESTART_DURING_MOVE:-0}" = 1 ] && echo 0 || echo 1)" \
+        "${CLIENT_IMAGE}" >/dev/null
+
+    local ready=0
+    deadline=$(( $(date +%s) + READY_WAIT_S ))
+    while [ "$(date +%s)" -lt "${deadline}" ]; do
+        if docker logs "${PROBE_NAME}" 2>/dev/null | grep -q "^FAILOVER: READY"; then ready=1; break; fi
+        probe_running || { dump_probe; fail "[${label}] the probe exited before READY"; }
+        sleep 1
+    done
+    [ "${ready}" = 1 ] || { dump_probe; fail "[${label}] the probe did not print READY within ${READY_WAIT_S}s"; }
+    local leader_id leader_svc
+    leader_id=$(docker logs "${PROBE_NAME}" 2>/dev/null | grep -oE '^FAILOVER_LEADER=-?[0-9]+' | tail -1 | cut -d= -f2) || true
+    [ -n "${leader_id}" ] || { dump_probe; fail "[${label}] the probe did not report the partition leader"; }
+    [ "${leader_id}" = "${EXPECTED_LEADER}" ] \
+        || { dump_probe; fail "[${label}] partition leader is node ${leader_id}, not the deterministic node ${EXPECTED_LEADER}"; }
+    leader_svc=$(node_id_to_service "${leader_id}")
+    log "presence_failover partition 0 is led by node ${leader_id} (${leader_svc}); consensus leader node ${consensus_leader}"
+    # The variant's client path really happened (gateway debug log of the seed).
+    local seed_log
+    seed_log="$(dc logs --no-log-prefix "${seed_svc}" 2>/dev/null || true)"
+    if [ "${seed_svc}" = "${leader_svc}" ]; then
+        if echo "${seed_log}" | grep -q "Subscribe per-partition redirect (topicId=${TOPIC_ID} part=0"; then
+            fail "[${label}] the seed is the leader but redirected the Subscribe"
+        fi
+    else
+        echo "${seed_log}" | grep -q "Subscribe per-partition redirect (topicId=${TOPIC_ID} part=0 leader=${EXPECTED_LEADER}" \
+            || fail "[${label}] the seed ${seed_svc} never redirected the Subscribe to node ${EXPECTED_LEADER}"
+        log "  seed ${seed_svc} redirected the Subscribe to node ${EXPECTED_LEADER} (the seed session followed it)"
+    fi
+
+    # ---- Step 4: controlled stop (SIGTERM -> controlled shutdown).
+    log "Step 4: Controlled stop of ${leader_svc} (SIGTERM, grace ${STOP_TIMEOUT_S}s)..."
+    local t_stop stopped_log shutdown_line moved_line redirected
+    t_stop=$(date +%s)
+    dc stop -t "${STOP_TIMEOUT_S}" "${leader_svc}"
+    log "${leader_svc} stopped after $(( $(date +%s) - t_stop ))s"
+    stopped_log="$(dc logs --no-log-prefix "${leader_svc}" 2>/dev/null || true)"
+    echo "${stopped_log}" | grep -q "controlled shutdown — handing partition leadership off" \
+        || { echo "${stopped_log}" | tail -60 >&2; fail "[${label}] ${leader_svc} did not run a controlled shutdown"; }
+    shutdown_line="$(echo "${stopped_log}" | grep -E "controlled shutdown (complete|budget)" | tail -1 || true)"
+    log "  ${shutdown_line:-<no completion line>}"
+    # The demoted node told the client: the moved-away summary, and (v6, a known
+    # new leader) one Redirect per subscription (gateway debug line).
+    moved_line="$(echo "${stopped_log}" | grep -E "subscription\(s\) this node can no longer serve" | tail -1 || true)"
+    [ -n "${moved_line}" ] || fail "[${label}] ${leader_svc} logged no moved-away summary before exiting"
+    log "  ${moved_line}"
+    redirected="$(echo "${stopped_log}" | grep -cE "topicId=${TOPIC_ID} partition=0 .*demoted / partition moved away\): Redirect" || true)"
+    [ "${redirected}" -ge 2 ] \
+        || fail "[${label}] ${leader_svc} redirected ${redirected} subscription(s) to the new leader (want 2)"
+    log "  ${leader_svc} answered ${redirected} subscription(s) Redirect to the new leader"
+    if [ "${RESTART_DURING_MOVE:-0}" = 1 ]; then
+        log "Restarting ${leader_svc} now (RESTART_DURING_MOVE=1)..."
+        dc start "${leader_svc}"
+    fi
+
+    # ---- Step 5: the probe's verdict.
+    deadline=$(( $(date +%s) + PROBE_DONE_WAIT_S ))
+    while probe_running && [ "$(date +%s)" -lt "${deadline}" ]; do sleep 2; done
+    if probe_running; then
+        dump_probe
+        fail "[${label}] STALL: the probe was still running ${PROBE_DONE_WAIT_S}s after the stop"
+    fi
+    local probe_rc probe_out ok_line new_leader
+    probe_rc="$(docker inspect -f '{{.State.ExitCode}}' "${PROBE_NAME}")"
+    probe_out="$(docker logs "${PROBE_NAME}" 2>&1 || true)"
     dump_probe
-    fail "STALL: the probe was still running ${PROBE_DONE_WAIT_S}s after the stop"
-fi
-probe_rc="$(docker inspect -f '{{.State.ExitCode}}' "${PROBE_NAME}")"
-probe_out="$(docker logs "${PROBE_NAME}" 2>&1 || true)"
-dump_probe
-[ "${probe_rc}" = 0 ] || fail "the probe exited ${probe_rc}"
-echo "${probe_out}" | grep -q "^TRANSIENT-FAILOVER-E2E: OK" || fail "the probe did not print TRANSIENT-FAILOVER-E2E: OK"
-before_rebind="$(echo "${probe_out}" | grep -oE '^FAILOVER_ACKED_BEFORE_REBIND=[0-9]+' | cut -d= -f2 || true)"
-if [ "${RESTART_DURING_MOVE:-0}" != 1 ]; then
-    # The stopped node comes back after the verdict (the move above went to a
-    # DIFFERENT node) and rejoins as a follower.
-    log "Restarting ${leader_svc} (it rejoins as a follower)..."
-    dc start "${leader_svc}"
-fi
+    [ "${probe_rc}" = 0 ] || fail "[${label}] the probe exited ${probe_rc}"
+    ok_line="$(echo "${probe_out}" | grep -E '^TRANSIENT-FAILOVER-E2E: OK' | tail -1 || true)"
+    [ -n "${ok_line}" ] || fail "[${label}] the probe did not print TRANSIENT-FAILOVER-E2E: OK"
+    # Every record around the move acked, none in doubt (the probe asserts it too).
+    echo "${ok_line}" | grep -qE "acked=${AROUND} inDoubt=0$" \
+        || fail "[${label}] want acked=${AROUND} inDoubt=0, got: ${ok_line}"
+    new_leader="$(echo "${probe_out}" | grep -oE '^FAILOVER_NEW_LEADER=-?[0-9]+' | tail -1 | cut -d= -f2 || true)"
+    if [ "${RESTART_DURING_MOVE:-0}" != 1 ]; then
+        [ -n "${new_leader}" ] && [ "${new_leader}" != "${leader_id}" ] && [ "${new_leader}" -ge 0 ] \
+            || fail "[${label}] the leader did not move off node ${leader_id} (after: '${new_leader}')"
+        # The stopped node comes back after the verdict and rejoins as a follower.
+        log "Restarting ${leader_svc} (it rejoins as a follower)..."
+        dc start "${leader_svc}"
+    fi
+    log "[${label}] PASSED: leader node ${leader_id} -> node ${new_leader}; ${ok_line}"
+    RESULTS+=("${label}: leader ${leader_id} -> ${new_leader}; ${ok_line}")
+    teardown
+}
+
+AROUND=200                 # the probe's kAround
+RESULTS=()
+VARIANTS="${FAILOVER_VARIANTS:-seed-follows-redirect seed-is-leader}"
+for v in ${VARIANTS}; do
+    case "${v}" in
+        seed-follows-redirect) run_variant "${v}" rune-1 ;;
+        seed-is-leader)        run_variant "${v}" rune-3 ;;
+        *) fail "unknown variant '${v}'" ;;
+    esac
+done
 
 log ""
 log "========================================"
 log "  TRANSIENT FAILOVER E2E PASSED (3 nodes, shard mode)"
-log "  presence_failover (transient) leader node ${leader_id} stopped (controlled) + restarted"
+for r in "${RESULTS[@]}"; do log "  ${r}"; done
 log "  -> read_committed + Latest (nothing delivered) subscriptions moved to the new leader"
-log "  -> $(echo "${probe_out}" | grep -E '^TRANSIENT-FAILOVER-E2E: OK' | tail -1)"
 log "  -> the transaction committed after the move reached the Latest subscription (it resumed at"
 log "     its position note, not the new leader's HW); nothing lost, nothing re-delivered"
-log "  -> (${before_rebind:-?} burst record(s) were acked before the Latest re-bind)"
 log "  TRANSIENT-FAILOVER-E2E: OK, exit 0."
 log "========================================"
