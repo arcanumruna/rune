@@ -1964,7 +1964,16 @@ void Client::sweepTimeouts(int64_t nowNs) {
     // --- M2 FIX: Pending subscribe-request timeouts ---
     // A Subscribe that gets no SubscribeResponse within subscribeTimeoutMs is
     // failed (active cleared) so the app is never left polling forever.
-    subscriberHub_.sweepTimedOut(now);
+    {
+        const int timedOut = subscriberHub_.sweepTimedOut(now);
+        // Silent-failure gap: the timeout is an explicit failure (failReason
+        // TimedOut) AND reaches the app's onError, once per Subscribe.
+        for (int i = 0; i < timedOut && cbError_; ++i) {
+            invokeUserCallback_("onError", [&] {
+                cbError_("Subscribe timed out: no SubscribeResponse within subscribeTimeoutMs");
+            });
+        }
+    }
 
     // --- CG-5: GroupConsumerHub duty cycle (heartbeat / auto-commit / rejoin) ---
     // The hub's doWork checks its own internal timers so calling it every
@@ -2457,6 +2466,39 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // frame), so we cannot update the cache in place — ask for metadata
             // now (rate-limited; falls back to the backoff refresh).
             requestMetadataNow_();
+
+            // Silent-failure gap: a PENDING plain Subscribe answered bare
+            // NotLeader (a topic whose definition has not committed yet, or a
+            // leader not yet known) is retried like the Redirect branch: once per
+            // pending resend, paced by fresh metadata + a doubling backoff, and
+            // bounded by the per-corr budget.  Exhausted -> explicit failure
+            // carrying the broker code, and the app's onError fires.
+            if (subscriberHub_.isPending(opt->correlationId)) {
+                if (subscriberHub_.chargeNotLeaderRetry(opt->correlationId,
+                                                        producer::ProducerImpl::kMaxRedirects)) {
+                    if (std::find(redirectedSubscribes_.begin(), redirectedSubscribes_.end(),
+                                  opt->correlationId) == redirectedSubscribes_.end()) {
+                        try {
+                            redirectedSubscribes_.push_back(opt->correlationId);
+                        } catch (...) {
+                            // allocation failure (cold path): it now times out explicitly
+                        }
+                    }
+                    redirectMetaSeen_       = metadataResponses_;
+                    nextRedirectedResendNs_ = now() + redirectedResendBackoffNs_;
+                    redirectedResendBackoffNs_ =
+                        std::min<int64_t>(redirectedResendBackoffNs_ * 2, kRedirectedResendMaxNs);
+                } else if (subscriberHub_.failPendingSubscribe(
+                               opt->correlationId, SubscriptionFailReason::RejectedByBroker,
+                               static_cast<uint16_t>(rpc::ErrorCode::NotLeader))) {
+                    if (cbError_) {
+                        invokeUserCallback_("onError", [&] {
+                            cbError_("Subscribe failed: NotLeader (retry budget exhausted)");
+                        });
+                    }
+                }
+                break;
+            }
 
             // Re-enqueue the produce that hit the stale leader.  The stored wire
             // frame is resent on the SAME session (leadership is expected to have

@@ -43,6 +43,7 @@ struct SubscribeRequest {
     std::vector<uint8_t>                  subscribeFrame;  // encoded Subscribe (resend on redirect)
     std::chrono::steady_clock::time_point deadline;        // M2: subscribe-request timeout
     bool                                  unsent = false;  // fix3 I4: refused, retried per cycle
+    uint8_t                               nlRetries = 0;   // bare-NotLeader retries spent (bounded budget)
 };
 
 class SubscriberHub {
@@ -170,12 +171,20 @@ public:
     void failPendingSubscribes(const std::string& reason);
     /// Fail the ONE pending subscription whose Subscribe carried
     /// `correlationId` (its handle sees finished()).  False if none.
-    bool failPendingSubscribe(int64_t correlationId, SubscriptionFailReason reason);
+    bool failPendingSubscribe(int64_t correlationId, SubscriptionFailReason reason,
+                              uint16_t brokerErrorCode = 0);
+
+    /// Spend one bare-NotLeader retry of the pending Subscribe `correlationId`.
+    /// True while within `maxRetries` (re-send it); false when the budget is
+    /// exhausted or the corr is not pending (caller fails it explicitly).
+    bool chargeNotLeaderRetry(int64_t correlationId, int maxRetries);
 
     /// M2 FIX [CB-5]: Sweep pending subscriptions whose subscribe-request
     /// deadline has expired.  Mirrors the produce-ack timeout sweep.
     /// Called from Client::sweepTimeouts() on the runner thread.
-    void sweepTimedOut(const std::chrono::steady_clock::time_point& now);
+    /// Each still-active timed-out Subscribe finishes with failReason TimedOut;
+    /// the return value is how many, so the caller can fire onError for each.
+    int sweepTimedOut(const std::chrono::steady_clock::time_point& now);
 
     /// CB-5 B: resend every PENDING Subscribe frame after a leader redirect +
     /// reconnect.  A Subscribe rejected by a follower with ErrorResponse
