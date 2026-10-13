@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -330,9 +331,11 @@ std::string readError(const std::string& bytes) {
 
 TEST(CatalogQueriesRegression, RcatLayoutIsFrozen) {
     const std::string b = rcatBytes({{0x0102, {0xAA, 0xBB}}});
-    const std::string expected = std::string("RCAT") + '\x01' + '\x00' +                     // magic, u16 version 1
+    const std::string expected = std::string("RCAT") + '\x02' + '\x00' +                     // magic, u16 version 2
                                  std::string("\x02\x01\x00\x00\x00\x00\x00\x00", 8) +       // i64 offset LE
-                                 std::string("\x02\x00\x00\x00", 4) + "\xAA\xBB";            // u32 len LE, bytes
+                                 std::string("\x02\x00\x00\x00", 4) +                          // u32 len LE
+                                 std::string("\x8D\x44\xE4\xE4", 4) +                          // u32 crc32c LE (0xE4E4448D)
+                                 "\xAA\xBB";                                                    // bytes
     EXPECT_EQ(b, expected);
     std::stringstream empty;
     rc::writeRcatHeader(empty);
@@ -347,9 +350,9 @@ TEST(CatalogQueriesRegression, RcatRefusalsNameTheBytePosition) {
     EXPECT_NE(readError("RCA").find("byte 0"), std::string::npos) << readError("RCA");
     EXPECT_NE(readError(std::string("XCAT\x01\x00", 6)).find("bad magic at byte 0"), std::string::npos);
     {
-        std::string v = good; v[4] = 2;
+        std::string v = good; v[4] = 1;   // the unreleased CRC-less version 1 is refused
         const auto e = readError(v);
-        EXPECT_NE(e.find("file version 2"), std::string::npos) << e;
+        EXPECT_NE(e.find("file version 1"), std::string::npos) << e;
         EXPECT_NE(e.find("byte 4"), std::string::npos) << e;
     }
     {
@@ -360,12 +363,12 @@ TEST(CatalogQueriesRegression, RcatRefusalsNameTheBytePosition) {
     {
         const auto e = readError(good.substr(0, good.size() - 1));   // last record's body short by one
         EXPECT_NE(e.find("truncated"), std::string::npos) << e;
-        EXPECT_NE(e.find("byte " + std::to_string(6 + 12 + 3 + 12)), std::string::npos) << e;   // where the byte is missing
+        EXPECT_NE(e.find("byte " + std::to_string(6 + 16 + 3 + 16)), std::string::npos) << e;   // where the byte is missing
     }
     {
         const auto e = readError(rcatBytes({{5, {1}}, {5, {2}}}));
         EXPECT_NE(e.find("offset 5 does not follow offset 5"), std::string::npos) << e;
-        EXPECT_NE(e.find("byte " + std::to_string(6 + 12 + 1)), std::string::npos) << e;
+        EXPECT_NE(e.find("byte " + std::to_string(6 + 16 + 1)), std::string::npos) << e;
     }
     EXPECT_NE(readError(rcatBytes({{5, {1}}, {4, {2}}})).find("does not follow"), std::string::npos);
     EXPECT_EQ(readError(rcatBytes({{3, {1}}, {9, {2}}})), "<accepted>") << "increasing is enough; replay judges gaps";
@@ -376,4 +379,134 @@ TEST(CatalogQueriesRegression, RcatHugeDeclaredLengthIsTruncatedNotAnAllocation)
     b[6 + 8 + 3] = '\x7F';   // declared length ~2 GiB, no bytes follow
     const auto e = readError(b);
     EXPECT_NE(e.find("truncated"), std::string::npos) << e;
+}
+
+// ── review follow-up M3: per-record CRC32C over the whole encoded event ──────────
+namespace {
+std::string goldenRcat() {
+    std::stringstream ss;
+    rc::writeRcatHeader(ss);
+    for (const auto& r : recorded()) rc::writeRcatRecord(ss, r.offset, rc::encode(r.event).value());
+    return ss.str();
+}
+/// The byte position of the n-th (0-based) occurrence of `needle` in `hay`.
+std::size_t nth(const std::string& hay, std::string_view needle, int n) {
+    std::size_t at = hay.find(needle);
+    for (int i = 0; i < n && at != std::string::npos; ++i) at = hay.find(needle, at + 1);
+    return at;
+}
+} // namespace
+
+TEST(CatalogQueriesRegression, RcatCrcCatchesABitFlipInTheStatementWhichTheFingerprintDoesNotCoverRegression) {
+    std::string bytes = goldenRcat();
+    const auto at = bytes.find("DEFINE TOPIC events");   // event 3's statement
+    ASSERT_NE(at, std::string::npos);
+    bytes[at] = static_cast<char>(bytes[at] ^ 0x01);
+    const auto e = readError(bytes);
+    EXPECT_NE(e.find("CRC32C mismatch in record 3"), std::string::npos) << e;
+
+    // Without the CRC nothing would notice: the tampered event still decodes and replays,
+    // because the statement is not part of the object's fingerprint.
+    auto log = recorded();
+    auto tampered = rc::encode(log[3].event).value();
+    const std::string stmt = "DEFINE TOPIC events";
+    auto it = std::search(tampered.begin(), tampered.end(), stmt.begin(), stmt.end());
+    ASSERT_NE(it, tampered.end());
+    *it ^= 0x01;
+    rc::CatalogReplayer r;
+    for (int64_t i = 0; i < 3; ++i) ASSERT_TRUE(r.feedDecoded(i, log[static_cast<std::size_t>(i)].event));
+    EXPECT_TRUE(r.feed(3, tampered).has_value()) << "the fingerprint alone does not cover the statement";
+}
+
+TEST(CatalogQueriesRegression, RcatCrcCatchesABitFlipInThePrincipalRegression) {
+    std::string bytes = goldenRcat();
+    const auto at = nth(bytes, "golden-cli", 5);   // record 5's principal.clientName
+    ASSERT_NE(at, std::string::npos);
+    bytes[at + 3] = static_cast<char>(bytes[at + 3] ^ 0x20);
+    const auto e = readError(bytes);
+    EXPECT_NE(e.find("CRC32C mismatch in record 5 (offset 5)"), std::string::npos) << e;
+    EXPECT_NE(e.find("stored=0x"), std::string::npos) << e;
+    EXPECT_NE(e.find("computed=0x"), std::string::npos) << e;
+}
+
+TEST(CatalogQueriesRegression, RcatCrcCatchesAFlipInTheStoredCrcItselfRegression) {
+    std::string bytes = goldenRcat();
+    bytes[rc::kRcatHeaderBytes + 12] = static_cast<char>(bytes[rc::kRcatHeaderBytes + 12] ^ 0x80);   // record 0's crc
+    EXPECT_NE(readError(bytes).find("CRC32C mismatch in record 0"), std::string::npos) << readError(bytes);
+}
+
+// ── review follow-up M1: as-of boundaries ────────────────────────────────────
+TEST(CatalogQueriesRegression, AsOfOffsetBoundariesRegression) {
+    const auto log = recorded();
+    const auto last = log.back().offset;
+    rc::CatalogReplayer full;
+    for (const auto& r : log) ASSERT_TRUE(full.feedDecoded(r.offset, r.event));
+
+    auto first = rc::stateAsOf(log, {.by = rc::AsOf::By::Offset, .value = 0});
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->appliedOffset(), 0);
+    EXPECT_EQ(first->topics().size(), 1u);
+    EXPECT_NE(first->topicByName("players"), nullptr);
+
+    auto atLast = rc::stateAsOf(log, {.by = rc::AsOf::By::Offset, .value = last});
+    ASSERT_TRUE(atLast.has_value());
+    EXPECT_EQ(atLast->appliedOffset(), last);
+    EXPECT_EQ(atLast->digest(), full.state().digest());
+
+    auto past = rc::stateAsOf(log, {.by = rc::AsOf::By::Offset, .value = last + 1000});
+    ASSERT_TRUE(past.has_value());
+    EXPECT_EQ(past->appliedOffset(), last) << "past the end = the whole recorded log";
+    EXPECT_EQ(past->digest(), full.state().digest());
+
+    for (int64_t neg : {int64_t{-1}, int64_t{-42}, INT64_MIN}) {
+        auto s = rc::stateAsOf(log, {.by = rc::AsOf::By::Offset, .value = neg});
+        ASSERT_TRUE(s.has_value()) << neg;
+        EXPECT_EQ(s->appliedOffset(), -1) << neg;
+        EXPECT_EQ(s->digest(), rc::CatalogState{}.digest()) << "before offset 0: the empty catalog";
+    }
+}
+
+TEST(CatalogQueriesRegression, AsOfEqualTimestampsIncludesEveryEventAtThatTimeRegression) {
+    auto log = recorded();
+    const int64_t t = log[5].event.timestampMs;
+    log[4].event.timestampMs = t;   // timestamps are informational: not fingerprinted
+    log[6].event.timestampMs = t;
+    auto at = rc::stateAsOf(log, {.by = rc::AsOf::By::TimeMs, .value = t});
+    ASSERT_TRUE(at.has_value());
+    EXPECT_EQ(at->appliedOffset(), 6) << "all three events stamped t are <= t";
+    auto before = rc::stateAsOf(log, {.by = rc::AsOf::By::TimeMs, .value = t - 1});
+    ASSERT_TRUE(before.has_value());
+    EXPECT_EQ(before->appliedOffset(), 3) << "none of them is <= t - 1";
+    auto since = rc::history(log, {.sinceMs = t});
+    ASSERT_FALSE(since.empty());
+    EXPECT_EQ(since.front()->offset, 4);
+}
+
+// ── review follow-up M2: diff is symmetric ───────────────────────────────────
+TEST(CatalogQueriesRegression, DiffIsSymmetricChangedNamesTheSameFieldsBothWaysRegression) {
+    const auto log = recorded();
+    std::vector<rc::CatalogState> states;
+    for (const auto& r : log) states.push_back(rc::stateAsOf(log, {.by = rc::AsOf::By::Offset, .value = r.offset}).value());
+    int changed = 0;
+    for (std::size_t i = 0; i < states.size(); ++i) {
+        for (std::size_t j = i + 1; j < states.size(); ++j) {
+            const auto ab = rc::diff(states[i], states[j]);
+            const auto ba = rc::diff(states[j], states[i]);
+            ASSERT_EQ(ab.size(), ba.size()) << i << " vs " << j;
+            for (std::size_t k = 0; k < ab.size(); ++k) {
+                const auto& x = ab[k];
+                const auto& y = ba[k];
+                EXPECT_EQ(x.type, y.type);
+                EXPECT_EQ(x.name, y.name);
+                EXPECT_EQ(x.fingerprintA, y.fingerprintB);
+                EXPECT_EQ(x.fingerprintB, y.fingerprintA);
+                using C = rc::DiffEntry::Change;
+                const C mirrored = x.change == C::Added ? C::Removed : x.change == C::Removed ? C::Added : C::Changed;
+                EXPECT_EQ(y.change, mirrored) << x.name << " " << i << " vs " << j;
+                EXPECT_EQ(x.fields, y.fields) << x.name << " " << i << " vs " << j;
+                changed += x.change == C::Changed ? 1 : 0;
+            }
+        }
+    }
+    EXPECT_GT(changed, 100) << "the golden log exercises many Changed pairs";
 }

@@ -1,7 +1,9 @@
 // src/catalog/CatalogFile.cpp — see CatalogFile.h for the frozen .rcat layout.
 #include <rune/catalog/CatalogFile.h>
+#include <rune/protocol/Crc32c.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <istream>
 #include <limits>
@@ -27,6 +29,11 @@ std::size_t readSome(std::istream& in, uint8_t* p, std::size_t n) {
     return static_cast<std::size_t>(in.gcount());
 }
 std::string at(uint64_t pos) { return " at byte " + std::to_string(pos); }
+std::string hex32(uint32_t v) {
+    char buf[2 + 8 + 1];
+    std::snprintf(buf, sizeof buf, "0x%08x", v);
+    return buf;
+}
 
 /// Body bytes are read in chunks, so a corrupt (huge) length allocates no more than the
 /// stream actually holds before it is found truncated.
@@ -45,6 +52,7 @@ void writeRcatRecord(std::ostream& out, int64_t offset, std::span<const uint8_t>
     }
     putLe<8>(out, static_cast<uint64_t>(offset));
     putLe<4>(out, static_cast<uint32_t>(bytes.size()));
+    putLe<4>(out, rune::protocol::crc32c(bytes.data(), bytes.size()));
     out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
 }
 
@@ -74,6 +82,7 @@ std::expected<std::vector<std::pair<int64_t, std::vector<uint8_t>>>, std::string
                                    std::to_string(kRcatRecordHeaderBytes) + " bytes)");
         const auto offset = static_cast<int64_t>(getLe(h.data(), 8));
         const auto len = static_cast<uint32_t>(getLe(h.data() + 8, 4));
+        const auto crc = static_cast<uint32_t>(getLe(h.data() + 12, 4));
         if (!out.empty() && offset <= out.back().first)
             return std::unexpected("rcat: offset " + std::to_string(offset) + " does not follow offset " +
                                    std::to_string(out.back().first) + at(recordAt));
@@ -89,6 +98,10 @@ std::expected<std::vector<std::pair<int64_t, std::vector<uint8_t>>>, std::string
                                        at(pos + have + r) + " (" + std::to_string(have + r) + " of " +
                                        std::to_string(len) + " bytes)");
         }
+        if (const uint32_t actual = rune::protocol::crc32c(body.data(), body.size()); actual != crc)
+            return std::unexpected("rcat: CRC32C mismatch in record " + std::to_string(out.size()) + " (offset " +
+                                   std::to_string(offset) + ")" + at(recordAt) + ": stored=" + hex32(crc) +
+                                   " computed=" + hex32(actual));
         pos += len;
         out.emplace_back(offset, std::move(body));
     }
