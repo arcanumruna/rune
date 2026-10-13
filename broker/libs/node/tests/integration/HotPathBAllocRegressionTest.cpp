@@ -17,10 +17,14 @@ void operator delete(void* p) noexcept {
     std::free(p);
 }
 void operator delete(void* p, std::size_t) noexcept { ::operator delete(p); }
-// D28b: heap allocations made by THIS thread while armed (the worker's duty
-// pass); the first few print a backtrace so the culprit is named.
-thread_local bool     gAllocArmed = false;
-thread_local uint64_t gArmedAllocs = 0;
+// D28b: heap allocations made while armed (the worker's duty pass); the first
+// few print a backtrace so the culprit is named.  Plain single-thread globals
+// (E2 final fix wave — hard rule 1, as TransientDataPathAllocTest): the worker
+// is driven by hand on the test thread, and an allocation by ANY thread inside
+// an armed window (e.g. the io backend's completion thread) is a steady-state
+// allocation too — counted, never hidden by a per-thread counter.
+bool     gAllocArmed = false;
+uint64_t gArmedAllocs = 0;
 void* operator new(std::size_t n) {
     if (gAllocArmed) [[unlikely]] {
         if (++gArmedAllocs <= 3) {
