@@ -17,8 +17,11 @@
 // EVERY step.  Documented rules the model also encodes: follower 2 leaves the
 // ISR when it fetches below the HW (DUR-1 / KIP-966) and re-enters once caught
 // up; an identical fetch may be conflated (spec 3.5); a control batch is never
-// delivered; an IDLE transactional producer whose data batches all left the
-// ring may be unknown after an ownership change (Kafka parity, KIP-360).
+// delivered; a transactional producer none of whose data batches is left in the
+// ring may be unknown after an ownership change (idle: Kafka parity, KIP-360; an
+// open transaction ALL of whose batches were evicted: the finding-B ruling's
+// unrecoverable case) — an open transaction with a batch still in the ring stays
+// known and keeps read_committed pinned (finding-B ruling, option (c)).
 // 64 seeds x 3000 steps (the Regression gate) + 20 random seeds (smoke).  A
 // failure prints its seed, step, and a delta-minimised op trace that replays
 // deterministically (`replay()`): a real bug's Regression test pins it.
@@ -119,7 +122,7 @@ struct Dist {
     uint64_t belowStartFetches = 0, leaderMoves = 0, restarts = 0, uncommittedRestarts = 0, commits = 0;
     uint64_t rcHeld = 0, rcBuildRetries = 0, acksAllAcked = 0, markersLanded = 0, markersRefused = 0;
     uint64_t gapFramesIgnored = 0, followerPartialApplies = 0, evictions = 0, steps = 0, seeds = 0;
-    uint64_t isrShrinks = 0, isrExpands = 0, producerExpired = 0, conflatedFetches = 0;
+    uint64_t isrShrinks = 0, isrExpands = 0, producerExpired = 0, conflatedFetches = 0, openTxnAllEvicted = 0, rebuildPins = 0;
 
     void add(const Dist& d) {
         for (std::size_t i = 0; i < timing.size(); ++i) timing[i] += d.timing[i];
@@ -130,7 +133,7 @@ struct Dist {
         commits += d.commits; rcHeld += d.rcHeld; rcBuildRetries += d.rcBuildRetries; acksAllAcked += d.acksAllAcked;
         markersLanded += d.markersLanded; markersRefused += d.markersRefused; gapFramesIgnored += d.gapFramesIgnored;
         followerPartialApplies += d.followerPartialApplies; evictions += d.evictions; steps += d.steps;
-        isrShrinks += d.isrShrinks; isrExpands += d.isrExpands; producerExpired += d.producerExpired; conflatedFetches += d.conflatedFetches;
+        isrShrinks += d.isrShrinks; isrExpands += d.isrExpands; producerExpired += d.producerExpired; openTxnAllEvicted += d.openTxnAllEvicted; rebuildPins += d.rebuildPins; conflatedFetches += d.conflatedFetches;
         seeds += d.seeds;
     }
     [[nodiscard]] std::string line() const {
@@ -148,7 +151,8 @@ struct Dist {
           << " acksAllAcked=" << acksAllAcked << " markers landed/refused=" << markersLanded << '/' << markersRefused
           << " rcHeld=" << rcHeld << " rcBuildRetries=" << rcBuildRetries << " gapFrames=" << gapFramesIgnored
           << " followerPartial=" << followerPartialApplies << " isr out/in=" << isrShrinks << '/' << isrExpands << " conflatedFetch=" << conflatedFetches
-          << " idleProducerExpired(28/20)=" << producerExpired;
+          << " producerUnknown(28/20)=" << producerExpired << " openTxnAllEvicted=" << openTxnAllEvicted
+          << " openTxnPinnedAtRingStart=" << rebuildPins;
         return o.str();
     }
 };
@@ -263,9 +267,19 @@ private:
     // ring: an IDLE transactional producer (no open transaction) none of whose data batches
     // is left there is unknown to the new owner — its next produce may answer
     // UnknownProducerId (28) / OutOfOrderSequence (20; a marker alone carries no sequence).
-    // Kafka parity: retention drops an idle producer's state (an ONGOING transaction's is
-    // retained); the client re-inits (KIP-360).  An open transaction gets no allowance.
+    // Kafka parity: retention drops an idle producer's state; the client re-inits (KIP-360).
+    // An OPEN transaction with a batch still in the ring stays known and pinned (ruling
+    // "finding B", option (c)): no allowance.  An open transaction ALL of whose batches were
+    // evicted is unrecoverable (the ruling's documented case): the rebuilt state forgets it
+    // (read_committed follows the evicted-cursor rule, its LSO pin is gone) and its next
+    // transactional produce may be refused 28/20 — the client aborts, then re-inits.
     bool        producerLost_ = false;
+    bool        openForgotten_ = false;      // the open txn was forgotten by the last rebuild
+    bool        reinitAfterAbort_ = false;   // the client aborts the forgotten txn, then re-inits
+    // Finding-B ruling, option (c): a rebuild that finds an open transaction in the ring whose
+    // first in-ring batch is not provably its first (ring start > 0 and no marker of its
+    // producer earlier in the ring) pins it at the ring start of that moment until it resolves.
+    std::optional<int64_t> rebuildPin_;
     int64_t     lastFetch_ = -1, hwAtLastFetch_ = 0, hwAtStepStart_ = 0, leoAtLastFetch_ = -1;
     int64_t     incarnation_ = 1;   // follower 2's process incarnation
 
@@ -334,7 +348,8 @@ private:
         produceAns_.clear(); readAns_.clear(); markerAns_.clear();
         leo_ = hw_ = ringStart_ = 0;
         seq_ = 0; txnOpen_ = false; decision_.reset(); markerRetry_.reset(); refusedUncommitted_.reset();
-        producerLost_ = false;
+        producerLost_ = openForgotten_ = reinitAfterAbort_ = false;
+        rebuildPin_.reset();
         inIsr_ = true; lastFetch_ = -1; hwAtLastFetch_ = 0; hwAtStepStart_ = 0; leoAtLastFetch_ = -1;
     }
     /// Follower 2 as a fresh process: an empty ring of the same (node-wide) size, a new incarnation.
@@ -445,9 +460,19 @@ private:
             if (own_ != Own::Disowned) break;
             setOwned(true); passDrain(4); own_ = Own::Owned;
             if (std::none_of(batches_.begin() + static_cast<std::ptrdiff_t>(firstHeldIdx(ringStart_)), batches_.end(),
-                             [&](const MBatch& b) { return b.pid == pid_ && b.fate != Fate::Control; }) &&
-                !txnOpen_)
+                             [&](const MBatch& b) { return b.pid == pid_ && b.fate != Fate::Control; })) {
                 producerLost_ = true;
+                if (txnOpen_) { openForgotten_ = true; ++d_.openTxnAllEvicted; }
+            } else if (txnOpen_ && ringStart_ > 0) {
+                bool markerFirst = false;   // a marker of this producer before its first in-ring open batch
+                for (std::size_t i = firstHeldIdx(ringStart_); i < batches_.size(); ++i) {
+                    const MBatch& b = batches_[i];
+                    if (b.pid != pid_) continue;
+                    if (b.fate == Fate::Control) { markerFirst = true; continue; }
+                    if (b.fate == Fate::Open) break;
+                }
+                if (!markerFirst) { rebuildPin_ = ringStart_; ++d_.rebuildPins; }   // each rebuild re-pins
+            }
             break;
         case K::Restart:
             boot(s.flag);
@@ -508,7 +533,7 @@ private:
     std::size_t doProduce(const Step& s, bool txn, bool afterCommit) {
         // The transactional client cannot add this partition to a new transaction until the
         // previous one's marker is acknowledged (CONCURRENT_TRANSACTIONS): it waits.
-        if (txn && (markerRetry_ || std::any_of(pending_.begin(), pending_.end(),
+        if (txn && (markerRetry_ || reinitAfterAbort_ || std::any_of(pending_.begin(), pending_.end(),
                                                 [](const Pending& p) { return p.kind == Pending::Marker; })))
             return 0;
         const mx::Op op = txn ? mx::Op::ProduceAcks0 : s.op;
@@ -597,9 +622,10 @@ private:
                 REQ(code != -1, "produce.unanswered", "a refused produce was never answered (a hang)");
                 if (code == kTransientLogFull) { got = mx::Outcome::RetriableLogFull; ++d_.ringFullRefusals; }
                 else if (code == kNotLeader)   got = mx::Outcome::RetriableNotLeader;
-                else if (txn && producerLost_ && !txnOpen_ && (code == 28 || code == 20)) {
-                    ++d_.producerExpired;   // Kafka parity: the client re-inits (KIP-360)
-                    ++pid_; seq_ = 0; producerLost_ = false;
+                else if (txn && producerLost_ && (code == 28 || code == 20)) {
+                    ++d_.producerExpired;
+                    if (txnOpen_) { decision_ = false; reinitAfterAbort_ = true; }   // abort it, then re-init
+                    else { ++pid_; seq_ = 0; producerLost_ = false; }                 // re-init (KIP-360)
                     return;
                 }
                 else {
@@ -696,6 +722,9 @@ private:
             maxLen_ = std::max(maxLen_, len);
             txnOpen_ = false;
             decision_.reset();
+            openForgotten_ = false;
+            rebuildPin_.reset();
+            if (reinitAfterAbort_) { reinitAfterAbort_ = false; producerLost_ = false; ++pid_; seq_ = 0; }
             out = len;
         };
         body();
@@ -875,9 +904,11 @@ private:
 
     /// read_committed bound: the HW, pinned at the first offset of an OPEN transaction.
     [[nodiscard]] int64_t lso() const {
+        const int64_t bound = rebuildPin_ ? std::min(*rebuildPin_, hw_) : hw_;
         for (std::size_t i = firstHeldIdx(-1); i < batches_.size(); ++i)
-            if (batches_[i].fate == Fate::Open && batches_[i].base < hw_) return batches_[i].base;
-        return hw_;
+            if (batches_[i].fate == Fate::Open && !openForgotten_ && batches_[i].base < hw_)
+                return std::min(bound, batches_[i].base);
+        return bound;
     }
     /// Plan, "Every cell asserts" 3: never a control batch (either isolation); read_committed
     /// additionally never an aborted or open transaction.
@@ -1190,29 +1221,55 @@ TEST(TransientDataPathStressRegression, RefusedProduceEvictsNothingTraceRegressi
 }
 
 // ---------------------------------------------------------------------------
-// FINDING B (escalated in the Task 12 report; a controller ruling is needed, so
-// this pin SKIPS unless RUNE_STRESS_FINDING_B=1 — it is not deleted): an OPEN transaction whose first batch the
-// ring evicted (it sat below the HW while 32 KiB of committed data passed), then
-// an ownership change.  The rebuilt read_committed state is scanned from the
-// ring, so it no longer knows the open transaction: read_committed delivers past
-// it (LSO = HW instead of pinned), and the producer's next transactional produce
-// is UnknownProducerId.  Before the ownership change the live state kept the LSO
-// pinned (step #29 passes).  Never reached by the 64 seeds; reached on purpose here.
+// Finding B (controller ruling, option (c) refined; fixed in RcState's ring
+// rebuild): an OPEN transaction whose FIRST batch the ring evicted while a later
+// batch of it is still in the ring, then an ownership change.  The rebuilt
+// read_committed state opened it at its first IN-RING batch, so read_committed
+// delivered the committed records between the ring start and that batch.  It is
+// now pinned at the ring start; the producer stays known; COMMIT resolves it.
 // ---------------------------------------------------------------------------
 TEST(TransientDataPathStressRegression, FindingB_OpenTransactionEvictedThenOwnershipMovedKeepsTheLso) {
-    if (std::getenv("RUNE_STRESS_FINDING_B") == nullptr)
-        GTEST_SKIP() << "FINDING B awaits a controller ruling (Task 12 report); RUNE_STRESS_FINDING_B=1 runs it";
+    std::vector<Step> t{op(K::ProduceTxn)};
+    for (int i = 0; i < 12; ++i) t.push_back(produce(mx::Op::ProduceAcks0, 1, 1500));
+    t.push_back(op(K::ProduceTxn));         // the same (still open) transaction's 2nd batch
+    for (int i = 0; i < 10; ++i) { t.push_back(fetch(16384)); t.push_back(produce(mx::Op::ProduceAcks0, 1, 1500)); }
+    t.push_back(fetch(16384));
+    t.push_back(read(1, Cur::Earliest));   // live state: pinned
+    t.push_back(op(K::Disown));
+    t.push_back(op(K::Reown));
+    t.push_back(read(1, Cur::Earliest));   // rebuilt state: must stay pinned
+    t.push_back(op(K::ProduceTxn));         // the producer is still known
+    t.push_back(op(K::Marker, /*commit=*/true));
+    t.push_back(fetch(16384));
+    t.push_back(read(1, Cur::Earliest));   // resolved: delivered
+    Stress s;
+    s.replay(t);
+    if (s.failed()) ADD_FAILURE() << s.failure().id << " at step " << s.failure().step << ": " << s.failure().detail;
+    EXPECT_EQ(s.dist().producerExpired, 0u) << "the open transaction's producer was forgotten";
+    EXPECT_GT(s.dist().evictions, 0u);
+}
+
+// The ruling's documented edge: an open transaction ALL of whose batches the ring
+// evicted, then an ownership change — unrecoverable on transient (the data is
+// gone): the rebuilt state forgets it, read_committed follows the evicted-cursor
+// rule, the producer's next transactional produce is UnknownProducerId and the
+// client aborts and re-inits.  Pinned so the model's allowance stays exercised.
+TEST(TransientDataPathStressRegression, OpenTransactionAllEvictedThenOwnershipMovedIsForgottenRegression) {
     std::vector<Step> t{op(K::ProduceTxn)};
     for (int i = 0; i < 15; ++i) t.push_back(produce(mx::Op::ProduceAcks0, 1, 1500));
     for (int i = 0; i < 6; ++i) { t.push_back(fetch(16384)); t.push_back(produce(mx::Op::ProduceAcks0, 1, 1500)); }
     t.push_back(fetch(16384));
-    t.push_back(read(1, Cur::Earliest));   // live state: LSO pinned at the evicted open txn (passes)
     t.push_back(op(K::Disown));
     t.push_back(op(K::Reown));
-    t.push_back(read(1, Cur::Earliest));   // rebuilt state: delivers past the open transaction
+    t.push_back(read(1, Cur::Earliest));
+    t.push_back(op(K::ProduceTxn));         // UnknownProducerId -> the client aborts
+    t.push_back(op(K::Marker, false));
+    t.push_back(op(K::ProduceTxn));         // re-initialised producer
     Stress s;
     s.replay(t);
     if (s.failed()) ADD_FAILURE() << s.failure().id << " at step " << s.failure().step << ": " << s.failure().detail;
+    EXPECT_EQ(s.dist().openTxnAllEvicted, 1u);
+    EXPECT_EQ(s.dist().producerExpired, 1u);
 }
 
 } // namespace

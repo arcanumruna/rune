@@ -4,6 +4,8 @@
 // cursor, ownership moves.  Deterministic: one worker driven by hand, no Aeron.
 #include "TransientRig.h"
 
+#include <rune/node/RcState.h>
+
 using namespace transient_rig;
 
 namespace {
@@ -302,4 +304,97 @@ TEST(TransientDataPathRegression, ReadCommittedFiltersAnAbortedTransactionAcross
     }
     EXPECT_EQ(bases, (std::vector<int64_t>{2})) << "an ABORTED batch was delivered after an ownership change "
                                                    "(the rebuilt state lost the aborted index)";
+}
+
+// ---------------------------------------------------------------------------
+// E2 Task 12 fix round 1 (finding B, controller ruling "option (c) refined"):
+// the RcState rebuilt from the ring after an ownership change saw only the
+// in-ring batches of an OPEN transaction whose FIRST batch the ring had
+// evicted — it opened it at its first IN-RING batch, so read_committed got the
+// committed records between the ring start and that batch although the
+// transaction is still open.  The rebuild now pins such a transaction at the
+// ring start (its first batch may lie below it); a transaction whose producer
+// left a COMMIT/ABORT marker in the ring before its first in-ring batch is
+// provably complete in the ring and opens at that batch.  The producer stays
+// known (its in-ring sequence) and its marker resolves it as normal.  A
+// transaction ALL of whose batches were evicted is unrecoverable (documented:
+// UnknownProducerId on its next produce; read_committed follows the evicted
+// cursor rule).
+// ---------------------------------------------------------------------------
+
+namespace {
+int64_t ringPut(rune::storage::InMemoryLog& mem, const std::vector<uint8_t>& b) {
+    int64_t base = -1;
+    const int32_t delta = rune::protocol::RecordBatchReader(b.data(), b.size()).lastOffsetDelta();
+    EXPECT_GE(mem.appendNoSyncRestamp(b.data(), b.size(), delta, base), 0);
+    return base;
+}
+std::vector<uint8_t> markerOf(int64_t pid, bool commit) {
+    return rune::transaction::ControlMarker::build(
+        pid, 0, commit ? rune::transaction::ControlType::Commit : rune::transaction::ControlType::Abort, 0);
+}
+} // namespace
+
+TEST(TransientDataPathRegression, RcRingRebuildPinsAnOpenTxnWhoseFirstBatchWasEvictedAtTheRingStartRegression) {
+    rune::storage::InMemoryLog mem(8 * 1024, 1000);   // plain DropOldest: evicts as needed
+    constexpr int64_t kA = 9, kB = 11;
+    ASSERT_EQ(ringPut(mem, batchOf(1, 50, kA, 0, 0, /*txn=*/true)), 0);   // A's txn opens at 0
+    for (int i = 0; i < 4; ++i) ringPut(mem, batchOf(1, 1500));
+    const int64_t a1 = ringPut(mem, batchOf(1, 50, kA, 0, 1, true));       // A's 2nd batch
+    ringPut(mem, batchOf(1, 50, kB, 0, 0, true));                          // B: a whole txn in the ring
+    ringPut(mem, markerOf(kB, true));
+    const int64_t b1 = ringPut(mem, batchOf(1, 50, kB, 0, 1, true));       // B's next txn: provably its first
+    for (int i = 0; i < 8 && mem.logStartOffset() == 0; ++i) ringPut(mem, batchOf(1, 1500));
+    const int64_t ringStart = mem.logStartOffset();
+    ASSERT_GT(ringStart, 0) << "precondition: A's first batch was evicted";
+    ASSERT_LT(ringStart, a1) << "precondition: A's second batch (and B's batches) are still in the ring";
+
+    rune::node::RcState rc;
+    rc.reserve(64);
+    rune::node::RcFacts f;
+    f.leader = true; f.epoch = 1;
+    (void)rc.advance(f, nullptr, rune::node::RcState::kDefaultScanBytesPerPass, &mem);
+    ASSERT_TRUE(rc.ready());
+    EXPECT_EQ(rc.tracker().firstOffsetOf(kA), ringStart)
+        << "an open txn whose first batch may have been evicted must pin at the ring start (was: its first "
+           "in-ring batch " << a1 << ")";
+    EXPECT_EQ(rc.tracker().firstOffsetOf(kB), b1) << "a txn after its producer's in-ring marker opens at its batch";
+    EXPECT_EQ(rc.lso(INT64_MAX), ringStart);
+
+    rc.onMarker(kA, mem.logEndOffset(), /*commit=*/false);   // A's ABORT resolves it as normal
+    EXPECT_EQ(rc.lso(INT64_MAX), b1);
+    EXPECT_TRUE(rc.aborted().isAborted(kA, a1)) << "the abort covers A's in-ring batch";
+    rc.onMarker(kB, mem.logEndOffset() + 1, true);
+    EXPECT_EQ(rc.lso(INT64_MAX), INT64_MAX) << "nothing open";
+}
+
+TEST(TransientDataPathRegression, OpenTxnWithItsFirstBatchEvictedSurvivesAnOwnershipChangeRegression) {
+    Rig rig(/*ringBytes=*/8 * 1024, /*maxBatches=*/1000);   // single node: HW = LEO, the ring evicts freely
+    constexpr int64_t kPid = 7;
+    int64_t base = -1;
+    ASSERT_EQ(produceTxnOk(rig, kPid, 0, &base), kOk);
+    ASSERT_EQ(base, 0);
+    for (int i = 0; i < 4; ++i) ASSERT_EQ(rig.produce(batchOf(1, 1500), 0), kOk);
+    ASSERT_EQ(produceTxnOk(rig, kPid, 1, &base), kOk);
+    const int64_t second = base;
+    for (int i = 0; i < 8 && rig.mem.logStartOffset() == 0; ++i) ASSERT_EQ(rig.produce(batchOf(1, 1500), 0), kOk);
+    const int64_t ringStart = rig.mem.logStartOffset();
+    ASSERT_GT(ringStart, 0);
+    ASSERT_LT(ringStart, second);
+
+    moveOwnershipAwayAndBack(rig);   // the RcState is rebuilt from the ring
+
+    const auto open = rig.readOnce(51, 0, /*read_committed=*/1);
+    ASSERT_TRUE(open.has_value());
+    EXPECT_TRUE(open->chunk.empty()) << "read_committed delivered past an open transaction after the move";
+    EXPECT_EQ(open->pushEffectiveBound(), ringStart) << "the LSO pins at the ring start";
+
+    ASSERT_EQ(rig.produce(batchOf(1, 50, kPid, 0, 2, true), 0, &base, kPid, 0, 2), kOk)
+        << "the producer must stay known (no UnknownProducerId)";
+    ASSERT_EQ(markerAnswer(rig, 8, kPid, /*commit=*/true), kOk);
+    const auto committed = rig.readOnce(52, 0, 1);
+    ASSERT_TRUE(committed.has_value());
+    ASSERT_FALSE(committed->chunk.empty()) << "the COMMIT did not resolve the pinned transaction";
+    EXPECT_EQ(rune::protocol::RecordBatchReader(committed->chunk.data(), committed->chunk.size()).baseOffset(),
+              rig.mem.logStartOffset()) << "delivery resumes at the (current) ring start";
 }

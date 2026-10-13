@@ -124,6 +124,8 @@ public:
     /// p99 16.6 µs @16 KiB, 18.4 µs @32 KiB, 21.9 µs @64 KiB → 32 KiB.
     static constexpr int32_t     kDefaultScanBytesPerPass = 32 * 1024;
     static constexpr std::size_t kTailReserve             = 256;
+    /// Distinct producers with a marker in the ring, per memory-backed rebuild (cold).
+    static constexpr std::size_t kRingMarkedPidsReserve   = 256;
     /// Read-ahead depth: request (async FADVISE / sync MADV_WILLNEED) this many
     /// budgets beyond the cursor (m7).
     static constexpr std::size_t kReadAheadBudgets        = 8;
@@ -168,6 +170,7 @@ public:
         aborted_.reserve(rune::transaction::AbortedTxnIndex::kDefaultReservedRanges);
         tail_.reserve(kTailReserve);
         residency_.reserve(static_cast<std::size_t>(kDefaultScanBytesPerPass) / 4096 + 2);
+        ringMarkedPids_.reserve(kRingMarkedPidsReserve);
     }
     void setResidencyProbe(RcResidencyProbe fn, void* ctx) noexcept { probeFn_ = fn; probeCtx_ = ctx; }
     /// F15 S5 (§2.5, I3): the owning worker's producer state for THIS partition.
@@ -585,15 +588,49 @@ private:
     // the build is forgotten exactly like a disk segment deleted by retention.
     // An unparseable batch in the ring is the same invariant violation as on
     // disk (halt: failing open would expose aborted data).  No allocation.
+    //
+    // E2 Task 12 fix round 1 (finding B; controller ruling "option (c) refined"):
+    // the ring may have evicted the FIRST batches of a transaction that is still
+    // open.  A transactional data batch whose producer is not open in this pass
+    // and has left no COMMIT/ABORT marker earlier in the ring is NOT provably its
+    // transaction's first batch when the ring start is above 0: the transaction
+    // is opened conservatively AT the ring start (LSO pinned there: read_committed
+    // never sees records between the ring start and the open transaction's data
+    // until its marker lands).  After an in-ring marker of the same producer (or
+    // with nothing evicted) the batch provably opens a new transaction and opens
+    // it at its own offset, as before.  A transaction ALL of whose batches were
+    // evicted leaves nothing in the ring to rebuild from: unrecoverable (its
+    // producer is unknown — UnknownProducerId on its next produce — and
+    // read_committed follows the evicted-cursor rule).  `ringMarkedPids_` is
+    // reserved (cold path; a growth is counted).
     std::size_t rebuildRcFromRing_(rune::storage::InMemoryLog& ring) {
+        using namespace rune::protocol::batch;
         rune::transaction::RcBuilder builder(&tracker_, &aborted_);
         std::size_t bytes = 0;
-        int64_t     off   = ring.logStartOffset();
+        const int64_t ringStart = ring.logStartOffset();
+        int64_t     off   = ringStart;
         const int64_t leo = ring.logEndOffset();
+        ringMarkedPids_.clear();
         while (off < leo) {
             const auto v = ring.readView(off, /*maxBytes=*/1);   // exactly one whole batch
             if (v.empty() || v.nextOffset <= off) [[unlikely]]
                 haltInvariant_("the ring has no readable batch below its LEO (RC build)");
+            if (ringStart > 0 && v.len >= static_cast<std::size_t>(kRecordBatchOverhead)) {
+                const rune::protocol::RecordBatchReader r(v.data, v.len);
+                const auto attrs = static_cast<uint16_t>(r.attributes());
+                const int64_t pid = r.producerId();
+                if (pid >= 0 && (attrs & static_cast<uint16_t>(kAttrControl)) != 0) {
+                    if (std::find(ringMarkedPids_.begin(), ringMarkedPids_.end(), pid) == ringMarkedPids_.end()) {
+                        if (ringMarkedPids_.size() == ringMarkedPids_.capacity()) [[unlikely]] ++ringMarkedPidsGrowths_;
+                        ringMarkedPids_.push_back(pid);
+                    }
+                } else if (pid >= 0 && (attrs & static_cast<uint16_t>(kAttrTransactional)) != 0 &&
+                           tracker_.firstOffsetOf(pid) < 0 &&
+                           std::find(ringMarkedPids_.begin(), ringMarkedPids_.end(), pid) == ringMarkedPids_.end()) {
+                    tracker_.onProduceBatch(pid, ringStart);   // conservative pin; the step below keeps it
+                    ++ringPinnedTxns_;
+                }
+            }
             if (builder.step(v.data, v.len).outcome == rune::transaction::RcBuilder::Outcome::Invalid) [[unlikely]]
                 haltInvariant_("RcBuilder refused a whole batch of the ring (RC build)");
             bytes += v.len;
@@ -613,6 +650,7 @@ private:
     int64_t cleanerLsoPublished_ = std::numeric_limits<int64_t>::min();   ///< D3b: last value published
     rune::transaction::AbortedTxnIndex aborted_;
     std::vector<TailEvent>             tail_;
+    std::vector<int64_t>               ringMarkedPids_;   ///< E2 finding B: pass-local, reserved
 #if defined(__APPLE__)
     std::vector<char>                  residency_;   ///< mincore vector (pre-reserved)
 #else
@@ -639,6 +677,11 @@ private:
     uint64_t    scannedBytes_     = 0;
     uint64_t    nonResidentSteps_ = 0;
     uint64_t    probeErrors_      = 0;
+    uint64_t    ringPinnedTxns_        = 0;   ///< E2 finding B: open txns pinned at the ring start
+    uint64_t    ringMarkedPidsGrowths_ = 0;
+public:
+    [[nodiscard]] uint64_t ringPinnedTxns() const noexcept { return ringPinnedTxns_; }
+    [[nodiscard]] uint64_t ringMarkedPidsGrowths() const noexcept { return ringMarkedPidsGrowths_; }
 };
 
 } // namespace rune::node
