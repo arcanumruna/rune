@@ -40,12 +40,15 @@ using namespace rune::storage;
 using namespace rune::protocol;
 namespace fs = std::filesystem;
 
-// Allocation counter for THIS thread only (the owner in these single-threaded
-// tests): replaces the global operator new for the whole test binary, counting
-// only while a window is open.
+// Allocation counter: replaces the global operator new for the whole test
+// binary, counting only while a window is open.  The windows run on the test
+// thread with no other thread running (single-threaded tests), so plain
+// globals suffice — no thread_local (hard rule 1; E2 final fix wave,
+// fix-on-sight).  The one multi-threaded test (the concurrent cleaner) never
+// opens a window.
 namespace {
-thread_local bool     tCount = false;
-thread_local uint64_t tAllocs = 0;
+bool     tCount = false;
+uint64_t tAllocs = 0;
 }
 void* operator new(std::size_t n) {
     if (tCount) ++tAllocs;
