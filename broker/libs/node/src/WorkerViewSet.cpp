@@ -363,14 +363,22 @@ int WorkerViewSet::reconcileTransient_(ViewInstance& inst, const TransientBounds
         // The ring's existing content changed at/above cutOffset (a truncation,
         // or a follower ring reset).  Records the view folded at/above the cut
         // may differ or be gone: re-fold from the cut (or the ring start).
+        // The replica keeps only the LAST cut: when the generation moved by
+        // more than one since this pass, an earlier cut may lie below it, so
+        // the cut is unknown — re-fold from the ring start (the same
+        // exactly-one-cut guard as Worker::waiterReplica_ and
+        // ClientGateway::inlineWaiterStillValid_).
+        const bool oneCut   = tb.logGeneration == live.logGeneration + 1;
+        const int64_t cut   = oneCut ? tb.cutOffset : tb.logStart;
         live.logGeneration = tb.logGeneration;
-        if (inst.foldCursor > tb.cutOffset) {
+        if (inst.foldCursor > cut) {
             ++inst.counters.transientSourceResets;
-            const int64_t to = std::max(tb.cutOffset, tb.logStart);
+            const int64_t to = std::max(cut, tb.logStart);
             spdlog::warn("WorkerViewSet: view {} partition {}: its transient source changed at offset {} "
-                         "below cursor {}; keeping the rows, re-folding from offset {} (resets={})",
-                         viewTopicId, inst.partition, tb.cutOffset, inst.foldCursor, to,
-                         inst.counters.transientSourceResets);
+                         "below cursor {} ({} cut since the last pass); keeping the rows, re-folding from "
+                         "offset {} (resets={})",
+                         viewTopicId, inst.partition, cut, inst.foldCursor,
+                         oneCut ? "one" : "more than one", to, inst.counters.transientSourceResets);
             inst.foldCursor = to;
             moved = 1;
         }

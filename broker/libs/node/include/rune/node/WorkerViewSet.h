@@ -154,7 +154,9 @@ struct TransientBounds {
 //                               — cursor tracks THIS source ring: re-folded from
 //                                 logStart when the ring was recreated (new
 //                                 incarnation), from the cut when its content
-//                                 changed below the cursor (new generation);
+//                                 changed below the cursor (generation + 1),
+//                                 from logStart when the generation moved by
+//                                 more (only the last cut is known);
 //                                 EVICTED when it falls below logStart,
 //                                 invariant breach when above logEnd.
 struct CursorFresh {};
