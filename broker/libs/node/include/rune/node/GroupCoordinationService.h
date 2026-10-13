@@ -61,7 +61,6 @@
 #include <unordered_map>
 #include <map>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 // Forward declaration — ClientGateway lives in rune_gateway; node→gateway direction is fine.
