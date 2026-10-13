@@ -3046,8 +3046,10 @@ void ClientGateway::logMovedAwaySummary_()
                  "summary ({} in total); the clients "
                  "re-subscribe from their positions on the leaders",
                  movedAwaySinceSummary_, readCommittedMovedAway_);
+    ++movedAwaySummaries_;
+    lastMovedAwaySummaryCount_ = movedAwaySinceSummary_;
     movedAwaySinceSummary_     = 0;
-    nextMovedAwaySummaryCycle_ = pushCycle_ + kMovedAwaySummaryEveryCycles;
+    nextMovedAwaySummaryNs_    = nowNs_ + kMovedAwaySummaryEveryNs;
 }
 
 bool ClientGateway::movedAway_(const Subscription& sub) const noexcept
@@ -4674,11 +4676,21 @@ void ClientGateway::handleUnsubscribe(const uint8_t* buf, std::size_t len)
 // ---------------------------------------------------------------------------
 void ClientGateway::pushSubscriptions()
 {
+    ++pushCycle_;   // F15 S4 fix round 1: the backoff clock (cycles, never wall time)
+    pushSubscriptionsPass_();
+    // E2 final fix wave (N2): the moved-away summary is logged at the END of
+    // the pass that retired subscriptions — prompt (the same pass), and
+    // accurate (a routed sweep's whole count, never a partial one) — then at
+    // most once per kMovedAwaySummaryEveryNs of wall time (retirements in the
+    // window are carried into the next summary, logged as soon as it elapses).
+    if (movedAwaySinceSummary_ != 0 && nowNs_ >= nextMovedAwaySummaryNs_) [[unlikely]]
+        logMovedAwaySummary_();
+}
+
+void ClientGateway::pushSubscriptionsPass_()
+{
     using namespace rune::protocol::batch;
 
-    ++pushCycle_;   // F15 S4 fix round 1: the backoff clock (cycles, never wall time)
-    if (movedAwaySinceSummary_ != 0 && pushCycle_ >= nextMovedAwaySummaryCycle_) [[unlikely]]
-        logMovedAwaySummary_();
     if (subscriptions_.empty()) return;
 
     // Task 11 carry (E2 Task 13): a plain subscription this node can no longer

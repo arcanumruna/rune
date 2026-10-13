@@ -963,6 +963,10 @@ public:
     [[nodiscard]] uint64_t readCommittedSubscriptionsMovedAway() const noexcept { return readCommittedMovedAway_; }
     static constexpr int64_t kMovedAwayScanEveryCyclesForTest = 16;   // == kMovedAwayScanEveryCycles
     static constexpr int     kMovedAwayLookupsPerSliceForTest = 32;   // == kMovedAwayLookupsPerSlice
+    static constexpr int64_t kMovedAwaySummaryEveryNsForTest  = 1'000'000'000;   // == kMovedAwaySummaryEveryNs
+    /// N2: moved-away summaries logged, and the count the last one reported.
+    [[nodiscard]] uint64_t movedAwaySummariesForTest() const noexcept { return movedAwaySummaries_; }
+    [[nodiscard]] uint64_t lastMovedAwaySummaryCountForTest() const noexcept { return lastMovedAwaySummaryCount_; }
     /// N1: the most movedAway_ probes any fallback slice made so far.
     [[nodiscard]] int movedAwayMaxProbesPerSliceForTest() const noexcept { return movedAwayMaxProbesPerSlice_; }
     /// N1 test seam: put every subscription in as few buckets as possible (a
@@ -1457,6 +1461,7 @@ private:
     void handleGetViewRow   (const uint8_t* buf, std::size_t len);
     // GB-3: Push delivery — called from doWork after ingress poll.
     void pushSubscriptions  ();
+    void pushSubscriptionsPass_();   ///< N2: the pass body (pushSubscriptions logs the summary after it)
     // GB-5p2: Group-commit flush — called from doWork() once per cycle AFTER all
     // handleProduce() calls have completed.  Flushes each dirty partition Log
     // exactly once (one fsync per touched partition = group-commit under load).
@@ -2105,12 +2110,15 @@ private:
     static constexpr int64_t     kMovedAwayScanEveryCycles   = kMovedAwayScanEveryCyclesForTest;   ///< power of two
     static constexpr int         kMovedAwayLookupsPerSlice   = kMovedAwayLookupsPerSliceForTest;
     static constexpr std::size_t kMovedAwayBucketsPerSlice   = 256;   ///< empty buckets cost no lookup, but bounded
-    static constexpr int64_t     kMovedAwaySummaryEveryCycles = 1 << 16;
+    /// N2: the moved-away summary's rate limit (wall time, the duty clock nowNs_).
+    static constexpr int64_t     kMovedAwaySummaryEveryNs    = kMovedAwaySummaryEveryNsForTest;
     std::size_t movedAwayBucket_           = 0;   ///< fallback scan cursor (bucket index)
     std::size_t movedAwayBucketPos_        = 0;   ///< N1: survivors of that bucket already visited (mid-bucket resume)
     int         movedAwayMaxProbesPerSlice_ = 0;  ///< N1: the most movedAway_ probes one slice made (tests)
     uint64_t    movedAwaySinceSummary_     = 0;
-    int64_t     nextMovedAwaySummaryCycle_ = 0;
+    int64_t     nextMovedAwaySummaryNs_    = 0;
+    uint64_t    movedAwaySummaries_        = 0;   ///< N2: summaries logged (tests)
+    uint64_t    lastMovedAwaySummaryCount_ = 0;   ///< N2: the count the last summary reported (tests)
     /// The fallback slice: at most kMovedAwayLookupsPerSlice movedAway_ probes,
     /// resuming at (movedAwayBucket_, movedAwayBucketPos_) — mid-bucket (N1).
     void scanMovedAwaySlice_();

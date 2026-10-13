@@ -889,3 +889,42 @@ TEST(TransientGatewayRegression, FallbackSliceIsBoundedByProbesInACollidingBucke
         << "SILENT STALL: the mid-bucket resume never reached every subscription";
     EXPECT_LE(r.gw.movedAwayMaxProbesPerSliceForTest(), ClientGateway::kMovedAwayLookupsPerSliceForTest);
 }
+
+// ---------------------------------------------------------------------------
+// E2 final fix wave (Task 13 re-review N2): the moved-away summary is logged
+// PROMPTLY (at the end of the very pass that retired the subscriptions) and
+// ACCURATELY (that pass's whole count) — then rate-limited by wall time: the
+// retirements inside the window are reported in one summary as soon as it
+// elapses.  RED (cycle-paced summary at the top of the pass): nothing logged
+// in the retiring pass; the next summary only 65536 passes later.
+// ---------------------------------------------------------------------------
+TEST(TransientGatewayRegression, MovedAwaySummaryIsPromptAndAccurateRegression) {
+    Rig r(RigOpts{.partitions = 2});
+    const int64_t sid = r.gw.injectTestSession(0);
+    for (int k = 0; k < 3; ++k) r.subscribe(sid, -2, 4000 + k, /*read_committed=*/1, /*partition=*/0);
+    for (int k = 0; k < 2; ++k) r.subscribe(sid, -2, 4100 + k, /*read_committed=*/1, /*partition=*/1);
+    ASSERT_EQ(r.subscribed.size(), 5u);
+    int64_t now = 5'000'000'000;
+    r.gw.setNowForTest(now);
+    const auto h0 = r.reg.lookupHandle(0, 0);
+    r.reg.setIntendedRole(0, 0, h0.incarnation, rune::node::ReplicaRegistry::IntendedRole::Follower);
+    r.gw.pushSubscriptionsForTest();   // ONE pass: the routed sweep retires partition 0's three
+    ASSERT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), 3u);
+    EXPECT_EQ(r.gw.movedAwaySummariesForTest(), 1u) << "the retiring pass logged no summary (it lags)";
+    EXPECT_EQ(r.gw.lastMovedAwaySummaryCountForTest(), 3u) << "the summary reported a partial count";
+
+    // Inside the rate window: partition 1's two are retired, the summary waits ...
+    now += 100'000'000;
+    r.gw.setNowForTest(now);
+    const auto h1 = r.reg.lookupHandle(0, 1);
+    r.reg.setIntendedRole(0, 1, h1.incarnation, rune::node::ReplicaRegistry::IntendedRole::Follower);
+    r.gw.pushSubscriptionsForTest();
+    ASSERT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), 5u);
+    EXPECT_EQ(r.gw.movedAwaySummariesForTest(), 1u) << "not rate-limited";
+    // ... and is logged on the first pass after the window, with both.
+    now += ClientGateway::kMovedAwaySummaryEveryNsForTest;
+    r.gw.setNowForTest(now);
+    r.gw.pushSubscriptionsForTest();
+    EXPECT_EQ(r.gw.movedAwaySummariesForTest(), 2u) << "the carried retirements were never reported";
+    EXPECT_EQ(r.gw.lastMovedAwaySummaryCountForTest(), 2u);
+}
