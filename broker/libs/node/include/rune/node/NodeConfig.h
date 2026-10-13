@@ -15,6 +15,8 @@
 //   RUNE_WORKER_INGRESS_BASE_STREAM — int32, default clientStreamId+1. Per-worker ingress stream id base (E5.1).
 //   RUNE_CONSENSUS_STREAM_ID — int32, default 10.
 //   RUNE_REPLICATION_STREAM_ID — int32, default 20. Stream for per-partition replication.
+//   RUNE_CATALOG_REPL_STREAM_ID — int32, default 30. Stream of the __catalog replication plane
+//                            (distinct from the replication stream and the per-worker range).
 //   RUNE_DATA_DIR          — filesystem path for durable data. Required, non-empty.
 //   RUNE_TOPICS            — comma-separated name:partitionCount topic declarations (GB-1).
 //                            Optional (absent or empty → no topics; produce/subscribe
@@ -212,6 +214,16 @@ struct NodeConfig {
     //   Overridable via RUNE_REPL_BASE_STREAM_ID (parseInt32).
     bool    perWorkerReplication = false;
     int32_t replBaseStreamId     = 2000;
+
+    // Catalog history Task 6: the __catalog partition's replication plane —
+    // its own Aeron stream on this node's replication channel (the channel the
+    // control-thread transport subscribes on with replicationStreamId and, in
+    // legacy per-worker mode, the worker planes with replBaseStreamId + w).
+    // Must be distinct from replicationStreamId and outside
+    // [replBaseStreamId, replBaseStreamId + workerCount) (validateCatalogStream).
+    // Overridable via RUNE_CATALOG_REPL_STREAM_ID (parseInt32).  Every broker of
+    // a cluster must use the same value.
+    int32_t catalogReplStreamId  = 30;
 
     // Self-contained worker shards (spec §3.1-§3.3).  DEFAULT (2026-10-02, the
     // measured 110k rec/s config, findings §4): shard mode + fused runtime
@@ -894,6 +906,13 @@ struct NodeConfig {
     /// NOT called during parseNodeConfig.  Callers (e.g. BrokerNode startup)
     /// must invoke this after parsing and refuse to start if it returns an error.
     std::optional<std::string> validateStreamRanges() const;
+
+    /// Catalog history Task 6: catalogReplStreamId must not collide with any
+    /// stream on the replication channel — replicationStreamId, or a per-worker
+    /// replication stream [replBaseStreamId, replBaseStreamId + workerCount).
+    /// nullopt = valid; else the error.  Checked by parseNodeConfig and by
+    /// BrokerNode at start (programmatic configs).
+    std::optional<std::string> validateCatalogStream() const;
 
     /// Refuses an Aeron dir that would destroy the log: the embedded driver runs
     /// with dir_delete_on_start + delete-on-shutdown and recursively deletes its

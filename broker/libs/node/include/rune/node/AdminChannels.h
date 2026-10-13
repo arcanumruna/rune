@@ -34,6 +34,7 @@
 
 #include <concurrent/AtomicBuffer.h>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <span>
@@ -56,6 +57,9 @@ enum : int32_t {
     kMsgEgressFrame       = 6,   // admin → control: [sessionId:i64][response frame]
     kMsgAlterTopic        = 7,   // gateway → admin: ALTER TOPIC (Task 11)
     kMsgCreateView        = 8,   // gateway → admin: CREATE VIEW (Task 19)
+    // Catalog history Task 6 (control → admin, on the AdminRoleRing):
+    kMsgCatalogRole       = 9,   // the __catalog replica's role (AdminRoleMsg, full form)
+    kMsgCatalogAlterIsrResponse = 10,  // the controller's AlterIsrResponse for (-6, 0), verbatim SBE
 };
 
 // ---------------------------------------------------------------------------
@@ -77,6 +81,10 @@ enum : int32_t {
     // (DefineTopic schema / CreateView record) COMMITTED; the control thread (owner
     // of TopicRegistry) rewrites its topic-id marker pending -> committed.
     kA2cTopicCommitted = 4,
+    // Catalog history Task 6: the __catalog replica's AlterIsr proposal (verbatim
+    // SBE AlterIsrMsg).  The control thread hands it to the controller channel
+    // (replTransport_->sendAlterIsr) — the same one the coordinator partitions use.
+    kA2cCatalogAlterIsr = 10,
 };
 
 // ---------------------------------------------------------------------------
@@ -84,7 +92,7 @@ enum : int32_t {
 // ---------------------------------------------------------------------------
 inline constexpr int kAdminRequestRingBytes     = 1 << 20;  // 1 MiB (descriptor blobs)
 inline constexpr int kCreateTopicRingBytes      = 1 << 16;  // 64 KiB
-inline constexpr int kAdminRoleRingBytes        = 1 << 12;  // 4 KiB
+inline constexpr int kAdminRoleRingBytes        = 1 << 12;  // 4 KiB (max message 512 B >= the largest role)
 // admin → control (T10 storage failure + F3 r6 SchemaUpdate).  Sized so that
 // every descriptor the request ring can deliver fits ONE SchemaUpdate message
 // (static_assert below, F3 round 7, item 4).
@@ -230,12 +238,19 @@ struct CreateTopicReplyMsg {
 // thread (becomeLeader/becomeFollower) — no cross-thread role_ write.
 // ---------------------------------------------------------------------------
 struct AdminRoleMsg {
+    /// The largest ISR a role carries (== AlterIsrMsg::kMaxIsr, FollowerSlots::kMaxReplicas).
+    static constexpr int kMaxIsr = 16;
     bool     leader   = false;   // true = become Leader, false = become Follower
-    int32_t  epoch    = 0;
-    int32_t  leaderId = 0;       // used when leader==false (follower)
-    // For leader: the ISR is the full replica set (schema replica minIsr gate
-    // handles quorum); we do not carry it on the wire — the admin thread rebuilds
-    // it from its own immutable replica-set knowledge.
+    int32_t  epoch    = 0;       // the leader epoch (the committed assignment's leaderEpoch)
+    int32_t  leaderId = 0;       // used when leader==false (follower); -1 = no leader
+    // Catalog history Task 6 (kMsgCatalogRole only): the committed assignment's
+    // ISR and partitionEpoch (the AlterIsr compare-and-set version).  The
+    // __topic_schemas role (kMsgAdminRole) leaves them empty / -1: its ISR is the
+    // full replica set, rebuilt by the admin thread from its own immutable
+    // replica-set knowledge.  Fixed-capacity (no allocation on the ring path).
+    int32_t  partitionEpoch = -1;
+    int32_t  isrCount       = 0;
+    std::array<int32_t, kMaxIsr> isr{};
 };
 
 // ===========================================================================
@@ -518,26 +533,59 @@ inline CreateTopicReplyMsg decodeCreateTopicReply(const uint8_t* buf, std::size_
 }
 
 // ---- AdminRole ----
-inline bool encodeAdminRole(OneToOneByteRing& ring, const AdminRoleMsg& m) {
+// Layout: [leader:u8][epoch:i32][leaderId:i32][partitionEpoch:i32][isrCount:i32][isr:i32 * isrCount].
+inline constexpr std::size_t kAdminRoleFixedBytes = 1 + 4 + 4 + 4 + 4;
+
+[[nodiscard]] inline constexpr std::size_t adminRoleWireLen(int32_t isrCount) noexcept {
+    return kAdminRoleFixedBytes + 4u * static_cast<std::size_t>(isrCount < 0 ? 0 : isrCount);
+}
+
+/// `msgType` = kMsgAdminRole (the __topic_schemas / __views role) or
+/// kMsgCatalogRole (the __catalog role).  false = ring full (the caller keeps
+/// the role and retries) or an ISR beyond kMaxIsr (never encoded).
+inline bool encodeAdminRole(OneToOneByteRing& ring, const AdminRoleMsg& m,
+                            int32_t msgType = kMsgAdminRole) {
     using namespace admin_wire;
-    const std::size_t len = 1 + 4 + 4;
-    const auto idx = ring.tryClaim(kMsgAdminRole, len);
+    if (m.isrCount < 0 || m.isrCount > AdminRoleMsg::kMaxIsr) return false;
+    // tryClaim throws beyond the ring's max message (capacity / 8); the 4 KiB
+    // role ring holds the largest role (17 + 16 * 4 B) by construction.
+    if (adminRoleWireLen(m.isrCount) > static_cast<std::size_t>(ring.maxMsgLength())) return false;
+    const auto idx = ring.tryClaim(msgType, adminRoleWireLen(m.isrCount));
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
     *p++ = m.leader ? 1 : 0;
-    putI32(p, m.epoch);    p += 4;
-    putI32(p, m.leaderId);
+    putI32(p, m.epoch);          p += 4;
+    putI32(p, m.leaderId);       p += 4;
+    putI32(p, m.partitionEpoch); p += 4;
+    putI32(p, m.isrCount);       p += 4;
+    for (int i = 0; i < m.isrCount; ++i, p += 4) putI32(p, m.isr[static_cast<std::size_t>(i)]);
     ring.commit(idx);
     return true;
 }
 
-inline AdminRoleMsg decodeAdminRole(const uint8_t* buf, std::size_t len) {
+/// Checked decode: false on a short frame or an ISR count outside [0, kMaxIsr]
+/// (the caller reports it — never applied as some other role).
+[[nodiscard]] inline bool decodeAdminRole(const uint8_t* buf, std::size_t len, AdminRoleMsg& m) {
     using namespace admin_wire;
+    m = AdminRoleMsg{};
+    if (len < kAdminRoleFixedBytes) return false;
+    m.leader         = buf[0] != 0;
+    m.epoch          = getI32(buf + 1);
+    m.leaderId       = getI32(buf + 5);
+    m.partitionEpoch = getI32(buf + 9);
+    m.isrCount       = getI32(buf + 13);
+    if (m.isrCount < 0 || m.isrCount > AdminRoleMsg::kMaxIsr || len < adminRoleWireLen(m.isrCount)) {
+        m = AdminRoleMsg{};
+        return false;
+    }
+    for (int i = 0; i < m.isrCount; ++i)
+        m.isr[static_cast<std::size_t>(i)] = getI32(buf + kAdminRoleFixedBytes + 4u * static_cast<std::size_t>(i));
+    return true;
+}
+
+inline AdminRoleMsg decodeAdminRole(const uint8_t* buf, std::size_t len) {
     AdminRoleMsg m;
-    if (len < 9) return m;
-    m.leader   = buf[0] != 0;
-    m.epoch    = getI32(buf + 1);
-    m.leaderId = getI32(buf + 5);
+    (void)decodeAdminRole(buf, len, m);
     return m;
 }
 

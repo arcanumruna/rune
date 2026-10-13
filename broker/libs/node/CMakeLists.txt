@@ -13,6 +13,7 @@ add_library(rune_node
     src/SchemaRegistry.cpp
     src/ViewRegistry.cpp
     src/AdminWorker.cpp
+    src/CatalogPartition.cpp
     src/ViewSnapshotIoAgent.cpp
     src/WorkerViewSet.cpp
     src/RuntimeTopicRecovery.cpp)
@@ -141,6 +142,7 @@ if(BUILD_TESTING)
         tests/node/SchemaRegistryTest.cpp
         tests/node/ViewRegistryTest.cpp
         tests/node/AdminWorkerTest.cpp
+        tests/node/AdminIsrChannelTest.cpp
         tests/node/SignalControlTest.cpp
         tests/node/LeaderObserverTest.cpp
         tests/node/OwnerThreadTestTaskTest.cpp
@@ -1458,6 +1460,15 @@ if(BUILD_TESTING)
         target_link_libraries(rune_transient_topic_data_path_tests PRIVATE rune_node rune_view aeron::aeron
                               GTest::gtest_main)
         gtest_discover_tests(rune_transient_topic_data_path_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+
+        # Catalog history Task 6: the __catalog partition on every broker —
+        # real replication on its admin-thread plane, controller-ISR leader
+        # (never unclean), new / wiped brokers refetch from 0; the admin/control
+        # role + ISR relay units.
+        add_executable(rune_catalog_replication_tests tests/integration/CatalogReplicationTest.cpp)
+        target_include_directories(rune_catalog_replication_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_catalog_replication_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
+        gtest_discover_tests(rune_catalog_replication_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
 
         # Leader-epoch monotonicity across restarts (Kafka parity): full cold
         # restart, single-node restart, stale same-epoch tail on a follower.

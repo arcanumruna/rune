@@ -303,6 +303,12 @@ void BrokerNode::start() {
         throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
                                  "]: refusing to start — " + *err);
     }
+    // Catalog history Task 6: the __catalog plane's stream (programmatic configs
+    // bypass parseNodeConfig's check).
+    if (auto err = config_.validateCatalogStream(); err.has_value()) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) +
+                                 "]: refusing to start — " + *err);
+    }
     // F15 S3 (design note §6, review S3 I-1): a worker return-ring claim
     // exception is an invariant-violation halt, so the return ring size is a
     // correctness setting — its max message must hold the largest batch any
@@ -2507,6 +2513,12 @@ void BrokerNode::buildGateway() {
                     for (int32_t t : {-1, -2})
                         if (replicaRegistry_ && replicaRegistry_->lookup(t, 0) != nullptr)
                             coord.push_back(rune::metadata::PartitionKey{t, 0});
+                    // Catalog history Task 6 (ruling 7): __catalog is on the same
+                    // controller-ISR path — replicas = every broker, leader elected
+                    // only from ISR ∩ live (never unclean).  Its replica is built
+                    // by buildCatalog_ (admin-owned, never in replicaRegistry_);
+                    // a broker without it never starts, so it always exists.
+                    coord.push_back(rune::metadata::PartitionKey{kCatalogTopicId, kCatalogPartition});
                     if (!coord.empty()) {
                         metadataService_->setCoordinatorPartitions(std::move(coord), balancerNodes);
                         if (replBridge_) replBridge_->setCoordinatorPartitionsOnController(true);
@@ -2964,8 +2976,119 @@ std::string BrokerNode::leaderClientEndpointFor_(const LeaderSnapshot& v) const 
 //          (seam for Task 8 gateway routing; for Task 6: no-op / discarded)
 //   6. Construct AdminWorkerAgent + AdminWorkerRunner (dedicated thread).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// BrokerNode::buildCatalog_ — catalog history Task 6 (spec §3, §5.6, ruling 7).
+//
+//   1. dataDir/__catalog + a recovered disk Log (never InMemoryLog).
+//   2. The replica: makeCatalogPartitionConfig, Follower at epoch 0, replicas =
+//      ISR seed = every broker.  Multi-node: its transport is a dedicated
+//      replication PLANE (a WorkerReplicationTransport built exactly like a
+//      legacy per-worker plane) on stream catalogReplStreamId over this node's
+//      replication channel, attached to the node client, its re-add broker on
+//      replTransport_ — polled ONLY by the admin thread.  Single node (or no
+//      replication transport): a NullPartitionTransport.
+//   3. NOT added to replicaRegistry_ (RULING-2 A: admin-owned); the bridge
+//      relays its committed assignment on the admin role ring, and its AlterIsr
+//      travels admin→control (AdminIsrChannel, wired once the agent exists).
+// Any failure throws: a broker never starts without its catalog.
+// ---------------------------------------------------------------------------
+void BrokerNode::buildCatalog_() {
+    namespace rr = rune::replication;
+    const fs::path dir = fs::path{config_.dataDir} / "__catalog";
+    fs::create_directories(dir);
+    catalogLog_ = std::make_unique<rune::storage::Log>(dir.string(), config_.offsetLogSegmentRollBytes);
+    catalogLog_->recover();
+    // Never compacted / retention-deleted: a recovered catalog always starts at
+    // 0 — a follower can never be "below the leader's start".  Anything else is
+    // a damaged (or foreign) directory: refuse loudly instead of serving it.
+    if (catalogLog_->logStartOffset() != 0) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __catalog at " +
+                                 dir.string() + " starts at offset " +
+                                 std::to_string(catalogLog_->logStartOffset()) +
+                                 " — the catalog is never truncated at the front; refusing to start");
+    }
+
+    std::vector<rr::NodeId> allNodeIds;
+    allNodeIds.reserve(config_.peers.size());
+    for (const auto& peer : config_.peers) allNodeIds.push_back(static_cast<rr::NodeId>(peer.id));
+    if (allNodeIds.size() > static_cast<std::size_t>(AdminRoleMsg::kMaxIsr)) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __catalog is replicated "
+                                 "to every broker; " + std::to_string(allNodeIds.size()) +
+                                 " brokers exceed the replica bound " + std::to_string(AdminRoleMsg::kMaxIsr));
+    }
+
+    // Ruling 7: multi-node with a controller channel → the controller-ISR path.
+    catalogOnController_ = !config_.isSingleNode() && replTransport_ != nullptr;
+    if (catalogOnController_ && !metadataService_) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __catalog needs the "
+                                 "controller (MetadataService failed to build) — refusing to start");
+    }
+
+    rr::PartitionTransport* transport = nullptr;
+    if (catalogOnController_) {
+        std::vector<std::pair<rr::NodeId, std::string>> replPeers;
+        replPeers.reserve(config_.peers.size());
+        for (const auto& peer : config_.peers) {
+            if (peer.id == config_.nodeId || peer.replicationPort == 0) continue;
+            replPeers.push_back({static_cast<rr::NodeId>(peer.id), peer.replicationChannel()});
+        }
+        const std::string inbound = config_.selfReplicationBindChannel();
+        if (!aeron_ || inbound.empty() || replPeers.size() + 1 != allNodeIds.size()) {
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __catalog replication "
+                                     "plane needs the node client and a replication port on every broker "
+                                     "(peers with one: " + std::to_string(replPeers.size()) + " of " +
+                                     std::to_string(allNodeIds.size() - 1) + ") — refusing to start");
+        }
+        const int32_t streamId = config_.catalogReplStreamId;
+        catalogPlane_ = std::make_unique<rr::WorkerReplicationTransport>(
+            /*workerId (diagnostic: the admin plane)=*/-1, inbound, streamId,
+            rr::WorkerReplicationTransport::DeferredAttach{});
+        // DR-15: resolution events for the ADMIN thread (the plane's owner); its
+        // post-startup re-adds go through the control thread (it rides the node
+        // client), exactly like a legacy per-worker plane.
+        if (resolverHub_) catalogPlane_->attachResolution(resolverHub_->subscribeOwner());
+        catalogAddBroker_ = std::make_unique<rr::PubAddBroker>(replPeers, streamId);
+        replTransport_->addPubAddBroker(catalogAddBroker_.get());
+        catalogPlane_->setAddBroker(catalogAddBroker_.get());
+        (void)catalogPlane_->attach(aeron_, replPeers, streamId);
+        if (!catalogPlane_->resolved()) {
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __catalog replication "
+                                     "plane inbound did not resolve (stream=" + std::to_string(streamId) +
+                                     ") — refusing to start with an unreplicated catalog");
+        }
+        transport = catalogPlane_.get();
+    } else {
+        if (!config_.isSingleNode()) {
+            spdlog::error("BrokerNode[{}]: multi-node without a replication transport — __catalog is NOT "
+                          "replicated and can never reach its majority minIsr ({}): catalog writes will "
+                          "be refused", config_.nodeId, catalogMinIsr(allNodeIds.size()));
+        }
+        nullTransports_.push_back(std::make_unique<rr::NullPartitionTransport>());
+        transport = nullTransports_.back().get();
+    }
+
+    catalogReplica_ = std::make_unique<rr::PartitionReplica>(
+        makeCatalogPartitionConfig(config_, allNodeIds.size()), rr::Role::Follower, /*epoch=*/0,
+        allNodeIds, allNodeIds, catalogLog_.get(), transport);
+    // KIP-903 / E2 C1 residual N1: the same process identities every replica of
+    // this process carries (ReplicaRegistry::add stamps registry replicas).
+    if (replicaRegistry_ && replicaRegistry_->processIncarnation() != 0)
+        catalogReplica_->setProcessIncarnation(replicaRegistry_->processIncarnation());
+    if (lifecycleNonce_ != 0) catalogReplica_->setLineageIdentity(lifecycleNonce_);
+
+    spdlog::info("BrokerNode[{}]: __catalog built at {} (LEO={}, minIsr={}, {}, role from {})",
+                 config_.nodeId, dir.string(), catalogLog_->logEndOffset(),
+                 catalogMinIsr(allNodeIds.size()),
+                 catalogPlane_ ? "replicated on stream " + std::to_string(config_.catalogReplStreamId)
+                               : std::string("single node"),
+                 catalogOnController_ ? "the controller (ISR-elected, never unclean)" : "the consensus leader");
+}
+
 void BrokerNode::buildAdminWorker() {
     const int32_t nodeId = config_.nodeId;
+    // Catalog history Task 6: the __catalog partition first, OUTSIDE the admin
+    // block's catch — a broker without its catalog never starts.
+    buildCatalog_();
     try {
         const fs::path schemaDir = fs::path{config_.dataDir} / "__topic_schemas";
         fs::create_directories(schemaDir);
@@ -3445,7 +3568,19 @@ void BrokerNode::buildAdminWorker() {
         adminWorkerAgent_ = std::make_unique<AdminWorkerAgent>(
             *schemaRegistry_, schemaReplica_.get(), config_.nodeId,
             std::move(replicaSetIds), std::move(deps),
-            viewsReplica_.get(), viewRegistry_.get());
+            viewsReplica_.get(), viewRegistry_.get(),
+            catalogReplica_.get(), catalogPlane_.get());
+
+        // Catalog history Task 6: wire the __catalog replica's controller path
+        // before any thread drives it.  ISR proposals → the admin→control ring
+        // (never replTransport_, which the control thread owns); its committed
+        // role ← the bridge, on the admin role ring (the control thread is that
+        // ring's single producer, as for the schema role below).
+        if (catalogOnController_) {
+            catalogReplica_->setIsrChannel(&adminWorkerAgent_->catalogIsrChannel());
+            if (replBridge_) replBridge_->setCatalogRoleRing(&adminWorkerAgent_->roleRing());
+            replTransport_->setForeignAlterIsrResponseHandler(&BrokerNode::onCatalogAlterIsrResponseThunk_, this);
+        }
 
         // Dedicated thread (separate from gateway and produce workers).
         // D2 round 2: shard mode parks without yields (NodeConfig::adminIdleShape); legacy: Agrona defaults.
@@ -3481,6 +3616,43 @@ void BrokerNode::buildAdminWorker() {
         viewsReplica_.reset();
         viewsLog_.reset();
     }
+    // Catalog history Task 6: the catalog has no other driver than the admin
+    // thread — no admin worker means an undriven catalog: never start so.
+    if (catalogReplica_ && !adminWorkerAgent_) {
+        throw std::runtime_error("BrokerNode[" + std::to_string(nodeId) + "]: the admin worker failed to "
+                                 "build — the __catalog replica would have no driver; refusing to start");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Catalog history Task 6 — control-thread halves of the catalog ISR relay.
+// ---------------------------------------------------------------------------
+void BrokerNode::forwardCatalogAlterIsr_(const uint8_t* p, std::size_t n) {
+    rune::replication::AlterIsrMsg m{};
+    if (!decodeCatalogAlterIsr(p, n, m) || m.topicId != kCatalogTopicId) [[unlikely]] {
+        if (adminToControlRejects_++ % 1024 == 0)
+            spdlog::error("BrokerNode[{}]: malformed __catalog AlterIsr frame (len={}) skipped (rejects={})",
+                          config_.nodeId, n, adminToControlRejects_);
+        return;
+    }
+    // A refused send (outbound ring full) is counted; the replica re-sends its
+    // proposal on its kAlterIsrResendNs cadence (it never assumes delivery).
+    if (!replTransport_ || !replTransport_->sendAlterIsr(m)) [[unlikely]] {
+        if (catalogAlterIsrRefused_++ % 1024 == 0)
+            spdlog::warn("BrokerNode[{}]: __catalog AlterIsr refused by the controller channel ({}) — "
+                         "the replica re-sends it (refused so far: {})", config_.nodeId,
+                         replTransport_ ? "outbound ring full" : "no transport", catalogAlterIsrRefused_);
+    }
+}
+
+bool BrokerNode::onCatalogAlterIsrResponseThunk_(void* self,
+                                                 const rune::replication::AlterIsrResponseMsg& r) noexcept {
+    auto* node = static_cast<BrokerNode*>(self);
+    if (r.topicId != kCatalogTopicId || r.partition != kCatalogPartition) return true;   // not ours: as before
+    if (!node->adminWorkerAgent_) return true;
+    // Verbatim (every field, leaderId included — the E2 shard-mode lesson).
+    // false = role ring full → the transport re-delivers it (never dropped).
+    return encodeCatalogAlterIsrResponse(node->adminWorkerAgent_->roleRing(), r);
 }
 
 // ---------------------------------------------------------------------------
@@ -3559,6 +3731,8 @@ void BrokerNode::stop() {
         adminWorkerRunner_->stopAndJoin();
         spdlog::info("BrokerNode[{}]: AdminWorker thread stopped", config_.nodeId);
     }
+    // Catalog history Task 6: no admin-thread test task waits forever.
+    if (adminWorkerAgent_) adminWorkerAgent_->skipQueuedAdminThreadTestTasks();
     // NOTE (Task 8a): do NOT reset adminWorkerAgent_ here.  The gateway holds it
     // as adminSink_ and the NodeRuntimeAgent's admin control hook captures it;
     // both run on the MAIN agent runner, which is still live at this point.  We
@@ -3642,6 +3816,11 @@ void BrokerNode::stop() {
     // viewRegistry_ is kept for the same reason (viewRegistryForTest after stop()).
     viewsReplica_.reset();    // admin-thread-owned only (RULING-2 A) — not in replicaRegistry_
     viewsLog_.reset();        // Log for __views (file flush on dtor)
+    // Catalog history Task 6: the admin thread is joined and the agent gone —
+    // the replica (holds the plane + log pointers) goes; the Log stays readable
+    // after stop() (catalogLogForTest's contract: quiesced) and is freed with
+    // the node (file flush on dtor), like schemaRegistry_.
+    catalogReplica_.reset();
     // TX-3: destroy txn state store before replicaRegistry_ (holds raw ptr to txn replica).
     txnState_.reset();        // ReplicatedTxnStateStore (holds raw ptr to txn replica in registry)
     txnReplica_.reset();      // no-op: ownership transferred to replicaRegistry_ in buildGateway
@@ -3666,6 +3845,10 @@ void BrokerNode::stop() {
     // undelivered publication (resolved by the control thread after the worker
     // stopped) — release it while the node client is alive (before aeron_.reset()).
     legacyPlaneBrokers_.clear();
+    // Catalog history Task 6: the __catalog plane (inbound sub + peer pubs on
+    // the node client) and its add broker, while the client is alive.
+    catalogPlane_.reset();
+    catalogAddBroker_.reset();
     // Per-worker ingress/egress deregister from their client while it is alive
     // (legacy: the node client; shard: the worker's own client).
     workerIngresses_.clear();
@@ -3835,6 +4018,26 @@ int BrokerNode::serviceAdminControl_() {
         }
         // else: ring full (impossible for 1-deep role churn) → retry next cycle
     }
+    // (1a) Catalog history Task 6: single node (no controller path) — the
+    //      __catalog role follows the consensus leader exactly as the schema
+    //      role above (ISR = every broker, not controller-managed).  Tracked on
+    //      its own so a full ring retries only this role.  Multi-node, the
+    //      bridge relays the controller's committed (-6, 0) assignment instead.
+    if (!catalogOnController_ && catalogReplica_ &&
+        (leaderNow != catalogLastRole_.leader || epochNow != catalogLastRole_.epoch)) {
+        AdminRoleMsg cm;
+        cm.leader   = leaderNow;
+        cm.epoch    = epochNow;
+        cm.leaderId = static_cast<int32_t>(v.leaderId);
+        if (leaderNow) {
+            for (const auto& peer : config_.peers)
+                if (cm.isrCount < AdminRoleMsg::kMaxIsr) cm.isr[static_cast<std::size_t>(cm.isrCount++)] = peer.id;
+        }
+        if (encodeAdminRole(agent->roleRing(), cm, kMsgCatalogRole)) {
+            catalogLastRole_ = PostedRole{leaderNow, epochNow};
+            ++work;
+        }
+    }
 
     // (1b) admin → control ring (F3 round 6/7, ported into T11's direct-call
     //      control plane):
@@ -3854,6 +4057,12 @@ int BrokerNode::serviceAdminControl_() {
             // thread is the single producer of each worker channel's install ring).
             if (tid == kA2cViewPlanUpdate) {
                 fanoutViewPlan_(decodeViewPlanUpdate(p, n));
+                return;
+            }
+            // Catalog history Task 6: the __catalog replica's AlterIsr → the
+            // controller channel (this thread owns replTransport_).
+            if (tid == kA2cCatalogAlterIsr) {
+                forwardCatalogAlterIsr_(p, n);
                 return;
             }
             // B10 / D4 fix round 1: the topic's catalog record committed — this

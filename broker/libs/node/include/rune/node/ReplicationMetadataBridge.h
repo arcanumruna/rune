@@ -54,9 +54,14 @@
 //   The bridge runs entirely on the duty-cycle thread.  MetadataService::doWork()
 //   also runs on the duty-cycle thread (NodeRuntimeAgent step 2b).  Both access
 //   the MSM's committed map on the SAME thread → single-threaded access → no races.
-//   The observedEpoch_ / observedIsLeader_ atomics are only for cross-thread reads
-//   by external observers (not modified by other threads during doWork).
+//   No cross-thread mirror (fix-on-sight, catalog history Task 6 — hard rule 1:
+//   the former observedEpoch_ / observedIsLeader_ atomics are gone): observers
+//   read isLeader() / lastEpoch() ON the control thread (BrokerNode's
+//   replicationIsLeaderForTest / replicationEpochForTest post a control task).
 
+#include <rune/node/AdminChannels.h>      // AdminRoleMsg (catalog history Task 6)
+#include <rune/node/CatalogPartition.h>   // kCatalogTopicId
+#include <rune/node/OneToOneByteRing.h>
 #include <rune/node/ReplicaRegistry.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/replication/Types.h>
@@ -66,11 +71,11 @@
 #include <rune/metadata/PartitionAssignment.h>
 #include <rune/metadata/MetadataStateMachine.h>
 
-#include <atomic>
 #include <deque>
 #include <string>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <vector>
 
 namespace rune::node {
@@ -152,6 +157,18 @@ public:
     /// BrokerNode turns it on multi-node.  Duty-cycle thread.
     void setCoordinatorPartitionsOnController(bool on) noexcept { coordinatorOnController_ = on; }
 
+    /// Catalog history Task 6: the __catalog replica (-6, 0) is ADMIN-thread-
+    /// owned (never in the registry).  On the controller path its committed
+    /// assignment is relayed as an AdminRoleMsg{leader, epoch = leaderEpoch,
+    /// leaderId, isr, partitionEpoch} (kMsgCatalogRole) on the admin role ring —
+    /// never a direct becomeLeader/becomeFollower call.  This thread (control) is
+    /// that ring's single producer.  A full ring (or a ring not wired yet) keeps
+    /// the role PENDING (one slot: a newer committed role supersedes it — roles
+    /// are absolute) and retries every cycle, never dropped.  Duty-cycle thread.
+    void setCatalogRoleRing(OneToOneByteRing* ring) noexcept { catalogRoleRing_ = ring; }
+    [[nodiscard]] bool catalogRolePendingForTest() const noexcept { return catalogRolePending_.has_value(); }
+    [[nodiscard]] uint64_t catalogRolesPostedForTest() const noexcept { return catalogRolesPosted_; }
+
     // -----------------------------------------------------------------------
     // doWork — single duty-cycle step.
     //
@@ -185,6 +202,7 @@ public:
         // (back-pressure / full ring) are retried every cycle, in order, until
         // delivered — never silently dropped.  Time-independent (no timers).
         int work = flushPendingRoleOps_();
+        if (catalogRolePending_) [[unlikely]] work += flushCatalogRole_();
 
         // ── Step A: INTERNAL partitions ──────────────────────────────────────
         // Drive internal partitions (topicId < 0) from cluster-consensus
@@ -220,12 +238,6 @@ public:
                 anyInternalFlip = true;
             }
 
-            // Update the atomic mirrors after internal-partition transitions.
-            // Both stores use release so observer threads that acquire-load
-            // isLeaderAtomic() / lastEpochAtomic() see the effects.
-            observedEpoch_.store(lastObservedEpoch_, std::memory_order_relaxed);
-            observedIsLeader_.store(selfIsClusterLeader, std::memory_order_release);
-
             if (anyInternalFlip) {
                 work += 1;
             }
@@ -253,19 +265,6 @@ public:
     /// The last observed cluster epoch (= leadershipTermId from consensus).
     [[nodiscard]] rune::replication::Epoch lastEpoch() const noexcept {
         return lastObservedEpoch_;
-    }
-
-    /// True if this node is currently the cluster leader (from the bridge's perspective).
-    /// Observer-thread-safe: uses the atomic observedIsLeader_ mirror.
-    [[nodiscard]] bool isLeaderAtomic() const noexcept {
-        return observedIsLeader_.load(std::memory_order_acquire);
-    }
-
-    /// The last cluster epoch applied to replicas.
-    /// Observer-thread-safe: acquire-load pairs with the release-store in doWork().
-    [[nodiscard]] rune::replication::Epoch lastEpochAtomic() const noexcept {
-        (void)observedIsLeader_.load(std::memory_order_acquire);
-        return observedEpoch_.load(std::memory_order_relaxed);
     }
 
     /// True if this node is currently the cluster leader (from the bridge's perspective).
@@ -444,6 +443,10 @@ private:
         const rune::metadata::PartitionKey& key,
         const rune::metadata::AssignmentMap& currentMap) noexcept
     {
+        if (key.topicId == kCatalogTopicId) {   // Task 6: admin-owned — relay on the role ring
+            if (const auto* pa = currentMap.get(key.topicId, key.partition)) postCatalogRole_(true, pa);
+            return;
+        }
         auto* replica = registry_.lookup(key.topicId, key.partition);
         if (!replica) return;
 
@@ -468,6 +471,10 @@ private:
         const rune::metadata::PartitionKey& key,
         const rune::metadata::AssignmentMap& currentMap) noexcept
     {
+        if (key.topicId == kCatalogTopicId) {   // Task 6: admin-owned — relay on the role ring
+            postCatalogRole_(false, currentMap.get(key.topicId, key.partition));
+            return;
+        }
         auto* replica = registry_.lookup(key.topicId, key.partition);
         if (!replica) return;
 
@@ -531,7 +538,18 @@ private:
     // Fields
     // -----------------------------------------------------------------------
 
-    [[nodiscard]] static constexpr bool isCoordinatorTopic_(int32_t t) noexcept { return t == -1 || t == -2; }
+    // F26: __catalog (-6) is on the controller-ISR path with the coordinator
+    // partitions — otherwise mapDriven_ never forwards its assignment.
+    [[nodiscard]] static constexpr bool isCoordinatorTopic_(int32_t t) noexcept {
+        return t == -1 || t == -2 || t == kCatalogTopicId;
+    }
+    // Catalog history Task 6 (see setCatalogRoleRing).  Defined in the .cpp.
+    void postCatalogRole_(bool leader, const rune::metadata::PartitionAssignment* pa) noexcept;
+    int  flushCatalogRole_() noexcept;
+    OneToOneByteRing*                              catalogRoleRing_    = nullptr;
+    std::optional<AdminRoleMsg>                    catalogRolePending_;
+    uint64_t                                       catalogRolesPosted_ = 0;
+    uint64_t                                       catalogRolesHeld_   = 0;
     [[nodiscard]] bool mapDriven_(int32_t t) const noexcept {
         return t >= 0 || (coordinatorOnController_ && isCoordinatorTopic_(t));
     }
@@ -560,11 +578,6 @@ private:
     rune::consensus::NodeId    lastObservedLeaderId_ = -1;
     rune::replication::Epoch   lastObservedEpoch_    = 0;
 
-    // Observer-thread-safe atomic mirrors.
-    // observedEpoch_ is relaxed-stored before observedIsLeader_ is release-stored;
-    // a reader that acquire-loads observedIsLeader_ will see the relaxed store.
-    std::atomic<rune::replication::Epoch> observedEpoch_{0};
-    std::atomic<bool>                     observedIsLeader_{false};
 };
 
 } // namespace rune::node

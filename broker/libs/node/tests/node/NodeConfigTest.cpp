@@ -3090,3 +3090,56 @@ TEST(NodeConfigRegression, TopicsErrorMessagesEscapeTheRawEntryRegression) {
         EXPECT_EQ(r.error.find('\x1b'), std::string::npos) << "raw control byte in: " << r.error;
     }
 }
+
+// ===========================================================================
+// Catalog history Task 6: RUNE_CATALOG_REPL_STREAM_ID (the __catalog plane's
+// stream on the replication channel) — default 30; distinct from the
+// replication stream and outside the per-worker replication range.
+// ===========================================================================
+TEST(NodeConfigCatalogStream, DefaultsToThirty) {
+    auto res = rune::node::parseNodeConfig(rune::node::fakeEnv(rune::node::base3node()));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->catalogReplStreamId, 30);
+    EXPECT_FALSE(res.config->validateCatalogStream().has_value());
+}
+
+TEST(NodeConfigCatalogStream, EnvOverride) {
+    auto env = rune::node::base3node();
+    env["RUNE_CATALOG_REPL_STREAM_ID"] = "4242";
+    auto res = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->catalogReplStreamId, 4242);
+}
+
+TEST(NodeConfigCatalogStream, NonIntegerIsAnError) {
+    auto env = rune::node::base3node();
+    env["RUNE_CATALOG_REPL_STREAM_ID"] = "thirty";
+    auto res = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+    EXPECT_FALSE(res.config.has_value());
+    EXPECT_NE(res.error.find("RUNE_CATALOG_REPL_STREAM_ID"), std::string::npos) << res.error;
+}
+
+TEST(NodeConfigCatalogStreamRegression, EqualToTheReplicationStreamIsRefused) {
+    auto env = rune::node::base3node();
+    env["RUNE_REPLICATION_STREAM_ID"] = "30";
+    auto res = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+    EXPECT_FALSE(res.config.has_value()) << "the catalog plane would share the replication stream";
+    EXPECT_NE(res.error.find("RUNE_CATALOG_REPL_STREAM_ID"), std::string::npos) << res.error;
+}
+
+TEST(NodeConfigCatalogStreamRegression, InsideThePerWorkerReplicationRangeIsRefused) {
+    auto env = rune::node::base3node();
+    env["RUNE_REPL_BASE_STREAM_ID"] = "28";
+    env["RUNE_WORKERS"] = "4";   // [28, 31] contains 30
+    auto res = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+    EXPECT_FALSE(res.config.has_value()) << "the catalog plane would share worker 2's stream";
+    EXPECT_NE(res.error.find("per-worker replication range"), std::string::npos) << res.error;
+    // Just outside the range: accepted.
+    env["RUNE_REPL_BASE_STREAM_ID"] = "31";
+    auto ok = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
+    ASSERT_TRUE(ok.config.has_value()) << ok.error;
+    // Programmatic configs: the same rule (BrokerNode re-checks at start).
+    rune::node::NodeConfig nc = *ok.config;
+    nc.catalogReplStreamId = 32;
+    EXPECT_TRUE(nc.validateCatalogStream().has_value());
+}

@@ -315,6 +315,16 @@ public:
     void setNodeControlResponseHandler(NodeControlResponseHandler fn, void* ctx) noexcept {
         nodeControlRespHandler_ = fn; nodeControlRespCtx_ = ctx;
     }
+    /// CONTROL thread (catalog history Task 6): the controller's answer for an
+    /// INTERNAL partition whose replica is NOT registered here because another
+    /// thread owns it (the admin-owned __catalog).  The handler relays it to the
+    /// owner on a ring; false = that ring is full → the fragment is left
+    /// unconsumed (ABORT, re-delivered next poll — never dropped).  Unset (or no
+    /// owner claims it): the answer is dropped as before (the replica re-sends).
+    using ForeignAlterIsrResponseHandler = bool (*)(void* ctx, const AlterIsrResponseMsg& resp) noexcept;
+    void setForeignAlterIsrResponseHandler(ForeignAlterIsrResponseHandler fn, void* ctx) noexcept {
+        foreignAlterIsrRespHandler_ = fn; foreignAlterIsrRespCtx_ = ctx;
+    }
 
     // -----------------------------------------------------------------------
     // D9: cross-node transaction markers (cold control traffic).
@@ -590,6 +600,8 @@ private:
     void*                                  alterIsrCtx_     = nullptr;
     NodeControlResponseHandler             nodeControlRespHandler_ = nullptr;  ///< control thread
     void*                                  nodeControlRespCtx_     = nullptr;
+    ForeignAlterIsrResponseHandler         foreignAlterIsrRespHandler_ = nullptr;  ///< control thread (Task 6)
+    void*                                  foreignAlterIsrRespCtx_     = nullptr;
     WriteTxnMarkerHandler                  txnMarkerHandler_     = nullptr;  ///< control thread (D9)
     WriteTxnMarkerResponseHandler          txnMarkerRespHandler_ = nullptr;
     void*                                  txnMarkerCtx_         = nullptr;

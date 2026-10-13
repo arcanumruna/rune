@@ -236,6 +236,26 @@ std::optional<std::string> NodeConfig::validateStreamRanges() const {
 }
 
 // ---------------------------------------------------------------------------
+// NodeConfig::validateCatalogStream  (catalog history Task 6)
+// ---------------------------------------------------------------------------
+std::optional<std::string> NodeConfig::validateCatalogStream() const {
+    if (catalogReplStreamId == replicationStreamId) {
+        return "RUNE_CATALOG_REPL_STREAM_ID=" + std::to_string(catalogReplStreamId) +
+               " equals RUNE_REPLICATION_STREAM_ID (the __catalog plane needs its own stream "
+               "on the replication channel)";
+    }
+    const int32_t count = workerCount >= 1 ? workerCount : 1;
+    if (catalogReplStreamId >= replBaseStreamId &&
+        static_cast<int64_t>(catalogReplStreamId) < static_cast<int64_t>(replBaseStreamId) + count) {
+        return "RUNE_CATALOG_REPL_STREAM_ID=" + std::to_string(catalogReplStreamId) +
+               " lies in the per-worker replication range [" + std::to_string(replBaseStreamId) + ", " +
+               std::to_string(static_cast<int64_t>(replBaseStreamId) + count - 1) +
+               "] (RUNE_REPL_BASE_STREAM_ID + RUNE_WORKERS)";
+    }
+    return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
 // Self-contained worker shards (spec §3.3): per-worker channels + validation
 // ---------------------------------------------------------------------------
 
@@ -608,6 +628,14 @@ ConfigResult parseNodeConfig(
             return {{}, std::string("RUNE_REPL_BASE_STREAM_ID is not a valid integer: ") + rawReplBase};
     }
 
+    // --- RUNE_CATALOG_REPL_STREAM_ID (optional, default 30) — catalog history Task 6 ---
+    int32_t catalogReplStreamId = 30;
+    const char* rawCatalogStream = getenv_fn("RUNE_CATALOG_REPL_STREAM_ID");
+    if (rawCatalogStream && !std::string_view(rawCatalogStream).empty()) {
+        if (!parseInt32(rawCatalogStream, catalogReplStreamId))
+            return {{}, std::string("RUNE_CATALOG_REPL_STREAM_ID is not a valid integer: ") + rawCatalogStream};
+    }
+
     // --- Election timing (optional, positive ms, env-overridable) ---
     // Defaults set in NodeConfig field initializers; only override if env var present.
     NodeConfig cfg;
@@ -624,6 +652,7 @@ ConfigResult parseNodeConfig(
                                       : std::string("aeron:udp?endpoint=") + rawClient;
     cfg.clientEndpoint.streamId = clientStreamId;
     cfg.replBaseStreamId        = replBaseStreamId;
+    cfg.catalogReplStreamId     = catalogReplStreamId;
     // RUNE_AERON_DIR (optional): Aeron dir override (empty → dataDir/aeron).
     if (const char* ad = getenv_fn("RUNE_AERON_DIR")) cfg.aeronDir = ad;
     if (auto err = cfg.validateAeronDir()) return {{}, *err};
@@ -1532,6 +1561,9 @@ ConfigResult parseNodeConfig(
             }
         }
     }
+
+    // Catalog history Task 6: after RUNE_WORKERS (the per-worker range) is known.
+    if (auto err = cfg.validateCatalogStream()) return {{}, *err};
 
     return {std::move(cfg), {}, std::move(warnings)};
 }

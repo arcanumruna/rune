@@ -7,6 +7,7 @@
 
 #include <rune/node/ReplicationMetadataBridge.h>
 
+#include <algorithm>
 #include <cassert>
 #include <rune/node/WorkerPool.h>
 
@@ -193,6 +194,52 @@ int ReplicationMetadataBridge::flushPendingRoleOps_() noexcept
     }
     if (pendingRoleOpsTotal_ == 0) pendingWarnAt_ = 64;
     return delivered;
+}
+
+// ---------------------------------------------------------------------------
+// Catalog history Task 6: the __catalog role relay (control thread → admin).
+// ---------------------------------------------------------------------------
+void ReplicationMetadataBridge::postCatalogRole_(bool leader,
+                                                 const rune::metadata::PartitionAssignment* pa) noexcept
+{
+    AdminRoleMsg m;
+    m.leader         = leader;
+    m.epoch          = pa ? pa->leaderEpoch : 0;
+    m.leaderId       = pa ? pa->leaderNode : rune::metadata::NO_LEADER;
+    m.partitionEpoch = pa ? pa->partitionEpoch : -1;
+    if (leader && pa) {
+        // Bounded by construction: replicas = every broker <= kMaxReplicas (16).
+        const std::size_t n = std::min<std::size_t>(pa->isr.size(), AdminRoleMsg::kMaxIsr);
+        if (n < pa->isr.size()) [[unlikely]]
+            spdlog::error("ReplicationMetadataBridge: __catalog ISR of {} members exceeds {} — "
+                          "truncated (configuration beyond the replica bound)",
+                          pa->isr.size(), AdminRoleMsg::kMaxIsr);
+        m.isrCount = static_cast<int32_t>(n);
+        for (std::size_t i = 0; i < n; ++i) m.isr[i] = pa->isr[i];
+    }
+    if (catalogRolePending_) {          // keep order: the newer absolute role supersedes the held one
+        catalogRolePending_ = m;
+        return;
+    }
+    if (catalogRoleRing_ != nullptr && encodeAdminRole(*catalogRoleRing_, m, kMsgCatalogRole)) {
+        ++catalogRolesPosted_;
+        return;
+    }
+    catalogRolePending_ = m;
+    if (catalogRolesHeld_++ % 1024 == 0)
+        spdlog::warn("ReplicationMetadataBridge: __catalog role (leader={} epoch={} leaderId={}) held — "
+                     "admin role ring {}; retried every cycle (held so far: {})",
+                     m.leader, m.epoch, m.leaderId,
+                     catalogRoleRing_ ? "full" : "not wired yet", catalogRolesHeld_);
+}
+
+int ReplicationMetadataBridge::flushCatalogRole_() noexcept
+{
+    if (!catalogRolePending_ || catalogRoleRing_ == nullptr) return 0;
+    if (!encodeAdminRole(*catalogRoleRing_, *catalogRolePending_, kMsgCatalogRole)) return 0;
+    catalogRolePending_.reset();
+    ++catalogRolesPosted_;
+    return 1;
 }
 
 } // namespace rune::node

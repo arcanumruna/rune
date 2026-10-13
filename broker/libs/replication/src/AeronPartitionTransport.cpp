@@ -388,8 +388,10 @@ bool AeronPartitionTransport::sendAlterIsrResponse(NodeId toLeader, const AlterI
     const std::size_t len = msg.encode(wire, sizeof wire);
     if (len == 0) return false;
     if (toLeader == static_cast<NodeId>(selfId_)) {   // controller == leader: local
-        (void)handleFrame_(wire, len);
-        return true;
+        // Catalog history Task 6: a local answer the owner's relay ring could not
+        // take (ABORT) is REFUSED, not reported delivered — the caller retries it
+        // (the MetadataService outbox) or the leader re-sends its proposal.
+        return handleFrame_(wire, len) != aeron::ControlledPollAction::ABORT;
     }
     return enqueueOutbound(static_cast<int32_t>(toLeader), wire, len);
 }
@@ -735,7 +737,14 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         if (r.topicId < 0) {
             // A coordinator partition (controller-ISR path, re-review MEDIUM-B):
             // internal replicas are driven on this (control) thread.
-            if (PartitionReplica* rep = resolveReplica_(r.topicId, r.partition)) rep->onAlterIsrResponse(r);
+            if (PartitionReplica* rep = resolveReplica_(r.topicId, r.partition)) {
+                rep->onAlterIsrResponse(r);
+            } else if (foreignAlterIsrRespHandler_ != nullptr &&
+                       !foreignAlterIsrRespHandler_(foreignAlterIsrRespCtx_, r)) {
+                // Catalog history Task 6: an admin-owned replica's answer whose
+                // relay ring is full — re-delivered next poll, never dropped.
+                return Action::ABORT;
+            }
             return Action::CONTINUE;
         }
         if (workerPool_) {

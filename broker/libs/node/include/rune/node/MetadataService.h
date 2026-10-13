@@ -49,7 +49,8 @@
 //     use this to detect bad config in tests or monitoring.
 //
 // USER topics (topicId >= 0) are assigned by the balancers.  Multi-node, the
-// COORDINATOR partitions (__consumer_offsets=-1, __transaction_state=-2) are
+// COORDINATOR partitions (__consumer_offsets=-1, __transaction_state=-2) and
+// __catalog (-6, catalog history Task 6) are
 // assigned by this controller too (re-review MEDIUM-B, see
 // decideCoordinatorPartition).  __cluster_metadata (-3) follows cluster
 // leadership and is NOT assigned.
@@ -184,8 +185,12 @@ public:
     // caught up, and the next tick moves leadership here.  Multi-node only
     // (BrokerNode); single-node keeps the consensus-driven path.
     // -----------------------------------------------------------------------
-    [[nodiscard]] static constexpr bool isCoordinatorTopic(int32_t topicId) noexcept {
-        return topicId == -1 || topicId == -2;
+    //
+    // Catalog history Task 6 (ruling 7): __catalog (-6) is on this path too —
+    // replicas = every broker, leader elected only from ISR ∩ live
+    // (allowUnclean = false), the controller preferring itself when in the ISR.
+    [[nodiscard]] static constexpr bool isControllerIsrInternalTopic(int32_t topicId) noexcept {
+        return topicId == -1 || topicId == -2 || topicId == -6;
     }
     /// Enable the controller path for `keys` (replicated on `replicas`).
     void setCoordinatorPartitions(std::vector<rune::metadata::PartitionKey> keys,

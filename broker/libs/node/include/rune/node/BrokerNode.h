@@ -53,6 +53,8 @@
 #include <rune/node/ViewRegistry.h>
 #include <rune/node/AdminWorker.h>
 #include <rune/node/AdminChannels.h>
+#include <rune/node/AdminIsrChannel.h>
+#include <rune/node/CatalogPartition.h>
 #include <rune/node/AdminControlPlane.h>
 #include <rune/node/DdlAnswerGate.h>
 #include <rune/node/SchemaFanout.h>
@@ -210,9 +212,11 @@ public:
                      std::vector<int32_t> replicaSet,
                      AdminDeps deps,
                      rune::replication::PartitionReplica* viewsReplica = nullptr,
-                     ViewRegistry* viewRegistry = nullptr)
+                     ViewRegistry* viewRegistry = nullptr,
+                     rune::replication::PartitionReplica* catalogReplica = nullptr,
+                     rune::replication::WorkerReplicationTransport* catalogPlane = nullptr)
         : worker_(reg, replica, selfId, std::move(replicaSet), std::move(deps),
-                  viewsReplica, viewRegistry)
+                  viewsReplica, viewRegistry, catalogReplica, catalogPlane)
         , requestRing_(kAdminRequestRingBytes)
         , replyRing_(kCreateTopicRingBytes)
         , roleRing_(kAdminRoleRingBytes) {}
@@ -290,12 +294,40 @@ public:
 
         // 1. Drain role events (control → admin) FIRST so leadership is current
         //    before any DDL runs this tick.
-        work += roleRing_.drain([this](int32_t /*tid*/,
+        //    Catalog history Task 6: the same ring carries the __catalog role
+        //    (kMsgCatalogRole) and the controller's AlterIsrResponse for (-6, 0)
+        //    (kMsgCatalogAlterIsrResponse, verbatim) — explicit per-type dispatch;
+        //    a malformed / unknown frame is reported, never applied as another.
+        work += roleRing_.drain([this](int32_t tid,
                                        aeron::concurrent::AtomicBuffer& b,
                                        aeron::util::index_t off,
                                        aeron::util::index_t len) {
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
-            worker_.onRole(decodeAdminRole(p, static_cast<std::size_t>(len)));
+            const auto  n = static_cast<std::size_t>(len);
+            if (tid == kMsgAdminRole) {
+                worker_.onRole(decodeAdminRole(p, n));
+                return;
+            }
+            if (tid == kMsgCatalogRole) {
+                AdminRoleMsg m;
+                if (decodeAdminRole(p, n, m)) worker_.onCatalogRole(m);
+                else reportBadRoleFrame_(tid, n);
+                return;
+            }
+            if (tid == kMsgCatalogAlterIsrResponse) {
+                rune::replication::AlterIsrResponseMsg r{};
+                if (decodeCatalogAlterIsrResponse(p, n, r)) worker_.onCatalogAlterIsrResponse(r);
+                else reportBadRoleFrame_(tid, n);
+                return;
+            }
+            reportBadRoleFrame_(tid, n);
+        }, 16);
+
+        // 1b. Catalog history Task 6: test-only tasks to run on THIS (admin)
+        //     thread (BrokerNode::onAdminThreadForTest).  Empty in production:
+        //     one acquire load.
+        work += testTaskRing_.poll([](int32_t, std::int64_t a, std::int64_t) noexcept {
+            runOwnerThreadTestTask(reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)), nullptr);
         }, 16);
 
         // 2. Drain create-topic replies (control → admin).
@@ -349,7 +381,9 @@ public:
         //    state), which halts the broker.  Signalled once (retried while the
         //    ring is full).
         if (!storageFailureSignalled_) {
+            // Catalog history Task 6: the __catalog log is admin-driven too.
             auto* r = worker_.replica();
+            if (!(r && r->isDiskBacked() && r->log()->storageFailed())) r = worker_.catalogReplica();
             if (r && r->isDiskBacked() && r->log()->storageFailed()) [[unlikely]] {
                 // M3 (Task 10 round 4): the ring's max message is capacity/8;
                 // an over-long path would make write() THROW on this thread.
@@ -510,7 +544,35 @@ public:
 
     AdminWorker& worker() noexcept { return worker_; }
 
+    /// Catalog history Task 6: the __catalog replica's ISR channel (admin →
+    /// control, kA2cCatalogAlterIsr).  BrokerNode wires it as the replica's
+    /// setIsrChannel on the controller-ISR path, before the admin thread starts.
+    AdminIsrChannel& catalogIsrChannel() noexcept { return catalogIsrChannel_; }
+    /// Role-ring frames refused as malformed / of an unknown type.
+    [[nodiscard]] uint64_t badRoleFramesForTest() const noexcept { return badRoleFrames_; }
+
+    /// TEST-ONLY (BrokerNode::onAdminThreadForTest): offer a ring-carried
+    /// OwnerThreadTestTask ref to THIS thread.  Many-to-one ring (any test
+    /// thread may offer, no lock).  false = ring full.
+    [[nodiscard]] bool offerAdminThreadTestTask(void* ref) noexcept {
+        return testTaskRing_.offer(kAdminTestTaskMsgTypeId,
+                                   static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(ref)));
+    }
+    /// Shutdown (after the admin runner was joined): skip every queued test
+    /// task so no test thread waits forever.
+    void skipQueuedAdminThreadTestTasks() noexcept {
+        (void)testTaskRing_.poll([](int32_t, std::int64_t a, std::int64_t) noexcept {
+            skipOwnerThreadTestTask(reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)));
+        });
+    }
+
 private:
+    [[gnu::cold]] [[gnu::noinline]] void reportBadRoleFrame_(int32_t tid, std::size_t n) noexcept {
+        if (badRoleFrames_++ % 1024 == 0)
+            spdlog::error("AdminWorkerAgent: role-ring frame type={} len={} refused (malformed or unknown; "
+                          "refused so far: {})", tid, n, badRoleFrames_);
+    }
+
     AdminWorker      worker_;
     OneToOneByteRing requestRing_;     // gateway/control → admin (DefineTopic/GetSchema)
     OneToOneByteRing replyRing_;       // control → admin (createTopic reply)
@@ -525,6 +587,12 @@ private:
     // admin → control (T10 storage failure + F3 r6 SchemaUpdate).  Sized like
     // the other blob-carrying admin rings so a descriptor fits one message.
     OneToOneByteRing failureRing_{kAdminToControlRingBytes};
+    // Catalog history Task 6: the __catalog replica's AlterIsr → failureRing_
+    // (declared after it: initialised with a reference to it).
+    AdminIsrChannel  catalogIsrChannel_{failureRing_};
+    static constexpr int32_t kAdminTestTaskMsgTypeId = 0x7E58;
+    rune::consensus::ControlRing<4096> testTaskRing_;   // test threads → admin (test-only)
+    uint64_t         badRoleFrames_ = 0;
     bool             storageFailureSignalled_ = false;
     std::vector<SchemaUpdateMsg> schemaBacklog_;   // admin-thread-owned (ring-full retry)
     std::vector<ViewPlanUpdateMsg> viewPlanBacklog_; // Task 19: admin-owned (ring-full retry)
@@ -785,6 +853,41 @@ public:
             topicId, partition, std::forward<F>(f), timeout);
     }
 
+    /// Catalog history Task 6: run `f()` on the ADMIN (AdminWorkerAgent) thread —
+    /// the owner of the __catalog replica, its Log and its plane (and the
+    /// __topic_schemas / __views replicas).  Same contract as
+    /// onOwnerThreadForTest (F9a): the admin thread decides run-or-skip from the
+    /// deadline alone; the caller waits for its decision with no bound of its
+    /// own.  Precondition: node started (admin worker running), not stopped.
+    template <class F>
+    auto onAdminThreadForTest(F&& f, std::chrono::milliseconds timeout = std::chrono::seconds{10}) {
+        using Impl = detail::OwnerThreadTestTaskImpl<std::decay_t<F>, OwnerThreadTestTask::Target::AdminThread>;
+        if (!started_ || stopped_ || !adminWorkerAgent_ || !adminWorkerRunner_) {
+            throw std::logic_error(
+                "onAdminThreadForTest: node is not running or has no admin worker — no admin "
+                "thread to run the task on");
+        }
+        auto task = std::make_shared<Impl>(kCatalogTopicId, kCatalogPartition, std::forward<F>(f),
+                                           OwnerThreadTestTask::Clock::now() + timeout);
+        auto* ref = new OwnerThreadTestTaskRef(task);   // the ring's reference
+        if (!adminWorkerAgent_->offerAdminThreadTestTask(ref)) {
+            delete ref;
+            throw std::runtime_error("onAdminThreadForTest: admin test-task ring full");
+        }
+        return awaitOwnerThreadTestTask(*task, timeout);
+    }
+
+    /// Test-only, ADMIN thread only (call inside onAdminThreadForTest): the
+    /// __catalog replica (null: none built).
+    [[nodiscard]] rune::replication::PartitionReplica* catalogReplicaForTest() const noexcept {
+        return catalogReplica_.get();
+    }
+    /// Test-only: the __catalog Log — ONLY while the admin thread is quiesced
+    /// (before start(), after stop()); otherwise read it inside onAdminThreadForTest.
+    [[nodiscard]] rune::storage::Log* catalogLogForTest() const noexcept { return catalogLog_.get(); }
+    /// Test-only: this node's id (immutable config).
+    [[nodiscard]] int32_t nodeIdForTest() const noexcept { return config_.nodeId; }
+
     /// F1: run `f()` on the CONTROL (NodeRuntimeAgent) thread — for test reads of
     /// control-thread-owned state (e.g. ClientGateway::pendingAckCount()).
     template <class F>
@@ -828,18 +931,26 @@ public:
     /// Test-only, CONTROL thread only: the consensus Election (nullptr when none).
     [[nodiscard]] const rune::consensus::Election* electionForTest() const noexcept { return election_.get(); }
 
-    /// Observer-thread-safe: true if the replication metadata bridge has
-    /// propagated this node's leadership to all its PartitionReplicas.
-    /// Uses the atomic mirror in ReplicationMetadataBridge.
-    bool replicationIsLeaderForTest() const noexcept {
-        return replBridge_ && replBridge_->isLeaderAtomic();
+    /// Test-only: true if the replication metadata bridge has propagated this
+    /// node's leadership to its internal PartitionReplicas.  Read ON the control
+    /// thread (the bridge's owner) — fix-on-sight (catalog history Task 6, hard
+    /// rule 1): no cross-thread atomic mirror.  Not running → false (the
+    /// bridge observed nothing yet / is gone).  Never call it from a task that
+    /// already runs on the control thread.
+    template <class = void>   // instantiated after submitOwnerThreadTestTask_ is defined
+    bool replicationIsLeaderForTest() {
+        if (!started_ || stopped_ || !runtimeAgent_ || !replBridge_) return false;
+        return onControlThreadForTest([this] { return replBridge_ && replBridge_->isLeader(); });
     }
 
-    /// Observer-thread-safe: the last epoch applied by the replication bridge.
-    /// Uses the atomic mirror in ReplicationMetadataBridge.
-    rune::replication::Epoch replicationEpochForTest() const noexcept {
-        if (!replBridge_) return 0;
-        return replBridge_->lastEpochAtomic();
+    /// Test-only: the last cluster epoch the bridge applied (control thread, as
+    /// above).  Not running → 0.
+    template <class = void>
+    rune::replication::Epoch replicationEpochForTest() {
+        if (!started_ || stopped_ || !runtimeAgent_ || !replBridge_) return 0;
+        return onControlThreadForTest([this]() -> rune::replication::Epoch {
+            return replBridge_ ? replBridge_->lastEpoch() : 0;
+        });
     }
 
     /// Set the minimum ISR size required for acks=All produces on this node's gateway.
@@ -1096,6 +1207,15 @@ private:
     void buildGateway();
     void buildWorkerPool();    // E1: shard→worker assignment (must call after replicaRegistry_ is fully built)
     void buildAdminWorker();   // Task 6: __topic_schemas log/replica + AdminWorker thread
+    // Catalog history Task 6: dataDir/__catalog Log + replica + its replication
+    // plane (admin-thread-owned).  Called from buildAdminWorker before the
+    // schema block.  Throws on any failure (no silent fallback: a broker
+    // without its catalog never starts).
+    void buildCatalog_();
+    // Catalog history Task 6 (control thread): a kA2cCatalogAlterIsr frame →
+    // the controller channel; the controller's (-6, 0) answer → the admin role ring.
+    void forwardCatalogAlterIsr_(const uint8_t* p, std::size_t n);
+    static bool onCatalogAlterIsrResponseThunk_(void* self, const rune::replication::AlterIsrResponseMsg& r) noexcept;
 
     // Task 8b (RULING-4, SINGLE-NODE): create + register the user
     // PartitionReplica(s) for a RUNTIME-defined topic (created via
@@ -1285,6 +1405,30 @@ private:
     //   adminWorkerRunner_ → adminWorkerAgent_ → schemaRegistry_
     //   → schemaReplica_ (in registry) → schemaLog_ → …
     // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Catalog history Task 6 — the __catalog partition (topic -6, partition 0).
+    // catalogLog_          — durable Log at dataDir/__catalog (never InMemoryLog).
+    // catalogPlane_        — its replication plane: a WorkerReplicationTransport
+    //                        on stream config_.catalogReplStreamId over the
+    //                        node's replication channel (multi-node only).
+    // catalogAddBroker_    — the plane's control-thread re-add broker (DR-15).
+    // catalogReplica_      — the PartitionReplica, owned HERE (never in
+    //                        replicaRegistry_), driven ONLY by the admin thread.
+    // catalogOnController_ — immutable after build: true = its role comes from
+    //                        the controller-ISR path (multi-node), false = the
+    //                        consensus leader (single node / no transport).
+    // Declared before adminWorkerAgent_ (which holds raw pointers to them).
+    // -----------------------------------------------------------------------
+    std::unique_ptr<rune::storage::Log>                   catalogLog_;
+    std::unique_ptr<rune::replication::WorkerReplicationTransport> catalogPlane_;
+    std::unique_ptr<rune::replication::PubAddBroker>      catalogAddBroker_;
+    std::unique_ptr<rune::replication::PartitionReplica>  catalogReplica_;
+    bool                                                  catalogOnController_ = false;
+    // Control thread: the last consensus-driven catalog role posted (single node).
+    struct PostedRole { bool leader = false; int32_t epoch = -1; };
+    PostedRole                                            catalogLastRole_;
+    uint64_t                                              catalogAlterIsrRefused_ = 0;   // control thread
+
     std::unique_ptr<rune::storage::Log>                   schemaLog_;
     std::unique_ptr<rune::replication::PartitionReplica>  schemaReplica_;
     std::unique_ptr<SchemaRegistry>                       schemaRegistry_;

@@ -9,11 +9,15 @@
 #include <vector>
 #include "rune/node/SchemaRegistry.h"
 #include "rune/node/AdminChannels.h"
+#include "rune/node/CatalogPartition.h"
 #include "rune/node/ViewRegistry.h"
 #include <rune/view/ViewPlan.h>
 #include <rune/codec/Descriptor.h>
 
-namespace rune::replication { class PartitionReplica; }
+namespace rune::replication {
+class PartitionReplica;
+struct AlterIsrResponseMsg;
+}
 
 namespace rune::node {
 
@@ -131,7 +135,15 @@ public:
                 // unit tests / deployments with no view catalog (CreateView then
                 // responds kInternal).
                 rune::replication::PartitionReplica* viewsReplica = nullptr,
-                ViewRegistry* viewRegistry = nullptr);
+                ViewRegistry* viewRegistry = nullptr,
+                // Catalog history Task 6: the __catalog replica + its replication
+                // plane, both admin-thread-owned (RULING-2 A): the admin thread is
+                // the ONLY thread that polls the plane and drives the replica.
+                // `catalogPlane` null = no peers (single node, or no replication
+                // port): the replica rides a NullPartitionTransport.
+                rune::replication::PartitionReplica* catalogReplica = nullptr,
+                rune::replication::WorkerReplicationTransportImpl<rune::replication::AeronPubRegistry>*
+                    catalogPlane = nullptr);
 
     // -----------------------------------------------------------------------
     // Ingress — enqueue an op (called on the ADMIN thread by AdminWorkerAgent
@@ -202,6 +214,22 @@ public:
     // live; an op demoted in AwaitingCommit is in doubt — KL2).
     // -----------------------------------------------------------------------
     void onRole(const AdminRoleMsg& role);
+
+    // -----------------------------------------------------------------------
+    // Catalog history Task 6 — control → admin: the __catalog replica's role.
+    // Multi-node: the committed (-6, 0) assignment from the controller-ISR path
+    // (leader → becomeLeader(epoch, isr, partitionEpoch); otherwise
+    // becomeFollower(epoch, leaderId), leaderId -1 = leaderless).  Single node:
+    // the consensus leader's role.  Applied on the admin thread only.  The
+    // replica holds the role state itself (no flag here).
+    // -----------------------------------------------------------------------
+    void onCatalogRole(const AdminRoleMsg& role);
+    /// control → admin: the controller's AlterIsrResponse for (-6, 0), verbatim.
+    void onCatalogAlterIsrResponse(const rune::replication::AlterIsrResponseMsg& r);
+    /// The __catalog replica this (admin) thread solely drives (null: none).
+    [[nodiscard]] rune::replication::PartitionReplica* catalogReplica() const noexcept { return catalogReplica_; }
+    /// Catalog plane frames that could not be applied (misrouted / handler threw).
+    [[nodiscard]] const CatalogFrameStats& catalogFrameStats() const noexcept { return catalogFrameStats_; }
 
     // -----------------------------------------------------------------------
     // doWork — drive the replica + advance the in-flight DDL state machine.
@@ -402,6 +430,16 @@ private:
     // Task 19: the __views durable catalog (admin-thread-owned, like replica_).
     rune::replication::PartitionReplica*  viewsReplica_  = nullptr;
     ViewRegistry*                         viewRegistry_  = nullptr;
+
+    // Catalog history Task 6: the __catalog replica + plane (admin-thread-owned).
+    rune::replication::PartitionReplica*  catalogReplica_ = nullptr;
+    rune::replication::WorkerReplicationTransportImpl<rune::replication::AeronPubRegistry>*
+                                          catalogPlane_   = nullptr;
+    CatalogFrameStats                     catalogFrameStats_;
+    // D26 (mirrors the worker's replScratch_): the catalog replica's disk reads
+    // pread into this preallocated buffer, never through the segment mmap.
+    std::vector<uint8_t>                  catalogReadScratch_;
+    static constexpr int kCatalogFragmentLimit = 16;
 
     // Leadership (admin-thread-owned; driven only by onRole()).
     bool     leader_      = false;

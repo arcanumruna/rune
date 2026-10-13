@@ -529,3 +529,121 @@ TEST_F(BridgePerPartitionTest, UserPartition_RemovedFromNode_BecomeFollower) {
     EXPECT_EQ(rep->role(), Role::Follower)
         << "user partition must become Follower after being reassigned to kNode2";
 }
+
+// ===========================================================================
+// Catalog history Task 6 (F26): __catalog (-6, 0) is admin-thread-owned (never
+// in the registry) and on the controller-ISR path.  With coordinatorOnController
+// its COMMITTED assignment reaches the admin role ring as one kMsgCatalogRole
+// frame {leader, epoch = leaderEpoch, leaderId, isr, partitionEpoch} — never a
+// direct becomeLeader, and never silently skipped (before F26 mapDriven_ never
+// forwarded -6, and a registry lookup would find no replica).
+// ===========================================================================
+namespace {
+std::vector<AdminRoleMsg> drainCatalogRoles(OneToOneByteRing& ring) {
+    std::vector<AdminRoleMsg> out;
+    while (ring.drain([&](int32_t tid, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                          aeron::util::index_t len) {
+        EXPECT_EQ(tid, kMsgCatalogRole);
+        AdminRoleMsg m;
+        EXPECT_TRUE(decodeAdminRole(reinterpret_cast<const uint8_t*>(b.buffer() + off),
+                                    static_cast<std::size_t>(len), m));
+        out.push_back(m);
+    }, 64) > 0) {}
+    return out;
+}
+void commitCatalogAssignment(MetadataStateMachine& msm, int64_t pos, int32_t leader,
+                             std::vector<int32_t> isr, int32_t leaderEpoch, int32_t partitionEpoch) {
+    auto [ubuf, usz] = encodeUpdate({kCatalogTopicId, 0, leader, std::move(isr), {1, 2, 3},
+                                     leaderEpoch, partitionEpoch});
+    msm.apply(ubuf.data(), usz, pos);
+    msm.commit(pos);
+}
+} // namespace
+
+TEST_F(BridgePerPartitionTest, CatalogAssignmentIsForwardedOnTheControllerPathRegression) {
+    MetadataStateMachine msm;
+    commitCatalogAssignment(msm, 0, kSelf, {kSelf, kNode2}, /*leaderEpoch=*/4, /*partitionEpoch=*/2);
+    OneToOneByteRing ring(1 << 12);
+    auto bridge = makeBridge(&msm);
+    bridge->setCoordinatorPartitionsOnController(true);
+    bridge->setCatalogRoleRing(&ring);
+    EXPECT_GE(bridge->doWork(kSelf, 10), 1);
+    auto roles = drainCatalogRoles(ring);
+    ASSERT_EQ(roles.size(), 1u) << "the committed (-6, 0) assignment must reach the admin role ring";
+    EXPECT_TRUE(roles[0].leader);
+    EXPECT_EQ(roles[0].epoch, 4) << "the per-partition leaderEpoch, never the cluster term";
+    EXPECT_EQ(roles[0].leaderId, kSelf);
+    EXPECT_EQ(roles[0].partitionEpoch, 2);
+    ASSERT_EQ(roles[0].isrCount, 2);
+    EXPECT_EQ(roles[0].isr[0], kSelf);
+    EXPECT_EQ(roles[0].isr[1], kNode2);
+    EXPECT_EQ(registry_.lookup(kCatalogTopicId, 0), nullptr) << "admin-owned: never in the registry";
+
+    // An ISR change only (partitionEpoch bump) → a same-epoch leader update.
+    MetadataStateMachine msm2;
+    commitCatalogAssignment(msm2, 0, kSelf, {kSelf, kNode2, kNode3}, 4, 3);
+    bridge->setMsm(&msm2);
+    (void)bridge->doWork(kSelf, 10);
+    roles = drainCatalogRoles(ring);
+    ASSERT_EQ(roles.size(), 1u);
+    EXPECT_TRUE(roles[0].leader);
+    EXPECT_EQ(roles[0].partitionEpoch, 3);
+    EXPECT_EQ(roles[0].isrCount, 3);
+
+    // Another node elected → follower of it (leaderless: leaderId -1).
+    MetadataStateMachine msm3;
+    commitCatalogAssignment(msm3, 0, kNode2, {kNode2}, 5, 4);
+    bridge->setMsm(&msm3);
+    (void)bridge->doWork(kSelf, 10);
+    roles = drainCatalogRoles(ring);
+    ASSERT_EQ(roles.size(), 1u);
+    EXPECT_FALSE(roles[0].leader);
+    EXPECT_EQ(roles[0].epoch, 5);
+    EXPECT_EQ(roles[0].leaderId, kNode2);
+}
+
+TEST_F(BridgePerPartitionTest, CatalogAssignmentIsNotMapDrivenOffTheControllerPath) {
+    // Single node: the consensus leader drives the catalog (BrokerNode), not the map.
+    MetadataStateMachine msm;
+    commitCatalogAssignment(msm, 0, kSelf, {kSelf}, 1, 0);
+    OneToOneByteRing ring(1 << 12);
+    auto bridge = makeBridge(&msm);
+    bridge->setCatalogRoleRing(&ring);
+    (void)bridge->doWork(kSelf, 10);
+    EXPECT_TRUE(drainCatalogRoles(ring).empty());
+}
+
+TEST_F(BridgePerPartitionTest, CatalogRoleHeldOnAFullRingSupersededAndDeliveredInOrderRegression) {
+    // No silent drop: a full ring (or one not wired yet) holds the role; a newer
+    // committed role supersedes the held one (roles are absolute); the next
+    // cycles deliver it once the ring has space.
+    MetadataStateMachine msm;
+    commitCatalogAssignment(msm, 0, kSelf, {kSelf, kNode2}, 4, 2);
+    auto bridge = makeBridge(&msm);
+    bridge->setCoordinatorPartitionsOnController(true);
+    (void)bridge->doWork(kSelf, 10);   // ring not wired yet
+    EXPECT_TRUE(bridge->catalogRolePendingForTest());
+
+    OneToOneByteRing ring(256);
+    AdminRoleMsg filler;
+    while (encodeAdminRole(ring, filler, kMsgCatalogRole)) {}
+    bridge->setCatalogRoleRing(&ring);
+    (void)bridge->doWork(kSelf, 10);
+    EXPECT_TRUE(bridge->catalogRolePendingForTest()) << "full ring: still held";
+
+    MetadataStateMachine msm2;   // a newer committed role arrives while held
+    commitCatalogAssignment(msm2, 0, kNode3, {kNode3, kSelf}, 6, 3);
+    bridge->setMsm(&msm2);
+    (void)bridge->doWork(kSelf, 10);
+    EXPECT_TRUE(bridge->catalogRolePendingForTest());
+
+    (void)drainCatalogRoles(ring);   // the admin thread drains the fillers
+    (void)bridge->doWork(kSelf, 10);
+    EXPECT_FALSE(bridge->catalogRolePendingForTest());
+    const auto roles = drainCatalogRoles(ring);
+    ASSERT_EQ(roles.size(), 1u) << "exactly the latest role, once";
+    EXPECT_FALSE(roles[0].leader);
+    EXPECT_EQ(roles[0].epoch, 6);
+    EXPECT_EQ(roles[0].leaderId, kNode3);
+    EXPECT_EQ(bridge->catalogRolesPostedForTest(), 1u);
+}

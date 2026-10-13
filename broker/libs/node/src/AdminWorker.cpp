@@ -6,6 +6,7 @@
 #include <rune/view/AggState.h>     // rune::view::isAggregateView (Phase 2a)
 #include <rune/view/PlanCompiler.h> // rune::view::compileView (Task 19)
 #include <rune/replication/PartitionReplica.h>
+#include <rune/replication/WorkerReplicationTransport.h>   // the __catalog plane (Task 6)
 #include <rune/protocol/RecordBatch.h>
 #include <spdlog/spdlog.h>
 
@@ -41,14 +42,50 @@ AdminWorker::AdminWorker(SchemaRegistry& reg,
                          std::vector<int32_t> replicaSet,
                          AdminDeps deps,
                          rune::replication::PartitionReplica* viewsReplica,
-                         ViewRegistry* viewRegistry)
+                         ViewRegistry* viewRegistry,
+                         rune::replication::PartitionReplica* catalogReplica,
+                         rune::replication::WorkerReplicationTransportImpl<rune::replication::AeronPubRegistry>*
+                             catalogPlane)
     : reg_(reg)
     , replica_(replica)
     , selfId_(selfId)
     , replicaSet_(std::move(replicaSet))
     , deps_(std::move(deps))
     , viewsReplica_(viewsReplica)
-    , viewRegistry_(viewRegistry) {}
+    , viewRegistry_(viewRegistry)
+    , catalogReplica_(catalogReplica)
+    , catalogPlane_(catalogPlane) {
+    if (catalogReplica_ != nullptr) {
+        // One max fetch + the batch framing slack the worker's scratch carries.
+        catalogReadScratch_.resize(static_cast<std::size_t>(rune::replication::kDefaultMaxFetchBytes) + 64u * 1024u);
+        catalogReplica_->setReadScratch(catalogReadScratch_.data(), catalogReadScratch_.size());
+    }
+}
+
+// ─── __catalog role (control → admin; catalog history Task 6) ───────────────
+// The role is absolute and epoch-stamped (the committed assignment); the
+// replica's own role machine handles re-asserts (same-epoch leader = ISR-only
+// update; same-epoch same-leader follower = no-op) and refuses a leadership at
+// an epoch it already led at (restart fence → asks the controller for a bump).
+void AdminWorker::onCatalogRole(const AdminRoleMsg& role) {
+    if (catalogReplica_ == nullptr) return;
+    namespace rr = rune::replication;
+    if (role.leader) {
+        std::vector<rr::NodeId> isr;
+        isr.reserve(static_cast<std::size_t>(role.isrCount));
+        for (int i = 0; i < role.isrCount; ++i)
+            isr.push_back(static_cast<rr::NodeId>(role.isr[static_cast<std::size_t>(i)]));
+        catalogReplica_->becomeLeader(static_cast<rr::Epoch>(role.epoch), std::move(isr), role.partitionEpoch);
+    } else {
+        catalogReplica_->becomeFollower(static_cast<rr::Epoch>(role.epoch),
+                                        static_cast<rr::NodeId>(role.leaderId));
+    }
+}
+
+void AdminWorker::onCatalogAlterIsrResponse(const rune::replication::AlterIsrResponseMsg& r) {
+    if (catalogReplica_ == nullptr) return;
+    catalogReplica_->onAlterIsrResponse(r);
+}
 
 // ─── nextSchemaVersion_ — single source of truth for CONTIGUOUS versions ────
 // (Task 10). DefineTopic (create, this task) and ALTER (Task 11) both route
@@ -453,6 +490,20 @@ int AdminWorker::doWork(int64_t nowNs) {
     // 1. Drive the replica(s) (RULING-2 A: admin thread SOLELY drives doWork).
     if (replica_)      work += replica_->doWork(nowNs);
     if (viewsReplica_) work += viewsReplica_->doWork(nowNs);   // Task 19: __views
+
+    // 1b. Catalog history Task 6: the __catalog plane (inbound frames applied
+    //     inline, zero-copy) and then the replica (push / fetch / ISR / HW).
+    //     DR-15: a peer publication unresolved at startup is re-added here.
+    if (catalogPlane_ && catalogReplica_) {
+        work += catalogPlane_->drivePeerResolve();
+        work += catalogPlane_->poll(kCatalogFragmentLimit,
+            [this, nowNs](int32_t topicId, int32_t partition, uint16_t templateId,
+                          const uint8_t* frame, std::size_t len) {
+                dispatchCatalogFrame(*catalogReplica_, topicId, partition, templateId, frame, len,
+                                     nowNs, catalogFrameStats_);
+            });
+    }
+    if (catalogReplica_) work += catalogReplica_->doWork(nowNs);
 
     // 2. Advance the in-flight DDL (HW check / commit).
     if (advance_(nowNs)) ++work;
