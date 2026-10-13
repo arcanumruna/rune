@@ -3510,6 +3510,19 @@ private:
                           pushReadErrors_);
     }
 
+    // Phase 2b E2: a TRANSIENT ring refused an append (full of unreplicated
+    // records, or a batch larger than the ring).  Counted; logged first + every 1024th.
+    [[gnu::cold]] void noteTransientFull_(int32_t topicId, int32_t partition,
+                                          rune::protocol::client::ErrorCode ec) noexcept {
+        ++transientFullRefusals_;
+        if (transientFullRefusals_ == 1 || (transientFullRefusals_ & 1023u) == 0)
+            spdlog::warn("Worker {}: transient topicId={} partition={}: ring refused an append ({}) — {} "
+                         "(total={}); raise RUNE_TRANSIENT_LOG_RING_BYTES or let the followers catch up",
+                         workerId_, topicId, partition, static_cast<int>(ec),
+                         ec == rune::protocol::client::ErrorCode::MessageTooLarge
+                             ? "batch larger than the ring" : "ring full of unreplicated records",
+                         transientFullRefusals_);
+    }
     [[gnu::cold]] void notePushReadOversize_(int32_t topicId, int32_t partition, int64_t offset) noexcept {
         ++pushReadOversize_;
         if (pushReadOversize_ == 1 || (pushReadOversize_ & 1023u) == 0)
@@ -3956,6 +3969,13 @@ private:
                 spdlog::warn("Worker {}: executeAppendControlRecordWire_ — min-ISR gate refused the marker "
                              "topicId={} partition={}", workerId_, topicId, partition);
                 ret.errorCode = static_cast<int16_t>(pc::ErrorCode::MinIsrViolation);
+            } else if (base == RepT::kAppendBackPressure) {
+                // Phase 2b E2: a TRANSIENT ring full of unreplicated records —
+                // retriable: the coordinator re-sends the marker (never dropped;
+                // TransactionCoordinationService::onControlMarkerRefused retries
+                // every code but Unknown{Topic,Partition} and the fence).
+                noteTransientFull_(topicId, partition, pc::ErrorCode::TransientLogFull);
+                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::TransientLogFull);
             } else {
                 spdlog::warn("Worker {}: executeAppendControlRecordWire_ — appendControlBatch returned {} "
                              "topicId={} partition={}", workerId_, base, topicId, partition);
@@ -4638,6 +4658,11 @@ public:
     [[nodiscard]] uint64_t pushReadMapFallbacksForTest() const noexcept { return pushReadMapFallbacks_; }
     [[nodiscard]] uint64_t pushReadErrorsForTest() const noexcept { return pushReadErrors_; }
     [[nodiscard]] std::size_t deferredPushReadsForTest() const noexcept { return deferredPushCount_; }
+    /// Phase 2b E2 (TRANSIENT partitions): produces/markers the ring refused;
+    /// reads whose cursor was below the ring start, and the records they skipped.
+    [[nodiscard]] uint64_t transientFullRefusalsForTest() const noexcept { return transientFullRefusals_; }
+    [[nodiscard]] uint64_t transientCursorSkipsForTest() const noexcept { return transientCursorSkips_; }
+    [[nodiscard]] uint64_t transientRecordsSkippedForTest() const noexcept { return transientRecordsSkipped_; }
 private:
     std::size_t                           pushBudgetLeft_ = kPushPassBudgetBytes;
     std::array<ChunkRun, kMaxPushRuns>    pushRuns_{};
@@ -4646,6 +4671,9 @@ private:
     /// batch past the budget (a fresh pass always takes one).  Larger first
     /// batches fall back to the mapped view (pushReadMapFallbacks_).
     std::vector<uint8_t>                  pushScratch_ = std::vector<uint8_t>(2 * kPushPassBudgetBytes + 64 * 1024);
+    uint64_t transientFullRefusals_   = 0;   ///< E2: ring refused a produce / marker (full or too large)
+    uint64_t transientCursorSkips_    = 0;   ///< E2: reads whose cursor was below the ring start
+    uint64_t transientRecordsSkipped_ = 0;   ///< E2: records those reads skipped (evicted unread)
     uint64_t                              pushReadMapFallbacks_ = 0;
     uint64_t                              pushReadErrors_ = 0;   ///< D26: push-read pread failures (answered empty)
     /// D26: replication read scratch — a fetch serve / owed re-serve / push of
@@ -6219,12 +6247,9 @@ private:
             if (!replica) continue;
             if (replica->topicId() == topicId &&
                 static_cast<int32_t>(replica->partitionId()) == partition) {
-                // Only disk-backed replicas expose a rune::storage::Log*.
-                // Memory-backed (InMemoryLog) replicas are NOT supported on the
-                // WorkerIngress produce path — the gateway fanout handles them
-                // via the existing WorkerOp ring (which carries a logPtr).
-                // Return nullptr for memory-backed so the caller sends an
-                // Internal error rather than crash.
+                // Only disk-backed replicas expose a rune::storage::Log*.  A
+                // TRANSIENT (InMemoryLog) replica returns {nullptr, replica}:
+                // produceCore_ appends to replica->memoryLog() (Phase 2b E2).
                 rune::storage::Log* log =
                     replica->isDiskBacked() ? replica->log() : nullptr;
                 return {log, replica};
@@ -6569,34 +6594,19 @@ private:
         ret.replica       = replica;
         if (replica) { ret.targetReplicaId = replica->registryId(); ret.incarnation = replica->incarnation(); }
 
-        if (!log) {
-            // E5.1.5: distinguish "partition not owned by this worker" (retriable
-            // NotLeader) from "owned but memory-backed log unsupported" (Internal).
-            //
-            // When getLogAndReplicaForPartition_ returns {nullptr, nullptr} the
-            // partition is NOT in owned_ — this worker is no longer the leader.
-            // The client must refresh metadata and re-route to the new owner.
-            // Return NotLeader (retriable), NOT Internal, so the client can retry.
-            //
-            // When it returns {nullptr, replica} (replica != nullptr), the partition
-            // IS owned but its log is memory-backed — the WorkerIngress path
-            // requires a disk-backed log (InMemoryLog is handled by the gateway
-            // fanout via the ingress_ ring).  Return Internal (non-retriable bug).
-            //
-            // Shared-nothing: no cross-worker forwarding per [[rune-shared-nothing-law]].
-            if (!replica) {
-                // Not owned: retriable NotLeader so client re-routes.
-                spdlog::debug("Worker {}: WorkerIngress: partition not owned (topicId={} "
-                              "partition={}); returning NotLeader (retriable)",
-                              workerId_, f.topicId, f.partition);
-                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
-            } else {
-                // Owned but transient (in-memory log): Internal.
-                spdlog::warn("Worker {}: WorkerIngress: owned but transient (in-memory) log for "
-                             "topicId={} partition={}; Internal error ack",
-                             workerId_, f.topicId, f.partition);
-                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
-            }
+        // Phase 2b E2: a TRANSIENT partition (owned replica, no disk Log) appends
+        // to the replica's own InMemoryLog through this same produce core.
+        rune::storage::InMemoryLog* const mem =
+            (log == nullptr && replica != nullptr) ? replica->memoryLog() : nullptr;
+        if (log == nullptr && mem == nullptr) {
+            // Not owned by this worker (getLogAndReplicaForPartition_ → {nullptr,
+            // nullptr}): retriable NotLeader so the client refreshes metadata and
+            // re-routes.  Shared-nothing: no cross-worker forwarding per
+            // [[rune-shared-nothing-law]].
+            spdlog::debug("Worker {}: produce for a partition this worker does not own (topicId={} "
+                          "partition={}); returning NotLeader (retriable)",
+                          workerId_, f.topicId, f.partition);
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
             enqueueReturn_(ret);
             return 1;
         }
@@ -6701,7 +6711,8 @@ private:
         // appends page-cache only and acks from its own io_ completion, gated on
         // the log's outstanding roll seals (onFlushCompletion_ / fireSealGated_),
         // then the HW gate for acks=all.  Only a disk-backed log has an fd to fsync.
-        const bool asyncStrict = durabilityTier == 2 && log->isDiskBacked();
+        // Phase 2b E2: a transient ring has no fd — tier=strict acks as Majority.
+        const bool asyncStrict = durabilityTier == 2 && log != nullptr && log->isDiskBacked();
         // The tier handleProduceBatch sees: never an inline sync for an op or an
         // async-Strict append.
         const uint8_t helperTier = (asyncStrict || f.fromOp) ? uint8_t{1} : durabilityTier;
@@ -6723,16 +6734,28 @@ private:
             return 1;
         }
 
-        // Call the shared produce helper.
-        rune::storage::ProduceOutcome outcome = rune::storage::handleProduceBatch(
-            rbSpan.data(), rbSpan.size(),
-            f.topicId, f.partition,
-            f.producerId, f.producerEpoch, f.baseSequence,
-            *log, psm_,
-            acksAll, isrSize, minIsr, helperTier,
-            // M-3: skip the repeat CRC pass ONLY when the op's producer says it
-            // validated these exact bytes (the gateway, right after ensureValid).
-            /*crcPreverified=*/f.fromOp && f.crcValidated);
+        // Call the shared produce helper — over the disk Log, or (Phase 2b E2) a
+        // TRANSIENT partition's ring: one memcpy into the ring, base offset +
+        // leader epoch patched there; the ring never evicts at/above the HW
+        // (prepareTransientAppend) — full → TransientLogFull (42, retriable),
+        // nothing appended.
+        // M-3: skip the repeat CRC pass ONLY when the op's producer says it
+        // validated these exact bytes (the gateway, right after ensureValid).
+        const bool crcPreverified = f.fromOp && f.crcValidated;
+        rune::storage::ProduceOutcome outcome;
+        if (log != nullptr) {
+            outcome = rune::storage::handleProduceBatch(
+                rbSpan.data(), rbSpan.size(), f.topicId, f.partition,
+                f.producerId, f.producerEpoch, f.baseSequence,
+                *log, psm_, acksAll, isrSize, minIsr, helperTier, crcPreverified);
+        } else {
+            replica->prepareTransientAppend();
+            outcome = rune::storage::handleProduceBatch(
+                rbSpan.data(), rbSpan.size(), f.topicId, f.partition,
+                f.producerId, f.producerEpoch, f.baseSequence,
+                *mem, psm_, acksAll, isrSize, minIsr, helperTier, crcPreverified);
+            if (outcome.logFull) [[unlikely]] noteTransientFull_(f.topicId, f.partition, outcome.error);
+        }
 
         // A duplicate answers its ORIGINAL base offset (-1 for a KNOWN-OLD
         // duplicate, EOS-OOS: OK, offset unknown — Kafka DUPLICATE_SEQUENCE_NUMBER)

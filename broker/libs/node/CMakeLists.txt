@@ -914,6 +914,17 @@ if(BUILD_TESTING)
         rune_transaction
         GTest::gtest_main)
     gtest_discover_tests(rune_hotpath_b_alloc_regression_tests)
+    # Phase 2b E2: the worker data path of TRANSIENT (InMemoryLog) partitions —
+    # produce, push reads, read_committed, full ring, evicted cursors.  No Aeron.
+    add_executable(rune_transient_data_path_tests
+        tests/integration/TransientDataPathTest.cpp)
+    target_link_libraries(rune_transient_data_path_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        rune_transaction
+        GTest::gtest_main)
+    gtest_discover_tests(rune_transient_data_path_tests)
 
     # ---------------------------------------------------------------------------
     # CP-9: RetentionCleanerAgent integration tests — separate cleaner-cadence
