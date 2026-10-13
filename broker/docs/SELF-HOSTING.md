@@ -191,6 +191,8 @@ before a produce is acknowledged but is **never written to disk**.
     the new leader, on that leader's own session, so its other subscriptions are untouched; records
     already delivered are not delivered again. Older clients do not resume: their subscription ends,
     and the application must re-subscribe.
+    A new subscription that a node redirects to the partition's leader is also made on that leader's
+    own session; the client's other subscriptions stay where they are.
 - A transient topic defined at runtime serves only once its definition has committed, exactly like a
   disk topic: until then produce and subscribe answer `NotLeader` (retriable) and metadata does not list it.
 - **Retention is the in-memory ring:** `RUNE_TRANSIENT_LOG_RING_BYTES` per partition (node-wide, default
