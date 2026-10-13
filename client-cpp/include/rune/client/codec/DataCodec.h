@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string_view>
 
 // Pull in the rune-protocol data codecs (header-only, sibling include path
 // injected into the build by CMakeLists.txt).
@@ -279,9 +280,29 @@ struct RecordsView {
     // Consumer groups (E2 Task 13 fix round 2): brokers push WHOLE batches; a
     // batch that straddles the member's position (a resume after a leader
     // move, a mid-batch committed offset) carries records already consumed.
-    // Records with offset < deliverFrom are such re-deliveries — skip them
-    // (0 = the whole batch is new).  Set by GroupConsumerHub; never on the wire.
+    // Records with offset < deliverFrom are such re-deliveries (0 = the whole
+    // batch is new).  Set by GroupConsumerHub; never on the wire.
+    // forEachRecord() skips them for you; only code that walks `recordBatch`
+    // itself (raw-batch access) must honour deliverFrom.
     int64_t                  deliverFrom     = 0;
+
+    /// Visit every NEW record of the batch: fn(key, value, offset, timestamp)
+    /// for each record with offset >= deliverFrom — the records a straddling
+    /// re-delivery carries below the consumer's position are never handed over
+    /// (E2 final fix wave, I4).  A malformed or empty batch visits nothing.
+    /// Templated (the visitor inlines; no allocation).  The spans are valid
+    /// only for the duration of the callback that received this view.
+    template <class Fn>
+    void forEachRecord(Fn&& fn) const {
+        if (recordBatch.size() < static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) return;
+        rune::protocol::RecordBatchReader reader(recordBatch.data(), recordBatch.size());
+        if (!reader.ensureValid()) return;
+        const int64_t from = deliverFrom;
+        reader.forEachRecord([&](std::string_view key, std::string_view value, int64_t offset, int64_t ts) {
+            if (offset < from) [[unlikely]] return;   // already consumed (straddling re-delivery)
+            fn(key, value, offset, ts);
+        });
+    }
 };
 
 /// Encode a Records frame into buf[0..cap-1].

@@ -86,8 +86,13 @@ struct TopicPartition {
 // RecordSet — a single pushed Records frame routed to this consumer.
 // This is the view from codec::RecordsView — zero-copy spans into Aeron buffer.
 // Valid ONLY during the onRecords callback.
-// A batch straddling the member's position (brokers push whole batches) sets
-// deliverFrom: skip its records with offset < deliverFrom — already consumed.
+// Iterate it with RecordSet::forEachRecord(fn(key, value, offset, timestamp)):
+// it hands over every record exactly once across leader moves and resumes.
+// Brokers push WHOLE batches, so a batch straddling the member's position (a
+// resume after a leader move, a mid-batch committed offset) carries records
+// already consumed; forEachRecord skips them (offset < deliverFrom).  Code that
+// walks `recordBatch` itself (RecordBatchReader — raw-batch access) MUST skip
+// records with offset < deliverFrom, or it sees those records twice.
 // ---------------------------------------------------------------------------
 using RecordSet = codec::RecordsView;
 

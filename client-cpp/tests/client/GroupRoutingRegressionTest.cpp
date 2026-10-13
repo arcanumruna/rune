@@ -2074,6 +2074,49 @@ TEST(GroupRoutingRegression, MovedFetchSubscriptionStraddlingBatchSkipsConsumedR
     EXPECT_EQ(consumed.size(), 7u);   // 10..16
 }
 
+// E2 final fix wave (I4): the same straddling re-delivery, but the application
+// does NOT cooperate — it iterates with RecordSet::forEachRecord and never
+// looks at deliverFrom.  The library's iteration skips the consumed records:
+// every record is handed over exactly once.  RED (forEachRecord without the
+// deliverFrom filter): 12..14 handed over twice.
+TEST(GroupRoutingRegression, RecordSetIterationSkipsAStraddlingReDeliveryWithoutAppCooperationRegression) {
+    GroupRig r(4229, 4230);
+    const auto [n1, p1port] = r.addNode(4229);
+    const auto [n2, p2port] = r.addNode(4229);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4229, ""}, {1, 1, 1, 1, 4229, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment = {{1, 1}};
+    r.gw.committedOffsets[{1, 1}] = 10;
+
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    std::map<int64_t, int> consumed;   // offset -> times handed to the application
+    int                    batches = 0;
+    gc.onRecords([&](const rc::RecordSet& rs) {
+        ++batches;
+        rs.forEachRecord([&](std::string_view, std::string_view, int64_t off, int64_t) { ++consumed[off]; });
+    });
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr; }));
+    const auto s1 = *r.subAt(1, n1);
+    r.gw.pushRecords(s1, 10, 5);   // 10..14
+    ASSERT_TRUE(r.drive([&] { return consumed.size() == 5; }));
+
+    r.gw.subscribeLeader[1] = n2;
+    r.gw.partitions = {{1, 0, 0, 1, 4229, ""}, {1, 1, 2, 2, 4229, ""}};
+    r.gw.sendError(n1, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader), "", s1.sessionId,
+                   s1.corrId);
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n2) != nullptr; }, 200'000));
+    const auto s2 = *r.subAt(1, n2);
+    ASSERT_EQ(s2.fromOffset, 15);
+    r.gw.pushRecords(s2, 12, 5);   // the whole batch containing 15: 12..16
+    ASSERT_TRUE(r.drive([&] { return batches == 2; }));
+    for (const auto& [off, n] : consumed) EXPECT_EQ(n, 1) << "offset " << off << " handed over " << n << " times";
+    EXPECT_EQ(consumed.size(), 7u);   // 10..16
+}
+
 // E2 Task 14 (Task 13 re-review N4): a group fetch instance NEVER acts on a
 // broker position note (an empty-batch Records frame, client version 6) — the
 // note concerns plain subscriptions; a member resumes from its own position.
