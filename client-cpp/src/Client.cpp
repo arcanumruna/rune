@@ -2215,6 +2215,17 @@ void Client::onEgressFrame(codec::TemplateId tid,
         if ((ec == rpc::ErrorCode::NotLeader || ec == rpc::ErrorCode::Redirect) && opt->correlationId != 0)
             [[unlikely]] {
             const auto snap = agent_.stateAndSessionId();
+            // E2 residual round 5 (R4): a Redirect for a PENDING Subscribe counts
+            // only from the session that Subscribe is outstanding on (its node
+            // session when homed, else the current seed session).  A late one
+            // from an earlier session (the dead seed, before a reconnect re-sent
+            // the Subscribe there) is ignored and counted — following it would
+            // bind the subscription a second time on another node.
+            if (ec == rpc::ErrorCode::Redirect &&
+                !subscriberHub_.answeredOnItsSession(opt->correlationId, opt->sessionId, snap.sessionId)) {
+                ++staleSubscribeRedirects_;
+                break;
+            }
             if (subscriberHub_.rearmMovedAway(
                     opt->correlationId, nextCorrId_, nextCorrId_ + 1, opt->sessionId, snap.sessionId,
                     std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg_.subscribeTimeoutMs))) {

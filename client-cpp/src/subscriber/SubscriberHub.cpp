@@ -758,6 +758,17 @@ bool SubscriberHub::movedPendingPartition(int64_t correlationId, int32_t& topicI
     return true;
 }
 
+bool SubscriberHub::answeredOnItsSession(int64_t correlationId, int64_t answerSid, int64_t seedSid) const
+{
+    if (answerSid == 0) return true;
+    const auto it = pendingByCorrelation_.find(correlationId);
+    if (it == pendingByCorrelation_.end() || !it->second || it->second->impl == nullptr) return true;
+    const SubscriptionImpl& impl = *it->second->impl;
+    if (!impl.active) return true;
+    if (impl.homeSession != 0 && impl.homeSid == 0) return false;   // held: nothing outstanding
+    return answerSid == homeSidOf_(impl, seedSid);
+}
+
 bool SubscriberHub::isNewPendingSubscribe(int64_t correlationId) const
 {
     const auto it = pendingByCorrelation_.find(correlationId);

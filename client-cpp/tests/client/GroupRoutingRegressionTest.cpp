@@ -2604,3 +2604,54 @@ TEST(GroupRoutingRegression, NewSubscribeRedirectedBeforeAnyMetadataStillFollows
     s1.unsubscribe();
     s2.unsubscribe();
 }
+
+// E2 final fix wave, residual round 5 — R4: a Redirect counts only from the
+// session its pending Subscribe is outstanding on.  The Subscribe was sent on
+// seed session S1 (its answer lost); the seed reconnected (S2) and re-sent it.
+// A LATE Redirect from S1 then arrives for the same correlationId: following
+// it would bind the subscription a second time, on node 1, while the copy
+// re-sent on S2 binds on the seed.  It is ignored and counted; the
+// subscription binds exactly once.  RED (no session check): node 1 got the
+// Subscribe too.
+TEST(GroupRoutingRegression, RedirectFromAnEarlierSessionNeverBindsASubscriptionTwiceRegression) {
+    GroupRig r(4247, 4248);
+    const auto [n1, p1port] = r.addNode(4247);
+    r.gw.moreBrokers   = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions    = {{1, 0, 0, 1, 4247, ""}};
+    r.gw.groupProtocol = false;
+    r.connect();
+    const std::string seedBefore = r.client.testTransport().ingressChannel();
+    r.gw.dropSubscribeResponsesNext = 2;   // the answers of the first send AND the reconnect's re-send are lost
+    PlainLedger led;
+    auto s = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()}, led.handler(0));
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribeCorrIds.size() == 1; }));
+    const int64_t corr = r.gw.subscribeCorrIds[0];
+    const int64_t s1   = r.gw.assignedSessionId;
+    r.gw.assignedSessionId = s1 + 100;   // the reconnect is assigned S2
+    r.gw.expireSession(s1);   // reconnect: S2, the pending Subscribe re-sent there
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribeCorrIds.size() >= 2 && r.gw.assignedSessionId != s1; }))
+        << "precondition: re-sent on a new seed session";
+    ASSERT_EQ(r.gw.subscribeCorrIds.back(), corr);
+
+    // The late Redirect of the FIRST send, from S1.
+    r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::Redirect),
+                   "127.0.0.1:" + std::to_string(p1port), s1, corr);
+    ASSERT_TRUE(r.drive([&] { return r.client.testStaleSubscribeRedirects() >= 1 || r.subAt(0, n1) != nullptr; }))
+        << "the late Redirect was neither ignored nor followed";
+    (void)r.drive([&] { return r.subAt(0, n1) != nullptr; }, 300'000);
+    EXPECT_EQ(r.subAt(0, n1), nullptr) << "DUPLICATE: a Redirect from an earlier session bound the subscription on node 1";
+    EXPECT_EQ(r.client.testStaleSubscribeRedirects(), 1u);
+    EXPECT_EQ(r.client.testTransport().ingressChannel(), seedBefore) << "the stale Redirect moved the seed";
+    EXPECT_FALSE(s.finished());
+
+    // The copy outstanding on the seed binds (one more re-send after a reconnect): exactly once.
+    const int64_t s2 = r.gw.assignedSessionId;
+    r.gw.assignedSessionId = s2 + 100;
+    r.gw.expireSession(s2);
+    ASSERT_TRUE(r.drive([&] { return s.subscriptionId() != 0; })) << "the subscription never bound on the seed";
+    EXPECT_EQ(r.subAt(0, n1), nullptr);
+    r.gw.pushRecords(*r.subAt(0, 0), 0, 3);
+    ASSERT_TRUE(r.drive([&] { return led.count(0) == 3; }));
+    EXPECT_EQ(led.dupes(), 0);
+    s.unsubscribe();
+}

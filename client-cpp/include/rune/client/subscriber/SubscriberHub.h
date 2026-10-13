@@ -228,6 +228,11 @@ public:
     /// route like a moved one (homeMoved / driveHomed), never by moving the
     /// seed.  False when not such a pending Subscribe (or not routed).
     bool adoptRedirectedSubscribe(int64_t correlationId);
+    /// R4: false only when `correlationId` is a PENDING Subscribe and the
+    /// answer came on a session it is not outstanding on (its node session
+    /// when homed — none while held — else the seed session `seedSid`).  Not
+    /// pending / an answer without a session id (0): true (not this check's).
+    [[nodiscard]] bool answeredOnItsSession(int64_t correlationId, int64_t answerSid, int64_t seedSid) const;
     /// R3: `correlationId` is a pending, never-bound, never-moved Subscribe.
     [[nodiscard]] bool isNewPendingSubscribe(int64_t correlationId) const;
     /// Route the pending moved Subscribe `correlationId` to its partition's

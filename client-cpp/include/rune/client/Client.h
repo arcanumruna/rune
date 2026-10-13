@@ -1162,7 +1162,9 @@ private:
     struct HeldRedirect { int64_t corrId; std::string endpoint; int metaSeen; };
     std::vector<HeldRedirect> heldRedirectFollows_;   // duty thread; cold
     uint64_t redirectFollowsHeld_ = 0;
+    uint64_t staleSubscribeRedirects_ = 0;   // R4: Redirects from a session the Subscribe is not outstanding on
 public:
+    [[nodiscard]] uint64_t testStaleSubscribeRedirects() const noexcept { return staleSubscribeRedirects_; }
     [[nodiscard]] uint64_t testRedirectFollowsHeld() const noexcept { return redirectFollowsHeld_; }
 private:
     std::vector<int64_t>  redirectedSubscribes_;
