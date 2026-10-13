@@ -2703,3 +2703,52 @@ TEST(TransientLineageControllerRegression, LineageIsTrustedOnlyWhileItsLeadersPr
     EXPECT_EQ(c.svc->trustedTransientLineage(0, 0), rune::metadata::kLineageUntrusted)
         << "SILENT LOSS: the dead process's lineage was trusted for the stale committed leadership";
 }
+
+// E2 final fix wave, residual round 3 — N3: leadership passing to a replica
+// that was NOT in the ISR (an unclean / survivor election) may lack committed
+// records even though it fetched from the confirmed leadership (it lagged out
+// of the ISR).  Such a leadership MINTS a new lineage — committed offsets are
+// answered "none", never resumed past data the new leader does not hold.
+// RED (the clean-election bit ignored): the survivor KEPT the lineage.
+TEST(TransientLineageControllerRegression, UncleanElectionToANonIsrReplicaMintsANewLineageRegression) {
+    CtlRig c;
+    c.svc->setAllowSurvivorElection(true);
+    const auto first = c.pa();
+    (void)answer(*c.svc, lineageReport(first, -1));
+    c.drive(50);
+    ASSERT_EQ(answer(*c.svc, lineageReport(first, -1)), rune::replication::kAlterIsrLineageConfirmed);
+    const uint64_t token = c.svc->transientLineage(0, 0)->lineage;
+    EXPECT_TRUE(c.pa().cleanElection);
+
+    // The followers lag out of the ISR; the sole-ISR memory leader restarts
+    // empty -> leaderless -> a survivor (non-ISR) election.
+    c.soleIsr();
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    const int32_t F = L == 1 ? 2 : 1;
+    const int32_t G = 6 - L - F;
+    c.svc->reportReplicaPosition(0, 0, G, le, 10);
+    auto bump = c.bump(le, /*memory=*/true);
+    bump.isr[3] = 2;
+    (void)c.svc->onAlterIsr(bump);
+    c.tick();
+    ASSERT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER);
+    const int32_t lle = c.pa().leaderEpoch;
+    (void)c.svc->onAlterIsr(leaderlessReport(L, lle, 0, 2));
+    (void)c.svc->onAlterIsr(leaderlessReport(F, lle, 0, 7));
+    (void)c.svc->onAlterIsr(leaderlessReport(G, lle, 10, 1));
+    c.tick();
+    ASSERT_EQ(c.pa().leaderNode, G) << "precondition: the survivor (non-ISR) replica leads";
+    EXPECT_FALSE(c.pa().cleanElection) << "a non-ISR leader was derived as a clean election";
+
+    // G fetched from the confirmed leadership (src = le): a clean handover
+    // would KEEP; an unclean one must MINT.
+    const auto unclean = c.pa();
+    (void)answer(*c.svc, lineageReport(unclean, le));
+    c.drive(50);
+    ASSERT_EQ(answer(*c.svc, lineageReport(unclean, le)), rune::replication::kAlterIsrLineageConfirmed);
+    const auto* l2 = c.svc->transientLineage(0, 0);
+    ASSERT_NE(l2, nullptr);
+    EXPECT_NE(l2->lineage, token)
+        << "SILENT LOSS: an unclean election kept the lineage (offsets resume past data the leader lacks)";
+    EXPECT_EQ(l2->mintEpoch, unclean.leaderEpoch);
+}

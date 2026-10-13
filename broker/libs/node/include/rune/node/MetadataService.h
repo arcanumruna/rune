@@ -942,7 +942,7 @@ public:
         r.partition = m.partition;
         // N1: the record carries the reporting leader's process identity.
         r.l = rune::metadata::decideTransientLineage(rec, m.leaderId, pa.leaderEpoch, m.isr[2], mintLineage_(),
-                                                     incarnationOf_(m));
+                                                     incarnationOf_(m), pa.cleanElection);   // N3: unclean mints
         noteLineageDecision_(r, rec);
         pendingLineageRecords_.push_back(r);
         drainDynamicQueue();

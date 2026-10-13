@@ -139,14 +139,27 @@ void MetadataStateMachine::commit(int64_t committedPos)
 void MetadataStateMachine::install_(int32_t topicId, int32_t partition,
                                     const PartitionAssignment& pa)
 {
+    bool clean = true;
     if (const PartitionAssignment* cur = committed_.get(topicId, partition)) {
         const bool regress =
             pa.leaderEpoch < cur->leaderEpoch ||
             (pa.leaderEpoch == cur->leaderEpoch && pa.leaderNode != cur->leaderNode) ||
             pa.partitionEpoch < cur->partitionEpoch;
         if (regress) { ++regressionsRejected_; return; }
+        // E2 C1 residual N3: a NEW leader is clean iff it was in the ISR of the
+        // assignment it replaces (a leaderless record keeps the ISR lineage);
+        // the same leader re-elected at a newer epoch holds its own data
+        // (clean); an ISR-only change / a leaderless record inherits.
+        if (pa.leaderNode >= 0 && pa.leaderNode != cur->leaderNode)
+            clean = std::find(cur->isr.begin(), cur->isr.end(), pa.leaderNode) != cur->isr.end();
+        else if (pa.leaderNode >= 0 && pa.leaderEpoch > cur->leaderEpoch)
+            clean = true;
+        else
+            clean = cur->cleanElection;
     }
-    committed_.put(topicId, partition, pa);
+    PartitionAssignment installed = pa;
+    installed.cleanElection = clean;
+    committed_.put(topicId, partition, installed);
     ++committedVersion_;
 }
 

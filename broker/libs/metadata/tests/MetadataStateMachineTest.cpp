@@ -1209,3 +1209,45 @@ TEST(MetadataStateMachineRegression, TransientLineageMintKeepResetDecisionsRegre
     EXPECT_FALSE(lineageConfirmedFor(&rec, &pa, 78)) << "single node: confirmed by an earlier process";
     EXPECT_FALSE(lineageConfirmedFor(nullptr, &pa, 0));
 }
+
+// E2 final fix wave, residual round 3 — N3: the MSM derives whether each
+// installed leadership was a CLEAN election (the new leader was in the ISR of
+// the assignment it replaced), deterministically on apply and on replay; and
+// an unclean leadership always MINTS a lineage.  RED: the derivation / the
+// decision ignored the ISR.
+TEST(MetadataStateMachineRegression, UncleanElectionIsDerivedAndAlwaysMintsRegression) {
+    const std::vector<UpdateArgs> log = {
+        {1, 0, 5, {5, 6, 7}, {5, 6, 7}, 1, 1},   // first assignment         -> clean
+        {1, 0, 6, {6, 5, 7}, {5, 6, 7}, 2, 2},   // ISR handover to 6         -> clean
+        {1, 0, 6, {6},       {5, 6, 7}, 2, 3},   // ISR shrinks to {6}        -> inherits clean
+        {1, 0, -1, {6},      {5, 6, 7}, 3, 4},   // leaderless (ISR kept)     -> inherits
+        {1, 0, 7, {7},       {5, 6, 7}, 4, 5},   // survivor 7 (not in {6})   -> UNCLEAN
+        {1, 0, 7, {7, 5},    {5, 6, 7}, 4, 6},   // ISR grows, same leader    -> inherits unclean
+        {1, 0, 7, {7, 5},    {5, 6, 7}, 5, 7},   // 7 re-elected (own data)   -> clean
+    };
+    const bool expect[] = {true, true, true, true, false, false, true};
+    {
+        MetadataStateMachine msm;
+        for (std::size_t i = 0; i < log.size(); ++i) {
+            auto [b, n] = encodeUpdate(log[i]);
+            msm.apply(b.data(), n, static_cast<int64_t>(i));
+            msm.commit(static_cast<int64_t>(i));
+            ASSERT_NE(msm.assignment(1, 0), nullptr);
+            EXPECT_EQ(msm.assignment(1, 0)->cleanElection, expect[i]) << "record " << i;
+        }
+    }
+    {   // replay (all pending, one commit) derives the same as one by one
+        MetadataStateMachine msm;
+        for (std::size_t i = 0; i < 5; ++i) {
+            auto [b, n] = encodeUpdate(log[i]);
+            msm.apply(b.data(), n, static_cast<int64_t>(i));
+        }
+        msm.commit(4);
+        EXPECT_FALSE(msm.assignment(1, 0)->cleanElection) << "replay derived a different election class";
+    }
+    TransientLineage rec;
+    rec.lineage = 0xAAAA; rec.mintEpoch = 4; rec.confirmedEpoch = 6; rec.confirmedLeader = 2;
+    EXPECT_EQ(decideTransientLineage(&rec, 1, 7, 6, 0xCCCC, 0, /*clean=*/true).lineage, 0xAAAAu);
+    EXPECT_EQ(decideTransientLineage(&rec, 1, 7, 6, 0xCCCC, 0, /*clean=*/false).lineage, 0xCCCCu)
+        << "an unclean leadership kept the lineage";
+}

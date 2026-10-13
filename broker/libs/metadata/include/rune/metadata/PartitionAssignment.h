@@ -64,6 +64,12 @@ struct PartitionAssignment {
     int32_t              leaderEpoch;     ///< Bumps on leader change or replica removal.
     int32_t              partitionEpoch;  ///< Bumps on every applied change.
     LeaderlessMark       mark{};          ///< D15: set only on a leaderless record that carried one.
+    /// E2 C1 residual N3: the current leader was elected CLEANLY — it was in the
+    /// ISR of the assignment it replaced (or the leader did not change, or it is
+    /// the first assignment).  Derived by the MSM at install (a pure function of
+    /// the committed log: identical on every node); false = an unclean /
+    /// survivor election: the new leader may lack committed data.
+    bool                 cleanElection = true;
 };
 
 /// Describes a requested mutation.  Fields use sentinel values to mean "unchanged".

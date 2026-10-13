@@ -127,11 +127,15 @@ struct TransientLineageRecord {
 /// minted a lineage that never committed) mints too: the safe side (an offset
 /// of an older lineage is answered "none", never resumed into other data).
 /// Pure; the controller supplies a fresh non-zero token.
+/// Residual N3: `cleanElection` false (the leader was not in the replaced
+/// assignment's ISR — an unclean / survivor election: it may lack committed
+/// records) always MINTS.
 [[nodiscard]] inline TransientLineage decideTransientLineage(const TransientLineage* rec, int32_t leader,
                                                              int32_t epoch, int32_t src, uint64_t freshToken,
-                                                             int64_t incarnation = 0) noexcept {
+                                                             int64_t incarnation = 0,
+                                                             bool cleanElection = true) noexcept {
     TransientLineage out;
-    const bool keep = rec != nullptr && rec->lineage != 0 && src >= 0 &&
+    const bool keep = cleanElection && rec != nullptr && rec->lineage != 0 && src >= 0 &&
                       src >= rec->mintEpoch && src <= rec->confirmedEpoch;
     out.lineage         = keep ? rec->lineage : freshToken;
     out.mintEpoch       = keep ? rec->mintEpoch : epoch;
