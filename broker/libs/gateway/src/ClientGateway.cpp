@@ -2998,6 +2998,14 @@ bool ClientGateway::readCommittedServableHere_(int32_t topicId, int32_t partitio
     return !v || v.publishedLeader();
 }
 
+bool ClientGateway::movedAway_(const Subscription& sub) const noexcept
+{
+    const GatewayReplicaView v{replicaRegistry_->lookupHandle(sub.topicId, sub.partition)};
+    if (!v) return sub.hadReplica;   // removed from this node since it was created
+    return sub.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) &&
+           !v.publishedLeader();
+}
+
 bool ClientGateway::retireReadCommittedMovedAway_(int64_t subId, Subscription& sub)
 {
     Session* session = sessions_.find(sub.sessionId);
@@ -3017,10 +3025,10 @@ bool ClientGateway::retireReadCommittedMovedAway_(int64_t subId, Subscription& s
         ix != session->subIdByKey.end() && ix->second == subId)
         session->subIdByKey.erase(ix);
     ++readCommittedMovedAway_;
-    spdlog::info("ClientGateway: read_committed subscription {} (sessionId={} topicId={} partition={} "
-                 "nextOffset={}) — this node no longer leads the partition: NotLeader, dropped (the client "
-                 "re-subscribes from its position on the leader)",
-                 subId, sub.sessionId, sub.topicId, sub.partition, sub.nextOffset);
+    spdlog::info("ClientGateway: subscription {} (sessionId={} topicId={} partition={} isolation={} "
+                 "nextOffset={}) — this node no longer serves it (demoted / partition moved away): NotLeader, "
+                 "dropped (the client re-subscribes from its position on the leader)",
+                 subId, sub.sessionId, sub.topicId, sub.partition, sub.isolation, sub.nextOffset);
     return true;
 }
 
@@ -4436,6 +4444,8 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     sub.nextOffset     = nextOffset;
     sub.isolation      = msg.isolation;
     sub.subscribeCorrId = msg.correlationId;
+    sub.hadReplica      = replicaRegistry_ != nullptr &&
+                          static_cast<bool>(replicaRegistry_->lookupHandle(msg.topicId, partition));
 
     subscriptions_.emplace(subId, std::move(sub));
     session->subIdByKey[subKey] = subId;   // 5a: the dedupe index
@@ -4571,18 +4581,21 @@ void ClientGateway::pushSubscriptions()
     // both worker modes (checked BEFORE the per-worker-egress skip: the owning
     // worker cannot tell the client, it only stops pushing).  Swept only on a
     // routed role change (one compare per pass otherwise).
-    const bool rcSweep = replicaRegistry_ != nullptr && replicaRegistry_->roleChanges() != seenRcSweepRoleChanges_;
+    //   Fix round 1: also on a replica REMOVAL (any isolation: the partition
+    //   moved off this node) and, as the fallback for a demotion no route
+    //   reports (fenced by a higher epoch), every kMovedAwaySweepCycles passes.
+    static_assert((kMovedAwaySweepCycles & (kMovedAwaySweepCycles - 1)) == 0, "power of two");
+    const bool rcSweep = replicaRegistry_ != nullptr &&
+                         (replicaRegistry_->roleChanges() != seenRcSweepRoleChanges_ ||
+                          (pushCycle_ & (kMovedAwaySweepCycles - 1)) == 0);
     if (rcSweep) [[unlikely]] seenRcSweepRoleChanges_ = replicaRegistry_->roleChanges();
     for (auto subIt = subscriptions_.begin(); subIt != subscriptions_.end(); ) {
         const int64_t subId = subIt->first;
         Subscription& sub   = subIt->second;
-        if (rcSweep && sub.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) &&
-            !sub.isGroup && sub.topicId >= 0 && !sub.failed) [[unlikely]] {
-            if (!readCommittedServableHere_(sub.topicId, sub.partition) &&
-                retireReadCommittedMovedAway_(subId, sub)) {
-                subIt = subscriptions_.erase(subIt);
-                continue;
-            }
+        if (rcSweep && !sub.isGroup && sub.topicId >= 0 && !sub.failed && movedAway_(sub) &&
+            retireReadCommittedMovedAway_(subId, sub)) [[unlikely]] {
+            subIt = subscriptions_.erase(subIt);
+            continue;
         }
         ++subIt;
         // read-rework T3/T4 (I3b): when per-worker egress is active the OWNING worker

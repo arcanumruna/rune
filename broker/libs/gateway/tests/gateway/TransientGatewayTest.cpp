@@ -566,7 +566,7 @@ TEST(TransientGatewayRegression, ReadCommittedSubscriptionOnADemotedLeaderAnswer
     // (ReplicationMetadataBridge::recordIntendedRole_) — the sweep's trigger.
     r.rep->becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
     for (int i = 0; i < 4; ++i) { r.gw.pushSubscriptionsForTest(); r.pass(); }
-    EXPECT_FALSE(r.errors.count(61)) << "swept without a routed role change (a per-pass lookup)";
+    EXPECT_FALSE(r.errors.count(61)) << "swept on a pass that is neither a routed role change nor the fallback";
     const auto h = r.reg.lookupHandle(0, 0);
     r.reg.setIntendedRole(0, 0, h.incarnation, rune::node::ReplicaRegistry::IntendedRole::Follower);
     for (int i = 0; i < 4; ++i) { r.gw.pushSubscriptionsForTest(); r.pass(); }
@@ -582,4 +582,61 @@ TEST(TransientGatewayRegression, ReadCommittedSubscriptionOnADemotedLeaderAnswer
     ASSERT_TRUE(r.errors.count(61));
     EXPECT_EQ(r.errors[61], kNotLeader);
     EXPECT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), 1u);
+}
+
+// ---------------------------------------------------------------------------
+// Task 13 fix round 1 — every way a node stops serving a subscription reaches
+// the client (no silent stall):
+//   (a) a group member's partition subscription (the member subscribes to the
+//       LEADER with a bit-61-tagged correlation id; the coordinator creates
+//       none) is answered NotLeader on THAT id — the client's group code
+//       re-routes the partition from its position;
+//   (b) a demotion no control-plane route reports (a leader fenced by a higher
+//       epoch flips its own role; no intended-role record) is caught by the
+//       periodic fallback sweep within kMovedAwaySweepCycles passes;
+//   (c) the partition's replica REMOVED from this node (it moved away) retires
+//       every plain subscription, read_uncommitted too.
+// ---------------------------------------------------------------------------
+TEST(TransientGatewayRegression, GroupMemberPartitionSubscriptionOnADemotedLeaderAnswersNotLeaderRegression) {
+    Rig r;
+    const int64_t sid = r.gw.injectTestSession(0);
+    constexpr int64_t kFetchCorr = (int64_t{1} << 61) | 7;   // rune-client GroupConsumerHub::kFetchCorrTag
+    r.subscribe(sid, 0, kFetchCorr, /*read_committed=*/1);
+    ASSERT_TRUE(r.subscribed.count(kFetchCorr));
+    r.rep->becomeFollower(2, 2);
+    const auto h = r.reg.lookupHandle(0, 0);
+    r.reg.setIntendedRole(0, 0, h.incarnation, rune::node::ReplicaRegistry::IntendedRole::Follower);
+    for (int i = 0; i < 4; ++i) { r.gw.pushSubscriptionsForTest(); r.pass(); }
+    ASSERT_TRUE(r.errors.count(kFetchCorr))
+        << "SILENT STALL: a group member's partition subscription on a demoted leader was never answered";
+    EXPECT_EQ(r.errors[kFetchCorr], kNotLeader);
+}
+
+TEST(TransientGatewayRegression, UnroutedDemotionIsCaughtByTheFallbackSweepRegression) {
+    Rig r;
+    const int64_t sid = r.gw.injectTestSession(0);
+    r.subscribe(sid, -2, 71, /*read_committed=*/1);
+    ASSERT_TRUE(r.subscribed.count(71));
+    r.rep->becomeFollower(2, 2);   // fenced by a higher epoch: the owner flips, nothing is routed
+    for (int64_t i = 0; i < 2 * ClientGateway::kMovedAwaySweepCyclesForTest && !r.errors.count(71); ++i)
+        r.gw.pushSubscriptionsForTest();
+    ASSERT_TRUE(r.errors.count(71))
+        << "SILENT STALL: a demotion no route reported left the read_committed subscription silent";
+    EXPECT_EQ(r.errors[71], kNotLeader);
+}
+
+TEST(TransientGatewayRegression, ReplicaRemovedFromThisNodeRetiresEveryPlainSubscriptionRegression) {
+    Rig r;
+    const int64_t sid = r.gw.injectTestSession(0);
+    r.subscribe(sid, -2, 81, /*read_committed=*/1);
+    r.subscribe(sid, -2, 82, /*read_uncommitted=*/0);
+    ASSERT_TRUE(r.subscribed.count(81));
+    ASSERT_TRUE(r.subscribed.count(82));
+    r.reg.remove(0, 0);   // the partition moved off this node (ReplicationMetadataBridge::applyDeleteForKey)
+    for (int i = 0; i < 4; ++i) r.gw.pushSubscriptionsForTest();
+    ASSERT_TRUE(r.errors.count(81)) << "SILENT STALL: read_committed subscription of a removed replica";
+    ASSERT_TRUE(r.errors.count(82)) << "SILENT STALL: read_uncommitted subscription of a removed replica";
+    EXPECT_EQ(r.errors[81], kNotLeader);
+    EXPECT_EQ(r.errors[82], kNotLeader);
+    EXPECT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), 2u);
 }

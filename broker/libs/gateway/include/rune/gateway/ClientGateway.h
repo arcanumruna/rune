@@ -957,9 +957,11 @@ public:
     /// Test seam: one gateway push pass (pushSubscriptions) without doWork's
     /// Aeron polling.
     void pushSubscriptionsForTest() { pushSubscriptions(); }
-    /// Read_committed subscriptions answered NotLeader + dropped because this
-    /// node stopped leading their partition (retireReadCommittedMovedAway_).
+    /// Plain subscriptions answered NotLeader + dropped because this node
+    /// stopped serving them (read_committed after a demotion; any isolation
+    /// after the replica was removed) — retireReadCommittedMovedAway_.
     [[nodiscard]] uint64_t readCommittedSubscriptionsMovedAway() const noexcept { return readCommittedMovedAway_; }
+    static constexpr int64_t kMovedAwaySweepCyclesForTest = 256;   // == kMovedAwaySweepCycles
 
     // -----------------------------------------------------------------------
     // applyProduceForTest — feed a raw Produce frame through the real
@@ -1220,6 +1222,10 @@ private:
         // Review I-2 fallback: push-cycle backoff after a notReady answer.
         int64_t notReadyBackoff  = 0;
         int64_t retryAtCycle     = 0;
+        // E2 Task 13 fix round 1: a replica of this partition was registered
+        // here when it was created — its later REMOVAL (the partition moved off
+        // this node) retires it NotLeader (retireMovedAway_), any isolation.
+        bool    hadReplica       = false;
     };
 
     // -----------------------------------------------------------------------
@@ -2079,11 +2085,18 @@ private:
     /// owning worker.  True = retired (the caller erases the record).
     bool retireReadCommittedMovedAway_(int64_t subId, Subscription& sub);
     uint64_t readCommittedMovedAway_ = 0;   ///< cold counter: subscriptions retired by retireReadCommittedMovedAway_
-    /// The registry's roleChanges() the last read_committed demotion sweep saw:
-    /// the sweep runs only on a role change (the control plane records every
-    /// routed role — ReplicationMetadataBridge::recordIntendedRole_), never a
-    /// per-pass lookup per subscription.
+    /// The registry's roleChanges() the last moved-away sweep saw.  The sweep
+    /// runs on every routed role change / replica removal (ReplicationMetadata
+    /// Bridge::recordIntendedRole_, ReplicaRegistry::remove) and, as the
+    /// fallback for a demotion no control-plane route reports (a leader fenced
+    /// by a higher epoch in onFetchRequest), every kMovedAwaySweepCycles push
+    /// passes — never a per-pass lookup per subscription.
     uint64_t seenRcSweepRoleChanges_ = 0;
+    static constexpr int64_t kMovedAwaySweepCycles = kMovedAwaySweepCyclesForTest;   ///< power of two
+    /// Moved-away verdict for one plain subscription during a sweep: true when
+    /// this node can no longer serve it — its replica was removed (any
+    /// isolation) or, read_committed, it is no longer a published leader.
+    [[nodiscard]] bool movedAway_(const Subscription& sub) const noexcept;
     int  pumpMarkerQueue_();
     // D9 (see TxnMarkerChannel).
     TxnMarkerChannel txnMarkerChannel_{};
