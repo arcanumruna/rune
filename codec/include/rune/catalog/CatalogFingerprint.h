@@ -10,8 +10,10 @@
 //              [, keyField, validate, evolvingBlob, schemaVersion, nextTag, compat]
 //   view:      'V', name, version, sinkPartitions, persistence, keyField,
 //              source count + each source name, normalizedPlanBlob,
-//              rune::codec::fingerprint(deserialize(outputDescriptorBlob)) (0 when it
-//              does not deserialize — apply refuses such an event first)
+//              the output descriptor as a definition: rune::codec::fingerprint(deserialize(
+//              outputDescriptorBlob)), its version, its field count and each field tag in
+//              declaration order (the layout) — a lone 0 when it does not deserialize
+//              (apply refuses such an event first)
 //   tombstone: 'D', wasView, name, finalVersion
 #include <rune/catalog/CatalogState.h>
 

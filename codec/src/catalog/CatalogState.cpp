@@ -158,7 +158,8 @@ std::expected<LiveFields, std::string> liveFieldsOf(const SchemaState& schema) {
         return std::unexpected(std::string("the evolving descriptor does not deserialize: ") + x.what());
     }
 }
-std::string quoted(std::string_view s) { return "'" + std::string(s) + "'"; }
+/// Field names in an error are client-supplied: escaped so a rejected one cannot forge log lines.
+std::string quoted(std::string_view s) { return "'" + escapeNameForLog(s) + "'"; }
 
 /// An ADD's width rule: a FixedStr has a width, nothing else does.
 std::optional<std::string> addWidthError(std::string_view name, cd::PrimType type, uint16_t fixedLen) {

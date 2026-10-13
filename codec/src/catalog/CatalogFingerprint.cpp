@@ -48,11 +48,20 @@ uint64_t config(uint64_t h, const TopicConfig& c) noexcept {   // declaration or
     return h;
 }
 
-uint64_t outputDescriptorFingerprint(const std::vector<uint8_t>& b) noexcept {
+/// The view's output descriptor as a DEFINITION (equal however it was serialized):
+/// rune::codec::fingerprint (name; per field, by tag: tag, type, since, until, key, name,
+/// enums, fixedLen), then what that leaves out but the definition fixes — the descriptor
+/// version and the field DECLARATION order (it fixes the block layout records use).
+uint64_t outputDescriptorFingerprint(uint64_t h, const std::vector<uint8_t>& b) noexcept {
     try {
-        return rune::codec::fingerprint(rune::codec::deserialize(std::span<const uint8_t>(b.data(), b.size())));
+        const rune::codec::Descriptor d = rune::codec::deserialize(std::span<const uint8_t>(b.data(), b.size()));
+        h = detail::fnvU64(h, rune::codec::fingerprint(d));
+        h = cdd::fnv1a_u16le(h, d.version);
+        h = cdd::fnv1a_u32le(h, static_cast<uint32_t>(d.fields.size()));
+        for (const auto& f : d.fields) h = cdd::fnv1a_u16le(h, f.id);
+        return h;
     } catch (...) {
-        return 0;   // apply refuses an undeserializable output descriptor before hashing
+        return detail::fnvU64(h, 0);   // apply refuses an undeserializable output descriptor before hashing
     }
 }
 } // namespace
@@ -90,7 +99,7 @@ uint64_t fingerprintOf(const ViewObject& v) noexcept {
     h = cdd::fnv1a_u32le(h, static_cast<uint32_t>(v.def.sourceNames.size()));
     for (const std::string& s : v.def.sourceNames) h = str(h, s);
     h = blob(h, v.def.normalizedPlanBlob);
-    h = detail::fnvU64(h, outputDescriptorFingerprint(v.def.outputDescriptorBlob));
+    h = outputDescriptorFingerprint(h, v.def.outputDescriptorBlob);
     return h;
 }
 

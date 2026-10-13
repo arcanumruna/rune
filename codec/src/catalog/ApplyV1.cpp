@@ -8,15 +8,19 @@
 //   CreateTopic       name valid (TopicName.h: 1..249 bytes of [A-Za-z0-9._-], not "." / "..",
 //                     no "__" prefix), free, not case-folding onto a different live name;
 //                     objectId == nextObjectId; ops.topicId == nextTopicId; versions 0 -> 1;
-//                     partitions >= 1; replicationFactor >= 0;
+//                     partitions >= 1; replicationFactor >= 0; config (below);
 //                     schema (if any): descriptor deserializes, nextTag past every tag,
 //                     keyField (if any) a live field
 //   DropTopic         live topic: objectId, name, topicId agree; versions chain; no live
 //                     view reads it
-//   AlterTopicConfig  live topic; versions chain; changes non-empty, no key twice; ranges:
-//                     retention.ms / retention.bytes / delete.retention.ms >= -1,
-//                     min.cleanable.dirty.ratio in [0, 1'000'000] ppm,
-//                     min.compaction.lag.ms >= 0, max.compaction.lag.ms >= -1
+//   AlterTopicConfig  live topic; versions chain; changes non-empty, no key twice, the ratio
+//                     fits 32 bits; the RESULTING config passes topicConfigError
+//   config            (CreateTopic's and AlterTopicConfig's result — ONE validator,
+//                     topicConfigError): retention.ms, retention.bytes, max.compaction.lag.ms
+//                     >= -1; delete.retention.ms, min.compaction.lag.ms >= 0;
+//                     min.cleanable.dirty.ratio in [0, 1'000'000] ppm; segment.bytes in
+//                     [1, kMaxSegmentRollBytes]; retention.check.ms, file.delete.delay.ms >= 1;
+//                     cleanup.policy <= 2, durability <= 1, durability.tier <= 2
 //   CreateSchema      live UNTYPED topic; versions chain; schema as for CreateTopic
 //   AlterSchema       live typed topic; versions chain; schema version not exhausted; ops
 //                     non-empty and not all SET COMPATIBILITY (that is SetCompatibility,
@@ -201,29 +205,19 @@ std::optional<ApplyError> checkViewDef(const CatalogState& s, const CatalogEvent
     return badOps;
 }
 
+/// AlterTopicConfig's own shape: at least one change, no key twice, and a ratio that fits its
+/// i32 field (checked before the narrowing store, so no value wraps into range).  The
+/// RANGES are topicConfigError's, run over the resulting config.
 std::optional<std::string> configChangesError(const CatalogEvent& e, const AlterTopicConfigOps& o) {
     if (o.changes.empty()) return prefix(e) + "no changes";
     uint32_t seen = 0;
     for (const ConfigChange& c : o.changes) {
         const auto k = static_cast<uint8_t>(c.key);
-        const std::string key = "key " + std::to_string(k);
-        if (seen & (1u << k)) return prefix(e) + key + " set twice";
+        if (seen & (1u << k)) return prefix(e) + "key " + std::to_string(k) + " set twice";
         seen |= 1u << k;
-        switch (c.key) {
-        case ConfigKey::RetentionMs:
-        case ConfigKey::RetentionBytes:
-        case ConfigKey::DeleteRetentionMs:
-        case ConfigKey::MaxCompactionLagMs:
-            if (c.value < -1) return prefix(e) + key + " value " + std::to_string(c.value) + " < -1";
-            break;
-        case ConfigKey::MinCompactionLagMs:
-            if (c.value < 0) return prefix(e) + key + " value " + std::to_string(c.value) + " < 0";
-            break;
-        case ConfigKey::MinCleanableDirtyRatioPpm:
-            if (c.value < 0 || c.value > 1'000'000)
-                return prefix(e) + key + " value " + std::to_string(c.value) + " outside [0, 1000000] ppm";
-            break;
-        }
+        if (c.key == ConfigKey::MinCleanableDirtyRatioPpm &&
+            (c.value < std::numeric_limits<int32_t>::min() || c.value > std::numeric_limits<int32_t>::max()))
+            return prefix(e) + "min.cleanable.dirty.ratio " + std::to_string(c.value) + " does not fit 32 bits";
     }
     return std::nullopt;
 }
@@ -248,6 +242,7 @@ Result createTopic(const CatalogState& s, const CatalogEvent& e, int64_t off, co
     if (o.partitions < 1) return fail(off, Code::Precondition, prefix(e) + "partitions " + std::to_string(o.partitions) + " < 1");
     if (o.replicationFactor < 0)
         return fail(off, Code::Precondition, prefix(e) + "replicationFactor " + std::to_string(o.replicationFactor) + " < 0");
+    if (auto c = topicConfigError(o.config)) return fail(off, Code::Precondition, prefix(e) + "config " + *c);
     TopicObject t{.objectId = e.objectId, .name = e.objectName, .version = 1, .topicId = o.topicId,
                   .partitions = o.partitions, .replicationFactor = o.replicationFactor,
                   .persistence = o.persistence, .config = o.config, .schema = std::nullopt};
@@ -276,6 +271,7 @@ Result alterTopicConfig(const CatalogState& s, const CatalogEvent& e, int64_t of
     if (auto c = configChangesError(e, o)) return fail(off, Code::Precondition, std::move(*c));
     TopicObject next = **t;
     applyConfigChanges(next.config, o);
+    if (auto c = topicConfigError(next.config)) return fail(off, Code::Precondition, prefix(e) + "config " + *c);
     next.version = e.newVersion;
     return StagedUpdate{std::move(next)};
 }
@@ -393,6 +389,33 @@ uint16_t schemaVersionOf(const StagedObject& o) noexcept {
 }
 
 } // namespace
+
+std::optional<std::string> topicConfigError(const TopicConfig& c) {
+    auto atLeast = [](std::string_view key, int64_t v, int64_t min) -> std::optional<std::string> {
+        if (v < min) return std::string(key) + " " + std::to_string(v) + " < " + std::to_string(min);
+        return std::nullopt;
+    };
+    auto byte = [](std::string_view key, uint8_t v, uint8_t max) -> std::optional<std::string> {
+        if (v > max) return std::string(key) + " " + std::to_string(v) + " > " + std::to_string(max);
+        return std::nullopt;
+    };
+    if (auto r = byte("cleanup.policy", c.cleanupPolicy, 2)) return r;
+    if (auto r = atLeast("retention.ms", c.retentionMs, -1)) return r;
+    if (auto r = atLeast("retention.bytes", c.retentionBytes, -1)) return r;
+    if (auto r = atLeast("delete.retention.ms", c.deleteRetentionMs, 0)) return r;
+    if (c.minCleanableDirtyRatioPpm < 0 || c.minCleanableDirtyRatioPpm > 1'000'000)
+        return "min.cleanable.dirty.ratio " + std::to_string(c.minCleanableDirtyRatioPpm) + " outside [0, 1000000] ppm";
+    if (auto r = atLeast("segment.bytes", c.segmentRollBytes, 1)) return r;
+    if (c.segmentRollBytes > kMaxSegmentRollBytes)
+        return "segment.bytes " + std::to_string(c.segmentRollBytes) + " > " + std::to_string(kMaxSegmentRollBytes);
+    if (auto r = atLeast("min.compaction.lag.ms", c.minCompactionLagMs, 0)) return r;
+    if (auto r = atLeast("max.compaction.lag.ms", c.maxCompactionLagMs, -1)) return r;
+    if (auto r = atLeast("retention.check.ms", c.retentionCheckMs, 1)) return r;
+    if (auto r = atLeast("file.delete.delay.ms", c.fileDeleteDelayMs, 1)) return r;
+    if (auto r = byte("durability", c.durability, 1)) return r;
+    if (auto r = byte("durability.tier", c.durabilityTier, 2)) return r;
+    return std::nullopt;   // coPartitionGroup, partitionKey: free-form (bounded by the wire's str16)
+}
 
 std::expected<Staged, ApplyError> ApplyV1::run(const CatalogState& s, const CatalogEvent& e, int64_t offset) {
     if (auto v = wire::validateEvent(e))

@@ -86,6 +86,19 @@ struct ApplyError {
     std::string detail;
 };
 
+/// The largest segment roll size a topic may set: segment positions are 32-bit, less one
+/// 64 MiB batch of headroom (the broker's rune::storage::Log::kMaxRollBytes, D19 L1).
+inline constexpr int64_t kMaxSegmentRollBytes = int64_t{INT32_MAX} - (int64_t{64} << 20);
+
+/// THE formatVer-1 TopicConfig rule (ONE validator: CreateTopic's config and the config an
+/// AlterTopicConfig results in), exported so a DDL front end refuses exactly what apply
+/// refuses.  nullopt = valid; otherwise "<key> <value> <rule>" (e.g. "retention.ms -2 < -1"):
+///   retention.ms, retention.bytes, max.compaction.lag.ms >= -1 (-1 = unbounded / disabled);
+///   delete.retention.ms, min.compaction.lag.ms >= 0; min.cleanable.dirty.ratio in
+///   [0, 1'000'000] ppm; segment.bytes in [1, kMaxSegmentRollBytes]; retention.check.ms,
+///   file.delete.delay.ms >= 1; cleanup.policy <= 2, durability <= 1, durability.tier <= 2.
+[[nodiscard]] std::optional<std::string> topicConfigError(const TopicConfig& c);
+
 struct ApplyV1;   // src/catalog/ApplyV1.h — the frozen formatVer-1 rules
 
 class CatalogState {
@@ -114,9 +127,12 @@ public:
     [[nodiscard]] int64_t  appliedOffset() const noexcept { return appliedOffset_; }   // -1 = nothing applied
     /// The applied event carrying `requestId` (ruling 9, F14) — what its DDL answered.  Cold.
     [[nodiscard]] std::optional<RequestRecord> request(const RequestId& requestId) const;
-    /// FNV-1a-64 over (appliedOffset, nextObjectId, nextTopicId, each live object's
-    /// fingerprint in objectId order, each tombstone's in apply order).  Equal digests at
-    /// equal offsets = identical catalogs.
+    /// FNV-1a-64 over exactly: appliedOffset, nextObjectId, nextTopicId, then each live
+    /// object's fingerprint (CatalogFingerprint.h) in objectId order, then each tombstone's
+    /// in apply order.  NOT hashed: which objectId / topicId / viewTopicId each object holds,
+    /// a view's compiledPlanBlob (fingerprints are id-free, ruling 11) and the request
+    /// records.  So equal digests at equal offsets mean equal definitions, counters and
+    /// drop history — the replicas-agree check — not byte-identical CatalogState values.
     [[nodiscard]] uint64_t digest() const noexcept;
 
 private:

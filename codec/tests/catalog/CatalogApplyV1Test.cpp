@@ -313,14 +313,40 @@ std::vector<RefusalCase> refusalCases() {
     c.push_back({"config: key twice", raw(cfg({{K::RetentionMs, 1}, {K::RetentionMs, 2}}), "u", 2, 1, 2), C::Precondition, "set twice"});
     c.push_back({"config: retention.ms", raw(cfg({{K::RetentionMs, -2}}), "u", 2, 1, 2), C::Precondition, "< -1"});
     c.push_back({"config: retention.bytes", raw(cfg({{K::RetentionBytes, -2}}), "u", 2, 1, 2), C::Precondition, "< -1"});
-    c.push_back({"config: delete.retention.ms", raw(cfg({{K::DeleteRetentionMs, -2}}), "u", 2, 1, 2), C::Precondition, "< -1"});
+    c.push_back({"config: delete.retention.ms", raw(cfg({{K::DeleteRetentionMs, -1}}), "u", 2, 1, 2), C::Precondition,
+                 "delete.retention.ms -1 < 0"});
     c.push_back({"config: max lag", raw(cfg({{K::MaxCompactionLagMs, -2}}), "u", 2, 1, 2), C::Precondition, "< -1"});
     c.push_back({"config: min lag", raw(cfg({{K::MinCompactionLagMs, -1}}), "u", 2, 1, 2), C::Precondition, "< 0"});
     c.push_back({"config: ratio < 0", raw(cfg({{K::MinCleanableDirtyRatioPpm, -1}}), "u", 2, 1, 2), C::Precondition, "outside"});
     c.push_back({"config: ratio > 1e6", raw(cfg({{K::MinCleanableDirtyRatioPpm, 1'000'001}}), "u", 2, 1, 2), C::Precondition, "outside"});
+    c.push_back({"config: ratio wraps into range", raw(cfg({{K::MinCleanableDirtyRatioPpm, (int64_t{1} << 32) + 5}}), "u", 2, 1, 2),
+                 C::Precondition, "does not fit 32 bits"});
     c.push_back({"config: bad key", raw(cfg({{static_cast<K>(0), 1}}), "u", 2, 1, 2), C::BadOps, "BadEnum"});
     c.push_back({"config: chain", raw(cfg({{K::RetentionMs, 1}}), "u", 2, 2, 3), C::Precondition, "version chain"});
     c.push_back({"config: a view", raw(cfg({{K::RetentionMs, 1}}), "v", 3, 1, 2), C::Precondition, "no live topic"});
+    // CreateTopic config: THE one TopicConfig validator (I1) — every range class, on create.
+    auto cc = [&](auto mutate) { auto o = ct(3); mutate(o.config); return raw(o, "n", 4, 0, 1); };
+    using TC = rc::TopicConfig;
+    c.push_back({"create config: retention.ms", cc([](TC& k) { k.retentionMs = -2; }), C::Precondition, "retention.ms -2 < -1"});
+    c.push_back({"create config: retention.bytes", cc([](TC& k) { k.retentionBytes = -2; }), C::Precondition, "retention.bytes -2 < -1"});
+    c.push_back({"create config: delete.retention.ms", cc([](TC& k) { k.deleteRetentionMs = -1; }), C::Precondition,
+                 "delete.retention.ms -1 < 0"});
+    c.push_back({"create config: ratio < 0", cc([](TC& k) { k.minCleanableDirtyRatioPpm = -1; }), C::Precondition,
+                 "min.cleanable.dirty.ratio -1 outside [0, 1000000] ppm"});
+    c.push_back({"create config: ratio > 1e6", cc([](TC& k) { k.minCleanableDirtyRatioPpm = 1'000'001; }), C::Precondition,
+                 "min.cleanable.dirty.ratio 1000001 outside"});
+    c.push_back({"create config: segment 0", cc([](TC& k) { k.segmentRollBytes = 0; }), C::Precondition, "segment.bytes 0 < 1"});
+    c.push_back({"create config: segment too big", cc([](TC& k) { k.segmentRollBytes = rc::kMaxSegmentRollBytes + 1; }),
+                 C::Precondition, "segment.bytes 2080374784 > 2080374783"});
+    c.push_back({"create config: min lag", cc([](TC& k) { k.minCompactionLagMs = -1; }), C::Precondition, "min.compaction.lag.ms -1 < 0"});
+    c.push_back({"create config: max lag", cc([](TC& k) { k.maxCompactionLagMs = -2; }), C::Precondition, "max.compaction.lag.ms -2 < -1"});
+    c.push_back({"create config: retention check 0", cc([](TC& k) { k.retentionCheckMs = 0; }), C::Precondition,
+                 "retention.check.ms 0 < 1"});
+    c.push_back({"create config: file delete delay 0", cc([](TC& k) { k.fileDeleteDelayMs = 0; }), C::Precondition,
+                 "file.delete.delay.ms 0 < 1"});
+    c.push_back({"create config: cleanup policy", cc([](TC& k) { k.cleanupPolicy = 3; }), C::BadOps, "BadEnum"});
+    c.push_back({"create config: durability", cc([](TC& k) { k.durability = 2; }), C::BadOps, "BadEnum"});
+    c.push_back({"create config: tier", cc([](TC& k) { k.durabilityTier = 3; }), C::BadOps, "BadEnum"});
     // CreateSchema
     c.push_back({"create schema: typed topic", raw(rc::CreateSchemaOps{schemaDef()}, "src", 1, 1, 2), C::Precondition, "already has a schema"});
     c.push_back({"create schema: chain", raw(rc::CreateSchemaOps{schemaDef()}, "u", 2, 1, 3), C::Precondition, "version chain"});
@@ -348,6 +374,34 @@ std::vector<RefusalCase> refusalCases() {
     c.push_back({"alter: drop under Forward",
                  raw(alt({rc::ResolvedAlterOp{.type = cd::AlterOpType::SetCompatibility, .mode = cd::CompatMode::Forward}, dropOp(1)}),
                      "src", 1, 1, 2), C::BadOps, "Forward"});
+    // AlterSchema: non-canonical resolved ops, RENAME collisions (M2), escaped names (M3)
+    auto ren = [](uint16_t tag, std::string to) {
+        return rc::ResolvedAlterOp{.type = cd::AlterOpType::Rename, .tag = tag, .name = std::move(to)};
+    };
+    { auto r = ren(1, "health"); r.primType = cd::PrimType::Int64;
+      c.push_back({"alter: rename carries a type", raw(alt({r}), "src", 1, 1, 2), C::Precondition, "RENAME tag 1: carries fields"}); }
+    { auto r = ren(1, "health"); r.fixedLen = 4;
+      c.push_back({"alter: rename carries a width", raw(alt({r}), "src", 1, 1, 2), C::Precondition, "RENAME tag 1: carries fields"}); }
+    { auto r = ren(1, "health"); r.mode = cd::CompatMode::Forward;
+      c.push_back({"alter: rename carries a mode", raw(alt({r}), "src", 1, 1, 2), C::Precondition, "RENAME tag 1: carries fields"}); }
+    { auto a = addOp(2, "mana"); a.mode = cd::CompatMode::Forward;
+      c.push_back({"alter: add carries a mode", raw(alt({a}), "src", 1, 1, 2), C::Precondition, "carries a compatibility mode"}); }
+    c.push_back({"alter: set-compat carries a tag",
+                 raw(alt({addOp(2, "mana"), rc::ResolvedAlterOp{.type = cd::AlterOpType::SetCompatibility, .tag = 1}}), "src", 1, 1, 2),
+                 C::Precondition, "SET COMPATIBILITY: carries fields"});
+    c.push_back({"alter: set-compat carries a name",
+                 raw(alt({addOp(2, "mana"), rc::ResolvedAlterOp{.type = cd::AlterOpType::SetCompatibility, .name = "x"}}), "src", 1, 1, 2),
+                 C::Precondition, "SET COMPATIBILITY: carries fields"});
+    c.push_back({"alter: drop carries a type",
+                 raw(alt({rc::ResolvedAlterOp{.type = cd::AlterOpType::Drop, .tag = 1, .primType = cd::PrimType::Bool}}), "src", 1, 1, 2),
+                 C::Precondition, "DROP tag 1: carries fields"});
+    c.push_back({"alter: rename onto a live name", raw(alt({ren(1, "id")}), "src", 1, 1, 2), C::Precondition,
+                 "RENAME tag 1: 'id' collides"});
+    c.push_back({"alter: rename to empty", raw(alt({ren(1, "")}), "src", 1, 1, 2), C::Precondition, "new name is empty"});
+    c.push_back({"alter: rename of a dead tag", raw(alt({ren(8, "z")}), "src", 1, 1, 2), C::Precondition, "RENAME tag 8: not a live"});
+    c.push_back({"alter: add with an empty name", raw(alt({addOp(2, "")}), "src", 1, 1, 2), C::Precondition, "field name is empty"});
+    c.push_back({"alter: a raw control byte is escaped", raw(alt({addOp(7, "x\ny\x1b")}), "src", 1, 1, 2), C::Precondition,
+                 "ADD 'x\\x0ay\\x1b': tag 7"});
     // SetCompatibility
     c.push_back({"set compat: untyped", raw(rc::SetCompatibilityOps{cd::CompatMode::Forward}, "u", 2, 1, 2), C::Precondition, "is untyped"});
     c.push_back({"set compat: chain", raw(rc::SetCompatibilityOps{cd::CompatMode::Forward}, "src", 1, 0, 1), C::Precondition, "version chain"});
@@ -375,6 +429,13 @@ std::vector<RefusalCase> refusalCases() {
     c.push_back({"alter view: chain", raw(av(viewOver({"src"}, 3)), "v", 3, 2, 3), C::Precondition, "version chain"});
     c.push_back({"alter view: same sink", raw(av(viewOver({"src"}, 2)), "v", 3, 1, 2), C::Precondition, "not a fresh sink"});
     c.push_back({"alter view: dead source", raw(av(viewOver({"gone"}, 3)), "v", 3, 1, 2), C::Precondition, "not a live topic"});
+    c.push_back({"alter view: source is a view", raw(av(viewOver({"v"}, 3)), "v", 3, 1, 2), C::Precondition,
+                 "source 'v' is not a live topic"});
+    { auto v = viewOver({"src"}, 3); v.keyField = "nope";
+      c.push_back({"alter view: key field", raw(av(v), "v", 3, 1, 2), C::Precondition, "key field 'nope' is not a field of the output"}); }
+    { auto v = viewOver({"src"}, 3); v.sinkPartitions = 0;
+      c.push_back({"alter view: sink partitions", raw(av(v), "v", 3, 1, 2), C::Precondition, "sinkPartitions 0"}); }
+    c.push_back({"alter view: a topic's objectId", raw(av(viewOver({"src"}, 3)), "src", 1, 1, 2), C::Precondition, "no live view"});
     // DropView
     c.push_back({"drop view: unknown", raw(rc::DropViewOps{2}, "v", 2, 1, 2), C::Precondition, "no live view"});
     c.push_back({"drop view: sink disagrees", raw(rc::DropViewOps{0}, "v", 3, 1, 2), C::Precondition, "sinks to 2"});
@@ -388,13 +449,16 @@ TEST(CatalogApplyV1Regression, EveryRuleRefusesEachInvalidPreconditionAndPreview
         rc::CatalogState s = fixture();
         const uint64_t before = s.digest();
         auto p = rc::previewFingerprint(s, c.e);
-        ASSERT_FALSE(p.has_value()) << c.what;
+        if (p.has_value()) { ADD_FAILURE() << c.what << ": accepted by previewFingerprint"; continue; }
         EXPECT_EQ(p.error().code, c.code) << c.what << ": " << p.error().detail;
         auto a = rc::apply(s, c.e, 3);
-        ASSERT_FALSE(a.has_value()) << c.what;
+        if (a.has_value()) { ADD_FAILURE() << c.what << ": accepted by apply"; continue; }
         EXPECT_EQ(a.error().code, c.code) << c.what << ": " << a.error().detail;
         EXPECT_EQ(a.error().offset, 3) << c.what;
         EXPECT_NE(a.error().detail.find(c.detail), std::string::npos) << c.what << ": " << a.error().detail;
+        for (const char ch : a.error().detail)
+            EXPECT_TRUE(static_cast<unsigned char>(ch) >= 0x20 && static_cast<unsigned char>(ch) < 0x7f)
+                << c.what << ": a detail never carries a raw control or non-ASCII byte";
         EXPECT_EQ(s.digest(), before) << c.what;
         EXPECT_EQ(s.appliedOffset(), 2) << c.what;
     }
@@ -549,4 +613,117 @@ TEST(CatalogApplyV1Regression, DigestIsAFunctionOfTheAppliedPrefix) {
     rc::CatalogState c = fixture();
     ASSERT_TRUE(rc::apply(c, stamped(c, rc::DropViewOps{2}, "v", 3, 1, 2), 4));
     EXPECT_NE(a.digest(), c.digest()) << "the applied offset is part of the digest";
+}
+
+// ── fix round 1 (M2): exhaustion and tombstoned objects ─────────────────────────────
+TEST(CatalogApplyV1Regression, FieldTagExhaustionIsRefusedNeverWrapped) {
+    rc::CatalogState s;
+    auto o = createOps(0, true);
+    o.schema->nextTag = 0xFFFF;   // legal: past every tag; but no tag is left to assign
+    ASSERT_TRUE(rc::apply(s, stamped(s, o, "t", 1, 0, 1), 0));
+    const rc::SchemaState& schema = *s.topicByName("t")->schema;
+    cd::AlterOp add{}; add.type = cd::AlterOpType::Add; add.name = "mana"; add.primType = cd::PrimType::Int32;
+    auto r = rc::resolveAlterOps(schema, std::vector<cd::AlterOp>{add});
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().find("field tags are exhausted"), std::string::npos) << r.error();
+    const uint64_t before = s.digest();
+    auto a = rc::apply(s, raw(rc::AlterSchemaOps{{addOp(0xFFFF, "mana")}}, "t", 1, 1, 2), 1);
+    ASSERT_FALSE(a.has_value());
+    EXPECT_EQ(a.error().code, rc::ApplyError::Code::Precondition);
+    EXPECT_NE(a.error().detail.find("field tags are exhausted"), std::string::npos) << a.error().detail;
+    EXPECT_EQ(s.digest(), before);
+    // One below the limit still works and leaves nextTag at the limit.
+    rc::SchemaState almost = schema; almost.nextTag = 0xFFFE;
+    auto ok = rc::resolveAlterOps(almost, std::vector<cd::AlterOp>{add});
+    ASSERT_TRUE(ok.has_value()) << ok.error();
+    EXPECT_EQ((*ok)[0].tag, 0xFFFE);
+    EXPECT_FALSE(rc::resolveAlterOps(almost, std::vector<cd::AlterOp>{add, add}).has_value()) << "the second ADD has no tag";
+}
+
+TEST(CatalogApplyV1Regression, SchemaVersionExhaustionIsRefused) {
+    // 0xFFFF is the untilVersion sentinel: the last assignable schema version is 0xFFFE.
+    rc::CatalogState s;
+    ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, true), "t", 1, 0, 1), 0));
+    int64_t off = 1;
+    uint32_t ver = 1;
+    for (uint32_t sv = 1; sv < 0xFFFE; ++sv, ++ver, ++off) {
+        auto mode = (sv % 2) ? cd::CompatMode::Forward : cd::CompatMode::Backward;
+        auto e = raw(rc::SetCompatibilityOps{mode}, "t", 1, ver, ver + 1);
+        auto fp = rc::previewFingerprint(s, e);
+        ASSERT_TRUE(fp.has_value()) << sv << ": " << fp.error().detail;
+        e.fingerprint = *fp;
+        ASSERT_TRUE(rc::apply(s, e, off)) << sv;
+    }
+    ASSERT_EQ(s.topicByName("t")->schema->schemaVersion, 0xFFFE);
+    for (rc::Ops ops : {rc::Ops{rc::SetCompatibilityOps{cd::CompatMode::Forward}},
+                        rc::Ops{rc::AlterSchemaOps{{addOp(2, "mana")}}}}) {
+        auto a = rc::apply(s, raw(ops, "t", 1, ver, ver + 1), off);
+        ASSERT_FALSE(a.has_value());
+        EXPECT_EQ(a.error().code, rc::ApplyError::Code::Precondition);
+        EXPECT_NE(a.error().detail.find("schema version 65534 is exhausted"), std::string::npos) << a.error().detail;
+    }
+}
+
+TEST(CatalogApplyV1Regression, ATombstonedObjectIdIsNeverLiveAgain) {
+    rc::CatalogState s = fixture();
+    ASSERT_TRUE(rc::apply(s, stamped(s, rc::DropViewOps{2}, "v", 3, 1, 2), 3));
+    ASSERT_TRUE(rc::apply(s, stamped(s, rc::DropTopicOps{1}, "u", 2, 1, 2), 4));
+    struct Case { const char* what; rc::CatalogEvent e; const char* detail; };
+    const Case cases[] = {
+        {"drop a dropped topic", raw(rc::DropTopicOps{1}, "u", 2, 2, 3), "no live topic with objectId 2"},
+        {"drop a dropped view", raw(rc::DropViewOps{2}, "v", 3, 2, 3), "no live view with objectId 3"},
+        {"alter a dropped topic", raw(rc::SetCompatibilityOps{cd::CompatMode::Forward}, "u", 2, 2, 3), "no live topic"},
+        {"alter a dropped view", raw(rc::AlterViewOps{viewOver({"src"}, 3)}, "v", 3, 2, 3), "no live view"},
+        {"config of a dropped topic", raw(rc::AlterTopicConfigOps{{{rc::ConfigKey::RetentionMs, 1}}}, "u", 2, 2, 3), "no live topic"},
+        {"re-create under the old objectId", raw(createOps(3, false), "u", 2, 0, 1), "objectId 2, next is 4"},
+    };
+    for (const auto& c : cases) {
+        const uint64_t before = s.digest();
+        auto a = rc::apply(s, c.e, 5);
+        ASSERT_FALSE(a.has_value()) << c.what;
+        EXPECT_EQ(a.error().code, rc::ApplyError::Code::Precondition) << c.what;
+        EXPECT_NE(a.error().detail.find(c.detail), std::string::npos) << c.what << ": " << a.error().detail;
+        EXPECT_EQ(s.digest(), before) << c.what;
+    }
+}
+
+TEST(CatalogApplyV1Regression, ResolveAndUnresolveEscapeNamesInTheirErrors) {
+    rc::CatalogState s;
+    ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, true), "t", 1, 0, 1), 0));
+    const rc::SchemaState& schema = *s.topicByName("t")->schema;
+    cd::AlterOp ghost{}; ghost.type = cd::AlterOpType::Drop; ghost.name = "gh\x1b[2Jost\n";
+    auto r = rc::resolveAlterOps(schema, std::vector<cd::AlterOp>{ghost});
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().find("'gh\\x1b[2Jost\\x0a'"), std::string::npos) << r.error();
+    EXPECT_EQ(r.error().find('\x1b'), std::string::npos);
+    EXPECT_EQ(r.error().find('\n'), std::string::npos);
+    auto u = rc::unresolveAlterOps(schema, std::vector<rc::ResolvedAlterOp>{addOp(9, "a\tb")});
+    ASSERT_FALSE(u.has_value());
+    EXPECT_NE(u.error().find("'a\\x09b'"), std::string::npos) << u.error();
+}
+
+TEST(CatalogApplyV1Regression, TopicConfigErrorIsTheOneValidator) {
+    EXPECT_FALSE(rc::topicConfigError(rc::TopicConfig{}).has_value()) << "today's defaults are valid";
+    rc::TopicConfig edge;
+    edge.retentionMs = -1; edge.retentionBytes = -1; edge.maxCompactionLagMs = -1;
+    edge.deleteRetentionMs = 0; edge.minCompactionLagMs = 0; edge.minCleanableDirtyRatioPpm = 0;
+    edge.segmentRollBytes = rc::kMaxSegmentRollBytes; edge.retentionCheckMs = 1; edge.fileDeleteDelayMs = 1;
+    edge.cleanupPolicy = 2; edge.durability = 1; edge.durabilityTier = 2;
+    EXPECT_FALSE(rc::topicConfigError(edge).has_value()) << *rc::topicConfigError(edge);
+    edge.minCleanableDirtyRatioPpm = 1'000'000; edge.segmentRollBytes = 1;
+    EXPECT_FALSE(rc::topicConfigError(edge).has_value());
+    // The enum ranges (apply refuses them earlier as BadOps; front ends rely on this function).
+    auto refused = [](auto mutate, const char* want) {
+        rc::TopicConfig c; mutate(c);
+        auto e = rc::topicConfigError(c);
+        return e.has_value() && e->find(want) != std::string::npos;
+    };
+    EXPECT_TRUE(refused([](rc::TopicConfig& c) { c.cleanupPolicy = 3; }, "cleanup.policy 3 > 2"));
+    EXPECT_TRUE(refused([](rc::TopicConfig& c) { c.durability = 2; }, "durability 2 > 1"));
+    EXPECT_TRUE(refused([](rc::TopicConfig& c) { c.durabilityTier = 3; }, "durability.tier 3 > 2"));
+    // AlterTopicConfig validates the RESULTING config with the same function.
+    rc::CatalogState s = fixture();
+    auto a = rc::apply(s, raw(rc::AlterTopicConfigOps{{{rc::ConfigKey::MinCompactionLagMs, -5}}}, "u", 2, 1, 2), 3);
+    ASSERT_FALSE(a.has_value());
+    EXPECT_NE(a.error().detail.find("config min.compaction.lag.ms -5 < 0"), std::string::npos) << a.error().detail;
 }
