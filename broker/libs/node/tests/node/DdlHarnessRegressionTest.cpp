@@ -1115,34 +1115,48 @@ TEST_P(DdlDemotionRegression, DemotionAnswersInternalAtOnceStartsNothingAndAppli
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-TEST_P(DdlDemotionRegression, RepromotionRunsTheQueuedOpsInFifoOrder) {
+// Final review I4 (production truth): the admin thread keeps ticking while demoted,
+// so the leader guard answers every QUEUED op Internal on the ticks after the
+// demotion — in FIFO order, nothing started, nothing applied.  (The queue never
+// "survives into the new term": that needs zero admin ticks between demote and
+// promote, which production cannot produce.)  The re-promoted leader then serves
+// a fresh request.
+TEST_P(DdlDemotionRegression, DemotionAnswersEveryQueuedOpInternalInFifoOrder) {
     const B4State s = GetParam();
     DdlHarness h(options(s));
     const int64_t x = driveInto(h, s);
     const int64_t y = h.submit(Op::DefineDisk, "q1");
     const int64_t w = h.submit(Op::AlterAdd, "src2");
     const int64_t u = h.submit(Op::ViewTransient, "q3");
+    const int reqs = h.createRequests();
 
     h.demote();
     ASSERT_TRUE(h.response(x).has_value());
     EXPECT_EQ(h.response(x)->err, kInternal);
-    h.promote();   // no tick while demoted: the queue survives into the new term
-    if (b4AwaitingId(s)) h.deliverCreate();   // x's stale reply
-    h.setControl(ControlMode::Auto);
-    h.settle();
-
-    ASSERT_TRUE(h.response(y).has_value());
-    ASSERT_TRUE(h.response(w).has_value());
-    ASSERT_TRUE(h.response(u).has_value());
-    EXPECT_EQ(h.response(y)->err, kOk);
-    EXPECT_EQ(h.response(w)->err, kOk);
-    EXPECT_EQ(h.response(w)->version, 2u);
-    EXPECT_EQ(h.response(u)->err, kOk);
+    for (int i = 0; i < 10; ++i) h.tick();   // the admin thread ticks while demoted
+    EXPECT_EQ(h.worker().pendingCount(), 0u) << "the queue drains while demoted";
+    for (const int64_t c : {y, w, u}) {
+        ASSERT_TRUE(h.response(c).has_value()) << "every queued op is answered while demoted";
+        EXPECT_EQ(h.response(c)->err, kInternal) << "retry on the new leader";
+    }
     std::vector<int64_t> order;
     for (const Response& r : h.responses())
-        if (r.corr == y || r.corr == w || r.corr == u) order.push_back(r.corr);
-    EXPECT_EQ(order, (std::vector<int64_t>{y, w, u})) << "FIFO after re-promotion";
+        if (r.corr == x || r.corr == y || r.corr == w || r.corr == u) order.push_back(r.corr);
+    EXPECT_EQ(order, (std::vector<int64_t>{x, y, w, u})) << "answered in FIFO order";
+    EXPECT_EQ(h.createRequests(), reqs) << "a demoted leader requests no topic";
+
+    if (b4AwaitingId(s)) h.deliverCreate();   // x's stale reply
+    h.promote();
+    h.setControl(ControlMode::Auto);
+    h.settle();
+    EXPECT_EQ(h.schemas().byName("q1"), nullptr);
+    EXPECT_EQ(h.schemas().byName("src2")->version, 1u);
+    EXPECT_EQ(h.views().byName("q3"), nullptr);
     EXPECT_FALSE(applied(h, s));
+    const int64_t z = h.submit(Op::DefineDisk, "q1");
+    h.settle();
+    ASSERT_TRUE(h.response(z).has_value());
+    EXPECT_EQ(h.response(z)->err, kOk) << "the re-promoted leader serves the retry";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 

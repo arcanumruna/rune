@@ -1,12 +1,13 @@
 // DdlOccupantMatrixRegressionTest.cpp — DDL conformance plan Task 8.
 //
-// One op against a name in every occupancy state (38 rows x 12 ops = 456 cells), driven
+// One op against a name in every occupancy state (41 rows x 12 ops = 492 cells), driven
 // through DdlHarness.  Expectations come ONLY from DdlExpectations.h.  Every cell
 // asserts the exact code, the requestCreateTopic count, no half-creation, the
 // final catalog delta, the serialization invariant, and the catalog after a restart.
 #include <gtest/gtest.h>
 #include "support/DdlHarness.h"
 
+#include <algorithm>
 #include <ostream>
 #include <string>
 #include <tuple>
@@ -21,7 +22,12 @@ enum class Setup : uint8_t {
     None, TypedDisk, TypedTransient, ViewPersisted, ViewTransient, StaticDisk, StaticTransient,
     RecoveredTyped, RecoveredView, OrphanDefineDisk, OrphanDefineTransient, OrphanSink,
     OrphanSinkAfterRestart,
+    // Final review I5(b): KL2 — the op appended its record, then timed out in
+    // AwaitingCommit (answered Internal, never applied live); the record committed.
+    // Live it is an orphan; after the restart (every cell restarts) it is committed.
+    InDoubtDefine, InDoubtView,
 };
+[[nodiscard]] constexpr bool isInDoubt(Setup s) noexcept { return s == Setup::InDoubtDefine || s == Setup::InDoubtView; }
 
 struct Row {
     const char* label;      // test-name fragment ([A-Za-z0-9_] only)
@@ -51,6 +57,9 @@ std::vector<Row> rows() {
         {"CaseVariantOfView",          Setup::ViewPersisted,          "Viewy", "viewy", Occupant::CaseVariant},
         {"CaseVariantOfStatic",        Setup::StaticDisk,             "Stat",  "stat",  Occupant::CaseVariant},
         {"CaseVariantOfOrphan",        Setup::OrphanDefineDisk,       "Orph",  "orph",  Occupant::CaseVariant},
+        {"InDoubtDefine",              Setup::InDoubtDefine,          "occ",   "occ",   Occupant::SchemaLessDisk},
+        {"InDoubtView",                Setup::InDoubtView,            "occ",   "occ",   Occupant::OrphanSink},
+        {"CaseVariantOfInDoubtView",   Setup::InDoubtView,            "Indo",  "indo",  Occupant::CaseVariant},
     };
     const std::vector<std::pair<const char*, std::string>> bad = {
         {"Reserved_topic_schemas",      "__topic_schemas"},
@@ -81,6 +90,7 @@ std::vector<Row> rows() {
 
 DdlHarnessOptions optionsFor(const Row& row) {
     DdlHarnessOptions o;
+    o.holdCommits = isInDoubt(row.setup);   // the HW waits for follower 2: an op can sit in AwaitingCommit
     if (row.setup == Setup::StaticDisk || row.setup == Setup::StaticTransient) {
         TopicSpec s;
         s.name = row.occupant;
@@ -96,6 +106,20 @@ void create(DdlHarness& h, Op op, const std::string& name) {
     h.settle();
     ASSERT_TRUE(h.response(c).has_value());
     ASSERT_EQ(h.response(c)->err, kOk) << "setup " << opName(op) << " '" << name << "'";
+}
+
+/// KL2: `op` appends its record, times out in AwaitingCommit (answered Internal,
+/// never applied live), then the record commits.
+void makeInDoubt(DdlHarness& h, Op op, const std::string& name) {
+    const int64_t c = h.submit(op, name);
+    ASSERT_TRUE(h.tickUntilAppended());
+    h.advance(AdminWorker::ddlTimeoutNs() + 1'000'000);
+    h.tick();
+    ASSERT_TRUE(h.response(c).has_value());
+    ASSERT_EQ(h.response(c)->err, kInternal);
+    h.releaseCommits();
+    h.tick();
+    ASSERT_FALSE(h.commitHeld()) << "the in-doubt record committed";
 }
 
 /// A create whose control thread made the topic but whose reply failed: an orphan.
@@ -124,6 +148,8 @@ void setupOccupant(DdlHarness& h, const Row& row) {
         case Setup::OrphanDefineDisk:       makeOrphan(h, Op::DefineDisk, row.occupant); return;
         case Setup::OrphanDefineTransient:  makeOrphan(h, Op::DefineTransient, row.occupant); return;
         case Setup::OrphanSink:             makeOrphan(h, Op::ViewPersisted, row.occupant); return;
+        case Setup::InDoubtDefine:          makeInDoubt(h, Op::DefineDisk, row.occupant); return;
+        case Setup::InDoubtView:            makeInDoubt(h, Op::ViewPersisted, row.occupant); return;
         case Setup::OrphanSinkAfterRestart:
             makeOrphan(h, Op::ViewPersisted, row.occupant);
             if (::testing::Test::HasFatalFailure()) return;
@@ -213,8 +239,26 @@ TEST_P(DdlOccupantMatrixRegression, OneOpOnAnOccupiedName) {
     }
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 
+    Catalog wantAfter = h.expectedAfterRestart(after);
+    if (isInDoubt(row.setup)) {
+        // The in-doubt record committed: after a restart the topic is the in-doubt
+        // op's committed kind — unless this op adopted it (then it is this op's).
+        // The reference is the same setup restarted with no op in between.
+        DdlHarness ref(optionsFor(row));
+        setupOccupant(ref, row);
+        if (HasFatalFailure()) return;
+        ref.restart();
+        const Catalog refCat = ref.catalog();
+        const CatalogEntry* committed = findEntry(refCat, row.occupant);
+        ASSERT_NE(committed, nullptr);
+        const CatalogEntry* live = findEntry(after, row.occupant);
+        const CatalogEntry kept = (live != nullptr && live->kind != EntryKind::SchemaLess) ? *live : *committed;
+        std::erase_if(wantAfter, [&](const CatalogEntry& e) { return e.id == committed->id; });
+        wantAfter.push_back(kept);
+        std::sort(wantAfter.begin(), wantAfter.end(), [](const CatalogEntry& a, const CatalogEntry& b) { return a.id < b.id; });
+    }
     h.restart();
-    EXPECT_EQ(h.catalog(), h.expectedAfterRestart(after)) << "state after a restart";
+    EXPECT_EQ(h.catalog(), wantAfter) << "state after a restart";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 

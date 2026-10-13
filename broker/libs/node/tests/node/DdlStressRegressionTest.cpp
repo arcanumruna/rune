@@ -3,14 +3,23 @@
 // Deterministic, seeded, model-checked: 3 simulated sessions submit random DDL over
 // a small colliding name pool (incl. a case variant, a reserved and an empty name)
 // while the scheduler delivers control replies (ok / fail / fail-after-create /
-// timeout / demotion) and releases commits in random interleavings, with frequent
+// timeout / demotion — in AwaitingId, and after the record was appended: timeout /
+// demotion in AwaitingCommit, KL2 "in doubt") and releases commits in random
+// interleavings, with frequent
 // restarts (>= 5% of steps; each drains to quiescence first).  The broker is
 // multi-node throughout (replica set {1,2}, also after a restart): commits can be
 // held and leadership can flap in every boot.  CREATE VIEW reads 1 or 2 sources
 // drawn from typed disk / typed transient topics, view outputs, schema-less and
 // missing names.  Every answer is checked against a reference model — name ->
 // Occupant (kind + persistence) + version — that applies ops in FIFO submission
-// order using ONLY the expectation table and the plan's view-source rules.  Worker
+// order using ONLY the expectation table and the plan's view-source rules.  A
+// demotion answers the in-flight op AND every queued op (the admin thread keeps
+// ticking while demoted: the leader guard answers each Internal, after the
+// admin-detected name / TopicExists checks).  An op answered Internal in
+// AwaitingCommit is IN DOUBT: live its topic is an orphan (a DefineTopic over it
+// adopts it; a DefineTopic over an in-doubt view sink is refused 25, I2); once
+// its record commits, the next promotion or restart makes it the committed kind.
+// Worker
 // view installs (commit and recovery) are checked against the model.  The final
 // catalog is checked against the model before and after a restart.
 //
@@ -58,33 +67,45 @@ using namespace rune::node::test;
 
 namespace {
 
-enum class Fault : uint8_t { None, FailNoCreate, FailAfterCreate, TimeoutInAwaitingId, DemoteInAwaitingId };
+enum class Fault : uint8_t {
+    None, FailNoCreate, FailAfterCreate, TimeoutInAwaitingId, DemoteInAwaitingId,
+    TimeoutInAwaitingCommit, DemoteInAwaitingCommit,   // final review I5(b): after the append (KL2)
+};
+constexpr int kFaultCount = 7;
 
 const char* faultName(Fault f) {
     switch (f) {
-        case Fault::None:                return "none";
-        case Fault::FailNoCreate:        return "failNoCreate";
-        case Fault::FailAfterCreate:     return "failAfterCreate";
-        case Fault::TimeoutInAwaitingId: return "timeout";
-        case Fault::DemoteInAwaitingId:  return "demote";
+        case Fault::None:                    return "none";
+        case Fault::FailNoCreate:            return "failNoCreate";
+        case Fault::FailAfterCreate:         return "failAfterCreate";
+        case Fault::TimeoutInAwaitingId:     return "timeout";
+        case Fault::DemoteInAwaitingId:      return "demote";
+        case Fault::TimeoutInAwaitingCommit: return "timeoutAfterAppend";
+        case Fault::DemoteInAwaitingCommit:  return "demoteAfterAppend";
     }
     return "?";
+}
+constexpr bool isCommitFault(Fault f) noexcept {
+    return f == Fault::TimeoutInAwaitingCommit || f == Fault::DemoteInAwaitingCommit;
 }
 
 /// Task 9's timing classes, as the stress schedule produces them.  T1..T4: the
 /// worker's state when a DDL op is SUBMITTED (idle / behind queued ops / another op
 /// in AwaitingId / another op in AwaitingCommit).  T5a..T6: a create reply acted on
-/// with that fault.  T7: an op on a name a DDL op touched in an earlier boot and
-/// none since this boot (A, restart, B).
-enum Timing : uint8_t { T1, T2, T3, T4, T5a, T5b, T5c, T6, T7, kTimingCount };
-const char* const kTimingNames[kTimingCount] = {"T1", "T2", "T3", "T4", "T5a", "T5b", "T5c", "T6", "T7"};
+/// with that fault.  T5d / T6b: a timeout / demotion AFTER the record was appended
+/// (AwaitingCommit — the op is in doubt).  T7: an op on a name a DDL op touched in
+/// an earlier boot and none since this boot (A, restart, B).
+enum Timing : uint8_t { T1, T2, T3, T4, T5a, T5b, T5c, T5d, T6, T6b, T7, kTimingCount };
+const char* const kTimingNames[kTimingCount] = {"T1", "T2", "T3", "T4", "T5a", "T5b", "T5c", "T5d", "T6", "T6b", "T7"};
 Timing timingOfFault(Fault f) {
     switch (f) {
-        case Fault::FailNoCreate:        return T5a;
-        case Fault::FailAfterCreate:     return T5b;
-        case Fault::TimeoutInAwaitingId: return T5c;
-        case Fault::DemoteInAwaitingId:  return T6;
-        case Fault::None:                break;
+        case Fault::FailNoCreate:            return T5a;
+        case Fault::FailAfterCreate:         return T5b;
+        case Fault::TimeoutInAwaitingId:     return T5c;
+        case Fault::DemoteInAwaitingId:      return T6;
+        case Fault::TimeoutInAwaitingCommit: return T5d;
+        case Fault::DemoteInAwaitingCommit:  return T6b;
+        case Fault::None:                    break;
     }
     return kTimingCount;
 }
@@ -94,6 +115,7 @@ struct Submitted {
     int64_t corr; Op op; std::string name; Fault fault;
     std::vector<std::string> sources;
     uint16_t sourceErr;   // the view-source rules' verdict at SUBMIT time (0 = sources ok)
+    bool demotedQueued = false;   // still queued when the leader was demoted (I4)
 };
 
 const std::vector<std::string> kPool = {"a", "b", "A", "s", "src", "__views", ""};
@@ -111,6 +133,10 @@ struct Model {
     std::map<std::string, Occupant> occ;       // exact name -> occupant (absent = Free)
     std::map<std::string, uint16_t> version;
     std::vector<std::string>        statics;   // schema-less boot topics survive restarts
+    /// KL2: per name, the in-doubt records in log order — the kind each would give
+    /// the name, and whether the HW covers it yet (releaseCommits / a restart).
+    struct InDoubt { Occupant committedAs; bool recordCommitted; };
+    std::map<std::string, std::vector<InDoubt>> inDoubt;
 
     Occupant at(const std::string& n) const {
         if (!isValidTopicName(n)) return Occupant::BadName;
@@ -144,8 +170,17 @@ struct Model {
     /// precede every control-detected cell (createRequests == 1) and every fault.
     uint16_t apply(const Submitted& s) {
         const Occupant o = at(s.name);
+        if (s.demotedQueued) return demotedAnswer(o, s.op);
         const Cell c = expectedCell(o, s.op);
         if (isView(s.op) && c.createRequests == 1 && s.sourceErr != kOk) return s.sourceErr;
+        if (c.createRequests == 1 && isCommitFault(s.fault)) {
+            // The fault strikes in AwaitingCommit — only an op whose cell succeeds
+            // gets there (a control-detected rejection ends at the reply).
+            if (c.code != kOk) return c.code;
+            if (o == Occupant::Free) occ[s.name] = orphanOf(s.op);   // live: an orphan
+            inDoubt[s.name].push_back(InDoubt{occupantAfterSuccess(o, s.op), false});
+            return kInternal;
+        }
         if (c.createRequests == 1 && s.fault != Fault::None) {
             if (s.fault != Fault::FailNoCreate && o == Occupant::Free) occ[s.name] = orphanOf(s.op);
             return kInternal;
@@ -156,7 +191,44 @@ struct Model {
         }
         return c.code;
     }
+    /// I4: an op still queued when the leader was demoted is answered on the next
+    /// admin tick: a DefineTopic's admin-detected checks (name rule 40, an exact
+    /// typed / view name 25) precede the leader guard; everything else is Internal.
+    uint16_t demotedAnswer(Occupant o, Op op) const {
+        if (o == Occupant::BadName && isCreate(op)) return kInvalidTopicName;
+        if (isDefine(op) && (o == Occupant::TypedDisk || o == Occupant::TypedTransient ||
+                             o == Occupant::ViewPersisted || o == Occupant::ViewTransient))
+            return kTopicExists;
+        return kInternal;
+    }
+    static bool unclaimed(Occupant o) {
+        return o == Occupant::Free || o == Occupant::SchemaLessDisk || o == Occupant::SchemaLessTransient ||
+               o == Occupant::OrphanSink;
+    }
+    /// The HW now covers every appended record (releaseCommits while leading).
+    void commitsReleased() {
+        for (auto& [n, v] : inDoubt) for (InDoubt& d : v) d.recordCommitted = true;
+    }
+    /// A promotion replays the committed catalogs: a committed in-doubt record on a
+    /// name nothing claimed live since becomes that name's kind.  `all` (a restart:
+    /// the rebooted follower learns the HW = every appended record) resolves all.
+    void resolveInDoubt(bool all) {
+        for (auto it = inDoubt.begin(); it != inDoubt.end();) {
+            std::vector<InDoubt>& v = it->second;
+            const Occupant* last = nullptr;
+            std::size_t keepFrom = 0;
+            for (std::size_t i = 0; i < v.size(); ++i)
+                if (all || v[i].recordCommitted) { last = &v[i].committedAs; keepFrom = i + 1; }
+            if (last != nullptr && unclaimed(exact(it->first))) {
+                occ[it->first] = *last;
+                version[it->first] = 1;
+            }
+            v.erase(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(keepFrom));
+            it = v.empty() ? inDoubt.erase(it) : std::next(it);
+        }
+    }
     void restart() {   // an orphan's name is free again (it became __orphan.<id> or vanished)
+        resolveInDoubt(/*all=*/true);
         for (auto& [n, o] : occ) {
             const bool schemaLess = o == Occupant::SchemaLessDisk || o == Occupant::SchemaLessTransient ||
                                     o == Occupant::OrphanSink;
@@ -180,7 +252,7 @@ Op drawOp(std::mt19937_64& rng) {
 Fault drawFault(std::mt19937_64& rng) {
     const uint64_t r = rng() % 100;
     if (r < 70) return Fault::None;
-    return static_cast<Fault>(1 + (r % 4));
+    return static_cast<Fault>(1 + (r % (kFaultCount - 1)));
 }
 std::vector<std::string> drawSources(std::mt19937_64& rng) {
     std::vector<std::string> v{kSources[rng() % kSources.size()]};
@@ -241,7 +313,9 @@ void expectNoSteadyStateAlloc(DdlHarness& h, const char* what) {
 struct StressStats {
     uint64_t steps = 0, ddl = 0, reads = 0, views = 0, twoSourceViews = 0, restarts = 0, flaps = 0, flapsAfterRestart = 0;
     uint64_t allocGates = 0, heldAfterRestart = 0;   // HW-gate waits in a rebooted (multi-node) broker
-    uint64_t faults[5] = {};                // create replies acted on, by Fault
+    uint64_t faults[kFaultCount] = {};      // create replies acted on, by Fault
+    uint64_t inDoubtOps = 0;                // ops actually struck in AwaitingCommit
+    uint64_t demotedQueued = 0;             // queued ops answered by a demotion (I4)
     uint64_t timing[kTimingCount] = {};     // Task 9 timing classes produced
     std::map<uint16_t, uint64_t> codes;     // DDL + read answers, by error code
 };
@@ -343,11 +417,33 @@ void runSeed(uint64_t seed) {
         if (h.recoveryViewInstalls() - before != m.views()) fail("");
         EXPECT_EQ(h.recoveryViewInstalls() - before, m.views()) << "recovery view installs at " << when;
     };
+    /// I4 (production truth): a demotion answers the in-flight op at once, and the
+    /// admin thread — which keeps ticking while demoted — answers every queued op
+    /// on the following ticks (the leader guard).  Marks those ops for the model.
+    auto demoteAndDrainQueue = [&] {
+        const std::size_t firstQueued = h.startedTotal() - kSetupDdlOps;   // after the in-flight op
+        h.demote();
+        for (std::size_t i = firstQueued; i < ddl.size(); ++i) { ddl[i].demotedQueued = true; ++st.demotedQueued; }
+        for (int i = 0; i < kMaxDrainIterations && h.worker().pendingCount() > 0; ++i) h.tick();
+        if (h.worker().pendingCount() > 0) ADD_FAILURE() << "the demoted admin thread did not drain its queue";
+    };
+    auto flap = [&](auto&& whileDemoted) {
+        const int rec0 = h.recoveryViewInstalls();
+        ++st.flaps;
+        if (st.restarts > 0) ++st.flapsAfterRestart;
+        demoteAndDrainQueue();
+        whileDemoted();
+        h.promote();
+        processAnswers();          // the demoted ops' answers (they committed no view)
+        m.resolveInDoubt(/*all=*/false);   // the promotion replays every committed record
+        expectRecoveryInstalls(rec0, "a leadership flap");
+    };
     auto actOnCreate = [&] {
         if (!h.worker().hasInFlight()) { note("deliver stale create", {}, true); h.deliverCreate(); return; }
         const Submitted& in = ddl[h.startedTotal() - kSetupDdlOps - 1];
+        const bool demotes = in.fault == Fault::DemoteInAwaitingId || in.fault == Fault::DemoteInAwaitingCommit;
         note(std::string("act on create of ") + opName(in.op) + " '" + in.name + "': " + faultName(in.fault),
-             in.name, in.fault == Fault::DemoteInAwaitingId);
+             in.name, demotes);
         ++st.faults[static_cast<int>(in.fault)];
         if (const Timing t = timingOfFault(in.fault); t != kTimingCount) ++st.timing[t];
         switch (in.fault) {
@@ -359,17 +455,23 @@ void runSeed(uint64_t seed) {
                 h.tick();            // answers the op Internal (may start the next op)
                 h.deliverCreate();   // the stale reply (FIFO: it is the oldest request)
                 break;
-            case Fault::DemoteInAwaitingId: {
-                // B4: the demotion answers the in-flight op Internal; queued ops stay
-                // queued and run on the re-promoted leader (no tick in between).
-                const int rec0 = h.recoveryViewInstalls();
-                ++st.flaps;
-                if (st.restarts > 0) ++st.flapsAfterRestart;
-                h.demote();
-                h.deliverCreate();   // stale reply
-                h.promote();
-                processAnswers();    // the demoted op's Internal (it committed no view)
-                expectRecoveryInstalls(rec0, "a leadership flap");
+            case Fault::DemoteInAwaitingId:
+                // B4: the demotion answers the in-flight op Internal; the stale reply
+                // then creates its topic (an orphan).
+                flap([&] { h.deliverCreate(); });
+                break;
+            case Fault::TimeoutInAwaitingCommit:
+            case Fault::DemoteInAwaitingCommit: {
+                h.deliverCreate();   // the op appends its record (if its cell succeeds)
+                const std::string_view state = h.worker().inFlightStateName();
+                if (state != "DefineAwaitingCommit" && state != "ViewAwaitingCommit") break;   // ended at the reply
+                ++st.inDoubtOps;
+                if (in.fault == Fault::TimeoutInAwaitingCommit) {
+                    h.advance(AdminWorker::ddlTimeoutNs() + 1'000'000);
+                    h.tick();        // answered Internal in AwaitingCommit: in doubt (KL2)
+                } else {
+                    flap([] {});
+                }
                 break;
             }
         }
@@ -381,7 +483,7 @@ void runSeed(uint64_t seed) {
         for (int i = 0; !h.quiescent(); ++i) {
             if (i == kMaxDrainIterations) { ADD_FAILURE() << "restart drain did not quiesce\n" << dumpTrace(); return false; }
             if (h.hasPendingCreate()) actOnCreate();
-            else if (h.commitHeld()) h.releaseCommits();
+            else if (h.commitHeld()) { h.releaseCommits(); m.commitsReleased(); }
             else h.tick();
             processAnswers();
         }
@@ -465,6 +567,7 @@ void runSeed(uint64_t seed) {
             }
             note("release commits");
             h.releaseCommits();
+            m.commitsReleased();
         } else if (a < 93) {
             if (h.quiescent()) {
                 note("alloc gate: idle");
@@ -502,7 +605,9 @@ void runSeed(uint64_t seed) {
     gTotals.views += st.views; gTotals.twoSourceViews += st.twoSourceViews;
     gTotals.restarts += st.restarts; gTotals.heldAfterRestart += st.heldAfterRestart; gTotals.flaps += st.flaps; gTotals.flapsAfterRestart += st.flapsAfterRestart;
     gTotals.allocGates += st.allocGates;
-    for (int i = 0; i < 5; ++i) gTotals.faults[i] += st.faults[i];
+    for (int i = 0; i < kFaultCount; ++i) gTotals.faults[i] += st.faults[i];
+    gTotals.inDoubtOps += st.inDoubtOps;
+    gTotals.demotedQueued += st.demotedQueued;
     for (int i = 0; i < kTimingCount; ++i) gTotals.timing[i] += st.timing[i];
     for (const auto& [c, n] : st.codes) gTotals.codes[c] += n;
     ::testing::Test::RecordProperty("steps", static_cast<int>(st.steps));
@@ -540,7 +645,11 @@ class StressTotalsPrinter : public ::testing::EmptyTestEventListener {
                 " allocGates=" + std::to_string(t.allocGates);
         line += " | createReplies ok=" + std::to_string(t.faults[0]) + " failNoCreate=" + std::to_string(t.faults[1]) +
                 " failAfterCreate=" + std::to_string(t.faults[2]) + " timeout=" + std::to_string(t.faults[3]) +
-                " demote=" + std::to_string(t.faults[4]);
+                " demote=" + std::to_string(t.faults[4]) +
+                " timeoutAfterAppend=" + std::to_string(t.faults[5]) +
+                " demoteAfterAppend=" + std::to_string(t.faults[6]) +
+                " (in doubt " + std::to_string(t.inDoubtOps) + ")" +
+                " demotedQueued=" + std::to_string(t.demotedQueued);
         line += " | codes";
         for (const auto& [c, n] : t.codes) line += " " + std::to_string(c) + "=" + std::to_string(n);
         line += " | timing";
