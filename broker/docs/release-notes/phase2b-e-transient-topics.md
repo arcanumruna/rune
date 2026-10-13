@@ -102,6 +102,8 @@ waits for its timeout.
 - **A runtime topic serves only once its definition commits.** Until then it is not listed in
   metadata, and produce and subscribe answer 2 (`NotLeader`, retriable). The `defineTopic` /
   `createView` answer is sent only when the topic serves, so the first produce after it succeeds.
+  If the topic still does not serve 5 s after its definition committed, the answer is 6
+  (`Internal`, in doubt), never OK.
   A definition that fails after its topic was created therefore leaves an empty, unusable topic,
   never one holding data.
 - `defineTopic` over a view's output topic answers 25 (`TopicExists`), also when that view's

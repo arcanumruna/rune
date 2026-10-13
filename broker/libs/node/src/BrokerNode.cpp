@@ -3846,8 +3846,11 @@ int BrokerNode::serviceAdminControl_() {
                 const int32_t topicId = decodeTopicCommitted(p, n);
                 if (topicId >= 0 && topicRegistry_ && topicRegistry_->commitTopic(topicId)) {
                     try {
-                        if (const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId))
+                        if (const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId)) {
+                            if (commitReplicaFault_ && *commitReplicaFault_ == spec->name) [[unlikely]]
+                                throw std::runtime_error("injected replica-build fault (test)");
                             (void)createRuntimeUserReplicas(*spec);
+                        }
                     } catch (const std::exception& ex) {
                         spdlog::error("BrokerNode[{}]: committed runtime topic id={} — building its replicas "
                                       "failed: {} (produce answers NotLeader until a restart rebuilds it)",
@@ -3927,9 +3930,9 @@ int BrokerNode::serviceAdminControl_() {
             std::chrono::steady_clock::now().time_since_epoch()).count();
         work += ddlAnswerGate_.release(nowNs, serves, send, [this](int64_t session, int32_t topicId) {
             ++ddlAnswersOverdue_;
-            spdlog::warn("BrokerNode[{}]: DDL OK for topic id={} (session {}) held {} ms waiting for the "
-                         "topic to serve — sent anyway (overdue answers: {})", config_.nodeId, topicId,
-                         session, kDdlAnswerMaxHoldNs / 1'000'000, ddlAnswersOverdue_);
+            spdlog::error("BrokerNode[{}]: DDL OK for topic id={} (session {}) held {} ms and the topic still "
+                          "does not serve — answered Internal (in doubt), not OK (in-doubt answers: {})",
+                          config_.nodeId, topicId, session, kDdlAnswerMaxHoldNs / 1'000'000, ddlAnswersOverdue_);
         });
     }
     if (ddlAnswerGate_.empty()) {

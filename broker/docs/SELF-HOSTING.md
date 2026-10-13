@@ -77,7 +77,9 @@ One rule applies to `RUNE_TOPICS` entries, the client's `defineTopic` and `creat
 - A runtime topic serves only once its definition commits. Until then it is not listed in
   metadata, and produce and subscribe to it are answered error 2 (`NotLeader`, retriable: the
   client refreshes metadata and retries). The `defineTopic` / `createView` answer is sent only
-  when the topic serves, so the first produce after it succeeds.
+  when the topic serves, so the first produce after it succeeds. If the topic still does not
+  serve 5 s after its definition committed, the request is answered 6 (`Internal`, in doubt)
+  instead of OK, and an error line is logged.
 - `defineTopic` over a view's output topic is rejected with error 25 (`TopicExists`), also when
   that view's `createView` failed or is in doubt. A `createView` retry with the same name and
   definition reuses its own failed attempt's output topic, which is always empty because nothing

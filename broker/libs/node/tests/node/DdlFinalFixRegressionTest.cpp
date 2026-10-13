@@ -340,3 +340,90 @@ TEST(DdlFixRegression, C1_InDoubtRecordReplayedByAPromotionServesRegression) {
         EXPECT_TRUE(h.violations().empty()) << h.violationText();
     }
 }
+
+// ── Concern 4 (controller ruling): a held DDL OK is never sent for a topic that
+// does not serve.  DdlAnswerGate holds a DefineTopic / CreateView OK until its
+// topic serves; past the hold limit with the topic STILL not serving, the request
+// is answered Internal (6, in doubt) — never the OK (a false OK is a silent
+// fallback).  The answer keeps the session + correlation id, so it is never lost.
+namespace {
+namespace pcl = rune::protocol::client;
+
+std::vector<uint8_t> defineOk(int64_t corr, int32_t topicId) {
+    pcl::DefineTopicResponse r;
+    r.sessionId = 7; r.correlationId = corr; r.topicId = topicId; r.version = 1; r.errorCode = 0;
+    std::vector<uint8_t> b(r.encodedSize());
+    b.resize(r.encode(b.data()));
+    return b;
+}
+std::vector<uint8_t> viewOk(int64_t corr, int32_t topicId) {
+    pcl::CreateViewResponse r;
+    r.sessionId = 7; r.correlationId = corr; r.viewTopicId = topicId; r.outputFingerprint = 0xabcdu;
+    r.errorCode = 0;
+    std::vector<uint8_t> b(r.encodedSize());
+    b.resize(r.encode(b.data()));
+    return b;
+}
+struct Sent { int64_t session; std::vector<uint8_t> frame; };
+} // namespace
+
+TEST(DdlAnswerGateRegression, HeldOkForATopicThatNeverServesIsAnsweredInternalNotOkRegression) {
+    constexpr int64_t kHold = 1'000;
+    DdlAnswerGate gate(4096, kHold);
+    auto never = [](int32_t) { return false; };
+    std::vector<Sent> sent;
+    auto send = [&](int64_t s, const uint8_t* f, std::size_t n) { sent.push_back({s, {f, f + n}}); };
+    std::vector<int32_t> overdue;
+    auto onOverdue = [&](int64_t, int32_t t) { overdue.push_back(t); };
+
+    const auto d = defineOk(11, 40);
+    const auto v = viewOk(12, 41);
+    ASSERT_EQ(gate.offer(100, d.data(), d.size(), 0, never), DdlAnswerGate::Offer::Held);
+    ASSERT_EQ(gate.offer(101, v.data(), v.size(), 0, never), DdlAnswerGate::Offer::Held);
+
+    EXPECT_EQ(gate.release(kHold - 1, never, send, onOverdue), 0) << "held within the limit";
+    EXPECT_TRUE(sent.empty());
+
+    // Past the limit: the define head goes out — as Internal.  The view becomes the
+    // head at that moment, so it gets its own full hold, then goes out Internal too.
+    EXPECT_EQ(gate.release(kHold, never, send, onOverdue), 1);
+    EXPECT_EQ(gate.release(2 * kHold, never, send, onOverdue), 1);
+    ASSERT_EQ(sent.size(), 2u);
+    EXPECT_TRUE(gate.empty()) << "never swallowed";
+    EXPECT_EQ(overdue, (std::vector<int32_t>{40, 41})) << "each in-doubt answer is reported (log + count)";
+
+    EXPECT_EQ(sent[0].session, 100);
+    const auto dr = pcl::DefineTopicResponse::decode(sent[0].frame.data(), sent[0].frame.size());
+    ASSERT_TRUE(dr.has_value());
+    EXPECT_EQ(dr->errorCode, static_cast<uint16_t>(pcl::ErrorCode::Internal)) << "in doubt, never OK";
+    EXPECT_EQ(dr->correlationId, 11);
+    EXPECT_EQ(dr->sessionId, 7);
+    EXPECT_EQ(dr->topicId, -1);
+
+    EXPECT_EQ(sent[1].session, 101);
+    const auto vr = pcl::CreateViewResponse::decode(sent[1].frame.data(), sent[1].frame.size());
+    ASSERT_TRUE(vr.has_value());
+    EXPECT_EQ(vr->errorCode, static_cast<uint16_t>(pcl::ErrorCode::Internal)) << "in doubt, never OK";
+    EXPECT_EQ(vr->correlationId, 12);
+    EXPECT_EQ(vr->viewTopicId, -1);
+}
+
+TEST(DdlAnswerGateRegression, HeldOkWhoseTopicServesInTimeIsSentAsOkRegression) {
+    constexpr int64_t kHold = 1'000;
+    DdlAnswerGate gate(4096, kHold);
+    bool serves = false;
+    auto ready = [&](int32_t) { return serves; };
+    std::vector<Sent> sent;
+    auto send = [&](int64_t s, const uint8_t* f, std::size_t n) { sent.push_back({s, {f, f + n}}); };
+    int overdue = 0;
+    auto onOverdue = [&](int64_t, int32_t) { ++overdue; };
+
+    const auto d = defineOk(21, 50);
+    ASSERT_EQ(gate.offer(100, d.data(), d.size(), 0, ready), DdlAnswerGate::Offer::Held);
+    EXPECT_EQ(gate.release(10, ready, send, onOverdue), 0);
+    serves = true;
+    EXPECT_EQ(gate.release(kHold + 5, ready, send, onOverdue), 1) << "serving at release: OK, even late";
+    ASSERT_EQ(sent.size(), 1u);
+    EXPECT_EQ(sent[0].frame, d) << "the original OK frame, byte for byte";
+    EXPECT_EQ(overdue, 0);
+}

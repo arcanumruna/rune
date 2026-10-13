@@ -681,6 +681,11 @@ public:
     void setAdminCreateFaultForTest(std::string name, bool afterCreate) {
         adminCreateFault_ = AdminCreateFaultForTest{std::move(name), afterCreate};
     }
+    /// Test-only (concern 4): building the replicas of the runtime topic `name`
+    /// fails when its record commits (kA2cTopicCommitted) — the topic never serves,
+    /// so its held DDL OK must be answered Internal (in doubt).  Set before start();
+    /// afterwards only the control thread reads it.
+    void setCommitReplicaFaultForTest(std::string name) { commitReplicaFault_ = std::move(name); }
 
     // -----------------------------------------------------------------------
     // Observers (F9a: ring-fed, no atomics)
@@ -1345,13 +1350,14 @@ private:
         bool        afterCreate;   // true: the topic is created first (an orphan)
     };
     std::optional<AdminCreateFaultForTest> adminCreateFault_;   // control thread after start()
+    std::optional<std::string>             commitReplicaFault_; // control thread after start()
     // C1 / M7: a DefineTopic / CreateView OK leaves only once its topic serves
     // (see DdlAnswerGate.h).  Control-thread-owned; one drain of the admin egress
     // ring (16 frames of at most a ring message each) always fits.
     static constexpr int64_t kDdlAnswerMaxHoldNs = 5'000'000'000LL;
     DdlAnswerGate ddlAnswerGate_{2u * static_cast<std::size_t>(kAdminRequestRingBytes) + 4096u,
                                  kDdlAnswerMaxHoldNs};
-    uint64_t      ddlAnswersOverdue_ = 0;   // control thread only
+    uint64_t      ddlAnswersOverdue_ = 0;   // control thread only: held OKs answered Internal (in doubt)
     [[nodiscard]] bool ddlTopicServes_(int32_t topicId) const noexcept;
     int32_t                                      shardResolveStallWorkerForTest_ = -1;
     std::chrono::milliseconds                    shardResolveStallForTest_{0};

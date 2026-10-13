@@ -629,6 +629,36 @@ TEST(DdlConformanceBrokerRegression, C1_DefineOkMeansTheTopicServesAtOnceRegress
     node.stop();
 }
 
+// Concern 4 (controller ruling): the replica build of a committed topic FAILS, so
+// the topic never serves.  The DDL answer gate must not send the held OK after its
+// hold limit (a false OK is a silent fallback): the define is answered Internal (6,
+// in doubt).  Later DDL is not wedged behind it.
+TEST(DdlConformanceBrokerRegression, C4_HeldOkForATopicThatNeverServesIsAnsweredInternalRegression) {
+    const TempDataDir tmp("c4_");
+    const fs::path& dir = tmp.path;
+    const NodeConfig cfg = makeSingleNodeConfig(dir);
+    BrokerNode node{cfg};
+    node.setCommitReplicaFaultForTest("nobuild");
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(30s));
+    ShardTestClient client(dir / "client-aeron");
+    client.keepSessionsAlive(true);
+    Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+    const int64_t sid = client.connect(w.gw, w.stream);
+    ASSERT_TRUE(w.awaitDdlReady(sid));
+
+    const auto t0 = Clock::now();
+    const auto r = client.awaitDefine(client.sendDefineTopic(w.gw, w.stream, sid, "nobuild", 1, charBlob(), 0),
+                                      Clock::now() + 20s);
+    ASSERT_TRUE(r.has_value()) << "answered, never dropped (no-hang)";
+    EXPECT_EQ(static_cast<int>(r->errorCode), kInternal) << "in doubt — never an OK for a topic that does not serve";
+    EXPECT_NE(static_cast<int>(r->errorCode), kOk);
+    EXPECT_GE(Clock::now() - t0, 4s) << "held for the hold limit first";
+
+    EXPECT_EQ(w.define(sid, "afterwards"), kOk) << "the gate is not wedged";
+    node.stop();
+}
+
 // C1 / I1 / I5(a): write to an orphan view SINK, then retry the CREATE VIEW, then
 // restart.  The write is refused (the sink is unroutable until a record claims it),
 // so the retry adopts an EMPTY sink — raw bytes can never become view output — and
