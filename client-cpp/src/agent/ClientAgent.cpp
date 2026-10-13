@@ -1303,10 +1303,11 @@ transport::AeronTransport::OfferResult ClientAgent::offerToCoordinator(uint32_t 
 }
 
 transport::AeronTransport::OfferResult ClientAgent::offerToEndpoint(const std::string& channel, uint8_t* buf,
-                                                                   std::size_t len, int64_t nowNs) noexcept {
+                                                                   std::size_t len, int64_t nowNs,
+                                                                   uint32_t& sessionIndex) noexcept {
     // The node's one session (0 = the seed: "" or where the seed physically is).
-    const uint32_t idx = coordinatorSessionIndex(channel, nowNs);
-    return offerToCoordinator(idx, buf, len);   // stamps that session's id; Retry while not Connected
+    sessionIndex = coordinatorSessionIndex(channel, nowNs);
+    return offerToCoordinator(sessionIndex, buf, len);   // stamps that session's id; Retry while not Connected
 }
 
 bool ClientAgent::reviveSession(uint32_t index, int64_t nowNs) noexcept {

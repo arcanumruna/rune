@@ -484,6 +484,7 @@ struct SchemaHarness {
 
     int64_t connectTimeoutMs = 5000;
     int64_t pingTimeoutMs    = 5000;  // also used as schema op timeout
+    int64_t ddlTimeoutMs     = 15000; // catalog history: a DDL's own deadline (DefineTopic / AlterTopic / CreateView)
 
     int32_t ingressStream;
     int32_t egressStream;
@@ -503,6 +504,7 @@ struct SchemaHarness {
         clientCfg.dataDir          = agentDir;
         clientCfg.connectTimeoutMs = connectTimeoutMs;
         clientCfg.pingTimeoutMs    = pingTimeoutMs;
+        clientCfg.ddlTimeoutMs     = ddlTimeoutMs;
 
         client = std::make_unique<Client>(clientCfg);
         cq     = std::make_unique<test_support::TestCq>(*client);
@@ -675,6 +677,7 @@ TEST(ClientSchema, GetTopicSchemaUnknownTopicPropagates) {
 TEST(ClientSchema, DefineTopicTimeoutFailsPromise) {
     SchemaHarness h(1108, 1109);
     h.pingTimeoutMs = 500;   // short timeout for this test
+    h.ddlTimeoutMs  = 500;   // catalog history: DefineTopic's own deadline
     h.build();
     h.connectAndWait();
 
@@ -690,7 +693,8 @@ TEST(ClientSchema, DefineTopicTimeoutFailsPromise) {
         << "defineTopic() future did not fail within timeout — potential hang";
 
     EXPECT_THROW(fut.defineResult(), std::exception)
-        << "defineTopic() must throw on timeout, not return a value";
+        << "defineTopic() must throw on timeout, not return a value: " << fut.describe();
+    EXPECT_EQ(fut.status(), OpStatus::Timeout) << fut.describe();
 }
 
 // ===========================================================================

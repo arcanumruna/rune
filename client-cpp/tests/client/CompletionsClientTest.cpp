@@ -423,8 +423,11 @@ TEST(CompletionsClient, ControlOpTimeoutCompletesTimeoutRegression) {
     EXPECT_EQ(cq2.timesCompleted(k.token()), 1);
 }
 
-// A session-fatal ErrorResponse (SessionExpired) completes EVERY pending control
-// op of the session SessionLost — exactly once each, promptly.
+// A session-fatal ErrorResponse (SessionExpired) completes EVERY pending
+// non-DDL control op of the session SessionLost — exactly once each, promptly.
+// Catalog history (Task 5 fix round 1, I1): a DDL is NOT failed by a seed
+// loss — it follows its own session: re-sent (same frame, same requestId) once
+// the seed is back, and completed exactly once by that answer.
 TEST(CompletionsClient, SessionFatalErrorCompletesAllPendingSessionLostRegression) {
     Rig r(cfgFor(5228));
     TestCq cq(r.client);
@@ -441,12 +444,17 @@ TEST(CompletionsClient, SessionFatalErrorCompletesAllPendingSessionLostRegressio
 
     r.gw.pingErrorCode = static_cast<int16_t>(rune::client::codec::ErrorCode::SessionExpired);
     auto p3 = pingOn(cq, r.client, {3});
-    ASSERT_TRUE(r.drive([&] { return p1.ready() && p2.ready() && p3.ready() && d.ready() && g.ready(); }));
-    for (const PendingOp* op : {&p1, &p2, &p3, &d, &g}) {
+    ASSERT_TRUE(r.drive([&] { return p1.ready() && p2.ready() && p3.ready() && g.ready(); }));
+    for (const PendingOp* op : {&p1, &p2, &p3, &g}) {
         EXPECT_EQ(op->status(), rc::OpStatus::SessionLost) << op->describe();
         EXPECT_EQ(op->outcome().c.errorCode,
                   static_cast<uint16_t>(rune::client::codec::ErrorCode::SessionExpired));
     }
+    EXPECT_FALSE(d.ready()) << "a seed loss must not fail a DDL: " << d.describe();
+    r.gw.replySchemas = true;   // the re-sent DefineTopic is answered
+    ASSERT_TRUE(r.drive([&] { return d.ready(); }));
+    EXPECT_TRUE(d.ok()) << d.describe();
+    EXPECT_EQ(r.gw.defines, 2) << "re-sent once after the seed came back";
     r.settle();
     for (const PendingOp* op : {&p1, &p2, &p3, &d, &g}) EXPECT_EQ(cq.timesCompleted(op->token()), 1);
     EXPECT_EQ(r.client.testPendingControlOps(), 0u);
@@ -903,6 +911,54 @@ TEST(CompletionsClient, QueueReleasedDuringAnOffOwnerCloseDrainRegression) {
     SUCCEED();
 }
 
+// Task 5 fix round 1 (M3): an Invoker close whose drain was ABANDONED (an
+// orphaned claim at the command-ring head) runs user code after its deferred
+// releases were applied — here a producer onAck(Closed) that destroys a queue
+// whose last op still sits in the ring behind the orphan (its fence > head).
+// That release must apply at once (nothing behind the orphan is ever applied),
+// never be deferred to a drain that already ran: a deferred one would leak its
+// ring and registry slot.
+namespace {
+struct QueueKiller {
+    std::unique_ptr<rc::Completions>* q = nullptr;
+    int closedAcks = 0;
+    static void on(void* ctx, rc::Token, int64_t, rc::OpStatus st, uint16_t) noexcept {
+        auto* k = static_cast<QueueKiller*>(ctx);
+        if (st == rc::OpStatus::Closed) { ++k->closedAcks; k->q->reset(); }
+    }
+};
+} // namespace
+
+TEST(CompletionsClient, ReleaseAfterAnAbandonedInvokerCloseDrainIsNotDeferredRegression) {
+    Watchdog wd("Invoker close: a release after the abandoned drain");
+    Rig r(cfgFor(5256, rc::RunnerMode::Invoker));
+    TestCq cq(r.client);
+    r.connect(cq);
+    r.gw.replyAcks = false;   // the send stays in flight until close completes it Closed
+    auto q2 = std::make_unique<rc::Completions>(r.client);
+    QueueKiller killer{&q2};
+    rc::ProducerConfig pc;
+    pc.lingerUs = 0;
+    auto p = r.client.producer(pc);
+    p.onAck(&QueueKiller::on, &killer);
+    const std::vector<uint8_t> v{1};
+    ASSERT_EQ(p.trySend(r.client.topic("t"), rc::Key(uint64_t{1}), std::span<const uint8_t>(v), rc::AckToken{1}),
+              rc::SendResult::Ok);
+    ASSERT_TRUE(r.drive([&] { return !r.gw.produced.empty(); }));
+    // An orphaned claim at the ring head: close()'s drain will give up behind it.
+    const auto idx = r.client.testClaimCommandRingWithoutCommitting(8);
+    ASSERT_GE(idx, 0);
+    r.client.testZeroCommandRingClaimHeader(idx);
+    r.client.testDisableCloseDrainUnblock();
+    r.client.testSetCloseDrainUnblockAfterYields(16);
+    // q2's last op is ring-submitted (between cycles) behind the orphan: its fence > head.
+    ASSERT_EQ(r.client.listTopics(*q2, 1), rc::OpResult::Accepted);
+    r.client.closeImmediately();   // abandoned drain -> deferred releases applied -> producers Closed -> onAck
+    EXPECT_EQ(killer.closedAcks, 1);
+    EXPECT_EQ(q2, nullptr) << "the onAck released the queue during close";
+    EXPECT_EQ(r.client.testDeferredReleases(), 0u) << "a release after the drain must not be deferred (leak)";
+}
+
 // I2: close()'s drain gives up behind a claim it cannot unblock (fix5) with a
 // CqAdd behind it — the registration is never applied.  The constructor must
 // not wait forever: it returns a born-finished (Closed) queue.
@@ -1216,7 +1272,10 @@ TEST(CompletionsClient, InCycleReleaseWithAnOpHeldAcrossTwoCyclesNeverMisdeliver
 
 // No-hang fix round 3 (I1, client side): the broker's EXPIRING state delivers an
 // unsolicited SessionExpired (correlationId 0) once the spill could not hold the
-// session's answers — every pending control op completes SessionLost.
+// session's answers — every pending non-DDL control op completes SessionLost.
+// Catalog history (Task 5 fix round 1, I1): a DDL is NOT failed by a seed
+// loss — it follows its own session: re-sent (same frame, same requestId) once
+// the seed is back, and completed exactly once by that answer.
 TEST(CompletionsClient, UnsolicitedSessionExpiredCompletesEveryPendingOpSessionLostRegression) {
     Rig r(cfgFor(5454));
     TestCq cq(r.client);
@@ -1229,10 +1288,15 @@ TEST(CompletionsClient, UnsolicitedSessionExpiredCompletesEveryPendingOpSessionL
     ASSERT_TRUE(r.drive([&] { return r.gw.defines == 1 && r.gw.schemaGets == 1; }));
     r.gw.sendError(0, static_cast<int16_t>(rune::client::codec::ErrorCode::SessionExpired), "", /*sid=*/0,
                    /*corrId=*/0);
-    ASSERT_TRUE(r.drive([&] { return d.ready() && g.ready(); }));
-    EXPECT_EQ(d.status(), rc::OpStatus::SessionLost);
+    ASSERT_TRUE(r.drive([&] { return g.ready(); }));
     EXPECT_EQ(g.status(), rc::OpStatus::SessionLost);
+    EXPECT_FALSE(d.ready()) << "a seed loss must not fail a DDL: " << d.describe();
+    r.gw.replySchemas = true;
+    ASSERT_TRUE(r.drive([&] { return d.ready(); }));
+    EXPECT_TRUE(d.ok()) << d.describe();
+    EXPECT_EQ(r.gw.defines, 2);
     r.settle();
+    EXPECT_EQ(cq.timesCompleted(d.token()), 1);
     EXPECT_EQ(r.client.testPendingControlOps(), 0u);
 }
 
@@ -1242,6 +1306,9 @@ TEST(CompletionsClient, UnsolicitedSessionExpiredCompletesEveryPendingOpSessionL
 // completes SessionLost at that edge, exactly as on a broker SessionExpired —
 // never later as Timeout through its per-op deadline.  RED (round 3): they
 // stayed pending until pingTimeoutMs and completed Timeout.
+// Catalog history (Task 5 fix round 1, I1): a DDL is NOT failed by a seed
+// loss — it follows its own session: re-sent (same frame, same requestId) once
+// the seed is back, and completed exactly once by that answer.
 TEST(CompletionsClient, OwnResponseTimeoutCompletesInFlightOpsSessionLostRegression) {
     rc::ClientConfig c = cfgFor(5458, rc::RunnerMode::Invoker, &fakeNow);
     c.responseTimeoutNs = 1'000'000'000LL;   // 1 s of silence = the session is lost
@@ -1258,19 +1325,27 @@ TEST(CompletionsClient, OwnResponseTimeoutCompletesInFlightOpsSessionLostRegress
     ASSERT_FALSE(d.ready());
     const int64_t t0 = g_now;
     // 1 ms per duty cycle; the broker answers nothing (no Pongs either).
-    ASSERT_TRUE(r.drive([&] { return d.ready() && g.ready(); }, 200'000, 1'000'000));
-    EXPECT_EQ(d.status(), rc::OpStatus::SessionLost) << d.describe();
+    ASSERT_TRUE(r.drive([&] { return g.ready(); }, 200'000, 1'000'000));
     EXPECT_EQ(g.status(), rc::OpStatus::SessionLost) << g.describe();
     EXPECT_LT(g_now - t0, 5'000'000'000LL) << "completed by the per-op deadline, not the session-loss edge";
+    EXPECT_FALSE(d.ready()) << "a seed loss must not fail a DDL: " << d.describe();
+    r.gw.replySchemas = true;
+    ASSERT_TRUE(r.drive([&] { return d.ready(); }, 200'000, 1'000'000));
+    EXPECT_TRUE(d.ok()) << d.describe();
+    EXPECT_GE(r.gw.defines, 2) << "re-sent after the session-loss edge";
     r.settle();
+    EXPECT_EQ(cq.timesCompleted(d.token()), 1);
     EXPECT_EQ(r.client.testPendingControlOps(), 0u);
 }
 
 // No-hang fix round 5 (N14): the broker's REAL unsolicited SessionExpired names
 // the session in its header (ClientGateway sends sessionId = the expiring
 // session's id, correlationId 0).  For the seed session's own id, every pending
-// control op completes SessionLost — the `opt->sessionId != 0` branch, which
-// the sid-0 test above never took.
+// non-DDL control op completes SessionLost — the `opt->sessionId != 0` branch,
+// which the sid-0 test above never took.
+// Catalog history (Task 5 fix round 1, I1): a DDL is NOT failed by a seed
+// loss — it follows its own session: re-sent (same frame, same requestId) once
+// the seed is back, and completed exactly once by that answer.
 TEST(CompletionsClient, SessionExpiredWithTheSeedsRealSessionIdCompletesPendingOpsSessionLostRegression) {
     Rig r(cfgFor(5460));
     TestCq cq(r.client);
@@ -1288,9 +1363,14 @@ TEST(CompletionsClient, SessionExpiredWithTheSeedsRealSessionIdCompletesPendingO
     ASSERT_TRUE(r.drive([&] { return r.gw.defines == 1 && r.gw.schemaGets == 1; }));
     r.gw.sendError(0, static_cast<int16_t>(rune::client::codec::ErrorCode::SessionExpired), "", seedSid,
                    /*corrId=*/0);
-    ASSERT_TRUE(r.drive([&] { return d.ready() && g.ready(); }));
-    EXPECT_EQ(d.status(), rc::OpStatus::SessionLost) << d.describe();
+    ASSERT_TRUE(r.drive([&] { return g.ready(); }));
     EXPECT_EQ(g.status(), rc::OpStatus::SessionLost) << g.describe();
+    EXPECT_FALSE(d.ready()) << "a seed loss must not fail a DDL: " << d.describe();
+    r.gw.replySchemas = true;
+    ASSERT_TRUE(r.drive([&] { return d.ready(); }));
+    EXPECT_TRUE(d.ok()) << d.describe();
+    EXPECT_EQ(r.gw.defines, 2);
     r.settle();
+    EXPECT_EQ(cq.timesCompleted(d.token()), 1);
     EXPECT_EQ(r.client.testPendingControlOps(), 0u);
 }

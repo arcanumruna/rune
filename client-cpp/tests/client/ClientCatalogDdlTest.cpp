@@ -135,6 +135,11 @@ TEST(ClientCatalogDdl, DdlOptionsClientNameOverridesTheConfigAndReplayedFromIsCa
     EXPECT_EQ(m->ext.replayedClusterId, "cluster-a");
     EXPECT_EQ(m->ext.replayedOffset, 77);
     EXPECT_EQ(m->ext.replayedPrincipal, "alice@10.0.0.1");
+    // Review M4: the generated requestId is stamped on the replayedFrom branch
+    // too (the requestId then sits before the replayed fields, not at the tail).
+    EXPECT_FALSE(m->ext.requestId.none());
+    EXPECT_EQ(m->ext.requestId.hi, r.client.instanceId());
+    EXPECT_NE(m->ext.requestId.lo, 0u);
 }
 
 TEST(ClientCatalogDdl, AlterViewSendsItsExpectedVersionKeyPersistenceAndPlan) {

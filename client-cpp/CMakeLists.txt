@@ -1368,6 +1368,7 @@ if(BUILD_TESTING)
         add_executable(rune_client_ddl_tests
             tests/client/ClientDdlRedirectRegressionTest.cpp
             tests/client/ClientCatalogDdlTest.cpp
+            tests/client/ClientDdlTimingRegressionTest.cpp
         )
         target_include_directories(rune_client_ddl_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
         target_link_libraries(rune_client_ddl_tests PRIVATE rune_client_api GTest::gtest_main)
