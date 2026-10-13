@@ -1,7 +1,7 @@
 # Rune — Catalog history and replication (`__catalog`)
 
-**Status:** design approved section by section by the user on 2026-10-13. Written spec awaiting final review.
-**Scheduling:** proposed **before Phase 2b Part D**, so that D's `rune console` / `rune schema` are built on these reads. The user still has to confirm this order.
+**Status:** approved by the user on 2026-10-13.
+**Scheduling:** **before Phase 2b Part D**, confirmed by the user on 2026-10-13, so that D's `rune console` / `rune schema` are built on these reads.
 **Repos:**
 - rune-broker: the catalog log, AdminWorker, apply, bootstrap, and the removal of `RUNE_TOPICS`.
 - rune-protocol: DDL Redirect, and the reads, which use the existing Subscribe.
