@@ -502,6 +502,7 @@ public:
     void setTransientLineage(TransientLineageFn fn, void* ctx) noexcept { lineageFn_ = fn; lineageCtx_ = ctx; }
     [[nodiscard]] uint64_t partitionDataResetsForTest() const noexcept { return partitionDataResets_; }
     [[nodiscard]] uint64_t lineageNotesSentForTest() const noexcept { return lineageNotesSent_; }
+    [[nodiscard]] uint64_t subscribesAwaitingLineageForTest() const noexcept { return subscribesAwaitingLineage_; }
     /// F15 S3 (re-review 2 B-1) ⇄ F18: THE client-visible batch limit — the ONE
     /// gateway setter.  BrokerNode sets NodeConfig::produceIntakeLimit()
     /// (= rune::node::Worker::maxAcceptableBatchBytes(config): rings, replication
@@ -1885,6 +1886,7 @@ private:
     void*              lineageCtx_ = nullptr;
     uint64_t           partitionDataResets_ = 0;
     uint64_t           lineageNotesSent_    = 0;
+    uint64_t           subscribesAwaitingLineage_ = 0;   ///< FU1: answered NotLeader (lineage unknown)
     std::vector<int64_t> pendingLineageNotes_;   ///< subscriptionIds awaiting their lineage
     /// Send (or queue until known) subscription `subId`'s lineage note.
     void noteLineage_(int64_t subId);

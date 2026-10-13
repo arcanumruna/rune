@@ -4403,6 +4403,19 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     //     answered PartitionDataReset — never served from a clamped position
     //     (the client's resume floor would drop the refilled records: silent
     //     loss); a claim while the lineage is unknown: the retriable NotLeader.
+    // FU1: a v7 PLAIN Subscribe (any — new or resumed) on a transient partition
+    //     whose lineage is not confirmed yet is answered the retriable NotLeader
+    //     (as OffsetFetch is): it never binds without a lineage note, so every
+    //     later resume of it can claim one.  Group-member fetches resume through
+    //     their group (bit-61 correlation ids) and are not gated here.
+    if (lineageFn_ != nullptr && served.kind == ServedPartition::Kind::Transient &&
+        (msg.correlationId & (int64_t{1} << 61)) == 0 &&
+        pc::clientUnderstandsLineageNote(session->clientVersion) &&
+        lineageFn_(lineageCtx_, msg.topicId, partition) == kLineageUnknown) [[unlikely]] {
+        ++subscribesAwaitingLineage_;
+        sendSubRedirect(std::string{}, msg.correlationId);   // retriable: bound once the lineage is known
+        return;
+    }
     if (lineageFn_ != nullptr && served.kind == ServedPartition::Kind::Transient && msg.partitionKnown == 1 &&
         msg.key.size() == 8 && pc::clientUnderstandsLineageNote(session->clientVersion)) [[unlikely]] {
         uint64_t claim = 0;

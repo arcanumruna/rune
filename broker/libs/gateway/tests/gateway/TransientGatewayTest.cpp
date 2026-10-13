@@ -1102,3 +1102,37 @@ TEST(TransientGatewayRegression, ReArmedSubscriptionAboveALaggingHwIsPushedFromT
             first = std::min(first, rec.baseOffset);
     EXPECT_EQ(first, 0) << "the lagging leader pushes from its HW, below the re-armed position (the client drops these)";
 }
+
+// E2 final fix wave — FU1: a v7 PLAIN Subscribe on a transient partition whose
+// data lineage is not confirmed yet is answered the retriable NotLeader (as
+// OffsetFetch is) and registers nothing — it never binds without a lineage
+// note.  Once the lineage is known it binds and the note follows.  A pre-v7
+// session (no notes, no claims) keeps the old behaviour.  RED (no gate): it
+// bound with no note.
+namespace {
+uint64_t g_fu1Lineage = UINT64_MAX;   // unknown
+uint64_t fu1Lineage(void*, int32_t, int32_t) noexcept { return g_fu1Lineage; }
+}  // namespace
+
+TEST(TransientGatewayRegression, PlainSubscribeWaitsForTheLineageBeforeBindingRegression) {
+    Rig r;
+    r.gw.setTransientLineage(&fu1Lineage, nullptr);
+    g_fu1Lineage = UINT64_MAX;
+    const int64_t v7 = r.gw.injectTestSession(0, rune::protocol::client::kClientVersionLineageNote);
+    r.subscribe(v7, /*Earliest=*/-2, 71);
+    EXPECT_FALSE(r.subscribed.count(71)) << "bound while the lineage was unknown (no lineage note possible)";
+    ASSERT_TRUE(r.errors.count(71));
+    EXPECT_EQ(r.errors[71], kNotLeader) << "not the retriable NotLeader";
+    EXPECT_EQ(r.gw.subscribesAwaitingLineageForTest(), 1u);
+
+    const int64_t v6 = r.gw.injectTestSession(0, 6);   // an older client: unchanged
+    r.subscribe(v6, -2, 72);
+    ASSERT_TRUE(r.subscribed.count(72));
+    EXPECT_EQ(r.subscribed[72].errorCode, kOk);
+
+    g_fu1Lineage = 0xABCD;   // confirmed
+    r.subscribe(v7, -2, 73);
+    ASSERT_TRUE(r.subscribed.count(73));
+    EXPECT_EQ(r.subscribed[73].errorCode, kOk);
+    EXPECT_EQ(r.gw.lineageNotesSentForTest(), 1u) << "bound without its lineage note";
+}
