@@ -2057,6 +2057,13 @@ private:
         rune::storage::Log* log  = nullptr;   ///< Kind::Disk only
     };
     [[nodiscard]] ServedPartition servedPartition_(int32_t topicId, int32_t partition) const noexcept;
+    /// E2 Task 11 ruling: may a read_committed subscription to (topicId,
+    /// partition) be accepted HERE?  read_committed is served from a LEADER's RC
+    /// state only (RcState I2): a follower answered OK and then delivered nothing
+    /// (a silent stall).  False only for a registered replica that is not a
+    /// published leader (GatewayReplicaView::publishedLeader); no replica
+    /// (unreplicated / internal) → true, unchanged.  Cold (subscribe time).
+    [[nodiscard]] bool readCommittedServableHere_(int32_t topicId, int32_t partition) const noexcept;
     int  pumpMarkerQueue_();
     // D9 (see TxnMarkerChannel).
     TxnMarkerChannel txnMarkerChannel_{};

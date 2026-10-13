@@ -2991,6 +2991,13 @@ ClientGateway::ServedPartition ClientGateway::servedPartition_(int32_t topicId, 
     return s;
 }
 
+bool ClientGateway::readCommittedServableHere_(int32_t topicId, int32_t partition) const noexcept
+{
+    if (replicaRegistry_ == nullptr || topicId < 0) return true;   // unreplicated / internal: unchanged
+    const GatewayReplicaView v{replicaRegistry_->lookupHandle(topicId, partition)};
+    return !v || v.publishedLeader();
+}
+
 bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 {
     // 1. Decode Produce.
@@ -4229,6 +4236,21 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         return;
     }
     rune::storage::Log* const log = served.log;   // nullptr ⟺ Kind::Transient
+
+    // E2 Task 11 ruling (no silent stall): read_committed is served from a
+    // LEADER's RC state only — a follower answered OK and then delivered nothing.
+    // Refused with the bare ErrorResponse{NotLeader} (retriable: the client
+    // refreshes metadata and re-routes to the leader), disk and transient alike,
+    // BEFORE any subscription is registered — the one registration point both
+    // worker modes go through (shard mode forwards the registered sub to the
+    // owning worker below).  Also covers a group carrier switching to it (5a).
+    if (msg.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) &&
+        !readCommittedServableHere_(msg.topicId, partition)) [[unlikely]] {
+        spdlog::debug("ClientGateway: read_committed Subscribe to topicId={} partition={} on a follower — "
+                      "NotLeader (retriable)", msg.topicId, partition);
+        sendSubRedirect(std::string{}, msg.correlationId);
+        return;
+    }
 
     // 5. Clamp fromOffset to [0, HW] (GR-6) — or [0, LEO] for non-replicated topics.
     //    fromOffset < 0 → "from Latest"; fromOffset > clamp-limit → clamped.
@@ -6586,6 +6608,13 @@ int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
         (served.kind == ServedPartition::Kind::Transient && !workerPool_)) {
         spdlog::warn("ClientGateway::addGroupSubscription: unknown (or uncommitted) topicId={} partition={}",
                      topicId, partition);
+        return -1;
+    }
+    // E2 Task 11 ruling: read_committed only where it is served (a leader).
+    if (isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) &&
+        !readCommittedServableHere_(topicId, partition)) [[unlikely]] {
+        spdlog::debug("ClientGateway::addGroupSubscription: read_committed on a follower topicId={} "
+                      "partition={} — refused (NotLeader)", topicId, partition);
         return -1;
     }
     rune::storage::Log* const log = served.log;   // nullptr ⟺ Kind::Transient

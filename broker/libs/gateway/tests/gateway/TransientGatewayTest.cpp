@@ -66,6 +66,7 @@ struct RigOpts {
     bool        runtime      = false;     // create the topic at RUNTIME: awaiting its commit (C1) until commit()
     std::size_t ringBytes    = 1u << 20;
     bool        withFollower = false;     // ISR {1,2}: follower 2 never fetches → the HW stays 0
+    bool        asFollower   = false;     // this node's replica is a FOLLOWER (leader 2)
 };
 
 // Gateway + topic 0 "presence" (1 partition, TRANSIENT) + its leader replica on
@@ -121,7 +122,9 @@ struct Rig {
         c.topicId = 0; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
         c.replicaLagMaxOffset = 1'000'000'000; c.replicaLagMaxMs = 600'000;
         const std::vector<int32_t> set = o.withFollower ? std::vector<int32_t>{1, 2} : std::vector<int32_t>{1};
-        auto r = std::make_unique<PartitionReplica>(c, Role::Leader, 1, set, set, &mem, &transport);
+        const std::vector<int32_t> all = o.asFollower ? std::vector<int32_t>{1, 2} : set;
+        auto r = std::make_unique<PartitionReplica>(c, o.asFollower ? Role::Follower : Role::Leader, 1, all, all,
+                                                    &mem, &transport);
         r->setExternalFollowerFlush(true);
         rep = r.get();
         reg.add(0, 0, std::move(r));
@@ -173,10 +176,10 @@ struct Rig {
         const auto it = produced.find(c);
         return it == produced.end() ? std::nullopt : std::optional<pc::ProduceResponse>(it->second);
     }
-    void subscribe(int64_t sid, int64_t fromOffset, int64_t subCorr) {
+    void subscribe(int64_t sid, int64_t fromOffset, int64_t subCorr, uint8_t isolation = 0) {
         pc::Subscribe s;
         s.sessionId = sid; s.correlationId = subCorr; s.topicId = 0; s.partition = 0;
-        s.partitionKnown = 1; s.fromOffset = fromOffset; s.isolation = 0;
+        s.partitionKnown = 1; s.fromOffset = fromOffset; s.isolation = isolation;
         std::vector<uint8_t> buf(s.encodedSize());
         buf.resize(s.encode(buf.data()));
         gw.applySubscribeForTest(buf.data(), buf.size());
@@ -488,4 +491,50 @@ TEST(TransientGatewayRegression, ResentRemoteMarkerForATransientPartitionIsAppen
     EXPECT_EQ(r.markerAnswers[1].second.token, 5005);
     EXPECT_EQ(r.markerAnswers[1].second.errorCode, kOk);
     EXPECT_EQ(r.markerAnswers[1].second.offset, 0) << "re-answered with another outcome";
+}
+
+// ---------------------------------------------------------------------------
+// E2 Task 11 fix round 2 (controller ruling 2026-10-13): read_committed is
+// served from a LEADER's RC state only (RcState I2).  A follower used to answer
+// the read_committed Subscribe OK and then deliver nothing — a silent stall.
+// It now answers the bare ErrorResponse{NotLeader} (retriable: the client
+// refreshes metadata and re-routes to the leader) and registers nothing.
+// read_uncommitted follower reads are unchanged.  (Disk twins + both worker
+// modes: the interaction matrix, R7.)
+// ---------------------------------------------------------------------------
+TEST(TransientGatewayRegression, ReadCommittedSubscribeOnAFollowerAnswersNotLeaderRegression) {
+    Rig r(RigOpts{.asFollower = true});
+    const int64_t sid = r.gw.injectTestSession(0);
+    r.subscribe(sid, /*Earliest=*/-2, 51, /*read_committed=*/1);
+    r.pass();
+    EXPECT_FALSE(r.subscribed.count(51)) << "a follower answered read_committed OK (then delivered nothing)";
+    ASSERT_TRUE(r.errors.count(51)) << "the read_committed Subscribe was never answered";
+    EXPECT_EQ(r.errors[51], kNotLeader);
+
+    r.subscribe(sid, -2, 52, /*read_uncommitted=*/0);   // follower reads stay served
+    ASSERT_TRUE(r.subscribed.count(52));
+    EXPECT_EQ(r.subscribed[52].errorCode, kOk);
+}
+
+TEST(TransientGatewayRegression, ReadCommittedSubscribeOnALeaderIsAcceptedRegression) {
+    Rig r;
+    const int64_t sid = r.gw.injectTestSession(0);
+    r.subscribe(sid, -2, 53, /*read_committed=*/1);
+    ASSERT_TRUE(r.subscribed.count(53));
+    EXPECT_EQ(r.subscribed[53].errorCode, kOk);
+    EXPECT_FALSE(r.errors.count(53));
+}
+
+TEST(TransientGatewayRegression, ReadCommittedGroupSubscriptionOnAFollowerIsRefusedRegression) {
+    Rig r(RigOpts{.asFollower = true});
+    const int64_t sid = r.gw.injectTestSession(0);
+    EXPECT_LT(r.gw.addGroupSubscription(sid, 0, 0, 0, /*isolation=*/1, /*pendingCarrier=*/false), 0)
+        << "a follower registered a read_committed group subscription";
+    const int64_t ru = r.gw.addGroupSubscription(sid, 0, 0, 0, /*isolation=*/0, /*pendingCarrier=*/false);
+    ASSERT_GE(ru, 0) << "read_uncommitted group reads on a follower stay served";
+
+    // A group carrier switching that member's subscription to read_committed is refused too.
+    r.subscribe(sid, -2, /*untagged carrier=*/0, /*read_committed=*/1);
+    ASSERT_TRUE(r.errors.count(0));
+    EXPECT_EQ(r.errors[0], kNotLeader);
 }

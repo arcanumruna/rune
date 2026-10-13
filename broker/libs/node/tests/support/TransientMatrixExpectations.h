@@ -38,6 +38,7 @@ enum class Outcome : uint8_t {
     OkEmptyAfterRestart,     // transient after a restart: offsets from 0, only post-restart records
     OkAfterCommit,           // C1: refused NotLeader, then Ok once the topic committed
     RetriableNotLeader,      // 2 (subscribe: bare ErrorResponse; group: -1); nothing appended / registered
+                             // (also read_committed on a follower — R7, ruling 2026-10-13: never OK-then-nothing)
     RetriableLogFull,        // 42 to a v6 session (NotLeader to v5); nothing appended; Ok after catch-up
     MarkerRetried,           // marker refused retriably; lands once the condition clears (leader cells)
     UnansweredThenReissued,  // no Records while disowned; served again once ownership returns
@@ -79,6 +80,10 @@ inline constexpr std::array<Timing, 7> kTimings{Timing::Steady, Timing::RingFull
     if (e.persist == Persist::Disk && ringOnly) return Outcome::NotApplicable;      // R4
     if (e.role == Role::Follower) {
         if (ringOnly) return Outcome::NotApplicable;                                 // R5
+        // R7 (controller ruling 2026-10-13, Task 11 fix round 2): read_committed is
+        // served from a leader's RC state only — a follower refuses the subscribe
+        // NotLeader (retriable: the client re-routes), never OK-then-nothing.
+        if (op == Op::ReadCommitted) return Outcome::RetriableNotLeader;
         if (t == Timing::LeaderMovesMidOp) return leaderMoves_(op);                  // R6
         if (isProduce(op)) return Outcome::RetriableNotLeader;                       // R7
         return marker ? Outcome::MarkerRetried : Outcome::ParityWithDisk;

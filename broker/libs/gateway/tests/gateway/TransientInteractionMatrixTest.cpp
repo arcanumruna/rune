@@ -499,10 +499,11 @@ struct Driver {
                     const int16_t retry = r->answer(r->produce(mx::wireAcks(c.op)));
                     EXPECT_EQ(retry, c.e.role == mx::Role::Leader ? kOk : kNotLeader) << "the retry on the owner";
                 }
-            } else {   // Uncommitted × Steady reads (R1)
+            } else {   // Uncommitted × Steady reads (R1); follower read_committed (R7)
                 const auto [code, subId] = openRead(r->topic());
-                EXPECT_EQ(code, kNotLeader) << "an uncommitted topic registered a subscription";
+                EXPECT_EQ(code, kNotLeader) << "a subscription was registered where it cannot be served";
                 EXPECT_LT(subId, 0);
+                EXPECT_TRUE(r->subIds.empty()) << "a SubscribeResponse was sent";
             }
             return;
         }
@@ -617,8 +618,7 @@ struct Driver {
             // read_committed: the ownership change rebuilt the RC state (a fresh
             // RcState) — the OPEN transaction at 0..1 must still pin the LSO.
             EXPECT_TRUE(got.empty()) << "an OPEN transaction leaked to read_committed after an ownership change";
-            if (c.e.role == mx::Role::Follower) return;   // RcState I2: read_committed serves a leader's log only
-                                                          // (a follower delivers nothing; disk == transient)
+            ASSERT_EQ(c.e.role, mx::Role::Leader) << "a follower refuses read_committed (R7: RetriableNotLeader)";
             EXPECT_GT(r->pool->worker(0).pushReadsForTest(), readsWhileDisowned)
                 << "the read was never re-issued after ownership returned";
             EXPECT_EQ(r->marker(), ClientGateway::kControlRecordAsync);
@@ -757,11 +757,11 @@ TEST(TransientMatrixCountRegression, CellCountsArePinned) {
     for (const Cell& c : allCells()) { ++by[mx::expect(c.op, c.e, c.t)]; ++total; }
     EXPECT_EQ(total, 1008);
     EXPECT_EQ(total - by[Outcome::NotApplicable], 366);
-    EXPECT_EQ(by[Outcome::RetriableNotLeader], 112);
+    EXPECT_EQ(by[Outcome::RetriableNotLeader], 124);   // + 12 follower read_committed (ruling 2026-10-13)
     EXPECT_EQ(by[Outcome::Ok], 84);
     EXPECT_EQ(by[Outcome::OkAfterCommit], 32);
-    EXPECT_EQ(by[Outcome::UnansweredThenReissued], 40);
-    EXPECT_EQ(by[Outcome::ParityWithDisk], 40);
+    EXPECT_EQ(by[Outcome::UnansweredThenReissued], 36);
+    EXPECT_EQ(by[Outcome::ParityWithDisk], 32);
     EXPECT_EQ(by[Outcome::OkEmptyAfterRestart], 18);
     EXPECT_EQ(by[Outcome::MarkerRetried], 18);
     EXPECT_EQ(by[Outcome::OkFromRingStart], 16);

@@ -54,6 +54,17 @@ public:
         return replica_->gatewayHighWatermark();
     }
     [[nodiscard]] int gatewayIsrSize() const noexcept { return replica_->gatewayIsrSize(); }
+    /// E2 Task 11 ruling (read_committed on a follower): true when this replica
+    /// can serve read_committed — its OWNER's published role (release-stored on
+    /// construction and every role transition: the same snapshot mechanism as
+    /// gatewayHighWatermark) is Leader and the routed-role hint is not Follower.
+    /// A snapshot, never the role authority: a stale "not leader" is a retriable
+    /// NotLeader (the client re-routes), a stale "leader" is the demotion the
+    /// client's metadata update moves the subscription away from.
+    [[nodiscard]] bool publishedLeader() const noexcept {
+        return intended_ != IntendedRole::Follower &&
+               replica_->cleanerRole() == rune::replication::Role::Leader;
+    }
 
     /// ONLY for the inline append path, where the control thread IS the owner
     /// (no worker pool, or a gateway-owned internal partition in shard mode):
