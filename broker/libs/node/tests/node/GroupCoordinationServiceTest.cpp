@@ -1522,3 +1522,89 @@ TEST_F(CG3ServiceTest, PendingLineageIsReCheckedAloneAndEmptyGroupsArePrunedRegr
     tick();
     EXPECT_EQ(service_->supersededMarkGroupsForTest(), 0u) << "an Empty group's superseded marks were never pruned";
 }
+
+// E2 final fix wave, residual round 6 — F1 (coordinator half) + F4.
+// A group whose CURRENT generation consumes a transient partition (it is in its
+// assignment) but holds NO committed offset on it: a new lineage still forces
+// it to rebalance (sweep) — and a commit that races ahead of the sweep, with no
+// stored offset to compare with, is fenced because the generation predates the
+// mint.  F4: while the new lineage is pending the coordinator re-checks only
+// that pending (group, partition) — no fetchAll over every group — and an
+// Empty group's lineage state is pruned.  RED (only committed offsets): the
+// no-commit group was never rebalanced and the racing commit was accepted.
+namespace {
+uint64_t g_f1Lineage = 0xA;
+uint64_t g_f1Version = 1;
+uint64_t f1Lineage(void*, int32_t, int32_t partition) noexcept { return partition == 0 ? g_f1Lineage : 0; }
+uint64_t f1Version(void*) noexcept { return g_f1Version; }
+std::size_t encodeJoinWithTopic(uint8_t* buf, int64_t corr, std::string_view group, std::string_view member,
+                                int32_t topicId) {
+    pc::JoinGroup msg;
+    msg.sessionId = 1; msg.correlationId = corr; msg.sessionTimeoutMs = 60'000;
+    msg.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+    msg.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(member.data()), member.size());
+    const std::array<int32_t, 1> topics{topicId};
+    return msg.encode(buf, std::span<const int32_t>(topics));
+}
+}  // namespace
+
+TEST_F(CG3ServiceTest, GroupConsumingAPartitionWithoutACommitIsFencedOnANewLineageRegression) {
+    g_f1Lineage = 0xA; g_f1Version = 1;
+    service_->setTransientLineage(&f1Lineage, nullptr);
+    service_->setTransientLineageVersion(&f1Version, nullptr);
+    auto stableMember = [&](const std::string& group) {
+        auto l = encodeJoinWithTopic(req_, 1200, group, "", kTestTopicId);
+        auto r = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, l, clock_, out_, kBufSize));
+        const std::string m(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size());
+        l = encodeJoinWithTopic(req_, 1201, group, m, kTestTopicId);
+        (void)service_->handleJoinGroup(req_, l, clock_, out_, kBufSize);
+        EXPECT_TRUE(driveUntil([&] { return service_->coordinator(group).state() == GroupState::Stable; }, 20));
+        return m;
+    };
+    auto commit = [&](const std::string& group, const std::string& m, int32_t gen, int64_t off) {
+        auto l = encodeOffsetCommit(req_, 1, 1202, group, m, gen, kTestTopicId, 0, off, "");
+        auto r = pc::OffsetCommitResponse::decode(out_, service_->handleOffsetCommit(req_, l, clock_, out_, kBufSize));
+        return r.has_value() && !r->results.empty() ? r->results[0].errorCode : int16_t{-99};
+    };
+    auto tick = [&] { clock_ += kStep; replica_->doWork(clock_); service_->doWork(clock_); };
+
+    // (a) The sweep: "g-swept" consumes partition 0 (assigned), never committed.
+    const std::string m1 = stableMember("g-swept");
+    const int32_t gen1 = service_->coordinator("g-swept").generationId();
+    g_f1Lineage = 0xB; ++g_f1Version;   // a new lineage
+    tick();
+    EXPECT_GT(service_->coordinator("g-swept").generationId(), gen1)
+        << "SILENT LOSS: a group consuming the partition without a commit was not rebalanced";
+    EXPECT_EQ(commit("g-swept", m1, gen1, 20), static_cast<int16_t>(pc::ErrorCode::IllegalGeneration));
+
+    // (b) The commit path, ahead of the sweep (the version has not moved yet).
+    const std::string m2 = stableMember("g-raced");
+    const int32_t gen2 = service_->coordinator("g-raced").generationId();
+    g_f1Lineage = 0xC;   // minted; the coordinator has not swept it
+    EXPECT_EQ(commit("g-raced", m2, gen2, 20), static_cast<int16_t>(pc::ErrorCode::IllegalGeneration))
+        << "SILENT LOSS: a commit with no stored offset, from a generation older than the mint, was accepted";
+    EXPECT_GT(service_->coordinator("g-raced").generationId(), gen2);
+
+    // F4: a PENDING lineage is re-checked alone (no fetchAll each 100 ms) and
+    // decided once it resolves.
+    const std::string m3 = stableMember("g-pending");
+    g_f1Lineage = GroupCoordinationService::kLineagePending; ++g_f1Version;
+    tick();
+    EXPECT_GE(service_->pendingLineageChecksForTest(), 1u) << "the undecided partition was not kept for re-check";
+    const int32_t gen3 = service_->coordinator("g-pending").generationId();
+    g_f1Lineage = 0xD;   // resolved (a mint) — WITHOUT a version move: only the pending re-check can see it
+    for (int i = 0; i < 200; ++i) tick();   // > 100 ms of duty time
+    EXPECT_EQ(service_->pendingLineageChecksForTest(), 0u);
+    EXPECT_GT(service_->coordinator("g-pending").generationId(), gen3) << "the pending re-check never decided it";
+
+    // F4: once a group is Empty its lineage state is pruned (no unbounded marks).
+    ASSERT_GE(service_->supersededMarkGroupsForTest(), 3u);
+    for (const auto& [g, m] : {std::pair<std::string, std::string>{"g-swept", m1}, {"g-raced", m2}, {"g-pending", m3}}) {
+        auto l = encodeLeaveGroup(req_, 1, 1203, g, m);
+        (void)service_->handleLeaveGroup(req_, l, clock_, out_, kBufSize);
+        ASSERT_TRUE(driveUntil([&] { return service_->coordinator(g).isEmpty(); }, 20)) << g << " never emptied";
+    }
+    g_f1Lineage = 0xE; ++g_f1Version;   // the next lineage change sweeps
+    tick();
+    EXPECT_EQ(service_->supersededMarkGroupsForTest(), 0u) << "an Empty group's superseded marks were never pruned";
+}

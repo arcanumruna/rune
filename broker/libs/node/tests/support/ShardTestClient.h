@@ -300,18 +300,37 @@ public:
     struct JoinAnswer { int16_t errorCode = -1; std::string memberId; int32_t generation = -1; };
     /// `memberId` empty: a new member; else a re-join of that member.
     std::optional<JoinAnswer> joinGroup(const std::string& gw, int32_t stream, int64_t sid, std::string_view group,
-                                        std::string_view memberId = {}) {
+                                        std::string_view memberId = {}, std::vector<int32_t> topicIds = {}) {
         pc::JoinGroup m;
         m.sessionId = sid; m.correlationId = ++corr_; m.sessionTimeoutMs = 30'000;
         m.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
         m.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(memberId.data()), memberId.size());
         std::vector<uint8_t> buf(512);
-        const std::size_t len = m.encode(buf.data(), std::span<const int32_t>());
+        const std::size_t len = m.encode(buf.data(), std::span<const int32_t>(topicIds));
         const int64_t c = m.correlationId;
         if (!send(gw, stream, buf.data(), len)) return std::nullopt;
         for (int i = 0; i < kMaxIters; ++i) {
             poll_();
             if (auto it = joins_.find(c); it != joins_.end()) return it->second;
+            pause_();
+        }
+        return std::nullopt;
+    }
+    /// Heartbeat of a member: its result code (OK once the group is Stable at
+    /// `generation`; RebalanceInProgress while it rebalances).
+    std::optional<int16_t> heartbeat(const std::string& gw, int32_t stream, int64_t sid, std::string_view group,
+                                     const std::string& member, int32_t generation) {
+        pc::Heartbeat m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.generationId = generation;
+        m.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+        m.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(member.data()), member.size());
+        std::vector<uint8_t> buf(512);
+        const std::size_t len = m.encode(buf.data());
+        const int64_t c = m.correlationId;
+        if (!send(gw, stream, buf.data(), len)) return std::nullopt;
+        for (int i = 0; i < kMaxIters; ++i) {
+            poll_();
+            if (auto it = heartbeats_.find(c); it != heartbeats_.end()) return it->second;
             pause_();
         }
         return std::nullopt;
@@ -649,6 +668,9 @@ private:
                         r->errorCode, std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size()),
                         r->generationId};
                 break;
+            case pc::TemplateId::HeartbeatResponse:
+                if (auto r = pc::HeartbeatResponse::decode(p, n)) heartbeats_[r->correlationId] = r->errorCode;
+                break;
             case pc::TemplateId::OffsetCommitResponse:
                 if (auto r = pc::OffsetCommitResponse::decode(p, n))
                     commits_[r->correlationId] = r->results.empty() ? int16_t{-1} : r->results[0].errorCode;
@@ -697,6 +719,7 @@ private:
     std::map<int64_t, int16_t>                      subscribes_;   // SubscribeResponse errorCode by corr
     int32_t                                         clientVersion_ = 1;
     std::map<int64_t, JoinAnswer>                   joins_;
+    std::map<int64_t, int16_t>                      heartbeats_;
     std::map<int64_t, int16_t>                      commits_;
     std::map<int64_t, std::pair<int64_t, int16_t>>  fetches_;
     std::optional<std::vector<PartitionInfo>>       metadata_;

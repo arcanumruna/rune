@@ -1171,3 +1171,129 @@ TEST(TransientLineageClusterRegression, ShardModeLeaderSeesItsLineageConfirmatio
     }
     EXPECT_FALSE(pending) << "the leader never matched the controller's lineage confirmation (shard mode)";
 }
+
+// E2 final fix wave, residual round 6 — F1 (silent loss): a group consumes an
+// RF=1 transient partition P but has NO committed offset on it (the first
+// auto-commit interval has not passed).  Its position (20) lives only in the
+// member.  P's node crashes and restarts empty: a new lineage.  Nothing stored
+// is superseded, yet the member's in-memory position is — the group must be
+// rebalanced all the same, and the member's commit at the pre-mint generation
+// (20: a position in the old data) refused; after re-joining it starts at the
+// log start and gets every post-restart record exactly once.  RED (only
+// committed offsets swept / fenced): the stale commit was accepted (stamped
+// with the new lineage) — the next fetch answered 20.
+TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANewLineageRegression) {
+    GroupCluster g;
+    g.crashStops = true;
+    g.rf         = 1;
+    g.partitions = 3;
+    for (int i = 0; i < 3; ++i) g.start(i);
+    ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
+    ShardTestClient c(g.cdir.path);
+    c.setClientVersion(rune::protocol::client::kClientVersion);
+    const int coord = g.coordinator();
+    ASSERT_GE(coord, 0);
+    int P = -1, L = -1;
+    {
+        const int64_t s = c.connect(gatewayChannel(g.ports, coord), kClientStream);
+        for (int k = 0; k < 400 && P < 0; ++k) {
+            for (const auto& pi : c.metadata(gatewayChannel(g.ports, coord), kClientStream, s))
+                if (pi.topicId == 0 && pi.leaderId >= 0 && pi.leaderId != coord) { P = pi.partition; L = pi.leaderId; break; }
+            if (P < 0) std::this_thread::sleep_for(50ms);   // metadata settling (poll interval)
+        }
+    }
+    ASSERT_GE(P, 0);
+    const std::string gwC = gatewayChannel(g.ports, coord);
+    const int64_t sidC = c.connect(gwC, kClientStream);
+
+    // The member joins (assigned every partition of topic 0, P among them) and
+    // consumes P from the log start — 20 records — committing nothing.
+    std::optional<ShardTestClient::JoinAnswer> j;
+    for (int k = 0; k < 400; ++k) {
+        j = c.joinGroup(gwC, kClientStream, sidC, "lg-nocommit", {}, {0});
+        if (j && j->errorCode == kOffsetOk) break;
+        std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_TRUE(j && j->errorCode == kOffsetOk);
+    const std::string member = j->memberId;
+    int32_t gen = j->generation;
+    const int64_t sidL = c.connect(gatewayChannel(g.ports, L), kClientStream);
+    for (int b = 0; b < 5; ++b)
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sidL, 0, P, 1, makeBatch(4)));
+    ASSERT_TRUE(c.subscribe(gatewayChannel(g.ports, L), kClientStream, sidL, 0, P, 0));
+    ASSERT_TRUE(c.pollUntil([&] { return pushedAt(c, 16) >= 1; })) << "precondition: the member consumed 0..19";
+    // The group is Stable at `gen` (assigned): its generation consumes P.  As a
+    // member does: RebalanceInProgress -> re-join (same member id).
+    bool stable = false;
+    for (int k = 0; k < 600 && !stable; ++k) {
+        const auto hb = c.heartbeat(gwC, kClientStream, sidC, "lg-nocommit", member, gen);
+        stable = hb && *hb == kOffsetOk;
+        if (!stable && hb && *hb == static_cast<int16_t>(rune::protocol::client::ErrorCode::RebalanceInProgress)) {
+            const auto rj = c.joinGroup(gwC, kClientStream, sidC, "lg-nocommit", member, {0});
+            if (rj && rj->errorCode == kOffsetOk) gen = rj->generation;
+        }
+        if (!stable) std::this_thread::sleep_for(50ms);   // the coordinator's rebalance (poll interval)
+    }
+    ASSERT_TRUE(stable) << "precondition: the group reached Stable";
+    // A separate PROBE group commits on P: its fetch turning -1 shows the mint.
+    std::string probeMember;
+    int32_t probeGen = -1;
+    bool probed = false;
+    for (int k = 0; k < 400 && !probed; ++k) {
+        const auto pj = c.joinGroup(gwC, kClientStream, sidC, "lg-probe", probeMember);
+        if (pj && pj->errorCode == kOffsetOk) {
+            probeMember = pj->memberId;
+            probeGen    = pj->generation;
+            const auto code = c.offsetCommit(gwC, kClientStream, sidC, "lg-probe", probeMember, probeGen, 0, P, 20);
+            probed = code && *code == kOffsetOk;
+        }
+        if (!probed) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_TRUE(probed);
+
+    // L crashes and restarts: a new lineage.
+    g.stop(L);
+    g.start(L);
+    bool minted = false;
+    for (int k = 0; k < 600 && !minted; ++k) {
+        const auto r = c.offsetFetch(gwC, kClientStream, sidC, "lg-probe", 0, P);
+        minted = r && r->second == kOffsetOk && r->first == -1;
+        if (!minted) std::this_thread::sleep_for(50ms);   // lineage settling (poll interval)
+    }
+    ASSERT_TRUE(minted) << "P's new lineage never confirmed";
+    // The member, at its pre-mint generation, commits its in-memory position.
+    const std::optional<int16_t> stale = c.offsetCommit(gwC, kClientStream, sidC, "lg-nocommit", member, gen, 0, P, 20);
+    ASSERT_TRUE(stale.has_value());
+    EXPECT_NE(*stale, kOffsetOk)
+        << "SILENT LOSS: a position from the superseded data was committed (no stored offset to compare with)";
+    const auto after = c.offsetFetch(gwC, kClientStream, sidC, "lg-nocommit", 0, P);
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->first, -1) << "SILENT LOSS: the member would resume at " << after->first;
+
+    // Re-join: a new generation; every post-restart record exactly once from the log start.
+    std::optional<ShardTestClient::JoinAnswer> j2;
+    for (int k = 0; k < 400; ++k) {
+        j2 = c.joinGroup(gwC, kClientStream, sidC, "lg-nocommit", member, {0});
+        if (j2 && j2->errorCode == kOffsetOk) break;
+        std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_TRUE(j2 && j2->errorCode == kOffsetOk);
+    EXPECT_GT(j2->generation, gen) << "the group was not rebalanced for the new lineage";
+    const int64_t sidL2 = c.connect(gatewayChannel(g.ports, L), kClientStream);
+    for (int64_t want = 0; want < 6; ++want) {
+        const auto ack = c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sidL2, 0, P, 1, makeBatch(1));
+        ASSERT_TRUE(ack.has_value());
+        ASSERT_EQ(ack->baseOffset, want) << "precondition: the ring restarted empty";
+    }
+    const std::size_t before = c.records().size();
+    ASSERT_TRUE(c.subscribe(gatewayChannel(g.ports, L), kClientStream, sidL2, 0, P, 0));
+    std::map<int64_t, int> seen;
+    ASSERT_TRUE(c.pollUntil([&] {
+        seen.clear();
+        for (std::size_t i = before; i < c.records().size(); ++i)
+            if (!c.records()[i].bytes.empty()) ++seen[c.records()[i].baseOffset];
+        return seen.size() >= 6;
+    }));
+    for (int64_t o = 0; o < 6; ++o) EXPECT_EQ(seen[o], 1) << "post-restart record " << o;
+    std::printf("[F1] stale commit answered %d\n", *stale);
+}

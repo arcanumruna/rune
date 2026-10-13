@@ -331,6 +331,12 @@ void GroupCoordinationService::sweepSupersededLineages_(int64_t nowNs) {
     pendingChecks_.clear();
     for (auto& [groupId, coord] : coordinators_) {
         if (coord.isEmpty()) { pruneGroupLineageState_(groupId); continue; }   // F4: nothing live to fence
+        // (a) the partitions its current generation consumes (F1: no commit needed)
+        if (auto gl = genLineages_.find(groupId); gl != genLineages_.end()) {
+            for (const auto& g : gl->second)
+                if (!checkSuperseded_(groupId, g.topicId, g.partition, 0, /*genEntry=*/true, nowNs))
+                    pendingChecks_.push_back(PendingCheck{groupId, g.topicId, g.partition, 0, true});
+        }
         // (b) its committed offsets (R1)
         for (const auto& [tp, co] : offsets_->fetchAll(groupId)) {
             if (co.lineage == 0 || topics_ == nullptr) continue;
@@ -971,8 +977,14 @@ size_t GroupCoordinationService::handleOffsetCommit(
             // member re-joins and re-fetches).  After that rebalance an old-
             // generation commit is fenced by genOk above.
             const auto prev = offsets_->fetch(groupIdStr, tp);
+            // Round 6 (F1): or this generation consumed the partition under a
+            // lineage that has been superseded since — even with NO committed
+            // offset (an in-memory position): the generation predates the mint.
+            GenLineage* gl = genLineageOf_(groupIdStr, e.topicId, e.partition);
+            if (gl != nullptr && gl->lineage == kLineagePending) gl->lineage = lineage;   // first confirmed
+            const bool genSuperseded = gl != nullptr && gl->lineage != lineage;
             const bool prevSuperseded = prev.has_value() && prev->lineage != 0 && prev->lineage != lineage;
-            if (prevSuperseded &&
+            if ((genSuperseded || prevSuperseded) &&
                 rebalanceForSupersededLineage_(groupIdStr, it->second, e.topicId, e.partition, lineage, nowNs)) {
                 ++supersededCommitsFenced_;
                 genOk = false;   // the rest of this request is at the old generation now
@@ -1253,6 +1265,7 @@ void GroupCoordinationService::onReachedStable(
     int64_t nowNs)
 {
     (void)nowNs;
+    recordGenLineages_(groupId, coord);   // round 6 (F1): the lineages this generation consumes
     if (!gateway_) return;  // no push path wired
 
     const int32_t gen = coord.generationId();
