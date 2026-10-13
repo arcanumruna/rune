@@ -73,6 +73,16 @@
 //     createView "race_mixed".  Prints one "DDL_RACE leg=<leg> role=<r> code=<n>" per leg.
 //   RUNE_MODE=catalog_dump: getTopicSchema for each RUNE_CATALOG_NAMES entry, one
 //     "CATALOG name=… code=… topicId=… version=… parts=… fp=…" line each.
+//   RUNE_MODE=group_commit (E2 final fix wave C1; after setup): a consumer group
+//     ("e2-presence-group", earliest) consumes presence_t (RUNE_VIEW_TT_TOPIC_ID)
+//     to its end (RUNE_VIEW_TT_END) and commits that position.  Prints
+//     "GROUP-COMMIT: OK committed=<n>".  Exit codes 150..152.
+//   RUNE_MODE=group_restart (C1; after verify_restart): the ring restarted
+//     empty and holds fewer records than the group committed.  Produces two
+//     more (offsets 1, 2 after verify_restart's 0); the SAME group rejoins and
+//     must deliver every post-restart record (0, 1, 2) exactly once — never
+//     resume at the committed position of the ring's previous life (silent
+//     loss).  Prints "GROUP-RESTART: OK".  Exit codes 153..157.
 //   RUNE_MODE=transient_failover (3-node, docker/transient-failover-e2e.sh): a
 //     read_committed + a Latest read_committed subscription on the transient
 //     topic "presence_failover"; prints FAILOVER_LEADER=<node> and
@@ -98,6 +108,7 @@
 #include <rune/client/view/ViewRowCodec.h>
 #include <rune/client/TypedTopic.h>
 #include <rune/client/subscriber/Subscription.h>
+#include <rune/client/group/GroupConsumer.h>
 
 #include "characters.gen.h"   // Phase 2b C: build-time codegen (tests/generated/characters.blob)
 
@@ -106,6 +117,8 @@
 #include <rune/codec/Serialize.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -953,6 +966,104 @@ static int transientFailoverMode(Client& c, std::chrono::milliseconds wait, int 
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// E2 final fix wave (C1): GroupConsume x Restart on the transient topic.
+// The group consumer is created in the client's setup phase (before connect),
+// with presence_t in ClientConfig::topics (the id comes from the setup handoff).
+// Records are counted per offset on the runner thread (atomics: the app thread
+// polls them to a deadline, then closes the consumer and waits for finished()).
+// ---------------------------------------------------------------------------
+static constexpr const char* kPresenceGroup = "e2-presence-group";
+
+static int groupCommitMode(ClientConfig cfg, int timeoutMs, int boundMs) {
+    const auto ttTopic = static_cast<int32_t>(getEnvI64("RUNE_VIEW_TT_TOPIC_ID", -1));
+    const int64_t ttEnd = getEnvI64("RUNE_VIEW_TT_END", -1);
+    if (ttTopic < 0 || ttEnd <= 0) { std::cerr << "PROBE: FAIL group_commit needs RUNE_VIEW_TT_TOPIC_ID / RUNE_VIEW_TT_END\n"; return 150; }
+    cfg.topics.push_back(TopicSpec{"presence_t", ttTopic, 1});
+    Client c(cfg);
+    GroupConfig g;
+    g.autoCommit      = false;
+    g.autoOffsetReset = OffsetReset::Earliest;
+    auto gc = c.subscribeGroup(kPresenceGroup, {"presence_t"}, g);
+    std::atomic<int64_t> next{0};
+    gc.onRecords([&next](const RecordSet& rs) {
+        if (rs.nextOffset() > next.load(std::memory_order_relaxed)) next.store(rs.nextOffset(), std::memory_order_relaxed);
+    });
+    c.connectAndWait();
+    const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(boundMs);
+    while (next.load(std::memory_order_relaxed) < ttEnd && std::chrono::steady_clock::now() < dl)
+        std::this_thread::sleep_for(5ms);   // poll interval, not correctness
+    if (next.load() < ttEnd) {
+        std::cerr << "PROBE: FAIL group_commit consumed to " << next.load() << " (want " << ttEnd << ")\n";
+        gc.close(); c.close(); return 151;
+    }
+    try {
+        gc.commitSyncAndWait(std::chrono::milliseconds(timeoutMs * 2));
+    } catch (const std::exception& ex) {
+        std::cerr << "PROBE: FAIL group_commit commitSync: " << ex.what() << "\n";
+        gc.close(); c.close(); return 152;
+    }
+    gc.close();
+    std::cout << "GROUP-COMMIT: OK committed=" << next.load() << "\n";
+    std::cout.flush();
+    c.close();
+    return 0;
+}
+
+static int groupRestartMode(ClientConfig cfg, int timeoutMs, int boundMs) {
+    const auto ttTopic = static_cast<int32_t>(getEnvI64("RUNE_VIEW_TT_TOPIC_ID", -1));
+    if (ttTopic < 0) { std::cerr << "PROBE: FAIL group_restart needs RUNE_VIEW_TT_TOPIC_ID\n"; return 153; }
+    cfg.topics.push_back(TopicSpec{"presence_t", ttTopic, 1});
+    Client c(cfg);
+    GroupConfig g;
+    g.autoCommit      = false;
+    g.autoOffsetReset = OffsetReset::Earliest;
+    auto gc = c.subscribeGroup(kPresenceGroup, {"presence_t"}, g);
+    constexpr int64_t kWant = 3;   // offsets 0 (verify_restart's record), 1, 2
+    std::array<std::atomic<int>, 64> seen{};
+    gc.onRecords([&seen](const RecordSet& rs) {
+        rs.forEachRecord([&seen](std::string_view, std::string_view, int64_t off, int64_t) {
+            if (off >= 0 && off < 64) seen[static_cast<std::size_t>(off)].fetch_add(1, std::memory_order_relaxed);
+        });
+    });
+    c.connectAndWait();
+    for (int64_t key = 40; key < 42; ++key) {
+        int64_t off = -1;
+        if (!produceOne(c, ttTopic, key, Acks::All, timeoutMs, off)) {
+            std::cerr << "PROBE: FAIL group_restart produce\n"; gc.close(); c.close(); return 154;
+        }
+    }
+    auto all = [&] {
+        for (int64_t o = 0; o < kWant; ++o) if (seen[static_cast<std::size_t>(o)].load() == 0) return false;
+        return true;
+    };
+    const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(boundMs);
+    while (!all() && std::chrono::steady_clock::now() < dl) std::this_thread::sleep_for(5ms);
+    gc.close();
+    const auto fin = std::chrono::steady_clock::now() + 10s;
+    while (!gc.finished() && std::chrono::steady_clock::now() < fin) std::this_thread::sleep_for(1ms);
+    if (!all()) {
+        std::cerr << "PROBE: FAIL group_restart SILENT LOSS: the group did not deliver every post-restart record:";
+        for (int64_t o = 0; o < kWant; ++o) std::cerr << " offset " << o << " x" << seen[static_cast<std::size_t>(o)].load();
+        std::cerr << " (it resumed at the committed position of the ring's previous life)\n";
+        c.close(); return 155;
+    }
+    for (int64_t o = 0; o < 64; ++o) {
+        if (seen[static_cast<std::size_t>(o)].load() > 1) {
+            std::cerr << "PROBE: FAIL group_restart offset " << o << " delivered " << seen[static_cast<std::size_t>(o)].load() << " times\n";
+            c.close(); return 156;
+        }
+        if (o >= kWant && seen[static_cast<std::size_t>(o)].load() != 0) {
+            std::cerr << "PROBE: FAIL group_restart delivered offset " << o << " (the ring holds only " << kWant << ")\n";
+            c.close(); return 157;
+        }
+    }
+    std::cout << "GROUP-RESTART: OK delivered the " << kWant << " post-restart records exactly once\n";
+    std::cout.flush();
+    c.close();
+    return 0;
+}
+
 int main() {
     const std::string mode        = getEnvStr("RUNE_MODE", "setup");
     const std::string target      = getEnvStr("RUNE_TARGET");
@@ -981,6 +1092,18 @@ int main() {
     cfg.idleMode         = IdleMode::LowLatency;
 
     const auto wait = std::chrono::milliseconds(timeoutMs);
+
+    // E2 final fix wave (C1): the group legs build their own client (the group
+    // consumer is registered before connect).
+    if (mode == "group_commit" || mode == "group_restart") {
+        try {
+            return mode == "group_commit" ? groupCommitMode(cfg, timeoutMs, boundMs)
+                                          : groupRestartMode(cfg, timeoutMs, boundMs);
+        } catch (const std::exception& ex) {
+            std::cerr << "PROBE: FAIL " << mode << " exception: " << ex.what() << "\n";
+            return 21;
+        }
+    }
 
     try {
         Client c(cfg);
@@ -1141,6 +1264,7 @@ int main() {
                 while (!sub.finished() && std::chrono::steady_clock::now() < fin) std::this_thread::sleep_for(1ms);
                 if (sub.position() != 4 || seen != 1) { std::cerr << "PROBE: FAIL subscribe(presence_t, latest) position=" << sub.position() << " seen=" << seen << " (want 4, 1)\n"; return 138; }
             }
+            int64_t ttEnd = -1;   // C1: presence_t's end, handed to the group_commit leg
             {
                 // read_committed: offsets 0-3 plain; a committed txn (2 records + marker),
                 // an aborted txn (2 records + marker), then one plain record (acks=All).
@@ -1149,6 +1273,7 @@ int main() {
                 if (!transientTxn(c, tt.topicId, "e2-presence-abort", 20, 2, /*commit=*/false, timeoutMs))  return 140;
                 int64_t off = -1;
                 if (!produceOne(c, tt.topicId, 30, Acks::All, timeoutMs, off)) { std::cerr << "PROBE: FAIL produce(presence_t) after txns\n"; return 141; }
+                ttEnd = off + 1;
                 int64_t seen = 0;
                 const int64_t pos = subscribeUntil(c, tt.topicId, From::earliest(), Isolation::ReadCommitted, off + 1, boundMs, &seen);
                 if (pos != off + 1 || seen != 7) {
@@ -1172,6 +1297,7 @@ int main() {
             std::cout << "VIEW_TOPIC_ID_AGG="   << viewA.viewTopicId        << "\n";
             std::cout << "VIEW_FP_AGG="         << viewA.outputFingerprint  << "\n";
             std::cout << "VIEW_TT_TOPIC_ID="    << tt.topicId               << "\n";
+            std::cout << "VIEW_TT_END="         << ttEnd                    << "\n";   // C1: the group_commit leg
             std::cout << "VIEW-PROBE-SETUP: OK\n";
             std::cout.flush();
             c.close();
