@@ -686,6 +686,7 @@ static int transientFailoverMode(Client& c, std::chrono::milliseconds wait, int 
     std::vector<uint16_t> rcCount(kMaxOff, 0), ltCount(kMaxOff, 0);
     int64_t rcOutOfRange = 0, ltOutOfRange = 0;
     bool    leaderPrinted = false;
+    int32_t leaderFirst = -2, leaderLast = -2;   // handler-owned: the partition leader at the first / last record
     std::optional<Subscription> rc, lt;
     struct Quiesce {
         std::optional<Subscription>& a;
@@ -705,8 +706,10 @@ static int transientFailoverMode(Client& c, std::chrono::milliseconds wait, int 
     rco.isolation = Isolation::ReadCommitted;
     rc.emplace(c.subscribe(th, 0, rco, [&](const Record& r) {
         if (r.offset >= 0 && r.offset < kMaxOff) ++rcCount[static_cast<std::size_t>(r.offset)]; else ++rcOutOfRange;
-        if (!leaderPrinted) {   // duty thread: the hook's documented caller
+        leaderLast = c.testLeaderFor(tt.topicId, 0);   // duty thread: the hook's documented caller
+        if (!leaderPrinted) {
             leaderPrinted = true;
+            leaderFirst   = leaderLast;
             std::cout << "FAILOVER_LEADER=" << c.testLeaderFor(tt.topicId, 0) << "\n";
             std::cout.flush();
         }
@@ -844,8 +847,24 @@ static int transientFailoverMode(Client& c, std::chrono::milliseconds wait, int 
     while (done < kAround && std::chrono::steady_clock::now() < dl) { drain(); std::this_thread::sleep_for(2ms); }
     if (done < kAround) { std::cerr << "PROBE: FAIL STALL: only " << done << "/" << kAround << " sends completed\n"; return 106; }
     if (ackedOffsets.empty()) { std::cerr << "PROBE: FAIL no record acked around the move\n"; return 107; }
+    // Every send around the move must be acked — a refused / in-doubt one would
+    // make "nothing lost around the move" vacuous.
+    if (static_cast<int>(ackedOffsets.size()) != kAround || failedSends != 0) {
+        std::cerr << "PROBE: FAIL acked " << ackedOffsets.size() << "/" << kAround << ", in doubt " << failedSends
+                  << " (every record around the move must be acked)\n";
+        return 125;
+    }
+    {
+        std::vector<int64_t> sorted = ackedOffsets;
+        std::sort(sorted.begin(), sorted.end());
+        if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+            std::cerr << "PROBE: FAIL two acks named the same offset\n";
+            return 127;
+        }
+    }
     const int64_t maxAcked = *std::max_element(ackedOffsets.begin(), ackedOffsets.end());
     const int64_t minAcked = *std::min_element(ackedOffsets.begin(), ackedOffsets.end());
+    if (minAcked < 0) { std::cerr << "PROBE: FAIL an Ok ack carried offset " << minAcked << "\n"; return 126; }
     if (maxAcked >= kMaxOff) { std::cerr << "PROBE: FAIL acked offset " << maxAcked << " beyond the counters\n"; return 108; }
 
     // (a) both keep receiving committed data on the new leader — bounded.
@@ -868,6 +887,12 @@ static int transientFailoverMode(Client& c, std::chrono::milliseconds wait, int 
         std::cerr << "PROBE: FAIL STALL: positions read_committed=" << rcPos << " Latest=" << ltPos
                   << " never passed the last acked offset " << maxAcked << " within " << boundMs << " ms\n";
         return 110;
+    }
+    std::cout << "FAILOVER_NEW_LEADER=" << leaderLast << "\n";
+    if (getEnvInt("RUNE_EXPECT_LEADER_CHANGE", 1) != 0 && (leaderLast < 0 || leaderLast == leaderFirst)) {
+        std::cerr << "PROBE: FAIL the partition leader did not change: before " << leaderFirst << ", after "
+                  << leaderLast << "\n";
+        return 124;
     }
     if (rcId1 == rcId0 || rcId1 <= 0) { std::cerr << "PROBE: FAIL the read_committed subscription did not move (id " << rcId0 << " -> " << rcId1 << ")\n"; return 111; }
 
@@ -1073,24 +1098,31 @@ int main() {
             // ---- 7. Phase 2b E/E2: a TRANSIENT topic — define at runtime (the OK is
             //         held until it serves: C1), produce in all three ack modes,
             //         subscribe from earliest / an offset / latest, read_committed.
-            //         Exit codes 80..86 (50..56 are typedRoutingLeg's, 60 ALTER's). ----
+            //         Exit codes 130..142, one per check (50..56 are typedRoutingLeg's,
+            //         60 ALTER's). ----
             DefineTopicResult tt = c.defineTopicAndWait(
                 "presence_t", /*partitions=*/1, /*keyField=*/"id", /*validate=*/false,
                 std::span<const uint8_t>(blob), Persistence::Transient, wait);
-            if (tt.errorCode != 0) { std::cerr << "PROBE: FAIL defineTopic(presence_t transient) errorCode=" << tt.errorCode << "\n"; return 80; }
+            if (tt.errorCode != 0) { std::cerr << "PROBE: FAIL defineTopic(presence_t transient) errorCode=" << tt.errorCode << "\n"; return 130; }
             {
                 int64_t off = -1;
-                if (!produceOne(c, tt.topicId, 1, Acks::None, timeoutMs, off))   { std::cerr << "PROBE: FAIL produce(presence_t, acks=None)\n"; return 81; }
-                if (!produceOne(c, tt.topicId, 2, Acks::Leader, timeoutMs, off) || off != 1) { std::cerr << "PROBE: FAIL produce(presence_t, acks=Leader) offset=" << off << "\n"; return 81; }
-                if (!produceOne(c, tt.topicId, 3, Acks::All, timeoutMs, off) || off != 2)    { std::cerr << "PROBE: FAIL produce(presence_t, acks=All) offset=" << off << "\n"; return 81; }
+                if (!produceOne(c, tt.topicId, 1, Acks::None, timeoutMs, off))   { std::cerr << "PROBE: FAIL produce(presence_t, acks=None)\n"; return 131; }
+                // acks=None reports Ok on hand-off: wait (bounded) until that record is
+                // in the log before the next producer sends — the offsets below are
+                // then deterministic (never a None record overtaken by a Leader one).
+                if (const int64_t landed = subscribeUntil(c, tt.topicId, From::earliest(), Isolation::ReadUncommitted, 1, boundMs); landed != 1) {
+                    std::cerr << "PROBE: FAIL presence_t acks=None record never landed (position " << landed << ")\n"; return 132;
+                }
+                if (!produceOne(c, tt.topicId, 2, Acks::Leader, timeoutMs, off) || off != 1) { std::cerr << "PROBE: FAIL produce(presence_t, acks=Leader) offset=" << off << "\n"; return 133; }
+                if (!produceOne(c, tt.topicId, 3, Acks::All, timeoutMs, off) || off != 2)    { std::cerr << "PROBE: FAIL produce(presence_t, acks=All) offset=" << off << "\n"; return 134; }
             }
             if (const int64_t pos = subscribeUntil(c, tt.topicId, From::earliest(), Isolation::ReadUncommitted, 3, boundMs); pos < 3) {
-                std::cerr << "PROBE: FAIL subscribe(presence_t, earliest) position=" << pos << " (want 3)\n"; return 82;
+                std::cerr << "PROBE: FAIL subscribe(presence_t, earliest) position=" << pos << " (want 3)\n"; return 135;
             }
             {
                 int64_t seen = 0;
                 const int64_t pos = subscribeUntil(c, tt.topicId, From::offset(2), Isolation::ReadUncommitted, 3, boundMs, &seen);
-                if (pos != 3 || seen != 1) { std::cerr << "PROBE: FAIL subscribe(presence_t, offset 2) position=" << pos << " seen=" << seen << " (want 3, 1)\n"; return 83; }
+                if (pos != 3 || seen != 1) { std::cerr << "PROBE: FAIL subscribe(presence_t, offset 2) position=" << pos << " seen=" << seen << " (want 3, 1)\n"; return 136; }
             }
             {
                 // Latest never replays: the subscription is live (its id is known) before
@@ -1102,27 +1134,27 @@ int main() {
                 const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(boundMs);
                 while (sub.subscriptionId() <= 0 && std::chrono::steady_clock::now() < dl) std::this_thread::sleep_for(5ms);
                 int64_t off = -1;
-                if (!produceOne(c, tt.topicId, 4, Acks::All, timeoutMs, off) || off != 3) { std::cerr << "PROBE: FAIL produce(presence_t) #4 offset=" << off << "\n"; return 84; }
+                if (!produceOne(c, tt.topicId, 4, Acks::All, timeoutMs, off) || off != 3) { std::cerr << "PROBE: FAIL produce(presence_t) #4 offset=" << off << "\n"; return 137; }
                 while (sub.position() < 4 && std::chrono::steady_clock::now() < dl) std::this_thread::sleep_for(5ms);
                 sub.unsubscribe();
                 const auto fin = std::chrono::steady_clock::now() + 5s;
                 while (!sub.finished() && std::chrono::steady_clock::now() < fin) std::this_thread::sleep_for(1ms);
-                if (sub.position() != 4 || seen != 1) { std::cerr << "PROBE: FAIL subscribe(presence_t, latest) position=" << sub.position() << " seen=" << seen << " (want 4, 1)\n"; return 84; }
+                if (sub.position() != 4 || seen != 1) { std::cerr << "PROBE: FAIL subscribe(presence_t, latest) position=" << sub.position() << " seen=" << seen << " (want 4, 1)\n"; return 138; }
             }
             {
                 // read_committed: offsets 0-3 plain; a committed txn (2 records + marker),
                 // an aborted txn (2 records + marker), then one plain record (acks=All).
                 // read_committed must see exactly 4 + 2 + 1 = 7 records and reach its end.
-                if (!transientTxn(c, tt.topicId, "e2-presence-commit", 10, 2, /*commit=*/true, timeoutMs))  return 85;
-                if (!transientTxn(c, tt.topicId, "e2-presence-abort", 20, 2, /*commit=*/false, timeoutMs))  return 85;
+                if (!transientTxn(c, tt.topicId, "e2-presence-commit", 10, 2, /*commit=*/true, timeoutMs))  return 139;
+                if (!transientTxn(c, tt.topicId, "e2-presence-abort", 20, 2, /*commit=*/false, timeoutMs))  return 140;
                 int64_t off = -1;
-                if (!produceOne(c, tt.topicId, 30, Acks::All, timeoutMs, off)) { std::cerr << "PROBE: FAIL produce(presence_t) after txns\n"; return 85; }
+                if (!produceOne(c, tt.topicId, 30, Acks::All, timeoutMs, off)) { std::cerr << "PROBE: FAIL produce(presence_t) after txns\n"; return 141; }
                 int64_t seen = 0;
                 const int64_t pos = subscribeUntil(c, tt.topicId, From::earliest(), Isolation::ReadCommitted, off + 1, boundMs, &seen);
                 if (pos != off + 1 || seen != 7) {
                     std::cerr << "PROBE: FAIL read_committed(presence_t) position=" << pos << " seen=" << seen
                               << " (want " << off + 1 << ", 7: an aborted or open record leaked, or a committed one was lost)\n";
-                    return 86;
+                    return 142;
                 }
             }
             std::cerr << "PROBE: transient topic presence_t topicId=" << tt.topicId
