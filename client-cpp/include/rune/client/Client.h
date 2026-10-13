@@ -1129,6 +1129,14 @@ private:
     /// Group fetch routing (GroupConsumerHub::FetchRouter, ctx = this): a
     /// member's per-partition Subscribe goes to the partition leader's session.
     static uint32_t fetchLeaderTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept;
+    /// E2 final fix wave (I2): a fresh correlationId for the subscriber hub
+    /// (a moved subscription re-armed after its node session was lost).
+    static int64_t nextCorrTrampoline_(void* ctx) noexcept;
+    /// E2 final fix wave (I2): a moved plain subscription answered Redirect
+    /// follows it PER PARTITION — the partition's route moves to `endpoint` and
+    /// the re-armed Subscribe goes to that node's own session; the seed is
+    /// never retargeted.  False when `corrId` is not a pending moved one.
+    bool followMovedSubscriptionRedirect_(int64_t corrId, std::string_view endpoint) noexcept;
     static int64_t fetchSessionIdTrampoline_(void* ctx, uint32_t session) noexcept;
     static uint64_t fetchEpochTrampoline_(void* ctx, uint32_t session) noexcept;
     static void fetchReviveTrampoline_(void* ctx, uint32_t session) noexcept;

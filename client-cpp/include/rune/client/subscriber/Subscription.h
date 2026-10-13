@@ -192,6 +192,18 @@ struct SubscriptionImpl {
     // client version 6): its cursor.  A subscription that delivered nothing
     // resumes there (never re-resolves Latest).  -1 = none.
     int64_t resumeHint     = -1;
+    // E2 final fix wave (I2): WHERE the subscription lives.  0 = the SEED
+    // session (every new subscription).  A MOVED subscription (rearmMovedAway)
+    // answered Redirect follows its partition's leader on that node's OWN
+    // session (homeSession = the agent's session index), as produce and group
+    // fetch do — the seed is never retargeted by it, so the other subscriptions
+    // bound on the seed stay alive.  homeSid / homeEpoch: that session's broker
+    // id and connect epoch when its Subscribe went out (homeSid 0 = held, not
+    // sent yet).  moved: re-armed by a leadership move at least once.
+    uint32_t homeSession   = 0;
+    int64_t  homeSid       = 0;
+    uint64_t homeEpoch     = 0;
+    bool     moved         = false;
     bool    active         = true;  // false once unsubscribed / timed out / closed
     bool    statusDirty    = false; // a snapshot newer than the last published one exists
     // F8a fix2: an Unsubscribe the transport refused, retried by the duty cycle.

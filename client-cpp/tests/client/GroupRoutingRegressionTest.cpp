@@ -2186,3 +2186,192 @@ TEST(GroupRoutingRegression, GroupFetchInstanceNeverActsOnAPositionNoteRegressio
     EXPECT_EQ(callbacks, 3);
     for (const auto& [off, n] : consumed) EXPECT_EQ(n, 1) << "offset " << off << " handed over " << n << " times";
 }
+
+// ===========================================================================
+// E2 final fix wave (I2): a MOVED plain subscription answered Redirect follows
+// it PER PARTITION, on the new leader node's own session — the seed is never
+// retargeted, so the other subscriptions bound on it stay alive.
+// ===========================================================================
+namespace {
+struct PlainLedger {
+    std::map<int32_t, std::map<int64_t, int>> seen;   // partition -> offset -> times delivered
+    rc::RecordHandler handler(int32_t p) {
+        return [this, p](const rc::Record& rec) { ++seen[p][rec.offset]; };
+    }
+    [[nodiscard]] int count(int32_t p) const {
+        const auto it = seen.find(p);
+        return it == seen.end() ? 0 : static_cast<int>(it->second.size());
+    }
+    [[nodiscard]] int dupes() const {
+        int d = 0;
+        for (const auto& [p, m] : seen)
+            for (const auto& [o, n] : m) d += n > 1 ? n - 1 : 0;
+        return d;
+    }
+};
+int subscribesFor(const test_support::InvokerGateway& gw, int32_t p) {
+    int n = 0;
+    for (const auto& s : gw.subscribed) n += (s.topicId == 1 && s.partition == p) ? 1 : 0;
+    return n;
+}
+}  // namespace
+
+// Two subscriptions bound on the seed (node 0 leads partitions 0 and 1); only
+// partition 0's leadership moves to node 1, whose Redirect answers its bound
+// Subscribe.  Expected: partition 0 re-subscribes on node 1's own session from
+// its position; partition 1's subscription is untouched (no re-subscribe, the
+// seed stays on node 0) and keeps delivering; every record exactly once.
+// RED (Task 14 behaviour): the client retargeted the SEED to node 1 — the
+// seed channel changed, and partition 1's subscription was left on the
+// abandoned session (a real broker drops it when that session expires: a
+// silent stall).
+TEST(GroupRoutingRegression, TwoBoundSubscriptionsOnOneSeedOnlyOneMovesRegression) {
+    GroupRig r(4231, 4232);
+    const auto [n1, p1port] = r.addNode(4231);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4231, ""}, {1, 1, 0, 1, 4231, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, 0}};
+    r.gw.groupProtocol   = false;
+    r.connect();
+    const std::string seedBefore = r.client.testTransport().ingressChannel();
+
+    PlainLedger led;
+    auto s0 = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()}, led.handler(0));
+    auto s1 = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()}, led.handler(1));
+    ASSERT_TRUE(r.drive([&] { return s0.subscriptionId() != 0 && s1.subscriptionId() != 0; }));
+    const auto a0 = *r.subAt(0, 0);
+    const auto a1 = *r.subAt(1, 0);
+    r.gw.pushRecords(a0, 0, 3);   // p0: 0..2
+    r.gw.pushRecords(a1, 0, 2);   // p1: 0..1
+    ASSERT_TRUE(r.drive([&] { return led.count(0) == 3 && led.count(1) == 2; }));
+
+    // Partition 0 alone moves to node 1; node 0 answers its bound Subscribe Redirect.
+    r.gw.subscribeLeader[0] = n1;
+    r.gw.partitions         = {{1, 0, 1, 2, 4231, ""}, {1, 1, 0, 1, 4231, ""}};
+    r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::Redirect),
+                   "127.0.0.1:" + std::to_string(p1port), a0.sessionId, a0.corrId);
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, n1) != nullptr && s0.subscriptionId() == r.subAt(0, n1)->subscriptionId; }))
+        << "SILENT STALL: the moved subscription never re-subscribed on its new leader";
+    const auto b0 = *r.subAt(0, n1);
+    EXPECT_EQ(b0.fromOffset, 3) << "not resumed at the moved subscription's position";
+    EXPECT_NE(b0.sessionId, a0.sessionId) << "re-subscribed on the seed session instead of node 1's own";
+    EXPECT_EQ(r.client.testTransport().ingressChannel(), seedBefore) << "the moved subscription retargeted the SEED";
+    EXPECT_EQ(subscribesFor(r.gw, 1), 1) << "the untouched subscription was re-subscribed";
+
+    // Both keep delivering: p1 on the seed (node 0), p0 on node 1.
+    r.gw.pushRecords(a1, 2, 2);   // p1: 2..3
+    r.gw.pushRecords(b0, 3, 2);   // p0: 3..4
+    ASSERT_TRUE(r.drive([&] { return led.count(0) == 5 && led.count(1) == 4; }))
+        << "p0 " << led.count(0) << "/5, p1 " << led.count(1) << "/4";
+    EXPECT_EQ(led.dupes(), 0);
+    EXPECT_TRUE(s1.active());
+    EXPECT_EQ(s1.subscriptionId(), a1.subscriptionId) << "the untouched subscription was re-bound";
+    // The old instance was released on node 0 (its own home session).
+    bool released = false;
+    for (std::size_t i = 0; i < r.gw.unsubscribed.size(); ++i)
+        released = released || (r.gw.unsubscribed[i] == a0.subscriptionId && r.gw.unsubscribedAt[i] == 0);
+    EXPECT_TRUE(released) << "the moved subscription's old instance was not unsubscribed on its node";
+    s0.unsubscribe();
+    s1.unsubscribe();
+}
+
+// I2: a subscription already homed on node 1 moves AGAIN — back to the seed's
+// node.  The answer arrives on node 1's session (its home), is accepted there,
+// and the subscription follows it back to the seed (the seed's node leads):
+// no retarget, no stall, exactly once; its Unsubscribe on leaving goes to
+// node 1.  RED: an answer on a non-seed session was ignored (the subscription
+// stayed bound to a node that no longer serves it).
+TEST(GroupRoutingRegression, HomedMovedSubscriptionMovesAgainFromItsNodeSessionRegression) {
+    GroupRig r(4233, 4234);
+    const auto [n1, p1port] = r.addNode(4233);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4233, ""}};
+    r.gw.subscribeLeader = {{0, 0}};
+    r.gw.groupProtocol   = false;
+    r.connect();
+    const std::string seedBefore = r.client.testTransport().ingressChannel();
+    PlainLedger led;
+    auto s0 = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()}, led.handler(0));
+    ASSERT_TRUE(r.drive([&] { return s0.subscriptionId() != 0; }));
+    const auto a0 = *r.subAt(0, 0);
+    r.gw.pushRecords(a0, 0, 2);
+    ASSERT_TRUE(r.drive([&] { return led.count(0) == 2; }));
+
+    r.gw.subscribeLeader[0] = n1;   // to node 1
+    r.gw.partitions         = {{1, 0, 1, 2, 4233, ""}};
+    r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::Redirect),
+                   "127.0.0.1:" + std::to_string(p1port), a0.sessionId, a0.corrId);
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, n1) != nullptr && s0.subscriptionId() == r.subAt(0, n1)->subscriptionId; }));
+    const auto b0 = *r.subAt(0, n1);
+    r.gw.pushRecords(b0, 2, 2);   // 2..3 from node 1
+    ASSERT_TRUE(r.drive([&] { return led.count(0) == 4; }));
+
+    // ... and back to node 0: node 1 answers on ITS session.
+    r.gw.subscribeLeader[0] = 0;
+    r.gw.partitions         = {{1, 0, 0, 3, 4233, ""}};
+    r.gw.sendError(n1, static_cast<int16_t>(rune::protocol::client::ErrorCode::Redirect),
+                   r.gw.brokerHost + ":" + std::to_string(r.gw.brokerPort), b0.sessionId, b0.corrId);
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, 0) != nullptr && r.subAt(0, 0)->corrId != a0.corrId &&
+                                     s0.subscriptionId() == r.subAt(0, 0)->subscriptionId; }))
+        << "SILENT STALL: an answer on the subscription's node session did not move it";
+    const auto c0 = *r.subAt(0, 0);
+    EXPECT_EQ(c0.fromOffset, 4);
+    EXPECT_EQ(c0.sessionId, a0.sessionId) << "not back on the seed session";
+    EXPECT_EQ(r.client.testTransport().ingressChannel(), seedBefore);
+    r.gw.pushRecords(c0, 4, 1);
+    ASSERT_TRUE(r.drive([&] { return led.count(0) == 5; }));
+    EXPECT_EQ(led.dupes(), 0);
+    bool releasedOnN1 = false;
+    for (std::size_t i = 0; i < r.gw.unsubscribed.size(); ++i)
+        releasedOnN1 = releasedOnN1 || (r.gw.unsubscribed[i] == b0.subscriptionId && r.gw.unsubscribedAt[i] == n1);
+    EXPECT_TRUE(releasedOnN1) << "the node-1 instance was not unsubscribed on node 1";
+    s0.unsubscribe();
+}
+
+// I2: the node session a moved subscription lives on is LOST (node 1 dies; the
+// cluster elects node 2, as metadata now says).  The broker ended the
+// subscription with that session: the client re-arms it from its position and
+// routes it to the new leader — never a silent stall.  RED (mutation: the
+// lost-session re-arm in SubscriberHub::driveHomed disabled): never
+// re-subscribed on node 2.
+TEST(GroupRoutingRegression, MovedSubscriptionWhoseNodeSessionIsLostIsReArmedRegression) {
+    RigOptions o;
+    o.keepaliveNs       = 50'000'000;   // 50 ms
+    o.responseTimeoutNs = 400'000'000;  // the session machine's own staleness rule
+    GroupRig r(4235, 4236, o);
+    const auto [n1, p1port] = r.addNode(4235);
+    const auto [n2, p2port] = r.addNode(4235);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4235, ""}};
+    r.gw.subscribeLeader = {{0, 0}};
+    r.gw.groupProtocol   = false;
+    r.connect();
+    PlainLedger led;
+    auto s0 = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()}, led.handler(0));
+    ASSERT_TRUE(r.drive([&] { return s0.subscriptionId() != 0; }));
+    const auto a0 = *r.subAt(0, 0);
+    r.gw.pushRecords(a0, 0, 2);
+    ASSERT_TRUE(r.drive([&] { return led.count(0) == 2; }));
+
+    r.gw.subscribeLeader[0] = n1;   // moves to node 1 (its own session)
+    r.gw.partitions         = {{1, 0, 1, 2, 4235, ""}};
+    r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::Redirect),
+                   "127.0.0.1:" + std::to_string(p1port), a0.sessionId, a0.corrId);
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, n1) != nullptr && s0.subscriptionId() == r.subAt(0, n1)->subscriptionId; }));
+    r.gw.pushRecords(*r.subAt(0, n1), 2, 2);   // 2..3
+    ASSERT_TRUE(r.drive([&] { return led.count(0) == 4; }));
+
+    // Node 1 dies; the cluster elects node 2.
+    r.gw.deadEndpoints.insert(n1);
+    r.gw.partitions      = {{1, 0, 2, 3, 4235, ""}};
+    r.gw.subscribeLeader = {{0, n2}};
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, n2) != nullptr && s0.subscriptionId() == r.subAt(0, n2)->subscriptionId; },
+                        20'000'000))
+        << "SILENT STALL: the moved subscription never left the lost node session";
+    EXPECT_EQ(r.subAt(0, n2)->fromOffset, 4) << "not resumed at its position";
+    r.gw.pushRecords(*r.subAt(0, n2), 4, 2);
+    ASSERT_TRUE(r.drive([&] { return led.count(0) == 6; }));
+    EXPECT_EQ(led.dupes(), 0);
+    EXPECT_TRUE(s0.active());
+    s0.unsubscribe();
+}

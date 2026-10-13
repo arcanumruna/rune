@@ -185,8 +185,60 @@ public:
     /// instance gets a best-effort Unsubscribe (`unsubCorrId`) on `sessionId`;
     /// its Records (old id / correlationId) are dropped from now on.  False (no
     /// change) when `correlationId` names no active bound subscription.  Cold.
-    bool rearmMovedAway(int64_t correlationId, int64_t newCorrId, int64_t unsubCorrId, int64_t sessionId,
-                        std::chrono::steady_clock::time_point deadline);
+    ///
+    /// E2 final fix wave (I2): `answerSid` is the session the answer came on —
+    /// it must be the subscription's own home session (`seedSid` for one on the
+    /// seed, its node session's id for a moved one homed on a leader node);
+    /// the old instance's Unsubscribe goes to that home.  The re-armed request
+    /// is stamped `seedSid` and homed on the seed until routed (homeMoved).
+    bool rearmMovedAway(int64_t correlationId, int64_t newCorrId, int64_t unsubCorrId, int64_t answerSid,
+                        int64_t seedSid, std::chrono::steady_clock::time_point deadline);
+
+    // ---- E2 final fix wave (I2): moved subscriptions live on their leader's
+    // own node session (never by retargeting the seed) -------------------------
+
+    /// How a moved subscription reaches its partition leader's node session
+    /// (plain function pointers + context, wired once before start by the
+    /// Client to its ClientAgent — the group fetch router's trampolines).
+    struct NodeRouter {
+        void* ctx = nullptr;
+        /// Session index leading (topicId, partition) now (0 = the seed); may
+        /// lazily open that node's session.
+        uint32_t (*leaderSession)(void* ctx, int32_t topicId, int32_t partition) = nullptr;
+        /// That session's broker session id while Connected, else 0.
+        int64_t (*sessionId)(void* ctx, uint32_t session) = nullptr;
+        /// That session's connect epoch while Connected, else 0 (a reconnect
+        /// that got the same broker id is a new epoch).
+        uint64_t (*epoch)(void* ctx, uint32_t session) = nullptr;
+        /// Offer a frame (already stamped with that session's id) on its node.
+        detail::SendResult (*offer)(void* ctx, uint32_t session, const uint8_t* buf, std::size_t len) = nullptr;
+        /// A fresh correlationId from the Client's duty-owned counter.
+        int64_t (*nextCorrId)(void* ctx) = nullptr;
+    };
+    void setNodeRouter(const NodeRouter& r) noexcept { router_ = r; }
+
+    /// The PENDING Subscribe `correlationId` belongs to a moved subscription:
+    /// its (topicId, bound partition).  False otherwise.
+    bool movedPendingPartition(int64_t correlationId, int32_t& topicId, int32_t& partition) const;
+    /// Route the pending moved Subscribe `correlationId` to its partition's
+    /// leader as the agent now routes it (the caller installed the route the
+    /// Redirect named): that node's own session — sent now when Connected,
+    /// else held and flushed by driveHomed() — or the seed (stamped `seedSid`)
+    /// when the seed's node leads it.  False when not a pending moved one.
+    bool homeMoved(int64_t correlationId, int64_t seedSid);
+    /// Subscriptions living on a leader node's session (an upper bound,
+    /// recounted by every driveHomed pass; the duty cycle calls driveHomed
+    /// only while non-zero — one branch otherwise).
+    [[nodiscard]] std::size_t homedCount() const noexcept { return homedCount_; }
+    /// Duty cycle (while homedCount() != 0): flush held moved Subscribes whose
+    /// node session is Connected (re-resolving the leader each attempt); a
+    /// moved subscription whose node session was LOST (dropped / reconnected:
+    /// the broker ended the subscription with it) is re-armed from its
+    /// position under a fresh correlationId (`deadline` = its subscribe
+    /// timeout) and routed again — never a silent stall.  Returns work done.
+    int driveHomed(int64_t seedSid, std::chrono::steady_clock::time_point deadline);
+    /// Moved subscriptions re-armed because their node session was lost.
+    [[nodiscard]] uint64_t homedSessionsLost() const noexcept { return homedSessionsLost_; }
     /// Bound subscriptions moved by rearmMovedAway.
     [[nodiscard]] uint64_t subscriptionsMoved() const noexcept { return subscriptionsMoved_; }
     /// E2 final fix wave (I1): batches wholly below a moved subscription's
@@ -370,6 +422,21 @@ private:
     uint64_t    subscribesFailed_      = 0;  // fix4 M1: Fatal Subscribe offers
     uint64_t    subscriptionsMoved_    = 0;  // E2 Task 13: rearmMovedAway
     uint64_t    movedDuplicateBatchesDropped_ = 0;  // E2 final fix wave (I1)
+    // E2 final fix wave (I2): moved subscriptions homed on leader node sessions.
+    NodeRouter  router_{};
+    std::size_t homedCount_        = 0;
+    uint64_t    homedSessionsLost_ = 0;
+    std::vector<int64_t> homedScratch_;   // driveHomed: lost bound ones (cold; capacity reused)
+    [[nodiscard]] bool routed_() const noexcept { return router_.offer != nullptr; }
+    /// The broker session id `impl` lives on: its node session's (homed) or `seedSid`.
+    [[nodiscard]] static int64_t homeSidOf_(const SubscriptionImpl& impl, int64_t seedSid) noexcept {
+        return impl.homeSession != 0 ? impl.homeSid : seedSid;
+    }
+    /// Route the pending request at `it` to its partition leader now (see homeMoved).
+    void routeMovedPending_(PendingMap::iterator it, int64_t seedSid);
+    /// Send a homed pending request on its node session when Connected (held otherwise).
+    void sendHomed_(PendingMap::iterator it);
+    static void stampSession_(std::vector<uint8_t>& frame, int64_t sid) noexcept;
     detail::SendResult sendSubscribeFrame_(const SubscribeRequest& req);
     /// F8c C3: the Subscribe correlationId of the subscription whose impl is
     /// `key`, found by address in this hub's own tables (0 = not held).

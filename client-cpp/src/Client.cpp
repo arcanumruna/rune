@@ -249,6 +249,16 @@ Client::Client(ClientConfig cfg)
         fr.brokerVersion = &Client::fetchBrokerVersionTrampoline_;
         fr.offer         = &Client::fetchOfferTrampoline_;
         groupConsumerHub_.setFetchRouter(fr);
+        // E2 final fix wave (I2): a moved plain subscription lives on its
+        // partition leader's own node session, reached the same way.
+        subscriber::SubscriberHub::NodeRouter nr;
+        nr.ctx           = this;
+        nr.leaderSession = &Client::fetchLeaderTrampoline_;
+        nr.sessionId     = &Client::fetchSessionIdTrampoline_;
+        nr.epoch         = &Client::fetchEpochTrampoline_;
+        nr.offer         = &Client::fetchOfferTrampoline_;
+        nr.nextCorrId    = &Client::nextCorrTrampoline_;
+        subscriberHub_.setNodeRouter(nr);
     }
 
     // MD1 Task 10: Wire the MetadataResponse hook so the cache is populated
@@ -1700,6 +1710,13 @@ int Client::dutyCycle(int64_t nowNs) {
     work += watchProduceRoutes_(nowNs);
     // DR-15: Subscribes redirected to an unreachable node, after fresh metadata.
     if (!redirectedSubscribes_.empty()) [[unlikely]] work += retryRedirectedSubscribes_(nowNs);
+    // E2 final fix wave (I2): moved subscriptions on their leader node's own
+    // session — held Subscribes flushed, a lost session's ones re-armed.
+    if (subscriberHub_.homedCount() != 0) [[unlikely]] {
+        work += subscriberHub_.driveHomed(
+            agent_.seedSession().machine.sessionId(),
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg_.subscribeTimeoutMs));
+    }
 
     // 3b'. F8c C3: control frames the transport refused (Retry), in order.
     if (unsentCtl_ != 0) [[unlikely]] work += retryUnsentControl_();
@@ -2189,15 +2206,25 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // on it names the re-armed Subscribe.  Cold (a leadership move).
         // Only an answer of the CURRENT session moves anything (a stale one of
         // an earlier session concerns a subscription that died with it).
+        // E2 final fix wave (I2): the answer may come on the seed or — for a
+        // subscription that moved before — on its leader node's own session;
+        // the hub checks it is the subscription's own home session.
         if ((ec == rpc::ErrorCode::NotLeader || ec == rpc::ErrorCode::Redirect) && opt->correlationId != 0)
             [[unlikely]] {
             const auto snap = agent_.stateAndSessionId();
-            if (snap.sessionId != 0 && opt->sessionId == snap.sessionId &&
-                subscriberHub_.rearmMovedAway(
-                    opt->correlationId, nextCorrId_, nextCorrId_ + 1, snap.sessionId,
+            if (subscriberHub_.rearmMovedAway(
+                    opt->correlationId, nextCorrId_, nextCorrId_ + 1, opt->sessionId, snap.sessionId,
                     std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg_.subscribeTimeoutMs))) {
                 opt->correlationId = nextCorrId_;
                 nextCorrId_ += 2;
+            }
+            // A moved subscription (re-armed now, or pending again and answered
+            // Redirect by the node it was re-sent to) follows the Redirect PER
+            // PARTITION: never a seed retarget, which would strand every other
+            // subscription bound on the seed (final review I2).
+            if (ec == rpc::ErrorCode::Redirect && !opt->message.empty() &&
+                followMovedSubscriptionRedirect_(opt->correlationId, opt->message)) {
+                break;
             }
         }
 
@@ -3750,6 +3777,37 @@ int Client::watchGroupSessions_(int64_t nowNs) {
     requestMetadataNow_();
     (void)groupConsumerHub_.reconcileFetch();
     return 1;
+}
+
+int64_t Client::nextCorrTrampoline_(void* ctx) noexcept {
+    return static_cast<Client*>(ctx)->nextCorrId_++;
+}
+
+bool Client::followMovedSubscriptionRedirect_(int64_t corrId, std::string_view endpoint) noexcept {
+    int32_t topicId = -1, partition = -1;
+    if (!subscriberHub_.movedPendingPartition(corrId, topicId, partition)) return false;
+    try {
+        const std::string newEndpoint(endpoint);
+        // As a produce / group fetch Redirect: the cache learns the leader
+        // provisionally (a lagging answer cannot undo it) and the partition's
+        // route follows it — only this partition, never the seed session.
+        std::string cacheEp = newEndpoint;
+        if (const auto at = cacheEp.find("endpoint="); at != std::string::npos) cacheEp = cacheEp.substr(at + 9u);
+        const int32_t node = metadataCache_.nodeIdForEndpoint(cacheEp);
+        if (node != metadata::MetadataCache::kNoLeader) {
+            const int32_t cur = metadataCache_.epochFor(topicId, partition);
+            metadataCache_.updatePartitionLeaderProvisional(topicId, partition, node, cur >= 0 ? cur + 1 : 0,
+                                                            nextCorrId_);
+        }
+        const std::string ch = toChannel(newEndpoint);
+        if (agent_.setRoute(topicId, partition, ch, ch)) producerHub_.noteRouteChanged(topicId, partition);
+    } catch (...) {
+        // Allocation failure on this cold path: routed by the current route;
+        // the metadata answer below re-routes.
+    }
+    (void)subscriberHub_.homeMoved(corrId, agent_.stateAndSessionId().sessionId);
+    requestMetadataNow_();
+    return true;
 }
 
 void Client::onGroupFetchRefused_(int64_t corrId, bool redirect, std::string_view endpoint) noexcept {

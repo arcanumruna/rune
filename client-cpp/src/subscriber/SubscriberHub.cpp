@@ -289,7 +289,7 @@ bool SubscriberHub::unsubscribe(int64_t       subscribeCorrId,
         // (duty) thread; if refused, the entry stays (active=false,
         // unsubPending) and the duty cycle retries it — never dropped.
         impl.unsubCorrId    = unsubCorrId;
-        impl.unsubSessionId = sessionId;
+        impl.unsubSessionId = homeSidOf_(impl, sessionId);   // I2: a moved one's own node session
         // fix4 M1: Fatal = never deliverable: finished locally, not retried.
         const bool sent = trySendUnsubscribe_(impl, submitFn) != detail::SendResult::Retry;
         if (!sent) markUnsubPending_(impl);
@@ -320,6 +320,8 @@ detail::SendResult SubscriberHub::trySendUnsubscribe_(const SubscriptionImpl& im
     const std::size_t frameLen = codec::encodeUnsubscribe(
         frameBuf, sizeof(frameBuf), impl.subscriptionId, impl.unsubSessionId, impl.unsubCorrId);
     if (frameLen == 0) return detail::SendResult::Accepted;  // cannot encode: nothing to retry
+    if (impl.homeSession != 0 && routed_())   // I2: on its own node session
+        return router_.offer(router_.ctx, impl.homeSession, frameBuf, frameLen);
     if (directSend_ != nullptr) return directSend_(directSendCtx_, frameBuf, frameLen);
     return (!submitFn || submitFn(0, frameBuf, frameLen)) ? detail::SendResult::Accepted
                                                           : detail::SendResult::Retry;
@@ -333,6 +335,8 @@ detail::SendResult SubscriberHub::retrySendUnsubscribe_(const SubscriptionImpl& 
     const std::size_t frameLen = codec::encodeUnsubscribe(
         frameBuf, sizeof(frameBuf), impl.subscriptionId, impl.unsubSessionId, impl.unsubCorrId);
     if (frameLen == 0) return detail::SendResult::Accepted;
+    if (impl.homeSession != 0 && routed_())   // I2: on its own node session
+        return router_.offer(router_.ctx, impl.homeSession, frameBuf, frameLen);
     return directSend_(directSendCtx_, frameBuf, frameLen);
 }
 
@@ -349,7 +353,10 @@ int SubscriberHub::retryPendingUnsubscribes(int64_t currentSessionId)
     for (auto it = activeById_.begin(); it != activeById_.end() && pendingUnsubCount_ != 0; ) {
         SubscriptionImpl& impl = *it->second;
         if (!impl.unsubPending || &impl == dispatching_) { ++it; continue; }
-        if (impl.unsubSessionId != currentSessionId) {
+        const int64_t homeNow = (impl.homeSession != 0 && routed_())
+                                    ? router_.sessionId(router_.ctx, impl.homeSession)
+                                    : currentSessionId;
+        if (impl.unsubSessionId != homeNow) {
             // Its session is gone: the broker dropped the subscription with it.
             ++unsubscribesDropped_;
             std::fprintf(stderr,
@@ -383,13 +390,16 @@ void SubscriberHub::onSubscribeResponse(
     // fix3: a response of a session that is no longer current must not bind
     // (its subscription died with that session; binding would leak it).  The
     // pending entry stays and is re-sent on the current session.
-    if (rsp.sessionId != sessionId) {
-        ++staleResponsesIgnored_;
-        return;
-    }
     auto it = pendingByCorrelation_.find(rsp.correlationId);
     if (it == pendingByCorrelation_.end()) {
+        if (rsp.sessionId != sessionId) ++staleResponsesIgnored_;
         return; // unknown correlationId — race with close/timeout; safe
+    }
+    // I2: a moved subscription's Subscribe went out on its own node session.
+    const int64_t expectSid = it->second->impl ? homeSidOf_(*it->second->impl, sessionId) : sessionId;
+    if (rsp.sessionId != expectSid || expectSid == 0) {
+        ++staleResponsesIgnored_;
+        return;
     }
     clearUnsent_(*it->second);
     SubscriptionImpl* impl = it->second->impl;
@@ -415,7 +425,7 @@ void SubscriberHub::onSubscribeResponse(
         // that we know the real id, send a proper Unsubscribe (direct, with
         // duty-cycle retry: an inactive entry is kept only while it is pending).
         if (impl->unsubCorrId == 0) impl->unsubCorrId = unsubCorrId;
-        impl->unsubSessionId = sessionId;
+        impl->unsubSessionId = expectSid;
         if (trySendUnsubscribe_(*impl, submitFn) == detail::SendResult::Retry) {  // Fatal: dropped
             markUnsubPending_(*impl);
             activeById_.emplace(rsp.subscriptionId, impl);  // cold path
@@ -446,10 +456,11 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
         // A-MEDIUM-1 (round 4): no session yet (a fresh connect) = no binding by
         // push: another client's push on a shared publication could carry the
         // same small correlationId.  The SubscribeResponse still binds.
-        if (currentSessionId == 0 || rv.sessionId != currentSessionId) return;
         const auto p = pendingByCorrelation_.find(rv.correlationId);
         if (p == pendingByCorrelation_.end() || p->second->impl == nullptr) return;
         SubscriptionImpl* pi = p->second->impl;
+        const int64_t expectSid = homeSidOf_(*pi, currentSessionId);   // I2: a moved one's node session
+        if (expectSid == 0 || rv.sessionId != expectSid) return;
         if (!pi->active || rv.topicId != pi->topicId) return;
         clearUnsent_(*p->second);
         pendingByCorrelation_.erase(p);
@@ -593,6 +604,7 @@ int SubscriberHub::resendPending(
     for (auto it = pendingByCorrelation_.begin(); it != pendingByCorrelation_.end(); ) {
         auto& req = it->second;
         if (!req || !req->impl || !req->impl->active) { ++it; continue; }  // unsubscribed
+        if (req->impl->homeSession != 0) { ++it; continue; }  // I2: lives on its node session
         auto& frame = req->subscribeFrame;
         if (frame.size() < kHeaderSessionIdOff + 8) { ++it; continue; }
 
@@ -636,9 +648,15 @@ bool SubscriberHub::resendOne(int64_t correlationId, int64_t sessionId, const Se
     if (!req || !req->impl || !req->impl->active) return false;
     auto& frame = req->subscribeFrame;
     if (frame.size() < kHeaderSessionIdOff + 8) return false;
+    req->deadline = newDeadline;
+    if (req->impl->moved && routed_()) {
+        // I2: a moved subscription goes wherever its partition leader is now
+        // (its node's own session, or the seed) — never by moving the seed.
+        routeMovedPending_(it, sessionId);
+        return true;
+    }
     const uint64_t u = static_cast<uint64_t>(sessionId);
     for (int i = 0; i < 8; ++i) frame[kHeaderSessionIdOff + i] = static_cast<uint8_t>(u >> (i * 8));
-    req->deadline = newDeadline;
     if (directSend_ != nullptr) {
         switch (sendSubscribeFrame_(*req)) {
         case detail::SendResult::Accepted: clearUnsent_(*req); return true;
@@ -654,7 +672,8 @@ bool SubscriberHub::resendOne(int64_t correlationId, int64_t sessionId, const Se
 // ---------------------------------------------------------------------------
 
 bool SubscriberHub::rearmMovedAway(int64_t correlationId, int64_t newCorrId, int64_t unsubCorrId,
-                                   int64_t sessionId, std::chrono::steady_clock::time_point deadline)
+                                   int64_t answerSid, int64_t seedSid,
+                                   std::chrono::steady_clock::time_point deadline)
 {
     if (correlationId == 0 || newCorrId == 0) return false;
     for (auto it = activeById_.begin(); it != activeById_.end(); ++it) {
@@ -663,6 +682,11 @@ bool SubscriberHub::rearmMovedAway(int64_t correlationId, int64_t newCorrId, int
         // Unsubscribed (erase deferred / Unsubscribe pending) or its handler is
         // running: nothing to move.
         if (!impl.active || impl.unsubPending || &impl == dispatching_) return false;
+        // Only an answer on the subscription's OWN session moves it (a stale
+        // one of an earlier session concerns an instance that died with it).
+        const int64_t homeSid = homeSidOf_(impl, seedSid);
+        if (homeSid == 0 || answerSid != homeSid) return false;
+        const int64_t sessionId = seedSid;   // the re-armed request starts on the seed (see homeMoved)
         const int32_t part = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
         // Nothing delivered (nextOffset 0): the broker's position note (its
         // bind-time resolved start / cursor), else the requested From.
@@ -683,15 +707,24 @@ bool SubscriberHub::rearmMovedAway(int64_t correlationId, int64_t newCorrId, int
         // unknown id is ignored); should the answer have been a stray one, this
         // keeps a second broker-side stream from leaking until the session
         // ends.  Best-effort by design: a refused offer is moot either way.
-        if (directSend_ != nullptr) {
+        {
             uint8_t unsubBuf[64]{};
             const std::size_t unsubLen =
-                codec::encodeUnsubscribe(unsubBuf, sizeof(unsubBuf), impl.subscriptionId, sessionId, unsubCorrId);
-            if (unsubLen > 0) (void)directSend_(directSendCtx_, unsubBuf, unsubLen);
+                codec::encodeUnsubscribe(unsubBuf, sizeof(unsubBuf), impl.subscriptionId, homeSid, unsubCorrId);
+            if (unsubLen > 0) {
+                if (impl.homeSession != 0 && routed_())   // I2: its old node session
+                    (void)router_.offer(router_.ctx, impl.homeSession, unsubBuf, unsubLen);
+                else if (directSend_ != nullptr)
+                    (void)directSend_(directSendCtx_, unsubBuf, unsubLen);
+            }
         }
         activeById_.erase(it);
         impl.correlationId  = newCorrId;
         impl.subscriptionId = 0;   // pending again until the leader binds it
+        impl.moved          = true;
+        impl.homeSession    = 0;   // routed by the caller (homeMoved / the pending paths)
+        impl.homeSid        = 0;
+        impl.homeEpoch      = 0;
         impl.resumeFloor    = impl.nextOffset > 0 ? impl.nextOffset : -1;
         impl.resumeHint     = -1;
         pendingByCorrelation_.emplace(newCorrId, std::move(req));
@@ -700,6 +733,168 @@ bool SubscriberHub::rearmMovedAway(int64_t correlationId, int64_t newCorrId, int
         return true;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// E2 final fix wave (I2): moved subscriptions on their leader's own session
+// ---------------------------------------------------------------------------
+
+void SubscriberHub::stampSession_(std::vector<uint8_t>& frame, int64_t sid) noexcept
+{
+    constexpr std::size_t kHeaderSessionIdOff = 8;
+    if (frame.size() < kHeaderSessionIdOff + 8) return;
+    const auto u = static_cast<uint64_t>(sid);
+    for (int i = 0; i < 8; ++i) frame[kHeaderSessionIdOff + i] = static_cast<uint8_t>(u >> (i * 8));
+}
+
+bool SubscriberHub::movedPendingPartition(int64_t correlationId, int32_t& topicId, int32_t& partition) const
+{
+    const auto it = pendingByCorrelation_.find(correlationId);
+    if (it == pendingByCorrelation_.end() || !it->second || it->second->impl == nullptr) return false;
+    const SubscriptionImpl& impl = *it->second->impl;
+    if (!impl.moved || !impl.active) return false;
+    topicId   = impl.topicId;
+    partition = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
+    return true;
+}
+
+bool SubscriberHub::homeMoved(int64_t correlationId, int64_t seedSid)
+{
+    if (!routed_()) return false;
+    const auto it = pendingByCorrelation_.find(correlationId);
+    if (it == pendingByCorrelation_.end() || !it->second || it->second->impl == nullptr) return false;
+    if (!it->second->impl->moved || !it->second->impl->active) return false;
+    routeMovedPending_(it, seedSid);
+    return true;
+}
+
+void SubscriberHub::routeMovedPending_(PendingMap::iterator it, int64_t seedSid)
+{
+    SubscribeRequest& req  = *it->second;
+    SubscriptionImpl& impl = *req.impl;
+    const int32_t part     = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
+    const uint32_t session = router_.leaderSession(router_.ctx, impl.topicId, part);
+    impl.homeSid   = 0;
+    impl.homeEpoch = 0;
+    if (session == 0) {
+        // The seed's node leads it: the historical seed path (sent now when
+        // the seed is Connected, else re-sent on its next connect).
+        impl.homeSession = 0;
+        stampSession_(req.subscribeFrame, seedSid);
+        if (!sessionConnected_ || seedSid == 0 || directSend_ == nullptr) { markUnsent_(req); return; }
+        switch (sendSubscribeFrame_(req)) {
+        case detail::SendResult::Accepted: clearUnsent_(req); break;
+        case detail::SendResult::Retry:    markUnsent_(req); break;
+        case detail::SendResult::Fatal:    (void)failRequest_(it); break;
+        }
+        return;
+    }
+    clearUnsent_(req);   // never the seed's retry list: driveHomed owns it now
+    impl.homeSession = session;
+    ++homedCount_;
+    sendHomed_(it);
+}
+
+void SubscriberHub::sendHomed_(PendingMap::iterator it)
+{
+    SubscribeRequest& req  = *it->second;
+    SubscriptionImpl& impl = *req.impl;
+    const int64_t sid = router_.sessionId(router_.ctx, impl.homeSession);
+    if (sid == 0) return;   // that node's session is (re)connecting: held, flushed by driveHomed
+    stampSession_(req.subscribeFrame, sid);
+    switch (router_.offer(router_.ctx, impl.homeSession, req.subscribeFrame.data(), req.subscribeFrame.size())) {
+    case detail::SendResult::Accepted:
+        impl.homeSid   = sid;
+        impl.homeEpoch = router_.epoch(router_.ctx, impl.homeSession);
+        break;
+    case detail::SendResult::Retry:
+        break;   // held: re-offered by driveHomed
+    case detail::SendResult::Fatal:
+        (void)failRequest_(it);
+        break;
+    }
+}
+
+int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_point deadline)
+{
+    if (!routed_()) { homedCount_ = 0; return 0; }
+    int work = 0;
+    std::size_t homed = 0;
+    // Pending ones: held (not sent) -> re-resolve the leader and send; sent but
+    // their session changed under them (reconnect / drop) -> route again.
+    for (auto it = pendingByCorrelation_.begin(); it != pendingByCorrelation_.end();) {
+        auto next = std::next(it);
+        SubscribeRequest* req = it->second.get();
+        if (req != nullptr && req->impl != nullptr && req->impl->active && req->impl->homeSession != 0) {
+            SubscriptionImpl& impl = *req->impl;
+            const bool held = impl.homeSid == 0;
+            const bool lost = !held && router_.epoch(router_.ctx, impl.homeSession) != impl.homeEpoch;
+            if (held || lost) {
+                if (lost) ++homedSessionsLost_;
+                routeMovedPending_(it, seedSid);   // homedCount_ is recounted below
+                ++work;
+            }
+            if (pendingByCorrelation_.find(impl.correlationId) != pendingByCorrelation_.end() &&
+                impl.homeSession != 0)
+                ++homed;
+        }
+        it = next;
+    }
+    // Bound ones whose node session was lost: the broker ended the
+    // subscription with that session — re-arm from the position.
+    homedScratch_.clear();
+    for (const auto& [id, impl] : activeById_) {
+        if (impl->homeSession == 0 || !impl->active || impl->unsubPending || impl == dispatching_) continue;
+        if (router_.epoch(router_.ctx, impl->homeSession) == impl->homeEpoch) { ++homed; continue; }
+        try {
+            homedScratch_.push_back(id);
+        } catch (...) {
+            ++homed;   // allocation failure (cold): the next pass retries
+        }
+    }
+    for (const int64_t id : homedScratch_) {
+        const auto ait = activeById_.find(id);
+        if (ait == activeById_.end()) continue;
+        SubscriptionImpl& impl = *ait->second;
+        const int64_t newCorr = router_.nextCorrId(router_.ctx);
+        const int32_t part    = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
+        const int64_t from    = impl.nextOffset > 0  ? impl.nextOffset
+                              : impl.resumeHint >= 0 ? impl.resumeHint
+                                                     : impl.fromWire;
+        uint8_t frameBuf[256]{};
+        const std::size_t frameLen = codec::encodeSubscribe(frameBuf, sizeof(frameBuf), impl.topicId, part,
+                                                            /*partitionKnown=*/1, from, impl.isolation,
+                                                            std::span<const uint8_t>{}, seedSid, newCorr);
+        if (frameLen == 0) { ++homed; continue; }
+        std::unique_ptr<SubscribeRequest> req;
+        try {
+            req = std::make_unique<SubscribeRequest>();   // cold: once per lost node session
+            req->subscribeFrame.assign(frameBuf, frameBuf + frameLen);
+        } catch (...) {
+            ++homed;
+            continue;   // the next pass retries
+        }
+        req->impl     = &impl;
+        req->deadline = deadline;
+        ++homedSessionsLost_;
+        activeById_.erase(ait);
+        impl.correlationId  = newCorr;
+        impl.subscriptionId = 0;
+        impl.resumeFloor    = impl.nextOffset > 0 ? impl.nextOffset : -1;
+        impl.resumeHint     = -1;
+        impl.homeSession    = 0;
+        impl.homeSid        = 0;
+        impl.homeEpoch      = 0;
+        auto [pit, ok] = pendingByCorrelation_.emplace(newCorr, std::move(req));
+        if (!ok) continue;
+        ++subscriptionsMoved_;
+        publishStatus_(impl);
+        routeMovedPending_(pit, seedSid);
+        if (impl.homeSession != 0) ++homed;
+        ++work;
+    }
+    homedCount_ = homed;
+    return work;
 }
 
 bool SubscriberHub::chargeNotLeaderRetry(int64_t correlationId, int maxRetries)
@@ -731,11 +926,16 @@ void SubscriberHub::failPendingSubscribes(const std::string& reason)
     // Finishing the impl (inactive + closed status ring) is the error signal:
     // the app's Subscription::active() turns false.  No unsubscribe frame is
     // needed — the broker never bound the id.
-    for (auto& [corrId, req] : pendingByCorrelation_) {
+    // I2: a moved subscription homed on a leader node's own session does not
+    // depend on the seed's redirect episode — it stays (its own deadline and
+    // driveHomed bound it).  Client close finishes everything (deactivateAll).
+    for (auto it = pendingByCorrelation_.begin(); it != pendingByCorrelation_.end();) {
+        auto& req = it->second;
+        if (req && req->impl && req->impl->homeSession != 0) { ++it; continue; }
+        if (req) clearUnsent_(*req);
         if (req && req->impl) finish_(*req->impl);
+        it = pendingByCorrelation_.erase(it);
     }
-    pendingByCorrelation_.clear();
-    unsentSubscribes_ = 0;
     (void)reason;
 }
 
