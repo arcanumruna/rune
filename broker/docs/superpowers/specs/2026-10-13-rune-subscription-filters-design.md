@@ -1,6 +1,6 @@
-# Rune Phase 2c — Subscription filters (DRAFT, awaiting user review)
+# Rune Phase 2c — Subscription filters
 
-**Status:** draft; the open questions are resolved (§13). It awaits the user's final approval. Scheduled after Phase 2b Part A.
+**Status:** approved by the user on 2026-10-13. The implementation plan is written after all Phase 2b parts (C, E, E2, D, B, F, A) are done.
 **Repos:** rune-codec (generator), rune-protocol (Subscribe filter field), rune-broker (evaluation and push), rune-client-cpp (API and encoder), rune-ql (`WHERE` → filter, later with Part D's console).
 
 ## 1. Goal
@@ -26,6 +26,7 @@ The benchmark gates in §11 prove this.
 - Ranges (`<`, `>`), `OR`, `NOT`.
 - Filtering on variable-length fields (strings, bytes).
 - Floating-point fields.
+- `FixedStr` fields longer than 16 bytes.
 - Expressions over two fields.
 - Changing a live subscription's filter. Instead, unsubscribe and re-subscribe from `position()`; nothing is lost or duplicated.
 - Filters on untyped topics. They are rejected explicitly (§9).
@@ -48,7 +49,7 @@ A subscription is **which partitions** plus an **optional filter**.
 
 ## 4. API: a functional definition, checked at compile time
 
-For each schema, the rune-codec generator also emits a **filter-by-example** struct, `E::Filter`. It has one optional member for every fixed-width, non-float field. A subscriber sets the members it cares about, and every member that is set becomes one term. Set members combine with AND.
+For each schema, the rune-codec generator also emits a **filter-by-example** struct, `E::Filter`. It has one optional member for every filterable field: fixed-width integer, enum and bool fields, plus `FixedStr` fields of at most 16 bytes. A subscriber sets the members it cares about, and every member that is set becomes one term. Set members combine with AND.
 
 ```cpp
 using E = rune::gen::PlayerEvent;
@@ -103,9 +104,10 @@ term   := [tag u16][primType u8][op u8: 1=Eq, 2=In][count u8 (Eq: 1; In: 1..64)]
 ```
 
 - `worldId == x` (u32) takes 2 + 5 + 4 = **11 bytes**.
-- The largest legal filter is bounded: 8 × (5 + 64 × 8) + 2 = 4,138 bytes. That is far below the transport's maximum message length, so a valid filter always fits one Subscribe frame.
+- The largest legal filter is bounded at 2 + 8 × (5 + 64 × 16) = 8,234 bytes, the widest value being a 16-byte `FixedStr`. The encoder checks the whole Subscribe frame against the transport's maximum message length. A filter that cannot fit fails explicitly before anything is sent, which follows the existing `std::length_error` rule for Subscribe.
 - **In the wire message:** `Subscribe` (templateId 18) gains a second variable-length field after `key`, a `u16` length prefix followed by the filter bytes. The field is present only when the session's client version is 7 or higher (`kClientVersionFilter`).
   - A v7 client sends a zero length for "no filter".
+  - `JoinGroup` gains the same trailing filter field for v7, so the coordinator can enforce one filter per group (§13.3).
   - Older clients and brokers never see the field.
   - A v7 client connected to a broker that predates filters is refused at session setup by the existing version negotiation, so a filter is never silently dropped.
 - **Canonical form:** the client sorts `in` values and sorts terms by tag before encoding. Two equal filters therefore encode identically, which the broker's index relies on (§6).
@@ -120,7 +122,7 @@ All filter state is owned by that thread (shared-nothing). Registration and remo
 
 **At Subscribe (cold path):**
 1. Decode and validate the filter against the topic's schema. Every tag must exist in some version; the type must match the field's type; the field must be fixed-width, non-float; the limits must hold. Any failure is answered explicitly (§9).
-2. Pick the **index term**: the first term in canonical order, normally `worldId`.
+2. Pick the **index term**: the first `Eq` term in tag order, or the first `In` term if there is no `Eq` term. An `In` index term registers the subscription once under each of its values, up to 64. A record has exactly one value for the field, so it still matches a subscription at most once.
 3. Build a **per-version accessor table** for each term's tag. For every schema version of the topic, store either (offset, width) or "absent in this version". The table lives in a preallocated slab. When `ALTER` adds a version, it is extended through the existing schema-distribution ring, before any record of the new version can reach this push point.
 
 **Per partition:** an **index** maps each distinct index-field tag to an open-addressing table from value to a list of filtered subscriptions.
@@ -144,6 +146,8 @@ All tables and slabs are sized from the configuration and preallocated. Steady s
 **Batch rebuild:**
 - A filtered subscription whose source batch is entirely matching gets the **original batch**, zero-copy.
 - A partly matching batch is **rebuilt**: the matching records are copied into the subscription's preallocated egress buffer as a new batch. Each record keeps its **original offset**, and the batch header and CRC are recomputed.
+  - If Rune's batch format requires contiguous offsets inside a batch, the rebuild emits one batch per contiguous run of matching records instead.
+  - The plan's first task verifies which rule applies and pins it with a test.
 - A batch with no matches sends nothing.
 - Unfiltered subscribers are unaffected.
 
@@ -164,7 +168,7 @@ All tables and slabs are sized from the configuration and preallocated. Steady s
 ## 8. Schema evolution
 
 - Filters name fields by durable tag, and tags are never reused. A filter compiled against version V keeps its meaning against later versions.
-- **Field dropped in a later version:** records of that version do not match the term. `ALTER` is not blocked. The admin answer lists the live filtered subscriptions that reference the dropped tag, so operators see the effect.
+- **Field dropped in a later version:** records of that version do not match the term. `ALTER` is not blocked. Each push point counts "records excluded because a filtered field is absent in their version", per subscription. It logs the first such exclusion per subscription and schema version, so operators see the effect.
 - **Field retyped (when retype ships):** the per-version accessor table gives the type for each version. A term whose encoded type does not match a version's type treats that version as absent, so nothing matches.
 - **A record whose version is unknown at this push point:** this cannot happen, because versions are distributed before any record of that version is produced. If it ever does, it is counted and treated as no match. It is never a crash and never a silent delivery.
 
