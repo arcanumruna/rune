@@ -1154,6 +1154,17 @@ private:
     // DR-15: Subscribes whose Redirect named an unreachable node — re-sent (only
     // they) after a fresh metadata answer and a doubling backoff.
     int retryRedirectedSubscribes_(int64_t nowNs);
+    // E2 residual round 5 (R3): the follow of a NEW plain Subscribe's Redirect.
+    enum class RedirectFollow : uint8_t { PerPartition, Hold, BySeed };
+    [[nodiscard]] RedirectFollow redirectFollowFor_(const std::string& endpoint) const;
+    void redirectBySeed_(int64_t corrId, const std::string& newEndpoint);
+    int  releaseHeldRedirectFollows_();
+    struct HeldRedirect { int64_t corrId; std::string endpoint; int metaSeen; };
+    std::vector<HeldRedirect> heldRedirectFollows_;   // duty thread; cold
+    uint64_t redirectFollowsHeld_ = 0;
+public:
+    [[nodiscard]] uint64_t testRedirectFollowsHeld() const noexcept { return redirectFollowsHeld_; }
+private:
     std::vector<int64_t>  redirectedSubscribes_;
     int                   redirectMetaSeen_ = 0;
     int64_t               nextRedirectedResendNs_ = 0;

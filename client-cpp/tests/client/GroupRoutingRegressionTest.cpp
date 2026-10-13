@@ -1817,10 +1817,19 @@ namespace {
 // The seed was retargeted off its bootstrap (node 0) to node 1 by a plain
 // Subscribe's data-op Redirect: the seed's identity is node 0, it is
 // physically on node 1.
-void moveSeedToNode1(GroupRig& r, int n1, int p1port, int32_t topicIdx) {
-    r.gw.subscribeRedirectNext = 1;
-    r.gw.subscribeRedirectTo   = "127.0.0.1:" + std::to_string(p1port);
-    (void)topicIdx;
+// The seed is moved by a DATA-OP Redirect of a Produce (no partition route
+// installed, no group active: the CB-5 B seed retarget).  E2 residual round 5
+// (R3): a plain Subscribe's Redirect never moves the seed any more (it follows
+// per partition, or is held until metadata places its target).
+void moveSeedToNode1(GroupRig& r, int n1, int p1port, int32_t topicIdx, std::optional<rc::Producer>& keep) {
+    r.gw.redirectNext = 1;
+    r.gw.redirectTo   = "127.0.0.1:" + std::to_string(p1port);
+    rc::ProducerConfig pc;
+    pc.lingerUs = 0;
+    keep.emplace(r.client.producer(pc));   // the caller keeps it alive (the redirected batch is re-sent)
+    const std::vector<uint8_t> val{1};
+    (void)keep->trySendTo(r.client.topic(topicIdx == 1 ? "b" : "t"), 0, rc::Key(uint64_t{1}),
+                                 std::span<const uint8_t>(val));
     ASSERT_TRUE(r.drive([&] {
         return r.client.testTransport().ingressChannel() == udp(p1port) && r.gw.connectsAt[n1] >= 1 &&
                r.client.testSessionStateAt(0) == rc::session::SessionState::Connected;
@@ -1841,7 +1850,8 @@ TEST(GroupRoutingRegression, TxnCoordinatorOnTheBootstrapAfterASeedRetargetRegre
     r.connect();
     auto sub = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
                                   [](const rc::Record&) {});
-    moveSeedToNode1(r, n1, p1port, 0);
+    std::optional<rc::Producer> seedMover;
+    moveSeedToNode1(r, n1, p1port, 0, seedMover);
     r.gw.coordinatorEndpoint   = 0;   // the bootstrap node is the coordinator
     r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(r.gw.brokerPort);
     r.gw.initPidReply          = true;
@@ -1879,7 +1889,8 @@ TEST(GroupRoutingRegression, GroupCoordinatorOnTheBootstrapAfterASeedRetargetReg
     r.connect();
     auto sub = r.client.subscribe(r.client.topic("b"), 0, rc::SubscribeOptions{rc::From::earliest()},
                                   [](const rc::Record&) {});
-    moveSeedToNode1(r, n1, p1port, 1);
+    std::optional<rc::Producer> seedMover;
+    moveSeedToNode1(r, n1, p1port, 1, seedMover);
     r.gw.coordinatorEndpoint   = 0;
     r.gw.coordinatorRedirectTo = "127.0.0.1:" + std::to_string(r.gw.brokerPort);
     rc::GroupConfig gcfg;
@@ -2537,6 +2548,58 @@ TEST(GroupRoutingRegression, NewSubscribeRedirectedFollowsPerPartitionAndNeverMo
     EXPECT_TRUE(s1.active());
     EXPECT_EQ(s0.subscriptionId(), a0.subscriptionId);
     EXPECT_EQ(s1.subscriptionId(), a1.subscriptionId);
+    s0.unsubscribe();
+    s1.unsubscribe();
+    s2.unsubscribe();
+}
+
+// E2 final fix wave, residual round 5 — R3: the O1 per-partition follow must
+// work BEFORE the first metadata answer installed any route (multiNodeRouting()
+// is still false).  With nothing known about the target the follow is HELD —
+// never skipped to a seed retarget (which would strand the subscriptions bound
+// on the seed: a silent stall); the first metadata answer places the target
+// and the subscription binds on that node's own session.  RED (gated on
+// multiNodeRouting()): the seed moved.
+TEST(GroupRoutingRegression, NewSubscribeRedirectedBeforeAnyMetadataStillFollowsPerPartitionRegression) {
+    GroupRig r(4245, 4246);
+    const auto [n1, p1port] = r.addNode(4245);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4245, ""}, {1, 1, 0, 1, 4245, ""}, {1, 2, 1, 1, 4245, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, 0}, {2, n1}};
+    r.gw.groupProtocol   = false;
+    r.gw.holdMetadata    = true;   // no metadata answer: no route is installed
+    r.connect();
+    const std::string seedBefore = r.client.testTransport().ingressChannel();
+
+    PlainLedger led;
+    auto s0 = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()}, led.handler(0));
+    auto s1 = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()}, led.handler(1));
+    ASSERT_TRUE(r.drive([&] { return s0.subscriptionId() != 0 && s1.subscriptionId() != 0; }));
+    const auto a0 = *r.subAt(0, 0);
+    const auto a1 = *r.subAt(1, 0);
+    auto s2 = r.client.subscribe(r.client.topic("t"), 2, rc::SubscribeOptions{rc::From::earliest()}, led.handler(2));
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribeRefusals >= 1; })) << "precondition: the seed redirected it";
+    // No metadata answer yet: the follow is HELD — the seed never moves.
+    ASSERT_TRUE(r.drive([&] { return r.client.testRedirectFollowsHeld() >= 1; }))
+        << "the follow was neither held nor done before any metadata (skipped)";
+    (void)r.drive([&] { return false; }, 200'000);
+    EXPECT_EQ(r.client.testTransport().ingressChannel(), seedBefore) << "the held follow moved the SEED";
+    // The first metadata answer arrives: the follow goes per partition.
+    ASSERT_FALSE(r.gw.metadataCorrIds.empty());
+    r.gw.holdMetadata = false;
+    r.gw.sendMetadata(a0.sessionId, r.gw.metadataCorrIds.back());
+    ASSERT_TRUE(r.drive([&] { return r.subAt(2, n1) != nullptr && s2.subscriptionId() == r.subAt(2, n1)->subscriptionId; },
+                        20'000'000))
+        << "SILENT STALL: the held follow never bound on its leader after the first metadata answer";
+    EXPECT_EQ(r.client.testTransport().ingressChannel(), seedBefore)
+        << "the new subscription's Redirect moved the SEED (no route yet: the follow was skipped)";
+    const auto b2 = *r.subAt(2, n1);
+    r.gw.pushRecords(a0, 0, 2);
+    r.gw.pushRecords(a1, 0, 2);
+    r.gw.pushRecords(b2, 0, 2);
+    ASSERT_TRUE(r.drive([&] { return led.count(0) == 2 && led.count(1) == 2 && led.count(2) == 2; }))
+        << "SILENT STALL: p0 " << led.count(0) << "/2, p1 " << led.count(1) << "/2, p2 " << led.count(2) << "/2";
+    EXPECT_EQ(led.dupes(), 0);
     s0.unsubscribe();
     s1.unsubscribe();
     s2.unsubscribe();

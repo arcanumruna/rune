@@ -228,6 +228,8 @@ public:
     /// route like a moved one (homeMoved / driveHomed), never by moving the
     /// seed.  False when not such a pending Subscribe (or not routed).
     bool adoptRedirectedSubscribe(int64_t correlationId);
+    /// R3: `correlationId` is a pending, never-bound, never-moved Subscribe.
+    [[nodiscard]] bool isNewPendingSubscribe(int64_t correlationId) const;
     /// Route the pending moved Subscribe `correlationId` to its partition's
     /// leader as the agent now routes it (the caller installed the route the
     /// Redirect named): that node's own session — sent now when Connected,

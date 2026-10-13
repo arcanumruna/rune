@@ -1710,6 +1710,7 @@ int Client::dutyCycle(int64_t nowNs) {
     work += watchProduceRoutes_(nowNs);
     // DR-15: Subscribes redirected to an unreachable node, after fresh metadata.
     if (!redirectedSubscribes_.empty()) [[unlikely]] work += retryRedirectedSubscribes_(nowNs);
+    if (!heldRedirectFollows_.empty()) [[unlikely]] work += releaseHeldRedirectFollows_();   // R3
     // E2 final fix wave (I2): moved subscriptions on their leader node's own
     // session — held Subscribes flushed, a lost session's ones re-armed.
     if (subscriberHub_.homedCount() != 0) [[unlikely]] {
@@ -2118,6 +2119,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     };
                 subscriberHub_.resendPending(newSessionId, subSendFn);
                 redirectedSubscribes_.clear();  // DR-15 re-review: re-sent here — never again on metadata
+                heldRedirectFollows_.clear();   // R3: likewise (a new Redirect decides it again)
             } else if (subscriberHub_.hasPending()) {
                 // F8a fix2: a pending Subscribe sent before this session existed
                 // was dropped by the ring drain (stale session) — re-issue every
@@ -2128,6 +2130,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                         return agent_.submitSend(fb, fl);
                     });
                 redirectedSubscribes_.clear();  // DR-15 re-review: re-sent here — never again on metadata
+                heldRedirectFollows_.clear();   // R3: likewise (a new Redirect decides it again)
             }
 
             // MAJOR-2 (round 3): the broker's capability, for every group
@@ -2372,14 +2375,37 @@ void Client::onEgressFrame(codec::TemplateId tid,
             }
 
             // E2 residual round 3 (O1): a NEW, never-bound plain Subscribe
-            // answered Redirect with multi-node routing follows it PER
-            // PARTITION on the leader node's own session (as a moved one does,
-            // I2) — never a seed retarget, which would strand every subscription
-            // already bound on the seed (a silent stall).
-            if (!groupActive && agent_.multiNodeRouting() &&
-                subscriberHub_.adoptRedirectedSubscribe(opt->correlationId) &&
-                followMovedSubscriptionRedirect_(opt->correlationId, opt->message)) {
-                break;
+            // answered Redirect follows it PER PARTITION on the leader node's
+            // own session (as a moved one does, I2) — never a seed retarget,
+            // which would strand every subscription already bound on the seed
+            // (a silent stall).  Round 5 (R3): also before the first metadata
+            // answer — the Redirect's endpoint installs the partition's route.
+            if (!groupActive && subscriberHub_.isNewPendingSubscribe(opt->correlationId) &&
+                !agent::ClientAgent::sameEndpoint(toChannel(newEndpoint), agent_.seedChannel())) {
+                bool handled = false;
+                switch (redirectFollowFor_(newEndpoint)) {
+                case RedirectFollow::PerPartition:
+                    handled = subscriberHub_.adoptRedirectedSubscribe(opt->correlationId) &&
+                              followMovedSubscriptionRedirect_(opt->correlationId, opt->message);
+                    break;
+                case RedirectFollow::Hold:
+                    // R3: no metadata answer yet — the broker set is unknown.
+                    // Held (neither sent nor followed by moving the seed) until
+                    // the next answer decides it; the subscribe deadline still
+                    // bounds it (explicit failure, never a hang).
+                    try {
+                        heldRedirectFollows_.push_back(HeldRedirect{opt->correlationId, newEndpoint, metadataResponses_});
+                        ++redirectFollowsHeld_;
+                        requestMetadataNow_();
+                        handled = true;
+                    } catch (...) {
+                        // allocation failure (cold): the seed path below
+                    }
+                    break;
+                case RedirectFollow::BySeed:
+                    break;
+                }
+                if (handled) break;
             }
 
             if (groupActive) {
@@ -2407,84 +2433,7 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 break;
             }
 
-            // Retarget transport to the leader's client endpoint.
-            // If the endpoint is already a full Aeron channel URI (starts with
-            // "aeron:"), use it as-is (test / ipc scenarios).  Otherwise treat
-            // it as host:port and build a UDP channel.  This allows both
-            // production UDP redirects and in-process ipc test redirects.
-            const std::string newChannel = toChannel(newEndpoint);  // N2
-
-            // Retarget is noexcept; if it fails the old publication is kept.
-            const bool retargeted = agent_.retarget(newChannel);
-
-            if (retargeted) {
-                // MD1 IMPORTANT-2: record the connection's new leader channel so
-                // proactive produce routing compares against the right target.
-                currentLeaderChannel() = newChannel;
-                // CB-5 B FIX (bugs 1-4): a data op (Produce OR Subscribe) was
-                // rejected by a FOLLOWER.  We must:
-                //   (1) reconnect to the leader with a FRESH session (the leader
-                //       has no session for us — submitReconnect forces a new
-                //       ConnectRequest even though we are still logically
-                //       Connected to the follower), and
-                //   (2) resend the affected op(s) — Produce AND Subscribe — but
-                //       only AFTER the new ConnectResponse{OK} arrives, so they
-                //       carry the leader's freshly assigned sessionId (re-stamped
-                //       into the frame header).  We defer the resend by setting
-                //       redirectPending_; the ConnectResponse{OK} handler flushes
-                //       it (see above).  This fixes: subscribe never resent (1),
-                //       stale sessionId (2), resend racing the reconnect (3).
-                //
-                // Stick-to-leader (4): the transport retarget persists and the
-                // new session is the leader's, so every subsequent op reads the
-                // leader session via stateAndSessionId() and lands directly on
-                // the leader without re-redirecting.
-                //
-                // Only initiate ONE reconnect per redirect episode: if a
-                // reconnect is already pending (multiple in-flight ops each
-                // redirected), coalesce — the single deferred resend on the next
-                // ConnectResponse{OK} flushes ALL pending ops.  This prevents
-                // session churn from a burst of redirects.
-                // Coalesce: only initiate ONE reconnect per redirect episode.
-                // Single-owner agent thread → a plain check-and-set (no CAS).
-                if (!redirectPending()) {
-                    redirectPending() = true;
-                    agent_.submitReconnect();
-                }
-                redirectedResendBackoffNs_ = kRedirectedResendInitNs;  // DR-15: a reachable target
-            } else {
-                // DR-15 (SIGTERM parity, Docker 2026-10-05): the redirect named a node
-                // that is unreachable right now (it just stopped — its host is gone).
-                // Never terminal: stay on the current node, ask for metadata, and
-                // re-send the pending Subscribes on the answer (the cluster moves on;
-                // the next answer redirects to the live leader or serves it).  The
-                // redirected Produce stays in flight — its attempt timer re-offers it
-                // (no redirect budget spent: nothing was re-sent).
-                if ((unreachableRedirects_++ & 1023u) == 0)
-                    std::fprintf(stderr, "rune-client: redirect target %s unreachable — staying, asking for metadata "
-                                 "(%llu so far)\n", newEndpoint.c_str(),
-                                 static_cast<unsigned long long>(unreachableRedirects_));
-                // Review M1: still an answer for the produce's in-flight accounting.
-                producerHub_.noteRedirectAnswer(opt->correlationId);
-                // Review MAJOR-1: only THIS Subscribe is re-sent (never the others,
-                // which still await their own answer — a duplicate would register a
-                // second subscription broker-side).
-                if (subscriberHub_.isPending(opt->correlationId) &&
-                    std::find(redirectedSubscribes_.begin(), redirectedSubscribes_.end(), opt->correlationId) ==
-                        redirectedSubscribes_.end()) {  // re-review NEW-M1: once per pending resend
-                    try {
-                        redirectedSubscribes_.push_back(opt->correlationId);
-                    } catch (...) {
-                        // allocation failure (cold path): it times out as before
-                    }
-                }
-                // Review M3: paced — the re-send waits for a fresh metadata answer
-                // AND a doubling backoff (100 ms .. 2 s); never a tight redirect loop.
-                redirectMetaSeen_       = metadataResponses_;
-                nextRedirectedResendNs_ = now() + redirectedResendBackoffNs_;
-                redirectedResendBackoffNs_ = std::min<int64_t>(redirectedResendBackoffNs_ * 2, kRedirectedResendMaxNs);
-                requestMetadataNow_();
-            }
+            redirectBySeed_(opt->correlationId, newEndpoint);
             break; // Redirect is handled; don't fall through to the error path.
         }
 
@@ -3746,6 +3695,131 @@ int Client::watchProduceRoutes_(int64_t nowNs) noexcept {
     if (!ask) return 0;
     requestMetadataNow_();
     return 1;
+}
+
+// Redirect of a data op followed by RETARGETING THE SEED (the single-node /
+// bootstrap-through-a-follower model, CB-5 B; DR-15 when the target is
+// unreachable).  Extracted from the ErrorResponse handler (E2 residual round 5,
+// R3) so a held per-partition follow can fall back to it.
+// E2 residual round 5 (R3): how a Redirect of a NEW plain Subscribe is
+// followed.  Per partition (O1) whenever the client can place the target: a
+// route exists, or the target is a known node of the cluster.  Before the
+// first metadata answer nothing is known — HOLD until it arrives (never skip
+// to a seed retarget, which would strand the subscriptions bound on the seed).
+// A target the cluster's metadata does not know (a node that just stopped, an
+// unresolvable host) keeps the seed path (DR-15: stay, ask, re-send).
+Client::RedirectFollow Client::redirectFollowFor_(const std::string& endpoint) const {
+    if (agent_.multiNodeRouting()) return RedirectFollow::PerPartition;
+    std::string ep = endpoint;
+    if (const auto at = ep.find("endpoint="); at != std::string::npos) ep = ep.substr(at + 9u);
+    if (metadataCache_.nodeIdForEndpoint(ep) != metadata::MetadataCache::kNoLeader) return RedirectFollow::PerPartition;
+    return metadataResponses_ == 0 ? RedirectFollow::Hold : RedirectFollow::BySeed;
+}
+
+// R3: a metadata answer arrived since the follow was held — decide it now.
+int Client::releaseHeldRedirectFollows_() {
+    int work = 0;
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < heldRedirectFollows_.size(); ++i) {
+        HeldRedirect h = heldRedirectFollows_[i];
+        if (!subscriberHub_.isNewPendingSubscribe(h.corrId)) { ++work; continue; }   // timed out / cancelled
+        if (metadataResponses_ == h.metaSeen) { heldRedirectFollows_[kept++] = std::move(h); continue; }
+        ++work;
+        switch (redirectFollowFor_(h.endpoint)) {
+        case RedirectFollow::PerPartition:
+            if (subscriberHub_.adoptRedirectedSubscribe(h.corrId) && followMovedSubscriptionRedirect_(h.corrId, h.endpoint))
+                break;
+            redirectBySeed_(h.corrId, h.endpoint);
+            break;
+        case RedirectFollow::Hold:   // still no answer applied (cannot happen: metaSeen moved)
+        case RedirectFollow::BySeed:
+            redirectBySeed_(h.corrId, h.endpoint);
+            break;
+        }
+    }
+    heldRedirectFollows_.resize(kept);
+    return work;
+}
+
+void Client::redirectBySeed_(int64_t corrId, const std::string& newEndpoint) {
+    // Retarget transport to the leader's client endpoint.
+    // If the endpoint is already a full Aeron channel URI (starts with
+    // "aeron:"), use it as-is (test / ipc scenarios).  Otherwise treat
+    // it as host:port and build a UDP channel.  This allows both
+    // production UDP redirects and in-process ipc test redirects.
+    const std::string newChannel = toChannel(newEndpoint);  // N2
+
+    // Retarget is noexcept; if it fails the old publication is kept.
+    const bool retargeted = agent_.retarget(newChannel);
+
+    if (retargeted) {
+        // MD1 IMPORTANT-2: record the connection's new leader channel so
+        // proactive produce routing compares against the right target.
+        currentLeaderChannel() = newChannel;
+        // CB-5 B FIX (bugs 1-4): a data op (Produce OR Subscribe) was
+        // rejected by a FOLLOWER.  We must:
+        //   (1) reconnect to the leader with a FRESH session (the leader
+        //       has no session for us — submitReconnect forces a new
+        //       ConnectRequest even though we are still logically
+        //       Connected to the follower), and
+        //   (2) resend the affected op(s) — Produce AND Subscribe — but
+        //       only AFTER the new ConnectResponse{OK} arrives, so they
+        //       carry the leader's freshly assigned sessionId (re-stamped
+        //       into the frame header).  We defer the resend by setting
+        //       redirectPending_; the ConnectResponse{OK} handler flushes
+        //       it (see above).  This fixes: subscribe never resent (1),
+        //       stale sessionId (2), resend racing the reconnect (3).
+        //
+        // Stick-to-leader (4): the transport retarget persists and the
+        // new session is the leader's, so every subsequent op reads the
+        // leader session via stateAndSessionId() and lands directly on
+        // the leader without re-redirecting.
+        //
+        // Only initiate ONE reconnect per redirect episode: if a
+        // reconnect is already pending (multiple in-flight ops each
+        // redirected), coalesce — the single deferred resend on the next
+        // ConnectResponse{OK} flushes ALL pending ops.  This prevents
+        // session churn from a burst of redirects.
+        // Coalesce: only initiate ONE reconnect per redirect episode.
+        // Single-owner agent thread → a plain check-and-set (no CAS).
+        if (!redirectPending()) {
+            redirectPending() = true;
+            agent_.submitReconnect();
+        }
+        redirectedResendBackoffNs_ = kRedirectedResendInitNs;  // DR-15: a reachable target
+    } else {
+        // DR-15 (SIGTERM parity, Docker 2026-10-05): the redirect named a node
+        // that is unreachable right now (it just stopped — its host is gone).
+        // Never terminal: stay on the current node, ask for metadata, and
+        // re-send the pending Subscribes on the answer (the cluster moves on;
+        // the next answer redirects to the live leader or serves it).  The
+        // redirected Produce stays in flight — its attempt timer re-offers it
+        // (no redirect budget spent: nothing was re-sent).
+        if ((unreachableRedirects_++ & 1023u) == 0)
+            std::fprintf(stderr, "rune-client: redirect target %s unreachable — staying, asking for metadata "
+                         "(%llu so far)\n", newEndpoint.c_str(),
+                         static_cast<unsigned long long>(unreachableRedirects_));
+        // Review M1: still an answer for the produce's in-flight accounting.
+        producerHub_.noteRedirectAnswer(corrId);
+        // Review MAJOR-1: only THIS Subscribe is re-sent (never the others,
+        // which still await their own answer — a duplicate would register a
+        // second subscription broker-side).
+        if (subscriberHub_.isPending(corrId) &&
+            std::find(redirectedSubscribes_.begin(), redirectedSubscribes_.end(), corrId) ==
+                redirectedSubscribes_.end()) {  // re-review NEW-M1: once per pending resend
+            try {
+                redirectedSubscribes_.push_back(corrId);
+            } catch (...) {
+                // allocation failure (cold path): it times out as before
+            }
+        }
+        // Review M3: paced — the re-send waits for a fresh metadata answer
+        // AND a doubling backoff (100 ms .. 2 s); never a tight redirect loop.
+        redirectMetaSeen_       = metadataResponses_;
+        nextRedirectedResendNs_ = now() + redirectedResendBackoffNs_;
+        redirectedResendBackoffNs_ = std::min<int64_t>(redirectedResendBackoffNs_ * 2, kRedirectedResendMaxNs);
+        requestMetadataNow_();
+    }
 }
 
 int Client::retryRedirectedSubscribes_(int64_t nowNs) {
