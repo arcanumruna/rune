@@ -340,6 +340,7 @@ run_full_restart_group() {
     echo "${out}" | grep -q "^GROUP-COMMIT: OK committed=20" || fail "[${label}] the group did not commit 20"
     log "Step G2: FULL restart, STAGGERED: the partition's old leader (rune-3) stops last and starts last..."
     n0="$(leader_lines)"
+    mint0="$(dc logs --no-log-prefix rune-1 rune-2 rune-3 2>/dev/null | grep -cE "topicId=${TOPIC_ID} partition=0 .*data lineage MINTED" || true)"
     dc stop -t "${STOP_TIMEOUT_S}" rune-1 rune-2
     dc stop -t "${STOP_TIMEOUT_S}" rune-3
     dc start rune-1 rune-2
@@ -351,6 +352,14 @@ run_full_restart_group() {
     # The old leader comes back last (the coordinator ran without it meanwhile).
     sleep "${STAGGER_S:-8}"
     dc start rune-3
+    # Readiness: the partition's new leadership has confirmed its (new) lineage —
+    # until then a produce is redirected / refused while leadership settles and
+    # the probe's producer fails explicitly once its redirect budget is spent.
+    deadline=$(( $(date +%s) + LEADER_WAIT_S ))
+    until [ "$(dc logs --no-log-prefix rune-1 rune-2 rune-3 2>/dev/null | grep -cE "topicId=${TOPIC_ID} partition=0 .*data lineage MINTED" || true)" -gt "${mint0}" ]; do
+        [ "$(date +%s)" -lt "${deadline}" ] || fail "[${label}] the partition's post-restart leadership never confirmed a lineage"
+        sleep 2
+    done
     log "Step G3: the same group must deliver every post-restart record (2) exactly once..."
     set +e
     out="$(run_group_probe group_restart -e RUNE_GROUP_PRE=0)"; rc=$?
