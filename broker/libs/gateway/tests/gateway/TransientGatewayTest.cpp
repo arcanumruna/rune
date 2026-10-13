@@ -918,7 +918,10 @@ TEST(TransientGatewayRegression, MovedAwaySummaryIsPromptAndAccurateRegression) 
     r.gw.setNowForTest(now);
     const auto h1 = r.reg.lookupHandle(0, 1);
     r.reg.setIntendedRole(0, 1, h1.incarnation, rune::node::ReplicaRegistry::IntendedRole::Follower);
-    r.gw.pushSubscriptionsForTest();
+    // (M4: a routed change right after a sweep is coalesced into the next one.)
+    for (int64_t i = 0; i <= ClientGateway::kRoutedSweepMinGapCyclesForTest &&
+                        r.gw.readCommittedSubscriptionsMovedAway() < 5u; ++i)
+        r.gw.pushSubscriptionsForTest();
     ASSERT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), 5u);
     EXPECT_EQ(r.gw.movedAwaySummariesForTest(), 1u) << "not rate-limited";
     // ... and is logged on the first pass after the window, with both.
@@ -927,4 +930,42 @@ TEST(TransientGatewayRegression, MovedAwaySummaryIsPromptAndAccurateRegression) 
     r.gw.pushSubscriptionsForTest();
     EXPECT_EQ(r.gw.movedAwaySummariesForTest(), 2u) << "the carried retirements were never reported";
     EXPECT_EQ(r.gw.lastMovedAwaySummaryCountForTest(), 2u);
+}
+
+// ---------------------------------------------------------------------------
+// E2 final fix wave (final review M4): routed role changes are COALESCED.  A
+// controlled shutdown moves many partitions, one routed role change per pass;
+// the sweep (a movedAway_ probe per eligible subscription) used to run on
+// every such pass — O(subscriptions) each.  Now the first change after a quiet
+// period sweeps at once and later ones share one sweep per
+// kRoutedSweepMinGapCycles passes; every demotion is still caught.  RED (one
+// sweep per changed pass): 128 sweeps.
+// ---------------------------------------------------------------------------
+TEST(TransientGatewayRegression, RoutedRoleChangesAreCoalescedIntoBoundedSweepsRegression) {
+    Rig r(RigOpts{.partitions = 3});
+    const int64_t sid = r.gw.injectTestSession(0);
+    for (int k = 0; k < 20; ++k) r.subscribe(sid, -2, 5000 + k, /*read_committed=*/1, /*partition=*/0);
+    for (int k = 0; k < 20; ++k) r.subscribe(sid, -2, 5100 + k, /*read_committed=*/1, /*partition=*/2);
+    ASSERT_EQ(r.subscribed.size(), 40u);
+    // A burst: partition 1 (no subscriptions) changes routed role on 128 consecutive passes.
+    const auto h1 = r.reg.lookupHandle(0, 1);
+    for (int i = 0; i < 128; ++i) {
+        r.reg.setIntendedRole(0, 1, h1.incarnation,
+                              (i & 1) ? rune::node::ReplicaRegistry::IntendedRole::Leader
+                                      : rune::node::ReplicaRegistry::IntendedRole::Follower);
+        r.gw.pushSubscriptionsForTest();
+    }
+    EXPECT_LE(r.gw.routedMovedAwaySweepsForTest(), 128u / ClientGateway::kRoutedSweepMinGapCyclesForTest + 1)
+        << "a routed sweep per changed pass (O(subscriptions) probes each)";
+    EXPECT_GE(r.gw.routedMovedAwaySweepsForTest(), 1u) << "the first change after a quiet period swept nothing";
+    EXPECT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), 0u) << "a subscription still led here was retired";
+    // Partition 2 is demoted inside the burst's gap: caught by the coalesced sweep.
+    const auto h2 = r.reg.lookupHandle(0, 2);
+    r.reg.setIntendedRole(0, 2, h2.incarnation, rune::node::ReplicaRegistry::IntendedRole::Follower);
+    for (int64_t i = 0; i <= ClientGateway::kRoutedSweepMinGapCyclesForTest &&
+                        r.gw.readCommittedSubscriptionsMovedAway() < 20u; ++i)
+        r.gw.pushSubscriptionsForTest();
+    EXPECT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), 20u)
+        << "SILENT STALL: a demotion coalesced into a later sweep was never caught";
+    for (int k = 0; k < 20; ++k) EXPECT_FALSE(r.errors.count(5000 + k)) << "partition 0 (still led) retired";
 }

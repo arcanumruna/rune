@@ -4706,10 +4706,20 @@ void ClientGateway::pushSubscriptionsPass_()
     //     a higher epoch) — every kMovedAwayScanEveryCycles passes, a slice of
     //     at most ~kMovedAwayLookupsPerSlice subscriptions behind a bucket
     //     cursor (scanMovedAwaySlice_); never an O(subs) spike.
-    const bool routedSweep = replicaRegistry_ != nullptr &&
-                             replicaRegistry_->roleChanges() != seenRcSweepRoleChanges_;
-    if (routedSweep) [[unlikely]] {
+    //   - E2 final fix wave (M4): routed changes are COALESCED — the first one
+    //     after a quiet period sweeps at once; while changes keep arriving (a
+    //     controlled shutdown moves many partitions, one routed pass each) at
+    //     most one sweep per kRoutedSweepMinGapCycles passes covers them all.
+    //     Never one O(subscriptions) probe pass per role change.
+    if (replicaRegistry_ != nullptr && replicaRegistry_->roleChanges() != seenRcSweepRoleChanges_) [[unlikely]] {
         seenRcSweepRoleChanges_ = replicaRegistry_->roleChanges();
+        routedSweepPending_     = true;
+    }
+    const bool routedSweep = routedSweepPending_ && pushCycle_ >= nextRoutedSweepCycle_;
+    if (routedSweep) [[unlikely]] {
+        routedSweepPending_   = false;
+        nextRoutedSweepCycle_ = pushCycle_ + kRoutedSweepMinGapCycles;
+        ++routedMovedAwaySweeps_;
     } else if (replicaRegistry_ != nullptr && (pushCycle_ & (kMovedAwayScanEveryCycles - 1)) == 0) [[unlikely]] {
         scanMovedAwaySlice_();
         if (subscriptions_.empty()) return;

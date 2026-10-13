@@ -964,6 +964,9 @@ public:
     static constexpr int64_t kMovedAwayScanEveryCyclesForTest = 16;   // == kMovedAwayScanEveryCycles
     static constexpr int     kMovedAwayLookupsPerSliceForTest = 32;   // == kMovedAwayLookupsPerSlice
     static constexpr int64_t kMovedAwaySummaryEveryNsForTest  = 1'000'000'000;   // == kMovedAwaySummaryEveryNs
+    static constexpr int64_t kRoutedSweepMinGapCyclesForTest  = 64;   // == kRoutedSweepMinGapCycles
+    /// M4: routed moved-away sweeps run so far (coalesced role changes).
+    [[nodiscard]] uint64_t routedMovedAwaySweepsForTest() const noexcept { return routedMovedAwaySweeps_; }
     /// N2: moved-away summaries logged, and the count the last one reported.
     [[nodiscard]] uint64_t movedAwaySummariesForTest() const noexcept { return movedAwaySummaries_; }
     [[nodiscard]] uint64_t lastMovedAwaySummaryCountForTest() const noexcept { return lastMovedAwaySummaryCount_; }
@@ -2107,6 +2110,11 @@ private:
     /// kMovedAwayScanEveryCycles push passes (scanMovedAwaySlice_) — never a
     /// per-pass lookup per subscription, never an O(subs) spike.
     uint64_t seenRcSweepRoleChanges_ = 0;
+    /// M4: a routed change is waiting for its (coalesced) sweep.
+    bool     routedSweepPending_     = false;
+    int64_t  nextRoutedSweepCycle_   = 0;     ///< M4: the earliest pass the next routed sweep may run
+    uint64_t routedMovedAwaySweeps_  = 0;     ///< M4: routed sweeps run (tests)
+    static constexpr int64_t kRoutedSweepMinGapCycles = kRoutedSweepMinGapCyclesForTest;
     static constexpr int64_t     kMovedAwayScanEveryCycles   = kMovedAwayScanEveryCyclesForTest;   ///< power of two
     static constexpr int         kMovedAwayLookupsPerSlice   = kMovedAwayLookupsPerSliceForTest;
     static constexpr std::size_t kMovedAwayBucketsPerSlice   = 256;   ///< empty buckets cost no lookup, but bounded
