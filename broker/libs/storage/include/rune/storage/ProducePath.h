@@ -61,6 +61,7 @@
 // (log, producerState) pair.
 
 #include <rune/storage/Log.h>
+#include <rune/storage/InMemoryLog.h>
 #include <rune/storage/ProducerStateManager.h>
 #include <rune/protocol/client/Protocol.h>
 
@@ -111,6 +112,11 @@ struct ProduceOutcome {
     /// D6: with error == UnknownProducerId, the partition's log start offset at
     /// the answer (the wire ProduceResponse.logStartOffset); -1 otherwise.
     int64_t  logStartOffset = -1;
+    /// Phase 2b E2: the append was refused by an InMemoryLog (a TRANSIENT
+    /// partition's ring): error TransientLogFull (42, retriable — the ring is
+    /// full of uncommitted data) or MessageTooLarge (larger than the ring).
+    /// Nothing was appended.  Never set for a disk Log.
+    bool     logFull = false;
 
     [[nodiscard]] bool isOK() const noexcept {
         return error == rune::protocol::client::ErrorCode::OK;
@@ -157,6 +163,10 @@ using rune::protocol::client::produceErrorForClient;
 // Never throws; all exceptions are caught and returned as ErrorCode::Internal.
 // Zero allocation on the success path.
 // ---------------------------------------------------------------------------
+// Phase 2b E2: templated over the concrete log type — rune::storage::Log (disk)
+// or rune::storage::InMemoryLog (a TRANSIENT partition's ring).  No virtual
+// dispatch; the two instantiations live in ProducePath.cpp.
+template <class LogT>
 ProduceOutcome handleProduceBatch(
     const uint8_t*                    batch,
     std::size_t                       batchLen,
@@ -165,13 +175,20 @@ ProduceOutcome handleProduceBatch(
     int64_t                           producerId,
     int16_t                           producerEpoch,
     int32_t                           baseSequence,
-    rune::storage::Log&               log,
+    LogT&                             log,
     rune::storage::ProducerStateManager& producerState,
     bool                              acksAll,
     int                               isrSize,
     int                               minIsr,
     uint8_t                           durabilityTier,
     bool                              crcPreverified = false) noexcept;
+
+extern template ProduceOutcome handleProduceBatch<Log>(
+    const uint8_t*, std::size_t, int32_t, int32_t, int64_t, int16_t, int32_t, Log&,
+    ProducerStateManager&, bool, int, int, uint8_t, bool) noexcept;
+extern template ProduceOutcome handleProduceBatch<InMemoryLog>(
+    const uint8_t*, std::size_t, int32_t, int32_t, int64_t, int16_t, int32_t, InMemoryLog&,
+    ProducerStateManager&, bool, int, int, uint8_t, bool) noexcept;
 
 } // namespace rune::storage
 

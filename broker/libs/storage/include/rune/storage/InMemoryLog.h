@@ -37,6 +37,18 @@
 //
 // NOT thread-safe (same contract as rune::storage::Log — single writer).
 //
+// Phase 2b E2 (TRANSIENT topics — the produce/subscribe data path):
+//   appendNoSyncRestamp(): the Log-compatible zero-copy restamp append used by
+//     the worker produce path (handleProduceBatch<InMemoryLog>): ONE memcpy into
+//     the ring, then the assigned base offset and (when leading) the leader epoch
+//     are patched in the ring copy — never in the caller's bytes.
+//   Eviction floor: DropOldest never evicts a batch whose lastOffset >= the
+//     floor (the owning replica keeps it at its high watermark: uncommitted
+//     data).  An append that would need such an eviction is REFUSED
+//     (kRefusedFull).  Default floor = INT64_MAX (unbounded: plain DropOldest).
+//   kRefusedTooLarge: a batch larger than the whole ring (never storable).
+//   resetTo(): restart EMPTY at an offset (follower below the leader's ring start).
+//
 // Namespace: rune::storage   C++23
 // ---------------------------------------------------------------------------
 
@@ -44,10 +56,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include <rune/storage/LogReadView.h>
+#include <rune/protocol/RecordBatch.h>
 
 namespace rune::storage {
 
@@ -108,6 +122,52 @@ public:
     int64_t appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffset) {
         return appendImpl(data, len, lastOffset);
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 2b E2 — the transient produce path.
+    // -----------------------------------------------------------------------
+    /// The append would have to evict a batch at/above the eviction floor (or the
+    /// BackPressure policy's ring is full): nothing appended, retry later.
+    static constexpr int64_t kRefusedFull     = -1;
+    /// The batch is larger than the whole ring: it can never be stored.
+    static constexpr int64_t kRefusedTooLarge = -2;
+
+    /// Log::appendNoSyncRestamp parity: assigns base = logEndOffset(), copies
+    /// [batch, batch+len) into the ring ONCE and patches the base offset
+    /// (bytes [0..7]) and — when leaderEpochStamp() >= 0 — the partition leader
+    /// epoch (bytes [12..15], outside the CRC) in the RING COPY; `batch` is never
+    /// mutated.  Returns nextOffset (base + lastOffsetDelta + 1) and sets
+    /// outBaseOffset, or a negative refusal code (kRefusedFull / kRefusedTooLarge)
+    /// with nothing appended.  Zero allocation.
+    int64_t appendNoSyncRestamp(const uint8_t* batch, std::size_t len,
+                                int32_t lastOffsetDelta, int64_t& outBaseOffset) {
+        const int64_t base = logEndOffset_;
+        const int64_t r = appendImpl(batch, len, base + static_cast<int64_t>(lastOffsetDelta));
+        if (r < 0) return r;
+        uint8_t* dst = ring_.data() + backEntry().ringOffset;
+        const auto ub = static_cast<uint64_t>(base);
+        for (int i = 0; i < 8; ++i)
+            dst[rune::protocol::batch::kBaseOffsetOffset + i] = static_cast<uint8_t>(ub >> (8 * i));
+        if (leaderEpochStamp_ >= 0 &&
+            len >= static_cast<std::size_t>(rune::protocol::batch::kPartitionLeaderEpochOffset + 4)) {
+            const auto ue = static_cast<uint32_t>(leaderEpochStamp_);
+            for (int i = 0; i < 4; ++i)
+                dst[rune::protocol::batch::kPartitionLeaderEpochOffset + i] = static_cast<uint8_t>(ue >> (8 * i));
+        }
+        outBaseOffset = base;
+        return logEndOffset_;
+    }
+
+    /// Log::setLeaderEpochStamp parity: the epoch appendNoSyncRestamp writes into
+    /// every batch it stores (-1 = leave the producer's bytes).  Set by the owning
+    /// PartitionReplica on leadership changes.  Owner thread only.
+    void setLeaderEpochStamp(int32_t epoch) noexcept { leaderEpochStamp_ = epoch; }
+    [[nodiscard]] int32_t leaderEpochStamp() const noexcept { return leaderEpochStamp_; }
+
+    /// Eviction floor: DropOldest never evicts a batch whose lastOffset >= floor.
+    /// The owning replica sets it to its high watermark before each append.
+    void setEvictionFloor(int64_t offset) noexcept { evictionFloor_ = offset; }
+    [[nodiscard]] int64_t evictionFloor() const noexcept { return evictionFloor_; }
 
     std::vector<uint8_t> read(int64_t startOffset, int32_t maxBytes) {
         if (startOffset < logStartOffset_ || entryCount_ == 0) {
@@ -255,6 +315,25 @@ public:
         return {logStartOffset_};
     }
 
+    /// Phase 2b E2 (follower catch-up): drop every batch and restart the ring
+    /// EMPTY at `offset` (logStart = logEnd = offset).  Keeps the eviction floor
+    /// and the leader-epoch stamp.  Cold.
+    void resetTo(int64_t offset) noexcept {
+        entryHead_ = 0; entryCount_ = 0;
+        head_ = 0; tail_ = 0; bytesUsed_ = 0;
+        logStartOffset_ = offset;
+        logEndOffset_   = offset;
+    }
+
+    /// Log parity for handleProduceBatch<LogT>: a ring never fails storage.
+    [[nodiscard]] constexpr bool storageFailed() const noexcept { return false; }
+    void markStorageFailed(int /*err*/) noexcept {}
+
+    /// Appends refused because the ring would have had to evict at/above the floor.
+    [[nodiscard]] uint64_t fullRefusals() const noexcept { return fullRefusals_; }
+    /// Records evicted (retention), summed over evicted batches.
+    [[nodiscard]] uint64_t evictedRecords() const noexcept { return evictedRecords_; }
+
     [[nodiscard]] bool isDiskBacked() const noexcept { return false; }
 
 private:
@@ -304,7 +383,9 @@ private:
     // Core append logic
     // -----------------------------------------------------------------------
     int64_t appendImpl(const uint8_t* data, std::size_t len, int64_t lastOffset) {
-        assert(len <= maxBytes_ && "batch larger than ring capacity — cannot store");
+        // Phase 2b E2: a batch larger than the whole ring can never be stored
+        // (was an assert — a release build corrupted the ring).
+        if (len > maxBytes_) [[unlikely]] return kRefusedTooLarge;
 
         const int64_t baseOffset = logEndOffset_;
 
@@ -324,6 +405,12 @@ private:
                 const std::size_t need = len + (ww ? la : 0);
                 if (bytesUsed_ + need <= maxBytes_ && entryCount_ < maxRecords_)
                     break; // fits — stop evicting
+                // Phase 2b E2: never evict at/above the floor (uncommitted data
+                // of a transient partition) — refuse the append instead.
+                if (frontEntry().lastOffset >= evictionFloor_) [[unlikely]] {
+                    ++fullRefusals_;
+                    return kRefusedFull;
+                }
                 evictOldest();
             }
         } else {
@@ -332,7 +419,8 @@ private:
             const bool ww = (len > la);
             const std::size_t need = len + (ww ? la : 0);
             if (bytesUsed_ + need > maxBytes_ || entryCount_ >= maxRecords_) {
-                return -1; // sentinel: ring full, caller must retry later
+                ++fullRefusals_;
+                return kRefusedFull; // sentinel: ring full, caller must retry later
             }
         }
 
@@ -368,6 +456,7 @@ private:
     void evictOldest() {
         assert(entryCount_ > 0);
         const Entry& oldest = frontEntry();
+        evictedRecords_ += static_cast<uint64_t>(oldest.lastOffset + 1 - oldest.baseOffset);
 
         // Detect wrap-induced padding: when oldest.ringOffset < head_, the ring
         // wrapped and there is a padding gap at [head_, maxBytes_) that should be
@@ -410,6 +499,10 @@ private:
     std::size_t           bytesUsed_ = 0;    ///< logical bytes in use (data + padding gaps)
     int64_t               logStartOffset_ = 0;
     int64_t               logEndOffset_   = 0;
+    int64_t               evictionFloor_  = std::numeric_limits<int64_t>::max();   ///< E2: see setEvictionFloor
+    int32_t               leaderEpochStamp_ = -1;                                   ///< E2: see setLeaderEpochStamp
+    uint64_t              fullRefusals_   = 0;
+    uint64_t              evictedRecords_ = 0;
 
     // Static synthetic dir string — no real directory.
     inline static const std::string syntheticDir_{"<inmem>"};
