@@ -405,14 +405,19 @@ struct Driver {
         ASSERT_TRUE(b.has_value()) << "seeding produce refused";
         hist.push_back(Acked{*b, recs});
     }
+    /// Both follower replicas hold batches 0..1 and 2..3 (HW 4): the cell's history.
+    void seedFollowers() {
+        seedFollower(*rig->rep[kTT], kTT);
+        seedFollower(*rig->rep[kDT], kDT);
+        rig->pass(4);
+        hist = {Acked{0, 2}, Acked{2, 2}};
+    }
     /// The timing's preconditions (data + ring state).
     void seed() {
         Rig& r = *rig;
         if (c.e.commit == mx::Commit::Uncommitted) return;
         if (c.e.role == mx::Role::Follower) {
-            seedFollower(*r.rep[kTT], kTT);
-            seedFollower(*r.rep[kDT], kDT);
-            r.pass(4);
+            seedFollowers();
             return;
         }
         switch (c.t) {
@@ -476,9 +481,7 @@ struct Driver {
     void run(Outcome want) {
         if (c.t == Timing::Restart && c.e.role == mx::Role::Follower) {   // R7 after a restart
             restart();
-            seedFollower(*rig->rep[kTT], kTT);
-            seedFollower(*rig->rep[kDT], kDT);
-            rig->pass(4);
+            seedFollowers();
         }
         Rig* r = rig.get();
         switch (want) {
@@ -583,16 +586,17 @@ struct Driver {
 
         case Outcome::UnansweredThenReissued: {   // R9 reads
             const auto [code, subId] = openRead(r->topic());
-            if (c.e.role == mx::Role::Leader) ASSERT_EQ(code, kOk);
-            else if (subId < 0) return;   // a follower that refuses the subscribe has nothing to re-issue
-                                          // (that answer is the ParityWithDisk cells' subject)
+            ASSERT_EQ(code, kOk) << "the subscription was refused";
+            ASSERT_GE(subId, 0) << "no subscription to re-issue";
             const int64_t hwAtOpen = r->hw();
             if (c.op == Op::SubLatest) {   // Latest sits AT the HW: no read is due until new data arrives
                 if (c.e.role == mx::Role::Leader) {
                     ackPlain(0, 2);
                 } else {
-                    replicateBatch(r->replica(), r->topic(), r->leo());
+                    const int64_t at = r->leo();
+                    replicateBatch(r->replica(), r->topic(), at);
                     r->pass(4);
+                    hist.push_back(Acked{at, 2});
                 }
                 ASSERT_GT(r->hw(), hwAtOpen) << "precondition: data above the Latest cursor";
             }
@@ -603,12 +607,23 @@ struct Driver {
             const uint64_t readsWhileDisowned = r->pool->worker(0).pushReadsForTest();   // stale reads never execute
             r->reown();
             const auto got = r->push(subId);
-            if (c.e.role == mx::Role::Leader && c.op != Op::ReadCommitted) {
-                if (c.op == Op::SubLatest) EXPECT_EQ(got, (std::vector<int64_t>{hist.back().base}));
-                else EXPECT_EQ(got, expectedBases(hist, resolvedStart(hwAtOpen), r->hw()));
+            if (c.op != Op::ReadCommitted) {
+                EXPECT_EQ(got, expectedBases(hist, resolvedStart(hwAtOpen), r->hw()))
+                    << "the re-issued read delivered the wrong batches";
+                EXPECT_GT(r->pool->worker(0).pushReadsForTest(), readsWhileDisowned)
+                    << "the read was never re-issued after ownership returned";
+                return;
             }
+            // read_committed: the ownership change rebuilt the RC state (a fresh
+            // RcState) — the OPEN transaction at 0..1 must still pin the LSO.
+            EXPECT_TRUE(got.empty()) << "an OPEN transaction leaked to read_committed after an ownership change";
+            if (c.e.role == mx::Role::Follower) return;   // RcState I2: read_committed serves a leader's log only
+                                                          // (a follower delivers nothing; disk == transient)
             EXPECT_GT(r->pool->worker(0).pushReadsForTest(), readsWhileDisowned)
                 << "the read was never re-issued after ownership returned";
+            EXPECT_EQ(r->marker(), ClientGateway::kControlRecordAsync);
+            r->pass(16);
+            EXPECT_EQ(r->push(subId), (std::vector<int64_t>{0, 2})) << "committed txn + plain batch, never the marker";
             return;
         }
 
@@ -618,8 +633,13 @@ struct Driver {
             for (int32_t t : {kTT, kDT}) {
                 const auto [cd, subId] = openRead(t);
                 code[t] = cd;
+                if (c.op == Op::SubLatest && subId >= 0) {   // parity over a real delivery, not empty == empty
+                    replicateBatch(*r->rep[t], t, r->rep[t]->logEndOffset());
+                    r->pass(4);
+                }
                 if (subId >= 0) got[t] = r->push(subId);
             }
+            if (c.op == Op::SubLatest) EXPECT_FALSE(got[kTT].empty()) << "Latest delivered nothing";
             EXPECT_EQ(code[kTT], code[kDT]) << "a follower's transient answer differs from its disk twin";
             EXPECT_EQ(got[kTT], got[kDT]) << "a follower's transient delivery differs from its disk twin";
             return;
