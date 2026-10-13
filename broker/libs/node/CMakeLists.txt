@@ -926,6 +926,17 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     gtest_discover_tests(rune_transient_data_path_tests)
 
+    # Phase 2b E2: replaces the global operator new (binary-wide) — own binary.
+    add_executable(rune_transient_alloc_regression_tests
+        tests/integration/TransientDataPathAllocTest.cpp)
+    target_link_libraries(rune_transient_alloc_regression_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        rune_transaction
+        GTest::gtest_main)
+    gtest_discover_tests(rune_transient_alloc_regression_tests)
+
     # ---------------------------------------------------------------------------
     # CP-9: RetentionCleanerAgent integration tests — separate cleaner-cadence
     #   retention: time (largestTimestamp), size, log-start-offset; async delete
