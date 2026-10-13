@@ -97,7 +97,15 @@ TEST(CatalogDdlWireRegression, AlterTopicConfigRefusesAnUnknownKey) {
     pc::AlterTopicConfig m; m.topicName = "t"; m.changes = changes;
     std::array<uint8_t, 256> buf{};
     const std::size_t n = m.encode(buf.data());
+    ASSERT_GT(n, 0u);   // the frame was really produced: the refusal below is the decoder's key check
     EXPECT_FALSE(pc::AlterTopicConfig::decode(buf.data(), n).has_value());
+
+    // Control: the same frame with a known key (1) decodes, so the refusal above is the key.
+    changes[2] = 1;
+    m.changes = changes;
+    const std::size_t n1 = m.encode(buf.data());
+    ASSERT_GT(n1, 0u);
+    EXPECT_TRUE(pc::AlterTopicConfig::decode(buf.data(), n1).has_value());
 }
 
 TEST(CatalogDdlWireRegression, DdlResponseRoundTrips) {
