@@ -2423,6 +2423,11 @@ private:
                 rune::replication::AlterIsrResponseMsg r{};
                 r.topicId        = op.topicId();
                 r.partition      = op.partition();
+                // Round 6 (fix-on-sight): the controller answers the node that
+                // asked — this one.  The op carries no leaderId; left at -1 the
+                // replica's lineage / leaderless-report acks never matched
+                // (reports re-sent forever, a rotation re-sent an unborn report).
+                r.leaderId       = rep->selfId();
                 r.leaderEpoch    = static_cast<rune::replication::Epoch>(op.roleEpoch());
                 r.partitionEpoch = op.rolePartitionEpoch();
                 r.errorCode      = op.replErrorCode();
