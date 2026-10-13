@@ -1508,6 +1508,10 @@ public:
         // Per-tick span: inter-tick gap = scheduler handoff/park; duration = tick cost.
         RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerDoWork, 0);
         int work = 0;
+        // E2 final fix wave (residual): ONE read_committed ring-rebuild budget
+        // per pass, shared by every memory-backed partition rebuilding (the
+        // produce gate's inline step and the per-pass driver alike).
+        ringBudgetLeft_ = static_cast<std::size_t>(rcScanBytesPerPass_);
 
         // E4: self-pin this thread to the assigned core on the FIRST doWork call.
         // Runs on the AgentRunner thread (the exact thread to pin).  One-shot:
@@ -5143,6 +5147,8 @@ private:
     }
     std::vector<RcSlot>   rcSlots_;
     std::size_t           rcWalkStart_ = 0;   // r3-1: rcAdvanceAll_'s round-robin start slot
+    std::size_t           ringCursor_  = 0;   // E2 residual: the next slot the shared ring budget starts at
+    std::size_t           ringBudgetLeft_ = RcState::kDefaultScanBytesPerPass;   // E2 residual: ring-rebuild bytes left this pass
     // Review I-2: read_committed PushReads held while their partition's RC
     // state builds — answered on Ready (or unanswered on ownership loss).
     // Each owes one return: counted in reservedAckSlots_(), capped, reserved.
@@ -5352,10 +5358,31 @@ private:
     // inline produce gate rcGate_ steps here too) and the real value after.
     std::size_t rcAdvance_(rune::replication::PartitionReplica* r, RcState& rc) {
         if (!rc.revalidate(rcFacts_(r))) publishCleanerLso_(r, rc);   // 0 before scanning
-        const std::size_t n = r->isDiskBacked() ? rc.advance(rcFacts_(r), r->log(), rcScanBytesPerPass_)
-                                                : rc.advance(rcFacts_(r), nullptr, rcScanBytesPerPass_, r->memoryLog());
+        std::size_t n = 0;
+        if (r->isDiskBacked()) {
+            n = rc.advance(rcFacts_(r), r->log(), rcScanBytesPerPass_);
+        } else {
+            // E2 final fix wave (residual): a memory-backed rebuild step draws on
+            // the pass's SHARED ring budget (at most ~kDefaultScanBytesPerPass of
+            // ring rebuild per worker pass, however many partitions rebuild).
+            // Spent: no step this pass (the state stays not Ready — reads held,
+            // gated produce refused NotLeader, as before).
+            const RcFacts f = rcFacts_(r);
+            if (rc.needsRingWork(f)) {
+                if (ringBudgetLeft_ > 0) {
+                    n = rc.advance(f, nullptr, static_cast<int32_t>(ringBudgetLeft_), r->memoryLog());
+                    ringBudgetLeft_ -= std::min(n, ringBudgetLeft_);
+                }
+            } else {
+                n = rc.advance(f, nullptr, rcScanBytesPerPass_, r->memoryLog());   // Ready / follower: no ring work
+            }
+        }
         publishCleanerLso_(r, rc);
         return n;
+    }
+    // E2 final fix wave (residual): memory-backed and in need of ring-rebuild work.
+    [[nodiscard]] bool ringWork_(rune::replication::PartitionReplica* r, const RcState& rc) const noexcept {
+        return !r->isDiskBacked() && rc.needsRingWork(rcFacts_(r));
     }
     // D3b fix round 1: a cleaner swap (rewritten / emptied segment) is NOT applied
     // while this partition's RC state is SCANNING the log: the rebuild walks the
@@ -5386,6 +5413,14 @@ private:
     // cursor, no allocation), so the kMaxRcHintsInFlight hint slots rotate over
     // the building partitions — every one is first in line once per
     // rcSlots_.size() passes, not only the first ones in a fixed order.
+    //
+    // E2 final fix wave (residual): the memory-backed (ring) rebuilds share ONE
+    // budget per pass (ringBudgetLeft_), handed out round-robin from a
+    // persistent cursor (ringCursor_): the partition that spent the last of it
+    // is followed by the next one on the following pass, so a rebuilding
+    // partition waits at most K-1 passes for its slice (K = rebuilding
+    // partitions) and none starves.  Disk partitions and ring partitions with
+    // no rebuild work keep the per-slot walk.  No allocation.
     int rcAdvanceAll_() {
         const std::size_t n = rcSlots_.size();
         if (n == 0) return 0;
@@ -5393,10 +5428,21 @@ private:
         int work = 0;
         for (std::size_t k = 0, i = rcWalkStart_; k < n; ++k) {
             RcSlot& sl = rcSlots_[i];
-            work += rcAdvance_(sl.replica, *sl.rc) > 0 ? 1 : 0;   // publishes the cleaner LSO (D3b)
+            if (!ringWork_(sl.replica, *sl.rc))
+                work += rcAdvance_(sl.replica, *sl.rc) > 0 ? 1 : 0;   // publishes the cleaner LSO (D3b)
             if (++i == n) i = 0;
         }
         if (++rcWalkStart_ == n) rcWalkStart_ = 0;
+        if (ringCursor_ >= n) ringCursor_ = 0;
+        for (std::size_t k = 0, i = ringCursor_; k < n && ringBudgetLeft_ > 0; ++k) {
+            RcSlot& sl = rcSlots_[i];
+            const std::size_t next = i + 1 == n ? 0 : i + 1;
+            if (ringWork_(sl.replica, *sl.rc)) {
+                work += rcAdvance_(sl.replica, *sl.rc) > 0 ? 1 : 0;
+                if (ringBudgetLeft_ == 0) ringCursor_ = next;   // the next pass starts after it
+            }
+            i = next;
+        }
         return work;
     }
     // D3b: publish the partition's first unstable offset to the cleaner (only on

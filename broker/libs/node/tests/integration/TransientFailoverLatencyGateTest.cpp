@@ -18,13 +18,19 @@
 // per-build-type budget.  It also reports the time until all K are Ready (the
 // read_committed availability after the failover) and the pass count.
 //
-// Budgets (named, per build type — the test binary may be built -O0):
-//   Release: kMaxPassReleaseUs — K x one 32 KiB step (~15-30 µs each on a dev box)
-//            plus the pass's own work, with headroom for a shared CI host;
-//   Debug:   kMaxPassDebugUs   — the same work unoptimised (~10x).
-// Pre-fix (one pass rebuilding K whole rings): hundreds of ms (Release), seconds
-// (Debug) — RED by an order of magnitude or more.  Best of kAttempts (a
-// scheduler preemption does not reproduce; a stall in the pass does).
+// E2 final fix wave (residual, ruled): the ring-rebuild budget is WORKER-WIDE —
+// at most kDefaultScanBytesPerPass (32 KiB) of rebuild per pass, shared
+// round-robin by every rebuilding partition — so the slowest pass with K
+// partitions stays near the single-partition figure (one 32 KiB step) instead
+// of K steps; the rebuild window grows K-fold instead (same total work).
+//
+// Budgets (named, per build type — the test binary may be built -O0), on the
+// p99 pass (the steady cost of the rebuild window) and the max pass (a stall):
+//   Release: kP99PassUs 100 / kMaxPassUs 1 000 — one ~25 µs step per pass;
+//   Debug:   kP99PassUs 250 / kMaxPassUs 2 000 — the same work unoptimised.
+// RED: per-partition budget (K steps per pass): p99 ~271 µs Release / ~704 µs
+// Debug; the original one-pass rebuild: 64.6 ms / 227 ms.  Best of kAttempts
+// (a scheduler preemption does not reproduce; a stall in the pass does).
 // Benchmark mode: RUNE_LATENCY_GATE_BENCH=1 prints, never fails.
 // ctest runs the binary RUN_SERIAL (a latency measurement must not share the host).
 #include <rune/metadata/ShardRouter.h>
@@ -64,9 +70,11 @@ constexpr std::size_t kRingB    = 8u << 20;           // RUNE_TRANSIENT_LOG_RING
 constexpr std::size_t kMaxBatch = 1'000'000;          // the ring's batch cap
 constexpr int         kAttempts = 3;
 #if defined(NDEBUG)
-constexpr int64_t kMaxPassUs = 2'000;    // kMaxPassReleaseUs
+constexpr int64_t kMaxPassUs = 1'000;    // Release
+constexpr int64_t kP99PassUs = 100;
 #else
-constexpr int64_t kMaxPassUs = 20'000;   // kMaxPassDebugUs
+constexpr int64_t kMaxPassUs = 2'000;    // Debug
+constexpr int64_t kP99PassUs = 250;
 #endif
 
 bool benchMode() {
@@ -183,20 +191,110 @@ Result runOnce() {
 TEST(TransientFailoverLatencyGateRegression, KTransientPartitionsBecomingLeaderNeverStallAWorkerPass) {
     Result best;
     best.maxPassUs = INT64_MAX;
+    best.p99PassUs = INT64_MAX;
     for (int a = 0; a < kAttempts; ++a) {
         const Result r = runOnce();
         ASSERT_TRUE(r.allReady) << "the K read_committed states never became Ready";
         std::printf("[transient failover gate] attempt %d: K=%d rings of %zu MiB: max pass %lld us, p99 pass "
-                    "%lld us, %d passes, all Ready after %lld us (budget %lld us)\n",
+                    "%lld us, %d passes, all Ready after %lld us (budget max %lld / p99 %lld us)\n",
                     a + 1, kK, kRingB >> 20, static_cast<long long>(r.maxPassUs),
                     static_cast<long long>(r.p99PassUs), r.passes, static_cast<long long>(r.allReadyUs),
-                    static_cast<long long>(kMaxPassUs));
-        if (r.maxPassUs < best.maxPassUs) best = r;
-        if (best.maxPassUs <= kMaxPassUs && !benchMode()) break;
+                    static_cast<long long>(kMaxPassUs), static_cast<long long>(kP99PassUs));
+        if (r.p99PassUs < best.p99PassUs || (r.p99PassUs == best.p99PassUs && r.maxPassUs < best.maxPassUs)) best = r;
+        if (best.maxPassUs <= kMaxPassUs && best.p99PassUs <= kP99PassUs && !benchMode()) break;
     }
     if (benchMode()) return;
+    EXPECT_LE(best.p99PassUs, kP99PassUs)
+        << "the p99 worker pass was " << best.p99PassUs << " us while K=" << kK
+        << " transient partitions rebuilt (a per-partition budget: K steps per pass)";
     EXPECT_LE(best.maxPassUs, kMaxPassUs)
         << "a worker pass stalled " << best.maxPassUs << " us while K=" << kK
         << " transient partitions rebuilt their read_committed state (one pass rebuilding whole rings)";
     EXPECT_GT(best.passes, kK) << "the K rebuilds were not spread over passes";
+}
+
+// ---------------------------------------------------------------------------
+// E2 final fix wave (residual): the worker-wide ring budget is SHARED FAIRLY.
+// K partitions rebuild at once (smaller 1 MiB rings: a functional check, not a
+// latency one).  Per pass: the ring-rebuild bytes of ALL partitions together
+// stay within one budget (+ one batch: a step always takes whole batches).
+// Per partition: it gets its first slice within K passes of the failover and,
+// while it rebuilds, never waits more than K passes for its next one; every
+// partition reaches Ready.  RED (a per-partition budget again): a pass rebuilt
+// ~K budgets.
+// ---------------------------------------------------------------------------
+TEST(TransientFailoverLatencyGateRegression, WorkerWideRingBudgetIsSharedFairlyRegression) {
+    constexpr int         K     = 10;
+    constexpr std::size_t kRing = 1u << 20;
+    std::vector<std::unique_ptr<rune::storage::InMemoryLog>> mems;
+    rune::replication::NullPartitionTransport transport;
+    rune::node::ReplicaRegistry reg;
+    WorkerPool pool{1, rune::metadata::ShardRouter(1)};
+    for (int p = 0; p < K; ++p) {
+        mems.push_back(std::make_unique<rune::storage::InMemoryLog>(kRing, kMaxBatch));
+        fillRing(*mems.back(), 1000 + 10 * p);
+        PartitionConfig c;
+        c.topicId = kTopic; c.partitionId = p; c.selfId = 1; c.minIsr = 1;
+        c.replicaLagMaxOffset = 1'000'000'000; c.replicaLagMaxMs = 600'000; c.followerFlushIntervalNs = 0;
+        auto r = std::make_unique<PartitionReplica>(c, Role::Follower, 1, std::vector<int32_t>{1, 2},
+                                                    std::vector<int32_t>{1, 2}, mems.back().get(), &transport);
+        r->setExternalFollowerFlush(true);
+        reg.add(kTopic, p, std::move(r));
+    }
+    pool.setRegistry(&reg);
+    Worker& w = pool.worker(0);
+    w.setWorkerIngress(nullptr, /*active=*/true);
+    w.setShardMode(true);
+    pool.assignFromRegistry(reg);
+    int64_t now = 1'000'000'000;
+    for (int i = 0; i < 8; ++i) { now += 1'000'000; (void)w.doWork(now); pool.drainAllReturns([](WorkerReturn) {}); }
+    for (int p = 0; p < K; ++p) {
+        WorkerOp op;
+        op.type = WorkerOp::Type::BecomeLeader;
+        op.topicId = kTopic; op.partition = p; op.roleEpoch = 2; op.isr = {1};
+        ASSERT_TRUE(pool.tryEnqueueOp(kTopic, p, std::move(op)));
+    }
+    constexpr uint64_t kBudget = rune::node::RcState::kDefaultScanBytesPerPass;
+    constexpr uint64_t kSlack  = 256;   // one minimum-size batch past the budget
+    std::vector<uint64_t> bytes(K, 0);
+    std::vector<int> firstPass(K, -1), lastPass(K, -1), maxGap(K, 0);
+    std::vector<bool> ready(K, false);
+    uint64_t maxPassBytes = 0;
+    int pass = 0;
+    for (; pass < 100'000; ++pass) {
+        now += 1'000;
+        (void)w.doWork(now);
+        pool.drainAllReturns([](WorkerReturn) {});
+        uint64_t passBytes = 0;
+        bool all = true;
+        for (int p = 0; p < K; ++p) {
+            const uint64_t b = w.rcScannedBytesForTest(kTopic, p);
+            if (b > bytes[static_cast<std::size_t>(p)]) {
+                passBytes += b - bytes[static_cast<std::size_t>(p)];
+                bytes[static_cast<std::size_t>(p)] = b;
+                if (firstPass[static_cast<std::size_t>(p)] < 0) firstPass[static_cast<std::size_t>(p)] = pass;
+                if (lastPass[static_cast<std::size_t>(p)] >= 0)
+                    maxGap[static_cast<std::size_t>(p)] =
+                        std::max(maxGap[static_cast<std::size_t>(p)], pass - lastPass[static_cast<std::size_t>(p)]);
+                lastPass[static_cast<std::size_t>(p)] = pass;
+            }
+            ready[static_cast<std::size_t>(p)] = w.rcStatusForTest(kTopic, p) == 2;
+            all = all && ready[static_cast<std::size_t>(p)];
+        }
+        maxPassBytes = std::max(maxPassBytes, passBytes);
+        if (all) break;
+    }
+    for (int p = 0; p < K; ++p) {
+        EXPECT_TRUE(ready[static_cast<std::size_t>(p)]) << "partition " << p << " never reached Ready (starved)";
+        EXPECT_GE(firstPass[static_cast<std::size_t>(p)], 0) << "partition " << p << " never got a slice";
+        EXPECT_LE(firstPass[static_cast<std::size_t>(p)], K) << "partition " << p << " waited "
+                                                             << firstPass[static_cast<std::size_t>(p)] << " passes for its first slice";
+        EXPECT_LE(maxGap[static_cast<std::size_t>(p)], K) << "partition " << p << " waited "
+                                                          << maxGap[static_cast<std::size_t>(p)] << " passes between slices";
+    }
+    EXPECT_LE(maxPassBytes, kBudget + kSlack)
+        << "one pass rebuilt " << maxPassBytes << " B across the partitions (the budget is " << kBudget
+        << " B per WORKER pass, not per partition)";
+    std::printf("[ring budget fairness] K=%d rings of %zu KiB: Ready after %d passes, max %llu B per pass\n", K,
+                kRing >> 10, pass + 1, static_cast<unsigned long long>(maxPassBytes));
 }

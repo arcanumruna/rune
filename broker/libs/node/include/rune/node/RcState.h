@@ -280,6 +280,13 @@ public:
     [[nodiscard]] bool scanning() const noexcept {
         return std::holds_alternative<Scanning>(st_) || std::holds_alternative<RingScanning>(st_);
     }
+    /// E2 final fix wave (residual): this MEMORY-BACKED state needs ring-rebuild
+    /// work on its next advance — it is RingScanning, or Unbuilt on a leader
+    /// (the advance begins the scan and takes its first step).  The worker
+    /// shares one per-pass budget across every partition for which this holds.
+    [[nodiscard]] bool needsRingWork(const RcFacts& f) const noexcept {
+        return std::holds_alternative<RingScanning>(st_) || (std::holds_alternative<Unbuilt>(st_) && f.leader);
+    }
     /// 0 Unbuilt, 1 Scanning (disk or ring), 2 Ready.
     [[nodiscard]] int statusCode() const noexcept { return scanning() ? 1 : ready() ? 2 : 0; }
 
