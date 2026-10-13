@@ -223,6 +223,13 @@ if(BUILD_TESTING)
                           rune_transaction spdlog::spdlog GTest::gtest_main)
     gtest_discover_tests(rune_gateway_transient_tests)
 
+    # Phase 2b E2: the transient interaction matrix (1008 TEST_P cells) — no Aeron.
+    add_executable(rune_gateway_transient_matrix_tests tests/gateway/TransientInteractionMatrixTest.cpp)
+    target_include_directories(rune_gateway_transient_matrix_tests PRIVATE ${CMAKE_SOURCE_DIR}/libs/node/tests)
+    target_link_libraries(rune_gateway_transient_matrix_tests PRIVATE rune_gateway rune_node rune_replication
+                          rune_storage rune_transaction spdlog::spdlog GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_transient_matrix_tests DISCOVERY_TIMEOUT 120)
+
     # D4: a follower redirects group / txn coordinator requests to the leader — no Aeron.
     add_executable(rune_gateway_coordinator_redirect_tests tests/gateway/CoordinatorRedirectTest.cpp)
     target_link_libraries(rune_gateway_coordinator_redirect_tests PRIVATE rune_gateway spdlog::spdlog GTest::gtest_main)
