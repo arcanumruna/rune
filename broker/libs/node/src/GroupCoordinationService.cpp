@@ -470,7 +470,7 @@ size_t GroupCoordinationService::handleSyncGroup(
     // member's push subscriptions at SyncGroup.  With distributed partition
     // leadership a partition's records come from its LEADER node; the member
     // subscribes there explicitly (after its OffsetFetch answer, from the
-    // committed offset or its reset policy).  A coordinator-created
+    // committed offset, or the log start when there is none).  A coordinator-created
     // subscription pushed from the SyncGroup moment, before the member knew its
     // position — those records were dropped and the subscription's cursor ran
     // ahead of the member (stalled / lost partitions).  The eager revoke at
@@ -716,7 +716,7 @@ bool GroupCoordinationService::staleLineage_(const rune::coordination::Committed
     if ((staleLineageOffsets_++ & 1023u) == 0)
         spdlog::info("GroupCoordinationService: committed offset {} of transient topicId={} partition={} "
                      "belongs to data that did not survive (lineage {:#x}, now {:#x}) — answered as no "
-                     "committed offset; the member applies its reset policy ({} so far)",
+                     "committed offset; the member starts at the log start ({} so far)",
                      co.offset, topicId, partition, co.lineage, now, staleLineageOffsets_);
     return true;
 }

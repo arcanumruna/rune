@@ -181,7 +181,8 @@ before a produce is acknowledged but is **never written to disk**.
     single-node broker restarts, and at the partition's first leadership. A leader move that keeps
     the data keeps the lineage: a failover, a controlled shutdown, a rolling restart. After a new
     lineage starts, an offset committed before it is answered as "no committed offset", so the
-    group starts at its reset policy and reads every refilled record. For a moment after a restart
+    group starts that partition at its log start (the oldest record the ring still holds, whatever
+    the consumer's reset setting) and reads every refilled record. For a moment after a restart
     or a leader move, until the new leadership has confirmed the lineage, OffsetFetch and
     OffsetCommit for that partition answer `NotLeader`. The client retries this automatically.
   - **Subscriptions follow a leader move.** When a node stops serving a subscription (it lost

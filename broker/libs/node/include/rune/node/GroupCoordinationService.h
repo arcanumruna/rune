@@ -124,8 +124,8 @@ public:
     // non-zero token that changes exactly when the partition's ring data did not
     // survive (a restart) — or 0 when unknown / not transient (no stamp, no
     // check: the historical behaviour).  OffsetCommit stamps each entry with it;
-    // OffsetFetch answers "no committed offset" (-1 — the member applies its
-    // reset policy) for an entry whose stamp differs from the current lineage,
+    // OffsetFetch answers "no committed offset" (-1 — the member starts at the
+    // partition's log start, never Latest) for an entry whose stamp differs from the current lineage,
     // so a member never resumes a refilled ring at a position of the old data
     // (silent loss of the first records after a restart).  A plain function
     // pointer + context (no allocation, no std::function on the commit path).
