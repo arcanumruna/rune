@@ -2581,3 +2581,78 @@ TEST(D15MemoryEpochRegression, UnmarkedLegacyLeaderlessRecordDecidedAsOnMainRegr
     EXPECT_NE(f.pa().leaderNode, NO_LEADER) << "the balancer did not decide the legacy leaderless partition";
     EXPECT_EQ(f.pa().leaderEpoch, lle + 1);
 }
+
+// ===========================================================================
+// E2 final fix wave (C1 multi-node, USER DECISION option b): the controller
+// commits a TRANSIENT partition's data lineage per leadership.  A leader's
+// report is answered kAlterIsrLineageConfirmed only once the record is
+// COMMITTED (re-sends until then); the lineage is MINTED for an unborn ring,
+// KEPT across a handover whose new leader fetched from the confirmed
+// leadership, MINTED again after a full restart; a report of a superseded
+// leadership is fenced.  RED: the report was never committed / answered.
+// ===========================================================================
+namespace {
+rune::replication::AlterIsrMsg lineageReport(const PartitionAssignment& a, int32_t src) {
+    rune::replication::AlterIsrMsg m{};
+    m.topicId = 0; m.partition = 0; m.leaderId = a.leaderNode; m.leaderEpoch = a.leaderEpoch;
+    m.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump;
+    m.partitionEpoch = a.partitionEpoch;
+    m.isr[1] = rune::replication::AlterIsrMsg::kLineageReport;
+    m.isr[2] = src;
+    return m;
+}
+int16_t answer(MetadataService& svc, const rune::replication::AlterIsrMsg& m) {
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answered = false;
+    (void)svc.onAlterIsr(m, &resp, &answered);
+    return answered ? resp.errorCode : int16_t{-1};
+}
+}  // namespace
+
+TEST(TransientLineageControllerRegression, LineageIsMintedKeptAndReMintedPerLeadershipRegression) {
+    CtlRig c;
+    const auto first = c.pa();
+    // Unborn ring (first leadership): not answered until committed, then confirmed.
+    EXPECT_EQ(answer(*c.svc, lineageReport(first, -1)), -1) << "confirmed before the record committed";
+    c.drive(50);
+    EXPECT_EQ(answer(*c.svc, lineageReport(first, -1)), rune::replication::kAlterIsrLineageConfirmed);
+    const auto* l1 = c.svc->transientLineage(0, 0);
+    ASSERT_NE(l1, nullptr) << "no lineage committed";
+    const uint64_t token1 = l1->lineage;
+    EXPECT_NE(token1, 0u);
+    EXPECT_EQ(l1->mintEpoch, first.leaderEpoch);
+    EXPECT_EQ(l1->confirmedEpoch, first.leaderEpoch);
+    EXPECT_EQ(l1->confirmedLeader, first.leaderNode);
+    EXPECT_EQ(c.svc->lineagesMintedForTest(), 1u);
+
+    // Handover (the old leader asks for a new epoch; another ISR member leads):
+    // the new leader fetched from the confirmed leadership -> KEPT.
+    (void)c.svc->onAlterIsr(c.bump());
+    c.tick();
+    const auto second = c.pa();
+    ASSERT_NE(second.leaderNode, first.leaderNode);
+    EXPECT_EQ(answer(*c.svc, lineageReport(first, -1)), rune::replication::kAlterIsrFencedLeaderEpoch)
+        << "a superseded leadership's report was not fenced";
+    (void)answer(*c.svc, lineageReport(second, first.leaderEpoch));
+    c.drive(50);
+    EXPECT_EQ(answer(*c.svc, lineageReport(second, first.leaderEpoch)), rune::replication::kAlterIsrLineageConfirmed);
+    const auto* l2 = c.svc->transientLineage(0, 0);
+    ASSERT_NE(l2, nullptr);
+    EXPECT_EQ(l2->lineage, token1) << "a handover that kept the data minted a new lineage (false 'none')";
+    EXPECT_EQ(l2->confirmedEpoch, second.leaderEpoch);
+    EXPECT_EQ(l2->mintEpoch, first.leaderEpoch);
+    EXPECT_EQ(c.svc->lineagesKeptForTest(), 1u);
+
+    // Full restart (every ring unborn): the next leadership re-mints.
+    (void)c.svc->onAlterIsr(c.bump());
+    c.tick();
+    const auto third = c.pa();
+    (void)answer(*c.svc, lineageReport(third, -1));
+    c.drive(50);
+    EXPECT_EQ(answer(*c.svc, lineageReport(third, -1)), rune::replication::kAlterIsrLineageConfirmed);
+    const auto* l3 = c.svc->transientLineage(0, 0);
+    ASSERT_NE(l3, nullptr);
+    EXPECT_NE(l3->lineage, token1) << "a leadership with an unborn ring kept the old lineage (offsets resumed into new data)";
+    EXPECT_EQ(l3->mintEpoch, third.leaderEpoch);
+    EXPECT_EQ(c.svc->lineagesMintedForTest(), 2u);
+}

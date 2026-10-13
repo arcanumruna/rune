@@ -373,6 +373,13 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
     }
     staleLead_.pending = false;
     report_.pending    = false;
+    // E2 final fix wave (C1 multi-node): a TRANSIENT leader reports, for this
+    // leadership, the leader epoch its ring's data came from (-1: unborn) — the
+    // controller keeps or mints the partition's data lineage and commits it.
+    if (memoryBacked_ && isrChannel_ != nullptr && cfg_.topicId >= 0 && newEpoch != lineageReport_.epoch) {
+        lineageReport_   = LineageReport{true, newEpoch, lineageSrcEpoch_, false, 0};
+        lineageSrcEpoch_ = newEpoch;   // the data from now on is this leadership's
+    }
 
     // NB1 fix: capture committed offset BEFORE flipping role or mutating state.
     // highWatermark() still returns the OLD role's view here:
@@ -1268,6 +1275,9 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     // epoch adoption here — once we follow that epoch, our fetch (validated by
     // its leader) brings the data.
     if (resp.leaderEpoch > epoch_) return;
+    // E2 final fix wave (C1 multi-node): this ring now follows the current
+    // leadership's data lineage (reported if it is ever promoted).
+    if (memoryBacked_ && role_ == Role::Follower) lineageSrcEpoch_ = epoch_;
 
     // Adaptive fetch cadence bookkeeping: we have now heard from the current (or a
     // newer) leader.  Record its advertised HW BEFORE any gap/truncate handling, so a
@@ -2362,6 +2372,7 @@ int PartitionReplica::doWork(int64_t nowNs)
     // Leader-epoch restart fence: a refused leadership asks for a new epoch.
     if (staleLead_.pending) [[unlikely]] work += requestLeaderEpochBump_(nowNs);
     if (report_.pending) [[unlikely]] work += sendLeaderlessReport_(nowNs);
+    if (lineageReport_.pending) [[unlikely]] work += sendLineageReport_(nowNs);
 
     if (role_ == Role::Leader) {
         // DR-BUG-6: reset the follower-lag TIME clock on the first tick after
@@ -2732,6 +2743,18 @@ void PartitionReplica::applyCommittedIsr_(std::vector<NodeId> isr, int32_t parti
 
 void PartitionReplica::onAlterIsrResponse(const AlterIsrResponseMsg& r)
 {
+    // C1 multi-node: the controller committed our lineage report (or we no
+    // longer lead at that epoch).  A FencedLeaderEpoch may also concern an ISR
+    // proposal of the same leadership: fall through to it.
+    if (lineageReport_.pending && r.leaderId == cfg_.selfId && r.leaderEpoch == lineageReport_.epoch &&
+        r.topicId == cfg_.topicId && r.partition == cfg_.partitionId) {
+        if (r.errorCode == kAlterIsrLineageConfirmed) {
+            lineageReport_.pending = false;
+            ++lineageConfirmed_;
+            return;
+        }
+        if (r.errorCode == kAlterIsrFencedLeaderEpoch) lineageReport_.pending = false;
+    }
     // N1/N2: the controller recorded our leaderless-partition report.
     if (report_.pending && role_ == Role::Follower && r.leaderId == cfg_.selfId &&
         r.leaderEpoch == report_.epoch) {
@@ -3204,6 +3227,29 @@ int32_t PartitionReplica::bumpFlags_() const noexcept
 {
     return (memoryBacked_ ? AlterIsrMsg::kBumpMemoryBacked : 0) |
            (logDirOffline_ ? AlterIsrMsg::kBumpLogDirFailed : 0);
+}
+
+int PartitionReplica::sendLineageReport_(int64_t nowNs)
+{
+    if (isrChannel_ == nullptr || role_ != Role::Leader || epoch_ != lineageReport_.epoch) {
+        lineageReport_.pending = false;   // not this leadership any more: its successor reports
+        return 0;
+    }
+    // Re-sent on the AlterIsr cadence until the controller confirms it committed.
+    if (lineageReport_.sent && nowNs - lineageReport_.sentNs < kAlterIsrResendNs) return 0;
+    lineageReport_.sent   = true;
+    lineageReport_.sentNs = nowNs;
+    AlterIsrMsg m{};
+    m.topicId        = cfg_.topicId;
+    m.partition      = cfg_.partitionId;
+    m.leaderId       = cfg_.selfId;
+    m.leaderEpoch    = lineageReport_.epoch;
+    m.isrCount       = AlterIsrMsg::kLeaderEpochBump;
+    m.partitionEpoch = committedPartitionEpoch_;
+    m.isr[1] = AlterIsrMsg::kLineageReport;
+    m.isr[2] = static_cast<int32_t>(lineageReport_.src);
+    if (!isrChannel_->sendAlterIsr(m)) ++sendRefusals_;
+    return 1;
 }
 
 int PartitionReplica::sendLeaderlessReport_(int64_t nowNs)

@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace rune::metadata {
@@ -124,6 +125,16 @@ public:
     //    record yet (a log written by pre-D15 binaries). ─────────────────────
     [[nodiscard]] int16_t featureLevel() const noexcept { return featureLevel_; }
 
+    // ── E2 final fix wave (C1 multi-node): the committed data lineage of a
+    //    TRANSIENT partition (TransientLineageRecord), nullptr when none was
+    //    committed.  A record that would move confirmedEpoch BACK is ignored
+    //    (a re-emitted stale decision). ─────────────────────────────────────
+    [[nodiscard]] const TransientLineage* lineage(int32_t topicId, int32_t partition) const noexcept {
+        const auto it = lineages_.find(lineageKey_(topicId, partition));
+        return it == lineages_.end() ? nullptr : &it->second;
+    }
+    [[nodiscard]] uint64_t lineageVersion() const noexcept { return lineageVersion_; }
+
 private:
     // Committed assignments (pos <= committedPos)
     AssignmentMap committed_;
@@ -141,6 +152,15 @@ private:
     /// D15: uncommitted FeatureLevelRecords (pos, level).
     std::vector<std::pair<int64_t, int16_t>> pendingFeature_;
     int16_t featureLevel_ = 0;
+    /// C1 multi-node: committed lineages + uncommitted records (pos, key, lineage).
+    static int64_t lineageKey_(int32_t t, int32_t p) noexcept {
+        return (static_cast<int64_t>(t) << 32) | static_cast<int64_t>(static_cast<uint32_t>(p));
+    }
+    std::unordered_map<int64_t, TransientLineage> lineages_;
+    struct PendingLineage { int64_t pos; int64_t key; TransientLineage l; };
+    std::vector<PendingLineage> pendingLineage_;
+    uint64_t lineageVersion_ = 0;
+    void installLineage_(int64_t key, const TransientLineage& l);
 
     int64_t committedPos_ = -1;
 
@@ -173,6 +193,8 @@ private:
 //     int32 replicaCount
 //     int32 replicas[0..replicaCount-1]
 //
+// E2 final fix wave (C1): nor the committed TransientLineage records (type
+// 0x8002) — the same gap, closed with the same image bump.
 // D15b m4 (documented gap, no production caller today): this image does NOT
 // carry the D15 replicated state — the committed featureLevel() (a
 // FeatureLevelRecord, type 0x8001) and each leaderless assignment's
@@ -212,6 +234,9 @@ void MetadataStateMachine::restore(Reader& r)
     // Full reset — pending discarded, committed cleared
     committed_.clear();
     pending_.clear();
+    lineages_.clear();          // not in the image (documented gap above)
+    pendingLineage_.clear();
+    ++lineageVersion_;
     ++committedVersion_;
 
     committedPos_ = r.readInt64();

@@ -712,7 +712,7 @@ bool GroupCoordinationService::staleLineage_(const rune::coordination::Committed
                                              int32_t partition)
 {
     const uint64_t now = lineageOf_(topicId, partition);
-    if (now == 0 || co.lineage == now) return false;   // unknown / not transient, or the same lineage
+    if (now == 0 || now == kLineagePending || co.lineage == now) return false;   // not transient / pending / same
     if ((staleLineageOffsets_++ & 1023u) == 0)
         spdlog::info("GroupCoordinationService: committed offset {} of transient topicId={} partition={} "
                      "belongs to data that did not survive (lineage {:#x}, now {:#x}) — answered as no "
@@ -820,8 +820,16 @@ size_t GroupCoordinationService::handleOffsetCommit(
         const std::string_view meta(
             reinterpret_cast<const char*>(e.metadata.data()), e.metadata.size());
 
-        const bool committed = offsets_->commit(groupIdStr, tp, e.offset, meta, nowNs,
-                                                lineageOf_(e.topicId, e.partition));   // C1
+        const uint64_t lineage = lineageOf_(e.topicId, e.partition);   // C1
+        if (lineage == kLineagePending) [[unlikely]] {
+            // The partition's current leadership has not confirmed its data
+            // lineage yet: no stamp could be right — refused retriably.
+            ++pendingLineageAnswers_;
+            r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            commitResultScratch_.push_back(r);
+            continue;
+        }
+        const bool committed = offsets_->commit(groupIdStr, tp, e.offset, meta, nowNs, lineage);
         r.errorCode = committed ? static_cast<int16_t>(pc::ErrorCode::OK)
                                 : static_cast<int16_t>(pc::ErrorCode::MinIsrViolation);
         commitResultScratch_.push_back(r);
@@ -916,13 +924,19 @@ size_t GroupCoordinationService::handleOffsetFetch(
                 if (opt) topicId = *opt;
             }
             if (topicId < 0) continue; // unknown topic — skip
-            if (staleLineage_(co, topicId, tp.partition)) continue;   // C1: as if never committed
+            const uint64_t lineage = lineageOf_(topicId, tp.partition);   // C1
+            if (lineage != kLineagePending && staleLineage_(co, topicId, tp.partition)) continue;   // as if never committed
 
             pc::OffsetFetchResult r;
             r.topicId   = topicId;
             r.partition = tp.partition;
             r.offset    = co.offset;
             r.errorCode = static_cast<int16_t>(pc::ErrorCode::OK);
+            if (lineage == kLineagePending) [[unlikely]] {   // not answerable yet: retriable
+                ++pendingLineageAnswers_;
+                r.offset    = -1;
+                r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            }
             fetchResultScratch_.push_back(r);
         }
     } else {
@@ -948,9 +962,17 @@ size_t GroupCoordinationService::handleOffsetFetch(
                 r.offset = -1; // no-offset sentinel
             } else {
                 const coord::TopicPartition tp{topicName, e.partition};
-                const auto co = offsets_->fetch(groupIdStr, tp);
-                r.offset = co.has_value() && !staleLineage_(*co, e.topicId, e.partition) ? co->offset
-                                                                                         : int64_t{-1};
+                if (lineageOf_(e.topicId, e.partition) == kLineagePending) [[unlikely]] {
+                    // C1: the current leadership has not confirmed the lineage
+                    // yet — neither the offset nor "none" can be answered.
+                    ++pendingLineageAnswers_;
+                    r.offset    = -1;
+                    r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+                } else {
+                    const auto co = offsets_->fetch(groupIdStr, tp);
+                    r.offset = co.has_value() && !staleLineage_(*co, e.topicId, e.partition) ? co->offset
+                                                                                             : int64_t{-1};
+                }
             }
             fetchResultScratch_.push_back(r);
         }

@@ -8,6 +8,8 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/GroupMessages.h>
+#include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/MessageHeader.h>
 #include <rune/protocol/client/MetadataMessages.h>
 #include <rune/protocol/client/Protocol.h>
@@ -21,6 +23,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <future>
@@ -137,7 +140,7 @@ public:
         pc::ConnectRequest req;
         req.correlationId  = ++corr_;
         req.egressStreamId = kEgressStream;
-        req.clientVersion  = 1;
+        req.clientVersion  = clientVersion_;
         req.egressChannel  = egressChannel_;
         std::vector<uint8_t> buf(pc::MessageHeader::ENCODED_SIZE + pc::ConnectRequest::BODY_FIXED + 2 +
                                  req.egressChannel.size());
@@ -290,6 +293,69 @@ public:
     }
 
     int64_t nextCorrelationId() noexcept { return ++corr_; }
+
+    // ── E2 final fix wave (C1 multi-node): consumer-group frames ──────────────
+    /// The ConnectRequest clientVersion of later connects (group frames need >= 3).
+    void setClientVersion(int32_t v) noexcept { clientVersion_ = v; }
+    struct JoinAnswer { int16_t errorCode = -1; std::string memberId; int32_t generation = -1; };
+    std::optional<JoinAnswer> joinGroup(const std::string& gw, int32_t stream, int64_t sid, std::string_view group) {
+        pc::JoinGroup m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.sessionTimeoutMs = 30'000;
+        m.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+        m.memberId = {};
+        std::vector<uint8_t> buf(512);
+        const std::size_t len = m.encode(buf.data(), std::span<const int32_t>());
+        const int64_t c = m.correlationId;
+        if (!send(gw, stream, buf.data(), len)) return std::nullopt;
+        for (int i = 0; i < kMaxIters; ++i) {
+            poll_();
+            if (auto it = joins_.find(c); it != joins_.end()) return it->second;
+            pause_();
+        }
+        return std::nullopt;
+    }
+    /// OffsetCommit of one (topic, partition) entry: its result code (nullopt: no answer).
+    std::optional<int16_t> offsetCommit(const std::string& gw, int32_t stream, int64_t sid, std::string_view group,
+                                        const std::string& member, int32_t generation, int32_t topicId,
+                                        int32_t partition, int64_t offset) {
+        pc::OffsetCommit m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.generationId = generation;
+        m.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+        m.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(member.data()), member.size());
+        pc::OffsetCommitEntry e;
+        e.topicId = topicId; e.partition = partition; e.offset = offset; e.metadata = {};
+        std::array<pc::OffsetCommitEntry, 1> es{e};
+        std::vector<uint8_t> buf(1024);
+        const std::size_t len = m.encode(buf.data(), std::span<const pc::OffsetCommitEntry>(es));
+        const int64_t c = m.correlationId;
+        if (!send(gw, stream, buf.data(), len)) return std::nullopt;
+        for (int i = 0; i < kMaxIters; ++i) {
+            poll_();
+            if (auto it = commits_.find(c); it != commits_.end()) return it->second;
+            pause_();
+        }
+        return std::nullopt;
+    }
+    /// OffsetFetch of one entry: (offset, errorCode) (nullopt: no answer).
+    std::optional<std::pair<int64_t, int16_t>> offsetFetch(const std::string& gw, int32_t stream, int64_t sid,
+                                                           std::string_view group, int32_t topicId, int32_t partition) {
+        pc::OffsetFetch m;
+        m.sessionId = sid; m.correlationId = ++corr_;
+        m.groupId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+        pc::OffsetFetchEntry e;
+        e.topicId = topicId; e.partition = partition;
+        std::array<pc::OffsetFetchEntry, 1> es{e};
+        std::vector<uint8_t> buf(512);
+        const std::size_t len = m.encode(buf.data(), std::span<const pc::OffsetFetchEntry>(es));
+        const int64_t c = m.correlationId;
+        if (!send(gw, stream, buf.data(), len)) return std::nullopt;
+        for (int i = 0; i < kMaxIters; ++i) {
+            poll_();
+            if (auto it = fetches_.find(c); it != fetches_.end()) return it->second;
+            pause_();
+        }
+        return std::nullopt;
+    }
     /// Invoker mode: one duty cycle of this client's driver + conductor WITHOUT reading the egress (a client that
     /// pumps its Aeron runtime — status messages flow — but does not consume its acks).  No-op when threaded.
     void pumpWithoutReading() { pump_(); }
@@ -575,6 +641,21 @@ private:
                     records_.push_back({r->subscriptionId, r->baseOffset,
                                         {r->recordBatch.begin(), r->recordBatch.end()}});
                 break;
+            case pc::TemplateId::JoinGroupResponse:
+                if (auto r = pc::JoinGroupResponse::decode(p, n))
+                    joins_[r->correlationId] = JoinAnswer{
+                        r->errorCode, std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size()),
+                        r->generationId};
+                break;
+            case pc::TemplateId::OffsetCommitResponse:
+                if (auto r = pc::OffsetCommitResponse::decode(p, n))
+                    commits_[r->correlationId] = r->results.empty() ? int16_t{-1} : r->results[0].errorCode;
+                break;
+            case pc::TemplateId::OffsetFetchResponse:
+                if (auto r = pc::OffsetFetchResponse::decode(p, n))
+                    if (!r->results.empty())
+                        fetches_[r->correlationId] = {r->results[0].offset, r->results[0].errorCode};
+                break;
             case pc::TemplateId::ErrorResponse:
                 if (auto e = pc::ErrorResponse::decode(p, n))
                     errors_.push_back({e->correlationId, e->code, std::string(e->message)});
@@ -612,6 +693,10 @@ private:
     std::map<int64_t, pc::AlterTopicResponse>       alters_;
     std::map<int64_t, SchemaAnswer>                 schemas_;
     std::map<int64_t, int16_t>                      subscribes_;   // SubscribeResponse errorCode by corr
+    int32_t                                         clientVersion_ = 1;
+    std::map<int64_t, JoinAnswer>                   joins_;
+    std::map<int64_t, int16_t>                      commits_;
+    std::map<int64_t, std::pair<int64_t, int16_t>>  fetches_;
     std::optional<std::vector<PartitionInfo>>       metadata_;
     std::vector<PushedRecords>                      records_;
     std::vector<ErrorSeen>                          errors_;

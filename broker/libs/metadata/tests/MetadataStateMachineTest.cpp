@@ -1117,3 +1117,95 @@ TEST(MetadataStateMachineRegression, D15ExtensionIdsOutsideProtocolSpaceRegressi
         EXPECT_EQ(pa->mark.kind, LeaderlessMark::Kind::None) << "a v1 record's fields were read as a D15 trailer";
     }
 }
+
+// ===========================================================================
+// E2 final fix wave (C1 multi-node, USER DECISION option b): a TRANSIENT
+// partition's data lineage — the TransientLineageRecord (type 0x8002) and the
+// controller's mint / keep / reset decision.
+// ===========================================================================
+namespace {
+std::size_t encodeLineage(uint8_t* buf, int32_t t, int32_t p, uint64_t token, int32_t mint, int32_t conf,
+                          int32_t leader, int64_t inc = 0) {
+    TransientLineageRecord r;
+    r.topicId = t; r.partition = p;
+    r.l.lineage = token; r.l.mintEpoch = mint; r.l.confirmedEpoch = conf; r.l.confirmedLeader = leader;
+    r.l.incarnation = inc;
+    return r.encode(buf, 64);
+}
+}  // namespace
+
+// The record commits only at its commit point, a revert drops it, a stale one
+// (an older confirmedEpoch) never moves the lineage back, and an older MSM's
+// decoder sees an unknown type (skipped).  RED: the lineage was never stored.
+TEST(MetadataStateMachineRegression, TransientLineageRecordCommitsAndNeverRegressesRegression) {
+    MetadataStateMachine msm;
+    uint8_t b[64];
+    std::size_t n = encodeLineage(b, 3, 0, 0xAAAA, 5, 5, 2);
+    const auto t = peekRecordType(b, n);
+    ASSERT_TRUE(t.has_value());
+    EXPECT_NE(*t, MetadataRecordType::UpdatePartitionAssignment) << "an older MSM must skip it";
+    msm.apply(b, n, 0);
+    EXPECT_EQ(msm.lineage(3, 0), nullptr) << "an uncommitted lineage is visible";
+    msm.revert(-1);
+    msm.commit(0);
+    EXPECT_EQ(msm.lineage(3, 0), nullptr) << "a reverted lineage took effect";
+    msm.apply(b, n, 1);
+    msm.commit(1);
+    ASSERT_NE(msm.lineage(3, 0), nullptr);
+    EXPECT_EQ(msm.lineage(3, 0)->lineage, 0xAAAAu);
+    EXPECT_EQ(msm.lineage(3, 0)->confirmedEpoch, 5);
+    n = encodeLineage(b, 3, 0, 0xAAAA, 5, 7, 1);   // kept across a handover to node 1 at epoch 7
+    msm.apply(b, n, 2);
+    msm.commit(2);
+    EXPECT_EQ(msm.lineage(3, 0)->confirmedEpoch, 7);
+    EXPECT_EQ(msm.lineage(3, 0)->confirmedLeader, 1);
+    n = encodeLineage(b, 3, 0, 0xBBBB, 6, 6, 2);   // a stale decision (epoch 6 < 7)
+    msm.apply(b, n, 3);
+    msm.commit(3);
+    EXPECT_EQ(msm.lineage(3, 0)->lineage, 0xAAAAu) << "a stale lineage decision moved the lineage back";
+    EXPECT_EQ(msm.lineage(3, 0)->confirmedEpoch, 7);
+}
+
+// The decision, case by case (pins which situations mint a NEW lineage):
+//   first-ever leadership (no record)             -> MINT
+//   full-cluster restart (leader's ring unborn)   -> MINT
+//   ISR handover / follower promotion (the new
+//     leader fetched from a confirmed leadership) -> KEEP (rolling restart too)
+//   promotion of a follower that fetched from a
+//     leadership that never confirmed             -> MINT (it may have minted)
+//   a replica whose data predates the lineage     -> MINT (unclean / edge)
+//   single node, same process (src = confirmed)   -> KEEP; new process (-1) -> MINT
+// RED: any case deciding the other way.
+TEST(MetadataStateMachineRegression, TransientLineageMintKeepResetDecisionsRegression) {
+    TransientLineage rec;
+    rec.lineage = 0xAAAA; rec.mintEpoch = 4; rec.confirmedEpoch = 6; rec.confirmedLeader = 2;
+    auto d = [&](const TransientLineage* r, int32_t src) { return decideTransientLineage(r, 1, 7, src, 0xCCCC); };
+    EXPECT_EQ(d(nullptr, -1).lineage, 0xCCCCu) << "first-ever leadership";
+    EXPECT_EQ(d(nullptr, -1).mintEpoch, 7);
+    EXPECT_EQ(d(&rec, -1).lineage, 0xCCCCu) << "full-cluster restart: the new leader's ring is unborn";
+    EXPECT_EQ(d(&rec, 6).lineage, 0xAAAAu) << "ISR handover from the confirmed leadership";
+    EXPECT_EQ(d(&rec, 6).mintEpoch, 4) << "a kept lineage keeps its mint epoch";
+    EXPECT_EQ(d(&rec, 5).lineage, 0xAAAAu) << "a follower of an earlier leadership of the same lineage";
+    EXPECT_EQ(d(&rec, 4).lineage, 0xAAAAu) << "a follower of the minting leadership";
+    EXPECT_EQ(d(&rec, 7).lineage, 0xCCCCu) << "data of a leadership that never confirmed (it may have minted)";
+    EXPECT_EQ(d(&rec, 3).lineage, 0xCCCCu) << "data older than the lineage (an unclean / edge election)";
+    const auto out = d(&rec, 6);
+    EXPECT_EQ(out.confirmedEpoch, 7);
+    EXPECT_EQ(out.confirmedLeader, 1);
+
+    // Trust: only for exactly the confirmed leadership (and, single node, process).
+    PartitionAssignment pa;
+    pa.leaderNode = 2; pa.leaderEpoch = 6; pa.partitionEpoch = 6;
+    EXPECT_TRUE(lineageConfirmedFor(&rec, &pa, 0));
+    pa.leaderEpoch = 7;
+    EXPECT_FALSE(lineageConfirmedFor(&rec, &pa, 0)) << "a newer leadership must confirm the lineage first";
+    pa.leaderEpoch = 6; pa.leaderNode = 1;
+    EXPECT_FALSE(lineageConfirmedFor(&rec, &pa, 0)) << "another leader at the same epoch";
+    pa.leaderNode = NO_LEADER;
+    EXPECT_FALSE(lineageConfirmedFor(&rec, &pa, 0)) << "leaderless";
+    pa.leaderNode = 2;
+    rec.incarnation = 77;
+    EXPECT_TRUE(lineageConfirmedFor(&rec, &pa, 77));
+    EXPECT_FALSE(lineageConfirmedFor(&rec, &pa, 78)) << "single node: confirmed by an earlier process";
+    EXPECT_FALSE(lineageConfirmedFor(nullptr, &pa, 0));
+}

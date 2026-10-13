@@ -34,7 +34,9 @@
 #        (c) no record was delivered twice.
 #      Exit 0 + "TRANSIENT-FAILOVER-E2E: OK".
 #
-# Variants (both by default; FAILOVER_VARIANTS selects): each on a fresh cluster.
+# Variants (all by default; FAILOVER_VARIANTS selects): each on a fresh cluster.
+# full-restart-group (E2 final fix wave C1): a consumer group commits, every node
+# restarts, the group must deliver every refilled record exactly once.
 # The partition leader is deterministic (StaticBalancer: node 2 = rune-3):
 #   seed-follows-redirect  the probe's seed is rune-1: its Subscribe is
 #                          redirected to rune-3 and the seed session follows;
@@ -293,13 +295,80 @@ run_variant() {
     teardown
 }
 
+# ---------------------------------------------------------------------------
+# Variant full-restart-group (E2 final fix wave C1 multi-node, option b):
+# GroupConsume x FULL 3-node restart, asserted where the client sees it.  A
+# consumer group commits presence_failover's end (20) on a fresh cluster; every
+# node restarts (the transient ring is lost everywhere; metadata survives); the
+# SAME group must then deliver every refilled record exactly once — its old
+# committed offset belongs to data that did not survive (a new lineage is
+# minted) and must never be resumed (exit 155 = the silent loss).
+# ---------------------------------------------------------------------------
+leader_lines() { dc logs --no-log-prefix rune-1 rune-2 rune-3 2>/dev/null | grep -cE 'node [0-9]+ is LEADER' || true; }
+run_group_probe() {
+    local mode="$1"; shift
+    docker rm -f "${PROBE_NAME}" >/dev/null 2>&1 || true
+    docker run --rm \
+        --name "${PROBE_NAME}" --hostname "${PROBE_NAME}" --network "${BROKER_NETWORK}" \
+        --platform linux/amd64 --shm-size=256m --security-opt seccomp=unconfined \
+        -e RUNE_MODE="${mode}" -e RUNE_GROUP_TOPIC=presence_failover -e RUNE_VIEW_TT_TOPIC_ID="${TOPIC_ID}" \
+        -e RUNE_TARGET="aeron:udp?endpoint=rune-1:40200" -e RUNE_TARGET_STREAM=1 \
+        -e RUNE_EGRESS="aeron:udp?endpoint=${PROBE_NAME}:${PROBE_EGRESS_PORT}" -e RUNE_EGRESS_STREAM=2 \
+        -e RUNE_DATA_DIR="/tmp/rune_tt_group" \
+        -e RUNE_TIMEOUT_MS="${PROBE_TIMEOUT_MS}" -e RUNE_WAIT_BOUND_MS="${WAIT_BOUND_MS}" \
+        "$@" "${CLIENT_IMAGE}" 2>&1
+}
+run_full_restart_group() {
+    local label="full-restart-group"
+    VARIANT="${label}"
+    log "======== variant ${label} (GroupConsume x full 3-node restart) ========"
+    dc up -d rune-1 rune-2 rune-3
+    local deadline n0
+    deadline=$(( $(date +%s) + LEADER_WAIT_S ))
+    until [ "$(leader_lines)" -ge 1 ]; do
+        [ "$(date +%s)" -lt "${deadline}" ] || fail "[${label}] no consensus leader within ${LEADER_WAIT_S}s"
+        sleep 2
+    done
+    log "Step G1: a group commits presence_failover's end (20 records produced first)..."
+    local out rc
+    set +e
+    out="$(run_group_probe group_commit -e RUNE_GROUP_PRODUCE=20 -e RUNE_VIEW_TT_END=20)"; rc=$?
+    set -e
+    echo "${out}" >&2
+    [ "${rc}" -eq 0 ] || fail "[${label}] group_commit exited ${rc}"
+    echo "${out}" | grep -q "^GROUP-COMMIT: OK committed=20" || fail "[${label}] the group did not commit 20"
+    log "Step G2: FULL restart of every node (transient data lost everywhere; metadata survives)..."
+    n0="$(leader_lines)"
+    dc stop -t "${STOP_TIMEOUT_S}" rune-1 rune-2 rune-3
+    dc start rune-1 rune-2 rune-3
+    deadline=$(( $(date +%s) + LEADER_WAIT_S ))
+    until [ "$(leader_lines)" -gt "${n0}" ]; do
+        [ "$(date +%s)" -lt "${deadline}" ] || fail "[${label}] no fresh consensus leader after the restart"
+        sleep 2
+    done
+    log "Step G3: the same group must deliver every post-restart record (2) exactly once..."
+    set +e
+    out="$(run_group_probe group_restart -e RUNE_GROUP_PRE=0)"; rc=$?
+    set -e
+    echo "${out}" >&2
+    [ "${rc}" -eq 0 ] || fail "[${label}] group_restart exited ${rc} (155 = SILENT LOSS: resumed at the old offset)"
+    echo "${out}" | grep -q "^GROUP-RESTART: OK" || fail "[${label}] the group did not deliver the post-restart records"
+    local minted
+    minted="$(dc logs --no-log-prefix rune-1 rune-2 rune-3 2>/dev/null | grep -cE "topicId=${TOPIC_ID} partition=0 .*data lineage MINTED" || true)"
+    [ "${minted}" -ge 2 ] || fail "[${label}] want a lineage minted before and after the restart, saw ${minted} MINTED line(s)"
+    log "[${label}] PASSED: committed 20 before the restart; after it the group delivered the refilled records exactly once (${minted} lineage mints)"
+    RESULTS+=("${label}: committed 20; after a full 3-node restart every refilled record delivered exactly once")
+    teardown
+}
+
 AROUND=200                 # the probe's kAround
 RESULTS=()
-VARIANTS="${FAILOVER_VARIANTS:-seed-follows-redirect seed-is-leader}"
+VARIANTS="${FAILOVER_VARIANTS:-seed-follows-redirect seed-is-leader full-restart-group}"
 for v in ${VARIANTS}; do
     case "${v}" in
         seed-follows-redirect) run_variant "${v}" rune-1 ;;
         seed-is-leader)        run_variant "${v}" rune-3 ;;
+        full-restart-group)    run_full_restart_group ;;
         *) fail "unknown variant '${v}'" ;;
     esac
 done

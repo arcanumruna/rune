@@ -130,10 +130,20 @@ public:
     // (silent loss of the first records after a restart).  A plain function
     // pointer + context (no allocation, no std::function on the commit path).
     // -----------------------------------------------------------------------
+    //
+    // C1 multi-node (USER DECISION option b): the lineage is committed metadata
+    // confirmed per leadership.  While the partition's current leadership has
+    // not confirmed it yet (kLineagePending — e.g. right after a full-cluster
+    // restart), OffsetCommit and OffsetFetch answer that entry NotLeader: an
+    // EXISTING retriable code the client retries with its bounded budget —
+    // never a guess, never silence.
+    static constexpr uint64_t kLineagePending = UINT64_MAX;
     using TransientLineageFn = uint64_t (*)(void* ctx, int32_t topicId, int32_t partition) noexcept;
     void setTransientLineage(TransientLineageFn fn, void* ctx) noexcept { lineageFn_ = fn; lineageCtx_ = ctx; }
     /// Committed offsets answered "none" because their lineage ended (C1).
     [[nodiscard]] uint64_t staleLineageOffsets() const noexcept { return staleLineageOffsets_; }
+    /// Entries answered NotLeader because the lineage was still pending (C1).
+    [[nodiscard]] uint64_t pendingLineageAnswers() const noexcept { return pendingLineageAnswers_; }
 
     // -----------------------------------------------------------------------
     // isLocalCoordinator — true when this node is the cluster leader.
@@ -251,6 +261,7 @@ private:
     TransientLineageFn lineageFn_  = nullptr;
     void*              lineageCtx_ = nullptr;
     uint64_t           staleLineageOffsets_ = 0;
+    uint64_t           pendingLineageAnswers_ = 0;
     [[nodiscard]] uint64_t lineageOf_(int32_t topicId, int32_t partition) const noexcept {
         return lineageFn_ != nullptr ? lineageFn_(lineageCtx_, topicId, partition) : 0;
     }

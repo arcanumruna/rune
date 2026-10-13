@@ -2183,10 +2183,7 @@ void BrokerNode::buildGateway() {
             // E2 final fix wave (C1): committed offsets of transient partitions
             // are positions of THIS process's rings (single node) — an offset
             // replayed from an earlier process is answered as none.
-            if (transientLineage_ == 0) {
-                std::random_device rd;
-                transientLineage_ = ((static_cast<uint64_t>(rd()) << 32) ^ rd()) | 1u;
-            }
+            ensureProcessIncarnation_();
             groupCoordService_->setTransientLineage(&BrokerNode::transientLineageTrampoline_, this);
 
             spdlog::info("BrokerNode[{}]: GroupCoordinationService wired (offsets at {})",
@@ -2435,6 +2432,14 @@ void BrokerNode::buildGateway() {
             if (replTransport_)
                 replTransport_->setAlterIsrHandler(&MetadataService::onAlterIsrThunk,
                                                    metadataService_.get());
+            // E2 final fix wave (C1): on a single node the controller confirms
+            // every transient partition's data lineage itself (no replica
+            // reports there: every ring is born with this process).
+            if (config_.isSingleNode()) {
+                ensureProcessIncarnation_();
+                metadataService_->setTransientLineageAuthority(processIncarnation_,
+                                                               &BrokerNode::isTransientTopicTrampoline_, this);
+            }
 
             // MD1 Task 7: wire the MSM into the bridge so USER partitions are
             // driven per-partition from the committed assignment map.
@@ -4264,13 +4269,29 @@ void BrokerNode::teardownShardRuntimes_() noexcept {
     shardDrivers_.clear();
 }
 
-uint64_t BrokerNode::transientLineageTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept {
-    // E2 final fix wave (C1).  Control thread (the group handlers run there).
-    (void)partition;
+void BrokerNode::ensureProcessIncarnation_() {
+    if (processIncarnation_ != 0) return;
+    std::random_device rd;
+    processIncarnation_ = static_cast<int64_t>((((static_cast<uint64_t>(rd()) << 32) ^ rd()) | 1u) & 0x7fffffffffffffffull);
+}
+
+bool BrokerNode::isTransientTopicTrampoline_(void* ctx, int32_t topicId) noexcept {
     auto* self = static_cast<BrokerNode*>(ctx);
-    if (!self->config_.isSingleNode() || self->topicRegistry_ == nullptr) return 0;
+    if (self->topicRegistry_ == nullptr) return false;
     const TopicSpec* spec = self->topicRegistry_->topic(topicId);
-    return spec != nullptr && spec->persistence == PersistenceMode::Transient ? self->transientLineage_ : 0;
+    return spec != nullptr && spec->persistence == PersistenceMode::Transient;
+}
+
+uint64_t BrokerNode::transientLineageTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept {
+    // E2 final fix wave (C1, option b).  Runtime thread: the group handlers,
+    // the gateway and the MetadataService all run on the NodeRuntimeAgent.
+    auto* self = static_cast<BrokerNode*>(ctx);
+    if (!isTransientTopicTrampoline_(ctx, topicId)) return 0;   // a disk partition: no lineage
+    if (self->metadataService_ == nullptr) return GroupCoordinationService::kLineagePending;
+    const auto* pa  = self->metadataService_->committedAssignment(topicId, partition);
+    const auto* rec = self->metadataService_->transientLineage(topicId, partition);
+    const int64_t inc = self->config_.isSingleNode() ? self->processIncarnation_ : 0;
+    return rune::metadata::lineageConfirmedFor(rec, pa, inc) ? rec->lineage : GroupCoordinationService::kLineagePending;
 }
 
 } // namespace rune::node

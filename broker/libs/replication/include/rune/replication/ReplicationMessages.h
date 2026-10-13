@@ -496,6 +496,13 @@ struct AlterIsrMsg {
     /// in ITS committed map the stopping node leads / is in-sync for nothing
     /// movable (so its routing no longer names it).
     static constexpr int32_t kNodeShutdownConfirm = 128;
+    /// E2 final fix wave (C1 multi-node): not a bump — a TRANSIENT partition
+    /// LEADER's data-lineage report for its leadership (`leaderId`,
+    /// `leaderEpoch`): isr[2] = the leader epoch of the data its ring holds
+    /// (-1: none — its ring is unborn).  Re-sent on the AlterIsr cadence until
+    /// answered kAlterIsrLineageConfirmed (committed) or FencedLeaderEpoch.
+    /// An older controller drops it (no answer; the leader keeps re-sending).
+    static constexpr int32_t kLineageReport = 256;
     static constexpr int32_t kConfirmUserClear = 1;
     static constexpr int32_t kConfirmAllClear  = 2;
     /// The controller's answer (responder id in `partition`): kAlterIsrOk =
@@ -558,6 +565,9 @@ inline constexpr int16_t kAlterIsrIneligibleReplica    = 1;  ///< every added re
 inline constexpr int16_t kAlterIsrFencedLeaderEpoch    = 2;  ///< not the current leader / leader epoch
 inline constexpr int16_t kAlterIsrInvalidUpdateVersion = 3;  ///< partitionEpoch is not the committed one
 inline constexpr int16_t kAlterIsrInvalidRequest       = 4;  ///< malformed (leader missing, non-replica)
+/// E2 final fix wave (C1 multi-node): the leader's TransientLineage report for
+/// its leader epoch is COMMITTED (the leader stops re-sending it).
+inline constexpr int16_t kAlterIsrLineageConfirmed     = 5;
 
 // ---------------------------------------------------------------------------
 // AlterIsrResponse (template 8, v3) — Kafka AlterPartitionResponse.  The leader

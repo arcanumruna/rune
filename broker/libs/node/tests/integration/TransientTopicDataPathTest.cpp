@@ -677,3 +677,208 @@ INSTANTIATE_TEST_SUITE_P(Cells, DemotedLeaderReadCommittedRegression,
                                          DemoteParam{mx::Mode::Shard, mx::Persist::Disk},
                                          DemoteParam{mx::Mode::Legacy, mx::Persist::Disk}),
                          demoteName);
+
+// ===========================================================================
+// E2 final fix wave (C1 multi-node, USER DECISION option b): committed group
+// offsets of a TRANSIENT partition across restarts of a 3-node cluster.  The
+// partition's data lineage is committed metadata, confirmed per leadership:
+//   - FULL-cluster restart: every ring is unborn, the new leader MINTS a new
+//     lineage — the group's committed offset is answered "none" (-1) after the
+//     (retriable NotLeader) settling window, never the old offset; the member
+//     applies its reset policy (the log start) and gets every post-restart
+//     record.  RED (no lineage): 20 was answered after the restart.
+//   - ROLLING restart (one node at a time, each catching up before the next):
+//     the data survives every step, the lineage is KEPT — the offset stays
+//     valid (no false -1).
+// ===========================================================================
+namespace {
+constexpr int16_t kOffsetOk        = 0;
+constexpr int16_t kOffsetNotLeader = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+
+struct GroupCluster {
+    TmpDir d0{"lg0"}, d1{"lg1"}, d2{"lg2"}, cdir{"lgc"};
+    Ports  ports = Ports::discover(3);
+    std::unique_ptr<BrokerNode> nodes[3];
+    NodeConfig cfg(int i) { return makeConfig(i, (i == 0 ? d0 : i == 1 ? d1 : d2).path, ports, 3, true); }
+    void start(int i) { nodes[i] = std::make_unique<BrokerNode>(cfg(i)); nodes[i]->start(); }
+    void stop(int i) { if (nodes[i]) { nodes[i]->stop(); nodes[i].reset(); } }
+    int liveNode() const { for (int i = 0; i < 3; ++i) if (nodes[i]) return i; return -1; }
+    /// The consensus leader (the group coordinator) as a live node sees it.
+    int coordinator() {
+        for (int k = 0; k < 400; ++k) {
+            for (int i = 0; i < 3; ++i)
+                if (nodes[i] && nodes[i]->isLeader()) return i;
+            std::this_thread::sleep_for(25ms);   // election settling (poll interval)
+        }
+        return -1;
+    }
+    /// topic 0 / partition 0's advertised leader (not `notThis`).
+    int partitionLeader(ShardTestClient& c, int notThis = -1) {
+        const int gw = liveNode();
+        const int64_t s = c.connect(gatewayChannel(ports, gw), kClientStream);
+        for (int i = 0; s > 0 && i < 400; ++i) {
+            for (const auto& pi : c.metadata(gatewayChannel(ports, gw), kClientStream, s))
+                if (pi.topicId == 0 && pi.partition == 0 && pi.leaderId >= 0 && pi.leaderId != notThis &&
+                    nodes[pi.leaderId] != nullptr)
+                    return static_cast<int>(pi.leaderId);
+            std::this_thread::sleep_for(50ms);   // metadata settling (poll interval)
+        }
+        return -1;
+    }
+    ~GroupCluster() { for (int i = 0; i < 3; ++i) stop(i); }
+};
+
+/// OffsetFetch to a settled answer: retries the retriable NotLeader (the
+/// lineage settling window) and a NotCoordinator (the coordinator moving);
+/// returns the offset, or -99 on no settled answer.  *pendingSeen counts the
+/// NotLeader answers; *answers records every non-pending offset answered.
+int64_t settledFetch(GroupCluster& g, ShardTestClient& c, const std::string& group, int* pendingSeen) {
+    for (int k = 0; k < 600; ++k) {
+        const int coord = g.coordinator();
+        if (coord < 0) continue;
+        const int64_t sid = c.connect(gatewayChannel(g.ports, coord), kClientStream);
+        if (sid <= 0) { std::this_thread::sleep_for(25ms); continue; }
+        const auto r = c.offsetFetch(gatewayChannel(g.ports, coord), kClientStream, sid, group, 0, 0);
+        if (r && r->second == kOffsetOk) return r->first;
+        if (r && r->second == kOffsetNotLeader && pendingSeen != nullptr) ++*pendingSeen;
+        std::this_thread::sleep_for(50ms);   // the client's retry pacing (poll interval)
+    }
+    return -99;
+}
+/// Join + commit `offset` on the coordinator, retrying the settling window.
+bool commitOffset(GroupCluster& g, ShardTestClient& c, const std::string& group, int64_t offset) {
+    for (int k = 0; k < 600; ++k) {
+        const int coord = g.coordinator();
+        if (coord < 0) continue;
+        const std::string gw = gatewayChannel(g.ports, coord);
+        const int64_t sid = c.connect(gw, kClientStream);
+        if (sid <= 0) { std::this_thread::sleep_for(25ms); continue; }
+        const auto j = c.joinGroup(gw, kClientStream, sid, group);
+        if (!j || j->errorCode != kOffsetOk) { std::this_thread::sleep_for(50ms); continue; }
+        const auto code = c.offsetCommit(gw, kClientStream, sid, group, j->memberId, j->generation, 0, 0, offset);
+        if (code && *code == kOffsetOk) return true;
+        std::this_thread::sleep_for(50ms);   // pending lineage / rebalance: retried (poll interval)
+    }
+    return false;
+}
+}  // namespace
+
+TEST(TransientLineageClusterRegression, FullClusterRestartAnswersAGroupsOffsetAsNoneRegression) {
+    GroupCluster g;
+    for (int i = 0; i < 3; ++i) g.start(i);
+    ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
+    ShardTestClient c(g.cdir.path);
+    c.setClientVersion(rune::protocol::client::kClientVersion);
+    const int leader = g.partitionLeader(c);
+    ASSERT_GE(leader, 0);
+    const int64_t sidL = c.connect(gatewayChannel(g.ports, leader), kClientStream);
+    for (int b = 0; b < 5; ++b)
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, leader), kClientStream, sidL, 0, 0, 1, makeBatch(4)));
+    ASSERT_TRUE(commitOffset(g, c, "lg-full", 20)) << "the group never committed its offset";
+    ASSERT_EQ(settledFetch(g, c, "lg-full", nullptr), 20) << "precondition: the committed offset is served";
+
+    // Full-cluster restart: every process (and ring) goes; metadata survives.
+    for (int i = 0; i < 3; ++i) g.stop(i);
+    for (int i = 0; i < 3; ++i) g.start(i);
+    ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
+    int pending = 0;
+    const int64_t after = settledFetch(g, c, "lg-full", &pending);
+    EXPECT_EQ(after, -1) << "SILENT LOSS: the offset of the ring's previous life was answered after a full-cluster "
+                            "restart (a member would skip the first " << after << " refilled records)";
+    std::printf("[lineage full restart] settled after %d retriable NotLeader answer(s)\n", pending);
+
+    // The member's reset policy (the log start) sees every post-restart record.
+    const int leader2 = g.partitionLeader(c);
+    ASSERT_GE(leader2, 0);
+    const int64_t sid2 = c.connect(gatewayChannel(g.ports, leader2), kClientStream);
+    auto first = c.produceUntilOk(workerIngressChannel(g.ports, leader2), kClientStream, sid2, 0, 0, 1, makeBatch(2));
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(first->baseOffset, 0) << "precondition: the ring restarted empty";
+    ASSERT_TRUE(c.subscribe(gatewayChannel(g.ports, leader2), kClientStream, sid2, 0, 0, /*from (reset)=*/0));
+    ASSERT_TRUE(c.pollUntil([&] { return pushedAt(c, 0) >= 1; })) << "the post-restart record was not delivered";
+}
+
+TEST(TransientLineageClusterRegression, RollingRestartKeepsAGroupsOffsetValidRegression) {
+    GroupCluster g;
+    for (int i = 0; i < 3; ++i) g.start(i);
+    ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
+    ShardTestClient c(g.cdir.path);
+    c.setClientVersion(rune::protocol::client::kClientVersion);
+    const int leader = g.partitionLeader(c);
+    ASSERT_GE(leader, 0);
+    const int64_t sidL = c.connect(gatewayChannel(g.ports, leader), kClientStream);
+    for (int b = 0; b < 5; ++b)
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, leader), kClientStream, sidL, 0, 0, 1, makeBatch(4)));
+    ASSERT_TRUE(commitOffset(g, c, "lg-rolling", 20));
+    ASSERT_EQ(settledFetch(g, c, "lg-rolling", nullptr), 20);
+
+    // One node at a time; each catches up (holds the 20 records again) before the next.
+    for (int i = 0; i < 3; ++i) {
+        g.stop(i);
+        ASSERT_GE(g.coordinator(), 0) << "no coordinator while node " << i << " is down";
+        ASSERT_GE(g.partitionLeader(c, i), 0) << "no partition leader while node " << i << " is down";
+        g.start(i);
+        bool caughtUp = false;
+        for (int k = 0; k < 600 && !caughtUp; ++k) {
+            caughtUp = hasReplica(*g.nodes[i], 0, 0) && leoOnOwner(*g.nodes[i], 0, 0) >= 20;
+            if (!caughtUp) std::this_thread::sleep_for(50ms);   // replication catch-up (poll interval)
+        }
+        ASSERT_TRUE(caughtUp) << "restarted node " << i << " never caught up";
+        std::this_thread::sleep_for(500ms);   // ISR re-admission settles (not a correctness gate: asserted below)
+    }
+    EXPECT_EQ(settledFetch(g, c, "lg-rolling", nullptr), 20)
+        << "a rolling restart (the data survived every step) answered the committed offset as 'none' (false -1)";
+}
+
+// C1 (single node — the same lineage mechanism; the controller is the lineage
+// authority, every ring living exactly as long as the process): the offset is
+// served while the process lives and answered "none" after a restart.  RED
+// (no single-node authority): the lineage never confirms — every answer stays
+// the retriable NotLeader (no settled answer).
+TEST(TransientLineageClusterRegression, SingleNodeRestartAnswersAGroupsOffsetAsNoneRegression) {
+    TmpDir dir{"lg1n"}, cdir{"lg1nc"};
+    const auto ports = Ports::discover(1);
+    const auto cfg = makeConfig(0, dir.path, ports, 1, /*shard=*/true);
+    ShardTestClient c(cdir.path);
+    c.setClientVersion(rune::protocol::client::kClientVersion);
+    const std::string gw = gatewayChannel(ports, 0);
+    auto settled = [&](int64_t& out) {
+        for (int k = 0; k < 400; ++k) {
+            const int64_t sid = c.connect(gw, kClientStream);
+            const auto r = sid > 0 ? c.offsetFetch(gw, kClientStream, sid, "lg-one", 0, 0) : std::nullopt;
+            if (r && r->second == kOffsetOk) { out = r->first; return true; }
+            std::this_thread::sleep_for(50ms);   // retry pacing (poll interval)
+        }
+        return false;
+    };
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(10'000ms));
+        const int64_t sid = c.connect(gw, kClientStream);
+        for (int b = 0; b < 3; ++b)
+            ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, 0), kClientStream, sid, 0, 0, 1, makeBatch(4)));
+        bool committed = false;
+        for (int k = 0; k < 400 && !committed; ++k) {
+            const int64_t s = c.connect(gw, kClientStream);
+            const auto j = c.joinGroup(gw, kClientStream, s, "lg-one");
+            if (j && j->errorCode == kOffsetOk) {
+                const auto code = c.offsetCommit(gw, kClientStream, s, "lg-one", j->memberId, j->generation, 0, 0, 12);
+                committed = code && *code == kOffsetOk;
+            }
+            if (!committed) std::this_thread::sleep_for(50ms);
+        }
+        ASSERT_TRUE(committed) << "the single-node lineage never confirmed (commits refused NotLeader forever)";
+        int64_t off = -99;
+        ASSERT_TRUE(settled(off));
+        EXPECT_EQ(off, 12);
+        node.stop();
+    }
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(10'000ms));
+    int64_t off = -99;
+    ASSERT_TRUE(settled(off)) << "no settled OffsetFetch answer after the restart";
+    EXPECT_EQ(off, -1) << "SILENT LOSS: a single-node restart answered the previous process's offset";
+    node.stop();
+}

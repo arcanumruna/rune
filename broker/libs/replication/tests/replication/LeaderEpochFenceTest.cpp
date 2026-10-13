@@ -360,3 +360,98 @@ TEST(LeaderEpochFenceRegression, FailedWorkerRecreateBacksOffRegression) {
     (void)r->prepareEpochStateWrite(buf.data(), buf.size(), w, need);
     EXPECT_GT(r->epochStateErrorsForTest(), errors) << "never retried after the backoff";
 }
+
+// ===========================================================================
+// E2 final fix wave (C1 multi-node, USER DECISION option b): a TRANSIENT
+// leader reports, for its leadership, the leader epoch its ring's data came
+// from — -1 when the ring is unborn (a process start: a full-cluster restart,
+// the first leadership); its leader's epoch when it was promoted from a
+// follower that fetched from that leader (ISR handover / rolling restart).  The
+// report is re-sent until the controller confirms it committed.  A disk
+// replica never reports.  RED: no lineage report was ever sent.
+// ===========================================================================
+namespace {
+std::vector<AlterIsrMsg> lineageReports(const CapturingTransport& t) {
+    std::vector<AlterIsrMsg> out;
+    for (const auto& m : t.sent)
+        if (m.isrCount == AlterIsrMsg::kLeaderEpochBump && (m.isr[1] & AlterIsrMsg::kLineageReport) != 0)
+            out.push_back(m);
+    return out;
+}
+AlterIsrResponseMsg lineageAck(int16_t code, Epoch epoch) {
+    AlterIsrResponseMsg a{};
+    a.topicId = 0; a.partition = 0; a.leaderId = 1; a.leaderEpoch = epoch; a.partitionEpoch = 0; a.errorCode = code;
+    return a;
+}
+}  // namespace
+
+TEST(LeaderEpochFenceRegression, UnbornTransientLeaderReportsANewLineageUntilConfirmedRegression) {
+    Dir d;
+    rune::storage::InMemoryLog log(1 << 20, 10'000);
+    CapturingTransport t;
+    auto r = memReplica(log, t);
+    r->setLeaderEpochFenceFile((d.path / "fence-0-0").string());
+    r->becomeLeader(5, kAll);
+    ASSERT_EQ(r->role(), Role::Leader);
+    int64_t now = 1'000'000'000;
+    r->doWork(now);
+    auto reps = lineageReports(t);
+    ASSERT_EQ(reps.size(), 1u) << "an unborn transient leader sent no lineage report";
+    EXPECT_EQ(reps[0].leaderEpoch, 5);
+    EXPECT_EQ(reps[0].leaderId, 1);
+    EXPECT_EQ(reps[0].isr[2], -1) << "an unborn ring holds no lineage data";
+    r->doWork(now + 1'000'000);
+    EXPECT_EQ(lineageReports(t).size(), 1u) << "re-sent faster than the AlterIsr cadence";
+    now += PartitionReplica::kAlterIsrResendNsForTest + 1;
+    r->doWork(now);
+    EXPECT_EQ(lineageReports(t).size(), 2u) << "never re-sent while unconfirmed";
+    r->onAlterIsrResponse(lineageAck(kAlterIsrLineageConfirmed, 5));
+    EXPECT_FALSE(r->lineageReportPendingForTest());
+    now += 10 * PartitionReplica::kAlterIsrResendNsForTest;
+    r->doWork(now);
+    EXPECT_EQ(lineageReports(t).size(), 2u) << "re-sent after the controller confirmed it";
+}
+
+TEST(LeaderEpochFenceRegression, PromotedTransientFollowerReportsItsLeadersEpochRegression) {
+    Dir d;
+    rune::storage::InMemoryLog log(1 << 20, 10'000);
+    CapturingTransport t;
+    auto r = memReplica(log, t);
+    r->setLeaderEpochFenceFile((d.path / "fence-0-0").string());
+    r->becomeFollower(7, /*leaderId=*/2);
+    EXPECT_EQ(r->lineageSrcEpochForTest(), -1) << "nothing fetched yet: unborn";
+    FetchResponseMsg resp{};
+    resp.leaderEpoch = 7; resp.partition = 0; resp.highWatermark = 0; resp.logStartOffset = 0;
+    resp.errorCode = kErrNone; resp.topicId = 0; resp.records = {};
+    r->applyReplicated(resp);
+    EXPECT_EQ(r->lineageSrcEpochForTest(), 7) << "the follower did not adopt its leader's lineage";
+    FetchResponseMsg stale = resp;
+    stale.leaderEpoch = 6;
+    r->applyReplicated(stale);
+    EXPECT_EQ(r->lineageSrcEpochForTest(), 7) << "a deposed leader's frame moved the lineage source";
+    r->becomeLeader(8, kAll);   // promoted (ISR handover / rolling restart)
+    ASSERT_EQ(r->role(), Role::Leader);
+    r->doWork(1'000'000'000);
+    const auto reps = lineageReports(t);
+    ASSERT_EQ(reps.size(), 1u);
+    EXPECT_EQ(reps[0].leaderEpoch, 8);
+    EXPECT_EQ(reps[0].isr[2], 7) << "the promoted leader must report the epoch its data came from";
+    // A fenced answer (no longer this leadership) stops it too.
+    r->onAlterIsrResponse(lineageAck(kAlterIsrFencedLeaderEpoch, 8));
+    EXPECT_FALSE(r->lineageReportPendingForTest());
+}
+
+TEST(LeaderEpochFenceRegression, DiskReplicaNeverSendsALineageReportRegression) {
+    Dir d;
+    const fs::path logDir = d.path / "log";
+    fs::create_directories(logDir);
+    rune::storage::Log log(logDir.string());
+    log.recover();
+    CapturingTransport t;
+    auto r = std::make_unique<PartitionReplica>(cfg(), Role::Follower, 0, kAll, kAll, &log, &t);
+    r->setIsrChannel(&t);
+    r->setLeaderEpochFenceFile((d.path / "fence").string());
+    r->becomeLeader(5, kAll);
+    r->doWork(1'000'000'000);
+    EXPECT_TRUE(lineageReports(t).empty()) << "a disk partition has no data lineage";
+}

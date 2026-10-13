@@ -760,6 +760,66 @@ TEST_F(CG3ServiceTest, TransientCommittedOffsetOfAnEndedLineageIsAnsweredAsNoneR
     EXPECT_EQ(restarted.staleLineageOffsets(), 2u);
 }
 
+// E2 final fix wave (C1 multi-node, option b): while the partition's CURRENT
+// leadership has not confirmed its data lineage (right after a full-cluster
+// restart, or a leader move, until the controller commits the lineage), the
+// coordinator can answer neither the committed offset (it may be of the old
+// lineage) nor "none" (it may be valid): OffsetFetch and OffsetCommit answer
+// that entry NotLeader — an existing retriable code the client retries with
+// its bounded budget.  Never a guess, never silence.  Once confirmed: the
+// stamp rules as before.  RED: the pending window answered the old offset.
+namespace {
+uint64_t g_pendingLineage = GroupCoordinationService::kLineagePending;
+uint64_t pendingThenKnown(void*, int32_t, int32_t partition) noexcept {
+    return partition == 0 ? g_pendingLineage : 0;
+}
+}  // namespace
+
+TEST_F(CG3ServiceTest, TransientOffsetsAreAnsweredRetriablyWhileTheLineageIsPendingRegression) {
+    const std::string groupId = "g-pending";
+    g_pendingLineage = 0x1111;
+    service_->setTransientLineage(&pendingThenKnown, nullptr);
+    auto jLen = encodeJoinGroup(req_, 1, 970, groupId, "", 5000);
+    auto jOut = service_->handleJoinGroup(req_, jLen, clock_, out_, kBufSize);
+    auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
+    ASSERT_TRUE(jResp.has_value());
+    const std::string memberId(reinterpret_cast<const char*>(jResp->memberId.data()), jResp->memberId.size());
+    auto commit = [&](int64_t off) {
+        auto ocLen = encodeOffsetCommit(req_, 1, 971, groupId, memberId, jResp->generationId, kTestTopicId, 0, off, "m");
+        auto ocOut = service_->handleOffsetCommit(req_, ocLen, clock_, out_, kBufSize);
+        auto ocResp = pc::OffsetCommitResponse::decode(out_, ocOut);
+        EXPECT_TRUE(ocResp.has_value());
+        return ocResp.has_value() ? ocResp->results[0].errorCode : int16_t{-99};
+    };
+    auto fetch = [&](int16_t& code) {
+        auto ofLen = encodeOffsetFetch(req_, 1, 972, groupId, kTestTopicId, 0);
+        auto ofOut = service_->handleOffsetFetch(req_, ofLen, clock_, out_, kBufSize);
+        auto r = pc::OffsetFetchResponse::decode(out_, ofOut);
+        EXPECT_TRUE(r.has_value());
+        code = r.has_value() ? r->results[0].errorCode : int16_t{-99};
+        return r.has_value() ? r->results[0].offset : int64_t{-99};
+    };
+    ASSERT_EQ(commit(5000), static_cast<int16_t>(pc::ErrorCode::OK));
+    ASSERT_TRUE(pumpHW(1));
+    int16_t code = 0;
+    EXPECT_EQ(fetch(code), 5000);
+
+    g_pendingLineage = GroupCoordinationService::kLineagePending;   // a full restart: not confirmed yet
+    const int64_t during = fetch(code);
+    EXPECT_EQ(code, static_cast<int16_t>(pc::ErrorCode::NotLeader))
+        << "the pending window was answered " << during << " (a guess: the offset may belong to data that did not survive)";
+    EXPECT_EQ(during, -1);
+    EXPECT_EQ(commit(9), static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "a commit was stamped while the lineage was unknown";
+    EXPECT_GE(service_->pendingLineageAnswers(), 2u);
+
+    g_pendingLineage = 0x2222;   // the new leadership MINTED a new lineage
+    EXPECT_EQ(fetch(code), -1) << "the old lineage's offset was answered after a re-mint";
+    EXPECT_EQ(code, static_cast<int16_t>(pc::ErrorCode::OK));
+    ASSERT_EQ(commit(3), static_cast<int16_t>(pc::ErrorCode::OK));
+    ASSERT_TRUE(pumpHW(2));
+    EXPECT_EQ(fetch(code), 3);
+}
+
 // 11. OffsetCommit wrong gen → IllegalGeneration.
 TEST_F(CG3ServiceTest, OffsetCommitWrongGenerationReturnsIllegalGeneration) {
     std::string groupId = "g-illegalgen";

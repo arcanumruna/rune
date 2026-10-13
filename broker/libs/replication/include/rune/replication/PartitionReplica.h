@@ -1696,6 +1696,30 @@ private:
     };
     LeaderlessReport report_;
     int  sendLeaderlessReport_(int64_t nowNs);
+    /// E2 final fix wave (C1 multi-node), TRANSIENT replicas only: the leader
+    /// epoch of the leadership whose data this ring holds (-1: unborn — nothing
+    /// held in this process).  A follower adopts its leader's epoch on every
+    /// accepted fetch answer; a leader takes its own epoch.
+    Epoch lineageSrcEpoch_ = -1;
+    /// The leader's lineage report for its leadership `epoch` (data source
+    /// `src`), re-sent until the controller confirms it committed.
+    struct LineageReport {
+        bool    pending = false;
+        Epoch   epoch   = -1;
+        Epoch   src     = -1;
+        bool    sent    = false;
+        int64_t sentNs  = 0;
+    };
+    LineageReport lineageReport_;
+    uint64_t      lineageConfirmed_ = 0;
+    int  sendLineageReport_(int64_t nowNs);
+public:
+    [[nodiscard]] bool     lineageReportPendingForTest() const noexcept { return lineageReport_.pending; }
+    [[nodiscard]] Epoch    lineageReportSrcForTest() const noexcept { return lineageReport_.src; }
+    [[nodiscard]] Epoch    lineageSrcEpochForTest() const noexcept { return lineageSrcEpoch_; }
+    [[nodiscard]] uint64_t lineageConfirmedForTest() const noexcept { return lineageConfirmed_; }
+    static constexpr int64_t kAlterIsrResendNsForTest = 50'000'000LL;   // == kAlterIsrResendNs
+private:
     [[nodiscard]] int32_t bumpFlags_() const noexcept;
     bool fenceEstablished_ = false;          ///< no-fence-file mode: the first leadership was refused
     /// D21 review L2: both leader-epoch-state slots were corrupt — the epochs an

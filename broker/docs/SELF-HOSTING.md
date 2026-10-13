@@ -175,12 +175,15 @@ before a produce is acknowledged but is **never written to disk**.
     idempotent and transactional produces get `NotLeader` (retriable). If the ring has evicted the
     first records of a transaction that is still open, `read_committed` consumers stay at the ring's
     oldest record until that transaction's commit or abort marker lands.
-  - **Committed consumer-group offsets of a transient partition do not survive the data.** On a
-    single-node broker, an offset committed before a restart is answered as "no committed offset"
-    after it, so the group starts at its reset policy and reads every refilled record. On a multi-node
-    cluster this is not handled yet: after a full-cluster restart a group resumes at its old committed
-    offset and skips the refilled records below it. Use a new group id (or commit offset 0) after a
-    full-cluster restart.
+  - **Committed consumer-group offsets of a transient partition do not outlive its data.** Each
+    transient partition has a data lineage, recorded in the cluster metadata. A new lineage starts
+    only when a leader takes over with no copy of the data: after a full-cluster restart, after a
+    single-node broker restarts, and at the partition's first leadership. A leader move that keeps
+    the data keeps the lineage: a failover, a controlled shutdown, a rolling restart. After a new
+    lineage starts, an offset committed before it is answered as "no committed offset", so the
+    group starts at its reset policy and reads every refilled record. For a moment after a restart
+    or a leader move, until the new leadership has confirmed the lineage, OffsetFetch and
+    OffsetCommit for that partition answer `NotLeader`. The client retries this automatically.
   - **Subscriptions follow a leader move.** When a node stops serving a subscription (it lost
     leadership of a `read_committed` partition, or the partition's replica moved off it), it answers
     the subscription instead of going silent. A client of this release resumes from its position on

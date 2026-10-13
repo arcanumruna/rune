@@ -34,6 +34,15 @@ void MetadataStateMachine::apply(const uint8_t* buf, std::size_t len, int64_t re
         return;
     }
 
+    if (static_cast<uint16_t>(*typeOpt) == kTransientLineageRecordType) {   // E2 C1 multi-node
+        const auto rec = TransientLineageRecord::decode(buf, len);
+        if (!rec.has_value()) return;
+        const int64_t key = lineageKey_(rec->topicId, rec->partition);
+        if (recordPos <= committedPos_) installLineage_(key, rec->l);
+        else pendingLineage_.push_back(PendingLineage{recordPos, key, rec->l});
+        return;
+    }
+
     switch (*typeOpt) {
     case MetadataRecordType::CreateTopic: {
         // CreateTopicRecord: we register the topic but don't pre-create partition
@@ -141,8 +150,28 @@ void MetadataStateMachine::install_(int32_t topicId, int32_t partition,
     ++committedVersion_;
 }
 
+void MetadataStateMachine::installLineage_(int64_t key, const TransientLineage& l)
+{
+    auto [it, fresh] = lineages_.try_emplace(key, l);
+    if (!fresh) {
+        if (l.confirmedEpoch < it->second.confirmedEpoch) { ++regressionsRejected_; return; }   // stale decision
+        it->second = l;
+    }
+    ++lineageVersion_;
+}
+
 void MetadataStateMachine::flushPending(int64_t upToPos)
 {
+    if (!pendingLineage_.empty()) {
+        std::sort(pendingLineage_.begin(), pendingLineage_.end(),
+                  [](const PendingLineage& a, const PendingLineage& b) { return a.pos < b.pos; });
+        std::size_t kept = 0;
+        for (auto& e : pendingLineage_) {
+            if (e.pos <= upToPos) installLineage_(e.key, e.l);
+            else pendingLineage_[kept++] = e;
+        }
+        pendingLineage_.resize(kept);
+    }
     if (!pendingFeature_.empty()) {
         std::erase_if(pendingFeature_, [&](const std::pair<int64_t, int16_t>& f) {
             if (f.first > upToPos) return false;
@@ -181,6 +210,7 @@ void MetadataStateMachine::revert(int64_t toCommittedPos)
     // O(n) in pending_ size, which is bounded by the max number of in-flight
     // (uncommitted) records.
     std::erase_if(pendingFeature_, [&](const std::pair<int64_t, int16_t>& f) { return f.first > toCommittedPos; });
+    std::erase_if(pendingLineage_, [&](const PendingLineage& e) { return e.pos > toCommittedPos; });
     if (pending_.empty()) return;
 
     std::size_t kept = 0;
