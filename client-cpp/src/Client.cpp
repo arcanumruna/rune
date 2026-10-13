@@ -2371,6 +2371,17 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 break; // handled per-partition; skip the single-transport retarget.
             }
 
+            // E2 residual round 3 (O1): a NEW, never-bound plain Subscribe
+            // answered Redirect with multi-node routing follows it PER
+            // PARTITION on the leader node's own session (as a moved one does,
+            // I2) — never a seed retarget, which would strand every subscription
+            // already bound on the seed (a silent stall).
+            if (!groupActive && agent_.multiNodeRouting() &&
+                subscriberHub_.adoptRedirectedSubscribe(opt->correlationId) &&
+                followMovedSubscriptionRedirect_(opt->correlationId, opt->message)) {
+                break;
+            }
+
             if (groupActive) {
                 // MEDIUM-4: while a group is active the seed session (the group
                 // coordinator's) never follows a data-op redirect.

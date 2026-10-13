@@ -758,6 +758,17 @@ bool SubscriberHub::movedPendingPartition(int64_t correlationId, int32_t& topicI
     return true;
 }
 
+bool SubscriberHub::adoptRedirectedSubscribe(int64_t correlationId)
+{
+    if (!routed_()) return false;
+    const auto it = pendingByCorrelation_.find(correlationId);
+    if (it == pendingByCorrelation_.end() || !it->second || it->second->impl == nullptr) return false;
+    SubscriptionImpl& impl = *it->second->impl;
+    if (!impl.active || impl.subscriptionId != 0) return false;
+    impl.moved = true;   // per-partition routed from now on (no position: nothing delivered yet)
+    return true;
+}
+
 bool SubscriberHub::homeMoved(int64_t correlationId, int64_t seedSid)
 {
     if (!routed_()) return false;

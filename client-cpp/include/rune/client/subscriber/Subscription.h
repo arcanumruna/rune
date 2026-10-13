@@ -199,7 +199,8 @@ struct SubscriptionImpl {
     // fetch do — the seed is never retargeted by it, so the other subscriptions
     // bound on the seed stay alive.  homeSid / homeEpoch: that session's broker
     // id and connect epoch when its Subscribe went out (homeSid 0 = held, not
-    // sent yet).  moved: re-armed by a leadership move at least once.
+    // sent yet).  moved: re-armed by a leadership move at least once, or a NEW
+    // Subscribe answered Redirect (O1) — routed per partition from then on.
     uint32_t homeSession   = 0;
     int64_t  homeSid       = 0;
     uint64_t homeEpoch     = 0;

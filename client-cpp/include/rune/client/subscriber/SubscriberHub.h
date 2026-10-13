@@ -223,6 +223,11 @@ public:
     /// The PENDING Subscribe `correlationId` belongs to a moved subscription:
     /// its (topicId, bound partition).  False otherwise.
     bool movedPendingPartition(int64_t correlationId, int32_t& topicId, int32_t& partition) const;
+    /// E2 residual round 3 (O1): the PENDING, never-bound Subscribe
+    /// `correlationId` was answered Redirect — it now lives on its partition's
+    /// route like a moved one (homeMoved / driveHomed), never by moving the
+    /// seed.  False when not such a pending Subscribe (or not routed).
+    bool adoptRedirectedSubscribe(int64_t correlationId);
     /// Route the pending moved Subscribe `correlationId` to its partition's
     /// leader as the agent now routes it (the caller installed the route the
     /// Redirect named): that node's own session — sent now when Connected,

@@ -2484,3 +2484,60 @@ TEST(GroupRoutingRegression, TransientNoCommittedOffsetSeedsTheLogStartNeverLate
     ASSERT_TRUE(r.drive([&] { return led.records[1] == 5; })) << "the refilled records were not all consumed";
     EXPECT_FALSE(gc.finished());
 }
+
+// E2 final fix wave, residual round 3 — O1: a NEW (never-bound) plain
+// Subscribe answered Redirect follows it PER PARTITION on the leader node's own
+// session, exactly as a moved subscription does (I2) — never a seed retarget.
+// Two subscriptions are bound on the seed (node 0 leads partitions 0 and 1); a
+// third, new one for partition 2 (node 1 leads it) goes to the seed and is
+// answered Redirect.  Expected: it binds on node 1's own session; the seed
+// channel is unchanged; the first two keep receiving on the seed, every record
+// exactly once.  RED (the historical Client-level retarget): the seed moved to
+// node 1 and the two bound subscriptions were stranded (silent stall).
+TEST(GroupRoutingRegression, NewSubscribeRedirectedFollowsPerPartitionAndNeverMovesTheSeedRegression) {
+    GroupRig r(4243, 4244);
+    const auto [n1, p1port] = r.addNode(4243);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4243, ""}, {1, 1, 0, 1, 4243, ""}, {1, 2, 1, 1, 4243, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, 0}, {2, n1}};
+    r.gw.groupProtocol   = false;
+    r.connect();
+    const std::string seedBefore = r.client.testTransport().ingressChannel();
+
+    PlainLedger led;
+    auto s0 = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()}, led.handler(0));
+    auto s1 = r.client.subscribe(r.client.topic("t"), 1, rc::SubscribeOptions{rc::From::earliest()}, led.handler(1));
+    ASSERT_TRUE(r.drive([&] { return s0.subscriptionId() != 0 && s1.subscriptionId() != 0; }));
+    const auto a0 = *r.subAt(0, 0);
+    const auto a1 = *r.subAt(1, 0);
+    r.gw.pushRecords(a0, 0, 2);
+    r.gw.pushRecords(a1, 0, 2);
+    ASSERT_TRUE(r.drive([&] { return led.count(0) == 2 && led.count(1) == 2; }));
+
+    // The new subscription: sent on the seed, answered Redirect to node 1.
+    auto s2 = r.client.subscribe(r.client.topic("t"), 2, rc::SubscribeOptions{rc::From::earliest()}, led.handler(2));
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribeRefusals >= 1; })) << "precondition: the seed redirected it";
+    ASSERT_TRUE(r.drive([&] { return r.subAt(2, n1) != nullptr && s2.subscriptionId() == r.subAt(2, n1)->subscriptionId; },
+                        20'000'000))
+        << "SILENT STALL: the redirected new subscription never bound on its leader";
+    const auto b2 = *r.subAt(2, n1);
+    EXPECT_NE(b2.sessionId, a0.sessionId) << "bound on the seed session instead of node 1's own";
+    EXPECT_EQ(r.client.testTransport().ingressChannel(), seedBefore) << "the new subscription's Redirect moved the SEED";
+    EXPECT_EQ(subscribesFor(r.gw, 0), 1) << "a bound subscription was re-subscribed";
+    EXPECT_EQ(subscribesFor(r.gw, 1), 1) << "a bound subscription was re-subscribed";
+
+    // All three deliver: p0 / p1 on the seed, p2 on node 1.
+    r.gw.pushRecords(a0, 2, 2);
+    r.gw.pushRecords(a1, 2, 2);
+    r.gw.pushRecords(b2, 0, 3);
+    ASSERT_TRUE(r.drive([&] { return led.count(0) == 4 && led.count(1) == 4 && led.count(2) == 3; }))
+        << "SILENT STALL: p0 " << led.count(0) << "/4, p1 " << led.count(1) << "/4, p2 " << led.count(2) << "/3";
+    EXPECT_EQ(led.dupes(), 0);
+    EXPECT_TRUE(s0.active());
+    EXPECT_TRUE(s1.active());
+    EXPECT_EQ(s0.subscriptionId(), a0.subscriptionId);
+    EXPECT_EQ(s1.subscriptionId(), a1.subscriptionId);
+    s0.unsubscribe();
+    s1.unsubscribe();
+    s2.unsubscribe();
+}
