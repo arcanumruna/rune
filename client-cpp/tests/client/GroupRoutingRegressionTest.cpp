@@ -2706,3 +2706,39 @@ TEST(GroupRoutingRegression, PlainSubscriptionNeverCarriesAPositionAcrossALineag
     EXPECT_EQ(led.dupes(), 0);
     s2.unsubscribe();
 }
+
+// E2 final fix wave — FU1 seed-session check: a plain subscription BOUND on the
+// SEED session is never re-armed when that session is lost (every way back is
+// a new broker session, which ended the old one's subscriptions).  It must end
+// EXPLICITLY (SessionLost) — never stay active() and silent.  A subscription
+// homed on a node's own session is untouched (driveHomed owns it).  RED (no
+// end on seed loss): s0 stayed active with no subscription broker-side.
+TEST(GroupRoutingRegression, SeedBoundPlainSubscriptionEndsExplicitlyWhenTheSeedSessionIsLostRegression) {
+    GroupRig r(4251, 4252);
+    const auto [n1, p1port] = r.addNode(4251);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4251, ""}, {1, 2, 1, 1, 4251, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {2, n1}};
+    r.gw.groupProtocol   = false;
+    r.connect();
+    PlainLedger led;
+    auto s0 = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()}, led.handler(0));
+    auto s2 = r.client.subscribe(r.client.topic("t"), 2, rc::SubscribeOptions{rc::From::earliest()}, led.handler(2));
+    ASSERT_TRUE(r.drive([&] {
+        return r.subAt(0, 0) != nullptr && s0.subscriptionId() == r.subAt(0, 0)->subscriptionId &&
+               r.subAt(2, n1) != nullptr && s2.subscriptionId() == r.subAt(2, n1)->subscriptionId;
+    })) << "precondition: p0 bound on the seed, p2 on node 1's own session";
+    const auto b0 = *r.subAt(0, 0);
+    r.gw.pushRecords(b0, 0, 5);
+    ASSERT_TRUE(r.drive([&] { return led.count(0) == 5; }));
+
+    const int connectsBefore = r.gw.connects;
+    r.gw.expireSession(b0.sessionId);   // the seed session is lost
+    ASSERT_TRUE(r.drive([&] { return !s0.active(); }, 20'000'000))
+        << "SILENT STALL: the seed-bound subscription stayed active after its session was lost";
+    EXPECT_EQ(s0.failReason(), rc::SubscriptionFailReason::SessionLost);
+    EXPECT_EQ(s0.position(), 5) << "the position to resubscribe from";
+    EXPECT_TRUE(s2.active()) << "a node-homed subscription is not the seed's";
+    ASSERT_TRUE(r.drive([&] { return r.gw.connects > connectsBefore; }, 20'000'000)) << "the seed reconnects";
+    s2.unsubscribe();
+}

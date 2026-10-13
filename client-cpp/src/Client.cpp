@@ -1869,6 +1869,18 @@ void Client::syncSeedSession_() noexcept {
             completeCtl_(p, OpStatus::SessionLost, 0, 0, 0, text);
         }
     }
+    // E2 FU1 (seed-session check): the seed LEFT its Connected session (stale
+    // loss, SessionExpired / UnknownSession, transport drop, a forced redirect
+    // reconnect).  Every way back is a NEW broker session (the broker's
+    // handleConnect always allocates one; the old one's subscriptions die with
+    // it), and plain subscriptions bound on the seed are never re-armed — each
+    // ends explicitly (SessionLost), never a silent stall.  Runs before any
+    // frame of a new session can bind (the first thing its ConnectResponse
+    // does).  close() finishes everything itself (Closed is excluded).
+    if (lastSeedState_ == session::SessionState::Connected && st != session::SessionState::Closed &&
+        (st != session::SessionState::Connected || sid != lastSeedSessionId_ || episode != lastSeedEpisode_))
+        [[unlikely]]
+        (void)subscriberHub_.endSeedBound();
     const bool connected = st == session::SessionState::Connected;
     subscriberHub_.setSessionConnected(connected);
     lastSeedState_     = st;

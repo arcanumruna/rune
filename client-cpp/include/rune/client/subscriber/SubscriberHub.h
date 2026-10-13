@@ -172,6 +172,13 @@ public:
     /// is treated as an already-unsubscribed response and a late Unsubscribe is
     /// emitted via the CB-5 A2 path rather than routing records to a dead impl).
     void failPendingSubscribes(const std::string& reason);
+    /// E2 FU1 (seed-session check): the seed session was lost.  Every plain
+    /// subscription BOUND on it (not homed on a node session) ended broker-side
+    /// with that session and is never re-armed: each is finished explicitly
+    /// with SubscriptionFailReason::SessionLost — never left active and silent.
+    /// Pending ones are untouched (resendPending re-issues them).  No
+    /// allocation.  Returns how many were ended.
+    int endSeedBound();
     /// Fail the ONE pending subscription whose Subscribe carried
     /// `correlationId` (its handle sees finished()).  False if none.
     bool failPendingSubscribe(int64_t correlationId, SubscriptionFailReason reason,
@@ -271,6 +278,7 @@ public:
     [[nodiscard]] bool movedRoutesToANode(int64_t correlationId);
     /// Moved subscriptions re-armed because their node session was lost.
     [[nodiscard]] uint64_t homedSessionsLost() const noexcept { return homedSessionsLost_; }
+    [[nodiscard]] uint64_t seedBoundEnded() const noexcept { return seedBoundEnded_; }
     /// Bound subscriptions moved by rearmMovedAway.
     [[nodiscard]] uint64_t subscriptionsMoved() const noexcept { return subscriptionsMoved_; }
     /// E2 final fix wave (I1): batches wholly below a moved subscription's
@@ -458,6 +466,7 @@ private:
     NodeRouter  router_{};
     std::size_t homedCount_        = 0;
     uint64_t    homedSessionsLost_ = 0;
+    uint64_t    seedBoundEnded_    = 0;   ///< E2 FU1: ended by endSeedBound (SessionLost)
     std::vector<int64_t> homedScratch_;   // driveHomed: lost bound ones (cold; capacity reused)
     [[nodiscard]] bool routed_() const noexcept { return router_.offer != nullptr; }
     /// The broker session id `impl` lives on: its node session's (homed) or `seedSid`.

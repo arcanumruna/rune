@@ -767,17 +767,24 @@ TEST(HubCommandClient, SubscribeFromOnConnectedCallbackReachesTheBrokerRegressio
 // I-1, the reviewer's exact path: after a reconnect, the ConnectResponse and a
 // Records push arrive in ONE poll; the record handler subscribes (duty thread,
 // direct) — the new Subscribe must reach the broker.
+// E2 FU1: a subscription BOUND on the lost seed session now ends explicitly
+// (SessionLost) — the broker always allocates a new session, so a push in the
+// reconnect poll belongs to a still-PENDING Subscribe (re-sent on the new
+// session) that the push binds.  A is kept pending by losing its first
+// SubscribeResponse.
 TEST(HubCommandClient, SubscribeFromARecordHandlerInTheReconnectPollReachesTheBrokerRegression) {
     HubRig r(4016, 0, &hubNow);
     r.connect();
     std::unique_ptr<rc::Subscription> b;
     int got = 0;
+    r.gw.dropSubscribeResponsesNext = 1;
     auto a = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()},
         [&](const rc::Record&) {
             if (++got == 1) b = std::make_unique<rc::Subscription>(subscribeT(r.client));
         });
-    ASSERT_TRUE(r.drive([&] { return a.subscriptionId() > 0; }));
-    ASSERT_EQ(r.gw.subscribed.size(), 1u);
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribed.size() == 1u; }));
+    r.settle(200);
+    ASSERT_EQ(a.subscriptionId(), 0) << "precondition: A is still pending";
 
     // The session goes down (liveness timeout on the duty clock) ...
     g_hubNow += 11'000'000'000LL;
@@ -791,9 +798,9 @@ TEST(HubCommandClient, SubscribeFromARecordHandlerInTheReconnectPollReachesTheBr
     const int connectsBefore = r.gw.connects;
     ASSERT_TRUE(r.drive([&] { return b != nullptr; })) << "A's handler never ran after the reconnect";
     ASSERT_GT(r.gw.connects, connectsBefore);
-    ASSERT_TRUE(r.drive([&] { return r.gw.subscribed.size() == 2; }))
+    EXPECT_GT(a.subscriptionId(), 0) << "A was bound by the push in the reconnect poll";
+    ASSERT_TRUE(r.drive([&] { return b->subscriptionId() > 0; }))
         << "the Subscribe adopted in the reconnect poll was lost";
-    ASSERT_TRUE(r.drive([&] { return b->subscriptionId() > 0; }));
 }
 
 // M1: a Subscribe the transport can never carry (Fatal) fails the subscription

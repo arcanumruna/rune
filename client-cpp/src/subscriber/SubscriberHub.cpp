@@ -1053,6 +1053,22 @@ void SubscriberHub::failPendingSubscribes(const std::string& reason)
     (void)reason;
 }
 
+int SubscriberHub::endSeedBound()
+{
+    int ended = 0;
+    for (auto it = activeById_.begin(); it != activeById_.end();) {
+        SubscriptionImpl* impl = it->second;
+        if (impl == nullptr || !impl->active || impl->homeSession != 0) { ++it; continue; }
+        impl->failReason = SubscriptionFailReason::SessionLost;
+        finish_(*impl);   // inactive + final status (closed by onRecords if dispatching)
+        ++ended;
+        ++seedBoundEnded_;
+        if (impl == dispatching_) { ++it; continue; }   // onRecords erases it once its handler returns
+        it = activeById_.erase(it);
+    }
+    return ended;
+}
+
 // ---------------------------------------------------------------------------
 // M2 FIX: sweepTimedOut — timeout pending subscribes that got no response
 // ---------------------------------------------------------------------------

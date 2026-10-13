@@ -130,6 +130,12 @@ enum class SubscriptionFailReason : int32_t {
     /// Silent-failure gap: the Subscribe got no SubscribeResponse within
     /// subscribeTimeoutMs (it used to finish with None and no onError).
     TimedOut = 3,
+    /// E2 FU1 (seed-session check): the subscription was bound on the SEED
+    /// session and that session was lost (a resume always gets a new broker
+    /// session, and the broker ends a session's subscriptions with it).  It is
+    /// ended explicitly — never left active and silent.  Subscribe again
+    /// (from position()) to continue.
+    SessionLost = 4,
 };
 
 struct SubscriptionStatus {
