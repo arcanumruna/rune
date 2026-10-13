@@ -5282,7 +5282,7 @@ private:
                 auto readRange = [mem](int64_t from, int64_t /*to*/) -> rune::storage::LogReadView {
                     return mem->readView(from, kPushMaxChunkBytes);
                 };
-                work += driveViewsOf_(topicId, partition, readRange, bound, nowNs, mem);
+                work += driveViewsOf_(topicId, partition, readRange, bound, nowNs, replica);
             }
         }
         return work;
@@ -5291,19 +5291,26 @@ private:
     // One owned source partition's view work.  Order matters: materialize a
     // recovery instance from its checkpoint FIRST, then rebuild/fold.  For a
     // TRANSIENT source the per-instance cursor reconcile happens INSIDE the fold
-    // (WorkerViewSet::driveView_) on the instance already held.
+    // (WorkerViewSet::driveView_) on the instance already held.  `transientRep`
+    // is the owning replica of a TRANSIENT source (its ring's bounds + identity:
+    // incarnation, logGeneration, last cut), nullptr for a disk source.
     // Task 19b (restart recovery): materializeRecoveryInstancesFor + driveRebuild
     // are gated on hasRecovery() — a broker with no durable views runs neither.
     template <class ReadRangeFn>
     int driveViewsOf_(int32_t topicId, int32_t partition, ReadRangeFn& readRange,
-                      int64_t bound, int64_t nowNs, rune::storage::InMemoryLog* transientSrc) {
+                      int64_t bound, int64_t nowNs,
+                      const rune::replication::PartitionReplica* transientRep) {
         int work = 0;
         TransientBounds tb;
         const TransientBounds* tbp = nullptr;
-        if (transientSrc != nullptr) {
-            tb.logStart = transientSrc->logStartOffset();
-            tb.logEnd   = transientSrc->logEndOffset();
-            tbp         = &tb;
+        if (transientRep != nullptr) {
+            const rune::storage::InMemoryLog* mem = transientRep->memoryLog();
+            tb.logStart      = mem->logStartOffset();
+            tb.logEnd        = mem->logEndOffset();
+            tb.incarnation   = transientRep->incarnation();     // E2: the ring's identity
+            tb.logGeneration = transientRep->logGeneration();
+            tb.cutOffset     = transientRep->lastTruncationOffset();
+            tbp              = &tb;
         }
         if (viewSet_->hasRecovery()) [[unlikely]] {
             viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
