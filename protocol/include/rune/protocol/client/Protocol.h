@@ -211,6 +211,11 @@ enum class ErrorCode : uint16_t {
 //       (after the same position note); the client follows it like any
 //       Subscribe Redirect.  Group-member partition subscriptions and
 //       sessions below 6 keep the bare NotLeader.
+//       (E2 final fix wave I2) The Rune v6 client follows a moved
+//       subscription's Redirect PER PARTITION: it re-subscribes from its
+//       position on the new leader's own session and never moves the session
+//       its other subscriptions ride on, so later answers / pushes of that
+//       subscription arrive on that node's session.  No format change.
 // ---------------------------------------------------------------------------
 inline constexpr int32_t kClientVersionUnknownProducerId          = 2;
 inline constexpr int32_t kClientVersionExplicitGroupSubscriptions = 3;
