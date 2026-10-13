@@ -204,6 +204,13 @@ enum class ErrorCode : uint16_t {
 //       recordBatch whose baseOffset is the broker's cursor — so a moved
 //       subscription that delivered nothing resumes there (never re-resolves
 //       Latest).  Clients below 6 ignore an empty Records batch.
+//       Also (E2 Task 14): when the broker already knows ANOTHER leader for a
+//       moved plain subscription (its routing image names it and its client
+//       endpoint is known), a session >= 6 is answered
+//       ErrorResponse{Redirect, that endpoint} instead of the bare NotLeader
+//       (after the same position note); the client follows it like any
+//       Subscribe Redirect.  Group-member partition subscriptions and
+//       sessions below 6 keep the bare NotLeader.
 // ---------------------------------------------------------------------------
 inline constexpr int32_t kClientVersionUnknownProducerId          = 2;
 inline constexpr int32_t kClientVersionExplicitGroupSubscriptions = 3;
