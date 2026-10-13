@@ -385,7 +385,9 @@ struct OffsetFetch {
 // OffsetFetchResult — one result within an OffsetFetchResponse (encode path).
 //   topicId(int32) + partition(int32) + offset(int64) + errorCode(int16)
 // Wire stride: 4 + 4 + 8 + 2 = 18 bytes (fixed)
-// offset -1 = no committed offset (the member applies its reset policy).
+// offset -1 = no committed offset (the Rune client starts the partition at its
+// log start — the oldest record the broker still holds — whatever its reset
+// setting; for a transient partition this reads every refilled record).
 // Phase 2b E2 (final fix wave C1): a broker also answers -1 (errorCode OK) for
 // a TRANSIENT partition whose committed offset belongs to data that did not
 // survive (a restart emptied the ring): an offset is a data position, and
