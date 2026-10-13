@@ -4760,16 +4760,34 @@ void ClientGateway::pushSubscriptionsPass_()
             topicRegistry_->log(sub.topicId, sub.partition) : nullptr;
         // Phase 2b E2: a TRANSIENT partition (no disk Log) is read by its owning
         // worker only (the PushRead below) — never by the inline path.
-        if (!log && (!workerPool_ ||
-                     servedPartition_(sub.topicId, sub.partition).kind != ServedPartition::Kind::Transient))
-            continue; // registry removed or not set — skip
+        // Final fix wave (M6): its classification + replica are cached on the
+        // subscription, refreshed only when a registry generation moved (a
+        // replica added / removed, a topic created / committed) — two integer
+        // compares per cycle instead of four hash probes.
+        if (!log) {
+            if (!workerPool_ || replicaRegistry_ == nullptr || topicRegistry_ == nullptr) continue;
+            const uint64_t regGen = replicaRegistry_->generation();
+            const uint64_t catGen = topicRegistry_->catalogGeneration();
+            if (sub.transientClassRegGen != regGen || sub.transientClassCatGen != catGen) [[unlikely]] {
+                sub.transientClassRegGen = regGen;
+                sub.transientClassCatGen = catGen;
+                ++transientClassifications_;
+                sub.transientReplica =
+                    servedPartition_(sub.topicId, sub.partition).kind == ServedPartition::Kind::Transient
+                        ? replicaRegistry_->lookup(sub.topicId, sub.partition)
+                        : nullptr;
+            }
+            if (sub.transientReplica == nullptr) continue;   // registry removed or not set — skip
+        }
 
         // GR-6: Look up the PartitionReplica for this (topicId, partition).
         // If found → bound = replica->highWatermark() (majority-committed).
         // If not found (non-replicated / registry not wired) → bound = LEO (pass-through).
         // O(1), no alloc, lock-free (single-writer duty-cycle thread).
         int64_t hw;
-        if (replicaRegistry_) {
+        if (!log) {
+            hw = sub.transientReplica->gatewayHighWatermark();   // M6: the cached replica (generations checked above)
+        } else if (replicaRegistry_) {
             const rune::replication::PartitionReplica* replica =
                 replicaRegistry_->lookup(sub.topicId, sub.partition);
             hw = replica ? replica->gatewayHighWatermark() : (log ? log->logEndOffset() : 0);
@@ -4834,8 +4852,9 @@ void ClientGateway::pushSubscriptionsPass_()
             if (sub.retryAtCycle > pushCycle_) continue;
 
             // Look up the owning replica (for the log accessor in the worker).
-            const rune::replication::PartitionReplica* repForRead = nullptr;
-            if (replicaRegistry_) {
+            // M6: a transient partition's is the cached one (no second probe).
+            const rune::replication::PartitionReplica* repForRead = log ? nullptr : sub.transientReplica;
+            if (log && replicaRegistry_) {
                 repForRead = replicaRegistry_->lookup(sub.topicId, sub.partition);
             }
 

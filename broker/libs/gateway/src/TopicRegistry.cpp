@@ -140,6 +140,7 @@ TopicRegistry::createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin o
 
     nameIndex_.emplace(spec.name, assignedId);
     topics_.push_back(std::move(entry));
+    ++catalogGeneration_;
 
     spdlog::info(
         "TopicRegistry::createTopic: topic='{}' id={} partitions={}",
@@ -256,6 +257,7 @@ TopicRegistry::commitTopic(int32_t topicId)
     (void)markTopicCommitted(topicId);
     if (e.committed) return false;
     e.committed = true;
+    ++catalogGeneration_;
     return true;
 }
 

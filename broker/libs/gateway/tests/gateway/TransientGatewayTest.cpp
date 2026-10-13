@@ -1030,3 +1030,32 @@ TEST(TransientGatewayRegression, SubscriptionAcceptedBeforeItsReplicaIsRetiredWh
     EXPECT_EQ(errors[77], kNotLeader);
     EXPECT_EQ(gw.readCommittedSubscriptionsMovedAway(), 1u);
 }
+
+// ---------------------------------------------------------------------------
+// E2 final fix wave (final review M6): the legacy-mode push loop classified
+// every transient subscription on every cycle (servedPartition_: servableLog,
+// awaitingCommit, topic, a replica lookup — then a second and a third lookup).
+// The classification and replica are now cached on the subscription and
+// refreshed only when the replica registry or the catalog changes; delivery is
+// unchanged.  RED (classified every pass): 200 classifications for 200 passes.
+// ---------------------------------------------------------------------------
+TEST(TransientGatewayRegression, LegacyPushClassifiesATransientSubscriptionOncePerRegistryChangeRegression) {
+    Rig r(RigOpts{.partitions = 2});
+    const int64_t sid = r.gw.injectTestSession(0);
+    r.subscribe(sid, 0, 6001, /*read_uncommitted=*/0);
+    ASSERT_TRUE(r.subscribed.count(6001));
+    ASSERT_TRUE(r.awaitProduced(r.produce(sid, 3)).has_value());
+    ASSERT_TRUE(r.pushUntil(1)) << "nothing delivered";
+    const uint64_t afterFirst = r.gw.transientClassificationsForTest();
+    EXPECT_GE(afterFirst, 1u);
+    for (int i = 0; i < 200; ++i) { r.gw.pushSubscriptionsForTest(); r.pass(); }
+    EXPECT_EQ(r.gw.transientClassificationsForTest(), afterFirst)
+        << "re-classified on cycles with no registry change (four hash probes per subscription per cycle)";
+    // A registry change (partition 1's replica replaced) refreshes it once; delivery goes on.
+    r.reg.remove(0, 1);
+    for (int i = 0; i < 4; ++i) { r.gw.pushSubscriptionsForTest(); r.pass(); }
+    EXPECT_EQ(r.gw.transientClassificationsForTest(), afterFirst + 1) << "not refreshed on a registry change";
+    const std::size_t before = r.records.size();
+    ASSERT_TRUE(r.awaitProduced(r.produce(sid, 2)).has_value());
+    ASSERT_TRUE(r.pushUntil(before + 1)) << "the cached classification stopped delivery";
+}

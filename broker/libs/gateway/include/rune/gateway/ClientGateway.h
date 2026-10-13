@@ -965,6 +965,8 @@ public:
     static constexpr int     kMovedAwayLookupsPerSliceForTest = 32;   // == kMovedAwayLookupsPerSlice
     static constexpr int64_t kMovedAwaySummaryEveryNsForTest  = 1'000'000'000;   // == kMovedAwaySummaryEveryNs
     static constexpr int64_t kRoutedSweepMinGapCyclesForTest  = 64;   // == kRoutedSweepMinGapCycles
+    /// M6: transient-partition classifications the push loop made (per registry change, not per cycle).
+    [[nodiscard]] uint64_t transientClassificationsForTest() const noexcept { return transientClassifications_; }
     /// M4: routed moved-away sweeps run so far (coalesced role changes).
     [[nodiscard]] uint64_t routedMovedAwaySweepsForTest() const noexcept { return routedMovedAwaySweeps_; }
     /// N2: moved-away summaries logged, and the count the last one reported.
@@ -1242,6 +1244,14 @@ private:
         // here when it was created — its later REMOVAL (the partition moved off
         // this node) retires it NotLeader (retireMovedAway_), any isolation.
         bool    hadReplica       = false;
+        // E2 final fix wave (M6): a partition with no disk Log is classified
+        // (servedPartition_: Transient → its replica) ONCE per registry change
+        // — keyed by the replica registry's generation (any add / remove) and
+        // the catalog's — never re-probed every push cycle.  transientReplica
+        // is valid only while both generations still match (checked first).
+        const rune::replication::PartitionReplica* transientReplica = nullptr;
+        uint64_t transientClassRegGen = UINT64_MAX;
+        uint64_t transientClassCatGen = UINT64_MAX;
     };
 
     // -----------------------------------------------------------------------
@@ -2114,6 +2124,7 @@ private:
     bool     routedSweepPending_     = false;
     int64_t  nextRoutedSweepCycle_   = 0;     ///< M4: the earliest pass the next routed sweep may run
     uint64_t routedMovedAwaySweeps_  = 0;     ///< M4: routed sweeps run (tests)
+    uint64_t transientClassifications_ = 0;   ///< M6: see Subscription::transientReplica (tests)
     static constexpr int64_t kRoutedSweepMinGapCycles = kRoutedSweepMinGapCyclesForTest;
     static constexpr int64_t     kMovedAwayScanEveryCycles   = kMovedAwayScanEveryCyclesForTest;   ///< power of two
     static constexpr int         kMovedAwayLookupsPerSlice   = kMovedAwayLookupsPerSliceForTest;
