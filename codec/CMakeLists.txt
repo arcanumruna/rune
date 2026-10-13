@@ -12,6 +12,17 @@ add_library(rune_codec STATIC
     src/AlterOps.cpp)
 target_include_directories(rune_codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+# ── rune_catalog — the shared catalog-history library (spec §6): event model,
+#    frozen per-formatVer apply rules, fingerprints, replayer, queries, .rcat.
+#    Linked by the broker (AdminWorker), the client and the rune CLI.
+set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include" CACHE PATH
+    "rune-protocol include dir (rune/protocol/CatalogTypes.h: the one TopicConfig + RequestId)")
+add_library(rune_catalog STATIC
+    src/catalog/CatalogEvent.cpp)
+target_include_directories(rune_catalog PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${RUNE_PROTOCOL_INCLUDE})
+target_link_libraries(rune_catalog PUBLIC rune_codec)
+target_compile_features(rune_catalog PUBLIC cxx_std_23)
+
 # ── CLI tool: rune_codec_gen ─────────────────────────────────────────────────
 add_executable(rune_codec_gen tools/rune_codec_gen_main.cpp)
 target_link_libraries(rune_codec_gen PRIVATE rune_codec)
@@ -96,6 +107,11 @@ add_dependencies(rune_codec_tests generate_characters_header generate_fixedstr_s
                  generate_str_keyed_header)
 include(GoogleTest)
 gtest_discover_tests(rune_codec_tests)
+
+add_executable(rune_catalog_tests
+    tests/catalog/CatalogEventTest.cpp)
+target_link_libraries(rune_catalog_tests PRIVATE rune_catalog GTest::gtest_main)
+gtest_discover_tests(rune_catalog_tests)
 
 find_package(benchmark QUIET)
 if(benchmark_FOUND)
