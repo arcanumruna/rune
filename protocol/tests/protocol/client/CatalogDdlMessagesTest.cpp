@@ -533,3 +533,18 @@ TEST(CatalogDdlConformance, DdlResponseGolden) {
     EXPECT_EQ(d->gateTopicId, 5);
     EXPECT_EQ(d->detail, "replicationFactor 5 > broker count 3");
 }
+
+// Fix round 0 (review concern 1): ConfigKey has ONE definition (CatalogTypes.h),
+// reused by the wire range and by rune-codec's catalog::ConfigKey; values never move.
+TEST(CatalogDdlWireRegression, ConfigKeyIsTheOneDefinitionAndItsValuesArePinnedRegression) {
+    using K = rune::protocol::ConfigKey;
+    static_assert(std::is_same_v<std::underlying_type_t<K>, uint8_t>);
+    EXPECT_EQ(static_cast<uint8_t>(K::RetentionMs), 1);
+    EXPECT_EQ(static_cast<uint8_t>(K::RetentionBytes), 2);
+    EXPECT_EQ(static_cast<uint8_t>(K::DeleteRetentionMs), 3);
+    EXPECT_EQ(static_cast<uint8_t>(K::MinCleanableDirtyRatioPpm), 4);
+    EXPECT_EQ(static_cast<uint8_t>(K::MinCompactionLagMs), 5);
+    EXPECT_EQ(static_cast<uint8_t>(K::MaxCompactionLagMs), 6);
+    EXPECT_EQ(pc::kConfigKeyFirst, static_cast<uint8_t>(K::RetentionMs));
+    EXPECT_EQ(pc::kConfigKeyLast, static_cast<uint8_t>(K::MaxCompactionLagMs));
+}

@@ -49,6 +49,16 @@ template <class To, class From>
     return t;
 }
 
+/// AlterTopicConfig keys (ruling 5) — the ONE definition: the wire
+/// (client/SchemaMessages.h AlterTopicConfig) and rune-codec's catalog events
+/// (catalog::ConfigKey aliases it).  Append-only; values never move.
+enum class ConfigKey : uint8_t {
+    RetentionMs = 1, RetentionBytes = 2, DeleteRetentionMs = 3,
+    MinCleanableDirtyRatioPpm = 4, MinCompactionLagMs = 5, MaxCompactionLagMs = 6,
+};
+inline constexpr ConfigKey kFirstConfigKey = ConfigKey::RetentionMs;
+inline constexpr ConfigKey kLastConfigKey  = ConfigKey::MaxCompactionLagMs;
+
 /// A DDL's logical id (F14): hi = the issuing client instance's random 64-bit id
 /// (never 0), lo = that instance's counter.  {0, 0} = none (a pre-v8 client).
 /// Stable across every resend of the same DDL.
