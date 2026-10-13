@@ -2526,6 +2526,21 @@ void Client::onEgressFrame(codec::TemplateId tid,
             // bounded by the per-corr budget.  Exhausted -> explicit failure
             // carrying the broker code, and the app's onError fires.
             if (subscriberHub_.isPending(opt->correlationId)) {
+                // E2 final fix wave (I2): a MOVED subscription whose partition
+                // routes to a node session retries THERE after a backoff (its
+                // new leader may not have taken over yet) — never through the
+                // seed, which may sit on the node that just went away.  Same
+                // bounded budget; exhausted -> the explicit failure below.
+                if (subscriberHub_.movedRoutesToANode(opt->correlationId) &&
+                    subscriberHub_.chargeNotLeaderRetry(opt->correlationId, producer::ProducerImpl::kMaxRedirects)) {
+                    (void)subscriberHub_.holdMovedForRetry(
+                        opt->correlationId,
+                        std::chrono::steady_clock::now() + std::chrono::nanoseconds(redirectedResendBackoffNs_));
+                    redirectedResendBackoffNs_ =
+                        std::min<int64_t>(redirectedResendBackoffNs_ * 2, kRedirectedResendMaxNs);
+                    requestMetadataNow_();
+                    break;
+                }
                 if (subscriberHub_.chargeNotLeaderRetry(opt->correlationId,
                                                         producer::ProducerImpl::kMaxRedirects)) {
                     if (std::find(redirectedSubscribes_.begin(), redirectedSubscribes_.end(),

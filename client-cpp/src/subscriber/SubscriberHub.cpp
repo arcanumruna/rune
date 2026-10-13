@@ -815,7 +815,34 @@ void SubscriberHub::sendHomed_(PendingMap::iterator it)
     }
 }
 
-int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_point deadline)
+bool SubscriberHub::movedRoutesToANode(int64_t correlationId)
+{
+    int32_t t = -1, p = -1;
+    if (!routed_() || !movedPendingPartition(correlationId, t, p)) return false;
+    return router_.leaderSession(router_.ctx, t, p) != 0;
+}
+
+bool SubscriberHub::holdMovedForRetry(int64_t correlationId, std::chrono::steady_clock::time_point notBefore)
+{
+    if (!routed_()) return false;
+    const auto it = pendingByCorrelation_.find(correlationId);
+    if (it == pendingByCorrelation_.end() || !it->second || it->second->impl == nullptr) return false;
+    SubscriptionImpl& impl = *it->second->impl;
+    if (!impl.moved || !impl.active) return false;
+    const int32_t  part    = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
+    const uint32_t session = router_.leaderSession(router_.ctx, impl.topicId, part);
+    if (session == 0) return false;   // the seed's node leads: the seed's own retry path
+    clearUnsent_(*it->second);
+    impl.homeSession       = session;
+    impl.homeSid           = 0;   // held: driveHomed re-offers it after notBefore
+    impl.homeEpoch         = 0;
+    it->second->notBefore  = notBefore;
+    ++homedCount_;
+    return true;
+}
+
+int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_point deadline,
+                              std::chrono::steady_clock::time_point now)
 {
     if (!routed_()) { homedCount_ = 0; return 0; }
     int work = 0;
@@ -829,7 +856,8 @@ int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_p
             SubscriptionImpl& impl = *req->impl;
             const bool held = impl.homeSid == 0;
             const bool lost = !held && router_.epoch(router_.ctx, impl.homeSession) != impl.homeEpoch;
-            if (held || lost) {
+            const bool due  = !held || now >= req->notBefore;   // a NotLeader backoff (holdMovedForRetry)
+            if ((held && due) || lost) {
                 if (lost) ++homedSessionsLost_;
                 routeMovedPending_(it, seedSid);   // homedCount_ is recounted below
                 ++work;

@@ -44,6 +44,9 @@ struct SubscribeRequest {
     std::chrono::steady_clock::time_point deadline;        // M2: subscribe-request timeout
     bool                                  unsent = false;  // fix3 I4: refused, retried per cycle
     uint8_t                               nlRetries = 0;   // bare-NotLeader retries spent (bounded budget)
+    // E2 final fix wave (I2): a moved subscription held on its node session is
+    // not re-offered before this time (a bare NotLeader backoff); epoch = no wait.
+    std::chrono::steady_clock::time_point notBefore{};
 };
 
 class SubscriberHub {
@@ -236,7 +239,17 @@ public:
     /// the broker ended the subscription with it) is re-armed from its
     /// position under a fresh correlationId (`deadline` = its subscribe
     /// timeout) and routed again — never a silent stall.  Returns work done.
-    int driveHomed(int64_t seedSid, std::chrono::steady_clock::time_point deadline);
+    int driveHomed(int64_t seedSid, std::chrono::steady_clock::time_point deadline,
+                   std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
+    /// The pending MOVED Subscribe `correlationId` was answered a bare
+    /// NotLeader (its new leader has not taken over yet): it is re-offered on
+    /// the partition's current route after `notBefore` by driveHomed — never
+    /// through the seed (which may sit on the node that just went away).  False
+    /// when it is not a pending moved one whose route is a node session.
+    bool holdMovedForRetry(int64_t correlationId, std::chrono::steady_clock::time_point notBefore);
+    /// The pending Subscribe `correlationId` is a moved one whose partition
+    /// currently routes to a node session (not the seed).
+    [[nodiscard]] bool movedRoutesToANode(int64_t correlationId);
     /// Moved subscriptions re-armed because their node session was lost.
     [[nodiscard]] uint64_t homedSessionsLost() const noexcept { return homedSessionsLost_; }
     /// Bound subscriptions moved by rearmMovedAway.

@@ -2375,3 +2375,48 @@ TEST(GroupRoutingRegression, MovedSubscriptionWhoseNodeSessionIsLostIsReArmedReg
     EXPECT_TRUE(s0.active());
     s0.unsubscribe();
 }
+
+// I2 (found by the 3-node transient failover e2e, seed-follows-redirect
+// variant): the seed session sits on the node being stopped.  It redirects the
+// moved subscription to node 1, but node 1 has not taken over yet and answers
+// a bare NotLeader; the seed's node is gone meanwhile.  The moved subscription
+// must retry on node 1's own session after a backoff and bind once node 1
+// leads — never wait for the seed.  RED (the retry went through the seed's
+// redirected-subscribe path, gated on the dead seed): never re-subscribed.
+TEST(GroupRoutingRegression, MovedSubscriptionAnsweredNotLeaderByItsNewLeaderRetriesThereWithoutTheSeedRegression) {
+    GroupRig r(4237, 4238);
+    const auto [n1, p1port] = r.addNode(4237);
+    const auto [n2, p2port] = r.addNode(4237);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4237, ""}};
+    r.gw.subscribeLeader = {{0, 0}};
+    r.gw.groupProtocol   = false;
+    r.connect();
+    PlainLedger led;
+    auto s0 = r.client.subscribe(r.client.topic("t"), 0, rc::SubscribeOptions{rc::From::earliest()}, led.handler(0));
+    ASSERT_TRUE(r.drive([&] { return s0.subscriptionId() != 0; }));
+    const auto a0 = *r.subAt(0, 0);
+    r.gw.pushRecords(a0, 0, 2);
+    ASSERT_TRUE(r.drive([&] { return led.count(0) == 2; }));
+
+    // Node 0 (the seed) stops: it redirects the subscription to node 1 and dies.
+    // Node 1 does not lead yet (the fake's routing still names node 2): bare NotLeader.
+    r.gw.subscribeLeader[0]  = n2;
+    r.gw.subscribeNotLeader  = true;
+    r.gw.partitions          = {{1, 0, 1, 2, 4237, ""}};
+    r.gw.sendError(0, static_cast<int16_t>(rune::protocol::client::ErrorCode::Redirect),
+                   "127.0.0.1:" + std::to_string(p1port), a0.sessionId, a0.corrId);
+    r.gw.deadEndpoints.insert(0);
+    ASSERT_TRUE(r.drive([&] { return r.gw.subscribeRefusals >= 1; })) << "node 1 never saw the moved Subscribe";
+    // Node 1 takes over.
+    r.gw.subscribeLeader[0] = n1;
+    ASSERT_TRUE(r.drive([&] { return r.subAt(0, n1) != nullptr && s0.subscriptionId() == r.subAt(0, n1)->subscriptionId; },
+                        20'000'000))
+        << "SILENT STALL: the moved subscription waited for the dead seed instead of retrying on node 1";
+    EXPECT_EQ(r.subAt(0, n1)->fromOffset, 2);
+    r.gw.pushRecords(*r.subAt(0, n1), 2, 2);
+    ASSERT_TRUE(r.drive([&] { return led.count(0) == 4; }));
+    EXPECT_EQ(led.dupes(), 0);
+    EXPECT_TRUE(s0.active());
+    s0.unsubscribe();
+}
