@@ -2641,8 +2641,11 @@ void Client::onEgressFrame(codec::TemplateId tid,
         // the node id in its high bits), whichever node / publication pushed it.
         // Route to the subscriber hub first (direct subscriptions).
         subscriberHub_.onRecords(*opt, agent_.seedSession().machine.sessionId());
-        // Also route to group consumer hub (assigned partitions).
-        groupConsumerHub_.onRecords(*opt);
+        // Also route to group consumer hub (assigned partitions) — never a
+        // broker POSITION NOTE (an empty batch, client version 6, E2 Task 13):
+        // it concerns plain subscriptions; a member resumes from its own
+        // position (an empty view would move it as one record).
+        if (!opt->recordBatch.empty()) [[likely]] groupConsumerHub_.onRecords(*opt);
         break;
     }
 

@@ -185,6 +185,11 @@ struct SubscriptionImpl {
     // the new leader pushes the WHOLE batch containing it, so that first batch's
     // records below it (already delivered) are dropped.  One-shot; -1 = none.
     int64_t resumeFloor    = -1;
+    // E2 Task 13 fix round 2: the broker's POSITION NOTE (an empty-batch
+    // Records frame sent before it answers a moved subscription NotLeader —
+    // client version 6): its cursor.  A subscription that delivered nothing
+    // resumes there (never re-resolves Latest).  -1 = none.
+    int64_t resumeHint     = -1;
     bool    active         = true;  // false once unsubscribed / timed out / closed
     bool    statusDirty    = false; // a snapshot newer than the last published one exists
     // F8a fix2: an Unsubscribe the transport refused, retried by the duty cycle.

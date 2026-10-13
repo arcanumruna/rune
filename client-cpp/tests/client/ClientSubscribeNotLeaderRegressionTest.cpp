@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -121,10 +122,16 @@ struct SubGateway {
                                                    std::span<const uint8_t>(batch), sessionId, corr);
         if (len > 0) send(replyBuf, len);
     }
-    // The first Subscribe binds (id 9) and delivers offsets 0..2; then this node
-    // stops leading the partition: NotLeader on that Subscribe's correlation id
-    // (what the broker answers a demoted leader's read_committed subscription).
-    // The re-subscribe binds (id 10) and delivers offsets 3..4.
+    // The move script (MovesAfterBind / MovesMidBatch).  Defaults: the first
+    // Subscribe binds (id 9) and delivers offsets 0..2; then this node stops
+    // leading the partition — optionally a position note (empty-batch Records,
+    // client version 6) — and NotLeader (or Redirect) on that Subscribe's
+    // correlation id.  The re-subscribe binds (id 10) and delivers 3..4.
+    std::vector<std::pair<int64_t, int>> firstPushes{{0, 3}};
+    std::vector<std::pair<int64_t, int>> secondPushes{{3, 2}};
+    int16_t     moveCode = static_cast<int16_t>(rp::ErrorCode::NotLeader);
+    std::string moveMessage;            // Redirect: the endpoint to follow
+    int64_t     noteBase = -1;          // >= 0: send a position note first
     void movesAfterBind(const rcc::SubscribeView& v, int k) {
         rcc::SubscribeView copy = v;
         copy.key = {};
@@ -134,15 +141,17 @@ struct SubGateway {
                                                      v.sessionId, v.correlationId);
         if (n > 0) send(replyBuf, n);
         if (k == 1) {
-            pushRecords(9, 0, 3, v.sessionId, v.correlationId);
-            n = rcc::encodeErrorResponse(replyBuf, sizeof(replyBuf), static_cast<int16_t>(rp::ErrorCode::NotLeader),
-                                         std::string_view{}, v.sessionId, v.correlationId);
+            for (const auto& [base, cnt] : firstPushes) pushRecords(9, base, cnt, v.sessionId, v.correlationId);
+            if (noteBase >= 0) {
+                n = rcc::encodeRecords(replyBuf, sizeof(replyBuf), 9, 1, 0, noteBase, std::span<const uint8_t>{},
+                                       v.sessionId, v.correlationId);
+                if (n > 0) send(replyBuf, n);
+            }
+            n = rcc::encodeErrorResponse(replyBuf, sizeof(replyBuf), moveCode, moveMessage, v.sessionId,
+                                         v.correlationId);
             if (n > 0) send(replyBuf, n);
         } else if (k == 2) {
-            // MovesMidBatch: the new leader's batch STRADDLES the resume position
-            // (offsets 0..4, position 3) — it is pushed whole.
-            if (mode == SubMode::MovesMidBatch) pushRecords(10, 0, 5, v.sessionId, v.correlationId);
-            else                                pushRecords(10, 3, 2, v.sessionId, v.correlationId);
+            for (const auto& [base, cnt] : secondPushes) pushRecords(10, base, cnt, v.sessionId, v.correlationId);
         }
     }
 
@@ -218,9 +227,10 @@ struct Rig {
         client->close();
         try { std::filesystem::remove_all(agentDir); } catch (...) {}
     }
-    Subscription subscribe(Isolation iso = Isolation::ReadUncommitted, RecordHandler h = [](const Record&) {}) {
+    Subscription subscribe(Isolation iso = Isolation::ReadUncommitted, RecordHandler h = [](const Record&) {},
+                           From from = From::earliest()) {
         auto th = client->topic("inventory");
-        SubscribeOptions o; o.from = From::earliest(); o.isolation = iso;
+        SubscribeOptions o; o.from = from; o.isolation = iso;
         return client->subscribe(th, 0, o, std::move(h));
     }
 };
@@ -328,6 +338,7 @@ TEST(SubscribeNotLeaderRegression, BoundSubscriptionAnsweredNotLeaderMovesFromIt
 // must not reach the handler again.  RED: 0..2 were delivered twice (8 records).
 TEST(SubscribeNotLeaderRegression, MovedSubscriptionDropsTheStraddlingBatchBelowItsPositionRegression) {
     Rig r("snl_e", 4740, 4741, SubMode::MovesMidBatch, 60'000);
+    r.gw->secondPushes = {{0, 5}};   // the new leader's batch STRADDLES the resume position 3
     std::atomic<uint32_t> seenMask{0};
     std::atomic<int>      seen{0};
     auto sub = r.subscribe(Isolation::ReadCommitted, [&](const Record& rec) {
@@ -344,5 +355,103 @@ TEST(SubscribeNotLeaderRegression, MovedSubscriptionDropsTheStraddlingBatchBelow
     for (int i = 0; i < 50; ++i) { r.gw->poll(16); std::this_thread::sleep_for(2ms); }   // let any duplicate land
     EXPECT_EQ(seen.load(), 5) << "records below the resume position were delivered again";
     EXPECT_EQ(seenMask.load(), 0x1Fu);
+    sub.unsubscribe();
+}
+
+// ---- Task 13 fix round 2 (M3 / M4) -----------------------------------------
+namespace {
+struct Seen {
+    std::atomic<int>      count{0};
+    std::atomic<uint64_t> mask{0};
+    std::atomic<int>      dupes{0};
+    RecordHandler handler() {
+        return [this](const Record& rec) {
+            if (rec.offset >= 0 && rec.offset < 64) {
+                const uint64_t bit = uint64_t{1} << rec.offset;
+                if (mask.fetch_or(bit) & bit) dupes.fetch_add(1);
+            }
+            count.fetch_add(1);
+        };
+    }
+};
+bool driveUntil(Rig& r, const std::function<bool()>& pred, int iters = 2500) {
+    for (int i = 0; i < iters; ++i) {
+        r.gw->poll(16);
+        if (pred()) return true;
+        std::this_thread::sleep_for(2ms);
+    }
+    return pred();
+}
+void settle(Rig& r) { for (int i = 0; i < 50; ++i) { r.gw->poll(16); std::this_thread::sleep_for(2ms); } }
+}  // namespace
+
+// M4: the floor never drops a batch WHOLLY below it — after a move that is not
+// a re-delivery (a reset / restarted transient log's new data): delivered.
+TEST(SubscribeNotLeaderRegression, MovedSubscriptionDeliversABatchWhollyBelowItsPositionRegression) {
+    Rig r("snl_f", 4750, 4751, SubMode::MovesAfterBind, 60'000);
+    r.gw->secondPushes = {{0, 2}, {3, 2}};   // 0..1 wholly below position 3, then 3..4
+    Seen seen;
+    auto sub = r.subscribe(Isolation::ReadCommitted, seen.handler());
+    ASSERT_TRUE(driveUntil(r, [&] { return sub.subscriptionId() == 10 && sub.position() == 5; }))
+        << "id " << sub.subscriptionId() << ", position " << sub.position();
+    settle(r);
+    EXPECT_EQ(seen.count.load(), 3 + 2 + 2) << "the wholly-below batch was dropped (or something else was)";
+    sub.unsubscribe();
+}
+
+// M4: the floor is ONE-SHOT — it applies to the first batch after the move
+// only.  Here the first batch (3..4) does not straddle; a later straddling one
+// (2..5) is delivered whole: a later batch below the position is not one the
+// resume asked for.
+TEST(SubscribeNotLeaderRegression, MovedSubscriptionFloorIsOneShotRegression) {
+    Rig r("snl_g", 4760, 4761, SubMode::MovesAfterBind, 60'000);
+    r.gw->secondPushes = {{3, 2}, {2, 4}};
+    Seen seen;
+    auto sub = r.subscribe(Isolation::ReadCommitted, seen.handler());
+    ASSERT_TRUE(driveUntil(r, [&] { return sub.subscriptionId() == 10 && seen.count.load() >= 3 + 2 + 4; }))
+        << "id " << sub.subscriptionId() << ", seen " << seen.count.load();
+    settle(r);
+    EXPECT_EQ(seen.count.load(), 3 + 2 + 4) << "the floor filtered a batch after the first";
+    sub.unsubscribe();
+}
+
+// M4: a moved subscription answered REDIRECT (the demoted node names the
+// leader) follows it: retarget + reconnect + the re-armed Subscribe resent on
+// the new session, from the position.
+TEST(SubscribeNotLeaderRegression, MovedSubscriptionAnsweredRedirectFollowsTheLeaderRegression) {
+    Rig r("snl_h", 4770, 4771, SubMode::MovesAfterBind, 60'000);
+    r.gw->moveCode    = static_cast<int16_t>(rp::ErrorCode::Redirect);
+    r.gw->moveMessage = "aeron:ipc";   // the leader's endpoint (same fake gateway)
+    Seen seen;
+    auto sub = r.subscribe(Isolation::ReadCommitted, seen.handler());
+    ASSERT_TRUE(driveUntil(r, [&] { return sub.subscriptionId() == 10 && sub.position() == 5; }))
+        << "SILENT STALL: a moved subscription answered Redirect never re-subscribed (id " << sub.subscriptionId()
+        << ", position " << sub.position() << ", Subscribes " << r.gw->subscribesSeen.load() << ")";
+    ASSERT_EQ(r.gw->subscribes.size(), 2u);
+    EXPECT_EQ(r.gw->subscribes[1].fromOffset, 3);
+    EXPECT_NE(r.gw->subscribes[1].correlationId, r.gw->subscribes[0].correlationId);
+    settle(r);
+    EXPECT_EQ(seen.count.load(), 5);
+    EXPECT_EQ(seen.dupes.load(), 0);
+    EXPECT_EQ(r.errors.load(), 0);
+    sub.unsubscribe();
+}
+
+// M3: a LATEST subscription bound but with nothing delivered must resume from
+// the broker's bind-time resolved position (its position note), never
+// re-resolve Latest — records produced around the move would be lost.
+TEST(SubscribeNotLeaderRegression, MovedLatestSubscriptionWithNothingDeliveredResumesAtThePositionNoteRegression) {
+    Rig r("snl_i", 4780, 4781, SubMode::MovesAfterBind, 60'000);
+    r.gw->firstPushes  = {};          // bound, nothing delivered
+    r.gw->noteBase     = 7;           // the broker resolved Latest to 7 at bind time
+    r.gw->secondPushes = {{7, 2}};
+    Seen seen;
+    auto sub = r.subscribe(Isolation::ReadCommitted, seen.handler(), From::latest());
+    ASSERT_TRUE(driveUntil(r, [&] { return sub.subscriptionId() == 10 && sub.position() == 9; }))
+        << "id " << sub.subscriptionId() << ", position " << sub.position();
+    ASSERT_EQ(r.gw->subscribes.size(), 2u);
+    EXPECT_EQ(r.gw->subscribes[0].fromOffset, -1) << "precondition: subscribed Latest";
+    EXPECT_EQ(r.gw->subscribes[1].fromOffset, 7) << "the move re-resolved Latest instead of resuming at the note";
+    EXPECT_EQ(seen.count.load(), 2);
     sub.unsubscribe();
 }

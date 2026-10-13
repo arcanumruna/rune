@@ -470,7 +470,13 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
     // The spans are views into the Aeron fragment buffer, which is valid for
     // the duration of this call (i.e. during the RecordHandler callback).
     const auto& rb = rv.recordBatch;
-    if (rb.empty()) return;
+    if (rb.empty()) {
+        // A POSITION NOTE (client version 6): the broker's cursor for this
+        // subscription, sent right before it answers NotLeader (moved).  Kept
+        // only while nothing was delivered (rearmMovedAway resumes there).
+        if (impl.nextOffset == 0 && rv.baseOffset >= 0) impl.resumeHint = rv.baseOffset;
+        return;
+    }
 
     rune::protocol::RecordBatchReader reader(rb.data(), rb.size());
     if (!reader.ensureValid()) {
@@ -651,7 +657,11 @@ bool SubscriberHub::rearmMovedAway(int64_t correlationId, int64_t newCorrId, int
         // running: nothing to move.
         if (!impl.active || impl.unsubPending || &impl == dispatching_) return false;
         const int32_t part = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
-        const int64_t from = impl.nextOffset > 0 ? impl.nextOffset : impl.fromWire;  // 0 = nothing delivered
+            // Nothing delivered (nextOffset 0): the broker's position note (its
+        // bind-time resolved start / cursor), else the requested From.
+        const int64_t from = impl.nextOffset > 0  ? impl.nextOffset
+                           : impl.resumeHint >= 0 ? impl.resumeHint
+                                                  : impl.fromWire;
         uint8_t frameBuf[256]{};
         const std::size_t frameLen = codec::encodeSubscribe(frameBuf, sizeof(frameBuf), impl.topicId, part,
                                                             /*partitionKnown=*/1, from, impl.isolation,
@@ -676,6 +686,7 @@ bool SubscriberHub::rearmMovedAway(int64_t correlationId, int64_t newCorrId, int
         impl.correlationId  = newCorrId;
         impl.subscriptionId = 0;   // pending again until the leader binds it
         impl.resumeFloor    = impl.nextOffset > 0 ? impl.nextOffset : -1;
+        impl.resumeHint     = -1;
         pendingByCorrelation_.emplace(newCorrId, std::move(req));
         ++subscriptionsMoved_;
         publishStatus_(impl);
