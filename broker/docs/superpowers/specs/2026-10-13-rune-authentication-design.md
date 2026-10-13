@@ -1,7 +1,7 @@
 # Rune — Authentication and access control
 
-**Status:** design agreed with the user, decision by decision, on 2026-10-13. The written spec awaits final review.
-**Scheduling:** proposed directly after the catalog-history phase (`__catalog`), because `__security` reuses that phase's event-log machinery. The user confirms the exact slot relative to D / B / F / A.
+**Status:** approved by the user on 2026-10-13.
+**Scheduling:** directly after the catalog-history phase and before Part D, confirmed by the user on 2026-10-13. `__security` reuses that phase's event-log machinery.
 **Out of scope:** tenants and multi-tenancy (a separate design), mTLS client certificates, tokens (OAuth/OIDC/JWT), deny rules and quotas.
 **Repos:**
 - rune-broker: `__security`, enforcement, the SCRAM server, the cluster key, bootstrap
