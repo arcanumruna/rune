@@ -249,34 +249,99 @@ bool GroupCoordinationService::rebalanceForSupersededLineage_(const GroupId& gro
     const coord::GroupState before = coord.state();
     if (!coord.forceRebalance(nowNs)) return false;
     ++supersededRebalances_;
-    spdlog::info("GroupCoordinationService: group '{}' holds a committed offset of transient topicId={} "
-                 "partition={} from a superseded data lineage (now {:#x}) — forced rebalance to generation {} "
-                 "(members re-fetch: the log start)", groupId, topicId, partition, now, coord.generationId());
+    spdlog::info("GroupCoordinationService: group '{}' consumed / committed transient topicId={} partition={} "
+                 "under a superseded data lineage (now {:#x}) — forced rebalance to generation {} (members "
+                 "re-fetch: the log start)", groupId, topicId, partition, now, coord.generationId());
     if (before != coord::GroupState::PreparingRebalance) onEnterPreparingRebalance(groupId, coord);
     return true;
+}
+
+GroupCoordinationService::GenLineage* GroupCoordinationService::genLineageOf_(const std::string& groupId,
+                                                                             int32_t topicId, int32_t partition) {
+    const auto it = genLineages_.find(groupId);
+    if (it == genLineages_.end()) return nullptr;
+    for (auto& g : it->second)
+        if (g.topicId == topicId && g.partition == partition) return &g;
+    return nullptr;
+}
+
+void GroupCoordinationService::recordGenLineages_(const GroupId& groupId, const coord::GroupCoordinator& coord) {
+    if (lineageFn_ == nullptr || topics_ == nullptr) return;
+    auto& v = genLineages_[groupId];   // cold: once per rebalance
+    v.clear();
+    for (const auto& m : coord.members()) {
+        for (const auto& tp : m.assignment) {
+            const auto id = topics_->topicIdForName(tp.topic);
+            if (!id) continue;
+            const uint64_t l = lineageOf_(*id, tp.partition);
+            if (l == 0) continue;   // a disk partition
+            bool dup = false;
+            for (const auto& g : v) dup = dup || (g.topicId == *id && g.partition == tp.partition);
+            if (!dup) v.push_back(GenLineage{*id, tp.partition, l});
+        }
+    }
+}
+
+void GroupCoordinationService::pruneGroupLineageState_(const std::string& groupId) {
+    supersededHandled_.erase(groupId);
+    genLineages_.erase(groupId);
+    std::erase_if(pendingChecks_, [&](const PendingCheck& p) { return p.groupId == groupId; });
+}
+
+bool GroupCoordinationService::checkSuperseded_(const std::string& groupId, int32_t topicId, int32_t partition,
+                                                uint64_t ref, bool genEntry, int64_t nowNs) {
+    const uint64_t now = lineageOf_(topicId, partition);
+    if (now == kLineagePending) return false;
+    if (now == 0) return true;
+    if (genEntry) {
+        GenLineage* g = genLineageOf_(groupId, topicId, partition);
+        if (g == nullptr) return true;   // re-recorded / pruned since
+        if (g->lineage == kLineagePending) { g->lineage = now; return true; }   // the first confirmed: consumed
+        ref = g->lineage;
+    }
+    if (ref == now) return true;
+    const auto it = coordinators_.find(groupId);
+    if (it != coordinators_.end() && !it->second.isEmpty())
+        (void)rebalanceForSupersededLineage_(it->first, it->second, topicId, partition, now, nowNs);
+    return true;
+}
+
+void GroupCoordinationService::retryPendingChecks_(int64_t nowNs) {
+    if (pendingChecks_.empty() || nowNs < nextLineageSweepNs_) return;
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < pendingChecks_.size(); ++i) {
+        PendingCheck& p = pendingChecks_[i];
+        if (!checkSuperseded_(p.groupId, p.topicId, p.partition, p.ref, p.genEntry, nowNs)) {
+            if (kept != i) pendingChecks_[kept] = std::move(p);
+            ++kept;
+        }
+    }
+    pendingChecks_.resize(kept);   // shrinks only: no allocation
+    nextLineageSweepNs_ = nowNs + 100'000'000;
 }
 
 void GroupCoordinationService::sweepSupersededLineages_(int64_t nowNs) {
     if (lineageFn_ == nullptr || offsets_ == nullptr || !isLocalCoordinator() || !offsetsLoaded_()) return;
     const uint64_t v = lineageVersionFn_ != nullptr ? lineageVersionFn_(lineageVersionCtx_) : 0;
-    const bool changed = v != lineageSweptVersion_;
-    if (!changed && !(lineageSweepRetry_ && nowNs >= nextLineageSweepNs_)) return;
-    bool pending = false;
+    if (v == lineageSweptVersion_) {   // no lineage change: only the undecided ones (F4: no fetchAll)
+        retryPendingChecks_(nowNs);
+        return;
+    }
+    // A lineage changed (an event: a restart / a leadership move) — cold.
+    pendingChecks_.clear();
     for (auto& [groupId, coord] : coordinators_) {
-        if (coord.isEmpty()) continue;
+        if (coord.isEmpty()) { pruneGroupLineageState_(groupId); continue; }   // F4: nothing live to fence
+        // (b) its committed offsets (R1)
         for (const auto& [tp, co] : offsets_->fetchAll(groupId)) {
-            if (co.lineage == 0 || topics_ == nullptr) continue;   // not a transient position
+            if (co.lineage == 0 || topics_ == nullptr) continue;
             const auto id = topics_->topicIdForName(tp.topic);
             if (!id) continue;
-            const uint64_t now = lineageOf_(*id, tp.partition);
-            if (now == kLineagePending) { pending = true; continue; }   // decided on a later sweep
-            if (now == 0 || now == co.lineage) continue;
-            (void)rebalanceForSupersededLineage_(groupId, coord, *id, tp.partition, now, nowNs);
+            if (!checkSuperseded_(groupId, *id, tp.partition, co.lineage, /*genEntry=*/false, nowNs))
+                pendingChecks_.push_back(PendingCheck{groupId, *id, tp.partition, co.lineage, false});
         }
     }
     lineageSweptVersion_ = v;
-    lineageSweepRetry_   = pending;
-    nextLineageSweepNs_  = nowNs + 100'000'000;   // a pending lineage: re-swept every 100 ms (cold)
+    nextLineageSweepNs_  = nowNs + 100'000'000;
 }
 
 // ---------------------------------------------------------------------------
@@ -906,7 +971,8 @@ size_t GroupCoordinationService::handleOffsetCommit(
             // member re-joins and re-fetches).  After that rebalance an old-
             // generation commit is fenced by genOk above.
             const auto prev = offsets_->fetch(groupIdStr, tp);
-            if (prev.has_value() && prev->lineage != 0 && prev->lineage != lineage &&
+            const bool prevSuperseded = prev.has_value() && prev->lineage != 0 && prev->lineage != lineage;
+            if (prevSuperseded &&
                 rebalanceForSupersededLineage_(groupIdStr, it->second, e.topicId, e.partition, lineage, nowNs)) {
                 ++supersededCommitsFenced_;
                 genOk = false;   // the rest of this request is at the old generation now

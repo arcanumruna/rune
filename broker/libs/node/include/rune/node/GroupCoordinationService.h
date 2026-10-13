@@ -303,8 +303,34 @@ private:
     LineageVersionFn lineageVersionFn_  = nullptr;
     void*            lineageVersionCtx_ = nullptr;
     uint64_t         lineageSweptVersion_ = 0;
-    bool             lineageSweepRetry_   = false;   ///< a lineage was pending at the last sweep
     int64_t          nextLineageSweepNs_  = 0;
+    /// Round 6 (F1): the lineage of each TRANSIENT partition a group's current
+    /// generation consumes (the union of its members' assignments — every
+    /// partition of its subscribed topics), recorded when it reached Stable;
+    /// kLineagePending when unknown then (members could not fetch a position
+    /// until it confirmed: the first confirmed lineage is adopted).  A group
+    /// whose consumed lineage is superseded is rebalanced even with NO
+    /// committed offset (an in-memory position must not cross the change).
+    struct GenLineage { int32_t topicId; int32_t partition; uint64_t lineage; };
+    std::unordered_map<std::string, std::vector<GenLineage>> genLineages_;
+    /// Round 6 (F4): what a sweep could not decide (the lineage was pending):
+    /// re-checked alone every 100 ms — no fetchAll, no allocation (capacity
+    /// persists; compacted in place).  `ref` = the lineage to compare with.
+    struct PendingCheck { std::string groupId; int32_t topicId; int32_t partition; uint64_t ref; bool genEntry; };
+    std::vector<PendingCheck> pendingChecks_;
+    void recordGenLineages_(const GroupId& groupId, const rune::coordination::GroupCoordinator& coord);
+    /// The group's recorded lineage entry for (topicId, partition), or nullptr.
+    GenLineage* genLineageOf_(const std::string& groupId, int32_t topicId, int32_t partition);
+    /// Decide one (group, partition): `ref` vs the current lineage.  Returns
+    /// false when the current lineage is still pending (re-check later).
+    bool checkSuperseded_(const std::string& groupId, int32_t topicId, int32_t partition, uint64_t ref,
+                          bool genEntry, int64_t nowNs);
+    void retryPendingChecks_(int64_t nowNs);
+    void pruneGroupLineageState_(const std::string& groupId);
+public:
+    [[nodiscard]] std::size_t pendingLineageChecksForTest() const noexcept { return pendingChecks_.size(); }
+    [[nodiscard]] std::size_t supersededMarkGroupsForTest() const noexcept { return supersededHandled_.size(); }
+private:
     uint64_t         supersededRebalances_    = 0;
     uint64_t         supersededCommitsFenced_ = 0;
     /// group -> (topicId, partition, new lineage) it was already rebalanced for.

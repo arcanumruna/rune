@@ -1480,3 +1480,45 @@ TEST_F(CG3ServiceTest, SupersededLineageForcesARebalanceAndFencesOldGenerationCo
     EXPECT_GE(service_->supersededLineageCommitsFenced(), 1u);
     EXPECT_EQ(service_->supersededLineageRebalances(), 2u);
 }
+
+// E2 final fix wave, residual round 6 — F4: steady state allocates nothing.
+// While a new lineage stays PENDING the coordinator re-checks only the pending
+// (group, partition) set every 100 ms — no fetchAll over every group — and
+// decides it once it resolves; an Empty group's lineage state is pruned.  RED
+// (no pending re-check / no prune): never decided / marks kept forever.
+namespace {
+uint64_t g_f4Lineage = 0xA;
+uint64_t g_f4Version = 1;
+uint64_t f4Lineage(void*, int32_t, int32_t partition) noexcept { return partition == 0 ? g_f4Lineage : 0; }
+uint64_t f4Version(void*) noexcept { return g_f4Version; }
+}  // namespace
+
+TEST_F(CG3ServiceTest, PendingLineageIsReCheckedAloneAndEmptyGroupsArePrunedRegression) {
+    g_f4Lineage = 0xA; g_f4Version = 1;
+    service_->setTransientLineage(&f4Lineage, nullptr);
+    service_->setTransientLineageVersion(&f4Version, nullptr);
+    auto tick = [&] { clock_ += kStep; replica_->doWork(clock_); service_->doWork(clock_); };
+    auto l = encodeJoinGroup(req_, 1, 1300, "g-f4", "", 60'000);
+    auto r = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, l, clock_, out_, kBufSize));
+    ASSERT_TRUE(r.has_value());
+    const std::string m(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size());
+    l = encodeOffsetCommit(req_, 1, 1301, "g-f4", m, r->generationId, kTestTopicId, 0, 50, "");
+    ASSERT_EQ(pc::OffsetCommitResponse::decode(out_, service_->handleOffsetCommit(req_, l, clock_, out_, kBufSize))
+                  ->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    tick();
+    g_f4Lineage = GroupCoordinationService::kLineagePending; ++g_f4Version;
+    tick();
+    EXPECT_EQ(service_->pendingLineageChecksForTest(), 1u) << "the undecided partition was not kept for re-check";
+    const int32_t gen = service_->coordinator("g-f4").generationId();
+    g_f4Lineage = 0xD;   // resolved (a mint), WITHOUT a version move: only the re-check can see it
+    for (int i = 0; i < 200; ++i) tick();
+    EXPECT_EQ(service_->pendingLineageChecksForTest(), 0u);
+    EXPECT_GT(service_->coordinator("g-f4").generationId(), gen) << "the pending re-check never decided it";
+    ASSERT_GE(service_->supersededMarkGroupsForTest(), 1u);
+    l = encodeLeaveGroup(req_, 1, 1302, "g-f4", m);
+    (void)service_->handleLeaveGroup(req_, l, clock_, out_, kBufSize);
+    ASSERT_TRUE(driveUntil([&] { return service_->coordinator("g-f4").isEmpty(); }, 20));
+    g_f4Lineage = 0xE; ++g_f4Version;
+    tick();
+    EXPECT_EQ(service_->supersededMarkGroupsForTest(), 0u) << "an Empty group's superseded marks were never pruned";
+}
