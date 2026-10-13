@@ -307,8 +307,15 @@ void ReplicatedOffsetStore::applyRecord(std::string_view /*unused_key*/,
 
 bool ReplicatedOffsetStore::rebuildFromLog()
 {
-    const rune::replication::Offset hw = replica_->highWatermark();
-    if (hw <= 0) return false; // nothing committed yet — caller should retry
+    const rune::replication::Offset hw  = replica_->highWatermark();
+    const rune::replication::Offset leo = replica_->logEndOffset();
+    // E2 residual round 4: the index is LOADED only from the leader's WHOLE log.
+    // An empty log is complete (nothing to load).  HW below the log end (a
+    // cold restart: the HW gated at 0, or below a previous term's tail while
+    // the ISR re-expands) would load a PREFIX — an older offset, or none, for a
+    // group whose newer commit sits above the HW: a guess.  Retry later.
+    if (leo <= 0) { index_.clear(); return true; }
+    if (hw <= 0 || hw < leo) return false;
     index_.clear();
 
     // Chunk size: large enough to read an entire typical segment in one call.

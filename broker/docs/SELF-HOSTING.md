@@ -185,6 +185,11 @@ before a produce is acknowledged but is **never written to disk**.
     the consumer's reset setting) and reads every refilled record. For a moment after a restart
     or a leader move, until the new leadership has confirmed the lineage, OffsetFetch and
     OffsetCommit for that partition answer `NotLeader`. The client retries this automatically.
+  - **Committed offsets are answered only once loaded.** After a restart, or when the group
+    coordinator moves to another node, the coordinator replays its whole `__consumer_offsets`
+    partition before it answers. Until then OffsetFetch and OffsetCommit answer `NotLeader` for
+    every topic, disk or transient, and the client retries. A group never resumes from a guessed
+    position.
   - **Subscriptions follow a leader move.** When a node stops serving a subscription (it lost
     leadership of a `read_committed` partition, or the partition's replica moved off it), it answers
     the subscription instead of going silent. A client of this release resumes from its position on

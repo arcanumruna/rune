@@ -781,6 +781,7 @@ size_t GroupCoordinationService::handleOffsetCommit(
     const bool genOk = groupExists && (msg.generationId == it->second.generationId());
 
     commitResultScratch_.clear();
+    const bool loaded = offsetsLoaded_();   // E2 residual round 4
 
     // Iterate entries defensively (CG-1 note: count can overstate; stop when
     // the view iterator ends, which happens when the frame bytes run out).
@@ -803,6 +804,15 @@ size_t GroupCoordinationService::handleOffsetCommit(
             r.errorCode = static_cast<int16_t>(
                 groupExists ? pc::ErrorCode::IllegalGeneration
                             : pc::ErrorCode::UnknownMember);
+            commitResultScratch_.push_back(r);
+            continue;
+        }
+
+        if (!loaded) [[unlikely]] {
+            // Round 4: the offsets are not loaded yet — a commit now would be
+            // wiped by the rebuild (clear + replay): refused retriably.
+            ++offsetsNotLoadedAnswers_;
+            r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
             commitResultScratch_.push_back(r);
             continue;
         }
@@ -900,6 +910,30 @@ size_t GroupCoordinationService::handleOffsetFetch(
     }
 
     fetchResultScratch_.clear();
+
+    if (!offsetsLoaded_()) [[unlikely]] {
+        // E2 residual round 4: the offsets of this coordinator's
+        // __consumer_offsets partition are not loaded yet (a restart / a new
+        // leadership; the rebuild waits for the whole log).  Neither an offset
+        // nor "none" can be answered — every entry (or one sentinel for a
+        // fetch-all) gets the retriable NotLeader; the client retries.
+        auto refuse = [&](int32_t t, int32_t p) {
+            if (pc::OffsetFetchResponse::encodedSizeFor(fetchResultScratch_.size() + 1) > outCap) return;
+            pc::OffsetFetchResult r;
+            r.topicId   = t;
+            r.partition = p;
+            r.offset    = -1;
+            r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            ++offsetsNotLoadedAnswers_;
+            fetchResultScratch_.push_back(r);
+        };
+        for (const auto& e : msg.entries) refuse(e.topicId, e.partition);
+        if (fetchResultScratch_.empty()) refuse(-1, -1);
+        pc::OffsetFetchResponse resp;
+        resp.sessionId     = msg.sessionId;
+        resp.correlationId = msg.correlationId;
+        return resp.encode(out, std::span<const pc::OffsetFetchResult>(fetchResultScratch_));
+    }
 
     if (msg.entries.empty()) {
         // Fetch all committed offsets for the group.

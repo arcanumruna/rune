@@ -328,6 +328,9 @@ protected:
             registry_.get(),
             [this] { return isLeader_; },
             [this] { return leaderNodeId_; });
+        // E2 residual round 4: the coordinator serves offsets only once it has
+        // loaded them (its first duty pass as coordinator, as in BrokerNode).
+        service_->doWork(clock_);
     }
 
     // Pump replica HW (for offset commit visibility).
@@ -747,6 +750,7 @@ TEST_F(CG3ServiceTest, TransientCommittedOffsetOfAnEndedLineageIsAnsweredAsNoneR
     GroupCoordinationService restarted(&replayed, registry_.get(), [] { return true; }, [] { return NodeId{1}; });
     g_lineage = 0x2222;
     restarted.setTransientLineage(&testLineage, nullptr);
+    restarted.doWork(clock_);   // round 4: loads the offsets (first duty pass)
     EXPECT_EQ(fetch(restarted, 0), -1)
         << "SILENT LOSS: an offset of the ring's previous life was answered after the restart";
     EXPECT_EQ(fetch(restarted, 1), 70) << "a partition without a lineage (disk) lost its committed offset";
@@ -892,6 +896,7 @@ TEST_F(CG3ServiceTest, OffsetCommitMinIsrViolationWhenReplicaGated) {
         &store2, &registry2,
         [&leader] { return leader; },
         [] { return NodeId{1}; });
+    svc2.doWork(0);   // round 4: loads the (empty) offsets log
 
     std::string groupId = "g-minisr";
     uint8_t req2[64 * 1024]{};
@@ -1267,4 +1272,134 @@ TEST_F(CG3ServiceTest, OldClientEvictionIsScopedToTheRequestsGroupRegression) {
     EXPECT_EQ(service_->coordinator("grp-B").memberCount(), 1u);
     EXPECT_EQ(heartbeatCode("grp-B", v4, b, 916), bBefore);
     (void)a2;
+}
+
+// ===========================================================================
+// E2 final fix wave, residual round 4: until this coordinator has LOADED the
+// offsets of its __consumer_offsets partition (the whole log, for the current
+// leadership), OffsetFetch answers the retriable NotLeader — never -1 / an
+// older offset from an empty or partial index (a guess) — and OffsetCommit is
+// refused NotLeader too (the load clears + replays the index: a commit taken
+// before it would be wiped).  Disk and transient topics alike.
+// ===========================================================================
+namespace {
+struct FetchAnswer { int16_t code; int64_t offset; };
+FetchAnswer fetchOne(GroupCoordinationService& svc, uint8_t* req, uint8_t* out, std::size_t cap,
+                     const std::string& group, int32_t topicId, int32_t p) {
+    auto len = encodeOffsetFetch(req, 1, 990, group, topicId, p);
+    auto n   = svc.handleOffsetFetch(req, len, 0, out, cap);
+    auto r   = pc::OffsetFetchResponse::decode(out, n);
+    if (!r.has_value() || r->results.empty()) return {int16_t{-99}, int64_t{-99}};
+    return {r->results[0].errorCode, r->results[0].offset};
+}
+}  // namespace
+
+// (a) The coordinator restarts (a new replica / store / service over the same
+// on-disk __consumer_offsets log) and an OffsetFetch arrives BEFORE its first
+// duty pass loaded the offsets: NotLeader, then — once loaded — the real
+// offset; never -1.  A commit in that window is refused, and one after the
+// load survives.  RED (no load gate): the first answer was -1 (OK).
+TEST_F(CG3ServiceTest, OffsetFetchBeforeTheOffsetsAreLoadedIsRetriableNeverNoneRegression) {
+    const std::string groupId = "g-reload";
+    ASSERT_TRUE(store_->commit(groupId, tp(std::string(kTestTopic), 0), 42, "", 1));
+    ASSERT_TRUE(pumpHW(replica_->logEndOffset()));
+    ASSERT_EQ(fetchOne(*service_, req_, out_, kBufSize, groupId, kTestTopicId, 0).offset, 42);
+
+    // Restart: everything above the log is rebuilt from scratch.
+    service_.reset();
+    store_.reset();
+    replica_.reset();
+    rune::storage::Log log2(dir.path);
+    log2.recover();
+    PartitionReplica rep2(makeSingleNodeConfig(kLeader, 1), Role::Leader, /*epoch=*/2,
+                          std::vector<NodeId>{kLeader}, std::vector<NodeId>{kLeader}, &log2, transport_.get());
+    ReplicatedOffsetStore store2(&rep2);
+    GroupCoordinationService svc2(&store2, registry_.get(), [] { return true; }, [] { return NodeId{kLeader}; });
+
+    // Before any duty pass: the request races the reload.
+    const FetchAnswer first = fetchOne(svc2, req_, out_, kBufSize, groupId, kTestTopicId, 0);
+    EXPECT_EQ(first.code, static_cast<int16_t>(pc::ErrorCode::NotLeader))
+        << "answered " << first.offset << " before the offsets were loaded (a guess: the committed offset is 42)";
+    EXPECT_FALSE(first.offset == -1 && first.code == static_cast<int16_t>(pc::ErrorCode::OK))
+        << "SILENT REWIND: 'no committed offset' answered before the reload";
+
+    // The member's commit in that window: refused retriably (the load would wipe it).
+    auto jLen = encodeJoinGroup(req_, 1, 991, groupId, "", 5000);
+    auto jOut = svc2.handleJoinGroup(req_, jLen, clock_, out_, kBufSize);
+    auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
+    ASSERT_TRUE(jResp.has_value());
+    const std::string memberId(reinterpret_cast<const char*>(jResp->memberId.data()), jResp->memberId.size());
+    auto commit = [&](int64_t off) {
+        auto l = encodeOffsetCommit(req_, 1, 992, groupId, memberId, jResp->generationId, kTestTopicId, 1, off, "");
+        auto n = svc2.handleOffsetCommit(req_, l, clock_, out_, kBufSize);
+        auto r = pc::OffsetCommitResponse::decode(out_, n);
+        return r.has_value() && !r->results.empty() ? r->results[0].errorCode : int16_t{-99};
+    };
+    EXPECT_EQ(commit(7), static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "a commit was taken before the load";
+
+    // Duty passes load the offsets; every answer meanwhile is NotLeader or 42.
+    FetchAnswer a{};
+    for (int i = 0; i < 200; ++i) {
+        clock_ += kStep;
+        rep2.doWork(clock_);
+        svc2.doWork(clock_);
+        a = fetchOne(svc2, req_, out_, kBufSize, groupId, kTestTopicId, 0);
+        if (a.code != static_cast<int16_t>(pc::ErrorCode::NotLeader)) break;
+    }
+    EXPECT_EQ(a.code, static_cast<int16_t>(pc::ErrorCode::OK)) << "never loaded";
+    EXPECT_EQ(a.offset, 42) << "after the load the real committed offset must be answered";
+    EXPECT_GE(svc2.offsetsNotLoadedAnswersForTest(), 2u);
+
+    ASSERT_EQ(commit(9), static_cast<int16_t>(pc::ErrorCode::OK));
+    clock_ += kStep;
+    rep2.doWork(clock_);
+    svc2.doWork(clock_);
+    EXPECT_EQ(fetchOne(svc2, req_, out_, kBufSize, groupId, kTestTopicId, 1).offset, 9)
+        << "a commit after the load was lost";
+}
+
+// (b) A PARTIAL log: the leader's high-watermark is below its log end (a
+// follower in the ISR has not caught up after a restart).  Loading the prefix
+// would answer an OLDER offset (10) for a group whose newest commit (30) sits
+// above the HW.  The load waits for the whole log: NotLeader until then, then
+// 30.  RED (prefix load): 10 was answered.
+TEST_F(CG3ServiceTest, OffsetsAreNotLoadedFromALogPrefixBelowTheLogEndRegression) {
+    service_.reset();
+    store_.reset();
+    replica_.reset();
+    TempDir d3("cg3_prefix");
+    rune::storage::Log log3(d3.path);
+    log3.recover();
+    PartitionReplica rep3(makeSingleNodeConfig(kLeader, /*minIsr=*/1), Role::Leader, /*epoch=*/1,
+                          std::vector<NodeId>{kLeader, 2}, std::vector<NodeId>{kLeader, 2}, &log3, transport_.get());
+    ReplicatedOffsetStore store3(&rep3);
+    const std::string groupId = "g-prefix";
+    for (const int64_t off : {10, 20, 30}) ASSERT_TRUE(store3.commit(groupId, tp(std::string(kTestTopic), 0), off, "", 1));
+    ASSERT_EQ(rep3.logEndOffset(), 3);
+    auto followerAt = [&](int64_t fetchOffset) {
+        rune::replication::FetchRequestMsg f{};
+        f.leaderEpoch = 1; f.partition = rep3.partitionId(); f.followerId = 2;
+        f.fetchOffset = fetchOffset; f.maxBytes = 1 << 20; f.topicId = rep3.topicId();
+        clock_ += kStep;
+        (void)rep3.onFetchRequest(f, clock_);
+        rep3.doWork(clock_);
+    };
+    followerAt(1);   // the follower holds record 0 only: HW 1 < log end 3
+    ASSERT_EQ(rep3.highWatermark(), 1) << "precondition: a partial log (HW below the log end)";
+
+    GroupCoordinationService svc3(&store3, registry_.get(), [] { return true; }, [] { return NodeId{kLeader}; });
+    for (int i = 0; i < 5; ++i) {
+        clock_ += kStep;
+        svc3.doWork(clock_);
+        const FetchAnswer a = fetchOne(svc3, req_, out_, kBufSize, groupId, kTestTopicId, 0);
+        EXPECT_EQ(a.code, static_cast<int16_t>(pc::ErrorCode::NotLeader))
+            << "answered " << a.offset << " from a log prefix (the newest commit is 30)";
+    }
+    followerAt(3);   // caught up: HW = log end
+    ASSERT_EQ(rep3.highWatermark(), 3);
+    clock_ += kStep;
+    svc3.doWork(clock_);
+    const FetchAnswer a = fetchOne(svc3, req_, out_, kBufSize, groupId, kTestTopicId, 0);
+    EXPECT_EQ(a.code, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(a.offset, 30) << "not the newest committed offset after the whole log loaded";
 }

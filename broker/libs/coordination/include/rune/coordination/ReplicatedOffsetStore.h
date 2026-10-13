@@ -111,9 +111,11 @@ public:
     /// Typical use: new coordinator leader calls this once after becoming
     /// leader before accepting any new OffsetCommit requests.
     ///
-    /// @returns true if the rebuild was EFFECTIVE (the replica's high-watermark
-    ///          was > 0, so the log was actually scanned).  Returns false when
-    ///          hw <= 0 (nothing to replay yet) — the caller should RETRY on a
+    /// @returns true if the index is now LOADED from the whole log: the
+    ///          replica's high-watermark reached its log end (the log was
+    ///          scanned), or the log is empty (nothing to load).  Returns false
+    ///          while hw <= 0 or hw < log end (E2 residual round 4: a prefix
+    ///          would answer an older offset / none) — the caller should RETRY on a
     ///          later duty cycle (see CP-5.2 cold-restart fix in
     ///          GroupCoordinationService::doWork): on a cold cluster restart the
     ///          HW is briefly gated at 0 while the ISR re-expands, and a one-shot

@@ -250,6 +250,25 @@ private:
     // group resumes committing, so re-running rebuild (clear+repopulate from the
     // log) cannot clobber a live in-memory commit.
     bool offsetsRebuilt_ = false;
+    /// E2 residual round 4: this coordinator has LOADED the offsets for the
+    /// current leadership + log content of its __consumer_offsets replica
+    /// (offsetsRebuilt_ for exactly the generation the replica has now, and the
+    /// replica still leads).  Checked per request — a request can arrive before
+    /// the duty cycle saw a leadership change.  Until then OffsetFetch and
+    /// OffsetCommit answer the retriable NotLeader: a fetch would answer from
+    /// an empty / partial index (-1 or an older offset — a guess), and a commit
+    /// would be overwritten by the rebuild (it clears + replays the log).
+    [[nodiscard]] bool offsetsLoaded_() const noexcept {
+        if (offsets_ == nullptr) return true;
+        const rune::replication::PartitionReplica* r = offsets_->replica();
+        if (r == nullptr) return true;
+        const uint64_t gen = (r->leadershipGeneration() << 32) ^ r->logGeneration();
+        return offsetsRebuilt_ && wasLeader_ && gen == offsetsGen_ && r->acceptsProduce();
+    }
+    uint64_t offsetsNotLoadedAnswers_ = 0;   ///< entries answered NotLeader while loading (round 4)
+public:
+    [[nodiscard]] uint64_t offsetsNotLoadedAnswersForTest() const noexcept { return offsetsNotLoadedAnswers_; }
+private:
     /// (leadershipGeneration << 32) ^ logGeneration of the offsets replica the
     /// index was rebuilt against (see doWork).
     uint64_t offsetsGen_ = 0;
