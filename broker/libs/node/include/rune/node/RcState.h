@@ -250,7 +250,8 @@ public:
 
     // ---- §2.3: per-pass driver --------------------------------------------
     /// `log` null = a memory-backed partition (`memLog`, F22): no bounded scan —
-    /// Ready at once, its producer state rebuilt from the ring in one cold pass.
+    /// Ready at once, its producer state AND its read_committed state (tracker +
+    /// aborted index) rebuilt from the ring in one cold pass.
     /// Returns the bytes this step parsed (0: no scan work).
     std::size_t advance(const RcFacts& f, rune::storage::Log* log, int32_t budget,
                         rune::storage::InMemoryLog* memLog = nullptr) {
@@ -287,8 +288,16 @@ public:
                     (memLog == nullptr ||
                      !psm_->rebuildFromLog(psmTopic_, *memLog, memLog->logEndOffset(), psmPartition_)))
                     psm_->clearPartition(psmTopic_, psmPartition_);
+                // E2 Task 11 fix round 1: the read_committed state is rebuilt from
+                // the SAME ring on this edge (the disk log's bounded scan, in one
+                // pass) — an empty tracker answered LSO = HW (an OPEN transaction
+                // delivered) and an empty aborted index delivered aborted batches
+                // after every ownership / leadership change.
+                const std::size_t bytes = memLog != nullptr ? rebuildRcFromRing_(*memLog) : 0;
+                scannedBytes_ += bytes;
+                if (bytes > maxStepBytes_) maxStepBytes_ = bytes;
                 st_ = Ready{f.epoch, f.logGeneration, f.leadershipGeneration};
-                return 0;
+                return bytes;
             }
             // F15 S5 (I3): the producer state is rebuilt from the log by this
             // scan — never kept from an earlier leadership or log generation.
@@ -567,6 +576,30 @@ private:
         if (baseSeq < 0) return;
         psm_->update(psmTopic_, pid, psmPartition_, r.producerEpoch(), baseSeq, baseSeq + r.lastOffsetDelta(),
                      r.baseOffset());
+    }
+    // E2 Task 11 fix round 1: the memory-backed build — every batch of the ring
+    // [logStart, LEO) through the same RcBuilder the disk scan uses (tracker +
+    // aborted index; reset_() emptied both).  The ring is resident memory: one
+    // synchronous cold pass, bounded by its capacity (memoryLogRingBytes), once
+    // per leadership / truncation / ownership change.  A batch evicted before
+    // the build is forgotten exactly like a disk segment deleted by retention.
+    // An unparseable batch in the ring is the same invariant violation as on
+    // disk (halt: failing open would expose aborted data).  No allocation.
+    std::size_t rebuildRcFromRing_(rune::storage::InMemoryLog& ring) {
+        rune::transaction::RcBuilder builder(&tracker_, &aborted_);
+        std::size_t bytes = 0;
+        int64_t     off   = ring.logStartOffset();
+        const int64_t leo = ring.logEndOffset();
+        while (off < leo) {
+            const auto v = ring.readView(off, /*maxBytes=*/1);   // exactly one whole batch
+            if (v.empty() || v.nextOffset <= off) [[unlikely]]
+                haltInvariant_("the ring has no readable batch below its LEO (RC build)");
+            if (builder.step(v.data, v.len).outcome == rune::transaction::RcBuilder::Outcome::Invalid) [[unlikely]]
+                haltInvariant_("RcBuilder refused a whole batch of the ring (RC build)");
+            bytes += v.len;
+            off = v.nextOffset;
+        }
+        return bytes;
     }
     void finish_(const Scanning& s) {
         // The tail lies wholly at or above target: replaying it after the scan

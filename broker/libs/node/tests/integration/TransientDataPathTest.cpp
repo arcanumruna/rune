@@ -213,3 +213,93 @@ TEST(TransientDataPathRegression, DeferredPushReadAfterOwnershipMovedNeverReadsT
     EXPECT_EQ(answeredWithData + unanswered, 4);
     EXPECT_EQ(rig.worker().deferredPushReadsForTest(), 0u);
 }
+
+// ---------------------------------------------------------------------------
+// E2 Task 11 fix round 1 (matrix cells ReadCommitted_Transient_*_Leader_Committed_
+// LeaderMovesMidOp): every ownership / leadership change builds a FRESH RcState.
+// Its memory-backed edge went Unbuilt -> Ready rebuilding only the producer
+// state — an EMPTY LsoTracker (LSO = HW: an open transaction delivered to
+// read_committed) and an EMPTY AbortedTxnIndex (aborted batches delivered).  The
+// ring must be scanned for both, exactly like the disk log's build.
+// ---------------------------------------------------------------------------
+namespace {
+int16_t produceTxnOk(Rig& rig, int64_t pid, int32_t seq, int64_t* base) {
+    const auto txn = batchOf(1, 50, pid, /*epoch=*/0, seq, /*txn=*/true);
+    int16_t code = -1;
+    for (int i = 0; i < 64 && code != kOk; ++i)   // NotLeader while the RC state builds (retriable)
+        code = rig.produce(txn, /*acks=*/0, base, pid, 0, seq);
+    return code;
+}
+int16_t markerAnswer(Rig& rig, int64_t token, int64_t pid, bool commit) {
+    rig.marker(token, pid, commit);
+    int16_t mcode = -1;
+    for (int i = 0; i < 64 && mcode == -1; ++i) {
+        rig.pass();
+        rig.pool.drainAllReturns([&](WorkerReturn r) {
+            if (r.type == WorkerReturn::Type::ControlRecordAppended && r.correlationId == token) mcode = r.errorCode;
+        });
+    }
+    return mcode;
+}
+void moveOwnershipAwayAndBack(Rig& rig) {
+    rig.worker().setOwnedDirect({});
+    for (int i = 0; i < 4; ++i) rig.pass();
+    Worker::OwnedSet s;
+    s.push_back(rig.rep);
+    rig.worker().setOwnedDirect(std::move(s));
+    for (int i = 0; i < 4; ++i) rig.pass();
+}
+} // namespace
+
+TEST(TransientDataPathRegression, ReadCommittedKeepsAnOpenTransactionAcrossAnOwnershipChangeRegression) {
+    Rig rig;
+    constexpr int64_t kPid = 7;
+    int64_t base = -1;
+    ASSERT_EQ(produceTxnOk(rig, kPid, 0, &base), kOk);
+    ASSERT_EQ(base, 0);
+    ASSERT_EQ(rig.produce(batchOf(1, 50), /*acks=*/0, &base), kOk);   // plain at 1
+    ASSERT_EQ(base, 1);
+
+    moveOwnershipAwayAndBack(rig);   // a fresh RcState, rebuilt from the ring
+
+    const auto open = rig.readOnce(31, 0, /*read_committed=*/1);
+    ASSERT_TRUE(open.has_value());
+    EXPECT_TRUE(open->chunk.empty()) << "an OPEN transaction leaked to read_committed after an ownership change";
+    EXPECT_EQ(open->pushEffectiveBound(), 0) << "the rebuilt LSO must pin at the open transaction's first offset";
+
+    ASSERT_EQ(markerAnswer(rig, 3, kPid, /*commit=*/true), kOk);
+    const auto committed = rig.readOnce(32, 0, 1);
+    ASSERT_TRUE(committed.has_value());
+    ASSERT_FALSE(committed->chunk.empty()) << "the committed transaction was never delivered";
+    EXPECT_EQ(rune::protocol::RecordBatchReader(committed->chunk.data(), committed->chunk.size()).baseOffset(), 0);
+    EXPECT_EQ(committed->newNextOffset, 3) << "txn at 0, plain at 1, marker at 2";
+}
+
+TEST(TransientDataPathRegression, ReadCommittedFiltersAnAbortedTransactionAcrossAnOwnershipChangeRegression) {
+    Rig rig;
+    constexpr int64_t kPid = 9;
+    int64_t base = -1;
+    ASSERT_EQ(produceTxnOk(rig, kPid, 0, &base), kOk);   // txn at 0
+    ASSERT_EQ(markerAnswer(rig, 4, kPid, /*commit=*/false), kOk);   // ABORT marker at 1
+    ASSERT_EQ(rig.produce(batchOf(1, 50), /*acks=*/0, &base), kOk);   // plain at 2
+    ASSERT_EQ(base, 2);
+
+    moveOwnershipAwayAndBack(rig);
+
+    std::vector<int64_t> bases;
+    int64_t from = 0;
+    for (int i = 0; i < 8 && from < 3; ++i) {
+        const auto r = rig.readOnce(40 + i, from, /*read_committed=*/1);
+        ASSERT_TRUE(r.has_value());
+        std::size_t pos = 0;
+        while (pos < r->chunk.size()) {
+            rune::protocol::RecordBatchReader b(r->chunk.data() + pos, r->chunk.size() - pos);
+            bases.push_back(b.baseOffset());
+            pos += static_cast<std::size_t>(b.totalLength());
+        }
+        if (r->newNextOffset <= from) break;
+        from = r->newNextOffset;
+    }
+    EXPECT_EQ(bases, (std::vector<int64_t>{2})) << "an ABORTED batch was delivered after an ownership change "
+                                                   "(the rebuilt state lost the aborted index)";
+}
