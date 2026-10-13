@@ -811,17 +811,17 @@ ConfigResult parseNodeConfig(
                     return {{}, "RUNE_TOPICS topic name '" + escapeNameForLog(name) + "' is invalid (" +
                                 std::string(topicNameErrorText(ne)) + ") in entry: " + escapeNameForLog(entry)};
                 if (!seenNames.insert(name).second)
-                    return {{}, "RUNE_TOPICS has duplicate topic name: " + name};
+                    return {{}, "RUNE_TOPICS has duplicate topic name: " + escapeNameForLog(name)};
                 for (const std::string& seen : seenNames) {
                     if (seen != name && topicNamesFoldEqual(seen, name))
-                        return {{}, "RUNE_TOPICS topic names '" + seen + "' and '" + name +
+                        return {{}, "RUNE_TOPICS topic names '" + escapeNameForLog(seen) + "' and '" + escapeNameForLog(name) +
                                     "' differ only by letter case (they would share one data "
-                                    "directory) in entry: " + std::string(entry)};
+                                    "directory) in entry: " + escapeNameForLog(entry)};
                 }
 
                 int32_t partCount{};
                 if (!parseInt32(countPart, partCount) || partCount < 1)
-                    return {{}, std::string("RUNE_TOPICS partition count must be >= 1, got: ") + std::string(countPart) + " in entry: " + std::string(entry)};
+                    return {{}, std::string("RUNE_TOPICS partition count must be >= 1, got: ") + escapeNameForLog(countPart) + " in entry: " + escapeNameForLog(entry)};
 
                 TopicSpec ts;
                 ts.name           = std::move(name);
@@ -857,9 +857,9 @@ ConfigResult parseNodeConfig(
                     for (auto& ch : klower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
 
                     if (klower == "group") {
-                        ts.coPartitionGroup = std::string(kval);
+                        ts.coPartitionGroup = escapeNameForLog(kval);
                     } else if (klower == "key") {
-                        ts.partitionKey = std::string(kval);
+                        ts.partitionKey = escapeNameForLog(kval);
                     } else if (klower == "persistence") {
                         std::string vlow(kval);
                         for (auto& ch : vlow) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
@@ -874,7 +874,7 @@ ConfigResult parseNodeConfig(
                         } else if (vlow == "disk") {
                             ts.persistence = PersistenceMode::Disk;
                         } else {
-                            return {{}, std::string("RUNE_TOPICS persistence must be 'disk' or 'transient', got: ") + std::string(kval) + " in entry: " + std::string(entry)};
+                            return {{}, std::string("RUNE_TOPICS persistence must be 'disk' or 'transient', got: ") + escapeNameForLog(kval) + " in entry: " + escapeNameForLog(entry)};
                         }
                     } else if (klower == "durability") {
                         std::string vlow(kval);
@@ -884,7 +884,7 @@ ConfigResult parseNodeConfig(
                         } else if (vlow == "all-in-sync") {
                             ts.durability = 1;
                         } else {
-                            return {{}, std::string("RUNE_TOPICS durability must be 'majority' or 'all-in-sync', got: ") + std::string(kval) + " in entry: " + std::string(entry)};
+                            return {{}, std::string("RUNE_TOPICS durability must be 'majority' or 'all-in-sync', got: ") + escapeNameForLog(kval) + " in entry: " + escapeNameForLog(entry)};
                         }
                     } else if (klower == "tier") {
                         // Async-durability tier (see NodeConfig.h): controls WHEN the
@@ -899,10 +899,10 @@ ConfigResult parseNodeConfig(
                         } else if (vlow == "strict") {
                             ts.durabilityTier = 2;
                         } else {
-                            return {{}, std::string("RUNE_TOPICS tier must be 'leader', 'majority' or 'strict', got: ") + std::string(kval) + " in entry: " + std::string(entry)};
+                            return {{}, std::string("RUNE_TOPICS tier must be 'leader', 'majority' or 'strict', got: ") + escapeNameForLog(kval) + " in entry: " + escapeNameForLog(entry)};
                         }
                     } else {
-                        return {{}, std::string("RUNE_TOPICS unknown option '") + std::string(kname) + "' in entry: " + std::string(entry)};
+                        return {{}, std::string("RUNE_TOPICS unknown option '") + escapeNameForLog(kname) + "' in entry: " + escapeNameForLog(entry)};
                     }
                 }
 
@@ -925,7 +925,7 @@ ConfigResult parseNodeConfig(
                     } else if (pol == "compact_delete" || pol == "compactdelete") {
                         ts.cleanupPolicy = TopicSpec::CleanupPolicy::CompactDelete;
                     } else {
-                        return {{}, std::string("RUNE_TOPICS policy must be 'delete', 'compact', or 'compact_delete', got: ") + pol + " in entry: " + std::string(entry)};
+                        return {{}, std::string("RUNE_TOPICS policy must be 'delete', 'compact', or 'compact_delete', got: ") + escapeNameForLog(pol) + " in entry: " + escapeNameForLog(entry)};
                     }
                 }
 
@@ -936,11 +936,11 @@ ConfigResult parseNodeConfig(
                     int64_t v{};
                     auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), v);
                     if (ec != std::errc{} || ptr != sv.data() + sv.size())
-                        return std::string("RUNE_TOPICS ") + fieldName + " must be an integer in: " + std::string(entry);
+                        return std::string("RUNE_TOPICS ") + fieldName + " must be an integer in: " + escapeNameForLog(entry);
                     if (!allowNeg1 && v < 1)
-                        return std::string("RUNE_TOPICS ") + fieldName + " must be a positive integer in: " + std::string(entry);
+                        return std::string("RUNE_TOPICS ") + fieldName + " must be a positive integer in: " + escapeNameForLog(entry);
                     if (allowNeg1 && v < -1)
-                        return std::string("RUNE_TOPICS ") + fieldName + " must be >= -1 in: " + std::string(entry);
+                        return std::string("RUNE_TOPICS ") + fieldName + " must be >= -1 in: " + escapeNameForLog(entry);
                     out = v;
                     return {};
                 };
@@ -952,7 +952,7 @@ ConfigResult parseNodeConfig(
                     // D19 L1: segment positions are 32-bit (Log::kMaxRollBytes).
                     if (ts.segmentRollBytes > rune::storage::Log::kMaxRollBytes)
                         return {{}, std::string("RUNE_TOPICS segmentRollBytes must be <= ") +
-                                        std::to_string(rune::storage::Log::kMaxRollBytes) + " in: " + std::string(entry)};
+                                        std::to_string(rune::storage::Log::kMaxRollBytes) + " in: " + escapeNameForLog(entry)};
                 }
 
                 // Positional[2] (optional): deleteRetentionMs (non-negative int64)
@@ -995,9 +995,9 @@ ConfigResult parseNodeConfig(
                     errno = 0;
                     double v = std::strtod(s.c_str(), &endp);
                     if (endp != s.c_str() + s.size() || errno != 0)
-                        return {{}, std::string("RUNE_TOPICS minCleanableDirtyRatio must be a number in: ") + std::string(entry)};
+                        return {{}, std::string("RUNE_TOPICS minCleanableDirtyRatio must be a number in: ") + escapeNameForLog(entry)};
                     if (v < 0.0 || v > 1.0)
-                        return {{}, std::string("RUNE_TOPICS minCleanableDirtyRatio must be in [0.0, 1.0] in: ") + std::string(entry)};
+                        return {{}, std::string("RUNE_TOPICS minCleanableDirtyRatio must be in [0.0, 1.0] in: ") + escapeNameForLog(entry)};
                     ts.minCleanableDirtyRatio = v;
                 }
 

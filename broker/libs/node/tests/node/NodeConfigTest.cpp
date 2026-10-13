@@ -3023,3 +3023,22 @@ TEST(NodeConfigRegression, RuneTopicsValidNamesStillParseRegression) {
     ASSERT_EQ(res.config->topics.size(), 6u);
     EXPECT_EQ(res.config->topics[5].name, maxLen);
 }
+
+// Final review M5: every RUNE_TOPICS error message escapes the raw env entry (a
+// control byte in an env var must never reach the log / terminal raw).
+TEST(NodeConfigRegression, TopicsErrorMessagesEscapeTheRawEntryRegression) {
+    const std::string esc = "\x1b[31m";
+    const std::vector<std::string> entries = {
+        "orders:1,Orders:1:delete" + esc,            // fold duplicate (B3)
+        "orders:x" + esc,                             // partition count
+        "orders:1:policy" + esc,                      // positional policy
+        "orders:1:persistence=disk" + esc,            // key=value option
+        "orders:1:nosuch" + esc + "=1",               // unknown option
+        "orders:1:delete:12" + esc,                   // integer field
+    };
+    for (const std::string& e : entries) {
+        const auto r = parseWithTopics(e.c_str());
+        ASSERT_FALSE(r.error.empty()) << e;
+        EXPECT_EQ(r.error.find('\x1b'), std::string::npos) << "raw control byte in: " << r.error;
+    }
+}
