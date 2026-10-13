@@ -461,6 +461,7 @@ static int doGroup(Client& client,
                                                   rs.recordBatch.size());
         reader.forEach([&](std::string_view /*key*/, std::string_view val,
                            int64_t off, int64_t /*ts*/) {
+            if (off < rs.deliverFrom) return;   // already consumed (a straddling re-delivery)
             int rc = -1, rk = -1, rs_seq = -1;
             const std::string valStr(val);
             decodePayload(valStr, rc, rk, rs_seq);
@@ -652,6 +653,7 @@ static int doTxnConsume(Client& c,
                                                   rs.recordBatch.size());
         reader.forEach([&](std::string_view /*key*/, std::string_view val,
                            int64_t off, int64_t /*ts*/) {
+            if (off < rs.deliverFrom) return;   // already consumed (a straddling re-delivery)
             int rc = -1, rk = -1, rs_seq = -1;
             const std::string valStr(val);
             decodePayload(valStr, rc, rk, rs_seq);

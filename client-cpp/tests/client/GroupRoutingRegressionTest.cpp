@@ -16,6 +16,7 @@
 #include "../support/InvokerGateway.h"
 
 #include <rune/client/Client.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/client/Completions.h>
 #include <rune/client/group/GroupConsumer.h>
 #include <rune/client/producer/TransactionalProducer.h>
@@ -2018,4 +2019,57 @@ TEST(GroupRoutingRegression, BoundFetchSubscriptionAnsweredNotLeaderMovesToTheNe
     r.gw.pushRecords(s2, 15, 2);
     ASSERT_TRUE(r.drive([&] { return led.records[1] == 7; }));
     EXPECT_EQ(led.next[1], 17);
+    // M4 (fix round 2): the old instance is released on node 1, as the plain path does.
+    int released = 0;
+    for (std::size_t i = 0; i < r.gw.unsubscribed.size(); ++i)
+        released += (r.gw.unsubscribed[i] == s1.subscriptionId && r.gw.unsubscribedAt[i] == n1) ? 1 : 0;
+    EXPECT_EQ(released, 1) << "the moved fetch subscription's old instance was not unsubscribed (exactly once) on its node";
+}
+
+// I1 (fix round 2): after the move the new leader pushes the WHOLE batch that
+// contains the member's position (brokers never split a batch): 12..16 for
+// position 15.  12..14 were consumed before the move: the RecordSet says so
+// (deliverFrom == 15) and a consumer iterating it from deliverFrom sees every
+// record exactly once.  RED: deliverFrom stayed 0 — 12..14 handed over twice.
+TEST(GroupRoutingRegression, MovedFetchSubscriptionStraddlingBatchSkipsConsumedRecordsRegression) {
+    GroupRig r(4225, 4226);
+    const auto [n1, p1port] = r.addNode(4225);
+    const auto [n2, p2port] = r.addNode(4225);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4225, ""}, {1, 1, 1, 1, 4225, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment = {{1, 1}};
+    r.gw.committedOffsets[{1, 1}] = 10;
+
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    std::map<int64_t, int> consumed;   // offset -> times handed to the application (duty thread = this thread)
+    std::vector<int64_t>   deliverFrom;
+    gc.onRecords([&](const rc::RecordSet& rs) {
+        deliverFrom.push_back(rs.deliverFrom);
+        rune::protocol::RecordBatchReader rd(rs.recordBatch.data(), rs.recordBatch.size());
+        if (!rd.ensureValid()) return;
+        rd.forEach([&](std::string_view, std::string_view, int64_t off, int64_t) {
+            if (off >= rs.deliverFrom) ++consumed[off];
+        });
+    });
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr; }));
+    const auto s1 = *r.subAt(1, n1);
+    r.gw.pushRecords(s1, 10, 5);   // 10..14
+    ASSERT_TRUE(r.drive([&] { return consumed.size() == 5; }));
+
+    r.gw.subscribeLeader[1] = n2;
+    r.gw.partitions = {{1, 0, 0, 1, 4225, ""}, {1, 1, 2, 2, 4225, ""}};
+    r.gw.sendError(n1, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader), "", s1.sessionId,
+                   s1.corrId);
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n2) != nullptr; }, 200'000));
+    const auto s2 = *r.subAt(1, n2);
+    ASSERT_EQ(s2.fromOffset, 15);
+    r.gw.pushRecords(s2, 12, 5);   // the whole batch containing 15: 12..16
+    ASSERT_TRUE(r.drive([&] { return deliverFrom.size() == 2; }));
+    EXPECT_EQ(deliverFrom.back(), 15) << "the straddling batch did not mark its consumed records";
+    for (const auto& [off, n] : consumed) EXPECT_EQ(n, 1) << "offset " << off << " handed over " << n << " times";
+    EXPECT_EQ(consumed.size(), 7u);   // 10..16
 }

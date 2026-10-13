@@ -947,6 +947,12 @@ bool GroupConsumerHub::onFetchSubscribeRefused(int64_t corrId, bool park, int32_
             // node stopped serving (it answers the instance's Subscribe id
             // NotLeader and drops it after a demotion): re-routed the same way.
             if (fs.corrId != corrId && !(fs.epoch != 0 && fs.instanceCorr == corrId)) continue;
+            // A BOUND instance (fix round 2, M4): release it on its node too, as
+            // the plain path does.  The node that answered NotLeader already
+            // dropped it (an Unsubscribe of an unknown id is ignored); should
+            // the answer have been a stray one, no second stream leaks.
+            if (fs.corrId != corrId && fs.subscriptionId != 0)
+                unsubscribe_(fs.session, fs.epoch, fs.subscriptionId, tp);
             fs.corrId         = 0;
             fs.epoch          = 0;  // registered nothing
             fs.brokerSid      = 0;
@@ -1287,14 +1293,24 @@ void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
         if (end <= pos) { ++droppedBatches_; return; }  // entirely below: a duplicate (MEDIUM-3)
         // Otherwise delivered and the position moves to the batch's end — a
         // batch above the position is legitimate (transaction markers, aborted
-        // batches, compaction holes are never pushed); one straddling it is
-        // delivered whole (at-least-once duplicates below the position).
+        // batches, compaction holes are never pushed).  E2 Task 13 fix round 2:
+        // one STRADDLING it (a resume after a leader move, a mid-batch
+        // committed offset — brokers push whole batches) carries records
+        // already consumed: the view says so (deliverFrom = the position; a
+        // stack copy, no allocation) and its iteration skips them.
+        codec::RecordsView straddle;
+        const codec::RecordsView* view = &rv;
+        if (rv.baseOffset < pos) [[unlikely]] {
+            straddle             = rv;
+            straddle.deliverFrom = pos;
+            view                 = &straddle;
+        }
 
         // Deliver to consumer. fix1 C1: noexcept doWork chain — catch/count/log.
         if (impl->cbRecords) {
             DispatchScope scope(*this, *impl);
             try {
-                impl->cbRecords(rv);
+                impl->cbRecords(*view);
             } catch (const std::exception& e) {
                 ++callbackExceptions_;
                 std::fprintf(stderr,

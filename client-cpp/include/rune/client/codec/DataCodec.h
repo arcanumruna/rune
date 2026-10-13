@@ -276,6 +276,12 @@ struct RecordsView {
     [[nodiscard]] int64_t nextOffset() const noexcept {
         return baseOffset + static_cast<int64_t>(lastOffsetDelta) + 1;
     }
+    // Consumer groups (E2 Task 13 fix round 2): brokers push WHOLE batches; a
+    // batch that straddles the member's position (a resume after a leader
+    // move, a mid-batch committed offset) carries records already consumed.
+    // Records with offset < deliverFrom are such re-deliveries — skip them
+    // (0 = the whole batch is new).  Set by GroupConsumerHub; never on the wire.
+    int64_t                  deliverFrom     = 0;
 };
 
 /// Encode a Records frame into buf[0..cap-1].
