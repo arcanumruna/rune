@@ -926,6 +926,21 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     gtest_discover_tests(rune_transient_data_path_tests)
 
+    # E2 final fix wave (I3): the K-partition transient failover latency gate —
+    # every worker pass timed while K full 8 MiB rings rebuild their
+    # read_committed state.  RUN_SERIAL: a latency measurement must not share the
+    # host.  Benchmark mode: RUNE_LATENCY_GATE_BENCH=1 (prints, never fails).
+    add_executable(rune_transient_failover_latency_gate_tests
+        tests/integration/TransientFailoverLatencyGateTest.cpp)
+    target_link_libraries(rune_transient_failover_latency_gate_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        rune_transaction
+        GTest::gtest_main)
+    gtest_discover_tests(rune_transient_failover_latency_gate_tests
+        PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+
     # Phase 2b E2: replaces the global operator new (binary-wide) — own binary.
     add_executable(rune_transient_alloc_regression_tests
         tests/integration/TransientDataPathAllocTest.cpp)

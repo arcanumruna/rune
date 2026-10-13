@@ -102,9 +102,14 @@ TEST(TransientDataPathRegression, RingRebuildWithMoreProducersThanTheMarkerSetNe
     f.leader = true; f.epoch = 1;
     gArmedAllocs = 0;
     gAllocArmed  = true;
-    (void)rc.advance(f, nullptr, rune::node::RcState::kDefaultScanBytesPerPass, &mem);
+    // E2 final fix wave (I3): the ring build is budgeted — many advance steps,
+    // every one of them allocation-free.
+    int steps = 0;
+    for (; steps < 4096 && !rc.ready(); ++steps)
+        (void)rc.advance(f, nullptr, rune::node::RcState::kDefaultScanBytesPerPass, &mem);
     gAllocArmed  = false;
-    ASSERT_TRUE(rc.ready());
+    ASSERT_TRUE(rc.ready()) << "the budgeted ring build never finished";
+    EXPECT_GT(steps, 1) << "precondition: the ring is larger than one step's budget";
     EXPECT_EQ(gArmedAllocs, 0u) << "the ring rebuild allocated (see the backtraces above)";
     EXPECT_EQ(rc.ringMarkedPids().slotBytes(), setBytes) << "the marker set grew";
     EXPECT_EQ(rc.ringMarkedPids().size(), rune::node::RcState::kRingMarkedPidsCapacity);

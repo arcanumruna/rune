@@ -10,7 +10,9 @@
 //
 //       Unbuilt                                    not serving read_committed
 //       Scanning{cursor, target, epoch, gens,      building [logStart, target)
-//                segment byte cursor}
+//                segment byte cursor}              (a DISK log)
+//       RingScanning{cursor, target, ringStart,    building [ringStart, target)
+//                    epoch, gens}                  (a memory ring; E2 final fix wave I3)
 //       Ready{epoch, gens}                         serving; append-time updates live
 //
 //     gens = (logGeneration, leadershipGeneration) the state was built for.
@@ -215,6 +217,21 @@ public:
         uint64_t logGen  = 0;
         uint64_t leadGen = 0;
     };
+    /// E2 final fix wave (I3): the MEMORY-BACKED build, budgeted like the disk
+    /// scan (kDefaultScanBytesPerPass of whole ring batches per advance step) —
+    /// it used to walk the whole ring (up to RUNE_TRANSIENT_LOG_RING_BYTES,
+    /// ~10^5-10^6 small batches) in ONE worker pass, for every partition whose
+    /// leadership / ownership changed in that pass.  While it runs the state is
+    /// not Ready: read_committed reads are held and idempotent / transactional
+    /// produces refused (NotLeader, retriable) — exactly as for a disk Scanning.
+    struct RingScanning {
+        int64_t  cursor    = 0;   ///< next ring offset to apply
+        int64_t  target    = 0;   ///< the ring's LEO at entry (fixed: markers above it ride the tail)
+        int64_t  ringStart = 0;   ///< the ring start this build began at (finding-B pins sit there)
+        int32_t  epoch     = 0;
+        uint64_t logGen    = 0;
+        uint64_t leadGen   = 0;
+    };
     struct TailEvent {
         int64_t producerId = -1;
         int64_t offset     = 0;
@@ -259,9 +276,12 @@ public:
     void setProfile(StepProfile* p) noexcept { profile_ = p; }
 
     [[nodiscard]] bool ready() const noexcept { return std::holds_alternative<Ready>(st_); }
-    [[nodiscard]] bool scanning() const noexcept { return std::holds_alternative<Scanning>(st_); }
-    /// 0 Unbuilt, 1 Scanning, 2 Ready.
-    [[nodiscard]] int statusCode() const noexcept { return static_cast<int>(st_.index()); }
+    /// Building (a disk Scanning or a memory RingScanning).
+    [[nodiscard]] bool scanning() const noexcept {
+        return std::holds_alternative<Scanning>(st_) || std::holds_alternative<RingScanning>(st_);
+    }
+    /// 0 Unbuilt, 1 Scanning (disk or ring), 2 Ready.
+    [[nodiscard]] int statusCode() const noexcept { return scanning() ? 1 : ready() ? 2 : 0; }
 
     // ---- §2.1: append-time updates (same invocation as the append) --------
     /// A TRANSACTIONAL data batch appended at `base` (not a duplicate).  Only
@@ -313,9 +333,9 @@ public:
     }
 
     // ---- §2.3: per-pass driver --------------------------------------------
-    /// `log` null = a memory-backed partition (`memLog`, F22): no bounded scan —
-    /// Ready at once, its producer state AND its read_committed state (tracker +
-    /// aborted index) rebuilt from the ring in one cold pass.
+    /// `log` null = a memory-backed partition (`memLog`, F22): its producer state
+    /// AND its read_committed state (tracker + aborted index) are rebuilt from
+    /// the ring by the budgeted RingScanning state (E2 final fix wave I3).
     /// Returns the bytes this step parsed (0: no scan work).
     std::size_t advance(const RcFacts& f, rune::storage::Log* log, int32_t budget,
                         rune::storage::InMemoryLog* memLog = nullptr) {
@@ -335,42 +355,40 @@ public:
                 // this edge, exactly like a disk log's scan — never kept from an
                 // earlier leadership / log generation (a retry answered
                 // duplicate-OK at an offset now holding other data), and never
-                // left empty: an empty state answers OOS ("NOT appended") for a
-                // STORED batch with seq > 0, and the client then writes it twice
-                // (clearing was NOT "at worst a retry appended again").  One
-                // synchronous pass, bounded by the ring capacity
-                // (memoryLogRingBytes); cold — once per leadership / truncation.
-                // The memory ring evicts its oldest batches (DropOldest), which
-                // forgets a producer like retention does (see the
-                // UNKNOWN_PRODUCER_ID ticket).  No ring (unreachable: every
-                // replica has a log) → cleared, and produceCore_ refuses every
-                // produce of a memory-backed partition anyway (Internal).
-                // A rebuild that stopped short (an unreadable batch) is cleared:
-                // nothing is answered from it (produceCore_ refuses every produce
-                // of a memory-backed partition, Internal).
-                if (psm_ != nullptr &&
-                    (memLog == nullptr ||
-                     !psm_->rebuildFromLog(psmTopic_, *memLog, memLog->logEndOffset(), psmPartition_)))
-                    psm_->clearPartition(psmTopic_, psmPartition_);
+                // answered from while incomplete: producerId >= 0 batches are
+                // refused until Ready (the produce gate), as on disk.
                 // E2 Task 11 fix round 1: the read_committed state is rebuilt from
-                // the SAME ring on this edge (the disk log's bounded scan, in one
-                // pass) — an empty tracker answered LSO = HW (an OPEN transaction
-                // delivered) and an empty aborted index delivered aborted batches
-                // after every ownership / leadership change.
-                const std::size_t bytes = memLog != nullptr ? rebuildRcFromRing_(*memLog) : 0;
-                scannedBytes_ += bytes;
-                if (bytes > maxStepBytes_) maxStepBytes_ = bytes;
-                st_ = Ready{f.epoch, f.logGeneration, f.leadershipGeneration};
-                return bytes;
+                // the SAME ring on this edge — an empty tracker answered LSO = HW
+                // (an OPEN transaction delivered) and an empty aborted index
+                // delivered aborted batches after every ownership / leadership
+                // change.
+                // E2 final fix wave (I3): both are rebuilt by the BUDGETED
+                // RingScanning state (whole batches, ~budget bytes per pass) —
+                // never the whole ring in one pass.  No ring (unreachable: every
+                // replica has a log) → Ready with an empty state; produceCore_
+                // refuses every produce of a memory-backed partition without a
+                // ring anyway.
+                if (psm_ != nullptr) psm_->clearPartition(psmTopic_, psmPartition_);
+                if (memLog == nullptr) {
+                    st_ = Ready{f.epoch, f.logGeneration, f.leadershipGeneration};
+                    return 0;
+                }
+                beginRingScan_(f, *memLog);
+            } else {
+                // F15 S5 (I3): the producer state is rebuilt from the log by this
+                // scan — never kept from an earlier leadership or log generation.
+                if (psm_ != nullptr) psm_->clearPartition(psmTopic_, psmPartition_);
+                Scanning sc;
+                sc.cursor = sc.segBase = log->logStartOffset();
+                sc.target = log->logEndOffset();
+                sc.epoch = f.epoch; sc.logGen = f.logGeneration; sc.leadGen = f.leadershipGeneration;
+                st_ = sc;
             }
-            // F15 S5 (I3): the producer state is rebuilt from the log by this
-            // scan — never kept from an earlier leadership or log generation.
-            if (psm_ != nullptr) psm_->clearPartition(psmTopic_, psmPartition_);
-            Scanning sc;
-            sc.cursor = sc.segBase = log->logStartOffset();
-            sc.target = log->logEndOffset();
-            sc.epoch = f.epoch; sc.logGen = f.logGeneration; sc.leadGen = f.leadershipGeneration;
-            st_ = sc;
+        }
+        if (RingScanning* rs = std::get_if<RingScanning>(&st_)) {
+            rs->epoch = f.epoch;
+            if (memLog == nullptr) [[unlikely]] return 0;   // never: a ring build is driven with its ring
+            return ringStep_(*rs, *memLog, budget);
         }
         Scanning& s = std::get<Scanning>(st_);
         s.epoch = f.epoch;
@@ -409,6 +427,7 @@ private:
     }
     [[nodiscard]] std::pair<uint64_t, uint64_t> builtFor_() const noexcept {
         if (const auto* s = std::get_if<Scanning>(&st_)) return {s->logGen, s->leadGen};
+        if (const auto* s = std::get_if<RingScanning>(&st_)) return {s->logGen, s->leadGen};
         const auto& r = std::get<Ready>(st_);
         return {r.logGen, r.leadGen};
     }
@@ -624,14 +643,18 @@ private:
     // (no sequence); an idempotent / transactional data batch records its
     // sequence range (an epoch older than an applied fence is ignored by the
     // PSM).  A CONTROL-flagged batch that is not a valid marker is ignored.
+    // `markerFromRebuild`: the ring build keeps the producer-state semantics of
+    // ProducerStateManager::rebuildFromLog it replaced (E2 final fix wave I3) —
+    // a marker newer than any surviving data batch marks the producer
+    // marker-only (D6 L1); the disk scan keeps its own (false).
     void feedProducerState_(const rune::protocol::RecordBatchReader& r, rune::transaction::RcBuilder::Outcome o,
-                            const uint8_t* bytes, std::size_t len) {
+                            const uint8_t* bytes, std::size_t len, bool markerFromRebuild = false) {
         using O = rune::transaction::RcBuilder::Outcome;
         const int64_t pid = r.producerId();
         if (pid < 0) return;
         if (o == O::CommitMarker || o == O::AbortMarker) {
             // D9 MAJOR-2: the marker's coordinatorEpoch restores the coordinator fence.
-            psm_->fenceEpoch(psmTopic_, pid, psmPartition_, r.producerEpoch(), /*fromRebuild=*/false,
+            psm_->fenceEpoch(psmTopic_, pid, psmPartition_, r.producerEpoch(), markerFromRebuild,
                              rune::storage::control_marker::coordinatorEpoch(bytes, len));
             return;
         }
@@ -642,44 +665,76 @@ private:
                      r.baseOffset());
     }
     // E2 Task 11 fix round 1: the memory-backed build — every batch of the ring
-    // [logStart, LEO) through the same RcBuilder the disk scan uses (tracker +
-    // aborted index; reset_() emptied both).  The ring is resident memory: one
-    // synchronous cold pass, bounded by its capacity (memoryLogRingBytes), once
-    // per leadership / truncation / ownership change.  A batch evicted before
-    // the build is forgotten exactly like a disk segment deleted by retention.
-    // An unparseable batch in the ring is the same invariant violation as on
-    // disk (halt: failing open would expose aborted data).  No allocation.
+    // [ringStart, LEO) through the same RcBuilder the disk scan uses (tracker +
+    // aborted index; reset_() emptied both) and the same producer-state feed
+    // (feedProducerState_).  E2 final fix wave (I3): BUDGETED — RingScanning
+    // applies whole batches up to ~`budget` bytes per advance step (at least
+    // one), so a K-partition failover never walks K whole rings in one worker
+    // pass.  A batch evicted before the build reached it is forgotten exactly
+    // like a disk segment deleted by retention — but the build restarts from
+    // the new ring start when the ring evicted batches it had NOT read yet (a
+    // marker among them could close a transaction this build opened): never a
+    // partial view served.  An unparseable batch in the ring is the same
+    // invariant violation as on disk (halt: failing open would expose aborted
+    // data).  No allocation.
     //
     // E2 Task 12 fix round 1 (finding B; controller ruling "option (c) refined"):
     // the ring may have evicted the FIRST batches of a transaction that is still
-    // open.  A transactional data batch whose producer is not open in this pass
-    // and has left no COMMIT/ABORT marker earlier in the ring is NOT provably its
-    // transaction's first batch when the ring start is above 0: the transaction
-    // is opened conservatively AT the ring start (LSO pinned there: read_committed
-    // never sees records between the ring start and the open transaction's data
-    // until its marker lands).  After an in-ring marker of the same producer (or
-    // with nothing evicted) the batch provably opens a new transaction and opens
-    // it at its own offset, as before.  A transaction ALL of whose batches were
-    // evicted leaves nothing in the ring to rebuild from: unrecoverable (its
-    // producer is unknown — UnknownProducerId on its next produce — and
-    // read_committed follows the evicted-cursor rule).  `ringMarkedPids_` is a
-    // fixed-capacity O(1) set (reserveRingRebuild): never allocates; a producer
-    // it cannot hold counts as unmarked — pinned at the ring start, the
+    // open.  A transactional data batch whose producer is not open in this
+    // build and has left no COMMIT/ABORT marker earlier in the ring is NOT
+    // provably its transaction's first batch when the ring start is above 0: the
+    // transaction is opened conservatively AT the ring start (LSO pinned there:
+    // read_committed never sees records between the ring start and the open
+    // transaction's data until its marker lands).  After an in-ring marker of
+    // the same producer (or with nothing evicted) the batch provably opens a new
+    // transaction and opens it at its own offset, as before.  A transaction ALL
+    // of whose batches were evicted leaves nothing in the ring to rebuild from:
+    // unrecoverable (its producer is unknown — UnknownProducerId on its next
+    // produce — and read_committed follows the evicted-cursor rule).
+    // `ringMarkedPids_` is a fixed-capacity O(1) set (reserveRingRebuild),
+    // build-local (cleared on every (re)start): never allocates; a producer it
+    // cannot hold counts as unmarked — pinned at the ring start, the
     // conservative side — and the overflow is counted.
-    std::size_t rebuildRcFromRing_(rune::storage::InMemoryLog& ring) {
-        using namespace rune::protocol::batch;
-        rune::transaction::RcBuilder builder(&tracker_, &aborted_);
-        std::size_t bytes = 0;
-        const int64_t ringStart = ring.logStartOffset();
-        int64_t     off   = ringStart;
-        const int64_t leo = ring.logEndOffset();
+    void beginRingScan_(const RcFacts& f, const rune::storage::InMemoryLog& ring) {
+        RingScanning rs;
+        rs.cursor = rs.ringStart = ring.logStartOffset();
+        rs.target  = ring.logEndOffset();
+        rs.epoch   = f.epoch;
+        rs.logGen  = f.logGeneration;
+        rs.leadGen = f.leadershipGeneration;
         ringMarkedPids_.clear();
-        while (off < leo) {
-            const auto v = ring.readView(off, /*maxBytes=*/1);   // exactly one whole batch
-            if (v.empty() || v.nextOffset <= off) [[unlikely]]
+        st_ = rs;
+    }
+    std::size_t ringStep_(RingScanning& rs, rune::storage::InMemoryLog& ring, int32_t budget) {
+        using namespace rune::protocol::batch;
+        ++scanSteps_;
+        if (rs.cursor < ring.logStartOffset()) [[unlikely]] {
+            // The ring evicted batches this build had not read: restart it from
+            // the new ring start (state, tail and producer state all rebuilt).
+            ++ringScanRestarts_;
+            if ((ringScanRestarts_ & (ringScanRestarts_ - 1)) == 0)
+                spdlog::warn("RcState: the transient ring evicted past the read_committed build's cursor {} "
+                             "(ring start {}) — build restarted from the ring start (restarts={})",
+                             rs.cursor, ring.logStartOffset(), ringScanRestarts_);
+            tracker_.clear();
+            aborted_.clear();
+            tail_.clear();
+            if (psm_ != nullptr) psm_->clearPartition(psmTopic_, psmPartition_);
+            const RcFacts f{true, rs.logGen, rs.leadGen, rs.epoch};
+            beginRingScan_(f, ring);   // the same alternative: `rs` now holds the restarted build
+        }
+        RingScanning& cur = rs;
+        rune::transaction::RcBuilder builder(&tracker_, &aborted_);
+        const std::size_t want = static_cast<std::size_t>(budget > 0 ? budget : 1);
+        std::size_t bytes = 0;
+        while (cur.cursor < cur.target && bytes < want) {
+            const auto v = ring.readView(cur.cursor, /*maxBytes=*/1);   // exactly one whole batch
+            if (v.empty() || v.nextOffset <= cur.cursor) [[unlikely]]
                 haltInvariant_("the ring has no readable batch below its LEO (RC build)");
-            if (ringStart > 0 && v.len >= static_cast<std::size_t>(kRecordBatchOverhead)) {
-                const rune::protocol::RecordBatchReader r(v.data, v.len);
+            if (v.len < static_cast<std::size_t>(kRecordBatchOverhead)) [[unlikely]]
+                haltInvariant_("a ring batch shorter than a batch header (RC build)");
+            const rune::protocol::RecordBatchReader r(v.data, v.len);
+            if (cur.ringStart > 0) {
                 const auto attrs = static_cast<uint16_t>(r.attributes());
                 const int64_t pid = r.producerId();
                 if (pid >= 0 && (attrs & static_cast<uint16_t>(kAttrControl)) != 0) {
@@ -687,14 +742,24 @@ private:
                         ++ringMarkedPidsOverflows_;
                 } else if (pid >= 0 && (attrs & static_cast<uint16_t>(kAttrTransactional)) != 0 &&
                            tracker_.firstOffsetOf(pid) < 0 && !ringMarkedPids_.contains(pid)) {
-                    tracker_.onProduceBatch(pid, ringStart);   // conservative pin; the step below keeps it
+                    tracker_.onProduceBatch(pid, cur.ringStart);   // conservative pin; the step below keeps it
                     ++ringPinnedTxns_;
                 }
             }
-            if (builder.step(v.data, v.len).outcome == rune::transaction::RcBuilder::Outcome::Invalid) [[unlikely]]
+            const auto out = builder.step(v.data, v.len);
+            if (out.outcome == rune::transaction::RcBuilder::Outcome::Invalid) [[unlikely]]
                 haltInvariant_("RcBuilder refused a whole batch of the ring (RC build)");
-            bytes += v.len;
-            off = v.nextOffset;
+            if (psm_ != nullptr) feedProducerState_(r, out.outcome, v.data, v.len, /*markerFromRebuild=*/true);
+            bytes     += v.len;
+            cur.cursor = v.nextOffset;
+        }
+        scannedBytes_ += bytes;
+        if (bytes > maxStepBytes_) maxStepBytes_ = bytes;
+        if (cur.cursor >= cur.target) {
+            // The tail lies wholly at or above target: replayed in order (§2.2).
+            for (const TailEvent& e : tail_) applyMarker_(e.producerId, e.offset, e.commit);
+            tail_.clear();
+            st_ = Ready{cur.epoch, cur.logGen, cur.leadGen};
         }
         return bytes;
     }
@@ -716,7 +781,7 @@ private:
 #else
     std::vector<unsigned char>         residency_;
 #endif
-    std::variant<Unbuilt, Scanning, Ready> st_{Unbuilt{}};
+    std::variant<Unbuilt, Scanning, Ready, RingScanning> st_{Unbuilt{}};
     RcResidencyProbe probeFn_  = nullptr;
     void*            probeCtx_ = nullptr;
     RcReadAhead      readAheadFn_  = nullptr;
@@ -739,7 +804,9 @@ private:
     uint64_t    probeErrors_      = 0;
     uint64_t    ringPinnedTxns_        = 0;   ///< E2 finding B: open txns pinned at the ring start
     uint64_t    ringMarkedPidsOverflows_ = 0;   ///< producers the fixed set could not hold (pinned conservatively)
+    uint64_t    ringScanRestarts_        = 0;   ///< I3: ring builds restarted (the ring evicted past the cursor)
 public:
+    [[nodiscard]] uint64_t ringScanRestarts() const noexcept { return ringScanRestarts_; }
     [[nodiscard]] uint64_t ringPinnedTxns() const noexcept { return ringPinnedTxns_; }
     [[nodiscard]] uint64_t ringMarkedPidsOverflows() const noexcept { return ringMarkedPidsOverflows_; }
     [[nodiscard]] const FixedPidSet& ringMarkedPids() const noexcept { return ringMarkedPids_; }

@@ -5,6 +5,7 @@
 #include "TransientRig.h"
 
 #include <rune/node/RcState.h>
+#include <rune/storage/ProducerStateManager.h>
 
 using namespace transient_rig;
 
@@ -394,6 +395,150 @@ TEST(TransientDataPathRegression, RcRingRebuildPinsAnOpenTxnWhoseFirstBatchWasEv
     EXPECT_TRUE(rc.aborted().isAborted(kA, a1)) << "the abort covers A's in-ring batch";
     rc.onMarker(kB, mem.logEndOffset() + 1, true);
     EXPECT_EQ(rc.lso(INT64_MAX), INT64_MAX) << "nothing open";
+}
+
+// ---------------------------------------------------------------------------
+// E2 final fix wave (final review I3): the memory-backed read_committed (and
+// producer-state) rebuild walked the WHOLE ring in one worker pass — up to
+// 8 MiB of ~10^5 small batches per partition, for every partition whose
+// leadership / ownership changed in that pass: tens to hundreds of ms on the
+// worker.  It is now the budgeted RingScanning state: at most ~the scan budget
+// (plus one batch) per advance step, many steps, and the result is EXACTLY the
+// one-shot result — the same open transactions, aborted ranges, LSO and
+// producer state (the PSM checked against ProducerStateManager::rebuildFromLog,
+// the old memory path).  RED (one-shot): the first advance parsed the whole
+// ring (maxStepBytes ~ 8 MiB) and was Ready at once.
+// ---------------------------------------------------------------------------
+namespace {
+struct RingContent {
+    std::vector<int64_t> pids;
+};
+// A full 8 MiB ring of minimum-size batches with transactions interleaved:
+// committed, aborted, idempotent and one still-open transaction per producer
+// group; the ring has wrapped (evicted its oldest batches).
+RingContent fillFullRing(rune::storage::InMemoryLog& mem) {
+    RingContent c;
+    const auto plain = batchOf(1, 0);
+    for (int64_t p = 0; p < 16; ++p) c.pids.push_back(100 + p);
+    std::vector<int32_t> seq(16, 0);
+    int64_t i = 0;
+    while (mem.logStartOffset() == 0 || i < 200'000) {
+        if (i % 997 == 0) {
+            const std::size_t k = static_cast<std::size_t>((i / 997) % 16);
+            const int64_t pid = c.pids[k];
+            ringPut(mem, batchOf(1, 0, pid, 0, seq[k]++, /*txn=*/true));
+            if ((i / 997) % 3 != 2) ringPut(mem, markerOf(pid, /*commit=*/((i / 997) % 3) == 0));
+        } else if (i % 499 == 0) {
+            ringPut(mem, batchOf(1, 0, 500 + (i % 7), 0, static_cast<int32_t>(i / 499)));   // idempotent
+        } else {
+            ringPut(mem, plain);
+        }
+        ++i;
+        if (i > 2'000'000) break;   // bounded
+    }
+    return c;
+}
+}  // namespace
+
+TEST(TransientDataPathRegression, RcRingRebuildIsBudgetedPerStepAndEqualsTheOneShotBuildRegression) {
+    rune::storage::InMemoryLog mem(8u << 20, 1'000'000);
+    const RingContent content = fillFullRing(mem);
+    ASSERT_GT(mem.logStartOffset(), 0) << "precondition: the ring wrapped (full)";
+    ASSERT_GT(mem.logEndOffset() - mem.logStartOffset(), 50'000) << "precondition: ~10^5 small batches";
+    constexpr int32_t kTopicId = 7, kPart = 0;
+    rune::node::RcFacts f;
+    f.leader = true; f.epoch = 1;
+
+    // The budgeted build.
+    rune::storage::ProducerStateManager psm;
+    rune::node::RcState rc;
+    rc.reserve(256);
+    rc.reserveRingRebuild();
+    rc.bindProducerState(&psm, kTopicId, kPart);
+    const std::size_t budget = rune::node::RcState::kDefaultScanBytesPerPass;
+    int steps = 0;
+    std::size_t firstStep = 0;
+    for (; steps < 100'000 && !rc.ready(); ++steps) {
+        const std::size_t n = rc.advance(f, nullptr, static_cast<int32_t>(budget), &mem);
+        if (steps == 0) firstStep = n;
+    }
+    ASSERT_TRUE(rc.ready()) << "the budgeted ring build never finished";
+    EXPECT_LE(firstStep, budget + 1024) << "one advance step parsed " << firstStep << " B (the whole ring in one pass)";
+    EXPECT_LE(rc.maxStepBytes(), budget + 1024) << "a step exceeded the budget by more than one batch";
+    EXPECT_GE(steps, static_cast<int>((8u << 20) / budget) - 1) << "the 8 MiB ring was not spread over the passes";
+
+    // The one-shot reference (the pre-I3 behaviour: a budget larger than the ring)
+    // and the old producer-state rebuild.
+    rune::storage::ProducerStateManager psmRef;
+    ASSERT_TRUE(psmRef.rebuildFromLog(kTopicId, mem, mem.logEndOffset(), kPart));
+    rune::node::RcState ref;
+    ref.reserve(256);
+    ref.reserveRingRebuild();
+    (void)ref.advance(f, nullptr, INT32_MAX, &mem);
+    ASSERT_TRUE(ref.ready());
+
+    EXPECT_EQ(rc.lso(INT64_MAX), ref.lso(INT64_MAX));
+    EXPECT_EQ(rc.tracker().openCount(), ref.tracker().openCount());
+    for (int64_t pid : content.pids)
+        EXPECT_EQ(rc.tracker().firstOffsetOf(pid), ref.tracker().firstOffsetOf(pid)) << "producer " << pid;
+    const auto& a = rc.aborted().ranges();
+    const auto& b = ref.aborted().ranges();
+    ASSERT_EQ(a.size(), b.size());
+    for (std::size_t k = 0; k < a.size(); ++k) {
+        EXPECT_EQ(a[k].producerId, b[k].producerId);
+        EXPECT_EQ(a[k].firstOffset, b[k].firstOffset);
+        EXPECT_EQ(a[k].lastOffset, b[k].lastOffset);
+    }
+    EXPECT_EQ(rc.ringPinnedTxns(), ref.ringPinnedTxns());
+    std::vector<int64_t> allPids = content.pids;
+    for (int64_t p = 500; p < 507; ++p) allPids.push_back(p);
+    for (int64_t pid : allPids) {
+        const auto* x = psm.entry(kTopicId, pid, kPart);
+        const auto* y = psmRef.entry(kTopicId, pid, kPart);
+        ASSERT_EQ(x == nullptr, y == nullptr) << "producer " << pid;
+        if (x == nullptr) continue;
+        EXPECT_EQ(x->producerEpoch, y->producerEpoch) << "producer " << pid;
+        EXPECT_EQ(x->lastSequence, y->lastSequence) << "producer " << pid;
+        EXPECT_EQ(x->markerOnly, y->markerOnly) << "producer " << pid;
+        EXPECT_EQ(x->coordinatorEpoch, y->coordinatorEpoch) << "producer " << pid;
+    }
+}
+
+// I3: a budgeted ring build spans passes, and the ring may EVICT batches it has
+// not read yet meanwhile (non-idempotent produce keeps appending; eviction is
+// below the HW).  A marker among them could close a transaction the build
+// already opened — clamping the cursor would leave that transaction open
+// forever (LSO pinned).  The build restarts from the new ring start instead.
+// RED (mutation: clamp the cursor instead of restarting): producer A stays open
+// and the LSO is pinned at its batch.
+TEST(TransientDataPathRegression, RcRingBuildRestartsWhenTheRingEvictsPastItsCursorRegression) {
+    rune::storage::InMemoryLog mem(64 * 1024, 100'000);   // DropOldest: evicts as needed
+    constexpr int64_t kA = 41;
+    const auto pad = batchOf(1, 200);
+    for (int i = 0; i < 20; ++i) ringPut(mem, pad);
+    const int64_t a0 = ringPut(mem, batchOf(1, 50, kA, 0, 0, /*txn=*/true));   // A opens ...
+    for (int i = 0; i < 20; ++i) ringPut(mem, pad);
+    ringPut(mem, markerOf(kA, /*commit=*/true));                               // ... and commits
+    for (int i = 0; i < 100; ++i) ringPut(mem, pad);
+    ASSERT_EQ(mem.logStartOffset(), 0) << "precondition: nothing evicted yet";
+
+    rune::node::RcState rc;
+    rc.reserve(64);
+    rc.reserveRingRebuild();
+    rune::node::RcFacts f;
+    f.leader = true; f.epoch = 1;
+    // Steps of ~1 KiB: the build reads A's batch (opens A) but not yet its marker.
+    while (!rc.ready() && rc.tracker().firstOffsetOf(kA) < 0)
+        (void)rc.advance(f, nullptr, /*budget=*/1024, &mem);
+    ASSERT_FALSE(rc.ready());
+    ASSERT_EQ(rc.tracker().firstOffsetOf(kA), a0) << "precondition: the build opened A";
+    // The ring evicts past the cursor — A's batch AND its marker go before the build reads the marker.
+    while (mem.logStartOffset() <= a0 + 22) ringPut(mem, pad);
+    for (int i = 0; i < 10'000 && !rc.ready(); ++i) (void)rc.advance(f, nullptr, 1024, &mem);
+    ASSERT_TRUE(rc.ready());
+    EXPECT_GE(rc.ringScanRestarts(), 1u) << "the build did not restart after the ring evicted past its cursor";
+    EXPECT_LT(rc.tracker().firstOffsetOf(kA), 0) << "A (committed, all evicted) stayed open";
+    EXPECT_EQ(rc.lso(INT64_MAX), INT64_MAX) << "the LSO is pinned by a transaction that committed";
 }
 
 TEST(TransientDataPathRegression, OpenTxnWithItsFirstBatchEvictedSurvivesAnOwnershipChangeRegression) {
