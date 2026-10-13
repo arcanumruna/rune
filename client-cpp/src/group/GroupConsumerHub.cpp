@@ -1582,9 +1582,11 @@ void GroupConsumerHub::onOffsetFetchResponse(const uint8_t* buf, std::size_t len
                 it->second = r.offset;
             }
             if (it->second == GroupConsumerImpl::kUnseededSentinel) {
-                // No committed offset: the reset policy — the log start (the
-                // broker clamps 0 up to it; the first batch then simply starts
-                // above 0, a legitimate gap).
+                // No committed offset: the LOG START, whatever autoOffsetReset
+                // says (the broker clamps 0 up to the oldest held record; the
+                // first batch then simply starts above 0, a legitimate gap).
+                // E2 N6: for a transient partition whose lineage changed this
+                // reads every refilled record — never Latest (silent loss).
                 it->second = 0;
             }
             if (routed_()) impl->fetch[tp].offsetKnown = true;

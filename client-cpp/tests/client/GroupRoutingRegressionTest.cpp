@@ -2452,3 +2452,35 @@ TEST(GroupRoutingRegression, OffsetFetchAnsweredNotLeaderWhileTheLineageSettlesI
     r.gw.pushRecords(*r.subAt(1, n1), 0, 3);
     ASSERT_TRUE(r.drive([&] { return led.records[1] == 3; }));
 }
+
+// E2 final fix wave, residual round 3 — N6: a TRANSIENT partition whose
+// committed offset did not survive (a new lineage) is answered -1 ("no
+// committed offset").  The member starts it at the LOG START — the oldest
+// record the ring still holds — so it reads every refilled record; it never
+// applies Latest (the GroupConfig default), which would skip the refill
+// (silent loss of the first records after a restart).  RED (the seed follows
+// autoOffsetReset=Latest): the subscription did not start at the log start.
+TEST(GroupRoutingRegression, TransientNoCommittedOffsetSeedsTheLogStartNeverLatestRegression) {
+    GroupRig r(4241, 4242);
+    const auto [n1, p1port] = r.addNode(4241);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions            = {{1, 0, 0, 1, 4241, ""}, {1, 1, 1, 1, 4241, ""}};
+    r.gw.subscribeLeader       = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment       = {{1, 1}};
+    r.gw.committedOffsets[{1, 1}] = -1;   // a re-minted lineage: the old offset answered "none"
+    rc::GroupConfig cfg;
+    cfg.autoOffsetReset = rc::OffsetReset::Latest;   // explicit (also the default)
+    auto gc = r.client.subscribeGroup("g", {"t"}, cfg);
+    Consumed led;
+    wire(gc, led);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr; }, 40'000'000))
+        << "the member never subscribed after a -1 answer";
+    EXPECT_EQ(r.subAt(1, n1)->fromOffset, 0)
+        << "SILENT LOSS: a 'no committed offset' answer did not start at the log start (Latest skips the refill)";
+    r.gw.pushRecords(*r.subAt(1, n1), 0, 5);
+    ASSERT_TRUE(r.drive([&] { return led.records[1] == 5; })) << "the refilled records were not all consumed";
+    EXPECT_FALSE(gc.finished());
+}

@@ -122,6 +122,11 @@ struct GroupConfig {
     bool         autoCommit           = true;
     int32_t      autoCommitIntervalMs = 5000;
     int32_t      sessionTimeoutMs     = 30000;
+    /// Not applied today: a partition with no committed offset (including a
+    /// transient partition whose committed offset did not survive a restart,
+    /// answered -1) always starts at its LOG START — the oldest record the
+    /// broker still holds (E2 N6; pinned by GroupRoutingRegression.
+    /// TransientNoCommittedOffsetSeedsTheLogStartNeverLatestRegression).
     OffsetReset  autoOffsetReset      = OffsetReset::Latest;
     IsolationLevel isolation          = IsolationLevel::ReadUncommitted;  // TX-5: read_committed support
     /// F8c C4 (spec Q6): a commitSync that has not completed this long after
