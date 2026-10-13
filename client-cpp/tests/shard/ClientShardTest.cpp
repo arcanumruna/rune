@@ -452,6 +452,30 @@ TEST(ClientShardRegression, LeaderSessionLossWhileLiveIsDegradedThenLive) {
     ASSERT_TRUE(r.drive([&] { return r.ledger.ok == 2; }, 1'000'000));
 }
 
+// A leader session opened lazily (first record to its node) runs on the
+// client's duty clock (ClientConfig::nanoClock), never on steady_clock.  RED:
+// openSession_ stamped its connect with steady_clock::now(), so on an injected
+// clock its connect timers sat in another clock domain — here (duty clock far
+// behind steady time) the ConnectRequest's fast retry and connect timeout never
+// came due, and a Connect sent before the leader's UDP publication connected
+// was never re-sent: the leader never came up.  (With the duty clock behind by
+// the rig's set-up wall time — invokerGroup() — it only delayed the leader by
+// that much: LeaderSessionLossWhileLiveIsDegradedThenLive's first phase lasted
+// set-up-wall-time + ~300 ms of duty time.)
+TEST(ClientShardRegression, LeaderSessionOpensOnTheDutyClockNotSteadyTimeRegression) {
+    auto g = invokerGroup(3876, 3877);
+    g_now  = 1'000'000'000;   // the duty clock: 1 s — unrelated to steady_clock
+    ShardRig r(g, 0);
+    addLeader(r.gw, 24856, 3876, 3878);
+    r.connect();
+    const int64_t start = g_now;
+    ASSERT_EQ(r.shard->trySend(r.shard->topic("t"), keyFor(3), kVal), rc::SendResult::Ok);
+    ASSERT_TRUE(r.drive([&] { return r.state() == rs::ShardState::Live && r.ledger.ok == 1; }, 1'000'000))
+        << "the leader session never connected on the duty clock (state " << rs::toString(r.state()) << ")";
+    EXPECT_LT(g_now - start, int64_t{5'000'000'000}) << "the leader's connect retries ran on another clock";
+    EXPECT_EQ(r.ledger.failed, 0);
+}
+
 TEST(ClientShardRegression, DeliveryTimeoutFailsBatchNotShard) {
     auto g                       = invokerGroup(3838, 3839);
     g.producer.deliveryTimeoutMs = 2000;

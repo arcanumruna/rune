@@ -119,6 +119,7 @@ int ClientAgent::doWork(int64_t nowNs) noexcept {
     // call reaching here once the transport (and everything it touches) is
     // being/has been torn down.
     if (stopped_) return 0;
+    dutyNowNs_ = nowNs;  // the clock a session opened during this pass runs on
 
     // T15b failed mode: no driver / conductor pumping, no I/O of any kind.
     int totalWork = failed_ ? 0 : transport_.dutyCycle();  // invoker: driver + conductor; thread mode: 0
@@ -1088,8 +1089,10 @@ Session& ClientAgent::openSession_(const std::string& endpoint) noexcept {
     scfg.keepaliveCorrelationId = -(static_cast<int64_t>(sessions_.size()) + 1);   // A10: Pong routing
     sessions_.emplace_back(std::make_unique<Session>(this, std::move(scfg), endpoint));
     Session& s = *sessions_.back();
-    s.machine.connect(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count());
+    // On the duty clock (the clock tick() runs on), never steady_clock: with an
+    // injected nanoClock the two are different domains and the connect's
+    // fast-retry / timeout would never (or only much later) come due.
+    s.machine.connect(dutyNowNs_);
     s.connectSubmitted = true;
     if (mnDebug_) {
         std::fprintf(stderr, "[MNDBG new-session] ep='%s' corrIdBase=%lld nSessions=%zu connectCorrId=%lld\n",

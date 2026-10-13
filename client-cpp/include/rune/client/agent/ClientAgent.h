@@ -962,6 +962,12 @@ private:
     bool started_ = false;
     bool stopped_ = false;
     bool failed_    = false;  // T15b failed mode (duty thread only)
+    // The duty clock (ClientConfig::nanoClock, or the default clock) of the
+    // current / latest doWork pass — the ONE clock every session machine runs
+    // on.  A session opened lazily mid-pass (openSession_) stamps its connect
+    // with it, never with steady_clock (an injected clock is another domain).
+    // 0 before the first pass: a session opened then is simply due at once.
+    int64_t dutyNowNs_ = 0;  // duty thread only
     bool testFault_ = false;  // T15b test seam (duty thread only)
 
     // ---- Egress observer (agent thread only; must be set before start()) ----
