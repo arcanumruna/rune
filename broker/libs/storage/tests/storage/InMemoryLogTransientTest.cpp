@@ -147,3 +147,93 @@ TEST(InMemoryLogTransientRegression, ShortBatchIsRefusedNotPatchedPastTheCopy) {
     EXPECT_EQ(base, -7) << "no base offset is reported for a refused batch";
     EXPECT_EQ(log.logEndOffset(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// E2 Task 11 (interaction matrix, follower ParityWithDisk cells): a follower
+// applies a FETCHED span of several whole batches in ONE appendNoSync.  The ring
+// must index it per batch, exactly like the disk Log — one Entry for the whole
+// span made a read from a mid-span offset re-deliver the earlier batches, made
+// eviction drop committed batches only together with their span-mates, and left
+// truncateTo(n) with n inside the span holding the stale bytes past n.
+// ---------------------------------------------------------------------------
+namespace {
+/// A batch as the leader's ring holds it: base offset stamped.
+std::vector<uint8_t> batchAt(int64_t base, int records, std::size_t valueBytes = 100) {
+    rune::protocol::RecordBatchBuilder b(base, 1000);
+    const std::string v(valueBytes, 'v');
+    for (int i = 0; i < records; ++i) b.append("k", v, 1000 + i);
+    return b.build();
+}
+std::vector<uint8_t> concat(std::initializer_list<const std::vector<uint8_t>*> parts) {
+    std::vector<uint8_t> out;
+    for (const auto* p : parts) out.insert(out.end(), p->begin(), p->end());
+    return out;
+}
+} // namespace
+
+TEST(InMemoryLogMultiBatchSpanRegression, ReadFromAMidSpanOffsetStartsAtThatBatch) {
+    InMemoryLog log(1 << 20, 1024);
+    const auto b0 = batchAt(0, 2), b1 = batchAt(2, 2);
+    const auto span = concat({&b0, &b1});
+    ASSERT_EQ(log.appendNoSync(span.data(), span.size(), 3), 0);
+    EXPECT_EQ(log.logEndOffset(), 4);
+
+    const auto v = log.readView(3, 1 << 20);
+    ASSERT_FALSE(v.empty());
+    EXPECT_EQ(v.baseOffset, 2) << "a read from offset 3 re-delivered the batch at 0 (disk Log: batch 2)";
+    EXPECT_EQ(v.len, b1.size());
+    EXPECT_EQ(log.read(2, 1 << 20), b1) << "the copying read too";
+    const auto all = log.readView(0, 1 << 20);
+    EXPECT_EQ(all.len, span.size()) << "both batches stay contiguous for a read from the span start";
+    EXPECT_EQ(all.nextOffset, 4);
+}
+
+TEST(InMemoryLogMultiBatchSpanRegression, TruncateInsideASpanDropsTheBatchesPastIt) {
+    InMemoryLog log(1 << 20, 1024);
+    const auto b0 = batchAt(0, 2), b1 = batchAt(2, 2);
+    const auto span = concat({&b0, &b1});
+    ASSERT_EQ(log.appendNoSync(span.data(), span.size(), 3), 0);
+    log.truncateTo(2);   // a follower's divergence truncation (KIP-279)
+    EXPECT_EQ(log.logEndOffset(), 2);
+    EXPECT_TRUE(log.readView(2, 1 << 20).empty()) << "the truncated batch is still readable";
+    EXPECT_EQ(log.readView(0, 1 << 20).len, b0.size()) << "the ring still holds the stale bytes past offset 2";
+
+    const auto nb = batchAt(2, 3, 50);   // the new leader's lineage at 2
+    ASSERT_EQ(log.appendNoSync(nb.data(), nb.size(), 4), 2);
+    EXPECT_EQ(log.read(2, 1 << 20), nb);
+    EXPECT_EQ(log.read(0, 1 << 20), concat({&b0, &nb}));
+}
+
+TEST(InMemoryLogMultiBatchSpanRegression, EvictionDropsOneBatchOfASpanAtATime) {
+    const auto b0 = batchAt(0, 2), b1 = batchAt(2, 2), b2 = batchAt(4, 2);
+    const auto span = concat({&b0, &b1});
+    InMemoryLog log(span.size() + b2.size() / 2, 1024);   // room for the span, not span + b2
+    ASSERT_EQ(log.appendNoSync(span.data(), span.size(), 3), 0);
+    ASSERT_EQ(log.appendNoSync(b2.data(), b2.size(), 5), 4);
+    EXPECT_EQ(log.logStartOffset(), 2) << "the committed batch at 2 was evicted together with its span-mate";
+    EXPECT_EQ(log.evictedRecords(), 2u);
+    EXPECT_EQ(log.read(2, 1 << 20), concat({&b1, &b2}));
+}
+
+TEST(InMemoryLogMultiBatchSpanRegression, EvictionFloorProtectsOnlyTheBatchesAtOrAboveIt) {
+    const auto b0 = batchAt(0, 2), b1 = batchAt(2, 2), b2 = batchAt(4, 2);
+    const auto span = concat({&b0, &b1});
+    InMemoryLog log(span.size() + b2.size() / 2, 1024);
+    ASSERT_EQ(log.appendNoSync(span.data(), span.size(), 3), 0);
+    log.setEvictionFloor(2);   // HW = 2: the batch at 0 is committed, the one at 2 is not
+    EXPECT_EQ(log.appendNoSync(b2.data(), b2.size(), 5), 4) << "the committed batch at 0 was evictable";
+    EXPECT_EQ(log.logStartOffset(), 2);
+}
+
+TEST(InMemoryLogMultiBatchSpanRegression, SpanOfMoreBatchesThanTheEntryCapIsRefusedTooLarge) {
+    InMemoryLog log(1 << 20, 2);
+    const auto b0 = batchAt(0, 1), b1 = batchAt(1, 1), b2 = batchAt(2, 1);
+    const auto span = concat({&b0, &b1, &b2});
+    EXPECT_EQ(log.appendNoSync(span.data(), span.size(), 2), InMemoryLog::kRefusedTooLarge);
+    EXPECT_EQ(log.logEndOffset(), 0) << "nothing appended";
+    const auto two = concat({&b0, &b1});
+    ASSERT_EQ(log.appendNoSync(two.data(), two.size(), 1), 0);
+    const auto b2b = batchAt(2, 1);
+    ASSERT_EQ(log.appendNoSync(b2b.data(), b2b.size(), 2), 2) << "the entry cap evicts per batch";
+    EXPECT_EQ(log.logStartOffset(), 1);
+}

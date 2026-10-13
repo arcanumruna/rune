@@ -111,16 +111,19 @@ public:
 
     /// Returns the base offset on success, or -1 if the ring is full
     /// (BackPressure mode only).
+    /// `data` may hold SEVERAL whole RecordBatches (a follower applies a fetched
+    /// span in one call): each becomes its own entry, exactly as the disk Log
+    /// indexes them (Phase 2b E2 Task 11) — see appendSpan_.
     int64_t append(const uint8_t* data, std::size_t len, int64_t lastOffset) {
-        return appendImpl(data, len, lastOffset);
+        return appendSpan_(data, len, lastOffset);
     }
 
     int64_t append(const std::vector<uint8_t>& batch, int64_t lastOffset) {
-        return appendImpl(batch.data(), batch.size(), lastOffset);
+        return appendSpan_(batch.data(), batch.size(), lastOffset);
     }
 
     int64_t appendNoSync(const uint8_t* data, std::size_t len, int64_t lastOffset) {
-        return appendImpl(data, len, lastOffset);
+        return appendSpan_(data, len, lastOffset);
     }
 
     // -----------------------------------------------------------------------
@@ -387,9 +390,61 @@ private:
     void popBackEntry() noexcept { --entryCount_; }
 
     // -----------------------------------------------------------------------
-    // Core append logic
+    // Phase 2b E2 Task 11 — a multi-batch span is indexed PER BATCH.
+    //
+    // A follower applies a fetched span of whole batches in one append.  Held as
+    // ONE entry, a read from a mid-span offset re-delivered the earlier batches,
+    // eviction (and the eviction floor) worked at span granularity, and
+    // truncateTo(n) with n inside the span kept the stale bytes past n.  Now: the
+    // span is still copied ONCE and contiguously, but each batch gets its own
+    // entry (base/last from its header, rebased onto logEndOffset_).
+    //
+    // countSpanBatches_ returns the number of batches when [data, len) is an exact
+    // sequence of whole, magic-2, offset-increasing batches whose relative extent
+    // matches lastOffset; otherwise 0 — the bytes are stored as ONE opaque entry
+    // (the pre-existing contract for non-batch payloads).  Header reads only; no
+    // allocation.  The leader's produce path (appendNoSyncRestamp: one batch) does
+    // not come here.
     // -----------------------------------------------------------------------
-    int64_t appendImpl(const uint8_t* data, std::size_t len, int64_t lastOffset) {
+    [[nodiscard]] std::size_t countSpanBatches_(const uint8_t* data, std::size_t len,
+                                                int64_t lastOffset) const noexcept {
+        namespace rb = rune::protocol::batch;
+        std::size_t n = 0, pos = 0;
+        int64_t first = 0, prevLast = 0;
+        while (pos < len) {
+            const std::size_t rem = len - pos;
+            if (rem < static_cast<std::size_t>(rb::kRecordBatchOverhead)) return 0;
+            if (static_cast<int8_t>(data[pos + rb::kMagicOffset]) != rb::kMagicValue) return 0;
+            const rune::protocol::RecordBatchReader r(data + pos, rem);
+            const int32_t total = r.totalLength();
+            if (total < rb::kRecordBatchOverhead || static_cast<std::size_t>(total) > rem) return 0;
+            const int64_t base = r.baseOffset();
+            const int32_t delta = r.lastOffsetDelta();
+            if (delta < 0) return 0;
+            if (n == 0) first = base;
+            else if (base <= prevLast) return 0;
+            prevLast = base + delta;
+            pos += static_cast<std::size_t>(total);
+            ++n;
+        }
+        if (n == 0 || logEndOffset_ + (prevLast - first) != lastOffset) return 0;
+        return n;
+    }
+
+    int64_t appendSpan_(const uint8_t* data, std::size_t len, int64_t lastOffset) {
+        const std::size_t n = countSpanBatches_(data, len, lastOffset);
+        if (n <= 1) return appendImpl(data, len, lastOffset);
+        // More batches than the entry ring holds can never be stored whole.
+        if (n > maxRecords_) [[unlikely]] return kRefusedTooLarge;
+        return appendImpl(data, len, lastOffset, n);
+    }
+
+    // -----------------------------------------------------------------------
+    // Core append logic.  `nEntries` > 1: [data, len) is a span of that many
+    // whole batches (validated by countSpanBatches_) — one entry per batch.
+    // -----------------------------------------------------------------------
+    int64_t appendImpl(const uint8_t* data, std::size_t len, int64_t lastOffset,
+                       std::size_t nEntries = 1) {
         // Phase 2b E2: a batch larger than the whole ring can never be stored
         // (was an assert — a release build corrupted the ring).
         if (len > maxBytes_) [[unlikely]] return kRefusedTooLarge;
@@ -410,7 +465,7 @@ private:
                 const std::size_t la = maxBytes_ - tail_;
                 const bool ww = (len > la);
                 const std::size_t need = len + (ww ? la : 0);
-                if (bytesUsed_ + need <= maxBytes_ && entryCount_ < maxRecords_)
+                if (bytesUsed_ + need <= maxBytes_ && entryCount_ + nEntries <= maxRecords_)
                     break; // fits — stop evicting
                 // Phase 2b E2: never evict at/above the floor (uncommitted data
                 // of a transient partition) — refuse the append instead.
@@ -425,7 +480,7 @@ private:
             const std::size_t la = maxBytes_ - tail_;
             const bool ww = (len > la);
             const std::size_t need = len + (ww ? la : 0);
-            if (bytesUsed_ + need > maxBytes_ || entryCount_ >= maxRecords_) {
+            if (bytesUsed_ + need > maxBytes_ || entryCount_ + nEntries > maxRecords_) {
                 ++fullRefusals_;
                 return kRefusedFull; // sentinel: ring full, caller must retry later
             }
@@ -451,7 +506,21 @@ private:
         tail_       = ringPos + len;
         bytesUsed_ += len;
 
-        pushBackEntry(Entry{baseOffset, lastOffset, ringPos, len});
+        if (nEntries == 1) {
+            pushBackEntry(Entry{baseOffset, lastOffset, ringPos, len});
+        } else {
+            // One entry per batch of the (validated) span, rebased onto baseOffset.
+            const uint8_t* const copy = ring_.data() + ringPos;
+            const int64_t first = rune::protocol::RecordBatchReader(copy, len).baseOffset();
+            std::size_t pos = 0;
+            for (std::size_t i = 0; i < nEntries; ++i) {
+                const rune::protocol::RecordBatchReader r(copy + pos, len - pos);
+                const auto total = static_cast<std::size_t>(r.totalLength());
+                const int64_t b = baseOffset + (r.baseOffset() - first);
+                pushBackEntry(Entry{b, b + r.lastOffsetDelta(), ringPos + pos, total});
+                pos += total;
+            }
+        }
         logEndOffset_ = lastOffset + 1;
 
         return baseOffset;
