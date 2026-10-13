@@ -384,7 +384,9 @@ private:
         ++entryCount_;
     }
     void popFrontEntry() noexcept {
-        entryHead_ = (entryHead_ + 1) % maxRecords_;
+        // Compare-and-reset, not `% maxRecords_` (a real division on a non-pow2
+        // capacity) — once per evicted batch (Task 11: per batch of a span too).
+        if (++entryHead_ == maxRecords_) entryHead_ = 0;
         --entryCount_;
     }
     void popBackEntry() noexcept { --entryCount_; }
@@ -512,14 +514,18 @@ private:
             // One entry per batch of the (validated) span, rebased onto baseOffset.
             const uint8_t* const copy = ring_.data() + ringPos;
             const int64_t first = rune::protocol::RecordBatchReader(copy, len).baseOffset();
-            std::size_t pos = 0;
+            // Precondition (the fit loop above): entryCount_ + nEntries <= maxRecords_.
+            std::size_t pos  = 0;
+            std::size_t phys = (entryHead_ + entryCount_) % maxRecords_;   // one division per span
             for (std::size_t i = 0; i < nEntries; ++i) {
                 const rune::protocol::RecordBatchReader r(copy + pos, len - pos);
                 const auto total = static_cast<std::size_t>(r.totalLength());
                 const int64_t b = baseOffset + (r.baseOffset() - first);
-                pushBackEntry(Entry{b, b + r.lastOffsetDelta(), ringPos + pos, total});
+                entries_[phys] = Entry{b, b + r.lastOffsetDelta(), ringPos + pos, total};
+                if (++phys == maxRecords_) phys = 0;
                 pos += total;
             }
+            entryCount_ += nEntries;
         }
         logEndOffset_ = lastOffset + 1;
 

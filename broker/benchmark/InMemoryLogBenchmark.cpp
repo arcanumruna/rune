@@ -128,6 +128,33 @@ static void BM_InMemoryLog_AppendNoSync(benchmark::State& state) {
 BENCHMARK(BM_InMemoryLog_AppendNoSync)->Unit(benchmark::kNanosecond);
 
 // ---------------------------------------------------------------------------
+// BM_InMemoryLog_AppendSpan/{1,4,16,64}
+//
+// Phase 2b E2 Task 11: a FOLLOWER applies a fetched span of N whole batches in
+// ONE appendNoSync; the ring copies it once and indexes it per batch (two header
+// walks: validate + index).  Steady state: the same span bytes every iteration
+// (the headers are rebased onto the LEO), a 4 MiB ring that evicts per batch.
+// items = batches (the per-batch cost is the time / item).
+// ---------------------------------------------------------------------------
+static void BM_InMemoryLog_AppendSpan(benchmark::State& state) {
+    const int n = static_cast<int>(state.range(0));
+    std::vector<uint8_t> span;
+    for (int i = 0; i < n; ++i) {
+        const auto b = makePoseBatch(i, 1700000000000LL + i);
+        span.insert(span.end(), b.begin(), b.end());
+    }
+    InMemoryLog log(4ull * 1024 * 1024, 1ull << 20);
+    for (auto _ : state) {
+        const int64_t last = log.logEndOffset() + n - 1;
+        int64_t result = log.appendNoSync(span.data(), span.size(), last);
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(state.iterations() * n);
+    state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(span.size()));
+}
+BENCHMARK(BM_InMemoryLog_AppendSpan)->Arg(1)->Arg(4)->Arg(16)->Arg(64)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
 // BM_InMemoryLog_AppendSteadyStateFull
 //
 // The realistic memory-backed hot path: a ring pre-filled to its record cap so
