@@ -197,11 +197,19 @@ enum class ErrorCode : uint16_t {
 //       ProduceResponse — retried after a backoff with the same identity and
 //       no metadata refresh.  A broker answers a session below 6 NotLeader
 //       instead (produceErrorForClient).
+//       Also (E2 Task 13): a subscription its node can no longer serve
+//       (demoted / partition moved away) is answered ErrorResponse{NotLeader}
+//       on its Subscribe correlationId; a session >= 6 is first sent a
+//       POSITION NOTE — a Records frame of that subscription with an EMPTY
+//       recordBatch whose baseOffset is the broker's cursor — so a moved
+//       subscription that delivered nothing resumes there (never re-resolves
+//       Latest).  Clients below 6 ignore an empty Records batch.
 // ---------------------------------------------------------------------------
 inline constexpr int32_t kClientVersionUnknownProducerId          = 2;
 inline constexpr int32_t kClientVersionExplicitGroupSubscriptions = 3;
 inline constexpr int32_t kClientVersionInvalidRequest             = 5;
 inline constexpr int32_t kClientVersionTransientLogFull           = 6;
+inline constexpr int32_t kClientVersionMovedPositionNote          = 6;
 inline constexpr int32_t kClientVersion                           = 6;   // what this protocol's client announces
 
 // ---------------------------------------------------------------------------
@@ -233,6 +241,12 @@ inline constexpr int32_t kBrokerVersion                           = 4;   // what
 /// TransientLogFull (42) (else the broker answers NotLeader).
 [[nodiscard]] constexpr bool clientUnderstandsTransientLogFull(int32_t clientVersion) noexcept {
     return clientVersion >= kClientVersionTransientLogFull;
+}
+
+/// True when a session that connected with `clientVersion` may be sent the
+/// moved-subscription position note (an empty-batch Records frame; see 6).
+[[nodiscard]] constexpr bool clientUnderstandsMovedPositionNote(int32_t clientVersion) noexcept {
+    return clientVersion >= kClientVersionMovedPositionNote;
 }
 
 /// The produce error code a session that connected with `clientVersion` is
