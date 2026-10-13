@@ -77,6 +77,8 @@
 //     ("e2-presence-group", earliest) consumes presence_t (RUNE_VIEW_TT_TOPIC_ID)
 //     to its end (RUNE_VIEW_TT_END) and commits that position.  Prints
 //     "GROUP-COMMIT: OK committed=<n>".  Exit codes 150..152.
+//     RUNE_GROUP_TOPIC (default presence_t) names the topic; RUNE_GROUP_PRODUCE
+//     (default 0) records are produced first (the 3-node leg's empty topic).
 //   RUNE_MODE=group_restart (C1; after verify_restart): the ring restarted
 //     empty and holds fewer records than the group committed.  Produces two
 //     more (offsets 1, 2 after verify_restart's 0); the SAME group rejoins and
@@ -975,21 +977,33 @@ static int transientFailoverMode(Client& c, std::chrono::milliseconds wait, int 
 // ---------------------------------------------------------------------------
 static constexpr const char* kPresenceGroup = "e2-presence-group";
 
+// The group legs' topic (RUNE_GROUP_TOPIC, default presence_t; the 3-node
+// failover e2e uses its static presence_failover).
+static std::string groupTopic() { return getEnvStr("RUNE_GROUP_TOPIC", "presence_t"); }
+
 static int groupCommitMode(ClientConfig cfg, int timeoutMs, int boundMs) {
     const auto ttTopic = static_cast<int32_t>(getEnvI64("RUNE_VIEW_TT_TOPIC_ID", -1));
     const int64_t ttEnd = getEnvI64("RUNE_VIEW_TT_END", -1);
+    const int64_t preProduce = getEnvI64("RUNE_GROUP_PRODUCE", 0);   // records to produce first (an empty topic)
     if (ttTopic < 0 || ttEnd <= 0) { std::cerr << "PROBE: FAIL group_commit needs RUNE_VIEW_TT_TOPIC_ID / RUNE_VIEW_TT_END\n"; return 150; }
-    cfg.topics.push_back(TopicSpec{"presence_t", ttTopic, 1});
+    const std::string topic = groupTopic();
+    cfg.topics.push_back(TopicSpec{topic, ttTopic, 1});
     Client c(cfg);
     GroupConfig g;
     g.autoCommit      = false;
     g.autoOffsetReset = OffsetReset::Earliest;
-    auto gc = c.subscribeGroup(kPresenceGroup, {"presence_t"}, g);
+    auto gc = c.subscribeGroup(kPresenceGroup, {topic}, g);
     std::atomic<int64_t> next{0};
     gc.onRecords([&next](const RecordSet& rs) {
         if (rs.nextOffset() > next.load(std::memory_order_relaxed)) next.store(rs.nextOffset(), std::memory_order_relaxed);
     });
     c.connectAndWait();
+    for (int64_t k = 0; k < preProduce; ++k) {
+        int64_t off = -1;
+        if (!produceOne(c, ttTopic, 100 + k, Acks::All, timeoutMs, off)) {
+            std::cerr << "PROBE: FAIL group_commit produce #" << k << "\n"; gc.close(); c.close(); return 150;
+        }
+    }
     const auto dl = std::chrono::steady_clock::now() + std::chrono::milliseconds(boundMs);
     while (next.load(std::memory_order_relaxed) < ttEnd && std::chrono::steady_clock::now() < dl)
         std::this_thread::sleep_for(5ms);   // poll interval, not correctness
@@ -1013,13 +1027,31 @@ static int groupCommitMode(ClientConfig cfg, int timeoutMs, int boundMs) {
 static int groupRestartMode(ClientConfig cfg, int timeoutMs, int boundMs) {
     const auto ttTopic = static_cast<int32_t>(getEnvI64("RUNE_VIEW_TT_TOPIC_ID", -1));
     if (ttTopic < 0) { std::cerr << "PROBE: FAIL group_restart needs RUNE_VIEW_TT_TOPIC_ID\n"; return 153; }
-    cfg.topics.push_back(TopicSpec{"presence_t", ttTopic, 1});
+    const std::string topic = groupTopic();
+    cfg.topics.push_back(TopicSpec{topic, ttTopic, 1});
+    // The 2 new records first, on a short-lived client: acks=All waits (bounded)
+    // until the partition has a writable leader again, so the group below
+    // starts against a settled partition (its data lineage confirmed).
+    {
+        Client p(cfg);
+        p.connectAndWait();
+        for (int64_t key = 40; key < 42; ++key) {
+            int64_t off = -1;
+            if (!produceOne(p, ttTopic, key, Acks::All, timeoutMs, off)) {
+                std::cerr << "PROBE: FAIL group_restart produce\n"; p.close(); return 154;
+            }
+        }
+        p.close();
+    }
     Client c(cfg);
     GroupConfig g;
     g.autoCommit      = false;
     g.autoOffsetReset = OffsetReset::Earliest;
-    auto gc = c.subscribeGroup(kPresenceGroup, {"presence_t"}, g);
-    constexpr int64_t kWant = 3;   // offsets 0 (verify_restart's record), 1, 2
+    auto gc = c.subscribeGroup(kPresenceGroup, {topic}, g);
+    // Records the restarted ring already holds (RUNE_GROUP_PRE; default 1 —
+    // verify_restart's record) + the 2 produced above: offsets 0..kWant-1.
+    const int64_t kWant = getEnvI64("RUNE_GROUP_PRE", 1) + 2;
+    if (kWant > 64) { std::cerr << "PROBE: FAIL group_restart RUNE_GROUP_PRE too large\n"; return 153; }
     std::array<std::atomic<int>, 64> seen{};
     gc.onRecords([&seen](const RecordSet& rs) {
         rs.forEachRecord([&seen](std::string_view, std::string_view, int64_t off, int64_t) {
@@ -1027,12 +1059,6 @@ static int groupRestartMode(ClientConfig cfg, int timeoutMs, int boundMs) {
         });
     });
     c.connectAndWait();
-    for (int64_t key = 40; key < 42; ++key) {
-        int64_t off = -1;
-        if (!produceOne(c, ttTopic, key, Acks::All, timeoutMs, off)) {
-            std::cerr << "PROBE: FAIL group_restart produce\n"; gc.close(); c.close(); return 154;
-        }
-    }
     auto all = [&] {
         for (int64_t o = 0; o < kWant; ++o) if (seen[static_cast<std::size_t>(o)].load() == 0) return false;
         return true;

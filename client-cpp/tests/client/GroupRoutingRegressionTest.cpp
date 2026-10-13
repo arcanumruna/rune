@@ -2420,3 +2420,35 @@ TEST(GroupRoutingRegression, MovedSubscriptionAnsweredNotLeaderByItsNewLeaderRet
     EXPECT_TRUE(s0.active());
     s0.unsubscribe();
 }
+
+// E2 final fix wave (C1 multi-node, broker option b): right after a full-cluster
+// restart a transient partition's data lineage is not confirmed yet and the
+// coordinator answers that OffsetFetch entry NotLeader (an existing retriable
+// code) — several times while the cluster settles.  The member must retry it
+// (paced, within its budget), never be refused and never seed a guessed
+// position; once answered it seeds and consumes from the answer (-1: the reset
+// policy, the log start).  Pins the client half of the broker's contract.
+TEST(GroupRoutingRegression, OffsetFetchAnsweredNotLeaderWhileTheLineageSettlesIsRetriedRegression) {
+    GroupRig r(4239, 4240);
+    const auto [n1, p1port] = r.addNode(4239);
+    r.gw.moreBrokers           = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions            = {{1, 0, 0, 1, 4239, ""}, {1, 1, 1, 1, 4239, ""}};
+    r.gw.subscribeLeader       = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment       = {{1, 1}};
+    r.gw.committedOffsets[{1, 1}] = -1;   // the answer once settled: no committed offset (a re-minted lineage)
+    r.gw.offsetFetchErrorCode  = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+    r.gw.offsetFetchErrorsNext = 4;
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed led;
+    wire(gc, led);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr; }, 80'000'000))
+        << "the member never subscribed after " << r.gw.offsetFetches << " fetches (refused: " << gc.finished() << ")";
+    EXPECT_FALSE(gc.finished()) << "a retriable NotLeader answer refused the consumer";
+    EXPECT_GE(r.gw.offsetFetches, 5) << "the NotLeader answers were not retried";
+    EXPECT_EQ(r.subAt(1, n1)->fromOffset, 0) << "not the reset policy (the log start) after 'no committed offset'";
+    r.gw.pushRecords(*r.subAt(1, n1), 0, 3);
+    ASSERT_TRUE(r.drive([&] { return led.records[1] == 3; }));
+}
