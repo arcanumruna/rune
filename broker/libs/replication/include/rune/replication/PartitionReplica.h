@@ -410,6 +410,14 @@ public:
     /// coordinator trusts a lineage only while its leader's process lives.
     /// Set once before the replica is driven (ReplicaRegistry::add).
     void setLineageIdentity(int64_t id) noexcept { lineageIdentity_ = id; }
+    /// E2 residual round 5 (R2): this process's identity ROTATED (a stale frame
+    /// superseded it at a controller).  Owner thread.  The replica adopts it
+    /// and — as the leader of a transient partition — re-reports its lineage
+    /// under the CURRENT identity, so the controller re-confirms it (same
+    /// leadership + data: KEEP) and the coordinator trusts it again.  A partition
+    /// never stays NotLeader for the life of the process.
+    void rotateLineageIdentity(int64_t id) noexcept;
+    [[nodiscard]] int64_t lineageIdentityForTest() const noexcept { return lineageIdentity_; }
     [[nodiscard]] int64_t processIncarnation() const noexcept { return processIncarnation_; }
 
     // -----------------------------------------------------------------------

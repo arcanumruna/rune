@@ -569,6 +569,12 @@ inline constexpr int16_t kAlterIsrInvalidRequest       = 4;  ///< malformed (lea
 /// E2 final fix wave (C1 multi-node): the leader's TransientLineage report for
 /// its leader epoch is COMMITTED (the leader stops re-sending it).
 inline constexpr int16_t kAlterIsrLineageConfirmed     = 5;
+/// E2 residual round 5 (R2): NODE-LOCAL only, never on the wire — the node's
+/// own runtime tells a user replica (on its owner thread, through the existing
+/// AlterIsrResponse op; the identity rides in the op's nextOffset slot) that
+/// this process's node-control identity ROTATED.  The replica adopts it and,
+/// leading a transient partition, re-reports its lineage under it.
+inline constexpr int16_t kAlterIsrLocalLineageIdentity = 100;
 
 // ---------------------------------------------------------------------------
 // AlterIsrResponse (template 8, v3) — Kafka AlterPartitionResponse.  The leader

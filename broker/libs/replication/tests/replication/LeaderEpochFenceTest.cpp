@@ -455,3 +455,50 @@ TEST(LeaderEpochFenceRegression, DiskReplicaNeverSendsALineageReportRegression) 
     r->doWork(1'000'000'000);
     EXPECT_TRUE(lineageReports(t).empty()) << "a disk partition has no data lineage";
 }
+
+// E2 final fix wave, residual round 5 — R2: the process identity ROTATED.  A
+// transient LEADER whose lineage was already confirmed re-reports it under the
+// new identity, with its own epoch as the data source (same leadership, same
+// data: the controller keeps the lineage); a follower only adopts it (its
+// next leadership reports under it).  RED (identity fixed at add): no
+// re-report — the controller's new identity never matches the record.
+TEST(LeaderEpochFenceRegression, RotatedIdentityIsReportedAgainByATransientLeaderRegression) {
+    Dir d;
+    rune::storage::InMemoryLog log(1 << 20, 10'000);
+    CapturingTransport t;
+    auto r = memReplica(log, t);
+    r->setLineageIdentity(0x0B0B);
+    r->setLeaderEpochFenceFile((d.path / "fence-0-0").string());
+    r->becomeLeader(5, kAll);
+    int64_t now = 1'000'000'000;
+    r->doWork(now);
+    r->onAlterIsrResponse(lineageAck(kAlterIsrLineageConfirmed, 5));
+    ASSERT_FALSE(r->lineageReportPendingForTest());
+    const std::size_t before = lineageReports(t).size();
+
+    r->rotateLineageIdentity(0x0C0C);
+    EXPECT_EQ(r->lineageIdentityForTest(), 0x0C0C);
+    EXPECT_TRUE(r->lineageReportPendingForTest()) << "the confirmed leader did not re-arm its report";
+    r->doWork(now += 1'000'000);
+    const auto reps = lineageReports(t);
+    ASSERT_EQ(reps.size(), before + 1) << "no lineage report under the rotated identity";
+    const auto& m = reps.back();
+    const int64_t id = static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(m.isr[4])) << 32) |
+                                            static_cast<uint32_t>(m.isr[3]));
+    EXPECT_EQ(id, 0x0C0C) << "the re-report carried the OLD identity";
+    EXPECT_EQ(m.leaderEpoch, 5);
+    EXPECT_EQ(m.isr[2], 5) << "the data source is this leadership (the controller keeps the lineage)";
+    r->onAlterIsrResponse(lineageAck(kAlterIsrLineageConfirmed, 5));
+    EXPECT_FALSE(r->lineageReportPendingForTest());
+    r->rotateLineageIdentity(0x0C0C);
+    EXPECT_FALSE(r->lineageReportPendingForTest()) << "an unchanged identity re-armed the report";
+
+    // A follower adopts it without reporting.
+    rune::storage::InMemoryLog log2(1 << 20, 10'000);
+    CapturingTransport t2;
+    auto f = memReplica(log2, t2);
+    f->becomeFollower(7, 2);
+    f->rotateLineageIdentity(0x0D0D);
+    EXPECT_EQ(f->lineageIdentityForTest(), 0x0D0D);
+    EXPECT_FALSE(f->lineageReportPendingForTest());
+}

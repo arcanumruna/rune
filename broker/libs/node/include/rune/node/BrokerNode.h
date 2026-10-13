@@ -794,6 +794,32 @@ public:
             -1, -1, std::forward<F>(f), timeout);
     }
 
+    /// E2 residual round 5 (R2), TEST-ONLY: a controller answers this node's
+    /// node-control identity kNodeSuperseded (as after a late frame of an
+    /// unseen older process) — the node ROTATES its process identity.  Runs on
+    /// the control thread; returns the identity before the rotation.
+    template <class = void>
+    int64_t supersedeProcessIdentityForTest() {
+        return onControlThreadForTest([this]() -> int64_t {
+            if (!runtimeAgent_) return 0;
+            auto& cs = runtimeAgent_->controlledShutdown();
+            const int64_t id = cs.nonceOnControl();
+            rune::replication::AlterIsrResponseMsg r{};
+            r.leaderId       = config_.nodeId;
+            r.leaderEpoch    = static_cast<rune::replication::Epoch>(static_cast<uint32_t>(static_cast<uint64_t>(id)));
+            r.partitionEpoch = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(id) >> 32));
+            r.errorCode      = rune::replication::AlterIsrMsg::kNodeSuperseded;
+            cs.onResponse(r);
+            return id;
+        });
+    }
+    template <class = void>
+    int64_t processIdentityForTest() {
+        return onControlThreadForTest([this]() -> int64_t {
+            return runtimeAgent_ ? runtimeAgent_->controlledShutdown().nonceOnControl() : 0;
+        });
+    }
+
     /// Test-only, CONTROL thread only (call inside onControlThreadForTest):
     /// the durable __cluster_metadata ISR knowledge (round-4 LOW-B tests).
     [[nodiscard]] const rune::replication::InternalIsrKnowledge* internalIsrKnowledgeForTest() const noexcept {

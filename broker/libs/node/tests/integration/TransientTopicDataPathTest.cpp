@@ -1090,3 +1090,56 @@ TEST(TransientLineageClusterRegression, Rf1CrashedLeaderMemberRejoiningBeforeDet
     for (int64_t o = 0; o < 6; ++o) EXPECT_EQ(seen[o], 1) << "post-restart record " << o << " not delivered exactly once";
     std::printf("[R1] window hit: %s; stale commit answered %d\n", windowHit ? "yes" : "no", *stale);
 }
+
+// E2 final fix wave, residual round 5 — R2: the partition leader's process
+// identity ROTATES (a controller answered it kNodeSuperseded — a late frame of
+// an unseen older process).  The controller now knows the NEW identity while
+// the committed lineage carries the old one: the coordinator would answer
+// NotLeader for the rest of the process's life.  The node tells its user
+// replicas (owner rings) and the leader re-reports under the CURRENT identity;
+// the controller re-confirms (same leadership, same data: the lineage is KEPT)
+// and the group's committed offset is answered again — within a bound, never
+// a re-mint (-1).  RED (replicas never re-report): NotLeader forever.
+TEST(TransientLineageClusterRegression, IdentityRotationReconfirmsTheLineageWithinABoundRegression) {
+    GroupCluster g;
+    for (int i = 0; i < 3; ++i) g.start(i);
+    ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
+    ShardTestClient c(g.cdir.path);
+    c.setClientVersion(rune::protocol::client::kClientVersion);
+    const int leader = g.partitionLeader(c);
+    ASSERT_GE(leader, 0);
+    const int64_t sidL = c.connect(gatewayChannel(g.ports, leader), kClientStream);
+    for (int b = 0; b < 5; ++b)
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, leader), kClientStream, sidL, 0, 0, 1, makeBatch(4)));
+    ASSERT_TRUE(commitOffset(g, c, "lg-rotate", 20));
+    ASSERT_EQ(settledFetch(g, c, "lg-rotate", nullptr), 20);
+
+    const int64_t before = g.nodes[leader]->supersedeProcessIdentityForTest();
+    ASSERT_NE(before, 0);
+    bool rotated = false;
+    for (int k = 0; k < 200 && !rotated; ++k) {
+        rotated = g.nodes[leader]->processIdentityForTest() != before;
+        if (!rotated) std::this_thread::sleep_for(25ms);   // the control thread rotates (poll interval)
+    }
+    ASSERT_TRUE(rotated) << "precondition: the leader's identity rotated";
+
+    // Bounded: well within the client's OffsetFetch retry budget.
+    const auto t0 = std::chrono::steady_clock::now();
+    int64_t off = -99;
+    int pending = 0;
+    for (int k = 0; k < 200; ++k) {
+        const int coord = g.coordinator();
+        if (coord < 0) continue;
+        const int64_t sid = c.connect(gatewayChannel(g.ports, coord), kClientStream);
+        const auto r = sid > 0 ? c.offsetFetch(gatewayChannel(g.ports, coord), kClientStream, sid, "lg-rotate", 0, 0)
+                               : std::nullopt;
+        if (r && r->second == kOffsetOk) { off = r->first; break; }
+        if (r && r->second == kOffsetNotLeader) ++pending;
+        std::this_thread::sleep_for(50ms);   // the client's retry pacing (poll interval)
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    EXPECT_EQ(off, 20) << "after the identity rotation the lineage was never re-confirmed (" << pending
+                       << " NotLeader answers) — or it was re-minted (-1: a false 'none')";
+    EXPECT_LT(ms, 10'000) << "re-confirmation took " << ms << " ms";
+    std::printf("[R2] re-confirmed after %lld ms, %d NotLeader answer(s)\n", static_cast<long long>(ms), pending);
+}

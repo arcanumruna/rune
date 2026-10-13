@@ -2416,7 +2416,10 @@ private:
             break;
         // MEDIUM-2: the controller's AlterIsr answer (cold).
         case WorkerOp::Type::AlterIsrResponse:
-            if (auto* rep = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica())) {
+            if (auto* rep = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+                rep != nullptr && op.replErrorCode() == rune::replication::kAlterIsrLocalLineageIdentity) {
+                rep->rotateLineageIdentity(op.nextOffset());   // R2: node-local identity rotation
+            } else if (rep != nullptr) {
                 rune::replication::AlterIsrResponseMsg r{};
                 r.topicId        = op.topicId();
                 r.partition      = op.partition();

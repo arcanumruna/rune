@@ -3229,6 +3229,14 @@ int32_t PartitionReplica::bumpFlags_() const noexcept
            (logDirOffline_ ? AlterIsrMsg::kBumpLogDirFailed : 0);
 }
 
+void PartitionReplica::rotateLineageIdentity(int64_t id) noexcept
+{
+    if (id == 0 || id == lineageIdentity_) return;
+    lineageIdentity_ = id;
+    if (memoryBacked_ && isrChannel_ != nullptr && cfg_.topicId >= 0 && role_ == Role::Leader)
+        lineageReport_ = LineageReport{true, epoch_, lineageSrcEpoch_, false, 0};   // re-confirm under `id`
+}
+
 int PartitionReplica::sendLineageReport_(int64_t nowNs)
 {
     if (isrChannel_ == nullptr || role_ != Role::Leader || epoch_ != lineageReport_.epoch) {
