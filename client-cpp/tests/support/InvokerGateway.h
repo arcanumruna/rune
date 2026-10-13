@@ -124,6 +124,13 @@ struct InvokerGateway {
         int64_t corrId     = 0;
     };
     std::vector<Subscribed> subscribed;
+    // E2 round 6 (F1): a TRANSIENT partition's current data lineage (partition ->
+    // token).  A Subscribe carrying a lineage CLAIM (partitionKnown, 8-byte key)
+    // for a partition listed here with another token is answered
+    // ErrorResponse{PartitionDataReset} (43), as the broker does.
+    std::map<int32_t, uint64_t> partitionLineage;
+    std::vector<uint64_t>       lineageClaims;   // every claim received (0 = none)
+    int                         dataResetAnswers = 0;
     std::vector<int64_t>    unsubscribed;  // subscriptionIds
     std::vector<int>        unsubscribedAt;  // the endpoint each Unsubscribe arrived on
     // Partition leadership for Subscribe (the broker's per-partition routing
@@ -655,6 +662,18 @@ struct InvokerGateway {
         send(from, out.data(), n);
     }
 
+    /// E2 round 6: the broker's transient LINEAGE NOTE for `sub` (an 8-byte batch).
+    void sendLineageNote(const Subscribed& sub, uint64_t token) {
+        namespace rcc = rune::client::codec;
+        uint8_t t[8];
+        for (int i = 0; i < 8; ++i) t[i] = static_cast<uint8_t>(token >> (8 * i));
+        std::vector<uint8_t> out(256);
+        const std::size_t n = rcc::encodeRecords(out.data(), out.size(), sub.subscriptionId, sub.topicId,
+                                                 sub.partition, -1, std::span<const uint8_t>(t, 8), sub.sessionId,
+                                                 stampSubscribeCorr ? sub.corrId : 0);
+        send(replyFromArrival ? sub.endpoint : 0, out.data(), n);
+    }
+
     void releaseHeld() {
         std::vector<Produced> h;
         h.swap(held);
@@ -1043,6 +1062,22 @@ private:
                     sv->correlationId);
                 send(replyFromArrival ? endpoint : 0, out.data(), n);
                 return;
+            }
+            {
+                uint64_t claim = 0;
+                if (sv->partitionKnown == 1 && sv->key.size() == 8)
+                    for (int i = 0; i < 8; ++i) claim |= static_cast<uint64_t>(sv->key[static_cast<std::size_t>(i)]) << (8 * i);
+                lineageClaims.push_back(claim);
+                if (const auto pl = partitionLineage.find(sv->partition);
+                    claim != 0 && pl != partitionLineage.end() && pl->second != claim) {
+                    ++dataResetAnswers;
+                    std::vector<uint8_t> out(256);
+                    const std::size_t n = rcc::encodeErrorResponse(
+                        out.data(), out.size(), static_cast<int16_t>(rp::ErrorCode::PartitionDataReset), "",
+                        sv->sessionId, sv->correlationId);
+                    send(replyFromArrival ? endpoint : 0, out.data(), n);
+                    return;
+                }
             }
             int64_t subId = nextSubscriptionId++;
             if (perEndpointSubIds) {

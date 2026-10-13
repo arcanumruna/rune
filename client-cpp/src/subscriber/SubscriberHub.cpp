@@ -49,7 +49,8 @@ void SubscriberHub::clearDirty_(SubscriptionImpl& impl) noexcept
 
 void SubscriberHub::publishStatus_(SubscriptionImpl& impl)
 {
-    if (impl.status.tryPublish(SubscriptionStatus{impl.subscriptionId, impl.nextOffset})) {
+    if (impl.status.tryPublish(
+            SubscriptionStatus{impl.subscriptionId, impl.nextOffset, SubscriptionFailReason::None, 0, impl.dataResets})) {
         clearDirty_(impl);
     } else if (!impl.status.closed()) {
         markDirty_(impl);
@@ -61,7 +62,8 @@ int SubscriberHub::republishDirty()
     int published = 0;
     for (SubscriptionImpl* p = dirtyHead_; p != nullptr; ) {
         SubscriptionImpl* next = p->nextDirty;
-        if (p->status.tryPublish(SubscriptionStatus{p->subscriptionId, p->nextOffset})) {
+        if (p->status.tryPublish(
+                SubscriptionStatus{p->subscriptionId, p->nextOffset, SubscriptionFailReason::None, 0, p->dataResets})) {
             clearDirty_(*p);
             ++published;
         } else if (p->status.closed()) {
@@ -79,7 +81,8 @@ void SubscriberHub::closeStatus_(SubscriptionImpl& impl)
     // Final snapshot (uses the ring's reserve — always fits), THEN close: an
     // app thread that observes finished() and drains afterwards sees it.
     (void)impl.status.publishFinal(
-        SubscriptionStatus{impl.subscriptionId, impl.nextOffset, impl.failReason, impl.brokerErrorCode});
+        SubscriptionStatus{impl.subscriptionId, impl.nextOffset, impl.failReason, impl.brokerErrorCode,
+                           impl.dataResets});
     impl.status.close();
 }
 
@@ -434,7 +437,8 @@ void SubscriberHub::onSubscribeResponse(
     }
 
     // Bind: lifecycle snapshot (uses the reserve — always fits).
-    (void)impl->status.publishFinal(SubscriptionStatus{impl->subscriptionId, impl->nextOffset, impl->failReason});
+    (void)impl->status.publishFinal(
+        SubscriptionStatus{impl->subscriptionId, impl->nextOffset, impl->failReason, 0, impl->dataResets});
     activeById_.emplace(rsp.subscriptionId, impl);
 }
 
@@ -466,7 +470,8 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
         pendingByCorrelation_.erase(p);
         pi->subscriptionId = rv.subscriptionId;
         pi->boundPartition = rv.partition;
-        (void)pi->status.publishFinal(SubscriptionStatus{pi->subscriptionId, pi->nextOffset, pi->failReason});
+        (void)pi->status.publishFinal(
+            SubscriptionStatus{pi->subscriptionId, pi->nextOffset, pi->failReason, 0, pi->dataResets});
         it = activeById_.emplace(rv.subscriptionId, pi).first;
     }
     SubscriptionImpl& impl = *it->second;
@@ -481,6 +486,14 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
     // The spans are views into the Aeron fragment buffer, which is valid for
     // the duration of this call (i.e. during the RecordHandler callback).
     const auto& rb = rv.recordBatch;
+    if (rb.size() == 8) {
+        // E2 round 6: the TRANSIENT LINEAGE NOTE (client version 7) — the data
+        // lineage this subscription's records belong to (claimed on a resume).
+        uint64_t l = 0;
+        for (int i = 0; i < 8; ++i) l |= static_cast<uint64_t>(rb[static_cast<std::size_t>(i)]) << (8 * i);
+        impl.lineage = l;
+        return;
+    }
     if (rb.empty()) {
         // A POSITION NOTE (client version 6): the broker's cursor for this
         // subscription, sent right before it answers NotLeader (moved).  Kept
@@ -694,9 +707,10 @@ bool SubscriberHub::rearmMovedAway(int64_t correlationId, int64_t newCorrId, int
                            : impl.resumeHint >= 0 ? impl.resumeHint
                                                   : impl.fromWire;
         uint8_t frameBuf[256]{};
+        uint8_t claim[8];
         const std::size_t frameLen = codec::encodeSubscribe(frameBuf, sizeof(frameBuf), impl.topicId, part,
                                                             /*partitionKnown=*/1, from, impl.isolation,
-                                                            std::span<const uint8_t>{}, sessionId, newCorrId);
+                                                            lineageClaim_(impl, claim), sessionId, newCorrId);
         if (frameLen == 0) return false;
         auto req = std::make_unique<SubscribeRequest>();   // cold: once per leadership move
         req->impl     = &impl;
@@ -756,6 +770,47 @@ bool SubscriberHub::movedPendingPartition(int64_t correlationId, int32_t& topicI
     topicId   = impl.topicId;
     partition = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
     return true;
+}
+
+/*static*/ std::span<const uint8_t> SubscriberHub::lineageClaim_(const SubscriptionImpl& impl, uint8_t (&buf)[8]) noexcept
+{
+    // A claim only for a resume FROM A POSITION (something delivered, or the
+    // broker's cursor note) of a subscription the broker noted a lineage for.
+    if (impl.lineage == 0 || (impl.nextOffset <= 0 && impl.resumeHint < 0)) return {};
+    for (int i = 0; i < 8; ++i) buf[i] = static_cast<uint8_t>(impl.lineage >> (8 * i));
+    return std::span<const uint8_t>(buf, 8);
+}
+
+bool SubscriberHub::restartFromLogStart(int64_t correlationId, int64_t seedSid,
+                                        std::chrono::steady_clock::time_point deadline)
+{
+    const auto it = pendingByCorrelation_.find(correlationId);
+    if (it == pendingByCorrelation_.end() || !it->second || it->second->impl == nullptr) return false;
+    SubscriptionImpl& impl = *it->second->impl;
+    if (!impl.active) return false;
+    const int32_t part = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
+    uint8_t frameBuf[256]{};
+    constexpr int64_t kFromEarliest = -2;   // From::earliest() on the wire: the log start
+    const std::size_t frameLen = codec::encodeSubscribe(frameBuf, sizeof(frameBuf), impl.topicId, part,
+                                                        /*partitionKnown=*/1, kFromEarliest, impl.isolation,
+                                                        std::span<const uint8_t>{}, seedSid, correlationId);
+    if (frameLen == 0) return false;
+    try {
+        it->second->subscribeFrame.assign(frameBuf, frameBuf + frameLen);
+    } catch (...) {
+        return false;   // allocation failure (cold): the subscribe deadline fails it explicitly
+    }
+    // The data it had a position in is gone: restart at the log start, no
+    // floor, no claim — and tell the application (never silent).
+    ++impl.dataResets;
+    ++partitionDataResets_;
+    impl.lineage     = 0;
+    impl.nextOffset  = 0;
+    impl.resumeFloor = -1;
+    impl.resumeHint  = -1;
+    impl.fromWire    = kFromEarliest;
+    publishStatus_(impl);
+    return resendOne(correlationId, seedSid, SendFn{}, deadline);
 }
 
 bool SubscriberHub::answeredOnItsSession(int64_t correlationId, int64_t answerSid, int64_t seedSid) const
@@ -920,9 +975,10 @@ int SubscriberHub::driveHomed(int64_t seedSid, std::chrono::steady_clock::time_p
                               : impl.resumeHint >= 0 ? impl.resumeHint
                                                      : impl.fromWire;
         uint8_t frameBuf[256]{};
+        uint8_t claim[8];
         const std::size_t frameLen = codec::encodeSubscribe(frameBuf, sizeof(frameBuf), impl.topicId, part,
                                                             /*partitionKnown=*/1, from, impl.isolation,
-                                                            std::span<const uint8_t>{}, seedSid, newCorr);
+                                                            lineageClaim_(impl, claim), seedSid, newCorr);
         if (frameLen == 0) { ++homed; continue; }
         std::unique_ptr<SubscribeRequest> req;
         try {

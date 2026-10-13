@@ -2655,3 +2655,54 @@ TEST(GroupRoutingRegression, RedirectFromAnEarlierSessionNeverBindsASubscription
     EXPECT_EQ(led.dupes(), 0);
     s.unsubscribe();
 }
+
+// E2 final fix wave, residual round 6 — F1 (plain subscriptions): a bound
+// plain subscription on a TRANSIENT partition lives on its leader node's own
+// session (homed).  The node crashes and comes back with an EMPTY ring (a new
+// data lineage); the client re-arms the subscription from its position (20)
+// after the lost session.  It must never carry that position across the
+// lineage change: the resume CLAIMS the lineage the broker noted at bind, the
+// broker answers PartitionDataReset, and the subscription restarts at the log
+// start with no resume floor — the application is told (dataResets() == 1) and
+// receives every post-restart record exactly once.  RED (no claim): the resume
+// bound at 20 and the floor dropped the refilled records 0..5 (silent loss).
+TEST(GroupRoutingRegression, PlainSubscriptionNeverCarriesAPositionAcrossALineageChangeRegression) {
+    GroupRig r(4249, 4250);
+    const auto [n1, p1port] = r.addNode(4249);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4249, ""}, {1, 2, 1, 1, 4249, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {2, n1}};
+    r.gw.groupProtocol   = false;
+    r.connect();
+    PlainLedger led;
+    auto s2 = r.client.subscribe(r.client.topic("t"), 2, rc::SubscribeOptions{rc::From::earliest()}, led.handler(2));
+    ASSERT_TRUE(r.drive([&] { return r.subAt(2, n1) != nullptr && s2.subscriptionId() == r.subAt(2, n1)->subscriptionId; }))
+        << "precondition: bound on node 1's own session";
+    const auto b1 = *r.subAt(2, n1);
+    r.gw.sendLineageNote(b1, 0x1111);   // the data lineage at bind
+    r.gw.pushRecords(b1, 0, 20);
+    ASSERT_TRUE(r.drive([&] { return led.count(2) == 20; }));
+
+    // Node 1 restarts with an empty ring: a new lineage; its session is lost.
+    r.gw.partitionLineage[2] = 0x2222;
+    r.gw.expireSession(b1.sessionId);
+    ASSERT_TRUE(r.drive([&] {
+        const auto* s = r.subAt(2, n1);
+        return r.gw.dataResetAnswers >= 1 && s != nullptr && s->fromOffset == -2 &&
+               s2.subscriptionId() == s->subscriptionId;
+    }, 20'000'000)) << "the resume never claimed its lineage / never restarted at the log start (claims: "
+                    << r.gw.lineageClaims.size() << ", resets " << r.gw.dataResetAnswers << ")";
+    EXPECT_NE(std::find(r.gw.lineageClaims.begin(), r.gw.lineageClaims.end(), uint64_t{0x1111}),
+              r.gw.lineageClaims.end()) << "the resume did not claim the noted lineage";
+    EXPECT_EQ(s2.dataResets(), 1u) << "the reset was not surfaced to the application";
+    EXPECT_TRUE(s2.active());
+
+    // Every post-restart record exactly once, from the log start (no floor).
+    led.seen[2].clear();
+    const auto b2 = *r.subAt(2, n1);
+    r.gw.pushRecords(b2, 0, 6);
+    ASSERT_TRUE(r.drive([&] { return led.count(2) == 6; }))
+        << "SILENT LOSS: " << led.count(2) << "/6 post-restart records delivered (a resume floor dropped them)";
+    EXPECT_EQ(led.dupes(), 0);
+    s2.unsubscribe();
+}

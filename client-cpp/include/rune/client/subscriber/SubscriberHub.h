@@ -233,6 +233,13 @@ public:
     /// when homed — none while held — else the seed session `seedSid`).  Not
     /// pending / an answer without a session id (0): true (not this check's).
     [[nodiscard]] bool answeredOnItsSession(int64_t correlationId, int64_t answerSid, int64_t seedSid) const;
+    /// E2 round 6 (F1): the broker answered the RESUMED Subscribe
+    /// `correlationId` PartitionDataReset — its transient partition's data
+    /// did not survive.  The subscription restarts at the log start (no resume
+    /// floor, no claim), its dataResets() is bumped, and the request is re-sent
+    /// on its route.  False when it is not a pending Subscribe.
+    bool restartFromLogStart(int64_t correlationId, int64_t seedSid, std::chrono::steady_clock::time_point deadline);
+    [[nodiscard]] uint64_t partitionDataResets() const noexcept { return partitionDataResets_; }
     /// R3: `correlationId` is a pending, never-bound, never-moved Subscribe.
     [[nodiscard]] bool isNewPendingSubscribe(int64_t correlationId) const;
     /// Route the pending moved Subscribe `correlationId` to its partition's
@@ -454,6 +461,9 @@ private:
     std::vector<int64_t> homedScratch_;   // driveHomed: lost bound ones (cold; capacity reused)
     [[nodiscard]] bool routed_() const noexcept { return router_.offer != nullptr; }
     /// The broker session id `impl` lives on: its node session's (homed) or `seedSid`.
+    /// The lineage claim a resume of `impl` carries in Subscribe.key (empty: none).
+    static std::span<const uint8_t> lineageClaim_(const SubscriptionImpl& impl, uint8_t (&buf)[8]) noexcept;
+    uint64_t partitionDataResets_ = 0;
     [[nodiscard]] static int64_t homeSidOf_(const SubscriptionImpl& impl, int64_t seedSid) noexcept {
         return impl.homeSession != 0 ? impl.homeSid : seedSid;
     }

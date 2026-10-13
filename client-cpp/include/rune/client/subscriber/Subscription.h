@@ -137,6 +137,7 @@ struct SubscriptionStatus {
     int64_t nextOffset     = 0;  // resume position (lastDelivered + 1; 0 = nothing delivered)
     SubscriptionFailReason failReason = SubscriptionFailReason::None;  // final snapshot only
     uint16_t brokerErrorCode = 0;  // RejectedByBroker: the SubscribeResponse errorCode (final snapshot only)
+    uint32_t dataResets      = 0;  // E2 round 6: times the partition's data was reset under it (see dataResets())
 };
 
 // ---------------------------------------------------------------------------
@@ -205,6 +206,12 @@ struct SubscriptionImpl {
     int64_t  homeSid       = 0;
     uint64_t homeEpoch     = 0;
     bool     moved         = false;
+    // E2 residual round 6 (F1): the TRANSIENT partition's data lineage the
+    // position belongs to (the broker's lineage note; 0 = unknown / not
+    // transient) — claimed on a resume; and how many times the broker answered
+    // a resume PartitionDataReset (the subscription restarted at the log start).
+    uint64_t lineage       = 0;
+    uint32_t dataResets    = 0;
     bool    active         = true;  // false once unsubscribed / timed out / closed
     bool    statusDirty    = false; // a snapshot newer than the last published one exists
     // F8a fix2: an Unsubscribe the transport refused, retried by the duty cycle.
@@ -339,6 +346,14 @@ public:
     /// The broker's error code when failReason() == RejectedByBroker (an
     /// rune::protocol::client::ErrorCode value), else 0.
     [[nodiscard]] uint16_t brokerErrorCode() const;
+
+    /// How many times this subscription's TRANSIENT partition lost its data
+    /// under it (its node restarted with an empty ring — a new data lineage):
+    /// each time the subscription restarted at the partition's log start, so
+    /// record offsets start over and records it had not consumed before the
+    /// reset are gone.  0 for a disk partition.  Never silent: this counter is
+    /// the application's signal.
+    [[nodiscard]] uint32_t dataResets() const;
 
 private:
     [[nodiscard]] bool onDutyThread_() const noexcept {

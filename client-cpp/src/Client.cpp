@@ -2226,6 +2226,22 @@ void Client::onEgressFrame(codec::TemplateId tid,
                 ++staleSubscribeRedirects_;
                 break;
             }
+        }
+        // E2 residual round 6 (F1): a resumed Subscribe's claimed data lineage
+        // did not survive (the transient partition's ring restarted): restart
+        // it at the log start and surface the reset (Subscription::dataResets).
+        if (ec == rpc::ErrorCode::PartitionDataReset && opt->correlationId != 0) [[unlikely]] {
+            const auto snap = agent_.stateAndSessionId();
+            if (subscriberHub_.answeredOnItsSession(opt->correlationId, opt->sessionId, snap.sessionId) &&
+                subscriberHub_.restartFromLogStart(
+                    opt->correlationId, snap.sessionId,
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg_.subscribeTimeoutMs))) {
+                break;
+            }
+        }
+        if ((ec == rpc::ErrorCode::NotLeader || ec == rpc::ErrorCode::Redirect) && opt->correlationId != 0)
+            [[unlikely]] {
+            const auto snap = agent_.stateAndSessionId();
             if (subscriberHub_.rearmMovedAway(
                     opt->correlationId, nextCorrId_, nextCorrId_ + 1, opt->sessionId, snap.sessionId,
                     std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg_.subscribeTimeoutMs))) {

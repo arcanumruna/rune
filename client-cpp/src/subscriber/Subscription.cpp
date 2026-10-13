@@ -161,6 +161,12 @@ SubscriptionFailReason Subscription::failReason() const {
     return cache_.failReason;
 }
 
+uint32_t Subscription::dataResets() const {
+    if (impl_ && onDutyThread_()) return impl_->dataResets;
+    drainStatus_();
+    return cache_.dataResets;
+}
+
 uint16_t Subscription::brokerErrorCode() const {
     if (impl_ && onDutyThread_()) return impl_->brokerErrorCode;
     drainStatus_();
