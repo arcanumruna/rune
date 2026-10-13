@@ -826,3 +826,40 @@ TEST(TransientGatewayRegression, MovedSubscriptionWithNoKnownOtherLeaderStaysNot
         EXPECT_TRUE(r.errorMessages[211].empty()) << "leader " << leader;
     }
 }
+
+// Fix round 1 (review I2): the Redirect carve-outs.  A group member's partition
+// subscriptions ride per-leader sessions and are re-routed by the client's group
+// code on a NotLeader — they keep the bare NotLeader even for a v6 session with
+// a known new leader:
+//   (a) a member's partition Subscribe (bit-61 tagged correlation id) is
+//       answered NotLeader, while a plain one in the same sweep is redirected;
+//   (b) a coordinator-created group subscription (isGroup, addGroupSubscription;
+//       on its own session — a plain Subscribe on the same session/partition
+//       would be taken as its carrier) is never answered Redirect.
+TEST(TransientGatewayRegression, MovedGroupSubscriptionsKeepNotLeaderEvenWithAKnownNewLeaderRegression) {
+    Rig r;
+    r.gw.setNodeIdForTest(1);
+    r.gw.setNodeEndpointMap({{1, "aeron:udp?endpoint=rune-2:40200"}, {2, "aeron:udp?endpoint=rune-3:40200"}});
+    const int64_t v6 = r.gw.injectTestSession(0);
+    const int64_t v6g = r.gw.injectTestSession(0);
+    constexpr int64_t kFetchCorr = (int64_t{1} << 61) | 9;   // rune-client GroupConsumerHub::kFetchCorrTag
+    r.subscribe(v6, 0, kFetchCorr, /*read_committed=*/1);
+    ASSERT_TRUE(r.subscribed.count(kFetchCorr));
+    r.subscribe(v6, -2, 221, /*read_committed=*/1);   // a plain one: the control (Redirect)
+    ASSERT_TRUE(r.subscribed.count(221));
+    const int64_t groupSub = r.gw.addGroupSubscription(v6g, 0, 0, 0, /*isolation=*/1, /*pendingCarrier=*/false);
+    ASSERT_GE(groupSub, 0);
+
+    r.gw.setRoutingImageSnapshot(rune::metadata::RoutingImage::build({{rune::metadata::gpidOf(0, 0), 2, 2}}));
+    const auto h = r.reg.lookupHandle(0, 0);
+    r.reg.setIntendedRole(0, 0, h.incarnation, rune::node::ReplicaRegistry::IntendedRole::Follower);
+    for (int i = 0; i < 4; ++i) { r.gw.pushSubscriptionsForTest(); r.pass(); }
+
+    ASSERT_TRUE(r.errors.count(221));
+    EXPECT_EQ(r.errors[221], static_cast<int16_t>(pc::ErrorCode::Redirect)) << "control: the plain one is redirected";
+    ASSERT_TRUE(r.errors.count(kFetchCorr)) << "SILENT STALL: the member's partition subscription was never answered";
+    EXPECT_EQ(r.errors[kFetchCorr], kNotLeader) << "a group member's partition subscription must keep NotLeader";
+    EXPECT_TRUE(r.errorMessages[kFetchCorr].empty());
+    for (const auto& [corr, code] : r.errors)
+        if (corr != 221) EXPECT_NE(code, static_cast<int16_t>(pc::ErrorCode::Redirect)) << "corr " << corr << " redirected";
+}
