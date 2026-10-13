@@ -24,6 +24,10 @@
 #        "user_totals" (persistence=0; GROUP BY userId: Count(*), Sum, Avg);
 #        produce o1(u100,10) o2(u100,30) o3(u200,5), update o1->50, move
 #        o3->(u100,5) -> u100 = {3, 85, 85/3}, u200 AbsentKey (emptied group).
+#     6. Phase 2b C: typed_route (8 partitions) routed by key.
+#     7. Phase 2b E/E2: transient topic presence_t defined at runtime; produce
+#        acks None/Leader/All; subscribe earliest/offset/latest; read_committed
+#        over a committed + an aborted transaction.
 #     Prints VIEW_* KEY=VALUE handoff lines + "VIEW-PROBE-SETUP: OK".
 #
 #   RESTART: `docker compose restart rune-1` (same named volume — the
@@ -45,6 +49,8 @@
 #         u200 AbsentKey; then o3 5->25 (a PRE-restart contributor) ->
 #         u100 = {3, 105, 35} — proves the contributor map survived (a lost
 #         map would give n 4, total 110).
+#     (e) presence_t exists after the restart (TopicExists, same id) and is
+#         empty (first produce at offset 0; subscribe + read_committed see 1).
 #     Prints "VIEW-ENGINE-E2E: OK" on success.
 #
 #   DDL conformance legs: setup also asserts ALTER on a view answers 38
@@ -301,17 +307,19 @@ VIEW_HP_INITIAL="$(extract VIEW_HP_INITIAL)"
 VIEW_ORDER_TOPIC_ID="$(extract VIEW_ORDER_TOPIC_ID)"
 VIEW_TOPIC_ID_AGG="$(extract VIEW_TOPIC_ID_AGG)"
 VIEW_FP_AGG="$(extract VIEW_FP_AGG)"
+VIEW_TT_TOPIC_ID="$(extract VIEW_TT_TOPIC_ID)"
 
 for v in VIEW_SRC_TOPIC_ID VIEW_TOPIC_ID_PERSISTED VIEW_FP_PERSISTED \
          VIEW_TOPIC_ID_TRANSIENT VIEW_FP_TRANSIENT VIEW_KEY_ID VIEW_HP_INITIAL \
-         VIEW_ORDER_TOPIC_ID VIEW_TOPIC_ID_AGG VIEW_FP_AGG; do
+         VIEW_ORDER_TOPIC_ID VIEW_TOPIC_ID_AGG VIEW_FP_AGG VIEW_TT_TOPIC_ID; do
     [ -n "${!v:-}" ] || fail "setup output did not carry ${v}= (handoff parse failed)"
 done
 log "Setup OK: srcTopicId=${VIEW_SRC_TOPIC_ID}" \
     "viewPersisted={id=${VIEW_TOPIC_ID_PERSISTED},fp=${VIEW_FP_PERSISTED}}" \
     "viewTransient={id=${VIEW_TOPIC_ID_TRANSIENT},fp=${VIEW_FP_TRANSIENT}}" \
     "key=${VIEW_KEY_ID} hp0=${VIEW_HP_INITIAL}" \
-    "orderTopicId=${VIEW_ORDER_TOPIC_ID} viewAgg={id=${VIEW_TOPIC_ID_AGG},fp=${VIEW_FP_AGG}}"
+    "orderTopicId=${VIEW_ORDER_TOPIC_ID} viewAgg={id=${VIEW_TOPIC_ID_AGG},fp=${VIEW_FP_AGG}}" \
+    "transientTopicId=${VIEW_TT_TOPIC_ID}"
 
 # Phase 2b Part C: typed_route (8 partitions) — typed records routed by key.
 echo "${setup_out}" | grep -q "^TYPED-ROUTING: OK" \
@@ -396,7 +404,7 @@ check_race_leg view 32
 check_race_leg mixed 25
 docker rm -f "${RACE_A}" "${RACE_B}" >/dev/null 2>&1 || true
 
-CATALOG_NAMES="character,char_persisted,char_transient,order,user_totals,typed_route,race_topic,race_view,race_mixed"
+CATALOG_NAMES="character,char_persisted,char_transient,order,user_totals,typed_route,race_topic,race_view,race_mixed,presence_t"
 dump_catalog() {
     local out
     out="$(run_client catalog_dump -e RUNE_CATALOG_NAMES="${CATALOG_NAMES}" 2>/dev/null)" || return 1
@@ -453,6 +461,7 @@ restart_out=$(run_client verify_restart \
     -e RUNE_VIEW_ORDER_TOPIC_ID="${VIEW_ORDER_TOPIC_ID}" \
     -e RUNE_VIEW_TOPIC_ID_AGG="${VIEW_TOPIC_ID_AGG}" \
     -e RUNE_VIEW_FP_AGG="${VIEW_FP_AGG}" \
+    -e RUNE_VIEW_TT_TOPIC_ID="${VIEW_TT_TOPIC_ID}" \
     2>&1)
 restart_rc=$?
 set -e
@@ -515,5 +524,6 @@ log "     + post-restart update retracts OK"
 log "  -> typed_route: 8-partition typed topic routed by key (Phase 2b C)"
 log "  -> DDL conformance: alter on a view = 38; two racing clients, exactly one"
 log "     winner per leg (topic 25, view 32, mixed 25); catalog identical across restart"
+log "  -> transient topic presence_t: produce (None/Leader/All) + subscribe (earliest/offset/latest) + read_committed (commit+abort); restart -> exists (TopicExists, same id) and empty (first offset 0)"
 log "  VIEW-ENGINE-E2E: OK, exit 0."
 log "========================================"
