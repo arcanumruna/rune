@@ -614,6 +614,8 @@ TEST_P(DemotedLeaderReadCommittedRegression, SubscriptionMovesToTheNewLeaderRegr
     const int64_t oldSub = c.records().back().subscriptionId;
     const int64_t position = 6;   // the next offset the client wants (records 0..5 delivered)
 
+    const std::size_t beforeMove = c.records().size();   // everything pushed from here on is post-demotion
+
     // 2. The leader is DEMOTED and stays alive.
     ASSERT_TRUE(c.whilePumping([&] { return nodes[leader]->controlledShutdown(20'000ms); }))
         << "the controlled shutdown never handed the partition off";
@@ -656,8 +658,15 @@ TEST_P(DemotedLeaderReadCommittedRegression, SubscriptionMovesToTheNewLeaderRegr
     EXPECT_EQ(first, position) << "the moved subscription did not resume at its position";
     ASSERT_TRUE(c.pollUntil([&] { return pushedOn(c, newSub, 8) >= 1; }))
         << "SILENT STALL: committed data stopped flowing after the move";
-    for (int64_t b : {0, 2, 4}) EXPECT_EQ(pushedOn(c, newSub, b), 0u) << "re-delivered below the position: " << b;
-    for (int64_t b : {6, 8}) EXPECT_EQ(pushedOn(c, oldSub, b), 0u) << "the demoted node kept pushing " << b;
+    // Nothing pushed after the demotion — on the old subscription or the moved
+    // one — is below the position, and the demoted node pushed no data at all.
+    for (std::size_t i = beforeMove; i < c.records().size(); ++i) {
+        const auto& rec = c.records()[i];
+        if (rec.bytes.empty()) continue;   // a position note (client version >= 6 only)
+        EXPECT_GE(rec.baseOffset, position) << "re-delivered below the position (subscription " << rec.subscriptionId
+                                            << ", base " << rec.baseOffset << ")";
+        EXPECT_NE(rec.subscriptionId, oldSub) << "the demoted node kept pushing (base " << rec.baseOffset << ")";
+    }
     c.whilePumping([&] { nodes[leader]->stop(); });
     for (auto& n : nodes) n->stop();
 }

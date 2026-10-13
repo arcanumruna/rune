@@ -961,7 +961,7 @@ public:
     /// stopped serving them (read_committed after a demotion; any isolation
     /// after the replica was removed) — retireReadCommittedMovedAway_.
     [[nodiscard]] uint64_t readCommittedSubscriptionsMovedAway() const noexcept { return readCommittedMovedAway_; }
-    static constexpr int64_t kMovedAwaySweepCyclesForTest = 256;   // == kMovedAwaySweepCycles
+    static constexpr int64_t kMovedAwayScanEveryCyclesForTest = 16;   // == kMovedAwayScanEveryCycles
 
     // -----------------------------------------------------------------------
     // applyProduceForTest — feed a raw Produce frame through the real
@@ -2089,10 +2089,24 @@ private:
     /// runs on every routed role change / replica removal (ReplicationMetadata
     /// Bridge::recordIntendedRole_, ReplicaRegistry::remove) and, as the
     /// fallback for a demotion no control-plane route reports (a leader fenced
-    /// by a higher epoch in onFetchRequest), every kMovedAwaySweepCycles push
-    /// passes — never a per-pass lookup per subscription.
+    /// by a higher epoch in onFetchRequest), a bounded slice every
+    /// kMovedAwayScanEveryCycles push passes (scanMovedAwaySlice_) — never a
+    /// per-pass lookup per subscription, never an O(subs) spike.
     uint64_t seenRcSweepRoleChanges_ = 0;
-    static constexpr int64_t kMovedAwaySweepCycles = kMovedAwaySweepCyclesForTest;   ///< power of two
+    static constexpr int64_t     kMovedAwayScanEveryCycles   = kMovedAwayScanEveryCyclesForTest;   ///< power of two
+    static constexpr int         kMovedAwayLookupsPerSlice   = 32;
+    static constexpr std::size_t kMovedAwayBucketsPerSlice   = 256;   ///< empty buckets cost no lookup, but bounded
+    static constexpr int64_t     kMovedAwaySummaryEveryCycles = 1 << 16;
+    std::size_t movedAwayBucket_           = 0;   ///< fallback scan cursor (bucket index)
+    uint64_t    movedAwaySinceSummary_     = 0;
+    int64_t     nextMovedAwaySummaryCycle_ = 0;
+    /// The fallback slice: at most ~kMovedAwayLookupsPerSlice movedAway_ verdicts
+    /// (whole buckets), resuming at movedAwayBucket_.
+    void scanMovedAwaySlice_();
+    void logMovedAwaySummary_();
+    [[nodiscard]] static bool movedAwayEligible_(const Subscription& sub) noexcept {
+        return !sub.isGroup && sub.topicId >= 0 && !sub.failed;
+    }
     /// Moved-away verdict for one plain subscription during a sweep: true when
     /// this node can no longer serve it — its replica was removed (any
     /// isolation) or, read_committed, it is no longer a published leader.

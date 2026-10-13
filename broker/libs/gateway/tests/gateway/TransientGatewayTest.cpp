@@ -67,6 +67,7 @@ struct RigOpts {
     std::size_t ringBytes    = 1u << 20;
     bool        withFollower = false;     // ISR {1,2}: follower 2 never fetches → the HW stays 0
     bool        asFollower   = false;     // this node's replica is a FOLLOWER (leader 2)
+    int32_t     partitions   = 1;         // topic 0's partition count (each a leader replica on its own ring)
 };
 
 // Gateway + topic 0 "presence" (1 partition, TRANSIENT) + its leader replica on
@@ -97,7 +98,7 @@ struct Rig {
               return 1;
           }, 1)) {
         rune::node::TopicSpec ts;
-        ts.name = "presence"; ts.partitionCount = 1; ts.topicId = 0;
+        ts.name = "presence"; ts.partitionCount = o.partitions; ts.topicId = 0;
         ts.persistence = rune::node::PersistenceMode::Transient;
         if (o.runtime) {
             registry = std::make_unique<TopicRegistry>(std::vector<rune::node::TopicSpec>{}, dir.path.string());
@@ -117,7 +118,20 @@ struct Rig {
         gw.setOnEgressFrame([this](int64_t, const uint8_t* b, std::size_t n) { onFrame(b, n, true); });
         if (pool) gw.setWorkerPool(pool.get());
     }
+    std::vector<std::unique_ptr<rune::storage::InMemoryLog>> extraMems;   // partitions 1.. (fix round 2)
+    std::vector<PartitionReplica*>                           extraReps;
     void addReplica() {
+        for (int32_t p = 1; p < o.partitions; ++p) {
+            extraMems.push_back(std::make_unique<rune::storage::InMemoryLog>(o.ringBytes, 10'000));
+            PartitionConfig c;
+            c.topicId = 0; c.partitionId = p; c.selfId = 1; c.minIsr = 1;
+            c.replicaLagMaxOffset = 1'000'000'000; c.replicaLagMaxMs = 600'000;
+            auto r = std::make_unique<PartitionReplica>(c, Role::Leader, 1, std::vector<int32_t>{1},
+                                                        std::vector<int32_t>{1}, extraMems.back().get(), &transport);
+            r->setExternalFollowerFlush(true);
+            extraReps.push_back(r.get());
+            reg.add(0, p, std::move(r));
+        }
         PartitionConfig c;
         c.topicId = 0; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
         c.replicaLagMaxOffset = 1'000'000'000; c.replicaLagMaxMs = 600'000;
@@ -176,9 +190,9 @@ struct Rig {
         const auto it = produced.find(c);
         return it == produced.end() ? std::nullopt : std::optional<pc::ProduceResponse>(it->second);
     }
-    void subscribe(int64_t sid, int64_t fromOffset, int64_t subCorr, uint8_t isolation = 0) {
+    void subscribe(int64_t sid, int64_t fromOffset, int64_t subCorr, uint8_t isolation = 0, int32_t partition = 0) {
         pc::Subscribe s;
-        s.sessionId = sid; s.correlationId = subCorr; s.topicId = 0; s.partition = 0;
+        s.sessionId = sid; s.correlationId = subCorr; s.topicId = 0; s.partition = partition;
         s.partitionKnown = 1; s.fromOffset = fromOffset; s.isolation = isolation;
         std::vector<uint8_t> buf(s.encodedSize());
         buf.resize(s.encode(buf.data()));
@@ -593,7 +607,7 @@ TEST(TransientGatewayRegression, ReadCommittedSubscriptionOnADemotedLeaderAnswer
 //       re-routes the partition from its position;
 //   (b) a demotion no control-plane route reports (a leader fenced by a higher
 //       epoch flips its own role; no intended-role record) is caught by the
-//       periodic fallback sweep within kMovedAwaySweepCycles passes;
+//       spread fallback scan (a bounded slice every kMovedAwayScanEveryCycles passes);
 //   (c) the partition's replica REMOVED from this node (it moved away) retires
 //       every plain subscription, read_uncommitted too.
 // ---------------------------------------------------------------------------
@@ -618,7 +632,7 @@ TEST(TransientGatewayRegression, UnroutedDemotionIsCaughtByTheFallbackSweepRegre
     r.subscribe(sid, -2, 71, /*read_committed=*/1);
     ASSERT_TRUE(r.subscribed.count(71));
     r.rep->becomeFollower(2, 2);   // fenced by a higher epoch: the owner flips, nothing is routed
-    for (int64_t i = 0; i < 2 * ClientGateway::kMovedAwaySweepCyclesForTest && !r.errors.count(71); ++i)
+    for (int64_t i = 0; i < 64 * ClientGateway::kMovedAwayScanEveryCyclesForTest && !r.errors.count(71); ++i)
         r.gw.pushSubscriptionsForTest();
     ASSERT_TRUE(r.errors.count(71))
         << "SILENT STALL: a demotion no route reported left the read_committed subscription silent";
@@ -639,4 +653,111 @@ TEST(TransientGatewayRegression, ReplicaRemovedFromThisNodeRetiresEveryPlainSubs
     EXPECT_EQ(r.errors[81], kNotLeader);
     EXPECT_EQ(r.errors[82], kNotLeader);
     EXPECT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), 2u);
+}
+
+// ---------------------------------------------------------------------------
+// Task 13 fix round 2.
+// ---------------------------------------------------------------------------
+// M1: the control plane records the routed role BEFORE the owning worker flips
+// the replica (ReplicationMetadataBridge::routeBecomeFollower_ →
+// recordIntendedRole_, then the role op).  The routed sweep must already treat
+// it as moved — intended == Follower — not wait for the published role (it
+// would otherwise only be caught by the fallback scan).
+TEST(TransientGatewayRegression, RoutedDemotionIsCaughtBeforeTheOwnerFlipsRegression) {
+    Rig r;
+    const int64_t sid = r.gw.injectTestSession(0);
+    r.subscribe(sid, -2, 91, /*read_committed=*/1);
+    ASSERT_TRUE(r.subscribed.count(91));
+    const auto h = r.reg.lookupHandle(0, 0);
+    r.reg.setIntendedRole(0, 0, h.incarnation, rune::node::ReplicaRegistry::IntendedRole::Follower);
+    ASSERT_EQ(r.rep->role(), Role::Leader) << "precondition: the owner has not flipped yet";
+    r.gw.pushSubscriptionsForTest();   // ONE pass: the routed trigger, no fallback slice
+    ASSERT_TRUE(r.errors.count(91)) << "a routed demotion waited for the owner's flip (fallback only)";
+    EXPECT_EQ(r.errors[91], kNotLeader);
+}
+
+// M5: the sweep never retires a subscription it can still serve.  Three
+// partitions, all led here; subscriptions of both isolations on each.  An
+// UNRELATED routed role change (partition 1 demoted) retires only partition
+// 1's read_committed subscription; a long run of fallback slices afterwards
+// retires nothing more.
+TEST(TransientGatewayRegression, SweepNeverRetiresASubscriptionOfAPartitionStillLedHereRegression) {
+    Rig r(RigOpts{.partitions = 3});
+    const int64_t sid = r.gw.injectTestSession(0);
+    int64_t corr = 100;
+    std::map<int64_t, std::pair<int32_t, uint8_t>> subs;   // corr -> (partition, isolation)
+    for (int32_t p = 0; p < 3; ++p)
+        for (uint8_t iso : {uint8_t{0}, uint8_t{1}})
+            for (int k = 0; k < 2; ++k) {
+                r.subscribe(sid, -2, ++corr, iso, p);
+                ASSERT_TRUE(r.subscribed.count(corr)) << "partition " << p;
+                subs[corr] = {p, iso};
+            }
+    PartitionReplica* p1 = r.extraReps[0];
+    const auto h = r.reg.lookupHandle(0, 1);
+    r.reg.setIntendedRole(0, 1, h.incarnation, rune::node::ReplicaRegistry::IntendedRole::Follower);
+    p1->becomeFollower(2, 2);
+    for (int64_t i = 0; i < 64 * ClientGateway::kMovedAwayScanEveryCyclesForTest; ++i) r.gw.pushSubscriptionsForTest();
+    for (const auto& [c, pi] : subs) {
+        const bool shouldRetire = pi.first == 1 && pi.second == 1;
+        EXPECT_EQ(r.errors.count(c), shouldRetire ? 1u : 0u)
+            << "corr " << c << " partition " << pi.first << " isolation " << int(pi.second);
+    }
+    EXPECT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), 2u);
+}
+
+// M3: before the NotLeader, a session >= 6 gets the POSITION NOTE — an
+// empty-batch Records frame of the subscription carrying the broker's cursor
+// (here the bind-time resolved Latest = the HW, 2) — so a subscription that
+// delivered nothing resumes there instead of re-resolving Latest.  A session
+// below 6 gets no note (it would ignore an empty batch anyway).
+TEST(TransientGatewayRegression, MovedSubscriptionGetsItsPositionNoteBeforeTheNotLeaderRegression) {
+    Rig r;
+    const int64_t v6 = r.gw.injectTestSession(0);
+    const int64_t v5 = r.gw.injectTestSession(0, /*clientVersion=*/5);
+    ASSERT_TRUE(r.awaitProduced(r.produce(v6, 2)).has_value());
+    r.subscribe(v6, /*Latest=*/-1, 95, /*read_committed=*/1);
+    r.subscribe(v5, /*Latest=*/-1, 96, /*read_committed=*/1);
+    ASSERT_TRUE(r.subscribed.count(95));
+    ASSERT_TRUE(r.subscribed.count(96));
+    const int64_t sub95 = r.subscribed[95].subscriptionId;
+    const int64_t sub96 = r.subscribed[96].subscriptionId;
+    const std::size_t before = r.records.size();
+    const auto h = r.reg.lookupHandle(0, 0);
+    r.reg.setIntendedRole(0, 0, h.incarnation, rune::node::ReplicaRegistry::IntendedRole::Follower);
+    r.gw.pushSubscriptionsForTest();
+    ASSERT_TRUE(r.errors.count(95));
+    ASSERT_TRUE(r.errors.count(96));
+    int notes95 = 0, notes96 = 0;
+    for (std::size_t i = before; i < r.records.size(); ++i) {
+        if (r.records[i].subscriptionId == sub95) {
+            ++notes95;
+            EXPECT_EQ(r.records[i].baseOffset, 2) << "the note carries the bind-time resolved Latest (the HW)";
+            EXPECT_EQ(r.records[i].recordBatch.size(), 0u) << "a position note has an empty batch";
+            EXPECT_EQ(r.records[i].correlationId, 95);
+        }
+        if (r.records[i].subscriptionId == sub96) ++notes96;
+    }
+    EXPECT_EQ(notes95, 1) << "no position note for the v6 session";
+    EXPECT_EQ(notes96, 0) << "a position note to a session below 6";
+}
+
+// M2: the fallback scan is spread — one slice every kMovedAwayScanEveryCycles
+// passes, at most ~kMovedAwayLookupsPerSlice verdicts (whole buckets) per
+// slice — never every subscription in one pass; and it still reaches them all.
+TEST(TransientGatewayRegression, FallbackScanIsBoundedPerSliceAndCoversEverySubscriptionRegression) {
+    Rig r;
+    const int64_t sid = r.gw.injectTestSession(0);
+    constexpr int kSubs = 200;
+    for (int k = 0; k < kSubs; ++k) r.subscribe(sid, -2, 1000 + k, /*read_committed=*/1);
+    ASSERT_EQ(r.subscribed.size(), static_cast<std::size_t>(kSubs));
+    r.rep->becomeFollower(2, 2);   // unrouted: only the fallback scan can see it
+    for (int64_t i = 0; i < ClientGateway::kMovedAwayScanEveryCyclesForTest; ++i) r.gw.pushSubscriptionsForTest();
+    const uint64_t firstSlice = r.gw.readCommittedSubscriptionsMovedAway();
+    EXPECT_GE(firstSlice, 1u) << "the slice made no progress";
+    EXPECT_LE(firstSlice, 48u) << "one slice retired " << firstSlice << " subscriptions (an O(subs) spike)";
+    for (int64_t i = 0; i < 4096 && r.gw.readCommittedSubscriptionsMovedAway() < kSubs; ++i)
+        r.gw.pushSubscriptionsForTest();
+    EXPECT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), static_cast<uint64_t>(kSubs))
+        << "SILENT STALL: the spread scan never reached every subscription";
 }

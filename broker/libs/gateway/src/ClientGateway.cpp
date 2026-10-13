@@ -2998,6 +2998,37 @@ bool ClientGateway::readCommittedServableHere_(int32_t topicId, int32_t partitio
     return !v || v.publishedLeader();
 }
 
+void ClientGateway::scanMovedAwaySlice_()
+{
+    const std::size_t nb = subscriptions_.bucket_count();
+    if (nb == 0) return;
+    int budget = kMovedAwayLookupsPerSlice;
+    // Whole buckets (the cursor never stops mid-bucket: a rehash only moves
+    // where the walk resumes, every subscription is reached on a later lap).
+    for (std::size_t visited = 0; visited < nb && visited < kMovedAwayBucketsPerSlice && budget > 0; ++visited) {
+        if (movedAwayBucket_ >= nb) movedAwayBucket_ = 0;
+        const std::size_t b = movedAwayBucket_++;
+        for (auto it = subscriptions_.begin(b); it != subscriptions_.end(b); ) {
+            const int64_t subId = it->first;
+            Subscription& sub   = it->second;
+            ++it;   // before a possible erase (erase invalidates only that element)
+            if (!movedAwayEligible_(sub)) continue;
+            --budget;
+            if (movedAway_(sub) && retireReadCommittedMovedAway_(subId, sub)) subscriptions_.erase(subId);
+        }
+    }
+}
+
+void ClientGateway::logMovedAwaySummary_()
+{
+    spdlog::info("ClientGateway: {} subscription(s) this node can no longer serve (demoted / partition moved "
+                 "away) answered NotLeader and dropped since the last summary ({} in total); the clients "
+                 "re-subscribe from their positions on the leaders",
+                 movedAwaySinceSummary_, readCommittedMovedAway_);
+    movedAwaySinceSummary_     = 0;
+    nextMovedAwaySummaryCycle_ = pushCycle_ + kMovedAwaySummaryEveryCycles;
+}
+
 bool ClientGateway::movedAway_(const Subscription& sub) const noexcept
 {
     const GatewayReplicaView v{replicaRegistry_->lookupHandle(sub.topicId, sub.partition)};
@@ -3010,6 +3041,25 @@ bool ClientGateway::retireReadCommittedMovedAway_(int64_t subId, Subscription& s
 {
     Session* session = sessions_.find(sub.sessionId);
     if (session == nullptr) return false;   // dies with its session (dropSessionSubscriptions_)
+    // Fix round 2 (M3): first the POSITION NOTE (Protocol.h, client version 6)
+    // — an empty-batch Records frame of this subscription carrying this
+    // broker's cursor (in shard mode the bind-time resolved start; legacy, the
+    // live cursor), so a subscription that delivered nothing resumes there on
+    // the new leader instead of re-resolving Latest (records produced around
+    // the move would be skipped).  Ordered before the NotLeader on the same
+    // reliable session egress.  Older clients ignore an empty batch.
+    if (pc::clientUnderstandsMovedPositionNote(session->clientVersion)) {
+        pc::Records note;
+        note.sessionId      = sub.sessionId;
+        note.correlationId  = sub.subscribeCorrId;
+        note.subscriptionId = subId;
+        note.topicId        = sub.topicId;
+        note.partition      = sub.partition;
+        note.baseOffset     = sub.nextOffset;
+        note.recordBatch    = {};
+        const std::size_t n = note.encode(scratch_.data());
+        sendAnswer_(*session, scratch_.data(), n);
+    }
     pc::ErrorResponse err;
     err.sessionId     = sub.sessionId;
     err.correlationId = sub.subscribeCorrId;
@@ -3025,7 +3075,8 @@ bool ClientGateway::retireReadCommittedMovedAway_(int64_t subId, Subscription& s
         ix != session->subIdByKey.end() && ix->second == subId)
         session->subIdByKey.erase(ix);
     ++readCommittedMovedAway_;
-    spdlog::info("ClientGateway: subscription {} (sessionId={} topicId={} partition={} isolation={} "
+    ++movedAwaySinceSummary_;   // one rate-limited info summary (logMovedAwaySummary_)
+    spdlog::debug("ClientGateway: subscription {} (sessionId={} topicId={} partition={} isolation={} "
                  "nextOffset={}) — this node no longer serves it (demoted / partition moved away): NotLeader, "
                  "dropped (the client re-subscribes from its position on the leader)",
                  subId, sub.sessionId, sub.topicId, sub.partition, sub.isolation, sub.nextOffset);
@@ -4574,25 +4625,35 @@ void ClientGateway::pushSubscriptions()
     using namespace rune::protocol::batch;
 
     ++pushCycle_;   // F15 S4 fix round 1: the backoff clock (cycles, never wall time)
+    if (movedAwaySinceSummary_ != 0 && pushCycle_ >= nextMovedAwaySummaryCycle_) [[unlikely]]
+        logMovedAwaySummary_();
     if (subscriptions_.empty()) return;
 
-    // Task 11 carry (E2 Task 13): a plain read_committed subscription whose
-    // partition this node no longer leads is answered NotLeader and dropped —
-    // both worker modes (checked BEFORE the per-worker-egress skip: the owning
-    // worker cannot tell the client, it only stops pushing).  Swept only on a
-    // routed role change (one compare per pass otherwise).
-    //   Fix round 1: also on a replica REMOVAL (any isolation: the partition
-    //   moved off this node) and, as the fallback for a demotion no route
-    //   reports (fenced by a higher epoch), every kMovedAwaySweepCycles passes.
-    static_assert((kMovedAwaySweepCycles & (kMovedAwaySweepCycles - 1)) == 0, "power of two");
-    const bool rcSweep = replicaRegistry_ != nullptr &&
-                         (replicaRegistry_->roleChanges() != seenRcSweepRoleChanges_ ||
-                          (pushCycle_ & (kMovedAwaySweepCycles - 1)) == 0);
-    if (rcSweep) [[unlikely]] seenRcSweepRoleChanges_ = replicaRegistry_->roleChanges();
+    // Task 11 carry (E2 Task 13): a plain subscription this node can no longer
+    // serve (movedAway_: read_committed after a demotion; any isolation after
+    // its replica was removed) is answered NotLeader and dropped — both worker
+    // modes (checked BEFORE the per-worker-egress skip: the owning worker
+    // cannot tell the client, it only stops pushing).
+    //   - Routed trigger (immediate): every routed role change / replica
+    //     removal bumps the registry's roleChanges(); the routed role is
+    //     recorded BEFORE the owner flips, and movedAway_ reads it
+    //     (publishedLeader() is false once intended == Follower).
+    //   - Fallback (fix round 2: spread): a demotion no route reports (fenced by
+    //     a higher epoch) — every kMovedAwayScanEveryCycles passes, a slice of
+    //     at most ~kMovedAwayLookupsPerSlice subscriptions behind a bucket
+    //     cursor (scanMovedAwaySlice_); never an O(subs) spike.
+    const bool routedSweep = replicaRegistry_ != nullptr &&
+                             replicaRegistry_->roleChanges() != seenRcSweepRoleChanges_;
+    if (routedSweep) [[unlikely]] {
+        seenRcSweepRoleChanges_ = replicaRegistry_->roleChanges();
+    } else if (replicaRegistry_ != nullptr && (pushCycle_ & (kMovedAwayScanEveryCycles - 1)) == 0) [[unlikely]] {
+        scanMovedAwaySlice_();
+        if (subscriptions_.empty()) return;
+    }
     for (auto subIt = subscriptions_.begin(); subIt != subscriptions_.end(); ) {
         const int64_t subId = subIt->first;
         Subscription& sub   = subIt->second;
-        if (rcSweep && !sub.isGroup && sub.topicId >= 0 && !sub.failed && movedAway_(sub) &&
+        if (routedSweep && movedAwayEligible_(sub) && movedAway_(sub) &&
             retireReadCommittedMovedAway_(subId, sub)) [[unlikely]] {
             subIt = subscriptions_.erase(subIt);
             continue;
