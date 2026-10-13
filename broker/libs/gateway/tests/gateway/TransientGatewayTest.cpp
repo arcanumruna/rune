@@ -863,3 +863,29 @@ TEST(TransientGatewayRegression, MovedGroupSubscriptionsKeepNotLeaderEvenWithAKn
     for (const auto& [corr, code] : r.errors)
         if (corr != 221) EXPECT_NE(code, static_cast<int16_t>(pc::ErrorCode::Redirect)) << "corr " << corr << " redirected";
 }
+
+// ---------------------------------------------------------------------------
+// E2 final fix wave (Task 13 re-review N1): the fallback slice is bounded by its
+// actual movedAway_ PROBES, even when the subscriptions collide into a few
+// buckets — it stops mid-bucket and resumes there.  It still reaches every
+// subscription.  RED (whole buckets, verdict budget checked between buckets):
+// the first slice probed all 200 subscriptions of the squeezed bucket(s).
+// ---------------------------------------------------------------------------
+TEST(TransientGatewayRegression, FallbackSliceIsBoundedByProbesInACollidingBucketRegression) {
+    Rig r;
+    const int64_t sid = r.gw.injectTestSession(0);
+    constexpr int kSubs = 200;
+    for (int k = 0; k < kSubs; ++k) r.subscribe(sid, -2, 3000 + k, /*read_committed=*/1);
+    ASSERT_EQ(r.subscribed.size(), static_cast<std::size_t>(kSubs));
+    r.gw.squeezeSubscriptionBucketsForTest();
+    r.rep->becomeFollower(2, 2);   // unrouted: only the fallback scan sees it
+    for (int64_t i = 0; i < ClientGateway::kMovedAwayScanEveryCyclesForTest; ++i) r.gw.pushSubscriptionsForTest();
+    EXPECT_GE(r.gw.readCommittedSubscriptionsMovedAway(), 1u) << "the slice made no progress";
+    EXPECT_LE(r.gw.movedAwayMaxProbesPerSliceForTest(), ClientGateway::kMovedAwayLookupsPerSliceForTest)
+        << "one slice probed " << r.gw.movedAwayMaxProbesPerSliceForTest() << " subscriptions of a colliding bucket";
+    for (int64_t i = 0; i < 8192 && r.gw.readCommittedSubscriptionsMovedAway() < kSubs; ++i)
+        r.gw.pushSubscriptionsForTest();
+    EXPECT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), static_cast<uint64_t>(kSubs))
+        << "SILENT STALL: the mid-bucket resume never reached every subscription";
+    EXPECT_LE(r.gw.movedAwayMaxProbesPerSliceForTest(), ClientGateway::kMovedAwayLookupsPerSliceForTest);
+}

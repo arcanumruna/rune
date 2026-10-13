@@ -962,6 +962,15 @@ public:
     /// after the replica was removed) — retireReadCommittedMovedAway_.
     [[nodiscard]] uint64_t readCommittedSubscriptionsMovedAway() const noexcept { return readCommittedMovedAway_; }
     static constexpr int64_t kMovedAwayScanEveryCyclesForTest = 16;   // == kMovedAwayScanEveryCycles
+    static constexpr int     kMovedAwayLookupsPerSliceForTest = 32;   // == kMovedAwayLookupsPerSlice
+    /// N1: the most movedAway_ probes any fallback slice made so far.
+    [[nodiscard]] int movedAwayMaxProbesPerSliceForTest() const noexcept { return movedAwayMaxProbesPerSlice_; }
+    /// N1 test seam: put every subscription in as few buckets as possible (a
+    /// pathological collision pattern the fallback slice must stay bounded on).
+    void squeezeSubscriptionBucketsForTest() {
+        subscriptions_.max_load_factor(1.0e9f);
+        subscriptions_.rehash(0);
+    }
 
     // -----------------------------------------------------------------------
     // applyProduceForTest — feed a raw Produce frame through the real
@@ -2094,14 +2103,16 @@ private:
     /// per-pass lookup per subscription, never an O(subs) spike.
     uint64_t seenRcSweepRoleChanges_ = 0;
     static constexpr int64_t     kMovedAwayScanEveryCycles   = kMovedAwayScanEveryCyclesForTest;   ///< power of two
-    static constexpr int         kMovedAwayLookupsPerSlice   = 32;
+    static constexpr int         kMovedAwayLookupsPerSlice   = kMovedAwayLookupsPerSliceForTest;
     static constexpr std::size_t kMovedAwayBucketsPerSlice   = 256;   ///< empty buckets cost no lookup, but bounded
     static constexpr int64_t     kMovedAwaySummaryEveryCycles = 1 << 16;
     std::size_t movedAwayBucket_           = 0;   ///< fallback scan cursor (bucket index)
+    std::size_t movedAwayBucketPos_        = 0;   ///< N1: survivors of that bucket already visited (mid-bucket resume)
+    int         movedAwayMaxProbesPerSlice_ = 0;  ///< N1: the most movedAway_ probes one slice made (tests)
     uint64_t    movedAwaySinceSummary_     = 0;
     int64_t     nextMovedAwaySummaryCycle_ = 0;
-    /// The fallback slice: at most ~kMovedAwayLookupsPerSlice movedAway_ verdicts
-    /// (whole buckets), resuming at movedAwayBucket_.
+    /// The fallback slice: at most kMovedAwayLookupsPerSlice movedAway_ probes,
+    /// resuming at (movedAwayBucket_, movedAwayBucketPos_) — mid-bucket (N1).
     void scanMovedAwaySlice_();
     void logMovedAwaySummary_();
     [[nodiscard]] static bool movedAwayEligible_(const Subscription& sub) noexcept {

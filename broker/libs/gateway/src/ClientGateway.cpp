@@ -3002,21 +3002,41 @@ void ClientGateway::scanMovedAwaySlice_()
 {
     const std::size_t nb = subscriptions_.bucket_count();
     if (nb == 0) return;
+    // E2 final fix wave (N1): the budget counts actual movedAway_ PROBES (one
+    // replica-registry lookup each) and the slice stops the moment it is
+    // spent — mid-bucket if need be (movedAwayBucketPos_ = the survivors of
+    // the current bucket already visited), so a colliding bucket can never
+    // exceed it.  A retired (erased) element does not advance the position;
+    // a rehash between slices only moves where the walk resumes — every
+    // subscription is still reached on a later lap (and the routed sweep
+    // covers them all).
     int budget = kMovedAwayLookupsPerSlice;
-    // Whole buckets (the cursor never stops mid-bucket: a rehash only moves
-    // where the walk resumes, every subscription is reached on a later lap).
     for (std::size_t visited = 0; visited < nb && visited < kMovedAwayBucketsPerSlice && budget > 0; ++visited) {
-        if (movedAwayBucket_ >= nb) movedAwayBucket_ = 0;
-        const std::size_t b = movedAwayBucket_++;
-        for (auto it = subscriptions_.begin(b); it != subscriptions_.end(b); ) {
+        if (movedAwayBucket_ >= nb) { movedAwayBucket_ = 0; movedAwayBucketPos_ = 0; }
+        const std::size_t b = movedAwayBucket_;
+        auto it = subscriptions_.begin(b);
+        std::size_t pos = 0;
+        for (; it != subscriptions_.end(b) && pos < movedAwayBucketPos_; ++it) ++pos;   // resume mid-bucket
+        bool spent = false;
+        while (it != subscriptions_.end(b)) {
+            if (budget == 0) { spent = true; break; }
             const int64_t subId = it->first;
             Subscription& sub   = it->second;
             ++it;   // before a possible erase (erase invalidates only that element)
-            if (!movedAwayEligible_(sub)) continue;
+            if (!movedAwayEligible_(sub)) { ++pos; continue; }
             --budget;
-            if (movedAway_(sub) && retireReadCommittedMovedAway_(subId, sub)) subscriptions_.erase(subId);
+            if (movedAway_(sub) && retireReadCommittedMovedAway_(subId, sub)) {
+                subscriptions_.erase(subId);   // the position stays: the next survivor takes its place
+                continue;
+            }
+            ++pos;
         }
+        if (spent) { movedAwayBucketPos_ = pos; break; }
+        ++movedAwayBucket_;
+        movedAwayBucketPos_ = 0;
     }
+    const int probes = kMovedAwayLookupsPerSlice - budget;
+    if (probes > movedAwayMaxProbesPerSlice_) movedAwayMaxProbesPerSlice_ = probes;
 }
 
 void ClientGateway::logMovedAwaySummary_()
