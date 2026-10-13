@@ -36,7 +36,8 @@
 #
 # Variants (all by default; FAILOVER_VARIANTS selects): each on a fresh cluster.
 # full-restart-group (E2 final fix wave C1): a consumer group commits, every node
-# restarts, the group must deliver every refilled record exactly once.
+# restarts — staggered, the partition's old leader stopped and started LAST
+# (residual N1) — and the group must deliver every refilled record exactly once.
 # The partition leader is deterministic (StaticBalancer: node 2 = rune-3):
 #   seed-follows-redirect  the probe's seed is rune-1: its Subscribe is
 #                          redirected to rune-3 and the seed session follows;
@@ -337,15 +338,19 @@ run_full_restart_group() {
     echo "${out}" >&2
     [ "${rc}" -eq 0 ] || fail "[${label}] group_commit exited ${rc}"
     echo "${out}" | grep -q "^GROUP-COMMIT: OK committed=20" || fail "[${label}] the group did not commit 20"
-    log "Step G2: FULL restart of every node (transient data lost everywhere; metadata survives)..."
+    log "Step G2: FULL restart, STAGGERED: the partition's old leader (rune-3) stops last and starts last..."
     n0="$(leader_lines)"
-    dc stop -t "${STOP_TIMEOUT_S}" rune-1 rune-2 rune-3
-    dc start rune-1 rune-2 rune-3
+    dc stop -t "${STOP_TIMEOUT_S}" rune-1 rune-2
+    dc stop -t "${STOP_TIMEOUT_S}" rune-3
+    dc start rune-1 rune-2
     deadline=$(( $(date +%s) + LEADER_WAIT_S ))
     until [ "$(leader_lines)" -gt "${n0}" ]; do
         [ "$(date +%s)" -lt "${deadline}" ] || fail "[${label}] no fresh consensus leader after the restart"
         sleep 2
     done
+    # The old leader comes back last (the coordinator ran without it meanwhile).
+    sleep "${STAGGER_S:-8}"
+    dc start rune-3
     log "Step G3: the same group must deliver every post-restart record (2) exactly once..."
     set +e
     out="$(run_group_probe group_restart -e RUNE_GROUP_PRE=0)"; rc=$?

@@ -499,7 +499,8 @@ struct AlterIsrMsg {
     /// E2 final fix wave (C1 multi-node): not a bump — a TRANSIENT partition
     /// LEADER's data-lineage report for its leadership (`leaderId`,
     /// `leaderEpoch`): isr[2] = the leader epoch of the data its ring holds
-    /// (-1: none — its ring is unborn).  Re-sent on the AlterIsr cadence until
+    /// (-1: none — its ring is unborn); isr[3]/isr[4] = the reporting
+    /// process's node-control identity (low/high 32 bits; residual N1).  Re-sent on the AlterIsr cadence until
     /// answered kAlterIsrLineageConfirmed (committed) or FencedLeaderEpoch.
     /// An older controller drops it (no answer; the leader keeps re-sending).
     static constexpr int32_t kLineageReport = 256;

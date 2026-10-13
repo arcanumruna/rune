@@ -265,6 +265,13 @@ struct NodeConfig {
     // Tests may set a lower value (e.g. 500 ms) for faster ISR shrink in kill scenarios.
     int64_t replicaLagMaxMs = 10'000;
 
+    // TEST-ONLY (E2 C1 residual N1): a controller that becomes ready takes no
+    // dynamic leadership decision for a USER partition (failover, leaderless,
+    // bump, rebalance) for this long — internal partitions are decided as
+    // usual.  Holds a full restart's stale committed leadership in place so a
+    // test can probe it.  0 (default): no hold; never set in production.
+    int64_t testUserDecisionHoldMs = 0;
+
     // Follower periodic-fetch backstop cadence (RUNE_FETCH_INTERVAL_US, default
     // 5000µs = 5ms).  GR-10 push + fast-ack is meant to drive replication; this
     // is only the lost-push backstop + ISR keepalive.  Exposed so acks=all

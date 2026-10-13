@@ -2656,3 +2656,50 @@ TEST(TransientLineageControllerRegression, LineageIsMintedKeptAndReMintedPerLead
     EXPECT_EQ(l3->mintEpoch, third.leaderEpoch);
     EXPECT_EQ(c.svc->lineagesMintedForTest(), 2u);
 }
+
+// E2 final fix wave, residual round 3 — N1 (Critical): the coordinator trusts a
+// committed lineage only while the confirmed leader's LIVE process identity
+// (its node-control registration nonce) is the one committed with it.  A full
+// restart keeps the committed (leader, epoch) until its bump commits; the
+// leader's NEW process (or no registration yet) must be "untrusted" — never the
+// old lineage.  RED (identity not checked): the old lineage was trusted.
+namespace {
+void registerNode(MetadataService& svc, int32_t node, int64_t nonce) {
+    rune::replication::AlterIsrMsg m{};
+    m.topicId  = rune::replication::AlterIsrMsg::kNodeControlTopicId;
+    m.leaderId = node;
+    m.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump;
+    m.isr[1]   = rune::replication::AlterIsrMsg::kNodeRegister;
+    m.isr[3]   = static_cast<int32_t>(static_cast<uint64_t>(nonce) & 0xffffffffu);
+    m.isr[4]   = static_cast<int32_t>(static_cast<uint64_t>(nonce) >> 32);
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answered = false;
+    (void)svc.onAlterIsr(m, &resp, &answered);
+}
+}  // namespace
+
+TEST(TransientLineageControllerRegression, LineageIsTrustedOnlyWhileItsLeadersProcessLivesRegression) {
+    CtlRig c;
+    const auto pa = c.pa();
+    const int64_t nonce1 = 0x1111'2222'3333'4444LL;
+    auto rep = lineageReport(pa, -1);
+    rep.isr[3] = static_cast<int32_t>(static_cast<uint64_t>(nonce1) & 0xffffffffu);
+    rep.isr[4] = static_cast<int32_t>(static_cast<uint64_t>(nonce1) >> 32);
+    (void)answer(*c.svc, rep);
+    c.drive(50);
+    ASSERT_EQ(answer(*c.svc, rep), rune::replication::kAlterIsrLineageConfirmed);
+    const uint64_t token = c.svc->transientLineage(0, 0)->lineage;
+    EXPECT_EQ(c.svc->transientLineage(0, 0)->incarnation, nonce1) << "the record must carry the leader's process";
+
+    EXPECT_EQ(c.svc->trustedTransientLineage(0, 0), rune::metadata::kLineageUntrusted)
+        << "trusted before the leader's process registered (a restarted controller knows nobody yet)";
+    registerNode(*c.svc, pa.leaderNode, nonce1);
+    EXPECT_EQ(c.svc->trustedTransientLineage(0, 0), token) << "the live, confirming process is not trusted";
+
+    // The leader's process restarted (a new nonce); the committed assignment is
+    // unchanged — the stale (L, E) a full restart leaves until the bump commits.
+    registerNode(*c.svc, pa.leaderNode, 0x5555'6666'7777'8888LL);
+    EXPECT_EQ(c.pa().leaderEpoch, pa.leaderEpoch) << "precondition: the leadership has not moved";
+    EXPECT_EQ(c.svc->trustedTransientLineage(0, 0), rune::metadata::kLineageUntrusted)
+        << "SILENT LOSS: the dead process's lineage was trusted for the stale committed leadership";
+}

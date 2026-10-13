@@ -3248,6 +3248,9 @@ int PartitionReplica::sendLineageReport_(int64_t nowNs)
     m.partitionEpoch = committedPartitionEpoch_;
     m.isr[1] = AlterIsrMsg::kLineageReport;
     m.isr[2] = static_cast<int32_t>(lineageReport_.src);
+    // N1: the reporting PROCESS (the node-control nonce, low/high 32 bits).
+    m.isr[3] = static_cast<int32_t>(static_cast<uint64_t>(lineageIdentity_) & 0xffffffffu);
+    m.isr[4] = static_cast<int32_t>(static_cast<uint64_t>(lineageIdentity_) >> 32);
     if (!isrChannel_->sendAlterIsr(m)) ++sendRefusals_;
     return 1;
 }

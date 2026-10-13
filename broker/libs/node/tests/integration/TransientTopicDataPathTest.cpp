@@ -699,7 +699,14 @@ struct GroupCluster {
     TmpDir d0{"lg0"}, d1{"lg1"}, d2{"lg2"}, cdir{"lgc"};
     Ports  ports = Ports::discover(3);
     std::unique_ptr<BrokerNode> nodes[3];
-    NodeConfig cfg(int i) { return makeConfig(i, (i == 0 ? d0 : i == 1 ? d1 : d2).path, ports, 3, true); }
+    bool    crashStops = false;   // controlledShutdownMs = 0: a stop hands nothing off (like a crash)
+    int64_t holdMs     = 0;       // NodeConfig::testUserDecisionHoldMs (the N1 window)
+    NodeConfig cfg(int i) {
+        NodeConfig c = makeConfig(i, (i == 0 ? d0 : i == 1 ? d1 : d2).path, ports, 3, true);
+        if (crashStops) c.controlledShutdownMs = 0;
+        c.testUserDecisionHoldMs = holdMs;
+        return c;
+    }
     void start(int i) { nodes[i] = std::make_unique<BrokerNode>(cfg(i)); nodes[i]->start(); }
     void stop(int i) { if (nodes[i]) { nodes[i]->stop(); nodes[i].reset(); } }
     int liveNode() const { for (int i = 0; i < 3; ++i) if (nodes[i]) return i; return -1; }
@@ -881,4 +888,72 @@ TEST(TransientLineageClusterRegression, SingleNodeRestartAnswersAGroupsOffsetAsN
     ASSERT_TRUE(settled(off)) << "no settled OffsetFetch answer after the restart";
     EXPECT_EQ(off, -1) << "SILENT LOSS: a single-node restart answered the previous process's offset";
     node.stop();
+}
+
+// E2 final fix wave, residual round 3 — N1 (Critical): after a full-cluster
+// restart the committed assignment still names the dead pre-restart leadership
+// (L, E) until its bump / failover commits, and the committed lineage is
+// "confirmed" for exactly (L, E).  The coordinator must not trust it: the
+// lineage is trusted only while the controller's currently known process
+// identity for L matches the one committed with it.  Staggered restart: the
+// two other nodes come back first (consensus, the coordinator, the offsets),
+// the old leader L LAST; the group's OffsetFetch arrives before P's leadership
+// moved.  Every answer must be NotLeader (pending) until a new leadership
+// confirms a new lineage, then -1 — never the old offset.  RED (identity not
+// checked): 20 answered in the window.
+TEST(TransientLineageClusterRegression, StaggeredFullRestartWithTheOldLeaderLastNeverAnswersTheOldOffsetRegression) {
+    GroupCluster g;
+    g.crashStops = true;   // ISRs stay full: nothing is handed off on the stops
+    for (int i = 0; i < 3; ++i) g.start(i);
+    ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
+    ShardTestClient c(g.cdir.path);
+    c.setClientVersion(rune::protocol::client::kClientVersion);
+    const int leader = g.partitionLeader(c);
+    ASSERT_GE(leader, 0);
+    const int64_t sidL = c.connect(gatewayChannel(g.ports, leader), kClientStream);
+    for (int b = 0; b < 5; ++b)
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, leader), kClientStream, sidL, 0, 0, 1, makeBatch(4)));
+    ASSERT_TRUE(commitOffset(g, c, "lg-stagger", 20));
+    ASSERT_EQ(settledFetch(g, c, "lg-stagger", nullptr), 20);
+
+    // Stop the others first and L LAST (a controlled shutdown with no live ISR
+    // peer cannot hand P off): the committed assignment keeps naming (L, E).
+    for (int i = 0; i < 3; ++i) if (i != leader) g.stop(i);
+    g.stop(leader);
+    // The restarted controller decides no USER partition for a while (test
+    // hold): P's committed leadership stays the dead (L, E), exactly as when
+    // its failover / bump is decided on a later tick.
+    g.holdMs = 6'000;
+    for (int i = 0; i < 3; ++i) if (i != leader) g.start(i);   // the old partition leader stays down
+    // The window: P's committed leadership is still the dead (L, E) — no clean
+    // leader exists while L is down.  Ask repeatedly (as a rejoining member does).
+    std::vector<std::pair<int64_t, int16_t>> answers;   // the coordinator's served answers (OK / NotLeader)
+    for (int k = 0; k < 4000 && answers.size() < 150; ++k) {
+        const int coord = g.coordinator();
+        if (coord < 0) continue;
+        const int64_t sid = c.connect(gatewayChannel(g.ports, coord), kClientStream);
+        if (sid <= 0) { std::this_thread::sleep_for(25ms); continue; }
+        const auto r = c.offsetFetch(gatewayChannel(g.ports, coord), kClientStream, sid, "lg-stagger", 0, 0);
+        // NotCoordinator: the coordinator is not ready yet (it does not answer offsets).
+        if (r && (r->second == kOffsetOk || r->second == kOffsetNotLeader)) answers.push_back(*r);
+        std::this_thread::sleep_for(25ms);   // the client's retry pacing (poll interval)
+    }
+    ASSERT_GE(answers.size(), 100u) << "the coordinator answered too rarely to cover the window";
+    int pendingN = 0;
+    for (const auto& [off, code] : answers) {
+        ASSERT_FALSE(code == kOffsetOk && off == 20)
+            << "SILENT LOSS: the old offset was answered from the dead leadership's lineage after a full restart";
+        pendingN += code == kOffsetNotLeader ? 1 : 0;
+    }
+    EXPECT_EQ(pendingN, static_cast<int>(answers.size()))
+        << "an answer other than the retriable pending NotLeader while the old leader's process is gone";
+    // The old leader comes back LAST (no hold for it — its process registers a
+    // NEW identity): its restart fence takes a new epoch with an unborn ring ->
+    // a NEW lineage -> -1 (never the old offset).
+    g.holdMs = 0;
+    g.start(leader);
+    EXPECT_EQ(settledFetch(g, c, "lg-stagger", nullptr), -1)
+        << "after the old leader returned, the offset of the ring's previous life was not answered as none";
+    std::printf("[lineage staggered restart] %zu answer(s) while the old leader was down, %d pending\n",
+                answers.size(), pendingN);
 }

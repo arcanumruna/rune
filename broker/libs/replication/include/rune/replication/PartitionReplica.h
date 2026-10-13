@@ -404,6 +404,12 @@ public:
     /// every start; 0 = untracked).  Stamped on every FetchRequest this replica
     /// sends; set once before the replica is driven (ReplicaRegistry::add).
     void setProcessIncarnation(int64_t inc) noexcept { processIncarnation_ = inc; }
+    /// E2 C1 residual N1: this PROCESS's node-control identity (the nonce the
+    /// node registers with every controller, ControlledShutdown).  Carried in
+    /// the transient lineage report and committed with the lineage, so the
+    /// coordinator trusts a lineage only while its leader's process lives.
+    /// Set once before the replica is driven (ReplicaRegistry::add).
+    void setLineageIdentity(int64_t id) noexcept { lineageIdentity_ = id; }
     [[nodiscard]] int64_t processIncarnation() const noexcept { return processIncarnation_; }
 
     // -----------------------------------------------------------------------
@@ -1701,6 +1707,7 @@ private:
     /// held in this process).  A follower adopts its leader's epoch on every
     /// accepted fetch answer; a leader takes its own epoch.
     Epoch lineageSrcEpoch_ = -1;
+    int64_t lineageIdentity_ = 0;   ///< N1: see setLineageIdentity
     /// The leader's lineage report for its leadership `epoch` (data source
     /// `src`), re-sent until the controller confirms it committed.
     struct LineageReport {

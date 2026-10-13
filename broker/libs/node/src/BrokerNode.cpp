@@ -1022,6 +1022,10 @@ void BrokerNode::buildReplication() {
     replicaRegistry_ = std::make_unique<ReplicaRegistry>();
     // KIP-903: every replica of this process stamps the process incarnation.
     replicaRegistry_->setProcessIncarnation(bumpProcessIncarnation(config_.dataDir));
+    // E2 C1 residual N1: the node-control identity (the same nonce the node
+    // registers with every controller) rides each transient lineage report.
+    if (lifecycleNonce_ == 0) lifecycleNonce_ = processNonce();
+    replicaRegistry_->setLineageIdentity(lifecycleNonce_);
     // Review 2026-10-04 MAJOR-2/3: durable internal-ISR knowledge — internal
     // replicas commit their ISR changes on a majority of it, and the consensus
     // election votes only for members of its newest internal ISRs.
@@ -2425,6 +2429,8 @@ void BrokerNode::buildGateway() {
             // MetadataService: applies committed records on doWork; exposes assignment().
             metadataService_ = std::make_unique<MetadataService>(
                 metaReplicaRaw, nodeId);
+            if (config_.testUserDecisionHoldMs > 0)   // TEST-ONLY (see NodeConfig)
+                metadataService_->setUserDecisionHoldForTest(config_.testUserDecisionHoldMs * 1'000'000);
             // Rebuild any previously committed assignments from the local Log.
             metadataService_->rebuildFromLog();
             // Kafka AlterPartition: this node's transport hands every AlterIsr it
@@ -2599,8 +2605,9 @@ void BrokerNode::buildGateway() {
         // Review M1: the node-control protocol identifies this PROCESS by a
         // random nonce (compared by identity) — never by the data-dir counter,
         // which restarts low after a wiped dir.
+        if (lifecycleNonce_ == 0) lifecycleNonce_ = processNonce();
         runtimeAgent_->controlledShutdown().bind(
-            config_.nodeId, processNonce(),
+            config_.nodeId, lifecycleNonce_,   // N1: the identity the lineage reports carry too
             [](void* t, int32_t to, const rune::replication::AlterIsrMsg& m) noexcept {
                 return static_cast<rune::replication::AeronPartitionTransport*>(t)->sendNodeControl(to, m);
             }, replTransport_.get(), metadataService_.get(), election_.get(), [this] {
@@ -4288,10 +4295,8 @@ uint64_t BrokerNode::transientLineageTrampoline_(void* ctx, int32_t topicId, int
     auto* self = static_cast<BrokerNode*>(ctx);
     if (!isTransientTopicTrampoline_(ctx, topicId)) return 0;   // a disk partition: no lineage
     if (self->metadataService_ == nullptr) return GroupCoordinationService::kLineagePending;
-    const auto* pa  = self->metadataService_->committedAssignment(topicId, partition);
-    const auto* rec = self->metadataService_->transientLineage(topicId, partition);
-    const int64_t inc = self->config_.isSingleNode() ? self->processIncarnation_ : 0;
-    return rune::metadata::lineageConfirmedFor(rec, pa, inc) ? rec->lineage : GroupCoordinationService::kLineagePending;
+    static_assert(GroupCoordinationService::kLineagePending == rune::metadata::kLineageUntrusted);
+    return self->metadataService_->trustedTransientLineage(topicId, partition);   // residual N1
 }
 
 } // namespace rune::node

@@ -141,6 +141,10 @@ struct TransientLineageRecord {
     return out;
 }
 
+/// The coordinator's "not answerable yet" lineage (settling window): equal to
+/// GroupCoordinationService::kLineagePending.
+inline constexpr uint64_t kLineageUntrusted = UINT64_MAX;
+
 /// C1 multi-node: the committed lineage `rec` is TRUSTED for the partition's
 /// current committed leadership `pa` (the coordinator answers from it only
 /// then): confirmed for exactly this leader and leader epoch, and — single node

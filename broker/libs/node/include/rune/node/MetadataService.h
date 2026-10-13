@@ -929,7 +929,7 @@ public:
             return false;
         }
         const rune::metadata::TransientLineage* rec = msm_.lineage(m.topicId, m.partition);
-        if (rune::metadata::lineageConfirmedFor(rec, &pa, 0)) {
+        if (rune::metadata::lineageConfirmedFor(rec, &pa, incarnationOf_(m))) {   // N1: by THIS process
             reply(rr::kAlterIsrLineageConfirmed, pa.partitionEpoch);
             return false;
         }
@@ -940,7 +940,9 @@ public:
         rune::metadata::TransientLineageRecord r;
         r.topicId   = m.topicId;
         r.partition = m.partition;
-        r.l = rune::metadata::decideTransientLineage(rec, m.leaderId, pa.leaderEpoch, m.isr[2], mintLineage_());
+        // N1: the record carries the reporting leader's process identity.
+        r.l = rune::metadata::decideTransientLineage(rec, m.leaderId, pa.leaderEpoch, m.isr[2], mintLineage_(),
+                                                     incarnationOf_(m));
         noteLineageDecision_(r, rec);
         pendingLineageRecords_.push_back(r);
         drainDynamicQueue();
@@ -977,6 +979,35 @@ public:
     }
     [[nodiscard]] const rune::metadata::TransientLineage* transientLineage(int32_t topicId, int32_t partition) const noexcept {
         return msm_.lineage(topicId, partition);
+    }
+    /// E2 C1 (residual N1): the data lineage the group coordinator may answer
+    /// committed offsets of a TRANSIENT partition against, or
+    /// kLineageUntrusted (the settling window: answered NotLeader).  Trusted
+    /// only when confirmed for the CURRENT committed leadership AND by the
+    /// leader's LIVE process: single node — this process (the lineage
+    /// authority's incarnation); multi-node — the identity this node currently
+    /// knows for the confirmed leader (its registration nonce; every node
+    /// registers with every controller).  After a full-cluster restart the
+    /// committed assignment still names the dead leadership until its bump /
+    /// failover commits: its committed identity no longer matches (or is not
+    /// yet known) — never trusted.  Runtime thread.
+    [[nodiscard]] uint64_t trustedTransientLineage(int32_t topicId, int32_t partition) const noexcept {
+        const rune::metadata::TransientLineage* rec = msm_.lineage(topicId, partition);
+        if (rec == nullptr) return rune::metadata::kLineageUntrusted;
+        const int64_t live = lineageAuthorityIncarnation_ != 0 ? lineageAuthorityIncarnation_
+                                                               : knownProcessIdentity(rec->confirmedLeader);
+        if (live == 0) return rune::metadata::kLineageUntrusted;   // the leader has not (re)registered yet
+        return rune::metadata::lineageConfirmedFor(rec, msm_.assignment(topicId, partition), live)
+                   ? rec->lineage : rune::metadata::kLineageUntrusted;
+    }
+    /// TEST-ONLY: see NodeConfig::testUserDecisionHoldMs.
+    void setUserDecisionHoldForTest(int64_t ns) noexcept { userDecisionHoldNs_ = ns; }
+    /// E2 C1 residual N1: the process identity this node currently knows for
+    /// `node` (its node-control registration nonce; every node registers with
+    /// every new controller) — 0 when unknown.
+    [[nodiscard]] int64_t knownProcessIdentity(int32_t node) const noexcept {
+        const auto it = nodeLifecycle_.find(node);
+        return it == nodeLifecycle_.end() ? 0 : it->second.nonce;
     }
     [[nodiscard]] const rune::metadata::PartitionAssignment* committedAssignment(int32_t topicId,
                                                                                 int32_t partition) const noexcept {
@@ -1556,6 +1587,11 @@ public:
 
         rune::metadata::DynamicBalancer bal;
         std::vector<rune::metadata::BalancerRecord> recs = bal.rebalance(in);
+        if (userDecisionHoldNs_ > 0 && lastNowNs_ < readySinceNs_ + userDecisionHoldNs_) [[unlikely]] {
+            // TEST-ONLY hold (NodeConfig::testUserDecisionHoldMs): no USER partition decision yet.
+            std::erase_if(recs, [](const rune::metadata::BalancerRecord& br) { return br.rec.topicId >= 0; });
+            bumpRequests_.clear();   // re-sent by their requesters; decided after the hold
+        }
         // A partition with a record in flight (e.g. a committed-ISR change from
         // AlterIsr) is decided again on the next tick, on the committed state —
         // never on a stale ISR.
@@ -1692,6 +1728,12 @@ public:
     /// \returns non-zero if any records were applied this cycle.
     int doWork(int64_t nowNs) {
         if (!replica_) return 0;
+        lastNowNs_ = nowNs;
+        if (userDecisionHoldNs_ > 0) {   // TEST-ONLY (NodeConfig::testUserDecisionHoldMs)
+            const bool ready = controllerReady_();
+            if (ready && !holdWasReady_) readySinceNs_ = nowNs;
+            holdWasReady_ = ready;
+        }
 
         // The log's existing content changed (a KIP-279 truncation while
         // following): everything applied from the old content is stale — rebuild
@@ -2351,6 +2393,8 @@ private:
     // C1 multi-node: lineage decisions to append, and the appended-not-yet-
     // committed ones (partition key -> metadata-log end offset).
     std::deque<rune::metadata::TransientLineageRecord> pendingLineageRecords_;
+    int64_t userDecisionHoldNs_ = 0, readySinceNs_ = 0, lastNowNs_ = 0;   ///< TEST-ONLY hold
+    bool    holdWasReady_       = false;
     std::unordered_map<int64_t, rune::replication::Offset> lineageInflight_;
     uint64_t lineagesMinted_ = 0, lineagesKept_ = 0, lineageMintCounter_ = 0;
     uint64_t lineageSalt_ = 0x5DEECE66Dull;

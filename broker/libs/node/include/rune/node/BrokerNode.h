@@ -1097,6 +1097,10 @@ private:
     /// single-node controller's lineage authority (every transient ring there
     /// lives exactly as long as the process).
     int64_t processIncarnation_ = 0;
+    /// E2 C1 residual N1: this process's node-control identity (multi-node) —
+    /// registered with every controller (ControlledShutdown) and stamped on
+    /// every replica's lineage report.  Drawn once at construction.
+    int64_t lifecycleNonce_ = 0;
     void ensureProcessIncarnation_();
     static uint64_t transientLineageTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept;
     static bool isTransientTopicTrampoline_(void* ctx, int32_t topicId) noexcept;
