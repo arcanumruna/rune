@@ -155,6 +155,34 @@ static void BM_InMemoryLog_AppendSpan(benchmark::State& state) {
 BENCHMARK(BM_InMemoryLog_AppendSpan)->Arg(1)->Arg(4)->Arg(16)->Arg(64)->Unit(benchmark::kNanosecond);
 
 // ---------------------------------------------------------------------------
+// BM_InMemoryLog_AppendRestampFloor/{1,8}
+//
+// Phase 2b E2 Task 12: the transient LEADER produce path in steady state — a
+// full 4 MiB ring with an eviction floor (the HW) right behind the log end, so
+// every append first decides the fit side-effect-free (a dry run over the
+// batches it would evict), then evicts them and lands.  Arg = pose batches per
+// produced batch (1 = one small batch evicts ~one; 8 = one 8x batch evicts ~8).
+// ---------------------------------------------------------------------------
+static void BM_InMemoryLog_AppendRestampFloor(benchmark::State& state) {
+    const int k = static_cast<int>(state.range(0));
+    std::vector<uint8_t> small = makePoseBatch(0, 1700000000000LL);
+    InMemoryLog log(4ull * 1024 * 1024, 1ull << 20);
+    int64_t base = 0;
+    while (log.logStartOffset() == 0)   // fill until it evicts (steady state)
+        (void)log.appendNoSyncRestamp(small.data(), small.size(), 0, base);
+    std::vector<uint8_t> big(small);   // the ring copies opaque bytes: a k-times-larger "batch"
+    big.resize(small.size() * static_cast<std::size_t>(k));
+    for (auto _ : state) {
+        log.setEvictionFloor(log.logEndOffset());   // everything appended so far is committed
+        int64_t r = log.appendNoSyncRestamp(big.data(), big.size(), 0, base);
+        benchmark::DoNotOptimize(r);
+    }
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(big.size()));
+}
+BENCHMARK(BM_InMemoryLog_AppendRestampFloor)->Arg(1)->Arg(8)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
 // BM_InMemoryLog_AppendSteadyStateFull
 //
 // The realistic memory-backed hot path: a ring pre-filled to its record cap so

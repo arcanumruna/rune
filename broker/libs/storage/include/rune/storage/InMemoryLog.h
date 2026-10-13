@@ -455,27 +455,37 @@ private:
 
         if (policy_ == FullPolicy::DropOldest) {
             // Evict oldest batches until there is room for the new batch AND
-            // the record count is under the cap.  We re-evaluate the fit after
-            // each eviction because evictOldest() may reset tail_ (and therefore
+            // the record count is under the cap.  The fit is re-evaluated after
+            // each eviction because an eviction may reset tail_ (and therefore
             // change whether a wrap is needed).
-            //
-            // Note: keep at least one remaining entry to guarantee forward
-            // progress — a single-entry ring may still evict down to empty,
-            // which is fine (tail_ resets to 0 and the new batch goes in fresh).
-            while (entryCount_ > 0) {
-                // Recompute wrap/totalNeed against CURRENT tail_.
-                const std::size_t la = maxBytes_ - tail_;
-                const bool ww = (len > la);
-                const std::size_t need = len + (ww ? la : 0);
-                if (bytesUsed_ + need <= maxBytes_ && entryCount_ + nEntries <= maxRecords_)
-                    break; // fits — stop evicting
+            if (evictionFloor_ == kNoEvictionFloor) {
+                // Plain DropOldest: any batch may go — evict until it fits.
+                while (entryCount_ > 0 && !fitsAfterEviction_(bytesUsed_, tail_, entryCount_, len, nEntries))
+                    evictOldest();
+            } else {
                 // Phase 2b E2: never evict at/above the floor (uncommitted data
-                // of a transient partition) — refuse the append instead.
-                if (frontEntry().lastOffset >= evictionFloor_) [[unlikely]] {
-                    ++fullRefusals_;
-                    return kRefusedFull;
+                // of a transient partition) — refuse the append instead.  Task 12
+                // (seeded stress): decide the fit FIRST, on local copies that
+                // mirror evictOldest(), and evict only when the append will land
+                // — a refusal has no side effect (it used to evict the committed
+                // batches below the floor and then refuse anyway).  Zero
+                // allocation; the common case (fits at once) is one check.
+                std::size_t sBytes = bytesUsed_, sHead = head_, sTail = tail_, sCount = entryCount_;
+                std::size_t phys = entryHead_, nEvict = 0;
+                while (sCount > 0 && !fitsAfterEviction_(sBytes, sTail, sCount, len, nEntries)) {
+                    const Entry& e = entries_[phys];
+                    if (e.lastOffset >= evictionFloor_) [[unlikely]] {
+                        ++fullRefusals_;
+                        return kRefusedFull;   // nothing evicted, nothing appended
+                    }
+                    if (e.ringOffset < sHead) { sBytes -= maxBytes_ - sHead; sHead = 0; }   // as evictOldest()
+                    sBytes -= e.length;
+                    sHead   = e.ringOffset + e.length;
+                    if (--sCount == 0) sHead = sTail = 0;
+                    if (++phys == maxRecords_) phys = 0;   // compare-and-reset, no division
+                    ++nEvict;
                 }
-                evictOldest();
+                for (std::size_t i = 0; i < nEvict; ++i) evictOldest();
             }
         } else {
             // BackPressure: refuse if caps would be exceeded.
@@ -532,6 +542,14 @@ private:
         return baseOffset;
     }
 
+    /// The fit test of the eviction loop, against a (possibly simulated) ring state.
+    [[nodiscard]] bool fitsAfterEviction_(std::size_t used, std::size_t tail, std::size_t count,
+                                          std::size_t len, std::size_t nEntries) const noexcept {
+        const std::size_t la   = maxBytes_ - tail;
+        const std::size_t need = len + (len > la ? la : 0);   // + the trailing gap when it wraps
+        return used + need <= maxBytes_ && count + nEntries <= maxRecords_;
+    }
+
     // O(1) eviction — advances head_ past the oldest batch (and any leading
     // wrap-padding that preceded it), decrements bytesUsed_, advances
     // logStartOffset_.  NO memmove, NO rebase loop.
@@ -581,7 +599,8 @@ private:
     std::size_t           bytesUsed_ = 0;    ///< logical bytes in use (data + padding gaps)
     int64_t               logStartOffset_ = 0;
     int64_t               logEndOffset_   = 0;
-    int64_t               evictionFloor_  = std::numeric_limits<int64_t>::max();   ///< E2: see setEvictionFloor
+    static constexpr int64_t kNoEvictionFloor = std::numeric_limits<int64_t>::max();
+    int64_t               evictionFloor_  = kNoEvictionFloor;   ///< E2: see setEvictionFloor
     int32_t               leaderEpochStamp_ = -1;                                   ///< E2: see setLeaderEpochStamp
     uint64_t              fullRefusals_   = 0;
     uint64_t              evictedRecords_ = 0;

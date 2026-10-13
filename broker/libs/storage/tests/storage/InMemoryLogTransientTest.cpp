@@ -75,6 +75,52 @@ TEST(InMemoryLogTransientRegression, RecordCapEvictionHonoursTheFloorToo) {
     EXPECT_EQ(log.logStartOffset(), 0);
 }
 
+// E2 Task 12 (seeded stress, seed 41): an append the floor forces to refuse
+// first EVICTED the committed batches below the floor, then refused anyway —
+// committed records lost for an append that never happened (readers at those
+// offsets were skipped forward).  A refusal must have no side effect: decide
+// the fit first, evict only when the append will land.
+TEST(InMemoryLogTransientRegression, RefusedAppendEvictsNothingRegression) {
+    const auto x = batchOf(1);
+    InMemoryLog log(4 * x.size(), 1024);   // room for exactly 4 batches
+    log.setEvictionFloor(0);
+    int64_t base = -1;
+    for (int i = 0; i < 4; ++i) ASSERT_GE(log.appendNoSyncRestamp(x.data(), x.size(), 0, base), 0);
+    log.setEvictionFloor(1);                // only offset 0 is committed
+    const auto big = batchOf(1, 2 * x.size());   // needs > 1 batch of room: refused
+    EXPECT_EQ(log.appendNoSyncRestamp(big.data(), big.size(), 0, base), InMemoryLog::kRefusedFull);
+    EXPECT_EQ(log.logStartOffset(), 0) << "a refused append evicted the committed batch at 0";
+    EXPECT_EQ(log.evictedRecords(), 0u);
+    EXPECT_EQ(log.logEndOffset(), 4);
+    const auto v = log.readView(0, 1 << 20);
+    ASSERT_FALSE(v.empty());
+    EXPECT_EQ(rune::protocol::RecordBatchReader(v.data, v.len).baseOffset(), 0) << "the committed batch is still served";
+    // ... and the same append fits once enough is committed: it evicts then.
+    log.setEvictionFloor(4);
+    EXPECT_EQ(log.appendNoSyncRestamp(big.data(), big.size(), 0, base), 5);
+    EXPECT_GT(log.logStartOffset(), 0);
+}
+
+TEST(InMemoryLogTransientRegression, RefusedAppendByTheRecordCapEvictsNothingRegression) {
+    const auto x = batchOf(1);
+    InMemoryLog log(1 << 20, /*maxRecords=*/3);
+    log.setEvictionFloor(0);
+    int64_t base = -1;
+    for (int i = 0; i < 3; ++i) ASSERT_GE(log.appendNoSyncRestamp(x.data(), x.size(), 0, base), 0);
+    log.setEvictionFloor(1);
+    // A 3-batch span needs 3 free slots; only 1 is evictable: refused, nothing evicted.
+    std::vector<uint8_t> span;
+    for (int64_t b = 0; b < 3; ++b) {
+        rune::protocol::RecordBatchBuilder bb(b, 1000);
+        bb.append("k", "v", 1000);
+        const auto one = bb.build();
+        span.insert(span.end(), one.begin(), one.end());
+    }
+    EXPECT_EQ(log.appendNoSync(span.data(), span.size(), log.logEndOffset() + 2), InMemoryLog::kRefusedFull);
+    EXPECT_EQ(log.logStartOffset(), 0) << "a refused span append evicted a committed batch";
+    EXPECT_EQ(log.logEndOffset(), 3);
+}
+
 TEST(InMemoryLogTransient, DefaultFloorKeepsDropOldestBehaviour) {
     const auto x = batchOf(1);
     InMemoryLog log(4 * x.size(), 1024);
