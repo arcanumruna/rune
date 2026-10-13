@@ -52,11 +52,9 @@ using TopicConfig   = rune::protocol::TopicConfig;
 using RequestId     = rune::protocol::RequestId;
 using RequestIdHash = rune::protocol::RequestIdHash;
 
-/// AlterTopicConfig keys (ruling 5).  Append-only.
-enum class ConfigKey : uint8_t {
-    RetentionMs = 1, RetentionBytes = 2, DeleteRetentionMs = 3,
-    MinCleanableDirtyRatioPpm = 4, MinCompactionLagMs = 5, MaxCompactionLagMs = 6,
-};
+/// AlterTopicConfig keys (ruling 5): the ONE definition lives in rune-protocol
+/// CatalogTypes.h (shared with the wire).  Append-only.
+using ConfigKey     = rune::protocol::ConfigKey;
 struct ConfigChange { ConfigKey key; int64_t value; bool operator==(const ConfigChange&) const = default; };
 
 struct SchemaDef {

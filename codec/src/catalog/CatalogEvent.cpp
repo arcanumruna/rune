@@ -28,7 +28,7 @@ constexpr bool validDurability(uint8_t v) noexcept     { return v <= wire::kMaxD
 constexpr bool validDurabilityTier(uint8_t v) noexcept { return v <= wire::kMaxDurabilityTier; }
 constexpr bool validConfigKey(ConfigKey k) noexcept {
     const auto v = static_cast<uint8_t>(k);
-    return v >= static_cast<uint8_t>(ConfigKey::RetentionMs) && v <= static_cast<uint8_t>(ConfigKey::MaxCompactionLagMs);
+    return v >= static_cast<uint8_t>(rune::protocol::kFirstConfigKey) && v <= static_cast<uint8_t>(rune::protocol::kLastConfigKey);
 }
 constexpr bool validAlterOpType(rune::codec::AlterOpType t) noexcept {
     const auto v = static_cast<uint8_t>(t);
