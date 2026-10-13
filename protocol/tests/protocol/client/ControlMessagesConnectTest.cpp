@@ -804,7 +804,7 @@ TEST(HandshakeContinueResponse, TemplateIdIsEleven) {
 // kProtocolVersion (the MessageHeader wire version) stays at 3.
 // ---------------------------------------------------------------------------
 TEST(VersionGates, ClientBrokerVersionBumpedProtocolVersionUnchanged) {
-    EXPECT_EQ(rpc::kClientVersion, 5);   // no-hang wave: understands InvalidRequest
+    EXPECT_EQ(rpc::kClientVersion, 6);   // v6: TransientLogFull (v5: InvalidRequest)
     EXPECT_EQ(rpc::kBrokerVersion, 4);
     EXPECT_EQ(rpc::kClientVersionCrypto, 4);
     EXPECT_EQ(rpc::kBrokerVersionCrypto, 4);

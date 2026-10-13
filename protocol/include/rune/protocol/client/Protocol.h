@@ -161,6 +161,12 @@ enum class ErrorCode : uint16_t {
                                   // starts with the reserved "__" prefix (internal topics)
     ViewSourceIsView       = 41,  // CreateView: a source is another view's output (a view sink carries
                                   // no change events yet, so the view would stay empty; until Phase 3)
+    TransientLogFull       = 42,  // Produce / txn marker (Phase 2b E2): a TRANSIENT partition's in-memory
+                                  // ring is full of records not yet replicated (at/above the high
+                                  // watermark) — NOTHING was appended.  RETRIABLE on the SAME leader
+                                  // after a backoff, without a metadata refresh.  Answered only to
+                                  // clients >= kClientVersionTransientLogFull (6); older clients get
+                                  // NotLeader (their retriable code) — see produceErrorForClient.
 };
 
 // ---------------------------------------------------------------------------
@@ -187,11 +193,16 @@ enum class ErrorCode : uint16_t {
 //       with ProtocolVersion (which those clients already treat as
 //       non-retriable) instead of InvalidRequest / Internal (which they would
 //       re-join on, forever).
+//   6 — Phase 2b E2: understands ErrorCode::TransientLogFull (42) on
+//       ProduceResponse — retried after a backoff with the same identity and
+//       no metadata refresh.  A broker answers a session below 6 NotLeader
+//       instead (produceErrorForClient).
 // ---------------------------------------------------------------------------
 inline constexpr int32_t kClientVersionUnknownProducerId          = 2;
 inline constexpr int32_t kClientVersionExplicitGroupSubscriptions = 3;
 inline constexpr int32_t kClientVersionInvalidRequest             = 5;
-inline constexpr int32_t kClientVersion                           = 5;   // what this protocol's client announces
+inline constexpr int32_t kClientVersionTransientLogFull           = 6;
+inline constexpr int32_t kClientVersion                           = 6;   // what this protocol's client announces
 
 // ---------------------------------------------------------------------------
 // Broker versions (ConnectResponse.brokerVersion, an additive trailing field;
@@ -218,14 +229,23 @@ inline constexpr int32_t kBrokerVersion                           = 4;   // what
     return clientVersion >= kClientVersionUnknownProducerId;
 }
 
+/// True when a session that connected with `clientVersion` may be answered
+/// TransientLogFull (42) (else the broker answers NotLeader).
+[[nodiscard]] constexpr bool clientUnderstandsTransientLogFull(int32_t clientVersion) noexcept {
+    return clientVersion >= kClientVersionTransientLogFull;
+}
+
 /// The produce error code a session that connected with `clientVersion` is
 /// answered: UnknownProducerId becomes OutOfOrderSequence (the pre-D6 answer)
-/// for clients below kClientVersionUnknownProducerId; every other code passes
-/// through.  The ONE definition every broker answer site uses (review L4).
+/// for clients below kClientVersionUnknownProducerId, and TransientLogFull becomes
+/// NotLeader for clients below kClientVersionTransientLogFull; every other code
+/// passes through.  The ONE definition every broker answer site uses (review L4).
 [[nodiscard]] constexpr ErrorCode produceErrorForClient(ErrorCode ec, int32_t clientVersion) noexcept {
-    return (ec == ErrorCode::UnknownProducerId && !clientUnderstandsUnknownProducerId(clientVersion))
-               ? ErrorCode::OutOfOrderSequence
-               : ec;
+    if (ec == ErrorCode::UnknownProducerId && !clientUnderstandsUnknownProducerId(clientVersion)) [[unlikely]]
+        return ErrorCode::OutOfOrderSequence;
+    if (ec == ErrorCode::TransientLogFull && !clientUnderstandsTransientLogFull(clientVersion)) [[unlikely]]
+        return ErrorCode::NotLeader;   // Phase 2b E2: a pre-v6 client's retriable code
+    return ec;
 }
 
 } // namespace rune::protocol::client

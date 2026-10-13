@@ -1853,3 +1853,39 @@ TEST(DataMessagesRegression, SubscribeUnknownIsolationByteIsRejectedRegression) 
     buf[rpc::MessageHeader::ENCODED_SIZE + 17] = 2;   // isolation byte
     EXPECT_FALSE(rpc::Subscribe::decode(buf.data(), n).has_value());
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2b E2 (controller ruling 2): a TRANSIENT partition's ring full of
+// not-yet-replicated records answers the dedicated retriable TransientLogFull
+// (42) — never NotLeader (which makes a client refresh metadata on every
+// refusal).  Append-only wire constant; sessions below client version 6 are
+// answered NotLeader, their retriable code.
+// ---------------------------------------------------------------------------
+TEST(TransientLogFullRegression, CodeIsPinned) {
+    EXPECT_EQ(static_cast<uint16_t>(rune::protocol::client::ErrorCode::TransientLogFull), 42u);
+    EXPECT_EQ(rune::protocol::client::kClientVersionTransientLogFull, 6);
+    EXPECT_GE(rune::protocol::client::kClientVersion, rune::protocol::client::kClientVersionTransientLogFull);
+}
+
+TEST(TransientLogFullRegression, OldClientsAreAnsweredNotLeader) {
+    namespace rpc = rune::protocol::client;
+    EXPECT_EQ(rpc::produceErrorForClient(rpc::ErrorCode::TransientLogFull, 5), rpc::ErrorCode::NotLeader);
+    EXPECT_EQ(rpc::produceErrorForClient(rpc::ErrorCode::TransientLogFull, 1), rpc::ErrorCode::NotLeader);
+    EXPECT_EQ(rpc::produceErrorForClient(rpc::ErrorCode::TransientLogFull, 6), rpc::ErrorCode::TransientLogFull);
+    // The pre-existing gate is unchanged.
+    EXPECT_EQ(rpc::produceErrorForClient(rpc::ErrorCode::UnknownProducerId, 1), rpc::ErrorCode::OutOfOrderSequence);
+    EXPECT_EQ(rpc::produceErrorForClient(rpc::ErrorCode::UnknownProducerId, 6), rpc::ErrorCode::UnknownProducerId);
+
+    rpc::ProduceResponse r;
+    r.sessionId = 1; r.correlationId = 2; r.partition = 0; r.baseOffset = -1;
+    r.errorCode = static_cast<int16_t>(rpc::ErrorCode::TransientLogFull);
+    std::array<uint8_t, 64> buf{};
+    const std::size_t n5 = r.encodeFor(buf.data(), 5);
+    auto d5 = rpc::ProduceResponse::decode(buf.data(), n5);
+    ASSERT_TRUE(d5.has_value());
+    EXPECT_EQ(d5->errorCode, static_cast<int16_t>(rpc::ErrorCode::NotLeader)) << "a v5 client must never see 42";
+    const std::size_t n6 = r.encodeFor(buf.data(), 6);
+    auto d6 = rpc::ProduceResponse::decode(buf.data(), n6);
+    ASSERT_TRUE(d6.has_value());
+    EXPECT_EQ(d6->errorCode, 42);
+}

@@ -235,7 +235,7 @@ TEST(ViewMessagesRegression, ViewSourceIsViewCodeIsPinned) {
 TEST(ViewMessagesRegression, RowTooLargeStatusAndInvalidRequestClientGateArePinnedRegression) {
     EXPECT_EQ(static_cast<uint16_t>(ViewRowResponse::kRowTooLarge), 7u);
     EXPECT_EQ(kClientVersionInvalidRequest, 5);
-    EXPECT_EQ(kClientVersion, 5);
+    EXPECT_EQ(kClientVersion, 6);
     EXPECT_FALSE(clientUnderstandsInvalidRequest(4));
     EXPECT_TRUE(clientUnderstandsInvalidRequest(5));
 }
