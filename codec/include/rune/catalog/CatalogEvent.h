@@ -4,7 +4,7 @@
 // FROZEN: a change ships under a new formatVer, and old events keep decoding
 // and applying under their own rules (spec §6).
 //
-// formatVer-1 layout (all little-endian):
+// formatVer-1 layout (all little-endian, written and read byte-wise — host-endian independent):
 //   u16 formatVer | u16 kind | u64 objectId | u32 prevVersion | u32 newVersion |
 //   i64 timestampMs | u64 fingerprint |
 //   str16 objectName | str32 statement |
@@ -14,6 +14,7 @@
 //   u8 hasReplayedFrom [str16 clusterId, i64 offset, str16 principal] |
 //   bytes32 ops  = u8 opsTag (== kind) + the kind's body (see CatalogEvent.cpp)
 // str16 = u16 length + bytes; str32/bytes32 = u32 length + bytes.
+// Golden byte vectors for every kind pin this layout (tests/catalog/CatalogEventTest.cpp).
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/PrimType.h>
 #include <rune/protocol/CatalogTypes.h>
@@ -25,6 +26,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -84,10 +86,11 @@ struct CreateTopicOps {
     Persistence              persistence       = Persistence::Disk;
     TopicConfig              config;
     std::optional<SchemaDef> schema;                    // nullopt = untyped topic
+    bool operator==(const CreateTopicOps&) const = default;
 };
-struct DropTopicOps        { int32_t topicId = -1; };
-struct AlterTopicConfigOps { std::vector<ConfigChange> changes; };
-struct CreateSchemaOps     { SchemaDef schema; };
+struct DropTopicOps        { int32_t topicId = -1;                bool operator==(const DropTopicOps&) const = default; };
+struct AlterTopicConfigOps { std::vector<ConfigChange> changes;   bool operator==(const AlterTopicConfigOps&) const = default; };
+struct CreateSchemaOps     { SchemaDef schema;                    bool operator==(const CreateSchemaOps&) const = default; };
 /// One AlterSchema operation RESOLVED against the evolving descriptor (spec §4, F20):
 /// every field is named by its durable tag (FieldDescriptor::id), never by name.
 struct ResolvedAlterOp {
@@ -99,14 +102,37 @@ struct ResolvedAlterOp {
     rune::codec::CompatMode  mode     = rune::codec::CompatMode::Backward;     // SetCompatibility only
     bool operator==(const ResolvedAlterOp&) const = default;
 };
-struct AlterSchemaOps      { std::vector<ResolvedAlterOp> ops; };   // resolved (F20) — never encodeAlterOps names
-struct SetCompatibilityOps { rune::codec::CompatMode mode = rune::codec::CompatMode::Backward; };
-struct CreateViewOps       { ViewDef view; };
-struct AlterViewOps        { ViewDef view; };                          // a FRESH sink (ruling 4)
-struct DropViewOps         { int32_t viewTopicId = -1; };
+struct AlterSchemaOps {   // resolved (F20) — never encodeAlterOps names
+    std::vector<ResolvedAlterOp> ops;
+    bool operator==(const AlterSchemaOps&) const = default;
+};
+struct SetCompatibilityOps {
+    rune::codec::CompatMode mode = rune::codec::CompatMode::Backward;
+    bool operator==(const SetCompatibilityOps&) const = default;
+};
+struct CreateViewOps { ViewDef view;            bool operator==(const CreateViewOps&) const = default; };
+struct AlterViewOps  { ViewDef view;            bool operator==(const AlterViewOps&) const = default; };   // a FRESH sink (ruling 4)
+struct DropViewOps   { int32_t viewTopicId = -1; bool operator==(const DropViewOps&) const = default; };
 
+/// Alternative i is the body of EventKind i+1 — kindOf() relies on it (pinned below).
 using Ops = std::variant<CreateTopicOps, DropTopicOps, AlterTopicConfigOps, CreateSchemaOps,
                          AlterSchemaOps, SetCompatibilityOps, CreateViewOps, AlterViewOps, DropViewOps>;
+
+namespace detail {
+template <EventKind K, class T>
+inline constexpr bool kOpsAt = std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(K) - 1, Ops>, T>;
+}
+static_assert(std::variant_size_v<Ops> == 9, "one Ops alternative per EventKind 1..9");
+static_assert(detail::kOpsAt<EventKind::CreateTopic, CreateTopicOps> &&
+              detail::kOpsAt<EventKind::DropTopic, DropTopicOps> &&
+              detail::kOpsAt<EventKind::AlterTopicConfig, AlterTopicConfigOps> &&
+              detail::kOpsAt<EventKind::CreateSchema, CreateSchemaOps> &&
+              detail::kOpsAt<EventKind::AlterSchema, AlterSchemaOps> &&
+              detail::kOpsAt<EventKind::SetCompatibility, SetCompatibilityOps> &&
+              detail::kOpsAt<EventKind::CreateView, CreateViewOps> &&
+              detail::kOpsAt<EventKind::AlterView, AlterViewOps> &&
+              detail::kOpsAt<EventKind::DropView, DropViewOps>,
+              "Ops variant order must equal EventKind order (kindOf = index + 1)");
 
 /// Until authentication exists: session id, client name and source address.  Afterwards
 /// `authenticated` carries the principal (same field, no layout change).  `requestId` is
@@ -120,12 +146,14 @@ struct Principal {
     std::string authenticated;
     RequestId   requestId{};               // {0, 0} = none (a pre-v8 client)
     uint64_t    requestFingerprint = 0;
+    bool operator==(const Principal&) const = default;
 };
 /// Set only on events written by `rune catalog replay` (spec §7).
 struct ReplayedFrom {
     std::string clusterId;
     int64_t     offset = -1;
     std::string principal;
+    bool operator==(const ReplayedFrom&) const = default;
 };
 
 struct CatalogEvent {
@@ -141,10 +169,14 @@ struct CatalogEvent {
     std::optional<ReplayedFrom> replayedFrom;
     int64_t                     timestampMs = 0;   // informational; the OFFSET is the order
     uint64_t                    fingerprint = 0;   // of the object's resulting state
+    bool operator==(const CatalogEvent&) const = default;
 };
 
 enum class DecodeError : uint8_t {
     Truncated, UnknownFormatVer, ReservedKind, UnknownKind, KindOpsMismatch, BadEnum, TrailingBytes,
+    /// The process could not allocate the decoded event (std::bad_alloc).  Not a statement
+    /// about the bytes: every length is bounded by the input before anything is sized.
+    OutOfMemory,
 };
 
 /// Wire widths (formatVer 1): a str16 holds at most kMaxStr16Bytes, a str32/bytes32 (and the
@@ -153,25 +185,29 @@ inline constexpr std::size_t kMaxStr16Bytes = 0xFFFF;
 inline constexpr std::size_t kMaxStr32Bytes = 0xFFFF'FFFF;
 inline constexpr std::size_t kMaxListCount  = 0xFFFF;
 
-/// Why an event cannot be encoded.  Encoding never truncates a length or a count: any field
-/// over its wire width is refused, so no undecodable event is ever produced.
+/// Why an event cannot be encoded.  Encoding refuses EXACTLY what decoding refuses: the
+/// value rules (formatVer, kind, kind/ops agreement, every enum range) are one shared
+/// validation run by both directions, and no length or count is ever truncated — so no
+/// undecodable event is ever produced.
 enum class EncodeError : uint8_t {
     FieldTooLong,      // a string / blob (or the ops blob) exceeds its length prefix's width
     TooManyElements,   // a list exceeds its u16 count
+    UnknownFormatVer,  // formatVer != kFormatV1           (decode: UnknownFormatVer)
+    ReservedKind,      // kind in [32, 63]                  (decode: ReservedKind)
+    UnknownKind,       // kind not 1..9 and not reserved    (decode: UnknownKind)
+    KindOpsMismatch,   // kind != kindOf(ops)               (decode: KindOpsMismatch)
+    BadEnum,           // an enum field outside its range   (decode: BadEnum)
 };
 
 [[nodiscard]] EventKind kindOf(const Ops& ops) noexcept;
 /// Clears `out` and encodes into it, reusing its capacity.  On error `out` is left empty.
 [[nodiscard]] std::expected<void, EncodeError> encodeInto(const CatalogEvent& e, std::vector<uint8_t>& out);
 [[nodiscard]] std::expected<std::vector<uint8_t>, EncodeError> encode(const CatalogEvent& e);
+/// Bounds-checked decode of one formatVer-1 event; the same validation as encode, plus the
+/// byte-level refusals (Truncated, TrailingBytes, a bool byte other than 0/1 → BadEnum).
 [[nodiscard]] std::expected<CatalogEvent, DecodeError> decode(std::span<const uint8_t> bytes) noexcept;
 [[nodiscard]] std::string_view kindName(EventKind k) noexcept;
 [[nodiscard]] std::string_view decodeErrorName(DecodeError e) noexcept;
 [[nodiscard]] std::string_view encodeErrorName(EncodeError e) noexcept;
-
-namespace detail_testing {
-/// Encoded size of a CreateTopicOps body (no tag byte).  Test-only.
-[[nodiscard]] std::size_t createTopicOpsSize(const CreateTopicOps& o);
-}
 
 } // namespace rune::catalog

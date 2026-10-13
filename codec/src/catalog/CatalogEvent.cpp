@@ -2,6 +2,7 @@
 #include "Wire.h"
 
 #include <new>
+#include <optional>
 #include <type_traits>
 #include <utility>
 
@@ -14,6 +15,95 @@ using wire::Writer;
 static_assert(kMaxStr16Bytes == 0xFFFF && kMaxStr32Bytes == 0xFFFF'FFFF && kMaxListCount == 0xFFFF,
               "formatVer-1 wire widths are frozen: u16 / u32 length prefixes, u16 list counts");
 
+// ── THE validation (formatVer 1) ───────────────────────────────────────────
+// One set of value rules, run by BOTH directions: encodeInto refuses exactly what decode
+// refuses, so no event the decoder would reject can ever be appended to __catalog.
+// (Byte-level refusals — Truncated, TrailingBytes, a bool byte other than 0/1 — have no
+// in-memory counterpart: the encoder cannot produce them.)
+enum class Violation : uint8_t { UnknownFormatVer, ReservedKind, UnknownKind, KindOpsMismatch, BadEnum };
+
+constexpr bool validPersistence(Persistence p) noexcept { return static_cast<uint8_t>(p) <= 1; }
+constexpr bool validCleanupPolicy(uint8_t v) noexcept  { return v <= 2; }   // Delete, Compact, CompactDelete
+constexpr bool validDurability(uint8_t v) noexcept     { return v <= 1; }   // Majority, AllInSync
+constexpr bool validDurabilityTier(uint8_t v) noexcept { return v <= 2; }   // Leader, Majority, Strict
+constexpr bool validConfigKey(ConfigKey k) noexcept {
+    const auto v = static_cast<uint8_t>(k);
+    return v >= static_cast<uint8_t>(ConfigKey::RetentionMs) && v <= static_cast<uint8_t>(ConfigKey::MaxCompactionLagMs);
+}
+constexpr bool validAlterOpType(rune::codec::AlterOpType t) noexcept {
+    const auto v = static_cast<uint8_t>(t);
+    return v >= static_cast<uint8_t>(rune::codec::AlterOpType::Add) &&
+           v <= static_cast<uint8_t>(rune::codec::AlterOpType::SetCompatibility);
+}
+constexpr bool validPrimType(rune::codec::PrimType t) noexcept {
+    return static_cast<uint8_t>(t) <= static_cast<uint8_t>(rune::codec::PrimType::FixedStr);
+}
+constexpr bool validCompatMode(rune::codec::CompatMode m) noexcept {
+    return static_cast<uint8_t>(m) <= static_cast<uint8_t>(rune::codec::CompatMode::Forward);
+}
+
+std::optional<Violation> checkFormatVer(uint16_t v) noexcept {
+    if (v != kFormatV1) return Violation::UnknownFormatVer;
+    return std::nullopt;
+}
+std::optional<Violation> checkKind(uint16_t k) noexcept {
+    if (k >= kReservedKindFirst && k <= kReservedKindLast) return Violation::ReservedKind;
+    if (k < static_cast<uint16_t>(EventKind::CreateTopic) || k > static_cast<uint16_t>(EventKind::DropView))
+        return Violation::UnknownKind;
+    return std::nullopt;
+}
+bool validConfig(const TopicConfig& c) noexcept {
+    return validCleanupPolicy(c.cleanupPolicy) && validDurability(c.durability) && validDurabilityTier(c.durabilityTier);
+}
+bool validOps(const Ops& ops) noexcept {
+    return std::visit([](const auto& o) -> bool {
+        using T = std::decay_t<decltype(o)>;
+        if constexpr (std::is_same_v<T, CreateTopicOps>) {
+            return validPersistence(o.persistence) && validConfig(o.config);
+        } else if constexpr (std::is_same_v<T, AlterTopicConfigOps>) {
+            for (const auto& c : o.changes) if (!validConfigKey(c.key)) return false;
+            return true;
+        } else if constexpr (std::is_same_v<T, AlterSchemaOps>) {
+            for (const auto& a : o.ops)
+                if (!validAlterOpType(a.type) || !validPrimType(a.primType) || !validCompatMode(a.mode)) return false;
+            return true;
+        } else if constexpr (std::is_same_v<T, SetCompatibilityOps>) {
+            return validCompatMode(o.mode);
+        } else if constexpr (std::is_same_v<T, CreateViewOps> || std::is_same_v<T, AlterViewOps>) {
+            return validPersistence(o.view.persistence);
+        } else {   // DropTopicOps, CreateSchemaOps, DropViewOps: no enum fields
+            return true;
+        }
+    }, ops);
+}
+std::optional<Violation> validate(const CatalogEvent& e) noexcept {
+    if (auto v = checkFormatVer(e.formatVer)) return v;
+    if (auto v = checkKind(static_cast<uint16_t>(e.kind))) return v;
+    if (e.kind != kindOf(e.ops)) return Violation::KindOpsMismatch;
+    if (!validOps(e.ops)) return Violation::BadEnum;
+    return std::nullopt;
+}
+DecodeError asDecodeError(Violation v) noexcept {
+    switch (v) {
+    case Violation::UnknownFormatVer: return DecodeError::UnknownFormatVer;
+    case Violation::ReservedKind:     return DecodeError::ReservedKind;
+    case Violation::UnknownKind:      return DecodeError::UnknownKind;
+    case Violation::KindOpsMismatch:  return DecodeError::KindOpsMismatch;
+    case Violation::BadEnum:          return DecodeError::BadEnum;
+    }
+    return DecodeError::BadEnum;
+}
+EncodeError asEncodeError(Violation v) noexcept {
+    switch (v) {
+    case Violation::UnknownFormatVer: return EncodeError::UnknownFormatVer;
+    case Violation::ReservedKind:     return EncodeError::ReservedKind;
+    case Violation::UnknownKind:      return EncodeError::UnknownKind;
+    case Violation::KindOpsMismatch:  return EncodeError::KindOpsMismatch;
+    case Violation::BadEnum:          return EncodeError::BadEnum;
+    }
+    return EncodeError::BadEnum;
+}
+
 // ── body writers (frozen, formatVer 1) ─────────────────────────────────────
 void putConfig(Writer& w, const TopicConfig& c) {
     w.u8(c.cleanupPolicy); w.i64(c.retentionMs); w.i64(c.retentionBytes); w.i64(c.deleteRetentionMs);
@@ -25,7 +115,7 @@ void putSchema(Writer& w, const SchemaDef& s) {
     w.str16(s.keyField); w.u8(s.validate ? 1 : 0); w.bytes32(s.descriptorBlob); w.u16(s.nextTag);
 }
 void putView(Writer& w, const ViewDef& v) {
-    w.i32(v.viewTopicId); w.i32(v.sinkPartitions); w.u8(static_cast<uint8_t>(v.persistence));
+    w.i32(v.viewTopicId); w.i32(v.sinkPartitions); w.e8(v.persistence);
     w.str16(v.keyField);
     w.count16(v.sourceNames.size());
     for (const auto& n : v.sourceNames) w.str16(n);
@@ -37,24 +127,23 @@ void putOps(Writer& w, const Ops& ops) {
         using T = std::decay_t<decltype(o)>;
         if constexpr (std::is_same_v<T, CreateTopicOps>) {
             w.i32(o.topicId); w.i32(o.partitions); w.i16(o.replicationFactor);
-            w.u8(static_cast<uint8_t>(o.persistence)); putConfig(w, o.config);
+            w.e8(o.persistence); putConfig(w, o.config);
             w.u8(o.schema ? 1 : 0);
             if (o.schema) putSchema(w, *o.schema);
         } else if constexpr (std::is_same_v<T, DropTopicOps>) {
             w.i32(o.topicId);
         } else if constexpr (std::is_same_v<T, AlterTopicConfigOps>) {
             w.count16(o.changes.size());
-            for (const auto& c : o.changes) { w.u8(static_cast<uint8_t>(c.key)); w.i64(c.value); }
+            for (const auto& c : o.changes) { w.e8(c.key); w.i64(c.value); }
         } else if constexpr (std::is_same_v<T, CreateSchemaOps>) {
             putSchema(w, o.schema);
         } else if constexpr (std::is_same_v<T, AlterSchemaOps>) {
             w.count16(o.ops.size());
             for (const auto& a : o.ops) {   // u8 type, u16 tag, str16 name, u8 primType, u16 fixedLen, u8 mode
-                w.u8(static_cast<uint8_t>(a.type)); w.u16(a.tag); w.str16(a.name);
-                w.u8(static_cast<uint8_t>(a.primType)); w.u16(a.fixedLen); w.u8(static_cast<uint8_t>(a.mode));
+                w.e8(a.type); w.u16(a.tag); w.str16(a.name); w.e8(a.primType); w.u16(a.fixedLen); w.e8(a.mode);
             }
         } else if constexpr (std::is_same_v<T, SetCompatibilityOps>) {
-            w.u8(static_cast<uint8_t>(o.mode));
+            w.e8(o.mode);
         } else if constexpr (std::is_same_v<T, CreateViewOps> || std::is_same_v<T, AlterViewOps>) {
             putView(w, o.view);
         } else {   // DropViewOps
@@ -64,40 +153,35 @@ void putOps(Writer& w, const Ops& ops) {
 }
 
 // ── body readers ────────────────────────────────────────────────────────────
+// They only PARSE: enum bytes are loaded raw (Reader::e8) and judged afterwards by the
+// shared validate(); a bool byte must be 0 or 1 (getBool) — the one byte-level value rule.
 // The smallest encoding of one list element: a list's count is checked against the
 // remaining bytes with these BEFORE the list is sized (a corrupt count never allocates).
 constexpr std::size_t kMinSourceNameBytes      = 2;                  // str16 ""
 constexpr std::size_t kConfigChangeBytes       = 1 + 8;              // u8 key, i64 value
 constexpr std::size_t kMinResolvedAlterOpBytes = 1 + 2 + 2 + 1 + 2 + 1;   // type, tag, str16 "", prim, fixedLen, mode
-// Each returns Truncated / BadEnum explicitly; an enum byte is never cast unchecked.
-std::optional<DecodeError> getPersistence(Reader& r, Persistence& p) {
-    uint8_t b; if (!r.u8(b)) return DecodeError::Truncated;
-    if (b > 1) return DecodeError::BadEnum;
-    p = static_cast<Persistence>(b); return std::nullopt;
+
+std::optional<DecodeError> getBool(Reader& r, bool& b) {
+    uint8_t v; if (!r.u8(v)) return DecodeError::Truncated;
+    if (v > 1) return DecodeError::BadEnum;
+    b = v == 1; return std::nullopt;
 }
-std::optional<DecodeError> getConfig(Reader& r, TopicConfig& c) {
-    if (!r.u8(c.cleanupPolicy)) return DecodeError::Truncated;
-    if (c.cleanupPolicy > 2) return DecodeError::BadEnum;
-    if (!r.i64(c.retentionMs) || !r.i64(c.retentionBytes) || !r.i64(c.deleteRetentionMs) ||
-        !r.i32(c.minCleanableDirtyRatioPpm) || !r.i64(c.segmentRollBytes) || !r.i64(c.minCompactionLagMs) ||
-        !r.i64(c.maxCompactionLagMs) || !r.i64(c.retentionCheckMs) || !r.i64(c.fileDeleteDelayMs) ||
-        !r.u8(c.durability) || !r.u8(c.durabilityTier) || !r.str16(c.coPartitionGroup) || !r.str16(c.partitionKey))
-        return DecodeError::Truncated;
-    if (c.durability > 1 || c.durabilityTier > 2) return DecodeError::BadEnum;
-    return std::nullopt;
+bool getConfig(Reader& r, TopicConfig& c) {
+    return r.u8(c.cleanupPolicy) && r.i64(c.retentionMs) && r.i64(c.retentionBytes) && r.i64(c.deleteRetentionMs) &&
+           r.i32(c.minCleanableDirtyRatioPpm) && r.i64(c.segmentRollBytes) && r.i64(c.minCompactionLagMs) &&
+           r.i64(c.maxCompactionLagMs) && r.i64(c.retentionCheckMs) && r.i64(c.fileDeleteDelayMs) &&
+           r.u8(c.durability) && r.u8(c.durabilityTier) && r.str16(c.coPartitionGroup) && r.str16(c.partitionKey);
 }
 std::optional<DecodeError> getSchema(Reader& r, SchemaDef& s) {
-    uint8_t v;
-    if (!r.str16(s.keyField) || !r.u8(v) || !r.bytes32(s.descriptorBlob) || !r.u16(s.nextTag))
-        return DecodeError::Truncated;
-    if (v > 1) return DecodeError::BadEnum;
-    s.validate = v == 1; return std::nullopt;
+    if (!r.str16(s.keyField)) return DecodeError::Truncated;
+    if (auto e = getBool(r, s.validate)) return e;
+    if (!r.bytes32(s.descriptorBlob) || !r.u16(s.nextTag)) return DecodeError::Truncated;
+    return std::nullopt;
 }
 std::optional<DecodeError> getView(Reader& r, ViewDef& v) {
-    if (!r.i32(v.viewTopicId) || !r.i32(v.sinkPartitions)) return DecodeError::Truncated;
-    if (auto e = getPersistence(r, v.persistence)) return e;
     uint16_t n;
-    if (!r.str16(v.keyField) || !r.u16(n)) return DecodeError::Truncated;
+    if (!r.i32(v.viewTopicId) || !r.i32(v.sinkPartitions) || !r.e8(v.persistence) || !r.str16(v.keyField) || !r.u16(n))
+        return DecodeError::Truncated;
     if (!r.canHold(n, kMinSourceNameBytes)) return DecodeError::Truncated;
     v.sourceNames.resize(n);
     for (auto& s : v.sourceNames) if (!r.str16(s)) return DecodeError::Truncated;
@@ -111,12 +195,11 @@ std::expected<Ops, DecodeError> getOps(Reader& r, EventKind kind) {
     switch (kind) {
     case EventKind::CreateTopic: {
         CreateTopicOps o;
-        if (!r.i32(o.topicId) || !r.i32(o.partitions) || !r.i16(o.replicationFactor))
+        if (!r.i32(o.topicId) || !r.i32(o.partitions) || !r.i16(o.replicationFactor) || !r.e8(o.persistence) ||
+            !getConfig(r, o.config))
             return std::unexpected(DecodeError::Truncated);
-        if (auto e = getPersistence(r, o.persistence)) return std::unexpected(*e);
-        if (auto e = getConfig(r, o.config)) return std::unexpected(*e);
-        uint8_t has; if (!r.u8(has)) return std::unexpected(DecodeError::Truncated);
-        if (has > 1) return std::unexpected(DecodeError::BadEnum);
+        bool has = false;
+        if (auto e = getBool(r, has)) return std::unexpected(*e);
         if (has) { SchemaDef s; if (auto e = getSchema(r, s)) return std::unexpected(*e); o.schema = std::move(s); }
         return o;
     }
@@ -125,11 +208,7 @@ std::expected<Ops, DecodeError> getOps(Reader& r, EventKind kind) {
         AlterTopicConfigOps o; uint16_t n; if (!r.u16(n)) return std::unexpected(DecodeError::Truncated);
         if (!r.canHold(n, kConfigChangeBytes)) return std::unexpected(DecodeError::Truncated);
         o.changes.resize(n);
-        for (auto& c : o.changes) {
-            uint8_t k; if (!r.u8(k) || !r.i64(c.value)) return std::unexpected(DecodeError::Truncated);
-            if (k < 1 || k > 6) return std::unexpected(DecodeError::BadEnum);
-            c.key = static_cast<ConfigKey>(k);
-        }
+        for (auto& c : o.changes) if (!r.e8(c.key) || !r.i64(c.value)) return std::unexpected(DecodeError::Truncated);
         return o;
     }
     case EventKind::CreateSchema: { CreateSchemaOps o; if (auto e = getSchema(r, o.schema)) return std::unexpected(*e); return o; }
@@ -137,37 +216,30 @@ std::expected<Ops, DecodeError> getOps(Reader& r, EventKind kind) {
         AlterSchemaOps o; uint16_t n; if (!r.u16(n)) return std::unexpected(DecodeError::Truncated);
         if (!r.canHold(n, kMinResolvedAlterOpBytes)) return std::unexpected(DecodeError::Truncated);
         o.ops.resize(n);
-        for (auto& a : o.ops) {
-            uint8_t t, pt, m;
-            if (!r.u8(t) || !r.u16(a.tag) || !r.str16(a.name) || !r.u8(pt) || !r.u16(a.fixedLen) || !r.u8(m))
+        for (auto& a : o.ops)
+            if (!r.e8(a.type) || !r.u16(a.tag) || !r.str16(a.name) || !r.e8(a.primType) || !r.u16(a.fixedLen) || !r.e8(a.mode))
                 return std::unexpected(DecodeError::Truncated);
-            if (t < 1 || t > 4 || pt > static_cast<uint8_t>(rune::codec::PrimType::FixedStr) || m > 1)
-                return std::unexpected(DecodeError::BadEnum);
-            a.type = static_cast<rune::codec::AlterOpType>(t); a.primType = static_cast<rune::codec::PrimType>(pt);
-            a.mode = static_cast<rune::codec::CompatMode>(m);
-        }
         return o;
     }
     case EventKind::SetCompatibility: {
-        uint8_t m; if (!r.u8(m)) return std::unexpected(DecodeError::Truncated);
-        if (m > 1) return std::unexpected(DecodeError::BadEnum);
-        return SetCompatibilityOps{static_cast<rune::codec::CompatMode>(m)};
+        SetCompatibilityOps o; if (!r.e8(o.mode)) return std::unexpected(DecodeError::Truncated); return o;
     }
     case EventKind::CreateView: { CreateViewOps o; if (auto e = getView(r, o.view)) return std::unexpected(*e); return o; }
     case EventKind::AlterView:  { AlterViewOps o;  if (auto e = getView(r, o.view)) return std::unexpected(*e); return o; }
     case EventKind::DropView:   { DropViewOps o; if (!r.i32(o.viewTopicId)) return std::unexpected(DecodeError::Truncated); return o; }
     }
-    return std::unexpected(DecodeError::UnknownKind);
+    return std::unexpected(DecodeError::UnknownKind);   // unreachable: the kind was validated first
 }
 
 } // namespace
 
 EventKind kindOf(const Ops& ops) noexcept {
-    return static_cast<EventKind>(ops.index() + 1);   // variant order == kind order (1..9)
+    return static_cast<EventKind>(ops.index() + 1);   // variant order == kind order (static_asserts in the header)
 }
 
 std::expected<void, EncodeError> encodeInto(const CatalogEvent& e, std::vector<uint8_t>& out) {
     out.clear();
+    if (auto v = validate(e)) return std::unexpected(asEncodeError(*v));   // the decoder's own rules
     Writer w(out);
     w.u16(e.formatVer); w.u16(static_cast<uint16_t>(e.kind)); w.u64(e.objectId);
     w.u32(e.prevVersion); w.u32(e.newVersion); w.i64(e.timestampMs); w.u64(e.fingerprint);
@@ -199,11 +271,12 @@ std::expected<CatalogEvent, DecodeError> decode(std::span<const uint8_t> bytes) 
         Reader r(bytes);
         CatalogEvent e;
         uint16_t kind;
+        // formatVer and kind decide how the rest is parsed, so they are judged (by the
+        // shared rules) before anything else is read.
         if (!r.u16(e.formatVer)) return std::unexpected(DecodeError::Truncated);
-        if (e.formatVer != kFormatV1) return std::unexpected(DecodeError::UnknownFormatVer);
+        if (auto v = checkFormatVer(e.formatVer)) return std::unexpected(asDecodeError(*v));
         if (!r.u16(kind)) return std::unexpected(DecodeError::Truncated);
-        if (kind >= kReservedKindFirst && kind <= kReservedKindLast) return std::unexpected(DecodeError::ReservedKind);
-        if (kind < 1 || kind > 9) return std::unexpected(DecodeError::UnknownKind);
+        if (auto v = checkKind(kind)) return std::unexpected(asDecodeError(*v));
         e.kind = static_cast<EventKind>(kind);
         if (!r.u64(e.objectId) || !r.u32(e.prevVersion) || !r.u32(e.newVersion) || !r.i64(e.timestampMs) ||
             !r.u64(e.fingerprint) || !r.str16(e.objectName) || !r.str32(e.statement) ||
@@ -211,8 +284,8 @@ std::expected<CatalogEvent, DecodeError> decode(std::span<const uint8_t> bytes) 
             !r.str16(e.principal.sourceAddress) || !r.str16(e.principal.authenticated) ||
             !r.u64(e.principal.requestId.hi) || !r.u64(e.principal.requestId.lo) || !r.u64(e.principal.requestFingerprint))
             return std::unexpected(DecodeError::Truncated);
-        uint8_t hasReplay; if (!r.u8(hasReplay)) return std::unexpected(DecodeError::Truncated);
-        if (hasReplay > 1) return std::unexpected(DecodeError::BadEnum);
+        bool hasReplay = false;
+        if (auto err = getBool(r, hasReplay)) return std::unexpected(*err);
         if (hasReplay) {
             ReplayedFrom rf;
             if (!r.str16(rf.clusterId) || !r.i64(rf.offset) || !r.str16(rf.principal)) return std::unexpected(DecodeError::Truncated);
@@ -224,9 +297,12 @@ std::expected<CatalogEvent, DecodeError> decode(std::span<const uint8_t> bytes) 
         if (!o) return std::unexpected(o.error());
         if (ops.rem() != 0 || r.rem() != 0) return std::unexpected(DecodeError::TrailingBytes);
         e.ops = std::move(*o);
+        if (auto v = validate(e)) return std::unexpected(asDecodeError(*v));   // the encoder's own rules
         return e;
     } catch (const std::bad_alloc&) {
-        return std::unexpected(DecodeError::Truncated);   // a length the process cannot hold is never trusted
+        // Every length is bounded by the input before anything is sized, so this is the
+        // process running out of memory — reported as such, never as corrupt bytes.
+        return std::unexpected(DecodeError::OutOfMemory);
     }
 }
 
@@ -245,7 +321,7 @@ std::string_view decodeErrorName(DecodeError e) noexcept {
     case DecodeError::Truncated: return "Truncated"; case DecodeError::UnknownFormatVer: return "UnknownFormatVer";
     case DecodeError::ReservedKind: return "ReservedKind"; case DecodeError::UnknownKind: return "UnknownKind";
     case DecodeError::KindOpsMismatch: return "KindOpsMismatch"; case DecodeError::BadEnum: return "BadEnum";
-    case DecodeError::TrailingBytes: return "TrailingBytes";
+    case DecodeError::TrailingBytes: return "TrailingBytes"; case DecodeError::OutOfMemory: return "OutOfMemory";
     }
     return "?";
 }
@@ -253,14 +329,11 @@ std::string_view decodeErrorName(DecodeError e) noexcept {
 std::string_view encodeErrorName(EncodeError e) noexcept {
     switch (e) {
     case EncodeError::FieldTooLong: return "FieldTooLong"; case EncodeError::TooManyElements: return "TooManyElements";
+    case EncodeError::UnknownFormatVer: return "UnknownFormatVer"; case EncodeError::ReservedKind: return "ReservedKind";
+    case EncodeError::UnknownKind: return "UnknownKind"; case EncodeError::KindOpsMismatch: return "KindOpsMismatch";
+    case EncodeError::BadEnum: return "BadEnum";
     }
     return "?";
-}
-
-namespace detail_testing {
-std::size_t createTopicOpsSize(const CreateTopicOps& o) {
-    std::vector<uint8_t> b; Writer w(b); putOps(w, Ops{o}); return b.size() - 1;
-}
 }
 
 } // namespace rune::catalog
