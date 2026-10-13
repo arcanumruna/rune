@@ -17,8 +17,12 @@
 #include <rune/protocol/client/DataMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune/replication/ReplicationMessages.h>
 #include <rune/storage/InMemoryLog.h>
 #include <rune/transaction/ControlMarker.h>
+
+#include <rune_protocol_internal_sbe/MessageHeader.h>
+#include <rune_protocol_internal_sbe/WorkerOp.h>
 
 #include <gtest/gtest.h>
 
@@ -177,6 +181,31 @@ struct Rig {
         buf.resize(s.encode(buf.data()));
         gw.applySubscribeForTest(buf.data(), buf.size());
     }
+    // ---- Remote (cluster-plane) txn markers: a peer coordinator's WriteTxnMarker ----
+    std::vector<std::pair<int32_t, rune::replication::WriteTxnMarkerResponseMsg>> markerAnswers;   // (origin, answer)
+    std::vector<uint8_t> markerBytes = rune::transaction::ControlMarker::build(7, 0,
+                                                                              rune::transaction::ControlType::Commit, 0);
+    static bool captureMarkerAnswer(void* self, int32_t to, const rune::replication::WriteTxnMarkerResponseMsg& a) {
+        static_cast<Rig*>(self)->markerAnswers.emplace_back(to, a);
+        return true;
+    }
+    void captureMarkerAnswers() {
+        gw.setTxnMarkerChannel({.sendMarker = nullptr, .sendResponse = &Rig::captureMarkerAnswer, .ctx = this});
+    }
+    /// A WriteTxnMarker from coordinator node 9 for presence/0 (producer 7, COMMIT).
+    rune::replication::WriteTxnMarkerMsg remoteMarker(int64_t token) const {
+        rune::replication::WriteTxnMarkerMsg m{};
+        m.coordinatorNodeId = 9; m.coordinatorEpoch = 0; m.token = token; m.topicId = 0; m.partition = 0;
+        m.producerId = 7; m.commit = 1; m.leaderEpoch = 1;   // the rig replica's leader epoch
+        m.marker = std::span<const uint8_t>(markerBytes);
+        return m;
+    }
+    /// Pass cycles until `n` marker answers arrived (bounded — never a hang).
+    bool answersUntil(std::size_t n) {
+        for (int i = 0; i < 64 && markerAnswers.size() < n; ++i) pass();
+        return markerAnswers.size() >= n;
+    }
+
     /// Push cycles (PushRead → worker → PushReadResult → Records) until n frames (bounded).
     bool pushUntil(std::size_t n) {
         for (int i = 0; i < 64 && records.size() < n; ++i) { gw.pushSubscriptionsForTest(); pass(); }
@@ -344,4 +373,119 @@ TEST(TransientGateway, WithoutAWorkerPoolTransientIsRefusedNeverInline) {
     ASSERT_TRUE(r.subscribed.count(9));
     EXPECT_EQ(r.subscribed[9].errorCode, kUnknownPartition);
     EXPECT_EQ(r.gw.addGroupSubscription(sid, 0, 0, 0, 0, false), -1);
+}
+
+// ---------------------------------------------------------------------------
+// Fix round 1: the cluster-plane entry appendRemoteControlRecord (a PEER
+// coordinator's WriteTxnMarker for a transient partition this node leads).
+// ---------------------------------------------------------------------------
+
+// (a) With a worker pool the remote marker is routed to the owning worker on the
+// op ring with NO disk Log (logPtr == nullptr: the worker appends to the replica's
+// ring) — and, run through the worker, it lands and is answered to the origin.
+TEST(TransientGatewayRegression, RemoteMarkerForATransientPartitionIsRoutedToTheWorkerRegression) {
+    namespace sbe = rune::protocol::internal::sbe;
+    {
+        Rig r;
+        r.captureMarkerAnswers();
+        r.gw.appendRemoteControlRecord(r.remoteMarker(5001));
+        EXPECT_EQ(r.gw.remoteMarkersInFlightForTest(), 0u) << "a leader-side marker is not a coordinator-side remote one";
+        EXPECT_EQ(r.gw.markersInFlightForTest(), 1u) << "the remote marker was not taken";
+        EXPECT_TRUE(r.markerAnswers.empty()) << "answered before the worker appended";
+        // Read the op the gateway put on worker 0's op ring (this test is its consumer).
+        int ops = 0;
+        uint64_t logPtr = ~0ull, replica = 0;
+        int opType = -1;
+        (void)r.pool->worker(0).opRingForDoorbell().drain(
+            [&](int32_t, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off, aeron::util::index_t len) {
+                char* cbuf = reinterpret_cast<char*>(buf.buffer()) + off;
+                sbe::MessageHeader mh;
+                mh.wrap(cbuf, 0, 0, static_cast<uint64_t>(len));
+                sbe::WorkerOp op;
+                op.wrapForDecode(cbuf, sbe::MessageHeader::encodedLength(), mh.blockLength(), mh.version(),
+                                 static_cast<uint64_t>(len));
+                ++ops;
+                opType  = static_cast<int>(static_cast<uint8_t>(op.opType()));
+                logPtr  = op.logPtr();
+                replica = op.replica();
+            }, 16);
+        ASSERT_EQ(ops, 1);
+        EXPECT_EQ(opType, static_cast<int>(rune::node::WorkerOp::Type::AppendControlRecord));
+        EXPECT_EQ(logPtr, 0u) << "a transient marker op carried a disk Log*";
+        EXPECT_EQ(replica, reinterpret_cast<uint64_t>(r.rep)) << "not stamped with the owning replica";
+    }
+    {
+        Rig r;
+        r.captureMarkerAnswers();
+        r.gw.appendRemoteControlRecord(r.remoteMarker(5002));
+        ASSERT_TRUE(r.answersUntil(1)) << "the origin coordinator was never answered (hang)";
+        EXPECT_EQ(r.markerAnswers[0].first, 9);
+        EXPECT_EQ(r.markerAnswers[0].second.token, 5002);
+        EXPECT_EQ(r.markerAnswers[0].second.errorCode, kOk);
+        EXPECT_EQ(r.markerAnswers[0].second.offset, 0);
+        EXPECT_EQ(r.mem.logEndOffset(), 1) << "the owning worker appended the marker to the ring";
+        EXPECT_EQ(r.gw.markersInFlightForTest(), 0u);
+    }
+}
+
+// (b) Without a worker pool nothing may append to a worker-owned ring: the
+// origin is answered NotLeader (retriable; offset -1), nothing appended.
+TEST(TransientGatewayRegression, RemoteMarkerForATransientPartitionWithoutAPoolAnswersNotLeaderRegression) {
+    Rig r({.workers = false});
+    r.captureMarkerAnswers();
+    r.gw.appendRemoteControlRecord(r.remoteMarker(5003));
+    ASSERT_EQ(r.markerAnswers.size(), 1u) << "the origin coordinator was never answered (hang)";
+    EXPECT_EQ(r.markerAnswers[0].first, 9);
+    EXPECT_EQ(r.markerAnswers[0].second.token, 5003);
+    EXPECT_EQ(r.markerAnswers[0].second.errorCode, kNotLeader);
+    EXPECT_EQ(r.markerAnswers[0].second.offset, -1);
+    EXPECT_EQ(r.mem.logEndOffset(), 0);
+    EXPECT_EQ(r.gw.markersInFlightForTest(), 0u);
+}
+
+// (c) C1: an UNCOMMITTED runtime transient topic takes no remote marker —
+// NotLeader to the origin (it re-resolves), nothing appended; once committed
+// the coordinator's re-sent copy (same token) lands.
+TEST(TransientGatewayRegression, RemoteMarkerForAnUncommittedTransientTopicAnswersNotLeaderRegression) {
+    Rig r({.workers = true, .runtime = true});
+    r.captureMarkerAnswers();
+    r.gw.appendRemoteControlRecord(r.remoteMarker(5004));
+    ASSERT_EQ(r.markerAnswers.size(), 1u) << "the origin coordinator was never answered (hang)";
+    EXPECT_EQ(r.markerAnswers[0].second.token, 5004);
+    EXPECT_EQ(r.markerAnswers[0].second.errorCode, kNotLeader);
+    EXPECT_EQ(r.markerAnswers[0].second.offset, -1);
+    EXPECT_EQ(r.gw.markersInFlightForTest(), 0u) << "an uncommitted topic took a marker";
+
+    r.commit();
+    r.gw.appendRemoteControlRecord(r.remoteMarker(5004));   // the coordinator's retry
+    ASSERT_TRUE(r.answersUntil(2));
+    EXPECT_EQ(r.markerAnswers[1].second.token, 5004);
+    EXPECT_EQ(r.markerAnswers[1].second.errorCode, kOk) << "the committed topic must take the retried marker";
+    EXPECT_EQ(r.markerAnswers[1].second.offset, 0);
+    EXPECT_EQ(r.mem.logEndOffset(), 1);
+}
+
+// (d) Idempotence: a re-sent copy of the same token — while in flight and after
+// it was answered — is never appended to the ring again; the answered copy is
+// re-answered with the original outcome.
+TEST(TransientGatewayRegression, ResentRemoteMarkerForATransientPartitionIsAppendedOnceRegression) {
+    Rig r;
+    r.captureMarkerAnswers();
+    const auto m = r.remoteMarker(5005);
+    r.gw.appendRemoteControlRecord(m);
+    r.gw.appendRemoteControlRecord(m);                       // copy while the first is in flight
+    EXPECT_EQ(r.gw.markersInFlightForTest(), 1u) << "the in-flight copy was routed again";
+    ASSERT_TRUE(r.answersUntil(1));
+    for (int i = 0; i < 8; ++i) r.pass();
+    ASSERT_EQ(r.markerAnswers.size(), 1u) << "one answer for the in-flight pair";
+    EXPECT_EQ(r.markerAnswers[0].second.errorCode, kOk);
+    EXPECT_EQ(r.mem.logEndOffset(), 1);
+
+    r.gw.appendRemoteControlRecord(m);                       // copy after the answer
+    for (int i = 0; i < 8; ++i) r.pass();
+    EXPECT_EQ(r.mem.logEndOffset(), 1) << "the answered copy was appended again";
+    ASSERT_EQ(r.markerAnswers.size(), 2u) << "the answered copy was not re-answered";
+    EXPECT_EQ(r.markerAnswers[1].second.token, 5005);
+    EXPECT_EQ(r.markerAnswers[1].second.errorCode, kOk);
+    EXPECT_EQ(r.markerAnswers[1].second.offset, 0) << "re-answered with another outcome";
 }
