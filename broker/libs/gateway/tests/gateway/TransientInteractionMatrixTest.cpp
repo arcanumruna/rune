@@ -349,6 +349,7 @@ struct Rig {
     [[nodiscard]] int64_t hw() const { return replica().highWatermark(); }
     [[nodiscard]] int64_t ringStart() const { return mem->logStartOffset(); }
     [[nodiscard]] uint64_t skipped() { return pool->worker(0).transientRecordsSkippedForTest(); }
+    [[nodiscard]] uint64_t freshRaised() { return pool->worker(0).transientFreshCursorsRaisedForTest(); }
 };
 
 /// One more batch (2 records at `base`) replicated into a FOLLOWER replica; HW = its end.
@@ -654,6 +655,7 @@ struct Driver {
                 EXPECT_EQ(r->transport.lastRecordsBytes, 0u);
             }
             const uint64_t skippedBefore = r->skipped();
+            const uint64_t freshBefore   = r->freshRaised();
             const auto [code, subId] = openRead(r->topic());
             ASSERT_EQ(code, kOk);
             const int64_t start = r->ringStart();
@@ -661,8 +663,15 @@ struct Driver {
             ASSERT_FALSE(got.empty()) << "a cursor below the ring start stalled";
             EXPECT_EQ(got.front(), start) << "did not resume at the ring start";
             EXPECT_EQ(got, expectedBases(hist, start, r->hw()));
-            EXPECT_EQ(r->skipped() - skippedBefore, static_cast<uint64_t>(start - resolvedStart(r->hw())))
-                << "skipped records were not counted exactly";
+            // E2 final fix wave (M2): a subscription opened BELOW the ring start
+            // (Earliest resolves to 0, a low explicit offset) never fell behind:
+            // it is raised to the ring start as a fresh cursor, never counted /
+            // warned as evicted-unread records (consumer lag).
+            if (start > resolvedStart(r->hw())) {
+                EXPECT_EQ(r->skipped() - skippedBefore, 0u)
+                    << "a subscribe below the ring start was counted as a reader that fell behind";
+                EXPECT_GE(r->freshRaised() - freshBefore, 1u) << "the fresh cursor raise was not counted";
+            }
             return;
         }
 

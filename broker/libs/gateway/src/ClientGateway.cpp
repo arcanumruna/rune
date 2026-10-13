@@ -4870,6 +4870,7 @@ void ClientGateway::pushSubscriptionsPass_()
             op.hwBound             = bound;
             op.isolation           = sub.isolation;
             op.isGroup             = sub.isGroup;
+            op.freshCursor         = sub.cursorFresh;   // M2
             op.groupCarrierReceived = sub.groupCarrierReceived;
 
             if (!workerPool_->tryEnqueueOp(sub.topicId, sub.partition, std::move(op))) {
@@ -5847,6 +5848,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             // A result for a cursor the subscription no longer holds (rewound /
             // re-seeded meanwhile) carries nothing to adopt.
             const bool current = sub.nextOffset == sub.issuedNextOffset;
+            if (current) sub.cursorFresh = false;   // M2: the worker's answer is the cursor from now on
 
             if (ret.chunkBytes().empty()) {
                 // F15 addendum R-1: the worker may have consumed batches without

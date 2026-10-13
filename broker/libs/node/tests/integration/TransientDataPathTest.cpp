@@ -157,6 +157,33 @@ TEST(TransientDataPathRegression, PushReadBelowRingStartResumesAtRingStartRegres
     EXPECT_EQ(rig.worker().transientRecordsSkippedForTest(), static_cast<uint64_t>(start));
 }
 
+// E2 final fix wave (final review M2): the gateway resolves Earliest to 0 for a
+// transient partition, so every Earliest / low-offset subscribe on a ring that
+// evicted anything used to be counted as `start - 0` evicted-unread records
+// and warned as "a reader fell behind its ring" — consumer lag that never
+// happened.  A PushRead carrying the gateway's FRESH bind-time cursor (bit 2 of
+// the op's flag byte, through the real ring encode/decode) is raised to the
+// ring start and counted apart; a non-fresh one (a cursor from a delivery)
+// keeps the lag count.  RED (before M2): the fresh read counted `start`
+// records skipped.
+TEST(TransientDataPathRegression, FreshCursorBelowTheRingStartIsNotCountedAsLagRegression) {
+    Rig rig(/*ringBytes=*/8 * 1024, /*maxBatches=*/1000);
+    for (int i = 0; i < 20; ++i) ASSERT_EQ(rig.produce(batchOf(1, 1000), 0), kOk);
+    const int64_t start = rig.mem.logStartOffset();
+    ASSERT_GT(start, 0) << "precondition: the ring evicted committed records (retention)";
+    const auto r = rig.readOnce(11, /*from=*/0, /*isolation=*/0, /*fresh=*/true);   // subscribed Earliest
+    ASSERT_TRUE(r.has_value());
+    ASSERT_FALSE(r->chunk.empty()) << "a fresh cursor below the ring start stalled";
+    EXPECT_EQ(rune::protocol::RecordBatchReader(r->chunk.data(), r->chunk.size()).baseOffset(), start);
+    EXPECT_EQ(rig.worker().transientCursorSkipsForTest(), 0u) << "a subscribe below the ring start counted as lag";
+    EXPECT_EQ(rig.worker().transientRecordsSkippedForTest(), 0u);
+    EXPECT_EQ(rig.worker().transientFreshCursorsRaisedForTest(), 1u);
+    // The same cursor from a delivery (not fresh) is lag: counted as before.
+    ASSERT_TRUE(rig.readOnce(12, /*from=*/0).has_value());
+    EXPECT_EQ(rig.worker().transientCursorSkipsForTest(), 1u);
+    EXPECT_EQ(rig.worker().transientRecordsSkippedForTest(), static_cast<uint64_t>(start));
+}
+
 TEST(TransientDataPathRegression, ReadCommittedHoldsTheOpenTransactionUntilItsCommitRegression) {
     Rig rig;
     constexpr int64_t kPid = 7;

@@ -1249,6 +1249,11 @@ private:
         // — keyed by the replica registry's generation (any add / remove) and
         // the catalog's — never re-probed every push cycle.  transientReplica
         // is valid only while both generations still match (checked first).
+        // E2 final fix wave (M2): the cursor is still the bind-time resolved
+        // start (no worker answer adopted yet) — sent with every PushRead
+        // (WorkerOp::freshCursor) so a transient ring start above it is not
+        // counted / warned as a reader that fell behind.
+        bool cursorFresh = true;
         const rune::replication::PartitionReplica* transientReplica = nullptr;
         uint64_t transientClassRegGen = UINT64_MAX;
         uint64_t transientClassCatGen = UINT64_MAX;

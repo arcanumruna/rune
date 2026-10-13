@@ -826,6 +826,10 @@ public:
         /// F15 S4: the partition's RC state (this worker's), re-resolved on every
         /// ownership apply and Subscribe — null when not owned / internal.
         RcState* rc = nullptr;
+        /// E2 final fix wave (M2): the cursor is still the bind-time resolved
+        /// start (no push pass has served it yet) — a transient ring start above
+        /// it is not a reader that fell behind (see skipEvictedCursor_).
+        bool cursorFresh = true;
     };
 
     // -----------------------------------------------------------------------
@@ -1171,7 +1175,8 @@ public:
            .recordCount(op.recordCount)
            .batchAttrs(op.batchAttrs)
            .deferAck(static_cast<std::uint8_t>((op.deferAck ? kOpFlagDeferAck : 0u) |
-                                               (op.crcValidated ? kOpFlagCrcValidated : 0u)))
+                                               (op.crcValidated ? kOpFlagCrcValidated : 0u) |
+                                               (op.freshCursor ? kOpFlagFreshCursor : 0u)))
            .durabilityTier(wireDurabilityTier)
            .enqueuedAtNs(op.enqueuedAtNs)
            .subscriptionId(op.subscriptionId)
@@ -2583,6 +2588,7 @@ private:
                 s.incarnation          = op.incarnation();
                 s.active               = true;   // re-subscribe (passed the guard) re-activates
                 s.rc                   = rcOf_(subReplica_(s));
+                s.cursorFresh          = true;   // M2: a requested cursor again (rewind / re-seed)
                 return;
             }
         }
@@ -2862,7 +2868,10 @@ private:
             rune::storage::InMemoryLog* const mem =
                 (s.logPtr == nullptr && rep != nullptr) ? rep->memoryLog() : nullptr;
             if (s.logPtr == nullptr && mem == nullptr) continue;
-            if (mem != nullptr) s.nextOffset = skipEvictedCursor_(*mem, s.nextOffset);   // TRANSIENT_EVICTED
+            if (mem != nullptr) {   // TRANSIENT_EVICTED
+                s.nextOffset  = skipEvictedCursor_(*mem, s.nextOffset, s.cursorFresh);
+                s.cursorFresh = false;   // from now on the cursor is this push's own: a later skip is lag
+            }
             int64_t bound = rep ? rep->highWatermark()
                                 : s.logPtr->logEndOffset();
             const RcState* rc = nullptr;
@@ -3212,6 +3221,7 @@ private:
         bool    carrier        = true;
         uint32_t targetReplicaId = 0;
         uint32_t incarnation     = 0;
+        bool     freshCursor     = false;   ///< E2 M2: the gateway's bind-time cursor (kOpFlagFreshCursor)
         rune::replication::PartitionReplica* replica = nullptr;
         rune::storage::Log*                  logPtr  = nullptr;
     };
@@ -3229,6 +3239,7 @@ private:
         a.isolation       = op.isolation();
         a.isGroup         = op.isGroup() != 0;
         a.carrier         = op.groupCarrierReceived() != 0;
+        a.freshCursor     = (op.deferAck() & kOpFlagFreshCursor) != 0;   // the wire flag byte (M2)
         a.targetReplicaId = op.targetReplicaId();
         a.incarnation     = op.incarnation();
         a.replica         = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
@@ -3246,7 +3257,7 @@ private:
         // serveHeldPushReads_) — never a ring this worker does not own.
         rune::storage::InMemoryLog* const mem =
             (log == nullptr && a.replica != nullptr) ? a.replica->memoryLog() : nullptr;
-        if (mem != nullptr) a.nextOffset = skipEvictedCursor_(*mem, a.nextOffset);
+        if (mem != nullptr) a.nextOffset = skipEvictedCursor_(*mem, a.nextOffset, a.freshCursor);
         const int32_t topicId    = a.topicId;
         const int32_t partition  = a.partition;
         const int64_t nextOffset = a.nextOffset;
@@ -3504,9 +3515,19 @@ private:
     // reader had not read yet (the in-memory retention).  The cursor resumes AT
     // the ring start — counted, logged first + every power of two — never a
     // stall on an offset the ring no longer holds.  Disk logs never take this.
-    [[nodiscard]] int64_t skipEvictedCursor_(const rune::storage::InMemoryLog& mem, int64_t cursor) noexcept {
+    // E2 final fix wave (M2): a FRESH cursor (the subscription's bind-time
+    // resolved start — Earliest is 0 on a transient partition — never moved by
+    // a read) below the ring start is a subscribe below the retention, not a
+    // reader that fell behind: it resumes at the ring start too, but is counted
+    // apart (transientFreshCursorsRaised_) and never warned as consumer lag.
+    [[nodiscard]] int64_t skipEvictedCursor_(const rune::storage::InMemoryLog& mem, int64_t cursor,
+                                             bool fresh) noexcept {
         const int64_t start = mem.logStartOffset();
         if (cursor >= start) [[likely]] return cursor;
+        if (fresh) {
+            ++transientFreshCursorsRaised_;
+            return start;
+        }
         ++transientCursorSkips_;
         transientRecordsSkipped_ += static_cast<uint64_t>(start - cursor);
         if ((transientCursorSkips_ & (transientCursorSkips_ - 1)) == 0)
@@ -4703,6 +4724,8 @@ public:
     [[nodiscard]] uint64_t transientFullRefusalsForTest() const noexcept { return transientFullRefusals_; }
     [[nodiscard]] uint64_t transientCursorSkipsForTest() const noexcept { return transientCursorSkips_; }
     [[nodiscard]] uint64_t transientRecordsSkippedForTest() const noexcept { return transientRecordsSkipped_; }
+    /// M2: fresh cursors (a subscribe below the ring start) raised to it — not lag.
+    [[nodiscard]] uint64_t transientFreshCursorsRaisedForTest() const noexcept { return transientFreshCursorsRaised_; }
 private:
     std::size_t                           pushBudgetLeft_ = kPushPassBudgetBytes;
     std::array<ChunkRun, kMaxPushRuns>    pushRuns_{};
@@ -4714,6 +4737,7 @@ private:
     uint64_t transientFullRefusals_   = 0;   ///< E2: ring refused a produce / marker (full or too large)
     uint64_t transientCursorSkips_    = 0;   ///< E2: reads whose cursor was below the ring start
     uint64_t transientRecordsSkipped_ = 0;   ///< E2: records those reads skipped (evicted unread)
+    uint64_t transientFreshCursorsRaised_ = 0;   ///< E2 M2: bind-time cursors below the ring start (not lag)
     uint64_t                              pushReadMapFallbacks_ = 0;
     uint64_t                              pushReadErrors_ = 0;   ///< D26: push-read pread failures (answered empty)
     /// D26: replication read scratch — a fetch serve / owed re-serve / push of

@@ -270,6 +270,7 @@ struct WorkerOp {
     // `deferAck` (rune-internal-ring.xml) is a FLAG BYTE, not a bool:
     //   bit 0 (kOpFlagDeferAck = 0x01)     — this deferAck (acks=all, steady state)
     //   bit 1 (kOpFlagCrcValidated = 0x02) — crcValidated (below; Produce only)
+    //   bit 2 (kOpFlagFreshCursor = 0x04)  — freshCursor (PushRead only; E2 M2)
     // Writer: Worker::enqueueOp only.  Readers MUST mask the bit they need
     // (executeProduceWire_ does); `deferAck() != 0` is wrong.  Rename the
     // schema field to `flags` the next time rune-protocol's schema is touched.
@@ -307,6 +308,13 @@ struct WorkerOp {
     uint8_t isolation      = 0;      ///< 0=read_uncommitted, 1=read_committed
     bool    isGroup        = false;
     bool    groupCarrierReceived = false;
+    /// E2 final fix wave (M2): the cursor is still the subscription's bind-time
+    /// resolved start (Earliest resolves to 0 for a transient partition; an
+    /// explicit low offset) — no worker answer has moved it yet.  A transient
+    /// ring start above it is "subscribed below the ring start", not a reader
+    /// that fell behind: counted apart, never warned.  Carried as bit 2 of the
+    /// wire flag byte (kOpFlagFreshCursor) — no protocol change.
+    bool    freshCursor    = false;
 
     // -----------------------------------------------------------------------
     // BecomeLeader / BecomeFollower-specific fields
@@ -584,6 +592,7 @@ enum class EnqueueResult : uint8_t { Enqueued, Full, TooLarge };
 /// The wire `deferAck` byte of a WorkerOp is a flag set (F15 S5 fix round 1).
 inline constexpr uint8_t kOpFlagDeferAck     = 0x01;   ///< WorkerOp::deferAck (acks=all, steady state)
 inline constexpr uint8_t kOpFlagCrcValidated = 0x02;   ///< WorkerOp::crcValidated (Produce only)
+inline constexpr uint8_t kOpFlagFreshCursor  = 0x04;   ///< WorkerOp::freshCursor (PushRead only; E2 M2)
 
 // ---------------------------------------------------------------------------
 // workerOpFrameBytes — the encoded size of one WorkerOp ring frame carrying a
