@@ -160,13 +160,31 @@ before a produce is acknowledged but is **never written to disk**.
   empty.
 - Renaming a topic's key field with `alter topic … rename` moves the topic's key to the new name.
 - Use `durability=majority` (default) or `all-in-sync` if a transient topic must survive a node death.
+- Produce (every `acks` mode, idempotent and transactional producers), push subscriptions from
+  earliest / latest / an offset, consumer groups and `read_committed` work exactly as on disk topics,
+  in both worker modes (`RUNE_WORKER_MODE=shard`, the default, and `legacy`). `tier=strict` acks like
+  `majority` (there is nothing to fsync).
+- A transient topic defined at runtime serves only once its definition has committed, exactly like a
+  disk topic: until then produce and subscribe answer `NotLeader` (retriable) and metadata does not list it.
+- **Retention is the in-memory ring:** `RUNE_TRANSIENT_LOG_RING_BYTES` per partition (node-wide, default
+  8 MiB, at most 1 000 000 batches). When it is full the oldest **committed** records (below the high
+  watermark) are evicted; a consumer whose position was evicted resumes at the oldest record still held
+  (counted and logged). Records not yet replicated are never evicted: while the ring is full of them a
+  produce is refused with error 42 (`TransientLogFull`, retriable — the client retries after a backoff
+  without refreshing metadata; clients older than this release see `NotLeader`) until the followers
+  catch up. A batch larger than the whole ring is refused `MessageTooLarge`.
+- A node that rejoins a transient partition whose leader already evicted the oldest records restarts
+  its copy at the leader's oldest record and catches up from there.
+- The ring size is set per node, so keep it the same on every node. A follower whose ring is smaller
+  than a batch it must replicate stops at that batch (logged as `follower WEDGED`) and leaves the ISR;
+  it does not skip the batch.
+- A transient view over a transient topic re-folds from the oldest held record when the topic's ring is
+  reset or recreated under it (counted as `transientSourceResets`); records evicted before the view
+  folded them are counted as `transientRecordsEvicted`.
 - `persistence=memory` in `RUNE_TOPICS` is a deprecated alias of `persistence=transient` and logs
   one warning per entry.
 - **Upgrade brokers before clients.** A new client defining a transient topic against an older
   broker silently gets a disk topic, because the older broker ignores the persistence byte.
-- Status in this release: a transient topic can be defined, survives restart as an empty topic,
-  and replicates. Produce/subscribe on transient topics is completed by the transient data-path
-  work (Part E2); end-to-end produce/consume is not yet claimed.
 
 ---
 

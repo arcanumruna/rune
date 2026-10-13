@@ -3,9 +3,12 @@
 Memory topics are renamed transient topics, and a transient topic now keeps
 its metadata across restarts. The changes below affect upgrades.
 
-Status: in this release a transient topic can be defined, survives restart as
-an empty topic, and replicates. Produce/subscribe on transient topics is
-completed by the transient data-path work (Part E2).
+Status: a transient topic can be defined, survives restart as an empty topic,
+replicates, and is produced to and consumed like a disk topic (Part E2). A new
+retriable error code 42 (`TransientLogFull`) answers a produce while the
+topic's in-memory ring is full of records not yet replicated; it is sent only to
+clients of this release (client version 6) — older clients get `NotLeader`.
+Upgrade brokers before clients.
 
 ## 1. Memory is now transient
 
