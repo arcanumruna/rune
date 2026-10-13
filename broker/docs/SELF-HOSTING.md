@@ -161,26 +161,52 @@ before a produce is acknowledged but is **never written to disk**.
 - Renaming a topic's key field with `alter topic … rename` moves the topic's key to the new name.
 - Use `durability=majority` (default) or `all-in-sync` if a transient topic must survive a node death.
 - Produce (every `acks` mode, idempotent and transactional producers), push subscriptions from
-  earliest / latest / an offset, consumer groups and `read_committed` work exactly as on disk topics,
-  in both worker modes (`RUNE_WORKER_MODE=shard`, the default, and `legacy`). `tier=strict` acks like
-  `majority` (there is nothing to fsync).
+  earliest / latest / an offset, consumer groups and `read_committed` work on transient topics in both
+  worker modes (`RUNE_WORKER_MODE=shard`, the default, and `legacy`). `tier=strict` acks like
+  `majority` (there is nothing to fsync). They differ from disk topics in these ways:
+  - **Fewer in-sync replicas than `minIsr` stops all produce once the ring is full.** While the ISR is
+    below `minIsr` the high watermark does not advance, so nothing can be evicted. When the ring fills
+    up, every produce is refused with error 42, including `acks=0` and `acks=1` (a disk topic keeps
+    accepting `acks=1`). The cause is replicas missing from the ISR, not slow followers: bring the
+    missing replicas back.
+  - **`read_committed` pauses briefly after a leadership or ownership move.** The new owner rebuilds
+    the read-committed state from the ring, a fixed amount per pass (about 6 ms of work for a full
+    8 MiB ring, spread over a few hundred passes). Meanwhile `read_committed` reads wait, and
+    idempotent and transactional produces get `NotLeader` (retriable). If the ring has evicted the
+    first records of a transaction that is still open, `read_committed` consumers stay at the ring's
+    oldest record until that transaction's commit or abort marker lands.
+  - **Committed consumer-group offsets of a transient partition do not survive the data.** On a
+    single-node broker, an offset committed before a restart is answered as "no committed offset"
+    after it, so the group starts at its reset policy and reads every refilled record. On a multi-node
+    cluster this is not handled yet: after a full-cluster restart a group resumes at its old committed
+    offset and skips the refilled records below it. Use a new group id (or commit offset 0) after a
+    full-cluster restart.
+  - **Subscriptions follow a leader move.** When a node stops serving a subscription (it lost
+    leadership of a `read_committed` partition, or the partition's replica moved off it), it answers
+    the subscription instead of going silent. A client of this release resumes from its position on
+    the new leader, on that leader's own session, so its other subscriptions are untouched; records
+    already delivered are not delivered again. Older clients do not resume: their subscription ends,
+    and the application must re-subscribe.
 - A transient topic defined at runtime serves only once its definition has committed, exactly like a
   disk topic: until then produce and subscribe answer `NotLeader` (retriable) and metadata does not list it.
 - **Retention is the in-memory ring:** `RUNE_TRANSIENT_LOG_RING_BYTES` per partition (node-wide, default
   8 MiB, at most 1 000 000 batches). When it is full the oldest **committed** records (below the high
-  watermark) are evicted; a consumer whose position was evicted resumes at the oldest record still held
-  (counted and logged). Records not yet replicated are never evicted: while the ring is full of them a
-  produce is refused with error 42 (`TransientLogFull`, retriable — the client retries after a backoff
-  without refreshing metadata; clients older than this release see `NotLeader`) until the followers
-  catch up. A batch larger than the whole ring is refused `MessageTooLarge`.
+  watermark) are evicted. A consumer whose position was evicted resumes at the oldest record still held
+  (counted and logged as a reader that fell behind). Subscribing below the oldest record (for example
+  from earliest) is not counted that way: the subscription simply starts at the oldest record. Records
+  not yet replicated are never evicted: while the ring is full of them a produce is refused with error
+  42 (`TransientLogFull`, retriable — the client retries after a 100 ms backoff without refreshing
+  metadata; clients older than this release see `NotLeader`) until the followers catch up. A batch
+  larger than the whole ring is refused `MessageTooLarge`.
 - A node that rejoins a transient partition whose leader already evicted the oldest records restarts
   its copy at the leader's oldest record and catches up from there.
 - The ring size is set per node, so keep it the same on every node. A follower whose ring is smaller
   than a batch it must replicate stops at that batch (logged as `follower WEDGED`) and leaves the ISR;
   it does not skip the batch.
-- A transient view over a transient topic re-folds from the oldest held record when the topic's ring is
-  reset or recreated under it (counted as `transientSourceResets`); records evicted before the view
-  folded them are counted as `transientRecordsEvicted`.
+- A transient view over a transient topic re-folds when the topic's ring changes under it (counted as
+  `transientSourceResets`): from the point where the ring's content changed, when it changed once since
+  the view last folded; from the oldest held record when the ring was recreated or changed more than
+  once. Records evicted before the view folded them are counted as `transientRecordsEvicted`.
 - `persistence=memory` in `RUNE_TOPICS` is a deprecated alias of `persistence=transient` and logs
   one warning per entry.
 - **Upgrade brokers before clients.** A new client defining a transient topic against an older
