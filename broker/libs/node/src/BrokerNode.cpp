@@ -1449,6 +1449,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
         bs.topicId          = topicId;
         bs.partitionCount   = spec.partitionCount;
         bs.rf               = static_cast<int16_t>(std::max<std::size_t>(1, allNodeIds.size()));
+        if (spec.replicationFactor > 0) bs.rf = std::min<int16_t>(spec.replicationFactor, bs.rf);
         bs.coPartitionGroup = spec.coPartitionGroup;
         bs.partitionKey     = spec.partitionKey;
         metadataService_->addRuntimeTopic(bs);
@@ -2189,6 +2190,7 @@ void BrokerNode::buildGateway() {
             // replayed from an earlier process is answered as none.
             ensureProcessIncarnation_();
             groupCoordService_->setTransientLineage(&BrokerNode::transientLineageTrampoline_, this);
+            groupCoordService_->setTransientLineageVersion(&BrokerNode::transientLineageVersionTrampoline_, this);
 
             spdlog::info("BrokerNode[{}]: GroupCoordinationService wired (offsets at {})",
                          nodeId, offsetDir.string());
@@ -2471,7 +2473,7 @@ void BrokerNode::buildGateway() {
                     rune::metadata::TopicSpec bs;
                     bs.topicId          = ts.topicId;
                     bs.partitionCount   = ts.partitionCount;
-                    bs.rf               = rf;
+                    bs.rf               = ts.replicationFactor > 0 ? std::min<int16_t>(ts.replicationFactor, rf) : rf;
                     bs.coPartitionGroup = ts.coPartitionGroup; // Note C fix: from parsed config
                     bs.partitionKey     = ts.partitionKey;     // Note C fix: from parsed config
                     balancerTopics.push_back(std::move(bs));
@@ -4280,6 +4282,11 @@ void BrokerNode::ensureProcessIncarnation_() {
     if (processIncarnation_ != 0) return;
     std::random_device rd;
     processIncarnation_ = static_cast<int64_t>((((static_cast<uint64_t>(rd()) << 32) ^ rd()) | 1u) & 0x7fffffffffffffffull);
+}
+
+uint64_t BrokerNode::transientLineageVersionTrampoline_(void* ctx) noexcept {
+    auto* self = static_cast<BrokerNode*>(ctx);
+    return self->metadataService_ != nullptr ? self->metadataService_->transientLineageVersion() : 0;
 }
 
 bool BrokerNode::isTransientTopicTrampoline_(void* ctx, int32_t topicId) noexcept {

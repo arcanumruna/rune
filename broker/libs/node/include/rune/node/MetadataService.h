@@ -629,6 +629,12 @@ public:
         int32_t pushedBits     = -1;      ///< member side: last confirmation sent
         int16_t featureLevel   = -1;      ///< D15: the level this process advertised (-1 = none yet)
         std::array<int64_t, 4> superseded{};   ///< recent dead processes (ring)
+        /// E2 residual round 5 (R1): the controller's failure detector found
+        /// this node DEAD (out of the heartbeat-eligible set): its process
+        /// identity no longer vouches for a transient lineage.  Restored only
+        /// by proof of a live process — a NEW process registering (adopt) or
+        /// an accepted lineage report from this nonce.
+        bool    lineageRevoked = false;
         uint32_t supersededNext = 0;
         std::unordered_map<int32_t, int32_t> confirmed;   ///< controller side: member → clear bits
         [[nodiscard]] bool isSuperseded(int64_t n) const noexcept {
@@ -642,6 +648,7 @@ public:
             if (isSuperseded(n)) return false;
             if (nonce != 0) superseded[supersededNext++ % superseded.size()] = nonce;
             nonce = n; shutting = false; userOnly = false; completePushed = false; pushedBits = -1;
+            lineageRevoked = false;   // R1: a new live process
             featureLevel = -1;   // D15: a new process may be another binary
             confirmed.clear();
             return true;
@@ -928,6 +935,9 @@ public:
             reply(rr::kAlterIsrFencedLeaderEpoch, pa.partitionEpoch);   // not this leadership any more
             return false;
         }
+        if (auto ls = nodeLifecycle_.find(m.leaderId);   // R1: the current leadership's live process reports
+            ls != nodeLifecycle_.end() && ls->second.lineageRevoked && ls->second.nonce == incarnationOf_(m))
+            ls->second.lineageRevoked = false;
         const rune::metadata::TransientLineage* rec = msm_.lineage(m.topicId, m.partition);
         if (rune::metadata::lineageConfirmedFor(rec, &pa, incarnationOf_(m))) {   // N1: by THIS process
             reply(rr::kAlterIsrLineageConfirmed, pa.partitionEpoch);
@@ -1007,8 +1017,13 @@ public:
     /// every new controller) — 0 when unknown.
     [[nodiscard]] int64_t knownProcessIdentity(int32_t node) const noexcept {
         const auto it = nodeLifecycle_.find(node);
-        return it == nodeLifecycle_.end() ? 0 : it->second.nonce;
+        if (it == nodeLifecycle_.end() || it->second.lineageRevoked) return 0;   // R1: found dead
+        return it->second.nonce;
     }
+    /// R1 (round 5): moves whenever a committed lineage changes (the group
+    /// coordinator re-sweeps its groups for superseded positions).
+    [[nodiscard]] uint64_t transientLineageVersion() const noexcept { return msm_.lineageVersion(); }
+    [[nodiscard]] uint64_t lineageIdentitiesRevokedForTest() const noexcept { return lineageIdentitiesRevoked_; }
     [[nodiscard]] const rune::metadata::PartitionAssignment* committedAssignment(int32_t topicId,
                                                                                 int32_t partition) const noexcept {
         return msm_.assignment(topicId, partition);
@@ -1229,6 +1244,21 @@ public:
             emptyMemoryLeader_.erase(k);
         }
     }
+    /// R1 (round 5): a node the failure detector found dead (out of the
+    /// heartbeat-eligible set) no longer vouches for a lineage — its remembered
+    /// identity is cleared for trust.  (Its leaderships are failed over / made
+    /// leaderless in the same tick; a node wrongly found dead gets a new
+    /// leadership whose lineage report restores it.)
+    void revokeDeadLineageIdentities_() {
+        for (auto& [n, st] : nodeLifecycle_) {
+            if (n == selfId_ || st.nonce == 0 || st.lineageRevoked || isEligible_(n)) continue;
+            st.lineageRevoked = true;
+            ++lineageIdentitiesRevoked_;
+            spdlog::info("MetadataService[{}]: node {} found dead — its process identity no longer vouches for "
+                         "transient lineages", selfId_, n);
+        }
+    }
+    uint64_t lineageIdentitiesRevoked_ = 0;
     [[nodiscard]] bool isEligible_(int32_t n) const noexcept {
         return std::find(eligible_.begin(), eligible_.end(), n) != eligible_.end();
     }
@@ -1517,6 +1547,7 @@ public:
         const std::vector<int32_t>& shutting = shuttingNodes_();
         eligible_.assign(eligibleNodes.begin(), eligibleNodes.end());
         eligibleKnown_ = true;
+        revokeDeadLineageIdentities_();   // R1 (round 5)
 
         // MEDIUM-B: coordinator partitions (controller-ISR path).
         const std::size_t coord = reconcileCoordinatorPartitions(eligibleNodes);

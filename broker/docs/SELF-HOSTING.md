@@ -190,6 +190,15 @@ before a produce is acknowledged but is **never written to disk**.
     partition before it answers. Until then OffsetFetch and OffsetCommit answer `NotLeader` for
     every topic, disk or transient, and the client retries. A group never resumes from a guessed
     position.
+  - **A new lineage rebalances the groups that read the old one.** When a transient partition
+    starts a new lineage, every consumer group with a committed offset on it is rebalanced. Its
+    members re-join, fetch "no committed offset" and start at the log start. A commit from before
+    that rebalance is refused with `IllegalGeneration`, and the client re-joins. This holds even if
+    a member fetched the old offset in the moment between a crash and its detection. A node that the
+    failure detector finds dead no longer vouches for a lineage.
+  - Topics take an optional replication factor: `RUNE_TOPICS=name:partitions:rf=N` (default: every
+    node). A transient topic with `rf=1` loses its data whenever its node stops; keep the cluster's
+    minimum in-sync replicas at or below `rf`.
   - **Subscriptions follow a leader move.** When a node stops serving a subscription (it lost
     leadership of a `read_committed` partition, or the partition's replica moved off it), it answers
     the subscription instead of going silent. A client of this release resumes from its position on

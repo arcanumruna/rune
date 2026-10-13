@@ -860,6 +860,13 @@ ConfigResult parseNodeConfig(
                         ts.coPartitionGroup = escapeNameForLog(kval);
                     } else if (klower == "key") {
                         ts.partitionKey = escapeNameForLog(kval);
+                    } else if (klower == "rf") {
+                        const std::string kv(kval);
+                        char* endp = nullptr;
+                        const long v = std::strtol(kv.c_str(), &endp, 10);
+                        if (endp == kv.c_str() || *endp != '\0' || v < 1 || v > 255)
+                            return {{}, std::string("RUNE_TOPICS rf must be an integer 1..255, got: ") + escapeNameForLog(kval) + " in entry: " + escapeNameForLog(entry)};
+                        ts.replicationFactor = static_cast<int16_t>(v);
                     } else if (klower == "persistence") {
                         std::string vlow(kval);
                         for (auto& ch : vlow) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));

@@ -296,6 +296,16 @@ public:
     /// True if the group has no members.
     [[nodiscard]] bool isEmpty() const noexcept { return members_.empty(); }
 
+    /// E2 residual round 5 (R1): start a rebalance NOW (generation bump,
+    /// PreparingRebalance) — every member must re-join and re-fetch its
+    /// positions; a request at the old generation is fenced.  No-op (false) for
+    /// an empty or Dead group.
+    bool forceRebalance(int64_t nowNs) {
+        if (members_.empty() || state_ == GroupState::Dead) return false;
+        triggerRebalance(nowNs);
+        return true;
+    }
+
 private:
     // -----------------------------------------------------------------------
     // Internal helpers

@@ -58,6 +58,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <unordered_map>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -140,6 +141,17 @@ public:
     static constexpr uint64_t kLineagePending = UINT64_MAX;
     using TransientLineageFn = uint64_t (*)(void* ctx, int32_t topicId, int32_t partition) noexcept;
     void setTransientLineage(TransientLineageFn fn, void* ctx) noexcept { lineageFn_ = fn; lineageCtx_ = ctx; }
+    /// E2 residual round 5 (R1): a counter that moves whenever a committed
+    /// lineage changes (MetadataStateMachine::lineageVersion).  On a change the
+    /// coordinator sweeps its groups: a group holding a committed offset of a
+    /// SUPERSEDED lineage (a new one was minted — the data it pointed into did
+    /// not survive) is forced to rebalance, so every member re-fetches (→ -1,
+    /// the log start) instead of consuming on from a position it fetched before
+    /// the mint; a commit at the old generation is fenced (IllegalGeneration).
+    using LineageVersionFn = uint64_t (*)(void* ctx) noexcept;
+    void setTransientLineageVersion(LineageVersionFn fn, void* ctx) noexcept { lineageVersionFn_ = fn; lineageVersionCtx_ = ctx; }
+    [[nodiscard]] uint64_t supersededLineageRebalances() const noexcept { return supersededRebalances_; }
+    [[nodiscard]] uint64_t supersededLineageCommitsFenced() const noexcept { return supersededCommitsFenced_; }
     /// Committed offsets answered "none" because their lineage ended (C1).
     [[nodiscard]] uint64_t staleLineageOffsets() const noexcept { return staleLineageOffsets_; }
     /// Entries answered NotLeader because the lineage was still pending (C1).
@@ -286,6 +298,24 @@ private:
     }
     /// The committed offset is a position of an ended lineage (C1): answer none.
     bool staleLineage_(const rune::coordination::CommittedOffset& co, int32_t topicId, int32_t partition);
+
+    // R1 (round 5): superseded-lineage rebalances.  Cold (a lineage change is a
+    // restart / an unclean election); allocation on this path is acceptable.
+    LineageVersionFn lineageVersionFn_  = nullptr;
+    void*            lineageVersionCtx_ = nullptr;
+    uint64_t         lineageSweptVersion_ = 0;
+    bool             lineageSweepRetry_   = false;   ///< a lineage was pending at the last sweep
+    int64_t          nextLineageSweepNs_  = 0;
+    uint64_t         supersededRebalances_    = 0;
+    uint64_t         supersededCommitsFenced_ = 0;
+    /// group -> (topicId, partition, new lineage) it was already rebalanced for.
+    struct SupersededMark { int32_t topicId; int32_t partition; uint64_t lineage; };
+    std::unordered_map<std::string, std::vector<SupersededMark>> supersededHandled_;
+    void sweepSupersededLineages_(int64_t nowNs);
+    /// Rebalance `groupId` once for (topicId, partition)'s new lineage `now`;
+    /// true when this call forced it (false: already handled / empty group).
+    bool rebalanceForSupersededLineage_(const GroupId& groupId, rune::coordination::GroupCoordinator& coord,
+                                        int32_t topicId, int32_t partition, uint64_t now, int64_t nowNs);
 
     /// Per-group coordinators.  Inserted lazily on first Join.
     /// std::map with std::less<> (transparent comparator) so hot-path find()

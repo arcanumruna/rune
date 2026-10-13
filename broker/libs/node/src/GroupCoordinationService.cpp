@@ -162,6 +162,8 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
 
     if (coordinators_.empty()) return 0;
 
+    sweepSupersededLineages_(nowNs);   // R1 (round 5)
+
     int work = 0;
     for (auto& [groupId, coord] : coordinators_) {
         const coord::GroupState stateBefore = coord.state();
@@ -218,6 +220,63 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
         }
     }
     return work;
+}
+
+// ---------------------------------------------------------------------------
+// E2 residual round 5 (R1): superseded-lineage rebalances.
+//
+// The coordinator can have answered a member a transient offset while the
+// lineage still looked valid (e.g. the partition's only replica had just died,
+// before the controller detected it).  Once a NEW lineage is minted for that
+// partition the offset points into data that did not survive.  Closing this
+// only at OffsetFetch leaves the member consuming on from its old position and
+// committing it under the new lineage (silent loss).  So, end to end:
+//   - every group holding a committed offset of a superseded lineage is forced
+//     to rebalance (generation bump): members revoke, re-join, re-fetch (-1:
+//     the log start) — swept here on every lineage change;
+//   - a commit at the old generation is fenced by the generation check
+//     (IllegalGeneration, explicit); a commit that reaches us BEFORE the sweep
+//     saw the change forces the rebalance itself and is refused (see
+//     handleOffsetCommit).
+// ---------------------------------------------------------------------------
+bool GroupCoordinationService::rebalanceForSupersededLineage_(const GroupId& groupId, coord::GroupCoordinator& coord,
+                                                              int32_t topicId, int32_t partition, uint64_t now,
+                                                              int64_t nowNs) {
+    auto& marks = supersededHandled_[groupId];
+    for (const auto& m : marks)
+        if (m.topicId == topicId && m.partition == partition && m.lineage == now) return false;
+    marks.push_back(SupersededMark{topicId, partition, now});
+    const coord::GroupState before = coord.state();
+    if (!coord.forceRebalance(nowNs)) return false;
+    ++supersededRebalances_;
+    spdlog::info("GroupCoordinationService: group '{}' holds a committed offset of transient topicId={} "
+                 "partition={} from a superseded data lineage (now {:#x}) — forced rebalance to generation {} "
+                 "(members re-fetch: the log start)", groupId, topicId, partition, now, coord.generationId());
+    if (before != coord::GroupState::PreparingRebalance) onEnterPreparingRebalance(groupId, coord);
+    return true;
+}
+
+void GroupCoordinationService::sweepSupersededLineages_(int64_t nowNs) {
+    if (lineageFn_ == nullptr || offsets_ == nullptr || !isLocalCoordinator() || !offsetsLoaded_()) return;
+    const uint64_t v = lineageVersionFn_ != nullptr ? lineageVersionFn_(lineageVersionCtx_) : 0;
+    const bool changed = v != lineageSweptVersion_;
+    if (!changed && !(lineageSweepRetry_ && nowNs >= nextLineageSweepNs_)) return;
+    bool pending = false;
+    for (auto& [groupId, coord] : coordinators_) {
+        if (coord.isEmpty()) continue;
+        for (const auto& [tp, co] : offsets_->fetchAll(groupId)) {
+            if (co.lineage == 0 || topics_ == nullptr) continue;   // not a transient position
+            const auto id = topics_->topicIdForName(tp.topic);
+            if (!id) continue;
+            const uint64_t now = lineageOf_(*id, tp.partition);
+            if (now == kLineagePending) { pending = true; continue; }   // decided on a later sweep
+            if (now == 0 || now == co.lineage) continue;
+            (void)rebalanceForSupersededLineage_(groupId, coord, *id, tp.partition, now, nowNs);
+        }
+    }
+    lineageSweptVersion_ = v;
+    lineageSweepRetry_   = pending;
+    nextLineageSweepNs_  = nowNs + 100'000'000;   // a pending lineage: re-swept every 100 ms (cold)
 }
 
 // ---------------------------------------------------------------------------
@@ -778,7 +837,7 @@ size_t GroupCoordinationService::handleOffsetCommit(
     // Generation fence: verify the member is in the group at the claimed generation.
     auto it = coordinators_.find(groupIdStr);
     const bool groupExists = (it != coordinators_.end());
-    const bool genOk = groupExists && (msg.generationId == it->second.generationId());
+    bool genOk = groupExists && (msg.generationId == it->second.generationId());   // R1: cleared by a forced rebalance
 
     commitResultScratch_.clear();
     const bool loaded = offsetsLoaded_();   // E2 residual round 4
@@ -838,6 +897,23 @@ size_t GroupCoordinationService::handleOffsetCommit(
             r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
             commitResultScratch_.push_back(r);
             continue;
+        }
+        if (lineage != 0) {
+            // R1 (round 5): the group's committed position for this partition is
+            // of a SUPERSEDED lineage and the group was not rebalanced for the new
+            // one yet — this member's position may come from the old data: the
+            // group is rebalanced now and the commit refused (explicit; the
+            // member re-joins and re-fetches).  After that rebalance an old-
+            // generation commit is fenced by genOk above.
+            const auto prev = offsets_->fetch(groupIdStr, tp);
+            if (prev.has_value() && prev->lineage != 0 && prev->lineage != lineage &&
+                rebalanceForSupersededLineage_(groupIdStr, it->second, e.topicId, e.partition, lineage, nowNs)) {
+                ++supersededCommitsFenced_;
+                genOk = false;   // the rest of this request is at the old generation now
+                r.errorCode = static_cast<int16_t>(pc::ErrorCode::IllegalGeneration);
+                commitResultScratch_.push_back(r);
+                continue;
+            }
         }
         const bool committed = offsets_->commit(groupIdStr, tp, e.offset, meta, nowNs, lineage);
         r.errorCode = committed ? static_cast<int16_t>(pc::ErrorCode::OK)

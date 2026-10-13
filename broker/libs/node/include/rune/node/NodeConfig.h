@@ -63,6 +63,9 @@ struct TopicSpec {
     std::string name;
     int32_t     partitionCount = 1;
     int32_t     topicId        = -1;
+    /// Replicas per partition (RUNE_TOPICS `rf=N`); 0 = every node (the
+    /// default).  Clamped to the cluster size.
+    int16_t     replicationFactor = 0;
     enum class CleanupPolicy : uint8_t { Delete = 0, Compact = 1, CompactDelete = 2 };
     CleanupPolicy cleanupPolicy           = CleanupPolicy::Delete;
     int64_t       retentionMs             = -1;             // -1 = unbounded

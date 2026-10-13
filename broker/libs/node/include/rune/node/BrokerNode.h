@@ -1104,6 +1104,7 @@ private:
     void ensureProcessIncarnation_();
     static uint64_t transientLineageTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept;
     static bool isTransientTopicTrampoline_(void* ctx, int32_t topicId) noexcept;
+    static uint64_t transientLineageVersionTrampoline_(void* ctx) noexcept;   // R1 (round 5)
 
     // Task 9 (RUNE_TLS SIGHUP reload): the trigger-only cross-thread ring —
     // requestTlsCertReload() (any thread) offers kTlsReloadTrigger;

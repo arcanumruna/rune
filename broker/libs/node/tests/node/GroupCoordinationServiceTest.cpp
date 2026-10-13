@@ -819,7 +819,20 @@ TEST_F(CG3ServiceTest, TransientOffsetsAreAnsweredRetriablyWhileTheLineageIsPend
     g_pendingLineage = 0x2222;   // the new leadership MINTED a new lineage
     EXPECT_EQ(fetch(code), -1) << "the old lineage's offset was answered after a re-mint";
     EXPECT_EQ(code, static_cast<int16_t>(pc::ErrorCode::OK));
-    ASSERT_EQ(commit(3), static_cast<int16_t>(pc::ErrorCode::OK));
+    // Residual round 5 (R1): this member's generation predates the mint — its
+    // position may come from the old data: the commit is fenced and the group
+    // rebalanced; after re-joining, the commit is accepted.
+    EXPECT_EQ(commit(3), static_cast<int16_t>(pc::ErrorCode::IllegalGeneration));
+    auto rj = encodeJoinGroup(req_, 1, 973, groupId, memberId, 5000);
+    auto rjOut = service_->handleJoinGroup(req_, rj, clock_, out_, kBufSize);
+    auto rjResp = pc::JoinGroupResponse::decode(out_, rjOut);
+    ASSERT_TRUE(rjResp.has_value());
+    ASSERT_GT(rjResp->generationId, jResp->generationId);
+    auto oc = encodeOffsetCommit(req_, 1, 974, groupId, memberId, rjResp->generationId, kTestTopicId, 0, 3, "m");
+    auto ocOut = service_->handleOffsetCommit(req_, oc, clock_, out_, kBufSize);
+    auto ocResp = pc::OffsetCommitResponse::decode(out_, ocOut);
+    ASSERT_TRUE(ocResp.has_value());
+    ASSERT_EQ(ocResp->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
     ASSERT_TRUE(pumpHW(2));
     EXPECT_EQ(fetch(code), 3);
 }
@@ -1402,4 +1415,68 @@ TEST_F(CG3ServiceTest, OffsetsAreNotLoadedFromALogPrefixBelowTheLogEndRegression
     const FetchAnswer a = fetchOne(svc3, req_, out_, kBufSize, groupId, kTestTopicId, 0);
     EXPECT_EQ(a.code, static_cast<int16_t>(pc::ErrorCode::OK));
     EXPECT_EQ(a.offset, 30) << "not the newest committed offset after the whole log loaded";
+}
+
+// E2 final fix wave, residual round 5 — R1 (coordinator half): a NEW lineage
+// minted for a transient partition supersedes every committed offset of the
+// old one.  (a) The lineage-change sweep forces every group holding such an
+// offset to rebalance (generation bump) — once per new lineage; a commit at
+// the old generation is fenced (IllegalGeneration).  (b) A commit that reaches
+// the coordinator before the sweep saw the change forces the rebalance itself
+// and is refused.  A commit in the new generation is accepted.  RED (no
+// superseded-lineage handling): the old-generation commit was accepted.
+namespace {
+uint64_t g_r1Lineage = 0xA;
+uint64_t g_r1Version = 1;
+uint64_t r1Lineage(void*, int32_t, int32_t partition) noexcept { return partition == 0 ? g_r1Lineage : 0; }
+uint64_t r1Version(void*) noexcept { return g_r1Version; }
+}  // namespace
+
+TEST_F(CG3ServiceTest, SupersededLineageForcesARebalanceAndFencesOldGenerationCommitsRegression) {
+    const std::string groupId = "g-r1";
+    g_r1Lineage = 0xA; g_r1Version = 1;
+    service_->setTransientLineage(&r1Lineage, nullptr);
+    service_->setTransientLineageVersion(&r1Version, nullptr);
+    auto join = [&](const std::string& member) {
+        auto l = encodeJoinGroup(req_, 1, 1100, groupId, member, 5000);
+        auto n = service_->handleJoinGroup(req_, l, clock_, out_, kBufSize);
+        auto r = pc::JoinGroupResponse::decode(out_, n);
+        EXPECT_TRUE(r.has_value());
+        return std::make_pair(std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size()),
+                              r->generationId);
+    };
+    auto commit = [&](const std::string& member, int32_t gen, int64_t off) {
+        auto l = encodeOffsetCommit(req_, 1, 1101, groupId, member, gen, kTestTopicId, 0, off, "");
+        auto n = service_->handleOffsetCommit(req_, l, clock_, out_, kBufSize);
+        auto r = pc::OffsetCommitResponse::decode(out_, n);
+        return r.has_value() && !r->results.empty() ? r->results[0].errorCode : int16_t{-99};
+    };
+    auto tick = [&] { clock_ += kStep; replica_->doWork(clock_); service_->doWork(clock_); };
+    auto [member, gen0] = join("");
+    ASSERT_TRUE(driveUntil([&] { return true; }, 1));
+    ASSERT_EQ(commit(member, gen0, 5000), static_cast<int16_t>(pc::ErrorCode::OK));
+    tick();
+    EXPECT_EQ(service_->supersededLineageRebalances(), 0u);
+
+    // (a) A new lineage is minted (the version moves): the sweep rebalances.
+    g_r1Lineage = 0xB; ++g_r1Version;
+    tick();
+    EXPECT_EQ(service_->supersededLineageRebalances(), 1u) << "the group was not rebalanced for the new lineage";
+    EXPECT_EQ(commit(member, gen0, 5100), static_cast<int16_t>(pc::ErrorCode::IllegalGeneration))
+        << "SILENT LOSS: a commit at the pre-mint generation was accepted";
+    for (int i = 0; i < 5; ++i) tick();
+    EXPECT_EQ(service_->supersededLineageRebalances(), 1u) << "rebalanced more than once for one new lineage";
+    auto [m2, gen1] = join(member);
+    EXPECT_GT(gen1, gen0);
+    for (int i = 0; i < 5; ++i) tick();
+    EXPECT_EQ(commit(m2, gen1, 3), static_cast<int16_t>(pc::ErrorCode::OK)) << "the new generation's commit was refused";
+
+    // (b) Another mint the sweep has not seen yet (no version move): the first
+    // commit forces the rebalance itself and is refused.
+    g_r1Lineage = 0xC;
+    tick();   // the version did not move: no sweep
+    EXPECT_EQ(commit(m2, gen1, 4), static_cast<int16_t>(pc::ErrorCode::IllegalGeneration))
+        << "SILENT LOSS: a commit raced ahead of the sweep and was stamped with the new lineage";
+    EXPECT_GE(service_->supersededLineageCommitsFenced(), 1u);
+    EXPECT_EQ(service_->supersededLineageRebalances(), 2u);
 }

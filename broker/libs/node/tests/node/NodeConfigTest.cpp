@@ -2846,6 +2846,20 @@ TEST(NodeConfigRegression, PersistenceMemoryIsDeprecatedAliasForTransient) {
     EXPECT_NE(res.warnings[1].find("chat"), std::string::npos) << res.warnings[1];
 }
 
+// E2 residual round 5: a per-topic replication factor (RUNE_TOPICS `rf=N`);
+// absent = every node (0).  Out of range / not a number is a config error.
+TEST(NodeConfig, TopicReplicationFactorParses) {
+    auto res = parseWithTopics("presence:3:persistence=transient:rf=1,orders:4");
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->topics[0].replicationFactor, 1);
+    EXPECT_EQ(res.config->topics[1].replicationFactor, 0) << "absent rf must mean every node";
+    for (const char* bad : {"t:1:rf=0", "t:1:rf=x", "t:1:rf=256", "t:1:rf=2x"}) {
+        auto r = parseWithTopics(bad);
+        EXPECT_FALSE(r.config.has_value()) << bad;
+        EXPECT_NE(r.error.find("rf must be an integer"), std::string::npos) << bad << ": " << r.error;
+    }
+}
+
 TEST(NodeConfig, PersistenceBadValueNamesTransient) {
     auto res = parseWithTopics("t:1:persistence=ram");
     ASSERT_FALSE(res.config.has_value());

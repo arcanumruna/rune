@@ -298,11 +298,13 @@ public:
     /// The ConnectRequest clientVersion of later connects (group frames need >= 3).
     void setClientVersion(int32_t v) noexcept { clientVersion_ = v; }
     struct JoinAnswer { int16_t errorCode = -1; std::string memberId; int32_t generation = -1; };
-    std::optional<JoinAnswer> joinGroup(const std::string& gw, int32_t stream, int64_t sid, std::string_view group) {
+    /// `memberId` empty: a new member; else a re-join of that member.
+    std::optional<JoinAnswer> joinGroup(const std::string& gw, int32_t stream, int64_t sid, std::string_view group,
+                                        std::string_view memberId = {}) {
         pc::JoinGroup m;
         m.sessionId = sid; m.correlationId = ++corr_; m.sessionTimeoutMs = 30'000;
         m.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
-        m.memberId = {};
+        m.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(memberId.data()), memberId.size());
         std::vector<uint8_t> buf(512);
         const std::size_t len = m.encode(buf.data(), std::span<const int32_t>());
         const int64_t c = m.correlationId;
