@@ -189,6 +189,11 @@ public:
     // -----------------------------------------------------------------------
     bool commitTopic(int32_t topicId);
 
+    /// E2 final fix wave (M6): bumped on every catalog change (a topic created,
+    /// a topic committed) — holders of a cached per-partition classification
+    /// (the gateway's transient subscriptions) refresh it when it moves.
+    [[nodiscard]] uint64_t catalogGeneration() const noexcept { return catalogGeneration_; }
+
     /// The topic exists and is still awaiting its commit (not servable).
     [[nodiscard]] bool awaitingCommit(int32_t topicId) const noexcept {
         return topicId >= 0 && static_cast<std::size_t>(topicId) < topics_.size() &&
@@ -223,6 +228,7 @@ public:
     deleteRetentionMsOf(int32_t topicId) const noexcept;
 
 private:
+    uint64_t catalogGeneration_ = 0;   ///< M6: see catalogGeneration()
     // Which caller built the topic: the constructor (static + recovered topics) or
     // a runtime DDL create.  Only a runtime create writes the topic-id marker.
     enum class CreateOrigin : uint8_t { Boot, Runtime };

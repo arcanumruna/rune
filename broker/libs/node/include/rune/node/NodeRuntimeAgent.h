@@ -490,6 +490,7 @@ private:
                 // Controlled shutdown (cold): register / hand-off steps, on
                 // the same slow tick as the rebalance it depends on.
                 slowWork += controlledShutdown_.doWork(nowNs);
+                slowWork += pushLineageIdentity_();   // R2 (round 5)
                 failoverTick_.done(nowNs, slowWork);
             }
 
@@ -998,6 +999,43 @@ private:
     const bool                                         ctrlLog_ = ::getenv("RUNE_CTRL_LOG") != nullptr;
     LeaderObserver*                                    leaderObserver_ = nullptr;  // F9a, non-owning
     ControlledShutdown                                 controlledShutdown_;        // control thread (+ rings)
+    /// E2 residual round 5 (R2): the process identity the user replicas carry
+    /// in their lineage reports.  When ControlledShutdown ROTATES it (a stale
+    /// frame superseded it), every user replica is told on its owner thread
+    /// (the AlterIsrResponse op, node-local code) and re-reports under the new
+    /// one.  0 = not observed yet (the startup identity is set at add).
+    int64_t pushedLineageIdentity_ = 0;
+    uint64_t lineageIdentityPushes_ = 0;
+    int pushLineageIdentity_() {
+        const int64_t id = controlledShutdown_.nonceOnControl();
+        if (id == 0 || id == pushedLineageIdentity_) return 0;
+        if (pushedLineageIdentity_ == 0) { pushedLineageIdentity_ = id; return 0; }   // the startup identity
+        if (registry_ == nullptr) { pushedLineageIdentity_ = id; return 0; }
+        bool all = true;
+        for (auto* replica : registry_->allReplicas()) {
+            if (replica == nullptr || replica->topicId() < 0) continue;
+            if (workerPool_ != nullptr) {
+                WorkerOp op;
+                op.type       = WorkerOp::Type::AlterIsrResponse;
+                op.topicId    = replica->topicId();
+                op.partition  = static_cast<int32_t>(replica->partitionId());
+                op.nextOffset = id;
+                op.replicatedPayload.errorCode = rune::replication::kAlterIsrLocalLineageIdentity;
+                all = workerPool_->tryEnqueueOp(op.topicId, op.partition, std::move(op)) && all;
+            } else {
+                replica->rotateLineageIdentity(id);   // single-thread mode: this thread drives it
+            }
+        }
+        if (!all) return 1;   // an owner ring was full: the whole push is retried (idempotent)
+        registry_->setLineageIdentity(id);   // replicas added from now on
+        pushedLineageIdentity_ = id;
+        ++lineageIdentityPushes_;
+        spdlog::info("NodeRuntimeAgent: process identity rotated — user replicas re-report their lineages under it");
+        return 1;
+    }
+public:
+    [[nodiscard]] uint64_t lineageIdentityPushesForTest() const noexcept { return lineageIdentityPushes_; }
+private:
     StorageFailureHook                                 storageFailureHook_;
     std::function<void(const std::string&)>            fatalHook_;
 

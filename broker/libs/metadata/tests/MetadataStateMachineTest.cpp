@@ -1117,3 +1117,232 @@ TEST(MetadataStateMachineRegression, D15ExtensionIdsOutsideProtocolSpaceRegressi
         EXPECT_EQ(pa->mark.kind, LeaderlessMark::Kind::None) << "a v1 record's fields were read as a D15 trailer";
     }
 }
+
+// ===========================================================================
+// E2 final fix wave (C1 multi-node, USER DECISION option b): a TRANSIENT
+// partition's data lineage — the TransientLineageRecord (type 0x8002) and the
+// controller's mint / keep / reset decision.
+// ===========================================================================
+namespace {
+std::size_t encodeLineage(uint8_t* buf, int32_t t, int32_t p, uint64_t token, int32_t mint, int32_t conf,
+                          int32_t leader, int64_t inc = 0) {
+    TransientLineageRecord r;
+    r.topicId = t; r.partition = p;
+    r.l.lineage = token; r.l.mintEpoch = mint; r.l.confirmedEpoch = conf; r.l.confirmedLeader = leader;
+    r.l.incarnation = inc;
+    return r.encode(buf, 64);
+}
+}  // namespace
+
+// The record commits only at its commit point, a revert drops it, a stale one
+// (an older confirmedEpoch) never moves the lineage back, and an older MSM's
+// decoder sees an unknown type (skipped).  RED: the lineage was never stored.
+TEST(MetadataStateMachineRegression, TransientLineageRecordCommitsAndNeverRegressesRegression) {
+    MetadataStateMachine msm;
+    uint8_t b[64];
+    std::size_t n = encodeLineage(b, 3, 0, 0xAAAA, 5, 5, 2);
+    const auto t = peekRecordType(b, n);
+    ASSERT_TRUE(t.has_value());
+    EXPECT_NE(*t, MetadataRecordType::UpdatePartitionAssignment) << "an older MSM must skip it";
+    msm.apply(b, n, 0);
+    EXPECT_EQ(msm.lineage(3, 0), nullptr) << "an uncommitted lineage is visible";
+    msm.revert(-1);
+    msm.commit(0);
+    EXPECT_EQ(msm.lineage(3, 0), nullptr) << "a reverted lineage took effect";
+    msm.apply(b, n, 1);
+    msm.commit(1);
+    ASSERT_NE(msm.lineage(3, 0), nullptr);
+    EXPECT_EQ(msm.lineage(3, 0)->lineage, 0xAAAAu);
+    EXPECT_EQ(msm.lineage(3, 0)->confirmedEpoch, 5);
+    n = encodeLineage(b, 3, 0, 0xAAAA, 5, 7, 1);   // kept across a handover to node 1 at epoch 7
+    msm.apply(b, n, 2);
+    msm.commit(2);
+    EXPECT_EQ(msm.lineage(3, 0)->confirmedEpoch, 7);
+    EXPECT_EQ(msm.lineage(3, 0)->confirmedLeader, 1);
+    n = encodeLineage(b, 3, 0, 0xBBBB, 6, 6, 2);   // a stale decision (epoch 6 < 7)
+    msm.apply(b, n, 3);
+    msm.commit(3);
+    EXPECT_EQ(msm.lineage(3, 0)->lineage, 0xAAAAu) << "a stale lineage decision moved the lineage back";
+    EXPECT_EQ(msm.lineage(3, 0)->confirmedEpoch, 7);
+}
+
+// The decision, case by case (pins which situations mint a NEW lineage):
+//   first-ever leadership (no record)             -> MINT
+//   full-cluster restart (leader's ring unborn)   -> MINT
+//   ISR handover / follower promotion (the new
+//     leader fetched from a confirmed leadership) -> KEEP (rolling restart too)
+//   promotion of a follower that fetched from a
+//     leadership that never confirmed             -> MINT (it may have minted)
+//   a replica whose data predates the lineage     -> MINT (unclean / edge)
+//   single node, same process (src = confirmed)   -> KEEP; new process (-1) -> MINT
+// RED: any case deciding the other way.
+TEST(MetadataStateMachineRegression, TransientLineageMintKeepResetDecisionsRegression) {
+    TransientLineage rec;
+    rec.lineage = 0xAAAA; rec.mintEpoch = 4; rec.confirmedEpoch = 6; rec.confirmedLeader = 2;
+    auto d = [&](const TransientLineage* r, int32_t src) { return decideTransientLineage(r, 1, 7, src, 0xCCCC); };
+    EXPECT_EQ(d(nullptr, -1).lineage, 0xCCCCu) << "first-ever leadership";
+    EXPECT_EQ(d(nullptr, -1).mintEpoch, 7);
+    EXPECT_EQ(d(&rec, -1).lineage, 0xCCCCu) << "full-cluster restart: the new leader's ring is unborn";
+    EXPECT_EQ(d(&rec, 6).lineage, 0xAAAAu) << "ISR handover from the confirmed leadership";
+    EXPECT_EQ(d(&rec, 6).mintEpoch, 4) << "a kept lineage keeps its mint epoch";
+    EXPECT_EQ(d(&rec, 5).lineage, 0xAAAAu) << "a follower of an earlier leadership of the same lineage";
+    EXPECT_EQ(d(&rec, 4).lineage, 0xAAAAu) << "a follower of the minting leadership";
+    EXPECT_EQ(d(&rec, 7).lineage, 0xCCCCu) << "data of a leadership that never confirmed (it may have minted)";
+    EXPECT_EQ(d(&rec, 3).lineage, 0xCCCCu) << "data older than the lineage (an unclean / edge election)";
+    const auto out = d(&rec, 6);
+    EXPECT_EQ(out.confirmedEpoch, 7);
+    EXPECT_EQ(out.confirmedLeader, 1);
+
+    // Trust: only for exactly the confirmed leadership (and, single node, process).
+    PartitionAssignment pa;
+    pa.leaderNode = 2; pa.leaderEpoch = 6; pa.partitionEpoch = 6;
+    EXPECT_TRUE(lineageConfirmedFor(&rec, &pa, 0));
+    pa.leaderEpoch = 7;
+    EXPECT_FALSE(lineageConfirmedFor(&rec, &pa, 0)) << "a newer leadership must confirm the lineage first";
+    pa.leaderEpoch = 6; pa.leaderNode = 1;
+    EXPECT_FALSE(lineageConfirmedFor(&rec, &pa, 0)) << "another leader at the same epoch";
+    pa.leaderNode = NO_LEADER;
+    EXPECT_FALSE(lineageConfirmedFor(&rec, &pa, 0)) << "leaderless";
+    pa.leaderNode = 2;
+    rec.incarnation = 77;
+    EXPECT_TRUE(lineageConfirmedFor(&rec, &pa, 77));
+    EXPECT_FALSE(lineageConfirmedFor(&rec, &pa, 78)) << "single node: confirmed by an earlier process";
+    EXPECT_FALSE(lineageConfirmedFor(nullptr, &pa, 0));
+}
+
+// E2 final fix wave, residual round 3 — N3: the MSM derives whether each
+// installed leadership was a CLEAN election (the new leader was in the ISR of
+// the assignment it replaced), deterministically on apply and on replay; and
+// an unclean leadership always MINTS a lineage.  RED: the derivation / the
+// decision ignored the ISR.
+TEST(MetadataStateMachineRegression, UncleanElectionIsDerivedAndAlwaysMintsRegression) {
+    const std::vector<UpdateArgs> log = {
+        {1, 0, 5, {5, 6, 7}, {5, 6, 7}, 1, 1},   // first assignment         -> clean
+        {1, 0, 6, {6, 5, 7}, {5, 6, 7}, 2, 2},   // ISR handover to 6         -> clean
+        {1, 0, 6, {6},       {5, 6, 7}, 2, 3},   // ISR shrinks to {6}        -> inherits clean
+        {1, 0, -1, {6},      {5, 6, 7}, 3, 4},   // leaderless (ISR kept)     -> inherits
+        {1, 0, 7, {7},       {5, 6, 7}, 4, 5},   // survivor 7 (not in {6})   -> UNCLEAN
+        {1, 0, 7, {7, 5},    {5, 6, 7}, 4, 6},   // ISR grows, same leader    -> inherits unclean
+        {1, 0, 7, {7, 5},    {5, 6, 7}, 5, 7},   // 7 re-elected (own data)   -> clean
+    };
+    const bool expect[] = {true, true, true, true, false, false, true};
+    {
+        MetadataStateMachine msm;
+        for (std::size_t i = 0; i < log.size(); ++i) {
+            auto [b, n] = encodeUpdate(log[i]);
+            msm.apply(b.data(), n, static_cast<int64_t>(i));
+            msm.commit(static_cast<int64_t>(i));
+            ASSERT_NE(msm.assignment(1, 0), nullptr);
+            EXPECT_EQ(msm.assignment(1, 0)->cleanElection, expect[i]) << "record " << i;
+        }
+    }
+    {   // replay (all pending, one commit) derives the same as one by one
+        MetadataStateMachine msm;
+        for (std::size_t i = 0; i < 5; ++i) {
+            auto [b, n] = encodeUpdate(log[i]);
+            msm.apply(b.data(), n, static_cast<int64_t>(i));
+        }
+        msm.commit(4);
+        EXPECT_FALSE(msm.assignment(1, 0)->cleanElection) << "replay derived a different election class";
+    }
+    TransientLineage rec;
+    rec.lineage = 0xAAAA; rec.mintEpoch = 4; rec.confirmedEpoch = 6; rec.confirmedLeader = 2;
+    EXPECT_EQ(decideTransientLineage(&rec, 1, 7, 6, 0xCCCC, 0, /*clean=*/true).lineage, 0xAAAAu);
+    EXPECT_EQ(decideTransientLineage(&rec, 1, 7, 6, 0xCCCC, 0, /*clean=*/false).lineage, 0xCCCCu)
+        << "an unclean leadership kept the lineage";
+}
+
+// E2 final fix wave, residual round 3 — N4: the MSM image carries the
+// committed transient lineages (and, closing the D15b m4 gap, the feature
+// level, every leaderless mark and the N3 clean-election class); an OLD (v0)
+// image still restores — as no lineages / level 0 / no marks / clean.
+// RED (lineages not in the image): the restored MSM had no lineage — a
+// successor would answer every transient group offset as pending/none, or
+// (worse) re-mint and lose the confirmation history.
+TEST(MetadataStateMachineRegression, SnapshotRestoreCarriesLineagesAndOldImagesStillLoadRegression) {
+    MetadataStateMachine msm;
+    const std::vector<UpdateArgs> log = {
+        {1, 0, 5, {5, 6}, {5, 6, 7}, 1, 1},
+        {1, 0, 7, {7}, {5, 6, 7}, 2, 2},         // unclean (7 not in {5, 6})
+        {1, 1, 6, {6, 5}, {5, 6, 7}, 1, 1},
+    };
+    int64_t pos = 0;
+    for (const auto& u : log) {
+        auto [b, n] = encodeUpdate(u);
+        msm.apply(b.data(), n, pos);
+        msm.commit(pos++);
+    }
+    {   // a leaderless partition with a D15 mark
+        std::vector<int32_t> isr{2}, reps{1, 2, 3};
+        UpdatePartitionAssignmentRecord rec;
+        rec.topicId = 4; rec.partition = 0; rec.leaderNode = NO_LEADER;
+        rec.isr = Int32ArrayView{isr.data(), 1}; rec.replicas = Int32ArrayView{reps.data(), 3};
+        rec.leaderEpoch = 3; rec.partitionEpoch = 3;
+        uint8_t buf[256];
+        std::size_t n = rec.encode(buf, sizeof buf);
+        LeaderlessMark mark;
+        mark.kind = LeaderlessMark::Kind::EmptyMemoryLeader; mark.node = 2; mark.incarnation = 0x77;
+        n += leaderless_trailer::encode(buf + n, sizeof buf - n, mark);
+        msm.apply(buf, n, pos);
+        msm.commit(pos++);
+    }
+    FeatureLevelRecord f; f.level = 1;
+    uint8_t fb[8];
+    const std::size_t fn = f.encode(fb, sizeof fb);
+    msm.apply(fb, fn, pos);
+    msm.commit(pos++);
+    uint8_t lb[64];
+    std::size_t ln = encodeLineage(lb, 1, 0, 0xAAAA'BBBB'CCCC'DDDDull, 2, 2, 7, 0x1122334455667788LL);
+    msm.apply(lb, ln, pos);
+    msm.commit(pos++);
+    ln = encodeLineage(lb, 1, 1, 0x1234, 1, 1, 6);
+    msm.apply(lb, ln, pos);
+    msm.commit(pos++);
+
+    VecSnapshotWriter w;
+    msm.snapshot(w);
+    MetadataStateMachine restored;
+    {
+        VecSnapshotReader r(w.data());
+        restored.restore(r);
+        EXPECT_TRUE(r.done()) << "the image was not consumed exactly";
+    }
+    for (const int32_t p : {0, 1}) {
+        const auto* a = msm.lineage(1, p);
+        const auto* b = restored.lineage(1, p);
+        ASSERT_NE(b, nullptr) << "partition " << p << ": the lineage was lost across snapshot/restore";
+        EXPECT_EQ(b->lineage, a->lineage);
+        EXPECT_EQ(b->mintEpoch, a->mintEpoch);
+        EXPECT_EQ(b->confirmedEpoch, a->confirmedEpoch);
+        EXPECT_EQ(b->confirmedLeader, a->confirmedLeader);
+        EXPECT_EQ(b->incarnation, a->incarnation);
+    }
+    EXPECT_FALSE(restored.assignment(1, 0)->cleanElection) << "the unclean election class was lost";
+    EXPECT_TRUE(restored.assignment(1, 1)->cleanElection);
+    EXPECT_EQ(restored.featureLevel(), 1) << "the feature level was lost (D15b m4)";
+    EXPECT_EQ(restored.assignment(4, 0)->mark.kind, LeaderlessMark::Kind::EmptyMemoryLeader);
+    EXPECT_EQ(restored.assignment(4, 0)->mark.node, 2);
+    EXPECT_EQ(restored.assignment(4, 0)->mark.incarnation, 0x77);
+    // The image bytes are a function of the state (lineages sorted by key).
+    VecSnapshotWriter w2;
+    restored.snapshot(w2);
+    EXPECT_EQ(w2.data(), w.data()) << "a restored state re-snapshots to different bytes";
+
+    // A v0 (pre-N4) image: committedPos, count, the bare assignment fields.
+    VecSnapshotWriter v0;
+    v0.writeInt64(41);
+    v0.writeInt32(1);
+    for (const int32_t x : {1, 0, 5, 3, 4, 2, 5, 6, 3, 5, 6, 7}) v0.writeInt32(x);
+    MetadataStateMachine old;
+    VecSnapshotReader r0(v0.data());
+    old.restore(r0);
+    EXPECT_TRUE(r0.done());
+    ASSERT_NE(old.assignment(1, 0), nullptr) << "an old image no longer loads";
+    EXPECT_EQ(old.assignment(1, 0)->leaderNode, 5);
+    EXPECT_EQ(old.assignment(1, 0)->leaderEpoch, 3);
+    EXPECT_EQ(old.assignment(1, 0)->isr, (std::vector<int32_t>{5, 6}));
+    EXPECT_EQ(old.assignment(1, 0)->replicas, (std::vector<int32_t>{5, 6, 7}));
+    EXPECT_TRUE(old.assignment(1, 0)->cleanElection);
+    EXPECT_EQ(old.lineage(1, 0), nullptr);
+    EXPECT_EQ(old.featureLevel(), 0);
+}

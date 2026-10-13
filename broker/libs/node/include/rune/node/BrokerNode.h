@@ -794,6 +794,32 @@ public:
             -1, -1, std::forward<F>(f), timeout);
     }
 
+    /// E2 residual round 5 (R2), TEST-ONLY: a controller answers this node's
+    /// node-control identity kNodeSuperseded (as after a late frame of an
+    /// unseen older process) — the node ROTATES its process identity.  Runs on
+    /// the control thread; returns the identity before the rotation.
+    template <class = void>
+    int64_t supersedeProcessIdentityForTest() {
+        return onControlThreadForTest([this]() -> int64_t {
+            if (!runtimeAgent_) return 0;
+            auto& cs = runtimeAgent_->controlledShutdown();
+            const int64_t id = cs.nonceOnControl();
+            rune::replication::AlterIsrResponseMsg r{};
+            r.leaderId       = config_.nodeId;
+            r.leaderEpoch    = static_cast<rune::replication::Epoch>(static_cast<uint32_t>(static_cast<uint64_t>(id)));
+            r.partitionEpoch = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(id) >> 32));
+            r.errorCode      = rune::replication::AlterIsrMsg::kNodeSuperseded;
+            cs.onResponse(r);
+            return id;
+        });
+    }
+    template <class = void>
+    int64_t processIdentityForTest() {
+        return onControlThreadForTest([this]() -> int64_t {
+            return runtimeAgent_ ? runtimeAgent_->controlledShutdown().nonceOnControl() : 0;
+        });
+    }
+
     /// Test-only, CONTROL thread only (call inside onControlThreadForTest):
     /// the durable __cluster_metadata ISR knowledge (round-4 LOW-B tests).
     [[nodiscard]] const rune::replication::InternalIsrKnowledge* internalIsrKnowledgeForTest() const noexcept {
@@ -1089,6 +1115,22 @@ private:
     // Configuration (immutable after construction)
     // -----------------------------------------------------------------------
     NodeConfig config_;
+    /// E2 final fix wave (C1, USER DECISION option b): a transient partition's
+    /// data lineage is COMMITTED METADATA (TransientLineageRecord) — the
+    /// coordinator answers from the lineage confirmed for the partition's
+    /// current leadership, and "pending" (a retriable answer) until it is.
+    /// processIncarnation_: a random non-zero token per process — the
+    /// single-node controller's lineage authority (every transient ring there
+    /// lives exactly as long as the process).
+    int64_t processIncarnation_ = 0;
+    /// E2 C1 residual N1: this process's node-control identity (multi-node) —
+    /// registered with every controller (ControlledShutdown) and stamped on
+    /// every replica's lineage report.  Drawn once at construction.
+    int64_t lifecycleNonce_ = 0;
+    void ensureProcessIncarnation_();
+    static uint64_t transientLineageTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept;
+    static bool isTransientTopicTrampoline_(void* ctx, int32_t topicId) noexcept;
+    static uint64_t transientLineageVersionTrampoline_(void* ctx) noexcept;   // R1 (round 5)
 
     // Task 9 (RUNE_TLS SIGHUP reload): the trigger-only cross-thread ring —
     // requestTlsCertReload() (any thread) offers kTlsReloadTrigger;

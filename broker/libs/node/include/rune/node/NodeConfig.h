@@ -63,6 +63,9 @@ struct TopicSpec {
     std::string name;
     int32_t     partitionCount = 1;
     int32_t     topicId        = -1;
+    /// Replicas per partition (RUNE_TOPICS `rf=N`); 0 = every node (the
+    /// default).  Clamped to the cluster size.
+    int16_t     replicationFactor = 0;
     enum class CleanupPolicy : uint8_t { Delete = 0, Compact = 1, CompactDelete = 2 };
     CleanupPolicy cleanupPolicy           = CleanupPolicy::Delete;
     int64_t       retentionMs             = -1;             // -1 = unbounded
@@ -264,6 +267,13 @@ struct NodeConfig {
     // Default 10 000 ms (10 s) matches the PartitionConfig default.
     // Tests may set a lower value (e.g. 500 ms) for faster ISR shrink in kill scenarios.
     int64_t replicaLagMaxMs = 10'000;
+
+    // TEST-ONLY (E2 C1 residual N1): a controller that becomes ready takes no
+    // dynamic leadership decision for a USER partition (failover, leaderless,
+    // bump, rebalance) for this long — internal partitions are decided as
+    // usual.  Holds a full restart's stale committed leadership in place so a
+    // test can probe it.  0 (default): no hold; never set in production.
+    int64_t testUserDecisionHoldMs = 0;
 
     // Follower periodic-fetch backstop cadence (RUNE_FETCH_INTERVAL_US, default
     // 5000µs = 5ms).  GR-10 push + fast-ack is meant to drive replication; this

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <string>
@@ -1119,4 +1120,163 @@ TEST(WorkerViewSetRegression, ViewDataDirsArePerProcess) {
                   ("rune-views-per-process-" + std::to_string(::getpid()))).string());
     EXPECT_TRUE(std::filesystem::is_directory(d));
     EXPECT_EQ(tmpDir("rune-views-test"), tmpDir("rune-views-test")) << "stable within a process";
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b E2 (Part E Task 7 carry-over): a Live cursor is live against ONE
+// source ring identity — (replica incarnation, logGeneration).
+// ---------------------------------------------------------------------------
+namespace {
+std::vector<uint8_t> concatBatches(std::initializer_list<std::vector<uint8_t>> parts) {
+    std::vector<uint8_t> out;
+    for (const auto& p : parts) out.insert(out.end(), p.begin(), p.end());
+    return out;
+}
+} // namespace
+
+// The source ring was RECREATED (a new replica for the same partition on this
+// node) and its range [0,3) happens to cover the old cursor 2: before the fix
+// the instance stayed Live at 2 — keys 7 and 8 kept their stale values.
+TEST(WorkerViewSetRegression, TransientSourceRecreatedRefoldsFromRingStartRegression) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(1), srcs, 0x40000035).value();
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-transient-recreated"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+
+    const auto inc1 = concatBatches({upsertAt(0, 7, 10), upsertAt(1, 8, 20)});
+    auto rr1 = [&](int64_t, int64_t) { return rune::storage::LogReadView{inc1.data(), inc1.size(), 0, 2}; };
+    rune::node::TransientBounds tb1{0, 2};
+    tb1.incarnation = 1;
+    vs.driveFolds(5, 0, rr1, 2, 0, &tb1);
+    const rune::view::RowLayout* L = nullptr;
+    ASSERT_NE(vs.getRow(0x40000035, 0, 7, L), nullptr);
+    ASSERT_EQ(rune::view::readSlot(vs.getRow(0x40000035, 0, 7, L), *L, 1).i, 10);
+
+    const auto inc2 = concatBatches({upsertAt(0, 7, 99), upsertAt(1, 8, 98), upsertAt(2, 9, 97)});
+    auto rr2 = [&](int64_t, int64_t) { return rune::storage::LogReadView{inc2.data(), inc2.size(), 0, 3}; };
+    rune::node::TransientBounds tb2{0, 3};
+    tb2.incarnation = 2;
+    vs.driveFolds(5, 0, rr2, 3, 0, &tb2);
+    EXPECT_EQ(rune::view::readSlot(vs.getRow(0x40000035, 0, 7, L), *L, 1).i, 99) << "a stale row survived";
+    EXPECT_EQ(rune::view::readSlot(vs.getRow(0x40000035, 0, 8, L), *L, 1).i, 98) << "a stale row survived";
+    ASSERT_NE(vs.getRow(0x40000035, 0, 9, L), nullptr);
+    EXPECT_EQ(vs.foldCounters(0x40000035, 0)->transientSourceResets, 1u);
+    EXPECT_EQ(vs.foldCounters(0x40000035, 0)->transientRecordsEvicted, 0u) << "a recreation is not an eviction";
+}
+
+// The ring's content changed IN PLACE (logGeneration moved: a truncation or a
+// follower ring reset) with the cut BELOW the cursor: re-fold from the cut.  A
+// generation change whose cut is at/above the cursor leaves it alone.
+TEST(WorkerViewSetRegression, TransientSourceCutBelowCursorRefoldsFromTheCutRegression) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(1), srcs, 0x40000036).value();
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-transient-cut"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+
+    const auto gen0 = concatBatches({upsertAt(0, 7, 1), upsertAt(1, 8, 2), upsertAt(2, 9, 3)});
+    auto rr0 = [&](int64_t, int64_t) { return rune::storage::LogReadView{gen0.data(), gen0.size(), 0, 3}; };
+    rune::node::TransientBounds tb0{0, 3};
+    vs.driveFolds(5, 0, rr0, 3, 0, &tb0);   // Live, cursor 3, generation 0
+
+    // Generation 1, cut at 1: offsets >= 1 changed — 8 and 9 now carry new values.
+    const auto gen1 = concatBatches({upsertAt(0, 7, 1), upsertAt(1, 8, 22), upsertAt(2, 9, 33)});
+    auto rr1 = [&](int64_t from, int64_t) {
+        EXPECT_EQ(from, 1) << "re-fold from the cut, not from the ring start or the old cursor";
+        return rune::storage::LogReadView{gen1.data(), gen1.size(), 0, 3};
+    };
+    rune::node::TransientBounds tb1{0, 3};
+    tb1.logGeneration = 1;
+    tb1.cutOffset     = 1;
+    vs.driveFolds(5, 0, rr1, 3, 0, &tb1);
+    const rune::view::RowLayout* L = nullptr;
+    EXPECT_EQ(rune::view::readSlot(vs.getRow(0x40000036, 0, 8, L), *L, 1).i, 22);
+    EXPECT_EQ(rune::view::readSlot(vs.getRow(0x40000036, 0, 9, L), *L, 1).i, 33);
+    EXPECT_EQ(vs.foldCounters(0x40000036, 0)->transientSourceResets, 1u);
+
+    // Generation 2, cut at 5 (above the cursor 3): nothing the view folded changed.
+    auto rrNone = [&](int64_t, int64_t) { return rune::storage::LogReadView{}; };
+    rune::node::TransientBounds tb2{0, 3};
+    tb2.logGeneration = 2;
+    tb2.cutOffset     = 5;
+    vs.driveFolds(5, 0, rrNone, 3, 0, &tb2);
+    EXPECT_EQ(vs.foldCounters(0x40000036, 0)->transientSourceResets, 1u) << "a cut above the cursor is no reset";
+}
+
+// The follower ring-reset shape (PartitionReplica::resetTransientLogTo_): the
+// generation moves with the cut at the OLD ring start and the ring restarts
+// empty ABOVE the cursor.  The view re-folds from the oldest held record (the
+// new logStart), counts one reset, and the jump is not counted as an eviction.
+TEST(WorkerViewSetRegression, TransientSourceRingResetRefoldsFromOldestHeldRecordRegression) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(1), srcs, 0x40000037).value();
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-transient-ring-reset"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+
+    const auto gen0 = concatBatches({upsertAt(0, 7, 1), upsertAt(1, 8, 2)});
+    auto rr0 = [&](int64_t, int64_t) { return rune::storage::LogReadView{gen0.data(), gen0.size(), 0, 2}; };
+    rune::node::TransientBounds tb0{0, 2};
+    vs.driveFolds(5, 0, rr0, 2, 0, &tb0);   // Live, cursor 2, generation 0
+
+    const auto reset = upsertAt(10, 9, 3);  // ring restarted at the leader's start 10
+    auto rr1 = [&](int64_t from, int64_t) {
+        EXPECT_EQ(from, 10) << "re-fold from the oldest held record";
+        return rune::storage::LogReadView{reset.data(), reset.size(), 10, 11};
+    };
+    rune::node::TransientBounds tb1{10, 11};
+    tb1.logGeneration = 1;
+    tb1.cutOffset     = 0;                  // cut at the OLD ring start
+    vs.driveFolds(5, 0, rr1, 11, 0, &tb1);
+    const rune::view::RowLayout* L = nullptr;
+    ASSERT_NE(vs.getRow(0x40000037, 0, 9, L), nullptr);
+    EXPECT_NE(vs.getRow(0x40000037, 0, 7, L), nullptr) << "rows are kept";
+    EXPECT_EQ(vs.foldCounters(0x40000037, 0)->transientSourceResets, 1u);
+    EXPECT_EQ(vs.foldCounters(0x40000037, 0)->transientRecordsEvicted, 0u) << "a reset is not an eviction";
+}
+
+// Fix round 1: PartitionReplica keeps only the LAST cut.  Two cuts between view
+// passes (truncate at 2, then at 5; generation 0 -> 2) with the cursor at 8:
+// trusting the last cut (5) would keep the stale rows folded from [2,5).  A
+// generation jump of more than one re-folds from the ring start.
+TEST(WorkerViewSetRegression, TransientSourceGenerationJumpRefoldsFromRingStartRegression) {
+    auto src = charSourceV1();
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(hpView(1), srcs, 0x40000038).value();
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-transient-gen-jump"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+
+    // Generation 0: keys 100..107 at offsets [0,8), hp = key.
+    const auto g0 = concatBatches({upsertAt(0, 100, 0), upsertAt(1, 101, 1), upsertAt(2, 102, 2),
+                                   upsertAt(3, 103, 3), upsertAt(4, 104, 4), upsertAt(5, 105, 5),
+                                   upsertAt(6, 106, 6), upsertAt(7, 107, 7)});
+    auto rrG0 = [&](int64_t, int64_t) { return rune::storage::LogReadView{g0.data(), g0.size(), 0, 8}; };
+    rune::node::TransientBounds tb0{0, 8};
+    vs.driveFolds(5, 0, rrG0, 8, 0, &tb0);   // Live, cursor 8, generation 0
+    const rune::view::RowLayout* L = nullptr;
+    ASSERT_EQ(rune::view::readSlot(vs.getRow(0x40000038, 0, 103, L), *L, 1).i, 3);
+
+    // Truncated at 2 (gen 1), refilled, truncated at 5 (gen 2), refilled: the
+    // ring now holds new values for offsets [2,8).  Only the last cut (5) is kept.
+    const auto g2 = concatBatches({upsertAt(0, 100, 0), upsertAt(1, 101, 1), upsertAt(2, 102, 52),
+                                   upsertAt(3, 103, 53), upsertAt(4, 104, 54), upsertAt(5, 105, 55),
+                                   upsertAt(6, 106, 56), upsertAt(7, 107, 57)});
+    auto rrG2 = [&](int64_t from, int64_t) {
+        EXPECT_EQ(from, 0) << "an unknown earlier cut: re-fold from the ring start";
+        return rune::storage::LogReadView{g2.data(), g2.size(), 0, 8};
+    };
+    rune::node::TransientBounds tb2{0, 8};
+    tb2.logGeneration = 2;
+    tb2.cutOffset     = 5;
+    vs.driveFolds(5, 0, rrG2, 8, 0, &tb2);
+    for (int64_t k = 102; k <= 107; ++k)
+        EXPECT_EQ(rune::view::readSlot(vs.getRow(0x40000038, 0, static_cast<uint64_t>(k), L), *L, 1).i, k - 50)
+            << "stale row for key " << k;
+    EXPECT_EQ(vs.foldCounters(0x40000038, 0)->transientSourceResets, 1u);
+    EXPECT_EQ(vs.foldCounters(0x40000038, 0)->transientRecordsEvicted, 0u);
 }

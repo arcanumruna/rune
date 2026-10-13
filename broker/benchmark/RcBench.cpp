@@ -32,6 +32,22 @@
 //                            getrusage outside the timed interval).  Regression
 //                            threshold (controller ticket): p99 <= 20 µs at the
 //                            default 32 KiB budget.
+//   BM_RcRingRebuildStep/<budget> — E2 final fix wave (I3): ONE budgeted step of
+//                            the MEMORY-BACKED rebuild (RingScanning) over a FULL
+//                            8 MiB InMemoryLog of minimum-size batches (~110k,
+//                            transactions interleaved), producer state fed too —
+//                            the per-partition cost a failover adds to each
+//                            worker pass.  p50 / p99 / max per step (µs).
+//   BM_RcRingRebuildFull/<budget> — the WHOLE ring rebuild (every step until
+//                            Ready).  <budget> = 2147483647 is the pre-I3
+//                            behaviour: the whole ring in ONE pass.
+//   BM_RcTransientFailover/<K> — the K-partition failover: ONE shard-mode worker
+//                            owns K transient follower partitions with full 8 MiB
+//                            rings; BecomeLeader for all K lands in one pass; every
+//                            Worker::doWork is timed until all K RC states are
+//                            Ready.  max_pass_us / p99_pass_us / all_ready_us /
+//                            passes (the Release twin of the
+//                            TransientFailoverLatencyGateRegression test gate).
 //   BM_RcWorkerPush/<iso>  — the worker-push egress arm (pushOwnedSubscriptions_)
 //                            of 64 x ~1 KiB non-txn batches on an embedded-driver
 //                            IPC publication (review I-3).  iso 0 / 1 as above.
@@ -46,10 +62,15 @@
 #endif
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/Worker.h>
+#include <rune/metadata/ShardRouter.h>
+#include <rune/node/ReplicaRegistry.h>
+#include <rune/node/WorkerPool.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
+#include <rune/storage/InMemoryLog.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/ProducerStateManager.h>
 #include <rune/transaction/ControlMarker.h>
 
 #include <benchmark/benchmark.h>
@@ -356,6 +377,192 @@ void BM_RcBuildStep(benchmark::State& state) {
 }
 #endif
 
+#if defined(RUNE_RCBENCH_S4)
+// ---- E2 final fix wave (I3): the memory-backed (transient) RC rebuild -------
+struct FullRing {
+    rune::storage::InMemoryLog mem{8u << 20, 1'000'000};
+    FullRing() {
+        auto build = [](int64_t pid, int32_t seq, bool txn) {
+            rune::protocol::RecordBatchBuilder b(0, 1000);
+            if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
+            if (txn) b.setTransactional(true);
+            b.append("", "", 1000);
+            return b.build();
+        };
+        auto put = [&](const std::vector<uint8_t>& b) {
+            int64_t base = -1;
+            (void)mem.appendNoSyncRestamp(b.data(), b.size(),
+                                          rune::protocol::RecordBatchReader(b.data(), b.size()).lastOffsetDelta(),
+                                          base);
+        };
+        const auto plain = build(-1, -1, false);
+        int32_t seq[8] = {};
+        for (int64_t i = 0; mem.logStartOffset() == 0 || i < 150'000; ++i) {
+            if (i % 1000 == 0) {
+                const int k = static_cast<int>((i / 1000) % 8);
+                put(build(1000 + k, seq[k]++, true));
+                if ((i / 1000) % 3 != 2)
+                    put(rune::transaction::ControlMarker::build(
+                        1000 + k, 0,
+                        ((i / 1000) % 3) == 0 ? rune::transaction::ControlType::Commit
+                                              : rune::transaction::ControlType::Abort, 0));
+            } else {
+                put(plain);
+            }
+            if (i > 2'000'000) break;
+        }
+    }
+};
+FullRing& fullRing() { static FullRing r; return r; }
+
+void BM_RcRingRebuildStep(benchmark::State& state) {
+    auto& ring = fullRing();
+    const auto budget = static_cast<int32_t>(state.range(0));
+    rune::storage::ProducerStateManager psm;
+    rune::node::RcState rc;
+    rc.reserve(256);
+    rc.reserveRingRebuild();
+    rc.bindProducerState(&psm, 1, 0);
+    rune::node::RcFacts f;
+    f.leader = true; f.epoch = 1;
+    std::vector<double> us;
+    us.reserve(1u << 20);
+    std::size_t bytes = 0;
+    for (auto _ : state) {
+        if (rc.ready()) ++f.logGeneration;   // the next step starts a fresh build (reset + first step)
+        const auto t0 = std::chrono::steady_clock::now();
+        bytes += rc.advance(f, nullptr, budget, &ring.mem);
+        const auto t1 = std::chrono::steady_clock::now();
+        us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+    }
+    std::sort(us.begin(), us.end());
+    state.counters["p50_us"] = us[us.size() / 2];
+    state.counters["p99_us"] = us[std::min(us.size() - 1, us.size() * 99 / 100)];
+    state.counters["max_us"] = us.back();
+    state.counters["ring_batches"] = static_cast<double>(ring.mem.logEndOffset() - ring.mem.logStartOffset());
+    state.SetBytesProcessed(static_cast<int64_t>(bytes));
+}
+
+void BM_RcRingRebuildFull(benchmark::State& state) {
+    auto& ring = fullRing();
+    const auto budget = static_cast<int32_t>(state.range(0));
+    rune::storage::ProducerStateManager psm;
+    rune::node::RcState rc;
+    rc.reserve(256);
+    rc.reserveRingRebuild();
+    rc.bindProducerState(&psm, 1, 0);
+    rune::node::RcFacts f;
+    f.leader = true; f.epoch = 1;
+    uint64_t steps = 0;
+    double maxStepUs = 0;
+    for (auto _ : state) {
+        ++f.logGeneration;   // a fresh build
+        do {
+            const auto t0 = std::chrono::steady_clock::now();
+            (void)rc.advance(f, nullptr, budget, &ring.mem);
+            const auto t1 = std::chrono::steady_clock::now();
+            maxStepUs = std::max(maxStepUs, std::chrono::duration<double, std::micro>(t1 - t0).count());
+            ++steps;
+        } while (!rc.ready());
+    }
+    state.counters["steps_per_rebuild"] = static_cast<double>(steps) / static_cast<double>(state.iterations());
+    state.counters["max_step_us"] = maxStepUs;
+}
+
+void BM_RcTransientFailover(benchmark::State& state) {
+    const int k = static_cast<int>(state.range(0));
+    auto fill = [](rune::storage::InMemoryLog& mem, int64_t pidBase) {
+        auto build = [](int64_t pid, int32_t seq, bool txn) {
+            rune::protocol::RecordBatchBuilder b(0, 1000);
+            if (pid >= 0) { b.setProducerId(pid); b.setProducerEpoch(0); b.setBaseSequence(seq); }
+            if (txn) b.setTransactional(true);
+            b.append("", "", 1000);
+            return b.build();
+        };
+        auto put = [&](const std::vector<uint8_t>& b) {
+            int64_t base = -1;
+            (void)mem.appendNoSyncRestamp(b.data(), b.size(),
+                                          rune::protocol::RecordBatchReader(b.data(), b.size()).lastOffsetDelta(),
+                                          base);
+        };
+        const auto plain = build(-1, -1, false);
+        int32_t seq[8] = {};
+        for (int64_t i = 0; mem.logStartOffset() == 0 || i < 150'000; ++i) {
+            if (i % 1000 == 0) {
+                const int j = static_cast<int>((i / 1000) % 8);
+                put(build(pidBase + j, seq[j]++, true));
+                if ((i / 1000) % 3 != 2)
+                    put(rune::transaction::ControlMarker::build(
+                        pidBase + j, 0,
+                        ((i / 1000) % 3) == 0 ? rune::transaction::ControlType::Commit
+                                              : rune::transaction::ControlType::Abort, 0));
+            } else {
+                put(plain);
+            }
+            if (i > 2'000'000) break;
+        }
+    };
+    double maxPass = 0, p99Pass = 0, allReady = 0, passes = 0;
+    for (auto _ : state) {
+        state.PauseTiming();
+        std::vector<std::unique_ptr<rune::storage::InMemoryLog>> mems;
+        rune::replication::NullPartitionTransport transport;
+        rune::node::ReplicaRegistry reg;
+        rune::node::WorkerPool pool{1, rune::metadata::ShardRouter(1)};
+        for (int p = 0; p < k; ++p) {
+            mems.push_back(std::make_unique<rune::storage::InMemoryLog>(8u << 20, 1'000'000));
+            fill(*mems.back(), 1000 + 10 * p);
+            rune::replication::PartitionConfig c;
+            c.topicId = 1; c.partitionId = p; c.selfId = 1; c.minIsr = 1;
+            c.replicaLagMaxOffset = 1'000'000'000; c.replicaLagMaxMs = 600'000; c.followerFlushIntervalNs = 0;
+            auto r = std::make_unique<rune::replication::PartitionReplica>(
+                c, rune::replication::Role::Follower, 1, std::vector<int32_t>{1, 2}, std::vector<int32_t>{1, 2},
+                mems.back().get(), &transport);
+            r->setExternalFollowerFlush(true);
+            reg.add(1, p, std::move(r));
+        }
+        pool.setRegistry(&reg);
+        rune::node::Worker& w = pool.worker(0);
+        w.setWorkerIngress(nullptr, true);
+        w.setShardMode(true);
+        pool.assignFromRegistry(reg);
+        int64_t now = 1'000'000'000;
+        for (int i = 0; i < 8; ++i) { now += 1'000'000; (void)w.doWork(now); pool.drainAllReturns([](rune::node::WorkerReturn) {}); }
+        for (int p = 0; p < k; ++p) {
+            rune::node::WorkerOp op;
+            op.type = rune::node::WorkerOp::Type::BecomeLeader;
+            op.topicId = 1; op.partition = p; op.roleEpoch = 2; op.isr = {1};
+            (void)pool.tryEnqueueOp(1, p, std::move(op));
+        }
+        std::vector<double> us;
+        us.reserve(1u << 16);
+        state.ResumeTiming();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 200'000; ++i) {
+            now += 1'000;
+            const auto a = std::chrono::steady_clock::now();
+            (void)w.doWork(now);
+            const auto b = std::chrono::steady_clock::now();
+            us.push_back(std::chrono::duration<double, std::micro>(b - a).count());
+            pool.drainAllReturns([](rune::node::WorkerReturn) {});
+            bool all = true;
+            for (int p = 0; p < k && all; ++p) all = w.rcStatusForTest(1, p) == 2;
+            if (all) { allReady = std::chrono::duration<double, std::micro>(b - t0).count(); break; }
+        }
+        state.PauseTiming();
+        std::sort(us.begin(), us.end());
+        maxPass = us.back();
+        p99Pass = us[std::min(us.size() - 1, us.size() * 99 / 100)];
+        passes  = static_cast<double>(us.size());
+        state.ResumeTiming();
+    }
+    state.counters["max_pass_us"]  = maxPass;
+    state.counters["p99_pass_us"]  = p99Pass;
+    state.counters["all_ready_us"] = allReady;
+    state.counters["passes"]       = passes;
+}
+#endif
+
 } // namespace
 
 BENCHMARK(BM_RcPushNonTxn)->Arg(0)->Arg(1)->Unit(benchmark::kMicrosecond);
@@ -363,4 +570,7 @@ BENCHMARK(BM_RcWorkerPush)->Arg(0)->Arg(1)->Unit(benchmark::kMicrosecond);
 #if defined(RUNE_RCBENCH_S4)
 BENCHMARK(BM_RcBuildStep)->Arg(16 * 1024)->Arg(32 * 1024)->Arg(64 * 1024)->Arg(256 * 1024)
     ->Unit(benchmark::kMicrosecond)->Iterations(20000);
+BENCHMARK(BM_RcRingRebuildStep)->Arg(32 * 1024)->Unit(benchmark::kMicrosecond)->Iterations(20000);
+BENCHMARK(BM_RcRingRebuildFull)->Arg(32 * 1024)->Arg(2147483647)->Unit(benchmark::kMillisecond)->Iterations(10);
+BENCHMARK(BM_RcTransientFailover)->Arg(1)->Arg(10)->Unit(benchmark::kMillisecond)->Iterations(3);
 #endif

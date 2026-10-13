@@ -404,6 +404,20 @@ public:
     /// every start; 0 = untracked).  Stamped on every FetchRequest this replica
     /// sends; set once before the replica is driven (ReplicaRegistry::add).
     void setProcessIncarnation(int64_t inc) noexcept { processIncarnation_ = inc; }
+    /// E2 C1 residual N1: this PROCESS's node-control identity (the nonce the
+    /// node registers with every controller, ControlledShutdown).  Carried in
+    /// the transient lineage report and committed with the lineage, so the
+    /// coordinator trusts a lineage only while its leader's process lives.
+    /// Set once before the replica is driven (ReplicaRegistry::add).
+    void setLineageIdentity(int64_t id) noexcept { lineageIdentity_ = id; }
+    /// E2 residual round 5 (R2): this process's identity ROTATED (a stale frame
+    /// superseded it at a controller).  Owner thread.  The replica adopts it
+    /// and — as the leader of a transient partition — re-reports its lineage
+    /// under the CURRENT identity, so the controller re-confirms it (same
+    /// leadership + data: KEEP) and the coordinator trusts it again.  A partition
+    /// never stays NotLeader for the life of the process.
+    void rotateLineageIdentity(int64_t id) noexcept;
+    [[nodiscard]] int64_t lineageIdentityForTest() const noexcept { return lineageIdentity_; }
     [[nodiscard]] int64_t processIncarnation() const noexcept { return processIncarnation_; }
 
     // -----------------------------------------------------------------------
@@ -1200,6 +1214,51 @@ public:
 private:
     uint64_t truncatesDeferred_ = 0;
     uint64_t appliesDroppedTruncatePending_ = 0;
+public:
+    /// Phase 2b E2 (TRANSIENT partitions): refresh the ring's eviction floor to
+    /// the current high watermark before an append that bypasses this replica
+    /// (the worker produce path appends to memoryLog() directly).  No-op on a
+    /// disk partition.  Owner thread.
+    void prepareTransientAppend() noexcept { refreshTransientEvictionFloor_(); }
+    /// Follower ring restarts at the leader's ring start / replicated applies the ring refused.
+    [[nodiscard]] uint64_t transientLogResetsForTest() const noexcept { return transientLogResets_; }
+    [[nodiscard]] uint64_t transientApplyRefusalsForTest() const noexcept {
+        return transientApplyFullRefusals_ + transientApplyTooLargeRefusals_;
+    }
+    /// Stats (owner thread): transient follower ring restarts, and replicated
+    /// applies the ring refused — full of records above the HW (retried when the
+    /// HW moves) / a batch larger than this node's ring (the follower wedges).
+    [[nodiscard]] uint64_t transientLogResets() const noexcept { return transientLogResets_; }
+    [[nodiscard]] uint64_t transientApplyFullRefusals() const noexcept { return transientApplyFullRefusals_; }
+    [[nodiscard]] uint64_t transientApplyTooLargeRefusals() const noexcept { return transientApplyTooLargeRefusals_; }
+private:
+    uint64_t transientLogResets_             = 0;
+    uint64_t transientApplyFullRefusals_     = 0;
+    uint64_t transientApplyTooLargeRefusals_ = 0;
+    /// The ring never evicts at/above what is not committed: the leader's HW
+    /// (min-ISR-gated served HW), a follower's followerHw_.
+    void refreshTransientEvictionFloor_() noexcept {
+        if (memoryBacked_) memLog_->setEvictionFloor(role_ == Role::Leader ? highWatermark() : followerHw_);
+    }
+    /// Kafka leader-epoch stamp of the ACTIVE log (disk Log or ring).
+    void stampEpochOnLog_(int32_t epoch) noexcept {
+        if (memoryBacked_) { if (memLog_ != nullptr) memLog_->setLeaderEpochStamp(epoch); }
+        else if (diskLog_ != nullptr) diskLog_->setLeaderEpochStamp(epoch);
+    }
+    /// Follower replicated apply: everything below min(our LEO, the frame's HW)
+    /// is committed by THIS frame already — free it before the append, so a ring
+    /// full of records the frame commits is not refused for a wasted round trip.
+    void refreshTransientApplyFloor_(Offset leaderHw) noexcept {
+        if (memoryBacked_)
+            memLog_->setEvictionFloor(std::max(followerHw_, std::min(logEndOffset_(), leaderHw)));
+    }
+    /// A replicated apply the ring refused (`rc` < 0): kRefusedFull is counted and
+    /// logged (rate-limited) — retried once the HW moves; kRefusedTooLarge (a batch
+    /// larger than this node's ring) is counted, logged and WEDGES the follower
+    /// (F18: stops fetching, leaves the ISR) — never a silent re-fetch loop.  Cold.
+    void onTransientApplyRefused_(int64_t rc, std::size_t frameBytes);
+    /// A transient follower below the leader's ring start restarts its ring there.  Cold.
+    void resetTransientLogTo_(Offset start);
 
     /// (Leader) GR-10: push records to all ISR followers via unsolicited
     /// FetchResponse.  Non-blocking (tryClaim/offer).  F27: each follower is
@@ -1276,7 +1335,9 @@ private:
         r.leaderEpoch    = epoch_;
         r.partition      = cfg_.partitionId;
         r.highWatermark  = highWatermark;
-        r.logStartOffset = 0;
+        // Phase 2b E2: a TRANSIENT leader advertises its ring start — a follower
+        // below it restarts its ring there (applyReplicated).  Disk: 0, unchanged.
+        r.logStartOffset = memoryBacked_ ? memLog_->logStartOffset() : 0;
         r.errorCode      = errorCode;
         r.topicId        = cfg_.topicId;
         r.records        = records;
@@ -1649,6 +1710,31 @@ private:
     };
     LeaderlessReport report_;
     int  sendLeaderlessReport_(int64_t nowNs);
+    /// E2 final fix wave (C1 multi-node), TRANSIENT replicas only: the leader
+    /// epoch of the leadership whose data this ring holds (-1: unborn — nothing
+    /// held in this process).  A follower adopts its leader's epoch on every
+    /// accepted fetch answer; a leader takes its own epoch.
+    Epoch lineageSrcEpoch_ = -1;
+    int64_t lineageIdentity_ = 0;   ///< N1: see setLineageIdentity
+    /// The leader's lineage report for its leadership `epoch` (data source
+    /// `src`), re-sent until the controller confirms it committed.
+    struct LineageReport {
+        bool    pending = false;
+        Epoch   epoch   = -1;
+        Epoch   src     = -1;
+        bool    sent    = false;
+        int64_t sentNs  = 0;
+    };
+    LineageReport lineageReport_;
+    uint64_t      lineageConfirmed_ = 0;
+    int  sendLineageReport_(int64_t nowNs);
+public:
+    [[nodiscard]] bool     lineageReportPendingForTest() const noexcept { return lineageReport_.pending; }
+    [[nodiscard]] Epoch    lineageReportSrcForTest() const noexcept { return lineageReport_.src; }
+    [[nodiscard]] Epoch    lineageSrcEpochForTest() const noexcept { return lineageSrcEpoch_; }
+    [[nodiscard]] uint64_t lineageConfirmedForTest() const noexcept { return lineageConfirmed_; }
+    static constexpr int64_t kAlterIsrResendNsForTest = 50'000'000LL;   // == kAlterIsrResendNs
+private:
     [[nodiscard]] int32_t bumpFlags_() const noexcept;
     bool fenceEstablished_ = false;          ///< no-fence-file mode: the first leadership was refused
     /// D21 review L2: both leader-epoch-state slots were corrupt — the epochs an

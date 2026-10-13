@@ -128,6 +128,91 @@ static void BM_InMemoryLog_AppendNoSync(benchmark::State& state) {
 BENCHMARK(BM_InMemoryLog_AppendNoSync)->Unit(benchmark::kNanosecond);
 
 // ---------------------------------------------------------------------------
+// BM_InMemoryLog_AppendSpan/{1,4,16,64}
+//
+// Phase 2b E2 Task 11: a FOLLOWER applies a fetched span of N whole batches in
+// ONE appendNoSync; the ring copies it once and indexes it per batch (two header
+// walks: validate + index).  Steady state: the same span bytes every iteration
+// (the headers are rebased onto the LEO), a 4 MiB ring that evicts per batch.
+// items = batches (the per-batch cost is the time / item).
+// ---------------------------------------------------------------------------
+static void BM_InMemoryLog_AppendSpan(benchmark::State& state) {
+    const int n = static_cast<int>(state.range(0));
+    std::vector<uint8_t> span;
+    for (int i = 0; i < n; ++i) {
+        const auto b = makePoseBatch(i, 1700000000000LL + i);
+        span.insert(span.end(), b.begin(), b.end());
+    }
+    InMemoryLog log(4ull * 1024 * 1024, 1ull << 20);
+    for (auto _ : state) {
+        const int64_t last = log.logEndOffset() + n - 1;
+        int64_t result = log.appendNoSync(span.data(), span.size(), last);
+        benchmark::DoNotOptimize(result);
+    }
+    state.SetItemsProcessed(state.iterations() * n);
+    state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(span.size()));
+}
+BENCHMARK(BM_InMemoryLog_AppendSpan)->Arg(1)->Arg(4)->Arg(16)->Arg(64)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
+// BM_InMemoryLog_AppendRestampFloor/{1,8}
+//
+// Phase 2b E2 Task 12: the transient LEADER produce path in steady state — a
+// full 4 MiB ring with an eviction floor (the HW) right behind the log end, so
+// every append first decides the fit side-effect-free (a dry run over the
+// batches it would evict), then evicts them and lands.  Arg k = the appended
+// batch's size in pose-batch units: k = 1 evicts about one resident pose batch
+// per append, k = 8 about eight.
+// ---------------------------------------------------------------------------
+static void BM_InMemoryLog_AppendRestampFloor(benchmark::State& state) {
+    const int k = static_cast<int>(state.range(0));
+    std::vector<uint8_t> small = makePoseBatch(0, 1700000000000LL);
+    InMemoryLog log(4ull * 1024 * 1024, 1ull << 20);
+    int64_t base = 0;
+    while (log.logStartOffset() == 0)   // fill until it evicts (steady state)
+        (void)log.appendNoSyncRestamp(small.data(), small.size(), 0, base);
+    std::vector<uint8_t> big(small);   // the ring copies opaque bytes: a k-times-larger "batch"
+    big.resize(small.size() * static_cast<std::size_t>(k));
+    for (auto _ : state) {
+        log.setEvictionFloor(log.logEndOffset());   // everything appended so far is committed
+        int64_t r = log.appendNoSyncRestamp(big.data(), big.size(), 0, base);
+        benchmark::DoNotOptimize(r);
+    }
+    state.SetItemsProcessed(state.iterations());
+    state.SetBytesProcessed(static_cast<int64_t>(state.iterations()) * static_cast<int64_t>(big.size()));
+}
+BENCHMARK(BM_InMemoryLog_AppendRestampFloor)->Arg(1)->Arg(8)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
+// BM_InMemoryLog_AppendRefusedFloor/{1,64}
+//
+// Phase 2b E2 Task 12 (review M5): the REFUSED transient append — a full ring
+// whose eviction floor leaves exactly k evictable batches, and an append too
+// large for the room those k would free.  The dry run walks the k batches,
+// meets the floor and refuses (TransientLogFull) with no side effect, so every
+// iteration measures the same refusal.  Arg = k, the batches the dry run walks.
+// ---------------------------------------------------------------------------
+static void BM_InMemoryLog_AppendRefusedFloor(benchmark::State& state) {
+    const int k = static_cast<int>(state.range(0));
+    std::vector<uint8_t> small = makePoseBatch(0, 1700000000000LL);
+    InMemoryLog log(4ull * 1024 * 1024, 1ull << 20);
+    int64_t base = 0;
+    while (log.logStartOffset() == 0)   // fill until it evicts: full
+        (void)log.appendNoSyncRestamp(small.data(), small.size(), 0, base);
+    log.setEvictionFloor(log.logStartOffset() + k);   // only k batches are committed
+    std::vector<uint8_t> big(small);
+    big.resize(small.size() * static_cast<std::size_t>(k + 2));   // more than k batches (+ slack) free
+    const int64_t leo = log.logEndOffset();
+    for (auto _ : state) {
+        int64_t r = log.appendNoSyncRestamp(big.data(), big.size(), 0, base);
+        benchmark::DoNotOptimize(r);
+    }
+    if (log.logEndOffset() != leo) state.SkipWithError("an append landed: the setup is not a refusal");
+    state.SetItemsProcessed(state.iterations());
+}
+BENCHMARK(BM_InMemoryLog_AppendRefusedFloor)->Arg(1)->Arg(64)->Unit(benchmark::kNanosecond);
+
+// ---------------------------------------------------------------------------
 // BM_InMemoryLog_AppendSteadyStateFull
 //
 // The realistic memory-backed hot path: a ring pre-filled to its record cap so

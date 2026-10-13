@@ -18,8 +18,10 @@
 #include "rune/metadata/AssignmentMap.h"
 #include "rune/metadata/PartitionAssignment.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 namespace rune::metadata {
@@ -124,6 +126,16 @@ public:
     //    record yet (a log written by pre-D15 binaries). ─────────────────────
     [[nodiscard]] int16_t featureLevel() const noexcept { return featureLevel_; }
 
+    // ── E2 final fix wave (C1 multi-node): the committed data lineage of a
+    //    TRANSIENT partition (TransientLineageRecord), nullptr when none was
+    //    committed.  A record that would move confirmedEpoch BACK is ignored
+    //    (a re-emitted stale decision). ─────────────────────────────────────
+    [[nodiscard]] const TransientLineage* lineage(int32_t topicId, int32_t partition) const noexcept {
+        const auto it = lineages_.find(lineageKey_(topicId, partition));
+        return it == lineages_.end() ? nullptr : &it->second;
+    }
+    [[nodiscard]] uint64_t lineageVersion() const noexcept { return lineageVersion_; }
+
 private:
     // Committed assignments (pos <= committedPos)
     AssignmentMap committed_;
@@ -141,6 +153,15 @@ private:
     /// D15: uncommitted FeatureLevelRecords (pos, level).
     std::vector<std::pair<int64_t, int16_t>> pendingFeature_;
     int16_t featureLevel_ = 0;
+    /// C1 multi-node: committed lineages + uncommitted records (pos, key, lineage).
+    static int64_t lineageKey_(int32_t t, int32_t p) noexcept {
+        return (static_cast<int64_t>(t) << 32) | static_cast<int64_t>(static_cast<uint32_t>(p));
+    }
+    std::unordered_map<int64_t, TransientLineage> lineages_;
+    struct PendingLineage { int64_t pos; int64_t key; TransientLineage l; };
+    std::vector<PendingLineage> pendingLineage_;
+    uint64_t lineageVersion_ = 0;
+    void installLineage_(int64_t key, const TransientLineage& l);
 
     int64_t committedPos_ = -1;
 
@@ -159,37 +180,41 @@ private:
 // Template implementations (snapshot / restore)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Binary snapshot format (all LE int32/int64):
-//   int64  committedPos
-//   int32  count         — number of (topicId, partition, assignment) entries
-//   per entry:
-//     int32 topicId
-//     int32 partition
-//     int32 leaderNode
-//     int32 leaderEpoch
-//     int32 partitionEpoch
-//     int32 isrCount
-//     int32 isr[0..isrCount-1]
-//     int32 replicaCount
-//     int32 replicas[0..replicaCount-1]
+// Binary snapshot format (all LE int32/int64).
 //
-// D15b m4 (documented gap, no production caller today): this image does NOT
-// carry the D15 replicated state — the committed featureLevel() (a
-// FeatureLevelRecord, type 0x8001) and each leaderless assignment's
-// LeaderlessMark (the 0xD1 trailer).  A restore from it would read level 0
-// and no marks, i.e. a successor would lose the leaderless reasons exactly as
-// after a pre-D15 log (see restoreLeaderlessMarks_).  Before any caller
-// (metadata snapshotting / log compaction) lands, bump the image to carry:
-//   int16 featureLevel                     — after committedPos
-//   per entry: uint8 markKind, int32 markNode, int64 markIncarnation
-// with a format version so an older image restores as level 0 / no marks.
+// Image v0 (legacy, still restored):
+//   int64  committedPos   (>= -1)
+//   int32  count
+//   per entry: int32 topicId, partition, leaderNode, leaderEpoch,
+//              partitionEpoch, isrCount, isr[..], replicaCount, replicas[..]
+//
+// Image v1 (written; E2 residual N4 — also closes the D15b m4 gap):
+//   int64  kImageV1Tag    (negative: a v0 image's first int64 is a
+//                          committedPos >= -1, so the tag is unambiguous)
+//   int64  committedPos
+//   int32  featureLevel   (D15 FeatureLevelRecord)
+//   int32  count
+//   per entry: the v0 fields, then
+//              int32 cleanElection (N3), int32 markKind, int32 markNode,
+//              int64 markIncarnation (D15 LeaderlessMark)
+//   int32  lineageCount   (C1 TransientLineage records, sorted by key)
+//   per lineage: int32 topicId, int32 partition, int64 lineage,
+//                int32 mintEpoch, int32 confirmedEpoch, int32 confirmedLeader,
+//                int64 incarnation
+//
+// A v0 image restores as feature level 0, no marks, clean elections and NO
+// lineages (a transient group offset then answers "pending"/"none" until a
+// leadership re-confirms — never a stale offset).
+
+inline constexpr int64_t kMsmImageV1Tag = -0x52554E45'00000001LL;   // "RUNE" v1
 
 template<typename Writer>
 void MetadataStateMachine::snapshot(Writer& w) const
 {
+    w.writeInt64(kMsmImageV1Tag);
     w.writeInt64(committedPos_);
+    w.writeInt32(featureLevel_);
 
-    // Count committed entries
     int32_t count = committed_.size();
     w.writeInt32(count);
 
@@ -203,7 +228,28 @@ void MetadataStateMachine::snapshot(Writer& w) const
         for (int32_t n : pa.isr)      w.writeInt32(n);
         w.writeInt32(static_cast<int32_t>(pa.replicas.size()));
         for (int32_t n : pa.replicas) w.writeInt32(n);
+        w.writeInt32(pa.cleanElection ? 1 : 0);
+        w.writeInt32(static_cast<int32_t>(pa.mark.kind));
+        w.writeInt32(pa.mark.node);
+        w.writeInt64(pa.mark.incarnation);
     });
+
+    // Sorted: the image bytes are a function of the state, not of hash order.
+    std::vector<int64_t> keys;
+    keys.reserve(lineages_.size());
+    for (const auto& [k, l] : lineages_) keys.push_back(k);
+    std::sort(keys.begin(), keys.end());
+    w.writeInt32(static_cast<int32_t>(keys.size()));
+    for (const int64_t k : keys) {
+        const TransientLineage& l = lineages_.at(k);
+        w.writeInt32(static_cast<int32_t>(k >> 32));
+        w.writeInt32(static_cast<int32_t>(static_cast<uint32_t>(k)));
+        w.writeInt64(static_cast<int64_t>(l.lineage));
+        w.writeInt32(l.mintEpoch);
+        w.writeInt32(l.confirmedEpoch);
+        w.writeInt32(l.confirmedLeader);
+        w.writeInt64(l.incarnation);
+    }
 }
 
 template<typename Reader>
@@ -212,9 +258,17 @@ void MetadataStateMachine::restore(Reader& r)
     // Full reset — pending discarded, committed cleared
     committed_.clear();
     pending_.clear();
+    pendingFeature_.clear();
+    lineages_.clear();
+    pendingLineage_.clear();
+    featureLevel_ = 0;
+    ++lineageVersion_;
     ++committedVersion_;
 
-    committedPos_ = r.readInt64();
+    const int64_t first = r.readInt64();
+    const bool v1 = first == kMsmImageV1Tag;
+    committedPos_ = v1 ? r.readInt64() : first;
+    if (v1) featureLevel_ = static_cast<int16_t>(r.readInt32());
     const int32_t count = r.readInt32();
 
     for (int32_t i = 0; i < count; ++i) {
@@ -230,7 +284,27 @@ void MetadataStateMachine::restore(Reader& r)
         int32_t repCount       = r.readInt32();
         pa.replicas.resize(static_cast<std::size_t>(repCount));
         for (int32_t j = 0; j < repCount; ++j) pa.replicas[j] = r.readInt32();
+        if (v1) {
+            pa.cleanElection    = r.readInt32() != 0;
+            pa.mark.kind        = static_cast<LeaderlessMark::Kind>(r.readInt32());
+            pa.mark.node        = r.readInt32();
+            pa.mark.incarnation = r.readInt64();
+        }
         committed_.put(topicId, partition, pa);
+    }
+    if (v1) {
+        const int32_t n = r.readInt32();
+        for (int32_t i = 0; i < n; ++i) {
+            const int32_t t = r.readInt32();
+            const int32_t p = r.readInt32();
+            TransientLineage l;
+            l.lineage         = static_cast<uint64_t>(r.readInt64());
+            l.mintEpoch       = r.readInt32();
+            l.confirmedEpoch  = r.readInt32();
+            l.confirmedLeader = r.readInt32();
+            l.incarnation     = r.readInt64();
+            lineages_[lineageKey_(t, p)] = l;
+        }
     }
     // Snapshot is a full image — any entry not in snapshot is absent (pruned by reset+reload).
 }

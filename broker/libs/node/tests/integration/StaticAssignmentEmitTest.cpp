@@ -2581,3 +2581,219 @@ TEST(D15MemoryEpochRegression, UnmarkedLegacyLeaderlessRecordDecidedAsOnMainRegr
     EXPECT_NE(f.pa().leaderNode, NO_LEADER) << "the balancer did not decide the legacy leaderless partition";
     EXPECT_EQ(f.pa().leaderEpoch, lle + 1);
 }
+
+// ===========================================================================
+// E2 final fix wave (C1 multi-node, USER DECISION option b): the controller
+// commits a TRANSIENT partition's data lineage per leadership.  A leader's
+// report is answered kAlterIsrLineageConfirmed only once the record is
+// COMMITTED (re-sends until then); the lineage is MINTED for an unborn ring,
+// KEPT across a handover whose new leader fetched from the confirmed
+// leadership, MINTED again after a full restart; a report of a superseded
+// leadership is fenced.  RED: the report was never committed / answered.
+// ===========================================================================
+namespace {
+rune::replication::AlterIsrMsg lineageReport(const PartitionAssignment& a, int32_t src) {
+    rune::replication::AlterIsrMsg m{};
+    m.topicId = 0; m.partition = 0; m.leaderId = a.leaderNode; m.leaderEpoch = a.leaderEpoch;
+    m.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump;
+    m.partitionEpoch = a.partitionEpoch;
+    m.isr[1] = rune::replication::AlterIsrMsg::kLineageReport;
+    m.isr[2] = src;
+    return m;
+}
+int16_t answer(MetadataService& svc, const rune::replication::AlterIsrMsg& m) {
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answered = false;
+    (void)svc.onAlterIsr(m, &resp, &answered);
+    return answered ? resp.errorCode : int16_t{-1};
+}
+}  // namespace
+
+TEST(TransientLineageControllerRegression, LineageIsMintedKeptAndReMintedPerLeadershipRegression) {
+    CtlRig c;
+    const auto first = c.pa();
+    // Unborn ring (first leadership): not answered until committed, then confirmed.
+    EXPECT_EQ(answer(*c.svc, lineageReport(first, -1)), -1) << "confirmed before the record committed";
+    c.drive(50);
+    EXPECT_EQ(answer(*c.svc, lineageReport(first, -1)), rune::replication::kAlterIsrLineageConfirmed);
+    const auto* l1 = c.svc->transientLineage(0, 0);
+    ASSERT_NE(l1, nullptr) << "no lineage committed";
+    const uint64_t token1 = l1->lineage;
+    EXPECT_NE(token1, 0u);
+    EXPECT_EQ(l1->mintEpoch, first.leaderEpoch);
+    EXPECT_EQ(l1->confirmedEpoch, first.leaderEpoch);
+    EXPECT_EQ(l1->confirmedLeader, first.leaderNode);
+    EXPECT_EQ(c.svc->lineagesMintedForTest(), 1u);
+
+    // Handover (the old leader asks for a new epoch; another ISR member leads):
+    // the new leader fetched from the confirmed leadership -> KEPT.
+    (void)c.svc->onAlterIsr(c.bump());
+    c.tick();
+    const auto second = c.pa();
+    ASSERT_NE(second.leaderNode, first.leaderNode);
+    EXPECT_EQ(answer(*c.svc, lineageReport(first, -1)), rune::replication::kAlterIsrFencedLeaderEpoch)
+        << "a superseded leadership's report was not fenced";
+    (void)answer(*c.svc, lineageReport(second, first.leaderEpoch));
+    c.drive(50);
+    EXPECT_EQ(answer(*c.svc, lineageReport(second, first.leaderEpoch)), rune::replication::kAlterIsrLineageConfirmed);
+    const auto* l2 = c.svc->transientLineage(0, 0);
+    ASSERT_NE(l2, nullptr);
+    EXPECT_EQ(l2->lineage, token1) << "a handover that kept the data minted a new lineage (false 'none')";
+    EXPECT_EQ(l2->confirmedEpoch, second.leaderEpoch);
+    EXPECT_EQ(l2->mintEpoch, first.leaderEpoch);
+    EXPECT_EQ(c.svc->lineagesKeptForTest(), 1u);
+
+    // Full restart (every ring unborn): the next leadership re-mints.
+    (void)c.svc->onAlterIsr(c.bump());
+    c.tick();
+    const auto third = c.pa();
+    (void)answer(*c.svc, lineageReport(third, -1));
+    c.drive(50);
+    EXPECT_EQ(answer(*c.svc, lineageReport(third, -1)), rune::replication::kAlterIsrLineageConfirmed);
+    const auto* l3 = c.svc->transientLineage(0, 0);
+    ASSERT_NE(l3, nullptr);
+    EXPECT_NE(l3->lineage, token1) << "a leadership with an unborn ring kept the old lineage (offsets resumed into new data)";
+    EXPECT_EQ(l3->mintEpoch, third.leaderEpoch);
+    EXPECT_EQ(c.svc->lineagesMintedForTest(), 2u);
+}
+
+// E2 final fix wave, residual round 3 — N1 (Critical): the coordinator trusts a
+// committed lineage only while the confirmed leader's LIVE process identity
+// (its node-control registration nonce) is the one committed with it.  A full
+// restart keeps the committed (leader, epoch) until its bump commits; the
+// leader's NEW process (or no registration yet) must be "untrusted" — never the
+// old lineage.  RED (identity not checked): the old lineage was trusted.
+namespace {
+void registerNode(MetadataService& svc, int32_t node, int64_t nonce) {
+    rune::replication::AlterIsrMsg m{};
+    m.topicId  = rune::replication::AlterIsrMsg::kNodeControlTopicId;
+    m.leaderId = node;
+    m.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump;
+    m.isr[1]   = rune::replication::AlterIsrMsg::kNodeRegister;
+    m.isr[3]   = static_cast<int32_t>(static_cast<uint64_t>(nonce) & 0xffffffffu);
+    m.isr[4]   = static_cast<int32_t>(static_cast<uint64_t>(nonce) >> 32);
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answered = false;
+    (void)svc.onAlterIsr(m, &resp, &answered);
+}
+}  // namespace
+
+TEST(TransientLineageControllerRegression, LineageIsTrustedOnlyWhileItsLeadersProcessLivesRegression) {
+    CtlRig c;
+    const auto pa = c.pa();
+    const int64_t nonce1 = 0x1111'2222'3333'4444LL;
+    auto rep = lineageReport(pa, -1);
+    rep.isr[3] = static_cast<int32_t>(static_cast<uint64_t>(nonce1) & 0xffffffffu);
+    rep.isr[4] = static_cast<int32_t>(static_cast<uint64_t>(nonce1) >> 32);
+    (void)answer(*c.svc, rep);
+    c.drive(50);
+    ASSERT_EQ(answer(*c.svc, rep), rune::replication::kAlterIsrLineageConfirmed);
+    const uint64_t token = c.svc->transientLineage(0, 0)->lineage;
+    EXPECT_EQ(c.svc->transientLineage(0, 0)->incarnation, nonce1) << "the record must carry the leader's process";
+
+    EXPECT_EQ(c.svc->trustedTransientLineage(0, 0), rune::metadata::kLineageUntrusted)
+        << "trusted before the leader's process registered (a restarted controller knows nobody yet)";
+    registerNode(*c.svc, pa.leaderNode, nonce1);
+    EXPECT_EQ(c.svc->trustedTransientLineage(0, 0), token) << "the live, confirming process is not trusted";
+
+    // The leader's process restarted (a new nonce); the committed assignment is
+    // unchanged — the stale (L, E) a full restart leaves until the bump commits.
+    registerNode(*c.svc, pa.leaderNode, 0x5555'6666'7777'8888LL);
+    EXPECT_EQ(c.pa().leaderEpoch, pa.leaderEpoch) << "precondition: the leadership has not moved";
+    EXPECT_EQ(c.svc->trustedTransientLineage(0, 0), rune::metadata::kLineageUntrusted)
+        << "SILENT LOSS: the dead process's lineage was trusted for the stale committed leadership";
+}
+
+// E2 final fix wave, residual round 3 — N3: leadership passing to a replica
+// that was NOT in the ISR (an unclean / survivor election) may lack committed
+// records even though it fetched from the confirmed leadership (it lagged out
+// of the ISR).  Such a leadership MINTS a new lineage — committed offsets are
+// answered "none", never resumed past data the new leader does not hold.
+// RED (the clean-election bit ignored): the survivor KEPT the lineage.
+TEST(TransientLineageControllerRegression, UncleanElectionToANonIsrReplicaMintsANewLineageRegression) {
+    CtlRig c;
+    c.svc->setAllowSurvivorElection(true);
+    const auto first = c.pa();
+    (void)answer(*c.svc, lineageReport(first, -1));
+    c.drive(50);
+    ASSERT_EQ(answer(*c.svc, lineageReport(first, -1)), rune::replication::kAlterIsrLineageConfirmed);
+    const uint64_t token = c.svc->transientLineage(0, 0)->lineage;
+    EXPECT_TRUE(c.pa().cleanElection);
+
+    // The followers lag out of the ISR; the sole-ISR memory leader restarts
+    // empty -> leaderless -> a survivor (non-ISR) election.
+    c.soleIsr();
+    const int32_t L = c.pa().leaderNode, le = c.pa().leaderEpoch;
+    const int32_t F = L == 1 ? 2 : 1;
+    const int32_t G = 6 - L - F;
+    c.svc->reportReplicaPosition(0, 0, G, le, 10);
+    auto bump = c.bump(le, /*memory=*/true);
+    bump.isr[3] = 2;
+    (void)c.svc->onAlterIsr(bump);
+    c.tick();
+    ASSERT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER);
+    const int32_t lle = c.pa().leaderEpoch;
+    (void)c.svc->onAlterIsr(leaderlessReport(L, lle, 0, 2));
+    (void)c.svc->onAlterIsr(leaderlessReport(F, lle, 0, 7));
+    (void)c.svc->onAlterIsr(leaderlessReport(G, lle, 10, 1));
+    c.tick();
+    ASSERT_EQ(c.pa().leaderNode, G) << "precondition: the survivor (non-ISR) replica leads";
+    EXPECT_FALSE(c.pa().cleanElection) << "a non-ISR leader was derived as a clean election";
+
+    // G fetched from the confirmed leadership (src = le): a clean handover
+    // would KEEP; an unclean one must MINT.
+    const auto unclean = c.pa();
+    (void)answer(*c.svc, lineageReport(unclean, le));
+    c.drive(50);
+    ASSERT_EQ(answer(*c.svc, lineageReport(unclean, le)), rune::replication::kAlterIsrLineageConfirmed);
+    const auto* l2 = c.svc->transientLineage(0, 0);
+    ASSERT_NE(l2, nullptr);
+    EXPECT_NE(l2->lineage, token)
+        << "SILENT LOSS: an unclean election kept the lineage (offsets resume past data the leader lacks)";
+    EXPECT_EQ(l2->mintEpoch, unclean.leaderEpoch);
+}
+
+// E2 final fix wave, residual round 5 — R1 (controller half): when the failure
+// detector finds a node dead (it leaves the heartbeat-eligible set), the
+// remembered process identity of that node no longer vouches for a lineage —
+// cleared for trust at once, even if the committed leadership has not moved
+// yet; a NEW process registering restores trust only for ITS lineages.  RED
+// (identity not cleared on death): the dead process's lineage stayed trusted.
+TEST(TransientLineageControllerRegression, DeathDetectionClearsTheRememberedLeaderIdentityRegression) {
+    CtlRig c;
+    // The partition leader must not be the controller (node 1) itself.
+    for (int i = 0; i < 4 && c.pa().leaderNode == 1; ++i) { (void)c.svc->onAlterIsr(c.bump()); c.tick(); }
+    ASSERT_NE(c.pa().leaderNode, 1) << "precondition: a partition leader other than the controller";
+    c.svc->setUserDecisionHoldForTest(INT64_MAX / 4);   // keep the committed leadership: isolate the identity rule
+    const auto pa = c.pa();
+    const int64_t nonce1 = 0x1111'2222'3333'4444LL;
+    auto rep = lineageReport(pa, -1);
+    rep.isr[3] = static_cast<int32_t>(static_cast<uint64_t>(nonce1) & 0xffffffffu);
+    rep.isr[4] = static_cast<int32_t>(static_cast<uint64_t>(nonce1) >> 32);
+    (void)answer(*c.svc, rep);
+    c.drive(50);
+    ASSERT_EQ(answer(*c.svc, rep), rune::replication::kAlterIsrLineageConfirmed);
+    registerNode(*c.svc, pa.leaderNode, nonce1);
+    const uint64_t token = c.svc->transientLineage(0, 0)->lineage;
+    ASSERT_EQ(c.svc->trustedTransientLineage(0, 0), token) << "precondition: the live leader's lineage is trusted";
+
+    // The failure detector: the leader is out of the eligible set.
+    std::vector<int32_t> live;
+    for (int32_t n : {1, 2, 3}) if (n != pa.leaderNode) live.push_back(n);
+    (void)c.svc->reassignDeadPartitionLeaders(live, 0);
+    c.drive(5);
+    EXPECT_EQ(c.pa().leaderNode, pa.leaderNode) << "precondition: the committed leadership has not moved (held)";
+    EXPECT_EQ(c.svc->knownProcessIdentity(pa.leaderNode), 0) << "the dead node's identity is still remembered";
+    EXPECT_EQ(c.svc->trustedTransientLineage(0, 0), rune::metadata::kLineageUntrusted)
+        << "SILENT LOSS: a lineage was vouched for by a process the failure detector found dead";
+    EXPECT_GE(c.svc->lineageIdentitiesRevokedForTest(), 1u);
+
+    // Back in the eligible set (heartbeats only): still untrusted — liveness
+    // is not proof that the SAME process came back.
+    (void)c.svc->reassignDeadPartitionLeaders({1, 2, 3}, 0);
+    EXPECT_EQ(c.svc->trustedTransientLineage(0, 0), rune::metadata::kLineageUntrusted)
+        << "heartbeats alone restored trust (a restarted process heartbeats before it registers)";
+    // A report from the live, confirming process for the current leadership restores it.
+    (void)answer(*c.svc, rep);
+    EXPECT_EQ(c.svc->trustedTransientLineage(0, 0), token) << "the live process's own report did not restore trust";
+}

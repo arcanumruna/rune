@@ -80,7 +80,6 @@
 using namespace rune::replication;
 using namespace rune::node;
 using namespace rune::metadata;
-namespace pmd = rune::protocol::metadata;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -132,52 +131,6 @@ static PartitionConfig makeUserCfg(NodeId selfId, int32_t topicId, int32_t parti
     cfg.pushOnAppend        = true;
     cfg.fastAckOnApply      = true;
     return cfg;
-}
-
-// Encode one UpdatePartitionAssignmentRecord into buf.
-static std::size_t encodeAssignment(
-    uint8_t* buf, std::size_t bufLen,
-    int32_t topicId, int32_t partition, int32_t leaderNode,
-    const std::vector<int32_t>& isr,
-    const std::vector<int32_t>& replicas,
-    int32_t leaderEpoch, int32_t partitionEpoch)
-{
-    static thread_local std::vector<uint8_t> isrBuf, repBuf;
-    isrBuf.resize(2 + isr.size() * 4);
-    repBuf.resize(2 + replicas.size() * 4);
-
-    auto writeU16 = [](uint8_t* p, uint16_t v) {
-        p[0] = static_cast<uint8_t>(v); p[1] = static_cast<uint8_t>(v >> 8);
-    };
-    auto writeS32 = [](uint8_t* p, int32_t v) {
-        uint32_t u = static_cast<uint32_t>(v);
-        p[0]=static_cast<uint8_t>(u);   p[1]=static_cast<uint8_t>(u>>8);
-        p[2]=static_cast<uint8_t>(u>>16); p[3]=static_cast<uint8_t>(u>>24);
-    };
-
-    writeU16(isrBuf.data(), static_cast<uint16_t>(isr.size()));
-    for (std::size_t i = 0; i < isr.size(); ++i)
-        writeS32(isrBuf.data() + 2 + i * 4, isr[i]);
-    writeU16(repBuf.data(), static_cast<uint16_t>(replicas.size()));
-    for (std::size_t i = 0; i < replicas.size(); ++i)
-        writeS32(repBuf.data() + 2 + i * 4, replicas[i]);
-
-    pmd::Int32ArrayView isrView(
-        reinterpret_cast<const int32_t*>(isrBuf.data() + 2),
-        static_cast<uint16_t>(isr.size()));
-    pmd::Int32ArrayView repView(
-        reinterpret_cast<const int32_t*>(repBuf.data() + 2),
-        static_cast<uint16_t>(replicas.size()));
-
-    pmd::UpdatePartitionAssignmentRecord rec;
-    rec.topicId        = topicId;
-    rec.partition      = partition;
-    rec.leaderNode     = leaderNode;
-    rec.isr            = isrView;
-    rec.replicas       = repView;
-    rec.leaderEpoch    = leaderEpoch;
-    rec.partitionEpoch = partitionEpoch;
-    return rec.encode(buf, bufLen);
 }
 
 // Build a minimal single-record batch for benchmarking.

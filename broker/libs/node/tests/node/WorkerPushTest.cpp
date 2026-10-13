@@ -15,6 +15,7 @@
 #include <rune/node/WorkerOp.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/transaction/ControlMarker.h>
+#include <rune/storage/InMemoryLog.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/DataMessages.h>
@@ -731,6 +732,206 @@ TEST_F(TxnRcRegression, WorkerPushPreCarrierGroupCutsAtAbortedBatch) {
                                 return !c.baseOffsets.empty() && c.baseOffsets.back() == 2; }, 10s));
     EXPECT_EQ(c.baseOffsets, (std::vector<int64_t>{0, 2})) << "the aborted batch was lost before the carrier";
     std::filesystem::remove_all(dir);
+}
+
+
+// ===========================================================================
+// Phase 2b E2 Task 5: the in-worker (shard-mode) subscription push of a
+// TRANSIENT partition — the Subscribe op carries no disk Log; the source is the
+// owned replica's InMemoryLog ring (zero-copy view, same thread).  A cursor the
+// ring evicted resumes AT the ring start (counted) — never a stall; a
+// subscription whose partition moved away parks and never reads the ring.
+// ===========================================================================
+class TransientOwnedPushRegression : public WorkerPushFixture {
+protected:
+    static rune::replication::PartitionConfig leaderCfg() {
+        rune::replication::PartitionConfig c;
+        c.topicId = 10; c.partitionId = 0; c.selfId = 1; c.minIsr = 1; c.durabilityTier = 1;
+        c.fetchIntervalNs = 1'000'000'000LL; c.isrCheckIntervalNs = 1'000'000'000LL; c.pushOnAppend = false;
+        c.replicaLagMaxMs = 1'000'000;
+        return c;
+    }
+    static int64_t appendRing(rune::storage::InMemoryLog& mem, int64_t base, std::size_t valueBytes = 8) {
+        rune::protocol::RecordBatchBuilder b(base, 1000 + base);
+        b.append("k", std::string(valueBytes, 'v'), 1000 + base);
+        const auto bytes = b.build();
+        EXPECT_GE(mem.append(bytes, base), 0);
+        return base + 1;
+    }
+    WorkerOp ringSubscribeOp(int64_t subId, rune::replication::PartitionReplica* r, int64_t from) {
+        WorkerOp op = subscribeOp(subId, r->topicId(), 0, from, /*log=*/nullptr);   // no disk Log
+        op.replica = r;
+        op.targetReplicaId = r->registryId(); op.incarnation = r->incarnation();   // as WorkerPool stamps it
+        return op;
+    }
+    struct NullT final : rune::replication::PartitionTransport {
+        bool sendFetchRequest(const rune::replication::FetchRequestMsg&) override { return true; }
+        bool sendFetchResponse(rune::replication::NodeId, const rune::replication::FetchResponseMsg&) override { return true; }
+    };
+};
+
+TEST_F(TransientOwnedPushRegression, OwnedSubscriptionPushesFromTheRingRegression) {
+    rune::storage::InMemoryLog mem(1u << 20, 1000);
+    constexpr int kN = 20;
+    for (int i = 0; i < kN; ++i) appendRing(mem, i);
+    NullT t;
+    rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &mem, &t);
+    rep.setRegistryHandle(3, 400);
+    rep.onLeaderLogAppended();
+    ASSERT_EQ(rep.highWatermark(), kN);
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3201);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3201);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    ASSERT_TRUE(w.tryEnqueueOp(ringSubscribeOp(1, &rep, 0)));
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1);
+        sub->poll(c.fa.handler(), 64);
+        return static_cast<int>(c.baseOffsets.size()) >= kN;
+    }, 10s)) << "a transient owned subscription pushed " << c.baseOffsets.size() << "/" << kN
+             << " (was: parked — no disk Log)";
+    for (int i = 0; i < kN; ++i) EXPECT_EQ(c.baseOffsets[i], i) << "out-of-order or gap at index " << i;
+    EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, kN);
+    EXPECT_EQ(w.transientCursorSkipsForTest(), 0u);
+}
+
+TEST_F(TransientOwnedPushRegression, EvictedCursorResumesAtTheRingStartRegression) {
+    rune::storage::InMemoryLog mem(8 * 1024, 1000);   // ~7 x 1 KiB batches fit: retention evicts
+    constexpr int kN = 20;
+    for (int i = 0; i < kN; ++i) appendRing(mem, i, 1000);
+    const int64_t start = mem.logStartOffset();
+    ASSERT_GT(start, 0) << "precondition: the ring evicted records";
+    NullT t;
+    rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &mem, &t);
+    rep.setRegistryHandle(3, 401);
+    rep.onLeaderLogAppended();
+    ASSERT_EQ(rep.highWatermark(), kN);
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3202);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3202);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    ASSERT_TRUE(w.tryEnqueueOp(ringSubscribeOp(1, &rep, /*from=*/0)));   // subscribed BELOW the ring start
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1);
+        sub->poll(c.fa.handler(), 64);
+        return !c.baseOffsets.empty() && c.baseOffsets.back() == kN - 1;
+    }, 10s)) << "a cursor below the ring start stalled (pushed " << c.baseOffsets.size() << ")";
+    ASSERT_FALSE(c.baseOffsets.empty());
+    EXPECT_EQ(c.baseOffsets.front(), start) << "resumed AT the ring start";
+    for (std::size_t i = 0; i < c.baseOffsets.size(); ++i) EXPECT_EQ(c.baseOffsets[i], start + static_cast<int64_t>(i));
+    // E2 final fix wave (M2): a subscription that STARTED below the ring start
+    // (its bind-time cursor) never fell behind — raised, not counted as lag.
+    // RED (before M2): counted as one skip of `start` evicted-unread records.
+    EXPECT_EQ(w.transientCursorSkipsForTest(), 0u) << "a fresh subscribe below the ring start counted as lag";
+    EXPECT_EQ(w.transientRecordsSkippedForTest(), 0u);
+    EXPECT_EQ(w.transientFreshCursorsRaisedForTest(), 1u) << "the fresh raise is counted once";
+}
+
+// E2 final fix wave (M2): a subscription that DELIVERED and then fell behind the
+// ring (the producer outran it and the ring evicted records it had not read)
+// is still counted and warned as evicted-unread records — only the fresh
+// bind-time cursor is exempt.
+TEST_F(TransientOwnedPushRegression, ASubscriptionThatDeliveredAndFellBehindIsCountedRegression) {
+    rune::storage::InMemoryLog mem(8 * 1024, 1000);   // ~7 x 1 KiB batches fit
+    for (int i = 0; i < 4; ++i) appendRing(mem, i, 1000);
+    ASSERT_EQ(mem.logStartOffset(), 0) << "precondition: nothing evicted yet";
+    NullT t;
+    rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &mem, &t);
+    rep.setRegistryHandle(3, 402);
+    rep.onLeaderLogAppended();
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3203);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3203);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    ASSERT_TRUE(w.tryEnqueueOp(ringSubscribeOp(1, &rep, /*from=*/0)));
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1);
+        sub->poll(c.fa.handler(), 64);
+        return c.baseOffsets.size() == 4u;
+    }, 10s)) << "delivered " << c.baseOffsets.size() << "/4";
+    ASSERT_EQ(w.subscriptionsForTest()[0].nextOffset, 4);
+
+    // The producer outruns the reader (no worker pass meanwhile): the ring evicts past its cursor.
+    for (int i = 4; i < 24; ++i) appendRing(mem, i, 1000);
+    rep.onLeaderLogAppended();
+    const int64_t start = mem.logStartOffset();
+    ASSERT_GT(start, 4) << "precondition: records the reader had not read were evicted";
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1);
+        sub->poll(c.fa.handler(), 64);
+        return !c.baseOffsets.empty() && c.baseOffsets.back() == 23;
+    }, 10s));
+    EXPECT_EQ(w.transientCursorSkipsForTest(), 1u) << "a reader that fell behind its ring was not counted";
+    EXPECT_EQ(w.transientRecordsSkippedForTest(), static_cast<uint64_t>(start - 4));
+    EXPECT_EQ(w.transientFreshCursorsRaisedForTest(), 0u);
+}
+
+TEST_F(TransientOwnedPushRegression, OwnershipMovedParksTheSubscriptionAndNeverReadsTheRingRegression) {
+    rune::storage::InMemoryLog mem(1u << 20, 1000);
+    int64_t next = 0;
+    for (int i = 0; i < 5; ++i) next = appendRing(mem, next);
+    NullT t;
+    rune::replication::PartitionReplica rep(leaderCfg(), rune::replication::Role::Leader, 1, {1}, {1}, &mem, &t);
+    rep.setRegistryHandle(3, 402);
+    rep.onLeaderLogAppended();
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3203);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3203);
+    ASSERT_NE(sub, nullptr);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    w.setOwnedDirect(Worker::OwnedSet{&rep});
+    ASSERT_TRUE(w.tryEnqueueOp(ringSubscribeOp(1, &rep, 0)));
+    Collector c;
+    ASSERT_TRUE(waitFor([&]() { w.doWork(1); sub->poll(c.fa.handler(), 64); return c.baseOffsets.size() >= 5u; }, 10s));
+
+    WorkerOp away; away.type = WorkerOp::Type::SetOwnership;   // the partition moved to another worker
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(away)));
+    w.doWork(2);
+    ASSERT_FALSE(w.subscriptionsForTest()[0].active) << "parked on ownership loss";
+    for (int i = 0; i < 5; ++i) next = appendRing(mem, next);   // the new owner's appends
+    rep.onLeaderLogAppended();
+    for (int i = 0; i < 100; ++i) { w.doWork(3); sub->poll(c.fa.handler(), 64); std::this_thread::sleep_for(1ms); }
+    EXPECT_EQ(c.baseOffsets.size(), 5u) << "pushed from a ring this worker no longer owns (a cross-thread read)";
+    EXPECT_EQ(w.subscriptionsForTest()[0].nextOffset, 5);
+
+    WorkerOp back; back.type = WorkerOp::Type::SetOwnership; back.ownedSet = {&rep};   // handed back
+    ASSERT_TRUE(w.tryEnqueueOp(std::move(back)));
+    ASSERT_TRUE(waitFor([&]() { w.doWork(4); sub->poll(c.fa.handler(), 64); return c.baseOffsets.size() >= 10u; }, 10s))
+        << "the re-granted subscription never resumed";
+    for (std::size_t i = 0; i < c.baseOffsets.size(); ++i) EXPECT_EQ(c.baseOffsets[i], static_cast<int64_t>(i));
 }
 
 

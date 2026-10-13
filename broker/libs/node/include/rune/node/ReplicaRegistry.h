@@ -36,6 +36,9 @@ public:
     /// (monotonic per node, bumped on every start — BrokerNode), stamped on
     /// every replica added from now on.  Set before the first add().
     void setProcessIncarnation(int64_t inc) noexcept { processIncarnation_ = inc; }
+    /// E2 C1 residual N1: the node-control process identity (see
+    /// PartitionReplica::setLineageIdentity) stamped on every replica added.
+    void setLineageIdentity(int64_t id) noexcept { lineageIdentity_ = id; }
     /// MAJOR-2/3: the node's durable internal-ISR knowledge, wired into the
     /// __cluster_metadata replica (MEDIUM-B: only it) added from now on.
     /// Non-owning.
@@ -58,6 +61,7 @@ public:
         // KIP-903: every replica of this process stamps the node's process
         // incarnation on its FetchRequests (0 = untracked: unit rigs).
         if (processIncarnation_ != 0) replica->setProcessIncarnation(processIncarnation_);
+        if (lineageIdentity_ != 0) replica->setLineageIdentity(lineageIdentity_);   // E2 C1 residual N1
         // MAJOR-2/3: internal replicas commit ISR changes on a majority's
         // durable knowledge (this node's store).
         // MEDIUM-B: only __cluster_metadata (the coordinator partitions are on
@@ -294,6 +298,7 @@ private:
     std::vector<Retired>  retired_;
     std::vector<uint32_t> freeIds_;
     int64_t processIncarnation_ = 0;   ///< KIP-903 (see setProcessIncarnation)
+    int64_t lineageIdentity_    = 0;   ///< E2 C1 residual N1
     rune::replication::InternalIsrKnowledge* internalIsrKnowledge_ = nullptr;   ///< MAJOR-2/3
     uint32_t              nextId_          = 1;   // 0 = unregistered (not gated)
     uint32_t              nextIncarnation_ = 1;

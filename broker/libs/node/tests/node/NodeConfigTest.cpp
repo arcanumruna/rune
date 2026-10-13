@@ -2846,6 +2846,54 @@ TEST(NodeConfigRegression, PersistenceMemoryIsDeprecatedAliasForTransient) {
     EXPECT_NE(res.warnings[1].find("chat"), std::string::npos) << res.warnings[1];
 }
 
+// E2 residual round 5: a per-topic replication factor (RUNE_TOPICS `rf=N`);
+// absent = every node (0).  Out of range / not a number is a config error.
+TEST(NodeConfig, TopicReplicationFactorParses) {
+    auto res = parseWithTopics("presence:3:persistence=transient:rf=1,orders:4");
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->topics[0].replicationFactor, 1);
+    EXPECT_EQ(res.config->topics[1].replicationFactor, 0) << "absent rf must mean every node";
+    for (const char* bad : {"t:1:rf=0", "t:1:rf=x", "t:1:rf=256", "t:1:rf=2x"}) {
+        auto r = parseWithTopics(bad);
+        EXPECT_FALSE(r.config.has_value()) << bad;
+        EXPECT_NE(r.error.find("rf must be an integer"), std::string::npos) << bad << ": " << r.error;
+    }
+}
+
+// E2 residual round 6 (F2): rf is checked against the cluster — rf <= nodes
+// (never silently clamped) and rf >= RUNE_MIN_ISR (else acks=all / offset
+// commits can never succeed); each error names its constraint.  RED (no
+// checks): rf=1 under the 3-node default minIsr and rf=4 on 3 nodes parsed.
+namespace {
+rune::node::ConfigResult parse3Nodes(const char* topics, const char* minIsr = nullptr) {
+    return rune::node::parseNodeConfig([topics, minIsr](const char* k) -> const char* {
+        std::string s = k;
+        if (s == "RUNE_NODE_ID") return "0";
+        if (s == "RUNE_PEERS") return "0@h0:1,1@h1:1,2@h2:1";
+        if (s == "RUNE_CLIENT_ENDPOINT") return "h0:2";
+        if (s == "RUNE_DATA_DIR") return "/tmp/x";
+        if (s == "RUNE_TOPICS") return topics;
+        if (s == "RUNE_MIN_ISR") return minIsr;
+        return nullptr;
+    });
+}
+}  // namespace
+
+TEST(NodeConfigRegression, TopicReplicationFactorIsCheckedAgainstTheClusterRegression) {
+    auto below = parse3Nodes("presence:3:persistence=transient:rf=1");   // default minIsr = 2
+    ASSERT_FALSE(below.config.has_value()) << "rf below the default minIsr was accepted";
+    EXPECT_NE(below.error.find("must be >= RUNE_MIN_ISR (2)"), std::string::npos) << below.error;
+    auto above = parse3Nodes("presence:3:rf=4");
+    ASSERT_FALSE(above.config.has_value()) << "rf above the node count was accepted (silently clamped)";
+    EXPECT_NE(above.error.find("must be <= the node count (3)"), std::string::npos) << above.error;
+    auto ok = parse3Nodes("presence:3:persistence=transient:rf=1", "1");
+    ASSERT_TRUE(ok.config.has_value()) << ok.error;
+    EXPECT_EQ(ok.config->topics[0].replicationFactor, 1);
+    auto ok3 = parse3Nodes("presence:3:rf=3");
+    ASSERT_TRUE(ok3.config.has_value()) << ok3.error;
+    EXPECT_EQ(ok3.config->topics[0].replicationFactor, 3);
+}
+
 TEST(NodeConfig, PersistenceBadValueNamesTransient) {
     auto res = parseWithTopics("t:1:persistence=ram");
     ASSERT_FALSE(res.config.has_value());

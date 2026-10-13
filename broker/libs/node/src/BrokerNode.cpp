@@ -1022,6 +1022,10 @@ void BrokerNode::buildReplication() {
     replicaRegistry_ = std::make_unique<ReplicaRegistry>();
     // KIP-903: every replica of this process stamps the process incarnation.
     replicaRegistry_->setProcessIncarnation(bumpProcessIncarnation(config_.dataDir));
+    // E2 C1 residual N1: the node-control identity (the same nonce the node
+    // registers with every controller) rides each transient lineage report.
+    if (lifecycleNonce_ == 0) lifecycleNonce_ = processNonce();
+    replicaRegistry_->setLineageIdentity(lifecycleNonce_);
     // Review 2026-10-04 MAJOR-2/3: durable internal-ISR knowledge — internal
     // replicas commit their ISR changes on a majority of it, and the consensus
     // election votes only for members of its newest internal ISRs.
@@ -1445,6 +1449,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
         bs.topicId          = topicId;
         bs.partitionCount   = spec.partitionCount;
         bs.rf               = static_cast<int16_t>(std::max<std::size_t>(1, allNodeIds.size()));
+        if (spec.replicationFactor > 0) bs.rf = std::min<int16_t>(spec.replicationFactor, bs.rf);
         bs.coPartitionGroup = spec.coPartitionGroup;
         bs.partitionKey     = spec.partitionKey;
         metadataService_->addRuntimeTopic(bs);
@@ -1978,6 +1983,7 @@ void BrokerNode::buildGateway() {
         // append so the leader replica's tracked LEO/HW is reconciled and followers
         // can fetch the new bytes (Mode A seam — no double-append).
         gateway_->setReplicaRegistry(replicaRegistry_.get());
+        gateway_->setTransientLineage(&BrokerNode::transientLineageTrampoline_, this);   // round 6 (F1)
 
         // M1: Apply the cluster-majority minIsr gate for acks=All produces.
         // gatewayMinIsr is computed from the peer count (or RUNE_MIN_ISR env override)
@@ -2180,6 +2186,12 @@ void BrokerNode::buildGateway() {
             // Wire both directions.
             gateway_->setGroupService(groupCoordService_.get());
             groupCoordService_->setGateway(gateway_.get());
+            // E2 final fix wave (C1): committed offsets of transient partitions
+            // are positions of THIS process's rings (single node) — an offset
+            // replayed from an earlier process is answered as none.
+            ensureProcessIncarnation_();
+            groupCoordService_->setTransientLineage(&BrokerNode::transientLineageTrampoline_, this);
+            groupCoordService_->setTransientLineageVersion(&BrokerNode::transientLineageVersionTrampoline_, this);
 
             spdlog::info("BrokerNode[{}]: GroupCoordinationService wired (offsets at {})",
                          nodeId, offsetDir.string());
@@ -2420,6 +2432,8 @@ void BrokerNode::buildGateway() {
             // MetadataService: applies committed records on doWork; exposes assignment().
             metadataService_ = std::make_unique<MetadataService>(
                 metaReplicaRaw, nodeId);
+            if (config_.testUserDecisionHoldMs > 0)   // TEST-ONLY (see NodeConfig)
+                metadataService_->setUserDecisionHoldForTest(config_.testUserDecisionHoldMs * 1'000'000);
             // Rebuild any previously committed assignments from the local Log.
             metadataService_->rebuildFromLog();
             // Kafka AlterPartition: this node's transport hands every AlterIsr it
@@ -2427,6 +2441,14 @@ void BrokerNode::buildGateway() {
             if (replTransport_)
                 replTransport_->setAlterIsrHandler(&MetadataService::onAlterIsrThunk,
                                                    metadataService_.get());
+            // E2 final fix wave (C1): on a single node the controller confirms
+            // every transient partition's data lineage itself (no replica
+            // reports there: every ring is born with this process).
+            if (config_.isSingleNode()) {
+                ensureProcessIncarnation_();
+                metadataService_->setTransientLineageAuthority(processIncarnation_,
+                                                               &BrokerNode::isTransientTopicTrampoline_, this);
+            }
 
             // MD1 Task 7: wire the MSM into the bridge so USER partitions are
             // driven per-partition from the committed assignment map.
@@ -2452,7 +2474,7 @@ void BrokerNode::buildGateway() {
                     rune::metadata::TopicSpec bs;
                     bs.topicId          = ts.topicId;
                     bs.partitionCount   = ts.partitionCount;
-                    bs.rf               = rf;
+                    bs.rf               = ts.replicationFactor > 0 ? std::min<int16_t>(ts.replicationFactor, rf) : rf;
                     bs.coPartitionGroup = ts.coPartitionGroup; // Note C fix: from parsed config
                     bs.partitionKey     = ts.partitionKey;     // Note C fix: from parsed config
                     balancerTopics.push_back(std::move(bs));
@@ -2586,8 +2608,9 @@ void BrokerNode::buildGateway() {
         // Review M1: the node-control protocol identifies this PROCESS by a
         // random nonce (compared by identity) — never by the data-dir counter,
         // which restarts low after a wiped dir.
+        if (lifecycleNonce_ == 0) lifecycleNonce_ = processNonce();
         runtimeAgent_->controlledShutdown().bind(
-            config_.nodeId, processNonce(),
+            config_.nodeId, lifecycleNonce_,   // N1: the identity the lineage reports carry too
             [](void* t, int32_t to, const rune::replication::AlterIsrMsg& m) noexcept {
                 return static_cast<rune::replication::AeronPartitionTransport*>(t)->sendNodeControl(to, m);
             }, replTransport_.get(), metadataService_.get(), election_.get(), [this] {
@@ -4254,6 +4277,34 @@ void BrokerNode::teardownShardRuntimes_() noexcept {
         }
     }
     shardDrivers_.clear();
+}
+
+void BrokerNode::ensureProcessIncarnation_() {
+    if (processIncarnation_ != 0) return;
+    std::random_device rd;
+    processIncarnation_ = static_cast<int64_t>((((static_cast<uint64_t>(rd()) << 32) ^ rd()) | 1u) & 0x7fffffffffffffffull);
+}
+
+uint64_t BrokerNode::transientLineageVersionTrampoline_(void* ctx) noexcept {
+    auto* self = static_cast<BrokerNode*>(ctx);
+    return self->metadataService_ != nullptr ? self->metadataService_->transientLineageVersion() : 0;
+}
+
+bool BrokerNode::isTransientTopicTrampoline_(void* ctx, int32_t topicId) noexcept {
+    auto* self = static_cast<BrokerNode*>(ctx);
+    if (self->topicRegistry_ == nullptr) return false;
+    const TopicSpec* spec = self->topicRegistry_->topic(topicId);
+    return spec != nullptr && spec->persistence == PersistenceMode::Transient;
+}
+
+uint64_t BrokerNode::transientLineageTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept {
+    // E2 final fix wave (C1, option b).  Runtime thread: the group handlers,
+    // the gateway and the MetadataService all run on the NodeRuntimeAgent.
+    auto* self = static_cast<BrokerNode*>(ctx);
+    if (!isTransientTopicTrampoline_(ctx, topicId)) return 0;   // a disk partition: no lineage
+    if (self->metadataService_ == nullptr) return GroupCoordinationService::kLineagePending;
+    static_assert(GroupCoordinationService::kLineagePending == rune::metadata::kLineageUntrusted);
+    return self->metadataService_->trustedTransientLineage(topicId, partition);   // residual N1
 }
 
 } // namespace rune::node

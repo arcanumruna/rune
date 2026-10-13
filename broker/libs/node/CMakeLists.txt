@@ -914,6 +914,54 @@ if(BUILD_TESTING)
         rune_transaction
         GTest::gtest_main)
     gtest_discover_tests(rune_hotpath_b_alloc_regression_tests)
+    # Phase 2b E2: the worker data path of TRANSIENT (InMemoryLog) partitions —
+    # produce, push reads, read_committed, full ring, evicted cursors.  No Aeron.
+    add_executable(rune_transient_data_path_tests
+        tests/integration/TransientDataPathTest.cpp)
+    target_link_libraries(rune_transient_data_path_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        rune_transaction
+        GTest::gtest_main)
+    gtest_discover_tests(rune_transient_data_path_tests)
+
+    # E2 final fix wave (I3): the K-partition transient failover latency gate —
+    # every worker pass timed while K full 8 MiB rings rebuild their
+    # read_committed state.  RUN_SERIAL: a latency measurement must not share the
+    # host.  Benchmark mode: RUNE_LATENCY_GATE_BENCH=1 (prints, never fails).
+    add_executable(rune_transient_failover_latency_gate_tests
+        tests/integration/TransientFailoverLatencyGateTest.cpp)
+    target_link_libraries(rune_transient_failover_latency_gate_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        rune_transaction
+        GTest::gtest_main)
+    gtest_discover_tests(rune_transient_failover_latency_gate_tests
+        PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+
+    # Phase 2b E2: replaces the global operator new (binary-wide) — own binary.
+    add_executable(rune_transient_alloc_regression_tests
+        tests/integration/TransientDataPathAllocTest.cpp)
+    target_link_libraries(rune_transient_alloc_regression_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        rune_transaction
+        GTest::gtest_main)
+    gtest_discover_tests(rune_transient_alloc_regression_tests)
+
+    # Phase 2b E2: seeded model-checked stress over a transient partition's shared ring.
+    add_executable(rune_transient_stress_tests tests/integration/TransientDataPathStressTest.cpp)
+    target_include_directories(rune_transient_stress_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_transient_stress_tests PRIVATE
+        rune_node
+        rune_replication
+        rune_storage
+        rune_transaction
+        GTest::gtest_main)
+    gtest_discover_tests(rune_transient_stress_tests PROPERTIES TIMEOUT 300)
 
     # ---------------------------------------------------------------------------
     # CP-9: RetentionCleanerAgent integration tests — separate cleaner-cadence
@@ -1402,6 +1450,14 @@ if(BUILD_TESTING)
         target_include_directories(rune_shard_mode_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_shard_mode_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_shard_mode_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
+
+        # Phase 2b E2: TRANSIENT topics end to end in-process over real Aeron —
+        # shard + legacy produce/subscribe, 3-node acks=all, restart (empty).
+        add_executable(rune_transient_topic_data_path_tests tests/integration/TransientTopicDataPathTest.cpp)
+        target_include_directories(rune_transient_topic_data_path_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+        target_link_libraries(rune_transient_topic_data_path_tests PRIVATE rune_node rune_view aeron::aeron
+                              GTest::gtest_main)
+        gtest_discover_tests(rune_transient_topic_data_path_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
 
         # Leader-epoch monotonicity across restarts (Kafka parity): full cold
         # restart, single-node restart, stale same-epoch tail on a follower.

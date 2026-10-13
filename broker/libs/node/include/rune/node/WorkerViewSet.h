@@ -44,6 +44,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 #include <rune/codec/Descriptor.h>
@@ -118,28 +119,53 @@ struct ViewFoldCounters {
     uint64_t aggNonFinite     = 0;   // aggregate: NaN/+-Inf Float input treated as NULL
     uint64_t aggInconsistent  = 0;   // aggregate: retraction found missing/zero state
     uint64_t transientRecordsEvicted = 0;   // transient ring dropped records the view had not folded
+    uint64_t transientSourceResets   = 0;   // E2: the source ring was recreated / cut under a live cursor (re-folded)
 };
 
 // The live [logStart, logEnd) of a TRANSIENT (InMemoryLog) source partition,
-// handed to the per-instance fold so it can reconcile its cursor (Phase 2b E).
+// handed to the per-instance fold so it can reconcile its cursor (Phase 2b E),
+// plus (Phase 2b E2) the ring's IDENTITY: the owning replica's registry
+// incarnation (a new replica + ring for the same partition on this node gets a
+// new one) and its logGeneration with the offset the last content change cut at
+// (PartitionReplica::lastTruncationOffset — a tail truncation or a follower ring
+// reset).  Defaults: an unregistered (0) generation-0 ring.
 struct TransientBounds {
-    int64_t logStart = 0;
-    int64_t logEnd   = 0;
+    int64_t  logStart      = 0;
+    int64_t  logEnd        = 0;
+    uint32_t incarnation   = 0;
+    uint64_t logGeneration = 0;
+    int64_t  cutOffset     = 0;
 };
 
 // Where an instance's foldCursor came from (only consulted for a transient
-// source; a disk source never reads it).  One explicit state, one path each:
-//   Fresh                — created empty; the first transient reconcile starts it
-//                          at the source's logStart (records evicted BEFORE the
-//                          view existed are not "lost" — never counted).
-//   RecoveredUnreconciled— cursor restored from a checkpoint taken against an
-//                          EARLIER incarnation of the source.  A transient source
-//                          restarts empty and reuses offsets, so that cursor is
-//                          meaningless: the first reconcile warns once, resets to
-//                          logStart and keeps the rows.
-//   Live                 — cursor tracks this incarnation: EVICTED when it falls
-//                          below logStart, invariant breach when above logEnd.
-enum class CursorState : uint8_t { Fresh, RecoveredUnreconciled, Live };
+// source; a disk source never reads it).  One explicit state, each holding only
+// its variables (CLAUDE.md rule 3), one path each:
+//   CursorFresh                 — created empty; the first transient reconcile
+//                                 starts it at the source's logStart (records
+//                                 evicted BEFORE the view existed are not
+//                                 "lost" — never counted).
+//   CursorRecoveredUnreconciled — cursor restored from a checkpoint taken against
+//                                 an EARLIER incarnation of the source.  A
+//                                 transient source restarts empty and reuses
+//                                 offsets, so that cursor is meaningless: the
+//                                 first reconcile warns once, resets to logStart
+//                                 and keeps the rows.
+//   CursorLive{incarnation, logGeneration}
+//                               — cursor tracks THIS source ring: re-folded from
+//                                 logStart when the ring was recreated (new
+//                                 incarnation), from the cut when its content
+//                                 changed below the cursor (generation + 1),
+//                                 from logStart when the generation moved by
+//                                 more (only the last cut is known);
+//                                 EVICTED when it falls below logStart,
+//                                 invariant breach when above logEnd.
+struct CursorFresh {};
+struct CursorRecoveredUnreconciled {};
+struct CursorLive {
+    uint32_t incarnation   = 0;
+    uint64_t logGeneration = 0;
+};
+using TransientCursor = std::variant<CursorFresh, CursorRecoveredUnreconciled, CursorLive>;
 
 // One installed materialized view on this worker, for ONE partition.  MOVABLE
 // (lives by value in `views_`): it declares only a converting constructor, so
@@ -157,7 +183,7 @@ struct ViewInstance {
     std::optional<AggInstance>         agg;
     int32_t                            partition       = 0;
     int64_t                            foldCursor      = 0;
-    CursorState                        cursorState     = CursorState::Fresh;
+    TransientCursor                    transientCursor{CursorFresh{}};
     // The offset O of the most recently ENCODED checkpoint delta.  This is the
     // attempted/encoded offset, NOT a durable one — durability is reported
     // separately by the view-snapshot IO agent's `done` ring (consumed in
@@ -595,7 +621,7 @@ private:
     }
 
     // Phase 2b E: the one cursor-state transition for an instance over a transient
-    // source (see CursorState).  Returns 1 if the cursor moved (counts as work),
+    // source (see TransientCursor).  Returns 1 if the cursor moved (counts as work),
     // else 0.  O(1), no allocation.
     static int reconcileTransient_(ViewInstance& inst, const TransientBounds& tb);
 

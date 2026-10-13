@@ -328,6 +328,9 @@ protected:
             registry_.get(),
             [this] { return isLeader_; },
             [this] { return leaderNodeId_; });
+        // E2 residual round 4: the coordinator serves offsets only once it has
+        // loaded them (its first duty pass as coordinator, as in BrokerNode).
+        service_->doWork(clock_);
     }
 
     // Pump replica HW (for offset commit visibility).
@@ -699,6 +702,141 @@ TEST_F(CG3ServiceTest, OffsetCommitAndFetchRoundTrip) {
     EXPECT_EQ(ofResp->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
 }
 
+// E2 final fix wave (C1): a TRANSIENT partition's committed offset is a data
+// position of one ring lineage.  The cluster restarts (here: the coordinator is
+// rebuilt from the replicated log with a NEW current lineage) and the ring is
+// empty, refilling from offset 0: OffsetFetch must answer "no committed offset"
+// (-1) — the member then applies its reset policy — instead of the old 5000
+// (the member would drop the first 5000 post-restart records as duplicates).
+// A partition with no lineage (a disk partition: provider 0) keeps its offset.
+// RED: the restarted coordinator answered 5000.
+namespace {
+uint64_t g_lineage = 0;
+uint64_t testLineage(void*, int32_t /*topicId*/, int32_t partition) noexcept {
+    return partition == 0 ? g_lineage : 0;   // partition 0 transient, partition 1 "disk"
+}
+}  // namespace
+
+TEST_F(CG3ServiceTest, TransientCommittedOffsetOfAnEndedLineageIsAnsweredAsNoneRegression) {
+    const std::string groupId = "g-transient";
+    g_lineage = 0x1111;
+    service_->setTransientLineage(&testLineage, nullptr);
+    auto jLen = encodeJoinGroup(req_, 1, 950, groupId, "", 5000);
+    auto jOut = service_->handleJoinGroup(req_, jLen, clock_, out_, kBufSize);
+    auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
+    ASSERT_TRUE(jResp.has_value());
+    const std::string memberId(reinterpret_cast<const char*>(jResp->memberId.data()), jResp->memberId.size());
+    for (int32_t p : {0, 1}) {
+        auto ocLen = encodeOffsetCommit(req_, 1, 951 + p, groupId, memberId, jResp->generationId, kTestTopicId,
+                                        p, p == 0 ? 5000 : 70, "m");
+        auto ocOut = service_->handleOffsetCommit(req_, ocLen, clock_, out_, kBufSize);
+        auto ocResp = pc::OffsetCommitResponse::decode(out_, ocOut);
+        ASSERT_TRUE(ocResp.has_value());
+        ASSERT_EQ(ocResp->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    }
+    ASSERT_TRUE(pumpHW(2));
+    auto fetch = [&](GroupCoordinationService& svc, int32_t p) {
+        auto ofLen = encodeOffsetFetch(req_, 1, 960, groupId, kTestTopicId, p);
+        auto ofOut = svc.handleOffsetFetch(req_, ofLen, clock_, out_, kBufSize);
+        auto r = pc::OffsetFetchResponse::decode(out_, ofOut);
+        EXPECT_TRUE(r.has_value());
+        return r.has_value() && !r->results.empty() ? r->results[0].offset : int64_t{-99};
+    };
+    EXPECT_EQ(fetch(*service_, 0), 5000) << "the live lineage's offset is answered";
+
+    // A full restart: the coordinator replays the log; the ring lineage is new.
+    ReplicatedOffsetStore replayed(replica_.get());
+    ASSERT_TRUE(replayed.rebuildFromLog());
+    GroupCoordinationService restarted(&replayed, registry_.get(), [] { return true; }, [] { return NodeId{1}; });
+    g_lineage = 0x2222;
+    restarted.setTransientLineage(&testLineage, nullptr);
+    restarted.doWork(clock_);   // round 4: loads the offsets (first duty pass)
+    EXPECT_EQ(fetch(restarted, 0), -1)
+        << "SILENT LOSS: an offset of the ring's previous life was answered after the restart";
+    EXPECT_EQ(fetch(restarted, 1), 70) << "a partition without a lineage (disk) lost its committed offset";
+    // The fetch-all form omits it (as if never committed).
+    auto allLen = encodeOffsetFetchAll(req_, 1, 961, groupId);
+    auto allOut = restarted.handleOffsetFetch(req_, allLen, clock_, out_, kBufSize);
+    auto all = pc::OffsetFetchResponse::decode(out_, allOut);
+    ASSERT_TRUE(all.has_value());
+    for (const auto& r : all->results)
+        EXPECT_FALSE(r.topicId == kTestTopicId && r.partition == 0) << "fetch-all answered the ended lineage's offset";
+    EXPECT_EQ(restarted.staleLineageOffsets(), 2u);
+}
+
+// E2 final fix wave (C1 multi-node, option b): while the partition's CURRENT
+// leadership has not confirmed its data lineage (right after a full-cluster
+// restart, or a leader move, until the controller commits the lineage), the
+// coordinator can answer neither the committed offset (it may be of the old
+// lineage) nor "none" (it may be valid): OffsetFetch and OffsetCommit answer
+// that entry NotLeader — an existing retriable code the client retries with
+// its bounded budget.  Never a guess, never silence.  Once confirmed: the
+// stamp rules as before.  RED: the pending window answered the old offset.
+namespace {
+uint64_t g_pendingLineage = GroupCoordinationService::kLineagePending;
+uint64_t pendingThenKnown(void*, int32_t, int32_t partition) noexcept {
+    return partition == 0 ? g_pendingLineage : 0;
+}
+}  // namespace
+
+TEST_F(CG3ServiceTest, TransientOffsetsAreAnsweredRetriablyWhileTheLineageIsPendingRegression) {
+    const std::string groupId = "g-pending";
+    g_pendingLineage = 0x1111;
+    service_->setTransientLineage(&pendingThenKnown, nullptr);
+    auto jLen = encodeJoinGroup(req_, 1, 970, groupId, "", 5000);
+    auto jOut = service_->handleJoinGroup(req_, jLen, clock_, out_, kBufSize);
+    auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
+    ASSERT_TRUE(jResp.has_value());
+    const std::string memberId(reinterpret_cast<const char*>(jResp->memberId.data()), jResp->memberId.size());
+    auto commit = [&](int64_t off) {
+        auto ocLen = encodeOffsetCommit(req_, 1, 971, groupId, memberId, jResp->generationId, kTestTopicId, 0, off, "m");
+        auto ocOut = service_->handleOffsetCommit(req_, ocLen, clock_, out_, kBufSize);
+        auto ocResp = pc::OffsetCommitResponse::decode(out_, ocOut);
+        EXPECT_TRUE(ocResp.has_value());
+        return ocResp.has_value() ? ocResp->results[0].errorCode : int16_t{-99};
+    };
+    auto fetch = [&](int16_t& code) {
+        auto ofLen = encodeOffsetFetch(req_, 1, 972, groupId, kTestTopicId, 0);
+        auto ofOut = service_->handleOffsetFetch(req_, ofLen, clock_, out_, kBufSize);
+        auto r = pc::OffsetFetchResponse::decode(out_, ofOut);
+        EXPECT_TRUE(r.has_value());
+        code = r.has_value() ? r->results[0].errorCode : int16_t{-99};
+        return r.has_value() ? r->results[0].offset : int64_t{-99};
+    };
+    ASSERT_EQ(commit(5000), static_cast<int16_t>(pc::ErrorCode::OK));
+    ASSERT_TRUE(pumpHW(1));
+    int16_t code = 0;
+    EXPECT_EQ(fetch(code), 5000);
+
+    g_pendingLineage = GroupCoordinationService::kLineagePending;   // a full restart: not confirmed yet
+    const int64_t during = fetch(code);
+    EXPECT_EQ(code, static_cast<int16_t>(pc::ErrorCode::NotLeader))
+        << "the pending window was answered " << during << " (a guess: the offset may belong to data that did not survive)";
+    EXPECT_EQ(during, -1);
+    EXPECT_EQ(commit(9), static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "a commit was stamped while the lineage was unknown";
+    EXPECT_GE(service_->pendingLineageAnswers(), 2u);
+
+    g_pendingLineage = 0x2222;   // the new leadership MINTED a new lineage
+    EXPECT_EQ(fetch(code), -1) << "the old lineage's offset was answered after a re-mint";
+    EXPECT_EQ(code, static_cast<int16_t>(pc::ErrorCode::OK));
+    // Residual round 5 (R1): this member's generation predates the mint — its
+    // position may come from the old data: the commit is fenced and the group
+    // rebalanced; after re-joining, the commit is accepted.
+    EXPECT_EQ(commit(3), static_cast<int16_t>(pc::ErrorCode::IllegalGeneration));
+    auto rj = encodeJoinGroup(req_, 1, 973, groupId, memberId, 5000);
+    auto rjOut = service_->handleJoinGroup(req_, rj, clock_, out_, kBufSize);
+    auto rjResp = pc::JoinGroupResponse::decode(out_, rjOut);
+    ASSERT_TRUE(rjResp.has_value());
+    ASSERT_GT(rjResp->generationId, jResp->generationId);
+    auto oc = encodeOffsetCommit(req_, 1, 974, groupId, memberId, rjResp->generationId, kTestTopicId, 0, 3, "m");
+    auto ocOut = service_->handleOffsetCommit(req_, oc, clock_, out_, kBufSize);
+    auto ocResp = pc::OffsetCommitResponse::decode(out_, ocOut);
+    ASSERT_TRUE(ocResp.has_value());
+    ASSERT_EQ(ocResp->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    ASSERT_TRUE(pumpHW(2));
+    EXPECT_EQ(fetch(code), 3);
+}
+
 // 11. OffsetCommit wrong gen → IllegalGeneration.
 TEST_F(CG3ServiceTest, OffsetCommitWrongGenerationReturnsIllegalGeneration) {
     std::string groupId = "g-illegalgen";
@@ -771,6 +909,7 @@ TEST_F(CG3ServiceTest, OffsetCommitMinIsrViolationWhenReplicaGated) {
         &store2, &registry2,
         [&leader] { return leader; },
         [] { return NodeId{1}; });
+    svc2.doWork(0);   // round 4: loads the (empty) offsets log
 
     std::string groupId = "g-minisr";
     uint8_t req2[64 * 1024]{};
@@ -1146,4 +1285,326 @@ TEST_F(CG3ServiceTest, OldClientEvictionIsScopedToTheRequestsGroupRegression) {
     EXPECT_EQ(service_->coordinator("grp-B").memberCount(), 1u);
     EXPECT_EQ(heartbeatCode("grp-B", v4, b, 916), bBefore);
     (void)a2;
+}
+
+// ===========================================================================
+// E2 final fix wave, residual round 4: until this coordinator has LOADED the
+// offsets of its __consumer_offsets partition (the whole log, for the current
+// leadership), OffsetFetch answers the retriable NotLeader — never -1 / an
+// older offset from an empty or partial index (a guess) — and OffsetCommit is
+// refused NotLeader too (the load clears + replays the index: a commit taken
+// before it would be wiped).  Disk and transient topics alike.
+// ===========================================================================
+namespace {
+struct FetchAnswer { int16_t code; int64_t offset; };
+FetchAnswer fetchOne(GroupCoordinationService& svc, uint8_t* req, uint8_t* out, std::size_t cap,
+                     const std::string& group, int32_t topicId, int32_t p) {
+    auto len = encodeOffsetFetch(req, 1, 990, group, topicId, p);
+    auto n   = svc.handleOffsetFetch(req, len, 0, out, cap);
+    auto r   = pc::OffsetFetchResponse::decode(out, n);
+    if (!r.has_value() || r->results.empty()) return {int16_t{-99}, int64_t{-99}};
+    return {r->results[0].errorCode, r->results[0].offset};
+}
+}  // namespace
+
+// (a) The coordinator restarts (a new replica / store / service over the same
+// on-disk __consumer_offsets log) and an OffsetFetch arrives BEFORE its first
+// duty pass loaded the offsets: NotLeader, then — once loaded — the real
+// offset; never -1.  A commit in that window is refused, and one after the
+// load survives.  RED (no load gate): the first answer was -1 (OK).
+TEST_F(CG3ServiceTest, OffsetFetchBeforeTheOffsetsAreLoadedIsRetriableNeverNoneRegression) {
+    const std::string groupId = "g-reload";
+    ASSERT_TRUE(store_->commit(groupId, tp(std::string(kTestTopic), 0), 42, "", 1));
+    ASSERT_TRUE(pumpHW(replica_->logEndOffset()));
+    ASSERT_EQ(fetchOne(*service_, req_, out_, kBufSize, groupId, kTestTopicId, 0).offset, 42);
+
+    // Restart: everything above the log is rebuilt from scratch.
+    service_.reset();
+    store_.reset();
+    replica_.reset();
+    rune::storage::Log log2(dir.path);
+    log2.recover();
+    PartitionReplica rep2(makeSingleNodeConfig(kLeader, 1), Role::Leader, /*epoch=*/2,
+                          std::vector<NodeId>{kLeader}, std::vector<NodeId>{kLeader}, &log2, transport_.get());
+    ReplicatedOffsetStore store2(&rep2);
+    GroupCoordinationService svc2(&store2, registry_.get(), [] { return true; }, [] { return NodeId{kLeader}; });
+
+    // Before any duty pass: the request races the reload.
+    const FetchAnswer first = fetchOne(svc2, req_, out_, kBufSize, groupId, kTestTopicId, 0);
+    EXPECT_EQ(first.code, static_cast<int16_t>(pc::ErrorCode::NotLeader))
+        << "answered " << first.offset << " before the offsets were loaded (a guess: the committed offset is 42)";
+    EXPECT_FALSE(first.offset == -1 && first.code == static_cast<int16_t>(pc::ErrorCode::OK))
+        << "SILENT REWIND: 'no committed offset' answered before the reload";
+
+    // The member's commit in that window: refused retriably (the load would wipe it).
+    auto jLen = encodeJoinGroup(req_, 1, 991, groupId, "", 5000);
+    auto jOut = svc2.handleJoinGroup(req_, jLen, clock_, out_, kBufSize);
+    auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
+    ASSERT_TRUE(jResp.has_value());
+    const std::string memberId(reinterpret_cast<const char*>(jResp->memberId.data()), jResp->memberId.size());
+    auto commit = [&](int64_t off) {
+        auto l = encodeOffsetCommit(req_, 1, 992, groupId, memberId, jResp->generationId, kTestTopicId, 1, off, "");
+        auto n = svc2.handleOffsetCommit(req_, l, clock_, out_, kBufSize);
+        auto r = pc::OffsetCommitResponse::decode(out_, n);
+        return r.has_value() && !r->results.empty() ? r->results[0].errorCode : int16_t{-99};
+    };
+    EXPECT_EQ(commit(7), static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "a commit was taken before the load";
+
+    // Duty passes load the offsets; every answer meanwhile is NotLeader or 42.
+    FetchAnswer a{};
+    for (int i = 0; i < 200; ++i) {
+        clock_ += kStep;
+        rep2.doWork(clock_);
+        svc2.doWork(clock_);
+        a = fetchOne(svc2, req_, out_, kBufSize, groupId, kTestTopicId, 0);
+        if (a.code != static_cast<int16_t>(pc::ErrorCode::NotLeader)) break;
+    }
+    EXPECT_EQ(a.code, static_cast<int16_t>(pc::ErrorCode::OK)) << "never loaded";
+    EXPECT_EQ(a.offset, 42) << "after the load the real committed offset must be answered";
+    EXPECT_GE(svc2.offsetsNotLoadedAnswersForTest(), 2u);
+
+    ASSERT_EQ(commit(9), static_cast<int16_t>(pc::ErrorCode::OK));
+    clock_ += kStep;
+    rep2.doWork(clock_);
+    svc2.doWork(clock_);
+    EXPECT_EQ(fetchOne(svc2, req_, out_, kBufSize, groupId, kTestTopicId, 1).offset, 9)
+        << "a commit after the load was lost";
+}
+
+// (b) A PARTIAL log: the leader's high-watermark is below its log end (a
+// follower in the ISR has not caught up after a restart).  Loading the prefix
+// would answer an OLDER offset (10) for a group whose newest commit (30) sits
+// above the HW.  The load waits for the whole log: NotLeader until then, then
+// 30.  RED (prefix load): 10 was answered.
+TEST_F(CG3ServiceTest, OffsetsAreNotLoadedFromALogPrefixBelowTheLogEndRegression) {
+    service_.reset();
+    store_.reset();
+    replica_.reset();
+    TempDir d3("cg3_prefix");
+    rune::storage::Log log3(d3.path);
+    log3.recover();
+    PartitionReplica rep3(makeSingleNodeConfig(kLeader, /*minIsr=*/1), Role::Leader, /*epoch=*/1,
+                          std::vector<NodeId>{kLeader, 2}, std::vector<NodeId>{kLeader, 2}, &log3, transport_.get());
+    ReplicatedOffsetStore store3(&rep3);
+    const std::string groupId = "g-prefix";
+    for (const int64_t off : {10, 20, 30}) ASSERT_TRUE(store3.commit(groupId, tp(std::string(kTestTopic), 0), off, "", 1));
+    ASSERT_EQ(rep3.logEndOffset(), 3);
+    auto followerAt = [&](int64_t fetchOffset) {
+        rune::replication::FetchRequestMsg f{};
+        f.leaderEpoch = 1; f.partition = rep3.partitionId(); f.followerId = 2;
+        f.fetchOffset = fetchOffset; f.maxBytes = 1 << 20; f.topicId = rep3.topicId();
+        clock_ += kStep;
+        (void)rep3.onFetchRequest(f, clock_);
+        rep3.doWork(clock_);
+    };
+    followerAt(1);   // the follower holds record 0 only: HW 1 < log end 3
+    ASSERT_EQ(rep3.highWatermark(), 1) << "precondition: a partial log (HW below the log end)";
+
+    GroupCoordinationService svc3(&store3, registry_.get(), [] { return true; }, [] { return NodeId{kLeader}; });
+    for (int i = 0; i < 5; ++i) {
+        clock_ += kStep;
+        svc3.doWork(clock_);
+        const FetchAnswer a = fetchOne(svc3, req_, out_, kBufSize, groupId, kTestTopicId, 0);
+        EXPECT_EQ(a.code, static_cast<int16_t>(pc::ErrorCode::NotLeader))
+            << "answered " << a.offset << " from a log prefix (the newest commit is 30)";
+    }
+    followerAt(3);   // caught up: HW = log end
+    ASSERT_EQ(rep3.highWatermark(), 3);
+    clock_ += kStep;
+    svc3.doWork(clock_);
+    const FetchAnswer a = fetchOne(svc3, req_, out_, kBufSize, groupId, kTestTopicId, 0);
+    EXPECT_EQ(a.code, static_cast<int16_t>(pc::ErrorCode::OK));
+    EXPECT_EQ(a.offset, 30) << "not the newest committed offset after the whole log loaded";
+}
+
+// E2 final fix wave, residual round 5 — R1 (coordinator half): a NEW lineage
+// minted for a transient partition supersedes every committed offset of the
+// old one.  (a) The lineage-change sweep forces every group holding such an
+// offset to rebalance (generation bump) — once per new lineage; a commit at
+// the old generation is fenced (IllegalGeneration).  (b) A commit that reaches
+// the coordinator before the sweep saw the change forces the rebalance itself
+// and is refused.  A commit in the new generation is accepted.  RED (no
+// superseded-lineage handling): the old-generation commit was accepted.
+namespace {
+uint64_t g_r1Lineage = 0xA;
+uint64_t g_r1Version = 1;
+uint64_t r1Lineage(void*, int32_t, int32_t partition) noexcept { return partition == 0 ? g_r1Lineage : 0; }
+uint64_t r1Version(void*) noexcept { return g_r1Version; }
+}  // namespace
+
+TEST_F(CG3ServiceTest, SupersededLineageForcesARebalanceAndFencesOldGenerationCommitsRegression) {
+    const std::string groupId = "g-r1";
+    g_r1Lineage = 0xA; g_r1Version = 1;
+    service_->setTransientLineage(&r1Lineage, nullptr);
+    service_->setTransientLineageVersion(&r1Version, nullptr);
+    auto join = [&](const std::string& member) {
+        auto l = encodeJoinGroup(req_, 1, 1100, groupId, member, 5000);
+        auto n = service_->handleJoinGroup(req_, l, clock_, out_, kBufSize);
+        auto r = pc::JoinGroupResponse::decode(out_, n);
+        EXPECT_TRUE(r.has_value());
+        return std::make_pair(std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size()),
+                              r->generationId);
+    };
+    auto commit = [&](const std::string& member, int32_t gen, int64_t off) {
+        auto l = encodeOffsetCommit(req_, 1, 1101, groupId, member, gen, kTestTopicId, 0, off, "");
+        auto n = service_->handleOffsetCommit(req_, l, clock_, out_, kBufSize);
+        auto r = pc::OffsetCommitResponse::decode(out_, n);
+        return r.has_value() && !r->results.empty() ? r->results[0].errorCode : int16_t{-99};
+    };
+    auto tick = [&] { clock_ += kStep; replica_->doWork(clock_); service_->doWork(clock_); };
+    auto [member, gen0] = join("");
+    ASSERT_TRUE(driveUntil([&] { return true; }, 1));
+    ASSERT_EQ(commit(member, gen0, 5000), static_cast<int16_t>(pc::ErrorCode::OK));
+    tick();
+    EXPECT_EQ(service_->supersededLineageRebalances(), 0u);
+
+    // (a) A new lineage is minted (the version moves): the sweep rebalances.
+    g_r1Lineage = 0xB; ++g_r1Version;
+    tick();
+    EXPECT_EQ(service_->supersededLineageRebalances(), 1u) << "the group was not rebalanced for the new lineage";
+    EXPECT_EQ(commit(member, gen0, 5100), static_cast<int16_t>(pc::ErrorCode::IllegalGeneration))
+        << "SILENT LOSS: a commit at the pre-mint generation was accepted";
+    for (int i = 0; i < 5; ++i) tick();
+    EXPECT_EQ(service_->supersededLineageRebalances(), 1u) << "rebalanced more than once for one new lineage";
+    auto [m2, gen1] = join(member);
+    EXPECT_GT(gen1, gen0);
+    for (int i = 0; i < 5; ++i) tick();
+    EXPECT_EQ(commit(m2, gen1, 3), static_cast<int16_t>(pc::ErrorCode::OK)) << "the new generation's commit was refused";
+
+    // (b) Another mint the sweep has not seen yet (no version move): the first
+    // commit forces the rebalance itself and is refused.
+    g_r1Lineage = 0xC;
+    tick();   // the version did not move: no sweep
+    EXPECT_EQ(commit(m2, gen1, 4), static_cast<int16_t>(pc::ErrorCode::IllegalGeneration))
+        << "SILENT LOSS: a commit raced ahead of the sweep and was stamped with the new lineage";
+    EXPECT_GE(service_->supersededLineageCommitsFenced(), 1u);
+    EXPECT_EQ(service_->supersededLineageRebalances(), 2u);
+}
+
+// E2 final fix wave, residual round 6 — F4: steady state allocates nothing.
+// While a new lineage stays PENDING the coordinator re-checks only the pending
+// (group, partition) set every 100 ms — no fetchAll over every group — and
+// decides it once it resolves; an Empty group's lineage state is pruned.  RED
+// (no pending re-check / no prune): never decided / marks kept forever.
+namespace {
+uint64_t g_f4Lineage = 0xA;
+uint64_t g_f4Version = 1;
+uint64_t f4Lineage(void*, int32_t, int32_t partition) noexcept { return partition == 0 ? g_f4Lineage : 0; }
+uint64_t f4Version(void*) noexcept { return g_f4Version; }
+}  // namespace
+
+TEST_F(CG3ServiceTest, PendingLineageIsReCheckedAloneAndEmptyGroupsArePrunedRegression) {
+    g_f4Lineage = 0xA; g_f4Version = 1;
+    service_->setTransientLineage(&f4Lineage, nullptr);
+    service_->setTransientLineageVersion(&f4Version, nullptr);
+    auto tick = [&] { clock_ += kStep; replica_->doWork(clock_); service_->doWork(clock_); };
+    auto l = encodeJoinGroup(req_, 1, 1300, "g-f4", "", 60'000);
+    auto r = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, l, clock_, out_, kBufSize));
+    ASSERT_TRUE(r.has_value());
+    const std::string m(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size());
+    l = encodeOffsetCommit(req_, 1, 1301, "g-f4", m, r->generationId, kTestTopicId, 0, 50, "");
+    ASSERT_EQ(pc::OffsetCommitResponse::decode(out_, service_->handleOffsetCommit(req_, l, clock_, out_, kBufSize))
+                  ->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    tick();
+    g_f4Lineage = GroupCoordinationService::kLineagePending; ++g_f4Version;
+    tick();
+    EXPECT_EQ(service_->pendingLineageChecksForTest(), 1u) << "the undecided partition was not kept for re-check";
+    const int32_t gen = service_->coordinator("g-f4").generationId();
+    g_f4Lineage = 0xD;   // resolved (a mint), WITHOUT a version move: only the re-check can see it
+    for (int i = 0; i < 200; ++i) tick();
+    EXPECT_EQ(service_->pendingLineageChecksForTest(), 0u);
+    EXPECT_GT(service_->coordinator("g-f4").generationId(), gen) << "the pending re-check never decided it";
+    ASSERT_GE(service_->supersededMarkGroupsForTest(), 1u);
+    l = encodeLeaveGroup(req_, 1, 1302, "g-f4", m);
+    (void)service_->handleLeaveGroup(req_, l, clock_, out_, kBufSize);
+    ASSERT_TRUE(driveUntil([&] { return service_->coordinator("g-f4").isEmpty(); }, 20));
+    g_f4Lineage = 0xE; ++g_f4Version;
+    tick();
+    EXPECT_EQ(service_->supersededMarkGroupsForTest(), 0u) << "an Empty group's superseded marks were never pruned";
+}
+
+// E2 final fix wave, residual round 6 — F1 (coordinator half) + F4.
+// A group whose CURRENT generation consumes a transient partition (it is in its
+// assignment) but holds NO committed offset on it: a new lineage still forces
+// it to rebalance (sweep) — and a commit that races ahead of the sweep, with no
+// stored offset to compare with, is fenced because the generation predates the
+// mint.  F4: while the new lineage is pending the coordinator re-checks only
+// that pending (group, partition) — no fetchAll over every group — and an
+// Empty group's lineage state is pruned.  RED (only committed offsets): the
+// no-commit group was never rebalanced and the racing commit was accepted.
+namespace {
+uint64_t g_f1Lineage = 0xA;
+uint64_t g_f1Version = 1;
+uint64_t f1Lineage(void*, int32_t, int32_t partition) noexcept { return partition == 0 ? g_f1Lineage : 0; }
+uint64_t f1Version(void*) noexcept { return g_f1Version; }
+std::size_t encodeJoinWithTopic(uint8_t* buf, int64_t corr, std::string_view group, std::string_view member,
+                                int32_t topicId) {
+    pc::JoinGroup msg;
+    msg.sessionId = 1; msg.correlationId = corr; msg.sessionTimeoutMs = 60'000;
+    msg.groupId  = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(group.data()), group.size());
+    msg.memberId = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(member.data()), member.size());
+    const std::array<int32_t, 1> topics{topicId};
+    return msg.encode(buf, std::span<const int32_t>(topics));
+}
+}  // namespace
+
+TEST_F(CG3ServiceTest, GroupConsumingAPartitionWithoutACommitIsFencedOnANewLineageRegression) {
+    g_f1Lineage = 0xA; g_f1Version = 1;
+    service_->setTransientLineage(&f1Lineage, nullptr);
+    service_->setTransientLineageVersion(&f1Version, nullptr);
+    auto stableMember = [&](const std::string& group) {
+        auto l = encodeJoinWithTopic(req_, 1200, group, "", kTestTopicId);
+        auto r = pc::JoinGroupResponse::decode(out_, service_->handleJoinGroup(req_, l, clock_, out_, kBufSize));
+        const std::string m(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size());
+        l = encodeJoinWithTopic(req_, 1201, group, m, kTestTopicId);
+        (void)service_->handleJoinGroup(req_, l, clock_, out_, kBufSize);
+        EXPECT_TRUE(driveUntil([&] { return service_->coordinator(group).state() == GroupState::Stable; }, 20));
+        return m;
+    };
+    auto commit = [&](const std::string& group, const std::string& m, int32_t gen, int64_t off) {
+        auto l = encodeOffsetCommit(req_, 1, 1202, group, m, gen, kTestTopicId, 0, off, "");
+        auto r = pc::OffsetCommitResponse::decode(out_, service_->handleOffsetCommit(req_, l, clock_, out_, kBufSize));
+        return r.has_value() && !r->results.empty() ? r->results[0].errorCode : int16_t{-99};
+    };
+    auto tick = [&] { clock_ += kStep; replica_->doWork(clock_); service_->doWork(clock_); };
+
+    // (a) The sweep: "g-swept" consumes partition 0 (assigned), never committed.
+    const std::string m1 = stableMember("g-swept");
+    const int32_t gen1 = service_->coordinator("g-swept").generationId();
+    g_f1Lineage = 0xB; ++g_f1Version;   // a new lineage
+    tick();
+    EXPECT_GT(service_->coordinator("g-swept").generationId(), gen1)
+        << "SILENT LOSS: a group consuming the partition without a commit was not rebalanced";
+    EXPECT_EQ(commit("g-swept", m1, gen1, 20), static_cast<int16_t>(pc::ErrorCode::IllegalGeneration));
+
+    // (b) The commit path, ahead of the sweep (the version has not moved yet).
+    const std::string m2 = stableMember("g-raced");
+    const int32_t gen2 = service_->coordinator("g-raced").generationId();
+    g_f1Lineage = 0xC;   // minted; the coordinator has not swept it
+    EXPECT_EQ(commit("g-raced", m2, gen2, 20), static_cast<int16_t>(pc::ErrorCode::IllegalGeneration))
+        << "SILENT LOSS: a commit with no stored offset, from a generation older than the mint, was accepted";
+    EXPECT_GT(service_->coordinator("g-raced").generationId(), gen2);
+
+    // F4: a PENDING lineage is re-checked alone (no fetchAll each 100 ms) and
+    // decided once it resolves.
+    const std::string m3 = stableMember("g-pending");
+    g_f1Lineage = GroupCoordinationService::kLineagePending; ++g_f1Version;
+    tick();
+    EXPECT_GE(service_->pendingLineageChecksForTest(), 1u) << "the undecided partition was not kept for re-check";
+    const int32_t gen3 = service_->coordinator("g-pending").generationId();
+    g_f1Lineage = 0xD;   // resolved (a mint) — WITHOUT a version move: only the pending re-check can see it
+    for (int i = 0; i < 200; ++i) tick();   // > 100 ms of duty time
+    EXPECT_EQ(service_->pendingLineageChecksForTest(), 0u);
+    EXPECT_GT(service_->coordinator("g-pending").generationId(), gen3) << "the pending re-check never decided it";
+
+    // F4: once a group is Empty its lineage state is pruned (no unbounded marks).
+    ASSERT_GE(service_->supersededMarkGroupsForTest(), 3u);
+    for (const auto& [g, m] : {std::pair<std::string, std::string>{"g-swept", m1}, {"g-raced", m2}, {"g-pending", m3}}) {
+        auto l = encodeLeaveGroup(req_, 1, 1203, g, m);
+        (void)service_->handleLeaveGroup(req_, l, clock_, out_, kBufSize);
+        ASSERT_TRUE(driveUntil([&] { return service_->coordinator(g).isEmpty(); }, 20)) << g << " never emptied";
+    }
+    g_f1Lineage = 0xE; ++g_f1Version;   // the next lineage change sweeps
+    tick();
+    EXPECT_EQ(service_->supersededMarkGroupsForTest(), 0u) << "an Empty group's superseded marks were never pruned";
 }

@@ -26,6 +26,7 @@ namespace rb  = rune::protocol::batch;
 // ---------------------------------------------------------------------------
 // handleProduceBatch — implementation.
 // ---------------------------------------------------------------------------
+template <class LogT>
 ProduceOutcome handleProduceBatch(
     const uint8_t*                    batch,
     std::size_t                       batchLen,
@@ -34,7 +35,7 @@ ProduceOutcome handleProduceBatch(
     int64_t                           producerId,
     int16_t                           producerEpoch,
     int32_t                           baseSequence,
-    rune::storage::Log&               log,
+    LogT&                             log,
     rune::storage::ProducerStateManager& producerState,
     bool                              acksAll,
     int                               isrSize,
@@ -275,11 +276,17 @@ ProduceOutcome handleProduceBatch(
     try {
         const int64_t appended =
             log.appendNoSyncRestamp(batch, batchLen, lastOffsetDelta, base);
-        if (appended < 0) {
-            // Returns negative on back-pressure (e.g. InMemoryLog full).
-            spdlog::warn("ProducePath: appendNoSyncRestamp refused (back-pressure) "
-                         "topicId={} partition={}", topicId, partition);
-            out.error = pc::ErrorCode::Internal;
+        if (appended < 0) [[unlikely]] {
+            // Phase 2b E2: only an InMemoryLog refuses (a disk Log throws).
+            // TRANSIENT_FULL: the ring cannot take the batch without evicting
+            // uncommitted data (at/above the HW) — TransientLogFull (42,
+            // controller ruling 2): retriable on the same leader, no metadata
+            // refresh; a pre-v6 session is answered NotLeader by encodeFor.  A
+            // batch larger than the whole ring can never fit: MessageTooLarge.
+            // The caller counts + rate-limits the log line (hot path: no log here).
+            out.logFull = true;
+            out.error   = appended == InMemoryLog::kRefusedTooLarge ? pc::ErrorCode::MessageTooLarge
+                                                                    : pc::ErrorCode::TransientLogFull;
             return out;
         }
         lastOffset = base + static_cast<int64_t>(lastOffsetDelta);
@@ -341,5 +348,12 @@ ProduceOutcome handleProduceBatch(
     out.batchAttrs  = batchAttrs;
     return out;
 }
+
+template ProduceOutcome handleProduceBatch<Log>(
+    const uint8_t*, std::size_t, int32_t, int32_t, int64_t, int16_t, int32_t, Log&,
+    ProducerStateManager&, bool, int, int, uint8_t, bool) noexcept;
+template ProduceOutcome handleProduceBatch<InMemoryLog>(
+    const uint8_t*, std::size_t, int32_t, int32_t, int64_t, int16_t, int32_t, InMemoryLog&,
+    ProducerStateManager&, bool, int, int, uint8_t, bool) noexcept;
 
 } // namespace rune::storage

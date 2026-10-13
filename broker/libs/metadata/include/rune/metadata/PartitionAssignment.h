@@ -41,6 +41,22 @@ struct LeaderlessMark {
     int64_t incarnation = 0;     ///< `node`'s process incarnation the mark is about
 };
 
+/// E2 final fix wave (C1 multi-node): a TRANSIENT partition's committed data
+/// lineage (TransientLineageRecord, MetadataExtensions.h).  `lineage` is the
+/// token; it was minted at leader epoch `mintEpoch` and is CONFIRMED for the
+/// leadership (`confirmedLeader`, `confirmedEpoch`) — the coordinator trusts it
+/// only for that leadership (a newer one must confirm it first).
+/// `incarnation`: on a single-node broker the process the lineage belongs to
+/// (its ring dies with the process); 0 multi-node (a restart always takes a
+/// new leader epoch there — the leader-epoch restart fence).
+struct TransientLineage {
+    uint64_t lineage         = 0;
+    int32_t  mintEpoch       = -1;
+    int32_t  confirmedEpoch  = -1;
+    int32_t  confirmedLeader = -1;
+    int64_t  incarnation     = 0;
+};
+
 struct PartitionAssignment {
     int32_t              leaderNode;      ///< Current leader; NO_LEADER (-1) if none.
     std::vector<int32_t> isr;             ///< In-sync replica set (ordered by convention).
@@ -48,6 +64,12 @@ struct PartitionAssignment {
     int32_t              leaderEpoch;     ///< Bumps on leader change or replica removal.
     int32_t              partitionEpoch;  ///< Bumps on every applied change.
     LeaderlessMark       mark{};          ///< D15: set only on a leaderless record that carried one.
+    /// E2 C1 residual N3: the current leader was elected CLEANLY — it was in the
+    /// ISR of the assignment it replaced (or the leader did not change, or it is
+    /// the first assignment).  Derived by the MSM at install (a pure function of
+    /// the committed log: identical on every node); false = an unclean /
+    /// survivor election: the new leader may lack committed data.
+    bool                 cleanElection = true;
 };
 
 /// Describes a requested mutation.  Fields use sentinel values to mean "unchanged".

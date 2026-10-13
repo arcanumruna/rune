@@ -67,7 +67,8 @@
 #include <rune/metadata/FailoverElection.h>      // MEDIUM-B: coordinator partitions
 #include <rune/metadata/ControlPlaneTimer.h>     // Task 14: deterministic logged tick
 #include <rune/metadata/ReplicaPositionTable.h>  // Task 14: election position input
-#include <rune/metadata/MetadataExtensions.h>    // D15: feature level + leaderless marks
+#include <rune/metadata/MetadataExtensions.h>    // D15: feature level + leaderless marks; C1 lineages
+#include <chrono>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/protocol/RecordBatch.h>  // RecordBatchReader
 #include <rune/protocol/MetadataRecords.h>
@@ -487,6 +488,9 @@ public:
         if (m.isrCount == rr::AlterIsrMsg::kLeaderEpochBump &&
             (m.isr[1] & rr::AlterIsrMsg::kBumpFollowerReport) != 0)
             return onLeaderlessReport_(m, *pa, reply);
+        if (m.isrCount == rr::AlterIsrMsg::kLeaderEpochBump &&
+            (m.isr[1] & rr::AlterIsrMsg::kLineageReport) != 0)
+            return onLineageReport_(m, *pa, reply);
         if (pa->leaderNode != m.leaderId || pa->leaderEpoch != static_cast<int32_t>(m.leaderEpoch)) {
             ++alterIsrRejected_;
             reply(rr::kAlterIsrFencedLeaderEpoch, pa->partitionEpoch);
@@ -625,6 +629,12 @@ public:
         int32_t pushedBits     = -1;      ///< member side: last confirmation sent
         int16_t featureLevel   = -1;      ///< D15: the level this process advertised (-1 = none yet)
         std::array<int64_t, 4> superseded{};   ///< recent dead processes (ring)
+        /// E2 residual round 5 (R1): the controller's failure detector found
+        /// this node DEAD (out of the heartbeat-eligible set): its process
+        /// identity no longer vouches for a transient lineage.  Restored only
+        /// by proof of a live process — a NEW process registering (adopt) or
+        /// an accepted lineage report from this nonce.
+        bool    lineageRevoked = false;
         uint32_t supersededNext = 0;
         std::unordered_map<int32_t, int32_t> confirmed;   ///< controller side: member → clear bits
         [[nodiscard]] bool isSuperseded(int64_t n) const noexcept {
@@ -638,6 +648,7 @@ public:
             if (isSuperseded(n)) return false;
             if (nonce != 0) superseded[supersededNext++ % superseded.size()] = nonce;
             nonce = n; shutting = false; userOnly = false; completePushed = false; pushedBits = -1;
+            lineageRevoked = false;   // R1: a new live process
             featureLevel = -1;   // D15: a new process may be another binary
             confirmed.clear();
             return true;
@@ -902,6 +913,153 @@ public:
         return false;
     }
 
+    // -----------------------------------------------------------------------
+    // E2 final fix wave (C1 multi-node, USER DECISION option b): TRANSIENT
+    // partition data lineages.  A transient leader reports, for its leadership,
+    // the leader epoch its ring's data came from (-1: unborn).  The controller
+    // KEEPS the committed lineage when the data provably belongs to it, MINTS a
+    // fresh one otherwise (decideTransientLineage) and commits a
+    // TransientLineageRecord confirming it for that leadership; the report is
+    // answered kAlterIsrLineageConfirmed only once that record is COMMITTED
+    // (the leader re-sends until then — a controller failover re-decides from
+    // the committed map).  Single node (setTransientLineageAuthority): no
+    // replica reports — every transient ring is born with the process, so the
+    // controller confirms each transient partition itself, keeping the lineage
+    // only within the same process incarnation.
+    // -----------------------------------------------------------------------
+    template <typename Reply>
+    bool onLineageReport_(const rune::replication::AlterIsrMsg& m,
+                          const rune::metadata::PartitionAssignment& pa, Reply& reply) {
+        namespace rr = rune::replication;
+        if (pa.leaderNode != m.leaderId || pa.leaderEpoch != static_cast<int32_t>(m.leaderEpoch)) {
+            reply(rr::kAlterIsrFencedLeaderEpoch, pa.partitionEpoch);   // not this leadership any more
+            return false;
+        }
+        if (auto ls = nodeLifecycle_.find(m.leaderId);   // R1: the current leadership's live process reports
+            ls != nodeLifecycle_.end() && ls->second.lineageRevoked && ls->second.nonce == incarnationOf_(m))
+            ls->second.lineageRevoked = false;
+        const rune::metadata::TransientLineage* rec = msm_.lineage(m.topicId, m.partition);
+        if (rune::metadata::lineageConfirmedFor(rec, &pa, incarnationOf_(m))) {   // N1: by THIS process
+            reply(rr::kAlterIsrLineageConfirmed, pa.partitionEpoch);
+            return false;
+        }
+        const int64_t key = partitionKey_(m.topicId, m.partition);
+        if (lineageInflight_.count(key) != 0) return false;   // being committed: the leader re-sends
+        for (const auto& q : pendingLineageRecords_)
+            if (q.topicId == m.topicId && q.partition == m.partition) return false;   // queued
+        rune::metadata::TransientLineageRecord r;
+        r.topicId   = m.topicId;
+        r.partition = m.partition;
+        // N1: the record carries the reporting leader's process identity.
+        r.l = rune::metadata::decideTransientLineage(rec, m.leaderId, pa.leaderEpoch, m.isr[2], mintLineage_(),
+                                                     incarnationOf_(m), pa.cleanElection);   // N3: unclean mints
+        noteLineageDecision_(r, rec);
+        pendingLineageRecords_.push_back(r);
+        drainDynamicQueue();
+        return true;
+    }
+    void noteLineageDecision_(const rune::metadata::TransientLineageRecord& r,
+                              const rune::metadata::TransientLineage* prev) {
+        const bool minted = prev == nullptr || prev->lineage != r.l.lineage;
+        ++(minted ? lineagesMinted_ : lineagesKept_);
+        spdlog::info("MetadataService[{}]: transient topicId={} partition={} leader {} epoch {}: data lineage {} "
+                     "{:#x} (minted at epoch {})", selfId_, r.topicId, r.partition, r.l.confirmedLeader,
+                     r.l.confirmedEpoch, minted ? "MINTED" : "kept", r.l.lineage, r.l.mintEpoch);
+    }
+    uint64_t mintLineage_() noexcept {
+        // splitmix64 over (time, counter, node): unique per decision, non-zero.
+        uint64_t x = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) ^
+                     (++lineageMintCounter_ << 32) ^ static_cast<uint64_t>(static_cast<uint32_t>(selfId_)) ^
+                     lineageSalt_;
+        x += 0x9E3779B97F4A7C15ull;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        x ^= x >> 31;
+        return x == 0 ? 1 : x;
+    }
+public:
+    /// Single node (C1): this controller is the transient lineage authority —
+    /// `selfIncarnation` (non-zero, per process) and the transient-topic
+    /// predicate.  Control thread; before the first doWork.
+    void setTransientLineageAuthority(int64_t selfIncarnation, bool (*isTransient)(void*, int32_t), void* ctx) noexcept {
+        lineageAuthorityIncarnation_ = selfIncarnation;
+        lineageIsTransient_          = isTransient;
+        lineageIsTransientCtx_       = ctx;
+        lineageSalt_ ^= static_cast<uint64_t>(selfIncarnation);
+    }
+    [[nodiscard]] const rune::metadata::TransientLineage* transientLineage(int32_t topicId, int32_t partition) const noexcept {
+        return msm_.lineage(topicId, partition);
+    }
+    /// E2 C1 (residual N1): the data lineage the group coordinator may answer
+    /// committed offsets of a TRANSIENT partition against, or
+    /// kLineageUntrusted (the settling window: answered NotLeader).  Trusted
+    /// only when confirmed for the CURRENT committed leadership AND by the
+    /// leader's LIVE process: single node — this process (the lineage
+    /// authority's incarnation); multi-node — the identity this node currently
+    /// knows for the confirmed leader (its registration nonce; every node
+    /// registers with every controller).  After a full-cluster restart the
+    /// committed assignment still names the dead leadership until its bump /
+    /// failover commits: its committed identity no longer matches (or is not
+    /// yet known) — never trusted.  Runtime thread.
+    [[nodiscard]] uint64_t trustedTransientLineage(int32_t topicId, int32_t partition) const noexcept {
+        const rune::metadata::TransientLineage* rec = msm_.lineage(topicId, partition);
+        if (rec == nullptr) return rune::metadata::kLineageUntrusted;
+        const int64_t live = lineageAuthorityIncarnation_ != 0 ? lineageAuthorityIncarnation_
+                                                               : knownProcessIdentity(rec->confirmedLeader);
+        if (live == 0) return rune::metadata::kLineageUntrusted;   // the leader has not (re)registered yet
+        return rune::metadata::lineageConfirmedFor(rec, msm_.assignment(topicId, partition), live)
+                   ? rec->lineage : rune::metadata::kLineageUntrusted;
+    }
+    /// TEST-ONLY: see NodeConfig::testUserDecisionHoldMs.
+    void setUserDecisionHoldForTest(int64_t ns) noexcept { userDecisionHoldNs_ = ns; }
+    /// E2 C1 residual N1: the process identity this node currently knows for
+    /// `node` (its node-control registration nonce; every node registers with
+    /// every new controller) — 0 when unknown.
+    [[nodiscard]] int64_t knownProcessIdentity(int32_t node) const noexcept {
+        const auto it = nodeLifecycle_.find(node);
+        if (it == nodeLifecycle_.end() || it->second.lineageRevoked) return 0;   // R1: found dead
+        return it->second.nonce;
+    }
+    /// R1 (round 5): moves whenever a committed lineage changes (the group
+    /// coordinator re-sweeps its groups for superseded positions).
+    [[nodiscard]] uint64_t transientLineageVersion() const noexcept { return msm_.lineageVersion(); }
+    [[nodiscard]] uint64_t lineageIdentitiesRevokedForTest() const noexcept { return lineageIdentitiesRevoked_; }
+    [[nodiscard]] const rune::metadata::PartitionAssignment* committedAssignment(int32_t topicId,
+                                                                                int32_t partition) const noexcept {
+        return msm_.assignment(topicId, partition);
+    }
+    [[nodiscard]] uint64_t lineagesMintedForTest() const noexcept { return lineagesMinted_; }
+    [[nodiscard]] uint64_t lineagesKeptForTest() const noexcept { return lineagesKept_; }
+private:
+    /// Single node: confirm every transient partition this node leads (keep
+    /// within this process, mint across processes) — re-checked when the
+    /// committed map or lineages change.  Cold.
+    void maybeConfirmSingleNodeLineages_() {
+        if (lineageAuthorityIncarnation_ == 0 || lineageIsTransient_ == nullptr || !controllerReady_()) return;
+        if (msm_.committedVersion() == lineageScanMapVersion_ && msm_.lineageVersion() == lineageScanLineageVersion_ &&
+            pendingLineageRecords_.empty() && lineageInflight_.empty())
+            return;
+        lineageScanMapVersion_     = msm_.committedVersion();
+        lineageScanLineageVersion_ = msm_.lineageVersion();
+        msm_.committedMap().forEach([&](int32_t t, int32_t p, const rune::metadata::PartitionAssignment& pa) {
+            if (t < 0 || pa.leaderNode != selfId_ || !lineageIsTransient_(lineageIsTransientCtx_, t)) return;
+            const rune::metadata::TransientLineage* rec = msm_.lineage(t, p);
+            if (rune::metadata::lineageConfirmedFor(rec, &pa, lineageAuthorityIncarnation_)) return;
+            const int64_t key = partitionKey_(t, p);
+            if (lineageInflight_.count(key) != 0) return;
+            for (const auto& q : pendingLineageRecords_) if (q.topicId == t && q.partition == p) return;
+            // Same process: the ring (and its data) is the one confirmed before.
+            const int32_t src = rec != nullptr && rec->incarnation == lineageAuthorityIncarnation_ ? rec->confirmedEpoch : -1;
+            rune::metadata::TransientLineageRecord r;
+            r.topicId = t; r.partition = p;
+            r.l = rune::metadata::decideTransientLineage(rec, selfId_, pa.leaderEpoch, src, mintLineage_(),
+                                                         lineageAuthorityIncarnation_);
+            noteLineageDecision_(r, rec);
+            pendingLineageRecords_.push_back(r);
+        });
+    }
+
+public:
     /// N1/N2: a replica of a LEADERLESS partition reports itself.  Recorded
     /// only for the current leaderless epoch; always answered (a stale report
     /// is moot — the replica gets a newer role).
@@ -1086,6 +1244,21 @@ public:
             emptyMemoryLeader_.erase(k);
         }
     }
+    /// R1 (round 5): a node the failure detector found dead (out of the
+    /// heartbeat-eligible set) no longer vouches for a lineage — its remembered
+    /// identity is cleared for trust.  (Its leaderships are failed over / made
+    /// leaderless in the same tick; a node wrongly found dead gets a new
+    /// leadership whose lineage report restores it.)
+    void revokeDeadLineageIdentities_() {
+        for (auto& [n, st] : nodeLifecycle_) {
+            if (n == selfId_ || st.nonce == 0 || st.lineageRevoked || isEligible_(n)) continue;
+            st.lineageRevoked = true;
+            ++lineageIdentitiesRevoked_;
+            spdlog::info("MetadataService[{}]: node {} found dead — its process identity no longer vouches for "
+                         "transient lineages", selfId_, n);
+        }
+    }
+    uint64_t lineageIdentitiesRevoked_ = 0;
     [[nodiscard]] bool isEligible_(int32_t n) const noexcept {
         return std::find(eligible_.begin(), eligible_.end(), n) != eligible_.end();
     }
@@ -1374,6 +1547,7 @@ public:
         const std::vector<int32_t>& shutting = shuttingNodes_();
         eligible_.assign(eligibleNodes.begin(), eligibleNodes.end());
         eligibleKnown_ = true;
+        revokeDeadLineageIdentities_();   // R1 (round 5)
 
         // MEDIUM-B: coordinator partitions (controller-ISR path).
         const std::size_t coord = reconcileCoordinatorPartitions(eligibleNodes);
@@ -1444,6 +1618,11 @@ public:
 
         rune::metadata::DynamicBalancer bal;
         std::vector<rune::metadata::BalancerRecord> recs = bal.rebalance(in);
+        if (userDecisionHoldNs_ > 0 && lastNowNs_ < readySinceNs_ + userDecisionHoldNs_) [[unlikely]] {
+            // TEST-ONLY hold (NodeConfig::testUserDecisionHoldMs): no USER partition decision yet.
+            std::erase_if(recs, [](const rune::metadata::BalancerRecord& br) { return br.rec.topicId >= 0; });
+            bumpRequests_.clear();   // re-sent by their requesters; decided after the hold
+        }
         // A partition with a record in flight (e.g. a committed-ISR change from
         // AlterIsr) is decided again on the next tick, on the committed state —
         // never on a stale ISR.
@@ -1580,6 +1759,12 @@ public:
     /// \returns non-zero if any records were applied this cycle.
     int doWork(int64_t nowNs) {
         if (!replica_) return 0;
+        lastNowNs_ = nowNs;
+        if (userDecisionHoldNs_ > 0) {   // TEST-ONLY (NodeConfig::testUserDecisionHoldMs)
+            const bool ready = controllerReady_();
+            if (ready && !holdWasReady_) readySinceNs_ = nowNs;
+            holdWasReady_ = ready;
+        }
 
         // The log's existing content changed (a KIP-279 truncation while
         // following): everything applied from the old content is stale — rebuild
@@ -1637,6 +1822,8 @@ public:
             // leader re-decides from the committed map.
             pendingDynamicRecords_.clear();
             inflight_.clear();
+            pendingLineageRecords_.clear();   // C1: the next controller re-decides (leaders re-send)
+            lineageInflight_.clear();
             pendingFeatureLevel_  = -1;   // D15: the next controller re-decides
             featureInflightLevel_ = -1;
             // Controlled-shutdown marks are kept (soft, every member holds
@@ -1651,7 +1838,10 @@ public:
         const rune::replication::Offset hw = replica_->highWatermark();
         for (auto it = inflight_.begin(); it != inflight_.end();)
             it = (it->second <= hw) ? inflight_.erase(it) : std::next(it);
+        for (auto it = lineageInflight_.begin(); it != lineageInflight_.end();)
+            it = (it->second <= hw) ? lineageInflight_.erase(it) : std::next(it);
         if (amLeader) maybeRaiseFeatureLevel_();   // D15 (no-op once at the supported level)
+        if (amLeader) maybeConfirmSingleNodeLineages_();   // C1 (single node only)
         if (hw <= 0 || hw <= lastApplied_) {
             // Nothing new to apply.  Still call commit() so pending records
             // already decoded in a prior partial cycle get committed.
@@ -2045,7 +2235,9 @@ private:
     }
 
     void drainDynamicQueue() {
-        if (pendingDynamicRecords_.empty() && pendingFeatureLevel_ <= msm_.featureLevel()) return;
+        if (pendingDynamicRecords_.empty() && pendingLineageRecords_.empty() &&
+            pendingFeatureLevel_ <= msm_.featureLevel())
+            return;
         if (!leaderReady_()) return;   // kept queued until this replica may append
 
         static constexpr std::size_t kEncBufSize = 16 * 1024;
@@ -2053,6 +2245,18 @@ private:
 
         std::size_t cycleRecords = 0;
         std::size_t cycleBytes   = 0;
+
+        // C1 multi-node: transient lineage records (one per confirmed leadership).
+        while (!pendingLineageRecords_.empty() && cycleRecords < kMaxRecordsPerBatch) {
+            const auto& lr = pendingLineageRecords_.front();
+            const std::size_t n = lr.encode(encBuf, kEncBufSize);
+            if (n == 0) { pendingLineageRecords_.pop_front(); continue; }
+            if (replica_->append(std::span<const uint8_t>(encBuf, n), /*acksAll=*/false) < 0) return;
+            lineageInflight_[partitionKey_(lr.topicId, lr.partition)] = replica_->logEndOffset();
+            pendingLineageRecords_.pop_front();
+            ++cycleRecords;
+            cycleBytes += n;
+        }
 
         if (pendingFeatureLevel_ > msm_.featureLevel()) {   // D15: ahead of the assignments
             rune::metadata::FeatureLevelRecord fr;
@@ -2217,6 +2421,18 @@ private:
     // invalidate existing elements.
     // -----------------------------------------------------------------------
     std::deque<rune::metadata::BalancerRecord> pendingDynamicRecords_;
+    // C1 multi-node: lineage decisions to append, and the appended-not-yet-
+    // committed ones (partition key -> metadata-log end offset).
+    std::deque<rune::metadata::TransientLineageRecord> pendingLineageRecords_;
+    int64_t userDecisionHoldNs_ = 0, readySinceNs_ = 0, lastNowNs_ = 0;   ///< TEST-ONLY hold
+    bool    holdWasReady_       = false;
+    std::unordered_map<int64_t, rune::replication::Offset> lineageInflight_;
+    uint64_t lineagesMinted_ = 0, lineagesKept_ = 0, lineageMintCounter_ = 0;
+    uint64_t lineageSalt_ = 0x5DEECE66Dull;
+    int64_t  lineageAuthorityIncarnation_ = 0;   ///< single node only (0 = replicas report)
+    bool   (*lineageIsTransient_)(void*, int32_t) = nullptr;
+    void*    lineageIsTransientCtx_ = nullptr;
+    uint64_t lineageScanMapVersion_ = UINT64_MAX, lineageScanLineageVersion_ = UINT64_MAX;
 
     // -----------------------------------------------------------------------
     // Task 14: control-plane tick state (leader-owned).

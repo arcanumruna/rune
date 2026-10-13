@@ -109,14 +109,15 @@ void ReplicatedOffsetStore::encodeKey(const GroupId& group, const TopicPartition
 // Internal: encode value into valScratch_
 // ---------------------------------------------------------------------------
 
-void ReplicatedOffsetStore::encodeVal(Offset offset, int64_t tsNs, std::string_view metadata)
+void ReplicatedOffsetStore::encodeVal(Offset offset, int64_t tsNs, std::string_view metadata, uint64_t lineage)
 {
-    // val_bytes = offset(int64) + tsNs(int64) + metaLen(uint16) + meta
+    // val_bytes = offset(int64) + tsNs(int64) + metaLen(uint16) + meta [+ lineage(uint64), C1]
     valScratch_.clear();
     pushLE64(valScratch_, offset);
     pushLE64(valScratch_, tsNs);
     pushLE16(valScratch_, static_cast<uint16_t>(metadata.size()));
     valScratch_.insert(valScratch_.end(), metadata.begin(), metadata.end());
+    if (lineage != 0) pushLE64(valScratch_, static_cast<int64_t>(lineage));   // a disk partition: unchanged bytes
 }
 
 // ---------------------------------------------------------------------------
@@ -127,7 +128,8 @@ bool ReplicatedOffsetStore::commit(const GroupId&        group,
                                     const TopicPartition& tp,
                                     Offset                offset,
                                     std::string_view      metadata,
-                                    int64_t               tsNs)
+                                    int64_t               tsNs,
+                                    uint64_t              lineage)
 {
     // Guard: group name, topic name, and metadata must each fit in uint16_t.
     // A size() >= 64 KiB would silently truncate the encoded length to a wrong
@@ -138,7 +140,7 @@ bool ReplicatedOffsetStore::commit(const GroupId&        group,
 
     // 1. Encode key + value into reusable scratch buffers.
     encodeKey(group, tp);
-    encodeVal(offset, tsNs, metadata);
+    encodeVal(offset, tsNs, metadata, lineage);
 
     // 2. Build the compact payload (key-section + val-section) into batchScratch_.
     //
@@ -183,6 +185,7 @@ bool ReplicatedOffsetStore::commit(const GroupId&        group,
     co.offset            = offset;
     co.metadata          = std::string(metadata);
     co.commitTimestampNs = tsNs;
+    co.lineage           = lineage;
     index_[group][tp]    = std::move(co);
     return true;
 }
@@ -270,6 +273,9 @@ void ReplicatedOffsetStore::applyRecord(std::string_view /*unused_key*/,
     uint16_t metaLen = getLE16(vp);   vp += 2; vsz -= 2;
     if (vsz < metaLen) return;
     std::string meta(reinterpret_cast<const char*>(vp), metaLen);
+    vp += metaLen; vsz -= metaLen;
+    // C1: the transient lineage stamp (absent in older / disk records: 0).
+    const uint64_t lineage = vsz >= 8u ? static_cast<uint64_t>(getLE64(vp)) : 0u;
 
     // ---- Fold into index (last-write-wins including lower-offset overwrite) ----
     TopicPartition tp{std::move(topic), partition};
@@ -277,6 +283,7 @@ void ReplicatedOffsetStore::applyRecord(std::string_view /*unused_key*/,
     co.offset            = offset;
     co.metadata          = std::move(meta);
     co.commitTimestampNs = tsNs;
+    co.lineage           = lineage;
     index_[group][std::move(tp)] = std::move(co);
 }
 
@@ -300,8 +307,15 @@ void ReplicatedOffsetStore::applyRecord(std::string_view /*unused_key*/,
 
 bool ReplicatedOffsetStore::rebuildFromLog()
 {
-    const rune::replication::Offset hw = replica_->highWatermark();
-    if (hw <= 0) return false; // nothing committed yet — caller should retry
+    const rune::replication::Offset hw  = replica_->highWatermark();
+    const rune::replication::Offset leo = replica_->logEndOffset();
+    // E2 residual round 4: the index is LOADED only from the leader's WHOLE log.
+    // An empty log is complete (nothing to load).  HW below the log end (a
+    // cold restart: the HW gated at 0, or below a previous term's tail while
+    // the ISR re-expands) would load a PREFIX — an older offset, or none, for a
+    // group whose newer commit sits above the HW: a guess.  Retry later.
+    if (leo <= 0) { index_.clear(); return true; }
+    if (hw <= 0 || hw < leo) return false;
     index_.clear();
 
     // Chunk size: large enough to read an entire typical segment in one call.

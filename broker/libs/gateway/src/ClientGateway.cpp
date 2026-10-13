@@ -670,6 +670,7 @@ int ClientGateway::doWork(int64_t nowNs) {
     // produce ack is sent as soon as the publication clears back-pressure,
     // preserving the "no silent drop on back-pressure" invariant.
     drainPendingResponses(nowNs);
+    if (!pendingLineageNotes_.empty()) [[unlikely]] (void)flushPendingLineageNotes_();   // round 6 (F1)
     // No-hang fix round 3: the no-hang counters, logged while the broker runs
     // (on change, at most every kNoHangStatsLogNs) — one compare per duty cycle.
     if (nowNs >= nextNoHangStatsLogNs_) [[unlikely]] (void)logNoHangStatsIfChanged_(nowNs);
@@ -2967,6 +2968,181 @@ void ClientGateway::noteUnanswerable_(const uint8_t* buf, std::size_t len, const
                  unanswerableFrames_);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2b E2: servedPartition_ — see ServedPartition.  The disk fast path is the
+// same single servableLog() probe every site made before; the C1 / topic /
+// replica probes run only when there is no servable disk Log.  Control thread.
+// ---------------------------------------------------------------------------
+ClientGateway::ServedPartition ClientGateway::servedPartition_(int32_t topicId, int32_t partition) const noexcept
+{
+    using Kind = ServedPartition::Kind;
+    ServedPartition s;
+    if (topicRegistry_ == nullptr) return s;
+    if (rune::storage::Log* log = topicRegistry_->servableLog(topicId, partition)) [[likely]] {
+        s.kind = Kind::Disk;
+        s.log  = log;
+        return s;
+    }
+    if (topicRegistry_->awaitingCommit(topicId)) { s.kind = Kind::AwaitingCommit; return s; }   // C1
+    const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
+    if (spec == nullptr || spec->persistence != rune::node::PersistenceMode::Transient) return s;
+    if (partition < 0 || partition >= spec->partitionCount) return s;
+    if (replicaRegistry_ != nullptr && replicaRegistry_->lookup(topicId, partition) != nullptr)
+        s.kind = Kind::Transient;
+    return s;
+}
+
+bool ClientGateway::readCommittedServableHere_(int32_t topicId, int32_t partition) const noexcept
+{
+    if (replicaRegistry_ == nullptr || topicId < 0) return true;   // unreplicated / internal: unchanged
+    const GatewayReplicaView v{replicaRegistry_->lookupHandle(topicId, partition)};
+    return !v || v.publishedLeader();
+}
+
+void ClientGateway::scanMovedAwaySlice_()
+{
+    const std::size_t nb = subscriptions_.bucket_count();
+    if (nb == 0) return;
+    // E2 final fix wave (N1): the budget counts actual movedAway_ PROBES (one
+    // replica-registry lookup each) and the slice stops the moment it is
+    // spent — mid-bucket if need be (movedAwayBucketPos_ = the survivors of
+    // the current bucket already visited), so a colliding bucket can never
+    // exceed it.  A retired (erased) element does not advance the position;
+    // a rehash between slices only moves where the walk resumes — every
+    // subscription is still reached on a later lap (and the routed sweep
+    // covers them all).
+    int budget = kMovedAwayLookupsPerSlice;
+    for (std::size_t visited = 0; visited < nb && visited < kMovedAwayBucketsPerSlice && budget > 0; ++visited) {
+        if (movedAwayBucket_ >= nb) { movedAwayBucket_ = 0; movedAwayBucketPos_ = 0; }
+        const std::size_t b = movedAwayBucket_;
+        auto it = subscriptions_.begin(b);
+        std::size_t pos = 0;
+        for (; it != subscriptions_.end(b) && pos < movedAwayBucketPos_; ++it) ++pos;   // resume mid-bucket
+        bool spent = false;
+        while (it != subscriptions_.end(b)) {
+            if (budget == 0) { spent = true; break; }
+            const int64_t subId = it->first;
+            Subscription& sub   = it->second;
+            ++it;   // before a possible erase (erase invalidates only that element)
+            if (!movedAwayEligible_(sub)) { ++pos; continue; }
+            --budget;
+            if (movedAway_(sub) && retireReadCommittedMovedAway_(subId, sub)) {
+                subscriptions_.erase(subId);   // the position stays: the next survivor takes its place
+                continue;
+            }
+            ++pos;
+        }
+        if (spent) { movedAwayBucketPos_ = pos; break; }
+        ++movedAwayBucket_;
+        movedAwayBucketPos_ = 0;
+    }
+    const int probes = kMovedAwayLookupsPerSlice - budget;
+    if (probes > movedAwayMaxProbesPerSlice_) movedAwayMaxProbesPerSlice_ = probes;
+}
+
+void ClientGateway::logMovedAwaySummary_()
+{
+    spdlog::info("ClientGateway: {} subscription(s) this node can no longer serve (demoted / partition moved "
+                 "away) answered NotLeader (v6: Redirect to a known new leader) and dropped since the last "
+                 "summary ({} in total); the clients "
+                 "re-subscribe from their positions on the leaders",
+                 movedAwaySinceSummary_, readCommittedMovedAway_);
+    ++movedAwaySummaries_;
+    lastMovedAwaySummaryCount_ = movedAwaySinceSummary_;
+    movedAwaySinceSummary_     = 0;
+    nextMovedAwaySummaryNs_    = nowNs_ + kMovedAwaySummaryEveryNs;
+}
+
+bool ClientGateway::movedAway_(Subscription& sub) const noexcept
+{
+    const GatewayReplicaView v{replicaRegistry_->lookupHandle(sub.topicId, sub.partition)};
+    if (!v) return sub.hadReplica;   // removed from this node since it (or a sweep) saw one
+    // E2 final fix wave (M5): a subscription accepted BEFORE this node got a
+    // replica of the partition (a reassignment adding the node later) learns it
+    // here, the first time a sweep sees the registered replica — so that
+    // replica's later removal retires it instead of leaving it silent.
+    sub.hadReplica = true;
+    return sub.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) &&
+           !v.publishedLeader();
+}
+
+bool ClientGateway::retireReadCommittedMovedAway_(int64_t subId, Subscription& sub)
+{
+    // Precondition (both callers gate on movedAwayEligible_): never a
+    // coordinator-created group subscription — those are revoked by the group
+    // coordinator, not retired here (E2 final fix wave: was a dead `!isGroup`
+    // term in the Redirect condition below).
+    assert(!sub.isGroup && "retireReadCommittedMovedAway_: a coordinator-created group subscription");
+    Session* session = sessions_.find(sub.sessionId);
+    if (session == nullptr) return false;   // dies with its session (dropSessionSubscriptions_)
+    // Fix round 2 (M3): first the POSITION NOTE (Protocol.h, client version 6)
+    // — an empty-batch Records frame of this subscription carrying this
+    // broker's cursor (in shard mode the bind-time resolved start; legacy, the
+    // live cursor), so a subscription that delivered nothing resumes there on
+    // the new leader instead of re-resolving Latest (records produced around
+    // the move would be skipped).  Ordered before the NotLeader on the same
+    // reliable session egress.  Older clients ignore an empty batch.
+    if (pc::clientUnderstandsMovedPositionNote(session->clientVersion)) {
+        pc::Records note;
+        note.sessionId      = sub.sessionId;
+        note.correlationId  = sub.subscribeCorrId;
+        note.subscriptionId = subId;
+        note.topicId        = sub.topicId;
+        note.partition      = sub.partition;
+        note.baseOffset     = sub.nextOffset;
+        note.recordBatch    = {};
+        const std::size_t n = note.encode(scratch_.data());
+        sendAnswer_(*session, scratch_.data(), n);
+    }
+    pc::ErrorResponse err;
+    err.sessionId     = sub.sessionId;
+    err.correlationId = sub.subscribeCorrId;
+    err.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+    static_assert(pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 <= kScratchSize,
+                  "scratch too small for a bare ErrorResponse");
+    // E2 Task 14 (3-node e2e): a plain subscription rides the client's SEED
+    // session, which followed the subscribe Redirect to this node.  A bare
+    // NotLeader makes the client re-arm it on that same session and wait for
+    // metadata over it — stranded when this node is stopping (controlled
+    // shutdown).  When the routing image already names ANOTHER leader with a
+    // known client endpoint, a v6 session is answered Redirect{endpoint}: the
+    // client follows it per partition (that leader's own session; the seed is
+    // never retargeted — E2 final fix wave I2) and re-subscribes from its
+    // position.  Group-member partition subscriptions (bit-61 correlation ids)
+    // ride per-leader sessions and keep the NotLeader their re-route handles.
+    constexpr int64_t kGroupFetchCorrTag = int64_t{1} << 61;   // rune-client GroupConsumerHub
+    if (pc::clientUnderstandsMovedPositionNote(session->clientVersion) &&
+        (sub.subscribeCorrId & kGroupFetchCorrTag) == 0 && routingImage_) {
+        const auto& entry = routingImage_->lookup(rune::metadata::gpidOf(sub.topicId, sub.partition));
+        if (entry.leaderNodeId != rune::metadata::RoutingImage::NO_LEADER_NODE_ID &&
+            entry.leaderNodeId != thisNodeId_) {
+            if (const auto ep = nodeEndpointMap_.find(entry.leaderNodeId);
+                ep != nodeEndpointMap_.end() && !ep->second.empty() &&
+                pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 + ep->second.size() <=
+                    scratch_.size()) {
+                err.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
+                err.message = ep->second;
+            }
+        }
+    }
+    const std::size_t encoded = err.encode(scratch_.data());
+    sendAnswer_(*session, scratch_.data(), encoded);   // queued + retried, never best-effort
+    if (perWorkerEgressActive_ && workerPool_)
+        forwardUnsubscribeToWorker_(subId, sub.topicId, sub.partition);   // the worker drops its cursor
+    pendingWorkerReads_.erase(subId);   // a PushRead in flight answers a sub that is gone (ignored)
+    if (const auto ix = session->subIdByKey.find(Session::SubKey{sub.subscribeCorrId, sub.topicId, sub.partition});
+        ix != session->subIdByKey.end() && ix->second == subId)
+        session->subIdByKey.erase(ix);
+    ++readCommittedMovedAway_;
+    ++movedAwaySinceSummary_;   // one rate-limited info summary (logMovedAwaySummary_)
+    spdlog::debug("ClientGateway: subscription {} (sessionId={} topicId={} partition={} isolation={} "
+                 "nextOffset={}) — this node no longer serves it (demoted / partition moved away): {}, "
+                 "dropped (the client re-subscribes from its position on the leader)",
+                 subId, sub.sessionId, sub.topicId, sub.partition, sub.isolation, sub.nextOffset,
+                 err.code == static_cast<int16_t>(pc::ErrorCode::Redirect) ? "Redirect" : "NotLeader");
+    return true;
+}
+
 bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 {
     // 1. Decode Produce.
@@ -3158,18 +3334,21 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // writable — answered NotLeader (retriable: the client refreshes metadata, which
     // lists the topic once it commits, and retries).  Nothing is appended, so a
     // topic boot may later reclaim as an orphan never holds an acknowledged record.
-    rune::storage::Log* log = topicRegistry_->servableLog(msg.topicId, partition);
-    if (!log) [[unlikely]] {
-        if (topicRegistry_->awaitingCommit(msg.topicId)) {
-            spdlog::debug("ClientGateway: Produce to topicId={} awaiting its DDL commit — NotLeader "
-                          "(retriable)", msg.topicId);
-            sendResp(pc::ErrorCode::NotLeader, partition, 0);
-            return true;
-        }
+    // Phase 2b E2: a TRANSIENT partition has no disk Log — routed to its owning
+    // worker below (op.logPtr = nullptr: the worker appends to the replica's ring).
+    const ServedPartition served = servedPartition_(msg.topicId, partition);
+    if (served.kind == ServedPartition::Kind::AwaitingCommit) [[unlikely]] {
+        spdlog::debug("ClientGateway: Produce to topicId={} awaiting its DDL commit — NotLeader "
+                      "(retriable)", msg.topicId);
+        sendResp(pc::ErrorCode::NotLeader, partition, 0);
+        return true;
+    }
+    if (served.kind == ServedPartition::Kind::Unknown) [[unlikely]] {
         spdlog::debug("ClientGateway: Produce bad partition={} for topicId={}", partition, msg.topicId);
         sendResp(pc::ErrorCode::UnknownPartition, partition, 0);
         return true;
     }
+    rune::storage::Log* log = served.log;   // nullptr ⟺ Kind::Transient
 
     // GR-4 / F15 §3.1 (I1): per-partition NotLeader.
     //
@@ -3512,6 +3691,14 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             takeProduceCredit_(*session, routedWorker);
         }
         // Response (or pending-ack) will be processed in drainWorkerReturns_().
+        return true;
+    }
+
+    // Phase 2b E2: a TRANSIENT partition is appended only by its owning worker —
+    // never inline (the gateway never touches a worker-owned ring).  Reached
+    // only without a worker pool (unit rigs; ruling 6).
+    if (log == nullptr) [[unlikely]] {
+        sendResp(pc::ErrorCode::UnknownPartition, partition, 0);
         return true;
     }
 
@@ -4178,17 +4365,79 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // C1: a runtime topic awaiting its DDL commit is not readable — the bare
     // ErrorResponse{NotLeader} every unservable-here subscribe gets (retriable:
     // refresh metadata, retry); no subscription is registered.
-    rune::storage::Log* log = topicRegistry_->servableLog(msg.topicId, partition);
-    if (!log) {
-        if (topicRegistry_->awaitingCommit(msg.topicId)) {
-            spdlog::debug("ClientGateway: Subscribe to topicId={} awaiting its DDL commit — NotLeader "
-                          "(retriable)", msg.topicId);
-            sendSubRedirect(std::string{}, msg.correlationId);
-            return;
-        }
+    const ServedPartition served = servedPartition_(msg.topicId, partition);
+    if (served.kind == ServedPartition::Kind::AwaitingCommit) {
+        spdlog::debug("ClientGateway: Subscribe to topicId={} awaiting its DDL commit — NotLeader "
+                      "(retriable)", msg.topicId);
+        sendSubRedirect(std::string{}, msg.correlationId);
+        return;
+    }
+    // Phase 2b E2: a TRANSIENT partition (no disk Log) is pushed by its owning
+    // worker only — refused without a worker pool (no inline push path).
+    if (served.kind == ServedPartition::Kind::Unknown ||
+        (served.kind == ServedPartition::Kind::Transient && !workerPool_)) {
         spdlog::debug("ClientGateway: Subscribe bad partition={} for topicId={}", partition, msg.topicId);
         sendResp(pc::ErrorCode::UnknownPartition, partition, 0);
         return;
+    }
+    rune::storage::Log* const log = served.log;   // nullptr ⟺ Kind::Transient
+
+    // E2 Task 11 ruling (no silent stall): read_committed is served from a
+    // LEADER's RC state only — a follower answered OK and then delivered nothing.
+    // Refused with the bare ErrorResponse{NotLeader} (retriable: the client
+    // refreshes metadata and re-routes to the leader), disk and transient alike,
+    // BEFORE any subscription is registered — the one registration point both
+    // worker modes go through (shard mode forwards the registered sub to the
+    // owning worker below).  Also covers a group carrier switching to it (5a).
+    if (msg.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) &&
+        !readCommittedServableHere_(msg.topicId, partition)) [[unlikely]] {
+        spdlog::debug("ClientGateway: read_committed Subscribe to topicId={} partition={} on a follower — "
+                      "NotLeader (retriable)", msg.topicId, partition);
+        sendSubRedirect(std::string{}, msg.correlationId);
+        return;
+    }
+
+    // 4b. E2 residual round 6 (F1): a RESUMED plain subscription of a v7 client
+    //     claims, in `key`, the data lineage its position belongs to.  A claim
+    //     against a TRANSIENT partition whose ring restarted (a new lineage) is
+    //     answered PartitionDataReset — never served from a clamped position
+    //     (the client's resume floor would drop the refilled records: silent
+    //     loss); a claim while the lineage is unknown: the retriable NotLeader.
+    // FU1: a v7 PLAIN Subscribe (any — new or resumed) on a transient partition
+    //     whose lineage is not confirmed yet is answered the retriable NotLeader
+    //     (as OffsetFetch is): it never binds without a lineage note, so every
+    //     later resume of it can claim one.  Group-member fetches resume through
+    //     their group (bit-61 correlation ids) and are not gated here.
+    if (lineageFn_ != nullptr && served.kind == ServedPartition::Kind::Transient &&
+        (msg.correlationId & (int64_t{1} << 61)) == 0 &&
+        pc::clientUnderstandsLineageNote(session->clientVersion) &&
+        lineageFn_(lineageCtx_, msg.topicId, partition) == kLineageUnknown) [[unlikely]] {
+        ++subscribesAwaitingLineage_;
+        sendSubRedirect(std::string{}, msg.correlationId);   // retriable: bound once the lineage is known
+        return;
+    }
+    if (lineageFn_ != nullptr && served.kind == ServedPartition::Kind::Transient && msg.partitionKnown == 1 &&
+        msg.key.size() == 8 && pc::clientUnderstandsLineageNote(session->clientVersion)) [[unlikely]] {
+        uint64_t claim = 0;
+        for (int i = 0; i < 8; ++i) claim |= static_cast<uint64_t>(msg.key[static_cast<std::size_t>(i)]) << (8 * i);
+        const uint64_t now = lineageFn_(lineageCtx_, msg.topicId, partition);
+        if (claim != 0 && now == kLineageUnknown) {
+            sendSubRedirect(std::string{}, msg.correlationId);   // retriable: decided once it is known
+            return;
+        }
+        if (claim != 0 && now != 0 && now != claim) {
+            ++partitionDataResets_;
+            spdlog::info("ClientGateway: resumed Subscribe sessionId={} topicId={} partition={} claims data lineage "
+                         "{:#x}, now {:#x} — PartitionDataReset (the client resumes from the log start)",
+                         msg.sessionId, msg.topicId, partition, claim, now);
+            pc::ErrorResponse er;
+            er.sessionId     = msg.sessionId;
+            er.correlationId = msg.correlationId;
+            er.code          = static_cast<int16_t>(pc::ErrorCode::PartitionDataReset);
+            const std::size_t n = er.encode(scratch_.data());
+            sendAnswer_(*session, scratch_.data(), n);
+            return;
+        }
     }
 
     // 5. Clamp fromOffset to [0, HW] (GR-6) — or [0, LEO] for non-replicated topics.
@@ -4218,7 +4467,9 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // "nothing to deliver" stall on a reconnecting subscriber).
     static constexpr int64_t kFromEarliest = -2;
     static constexpr int64_t kFromLatest   = -1;
-    const int64_t leo = log->logEndOffset();
+    // E2: a transient partition's replica is registered (servedPartition_), so
+    // its clamp is the published HW below — the ring itself is never read here.
+    const int64_t leo = log != nullptr ? log->logEndOffset() : 0;
     // GR-6: use HW as the clamp limit when a replica is available.
     // For non-replicated / single-node topics, HW == LEO — no behavioral change.
     int64_t clampLimit;
@@ -4236,7 +4487,10 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // begin()), so an Earliest subscriber pinned to 0 gets 0 records for the life
     // of the subscription.  Resolve Earliest — and clamp any explicit fromOffset
     // that points into a deleted region — UP to the live log start instead.
-    const int64_t logStart = log->logStartOffset();
+    // E2: a transient ring's start is worker-owned state (never read cross-
+    // thread): Earliest resolves to 0 and the owning worker moves a cursor below
+    // its ring start up to it (TRANSIENT_EVICTED, Worker::skipEvictedCursor_).
+    const int64_t logStart = log != nullptr ? log->logStartOffset() : 0;
     int64_t nextOffset;
     if (msg.fromOffset == kFromEarliest) {
         // Earliest → the oldest offset still readable (NOT hardcoded 0).
@@ -4344,6 +4598,8 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     sub.nextOffset     = nextOffset;
     sub.isolation      = msg.isolation;
     sub.subscribeCorrId = msg.correlationId;
+    sub.hadReplica      = replicaRegistry_ != nullptr &&
+                          static_cast<bool>(replicaRegistry_->lookupHandle(msg.topicId, partition));
 
     subscriptions_.emplace(subId, std::move(sub));
     session->subIdByKey[subKey] = subId;   // 5a: the dedupe index
@@ -4362,9 +4618,67 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
 
     // Reply SubscribeResponse{OK, partition, subscriptionId}.
     sendResp(pc::ErrorCode::OK, partition, subId);
+    if (served.kind == ServedPartition::Kind::Transient) noteLineage_(subId);   // round 6 (F1)
 
     spdlog::debug("ClientGateway: Subscribe sessionId={} subId={} topic={} partition={} nextOffset={} isolation={}",
                   msg.sessionId, subId, msg.topicId, partition, nextOffset, msg.isolation);
+}
+
+// ---------------------------------------------------------------------------
+// E2 residual round 6 (F1): the transient LINEAGE NOTE — a Records frame of the
+// subscription whose recordBatch is exactly the 8-byte LE lineage token (see
+// rune-protocol kClientVersionLineageNote), on the session's reliable egress
+// after its SubscribeResponse.  Plain subscriptions of v7 sessions only; a
+// lineage still unknown at bind is noted once it resolves (doWork, cold).
+// ---------------------------------------------------------------------------
+void ClientGateway::sendLineageNote_(Session& session, int64_t subId, const Subscription& sub, uint64_t lineage) {
+    uint8_t token[8];
+    for (int i = 0; i < 8; ++i) token[i] = static_cast<uint8_t>(lineage >> (8 * i));
+    pc::Records note;
+    note.sessionId      = sub.sessionId;
+    note.correlationId  = sub.subscribeCorrId;
+    note.subscriptionId = subId;
+    note.topicId        = sub.topicId;
+    note.partition      = sub.partition;
+    note.baseOffset     = -1;
+    note.recordBatch    = std::span<const uint8_t>(token, 8);
+    const std::size_t n = note.encode(scratch_.data());
+    sendAnswer_(session, scratch_.data(), n);
+    ++lineageNotesSent_;
+}
+
+void ClientGateway::noteLineage_(int64_t subId) {
+    if (lineageFn_ == nullptr) return;
+    const auto it = subscriptions_.find(subId);
+    if (it == subscriptions_.end() || it->second.isGroup) return;
+    constexpr int64_t kGroupFetchCorrTag = int64_t{1} << 61;   // group-member fetches resume via their group
+    if ((it->second.subscribeCorrId & kGroupFetchCorrTag) != 0) return;
+    Session* session = sessions_.find(it->second.sessionId);
+    if (session == nullptr || !pc::clientUnderstandsLineageNote(session->clientVersion)) return;
+    const uint64_t now = lineageFn_(lineageCtx_, it->second.topicId, it->second.partition);
+    if (now == 0) return;
+    if (now == kLineageUnknown) {
+        try { pendingLineageNotes_.push_back(subId); } catch (...) {}   // cold; a lost note = no claim (old behaviour)
+        return;
+    }
+    sendLineageNote_(*session, subId, it->second, now);
+}
+
+int ClientGateway::flushPendingLineageNotes_() {
+    int work = 0;
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < pendingLineageNotes_.size(); ++i) {
+        const int64_t subId = pendingLineageNotes_[i];
+        const auto it = subscriptions_.find(subId);
+        Session* session = it != subscriptions_.end() ? sessions_.find(it->second.sessionId) : nullptr;
+        if (session == nullptr) { ++work; continue; }   // gone
+        const uint64_t now = lineageFn_(lineageCtx_, it->second.topicId, it->second.partition);
+        if (now == kLineageUnknown) { pendingLineageNotes_[kept++] = subId; continue; }
+        if (now != 0) sendLineageNote_(*session, subId, it->second, now);
+        ++work;
+    }
+    pendingLineageNotes_.resize(kept);
+    return work;
 }
 
 // ---------------------------------------------------------------------------
@@ -4469,12 +4783,63 @@ void ClientGateway::handleUnsubscribe(const uint8_t* buf, std::size_t len)
 // ---------------------------------------------------------------------------
 void ClientGateway::pushSubscriptions()
 {
+    ++pushCycle_;   // F15 S4 fix round 1: the backoff clock (cycles, never wall time)
+    pushSubscriptionsPass_();
+    // E2 final fix wave (N2): the moved-away summary is logged at the END of
+    // the pass that retired subscriptions — prompt (the same pass), and
+    // accurate (a routed sweep's whole count, never a partial one) — then at
+    // most once per kMovedAwaySummaryEveryNs of wall time (retirements in the
+    // window are carried into the next summary, logged as soon as it elapses).
+    if (movedAwaySinceSummary_ != 0 && nowNs_ >= nextMovedAwaySummaryNs_) [[unlikely]]
+        logMovedAwaySummary_();
+}
+
+void ClientGateway::pushSubscriptionsPass_()
+{
     using namespace rune::protocol::batch;
 
-    ++pushCycle_;   // F15 S4 fix round 1: the backoff clock (cycles, never wall time)
     if (subscriptions_.empty()) return;
 
-    for (auto& [subId, sub] : subscriptions_) {
+    // Task 11 carry (E2 Task 13): a plain subscription this node can no longer
+    // serve (movedAway_: read_committed after a demotion; any isolation after
+    // its replica was removed) is answered NotLeader and dropped — both worker
+    // modes (checked BEFORE the per-worker-egress skip: the owning worker
+    // cannot tell the client, it only stops pushing).
+    //   - Routed trigger (immediate): every routed role change / replica
+    //     removal bumps the registry's roleChanges(); the routed role is
+    //     recorded BEFORE the owner flips, and movedAway_ reads it
+    //     (publishedLeader() is false once intended == Follower).
+    //   - Fallback (fix round 2: spread): a demotion no route reports (fenced by
+    //     a higher epoch) — every kMovedAwayScanEveryCycles passes, a slice of
+    //     at most ~kMovedAwayLookupsPerSlice subscriptions behind a bucket
+    //     cursor (scanMovedAwaySlice_); never an O(subs) spike.
+    //   - E2 final fix wave (M4): routed changes are COALESCED — the first one
+    //     after a quiet period sweeps at once; while changes keep arriving (a
+    //     controlled shutdown moves many partitions, one routed pass each) at
+    //     most one sweep per kRoutedSweepMinGapCycles passes covers them all.
+    //     Never one O(subscriptions) probe pass per role change.
+    if (replicaRegistry_ != nullptr && replicaRegistry_->roleChanges() != seenRcSweepRoleChanges_) [[unlikely]] {
+        seenRcSweepRoleChanges_ = replicaRegistry_->roleChanges();
+        routedSweepPending_     = true;
+    }
+    const bool routedSweep = routedSweepPending_ && pushCycle_ >= nextRoutedSweepCycle_;
+    if (routedSweep) [[unlikely]] {
+        routedSweepPending_   = false;
+        nextRoutedSweepCycle_ = pushCycle_ + kRoutedSweepMinGapCycles;
+        ++routedMovedAwaySweeps_;
+    } else if (replicaRegistry_ != nullptr && (pushCycle_ & (kMovedAwayScanEveryCycles - 1)) == 0) [[unlikely]] {
+        scanMovedAwaySlice_();
+        if (subscriptions_.empty()) return;
+    }
+    for (auto subIt = subscriptions_.begin(); subIt != subscriptions_.end(); ) {
+        const int64_t subId = subIt->first;
+        Subscription& sub   = subIt->second;
+        if (routedSweep && movedAwayEligible_(sub) && movedAway_(sub) &&
+            retireReadCommittedMovedAway_(subId, sub)) [[unlikely]] {
+            subIt = subscriptions_.erase(subIt);
+            continue;
+        }
+        ++subIt;
         // read-rework T3/T4 (I3b): when per-worker egress is active the OWNING worker
         // reads+encodes+pushes user partitions on its own dynamic-MDC egress — the
         // gateway must NOT also push them (that would double-deliver).  Internal
@@ -4495,20 +4860,42 @@ void ClientGateway::pushSubscriptions()
         // See block comment above for the full rationale.
         rune::storage::Log* log = topicRegistry_ ?
             topicRegistry_->log(sub.topicId, sub.partition) : nullptr;
-        if (!log) continue; // registry removed or not set — skip
+        // Phase 2b E2: a TRANSIENT partition (no disk Log) is read by its owning
+        // worker only (the PushRead below) — never by the inline path.
+        // Final fix wave (M6): its classification + replica are cached on the
+        // subscription, refreshed only when a registry generation moved (a
+        // replica added / removed, a topic created / committed) — two integer
+        // compares per cycle instead of four hash probes.
+        if (!log) {
+            if (!workerPool_ || replicaRegistry_ == nullptr || topicRegistry_ == nullptr) continue;
+            const uint64_t regGen = replicaRegistry_->generation();
+            const uint64_t catGen = topicRegistry_->catalogGeneration();
+            if (sub.transientClassRegGen != regGen || sub.transientClassCatGen != catGen) [[unlikely]] {
+                sub.transientClassRegGen = regGen;
+                sub.transientClassCatGen = catGen;
+                ++transientClassifications_;
+                sub.transientReplica =
+                    servedPartition_(sub.topicId, sub.partition).kind == ServedPartition::Kind::Transient
+                        ? replicaRegistry_->lookup(sub.topicId, sub.partition)
+                        : nullptr;
+            }
+            if (sub.transientReplica == nullptr) continue;   // registry removed or not set — skip
+        }
 
         // GR-6: Look up the PartitionReplica for this (topicId, partition).
         // If found → bound = replica->highWatermark() (majority-committed).
         // If not found (non-replicated / registry not wired) → bound = LEO (pass-through).
         // O(1), no alloc, lock-free (single-writer duty-cycle thread).
         int64_t hw;
-        if (replicaRegistry_) {
+        if (!log) {
+            hw = sub.transientReplica->gatewayHighWatermark();   // M6: the cached replica (generations checked above)
+        } else if (replicaRegistry_) {
             const rune::replication::PartitionReplica* replica =
                 replicaRegistry_->lookup(sub.topicId, sub.partition);
-            hw = replica ? replica->gatewayHighWatermark() : log->logEndOffset();
+            hw = replica ? replica->gatewayHighWatermark() : (log ? log->logEndOffset() : 0);
         } else {
             // No replication wired — single-node pass-through: HW == LEO.
-            hw = log->logEndOffset();
+            hw = log ? log->logEndOffset() : 0;
         }
 
         // TX-4 Task 9: Apply isolation-level bound.
@@ -4567,8 +4954,9 @@ void ClientGateway::pushSubscriptions()
             if (sub.retryAtCycle > pushCycle_) continue;
 
             // Look up the owning replica (for the log accessor in the worker).
-            const rune::replication::PartitionReplica* repForRead = nullptr;
-            if (replicaRegistry_) {
+            // M6: a transient partition's is the cached one (no second probe).
+            const rune::replication::PartitionReplica* repForRead = log ? nullptr : sub.transientReplica;
+            if (log && replicaRegistry_) {
                 repForRead = replicaRegistry_->lookup(sub.topicId, sub.partition);
             }
 
@@ -4584,6 +4972,7 @@ void ClientGateway::pushSubscriptions()
             op.hwBound             = bound;
             op.isolation           = sub.isolation;
             op.isGroup             = sub.isGroup;
+            op.freshCursor         = sub.cursorFresh;   // M2
             op.groupCarrierReceived = sub.groupCarrierReceived;
 
             if (!workerPool_->tryEnqueueOp(sub.topicId, sub.partition, std::move(op))) {
@@ -5169,8 +5558,14 @@ void ClientGateway::appendRemoteControlRecord(const rune::replication::WriteTxnM
     // Review MEDIUM-5: this node's routing image is NOT consulted — it can lag
     // the replica role; the worker's role gate is the authority (a follower
     // replica answers NotLeader through it).
-    rune::storage::Log* log = topicRegistry_ ? topicRegistry_->servableLog(w.topicId, w.partition) : nullptr;   // C1
-    if (log == nullptr || w.topicId < 0 || w.marker.empty()) {
+    // C1 + E2: a committed transient partition takes markers too (its owning
+    // worker appends the control batch to the ring); uncommitted / unknown →
+    // NotLeader (the coordinator re-resolves — never Unknown*, see above).
+    const ServedPartition served = servedPartition_(w.topicId, w.partition);
+    rune::storage::Log* const log = served.log;
+    const bool servable = served.kind == ServedPartition::Kind::Disk ||
+                          served.kind == ServedPartition::Kind::Transient;
+    if (!servable || w.topicId < 0 || w.marker.empty()) {
         answerRemoteOrigin_(m, static_cast<int16_t>(pcl::ErrorCode::NotLeader), -1);
         return;
     }
@@ -5227,7 +5622,8 @@ void ClientGateway::appendRemoteControlRecord(const rune::replication::WriteTxnM
         return;
     }
     // No worker pool (unit rigs / single-thread): the inline append.
-    const int64_t base = appendControlRecordInline_(w.topicId, w.partition, w.marker, log);
+    // E2: a transient partition has no inline append (worker-owned ring) — NotLeader, the coordinator retries.
+    const int64_t base = log != nullptr ? appendControlRecordInline_(w.topicId, w.partition, w.marker, log) : -1;
     if (base >= 0) notifyControlMarker(w.topicId, w.partition, w.producerId, base, w.commit != 0);
     answerRemoteOrigin_(m, base >= 0 ? int16_t{0} : static_cast<int16_t>(pcl::ErrorCode::NotLeader), base);
 }
@@ -5554,6 +5950,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             // A result for a cursor the subscription no longer holds (rewound /
             // re-seeded meanwhile) carries nothing to adopt.
             const bool current = sub.nextOffset == sub.issuedNextOffset;
+            if (current) sub.cursorFresh = false;   // M2: the worker's answer is the cursor from now on
 
             if (ret.chunkBytes().empty()) {
                 // F15 addendum R-1: the worker may have consumed batches without
@@ -6524,16 +6921,28 @@ int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
         return -1;
     }
 
-    rune::storage::Log* log = topicRegistry_->servableLog(topicId, partition);   // C1
-    if (!log) {
+    // C1 + E2: uncommitted / unknown → refused; a TRANSIENT partition (no disk
+    // Log) is pushed by its owning worker only — refused without a worker pool.
+    const ServedPartition served = servedPartition_(topicId, partition);
+    if (served.kind == ServedPartition::Kind::AwaitingCommit || served.kind == ServedPartition::Kind::Unknown ||
+        (served.kind == ServedPartition::Kind::Transient && !workerPool_)) {
         spdlog::warn("ClientGateway::addGroupSubscription: unknown (or uncommitted) topicId={} partition={}",
                      topicId, partition);
         return -1;
     }
+    // E2 Task 11 ruling: read_committed only where it is served (a leader).
+    if (isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) &&
+        !readCommittedServableHere_(topicId, partition)) [[unlikely]] {
+        spdlog::debug("ClientGateway::addGroupSubscription: read_committed on a follower topicId={} "
+                      "partition={} — refused (NotLeader)", topicId, partition);
+        return -1;
+    }
+    rune::storage::Log* const log = served.log;   // nullptr ⟺ Kind::Transient
 
     // Clamp fromOffset to [0, bound] where bound is HW when a replica is
-    // wired (GR-6), else LEO.  Negative fromOffset is clamped to 0 (log start).
-    const int64_t leo = log->logEndOffset();
+    // wired (GR-6), else LEO.  Negative fromOffset is clamped to 0 (log start;
+    // E2: a transient cursor below the ring start is moved up by the worker).
+    const int64_t leo = log != nullptr ? log->logEndOffset() : 0;
     int64_t bound;
     if (replicaRegistry_) {
         const rune::replication::PartitionReplica* replica =
@@ -6700,12 +7109,15 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
         return -1;
     }
 
-    rune::storage::Log* log = topicRegistry_->servableLog(topicId, partition);   // C1
-    if (!log) {
+    // C1 + E2: a committed TRANSIENT partition's markers ride the same worker /
+    // remote paths below (the worker appends the control batch to the ring).
+    const ServedPartition served = servedPartition_(topicId, partition);
+    if (served.kind != ServedPartition::Kind::Disk && served.kind != ServedPartition::Kind::Transient) {
         spdlog::debug("ClientGateway::appendControlRecord: unknown (or uncommitted) topicId={} partition={} "
                       "— dropped", topicId, partition);
         return -1;
     }
+    rune::storage::Log* const log = served.log;   // nullptr ⟺ Kind::Transient
 
     if (producerId < 0 && marker.size() >= 43u + 8u) {   // the control batch's producerId (LE @43)
         producerId = 0;
@@ -6778,6 +7190,11 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
                          topicId, partition, markerSendQueue_.size());
         }
         return kControlRecordAsync;
+    }
+    if (log == nullptr) [[unlikely]] {   // E2: transient without a worker pool — no inline append (ruling 6)
+        spdlog::debug("ClientGateway::appendControlRecord: transient topicId={} partition={} without a "
+                      "worker pool — dropped", topicId, partition);
+        return -1;
     }
     return appendControlRecordInline_(topicId, partition, marker, log);
 }

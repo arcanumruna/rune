@@ -841,3 +841,55 @@ TEST(WorkerRegression, RecoveryViewOverTransientSourceReachesReadyRegression) {
     EXPECT_FALSE(vs.hasRecovery()) << "recovery latches off once every instance is Ready";
     EXPECT_TRUE(w.viewsReady()) << "election-eligibility gate must open";
 }
+
+// Phase 2b E2 (Part E Task 7 carry-over), on the real worker pass: the
+// partition's replica is RECREATED (new incarnation, new ring) while the view
+// instance survives on the worker; the new ring's range covers the old cursor.
+// Before the fix the instance stayed Live and key 7 kept its stale hp 55.
+TEST(WorkerRegression, ViewOverRecreatedTransientSourceRefoldsRegression) {
+    constexpr int32_t kSrc = 23, kView = 0x40000043;
+    ReplicaFixture a(kSrc, 0), b(kSrc, 0);
+    a.replica->setRegistryHandle(/*id=*/1, /*incarnation=*/1);
+    b.replica->setRegistryHandle(/*id=*/1, /*incarnation=*/2);
+
+    const auto src = rune::codec::DescriptorBuilder("character", 1)
+        .add("characterId", rune::codec::PrimType::Int64, 1, /*isKey*/ true)
+        .add("hp", rune::codec::PrimType::Int32)
+        .build();
+    rune::view::ViewPlan v;
+    v.viewName = "char_hp_recreated"; v.key = "characterId"; v.sources = {{kSrc, "characterId"}};
+    v.output = {{"characterId", rune::codec::PrimType::Int64, 0, "characterId", rune::view::MergeRule::Replace},
+                {"hp", rune::codec::PrimType::Int32, 0, "hp", rune::view::MergeRule::Replace}};
+    v.persistence = 1;
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(v, srcs, kView).value();
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-worker-transient-recreated"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+
+    auto put = [](PartitionReplica& r, uint8_t id, int32_t hp) {
+        std::vector<uint8_t> value;
+        auto le = [&](uint64_t x, int n) { for (int i = 0; i < n; ++i) value.push_back(uint8_t(x >> (8 * i))); };
+        le(12, 2); le(1, 2); le(id, 8); le(static_cast<uint32_t>(hp), 4);
+        std::vector<uint8_t> key(8, 0); key[0] = id;
+        ASSERT_GE(r.appendKeyed(std::span<const uint8_t>(key), std::span<const uint8_t>(value), false), 0);
+    };
+    put(*a.replica, 7, 55);                                   // incarnation 1: offset 0
+    Worker w(/*workerId=*/0);
+    w.setOwnedDirect(Worker::OwnedSet{a.replica.get()});
+    w.setViewSet(&vs);
+    const rune::view::RowLayout* L = nullptr;
+    int64_t nowNs = 0;
+    for (int i = 0; i < 200 && vs.getRow(kView, 0, 7, L) == nullptr; ++i) w.doWork(nowNs += 1'000'000);
+    ASSERT_NE(vs.getRow(kView, 0, 7, L), nullptr);
+    ASSERT_EQ(rune::view::readSlot(vs.getRow(kView, 0, 7, L), *L, 1).i, 55);
+
+    put(*b.replica, 7, 66);                                   // incarnation 2: offset 0 — a different record
+    put(*b.replica, 9, 1);                                    // offset 1: the ring now covers the old cursor 1
+    w.setOwnedDirect(Worker::OwnedSet{b.replica.get()});      // the partition's replica was recreated
+    for (int i = 0; i < 200 && rune::view::readSlot(vs.getRow(kView, 0, 7, L), *L, 1).i != 66; ++i)
+        w.doWork(nowNs += 1'000'000);
+    EXPECT_EQ(rune::view::readSlot(vs.getRow(kView, 0, 7, L), *L, 1).i, 66) << "the view kept a row of the old ring";
+    ASSERT_NE(vs.getRow(kView, 0, 9, L), nullptr);
+    EXPECT_EQ(vs.foldCounters(kView, 0)->transientSourceResets, 1u);
+}

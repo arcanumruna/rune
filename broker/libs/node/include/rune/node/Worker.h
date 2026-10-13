@@ -515,6 +515,9 @@ public:
         for (auto& sl : rcSlots_) installReadAhead_(sl);
     }
     [[nodiscard]] uint64_t rcHintsSyncForTest() const noexcept { return rcHintsSync_; }
+    /// E2 residual N5: passes whose rcAdvanceAll_ walked the slots for ring
+    /// (memory-backed) rebuild work — stays 0 on a worker with no memory-backed partition.
+    [[nodiscard]] uint64_t ringWalksForTest() const noexcept { return ringWalks_; }
     [[nodiscard]] uint64_t rcHintsSkippedForTest() const noexcept { return rcHintsSkipped_; }
     [[nodiscard]] uint64_t rcHintErrorsForTest() const noexcept { return rcHintErrors_; }
     /// Fix round 3 test seams.  Fake async hints: the issuer behaves as on
@@ -826,6 +829,10 @@ public:
         /// F15 S4: the partition's RC state (this worker's), re-resolved on every
         /// ownership apply and Subscribe — null when not owned / internal.
         RcState* rc = nullptr;
+        /// E2 final fix wave (M2): the cursor is still the bind-time resolved
+        /// start (no push pass has served it yet) — a transient ring start above
+        /// it is not a reader that fell behind (see skipEvictedCursor_).
+        bool cursorFresh = true;
     };
 
     // -----------------------------------------------------------------------
@@ -1171,7 +1178,8 @@ public:
            .recordCount(op.recordCount)
            .batchAttrs(op.batchAttrs)
            .deferAck(static_cast<std::uint8_t>((op.deferAck ? kOpFlagDeferAck : 0u) |
-                                               (op.crcValidated ? kOpFlagCrcValidated : 0u)))
+                                               (op.crcValidated ? kOpFlagCrcValidated : 0u) |
+                                               (op.freshCursor ? kOpFlagFreshCursor : 0u)))
            .durabilityTier(wireDurabilityTier)
            .enqueuedAtNs(op.enqueuedAtNs)
            .subscriptionId(op.subscriptionId)
@@ -1503,6 +1511,10 @@ public:
         // Per-tick span: inter-tick gap = scheduler handoff/park; duration = tick cost.
         RUNE_FR_SPAN_RUNTIME(rune_fr::Site::WorkerDoWork, 0);
         int work = 0;
+        // E2 final fix wave (residual): ONE read_committed ring-rebuild budget
+        // per pass, shared by every memory-backed partition rebuilding (the
+        // produce gate's inline step and the per-pass driver alike).
+        ringBudgetLeft_ = static_cast<std::size_t>(rcScanBytesPerPass_);
 
         // E4: self-pin this thread to the assigned core on the FIRST doWork call.
         // Runs on the AgentRunner thread (the exact thread to pin).  One-shot:
@@ -2404,10 +2416,18 @@ private:
             break;
         // MEDIUM-2: the controller's AlterIsr answer (cold).
         case WorkerOp::Type::AlterIsrResponse:
-            if (auto* rep = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica())) {
+            if (auto* rep = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
+                rep != nullptr && op.replErrorCode() == rune::replication::kAlterIsrLocalLineageIdentity) {
+                rep->rotateLineageIdentity(op.nextOffset());   // R2: node-local identity rotation
+            } else if (rep != nullptr) {
                 rune::replication::AlterIsrResponseMsg r{};
                 r.topicId        = op.topicId();
                 r.partition      = op.partition();
+                // Round 6 (fix-on-sight): the controller answers the node that
+                // asked — this one.  The op carries no leaderId; left at -1 the
+                // replica's lineage / leaderless-report acks never matched
+                // (reports re-sent forever, a rotation re-sent an unborn report).
+                r.leaderId       = rep->selfId();
                 r.leaderEpoch    = static_cast<rune::replication::Epoch>(op.roleEpoch());
                 r.partitionEpoch = op.rolePartitionEpoch();
                 r.errorCode      = op.replErrorCode();
@@ -2583,6 +2603,7 @@ private:
                 s.incarnation          = op.incarnation();
                 s.active               = true;   // re-subscribe (passed the guard) re-activates
                 s.rc                   = rcOf_(subReplica_(s));
+                s.cursorFresh          = true;   // M2: a requested cursor again (rewind / re-seed)
                 return;
             }
         }
@@ -2806,7 +2827,7 @@ private:
             const std::size_t si = (pushRotor_ + k) % nSubs;
             auto& s = subs_[si];
             if (pushBudgetLeft_ == 0) { pushRotor_ = si; break; }
-            if (!s.logPtr || !s.active) continue;   // parked: partition moved away
+            if (!s.active) continue;   // parked: partition moved away (E2: the source is resolved below)
 
             // Hybrid egress: prefer this consumer's UNICAST pub (independent
             // per-consumer offsets); fall back to the shared MDC pub (broadcast).
@@ -2857,6 +2878,15 @@ private:
             // Not Ready (§2.3): skip this subscription this pass.
             auto* rep = subReplica_(s);
             if (s.incarnation != 0 && !rep) continue;   // not owned (defensive: active implies owned)
+            // Phase 2b E2: a TRANSIENT partition's source is the owned replica's
+            // ring (the Subscribe op carried no disk Log); no source → nothing to push.
+            rune::storage::InMemoryLog* const mem =
+                (s.logPtr == nullptr && rep != nullptr) ? rep->memoryLog() : nullptr;
+            if (s.logPtr == nullptr && mem == nullptr) continue;
+            if (mem != nullptr) {   // TRANSIENT_EVICTED
+                s.nextOffset  = skipEvictedCursor_(*mem, s.nextOffset, s.cursorFresh);
+                s.cursorFresh = false;   // from now on the cursor is this push's own: a later skip is lag
+            }
             int64_t bound = rep ? rep->highWatermark()
                                 : s.logPtr->logEndOffset();
             const RcState* rc = nullptr;
@@ -2873,8 +2903,10 @@ private:
             // segment read mmap — stopping near the bound (D26).  noexcept (F3):
             // a failed read is an empty view (retry next pass; an I/O error is
             // counted + logged, never retried through the mapping).
-            const rune::storage::LogReadView view = readNoFault_(
-                s.logPtr, s.nextOffset, std::min<std::size_t>(kPushMaxChunkBytes, pushBudgetLeft_), bound);
+            const std::size_t readCap = std::min<std::size_t>(kPushMaxChunkBytes, pushBudgetLeft_);
+            const rune::storage::LogReadView view =
+                s.logPtr != nullptr ? readNoFault_(s.logPtr, s.nextOffset, readCap, bound)
+                                    : mem->readView(s.nextOffset, static_cast<int32_t>(readCap));   // E2: zero-copy ring view
             if (view.empty()) continue;
 
             std::size_t pos = 0;
@@ -3204,6 +3236,7 @@ private:
         bool    carrier        = true;
         uint32_t targetReplicaId = 0;
         uint32_t incarnation     = 0;
+        bool     freshCursor     = false;   ///< E2 M2: the gateway's bind-time cursor (kOpFlagFreshCursor)
         rune::replication::PartitionReplica* replica = nullptr;
         rune::storage::Log*                  logPtr  = nullptr;
     };
@@ -3221,6 +3254,7 @@ private:
         a.isolation       = op.isolation();
         a.isGroup         = op.isGroup() != 0;
         a.carrier         = op.groupCarrierReceived() != 0;
+        a.freshCursor     = (op.deferAck() & kOpFlagFreshCursor) != 0;   // the wire flag byte (M2)
         a.targetReplicaId = op.targetReplicaId();
         a.incarnation     = op.incarnation();
         a.replica         = reinterpret_cast<rune::replication::PartitionReplica*>(op.replica());
@@ -3228,7 +3262,17 @@ private:
         servePushRead_(a, /*mayHold=*/true);
     }
 
-    void servePushRead_(const PushReadArgs& a, bool mayHold) {
+    void servePushRead_(const PushReadArgs& in, bool mayHold) {
+        PushReadArgs a = in;   // Phase 2b E2: the cursor may move up (TRANSIENT_EVICTED) — a stack copy
+        rune::storage::Log* log = a.logPtr;
+        // Phase 2b E2: a TRANSIENT partition has no disk Log — its source is the
+        // owning replica's InMemoryLog.  a.replica is THIS worker's replica here:
+        // PushRead is ownership-gated, and a deferred / held read whose partition
+        // moved away is re-served with replica == nullptr (beginPushPass_,
+        // serveHeldPushReads_) — never a ring this worker does not own.
+        rune::storage::InMemoryLog* const mem =
+            (log == nullptr && a.replica != nullptr) ? a.replica->memoryLog() : nullptr;
+        if (mem != nullptr) a.nextOffset = skipEvictedCursor_(*mem, a.nextOffset, a.freshCursor);
         const int32_t topicId    = a.topicId;
         const int32_t partition  = a.partition;
         const int64_t nextOffset = a.nextOffset;
@@ -3246,9 +3290,8 @@ private:
         ret.groupCarrierReceived = a.carrier;
         ret.setPushEffectiveBound(-1);   // N5: unanswered unless a path below answers explicitly
 
-        rune::storage::Log* log = a.logPtr;
-        if (!log) {
-            // No log: an UNANSWERED read (review I-1) — the gateway re-issues it
+        if (!log && !mem) {
+            // No source: an UNANSWERED read (review I-1) — the gateway re-issues it
             // and never parks the subscription on it.
             ret.setPushEffectiveBound(-1);
             enqueueReturn_(ret);
@@ -3308,7 +3351,7 @@ private:
         // clamped on the fly (bound, markers, aborted batches), within this
         // pass's push byte budget.
         if (nextOffset < bound) {
-            switch (readPushChunk_(a, ret, log, bound, rc)) {
+            switch (readPushChunk_(a, ret, log, mem, bound, rc)) {
             case PushChunk::Written:
                 return;                         // answered in place (ret_ slot)
             case PushChunk::Deferred:
@@ -3350,8 +3393,8 @@ private:
     //              (the read is idempotent — nothing consumed);
     //   TooLarge — the first deliverable batch alone exceeds the ring's max message.
     enum class PushChunk : uint8_t { Written, Empty, Deferred, TooLarge };
-    PushChunk readPushChunk_(const PushReadArgs& a, WorkerReturn& ret, rune::storage::Log* log, int64_t bound,
-                             const RcState* rc) {
+    PushChunk readPushChunk_(const PushReadArgs& a, WorkerReturn& ret, rune::storage::Log* log,
+                             rune::storage::InMemoryLog* mem, int64_t bound, const RcState* rc) {
         using rune::protocol::RecordBatchReader;
         namespace b = rune::protocol::batch;
         if (pushBudgetLeft_ == 0) return PushChunk::Deferred;
@@ -3362,7 +3405,11 @@ private:
         // segment read mmap — stopping near the bound (D26).  noexcept (F3): a
         // failed read is an empty view — answered empty, the gateway retries
         // next cycle.
-        const rune::storage::LogReadView v = readNoFault_(log, a.nextOffset, cap, bound);
+        // Phase 2b E2: a TRANSIENT partition reads a zero-copy view of its ring
+        // (same thread, no syscall); the bound clamp below applies unchanged.
+        const rune::storage::LogReadView v =
+            log != nullptr ? readNoFault_(log, a.nextOffset, cap, bound)
+                           : mem->readView(a.nextOffset, static_cast<int32_t>(cap));
         if (v.empty()) return PushChunk::Empty;
         const bool preCarrier = a.isGroup && !a.carrier;
         std::size_t rd = 0, nRuns = 0, total = 0;
@@ -3468,12 +3515,41 @@ private:
                 a.replica = r;
                 a.logPtr  = r->isDiskBacked() ? r->log() : nullptr;
             } else {
-                a.logPtr = nullptr;   // never read a log this worker no longer owns → unanswered
+                // Never read a log — or (E2) a transient ring, found through the
+                // replica — this worker no longer owns → unanswered.
+                a.logPtr  = nullptr;
+                a.replica = nullptr;
             }
             servePushRead_(a, /*mayHold=*/true);
             ++n;
         }
         return n;
+    }
+
+    // Phase 2b E2 — TRANSIENT_EVICTED: the ring evicted committed records this
+    // reader had not read yet (the in-memory retention).  The cursor resumes AT
+    // the ring start — counted, logged first + every power of two — never a
+    // stall on an offset the ring no longer holds.  Disk logs never take this.
+    // E2 final fix wave (M2): a FRESH cursor (the subscription's bind-time
+    // resolved start — Earliest is 0 on a transient partition — never moved by
+    // a read) below the ring start is a subscribe below the retention, not a
+    // reader that fell behind: it resumes at the ring start too, but is counted
+    // apart (transientFreshCursorsRaised_) and never warned as consumer lag.
+    [[nodiscard]] int64_t skipEvictedCursor_(const rune::storage::InMemoryLog& mem, int64_t cursor,
+                                             bool fresh) noexcept {
+        const int64_t start = mem.logStartOffset();
+        if (cursor >= start) [[likely]] return cursor;
+        if (fresh) {
+            ++transientFreshCursorsRaised_;
+            return start;
+        }
+        ++transientCursorSkips_;
+        transientRecordsSkipped_ += static_cast<uint64_t>(start - cursor);
+        if ((transientCursorSkips_ & (transientCursorSkips_ - 1)) == 0)
+            spdlog::warn("Worker {}: a reader of a transient partition fell behind its ring: cursor {} < ring "
+                         "start {} — resumed at {} (skips={}, records skipped={})", workerId_, cursor, start,
+                         start, transientCursorSkips_, transientRecordsSkipped_);
+        return start;
     }
 
     // #65: the worker's push reads.  First-touch page faults on a segment read
@@ -3510,6 +3586,19 @@ private:
                           pushReadErrors_);
     }
 
+    // Phase 2b E2: a TRANSIENT ring refused an append (full of unreplicated
+    // records, or a batch larger than the ring).  Counted; logged first + every 1024th.
+    [[gnu::cold]] void noteTransientFull_(int32_t topicId, int32_t partition,
+                                          rune::protocol::client::ErrorCode ec) noexcept {
+        ++transientFullRefusals_;
+        if (transientFullRefusals_ == 1 || (transientFullRefusals_ & 1023u) == 0)
+            spdlog::warn("Worker {}: transient topicId={} partition={}: ring refused an append ({}) — {} "
+                         "(total={}); raise RUNE_TRANSIENT_LOG_RING_BYTES or let the followers catch up",
+                         workerId_, topicId, partition, static_cast<int>(ec),
+                         ec == rune::protocol::client::ErrorCode::MessageTooLarge
+                             ? "batch larger than the ring" : "ring full of unreplicated records",
+                         transientFullRefusals_);
+    }
     [[gnu::cold]] void notePushReadOversize_(int32_t topicId, int32_t partition, int64_t offset) noexcept {
         ++pushReadOversize_;
         if (pushReadOversize_ == 1 || (pushReadOversize_ & 1023u) == 0)
@@ -3956,6 +4045,13 @@ private:
                 spdlog::warn("Worker {}: executeAppendControlRecordWire_ — min-ISR gate refused the marker "
                              "topicId={} partition={}", workerId_, topicId, partition);
                 ret.errorCode = static_cast<int16_t>(pc::ErrorCode::MinIsrViolation);
+            } else if (base == RepT::kAppendBackPressure) {
+                // Phase 2b E2: a TRANSIENT ring full of unreplicated records —
+                // retriable: the coordinator re-sends the marker (never dropped;
+                // TransactionCoordinationService::onControlMarkerRefused retries
+                // every code but Unknown{Topic,Partition} and the fence).
+                noteTransientFull_(topicId, partition, pc::ErrorCode::TransientLogFull);
+                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::TransientLogFull);
             } else {
                 spdlog::warn("Worker {}: executeAppendControlRecordWire_ — appendControlBatch returned {} "
                              "topicId={} partition={}", workerId_, base, topicId, partition);
@@ -4638,6 +4734,13 @@ public:
     [[nodiscard]] uint64_t pushReadMapFallbacksForTest() const noexcept { return pushReadMapFallbacks_; }
     [[nodiscard]] uint64_t pushReadErrorsForTest() const noexcept { return pushReadErrors_; }
     [[nodiscard]] std::size_t deferredPushReadsForTest() const noexcept { return deferredPushCount_; }
+    /// Phase 2b E2 (TRANSIENT partitions): produces/markers the ring refused;
+    /// reads whose cursor was below the ring start, and the records they skipped.
+    [[nodiscard]] uint64_t transientFullRefusalsForTest() const noexcept { return transientFullRefusals_; }
+    [[nodiscard]] uint64_t transientCursorSkipsForTest() const noexcept { return transientCursorSkips_; }
+    [[nodiscard]] uint64_t transientRecordsSkippedForTest() const noexcept { return transientRecordsSkipped_; }
+    /// M2: fresh cursors (a subscribe below the ring start) raised to it — not lag.
+    [[nodiscard]] uint64_t transientFreshCursorsRaisedForTest() const noexcept { return transientFreshCursorsRaised_; }
 private:
     std::size_t                           pushBudgetLeft_ = kPushPassBudgetBytes;
     std::array<ChunkRun, kMaxPushRuns>    pushRuns_{};
@@ -4646,6 +4749,10 @@ private:
     /// batch past the budget (a fresh pass always takes one).  Larger first
     /// batches fall back to the mapped view (pushReadMapFallbacks_).
     std::vector<uint8_t>                  pushScratch_ = std::vector<uint8_t>(2 * kPushPassBudgetBytes + 64 * 1024);
+    uint64_t transientFullRefusals_   = 0;   ///< E2: ring refused a produce / marker (full or too large)
+    uint64_t transientCursorSkips_    = 0;   ///< E2: reads whose cursor was below the ring start
+    uint64_t transientRecordsSkipped_ = 0;   ///< E2: records those reads skipped (evicted unread)
+    uint64_t transientFreshCursorsRaised_ = 0;   ///< E2 M2: bind-time cursors below the ring start (not lag)
     uint64_t                              pushReadMapFallbacks_ = 0;
     uint64_t                              pushReadErrors_ = 0;   ///< D26: push-read pread failures (answered empty)
     /// D26: replication read scratch — a fetch serve / owed re-serve / push of
@@ -5051,6 +5158,10 @@ private:
     }
     std::vector<RcSlot>   rcSlots_;
     std::size_t           rcWalkStart_ = 0;   // r3-1: rcAdvanceAll_'s round-robin start slot
+    std::size_t           ringCursor_  = 0;   // E2 residual: the next slot the shared ring budget starts at
+    std::size_t           ringBudgetLeft_ = RcState::kDefaultScanBytesPerPass;   // E2 residual: ring-rebuild bytes left this pass
+    std::size_t           ringSlots_   = 0;   // E2 residual N5: memory-backed rcSlots_ (set on ownership apply)
+    uint64_t              ringWalks_   = 0;   // N5: passes that walked the slots for ring work (test seam)
     // Review I-2: read_committed PushReads held while their partition's RC
     // state builds — answered on Ready (or unanswered on ownership loss).
     // Each owes one return: counted in reservedAckSlots_(), capped, reserved.
@@ -5085,7 +5196,8 @@ private:
                 if (r->isDiskBacked()) a.logPtr = r->log();
                 servePushRead_(a, /*mayHold=*/false);
             } else {
-                a.logPtr = nullptr;   // never read a log this worker no longer owns
+                a.logPtr  = nullptr;   // never read a log this worker no longer owns
+                a.replica = nullptr;   // E2: nor its ring (a transient read finds it through the replica)
                 servePushRead_(a, false);   // → unanswered: the gateway re-issues to the new owner
             }
             ++n;
@@ -5149,6 +5261,7 @@ private:
             if (!slot.rc) {
                 slot.rc = std::make_unique<RcState>();
                 slot.rc->reserve(rcOpenTxnCapacity_);
+                if (!r->isDiskBacked()) slot.rc->reserveRingRebuild();   // E2: memory-backed only
                 slot.rc->setResidencyProbe(rcProbeFn_, rcProbeCtx_);
                 // F15 S5 (I3): the build rebuilds THIS worker's producer state.
                 slot.rc->bindProducerState(&psm_, r->topicId(), static_cast<int32_t>(r->partitionId()));
@@ -5157,6 +5270,8 @@ private:
             next.push_back(std::move(slot));
         }
         rcSlots_ = std::move(next);
+        ringSlots_ = 0;   // E2 residual N5: memory-backed slots (0 -> no ring walk at all)
+        for (const auto& sl : rcSlots_) ringSlots_ += sl.replica->isDiskBacked() ? 0u : 1u;
         rcById_.assign(ownedInc_.size(), nullptr);
         for (auto& sl : rcSlots_)
             if (sl.inc != 0 && sl.replica->registryId() < rcById_.size()) rcById_[sl.replica->registryId()] = sl.rc.get();
@@ -5213,7 +5328,7 @@ private:
                 auto readRange = [mem](int64_t from, int64_t /*to*/) -> rune::storage::LogReadView {
                     return mem->readView(from, kPushMaxChunkBytes);
                 };
-                work += driveViewsOf_(topicId, partition, readRange, bound, nowNs, mem);
+                work += driveViewsOf_(topicId, partition, readRange, bound, nowNs, replica);
             }
         }
         return work;
@@ -5222,19 +5337,26 @@ private:
     // One owned source partition's view work.  Order matters: materialize a
     // recovery instance from its checkpoint FIRST, then rebuild/fold.  For a
     // TRANSIENT source the per-instance cursor reconcile happens INSIDE the fold
-    // (WorkerViewSet::driveView_) on the instance already held.
+    // (WorkerViewSet::driveView_) on the instance already held.  `transientRep`
+    // is the owning replica of a TRANSIENT source (its ring's bounds + identity:
+    // incarnation, logGeneration, last cut), nullptr for a disk source.
     // Task 19b (restart recovery): materializeRecoveryInstancesFor + driveRebuild
     // are gated on hasRecovery() — a broker with no durable views runs neither.
     template <class ReadRangeFn>
     int driveViewsOf_(int32_t topicId, int32_t partition, ReadRangeFn& readRange,
-                      int64_t bound, int64_t nowNs, rune::storage::InMemoryLog* transientSrc) {
+                      int64_t bound, int64_t nowNs,
+                      const rune::replication::PartitionReplica* transientRep) {
         int work = 0;
         TransientBounds tb;
         const TransientBounds* tbp = nullptr;
-        if (transientSrc != nullptr) {
-            tb.logStart = transientSrc->logStartOffset();
-            tb.logEnd   = transientSrc->logEndOffset();
-            tbp         = &tb;
+        if (transientRep != nullptr) {
+            const rune::storage::InMemoryLog* mem = transientRep->memoryLog();
+            tb.logStart      = mem->logStartOffset();
+            tb.logEnd        = mem->logEndOffset();
+            tb.incarnation   = transientRep->incarnation();     // E2: the ring's identity
+            tb.logGeneration = transientRep->logGeneration();
+            tb.cutOffset     = transientRep->lastTruncationOffset();
+            tbp              = &tb;
         }
         if (viewSet_->hasRecovery()) [[unlikely]] {
             viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
@@ -5251,10 +5373,31 @@ private:
     // inline produce gate rcGate_ steps here too) and the real value after.
     std::size_t rcAdvance_(rune::replication::PartitionReplica* r, RcState& rc) {
         if (!rc.revalidate(rcFacts_(r))) publishCleanerLso_(r, rc);   // 0 before scanning
-        const std::size_t n = r->isDiskBacked() ? rc.advance(rcFacts_(r), r->log(), rcScanBytesPerPass_)
-                                                : rc.advance(rcFacts_(r), nullptr, rcScanBytesPerPass_, r->memoryLog());
+        std::size_t n = 0;
+        if (r->isDiskBacked()) {
+            n = rc.advance(rcFacts_(r), r->log(), rcScanBytesPerPass_);
+        } else {
+            // E2 final fix wave (residual): a memory-backed rebuild step draws on
+            // the pass's SHARED ring budget (at most ~kDefaultScanBytesPerPass of
+            // ring rebuild per worker pass, however many partitions rebuild).
+            // Spent: no step this pass (the state stays not Ready — reads held,
+            // gated produce refused NotLeader, as before).
+            const RcFacts f = rcFacts_(r);
+            if (rc.needsRingWork(f)) {
+                if (ringBudgetLeft_ > 0) {
+                    n = rc.advance(f, nullptr, static_cast<int32_t>(ringBudgetLeft_), r->memoryLog());
+                    ringBudgetLeft_ -= std::min(n, ringBudgetLeft_);
+                }
+            } else {
+                n = rc.advance(f, nullptr, rcScanBytesPerPass_, r->memoryLog());   // Ready / follower: no ring work
+            }
+        }
         publishCleanerLso_(r, rc);
         return n;
+    }
+    // E2 final fix wave (residual): memory-backed and in need of ring-rebuild work.
+    [[nodiscard]] bool ringWork_(rune::replication::PartitionReplica* r, const RcState& rc) const noexcept {
+        return !r->isDiskBacked() && rc.needsRingWork(rcFacts_(r));
     }
     // D3b fix round 1: a cleaner swap (rewritten / emptied segment) is NOT applied
     // while this partition's RC state is SCANNING the log: the rebuild walks the
@@ -5285,6 +5428,14 @@ private:
     // cursor, no allocation), so the kMaxRcHintsInFlight hint slots rotate over
     // the building partitions — every one is first in line once per
     // rcSlots_.size() passes, not only the first ones in a fixed order.
+    //
+    // E2 final fix wave (residual): the memory-backed (ring) rebuilds share ONE
+    // budget per pass (ringBudgetLeft_), handed out round-robin from a
+    // persistent cursor (ringCursor_): the partition that spent the last of it
+    // is followed by the next one on the following pass, so a rebuilding
+    // partition waits at most K-1 passes for its slice (K = rebuilding
+    // partitions) and none starves.  Disk partitions and ring partitions with
+    // no rebuild work keep the per-slot walk.  No allocation.
     int rcAdvanceAll_() {
         const std::size_t n = rcSlots_.size();
         if (n == 0) return 0;
@@ -5292,10 +5443,23 @@ private:
         int work = 0;
         for (std::size_t k = 0, i = rcWalkStart_; k < n; ++k) {
             RcSlot& sl = rcSlots_[i];
-            work += rcAdvance_(sl.replica, *sl.rc) > 0 ? 1 : 0;   // publishes the cleaner LSO (D3b)
+            if (!ringWork_(sl.replica, *sl.rc))
+                work += rcAdvance_(sl.replica, *sl.rc) > 0 ? 1 : 0;   // publishes the cleaner LSO (D3b)
             if (++i == n) i = 0;
         }
         if (++rcWalkStart_ == n) rcWalkStart_ = 0;
+        if (ringSlots_ == 0) return work;   // N5: a disk-only worker pays nothing for the ring budget
+        ++ringWalks_;
+        if (ringCursor_ >= n) ringCursor_ = 0;
+        for (std::size_t k = 0, i = ringCursor_; k < n && ringBudgetLeft_ > 0; ++k) {
+            RcSlot& sl = rcSlots_[i];
+            const std::size_t next = i + 1 == n ? 0 : i + 1;
+            if (ringWork_(sl.replica, *sl.rc)) {
+                work += rcAdvance_(sl.replica, *sl.rc) > 0 ? 1 : 0;
+                if (ringBudgetLeft_ == 0) ringCursor_ = next;   // the next pass starts after it
+            }
+            i = next;
+        }
         return work;
     }
     // D3b: publish the partition's first unstable offset to the cleaner (only on
@@ -6219,12 +6383,9 @@ private:
             if (!replica) continue;
             if (replica->topicId() == topicId &&
                 static_cast<int32_t>(replica->partitionId()) == partition) {
-                // Only disk-backed replicas expose a rune::storage::Log*.
-                // Memory-backed (InMemoryLog) replicas are NOT supported on the
-                // WorkerIngress produce path — the gateway fanout handles them
-                // via the existing WorkerOp ring (which carries a logPtr).
-                // Return nullptr for memory-backed so the caller sends an
-                // Internal error rather than crash.
+                // Only disk-backed replicas expose a rune::storage::Log*.  A
+                // TRANSIENT (InMemoryLog) replica returns {nullptr, replica}:
+                // produceCore_ appends to replica->memoryLog() (Phase 2b E2).
                 rune::storage::Log* log =
                     replica->isDiskBacked() ? replica->log() : nullptr;
                 return {log, replica};
@@ -6569,34 +6730,19 @@ private:
         ret.replica       = replica;
         if (replica) { ret.targetReplicaId = replica->registryId(); ret.incarnation = replica->incarnation(); }
 
-        if (!log) {
-            // E5.1.5: distinguish "partition not owned by this worker" (retriable
-            // NotLeader) from "owned but memory-backed log unsupported" (Internal).
-            //
-            // When getLogAndReplicaForPartition_ returns {nullptr, nullptr} the
-            // partition is NOT in owned_ — this worker is no longer the leader.
-            // The client must refresh metadata and re-route to the new owner.
-            // Return NotLeader (retriable), NOT Internal, so the client can retry.
-            //
-            // When it returns {nullptr, replica} (replica != nullptr), the partition
-            // IS owned but its log is memory-backed — the WorkerIngress path
-            // requires a disk-backed log (InMemoryLog is handled by the gateway
-            // fanout via the ingress_ ring).  Return Internal (non-retriable bug).
-            //
-            // Shared-nothing: no cross-worker forwarding per [[rune-shared-nothing-law]].
-            if (!replica) {
-                // Not owned: retriable NotLeader so client re-routes.
-                spdlog::debug("Worker {}: WorkerIngress: partition not owned (topicId={} "
-                              "partition={}); returning NotLeader (retriable)",
-                              workerId_, f.topicId, f.partition);
-                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
-            } else {
-                // Owned but transient (in-memory log): Internal.
-                spdlog::warn("Worker {}: WorkerIngress: owned but transient (in-memory) log for "
-                             "topicId={} partition={}; Internal error ack",
-                             workerId_, f.topicId, f.partition);
-                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
-            }
+        // Phase 2b E2: a TRANSIENT partition (owned replica, no disk Log) appends
+        // to the replica's own InMemoryLog through this same produce core.
+        rune::storage::InMemoryLog* const mem =
+            (log == nullptr && replica != nullptr) ? replica->memoryLog() : nullptr;
+        if (log == nullptr && mem == nullptr) {
+            // Not owned by this worker (getLogAndReplicaForPartition_ → {nullptr,
+            // nullptr}): retriable NotLeader so the client refreshes metadata and
+            // re-routes.  Shared-nothing: no cross-worker forwarding per
+            // [[rune-shared-nothing-law]].
+            spdlog::debug("Worker {}: produce for a partition this worker does not own (topicId={} "
+                          "partition={}); returning NotLeader (retriable)",
+                          workerId_, f.topicId, f.partition);
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
             enqueueReturn_(ret);
             return 1;
         }
@@ -6701,7 +6847,8 @@ private:
         // appends page-cache only and acks from its own io_ completion, gated on
         // the log's outstanding roll seals (onFlushCompletion_ / fireSealGated_),
         // then the HW gate for acks=all.  Only a disk-backed log has an fd to fsync.
-        const bool asyncStrict = durabilityTier == 2 && log->isDiskBacked();
+        // Phase 2b E2: a transient ring has no fd — tier=strict acks as Majority.
+        const bool asyncStrict = durabilityTier == 2 && log != nullptr && log->isDiskBacked();
         // The tier handleProduceBatch sees: never an inline sync for an op or an
         // async-Strict append.
         const uint8_t helperTier = (asyncStrict || f.fromOp) ? uint8_t{1} : durabilityTier;
@@ -6723,16 +6870,28 @@ private:
             return 1;
         }
 
-        // Call the shared produce helper.
-        rune::storage::ProduceOutcome outcome = rune::storage::handleProduceBatch(
-            rbSpan.data(), rbSpan.size(),
-            f.topicId, f.partition,
-            f.producerId, f.producerEpoch, f.baseSequence,
-            *log, psm_,
-            acksAll, isrSize, minIsr, helperTier,
-            // M-3: skip the repeat CRC pass ONLY when the op's producer says it
-            // validated these exact bytes (the gateway, right after ensureValid).
-            /*crcPreverified=*/f.fromOp && f.crcValidated);
+        // Call the shared produce helper — over the disk Log, or (Phase 2b E2) a
+        // TRANSIENT partition's ring: one memcpy into the ring, base offset +
+        // leader epoch patched there; the ring never evicts at/above the HW
+        // (prepareTransientAppend) — full → TransientLogFull (42, retriable),
+        // nothing appended.
+        // M-3: skip the repeat CRC pass ONLY when the op's producer says it
+        // validated these exact bytes (the gateway, right after ensureValid).
+        const bool crcPreverified = f.fromOp && f.crcValidated;
+        rune::storage::ProduceOutcome outcome;
+        if (log != nullptr) {
+            outcome = rune::storage::handleProduceBatch(
+                rbSpan.data(), rbSpan.size(), f.topicId, f.partition,
+                f.producerId, f.producerEpoch, f.baseSequence,
+                *log, psm_, acksAll, isrSize, minIsr, helperTier, crcPreverified);
+        } else {
+            replica->prepareTransientAppend();
+            outcome = rune::storage::handleProduceBatch(
+                rbSpan.data(), rbSpan.size(), f.topicId, f.partition,
+                f.producerId, f.producerEpoch, f.baseSequence,
+                *mem, psm_, acksAll, isrSize, minIsr, helperTier, crcPreverified);
+            if (outcome.logFull) [[unlikely]] noteTransientFull_(f.topicId, f.partition, outcome.error);
+        }
 
         // A duplicate answers its ORIGINAL base offset (-1 for a KNOWN-OLD
         // duplicate, EOS-OOS: OK, offset unknown — Kafka DUPLICATE_SEQUENCE_NUMBER)

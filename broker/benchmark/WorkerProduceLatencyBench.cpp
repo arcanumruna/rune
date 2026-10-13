@@ -109,6 +109,8 @@ static void reportPercentiles(benchmark::State& state, std::vector<int64_t>& ns)
         benchmark::Counter(static_cast<double>(ns[ns.size()/2]) / 1000.0);
     state.counters["p99Us"] =
         benchmark::Counter(static_cast<double>(ns[static_cast<std::size_t>(ns.size()*99/100)]) / 1000.0);
+    state.counters["p999Us"] =
+        benchmark::Counter(static_cast<double>(ns[static_cast<std::size_t>(ns.size()*999/1000)]) / 1000.0);
 }
 
 // One produce → ack round trip on the REAL worker path, timed.
@@ -240,6 +242,94 @@ static void BM_WorkerRoleGate_Baseline(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations());
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2b E2: produce -> subscribe latency, TRANSIENT vs DISK, on the REAL
+// worker path: a Produce op (append + ack) then a PushRead op at the produced
+// offset (the read a subscription's next push cycle makes) -> the
+// PushReadResult carrying the batch.  One sample = "a produced record reaches
+// a subscriber" on one worker.  Gate (E2): transient p50 and p99 <= disk's.
+// ---------------------------------------------------------------------------
+struct TransientWorkerFixture {
+    rune::storage::InMemoryLog        mem{64u << 20, 1'000'000};
+    NullTransport                     transport;
+    std::unique_ptr<PartitionReplica> replica;
+    std::unique_ptr<Worker>           worker;
+
+    TransientWorkerFixture() {
+        PartitionConfig cfg{};
+        cfg.topicId = 1; cfg.partitionId = 0; cfg.selfId = 1; cfg.minIsr = 1;
+        cfg.replicaLagMaxMs = 10'000; cfg.replicaLagMaxOffset = 10'000;
+        cfg.fetchIntervalNs = 1'000'000LL; cfg.isrCheckIntervalNs = 1'000'000LL;
+        cfg.maxFetchBytes = 1 << 20; cfg.pushOnAppend = false;
+        replica = std::make_unique<PartitionReplica>(
+            cfg, rune::replication::Role::Leader, /*epoch=*/1,
+            std::vector<rune::replication::NodeId>{1},
+            std::vector<rune::replication::NodeId>{1}, &mem, &transport);
+        worker = std::make_unique<Worker>(0);
+        worker->setOwnedDirect(Worker::OwnedSet{replica.get()});
+    }
+};
+
+template <class Fix>
+static void runProduceToPushRead(benchmark::State& state, Fix& fix, Log* diskLog, std::size_t payload) {
+    std::vector<int64_t> samples;
+    samples.reserve(1 << 16);
+    int64_t nowNs = 1, corr = 0, sub = 0;
+    const auto proto = makeBatch(payload);
+    for (auto _ : state) {
+        WorkerOp prod;
+        prod.type = WorkerOp::Type::Produce;
+        prod.topicId = 1; prod.partition = 0;
+        prod.replica = fix.replica.get(); prod.logPtr = diskLog;   // transient: nullptr
+        prod.sessionId = 1; prod.correlationId = ++corr;
+        prod.lastOffsetDelta = 0; prod.recordCount = 1; prod.durabilityTier = 1;
+        prod.recordBatchBytes = proto;
+        WorkerOp read;
+        read.type = WorkerOp::Type::PushRead;
+        read.topicId = 1; read.partition = 0;
+        read.replica = fix.replica.get(); read.logPtr = diskLog;
+        read.subscriptionId = ++sub; read.sessionId = 1;
+        read.hwBound = INT64_MAX; read.isolation = 0;
+
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!fix.worker->tryEnqueueOp(prod)) fix.worker->doWork(nowNs++);
+        int64_t base = -1;
+        for (int i = 0; i < 5'000'000 && base < 0; ++i) {
+            fix.worker->doWork(nowNs++);
+            fix.worker->drainReturn([&](WorkerReturn&& r) {
+                if (r.type == WorkerReturn::Type::ProduceResult && r.errorCode == 0) base = r.baseOffset;
+            });
+        }
+        read.nextOffset = base;
+        while (!fix.worker->tryEnqueueOp(read)) fix.worker->doWork(nowNs++);
+        bool delivered = false;
+        for (int i = 0; i < 5'000'000 && !delivered; ++i) {
+            fix.worker->doWork(nowNs++);
+            fix.worker->drainReturn([&](WorkerReturn&& r) {
+                if (r.type == WorkerReturn::Type::PushReadResult && !r.chunk.empty()) delivered = true;
+            });
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        if (!delivered) { state.SkipWithError("the produced record never reached the PushRead"); break; }
+        samples.push_back(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+    }
+    state.SetItemsProcessed(state.iterations());
+    reportPercentiles(state, samples);
+}
+
+static void BM_WorkerProduceToPushRead_Disk_256B(benchmark::State& s) {
+    RealWorkerFixture f; runProduceToPushRead(s, f, f.log.get(), 256);
+}
+static void BM_WorkerProduceToPushRead_Transient_256B(benchmark::State& s) {
+    TransientWorkerFixture f; runProduceToPushRead(s, f, nullptr, 256);
+}
+static void BM_WorkerProduceToPushRead_Disk_1KiB(benchmark::State& s) {
+    RealWorkerFixture f; runProduceToPushRead(s, f, f.log.get(), 1024);
+}
+static void BM_WorkerProduceToPushRead_Transient_1KiB(benchmark::State& s) {
+    TransientWorkerFixture f; runProduceToPushRead(s, f, nullptr, 1024);
+}
+
 } // namespace
 
 BENCHMARK(BM_WorkerRoleGate)->Arg(1)->Arg(64)->Arg(1024)->Unit(benchmark::kNanosecond);
@@ -250,3 +340,7 @@ BENCHMARK(BM_WorkerProduce_Majority_1KiB)->Unit(benchmark::kNanosecond)->MinTime
 BENCHMARK(BM_WorkerProduce_Majority_256B)->Unit(benchmark::kNanosecond)->MinTime(0.2);
 BENCHMARK(BM_WorkerProduce_Strict_1KiB)->Unit(benchmark::kNanosecond)->MinTime(0.2);
 BENCHMARK(BM_WorkerProduce_Strict_256B)->Unit(benchmark::kNanosecond)->MinTime(0.2);
+BENCHMARK(BM_WorkerProduceToPushRead_Disk_256B)->Unit(benchmark::kNanosecond)->MinTime(0.2);
+BENCHMARK(BM_WorkerProduceToPushRead_Transient_256B)->Unit(benchmark::kNanosecond)->MinTime(0.2);
+BENCHMARK(BM_WorkerProduceToPushRead_Disk_1KiB)->Unit(benchmark::kNanosecond)->MinTime(0.2);
+BENCHMARK(BM_WorkerProduceToPushRead_Transient_1KiB)->Unit(benchmark::kNanosecond)->MinTime(0.2);

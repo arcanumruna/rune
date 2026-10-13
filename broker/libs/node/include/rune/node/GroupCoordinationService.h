@@ -58,9 +58,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <unordered_map>
 #include <map>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 // Forward declaration — ClientGateway lives in rune_gateway; node→gateway direction is fine.
@@ -116,6 +116,45 @@ public:
     void setGateway(rune::gateway::ClientGateway* gateway) noexcept {
         gateway_ = gateway;
     }
+
+    // -----------------------------------------------------------------------
+    // E2 final fix wave (C1): committed offsets of TRANSIENT partitions are data
+    // positions, and transient data does not survive its ring.  The lineage
+    // provider answers the CURRENT data lineage of (topicId, partition) — a
+    // non-zero token that changes exactly when the partition's ring data did not
+    // survive (a restart) — or 0 when unknown / not transient (no stamp, no
+    // check: the historical behaviour).  OffsetCommit stamps each entry with it;
+    // OffsetFetch answers "no committed offset" (-1 — the member starts at the
+    // partition's log start, never Latest) for an entry whose stamp differs from the current lineage,
+    // so a member never resumes a refilled ring at a position of the old data
+    // (silent loss of the first records after a restart).  A plain function
+    // pointer + context (no allocation, no std::function on the commit path).
+    // -----------------------------------------------------------------------
+    //
+    // C1 multi-node (USER DECISION option b): the lineage is committed metadata
+    // confirmed per leadership.  While the partition's current leadership has
+    // not confirmed it yet (kLineagePending — e.g. right after a full-cluster
+    // restart), OffsetCommit and OffsetFetch answer that entry NotLeader: an
+    // EXISTING retriable code the client retries with its bounded budget —
+    // never a guess, never silence.
+    static constexpr uint64_t kLineagePending = UINT64_MAX;
+    using TransientLineageFn = uint64_t (*)(void* ctx, int32_t topicId, int32_t partition) noexcept;
+    void setTransientLineage(TransientLineageFn fn, void* ctx) noexcept { lineageFn_ = fn; lineageCtx_ = ctx; }
+    /// E2 residual round 5 (R1): a counter that moves whenever a committed
+    /// lineage changes (MetadataStateMachine::lineageVersion).  On a change the
+    /// coordinator sweeps its groups: a group holding a committed offset of a
+    /// SUPERSEDED lineage (a new one was minted — the data it pointed into did
+    /// not survive) is forced to rebalance, so every member re-fetches (→ -1,
+    /// the log start) instead of consuming on from a position it fetched before
+    /// the mint; a commit at the old generation is fenced (IllegalGeneration).
+    using LineageVersionFn = uint64_t (*)(void* ctx) noexcept;
+    void setTransientLineageVersion(LineageVersionFn fn, void* ctx) noexcept { lineageVersionFn_ = fn; lineageVersionCtx_ = ctx; }
+    [[nodiscard]] uint64_t supersededLineageRebalances() const noexcept { return supersededRebalances_; }
+    [[nodiscard]] uint64_t supersededLineageCommitsFenced() const noexcept { return supersededCommitsFenced_; }
+    /// Committed offsets answered "none" because their lineage ended (C1).
+    [[nodiscard]] uint64_t staleLineageOffsets() const noexcept { return staleLineageOffsets_; }
+    /// Entries answered NotLeader because the lineage was still pending (C1).
+    [[nodiscard]] uint64_t pendingLineageAnswers() const noexcept { return pendingLineageAnswers_; }
 
     // -----------------------------------------------------------------------
     // isLocalCoordinator — true when this node is the cluster leader.
@@ -222,12 +261,86 @@ private:
     // group resumes committing, so re-running rebuild (clear+repopulate from the
     // log) cannot clobber a live in-memory commit.
     bool offsetsRebuilt_ = false;
+    /// E2 residual round 4: this coordinator has LOADED the offsets for the
+    /// current leadership + log content of its __consumer_offsets replica
+    /// (offsetsRebuilt_ for exactly the generation the replica has now, and the
+    /// replica still leads).  Checked per request — a request can arrive before
+    /// the duty cycle saw a leadership change.  Until then OffsetFetch and
+    /// OffsetCommit answer the retriable NotLeader: a fetch would answer from
+    /// an empty / partial index (-1 or an older offset — a guess), and a commit
+    /// would be overwritten by the rebuild (it clears + replays the log).
+    [[nodiscard]] bool offsetsLoaded_() const noexcept {
+        if (offsets_ == nullptr) return true;
+        const rune::replication::PartitionReplica* r = offsets_->replica();
+        if (r == nullptr) return true;
+        const uint64_t gen = (r->leadershipGeneration() << 32) ^ r->logGeneration();
+        return offsetsRebuilt_ && wasLeader_ && gen == offsetsGen_ && r->acceptsProduce();
+    }
+    uint64_t offsetsNotLoadedAnswers_ = 0;   ///< entries answered NotLeader while loading (round 4)
+public:
+    [[nodiscard]] uint64_t offsetsNotLoadedAnswersForTest() const noexcept { return offsetsNotLoadedAnswers_; }
+private:
     /// (leadershipGeneration << 32) ^ logGeneration of the offsets replica the
     /// index was rebuilt against (see doWork).
     uint64_t offsetsGen_ = 0;
 
     // CG-4: ClientGateway — non-owning; may be null (tests without push subs).
     rune::gateway::ClientGateway*              gateway_ = nullptr;
+
+    // C1: see setTransientLineage().
+    TransientLineageFn lineageFn_  = nullptr;
+    void*              lineageCtx_ = nullptr;
+    uint64_t           staleLineageOffsets_ = 0;
+    uint64_t           pendingLineageAnswers_ = 0;
+    [[nodiscard]] uint64_t lineageOf_(int32_t topicId, int32_t partition) const noexcept {
+        return lineageFn_ != nullptr ? lineageFn_(lineageCtx_, topicId, partition) : 0;
+    }
+    /// The committed offset is a position of an ended lineage (C1): answer none.
+    bool staleLineage_(const rune::coordination::CommittedOffset& co, int32_t topicId, int32_t partition);
+
+    // R1 (round 5): superseded-lineage rebalances.  Cold (a lineage change is a
+    // restart / an unclean election); allocation on this path is acceptable.
+    LineageVersionFn lineageVersionFn_  = nullptr;
+    void*            lineageVersionCtx_ = nullptr;
+    uint64_t         lineageSweptVersion_ = 0;
+    int64_t          nextLineageSweepNs_  = 0;
+    /// Round 6 (F1): the lineage of each TRANSIENT partition a group's current
+    /// generation consumes (the union of its members' assignments — every
+    /// partition of its subscribed topics), recorded when it reached Stable;
+    /// kLineagePending when unknown then (members could not fetch a position
+    /// until it confirmed: the first confirmed lineage is adopted).  A group
+    /// whose consumed lineage is superseded is rebalanced even with NO
+    /// committed offset (an in-memory position must not cross the change).
+    struct GenLineage { int32_t topicId; int32_t partition; uint64_t lineage; };
+    std::unordered_map<std::string, std::vector<GenLineage>> genLineages_;
+    /// Round 6 (F4): what a sweep could not decide (the lineage was pending):
+    /// re-checked alone every 100 ms — no fetchAll, no allocation (capacity
+    /// persists; compacted in place).  `ref` = the lineage to compare with.
+    struct PendingCheck { std::string groupId; int32_t topicId; int32_t partition; uint64_t ref; bool genEntry; };
+    std::vector<PendingCheck> pendingChecks_;
+    void recordGenLineages_(const GroupId& groupId, const rune::coordination::GroupCoordinator& coord);
+    /// The group's recorded lineage entry for (topicId, partition), or nullptr.
+    GenLineage* genLineageOf_(const std::string& groupId, int32_t topicId, int32_t partition);
+    /// Decide one (group, partition): `ref` vs the current lineage.  Returns
+    /// false when the current lineage is still pending (re-check later).
+    bool checkSuperseded_(const std::string& groupId, int32_t topicId, int32_t partition, uint64_t ref,
+                          bool genEntry, int64_t nowNs);
+    void retryPendingChecks_(int64_t nowNs);
+    void pruneGroupLineageState_(const std::string& groupId);
+public:
+    [[nodiscard]] std::size_t pendingLineageChecksForTest() const noexcept { return pendingChecks_.size(); }
+    [[nodiscard]] std::size_t supersededMarkGroupsForTest() const noexcept { return supersededHandled_.size(); }
+private:
+    uint64_t         supersededRebalances_    = 0;
+    uint64_t         supersededCommitsFenced_ = 0;
+    /// group -> (topicId, partition, new lineage) it was already rebalanced for.
+    struct SupersededMark { int32_t topicId; int32_t partition; uint64_t lineage; };
+    std::unordered_map<std::string, std::vector<SupersededMark>> supersededHandled_;
+    void sweepSupersededLineages_(int64_t nowNs);
+    /// Rebalance `groupId` once for (topicId, partition)'s new lineage `now`;
+    /// true when this call forced it (false: already handled / empty group).
+    bool rebalanceForSupersededLineage_(const GroupId& groupId, rune::coordination::GroupCoordinator& coord,
+                                        int32_t topicId, int32_t partition, uint64_t now, int64_t nowNs);
 
     /// Per-group coordinators.  Inserted lazily on first Join.
     /// std::map with std::less<> (transparent comparator) so hot-path find()

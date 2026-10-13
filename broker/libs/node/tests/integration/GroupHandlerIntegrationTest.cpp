@@ -199,6 +199,7 @@ protected:
             registry_.get(),
             [] { return true; },
             [] { return NodeId{1}; });
+        service_->doWork(0);   // E2 residual round 4: offsets loaded on the first duty pass
     }
 
     bool driveUntil(std::function<bool()> pred, int cap = kCap) {

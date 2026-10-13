@@ -360,3 +360,179 @@ TEST(LeaderEpochFenceRegression, FailedWorkerRecreateBacksOffRegression) {
     (void)r->prepareEpochStateWrite(buf.data(), buf.size(), w, need);
     EXPECT_GT(r->epochStateErrorsForTest(), errors) << "never retried after the backoff";
 }
+
+// ===========================================================================
+// E2 final fix wave (C1 multi-node, USER DECISION option b): a TRANSIENT
+// leader reports, for its leadership, the leader epoch its ring's data came
+// from — -1 when the ring is unborn (a process start: a full-cluster restart,
+// the first leadership); its leader's epoch when it was promoted from a
+// follower that fetched from that leader (ISR handover / rolling restart).  The
+// report is re-sent until the controller confirms it committed.  A disk
+// replica never reports.  RED: no lineage report was ever sent.
+// ===========================================================================
+namespace {
+std::vector<AlterIsrMsg> lineageReports(const CapturingTransport& t) {
+    std::vector<AlterIsrMsg> out;
+    for (const auto& m : t.sent)
+        if (m.isrCount == AlterIsrMsg::kLeaderEpochBump && (m.isr[1] & AlterIsrMsg::kLineageReport) != 0)
+            out.push_back(m);
+    return out;
+}
+AlterIsrResponseMsg lineageAck(int16_t code, Epoch epoch) {
+    AlterIsrResponseMsg a{};
+    a.topicId = 0; a.partition = 0; a.leaderId = 1; a.leaderEpoch = epoch; a.partitionEpoch = 0; a.errorCode = code;
+    return a;
+}
+}  // namespace
+
+TEST(LeaderEpochFenceRegression, UnbornTransientLeaderReportsANewLineageUntilConfirmedRegression) {
+    Dir d;
+    rune::storage::InMemoryLog log(1 << 20, 10'000);
+    CapturingTransport t;
+    auto r = memReplica(log, t);
+    r->setLeaderEpochFenceFile((d.path / "fence-0-0").string());
+    r->becomeLeader(5, kAll);
+    ASSERT_EQ(r->role(), Role::Leader);
+    int64_t now = 1'000'000'000;
+    r->doWork(now);
+    auto reps = lineageReports(t);
+    ASSERT_EQ(reps.size(), 1u) << "an unborn transient leader sent no lineage report";
+    EXPECT_EQ(reps[0].leaderEpoch, 5);
+    EXPECT_EQ(reps[0].leaderId, 1);
+    EXPECT_EQ(reps[0].isr[2], -1) << "an unborn ring holds no lineage data";
+    r->doWork(now + 1'000'000);
+    EXPECT_EQ(lineageReports(t).size(), 1u) << "re-sent faster than the AlterIsr cadence";
+    now += PartitionReplica::kAlterIsrResendNsForTest + 1;
+    r->doWork(now);
+    EXPECT_EQ(lineageReports(t).size(), 2u) << "never re-sent while unconfirmed";
+    r->onAlterIsrResponse(lineageAck(kAlterIsrLineageConfirmed, 5));
+    EXPECT_FALSE(r->lineageReportPendingForTest());
+    now += 10 * PartitionReplica::kAlterIsrResendNsForTest;
+    r->doWork(now);
+    EXPECT_EQ(lineageReports(t).size(), 2u) << "re-sent after the controller confirmed it";
+}
+
+TEST(LeaderEpochFenceRegression, PromotedTransientFollowerReportsItsLeadersEpochRegression) {
+    Dir d;
+    rune::storage::InMemoryLog log(1 << 20, 10'000);
+    CapturingTransport t;
+    auto r = memReplica(log, t);
+    r->setLeaderEpochFenceFile((d.path / "fence-0-0").string());
+    r->becomeFollower(7, /*leaderId=*/2);
+    EXPECT_EQ(r->lineageSrcEpochForTest(), -1) << "nothing fetched yet: unborn";
+    FetchResponseMsg resp{};
+    resp.leaderEpoch = 7; resp.partition = 0; resp.highWatermark = 0; resp.logStartOffset = 0;
+    resp.errorCode = kErrNone; resp.topicId = 0; resp.records = {};
+    r->applyReplicated(resp);
+    EXPECT_EQ(r->lineageSrcEpochForTest(), 7) << "the follower did not adopt its leader's lineage";
+    FetchResponseMsg stale = resp;
+    stale.leaderEpoch = 6;
+    r->applyReplicated(stale);
+    EXPECT_EQ(r->lineageSrcEpochForTest(), 7) << "a deposed leader's frame moved the lineage source";
+    r->becomeLeader(8, kAll);   // promoted (ISR handover / rolling restart)
+    ASSERT_EQ(r->role(), Role::Leader);
+    r->doWork(1'000'000'000);
+    const auto reps = lineageReports(t);
+    ASSERT_EQ(reps.size(), 1u);
+    EXPECT_EQ(reps[0].leaderEpoch, 8);
+    EXPECT_EQ(reps[0].isr[2], 7) << "the promoted leader must report the epoch its data came from";
+    // A fenced answer (no longer this leadership) stops it too.
+    r->onAlterIsrResponse(lineageAck(kAlterIsrFencedLeaderEpoch, 8));
+    EXPECT_FALSE(r->lineageReportPendingForTest());
+}
+
+TEST(LeaderEpochFenceRegression, DiskReplicaNeverSendsALineageReportRegression) {
+    Dir d;
+    const fs::path logDir = d.path / "log";
+    fs::create_directories(logDir);
+    rune::storage::Log log(logDir.string());
+    log.recover();
+    CapturingTransport t;
+    auto r = std::make_unique<PartitionReplica>(cfg(), Role::Follower, 0, kAll, kAll, &log, &t);
+    r->setIsrChannel(&t);
+    r->setLeaderEpochFenceFile((d.path / "fence").string());
+    r->becomeLeader(5, kAll);
+    r->doWork(1'000'000'000);
+    EXPECT_TRUE(lineageReports(t).empty()) << "a disk partition has no data lineage";
+}
+
+// E2 final fix wave, residual round 5 — R2: the process identity ROTATED.  A
+// transient LEADER whose lineage was already confirmed re-reports it under the
+// new identity, with its own epoch as the data source (same leadership, same
+// data: the controller keeps the lineage); a follower only adopts it (its
+// next leadership reports under it).  RED (identity fixed at add): no
+// re-report — the controller's new identity never matches the record.
+TEST(LeaderEpochFenceRegression, RotatedIdentityIsReportedAgainByATransientLeaderRegression) {
+    Dir d;
+    rune::storage::InMemoryLog log(1 << 20, 10'000);
+    CapturingTransport t;
+    auto r = memReplica(log, t);
+    r->setLineageIdentity(0x0B0B);
+    r->setLeaderEpochFenceFile((d.path / "fence-0-0").string());
+    r->becomeLeader(5, kAll);
+    int64_t now = 1'000'000'000;
+    r->doWork(now);
+    r->onAlterIsrResponse(lineageAck(kAlterIsrLineageConfirmed, 5));
+    ASSERT_FALSE(r->lineageReportPendingForTest());
+    const std::size_t before = lineageReports(t).size();
+
+    r->rotateLineageIdentity(0x0C0C);
+    EXPECT_EQ(r->lineageIdentityForTest(), 0x0C0C);
+    EXPECT_TRUE(r->lineageReportPendingForTest()) << "the confirmed leader did not re-arm its report";
+    r->doWork(now += 1'000'000);
+    const auto reps = lineageReports(t);
+    ASSERT_EQ(reps.size(), before + 1) << "no lineage report under the rotated identity";
+    const AlterIsrMsg m = reps.back();
+    const int64_t id = static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(m.isr[4])) << 32) |
+                                            static_cast<uint32_t>(m.isr[3]));
+    EXPECT_EQ(id, 0x0C0C) << "the re-report carried the OLD identity";
+    EXPECT_EQ(m.leaderEpoch, 5);
+    EXPECT_EQ(m.isr[2], 5) << "the data source is this leadership (the controller keeps the lineage)";
+    r->onAlterIsrResponse(lineageAck(kAlterIsrLineageConfirmed, 5));
+    EXPECT_FALSE(r->lineageReportPendingForTest());
+    r->rotateLineageIdentity(0x0C0C);
+    EXPECT_FALSE(r->lineageReportPendingForTest()) << "an unchanged identity re-armed the report";
+
+    // A follower adopts it without reporting.
+    rune::storage::InMemoryLog log2(1 << 20, 10'000);
+    CapturingTransport t2;
+    auto f = memReplica(log2, t2);
+    f->becomeFollower(7, 2);
+    f->rotateLineageIdentity(0x0D0D);
+    EXPECT_EQ(f->lineageIdentityForTest(), 0x0D0D);
+    EXPECT_FALSE(f->lineageReportPendingForTest());
+}
+
+// E2 final fix wave, residual round 6 — F3: a rotation that lands while the
+// leadership's lineage report is still UNCONFIRMED keeps that report's data
+// source (a promoted follower's: the epoch it fetched from) and changes only
+// the identity — re-sending with the leader's own epoch would MINT instead of
+// KEEP (a false "none").  RED: the re-sent report carried src = its own epoch.
+TEST(LeaderEpochFenceRegression, RotationBeforeConfirmationKeepsThePendingReportsSourceRegression) {
+    Dir d;
+    rune::storage::InMemoryLog log(1 << 20, 10'000);
+    CapturingTransport t;
+    auto r = memReplica(log, t);
+    r->setLineageIdentity(0x0B0B);
+    r->setLeaderEpochFenceFile((d.path / "fence-0-0").string());
+    r->becomeFollower(7, /*leaderId=*/2);
+    FetchResponseMsg resp{};
+    resp.leaderEpoch = 7; resp.partition = 0; resp.highWatermark = 0; resp.logStartOffset = 0;
+    resp.errorCode = kErrNone; resp.topicId = 0; resp.records = {};
+    r->applyReplicated(resp);   // the data is epoch 7's
+    r->becomeLeader(8, kAll);   // promoted: reports src 7 (KEEP)
+    int64_t now = 1'000'000'000;
+    r->doWork(now);
+    ASSERT_EQ(lineageReports(t).back().isr[2], 7);
+    ASSERT_TRUE(r->lineageReportPendingForTest()) << "precondition: not confirmed yet";
+    r->rotateLineageIdentity(0x0C0C);
+    r->doWork(now += 1'000'000);   // re-sent at once (not after the resend cadence)
+    const auto reps = lineageReports(t);
+    ASSERT_GE(reps.size(), 2u) << "the pending report was not re-sent under the new identity";
+    const AlterIsrMsg m = reps.back();
+    const int64_t id = static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(m.isr[4])) << 32) |
+                                            static_cast<uint32_t>(m.isr[3]));
+    EXPECT_EQ(id, 0x0C0C) << "the pending report kept the old identity";
+    EXPECT_EQ(m.isr[2], 7) << "the rotation rewrote the pending report's source (KEEP would become a MINT)";
+    EXPECT_EQ(m.leaderEpoch, 8);
+}

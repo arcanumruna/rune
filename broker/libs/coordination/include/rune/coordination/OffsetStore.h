@@ -35,6 +35,12 @@ struct CommittedOffset {
     Offset      offset{0};
     std::string metadata;
     int64_t     commitTimestampNs{0};
+    /// E2 final fix wave (C1): the TRANSIENT partition's data lineage this
+    /// offset was committed against (0 = none: a disk partition, or a commit
+    /// made before lineage stamps).  An offset is a data position: on a
+    /// transient partition it means nothing once the ring's data did not
+    /// survive (a restart) — the coordinator then answers "no committed offset".
+    uint64_t    lineage{0};
 };
 
 // ---------------------------------------------------------------------------

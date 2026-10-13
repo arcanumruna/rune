@@ -162,6 +162,8 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
 
     if (coordinators_.empty()) return 0;
 
+    sweepSupersededLineages_(nowNs);   // R1 (round 5)
+
     int work = 0;
     for (auto& [groupId, coord] : coordinators_) {
         const coord::GroupState stateBefore = coord.state();
@@ -218,6 +220,134 @@ int GroupCoordinationService::doWork(int64_t nowNs) {
         }
     }
     return work;
+}
+
+// ---------------------------------------------------------------------------
+// E2 residual round 5 (R1): superseded-lineage rebalances.
+//
+// The coordinator can have answered a member a transient offset while the
+// lineage still looked valid (e.g. the partition's only replica had just died,
+// before the controller detected it).  Once a NEW lineage is minted for that
+// partition the offset points into data that did not survive.  Closing this
+// only at OffsetFetch leaves the member consuming on from its old position and
+// committing it under the new lineage (silent loss).  So, end to end:
+//   - every group holding a committed offset of a superseded lineage is forced
+//     to rebalance (generation bump): members revoke, re-join, re-fetch (-1:
+//     the log start) — swept here on every lineage change;
+//   - a commit at the old generation is fenced by the generation check
+//     (IllegalGeneration, explicit); a commit that reaches us BEFORE the sweep
+//     saw the change forces the rebalance itself and is refused (see
+//     handleOffsetCommit).
+// ---------------------------------------------------------------------------
+bool GroupCoordinationService::rebalanceForSupersededLineage_(const GroupId& groupId, coord::GroupCoordinator& coord,
+                                                              int32_t topicId, int32_t partition, uint64_t now,
+                                                              int64_t nowNs) {
+    auto& marks = supersededHandled_[groupId];
+    for (const auto& m : marks)
+        if (m.topicId == topicId && m.partition == partition && m.lineage == now) return false;
+    marks.push_back(SupersededMark{topicId, partition, now});
+    const coord::GroupState before = coord.state();
+    if (!coord.forceRebalance(nowNs)) return false;
+    ++supersededRebalances_;
+    spdlog::info("GroupCoordinationService: group '{}' consumed / committed transient topicId={} partition={} "
+                 "under a superseded data lineage (now {:#x}) — forced rebalance to generation {} (members "
+                 "re-fetch: the log start)", groupId, topicId, partition, now, coord.generationId());
+    if (before != coord::GroupState::PreparingRebalance) onEnterPreparingRebalance(groupId, coord);
+    return true;
+}
+
+GroupCoordinationService::GenLineage* GroupCoordinationService::genLineageOf_(const std::string& groupId,
+                                                                             int32_t topicId, int32_t partition) {
+    const auto it = genLineages_.find(groupId);
+    if (it == genLineages_.end()) return nullptr;
+    for (auto& g : it->second)
+        if (g.topicId == topicId && g.partition == partition) return &g;
+    return nullptr;
+}
+
+void GroupCoordinationService::recordGenLineages_(const GroupId& groupId, const coord::GroupCoordinator& coord) {
+    if (lineageFn_ == nullptr || topics_ == nullptr) return;
+    auto& v = genLineages_[groupId];   // cold: once per rebalance
+    v.clear();
+    for (const auto& m : coord.members()) {
+        for (const auto& tp : m.assignment) {
+            const auto id = topics_->topicIdForName(tp.topic);
+            if (!id) continue;
+            const uint64_t l = lineageOf_(*id, tp.partition);
+            if (l == 0) continue;   // a disk partition
+            bool dup = false;
+            for (const auto& g : v) dup = dup || (g.topicId == *id && g.partition == tp.partition);
+            if (!dup) v.push_back(GenLineage{*id, tp.partition, l});
+        }
+    }
+}
+
+void GroupCoordinationService::pruneGroupLineageState_(const std::string& groupId) {
+    supersededHandled_.erase(groupId);
+    genLineages_.erase(groupId);
+    std::erase_if(pendingChecks_, [&](const PendingCheck& p) { return p.groupId == groupId; });
+}
+
+bool GroupCoordinationService::checkSuperseded_(const std::string& groupId, int32_t topicId, int32_t partition,
+                                                uint64_t ref, bool genEntry, int64_t nowNs) {
+    const uint64_t now = lineageOf_(topicId, partition);
+    if (now == kLineagePending) return false;
+    if (now == 0) return true;
+    if (genEntry) {
+        GenLineage* g = genLineageOf_(groupId, topicId, partition);
+        if (g == nullptr) return true;   // re-recorded / pruned since
+        if (g->lineage == kLineagePending) { g->lineage = now; return true; }   // the first confirmed: consumed
+        ref = g->lineage;
+    }
+    if (ref == now) return true;
+    const auto it = coordinators_.find(groupId);
+    if (it != coordinators_.end() && !it->second.isEmpty())
+        (void)rebalanceForSupersededLineage_(it->first, it->second, topicId, partition, now, nowNs);
+    return true;
+}
+
+void GroupCoordinationService::retryPendingChecks_(int64_t nowNs) {
+    if (pendingChecks_.empty() || nowNs < nextLineageSweepNs_) return;
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < pendingChecks_.size(); ++i) {
+        PendingCheck& p = pendingChecks_[i];
+        if (!checkSuperseded_(p.groupId, p.topicId, p.partition, p.ref, p.genEntry, nowNs)) {
+            if (kept != i) pendingChecks_[kept] = std::move(p);
+            ++kept;
+        }
+    }
+    pendingChecks_.resize(kept);   // shrinks only: no allocation
+    nextLineageSweepNs_ = nowNs + 100'000'000;
+}
+
+void GroupCoordinationService::sweepSupersededLineages_(int64_t nowNs) {
+    if (lineageFn_ == nullptr || offsets_ == nullptr || !isLocalCoordinator() || !offsetsLoaded_()) return;
+    const uint64_t v = lineageVersionFn_ != nullptr ? lineageVersionFn_(lineageVersionCtx_) : 0;
+    if (v == lineageSweptVersion_) {   // no lineage change: only the undecided ones (F4: no fetchAll)
+        retryPendingChecks_(nowNs);
+        return;
+    }
+    // A lineage changed (an event: a restart / a leadership move) — cold.
+    pendingChecks_.clear();
+    for (auto& [groupId, coord] : coordinators_) {
+        if (coord.isEmpty()) { pruneGroupLineageState_(groupId); continue; }   // F4: nothing live to fence
+        // (a) the partitions its current generation consumes (F1: no commit needed)
+        if (auto gl = genLineages_.find(groupId); gl != genLineages_.end()) {
+            for (const auto& g : gl->second)
+                if (!checkSuperseded_(groupId, g.topicId, g.partition, 0, /*genEntry=*/true, nowNs))
+                    pendingChecks_.push_back(PendingCheck{groupId, g.topicId, g.partition, 0, true});
+        }
+        // (b) its committed offsets (R1)
+        for (const auto& [tp, co] : offsets_->fetchAll(groupId)) {
+            if (co.lineage == 0 || topics_ == nullptr) continue;
+            const auto id = topics_->topicIdForName(tp.topic);
+            if (!id) continue;
+            if (!checkSuperseded_(groupId, *id, tp.partition, co.lineage, /*genEntry=*/false, nowNs))
+                pendingChecks_.push_back(PendingCheck{groupId, *id, tp.partition, co.lineage, false});
+        }
+    }
+    lineageSweptVersion_ = v;
+    nextLineageSweepNs_  = nowNs + 100'000'000;
 }
 
 // ---------------------------------------------------------------------------
@@ -470,7 +600,7 @@ size_t GroupCoordinationService::handleSyncGroup(
     // member's push subscriptions at SyncGroup.  With distributed partition
     // leadership a partition's records come from its LEADER node; the member
     // subscribes there explicitly (after its OffsetFetch answer, from the
-    // committed offset or its reset policy).  A coordinator-created
+    // committed offset, or the log start when there is none).  A coordinator-created
     // subscription pushed from the SyncGroup moment, before the member knew its
     // position — those records were dropped and the subscription's cursor ran
     // ahead of the member (stalled / lost partitions).  The eager revoke at
@@ -705,6 +835,23 @@ void GroupCoordinationService::evictSessionMembers(int64_t sessionId, int64_t no
 }
 
 // ---------------------------------------------------------------------------
+// E2 final fix wave (C1): a transient partition's committed offset is a
+// position of ONE data lineage — answered only while that lineage lives.
+// ---------------------------------------------------------------------------
+bool GroupCoordinationService::staleLineage_(const rune::coordination::CommittedOffset& co, int32_t topicId,
+                                             int32_t partition)
+{
+    const uint64_t now = lineageOf_(topicId, partition);
+    if (now == 0 || now == kLineagePending || co.lineage == now) return false;   // not transient / pending / same
+    if ((staleLineageOffsets_++ & 1023u) == 0)
+        spdlog::info("GroupCoordinationService: committed offset {} of transient topicId={} partition={} "
+                     "belongs to data that did not survive (lineage {:#x}, now {:#x}) — answered as no "
+                     "committed offset; the member starts at the log start ({} so far)",
+                     co.offset, topicId, partition, co.lineage, now, staleLineageOffsets_);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // handleOffsetCommit (templateId 40)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleOffsetCommit(
@@ -761,9 +908,10 @@ size_t GroupCoordinationService::handleOffsetCommit(
     // Generation fence: verify the member is in the group at the claimed generation.
     auto it = coordinators_.find(groupIdStr);
     const bool groupExists = (it != coordinators_.end());
-    const bool genOk = groupExists && (msg.generationId == it->second.generationId());
+    bool genOk = groupExists && (msg.generationId == it->second.generationId());   // R1: cleared by a forced rebalance
 
     commitResultScratch_.clear();
+    const bool loaded = offsetsLoaded_();   // E2 residual round 4
 
     // Iterate entries defensively (CG-1 note: count can overstate; stop when
     // the view iterator ends, which happens when the frame bytes run out).
@@ -790,6 +938,15 @@ size_t GroupCoordinationService::handleOffsetCommit(
             continue;
         }
 
+        if (!loaded) [[unlikely]] {
+            // Round 4: the offsets are not loaded yet — a commit now would be
+            // wiped by the rebuild (clear + replay): refused retriably.
+            ++offsetsNotLoadedAnswers_;
+            r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            commitResultScratch_.push_back(r);
+            continue;
+        }
+
         // Resolve topicId → topic name.
         const std::string topicName = topicNameForId(topics_, e.topicId);
         if (topicName.empty()) {
@@ -803,7 +960,40 @@ size_t GroupCoordinationService::handleOffsetCommit(
         const std::string_view meta(
             reinterpret_cast<const char*>(e.metadata.data()), e.metadata.size());
 
-        const bool committed = offsets_->commit(groupIdStr, tp, e.offset, meta, nowNs);
+        const uint64_t lineage = lineageOf_(e.topicId, e.partition);   // C1
+        if (lineage == kLineagePending) [[unlikely]] {
+            // The partition's current leadership has not confirmed its data
+            // lineage yet: no stamp could be right — refused retriably.
+            ++pendingLineageAnswers_;
+            r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            commitResultScratch_.push_back(r);
+            continue;
+        }
+        if (lineage != 0) {
+            // R1 (round 5): the group's committed position for this partition is
+            // of a SUPERSEDED lineage and the group was not rebalanced for the new
+            // one yet — this member's position may come from the old data: the
+            // group is rebalanced now and the commit refused (explicit; the
+            // member re-joins and re-fetches).  After that rebalance an old-
+            // generation commit is fenced by genOk above.
+            const auto prev = offsets_->fetch(groupIdStr, tp);
+            // Round 6 (F1): or this generation consumed the partition under a
+            // lineage that has been superseded since — even with NO committed
+            // offset (an in-memory position): the generation predates the mint.
+            GenLineage* gl = genLineageOf_(groupIdStr, e.topicId, e.partition);
+            if (gl != nullptr && gl->lineage == kLineagePending) gl->lineage = lineage;   // first confirmed
+            const bool genSuperseded = gl != nullptr && gl->lineage != lineage;
+            const bool prevSuperseded = prev.has_value() && prev->lineage != 0 && prev->lineage != lineage;
+            if ((genSuperseded || prevSuperseded) &&
+                rebalanceForSupersededLineage_(groupIdStr, it->second, e.topicId, e.partition, lineage, nowNs)) {
+                ++supersededCommitsFenced_;
+                genOk = false;   // the rest of this request is at the old generation now
+                r.errorCode = static_cast<int16_t>(pc::ErrorCode::IllegalGeneration);
+                commitResultScratch_.push_back(r);
+                continue;
+            }
+        }
+        const bool committed = offsets_->commit(groupIdStr, tp, e.offset, meta, nowNs, lineage);
         r.errorCode = committed ? static_cast<int16_t>(pc::ErrorCode::OK)
                                 : static_cast<int16_t>(pc::ErrorCode::MinIsrViolation);
         commitResultScratch_.push_back(r);
@@ -875,6 +1065,30 @@ size_t GroupCoordinationService::handleOffsetFetch(
 
     fetchResultScratch_.clear();
 
+    if (!offsetsLoaded_()) [[unlikely]] {
+        // E2 residual round 4: the offsets of this coordinator's
+        // __consumer_offsets partition are not loaded yet (a restart / a new
+        // leadership; the rebuild waits for the whole log).  Neither an offset
+        // nor "none" can be answered — every entry (or one sentinel for a
+        // fetch-all) gets the retriable NotLeader; the client retries.
+        auto refuse = [&](int32_t t, int32_t p) {
+            if (pc::OffsetFetchResponse::encodedSizeFor(fetchResultScratch_.size() + 1) > outCap) return;
+            pc::OffsetFetchResult r;
+            r.topicId   = t;
+            r.partition = p;
+            r.offset    = -1;
+            r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            ++offsetsNotLoadedAnswers_;
+            fetchResultScratch_.push_back(r);
+        };
+        for (const auto& e : msg.entries) refuse(e.topicId, e.partition);
+        if (fetchResultScratch_.empty()) refuse(-1, -1);
+        pc::OffsetFetchResponse resp;
+        resp.sessionId     = msg.sessionId;
+        resp.correlationId = msg.correlationId;
+        return resp.encode(out, std::span<const pc::OffsetFetchResult>(fetchResultScratch_));
+    }
+
     if (msg.entries.empty()) {
         // Fetch all committed offsets for the group.
         // Bound-check BEFORE writing each result so a large fetch-all never
@@ -898,12 +1112,19 @@ size_t GroupCoordinationService::handleOffsetFetch(
                 if (opt) topicId = *opt;
             }
             if (topicId < 0) continue; // unknown topic — skip
+            const uint64_t lineage = lineageOf_(topicId, tp.partition);   // C1
+            if (lineage != kLineagePending && staleLineage_(co, topicId, tp.partition)) continue;   // as if never committed
 
             pc::OffsetFetchResult r;
             r.topicId   = topicId;
             r.partition = tp.partition;
             r.offset    = co.offset;
             r.errorCode = static_cast<int16_t>(pc::ErrorCode::OK);
+            if (lineage == kLineagePending) [[unlikely]] {   // not answerable yet: retriable
+                ++pendingLineageAnswers_;
+                r.offset    = -1;
+                r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            }
             fetchResultScratch_.push_back(r);
         }
     } else {
@@ -929,8 +1150,17 @@ size_t GroupCoordinationService::handleOffsetFetch(
                 r.offset = -1; // no-offset sentinel
             } else {
                 const coord::TopicPartition tp{topicName, e.partition};
-                const auto co = offsets_->fetch(groupIdStr, tp);
-                r.offset = co.has_value() ? co->offset : int64_t{-1};
+                if (lineageOf_(e.topicId, e.partition) == kLineagePending) [[unlikely]] {
+                    // C1: the current leadership has not confirmed the lineage
+                    // yet — neither the offset nor "none" can be answered.
+                    ++pendingLineageAnswers_;
+                    r.offset    = -1;
+                    r.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+                } else {
+                    const auto co = offsets_->fetch(groupIdStr, tp);
+                    r.offset = co.has_value() && !staleLineage_(*co, e.topicId, e.partition) ? co->offset
+                                                                                             : int64_t{-1};
+                }
             }
             fetchResultScratch_.push_back(r);
         }
@@ -1035,6 +1265,7 @@ void GroupCoordinationService::onReachedStable(
     int64_t nowNs)
 {
     (void)nowNs;
+    recordGenLineages_(groupId, coord);   // round 6 (F1): the lineages this generation consumes
     if (!gateway_) return;  // no push path wired
 
     const int32_t gen = coord.generationId();

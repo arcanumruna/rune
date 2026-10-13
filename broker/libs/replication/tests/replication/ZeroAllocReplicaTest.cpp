@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
+#include <rune/storage/InMemoryLog.h>
 #include <rune/protocol/RecordBatch.h>
 
 #include <atomic>
@@ -129,4 +130,39 @@ TEST(ZeroAllocReplicaRegression, FetchFromFreshlyRolledSegmentAllocatesNothing) 
     }
     EXPECT_EQ(t.frames, framesBefore + 1);
     EXPECT_EQ(n, 0u) << "first fetch from a rolled segment must not allocate its read map";
+}
+
+// Phase 2b E2 (fix-on-sight): applyReplicated copied the new suffix of every
+// replicated response into a fresh std::vector before appending — a heap
+// allocation per apply on the follower's hot path (disk AND transient).
+TEST(ZeroAllocReplicaRegression, TransientFollowerApplyAllocatesNothing) {
+    rune::storage::InMemoryLog mem(1 << 20, 4096);
+    SinkTransport t;
+    PartitionConfig c = cfg(/*push=*/false);
+    c.selfId = 2;
+    PartitionReplica follower(c, Role::Follower, 1, {1, 2}, {1, 2}, &mem, &t);
+    auto batchAt = [](int64_t base) {
+        rune::protocol::RecordBatchBuilder b(base, 1000);
+        b.append("k", std::string(512, 'v'), 1000);
+        auto x = b.build();
+        rune::protocol::RecordBatchReader::stampLeaderEpoch(x.data(), 1);
+        return x;
+    };
+    const auto b0 = batchAt(0), b1 = batchAt(1);
+    FetchResponseMsg r0{};
+    r0.leaderEpoch = 1; r0.partition = 0; r0.highWatermark = 1; r0.logStartOffset = 0;
+    r0.errorCode = 0; r0.topicId = 0; r0.records = std::span<const uint8_t>(b0);
+    follower.applyReplicated(r0);   // warm-up: the epoch-cache entry for epoch 1 is created here
+    ASSERT_EQ(follower.logEndOffset(), 1);
+    FetchResponseMsg r1 = r0;
+    r1.highWatermark = 2;
+    r1.records = std::span<const uint8_t>(b1);
+    uint64_t n = 0;
+    {
+        Armed a;
+        follower.applyReplicated(r1);
+        n = a.count();
+    }
+    EXPECT_EQ(follower.logEndOffset(), 2);
+    EXPECT_EQ(n, 0u) << "the follower's replicated apply must not allocate";
 }

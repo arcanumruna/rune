@@ -492,6 +492,17 @@ public:
     // pool's worker intake limit, so a gateway-routed batch the worker op /
     // return ring cannot carry is answered MessageTooLarge, never thrown.
     void setWorkerPool(rune::node::WorkerPool* pool) noexcept;
+
+    /// E2 residual round 6 (F1, plain subscriptions): a TRANSIENT partition's
+    /// current data lineage (0 = not transient, UINT64_MAX = not known yet,
+    /// else the token) — the same provider the group coordinator uses (this
+    /// thread).  Drives the lineage note (bind) and the claim check (resume),
+    /// see rune-protocol kClientVersionLineageNote.
+    using TransientLineageFn = uint64_t (*)(void* ctx, int32_t topicId, int32_t partition) noexcept;
+    void setTransientLineage(TransientLineageFn fn, void* ctx) noexcept { lineageFn_ = fn; lineageCtx_ = ctx; }
+    [[nodiscard]] uint64_t partitionDataResetsForTest() const noexcept { return partitionDataResets_; }
+    [[nodiscard]] uint64_t lineageNotesSentForTest() const noexcept { return lineageNotesSent_; }
+    [[nodiscard]] uint64_t subscribesAwaitingLineageForTest() const noexcept { return subscribesAwaitingLineage_; }
     /// F15 S3 (re-review 2 B-1) ⇄ F18: THE client-visible batch limit — the ONE
     /// gateway setter.  BrokerNode sets NodeConfig::produceIntakeLimit()
     /// (= rune::node::Worker::maxAcceptableBatchBytes(config): rings, replication
@@ -957,6 +968,29 @@ public:
     /// Test seam: one gateway push pass (pushSubscriptions) without doWork's
     /// Aeron polling.
     void pushSubscriptionsForTest() { pushSubscriptions(); }
+    /// Plain subscriptions answered NotLeader + dropped because this node
+    /// stopped serving them (read_committed after a demotion; any isolation
+    /// after the replica was removed) — retireReadCommittedMovedAway_.
+    [[nodiscard]] uint64_t readCommittedSubscriptionsMovedAway() const noexcept { return readCommittedMovedAway_; }
+    static constexpr int64_t kMovedAwayScanEveryCyclesForTest = 16;   // == kMovedAwayScanEveryCycles
+    static constexpr int     kMovedAwayLookupsPerSliceForTest = 32;   // == kMovedAwayLookupsPerSlice
+    static constexpr int64_t kMovedAwaySummaryEveryNsForTest  = 1'000'000'000;   // == kMovedAwaySummaryEveryNs
+    static constexpr int64_t kRoutedSweepMinGapCyclesForTest  = 64;   // == kRoutedSweepMinGapCycles
+    /// M6: transient-partition classifications the push loop made (per registry change, not per cycle).
+    [[nodiscard]] uint64_t transientClassificationsForTest() const noexcept { return transientClassifications_; }
+    /// M4: routed moved-away sweeps run so far (coalesced role changes).
+    [[nodiscard]] uint64_t routedMovedAwaySweepsForTest() const noexcept { return routedMovedAwaySweeps_; }
+    /// N2: moved-away summaries logged, and the count the last one reported.
+    [[nodiscard]] uint64_t movedAwaySummariesForTest() const noexcept { return movedAwaySummaries_; }
+    [[nodiscard]] uint64_t lastMovedAwaySummaryCountForTest() const noexcept { return lastMovedAwaySummaryCount_; }
+    /// N1: the most movedAway_ probes any fallback slice made so far.
+    [[nodiscard]] int movedAwayMaxProbesPerSliceForTest() const noexcept { return movedAwayMaxProbesPerSlice_; }
+    /// N1 test seam: put every subscription in as few buckets as possible (a
+    /// pathological collision pattern the fallback slice must stay bounded on).
+    void squeezeSubscriptionBucketsForTest() {
+        subscriptions_.max_load_factor(1.0e9f);
+        subscriptions_.rehash(0);
+    }
 
     // -----------------------------------------------------------------------
     // applyProduceForTest — feed a raw Produce frame through the real
@@ -1217,6 +1251,23 @@ private:
         // Review I-2 fallback: push-cycle backoff after a notReady answer.
         int64_t notReadyBackoff  = 0;
         int64_t retryAtCycle     = 0;
+        // E2 Task 13 fix round 1: a replica of this partition was registered
+        // here when it was created — its later REMOVAL (the partition moved off
+        // this node) retires it NotLeader (retireMovedAway_), any isolation.
+        bool    hadReplica       = false;
+        // E2 final fix wave (M6): a partition with no disk Log is classified
+        // (servedPartition_: Transient → its replica) ONCE per registry change
+        // — keyed by the replica registry's generation (any add / remove) and
+        // the catalog's — never re-probed every push cycle.  transientReplica
+        // is valid only while both generations still match (checked first).
+        // E2 final fix wave (M2): the cursor is still the bind-time resolved
+        // start (no worker answer adopted yet) — sent with every PushRead
+        // (WorkerOp::freshCursor) so a transient ring start above it is not
+        // counted / warned as a reader that fell behind.
+        bool cursorFresh = true;
+        const rune::replication::PartitionReplica* transientReplica = nullptr;
+        uint64_t transientClassRegGen = UINT64_MAX;
+        uint64_t transientClassCatGen = UINT64_MAX;
     };
 
     // -----------------------------------------------------------------------
@@ -1439,6 +1490,7 @@ private:
     void handleGetViewRow   (const uint8_t* buf, std::size_t len);
     // GB-3: Push delivery — called from doWork after ingress poll.
     void pushSubscriptions  ();
+    void pushSubscriptionsPass_();   ///< N2: the pass body (pushSubscriptions logs the summary after it)
     // GB-5p2: Group-commit flush — called from doWork() once per cycle AFTER all
     // handleProduce() calls have completed.  Flushes each dirty partition Log
     // exactly once (one fsync per touched partition = group-commit under load).
@@ -1826,6 +1878,21 @@ private:
     // drainWorkerReturns_() sends deferred responses at the top of doWork().
     rune::node::WorkerPool* workerPool_ = nullptr;
 
+    // E2 residual round 6 (F1): see setTransientLineage().  Cold state (bind /
+    // resume rate); pendingLineageNotes_ is non-empty only while a bound
+    // transient subscription's lineage is still unknown.
+    static constexpr uint64_t kLineageUnknown = UINT64_MAX;
+    TransientLineageFn lineageFn_  = nullptr;
+    void*              lineageCtx_ = nullptr;
+    uint64_t           partitionDataResets_ = 0;
+    uint64_t           lineageNotesSent_    = 0;
+    uint64_t           subscribesAwaitingLineage_ = 0;   ///< FU1: answered NotLeader (lineage unknown)
+    std::vector<int64_t> pendingLineageNotes_;   ///< subscriptionIds awaiting their lineage
+    /// Send (or queue until known) subscription `subId`'s lineage note.
+    void noteLineage_(int64_t subId);
+    void sendLineageNote_(Session& session, int64_t subId, const Subscription& sub, uint64_t lineage);
+    int  flushPendingLineageNotes_();
+
     // E5.1.3 (e): per-worker ingress active flag.
     //
     // When true, the gateway produce fanout (tryEnqueueOp for Produce) is SKIPPED.
@@ -2040,6 +2107,80 @@ private:
     [[nodiscard]] bool routesToWorker_(int32_t topicId) const noexcept {
         return workerPool_ != nullptr && (!perWorkerIngressActive_ || topicId >= 0);
     }
+
+    // Phase 2b E2: what this gateway can serve for (topic, partition) — ONE
+    // explicit kind each (CLAUDE.md rule 3), C1 first:
+    //   AwaitingCommit — a runtime topic whose catalog record has not committed
+    //                    (TopicRegistry::awaitingCommit): retriable NotLeader.
+    //   Disk           — its servable disk Log (`log`).
+    //   Transient      — committed, persistence=transient, in range, replica
+    //                    registered: NO disk Log; its InMemoryLog is owned by the
+    //                    replica's worker and is NEVER touched here (its
+    //                    published HW is the subscribe clamp).
+    //   Unknown        — nothing servable here.
+    struct ServedPartition {
+        enum class Kind : uint8_t { Unknown, AwaitingCommit, Disk, Transient };
+        Kind                kind = Kind::Unknown;
+        rune::storage::Log* log  = nullptr;   ///< Kind::Disk only
+    };
+    [[nodiscard]] ServedPartition servedPartition_(int32_t topicId, int32_t partition) const noexcept;
+    /// E2 Task 11 ruling: may a read_committed subscription to (topicId,
+    /// partition) be accepted HERE?  read_committed is served from a LEADER's RC
+    /// state only (RcState I2): a follower answered OK and then delivered nothing
+    /// (a silent stall).  False only for a registered replica that is not a
+    /// published leader (GatewayReplicaView::publishedLeader); no replica
+    /// (unreplicated / internal) → true, unchanged.  Cold (subscribe time, and
+    /// the demotion sweep on a routed role change — retireReadCommittedMovedAway_).
+    [[nodiscard]] bool readCommittedServableHere_(int32_t topicId, int32_t partition) const noexcept;
+    /// Task 11 carry (E2 Task 13): a plain read_committed subscription accepted
+    /// while this node led the partition, which it no longer leads (demoted:
+    /// controlled shutdown, failover, a higher epoch) — no RC state serves it
+    /// here any more, so it would push nothing, forever (a silent stall, disk
+    /// and transient, both worker modes).  Answer its Subscribe correlation id
+    /// with the bare ErrorResponse{NotLeader} (the retriable re-route every
+    /// unservable-here read_committed subscribe gets; the client re-subscribes
+    /// from its position and follows the leader) and drop it here and on the
+    /// owning worker.  True = retired (the caller erases the record).
+    bool retireReadCommittedMovedAway_(int64_t subId, Subscription& sub);
+    uint64_t readCommittedMovedAway_ = 0;   ///< cold counter: subscriptions retired by retireReadCommittedMovedAway_
+    /// The registry's roleChanges() the last moved-away sweep saw.  The sweep
+    /// runs on every routed role change / replica removal (ReplicationMetadata
+    /// Bridge::recordIntendedRole_, ReplicaRegistry::remove) and, as the
+    /// fallback for a demotion no control-plane route reports (a leader fenced
+    /// by a higher epoch in onFetchRequest), a bounded slice every
+    /// kMovedAwayScanEveryCycles push passes (scanMovedAwaySlice_) — never a
+    /// per-pass lookup per subscription, never an O(subs) spike.
+    uint64_t seenRcSweepRoleChanges_ = 0;
+    /// M4: a routed change is waiting for its (coalesced) sweep.
+    bool     routedSweepPending_     = false;
+    int64_t  nextRoutedSweepCycle_   = 0;     ///< M4: the earliest pass the next routed sweep may run
+    uint64_t routedMovedAwaySweeps_  = 0;     ///< M4: routed sweeps run (tests)
+    uint64_t transientClassifications_ = 0;   ///< M6: see Subscription::transientReplica (tests)
+    static constexpr int64_t kRoutedSweepMinGapCycles = kRoutedSweepMinGapCyclesForTest;
+    static constexpr int64_t     kMovedAwayScanEveryCycles   = kMovedAwayScanEveryCyclesForTest;   ///< power of two
+    static constexpr int         kMovedAwayLookupsPerSlice   = kMovedAwayLookupsPerSliceForTest;
+    static constexpr std::size_t kMovedAwayBucketsPerSlice   = 256;   ///< empty buckets cost no lookup, but bounded
+    /// N2: the moved-away summary's rate limit (wall time, the duty clock nowNs_).
+    static constexpr int64_t     kMovedAwaySummaryEveryNs    = kMovedAwaySummaryEveryNsForTest;
+    std::size_t movedAwayBucket_           = 0;   ///< fallback scan cursor (bucket index)
+    std::size_t movedAwayBucketPos_        = 0;   ///< N1: survivors of that bucket already visited (mid-bucket resume)
+    int         movedAwayMaxProbesPerSlice_ = 0;  ///< N1: the most movedAway_ probes one slice made (tests)
+    uint64_t    movedAwaySinceSummary_     = 0;
+    int64_t     nextMovedAwaySummaryNs_    = 0;
+    uint64_t    movedAwaySummaries_        = 0;   ///< N2: summaries logged (tests)
+    uint64_t    lastMovedAwaySummaryCount_ = 0;   ///< N2: the count the last summary reported (tests)
+    /// The fallback slice: at most kMovedAwayLookupsPerSlice movedAway_ probes,
+    /// resuming at (movedAwayBucket_, movedAwayBucketPos_) — mid-bucket (N1).
+    void scanMovedAwaySlice_();
+    void logMovedAwaySummary_();
+    [[nodiscard]] static bool movedAwayEligible_(const Subscription& sub) noexcept {
+        return !sub.isGroup && sub.topicId >= 0 && !sub.failed;
+    }
+    /// Moved-away verdict for one plain subscription during a sweep: true when
+    /// this node can no longer serve it — its replica was removed (any
+    /// isolation) or, read_committed, it is no longer a published leader.
+    /// M5: also records hadReplica the first time it sees a registered replica.
+    [[nodiscard]] bool movedAway_(Subscription& sub) const noexcept;
     int  pumpMarkerQueue_();
     // D9 (see TxnMarkerChannel).
     TxnMarkerChannel txnMarkerChannel_{};
