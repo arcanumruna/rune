@@ -1067,6 +1067,22 @@ if(BUILD_TESTING)
 
         gtest_discover_tests(rune_notleader_retry_tests)
 
+        # ── Silent-failure gap — Subscribe answered bare NotLeader / timeout ──
+        add_executable(rune_subscribe_notleader_regression_tests
+            tests/client/ClientSubscribeNotLeaderRegressionTest.cpp
+        )
+        target_include_directories(rune_subscribe_notleader_regression_tests PRIVATE
+            ${RUNE_PROTOCOL_INCLUDE}
+        )
+        target_link_libraries(rune_subscribe_notleader_regression_tests PRIVATE
+            rune_client_api
+            rune_client_producer
+            rune_client_subscriber
+            GTest::gtest_main
+        )
+
+        gtest_discover_tests(rune_subscribe_notleader_regression_tests)
+
         # ── MD1 Task 10 review — metadata routing against a real gateway ──────
         add_executable(rune_metadata_routing_tests
             tests/client/MetadataRoutingTest.cpp

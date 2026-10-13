@@ -92,6 +92,10 @@ using Bytes = std::vector<uint8_t>;
 //               the topic is empty).
 enum class Persistence : uint8_t { Disk = 0, Transient = 1 };
 
+/// Result of DefineTopic. errorCode: 0 OK; TopicExists=25 (the name - or a name
+/// differing from it only in letter case - is taken); InvalidSchema=23 (bad
+/// descriptor or partitions < 1); InvalidTopicName=40 (empty, > 249 bytes, "."/"..",
+/// a byte outside [A-Za-z0-9._-], or the reserved "__" prefix).
 struct DefineTopicResult {
     int32_t  topicId   = -1;
     uint16_t version   = 0;
@@ -123,7 +127,9 @@ struct AlterTopicResult {
 // ---------------------------------------------------------------------------
 
 /// Result of CreateView (wire 70/71). errorCode is a broker ErrorCode (e.g.
-/// ViewExists=32, ViewSourceNotFound=33, ViewFieldUnresolved=34,
+/// ViewExists=32, ViewSourceNotFound=33, ViewFieldUnresolved=34, TopicExists=25,
+/// InvalidTopicName=40 (same name rule as defineTopic), ViewSourceIsView=41 (a source is
+/// another view's output - not supported until Phase 3),
 /// ViewSourceTransient=37: a view that reads a transient topic must itself be
 /// transient).
 struct CreateViewResult {

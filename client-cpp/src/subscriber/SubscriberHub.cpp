@@ -626,13 +626,24 @@ bool SubscriberHub::resendOne(int64_t correlationId, int64_t sessionId, const Se
 // M2 FIX: failPendingSubscribes — fail all unbound pending subscribes
 // ---------------------------------------------------------------------------
 
-bool SubscriberHub::failPendingSubscribe(int64_t correlationId, SubscriptionFailReason reason)
+bool SubscriberHub::chargeNotLeaderRetry(int64_t correlationId, int maxRetries)
+{
+    const auto it = pendingByCorrelation_.find(correlationId);
+    if (it == pendingByCorrelation_.end() || !it->second) return false;
+    if (it->second->nlRetries >= maxRetries) return false;
+    ++it->second->nlRetries;
+    return true;
+}
+
+bool SubscriberHub::failPendingSubscribe(int64_t correlationId, SubscriptionFailReason reason,
+                                         uint16_t brokerErrorCode)
 {
     const auto it = pendingByCorrelation_.find(correlationId);
     if (it == pendingByCorrelation_.end()) return false;
     clearUnsent_(*it->second);
     if (it->second->impl) {
         it->second->impl->failReason = reason;
+        it->second->impl->brokerErrorCode = brokerErrorCode;
         finish_(*it->second->impl);
     }
     pendingByCorrelation_.erase(it);
@@ -656,19 +667,29 @@ void SubscriberHub::failPendingSubscribes(const std::string& reason)
 // M2 FIX: sweepTimedOut — timeout pending subscribes that got no response
 // ---------------------------------------------------------------------------
 
-void SubscriberHub::sweepTimedOut(const std::chrono::steady_clock::time_point& now)
+int SubscriberHub::sweepTimedOut(const std::chrono::steady_clock::time_point& now)
 {
+    int timedOut = 0;
     for (auto it = pendingByCorrelation_.begin();
          it != pendingByCorrelation_.end(); )
     {
         if (now >= it->second->deadline) {
-            if (it->second->impl) finish_(*it->second->impl);
+            if (SubscriptionImpl* impl = it->second->impl) {
+                // An app-unsubscribed (inactive) one times out quietly; an active
+                // one is an explicit TimedOut failure the app must see.
+                if (impl->active) {
+                    impl->failReason = SubscriptionFailReason::TimedOut;
+                    ++timedOut;
+                }
+                finish_(*impl);
+            }
             clearUnsent_(*it->second);
             it = pendingByCorrelation_.erase(it);
         } else {
             ++it;
         }
     }
+    return timedOut;
 }
 
 // ---------------------------------------------------------------------------

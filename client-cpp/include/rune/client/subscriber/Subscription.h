@@ -127,6 +127,9 @@ enum class SubscriptionFailReason : int32_t {
     /// Subscription::brokerErrorCode().  (Such an answer used to BIND the
     /// subscription with id 0 — active, never delivering: a silent hang.)
     RejectedByBroker = 2,
+    /// Silent-failure gap: the Subscribe got no SubscribeResponse within
+    /// subscribeTimeoutMs (it used to finish with None and no onError).
+    TimedOut = 3,
 };
 
 struct SubscriptionStatus {
