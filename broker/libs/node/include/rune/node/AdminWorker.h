@@ -4,6 +4,8 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <variant>
 #include <vector>
 #include "rune/node/SchemaRegistry.h"
 #include "rune/node/AdminChannels.h"
@@ -27,6 +29,9 @@ namespace rune::node {
 //   SchemaConflict        = 31  (ALTER: stale expectedVersion — optimistic CAS)
 //   ViewSourceTransient   = 37  (CREATE VIEW: persisted view over a transient source)
 //   ViewNotAlterable      = 38  (ALTER TOPIC naming a view's output topic)
+//   InvalidTopicName      = 40  (DefineTopic/CreateView: name fails TopicName.h)
+//   ViewSourceIsView      = 41  (CREATE VIEW whose source is another view's output)
+//   (InvalidSchema 23 also answers DefineTopic.partitionCount < 1)
 
 // ---------------------------------------------------------------------------
 // AdminDeps — effects the AdminWorker needs, all resolved on the admin thread.
@@ -66,6 +71,13 @@ struct AdminDeps {
     // which delivers it to each worker's WorkerViewSet (installView on the
     // worker's OWN thread — never cross-thread).  Admin → control ring hand-off.
     std::function<void(const ViewPlanUpdateMsg&)> pushViewPlan;
+
+    // B10 / D4 fix round 1: a runtime topic's catalog record COMMITTED (DefineTopic
+    // schema record / CreateView record past the HW gate).  Posted on the
+    // admin→control ring (kA2cTopicCommitted); the control thread rewrites the
+    // topic's dir marker pending -> committed, so boot never DELETES its data even
+    // if the catalog is later damaged.  Optional (unset = no marker tracking).
+    std::function<void(int32_t topicId)> topicCommitted;
 
     // Task 19: send the CreateView response back to the client (encode + egress).
     std::function<void(int64_t session, int64_t corr, int32_t viewTopicId,
@@ -186,6 +198,8 @@ public:
     // control → admin: role transition for the schema replica.  Applied on the
     // admin thread (becomeLeader/becomeFollower) — no cross-thread role_ write.
     // C: on a Follower→Leader edge, rebuild the SchemaRegistry from the log.
+    // B4: demotion answers an in-flight DDL op Internal at once (never applied
+    // live; an op demoted in AwaitingCommit is in doubt — KL2).
     // -----------------------------------------------------------------------
     void onRole(const AdminRoleMsg& role);
 
@@ -205,6 +219,18 @@ public:
     /// No-hang fix round 3: the DDL queue bound; a request beyond it is answered Internal.
     static constexpr std::size_t kMaxPendingDdl = 256;
     [[nodiscard]] uint64_t pendingDdlRefused() const noexcept { return pendingDdlRefused_; }
+    /// B4 fix round 1: in-flight ops answered Internal because their commit
+    /// replica (or the view catalog) was missing in AwaitingCommit — never dropped.
+    [[nodiscard]] uint64_t commitReplicaMissing() const noexcept { return commitReplicaMissing_; }
+    /// The schema / __views replica pair (test access swaps it — final review M4:
+    /// no public mutator; see AdminWorkerTestAccess in the tests' support headers).
+    struct ReplicasForTest {
+        rune::replication::PartitionReplica* schema = nullptr;
+        rune::replication::PartitionReplica* views  = nullptr;
+    };
+    /// Final review M2: DDL ops refused Internal because the last promotion's
+    /// catalog rebuild failed (__topic_schemas or __views).
+    [[nodiscard]] uint64_t refusedForFailedRebuild() const noexcept { return refusedForFailedRebuild_; }
 
     // Fail-loud recovery signal (regression fix): true iff the most recent
     // rebuildFromLog_() (Follower->Leader promotion replay) hit a corrupt or
@@ -215,10 +241,95 @@ public:
     // control-plane wiring) poll this to detect/halt instead of trusting a
     // silently-incomplete registry.
     [[nodiscard]] bool rebuildFailed() const noexcept { return rebuildFailed_; }
+    /// The view-catalog counterpart (recoverViewsOnPromotion_ hit a corrupt record).
+    [[nodiscard]] bool viewsRebuildFailed() const noexcept { return viewsRebuildFailed_; }
+
+    // DDL conformance (tests): with startedCount() a test proves AT MOST ONE op is
+    // ever started-but-unanswered — started - answered == (hasInFlight() ? 1 : 0).
+    [[nodiscard]] bool hasInFlight() const noexcept {
+        return !std::holds_alternative<Idle>(inFlight_);
+    }
+    /// Task 10b (hard rule 3): the in-flight state's name — "Idle",
+    /// "DefineAwaitingId", "DefineAwaitingCommit", "AlterAwaitingCommit",
+    /// "ViewAwaitingId" or "ViewAwaitingCommit".
+    [[nodiscard]] std::string_view inFlightStateName() const noexcept;
+    /// Queued DDL ops dequeued by startNext_ (each is answered exactly once,
+    /// synchronously or later).  Monotone; admin-thread-owned.
+    [[nodiscard]] uint64_t startedCount() const noexcept { return started_; }
+    /// The in-flight error-path bound (see kDdlTimeoutNs).
+    [[nodiscard]] static constexpr int64_t ddlTimeoutNs() noexcept { return kDdlTimeoutNs; }
+
+    // ── In-flight DDL state machine (hard rule 3: each STATE holds exactly the
+    //    variables that state needs — no flat op struct, no kind/state flags).
+    //    Transitions construct the next state from the previous one (fields are
+    //    moved across).  Every alternative but Idle is an op that has been started
+    //    and not yet answered; every exit answers it and returns to Idle.
+    //    Public so the Task 10b regression can pin the shape at compile time.
+    struct Idle {};
+    // DefineTopic: create-topic request posted to the control thread; waiting for
+    // the reply ring (ticket match).  `fieldCount` (descriptor field count of
+    // msg.blob, captured once while PARSING) seeds nextTag on commit.
+    struct DefineAwaitingId {
+        DefineTopicMsg msg;
+        int64_t        ticket     = 0;
+        int64_t        startedNs  = 0;
+        uint16_t       fieldCount = 0;
+    };
+    // DefineTopic: TopicSchema appended to __topic_schemas; waiting for the HW to
+    // cover `appendedLast`.  topicId / partitionCount / persistence are the
+    // AUTHORITATIVE values from the create reply (final review I1, Phase 2b E).
+    struct DefineAwaitingCommit {
+        DefineTopicMsg  msg;
+        int64_t         startedNs      = 0;
+        uint16_t        fieldCount     = 0;
+        int32_t         topicId        = -1;
+        int32_t         partitionCount = 0;
+        PersistenceMode persistence    = PersistenceMode::Disk;
+        int64_t         appendedLast   = -1;
+    };
+    // AlterTopic: skips the id round-trip (the topic exists).  `alterSchema` is the
+    // record applied on the HW gate; its topicId / version are the ALTER's topic id
+    // and the contiguous new version computed ONCE in startAlter_.
+    struct AlterAwaitingCommit {
+        AlterTopicMsg alter;
+        int64_t       startedNs    = 0;
+        TopicSchema   alterSchema;
+        int64_t       appendedLast = -1;
+    };
+    // CreateView: compiled + validated; keyed+Compact SINK create posted to the
+    // control thread; waiting for the sink id.  The output fingerprint is
+    // compiledPlan.outputFingerprint.
+    struct ViewAwaitingId {
+        CreateViewMsg                view;
+        int64_t                      ticket    = 0;
+        int64_t                      startedNs = 0;
+        rune::view::CompiledViewPlan compiledPlan;   // viewTopicId stamped on the reply
+        rune::codec::Descriptor      viewOutDesc;    // output descriptor (registered in reg_)
+        rune::codec::Descriptor      viewSrcDesc;    // source descriptor (fan-out evolvingSrc)
+    };
+    // CreateView: ViewRecord appended to __views; waiting for the views replica's
+    // HW to cover `appendedLast`.  The view's topic id is viewRecord.viewTopicId;
+    // the compiled plan lives ONCE, serialized in viewRecord.compiledPlanBlob (final
+    // review M3) — the commit fans out those bytes.  `partitionCount` is the sink's
+    // partition count, resolved on the reply (authoritative, or the source's).
+    struct ViewAwaitingCommit {
+        CreateViewMsg                view;
+        int64_t                      startedNs         = 0;
+        uint64_t                     outputFingerprint = 0;
+        rune::codec::Descriptor      viewOutDesc;
+        rune::codec::Descriptor      viewSrcDesc;
+        int32_t                      partitionCount    = 1;
+        ViewRecord                   viewRecord;     // applied on the HW gate
+        int64_t                      appendedLast      = -1;
+    };
+    using InFlight = std::variant<Idle, DefineAwaitingId, DefineAwaitingCommit,
+                                  AlterAwaitingCommit, ViewAwaitingId, ViewAwaitingCommit>;
 
 private:
     // Rebuild the SchemaRegistry from [0, HW) of the schema replica.
     void rebuildFromLog_();
+    // B4 fix round 1: AwaitingCommit with no replica/catalog -> log, count, answer Internal.
+    void answerMissingCommitReplica_(const char* catalog);
 
     // Task 19b (restart recovery): the view counterpart of rebuildFromLog_, on
     // the SAME Follower->Leader edge.  Rebuild the ViewRegistry from [0, HW) of
@@ -245,19 +356,26 @@ private:
     // CREATE VIEW branch of onCreateTopicReply (Task 19): the sink id came back;
     // stamp it onto the compiled plan, append the durable ViewRecord to __views,
     // and move to AwaitingCommit (gated on the views replica's HW).
-    void onCreateViewReply_(const CreateTopicReplyMsg& reply);
+    void onCreateViewReply_(ViewAwaitingId& op, const CreateTopicReplyMsg& reply);
 
     // CREATE VIEW commit (Task 19), on the HW gate: apply the ViewRecord to the
     // ViewRegistry, register the view's output descriptor in the SchemaRegistry
     // (so GetTopicSchema/openView works — the view is a typed topic), respond OK,
     // and fan the compiled plan out to the workers (pushViewPlan).
-    void commitCreateView_();
+    void commitCreateView_(const ViewAwaitingCommit& op);
 
     // ALTER branch of startNext_ (admin thread, leader-guarded).  Resolves the
     // topic, runs the optimistic-CAS + compatibility gate, applies the ops to
     // the current evolving descriptor and appends the new durable TopicSchema —
     // ATOMIC: on any failure nothing is appended and the version is not bumped.
     void startAlter_(AlterTopicMsg msg, int64_t nowNs);
+    // Answer the in-flight op with `code` in its own response kind (Define /
+    // CreateView / Alter) carrying `topicId`, then go Idle.  The exit for an
+    // in-flight op that ends without committing (case conflict B3).
+    void answerInFlight_(uint16_t code, int32_t topicId);
+    // The topic id an uncommitted in-flight op is answered with on timeout /
+    // demotion / missing commit replica: the ALTER's topic id, else -1.
+    [[nodiscard]] int32_t inFlightAlterTopicId_() const noexcept;
 
     // ── Version-assignment helper (Task 10) ─────────────────────────────────
     // SOURCE OF TRUTH for the version assigned to a schema commit on
@@ -272,57 +390,8 @@ private:
 
     static constexpr uint16_t kInitialSchemaVersion = 1;
 
-    enum class DdlState {
-        Idle,             // nothing in flight
-        AwaitingId,       // requested createTopic; waiting for reply ring (CREATE only)
-        AwaitingCommit,   // appended durable record; waiting for HW to cover it
-    };
-
-    // Which kind of DDL an op (queued or in-flight) is.  CREATE goes through the
-    // createTopic round-trip (AwaitingId); ALTER skips it (topic already exists)
-    // and commits straight to AwaitingCommit.
-    enum class DdlKind { Create, Alter, CreateView };
-
-    // A queued DDL op, discriminated by `kind`.  Exactly one of the message
-    // members is meaningful (shared-nothing cold-path struct; DDL is rare).
-    struct PendingDdl {
-        DdlKind        kind = DdlKind::Create;
-        DefineTopicMsg define;   // kind == Create
-        AlterTopicMsg  alter;    // kind == Alter
-        CreateViewMsg  view;     // kind == CreateView
-    };
-
-    // One queued/in-flight DDL op.  Each state uses exactly its own fields.
-    struct DdlOp {
-        DdlKind        kind          = DdlKind::Create;
-        DefineTopicMsg msg;                  // CREATE
-        AlterTopicMsg  alter;                // ALTER (session/corr for the response)
-        int64_t        ticket        = 0;
-        int32_t        topicId       = -1;   // set on AwaitingId → AwaitingCommit
-        int32_t        partitionCount = 0;   // AUTHORITATIVE count from the create
-                                              // reply (final review I1) — what the
-                                              // schema registry records
-        PersistenceMode persistence  = PersistenceMode::Disk;   // AUTHORITATIVE mode from
-                                              // the create reply (Phase 2b E)
-        int64_t        appendedBase  = -1;   // set on AwaitingCommit (HW must reach it)
-        int64_t        appendedLast  = -1;
-        int64_t        startedNs     = 0;    // for timeout
-        uint16_t       fieldCount    = 0;    // field count of msg.blob's descriptor,
-                                              // captured once during PARSING
-                                              // (startNext_) — seeds nextTag on create.
-        // ── ALTER-only (computed ONCE in startAlter_; Task 10 review note: the
-        //    contiguous version is NOT recomputed later) ──────────────────────
-        uint16_t       newVersion    = 0;    // latest.version + 1
-        TopicSchema    alterSchema;          // the record applied on the HW gate
-
-        // ── CREATE VIEW-only (Task 19; compiled ONCE in startCreateView_) ──────
-        CreateViewMsg                view;              // the request (session/corr/persistence)
-        rune::view::CompiledViewPlan compiledPlan;      // viewTopicId stamped on the reply
-        rune::codec::Descriptor      viewOutDesc;       // output descriptor (registered in reg_)
-        rune::codec::Descriptor      viewSrcDesc;       // source descriptor (fan-out evolvingSrc)
-        uint64_t                     outputFingerprint = 0;
-        ViewRecord                   viewRecord;        // the record applied on the HW gate
-    };
+    // A queued DDL op: exactly one request message (the alternative IS the kind).
+    using PendingDdl = std::variant<DefineTopicMsg, AlterTopicMsg, CreateViewMsg>;
 
     SchemaRegistry&                       reg_;
     rune::replication::PartitionReplica*  replica_;
@@ -342,13 +411,22 @@ private:
     // Set by rebuildFromLog_() on a corrupt/truncated TopicSchema record; see
     // rebuildFailed() above. Admin-thread-owned (no atomics — shared-nothing).
     bool     rebuildFailed_ = false;
+    // M2: the __views counterpart.  While either is set, new DDL is refused
+    // Internal: the registries may miss records past the corrupt one, so a create
+    // could adopt (Task 14 / KL1b) a committed topic's sink.
+    bool     viewsRebuildFailed_ = false;
+    uint64_t refusedForFailedRebuild_ = 0;
+
+    // Final review M4: tests swap the replica pointers through this friend only.
+    friend struct AdminWorkerTestAccess;
 
     // In-flight DDL state machine.
-    DdlState        state_ = DdlState::Idle;
-    std::optional<DdlOp> inFlight_;
+    InFlight        inFlight_;              // Idle when no DDL op is in flight
     std::deque<PendingDdl> pending_;        // queued DDL ops (CREATE + ALTER, serialized); <= kMaxPendingDdl
     uint64_t pendingDdlRefused_ = 0;        // fix round 3: answered Internal because the queue was full
+    uint64_t commitReplicaMissing_ = 0;     // B4 fix round 1: AwaitingCommit with no commit replica
     int64_t         nextTicket_ = 1;
+    uint64_t        started_    = 0;    // ops dequeued by startNext_ (startedCount())
 
     // Timeout for a stuck in-flight op (createTopic reply lost, or HW never
     // advances because leadership was lost) — respond Internal and move on.

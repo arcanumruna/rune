@@ -139,12 +139,13 @@ public:
     }
 
     // Build gateway with optional leader flag.
-    void buildGateway(bool isLeader = true)
+    void buildGateway(bool isLeader = true, std::vector<TopicSpec> extraSpecs = {})
     {
         std::vector<TopicSpec> specs = {
             makeSpec("alpha", 2, kTopicAlpha),
             makeSpec("beta",  1, kTopicBeta),
         };
+        for (TopicSpec& ts : extraSpecs) specs.push_back(std::move(ts));
         topicReg_ = std::make_unique<TopicRegistry>(specs, tmpDir_->path.string());
 
         auto leaderViewFn = [isLeader]() -> LeaderView {
@@ -575,6 +576,59 @@ TEST_F(MetadataRequestFixture, Regression_OtherMessagesStillDispatch)
     // Connect → should still get a ConnectResponse{OK}.
     const int64_t sid = connectClient(client, /*correlationId=*/500);
     EXPECT_GT(sid, 0) << "Connect should still work after Metadata wiring";
+}
+
+// ===========================================================================
+// DDL conformance Task 12 (D1): the routing image is replicated state and can
+// outlive a partition the TopicRegistry no longer has — e.g. a runtime topic whose
+// DDL never committed is recovered at the next boot as a ZERO-partition
+// __orphan.<id> placeholder, while __cluster_metadata still holds the assignment
+// made before the restart.  The listing must follow the registry's partition
+// count: a placeholder (and any partition past a topic's count) is never listed.
+// ===========================================================================
+class MetadataStaleAssignmentRegression : public MetadataRequestFixture {};
+
+TEST_F(MetadataStaleAssignmentRegression, PartitionsBeyondTheRegisteredCountAreNotListed)
+{
+    constexpr int32_t kPlaceholder = 2;
+    buildGateway(/*isLeader=*/true, {makeSpec("__orphan.2", 0, kPlaceholder)});
+    auto img = md::RoutingImage::build(std::vector<md::RoutingImage::BuildEntry>{
+        {gpid(kTopicAlpha, 0),   kThisNodeId, 1},
+        {gpid(kTopicAlpha, 1),   kThisNodeId, 1},
+        {gpid(kTopicBeta,  0),   kThisNodeId, 1},
+        {gpid(kTopicBeta,  1),   kThisNodeId, 1},   // stale: beta has ONE partition
+        {gpid(kPlaceholder, 0),  kThisNodeId, 1},   // stale: the placeholder has none
+    });
+    gw_->setRoutingImageSnapshot(img);
+
+    const int64_t sid = gw_->injectTestSession(nowNs());
+    std::optional<pc::MetadataResponse::Decoded> captured;
+    gw_->setOnEgressFrame([&](int64_t, const uint8_t* buf, std::size_t len) {
+        auto dec = pc::MetadataResponse::decode(buf, len);
+        if (dec && dec->correlationId == 600) captured = std::move(dec);
+    });
+    auto client = makeClient(kEgressBase + 6);
+    pump([&]() { return client.ingressPub->isConnected(); },
+         nullptr, nullptr, kPumpIter, "waitConnected");
+
+    for (const std::vector<int32_t>& filter : {std::vector<int32_t>{}, std::vector<int32_t>{kPlaceholder}}) {
+        captured.reset();
+        pc::MetadataRequest req;
+        req.sessionId     = sid;
+        req.correlationId = 600;
+        req.topicIds      = std::span<const int32_t>(filter.data(), filter.size());
+        std::vector<uint8_t> reqBuf(req.encodedSize());
+        req.encode(reqBuf.data());
+        offerBounded(*client.ingressPub, reqBuf.data(), reqBuf.size(), "MetadataReqStale");
+        pump([&]() { return captured.has_value(); },
+             nullptr, nullptr, kPumpIter, "MetadataResponseStale");
+        ASSERT_TRUE(captured.has_value());
+        for (const auto& p : captured->partitions) {
+            EXPECT_NE(p.topicId, kPlaceholder) << "a zero-partition placeholder is never listed";
+            EXPECT_FALSE(p.topicId == kTopicBeta && p.partition == 1) << "beta has one partition";
+        }
+        EXPECT_EQ(captured->partitions.size(), filter.empty() ? 3u : 0u);
+    }
 }
 
 } // namespace

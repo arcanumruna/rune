@@ -65,11 +65,18 @@ enum : int32_t {
 //   kA2cSchemaUpdate   : [topicId:i32][descriptor blob] (F3 round 6, item 3:
 //                        the control thread — the ONLY producer of the worker
 //                        SPSC ingress rings — fans it out to every worker)
+//   kA2cTopicCommitted : [topicId:i32] (B10 / D4 fix round 1: the topic's catalog
+//                        record committed; the control thread rewrites its
+//                        topic-id marker pending -> committed)
 // ---------------------------------------------------------------------------
 enum : int32_t {
     kA2cStorageFailure = 1,
     kA2cSchemaUpdate   = 2,
     kA2cViewPlanUpdate = 3,   // Task 19: admin → control, fan out a compiled view plan
+    // B10 / D4 fix round 1: [topicId:i32] — a runtime topic's catalog record
+    // (DefineTopic schema / CreateView record) COMMITTED; the control thread (owner
+    // of TopicRegistry) rewrites its topic-id marker pending -> committed.
+    kA2cTopicCommitted = 4,
 };
 
 // ---------------------------------------------------------------------------
@@ -197,6 +204,24 @@ struct CreateTopicReplyMsg {
     // kPersistenceNotReported = frame without it (caller keeps the requested mode).
     static constexpr uint8_t kPersistenceNotReported = 0xff;
     uint8_t persistence    = kPersistenceNotReported;
+    // DDL conformance B3: the requested name differs only in ASCII case from the
+    // existing topic `topicId` (existed = true): nothing was created and the admin
+    // thread answers TopicExists.  Ring trailer byte 18; absent => false.
+    bool    caseConflict   = false;
+    // OPTIONAL KL1 follow-up: the existing topic is a RUNTIME topic whose spec is
+    // exactly the requested view sink's (Compact, key, partitions, mode) — the admin
+    // thread may adopt it when no catalog record claims it (its own orphan sink).
+    // Ring trailer byte 19; absent => false.
+    // Final review I1: also requires the topic to be UNCOMMITTED (not servable — so
+    // nothing could have been acknowledged into it) and every partition log EMPTY
+    // (read by the control thread, which alone has touched an uncommitted topic).
+    bool    sinkSpecMatches = false;
+    // Final review I2: the existing topic is a RUNTIME topic with the Compact
+    // cleanup policy — only a CREATE VIEW sink is one (DefineTopic creates Delete
+    // topics).  The admin thread answers a DefineTopic over it TopicExists (25):
+    // a view sink is never adopted as a typed topic (KL1b closed), so the two
+    // catalogs never both claim one id.  Ring trailer byte 20; absent => false.
+    bool    existingIsRuntimeCompact = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -439,7 +464,7 @@ inline CreateTopicReqMsg decodeCreateTopicReq(const uint8_t* buf, std::size_t le
     m.cleanupPolicy = buf[pos++];
     if (pos < len) {   // Phase 2b E; absent => disk
         if (buf[pos] > 1) {   // unknown mode: never cast it — a nameless request fails
-            m.name.clear();   // on the control thread (createTopic rejects "")
+            m.name.clear();   // on the control thread (createTopicForAdmin refuses an invalid name)
             m.partitionCount = 0;
             return m;
         }
@@ -451,7 +476,7 @@ inline CreateTopicReqMsg decodeCreateTopicReq(const uint8_t* buf, std::size_t le
 // ---- CreateTopicReply ----
 inline bool encodeCreateTopicReply(OneToOneByteRing& ring, const CreateTopicReplyMsg& m) {
     using namespace admin_wire;
-    const std::size_t len = 8 + 4 + 4 + 1 + 1;
+    const std::size_t len = 8 + 4 + 4 + 1 + 1 + 1 + 1 + 1;
     const auto idx = ring.tryClaim(kMsgCreateTopicReply, len);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
@@ -459,7 +484,10 @@ inline bool encodeCreateTopicReply(OneToOneByteRing& ring, const CreateTopicRepl
     putI32(p, m.topicId); p += 4;
     putI32(p, m.partitionCount); p += 4;
     *p++ = m.existed ? 1 : 0;
-    *p   = m.persistence;
+    *p++ = m.persistence;
+    *p++ = m.caseConflict ? 1 : 0;      // DDL conformance B3 trailer
+    *p++ = m.sinkSpecMatches ? 1 : 0;   // Task 14 (KL1 follow-up) trailer
+    *p   = m.existingIsRuntimeCompact ? 1 : 0;   // final review I2 trailer
     ring.commit(idx);
     return true;
 }
@@ -474,9 +502,15 @@ inline CreateTopicReplyMsg decodeCreateTopicReply(const uint8_t* buf, std::size_
     m.partitionCount = getI32(buf + 12);
     m.existed        = buf[16] != 0;
     if (len < 18) return m;   // pre-2b-E frame: persistence not reported
+    if (len >= 19) m.caseConflict = buf[18] != 0;   // DDL conformance B3 trailer
+    if (len >= 20) m.sinkSpecMatches = buf[19] != 0;   // Task 14 (KL1 follow-up) trailer
+    if (len >= 21) m.existingIsRuntimeCompact = buf[20] != 0;   // final review I2 trailer
     if (buf[17] == CreateTopicReplyMsg::kPersistenceNotReported) return m;
     if (buf[17] > 1) {        // unknown mode: never cast — fail the create
-        m.topicId = -1;
+        m.topicId      = -1;
+        m.caseConflict = false;   // a failed create is Internal, never TopicExists
+        m.sinkSpecMatches = false;   // nor an adoptable sink
+        m.existingIsRuntimeCompact = false;
         return m;
     }
     m.persistence = buf[17];
@@ -615,6 +649,24 @@ inline ViewPlanUpdateMsg decodeViewPlanUpdate(const uint8_t* buf, std::size_t le
     if (!readBlob(m.outDescBlob)) return m;
     (void)readBlob(m.srcDescBlob);
     return m;
+}
+
+// ---- TopicCommitted (admin → control; B10 / D4 fix round 1) ----
+// Layout: [topicId:i32].
+inline constexpr std::size_t kTopicCommittedWireLen = 4;
+
+inline bool encodeTopicCommitted(OneToOneByteRing& ring, int32_t topicId) {
+    const auto idx = ring.tryClaim(kA2cTopicCommitted, kTopicCommittedWireLen);
+    if (idx < 0) return false;
+    admin_wire::putI32(ring.base() + idx, topicId);
+    ring.commit(idx);
+    return true;
+}
+
+/// The committed topic id, or -1 on a malformed (short) frame.
+[[nodiscard]] inline int32_t decodeTopicCommitted(const uint8_t* buf, std::size_t len) {
+    if (len < kTopicCommittedWireLen) return -1;
+    return admin_wire::getI32(buf);
 }
 
 // ---- F3 round 7, item 4: descriptor size is bounded BY CONSTRUCTION ----

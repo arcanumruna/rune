@@ -24,6 +24,7 @@
 #include <cassert>
 #include <rune/protocol/client/SchemaMessages.h>
 #include <cstdlib>
+#include <limits>
 #include <rune/gateway/SpillFifo.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/consensus/ControlRing.h>   // Task 9: tlsReloadRing_ (SIGHUP trigger)
@@ -53,6 +54,7 @@
 #include <rune/node/AdminWorker.h>
 #include <rune/node/AdminChannels.h>
 #include <rune/node/AdminControlPlane.h>
+#include <rune/node/DdlAnswerGate.h>
 #include <rune/node/SchemaFanout.h>
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/ViewSnapshotIoAgent.h>
@@ -335,7 +337,11 @@ public:
         // 4b. F3 round 6, item 3: retry SchemaUpdates the admin→control ring
         //     could not take (full) — retry-on-full, never a drop.
         if (!schemaBacklog_.empty()) [[unlikely]] work += flushSchemaBacklog_();
-        if (!viewPlanBacklog_.empty()) [[unlikely]] work += flushViewPlanBacklog_();  // Task 19
+        // C1: commits before plans — a view plan never overtakes its sink's commit
+        // (the control thread builds the sink's replicas on kA2cTopicCommitted).
+        if (!topicCommittedBacklog_.empty()) [[unlikely]] work += flushTopicCommittedBacklog_();  // B10
+        if (!viewPlanBacklog_.empty() && topicCommittedBacklog_.empty()) [[unlikely]]
+            work += flushViewPlanBacklog_();  // Task 19
         if (!egressBacklog_.empty()) [[unlikely]] work += flushEgressBacklog_();       // no-hang R2 / fix round 2
 
         // 5. fsyncgate (Task 10 fix 3 / I1): the schema log this thread drives
@@ -470,10 +476,25 @@ public:
                           vp.viewTopicId, viewPlanUpdateWireLen(vp), failureRing_.maxMsgLength());
             return;
         }
-        if (!viewPlanBacklog_.empty() ||
+        // C1: behind any backlogged commit too — a plan never overtakes its sink's
+        // kA2cTopicCommitted on the ring (the commits flush first, see doWork).
+        if (!viewPlanBacklog_.empty() || !topicCommittedBacklog_.empty() ||
             !encodeViewPlanUpdate(failureRing_, kA2cViewPlanUpdate, vp))
             viewPlanBacklog_.push_back(vp);   // keep FIFO order
     }
+
+    /// B10 / D4 fix round 1 — ADMIN thread only (deps.topicCommitted).  Post
+    /// kA2cTopicCommitted on the admin→control ring; the control thread rewrites
+    /// the topic's dir marker pending -> committed.  Ring full → admin-owned
+    /// backlog, retried every doWork (FIFO, never dropped).
+    void postTopicCommitted(int32_t topicId) {
+        if (!topicCommittedBacklog_.empty() || !encodeTopicCommitted(failureRing_, topicId))
+            topicCommittedBacklog_.push_back(topicId);
+    }
+    [[nodiscard]] std::size_t topicCommittedBacklogForTest() const noexcept {
+        return topicCommittedBacklog_.size();
+    }
+    int flushTopicCommittedBacklogForTest() { return flushTopicCommittedBacklog_(); }
 
     // -----------------------------------------------------------------------
     // Producer-side accessors — the gateway/control thread enqueues here.
@@ -507,6 +528,7 @@ private:
     bool             storageFailureSignalled_ = false;
     std::vector<SchemaUpdateMsg> schemaBacklog_;   // admin-thread-owned (ring-full retry)
     std::vector<ViewPlanUpdateMsg> viewPlanBacklog_; // Task 19: admin-owned (ring-full retry)
+    std::vector<int32_t> topicCommittedBacklog_;     // B10 fix round 1: admin-owned (ring-full retry)
     // Fix round 2: preallocated, bounded (was an unbounded vector<vector> with
     // O(n) front erase).  4x the ring: one tick's answers fit by construction.
     static constexpr std::size_t kEgressBacklogBytes = 4u * static_cast<std::size_t>(kAdminEgressRingBytes);
@@ -551,6 +573,16 @@ private:
             ++sent;
         schemaBacklog_.erase(schemaBacklog_.begin(),
                              schemaBacklog_.begin() + static_cast<std::ptrdiff_t>(sent));
+        return static_cast<int>(sent);
+    }
+
+    int flushTopicCommittedBacklog_() {
+        std::size_t sent = 0;
+        while (sent < topicCommittedBacklog_.size() &&
+               encodeTopicCommitted(failureRing_, topicCommittedBacklog_[sent]))
+            ++sent;
+        topicCommittedBacklog_.erase(topicCommittedBacklog_.begin(),
+                                     topicCommittedBacklog_.begin() + static_cast<std::ptrdiff_t>(sent));
         return static_cast<int>(sent);
     }
 
@@ -646,6 +678,19 @@ public:
     void skipProvisionerRunnerForTest() noexcept { skipProvisionerRunnerForTest_ = true; }
     /// Test-only: during start(), re-run the SCHEMA log's recovery with this msync errno.
     void setSchemaRecoveryFaultForTest(int err) noexcept { schemaRecoveryFaultForTest_ = err; }
+    /// Test-only (DDL conformance): the control thread answers the FIRST admin
+    /// create-topic request for `name` with a failure.  afterCreate=false fails
+    /// before creating; true creates the topic first (the reply is lost after the
+    /// work — an orphan).  Set before start(); afterwards only the control thread
+    /// reads/writes it (single owner).
+    void setAdminCreateFaultForTest(std::string name, bool afterCreate) {
+        adminCreateFault_ = AdminCreateFaultForTest{std::move(name), afterCreate};
+    }
+    /// Test-only (concern 4): building the replicas of the runtime topic `name`
+    /// fails when its record commits (kA2cTopicCommitted) — the topic never serves,
+    /// so its held DDL OK must be answered Internal (in doubt).  Set before start();
+    /// afterwards only the control thread reads it.
+    void setCommitReplicaFaultForTest(std::string name) { commitReplicaFault_ = std::move(name); }
 
     // -----------------------------------------------------------------------
     // Observers (F9a: ring-fed, no atomics)
@@ -1261,6 +1306,11 @@ private:
     // Task 8a: last leadership state posted to the admin role ring (control thread).
     bool                                                  adminLastLeader_ = false;
     int32_t                                               adminLastEpoch_  = -1;
+    // Task 14: the static RUNE_TOPICS count, set once on the startup thread before the
+    // recovery append (ids >= it are runtime topics); read by the control thread's
+    // create drain (createTopicForAdmin's firstRuntimeId).  Immutable after start.
+    // Defaults to "never matches" (fail-closed) until start() sets it.
+    int32_t                                               firstRuntimeTopicId_ = std::numeric_limits<int32_t>::max();
     std::unique_ptr<rune::consensus::BackoffIdleStrategy> adminWorkerIdleStrategy_;   // NodeConfig::adminIdleShape
     rune::consensus::MonotonicNanoClock                   adminWorkerClock_;
     std::unique_ptr<rune::consensus::AgentRunner>         adminWorkerRunner_;
@@ -1299,6 +1349,21 @@ private:
     int  recoveryFaultForTest_ = 0;
     bool skipProvisionerRunnerForTest_ = false;
     int  schemaRecoveryFaultForTest_ = 0;
+    // Final review M4: ONE armed test fault (no loose flags) — disarmed when it fires.
+    struct AdminCreateFaultForTest {
+        std::string name;          // the first create request for this name fails
+        bool        afterCreate;   // true: the topic is created first (an orphan)
+    };
+    std::optional<AdminCreateFaultForTest> adminCreateFault_;   // control thread after start()
+    std::optional<std::string>             commitReplicaFault_; // control thread after start()
+    // C1 / M7: a DefineTopic / CreateView OK leaves only once its topic serves
+    // (see DdlAnswerGate.h).  Control-thread-owned; one drain of the admin egress
+    // ring (16 frames of at most a ring message each) always fits.
+    static constexpr int64_t kDdlAnswerMaxHoldNs = 5'000'000'000LL;
+    DdlAnswerGate ddlAnswerGate_{2u * static_cast<std::size_t>(kAdminRequestRingBytes) + 4096u,
+                                 kDdlAnswerMaxHoldNs};
+    uint64_t      ddlAnswersOverdue_ = 0;   // control thread only: held OKs answered Internal (in doubt)
+    [[nodiscard]] bool ddlTopicServes_(int32_t topicId) const noexcept;
     int32_t                                      shardResolveStallWorkerForTest_ = -1;
     std::chrono::milliseconds                    shardResolveStallForTest_{0};
     void buildShardRuntimes_();

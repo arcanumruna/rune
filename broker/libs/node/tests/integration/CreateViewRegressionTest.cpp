@@ -22,6 +22,7 @@
 // (installViewForRecovery / driveRebuild — Task 19b).
 // ---------------------------------------------------------------------------
 
+#include <unistd.h>
 #include <gtest/gtest.h>
 
 #include <rune/node/AdminWorker.h>
@@ -69,7 +70,9 @@ namespace {
 std::string uniqSuffix() {
     static std::atomic<uint64_t> seq{0};
     const auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
-    return std::to_string(seq.fetch_add(1, std::memory_order_relaxed)) + "_" + std::to_string(ts);
+    // The pid keeps ctest -j parallel PROCESSES apart (each starts seq at 0 and the
+    // clock can tick identically in two of them; a shared dir was removed under a peer).
+    return std::to_string(::getpid()) + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed)) + "_" + std::to_string(ts);
 }
 
 struct TmpDir {
@@ -166,6 +169,7 @@ protected:
             return true;
         };
         deps.pushValidators = [](const RegistryEntry&, int32_t) {};
+        deps.topicCommitted = [this](int32_t topicId) { committedIds_.push_back(topicId); };
         deps.respondDefine  = [this](int64_t, int64_t, int32_t topicId, uint16_t, uint16_t err) {
             lastDefineTopicId_ = topicId; lastDefineError_ = err;
             defineResults_.push_back(err);
@@ -282,6 +286,7 @@ protected:
     int32_t  lastDefineTopicId_ = -1;
     uint16_t lastDefineError_   = 0xffff;
     int32_t  lastViewTopicId_   = -2;
+    std::vector<int32_t> committedIds_;   // B10 fix round 1: deps.topicCommitted
     uint64_t lastViewFinger_    = 0;
     uint16_t lastViewError_     = 0xffff;
     std::string lastSinkKeyField_;
@@ -333,6 +338,10 @@ TEST_F(CreateViewRegression, CreateViewPersistsCompilesAndInstalls) {
     cv2.corr = 21;
     driveCreateView(cv2);
     EXPECT_EQ(lastViewError_, static_cast<uint16_t>(pc::ErrorCode::ViewExists));
+
+    // 8. B10 fix round 1 (I1): the source's DefineTopic and the view sink's record
+    //    each signalled "committed" exactly once; the refused duplicate did not.
+    EXPECT_EQ(committedIds_, (std::vector<int32_t>{srcTopicId, lastViewTopicId_}));
 }
 
 namespace {

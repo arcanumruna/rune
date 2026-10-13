@@ -47,6 +47,7 @@
 
 #include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/PartitionHash.h>
@@ -1351,4 +1352,268 @@ TEST(SchemaGatewayRegression, OversizedTopicSchemaAnswerIsMessageTooLargeRegress
     EXPECT_EQ(got->errorCode, static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge));
     EXPECT_EQ(got->descriptorLen, 0u);
     EXPECT_EQ(agent.egressBacklogForTest(), 0u);
+}
+
+// ===========================================================================
+// DDL conformance plan Task 11 — wire-level cells through the gateway with the
+// control thread played by createTopicForAdmin over the REAL TopicRegistry.
+// ===========================================================================
+namespace {
+
+// ── control-thread adoption of a schema-less static topic ────────────────────
+struct AdoptCase {
+    const char* label; PersistenceMode staticMode; int32_t staticParts;
+    uint8_t definePersistence; uint32_t requestParts; uint16_t wantCode; PersistenceMode wantRecorded;
+};
+void PrintTo(const AdoptCase& c, std::ostream* os) { *os << c.label; }
+const AdoptCase kAdoptCases[] = {
+    {"DiskStatic_DiskDefine_MorePartitions",  PersistenceMode::Disk,      3, 0, 8, 0,  PersistenceMode::Disk},
+    {"DiskStatic_DiskDefine_FewerPartitions", PersistenceMode::Disk,      3, 0, 1, 0,  PersistenceMode::Disk},
+    {"DiskStatic_TransientDefine",            PersistenceMode::Disk,      3, 1, 3, 25, PersistenceMode::Disk},
+    {"TransientStatic_DiskDefine",            PersistenceMode::Transient, 2, 0, 5, 0,  PersistenceMode::Transient},
+    {"TransientStatic_TransientDefine",       PersistenceMode::Transient, 2, 1, 2, 0,  PersistenceMode::Transient},
+};
+
+class SchemaGatewayAdoptionRegression : public ::testing::TestWithParam<AdoptCase> {};
+
+TEST_P(SchemaGatewayAdoptionRegression, DefineOverStaticSchemaLessTopic) {
+    const AdoptCase& c = GetParam();
+    SgHarness h;
+    h.realControl = true;
+    rune::node::TopicSpec boot;
+    boot.name = "orders"; boot.partitionCount = c.staticParts; boot.persistence = c.staticMode;
+    const int32_t id = h.topicReg->createTopic(boot);
+    const int32_t topicsBefore = h.topicReg->topicCount();
+    const int64_t schemaEnd = h.schemaLog.logEndOffset();
+
+    const auto def = encodeDefineFrame(1, 1, "orders", c.requestParts, "userId", false, charsBlob(),
+                                       c.definePersistence);
+    h.gw.applyDefineTopicForTest(def.data(), def.size());
+    h.pump();
+    const auto r = firstFrame<pc::DefineTopicResponse>(h);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, c.wantCode);
+    EXPECT_EQ(h.topicReg->topicCount(), topicsBefore) << "adoption never creates a second topic";
+    EXPECT_EQ(h.topicReg->topic(id)->persistence, c.staticMode) << "the live topic keeps its backend";
+    EXPECT_EQ(h.topicReg->topic(id)->partitionCount, c.staticParts);
+    if (c.wantCode == 0) {
+        EXPECT_EQ(r->topicId, id);
+        const RegistryEntry* e = h.schemaReg.byName("orders");
+        ASSERT_NE(e, nullptr);
+        EXPECT_EQ(e->persistence, c.wantRecorded);
+        EXPECT_EQ(e->partitionCount, c.staticParts) << "the authoritative count, never the requested one";
+        EXPECT_EQ(h.schemaLog.logEndOffset(), schemaEnd + 1);
+    } else {
+        EXPECT_EQ(h.schemaReg.byName("orders"), nullptr);
+        EXPECT_EQ(h.schemaLog.logEndOffset(), schemaEnd);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(Ddl, SchemaGatewayAdoptionRegression, ::testing::ValuesIn(kAdoptCases),
+    [](const ::testing::TestParamInfo<AdoptCase>& i) { return std::string(i.param.label); });
+
+// ── names over the wire (B1/B2/B3/B6) ────────────────────────────────────────
+struct WireNameCase { const char* label; std::string name; uint32_t parts; uint16_t wantCode; };
+void PrintTo(const WireNameCase& c, std::ostream* os) { *os << c.label; }
+const WireNameCase kWireNameCases[] = {
+    {"Empty",              "",                     1, 40},
+    {"Slash",              "a/b",                  1, 40},
+    {"DotDot",             "..",                   1, 40},
+    {"ReservedViews",      "__views",              1, 40},
+    {"ReservedSchemas",    "__topic_schemas",      1, 40},
+    {"TooLong",            std::string(250, 'x'),  1, 40},
+    {"CaseOfStaticEvents", "Events",               1, 25},
+    {"ZeroPartitions",     "fresh",                0, 23},
+};
+
+class SchemaGatewayNameRegression : public ::testing::TestWithParam<WireNameCase> {};
+
+TEST_P(SchemaGatewayNameRegression, DefineIsRejectedAndCreatesNothing) {
+    const WireNameCase& c = GetParam();
+    SgHarness h;   // static "events" (id 0)
+    h.realControl = true;
+    const int32_t topicsBefore = h.topicReg->topicCount();
+    const int64_t schemaEnd = h.schemaLog.logEndOffset();
+    const auto def = encodeDefineFrame(1, 9, c.name, c.parts, "userId", false, charsBlob());
+    h.gw.applyDefineTopicForTest(def.data(), def.size());
+    h.pump();
+    const auto r = firstFrame<pc::DefineTopicResponse>(h);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->correlationId, 9);
+    EXPECT_EQ(r->errorCode, c.wantCode);
+    EXPECT_EQ(h.topicReg->topicCount(), topicsBefore);
+    EXPECT_EQ(h.schemaLog.logEndOffset(), schemaEnd);
+    EXPECT_FALSE(h.topicReg->topicIdForName(c.name).has_value());
+}
+
+INSTANTIATE_TEST_SUITE_P(Ddl, SchemaGatewayNameRegression, ::testing::ValuesIn(kWireNameCases),
+    [](const ::testing::TestParamInfo<WireNameCase>& i) { return std::string(i.param.label); });
+
+// ── malformed frames: every DDL op with a corrupt body is ANSWERED (never times out)
+enum class DdlFrame : uint8_t { Define, CreateView, Alter, GetSchema };
+enum class Corruption : uint8_t { UnknownPersistenceByte, HeaderOnly, CutMidBody, UnknownSession };
+struct MalformedCase { const char* label; DdlFrame kind; Corruption corruption; };
+void PrintTo(const MalformedCase& c, std::ostream* os) { *os << c.label; }
+constexpr int64_t kMalformedCorr = 4242;
+
+std::vector<uint8_t> validDdlFrame(DdlFrame k, int64_t session) {
+    switch (k) {
+        case DdlFrame::Define:
+            return encodeDefineFrame(session, kMalformedCorr, "orders", 1, "userId", false, charsBlob(),
+                                     pc::DefineTopic::kPersistenceTransient);
+        case DdlFrame::CreateView: {
+            const std::vector<uint8_t> plan{1, 2, 3};
+            pc::CreateView m;
+            m.sessionId = session; m.correlationId = kMalformedCorr; m.viewName = "v"; m.keyField = "id";
+            m.persistence = 1; m.planBlob = plan.data(); m.planLen = static_cast<uint32_t>(plan.size());
+            std::vector<uint8_t> f(m.encodedSize());
+            m.encode(f.data());
+            return f;
+        }
+        case DdlFrame::Alter:
+            return encodeAlterFrame(session, kMalformedCorr, "orders", 0, {});
+        case DdlFrame::GetSchema: {
+            pc::GetTopicSchema g;
+            g.sessionId = session; g.correlationId = kMalformedCorr; g.topicName = "orders";
+            std::vector<uint8_t> f(g.encodedSize());
+            g.encode(f.data());
+            return f;
+        }
+    }
+    return {};
+}
+
+std::vector<uint8_t> corrupt(DdlFrame k, Corruption c) {
+    std::vector<uint8_t> f = validDdlFrame(k, c == Corruption::UnknownSession ? 99 : 1);
+    switch (c) {
+        case Corruption::UnknownPersistenceByte:
+        case Corruption::UnknownSession:   // corrupt body on a session the gateway does not know
+            if (k == DdlFrame::Define)          f.back() = 2;
+            else if (k == DdlFrame::CreateView) f[pc::MessageHeader::ENCODED_SIZE] = 2;
+            else                                f.resize(pc::MessageHeader::ENCODED_SIZE);
+            break;
+        case Corruption::HeaderOnly:
+            f.resize(pc::MessageHeader::ENCODED_SIZE);
+            break;
+        case Corruption::CutMidBody:
+            f.resize(f.size() - 3);
+            break;
+    }
+    return f;
+}
+
+bool decodes(DdlFrame k, const std::vector<uint8_t>& f) {
+    switch (k) {
+        case DdlFrame::Define:     return pc::DefineTopic::decode(f.data(), f.size()).has_value();
+        case DdlFrame::CreateView: return pc::CreateView::decode(f.data(), f.size()).has_value();
+        case DdlFrame::Alter:      return pc::AlterTopic::decode(f.data(), f.size()).has_value();
+        case DdlFrame::GetSchema:  return pc::GetTopicSchema::decode(f.data(), f.size()).has_value();
+    }
+    return false;
+}
+
+void apply(SgHarness& h, DdlFrame k, const std::vector<uint8_t>& f) {
+    switch (k) {
+        case DdlFrame::Define:     h.gw.applyDefineTopicForTest(f.data(), f.size()); break;
+        case DdlFrame::CreateView: h.gw.applyCreateViewForTest(f.data(), f.size()); break;
+        case DdlFrame::Alter:      h.gw.applyAlterTopicForTest(f.data(), f.size()); break;
+        case DdlFrame::GetSchema:  h.gw.applyGetTopicSchemaForTest(f.data(), f.size()); break;
+    }
+}
+
+/// Frames answering `corr`: the op's OWN response type carrying InvalidSchema (23) —
+/// the no-hang wave's rule (RequestRejection.h::encodeRejection).  Any other frame on
+/// `corr` (a generic ErrorResponse, another code) is counted in `other`.
+template <class R>
+int errorAnswers(const SgHarness& h, int64_t corr, int& other) {
+    int n = 0;
+    for (const auto& [sid, bytes] : h.captured) {
+        if (auto r = R::decode(bytes.data(), bytes.size()); r && r->correlationId == corr) {
+            if (r->errorCode == static_cast<uint16_t>(pc::ErrorCode::InvalidSchema)) ++n; else ++other;
+        } else if (auto e = pc::ErrorResponse::decode(bytes.data(), bytes.size()); e && e->correlationId == corr) {
+            ++other;
+        }
+    }
+    return n;
+}
+int errorAnswersFor(const SgHarness& h, DdlFrame k, int& other) {
+    switch (k) {
+        case DdlFrame::Define:     return errorAnswers<pc::DefineTopicResponse>(h, kMalformedCorr, other);
+        case DdlFrame::CreateView: return errorAnswers<pc::CreateViewResponse>(h, kMalformedCorr, other);
+        case DdlFrame::Alter:      return errorAnswers<pc::AlterTopicResponse>(h, kMalformedCorr, other);
+        case DdlFrame::GetSchema:  return errorAnswers<pc::TopicSchemaResponse>(h, kMalformedCorr, other);
+    }
+    return 0;
+}
+
+const MalformedCase kMalformedCases[] = {
+    {"Define_UnknownPersistenceByte",     DdlFrame::Define,     Corruption::UnknownPersistenceByte},
+    {"Define_HeaderOnly",                 DdlFrame::Define,     Corruption::HeaderOnly},
+    {"Define_CutMidBody",                 DdlFrame::Define,     Corruption::CutMidBody},
+    {"Define_UnknownSession",             DdlFrame::Define,     Corruption::UnknownSession},
+    {"CreateView_UnknownPersistenceByte", DdlFrame::CreateView, Corruption::UnknownPersistenceByte},
+    {"CreateView_HeaderOnly",             DdlFrame::CreateView, Corruption::HeaderOnly},
+    {"CreateView_CutMidBody",             DdlFrame::CreateView, Corruption::CutMidBody},
+    {"CreateView_UnknownSession",         DdlFrame::CreateView, Corruption::UnknownSession},
+    {"Alter_HeaderOnly",                  DdlFrame::Alter,      Corruption::HeaderOnly},
+    {"Alter_CutMidBody",                  DdlFrame::Alter,      Corruption::CutMidBody},
+    {"Alter_UnknownSession",              DdlFrame::Alter,      Corruption::UnknownSession},
+    {"GetSchema_HeaderOnly",              DdlFrame::GetSchema,  Corruption::HeaderOnly},
+    {"GetSchema_CutMidBody",              DdlFrame::GetSchema,  Corruption::CutMidBody},
+    {"GetSchema_UnknownSession",          DdlFrame::GetSchema,  Corruption::UnknownSession},
+};
+
+class SchemaGatewayMalformedDdlRegression : public ::testing::TestWithParam<MalformedCase> {};
+
+TEST_P(SchemaGatewayMalformedDdlRegression, CorruptBodyIsAnsweredNeverDropped) {
+    const MalformedCase& c = GetParam();
+    SgHarness h;
+    h.realControl = true;
+    const std::vector<uint8_t> f = corrupt(c.kind, c.corruption);
+    ASSERT_FALSE(decodes(c.kind, f)) << "precondition: the frame body really is corrupt";
+    const int64_t schemaEnd = h.schemaLog.logEndOffset();
+    const int32_t topicsBefore = h.topicReg->topicCount();
+
+    apply(h, c.kind, f);
+    h.pump();
+
+    if (c.corruption == Corruption::UnknownSession) {
+        // No session to answer on: the only DDL frame that is not answered (counted + warn-logged).
+        EXPECT_TRUE(h.captured.empty()) << "nothing is sent to an unknown session";
+    } else {
+        int other = 0;
+        EXPECT_EQ(errorAnswersFor(h, c.kind, other), 1)
+            << "exactly one own-type InvalidSchema (23) answer on correlationId " << kMalformedCorr
+            << " — none may time out";
+        EXPECT_EQ(other, 0) << "no second / differently-coded answer";
+    }
+    EXPECT_EQ(h.admin->pendingCount(), 0u) << "a corrupt frame never reaches the admin queue";
+    EXPECT_EQ(h.schemaLog.logEndOffset(), schemaEnd);
+    EXPECT_EQ(h.topicReg->topicCount(), topicsBefore);
+}
+
+INSTANTIATE_TEST_SUITE_P(Ddl, SchemaGatewayMalformedDdlRegression, ::testing::ValuesIn(kMalformedCases),
+    [](const ::testing::TestParamInfo<MalformedCase>& i) { return std::string(i.param.label); });
+
+} // namespace
+
+// ── reads / alters of a schema-less static topic (Occupant SchemaLessDisk) ────
+TEST(SchemaGatewayStaticRegression, GetSchemaOfStaticSchemaLessTopicIsUnknownTopic) {
+    SgHarness h;
+    h.realControl = true;
+    const auto r = getSchema(h, "events", 31);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, 7u);
+}
+
+TEST(SchemaGatewayStaticRegression, AlterOfStaticSchemaLessTopicIsUnknownTopic) {
+    SgHarness h;
+    h.realControl = true;
+    const auto f = encodeAlterFrame(1, 32, "events", 0, rune::codec::encodeAlterOps({addColumnOp("x", PrimType::Int64)}));
+    h.gw.applyAlterTopicForTest(f.data(), f.size());
+    h.pump();
+    const auto r = firstFrame<pc::AlterTopicResponse>(h);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, 7u);
+    EXPECT_EQ(h.schemaReg.byName("events"), nullptr);
 }

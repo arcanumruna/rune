@@ -16,6 +16,7 @@
 #include <rune/aeronutil/testing/FreePort.h>
 #include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
+#include <rune/gateway/TopicRegistry.h>
 #include <rune/node/HostDefaults.h>
 #include <rune/node/Worker.h>
 #include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
@@ -2000,6 +2001,184 @@ TEST(BrokerNodeRegression, RuntimeTransientTopicIsInMemoryAndRestartsEmptyRegres
         EXPECT_FALSE(fs::exists(dir / "topics" / "presence"));
         node.stop();
     }
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
+// B10 / D4 fix round 1 (I1): the REAL production path of the two-phase topic-id
+// marker on a live single-node BrokerNode.  A client DefineTopic → the control
+// thread's createTopic writes "pending <id>" → the admin thread commits the
+// __topic_schemas record (HW gate) → deps.topicCommitted → kA2cTopicCommitted on
+// the admin→control ring → the control thread (TopicRegistry's single writer)
+// rewrites the marker "committed <id>".  Condition-driven, bounded.
+// ---------------------------------------------------------------------------
+TEST(BrokerNodeRegression, DefineTopicMarksTheTopicDirCommittedOverTheAdminRingRegression) {
+    const fs::path dir = makeTempDataDir("marker_e2e_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    const uint16_t clientPort = rune::node::test::freeUdpPort();
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(30s));
+
+    rune::node::test::ShardTestClient client(dir / "client-aeron");
+    const std::string& gw = cfg.clientEndpoint.channel;
+    const int32_t stream  = cfg.clientEndpoint.streamId;
+    const int64_t sid = client.connect(gw, stream);
+    ASSERT_GT(sid, 0);
+
+    const std::vector<uint8_t> blob = rune::codec::serialize(
+        rune::codec::DescriptorBuilder("marked").add("id", rune::codec::PrimType::Int64).build());
+    namespace pc = rune::protocol::client;
+    using Clock = std::chrono::steady_clock;
+    const auto deadline = Clock::now() + 20s;
+    constexpr uint16_t kDdlInternal = static_cast<uint16_t>(pc::ErrorCode::Internal);
+    constexpr uint16_t kDdlExists   = static_cast<uint16_t>(pc::ErrorCode::TopicExists);
+
+    int32_t topicId = -1;
+    bool sawInternal = false;
+    while (topicId < 0) {
+        ASSERT_LT(Clock::now(), deadline) << "DefineTopic did not commit within the test deadline";
+        auto def = client.defineTopicUntil(gw, stream, sid, "marked", 1, /*validate=*/false,
+                                           blob, std::min(deadline, Clock::now() + 5s));
+        ASSERT_TRUE(def.has_value()) << "no DefineTopicResponse";
+        if (def->errorCode == 0) { topicId = def->topicId; break; }
+        if (def->errorCode == kDdlExists && sawInternal) { topicId = def->topicId; break; }
+        ASSERT_EQ(def->errorCode, kDdlInternal) << "non-retryable code " << def->errorCode;
+        sawInternal = true;
+        std::this_thread::sleep_for(20ms);   // admin leadership settling
+    }
+    ASSERT_GE(topicId, 0);
+
+    const fs::path marker = dir / "topics" / "marked" / rune::gateway::kTopicIdMarkerFile;
+    const std::string want = "committed " + std::to_string(topicId) + "\n";
+    std::string got;
+    while (Clock::now() < deadline) {
+        std::ifstream in(marker, std::ios::binary);
+        got.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        if (got == want) break;
+        std::this_thread::sleep_for(5ms);
+    }
+    EXPECT_EQ(got, want) << "the control thread must rewrite the marker once the record commits";
+    EXPECT_FALSE(fs::exists(marker.parent_path() / rune::gateway::kTopicIdMarkerTmpFile));
+
+    node.stop();
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
+// DDL conformance B3 end to end on a live single-node BrokerNode: a DefineTopic
+// whose name differs only in letter case from an existing topic (runtime or
+// RUNE_TOPICS static) is TopicExists carrying the existing topic's id, and the
+// control thread creates NOTHING for it (no topic id consumed, no replica) —
+// the caseConflict trailer crosses the real CreateTopicReply ring.
+// ---------------------------------------------------------------------------
+TEST(BrokerNodeRegression, CaseVariantDefineTopicIsTopicExistsEndToEndRegression) {
+    const fs::path dir = makeTempDataDir("case_fold_e2e_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    TopicSpec stat; stat.name = "Stat"; stat.partitionCount = 1; stat.topicId = 0;
+    cfg.topics = {stat};
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(30s));
+
+    rune::node::test::ShardTestClient client(dir / "client-aeron");
+    const std::string& gw = cfg.clientEndpoint.channel;
+    const int32_t stream  = cfg.clientEndpoint.streamId;
+    const int64_t sid = client.connect(gw, stream);
+    ASSERT_GT(sid, 0);
+
+    const std::vector<uint8_t> blob = rune::codec::serialize(
+        rune::codec::DescriptorBuilder("orders").add("id", rune::codec::PrimType::Int64).build());
+    namespace pc = rune::protocol::client;
+    using Clock = std::chrono::steady_clock;
+    constexpr uint16_t kInternal = static_cast<uint16_t>(pc::ErrorCode::Internal);
+    constexpr uint16_t kExists   = static_cast<uint16_t>(pc::ErrorCode::TopicExists);
+    const auto testDeadline = Clock::now() + 30s;
+    // One DefineTopic; Internal (admin leadership still settling) is retried.
+    auto define = [&](std::string_view name, uint8_t persistence) -> std::optional<pc::DefineTopicResponse> {
+        while (Clock::now() < testDeadline) {
+            auto r = client.defineTopicUntil(gw, stream, sid, name, 1, /*validate=*/false, blob,
+                                             std::min(testDeadline, Clock::now() + 5s), persistence);
+            if (!r || r->errorCode != kInternal) return r;
+            std::this_thread::sleep_for(20ms);
+        }
+        return std::nullopt;
+    };
+
+    const auto orders = define("Orders", 0);
+    ASSERT_TRUE(orders.has_value());
+    ASSERT_EQ(orders->errorCode, 0);
+    const int32_t ordersId = orders->topicId;
+    ASSERT_GE(ordersId, 0);
+
+    for (const auto& [name, persistence] : std::vector<std::pair<std::string, uint8_t>>{
+             {"orders", 0}, {"ORDERS", 1}, {"oRdErS", 0}}) {
+        SCOPED_TRACE(name);
+        const auto r = define(name, persistence);
+        ASSERT_TRUE(r.has_value()) << "no DefineTopicResponse";
+        EXPECT_EQ(r->errorCode, kExists);
+        EXPECT_EQ(r->topicId, ordersId) << "answers the colliding topic's id";
+    }
+    for (const std::string name : {"stat", "STAT"}) {
+        SCOPED_TRACE(name);
+        const auto r = define(name, 0);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->errorCode, kExists);
+        EXPECT_EQ(r->topicId, 0) << "the static topic's id";
+    }
+
+    // Nothing was created for any refused variant: the next topic takes the very
+    // next id, and no replica exists past it.
+    const auto next = define("next", 0);
+    ASSERT_TRUE(next.has_value());
+    ASSERT_EQ(next->errorCode, 0);
+    EXPECT_EQ(next->topicId, ordersId + 1) << "a refused variant consumed a topic id";
+    EXPECT_TRUE(rune::node::test::hasReplica(node, ordersId, 0));
+    EXPECT_FALSE(rune::node::test::hasReplica(node, next->topicId + 1, 0));
+
+    node.stop();
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// DDL conformance Task 12: schemaRegistryForTest() / viewRegistryForTest() are
+// documented as readable "when the node is stopped", but stop() reset both, so
+// every post-stop catalog check dereferenced null (SEGFAULT).  The registries own
+// no replica pointers and no thread touches them after stop(): they now live until
+// the node is destroyed.
+TEST(BrokerNodeStopRegression, CatalogRegistriesReadableAfterStop) {
+    const fs::path dir = makeTempDataDir("regs_after_stop_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(30s));
+
+    rune::node::test::ShardTestClient client(dir / "client-aeron");
+    client.keepSessionsAlive(true);
+    const std::string& gw = cfg.clientEndpoint.channel;
+    const int32_t stream  = cfg.clientEndpoint.streamId;
+    const int64_t sid = client.connect(gw, stream);
+    ASSERT_GT(sid, 0);
+    const std::vector<uint8_t> blob = rune::codec::serialize(
+        rune::codec::DescriptorBuilder("kept").add("id", rune::codec::PrimType::Int64).build());
+    namespace pc = rune::protocol::client;
+    using Clock = std::chrono::steady_clock;
+    const auto deadline = Clock::now() + 30s;
+    std::optional<pc::DefineTopicResponse> r;
+    while (Clock::now() < deadline) {   // Internal while admin leadership settles
+        r = client.defineTopicUntil(gw, stream, sid, "kept", 1, /*validate=*/false, blob,
+                                    std::min(deadline, Clock::now() + 5s), 0);
+        if (!r || r->errorCode != static_cast<uint16_t>(pc::ErrorCode::Internal)) break;
+        std::this_thread::sleep_for(20ms);
+    }
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->errorCode, 0);
+
+    node.stop();
+    ASSERT_NE(node.schemaRegistryForTest(), nullptr) << "readable after stop (documented contract)";
+    ASSERT_NE(node.schemaRegistryForTest()->byName("kept"), nullptr);
+    EXPECT_EQ(node.schemaRegistryForTest()->byName("kept")->version, 1u);
+    EXPECT_NE(node.viewRegistryForTest(), nullptr) << "readable after stop (documented contract)";
     std::error_code ec; fs::remove_all(dir, ec);
 }
 

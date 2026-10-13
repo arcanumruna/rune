@@ -3153,8 +3153,19 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return true;
     }
 
-    rune::storage::Log* log = topicRegistry_->log(msg.topicId, partition);
-    if (!log) {
+    // C1 (DDL conformance final review): servableLog() is log() for a topic whose
+    // catalog record committed; a runtime topic still awaiting its commit is not
+    // writable — answered NotLeader (retriable: the client refreshes metadata, which
+    // lists the topic once it commits, and retries).  Nothing is appended, so a
+    // topic boot may later reclaim as an orphan never holds an acknowledged record.
+    rune::storage::Log* log = topicRegistry_->servableLog(msg.topicId, partition);
+    if (!log) [[unlikely]] {
+        if (topicRegistry_->awaitingCommit(msg.topicId)) {
+            spdlog::debug("ClientGateway: Produce to topicId={} awaiting its DDL commit — NotLeader "
+                          "(retriable)", msg.topicId);
+            sendResp(pc::ErrorCode::NotLeader, partition, 0);
+            return true;
+        }
         spdlog::debug("ClientGateway: Produce bad partition={} for topicId={}", partition, msg.topicId);
         sendResp(pc::ErrorCode::UnknownPartition, partition, 0);
         return true;
@@ -4164,8 +4175,17 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         return;
     }
 
-    rune::storage::Log* log = topicRegistry_->log(msg.topicId, partition);
+    // C1: a runtime topic awaiting its DDL commit is not readable — the bare
+    // ErrorResponse{NotLeader} every unservable-here subscribe gets (retriable:
+    // refresh metadata, retry); no subscription is registered.
+    rune::storage::Log* log = topicRegistry_->servableLog(msg.topicId, partition);
     if (!log) {
+        if (topicRegistry_->awaitingCommit(msg.topicId)) {
+            spdlog::debug("ClientGateway: Subscribe to topicId={} awaiting its DDL commit — NotLeader "
+                          "(retriable)", msg.topicId);
+            sendSubRedirect(std::string{}, msg.correlationId);
+            return;
+        }
         spdlog::debug("ClientGateway: Subscribe bad partition={} for topicId={}", partition, msg.topicId);
         sendResp(pc::ErrorCode::UnknownPartition, partition, 0);
         return;
@@ -5149,7 +5169,7 @@ void ClientGateway::appendRemoteControlRecord(const rune::replication::WriteTxnM
     // Review MEDIUM-5: this node's routing image is NOT consulted — it can lag
     // the replica role; the worker's role gate is the authority (a follower
     // replica answers NotLeader through it).
-    rune::storage::Log* log = topicRegistry_ ? topicRegistry_->log(w.topicId, w.partition) : nullptr;
+    rune::storage::Log* log = topicRegistry_ ? topicRegistry_->servableLog(w.topicId, w.partition) : nullptr;   // C1
     if (log == nullptr || w.topicId < 0 || w.marker.empty()) {
         answerRemoteOrigin_(m, static_cast<int16_t>(pcl::ErrorCode::NotLeader), -1);
         return;
@@ -6504,9 +6524,9 @@ int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
         return -1;
     }
 
-    rune::storage::Log* log = topicRegistry_->log(topicId, partition);
+    rune::storage::Log* log = topicRegistry_->servableLog(topicId, partition);   // C1
     if (!log) {
-        spdlog::warn("ClientGateway::addGroupSubscription: unknown topicId={} partition={}",
+        spdlog::warn("ClientGateway::addGroupSubscription: unknown (or uncommitted) topicId={} partition={}",
                      topicId, partition);
         return -1;
     }
@@ -6680,10 +6700,10 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
         return -1;
     }
 
-    rune::storage::Log* log = topicRegistry_->log(topicId, partition);
+    rune::storage::Log* log = topicRegistry_->servableLog(topicId, partition);   // C1
     if (!log) {
-        spdlog::debug("ClientGateway::appendControlRecord: unknown topicId={} partition={} — dropped",
-                      topicId, partition);
+        spdlog::debug("ClientGateway::appendControlRecord: unknown (or uncommitted) topicId={} partition={} "
+                      "— dropped", topicId, partition);
         return -1;
     }
 
@@ -6985,8 +7005,9 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
     //   partition = gpid % kMaxGpidPartitions
     //
     // If topicRegistry_ is set, we only include partitions whose topicId is in
-    // range [0, topicRegistry_->topicCount()).  This prevents ghost partitions
-    // from a stale routing image that refers to topics no longer registered.
+    // range [0, topicRegistry_->topicCount()) and whose partition is below that
+    // topic's registered partitionCount.  This prevents ghost partitions from a
+    // stale routing image that refers to topics/partitions no longer registered.
     //
     // If the request carries specific topicIds (topicIds non-empty), filter
     // to only those topics.
@@ -7023,9 +7044,17 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
             const int32_t topicId   = gpid / kMaxGpidPartitions;
             const int32_t partition = gpid % kMaxGpidPartitions;
 
-            // Filter: known topics only (when topicRegistry_ is wired).
-            if (topicRegistry_ && topicId >= topicRegistry_->topicCount()) {
-                continue;
+            // Filter: known topics only (when topicRegistry_ is wired) — and only
+            // the partitions the registry has: the replicated image can still
+            // assign a partition the registry no longer holds (DDL conformance
+            // D1: a ZERO-partition __orphan.<id> placeholder recovered at boot
+            // keeps its pre-restart assignment in __cluster_metadata).
+            // C1: a runtime topic awaiting its DDL commit is not listed.
+            if (topicRegistry_) {
+                if (topicId >= topicRegistry_->topicCount()) continue;
+                const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
+                if (spec == nullptr || partition >= spec->partitionCount) continue;
+                if (topicRegistry_->awaitingCommit(topicId)) continue;
             }
 
             // Filter: requested topics only (when non-empty topic list in request).

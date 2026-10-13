@@ -1,12 +1,14 @@
 #include <rune/storage/LeaderEpochCache.h>
 #include <gtest/gtest.h>
 #include <filesystem>
+#include <string>
+#include <unistd.h>
 using namespace rune::storage;
 
 TEST(LeaderEpochCachePersist, RoundTripsThroughFile) {
     LeaderEpochCache c;
     c.assign(0, 0); c.assign(1, 100); c.assign(3, 250);
-    const auto path = std::filesystem::temp_directory_path() / "lec_ckpt.bin";
+    const auto path = std::filesystem::temp_directory_path() / ("lec_ckpt_" + std::to_string(::getpid()) + ".bin");
     c.checkpointToFile(path.string());
 
     LeaderEpochCache c2;
@@ -27,7 +29,7 @@ TEST(LeaderEpochCachePersist, MissingFileReturnsFalse) {
 }
 
 TEST(LeaderEpochCachePersist, TruncatedFileReturnsFalse) {
-    const auto path = std::filesystem::temp_directory_path() / "lec_truncated.bin";
+    const auto path = std::filesystem::temp_directory_path() / ("lec_truncated_" + std::to_string(::getpid()) + ".bin");
     // Write 3 bytes — clearly truncated
     {
         int fd = ::open(path.string().c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -45,7 +47,7 @@ TEST(LeaderEpochCachePersist, CorruptMagicReturnsFalse) {
     LeaderEpochCache c;
     c.assign(0, 0);
     c.assign(1, 100);
-    const auto path = std::filesystem::temp_directory_path() / "lec_corrupt.bin";
+    const auto path = std::filesystem::temp_directory_path() / ("lec_corrupt_" + std::to_string(::getpid()) + ".bin");
     c.checkpointToFile(path.string());
 
     // Corrupt the first byte of the magic
@@ -62,7 +64,7 @@ TEST(LeaderEpochCachePersist, CorruptMagicReturnsFalse) {
 }
 
 TEST(LeaderEpochCachePersist, EmptyCacheRoundTrips) {
-    const auto path = std::filesystem::temp_directory_path() / "lec_empty.bin";
+    const auto path = std::filesystem::temp_directory_path() / ("lec_empty_" + std::to_string(::getpid()) + ".bin");
     LeaderEpochCache c;
     c.checkpointToFile(path.string());
 
@@ -89,7 +91,7 @@ TEST(LeaderEpochCachePersist, BadPathLeavesNoPollutingFile) {
 // FIX 2 regression: a successful checkpoint survives a restore (write-path
 // integrity end-to-end including the directory fsync branch).
 TEST(LeaderEpochCachePersist, CheckpointIntegrityAfterFixes) {
-    const auto path = std::filesystem::temp_directory_path() / "lec_fix2_ckpt.bin";
+    const auto path = std::filesystem::temp_directory_path() / ("lec_fix2_ckpt_" + std::to_string(::getpid()) + ".bin");
     LeaderEpochCache c;
     c.assign(0, 0); c.assign(2, 200); c.assign(4, 400);
     c.checkpointToFile(path.string());
@@ -125,7 +127,6 @@ TEST(LeaderEpochCachePersist, EntriesAccessor) {
 // ---------------------------------------------------------------------------
 #include <rune/storage/LeaderEpochState.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 

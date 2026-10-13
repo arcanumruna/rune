@@ -84,3 +84,44 @@ waits for its timeout.
 - An unknown `acks` or `isolation` byte (anything above 1) is rejected with
   `InvalidRequest`. It is no longer read as one of the two valid modes.
 
+## 8. DDL names, conflicts and boot clean-up
+
+- Topic and view names must be 1–249 bytes of `[A-Za-z0-9._-]`, must not be `.` or `..`, and must
+  not start with `__`.
+  - DDL answers error 40 (`InvalidTopicName`).
+  - A `RUNE_TOPICS` entry with a bad name now refuses to boot and names the entry. **Check
+    your `RUNE_TOPICS` before upgrading.**
+- Two names that differ only by ASCII letter case are rejected: DDL answers 25 (`TopicExists`),
+  and `RUNE_TOPICS` refuses to boot.
+- `createView` over another view's output answers 41 (`ViewSourceIsView`) instead of creating a
+  view that stays empty.
+- `alter topic … rename` of the key field now moves the topic's key with it.
+- A demoted leader answers the DDL request in flight **and every queued DDL request** with 6
+  (`Internal`); retry on the new leader. A request answered 6 after its record was written is in
+  doubt: it may still take effect (at the latest after a restart).
+- **A runtime topic serves only once its definition commits.** Until then it is not listed in
+  metadata, and produce and subscribe answer 2 (`NotLeader`, retriable). The `defineTopic` /
+  `createView` answer is sent only when the topic serves, so the first produce after it succeeds.
+  If the topic still does not serve 5 s after its definition committed, the answer is 6
+  (`Internal`, in doubt), never OK.
+  A definition that fails after its topic was created therefore leaves an empty, unusable topic,
+  never one holding data.
+- `defineTopic` over a view's output topic answers 25 (`TopicExists`), also when that view's
+  `createView` failed or is in doubt. A `createView` retry with the same name and definition
+  reuses its own failed attempt's (always empty) output topic.
+- A failed definition can no longer stop the broker from booting. Its topic id becomes a hidden,
+  zero-partition placeholder `__orphan.<id>`: not listed in metadata, produce and subscribe
+  refused.
+- **A `RUNE_TOPICS` name equal to a runtime topic's name, or differing only by case, refuses to
+  boot** and names both entries. **Check your `RUNE_TOPICS` before upgrading.** Adding or removing
+  `RUNE_TOPICS` entries while runtime topics exist shifts their ids (see SELF-HOSTING.md).
+- Runtime-defined disk topic directories carry a `topic-id` marker: `pending <id>` at create,
+  `committed <id>` after the catalog commit (or at boot, when the catalog claims the directory).
+- Boot deletes a topic directory only when it belongs to a boot-created `__orphan.<id>` placeholder,
+  its marker reads `pending`, every partition `.log` file in it is empty, and neither catalog log
+  is truncated or missing on its own — on this boot or an earlier one (`dataDir/.catalog-damaged`
+  remembers the damage). **Any
+  other topic directory no longer in the catalog is moved to
+  `dataDir/quarantine/<name>-<unix-timestamp>/`, never deleted.** That includes a topic removed
+  from `RUNE_TOPICS`. With a damaged catalog nothing is deleted that boot. Re-adding the topic
+  starts it empty; see SELF-HOSTING.md, "Data directory clean-up at boot", for the manual restore.

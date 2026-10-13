@@ -6,6 +6,10 @@ build/
 cov/
 cmake-build-debug/
 cmake-build-release/
+build-*/
+
+# e2e scratch (docker/view-engine-e2e.sh race barrier dir)
+.ddl-race.*/
 
 # Version control
 .git/

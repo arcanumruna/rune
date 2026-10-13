@@ -47,6 +47,9 @@
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/storage/InMemoryLog.h>
 
+#include <unistd.h>
+#include <filesystem>
+#include <string>
 #include <gtest/gtest.h>
 #include <memory>
 #include <atomic>
@@ -66,6 +69,29 @@ using rune::replication::NodeId;
 using rune::storage::InMemoryLog;
 
 namespace {
+
+// Per-PROCESS view data dirs "<temp>/<name>-<pid>": ctest -j runs each test as its
+// own process (and other checkouts run the same suites), so a fixed /tmp/<name>
+// let one process's cleanup wipe another's files.  Removed when the tests finish.
+std::vector<std::string>& createdTmpDirs() {
+    static std::vector<std::string> dirs;
+    return dirs;
+}
+std::string tmpDir(const std::string& name) {
+    std::string d = (std::filesystem::temp_directory_path() /
+                     (name + "-" + std::to_string(::getpid()))).string();
+    createdTmpDirs().push_back(d);
+    return d;
+}
+class TmpDirCleanup : public ::testing::Environment {
+public:
+    void TearDown() override {
+        std::error_code ec;
+        for (const std::string& d : createdTmpDirs()) std::filesystem::remove_all(d, ec);
+    }
+};
+[[maybe_unused]] ::testing::Environment* const kTmpDirCleanup =
+    ::testing::AddGlobalTestEnvironment(new TmpDirCleanup);
 
 // Minimal single-node memory-backed replica.  Mirrors the pattern used by
 // TransactionCoordinationServiceTest (the ground-truth call site per the brief).
@@ -726,7 +752,7 @@ TEST(WorkerRegression, ViewFoldsOverTransientSourceRegression) {
     auto comp = rune::view::compileView(v, srcs, kView).value();
 
     rune::node::ViewSnapshotChannel ch;
-    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-worker-transient");
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-worker-transient"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
 
     std::vector<uint8_t> value;
@@ -777,7 +803,7 @@ TEST(WorkerRegression, RecoveryViewOverTransientSourceReachesReadyRegression) {
     auto comp = rune::view::compileView(v, srcs, kView).value();
 
     rune::node::ViewSnapshotChannel ch;
-    rune::node::WorkerViewSet vs(ch, "/tmp/rune-views-worker-transient-recovery");
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-worker-transient-recovery"));
     // Push a recovery-flagged install exactly as BrokerNode::fanoutViewPlan_ does.
     rune::node::ViewPlanUpdateMsg m;
     m.viewTopicId = kView;
