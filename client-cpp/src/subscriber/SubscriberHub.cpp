@@ -483,16 +483,23 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
         return; // Malformed batch — drop (never crash).
     }
 
-    // E2 Task 13 fix round 1: the first batch after a move may STRADDLE the
-    // resume position (brokers push whole batches) — its records below it were
-    // delivered before the move: never twice.  One-shot (the first batch only);
-    // a batch entirely below it is not one the resume asked for (a reset /
-    // restarted transient log's new data) and is delivered.  No allocation.
+    // E2 final fix wave (I1): a moved subscription resumes at its position,
+    // but the new leader may push from BELOW it — a batch straddling it
+    // (brokers push whole batches), or whole batches below it while the new
+    // leader's HW still lags the old one's (the gateway clamps the resume
+    // offset to its HW).  Every record below the position was delivered
+    // before the move: never twice.  The floor is STICKY until a record at or
+    // above it is delivered (a re-armed subscription never meets a restarted
+    // log: a restart ends the session, so the move fails explicitly).  No
+    // allocation; one predicted compare per batch while no floor is set.
     int64_t dropBelow = -1;
     if (impl.resumeFloor >= 0) [[unlikely]] {
-        const int64_t base = reader.baseOffset();
-        const int64_t last = base + static_cast<int64_t>(reader.lastOffsetDelta());
-        if (base < impl.resumeFloor && last >= impl.resumeFloor) dropBelow = impl.resumeFloor;
+        const int64_t last = reader.baseOffset() + static_cast<int64_t>(reader.lastOffsetDelta());
+        if (last < impl.resumeFloor) {   // wholly below: duplicates only
+            ++movedDuplicateBatchesDropped_;
+            return;
+        }
+        dropBelow        = impl.resumeFloor;   // this batch carries a record at/above it
         impl.resumeFloor = -1;
     }
 

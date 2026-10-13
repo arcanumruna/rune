@@ -181,9 +181,11 @@ struct SubscriptionImpl {
     SubscriptionFailReason failReason = SubscriptionFailReason::None;  // set before a failing finish
     uint16_t brokerErrorCode = 0;  // RejectedByBroker: the broker's error code
     int64_t nextOffset     = 0;  // lastDelivered + 1 (CB-5 resume point)
-    // E2 Task 13: the resume position of a moved subscription (rearmMovedAway);
-    // the new leader pushes the WHOLE batch containing it, so that first batch's
-    // records below it (already delivered) are dropped.  One-shot; -1 = none.
+    // E2 Task 13: the resume position of a moved subscription (rearmMovedAway).
+    // Records below it were delivered before the move: dropped (a straddling
+    // batch's lower records, whole batches below it while the new leader's HW
+    // lags).  Sticky until a batch carrying a record at/above it arrives
+    // (E2 final fix wave, I1); -1 = none.
     int64_t resumeFloor    = -1;
     // E2 Task 13 fix round 2: the broker's POSITION NOTE (an empty-batch
     // Records frame sent before it answers a moved subscription NotLeader —

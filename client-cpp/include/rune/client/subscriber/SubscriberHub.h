@@ -189,6 +189,9 @@ public:
                         std::chrono::steady_clock::time_point deadline);
     /// Bound subscriptions moved by rearmMovedAway.
     [[nodiscard]] uint64_t subscriptionsMoved() const noexcept { return subscriptionsMoved_; }
+    /// E2 final fix wave (I1): batches wholly below a moved subscription's
+    /// resume floor (re-deliveries from a new leader whose HW lagged), dropped.
+    [[nodiscard]] uint64_t movedDuplicateBatchesDropped() const noexcept { return movedDuplicateBatchesDropped_; }
 
     /// Spend one bare-NotLeader retry of the pending Subscribe `correlationId`.
     /// True while within `maxRetries` (re-send it); false when the budget is
@@ -366,6 +369,7 @@ private:
     uint64_t    staleResponsesIgnored_ = 0;
     uint64_t    subscribesFailed_      = 0;  // fix4 M1: Fatal Subscribe offers
     uint64_t    subscriptionsMoved_    = 0;  // E2 Task 13: rearmMovedAway
+    uint64_t    movedDuplicateBatchesDropped_ = 0;  // E2 final fix wave (I1)
     detail::SendResult sendSubscribeFrame_(const SubscribeRequest& req);
     /// F8c C3: the Subscribe correlationId of the subscription whose impl is
     /// `key`, found by address in this hub's own tables (0 = not held).

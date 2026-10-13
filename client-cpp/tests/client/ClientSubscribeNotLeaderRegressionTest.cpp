@@ -385,9 +385,13 @@ bool driveUntil(Rig& r, const std::function<bool()>& pred, int iters = 2500) {
 void settle(Rig& r) { for (int i = 0; i < 50; ++i) { r.gw->poll(16); std::this_thread::sleep_for(2ms); } }
 }  // namespace
 
-// M4: the floor never drops a batch WHOLLY below it — after a move that is not
-// a re-delivery (a reset / restarted transient log's new data): delivered.
-TEST(SubscribeNotLeaderRegression, MovedSubscriptionDeliversABatchWhollyBelowItsPositionRegression) {
+// E2 final fix wave (I1) — replaces Task 13's "a batch wholly below the floor
+// is delivered": after a move the new leader's HW may still LAG the old one's
+// (it seeds its HW from its follower HW, one fetch round behind); the gateway
+// clamps the resume offset down to that HW and pushes from there — every
+// batch wholly below the position is a re-delivery.  RED (one-shot floor):
+// 0..1 delivered again (count 7, dupes 2).
+TEST(SubscribeNotLeaderRegression, MovedSubscriptionDropsABatchWhollyBelowItsPositionRegression) {
     Rig r("snl_f", 4750, 4751, SubMode::MovesAfterBind, 60'000);
     r.gw->secondPushes = {{0, 2}, {3, 2}};   // 0..1 wholly below position 3, then 3..4
     Seen seen;
@@ -395,15 +399,35 @@ TEST(SubscribeNotLeaderRegression, MovedSubscriptionDeliversABatchWhollyBelowIts
     ASSERT_TRUE(driveUntil(r, [&] { return sub.subscriptionId() == 10 && sub.position() == 5; }))
         << "id " << sub.subscriptionId() << ", position " << sub.position();
     settle(r);
-    EXPECT_EQ(seen.count.load(), 3 + 2 + 2) << "the wholly-below batch was dropped (or something else was)";
+    EXPECT_EQ(seen.count.load(), 3 + 2) << "a batch wholly below the resume position was re-delivered";
+    EXPECT_EQ(seen.dupes.load(), 0);
+    EXPECT_EQ(seen.mask.load(), 0x1Fu);
     sub.unsubscribe();
 }
 
-// M4: the floor is ONE-SHOT — it applies to the first batch after the move
-// only.  Here the first batch (3..4) does not straddle; a later straddling one
-// (2..5) is delivered whole: a later batch below the position is not one the
-// resume asked for.
-TEST(SubscribeNotLeaderRegression, MovedSubscriptionFloorIsOneShotRegression) {
+// I1: the lagging new leader pushes SEVERAL batches below the position before
+// it reaches it (one per record here: 0, 1, 2), then a straddling one (2..4).
+// The floor holds across all of them — only 3..4 are new.  RED (one-shot
+// floor): the first wholly-below batch cleared the floor; 0..2 and the
+// straddle's 2 were delivered twice.
+TEST(SubscribeNotLeaderRegression, MovedSubscriptionFloorHoldsAcrossALaggingLeadersBatchesRegression) {
+    Rig r("snl_k", 4800, 4801, SubMode::MovesAfterBind, 60'000);
+    r.gw->secondPushes = {{0, 1}, {1, 1}, {2, 1}, {2, 3}};
+    Seen seen;
+    auto sub = r.subscribe(Isolation::ReadCommitted, seen.handler());
+    ASSERT_TRUE(driveUntil(r, [&] { return sub.subscriptionId() == 10 && sub.position() == 5; }))
+        << "id " << sub.subscriptionId() << ", position " << sub.position();
+    settle(r);
+    EXPECT_EQ(seen.count.load(), 5) << "records below the resume position were delivered again";
+    EXPECT_EQ(seen.dupes.load(), 0);
+    EXPECT_EQ(seen.mask.load(), 0x1Fu);
+    sub.unsubscribe();
+}
+
+// M4 / I1: the floor ENDS once a record at/above it was delivered.  Here the
+// first batch after the move (3..4) is above it; a later batch reaching below
+// the position (2..5) is not a resume re-delivery and is delivered whole.
+TEST(SubscribeNotLeaderRegression, MovedSubscriptionFloorEndsAfterADeliveryAtOrAboveItRegression) {
     Rig r("snl_g", 4760, 4761, SubMode::MovesAfterBind, 60'000);
     r.gw->secondPushes = {{3, 2}, {2, 4}};
     Seen seen;
@@ -411,7 +435,7 @@ TEST(SubscribeNotLeaderRegression, MovedSubscriptionFloorIsOneShotRegression) {
     ASSERT_TRUE(driveUntil(r, [&] { return sub.subscriptionId() == 10 && seen.count.load() >= 3 + 2 + 4; }))
         << "id " << sub.subscriptionId() << ", seen " << seen.count.load();
     settle(r);
-    EXPECT_EQ(seen.count.load(), 3 + 2 + 4) << "the floor filtered a batch after the first";
+    EXPECT_EQ(seen.count.load(), 3 + 2 + 4) << "the floor filtered a batch after a delivery at/above it";
     sub.unsubscribe();
 }
 
