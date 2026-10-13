@@ -215,3 +215,41 @@ TEST(TransientReplicaRegression, FollowerAppliesOnlyTheContiguousBatchesOfAFrame
     const auto v = mem.readView(0, 1 << 20);
     EXPECT_EQ(v.len, b0.size()) << "the batch past the gap must not be stored under offset 0";
 }
+
+// Fix round 2 (re-review): the follower's kRefusedFull branch — a frame that
+// needs room while every held record is still above the HW is refused VISIBLY
+// (counted), applies nothing, does NOT wedge (retriable), and the same records
+// apply once a frame carries a HW that commits the held ones.
+TEST(TransientReplicaRegression, FollowerRingFullAboveTheHwRefusesRetriablyAndAppliesOnceTheHwMovesRegression) {
+    rune::storage::InMemoryLog mem(8 * 1024, 1000);
+    InMemoryTransport transport;
+    PartitionReplica r2(tcfg(2), Role::Follower, 1, {1, 2}, {1, 2}, &mem, &transport);
+    auto frameOf = [](int64_t first, int n) {
+        std::vector<uint8_t> f;
+        for (int64_t b = first; b < first + n; ++b) {
+            const auto x = stampedBatch(b, 1024);
+            f.insert(f.end(), x.begin(), x.end());
+        }
+        return f;
+    };
+    const auto f0 = frameOf(0, 5), f1 = frameOf(5, 5);   // two frames overflow the 8 KiB ring
+    FetchResponseMsg r{};
+    r.leaderEpoch = 1; r.partition = 0; r.topicId = 7; r.logStartOffset = 0; r.errorCode = 0;
+    r.highWatermark = 0;
+    r.records = std::span<const uint8_t>(f0);
+    r2.applyReplicated(r);
+    ASSERT_EQ(r2.logEndOffset(), 5);
+    r.records = std::span<const uint8_t>(f1);            // HW still 0: nothing evictable
+    r2.applyReplicated(r);
+    EXPECT_EQ(r2.transientApplyFullRefusals(), 1u) << "the refusal must be visible (counted)";
+    EXPECT_EQ(r2.transientApplyTooLargeRefusals(), 0u);
+    EXPECT_EQ(r2.logEndOffset(), 5) << "a refused frame applies nothing";
+    EXPECT_EQ(mem.logStartOffset(), 0) << "no uncommitted record was evicted";
+    EXPECT_EQ(r2.wedgedAtOffset(), -1) << "a full ring is retriable: never wedge";
+    r.highWatermark = 5;                                  // the leader's next answer commits [0,5)
+    r2.applyReplicated(r);
+    EXPECT_EQ(r2.logEndOffset(), 10) << "the re-served frame applies once the HW moves";
+    EXPECT_EQ(r2.transientApplyFullRefusals(), 1u);
+    EXPECT_GT(mem.logStartOffset(), 0);
+    EXPECT_EQ(r2.wedgedAtOffset(), -1);
+}
