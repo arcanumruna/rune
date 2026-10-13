@@ -17,6 +17,47 @@
 - **Boot today:** `BrokerNode::start` step 1b (anchor: `// 1b. Restart recovery of RUNTIME-defined topics`) reads both catalogs off disk (`recoverRuntimeTopics`), appends recovered specs to `config_.topics` (the `RUNE_TOPICS` list), fills id gaps with `__orphan.<id>` placeholders, runs `refuseStaticNamesCollidingWithRecovered` and `reconcileTopicDirs` (two-phase `topic-id` markers, quarantine).
 - **`RUNE_TOPICS`:** parsed in `NodeConfig.cpp` (anchor `// --- RUNE_TOPICS (optional) ---`, options `group= key= rf= persistence= durability= tier=` + positional cleanup/retention fields), consumed through `config_.topics` in ~20 places in `BrokerNode.cpp`; 43 files reference it (libs/, docker/, docs/, dr-e2e/, bench/), 22 in-process test files set `NodeConfig::topics`.
 
+## Pre-flight rulings (2026-10-13)
+
+Binding rulings from the pre-flight scan (`.superpowers/sdd/2026-10-13-rune-catalog-history/preflight-rulings.md`), applied below. One line each, with the tasks they changed:
+
+- **F1** — `Dispatch.h::isKnownTemplate` covers 64–78; the `DispatchTest.cpp` "unknown" pins move to 79 and `ControlMessagesConnectTest.cpp` pins client version 8 → Task 4.
+- **F2** — the AlterView effect-order test uses the golden sinks (new 4, old 3) and asserts every step was found → Task 7.
+- **F3** — `AlterTopic` on an untyped topic answers `UnknownTopic 7` (today's code, binding for Task 10) → Task 9.
+- **F4** — the applier's effects are a per-state phase variant (`AwaitingBoot → Booted → Live`, no `recovery` flag); exactly one boot replay; Task 16 deletes Task 9's admin-thread replay → Tasks 7, 9, 16.
+- **F5** — the grep gate reads an explicit allowlist file (`scripts/rune_topics_allowlist.txt`: the refusal check, its Regression test, the release note); `NodeConfig.cpp` keeps only a presence refusal; the refusal test lives in `NodeConfigTest.cpp`; tracked `build-release/` is untracked and build dirs are ignored; `AdminWorker.cpp`, `CreateViewRegressionTest.cpp`, `SchemaGatewayTest.cpp` are listed → Tasks 17, 18, 19, 25.
+- **F6** — `FdBudget.cpp:75` estimates from the catalog's boot topics (the check moves from `main.cpp` into `BrokerNode::start`) → Task 17.
+- **F7** — the single-threaded fake (`test_support::InvokerGateway`) serves only non-blocking unit tests; blocking `*AndWait`, catalog reads and `rune::cli::run(--broker)` are tested against real in-process `BrokerNode`s in the broker's new `rune_client_broker_tests` target → Tasks 5, 11, 13, 15, 22.
+- **F8** — `ql::parseScript` (strict, multi-statement); `ql::parse` refuses trailing input; `rune ql -f` runs every statement in order and stops at the first error naming its index → Tasks 14, 15.
+- **F9** — `SetCompatibility` applies through `applyOps` (the evolving descriptor's version bumps, as today) → Task 2.
+- **F10** — the "name taken" precondition case is built unstamped → Task 2.
+- **F11** — `CatalogGoldenTest.cpp` / `CatalogQueriesTest.cpp` includes → Task 3.
+- **F12** — allocation gates use the repo's real pattern (per-binary `operator new` replacement with plain single-thread globals, own executable `rune_catalog_alloc_regression_tests`); the hot-path gate is the existing `HotPathBRig.h` `Rig` tests → Tasks 7, 12, 23.
+- **F13** — a DDL whose commit times out answers the retriable `NotLeader 2`; `Internal 6` only on a halted broker → Task 9.
+- **F14** — `RequestId` is 128-bit (random client instance id + counter); the event records a `requestFingerprint`; dedupe keys on (requestId, fingerprint); the same id with a different statement answers `InvalidRequest` → Tasks 1, 2, 3, 4, 5, 9 (types also in 11, 15, 20, 21, 22).
+- **F15/F16** — every matrix cell's expected codes come from `cmatrix::expectedCodes`; R2/R5 final codes fixed; R3/R4 via a follower answer `Redirect` first → Tasks 20, 22.
+- **F17** — `rune ql --request-id`; the Task 24 re-run reuses it → Tasks 15, 24.
+- **F18** — history rows print `replayedFrom` → Task 15.
+- **F19** — Task 12 kept: serving the existing Subscribe for −6 is transport; spec §7 wording amended.
+- **F20** — `AlterSchema` ops are stored resolved to durable tags (`ResolvedAlterOp`) → Tasks 1, 2, 3, 9, 15.
+- **F21** — the shared library lives in rune-codec; spec Repos line amended.
+- **F22** — `timestampMs` = the leader's wall clock at append; spec §4 amended → Task 9.
+- **F23** — the purge cross-reference is Task 16; the reuse test checks the old data is unreadable and that `dropped/0.t` existed then vanished → Task 8.
+- **F24** — the below-minIsr test produces and consumes → Task 11.
+- **F25** — Task 1 expects 9 tests → Task 1.
+- **F26** — `MetadataService::assignment`; the bridge's `isCoordinatorTopic_`/`mapDriven_` include −6; `BrokerNode.h` listed → Task 6.
+- **F27** — view sinks go through a separate `sinkApplied(SinkSpec)` effect → Task 7.
+- **F28** — `CatalogApplier::lastApplied()` → Tasks 7, 9.
+- **F29** — `CatalogReadServer::Sub` is `variant<Backlog, Live>`; the client's DDL retry state is a variant → Tasks 5, 12.
+- **F30** — the stress accepts `Internal 6` only from a broker whose applier is halted → Task 21.
+- **F31** — `replicas` is `int16_t` everywhere (QL parse bound) → Task 14.
+- **F32** — one `TopicConfig` definition (`rune-protocol/include/rune/protocol/CatalogTypes.h`), reused by codec, client and rune-ql → Tasks 1, 4, 5, 14, 15.
+- **F33** — `view_probe --create-only` is a listed change → Task 24.
+- **F34** — Task 22 lists `CatalogReplicationTest.cpp` (it moves `ThreeNodes` out of it) → Task 22.
+- **F35** — rune-codec gets a Release build dir; `rune_codec_bench` links `rune_catalog` → Task 3.
+- **F36** — Task 10's occupant literal matches `kOccupantCount` (10 → 9) → Task 10.
+- **F37** — a pre-v8 session's DDL on a broker that is not the catalog leader is answered `InvalidRequest` ("client too old for cluster DDL routing; upgrade") in its own response type, never left to wait out → Tasks 4, 11, 25.
+
 ## Execution context
 
 - **Repos / branch:** create `feat/catalog-history` in each worktree under `/Users/vradu/Projects/se-worktrees/`:
@@ -31,7 +72,8 @@
   - broker tests: `build-fast` (Ninja, Debug, `BUILD_TESTING=ON`, `RUNE_PROTOCOL_INCLUDE` → `../rune-protocol/include`, `RUNE_CODEC_ROOT` → `../rune-codec`). After a CMake edit: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast`. If missing: `cmake -S . -B build-fast -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DCMAKE_TOOLCHAIN_FILE=/Users/vradu/Projects/se-worktrees/rune-broker/build/Debug/generators/conan_toolchain.cmake -DRUNE_PROTOCOL_INCLUDE=/Users/vradu/Projects/se-worktrees/rune-protocol/include -DRUNE_CODEC_ROOT=/Users/vradu/Projects/se-worktrees/rune-codec`.
   - broker benchmarks: `build-bench-rel` (Ninja, `BUILD_BENCHMARKS=ON`, `-O3 -DNDEBUG`).
   - client: `build` (Unix Makefiles; `RUNE_PROTOCOL_INCLUDE` → `../rune-protocol/include`, `RUNE_CODEC_ROOT` → `../rune-codec`, `RUNE_QL_ROOT` → `../rune-ql`).
-  - protocol: `build` (target `rune_protocol_tests`). rune-ql: `build` (target `rune_ql_tests`). rune-codec: `build` (targets `rune_codec_tests`, new `rune_catalog_tests`).
+  - protocol: `build` (target `rune_protocol_tests`). rune-ql: `build` (target `rune_ql_tests`). rune-codec: `build` (targets `rune_codec_tests`, new `rune_catalog_tests`) and `build-rel` (Release, `rune_codec_bench`; created in Task 3).
+  - broker client-integration tests (F7): `build-fast` target `rune_client_broker_tests` (created in Task 11) compiles the client from `RUNE_CLIENT_ROOT` (default `../rune-client-cpp`) — the real `rune_client_api` / `rune_cli_lib` against real in-process `BrokerNode`s.
 - **Test gate (CLAUDE.md rule 7):**
   - **Per task / fix round:** build, then run the executables covering the code the task touches plus every new or changed test, at `-j14` — each task's "Run" step names the exact filter: `ctest --test-dir <build> -R '<filter>' --output-on-failure -j14`.
   - **The FULL `*Regression*` suite runs only at the checkpoints**, in every repo touched since the last checkpoint: broker `ctest --test-dir build-fast -R Regression --output-on-failure -j14`; client `ctest --test-dir build -R Regression --output-on-failure -j14`; protocol `ctest --test-dir build -R Regression --output-on-failure`; rune-ql `ctest --test-dir build -R Regression --output-on-failure`; rune-codec `ctest --test-dir build -R Regression --output-on-failure -j14`. A checkpoint failure is bisected over the commits since the last green checkpoint.
@@ -43,7 +85,7 @@
 - **HARD RULES (CLAUDE.md, all eight), as they bind here:**
   1. **Shared-nothing.** The `__catalog` replica, `CatalogState`, `CatalogApplier`, `SchemaRegistry` and `ViewRegistry` are owned by the admin thread only; `TopicRegistry`, `ReplicaRegistry`, `MetadataService` by the control thread only; the gateway never reads catalog state — it gets a control-thread-owned `CatalogRoute` value. No locks, no atomics as coordination, no `thread_local`.
   2. **Rings are the only cross-thread channel.** Every new hop is a message on an existing SPSC ring (`AdminChannels.h`): role + ISR relays, applied-topic / dropped-topic / config / view-uninstall / halted effects, dropped-dir purges, catalog subscribe forwarding. No cross-thread callback, no shared pointer read across threads.
-  3. **Per-state variables.** `AdminWorker` leadership is `std::variant<CatalogFollower, CatalogLeaderCatchingUp, CatalogLeaderServing>`; the in-flight DDL is `std::variant<Idle, AwaitingCommit>`; `CatalogApplier` is `std::variant<Applying, Halted>`; a TopicRegistry entry is `Serving` or `Dropped`; a create behind a not-yet-retired drop of the same name is `PendingCreateBehindDrop`. No scattered booleans.
+  3. **Per-state variables.** `AdminWorker` leadership is `std::variant<CatalogFollower, CatalogLeaderCatchingUp, CatalogLeaderServing>`; the in-flight DDL is `std::variant<Idle, AwaitingCommit>`; `CatalogApplier` is `std::variant<Applying, Halted>` and its effects phase `std::variant<AwaitingBoot, Booted, Live>` (boot vs live effects — never a `recovery` flag, F4); a `CatalogReadServer` subscription is `std::variant<Backlog, Live>` (F29); the client's DDL retry state is `std::variant<DdlSent, DdlNotLeaderSeen, DdlAwaitingResend>` (F29); a TopicRegistry entry is `Serving` or `Dropped`; a create behind a not-yet-retired drop of the same name is `PendingCreateBehindDrop`. No scattered booleans.
   4. **Zero steady-state allocation.** The produce/consume/query hot path is untouched (gate: Task 23). The catalog path is control plane (cold), but its steady state still allocates nothing: the applier, the catalog read server and an idle catalog subscription reuse preallocated buffers (capacity persists); an idle cluster's admin pass allocates nothing (Task 23 counts it).
   5. **Test and benchmark everything:** unit, parameterized matrix, seeded model-checked stress, 3-node BrokerNode integration over real Aeron, docker e2e; benchmarks: library replay (Task 3), boot replay of 10 000 events < 1 s (Task 23), hot-path produce/consume benches unchanged (Task 23).
   6. **A `*Regression*`-named test on every fix** (every fix-on-sight below carries one).
@@ -55,7 +97,7 @@
 - **Spec §6:** apply rules per `formatVer` are frozen; one shared library; every replay verifies every fingerprint; golden logs per `formatVer` replay to fixed fingerprints forever.
 - **Spec §8:** `replicationFactor ≤ broker count` and `replicationFactor ≥ minIsr`, each an explicit error; no `RUNE_TOPICS` mention remains (grep gate, Task 19).
 - **No migration** (spec §1): `__catalog` replaces `__topic_schemas` / `__views` outright; old data dirs of those logs are ignored (logged once) and never read.
-- **Error codes (spec §9) — no new protocol error codes:** Redirect `3` (ErrorResponse, message = leader client endpoint), NotLeader `2`, TopicExists `25`, the existing specific codes, InvalidRequest `39` with a detail message, Internal `6` on a halted broker.
+- **Error codes (spec §9) — no new protocol error codes:** Redirect `3` (ErrorResponse, message = leader client endpoint), NotLeader `2` (also a DDL whose commit did not complete within `kDdlTimeoutNs` — it may still commit, the retry dedupes, F13), TopicExists `25`, the existing specific codes, InvalidRequest `39` with a detail message (also: a reused `requestId` with a different statement, F14; a pre-v8 session's DDL on a non-leader, F37), Internal `6` on a halted broker only.
 - **Carry-overs folded in:** this phase closes the E2 carry-over "multi-node runtime DDL fails" (Tasks 6, 9, 22) and the deferred "multi-node `__topic_schemas` replication" (schema-evolution spec §8); the static/runtime name-collision boot rule (`refuseStaticNamesCollidingWithRecovered`) is deleted with `RUNE_TOPICS` (Tasks 16–17). Part D (`rune console` / `rune schema`) is scheduled after this phase and builds on Task 13's reads and Task 15's `rune ql`; the console must also map codes 37/42/43 (recorded by E/E2) — still Part D's.
 
 ## Review Focus
@@ -75,7 +117,7 @@ Also pinned: a new catalog leader refuses DDL until it applied up to its HW (`Ca
 
 ## Spec ambiguities resolved by this plan (binding for executors)
 
-1. **Where the shared replay library lives.** Spec §6 / Repos put it under rune-client-cpp, but the broker must link it and has no client dependency. **Ruling:** `rune_catalog` lives in **rune-codec** (`include/rune/catalog/`, `src/catalog/`) — the one sibling every consumer (broker, client, CLI) already compiles from source — so all three link byte-identical rules. The client exposes it through its own API (Task 13).
+1. **Where the shared replay library lives.** Spec §6 / Repos put it under rune-client-cpp, but the broker must link it and has no client dependency. **Ruling (spec Repos line amended, F21):** `rune_catalog` lives in **rune-codec** (`include/rune/catalog/`, `src/catalog/`) — the one sibling every consumer (broker, client, CLI) already compiles from source — so all three link byte-identical rules. The client exposes it through its own API (Task 13).
 2. **Schema events vs objects.** **Ruling:** a schema is an aspect of its topic object. `CreateSchema` / `AlterSchema` / `SetCompatibility` carry the topic's `objectId`; `prevVersion`/`newVersion` are the topic object's version (every event on the object bumps it by 1); the schema's own contiguous version (`u16`, the wire/`SchemaRegistry` version) is part of the resulting state. `SHOW SCHEMA t AS OF VERSION n` selects schema version `n`; `SHOW TOPIC t AS OF VERSION n` selects object version `n`.
 3. **Which DDL emits which kind.** `DefineTopic` on a free name → `CreateTopic` (carrying the schema when the descriptor is non-empty; an empty descriptor is an **untyped** topic); `DefineTopic` with a descriptor on an existing untyped topic → `CreateSchema` (today's "schema-less adoption"); `AlterTopic` whose ops are all `SET COMPATIBILITY` → `SetCompatibility`, any other `AlterTopic` → `AlterSchema`; new wire ops `DropTopic`, `DropView`, `AlterView`, `AlterTopicConfig` → their kinds.
 4. **`AlterView` semantics.** The view-engine spec defers the live background cut-over. **Ruling:** `AlterView` replaces the view's plan and output under the same `objectId` with a **fresh sink topic** (new `viewTopicId`); the old sink is dropped; the view re-folds from its source and `GetViewRow` answers `NotReady` until caught up. The event layout does not change when the live cut-over lands later (it changes serving, not definitions).
@@ -83,17 +125,19 @@ Also pinned: a new catalog leader refuses DDL until it applied up to its HW (`Ca
 6. **Drop rules.** `DropTopic` of a topic a view reads → `InvalidRequest` naming the view; `DropTopic` of a view name → `InvalidRequest` ("is a view; use DROP VIEW"); unknown names → `UnknownTopic (7)` with detail (there is no `UnknownView` error code; `ViewRowResponse` status 4 is a read status, not a DDL code).
 7. **`__catalog` leadership.** "Unclean disabled" + "every broker" rules out following the consensus leader (a lagging consensus leader would lose committed events). **Ruling:** `__catalog` joins the controller-ISR path of the coordinator partitions (re-review MEDIUM-B, `MetadataService::decideCoordinatorPartition`): replicas = every broker, leader elected only from the ISR (`allowUnclean = false`), the controller prefers itself when it is in the ISR (so the catalog leader is normally the controller). Single-node keeps the consensus-driven path.
 8. **What "applied" survives a restart.** There is no persisted HW. **Ruling:** the applier persists `dataDir/__catalog/applied` = (last applied offset, state digest) **before** posting any side effect; boot replays `[0, applied]` only (always committed) and catches up the rest live.
-9. **Exactly-once DDL across a leader change.** **Ruling:** every DDL carries a client `requestId` (u64, stable across retries) in the event's principal; the leader answers a retry whose `requestId` already committed with that event's original result.
-10. **Catalog reads and "caught up".** Spec §7 reuses Subscribe; a client must know when it has the whole committed prefix. **Ruling:** for topic id −6 only, the serving broker pushes one `Records` frame with `baseOffset = HW` and an empty records payload as the caught-up marker after the backlog, documented in `Protocol.h`; no layout change.
+9. **Exactly-once DDL across a leader change.** **Ruling (F14):** every DDL carries a client `RequestId` (128-bit: a random 64-bit client instance id + a 64-bit counter, stable across retries) in the event's principal, next to the `requestFingerprint` the leader computes over the request's statement and operation bytes; the leader answers a retry whose `(requestId, requestFingerprint)` already committed with that event's original result, and a request whose `requestId` committed with a **different** fingerprint with `InvalidRequest 39` ("requestId reused for a different statement") — never a silent wrong success.
+10. **Catalog reads and "caught up".** Spec §7 reuses Subscribe (amended F19: the broker serving that Subscribe for −6 is transport; replay stays client-side); a client must know when it has the whole committed prefix. **Ruling:** for topic id −6 only, the serving broker pushes one `Records` frame with `baseOffset = HW` and an empty records payload as the caught-up marker after the backlog, documented in `Protocol.h`; no layout change.
 11. **View fingerprints across clusters.** Ids differ between clusters (spec §7 replay). **Ruling:** fingerprints cover definitions, never ids: a view's fingerprint covers its source **names** and its authored plan **normalized** (each source `topicId` replaced by its ordinal), never the compiled plan (which embeds ids).
 12. **"New broker joining".** Rune peers are static configuration. **Ruling:** a new broker is a configured peer started with an empty data dir after the catalog has events; the coordinator replica set already names it; it replays from offset 0 and joins the ISR once caught up (AlterIsr).
 13. **Where `principal.sourceAddress` comes from.** Connect carries no client name. **Ruling:** the DDL extension carries `clientName` + `requestId`; the gateway adds `sessionId` and the session's egress channel as the source address.
+14. **"Resolved" ops (spec §4, F20).** **Ruling:** `AlterSchema` stores `ResolvedAlterOp`s — every field named by durable tag (`FieldDescriptor::id`; an ADD carries the tag it is assigned) — never the name-based `encodeAlterOps` blob. The leader resolves (`rune::catalog::resolveAlterOps`); apply maps tags back onto the evolving descriptor; `rune catalog replay` un-resolves against the target (`unresolveAlterOps`).
+15. **`timestampMs` (spec §4 amended, F22).** **Ruling:** the leader's wall clock when it builds the event for the append; the commit time is unknown before the append and the event is immutable.
 
 ---
 
 ## Interaction matrix
 
-**Single source of truth:** `libs/node/tests/support/CatalogMatrixExpectations.h` (Task 20) — `expect(Kind, Entity, Timing) → Outcome`. The unit matrix (Task 20), the seeded stress (Task 21), the 3-node integration slice (Task 22) and the docker e2e (Task 24) all read it; no test hard-codes an outcome.
+**Single source of truth:** `libs/node/tests/support/CatalogMatrixExpectations.h` (Task 20) — `expect(Kind, Entity, Timing) → Outcome` and `expectedCodes(Kind, Entity, Timing) → ExpectedCodes` (every answer code a cell asserts, F15/F16). The unit matrix (Task 20), the seeded stress (Task 21), the 3-node integration slice (Task 22) and the docker e2e (Task 24) all read it; no test hard-codes an outcome.
 
 ### Operations (9 event kinds, spec §2)
 
@@ -121,7 +165,7 @@ Also pinned: a new catalog leader refuses DDL until it applied up to its HW (`Ca
 | `LeaderChangeMidDdl` | the leader appends the event, then loses leadership before answering; the controller elects another ISR member; the client retries (same `requestId`) |
 | `RestartMidApply` | one follower is stopped after persisting its applied checkpoint and before its side effects run, then restarted from its data dir |
 | `NewBrokerJoins` | the op commits with brokers {1,2}; broker 3 starts with an empty data dir, replays from offset 0 |
-| `CatalogBelowMinIsr` | two brokers are down; the op is issued to the survivor; then one broker returns and the op is retried |
+| `CatalogBelowMinIsr` | `Via = Leader`: two followers are down and the op is issued to the surviving leader. `Via = Follower`: the op is issued to a follower, which answers `Redirect`; then both followers (the via broker included) are stopped before the followed request reaches the leader. Then one broker returns and the op is retried |
 | `ConcurrentDdlDifferentBrokers` | the same op (same name / same `expectedVersion`) is sent to two different brokers in the same pass, different `requestId`s |
 | `DropAndReuseName` | create → drop → create the same name, then the op (on the new object) |
 | `CreateRacesPlacement` | the op's topic is applied on a broker before its placement commits; produce/subscribe are issued in that window |
@@ -133,9 +177,9 @@ Also pinned: a new catalog leader refuses DDL until it applied up to its HW (`Ca
 |---|---|---|
 | R1 | `CreateRacesPlacement` × kind ∉ {`CreateTopic`, `CreateView`, `AlterView`} | `NotApplicable` (no new topic / sink is placed) |
 | R2 | `FingerprintMismatch` | `HaltedBrokerInternalOthersOk`: broker 3's applier is `Halted` at that offset, its halt counter = 1, a DDL sent to broker 3 is answered `Internal (6)` (never redirected), the same op via the leader is `Ok`, brokers 1 and 2 agree on the digest; broker 3 still serves produce/consume on topics it applied |
-| R3 | `CatalogBelowMinIsr` | `NotLeaderUntilBudgetThenOk`: first attempt answered `NotLeader (2)` until the client budget ends → explicit client failure `NotLeader`, nothing appended past the HW; produce/consume on an existing topic led by the survivor still succeed (acks=leader); after one broker returns, the retried op is `Ok` exactly once |
-| R4 | `LeaderChangeMidDdl` | `NotLeaderThenOkOnce`: first answer `NotLeader (2)`, the retry (same `requestId`) answers `Ok` with the same `objectId` / version; exactly one event with that `requestId` in every broker's log |
-| R5 | `ConcurrentDdlDifferentBrokers` | `OneWinsOneConflict`: exactly one `Ok`; the other gets the kind's conflict code — creates `TopicExists (25)` / `ViewExists (32)`; `AlterSchema`/`SetCompatibility`/`AlterTopicConfig` with the same `expectedVersion` `SchemaConflict (31)`; drops `UnknownTopic (7)`; `AlterView` `SchemaConflict (31)` |
+| R3 | `CatalogBelowMinIsr` | `NotLeaderUntilBudgetThenOk`: the leader answers `NotLeader (2)` until the client budget ends → explicit client failure `NotLeader` (final 2), nothing appended past the HW; produce/consume on an existing topic led by the survivor still succeed (acks=leader); after one broker returns, the retried op is `Ok` exactly once. Via a follower the first answer is `Redirect (3)`, then `NotLeader (2)` |
+| R4 | `LeaderChangeMidDdl` | `NotLeaderThenOkOnce`: the leader's answer is `NotLeader (2)`, the retry (same `requestId`) answers `Ok` with the same `objectId` / version; exactly one event with that `requestId` in every broker's log. Via a follower the first answer is `Redirect (3)`, then `NotLeader (2)`, final `Ok` |
+| R5 | `ConcurrentDdlDifferentBrokers` | `OneWinsOneConflict`: exactly one `Ok`; the other gets the kind's conflict code — creates `TopicExists (25)` / `ViewExists (32)`; `AlterSchema`/`SetCompatibility`/`AlterTopicConfig` with the same `expectedVersion` `SchemaConflict (31)`; drops `UnknownTopic (7)`; `AlterView` `SchemaConflict (31)`. The DDL sent to the leader is applied first (deterministic pass order): via the leader the cell's DDL wins (final 0, the other gets the conflict code); via a follower it is redirected and loses (first 3, final = the conflict code, the other 0) |
 | R6 | `DropAndReuseName` | `OkNewObjectId`: the op applies to the new object (new `objectId`, its version chain restarts at 1); history keeps both objects distinct |
 | R7 | `CreateRacesPlacement` (applicable kinds) | `OkAfterPlacement`: produce/subscribe in the window answer `NotLeader (2)`; the DDL `Ok` is released only after the topic serves on the leader's broker; afterwards produce/subscribe succeed |
 | R8 | `Via = Follower` × {`Steady`, `RestartMidApply`, `NewBrokerJoins`} | `RedirectThenOk`: first answer `ErrorResponse{Redirect, leader endpoint}`, the followed request `Ok` |
@@ -143,17 +187,19 @@ Also pinned: a new catalog leader refuses DDL until it applied up to its HW (`Ca
 
 `Persist = Transient` changes no outcome; it changes what is asserted (a transient topic exists and is empty after `RestartMidApply`; a transient view re-folds).
 
+**Exact codes per cell (`cmatrix::expectedCodes`, F15/F16).** Every applicable cell sent via a follower answers `Redirect (3)` first (message = the leader's client endpoint), then the leader's answer — except R2, where broker 3 is halted and answers `Internal (6)`, never a redirect. `ExpectedCodes{first, afterRedirect, final, other, viaLeader, retried}` (−1 = no such answer): R2 `{6, −1, 6, −1, 0, −1}`; R3 Leader `{2, −1, 2, −1, −1, 0}`, Follower `{3, 2, 2, −1, −1, 0}`; R4 Leader `{2, −1, 0, …}`, Follower `{3, 2, 0, …}`; R5 Leader `{0, −1, 0, conflict, …}`, Follower `{3, conflict, conflict, 0, …}`; R6/R7/R8/R9 Leader `{0, −1, 0, …}`, Follower `{3, 0, 0, …}`.
+
 ### Cell counts (pinned by `CatalogMatrixCountRegression.CellCountsArePinned`, Task 20)
 
 9 kinds × 4 entities × 9 timings = **324 cells**: **300 applicable**, 24 `NotApplicable` (R1: 6 kinds × 4 entities). Applicable by rule: R2 `HaltedBrokerInternalOthersOk` 36, R3 `NotLeaderUntilBudgetThenOk` 36, R4 `NotLeaderThenOkOnce` 36, R5 `OneWinsOneConflict` 36, R6 `OkNewObjectId` 36, R7 `OkAfterPlacement` 12, R8 `RedirectThenOk` 54, R9 `Ok` 54 = **300**.
 
 ### Every cell asserts
 
-1. The exact first answer (template + code, `Redirect` endpoint = the leader's client endpoint) and the final client-visible result.
+1. Every answer code `cmatrix::expectedCodes` names — the first answer (template + code, `Redirect` endpoint = the leader's client endpoint), the first answer after a followed `Redirect`, the final client-visible result, and where the timing has them the concurrent DDL's result, the same op via the leader and the retried op. No cell hard-codes a code.
 2. **Every DDL answered exactly once** (`AdminWorker::startedCount() == answeredCount()` on every broker; the client saw one terminal result per `requestId`).
 3. **Identical catalogs:** every running, non-halted broker reaches the same `CatalogState::digest()` at the same applied offset.
 4. **No DDL lost or duplicated:** each `requestId` that was answered `Ok` appears exactly once in the log; each refused one appears zero times.
-5. **History:** the shared library's `history()` over the log shows the op with the right `kind`, `objectId`, `prevVersion → newVersion`, `statement`, `principal.requestId`.
+5. **History:** the shared library's `history()` over the log shows the op with the right `kind`, `objectId`, `prevVersion → newVersion`, `statement`, `principal.requestId` (128-bit) and `principal.requestFingerprint`.
 6. **Serving (C1 generalized):** a topic serves on a broker iff its `CreateTopic` is applied there and its placement is committed.
 
 ### Coverage by layer
@@ -171,47 +217,58 @@ Also pinned: a new catalog leader refuses DDL until it applied up to its HW (`Ca
 
 | File | Responsibility | Task |
 |---|---|---|
-| `rune-codec/include/rune/catalog/CatalogEvent.h`, `src/catalog/CatalogEvent.cpp` | event model, kinds, v1 fixed-layout encode/decode | 1 |
+| `rune-protocol/include/rune/protocol/CatalogTypes.h` | the ONE `TopicConfig` definition (owned + view instantiations) and `RequestId` (F32, F14) — header-only, std-only | 1 |
+| `rune-codec/include/rune/catalog/CatalogEvent.h`, `src/catalog/CatalogEvent.cpp` | event model, kinds, resolved alter ops, v1 fixed-layout encode/decode | 1 |
 | `rune-codec/include/rune/catalog/CatalogState.h`, `src/catalog/CatalogState.cpp`, `src/catalog/ApplyV1.cpp`, `include/rune/catalog/CatalogFingerprint.h`, `src/catalog/CatalogFingerprint.cpp` | state, frozen v1 rules, fingerprints, digest | 2 |
-| `rune-codec/include/rune/catalog/CatalogReplayer.h`, `CatalogQueries.h`, `CatalogFile.h` + `src/catalog/*.cpp`, `tools/make_catalog_golden.cpp`, `tests/catalog/golden/v1/*.rcat`, `benchmark/CatalogReplayBench.cpp` | replayer, history / as-of / diff, `.rcat`, golden logs, replay bench | 3 |
+| `rune-codec/include/rune/catalog/CatalogReplayer.h`, `CatalogQueries.h`, `CatalogFile.h` + `src/catalog/*.cpp`, `tools/make_catalog_golden.cpp`, `tests/catalog/golden/v1/*.rcat`, `benchmark/CatalogReplayBench.cpp`, `build-rel/` (Release build dir, not tracked) | replayer, history / as-of / diff, `.rcat`, golden logs, replay bench | 3 |
 | `rune-codec/CMakeLists.txt`, `tests/catalog/*Test.cpp` | `rune_catalog` lib + `rune_catalog_tests` | 1–3 |
-| `rune-protocol/include/rune/protocol/client/Protocol.h`, `SchemaMessages.h`, `tests/protocol/client/CatalogDdlMessagesTest.cpp`, `conformance/*` | templates 74–78, DDL extension, DefineTopic rf/config, `kCatalogTopicId`, client version 8 | 4 |
-| `rune-client-cpp/include/rune/client/Client.h`, `src/Client.cpp`, `include/rune/client/codec/Codec.h`, `tests/client/ClientDdlRedirectRegressionTest.cpp`, `tests/client/ClientCatalogDdlTest.cpp` | new DDL ops, DDL options, Redirect / NotLeader / InvalidRequest handling for control ops, request ids | 5 |
-| `libs/node/include/rune/node/CatalogPartition.h`, `AdminIsrChannel.h`, `libs/node/src/BrokerNode.cpp` (`buildCatalog_`), `MetadataService.h`, `NodeConfig.{h,cpp}` (`catalogReplStreamId`), `libs/node/tests/integration/CatalogReplicationTest.cpp` | `__catalog` partition, admin replication plane, controller-ISR placement, role/ISR relays | 6 |
-| `libs/node/include/rune/node/CatalogApplier.h`, `CatalogCheckpoint.h`, `libs/node/src/CatalogApplier.cpp`, `libs/node/tests/node/CatalogApplierTest.cpp` | apply in offset order, verify, halt, checkpoint, projections, effects | 7 |
+| `rune-protocol/include/rune/protocol/client/Protocol.h`, `SchemaMessages.h`, `Dispatch.h`, `tests/protocol/client/CatalogDdlMessagesTest.cpp`, `DispatchTest.cpp`, `ControlMessagesConnectTest.cpp`, `conformance/*` | templates 74–78 (known to `isKnownTemplate`), DDL extension, DefineTopic rf/config, `kCatalogTopicId`, client version 8 | 4 |
+| `rune-client-cpp/include/rune/client/Client.h`, `src/Client.cpp`, `include/rune/client/codec/Codec.h`, `tests/support/InvokerGateway.h`, `tests/client/ClientDdlRedirectRegressionTest.cpp`, `tests/client/ClientCatalogDdlTest.cpp`, `CMakeLists.txt` (embeddable: shared sibling targets guarded) | new DDL ops, DDL options, Redirect / NotLeader / InvalidRequest handling for control ops, 128-bit request ids | 5 |
+| `libs/node/include/rune/node/CatalogPartition.h`, `AdminIsrChannel.h`, `libs/node/src/BrokerNode.cpp` (`buildCatalog_`), `BrokerNode.h` (test hooks), `MetadataService.h`, `ReplicationMetadataBridge.h`, `NodeConfig.{h,cpp}` (`catalogReplStreamId`), `libs/node/tests/integration/CatalogReplicationTest.cpp` | `__catalog` partition, admin replication plane, controller-ISR placement, role/ISR relays | 6 |
+| `libs/node/include/rune/node/CatalogApplier.h`, `CatalogCheckpoint.h`, `libs/node/src/CatalogApplier.cpp`, `libs/node/tests/node/CatalogApplierTest.cpp`, `libs/node/tests/support/CatalogRig.h`, `libs/node/tests/node/CatalogAllocRegressionTest.cpp` (own binary) | apply in offset order, verify, halt, checkpoint, projections, effects (phase variant) | 7 |
 | `libs/gateway/include/rune/gateway/TopicRegistry.h`, `libs/gateway/src/TopicRegistry.cpp`, `libs/node/src/BrokerNode.cpp` (control drain), `libs/node/include/rune/node/AdminChannels.h`, `LogCleanerAgent.h`, `WorkerViewSet.{h,cpp}`, `libs/metadata/include/rune/metadata/MetadataExtensions.h`, `MetadataStateMachine.cpp`, `libs/node/tests/node/CatalogEffectsTest.cpp`, `libs/gateway/tests/gateway/CatalogGatewayTest.cpp` | control-thread effects, drop/purge, config override, view uninstall, placement add/remove | 8 |
 | `libs/node/include/rune/node/AdminWorker.h`, `libs/node/src/AdminWorker.cpp`, `AdminChannels.h`, `DdlAnswerGate.h`, `AdminCreateTopic.h` (deleted), `libs/gateway/include/rune/gateway/IAdminRequestSink.h`, `ClientGateway.{h,cpp}`, `TopicRegistry.{h,cpp}`, `libs/node/tests/support/CatalogDdlRig.h`, `libs/node/tests/node/CatalogWritePathTest.cpp` + ported DDL tests | write path through the catalog leader; new DDL ops; rf bounds; dedupe | 9 |
 | `libs/node/tests/support/{DdlHarness,DdlExpectations}.h`, `libs/node/tests/node/Ddl*Test.cpp`, `libs/node/tests/integration/DdlConformanceBrokerRegressionTest.cpp` | DDL conformance suite ported to the catalog | 10 |
-| `libs/gateway/include/rune/gateway/CatalogRoute.h`, `ClientGateway.cpp`, `AdminWorker.cpp`, `BrokerNode.cpp`, `libs/node/tests/node/CatalogLeadershipTest.cpp` | Redirect, NotLeader, catch-up gate, minIsr, halted | 11 |
+| `libs/gateway/include/rune/gateway/CatalogRoute.h`, `ClientGateway.cpp`, `AdminWorker.cpp`, `BrokerNode.cpp`, `libs/node/tests/node/CatalogLeadershipTest.cpp`, root `CMakeLists.txt` + `libs/node/CMakeLists.txt` (`rune_client_broker_tests`), `libs/node/tests/client/ClientDdlBrokerRegressionTest.cpp` | Redirect, NotLeader, catch-up gate, minIsr, halted, pre-v8 sessions; the real client against a real broker | 11 |
 | `libs/node/include/rune/node/CatalogReadServer.h`, `libs/node/src/CatalogReadServer.cpp`, `ClientGateway.cpp`, `libs/node/tests/node/CatalogReadServerTest.cpp` | `__catalog` Subscribe served by the admin thread | 12 |
-| `rune-client-cpp/include/rune/client/catalog/CatalogReader.h`, `src/catalog/CatalogReader.cpp`, `TopicHandle.h`, `Subscription.h`, `tests/catalog/CatalogReaderTest.cpp`, `CMakeLists.txt` | history / as-of / diff client API | 13 |
-| `rune-ql/include/rune/ql/{Ast,Parser,Backends}.h`, `src/{Parser,Backends}.cpp`, `tests/CatalogStatementsTest.cpp` | `SHOW HISTORY`, `AS OF`, `DIFF`, `DROP`, `ALTER … SET`, `replicas`, `with (…)`, untyped topics | 14 |
-| `rune-client-cpp/src/cli/Cli.cpp`, `src/cli/CatalogCommands.cpp`, `include/rune/cli/CatalogCommands.h`, `include/rune/client/view/ViewPlanAuthor.h`, `tests/RuneCliCatalogTest.cpp`, `tests/support/CatalogFakes.h` | `rune ql`, `rune catalog export|replay|diff` | 15 |
+| `rune-client-cpp/include/rune/client/catalog/CatalogReader.h`, `src/catalog/CatalogReader.cpp`, `TopicHandle.h`, `Subscription.h`, `tests/catalog/CatalogReaderTest.cpp`, `CMakeLists.txt`; broker `libs/node/tests/client/ClientCatalogReadBrokerRegressionTest.cpp` | history / as-of / diff client API | 13 |
+| `rune-ql/include/rune/ql/{Ast,Parser,Backends}.h`, `src/{Parser,Backends}.cpp`, `tests/CatalogStatementsTest.cpp`, `CMakeLists.txt` (`RUNE_PROTOCOL_INCLUDE`) | `SHOW HISTORY`, `AS OF`, `DIFF`, `DROP`, `ALTER … SET`, `replicas`, `with (…)`, untyped topics, `parseScript` | 14 |
+| `rune-client-cpp/src/cli/Cli.cpp`, `src/cli/CatalogCommands.cpp`, `include/rune/cli/CatalogCommands.h`, `include/rune/client/view/ViewPlanAuthor.h`, `tests/RuneCliCatalogTest.cpp` (offline); broker `libs/node/tests/client/RuneCliBrokerRegressionTest.cpp` | `rune ql`, `rune catalog export|replay|diff` | 15 |
 | `libs/node/src/BrokerNode.cpp`, `RuntimeTopicRecovery.{h,cpp}` (deleted), `TopicDirReconcile.{h,cpp}` (new), `SchemaRegistry.{h,cpp}`, `ViewRegistry.{h,cpp}`, `AdminWorker.{h,cpp}`, `libs/node/tests/node/CatalogBootTest.cpp` | boot from the catalog; retire `__topic_schemas`/`__views`/recovery | 16 |
-| `NodeConfig.{h,cpp}`, `libs/node/tests/support/TestCluster.h`, `libs/node/tests/node/{BrokerNode,BrokerNodeGateway,NodeConfig,DdlHarnessRegression,TestCluster}Test.cpp`, `benchmark/FusedRuntimePassBench.cpp` | delete `RUNE_TOPICS`/`topics`/`rf=`; `TestCluster::defineTopic`; node tests migrated | 17 |
-| the 21 `libs/node/tests/integration/*Test.cpp` listed in Task 18, `tests/integration/ClusterHarness.h` | integration tests create topics by DDL | 18 |
-| `docker/*`, `docker/topics/*.rql`, `docker/create-topics.sh`, `dr-e2e/**`, `bench/kafka-compare/*`, `docs/**`, `scripts/check_no_rune_topics.py`, `CMakeLists.txt` | scripts migrated to DDL; grep gate | 19 |
+| `NodeConfig.{h,cpp}`, `FdBudget.{h,cpp}`, `src/main.cpp`, `AdminWorker.cpp` (comment), `libs/node/tests/support/TestCluster.h`, `libs/node/tests/node/{BrokerNode,BrokerNodeGateway,NodeConfig,DdlHarnessRegression,TestCluster,FdBudget}Test.cpp`, `benchmark/FusedRuntimePassBench.cpp` | delete `RUNE_TOPICS`/`topics`/`rf=`; FD budget from the catalog; `TestCluster::defineTopic`; node tests migrated | 17 |
+| the 21 `libs/node/tests/integration/*Test.cpp` listed in Task 18 + `CreateViewRegressionTest.cpp`, `SchemaGatewayTest.cpp` (comments) | integration tests create topics by DDL | 18 |
+| `docker/*`, `docker/topics/*.rql`, `docker/create-topics.sh`, `dr-e2e/**`, `bench/kafka-compare/*`, `docs/**`, `scripts/check_no_rune_topics.py`, `scripts/rune_topics_allowlist.txt`, `.gitignore`, `build-release/` (untracked), `CMakeLists.txt` | scripts migrated to DDL; grep gate with an explicit allowlist | 19 |
 | `libs/node/tests/support/{CatalogMatrixExpectations,CatalogClusterHarness}.h`, `libs/replication/include/rune/replication/testing/FilteringTransport.h`, `libs/node/tests/node/CatalogInteractionMatrixRegressionTest.cpp` | matrix table + parameterized unit matrix | 20 |
 | `libs/node/tests/support/CatalogModel.h`, `libs/node/tests/node/CatalogStressRegressionTest.cpp` | seeded model-checked stress | 21 |
-| `libs/node/tests/integration/CatalogClusterIntegrationTest.cpp` | 3-node BrokerNode slice | 22 |
-| `benchmark/CatalogBootReplayBench.cpp`, `libs/node/tests/node/CatalogGatesRegressionTest.cpp` | 10k boot replay < 1 s, hot-path parity, idle zero-alloc | 23 |
-| `docker/catalog-e2e.sh`, `docker/docker-compose.catalog.yml`, `docker/topics/*.rql` | docker e2e | 24 |
+| `libs/node/tests/integration/CatalogClusterIntegrationTest.cpp`, `libs/node/tests/support/ThreeNodes.h` (moved out of `CatalogReplicationTest.cpp`), `libs/node/tests/client/ClientDdlClusterRegressionTest.cpp` | 3-node BrokerNode slice; the real client through every broker | 22 |
+| `benchmark/CatalogBootReplayBench.cpp`, `libs/node/tests/node/CatalogGatesRegressionTest.cpp`, `libs/node/tests/node/CatalogAllocRegressionTest.cpp` (append) | 10k boot replay < 1 s, hot-path parity, idle zero-alloc | 23 |
+| `docker/catalog-e2e.sh`, `docker/docker-compose.catalog.yml`, `docker/topics/*.rql`, `rune-client-cpp/examples/view_probe.cpp` (`--create-only`) | docker e2e | 24 |
 | `docs/SELF-HOSTING.md`, `docs/CATALOG.md`, `docs/release-notes/catalog-history.md` | docs | 25 |
 
 ---
 ### Task 1: `rune_catalog` — the event model and its frozen v1 encoding (rune-codec)
 
-Spec §4: one fixed-layout, versioned record per event. This task defines the in-memory event (`CatalogEvent`), the nine kinds of §2 plus the reserved tenant/ACL range, and the `formatVer = 1` wire layout (encode + bounds-checked decode). Nothing else in the plan encodes or decodes an event by hand.
+Spec §4: one fixed-layout, versioned record per event. This task defines the in-memory event (`CatalogEvent`), the nine kinds of §2 plus the reserved tenant/ACL range, and the `formatVer = 1` wire layout (encode + bounds-checked decode). Nothing else in the plan encodes or decodes an event by hand. It also creates the ONE `TopicConfig` definition and the 128-bit `RequestId` in rune-protocol (F32, F14), because this is the first task that needs them; Task 4 (wire), Task 5 (client) and Task 14 (rune-ql) reuse them.
 
 **Files:**
+- Create: `rune-protocol/include/rune/protocol/CatalogTypes.h` (header-only, std-only: `BasicTopicConfig<Str>`, `TopicConfig`, `TopicConfigView`, `convertTopicConfig`, `RequestId`, `RequestIdHash`)
 - Create: `rune-codec/include/rune/catalog/CatalogEvent.h`
 - Create: `rune-codec/src/catalog/Wire.h` (internal LE writer / reader)
 - Create: `rune-codec/src/catalog/CatalogEvent.cpp`
-- Modify: `rune-codec/CMakeLists.txt` (new `rune_catalog` library + `rune_catalog_tests`)
+- Modify: `rune-codec/CMakeLists.txt` (new `rune_catalog` library + `rune_catalog_tests`; `RUNE_PROTOCOL_INCLUDE` cache path, default `${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include`, on `rune_catalog`'s PUBLIC include dirs — the broker and the client already pass it)
 - Test: `rune-codec/tests/catalog/CatalogEventTest.cpp`
 
 **Interfaces:**
-- Consumes: `rune::codec::CompatMode` (`include/rune/codec/AlterOps.h`).
+- Consumes: `rune::codec::{CompatMode, AlterOpType, PrimType}` (`include/rune/codec/AlterOps.h`, `PrimType.h`); `rune::protocol::{TopicConfig, RequestId, RequestIdHash}` (created here).
+- Produces (namespace `rune::protocol`, `rune-protocol/include/rune/protocol/CatalogTypes.h`):
+  ```cpp
+  template <class Str> struct BasicTopicConfig;              // every field + its ONE default (F32)
+  using TopicConfig     = BasicTopicConfig<std::string>;      // owned: catalog, client, rune-ql
+  using TopicConfigView = BasicTopicConfig<std::string_view>; // the wire's zero-copy decode (Task 4)
+  template <class To, class From> [[nodiscard]] To convertTopicConfig(const From&);   // the one field-for-field copy
+  struct RequestId { uint64_t hi = 0, lo = 0; constexpr bool none() const noexcept; auto operator<=>(const RequestId&) const = default; };
+  struct RequestIdHash { std::size_t operator()(const RequestId&) const noexcept; };
+  ```
 - Produces (namespace `rune::catalog`) — used by every later task:
   ```cpp
   enum class EventKind : uint16_t { CreateTopic = 1, DropTopic = 2, AlterTopicConfig = 3,
@@ -219,7 +276,9 @@ Spec §4: one fixed-layout, versioned record per event. This task defines the in
   inline constexpr uint16_t kFormatV1 = 1, kCurrentFormatVer = kFormatV1;
   inline constexpr uint16_t kReservedKindFirst = 32, kReservedKindLast = 63;   // tenants + ACLs
   enum class Persistence : uint8_t { Disk = 0, Transient = 1 };
-  struct TopicConfig;  struct SchemaDef;  struct ViewDef;  enum class ConfigKey : uint8_t;  struct ConfigChange;
+  using TopicConfig = rune::protocol::TopicConfig;  using RequestId = rune::protocol::RequestId;
+  struct SchemaDef;  struct ViewDef;  enum class ConfigKey : uint8_t;  struct ConfigChange;
+  struct ResolvedAlterOp;   // an AlterSchema op with every field named by durable tag (spec §4, F20)
   struct CreateTopicOps; struct DropTopicOps; struct AlterTopicConfigOps; struct CreateSchemaOps;
   struct AlterSchemaOps; struct SetCompatibilityOps; struct CreateViewOps; struct AlterViewOps; struct DropViewOps;
   using Ops = std::variant<CreateTopicOps, DropTopicOps, AlterTopicConfigOps, CreateSchemaOps, AlterSchemaOps,
@@ -254,7 +313,8 @@ rc::CatalogEvent baseEvent(rc::Ops ops) {
     e.statement = "topic players { id int64 } partitions 3 key id;";
     e.ops = std::move(ops);
     e.principal = rc::Principal{.sessionId = 42, .clientName = "cli", .sourceAddress = "aeron:udp?endpoint=10.0.0.5:40500",
-                                .authenticated = "", .requestId = 0xABCDEFull};
+                                .authenticated = "", .requestId = {.hi = 0x0123456789ABCDEFull, .lo = 0xABCDEFull},
+                                .requestFingerprint = 0x5151515151515151ull};
     e.timestampMs = 1'760'000'000'000;
     e.fingerprint = 0x1122334455667788ull;
     return e;
@@ -277,7 +337,10 @@ std::vector<rc::Ops> everyKind() {
     return {typedCreate(), rc::DropTopicOps{.topicId = 3},
             rc::AlterTopicConfigOps{.changes = {{rc::ConfigKey::RetentionMs, 1000}, {rc::ConfigKey::RetentionBytes, -1}}},
             rc::CreateSchemaOps{.schema = {.keyField = "id", .validate = false, .descriptorBlob = {5, 6}, .nextTag = 2}},
-            rc::AlterSchemaOps{.alterOpsBlob = {1, 0, 2}},
+            rc::AlterSchemaOps{.ops = {{.type = rune::codec::AlterOpType::Add, .tag = 2, .name = "mana",
+                                        .primType = rune::codec::PrimType::Int32},
+                                       {.type = rune::codec::AlterOpType::Rename, .tag = 1, .name = "health"},
+                                       {.type = rune::codec::AlterOpType::Drop, .tag = 0}}},
             rc::SetCompatibilityOps{.mode = rune::codec::CompatMode::Forward},
             rc::CreateViewOps{.view = viewDef()}, rc::AlterViewOps{.view = viewDef()}, rc::DropViewOps{.viewTopicId = 9}};
 }
@@ -293,9 +356,15 @@ TEST(CatalogEventRegression, EveryKindRoundTripsByteExactly) {
         EXPECT_EQ(rc::encode(*d), bytes) << rc::kindName(e.kind);
         EXPECT_EQ(d->kind, e.kind);
         EXPECT_EQ(d->ops.index(), e.ops.index());
-        EXPECT_EQ(d->principal.requestId, 0xABCDEFull);
+        EXPECT_EQ(d->principal.requestId, (rc::RequestId{0x0123456789ABCDEFull, 0xABCDEFull})) << "128-bit request id (F14)";
+        EXPECT_EQ(d->principal.requestFingerprint, 0x5151515151515151ull);
         ASSERT_TRUE(d->replayedFrom.has_value());
         EXPECT_EQ(d->replayedFrom->offset, 12);
+        if (const auto* a = std::get_if<rc::AlterSchemaOps>(&d->ops)) {   // F20: durable tags, never names
+            ASSERT_EQ(a->ops.size(), 3u);
+            EXPECT_EQ(a->ops[0].tag, 2); EXPECT_EQ(a->ops[1].tag, 1); EXPECT_EQ(a->ops[1].name, "health");
+            EXPECT_EQ(a->ops[2].type, rune::codec::AlterOpType::Drop); EXPECT_TRUE(a->ops[2].name.empty());
+        }
     }
 }
 
@@ -383,9 +452,11 @@ TEST(CatalogEventRegression, EncodeIntoReusesCapacity) {
 # ── rune_catalog — the shared catalog-history library (spec §6): event model,
 #    frozen per-formatVer apply rules, fingerprints, replayer, queries, .rcat.
 #    Linked by the broker (AdminWorker), the client and the rune CLI.
+set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include" CACHE PATH
+    "rune-protocol include dir (rune/protocol/CatalogTypes.h: the one TopicConfig + RequestId)")
 add_library(rune_catalog STATIC
     src/catalog/CatalogEvent.cpp)
-target_include_directories(rune_catalog PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(rune_catalog PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${RUNE_PROTOCOL_INCLUDE})
 target_link_libraries(rune_catalog PUBLIC rune_codec)
 target_compile_features(rune_catalog PUBLIC cxx_std_23)
 ```
@@ -404,6 +475,87 @@ gtest_discover_tests(rune_catalog_tests)
 Run: `cmake /Users/vradu/Projects/se-worktrees/rune-codec/build && cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build -j14 --target rune_catalog_tests`
 Expected: compile error `'rune/catalog/CatalogEvent.h' file not found`.
 
+- [ ] **Step 4a: Create `rune-protocol/include/rune/protocol/CatalogTypes.h`** (F32, F14 — the one definition; Task 4 pins it with protocol tests):
+
+```cpp
+#pragma once
+// rune/protocol/CatalogTypes.h — catalog history: the ONE definition of a topic's
+// creation config (F32) and of a DDL request id (F14), shared by rune-codec's
+// rune_catalog, the wire (client/SchemaMessages.h), the client and rune-ql.
+// Header-only and std-only: rune-codec and rune-ql include it with no other
+// protocol header.  Defaults = today's TopicSpec defaults; no other copy exists.
+#include <compare>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <string>
+#include <string_view>
+
+namespace rune::protocol {
+
+/// Str = std::string (owned) or std::string_view (the wire's zero-copy decode).
+template <class Str>
+struct BasicTopicConfig {
+    uint8_t cleanupPolicy             = 0;            // 0 Delete, 1 Compact, 2 CompactDelete
+    int64_t retentionMs               = -1;
+    int64_t retentionBytes            = -1;
+    int64_t deleteRetentionMs         = 86'400'000;
+    int32_t minCleanableDirtyRatioPpm = 500'000;      // 0.5
+    int64_t segmentRollBytes          = 64LL * 1024 * 1024;
+    int64_t minCompactionLagMs        = 0;
+    int64_t maxCompactionLagMs        = -1;
+    int64_t retentionCheckMs          = 300'000;
+    int64_t fileDeleteDelayMs         = 60'000;
+    uint8_t durability                = 0;            // 0 Majority, 1 AllInSync
+    uint8_t durabilityTier            = 1;            // 0 Leader, 1 Majority, 2 Strict
+    Str     coPartitionGroup{};
+    Str     partitionKey{};
+    bool operator==(const BasicTopicConfig&) const = default;
+};
+using TopicConfig     = BasicTopicConfig<std::string>;
+using TopicConfigView = BasicTopicConfig<std::string_view>;
+
+/// The one field-for-field copy between the two instantiations.
+template <class To, class From>
+[[nodiscard]] To convertTopicConfig(const From& f) {
+    To t;
+    t.cleanupPolicy = f.cleanupPolicy; t.retentionMs = f.retentionMs; t.retentionBytes = f.retentionBytes;
+    t.deleteRetentionMs = f.deleteRetentionMs; t.minCleanableDirtyRatioPpm = f.minCleanableDirtyRatioPpm;
+    t.segmentRollBytes = f.segmentRollBytes; t.minCompactionLagMs = f.minCompactionLagMs;
+    t.maxCompactionLagMs = f.maxCompactionLagMs; t.retentionCheckMs = f.retentionCheckMs;
+    t.fileDeleteDelayMs = f.fileDeleteDelayMs; t.durability = f.durability; t.durabilityTier = f.durabilityTier;
+    t.coPartitionGroup = decltype(t.coPartitionGroup)(f.coPartitionGroup);
+    t.partitionKey     = decltype(t.partitionKey)(f.partitionKey);
+    return t;
+}
+
+/// A DDL's logical id (F14): hi = the issuing client instance's random 64-bit id
+/// (never 0), lo = that instance's counter.  {0, 0} = none (a pre-v8 client).
+/// Stable across every resend of the same DDL.
+struct RequestId {
+    uint64_t hi = 0;
+    uint64_t lo = 0;
+    [[nodiscard]] constexpr bool none() const noexcept { return hi == 0 && lo == 0; }
+    auto operator<=>(const RequestId&) const = default;
+};
+struct RequestIdHash {
+    std::size_t operator()(const RequestId& r) const noexcept {
+        return std::hash<uint64_t>{}(r.hi * 0x9E3779B97F4A7C15ull ^ r.lo);
+    }
+};
+
+} // namespace rune::protocol
+```
+
+Commit it in rune-protocol before Step 4 (the codec includes it through `RUNE_PROTOCOL_INCLUDE`):
+
+```bash
+git -C /Users/vradu/Projects/se-worktrees/rune-protocol add include/rune/protocol/CatalogTypes.h
+git -C /Users/vradu/Projects/se-worktrees/rune-protocol commit -m "feat(protocol): CatalogTypes.h — the one TopicConfig definition + 128-bit RequestId (catalog history F32/F14)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
 - [ ] **Step 4: Implement `CatalogEvent.h`**
 
 ```cpp
@@ -418,11 +570,14 @@ Expected: compile error `'rune/catalog/CatalogEvent.h' file not found`.
 //   i64 timestampMs | u64 fingerprint |
 //   str16 objectName | str32 statement |
 //   principal: i64 sessionId, str16 clientName, str16 sourceAddress,
-//              str16 authenticated, u64 requestId |
+//              str16 authenticated, u64 requestIdHi, u64 requestIdLo,
+//              u64 requestFingerprint |
 //   u8 hasReplayedFrom [str16 clusterId, i64 offset, str16 principal] |
 //   bytes32 ops  = u8 opsTag (== kind) + the kind's body (see CatalogEvent.cpp)
 // str16 = u16 length + bytes; str32/bytes32 = u32 length + bytes.
 #include <rune/codec/AlterOps.h>
+#include <rune/codec/PrimType.h>
+#include <rune/protocol/CatalogTypes.h>
 
 #include <cstdint>
 #include <expected>
@@ -448,24 +603,12 @@ inline constexpr uint16_t kReservedKindLast  = 63;
 
 enum class Persistence : uint8_t { Disk = 0, Transient = 1 };
 
-/// Every TopicSpec property a CreateTopic fixes.  Defaults = today's TopicSpec defaults.
-struct TopicConfig {
-    uint8_t     cleanupPolicy             = 0;            // 0 Delete, 1 Compact, 2 CompactDelete
-    int64_t     retentionMs               = -1;
-    int64_t     retentionBytes            = -1;
-    int64_t     deleteRetentionMs         = 86'400'000;
-    int32_t     minCleanableDirtyRatioPpm = 500'000;      // 0.5
-    int64_t     segmentRollBytes          = 64LL * 1024 * 1024;
-    int64_t     minCompactionLagMs        = 0;
-    int64_t     maxCompactionLagMs        = -1;
-    int64_t     retentionCheckMs          = 300'000;
-    int64_t     fileDeleteDelayMs         = 60'000;
-    uint8_t     durability                = 0;            // 0 Majority, 1 AllInSync
-    uint8_t     durabilityTier            = 1;            // 0 Leader, 1 Majority, 2 Strict
-    std::string coPartitionGroup;
-    std::string partitionKey;
-    bool operator==(const TopicConfig&) const = default;
-};
+/// Every TopicSpec property a CreateTopic fixes — the ONE definition lives in rune-protocol
+/// (F32): the wire, the client and rune-ql use the same struct and the same defaults.
+using TopicConfig   = rune::protocol::TopicConfig;
+/// The client's id of the logical DDL (F14, ruling 9): 128-bit, stable across retries.
+using RequestId     = rune::protocol::RequestId;
+using RequestIdHash = rune::protocol::RequestIdHash;
 
 /// AlterTopicConfig keys (ruling 5).  Append-only.
 enum class ConfigKey : uint8_t {
@@ -505,7 +648,18 @@ struct CreateTopicOps {
 struct DropTopicOps        { int32_t topicId = -1; };
 struct AlterTopicConfigOps { std::vector<ConfigChange> changes; };
 struct CreateSchemaOps     { SchemaDef schema; };
-struct AlterSchemaOps      { std::vector<uint8_t> alterOpsBlob; };   // rune::codec::encodeAlterOps
+/// One AlterSchema operation RESOLVED against the evolving descriptor (spec §4, F20):
+/// every field is named by its durable tag (FieldDescriptor::id), never by name.
+struct ResolvedAlterOp {
+    rune::codec::AlterOpType type     = rune::codec::AlterOpType::Add;
+    uint16_t                 tag      = 0;     // Add: the tag it is assigned; Drop / Rename: the field's tag; SetCompat: 0
+    std::string              name;            // Add: the new field's name; Rename: the NEW name; otherwise empty
+    rune::codec::PrimType    primType = rune::codec::PrimType::Int32;          // Add only
+    uint16_t                 fixedLen = 0;                                     // Add only (FixedStr width)
+    rune::codec::CompatMode  mode     = rune::codec::CompatMode::Backward;     // SetCompatibility only
+    bool operator==(const ResolvedAlterOp&) const = default;
+};
+struct AlterSchemaOps      { std::vector<ResolvedAlterOp> ops; };   // resolved (F20) — never encodeAlterOps names
 struct SetCompatibilityOps { rune::codec::CompatMode mode = rune::codec::CompatMode::Backward; };
 struct CreateViewOps       { ViewDef view; };
 struct AlterViewOps        { ViewDef view; };                          // a FRESH sink (ruling 4)
@@ -516,13 +670,16 @@ using Ops = std::variant<CreateTopicOps, DropTopicOps, AlterTopicConfigOps, Crea
 
 /// Until authentication exists: session id, client name and source address.  Afterwards
 /// `authenticated` carries the principal (same field, no layout change).  `requestId` is
-/// the client's id of the logical DDL, stable across retries (ruling 9).
+/// the client's id of the logical DDL, stable across retries (ruling 9, F14); the leader's
+/// `requestFingerprint` (FNV-1a-64 over the request's statement and operation bytes, Task 9)
+/// lets a retry be told apart from a different statement that reuses the id.
 struct Principal {
     int64_t     sessionId = 0;
     std::string clientName;
     std::string sourceAddress;
     std::string authenticated;
-    uint64_t    requestId = 0;
+    RequestId   requestId{};               // {0, 0} = none (a pre-v8 client)
+    uint64_t    requestFingerprint = 0;
 };
 /// Set only on events written by `rune catalog replay` (spec §7).
 struct ReplayedFrom {
@@ -687,7 +844,11 @@ void putOps(Writer& w, const Ops& ops) {
         } else if constexpr (std::is_same_v<T, CreateSchemaOps>) {
             putSchema(w, o.schema);
         } else if constexpr (std::is_same_v<T, AlterSchemaOps>) {
-            w.bytes32(o.alterOpsBlob);
+            w.u16(static_cast<uint16_t>(o.ops.size()));
+            for (const auto& a : o.ops) {   // u8 type, u16 tag, str16 name, u8 primType, u16 fixedLen, u8 mode
+                w.u8(static_cast<uint8_t>(a.type)); w.u16(a.tag); w.str16(a.name);
+                w.u8(static_cast<uint8_t>(a.primType)); w.u16(a.fixedLen); w.u8(static_cast<uint8_t>(a.mode));
+            }
         } else if constexpr (std::is_same_v<T, SetCompatibilityOps>) {
             w.u8(static_cast<uint8_t>(o.mode));
         } else if constexpr (std::is_same_v<T, CreateViewOps> || std::is_same_v<T, AlterViewOps>) {
@@ -761,7 +922,20 @@ std::expected<Ops, DecodeError> getOps(Reader& r, EventKind kind) {
         return o;
     }
     case EventKind::CreateSchema: { CreateSchemaOps o; if (auto e = getSchema(r, o.schema)) return std::unexpected(*e); return o; }
-    case EventKind::AlterSchema: { AlterSchemaOps o; if (!r.bytes32(o.alterOpsBlob)) return std::unexpected(DecodeError::Truncated); return o; }
+    case EventKind::AlterSchema: {
+        AlterSchemaOps o; uint16_t n; if (!r.u16(n)) return std::unexpected(DecodeError::Truncated);
+        o.ops.resize(n);
+        for (auto& a : o.ops) {
+            uint8_t t, pt, m;
+            if (!r.u8(t) || !r.u16(a.tag) || !r.str16(a.name) || !r.u8(pt) || !r.u16(a.fixedLen) || !r.u8(m))
+                return std::unexpected(DecodeError::Truncated);
+            if (t < 1 || t > 4 || pt > static_cast<uint8_t>(rune::codec::PrimType::FixedStr) || m > 1)
+                return std::unexpected(DecodeError::BadEnum);
+            a.type = static_cast<rune::codec::AlterOpType>(t); a.primType = static_cast<rune::codec::PrimType>(pt);
+            a.mode = static_cast<rune::codec::CompatMode>(m);
+        }
+        return o;
+    }
     case EventKind::SetCompatibility: {
         uint8_t m; if (!r.u8(m)) return std::unexpected(DecodeError::Truncated);
         if (m > 1) return std::unexpected(DecodeError::BadEnum);
@@ -787,7 +961,8 @@ void encodeInto(const CatalogEvent& e, std::vector<uint8_t>& out) {
     w.u32(e.prevVersion); w.u32(e.newVersion); w.i64(e.timestampMs); w.u64(e.fingerprint);
     w.str16(e.objectName); w.str32(e.statement);
     w.i64(e.principal.sessionId); w.str16(e.principal.clientName); w.str16(e.principal.sourceAddress);
-    w.str16(e.principal.authenticated); w.u64(e.principal.requestId);
+    w.str16(e.principal.authenticated); w.u64(e.principal.requestId.hi); w.u64(e.principal.requestId.lo);
+    w.u64(e.principal.requestFingerprint);
     w.u8(e.replayedFrom ? 1 : 0);
     if (e.replayedFrom) { w.str16(e.replayedFrom->clusterId); w.i64(e.replayedFrom->offset); w.str16(e.replayedFrom->principal); }
     const std::size_t lenAt = w.size();
@@ -812,7 +987,8 @@ std::expected<CatalogEvent, DecodeError> decode(std::span<const uint8_t> bytes) 
         if (!r.u64(e.objectId) || !r.u32(e.prevVersion) || !r.u32(e.newVersion) || !r.i64(e.timestampMs) ||
             !r.u64(e.fingerprint) || !r.str16(e.objectName) || !r.str32(e.statement) ||
             !r.i64(e.principal.sessionId) || !r.str16(e.principal.clientName) ||
-            !r.str16(e.principal.sourceAddress) || !r.str16(e.principal.authenticated) || !r.u64(e.principal.requestId))
+            !r.str16(e.principal.sourceAddress) || !r.str16(e.principal.authenticated) ||
+            !r.u64(e.principal.requestId.hi) || !r.u64(e.principal.requestId.lo) || !r.u64(e.principal.requestFingerprint))
             return std::unexpected(DecodeError::Truncated);
         uint8_t hasReplay; if (!r.u8(hasReplay)) return std::unexpected(DecodeError::Truncated);
         if (hasReplay > 1) return std::unexpected(DecodeError::BadEnum);
@@ -867,7 +1043,7 @@ Note the truncation test: a prefix that cuts inside the length-prefixed ops blob
 - [ ] **Step 7: Run the tests**
 
 Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build -j14 --target rune_catalog_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-codec/build -R 'CatalogEvent' --output-on-failure -j14`
-Expected: all 8 `CatalogEventRegression.*` PASS.
+Expected: all 9 `CatalogEventRegression.*` PASS.
 
 - [ ] **Step 8: Commit**
 
@@ -904,7 +1080,8 @@ Spec §5.3 / §6: applying an event = the rules of its `formatVer`, then verifyi
   struct Tombstone   { uint64_t objectId; std::string name; uint32_t finalVersion; bool wasView; };
   struct Applied     { EventKind kind; uint64_t objectId; uint32_t newVersion; uint64_t fingerprint;
                        int32_t createdTopicId; int32_t droppedTopicId; };   // -1 when none
-  struct RequestRecord { int64_t offset; EventKind kind; uint64_t objectId; uint32_t newVersion; int32_t topicId; uint16_t schemaVersion; };
+  struct RequestRecord { int64_t offset; EventKind kind; uint64_t objectId; uint32_t newVersion; int32_t topicId; uint16_t schemaVersion;
+                         uint64_t requestFingerprint; };   // F14: dedupe keys on (requestId, requestFingerprint)
   struct ApplyError  { int64_t offset; enum class Code : uint8_t { UnsupportedFormat, Precondition,
                        FingerprintMismatch, BadOps } code; uint64_t expected; uint64_t actual; std::string detail; };
   class CatalogState { /* see Step 3 */ };
@@ -914,7 +1091,14 @@ Spec §5.3 / §6: applying an event = the rules of its `formatVer`, then verifyi
   [[nodiscard]] uint64_t fingerprintOf(const ViewObject&) noexcept;
   [[nodiscard]] uint64_t fingerprintOf(const Tombstone&) noexcept;
   [[nodiscard]] std::string_view applyErrorName(ApplyError::Code) noexcept;
+  // F20: the leader resolves name-based ALTER ops to durable tags; replay un-resolves them on a target.
+  [[nodiscard]] std::expected<std::vector<ResolvedAlterOp>, std::string>
+      resolveAlterOps(const SchemaState&, std::span<const rune::codec::AlterOp>);
+  [[nodiscard]] std::expected<std::vector<rune::codec::AlterOp>, std::string>
+      unresolveAlterOps(const SchemaState&, std::span<const ResolvedAlterOp>);
   ```
+
+`resolveAlterOps` walks the ops in order against the evolving descriptor (`deserialize(evolvingBlob)`): an ADD gets `tag = nextTag + (number of ADDs before it)`; a DROP / RENAME of a name resolves to that **live** field's `FieldDescriptor::id` (a later op sees the effect of an earlier RENAME in the same list); a SET COMPATIBILITY carries its mode; a name that is not live → error naming it. `unresolveAlterOps` is the inverse on any state with the same definition (same fingerprint): tag → the live field's current name; an ADD's tag must equal the running `nextTag` (else error). Both are pure; `apply` uses `unresolveAlterOps` (below), so a resolved op is checked against the exact state it applies to.
 
 **The frozen v1 apply rules** (in `ApplyV1.cpp`; every rule failing is `ApplyError::Precondition` naming the offset):
 
@@ -924,8 +1108,8 @@ Spec §5.3 / §6: applying an event = the rules of its `formatVer`, then verifyi
 | `DropTopic` | live topic with that `objectId`, name, `topicId`; `prevVersion == version`; `newVersion == version + 1`; no live view lists it in `sourceNames` | topic removed; `Tombstone{finalVersion = newVersion}` recorded; its name is free |
 | `AlterTopicConfig` | live topic; versions chain; `changes` non-empty, no key twice, `MinCleanableDirtyRatioPpm ∈ [0, 1'000'000]`, retention values `≥ -1` | the keys set; version + 1 |
 | `CreateSchema` | live **untyped** topic; versions chain | `schema` set (schemaVersion 1); version + 1 |
-| `AlterSchema` | live typed topic; versions chain; `decodeAlterOps` succeeds; `applyOps(evolving, ops, nextTag, schemaVersion+1)` succeeds | evolving blob replaced, `nextTag` advanced, `schemaVersion + 1`, a `SET COMPATIBILITY` op inside sets `compat`, a RENAME of the key field moves `keyField`; version + 1 |
-| `SetCompatibility` | live typed topic; versions chain | `compat = mode`, `schemaVersion + 1` (a compat change is a schema version, as today's `startAlter_`); version + 1 |
+| `AlterSchema` | live typed topic; versions chain; `ops` non-empty; `unresolveAlterOps(schema, ops)` succeeds (every tag live, every ADD's tag = the running `nextTag` — F20); `applyOps(evolving, unresolved, nextTag, schemaVersion+1)` succeeds | evolving blob replaced, `nextTag` advanced, `schemaVersion + 1`, a `SET COMPATIBILITY` op inside sets `compat`, a RENAME of the key field moves `keyField`; version + 1 |
+| `SetCompatibility` | live typed topic; versions chain; `applyOps(evolving, {SET_COMPATIBILITY mode}, nextTag, schemaVersion+1)` succeeds | exactly today's `startAlter_` (F9): the evolving blob is replaced by that `applyOps` result (its descriptor `version` becomes `schemaVersion + 1`), `compat = mode`, `schemaVersion + 1`; version + 1 |
 | `CreateView` | name free, `objectId == nextObjectId`, `view.viewTopicId == nextTopicId`, every `sourceNames[i]` a live topic, `prevVersion 0 → 1` | new `ViewObject`; `nextObjectId++`, `nextTopicId++` |
 | `AlterView` | live view; versions chain; `view.viewTopicId == nextTopicId` (a fresh sink, ruling 4); sources live | `def` replaced; version + 1; `nextTopicId++`; `Applied.droppedTopicId` = old sink id, `createdTopicId` = new |
 | `DropView` | live view with that `viewTopicId`; versions chain | view removed; tombstone; `droppedTopicId` = its sink |
@@ -1005,14 +1189,16 @@ TEST(CatalogApplyV1Regression, EveryPreconditionIsExplicit) {
     ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, false), "t", 1, 0, 1), 0));
     struct Case { const char* what; rc::CatalogEvent e; };
     std::vector<Case> cases;
-    { auto e = stamped(s, createOps(1, false), "t", 2, 0, 1); cases.push_back({"name taken", e}); }
+    { rc::CatalogEvent e; e.kind = rc::EventKind::CreateTopic; e.ops = createOps(1, false); e.objectName = "t";
+      e.objectId = 2; e.newVersion = 1; cases.push_back({"name taken", e}); }   // unstamped (F10): no preview of an invalid event
     { rc::CatalogEvent e; e.kind = rc::EventKind::CreateTopic; e.ops = createOps(7, false); e.objectName = "u";
       e.objectId = 2; e.newVersion = 1; cases.push_back({"topicId != nextTopicId", e}); }
     { rc::CatalogEvent e; e.kind = rc::EventKind::CreateTopic; e.ops = createOps(1, false); e.objectName = "u";
       e.objectId = 9; e.newVersion = 1; cases.push_back({"objectId != nextObjectId", e}); }
     { rc::CatalogEvent e; e.kind = rc::EventKind::DropTopic; e.ops = rc::DropTopicOps{0}; e.objectName = "t";
       e.objectId = 1; e.prevVersion = 3; e.newVersion = 4; cases.push_back({"version chain broken", e}); }
-    { rc::CatalogEvent e; e.kind = rc::EventKind::AlterSchema; e.ops = rc::AlterSchemaOps{{1}}; e.objectName = "t";
+    { rc::CatalogEvent e; e.kind = rc::EventKind::AlterSchema;
+      e.ops = rc::AlterSchemaOps{{rc::ResolvedAlterOp{.type = cd::AlterOpType::Drop, .tag = 0}}}; e.objectName = "t";
       e.objectId = 1; e.prevVersion = 1; e.newVersion = 2; cases.push_back({"alter of an untyped topic", e}); }
     for (auto& c : cases) {
         const uint64_t before = s.digest();
@@ -1029,7 +1215,11 @@ TEST(CatalogApplyV1Regression, SchemaLifecycleOnOneObject) {
     ASSERT_TRUE(rc::apply(s, stamped(s, rc::CreateSchemaOps{{.keyField = "id", .validate = false,
         .descriptorBlob = blob2(), .nextTag = 2}}, "t", 1, 1, 2), 1));                     // CreateSchema
     cd::AlterOp add{}; add.type = cd::AlterOpType::Add; add.name = "mana"; add.primType = cd::PrimType::Int32;
-    ASSERT_TRUE(rc::apply(s, stamped(s, rc::AlterSchemaOps{cd::encodeAlterOps({add})}, "t", 1, 2, 3), 2));
+    auto resolved = rc::resolveAlterOps(*s.topicByName("t")->schema, std::vector<cd::AlterOp>{add});
+    ASSERT_TRUE(resolved.has_value()) << resolved.error();
+    ASSERT_EQ(resolved->size(), 1u);
+    EXPECT_EQ((*resolved)[0].tag, 2) << "an ADD is stored with the durable tag it is assigned (F20)";
+    ASSERT_TRUE(rc::apply(s, stamped(s, rc::AlterSchemaOps{*resolved}, "t", 1, 2, 3), 2));
     ASSERT_TRUE(rc::apply(s, stamped(s, rc::SetCompatibilityOps{cd::CompatMode::Forward}, "t", 1, 3, 4), 3));
     const rc::TopicObject* t = s.topicByName("t");
     ASSERT_NE(t, nullptr);
@@ -1037,6 +1227,48 @@ TEST(CatalogApplyV1Regression, SchemaLifecycleOnOneObject) {
     EXPECT_EQ(t->schema->schemaVersion, 3);   // create 1, alter 2, set-compat 3
     EXPECT_EQ(t->schema->compat, cd::CompatMode::Forward);
     EXPECT_EQ(t->schema->nextTag, 3);
+}
+
+TEST(CatalogApplyV1Regression, SetCompatibilityBumpsTheEvolvingDescriptorVersionLikeTodayRegression) {
+    // F9: today's startAlter_ runs applyOps for SET COMPATIBILITY, which stamps the evolving
+    // descriptor with the new schema version (Evolve.cpp) — projections and GetTopicSchema see it.
+    rc::CatalogState s;
+    ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, true), "t", 1, 0, 1), 0));
+    ASSERT_TRUE(rc::apply(s, stamped(s, rc::SetCompatibilityOps{cd::CompatMode::Forward}, "t", 1, 1, 2), 1));
+    const rc::TopicObject* t = s.topicByName("t");
+    EXPECT_EQ(t->schema->schemaVersion, 2);
+    EXPECT_EQ(cd::deserialize(t->schema->evolvingBlob).version, 2) << "the evolving blob went through applyOps";
+}
+
+TEST(CatalogApplyV1Regression, ResolvedOpsNameFieldsByDurableTagAndRoundTrip) {
+    // F20: a RENAME / DROP is stored by tag; unresolving on the same definition gives the names back.
+    rc::CatalogState s;
+    ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, true), "t", 1, 0, 1), 0));
+    cd::AlterOp ren{}; ren.type = cd::AlterOpType::Rename; ren.name = "hp"; ren.newName = "health";
+    cd::AlterOp drop{}; drop.type = cd::AlterOpType::Drop; drop.name = "health";   // sees the rename before it
+    const auto& schema = *s.topicByName("t")->schema;
+    auto r = rc::resolveAlterOps(schema, std::vector<cd::AlterOp>{ren, drop});
+    ASSERT_TRUE(r.has_value()) << r.error();
+    EXPECT_EQ((*r)[0].tag, 1); EXPECT_EQ((*r)[0].name, "health");
+    EXPECT_EQ((*r)[1].tag, 1); EXPECT_TRUE((*r)[1].name.empty());
+    auto back = rc::unresolveAlterOps(schema, std::span<const rc::ResolvedAlterOp>(*r));
+    ASSERT_TRUE(back.has_value()) << back.error();
+    EXPECT_EQ((*back)[0].name, "hp"); EXPECT_EQ((*back)[0].newName, "health");
+    EXPECT_FALSE(rc::resolveAlterOps(schema, std::vector<cd::AlterOp>{drop}).has_value()) << "'health' is not live yet";
+}
+
+TEST(CatalogApplyV1Regression, AlterSchemaWithAStaleAddTagIsAPrecondition) {
+    rc::CatalogState s;
+    ASSERT_TRUE(rc::apply(s, stamped(s, createOps(0, true), "t", 1, 0, 1), 0));
+    rc::CatalogEvent e; e.kind = rc::EventKind::AlterSchema; e.objectName = "t"; e.objectId = 1;
+    e.prevVersion = 1; e.newVersion = 2;
+    e.ops = rc::AlterSchemaOps{{rc::ResolvedAlterOp{.type = cd::AlterOpType::Add, .tag = 7, .name = "mana",
+                                                    .primType = cd::PrimType::Int32}}};   // nextTag is 2
+    const uint64_t before = s.digest();
+    auto a = rc::apply(s, e, 1);
+    ASSERT_FALSE(a.has_value());
+    EXPECT_EQ(a.error().code, rc::ApplyError::Code::Precondition);
+    EXPECT_EQ(s.digest(), before);
 }
 
 TEST(CatalogApplyV1Regression, DropAndReuseGetsANewObjectIdAndTopicId) {
@@ -1090,18 +1322,22 @@ TEST(CatalogApplyV1Regression, FingerprintsIgnoreIdsSoClustersCompare) {
 
 TEST(CatalogApplyV1Regression, RequestIdsAreRecordedAndADuplicateIsRefused) {
     rc::CatalogState s;
+    const rc::RequestId rid{.hi = 0xC11E, .lo = 77};
     auto e = stamped(s, createOps(0, true), "x", 1, 0, 1);
-    e.principal.requestId = 77;
+    e.principal.requestId = rid;
+    e.principal.requestFingerprint = 0xF1;
     ASSERT_TRUE(rc::apply(s, e, 0));
-    auto r = s.request(77);
+    auto r = s.request(rid);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->offset, 0); EXPECT_EQ(r->objectId, 1u); EXPECT_EQ(r->topicId, 0); EXPECT_EQ(r->schemaVersion, 1);
+    EXPECT_EQ(r->requestFingerprint, 0xF1u) << "F14: the dedupe key carries the statement fingerprint";
+    EXPECT_FALSE(s.request(rc::RequestId{.hi = 0xC11F, .lo = 77}).has_value()) << "all 128 bits are the key";
     auto again = stamped(s, createOps(1, false), "y", 2, 0, 1);
-    again.principal.requestId = 77;
+    again.principal.requestId = rid;
     auto a = rc::apply(s, again, 1);
     ASSERT_FALSE(a.has_value());
     EXPECT_EQ(a.error().code, rc::ApplyError::Code::Precondition);
-    EXPECT_FALSE(s.request(0).has_value()) << "requestId 0 (pre-v8 clients) is never recorded";
+    EXPECT_FALSE(s.request(rc::RequestId{}).has_value()) << "requestId {0,0} (pre-v8 clients) is never recorded";
 }
 
 TEST(CatalogApplyV1Regression, FingerprintCoversEveryDefinitionField) {
@@ -1193,12 +1429,13 @@ struct Applied {
 };
 /// What an applied DDL answered — replayed to a retry with the same requestId (ruling 9).
 struct RequestRecord {
-    int64_t   offset        = -1;
-    EventKind kind          = EventKind::CreateTopic;
-    uint64_t  objectId      = 0;
-    uint32_t  newVersion    = 0;
-    int32_t   topicId       = -1;   // the topic / view sink id the answer names
-    uint16_t  schemaVersion = 0;    // topic kinds with a schema: the resulting schema version
+    int64_t   offset             = -1;
+    EventKind kind               = EventKind::CreateTopic;
+    uint64_t  objectId           = 0;
+    uint32_t  newVersion         = 0;
+    int32_t   topicId            = -1;   // the topic / view sink id the answer names
+    uint16_t  schemaVersion      = 0;    // topic kinds with a schema: the resulting schema version
+    uint64_t  requestFingerprint = 0;    // F14: a retry must match it; a different statement is InvalidRequest
 };
 struct ApplyError {
     enum class Code : uint8_t { UnsupportedFormat, Precondition, FingerprintMismatch, BadOps };
@@ -1229,8 +1466,8 @@ public:
     [[nodiscard]] uint64_t nextObjectId() const noexcept { return nextObjectId_; }
     [[nodiscard]] int32_t  nextTopicId()  const noexcept { return nextTopicId_; }
     [[nodiscard]] int64_t  appliedOffset() const noexcept { return appliedOffset_; }   // -1 = nothing applied
-    /// The applied event carrying `requestId` (ruling 9) — what its DDL answered.  Cold.
-    [[nodiscard]] std::optional<RequestRecord> request(uint64_t requestId) const;
+    /// The applied event carrying `requestId` (ruling 9, F14) — what its DDL answered.  Cold.
+    [[nodiscard]] std::optional<RequestRecord> request(const RequestId& requestId) const;
     /// FNV over the whole state (see Task 2 text).  Equal digests at equal offsets = identical catalogs.
     [[nodiscard]] uint64_t digest() const noexcept;
 
@@ -1243,7 +1480,7 @@ private:
     std::unordered_map<std::string, uint64_t>   viewNames_;
     std::unordered_map<int32_t, uint64_t>       topicIds_;      // topicId → topic objectId
     std::unordered_map<int32_t, uint64_t>       viewTopicIds_;  // sink topicId → view objectId
-    std::unordered_map<uint64_t, RequestRecord> requests_;      // requestId → its applied event (0 never stored)
+    std::unordered_map<RequestId, RequestRecord, RequestIdHash> requests_;   // requestId → its applied event ({0,0} never stored)
     std::vector<Tombstone>                      tombstones_;
     uint64_t nextObjectId_  = 1;
     int32_t  nextTopicId_   = 0;
@@ -1257,9 +1494,16 @@ private:
 /// fails exactly where apply() would (except FingerprintMismatch).
 [[nodiscard]] std::expected<uint64_t, ApplyError> previewFingerprint(const CatalogState& s, const CatalogEvent& e);
 [[nodiscard]] std::string_view applyErrorName(ApplyError::Code c) noexcept;
+/// F20: name-based ALTER ops → durable tags (the leader), and back (apply; `rune catalog replay`).
+[[nodiscard]] std::expected<std::vector<ResolvedAlterOp>, std::string>
+    resolveAlterOps(const SchemaState& schema, std::span<const rune::codec::AlterOp> ops);
+[[nodiscard]] std::expected<std::vector<rune::codec::AlterOp>, std::string>
+    unresolveAlterOps(const SchemaState& schema, std::span<const ResolvedAlterOp> ops);
 
 } // namespace rune::catalog
 ```
+
+(`resolveAlterOps` / `unresolveAlterOps` live in `src/catalog/CatalogState.cpp`; they deserialize the evolving blob once and track renames / adds through the list as described above.)
 
 - [ ] **Step 4: Implement `ApplyV1.cpp`** — the rule table above, as one `struct ApplyV1` with a static `run(const CatalogState&, const CatalogEvent&, int64_t offset) → std::expected<Staged, ApplyError>` that builds a **staged change** without touching the state, and `commit(CatalogState&, Staged&&)` that installs it:
 
@@ -1282,7 +1526,7 @@ struct ApplyV1 {
 }
 ```
 
-`run` implements each row (a `Precondition` error's `detail` names the rule, e.g. `"CreateTopic: name 'players' is taken"`, `"AlterSchema: version chain 3 -> 5, object at 4"`). `AlterSchema` runs `rune::codec::decodeAlterOps` (nullopt → `BadOps`), then `rune::codec::applyOps(deserialize(evolvingBlob), ops, nextTag, schemaVersion + 1)` inside a `try` (a throw or an `EvolveError` → `BadOps` with the message); the key field follows a RENAME exactly like `AdminWorker::startAlter_` (anchor `DDL conformance B8 / D3a`). `commit` updates the maps, counters (`nextObjectId_` / `nextTopicId_` exactly as the table says), `appliedOffset_ = offset`, and `requests_[e.principal.requestId] = RequestRecord{…}` when the id is non-zero (a requestId seen twice in a log is a `Precondition` error in `run` — the leader never writes one twice).
+`run` implements each row (a `Precondition` error's `detail` names the rule, e.g. `"CreateTopic: name 'players' is taken"`, `"AlterSchema: version chain 3 -> 5, object at 4"`). `AlterSchema` runs `unresolveAlterOps(schema, ops)` (an error → `Precondition` with its message, F20), then `rune::codec::applyOps(deserialize(evolvingBlob), unresolved, nextTag, schemaVersion + 1)` inside a `try` (a throw or an `EvolveError` → `BadOps` with the message); `SetCompatibility` runs the same `applyOps` with the single `{AlterOpType::SetCompatibility, mode}` op (F9); the key field follows a RENAME exactly like `AdminWorker::startAlter_` (anchor `DDL conformance B8 / D3a`). `commit` updates the maps, counters (`nextObjectId_` / `nextTopicId_` exactly as the table says), `appliedOffset_ = offset`, and `requests_[e.principal.requestId] = RequestRecord{…, requestFingerprint = e.principal.requestFingerprint}` when the id is not `{0, 0}` (a requestId seen twice in a log is a `Precondition` error in `run` — the leader never writes one twice).
 
 `apply()` in `CatalogState.cpp`:
 
@@ -1338,7 +1582,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Create: `rune-codec/tools/make_catalog_golden.cpp`
 - Create: `rune-codec/tests/catalog/golden/v1/basic.rcat` (generated, checked in), `rune-codec/tests/catalog/CatalogGoldenPins.h` (pinned digests, checked in)
 - Create: `rune-codec/benchmark/CatalogReplayBench.cpp`
-- Modify: `rune-codec/CMakeLists.txt`
+- Create (not tracked): `rune-codec/build-rel/` — the Release build dir for `rune_codec_bench` (F35)
+- Modify: `rune-codec/CMakeLists.txt` (`rune_codec_bench` gains `benchmark/CatalogReplayBench.cpp` and links `rune_catalog`, F35)
 - Test: `rune-codec/tests/catalog/CatalogReplayerTest.cpp`, `CatalogQueriesTest.cpp`, `CatalogGoldenTest.cpp`
 
 **Interfaces:**
@@ -1441,15 +1686,20 @@ TEST(CatalogReplayerRegression, ResumingFromACachedPrefixEqualsAFullReplay) {
 }
 ```
 
-`GoldenScript.h` (in `include/rune/catalog/testing/`, header-only, deterministic: fixed timestamps `1'760'000'000'000 + 1000*i`, fixed principals, request ids `i+1`): builds **every kind at least twice** on a growing `CatalogState`, stamping each event with `previewFingerprint` — in order: CreateTopic `players` (typed, disk, rf 3); CreateTopic `events` (untyped, 4 partitions); CreateTopic `presence` (untyped, transient); CreateSchema on `events`; AlterSchema `players` (ADD `mana`); AlterSchema `players` (RENAME `hp`→`health`); SetCompatibility `players` forward; AlterTopicConfig `events` {retention.ms 60000}; AlterTopicConfig `events` {retention.bytes 1 GiB, min.cleanable.dirty.ratio 0.25}; CreateView `top_players` over `players`; AlterView `top_players`; CreateView `ev_view` over `events`; DropView `ev_view`; DropTopic `presence`; CreateTopic `presence` (reuse: new objectId, transient); DropView `top_players`; DropTopic `players`; CreateTopic `players` (reuse, untyped) — 18 events. `goldenScriptV1()` returns them as `std::vector<CatalogEvent>`.
+`GoldenScript.h` (in `include/rune/catalog/testing/`, header-only, deterministic: fixed timestamps `1'760'000'000'000 + 1000*i`, fixed principals, request ids `RequestId{0x601D, i+1}` with request fingerprints `0xF00D'0000 + i` (F14), every AlterSchema built with `resolveAlterOps` on the growing state so its ops carry durable tags (F20)): builds **every kind at least twice** on a growing `CatalogState`, stamping each event with `previewFingerprint` — in order: CreateTopic `players` (typed, disk, rf 3); CreateTopic `events` (untyped, 4 partitions); CreateTopic `presence` (untyped, transient); CreateSchema on `events`; AlterSchema `players` (ADD `mana`); AlterSchema `players` (RENAME `hp`→`health`); SetCompatibility `players` forward; AlterTopicConfig `events` {retention.ms 60000}; AlterTopicConfig `events` {retention.bytes 1 GiB, min.cleanable.dirty.ratio 0.25}; CreateView `top_players` over `players`; AlterView `top_players`; CreateView `ev_view` over `events`; DropView `ev_view`; DropTopic `presence`; CreateTopic `presence` (reuse: new objectId, transient); DropView `top_players`; DropTopic `players`; CreateTopic `players` (reuse, untyped) — 18 events. `goldenScriptV1()` returns them as `std::vector<CatalogEvent>`.
 
 `CatalogQueriesTest.cpp`:
 
 ```cpp
+#include <rune/catalog/CatalogFile.h>
 #include <rune/catalog/CatalogQueries.h>
 #include <rune/catalog/CatalogReplayer.h>
 #include <rune/catalog/testing/GoldenScript.h>
 #include <gtest/gtest.h>
+
+#include <algorithm>
+#include <set>
+#include <sstream>
 
 namespace rc = rune::catalog;
 
@@ -1541,8 +1791,10 @@ TEST(CatalogQueriesRegression, RcatRoundTripsAndRefusesGarbage) {
 // change under formatVer 2 instead (Global Constraints).
 #include <rune/catalog/CatalogFile.h>
 #include <rune/catalog/CatalogReplayer.h>
+#include <rune/catalog/testing/GoldenScript.h>
 #include "CatalogGoldenPins.h"
 #include <fstream>
+#include <iterator>
 #include <gtest/gtest.h>
 
 TEST(CatalogGoldenRegression, V1LogsReplayToPinnedFingerprints) {
@@ -1620,14 +1872,21 @@ mkdir -p /Users/vradu/Projects/se-worktrees/rune-codec/tests/catalog/golden/v1
 
 Create `tests/catalog/CatalogGoldenPins.h` as `#pragma once`, `#include <cstdint>`, `namespace rune::catalog::golden {` + the printed array verbatim + `}`. These 18 constants are frozen from now on.
 
-- [ ] **Step 5: Replay benchmark** — `benchmark/CatalogReplayBench.cpp` (added to `rune_codec_bench` when `benchmark_FOUND`): `BM_CatalogReplay10k` builds 10 000 events once (cycling CreateTopic / AlterSchema / AlterTopicConfig / CreateView / DropView / DropTopic over 500 names, each stamped), encodes them, and per iteration replays all 10 000 through a fresh `CatalogReplayer`; reports `items_per_second`. Gate (asserted in Task 23 at broker level, recorded here): one iteration < 200 ms Release.
+- [ ] **Step 5: Replay benchmark** — `benchmark/CatalogReplayBench.cpp` (added to `rune_codec_bench` when `benchmark_FOUND`; the target becomes `add_executable(rune_codec_bench benchmark/ValidatorBenchmark.cpp benchmark/CatalogReplayBench.cpp)` + `target_link_libraries(rune_codec_bench PRIVATE rune_codec rune_catalog benchmark::benchmark)`, F35): `BM_CatalogReplay10k` builds 10 000 events once (cycling CreateTopic / AlterSchema / AlterTopicConfig / CreateView / DropView / DropTopic over 500 names, each stamped), encodes them, and per iteration replays all 10 000 through a fresh `CatalogReplayer`; reports `items_per_second`. Gate (asserted in Task 23 at broker level, recorded here): one iteration < 200 ms Release.
 
 - [ ] **Step 6: Run the tests + bench**
 
 Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build -j14 --target rune_catalog_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-codec/build -R 'Catalog' --output-on-failure -j14`
 Expected: all `CatalogEventRegression.*`, `CatalogApplyV1Regression.*`, `CatalogReplayerRegression.*`, `CatalogQueriesRegression.*`, `CatalogGoldenRegression.*` PASS.
-Run (bench, Release build dir if present, else skip and note): `/Users/vradu/Projects/se-worktrees/rune-codec/build-rel/rune_codec_bench --benchmark_filter=CatalogReplay`
-Expected: < 200 ms per iteration; record the number in the commit body.
+Run (bench — create the Release build dir once, F35; the existing conan Release toolchain provides Google Benchmark):
+
+```bash
+cmake -S /Users/vradu/Projects/se-worktrees/rune-codec -B /Users/vradu/Projects/se-worktrees/rune-codec/build-rel -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=/Users/vradu/Projects/se-worktrees/rune-codec/build/Release/generators/conan_toolchain.cmake
+cmake --build /Users/vradu/Projects/se-worktrees/rune-codec/build-rel -j14 --target rune_codec_bench
+/Users/vradu/Projects/se-worktrees/rune-codec/build-rel/rune_codec_bench --benchmark_filter=CatalogReplay
+```
+
+Expected: the configure step reports `benchmark` found (a missing benchmark package is a failure of this step, never a skip); < 200 ms per iteration; record the number in the commit body.
 
 - [ ] **Step 7: Commit**
 
@@ -1650,6 +1909,9 @@ Wire for spec §5.1 (Redirect / NotLeader are existing codes), §7 (reads use Su
 - Modify: `rune-protocol/include/rune/protocol/client/Protocol.h` (`TemplateId` after `ViewRowResponse = 73`; the client-version block; new constant)
 - Modify: `rune-protocol/include/rune/protocol/client/SchemaMessages.h` (`DdlExtension`, `TopicConfigWire`; `DefineTopic`, `AlterTopic`, `CreateView` trailers; new `DropTopic`, `AlterTopicConfig`, `DropView`, `AlterView`, `DdlResponse`)
 - Modify: `rune-protocol/include/rune/protocol/client/DataMessages.h` (comment only: the catalog subscription + caught-up marker)
+- Modify: `rune-protocol/include/rune/protocol/client/Dispatch.h` (F1: `isKnownTemplate` — the schema/view range becomes `DefineTopic (64) .. DdlResponse (78)`; the range comment lists 74–78. Without it the broker gateway's `checkFrame` (`ClientGateway.cpp`, anchor `checkFrame(`) drops every new DDL frame as `UnknownTemplate`)
+- Modify: `rune-protocol/tests/protocol/client/DispatchTest.cpp` (F1: `DispatchCheckFrame.UnknownTemplateSeventyFour` becomes `KnownTemplatesSeventyFourToSeventyEight` (Ok for 74..78) + `UnknownTemplateSeventyNine`; the `isKnownTemplate` pin list (anchor `EXPECT_FALSE(rpc::isKnownTemplate(74));`) moves its unknown pin to 79 and adds `EXPECT_TRUE` for 74..78; the comment "74+ (unassigned schema/view gap)" becomes "79+")
+- Modify: `rune-protocol/tests/protocol/client/ControlMessagesConnectTest.cpp` (F1: `VersionGates.ClientBrokerVersionBumpedProtocolVersionUnchanged` pins `kClientVersion == 8` with the comment `// v8: catalog history DDL (v7: transient lineage note + claim)`)
 - Create: `rune-protocol/tests/protocol/client/CatalogDdlMessagesTest.cpp`; modify `rune-protocol/CMakeLists.txt` (add it to `rune_protocol_tests`)
 - Modify: `rune-protocol/conformance/gen_vectors.cpp`, `conformance/manifest.md`, add `conformance/vectors/{define_topic_v8,drop_topic,alter_topic_config,drop_view,alter_view,ddl_response}.bin`
 
@@ -1663,11 +1925,11 @@ Wire for spec §5.1 (Redirect / NotLeader are existing codes), §7 (reads use Su
   struct DdlExtension {                      // trailer on every DDL request (v8)
       std::string_view statement;            // original DDL text ("" for API-issued)
       std::string_view clientName;
-      uint64_t         requestId = 0;        // stable across retries (ruling 9)
+      rune::protocol::RequestId requestId{}; // 128-bit, stable across retries (ruling 9, F14)
       uint8_t          hasReplayedFrom = 0;
       std::string_view replayedClusterId; int64_t replayedOffset = -1; std::string_view replayedPrincipal;
   };
-  struct TopicConfigWire { /* every rune::catalog::TopicConfig field, same order + types */ };
+  using TopicConfigWire = rune::protocol::TopicConfigView;   // F32: the one definition (CatalogTypes.h, Task 1), zero-copy view
   struct ConfigChangeWire { uint8_t key; int64_t value; };
   // DefineTopic gains: int16_t replicationFactor; TopicConfigWire config; bool hasExt; DdlExtension ext;
   // AlterTopic / CreateView gain: bool hasExt; DdlExtension ext;
@@ -1683,20 +1945,23 @@ Wire for spec §5.1 (Redirect / NotLeader are existing codes), §7 (reads use Su
   ```
 
 Layouts (all LE; `varstr` = u16 + bytes; `varbytes32` = u32 + bytes):
-- `DdlExtension`: `varstr statement` (encoded as u32 length: statements can exceed 64 KiB), `varstr clientName`, `u64 requestId`, `u8 hasReplayedFrom`, then when 1: `varstr clusterId`, `i64 offset`, `varstr principal`.
+- `DdlExtension`: `varstr statement` (encoded as u32 length: statements can exceed 64 KiB), `varstr clientName`, `u64 requestIdHi`, `u64 requestIdLo`, `u8 hasReplayedFrom`, then when 1: `varstr clusterId`, `i64 offset`, `varstr principal`. (The request fingerprint is computed by the leader, Task 9 — never trusted from the wire.)
 - `DefineTopic` v8: the existing body, then the persistence byte **always** written when the extension follows, then `i16 replicationFactor`, `TopicConfigWire` (`u8 cleanupPolicy, i64 retentionMs, i64 retentionBytes, i64 deleteRetentionMs, i32 minCleanableDirtyRatioPpm, i64 segmentRollBytes, i64 minCompactionLagMs, i64 maxCompactionLagMs, i64 retentionCheckMs, i64 fileDeleteDelayMs, u8 durability, u8 durabilityTier, varstr coPartitionGroup, varstr partitionKey`), then `DdlExtension`. Decode: after the persistence byte, `pos == avail` → no extension (`hasExt = false`, rf 0, default config); otherwise the full trailer must decode exactly to `avail` (anything else → nullopt).
 - `AlterTopic` / `CreateView` v8: the existing body, then `DdlExtension` (same exact-to-end rule).
 - `DropTopic` / `DropView`: `varstr name` + `DdlExtension`. `AlterView`: `varstr viewName, varstr keyField, u8 persistence, u32 expectedVersion, varbytes32 planBlob` + ext. `AlterTopicConfig`: `varstr topicName, u32 expectedVersion, u16 count, (u8 key, i64 value)*` + ext; a key outside 1..6 → nullopt.
 - `DdlResponse`: `u16 errorCode, u64 objectId, u32 newVersion, i32 gateTopicId, varstr detail`.
 
-Also, in the "Client versions" comment block, add: *"8 — catalog history: DDL extension trailer (statement, clientName, requestId, replayedFrom), DefineTopic replicationFactor + topic config, DropTopic/AlterTopicConfig/DropView/AlterView (74–77) answered by DdlResponse (78). DDL to a broker that is not the `__catalog` leader is answered ErrorResponse{Redirect, leader client endpoint}; a leader change, a catching-up leader or `__catalog` below minIsr answers NotLeader (retriable); a broker whose catalog apply halted answers Internal. Any DDL may be answered ErrorResponse{InvalidRequest, detail} (e.g. replicationFactor bounds)."* — and in `DataMessages.h` above `struct Subscribe`: *"Subscribe{topicId = kCatalogTopicId (−6), partition 0, partitionKnown 1} reads `__catalog` from ANY broker, served from that broker's replica up to its high watermark. After the committed backlog the broker pushes ONE Records frame with baseOffset = its HW and an EMPTY records payload — the caught-up marker (catalog subscriptions only); live events follow as they commit."*
+Also, in the "Client versions" comment block, add: *"8 — catalog history: DDL extension trailer (statement, clientName, 128-bit requestId, replayedFrom), DefineTopic replicationFactor + topic config, DropTopic/AlterTopicConfig/DropView/AlterView (74–77) answered by DdlResponse (78). DDL to a broker that is not the `__catalog` leader is answered ErrorResponse{Redirect, leader client endpoint}; a leader change, a catching-up leader, a commit that did not complete in time or `__catalog` below minIsr answers NotLeader (retriable; the retry with the same requestId is deduplicated); a broker whose catalog apply halted answers Internal. Any DDL may be answered ErrorResponse{InvalidRequest, detail} (e.g. replicationFactor bounds, a requestId reused for a different statement). A session below 8 never receives a Redirect for DDL: on a broker that is not the catalog leader its DefineTopic/AlterTopic/CreateView is answered in its own response type with InvalidRequest (client too old for cluster DDL routing; upgrade)."* — and `inline constexpr bool clientUnderstandsCatalogDdl(int32_t v) noexcept { return v >= kClientVersionCatalog; }` next to the other `clientUnderstands*` helpers (F37). — and in `DataMessages.h` above `struct Subscribe`: *"Subscribe{topicId = kCatalogTopicId (−6), partition 0, partitionKnown 1} reads `__catalog` from ANY broker, served from that broker's replica up to its high watermark. After the committed backlog the broker pushes ONE Records frame with baseOffset = its HW and an EMPTY records payload — the caught-up marker (catalog subscriptions only); live events follow as they commit."*
 
 - [ ] **Step 1: Write the failing tests** — `CatalogDdlMessagesTest.cpp`:
 
 ```cpp
+#include <rune/protocol/CatalogTypes.h>
+#include <rune/protocol/client/Dispatch.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/SchemaMessages.h>
 #include <array>
+#include <type_traits>
 #include <gtest/gtest.h>
 
 namespace pc = rune::protocol::client;
@@ -1710,6 +1975,20 @@ TEST(CatalogDdlWireRegression, ConstantsArePinned) {
     EXPECT_EQ(pc::kClientVersionCatalog, 8);
     EXPECT_GE(pc::kClientVersion, pc::kClientVersionCatalog);
     EXPECT_EQ(pc::kCatalogTopicId, -6);
+    for (uint16_t t = 74; t <= 78; ++t) EXPECT_TRUE(pc::isKnownTemplate(t)) << t << " (F1: else checkFrame drops it)";
+    EXPECT_FALSE(pc::isKnownTemplate(79));
+    EXPECT_FALSE(pc::clientUnderstandsCatalogDdl(7));
+    EXPECT_TRUE(pc::clientUnderstandsCatalogDdl(8));
+}
+
+TEST(CatalogDdlWireRegression, TopicConfigWireIsTheOneTopicConfigDefinition) {
+    // F32: the wire view, the owned config (catalog / client / rune-ql) and their defaults are one definition.
+    static_assert(std::is_same_v<pc::TopicConfigWire, rune::protocol::BasicTopicConfig<std::string_view>>);
+    const rune::protocol::TopicConfig owned{};
+    EXPECT_EQ(rune::protocol::convertTopicConfig<pc::TopicConfigWire>(owned), pc::TopicConfigWire{});
+    rune::protocol::TopicConfig c; c.retentionMs = 5; c.partitionKey = "k";
+    EXPECT_EQ(rune::protocol::convertTopicConfig<rune::protocol::TopicConfig>(
+                  rune::protocol::convertTopicConfig<pc::TopicConfigWire>(c)), c);
 }
 
 TEST(CatalogDdlWireRegression, DefineTopicV8RoundTripsRfConfigAndExtension) {
@@ -1718,7 +1997,7 @@ TEST(CatalogDdlWireRegression, DefineTopicV8RoundTripsRfConfigAndExtension) {
     m.persistence = 0; m.replicationFactor = 3;
     m.config.retentionMs = 60'000; m.config.cleanupPolicy = 1; m.config.partitionKey = "k";
     m.hasExt = true; m.ext.statement = "topic events partitions 4 replicas 3;"; m.ext.clientName = "cli";
-    m.ext.requestId = 77; m.ext.hasReplayedFrom = 1; m.ext.replayedClusterId = "src"; m.ext.replayedOffset = 5;
+    m.ext.requestId = {.hi = 0xC11E, .lo = 77}; m.ext.hasReplayedFrom = 1; m.ext.replayedClusterId = "src"; m.ext.replayedOffset = 5;
     std::array<uint8_t, 1024> buf{};
     const std::size_t n = m.encode(buf.data());
     ASSERT_EQ(n, m.encodedSize());
@@ -1729,7 +2008,7 @@ TEST(CatalogDdlWireRegression, DefineTopicV8RoundTripsRfConfigAndExtension) {
     EXPECT_EQ(d->config.cleanupPolicy, 1);
     EXPECT_EQ(d->config.partitionKey, "k");
     EXPECT_TRUE(d->hasExt);
-    EXPECT_EQ(d->ext.requestId, 77u);
+    EXPECT_EQ(d->ext.requestId, (rune::protocol::RequestId{0xC11E, 77})) << "all 128 bits (F14)";
     EXPECT_EQ(d->ext.replayedOffset, 5);
     EXPECT_EQ(d->descriptorLen, 0u) << "an empty descriptor is an untyped topic";
 }
@@ -1746,7 +2025,7 @@ TEST(CatalogDdlWireRegression, PreV8DefineTopicStillDecodes) {
 }
 
 TEST(CatalogDdlWireRegression, EveryTruncatedTrailerIsRefused) {
-    pc::DropTopic m; m.topicName = "t"; m.ext.statement = "drop topic t;"; m.ext.requestId = 9;
+    pc::DropTopic m; m.topicName = "t"; m.ext.statement = "drop topic t;"; m.ext.requestId = {.hi = 1, .lo = 9};
     std::array<uint8_t, 256> buf{};
     const std::size_t n = m.encode(buf.data());
     for (std::size_t k = 0; k < n; ++k) EXPECT_FALSE(pc::DropTopic::decode(buf.data(), k).has_value()) << k;
@@ -1786,7 +2065,7 @@ Expected: compile errors (`DropTopic` is not a member of `TemplateId`, …).
 
 - [ ] **Step 5: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-protocol/build -j14 --target rune_protocol_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-protocol/build -R 'CatalogDdlWire|DefineTopic|Conformance' --output-on-failure`
+Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-protocol/build -j14 --target rune_protocol_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-protocol/build -R 'CatalogDdlWire|DefineTopic|Conformance|DispatchCheckFrame|Dispatch|VersionGates' --output-on-failure`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -1801,32 +2080,53 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ---
 ### Task 5: Client — the new DDL ops, DDL options, and Redirect / NotLeader / InvalidRequest handling for every DDL
 
-Spec §5.1–§5.2, §5.5, §9: "A broker that is not the `__catalog` leader answers with the existing Redirect … which clients already follow"; "Clients retry within their budget and then fail explicitly." Today the client follows `Redirect` for data ops only; a DDL answered `ErrorResponse` is left pending until its deadline. This task makes every DDL op (`DefineTopic`, `AlterTopic`, `CreateView`, and the new four) follow `Redirect`, retry `NotLeader` with a backoff inside its budget, surface `InvalidRequest` detail, and carry the DDL extension with a stable `requestId`.
+Spec §5.1–§5.2, §5.5, §9: "A broker that is not the `__catalog` leader answers with the existing Redirect … which clients already follow"; "Clients retry within their budget and then fail explicitly." Today the client follows `Redirect` for data ops only; a DDL answered `ErrorResponse` is left pending until its deadline. This task makes every DDL op (`DefineTopic`, `AlterTopic`, `CreateView`, and the new four) follow `Redirect`, retry `NotLeader` with a backoff inside its budget, surface `InvalidRequest` detail, and carry the DDL extension with a stable 128-bit `requestId` (F14).
 
 **Files:**
 - Modify: `rune-client-cpp/include/rune/client/Completion.h` (`OpKind`: append `DropTopic, DropView, AlterView, AlterTopicConfig` after `GetViewRow`)
-- Modify: `rune-client-cpp/include/rune/client/Client.h` (`DdlOptions`, `TopicOptions`, `DdlResult`; new ops + `AndWait` forms; `defineTopic` overload taking `TopicOptions` + `DdlOptions`; `PendingCtl` gains the DDL retry state)
-- Modify: `rune-client-cpp/src/Client.cpp` (encode the extension on every DDL; `DdlResponse` (78) dispatch; the `ErrorResponse` branch for pending DDL ops; the retry pump in the duty cycle next to `retryRedirectedSubscribes_`)
+- Modify: `rune-client-cpp/include/rune/client/Client.h` (`DdlOptions`, `TopicOptions`, `DdlResult`; the new ops in both forms — non-blocking `op(…, CompletionTarget, Token)` and `*AndWait`; `defineTopic` / `alterTopic` / `createView` overloads taking `DdlOptions` (and `TopicOptions` for `defineTopic`); `PendingCtl` gains the encoded `frame` and the `DdlRetry` state variant)
+- Modify: `rune-client-cpp/src/Client.cpp` (encode the extension on every DDL; `DdlResponse` (78) dispatch; the `ErrorResponse` branch for pending DDL ops; the retry pump in the duty cycle next to `retryRedirectedSubscribes_`; the 128-bit request id source)
 - Modify: `rune-client-cpp/include/rune/client/agent/ClientAgent.h`, `src/agent/ClientAgent.cpp` (`offerToEndpoint(channel, frame)` — the per-endpoint session pool `offerToPartition` already uses)
-- Test: `rune-client-cpp/tests/client/ClientDdlRedirectRegressionTest.cpp`, `rune-client-cpp/tests/client/ClientCatalogDdlTest.cpp` (both against the existing `tests/support/InvokerGateway.h` fake broker); add both to `CMakeLists.txt`
+- Modify: `rune-client-cpp/tests/support/InvokerGateway.h` (test support only, F7: `std::map<uint16_t, std::function<void(int endpoint, const uint8_t*, std::size_t)>> templateHandlers` — consulted first in `onFrame`, after the dead-endpoint check; `void sendDdlResponse(int endpoint, const rune::protocol::client::DdlResponse&)`. Error answers use the existing `sendError(from, code, message, sessionId, corrId)`)
+- Modify: `rune-client-cpp/CMakeLists.txt` (add the two tests to `rune_client_tests`; F7: wrap the definitions of the shared sibling targets `rune_fr`, `rune_crypto`, `rune_codec` and `rune_gso` in `if(NOT TARGET <name>)` so a parent project — the broker's `rune_client_broker_tests`, Task 11 — can embed this project with `add_subdirectory` and supply its own copies; the standalone build is unchanged)
+- Test: `rune-client-cpp/tests/client/ClientDdlRedirectRegressionTest.cpp`, `rune-client-cpp/tests/client/ClientCatalogDdlTest.cpp` — **non-blocking** ops on the real single-threaded fake `test_support::InvokerGateway` (invoker mode: the test thread alternates `client.doWork()` and `gw.pump()`, the `Rig` / `drive()` pattern of `tests/client/InvokerClientTest.cpp` and `IngressEndpointRoutingTest.cpp`, copied into each file's anonymous namespace; an injected `ClientConfig::nanoClock` walks the backoff and the budget). The fake cannot serve a blocking call (it is pumped by the calling thread), so the blocking `*AndWait` forms are tested against real in-process `BrokerNode`s: single node in Task 11, three nodes in Task 22 (F7).
 
 **Interfaces:**
-- Consumes: Task 4's frames, `kClientVersion = 8`.
+- Consumes: Task 4's frames, `kClientVersion = 8`; `rune::protocol::{TopicConfig, RequestId}` (Task 1, `CatalogTypes.h`).
 - Produces (namespace `rune::client`):
   ```cpp
   struct DdlOptions {
       std::string statement;              // original DDL text (QL/CLI fill it; "" for API-issued)
       std::string clientName;             // defaults to ClientConfig::clientName
-      uint64_t    requestId = 0;          // 0 = the client generates one; reused on every retry
+      rune::protocol::RequestId requestId{};   // {0,0} = the client generates one; reused on every resend (F14)
       struct ReplayedFrom { std::string clusterId; int64_t offset = -1; std::string principal; };
       std::optional<ReplayedFrom> replayedFrom;   // `rune catalog replay` only (Task 15) → DdlExtension.hasReplayedFrom
   };
-  struct TopicOptions { int16_t replicationFactor = 0; rune::protocol::client::TopicConfigWire config{}; };
+  struct TopicOptions { int16_t replicationFactor = 0; rune::protocol::TopicConfig config{}; };   // F32: the one definition
   struct DdlResult { uint16_t errorCode = 0; uint64_t objectId = 0; uint32_t newVersion = 0; std::string detail; };
+  // Non-blocking (Completion: value = objectId, aux = newVersion, payload = detail / the ErrorResponse message):
+  OpResult dropTopic(std::string_view name, const DdlOptions&, CompletionTarget, Token);
+  OpResult dropView(std::string_view name, const DdlOptions&, CompletionTarget, Token);
+  OpResult alterView(std::string_view name, std::string_view keyField, uint8_t persistence, uint32_t expectedVersion,
+                     std::span<const uint8_t> planBlob, const DdlOptions&, CompletionTarget, Token);
+  OpResult alterTopicConfig(std::string_view name, uint32_t expectedVersion,
+                            std::span<const rune::protocol::client::ConfigChangeWire> changes, const DdlOptions&,
+                            CompletionTarget, Token);
+  OpResult defineTopic(std::string_view name, uint32_t partitions, std::string_view keyField,
+                       std::span<const uint8_t> descriptorBlob /* empty = untyped */, bool validate, Persistence,
+                       const TopicOptions&, const DdlOptions&, CompletionTarget, Token);
+  OpResult alterTopic(std::string_view name, uint16_t expectedVersion, std::span<const uint8_t> opsBlob,
+                      const DdlOptions&, CompletionTarget, Token);
+  OpResult createView(std::string_view viewName, std::string_view keyField, uint8_t persistence,
+                      std::span<const uint8_t> planBlob, const DdlOptions&, CompletionTarget, Token);
+  // Blocking conveniences (pump-until-done, like every *AndWait):
   DefineTopicResult defineTopicAndWait(std::string_view name, uint32_t partitions, std::string_view keyField,
-                                       std::span<const uint8_t> descriptorBlob /* empty = untyped */, bool validate,
-                                       Persistence persistence, const TopicOptions& topic, const DdlOptions& ddl,
-                                       std::chrono::milliseconds timeout);
+                                       std::span<const uint8_t> descriptorBlob, bool validate, Persistence persistence,
+                                       const TopicOptions& topic, const DdlOptions& ddl, std::chrono::milliseconds timeout);
+  AlterTopicResult  alterTopicAndWait(std::string_view name, uint16_t expectedVersion, std::span<const uint8_t> opsBlob,
+                                      const DdlOptions&, std::chrono::milliseconds);
+  CreateViewResult  createViewAndWait(std::string_view viewName, std::string_view keyField, uint8_t persistence,
+                                      std::span<const uint8_t> planBlob, const DdlOptions&, std::chrono::milliseconds);
   DdlResult dropTopicAndWait(std::string_view name, const DdlOptions&, std::chrono::milliseconds);
   DdlResult dropViewAndWait(std::string_view name, const DdlOptions&, std::chrono::milliseconds);
   DdlResult alterViewAndWait(std::string_view name, std::string_view keyField, uint8_t persistence,
@@ -1839,128 +2139,211 @@ Spec §5.1–§5.2, §5.5, §9: "A broker that is not the `__catalog` leader ans
   // ClientConfig gains `std::string clientName = "rune-client"` and
   //   `std::chrono::milliseconds ddlRetryBudget{10'000}` (NotLeader retries; bounded by the op timeout too).
   static constexpr int kMaxDdlRedirects = 3;
+  // PendingCtl's DDL retry state — one explicit state per phase (hard rule 3, F29):
+  struct DdlSent           { int redirects = 0; };                                         // no NotLeader seen yet
+  struct DdlNotLeaderSeen  { int redirects; int64_t budgetEndNs; int64_t backoffNs; };     // resent, awaiting its answer
+  struct DdlAwaitingResend { int redirects; int64_t budgetEndNs; int64_t backoffNs; int64_t resendAtNs; };
+  using DdlRetry = std::variant<DdlSent, DdlNotLeaderSeen, DdlAwaitingResend>;
+  // PendingCtl gains: std::vector<uint8_t> frame (the encoded request, re-sent verbatim); DdlRetry retry;
   ```
 
 Behaviour (all on the duty thread, cold path):
-- **Encode:** every DDL frame carries `DdlExtension{statement, clientName, requestId}`; `requestId = ddl.requestId ? ddl.requestId : nextRequestId_()` where `nextRequestId_()` = `(random 32-bit client nonce << 32) | ++counter` — the nonce is drawn once at `Client` construction from `std::random_device`. The encoded frame is kept in `PendingCtl::frame` (re-sent verbatim, so the `requestId` is stable).
-- **`ErrorResponse{Redirect, endpoint}` for a pending DDL corrId:** `++redirects`; above `kMaxDdlRedirects` → complete `BrokerError` with `errorCode = 3` and detail `"redirected more than 3 times"`. Otherwise, multi-node routing on → `agent_.offerToEndpoint(toChannel(endpoint), frame)`; off → the existing seed retarget (`submitReconnect`, the same call the data-op Redirect path makes) and the frame waits in `unsentFrame` to be re-offered once connected.
-- **`ErrorResponse{NotLeader}` or a response with `errorCode == 2`:** schedule a resend at `now + backoff` (100 ms doubling to 1 s); past `min(deadline, firstNotLeader + ddlRetryBudget)` → complete `BrokerError` with `errorCode = 2` ("explicit client failure", spec §5.5).
+- **Request id (F14):** every DDL frame carries `DdlExtension{statement, clientName, requestId}`; `requestId = !ddl.requestId.none() ? ddl.requestId : RequestId{clientInstanceId_, ++requestCounter_}`, where `clientInstanceId_` is a random 64-bit value drawn once at `Client` construction from `std::random_device` (two 32-bit draws; redrawn while 0). Distinct `rune ql` processes therefore collide only with 2⁻⁶⁴ odds per pair, and the broker additionally refuses a reused id whose statement differs (Task 9). The encoded frame is kept in `PendingCtl::frame` (re-sent verbatim, so the `requestId` is stable).
+- **`ErrorResponse{Redirect, endpoint}` for a pending DDL corrId:** `redirects + 1` in the current retry state; above `kMaxDdlRedirects` → complete `BrokerError` with `errorCode = 3` and detail `"redirected more than 3 times"`. Otherwise, multi-node routing on → `agent_.offerToEndpoint(toChannel(endpoint), frame)`; off → the existing seed retarget (`submitReconnect`, the same call the data-op Redirect path makes) and the frame waits in `unsentFrame` to be re-offered once connected.
+- **`ErrorResponse{NotLeader}` or a response with `errorCode == 2`:** `DdlSent` → `DdlAwaitingResend{budgetEndNs = min(deadline, now + ddlRetryBudget), backoffNs = 100 ms, resendAtNs = now + 100 ms}`; `DdlNotLeaderSeen` → `DdlAwaitingResend` with the backoff doubled (cap 1 s); when `now ≥ budgetEndNs` → complete `BrokerError` with `errorCode = 2` ("explicit client failure", spec §5.5). `resendDueDdl_` moves a due `DdlAwaitingResend` to `DdlNotLeaderSeen` by re-offering `frame`.
 - **`ErrorResponse{InvalidRequest | other}`:** complete `BrokerError` with that code and `detail = message`.
 - **`DdlResponse` (78):** complete with `errorCode`, `objectId`, `newVersion`, `detail`; `errorCode == 2` follows the NotLeader rule.
 
-- [ ] **Step 1: Write the failing tests** — `ClientDdlRedirectRegressionTest.cpp` (the fake broker answers by script; `InvokerGateway` exposes `onFrame(templateId, handler)` and `reply(frame)` — use its existing API names):
+- [ ] **Step 1: Write the failing tests** — `ClientDdlRedirectRegressionTest.cpp` (non-blocking ops; the fake answers through `templateHandlers`):
 
 ```cpp
 // Catalog history §5.1/§5.2/§9: every DDL follows Redirect, retries NotLeader inside
 // its budget, then fails explicitly; the requestId is stable across every resend.
-#include "support/InvokerGateway.h"
+// Non-blocking ops on the single-threaded fake (F7): the test thread drives
+// client.doWork() + gw.pump(); the blocking *AndWait forms are proven against
+// real BrokerNodes (Task 11: one node; Task 22: three nodes).
+#include "../support/InvokerGateway.h"
+#include "../support/TestCompletions.h"
 #include <rune/client/Client.h>
 #include <rune/protocol/client/SchemaMessages.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <string>
+#include <unistd.h>
+#include <vector>
+
 namespace pc = rune::protocol::client;
-using namespace std::chrono_literals;
+namespace rc = rune::client;
+
+namespace {
+int64_t g_now = 1'000'000'000;                      // test thread only: invoker mode has one thread
+int64_t fakeNow() noexcept { return g_now; }
+std::atomic<int> g_ctr{0};
+
+rc::ClientConfig invokerCfg(int32_t in, int32_t eg) {   // as InvokerClientTest.cpp's invokerCfg, plus the clock
+    rc::ClientConfig c;
+    c.gatewayChannel = "aeron:ipc"; c.gatewayStreamId = in; c.egressChannel = "aeron:ipc"; c.egressStreamId = eg;
+    c.dataDir = "/tmp/ddl_redirect_" + std::to_string(::getpid()) + "_" + std::to_string(g_ctr.fetch_add(1));
+    c.runnerMode = rc::RunnerMode::Invoker;
+    c.nanoClock = &fakeNow;
+    return c;
+}
+struct Rig {   // InvokerClientTest.cpp's Rig: client + fake on the client's embedded driver
+    rc::Client                   client;
+    test_support::InvokerGateway gw;
+    explicit Rig(const rc::ClientConfig& c)
+        : client(c), gw(c.dataDir + "/aeron", c.gatewayChannel, c.gatewayStreamId, c.egressChannel, c.egressStreamId) {}
+    template <class P> bool drive(P&& pred, int64_t stepNs = 0) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            g_now += stepNs; client.doWork(); gw.pump();
+            if (pred()) return true;
+        }
+        return false;
+    }
+    void connect() {
+        ASSERT_TRUE(drive([&] { return gw.ready(); }));
+        test_support::TestCq cq(client);
+        auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return client.connect(q, t); });
+        ASSERT_TRUE(drive([&] { return f.ready(); }));
+        ASSERT_TRUE(f.ok()) << f.describe();
+    }
+    void answerError(int ep, pc::ErrorCode code, const std::string& msg, int64_t session, int64_t corr) {
+        gw.sendError(ep, static_cast<int16_t>(code), msg, session, corr);
+    }
+};
+std::string payloadText(const test_support::PendingOp& f) {
+    const auto b = f.bytes(); return {b.begin(), b.end()};
+}
+} // namespace
 
 TEST(ClientDdlRedirectRegression, NotLeaderIsRetriedWithTheSameRequestIdThenSucceeds) {
-    rune::client::test::InvokerGateway gw;
-    std::vector<uint64_t> seenRequestIds;
+    Rig r(invokerCfg(3960, 3961));
+    r.connect();
+    std::vector<rune::protocol::RequestId> seen;
     int n = 0;
-    gw.onFrame(pc::TemplateId::DropTopic, [&](const uint8_t* f, std::size_t len) {
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
         auto m = pc::DropTopic::decode(f, len);
         ASSERT_TRUE(m.has_value());
-        seenRequestIds.push_back(m->ext.requestId);
-        if (n++ < 2) { gw.replyError(m->sessionId, m->correlationId, pc::ErrorCode::NotLeader, ""); return; }
-        pc::DdlResponse r; r.sessionId = m->sessionId; r.correlationId = m->correlationId; r.objectId = 4; r.newVersion = 2;
-        gw.reply(r);
-    });
-    auto client = gw.connectClient();
-    const auto res = client->dropTopicAndWait("t", {}, 5s);
-    EXPECT_EQ(res.errorCode, 0);
-    EXPECT_EQ(res.objectId, 4u);
-    ASSERT_EQ(seenRequestIds.size(), 3u);
-    EXPECT_NE(seenRequestIds[0], 0u);
-    EXPECT_EQ(seenRequestIds[0], seenRequestIds[1]);
-    EXPECT_EQ(seenRequestIds[1], seenRequestIds[2]);
+        seen.push_back(m->ext.requestId);
+        if (n++ < 2) { r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId); return; }
+        pc::DdlResponse resp; resp.sessionId = m->sessionId; resp.correlationId = m->correlationId;
+        resp.objectId = 4; resp.newVersion = 2;
+        r.gw.sendDdlResponse(ep, resp);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/50'000'000));   // walks the 100 ms → 200 ms backoff
+    ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(f.outcome().c.value, 4);
+    EXPECT_EQ(f.outcome().c.aux, 2);
+    ASSERT_EQ(seen.size(), 3u);
+    EXPECT_FALSE(seen[0].none());
+    EXPECT_NE(seen[0].hi, 0u) << "the random client instance id (F14)";
+    EXPECT_EQ(seen[0], seen[1]);
+    EXPECT_EQ(seen[1], seen[2]);
 }
 
 TEST(ClientDdlRedirectRegression, NotLeaderPastTheBudgetIsAnExplicitFailureNotAHang) {
-    rune::client::test::InvokerGateway gw;
-    gw.onFrame(pc::TemplateId::DefineTopic, [&](const uint8_t* f, std::size_t len) {
+    rc::ClientConfig cfg = invokerCfg(3962, 3963);
+    cfg.ddlRetryBudget = std::chrono::milliseconds(400);
+    Rig r(cfg);
+    r.connect();
+    r.gw.templateHandlers[pc::DefineTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
         auto m = pc::DefineTopic::decode(f, len);
-        gw.replyError(m->sessionId, m->correlationId, pc::ErrorCode::NotLeader, "");
+        ASSERT_TRUE(m.has_value());
+        r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    const int64_t t0 = g_now;
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) {
+        return r.client.defineTopic("t", 1, "", {}, false, rc::Persistence::Disk, {}, {}, q, t);
     });
-    rune::client::ClientConfig cfg = gw.clientConfig();
-    cfg.ddlRetryBudget = 400ms;
-    auto client = gw.connectClient(cfg);
-    const auto t0 = std::chrono::steady_clock::now();
-    const auto r = client->defineTopicAndWait("t", 1, "", {}, false, rune::client::Persistence::Disk, {}, {}, 5s);
-    EXPECT_EQ(r.errorCode, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
-    EXPECT_LT(std::chrono::steady_clock::now() - t0, 3s) << "the budget, not the 5 s op timeout, ends it";
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/20'000'000));
+    ASSERT_TRUE(f.failed());
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(f.outcome().c.errorCode, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_LT(g_now - t0, int64_t{2'000'000'000}) << "the 400 ms budget, not the op timeout, ends it";
 }
 
 TEST(ClientDdlRedirectRegression, RedirectIsFollowedToTheLeaderEndpoint) {
-    rune::client::test::InvokerGateway follower, leader;
-    follower.onFrame(pc::TemplateId::AlterTopicConfig, [&](const uint8_t* f, std::size_t len) {
+    Rig r(invokerCfg(3964, 3965));
+    const std::string leaderCh = "aeron:udp?endpoint=127.0.0.1:24801";
+    const int leader = r.gw.addEndpoint(leaderCh, 3964);          // a second fake node (IngressEndpointRoutingTest)
+    r.connect();
+    int leaderSaw = 0;
+    r.gw.templateHandlers[pc::AlterTopicConfig::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
         auto m = pc::AlterTopicConfig::decode(f, len);
-        follower.replyError(m->sessionId, m->correlationId, pc::ErrorCode::Redirect, leader.clientEndpoint());
-    });
-    bool leaderSaw = false;
-    leader.onFrame(pc::TemplateId::AlterTopicConfig, [&](const uint8_t* f, std::size_t len) {
-        auto m = pc::AlterTopicConfig::decode(f, len);
-        leaderSaw = true;
-        pc::DdlResponse r; r.sessionId = m->sessionId; r.correlationId = m->correlationId; r.newVersion = 3;
-        leader.reply(r);
-    });
-    auto client = follower.connectClient(follower.clientConfigWithPeer(leader));
+        ASSERT_TRUE(m.has_value());
+        if (ep != leader) { r.answerError(ep, pc::ErrorCode::Redirect, leaderCh, m->sessionId, m->correlationId); return; }
+        ++leaderSaw;
+        pc::DdlResponse resp; resp.sessionId = m->sessionId; resp.correlationId = m->correlationId; resp.newVersion = 3;
+        r.gw.sendDdlResponse(ep, resp);
+    };
     const pc::ConfigChangeWire ch{1, 60'000};
-    const auto r = client->alterTopicConfigAndWait("t", 0, std::span(&ch, 1), {}, 5s);
-    EXPECT_TRUE(leaderSaw);
-    EXPECT_EQ(r.errorCode, 0);
-    EXPECT_EQ(r.newVersion, 3u);
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) {
+        return r.client.alterTopicConfig("t", 0, std::span(&ch, 1), {}, q, t);
+    });
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(leaderSaw, 1);
+    EXPECT_EQ(f.outcome().c.aux, 3);
 }
 
 TEST(ClientDdlRedirectRegression, RedirectLoopEndsExplicitly) {
-    rune::client::test::InvokerGateway gw;
-    gw.onFrame(pc::TemplateId::DropView, [&](const uint8_t* f, std::size_t len) {
+    Rig r(invokerCfg(3966, 3967));
+    const std::string loopCh = "aeron:udp?endpoint=127.0.0.1:24803";
+    (void)r.gw.addEndpoint(loopCh, 3966);
+    r.connect();
+    r.gw.templateHandlers[pc::DropView::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
         auto m = pc::DropView::decode(f, len);
-        gw.replyError(m->sessionId, m->correlationId, pc::ErrorCode::Redirect, gw.clientEndpoint());   // to itself
-    });
-    auto client = gw.connectClient();
-    const auto r = client->dropViewAndWait("v", {}, 5s);
-    EXPECT_EQ(r.errorCode, static_cast<uint16_t>(pc::ErrorCode::Redirect));
-    EXPECT_NE(r.detail.find("redirected more than"), std::string::npos);
+        ASSERT_TRUE(m.has_value());
+        r.answerError(ep, pc::ErrorCode::Redirect, loopCh, m->sessionId, m->correlationId);   // every node: "ask loopCh"
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropView("v", {}, q, t); });
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    ASSERT_TRUE(f.failed());
+    EXPECT_EQ(f.outcome().c.errorCode, static_cast<uint16_t>(pc::ErrorCode::Redirect));
+    EXPECT_NE(payloadText(f).find("redirected more than"), std::string::npos);
 }
 
 TEST(ClientDdlRedirectRegression, InvalidRequestDetailReachesTheCaller) {
-    rune::client::test::InvokerGateway gw;
-    gw.onFrame(pc::TemplateId::DefineTopic, [&](const uint8_t* f, std::size_t len) {
+    Rig r(invokerCfg(3968, 3969));
+    r.connect();
+    r.gw.templateHandlers[pc::DefineTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
         auto m = pc::DefineTopic::decode(f, len);
-        gw.replyError(m->sessionId, m->correlationId, pc::ErrorCode::InvalidRequest,
-                      "replicationFactor 5 > broker count 3");
+        ASSERT_TRUE(m.has_value());
+        r.answerError(ep, pc::ErrorCode::InvalidRequest, "replicationFactor 5 > broker count 3", m->sessionId,
+                      m->correlationId);
+    };
+    rc::TopicOptions topic; topic.replicationFactor = 5;
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) {
+        return r.client.defineTopic("t", 1, "", {}, false, rc::Persistence::Disk, topic, {}, q, t);
     });
-    auto client = gw.connectClient();
-    rune::client::TopicOptions topic; topic.replicationFactor = 5;
-    const auto r = client->defineTopicAndWait("t", 1, "", {}, false, rune::client::Persistence::Disk, topic, {}, 5s);
-    EXPECT_EQ(r.errorCode, 39);
-    EXPECT_EQ(r.detail, "replicationFactor 5 > broker count 3");
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    EXPECT_EQ(f.outcome().c.errorCode, 39);
+    EXPECT_EQ(payloadText(f), "replicationFactor 5 > broker count 3");
 }
 ```
 
-`ClientCatalogDdlTest.cpp` pins the encodings the client sends: `defineTopicAndWait` with an empty descriptor sends `descriptorLen 0`, `replicationFactor`, the config and the extension (`statement` and `clientName` from `DdlOptions` / `ClientConfig`); `alterViewAndWait` sends `AlterView` with `expectedVersion`; every one of the 7 DDL ops sets `ext.requestId != 0`; two different ops get different `requestId`s.
-
-(If `InvokerGateway` lacks `replyError`, `onFrame`, `clientEndpoint` or `clientConfigWithPeer`, add them in this task as thin wrappers over its existing frame-injection API — test support only.)
+`ClientCatalogDdlTest.cpp` (same `Rig`, non-blocking) pins the encodings the client sends: `defineTopic` with an empty descriptor sends `descriptorLen 0`, `replicationFactor`, the config (`TopicConfigWire` equal to the `TopicOptions::config` converted with `convertTopicConfig`) and the extension (`statement` and `clientName` from `DdlOptions` / `ClientConfig`); `alterView` sends `AlterView` with `expectedVersion`; every one of the 7 DDL ops sets a non-`none()` `ext.requestId`; two different ops get different `requestId`s with the same `hi`; two `Client` instances get different `hi` (F14); an explicit `DdlOptions::requestId` is sent verbatim.
 
 - [ ] **Step 2: Run to verify they fail**
 
 Run: `cmake /Users/vradu/Projects/se-worktrees/rune-client-cpp/build && cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14 --target rune_client_tests`
-Expected: compile errors (`dropTopicAndWait` is not a member of `rune::client::Client`).
+Expected: compile errors (`dropTopic` is not a member of `rune::client::Client`; `templateHandlers` is not a member of `test_support::InvokerGateway`).
 
-- [ ] **Step 3: Implement** the ops, options, `PendingCtl` retry state (`std::vector<uint8_t> frame; int redirects = 0; int64_t firstNotLeaderNs = 0; int64_t resendAtNs = 0;`), the `ErrorResponse` branch (placed **before** the data-op Redirect branch, matched by `findCtl_(corrId)` and an `isDdlOp(op)` predicate covering `DefineTopic, AlterTopic, CreateView, DropTopic, DropView, AlterView, AlterTopicConfig`), the `DdlResponse` case, and `int Client::resendDueDdl_(int64_t nowNs)` called in the duty cycle next to `retryRedirectedSubscribes_`. `ClientAgent::offerToEndpoint(const std::string& channel, const uint8_t*, std::size_t)` reuses the per-endpoint session lookup `offerToPartition` uses.
+- [ ] **Step 3: Implement** the ops, options, the `DdlRetry` variant (no scattered retry fields), the `ErrorResponse` branch (placed **before** the data-op Redirect branch, matched by `findCtl_(corrId)` and an `isDdlOp(op)` predicate covering `DefineTopic, AlterTopic, CreateView, DropTopic, DropView, AlterView, AlterTopicConfig`), the `DdlResponse` case, and `int Client::resendDueDdl_(int64_t nowNs)` called in the duty cycle next to `retryRedirectedSubscribes_`. `ClientAgent::offerToEndpoint(const std::string& channel, const uint8_t*, std::size_t)` reuses the per-endpoint session lookup `offerToPartition` uses. The `*AndWait` forms are the usual pump-until-done wrappers over the non-blocking ops (their real-broker tests land in Tasks 11 and 22). Add the `if(NOT TARGET …)` guards to `CMakeLists.txt` and reconfigure the standalone build to prove it unchanged.
 
 - [ ] **Step 4: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'ClientDdlRedirect|ClientCatalogDdl|ClientSchema|Redirect|Conformance' --output-on-failure -j14`
-Expected: PASS (existing `RedirectTest`, `ClientSchemaTest` unchanged).
+Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'ClientDdlRedirect|ClientCatalogDdl|ClientSchema|Redirect|InvokerClient|IngressEndpointRouting|Conformance' --output-on-failure -j14`
+Expected: PASS (existing `RedirectTest`, `ClientSchemaTest`, `InvokerClientTest` unchanged).
 
 - [ ] **Step 5: Commit**
 
@@ -1985,11 +2368,12 @@ Spec §3, §5.6, §5.3 "New broker". Today's catalog logs ride a `NullPartitionT
 - Modify: `libs/node/include/rune/node/NodeConfig.h` / `src/NodeConfig.cpp` (`catalogReplStreamId`, env `RUNE_CATALOG_REPL_STREAM_ID`, default 30; validation: distinct from `replicationStreamId` and outside `[replBaseStreamId, replBaseStreamId + workerCount)`)
 - Modify: `libs/node/include/rune/node/MetadataService.h` (`isCoordinatorTopic` → also −6, renamed `isControllerIsrInternalTopic`; every call site)
 - Modify: `libs/node/include/rune/node/AdminChannels.h` (`AdminRoleMsg` carries `isr`, `partitionEpoch`, `leaderEpoch`; `kA2cCatalogAlterIsr = 10`)
-- Modify: `libs/node/src/ReplicationMetadataBridge.cpp`, `libs/node/include/rune/node/ReplicationMetadataBridge.h` (route −6 role changes onto the admin role ring instead of a direct call)
+- Modify: `libs/node/src/ReplicationMetadataBridge.cpp`, `libs/node/include/rune/node/ReplicationMetadataBridge.h` (route −6 role changes onto the admin role ring instead of a direct call; F26: `isCoordinatorTopic_(t)` becomes `t == -1 || t == -2 || t == kCatalogTopicId`, so `mapDriven_` treats −6 as controller-driven when `coordinatorOnController_` — otherwise the bridge never forwards the −6 assignment)
 - Modify: `libs/node/src/BrokerNode.cpp` (`buildCatalog_()`, called from `buildAdminWorker()` before the schema block; `setCoordinatorPartitions` includes `{-6, 0}`; the control drain forwards `kA2cCatalogAlterIsr`; single-node role from the consensus leader exactly as today's `AdminRoleMsg`)
 - Modify: `libs/node/include/rune/node/AdminWorker.h`, `libs/node/src/AdminWorker.cpp` (own + drive the catalog replica: `doWork`, `onCatalogRole`)
+- Modify: `libs/node/include/rune/node/BrokerNode.h` (F26: `buildCatalog_()` and the catalog members; test hooks `onAdminThreadForTest(f)`, `catalogLogForTest()`; the `AdminWorkerAgent` admin test ring the hook posts on)
 - Modify: `libs/node/CMakeLists.txt` (new test executable `rune_catalog_replication_tests`)
-- Test: `libs/node/tests/integration/CatalogReplicationTest.cpp`, `libs/node/tests/node/AdminIsrChannelTest.cpp` (in `rune_node_tests`)
+- Test: `libs/node/tests/integration/CatalogReplicationTest.cpp`, `libs/node/tests/node/AdminIsrChannelTest.cpp` (in `rune_node_tests`), `libs/node/tests/node/ReplicationMetadataBridgePerPartitionTest.cpp` (append, F26)
 
 **Interfaces:**
 - Produces:
@@ -2030,7 +2414,7 @@ TEST(CatalogReplicationRegression, FormationCreatesTheCatalogOnEveryBrokerWithAC
     const int32_t leader = c.catalogLeaderId();
     for (auto& n : c.nodes) {
         const auto pa = n->onControlThreadForTest([&] {
-            return *n->metadataServiceForTest()->assignmentForTest(rune::node::kCatalogTopicId, 0);
+            return *n->metadataServiceForTest()->assignment(rune::node::kCatalogTopicId, 0);   // F26: the real API
         });
         EXPECT_EQ(pa.leaderNode, leader);
         EXPECT_EQ(pa.replicas.size(), 3u) << "replicated to every broker";
@@ -2086,7 +2470,7 @@ TEST(CatalogReplicationRegression, ANewBrokerWithAnEmptyDataDirFetchesTheCatalog
 Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_catalog_replication_tests rune_node_tests`
 Expected: compile errors (`rune/node/CatalogPartition.h` not found).
 
-- [ ] **Step 3: Implement** the files and edits listed above. `MetadataService::isControllerIsrInternalTopic(id)` returns `id == -1 || id == -2 || id == kCatalogTopicId`; `BrokerNode` (anchor `metadataService_->setCoordinatorPartitions(std::move(coord), balancerNodes);`) appends `rune::metadata::PartitionKey{kCatalogTopicId, 0}` to `coord`. `decideCoordinatorPartition` needs no change (replicas = `balancerNodes`, never unclean — re-read its doc comment, it already elects only from `ISR ∩ live`).
+- [ ] **Step 3: Implement** the files and edits listed above. `MetadataService::isControllerIsrInternalTopic(id)` returns `id == -1 || id == -2 || id == kCatalogTopicId`, and the bridge's `isCoordinatorTopic_` the same set (F26 — add `TEST_F(BridgePerPartitionTest, CatalogAssignmentIsForwardedOnTheControllerPathRegression)` to `libs/node/tests/node/ReplicationMetadataBridgePerPartitionTest.cpp` (listed in Files): with `coordinatorOnController_`, a committed `(−6, 0)` assignment reaches the admin role ring); `BrokerNode` (anchor `metadataService_->setCoordinatorPartitions(std::move(coord), balancerNodes);`) appends `rune::metadata::PartitionKey{kCatalogTopicId, 0}` to `coord`. `decideCoordinatorPartition` needs no change (replicas = `balancerNodes`, never unclean — re-read its doc comment, it already elects only from `ISR ∩ live`).
 
 - [ ] **Step 4: Run**
 
@@ -2114,11 +2498,12 @@ Spec §5.3: each broker applies strictly in offset order from its last applied o
 **Files:**
 - Create: `libs/node/include/rune/node/CatalogCheckpoint.h` (+ `libs/node/src/CatalogCheckpoint.cpp`)
 - Create: `libs/node/include/rune/node/CatalogApplier.h`, `libs/node/src/CatalogApplier.cpp`
+- Create: `libs/node/tests/support/CatalogRig.h` (the applier fixture, below — shared by this task's two test files and Task 8)
 - Modify: `libs/node/include/rune/node/AdminChannels.h` (effect messages, below)
 - Modify: `libs/node/include/rune/node/SchemaRegistry.h` / `src/SchemaRegistry.cpp` (`erase(int32_t topicId)`), `ViewRegistry.h` / `src/ViewRegistry.cpp` (`erase(int32_t viewTopicId)`)
 - Modify: `libs/node/include/rune/node/RoleCounter.h` (`kCatalogApplyHaltedCounterTypeId = 1'000'217`, `kCatalogAppliedOffsetCounterTypeId = 1'000'218`), `libs/node/src/BrokerNode.cpp` (register both counters next to `outOfSyncCounterRegId_`; set them from `kA2cCatalogApplied` / `kA2cCatalogHalted`)
-- Modify: `libs/node/CMakeLists.txt` (`CatalogApplier.cpp`, `CatalogCheckpoint.cpp` in `rune_node`; link `rune_catalog`; root `CMakeLists.txt` defines `rune_catalog` from `${RUNE_CODEC_ROOT}/src/catalog/*.cpp` next to `rune_codec`)
-- Test: `libs/node/tests/node/CatalogApplierTest.cpp` (in `rune_node_tests`)
+- Modify: `libs/node/CMakeLists.txt` (`CatalogApplier.cpp`, `CatalogCheckpoint.cpp` in `rune_node`; link `rune_catalog`; root `CMakeLists.txt` defines `rune_catalog` from `${RUNE_CODEC_ROOT}/src/catalog/*.cpp` next to `rune_codec`, with `${RUNE_PROTOCOL_INCLUDE}` on its include path; F12: new executable `rune_catalog_alloc_regression_tests` — it replaces the global `operator new`, which is binary-wide, so it is its own binary like `rune_ddl_stress_tests` / `rune_transient_alloc_regression_tests`)
+- Test: `libs/node/tests/node/CatalogApplierTest.cpp` (in `rune_node_tests`), `libs/node/tests/node/CatalogAllocRegressionTest.cpp` (in `rune_catalog_alloc_regression_tests`; Tasks 12 and 23 append to it)
 
 **Interfaces:**
 - Consumes: `rune::catalog::{CatalogState, CatalogReplayer, apply, decode, Applied}`; the catalog replica (Task 6).
@@ -2129,32 +2514,49 @@ Spec §5.3: each broker applies strictly in offset order from its last applied o
   [[nodiscard]] std::optional<CatalogCheckpoint> readCatalogCheckpoint(const std::string& catalogDir);  // nullopt = none
   [[nodiscard]] bool writeCatalogCheckpoint(const std::string& catalogDir, const CatalogCheckpoint&);    // tmp+fsync+rename+dir fsync
   // CatalogApplier.h
+  /// A view's sink topic (F27): a view sink has no TopicObject — the applier builds this from the ViewDef.
+  struct SinkSpec { int32_t topicId; std::string name; int32_t partitions; rune::catalog::Persistence persistence; };
   struct CatalogEffects {     // admin-thread effect sink; production = ring encoders (AdminWorkerAgent)
-      std::function<void(const rune::catalog::TopicObject&)>               topicApplied;     // CreateTopic, sink of Create/AlterView
+      std::function<void(const rune::catalog::TopicObject&)>               topicApplied;     // CreateTopic only
+      std::function<void(const SinkSpec&)>                                 sinkApplied;      // sink of Create/AlterView (F27)
       std::function<void(int32_t topicId, const std::string& name)>        topicDropped;     // DropTopic, retired sink
       std::function<void(int32_t topicId, std::span<const rune::catalog::ConfigChange>)> topicConfig;
       std::function<void(const rune::catalog::TopicObject&)>               schemaChanged;    // validators fan-out
-      std::function<void(const rune::catalog::ViewObject&, bool recovery)> viewInstalled;
+      std::function<void(const rune::catalog::ViewObject&)>                viewInstalled;    // recovery-ness = the phase (F4)
       std::function<void(int32_t viewTopicId)>                             viewUninstalled;
       std::function<void(int64_t offset, uint64_t digest)>                 applied;          // metric + tests
       std::function<void(const rune::catalog::ApplyError&)>               halted;
   };
+  /// Boot vs live effects are selected by the applier's PHASE, never by a flag (hard rule 3, F4).
+  struct BootEffects { CatalogEffects sink; };   // replayLocal: every view install is a RECOVERY install
+  struct LiveEffects { CatalogEffects sink; };   // applyCommitted: every view install is a commit install
   class CatalogApplier {
   public:
       struct Applying { int64_t nextOffset = 0; };
       struct Halted   { rune::catalog::ApplyError error; };
-      CatalogApplier(std::string catalogDir, SchemaRegistry&, ViewRegistry&, CatalogEffects);
-      /// Boot: replay [0, checkpoint] from the local log; returns the applied count or the halt.
-      int replayLocal(rune::replication::PartitionReplica& r, bool recoveryInstalls);
-      /// Steady: apply every committed record in [nextOffset, hw).  Returns work done.
+      struct AwaitingBoot {};                          // constructed; the one boot replay has not run
+      struct Booted { BootEffects effects; };          // replayLocal ran (exactly once); not yet live
+      struct Live   { LiveEffects effects; };          // applyCommitted runs here only
+      struct AppliedAt { int64_t offset = -1; rune::catalog::Applied applied{}; };   // F28
+      CatalogApplier(std::string catalogDir, SchemaRegistry&, ViewRegistry&);
+      /// Boot: replay [0, checkpoint] from the local log through `boot` — ONLY from AwaitingBoot
+      /// (→ Booted).  Any other phase: logs an error, applies nothing, returns -1 (exactly one boot replay).
+      int replayLocal(rune::replication::PartitionReplica& r, BootEffects boot);
+      /// AwaitingBoot | Booted → Live.  The broker calls it once, on the admin thread.
+      void goLive(LiveEffects live);
+      /// Steady: apply every committed record in [nextOffset, hw) — Live only (any other phase: 0, nothing applied).
       int applyCommitted(rune::replication::PartitionReplica& r);
       [[nodiscard]] const rune::catalog::CatalogState& state() const noexcept;
+      [[nodiscard]] const AppliedAt& lastApplied() const noexcept;   // F28: what the last applied event did, and where
       [[nodiscard]] bool halted() const noexcept;
       [[nodiscard]] int64_t nextOffset() const noexcept;     // -1 when halted
       [[nodiscard]] std::string_view stateName() const noexcept;   // "Applying" | "Halted"
+      [[nodiscard]] std::string_view phaseName() const noexcept;   // "AwaitingBoot" | "Booted" | "Live"
       void tamperNextFingerprintForTest() noexcept;          // matrix FingerprintMismatch seam (test-only)
   private:
-      std::variant<Applying, Halted> st_;
+      std::variant<Applying, Halted>             st_;
+      std::variant<AwaitingBoot, Booted, Live>   phase_;
+      AppliedAt                                  lastApplied_;
       …
   };
   ```
@@ -2166,10 +2568,10 @@ Per committed record, `applyCommitted` does, in this order:
 3. on any error → `st_ = Halted{err}`; `spdlog::critical("CatalogApplier: apply HALTED at offset {} — {}; this broker serves what it applied and accepts no catalog change until an operator intervenes (docs/CATALOG.md#halted)", …)`; `effects_.halted(err)`; return — **never** skip;
 4. `writeCatalogCheckpoint(dir, {offset, state_.digest()})` — a failed write is a storage failure (posted as `kA2cStorageFailure`, the existing halt path), never ignored;
 5. projections: `SchemaRegistry` (a `TopicSchema` built from the topic object's schema aspect: topicId, schemaVersion, partitions, keyField, validate, evolving blob, nextTag, compat, name, persistence — exactly the fields `AdminWorker::advance_` sets today) / `erase` on drops; `ViewRegistry` (`ViewRecord{viewTopicId, name, compiledPlanBlob, persistence, outputDescriptorBlob}`) / `erase`;
-6. effects by kind: `CreateTopic` → `topicApplied`; `DropTopic` → `topicDropped`; `AlterTopicConfig` → `topicConfig`; `CreateSchema`/`AlterSchema`/`SetCompatibility` → `schemaChanged`; `CreateView` → `topicApplied(sink)` then `viewInstalled(view, recovery)`; `AlterView` → `topicApplied(new sink)`, `viewInstalled(new)`, `viewUninstalled(old)`, `topicDropped(old sink)`; `DropView` → `viewUninstalled`, `topicDropped(sink)`;
-7. `effects_.applied(offset, digest)`.
+6. effects by kind, into the current phase's sink (`Live` in steady state): `CreateTopic` → `topicApplied`; `DropTopic` → `topicDropped`; `AlterTopicConfig` → `topicConfig`; `CreateSchema`/`AlterSchema`/`SetCompatibility` → `schemaChanged`; `CreateView` → `sinkApplied(sink)` then `viewInstalled(view)`; `AlterView` → `sinkApplied(new sink)`, `viewInstalled(new)`, `viewUninstalled(old)`, `topicDropped(old sink)`; `DropView` → `viewUninstalled`, `topicDropped(sink)` (the `SinkSpec` is `{viewTopicId, view name, sinkPartitions, persistence}` — F27);
+7. `lastApplied_ = {offset, applied}` (F28); `effects_.applied(offset, digest)`.
 
-`replayLocal` replays `[0, checkpoint.appliedOffset]` (no checkpoint → nothing) through the same steps 1–3 and 5–6 (no checkpoint rewrite; `recovery = true` on view installs, so workers rebuild from their checkpoints as `recoverViewsOnPromotion_` does today); a digest that differs from the checkpoint's → `Halted` (local log damage).
+`replayLocal` replays `[0, checkpoint.appliedOffset]` (no checkpoint → nothing) through the same steps 1–3 and 5–7 into the `BootEffects` sink (no checkpoint rewrite; every view install there is a recovery install by construction, so workers rebuild from their checkpoints as `recoverViewsOnPromotion_` does today); a digest that differs from the checkpoint's → `Halted` (local log damage). It runs only from `AwaitingBoot`; a second call is refused (−1, error log, nothing applied) — the boot prefix is applied exactly once (a second replay would re-apply recorded request ids and halt on `Precondition`, F4).
 
 - [ ] **Step 1: Write the failing tests** — `CatalogApplierTest.cpp` uses a real `Log` + a follower `PartitionReplica` fed by `appendAsFollowerForTest` (or a leader replica with ISR {self} and `onLeaderLogAppended()`, so HW = LEO), events from `rune::catalog::testing::goldenScriptV1()`, and a recording `CatalogEffects`:
 
@@ -2181,6 +2583,8 @@ TEST(CatalogApplierRegression, AppliesCommittedEventsInOffsetOrderOnly) {
     EXPECT_GT(rig.applier.applyCommitted(rig.replica()), 0);
     EXPECT_EQ(rig.applier.nextOffset(), 5) << "never past the HW";
     EXPECT_EQ(rig.rec.appliedOffsets, (std::vector<int64_t>{0, 1, 2, 3, 4}));
+    EXPECT_EQ(rig.applier.lastApplied().offset, 4) << "F28: the leader answers a requestId-less DDL from it";
+    EXPECT_EQ(rig.applier.lastApplied().applied.kind, rune::catalog::EventKind::AlterSchema);   // golden offset 4
 }
 
 TEST(CatalogApplierRegression, FingerprintMismatchHaltsApplyRaisesTheMetricAndKeepsServingRegression) {
@@ -2214,11 +2618,27 @@ TEST(CatalogApplierRegression, BootReplaysExactlyTheCheckpointedPrefix) {
     rig.appendEvents(0, 10);
     rig.applier.applyCommitted(rig.replica());
     const uint64_t digest = rig.applier.state().digest();
-    rig.restart();                                      // same dir: log recovered, fresh applier + registries
-    EXPECT_EQ(rig.applier.replayLocal(rig.replica(), /*recoveryInstalls=*/true), 10);
+    rig.restart();                                      // same dir: log recovered, fresh applier (AwaitingBoot) + registries
+    EXPECT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 10);
+    EXPECT_EQ(rig.applier.phaseName(), "Booted");
     EXPECT_EQ(rig.applier.state().digest(), digest);
-    EXPECT_TRUE(std::all_of(rig.rec.viewInstallRecovery.begin(), rig.rec.viewInstallRecovery.end(),
-                            [](bool r) { return r; })) << "boot installs are recovery installs";
+    EXPECT_FALSE(rig.rec.bootViewInstalls.empty()) << "golden views reinstalled through the BOOT sink (recovery installs)";
+    EXPECT_TRUE(rig.rec.liveViewInstalls.empty()) << "the phase, not a flag, selects the sink (F4)";
+}
+
+TEST(CatalogApplierRegression, ExactlyOneBootReplayRegression) {
+    // F4: a second replay of the same prefix would re-apply recorded request ids (Precondition → halt).
+    CatalogRig rig("ap_once");
+    rig.appendEvents(0, 6);
+    rig.applier.applyCommitted(rig.replica());
+    rig.restart();
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 6);
+    EXPECT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), -1) << "refused, explicitly";
+    EXPECT_FALSE(rig.applier.halted());
+    rig.applier.goLive(rig.rec.liveEffects());
+    EXPECT_EQ(rig.applier.phaseName(), "Live");
+    EXPECT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), -1);
+    EXPECT_EQ(rig.applier.nextOffset(), 6);
 }
 
 TEST(CatalogApplierRegression, BootDigestDisagreeingWithTheCheckpointHalts) {
@@ -2227,7 +2647,7 @@ TEST(CatalogApplierRegression, BootDigestDisagreeingWithTheCheckpointHalts) {
     rig.applier.applyCommitted(rig.replica());
     rig.restart();
     ASSERT_TRUE(rune::node::writeCatalogCheckpoint(rig.catalogDir(), {3, 0xBAD}));
-    rig.applier.replayLocal(rig.replica(), true);
+    rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects());
     EXPECT_TRUE(rig.applier.halted());
 }
 
@@ -2235,35 +2655,77 @@ TEST(CatalogApplierRegression, AlterViewEffectsRunInstallBeforeUninstallAndRetir
     CatalogRig rig("ap_view");
     rig.appendEvents(0, 11);                            // through golden AlterView top_players (offset 10)
     rig.applier.applyCommitted(rig.replica());
-    const auto& seq = rig.rec.sequence;                 // e.g. "topicApplied:4", "viewInstalled:4", …
-    auto at = [&](const std::string& s) { return std::find(seq.begin(), seq.end(), s) - seq.begin(); };
-    EXPECT_LT(at("topicApplied:5"), at("viewInstalled:5"));
-    EXPECT_LT(at("viewInstalled:5"), at("viewUninstalled:4"));
-    EXPECT_LT(at("viewUninstalled:4"), at("topicDropped:4"));
-}
-
-TEST(CatalogApplierRegression, SteadyIdleApplyAllocatesNothing) {
-    CatalogRig rig("ap_alloc");
-    rig.appendEvents(0, 18);
-    rig.applier.applyCommitted(rig.replica());
-    rune::test::AllocCounter ac;                        // libs/node/tests support (used by HotPathBAllocRegressionTest)
-    for (int i = 0; i < 1000; ++i) (void)rig.applier.applyCommitted(rig.replica());
-    EXPECT_EQ(ac.count(), 0u);
+    const auto& seq = rig.rec.sequence;                 // e.g. "sinkApplied:3", "viewInstalled:3", …
+    // Golden script: CreateView top_players (offset 9) took sink topic id 3; AlterView (offset 10) takes sink 4 (F2).
+    auto at = [&](const std::string& s) {
+        const auto i = static_cast<std::size_t>(std::find(seq.begin(), seq.end(), s) - seq.begin());
+        EXPECT_LT(i, seq.size()) << "effect '" << s << "' never ran";
+        return i;
+    };
+    EXPECT_LT(at("sinkApplied:4"), at("viewInstalled:4")) << "view sinks go through sinkApplied (F27)";
+    EXPECT_LT(at("viewInstalled:4"), at("viewUninstalled:3"));
+    EXPECT_LT(at("viewUninstalled:3"), at("topicDropped:3"));
 }
 ```
 
-`CatalogRig` is a file-local fixture (log under a `TmpDir`, the replica, `SchemaRegistry`, `ViewRegistry`, a `Recorder` whose `CatalogEffects` lambdas push into vectors and `sequence` strings) — written once in this file, reused in Task 8's `CatalogEffectsTest.cpp` by moving it to `libs/node/tests/support/CatalogRig.h` there.
+`CatalogRig` (`libs/node/tests/support/CatalogRig.h`, namespace `rune::node::test`, created in this task: the alloc binary below needs it too) is the fixture: log under a `TmpDir`, the replica, `SchemaRegistry`, `ViewRegistry`, an applier already moved to `Live` with the recorder's `liveEffects()`, a `Recorder` whose `bootEffects()` / `liveEffects()` build `CatalogEffects` lambdas that push into vectors — `bootViewInstalls`, `liveViewInstalls`, … — and `sequence` strings `"<effect>:<topicId>"`; `restart()` rebuilds the applier in `AwaitingBoot`. Task 8's `CatalogEffectsTest.cpp` reuses it.
+
+`CatalogAllocRegressionTest.cpp` (own binary `rune_catalog_alloc_regression_tests`, F12) — the repo's real allocation gate: a file-scope replacement of the global `operator new` / `new[]` / `delete` with **plain single-thread globals**, exactly the `DdlStressRegressionTest.cpp` / `TransientDataPathAllocTest.cpp` pattern (no `AllocCounter` type exists in `libs/node/tests`; none is invented):
+
+```cpp
+// CatalogAllocRegressionTest.cpp — catalog history: the admin thread's catalog steady
+// state never allocates.  Replaces the global operator new (binary-wide), so it lives in
+// its own binary (rune_catalog_alloc_regression_tests).  Tasks 12 and 23 append here.
+#include "support/CatalogRig.h"
+#include <gtest/gtest.h>
+#include <cstdlib>
+#include <new>
+
+namespace {
+bool     gArmed       = false;   // single-threaded test binary: plain globals, no atomics
+uint64_t gArmedAllocs = 0;
+}
+void* operator new(std::size_t n) {
+    if (gArmed) ++gArmedAllocs;
+    if (void* p = std::malloc(n ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t n) {
+    if (gArmed) ++gArmedAllocs;
+    if (void* p = std::malloc(n ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+
+using rune::node::test::CatalogRig;
+
+TEST(CatalogAllocRegression, SteadyIdleApplyAllocatesNothingRegression) {
+    CatalogRig rig("ap_alloc");
+    rig.appendEvents(0, 18);
+    rig.applier.applyCommitted(rig.replica());
+    gArmedAllocs = 0;
+    gArmed = true;
+    for (int i = 0; i < 1000; ++i) (void)rig.applier.applyCommitted(rig.replica());
+    gArmed = false;
+    EXPECT_EQ(gArmedAllocs, 0u);
+}
+```
+
+(`CatalogRig` lives in `support/CatalogRig.h` from this task on, so no later task moves it.)
 
 - [ ] **Step 2: Run to verify they fail**
 
 Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_node_tests`
 Expected: compile error (`rune/node/CatalogApplier.h` not found).
 
-- [ ] **Step 3: Implement** as specified. `CatalogApplier` holds the state machine `std::variant<Applying, Halted>`; `nextOffset()` returns `std::get<Applying>(st_).nextOffset` or −1. The production `CatalogEffects` (built in `AdminWorkerAgent`) encodes the `kA2c*` messages; `schemaChanged` → `kA2cSchemaUpdate` (existing) when `validate`; `viewInstalled` → `kA2cViewPlanUpdate` (existing, `recovery` flag); a full ring is the existing backlog path (`schemaBacklog_` / `topicCommittedBacklog_` pattern: preallocated, flushed next pass, never dropped).
+- [ ] **Step 3: Implement** as specified. `CatalogApplier` holds the state machine `std::variant<Applying, Halted>` and the effects phase `std::variant<AwaitingBoot, Booted, Live>` (F4); `nextOffset()` returns `std::get<Applying>(st_).nextOffset` or −1. The production `LiveEffects` (built in `AdminWorkerAgent`) encodes the `kA2c*` messages; `topicApplied` and `sinkApplied` both encode `kA2cCatalogTopicApplied` (a sink: default `TopicConfig`, rf 0); `schemaChanged` → `kA2cSchemaUpdate` (existing) when `validate`; `viewInstalled` → `kA2cViewPlanUpdate` (existing) with its recovery byte **0** — the production `BootEffects` sets it to **1** (until Task 16 replaces the boot sink): the byte is chosen by which phase's sink runs, never passed as a flag; a full ring is the existing backlog path (`schemaBacklog_` / `topicCommittedBacklog_` pattern: preallocated, flushed next pass, never dropped).
 
 - [ ] **Step 4: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_node_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogApplier|SchemaRegistry|ViewRegistry' --output-on-failure -j14`
+Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_node_tests rune_catalog_alloc_regression_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogApplier|CatalogAlloc|SchemaRegistry|ViewRegistry' --output-on-failure -j14`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -2294,15 +2756,16 @@ Spec §5.4: "When the controller sees a `CreateTopic` applied, it assigns that t
 - Modify: `libs/node/include/rune/node/WorkerViewSet.h`, `libs/node/src/WorkerViewSet.cpp` (`uninstallView(int32_t viewTopicId)`: drops its instances, recovery templates and dirty state on the worker's own thread), `libs/node/include/rune/node/WorkerOp.h` / the view-install ring encoding (`ViewPlanUpdateMsg` gains `uninstall`)
 - Modify: `libs/gateway/src/ClientGateway.cpp` (C1 generalized: produce / subscribe / metadata for a topic id this broker has not applied → `NotLeader (2)` when the MSM holds a committed placement for it, `UnknownTopic (7)` otherwise; `Dropped` → `UnknownTopic`)
 - Modify: `libs/node/include/rune/node/AdminChannels.h` (`kMsgPurgeDroppedDir = 16` on the control → admin ring — the former create-topic reply ring, renamed `controlToAdminRing()`)
+- Modify: `libs/node/include/rune/node/BrokerNode.h` (test hooks `postCatalogEffectForTest`, `catalogTopicServesForTest`, `holdDroppedDirPurgeForTest` — F23)
 - Test: `libs/node/tests/node/CatalogEffectsTest.cpp`, `libs/gateway/tests/gateway/CatalogGatewayTest.cpp`, `libs/metadata/tests/MetadataStateMachineTest.cpp` (append), `libs/node/tests/node/LogCleanerPolicyOverrideTest.cpp`, `libs/node/tests/node/WorkerViewSetTest.cpp` (append)
 
 **Interfaces:**
 - Consumes: Task 7's messages.
-- Produces: `TopicRegistry::{createTopicAt, dropTopic, releaseDroppedLogs, state}`, `MetadataService::removeRuntimeTopic`, `WorkerViewSet::uninstallView`, `BrokerNode::catalogTopicServesForTest(topicId)`.
+- Produces: `TopicRegistry::{createTopicAt, dropTopic, releaseDroppedLogs, state}`, `MetadataService::removeRuntimeTopic`, `WorkerViewSet::uninstallView`, `BrokerNode::catalogTopicServesForTest(topicId)`, and (F23, `BrokerNode.h`) `holdDroppedDirPurgeForTest(bool)` — an admin-thread-owned hold, set through `onAdminThreadForTest`, under which `kMsgPurgeDroppedDir` paths queue (preallocated) instead of being removed; releasing it purges them on the next admin pass.
 
 The drop sequence on the control thread (one explicit state per step):
 1. `kA2cCatalogTopicDropped{id, name}` → `TopicRegistry::dropTopic(id)` (serves nothing from now on: gateway answers `UnknownTopic`), `metadataService_->removeRuntimeTopic(id)`, `replicaRegistry_->remove(id, p)` for every partition, transient ring freed with the replica; record `DroppedTopic{id, name, retireGen = replicaRegistry_->generation()}` in `droppedAwaitingRetire_`.
-2. Each pass: when every worker and the cleaner/provisioner acked a generation ≥ `retireGen` (the same condition `collectRetired` uses), `TopicRegistry::releaseDroppedLogs(id)` closes the logs, then `rename(topics/<name>, dropped/<id>.<name>)` (atomic; a failed rename is logged at error and retried next pass — never deleted in place) and post `kMsgPurgeDroppedDir{path}` to the admin thread, which `std::filesystem::remove_all`s it (cold; a failure is logged and the dir stays for the boot purge, Task 12).
+2. Each pass: when every worker and the cleaner/provisioner acked a generation ≥ `retireGen` (the same condition `collectRetired` uses), `TopicRegistry::releaseDroppedLogs(id)` closes the logs, then `rename(topics/<name>, dropped/<id>.<name>)` (atomic; a failed rename is logged at error and retried next pass — never deleted in place) and post `kMsgPurgeDroppedDir{path}` to the admin thread, which `std::filesystem::remove_all`s it (cold; a failure is logged and the dir stays for the boot purge — `reconcileTopicDirs`, Task 16).
 3. A `kA2cCatalogTopicApplied` whose name is still held by an entry of `droppedAwaitingRetire_` → `PendingCreateBehindDrop{spec}` queued; it runs (step `createTopicAt` + `createRuntimeUserReplicas` + `addRuntimeTopic`) right after that name's rename succeeded. FIFO per name.
 
 - [ ] **Step 1: Write the failing tests.** `CatalogEffectsTest.cpp` (a single-node `BrokerNode` with the catalog wired and a test hook `BrokerNode::postCatalogEffectForTest(frame)` that encodes onto the admin→control ring from the admin thread via `onAdminThreadForTest`):
@@ -2321,12 +2784,15 @@ TEST(CatalogEffectsRegression, CreateBehindDropWaitsForTheDirRenameAndStartsEmpt
     n.applyCreateTopic(0, "t", 1);
     ASSERT_TRUE(n.awaitServes(0, 10s));
     n.produceSync(0, 0, "old-record");
+    n.node()->holdDroppedDirPurgeForTest(true);        // keep the renamed dir observable (F23)
     n.applyDropTopic(0, "t");
     n.applyCreateTopic(1, "t", 1);                     // same name, immediately
     ASSERT_TRUE(n.awaitServes(1, 10s));
+    EXPECT_TRUE(std::filesystem::exists(n.dataDir() / "dropped" / "0.t"))
+        << "the old data was renamed away before the reused name was created";
     EXPECT_EQ(n.logEndOffset(1, 0), 0) << "the reused name starts EMPTY";
-    EXPECT_FALSE(std::filesystem::exists(n.dataDir() / "topics" / "t" / "0" / "00000000000000000000.log") &&
-                 n.logEndOffset(1, 0) != 0);
+    EXPECT_TRUE(n.consumeAllFromEarliest(1, 0).empty()) << "the old record is unreadable under the reused name";
+    n.node()->holdDroppedDirPurgeForTest(false);
     EXPECT_TRUE(n.awaitPathGone(n.dataDir() / "dropped" / "0.t", 10s)) << "purged by the admin thread";
 }
 
@@ -2404,7 +2870,7 @@ Spec §5.1: on the leader, the single AdminWorker validates against its applied 
 - Delete: `libs/node/include/rune/node/AdminCreateTopic.h`
 - Modify: `libs/gateway/include/rune/gateway/IAdminRequestSink.h` (every submit takes a `DdlMetaView`; four new submits), `libs/gateway/include/rune/gateway/ClientGateway.h`, `libs/gateway/src/ClientGateway.cpp` (`handleDropTopic`, `handleDropView`, `handleAlterView`, `handleAlterTopicConfig`; template dispatch 74–77; the extension decoded on 64/68/70)
 - Modify: `libs/node/include/rune/node/DdlAnswerGate.h` (`gatedTopicOf` also gates a `DdlResponse` with `errorCode == 0 && gateTopicId >= 0`)
-- Modify: `libs/node/src/BrokerNode.cpp` (`buildAdminWorker`: the `AdminDeps` lose `requestCreateTopic`/`topicCommitted`, gain `respondDdl`, `respondError`, `brokerCount`, `topicMinIsr`; the create-request drain (anchor `// (2) Drain create-topic requests (admin → control).`) is deleted; the admin thread calls `applier.replayLocal(...)` once before its first `doWork`)
+- Modify: `libs/node/src/BrokerNode.cpp` (`buildAdminWorker`: the `AdminDeps` lose `requestCreateTopic`/`topicCommitted`, gain `respondDdl`, `respondError`, `brokerCount`, `topicMinIsr`; the create-request drain (anchor `// (2) Drain create-topic requests (admin → control).`) is deleted; the admin thread calls `applier.replayLocal(*catalogReplica_, BootEffects{…})` exactly once — its sink is the ring encoders with the view-install recovery byte set — then `applier.goLive(LiveEffects{…})`, before its first `doWork`. **Task 16 deletes this call** and moves the one boot replay to the startup thread (F4))
 - Modify: `libs/gateway/include/rune/gateway/TopicRegistry.h`, `libs/gateway/src/TopicRegistry.cpp` (delete the runtime `createTopic`, `commitTopic`, `awaitingCommit`, `markTopicCommitted`, the `committed` flag and the topic-id marker helpers — their last caller is gone)
 - Port (they exercised the deleted round-trip): `libs/node/tests/node/AdminWorkerTest.cpp`, `libs/node/tests/node/DdlFinalFixRegressionTest.cpp`, `libs/node/tests/integration/SchemaGatewayTest.cpp`, `CreateViewRegressionTest.cpp`, `GetViewRowRegressionTest.cpp`, `SchemaPersistenceTest.cpp` (now "a schema survives restart through `__catalog`"), `libs/gateway/tests/gateway/TopicServabilityTest.cpp`, `TransientGatewayTest.cpp`, `TransientInteractionMatrixTest.cpp` (C1 precondition "uncommitted" → "applied but not placed", same assertions; `TransientMatrixExpectations.h` unchanged)
 - Create: `libs/node/tests/support/CatalogDdlRig.h` (one AdminWorker + catalog leader replica with ISR {self} + applier + recording deps; reused by Tasks 10, 11, 20)
@@ -2415,7 +2881,8 @@ Spec §5.1: on the leader, the single AdminWorker validates against its applied 
 - Produces:
   ```cpp
   // AdminChannels.h
-  struct DdlMeta { std::string statement, clientName, sourceAddress; int64_t sessionId = 0; uint64_t requestId = 0;
+  struct DdlMeta { std::string statement, clientName, sourceAddress; int64_t sessionId = 0;
+                   rune::protocol::RequestId requestId{};           // 128-bit; {0,0} = a pre-v8 client (F14)
                    bool hasReplayedFrom = false; std::string replayedClusterId; int64_t replayedOffset = -1;
                    std::string replayedPrincipal; };
   struct DropTopicMsg        { int64_t session, corr; std::string name; DdlMeta meta; };
@@ -2437,6 +2904,10 @@ Spec §5.1: on the leader, the single AdminWorker validates against its applied 
   struct AwaitingCommit { DdlRequest req; rune::catalog::CatalogEvent event; int64_t offset = -1; int64_t startedNs = 0; };
   using InFlight = std::variant<Idle, AwaitingCommit>;
   struct DdlRejection { uint16_t code; std::string detail; int32_t topicId = -1; uint16_t version = 0; };
+  /// F14: FNV-1a-64 over the request's template id, object name, statement text and every operation
+  /// field (descriptor / ops / plan / config / changes / rf / partitions / persistence / expectedVersion) —
+  /// never the requestId, clientName, session or replayedFrom.  Deterministic on every broker.
+  [[nodiscard]] uint64_t requestFingerprint(const DdlRequest&) noexcept;
   void submit(DdlRequest req);                                   // replaces submitDefineTopic/AlterTopic/CreateView
   [[nodiscard]] uint64_t answeredCount() const noexcept;          // matrix invariant 2
   [[nodiscard]] const CatalogApplier& applier() const noexcept;
@@ -2454,21 +2925,21 @@ Spec §5.1: on the leader, the single AdminWorker validates against its applied 
 | Request | Rejections (code) | Event |
 |---|---|---|
 | `DefineTopic` | bad persistence byte / partitions < 1 / malformed non-empty descriptor → `InvalidSchema 23`; name fails `isValidTopicName` → `InvalidTopicName 40`; a live name differing only in ASCII case (`TopicName.h` fold) → `TopicExists 25`; name is a view or a typed topic → `TopicExists 25` (+ its id/version); untyped topic + empty descriptor → `TopicExists 25`; untyped **disk** topic + explicit `transient` → `TopicExists 25` (final review I1); `replicationFactor > brokerCount` → `ErrorResponse{InvalidRequest 39, "replicationFactor R > broker count N"}`; `0 < replicationFactor < topicMinIsr` → `ErrorResponse{39, "replicationFactor R < minIsr M"}`; `segmentRollBytes > Log::kMaxRollBytes`, ratio outside `[0, 1e6]`, `cleanupPolicy > 2`, `durability > 1`, `tier > 2`, retention < −1 → `ErrorResponse{39, "<field> …"}` | free name → `CreateTopic{topicId = nextTopicId, …, schema iff descriptor non-empty}`, `objectId = nextObjectId`, `0 → 1`; untyped topic + descriptor → `CreateSchema` on that object |
-| `AlterTopic` | as today's `startAlter_`: view name → `ViewNotAlterable 38`; unknown → `UnknownTopic 7`; untyped → `InvalidSchema 23`; stale `expectedVersion` (schema version) → `SchemaConflict 31`; bad ops → `InvalidSchema 23`; compat gate → `SchemaIncompatible 30`; `applyOps` error → `InvalidSchema 23` | all ops `SET COMPATIBILITY` → `SetCompatibility`; else `AlterSchema{opsBlob}` |
+| `AlterTopic` | as today's `startAlter_`: view name → `ViewNotAlterable 38`; unknown → `UnknownTopic 7`; untyped → `UnknownTopic 7` (today's answer — an untyped topic has no schema in the registry, `AdminWorker.cpp` anchor `const RegistryEntry* latest = reg_.byName(msg.topicName);` — and `DdlExpectations` pins SchemaLess × Alter* = 7, binding for Task 10, F3); stale `expectedVersion` (schema version) → `SchemaConflict 31`; bad ops → `InvalidSchema 23`; a name `resolveAlterOps` cannot resolve → `InvalidSchema 23`; compat gate → `SchemaIncompatible 30`; `applyOps` error → `InvalidSchema 23` | all ops `SET COMPATIBILITY` → `SetCompatibility`; else `AlterSchema{resolveAlterOps(schema, decodeAlterOps(opsBlob))}` — stored resolved to durable tags (F20) |
 | `CreateView` | as today's `startCreateView_` (codes 23, 40, 32, 25, 34, 41, 33, 37, 35/34, 36) | `CreateView{viewTopicId = nextTopicId, sinkPartitions = source's, sourceNames, normalizedPlanBlob, compiledPlanBlob (viewTopicId stamped), outputDescriptorBlob}` |
 | `AlterView` | unknown view → `UnknownTopic 7` (detail "no view named …"); stale `expectedVersion` (object version) → `SchemaConflict 31`; plan errors as `CreateView` | `AlterView` with a fresh `viewTopicId = nextTopicId` |
 | `DropView` | unknown → `UnknownTopic 7` (detail) | `DropView{viewTopicId}` |
 | `DropTopic` | unknown → `UnknownTopic 7`; a view name → `ErrorResponse{39, "'v' is a view; use DROP VIEW"}`; read by view `v` → `ErrorResponse{39, "topic 't' is the source of view 'v'"}` | `DropTopic{topicId}` |
 | `AlterTopicConfig` | unknown → `UnknownTopic 7`; a view → `ViewNotAlterable 38`; stale `expectedVersion` (object version, 0 = unconditional) → `SchemaConflict 31`; empty / duplicate keys / out-of-range values → `ErrorResponse{39, detail}` | `AlterTopicConfig{changes}` |
 
-`normalizedPlanBlob` = `rune::view::serializeAuthored` of the authored plan after replacing each `sources[i].topicId` with `i` (ruling 11). The event's `statement`, `principal{sessionId, clientName, sourceAddress, requestId}`, `replayedFrom`, `timestampMs = system_clock now` come from `DdlMeta`; then `fingerprint = previewFingerprint(state, event)` (a failure here is an internal bug → answered `Internal 6`, logged at error, nothing appended).
+`normalizedPlanBlob` = `rune::view::serializeAuthored` of the authored plan after replacing each `sources[i].topicId` with `i` (ruling 11). The event's `statement`, `principal{sessionId, clientName, sourceAddress, requestId}`, `replayedFrom` come from `DdlMeta`; `principal.requestFingerprint = requestFingerprint(req)` (F14); `timestampMs = system_clock now` **when the event is built for the append** — the commit time is not known yet and the event is immutable (spec §4 as amended, F22); then `fingerprint = previewFingerprint(state, event)` (a failure here is an internal bug → answered `Internal 6`, logged at error, nothing appended).
 
 **Steps of one DDL on the leader** (`startNext_`, `advance_`):
 1. Role gate: `CatalogFollower` / `CatalogLeaderCatchingUp` → answer `NotLeader 2` (retriable; Task 11 makes the gateway redirect before the request reaches here); applier `Halted` → `Internal 6`.
-2. Dedupe: `meta.requestId != 0 && state.request(requestId)` → answer that record's result (same response type, `errorCode 0`); a request whose `requestId` equals the in-flight event's waits in `pending_` and is answered after it.
+2. Dedupe (F14) on `(requestId, requestFingerprint(req))`: `!meta.requestId.none() && state.request(requestId)` → when the record's `requestFingerprint` equals this request's, answer that record's result (same response type, `errorCode 0`); when it differs, answer `ErrorResponse{InvalidRequest 39, "requestId reused for a different statement"}` and append nothing — never another DDL's success. A request whose `requestId` equals the in-flight event's waits in `pending_` and is answered after it by the same rule.
 3. `buildEvent_` → reject, or encode into the reused `eventBuf_` and `catalogReplica_->appendKeyed(key = objectId LE 8 bytes, eventBuf_, acksAll = true)`; `< 0` (minIsr not met) → `NotLeader 2` (spec §5.5), nothing in flight.
 4. `AwaitingCommit{req, event, offset}`; `catalogReplica_->onLeaderLogAppended()`.
-5. Each `doWork`: plane poll → `catalogReplica_->doWork` → `applier_.applyCommitted(*catalogReplica_)` → `advance_`: `applier_.nextOffset() > offset` → answer OK from `state.request(requestId)` (or, for `requestId 0`, from the `Applied` the applier recorded for that offset): `DefineTopicResponse{topicId, schemaVersion}` / `AlterTopicResponse{topicId, schemaVersion}` / `CreateViewResponse{viewTopicId, outputFingerprint}` / `DdlResponse{objectId, newVersion, gateTopicId}` (`AlterView`: the new sink; drops / config: −1); applier halted at or before `offset` → `Internal 6`; `now − startedNs > kDdlTimeoutNs` → `Internal 6` (error bound, unchanged).
+5. Each `doWork`: plane poll → `catalogReplica_->doWork` → `applier_.applyCommitted(*catalogReplica_)` → `advance_`: `applier_.nextOffset() > offset` → answer OK from `state.request(requestId)` (or, for a `none()` requestId, from `applier_.lastApplied()` — F28 — whose `offset` must equal the in-flight `offset`: the single AdminWorker has one event in flight and the catch-up gate applied everything before it; a mismatch is a bug → `Internal 6`, logged at error): `DefineTopicResponse{topicId, schemaVersion}` / `AlterTopicResponse{topicId, schemaVersion}` / `CreateViewResponse{viewTopicId, outputFingerprint}` / `DdlResponse{objectId, newVersion, gateTopicId}` (`AlterView`: the new sink; drops / config: −1); applier halted at or before `offset` → `Internal 6`; `now − startedNs > kDdlTimeoutNs` → the retriable **`NotLeader 2`** (F13, spec §9: the appended event may still commit — `Internal` would tell the client not to retry; the retry with the same `requestId` is deduplicated to the original result if it committed, and re-executed if it did not), nothing more appended, `AwaitingCommit` → `Idle`. `Internal 6` is answered only by a halted applier (and the internal-bug cases above).
 6. Demotion while `AwaitingCommit` → answer `NotLeader 2` (spec §5.2: explicit, retriable — today it is `Internal`); the retry dedupes on the new leader if the event committed.
 
 - [ ] **Step 1: Write the failing tests** — `CatalogDdlRig.h` (support) + `CatalogWritePathTest.cpp`:
@@ -2488,14 +2959,16 @@ TEST(CatalogWritePathRegression, DefineTopicIsOneCreateTopicEventWithPrincipalAn
     rig.becomeServingLeader();
     const auto a = rig.define({.name = "players", .partitions = 3, .typed = true, .rf = 3,
                                .statement = "topic players {...} partitions 3 replicas 3;",
-                               .clientName = "cli", .requestId = 11});
+                               .clientName = "cli", .requestId = {.hi = 0xC11E, .lo = 11}});
     EXPECT_EQ(a.code, 0); EXPECT_EQ(a.topicId, 0); EXPECT_EQ(a.version, 1);
     const auto log = rig.recordedLog();
     ASSERT_EQ(log.size(), 1u);
     EXPECT_EQ(log[0].event.kind, rc::EventKind::CreateTopic);
     EXPECT_EQ(log[0].event.statement, "topic players {...} partitions 3 replicas 3;");
     EXPECT_EQ(log[0].event.principal.clientName, "cli");
-    EXPECT_EQ(log[0].event.principal.requestId, 11u);
+    EXPECT_EQ(log[0].event.principal.requestId, (rune::protocol::RequestId{0xC11E, 11}));
+    EXPECT_NE(log[0].event.principal.requestFingerprint, 0u) << "F14: the leader's statement fingerprint";
+    EXPECT_GT(log[0].event.timestampMs, 0) << "stamped at append (F22)";
     EXPECT_EQ(log[0].event.principal.sessionId, rig.sessionId());
     EXPECT_FALSE(log[0].event.principal.sourceAddress.empty());
 }
@@ -2534,13 +3007,53 @@ TEST(CatalogWritePathRegression, ReplicationFactorBoundsAreExplicitErrorsRegress
 TEST(CatalogWritePathRegression, DuplicateRequestIdAnswersTheOriginalResultRegression) {
     CatalogDdlRig rig("wp_dedupe", 3);
     rig.becomeServingLeader();
-    const auto first  = rig.define({.name = "t", .partitions = 1, .typed = true, .requestId = 99});
-    const auto second = rig.define({.name = "t", .partitions = 1, .typed = true, .requestId = 99});
+    const rune::protocol::RequestId rid{.hi = 0xC11E, .lo = 99};
+    const auto first  = rig.define({.name = "t", .partitions = 1, .typed = true, .requestId = rid});
+    const auto second = rig.define({.name = "t", .partitions = 1, .typed = true, .requestId = rid});
     EXPECT_EQ(second.code, 0) << "a retry of a committed DDL is its original success, not TopicExists";
     EXPECT_EQ(second.topicId, first.topicId);
     EXPECT_EQ(second.version, first.version);
     EXPECT_EQ(rig.recordedLog().size(), 1u);
-    EXPECT_EQ(rig.define({.name = "t", .partitions = 1, .typed = true, .requestId = 100}).code, 25);
+    EXPECT_EQ(rig.define({.name = "t", .partitions = 1, .typed = true, .requestId = {.hi = 0xC11E, .lo = 100}}).code, 25);
+}
+
+TEST(CatalogWritePathRegression, RequestIdReusedForADifferentStatementIsInvalidRequestRegression) {
+    // F14: two rune ql processes that drew the same id must never get each other's success.
+    CatalogDdlRig rig("wp_reuse", 3);
+    rig.becomeServingLeader();
+    const rune::protocol::RequestId rid{.hi = 0xC11E, .lo = 7};
+    ASSERT_EQ(rig.define({.name = "a", .partitions = 1, .requestId = rid}).code, 0);
+    const auto other = rig.define({.name = "b", .partitions = 2, .requestId = rid});
+    EXPECT_EQ(other.code, 39);
+    EXPECT_EQ(other.detail, "requestId reused for a different statement");
+    EXPECT_EQ(rig.recordedLog().size(), 1u) << "nothing appended for the reused id";
+    EXPECT_EQ(rig.admin().startedCount(), rig.admin().answeredCount());
+}
+
+TEST(CatalogWritePathRegression, CommitTimeoutAnswersRetriableNotLeaderAndTheRetryIsExactRegression) {
+    // F13: past kDdlTimeoutNs the appended event may still commit — the answer must be retriable,
+    // and the retry (same requestId) must get the original result once it committed.
+    CatalogDdlRig rig("wp_timeout", 3);
+    rig.becomeServingLeader(/*isr=*/{1, 2});              // follower 2 silent: the event stays uncommitted
+    const rune::protocol::RequestId rid{.hi = 0xC11E, .lo = 8};
+    const int64_t corr = rig.submitDefineNoWait({.name = "t", .partitions = 1, .requestId = rid});
+    rig.advanceClockPast(rune::node::AdminWorker::ddlTimeoutNs());
+    const auto a = rig.answerFor(corr);
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->code, 2) << "NotLeader (retriable), never Internal, on a healthy broker";
+    rig.resumeFollower(2);                                 // the event commits after all
+    const auto retry = rig.define({.name = "t", .partitions = 1, .requestId = rid});
+    EXPECT_EQ(retry.code, 0) << "the retry is the original success, not TopicExists";
+    EXPECT_EQ(rig.countEventsWithRequestId(rid), 1u);
+}
+
+TEST(CatalogWritePathRegression, AlterOfAnUntypedTopicIsUnknownTopicAsToday) {
+    // F3: today's startAlter_ answers UnknownTopic (7) for a topic with no schema; DdlExpectations pins it.
+    CatalogDdlRig rig("wp_untyped_alter", 3);
+    rig.becomeServingLeader();
+    ASSERT_EQ(rig.define({.name = "u", .partitions = 1, .typed = false}).code, 0);
+    EXPECT_EQ(rig.alterAdd("u", "mana").code, 7);
+    EXPECT_EQ(rig.recordedLog().size(), 1u);
 }
 
 TEST(CatalogWritePathRegression, DropRulesAreExplicit) {
@@ -2590,13 +3103,15 @@ TEST(CatalogWritePathRegression, AnswerComesAfterLocalApplyNotJustCommit) {
 Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_node_tests`
 Expected: compile error (`support/CatalogDdlRig.h` / `AdminWorker::submit` missing).
 
+(`CatalogDdlRig` provides, besides the calls above: `advanceClockPast(ns)` (its deterministic clock), `resumeFollower(id)` (the silent follower fetches again), `countEventsWithRequestId(RequestId)`; the define/alter helpers take `requestId` as `rune::protocol::RequestId`.)
+
 - [ ] **Step 3: Implement** the AdminWorker rewrite, the gateway handlers (each mirrors `handleDefineTopic`: decode → `rejectRequest_(InvalidRequest)` on an undecodable body → known session → `adminSink_->submitX(...)` with the `DdlMetaView{statement, clientName, requestId, replayedFrom…, sessionId, sourceAddress = session.egressChannel}`; ring full → `Internal 6`, as today), the `AdminDeps` wiring in `BrokerNode`, the deletions. `startedCount()` / `answeredCount()` are incremented at exactly one place each (`startNext_` dequeue; the single `answer_(…)` helper every exit uses).
 
 - [ ] **Step 4: Port the listed tests** to the catalog path (same scenarios and assertions where the behaviour is unchanged; a scenario that only existed for the deleted round-trip — e.g. "control thread reports `existed`" — becomes the catalog-state equivalent, named the same with `Catalog` prefixed). Their orphan cases go in Task 10 and their `RUNE_TOPICS` set-up in Tasks 16–18 (their own tasks).
 
 - [ ] **Step 5: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogWritePath|AdminWorker|DdlFinalFix|SchemaGateway|CreateView|GetViewRow|SchemaPersistence|TopicServability|TransientGateway|TransientInteractionMatrix|DdlAnswerGate' --output-on-failure -j14`
+Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogWritePath|CatalogApplier|AdminWorker|DdlFinalFix|SchemaGateway|CreateView|GetViewRow|SchemaPersistence|TopicServability|TransientGateway|TransientInteractionMatrix|DdlAnswerGate' --output-on-failure -j14`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -2619,8 +3134,9 @@ The DDL conformance plan's suites (`DdlHarness.h`, `DdlExpectations.h`, `DdlHarn
 - Modify: `libs/node/tests/support/DdlExpectations.h`:
   - Occupants: `SchemaLessDisk` / `SchemaLessTransient` are now **untyped topics created by DDL** (were static `RUNE_TOPICS`); `OrphanSink` is **deleted** (an uncommitted create no longer leaves anything behind — there is no orphan); every other occupant unchanged.
   - Ops: append `DropTopic`, `DropView`, `AlterView`, `AlterTopicConfig` (+ their expected codes per occupant, from the Task 9 table).
+  - Existing codes are unchanged — in particular `SchemaLessDisk` / `SchemaLessTransient` × every `Alter*` op stays `7` (Task 9 answers an alter of an untyped topic `UnknownTopic`, F3).
   - "†: detected by the control thread" rows are gone — every rejection is decided on the admin thread from the catalog state; `requestCreateTopic` call counts become "events appended" (0 for every rejection, 1 for an accepted op).
-- Modify: `libs/node/tests/node/DdlHarnessRegressionTest.cpp`, `DdlOccupantMatrixRegressionTest.cpp`, `DdlPairTimingMatrixRegressionTest.cpp`, `DdlStressRegressionTest.cpp`, `libs/node/tests/integration/DdlConformanceBrokerRegressionTest.cpp` (pins updated: occupant rows 38 → 36 (two `OrphanSink` rows removed), ops 12 → 16; cell count pin recomputed in the same test from the table, never hand-typed)
+- Modify: `libs/node/tests/node/DdlHarnessRegressionTest.cpp`, `DdlOccupantMatrixRegressionTest.cpp`, `DdlPairTimingMatrixRegressionTest.cpp`, `DdlStressRegressionTest.cpp`, `libs/node/tests/integration/DdlConformanceBrokerRegressionTest.cpp` (pins updated: `kOccupantCount` 10 → 9 (the `OrphanSink` row removed — F36: the literal is the occupant count of `DdlExpectations.h`, not a matrix-row count), `kOpCount` 12 → 16; cell count pin recomputed in the same test from the table, never hand-typed)
 
 **Interfaces:**
 - Consumes: `CatalogDdlRig` (Task 9).
@@ -2655,7 +3171,9 @@ Spec §5.1 (Redirect), §5.2 (leader change), §5.5 (unavailable), §9 (halted �
 - Modify: `libs/gateway/include/rune/gateway/ClientGateway.h`, `libs/gateway/src/ClientGateway.cpp` (`setCatalogRoute(CatalogRoute)`; every DDL handler (64, 68, 70, 74–77) consults `ddlRoute_()` before submitting; `GetTopicSchema` (66) and `GetViewRow` (72) are reads — served locally from the broker's projection, never redirected)
 - Modify: `libs/node/src/BrokerNode.cpp` (compute `CatalogRoute` each control pass from the MSM assignment of `(−6, 0)` + `kA2cCatalogHalted`; publish on change only)
 - Modify: `libs/node/src/AdminWorker.cpp` (role transitions: `onCatalogRole(leader)` → `CatalogLeaderCatchingUp`; `doWork` promotes to `CatalogLeaderServing` once `catalogReplica_->highWatermark() == catalogReplica_->logEndOffset()` (every record the new leader holds — including a previous epoch's tail — is committed: HW = min LEO over the ISR) **and** `applier.nextOffset() == highWatermark()` (all of it applied); a follower edge → `CatalogFollower`, an in-flight op → `NotLeader`; every transition logs `AdminWorker: __catalog role -> <roleName()> (epoch N)` at info — Task 24 finds the leader by it)
-- Test: `libs/node/tests/node/CatalogLeadershipTest.cpp` (on `CatalogDdlRig` extended to 3 rigs over one `FilteringTransport` — Task 20 promotes this to `CatalogClusterHarness`), `libs/gateway/tests/gateway/CatalogGatewayTest.cpp` (append)
+- Modify: root `CMakeLists.txt` (F7: `set(RUNE_CLIENT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-client-cpp" CACHE PATH …)`; under `BUILD_TESTING`, after the broker's own `rune_codec` / `rune_fr` / `rune_gso` / `rune_crypto` / `rune_catalog` targets: `if(NOT EXISTS "${RUNE_CLIENT_ROOT}/CMakeLists.txt") message(FATAL_ERROR "RUNE_CLIENT_ROOT … is required for rune_client_broker_tests")` — never a silent skip — then `add_subdirectory(${RUNE_CLIENT_ROOT} ${CMAKE_BINARY_DIR}/rune-client EXCLUDE_FROM_ALL)`; the client's `if(NOT TARGET …)` guards (Task 5) reuse the broker's copies of the shared sibling targets)
+- Modify: `libs/node/CMakeLists.txt` (F7: new executable `rune_client_broker_tests` — sources under `libs/node/tests/client/`, linking `rune_node`, the client's `rune_client_api`, `GTest::gtest_main`; Task 15 adds `rune_cli_lib`)
+- Test: `libs/node/tests/node/CatalogLeadershipTest.cpp` (on `CatalogDdlRig` extended to 3 rigs over one `FilteringTransport` — Task 20 promotes this to `CatalogClusterHarness`), `libs/gateway/tests/gateway/CatalogGatewayTest.cpp` (append), `libs/node/tests/client/OneBroker.h` + `libs/node/tests/client/ClientDdlBrokerRegressionTest.cpp` (F7: the real client's blocking `*AndWait` DDL against a real single-node `BrokerNode`)
 
 **Interfaces:**
 - Produces:
@@ -2670,6 +3188,7 @@ Spec §5.1 (Redirect), §5.2 (leader change), §5.5 (unavailable), §9 (halted �
   void setCatalogRoute(CatalogRoute r) noexcept;
   ```
 - DDL answers by route: `RouteHalted` → `ErrorResponse{Internal 6, "catalog apply halted at offset N"}` (spec §9 — never a redirect, matrix R2); `RouteRemote` → `ErrorResponse{Redirect 3, endpoint}`; `RouteUnknown` → `ErrorResponse{NotLeader 2}`; `RouteLocalLeader` → submit to the admin ring.
+- **Pre-v8 sessions (F37):** a session with `!clientUnderstandsCatalogDdl(session.clientVersion)` (Task 4) cannot follow a DDL `Redirect`, and a v7 client leaves a DDL `ErrorResponse` pending until its deadline. Its `DefineTopic` / `AlterTopic` / `CreateView` (the only DDL templates below v8) on a broker whose route is not `RouteLocalLeader` is therefore answered **in the request's own response type** (`DefineTopicResponse` / `AlterTopicResponse` / `CreateViewResponse`) with `errorCode = InvalidRequest (39)`, and the reason `"client too old for cluster DDL routing; upgrade"` is logged at warn with the session id (those frames carry no message) — never a Redirect, never a wait-out. `RouteHalted` → own type with `Internal 6`; `RouteUnknown` → own type with `NotLeader 2`. On `RouteLocalLeader` a pre-v8 DDL is served as today (`requestId` none).
 
 - [ ] **Step 1: Write the failing tests** — `CatalogLeadershipTest.cpp`:
 
@@ -2691,15 +3210,16 @@ TEST(CatalogLeadershipRegression, NewLeaderAnswersNotLeaderUntilCaughtUpRegressi
 
 TEST(CatalogLeadershipRegression, RetryAfterLeaderChangeReturnsTheOriginalResultOnceRegression) {
     CatalogTrio t("ld_retry");
+    const rune::protocol::RequestId rid{.hi = 0xC11E, .lo = 5};
     t.holdHighWatermark(1);                            // 1 appends, the HW does not move yet
-    const int64_t corr = t.submitDefineNoWait(1, {.name = "t", .partitions = 1, .typed = true, .requestId = 5});
+    const int64_t corr = t.submitDefineNoWait(1, {.name = "t", .partitions = 1, .typed = true, .requestId = rid});
     t.replicateTo({2, 3});                             // the event reaches 2 and 3 …
     t.moveCatalogLeadership(2);                        // … then 1 loses leadership before answering
     EXPECT_EQ(t.answerFor(1, corr)->code, 2);
     ASSERT_TRUE(t.awaitRole(2, "LeaderServing", 10s));
-    const auto retry = t.define(2, {.name = "t", .partitions = 1, .typed = true, .requestId = 5});
+    const auto retry = t.define(2, {.name = "t", .partitions = 1, .typed = true, .requestId = rid});
     EXPECT_EQ(retry.code, 0);
-    EXPECT_EQ(t.countEventsWithRequestId(5), 1u) << "no DDL lost or duplicated";
+    EXPECT_EQ(t.countEventsWithRequestId(rid), 1u) << "no DDL lost or duplicated";
     EXPECT_TRUE(t.allDigestsEqual());
 }
 
@@ -2709,8 +3229,14 @@ TEST(CatalogLeadershipRegression, BelowMinIsrEveryDdlIsNotLeaderAndProduceIsUnaf
     t.kill(2); t.kill(3);
     EXPECT_EQ(t.define(1, {.name = "more", .partitions = 1}).code, 2);
     EXPECT_EQ(t.admin(1).startedCount(), t.admin(1).answeredCount());
+    // F24: produce and consume on the existing topic really happen, below the catalog's minIsr.
+    const auto off = t.produce(1, "data", {0xAB, 0xCD});              // acks=leader on the survivor
+    ASSERT_TRUE(off.has_value()) << "produce on an existing topic is unaffected (spec §5.5)";
+    EXPECT_EQ(t.consumeFrom(1, "data", *off), (std::vector<uint8_t>{0xAB, 0xCD}));
 }
 ```
+
+(`CatalogTrio` places each applied topic's partitions as real `PartitionReplica`s on the same `FilteringTransport` — leader = the broker the trio's placement map names, `minIsr 1`, acks=leader — so `produce(broker, topic, bytes) → std::optional<int64_t>` appends through that leader replica and `consumeFrom(broker, topic, offset)` reads the record back; F24.)
 
 `CatalogGatewayTest.cpp` (append):
 
@@ -2742,20 +3268,81 @@ TEST(CatalogGatewayRegression, SchemaReadsAreServedLocallyOnAFollower) {
     g.gateway().setCatalogRoute(rune::gateway::RouteRemote{"x:1"});
     EXPECT_EQ(g.sendGetTopicSchema("t").forwardedToAdmin, true) << "reads are never redirected";
 }
+TEST(CatalogGatewayRegression, PreV8DdlToANonLeaderIsInvalidRequestNotARedirectRegression) {
+    // F37: a v7 client cannot follow a DDL Redirect and waits out an ErrorResponse — answer it explicitly.
+    GatewayRig g(/*clientVersion=*/7);
+    g.gateway().setCatalogRoute(rune::gateway::RouteRemote{"10.0.0.2:40200"});
+    for (auto tmpl : {rune::protocol::client::TemplateId::DefineTopic, rune::protocol::client::TemplateId::AlterTopic,
+                      rune::protocol::client::TemplateId::CreateView}) {
+        const auto r = g.sendDdl(tmpl);
+        EXPECT_EQ(r.responseTemplate, g.ownResponseTemplate(tmpl)) << "its own response type, not ErrorResponse";
+        EXPECT_EQ(r.code, rune::protocol::client::ErrorCode::InvalidRequest);
+        EXPECT_EQ(g.adminSubmits(), 0u);
+    }
+    EXPECT_TRUE(g.warnLogContains("client too old for cluster DDL routing; upgrade"));
+}
 ```
+
+`ClientDdlBrokerRegressionTest.cpp` (new binary `rune_client_broker_tests`, F7) — the **real** client (`rune::client::Client`, Thread runner mode) against one **real** `BrokerNode` started in-process (`OneBroker`, created here in `libs/node/tests/client/OneBroker.h` and reused by Tasks 13 and 15: `TmpDir` + `Ports::discover` + `makeConfig` as `TransientTopicDataPathTest.cpp` does, `pinLegacyRuntime` from `support/TestNodeConfig.h`; `connectClient()` points the client's `gatewayChannel` at the node's client endpoint; `catalogEvents()` reads the node's `__catalog` log through `onAdminThreadForTest` and decodes it with `rune_catalog`; `endpoint()` = `host:port` for the CLI). The fake cannot serve these calls: a blocking `*AndWait` pumps its own thread.
+
+```cpp
+TEST(ClientDdlBrokerRegression, EveryDdlAndWaitRoundTripsThroughARealBroker) {
+    OneBroker b("cb_all");
+    auto client = b.connectClient();
+    rune::client::DdlOptions o; o.statement = "topic u partitions 1;";
+    ASSERT_EQ(client->defineTopicAndWait("u", 1, "", {}, false, rune::client::Persistence::Disk, {}, o, 10s).errorCode, 0);
+    const rune::protocol::client::ConfigChangeWire ch{1, 60'000};
+    EXPECT_EQ(client->alterTopicConfigAndWait("u", 0, std::span(&ch, 1), {}, 10s).errorCode, 0);
+    EXPECT_EQ(client->defineTopicAndWait("u", 1, "id", b.idDescriptor(), false, rune::client::Persistence::Disk,
+                                         {}, {}, 10s).errorCode, 0) << "CreateSchema on the untyped topic";
+    EXPECT_EQ(client->alterTopicAndWait("u", 0, b.addColumnOps("mana"), {}, 10s).errorCode, 0);
+    EXPECT_EQ(client->createViewAndWait("v", "id", 0, b.viewPlanOver("u"), {}, 10s).errorCode, 0);
+    EXPECT_EQ(client->alterViewAndWait("v", "id", 0, /*expectedVersion=*/1, b.viewPlanOver("u", /*extra=*/true), {},
+                                       10s).errorCode, 0);
+    EXPECT_EQ(client->dropViewAndWait("v", {}, 10s).errorCode, 0);
+    EXPECT_EQ(client->dropTopicAndWait("u", {}, 10s).errorCode, 0);
+    const auto log = b.catalogEvents();
+    ASSERT_EQ(log.size(), 8u);
+    EXPECT_EQ(log[0].event.statement, "topic u partitions 1;");
+    EXPECT_FALSE(log[0].event.principal.requestId.none());
+}
+
+TEST(ClientDdlBrokerRegression, InvalidRequestDetailFromTheBrokerReachesTheCaller) {
+    OneBroker b("cb_rf");
+    auto client = b.connectClient();
+    rune::client::TopicOptions topic; topic.replicationFactor = 5;
+    const auto r = client->defineTopicAndWait("t", 1, "", {}, false, rune::client::Persistence::Disk, topic, {}, 10s);
+    EXPECT_EQ(r.errorCode, 39);
+    EXPECT_EQ(r.detail, "replicationFactor 5 > broker count 1");
+}
+
+TEST(ClientDdlBrokerRegression, ARetriedRequestIdGetsTheOriginalResultFromTheBroker) {
+    OneBroker b("cb_dedupe");
+    auto client = b.connectClient();
+    rune::client::DdlOptions o; o.requestId = {.hi = 0xC11E, .lo = 42};
+    const auto first  = client->defineTopicAndWait("t", 1, "", {}, false, rune::client::Persistence::Disk, {}, o, 10s);
+    const auto second = client->defineTopicAndWait("t", 1, "", {}, false, rune::client::Persistence::Disk, {}, o, 10s);
+    EXPECT_EQ(first.errorCode, 0);
+    EXPECT_EQ(second.errorCode, 0) << "not TopicExists";
+    EXPECT_EQ(second.topicId, first.topicId);
+    EXPECT_EQ(b.catalogEvents().size(), 1u);
+}
+```
+
+(The multi-node blocking cases — a follower's `Redirect` followed by `*AndWait`, `NotLeader` until the budget below minIsr — need three nodes and land in Task 22, F7.)
 
 - [ ] **Step 2: Run to verify they fail**, then **Step 3: implement** as specified. `BrokerNode` recomputes the route in `serviceAdminControl_` (control thread): halted (latched from `kA2cCatalogHalted`) → `RouteHalted`; else MSM `(−6,0)` leader == self → `RouteLocalLeader`; leader ≥ 0 → `RouteRemote{peer.clientChannel()}` (as `leaderClientEndpointFor_` builds it); else `RouteUnknown`. Single node → `RouteLocalLeader` once the consensus leader is self, else `RouteUnknown`.
 
 - [ ] **Step 4: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogLeadership|CatalogGateway|CatalogWritePath|SchemaGateway' --output-on-failure -j14`
+Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogLeadership|CatalogGateway|CatalogWritePath|SchemaGateway|ClientDdlBroker' --output-on-failure -j14`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(catalog): DDL Redirect to the catalog leader, NotLeader on leader change / catch-up / below minIsr, Internal when halted
+git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs CMakeLists.txt
+git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(catalog): DDL Redirect to the catalog leader, NotLeader on leader change / catch-up / below minIsr, Internal when halted; pre-v8 DDL on a non-leader answered InvalidRequest; real client vs real broker tests
 
 Fix-on-sight: a non-leader admin answered DDL Internal (non-retriable) instead of a redirect.
 
@@ -2773,14 +3360,19 @@ Spec §7: reads are client-side; the client consumes `__catalog` with the existi
 - Modify: `libs/node/include/rune/node/AdminChannels.h` (`kMsgCatalogSubscribe = 14` `[session][corr][fromOffset]`, `kMsgCatalogUnsubscribe = 15` `[session][subscriptionId]`; session-close notice reuses the unsubscribe with `subscriptionId = -1` = all of that session)
 - Modify: `libs/gateway/src/ClientGateway.cpp` (Subscribe with `topicId == kCatalogTopicId`: partition must be 0 → else `InvalidRequest`; forwarded; `SubscribeResponse` is sent by the admin thread; Unsubscribe of a catalog subscription id (ids from the admin's range, below) forwarded; session expiry posts the session-wide unsubscribe)
 - Modify: `libs/node/src/AdminWorker.cpp` (`readServer_.pump()` in `doWork` after the applier)
-- Test: `libs/node/tests/node/CatalogReadServerTest.cpp`
+- Create: `libs/node/tests/support/CatalogReadRig.h` (`rune::node::test::ReadRig`: a catalog replica — leader with ISR {self}, or follower — + the server + a recording egress; used by both test files below)
+- Test: `libs/node/tests/node/CatalogReadServerTest.cpp` (`using rune::node::test::ReadRig;`), `libs/node/tests/node/CatalogAllocRegressionTest.cpp` (append, F12)
+- Spec note: spec §7 as amended (F19) — serving the existing Subscribe for −6 is transport, not a read API; history / as-of / diff and replay stay client-side (Task 13).
 
 **Interfaces:**
 - Produces:
   ```cpp
   class CatalogReadServer {
   public:
-      struct Sub { int64_t session; int64_t subscriptionId; int64_t nextOffset; bool caughtUpSent; };
+      // One explicit state per subscription phase (hard rule 3, F29) — no caughtUpSent flag:
+      struct Backlog { int64_t nextOffset; };   // pushing [nextOffset, HW); the marker is sent on leaving this state
+      struct Live    { int64_t nextOffset; };   // marker sent; pushes new commits as they arrive
+      struct Sub { int64_t session; int64_t subscriptionId; std::variant<Backlog, Live> phase; };
       CatalogReadServer(rune::replication::PartitionReplica& catalog, EgressFn send, std::size_t maxSubs = 64);
       void subscribe(int64_t session, int64_t corr, int64_t fromOffset);   // answers SubscribeResponse
       void unsubscribe(int64_t session, int64_t subscriptionId);           // -1 = every sub of the session
@@ -2789,7 +3381,7 @@ Spec §7: reads are client-side; the client consumes `__catalog` with the existi
   };
   inline constexpr int64_t kCatalogSubscriptionIdBase = int64_t{1} << 62;  // never collides with gateway ids
   ```
-- Rules: `fromOffset` −2 (earliest) → 0; −1 (latest) → HW; an explicit offset above HW → HW; over `maxSubs` → `SubscribeResponse{errorCode = Internal}` with a log line (bounded, never silent). `pump()` reads at most `kCatalogReadChunk` per sub per pass into one **preallocated** buffer, never past the HW (followers serve their own HW — committed data only), encodes `Records{subscriptionId, topicId = −6, partition 0, baseOffset}` frames (whole batches, like `servePushRead_`), and after the backlog sends the empty-payload marker `Records{baseOffset = HW}` once; new commits are pushed as they arrive (no new marker). Egress full → the sub keeps its `nextOffset` and resumes next pass.
+- Rules: `fromOffset` −2 (earliest) → 0; −1 (latest) → HW; an explicit offset above HW → HW; over `maxSubs` → `SubscribeResponse{errorCode = Internal}` with a log line (bounded, never silent). `pump()` reads at most `kCatalogReadChunk` per sub per pass into one **preallocated** buffer, never past the HW (followers serve their own HW — committed data only), encodes `Records{subscriptionId, topicId = −6, partition 0, baseOffset}` frames (whole batches, like `servePushRead_`), and when a `Backlog` sub reaches the HW it sends the empty-payload marker `Records{baseOffset = HW}` and becomes `Live` (the transition is the "once"); a `Live` sub pushes new commits as they arrive (no new marker). Egress full → the sub keeps its state and `nextOffset` and resumes next pass.
 
 - [ ] **Step 1: Write the failing tests**:
 
@@ -2832,14 +3424,21 @@ TEST(CatalogReadServerRegression, TooManySubscriptionsAreAnsweredNotDropped) {
     EXPECT_EQ(r.subscribeError(3, 1), rune::protocol::client::ErrorCode::Internal);
 }
 
-TEST(CatalogReadServerRegression, IdleSubscriptionsAllocateNothing) {
-    ReadRig r("rd_alloc");
+```
+
+and, appended to `CatalogAllocRegressionTest.cpp` (the own-binary allocation gate of Task 7, F12; `ReadRig` lives in `libs/node/tests/support/CatalogReadRig.h` so both files use it — add `#include "support/CatalogReadRig.h"` there):
+
+```cpp
+TEST(CatalogAllocRegression, IdleCatalogSubscriptionsAllocateNothingRegression) {
+    rune::node::test::ReadRig r("rd_alloc");
     r.commitEvents(3);
     r.server.subscribe(7, 1, -2);
-    r.server.pump();
-    rune::test::AllocCounter ac;
+    r.server.pump();                                   // backlog + marker: the sub is Live
+    gArmedAllocs = 0;
+    gArmed = true;
     for (int i = 0; i < 1000; ++i) (void)r.server.pump();
-    EXPECT_EQ(ac.count(), 0u);
+    gArmed = false;
+    EXPECT_EQ(gArmedAllocs, 0u);
 }
 ```
 
@@ -2847,7 +3446,7 @@ plus a gateway test `CatalogGatewayRegression.CatalogSubscribeIsForwardedOnAnyBr
 
 - [ ] **Step 2: Run to verify they fail**, **Step 3: implement**, **Step 4: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogReadServer|CatalogGateway' --output-on-failure -j14`
+Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogReadServer|CatalogGateway|CatalogAlloc' --output-on-failure -j14`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -2867,11 +3466,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 Spec §7: "the client consumes it, with the existing Subscribe from offset 0, and replays it with the shared library … the client caches the replayed prefix." Shared-nothing: the record handler runs on the runner thread and only copies records into an SPSC ring; the app thread owns the cache and the replayer.
 
 **Files:**
-- Modify: `rune-client-cpp/CMakeLists.txt` (`rune_catalog` from `${RUNE_CODEC_ROOT}/src/catalog/*.cpp`, next to `rune_codec`; `rune_client_api` links it)
+- Modify: `rune-client-cpp/CMakeLists.txt` (`rune_catalog` from `${RUNE_CODEC_ROOT}/src/catalog/*.cpp`, next to `rune_codec`, with `${RUNE_PROTOCOL_INCLUDE}` on its include path and wrapped in `if(NOT TARGET rune_catalog)` like the other shared sibling targets (Task 5, F7); `rune_client_api` links it)
 - Modify: `rune-client-cpp/include/rune/client/TopicHandle.h` (`static constexpr TopicHandle catalog() noexcept { return {rune::protocol::client::kCatalogTopicId, 1}; }`), `include/rune/client/subscriber/Subscription.h` (`SubscribeOptions::onCaughtUp` — `std::function<void(int64_t highWatermark)>`, invoked on the runner thread for an empty-payload `Records` frame of a catalog subscription), `src/subscriber/SubscriberHub.cpp` (dispatch of that frame), `src/Client.cpp` (`subscribe` accepts `TopicHandle::catalog()` with partition 0)
 - Create: `rune-client-cpp/include/rune/client/catalog/CatalogReader.h`, `src/catalog/CatalogReader.cpp`
 - Modify: `rune-client-cpp/include/rune/client/Client.h` (the three API calls)
-- Test: `rune-client-cpp/tests/catalog/CatalogReaderTest.cpp` (fake gateway pushing golden events), add to `CMakeLists.txt`
+- Test: `rune-client-cpp/tests/catalog/CatalogReaderTest.cpp` — **non-blocking** reader tests on `test_support::InvokerGateway` (a `templateHandlers[Subscribe]` handler answers the catalog Subscribe and pushes the golden events, one record per `Records` frame, then the empty-payload marker); add to `CMakeLists.txt`
+- Test (broker repo, F7): `libs/node/tests/client/ClientCatalogReadBrokerRegressionTest.cpp` in `rune_client_broker_tests` (Task 11) — the blocking `catalogHistory` / `catalogAsOf` / `catalogDiff` against a real `BrokerNode` (`OneBroker`), committed in rune-broker
 
 **Interfaces:**
 - Consumes: `rune::catalog::{CatalogReplayer, RecordedEvent, history, stateAsOf, diff, HistoryFilter, AsOf, DiffEntry, ReplayError}`; `Client::subscribe`.
@@ -2883,6 +3483,11 @@ Spec §7: "the client consumes it, with the existing Subscribe from offset 0, an
   class CatalogReader {                     // app-thread object; one per Client (lazily created)
   public:
       explicit CatalogReader(Client&);
+      // Non-blocking pair (F7: what the single-threaded fake tests): subscribe from the cache end, then
+      // drain the ring each call; nullopt = not done yet (the caller keeps pumping doWork()).
+      OpResult beginRefresh();
+      std::optional<CatalogResult<void>> pollRefresh(int64_t nowNs, int64_t deadlineNs);
+      // Blocking: beginRefresh + pollRefresh until done (pumps doWork() in Invoker mode, idles in Thread mode).
       CatalogResult<void> refresh(std::chrono::milliseconds timeout);   // subscribe from cache end → caught-up marker
       [[nodiscard]] std::span<const rune::catalog::RecordedEvent> events() const noexcept;
       [[nodiscard]] const rune::catalog::CatalogState& state() const noexcept;
@@ -2896,71 +3501,121 @@ Spec §7: "the client consumes it, with the existing Subscribe from offset 0, an
   ```
 - `refresh`: subscribe `TopicHandle::catalog()` partition 0 `From::offset(cache.nextOffset())`; the handler copies `(offset, value)` into a `detail::OneToOneRingBuffer` (4 MiB, preallocated once per reader; a record larger than a quarter of it is split over a length-prefixed sequence of frames); `onCaughtUp(hw)` writes an end frame; the app thread drains, `feed`s each record into the cached `CatalogReplayer`, appends a `RecordedEvent`, stops at the end frame whose `hw ≤ nextOffset`, then unsubscribes. A replay error → `Replay` with the offset (the cache keeps the verified prefix; the next refresh retries from it — and fails the same way: explicit, never silently skipped). Deadline → `Timeout`.
 
-- [ ] **Step 1: Write the failing tests** — `CatalogReaderTest.cpp`:
+- [ ] **Step 1: Write the failing tests** — `CatalogReaderTest.cpp` (client repo; non-blocking: the invoker `Rig`, `invokerCfg` and fake clock `g_now` of Task 5's tests, copied into this file's anonymous namespace; `CatalogFeed` is a file-local helper that installs `gw.templateHandlers[Subscribe]` serving a vector of events from the requested offset, records each `fromOffset`, and can withhold the marker):
 
 ```cpp
-TEST(CatalogReaderRegression, HistoryAsOfAndDiffMatchTheLibraryOverTheSameLog) {
-    FakeCatalogBroker b;                                // InvokerGateway + a catalog Subscribe handler
-    b.setLog(rune::catalog::testing::goldenScriptV1());
+namespace {
+/// Drive one non-blocking refresh to completion (or the 10 s hang guard).
+std::optional<rune::client::CatalogResult<void>> refreshOnce(Rig& r, rune::client::CatalogReader& reader,
+                                                              int64_t budgetNs) {
+    if (reader.beginRefresh() != rune::client::OpResult::Accepted) return std::nullopt;
+    const int64_t deadline = g_now + budgetNs;
+    std::optional<rune::client::CatalogResult<void>> done;
+    r.drive([&] { done = reader.pollRefresh(g_now, deadline); return done.has_value(); }, /*stepNs=*/1'000'000);
+    return done;
+}
+} // namespace
+
+TEST(CatalogReaderRegression, RefreshReplaysEveryEventAndStopsAtTheMarker) {
+    Rig r(invokerCfg(3980, 3981)); r.connect();
+    CatalogFeed feed(r.gw, rune::catalog::testing::goldenScriptV1());
+    rune::client::CatalogReader reader(r.client);
+    auto done = refreshOnce(r, reader, 5'000'000'000);
+    ASSERT_TRUE(done.has_value());
+    ASSERT_TRUE(done->has_value()) << done->error().detail;
+    EXPECT_EQ(reader.events().size(), 18u);
+    rune::catalog::CatalogReplayer lib;
+    for (const auto& e : reader.events()) ASSERT_TRUE(lib.feedDecoded(e.offset, e.event));
+    EXPECT_EQ(reader.state().digest(), lib.state().digest()) << "the reader replays with the shared library";
+}
+
+TEST(CatalogReaderRegression, SecondRefreshFetchesOnlyTheNewTail) {
+    Rig r(invokerCfg(3982, 3983)); r.connect();
+    auto log = rune::catalog::testing::goldenScriptV1();
+    CatalogFeed feed(r.gw, {log.begin(), log.begin() + 10});
+    rune::client::CatalogReader reader(r.client);
+    ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
+    feed.append({log.begin() + 10, log.end()});
+    ASSERT_TRUE(refreshOnce(r, reader, 5'000'000'000).value().has_value());
+    EXPECT_EQ(feed.subscribeFromOffsets(), (std::vector<int64_t>{0, 10})) << "the replayed prefix is cached";
+    EXPECT_EQ(reader.events().size(), 18u);
+}
+
+TEST(CatalogReaderRegression, TamperedEventIsAReplayErrorNamingItsOffset) {
+    Rig r(invokerCfg(3984, 3985)); r.connect();
+    auto log = rune::catalog::testing::goldenScriptV1();
+    log[4].fingerprint ^= 1;
+    CatalogFeed feed(r.gw, log);
+    rune::client::CatalogReader reader(r.client);
+    auto done = refreshOnce(r, reader, 5'000'000'000);
+    ASSERT_TRUE(done.has_value());
+    ASSERT_FALSE(done->has_value());
+    EXPECT_EQ(done->error().kind, rune::client::CatalogReadError::Kind::Replay);
+    EXPECT_EQ(done->error().offset, 4);
+    EXPECT_EQ(reader.events().size(), 4u) << "the verified prefix stays cached";
+}
+
+TEST(CatalogReaderRegression, NoCaughtUpMarkerIsATimeoutNotAHang) {
+    Rig r(invokerCfg(3986, 3987)); r.connect();
+    CatalogFeed feed(r.gw, rune::catalog::testing::goldenScriptV1());
+    feed.suppressCaughtUpMarker();
+    rune::client::CatalogReader reader(r.client);
+    auto done = refreshOnce(r, reader, /*budgetNs=*/500'000'000);
+    ASSERT_TRUE(done.has_value()) << "the deadline ends it";
+    ASSERT_FALSE(done->has_value());
+    EXPECT_EQ(done->error().kind, rune::client::CatalogReadError::Kind::Timeout);
+}
+```
+
+`ClientCatalogReadBrokerRegressionTest.cpp` (broker repo, `rune_client_broker_tests`, F7) — the **blocking** API against a real `BrokerNode`; the expected values come from replaying the broker's own log with the library, never hand-typed:
+
+```cpp
+TEST(ClientCatalogReadBrokerRegression, HistoryAsOfAndDiffMatchTheLibraryOverTheBrokersLog) {
+    OneBroker b("cr_all");
     auto client = b.connectClient();
-    auto h = client->catalogHistory({.type = rune::catalog::ObjectType::Schema, .name = "players"}, 5s);
+    b.runSchemaLifecycle(*client, "players");            // define typed, alter add, alter rename, set compat (via *AndWait)
+    ASSERT_EQ(client->defineTopicAndWait("events", 2, "", {}, false, rune::client::Persistence::Disk, {}, {}, 10s).errorCode, 0);
+    const auto log = b.catalogEvents();                   // RecordedEvents decoded from the node's __catalog
+    auto h = client->catalogHistory({.type = rune::catalog::ObjectType::Schema, .name = "players"}, 10s);
     ASSERT_TRUE(h.has_value()) << h.error().detail;
-    EXPECT_EQ(h->size(), 4u);
-    auto s = client->catalogAsOf({.by = rune::catalog::AsOf::By::Offset, .value = 5}, 5s);
+    EXPECT_EQ(h->size(), rune::catalog::history(log, {.type = rune::catalog::ObjectType::Schema, .name = "players"}).size());
+    auto s = client->catalogAsOf({.by = rune::catalog::AsOf::By::Offset, .value = 2}, 10s);
     ASSERT_TRUE(s.has_value());
-    EXPECT_EQ(s->topicByName("players")->schema->schemaVersion, 3);
-    auto d = client->catalogDiff({.by = rune::catalog::AsOf::By::Offset, .value = 6},
-                                 {.by = rune::catalog::AsOf::By::Offset, .value = 17}, 5s);
+    EXPECT_EQ(s->digest(), rune::catalog::stateAsOf(log, {.by = rune::catalog::AsOf::By::Offset, .value = 2})->digest());
+    auto d = client->catalogDiff({.by = rune::catalog::AsOf::By::Offset, .value = 0},
+                                 {.by = rune::catalog::AsOf::By::Offset, .value = static_cast<int64_t>(log.size()) - 1}, 10s);
     ASSERT_TRUE(d.has_value());
     EXPECT_FALSE(d->empty());
 }
 
-TEST(CatalogReaderRegression, SecondCallFetchesOnlyTheNewTail) {
-    FakeCatalogBroker b;
-    auto log = rune::catalog::testing::goldenScriptV1();
-    b.setLog({log.begin(), log.begin() + 10});
+TEST(ClientCatalogReadBrokerRegression, ASecondReadSeesNewDdlFromTheCachedPrefix) {
+    OneBroker b("cr_tail");
     auto client = b.connectClient();
-    ASSERT_TRUE(client->catalogHistory({}, 5s));
-    b.append({log.begin() + 10, log.end()});
-    ASSERT_TRUE(client->catalogHistory({}, 5s));
-    EXPECT_EQ(b.subscribeFromOffsets(), (std::vector<int64_t>{0, 10})) << "the replayed prefix is cached";
-}
-
-TEST(CatalogReaderRegression, TamperedEventIsAReplayErrorNamingItsOffset) {
-    FakeCatalogBroker b;
-    auto log = rune::catalog::testing::goldenScriptV1();
-    log[4].fingerprint ^= 1;
-    b.setLog(log);
-    auto client = b.connectClient();
-    auto h = client->catalogHistory({}, 5s);
-    ASSERT_FALSE(h.has_value());
-    EXPECT_EQ(h.error().kind, rune::client::CatalogReadError::Kind::Replay);
-    EXPECT_EQ(h.error().offset, 4);
-}
-
-TEST(CatalogReaderRegression, NoCaughtUpMarkerIsATimeoutNotAHang) {
-    FakeCatalogBroker b;
-    b.setLog(rune::catalog::testing::goldenScriptV1());
-    b.suppressCaughtUpMarker();
-    auto client = b.connectClient();
-    const auto t0 = std::chrono::steady_clock::now();
-    auto h = client->catalogHistory({}, 500ms);
-    ASSERT_FALSE(h.has_value());
-    EXPECT_EQ(h.error().kind, rune::client::CatalogReadError::Kind::Timeout);
-    EXPECT_LT(std::chrono::steady_clock::now() - t0, 2s);
+    ASSERT_EQ(client->defineTopicAndWait("a", 1, "", {}, false, rune::client::Persistence::Disk, {}, {}, 10s).errorCode, 0);
+    ASSERT_EQ(client->catalogHistory({}, 10s)->size(), 1u);
+    ASSERT_EQ(client->defineTopicAndWait("b", 1, "", {}, false, rune::client::Persistence::Disk, {}, {}, 10s).errorCode, 0);
+    ASSERT_EQ(client->catalogHistory({}, 10s)->size(), 2u);
+    EXPECT_EQ(b.catalogSubscribeFromOffsets(), (std::vector<int64_t>{0, 1})) << "the client resumed from its cache end";
 }
 ```
+
+(`OneBroker::runSchemaLifecycle` and `catalogSubscribeFromOffsets` — the `fromOffset` of each catalog Subscribe the node's `CatalogReadServer` accepted, read through `onAdminThreadForTest` — are added to `libs/node/tests/client/OneBroker.h` here.)
 
 - [ ] **Step 2: Run to verify they fail**, **Step 3: implement**, **Step 4: Run**
 
 Run: `cmake /Users/vradu/Projects/se-worktrees/rune-client-cpp/build && cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'CatalogReader|Subscriber|OneToOneRingBuffer' --output-on-failure -j14`
+Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_client_broker_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'ClientCatalogReadBroker|ClientDdlBroker' --output-on-failure -j14`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit** (two repos)
 
 ```bash
 git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add include src tests CMakeLists.txt
 git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(client): catalogHistory / catalogAsOf / catalogDiff over the shared replay library (cached prefix)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/tests/client
+git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(catalog): the real client's catalog reads against a real broker
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2973,13 +3628,13 @@ Spec §7 (QL column of the reads table) and §8 (`replicationFactor` on CreateTo
 
 **Files:**
 - Modify: `rune-ql/include/rune/ql/Ast.h`, `include/rune/ql/Parser.h`, `src/Parser.cpp`, `include/rune/ql/Backends.h`, `src/Backends.cpp`
-- Create: `rune-ql/tests/CatalogStatementsTest.cpp`; modify `rune-ql/CMakeLists.txt`
+- Create: `rune-ql/tests/CatalogStatementsTest.cpp`; modify `rune-ql/CMakeLists.txt` (add the test; F32: `set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include" CACHE PATH …)` on `rune_ql`'s PUBLIC include dirs — rune-ql includes only the std-only `rune/protocol/CatalogTypes.h`; the client's own `rune_ql` target already has the protocol include)
 
 **Interfaces:**
 - Produces (namespace `rune::ql`):
   ```cpp
-  // TopicDef gains: uint16_t replicas = 0; std::vector<ConfigSetting> with;
-  //   (fields may be EMPTY → an untyped topic; then `key` is absent)
+  // TopicDef gains: int16_t replicas = 0 (F31: the wire / client / catalog type; parse bound 0..32767);
+  //   std::vector<ConfigSetting> with;  (fields may be EMPTY → an untyped topic; then `key` is absent)
   struct ConfigSetting { std::string key; int64_t value; std::string text; };   // text: enum / string settings
   struct AlterTopicConfigDef { std::string name; std::vector<ConfigSetting> settings; };
   struct DropTopicDef { std::string name; };
@@ -2992,15 +3647,18 @@ Spec §7 (QL column of the reads table) and §8 (`replicationFactor` on CreateTo
   using Statement = std::variant<TopicDef, AlterTopicDef, AlterTopicConfigDef, DropTopicDef, DropViewDef,
                                  ShowHistoryDef, ShowAsOfDef, DiffDef>;
   std::expected<Statement, ParseError> parse(std::string_view src) noexcept;     // (was variant<TopicDef, AlterTopicDef>)
+  //   F8: exactly ONE statement — any non-blank input after its ';' is a ParseError
+  //   ("expected end of input after statement 1; use a script (rune ql -f) for several statements").
+  struct ScriptError { std::size_t statementIndex; ParseError error; };          // 1-based index of the failing statement
+  std::expected<std::vector<Statement>, ScriptError> parseScript(std::string_view src) noexcept;
+  //   F8: every ';'-terminated statement in order; strict — a statement that fails to parse, or trailing
+  //   input that is not a complete statement, is an error naming its index.  Never "the first one only".
   // Backends:
   struct AlterTopicConfigPlan { std::string name; std::vector<std::pair<uint8_t /*ConfigKey*/, int64_t>> changes; };
   [[nodiscard]] std::expected<AlterTopicConfigPlan, ParseError> applyConfigPlan(const AlterTopicConfigDef&);
-  struct TopicCreateConfig {   // rune-ql stays protocol-free: the client maps this 1:1 onto TopicConfigWire
-      uint8_t cleanupPolicy = 0; int64_t retentionMs = -1, retentionBytes = -1, deleteRetentionMs = 86'400'000;
-      int32_t minCleanableDirtyRatioPpm = 500'000; int64_t segmentRollBytes = 64LL << 20, minCompactionLagMs = 0,
-      maxCompactionLagMs = -1, retentionCheckMs = 300'000, fileDeleteDelayMs = 60'000;
-      uint8_t durability = 0, durabilityTier = 1; std::string coPartitionGroup, partitionKey; };
-  // DefineTopicPlan gains: uint16_t replicas; TopicCreateConfig config (from `with`);
+  using TopicCreateConfig = rune::protocol::TopicConfig;   // F32: the ONE definition (rune/protocol/CatalogTypes.h,
+                                                           // std-only) — no hand-copied defaults in rune-ql
+  // DefineTopicPlan gains: int16_t replicas (F31); TopicCreateConfig config (from `with`);
   //   an empty descriptorBlob for an untyped topic.
   ```
 - Grammar additions (to the header comment of `Parser.cpp`):
@@ -3103,6 +3761,41 @@ TEST(QlCatalogStatementsRegression, ExistingStatementsAreUnchanged) {
     EXPECT_TRUE(std::holds_alternative<ql::AlterTopicDef>(*ql::parse("alter topic t add column x int32;")));
     EXPECT_TRUE(std::holds_alternative<ql::TopicDef>(*ql::parse("transient topic t { id int64 } partitions 1 key id;")));
 }
+TEST(QlCatalogStatementsRegression, ReplicasIsInt16WithAParseBound) {
+    // F31: int16_t like the wire, the client and the catalog.
+    static_assert(std::is_same_v<decltype(ql::TopicDef{}.replicas), int16_t>);
+    EXPECT_EQ(std::get<ql::TopicDef>(*ql::parse("topic t partitions 1 replicas 32767;")).replicas, 32767);
+    auto r = ql::parse("topic t partitions 1 replicas 32768;");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find("replicas"), std::string::npos);
+}
+TEST(QlCatalogStatementsRegression, TopicCreateConfigIsTheOneProtocolDefinition) {
+    static_assert(std::is_same_v<ql::TopicCreateConfig, rune::protocol::TopicConfig>);   // F32
+    EXPECT_EQ(ql::applyPlan(std::get<ql::TopicDef>(*ql::parse("topic t partitions 1;"))).config,
+              rune::protocol::TopicConfig{}) << "no `with`: exactly the shared defaults";
+}
+TEST(QlCatalogStatementsRegression, ParseRefusesTrailingStatementsRegression) {
+    // F8: a second statement is never silently dropped.
+    auto r = ql::parse("topic a partitions 1; topic b partitions 1;");
+    ASSERT_FALSE(r.has_value());
+    EXPECT_NE(r.error().message.find("end of input"), std::string::npos);
+    EXPECT_TRUE(ql::parse("topic a partitions 1;  \n").has_value()) << "trailing blanks are fine";
+}
+TEST(QlCatalogStatementsRegression, ParseScriptReturnsEveryStatementInOrder) {
+    auto s = ql::parseScript("topic events partitions 1;\ntopic multi partitions 3;\ndrop topic events;\n");
+    ASSERT_TRUE(s.has_value()) << s.error().error.message;
+    ASSERT_EQ(s->size(), 3u);
+    EXPECT_EQ(std::get<ql::TopicDef>((*s)[1]).name, "multi");
+    EXPECT_TRUE(std::holds_alternative<ql::DropTopicDef>((*s)[2]));
+}
+TEST(QlCatalogStatementsRegression, ParseScriptErrorNamesTheStatementIndexRegression) {
+    auto s = ql::parseScript("topic a partitions 1;\ntopic b partitions;\ntopic c partitions 1;");
+    ASSERT_FALSE(s.has_value());
+    EXPECT_EQ(s.error().statementIndex, 2u);
+    auto t = ql::parseScript("topic a partitions 1; topic b");   // an unterminated tail is an error, not ignored
+    ASSERT_FALSE(t.has_value());
+    EXPECT_EQ(t.error().statementIndex, 2u);
+}
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -3110,9 +3803,9 @@ TEST(QlCatalogStatementsRegression, ExistingStatementsAreUnchanged) {
 Run: `cmake /Users/vradu/Projects/se-worktrees/rune-ql/build && cmake --build /Users/vradu/Projects/se-worktrees/rune-ql/build -j14 --target rune_ql_tests`
 Expected: compile errors (`DropTopicDef` undeclared).
 
-- [ ] **Step 3: Implement** the grammar (one new `parseX()` per statement in the existing recursive-descent style; `parseStatement()` dispatches on the first keyword: `topic`, `transient`, `alter`, `drop`, `show`, `diff`). Dotted config keys are tokenised as `IDENT ('.' IDENT)*` joined.
+- [ ] **Step 3: Implement** the grammar (one new `parseX()` per statement in the existing recursive-descent style; `parseStatement()` dispatches on the first keyword: `topic`, `transient`, `alter`, `drop`, `show`, `diff`). Dotted config keys are tokenised as `IDENT ('.' IDENT)*` joined. `parse()` = `parseStatement()` + an end-of-input check (only whitespace / comments may follow); `parseScript()` loops `parseStatement()` until end of input, recording the 1-based index of each statement (F8). `replicas` parses as an integer checked against `[0, INT16_MAX]` (F31).
 
-- [ ] **Step 4: Update the client** for the new variant (`rune-client-cpp/src/cli/Cli.cpp` uses `parse`'s result: replace its `std::get_if<TopicDef>` / `<AlterTopicDef>` handling with a `std::visit` over `Statement`, every new alternative answering "not supported by 'schema apply' — use 'rune ql'" until Task 15). Build the client to prove it compiles.
+- [ ] **Step 4: Update the client** for the new variant (`rune-client-cpp/src/cli/Cli.cpp` uses `parse`'s result: replace its `std::get_if<TopicDef>` / `<AlterTopicDef>` handling with a `std::visit` over `Statement`, every new alternative answering "not supported by 'schema apply' — use 'rune ql'" until Task 15; `schema apply` keeps the single-statement `parse()`, so a file with several statements is now an explicit parse error naming `rune ql -f` instead of applying only the first — F8, pinned by a new `RuneCliOffline` case `SchemaApplyRefusesAMultiStatementFileRegression` in `rune-client-cpp/tests/RuneCliOfflineTest.cpp`). Build the client and run `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R RuneCliOffline --output-on-failure`.
 
 - [ ] **Step 5: Run**
 
@@ -3126,8 +3819,8 @@ git -C /Users/vradu/Projects/se-worktrees/rune-ql add include src tests CMakeLis
 git -C /Users/vradu/Projects/se-worktrees/rune-ql commit -m "feat(ql): SHOW HISTORY / AS OF / DIFF, DROP TOPIC|VIEW, ALTER TOPIC SET, replicas, untyped topics
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add src/cli/Cli.cpp
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "refactor(cli): visit the rune-ql Statement variant
+git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add src/cli/Cli.cpp tests/RuneCliOfflineTest.cpp
+git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "refactor(cli): visit the rune-ql Statement variant; schema apply refuses multi-statement files
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3141,78 +3834,41 @@ Spec §7 "Replay to rebuild (CLI)". `replay` re-issues each event as DDL on the 
 **Files:**
 - Create: `rune-client-cpp/include/rune/cli/CatalogCommands.h`, `src/cli/CatalogCommands.cpp`
 - Modify: `rune-client-cpp/src/cli/Cli.cpp` (`ql` and `catalog` subcommands; `printUsage`), `include/rune/client/view/ViewPlanAuthor.h` (`deserializeAuthored(span) → std::optional<ViewPlan>`; `remapSources(ViewPlan&, std::span<const int32_t> topicIds)`)
-- Test: `rune-client-cpp/tests/RuneCliCatalogTest.cpp` (offline: `.rcat` files + a fake broker), `rune-client-cpp/tests/RuneCliLiveTest.cpp` (append a live `ql` case gated like its existing cases)
+- Test: `rune-client-cpp/tests/RuneCliCatalogTest.cpp` (offline only: `--dry-run`, `.rcat` files, the pure row / step-check functions), `rune-client-cpp/tests/RuneCliLiveTest.cpp` (append a live `ql` case gated like its existing cases)
+- Test (broker repo, F7): `libs/node/tests/client/RuneCliBrokerRegressionTest.cpp` in `rune_client_broker_tests` (link `rune_cli_lib` there) — every `rune::cli::run(… --broker …)` case runs against real in-process `BrokerNode`s (`OneBroker`, Task 11); the single-threaded fake cannot serve a CLI that builds its own `Client` and blocks
 
 **Interfaces:**
-- Consumes: Tasks 5, 13, 14.
+- Consumes: Tasks 5, 13, 14; `rune::catalog::{unresolveAlterOps, RequestId}` (Tasks 1–2).
 - Produces — CLI surface (exit 0 success, 1 explicit error with a message on stderr, 2 usage):
   ```
-  rune ql (-e "<statement>" | -f <file|->) [--dry-run] [--verbose] --broker host:port
+  rune ql (-e "<statement>" | -f <file|->) [--dry-run] [--verbose] [--request-id <32 hex digits>] --broker host:port
         executes DDL (statement text recorded) and reads; --dry-run parses and prints the plan without a broker;
-        --verbose prints every followed Redirect and NotLeader retry to stderr
+        --verbose prints every followed Redirect and NotLeader retry to stderr;
+        -f runs EVERY statement of the file in order (ql::parseScript) and stops at the first error — parse or
+           broker — with "statement N: <error>" on stderr (exit 1); nothing after it is issued (F8);
+        --request-id fixes the DDL's RequestId (hi = first 16 hex digits, lo = last 16), so re-running the same
+           statement after a crash or a kill returns the ORIGINAL result instead of a conflict (F17); with -f,
+           statement N uses {hi, lo + N - 1}
   rune catalog export [--up-to <offset>] --broker host:port > file.rcat
   rune catalog replay --from <file.rcat|host:port> --into host:port [--up-to <offset>] [--cluster-id <id>]
+        (--cluster-id defaults to the --from argument verbatim)
   rune catalog diff --from <file.rcat|host:port> --to <file.rcat|host:port>
   ```
-  DDL statements map onto Task 5's calls 1:1 (`TopicDef` → `defineTopicAndWait` with `TopicOptions{replicas, config}` copied field-for-field from rune-ql's `TopicCreateConfig`; `AlterTopicConfigDef` → `alterTopicConfigAndWait`; drops → `drop*AndWait`; `AlterTopicDef` → `alterTopicAndWait`). `rune ql` prints reads as aligned text tables: history rows `offset  time(UTC)  kind  object(objectId)  version prev→new  principal  statement`; `SHOW … AS OF` prints the object's definition (topic: partitions, replicas, persistence, config, schema via `rune::codec::toText`; view: sources, key, output columns); `DIFF` prints `+ added`, `- removed`, `~ changed: field, field`. `DIFF SCHEMA t VERSION a TO b` = `diff(asOf(schema t version a), asOf(schema t version b))` restricted to `t`.
-- Replay algorithm (`CatalogCommands.cpp`): read the source events (`readRcat` or a `CatalogReader` on the source cluster), stop after `--up-to`; for each event in order build the target DDL from its `ops`: `CreateTopic` → `defineTopicAndWait(name, partitions, keyField, descriptorBlob, validate, persistence, {rf, config}, ddl)`; `CreateSchema` → `defineTopicAndWait` on the existing name with the descriptor; `AlterSchema` / `SetCompatibility` → `alterTopic` with the ops blob (expectedVersion 0); `AlterTopicConfig` → `alterTopicConfigAndWait`; `CreateView` / `AlterView` → the normalized authored plan, `remapSources` from `sourceNames` to the **target** topic ids (from the target's `CatalogReader` state), then `createViewAndWait` / `alterViewAndWait`; drops → `dropTopicAndWait` / `dropViewAndWait`. Each with `DdlOptions{statement = event.statement, requestId = hash(sourceClusterId, offset), replayedFrom = {clusterId, offset, principal = clientName@sourceAddress}}` — rerunning a replay after a crash is idempotent (same request ids). After each answer: `catalogHistory` refresh on the target; the target event whose `principal.requestId` equals this step's request id (new, or the one a rerun deduplicated to) must carry `replayedFrom.offset == source offset` and **the same fingerprint** as the source event; else exit 1 with `replay aborted at source offset N (<kind> '<name>'): target fingerprint 0x… != source 0x…`. A DDL error → exit 1 naming the offset and the broker's code/detail.
+  ```cpp
+  // include/rune/cli/CatalogCommands.h (namespace rune::cli) — pure helpers, unit-tested offline:
+  [[nodiscard]] std::string formatHistoryRow(const rune::catalog::RecordedEvent&);   // F18: includes replayedFrom
+  [[nodiscard]] std::optional<std::string> verifyReplayStep(const rune::catalog::RecordedEvent& source,
+                                                            const rune::catalog::RecordedEvent& target);   // nullopt = ok
+  [[nodiscard]] rune::catalog::RequestId replayRequestId(std::string_view sourceClusterId, int64_t sourceOffset) noexcept;
+  [[nodiscard]] std::optional<rune::catalog::RequestId> parseRequestId(std::string_view hex32) noexcept;
+  ```
+  DDL statements map onto Task 5's calls 1:1 (`TopicDef` → `defineTopicAndWait` with `TopicOptions{replicas, config}` — `config` is the plan's `TopicCreateConfig`, which **is** `rune::protocol::TopicConfig` (F32), assigned, not copied field by field; `AlterTopicConfigDef` → `alterTopicConfigAndWait`; drops → `drop*AndWait`; `AlterTopicDef` → `alterTopicAndWait`), each with `DdlOptions{statement, requestId from --request-id}`. `rune ql` prints reads as aligned text tables: history rows `offset  time(UTC)  kind  object(objectId)  version prev→new  principal  replayedFrom  statement` — `replayedFrom` is `<clusterId>@<offset>` or `-` (F18; `formatHistoryRow`); `SHOW … AS OF` prints the object's definition (topic: partitions, replicas, persistence, config, schema via `rune::codec::toText`; view: sources, key, output columns); `DIFF` prints `+ added`, `- removed`, `~ changed: field, field`. `DIFF SCHEMA t VERSION a TO b` = `diff(asOf(schema t version a), asOf(schema t version b))` restricted to `t`.
+- Replay algorithm (`CatalogCommands.cpp`): read the source events (`readRcat` or a `CatalogReader` on the source cluster) and **verify them with a `CatalogReplayer`** (a tampered source stops before anything is issued), stop after `--up-to`; for each event in order build the target DDL from its `ops`: `CreateTopic` → `defineTopicAndWait(name, partitions, keyField, descriptorBlob, validate, persistence, {rf, config}, ddl)`; `CreateSchema` → `defineTopicAndWait` on the existing name with the descriptor; `AlterSchema` → `unresolveAlterOps(<the target's current schema of that object, from its CatalogReader state>, ops)` (F20: the event stores durable tags; the target's state has the same definition, so the tags map to the same names) → `encodeAlterOps` → `alterTopicAndWait(expectedVersion 0)`; `SetCompatibility` → `alterTopicAndWait` with the single `SET_COMPATIBILITY mode` op; `AlterTopicConfig` → `alterTopicConfigAndWait`; `CreateView` / `AlterView` → the normalized authored plan, `remapSources` from `sourceNames` to the **target** topic ids (from the target's `CatalogReader` state), then `createViewAndWait` / `alterViewAndWait`; drops → `dropTopicAndWait` / `dropViewAndWait`. Each with `DdlOptions{statement = event.statement, requestId = replayRequestId(sourceClusterId, offset) = {fnv1a64(sourceClusterId), uint64(offset)}, replayedFrom = {clusterId, offset, principal = clientName@sourceAddress}}` — rerunning a replay after a crash is idempotent (same request ids, same statements → the broker's `(requestId, requestFingerprint)` dedupe returns the original results, F14). After each answer: `catalogHistory` refresh on the target; the target event whose `principal.requestId` equals this step's request id (new, or the one a rerun deduplicated to) is checked with `verifyReplayStep(source, target)`: `replayedFrom.offset == source offset` and **the same fingerprint**, else exit 1 with its message `replay aborted at source offset N (<kind> '<name>'): target fingerprint 0x… != source 0x…`. A DDL error → exit 1 with `replay aborted at source offset N (<kind> '<name>'): <code name> (<code>) <detail>`; nothing past it is issued.
 - `diff` compares the two final states with `rune::catalog::diff`; prints differences; exit 0 when there are none, 3 when there are (scripts test `== 0`).
 
-- [ ] **Step 1: Write the failing tests** — `RuneCliCatalogTest.cpp`:
+- [ ] **Step 1: Write the failing tests** — `RuneCliCatalogTest.cpp` (client repo, offline — no broker, nothing blocking on a fake):
 
 ```cpp
-TEST(RuneCliCatalogRegression, ExportWritesEveryEventAndUpToStops) {
-    FakeCatalogBroker b; b.setLog(rune::catalog::testing::goldenScriptV1());
-    std::stringstream out, err;
-    ASSERT_EQ(rune::cli::run({"catalog", "export", "--up-to", "9", "--broker", b.endpoint()}, out, err), 0) << err.str();
-    auto recs = rune::catalog::readRcat(out);
-    ASSERT_TRUE(recs.has_value());
-    EXPECT_EQ(recs->size(), 10u);
-}
-
-TEST(RuneCliCatalogRegression, ReplayReissuesEveryKindAndVerifiesFingerprints) {
-    FakeCatalogBroker src; src.setLog(rune::catalog::testing::goldenScriptV1());
-    FakeDdlCluster target;                              // applies DDL through rune_catalog, assigns ids (offset by +5)
-    std::stringstream out, err;
-    ASSERT_EQ(rune::cli::run({"catalog", "replay", "--from", src.endpoint(), "--into", target.endpoint(),
-                              "--cluster-id", "src"}, out, err), 0) << err.str();
-    EXPECT_EQ(target.eventCount(), 18u);
-    EXPECT_TRUE(std::all_of(target.events().begin(), target.events().end(),
-                            [](const auto& e) { return e.replayedFrom && e.replayedFrom->clusterId == "src"; }));
-    std::stringstream o2, e2;
-    EXPECT_EQ(rune::cli::run({"catalog", "diff", "--from", src.endpoint(), "--to", target.endpoint()}, o2, e2), 0)
-        << o2.str();
-}
-
-TEST(RuneCliCatalogRegression, ReplayAbortsLoudlyAtTheFirstDivergingEvent) {
-    FakeCatalogBroker src; src.setLog(rune::catalog::testing::goldenScriptV1());
-    FakeDdlCluster target;
-    target.corruptFingerprintOfNthEvent(6);
-    std::stringstream out, err;
-    EXPECT_EQ(rune::cli::run({"catalog", "replay", "--from", src.endpoint(), "--into", target.endpoint()}, out, err), 1);
-    EXPECT_NE(err.str().find("replay aborted at source offset 6"), std::string::npos) << err.str();
-    EXPECT_EQ(target.eventCount(), 7u) << "nothing issued past the divergence";
-}
-
-TEST(RuneCliCatalogRegression, ReplayIsIdempotentAfterACrash) {
-    FakeCatalogBroker src; src.setLog(rune::catalog::testing::goldenScriptV1());
-    FakeDdlCluster target;
-    std::stringstream o, e;
-    ASSERT_EQ(rune::cli::run({"catalog", "replay", "--from", src.endpoint(), "--into", target.endpoint(),
-                              "--up-to", "8"}, o, e), 0);
-    ASSERT_EQ(rune::cli::run({"catalog", "replay", "--from", src.endpoint(), "--into", target.endpoint()}, o, e), 0);
-    EXPECT_EQ(target.eventCount(), 18u) << "same request ids: the first 9 are deduplicated";
-}
-
-TEST(RuneCliCatalogRegression, DiffReportsDifferencesWithExit3) {
-    FakeCatalogBroker a; a.setLog(rune::catalog::testing::goldenScriptV1());
-    auto shorter = rune::catalog::testing::goldenScriptV1(); shorter.resize(12);
-    FakeCatalogBroker b; b.setLog(shorter);
-    std::stringstream out, err;
-    EXPECT_EQ(rune::cli::run({"catalog", "diff", "--from", a.endpoint(), "--to", b.endpoint()}, out, err), 3);
-    EXPECT_NE(out.str().find("players"), std::string::npos);
-}
-
 TEST(RuneCliCatalogRegression, QlDryRunParsesWithoutABroker) {
     std::stringstream out, err;
     EXPECT_EQ(rune::cli::run({"ql", "-e", "topic t partitions 2 replicas 3 with (tier = leader);", "--dry-run"}, out, err), 0);
@@ -3220,34 +3876,185 @@ TEST(RuneCliCatalogRegression, QlDryRunParsesWithoutABroker) {
     EXPECT_EQ(rune::cli::run({"ql", "-e", "topic t partitions;", "--dry-run"}, out, err), 1);
 }
 
-TEST(RuneCliCatalogRegression, QlExecutesDdlWithItsStatementAndPrintsHistory) {
-    FakeDdlCluster c;
+TEST(RuneCliCatalogRegression, QlFileDryRunNamesTheFailingStatementIndexRegression) {
+    // F8: -f is a script; a bad statement is named by its index, never skipped.
+    const auto f = writeTemp("three.rql", "topic a partitions 1;\ntopic b partitions;\ntopic c partitions 1;\n");
     std::stringstream out, err;
-    ASSERT_EQ(rune::cli::run({"ql", "-e", "topic events partitions 2 replicas 1;", "--broker", c.endpoint()}, out, err), 0);
-    EXPECT_EQ(c.events().back().statement, "topic events partitions 2 replicas 1;");
-    std::stringstream h;
-    ASSERT_EQ(rune::cli::run({"ql", "-e", "show history topic events;", "--broker", c.endpoint()}, h, err), 0);
-    EXPECT_NE(h.str().find("CreateTopic"), std::string::npos);
+    EXPECT_EQ(rune::cli::run({"ql", "-f", f, "--dry-run"}, out, err), 1);
+    EXPECT_NE(err.str().find("statement 2"), std::string::npos) << err.str();
+    std::stringstream o2, e2;
+    const auto g = writeTemp("ok.rql", "topic a partitions 1;\ntopic b partitions 2;\n");
+    ASSERT_EQ(rune::cli::run({"ql", "-f", g, "--dry-run"}, o2, e2), 0) << e2.str();
+    EXPECT_NE(o2.str().find("topic a"), std::string::npos);
+    EXPECT_NE(o2.str().find("topic b"), std::string::npos) << "every statement is planned, not just the first";
+}
+
+TEST(RuneCliCatalogRegression, RequestIdFlagIsValidated) {
+    std::stringstream out, err;
+    EXPECT_EQ(rune::cli::run({"ql", "-e", "topic t partitions 1;", "--request-id", "xyz", "--dry-run"}, out, err), 2);
+    EXPECT_NE(err.str().find("--request-id"), std::string::npos);
+    const auto id = rune::cli::parseRequestId("0000000000000001000000000000002a");
+    ASSERT_TRUE(id.has_value());
+    EXPECT_EQ(*id, (rune::catalog::RequestId{1, 42}));
+}
+
+TEST(RuneCliCatalogRegression, HistoryRowPrintsReplayedFromRegression) {
+    // F18: Task 24 reads "replayedFrom a@<offset>" from `show history`.
+    auto log = rune::catalog::testing::goldenScriptV1();
+    rune::catalog::RecordedEvent r{7, log[7]};
+    EXPECT_NE(rune::cli::formatHistoryRow(r).find(" - "), std::string::npos) << "no replayedFrom: '-'";
+    r.event.replayedFrom = rune::catalog::ReplayedFrom{.clusterId = "a", .offset = 7, .principal = "cli@x"};
+    EXPECT_NE(rune::cli::formatHistoryRow(r).find("a@7"), std::string::npos);
+}
+
+TEST(RuneCliCatalogRegression, ReplayStepMismatchNamesTheSourceOffset) {
+    auto log = rune::catalog::testing::goldenScriptV1();
+    rune::catalog::RecordedEvent src{6, log[6]}, tgt{40, log[6]};
+    tgt.event.replayedFrom = rune::catalog::ReplayedFrom{.clusterId = "src", .offset = 6};
+    EXPECT_FALSE(rune::cli::verifyReplayStep(src, tgt).has_value());
+    tgt.event.fingerprint ^= 1;
+    const auto m = rune::cli::verifyReplayStep(src, tgt);
+    ASSERT_TRUE(m.has_value());
+    EXPECT_NE(m->find("replay aborted at source offset 6"), std::string::npos) << *m;
+}
+
+TEST(RuneCliCatalogRegression, DiffOfTwoFilesReportsDifferencesWithExit3) {
+    const auto full = writeRcatFile("full.rcat", rune::catalog::testing::goldenScriptV1());
+    auto shorter = rune::catalog::testing::goldenScriptV1(); shorter.resize(12);
+    const auto part = writeRcatFile("part.rcat", shorter);
+    std::stringstream out, err;
+    EXPECT_EQ(rune::cli::run({"catalog", "diff", "--from", full, "--to", part}, out, err), 3);
+    EXPECT_NE(out.str().find("players"), std::string::npos);
+    std::stringstream o2, e2;
+    EXPECT_EQ(rune::cli::run({"catalog", "diff", "--from", full, "--to", full}, o2, e2), 0);
 }
 ```
 
-(`FakeCatalogBroker` / `FakeDdlCluster` are client test-support fakes over `InvokerGateway` in `tests/support/CatalogFakes.h`: the first serves a catalog Subscribe from a vector; the second also accepts DDL, builds events with `rune_catalog` (`previewFingerprint`), appends them to its own log and answers like a leader — so `replay` sees real fingerprints.)
+(`writeTemp` / `writeRcatFile` are file-local helpers writing under a per-test temp dir.)
+
+`RuneCliBrokerRegressionTest.cpp` (broker repo, `rune_client_broker_tests`, F7 — real `BrokerNode`s, the real CLI):
+
+```cpp
+TEST(RuneCliBrokerRegression, ExportWritesEveryEventAndUpToStops) {
+    OneBroker b("cli_export");
+    b.runEveryKind();                                     // all 9 kinds through the real client (OneBroker helper)
+    std::stringstream out, err;
+    ASSERT_EQ(rune::cli::run({"catalog", "export", "--up-to", "5", "--broker", b.endpoint()}, out, err), 0) << err.str();
+    auto recs = rune::catalog::readRcat(out);
+    ASSERT_TRUE(recs.has_value());
+    EXPECT_EQ(recs->size(), 6u);
+}
+
+TEST(RuneCliBrokerRegression, ReplayReissuesEveryKindAndVerifiesFingerprints) {
+    OneBroker src("cli_src"), dst("cli_dst");
+    src.runEveryKind();
+    std::stringstream out, err;
+    ASSERT_EQ(rune::cli::run({"catalog", "replay", "--from", src.endpoint(), "--into", dst.endpoint(),
+                              "--cluster-id", "src"}, out, err), 0) << err.str();
+    const auto s = src.catalogEvents(), d = dst.catalogEvents();
+    ASSERT_EQ(d.size(), s.size());
+    for (std::size_t i = 0; i < d.size(); ++i) {
+        ASSERT_TRUE(d[i].event.replayedFrom.has_value());
+        EXPECT_EQ(d[i].event.replayedFrom->clusterId, "src");
+        EXPECT_EQ(d[i].event.fingerprint, s[i].event.fingerprint) << "offset " << i;
+    }
+    std::stringstream o2, e2;
+    EXPECT_EQ(rune::cli::run({"catalog", "diff", "--from", src.endpoint(), "--to", dst.endpoint()}, o2, e2), 0) << o2.str();
+    std::stringstream h, e3;
+    ASSERT_EQ(rune::cli::run({"ql", "-e", "show history;", "--broker", dst.endpoint()}, h, e3), 0);
+    EXPECT_NE(h.str().find("src@0"), std::string::npos) << "F18: replayedFrom in the history rows";
+}
+
+TEST(RuneCliBrokerRegression, ReplayAbortsLoudlyAtTheFirstFailingEvent) {
+    OneBroker src("cli_src2"), dst("cli_dst2");
+    src.runEveryKind();
+    ASSERT_EQ(dst.connectClient()->defineTopicAndWait(src.catalogEvents()[1].event.objectName, 1, "", {}, false,
+                                                     rune::client::Persistence::Disk, {}, {}, 10s).errorCode, 0);
+    const std::size_t before = dst.catalogEvents().size();
+    std::stringstream out, err;
+    EXPECT_EQ(rune::cli::run({"catalog", "replay", "--from", src.endpoint(), "--into", dst.endpoint()}, out, err), 1);
+    EXPECT_NE(err.str().find("replay aborted at source offset 1"), std::string::npos) << err.str();
+    EXPECT_EQ(dst.catalogEvents().size(), before + 1) << "offset 0 replayed, nothing issued past the failure";
+}
+
+TEST(RuneCliBrokerRegression, ReplayIsIdempotentAfterACrash) {
+    OneBroker src("cli_src3"), dst("cli_dst3");
+    src.runEveryKind();
+    std::stringstream o, e;
+    ASSERT_EQ(rune::cli::run({"catalog", "replay", "--from", src.endpoint(), "--into", dst.endpoint(),
+                              "--up-to", "4"}, o, e), 0) << e.str();
+    ASSERT_EQ(rune::cli::run({"catalog", "replay", "--from", src.endpoint(), "--into", dst.endpoint()}, o, e), 0) << e.str();
+    EXPECT_EQ(dst.catalogEvents().size(), src.catalogEvents().size()) << "same request ids: the first 5 are deduplicated";
+}
+
+TEST(RuneCliBrokerRegression, QlExecutesDdlWithItsStatementAndPrintsHistory) {
+    OneBroker b("cli_ql");
+    std::stringstream out, err;
+    ASSERT_EQ(rune::cli::run({"ql", "-e", "topic events partitions 2 replicas 1;", "--broker", b.endpoint()}, out, err), 0)
+        << err.str();
+    EXPECT_EQ(b.catalogEvents().back().event.statement, "topic events partitions 2 replicas 1;");
+    std::stringstream h;
+    ASSERT_EQ(rune::cli::run({"ql", "-e", "show history topic events;", "--broker", b.endpoint()}, h, err), 0);
+    EXPECT_NE(h.str().find("CreateTopic"), std::string::npos);
+}
+
+TEST(RuneCliBrokerRegression, QlFileRunsEveryStatementAndStopsAtTheFirstErrorRegression) {
+    // F8: e2e.rql-style scripts create every topic, in order; a failure stops the script, named.
+    OneBroker b("cli_script");
+    const auto f = writeTemp("s.rql", "topic a partitions 1;\ntopic b partitions 3;\ntopic a partitions 1;\ntopic c partitions 1;\n");
+    std::stringstream out, err;
+    EXPECT_EQ(rune::cli::run({"ql", "-f", f, "--broker", b.endpoint()}, out, err), 1);
+    EXPECT_NE(err.str().find("statement 3"), std::string::npos) << err.str();
+    EXPECT_EQ(b.catalogEvents().size(), 2u) << "a and b created; c never issued";
+}
+
+TEST(RuneCliBrokerRegression, QlRequestIdMakesARerunReturnTheOriginalResultRegression) {
+    // F17: a re-run of a DDL whose first attempt may have committed returns its original success.
+    OneBroker b("cli_rid");
+    const std::string rid = "00000000000000c1000000000000002a";
+    std::stringstream o1, e1, o2, e2;
+    ASSERT_EQ(rune::cli::run({"ql", "-e", "topic midkill partitions 2;", "--request-id", rid, "--broker", b.endpoint()},
+                             o1, e1), 0) << e1.str();
+    EXPECT_EQ(rune::cli::run({"ql", "-e", "topic midkill partitions 2;", "--request-id", rid, "--broker", b.endpoint()},
+                             o2, e2), 0) << "not TopicExists: " << e2.str();
+    EXPECT_EQ(b.catalogEvents().size(), 1u);
+    std::stringstream o3, e3;
+    EXPECT_EQ(rune::cli::run({"ql", "-e", "topic other partitions 2;", "--request-id", rid, "--broker", b.endpoint()},
+                             o3, e3), 1);
+    EXPECT_NE(e3.str().find("requestId reused for a different statement"), std::string::npos) << e3.str();
+}
+
+TEST(RuneCliBrokerRegression, DiffOfTwoBrokersReportsDifferencesWithExit3) {
+    OneBroker a("cli_da"), b("cli_db");
+    a.runEveryKind();
+    std::stringstream out, err;
+    EXPECT_EQ(rune::cli::run({"catalog", "diff", "--from", a.endpoint(), "--to", b.endpoint()}, out, err), 3);
+}
+```
+
+(`OneBroker::runEveryKind()` — added to `libs/node/tests/client/OneBroker.h` here — issues all nine kinds through the real client: CreateTopic typed + untyped, CreateSchema, AlterSchema, SetCompatibility, AlterTopicConfig, CreateView, AlterView, DropView, DropTopic; `writeTemp` writes under the test's `TmpDir`.)
 
 - [ ] **Step 2: Run to verify they fail**, **Step 3: implement**, **Step 4: Run**
 
 Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-client-cpp/build -R 'RuneCli' --output-on-failure -j14`
 Expected: PASS (the live cases skip without a broker, as today).
+Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_client_broker_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'RuneCliBroker|ClientCatalogReadBroker|ClientDdlBroker' --output-on-failure -j14`
+Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add include src tests CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(cli): rune ql + rune catalog export|replay|diff (fingerprint-verified, idempotent replay)
+git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(cli): rune ql (-f scripts, --request-id) + rune catalog export|replay|diff (fingerprint-verified, idempotent replay)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git -C /Users/vradu/Projects/se-worktrees/rune-broker add libs/node/tests/client libs/node/CMakeLists.txt
+git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(catalog): the real rune CLI against real brokers (ql scripts, request ids, export/replay/diff)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
-- [ ] **Checkpoint E (controller):** full `*Regression*` suites in client, rune-ql, rune-codec; broker `build-fast` builds.
+- [ ] **Checkpoint E (controller):** full `*Regression*` suites in client, rune-ql, rune-codec; broker `build-fast` builds and its `*Regression*` suite passes (it now includes `rune_client_broker_tests`: the real client and CLI against real brokers, F7).
 
 ---
 ### Task 16: Broker — boot from `__catalog`; retire `__topic_schemas`, `__views` and runtime-topic recovery
@@ -3256,10 +4063,11 @@ Spec §3 ("single source of truth"), §5.3 ("Restart: the broker replays its loc
 
 **Files:**
 - Modify: `libs/node/src/BrokerNode.cpp`:
-  - step 1b (anchor `// 1b. Restart recovery of RUNTIME-defined topics`) is replaced by `bootFromCatalog_()`: build the catalog `Log` + replica (deferred plane, Task 6's `buildCatalog_` moves here), construct the `CatalogApplier` with a `BootCatalogSink` effects object, `applier.replayLocal(*catalogReplica_, /*recoveryInstalls=*/true)`; the sink fills `bootTopics_` (`std::vector<TopicSpec>`, live topics in topic-id order) + `bootDroppedIds_` and stashes recovery view installs and validator pushes for after the workers exist. A halted boot replay does **not** refuse to start: the broker boots with the applied prefix, halted (route `RouteHalted`), logged at critical — spec §5.3 "keeps serving what it had already applied".
+  - step 1b (anchor `// 1b. Restart recovery of RUNTIME-defined topics`) is replaced by `bootFromCatalog_()`: build the catalog `Log` + replica (deferred plane, Task 6's `buildCatalog_` moves here), construct the `CatalogApplier` (phase `AwaitingBoot`), `applier.replayLocal(*catalogReplica_, BootEffects{bootCatalogSink_})` — **the one boot replay** (F4); the `BootCatalogSink` fills `bootTopics_` (`std::vector<TopicSpec>`, live topics in topic-id order) + `bootDroppedIds_` and stashes recovery view installs and validator pushes for after the workers exist. A halted boot replay does **not** refuse to start: the broker boots with the applied prefix, halted (route `RouteHalted`), logged at critical — spec §5.3 "keeps serving what it had already applied".
   - `TopicRegistry` is constructed **empty**, then `createTopicAt(id, spec)` for each `bootTopics_` entry and a `Dropped` slot for each `bootDroppedIds_` id.
   - every `config_.topics` consumer (~20 sites, `grep -n 'config_.topics' libs/node/src/BrokerNode.cpp`) reads `bootTopics_` instead.
-  - `buildAdminWorker()`: delete the `__topic_schemas` block (anchor `const fs::path schemaDir = fs::path{config_.dataDir} / "__topic_schemas";`) and the `__views` block (anchor `const fs::path viewsDir = fs::path{config_.dataDir} / "__views";`) and their members (`schemaLog_`, `schemaReplica_`, `viewsLog_`, `viewsReplica_`); hand the applier + catalog replica to `AdminWorkerAgent`; post the stashed recovery installs once the workers are built.
+  - `buildAdminWorker()`: delete the `__topic_schemas` block (anchor `const fs::path schemaDir = fs::path{config_.dataDir} / "__topic_schemas";`) and the `__views` block (anchor `const fs::path viewsDir = fs::path{config_.dataDir} / "__views";`) and their members (`schemaLog_`, `schemaReplica_`, `viewsLog_`, `viewsReplica_`); hand the applier (phase `Booted`) + catalog replica to `AdminWorkerAgent`, whose first admin pass calls `applier.goLive(LiveEffects{ring encoders})` once; post the stashed recovery installs once the workers are built.
+  - **delete Task 9's admin-thread boot replay** (the `replayLocal(*catalogReplica_, BootEffects{…})` + `goLive` call before the admin thread's first `doWork`, F4): the prefix is applied exactly once, on the startup thread. A second `replayLocal` would be refused by the applier anyway (Task 7) — the deletion removes the call, the refusal guards against its return.
   - `firstRuntimeTopicId_` and everything that reads it are deleted.
 - Delete: `libs/node/include/rune/node/RuntimeTopicRecovery.h`, `libs/node/src/RuntimeTopicRecovery.cpp`, `libs/node/tests/node/RuntimeTopicRecoveryTest.cpp`
 - Create: `libs/node/include/rune/node/TopicDirReconcile.h`, `libs/node/src/TopicDirReconcile.cpp` — `reconcileTopicDirs(dataDir, liveTopics, now)`: (1) `remove_all` every entry of `dataDir/dropped/` (left by a purge the admin thread could not finish), (2) **quarantine** (never delete) every `dataDir/topics/<name>` that no live topic claims (exactly or by ASCII case fold) to `dataDir/quarantine/<name>-<now>[-N]`, logged at warn, symlinks never followed (the existing `quarantine` helper code moves here verbatim from `RuntimeTopicRecovery.cpp`), (3) a `dataDir/__topic_schemas` or `dataDir/__views` dir is left untouched and logged once at warn ("retired catalog dir ignored — `__catalog` is the catalog; no migration").
@@ -3270,7 +4078,7 @@ Spec §3 ("single source of truth"), §5.3 ("Restart: the broker replays its loc
 
 **Interfaces:**
 - Consumes: Tasks 6–9.
-- Produces: `BrokerNode::bootTopics_` (private), `reconcileTopicDirs(const std::string&, const std::vector<TopicSpec>&, int64_t) → TopicDirReconciliation{quarantined, purged}`.
+- Produces: `BrokerNode::bootTopics_` (private), `reconcileTopicDirs(const std::string&, const std::vector<TopicSpec>&, int64_t) → TopicDirReconciliation{quarantined, purged}`, test hooks `bootReplaysForTest()` (the number of `replayLocal` calls that returned ≥ 0 since construction) and `catalogApplierPhaseForTest()` (`phaseName()`, read on the admin thread).
 
 - [ ] **Step 1: Write the failing tests** — `CatalogBootTest.cpp` (single-node BrokerNode, DDL through `BrokerNode::submitDdlForTest` — added here: posts a `DdlRequest` from the control thread with the reserved test session `kTestDdlSession = -42`, answers captured on the control thread and read with `takeTestDdlAnswerForTest()`):
 
@@ -3329,6 +4137,20 @@ TEST(CatalogBootRegression, RetiredCatalogDirsAreIgnoredNotRead) {
     EXPECT_TRUE(std::filesystem::exists(r.dataDir() / "__topic_schemas"));
 }
 
+TEST(CatalogBootRegression, TheCatalogPrefixIsAppliedExactlyOnceAtBootRegression) {
+    // F4: Task 9 replayed on the admin thread; this task replays on the startup thread.  Both together would
+    // re-apply recorded request ids (Precondition) and halt the broker on every restart.
+    BootRig r("boot_once");
+    r.start();
+    ASSERT_EQ(r.define({.name = "a", .partitions = 1, .requestId = {.hi = 0xB0, .lo = 1}}).code, 0);
+    ASSERT_EQ(r.define({.name = "b", .partitions = 1, .requestId = {.hi = 0xB0, .lo = 2}}).code, 0);
+    r.restart();
+    EXPECT_EQ(r.catalogHaltedCounter(), 0);
+    EXPECT_EQ(r.applierPhaseName(), "Live");
+    EXPECT_EQ(r.bootReplaysForTest(), 1) << "one replayLocal that returned >= 0, on the startup thread";
+    EXPECT_EQ(r.define({.name = "c", .partitions = 1}).code, 0);
+}
+
 TEST(CatalogBootRegression, HaltedBootReplayStillBootsAndRefusesDdl) {
     BootRig r("boot_halt");
     r.start();
@@ -3364,12 +4186,13 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 Spec §8: delete the setting and its parsing, static topic creation and recovery at boot, the static-versus-runtime collision rule, the `rf=N` option; in-process tests use a one-line `TestCluster::defineTopic(...)`.
 
 **Files:**
-- Modify: `libs/node/include/rune/node/NodeConfig.h` (delete `topics`, the `RUNE_TOPICS` doc lines, the `rf=`/`RUNE_TOPICS` mentions in `TopicSpec`'s comments — `TopicSpec` itself stays: it is the internal topic description `TopicRegistry` and `createRuntimeUserReplicas` use), `libs/node/src/NodeConfig.cpp` (delete the block from anchor `// --- RUNE_TOPICS (optional) ---` to `// Absent or empty RUNE_TOPICS → cfg.topics stays empty (valid).` inclusive; a set `RUNE_TOPICS` env var is now refused at config load: `"RUNE_TOPICS was removed — topics are created by DDL (see docs/SELF-HOSTING.md#topics-are-created-by-ddl)"` — an explicit error, never silently ignored)
+- Modify: `libs/node/include/rune/node/NodeConfig.h` (delete `topics`, the `RUNE_TOPICS` doc lines, the `rf=`/`RUNE_TOPICS` mentions in `TopicSpec`'s comments — `TopicSpec` itself stays: it is the internal topic description `TopicRegistry` and `createRuntimeUserReplicas` use), `libs/node/src/NodeConfig.cpp` (delete the block from anchor `// --- RUNE_TOPICS (optional) ---` to `// Absent or empty RUNE_TOPICS → cfg.topics stays empty (valid).` inclusive; F5: the env read is reduced to exactly one **presence refusal** — `if (getenv_fn("RUNE_TOPICS") != nullptr) return {{}, "RUNE_TOPICS was removed — topics are created by DDL (see docs/SELF-HOSTING.md#topics-are-created-by-ddl)"};` — nothing else reads, parses or mentions the variable in this file (2 mentions: the lookup and the message; Task 19's allowlist pins that count). A set variable is an explicit error, never silently ignored)
 - Modify: `libs/node/src/BrokerNode.cpp` (`refuseStaticNamesCollidingWithRecovered` call gone with Task 16's step 1b; grep that no `RUNE_TOPICS` / `config_.topics` remains)
-- Modify: `libs/node/include/rune/node/TopicName.h`, `AdminChannels.h`, `BrokerNode.h`, `libs/gateway/include/rune/gateway/TopicRegistry.h` (comment mentions)
+- Modify: `libs/node/include/rune/node/TopicName.h`, `AdminChannels.h`, `BrokerNode.h`, `libs/gateway/include/rune/gateway/TopicRegistry.h`, `libs/node/src/AdminWorker.cpp` (comment mentions — F5: `AdminWorker.cpp`'s "by name — a RUNE_TOPICS boot topic, a recovered runtime topic" becomes "by name — an untyped topic created by DDL")
+- Modify (F6): `libs/node/include/rune/node/FdBudget.h`, `libs/node/src/FdBudget.cpp` — `applyFdLimitAtStartup(const NodeConfig&, std::span<const TopicSpec> topics, std::string& error)`: the estimate (anchor `estimateFdNeed(cfg.topics,`) uses the topics the catalog boot replay produced, not the deleted `NodeConfig::topics`; `estimateFdNeed` takes `std::span<const TopicSpec>`. `src/main.cpp`: the FD-1 block (anchor `if (!rune::node::applyFdLimitAtStartup(*cfg, fdErr)) {`) is deleted; `BrokerNode::start` calls `applyFdLimitAtStartup(config_, bootTopics_, err)` right after `bootFromCatalog_()` and throws `std::runtime_error(err)` on a refusal (main's existing `catch` logs it and exits non-zero) — the catalog's topics are counted at boot, which the static list never did for runtime topics. `BrokerNode.h` gains `fdNeedAtBootForTest()`.
 - Create: `libs/node/tests/support/TestCluster.h`
-- Migrate: `libs/node/tests/node/BrokerNodeTest.cpp`, `BrokerNodeGatewayTest.cpp`, `NodeConfigTest.cpp` (delete every `RUNE_TOPICS` parse case — 58 references — and add `NodeConfigRegression.RuneTopicsIsRefusedWithAPointerToDdl`), `DdlHarnessRegressionTest.cpp`, `libs/node/tests/support/DdlHarness.h` (the `statics` option is gone since Task 10 — remove its last comment), `benchmark/FusedRuntimePassBench.cpp`
-- Test: `libs/node/tests/node/TestClusterTest.cpp`
+- Migrate: `libs/node/tests/node/BrokerNodeTest.cpp`, `BrokerNodeGatewayTest.cpp`, `NodeConfigTest.cpp` (delete every `RUNE_TOPICS` parse case — 58 references — and add `NodeConfigRegression.RuneTopicsIsRefusedWithAPointerToDdl` **in this file**, F5), `DdlHarnessRegressionTest.cpp`, `libs/node/tests/support/DdlHarness.h` (the `statics` option is gone since Task 10 — remove its last comment), `benchmark/FusedRuntimePassBench.cpp`, `libs/node/tests/node/FdBudgetTest.cpp` (the `estimateFdNeed` calls take a span — F6)
+- Test: `libs/node/tests/node/TestClusterTest.cpp`, `libs/node/tests/node/NodeConfigTest.cpp` (the refusal Regression test)
 
 **Interfaces:**
 - Produces:
@@ -3425,28 +4248,42 @@ TEST(TestClusterRegression, DefineTopicCarriesEveryFormerRuneTopicsOption) {
     EXPECT_EQ(got.retentionMs, 1000); EXPECT_EQ(got.durabilityTier, 0);
     EXPECT_EQ(got.persistence, rune::node::PersistenceMode::Transient);
 }
-TEST(NodeConfigRegression, RuneTopicsIsRefusedWithAPointerToDdl) {
-    auto r = rune::node::NodeConfig::fromEnv([](const char* k) -> const char* {
-        if (std::string_view(k) == "RUNE_TOPICS") return "events:1";
-        return rune::node::test::minimalEnv(k);
-    });
-    ASSERT_FALSE(r.ok());
-    EXPECT_NE(r.error().find("topics are created by DDL"), std::string::npos);
+TEST(FdBudgetRegression, BootBudgetCountsTheCatalogTopicsRegression) {
+    // F6: the FD estimate came from NodeConfig::topics (deleted); it now comes from the catalog's boot topics.
+    SingleNodeForTest n("tc_fd");
+    rune::node::test::TestCluster c({n.node()});
+    ASSERT_EQ(c.defineTopic("a", 4), 0);
+    ASSERT_EQ(c.defineTopic("b", 2), 1);
+    n.restart();
+    const std::vector<rune::node::TopicSpec> specs{n.topicSpecOnControl(0), n.topicSpecOnControl(1)};
+    EXPECT_EQ(n.node()->fdNeedAtBootForTest(),
+              rune::node::estimateFdNeed(specs, static_cast<uint64_t>(n.config().segmentProvisionDepth)));
+    EXPECT_GT(n.node()->fdNeedAtBootForTest(), rune::node::estimateFdNeed({}, 0)) << "the catalog's partitions are counted";
 }
 ```
 
-(Use `NodeConfigTest.cpp`'s existing env-injection helper and result type names verbatim — the snippet shows the intent: the load fails, the message points to DDL.)
+and in `NodeConfigTest.cpp` (namespace `rune::node`, its existing `fakeEnv` / `base1node` helpers and `parseNodeConfig` result shape — F5: the refusal test lives here, the one test file the grep gate allows):
+
+```cpp
+TEST(NodeConfigRegression, RuneTopicsIsRefusedWithAPointerToDdl) {
+    auto env = base1node();
+    env["RUNE_TOPICS"] = "events:1";
+    auto r = parseNodeConfig(fakeEnv(env));
+    EXPECT_FALSE(r.config.has_value());
+    EXPECT_NE(r.error.find("topics are created by DDL"), std::string::npos) << r.error;
+}
+```
 
 - [ ] **Step 2: Run to verify they fail**, **Step 3: implement** + migrate the listed files, **Step 4: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'TestCluster|NodeConfig|BrokerNode|DdlHarness' --output-on-failure -j14`
+Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'TestCluster|NodeConfig|BrokerNode|DdlHarness|FdBudget' --output-on-failure -j14`
 Expected: PASS. `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-bench-rel -j14 --target rune_broker_benchmark` builds.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add -A libs benchmark
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(catalog)!: remove RUNE_TOPICS, NodeConfig::topics, rf= and the static/runtime collision rule; TestCluster::defineTopic
+git -C /Users/vradu/Projects/se-worktrees/rune-broker add -A libs benchmark src
+git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "feat(catalog)!: remove RUNE_TOPICS, NodeConfig::topics, rf= and the static/runtime collision rule; FD budget from the catalog; TestCluster::defineTopic
 
 Topics exist only through DDL. A set RUNE_TOPICS refuses to load with a pointer to the DDL docs.
 
@@ -3461,6 +4298,8 @@ Mechanical, by the Task 17 rule; split from it so each commit stays reviewable. 
 
 **Files (migrate):** `libs/node/tests/integration/{BootstrapRoutingImageTest, CompactionRetentionSmokeTest, ConsensusCandidacyElectionTest, ControlledShutdownRegressionTest, D9CrossNodeMarkerTest, DdlConformanceBrokerRegressionTest, EpochRestartRegressionTest, GatewayAcksAllDeferredAckTest, GatewayFailoverReplicationTest, GatewayProduceReplicationTest, GatewayPsmFailoverTest, GatewayReplicationWiringTest, GatewaySubscribeHwBoundTest, MultiLeaderProduceTest, PerWorkerReplicationTest, RebalanceFailoverIntegrationTest, ShardModeTest, ShardNonBlockingTest, StaticAssignmentEmitTest, TransientTopicDataPathTest, WorkerPoolParityTest}.cpp`, plus `tests/integration/ClusterHarness.h` if it builds topics.
 
+**Files (comment mentions, F5):** `libs/node/tests/integration/CreateViewRegressionTest.cpp` (anchor `// a RUNE_TOPICS boot topic: no schema`) and `libs/node/tests/integration/SchemaGatewayTest.cpp` (anchor `RUNE_TOPICS boot topic with no schema`) — each rewritten to "an untyped topic created by DDL"; without this the Task 19 gate fails on them.
+
 Two files change meaning, not just mechanics:
 - `StaticAssignmentEmitTest.cpp` / `BootstrapRoutingImageTest.cpp` tested "boot topics are assigned at boot". Rename the suites `CatalogAssignmentEmitTest` / `CatalogBootstrapRoutingImageTest`: the topics are defined by DDL, the cluster is restarted, and the assertions (assignment emitted once, routing image complete) now hold for **catalog-recovered** topics.
 - `TransientTopicDataPathTest.cpp` has static-transient cases (`RUNE_TOPICS … persistence=transient`); they become `defineTopic(spec with persistence Transient)` — their "restart → exists and empty" assertions are unchanged (the topic now comes back from the catalog).
@@ -3468,7 +4307,7 @@ Two files change meaning, not just mechanics:
 - [ ] **Step 1: Migrate** every file above by the rule; delete each `cfg.topics` line; build.
 - [ ] **Step 2: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'Compaction|Consensus|ControlledShutdown|D9|DdlConformanceBroker|EpochRestart|Gateway|MultiLeader|PerWorkerReplication|Rebalance|ShardMode|ShardNonBlocking|CatalogAssignmentEmit|CatalogBootstrapRoutingImage|TransientTopicDataPath|WorkerPoolParity|ClusterDisasterRecovery' --output-on-failure -j14`
+Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'Compaction|Consensus|ControlledShutdown|D9|DdlConformanceBroker|EpochRestart|Gateway|MultiLeader|PerWorkerReplication|Rebalance|ShardMode|ShardNonBlocking|CatalogAssignmentEmit|CatalogBootstrapRoutingImage|TransientTopicDataPath|WorkerPoolParity|ClusterDisasterRecovery|CreateView|SchemaGateway' --output-on-failure -j14`
 Expected: PASS — the same scenarios as before the migration.
 - [ ] **Step 3: Commit**
 
@@ -3486,12 +4325,25 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 Spec §8: docker e2e scripts create their topics through the CLI or the probe before producing; every existing `RUNE_TOPICS` use is migrated, and none remain (grep gate); SELF-HOSTING.md loses every mention (its new section lands in Task 25).
 
 **Files:**
-- Create: `docker/topics/e2e.rql` (`topic events partitions 1;` `topic multi partitions 3;` `topic cg partitions 4;` — the ids 0, 1, 2 the e2e client uses), `docker/topics/transient-failover.rql` (+ `transient topic presence_failover partitions 1;` as the 4th, id 3), `docker/create-topics.sh` (runs the rune-ql-probe image's `rune ql -f /topics/<file>.rql --broker <seed>` on the compose network; bounded retries on `NotLeader` / connection refused while the cluster forms, then an explicit failure)
+- Create: `docker/topics/e2e.rql` (`topic events partitions 1;` `topic multi partitions 3;` `topic cg partitions 4;` — the ids 0, 1, 2 the e2e client uses), `docker/topics/transient-failover.rql` (+ `transient topic presence_failover partitions 1;` as the 4th, id 3), `docker/create-topics.sh` (runs the rune-ql-probe image's `rune ql -f /topics/<file>.rql --request-id <fixed per file> --broker <seed>` on the compose network — `-f` runs every statement in order and stops at the first error naming it (F8), and the fixed request id makes a retried run after a partial one return the original results (F17); bounded retries on `NotLeader` / connection refused while the cluster forms, then an explicit failure)
 - Modify: `docker/docker-compose.yml`, `docker/docker-compose.transient-failover.yml`, `docker/docker-compose.single.yml` (delete `RUNE_TOPICS` and its comment), `docker/e2e.sh`, `docker/transient-failover-e2e.sh` (call `create-topics.sh` after the leader is up, before any producer; `TOPIC_ID=3` comment rewritten)
 - Modify: `dr-e2e/harness/cluster.py`, `dr-e2e/harness/driver.py`, `dr-e2e/harness/dockerutil.py`, `dr-e2e/tests/{test_cg_atleastonce,test_cg_failover,test_cg_rebalance,test_compaction_e2e,test_dr2_multiclient,test_multi_leader_smoke,test_per_worker_ingress}.py` (the harness gains `create_topics(spec_list)`: builds a `.rql` from the old `name:partitions[:options]` strings — options mapped to the `with (…)` clause / `replicas` / `transient` — and runs it through the CLI container; every former `RUNE_TOPICS` env becomes a `create_topics` call)
 - Modify: `bench/kafka-compare/{cluster.sh,lib.sh,run-rune.sh,replbench.sh,README.md}` (native brokers: after start, `"$RUNE_CLI" ql -e "topic bench partitions $P with (tier = leader);" --broker …`; `RUNE_CLI` defaults to `../rune-client-cpp/build/rune`; the README's D0 row reads `topic bench … with (tier = leader)`)
 - Modify: `docs/release-notes/phase2b-c-typed-topic-routing.md`, `docs/release-notes/phase2b-e-transient-topics.md`, `docs/SELF-HOSTING.md`, `docs/superpowers/2026-09-14-rune-client-milestone-b-acceptance.md` (replace each `RUNE_TOPICS` example with the DDL equivalent; release notes keep their history in prose: "topics were then declared with an environment variable, since removed — see SELF-HOSTING")
-- Create: `scripts/check_no_rune_topics.py`; modify root `CMakeLists.txt` (`add_test(NAME NoRuneTopicsGateRegression.RepositoryHasNoRuneTopicsMention COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/check_no_rune_topics.py ${CMAKE_SOURCE_DIR})`)
+- Create: `scripts/check_no_rune_topics.py`, `scripts/rune_topics_allowlist.txt` (F5: the explicit allowlist the gate reads); modify root `CMakeLists.txt` (`add_test(NAME NoRuneTopicsGateRegression.RepositoryHasNoRuneTopicsMention COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/check_no_rune_topics.py ${CMAKE_SOURCE_DIR})`)
+- Fix-on-sight (F5): `build-release/` is tracked (`git ls-files build-release` lists `Makefile`s, `librune_node.a`, `rune_broker`, …) and its binaries contain the string. Untrack it — `git -C /Users/vradu/Projects/se-worktrees/rune-broker rm -r -q --cached build-release` (the files stay on disk) — and add `/build-*/` to `.gitignore` next to `/build/` so no build dir is ever tracked again. The gate's binary check below is its regression.
+
+`scripts/rune_topics_allowlist.txt`:
+
+```
+# The ONLY files that may mention RUNE_TOPICS (catalog history F5), each with its exact
+# maximum number of mentions.  Anything else — or more mentions — fails
+# NoRuneTopicsGateRegression.RepositoryHasNoRuneTopicsMention.
+# <path>                                   <max>  # why
+libs/node/src/NodeConfig.cpp               2      # the presence refusal (Task 17): the lookup + its message
+libs/node/tests/node/NodeConfigTest.cpp    1      # NodeConfigRegression.RuneTopicsIsRefusedWithAPointerToDdl
+docs/release-notes/catalog-history.md      2      # the release note that names the removal (Task 25)
+```
 
 `scripts/check_no_rune_topics.py`:
 
@@ -3500,53 +4352,62 @@ Spec §8: docker e2e scripts create their topics through the CLI or the probe be
 """Grep gate (catalog history spec §8): no RUNE_TOPICS mention may remain.
 
 Scans every tracked file except historical design records (docs/superpowers/**,
-which describe what existed when they were written) and this script.  Exit 1
-listing every hit; exit 0 when clean.  The broker's config loader refuses the
-variable explicitly (NodeConfig.cpp), and that one refusal message is allowed.
+which describe what existed when they were written) and the gate's own two files.
+The only other mentions allowed are listed — path and maximum count — in
+scripts/rune_topics_allowlist.txt (F5): the config loader's presence refusal, its
+Regression test, and the release note naming the removal.  A tracked binary that
+contains the string (e.g. committed build output) is a hit too.  Exit 1 listing
+every hit; exit 0 when clean.
 """
 import subprocess, sys, pathlib
 
 root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
 files = subprocess.run(["git", "-C", str(root), "ls-files"], capture_output=True, text=True, check=True).stdout.split()
-allowed_exact = {
-    "scripts/check_no_rune_topics.py",
-}
-allowed_lines = {
-    ("libs/node/src/NodeConfig.cpp", 'RUNE_TOPICS was removed'),
-    ("libs/node/tests/node/NodeConfigTest.cpp", 'RUNE_TOPICS'),
-}
+allow = {}
+for raw in (root / "scripts" / "rune_topics_allowlist.txt").read_text().splitlines():
+    entry = raw.split("#", 1)[0].split()
+    if entry:
+        allow[entry[0]] = int(entry[1])
+own = {"scripts/check_no_rune_topics.py", "scripts/rune_topics_allowlist.txt"}
 hits = []
 for f in files:
-    if f.startswith("docs/superpowers/") or f in allowed_exact:
+    if f.startswith("docs/superpowers/") or f in own:
         continue
-    p = root / f
     try:
-        text = p.read_text(errors="ignore")
+        data = (root / f).read_bytes()
     except (IsADirectoryError, FileNotFoundError):
         continue
-    for n, line in enumerate(text.splitlines(), 1):
-        if "RUNE_TOPICS" in line and not any(f == af and frag in line for af, frag in allowed_lines):
-            hits.append(f"{f}:{n}: {line.strip()}")
+    if b"\0" in data[:8192]:
+        if b"RUNE_TOPICS" in data:
+            hits.append(f"{f}: tracked binary contains RUNE_TOPICS (build output must not be tracked)")
+        continue
+    lines = [(n, l) for n, l in enumerate(data.decode(errors="ignore").splitlines(), 1) if "RUNE_TOPICS" in l]
+    mentions = sum(l.count("RUNE_TOPICS") for _, l in lines)
+    if mentions == 0 or mentions <= allow.get(f, 0):
+        continue
+    hits += [f"{f}:{n}: {l.strip()}" for n, l in lines]
+    if f in allow:
+        hits.append(f"{f}: {mentions} mentions > allowlisted {allow[f]}")
 if hits:
     print("RUNE_TOPICS must not appear (topics are created by DDL):")
     print("\n".join(hits))
     sys.exit(1)
-print("ok: no RUNE_TOPICS mention")
+print("ok: no RUNE_TOPICS mention outside scripts/rune_topics_allowlist.txt")
 ```
 
-(`NodeConfigTest.cpp`'s single allowed reference is the refusal test of Task 17.)
+(The refusal check and its test are Task 17's; the release note is Task 25's, so its entry is allowed before the file exists. `SELF-HOSTING.md` is **not** allowlisted: spec §8 removes every mention there.)
 
 - [ ] **Step 1: Run the gate to see it fail**
 
 Run: `python3 /Users/vradu/Projects/se-worktrees/rune-broker/scripts/check_no_rune_topics.py /Users/vradu/Projects/se-worktrees/rune-broker`
-Expected: exit 1 listing the docker / dr-e2e / bench / docs hits.
+Expected: exit 1 listing the docker / dr-e2e / bench / docs hits and the tracked `build-release/` binaries.
 
-- [ ] **Step 2: Migrate** every listed file.
+- [ ] **Step 2: Migrate** every listed file; untrack `build-release/` and ignore `/build-*/` (F5).
 
 - [ ] **Step 3: Run the gate + the scripts**
 
 Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R NoRuneTopicsGate --output-on-failure`
-Expected: PASS (`ok: no RUNE_TOPICS mention`).
+Expected: PASS (`ok: no RUNE_TOPICS mention outside scripts/rune_topics_allowlist.txt`).
 Run: `bash /Users/vradu/Projects/se-worktrees/rune-broker/docker/e2e.sh` and `bash /Users/vradu/Projects/se-worktrees/rune-broker/docker/transient-failover-e2e.sh`
 Expected: both end with their existing success line (topics now created by `create-topics.sh`).
 Run: `cd /Users/vradu/Projects/se-worktrees/rune-broker/dr-e2e && python3 -m pytest tests/test_multi_leader_smoke.py -x`
@@ -3555,8 +4416,8 @@ Expected: PASS (the smoke the others share the harness with; the full dr-e2e mat
 - [ ] **Step 4: Commit**
 
 ```bash
-git -C /Users/vradu/Projects/se-worktrees/rune-broker add -A docker dr-e2e bench docs scripts CMakeLists.txt
-git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "chore(catalog): docker, dr-e2e and kafka-compare create topics by DDL; RUNE_TOPICS grep gate
+git -C /Users/vradu/Projects/se-worktrees/rune-broker add -A docker dr-e2e bench docs scripts CMakeLists.txt .gitignore
+git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "chore(catalog): docker, dr-e2e and kafka-compare create topics by DDL; RUNE_TOPICS grep gate (explicit allowlist); untrack build-release
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3587,6 +4448,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   enum class Outcome : uint8_t { NotApplicable, Ok, RedirectThenOk, NotLeaderThenOkOnce, NotLeaderUntilBudgetThenOk,
                                  OneWinsOneConflict, OkNewObjectId, OkAfterPlacement, HaltedBrokerInternalOthersOk };
   [[nodiscard]] Outcome expect(Kind, Entity, Timing) noexcept;
+  struct ExpectedCodes { int first, afterRedirect, final, other, viaLeader, retried; };   // -1 = no such answer
+  [[nodiscard]] ExpectedCodes expectedCodes(Kind, Entity, Timing) noexcept;   // F15/F16: every code a cell asserts
   [[nodiscard]] int naRule(Kind, Entity, Timing) noexcept;          // 1 for R1, 0 = applicable
   [[nodiscard]] uint16_t conflictCode(Kind) noexcept;               // R5
   [[nodiscard]] std::string_view name(Kind) noexcept; name(Timing); name(Outcome);
@@ -3645,6 +4508,39 @@ inline constexpr int kKinds = 9, kEntities = 4, kTimings = 9;
     case Kind::DropTopic: case Kind::DropView:       return 7;    // UnknownTopic
     default:                                         return 31;   // SchemaConflict (expectedVersion)
     }
+}
+
+/// Every answer code a cell asserts (F15/F16) — the ONLY place a matrix code is written down.
+///   first          the first answer to the cell's DDL
+///   afterRedirect  the first answer after following a Redirect (-1: the first answer was not a Redirect)
+///   final          the client-visible terminal result of the cell's DDL
+///   other          R5: the concurrent DDL's terminal result
+///   viaLeader      R2: the same op sent via the leader
+///   retried        R3: the op retried after one broker returned
+/// A DDL sent via a follower answers Redirect (3) first in every rule except R2 (broker 3 is halted
+/// and answers Internal, never a redirect).  The DDL sent to the leader is applied first (R5).
+struct ExpectedCodes { int first, afterRedirect, final, other, viaLeader, retried; };
+[[nodiscard]] constexpr ExpectedCodes expectedCodes(Kind k, Entity e, Timing t) noexcept {
+    const bool viaF = e.via == Via::Follower;   // a follower answers Redirect (3) first
+    auto viaLeaderThen = [&](int leaderAnswer, int final) {
+        return viaF ? ExpectedCodes{3, leaderAnswer, final, -1, -1, -1} : ExpectedCodes{leaderAnswer, -1, final, -1, -1, -1};
+    };
+    switch (expect(k, e, t)) {
+    case Outcome::NotApplicable:                return {-1, -1, -1, -1, -1, -1};
+    case Outcome::HaltedBrokerInternalOthersOk: return {6, -1, 6, -1, 0, -1};                       // R2
+    case Outcome::NotLeaderUntilBudgetThenOk: {                                                    // R3
+        ExpectedCodes c = viaLeaderThen(2, 2); c.retried = 0; return c;
+    }
+    case Outcome::NotLeaderThenOkOnce:          return viaLeaderThen(2, 0);                         // R4
+    case Outcome::OneWinsOneConflict: {                                                            // R5
+        const int conflict = conflictCode(k);
+        return viaF ? ExpectedCodes{3, conflict, conflict, 0, -1, -1} : ExpectedCodes{0, -1, 0, conflict, -1, -1};
+    }
+    case Outcome::OkNewObjectId: case Outcome::OkAfterPlacement:                                   // R6 / R7
+    case Outcome::RedirectThenOk: case Outcome::Ok:                                                // R8 / R9
+        return viaLeaderThen(0, 0);
+    }
+    return {-1, -1, -1, -1, -1, -1};
 }
 [[nodiscard]] constexpr std::string_view name(Kind k) noexcept {
     constexpr std::string_view n[] = {"CreateTopic", "DropTopic", "AlterTopicConfig", "CreateSchema", "AlterSchema",
@@ -3705,6 +4601,27 @@ TEST(CatalogMatrixCountRegression, CellCountsArePinned) {
     EXPECT_EQ(byOutcome[static_cast<int>(cm::Outcome::Ok)], 54);
 }
 
+TEST(CatalogMatrixCountRegression, ExpectedCodesAgreeWithTheOutcomeOfEveryCell) {
+    // F15/F16: the code table and the outcome table cannot drift apart.
+    for (int k = 0; k < cm::kKinds; ++k)
+        for (int v = 0; v < 2; ++v)
+            for (int p = 0; p < 2; ++p)
+                for (int t = 0; t < cm::kTimings; ++t) {
+                    const cm::Kind kind = static_cast<cm::Kind>(k);
+                    const cm::Entity e{static_cast<cm::Via>(v), static_cast<cm::Persist>(p)};
+                    const cm::Timing tm = static_cast<cm::Timing>(t);
+                    const auto o = cm::expect(kind, e, tm);
+                    const auto c = cm::expectedCodes(kind, e, tm);
+                    if (o == cm::Outcome::NotApplicable) { EXPECT_EQ(c.first, -1); continue; }
+                    if (o == cm::Outcome::HaltedBrokerInternalOthersOk) { EXPECT_EQ(c.first, 6); EXPECT_EQ(c.viaLeader, 0); continue; }
+                    EXPECT_EQ(c.first == 3, e.via == cm::Via::Follower) << "a follower redirects first, a leader never";
+                    EXPECT_EQ(c.afterRedirect != -1, e.via == cm::Via::Follower);
+                    if (o == cm::Outcome::NotLeaderUntilBudgetThenOk) { EXPECT_EQ(c.final, 2); EXPECT_EQ(c.retried, 0); }
+                    else if (o == cm::Outcome::OneWinsOneConflict) EXPECT_EQ((c.final == 0) + (c.other == 0), 1);
+                    else EXPECT_EQ(c.final, 0);
+                }
+}
+
 struct Cell { cm::Kind kind; cm::Entity entity; cm::Timing timing; };
 std::vector<Cell> allCells() {
     std::vector<Cell> out;
@@ -3732,36 +4649,36 @@ TEST_P(CatalogInteractionMatrixRegression, Cell) {
     h.buildPrecondition(c.kind, c.entity.persist);            // the "Precondition" column of the plan's ops table
     const auto run = h.runCell(c.kind, c.entity, c.timing);   // drives the timing, records every answer
 
-    // 1. exact first answer + final result
+    // 1. every answer code, all from cmatrix::expectedCodes (F15/F16 — no code is hard-coded here)
+    const cm::ExpectedCodes ec = cm::expectedCodes(c.kind, c.entity, c.timing);
+    EXPECT_EQ(run.first.code, ec.first);
+    if (ec.first == 3) EXPECT_EQ(run.first.message, h.leaderClientEndpoint());
+    EXPECT_EQ(run.afterRedirectCode, ec.afterRedirect);
+    EXPECT_EQ(run.finalCode, ec.final);
+    EXPECT_EQ(run.otherFinalCode, ec.other);
+    EXPECT_EQ(run.viaLeaderCode, ec.viaLeader);
+    EXPECT_EQ(run.retriedCode, ec.retried);
+    // 1b. what each outcome asserts besides codes
     switch (want) {
-    case cm::Outcome::Ok:                         EXPECT_EQ(run.first.code, 0); break;
-    case cm::Outcome::RedirectThenOk:             EXPECT_EQ(run.first.code, 3);
-                                                  EXPECT_EQ(run.first.message, h.leaderClientEndpoint()); break;
-    case cm::Outcome::NotLeaderThenOkOnce:        EXPECT_EQ(run.first.code, 2); break;
-    case cm::Outcome::NotLeaderUntilBudgetThenOk: EXPECT_EQ(run.first.code, 2);
-                                                  EXPECT_EQ(run.budgetExhaustedCode, 2);
-                                                  EXPECT_TRUE(run.produceOnExistingTopicSucceeded); break;
-    case cm::Outcome::OneWinsOneConflict:         EXPECT_EQ(run.okCount, 1);
-                                                  EXPECT_EQ(run.loserCode, cm::conflictCode(c.kind)); break;
+    case cm::Outcome::NotLeaderUntilBudgetThenOk: EXPECT_TRUE(run.produceOnExistingTopicSucceeded); break;
+    case cm::Outcome::OneWinsOneConflict:         EXPECT_EQ(run.okCount, 1); break;
     case cm::Outcome::OkNewObjectId:              EXPECT_NE(run.objectIdAfter, run.objectIdBefore);
                                                   EXPECT_EQ(run.newVersionAfter, run.firstVersionOfNewObject); break;
     case cm::Outcome::OkAfterPlacement:           EXPECT_EQ(run.produceInWindowCode, 2);
                                                   EXPECT_TRUE(run.okReleasedOnlyAfterServing); break;
     case cm::Outcome::HaltedBrokerInternalOthersOk:
         EXPECT_TRUE(h.applierHalted(3)); EXPECT_EQ(h.haltCounter(3), 1);
-        EXPECT_EQ(run.answerFromHaltedBroker, 6); EXPECT_EQ(run.answerViaLeader, 0);
         EXPECT_TRUE(run.haltedBrokerStillServesAppliedTopics); break;
-    case cm::Outcome::NotApplicable: break;
+    default: break;
     }
-    EXPECT_EQ(run.finalCode, want == cm::Outcome::OneWinsOneConflict ? run.finalCode : 0);
     // 2. every DDL answered exactly once
     for (int b = 1; b <= 3; ++b) EXPECT_EQ(h.admin(b).startedCount(), h.admin(b).answeredCount()) << "broker " << b;
     EXPECT_TRUE(run.everyRequestHadOneTerminalResult);
     // 3. identical catalogs on every running non-halted broker
     EXPECT_TRUE(h.awaitDigestsEqual(/*excludeHalted=*/true));
     // 4. no DDL lost or duplicated
-    for (uint64_t rid : run.okRequestIds)      EXPECT_EQ(h.countEventsWithRequestId(rid), 1u);
-    for (uint64_t rid : run.refusedRequestIds) EXPECT_EQ(h.countEventsWithRequestId(rid), 0u);
+    for (const rune::protocol::RequestId& rid : run.okRequestIds)      EXPECT_EQ(h.countEventsWithRequestId(rid), 1u);
+    for (const rune::protocol::RequestId& rid : run.refusedRequestIds) EXPECT_EQ(h.countEventsWithRequestId(rid), 0u);
     // 5. history shows the op
     EXPECT_TRUE(h.historyShows(c.kind, run.objectIdAfter, run.statement, run.okRequestIds));
     // 6. serving iff applied + placed
@@ -3771,12 +4688,12 @@ TEST_P(CatalogInteractionMatrixRegression, Cell) {
 INSTANTIATE_TEST_SUITE_P(AllCells, CatalogInteractionMatrixRegression, testing::ValuesIn(allCells()), cellName);
 ```
 
-- [ ] **Step 3: Implement `CatalogClusterHarness.h`** — `runCell` drives each timing exactly as the plan's timing table describes, using: `FilteringTransport::isolate/deisolate` (minIsr, catch-up), `holdHighWatermark(b)` (stop the followers' fetches so an append stays uncommitted), `moveCatalogLeadership(to)` (commits a new `(−6,0)` assignment through the scripted controller), `stopBroker(b)` / `restartBroker(b)` (rebuilds the rig on its dirs: checkpoint + log survive), `startFreshBroker(3)`, `applier(3).tamperNextFingerprintForTest()`, `placeAfter(b, topicId, delayPasses)` (delays the placement commit for `CreateRacesPlacement`), and the client model's `send(via, request)` (follows `Redirect`, retries `NotLeader` with the budget in deterministic passes). Every wait is bounded by a pass cap (`ASSERT`-fails with the cell name on overrun — never hangs).
+- [ ] **Step 3: Implement `CatalogClusterHarness.h`** — `runCell` drives each timing exactly as the plan's timing table describes, using: `FilteringTransport::isolate/deisolate` (minIsr, catch-up), `holdHighWatermark(b)` (stop the followers' fetches so an append stays uncommitted), `moveCatalogLeadership(to)` (commits a new `(−6,0)` assignment through the scripted controller), `stopBroker(b)` / `restartBroker(b)` (rebuilds the rig on its dirs: checkpoint + log survive), `startFreshBroker(3)`, `applier(3).tamperNextFingerprintForTest()`, `placeAfter(b, topicId, delayPasses)` (delays the placement commit for `CreateRacesPlacement`), and the client model's `send(via, request)` (follows `Redirect`, retries `NotLeader` with the budget in deterministic passes; 128-bit `RequestId`s as Task 5's client). `runCell` records, per the `ExpectedCodes` fields, `first`, `afterRedirectCode`, `finalCode`, `otherFinalCode`, `viaLeaderCode`, `retriedCode` (−1 where the timing has no such answer). `CatalogBelowMinIsr` with `Via = Follower` sends to a follower first, takes its `Redirect`, then stops both followers before the followed request reaches the leader (the timing table). Every wait is bounded by a pass cap (`ASSERT`-fails with the cell name on overrun — never hangs).
 
 - [ ] **Step 4: Run**
 
 Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_catalog_matrix_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogMatrixCount|CatalogInteractionMatrix' --output-on-failure -j14`
-Expected: 1 count pin PASS; 300 cells PASS, 24 SKIPPED (R1).
+Expected: 2 count pins PASS; 300 cells PASS, 24 SKIPPED (R1).
 
 - [ ] **Step 5: Commit**
 
@@ -3816,7 +4733,7 @@ TEST_P(CatalogStressRegression, RandomDdlUnderChurnMatchesTheModel) {
     std::mt19937 rng(GetParam());
     rune::node::test::CatalogClusterHarness h("stress_" + std::to_string(GetParam()), 3);
     rune::node::test::CatalogModel model;
-    std::map<std::string, std::set<uint64_t>> okRequestsByName;
+    std::map<std::string, std::set<rune::protocol::RequestId>> okRequestsByName;
     for (int step = 0; step < 400; ++step) {
         const auto action = h.randomAction(rng);
         const auto answers = h.perform(action);                       // every answer of this step, terminal ones marked
@@ -3829,8 +4746,13 @@ TEST_P(CatalogStressRegression, RandomDdlUnderChurnMatchesTheModel) {
                 okRequestsByName[a.request.name].insert(a.request.requestId);
             } else if (a.code == m.refusalCode) {
                 // refused exactly as the model refuses
+            } else if (a.code == 6) {
+                // F30: Internal only from a broker the model knows is halted (a tampered fingerprint) —
+                // never from a healthy broker (e.g. a commit timeout must be the retriable NotLeader, F13).
+                ASSERT_TRUE(h.applierHalted(a.broker))
+                    << "seed " << GetParam() << " step " << step << ": Internal (6) from healthy broker " << a.broker;
             } else {
-                ASSERT_TRUE(a.code == 2 || a.code == 3 || a.code == 6)
+                ASSERT_TRUE(a.code == 2 || a.code == 3)
                     << "seed " << GetParam() << " step " << step << ": unexpected code " << a.code;
             }
         }
@@ -3843,7 +4765,7 @@ TEST_P(CatalogStressRegression, RandomDdlUnderChurnMatchesTheModel) {
     for (int b = 1; b <= 3; ++b) EXPECT_EQ(h.admin(b).startedCount(), h.admin(b).answeredCount());
     // Invariant: no DDL lost or duplicated.
     for (const auto& [name, rids] : okRequestsByName)
-        for (uint64_t rid : rids) EXPECT_EQ(h.countEventsWithRequestId(rid), 1u) << name;
+        for (const auto& rid : rids) EXPECT_EQ(h.countEventsWithRequestId(rid), 1u) << name;
     // Invariant: two creates on one name never both succeed (per live object generation).
     EXPECT_TRUE(h.noNameHadTwoConcurrentLiveObjects());
     // The broker catalog equals the independent model.
@@ -3853,7 +4775,7 @@ TEST_P(CatalogStressRegression, RandomDdlUnderChurnMatchesTheModel) {
 INSTANTIATE_TEST_SUITE_P(Seeds, CatalogStressRegression, testing::Range(1u, 65u));
 ```
 
-- [ ] **Step 2: Implement `CatalogModel.h`** and the harness additions (`randomAction`, `perform`, `digestsEqualAtEqualOffsets`, `noNameHadTwoConcurrentLiveObjects` — checks the log: between a create and the drop of the same name, no other create of that name; `catalogAsModelSnapshot` — the leader's `CatalogState` mapped to the model's shapes).
+- [ ] **Step 2: Implement `CatalogModel.h`** and the harness additions (`randomAction`, `perform` — each answer carries the `broker` that sent it, F30 — `digestsEqualAtEqualOffsets`, `noNameHadTwoConcurrentLiveObjects` — checks the log: between a create and the drop of the same name, no other create of that name; `catalogAsModelSnapshot` — the leader's `CatalogState` mapped to the model's shapes).
 
 - [ ] **Step 3: Run**
 
@@ -3876,24 +4798,33 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 Spec §10: "BrokerNode integration, 3 nodes: runtime `CreateTopic` and `CreateView` through every broker, with a leader kill mid-DDL. This closes the E2 carry-over."
 
 **Files:**
-- Create: `libs/node/tests/integration/CatalogClusterIntegrationTest.cpp`; modify `libs/node/CMakeLists.txt` (`rune_catalog_integration_tests`)
+- Create: `libs/node/tests/integration/CatalogClusterIntegrationTest.cpp`; modify `libs/node/CMakeLists.txt` (`rune_catalog_integration_tests`; `ClientDdlClusterRegressionTest.cpp` joins `rune_client_broker_tests`)
+- Create: `libs/node/tests/support/ThreeNodes.h` — Task 6's `ThreeNodes` helper, moved verbatim out of the file below
+- Modify: `libs/node/tests/integration/CatalogReplicationTest.cpp` (F34: its file-local `ThreeNodes` is deleted and the file includes `support/ThreeNodes.h`; its five tests are unchanged)
+- Modify: `libs/node/tests/support/ShardTestClient.h` (the new wire DDL sends, below)
+- Create: `libs/node/tests/client/ClientDdlClusterRegressionTest.cpp` (F7: the real client's blocking `*AndWait` through a follower, across a leader kill and below minIsr — on three real `BrokerNode`s)
 
 **Interfaces:**
-- Consumes: `ShardTestClient` (wire DDL: `sendDefineTopic`, `awaitDefine`, plus new `sendDropTopic`, `sendAlterTopic`, `sendCreateView`, `awaitDdl` added here, following its existing `sendDefineTopic` pattern and carrying the DDL extension with a `requestId`), `cmatrix::expect`, Task 6's `ThreeNodes` helper (moved to `libs/node/tests/support/ThreeNodes.h`).
+- Consumes: `ShardTestClient` (wire DDL: `sendDefineTopic`, `awaitDefine`, plus new `sendDropTopic`, `sendAlterTopic`, `sendCreateView`, `awaitDdl` added here, following its existing `sendDefineTopic` pattern and carrying the DDL extension with a 128-bit `RequestId`), `cmatrix::{expect, expectedCodes}` (F16), `ThreeNodes` (`support/ThreeNodes.h`).
 
 Cells: `{CreateTopic, CreateView, DropTopic, AlterSchema}` × `{Steady via node 1, Steady via node 2, Steady via node 3, LeaderChangeMidDdl (the catalog leader is stopped right after the DDL frame is sent), RestartMidApply (a follower is stopped and restarted while the DDL commits), NewBrokerJoins (node 3 first started after the DDL), DropAndReuseName, CreateRacesPlacement}` = **32** cells, each followed by: produce acks=all + subscribe from earliest **through every running broker's client endpoint** to the topic (or the view's source, then `GetViewRow`) and assert delivery — the E2 carry-over's failure mode.
 
-- [ ] **Step 1: Write the slice** (parameterized over `(Kind, Timing)`; outcomes from `cmatrix::expect` with `Via` = the broker the DDL went to):
+- [ ] **Step 1: Write the slice** (parameterized over `(Kind, Timing)`; every expected code from `cmatrix::expectedCodes` with `Via` = whether the broker the DDL went to was the catalog leader at send time and `Persist::Disk` — F16, no hard-coded outcome):
 
 ```cpp
 TEST_P(CatalogClusterSliceRegression, RuntimeDdlThroughEveryBrokerThenDataThroughEveryBroker) {
     const auto [kind, timing, viaNode] = GetParam();
+    if (cm::naRule(kind, {cm::Via::Leader, cm::Persist::Disk}, timing) != 0) GTEST_SKIP() << "R1";   // e.g. DropTopic x CreateRacesPlacement
     ThreeNodes c = ThreeNodes::start(sliceDirName(GetParam()), timing == cm::Timing::NewBrokerJoins
                                      ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 3});
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     c.buildPrecondition(kind);                                     // via DDL, through the leader
     const auto res = c.runSliceCell(kind, timing, viaNode);        // the DDL + the timing, real nodes
-    EXPECT_EQ(res.finalCode, 0) << res.trace;
+    const cm::ExpectedCodes ec = cm::expectedCodes(kind, {res.viaWasLeader ? cm::Via::Leader : cm::Via::Follower,
+                                                          cm::Persist::Disk}, timing);
+    EXPECT_EQ(res.firstCode, ec.first) << res.trace;
+    EXPECT_EQ(res.afterRedirectCode, ec.afterRedirect) << res.trace;
+    EXPECT_EQ(res.finalCode, ec.final) << res.trace;
     if (timing == cm::Timing::NewBrokerJoins) c.startNode(3);
     ASSERT_TRUE(c.awaitCatalogDigestsEqual(30s)) << "identical catalogs on every broker";
     for (int n : c.runningNodes()) {
@@ -3912,9 +4843,49 @@ TEST(CatalogClusterRegression, MultiNodeRuntimeDefineTopicServesOnEveryBrokerReg
 TEST(CatalogClusterRegression, MultiNodeRuntimeCreateViewFoldsOnTheSourceLeaderRegression) { … }
 ```
 
+and, in `ClientDdlClusterRegressionTest.cpp` (`rune_client_broker_tests`, F7 — the blocking client API across real brokers, which neither the fake nor one node can exercise):
+
+```cpp
+TEST(ClientDdlClusterRegression, AndWaitThroughAFollowerFollowsTheRedirect) {
+    ThreeNodes c = ThreeNodes::start("cc_redirect");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    auto client = c.connectClient(c.aFollowerOfTheCatalog());
+    const auto r = client->defineTopicAndWait("t", 1, "", {}, false, rune::client::Persistence::Disk, {}, {}, 20s);
+    EXPECT_EQ(r.errorCode, 0) << r.detail;
+    EXPECT_TRUE(c.awaitCatalogDigestsEqual(30s));
+}
+
+TEST(ClientDdlClusterRegression, LeaderKilledMidDdlTheRetryGetsTheOriginalResultOnce) {
+    ThreeNodes c = ThreeNodes::start("cc_kill");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    auto client = c.connectClient(c.catalogLeaderId());
+    rune::client::DdlOptions o; o.requestId = {.hi = 0xC11E, .lo = 77};
+    c.killCatalogLeaderAfterNextAppend();                          // test seam: stop the leader right after its append
+    const auto r = client->defineTopicAndWait("t", 1, "", {}, false, rune::client::Persistence::Disk, {}, o, 30s);
+    EXPECT_EQ(r.errorCode, 0) << "NotLeader retried within the budget, deduplicated on the new leader: " << r.detail;
+    EXPECT_EQ(c.countEventsWithRequestId(o.requestId), 1u);
+}
+
+TEST(ClientDdlClusterRegression, BelowMinIsrAndWaitFailsExplicitlyWithNotLeader) {
+    ThreeNodes c = ThreeNodes::start("cc_minisr");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int32_t leader = c.catalogLeaderId();
+    rune::client::ClientConfig cfg = c.clientConfigFor(leader);
+    cfg.ddlRetryBudget = std::chrono::milliseconds(1500);
+    auto client = c.connectClient(cfg);
+    for (int n : c.runningNodes()) if (n != leader) c.stop(n);
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto r = client->defineTopicAndWait("t", 1, "", {}, false, rune::client::Persistence::Disk, {}, {}, 30s);
+    EXPECT_EQ(r.errorCode, 2) << "an explicit NotLeader failure once the budget is spent (spec §5.5)";
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 10s) << "the budget, not the 30 s op timeout, ends it";
+}
+```
+
+(`ThreeNodes` gains, here: `connectClient(nodeId | ClientConfig)`, `clientConfigFor(nodeId)`, `aFollowerOfTheCatalog()`, `killCatalogLeaderAfterNextAppend()` (an admin-thread seam on the leader's `BrokerNode`), `countEventsWithRequestId(RequestId)`.)
+
 - [ ] **Step 2: Run**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_catalog_integration_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogCluster' --output-on-failure -j4`
+Run: `cmake /Users/vradu/Projects/se-worktrees/rune-broker/build-fast && cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 --target rune_catalog_integration_tests rune_catalog_replication_tests rune_client_broker_tests && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogCluster|CatalogReplication|ClientDdlCluster' --output-on-failure -j4`
 Expected: PASS (`-j4`: each cell runs three brokers).
 
 - [ ] **Step 3: Commit**
@@ -3934,7 +4905,8 @@ Spec §10 "Gates".
 
 **Files:**
 - Create: `benchmark/CatalogBootReplayBench.cpp` (in `rune_broker_benchmark`: builds a `__catalog` log of 10 000 events — 2 000 topics created, 2 000 schema alters, 2 000 config alters, 1 000 views created + altered, 1 000 drops — once, then times `BrokerNode` boot step `bootFromCatalog_()` alone via a `BrokerNode::bootFromCatalogForBench(dataDir)` static seam)
-- Create: `libs/node/tests/node/CatalogGatesRegressionTest.cpp` (in `rune_node_tests`)
+- Create: `libs/node/tests/node/CatalogGatesRegressionTest.cpp` (in `rune_node_tests`: the boot-replay time gate)
+- Modify: `libs/node/tests/node/CatalogAllocRegressionTest.cpp` (append the idle-admin-pass gate — F12: the allocation gates live in their own binary with the per-binary `operator new` replacement; there is no `AllocCounter` type)
 - Modify: root `CMakeLists.txt` (benchmark source list, after the last `benchmark/*.cpp` entry)
 
 - [ ] **Step 1: Write the gate tests**:
@@ -3955,32 +4927,30 @@ TEST(CatalogGatesRegression, BootReplayOfTenThousandEventsIsUnderOneSecond) {
 #endif
 }
 
-TEST(CatalogGatesRegression, IdleCatalogAdminPassAllocatesNothing) {
+```
+
+and, appended to `CatalogAllocRegressionTest.cpp` (own binary, plain `gArmed` / `gArmedAllocs` globals — F12; add `#include "support/CatalogDdlRig.h"` there):
+
+```cpp
+TEST(CatalogAllocRegression, IdleCatalogAdminPassAllocatesNothingRegression) {
     rune::node::test::CatalogDdlRig rig("gate_alloc", 3);
     rig.becomeServingLeader();
     for (int i = 0; i < 50; ++i) ASSERT_EQ(rig.define({.name = "t" + std::to_string(i), .partitions = 1}).code, 0);
     rig.subscribeCatalog(/*session=*/9);                                // an idle catalog reader too
     rig.pumpUntilIdle();
-    rune::test::AllocCounter ac;
+    gArmedAllocs = 0;
+    gArmed = true;
     for (int i = 0; i < 10'000; ++i) (void)rig.admin().doWork(rig.nowNs());
-    EXPECT_EQ(ac.count(), 0u);
-}
-
-TEST(CatalogGatesRegression, ProduceAndPushReadAllocateNothingWithACatalogPresent) {
-    // The existing hot-path zero-alloc rig (HotPathBAllocRegressionTest's), on a topic created by DDL.
-    rune::node::test::HotPathBRig rig("gate_hot", rune::node::test::HotPathBRig::TopicFrom::CatalogDdl);
-    rig.warm();
-    rune::test::AllocCounter ac;
-    rig.produceAndPushRead(100'000);
-    EXPECT_EQ(ac.count(), 0u);
+    gArmed = false;
+    EXPECT_EQ(gArmedAllocs, 0u);
 }
 ```
 
-(`HotPathBRig::TopicFrom::CatalogDdl` is added in this task: the rig defines its topic through `TestCluster` instead of the removed static list.)
+**The hot-path zero-allocation gate is the existing one, unchanged (F12 — real names, nothing invented):** `HotPathBRegression.SteadyStateDutyPassesNeverAllocateRegression` (binary `rune_hotpath_b_alloc_regression_tests`, `struct Rig` from `libs/node/tests/integration/HotPathBRig.h`) and `TransientDataPathRegression.SteadyStateProduceEvictAndPushReadNeverAllocateRegression` (`rune_transient_alloc_regression_tests`, `TransientRig.h`). Their `Rig` drives a `Worker` directly with a replica it builds itself — exactly what a catalog-created topic is on a worker (`createRuntimeUserReplicas` hands the worker the same replica), so the catalog cannot add an allocation on that path that these tests would miss; this task re-runs them as the gate (Step 2) and proves the produce/consume medians unchanged (Step 3).
 
 - [ ] **Step 2: Run the tests**
 
-Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogGates|HotPathBAlloc|TransientDataPathAlloc|ZeroAlloc' --output-on-failure -j14`
+Run: `cmake --build /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -j14 && ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R 'CatalogGates|CatalogAlloc|SteadyStateDutyPassesNeverAllocate|SteadyStateProduceEvictAndPushReadNeverAllocate|RingRebuildWithMoreProducersThanTheMarkerSetNeverAllocates|ZeroAlloc' --output-on-failure -j14`
 Expected: PASS.
 
 - [ ] **Step 3: Benchmarks** — boot replay (Release gate) and hot-path parity against the base commit:
@@ -4006,7 +4976,7 @@ git -C /Users/vradu/Projects/se-worktrees/rune-broker add benchmark libs CMakeLi
 git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -F /tmp/catalog-gates-msg.txt
 ```
 
-where `/tmp/catalog-gates-msg.txt` is written in Step 3 from the benchmark output: first line `test(catalog): gates — 10k-event boot replay < 1 s, idle catalog + hot path allocate nothing, hot-path benches at parity`, a blank line, one line per benchmark `<name>: base <median> -> branch <median> (<delta %>)` plus `CatalogBootReplay: <median>`, a blank line, `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+where `/tmp/catalog-gates-msg.txt` is written in Step 3 from the benchmark output: first line `test(catalog): gates — 10k-event boot replay < 1 s, idle catalog admin pass allocates nothing, hot-path alloc gates green, hot-path benches at parity`, a blank line, one line per benchmark `<name>: base <median> -> branch <median> (<delta %>)` plus `CatalogBootReplay: <median>`, a blank line, `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ---
 
@@ -4016,15 +4986,15 @@ Spec §10 "Docker e2e, 3 nodes": 1. DDL through each broker; 2. the `__catalog` 
 
 **Files:**
 - Create: `docker/docker-compose.catalog.yml` (two 3-node clusters as two compose projects from one file with `${CLUSTER}`-prefixed service names and distinct host ports; `RUNE_CATALOG_REPL_STREAM_ID` default), `docker/catalog-e2e.sh`, `docker/topics/catalog-e2e.rql`
-- Modify: `rune-client-cpp/examples/view_probe.cpp` only if a view assertion needs it (it already reads views by name)
+- Modify: `rune-client-cpp/examples/view_probe.cpp` (F33 — a listed change, the script needs it: add `--create-only`, which creates the view over the given source through `createViewAndWait` and exits 0 on Ok, 1 printing the code + detail otherwise, without reading rows; committed in rune-client-cpp)
 
 `docker/catalog-e2e.sh` (structure; bounded waits, `trap` teardown, no fixed sleeps as gates — the house style of `docker/view-engine-e2e.sh`):
 1. Build the broker image (`docker compose -f docker/docker-compose.catalog.yml build`, exit status checked directly) and the client `rune-ql-probe` image (rune CLI).
 2. `CLUSTER=a` up; wait (bounded, 180 s) until each node's role counter shows a consensus leader **and** `rune ql -e "show history;"` succeeds against node 1.
 3. **DDL through each broker:** `rune ql -f /topics/catalog-e2e.rql --broker a-rune-1:40200` (topic `players` typed, `events` untyped `replicas 3`, `presence` transient), then `rune ql -e "alter topic players add column mana int32;" --broker a-rune-2:40200`, then `rune ql -e "alter topic events set retention.ms = 600000;" --broker a-rune-3:40200`, a view through node 2 (`view_probe --create-only`). Each must exit 0 (a follower answers `Redirect`; the CLI follows it).
-4. **Leader killed mid-DDL:** find the catalog leader by a bounded poll of `docker logs` for the last `AdminWorker: __catalog role -> LeaderServing (epoch N)` line (Task 11 logs it on every promotion; the highest epoch wins), start `rune ql -e "topic midkill partitions 2;"` against it in the background, `docker kill` the leader container 50 ms later, wait for the CLI: it must exit 0 (retried on the new leader, deduplicated) **or** exit 1 with `NotLeader` after its budget — then re-run the same statement once: exit 0. Assert `show history topic midkill;` lists exactly one `CreateTopic`. Restart the killed node; wait until `rune catalog diff --from a-rune-1:40200 --to a-rune-<killed>:40200` exits 0 (all brokers converge).
+4. **Leader killed mid-DDL:** find the catalog leader by a bounded poll of `docker logs` for the last `AdminWorker: __catalog role -> LeaderServing (epoch N)` line (Task 11 logs it on every promotion; the highest epoch wins), start `rune ql -e "topic midkill partitions 2;" --request-id 00000000000000c1000000000000006d` against it in the background, `docker kill` the leader container 50 ms later, wait for the CLI: it must exit 0 (retried on the new leader, deduplicated) **or** exit 1 with `NotLeader` after its budget — then re-run the same statement **with the same `--request-id`** once: exit 0 (F17: if the killed attempt committed, the broker's `(requestId, requestFingerprint)` dedupe returns its original result instead of `TopicExists`; if it did not, the re-run creates it). Assert `show history topic midkill;` lists exactly one `CreateTopic`. Restart the killed node; wait until `rune catalog diff --from a-rune-1:40200 --to a-rune-<killed>:40200` exits 0 (all brokers converge).
 5. Produce + consume through every broker on `events` (`rune_produce_subscribe` example, existing image) — data path after runtime DDL on 3 nodes.
-6. **Export → replay → diff:** `rune catalog export --broker a-rune-1:40200 > /work/a.rcat`; `CLUSTER=b` up (fresh, empty); `rune catalog replay --from /work/a.rcat --into b-rune-1:40200 --cluster-id a`; `rune catalog diff --from a-rune-1:40200 --to b-rune-1:40200` → exit 0 and prints no differences. `rune ql -e "show history;" --broker b-rune-2:40200` shows every event with `replayedFrom a@<offset>`.
+6. **Export → replay → diff:** `rune catalog export --broker a-rune-1:40200 > /work/a.rcat`; `CLUSTER=b` up (fresh, empty); `rune catalog replay --from /work/a.rcat --into b-rune-1:40200 --cluster-id a`; `rune catalog diff --from a-rune-1:40200 --to b-rune-1:40200` → exit 0 and prints no differences. `rune ql -e "show history;" --broker b-rune-2:40200` shows every event with `replayedFrom a@<offset>` (the history row's `replayedFrom` column, Task 15 — F18).
 7. Print `CATALOG-E2E: OK`; teardown both projects.
 
 - [ ] **Step 1: Write the compose file, the `.rql` and the script.**
@@ -4035,6 +5005,10 @@ Expected: ends with `CATALOG-E2E: OK`, exit 0.
 - [ ] **Step 3: Commit**
 
 ```bash
+git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp add examples/view_probe.cpp
+git -C /Users/vradu/Projects/se-worktrees/rune-client-cpp commit -m "feat(examples): view_probe --create-only (catalog e2e)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 git -C /Users/vradu/Projects/se-worktrees/rune-broker add docker
 git -C /Users/vradu/Projects/se-worktrees/rune-broker commit -m "test(catalog): docker e2e — 3-node DDL via each broker, leader killed mid-DDL, export/replay/diff into a fresh cluster
 
@@ -4048,11 +5022,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Files:**
 - Modify: `docs/SELF-HOSTING.md` — new section **"Topics are created by DDL"** (no `RUNE_TOPICS`; `rune ql -e "topic events partitions 3 replicas 3;"`; the `with (…)` creation settings table mapping every former option; `replicationFactor` rules: `≤ broker count`, `≥ minIsr`, 0 = every broker; typed vs untyped topics; `alter topic … set` for the six alterable settings; `drop topic` / `drop view` rules), and **"The catalog (`__catalog`)"** (one partition on every broker, majority, never unclean / compacted / deleted; `RUNE_CATALOG_REPL_STREAM_ID`; restart and new-broker behaviour; `dataDir/__catalog/applied`; old `__topic_schemas` / `__views` dirs are ignored and may be deleted by hand).
 - Create: `docs/CATALOG.md` — the event model (fields, kinds, `formatVer` rules), reads (`SHOW HISTORY` / `AS OF` / `DIFF`, client API), `rune catalog export|replay|diff` with examples, the error table of spec §9, and **"#halted"**: what a fingerprint-mismatch halt means, the metric (`catalog apply halted` counter type 1 000 217, applied-offset counter 1 000 218), and the operator procedure (stop the broker, move `dataDir/__catalog` aside, restart: it re-fetches the whole catalog from the leader and re-applies from offset 0; if the leader itself halted, `rune catalog export` from a healthy broker and compare with `rune catalog diff`).
-- Create: `docs/release-notes/catalog-history.md` (breaking: `RUNE_TOPICS` removed — a set variable refuses to start; client version 8; new DDL ops and codes used; no migration).
+- Create: `docs/release-notes/catalog-history.md` (breaking: `RUNE_TOPICS` removed — a set variable refuses to start; client version 8; new DDL ops and codes used; **pre-v8 clients** (F37): DDL sent to a broker that is not the catalog leader is answered `InvalidRequest` in its own response type ("client too old for cluster DDL routing; upgrade", logged by the broker) — upgrade clients before running DDL against a multi-node cluster; `rune ql --request-id` and `-f` scripts; no migration). It names the variable at most twice — the count `scripts/rune_topics_allowlist.txt` allows (F5).
 - Modify: `rune-client-cpp/README.md` (the new API + CLI commands), `rune-ql/README.md` if present (the new statements).
 
 - [ ] **Step 1: Write the docs.**
-- [ ] **Step 2: Verify** every statement in them parses with the built CLI (`/Users/vradu/Projects/se-worktrees/rune-client-cpp/build/rune ql -e "<each statement>" --dry-run`), and rerun the grep gate: `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R NoRuneTopicsGate --output-on-failure`.
+- [ ] **Step 2: Verify** every statement in them parses with the built CLI (`/Users/vradu/Projects/se-worktrees/rune-client-cpp/build/rune ql -e "<each statement>" --dry-run`), and rerun the grep gate: `ctest --test-dir /Users/vradu/Projects/se-worktrees/rune-broker/build-fast -R NoRuneTopicsGate --output-on-failure` — it passes with the release note's mentions inside its allowlisted count; any other doc mention (e.g. in `SELF-HOSTING.md` or `CATALOG.md`) fails it.
 - [ ] **Step 3: Commit** (broker docs; client/ql READMEs in their repos)
 
 ```bash
@@ -4084,10 +5058,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - §9 errors table → Task 11 (Redirect, NotLeader, Internal when halted), Task 9 (TopicExists, specific codes, InvalidRequest with detail), Tasks 3/13/15 (replay / diff errors naming the offset).
   - §10 testing → matrix section + Tasks 20 (unit), 21 (stress, the four invariants), 22 (3-node slice), 24 (docker e2e, all four steps), 3 + 23 (gates: 10k boot replay < 1 s, hot-path parity, zero-alloc; "every DDL answered" is invariant 2 of every matrix cell and of the stress).
   - §11 relation to other work → Global Constraints "Carry-overs folded in"; Part D noted.
+- **Pre-flight rulings:** F1–F37 applied (see "Pre-flight rulings (2026-10-13)" above); spec §4 (`timestampMs` at append), §7 (Subscribe serving is transport) and the Repos line (rune-codec hosts `rune_catalog`) amended with dated notes.
 - **Placeholder scan:** no "TBD"/"TODO"/"fill in"/"similar to Task N". Runtime data is produced by named steps, never invented: the golden digests (Task 3 Step 4, printed by `make_catalog_golden`, then frozen) and the benchmark medians (Task 23 Step 3, written into the commit message file). Mechanical migrations (Tasks 17–19) give the exact rule, the exact file list and a before/after.
-- **Type consistency:** `rune::catalog::{EventKind, CatalogEvent, Ops, CreateTopicOps…DropViewOps, TopicConfig, ConfigKey, ConfigChange, SchemaDef, ViewDef, Principal, ReplayedFrom, DecodeError, encode, encodeInto, decode, kindOf}` (Task 1) are used unchanged by Tasks 2, 3, 7, 9, 13, 15; `CatalogState`, `RequestRecord`, `Applied`, `ApplyError`, `apply`, `previewFingerprint`, `fingerprintOf`, `digest()` (Task 2) by 3, 7, 9, 13, 20, 21; `CatalogReplayer`, `RecordedEvent`, `history`, `stateAsOf`, `AsOf`, `HistoryFilter`, `diff`, `DiffEntry`, `ReplayError`, `describe`, `readRcat`/`writeRcat*`, `testing::goldenScriptV1` (Task 3) by 13, 15; protocol `DdlExtension`, `TopicConfigWire`, `ConfigChangeWire`, `DropTopic`/`AlterTopicConfig`/`DropView`/`AlterView`/`DdlResponse`, `kCatalogTopicId`, `kClientVersionCatalog` (Task 4) by 5, 9, 12, 13, 15; `kCatalogTopicId` (broker, Task 6) equals the protocol constant; `CatalogApplier`, `CatalogEffects`, `CatalogCheckpoint` (Task 7) by 8, 9, 16, 20; the `kA2c*` ids 5–11 and `kMsg*` ids 10–16 are assigned once (Tasks 6, 7, 8, 9, 12) with no reuse; `CatalogRole` variants, `InFlight{Idle, AwaitingCommit}`, `DdlRequest`, `DdlMeta`, `answeredCount()` (Task 9) by 10, 11, 20, 21; `CatalogRoute` (Task 11) by 20; `CatalogReadServer` (Task 12) by 20, 23; `TestCluster::defineTopic(TopicSpec)` / `(name, partitions)` (Task 17) by 18, 23; `cmatrix::{Kind, Via, Persist, Entity, Timing, Outcome, expect, naRule, conflictCode, name}` (Task 20) by 21, 22, 24.
+- **Type consistency:** `rune::protocol::{TopicConfig, TopicConfigView, convertTopicConfig, RequestId, RequestIdHash}` (Task 1, `CatalogTypes.h` — F32/F14) by Tasks 2, 4, 5, 9, 14, 15, 20–22; `rune::catalog::{EventKind, CatalogEvent, Ops, CreateTopicOps…DropViewOps, ResolvedAlterOp, TopicConfig, RequestId, ConfigKey, ConfigChange, SchemaDef, ViewDef, Principal, ReplayedFrom, DecodeError, encode, encodeInto, decode, kindOf}` (Task 1) are used unchanged by Tasks 2, 3, 7, 9, 13, 15; `CatalogState`, `RequestRecord`, `Applied`, `ApplyError`, `apply`, `previewFingerprint`, `fingerprintOf`, `digest()`, `resolveAlterOps`, `unresolveAlterOps` (Task 2) by 3, 7, 9, 13, 15, 20, 21; `CatalogReplayer`, `RecordedEvent`, `history`, `stateAsOf`, `AsOf`, `HistoryFilter`, `diff`, `DiffEntry`, `ReplayError`, `describe`, `readRcat`/`writeRcat*`, `testing::goldenScriptV1` (Task 3) by 13, 15; protocol `DdlExtension`, `TopicConfigWire`, `ConfigChangeWire`, `DropTopic`/`AlterTopicConfig`/`DropView`/`AlterView`/`DdlResponse`, `kCatalogTopicId`, `kClientVersionCatalog` (Task 4) by 5, 9, 12, 13, 15; `kCatalogTopicId` (broker, Task 6) equals the protocol constant; `CatalogApplier` (+ `BootEffects` / `LiveEffects`, `goLive`, `lastApplied`), `CatalogEffects` (+ `SinkSpec`), `CatalogCheckpoint`, `CatalogRig` (Task 7) by 8, 9, 16, 20; the `kA2c*` ids 5–11 and `kMsg*` ids 10–16 are assigned once (Tasks 6, 7, 8, 9, 12) with no reuse; `CatalogRole` variants, `InFlight{Idle, AwaitingCommit}`, `DdlRequest`, `DdlMeta`, `answeredCount()` (Task 9) by 10, 11, 20, 21; `CatalogRoute` (Task 11) by 20; `CatalogReadServer` (Task 12) by 20, 23; `TestCluster::defineTopic(TopicSpec)` / `(name, partitions)` (Task 17) by 18; `OneBroker` (Task 11, `libs/node/tests/client/OneBroker.h`) by 13, 15; `ThreeNodes` (Task 6, moved to `support/ThreeNodes.h` in Task 22) by 22; `ql::parseScript` (Task 14) by 15, 19, 24; `cmatrix::{Kind, Via, Persist, Entity, Timing, Outcome, ExpectedCodes, expect, expectedCodes, naRule, conflictCode, name}` (Task 20) by 21, 22, 24.
 - **Review Focus:** each of the six has its named test in the owning task (Tasks 9 + 11 + 20 + 21; 7 + 20; 8 + 20; 8 + 20; 7 + 11 + 16 + 20; 12).
-- **Philosophy:** shared-nothing — admin owns the catalog replica / state / registries, control owns TopicRegistry / placement, the gateway reads a control-owned `CatalogRoute`, the cleaner gets overrides on its own ring, the client's record handler only feeds an SPSC ring; rings only — every new hop is a typed message on an existing SPSC ring (no new thread, no callback across threads); per-state variables — `CatalogRole`, `InFlight`, `CatalogApplier::{Applying, Halted}`, `TopicState`, `PendingCreateBehindDrop`, `CatalogRoute`; zero allocation — hot path untouched and re-measured (Task 23), idle applier / read server / admin pass proven allocation-free (Tasks 7, 12, 23); test + benchmark — every task has its tests, Tasks 3 and 23 benchmark; regression naming — every test of a fix is `*Regression*`; fix-on-sight — listed in Global Constraints rule 8, each with its task.
+- **Philosophy:** shared-nothing — admin owns the catalog replica / state / registries, control owns TopicRegistry / placement, the gateway reads a control-owned `CatalogRoute`, the cleaner gets overrides on its own ring, the client's record handler only feeds an SPSC ring; rings only — every new hop is a typed message on an existing SPSC ring (no new thread, no callback across threads); per-state variables — `CatalogRole`, `InFlight`, `CatalogApplier::{Applying, Halted}` + `{AwaitingBoot, Booted, Live}`, `CatalogReadServer::{Backlog, Live}`, the client's `DdlRetry`, `TopicState`, `PendingCreateBehindDrop`, `CatalogRoute`; zero allocation — hot path untouched and re-measured (Task 23, the existing `HotPathBRig.h` / `TransientRig.h` alloc gates), idle applier / read server / admin pass proven allocation-free in their own binary with the repo's `operator new` replacement pattern (Tasks 7, 12, 23); test + benchmark — every task has its tests, Tasks 3 and 23 benchmark; regression naming — every test of a fix is `*Regression*`; fix-on-sight — listed in Global Constraints rule 8, each with its task.
 
 ## Execution handoff
 

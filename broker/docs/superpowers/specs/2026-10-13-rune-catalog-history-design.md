@@ -5,9 +5,12 @@
 **Repos:**
 - rune-broker: the catalog log, AdminWorker, apply, bootstrap, and the removal of `RUNE_TOPICS`.
 - rune-protocol: DDL Redirect, and the reads, which use the existing Subscribe.
-- rune-client-cpp: the history / as-of / diff API and the shared replay library.
+- rune-codec: the shared replay library (`rune_catalog`), which the broker, the client and the CLI all compile from source.
+- rune-client-cpp: the history / as-of / diff API over the shared replay library.
 - rune-ql: `SHOW HISTORY`, `AS OF`, `DIFF`.
 - The `rune` CLI: `catalog export | replay | diff`.
+
+*Amended 2026-10-13 (pre-flight): the shared replay library lives in rune-codec, not rune-client-cpp (ruling F21).*
 
 ## 1. Goal
 
@@ -59,10 +62,12 @@ Each event is one record in `__catalog`. Its encoding is fixed-layout and versio
 | `ops` | The parsed, resolved operations, for example field names resolved to durable tags. |
 | `principal` | Who issued it. Until authentication exists: session id, client name and source address. Afterwards: the authenticated principal, in the same field. |
 | `replayedFrom` | Set only on events written by `rune catalog replay`: the source cluster's id, offset and original principal. |
-| `timestampMs` i64 | The leader's wall clock at commit. Informational only; the **offset** is the order. |
+| `timestampMs` i64 | The leader's wall clock when it appends the event (the commit time is not known before the append, and the event is immutable). Informational only; the **offset** is the order. |
 | `fingerprint` u64 | A fingerprint of the object's **resulting state**. The resulting state itself is NOT stored. |
 
 **Drops** are events. A dropped name may be reused, but the new object gets a new `objectId`, so history never conflates the two.
+
+*Amended 2026-10-13 (pre-flight): `timestampMs` is stamped at append, not at commit (ruling F22).*
 
 ## 5. Write path, serialization, apply
 
@@ -129,7 +134,9 @@ When `__catalog` has fewer than minIsr in-sync replicas:
 
 ## 7. Reads
 
-`__catalog` is a topic. Reads are **client-side**: the client consumes it, with the existing Subscribe from offset 0, and replays it with the shared library. No broker read path is needed. Access control comes later with multi-tenancy ACLs.
+`__catalog` is a topic. Reads are **client-side**: the client consumes it, with the existing Subscribe from offset 0, and replays it with the shared library. The broker only serves that existing Subscribe for the internal topic id (−6) from its replica, which is transport, not a special read API; no broker-side query, history or replay path exists. Access control comes later with multi-tenancy ACLs.
+
+*Amended 2026-10-13 (pre-flight): the broker serves the existing Subscribe on `__catalog`; replay stays client-side (ruling F19).*
 
 | Need | QL / console | Client API |
 |---|---|---|
