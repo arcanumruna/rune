@@ -13,7 +13,10 @@
 //   key   = groupLen(uint16) + group(bytes) + topicLen(uint16) + topic(bytes)
 //           + partition(int32)                                  [total: variable]
 //   value = offset(int64) + tsNs(int64) + metaLen(uint16) + meta(bytes)
-//           [total: 18 + metaLen bytes]
+//           [ + lineage(uint64) — E2 final fix wave C1: only when non-zero (a
+//             TRANSIENT partition's data lineage); older records lack it (0)
+//             and older readers ignore the trailing bytes ]
+//           [total: 18 + metaLen (+ 8) bytes]
 //
 // Allocation behavior:
 //   commit(): CG-2's own encoding path is close-to-zero-alloc.  The key_bytes
@@ -72,11 +75,15 @@ public:
     ///
     /// Kafka semantics: a later commit with a LOWER offset is allowed and
     /// replaces the previous entry.
+    /// `lineage` (C1): the transient partition's data lineage the offset is a
+    /// position in (0 = none: a disk partition — the record is byte-identical
+    /// to before).
     bool commit(const GroupId&        group,
                 const TopicPartition& tp,
                 Offset                offset,
                 std::string_view      metadata,
-                int64_t               tsNs);
+                int64_t               tsNs,
+                uint64_t              lineage = 0);
 
     // -----------------------------------------------------------------------
     // Read path (cold — O(1) or O(n) over the group's partitions).
@@ -125,7 +132,7 @@ private:
     void encodeKey(const GroupId& group, const TopicPartition& tp);
 
     /// Encode (offset, tsNs, metadata) → valScratch_.
-    void encodeVal(Offset offset, int64_t tsNs, std::string_view metadata);
+    void encodeVal(Offset offset, int64_t tsNs, std::string_view metadata, uint64_t lineage = 0);
 
     /// Apply one decoded record to the in-memory map (last-write-wins).
     void applyRecord(std::string_view key, std::string_view val);

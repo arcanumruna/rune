@@ -49,6 +49,10 @@
 #         u200 AbsentKey; then o3 5->25 (a PRE-restart contributor) ->
 #         u100 = {3, 105, 35} — proves the contributor map survived (a lost
 #         map would give n 4, total 110).
+#   GROUP LEGS (E2 final fix wave C1, GroupConsume x Restart): RUNE_MODE=
+#   group_commit after RUN 1 (a consumer group commits presence_t's end) and
+#   RUNE_MODE=group_restart after RUN 2 (the same group delivers every record of
+#   the refilled ring, exactly once — never resuming at the old position).
 #     (e) presence_t exists after the restart (TopicExists, same id) and is
 #         empty (first produce at offset 0; subscribe + read_committed see 1).
 #     Prints "VIEW-ENGINE-E2E: OK" on success.
@@ -308,10 +312,11 @@ VIEW_ORDER_TOPIC_ID="$(extract VIEW_ORDER_TOPIC_ID)"
 VIEW_TOPIC_ID_AGG="$(extract VIEW_TOPIC_ID_AGG)"
 VIEW_FP_AGG="$(extract VIEW_FP_AGG)"
 VIEW_TT_TOPIC_ID="$(extract VIEW_TT_TOPIC_ID)"
+VIEW_TT_END="$(extract VIEW_TT_END)"
 
 for v in VIEW_SRC_TOPIC_ID VIEW_TOPIC_ID_PERSISTED VIEW_FP_PERSISTED \
          VIEW_TOPIC_ID_TRANSIENT VIEW_FP_TRANSIENT VIEW_KEY_ID VIEW_HP_INITIAL \
-         VIEW_ORDER_TOPIC_ID VIEW_TOPIC_ID_AGG VIEW_FP_AGG VIEW_TT_TOPIC_ID; do
+         VIEW_ORDER_TOPIC_ID VIEW_TOPIC_ID_AGG VIEW_FP_AGG VIEW_TT_TOPIC_ID VIEW_TT_END; do
     [ -n "${!v:-}" ] || fail "setup output did not carry ${v}= (handoff parse failed)"
 done
 log "Setup OK: srcTopicId=${VIEW_SRC_TOPIC_ID}" \
@@ -325,6 +330,20 @@ log "Setup OK: srcTopicId=${VIEW_SRC_TOPIC_ID}" \
 echo "${setup_out}" | grep -q "^TYPED-ROUTING: OK" \
     || fail "setup client did not print 'TYPED-ROUTING: OK' (typed topics must route by key)"
 log "Typed routing OK: $(echo "${setup_out}" | grep -E '^TYPED-ROUTING: OK' | tail -1)"
+
+# E2 final fix wave (C1) — GroupConsume x Restart, part 1: a consumer group
+# consumes presence_t to its end and COMMITS that position (offset
+# ${VIEW_TT_END}) before the restart.  Part 2 runs after verify_restart.
+log "Step 4a: group_commit — a consumer group commits presence_t's end (${VIEW_TT_END})..."
+set +e
+group_commit_out=$(run_client group_commit \
+    -e RUNE_VIEW_TT_TOPIC_ID="${VIEW_TT_TOPIC_ID}" -e RUNE_VIEW_TT_END="${VIEW_TT_END}" 2>&1)
+group_commit_rc=$?
+set -e
+echo "${group_commit_out}" >&2
+[ "${group_commit_rc}" -eq 0 ] || fail "group_commit client exited non-zero (${group_commit_rc})"
+echo "${group_commit_out}" | grep -q "^GROUP-COMMIT: OK committed=${VIEW_TT_END}" \
+    || fail "group_commit did not commit presence_t's end (${VIEW_TT_END})"
 
 # ---------------------------------------------------------------------------
 # The CREATE path above (define -> createView x2 -> produce -> getViewRow x2 OK)
@@ -481,6 +500,23 @@ if ! echo "${restart_out}" | grep -q "VIEW-ENGINE-E2E: OK"; then
 fi
 
 # ---------------------------------------------------------------------------
+# Step 7a (E2 final fix wave C1) — GroupConsume x Restart, part 2: the ring
+# restarted empty and now holds fewer records than the group committed before
+# the restart.  The SAME group must deliver every post-restart record — the
+# client-visible check (a committed offset of the ring's previous life used to
+# be resumed: the member dropped the refilled records as "duplicates").
+# ---------------------------------------------------------------------------
+log "Step 7a: group_restart — the group delivers every post-restart presence_t record..."
+set +e
+group_restart_out=$(run_client group_restart -e RUNE_VIEW_TT_TOPIC_ID="${VIEW_TT_TOPIC_ID}" 2>&1)
+group_restart_rc=$?
+set -e
+echo "${group_restart_out}" >&2
+[ "${group_restart_rc}" -eq 0 ] || fail "group_restart client exited non-zero (${group_restart_rc})"
+echo "${group_restart_out}" | grep -q "^GROUP-RESTART: OK" \
+    || fail "group_restart did not deliver the post-restart records (GroupConsume x Restart)"
+
+# ---------------------------------------------------------------------------
 # Step 7b (DDL conformance): the catalog is identical after the restart.
 # ---------------------------------------------------------------------------
 catalog_after="$(dump_catalog)" || fail "catalog dump (post-restart) failed"
@@ -525,5 +561,6 @@ log "  -> typed_route: 8-partition typed topic routed by key (Phase 2b C)"
 log "  -> DDL conformance: alter on a view = 38; two racing clients, exactly one"
 log "     winner per leg (topic 25, view 32, mixed 25); catalog identical across restart"
 log "  -> transient topic presence_t: produce (None/Leader/All) + subscribe (earliest/offset/latest) + read_committed (commit+abort); restart -> exists (TopicExists, same id) and empty (first offset 0)"
+log "  -> GroupConsume x Restart: a group committed presence_t's end (${VIEW_TT_END}); after the restart it delivered every refilled record exactly once"
 log "  VIEW-ENGINE-E2E: OK, exit 0."
 log "========================================"

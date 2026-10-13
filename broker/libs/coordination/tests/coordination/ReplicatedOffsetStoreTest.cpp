@@ -254,6 +254,34 @@ TEST_F(ReplicatedOffsetStoreTest, RebuildFromLogReconstructsState) {
 }
 
 // ===========================================================================
+// E2 final fix wave (C1): a TRANSIENT partition's committed offset carries the
+// data lineage it is a position of — persisted with the commit and replayed by
+// rebuildFromLog (the coordinator answers "no committed offset" once that
+// lineage ended).  A lineage-0 commit (a disk partition) is byte-identical to
+// before and replays as 0.  RED: the lineage was neither stored nor replayed.
+// ===========================================================================
+TEST_F(ReplicatedOffsetStoreTest, TransientLineageIsPersistedAndReplayedRegression) {
+    constexpr uint64_t kLineage = 0xA5A5'1234'0000'0001ull;
+    ASSERT_TRUE(store_->commit("grp1", tp("presence", 0), 5000, "m", 1'000, kLineage));
+    ASSERT_TRUE(store_->commit("grp1", tp("orders", 0), 70, "m", 2'000));   // disk: no lineage
+    ASSERT_TRUE(pumpHW(2));
+    ASSERT_EQ(store_->fetch("grp1", tp("presence", 0))->lineage, kLineage);
+    ASSERT_EQ(store_->fetch("grp1", tp("orders", 0))->lineage, 0u);
+
+    ReplicatedOffsetStore rebuilt(replica_.get());
+    ASSERT_TRUE(rebuilt.rebuildFromLog());
+    const auto t = rebuilt.fetch("grp1", tp("presence", 0));
+    ASSERT_TRUE(t.has_value());
+    EXPECT_EQ(t->offset, 5000);
+    EXPECT_EQ(t->lineage, kLineage) << "the lineage stamp did not survive the replay";
+    const auto d = rebuilt.fetch("grp1", tp("orders", 0));
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->offset, 70);
+    EXPECT_EQ(d->lineage, 0u);
+    EXPECT_EQ(d->metadata, "m") << "the disk record's metadata is intact";
+}
+
+// ===========================================================================
 // 6b. rebuildFromLog is a RETRYABLE no-op while HW==0  [CP-5.2 cold-restart fix]
 //
 // On a cold cluster restart a node becomes coordinator with the __consumer_offsets

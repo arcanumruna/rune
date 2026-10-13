@@ -1089,6 +1089,15 @@ private:
     // Configuration (immutable after construction)
     // -----------------------------------------------------------------------
     NodeConfig config_;
+    /// E2 final fix wave (C1): this process's transient data lineage — a random
+    /// non-zero token drawn at construction.  On a SINGLE-NODE broker every
+    /// transient partition's ring lives exactly as long as this process, so it
+    /// IS the partitions' data lineage (GroupCoordinationService stamps
+    /// committed offsets with it and answers "none" for an offset of an earlier
+    /// process).  Multi-node: 0 (the lineage of a replicated ring is not known
+    /// to the coordinator — no stamp, no check; see the E2 final-fix report).
+    uint64_t transientLineage_ = 0;
+    static uint64_t transientLineageTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept;
 
     // Task 9 (RUNE_TLS SIGHUP reload): the trigger-only cross-thread ring —
     // requestTlsCertReload() (any thread) offers kTlsReloadTrigger;

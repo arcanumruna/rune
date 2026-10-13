@@ -699,6 +699,67 @@ TEST_F(CG3ServiceTest, OffsetCommitAndFetchRoundTrip) {
     EXPECT_EQ(ofResp->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
 }
 
+// E2 final fix wave (C1): a TRANSIENT partition's committed offset is a data
+// position of one ring lineage.  The cluster restarts (here: the coordinator is
+// rebuilt from the replicated log with a NEW current lineage) and the ring is
+// empty, refilling from offset 0: OffsetFetch must answer "no committed offset"
+// (-1) — the member then applies its reset policy — instead of the old 5000
+// (the member would drop the first 5000 post-restart records as duplicates).
+// A partition with no lineage (a disk partition: provider 0) keeps its offset.
+// RED: the restarted coordinator answered 5000.
+namespace {
+uint64_t g_lineage = 0;
+uint64_t testLineage(void*, int32_t /*topicId*/, int32_t partition) noexcept {
+    return partition == 0 ? g_lineage : 0;   // partition 0 transient, partition 1 "disk"
+}
+}  // namespace
+
+TEST_F(CG3ServiceTest, TransientCommittedOffsetOfAnEndedLineageIsAnsweredAsNoneRegression) {
+    const std::string groupId = "g-transient";
+    g_lineage = 0x1111;
+    service_->setTransientLineage(&testLineage, nullptr);
+    auto jLen = encodeJoinGroup(req_, 1, 950, groupId, "", 5000);
+    auto jOut = service_->handleJoinGroup(req_, jLen, clock_, out_, kBufSize);
+    auto jResp = pc::JoinGroupResponse::decode(out_, jOut);
+    ASSERT_TRUE(jResp.has_value());
+    const std::string memberId(reinterpret_cast<const char*>(jResp->memberId.data()), jResp->memberId.size());
+    for (int32_t p : {0, 1}) {
+        auto ocLen = encodeOffsetCommit(req_, 1, 951 + p, groupId, memberId, jResp->generationId, kTestTopicId,
+                                        p, p == 0 ? 5000 : 70, "m");
+        auto ocOut = service_->handleOffsetCommit(req_, ocLen, clock_, out_, kBufSize);
+        auto ocResp = pc::OffsetCommitResponse::decode(out_, ocOut);
+        ASSERT_TRUE(ocResp.has_value());
+        ASSERT_EQ(ocResp->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::OK));
+    }
+    ASSERT_TRUE(pumpHW(2));
+    auto fetch = [&](GroupCoordinationService& svc, int32_t p) {
+        auto ofLen = encodeOffsetFetch(req_, 1, 960, groupId, kTestTopicId, p);
+        auto ofOut = svc.handleOffsetFetch(req_, ofLen, clock_, out_, kBufSize);
+        auto r = pc::OffsetFetchResponse::decode(out_, ofOut);
+        EXPECT_TRUE(r.has_value());
+        return r.has_value() && !r->results.empty() ? r->results[0].offset : int64_t{-99};
+    };
+    EXPECT_EQ(fetch(*service_, 0), 5000) << "the live lineage's offset is answered";
+
+    // A full restart: the coordinator replays the log; the ring lineage is new.
+    ReplicatedOffsetStore replayed(replica_.get());
+    ASSERT_TRUE(replayed.rebuildFromLog());
+    GroupCoordinationService restarted(&replayed, registry_.get(), [] { return true; }, [] { return NodeId{1}; });
+    g_lineage = 0x2222;
+    restarted.setTransientLineage(&testLineage, nullptr);
+    EXPECT_EQ(fetch(restarted, 0), -1)
+        << "SILENT LOSS: an offset of the ring's previous life was answered after the restart";
+    EXPECT_EQ(fetch(restarted, 1), 70) << "a partition without a lineage (disk) lost its committed offset";
+    // The fetch-all form omits it (as if never committed).
+    auto allLen = encodeOffsetFetchAll(req_, 1, 961, groupId);
+    auto allOut = restarted.handleOffsetFetch(req_, allLen, clock_, out_, kBufSize);
+    auto all = pc::OffsetFetchResponse::decode(out_, allOut);
+    ASSERT_TRUE(all.has_value());
+    for (const auto& r : all->results)
+        EXPECT_FALSE(r.topicId == kTestTopicId && r.partition == 0) << "fetch-all answered the ended lineage's offset";
+    EXPECT_EQ(restarted.staleLineageOffsets(), 2u);
+}
+
 // 11. OffsetCommit wrong gen → IllegalGeneration.
 TEST_F(CG3ServiceTest, OffsetCommitWrongGenerationReturnsIllegalGeneration) {
     std::string groupId = "g-illegalgen";

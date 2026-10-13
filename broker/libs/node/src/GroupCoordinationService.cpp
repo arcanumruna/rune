@@ -705,6 +705,23 @@ void GroupCoordinationService::evictSessionMembers(int64_t sessionId, int64_t no
 }
 
 // ---------------------------------------------------------------------------
+// E2 final fix wave (C1): a transient partition's committed offset is a
+// position of ONE data lineage — answered only while that lineage lives.
+// ---------------------------------------------------------------------------
+bool GroupCoordinationService::staleLineage_(const rune::coordination::CommittedOffset& co, int32_t topicId,
+                                             int32_t partition)
+{
+    const uint64_t now = lineageOf_(topicId, partition);
+    if (now == 0 || co.lineage == now) return false;   // unknown / not transient, or the same lineage
+    if ((staleLineageOffsets_++ & 1023u) == 0)
+        spdlog::info("GroupCoordinationService: committed offset {} of transient topicId={} partition={} "
+                     "belongs to data that did not survive (lineage {:#x}, now {:#x}) — answered as no "
+                     "committed offset; the member applies its reset policy ({} so far)",
+                     co.offset, topicId, partition, co.lineage, now, staleLineageOffsets_);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // handleOffsetCommit (templateId 40)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleOffsetCommit(
@@ -803,7 +820,8 @@ size_t GroupCoordinationService::handleOffsetCommit(
         const std::string_view meta(
             reinterpret_cast<const char*>(e.metadata.data()), e.metadata.size());
 
-        const bool committed = offsets_->commit(groupIdStr, tp, e.offset, meta, nowNs);
+        const bool committed = offsets_->commit(groupIdStr, tp, e.offset, meta, nowNs,
+                                                lineageOf_(e.topicId, e.partition));   // C1
         r.errorCode = committed ? static_cast<int16_t>(pc::ErrorCode::OK)
                                 : static_cast<int16_t>(pc::ErrorCode::MinIsrViolation);
         commitResultScratch_.push_back(r);
@@ -898,6 +916,7 @@ size_t GroupCoordinationService::handleOffsetFetch(
                 if (opt) topicId = *opt;
             }
             if (topicId < 0) continue; // unknown topic — skip
+            if (staleLineage_(co, topicId, tp.partition)) continue;   // C1: as if never committed
 
             pc::OffsetFetchResult r;
             r.topicId   = topicId;
@@ -930,7 +949,8 @@ size_t GroupCoordinationService::handleOffsetFetch(
             } else {
                 const coord::TopicPartition tp{topicName, e.partition};
                 const auto co = offsets_->fetch(groupIdStr, tp);
-                r.offset = co.has_value() ? co->offset : int64_t{-1};
+                r.offset = co.has_value() && !staleLineage_(*co, e.topicId, e.partition) ? co->offset
+                                                                                         : int64_t{-1};
             }
             fetchResultScratch_.push_back(r);
         }

@@ -2180,6 +2180,14 @@ void BrokerNode::buildGateway() {
             // Wire both directions.
             gateway_->setGroupService(groupCoordService_.get());
             groupCoordService_->setGateway(gateway_.get());
+            // E2 final fix wave (C1): committed offsets of transient partitions
+            // are positions of THIS process's rings (single node) — an offset
+            // replayed from an earlier process is answered as none.
+            if (transientLineage_ == 0) {
+                std::random_device rd;
+                transientLineage_ = ((static_cast<uint64_t>(rd()) << 32) ^ rd()) | 1u;
+            }
+            groupCoordService_->setTransientLineage(&BrokerNode::transientLineageTrampoline_, this);
 
             spdlog::info("BrokerNode[{}]: GroupCoordinationService wired (offsets at {})",
                          nodeId, offsetDir.string());
@@ -4254,6 +4262,15 @@ void BrokerNode::teardownShardRuntimes_() noexcept {
         }
     }
     shardDrivers_.clear();
+}
+
+uint64_t BrokerNode::transientLineageTrampoline_(void* ctx, int32_t topicId, int32_t partition) noexcept {
+    // E2 final fix wave (C1).  Control thread (the group handlers run there).
+    (void)partition;
+    auto* self = static_cast<BrokerNode*>(ctx);
+    if (!self->config_.isSingleNode() || self->topicRegistry_ == nullptr) return 0;
+    const TopicSpec* spec = self->topicRegistry_->topic(topicId);
+    return spec != nullptr && spec->persistence == PersistenceMode::Transient ? self->transientLineage_ : 0;
 }
 
 } // namespace rune::node

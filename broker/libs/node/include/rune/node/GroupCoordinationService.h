@@ -118,6 +118,24 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // E2 final fix wave (C1): committed offsets of TRANSIENT partitions are data
+    // positions, and transient data does not survive its ring.  The lineage
+    // provider answers the CURRENT data lineage of (topicId, partition) — a
+    // non-zero token that changes exactly when the partition's ring data did not
+    // survive (a restart) — or 0 when unknown / not transient (no stamp, no
+    // check: the historical behaviour).  OffsetCommit stamps each entry with it;
+    // OffsetFetch answers "no committed offset" (-1 — the member applies its
+    // reset policy) for an entry whose stamp differs from the current lineage,
+    // so a member never resumes a refilled ring at a position of the old data
+    // (silent loss of the first records after a restart).  A plain function
+    // pointer + context (no allocation, no std::function on the commit path).
+    // -----------------------------------------------------------------------
+    using TransientLineageFn = uint64_t (*)(void* ctx, int32_t topicId, int32_t partition) noexcept;
+    void setTransientLineage(TransientLineageFn fn, void* ctx) noexcept { lineageFn_ = fn; lineageCtx_ = ctx; }
+    /// Committed offsets answered "none" because their lineage ended (C1).
+    [[nodiscard]] uint64_t staleLineageOffsets() const noexcept { return staleLineageOffsets_; }
+
+    // -----------------------------------------------------------------------
     // isLocalCoordinator — true when this node is the cluster leader.
     // v1 seam: all groups are coordinated by the cluster leader.
     // Milestone-D will add per-group routing.
@@ -228,6 +246,16 @@ private:
 
     // CG-4: ClientGateway — non-owning; may be null (tests without push subs).
     rune::gateway::ClientGateway*              gateway_ = nullptr;
+
+    // C1: see setTransientLineage().
+    TransientLineageFn lineageFn_  = nullptr;
+    void*              lineageCtx_ = nullptr;
+    uint64_t           staleLineageOffsets_ = 0;
+    [[nodiscard]] uint64_t lineageOf_(int32_t topicId, int32_t partition) const noexcept {
+        return lineageFn_ != nullptr ? lineageFn_(lineageCtx_, topicId, partition) : 0;
+    }
+    /// The committed offset is a position of an ended lineage (C1): answer none.
+    bool staleLineage_(const rune::coordination::CommittedOffset& co, int32_t topicId, int32_t partition);
 
     /// Per-group coordinators.  Inserted lazily on first Join.
     /// std::map with std::less<> (transparent comparator) so hot-path find()
