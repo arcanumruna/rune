@@ -197,8 +197,9 @@ before a produce is acknowledged but is **never written to disk**.
     a member fetched the old offset in the moment between a crash and its detection. A node that the
     failure detector finds dead no longer vouches for a lineage.
   - Topics take an optional replication factor: `RUNE_TOPICS=name:partitions:rf=N` (default: every
-    node). A transient topic with `rf=1` loses its data whenever its node stops; keep the cluster's
-    minimum in-sync replicas at or below `rf`.
+    node). A transient topic with `rf=1` loses its data whenever its node stops. `rf` must be at most
+    the node count and at least `RUNE_MIN_ISR`; anything else is a startup error that names the
+    constraint.
   - **Subscriptions follow a leader move.** When a node stops serving a subscription (it lost
     leadership of a `read_committed` partition, or the partition's replica moved off it), it answers
     the subscription instead of going silent. A client of this release resumes from its position on

@@ -866,6 +866,17 @@ ConfigResult parseNodeConfig(
                         const long v = std::strtol(kv.c_str(), &endp, 10);
                         if (endp == kv.c_str() || *endp != '\0' || v < 1 || v > 255)
                             return {{}, std::string("RUNE_TOPICS rf must be an integer 1..255, got: ") + escapeNameForLog(kval) + " in entry: " + escapeNameForLog(entry)};
+                        // E2 residual round 6 (F2): fail fast, naming the constraint —
+                        // never silently clamp (Kafka INVALID_REPLICATION_FACTOR) or
+                        // accept a factor no acks=All produce / offset commit can meet.
+                        const long nodes = static_cast<long>(std::max<std::size_t>(1, cfg.peers.size()));
+                        if (v > nodes)
+                            return {{}, "RUNE_TOPICS rf (" + std::to_string(v) + ") must be <= the node count (" +
+                                            std::to_string(nodes) + ") in entry: " + escapeNameForLog(entry)};
+                        if (v < cfg.gatewayMinIsr)
+                            return {{}, "RUNE_TOPICS rf (" + std::to_string(v) + ") must be >= RUNE_MIN_ISR (" +
+                                            std::to_string(cfg.gatewayMinIsr) + ") in entry: " +
+                                            escapeNameForLog(entry) + " — a smaller factor can never satisfy acks=all"};
                         ts.replicationFactor = static_cast<int16_t>(v);
                     } else if (klower == "persistence") {
                         std::string vlow(kval);
