@@ -29,9 +29,9 @@
 //   RejoinAfterRestart_PreferredLeaderMoveBack
 //   NoIsrSurvivor_GoesNoLeaderAndRecoversOnUnfence
 //   TwoNodeLoss_FenceOneAtATime
-//   MemoryTopic_HandoffKeepsDataWhenReplicaSurvives
-//   MemoryTopic_DataGoneWhenNoneSurvive
-//   MemoryTopic_AllInSyncFollowerCatchUpFromLeaderRing
+//   TransientTopic_HandoffKeepsDataWhenReplicaSurvives
+//   TransientTopic_DataGoneWhenNoneSurvive
+//   TransientTopic_AllInSyncFollowerCatchUpFromLeaderRing
 //
 // All waits are bounded (kDriverCap + ASSERT_TRUE << "stalled…").  No busy-spin.
 // ---------------------------------------------------------------------------
@@ -720,7 +720,7 @@ TEST(RebalanceFailover, TwoNodeLoss_FenceOneAtATime) {
 // (InMemoryLog-backed partition; a survivor holds the committed ring → the new
 // leader serves it.)
 // ---------------------------------------------------------------------------
-TEST(RebalanceFailover, MemoryTopic_HandoffKeepsDataWhenReplicaSurvives) {
+TEST(RebalanceFailover, TransientTopic_HandoffKeepsDataWhenReplicaSurvives) {
     constexpr int32_t kTopic = 120, kPart = 0;
     const std::vector<NodeId> all = {1, 2, 3};
 
@@ -773,7 +773,7 @@ TEST(RebalanceFailover, MemoryTopic_HandoffKeepsDataWhenReplicaSurvives) {
 // A fresh in-memory replica set (all "restarted") has no committed data — the
 // contract is that memory topics do NOT survive a full-replica-set loss.
 // ---------------------------------------------------------------------------
-TEST(RebalanceFailover, MemoryTopic_DataGoneWhenNoneSurvive) {
+TEST(RebalanceFailover, TransientTopic_DataGoneWhenNoneSurvive) {
     constexpr int32_t kTopic = 130, kPart = 0;
     const std::vector<NodeId> all = {1, 2, 3};
 
@@ -816,7 +816,7 @@ TEST(RebalanceFailover, MemoryTopic_DataGoneWhenNoneSurvive) {
 // Memory-topic all-in-sync: a bounded-ring follower catches up from the leader's
 // in-memory ring (AllInSync → every replica must be in sync).
 // ---------------------------------------------------------------------------
-TEST(RebalanceFailover, MemoryTopic_AllInSyncFollowerCatchUpFromLeaderRing) {
+TEST(RebalanceFailover, TransientTopic_AllInSyncFollowerCatchUpFromLeaderRing) {
     constexpr int32_t kTopic = 140, kPart = 0;
     const std::vector<NodeId> all = {1, 2, 3};
 
@@ -853,4 +853,39 @@ TEST(RebalanceFailover, MemoryTopic_AllInSyncFollowerCatchUpFromLeaderRing) {
         << "AllInSync: HW == LEO only after every replica caught up from the ring";
     EXPECT_GE(r2.logEndOffset(), leo);
     EXPECT_GE(r3.logEndOffset(), leo);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b E (spec gate): a TRANSIENT (InMemoryLog) partition under acks=All is
+// replicated BEFORE ack — the leader's HW (the ack gate) does not move past
+// what every in-sync follower holds.
+// ---------------------------------------------------------------------------
+TEST(RebalanceFailoverRegression, TransientTopicAcksAllReplicatesBeforeAck) {
+    constexpr int32_t kTopic = 150, kPart = 0;
+    const std::vector<NodeId> all = {1, 2, 3};
+    rune::storage::InMemoryLog mem1(1 << 20, 4096), mem2(1 << 20, 4096), mem3(1 << 20, 4096);
+    InMemoryTransport transport;
+    auto cfg = [&](NodeId s) { return userCfg(s, kTopic, kPart, 3, DurabilityMode::AllInSync); };
+    PartitionReplica r1(cfg(1), Role::Leader,   1, all, all, &mem1, &transport);
+    PartitionReplica r2(cfg(2), Role::Follower, 1, all, all, &mem2, &transport);
+    PartitionReplica r3(cfg(3), Role::Follower, 1, all, all, &mem3, &transport);
+    transport.setLeader(&r1); transport.addFollower(2, &r2); transport.addFollower(3, &r3);
+    ASSERT_TRUE(r1.isMemoryBacked());
+
+    auto p = payload(0x77);
+    ASSERT_GE(r1.append(std::span<const uint8_t>(p.data(), p.size()), /*acksAll=*/true), 0);
+    const Offset leo = r1.logEndOffset();
+    EXPECT_LT(r1.highWatermark(), leo) << "no ack before any follower has the record";
+
+    int64_t clock = 0;
+    for (int i = 0; i < kDriverCap; ++i) {
+        clock += 1'000'000LL;
+        r1.doWork(clock); r2.doWork(clock); r3.doWork(clock);
+        transport.pump(clock);
+        // Invariant at EVERY step: the ack gate never runs ahead of the slowest ISR member.
+        ASSERT_LE(r1.highWatermark(), std::min(r2.logEndOffset(), r3.logEndOffset()))
+            << "HW (ack) advanced past a follower that does not hold the record";
+        if (r1.highWatermark() >= leo) break;
+    }
+    EXPECT_EQ(r1.highWatermark(), leo) << "stalled: all followers must catch up and HW reach LEO";
 }

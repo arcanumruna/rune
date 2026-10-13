@@ -979,6 +979,41 @@ public:
     /// disagreed with the RecordBatch header.
     [[nodiscard]] uint64_t identityMismatchRejects() const noexcept { return identityMismatchRejects_; }
     [[nodiscard]] uint64_t oversizeProduceRejectLogsForTest() const noexcept { return oversizeProduceRejectLogs_; }
+    /// No-hang wave: undecodable worker-ingress Produce frames answered InvalidRequest (worker thread).
+    [[nodiscard]] uint64_t undecodableProduceAnswers() const noexcept { return undecodableProduceAnswers_; }
+    [[nodiscard]] uint64_t undecodableProduceAnswersForTest() const noexcept { return undecodableProduceAnswers_; }
+
+    // No-hang fix round 4 (item 6): this worker's no-hang counters, logged by
+    // the worker ITSELF (its own thread — shared-nothing: no other thread ever
+    // reads them while it runs) every kNoHangStatsLogNs when any changed.
+    // The change detector compares the counters one by one (no signature).
+    struct NoHangStats {
+        uint64_t undecodableProduceAnswers   = 0;   // worker-ingress Produce answered InvalidRequest
+        uint64_t acksAllRefusedNoReservation = 0;   // gateway-routed acks=all refused (no reservation)
+        uint64_t sessionSignalsDeferred      = 0;   // session signals a full ring deferred
+        bool operator==(const NoHangStats&) const = default;
+    };
+    [[nodiscard]] NoHangStats noHangStats() const noexcept {
+        return NoHangStats{undecodableProduceAnswers_, acksAllRefusedNoReservation_, sessionSignalsDeferred_};
+    }
+    static constexpr int64_t kNoHangStatsLogNs = 10'000'000'000LL;   // 10 s
+    /// Logs the line when a counter changed since the last one; returns whether it logged.
+    bool logNoHangStatsIfChanged_(int64_t nowNs) {
+        nextNoHangStatsLogNs_ = nowNs + kNoHangStatsLogNs;
+        const NoHangStats nh = noHangStats();
+        if (nh == lastNoHangStats_) return false;
+        lastNoHangStats_ = nh;
+        spdlog::info("Worker {}: no-hang stats — worker-ingress Produce answered InvalidRequest={} "
+                     "acks=all refused (no reservation)={} session signals deferred={}", workerId_,
+                     nh.undecodableProduceAnswers, nh.acksAllRefusedNoReservation, nh.sessionSignalsDeferred);
+        return true;
+    }
+    bool logNoHangStatsForTest(int64_t nowNs) { return logNoHangStatsIfChanged_(nowNs); }
+    [[nodiscard]] int64_t nextNoHangStatsLogNsForTest() const noexcept { return nextNoHangStatsLogNs_; }
+    /// Test seam: one duty pass's periodic check exactly as doWork runs it.
+    bool maybeLogNoHangStatsForTest(int64_t nowNs) {
+        return nowNs >= nextNoHangStatsLogNs_ && logNoHangStatsIfChanged_(nowNs);
+    }
 
     /// Task 13 fix round 1 (C1a): ops that ride the session-lifecycle ring.
     [[nodiscard]] static constexpr bool isSessionLifecycleOp(WorkerOp::Type t) noexcept {
@@ -1496,6 +1531,9 @@ public:
         }
 
         passNowNs_ = nowNs;   // this pass's clock (acks=all deadlines on the op path)
+        // No-hang fix round 4 (item 6): this worker's counters, logged from its
+        // own thread on change — one compare per pass.
+        if (nowNs >= nextNoHangStatsLogNs_) [[unlikely]] (void)logNoHangStatsIfChanged_(nowNs);
         // Task 13 fix round 1 (C1a): session lifecycle first, in full, every
         // pass and every mode — never behind data ops or any backlog.
         work += drainSessionOps_();
@@ -5137,9 +5175,10 @@ private:
     // non-disruptive: runs right after rcAdvanceAll_(), only when a view set is
     // attached.  The read-committed bound is rc->lso(liveHw) — the SAME idiom
     // the push path uses (Worker.h ~2788-2793) — so a view never folds an
-    // uncommitted (open-txn) batch.  Phase 1: disk-backed sources only (the
-    // fold reads the committed log via readNoFault_ into the worker's push
-    // scratch, one pread, no page fault).  Returns the REAL progress count
+    // uncommitted (open-txn) batch.  Disk sources fold through readNoFault_ (one
+    // pread, no page fault); TRANSIENT sources (Phase 2b E) fold through the
+    // replica's InMemoryLog::readView (zero-copy, same thread) after
+    // WorkerViewSet::driveView_ / reconcileTransient_.  Returns the REAL progress count
     // (records folded + checkpoint deltas pushed/held across every driven
     // view) so the node's idle strategy never backs off while view work — a
     // fold that advanced, or a back-pressured delta still awaiting ring space —
@@ -5153,33 +5192,55 @@ private:
             // partition no installed view is interested in.
             if (!viewSet_->interestedIn(topicId)) continue;
             if (replica->role() != rune::replication::Role::Leader) continue;
-            if (!replica->isDiskBacked()) continue;  // Phase 1: committed disk log only
             const RcState* rcState = rcServe_(replica, rcOf_(replica));
             if (rcState == nullptr) continue;         // RC not Ready: fail closed, no bound
             const int64_t liveHw = replica->highWatermark();
             const int64_t bound  = rcState->lso(liveHw);
-            rune::storage::Log* log = replica->log();
-            if (log == nullptr) continue;
             const int32_t partition = static_cast<int32_t>(replica->partitionId());
-            auto readRange = [this, log](int64_t from, int64_t to) -> rune::storage::LogReadView {
-                return readNoFault_(log, from, kPushMaxChunkBytes, to);
-            };
-            // Task 19b (restart recovery): BEFORE the normal fold, for a worker
-            // that hosts any restart-recovery view, (1) materialize this owned
-            // (view, partition)'s instance from its on-disk checkpoint (once,
-            // cold — RebuildingViews + serve-guard, NOT a fresh Ready instance),
-            // then (2) driveRebuild the committed tail [foldCursor, bound) and
-            // flip RebuildingViews -> Ready once foldCursor >= bound (the T16
-            // readiness flip — driveFolds alone never raises readiness, so a
-            // recovered instance would otherwise stay NotReady forever).  Both
-            // are gated on hasRecovery(): a broker with no durable views runs
-            // this path not at all (unchanged).
-            if (viewSet_->hasRecovery()) [[unlikely]] {
-                viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
-                work += viewSet_->driveRebuild(topicId, partition, readRange, bound, nowNs);
+            if (replica->isDiskBacked()) {
+                rune::storage::Log* log = replica->log();
+                if (log == nullptr) continue;
+                auto readRange = [this, log](int64_t from, int64_t to) -> rune::storage::LogReadView {
+                    return readNoFault_(log, from, kPushMaxChunkBytes, to);
+                };
+                work += driveViewsOf_(topicId, partition, readRange, bound, nowNs, nullptr);
+            } else {
+                // Phase 2b E: a TRANSIENT source — zero-copy view into the
+                // replica's own ring (same thread).  The fold itself stops at its
+                // passBound, so the ring's view needs no upper bound.
+                rune::storage::InMemoryLog* mem = replica->memoryLog();
+                if (mem == nullptr) continue;
+                auto readRange = [mem](int64_t from, int64_t /*to*/) -> rune::storage::LogReadView {
+                    return mem->readView(from, kPushMaxChunkBytes);
+                };
+                work += driveViewsOf_(topicId, partition, readRange, bound, nowNs, mem);
             }
-            work += viewSet_->driveFolds(topicId, partition, readRange, bound, nowNs);
         }
+        return work;
+    }
+
+    // One owned source partition's view work.  Order matters: materialize a
+    // recovery instance from its checkpoint FIRST, then rebuild/fold.  For a
+    // TRANSIENT source the per-instance cursor reconcile happens INSIDE the fold
+    // (WorkerViewSet::driveView_) on the instance already held.
+    // Task 19b (restart recovery): materializeRecoveryInstancesFor + driveRebuild
+    // are gated on hasRecovery() — a broker with no durable views runs neither.
+    template <class ReadRangeFn>
+    int driveViewsOf_(int32_t topicId, int32_t partition, ReadRangeFn& readRange,
+                      int64_t bound, int64_t nowNs, rune::storage::InMemoryLog* transientSrc) {
+        int work = 0;
+        TransientBounds tb;
+        const TransientBounds* tbp = nullptr;
+        if (transientSrc != nullptr) {
+            tb.logStart = transientSrc->logStartOffset();
+            tb.logEnd   = transientSrc->logEndOffset();
+            tbp         = &tb;
+        }
+        if (viewSet_->hasRecovery()) [[unlikely]] {
+            viewSet_->materializeRecoveryInstancesFor(topicId, partition, bound);
+            work += viewSet_->driveRebuild(topicId, partition, readRange, bound, nowNs, tbp);
+        }
+        work += viewSet_->driveFolds(topicId, partition, readRange, bound, nowNs, tbp);
         return work;
     }
 
@@ -6313,11 +6374,10 @@ private:
     //
     // E5.1.3 review fixes applied here:
     //   #2: All error-code literals replaced with pc::ErrorCode enum values.
-    //   #3: acksAll derivation: acks != 0 (broader than gateway's acks == 1, but
-    //       safer — catches both acks=Leader (1) and any future all-in-sync flag).
-    //       Gateway uses acks == 1; we use acks != 0 here for defensive correctness:
-    //       the Produce wire field carries 0=NoAck, 1=Leader, -1=All; treating any
-    //       non-zero value as "acks requested" prevents silent false-durability.
+    //   #3: acksAll derivation.  The Produce wire acks byte is two-valued:
+    //       0 = Leader/None (immediate ack), 1 = All (deferred until the ISR HW);
+    //       Produce::decode rejects any other value (no-hang wave), so acks != 0
+    //       and the gateway's acks == 1 agree.
     // -----------------------------------------------------------------------
     // `directAck` (D8d): the admission (SessionAckSink::admitDirect) of this
     // frame — carried by its answer (exactly one: produceCore_ answers every
@@ -6378,11 +6438,27 @@ private:
         // data/len, byte-identical to pre-Task-22; encrypted path: the
         // reconstructed [24B header][plaintext body] from above).
         auto msgOpt = pc::Produce::decode(decData, decLen);
-        if (!msgOpt) {
+        if (!msgOpt) [[unlikely]] {
+            if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (answered)
+            // No-hang (R2): a frame whose MessageHeader decodes is ANSWERED
+            // ProduceResponse{InvalidRequest} on its correlationId (the answer
+            // carries this frame's direct-budget unit, like every produce
+            // answer) — never dropped while the client waits out its timeout.
+            if (const auto hdr = pc::MessageHeader::decode(decData, decLen)) {
+                if (undecodableProduceAnswers_++ % 1024 == 0)
+                    spdlog::warn("Worker {}: WorkerIngress: Produce body undecodable (len={}, session={}, "
+                                 "corr={}); answered InvalidRequest (total {})", workerId_, decLen,
+                                 hdr->sessionId, hdr->correlationId, undecodableProduceAnswers_);
+                WorkerReturn ret = produceAnswer_(ProduceOrigin::WorkerIngress, hdr->sessionId,
+                                                  hdr->correlationId, /*topicId=*/-1, /*partition=*/-1);
+                ret.directAck = directAck;
+                ret.errorCode = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
+                enqueueReturn_(ret);
+                return 1;
+            }
             if (directAck != 0) ackSink_->releaseDirect(produceSessionIdOf_(data), directAck);
-            if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed (dropped)
-            spdlog::warn("Worker {}: WorkerIngress: failed to decode Produce frame "
-                         "len={}; dropping", workerId_, decLen);
+            spdlog::warn("Worker {}: WorkerIngress: Produce frame header undecodable "
+                         "len={}; dropping (unanswerable)", workerId_, decLen);
             return 0;
         }
         const pc::Produce& msg = *msgOpt;
@@ -6409,10 +6485,8 @@ private:
         if (openSeq != 0) [[unlikely]] commitProduceSeq(openCtx, openSeq);   // consumed from here on
 
         // E5.1.3 review fix #3: acksAll = (acks != 0).
-        // The Produce wire field carries 0=NoAck, 1=Leader, -1 (0xFF)=All.
-        // Using acks != 0 is safer than acks == 1 (the gateway's rule) because
-        // it covers any non-zero acks field including potential future extension
-        // values, preventing silent false-durability on unknown acks values.
+        // The Produce wire acks byte is 0 (Leader/None) or 1 (All); decode
+        // rejects anything else (answered InvalidRequest above).
         ProduceFields f;
         f.sessionId     = msg.sessionId;
         f.correlationId = msg.correlationId;
@@ -6517,8 +6591,8 @@ private:
                               workerId_, f.topicId, f.partition);
                 ret.errorCode = static_cast<int16_t>(pc::ErrorCode::NotLeader);
             } else {
-                // Owned but memory-backed: Internal.
-                spdlog::warn("Worker {}: WorkerIngress: owned but memory-backed log for "
+                // Owned but transient (in-memory log): Internal.
+                spdlog::warn("Worker {}: WorkerIngress: owned but transient (in-memory) log for "
                              "topicId={} partition={}; Internal error ack",
                              workerId_, f.topicId, f.partition);
                 ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
@@ -6570,10 +6644,10 @@ private:
         // restamps the base offset in place via pwritev — no mutable local copy.
         if (rbSpan.empty()) {
             spdlog::warn("Worker {}: WorkerIngress: empty recordBatch topicId={} "
-                         "partition={}; Internal error ack",
+                         "partition={}; answered InvalidRequest",
                          workerId_, f.topicId, f.partition);
-            // E5.1.3 review fix #2: use enum, not magic literal.
-            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::Internal);
+            // Fix round 2: a malformed request is InvalidRequest (39), not Internal.
+            ret.errorCode = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
             enqueueReturn_(ret);
             return 1;
         }
@@ -6764,6 +6838,12 @@ private:
         pendingAcksAll_.push_back(std::move(pending));
         return 1;
     }
+
+    // No-hang wave (R2): undecodable worker-ingress Produce frames answered
+    // InvalidRequest (worker-thread owned; kept LAST so no hot member moves).
+    uint64_t undecodableProduceAnswers_ = 0;
+    int64_t     nextNoHangStatsLogNs_ = 0;   // fix round 4 (item 6): periodic no-hang line
+    NoHangStats lastNoHangStats_{};
 };
 
 } // namespace rune::node

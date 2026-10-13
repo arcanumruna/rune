@@ -3,6 +3,7 @@
 #include <rune/gateway/ClientGateway.h>
 #include <rune/gateway/ConnectDowngradePolicy.h>
 #include <rune/gateway/CryptoFrame.h>
+#include <rune/gateway/RequestRejection.h>
 #include <cassert>
 #include <rune_fr/FlightRecorder.h>
 #include <rune/gateway/TopicRegistry.h>
@@ -164,6 +165,31 @@ ClientGateway::ClientGateway(TestConstructTag,
     drainingRegistrations_.reserve(kMaxPendingConnects);
 }
 
+void ClientGateway::injectPendingHandshakeForTest(int64_t sessionId)
+{
+    static unsigned char placeholder alignas(64)[512];
+    assert(testEgressFn_ && "injectPendingHandshakeForTest needs makeForTest's TestEgressFn");
+    PendingConnect pc;
+    pc.sessionId         = sessionId;
+    pc.awaitingHandshake = true;
+    pc.resolvedPub = std::shared_ptr<aeron::ExclusivePublication>(
+        reinterpret_cast<aeron::ExclusivePublication*>(placeholder), [](aeron::ExclusivePublication*) {});
+    pendingConnects_.push_back(std::move(pc));
+}
+
+int64_t ClientGateway::injectReliableTestSessionForTest(int64_t nowNs, int32_t clientVersion)
+{
+    // A non-null placeholder (never dereferenced while testEgressFn_ intercepts
+    // every offer; the no-op deleter frees nothing).
+    static unsigned char placeholder alignas(64)[512];
+    assert(testEgressFn_ && "injectReliableTestSessionForTest needs makeForTest's TestEgressFn");
+    std::shared_ptr<aeron::ExclusivePublication> fake(
+        reinterpret_cast<aeron::ExclusivePublication*>(placeholder), [](aeron::ExclusivePublication*) {});
+    const int64_t sid = sessions_.nextSessionId();
+    sessions_.add(sid, std::move(fake), nowNs, {}, 0, clientVersion);
+    return sid;
+}
+
 // ---------------------------------------------------------------------------
 // G0.1: makeForTest — static factory for test-only (no Aeron) construction.
 // ---------------------------------------------------------------------------
@@ -210,70 +236,224 @@ int64_t ClientGateway::offerBytes_(Session* session,
 // ---------------------------------------------------------------------------
 // CG round 3 (MEDIUM-2): a Subscribe's answer (SubscribeResponse / its
 // Redirect / NotLeader) is queued and retried under back-pressure like the
-// produce answers (enqueueOrBestEffort_) — never a best-effort drop of the
+// produce answers (sendReliable_) — never a best-effort drop of the
 // answer that binds the client's subscription.  Sessions without a real egress
 // publication (test fixtures: injectTestSession / the null-egress capture
 // hook) keep the direct sendTo path they are observed through.
 // ---------------------------------------------------------------------------
-void ClientGateway::sendSubscribeAnswer_(Session& session, const uint8_t* buf, std::size_t len)
+void ClientGateway::sendAnswer_(Session& session, const uint8_t* buf, std::size_t len)
 {
     if (!session.egress) {
         (void)sendTo(session, buf, len);
         return;
     }
-    enqueueOrBestEffort_(session, buf, len);
+    sendReliable_(session, buf, len);
 }
 
 // ---------------------------------------------------------------------------
-// G0.1: enqueueOrBestEffort_ — THE single reliable-egress primitive.
+// G0.1 / no-hang fix rounds 2-4 (I1 / N8): sendReliable_ — THE reliable-egress
+// primitive.
 //
-// EVERY produce-path ack / redirect / error response routes through this
-// function (directly or via sendRespReliable_).  It:
-//   1. Tries immediate delivery via offerBytes_(&session).
-//   2. On back-pressure (result <= 0): copies the bytes onto the ring.
-//   3. On ring-full or oversized frame: best-effort sendTo + warn (bounded,
-//      logged last resort — never a silent drop).
-//
-// The bytes must already be encoded (caller owns encoding into any buffer).
-// len > PendingResp::kMaxBytes → cannot fit a ring slot → best-effort.
+// EVERY client answer (produce acks, redirects, error answers, DDL / group /
+// txn / metadata / view-row answers, Pong) routes through this function.  Per
+// the session's spill state (Session::spill, SessionTable.h):
+//   Normal   — immediate delivery (offerBytes_); one compare on the hot path.
+//              Refused → the answer is spilled and the session becomes Spilled.
+//   Spilled  — earlier answers still wait: this one is appended behind them
+//              (per-session FIFO), re-offered by drainPendingResponses.
+//   Expiring — refused and counted (the session's SessionExpired is owed).
+// Over the per-session quota, or a record larger than the staging buffer: the
+// session itself is EXPIRED.  Pool full: the session holding the most pool
+// bytes is expired (possibly this one) — never a best-effort send, never a
+// silent drop.
 //
 // Single-writer: duty-cycle thread only.
 // ---------------------------------------------------------------------------
-void ClientGateway::enqueueOrBestEffort_(Session&       session,
-                                         const uint8_t* buf,
-                                         std::size_t    len)
+void ClientGateway::sendReliable_(Session&       session,
+                                  const uint8_t* buf,
+                                  std::size_t    len)
 {
-    // Try immediate delivery.
-    const int64_t result = offerBytes_(&session, buf, len);
-    if (result > 0) return;   // delivered
-
-    // Oversized for the fixed ring slot — best-effort (rare long redirect URLs).
-    if (len > PendingResp::kMaxBytes) {
-        spdlog::warn("ClientGateway: egress frame {} bytes > ring slot {}; "
-                     "best-effort send (session={})",
-                     len, PendingResp::kMaxBytes, session.sessionId);
-        sendTo(session, buf, len);
+    // Fix round 5: every gateway-encoded answer fits the spill's staging buffer
+    // (a larger scratch must fail the build, not expire healthy clients).
+    static_assert(kScratchSize <= kMaxSpillRecordBytes, "gateway scratch answers must be spillable");
+    if (session.spill.state == SpillState::Normal) [[likely]] {
+        if (offerBytes_(&session, buf, len) > 0) return;   // delivered
+    } else if (session.spill.state == SpillState::Expiring) [[unlikely]] {
+        ++spillExpiryDrops_;   // the session is being expired: SessionExpired tells the client
         return;
     }
-
-    // Ring full — best-effort (should never fire; back-pressure clears in cycles).
-    if (pendingRespCount_ >= kMaxPendingResponses) {
-        spdlog::warn("ClientGateway: pendingResponses_ ring full ({} entries); "
-                     "best-effort send (session={})",
-                     kMaxPendingResponses, session.sessionId);
-        sendTo(session, buf, len);
+    // Fix round 3 (I1 fairness) / round 4 (N10): the quota counts POOL bytes; the
+    // session over quota is the one expired — the slow / stalled consumer,
+    // never an innocent pusher.
+    if (len > kMaxSpillRecordBytes ||
+        session.spill.bytes + SpillPool::bytesFor(len) > kSessionSpillQuota) {
+        expireForSpill_(session);
         return;
     }
+    while (!egressSpill_.append(session.spill.chain, buf, len)) {
+        // Pool full: expire the session holding the MOST pool bytes (possibly
+        // this one) — O(1) to free (its chain is spliced back) — and retry.
+        Session* hog = largestSpiller_();
+        if (hog == nullptr || hog == &session || hog->spill.bytes <= session.spill.bytes) {
+            expireForSpill_(session);
+            return;
+        }
+        expireForSpill_(*hog);
+    }
+    session.spill.bytes += static_cast<uint32_t>(SpillPool::bytesFor(len));
+    if (session.spill.state == SpillState::Normal) {
+        session.spill.state = SpillState::Spilled;
+        linkSpillReady_(session);
+    }
+}
 
-    // Enqueue for drainPendingResponses().
-    const std::size_t slot = (pendingRespHead_ + pendingRespCount_) % kMaxPendingResponses;
-    PendingResp& e = pendingResponses_[slot];
-    std::memcpy(e.bytes.data(), buf, len);
-    e.len       = len;
-    e.sessionId = session.sessionId;
-    ++pendingRespCount_;
-    spdlog::debug("ClientGateway: egress back-pressured; enqueued session={} "
-                  "len={} (depth={})", session.sessionId, len, pendingRespCount_);
+// Cold (pool full only): O(sessions on the ready list), never O(all sessions).
+Session* ClientGateway::largestSpiller_()
+{
+    Session* best = nullptr;
+    for (Session* s = spillReadyHead_; s != nullptr; s = s->spill.nextReady)
+        if (best == nullptr || s->spill.bytes > best->spill.bytes) best = s;
+    return best;
+}
+
+void ClientGateway::linkSpillReady_(Session& s) noexcept
+{
+    s.spill.prevReady = spillReadyTail_;
+    s.spill.nextReady = nullptr;
+    if (spillReadyTail_ != nullptr) spillReadyTail_->spill.nextReady = &s; else spillReadyHead_ = &s;
+    spillReadyTail_ = &s;
+    ++spillReadySessions_;
+}
+
+void ClientGateway::unlinkSpillReady_(Session& s) noexcept
+{
+    if (s.spill.prevReady != nullptr) s.spill.prevReady->spill.nextReady = s.spill.nextReady;
+    else spillReadyHead_ = s.spill.nextReady;
+    if (s.spill.nextReady != nullptr) s.spill.nextReady->spill.prevReady = s.spill.prevReady;
+    else spillReadyTail_ = s.spill.prevReady;
+    s.spill.prevReady = nullptr;
+    s.spill.nextReady = nullptr;
+    --spillReadySessions_;
+}
+
+bool ClientGateway::spillWritable_(const Session& s) const noexcept
+{
+    // Test egress (testEgressFn_) and egress-less sessions: the offer decides.
+    if (testEgressFn_ || !s.egress) return true;
+    // Aeron refuses an offer only when not connected or position >= limit.
+    return s.egress->isConnected() && s.egress->availableWindow() > 0;
+}
+
+// The spill cannot hold this session's answers any more.  Fix round 3 (I1) /
+// round 4 (N8, N9): the session enters the explicit EXPIRING state — its
+// spilled answers are released (O(1): the chain is spliced back), every new
+// answer is refused (counted), its ingress is dropped (admit path), and its
+// SessionExpired is re-offered each drain (serviceSpillExpiring_) until it is
+// delivered or the lease deadline passes; only then is the session closed.
+// The publication stays alive until then (it is the only way to tell the client).
+void ClientGateway::expireForSpill_(Session& session)
+{
+    if (spillExpiries_++ % 1024 == 0)
+        spdlog::error("ClientGateway: egress spill: session={} holds {} B ({} answers; spill {} B of {} B) — "
+                      "expiring it (SessionExpired) instead of dropping answers (expiries={})",
+                      session.sessionId, session.spill.bytes, session.spill.chain.records,
+                      egressSpill_.usedBytes(), egressSpill_.capacityBytes(), spillExpiries_);
+    if (session.spill.state == SpillState::Spilled) {
+        (void)egressSpill_.freeAll(session.spill.chain);
+        unlinkSpillReady_(session);
+    }
+    session.spill = SessionSpill{};
+    session.spill.state = SpillState::Expiring;
+    ++expiringSessions_;
+    if (spillExpiringCount_ == spillExpiring_.size()) [[unlikely]] {
+        // The preallocated EXPIRING table is full: the session stays marked
+        // (every answer refused) and is adopted by serviceSpillExpiring_ as soon
+        // as a slot frees — never closed here (a caller may still hold it).
+        ++spillExpiringOverflow_;
+        return;
+    }
+    spillExpiring_[spillExpiringCount_++] = SpillExpiring{session.sessionId, nowNs_ + sessionTimeoutNs_};
+}
+
+void ClientGateway::serviceSpillExpiring_(int64_t nowNs)
+{
+    pc::ErrorResponse e;
+    e.correlationId = 0;
+    e.code          = static_cast<int16_t>(pc::ErrorCode::SessionExpired);
+    for (std::size_t i = 0; i < spillExpiringCount_;) {
+        SpillExpiring& ex = spillExpiring_[i];
+        Session* s = sessions_.find(ex.sessionId);
+        bool done = false;
+        if (s == nullptr) {
+            // Fix round 4 (N15): closed meanwhile (reaped / disconnected) before
+            // its SessionExpired could be delivered — counted as notify-lost.
+            ++spillExpiryNotifyLost_;
+            done = true;
+        } else {
+            // Fix round 4 (N9): once serviced, an Expiring session's
+            // subscriptions end (gateway pushes AND the owning workers'
+            // cursors) — no Records compete with its SessionExpired.
+            if (!ex.subscriptionsDropped) {
+                dropSessionSubscriptions_(ex.sessionId);
+                ex.subscriptionsDropped = true;
+            }
+            e.sessionId = ex.sessionId;
+            const std::size_t n = e.encode(scratch_.data());
+            const bool sent = s->egress ? offerBytes_(s, scratch_.data(), n) > 0
+                                        : sendTo(*s, scratch_.data(), n);   // egress-less test session (hook)
+            if (sent) {
+                ++spillExpiryNotified_;
+                done = true;
+            } else if (nowNs >= ex.deadlineNs) {
+                ++spillExpiryNotifyLost_;   // lease over: the client's own keepalive timeout has fired too
+                done = true;
+            }
+            if (done) (void)closeSession_(ex.sessionId, /*notifyExpired=*/false);
+        }
+        if (done) spillExpiring_[i] = spillExpiring_[--spillExpiringCount_];
+        else ++i;
+    }
+    // Marked sessions the full table could not take yet: adopt them now.
+    if (spillExpiringOverflow_ != 0 && spillExpiringCount_ < spillExpiring_.size()) [[unlikely]] {
+        sessions_.forEach([&](Session& s) {
+            if (s.spill.state != SpillState::Expiring || spillExpiringCount_ == spillExpiring_.size()) return;
+            for (std::size_t k = 0; k < spillExpiringCount_; ++k)
+                if (spillExpiring_[k].sessionId == s.sessionId) return;
+            spillExpiring_[spillExpiringCount_++] = SpillExpiring{s.sessionId, nowNs + sessionTimeoutNs_};
+        });
+        spillExpiringOverflow_ = (spillExpiringCount_ == spillExpiring_.size()) ? spillExpiringOverflow_ : 0;
+    }
+}
+
+// Fix round 4 (N9): one probe of the frame's header session (bytes 8..15, as
+// produceFramePause_) — called only while some session is Expiring.
+bool ClientGateway::dropExpiringFrame_(const uint8_t* buf, std::size_t len)
+{
+    if (len < pc::MessageHeader::ENCODED_SIZE) return false;
+    uint64_t sid = 0;
+    for (int i = 7; i >= 0; --i) sid = (sid << 8) | buf[8 + i];
+    const Session* s = sessions_.find(static_cast<int64_t>(sid));
+    if (s == nullptr || s->spill.state != SpillState::Expiring) return false;
+    const uint16_t tid = static_cast<uint16_t>(buf[2] | (buf[3] << 8));
+    // Only a PLAINTEXT session's Disconnect finalizes: this probe runs before
+    // the AEAD check, so on an encrypted session the frame is unauthenticated
+    // (session ids are guessable) and must not change its state — it keeps the
+    // counted drop and its lease (final no-hang review B1).
+    if (tid == static_cast<uint16_t>(pc::TemplateId::Disconnect) && !s->crypto.encrypted) {
+        // Fix round 5: the client asked to leave — nobody waits for its
+        // SessionExpired.  Finalize now (no notification), leave the EXPIRING
+        // table, counted apart (never as notify-lost).
+        for (std::size_t i = 0; i < spillExpiringCount_; ++i) {
+            if (spillExpiring_[i].sessionId != s->sessionId) continue;
+            spillExpiring_[i] = spillExpiring_[--spillExpiringCount_];
+            break;
+        }
+        ++spillExpiryClientLeft_;
+        (void)closeSession_(static_cast<int64_t>(sid), /*notifyExpired=*/false);
+        return true;
+    }
+    ++expiringIngressDrops_;   // never executed: the client is owed SessionExpired (→ SessionLost)
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +483,9 @@ void ClientGateway::enqueueOrBestEffort_(Session&       session,
 // ---------------------------------------------------------------------------
 rune::node::RecordsSendResult ClientGateway::pushRecords_(Session& session, const pc::Records& rec)
 {
+    // Fix round 4 (N9): an Expiring session receives no Records (its cursor is
+    // not advanced; the subscription ends with the session).
+    if (session.spill.state == SpillState::Expiring) [[unlikely]] return {rune::node::RecordsSendKind::Retry, -1};
     if (session.egress) [[likely]] {
         if (session.crypto.encrypted) {
             rune::node::RecordsSealCtx seal;
@@ -367,7 +550,7 @@ void ClientGateway::trySendOwedPushError_(Subscription& sub, Session& session)
 
 // ---------------------------------------------------------------------------
 // G0.1: sendRespReliable_ — encode a ProduceResponse into scratch_ and route it
-// through enqueueOrBestEffort_.  Returns false only on an encode error.
+// through sendReliable_.  Returns false only on an encode error.
 // ---------------------------------------------------------------------------
 bool ClientGateway::sendRespReliable_(Session&          session,
                                       pc::ErrorCode     ec,
@@ -376,8 +559,6 @@ bool ClientGateway::sendRespReliable_(Session&          session,
                                       int64_t           correlationId,
                                       int64_t           logStartOffset)
 {
-    static_assert(pc::ProduceResponse::ENCODED_SIZE <= PendingResp::kMaxBytes,
-                  "ProduceResponse::ENCODED_SIZE exceeds PendingResp::kMaxBytes");
     static_assert(pc::ProduceResponse::ENCODED_SIZE <= kScratchSize,
                   "ProduceResponse::ENCODED_SIZE exceeds kScratchSize");
 
@@ -392,12 +573,12 @@ bool ClientGateway::sendRespReliable_(Session&          session,
     resp.baseOffset     = baseOffset;
     resp.logStartOffset = logStartOffset;
     const std::size_t encoded = resp.encodeFor(scratch_.data(), session.clientVersion);
-    if (encoded == 0 || encoded > PendingResp::kMaxBytes) {
+    if (encoded == 0) {
         spdlog::error("ClientGateway::sendRespReliable_: encode error ({} bytes)", encoded);
         return false;
     }
 
-    enqueueOrBestEffort_(session, scratch_.data(), encoded);
+    sendReliable_(session, scratch_.data(), encoded);
     return true;
 }
 
@@ -415,13 +596,13 @@ bool ClientGateway::sendRespReliable(rune::protocol::client::ErrorCode ec,
                                      int64_t    baseOffset,
                                      int64_t    correlationId)
 {
-    if (testEgressFn_) {
-        // No real Session in the test harness — build a synthetic one whose id
-        // matches currentProduceSessionId_.  offerBytes_ routes through
-        // testEgressFn_ and never dereferences the session pointer in test mode.
-        Session synthetic;
-        synthetic.sessionId = currentProduceSessionId_;
-        return sendRespReliable_(synthetic, ec, partition, baseOffset, correlationId);
+    if (testEgressFn_ && !sessions_.find(currentProduceSessionId_)) {
+        // No Session in the test harness yet — register an egress-less one under
+        // currentProduceSessionId_ (offerBytes_ routes through testEgressFn_ and
+        // never dereferences the publication in test mode), so the spill drain
+        // finds it like any live session.
+        sessions_.add(currentProduceSessionId_, /*egress=*/nullptr, nowNs_, {}, 0,
+                      rune::protocol::client::kClientVersion);
     }
 
     Session* session = sessions_.find(currentProduceSessionId_);
@@ -434,31 +615,40 @@ bool ClientGateway::sendRespReliable(rune::protocol::client::ErrorCode ec,
 }
 
 // ---------------------------------------------------------------------------
-// G0.1: drainPendingResponses — re-offer queued egress frames from the ring.
-// Stops at the first back-pressure (preserves FIFO).
-// Returns number of frames delivered.
-//
-// nowNs is currently unused (no per-entry aging) — kept in the signature for
-// the doWork() call convention and future deadline/timeout support.
+// G0.1 / fix rounds 3-4 (I1, N8): drainPendingResponses — re-offer spilled
+// answers.  Walks the READY list (sessions holding spilled answers), never the
+// records: per session, an O(1) window check (a session whose publication has
+// no window costs one compare and is skipped), then its oldest answers are
+// offered until one is refused.  Per-session order holds by construction (one
+// chain per session); a stalled session never blocks another.
+// Returns the number of answers delivered.
 // ---------------------------------------------------------------------------
-int ClientGateway::drainPendingResponses(int64_t /*nowNs*/)
+int ClientGateway::drainPendingResponses(int64_t nowNs)
 {
+    // Fix round 3 (I1): sessions in the EXPIRING state get their SessionExpired
+    // re-offered (closed once delivered, or at the lease deadline).
+    if ((spillExpiringCount_ | spillExpiringOverflow_) != 0) [[unlikely]]
+        serviceSpillExpiring_(nowNs != 0 ? nowNs : nowNs_);
+    if (spillReadyHead_ == nullptr) [[likely]] return 0;
     int delivered = 0;
-    while (pendingRespCount_ > 0) {
-        PendingResp& e  = pendingResponses_[pendingRespHead_];
-        Session* session = testEgressFn_ ? nullptr : sessions_.find(e.sessionId);
-        // Session reaped (production, non-test) → cannot deliver → discard the
-        // entry (no session to ack) rather than blocking the queue forever.
-        if (!testEgressFn_ && !session) {
-            pendingRespHead_ = (pendingRespHead_ + 1) % kMaxPendingResponses;
-            --pendingRespCount_;
-            continue;
+    for (Session* s = spillReadyHead_; s != nullptr;) {
+        Session* const next = s->spill.nextReady;
+        if (spillWritable_(*s)) {
+            SessionSpill& sp = s->spill;
+            while (!sp.chain.empty()) {
+                const std::size_t len = egressSpill_.headLen(sp.chain);
+                const uint8_t* data = egressSpill_.headData(sp.chain, spillStage_.data());
+                if (offerBytes_(s, data, len) <= 0) break;   // refused: the rest keeps its order
+                egressSpill_.popHead(sp.chain);
+                sp.bytes -= static_cast<uint32_t>(SpillPool::bytesFor(len));
+                ++delivered;
+            }
+            if (sp.chain.empty()) {
+                unlinkSpillReady_(*s);
+                sp = SessionSpill{};   // back to Normal
+            }
         }
-        const int64_t result = offerBytes_(session, e.bytes.data(), e.len);
-        if (result <= 0) break;   // still back-pressured — stop (preserve FIFO)
-        pendingRespHead_ = (pendingRespHead_ + 1) % kMaxPendingResponses;
-        --pendingRespCount_;
-        ++delivered;
+        s = next;
     }
     return delivered;
 }
@@ -480,6 +670,9 @@ int ClientGateway::doWork(int64_t nowNs) {
     // produce ack is sent as soon as the publication clears back-pressure,
     // preserving the "no silent drop on back-pressure" invariant.
     drainPendingResponses(nowNs);
+    // No-hang fix round 3: the no-hang counters, logged while the broker runs
+    // (on change, at most every kNoHangStatsLogNs) — one compare per duty cycle.
+    if (nowNs >= nextNoHangStatsLogNs_) [[unlikely]] (void)logNoHangStatsIfChanged_(nowNs);
 
     // E2 inc2a: drain the workers' return rings FIRST — send responses from the
     // previous cycle's produce-appends and push-reads before processing any new
@@ -887,6 +1080,12 @@ void ClientGateway::onFragment(aeron::concurrent::AtomicBuffer& buffer,
 
 bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
 {
+    // Fix round 4 (N9): an Expiring session's frames are never executed — no
+    // Produce append, DDL, commit or txn op after the broker decided the
+    // session is dead.  One compare while no session is Expiring.
+    if (expiringSessions_ != 0) [[unlikely]] {
+        if (dropExpiringFrame_(buf, len)) return true;   // consumed, not executed
+    }
     // client<->broker TLS/AEAD (Task 8): decrypt BEFORE checkFrame — mirrors
     // the client's dispatchEgressFrame (Task 6). templateId/sessionId are
     // always plaintext (they form the AEAD AAD), so peek them via
@@ -948,8 +1147,30 @@ bool ClientGateway::onClientFrame_(const uint8_t* buf, std::size_t len)
 
     // Step 1: validate frame with checkFrame — reject anything non-conformant.
     const auto fc = pc::checkFrame(buf, len);
-    if (fc.status != pc::FrameStatus::Ok) {
-        // Drop silently — bad/unknown frame never crashes the gateway.
+    if (fc.status != pc::FrameStatus::Ok) [[unlikely]] {
+        // Never crashes the gateway.  No-hang (R2): a frame whose header decodes
+        // on a known session (wrong schema / newer version / unknown template —
+        // a newer or foreign client) is answered ErrorResponse{ProtocolVersion}
+        // on its correlationId instead of leaving the client waiting.
+        const auto hdr = pc::MessageHeader::decode(buf, len);
+        Session* s = hdr ? sessions_.find(hdr->sessionId) : nullptr;
+        // Fix round 2 (I6): a known request template is answered with ITS OWN
+        // response type (the client completes that op; an ErrorResponse only
+        // completes control ops); ErrorResponse only when the template has none.
+        if (s != nullptr && answerRejection_(*s, *hdr, static_cast<uint16_t>(pc::ErrorCode::ProtocolVersion),
+                                             "frame failed checkFrame", buf, len)) {
+            // answered
+        } else if (s != nullptr) {
+            pc::ErrorResponse er;
+            er.sessionId     = hdr->sessionId;
+            er.correlationId = hdr->correlationId;
+            er.code          = static_cast<int16_t>(pc::ErrorCode::ProtocolVersion);
+            const std::size_t n = er.encode(scratch_.data());
+            ++rejectedRequests_;
+            sendAnswer_(*s, scratch_.data(), n);
+        } else {
+            noteUnanswerable_(buf, len, "frame failed checkFrame");
+        }
         return true;
     }
 
@@ -1098,6 +1319,33 @@ void ClientGateway::evictOldestPendingConnect_()
     // not yet resolved — the conductor still holds it in AWAITING state).
     const bool evictedAlreadyResolved = (pendingConnects_.front().resolvedPub != nullptr) ||
                                         pendingConnects_.front().awaitingResolve;   // nothing registered
+    // Fix round 3 (fix-on-sight): an evicted connect whose reply publication is
+    // resolved is ANSWERED (ConnectResponse{Internal}, no session) — one offer:
+    // the eviction exists to bound this table, so it is not retried (counted).
+    // Fix round 5 (N17): answer the leg the client is WAITING for — a client in
+    // Handshaking ignores a ConnectResponse; it gets HandshakeContinueResponse:
+    // the owed HandshakeFailed for a failing handshake, Internal (retriable)
+    // for one still in progress.
+    if (const auto& ev = pendingConnects_.front(); ev.resolvedPub) {
+        std::size_t n = 0;
+        if (ev.failingHandshake || ev.awaitingHandshake) {
+            pc::HandshakeContinueResponse hr;
+            hr.sessionId     = ev.sessionId;
+            hr.correlationId = ev.failingHandshake ? ev.handshakeFailCorr : ev.correlationId;
+            hr.code          = static_cast<int16_t>(ev.failingHandshake ? pc::ErrorCode::HandshakeFailed
+                                                                        : pc::ErrorCode::Internal);
+            n = hr.encode(scratch_.data());
+        } else {
+            pc::ConnectResponse resp;
+            resp.sessionId     = 0;
+            resp.correlationId = ev.correlationId;
+            resp.code          = static_cast<int16_t>(pc::ErrorCode::Internal);
+            n = resp.encode(scratch_.data());
+        }
+        if (!offerOnPub_(*ev.resolvedPub, scratch_.data(), n)) ++unanswerableFrames_;
+    } else {
+        ++unanswerableFrames_;   // no reply publication yet: nothing to answer on
+    }
     // Fix round 1 (I2): an evicted entry whose announcement began holds
     // worker ack-table slots — close it on every worker (never leaked).
     closeDroppedPendingConnect_(pendingConnects_.front());
@@ -1181,6 +1429,17 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
     // Fix round 2 (finding 2): tell the client before its publication goes —
     // the rune client reconnects only on SessionExpired / UnknownSession.
     if (notifyExpired) sendSessionExpired_(nullptr, s, sid);
+    // Fix round 4 (N16): its spilled answers die with it (O(1)) and it leaves
+    // the ready list; an Expiring one leaves the exact Expiring count (its
+    // table row is dropped by serviceSpillExpiring_, counted notify-lost
+    // unless this close follows its delivered SessionExpired).
+    if (s->spill.state == SpillState::Spilled) {
+        (void)egressSpill_.freeAll(s->spill.chain);
+        unlinkSpillReady_(*s);
+    } else if (s->spill.state == SpillState::Expiring) {
+        --expiringSessions_;
+    }
+    s->spill = SessionSpill{};
     if (s->heldByWorkers != 0) --heldSessions_;
     if (s->produceInFlight >= sessionProduceCredits_) --creditBlockedSessions_;   // D8c: its budget dies with it
     if (s->capDeferredOn >= 0) --capDeferredSessions_;                              // R3: its deferral memo too
@@ -1206,9 +1465,21 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
         pit = (pit->first.first == sid) ? pendingRecordEgress_.erase(pit) : std::next(pit);
     }
 
-    // GB-3: drop all subscriptions belonging to this session — and the owning
-    // workers' cursors too (2026-10-05: they used to outlive the session and
-    // push forever; queued, never dropped, ordered behind queued Subscribes).
+    dropSessionSubscriptions_(sid);
+
+    // CG-4 fix (#2): erase the group-member tracking entry so groupMemberSubs_
+    // does not grow unboundedly under connect/disconnect churn.
+    groupMemberSubs_.erase(sid);
+    return true;
+}
+
+// GB-3: drop all subscriptions belonging to this session — and the owning
+// workers' cursors too (2026-10-05: they used to outlive the session and push
+// forever; queued, never dropped, ordered behind queued Subscribes).  Called on
+// close, and (fix round 4, N9) once an Expiring session is first serviced —
+// never from inside a subscriptions_ walk.
+void ClientGateway::dropSessionSubscriptions_(int64_t sid)
+{
     const bool workerSubs = perWorkerEgressActive_ && workerPool_;
     auto it = subscriptions_.begin();
     while (it != subscriptions_.end()) {
@@ -1220,11 +1491,6 @@ bool ClientGateway::closeSession_(int64_t sid, bool notifyExpired)
             ++it;
         }
     }
-
-    // CG-4 fix (#2): erase the group-member tracking entry so groupMemberSubs_
-    // does not grow unboundedly under connect/disconnect churn.
-    groupMemberSubs_.erase(sid);
-    return true;
 }
 
 ClientGateway::ProducePause ClientGateway::produceFramePause_(const uint8_t* buf, std::size_t len, int32_t* capWorker)
@@ -1254,8 +1520,36 @@ ClientGateway::ProducePause ClientGateway::produceFramePause_(const uint8_t* buf
     return ProducePause::None;
 }
 
+bool ClientGateway::logNoHangStatsIfChanged_(int64_t nowNs)
+{
+    nextNoHangStatsLogNs_ = nowNs + kNoHangStatsLogNs;
+    const NoHangStats nh = noHangStats();
+    // Fix round 4 (N11): counters compared one by one (no signature that can
+    // cancel out).
+    if (!noHangCountersDiffer(nh, lastNoHangStats_)) return false;
+    lastNoHangStats_ = nh;
+    spdlog::info("ClientGateway: no-hang stats — rejected (answered with an error)={} unanswerable={} "
+                 "spillExpiries={} (SessionExpired delivered={} lost={} expiring now={}) spillExpiryDrops={} "
+                 "expiringIngressDrops={} clientLeftWhileExpiring={} oldClientUnknownMember={} (session-wide={}) "
+                 "spilledNow={} ({} B)", nh.rejectedRequests, nh.unanswerableFrames,
+                 nh.spillExpiries, nh.spillExpiryNotified, nh.spillExpiryNotifyLost, nh.spillExpiring,
+                 nh.spillExpiryDrops, nh.expiringIngressDrops, nh.spillExpiryClientLeft, nh.oldClientUnknownMember,
+                 nh.oldClientSessionWideEvictions, nh.spilledAnswers, nh.spillUsedBytes);
+    return true;
+}
+
 void ClientGateway::logProducePauseStats() const
 {
+    if (const NoHangStats nh = noHangStats(); noHangCountersDiffer(nh, NoHangStats{}) || nh.spilledAnswers != 0) {
+        spdlog::warn("ClientGateway: no-hang stats — rejected (answered with an error)={} unanswerable={} "
+                     "spillExpiries={} (SessionExpired delivered={} lost={}) spillExpiryDrops={} "
+                     "expiringIngressDrops={} clientLeftWhileExpiring={} oldClientUnknownMember={} "
+                     "(session-wide={}) spilledNow={} ({} B)",
+                     nh.rejectedRequests, nh.unanswerableFrames, nh.spillExpiries, nh.spillExpiryNotified,
+                     nh.spillExpiryNotifyLost, nh.spillExpiryDrops, nh.expiringIngressDrops,
+                     nh.spillExpiryClientLeft, nh.oldClientUnknownMember, nh.oldClientSessionWideEvictions,
+                     nh.spilledAnswers, nh.spillUsedBytes);
+    }
     if (heldProduceAborts_ == 0 && produceCreditUnderflows_ == 0) return;
     spdlog::warn("ClientGateway: produce pauses — aborts={} (credit={} workerCap={}) creditUnderflows={}",
                  heldProduceAborts_, creditProduceAborts_, workerCapProduceAborts_, produceCreditUnderflows_);
@@ -1263,7 +1557,19 @@ void ClientGateway::logProducePauseStats() const
 
 bool ClientGateway::admitClientFrame_(const uint8_t* buf, std::size_t len)
 {
-    if ((heldSessions_ | creditBlockedSessions_ | capDeferredSessions_) == 0) [[likely]] return true;
+    if ((heldSessions_ | creditBlockedSessions_ | capDeferredSessions_ | expiringSessions_) == 0) [[likely]]
+        return true;
+    // Fix round 4/5 (N9 / N20): a frame of an Expiring session is checked FIRST
+    // and CONSUMED (admitted; onClientFrame_ drops it, counted) — never
+    // ABORTed by a credit / cap pause it can no longer clear.
+    if (expiringSessions_ != 0 && len >= pc::MessageHeader::ENCODED_SIZE) [[unlikely]] {
+        uint64_t sid = 0;
+        for (int i = 7; i >= 0; --i) sid = (sid << 8) | buf[8 + i];
+        if (const Session* s = sessions_.find(static_cast<int64_t>(sid));
+            s != nullptr && s->spill.state == SpillState::Expiring)
+            return true;
+        if ((heldSessions_ | creditBlockedSessions_ | capDeferredSessions_) == 0) return true;
+    }
     int32_t capWorker = -1;
     const ProducePause p = produceFramePause_(buf, len, &capWorker);
     if (p == ProducePause::None) return true;
@@ -1424,7 +1730,13 @@ void ClientGateway::sendSessionExpired_(aeron::ExclusivePublication* pub, Sessio
     e.correlationId = 0;
     e.code          = static_cast<int16_t>(pc::ErrorCode::SessionExpired);
     const std::size_t encoded = e.encode(scratch_.data());
-    if (session) (void)sendTo(*session, scratch_.data(), encoded);   // best effort
+    // Best effort by nature: the session's publication goes away with it (the
+    // client's next request then meets UnknownSession).  offerBytes_ = sendTo in
+    // production; the test egress intercepts it.
+    if (session) {
+        if (session->egress) (void)offerBytes_(session, scratch_.data(), encoded);
+        else                 (void)sendTo(*session, scratch_.data(), encoded);   // egress-less test session (hook)
+    }
     else if (pub) (void)sendOnPub(*pub, scratch_.data(), encoded);
 }
 
@@ -1513,16 +1825,26 @@ void ClientGateway::onSessionSignal_(const rune::node::WorkerReturn& ret)
 void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t nowNs)
 {
     auto reqOpt = pc::ConnectRequest::decode(buf, len);
-    if (!reqOpt) return; // truncated — drop
+    if (!reqOpt) {
+        // No session and no decodable reply channel: nothing to answer on.  The
+        // client's connect deadline bounds it.  Counted + warned (R2).
+        noteUnanswerable_(buf, len, "Connect body undecodable (no reply channel)");
+        return;
+    }
 
     const auto& req = *reqOpt;
     // Task 13 fix round 1 (I2): a worker's ack table stores the reply channel in
     // a fixed slot — refuse a longer one HERE (never accept a session no worker
     // can ack; the worker treats a refused announcement as an invariant halt).
-    if (shardMode_ && req.egressChannel.size() > rune::node::SessionAckSink::kMaxChannelBytes) [[unlikely]] {
-        spdlog::warn("ClientGateway: egress channel of {} B exceeds the shard limit {} B; dropping Connect",
-                     req.egressChannel.size(), rune::node::SessionAckSink::kMaxChannelBytes);
-        return;
+    // Fix round 2: refused EXPLICITLY — the gateway can still resolve the reply
+    // channel (only the workers' fixed slots cannot hold it), so the connect
+    // goes through the pending-connect machinery and is answered
+    // ConnectResponse{InvalidRequest} with no session (pollPendingConnects).
+    const bool channelTooLongForShard =
+        shardMode_ && req.egressChannel.size() > rune::node::SessionAckSink::kMaxChannelBytes;
+    if (channelTooLongForShard) [[unlikely]] {
+        spdlog::warn("ClientGateway: egress channel of {} B exceeds the shard limit {} B; Connect refused "
+                     "(InvalidRequest)", req.egressChannel.size(), rune::node::SessionAckSink::kMaxChannelBytes);
     }
 
     // -----------------------------------------------------------------------
@@ -1619,6 +1941,8 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     pc_entry.egressChannel         = std::string(req.egressChannel);
     pc_entry.egressStreamId        = req.egressStreamId;
     pc_entry.clientVersion         = req.clientVersion;   // D6
+    if (channelTooLongForShard) [[unlikely]]
+        pc_entry.refuseCode = static_cast<uint16_t>(pc::ErrorCode::InvalidRequest);
 
     // client<->broker TLS/AEAD (Task 7): drive the server-role handshake's
     // FIRST leg right here, synchronously, off the client's ClientHello
@@ -1627,7 +1951,8 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     // NOTE: capturedLeaderEndpoint was already std::move()'d into
     // pc_entry.leaderClientEndpoint above — read the redirect decision back
     // off pc_entry, not the now-moved-from local.
-    const bool isRedirectCapture = (!pc_entry.isLeader && !pc_entry.leaderClientEndpoint.empty());
+    const bool isRedirectCapture = (!pc_entry.isLeader && !pc_entry.leaderClientEndpoint.empty()) ||
+                                   pc_entry.refuseCode != 0;   // a refused connect engages no crypto either
     const bool clientOffersCrypto = !req.cipherList.empty() && !req.handshakeBytes.empty();
     const bool brokerHasTls       = !tlsCertPem_.empty() && !tlsKeyPem_.empty();
     // Task 19 (per-worker egress crypto addendum): shard mode used to refuse
@@ -1690,14 +2015,15 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     const std::string_view replyHost = rune::consensus::PeerHostTable::endpointHost(pc_entry.egressChannel);
     if (hostResolver_.valid() && !replyHost.empty() &&
         !rune::consensus::PeerHostTable::isNumericHost(replyHost)) [[unlikely]] {
-        auto* host = new std::string(replyHost);
-        if (!hostResolver_.req->offer(rune::consensus::kHostResolveRequest, sessionId,
-                                      static_cast<int64_t>(reinterpret_cast<std::intptr_t>(host)))) {
-            delete host;
-            spdlog::warn("ClientGateway: host-resolve ring full; dropping Connect (the client retries)");
-            return;
-        }
         pc_entry.awaitingResolve = true;
+        // Fix round 3 (concern 2): a momentarily full resolve ring no longer
+        // drops the Connect — the pending connect is kept (ResolveOfferPending)
+        // and the offer retried every poll until accepted or the connect
+        // timeout (pollPendingConnects).
+        pc_entry.resolveOfferPending = !offerHostResolve_(pc_entry);
+        if (pc_entry.resolveOfferPending)
+            spdlog::warn("ClientGateway: host-resolve ring full; session={} Connect kept pending, offer retried",
+                         sessionId);
         pendingConnects_.push_back(std::move(pc_entry));
         return;
     }
@@ -1750,6 +2076,23 @@ bool ClientGateway::registerConnectEgress_(PendingConnect& pending)
                      pending.egressChannel);
         return false;
     }
+    return true;
+}
+
+// Offer the reply host of `pending` to the cold resolver (cold path: the host
+// string is heap-owned by the request until the hub frees it).  False = the
+// ring is full right now (the caller keeps the connect pending and retries).
+bool ClientGateway::offerHostResolve_(PendingConnect& pending)
+{
+    // Fix round 4 (N12): allocated once per connect; a refused offer keeps it
+    // (retried each poll with no new allocation); the ring takes it on success.
+    if (!pending.resolveHost)
+        pending.resolveHost = std::make_unique<std::string>(
+            rune::consensus::PeerHostTable::endpointHost(pending.egressChannel));
+    if (!hostResolver_.req->offer(rune::consensus::kHostResolveRequest, pending.sessionId,
+                                  static_cast<int64_t>(reinterpret_cast<std::intptr_t>(pending.resolveHost.get()))))
+        return false;
+    (void)pending.resolveHost.release();   // owned by the resolver from here (it deletes it)
     return true;
 }
 
@@ -1845,6 +2188,20 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             continue;
         }
 
+        if (pending.failingHandshake) [[unlikely]] {      // fix round 3 (N4): HandshakeFailed not yet delivered
+            if (offerHandshakeFailed_(pending)) {
+                closeDroppedPendingConnect_(pending);
+                it = pendingConnects_.erase(it);
+            } else {
+                ++it;
+            }
+            continue;
+        }
+        if (pending.resolveOfferPending) [[unlikely]] {   // fix round 3: retry a refused resolve offer
+            pending.resolveOfferPending = !offerHostResolve_(pending);
+            ++it;
+            continue;
+        }
         if (pending.awaitingResolve) { ++it; continue; }   // reply host not resolved yet (LOW-4)
         // client<->broker TLS/AEAD (Task 7): the first ConnectResponse (with
         // the chosen cipher + server's first flight) was already sent; this
@@ -1919,14 +2276,22 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
                                        pc::ErrorResponse::BODY_FIXED + 2 +
                                        pending.leaderClientEndpoint.size();
             if (needed > scratch_.size()) {
-                // Pathological endpoint length — drop (cannot encode).  The
-                // resolvedPub shared_ptr release on erase() frees the egress reg.
-                spdlog::warn("ClientGateway: redirect endpoint too large ({}B); dropping",
+                // Fix round 2: a pathological endpoint length is never a silent
+                // drop — the client gets the bare NotLeader (no endpoint).
+                spdlog::warn("ClientGateway: redirect endpoint too large ({}B); answered NotLeader",
                              pending.leaderClientEndpoint.size());
-                it = pendingConnects_.erase(it);
-                continue;
+                err.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+                err.message = {};
             }
             encoded = err.encode(scratch_.data());
+        } else if (pending.refuseCode != 0) [[unlikely]] {
+            // Fix round 2: an explicitly refused connect (e.g. a reply channel the
+            // shard workers cannot hold) — answered, NO session created.
+            pc::ConnectResponse resp;
+            resp.sessionId     = 0;
+            resp.correlationId = pending.correlationId;
+            resp.code          = static_cast<int16_t>(pending.refuseCode);
+            encoded = resp.encode(scratch_.data());
         } else if (pending.cryptoFailed) {
             // client<->broker TLS/AEAD (Task 7): the server-role TlsSession
             // rejected the client's opening handshake bytes (handleConnect).
@@ -2017,7 +2382,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
         // Send succeeded.  Redirect / handshake-failure entries create NO
         // session (the resolvedPub shared_ptr release on erase frees the
         // transient egress registration).
-        if (isRedirect || pending.cryptoFailed) {
+        if (isRedirect || pending.cryptoFailed || pending.refuseCode != 0) {
             it = pendingConnects_.erase(it);
             continue;
         }
@@ -2057,10 +2422,65 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
 // sessionId / decode failure / no matching awaiting-handshake entry → drop,
 // never crash (same contract as every other dispatch handler).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// failPendingHandshake_ — THE failure path of a handshake in progress: send
+// HandshakeFailed (non-retriable) on its reply publication, close it
+// everywhere (Task 13: an announced-but-never-accepted session), forget it.
+// ---------------------------------------------------------------------------
+void ClientGateway::failPendingHandshake_(std::deque<PendingConnect>::iterator it, int64_t correlationId)
+{
+    PendingConnect& pending = *it;
+    // Fix round 3 (N4): delivered reliably — a refused offer leaves the entry in
+    // the explicit FailingHandshake state (awaitingHandshake cleared), re-offered
+    // every poll until delivered or the connect timeout.
+    pending.awaitingHandshake  = false;
+    pending.failingHandshake   = true;
+    pending.handshakeFailCorr  = correlationId;
+    if (offerHandshakeFailed_(pending)) {
+        closeDroppedPendingConnect_(pending);
+        pendingConnects_.erase(it);
+    }
+}
+
+bool ClientGateway::offerHandshakeFailed_(PendingConnect& pending)
+{
+    pc::HandshakeContinueResponse fail;
+    fail.sessionId     = pending.sessionId;
+    fail.correlationId = pending.handshakeFailCorr;
+    fail.code          = static_cast<int16_t>(pc::ErrorCode::HandshakeFailed);
+    static_assert(pc::MessageHeader::ENCODED_SIZE + 64 <= kScratchSize);
+    return offerOnPub_(*pending.resolvedPub, scratch_.data(), fail.encode(scratch_.data()));
+}
+
+// Pre-session sends (a pending connect's reply publication): the real
+// publication, or the TestEgressFn (test gateways never reach Aeron).
+bool ClientGateway::offerOnPub_(aeron::ExclusivePublication& pub, const uint8_t* buf, std::size_t len)
+{
+    if (testEgressFn_) [[unlikely]] return testEgressFn_(buf, len) > 0;
+    return sendOnPub(pub, buf, len);
+}
+
 void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len, int64_t nowNs)
 {
     auto hcOpt = pc::HandshakeContinue::decode(buf, len);
-    if (!hcOpt) return;  // truncated — drop
+    if (!hcOpt) {
+        // Fix round 2 (I5): the header's sessionId names the handshake in
+        // progress (an awaitingHandshake pending connect with a resolved reply
+        // publication) — THAT handshake fails explicitly: HandshakeFailed on the
+        // header's correlationId, the pending connect closed.  Only a frame with
+        // no decodable header or no such handshake is unanswerable.
+        const auto hdr = pc::MessageHeader::decode(buf, len);
+        auto pit = pendingConnects_.begin();
+        for (; hdr && pit != pendingConnects_.end(); ++pit)
+            if (pit->sessionId == hdr->sessionId && pit->awaitingHandshake) break;
+        if (!hdr || pit == pendingConnects_.end() || !pit->resolvedPub) {
+            noteUnanswerable_(buf, len, "HandshakeContinue undecodable, no handshake in progress");
+            return;
+        }
+        ++rejectedRequests_;
+        failPendingHandshake_(pit, hdr->correlationId);
+        return;
+    }
     const auto& hc = *hcOpt;
 
     auto it = pendingConnects_.begin();
@@ -2078,16 +2498,7 @@ void ClientGateway::handleHandshakeContinue_(const uint8_t* buf, std::size_t len
     const auto hs = pending.tls->readInbound(
         reinterpret_cast<const uint8_t*>(hc.handshakeBytes.data()), hc.handshakeBytes.size());
     if (hs == rune::crypto::HsState::Failed) {
-        pc::HandshakeContinueResponse fail;
-        fail.sessionId     = pending.sessionId;
-        fail.correlationId = hc.correlationId;
-        fail.code          = static_cast<int16_t>(pc::ErrorCode::HandshakeFailed);
-        const std::size_t need = fail.encodedSize();
-        if (need <= scratch_.size()) {
-            (void)sendOnPub(*pending.resolvedPub, scratch_.data(), fail.encode(scratch_.data()));
-        }
-        closeDroppedPendingConnect_(pending);  // Task 13: close-everywhere for an announced-but-never-accepted session
-        pendingConnects_.erase(it);
+        failPendingHandshake_(it, hc.correlationId);
         return;
     }
 
@@ -2245,7 +2656,10 @@ void ClientGateway::drainPendingReleases()
 void ClientGateway::handleKeepalive(const uint8_t* buf, std::size_t len, int64_t nowNs)
 {
     auto msgOpt = pc::Keepalive::decode(buf, len);
-    if (!msgOpt) return;
+    if (!msgOpt) {
+        noteUnanswerable_(buf, len, "Keepalive body undecodable (no response type)");
+        return;
+    }
     sessions_.touch(msgOpt->sessionId, nowNs);
 }
 
@@ -2255,11 +2669,16 @@ void ClientGateway::handleKeepalive(const uint8_t* buf, std::size_t len, int64_t
 void ClientGateway::handlePing(const uint8_t* buf, std::size_t len, int64_t nowNs)
 {
     auto pingOpt = pc::Ping::decode(buf, len);
-    if (!pingOpt) return;
+    if (!pingOpt) {
+        // No-hang (R2): answered ErrorResponse{InvalidRequest} (the client
+        // completes its pending ping with that error).
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "Ping body undecodable");
+        return;
+    }
 
     Session* session = sessions_.find(pingOpt->sessionId);
     if (!session) {
-        // Unknown session — drop (no egress to reply on).
+        noteUnanswerable_(buf, len, "Ping for unknown session");
         return;
     }
 
@@ -2276,10 +2695,16 @@ void ClientGateway::handlePing(const uint8_t* buf, std::size_t len, int64_t nowN
 
     // Guard: echo payload must fit in the scratch buffer.
     const std::size_t needed = pc::MessageHeader::ENCODED_SIZE + 2 + pingOpt->echo.size();
-    if (needed > scratch_.size()) return; // oversized echo — drop
+    if (needed > scratch_.size()) {
+        // No-hang (R2): an echo the Pong cannot carry is answered, not dropped.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge),
+                             "Ping echo exceeds the Pong scratch");
+        return;
+    }
 
     const std::size_t encoded = pong.encode(scratch_.data());
-    sendTo(*session, scratch_.data(), encoded);
+    // No-hang (R2): queued under back-pressure, never a best-effort drop.
+    sendAnswer_(*session, scratch_.data(), encoded);
 }
 
 // ---------------------------------------------------------------------------
@@ -2288,7 +2713,10 @@ void ClientGateway::handlePing(const uint8_t* buf, std::size_t len, int64_t nowN
 void ClientGateway::handleDisconnect(const uint8_t* buf, std::size_t len)
 {
     auto msgOpt = pc::Disconnect::decode(buf, len);
-    if (!msgOpt) return;
+    if (!msgOpt) {
+        noteUnanswerable_(buf, len, "Disconnect body undecodable (no response type)");
+        return;
+    }
     (void)closeSession_(msgOpt->sessionId);
 }
 
@@ -2301,8 +2729,8 @@ bool ClientGateway::sendTo(Session& session, const uint8_t* buf, std::size_t len
     // encoded (every caller already encoded into scratch_/its own buffer),
     // BEFORE handing bytes to the egress. sendTo is the single chokepoint
     // every Session-aware broker->client send path funnels through
-    // (sendRespReliable_/enqueueOrBestEffort_/offerBytes_, sendControlFrame,
-    // sendSubscribeAnswer_, drainPendingResponses, trySendOwedPushError_,
+    // (sendRespReliable_/sendReliable_/offerBytes_, sendControlFrame,
+    // sendAnswer_, drainPendingResponses, trySendOwedPushError_,
     // handlePing, sendSessionExpired_) — so sealing here, once, covers all of
     // them with no per-caller duplication (Rule 3: one state, one code path).
     // `seq=++crypto.sendSeq`, encode CryptoSubHeader, seal into a reusable
@@ -2436,16 +2864,117 @@ void ClientGateway::sendErrorResponse_(Session& session, int64_t sessionId, int6
     if (needed <= scratch_.size()) {
         const std::size_t encoded = errResp.encode(scratch_.data());
         // G0.1: reliable delivery (retry on back-pressure).
-        enqueueOrBestEffort_(session, scratch_.data(), encoded);
+        sendReliable_(session, scratch_.data(), encoded);
     }
+}
+
+// ---------------------------------------------------------------------------
+// No-hang wave (R2): rejectRequest_ / noteUnanswerable_ — see the declaration.
+// Both run only after a decode / admission failure (cold path).  No
+// allocation: the answer is encoded into scratch_ (or by sendRespReliable_);
+// the log is rate-limited (first, then every 1024th) and formats integers only.
+// ---------------------------------------------------------------------------
+bool ClientGateway::rejectRequest_(const uint8_t* buf, std::size_t len, uint16_t code,
+                                   const char* why)
+{
+    const auto hdr = pc::MessageHeader::decode(buf, len);
+    if (!hdr) { noteUnanswerable_(buf, len, why); return false; }
+    Session* session = sessions_.find(hdr->sessionId);
+    if (!session) { noteUnanswerable_(buf, len, why); return false; }
+    if (!answerRejection_(*session, *hdr, code, why, buf, len)) { noteUnanswerable_(buf, len, why); return false; }
+    return true;
+}
+
+// The typed answer itself (own response type), or false when the request type
+// has none.  Old clients (< kClientVersionInvalidRequest) re-join forever on an
+// InvalidRequest / Internal JoinGroup / SyncGroup answer, so they get
+// ProtocolVersion there — which they already treat as non-retriable.
+bool ClientGateway::answerRejection_(Session& session, const pc::MessageHeader& hdr, uint16_t code,
+                                     const char* why, const uint8_t* buf, std::size_t len)
+{
+    const uint16_t tid = hdr.templateId;
+    if (!pc::clientUnderstandsInvalidRequest(session.clientVersion) &&
+        (tid == static_cast<uint16_t>(pc::TemplateId::JoinGroup) ||
+         tid == static_cast<uint16_t>(pc::TemplateId::SyncGroup))) {
+        code = static_cast<uint16_t>(pc::ErrorCode::ProtocolVersion);
+    }
+    // Fix round 4 (item 8): an old client stays Stable on a Heartbeat /
+    // OffsetFetch Internal / InvalidRequest (and re-fetches forever) — it gets
+    // UnknownMember, made true by evicting its members: it re-joins.
+    if (!pc::clientUnderstandsInvalidRequest(session.clientVersion) &&
+        (tid == static_cast<uint16_t>(pc::TemplateId::Heartbeat) ||
+         tid == static_cast<uint16_t>(pc::TemplateId::OffsetFetch)) &&
+        (code == static_cast<uint16_t>(pc::ErrorCode::Internal) ||
+         code == static_cast<uint16_t>(pc::ErrorCode::InvalidRequest))) [[unlikely]] {
+        code = static_cast<uint16_t>(pc::ErrorCode::UnknownMember);
+        evictOldClientMember_(session, tid, buf, len, nowNs_);
+        ++oldClientUnknownMemberAnswers_;
+    }
+    if (tid == static_cast<uint16_t>(pc::TemplateId::Produce)) {
+        // Version-gated frame (pre-D6 38 B for old clients), queued under back-pressure.
+        ++rejectedRequests_;
+        (void)sendRespReliable_(session, static_cast<pc::ErrorCode>(code), /*partition=*/-1,
+                                /*baseOffset=*/0, hdr.correlationId, /*logStartOffset=*/-1);
+        return true;
+    }
+    const std::size_t n = encodeRejection(tid, hdr.sessionId, hdr.correlationId, code,
+                                          scratch_.data(), scratch_.size());
+    if (n == 0) return false;
+    ++rejectedRequests_;
+    if (rejectedRequests_ % 1024 == 1) {
+        spdlog::warn("ClientGateway: request tid={} session={} corr={} rejected ({}): answered code {} "
+                     "(rejections={})", tid, hdr.sessionId, hdr.correlationId, why, code, rejectedRequests_);
+    }
+    sendAnswer_(session, scratch_.data(), n);
+    return true;
+}
+
+void ClientGateway::evictOldClientMember_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len,
+                                          int64_t nowNs)
+{
+    if (!groupService_) return;
+    const auto sv = [](std::span<const uint8_t> b) {
+        return std::string_view(reinterpret_cast<const char*>(b.data()), b.size());
+    };
+    if (tid == static_cast<uint16_t>(pc::TemplateId::Heartbeat)) {
+        if (const auto m = pc::Heartbeat::decode(buf, len)) {
+            groupService_->evictMember(sv(m->groupId), sv(m->memberId), session.sessionId, nowNs);
+            return;
+        }
+    } else if (tid == static_cast<uint16_t>(pc::TemplateId::SyncGroup)) {
+        if (const auto m = pc::SyncGroup::decode(buf, len)) {
+            groupService_->evictMember(sv(m->groupId), sv(m->memberId), session.sessionId, nowNs);
+            return;
+        }
+    } else if (tid == static_cast<uint16_t>(pc::TemplateId::OffsetFetch)) {
+        if (const auto m = pc::OffsetFetch::decode(buf, len)) {
+            groupService_->evictMember(sv(m->groupId), std::string_view{}, session.sessionId, nowNs);
+            return;
+        }
+    }
+    // Undecodable body: the group is unknown — the session's members (counted apart).
+    groupService_->evictSessionMembers(session.sessionId, nowNs);
+    ++oldClientSessionWideEvictions_;
+}
+
+void ClientGateway::noteUnanswerable_(const uint8_t* buf, std::size_t len, const char* why)
+{
+    if (unanswerableFrames_++ % 1024 != 0) return;
+    const auto hdr = pc::MessageHeader::decode(buf, len);
+    spdlog::warn("ClientGateway: unanswerable frame dropped ({}): len={} tid={} session={} "
+                 "(header {}; dropped so far={})", why, len, hdr ? hdr->templateId : 0,
+                 hdr ? hdr->sessionId : 0, hdr ? "decoded, no session / no response type" : "undecodable",
+                 unanswerableFrames_);
 }
 
 bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 {
     // 1. Decode Produce.
     auto msgOpt = pc::Produce::decode(buf, len);
-    if (!msgOpt) {
-        spdlog::debug("ClientGateway: Produce decode failed (truncated?) — dropped");
+    if (!msgOpt) [[unlikely]] {
+        // No-hang (R2): answered InvalidRequest on the header's correlationId.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                             "Produce body undecodable");
         return true;
     }
     const pc::Produce& msg = *msgOpt;
@@ -2454,8 +2983,8 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 
     // 2. Require known session.
     Session* session = sessions_.find(msg.sessionId);
-    if (!session) {
-        spdlog::debug("ClientGateway: Produce for unknown sessionId={} — dropped", msg.sessionId);
+    if (!session) [[unlikely]] {
+        noteUnanswerable_(buf, len, "Produce for unknown session");
         return true;
     }
     // F23: any request is liveness (Kafka: idle == no requests).  Reuses the
@@ -2497,11 +3026,15 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
                                    pc::ErrorResponse::BODY_FIXED + 2 +
                                    errResp.message.size();
-        if (needed > scratch_.size()) return;   // oversized — drop (same as before)
+        if (needed > scratch_.size()) [[unlikely]] {
+            // Fix round 2: an endpoint too long for the frame is never dropped —
+            // the client gets the bare NotLeader (it refreshes metadata, retries).
+            errResp.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            errResp.message = {};
+        }
         const std::size_t encoded = errResp.encode(scratch_.data());
-        // G0.1: route through the single reliable-egress primitive (retries on
-        // back-pressure; best-effort fallback for oversized redirect URLs).
-        enqueueOrBestEffort_(*session, scratch_.data(), encoded);
+        // G0.1: the single reliable-egress primitive (spilled under back-pressure).
+        sendReliable_(*session, scratch_.data(), encoded);
     };
 
     // Cluster-level fallback (path B): only when routingImage_ is null.
@@ -2620,8 +3153,19 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         return true;
     }
 
-    rune::storage::Log* log = topicRegistry_->log(msg.topicId, partition);
-    if (!log) {
+    // C1 (DDL conformance final review): servableLog() is log() for a topic whose
+    // catalog record committed; a runtime topic still awaiting its commit is not
+    // writable — answered NotLeader (retriable: the client refreshes metadata, which
+    // lists the topic once it commits, and retries).  Nothing is appended, so a
+    // topic boot may later reclaim as an orphan never holds an acknowledged record.
+    rune::storage::Log* log = topicRegistry_->servableLog(msg.topicId, partition);
+    if (!log) [[unlikely]] {
+        if (topicRegistry_->awaitingCommit(msg.topicId)) {
+            spdlog::debug("ClientGateway: Produce to topicId={} awaiting its DDL commit — NotLeader "
+                          "(retriable)", msg.topicId);
+            sendResp(pc::ErrorCode::NotLeader, partition, 0);
+            return true;
+        }
         spdlog::debug("ClientGateway: Produce bad partition={} for topicId={}", partition, msg.topicId);
         sendResp(pc::ErrorCode::UnknownPartition, partition, 0);
         return true;
@@ -2682,10 +3226,9 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // Guard: recordBatch must be present (non-empty).
     const std::size_t batchLen = msg.recordBatch.size();
     if (batchLen == 0) {
-        spdlog::debug("ClientGateway: Produce empty recordBatch — dropped");
-        // Reply InvalidBatch (no valid errorCode for InvalidBatch in client::ErrorCode;
-        // use Internal as the closest sentinel for a malformed produce).
-        sendResp(pc::ErrorCode::Internal, partition, 0);
+        // Fix round 2: a malformed request is InvalidRequest (39, non-retriable),
+        // not Internal.
+        sendResp(pc::ErrorCode::InvalidRequest, partition, 0);
         return true;
     }
 
@@ -2717,9 +3260,9 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     constexpr std::size_t kMinBatchSize =
         static_cast<std::size_t>(rune::protocol::batch::kRecordCountOffset) + 4u;
     if (batchLen < kMinBatchSize) {
-        spdlog::debug("ClientGateway: Produce batch too short ({} < {}); dropped",
+        spdlog::debug("ClientGateway: Produce batch too short ({} < {}); answered InvalidRequest",
                       batchLen, kMinBatchSize);
-        sendResp(pc::ErrorCode::Internal, partition, 0);
+        sendResp(pc::ErrorCode::InvalidRequest, partition, 0);
         return true;
     }
 
@@ -2775,7 +3318,7 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
         if (needed <= scratch_.size()) {
             const std::size_t encoded = errResp.encode(scratch_.data());
             // G0.1: reliable delivery (retry on back-pressure).
-            enqueueOrBestEffort_(*session, scratch_.data(), encoded);
+            sendReliable_(*session, scratch_.data(), encoded);
         }
         return true;  // log untouched — no append, no LEO advance
     }
@@ -3491,16 +4034,18 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
 {
     // 1. Decode.
     auto msgOpt = pc::Subscribe::decode(buf, len);
-    if (!msgOpt) {
-        spdlog::debug("ClientGateway: Subscribe decode failed (truncated?) — dropped");
+    if (!msgOpt) [[unlikely]] {
+        // No-hang (R2): answered SubscribeResponse{InvalidRequest}.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                             "Subscribe body undecodable");
         return;
     }
     const pc::Subscribe& msg = *msgOpt;
 
     // 2. Require known session.
     Session* session = sessions_.find(msg.sessionId);
-    if (!session) {
-        spdlog::debug("ClientGateway: Subscribe for unknown sessionId={} — dropped", msg.sessionId);
+    if (!session) [[unlikely]] {
+        noteUnanswerable_(buf, len, "Subscribe for unknown session");
         return;
     }
 
@@ -3524,10 +4069,14 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         const std::size_t needed = pc::MessageHeader::ENCODED_SIZE +
                                    pc::ErrorResponse::BODY_FIXED + 2 +
                                    errResp.message.size();
-        if (needed <= scratch_.size()) {
-            const std::size_t encoded = errResp.encode(scratch_.data());
-            sendSubscribeAnswer_(*session, scratch_.data(), encoded);  // CG round 3: queued, not best-effort
+        if (needed > scratch_.size()) [[unlikely]] {
+            // Fix round 2: an endpoint too long for the frame is never dropped —
+            // the client gets the bare NotLeader (it refreshes metadata, retries).
+            errResp.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+            errResp.message = {};
         }
+        const std::size_t encoded = errResp.encode(scratch_.data());
+        sendAnswer_(*session, scratch_.data(), encoded);  // CG round 3: queued, not best-effort
     };
 
     // Cluster-level fallback: only when routingImage_ is null.
@@ -3552,7 +4101,7 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         const std::size_t encoded = resp.encode(scratch_.data());
         // CG round 3 (MEDIUM-2): queued + retried under back-pressure like the
         // produce answers — never a best-effort drop of the binding answer.
-        sendSubscribeAnswer_(*session, scratch_.data(), encoded);
+        sendAnswer_(*session, scratch_.data(), encoded);
     };
 
     // 3. Resolve partition.
@@ -3626,8 +4175,17 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         return;
     }
 
-    rune::storage::Log* log = topicRegistry_->log(msg.topicId, partition);
+    // C1: a runtime topic awaiting its DDL commit is not readable — the bare
+    // ErrorResponse{NotLeader} every unservable-here subscribe gets (retriable:
+    // refresh metadata, retry); no subscription is registered.
+    rune::storage::Log* log = topicRegistry_->servableLog(msg.topicId, partition);
     if (!log) {
+        if (topicRegistry_->awaitingCommit(msg.topicId)) {
+            spdlog::debug("ClientGateway: Subscribe to topicId={} awaiting its DDL commit — NotLeader "
+                          "(retriable)", msg.topicId);
+            sendSubRedirect(std::string{}, msg.correlationId);
+            return;
+        }
         spdlog::debug("ClientGateway: Subscribe bad partition={} for topicId={}", partition, msg.topicId);
         sendResp(pc::ErrorCode::UnknownPartition, partition, 0);
         return;
@@ -3819,7 +4377,10 @@ void ClientGateway::handleUnsubscribe(const uint8_t* buf, std::size_t len)
 {
     auto msgOpt = pc::Unsubscribe::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("ClientGateway: Unsubscribe decode failed — dropped");
+        // No-hang (R2): Unsubscribe has no response type — nothing waits on it
+        // (the client removes its routing entry locally; the broker-side
+        // subscription dies with the session at the latest).  Counted + warned.
+        noteUnanswerable_(buf, len, "Unsubscribe body undecodable (no response type)");
         return;
     }
     // Only the owning session may remove a subscription (an Unsubscribe from
@@ -3977,6 +4538,10 @@ void ClientGateway::pushSubscriptions()
         }
 
         if (sub.nextOffset >= bound) continue; // nothing committed to push yet
+        // Fix round 4/5 (N9, N24): no Records to an Expiring session (its
+        // subscriptions end when its Expiring state is serviced) — checked only
+        // when there is something to push (the idle pass reads nothing more).
+        if (session->spill.state == SpillState::Expiring) [[unlikely]] continue;
 
         // E2 inc2a: When a WorkerPool is wired, route the log read through the
         // owning worker's SPSC ingress ring.  The chunk is returned via the
@@ -4604,7 +5169,7 @@ void ClientGateway::appendRemoteControlRecord(const rune::replication::WriteTxnM
     // Review MEDIUM-5: this node's routing image is NOT consulted — it can lag
     // the replica role; the worker's role gate is the authority (a follower
     // replica answers NotLeader through it).
-    rune::storage::Log* log = topicRegistry_ ? topicRegistry_->log(w.topicId, w.partition) : nullptr;
+    rune::storage::Log* log = topicRegistry_ ? topicRegistry_->servableLog(w.topicId, w.partition) : nullptr;   // C1
     if (log == nullptr || w.topicId < 0 || w.marker.empty()) {
         answerRemoteOrigin_(m, static_cast<int16_t>(pcl::ErrorCode::NotLeader), -1);
         return;
@@ -4857,15 +5422,18 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
             resp.rowBytesLen   = static_cast<uint32_t>(rowBytes.size());
             const std::size_t need = resp.encodedSize();
             if (need > kScratchSize) [[unlikely]] {
-                // A view row larger than the egress scratch (not expected in
-                // Phase 1's small rows): answer SchemaMismatch-free MessageTooLarge
-                // is out of scope; drop loudly rather than overrun scratch_.
-                spdlog::error("ClientGateway: ViewRowResponse {} B exceeds scratch ({} B) — dropped "
-                              "(viewTopicId={})", need, kScratchSize, ret.readTopicId);
-                return;
+                // Fix round 2 (I4): a row larger than the egress frame is answered
+                // ViewRowResponse{RowTooLarge (7)} with no row bytes — the read
+                // completes with that status (it used to be dropped).
+                spdlog::error("ClientGateway: ViewRowResponse {} B exceeds scratch ({} B) — answered "
+                              "RowTooLarge (viewTopicId={})", need, kScratchSize, ret.readTopicId);
+                resp.status      = pc::ViewRowResponse::kRowTooLarge;
+                resp.rowLen      = 0;
+                resp.rowBytes    = nullptr;
+                resp.rowBytesLen = 0;
             }
             const std::size_t encoded = resp.encode(scratch_.data());
-            enqueueOrBestEffort_(*session, scratch_.data(), encoded);
+            sendReliable_(*session, scratch_.data(), encoded);
             return;
         }
 
@@ -4920,7 +5488,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 // D6 review M4: the pre-D6 38 B frame below clientVersion 2.
                 const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);
                 // G0.1: reliable delivery (retry on back-pressure).
-                enqueueOrBestEffort_(*session, scratch_.data(), encoded);
+                sendReliable_(*session, scratch_.data(), encoded);
                 return;
             }
 
@@ -4940,7 +5508,7 @@ void ClientGateway::handleWorkerReturn_(rune::node::WorkerReturn ret)
                 okResp.baseOffset    = ret.baseOffset;
                 const std::size_t encoded = okResp.encodeFor(scratch_.data(), session->clientVersion);
                 // G0.1: reliable delivery (retry on back-pressure).
-                enqueueOrBestEffort_(*session, scratch_.data(), encoded);
+                sendReliable_(*session, scratch_.data(), encoded);
             }
             return;
         }
@@ -5254,7 +5822,7 @@ void ClientGateway::drainPendingAcks()
                 resp.partition     = entry.partition;
                 resp.baseOffset    = 0;
                 const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);   // D6 M4
-                enqueueOrBestEffort_(*session, scratch_.data(), encoded);
+                sendReliable_(*session, scratch_.data(), encoded);
             }
             spdlog::debug("ClientGateway: acks=All pending ack for topic={} partition={} is stale "
                           "(partition removed / re-created) → NotLeader", entry.topicId, entry.partition);
@@ -5276,7 +5844,7 @@ void ClientGateway::drainPendingAcks()
                 resp.partition     = entry.partition;
                 resp.baseOffset    = 0;
                 const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);   // D6 M4
-                enqueueOrBestEffort_(*session, scratch_.data(), encoded);
+                sendReliable_(*session, scratch_.data(), encoded);
             }
             if (i + 1 < pendingAcks_.size()) pendingAcks_[i] = std::move(pendingAcks_.back());
             pendingAcks_.pop_back();
@@ -5307,7 +5875,7 @@ void ClientGateway::drainPendingAcks()
                 // G0.1: reliable delivery (retry on back-pressure) — this is the
                 // highest-durability acks=All OK ack; a silent drop here is the
                 // exact defect #3 the retry queue exists to prevent.
-                enqueueOrBestEffort_(*session, scratch_.data(), encoded);
+                sendReliable_(*session, scratch_.data(), encoded);
                 spdlog::debug("ClientGateway: acks=All deferred ack sent OK "
                               "sessionId={} partition={} baseOffset={} lastOffset={} hw={}",
                               entry.sessionId, entry.partition, entry.baseOffset,
@@ -5330,7 +5898,7 @@ void ClientGateway::drainPendingAcks()
                 resp.baseOffset    = entry.baseOffset;
                 const std::size_t encoded = resp.encodeFor(scratch_.data(), session->clientVersion);   // D6 M4
                 // G0.1: reliable delivery (retry on back-pressure).
-                enqueueOrBestEffort_(*session, scratch_.data(), encoded);
+                sendReliable_(*session, scratch_.data(), encoded);
                 spdlog::warn("ClientGateway: acks=All deferred ack timed out "
                              "sessionId={} partition={} baseOffset={} lastOffset={} "
                              "hw={} elapsed_ms={}",
@@ -5465,8 +6033,9 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
                                        int64_t nowNs, uint16_t tid)
 {
     if (!groupService_) {
-        // Group service not wired in — drop silently (configuration choice).
-        spdlog::debug("ClientGateway: group message tid={} received but groupService_ not set — dropped", tid);
+        // No-hang (R2): no group service on this node — answered Internal.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal),
+                             "group service not wired");
         return;
     }
 
@@ -5476,17 +6045,35 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
     // session lookup.
     auto hdrOpt = pc::MessageHeader::decode(buf, len);
     if (!hdrOpt) {
-        spdlog::debug("ClientGateway: group message tid={} header decode failed — dropped", tid);
+        noteUnanswerable_(buf, len, "group message header undecodable");
         return;
     }
 
     Session* session = sessions_.find(hdrOpt->sessionId);
     if (!session) {
-        spdlog::debug("ClientGateway: group message tid={} for unknown sessionId={} — dropped",
-                      tid, hdrOpt->sessionId);
+        noteUnanswerable_(buf, len, "group message for unknown session");
         return;
     }
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
+
+    // Fix round 2 (old-client compatibility): a client below
+    // kClientVersionInvalidRequest re-joins forever on an InvalidRequest
+    // JoinGroup / SyncGroup answer — the gateway checks the body itself for
+    // those clients so answerRejection_ can answer ProtocolVersion instead.
+    // Fix round 4 (item 8): ... and Heartbeat / OffsetFetch, whose rejection an
+    // old client gets as UnknownMember (answerRejection_).
+    if (!pc::clientUnderstandsInvalidRequest(session->clientVersion)) [[unlikely]] {
+        const bool undecodable =
+            (tid == static_cast<uint16_t>(pc::TemplateId::JoinGroup) && !pc::JoinGroup::decode(buf, len)) ||
+            (tid == static_cast<uint16_t>(pc::TemplateId::SyncGroup) && !pc::SyncGroup::decode(buf, len)) ||
+            (tid == static_cast<uint16_t>(pc::TemplateId::Heartbeat) && !pc::Heartbeat::decode(buf, len)) ||
+            (tid == static_cast<uint16_t>(pc::TemplateId::OffsetFetch) && !pc::OffsetFetch::decode(buf, len));
+        if (undecodable) {
+            (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                                 "group request undecodable (old client)");
+            return;
+        }
+    }
 
     // Dispatch to the service.  The service encodes the response into scratch_.
     // Capacity is passed so handlers bound-check BEFORE writing each element;
@@ -5514,18 +6101,43 @@ void ClientGateway::handleGroupMessage(const uint8_t* buf, std::size_t len,
             encoded = groupService_->handleOffsetFetch(buf, len, nowNs, scratch_.data(), cap);
             break;
         default:
-            return; // unknown group template — drop
+            // Unreachable: onClientFrame_ routes only the six group request ids here.
+            (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                                 "not a group request");
+            return;
     }
 
-    if (encoded == 0) return; // handler signalled an error (e.g. decode failure)
-    if (encoded > scratch_.size()) {
-        // Should never happen: handlers bound-check before writing.
-        spdlog::error("ClientGateway: group response tid={} encoded size {} > scratch {} — BUG; dropped",
+    // No-hang (R2): the service answers its own decode failures
+    // (InvalidRequest, RequestRejection.h) — a group handler never defers its
+    // answer, so 0 here means it could not answer at all: Internal, never a drop.
+    if (encoded == 0 || encoded > scratch_.size()) [[unlikely]] {
+        spdlog::error("ClientGateway: group response tid={} encoded size {} (scratch {}) — answered Internal",
                       tid, encoded, scratch_.size());
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal),
+                             "group service produced no answer");
         return;
     }
 
-    sendTo(*session, scratch_.data(), encoded);
+    // Fix round 4 (item 8, pre-v5 clients): a v4 member stays Stable on a
+    // Heartbeat / SyncGroup error outside the rebalance set — Internal (an
+    // unknown coordinator result) is answered UnknownMember instead, and the
+    // member is evicted so the answer is true: the v4 member re-joins.
+    if (!pc::clientUnderstandsInvalidRequest(session->clientVersion) &&
+        (templateId == pc::TemplateId::Heartbeat || templateId == pc::TemplateId::SyncGroup) &&
+        encoded >= pc::MessageHeader::ENCODED_SIZE + 2) [[unlikely]] {
+        uint8_t* const ec = scratch_.data() + pc::MessageHeader::ENCODED_SIZE;   // errorCode: body offset 0
+        const auto code = static_cast<pc::ErrorCode>(static_cast<uint16_t>(ec[0] | (ec[1] << 8)));
+        if (code == pc::ErrorCode::Internal || code == pc::ErrorCode::InvalidRequest) {
+            const auto um = static_cast<uint16_t>(pc::ErrorCode::UnknownMember);
+            ec[0] = static_cast<uint8_t>(um & 0xFF);
+            ec[1] = static_cast<uint8_t>(um >> 8);
+            evictOldClientMember_(*session, tid, buf, len, nowNs);
+            ++oldClientUnknownMemberAnswers_;
+        }
+    }
+
+    // Queued under back-pressure (never a best-effort drop of a coordinator answer).
+    sendAnswer_(*session, scratch_.data(), encoded);
 }
 
 // ---------------------------------------------------------------------------
@@ -5562,7 +6174,8 @@ bool ClientGateway::redirectToCoordinator_(Session& session, int64_t correlation
     ++coordinatorRedirects_;
     spdlog::debug("ClientGateway: coordinator request on a follower sessionId={} corr={} → NotCoordinator {}",
                   session.sessionId, correlationId, lv.leaderClientEndpoint);
-    sendTo(session, scratch_.data(), encoded);
+    // No-hang (R2): queued under back-pressure, never a best-effort drop.
+    sendAnswer_(session, scratch_.data(), encoded);
     return true;
 }
 
@@ -5579,25 +6192,29 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
                                      int64_t nowNs, uint16_t tid)
 {
     if (!txnService_) {
-        spdlog::debug("ClientGateway: txn message tid={} received but txnService_ not set — dropped", tid);
+        // No-hang (R2): no txn service on this node — answered Internal.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal),
+                             "txn service not wired");
         return;
     }
 
     auto hdrOpt = pc::MessageHeader::decode(buf, len);
     if (!hdrOpt) {
-        spdlog::debug("ClientGateway: txn message tid={} header decode failed — dropped", tid);
+        noteUnanswerable_(buf, len, "txn message header undecodable");
         return;
     }
 
     Session* session = sessions_.find(hdrOpt->sessionId);
     if (!session) {
-        spdlog::debug("ClientGateway: txn message tid={} for unknown sessionId={} — dropped",
-                      tid, hdrOpt->sessionId);
+        noteUnanswerable_(buf, len, "txn message for unknown session");
         return;
     }
     if (redirectToCoordinator_(*session, hdrOpt->correlationId)) return;   // D4
 
     std::size_t encoded = 0;
+    // Fix round 3 (I3): the scratch always holds any fixed-size txn answer and
+    // any rejection — a handler's 0 can only mean EndTxn's "deferred".
+    static_assert(kScratchSize >= kTxnMinOutCap, "txn handlers need kTxnMinOutCap");
     const std::size_t cap = scratch_.size();
     const auto templateId = static_cast<pc::TemplateId>(tid);
     switch (templateId) {
@@ -5617,17 +6234,34 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
             encoded = txnService_->handleEndTxn(buf, len, nowNs, scratch_.data(), cap);
             break;
         default:
-            return; // unknown txn template — drop
+            // Unreachable: onClientFrame_ routes only the five txn request ids here.
+            (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest),
+                                 "not a txn request");
+            return;
     }
 
-    if (encoded == 0) return;
-    if (encoded > scratch_.size()) {
-        spdlog::error("ClientGateway: txn response tid={} encoded size {} > scratch {} — BUG; dropped",
+    // 0 = the answer is DEFERRED — legal for EndTxn only (sent by
+    // completeAwaiting_ when the last marker lands; ITxnRequestHandler
+    // contract).  The service answers decode failures (InvalidRequest) and
+    // responses that do not fit (MessageTooLarge) itself.  A 0 from any other
+    // handler is a broken contract: answered Internal, never dropped.
+    if (encoded == 0) {
+        if (templateId == pc::TemplateId::EndTxn) return;   // deferred
+        spdlog::error("ClientGateway: txn handler tid={} produced no answer — answered Internal", tid);
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal),
+                             "txn service produced no answer");
+        return;
+    }
+    if (encoded > scratch_.size()) [[unlikely]] {
+        spdlog::error("ClientGateway: txn response tid={} encoded size {} > scratch {} — BUG; answered Internal",
                       tid, encoded, scratch_.size());
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal),
+                             "txn response overflow");
         return;
     }
 
-    sendTo(*session, scratch_.data(), encoded);
+    // Queued under back-pressure (never a best-effort drop of a coordinator answer).
+    sendAnswer_(*session, scratch_.data(), encoded);
 }
 
 // ---------------------------------------------------------------------------
@@ -5639,12 +6273,16 @@ void ClientGateway::handleTxnMessage(const uint8_t* buf, std::size_t len,
 void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
 {
     if (!adminSink_) {
-        spdlog::debug("ClientGateway: DefineTopic received but adminSink_ not set — dropped");
+        // No-hang (R2): no admin thread wired — answered Internal.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "DefineTopic: admin sink not wired");
         return;
     }
     auto msgOpt = pc::DefineTopic::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("ClientGateway: DefineTopic decode failed — dropped");
+        // Final review M3 / no-hang (R2): a malformed body (e.g. an unknown
+        // persistence byte) is answered InvalidSchema (23) on the header's
+        // correlationId — the client never waits out its timeout.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidSchema), "DefineTopic body undecodable");
         return;
     }
     const pc::DefineTopic& m = *msgOpt;
@@ -5652,16 +6290,21 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
     // Require a known session (mirror handleProduce).
     Session* session = sessions_.find(m.sessionId);
     if (!session) {
-        spdlog::debug("ClientGateway: DefineTopic for unknown sessionId={} — dropped", m.sessionId);
+        noteUnanswerable_(buf, len, "DefineTopic for unknown session");
         return;
     }
 
     // Copy-and-return: the sink OWNS the copied bytes (name/keyField/blob views
     // point into the ingress buffer and are copied by the sink before return).
-    (void)adminSink_->submitDefineTopic(m.sessionId, m.correlationId,
-                                        m.topicName, m.partitionCount,
-                                        m.keyField, m.validate,
-                                        m.descriptorBlob, m.descriptorLen);
+    if (!adminSink_->submitDefineTopic(m.sessionId, m.correlationId,
+                                       m.topicName, m.partitionCount,
+                                       m.keyField, m.validate,
+                                       m.descriptorBlob, m.descriptorLen,
+                                       m.persistence)) {
+        // No-hang (R2): admin request ring full — answered Internal (retry later).
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "DefineTopic: admin ring full");
+        return;
+    }
     // Return immediately — the AdminWorker produces the DefineTopicResponse
     // asynchronously on the session egress (via the admin→control egress ring).
 }
@@ -5673,23 +6316,26 @@ void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
 void ClientGateway::handleGetTopicSchema(const uint8_t* buf, std::size_t len)
 {
     if (!adminSink_) {
-        spdlog::debug("ClientGateway: GetTopicSchema received but adminSink_ not set — dropped");
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "GetTopicSchema: admin sink not wired");
         return;
     }
     auto msgOpt = pc::GetTopicSchema::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("ClientGateway: GetTopicSchema decode failed — dropped");
+        // No-hang (R2): answered TopicSchemaResponse{InvalidSchema}.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidSchema), "GetTopicSchema body undecodable");
         return;
     }
     const pc::GetTopicSchema& m = *msgOpt;
 
     Session* session = sessions_.find(m.sessionId);
     if (!session) {
-        spdlog::debug("ClientGateway: GetTopicSchema for unknown sessionId={} — dropped", m.sessionId);
+        noteUnanswerable_(buf, len, "GetTopicSchema for unknown session");
         return;
     }
-    (void)adminSink_->submitGetSchema(m.sessionId, m.correlationId, m.topicName,
-                                      m.requestedFingerprint);
+    if (!adminSink_->submitGetSchema(m.sessionId, m.correlationId, m.topicName,
+                                     m.requestedFingerprint)) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "GetTopicSchema: admin ring full");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5704,12 +6350,13 @@ void ClientGateway::handleGetTopicSchema(const uint8_t* buf, std::size_t len)
 void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
 {
     if (!adminSink_) {
-        spdlog::debug("ClientGateway: AlterTopic received but adminSink_ not set — dropped");
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "AlterTopic: admin sink not wired");
         return;
     }
     auto msgOpt = pc::AlterTopic::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("ClientGateway: AlterTopic decode failed — dropped");
+        // No-hang (R2): answered AlterTopicResponse{InvalidSchema}.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidSchema), "AlterTopic body undecodable");
         return;
     }
     const pc::AlterTopic& m = *msgOpt;
@@ -5717,14 +6364,17 @@ void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
     // Require a known session (mirror handleDefineTopic).
     Session* session = sessions_.find(m.sessionId);
     if (!session) {
-        spdlog::debug("ClientGateway: AlterTopic for unknown sessionId={} — dropped", m.sessionId);
+        noteUnanswerable_(buf, len, "AlterTopic for unknown session");
         return;
     }
 
     // Copy-and-return: the sink OWNS the copied bytes (topicName/opsBlob views
     // point into the ingress buffer and are copied by the sink before return).
-    (void)adminSink_->submitAlterTopic(m.sessionId, m.correlationId, m.topicName,
-                                       m.expectedVersion, m.opsBlob, m.opsLen);
+    if (!adminSink_->submitAlterTopic(m.sessionId, m.correlationId, m.topicName,
+                                      m.expectedVersion, m.opsBlob, m.opsLen)) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "AlterTopic: admin ring full");
+        return;
+    }
     // Return immediately — the AdminWorker produces the AlterTopicResponse
     // asynchronously on the session egress (via the admin→control egress ring).
 }
@@ -5741,12 +6391,14 @@ void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
 void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
 {
     if (!adminSink_) {
-        spdlog::debug("ClientGateway: CreateView received but adminSink_ not set — dropped");
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "CreateView: admin sink not wired");
         return;
     }
     auto msgOpt = pc::CreateView::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("ClientGateway: CreateView decode failed — dropped");
+        // No-hang (R2): answered CreateViewResponse{InvalidSchema} (e.g. an
+        // unknown persistence byte — CreateView::decode rejects > 1).
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidSchema), "CreateView body undecodable");
         return;
     }
     const pc::CreateView& m = *msgOpt;
@@ -5754,15 +6406,18 @@ void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
     // Require a known session (mirror handleDefineTopic).
     Session* session = sessions_.find(m.sessionId);
     if (!session) {
-        spdlog::debug("ClientGateway: CreateView for unknown sessionId={} — dropped", m.sessionId);
+        noteUnanswerable_(buf, len, "CreateView for unknown session");
         return;
     }
 
     // Copy-and-return: the sink OWNS the copied bytes (viewName/keyField/planBlob
     // views point into the ingress buffer and are copied by the sink before return).
-    (void)adminSink_->submitCreateView(m.sessionId, m.correlationId,
-                                       m.viewName, m.keyField, m.persistence,
-                                       m.planBlob, m.planLen);
+    if (!adminSink_->submitCreateView(m.sessionId, m.correlationId,
+                                      m.viewName, m.keyField, m.persistence,
+                                      m.planBlob, m.planLen)) {
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "CreateView: admin ring full");
+        return;
+    }
     // Return immediately — the AdminWorker produces the CreateViewResponse
     // asynchronously on the session egress (via the admin→control egress ring).
 }
@@ -5786,19 +6441,22 @@ void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
 void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
 {
     if (!workerPool_) {
-        spdlog::debug("ClientGateway: GetViewRow received but workerPool_ not set — dropped");
+        // No-hang (R2): no workers on this gateway — no view is servable here, a
+        // permanent condition: UnknownView (4), not the retriable NotReady.
+        (void)rejectRequest_(buf, len, pc::ViewRowResponse::kUnknownView, "GetViewRow: no worker pool");
         return;
     }
     auto msgOpt = pc::GetViewRow::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("ClientGateway: GetViewRow decode failed — dropped");
+        // No-hang (R2): answered ViewRowResponse{InvalidRequest (5)}.
+        (void)rejectRequest_(buf, len, pc::ViewRowResponse::kInvalidRequest, "GetViewRow body undecodable");
         return;
     }
     const pc::GetViewRow& m = *msgOpt;
 
     Session* session = sessions_.find(m.sessionId);
     if (!session) {
-        spdlog::debug("ClientGateway: GetViewRow for unknown sessionId={} — dropped", m.sessionId);
+        noteUnanswerable_(buf, len, "GetViewRow for unknown session");
         return;
     }
 
@@ -5824,10 +6482,10 @@ void ClientGateway::handleGetViewRow(const uint8_t* buf, std::size_t len)
     op.hwBound       = static_cast<int64_t>(m.requestedFingerprint); // requestedFingerprint (reused field)
 
     if (!workerPool_->tryEnqueueOp(m.viewTopicId, partition, std::move(op))) {
-        // Back-pressure: the worker ingress ring is full this cycle.  The client
-        // re-issues the read (a point read is idempotent); nothing is parked.
-        spdlog::debug("ClientGateway: GetViewRow enqueue back-pressured (viewTopicId={} partition={})",
-                      m.viewTopicId, partition);
+        // Back-pressure: the worker ingress ring is full this cycle.  No-hang
+        // (R2): answered ViewRowResponse{Busy (6)} — the read was not performed;
+        // the client re-issues it (a point read is idempotent).  Nothing parked.
+        (void)rejectRequest_(buf, len, pc::ViewRowResponse::kBusy, "GetViewRow: worker ring full");
     }
 }
 
@@ -5866,9 +6524,9 @@ int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
         return -1;
     }
 
-    rune::storage::Log* log = topicRegistry_->log(topicId, partition);
+    rune::storage::Log* log = topicRegistry_->servableLog(topicId, partition);   // C1
     if (!log) {
-        spdlog::warn("ClientGateway::addGroupSubscription: unknown topicId={} partition={}",
+        spdlog::warn("ClientGateway::addGroupSubscription: unknown (or uncommitted) topicId={} partition={}",
                      topicId, partition);
         return -1;
     }
@@ -5982,7 +6640,12 @@ bool ClientGateway::sendControlFrame(int64_t sessionId,
         spdlog::debug("ClientGateway::sendControlFrame: unknown sessionId={} — dropped", sessionId);
         return false;
     }
-    return sendTo(*session, buf, len);
+    // No-hang (R2): every answer delivered through here (DDL responses from the
+    // admin thread, deferred EndTxn answers, Assign) is queued and retried under
+    // back-pressure — a best-effort sendTo lost it and left the client waiting.
+    if (!session->egress) return sendTo(*session, buf, len);   // egress-less test sessions (capture hook)
+    sendReliable_(*session, buf, len);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -6037,10 +6700,10 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
         return -1;
     }
 
-    rune::storage::Log* log = topicRegistry_->log(topicId, partition);
+    rune::storage::Log* log = topicRegistry_->servableLog(topicId, partition);   // C1
     if (!log) {
-        spdlog::debug("ClientGateway::appendControlRecord: unknown topicId={} partition={} — dropped",
-                      topicId, partition);
+        spdlog::debug("ClientGateway::appendControlRecord: unknown (or uncommitted) topicId={} partition={} "
+                      "— dropped", topicId, partition);
         return -1;
     }
 
@@ -6268,12 +6931,19 @@ void ClientGateway::notifyControlMarker(int32_t topicId, int32_t partition,
 void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
 {
     auto reqOpt = pc::MetadataRequest::decode(buf, len);
-    if (!reqOpt) return;  // truncated or bad — drop
+    if (!reqOpt) {
+        // No-hang (R2): answered ErrorResponse{InvalidRequest}.
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), "MetadataRequest body undecodable");
+        return;
+    }
 
     const pc::MetadataRequest& req = *reqOpt;
 
     Session* session = sessions_.find(req.sessionId);
-    if (!session) return;  // unknown session — drop
+    if (!session) {
+        noteUnanswerable_(buf, len, "MetadataRequest for unknown session");
+        return;
+    }
 
     // -----------------------------------------------------------------------
     // Build BrokerEntry list from nodeEndpointMap_.
@@ -6335,8 +7005,9 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
     //   partition = gpid % kMaxGpidPartitions
     //
     // If topicRegistry_ is set, we only include partitions whose topicId is in
-    // range [0, topicRegistry_->topicCount()).  This prevents ghost partitions
-    // from a stale routing image that refers to topics no longer registered.
+    // range [0, topicRegistry_->topicCount()) and whose partition is below that
+    // topic's registered partitionCount.  This prevents ghost partitions from a
+    // stale routing image that refers to topics/partitions no longer registered.
     //
     // If the request carries specific topicIds (topicIds non-empty), filter
     // to only those topics.
@@ -6373,9 +7044,17 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
             const int32_t topicId   = gpid / kMaxGpidPartitions;
             const int32_t partition = gpid % kMaxGpidPartitions;
 
-            // Filter: known topics only (when topicRegistry_ is wired).
-            if (topicRegistry_ && topicId >= topicRegistry_->topicCount()) {
-                continue;
+            // Filter: known topics only (when topicRegistry_ is wired) — and only
+            // the partitions the registry has: the replicated image can still
+            // assign a partition the registry no longer holds (DDL conformance
+            // D1: a ZERO-partition __orphan.<id> placeholder recovered at boot
+            // keeps its pre-restart assignment in __cluster_metadata).
+            // C1: a runtime topic awaiting its DDL commit is not listed.
+            if (topicRegistry_) {
+                if (topicId >= topicRegistry_->topicCount()) continue;
+                const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
+                if (spec == nullptr || partition >= spec->partitionCount) continue;
+                if (topicRegistry_->awaitingCommit(topicId)) continue;
             }
 
             // Filter: requested topics only (when non-empty topic list in request).
@@ -6467,10 +7146,13 @@ void ClientGateway::handleMetadata(const uint8_t* buf, std::size_t len)
     const std::size_t needed = resp.encodedSize();
     if (needed <= scratch_.size()) {
         const std::size_t encoded = resp.encode(scratch_.data());
-        sendTo(*session, scratch_.data(), encoded);
+        // No-hang (R2): queued under back-pressure (best-effort only above a ring slot).
+        sendAnswer_(*session, scratch_.data(), encoded);
     } else {
-        spdlog::warn("ClientGateway: MetadataResponse too large ({} bytes); scratch={} — dropped",
-                     needed, scratch_.size());
+        spdlog::warn("ClientGateway: MetadataResponse too large ({} bytes); scratch={} — answered "
+                     "MessageTooLarge", needed, scratch_.size());
+        (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge),
+                             "MetadataResponse exceeds scratch");
     }
 }
 

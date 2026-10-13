@@ -165,6 +165,13 @@ public:
     size_t handleLeaveGroup  (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
     size_t handleOffsetCommit(const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
     size_t handleOffsetFetch (const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap) override;
+    /// No-hang fix round 4 (item 8): every member tracked on `sessionId` leaves
+    /// its group (subscriptions revoked, session mapping dropped).  Cold.
+    void evictSessionMembers(int64_t sessionId, int64_t nowNs) override;
+    /// No-hang fix round 5 (N23): only the request's (group, member) on `sessionId`
+    /// (memberId empty: this session's members of that group).  Cold.
+    void evictMember(std::string_view groupId, std::string_view memberId, int64_t sessionId,
+                     int64_t nowNs) override;
 
 private:
     // -----------------------------------------------------------------------
@@ -245,6 +252,7 @@ private:
     std::string groupIdScratch_;    ///< groupId span → reusable std::string
     std::string memberIdScratch_;   ///< memberId span → reusable std::string
     std::string memberKeyScratch_;  ///< "groupId:memberId" composite lookup key
+    std::vector<std::string> evictScratch_;   ///< fix round 4: members to evict (cold path)
 
     // CG-4: scratch buffer for Assign frame encoding.
     // 68 KiB bound: header 24 + generationId 4 + count 2 = 30 B fixed; each

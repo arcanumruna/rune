@@ -11,6 +11,7 @@
 // No Aeron driver required: uses makeForTest() + applyMetadataForTest() + setOnEgressFrame().
 
 #include <rune/gateway/ClientGateway.h>
+#include <rune/protocol/client/ControlMessages.h>
 #include <rune/metadata/RoutingImage.h>
 #include <rune/metadata/Gpid.h>
 #include <rune/metadata/ShardRouter.h>
@@ -429,6 +430,29 @@ TEST(MetadataResponseIngressStreamIdRegression, ShardModeAdvertisesTheStreamTheN
                "advertised worker endpoint; topic=" << p.topicId << " part=" << p.partition;
         EXPECT_FALSE(std::string(p.ingressEndpoint).empty()) << "the endpoint-aware route stays advertised";
     }
+}
+
+
+// No-hang wave (R2): a MetadataRequest whose body does not decode is answered
+// ErrorResponse{InvalidRequest} on its correlationId (it used to be dropped).
+TEST(MetadataResponseRegression, MalformedMetadataRequestIsAnsweredInvalidRequestRegression)
+{
+    ClientGateway gw = ClientGateway::makeForTest(acceptAllEgress, /*sessionId=*/1);
+    std::optional<pc::ErrorResponse> err;
+    gw.setOnEgressFrame([&](int64_t, const uint8_t* buf, std::size_t len) {
+        if (auto e = pc::ErrorResponse::decode(buf, len)) err = e;
+    });
+    const int64_t sid = gw.injectTestSession();
+    pc::MessageHeader h;
+    h.blockLength = 0; h.templateId = static_cast<uint16_t>(pc::TemplateId::MetadataRequest);
+    h.sessionId = sid; h.correlationId = 818;
+    std::vector<uint8_t> f(pc::MessageHeader::ENCODED_SIZE);   // header only: the count field is missing
+    h.encode(f.data());
+    ASSERT_FALSE(pc::MetadataRequest::decode(f.data(), f.size()).has_value());
+    gw.applyMetadataForTest(f.data(), f.size());
+    ASSERT_TRUE(err.has_value()) << "a malformed MetadataRequest must be answered";
+    EXPECT_EQ(err->correlationId, 818);
+    EXPECT_EQ(err->code, static_cast<int16_t>(pc::ErrorCode::InvalidRequest));
 }
 
 } // namespace

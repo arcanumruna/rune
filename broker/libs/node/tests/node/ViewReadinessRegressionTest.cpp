@@ -12,6 +12,9 @@
 //
 // Review-focus #5: a GetViewRow for a view still REBUILDING_VIEWS surfaces a
 // RETRIABLE not-ready (nullptr + RowStatus::NotReady), never a half-built row.
+#include <unistd.h>
+#include <filesystem>
+#include <string>
 #include <gtest/gtest.h>
 
 #include <cstdint>
@@ -31,6 +34,29 @@
 #include <rune/node/WorkerViewSet.h>
 
 namespace {
+
+// Per-PROCESS view data dirs "<temp>/<name>-<pid>": ctest -j runs each test as its
+// own process (and other checkouts run the same suites), so a fixed /tmp/<name>
+// let one process's cleanup wipe another's files.  Removed when the tests finish.
+std::vector<std::string>& createdTmpDirs() {
+    static std::vector<std::string> dirs;
+    return dirs;
+}
+std::string tmpDir(const std::string& name) {
+    std::string d = (std::filesystem::temp_directory_path() /
+                     (name + "-" + std::to_string(::getpid()))).string();
+    createdTmpDirs().push_back(d);
+    return d;
+}
+class TmpDirCleanup : public ::testing::Environment {
+public:
+    void TearDown() override {
+        std::error_code ec;
+        for (const std::string& d : createdTmpDirs()) std::filesystem::remove_all(d, ec);
+    }
+};
+[[maybe_unused]] ::testing::Environment* const kTmpDirCleanup =
+    ::testing::AddGlobalTestEnvironment(new TmpDirCleanup);
 
 // v1 "character" source: {characterId: Int64 key (tag 0), hp: Int32 (tag 1)}.
 rune::codec::Descriptor charSourceV1() {
@@ -148,7 +174,7 @@ TEST(ViewReadinessRegression, GetViewRowNotReadyIsRetriable) {
         makeBaseCheckpoint(comp.plan, comp.rowLayout, src, upsertRun(7, 10, 2, 0), /*foldTo*/ 2);
 
     rune::node::ViewSnapshotChannel channel;
-    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-test");
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-test"));
 
     // Install-for-recovery: checkpointO=2 (from the base), committedTail=4.
     // The source log tail (2,4] still has to be replayed -> REBUILDING_VIEWS.
@@ -202,7 +228,7 @@ TEST(ViewReadinessRegression, ColdAllNodeRestartReachesReadyFromLocalStateOnly) 
     auto comp = rune::view::compileView(hpView(0), srcs, 0x40000007).value();
 
     rune::node::ViewSnapshotChannel channel;
-    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-test");
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-test"));
 
     // Empty checkpoint (no base, no deltas) -> foldCursor starts at 0.  The
     // committed source tail is [0,3) -> REBUILDING_VIEWS (committedTail=3>0).
@@ -243,7 +269,7 @@ TEST(ViewReadinessRegression, EmptySourceIsReadyImmediately) {
     auto comp = rune::view::compileView(hpView(0), srcs, 0x40000007).value();
 
     rune::node::ViewSnapshotChannel channel;
-    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-test");
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-test"));
 
     const std::span<const uint8_t> noBase{};
     const std::span<const std::span<const uint8_t>> noDeltas{};
@@ -258,7 +284,7 @@ TEST(ViewReadinessRegression, EmptySourceIsReadyImmediately) {
 // the no-views case must never gate serving/elections closed.
 TEST(ViewReadinessRegression, NoInstancesIsReady) {
     rune::node::ViewSnapshotChannel channel;
-    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-test");
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-test"));
     EXPECT_TRUE(vs.allViewsReady());
 }
 
@@ -275,7 +301,7 @@ TEST(ViewReadinessRegression, CapacityExceededEventDoesNotStopFolding) {
     comp.plan.sizing.maxRows = 1;  // capacity-bounded view
 
     rune::node::ViewSnapshotChannel channel;
-    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-test");
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-test"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ true);
 
     const auto b0 = upsertRun(7, 10, /*count*/ 1, /*baseOffset*/ 0);  // key 7 @ [0,1)
@@ -323,7 +349,7 @@ TEST(ViewReadinessRegression, RecoverAtMaxRowsStillReachesReadyNoStall) {
         makeBaseCheckpoint(comp.plan, comp.rowLayout, src, upsertRun(7, 10, 1, 0), /*foldTo*/ 1);
 
     rune::node::ViewSnapshotChannel channel;
-    rune::node::WorkerViewSet vs(channel, "/tmp/rune-views-test");
+    rune::node::WorkerViewSet vs(channel, tmpDir("rune-views-test"));
 
     const std::span<const std::span<const uint8_t>> noDeltas{};
     vs.installViewForRecovery(comp.plan, comp.rowLayout, src, /*persisted*/ true,

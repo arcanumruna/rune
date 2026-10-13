@@ -47,6 +47,12 @@
 #         map would give n 4, total 110).
 #     Prints "VIEW-ENGINE-E2E: OK" on success.
 #
+#   DDL conformance legs: setup also asserts ALTER on a view answers 38
+#   (ViewNotAlterable); two race containers (RUNE_MODE=ddl_race) fire colliding
+#   DDL released by one barrier file — exactly one wins per leg; and a
+#   RUNE_MODE=catalog_dump snapshot taken before the restart must equal the
+#   one taken after it.
+#
 # Usage:  bash docker/view-engine-e2e.sh
 # Run from the rune-broker repo root (this worktree). Requires the sibling
 # worktrees: ../rune-protocol ../rune-codec ../rune-crypto ../rune-fr ../rune-ql
@@ -124,6 +130,8 @@ fail() { echo "[view-engine-e2e] FAIL: $*" >&2; exit 1; }
 teardown() {
     log "Tearing down (compose down -v + client rm)..."
     docker rm -f "${CLIENT_HOSTNAME}" 2>/dev/null || true
+    docker rm -f rune-ddl-race-a rune-ddl-race-b 2>/dev/null || true
+    [ -n "${RACE_DIR:-}" ] && rm -rf "${RACE_DIR}" || true
     docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" down -v --remove-orphans 2>/dev/null || true
 }
 trap teardown EXIT
@@ -315,6 +323,87 @@ log "Typed routing OK: $(echo "${setup_out}" | grep -E '^TYPED-ROUTING: OK' | ta
 # has passed.  The restart -> recover leg below runs by default; set
 # RUN_RESTART_LEG=0 for a quick create-path-only run.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Step 4b (DDL conformance): ALTER on a view's output answers ViewNotAlterable.
+# ---------------------------------------------------------------------------
+echo "${setup_out}" | grep -q "^ALTER-VIEW: OK code=38" \
+    || fail "setup client did not print 'ALTER-VIEW: OK code=38' (alter topic <view> must be 38)"
+log "ALTER on a view: 38 (ViewNotAlterable) OK"
+
+# ---------------------------------------------------------------------------
+# Step 4c (DDL conformance): two clients fire colliding DDL concurrently.  Both
+# containers connect and print READY, then block on a shared barrier file; the
+# script releases them together.  Per leg exactly one wins (0) and the other gets
+# the collision code: topic/topic 25, view/view 32, topic/view 25.
+# ---------------------------------------------------------------------------
+RACE_DIR="$(mktemp -d "${BROKER_REPO}/.ddl-race.XXXXXX")"
+RACE_A="rune-ddl-race-a"
+RACE_B="rune-ddl-race-b"
+
+start_race_client() {
+    local role="$1" host="$2"
+    docker rm -f "${host}" >/dev/null 2>&1 || true
+    docker run -d \
+        --name "${host}" --hostname "${host}" --network "${BROKER_NETWORK}" \
+        --platform linux/amd64 --shm-size=256m --security-opt seccomp=unconfined \
+        -v "${RACE_DIR}:/barrier" \
+        -e RUNE_MODE=ddl_race -e RUNE_RACE_ROLE="${role}" -e RUNE_BARRIER_DIR=/barrier \
+        -e RUNE_TARGET="${BROKER_TARGET}" -e RUNE_TARGET_STREAM=1 \
+        -e RUNE_EGRESS="aeron:udp?endpoint=${host}:${CLIENT_EGRESS_PORT}" -e RUNE_EGRESS_STREAM=2 \
+        -e RUNE_DATA_DIR="/tmp/rune_view_probe" \
+        -e RUNE_TIMEOUT_MS="${PROBE_TIMEOUT_MS}" -e RUNE_WAIT_BOUND_MS="${WAIT_BOUND_MS}" \
+        "${CLIENT_IMAGE}" >/dev/null
+}
+await_race_ready() {
+    local host="$1" deadline
+    deadline=$(( $(date +%s) + 120 ))
+    while [ "$(date +%s)" -lt "${deadline}" ]; do
+        docker logs "${host}" 2>/dev/null | grep -q "^DDL-RACE: READY" && return 0
+        sleep 1
+    done
+    return 1
+}
+race_code() {   # $1 = stdout of one race client, $2 = leg
+    echo "$1" | grep -oE "^DDL_RACE leg=$2 role=[ab] code=[0-9]+" | tail -1 | sed -E 's/.*code=//'
+}
+check_race_leg() {   # $1 = leg, $2 = the loser's collision code
+    local leg="$1" loser="$2" a b
+    a="$(race_code "${race_out_a}" "${leg}")"
+    b="$(race_code "${race_out_b}" "${leg}")"
+    [ -n "${a}" ] && [ -n "${b}" ] || fail "DDL race leg ${leg}: missing result (a='${a}' b='${b}')"
+    if { [ "${a}" = 0 ] && [ "${b}" = "${loser}" ]; } || { [ "${b}" = 0 ] && [ "${a}" = "${loser}" ]; }; then
+        log "DDL race leg ${leg}: exactly one winner (a=${a} b=${b})"
+    else
+        fail "DDL race leg ${leg}: want exactly one 0 and one ${loser}, got a=${a} b=${b}"
+    fi
+}
+
+log "Step 4c: DDL race — two clients, colliding DDL, released together..."
+start_race_client a "${RACE_A}"
+start_race_client b "${RACE_B}"
+await_race_ready "${RACE_A}" || fail "race client a never printed READY"
+await_race_ready "${RACE_B}" || fail "race client b never printed READY"
+touch "${RACE_DIR}/go"
+race_rc_a="$(docker wait "${RACE_A}")"
+race_rc_b="$(docker wait "${RACE_B}")"
+race_out_a="$(docker logs "${RACE_A}" 2>/dev/null)"
+race_out_b="$(docker logs "${RACE_B}" 2>/dev/null)"
+echo "----- race a -----" >&2; echo "${race_out_a}" >&2
+echo "----- race b -----" >&2; echo "${race_out_b}" >&2
+[ "${race_rc_a}" = 0 ] && [ "${race_rc_b}" = 0 ] || fail "race clients exited ${race_rc_a}/${race_rc_b}"
+check_race_leg topic 25
+check_race_leg view 32
+check_race_leg mixed 25
+docker rm -f "${RACE_A}" "${RACE_B}" >/dev/null 2>&1 || true
+
+CATALOG_NAMES="character,char_persisted,char_transient,order,user_totals,typed_route,race_topic,race_view,race_mixed"
+dump_catalog() {
+    local out
+    out="$(run_client catalog_dump -e RUNE_CATALOG_NAMES="${CATALOG_NAMES}" 2>/dev/null)" || return 1
+    echo "${out}" | grep -q "^CATALOG-DUMP: OK" || return 1
+    echo "${out}" | grep -E "^CATALOG name="
+}
+
 if [ "${RUN_RESTART_LEG:-1}" != "1" ]; then
     log ""
     log "========================================"
@@ -327,6 +416,13 @@ if [ "${RUN_RESTART_LEG:-1}" != "1" ]; then
     log "========================================"
     exit 0
 fi
+
+# ---------------------------------------------------------------------------
+# Step 4d (DDL conformance): snapshot the catalog before the restart.
+# ---------------------------------------------------------------------------
+catalog_before="$(dump_catalog)" || fail "catalog dump (pre-restart) failed"
+echo "${catalog_before}" | grep -q " code=[1-9]" && fail "a pre-restart catalog entry did not resolve: ${catalog_before}"
+log "Catalog before restart:"; echo "${catalog_before}" >&2
 
 # ---------------------------------------------------------------------------
 # Step 5: Restart the broker (same named volume — persisted state survives).
@@ -376,6 +472,16 @@ if ! echo "${restart_out}" | grep -q "VIEW-ENGINE-E2E: OK"; then
 fi
 
 # ---------------------------------------------------------------------------
+# Step 7b (DDL conformance): the catalog is identical after the restart.
+# ---------------------------------------------------------------------------
+catalog_after="$(dump_catalog)" || fail "catalog dump (post-restart) failed"
+if [ "${catalog_before}" != "${catalog_after}" ]; then
+    diff <(echo "${catalog_before}") <(echo "${catalog_after}") >&2 || true
+    fail "the DDL catalog differs after the restart"
+fi
+log "Catalog identical after restart ($(echo "${catalog_after}" | wc -l | tr -d ' ') entries)"
+
+# ---------------------------------------------------------------------------
 # Step 8: prove user_totals was restored from its v2 CHECKPOINT (not merely
 # re-folded from the retained source, which would also yield correct rows).
 # The broker logs ONE "VIEW-RECOVERED view=<id> partition=<p> O=<O>
@@ -407,5 +513,7 @@ log "  -> reproduce -> both views fold the new value live OK"
 log "  -> user_totals (Count(*)/Sum/Avg) recovered from its v2 checkpoint (VIEW-RECOVERED format=v2, O>0)"
 log "     + post-restart update retracts OK"
 log "  -> typed_route: 8-partition typed topic routed by key (Phase 2b C)"
+log "  -> DDL conformance: alter on a view = 38; two racing clients, exactly one"
+log "     winner per leg (topic 25, view 32, mixed 25); catalog identical across restart"
 log "  VIEW-ENGINE-E2E: OK, exit 0."
 log "========================================"

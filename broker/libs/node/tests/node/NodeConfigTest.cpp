@@ -1,4 +1,5 @@
 #include <rune/node/NodeConfig.h>
+#include <rune/node/TopicName.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/HostDefaults.h>
 #include <rune/node/EmbeddedDriver.h>
@@ -1223,7 +1224,7 @@ TEST(NodeConfig, ParsesCoPartitionGroupKeyAndPersistence) {
     EXPECT_EQ(ts[0].coPartitionGroup, "acct");
     EXPECT_EQ(ts[0].partitionKey, "userId");
     EXPECT_EQ(ts[0].durability, 1);
-    EXPECT_EQ(ts[1].persistence, rune::node::PersistenceMode::Memory);
+    EXPECT_EQ(ts[1].persistence, rune::node::PersistenceMode::Transient);
 }
 
 TEST(NodeConfig, LegacyTopicGrammarStillParses) {
@@ -1246,7 +1247,7 @@ TEST(NodeConfig, PersistenceMemoryDurabilityAllInSync) {
         if (s=="RUNE_TOPICS") return "ephemeral:2:persistence=memory:durability=all-in-sync"; return nullptr; };
     auto res=rune::node::parseNodeConfig(env);
     ASSERT_TRUE(res.config.has_value()) << res.error;
-    EXPECT_EQ(res.config->topics[0].persistence, rune::node::PersistenceMode::Memory);
+    EXPECT_EQ(res.config->topics[0].persistence, rune::node::PersistenceMode::Transient);
     EXPECT_EQ(res.config->topics[0].durability, 1u);
 }
 
@@ -1486,14 +1487,14 @@ TEST(NodeConfig, ShardIdleUsesWakeOnlyWhenEnabled) {
 
 // ---------------------------------------------------------------------------
 // E3 Task 7: io-ring depths + memory-log ring bytes (RUNE_IO_SUBMIT_RING_DEPTH,
-// RUNE_IO_COMPLETION_RING_DEPTH, RUNE_MEMORY_LOG_RING_BYTES)
+// RUNE_IO_COMPLETION_RING_DEPTH, RUNE_TRANSIENT_LOG_RING_BYTES)
 // ---------------------------------------------------------------------------
 
 TEST(NodeConfig, IoRingDepthsParseFromEnvPow2) {
     // Override two of the three fields; confirm the third stays at its default.
     auto base = base1node();
     base["RUNE_IO_SUBMIT_RING_DEPTH"]  = "2048";
-    base["RUNE_MEMORY_LOG_RING_BYTES"] = "16777216"; // 16 MiB = 2^24
+    base["RUNE_TRANSIENT_LOG_RING_BYTES"] = "16777216"; // 16 MiB = 2^24
     auto res = rune::node::parseNodeConfig(fakeEnv(base));
     ASSERT_TRUE(res.config.has_value()) << res.error;
     EXPECT_EQ(res.config->ioSubmitRingDepth,    2048);
@@ -1516,7 +1517,7 @@ TEST(NodeConfig, IoRingDepthsNonPow2KeepsDefault) {
     auto base = base1node();
     base["RUNE_IO_SUBMIT_RING_DEPTH"]     = "1000";  // not a power of two
     base["RUNE_IO_COMPLETION_RING_DEPTH"] = "3000";  // not a power of two
-    base["RUNE_MEMORY_LOG_RING_BYTES"]    = "7";     // not a power of two
+    base["RUNE_TRANSIENT_LOG_RING_BYTES"]    = "7";     // not a power of two
     auto res = rune::node::parseNodeConfig(fakeEnv(base));
     ASSERT_TRUE(res.config.has_value()) << res.error;
     EXPECT_EQ(res.config->ioSubmitRingDepth,     1024) << "non-pow2 must keep default";
@@ -1538,7 +1539,7 @@ TEST(NodeConfig, IoRingDepthsAllThreeOverridden) {
     auto base = base1node();
     base["RUNE_IO_SUBMIT_RING_DEPTH"]     = "512";
     base["RUNE_IO_COMPLETION_RING_DEPTH"] = "256";
-    base["RUNE_MEMORY_LOG_RING_BYTES"]    = "4194304"; // 4 MiB = 2^22
+    base["RUNE_TRANSIENT_LOG_RING_BYTES"]    = "4194304"; // 4 MiB = 2^22
     auto res = rune::node::parseNodeConfig(fakeEnv(base));
     ASSERT_TRUE(res.config.has_value()) << res.error;
     EXPECT_EQ(res.config->ioSubmitRingDepth,     512);
@@ -2803,5 +2804,241 @@ TEST(NodeConfigRegression, IdleMaxParkUsIsBoundedAndStrictRegression) {
         const auto r = rune::node::parseNodeConfig(rune::node::fakeEnv(env));
         EXPECT_FALSE(r.config.has_value()) << "RUNE_IDLE_MAX_PARK_US=" << bad << " was accepted";
         if (!r.config.has_value()) EXPECT_NE(r.error.find("RUNE_IDLE_MAX_PARK_US"), std::string::npos) << r.error;
+    }
+}
+
+// ===========================================================================
+// Phase 2b E: transient topics (rename of memory topics)
+// ===========================================================================
+namespace {
+rune::node::ConfigResult parseWithTopics(const char* topics) {
+    return rune::node::parseNodeConfig([topics](const char* k) -> const char* {
+        std::string s = k;
+        if (s == "RUNE_NODE_ID") return "0";
+        if (s == "RUNE_PEERS") return "0@h:1";
+        if (s == "RUNE_CLIENT_ENDPOINT") return "h:2";
+        if (s == "RUNE_DATA_DIR") return "/tmp/x";
+        if (s == "RUNE_TOPICS") return topics;
+        return nullptr;
+    });
+}
+} // namespace
+
+TEST(NodeConfig, PersistenceTransientParses) {
+    auto res = parseWithTopics("presence:2:persistence=transient,orders:4:persistence=disk");
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->topics[0].persistence, rune::node::PersistenceMode::Transient);
+    EXPECT_EQ(res.config->topics[1].persistence, rune::node::PersistenceMode::Disk);
+    EXPECT_TRUE(res.warnings.empty()) << "the canonical spelling never warns";
+}
+
+// Existing compose files say persistence=memory: they must keep booting, as
+// TRANSIENT topics, with exactly one deprecation warning per such entry.
+TEST(NodeConfigRegression, PersistenceMemoryIsDeprecatedAliasForTransient) {
+    auto res = parseWithTopics("presence:2:persistence=MEMORY,chat:1:persistence=memory");
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->topics[0].persistence, rune::node::PersistenceMode::Transient);
+    EXPECT_EQ(res.config->topics[1].persistence, rune::node::PersistenceMode::Transient);
+    ASSERT_EQ(res.warnings.size(), 2u);
+    EXPECT_NE(res.warnings[0].find("deprecated"), std::string::npos) << res.warnings[0];
+    EXPECT_NE(res.warnings[0].find("persistence=transient"), std::string::npos) << res.warnings[0];
+    EXPECT_NE(res.warnings[0].find("presence"), std::string::npos) << res.warnings[0];
+    EXPECT_NE(res.warnings[1].find("chat"), std::string::npos) << res.warnings[1];
+}
+
+TEST(NodeConfig, PersistenceBadValueNamesTransient) {
+    auto res = parseWithTopics("t:1:persistence=ram");
+    ASSERT_FALSE(res.config.has_value());
+    EXPECT_NE(res.error.find("'disk' or 'transient'"), std::string::npos) << res.error;
+}
+
+TEST(NodeConfig, PersistenceModeWireMapping) {
+    using rune::node::PersistenceMode;
+    EXPECT_EQ(rune::node::persistenceToWire(PersistenceMode::Disk), 0u);
+    EXPECT_EQ(rune::node::persistenceToWire(PersistenceMode::Transient), 1u);
+    EXPECT_EQ(rune::node::persistenceFromWire(0), PersistenceMode::Disk);
+    EXPECT_EQ(rune::node::persistenceFromWire(1), PersistenceMode::Transient);
+}
+
+TEST(NodeConfigRegression, PersistenceFromWireRejectsUnknownByte) {
+    using rune::node::PersistenceMode;
+    EXPECT_FALSE(rune::node::persistenceFromWire(2).has_value());
+    EXPECT_FALSE(rune::node::persistenceFromWire(0x7f).has_value());
+    EXPECT_FALSE(rune::node::persistenceFromWire(0xff).has_value());
+    EXPECT_TRUE(rune::node::persistenceFromWire(0).has_value());
+    EXPECT_TRUE(rune::node::persistenceFromWire(1).has_value());
+}
+
+// Controller ruling SQ5: RUNE_TRANSIENT_LOG_RING_BYTES is canonical;
+// RUNE_MEMORY_LOG_RING_BYTES is a deprecated alias (one warning).
+TEST(NodeConfigRegression, TransientLogRingBytesCanonical) {
+    auto base = rune::node::base1node();
+    base["RUNE_TRANSIENT_LOG_RING_BYTES"] = "16777216";
+    auto res = rune::node::parseNodeConfig(rune::node::fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->memoryLogRingBytes, 16 * 1024 * 1024);
+    EXPECT_TRUE(res.warnings.empty());
+}
+
+TEST(NodeConfigRegression, MemoryLogRingBytesIsDeprecatedAlias) {
+    auto base = rune::node::base1node();
+    base["RUNE_MEMORY_LOG_RING_BYTES"] = "4194304";
+    auto res = rune::node::parseNodeConfig(rune::node::fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->memoryLogRingBytes, 4 * 1024 * 1024);
+    ASSERT_EQ(res.warnings.size(), 1u);
+    EXPECT_NE(res.warnings[0].find("RUNE_MEMORY_LOG_RING_BYTES"), std::string::npos) << res.warnings[0];
+    EXPECT_NE(res.warnings[0].find("RUNE_TRANSIENT_LOG_RING_BYTES"), std::string::npos) << res.warnings[0];
+}
+
+TEST(NodeConfigRegression, TransientLogRingBytesWinsOverAlias) {
+    auto base = rune::node::base1node();
+    base["RUNE_TRANSIENT_LOG_RING_BYTES"] = "16777216";
+    base["RUNE_MEMORY_LOG_RING_BYTES"]    = "4194304";
+    auto res = rune::node::parseNodeConfig(rune::node::fakeEnv(base));
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    EXPECT_EQ(res.config->memoryLogRingBytes, 16 * 1024 * 1024);
+    EXPECT_EQ(res.warnings.size(), 1u) << "the alias still warns";
+}
+
+// ── DDL conformance B7 / user decision D2d: static RUNE_TOPICS names obey the DDL
+//    name rule (TopicName.h) — a bad name is a boot config error naming the entry.
+namespace {
+struct BadStaticName { std::string name; rune::node::TopicNameError kind; const char* label; };
+std::vector<BadStaticName> badStaticNames() {
+    using rune::node::TopicNameError;
+    return {
+        {std::string(250, 'x'), TopicNameError::TooLong, "len250"},
+        {std::string(600, 'y'), TopicNameError::TooLong, "len600"},
+        {".", TopicNameError::DotSegment, "dot"},
+        {"..", TopicNameError::DotSegment, "dotdot"},
+        {"../escape", TopicNameError::BadChar, "traversal"},
+        {"a/b", TopicNameError::BadChar, "slash"},
+        {"/abs", TopicNameError::BadChar, "absolute"},
+        {"a\\b", TopicNameError::BadChar, "backslash"},
+        {"has space", TopicNameError::BadChar, "space"},
+        {"tab\tname", TopicNameError::BadChar, "tab"},
+        {"caf\xc3\xa9", TopicNameError::BadChar, "nonascii"},
+        {"__topic_schemas", TopicNameError::Reserved, "topic_schemas"},
+        {"__views", TopicNameError::Reserved, "views"},
+        {"__consumer_offsets", TopicNameError::Reserved, "consumer_offsets"},
+        {"__transaction_state", TopicNameError::Reserved, "transaction_state"},
+        {"__cluster_metadata", TopicNameError::Reserved, "cluster_metadata"},
+        {"__view_snapshots", TopicNameError::Reserved, "view_snapshots"},
+        {"__orphan.1", TopicNameError::Reserved, "orphan"},
+        {"__x", TopicNameError::Reserved, "x"},
+    };
+}
+} // namespace
+
+class RuneTopicsNameRegression : public ::testing::TestWithParam<BadStaticName> {};
+
+TEST_P(RuneTopicsNameRegression, InvalidNameIsAConfigErrorNamingTheEntry) {
+    const BadStaticName& b = GetParam();
+    ASSERT_EQ(rune::node::checkTopicName(b.name), b.kind) << "table sanity";
+    const std::string reason(rune::node::topicNameErrorText(b.kind));
+    // First, in the middle (after a valid entry), and last.
+    for (const std::string& list : {b.name + ":1", "ok:1," + b.name + ":2", b.name + ":1,ok:2"}) {
+        SCOPED_TRACE(list);
+        const auto res = parseWithTopics(list.c_str());
+        ASSERT_FALSE(res.config.has_value()) << "must refuse to boot";
+        // The name and entry are escaped (fix-on-sight: no raw control bytes in the error).
+        const std::string shown = rune::node::escapeNameForLog(b.name);
+        EXPECT_NE(res.error.find("RUNE_TOPICS topic name '" + shown + "' is invalid"), std::string::npos) << res.error;
+        EXPECT_NE(res.error.find(reason), std::string::npos) << res.error;
+        EXPECT_NE(res.error.find("in entry: " + shown + ":"), std::string::npos) << "names the entry: " << res.error;
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(EveryKind, RuneTopicsNameRegression, ::testing::ValuesIn(badStaticNames()),
+                         [](const ::testing::TestParamInfo<BadStaticName>& i) { return std::string(i.param.label); });
+
+TEST(NodeConfigRegression, RuneTopicsInvalidNameIsEscapedInTheConfigErrorRegression) {
+    struct Case { const char* list; const char* shown; };
+    const Case cases[] = {
+        {"bad\nname:1",       "'bad\\x0aname'"},
+        {"ok:1,esc\x1b[2J:2",  "'esc\\x1b[2J'"},
+        {"back\\slash:1",     "'back\\\\slash'"},
+    };
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.shown);
+        const auto res = parseWithTopics(c.list);
+        ASSERT_FALSE(res.config.has_value());
+        EXPECT_NE(res.error.find(c.shown), std::string::npos) << res.error;
+        for (const char ch : res.error) {
+            const auto u = static_cast<unsigned char>(ch);
+            EXPECT_TRUE(u >= 0x20 && u < 0x7f) << "raw byte " << static_cast<int>(u);
+        }
+    }
+    // A name-less / colon-less entry is echoed escaped too.
+    const auto noColon = parseWithTopics("ok:1,x\ny");
+    ASSERT_FALSE(noColon.config.has_value());
+    EXPECT_NE(noColon.error.find("x\\x0ay"), std::string::npos) << noColon.error;
+}
+
+TEST(NodeConfigRegression, RuneTopicsEmptyNameStillAConfigErrorNamingTheEntryRegression) {
+    const auto res = parseWithTopics("ok:1,:2");
+    ASSERT_FALSE(res.config.has_value());
+    EXPECT_NE(res.error.find("empty name"), std::string::npos) << res.error;
+    EXPECT_NE(res.error.find(":2"), std::string::npos) << res.error;
+}
+
+TEST(NodeConfigRegression, RuneTopicsInvalidNameWithExtendedFieldsIsStillRefusedRegression) {
+    const auto res = parseWithTopics("__views:1:persistence=transient");
+    ASSERT_FALSE(res.config.has_value());
+    EXPECT_NE(res.error.find("topic name '__views' is invalid"), std::string::npos) << res.error;
+}
+
+TEST(NodeConfigRegression, RuneTopicsCaseOnlyDuplicateIsAConfigErrorRegression) {
+    struct Case { const char* list; const char* a; const char* b; };
+    const Case cases[] = {
+        {"Orders:1,orders:4",               "Orders", "orders"},
+        {"Orders:1,chat:2,orders:4",        "Orders", "orders"},
+        {"chat:1,CHAT:1",                   "chat",   "CHAT"},
+        {"aB:1,x:1,Ab:1",                   "aB",     "Ab"},
+        {"orders.V2:1,ORDERS.v2:1",         "orders.V2", "ORDERS.v2"},
+    };
+    for (const Case& c : cases) {
+        SCOPED_TRACE(c.list);
+        const auto res = parseWithTopics(c.list);
+        ASSERT_FALSE(res.config.has_value());
+        EXPECT_NE(res.error.find(std::string("'") + c.a + "'"), std::string::npos) << res.error;
+        EXPECT_NE(res.error.find(std::string("'") + c.b + "'"), std::string::npos) << res.error;
+        EXPECT_NE(res.error.find("differ only by letter case"), std::string::npos) << res.error;
+        EXPECT_NE(res.error.find("in entry:"), std::string::npos) << res.error;
+    }
+}
+
+TEST(NodeConfigRegression, RuneTopicsExactDuplicateKeepsItsOwnMessageRegression) {
+    const auto res = parseWithTopics("orders:1,orders:2");
+    ASSERT_FALSE(res.config.has_value());
+    EXPECT_NE(res.error.find("duplicate topic name: orders"), std::string::npos) << res.error;
+}
+
+TEST(NodeConfigRegression, RuneTopicsValidNamesStillParseRegression) {
+    const std::string maxLen(249, 'x');
+    const std::string topics = "orders.v2:1,_private:1,a-b_c:2,Orders2:1,x__y:1," + maxLen + ":1";
+    const auto res = parseWithTopics(topics.c_str());
+    ASSERT_TRUE(res.config.has_value()) << res.error;
+    ASSERT_EQ(res.config->topics.size(), 6u);
+    EXPECT_EQ(res.config->topics[5].name, maxLen);
+}
+
+// Final review M5: every RUNE_TOPICS error message escapes the raw env entry (a
+// control byte in an env var must never reach the log / terminal raw).
+TEST(NodeConfigRegression, TopicsErrorMessagesEscapeTheRawEntryRegression) {
+    const std::string esc = "\x1b[31m";
+    const std::vector<std::string> entries = {
+        "orders:1,Orders:1:delete" + esc,            // fold duplicate (B3)
+        "orders:x" + esc,                             // partition count
+        "orders:1:policy" + esc,                      // positional policy
+        "orders:1:persistence=disk" + esc,            // key=value option
+        "orders:1:nosuch" + esc + "=1",               // unknown option
+        "orders:1:delete:12" + esc,                   // integer field
+    };
+    for (const std::string& e : entries) {
+        const auto r = parseWithTopics(e.c_str());
+        ASSERT_FALSE(r.error.empty()) << e;
+        EXPECT_EQ(r.error.find('\x1b'), std::string::npos) << "raw control byte in: " << r.error;
     }
 }

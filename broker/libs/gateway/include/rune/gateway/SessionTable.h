@@ -27,6 +27,7 @@
 // seals/opens frames under it can be unit-tested standalone without ever
 // touching <Aeron.h>.
 #include <rune/gateway/CryptoState.h>
+#include <rune/gateway/SpillPool.h>
 
 #include <array>
 #include <cstddef>
@@ -38,6 +39,20 @@
 #include <unordered_map>
 
 namespace rune::gateway {
+
+struct Session;
+
+/// No-hang fix round 4 (N19): the explicit egress-spill state of a Session.
+enum class SpillState : uint8_t { Normal = 0, Spilled = 1, Expiring = 2 };
+
+/// The variables of Session's spill state machine (see Session::spill).
+struct SessionSpill {
+    SpillState       state     = SpillState::Normal;
+    uint32_t         bytes     = 0;          // Spilled: SpillPool bytes held (quota unit)
+    SpillPool::Chain chain;                  // Spilled: this session's records, oldest first
+    Session*         prevReady = nullptr;    // Spilled: the gateway's ready list (intrusive)
+    Session*         nextReady = nullptr;
+};
 
 // ---------------------------------------------------------------------------
 // CryptoState — see rune/gateway/CryptoState.h (extracted there in Task 8 so
@@ -80,6 +95,17 @@ struct Session {
     // claimed yet (SessionSignal Credit).  At ClientGateway::sessionProduceCredits()
     // the gateway ABORTs this session's Produce frames.  Dies with the session.
     uint32_t                                       produceInFlight = 0;
+    // No-hang fix rounds 2-4 (I1 / N8 / N19): this session's egress-spill state
+    // machine (ClientGateway::sendReliable_ / drainPendingResponses):
+    //   Normal   — nothing spilled: answers are offered directly (hot path: one compare).
+    //   Spilled  — answers wait in the gateway's SpillPool, in order, on `chain`
+    //              (new answers queue behind them); the session is linked on the
+    //              gateway's ready list (prevReady / nextReady); `bytes` = pool
+    //              bytes held (quota ClientGateway::kSessionSpillQuota).
+    //   Expiring — the spill could not hold it: its answers are discarded and
+    //              refused, its ingress is dropped, its SessionExpired is owed.
+    // chain / bytes / prevReady / nextReady are meaningful in Spilled only.
+    SessionSpill                                   spill;
     // Lows batch C (D8c R3): the worker whose full routed share deferred this
     // session's head Produce (-1 = none).  While set, the redelivered frame is
     // ABORTed by ClientGateway::admitClientFrame_ (one probe) instead of being

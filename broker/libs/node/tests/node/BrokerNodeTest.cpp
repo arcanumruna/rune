@@ -16,6 +16,7 @@
 #include <rune/aeronutil/testing/FreePort.h>
 #include "../support/TestNodeConfig.h"
 #include <rune/node/BrokerNode.h>
+#include <rune/gateway/TopicRegistry.h>
 #include <rune/node/HostDefaults.h>
 #include <rune/node/Worker.h>
 #include "../support/OwnerThreadTestHelpers.h"  // F1: owner-thread replica probes
@@ -991,7 +992,7 @@ TEST(BrokerNodeTest, M1_AllInSyncDurabilityWiresEndToEnd) {
 // ===========================================================================
 // Task M1 precondition #2: memory-backed partition skips cleaner / log().
 //
-// A topic declared with persistence=Memory uses an InMemoryLog.
+// A topic declared with persistence=Transient uses an InMemoryLog.
 // The LogCleanerAgent must not call replica->log() (which asserts isDiskBacked())
 // on such a replica.  The test verifies this by:
 //   1. Creating a compact memory-backed topic (normally the cleaner would run).
@@ -1000,7 +1001,7 @@ TEST(BrokerNodeTest, M1_AllInSyncDurabilityWiresEndToEnd) {
 //
 // Also verifies ilog()->isDiskBacked() == false for the memory replica.
 // ===========================================================================
-TEST(BrokerNodeTest, M1_MemoryBackedPartitionSkipsCleaner) {
+TEST(BrokerNodeTest, M1_TransientPartitionSkipsCleaner) {
     TempDir tmp{"m1_mem_"};
     NodeConfig cfg = makeSingleNodeConfig(tmp.path);
 
@@ -1010,7 +1011,7 @@ TEST(BrokerNodeTest, M1_MemoryBackedPartitionSkipsCleaner) {
     ts.topicId               = 0;
     ts.cleanupPolicy         = TopicSpec::CleanupPolicy::Compact;
     ts.minCleanableDirtyRatio = 0.0;  // would fire immediately on disk topics
-    ts.persistence           = PersistenceMode::Memory;
+    ts.persistence           = PersistenceMode::Transient;
 
     cfg.topics = {ts};
 
@@ -1033,9 +1034,9 @@ TEST(BrokerNodeTest, M1_MemoryBackedPartitionSkipsCleaner) {
             return std::pair{r.isMemoryBacked(), r.isDiskBacked()};
         });
     EXPECT_TRUE(memBacked)
-        << "Task M1: persistence=Memory must produce a memory-backed replica (InMemoryLog)";
+        << "Task M1: persistence=Transient must produce a memory-backed replica (InMemoryLog)";
     EXPECT_FALSE(diskBacked)
-        << "Task M1: persistence=Memory replica must not be disk-backed";
+        << "Task M1: persistence=Transient replica must not be disk-backed";
 
     // If we reach here without a crash/assertion, the cleaner correctly skipped
     // the memory-backed replica's log() call.
@@ -1915,4 +1916,270 @@ TEST(BrokerNodeRegression, GatewayConstructionFailureRefusesToStartNotHeadless) 
     node.stop();
     ::close(squat);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2b E (spec gate): a runtime DefineTopic(persistence=transient) creates
+// the topic on an InMemoryLog (no disk partition dir), and after a node restart
+// the topic EXISTS again as a transient topic and is EMPTY (data never on disk).
+// ---------------------------------------------------------------------------
+TEST(BrokerNodeRegression, RuntimeTransientTopicIsInMemoryAndRestartsEmptyRegression) {
+    namespace pc = rune::protocol::client;
+    using Clock = std::chrono::steady_clock;
+    using rune::replication::PartitionReplica;
+    const fs::path dir = makeTempDataDir("transient_rt_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    const uint16_t clientPort = rune::node::test::freeUdpPort();
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
+    const std::string& gw = cfg.clientEndpoint.channel;
+    const int32_t stream  = cfg.clientEndpoint.streamId;
+
+    const auto desc = rune::codec::DescriptorBuilder("presence")
+        .add("userId", rune::codec::PrimType::Int64, 1, /*isKey*/ true)
+        .add("online", rune::codec::PrimType::Bool)
+        .build();
+    const std::vector<uint8_t> blob = rune::codec::serialize(desc);
+
+    auto awaitLeaderReplica = [](BrokerNode& n, int32_t topicId, Clock::time_point deadline) {
+        while (Clock::now() < deadline) {
+            if (rune::node::test::hasReplica(n, topicId, 0) &&
+                rune::node::test::roleOnOwner(n, topicId, 0) == rune::replication::Role::Leader)
+                return true;
+            std::this_thread::sleep_for(5ms);   // poll interval, not correctness
+        }
+        return false;
+    };
+
+    int32_t topicId = -1;
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        rune::node::test::ShardTestClient client(dir / "client-aeron");
+        const int64_t sid = client.connect(gw, stream);
+        ASSERT_GT(sid, 0);
+
+        const auto deadline = Clock::now() + 20s;
+        while (topicId < 0) {
+            ASSERT_LT(Clock::now(), deadline) << "DefineTopic did not commit within the deadline";
+            auto def = client.defineTopicUntil(gw, stream, sid, "presence", 1, /*validate=*/false,
+                                               blob, std::min(deadline, Clock::now() + 5s),
+                                               pc::DefineTopic::kPersistenceTransient);
+            ASSERT_TRUE(def.has_value()) << "no DefineTopicResponse";
+            if (def->errorCode == 0 ||
+                (def->errorCode == static_cast<uint16_t>(pc::ErrorCode::TopicExists) && def->topicId >= 0)) {
+                topicId = def->topicId;
+                break;
+            }
+            ASSERT_EQ(def->errorCode, static_cast<uint16_t>(pc::ErrorCode::Internal))
+                << "non-retryable DefineTopic error " << def->errorCode;
+            std::this_thread::sleep_for(20ms);   // admin leadership settling (short backoff)
+        }
+        ASSERT_TRUE(awaitLeaderReplica(node, topicId, Clock::now() + 10s));
+
+        const auto [mem, disk] = node.onOwnerThreadForTest(topicId, 0,
+            [](PartitionReplica& r) { return std::pair{r.isMemoryBacked(), r.isDiskBacked()}; });
+        EXPECT_TRUE(mem) << "a transient runtime topic must be InMemoryLog-backed";
+        EXPECT_FALSE(disk);
+        EXPECT_FALSE(fs::exists(dir / "topics" / "presence"))
+            << "a transient topic must never create a disk partition directory";
+
+        const std::vector<uint8_t> rec(24, 0x5A);
+        ASSERT_GE(rune::node::test::appendOnOwner(node, rec, /*acksAll=*/false, topicId, 0), 0);
+        ASSERT_GT(rune::node::test::leoOnOwner(node, topicId, 0), 0) << "data present before restart";
+        node.stop();
+    }
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ASSERT_TRUE(awaitLeaderReplica(node, topicId, Clock::now() + 20s))
+            << "the transient topic's metadata must survive the restart (recovered from __topic_schemas)";
+        const auto [mem, leo] = node.onOwnerThreadForTest(topicId, 0,
+            [](PartitionReplica& r) { return std::pair{r.isMemoryBacked(), r.logEndOffset()}; });
+        EXPECT_TRUE(mem) << "recovered as TRANSIENT, not as a disk topic";
+        EXPECT_EQ(leo, 0) << "a transient topic restarts EMPTY — its data was never on disk";
+        EXPECT_FALSE(fs::exists(dir / "topics" / "presence"));
+        node.stop();
+    }
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
+// B10 / D4 fix round 1 (I1): the REAL production path of the two-phase topic-id
+// marker on a live single-node BrokerNode.  A client DefineTopic → the control
+// thread's createTopic writes "pending <id>" → the admin thread commits the
+// __topic_schemas record (HW gate) → deps.topicCommitted → kA2cTopicCommitted on
+// the admin→control ring → the control thread (TopicRegistry's single writer)
+// rewrites the marker "committed <id>".  Condition-driven, bounded.
+// ---------------------------------------------------------------------------
+TEST(BrokerNodeRegression, DefineTopicMarksTheTopicDirCommittedOverTheAdminRingRegression) {
+    const fs::path dir = makeTempDataDir("marker_e2e_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    const uint16_t clientPort = rune::node::test::freeUdpPort();
+    cfg.clientEndpoint.channel = "aeron:udp?endpoint=127.0.0.1:" + std::to_string(clientPort);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(30s));
+
+    rune::node::test::ShardTestClient client(dir / "client-aeron");
+    const std::string& gw = cfg.clientEndpoint.channel;
+    const int32_t stream  = cfg.clientEndpoint.streamId;
+    const int64_t sid = client.connect(gw, stream);
+    ASSERT_GT(sid, 0);
+
+    const std::vector<uint8_t> blob = rune::codec::serialize(
+        rune::codec::DescriptorBuilder("marked").add("id", rune::codec::PrimType::Int64).build());
+    namespace pc = rune::protocol::client;
+    using Clock = std::chrono::steady_clock;
+    const auto deadline = Clock::now() + 20s;
+    constexpr uint16_t kDdlInternal = static_cast<uint16_t>(pc::ErrorCode::Internal);
+    constexpr uint16_t kDdlExists   = static_cast<uint16_t>(pc::ErrorCode::TopicExists);
+
+    int32_t topicId = -1;
+    bool sawInternal = false;
+    while (topicId < 0) {
+        ASSERT_LT(Clock::now(), deadline) << "DefineTopic did not commit within the test deadline";
+        auto def = client.defineTopicUntil(gw, stream, sid, "marked", 1, /*validate=*/false,
+                                           blob, std::min(deadline, Clock::now() + 5s));
+        ASSERT_TRUE(def.has_value()) << "no DefineTopicResponse";
+        if (def->errorCode == 0) { topicId = def->topicId; break; }
+        if (def->errorCode == kDdlExists && sawInternal) { topicId = def->topicId; break; }
+        ASSERT_EQ(def->errorCode, kDdlInternal) << "non-retryable code " << def->errorCode;
+        sawInternal = true;
+        std::this_thread::sleep_for(20ms);   // admin leadership settling
+    }
+    ASSERT_GE(topicId, 0);
+
+    const fs::path marker = dir / "topics" / "marked" / rune::gateway::kTopicIdMarkerFile;
+    const std::string want = "committed " + std::to_string(topicId) + "\n";
+    std::string got;
+    while (Clock::now() < deadline) {
+        std::ifstream in(marker, std::ios::binary);
+        got.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        if (got == want) break;
+        std::this_thread::sleep_for(5ms);
+    }
+    EXPECT_EQ(got, want) << "the control thread must rewrite the marker once the record commits";
+    EXPECT_FALSE(fs::exists(marker.parent_path() / rune::gateway::kTopicIdMarkerTmpFile));
+
+    node.stop();
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// ---------------------------------------------------------------------------
+// DDL conformance B3 end to end on a live single-node BrokerNode: a DefineTopic
+// whose name differs only in letter case from an existing topic (runtime or
+// RUNE_TOPICS static) is TopicExists carrying the existing topic's id, and the
+// control thread creates NOTHING for it (no topic id consumed, no replica) —
+// the caseConflict trailer crosses the real CreateTopicReply ring.
+// ---------------------------------------------------------------------------
+TEST(BrokerNodeRegression, CaseVariantDefineTopicIsTopicExistsEndToEndRegression) {
+    const fs::path dir = makeTempDataDir("case_fold_e2e_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    TopicSpec stat; stat.name = "Stat"; stat.partitionCount = 1; stat.topicId = 0;
+    cfg.topics = {stat};
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(30s));
+
+    rune::node::test::ShardTestClient client(dir / "client-aeron");
+    const std::string& gw = cfg.clientEndpoint.channel;
+    const int32_t stream  = cfg.clientEndpoint.streamId;
+    const int64_t sid = client.connect(gw, stream);
+    ASSERT_GT(sid, 0);
+
+    const std::vector<uint8_t> blob = rune::codec::serialize(
+        rune::codec::DescriptorBuilder("orders").add("id", rune::codec::PrimType::Int64).build());
+    namespace pc = rune::protocol::client;
+    using Clock = std::chrono::steady_clock;
+    constexpr uint16_t kInternal = static_cast<uint16_t>(pc::ErrorCode::Internal);
+    constexpr uint16_t kExists   = static_cast<uint16_t>(pc::ErrorCode::TopicExists);
+    const auto testDeadline = Clock::now() + 30s;
+    // One DefineTopic; Internal (admin leadership still settling) is retried.
+    auto define = [&](std::string_view name, uint8_t persistence) -> std::optional<pc::DefineTopicResponse> {
+        while (Clock::now() < testDeadline) {
+            auto r = client.defineTopicUntil(gw, stream, sid, name, 1, /*validate=*/false, blob,
+                                             std::min(testDeadline, Clock::now() + 5s), persistence);
+            if (!r || r->errorCode != kInternal) return r;
+            std::this_thread::sleep_for(20ms);
+        }
+        return std::nullopt;
+    };
+
+    const auto orders = define("Orders", 0);
+    ASSERT_TRUE(orders.has_value());
+    ASSERT_EQ(orders->errorCode, 0);
+    const int32_t ordersId = orders->topicId;
+    ASSERT_GE(ordersId, 0);
+
+    for (const auto& [name, persistence] : std::vector<std::pair<std::string, uint8_t>>{
+             {"orders", 0}, {"ORDERS", 1}, {"oRdErS", 0}}) {
+        SCOPED_TRACE(name);
+        const auto r = define(name, persistence);
+        ASSERT_TRUE(r.has_value()) << "no DefineTopicResponse";
+        EXPECT_EQ(r->errorCode, kExists);
+        EXPECT_EQ(r->topicId, ordersId) << "answers the colliding topic's id";
+    }
+    for (const std::string name : {"stat", "STAT"}) {
+        SCOPED_TRACE(name);
+        const auto r = define(name, 0);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->errorCode, kExists);
+        EXPECT_EQ(r->topicId, 0) << "the static topic's id";
+    }
+
+    // Nothing was created for any refused variant: the next topic takes the very
+    // next id, and no replica exists past it.
+    const auto next = define("next", 0);
+    ASSERT_TRUE(next.has_value());
+    ASSERT_EQ(next->errorCode, 0);
+    EXPECT_EQ(next->topicId, ordersId + 1) << "a refused variant consumed a topic id";
+    EXPECT_TRUE(rune::node::test::hasReplica(node, ordersId, 0));
+    EXPECT_FALSE(rune::node::test::hasReplica(node, next->topicId + 1, 0));
+
+    node.stop();
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+// DDL conformance Task 12: schemaRegistryForTest() / viewRegistryForTest() are
+// documented as readable "when the node is stopped", but stop() reset both, so
+// every post-stop catalog check dereferenced null (SEGFAULT).  The registries own
+// no replica pointers and no thread touches them after stop(): they now live until
+// the node is destroyed.
+TEST(BrokerNodeStopRegression, CatalogRegistriesReadableAfterStop) {
+    const fs::path dir = makeTempDataDir("regs_after_stop_");
+    NodeConfig cfg = makeSingleNodeConfig(dir);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(30s));
+
+    rune::node::test::ShardTestClient client(dir / "client-aeron");
+    client.keepSessionsAlive(true);
+    const std::string& gw = cfg.clientEndpoint.channel;
+    const int32_t stream  = cfg.clientEndpoint.streamId;
+    const int64_t sid = client.connect(gw, stream);
+    ASSERT_GT(sid, 0);
+    const std::vector<uint8_t> blob = rune::codec::serialize(
+        rune::codec::DescriptorBuilder("kept").add("id", rune::codec::PrimType::Int64).build());
+    namespace pc = rune::protocol::client;
+    using Clock = std::chrono::steady_clock;
+    const auto deadline = Clock::now() + 30s;
+    std::optional<pc::DefineTopicResponse> r;
+    while (Clock::now() < deadline) {   // Internal while admin leadership settles
+        r = client.defineTopicUntil(gw, stream, sid, "kept", 1, /*validate=*/false, blob,
+                                    std::min(deadline, Clock::now() + 5s), 0);
+        if (!r || r->errorCode != static_cast<uint16_t>(pc::ErrorCode::Internal)) break;
+        std::this_thread::sleep_for(20ms);
+    }
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->errorCode, 0);
+
+    node.stop();
+    ASSERT_NE(node.schemaRegistryForTest(), nullptr) << "readable after stop (documented contract)";
+    ASSERT_NE(node.schemaRegistryForTest()->byName("kept"), nullptr);
+    EXPECT_EQ(node.schemaRegistryForTest()->byName("kept")->version, 1u);
+    EXPECT_NE(node.viewRegistryForTest(), nullptr) << "readable after stop (documented contract)";
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
 } // namespace rune::node

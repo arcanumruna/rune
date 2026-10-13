@@ -28,6 +28,9 @@
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 #include <rune/protocol/client/TxnMessages.h>
+#include <rune/gateway/ITxnRequestHandler.h>
+#include <rune/protocol/client/MessageHeader.h>
+#include <array>
 #include <rune/protocol/client/Protocol.h>
 
 #include <atomic>
@@ -546,4 +549,98 @@ TEST(TransactionCoordinationServiceRegression, PushedLeadershipNeverCallsTheLead
     for (int i = 0; i < 100; ++i) (void)svc.doWork(i);
     EXPECT_FALSE(svc.isLocalCoordinator());
     EXPECT_EQ(calls, 0) << "isLeaderFn_ called on the duty cycle after a leadership push";
+}
+
+// ===========================================================================
+// No-hang wave (R2): every txn handler answers a request whose body does not
+// decode with its own response type + InvalidRequest (it used to return 0 —
+// indistinguishable from EndTxn's deferred answer, so the gateway dropped it).
+// ===========================================================================
+TEST_F(TransactionCoordinationServiceTest, MalformedTxnRequestsAreAnsweredInvalidRequestRegression) {
+    constexpr auto kInv = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
+    auto headerOnly = [&](pc::TemplateId tid, int64_t corr) {
+        pc::MessageHeader h;
+        h.blockLength = 32; h.templateId = static_cast<uint16_t>(tid);
+        h.sessionId = 42; h.correlationId = corr;
+        h.encode(reqBuf_.data());
+        return pc::MessageHeader::ENCODED_SIZE;
+    };
+    std::size_t o = svc_->handleInitProducerId(reqBuf_.data(), headerOnly(pc::TemplateId::InitProducerId, 1),
+                                               0, outBuf_.data(), outBuf_.size());
+    auto ip = pc::InitProducerIdResponse::decode(outBuf_.data(), o);
+    ASSERT_TRUE(ip.has_value()); EXPECT_EQ(ip->correlationId, 1); EXPECT_EQ(ip->errorCode, kInv);
+
+    o = svc_->handleAddPartitions(reqBuf_.data(), headerOnly(pc::TemplateId::AddPartitionsToTxn, 2),
+                                  0, outBuf_.data(), outBuf_.size());
+    auto ap = pc::AddPartitionsToTxnResponse::decode(outBuf_.data(), o);
+    ASSERT_TRUE(ap.has_value()); EXPECT_EQ(ap->correlationId, 2);
+    ASSERT_EQ(ap->results.size(), 1u); EXPECT_EQ(ap->results[0].errorCode, kInv);
+
+    o = svc_->handleAddOffsets(reqBuf_.data(), headerOnly(pc::TemplateId::AddOffsetsToTxn, 3),
+                               0, outBuf_.data(), outBuf_.size());
+    auto ao = pc::AddOffsetsToTxnResponse::decode(outBuf_.data(), o);
+    ASSERT_TRUE(ao.has_value()); EXPECT_EQ(ao->correlationId, 3); EXPECT_EQ(ao->errorCode, kInv);
+
+    o = svc_->handleTxnOffsetCommit(reqBuf_.data(), headerOnly(pc::TemplateId::TxnOffsetCommit, 4),
+                                    0, outBuf_.data(), outBuf_.size());
+    auto tc = pc::TxnOffsetCommitResponse::decode(outBuf_.data(), o);
+    ASSERT_TRUE(tc.has_value()); EXPECT_EQ(tc->correlationId, 4);
+    ASSERT_EQ(tc->results.size(), 1u); EXPECT_EQ(tc->results[0].errorCode, kInv);
+
+    o = svc_->handleEndTxn(reqBuf_.data(), headerOnly(pc::TemplateId::EndTxn, 5),
+                           0, outBuf_.data(), outBuf_.size());
+    auto et = pc::EndTxnResponse::decode(outBuf_.data(), o);
+    ASSERT_TRUE(et.has_value()); EXPECT_EQ(et->correlationId, 5); EXPECT_EQ(et->errorCode, kInv);
+}
+
+// No-hang fix round 2 (I3): a response that does not fit the caller's buffer is
+// answered MessageTooLarge (its own response type) — it used to return 0, which
+// the gateway reads as "deferred" and never answers.
+TEST_F(TransactionCoordinationServiceTest, ResponseThatCannotFitIsAnsweredMessageTooLargeRegression) {
+    std::size_t reqLen = encodeInitProducerId(reqBuf_.data(), reqBuf_.size(), 1, 1, 30'000, "txnBig");
+    std::size_t outLen = svc_->handleInitProducerId(reqBuf_.data(), reqLen, 0, outBuf_.data(), outBuf_.size());
+    const auto init = pc::InitProducerIdResponse::decode(outBuf_.data(), outLen);
+    ASSERT_TRUE(init);
+    std::vector<pc::TxnTopicPartition> parts;
+    for (int32_t p = 0; p < 20; ++p) parts.push_back({0, p});   // 24 + 2 + 20*10 B > 64 B
+    reqLen = encodeAddPartitions(reqBuf_.data(), reqBuf_.size(), 1, 9, init->producerId, init->producerEpoch,
+                                 "txnBig", parts);
+    ASSERT_GT(reqLen, 0u);
+    constexpr std::size_t kSmallCap = 64;   // kMaxRejectionBytes: room for the rejection only
+    outLen = svc_->handleAddPartitions(reqBuf_.data(), reqLen, 0, outBuf_.data(), kSmallCap);
+    ASSERT_GT(outLen, 0u) << "a response that cannot fit returned 0 (= 'deferred', never answered)";
+    const auto r = pc::AddPartitionsToTxnResponse::decode(outBuf_.data(), outLen);
+    ASSERT_TRUE(r);
+    EXPECT_EQ(r->correlationId, 9);
+    ASSERT_EQ(r->results.size(), 1u);
+    EXPECT_EQ(r->results[0].errorCode, static_cast<int16_t>(pc::ErrorCode::MessageTooLarge));
+}
+
+// Fix round 3 (I3): handleEndTxn never returns the "deferred" 0 for an answer it
+// could not write.  At the contract minimum (kTxnMinOutCap) every EndTxn outcome
+// is written; below it the handler halts loudly instead of returning 0.
+TEST_F(TransactionCoordinationServiceTest, EndTxnAtMinOutCapIsAlwaysAnsweredRegression) {
+    std::array<uint8_t, rune::gateway::kTxnMinOutCap> small{};
+    // A malformed EndTxn (rejection) and a not-coordinator EndTxn, both at the minimum.
+    pc::MessageHeader h;
+    h.blockLength = 32; h.templateId = static_cast<uint16_t>(pc::TemplateId::EndTxn);
+    h.sessionId = 42; h.correlationId = 7;
+    h.encode(reqBuf_.data());
+    std::size_t n = svc_->handleEndTxn(reqBuf_.data(), pc::MessageHeader::ENCODED_SIZE, 0, small.data(), small.size());
+    ASSERT_GT(n, 0u) << "a malformed EndTxn yielded the 'deferred' 0";
+    EXPECT_EQ(pc::EndTxnResponse::decode(small.data(), n)->correlationId, 7);
+    isLeader_ = false;
+    const std::size_t reqLen = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 42, 8, 10, 0, true, "txA");
+    n = svc_->handleEndTxn(reqBuf_.data(), reqLen, 0, small.data(), small.size());
+    ASSERT_GT(n, 0u);
+    EXPECT_EQ(pc::EndTxnResponse::decode(small.data(), n)->errorCode,
+              static_cast<int16_t>(pc::ErrorCode::NotCoordinator));
+}
+
+TEST_F(TransactionCoordinationServiceTest, EndTxnBelowMinOutCapHaltsInsteadOfDeferringRegression) {
+    isLeader_ = false;
+    const std::size_t reqLen = encodeEndTxn(reqBuf_.data(), reqBuf_.size(), 42, 9, 10, 0, true, "txA");
+    std::array<uint8_t, 8> tiny{};
+    EXPECT_DEATH((void)svc_->handleEndTxn(reqBuf_.data(), reqLen, 0, tiny.data(), tiny.size()),
+                 "kTxnMinOutCap");
 }

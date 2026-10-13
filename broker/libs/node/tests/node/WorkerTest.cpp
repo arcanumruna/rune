@@ -35,10 +35,21 @@
 #include <rune/node/Worker.h>
 #include <rune/node/WorkerOp.h>
 #include <rune/node/WorkerReplicationTransport.h>
+#include <rune/node/WorkerViewSet.h>
+#include <rune/node/ViewSnapshotChannel.h>
+#include <rune/node/AdminChannels.h>
+#include <rune/codec/Serialize.h>
+#include <rune/view/PlanCompiler.h>
+#include <rune/view/ViewRow.h>
+#include <rune/codec/Descriptor.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/ReplicationMessages.h>
 #include <rune/storage/InMemoryLog.h>
 
+#include <unistd.h>
+#include <filesystem>
+#include <string>
 #include <gtest/gtest.h>
 #include <memory>
 #include <atomic>
@@ -58,6 +69,29 @@ using rune::replication::NodeId;
 using rune::storage::InMemoryLog;
 
 namespace {
+
+// Per-PROCESS view data dirs "<temp>/<name>-<pid>": ctest -j runs each test as its
+// own process (and other checkouts run the same suites), so a fixed /tmp/<name>
+// let one process's cleanup wipe another's files.  Removed when the tests finish.
+std::vector<std::string>& createdTmpDirs() {
+    static std::vector<std::string> dirs;
+    return dirs;
+}
+std::string tmpDir(const std::string& name) {
+    std::string d = (std::filesystem::temp_directory_path() /
+                     (name + "-" + std::to_string(::getpid()))).string();
+    createdTmpDirs().push_back(d);
+    return d;
+}
+class TmpDirCleanup : public ::testing::Environment {
+public:
+    void TearDown() override {
+        std::error_code ec;
+        for (const std::string& d : createdTmpDirs()) std::filesystem::remove_all(d, ec);
+    }
+};
+[[maybe_unused]] ::testing::Environment* const kTmpDirCleanup =
+    ::testing::AddGlobalTestEnvironment(new TmpDirCleanup);
 
 // Minimal single-node memory-backed replica.  Mirrors the pattern used by
 // TransactionCoordinationServiceTest (the ground-truth call site per the brief).
@@ -693,4 +727,117 @@ TEST(Worker, DoWorkReplTransportNullReplicaGuard)
     EXPECT_EQ(follower->logEndOffset(), leoAtStart)
         << "Null-replica guard must drop frames for unowned (topicId=99, partition=88); "
            "LEO of the owned replica (5,7) must be unchanged";
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b E: a view over a TRANSIENT (InMemoryLog) source folds on the real
+// worker pass.  Before the fix driveViews_ skipped every non-disk source, so
+// the row never appeared (and a recovery view would never become Ready).
+// ---------------------------------------------------------------------------
+TEST(WorkerRegression, ViewFoldsOverTransientSourceRegression) {
+    constexpr int32_t kSrc = 21, kView = 0x40000041;
+    ReplicaFixture f(kSrc, 0);
+    ASSERT_TRUE(f.replica->isMemoryBacked());
+
+    const auto src = rune::codec::DescriptorBuilder("character", 1)
+        .add("characterId", rune::codec::PrimType::Int64, 1, /*isKey*/ true)
+        .add("hp", rune::codec::PrimType::Int32)
+        .build();
+    rune::view::ViewPlan v;
+    v.viewName = "char_hp"; v.key = "characterId"; v.sources = {{kSrc, "characterId"}};
+    v.output = {{"characterId", rune::codec::PrimType::Int64, 0, "characterId", rune::view::MergeRule::Replace},
+                {"hp", rune::codec::PrimType::Int32, 0, "hp", rune::view::MergeRule::Replace}};
+    v.persistence = 1;
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(v, srcs, kView).value();
+
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-worker-transient"));
+    vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
+
+    std::vector<uint8_t> value;
+    auto le = [&](uint64_t x, int n) { for (int i = 0; i < n; ++i) value.push_back(uint8_t(x >> (8 * i))); };
+    le(12, 2); le(1, 2); le(7, 8); le(55, 4);                 // blockLength, version, id=7, hp=55
+    std::vector<uint8_t> key(8, 0); key[0] = 7;
+    // appendKeyed wraps ONE record with a real wire key (append(span) would wrap
+    // the whole span as a single keyless value).
+    ASSERT_GE(f.replica->appendKeyed(std::span<const uint8_t>(key.data(), key.size()),
+                                     std::span<const uint8_t>(value.data(), value.size()),
+                                     /*acksAll=*/false), 0);
+
+    Worker w(/*workerId=*/0);
+    w.setOwnedDirect(Worker::OwnedSet{f.replica.get()});
+    w.setViewSet(&vs);
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = nullptr;
+    for (int i = 0; i < 200 && row == nullptr; ++i) {          // bounded: RC build + HW + fold
+        w.doWork(/*nowNs=*/1'000'000LL * (i + 1));
+        row = vs.getRow(kView, 0, 7, L);
+    }
+    ASSERT_NE(row, nullptr) << "the worker must fold a view over a transient source";
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 55);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b E (I2): a RECOVERY-installed view over a transient source reaches
+// Ready on the real worker pass (hasRecovery -> materialize -> rebuild -> fold),
+// so Worker::viewsReady() -- the election-eligibility gate -- becomes true.
+// Before the fix driveViews_ skipped the transient source, the instance stayed
+// RebuildingViews forever and the node was never election-eligible.
+// ---------------------------------------------------------------------------
+TEST(WorkerRegression, RecoveryViewOverTransientSourceReachesReadyRegression) {
+    constexpr int32_t kSrc = 22, kView = 0x40000042;
+    ReplicaFixture f(kSrc, 0);
+    ASSERT_TRUE(f.replica->isMemoryBacked());
+
+    const auto src = rune::codec::DescriptorBuilder("character", 1)
+        .add("characterId", rune::codec::PrimType::Int64, 1, /*isKey*/ true)
+        .add("hp", rune::codec::PrimType::Int32)
+        .build();
+    rune::view::ViewPlan v;
+    v.viewName = "char_hp"; v.key = "characterId"; v.sources = {{kSrc, "characterId"}};
+    v.output = {{"characterId", rune::codec::PrimType::Int64, 0, "characterId", rune::view::MergeRule::Replace},
+                {"hp", rune::codec::PrimType::Int32, 0, "hp", rune::view::MergeRule::Replace}};
+    v.persistence = 1;   // transient view over a transient source
+    const rune::codec::Descriptor* srcs[] = {&src};
+    auto comp = rune::view::compileView(v, srcs, kView).value();
+
+    rune::node::ViewSnapshotChannel ch;
+    rune::node::WorkerViewSet vs(ch, tmpDir("rune-views-worker-transient-recovery"));
+    // Push a recovery-flagged install exactly as BrokerNode::fanoutViewPlan_ does.
+    rune::node::ViewPlanUpdateMsg m;
+    m.viewTopicId = kView;
+    m.persistence = 1;
+    m.recovery    = true;
+    m.planBlob    = rune::view::serialize(comp.plan);
+    m.outDescBlob = rune::codec::serialize(comp.outputDescriptor);
+    m.srcDescBlob = rune::codec::serialize(src);
+    ASSERT_TRUE(rune::node::encodeViewPlanUpdate(
+        ch.install, rune::node::ViewSnapshotChannel::kInstallMsgType, m));
+
+    std::vector<uint8_t> value;
+    auto le = [&](uint64_t x, int n) { for (int i = 0; i < n; ++i) value.push_back(uint8_t(x >> (8 * i))); };
+    le(12, 2); le(1, 2); le(7, 8); le(55, 4);
+    std::vector<uint8_t> key(8, 0); key[0] = 7;
+    ASSERT_GE(f.replica->appendKeyed(std::span<const uint8_t>(key.data(), key.size()),
+                                     std::span<const uint8_t>(value.data(), value.size()),
+                                     /*acksAll=*/false), 0);
+
+    Worker w(/*workerId=*/0);
+    w.setOwnedDirect(Worker::OwnedSet{f.replica.get()});
+    w.setViewSet(&vs);
+    EXPECT_TRUE(w.viewsReady()) << "no instance hosted yet: the gate is inert";
+
+    const rune::view::RowLayout* L = nullptr;
+    const uint8_t* row = nullptr;
+    for (int i = 0; i < 200 && row == nullptr; ++i) {          // bounded: RC build + HW + rebuild
+        w.doWork(1'000'000LL * (i + 1));
+        row = vs.getRow(kView, 0, 7, L);                       // nullptr until the instance is Ready
+    }
+    ASSERT_NE(row, nullptr) << "the recovery view over a transient source must reach Ready and serve";
+    EXPECT_EQ(rune::view::readSlot(row, *L, 1).i, 55);
+    EXPECT_EQ(vs.readiness(kView, 0), rune::node::ViewReadiness::Ready);
+    EXPECT_EQ(vs.viewCount(), 1u) << "the recovery install materialized its instance";
+    EXPECT_FALSE(vs.hasRecovery()) << "recovery latches off once every instance is Ready";
+    EXPECT_TRUE(w.viewsReady()) << "election-eligibility gate must open";
 }

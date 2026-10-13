@@ -41,6 +41,7 @@
 #include <rune/protocol/client/OffsetMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/MessageHeader.h>
+#include <rune/node/GroupErrorMapping.h>
 
 #include <atomic>
 #include <chrono>
@@ -993,4 +994,156 @@ TEST_F(CG3ServiceTest, OffsetIndexRebuiltWhenTheLogContentChangesRegression) {
     EXPECT_FALSE(store_->fetch("g-stale", tp("t", 0)).has_value())
         << "a commit truncated out of the log is still served from the stale index";
     EXPECT_TRUE(store_->fetch("g-new", tp("t", 1)).has_value());
+}
+
+// ===========================================================================
+// No-hang wave (R2): every group handler answers a request whose body does not
+// decode with its own response type + InvalidRequest on the header's
+// correlationId (it used to return 0 — dropped, the member waited out its
+// timeout).
+// ===========================================================================
+namespace {
+std::size_t groupHeaderOnly(uint8_t* buf, pc::TemplateId tid, int64_t corr) {
+    pc::MessageHeader h;
+    h.blockLength = 32; h.templateId = static_cast<uint16_t>(tid);
+    h.sessionId = 5; h.correlationId = corr;
+    h.encode(buf);
+    return pc::MessageHeader::ENCODED_SIZE;
+}
+} // namespace
+
+TEST_F(CG3ServiceTest, MalformedGroupRequestsAreAnsweredInvalidRequestRegression) {
+    constexpr auto kInv = static_cast<int16_t>(pc::ErrorCode::InvalidRequest);
+    std::size_t n = groupHeaderOnly(req_, pc::TemplateId::JoinGroup, 1);
+    std::size_t o = service_->handleJoinGroup(req_, n, clock_, out_, kBufSize);
+    auto j = pc::JoinGroupResponse::decode(out_, o);
+    ASSERT_TRUE(j.has_value()); EXPECT_EQ(j->correlationId, 1); EXPECT_EQ(j->errorCode, kInv);
+
+    n = groupHeaderOnly(req_, pc::TemplateId::SyncGroup, 2);
+    o = service_->handleSyncGroup(req_, n, clock_, out_, kBufSize);
+    auto s = pc::SyncGroupResponse::decode(out_, o);
+    ASSERT_TRUE(s.has_value()); EXPECT_EQ(s->correlationId, 2); EXPECT_EQ(s->errorCode, kInv);
+
+    n = groupHeaderOnly(req_, pc::TemplateId::Heartbeat, 3);
+    o = service_->handleHeartbeat(req_, n, clock_, out_, kBufSize);
+    auto hb = pc::HeartbeatResponse::decode(out_, o);
+    ASSERT_TRUE(hb.has_value()); EXPECT_EQ(hb->correlationId, 3); EXPECT_EQ(hb->errorCode, kInv);
+
+    n = groupHeaderOnly(req_, pc::TemplateId::LeaveGroup, 4);
+    o = service_->handleLeaveGroup(req_, n, clock_, out_, kBufSize);
+    auto l = pc::LeaveGroupResponse::decode(out_, o);
+    ASSERT_TRUE(l.has_value()); EXPECT_EQ(l->correlationId, 4); EXPECT_EQ(l->errorCode, kInv);
+
+    n = groupHeaderOnly(req_, pc::TemplateId::OffsetCommit, 5);
+    o = service_->handleOffsetCommit(req_, n, clock_, out_, kBufSize);
+    auto oc = pc::OffsetCommitResponse::decode(out_, o);
+    ASSERT_TRUE(oc.has_value()); EXPECT_EQ(oc->correlationId, 5);
+    ASSERT_EQ(oc->results.size(), 1u); EXPECT_EQ(oc->results[0].errorCode, kInv);
+
+    n = groupHeaderOnly(req_, pc::TemplateId::OffsetFetch, 6);
+    o = service_->handleOffsetFetch(req_, n, clock_, out_, kBufSize);
+    auto of = pc::OffsetFetchResponse::decode(out_, o);
+    ASSERT_TRUE(of.has_value()); EXPECT_EQ(of->correlationId, 6);
+    ASSERT_EQ(of->results.size(), 1u); EXPECT_EQ(of->results[0].errorCode, kInv);
+}
+
+// No-hang fix round 3 (fix-on-sight): an unknown coordinator result maps to
+// Internal — it used to map to OK (an error silently answered as success).
+TEST(GroupErrorMappingRegression, UnknownCoordinatorResultIsInternalNotOkRegression) {
+    using rune::node::joinErrorToProto;
+    using rune::node::heartbeatErrorToProto;
+    using rune::node::syncErrorToProto;
+    constexpr auto kOk  = static_cast<int16_t>(pc::ErrorCode::OK);
+    constexpr auto kInt = static_cast<int16_t>(pc::ErrorCode::Internal);
+    EXPECT_EQ(joinErrorToProto(0), kOk);
+    EXPECT_EQ(joinErrorToProto(rune::coordination::JoinResult::kErrDead), static_cast<int16_t>(pc::ErrorCode::GroupDead));
+    EXPECT_EQ(heartbeatErrorToProto(rune::coordination::HeartbeatResult::kOk), kOk);
+    EXPECT_EQ(syncErrorToProto(rune::coordination::SyncResult::kOk), kOk);
+    for (const int unknown : {77, -1, 1000}) {
+        EXPECT_EQ(joinErrorToProto(unknown), kInt) << unknown;
+        EXPECT_EQ(heartbeatErrorToProto(unknown), kInt) << unknown;
+        EXPECT_EQ(syncErrorToProto(unknown), kInt) << unknown;
+    }
+}
+
+// No-hang fix round 4 (item 8, ruling): the gateway answers a pre-v5 client
+// UnknownMember instead of an Internal / InvalidRequest it would ignore — and
+// evicts the members on that session so the answer is TRUE: a later Heartbeat
+// of that member is UnknownMember (the v4 client re-joins on it).  Members on
+// other sessions are untouched.
+TEST_F(CG3ServiceTest, EvictSessionMembersMakesUnknownMemberTrueRegression) {
+    const std::string groupId = "g-evict";
+    auto joinAs = [&](int64_t sid, int64_t corr) {
+        const auto n = encodeJoinGroup(req_, sid, corr, groupId, "", 5000);
+        const auto o = service_->handleJoinGroup(req_, n, clock_, out_, kBufSize);
+        const auto r = pc::JoinGroupResponse::decode(out_, o);
+        EXPECT_TRUE(r.has_value());
+        return std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size());
+    };
+    const std::string oldMember = joinAs(/*sid=*/7, 900);
+    const std::string newMember = joinAs(/*sid=*/8, 901);
+    ASSERT_EQ(service_->coordinator(groupId).memberCount(), 2u);
+
+    service_->evictSessionMembers(/*sessionId=*/7, clock_);
+    EXPECT_EQ(service_->coordinator(groupId).memberCount(), 1u) << "the old client's member was not evicted";
+
+    const int32_t gen = service_->coordinator(groupId).generationId();
+    auto hb = encodeHeartbeat(req_, 7, 902, groupId, oldMember, gen);
+    auto o = service_->handleHeartbeat(req_, hb, clock_, out_, kBufSize);
+    ASSERT_GT(o, 0u);
+    EXPECT_EQ(decodeHBErrorCode(out_, o), static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+    hb = encodeHeartbeat(req_, 8, 903, groupId, newMember, gen);
+    o = service_->handleHeartbeat(req_, hb, clock_, out_, kBufSize);
+    ASSERT_GT(o, 0u);
+    EXPECT_NE(decodeHBErrorCode(out_, o), static_cast<int16_t>(pc::ErrorCode::UnknownMember))
+        << "a member on another session was evicted";
+    service_->evictSessionMembers(/*sessionId=*/7, clock_);   // idempotent: nothing left to evict
+    EXPECT_EQ(service_->coordinator(groupId).memberCount(), 1u);
+}
+
+// No-hang fix round 5 (N23): the pre-v5 eviction is SCOPED.  One (v4) session
+// hosts members of group A and group B; an error in A evicts only A's member —
+// B's member on the same session keeps heartbeating OK (no rebalance thrash of
+// a healthy group).  The OffsetFetch variant (group only, no member) evicts
+// this session's members of A only.  A member mapped to ANOTHER session is
+// never evicted (no spoofing).  RED (round 4): evictSessionMembers took both.
+TEST_F(CG3ServiceTest, OldClientEvictionIsScopedToTheRequestsGroupRegression) {
+    auto joinAs = [&](const std::string& groupId, int64_t sid, int64_t corr) {
+        const auto n = encodeJoinGroup(req_, sid, corr, groupId, "", 5000);
+        const auto o = service_->handleJoinGroup(req_, n, clock_, out_, kBufSize);
+        const auto r = pc::JoinGroupResponse::decode(out_, o);
+        EXPECT_TRUE(r.has_value());
+        return std::string(reinterpret_cast<const char*>(r->memberId.data()), r->memberId.size());
+    };
+    auto heartbeatCode = [&](const std::string& groupId, int64_t sid, const std::string& member, int64_t corr) {
+        const int32_t gen = service_->coordinator(groupId).generationId();
+        const auto n = encodeHeartbeat(req_, sid, corr, groupId, member, gen);
+        const auto o = service_->handleHeartbeat(req_, n, clock_, out_, kBufSize);
+        EXPECT_GT(o, 0u);
+        return decodeHBErrorCode(out_, o);
+    };
+    const int64_t v4 = 7;
+    const std::string a = joinAs("grp-A", v4, 910);
+    const std::string b = joinAs("grp-B", v4, 911);
+    const int16_t bBefore = heartbeatCode("grp-B", v4, b, 912);
+    ASSERT_NE(bBefore, static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+
+    // Spoof guard: (grp-A, a) is not mapped to session 99.
+    service_->evictMember("grp-A", a, /*sessionId=*/99, clock_);
+    EXPECT_EQ(service_->coordinator("grp-A").memberCount(), 1u) << "another session's member was evicted";
+
+    service_->evictMember("grp-A", a, v4, clock_);   // Heartbeat / SyncGroup Internal in A
+    EXPECT_EQ(service_->coordinator("grp-A").memberCount(), 0u);
+    EXPECT_EQ(heartbeatCode("grp-A", v4, a, 913), static_cast<int16_t>(pc::ErrorCode::UnknownMember));
+    EXPECT_EQ(service_->coordinator("grp-B").memberCount(), 1u) << "group B's member was evicted for A's error";
+    EXPECT_EQ(heartbeatCode("grp-B", v4, b, 914), bBefore) << "group B was disturbed by A's error";
+
+    // OffsetFetch variant: the group only.
+    const std::string a2 = joinAs("grp-A", v4, 915);
+    ASSERT_EQ(service_->coordinator("grp-A").memberCount(), 1u);
+    service_->evictMember("grp-A", std::string_view{}, v4, clock_);
+    EXPECT_EQ(service_->coordinator("grp-A").memberCount(), 0u);
+    EXPECT_EQ(service_->coordinator("grp-B").memberCount(), 1u);
+    EXPECT_EQ(heartbeatCode("grp-B", v4, b, 916), bBefore);
+    (void)a2;
 }

@@ -6,6 +6,8 @@
 // ---------------------------------------------------------------------------
 
 #include <rune/node/GroupCoordinationService.h>
+#include <rune/node/GroupErrorMapping.h>
+#include <rune/gateway/RequestRejection.h>
 
 #include <rune/gateway/ClientGateway.h>  // CG-4: addGroupSubscription / revokeGroupSubscriptions / sendControlFrame
 
@@ -24,36 +26,10 @@ namespace rune::node {
 namespace pc = rune::protocol::client;
 namespace coord = rune::coordination;
 
-// ---------------------------------------------------------------------------
-// Helper: convert coordinator error codes → protocol ErrorCode (int16_t)
-// ---------------------------------------------------------------------------
-static int16_t joinErrorToProto(int coordErr) noexcept {
-    switch (coordErr) {
-        case coord::JoinResult::kErrDead: return static_cast<int16_t>(pc::ErrorCode::GroupDead);
-        default:                          return static_cast<int16_t>(pc::ErrorCode::OK);
-    }
-}
-
-static int16_t heartbeatErrorToProto(int coordErr) noexcept {
-    switch (coordErr) {
-        case coord::HeartbeatResult::kOk:                   return static_cast<int16_t>(pc::ErrorCode::OK);
-        case coord::HeartbeatResult::kErrUnknownMember:     return static_cast<int16_t>(pc::ErrorCode::UnknownMember);
-        case coord::HeartbeatResult::kErrStaleGeneration:   return static_cast<int16_t>(pc::ErrorCode::StaleGeneration);
-        case coord::HeartbeatResult::kErrRebalanceInProgress: return static_cast<int16_t>(pc::ErrorCode::RebalanceInProgress);
-        default:                                            return static_cast<int16_t>(pc::ErrorCode::OK);
-    }
-}
-
-static int16_t syncErrorToProto(int coordErr) noexcept {
-    switch (coordErr) {
-        case coord::SyncResult::kOk:                   return static_cast<int16_t>(pc::ErrorCode::OK);
-        case coord::SyncResult::kErrStaleGeneration:   return static_cast<int16_t>(pc::ErrorCode::StaleGeneration);
-        case coord::SyncResult::kErrUnknownMember:     return static_cast<int16_t>(pc::ErrorCode::UnknownMember);
-        case coord::SyncResult::kErrRebalanceInProgress: return static_cast<int16_t>(pc::ErrorCode::RebalanceInProgress);
-        case coord::SyncResult::kErrWrongState:        return static_cast<int16_t>(pc::ErrorCode::RebalanceInProgress);
-        default:                                       return static_cast<int16_t>(pc::ErrorCode::OK);
-    }
-}
+// Coordinator result → protocol ErrorCode: GroupErrorMapping.h (fix round 3).
+using rune::node::joinErrorToProto;
+using rune::node::heartbeatErrorToProto;
+using rune::node::syncErrorToProto;
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -128,7 +104,8 @@ coord::TopicPartitionCounts GroupCoordinationService::buildTopicPartitionCounts(
     const int32_t n = topics_->topicCount();
     for (int32_t tid = 0; tid < n; ++tid) {
         const rune::node::TopicSpec* spec = topics_->topic(tid);
-        if (spec) {
+        // C1: a runtime topic awaiting its DDL commit is not assignable.
+        if (spec && !topics_->awaitingCommit(tid)) {
             counts[spec->name] = spec->partitionCount;
         }
     }
@@ -262,12 +239,14 @@ static std::string topicNameForId(rune::gateway::TopicRegistry* topics, int32_t 
 // handleJoinGroup (templateId 32)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleJoinGroup(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t /*outCap*/)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
 {
     auto msgOpt = pc::JoinGroup::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("GroupCoordinationService: JoinGroup decode failed — dropped");
-        return 0;
+        // No-hang (R2): answered JoinGroupResponse{InvalidRequest}, never dropped.
+        spdlog::debug("GroupCoordinationService: JoinGroup decode failed — answered InvalidRequest");
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::JoinGroup& msg = *msgOpt;
 
@@ -423,12 +402,14 @@ size_t GroupCoordinationService::handleJoinGroup(
 // handleSyncGroup (templateId 34)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleSyncGroup(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t /*outCap*/)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
 {
     auto msgOpt = pc::SyncGroup::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("GroupCoordinationService: SyncGroup decode failed — dropped");
-        return 0;
+        // No-hang (R2): answered SyncGroupResponse{InvalidRequest}, never dropped.
+        spdlog::debug("GroupCoordinationService: SyncGroup decode failed — answered InvalidRequest");
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::SyncGroup& msg = *msgOpt;
 
@@ -524,12 +505,14 @@ size_t GroupCoordinationService::handleSyncGroup(
 // handleHeartbeat (templateId 36)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleHeartbeat(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t /*outCap*/)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
 {
     auto msgOpt = pc::Heartbeat::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("GroupCoordinationService: Heartbeat decode failed — dropped");
-        return 0;
+        // No-hang (R2): answered HeartbeatResponse{InvalidRequest}, never dropped.
+        spdlog::debug("GroupCoordinationService: Heartbeat decode failed — answered InvalidRequest");
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::Heartbeat& msg = *msgOpt;
 
@@ -574,12 +557,14 @@ size_t GroupCoordinationService::handleHeartbeat(
 // handleLeaveGroup (templateId 38)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleLeaveGroup(
-    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t /*outCap*/)
+    const uint8_t* buf, size_t len, int64_t nowNs, uint8_t* out, size_t outCap)
 {
     auto msgOpt = pc::LeaveGroup::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("GroupCoordinationService: LeaveGroup decode failed — dropped");
-        return 0;
+        // No-hang (R2): answered LeaveGroupResponse{InvalidRequest}, never dropped.
+        spdlog::debug("GroupCoordinationService: LeaveGroup decode failed — answered InvalidRequest");
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::LeaveGroup& msg = *msgOpt;
 
@@ -650,6 +635,76 @@ size_t GroupCoordinationService::handleLeaveGroup(
 }
 
 // ---------------------------------------------------------------------------
+// evictSessionMembers — no-hang fix round 4 (item 8, pre-v5 clients).
+//
+// A v4 client stays Stable on a Heartbeat answer outside the rebalance set
+// (Internal / InvalidRequest): the gateway answers it UnknownMember instead and
+// calls this, so the answer is true — the member is gone (as on LeaveGroup),
+// the v4 member re-joins, and any split-brain ends with that paced re-join.
+// Cold (an error answer to an old client only).
+// ---------------------------------------------------------------------------
+void GroupCoordinationService::evictMember(std::string_view groupId, std::string_view memberId,
+                                           int64_t sessionId, int64_t nowNs)
+{
+    // No-hang fix round 5 (N23): scoped to the request's group (and member) —
+    // a failing group A on a session never evicts that session's member of a
+    // healthy group B (which would keep B rebalancing for as long as A fails).
+    // Subscriptions are not revoked here: group members subscribe explicitly
+    // (CG routing redesign) and drop their own subscriptions on re-join;
+    // revokeGroupSubscriptions is session-wide and would hit group B.
+    auto cit = coordinators_.find(groupId);
+    if (cit == coordinators_.end()) return;
+    coord::GroupCoordinator& coord = cit->second;
+    evictScratch_.clear();
+    for (const auto& member : coord.members()) {
+        if (!memberId.empty() && member.memberId != memberId) continue;
+        memberKeyScratch_.clear();
+        memberKeyScratch_.append(groupId);
+        memberKeyScratch_ += ':';
+        memberKeyScratch_.append(member.memberId);
+        const auto it = memberSessionMap_.find(memberKeyScratch_);
+        if (it != memberSessionMap_.end() && it->second == sessionId) evictScratch_.push_back(member.memberId);
+    }
+    for (const auto& m : evictScratch_) {
+        spdlog::warn("GroupCoordinationService: old client (session {}) member '{}' of group '{}' evicted — "
+                     "answered UnknownMember instead of an error it would ignore", sessionId, m, groupId);
+        coord.leave(m, coord.generationId(), nowNs);
+        memberKeyScratch_.clear();
+        memberKeyScratch_.append(groupId);
+        memberKeyScratch_ += ':';
+        memberKeyScratch_.append(m);
+        memberSessionMap_.erase(memberKeyScratch_);
+    }
+}
+
+void GroupCoordinationService::evictSessionMembers(int64_t sessionId, int64_t nowNs)
+{
+    for (auto& [groupId, coord] : coordinators_) {
+        evictScratch_.clear();
+        for (const auto& member : coord.members()) {
+            memberKeyScratch_.clear();
+            memberKeyScratch_.append(groupId);
+            memberKeyScratch_ += ':';
+            memberKeyScratch_.append(member.memberId);
+            const auto it = memberSessionMap_.find(memberKeyScratch_);
+            if (it != memberSessionMap_.end() && it->second == sessionId) evictScratch_.push_back(member.memberId);
+        }
+        if (evictScratch_.empty()) continue;
+        if (gateway_) gateway_->revokeGroupSubscriptions(sessionId);
+        for (const auto& memberId : evictScratch_) {
+            spdlog::warn("GroupCoordinationService: old client (session {}) member '{}' of group '{}' evicted — "
+                         "answered UnknownMember instead of an error it would ignore", sessionId, memberId, groupId);
+            coord.leave(memberId, coord.generationId(), nowNs);
+            memberKeyScratch_.clear();
+            memberKeyScratch_.append(groupId);
+            memberKeyScratch_ += ':';
+            memberKeyScratch_.append(memberId);
+            memberSessionMap_.erase(memberKeyScratch_);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // handleOffsetCommit (templateId 40)
 // ---------------------------------------------------------------------------
 size_t GroupCoordinationService::handleOffsetCommit(
@@ -657,8 +712,10 @@ size_t GroupCoordinationService::handleOffsetCommit(
 {
     auto msgOpt = pc::OffsetCommit::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("GroupCoordinationService: OffsetCommit decode failed — dropped");
-        return 0;
+        // No-hang (R2): answered OffsetCommitResponse{InvalidRequest}, never dropped.
+        spdlog::debug("GroupCoordinationService: OffsetCommit decode failed — answered InvalidRequest");
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::OffsetCommit& msg = *msgOpt;
 
@@ -768,8 +825,10 @@ size_t GroupCoordinationService::handleOffsetFetch(
 
     auto msgOpt = pc::OffsetFetch::decode(buf, len);
     if (!msgOpt) {
-        spdlog::debug("GroupCoordinationService: OffsetFetch decode failed — dropped");
-        return 0;
+        // No-hang (R2): answered OffsetFetchResponse{InvalidRequest}, never dropped.
+        spdlog::debug("GroupCoordinationService: OffsetFetch decode failed — answered InvalidRequest");
+        return rune::gateway::encodeRejectionFor(
+            buf, len, static_cast<uint16_t>(pc::ErrorCode::InvalidRequest), out, outCap);
     }
     const pc::OffsetFetch& msg = *msgOpt;
 
@@ -904,6 +963,10 @@ void GroupCoordinationService::onEnterPreparingRebalance(
     const GroupId& groupId,
     rune::coordination::GroupCoordinator& coord)
 {
+    // Fix round 5: an Assign frame (sent reliably through sendControlFrame)
+    // always fits the gateway spill's staging buffer.
+    static_assert(kAssignFrameScratchSize <= rune::gateway::ClientGateway::spillSizing().stage,
+                  "Assign frames must be spillable");
     if (!gateway_) return;  // no push path wired
 
     const int32_t gen = coord.generationId();

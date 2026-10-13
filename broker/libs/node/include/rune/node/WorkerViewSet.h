@@ -117,7 +117,29 @@ struct ViewFoldCounters {
     uint64_t aggOverflow      = 0;   // aggregate: Sum emitted NULL (did not fit its type)
     uint64_t aggNonFinite     = 0;   // aggregate: NaN/+-Inf Float input treated as NULL
     uint64_t aggInconsistent  = 0;   // aggregate: retraction found missing/zero state
+    uint64_t transientRecordsEvicted = 0;   // transient ring dropped records the view had not folded
 };
+
+// The live [logStart, logEnd) of a TRANSIENT (InMemoryLog) source partition,
+// handed to the per-instance fold so it can reconcile its cursor (Phase 2b E).
+struct TransientBounds {
+    int64_t logStart = 0;
+    int64_t logEnd   = 0;
+};
+
+// Where an instance's foldCursor came from (only consulted for a transient
+// source; a disk source never reads it).  One explicit state, one path each:
+//   Fresh                — created empty; the first transient reconcile starts it
+//                          at the source's logStart (records evicted BEFORE the
+//                          view existed are not "lost" — never counted).
+//   RecoveredUnreconciled— cursor restored from a checkpoint taken against an
+//                          EARLIER incarnation of the source.  A transient source
+//                          restarts empty and reuses offsets, so that cursor is
+//                          meaningless: the first reconcile warns once, resets to
+//                          logStart and keeps the rows.
+//   Live                 — cursor tracks this incarnation: EVICTED when it falls
+//                          below logStart, invariant breach when above logEnd.
+enum class CursorState : uint8_t { Fresh, RecoveredUnreconciled, Live };
 
 // One installed materialized view on this worker, for ONE partition.  MOVABLE
 // (lives by value in `views_`): it declares only a converting constructor, so
@@ -135,6 +157,7 @@ struct ViewInstance {
     std::optional<AggInstance>         agg;
     int32_t                            partition       = 0;
     int64_t                            foldCursor      = 0;
+    CursorState                        cursorState     = CursorState::Fresh;
     // The offset O of the most recently ENCODED checkpoint delta.  This is the
     // attempted/encoded offset, NOT a durable one — durability is reported
     // separately by the view-snapshot IO agent's `done` ring (consumed in
@@ -290,7 +313,8 @@ public:
     // the loop is driven under a hard cap by the caller, never `while(!ready)`.
     template <class ReadRangeFn>
     int driveRebuild(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange,
-                     int64_t committedTail, int64_t nowNs) {
+                     int64_t committedTail, int64_t nowNs,
+                     const TransientBounds* transientSrc = nullptr) {
         (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
         auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end()) return 0;
@@ -300,7 +324,7 @@ public:
             if (vit == views_.end()) continue;  // not hosted-for-recovery here
             ViewInstance& inst = vit->second;
             if (inst.readiness == ViewReadiness::Ready) continue;  // already caught up
-            work += driveView_(inst, readRange, committedTail);
+            work += driveView_(inst, readRange, committedTail, transientSrc);
             if (inst.foldCursor >= committedTail) {
                 inst.readiness = ViewReadiness::Ready;
                 // Task 19b: once EVERY hosted instance of this view is Ready, drop
@@ -330,7 +354,8 @@ public:
     // pushed/held this pass (0 == genuinely no work).
     template <class ReadRangeFn>
     int driveFolds(int32_t srcTopicId, int32_t partition, ReadRangeFn&& readRange,
-                   int64_t bound, int64_t nowNs) {
+                   int64_t bound, int64_t nowNs,
+                   const TransientBounds* transientSrc = nullptr) {
         (void)nowNs;  // reserved for checkpoint cadence (Phase 1: every batch boundary)
         auto it = subscriptionIndex_.find(srcTopicId);
         if (it == subscriptionIndex_.end()) return 0;
@@ -341,7 +366,7 @@ public:
             // driveRebuild/materializeRecoveryInstancesFor already use.
             ViewInstance* inst = getOrCreate_(viewTopicId, partition, bound);
             if (inst == nullptr) continue;  // defensive: template must exist
-            work += driveView_(*inst, readRange, bound);
+            work += driveView_(*inst, readRange, bound, transientSrc);
         }
         return work;
     }
@@ -477,8 +502,13 @@ private:
     // view, drains + encodes + pushes a checkpoint delta.  Returns this pass's
     // progress count for the instance.
     template <class ReadRangeFn>
-    int driveView_(ViewInstance& inst, ReadRangeFn&& readRange, int64_t bound) {
+    int driveView_(ViewInstance& inst, ReadRangeFn&& readRange, int64_t bound,
+                   const TransientBounds* transientSrc) {
         int work = 0;
+        // 0. Phase 2b E: a TRANSIENT source — reconcile THIS instance's cursor
+        //    against the source's live range (no extra hash lookups: the caller
+        //    already holds the instance).  Disk sources pass nullptr.
+        if (transientSrc != nullptr) work += reconcileTransient_(inst, *transientSrc);
         // 1. A delta held from a back-pressured prior pass flushes first.  Held
         //    view work counts as progress (keep the worker hot so it retries the
         //    ring); if it still cannot be pushed, hold and do not fold further.
@@ -563,6 +593,11 @@ private:
         work += buildAndPushCheckpoint_(inst);
         return work;
     }
+
+    // Phase 2b E: the one cursor-state transition for an instance over a transient
+    // source (see CursorState).  Returns 1 if the cursor moved (counts as work),
+    // else 0.  O(1), no allocation.
+    static int reconcileTransient_(ViewInstance& inst, const TransientBounds& tb);
 
     // Drain the dirtied rows into a checkpoint delta (copying each row's bytes
     // into stable scratch — drainDirty's row pointer is only valid during the

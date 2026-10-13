@@ -483,5 +483,33 @@ TEST_F(GatewayRedirectFixture, ExistingSession_UnaffectedBy_LeadershipFlip) {
     EXPECT_EQ(gw_->sessionCount(), 1u);
 }
 
+
+// Fix round 3 (N7 untested path): a follower whose leader endpoint is too long
+// for the frame answers the Connect with the bare NotLeader (no endpoint) —
+// never a silent drop of the pending connect.
+TEST_F(GatewayRedirectFixture, OversizedLeaderEndpointAnswersConnectNotLeaderRegression) {
+    const std::string hugeEndpoint(80 * 1024, 'e');
+    buildGateway([&]() -> LeaderView { return LeaderView{/*isLeader=*/false, hugeEndpoint}; });
+    auto client = makeClient(kEgressBase + 31);
+    pump([&]() { return client.ingressPub->isConnected(); }, nullptr, nullptr, kPumpIter, "waitPubConnected");
+    pc::ConnectRequest req;
+    req.correlationId = 4343; req.egressStreamId = client.egressStreamId; req.clientVersion = 5;
+    req.egressChannel = client.egressChannel;
+    uint8_t sc[512] = {};
+    offerBounded(*client.ingressPub, sc, req.encode(sc), "OversizedRedirectConnect");
+    std::optional<pc::ErrorResponse> errResp;
+    aeron::FragmentAssembler asm_([&](aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t offset,
+                                      aeron::util::index_t flen, aeron::Header&) {
+        auto dec = pc::ErrorResponse::decode(reinterpret_cast<const uint8_t*>(buf.buffer() + offset),
+                                             static_cast<std::size_t>(flen));
+        if (dec) { dec->message = {}; errResp = *dec; }
+    });
+    pump([&]() { return errResp.has_value(); }, &*client.egressSub, &asm_, kPumpIter, "ErrorResponse(NotLeader)");
+    ASSERT_TRUE(errResp.has_value()) << "an oversized redirect endpoint dropped the Connect";
+    EXPECT_EQ(errResp->code, static_cast<int16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_EQ(errResp->correlationId, 4343);
+    EXPECT_EQ(gw_->sessionCount(), 0u);
+}
+
 } // namespace
 } // namespace rune::gateway

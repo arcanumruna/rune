@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 
 namespace rune::gateway {
 
@@ -53,6 +54,21 @@ struct IGroupRequestHandler {
     virtual size_t handleOffsetFetch (const uint8_t* buf, size_t len,
                                       int64_t nowNs,
                                       uint8_t* out, size_t outCap) = 0;
+
+    // No-hang fix rounds 4-5 (item 8 / N23, pre-v5 clients): the gateway
+    // answers an old client UnknownMember in place of an Internal /
+    // InvalidRequest it would ignore; these make that answer TRUE (the old
+    // client re-joins on it).  Cold paths.  Default: nothing to evict.
+    //
+    // evictMember: the request's own (group, member) — only if that member is
+    // mapped to `sessionId` (another session's member is never touched);
+    // `memberId` empty = every member of `sessionId` in `groupId` (OffsetFetch
+    // names the group only).  Other groups on the same session are untouched.
+    virtual void evictMember(std::string_view groupId, std::string_view memberId, int64_t sessionId,
+                             int64_t nowNs) { (void)groupId; (void)memberId; (void)sessionId; (void)nowNs; }
+    // evictSessionMembers: every member on `sessionId` — ONLY for a request
+    // whose body is undecodable (its group is unknown).
+    virtual void evictSessionMembers(int64_t sessionId, int64_t nowNs) { (void)sessionId; (void)nowNs; }
 };
 
 } // namespace rune::gateway

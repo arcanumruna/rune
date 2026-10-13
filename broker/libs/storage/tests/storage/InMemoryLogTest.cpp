@@ -1,6 +1,7 @@
 #include <rune/storage/InMemoryLog.h>
 #include <rune/storage/Log.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 #include <filesystem>
 using namespace rune::storage;
 
@@ -37,7 +38,7 @@ TEST(InMemoryLog, IsDiskBackedTag) {
     InMemoryLog iml(1<<20, 1024);
     EXPECT_FALSE(iml.isDiskBacked());
 
-    auto tmpDir = std::filesystem::temp_directory_path() / "rune_isdiskbacked_test";
+    auto tmpDir = std::filesystem::temp_directory_path() / ("rune_isdiskbacked_test_" + std::to_string(::getpid()));
     std::filesystem::create_directories(tmpDir);
     {
         Log diskLog(tmpDir.string());

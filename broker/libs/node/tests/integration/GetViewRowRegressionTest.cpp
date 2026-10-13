@@ -23,6 +23,7 @@
 //   OpenViewFingerprintMismatchRejected     — stale fingerprint -> SchemaMismatch
 // ---------------------------------------------------------------------------
 
+#include <unistd.h>
 #include <gtest/gtest.h>
 
 #include <rune/node/Worker.h>
@@ -70,6 +71,29 @@ namespace rv = rune::view;
 namespace pc = rune::protocol::client;
 
 namespace {
+
+// Per-PROCESS view data dirs "<temp>/<name>-<pid>": ctest -j runs each test as its
+// own process (and other checkouts run the same suites), so a fixed /tmp/<name>
+// let one process's cleanup wipe another's files.  Removed when the tests finish.
+std::vector<std::string>& createdTmpDirs() {
+    static std::vector<std::string> dirs;
+    return dirs;
+}
+std::string tmpDir(const std::string& name) {
+    std::string d = (std::filesystem::temp_directory_path() /
+                     (name + "-" + std::to_string(::getpid()))).string();
+    createdTmpDirs().push_back(d);
+    return d;
+}
+class TmpDirCleanup : public ::testing::Environment {
+public:
+    void TearDown() override {
+        std::error_code ec;
+        for (const std::string& d : createdTmpDirs()) std::filesystem::remove_all(d, ec);
+    }
+};
+[[maybe_unused]] ::testing::Environment* const kTmpDirCleanup =
+    ::testing::AddGlobalTestEnvironment(new TmpDirCleanup);
 
 constexpr int32_t kViewTopicId = 0x40000007;
 constexpr int32_t kSrcTopicId  = 5;
@@ -160,7 +184,7 @@ TEST(GetViewRowRegression, GetViewRowAbsentKeyReturnsTypedAbsent) {
     auto comp = rv::compileView(hpView(), srcs, kViewTopicId).value();
 
     ViewSnapshotChannel channel;
-    WorkerViewSet vs(channel, "/tmp/rune-views-gvr-absent");
+    WorkerViewSet vs(channel, tmpDir("rune-views-gvr-absent"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
 
     // Fold one row (key 7) so the (view, partition 0) instance exists + is Ready.
@@ -191,7 +215,7 @@ TEST(GetViewRowRegression, GetViewRowReturnsCurrentRowAfterFold) {
     auto comp = rv::compileView(hpView(), srcs, kViewTopicId).value();
 
     ViewSnapshotChannel channel;
-    WorkerViewSet vs(channel, "/tmp/rune-views-gvr-ok");
+    WorkerViewSet vs(channel, tmpDir("rune-views-gvr-ok"));
     vs.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
 
     const auto batch = oneUpsert(7, 50);
@@ -237,7 +261,7 @@ TEST(GetViewRowRegression, ShardDutyCyclePassDrainsViewInstallRing) {
     auto comp = rv::compileView(hpView(), srcs, kViewTopicId).value();
 
     ViewSnapshotChannel channel;
-    WorkerViewSet vs(channel, "/tmp/rune-views-shard-install");
+    WorkerViewSet vs(channel, tmpDir("rune-views-shard-install"));
 
     // Seed the install ring EXACTLY as BrokerNode::pumpViewFanout_ does.
     ViewPlanUpdateMsg vp;
@@ -301,8 +325,8 @@ TEST(GetViewRowRegression, MultiWorkerRoutesToSourceOwnerViaCoLocation) {
     // Fan-out installs the TEMPLATE on every worker; only the source-owner folds
     // a row for (viewTopicId, partition 0) — exactly as production driveViews_.
     ViewSnapshotChannel ch0, ch1;
-    WorkerViewSet vs0(ch0, "/tmp/rune-views-gvr-mw0");
-    WorkerViewSet vs1(ch1, "/tmp/rune-views-gvr-mw1");
+    WorkerViewSet vs0(ch0, tmpDir("rune-views-gvr-mw0"));
+    WorkerViewSet vs1(ch1, tmpDir("rune-views-gvr-mw1"));
     vs0.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
     vs1.installView(comp.plan, comp.rowLayout, src, /*persisted*/ false);
     WorkerViewSet* vsByWorker[kWorkers] = {&vs0, &vs1};
@@ -361,7 +385,9 @@ namespace {
 std::string uniqSuffix() {
     static std::atomic<uint64_t> seq{0};
     const auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
-    return std::to_string(seq.fetch_add(1, std::memory_order_relaxed)) + "_" + std::to_string(ts);
+    // The pid keeps ctest -j parallel PROCESSES apart (each starts seq at 0 and the
+    // clock can tick identically in two of them; a shared dir was removed under a peer).
+    return std::to_string(::getpid()) + "_" + std::to_string(seq.fetch_add(1, std::memory_order_relaxed)) + "_" + std::to_string(ts);
 }
 
 struct TmpDir {
@@ -433,7 +459,7 @@ protected:
 
         AdminDeps deps;
         deps.requestCreateTopic = [this](int64_t ticket, int32_t, const std::string&,
-                                         const std::string&, uint8_t) -> bool {
+                                         const std::string&, uint8_t, uint8_t) -> bool {
             pendingTicket_ = ticket;
             return true;
         };

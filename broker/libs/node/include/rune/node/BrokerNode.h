@@ -20,6 +20,12 @@
 // Multi-node: real per-peer UDP publications + ingress subscription.
 // Both paths now serve clients via ClientGateway (single-writer duty-cycle).
 
+#include <cstring>
+#include <cassert>
+#include <rune/protocol/client/SchemaMessages.h>
+#include <cstdlib>
+#include <limits>
+#include <rune/gateway/SpillFifo.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/consensus/ControlRing.h>   // Task 9: tlsReloadRing_ (SIGHUP trigger)
 #include <rune/node/EmbeddedDriver.h>
@@ -48,6 +54,7 @@
 #include <rune/node/AdminWorker.h>
 #include <rune/node/AdminChannels.h>
 #include <rune/node/AdminControlPlane.h>
+#include <rune/node/DdlAnswerGate.h>
 #include <rune/node/SchemaFanout.h>
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/ViewSnapshotIoAgent.h>
@@ -218,7 +225,8 @@ public:
                            std::string_view name, uint32_t partitionCount,
                            std::string_view keyField, bool validate,
                            const uint8_t* descriptorBlob,
-                           uint32_t descriptorLen) override {
+                           uint32_t descriptorLen,
+                           uint8_t persistence) override {
         DefineTopicMsg m;
         m.session        = sessionId;
         m.corr           = correlationId;
@@ -228,6 +236,7 @@ public:
         m.keyField.assign(keyField);
         if (descriptorBlob && descriptorLen)
             m.blob.assign(descriptorBlob, descriptorBlob + descriptorLen);
+        m.persistence = persistence;
         return encodeDefineTopic(requestRing_, m);
     }
 
@@ -299,7 +308,13 @@ public:
         }, 16);
 
         // 3. Drain gateway requests (DefineTopic / GetSchema).
-        work += requestRing_.drain([this](int32_t tid,
+        //    Fix round 2: while DDL answers wait in the egress backlog, NO new
+        //    request is taken — the request ring fills and the gateway answers
+        //    the next DDL Internal (an explicit answer) instead of the backlog
+        //    growing.  This bounds the backlog to one tick's answers (<= 16
+        //    drained + the in-flight op), far below kEgressBacklogBytes.
+        if (!egressBacklog_.empty()) [[unlikely]] work += flushEgressBacklog_();
+        if (egressBacklog_.empty()) work += requestRing_.drain([this](int32_t tid,
                                           aeron::concurrent::AtomicBuffer& b,
                                           aeron::util::index_t off,
                                           aeron::util::index_t len) {
@@ -322,7 +337,12 @@ public:
         // 4b. F3 round 6, item 3: retry SchemaUpdates the admin→control ring
         //     could not take (full) — retry-on-full, never a drop.
         if (!schemaBacklog_.empty()) [[unlikely]] work += flushSchemaBacklog_();
-        if (!viewPlanBacklog_.empty()) [[unlikely]] work += flushViewPlanBacklog_();  // Task 19
+        // C1: commits before plans — a view plan never overtakes its sink's commit
+        // (the control thread builds the sink's replicas on kA2cTopicCommitted).
+        if (!topicCommittedBacklog_.empty()) [[unlikely]] work += flushTopicCommittedBacklog_();  // B10
+        if (!viewPlanBacklog_.empty() && topicCommittedBacklog_.empty()) [[unlikely]]
+            work += flushViewPlanBacklog_();  // Task 19
+        if (!egressBacklog_.empty()) [[unlikely]] work += flushEgressBacklog_();       // no-hang R2 / fix round 2
 
         // 5. fsyncgate (Task 10 fix 3 / I1): the schema log this thread drives
         //    failed an fsync → hand it to the control thread (ring, no shared
@@ -378,6 +398,69 @@ public:
             schemaBacklog_.push_back(SchemaUpdateMsg{topicId, version, blob});   // keep FIFO order
     }
     [[nodiscard]] std::size_t schemaBacklogForTest() const noexcept { return schemaBacklog_.size(); }
+
+    /// No-hang wave (R2) / fix round 2 — ADMIN thread only (the deps.respond*
+    /// callbacks).  Post one DDL response frame for `session` on the
+    /// admin→control egress ring as [sessionId:i64][frame].  Ring full → the
+    /// preallocated, bounded backlog (SpillFifo, FIFO), retried every doWork;
+    /// while it is non-empty no new DDL request is taken (doWork step 3), which
+    /// bounds it by construction.  Returns false ONLY when the frame can never
+    /// fit one ring message (8 + n > maxMsgLength) — the caller answers
+    /// MessageTooLarge instead.  Never allocates.
+    [[nodiscard]] bool postEgressFrame(int64_t session, const uint8_t* frame, std::size_t n) {
+        if (8 + n > static_cast<std::size_t>(egressRing_.maxMsgLength())) return false;
+        if (egressBacklog_.empty() && tryPostEgress_(session, frame, n)) return true;
+        if (!egressBacklog_.push(session, frame, n)) [[unlikely]] haltEgressBacklogFull_();
+        return true;
+    }
+    /// ADMIN thread only (deps.respondGet).  Encode a TopicSchemaResponse in place
+    /// in the egress ring (or, ring full / backlog ahead, via the preallocated
+    /// stage into the bounded backlog).  A descriptor that can never fit one ring
+    /// message is answered MessageTooLarge with no blob — never parked forever,
+    /// never dropped.
+    void postTopicSchemaResponse(int64_t session, int64_t corr, int32_t topicId, uint16_t version,
+                                 int32_t partitionCount, const std::vector<uint8_t>& blob,
+                                 uint16_t errorCode) {
+        namespace pc = rune::protocol::client;
+        pc::TopicSchemaResponse resp;
+        resp.sessionId      = session;
+        resp.correlationId  = corr;
+        resp.topicId        = topicId;
+        resp.version        = version;
+        resp.errorCode      = errorCode;
+        resp.partitionCount = partitionCount;   // Phase 2b Part C
+        resp.descriptorBlob = blob.empty() ? nullptr : blob.data();
+        resp.descriptorLen  = static_cast<uint32_t>(blob.size());
+        if (resp.encodedSize() > maxEgressFrameBytes()) [[unlikely]] {
+            resp.descriptorBlob = nullptr;
+            resp.descriptorLen  = 0;
+            resp.errorCode      = static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge);
+        }
+        const std::size_t sz = resp.encodedSize();
+        const auto idx = egressBacklog_.empty() ? egressRing_.tryClaim(kMsgEgressFrame, 8 + sz) : -1;
+        if (idx < 0) [[unlikely]] {
+            [[maybe_unused]] const std::size_t w = resp.encode(egressStage_.data());
+            assert(w == sz && "TopicSchemaResponse encode() != encodedSize()");
+            [[maybe_unused]] const bool posted = postEgressFrame(session, egressStage_.data(), sz);
+            assert(posted);
+            return;
+        }
+        uint8_t* p = egressRing_.base() + idx;
+        std::memcpy(p, &session, 8);
+        [[maybe_unused]] const std::size_t written = resp.encode(p + 8);
+        assert(written == sz && "TopicSchemaResponse encode() != encodedSize()");
+        egressRing_.commit(idx);
+    }
+
+    /// Admin-thread scratch for an answer encoded off-ring (preallocated to one
+    /// ring message; sz <= maxEgressFrameBytes()).
+    [[nodiscard]] uint8_t* egressStage(std::size_t /*sz*/) noexcept { return egressStage_.data(); }
+    [[nodiscard]] std::size_t maxEgressFrameBytes() const noexcept {
+        return static_cast<std::size_t>(egressRing_.maxMsgLength()) - 8u;
+    }
+    [[nodiscard]] bool egressBacklogEmpty() const noexcept { return egressBacklog_.empty(); }
+    [[nodiscard]] std::size_t egressBacklogForTest() const noexcept { return egressBacklog_.count(); }
+    int flushEgressBacklogForTest() { return flushEgressBacklog_(); }
     int flushSchemaBacklogForTest() { return flushSchemaBacklog_(); }
 
     /// Task 19 — ADMIN thread only (called from deps.pushViewPlan inside
@@ -393,10 +476,25 @@ public:
                           vp.viewTopicId, viewPlanUpdateWireLen(vp), failureRing_.maxMsgLength());
             return;
         }
-        if (!viewPlanBacklog_.empty() ||
+        // C1: behind any backlogged commit too — a plan never overtakes its sink's
+        // kA2cTopicCommitted on the ring (the commits flush first, see doWork).
+        if (!viewPlanBacklog_.empty() || !topicCommittedBacklog_.empty() ||
             !encodeViewPlanUpdate(failureRing_, kA2cViewPlanUpdate, vp))
             viewPlanBacklog_.push_back(vp);   // keep FIFO order
     }
+
+    /// B10 / D4 fix round 1 — ADMIN thread only (deps.topicCommitted).  Post
+    /// kA2cTopicCommitted on the admin→control ring; the control thread rewrites
+    /// the topic's dir marker pending -> committed.  Ring full → admin-owned
+    /// backlog, retried every doWork (FIFO, never dropped).
+    void postTopicCommitted(int32_t topicId) {
+        if (!topicCommittedBacklog_.empty() || !encodeTopicCommitted(failureRing_, topicId))
+            topicCommittedBacklog_.push_back(topicId);
+    }
+    [[nodiscard]] std::size_t topicCommittedBacklogForTest() const noexcept {
+        return topicCommittedBacklog_.size();
+    }
+    int flushTopicCommittedBacklogForTest() { return flushTopicCommittedBacklog_(); }
 
     // -----------------------------------------------------------------------
     // Producer-side accessors — the gateway/control thread enqueues here.
@@ -418,13 +516,54 @@ private:
     OneToOneByteRing replyRing_;       // control → admin (createTopic reply)
     OneToOneByteRing roleRing_;        // control → admin (role events)
     OneToOneByteRing createReqRing_{kCreateTopicRingBytes}; // admin → control (createTopic req)
-    OneToOneByteRing egressRing_{kAdminRequestRingBytes};   // admin → control (response frames: [sessionId:i64][frame])
+    OneToOneByteRing egressRing_{kAdminEgressRingBytes};   // admin → control (response frames: [sessionId:i64][frame])
+    // Fix round 5: an admin answer (at most the ring's max message, capacity/8)
+    // always fits the gateway spill's staging buffer.
+    static_assert(static_cast<std::size_t>(kAdminEgressRingBytes) / 8 <=
+                      rune::gateway::ClientGateway::spillSizing().stage,
+                  "admin egress answers must be spillable");
     // admin → control (T10 storage failure + F3 r6 SchemaUpdate).  Sized like
     // the other blob-carrying admin rings so a descriptor fits one message.
     OneToOneByteRing failureRing_{kAdminToControlRingBytes};
     bool             storageFailureSignalled_ = false;
     std::vector<SchemaUpdateMsg> schemaBacklog_;   // admin-thread-owned (ring-full retry)
     std::vector<ViewPlanUpdateMsg> viewPlanBacklog_; // Task 19: admin-owned (ring-full retry)
+    std::vector<int32_t> topicCommittedBacklog_;     // B10 fix round 1: admin-owned (ring-full retry)
+    // Fix round 2: preallocated, bounded (was an unbounded vector<vector> with
+    // O(n) front erase).  4x the ring: one tick's answers fit by construction.
+    static constexpr std::size_t kEgressBacklogBytes = 4u * static_cast<std::size_t>(kAdminEgressRingBytes);
+    rune::gateway::SpillFifo egressBacklog_{kEgressBacklogBytes};
+    std::vector<uint8_t> egressStage_ = std::vector<uint8_t>(static_cast<std::size_t>(kAdminEgressRingBytes) / 8);
+
+    // The bound (doWork step 3 pauses intake while the backlog is non-empty) was
+    // exceeded: an invariant breach — halt loudly, never drop a DDL answer.
+    [[noreturn]] [[gnu::cold]] [[gnu::noinline]] void haltEgressBacklogFull_() const noexcept {
+        spdlog::critical("AdminWorkerAgent: DDL egress backlog full ({} answers, {} B) beyond its "
+                         "static bound — halting rather than dropping a DDL answer",
+                         egressBacklog_.count(), egressBacklog_.usedBytes());
+        std::abort();
+    }
+
+    bool tryPostEgress_(int64_t session, const uint8_t* frame, std::size_t n) {
+        const auto idx = egressRing_.tryClaim(kMsgEgressFrame, 8 + n);
+        if (idx < 0) return false;
+        uint8_t* p = egressRing_.base() + idx;
+        std::memcpy(p, &session, 8);
+        std::memcpy(p + 8, frame, n);
+        egressRing_.commit(idx);
+        return true;
+    }
+
+    int flushEgressBacklog_() {
+        int sent = 0;
+        while (!egressBacklog_.empty()) {
+            const auto r = egressBacklog_.front();
+            if (!tryPostEgress_(r.key, r.data, r.len)) break;
+            egressBacklog_.pop();
+            ++sent;
+        }
+        return sent;
+    }
 
     int flushSchemaBacklog_() {
         std::size_t sent = 0;
@@ -434,6 +573,16 @@ private:
             ++sent;
         schemaBacklog_.erase(schemaBacklog_.begin(),
                              schemaBacklog_.begin() + static_cast<std::ptrdiff_t>(sent));
+        return static_cast<int>(sent);
+    }
+
+    int flushTopicCommittedBacklog_() {
+        std::size_t sent = 0;
+        while (sent < topicCommittedBacklog_.size() &&
+               encodeTopicCommitted(failureRing_, topicCommittedBacklog_[sent]))
+            ++sent;
+        topicCommittedBacklog_.erase(topicCommittedBacklog_.begin(),
+                                     topicCommittedBacklog_.begin() + static_cast<std::ptrdiff_t>(sent));
         return static_cast<int>(sent);
     }
 
@@ -529,6 +678,19 @@ public:
     void skipProvisionerRunnerForTest() noexcept { skipProvisionerRunnerForTest_ = true; }
     /// Test-only: during start(), re-run the SCHEMA log's recovery with this msync errno.
     void setSchemaRecoveryFaultForTest(int err) noexcept { schemaRecoveryFaultForTest_ = err; }
+    /// Test-only (DDL conformance): the control thread answers the FIRST admin
+    /// create-topic request for `name` with a failure.  afterCreate=false fails
+    /// before creating; true creates the topic first (the reply is lost after the
+    /// work — an orphan).  Set before start(); afterwards only the control thread
+    /// reads/writes it (single owner).
+    void setAdminCreateFaultForTest(std::string name, bool afterCreate) {
+        adminCreateFault_ = AdminCreateFaultForTest{std::move(name), afterCreate};
+    }
+    /// Test-only (concern 4): building the replicas of the runtime topic `name`
+    /// fails when its record commits (kA2cTopicCommitted) — the topic never serves,
+    /// so its held DDL OK must be answered Internal (in doubt).  Set before start();
+    /// afterwards only the control thread reads it.
+    void setCommitReplicaFaultForTest(std::string name) { commitReplicaFault_ = std::move(name); }
 
     // -----------------------------------------------------------------------
     // Observers (F9a: ring-fed, no atomics)
@@ -1144,6 +1306,11 @@ private:
     // Task 8a: last leadership state posted to the admin role ring (control thread).
     bool                                                  adminLastLeader_ = false;
     int32_t                                               adminLastEpoch_  = -1;
+    // Task 14: the static RUNE_TOPICS count, set once on the startup thread before the
+    // recovery append (ids >= it are runtime topics); read by the control thread's
+    // create drain (createTopicForAdmin's firstRuntimeId).  Immutable after start.
+    // Defaults to "never matches" (fail-closed) until start() sets it.
+    int32_t                                               firstRuntimeTopicId_ = std::numeric_limits<int32_t>::max();
     std::unique_ptr<rune::consensus::BackoffIdleStrategy> adminWorkerIdleStrategy_;   // NodeConfig::adminIdleShape
     rune::consensus::MonotonicNanoClock                   adminWorkerClock_;
     std::unique_ptr<rune::consensus::AgentRunner>         adminWorkerRunner_;
@@ -1182,6 +1349,21 @@ private:
     int  recoveryFaultForTest_ = 0;
     bool skipProvisionerRunnerForTest_ = false;
     int  schemaRecoveryFaultForTest_ = 0;
+    // Final review M4: ONE armed test fault (no loose flags) — disarmed when it fires.
+    struct AdminCreateFaultForTest {
+        std::string name;          // the first create request for this name fails
+        bool        afterCreate;   // true: the topic is created first (an orphan)
+    };
+    std::optional<AdminCreateFaultForTest> adminCreateFault_;   // control thread after start()
+    std::optional<std::string>             commitReplicaFault_; // control thread after start()
+    // C1 / M7: a DefineTopic / CreateView OK leaves only once its topic serves
+    // (see DdlAnswerGate.h).  Control-thread-owned; one drain of the admin egress
+    // ring (16 frames of at most a ring message each) always fits.
+    static constexpr int64_t kDdlAnswerMaxHoldNs = 5'000'000'000LL;
+    DdlAnswerGate ddlAnswerGate_{2u * static_cast<std::size_t>(kAdminRequestRingBytes) + 4096u,
+                                 kDdlAnswerMaxHoldNs};
+    uint64_t      ddlAnswersOverdue_ = 0;   // control thread only: held OKs answered Internal (in doubt)
+    [[nodiscard]] bool ddlTopicServes_(int32_t topicId) const noexcept;
     int32_t                                      shardResolveStallWorkerForTest_ = -1;
     std::chrono::milliseconds                    shardResolveStallForTest_{0};
     void buildShardRuntimes_();

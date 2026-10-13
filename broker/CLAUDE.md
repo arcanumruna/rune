@@ -57,7 +57,7 @@ These are non-negotiable across every Rune repo. Check every design and every fi
 4. **Zero allocations.** No heap allocation on hot paths or in steady state — preallocate, reuse buffers (capacity persists), fixed stack buffers; no per-cycle `std::vector` returns / `std::function` / dynamic containers on the fast path.
 5. **Test everything, benchmark everything.** Prove features via real e2e/integration + benchmarks. No hand-waving; no "done" without the real path green.
 6. **Regression test on EVERY fix**, marked as a regression suite (e.g. `*Regression*`) so they run together.
-7. **On every fix/implementation, run the FULL regression suite FIRST (priority)** — then all other tests. The regression suite is the gate before anything else.
+7. **Affected-area tests on every fix/implementation; the FULL regression suite at checkpoints.** Each task / fix round: build, then run the test executables covering the code it touches plus every new or changed test. The FULL `*Regression*` suite runs at checkpoints — after a batch of related tasks, before any final/whole-branch review, and after every merge — and is the gate before anything integrates. A checkpoint failure is bisected over the commits since the last green checkpoint.
 8. **Fix-on-sight.** If while reading any file you find code that violates this philosophy (shared state, cross-thread callback, scattered flags, hot-path allocation, untested/un-regressed fix), you FIX it — don't just note it.
 
 ## Benchmark: optimal config for the 4-core box (ccx23 3-node acks=all)

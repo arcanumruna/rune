@@ -41,6 +41,7 @@
 // All Aeron channels use the aeron:udp transport (container transport).
 
 #include <rune/node/IdleShape.h>
+#include <rune/node/PersistenceMode.h>
 #include <rune/node/PemFile.h>   // Task 9: loadPemFile() — re-exported here for config callers
 
 #include <algorithm>
@@ -53,16 +54,6 @@
 #include <vector>
 
 namespace rune::node {
-
-// ---------------------------------------------------------------------------
-// PersistenceMode — controls the log backend for a topic's partitions.
-// ---------------------------------------------------------------------------
-enum class PersistenceMode : uint8_t {
-    Disk   = 0,   ///< On-disk Log (default). Survives node restarts.
-    Memory = 1,   ///< In-memory InMemoryLog. Zero-disk, zero-recovery (data lost on restart).
-                  ///  A memory topic that must survive node deaths MUST use a durable
-                  ///  mode (majority or all-in-sync) so data is replicated to other nodes.
-};
 
 // ---------------------------------------------------------------------------
 // TopicSpec — one declared topic (GB-1).
@@ -114,10 +105,10 @@ struct TopicSpec {
     std::string   coPartitionGroup;
     std::string   partitionKey;
 
-    // Task M1: persistence and durability modes.
-    // persistence: selects the log backend (Disk = default, Memory = InMemoryLog).
+    // Task M1 / Phase 2b E: persistence and durability modes.
+    // persistence: selects the log backend (Disk = default, Transient = InMemoryLog).
     // durability: 0 = Majority (default), 1 = AllInSync.  Forwarded to PartitionConfig.
-    //   Memory topics that must survive a node death MUST use majority or all-in-sync
+    //   Transient topics that must survive a node death MUST use majority or all-in-sync
     //   durability so the data is replicated to peer nodes before acknowledgement.
     PersistenceMode persistence = PersistenceMode::Disk;
     uint8_t         durability  = 0;   // 0 = Majority, 1 = AllInSync
@@ -569,7 +560,7 @@ struct NodeConfig {
     //   - ioCompletionRingDepth: slot depth of each worker's IoBackend completion ring.
     //     RUNE_IO_COMPLETION_RING_DEPTH. Default 1024 (matches Worker::kIoCompletionDepth).
     //   - memoryLogRingBytes: byte capacity of each InMemoryLog single-owner ring.
-    //     RUNE_MEMORY_LOG_RING_BYTES. Default 8 MiB.
+    //     RUNE_TRANSIENT_LOG_RING_BYTES (alias RUNE_MEMORY_LOG_RING_BYTES, deprecated). Default 8 MiB.
     int32_t replicationOutboundRingBytes = 32 * 1024 * 1024;   // findings §4 (was 4 MiB)
     int32_t workerIngressRingBytes       = 32 * 1024 * 1024;
     int32_t workerReturnRingBytes        = 32 * 1024 * 1024;
@@ -942,6 +933,9 @@ struct NodeConfig {
 struct ConfigResult {
     std::optional<NodeConfig> config;
     std::string               error;
+    // Non-fatal, one line each, logged by the caller (main) at startup — e.g. a
+    // deprecated RUNE_TOPICS spelling (Phase 2b E: persistence=memory).
+    std::vector<std::string>  warnings;
 };
 
 /// Parse a Linux cpu list ("0", "0,4-5"); sorted + deduplicated.  nullopt on any malformed token,

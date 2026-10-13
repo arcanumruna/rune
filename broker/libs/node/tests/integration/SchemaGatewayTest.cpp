@@ -33,6 +33,7 @@
 #include <rune/node/AdminWorker.h>
 #include <rune/node/AdminChannels.h>
 #include <rune/node/AdminCreateTopic.h>
+#include <rune/node/BrokerNode.h>   // AdminWorkerAgent (no-hang R2 egress backlog)
 #include <rune/node/SchemaRegistry.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/replication/PartitionReplica.h>
@@ -46,6 +47,7 @@
 
 #include <rune/protocol/client/SchemaMessages.h>
 #include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/PartitionHash.h>
@@ -140,6 +142,7 @@ struct SgHarness {
     OneToOneByteRing egressRing{kAdminRequestRingBytes};
 
     std::unique_ptr<AdminWorker> admin;
+    std::optional<CreateTopicReqMsg> lastCreateReq;   // Phase 2b E: last request the control thread saw
 
     // Gateway + its user topic registry.
     std::string topicDirPath;
@@ -150,10 +153,12 @@ struct SgHarness {
         OneToOneByteRing* ring;
         bool submitDefineTopic(int64_t s, int64_t c, std::string_view name,
                                uint32_t parts, std::string_view keyField, bool validate,
-                               const uint8_t* blob, uint32_t blen) override {
+                               const uint8_t* blob, uint32_t blen,
+                               uint8_t persistence) override {
             DefineTopicMsg m; m.session=s; m.corr=c; m.partitionCount=(int32_t)parts;
             m.validate=validate; m.name.assign(name); m.keyField.assign(keyField);
             if (blob && blen) m.blob.assign(blob, blob+blen);
+            m.persistence=persistence;
             return encodeDefineTopic(*ring, m);
         }
         bool submitGetSchema(int64_t s, int64_t c, std::string_view name,
@@ -221,9 +226,10 @@ struct SgHarness {
         deps.requestCreateTopic = [this](int64_t ticket, int32_t parts,
                                          const std::string& name,
                                          const std::string& keyField,
-                                         uint8_t cleanupPolicy) -> bool {
+                                         uint8_t cleanupPolicy,
+                                         uint8_t persistence) -> bool {
             CreateTopicReqMsg m; m.ticket=ticket; m.partitionCount=parts; m.name=name;
-            m.keyField=keyField; m.cleanupPolicy=cleanupPolicy;
+            m.keyField=keyField; m.cleanupPolicy=cleanupPolicy; m.persistence=persistence;
             return encodeCreateTopicReq(createReqRing, m);
         };
         deps.pushValidators = [](const RegistryEntry&, int32_t) {};
@@ -304,6 +310,7 @@ struct SgHarness {
                                            aeron::util::index_t off, aeron::util::index_t len) {
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer()+off);
             CreateTopicReqMsg req = decodeCreateTopicReq(p, (std::size_t)len);
+            lastCreateReq = req;
             CreateTopicReplyMsg reply; reply.ticket = req.ticket;
             if (realControl) {
                 reply = createTopicForAdmin(*topicReg, req);
@@ -363,8 +370,10 @@ struct SgHarness {
 std::vector<uint8_t> encodeDefineFrame(int64_t session, int64_t corr,
                                        const std::string& name, uint32_t parts,
                                        const std::string& keyField, bool validate,
-                                       const std::vector<uint8_t>& blob) {
+                                       const std::vector<uint8_t>& blob,
+                                       uint8_t persistence = 0) {
     pc::DefineTopic m;
+    m.persistence = persistence;
     m.sessionId = session; m.correlationId = corr; m.topicName = name;
     m.partitionCount = parts; m.keyField = keyField; m.validate = validate;
     m.descriptorBlob = blob.data(); m.descriptorLen = (uint32_t)blob.size();
@@ -388,6 +397,38 @@ std::vector<uint8_t> encodeAlterFrame(int64_t session, int64_t corr,
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Phase 2b E: the wire persistence byte reaches the control thread's
+// create-topic request and the durable registry entry — and an OLD client's
+// frame (no byte) still creates a disk topic.
+// ---------------------------------------------------------------------------
+TEST(SchemaGatewayRegression, DefineTopicTransientByteReachesControlAndRegistry) {
+    SgHarness h;
+    auto blob = charsBlob();
+    auto frame = encodeDefineFrame(1, 5, "characters", 2, "userId", false, blob,
+                                   pc::DefineTopic::kPersistenceTransient);
+    h.gw.applyDefineTopicForTest(frame.data(), frame.size());
+    h.pump();
+    ASSERT_TRUE(h.lastCreateReq.has_value());
+    EXPECT_EQ(h.lastCreateReq->persistence, 1u);
+    ASSERT_NE(h.schemaReg.byName("characters"), nullptr);
+    EXPECT_EQ(h.schemaReg.byName("characters")->persistence, PersistenceMode::Transient);
+}
+
+TEST(SchemaGatewayRegression, DefineTopicWithoutPersistenceByteCreatesDiskTopic) {
+    SgHarness h;
+    auto blob = charsBlob();
+    auto frame = encodeDefineFrame(1, 6, "characters", 2, "userId", false, blob);   // old client
+    ASSERT_EQ(frame.size(), pc::MessageHeader::ENCODED_SIZE + pc::DefineTopic::BODY_FIXED
+                                + 2 + 10 + 2 + 6 + 4 + blob.size())
+        << "precondition: a disk frame carries no persistence byte";
+    h.gw.applyDefineTopicForTest(frame.data(), frame.size());
+    h.pump();
+    ASSERT_TRUE(h.lastCreateReq.has_value());
+    EXPECT_EQ(h.lastCreateReq->persistence, 0u);
+    EXPECT_EQ(h.schemaReg.byName("characters")->persistence, PersistenceMode::Disk);
+}
 
 // ---------------------------------------------------------------------------
 // End-to-end: DefineTopic through the gateway → admin ring → replica → response.
@@ -550,6 +591,91 @@ TEST(SchemaGatewayRegression, DefineTopicOverExistingTopicRecordsAuthoritativePa
         EXPECT_LT(client, 3) << "key " << k << " routed to a nonexistent partition";
         EXPECT_EQ(client, h.topicReg->partitionForKey(ordersId, ks)) << "key " << k;
     }
+}
+
+// Phase 2b E review I1: createTopic is idempotent by name and ignores the requested
+// spec for an existing schema-less topic.  The recorded persistence must be the
+// topic's REAL one (what restart recovery reads), never the request's.
+static void expectRecordedModeMatchesTopic(SgHarness& h, const std::string& name,
+                                           int32_t id, PersistenceMode expected) {
+    ASSERT_NE(h.topicReg->topic(id), nullptr);
+    EXPECT_EQ(h.topicReg->topic(id)->persistence, expected) << "the live topic is unchanged";
+    const RegistryEntry* e = h.schemaReg.byName(name);
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(e->persistence, expected) << "the schema record must match the live topic";
+}
+
+TEST(SchemaGatewayRegression, DiskDefineOverExistingTransientTopicRecordsTransient) {
+    SgHarness h;
+    h.realControl = true;
+    rune::node::TopicSpec boot; boot.name = "orders"; boot.partitionCount = 2;
+    boot.persistence = PersistenceMode::Transient;
+    const int32_t id = h.topicReg->createTopic(boot);   // pre-existing, schema-less
+
+    const auto def = encodeDefineFrame(1, 1, "orders", 2, "userId", false, charsBlob());   // disk
+    h.gw.applyDefineTopicForTest(def.data(), def.size());
+    h.pump();
+    const auto r = firstFrame<pc::DefineTopicResponse>(h);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, 0u);
+    expectRecordedModeMatchesTopic(h, "orders", id, PersistenceMode::Transient);
+}
+
+// Final review I1: the client EXPLICITLY asked for a transient topic over an existing
+// schema-less DISK topic.  The topic keeps its log backend, so answering OK would
+// hand back a topic that silently is not transient -> TopicExists, nothing recorded.
+TEST(SchemaGatewayRegression, TransientDefineOverExistingDiskTopicIsTopicExistsRegression) {
+    SgHarness h;
+    h.realControl = true;
+    rune::node::TopicSpec boot; boot.name = "orders"; boot.partitionCount = 2;
+    const int32_t id = h.topicReg->createTopic(boot);   // disk, schema-less
+    const int64_t schemaEndBefore = h.schemaLog.logEndOffset();
+
+    const auto def = encodeDefineFrame(1, 1, "orders", 2, "userId", false, charsBlob(),
+                                       pc::DefineTopic::kPersistenceTransient);
+    h.gw.applyDefineTopicForTest(def.data(), def.size());
+    h.pump();
+    const auto r = firstFrame<pc::DefineTopicResponse>(h);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, 25u) << "TopicExists";
+    EXPECT_EQ(h.schemaReg.byName("orders"), nullptr) << "no schema recorded";
+    EXPECT_EQ(h.schemaLog.logEndOffset(), schemaEndBefore) << "no TopicSchema record appended";
+    ASSERT_NE(h.topicReg->topic(id), nullptr);
+    EXPECT_EQ(h.topicReg->topic(id)->persistence, PersistenceMode::Disk) << "live topic still Disk";
+}
+
+// Final review M3: a DefineTopic whose body fails protocol decode (unknown
+// persistence byte) must be answered, not dropped (the client would wait its
+// full timeout).
+TEST(SchemaGatewayRegression, DefineTopicUnknownPersistenceByteIsAnsweredInvalidSchemaRegression) {
+    SgHarness h;
+    auto def = encodeDefineFrame(1, 77, "orders", 2, "userId", false, charsBlob(),
+                                 pc::DefineTopic::kPersistenceTransient);
+    def.back() = 2;   // one past Transient
+    ASSERT_FALSE(pc::DefineTopic::decode(def.data(), def.size()).has_value());
+    h.gw.applyDefineTopicForTest(def.data(), def.size());
+    h.pump();
+    const auto r = firstFrame<pc::DefineTopicResponse>(h);
+    ASSERT_TRUE(r.has_value()) << "a malformed DefineTopic must get a response";
+    EXPECT_EQ(r->correlationId, 77);
+    EXPECT_EQ(r->errorCode, 23u) << "InvalidSchema";
+    EXPECT_EQ(h.schemaReg.byName("orders"), nullptr);
+}
+
+// The control-thread `spec.persistence` line really creates a transient topic:
+// no disk log objects, mode recorded in both the live topic and the schema.
+TEST(SchemaGatewayRegression, NewTransientDefineCreatesTransientTopicOnControl) {
+    SgHarness h;
+    h.realControl = true;
+    const auto def = encodeDefineFrame(1, 1, "orders", 2, "userId", false, charsBlob(),
+                                       pc::DefineTopic::kPersistenceTransient);
+    h.gw.applyDefineTopicForTest(def.data(), def.size());
+    h.pump();
+    const auto r = firstFrame<pc::DefineTopicResponse>(h);
+    ASSERT_TRUE(r.has_value());
+    ASSERT_EQ(r->errorCode, 0u);
+    expectRecordedModeMatchesTopic(h, "orders", r->topicId, PersistenceMode::Transient);
+    EXPECT_EQ(h.topicReg->log(r->topicId, 0), nullptr) << "transient: no disk Log";
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,4 +1138,482 @@ TEST(SchemaGatewayRegression, DdlDoesNotBlockProduce) {
     // Draining it now should surface exactly the queued DefineTopic.
     int drained = h.serviceAdminIngress();
     EXPECT_EQ(drained, 1) << "the stalled DefineTopic was still queued on the admin ring";
+}
+
+// ===========================================================================
+// No-hang wave (R2): every DDL request with a decodable header on a known
+// session is answered (its own response type + InvalidSchema / Internal) —
+// never dropped while the client waits out its timeout.
+// ===========================================================================
+namespace {
+std::vector<uint8_t> ddlHeaderOnly(pc::TemplateId tid, int64_t corr) {
+    pc::MessageHeader h;
+    h.blockLength = 32; h.templateId = static_cast<uint16_t>(tid);
+    h.sessionId = 1; h.correlationId = corr;
+    std::vector<uint8_t> f(pc::MessageHeader::ENCODED_SIZE);
+    h.encode(f.data());
+    return f;
+}
+} // namespace
+
+TEST(SchemaGatewayRegression, MalformedGetTopicSchemaIsAnsweredInvalidSchemaRegression) {
+    SgHarness h;
+    const auto f = ddlHeaderOnly(pc::TemplateId::GetTopicSchema, 91);
+    ASSERT_FALSE(pc::GetTopicSchema::decode(f.data(), f.size()).has_value());
+    h.gw.applyGetTopicSchemaForTest(f.data(), f.size());
+    h.pump();
+    const auto r = firstFrame<pc::TopicSchemaResponse>(h);
+    ASSERT_TRUE(r.has_value()) << "a malformed GetTopicSchema must get a response";
+    EXPECT_EQ(r->correlationId, 91);
+    EXPECT_EQ(r->errorCode, 23u) << "InvalidSchema";
+}
+
+TEST(SchemaGatewayRegression, MalformedAlterTopicIsAnsweredInvalidSchemaRegression) {
+    SgHarness h;
+    const auto f = ddlHeaderOnly(pc::TemplateId::AlterTopic, 92);
+    ASSERT_FALSE(pc::AlterTopic::decode(f.data(), f.size()).has_value());
+    h.gw.applyAlterTopicForTest(f.data(), f.size());
+    h.pump();
+    const auto r = firstFrame<pc::AlterTopicResponse>(h);
+    ASSERT_TRUE(r.has_value()) << "a malformed AlterTopic must get a response";
+    EXPECT_EQ(r->correlationId, 92);
+    EXPECT_EQ(r->errorCode, 23u) << "InvalidSchema";
+}
+
+// The finding's original case: a CreateView whose persistence byte is unknown
+// fails CreateView::decode — answered, not dropped.
+TEST(SchemaGatewayRegression, MalformedCreateViewIsAnsweredInvalidSchemaRegression) {
+    SgHarness h;
+    pc::CreateView cv;
+    cv.sessionId = 1; cv.correlationId = 93; cv.viewName = "v"; cv.keyField = "id";
+    cv.persistence = 1;
+    const std::vector<uint8_t> plan = {1, 2, 3};
+    cv.planBlob = plan.data(); cv.planLen = static_cast<uint32_t>(plan.size());
+    std::vector<uint8_t> f(cv.encodedSize());
+    cv.encode(f.data());
+    bool patched = false;
+    for (std::size_t i = pc::MessageHeader::ENCODED_SIZE; i < f.size(); ++i) {
+        std::vector<uint8_t> g = f; g[i] = 2;
+        if (!pc::CreateView::decode(g.data(), g.size()).has_value()) { f = g; patched = true; break; }
+    }
+    ASSERT_TRUE(patched) << "could not locate the persistence byte";
+    h.gw.applyCreateViewForTest(f.data(), f.size());
+    h.pump();
+    const auto r = firstFrame<pc::CreateViewResponse>(h);
+    ASSERT_TRUE(r.has_value()) << "a malformed CreateView must get a response";
+    EXPECT_EQ(r->correlationId, 93);
+    EXPECT_EQ(r->errorCode, 23u) << "InvalidSchema";
+}
+
+// The gateway→admin request ring is full: the DDL is answered Internal at once
+// (it used to be dropped — `(void)adminSink_->submit...`).
+TEST(SchemaGatewayRegression, DdlOnAFullAdminRingIsAnsweredInternalRegression) {
+    SgHarness h;
+    const std::vector<uint8_t> big(4096, 0xAB);   // fills the ring in a few hundred frames
+    int64_t corr = 1;
+    std::optional<pc::DefineTopicResponse> r;
+    for (; corr < 100'000 && !r; ++corr) {
+        const auto def = encodeDefineFrame(1, corr, "t" + std::to_string(corr), 1, "", false, big);
+        h.gw.applyDefineTopicForTest(def.data(), def.size());   // nobody drains requestRing
+        r = firstFrame<pc::DefineTopicResponse>(h);
+    }
+    ASSERT_TRUE(r.has_value()) << "a DefineTopic refused by a full admin ring was dropped";
+    EXPECT_EQ(r->correlationId, corr - 1);
+    EXPECT_EQ(r->errorCode, static_cast<uint16_t>(pc::ErrorCode::Internal));
+}
+
+TEST(SchemaGatewayRegression, DdlWithoutAnAdminSinkIsAnsweredInternalRegression) {
+    SgHarness h;
+    h.gw.setAdminSink(nullptr);
+    const auto def = encodeDefineFrame(1, 94, "orders", 1, "", false, charsBlob());
+    h.gw.applyDefineTopicForTest(def.data(), def.size());
+    const auto r = firstFrame<pc::DefineTopicResponse>(h);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->correlationId, 94);
+    EXPECT_EQ(r->errorCode, static_cast<uint16_t>(pc::ErrorCode::Internal));
+}
+
+// R1: the control-thread create never defaults an unknown mode byte to Disk —
+// it refuses the create (topicId -1 → the admin thread answers Internal).
+TEST(SchemaGatewayRegression, CreateTopicForAdminRefusesUnknownPersistenceRegression) {
+    const std::string dir = uniqDir("ctp");
+    rune::gateway::TopicRegistry reg(std::vector<rune::node::TopicSpec>{}, dir);
+    CreateTopicReqMsg req; req.ticket = 7; req.partitionCount = 2; req.name = "orders";
+    req.persistence = 2;
+    const CreateTopicReplyMsg r = createTopicForAdmin(reg, req);
+    EXPECT_EQ(r.ticket, 7);
+    EXPECT_EQ(r.topicId, -1);
+    EXPECT_FALSE(r.existed);
+    EXPECT_FALSE(reg.topicIdForName("orders").has_value()) << "nothing created";
+}
+
+// The admin→control egress ring is full: a DDL answer goes to the admin-owned
+// FIFO backlog and is delivered once the control thread drains — the respond*
+// callbacks used to `return` on a failed tryClaim (answer lost, client hung).
+TEST(SchemaGatewayRegression, DdlAnswerOnAFullEgressRingIsBackloggedNotDroppedRegression) {
+    SchemaRegistry sreg;
+    rune::node::AdminWorkerAgent agent(sreg, /*replica=*/nullptr, /*selfId=*/1, {1},
+                                       rune::node::AdminDeps{});
+    pc::DefineTopicResponse resp;
+    resp.sessionId = 1; resp.topicId = 3; resp.version = 1;
+    uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::DefineTopicResponse::BODY_FIXED];
+    int64_t posted = 0;
+    while (agent.egressBacklogForTest() == 0 && posted < 1'000'000) {
+        resp.correlationId = ++posted;
+        ASSERT_TRUE(agent.postEgressFrame(1, frame, resp.encode(frame)));
+    }
+    ASSERT_EQ(agent.egressBacklogForTest(), 1u) << "the ring never filled";
+    for (int extra = 0; extra < 3; ++extra) {   // FIFO behind the backlog, even if the ring has room
+        resp.correlationId = ++posted;
+        ASSERT_TRUE(agent.postEgressFrame(1, frame, resp.encode(frame)));
+    }
+    int64_t expect = 1;
+    auto drain = [&] {
+        agent.egressRing().drain([&](int32_t, aeron::concurrent::AtomicBuffer& b,
+                                     aeron::util::index_t off, aeron::util::index_t len) {
+            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+            const auto r = pc::DefineTopicResponse::decode(p + 8, static_cast<std::size_t>(len) - 8);
+            ASSERT_TRUE(r.has_value());
+            EXPECT_EQ(r->correlationId, expect) << "answers out of order";
+            ++expect;
+        }, 1 << 20);
+    };
+    for (int round = 0; round < 64 && expect <= posted; ++round) {
+        drain();
+        (void)agent.flushEgressBacklogForTest();
+    }
+    drain();
+    EXPECT_EQ(expect, posted + 1) << "every DDL answer delivered exactly once";
+    EXPECT_EQ(agent.egressBacklogForTest(), 0u);
+}
+
+// Fix round 2: the admin egress backlog is bounded by construction — while it
+// holds answers, the agent takes NO new DDL request (the request ring fills and
+// the gateway answers Internal); a frame that can never fit one ring message is
+// refused (the caller answers MessageTooLarge) instead of parking forever.
+TEST(SchemaGatewayRegression, AdminEgressBacklogPausesIntakeAndRefusesUnfittableFramesRegression) {
+    SchemaRegistry sreg;
+    rune::node::AdminWorkerAgent agent(sreg, /*replica=*/nullptr, /*selfId=*/1, {1},
+                                       rune::node::AdminDeps{});
+    std::vector<uint8_t> huge(agent.maxEgressFrameBytes() + 1, 0);
+    EXPECT_FALSE(agent.postEgressFrame(1, huge.data(), huge.size()));
+    EXPECT_EQ(agent.egressBacklogForTest(), 0u);
+
+    pc::DefineTopicResponse resp; resp.sessionId = 1;
+    uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::DefineTopicResponse::BODY_FIXED];
+    int64_t corr = 0;
+    while (agent.egressBacklogForTest() == 0 && corr < 1'000'000) {
+        resp.correlationId = ++corr;
+        ASSERT_TRUE(agent.postEgressFrame(1, frame, resp.encode(frame)));
+    }
+    ASSERT_GT(agent.egressBacklogForTest(), 0u);
+    // A DDL request waiting in the request ring is NOT taken while answers wait.
+    GetSchemaMsg g; g.session = 1; g.corr = 7; g.name = "x";
+    ASSERT_TRUE(encodeGetSchema(agent.requestRing(), g));
+    (void)agent.doWork(1);   // the egress ring is still full (nobody drains it)
+    std::size_t pendingRequests = 0;
+    agent.requestRing().drain([&](int32_t, aeron::concurrent::AtomicBuffer&, aeron::util::index_t,
+                                  aeron::util::index_t) { ++pendingRequests; }, 16);
+    EXPECT_EQ(pendingRequests, 1u) << "intake continued while DDL answers were backlogged";
+}
+
+// Fix round 2: an unknown cleanup-policy byte on a create request is refused,
+// never cast into the enum.
+TEST(SchemaGatewayRegression, CreateTopicForAdminRefusesUnknownCleanupPolicyRegression) {
+    const std::string dir = uniqDir("ctc");
+    rune::gateway::TopicRegistry reg(std::vector<rune::node::TopicSpec>{}, dir);
+    CreateTopicReqMsg req; req.ticket = 8; req.partitionCount = 1; req.name = "orders";
+    req.cleanupPolicy = 3;
+    const CreateTopicReplyMsg r = createTopicForAdmin(reg, req);
+    EXPECT_EQ(r.topicId, -1);
+    EXPECT_FALSE(reg.topicIdForName("orders").has_value());
+    req.cleanupPolicy = 2;   // CompactDelete is valid
+    EXPECT_GE(createTopicForAdmin(reg, req).topicId, 0);
+}
+
+// Fix round 3 (untested error path): a TopicSchemaResponse whose descriptor can
+// never fit one admin egress message is answered MessageTooLarge (no blob) — on
+// the ring and through the backlog — never parked forever, never dropped.
+TEST(SchemaGatewayRegression, OversizedTopicSchemaAnswerIsMessageTooLargeRegression) {
+    SchemaRegistry sreg;
+    rune::node::AdminWorkerAgent agent(sreg, /*replica=*/nullptr, /*selfId=*/1, {1},
+                                       rune::node::AdminDeps{});
+    const std::vector<uint8_t> huge(agent.maxEgressFrameBytes() + 1, 0x7A);
+    agent.postTopicSchemaResponse(/*session=*/1, /*corr=*/55, /*topicId=*/3, /*version=*/1, /*parts=*/2,
+                                  huge, /*errorCode=*/0);
+    std::optional<pc::TopicSchemaResponse> got;
+    agent.egressRing().drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                                 aeron::util::index_t len) {
+        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+        got = pc::TopicSchemaResponse::decode(p + 8, static_cast<std::size_t>(len) - 8);
+    }, 16);
+    ASSERT_TRUE(got.has_value()) << "an oversized TopicSchemaResponse was dropped";
+    EXPECT_EQ(got->correlationId, 55);
+    EXPECT_EQ(got->errorCode, static_cast<uint16_t>(pc::ErrorCode::MessageTooLarge));
+    EXPECT_EQ(got->descriptorLen, 0u);
+    EXPECT_EQ(agent.egressBacklogForTest(), 0u);
+}
+
+// ===========================================================================
+// DDL conformance plan Task 11 — wire-level cells through the gateway with the
+// control thread played by createTopicForAdmin over the REAL TopicRegistry.
+// ===========================================================================
+namespace {
+
+// ── control-thread adoption of a schema-less static topic ────────────────────
+struct AdoptCase {
+    const char* label; PersistenceMode staticMode; int32_t staticParts;
+    uint8_t definePersistence; uint32_t requestParts; uint16_t wantCode; PersistenceMode wantRecorded;
+};
+void PrintTo(const AdoptCase& c, std::ostream* os) { *os << c.label; }
+const AdoptCase kAdoptCases[] = {
+    {"DiskStatic_DiskDefine_MorePartitions",  PersistenceMode::Disk,      3, 0, 8, 0,  PersistenceMode::Disk},
+    {"DiskStatic_DiskDefine_FewerPartitions", PersistenceMode::Disk,      3, 0, 1, 0,  PersistenceMode::Disk},
+    {"DiskStatic_TransientDefine",            PersistenceMode::Disk,      3, 1, 3, 25, PersistenceMode::Disk},
+    {"TransientStatic_DiskDefine",            PersistenceMode::Transient, 2, 0, 5, 0,  PersistenceMode::Transient},
+    {"TransientStatic_TransientDefine",       PersistenceMode::Transient, 2, 1, 2, 0,  PersistenceMode::Transient},
+};
+
+class SchemaGatewayAdoptionRegression : public ::testing::TestWithParam<AdoptCase> {};
+
+TEST_P(SchemaGatewayAdoptionRegression, DefineOverStaticSchemaLessTopic) {
+    const AdoptCase& c = GetParam();
+    SgHarness h;
+    h.realControl = true;
+    rune::node::TopicSpec boot;
+    boot.name = "orders"; boot.partitionCount = c.staticParts; boot.persistence = c.staticMode;
+    const int32_t id = h.topicReg->createTopic(boot);
+    const int32_t topicsBefore = h.topicReg->topicCount();
+    const int64_t schemaEnd = h.schemaLog.logEndOffset();
+
+    const auto def = encodeDefineFrame(1, 1, "orders", c.requestParts, "userId", false, charsBlob(),
+                                       c.definePersistence);
+    h.gw.applyDefineTopicForTest(def.data(), def.size());
+    h.pump();
+    const auto r = firstFrame<pc::DefineTopicResponse>(h);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, c.wantCode);
+    EXPECT_EQ(h.topicReg->topicCount(), topicsBefore) << "adoption never creates a second topic";
+    EXPECT_EQ(h.topicReg->topic(id)->persistence, c.staticMode) << "the live topic keeps its backend";
+    EXPECT_EQ(h.topicReg->topic(id)->partitionCount, c.staticParts);
+    if (c.wantCode == 0) {
+        EXPECT_EQ(r->topicId, id);
+        const RegistryEntry* e = h.schemaReg.byName("orders");
+        ASSERT_NE(e, nullptr);
+        EXPECT_EQ(e->persistence, c.wantRecorded);
+        EXPECT_EQ(e->partitionCount, c.staticParts) << "the authoritative count, never the requested one";
+        EXPECT_EQ(h.schemaLog.logEndOffset(), schemaEnd + 1);
+    } else {
+        EXPECT_EQ(h.schemaReg.byName("orders"), nullptr);
+        EXPECT_EQ(h.schemaLog.logEndOffset(), schemaEnd);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(Ddl, SchemaGatewayAdoptionRegression, ::testing::ValuesIn(kAdoptCases),
+    [](const ::testing::TestParamInfo<AdoptCase>& i) { return std::string(i.param.label); });
+
+// ── names over the wire (B1/B2/B3/B6) ────────────────────────────────────────
+struct WireNameCase { const char* label; std::string name; uint32_t parts; uint16_t wantCode; };
+void PrintTo(const WireNameCase& c, std::ostream* os) { *os << c.label; }
+const WireNameCase kWireNameCases[] = {
+    {"Empty",              "",                     1, 40},
+    {"Slash",              "a/b",                  1, 40},
+    {"DotDot",             "..",                   1, 40},
+    {"ReservedViews",      "__views",              1, 40},
+    {"ReservedSchemas",    "__topic_schemas",      1, 40},
+    {"TooLong",            std::string(250, 'x'),  1, 40},
+    {"CaseOfStaticEvents", "Events",               1, 25},
+    {"ZeroPartitions",     "fresh",                0, 23},
+};
+
+class SchemaGatewayNameRegression : public ::testing::TestWithParam<WireNameCase> {};
+
+TEST_P(SchemaGatewayNameRegression, DefineIsRejectedAndCreatesNothing) {
+    const WireNameCase& c = GetParam();
+    SgHarness h;   // static "events" (id 0)
+    h.realControl = true;
+    const int32_t topicsBefore = h.topicReg->topicCount();
+    const int64_t schemaEnd = h.schemaLog.logEndOffset();
+    const auto def = encodeDefineFrame(1, 9, c.name, c.parts, "userId", false, charsBlob());
+    h.gw.applyDefineTopicForTest(def.data(), def.size());
+    h.pump();
+    const auto r = firstFrame<pc::DefineTopicResponse>(h);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->correlationId, 9);
+    EXPECT_EQ(r->errorCode, c.wantCode);
+    EXPECT_EQ(h.topicReg->topicCount(), topicsBefore);
+    EXPECT_EQ(h.schemaLog.logEndOffset(), schemaEnd);
+    EXPECT_FALSE(h.topicReg->topicIdForName(c.name).has_value());
+}
+
+INSTANTIATE_TEST_SUITE_P(Ddl, SchemaGatewayNameRegression, ::testing::ValuesIn(kWireNameCases),
+    [](const ::testing::TestParamInfo<WireNameCase>& i) { return std::string(i.param.label); });
+
+// ── malformed frames: every DDL op with a corrupt body is ANSWERED (never times out)
+enum class DdlFrame : uint8_t { Define, CreateView, Alter, GetSchema };
+enum class Corruption : uint8_t { UnknownPersistenceByte, HeaderOnly, CutMidBody, UnknownSession };
+struct MalformedCase { const char* label; DdlFrame kind; Corruption corruption; };
+void PrintTo(const MalformedCase& c, std::ostream* os) { *os << c.label; }
+constexpr int64_t kMalformedCorr = 4242;
+
+std::vector<uint8_t> validDdlFrame(DdlFrame k, int64_t session) {
+    switch (k) {
+        case DdlFrame::Define:
+            return encodeDefineFrame(session, kMalformedCorr, "orders", 1, "userId", false, charsBlob(),
+                                     pc::DefineTopic::kPersistenceTransient);
+        case DdlFrame::CreateView: {
+            const std::vector<uint8_t> plan{1, 2, 3};
+            pc::CreateView m;
+            m.sessionId = session; m.correlationId = kMalformedCorr; m.viewName = "v"; m.keyField = "id";
+            m.persistence = 1; m.planBlob = plan.data(); m.planLen = static_cast<uint32_t>(plan.size());
+            std::vector<uint8_t> f(m.encodedSize());
+            m.encode(f.data());
+            return f;
+        }
+        case DdlFrame::Alter:
+            return encodeAlterFrame(session, kMalformedCorr, "orders", 0, {});
+        case DdlFrame::GetSchema: {
+            pc::GetTopicSchema g;
+            g.sessionId = session; g.correlationId = kMalformedCorr; g.topicName = "orders";
+            std::vector<uint8_t> f(g.encodedSize());
+            g.encode(f.data());
+            return f;
+        }
+    }
+    return {};
+}
+
+std::vector<uint8_t> corrupt(DdlFrame k, Corruption c) {
+    std::vector<uint8_t> f = validDdlFrame(k, c == Corruption::UnknownSession ? 99 : 1);
+    switch (c) {
+        case Corruption::UnknownPersistenceByte:
+        case Corruption::UnknownSession:   // corrupt body on a session the gateway does not know
+            if (k == DdlFrame::Define)          f.back() = 2;
+            else if (k == DdlFrame::CreateView) f[pc::MessageHeader::ENCODED_SIZE] = 2;
+            else                                f.resize(pc::MessageHeader::ENCODED_SIZE);
+            break;
+        case Corruption::HeaderOnly:
+            f.resize(pc::MessageHeader::ENCODED_SIZE);
+            break;
+        case Corruption::CutMidBody:
+            f.resize(f.size() - 3);
+            break;
+    }
+    return f;
+}
+
+bool decodes(DdlFrame k, const std::vector<uint8_t>& f) {
+    switch (k) {
+        case DdlFrame::Define:     return pc::DefineTopic::decode(f.data(), f.size()).has_value();
+        case DdlFrame::CreateView: return pc::CreateView::decode(f.data(), f.size()).has_value();
+        case DdlFrame::Alter:      return pc::AlterTopic::decode(f.data(), f.size()).has_value();
+        case DdlFrame::GetSchema:  return pc::GetTopicSchema::decode(f.data(), f.size()).has_value();
+    }
+    return false;
+}
+
+void apply(SgHarness& h, DdlFrame k, const std::vector<uint8_t>& f) {
+    switch (k) {
+        case DdlFrame::Define:     h.gw.applyDefineTopicForTest(f.data(), f.size()); break;
+        case DdlFrame::CreateView: h.gw.applyCreateViewForTest(f.data(), f.size()); break;
+        case DdlFrame::Alter:      h.gw.applyAlterTopicForTest(f.data(), f.size()); break;
+        case DdlFrame::GetSchema:  h.gw.applyGetTopicSchemaForTest(f.data(), f.size()); break;
+    }
+}
+
+/// Frames answering `corr`: the op's OWN response type carrying InvalidSchema (23) —
+/// the no-hang wave's rule (RequestRejection.h::encodeRejection).  Any other frame on
+/// `corr` (a generic ErrorResponse, another code) is counted in `other`.
+template <class R>
+int errorAnswers(const SgHarness& h, int64_t corr, int& other) {
+    int n = 0;
+    for (const auto& [sid, bytes] : h.captured) {
+        if (auto r = R::decode(bytes.data(), bytes.size()); r && r->correlationId == corr) {
+            if (r->errorCode == static_cast<uint16_t>(pc::ErrorCode::InvalidSchema)) ++n; else ++other;
+        } else if (auto e = pc::ErrorResponse::decode(bytes.data(), bytes.size()); e && e->correlationId == corr) {
+            ++other;
+        }
+    }
+    return n;
+}
+int errorAnswersFor(const SgHarness& h, DdlFrame k, int& other) {
+    switch (k) {
+        case DdlFrame::Define:     return errorAnswers<pc::DefineTopicResponse>(h, kMalformedCorr, other);
+        case DdlFrame::CreateView: return errorAnswers<pc::CreateViewResponse>(h, kMalformedCorr, other);
+        case DdlFrame::Alter:      return errorAnswers<pc::AlterTopicResponse>(h, kMalformedCorr, other);
+        case DdlFrame::GetSchema:  return errorAnswers<pc::TopicSchemaResponse>(h, kMalformedCorr, other);
+    }
+    return 0;
+}
+
+const MalformedCase kMalformedCases[] = {
+    {"Define_UnknownPersistenceByte",     DdlFrame::Define,     Corruption::UnknownPersistenceByte},
+    {"Define_HeaderOnly",                 DdlFrame::Define,     Corruption::HeaderOnly},
+    {"Define_CutMidBody",                 DdlFrame::Define,     Corruption::CutMidBody},
+    {"Define_UnknownSession",             DdlFrame::Define,     Corruption::UnknownSession},
+    {"CreateView_UnknownPersistenceByte", DdlFrame::CreateView, Corruption::UnknownPersistenceByte},
+    {"CreateView_HeaderOnly",             DdlFrame::CreateView, Corruption::HeaderOnly},
+    {"CreateView_CutMidBody",             DdlFrame::CreateView, Corruption::CutMidBody},
+    {"CreateView_UnknownSession",         DdlFrame::CreateView, Corruption::UnknownSession},
+    {"Alter_HeaderOnly",                  DdlFrame::Alter,      Corruption::HeaderOnly},
+    {"Alter_CutMidBody",                  DdlFrame::Alter,      Corruption::CutMidBody},
+    {"Alter_UnknownSession",              DdlFrame::Alter,      Corruption::UnknownSession},
+    {"GetSchema_HeaderOnly",              DdlFrame::GetSchema,  Corruption::HeaderOnly},
+    {"GetSchema_CutMidBody",              DdlFrame::GetSchema,  Corruption::CutMidBody},
+    {"GetSchema_UnknownSession",          DdlFrame::GetSchema,  Corruption::UnknownSession},
+};
+
+class SchemaGatewayMalformedDdlRegression : public ::testing::TestWithParam<MalformedCase> {};
+
+TEST_P(SchemaGatewayMalformedDdlRegression, CorruptBodyIsAnsweredNeverDropped) {
+    const MalformedCase& c = GetParam();
+    SgHarness h;
+    h.realControl = true;
+    const std::vector<uint8_t> f = corrupt(c.kind, c.corruption);
+    ASSERT_FALSE(decodes(c.kind, f)) << "precondition: the frame body really is corrupt";
+    const int64_t schemaEnd = h.schemaLog.logEndOffset();
+    const int32_t topicsBefore = h.topicReg->topicCount();
+
+    apply(h, c.kind, f);
+    h.pump();
+
+    if (c.corruption == Corruption::UnknownSession) {
+        // No session to answer on: the only DDL frame that is not answered (counted + warn-logged).
+        EXPECT_TRUE(h.captured.empty()) << "nothing is sent to an unknown session";
+    } else {
+        int other = 0;
+        EXPECT_EQ(errorAnswersFor(h, c.kind, other), 1)
+            << "exactly one own-type InvalidSchema (23) answer on correlationId " << kMalformedCorr
+            << " — none may time out";
+        EXPECT_EQ(other, 0) << "no second / differently-coded answer";
+    }
+    EXPECT_EQ(h.admin->pendingCount(), 0u) << "a corrupt frame never reaches the admin queue";
+    EXPECT_EQ(h.schemaLog.logEndOffset(), schemaEnd);
+    EXPECT_EQ(h.topicReg->topicCount(), topicsBefore);
+}
+
+INSTANTIATE_TEST_SUITE_P(Ddl, SchemaGatewayMalformedDdlRegression, ::testing::ValuesIn(kMalformedCases),
+    [](const ::testing::TestParamInfo<MalformedCase>& i) { return std::string(i.param.label); });
+
+} // namespace
+
+// ── reads / alters of a schema-less static topic (Occupant SchemaLessDisk) ────
+TEST(SchemaGatewayStaticRegression, GetSchemaOfStaticSchemaLessTopicIsUnknownTopic) {
+    SgHarness h;
+    h.realControl = true;
+    const auto r = getSchema(h, "events", 31);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, 7u);
+}
+
+TEST(SchemaGatewayStaticRegression, AlterOfStaticSchemaLessTopicIsUnknownTopic) {
+    SgHarness h;
+    h.realControl = true;
+    const auto f = encodeAlterFrame(1, 32, "events", 0, rune::codec::encodeAlterOps({addColumnOp("x", PrimType::Int64)}));
+    h.gw.applyAlterTopicForTest(f.data(), f.size());
+    h.pump();
+    const auto r = firstFrame<pc::AlterTopicResponse>(h);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->errorCode, 7u);
+    EXPECT_EQ(h.schemaReg.byName("events"), nullptr);
 }

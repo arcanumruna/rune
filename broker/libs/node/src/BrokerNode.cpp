@@ -379,16 +379,28 @@ void BrokerNode::start() {
     //     builder consumes config_.topics — and append the recovered specs so
     //     TopicRegistry / buildReplication / worker placement / MetadataService /
     //     read-committed rebuild treat them exactly like static topics.  Throws
-    //     (refusing to boot) on a damaged catalog or a non-contiguous id sequence.
+    //     (refusing to boot) on a damaged catalog; an id gap (an orphan whose DDL
+    //     never committed) becomes a hidden zero-partition __orphan.<id> (B5).
     {
-        std::vector<TopicSpec> recovered = recoverRuntimeTopicSpecs(
-            config_.dataDir, static_cast<int32_t>(config_.topics.size()));
+        firstRuntimeTopicId_ = static_cast<int32_t>(config_.topics.size());   // Task 14
+        RecoveredRuntimeTopics recoveredTopics = recoverRuntimeTopics(
+            config_.dataDir, firstRuntimeTopicId_);
+        std::vector<TopicSpec>& recovered = recoveredTopics.specs;
+        // Final review I3: a RUNE_TOPICS name equal (or equal but for case) to a
+        // recovered runtime topic refuses boot — before anything on disk is touched.
+        refuseStaticNamesCollidingWithRecovered(config_.topics, recoveredTopics.catalogTopics);
         if (!recovered.empty()) {
             spdlog::info("BrokerNode[{}]: recovered {} runtime topic(s) from the admin "
                          "catalogs (ids {}..{})", config_.nodeId, recovered.size(),
                          recovered.front().topicId, recovered.back().topicId);
             for (auto& spec : recovered) config_.topics.push_back(std::move(spec));
         }
+        // B10 / D4: delete only orphan-placeholder topic dirs; quarantine every other
+        // unclaimed topic dir (never delete it) — BEFORE the TopicRegistry opens logs.
+        (void)reconcileTopicDirs(config_.dataDir, config_.topics, recoveredTopics.placeholderIds,
+                                 std::chrono::duration_cast<std::chrono::seconds>(
+                                     std::chrono::system_clock::now().time_since_epoch()).count(),
+                                 recoveredTopics.catalogDamage);   // fix round 2b: damaged -> no deletes
     }
 
     // 2. Build the TopicRegistry (after dataDir creation, before the gateway).
@@ -1116,18 +1128,18 @@ void BrokerNode::buildReplication() {
 
         for (int32_t part = 0; part < spec->partitionCount; ++part) {
             // Task M1: select log backend by persistence mode.
-            // Memory-backed: create an InMemoryLog (large caps — production-suitable).
+            // Transient: create an InMemoryLog (large caps — production-suitable).
             // Disk-backed: use the Log from TopicRegistry (recovered on startup).
             // De-virtualized seam (Milestone D P2): keep the concrete typed pointer
             // and construct via the matching PartitionReplica overload — no ILog*.
             rune::storage::Log*         diskLogPtr = nullptr;
             rune::storage::InMemoryLog* memLogPtr  = nullptr;
-            const bool isMemory = (spec->persistence == rune::node::PersistenceMode::Memory);
+            const bool isTransient = (spec->persistence == rune::node::PersistenceMode::Transient);
 
-            if (isMemory) {
-                // Memory-backed partition: create an InMemoryLog.
-                // Recovery SKIPS memory partitions — they start empty (precondition #3).
-                // Use config_.memoryLogRingBytes (default 8 MiB, env RUNE_MEMORY_LOG_RING_BYTES)
+            if (isTransient) {
+                // Transient partition: create an InMemoryLog.
+                // Recovery SKIPS transient partitions — they start empty (precondition #3).
+                // Use config_.memoryLogRingBytes (default 8 MiB, env RUNE_TRANSIENT_LOG_RING_BYTES)
                 // as the fixed circular-ring capacity.  Keep DropOldest (not BackPressure)
                 // so existing memory-persistence tests are parity-unchanged.
                 const std::size_t kMemLogMaxBytes =
@@ -1138,7 +1150,7 @@ void BrokerNode::buildReplication() {
                         kMemLogMaxBytes, kMemLogMaxRecords,
                         rune::storage::FullPolicy::DropOldest));
                 memLogPtr = memoryLogs_.back().get();
-                spdlog::debug("BrokerNode[{}]: topic '{}' partition {} using InMemoryLog",
+                spdlog::debug("BrokerNode[{}]: transient topic '{}' partition {} on InMemoryLog",
                               config_.nodeId, spec->name, part);
             } else {
                 diskLogPtr = topicRegistry_->log(topicId, part);
@@ -1225,7 +1237,7 @@ void BrokerNode::buildReplication() {
 
             // De-virtualized seam (Milestone D P2): dispatch to the matching
             // concrete constructor overload so the replica stores a typed pointer.
-            auto replica = isMemory
+            auto replica = isTransient
                 ? std::make_unique<PartitionReplica>(
                       pcfg, Role::Follower, /*epoch=*/0,
                       allNodeIds, allNodeIds, memLogPtr, transport)
@@ -1233,7 +1245,7 @@ void BrokerNode::buildReplication() {
                       pcfg, Role::Follower, /*epoch=*/0,
                       allNodeIds, allNodeIds, diskLogPtr, transport);
             applyWorkerDrivenDurability(*replica, topicId, provisionChannel_(), config_.segmentProvisionThresholdPct);   // Task 10 + F30 + hotpath-A
-            if (isMemory) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
+            if (isTransient) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
             // Kafka AlterPartition: user-partition ISR changes go through the
             // controller (multi-node); internal partitions keep a leader-local ISR.
             if (topicId >= 0 && replTransport_ && !config_.isSingleNode())
@@ -1339,10 +1351,10 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
 
         rune::storage::Log*         diskLogPtr = nullptr;
         rune::storage::InMemoryLog* memLogPtr  = nullptr;
-        const bool isMemory =
-            (spec.persistence == rune::node::PersistenceMode::Memory);
+        const bool isTransient =
+            (spec.persistence == rune::node::PersistenceMode::Transient);
 
-        if (isMemory) {
+        if (isTransient) {
             const std::size_t kMemLogMaxBytes =
                 static_cast<std::size_t>(config_.memoryLogRingBytes);
             constexpr std::size_t kMemLogMaxRecords = 1'000'000UL;
@@ -1401,7 +1413,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
             }
         }
 
-        auto replica = isMemory
+        auto replica = isTransient
             ? std::make_unique<PartitionReplica>(
                   pcfg, Role::Follower, /*epoch=*/0,
                   allNodeIds, allNodeIds, memLogPtr, transport)
@@ -1409,7 +1421,7 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
                   pcfg, Role::Follower, /*epoch=*/0,
                   allNodeIds, allNodeIds, diskLogPtr, transport);
         applyWorkerDrivenDurability(*replica, topicId, provisionChannel_(), config_.segmentProvisionThresholdPct);   // same policy as boot (F30 fix round 1, F3)
-        if (isMemory) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
+        if (isTransient) setMemoryEpochFence(*replica, config_.dataDir, topicId, part);
         if (topicId >= 0 && replTransport_ && !config_.isSingleNode())
             replica->setIsrChannel(replTransport_.get());   // Kafka AlterPartition (see boot)
 
@@ -3274,7 +3286,8 @@ void BrokerNode::buildAdminWorker() {
         deps.requestCreateTopic = [this](int64_t ticket, int32_t partitionCount,
                                          const std::string& name,
                                          const std::string& keyField,
-                                         uint8_t cleanupPolicy) -> bool {
+                                         uint8_t cleanupPolicy,
+                                         uint8_t persistence) -> bool {
             if (!adminWorkerAgent_) return false;
             CreateTopicReqMsg m;
             m.ticket         = ticket;
@@ -3282,6 +3295,7 @@ void BrokerNode::buildAdminWorker() {
             m.name           = name;
             m.keyField       = keyField;         // Task 19: view sink key field
             m.cleanupPolicy  = cleanupPolicy;    // Task 19: Compact for a view sink table
+            m.persistence    = persistence;      // Phase 2b E: 1 = transient (InMemoryLog)
             return encodeCreateTopicReq(adminWorkerAgent_->createReqRing(), m);
         };
 
@@ -3325,13 +3339,10 @@ void BrokerNode::buildAdminWorker() {
             resp.errorCode     = errorCode;
             uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::DefineTopicResponse::BODY_FIXED];
             const std::size_t n = resp.encode(frame);
-            auto& ring = adminWorkerAgent_->egressRing();
-            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + n);
-            if (idx < 0) return;  // ring full — DDL response dropped (rare); client retries
-            uint8_t* p = ring.base() + idx;
-            std::memcpy(p, &session, 8);
-            std::memcpy(p + 8, frame, n);
-            ring.commit(idx);
+            // No-hang (R2): ring full → admin-owned bounded backlog, retried
+            // (never dropped).  A fixed-size answer always fits one ring message.
+            [[maybe_unused]] const bool posted = adminWorkerAgent_->postEgressFrame(session, frame, n);
+            assert(posted && "a fixed-size DDL answer always fits one admin egress message");
         };
         // respondAlter (Task 11): encode the AlterTopicResponse frame and push it
         // on egressRing_ exactly like respondDefine (same single-writer egress path).
@@ -3347,43 +3358,20 @@ void BrokerNode::buildAdminWorker() {
             resp.errorCode     = errorCode;
             uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::AlterTopicResponse::BODY_FIXED];
             const std::size_t n = resp.encode(frame);
-            auto& ring = adminWorkerAgent_->egressRing();
-            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + n);
-            if (idx < 0) return;  // ring full — DDL response dropped (rare); client retries
-            uint8_t* p = ring.base() + idx;
-            std::memcpy(p, &session, 8);
-            std::memcpy(p + 8, frame, n);
-            ring.commit(idx);
+            // No-hang (R2): ring full → admin-owned bounded backlog, retried
+            // (never dropped).  A fixed-size answer always fits one ring message.
+            [[maybe_unused]] const bool posted = adminWorkerAgent_->postEgressFrame(session, frame, n);
+            assert(posted && "a fixed-size DDL answer always fits one admin egress message");
         };
         deps.respondGet = [this](int64_t session, int64_t corr, int32_t topicId,
                                  uint16_t version, int32_t partitionCount,
                                  const std::vector<uint8_t>& blob,
                                  uint16_t errorCode) {
             if (!adminWorkerAgent_) return;
-            namespace pc = rune::protocol::client;
-            pc::TopicSchemaResponse resp;
-            resp.sessionId      = session;
-            resp.correlationId  = corr;
-            resp.topicId        = topicId;
-            resp.version        = version;
-            resp.errorCode      = errorCode;
-            resp.partitionCount = partitionCount;   // Phase 2b Part C
-            resp.descriptorBlob = blob.empty() ? nullptr : blob.data();
-            resp.descriptorLen  = static_cast<uint32_t>(blob.size());
-            // Encode IN PLACE in the claimed egress slot (no per-response frame
-            // vector; encodedSize() == encode()'s return by construction).
-            const std::size_t sz = resp.encodedSize();
-            auto& ring = adminWorkerAgent_->egressRing();
-            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + sz);
-            if (idx < 0) return;  // ring full — DDL response dropped (rare); client retries
-            uint8_t* p = ring.base() + idx;
-            std::memcpy(p, &session, 8);
-            // Debug guard: encode() must fill exactly the claimed slot — a
-            // drift between encodedSize() and encode() would ship a short
-            // frame or overrun the slot.  Release keeps the unchecked encode.
-            [[maybe_unused]] const std::size_t written = resp.encode(p + 8);
-            assert(written == sz && "TopicSchemaResponse encode() != encodedSize()");
-            ring.commit(idx);
+            // Fix round 3: the encode / post / MessageTooLarge logic lives in
+            // AdminWorkerAgent::postTopicSchemaResponse (directly testable).
+            adminWorkerAgent_->postTopicSchemaResponse(session, corr, topicId, version, partitionCount,
+                                                       blob, errorCode);
         };
 
         // respondCreateView (Task 19): encode the CreateViewResponse frame and
@@ -3400,13 +3388,10 @@ void BrokerNode::buildAdminWorker() {
             resp.errorCode         = errorCode;
             uint8_t frame[pc::MessageHeader::ENCODED_SIZE + pc::CreateViewResponse::BODY_FIXED];
             const std::size_t n = resp.encode(frame);
-            auto& ring = adminWorkerAgent_->egressRing();
-            const auto idx = ring.tryClaim(kMsgEgressFrame, 8 + n);
-            if (idx < 0) return;  // ring full — DDL response dropped (rare); client retries
-            uint8_t* p = ring.base() + idx;
-            std::memcpy(p, &session, 8);
-            std::memcpy(p + 8, frame, n);
-            ring.commit(idx);
+            // No-hang (R2): ring full → admin-owned bounded backlog, retried
+            // (never dropped).  A fixed-size answer always fits one ring message.
+            [[maybe_unused]] const bool posted = adminWorkerAgent_->postEgressFrame(session, frame, n);
+            assert(posted && "a fixed-size DDL answer always fits one admin egress message");
         };
 
         // pushViewPlan (Task 19): post a compiled view plan on the admin→control
@@ -3418,6 +3403,16 @@ void BrokerNode::buildAdminWorker() {
         deps.pushViewPlan = [this](const ViewPlanUpdateMsg& vp) {
             if (!adminWorkerAgent_) return;
             adminWorkerAgent_->postViewPlan(vp);
+        };
+
+        // topicCommitted (B10 / D4 fix round 1): ADMIN thread, after a DefineTopic /
+        // CreateView record commits.  Posted on the admin→control ring
+        // (kA2cTopicCommitted); the control thread — the TopicRegistry's single
+        // writer — rewrites the topic dir's marker pending -> committed.  No
+        // cross-thread filesystem or registry access.
+        deps.topicCommitted = [this](int32_t topicId) {
+            if (!adminWorkerAgent_) return;
+            adminWorkerAgent_->postTopicCommitted(topicId);
         };
 
         // Construct AdminWorkerAgent (owns AdminWorker + the __topic_schemas
@@ -3570,6 +3565,16 @@ void BrokerNode::stop() {
     // state (ring-ownership mode) change.
     if (workerPool_) workerPool_->disarmAfterControlJoined();
     if (gateway_) gateway_->logProducePauseStats();   // D8c: control thread joined — single reader
+    // No-hang fix round 3: the per-worker no-hang counters (the worker runners
+    // were joined in 1a — every worker's counter is final and single-reader now).
+    if (workerPool_) {
+        uint64_t undecodable = 0;
+        for (int32_t w = 0; w < workerPool_->workerCount(); ++w)
+            undecodable += workerPool_->worker(w).undecodableProduceAnswers();
+        if (undecodable != 0)
+            spdlog::warn("BrokerNode[{}]: no-hang stats — worker-ingress Produce frames answered "
+                         "InvalidRequest={}", config_.nodeId, undecodable);
+    }
     // F9a: the control thread is joined — skip any owner-thread test task still
     // queued for it (its test thread waits for a decision with no bound).
     if (runtimeAgent_) runtimeAgent_->skipQueuedOwnerThreadTestTasks();
@@ -3603,15 +3608,15 @@ void BrokerNode::stop() {
     metadataService_.reset(); // MetadataService (holds raw ptr to metadata replica in registry)
     metadataReplica_.reset(); // no-op: ownership transferred to replicaRegistry_ in buildGateway
     metadataLog_.reset();     // Log for __cluster_metadata (file flush on dtor)
-    // Task 6: destroy schema registry before replicaRegistry_ (schema replica in registry).
     // adminWorkerAgent_ is already reset above (in the runner stop block).
-    schemaRegistry_.reset();  // SchemaRegistry (no raw ptrs to replicas — safe to reset here)
+    // schemaRegistry_ is NOT reset: it owns no replica pointers and no thread
+    // touches it once the admin worker is gone, so it stays readable after stop()
+    // (schemaRegistryForTest's contract) and is freed with the node.
     schemaReplica_.reset();   // no-op: ownership transferred to replicaRegistry_ in buildAdminWorker
     schemaLog_.reset();       // Log for __topic_schemas (file flush on dtor)
-    // Task 17: destroy view registry before its replica/log (viewsReplica_ is
-    // admin-thread-owned only, same as schemaReplica_ — never transferred to
-    // replicaRegistry_, but reset here in the same relative order for symmetry).
-    viewRegistry_.reset();    // ViewRegistry (no raw ptrs to replicas — safe to reset here)
+    // Task 17: viewsReplica_ is admin-thread-owned only, same as schemaReplica_ —
+    // never transferred to replicaRegistry_, but reset here for symmetry.
+    // viewRegistry_ is kept for the same reason (viewRegistryForTest after stop()).
     viewsReplica_.reset();    // admin-thread-owned only (RULING-2 A) — not in replicaRegistry_
     viewsLog_.reset();        // Log for __views (file flush on dtor)
     // TX-3: destroy txn state store before replicaRegistry_ (holds raw ptr to txn replica).
@@ -3828,6 +3833,32 @@ int BrokerNode::serviceAdminControl_() {
                 fanoutViewPlan_(decodeViewPlanUpdate(p, n));
                 return;
             }
+            // B10 / D4 fix round 1: the topic's catalog record committed — this
+            // (control) thread owns TopicRegistry, so it rewrites the dir marker.
+            // C1 (final review): the commit is also what makes a runtime topic
+            // SERVABLE — commitTopic flips it, and only then are its replicas and
+            // metadata assignment built (createRuntimeUserReplicas), so an orphan
+            // (a create whose record never committed) is never routable: no
+            // produce, subscribe, worker ingress or metadata entry can reach it.
+            // kA2cTopicCommitted precedes the view plan on this FIFO ring, so a
+            // view's install still finds its sink's replicas.
+            if (tid == kA2cTopicCommitted) {
+                const int32_t topicId = decodeTopicCommitted(p, n);
+                if (topicId >= 0 && topicRegistry_ && topicRegistry_->commitTopic(topicId)) {
+                    try {
+                        if (const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId)) {
+                            if (commitReplicaFault_ && *commitReplicaFault_ == spec->name) [[unlikely]]
+                                throw std::runtime_error("injected replica-build fault (test)");
+                            (void)createRuntimeUserReplicas(*spec);
+                        }
+                    } catch (const std::exception& ex) {
+                        spdlog::error("BrokerNode[{}]: committed runtime topic id={} — building its replicas "
+                                      "failed: {} (produce answers NotLeader until a restart rebuilds it)",
+                                      config_.nodeId, topicId, ex.what());
+                    }
+                }
+                return;
+            }
             const A2cDispatch d = dispatchAdminToControl(tid, p, n,
                 [this](int32_t e, std::string_view dir) {
                     onStorageFailure_(std::string(dir), e);
@@ -3859,31 +3890,26 @@ int BrokerNode::serviceAdminControl_() {
                 decodeCreateTopicReq(p, static_cast<std::size_t>(len));
             CreateTopicReplyMsg reply;
             reply.ticket = req.ticket;
-            if (topicRegistry_) {
+            // Test-only fault (setAdminCreateFaultForTest): the first request for the
+            // configured name fails, before or after the topic is created; firing
+            // disarms it.
+            std::optional<AdminCreateFaultForTest> fault;
+            if (adminCreateFault_ && req.name == adminCreateFault_->name) [[unlikely]] {
+                fault = std::move(adminCreateFault_);
+                adminCreateFault_.reset();
+            }
+            if (fault && !fault->afterCreate) {
+                reply.topicId = -1;
+            } else if (topicRegistry_) {
                 // createTopicForAdmin (AdminCreateTopic.h): createTopic + the
                 // AUTHORITATIVE partition count + `existed` (final review I1 —
                 // an existing name returns that topic, never the requested spec).
-                reply = createTopicForAdmin(*topicRegistry_, req);
-                // Task 8b (SINGLE-NODE): make the runtime topic
-                // produce/consume-capable by creating its user
-                // PartitionReplica(s) NOW, on this same control
-                // thread that owns TopicRegistry / replicaRegistry_
-                // / replTransport_ / MetadataService (no new
-                // cross-thread mutation).  The authoritative spec
-                // (assigned id + all fields, dirs/logs already
-                // created by createTopic) is read back from the
-                // registry and replayed through the boot path
-                // (idempotent for an existing topic's replicas).
-                if (reply.topicId >= 0) {
-                    try {
-                        if (const rune::node::TopicSpec* authSpec =
-                                topicRegistry_->topic(reply.topicId))
-                            (void)createRuntimeUserReplicas(*authSpec);
-                    } catch (const std::exception& ex) {
-                        spdlog::error("BrokerNode: admin createTopic('{}') replicas failed: {}",
-                                      req.name, ex.what());
-                        reply.topicId = -1;
-                    }
+                // C1: the topic is created AWAITING COMMIT — no replica, no
+                // assignment, not servable — until kA2cTopicCommitted (above).
+                reply = createTopicForAdmin(*topicRegistry_, req, firstRuntimeTopicId_);
+                if (fault) {
+                    reply.topicId = -1; reply.existed = false; reply.caseConflict = false;
+                    reply.sinkSpecMatches = false; reply.existingIsRuntimeCompact = false;
                 }
             }
             // Reply ring is 1-deep in flight (one DDL at a time) → never full.
@@ -3891,24 +3917,67 @@ int BrokerNode::serviceAdminControl_() {
         }, 8);
 
     // (3) Drain response frames (admin → control) → session egress.
-    work += agent->egressRing().drain(
-        [this](int32_t /*tid*/,
-               aeron::concurrent::AtomicBuffer& b,
-               aeron::util::index_t off,
-               aeron::util::index_t len) {
-            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
-            const auto n = static_cast<std::size_t>(len);
-            if (n < 8) return;
-            int64_t session;
-            std::memcpy(&session, p, 8);
-            if (gateway_)
-                (void)gateway_->sendControlFrame(session, p + 8, n - 8);
-        }, 16);
+    //     C1 / M7: through the DDL answer gate — a DefineTopic / CreateView OK
+    //     leaves only once its topic serves (committed above, in (1b), and its
+    //     assignment routed); FIFO behind it.  The ring is drained only while the
+    //     gate holds nothing, so one drain always fits the gate.
+    auto send = [this](int64_t session, const uint8_t* f, std::size_t n) {
+        if (gateway_) (void)gateway_->sendControlFrame(session, f, n);
+    };
+    auto serves = [this](int32_t topicId) { return ddlTopicServes_(topicId); };
+    if (!ddlAnswerGate_.empty()) {
+        const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        work += ddlAnswerGate_.release(nowNs, serves, send, [this](int64_t session, int32_t topicId) {
+            ++ddlAnswersOverdue_;
+            spdlog::error("BrokerNode[{}]: DDL OK for topic id={} (session {}) held {} ms and the topic still "
+                          "does not serve — answered Internal (in doubt), not OK (in-doubt answers: {})",
+                          config_.nodeId, topicId, session, kDdlAnswerMaxHoldNs / 1'000'000, ddlAnswersOverdue_);
+        });
+    }
+    if (ddlAnswerGate_.empty()) {
+        work += agent->egressRing().drain(
+            [this, &send, &serves](int32_t /*tid*/,
+                                   aeron::concurrent::AtomicBuffer& b,
+                                   aeron::util::index_t off,
+                                   aeron::util::index_t len) {
+                const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+                const auto n = static_cast<std::size_t>(len);
+                if (n < 8) return;
+                int64_t session;
+                std::memcpy(&session, p, 8);
+                const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                switch (ddlAnswerGate_.offer(session, p + 8, n - 8, nowNs, serves)) {
+                    case DdlAnswerGate::Offer::Pass: send(session, p + 8, n - 8); break;
+                    case DdlAnswerGate::Offer::Held: break;
+                    case DdlAnswerGate::Offer::Full:   // impossible by sizing: never dropped silently
+                        spdlog::critical("BrokerNode[{}]: DDL answer gate full — sending the answer ungated",
+                                         config_.nodeId);
+                        send(session, p + 8, n - 8);
+                        break;
+                }
+            }, 16);
+    }
 
     return work;
 }
 
 int AdminControlPlane::doWork(int64_t /*nowNs*/) { return node_.serviceAdminControl_(); }
+
+// C1 / M7: the topic of a DDL OK serves — its record committed (servable) and, when
+// a metadata service drives assignments, every partition's role has been routed
+// (the control-owned intended-role hint the bridge records).  Control thread.
+bool BrokerNode::ddlTopicServes_(int32_t topicId) const noexcept {
+    if (!topicRegistry_) return true;
+    if (topicRegistry_->awaitingCommit(topicId)) return false;
+    const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
+    if (spec == nullptr || !replicaRegistry_ || !metadataService_) return true;
+    for (int32_t p = 0; p < spec->partitionCount; ++p)
+        if (replicaRegistry_->lookupHandle(topicId, p).intendedRole == ReplicaRegistry::IntendedRole::Unknown)
+            return false;
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // A9 (findings §4.15): fused placement — the runtime runs in worker 0's pass, so the cross-thread rings the

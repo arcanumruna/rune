@@ -10,6 +10,7 @@
 #include <rune/codec/AlterOps.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Validator.h>
+#include <rune/node/PersistenceMode.h>
 
 namespace rune::node {
 
@@ -22,7 +23,8 @@ inline constexpr uint32_t RUNTIME_TOPIC_ID_BASE  = 0x40000000u;
 ///   topicId:i32, version:u16, partitionCount:i32, validate:u8,
 ///   keyFieldLen:u16 + keyField bytes,
 ///   descriptorLen:u32 + descriptorBlob bytes,
-///   nextTag:u16, compatMode:u8.
+///   nextTag:u16, compatMode:u8
+///   [, nameLen:u16 + name [, persistence:u8 (=1, transient only)]].
 /// The trailing (nextTag, compatMode) pair is APPENDED after the original
 /// layout (schema-evolution, Task 9) so legacy records written before these
 /// fields existed still deserialize: when the trailing bytes are absent
@@ -45,6 +47,11 @@ struct TopicSchema {
     // records written before it existed; boot recovery recreates the topic
     // under this name (RuntimeTopicRecovery).
     std::string           topicName;
+    // Phase 2b E: the topic's persistence mode.  Optional trailing byte AFTER the
+    // topicName trailer, written only when Transient (a disk record is
+    // byte-identical to the pre-2b layout).  Boot recovery recreates a runtime
+    // topic as transient from it (RuntimeTopicRecovery); ALTER carries it forward.
+    PersistenceMode       persistence    = PersistenceMode::Disk;
 
     [[nodiscard]] std::vector<uint8_t> serialize() const;
     [[nodiscard]] static std::optional<TopicSchema> deserialize(std::span<const uint8_t> buf);
@@ -67,6 +74,7 @@ struct RegistryEntry {
     int32_t                          partitionCount = 1;
     uint16_t                         nextTag        = 0;
     rune::codec::CompatMode          compatMode     = rune::codec::CompatMode::Backward;
+    PersistenceMode                  persistence    = PersistenceMode::Disk;   // Phase 2b E
     std::string                      topicName;        // durable topic name (may be empty: legacy record)
 };
 

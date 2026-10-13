@@ -1,4 +1,5 @@
 #include <rune/node/NodeConfig.h>
+#include <rune/node/TopicName.h>
 #include <rune/consensus/PeerResolution.h>
 #include <rune/node/Worker.h>
 #include <rune/storage/Log.h>                       // Log::kMaxRollBytes                         // Worker::maxAcceptableBatchBytes (THE batch limit)
@@ -485,6 +486,7 @@ std::optional<std::vector<int32_t>> parseCpuList(std::string_view s) {
 ConfigResult parseNodeConfig(
     const std::function<const char*(const char*)>& getenv_fn)
 {
+    std::vector<std::string> warnings;   // non-fatal (deprecated spellings); returned on success
     // --- RUNE_NODE_ID (required) ---
     const char* rawNodeId = getenv_fn("RUNE_NODE_ID");
     if (!rawNodeId || std::string_view(rawNodeId).empty())
@@ -780,7 +782,7 @@ ConfigResult parseNodeConfig(
                 // Remaining fields can be either:
                 //   (a) Positional legacy fields (no '=' in token): policy, segmentRollBytes, etc.
                 //   (b) Named key=value tokens (contain '='): group=<g>, key=<k>,
-                //       persistence=memory|disk, durability=majority|all-in-sync.
+                //       persistence=disk|transient (memory = deprecated alias), durability=majority|all-in-sync.
                 // Both formats are backward-compatible: a token is key=value iff it
                 // contains '='; otherwise it is a positional legacy field.
                 std::vector<std::string_view> fields;
@@ -794,21 +796,32 @@ ConfigResult parseNodeConfig(
                 }
 
                 if (fields.size() < 2)
-                    return {{}, std::string("RUNE_TOPICS entry missing ':' in: ") + std::string(entry)};
+                    return {{}, std::string("RUNE_TOPICS entry missing ':' in: ") + escapeNameForLog(entry)};
 
                 std::string_view namePart  = fields[0];
                 std::string_view countPart = fields[1];
 
                 if (namePart.empty())
-                    return {{}, std::string("RUNE_TOPICS entry has empty name in: ") + std::string(entry)};
+                    return {{}, std::string("RUNE_TOPICS entry has empty name in: ") + escapeNameForLog(entry)};
 
                 std::string name(namePart);
+                // DDL conformance B7 / D2d: a static name obeys the DDL name rule — it is
+                // the directory dataDir/topics/<name>/ too.
+                if (const TopicNameError ne = checkTopicName(name); ne != TopicNameError::None)
+                    return {{}, "RUNE_TOPICS topic name '" + escapeNameForLog(name) + "' is invalid (" +
+                                std::string(topicNameErrorText(ne)) + ") in entry: " + escapeNameForLog(entry)};
                 if (!seenNames.insert(name).second)
-                    return {{}, "RUNE_TOPICS has duplicate topic name: " + name};
+                    return {{}, "RUNE_TOPICS has duplicate topic name: " + escapeNameForLog(name)};
+                for (const std::string& seen : seenNames) {
+                    if (seen != name && topicNamesFoldEqual(seen, name))
+                        return {{}, "RUNE_TOPICS topic names '" + escapeNameForLog(seen) + "' and '" + escapeNameForLog(name) +
+                                    "' differ only by letter case (they would share one data "
+                                    "directory) in entry: " + escapeNameForLog(entry)};
+                }
 
                 int32_t partCount{};
                 if (!parseInt32(countPart, partCount) || partCount < 1)
-                    return {{}, std::string("RUNE_TOPICS partition count must be >= 1, got: ") + std::string(countPart) + " in entry: " + std::string(entry)};
+                    return {{}, std::string("RUNE_TOPICS partition count must be >= 1, got: ") + escapeNameForLog(countPart) + " in entry: " + escapeNameForLog(entry)};
 
                 TopicSpec ts;
                 ts.name           = std::move(name);
@@ -844,18 +857,24 @@ ConfigResult parseNodeConfig(
                     for (auto& ch : klower) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
 
                     if (klower == "group") {
-                        ts.coPartitionGroup = std::string(kval);
+                        ts.coPartitionGroup = escapeNameForLog(kval);
                     } else if (klower == "key") {
-                        ts.partitionKey = std::string(kval);
+                        ts.partitionKey = escapeNameForLog(kval);
                     } else if (klower == "persistence") {
                         std::string vlow(kval);
                         for (auto& ch : vlow) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-                        if (vlow == "memory") {
-                            ts.persistence = PersistenceMode::Memory;
+                        if (vlow == "transient") {
+                            ts.persistence = PersistenceMode::Transient;
+                        } else if (vlow == "memory") {
+                            // Phase 2b E: memory topics were renamed transient topics.
+                            // Existing compose files keep working; one line per entry.
+                            ts.persistence = PersistenceMode::Transient;
+                            warnings.push_back("RUNE_TOPICS persistence=memory is deprecated — use "
+                                               "persistence=transient (topic '" + ts.name + "')");
                         } else if (vlow == "disk") {
                             ts.persistence = PersistenceMode::Disk;
                         } else {
-                            return {{}, std::string("RUNE_TOPICS persistence must be 'disk' or 'memory', got: ") + std::string(kval) + " in entry: " + std::string(entry)};
+                            return {{}, std::string("RUNE_TOPICS persistence must be 'disk' or 'transient', got: ") + escapeNameForLog(kval) + " in entry: " + escapeNameForLog(entry)};
                         }
                     } else if (klower == "durability") {
                         std::string vlow(kval);
@@ -865,7 +884,7 @@ ConfigResult parseNodeConfig(
                         } else if (vlow == "all-in-sync") {
                             ts.durability = 1;
                         } else {
-                            return {{}, std::string("RUNE_TOPICS durability must be 'majority' or 'all-in-sync', got: ") + std::string(kval) + " in entry: " + std::string(entry)};
+                            return {{}, std::string("RUNE_TOPICS durability must be 'majority' or 'all-in-sync', got: ") + escapeNameForLog(kval) + " in entry: " + escapeNameForLog(entry)};
                         }
                     } else if (klower == "tier") {
                         // Async-durability tier (see NodeConfig.h): controls WHEN the
@@ -880,10 +899,10 @@ ConfigResult parseNodeConfig(
                         } else if (vlow == "strict") {
                             ts.durabilityTier = 2;
                         } else {
-                            return {{}, std::string("RUNE_TOPICS tier must be 'leader', 'majority' or 'strict', got: ") + std::string(kval) + " in entry: " + std::string(entry)};
+                            return {{}, std::string("RUNE_TOPICS tier must be 'leader', 'majority' or 'strict', got: ") + escapeNameForLog(kval) + " in entry: " + escapeNameForLog(entry)};
                         }
                     } else {
-                        return {{}, std::string("RUNE_TOPICS unknown option '") + std::string(kname) + "' in entry: " + std::string(entry)};
+                        return {{}, std::string("RUNE_TOPICS unknown option '") + escapeNameForLog(kname) + "' in entry: " + escapeNameForLog(entry)};
                     }
                 }
 
@@ -906,7 +925,7 @@ ConfigResult parseNodeConfig(
                     } else if (pol == "compact_delete" || pol == "compactdelete") {
                         ts.cleanupPolicy = TopicSpec::CleanupPolicy::CompactDelete;
                     } else {
-                        return {{}, std::string("RUNE_TOPICS policy must be 'delete', 'compact', or 'compact_delete', got: ") + pol + " in entry: " + std::string(entry)};
+                        return {{}, std::string("RUNE_TOPICS policy must be 'delete', 'compact', or 'compact_delete', got: ") + escapeNameForLog(pol) + " in entry: " + escapeNameForLog(entry)};
                     }
                 }
 
@@ -917,11 +936,11 @@ ConfigResult parseNodeConfig(
                     int64_t v{};
                     auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), v);
                     if (ec != std::errc{} || ptr != sv.data() + sv.size())
-                        return std::string("RUNE_TOPICS ") + fieldName + " must be an integer in: " + std::string(entry);
+                        return std::string("RUNE_TOPICS ") + fieldName + " must be an integer in: " + escapeNameForLog(entry);
                     if (!allowNeg1 && v < 1)
-                        return std::string("RUNE_TOPICS ") + fieldName + " must be a positive integer in: " + std::string(entry);
+                        return std::string("RUNE_TOPICS ") + fieldName + " must be a positive integer in: " + escapeNameForLog(entry);
                     if (allowNeg1 && v < -1)
-                        return std::string("RUNE_TOPICS ") + fieldName + " must be >= -1 in: " + std::string(entry);
+                        return std::string("RUNE_TOPICS ") + fieldName + " must be >= -1 in: " + escapeNameForLog(entry);
                     out = v;
                     return {};
                 };
@@ -933,7 +952,7 @@ ConfigResult parseNodeConfig(
                     // D19 L1: segment positions are 32-bit (Log::kMaxRollBytes).
                     if (ts.segmentRollBytes > rune::storage::Log::kMaxRollBytes)
                         return {{}, std::string("RUNE_TOPICS segmentRollBytes must be <= ") +
-                                        std::to_string(rune::storage::Log::kMaxRollBytes) + " in: " + std::string(entry)};
+                                        std::to_string(rune::storage::Log::kMaxRollBytes) + " in: " + escapeNameForLog(entry)};
                 }
 
                 // Positional[2] (optional): deleteRetentionMs (non-negative int64)
@@ -976,9 +995,9 @@ ConfigResult parseNodeConfig(
                     errno = 0;
                     double v = std::strtod(s.c_str(), &endp);
                     if (endp != s.c_str() + s.size() || errno != 0)
-                        return {{}, std::string("RUNE_TOPICS minCleanableDirtyRatio must be a number in: ") + std::string(entry)};
+                        return {{}, std::string("RUNE_TOPICS minCleanableDirtyRatio must be a number in: ") + escapeNameForLog(entry)};
                     if (v < 0.0 || v > 1.0)
-                        return {{}, std::string("RUNE_TOPICS minCleanableDirtyRatio must be in [0.0, 1.0] in: ") + std::string(entry)};
+                        return {{}, std::string("RUNE_TOPICS minCleanableDirtyRatio must be in [0.0, 1.0] in: ") + escapeNameForLog(entry)};
                     ts.minCleanableDirtyRatio = v;
                 }
 
@@ -1074,7 +1093,15 @@ ConfigResult parseNodeConfig(
     parsePow2(getenv_fn("RUNE_WORKER_RETURN_RING_BYTES"),  cfg.workerReturnRingBytes);
     parsePow2(getenv_fn("RUNE_IO_SUBMIT_RING_DEPTH"),     cfg.ioSubmitRingDepth);
     parsePow2(getenv_fn("RUNE_IO_COMPLETION_RING_DEPTH"), cfg.ioCompletionRingDepth);
-    parsePow2(getenv_fn("RUNE_MEMORY_LOG_RING_BYTES"),    cfg.memoryLogRingBytes);
+    {
+        // Phase 2b E: RUNE_TRANSIENT_LOG_RING_BYTES is canonical; RUNE_MEMORY_LOG_RING_BYTES
+        // is a deprecated alias (one warning whenever it is set; canonical wins if both).
+        const char* canon = getenv_fn("RUNE_TRANSIENT_LOG_RING_BYTES");
+        const char* alias = getenv_fn("RUNE_MEMORY_LOG_RING_BYTES");
+        if (alias)
+            warnings.push_back("RUNE_MEMORY_LOG_RING_BYTES is deprecated; use RUNE_TRANSIENT_LOG_RING_BYTES");
+        parsePow2(canon ? canon : alias, cfg.memoryLogRingBytes);
+    }
     parsePow2(getenv_fn("RUNE_AERON_TERM_BUFFER_BYTES"),  cfg.aeronTermBufferBytes);
     if (const char* raw = getenv_fn("RUNE_IOWQ_CORES"); raw && *raw) {
         auto cpus = parseCpuList(raw);
@@ -1488,7 +1515,7 @@ ConfigResult parseNodeConfig(
         }
     }
 
-    return {std::move(cfg), {}};
+    return {std::move(cfg), {}, std::move(warnings)};
 }
 
 // ---------------------------------------------------------------------------

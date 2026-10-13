@@ -9,6 +9,8 @@
 
 #include <gtest/gtest.h>
 #include "rune/node/AdminWorker.h"
+#include <rune/node/AdminChannels.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/replication/Types.h>
 #include <rune/storage/Log.h>
@@ -21,6 +23,7 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 
 using namespace rune::node;
 using namespace rune::codec;
@@ -74,6 +77,11 @@ struct Harness {
     // Pending createTopic request (ticket, partitionCount) awaiting a reply.
     int64_t pendingTicket = -1;
     bool    failCreate = false;
+    uint8_t lastCreatePersistence = 0xff;
+    uint8_t replyPersistence = CreateTopicReplyMsg::kPersistenceNotReported;   // no-hang R1
+    // B10 fix round 1: deps.topicCommitted capture + the HW at the moment it fired.
+    std::vector<int32_t> committedIds;
+    int64_t hwAtCommitSignal = -1;
 
     explicit Harness()
         : dir(uniqDir("h")), log(dir) {
@@ -90,10 +98,14 @@ struct Harness {
 
         AdminDeps d;
         d.requestCreateTopic = [this](int64_t ticket, int32_t, const std::string&,
-                                      const std::string&, uint8_t) -> bool {
-            ++creates; pendingTicket = ticket; return true;
+                                      const std::string&, uint8_t, uint8_t persistence) -> bool {
+            ++creates; pendingTicket = ticket; lastCreatePersistence = persistence; return true;
         };
         d.pushValidators = [this](const RegistryEntry&, int32_t) { ++pushes; };
+        d.topicCommitted = [this](int32_t topicId) {
+            committedIds.push_back(topicId);
+            hwAtCommitSignal = replica->highWatermark();
+        };
         d.respondDefine = [this](int64_t,int64_t,int32_t tid,uint16_t,uint16_t e) {
             lastTopicId = tid; lastErr = e;
         };
@@ -114,8 +126,9 @@ struct Harness {
     // control reply → doWork loop until the state machine settles.
     void runDefine(int64_t session, int64_t corr, const std::string& name,
                    const std::string& keyField, int32_t parts, bool validate,
-                   std::vector<uint8_t> blob) {
+                   std::vector<uint8_t> blob, uint8_t persistence = 0) {
         DefineTopicMsg m;
+        m.persistence = persistence;
         m.session = session; m.corr = corr; m.name = name; m.keyField = keyField;
         m.partitionCount = parts; m.validate = validate; m.blob = std::move(blob);
         w->submitDefineTopic(std::move(m));
@@ -129,6 +142,7 @@ struct Harness {
                 CreateTopicReplyMsg reply;
                 reply.ticket  = pendingTicket;
                 reply.topicId = failCreate ? -1 : nextTopicId++;
+                reply.persistence = replyPersistence;
                 pendingTicket = -1;
                 w->onCreateTopicReply(reply);
             }
@@ -235,6 +249,61 @@ TEST(AdminWorkerRegression, CommitGatedOnHighWatermark) {
     EXPECT_EQ(h.lastErr,0);
     EXPECT_GE(h.log.logEndOffset(), 1LL);
     EXPECT_GE(h.replica->highWatermark(), 1LL);
+}
+
+// B10 / D4 fix round 1 (I1): the admin thread signals "record committed" for a
+// DefineTopic exactly once, only AFTER the HW covers the record (the control
+// thread then rewrites the dir marker pending -> committed).  A refused, failed,
+// duplicate or ALTER DDL never signals.
+TEST(AdminWorkerRegression, TopicCommittedSignalledOnceAfterTheRecordCommitsRegression) {
+    Harness h;
+    h.runDefine(1,2,"characters","userId",16,false,charsBlob());
+    ASSERT_EQ(h.lastErr,0);
+    EXPECT_EQ(h.committedIds, (std::vector<int32_t>{0}));
+    EXPECT_GE(h.hwAtCommitSignal, h.log.logEndOffset()) << "signalled only once the HW covers the record";
+    h.runDefine(1,3,"characters","userId",16,false,charsBlob());   // TopicExists
+    h.runAlter(1,4,"characters",1,opsBlob({addOp("level", PrimType::Int32)}));
+    EXPECT_EQ(h.committedIds, (std::vector<int32_t>{0})) << "duplicate / ALTER never re-signal";
+}
+
+TEST(AdminWorkerRegression, NoTopicCommittedSignalWhenTheDdlNeverCommitsRegression) {
+    {
+        Harness h;
+        h.failCreate = true;
+        h.runDefine(1,2,"characters","userId",16,false,charsBlob());
+        EXPECT_EQ(h.lastErr,6);
+        EXPECT_TRUE(h.committedIds.empty()) << "a failed create is never marked committed";
+    }
+    {
+        Harness h;
+        h.w->onRole(AdminRoleMsg{/*leader=*/false, /*epoch=*/2, /*leaderId=*/2});
+        h.runDefine(1,2,"characters","userId",16,false,charsBlob());
+        EXPECT_TRUE(h.committedIds.empty()) << "a follower commits nothing";
+    }
+    {
+        Harness h;
+        h.runDefine(1,2,"bad","",1,false,{0,1,2});   // InvalidSchema
+        EXPECT_TRUE(h.committedIds.empty());
+    }
+}
+
+// The kA2cTopicCommitted frame on a real SPSC ring: [topicId:i32]; a short frame
+// decodes to -1 (the control thread ignores it).
+TEST(AdminWorkerRegression, TopicCommittedRingFrameRoundTripsRegression) {
+    OneToOneByteRing ring(kAdminToControlRingBytes);
+    ASSERT_TRUE(encodeTopicCommitted(ring, 42));
+    int32_t gotType = 0, gotId = -2;
+    const int n = ring.drain([&](int32_t tid, aeron::concurrent::AtomicBuffer& b,
+                                 aeron::util::index_t off, aeron::util::index_t len) {
+        gotType = tid;
+        gotId = decodeTopicCommitted(reinterpret_cast<const uint8_t*>(b.buffer() + off),
+                                     static_cast<std::size_t>(len));
+    }, 4);
+    EXPECT_EQ(n, 1);
+    EXPECT_EQ(gotType, kA2cTopicCommitted);
+    EXPECT_EQ(gotId, 42);
+    const uint8_t shortFrame[3] = {1, 2, 3};
+    EXPECT_EQ(decodeTopicCommitted(shortFrame, sizeof shortFrame), -1);
 }
 
 // Regression (RULING-2 D): DDL is leader-only.  A follower AdminWorker must
@@ -470,4 +539,167 @@ TEST(AdminWorkerRegression, AlterByTopicNameWhenItDiffersFromDescriptorName) {
     ASSERT_NE(h.reg.byName("typed_route"), nullptr);
     EXPECT_EQ(h.reg.byName("typed_route")->version, 2);
     EXPECT_EQ(h.reg.byName("typed_route")->partitionCount, 8);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b E: transient topics through the DDL state machine.
+// ---------------------------------------------------------------------------
+TEST(AdminWorkerRegression, TransientDefineRequestsTransientTopicAndRecordsMode) {
+    Harness h;
+    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob(), /*persistence=*/1);
+    ASSERT_EQ(h.lastErr, 0);
+    EXPECT_EQ(h.lastCreatePersistence, 1u) << "control thread must be asked for a transient topic";
+    const RegistryEntry* e = h.reg.byName("characters");
+    ASSERT_NE(e, nullptr);
+    EXPECT_EQ(e->persistence, PersistenceMode::Transient);
+
+    // The DURABLE record (what boot recovery reads) carries the mode too.
+    const std::vector<uint8_t> raw = h.log.read(0, 1 << 20);
+    ASSERT_FALSE(raw.empty());
+    rune::protocol::RecordBatchReader rd(raw.data(), raw.size());
+    ASSERT_TRUE(rd.ensureValid());
+    std::optional<TopicSchema> rec;
+    rd.forEachRecord([&](std::string_view, std::string_view v, int64_t, int64_t) {
+        rec = TopicSchema::deserialize(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(v.data()), v.size()));
+    });
+    ASSERT_TRUE(rec.has_value());
+    EXPECT_EQ(rec->persistence, PersistenceMode::Transient);
+}
+
+TEST(AdminWorkerRegression, DiskDefineRequestsDiskTopic) {
+    Harness h;
+    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob());
+    ASSERT_EQ(h.lastErr, 0);
+    EXPECT_EQ(h.lastCreatePersistence, 0u);
+    EXPECT_EQ(h.reg.byName("characters")->persistence, PersistenceMode::Disk);
+}
+
+// ALTER writes a NEW TopicSchema version — the one recovery reads.  It must
+// carry the mode forward or a restart would recreate the topic on disk.
+TEST(AdminWorkerRegression, AlterCarriesTransientPersistenceForward) {
+    Harness h;
+    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob(), /*persistence=*/1);
+    ASSERT_EQ(h.lastErr, 0);
+    h.runAlter(1, 3, "characters", /*expectedVersion=*/1, opsBlob({addOp("email", PrimType::String)}));
+    ASSERT_EQ(h.lastAlterErr, 0);
+    ASSERT_EQ(h.lastAlterVersion, 2u);
+    const RegistryEntry* v2 = h.reg.byName("characters");
+    ASSERT_NE(v2, nullptr);
+    EXPECT_EQ(v2->version, 2u);
+    EXPECT_EQ(v2->persistence, PersistenceMode::Transient);
+}
+
+// Re-defining an existing name with the OTHER persistence is TopicExists and
+// never flips the mode (no second create, registry unchanged).
+TEST(AdminWorkerRegression, RedefineExistingTopicWithOtherPersistenceIsTopicExists) {
+    Harness h;
+    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob(), /*persistence=*/0);
+    ASSERT_EQ(h.lastErr, 0);
+    h.lastErr = 0xffff;
+    h.runDefine(1, 3, "characters", "userId", 4, false, charsBlob(), /*persistence=*/1);
+    EXPECT_EQ(h.lastErr, 25) << "TopicExists";
+    EXPECT_EQ(h.creates, 1);
+    EXPECT_EQ(h.reg.byName("characters")->persistence, PersistenceMode::Disk);
+}
+
+// The in-process ring frames carry the byte; a frame without it decodes as disk;
+// an unknown value is never cast into the enum.
+TEST(AdminWorkerRegression, AdminRingFramesCarryPersistence) {
+    OneToOneByteRing ring{kAdminRequestRingBytes};
+    DefineTopicMsg m; m.session = 7; m.corr = 8; m.name = "p"; m.blob = {1, 2}; m.persistence = 1;
+    ASSERT_TRUE(encodeDefineTopic(ring, m));
+    DefineTopicMsg got;
+    ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                   aeron::util::index_t len) {
+        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+        const std::size_t n = static_cast<std::size_t>(len);
+        got = decodeDefineTopic(p, n);
+        // Same frame minus the trailing persistence byte = a pre-2b frame -> disk.
+        const DefineTopicMsg legacy = decodeDefineTopic(p, n - 1);
+        EXPECT_EQ(legacy.persistence, 0u);
+        EXPECT_EQ(legacy.blob, (std::vector<uint8_t>{1, 2}));
+        // Unknown value: rejected (blob dropped => InvalidSchema), never cast.
+        std::vector<uint8_t> bad(p, p + n);
+        bad.back() = 2;
+        const DefineTopicMsg rej = decodeDefineTopic(bad.data(), bad.size());
+        EXPECT_EQ(rej.persistence, 0u);
+        EXPECT_TRUE(rej.blob.empty());
+        EXPECT_EQ(rej.corr, 8);
+    }, 1);
+    EXPECT_EQ(got.persistence, 1u);
+    EXPECT_EQ(got.blob, (std::vector<uint8_t>{1, 2}));
+
+    OneToOneByteRing creq{kCreateTopicRingBytes};
+    CreateTopicReqMsg c; c.ticket = 3; c.partitionCount = 2; c.name = "p"; c.persistence = 1;
+    ASSERT_TRUE(encodeCreateTopicReq(creq, c));
+    CreateTopicReqMsg cgot;
+    creq.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                   aeron::util::index_t len) {
+        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+        const std::size_t n = static_cast<std::size_t>(len);
+        cgot = decodeCreateTopicReq(p, n);
+        EXPECT_EQ(decodeCreateTopicReq(p, n - 1).persistence, 0u);
+        std::vector<uint8_t> bad(p, p + n);
+        bad.back() = 2;
+        const CreateTopicReqMsg rej = decodeCreateTopicReq(bad.data(), bad.size());
+        EXPECT_EQ(rej.persistence, 0u);
+        EXPECT_TRUE(rej.name.empty());
+    }, 1);
+    EXPECT_EQ(cgot.persistence, 1u);
+    EXPECT_EQ(cgot.cleanupPolicy, 0u);
+}
+
+// ===========================================================================
+// No-hang wave (R1): an unknown persistence byte is never defaulted to Disk.
+// ===========================================================================
+
+// A directly submitted DefineTopicMsg (no ring decode) with persistence 2 is
+// rejected InvalidSchema before anything starts.
+TEST(AdminWorkerRegression, DirectDefineWithUnknownPersistenceIsInvalidSchemaRegression) {
+    Harness h;
+    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob(), /*persistence=*/2);
+    EXPECT_EQ(h.lastErr, 23u) << "InvalidSchema";
+    EXPECT_EQ(h.creates, 0) << "nothing started";
+    EXPECT_EQ(h.reg.byName("characters"), nullptr);
+}
+
+// The control thread's reply reports an unknown mode: the define fails Internal,
+// nothing is recorded, and the worker is Idle again (the next define runs).
+TEST(AdminWorkerRegression, CreateReplyWithUnknownPersistenceFailsInternalAndGoesIdleRegression) {
+    Harness h;
+    h.replyPersistence = 2;
+    h.runDefine(1, 2, "characters", "userId", 4, false, charsBlob());
+    EXPECT_EQ(h.lastErr, 6u) << "Internal";
+    EXPECT_EQ(h.reg.byName("characters"), nullptr) << "nothing recorded";
+    EXPECT_EQ(h.w->pendingCount(), 0u);
+
+    h.replyPersistence = CreateTopicReplyMsg::kPersistenceNotReported;
+    h.lastErr = 0xffff;
+    h.runDefine(1, 3, "orders", "userId", 4, false, charsBlob());
+    EXPECT_EQ(h.lastErr, 0u) << "the worker went Idle: the next define completes";
+    ASSERT_NE(h.reg.byName("orders"), nullptr);
+}
+
+// No-hang fix round 3 (fix-on-sight): the DDL queue is bounded — a request
+// beyond kMaxPendingDdl is answered Internal at once instead of queued forever.
+TEST(AdminWorkerRegression, DdlQueueIsBoundedAndOverflowIsAnsweredInternalRegression) {
+    Harness h;
+    for (std::size_t i = 0; i < AdminWorker::kMaxPendingDdl; ++i) {
+        DefineTopicMsg m; m.session = 1; m.corr = static_cast<int64_t>(i); m.name = "t" + std::to_string(i);
+        m.partitionCount = 1; m.blob = charsBlob();
+        h.w->submitDefineTopic(std::move(m));
+    }
+    ASSERT_EQ(h.w->pendingCount(), AdminWorker::kMaxPendingDdl);
+    h.lastErr = 0xffff;
+    DefineTopicMsg over; over.session = 1; over.corr = 999; over.name = "over"; over.partitionCount = 1;
+    over.blob = charsBlob();
+    h.w->submitDefineTopic(std::move(over));
+    EXPECT_EQ(h.lastErr, 6u) << "a DDL beyond the bound was queued (or dropped) instead of answered Internal";
+    EXPECT_EQ(h.w->pendingCount(), AdminWorker::kMaxPendingDdl);
+    EXPECT_EQ(h.w->pendingDdlRefused(), 1u);
+    h.lastAlterErr = 0xffff;
+    AlterTopicMsg a; a.session = 1; a.corr = 1000; a.topicName = "t0";
+    h.w->submitAlterTopic(std::move(a));
+    EXPECT_EQ(h.lastAlterErr, 6u);
 }

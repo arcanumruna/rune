@@ -140,11 +140,12 @@ int main() {
     }
 
     // Parse configuration from environment.
-    auto [cfg, err] = rune::node::parseNodeConfigFromEnv();
+    auto [cfg, err, warnings] = rune::node::parseNodeConfigFromEnv();
     if (!cfg.has_value()) {
         std::cerr << "rune-broker: configuration error: " << err << "\n";
         return 2;
     }
+    for (const auto& w : warnings) spdlog::warn("rune-broker: {}", w);
 
     spdlog::info("rune-broker: node {} starting, dataDir={}",
                  cfg->nodeId, cfg->dataDir);

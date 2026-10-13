@@ -150,6 +150,7 @@ if(BUILD_TESTING)
         tests/node/ViewSnapshotIoAgentTest.cpp
         tests/node/WorkerViewSetTest.cpp
         tests/node/RuntimeTopicRecoveryTest.cpp
+        tests/node/TopicNameTest.cpp
         tests/node/ViewReadinessRegressionTest.cpp
         tests/node/ViewRecoveryRegressionTest.cpp
         )
@@ -306,6 +307,8 @@ if(BUILD_TESTING)
     target_link_libraries(rune_worker_tests PRIVATE
         rune_node
         rune_replication
+        rune_view
+        rune_codec
         GTest::gtest_main)
     gtest_discover_tests(rune_worker_tests)
 
@@ -535,6 +538,45 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     gtest_discover_tests(rune_create_view_tests
         PROPERTIES TIMEOUT 60)
+
+    # ---------------------------------------------------------------------------
+    # DDL conformance plan: DdlHarness suites — fix regressions (B1-B4, KL2), the
+    # Occupant x Op matrix and the pair x timing matrix.  On-host (no Aeron),
+    # deterministic.  Every suite name contains "Regression".
+    # ---------------------------------------------------------------------------
+    add_executable(rune_ddl_conformance_tests
+        tests/node/DdlHarnessRegressionTest.cpp
+        tests/node/DdlOccupantMatrixRegressionTest.cpp
+        tests/node/DdlPairTimingMatrixRegressionTest.cpp
+        tests/node/DdlFinalFixRegressionTest.cpp)
+    target_include_directories(rune_ddl_conformance_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_ddl_conformance_tests PRIVATE
+        rune_node
+        rune_view
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_ddl_conformance_tests
+        DISCOVERY_TIMEOUT 120
+        PROPERTIES TIMEOUT 120)
+
+    # DDL conformance plan Task 10: seeded model-checked DDL stress + the admin
+    # steady-state zero-alloc gate.  Own executable (replaces global operator new).
+    add_executable(rune_ddl_stress_tests
+        tests/node/DdlStressRegressionTest.cpp)
+    target_include_directories(rune_ddl_stress_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_ddl_stress_tests PRIVATE
+        rune_node
+        rune_view
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_ddl_stress_tests
+        PROPERTIES TIMEOUT 180)
 
     # ---------------------------------------------------------------------------
     # Task 20: GetViewRowRegressionTest — the GetViewRow point-read path (real
@@ -917,6 +959,21 @@ if(BUILD_TESTING)
             # port was taken concurrently → "Address already in use").
             gtest_discover_tests(rune_broker_node_tests
                 PROPERTIES TIMEOUT 60 RESOURCE_LOCK rune_udp_ports
+                ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
+
+            # DDL conformance plan Task 12: DDL serialization + name collisions over
+            # a REAL single-node BrokerNode and real Aeron (T1/T2/T3-T4/T5/T7).
+            add_executable(rune_ddl_broker_tests
+                tests/integration/DdlConformanceBrokerRegressionTest.cpp)
+            target_include_directories(rune_ddl_broker_tests PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+            target_link_libraries(rune_ddl_broker_tests PRIVATE
+                rune_node
+                rune_view
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_ddl_broker_tests
+                PROPERTIES TIMEOUT 180 RESOURCE_LOCK rune_udp_ports
                 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # EmbeddedDriver: one driver, one pumping thread (spec §3.6).

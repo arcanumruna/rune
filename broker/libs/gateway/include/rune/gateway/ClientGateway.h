@@ -53,6 +53,7 @@
 
 #include <rune/aeronutil/AeronPump.h>
 #include <rune/gateway/SessionTable.h>
+#include <rune/gateway/SpillPool.h>
 #include <rune/gateway/IGroupRequestHandler.h>
 #include <rune/gateway/ITxnRequestHandler.h>
 #include <rune/gateway/IAdminRequestSink.h>
@@ -83,6 +84,7 @@ namespace rune::node { class WorkerPool; struct WorkerReturn; }
 #include <rune/node/SessionAnnouncer.h>
 // G0.1: ErrorCode enum for sendRespReliable() signature.
 #include <rune/protocol/client/Protocol.h>
+#include <rune/protocol/client/MessageHeader.h>
 
 #include <algorithm>
 #include <array>
@@ -678,7 +680,7 @@ public:
     // ring.  For tests and monitoring.
     // -----------------------------------------------------------------------
     [[nodiscard]] std::size_t pendingResponseCount() const noexcept {
-        return pendingRespCount_;
+        return egressSpill_.records();
     }
 
     // -----------------------------------------------------------------------
@@ -980,6 +982,51 @@ public:
         handleTxnMessage(buf, len, nowNs, tid);
     }
     [[nodiscard]] uint64_t coordinatorRedirectsForTest() const noexcept { return coordinatorRedirects_; }
+    // No-hang wave (R2) test seams: the full ingress dispatch (checkFrame +
+    // every handler) and the reject / unanswerable counters.
+    bool applyClientFrameForTest(const uint8_t* buf, std::size_t len) { return onClientFrame_(buf, len); }
+    void applyGetViewRowForTest(const uint8_t* buf, std::size_t len) { handleGetViewRow(buf, len); }
+    [[nodiscard]] uint64_t rejectedRequestsForTest() const noexcept { return rejectedRequests_; }
+    // No-hang fix round 2: inject a session with a NON-NULL placeholder egress
+    // (never dereferenced: makeForTest's TestEgressFn intercepts every offer of
+    // the reliable answer path), so tests exercise the production answer path
+    // (spill, per-session FIFO, spill-full expiry) — no test flag on it.
+    // Fix round 2 (I5): a handshake in progress (awaitingHandshake, placeholder
+    // reply publication intercepted by the TestEgressFn).
+    void injectPendingHandshakeForTest(int64_t sessionId);
+    void pollPendingConnectsForTest(int64_t nowNs) { pollPendingConnects(nowNs); }
+    int64_t injectReliableTestSessionForTest(int64_t nowNs = 0,
+                                             int32_t clientVersion = rune::protocol::client::kClientVersion);
+    [[nodiscard]] std::size_t egressSpillUsedBytesForTest() const noexcept { return egressSpill_.usedBytes(); }
+    /// Fix round 4: a session's spill state / pool bytes held (test seam; Normal / 0 when unknown).
+    [[nodiscard]] SpillState spillStateForTest(int64_t sid) noexcept {
+        const Session* s = sessions_.find(sid);
+        return s ? s->spill.state : SpillState::Normal;
+    }
+    [[nodiscard]] std::size_t spilledBytesForTest(int64_t sid) noexcept {
+        const Session* s = sessions_.find(sid);
+        return s ? s->spill.bytes : 0;
+    }
+    [[nodiscard]] std::size_t spillReadySessionsForTest() const noexcept { return spillReadySessions_; }
+    /// Fix round 4 (N12): the reply-host string a pending connect still owns (null once the ring took it).
+    [[nodiscard]] const void* pendingResolveHostForTest(std::size_t i) const noexcept {
+        return i < pendingConnects_.size() ? pendingConnects_[i].resolveHost.get() : nullptr;
+    }
+    /// Fix round 4: the spill's sizing (tests / benches).
+    struct SpillSizing { std::size_t total, pool, stage, sessionQuota; };
+    static constexpr SpillSizing spillSizing() noexcept;
+    /// Fix round 5 (N20): a worker reports `sid` Held (as a SessionSignal Held does).
+    void markSessionHeldForTest(int64_t sid) {
+        if (Session* s = sessions_.find(sid); s && s->heldByWorkers == 0) { s->heldByWorkers = 1; ++heldSessions_; }
+    }
+    /// Fix round 4 (N9): put a session in the Expiring state exactly as a full spill does.
+    void expireSessionForSpillForTest(int64_t sid) {
+        if (Session* s = sessions_.find(sid)) expireForSpill_(*s);
+    }
+    [[nodiscard]] uint64_t oldClientUnknownMemberAnswersForTest() const noexcept { return oldClientUnknownMemberAnswers_; }
+    [[nodiscard]] uint64_t oldClientSessionWideEvictionsForTest() const noexcept { return oldClientSessionWideEvictions_; }
+    [[nodiscard]] bool sessionExistsForTest(int64_t sid) noexcept { return sessions_.find(sid) != nullptr; }
+    [[nodiscard]] uint64_t unanswerableFramesForTest() const noexcept { return unanswerableFrames_; }
     void applyMetadataForTest(const uint8_t* buf, std::size_t len) {
         handleMetadata(buf, len);
     }
@@ -1072,27 +1119,38 @@ private:
     };
 
     // -----------------------------------------------------------------------
-    // G0.1: PendingResp — one already-encoded response frame waiting for the
-    // egress publication to clear back-pressure.
+    // No-hang fix rounds 2-4 (I1 / N8): the egress SPILL — every back-pressured
+    // client answer is kept, in per-session order, in a preallocated block pool
+    // (SpillPool: one intrusive chain per Session) and re-offered by
+    // drainPendingResponses, which walks only the READY list of sessions that
+    // hold spilled answers (O(1) per spilling session per duty cycle; a session
+    // whose publication has no window costs one compare).  There is NO
+    // best-effort fallback: a session the spill cannot hold is EXPIRED
+    // explicitly (SessionExpired, then closed — every pending client op
+    // completes SessionLost), never silently short of an answer.
     //
-    // Pre-allocated inline (no hot-path heap alloc).  The encoded bytes are
-    // copied into `bytes` at enqueue time (encode-once strategy); `sessionId`
-    // identifies the egress session on drain.
-    //
-    // kMaxBytes = 512 covers ProduceResponse (46 B, D6) and ErrorResponse with a
-    // typical redirect URL (< ~450 B).  Responses that exceed kMaxBytes are
-    // sent best-effort and NOT enqueued (same as pre-fix behaviour for those
-    // rare oversized frames).  A static_assert in sendRespReliable_ ensures the
-    // produce-ack path (ProduceResponse::ENCODED_SIZE = 46) always fits.
-    //
-    // Single-writer: all accesses are on the duty-cycle thread only.
+    // Memory: kEgressSpillBytes in total, allocated once — the block pool plus
+    // the staging buffer a multi-block answer is gathered into for its offer.
     // -----------------------------------------------------------------------
-    struct PendingResp {
-        static constexpr std::size_t kMaxBytes = 512;
-        std::array<uint8_t, kMaxBytes> bytes{};
-        std::size_t len       = 0;
-        int64_t     sessionId = 0;
+    static constexpr std::size_t kEgressSpillBytes     = 4u << 20;     // 4 MiB in total
+    static constexpr std::size_t kMaxSpillRecordBytes  = 256u << 10;   // the staging buffer (largest spillable answer)
+    static constexpr std::size_t kEgressSpillPoolBytes = kEgressSpillBytes - kMaxSpillRecordBytes;
+    // Fix round 3 (I1 fairness) / round 4 (N10): one session may hold at most
+    // this many POOL bytes (blocks, headers included) — 8 x quota == the pool;
+    // the session over quota is the one expired (never an innocent pusher).
+    static constexpr std::size_t kSessionSpillQuota = kEgressSpillPoolBytes / 8;
+    // Fix round 3 (I1 SessionExpired delivery): the explicit EXPIRING state of a
+    // session the spill could not hold — only what that state needs.  Its
+    // SessionExpired is re-offered every drain until delivered (then the session
+    // is closed) or until the lease deadline (closed anyway, counted lost).
+    // Preallocated; a full table leaves the session marked (answers refused) and
+    // adopts it as soon as a slot frees.
+    struct SpillExpiring {
+        int64_t sessionId  = 0;
+        int64_t deadlineNs = 0;
+        bool    subscriptionsDropped = false;   // fix round 4 (N9): its push subscriptions ended
     };
+    static constexpr std::size_t kMaxSpillExpiring = 256;
 
     // -----------------------------------------------------------------------
     // Subscription — per-session push subscription (GB-3 / GR-6).
@@ -1201,6 +1259,17 @@ private:
         // the duty thread (PeerResolverHub); no publication registered yet
         // (registrationId unused) until the numeric endpoint is known.
         bool        awaitingResolve = false;
+        // Fix round 3: the resolve ring refused the reply-host offer — retried
+        // each poll until accepted or the connect timeout (never a silent drop).
+        bool        resolveOfferPending = false;
+        // Fix round 4 (N12): the reply host handed to the resolver, allocated
+        // ONCE per pending connect (owned here until the ring accepts it) — a
+        // refused offer is retried without a new allocation.
+        std::unique_ptr<std::string> resolveHost;
+        // Fix round 3 (N4): the explicit FailingHandshake state — HandshakeFailed
+        // (on handshakeFailCorr) re-offered each poll until delivered / timeout.
+        bool        failingHandshake  = false;
+        int64_t     handshakeFailCorr = 0;
 
         // ---------------------------------------------------------------
         // client<->broker TLS/AEAD (Task 7) — server-role handshake state.
@@ -1232,6 +1301,9 @@ private:
         // ConnectResponse{HandshakeFailed} and creates no session — never
         // installs all-zero keys.
         bool        cryptoFailed = false;
+        // Fix round 2: non-zero = answer ConnectResponse{refuseCode} on the
+        // resolved reply publication and create NO session (explicit refusal).
+        uint16_t    refuseCode = 0;
     };
 
     // -----------------------------------------------------------------------
@@ -1382,7 +1454,7 @@ private:
     void drainPendingAcks();
 
     // -----------------------------------------------------------------------
-    // G0.1: enqueueOrBestEffort_ — THE single reliable-egress primitive.
+    // G0.1: sendReliable_ — THE single reliable-egress primitive.
     //
     // Tries to deliver already-encoded bytes via offerBytes_(session).  On
     // back-pressure (offer <= 0) copies the bytes onto the pendingResponses_
@@ -1394,13 +1466,52 @@ private:
     // this function so the "no silent drop on back-pressure" invariant holds on
     // all paths (inline, worker, deferred acks=All, redirects).
     //
-    // `len` must be <= PendingResp::kMaxBytes; oversized frames (rare long
-    // redirect URLs) are sent best-effort (they cannot fit the fixed ring slot).
+    // No-hang fix round 2 (I1): any size; per-session FIFO (a session with
+    // spilled answers spills every new one behind them); spill full → the
+    // session is expired explicitly (expireForSpill_), never best-effort.
     //
     // Single-writer: duty-cycle thread only.
     // -----------------------------------------------------------------------
-    void enqueueOrBestEffort_(Session& session, const uint8_t* buf, std::size_t len);
-    void sendSubscribeAnswer_(Session& session, const uint8_t* buf, std::size_t len);
+    void sendReliable_(Session& session, const uint8_t* buf, std::size_t len);
+    void expireForSpill_(Session& session);
+    void serviceSpillExpiring_(int64_t nowNs);
+    [[nodiscard]] Session* largestSpiller_();
+    // Fix round 4 (N8): the intrusive READY list of Spilled sessions.
+    void linkSpillReady_(Session& s) noexcept;
+    void unlinkSpillReady_(Session& s) noexcept;
+    // Fix round 4 (N8): O(1) "would an offer be accepted now?" — Aeron refuses
+    // an offer only at position >= positionLimit (or not connected).
+    [[nodiscard]] bool spillWritable_(const Session& s) const noexcept;
+    // Fix round 4 (N9): a frame of an Expiring session is dropped (counted) —
+    // never executed; true = dropped.
+    [[nodiscard]] bool dropExpiringFrame_(const uint8_t* buf, std::size_t len);
+    // GB-3 / fix round 4 (N9): a session's subscriptions (and the owning
+    // workers' cursors) end — at close, and once its Expiring state is serviced.
+    void dropSessionSubscriptions_(int64_t sid);
+    // An answer to a client request: reliable (sendReliable_) on a real
+    // session; an egress-less injected test session goes through sendTo (its
+    // capture hook).
+    void sendAnswer_(Session& session, const uint8_t* buf, std::size_t len);
+    // No-hang wave (R2): answer the request in buf[0..len) with its OWN
+    // response type carrying `code` (RequestRejection.h) on the header's
+    // correlationId — a header-decodable request on a known session is never
+    // dropped.  Produce goes through sendRespReliable_ (version-gated frame);
+    // every other answer through sendAnswer_ (queued under
+    // back-pressure).  Returns false — after noteUnanswerable_ — only when the
+    // header does not decode, the session is unknown, or the request type has
+    // no response (fire-and-forget).  Cold path; zero allocation.
+    bool rejectRequest_(const uint8_t* buf, std::size_t len, uint16_t code, const char* why);
+    bool answerRejection_(Session& session, const rune::protocol::client::MessageHeader& hdr,
+                          uint16_t code, const char* why, const uint8_t* buf, std::size_t len);
+    // No-hang fix rounds 4-5 (item 8 / N23): make a pre-v5 client's
+    // UnknownMember true — evict the request's own (group, member) (the group
+    // for OffsetFetch); session-wide only when the body is undecodable.
+    void evictOldClientMember_(Session& session, uint16_t tid, const uint8_t* buf, std::size_t len,
+                               int64_t nowNs);
+    // The only frames that may go unanswered (undecodable header, unknown
+    // session, no response type): counted, warn-logged rate-limited (first,
+    // then every 1024th — never a per-frame log on the produce path).
+    void noteUnanswerable_(const uint8_t* buf, std::size_t len, const char* why);
     // Task 13 fix round 1: shard-mode session lifecycle helpers.
     /// Worker ack-table slots in use or about to be (I2): accepted sessions +
     /// closes not yet queued on every worker + pending connects whose
@@ -1408,6 +1519,10 @@ private:
     [[nodiscard]] std::size_t shardSessionSlotsInUse_() const noexcept;
     /// A dropped pending connect whose announcement began → close everywhere.
     void closeDroppedPendingConnect_(const PendingConnect& pending);
+    void failPendingHandshake_(std::deque<PendingConnect>::iterator it, int64_t correlationId);
+    bool offerOnPub_(aeron::ExclusivePublication& pub, const uint8_t* buf, std::size_t len);
+    bool offerHostResolve_(PendingConnect& pending);
+    bool offerHandshakeFailed_(PendingConnect& pending);
     /// Task 19: retry the per-worker crypto-key SessionAnnounce (second
     /// wave) for every session in pendingCryptoAnnounces_ a full worker ring
     /// refused earlier. A session closed/expired in the meantime is dropped
@@ -1494,7 +1609,7 @@ private:
     // -----------------------------------------------------------------------
     // G0.1: sendRespReliable_ — private production implementation.
     // Encodes a ProduceResponse into scratch_ and routes it through
-    // enqueueOrBestEffort_.  Always returns true (never silently drops).
+    // sendReliable_.  Always returns true (never silently drops).
     // Returns false only on encode error (shouldn't happen given static_assert).
     //
     // NOTE: The public 4-param sendRespReliable() delegates here using
@@ -1585,6 +1700,7 @@ private:
     uint32_t                                     sessionProduceCredits_ = kDefaultSessionProduceCredits;
     std::size_t                                  creditBlockedSessions_ = 0;   // sessions with produceInFlight >= budget
     std::size_t                                  capDeferredSessions_ = 0;     // sessions with capDeferredOn >= 0 (R3)
+    std::size_t                                  expiringSessions_ = 0;        // fix round 4/5 (N9, N20): sessions Expiring (exact)
     uint64_t                                     creditProduceAborts_   = 0;   // ABORTs for want of credit
     uint64_t                                     produceCreditUnderflows_ = 0; // Credit beyond in-flight (invariant breach; clamped)
     // D8c fix round 1 (MAJOR-1): forwarded, unclaimed produces per worker (all sessions).
@@ -2115,6 +2231,51 @@ public:
     /// pause happened; warn so it shows at the perf log level).  Call once the
     /// control thread is joined.
     void logProducePauseStats() const;
+    /// Fix round 3: the periodic no-hang stats line (duty thread; on change).
+    bool logNoHangStatsIfChanged_(int64_t nowNs);
+    bool logNoHangStatsForTest(int64_t nowNs) { return logNoHangStatsIfChanged_(nowNs); }
+    static constexpr int64_t kNoHangStatsLogNs = 10'000'000'000LL;   // 10 s
+    [[nodiscard]] int64_t nextNoHangStatsLogNsForTest() const noexcept { return nextNoHangStatsLogNs_; }
+    // No-hang wave stats (fix round 2): requests answered with an error instead
+    // of dropped, frames that could not be answered, spill expiries.  Read on
+    // the duty thread (or after it joined); logged with logProducePauseStats.
+    struct NoHangStats {
+        uint64_t    rejectedRequests   = 0;
+        uint64_t    unanswerableFrames = 0;
+        uint64_t    spillExpiries      = 0;
+        uint64_t    spillExpiryDrops   = 0;
+        std::size_t spilledAnswers     = 0;
+        std::size_t spillUsedBytes     = 0;
+        uint64_t    spillExpiryNotified   = 0;
+        uint64_t    spillExpiryNotifyLost = 0;
+        std::size_t spillExpiring         = 0;
+        uint64_t    expiringIngressDrops  = 0;   // fix round 4 (N9): frames of an Expiring session dropped
+        // Fix round 5 (N21 / N23 / Disconnect): pre-v5 group errors answered
+        // UnknownMember (+ the session-wide evictions among them), and Expiring
+        // sessions finalized by the client's own Disconnect.
+        uint64_t    oldClientUnknownMember       = 0;
+        uint64_t    oldClientSessionWideEvictions = 0;
+        uint64_t    spillExpiryClientLeft        = 0;
+    };
+    /// Fix round 4 (item 6 / N11): the periodic line's change detector — the
+    /// COUNTERS compared one by one (the round-3 XOR signature missed changes
+    /// that cancelled out); gauges (spilledAnswers / bytes / expiring) excluded.
+    [[nodiscard]] static bool noHangCountersDiffer(const NoHangStats& a, const NoHangStats& b) noexcept {
+        return a.rejectedRequests != b.rejectedRequests || a.unanswerableFrames != b.unanswerableFrames ||
+               a.spillExpiries != b.spillExpiries || a.spillExpiryDrops != b.spillExpiryDrops ||
+               a.spillExpiryNotified != b.spillExpiryNotified ||
+               a.spillExpiryNotifyLost != b.spillExpiryNotifyLost ||
+               a.expiringIngressDrops != b.expiringIngressDrops ||
+               a.oldClientUnknownMember != b.oldClientUnknownMember ||
+               a.oldClientSessionWideEvictions != b.oldClientSessionWideEvictions ||
+               a.spillExpiryClientLeft != b.spillExpiryClientLeft;
+    }
+    [[nodiscard]] NoHangStats noHangStats() const noexcept {
+        return NoHangStats{rejectedRequests_, unanswerableFrames_, spillExpiries_, spillExpiryDrops_,
+                           egressSpill_.records(), egressSpill_.usedBytes(), spillExpiryNotified_,
+                           spillExpiryNotifyLost_, expiringSessions_, expiringIngressDrops_,
+                           oldClientUnknownMemberAnswers_, oldClientSessionWideEvictions_, spillExpiryClientLeft_};
+    }
     /// D8c test seams (control thread only).
     [[nodiscard]] uint64_t creditProduceAbortsForTest() const noexcept { return creditProduceAborts_; }
     [[nodiscard]] uint64_t produceCreditUnderflowsForTest() const noexcept { return produceCreditUnderflows_; }
@@ -2429,27 +2590,16 @@ private:
     // Single-writer: only accessed on the duty-cycle thread.
     std::unordered_map<int64_t, PartitionTxnState> partitionTxnStates_;
 
-    // -----------------------------------------------------------------------
-    // G0.1: Egress retry queue — bounded, pre-allocated, no hot-path alloc.
-    //
-    // pendingResponses_: ring buffer of encoded frames waiting for back-pressure
-    //   to clear.  Head/tail/count are maintained as plain indices (single-writer,
-    //   no CAS/atomics needed).  Capacity: kMaxPendingResponses.
-    //
-    // pendingRespHead_:  index of the first (oldest) entry; popped on drain.
-    // pendingRespCount_: number of live entries (0 = empty).
-    //
-    // When the ring is full and a new response must be enqueued, the frame is
-    // sent best-effort via sendTo (same as pre-fix behaviour) and a warning is
-    // logged.  This is a hard-stop guard — the ring should never fill in practice
-    // (back-pressure clears within a few doWork cycles under normal conditions).
-    //
-    // Single-writer: all accesses on the duty-cycle thread.
-    // -----------------------------------------------------------------------
-    static constexpr std::size_t kMaxPendingResponses = 64;
-    std::array<PendingResp, kMaxPendingResponses> pendingResponses_{};
-    std::size_t pendingRespHead_  = 0;
-    std::size_t pendingRespCount_ = 0;
+    // No-hang fix round 2 (I1): the egress spill (see kEgressSpillBytes).
+    // Single-writer: duty-cycle thread only.  Allocated once at construction.
+    rune::gateway::SpillPool egressSpill_{kEgressSpillPoolBytes};
+    std::vector<uint8_t>     spillStage_ = std::vector<uint8_t>(kMaxSpillRecordBytes);   // multi-block gather
+    Session*    spillReadyHead_     = nullptr;   // fix round 4: Spilled sessions (intrusive, Session::spill)
+    Session*    spillReadyTail_     = nullptr;
+    std::size_t spillReadySessions_ = 0;
+    std::array<SpillExpiring, kMaxSpillExpiring> spillExpiring_{};
+    std::size_t spillExpiringCount_ = 0;
+    std::size_t spillExpiringOverflow_ = 0;   // marked sessions not yet in the table (adopted on a free slot)
 
     // G0.1: session id captured at the start of handleProduce; used by the
     // public 4-param sendRespReliable() (test seam) to locate the session.
@@ -2461,6 +2611,21 @@ private:
     // egress publication.  Null (= nullptr) in production — zero overhead on
     // the hot path (one null-check).
     TestEgressFn testEgressFn_;
+
+    // No-hang wave (R2): cold-path counters + the test seam flag — kept at the
+    // END of the object so no hot member's offset moves.
+    uint64_t rejectedRequests_      = 0;       // answered with an error instead of dropped
+    uint64_t unanswerableFrames_    = 0;       // dropped: no header / no session / no response type
+    uint64_t spillExpiries_         = 0;       // sessions expired because the egress spill was full
+    uint64_t spillExpiryDrops_      = 0;       // answers to an expiring session (it gets SessionExpired)
+    uint64_t spillExpiryNotified_   = 0;       // ... whose SessionExpired was delivered
+    uint64_t spillExpiryNotifyLost_ = 0;       // ... closed at the lease deadline without delivery
+    int64_t  nextNoHangStatsLogNs_  = 0;       // fix round 3: periodic no-hang stats line
+    uint64_t expiringIngressDrops_  = 0;       // fix round 4 (N9): frames of an Expiring session dropped
+    uint64_t oldClientUnknownMemberAnswers_ = 0;   // fix round 4 (item 8): pre-v5 group errors → UnknownMember
+    uint64_t oldClientSessionWideEvictions_ = 0;   // fix round 5 (N23): ... of them with an undecodable body
+    uint64_t spillExpiryClientLeft_         = 0;   // fix round 5: Expiring sessions the client Disconnected
+    NoHangStats lastNoHangStats_{};            // fix round 4 (N11): the last logged counters
 
     // G0.1: Private test constructor (skips Aeron setup).
     // Accessed via makeForTest() only.
@@ -2476,5 +2641,9 @@ private:
                            std::function<LeaderView()> leaderView,
                            int64_t                     currentSessionId);
 };
+
+constexpr ClientGateway::SpillSizing ClientGateway::spillSizing() noexcept {
+    return SpillSizing{kEgressSpillBytes, kEgressSpillPoolBytes, kMaxSpillRecordBytes, kSessionSpillQuota};
+}
 
 } // namespace rune::gateway
