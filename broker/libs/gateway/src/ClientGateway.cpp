@@ -3052,10 +3052,15 @@ void ClientGateway::logMovedAwaySummary_()
     nextMovedAwaySummaryNs_    = nowNs_ + kMovedAwaySummaryEveryNs;
 }
 
-bool ClientGateway::movedAway_(const Subscription& sub) const noexcept
+bool ClientGateway::movedAway_(Subscription& sub) const noexcept
 {
     const GatewayReplicaView v{replicaRegistry_->lookupHandle(sub.topicId, sub.partition)};
-    if (!v) return sub.hadReplica;   // removed from this node since it was created
+    if (!v) return sub.hadReplica;   // removed from this node since it (or a sweep) saw one
+    // E2 final fix wave (M5): a subscription accepted BEFORE this node got a
+    // replica of the partition (a reassignment adding the node later) learns it
+    // here, the first time a sweep sees the registered replica — so that
+    // replica's later removal retires it instead of leaving it silent.
+    sub.hadReplica = true;
     return sub.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) &&
            !v.publishedLeader();
 }

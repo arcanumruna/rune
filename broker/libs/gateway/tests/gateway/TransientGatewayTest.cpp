@@ -969,3 +969,64 @@ TEST(TransientGatewayRegression, RoutedRoleChangesAreCoalescedIntoBoundedSweepsR
         << "SILENT STALL: a demotion coalesced into a later sweep was never caught";
     for (int k = 0; k < 20; ++k) EXPECT_FALSE(r.errors.count(5000 + k)) << "partition 0 (still led) retired";
 }
+
+// ---------------------------------------------------------------------------
+// E2 final fix wave (final review M5): `hadReplica` was captured only at
+// subscribe time.  A subscription accepted BEFORE this node got a replica of
+// the partition (here: a DISK topic served from its Log with no replica
+// registered yet; a reassignment then adds this node) was never retired when
+// that replica was later removed — it went silent.  The sweep now records the
+// replica the first time it sees it.  RED: the removal retired nothing.
+// ---------------------------------------------------------------------------
+TEST(TransientGatewayRegression, SubscriptionAcceptedBeforeItsReplicaIsRetiredWhenTheReplicaIsRemovedRegression) {
+    TempDir dir;
+    rune::node::TopicSpec ts;
+    ts.name = "inventory"; ts.partitionCount = 1; ts.topicId = 0;   // a DISK topic
+    TopicRegistry registry(std::vector<rune::node::TopicSpec>{ts}, dir.path.string());
+    rune::replication::NullPartitionTransport transport;
+    rune::node::ReplicaRegistry reg;
+    std::map<int64_t, int16_t> errors;
+    std::map<int64_t, pc::SubscribeResponse> subscribed;
+    auto onFrame = [&](const uint8_t* b, std::size_t n) {
+        const auto h = pc::MessageHeader::decode(b, n);
+        if (!h) return;
+        if (static_cast<pc::TemplateId>(h->templateId) == pc::TemplateId::ErrorResponse) {
+            if (auto r = pc::ErrorResponse::decode(b, n)) errors[r->correlationId] = r->code;
+        } else if (static_cast<pc::TemplateId>(h->templateId) == pc::TemplateId::SubscribeResponse) {
+            if (auto r = pc::SubscribeResponse::decode(b, n)) subscribed[r->correlationId] = *r;
+        }
+    };
+    ClientGateway gw = ClientGateway::makeForTest([&](const uint8_t* b, std::size_t n) -> int64_t { onFrame(b, n); return 1; }, 1);
+    gw.setTopicRegistry(&registry);
+    gw.setReplicaRegistry(&reg);
+    gw.setCommittedMetadataReady(true);
+    gw.setOnEgressFrame([&](int64_t, const uint8_t* b, std::size_t n) { onFrame(b, n); });
+    const int64_t sid = gw.injectTestSession(0);
+    pc::Subscribe s;
+    s.sessionId = sid; s.correlationId = 77; s.topicId = 0; s.partition = 0;
+    s.partitionKnown = 1; s.fromOffset = 0; s.isolation = 0;
+    std::vector<uint8_t> buf(s.encodedSize());
+    buf.resize(s.encode(buf.data()));
+    gw.applySubscribeForTest(buf.data(), buf.size());
+    ASSERT_TRUE(subscribed.count(77)) << "precondition: served from the Log with no replica registered";
+
+    // A reassignment adds this node: its replica of the partition is registered.
+    PartitionConfig c;
+    c.topicId = 0; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+    c.replicaLagMaxOffset = 1'000'000'000; c.replicaLagMaxMs = 600'000;
+    auto rep = std::make_unique<PartitionReplica>(c, Role::Leader, 1, std::vector<int32_t>{1}, std::vector<int32_t>{1},
+                                                  registry.log(0, 0), &transport);
+    rep->setExternalFollowerFlush(true);
+    reg.add(0, 0, std::move(rep));
+    for (int64_t i = 0; i < 4 * ClientGateway::kMovedAwayScanEveryCyclesForTest; ++i) gw.pushSubscriptionsForTest();
+    EXPECT_FALSE(errors.count(77)) << "retired while its replica is still here";
+
+    // ... and later moves it away again.
+    reg.remove(0, 0);
+    for (int64_t i = 0; i < 4 * ClientGateway::kMovedAwayScanEveryCyclesForTest && !errors.count(77); ++i)
+        gw.pushSubscriptionsForTest();
+    ASSERT_TRUE(errors.count(77))
+        << "SILENT STALL: a subscription accepted before its replica existed was never retired on the removal";
+    EXPECT_EQ(errors[77], kNotLeader);
+    EXPECT_EQ(gw.readCommittedSubscriptionsMovedAway(), 1u);
+}

@@ -2137,7 +2137,8 @@ private:
     /// Moved-away verdict for one plain subscription during a sweep: true when
     /// this node can no longer serve it — its replica was removed (any
     /// isolation) or, read_committed, it is no longer a published leader.
-    [[nodiscard]] bool movedAway_(const Subscription& sub) const noexcept;
+    /// M5: also records hadReplica the first time it sees a registered replica.
+    [[nodiscard]] bool movedAway_(Subscription& sub) const noexcept;
     int  pumpMarkerQueue_();
     // D9 (see TxnMarkerChannel).
     TxnMarkerChannel txnMarkerChannel_{};
