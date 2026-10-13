@@ -105,7 +105,7 @@ term   := [tag u16][primType u8][op u8: 1=Eq, 2=In][count u8 (Eq: 1; In: 1..64)]
 
 - `worldId == x` (u32) takes 2 + 5 + 4 = **11 bytes**.
 - The largest legal filter is bounded at 2 + 8 × (5 + 64 × 16) = 8,234 bytes, the widest value being a 16-byte `FixedStr`. The encoder checks the whole Subscribe frame against the transport's maximum message length. A filter that cannot fit fails explicitly before anything is sent, which follows the existing `std::length_error` rule for Subscribe.
-- **In the wire message:** `Subscribe` (templateId 18) gains a second variable-length field after `key`, a `u16` length prefix followed by the filter bytes. The field is present only when the session's client version is 8 or higher (`kClientVersionFilter`; v7 is taken by E2's PartitionDataReset).
+- **In the wire message:** `Subscribe` (templateId 18) gains a second variable-length field after `key`, a `u16` length prefix followed by the filter bytes. The field is present only when the session's client version is at least `kClientVersionFilter` (the next version at implementation time; v7 is taken by E2, and authentication may take the one after).
   - A v8 client sends a zero length for "no filter".
   - `JoinGroup` gains the same trailing filter field for v8, so the coordinator can enforce one filter per group (§13.3).
   - Older clients and brokers never see the field.
