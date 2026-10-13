@@ -48,7 +48,7 @@ std::string uniqueDir(const char* prefix) {
            "_" + std::to_string(g_ctr.fetch_add(1));
 }
 
-enum class SubMode { OkAfterOneNotLeader, AlwaysNotLeader, Silent, MovesAfterBind };
+enum class SubMode { OkAfterOneNotLeader, AlwaysNotLeader, Silent, MovesAfterBind, MovesMidBatch };
 
 struct SubGateway {
     std::atomic<int> subscribesSeen{0};
@@ -139,7 +139,10 @@ struct SubGateway {
                                          std::string_view{}, v.sessionId, v.correlationId);
             if (n > 0) send(replyBuf, n);
         } else if (k == 2) {
-            pushRecords(10, 3, 2, v.sessionId, v.correlationId);
+            // MovesMidBatch: the new leader's batch STRADDLES the resume position
+            // (offsets 0..4, position 3) — it is pushed whole.
+            if (mode == SubMode::MovesMidBatch) pushRecords(10, 0, 5, v.sessionId, v.correlationId);
+            else                                pushRecords(10, 3, 2, v.sessionId, v.correlationId);
         }
     }
 
@@ -164,7 +167,7 @@ struct SubGateway {
             if (!opt) return;
             const int k = subscribesSeen.fetch_add(1) + 1;
             if (mode == SubMode::Silent) return;
-            if (mode == SubMode::MovesAfterBind) { movesAfterBind(*opt, k); return; }
+            if (mode == SubMode::MovesAfterBind || mode == SubMode::MovesMidBatch) { movesAfterBind(*opt, k); return; }
             std::size_t n;
             if (mode == SubMode::AlwaysNotLeader || k == 1) {
                 n = rcc::encodeErrorResponse(replyBuf, sizeof(replyBuf),
@@ -316,5 +319,30 @@ TEST(SubscribeNotLeaderRegression, BoundSubscriptionAnsweredNotLeaderMovesFromIt
     EXPECT_EQ(r.errors.load(), 0);
     ASSERT_FALSE(r.gw->unsubscribedIds.empty()) << "the old instance was not released";
     EXPECT_EQ(r.gw->unsubscribedIds.front(), 9);
+    sub.unsubscribe();
+}
+
+// Rune E2 Task 13 fix round 1: the moved subscription resumes at position 3,
+// but the new leader pushes the WHOLE batch containing it (offsets 0..4 —
+// brokers never split a batch).  Records 0..2 were already delivered: they
+// must not reach the handler again.  RED: 0..2 were delivered twice (8 records).
+TEST(SubscribeNotLeaderRegression, MovedSubscriptionDropsTheStraddlingBatchBelowItsPositionRegression) {
+    Rig r("snl_e", 4740, 4741, SubMode::MovesMidBatch, 60'000);
+    std::atomic<uint32_t> seenMask{0};
+    std::atomic<int>      seen{0};
+    auto sub = r.subscribe(Isolation::ReadCommitted, [&](const Record& rec) {
+        if (rec.offset >= 0 && rec.offset < 32) seenMask.fetch_or(1u << rec.offset);
+        seen.fetch_add(1);
+    });
+    bool moved = false;
+    for (int i = 0; i < 2500 && !moved; ++i) {
+        r.gw->poll(16);
+        moved = sub.subscriptionId() == 10 && sub.position() == 5;
+        if (!moved) std::this_thread::sleep_for(2ms);
+    }
+    ASSERT_TRUE(moved) << "id " << sub.subscriptionId() << ", position " << sub.position();
+    for (int i = 0; i < 50; ++i) { r.gw->poll(16); std::this_thread::sleep_for(2ms); }   // let any duplicate land
+    EXPECT_EQ(seen.load(), 5) << "records below the resume position were delivered again";
+    EXPECT_EQ(seenMask.load(), 0x1Fu);
     sub.unsubscribe();
 }

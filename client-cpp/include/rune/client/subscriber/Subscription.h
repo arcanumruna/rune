@@ -181,6 +181,10 @@ struct SubscriptionImpl {
     SubscriptionFailReason failReason = SubscriptionFailReason::None;  // set before a failing finish
     uint16_t brokerErrorCode = 0;  // RejectedByBroker: the broker's error code
     int64_t nextOffset     = 0;  // lastDelivered + 1 (CB-5 resume point)
+    // E2 Task 13: the resume position of a moved subscription (rearmMovedAway);
+    // the new leader pushes the WHOLE batch containing it, so that first batch's
+    // records below it (already delivered) are dropped.  One-shot; -1 = none.
+    int64_t resumeFloor    = -1;
     bool    active         = true;  // false once unsubscribed / timed out / closed
     bool    statusDirty    = false; // a snapshot newer than the last published one exists
     // F8a fix2: an Unsubscribe the transport refused, retried by the duty cycle.

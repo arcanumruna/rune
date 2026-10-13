@@ -477,6 +477,19 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
         return; // Malformed batch — drop (never crash).
     }
 
+    // E2 Task 13 fix round 1: the first batch after a move may STRADDLE the
+    // resume position (brokers push whole batches) — its records below it were
+    // delivered before the move: never twice.  One-shot (the first batch only);
+    // a batch entirely below it is not one the resume asked for (a reset /
+    // restarted transient log's new data) and is delivered.  No allocation.
+    int64_t dropBelow = -1;
+    if (impl.resumeFloor >= 0) [[unlikely]] {
+        const int64_t base = reader.baseOffset();
+        const int64_t last = base + static_cast<int64_t>(reader.lastOffsetDelta());
+        if (base < impl.resumeFloor && last >= impl.resumeFloor) dropBelow = impl.resumeFloor;
+        impl.resumeFloor = -1;
+    }
+
     const int64_t before = impl.nextOffset;
     dispatching_ = &impl;
     reader.forEach([&](std::string_view keyView,
@@ -487,6 +500,7 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
         // The handler may have unsubscribed this subscription (directly, on
         // this thread): deliver nothing more of the batch.
         if (!impl.active) return;
+        if (absOffset < dropBelow) [[unlikely]] return;   // delivered before the move
 
         Record rec;
         rec.offset    = absOffset;
@@ -661,6 +675,7 @@ bool SubscriberHub::rearmMovedAway(int64_t correlationId, int64_t newCorrId, int
         activeById_.erase(it);
         impl.correlationId  = newCorrId;
         impl.subscriptionId = 0;   // pending again until the leader binds it
+        impl.resumeFloor    = impl.nextOffset > 0 ? impl.nextOffset : -1;
         pendingByCorrelation_.emplace(newCorrId, std::move(req));
         ++subscriptionsMoved_;
         publishStatus_(impl);
