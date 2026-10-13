@@ -1143,3 +1143,31 @@ TEST(TransientLineageClusterRegression, IdentityRotationReconfirmsTheLineageWith
     EXPECT_LT(ms, 10'000) << "re-confirmation took " << ms << " ms";
     std::printf("[R2] re-confirmed after %lld ms, %d NotLeader answer(s)\n", static_cast<long long>(ms), pending);
 }
+
+// E2 final fix wave, residual round 6 (fix-on-sight): in SHARD mode the
+// controller's answer to a user replica's lineage report reaches it through
+// the worker's AlterIsrResponse op, which carries no leaderId — the replica's
+// "is this answer mine" check never matched, so its report stayed pending
+// (re-sent forever) and a later identity rotation re-sent an UNBORN report
+// (a false re-mint).  Once the coordinator serves the committed offset (the
+// lineage is confirmed), the leader replica's report is no longer pending.
+// RED (leaderId left -1): still pending after the confirmation.
+TEST(TransientLineageClusterRegression, ShardModeLeaderSeesItsLineageConfirmationRegression) {
+    GroupCluster g;
+    for (int i = 0; i < 3; ++i) g.start(i);
+    ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
+    ShardTestClient c(g.cdir.path);
+    c.setClientVersion(rune::protocol::client::kClientVersion);
+    const int leader = g.partitionLeader(c);
+    ASSERT_GE(leader, 0);
+    const int64_t sidL = c.connect(gatewayChannel(g.ports, leader), kClientStream);
+    ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, leader), kClientStream, sidL, 0, 0, 1, makeBatch(4)));
+    ASSERT_TRUE(commitOffset(g, c, "lg-ack", 4));   // committable: the lineage is confirmed
+    bool pending = true;
+    for (int k = 0; k < 100 && pending; ++k) {
+        pending = g.nodes[leader]->onOwnerThreadForTest(
+            0, 0, [](rune::replication::PartitionReplica& r) { return r.lineageReportPendingForTest(); });
+        if (pending) std::this_thread::sleep_for(50ms);   // the answer's round trip (poll interval)
+    }
+    EXPECT_FALSE(pending) << "the leader never matched the controller's lineage confirmation (shard mode)";
+}

@@ -482,7 +482,7 @@ TEST(LeaderEpochFenceRegression, RotatedIdentityIsReportedAgainByATransientLeade
     r->doWork(now += 1'000'000);
     const auto reps = lineageReports(t);
     ASSERT_EQ(reps.size(), before + 1) << "no lineage report under the rotated identity";
-    const auto& m = reps.back();
+    const AlterIsrMsg m = reps.back();
     const int64_t id = static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(m.isr[4])) << 32) |
                                             static_cast<uint32_t>(m.isr[3]));
     EXPECT_EQ(id, 0x0C0C) << "the re-report carried the OLD identity";
@@ -501,4 +501,38 @@ TEST(LeaderEpochFenceRegression, RotatedIdentityIsReportedAgainByATransientLeade
     f->rotateLineageIdentity(0x0D0D);
     EXPECT_EQ(f->lineageIdentityForTest(), 0x0D0D);
     EXPECT_FALSE(f->lineageReportPendingForTest());
+}
+
+// E2 final fix wave, residual round 6 — F3: a rotation that lands while the
+// leadership's lineage report is still UNCONFIRMED keeps that report's data
+// source (a promoted follower's: the epoch it fetched from) and changes only
+// the identity — re-sending with the leader's own epoch would MINT instead of
+// KEEP (a false "none").  RED: the re-sent report carried src = its own epoch.
+TEST(LeaderEpochFenceRegression, RotationBeforeConfirmationKeepsThePendingReportsSourceRegression) {
+    Dir d;
+    rune::storage::InMemoryLog log(1 << 20, 10'000);
+    CapturingTransport t;
+    auto r = memReplica(log, t);
+    r->setLineageIdentity(0x0B0B);
+    r->setLeaderEpochFenceFile((d.path / "fence-0-0").string());
+    r->becomeFollower(7, /*leaderId=*/2);
+    FetchResponseMsg resp{};
+    resp.leaderEpoch = 7; resp.partition = 0; resp.highWatermark = 0; resp.logStartOffset = 0;
+    resp.errorCode = kErrNone; resp.topicId = 0; resp.records = {};
+    r->applyReplicated(resp);   // the data is epoch 7's
+    r->becomeLeader(8, kAll);   // promoted: reports src 7 (KEEP)
+    int64_t now = 1'000'000'000;
+    r->doWork(now);
+    ASSERT_EQ(lineageReports(t).back().isr[2], 7);
+    ASSERT_TRUE(r->lineageReportPendingForTest()) << "precondition: not confirmed yet";
+    r->rotateLineageIdentity(0x0C0C);
+    r->doWork(now += 1'000'000);   // re-sent at once (not after the resend cadence)
+    const auto reps = lineageReports(t);
+    ASSERT_GE(reps.size(), 2u) << "the pending report was not re-sent under the new identity";
+    const AlterIsrMsg m = reps.back();
+    const int64_t id = static_cast<int64_t>((static_cast<uint64_t>(static_cast<uint32_t>(m.isr[4])) << 32) |
+                                            static_cast<uint32_t>(m.isr[3]));
+    EXPECT_EQ(id, 0x0C0C) << "the pending report kept the old identity";
+    EXPECT_EQ(m.isr[2], 7) << "the rotation rewrote the pending report's source (KEEP would become a MINT)";
+    EXPECT_EQ(m.leaderEpoch, 8);
 }

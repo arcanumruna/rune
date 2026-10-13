@@ -3233,8 +3233,16 @@ void PartitionReplica::rotateLineageIdentity(int64_t id) noexcept
 {
     if (id == 0 || id == lineageIdentity_) return;
     lineageIdentity_ = id;
-    if (memoryBacked_ && isrChannel_ != nullptr && cfg_.topicId >= 0 && role_ == Role::Leader)
-        lineageReport_ = LineageReport{true, epoch_, lineageSrcEpoch_, false, 0};   // re-confirm under `id`
+    if (!(memoryBacked_ && isrChannel_ != nullptr && cfg_.topicId >= 0 && role_ == Role::Leader)) return;
+    if (lineageReport_.pending && lineageReport_.epoch == epoch_) {
+        // Round 6 (F3): a report of this leadership is still unconfirmed — keep
+        // ITS data source (becomeLeader already advanced lineageSrcEpoch_ to
+        // epoch_: re-sending with it would turn a KEEP into a MINT, a false
+        // "none"); only the identity changes, re-sent at once.
+        lineageReport_.sent = false;
+        return;
+    }
+    lineageReport_ = LineageReport{true, epoch_, lineageSrcEpoch_, false, 0};   // re-confirm under `id`
 }
 
 int PartitionReplica::sendLineageReport_(int64_t nowNs)
