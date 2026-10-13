@@ -4,15 +4,18 @@
 // (binary-wide), so it lives in its own binary (rune_transient_alloc_regression_tests).
 #include "TransientRig.h"
 
+#include <rune/node/RcState.h>
+
 #include <execinfo.h>
 #include <cstdio>
 #include <cstdlib>
 #include <new>
 
-// Heap allocations made by THIS thread while armed; the first few print a
-// backtrace so the culprit is named.
-thread_local bool     gAllocArmed  = false;
-thread_local uint64_t gArmedAllocs = 0;
+// Heap allocations made while armed; the first few print a backtrace so the
+// culprit is named.  The worker is driven by hand on the test thread (no other
+// thread runs while armed), so plain globals suffice (no thread_local).
+bool     gAllocArmed  = false;
+uint64_t gArmedAllocs = 0;
 void* operator new(std::size_t n) {
     if (gAllocArmed) [[unlikely]] {
         if (++gArmedAllocs <= 3) {
@@ -62,4 +65,59 @@ TEST(TransientDataPathRegression, SteadyStateProduceEvictAndPushReadNeverAllocat
         drainReads();
     }
     EXPECT_EQ(gArmedAllocs, 0u) << "a steady-state transient pass allocated (see the backtraces above)";
+}
+
+// E2 Task 12 fix round 2 (review I1): the memory-backed RC rebuild remembers the
+// producers with an in-ring marker in a FIXED-capacity O(1) set — never a
+// growing vector scanned linearly.  More producers than it holds: the rebuild
+// allocates nothing, the ones it could not remember are pinned at the ring start
+// (the conservative side of the finding-B ruling) and counted; the others open
+// at their own batch.
+TEST(TransientDataPathRegression, RingRebuildWithMoreProducersThanTheMarkerSetNeverAllocatesRegression) {
+    constexpr int     kProducers = static_cast<int>(rune::node::RcState::kRingMarkedPidsCapacity) + 76;
+    constexpr int64_t kPid0      = 1000;
+    rune::storage::InMemoryLog mem(16u << 20, 100'000);
+    mem.resetTo(10);   // the ring starts above 0: an unmarked producer's first batch is not provably its txn's first
+    auto put = [&](const std::vector<uint8_t>& b) {
+        int64_t base = -1;
+        const int32_t d = rune::protocol::RecordBatchReader(b.data(), b.size()).lastOffsetDelta();
+        EXPECT_GE(mem.appendNoSyncRestamp(b.data(), b.size(), d, base), 0);
+        return base;
+    };
+    for (int p = 0; p < kProducers; ++p) {   // every producer: a whole committed txn ...
+        put(batchOf(1, 10, kPid0 + p, 0, 0, /*txn=*/true));
+        put(rune::transaction::ControlMarker::build(kPid0 + p, 0, rune::transaction::ControlType::Commit, 0));
+    }
+    std::vector<int64_t> second(kProducers);
+    for (int p = 0; p < kProducers; ++p)      // ... then a new, open txn
+        second[static_cast<std::size_t>(p)] = put(batchOf(1, 10, kPid0 + p, 0, 1, true));
+    const int64_t ringStart = mem.logStartOffset();
+    ASSERT_EQ(ringStart, 10);
+
+    rune::node::RcState rc;
+    rc.reserve(4 * kProducers);
+    rc.reserveRingRebuild();
+    const std::size_t setBytes = rc.ringMarkedPids().slotBytes();
+    rune::node::RcFacts f;
+    f.leader = true; f.epoch = 1;
+    gArmedAllocs = 0;
+    gAllocArmed  = true;
+    (void)rc.advance(f, nullptr, rune::node::RcState::kDefaultScanBytesPerPass, &mem);
+    gAllocArmed  = false;
+    ASSERT_TRUE(rc.ready());
+    EXPECT_EQ(gArmedAllocs, 0u) << "the ring rebuild allocated (see the backtraces above)";
+    EXPECT_EQ(rc.ringMarkedPids().slotBytes(), setBytes) << "the marker set grew";
+    EXPECT_EQ(rc.ringMarkedPids().size(), rune::node::RcState::kRingMarkedPidsCapacity);
+    EXPECT_EQ(rc.ringMarkedPidsOverflows(), 76u);
+    int own = 0, pinned = 0;
+    for (int p = 0; p < kProducers; ++p) {
+        const int64_t first = rc.tracker().firstOffsetOf(kPid0 + p);
+        if (first == second[static_cast<std::size_t>(p)]) ++own;
+        else if (first == ringStart) ++pinned;
+        else ADD_FAILURE() << "producer " << p << " opened at " << first;
+    }
+    EXPECT_EQ(own, static_cast<int>(rune::node::RcState::kRingMarkedPidsCapacity))
+        << "a remembered producer's txn opens at its own batch";
+    EXPECT_EQ(pinned, 76) << "an overflowed producer is pinned at the ring start (conservative)";
+    EXPECT_EQ(rc.lso(INT64_MAX), ringStart);
 }

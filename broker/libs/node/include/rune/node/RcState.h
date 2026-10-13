@@ -116,6 +116,62 @@ struct RcFacts {
     int32_t  epoch                = 0;
 };
 
+/// A fixed-capacity open-addressing set of producer ids (>= 0): linear probing at
+/// load <= 1/2, O(1) membership, no allocation after reserve() and never past its
+/// capacity — an insert into a full set is refused (the caller decides the policy).
+/// Cold-path helper of the memory-backed RC rebuild (E2 Task 12, finding B).
+class FixedPidSet {
+public:
+    enum class Insert : uint8_t { Inserted, Present, Full };
+    void reserve(std::size_t maxPids) {
+        std::size_t slots = 1;
+        while (slots < 2 * maxPids) slots <<= 1;
+        slots_.assign(slots, kEmpty);
+        mask_ = slots - 1;
+        max_  = maxPids;
+        n_    = 0;
+    }
+    void clear() noexcept {
+        if (n_ != 0) std::fill(slots_.begin(), slots_.end(), kEmpty);
+        n_ = 0;
+    }
+    [[nodiscard]] bool contains(int64_t pid) const noexcept {
+        if (max_ == 0) return false;
+        for (std::size_t i = hash_(pid) & mask_;; i = (i + 1) & mask_) {
+            if (slots_[i] == pid) return true;
+            if (slots_[i] == kEmpty) return false;
+        }
+    }
+    Insert insert(int64_t pid) noexcept {
+        if (max_ == 0) return Insert::Full;
+        for (std::size_t i = hash_(pid) & mask_;; i = (i + 1) & mask_) {
+            if (slots_[i] == pid) return Insert::Present;
+            if (slots_[i] == kEmpty) {
+                if (n_ == max_) return Insert::Full;
+                slots_[i] = pid;
+                ++n_;
+                return Insert::Inserted;
+            }
+        }
+    }
+    [[nodiscard]] std::size_t size() const noexcept { return n_; }
+    [[nodiscard]] std::size_t capacity() const noexcept { return max_; }
+    [[nodiscard]] std::size_t slotBytes() const noexcept { return slots_.capacity() * sizeof(int64_t); }
+
+private:
+    static constexpr int64_t kEmpty = -1;
+    static std::size_t hash_(int64_t pid) noexcept {   // splitmix64 finaliser
+        uint64_t x = static_cast<uint64_t>(pid) + 0x9E3779B97F4A7C15ull;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        return static_cast<std::size_t>(x ^ (x >> 31));
+    }
+    std::vector<int64_t> slots_;
+    std::size_t          mask_ = 0;
+    std::size_t          max_  = 0;
+    std::size_t          n_    = 0;
+};
+
 class RcState {
 public:
     /// Per-pass build budget (bytes parsed per advance step).  Set from
@@ -124,8 +180,10 @@ public:
     /// p99 16.6 µs @16 KiB, 18.4 µs @32 KiB, 21.9 µs @64 KiB → 32 KiB.
     static constexpr int32_t     kDefaultScanBytesPerPass = 32 * 1024;
     static constexpr std::size_t kTailReserve             = 256;
-    /// Distinct producers with a marker in the ring, per memory-backed rebuild (cold).
-    static constexpr std::size_t kRingMarkedPidsReserve   = 256;
+    /// Distinct producers with a marker in the ring one memory-backed rebuild can
+    /// remember (fixed capacity; past it a producer counts as "no marker seen" —
+    /// pinned at the ring start, the conservative side — and the overflow is counted).
+    static constexpr std::size_t kRingMarkedPidsCapacity  = 1024;
     /// Read-ahead depth: request (async FADVISE / sync MADV_WILLNEED) this many
     /// budgets beyond the cursor (m7).
     static constexpr std::size_t kReadAheadBudgets        = 8;
@@ -170,8 +228,11 @@ public:
         aborted_.reserve(rune::transaction::AbortedTxnIndex::kDefaultReservedRanges);
         tail_.reserve(kTailReserve);
         residency_.reserve(static_cast<std::size_t>(kDefaultScanBytesPerPass) / 4096 + 2);
-        ringMarkedPids_.reserve(kRingMarkedPidsReserve);
     }
+    /// Cold (ownership apply), MEMORY-BACKED partitions only: the ring rebuild's
+    /// fixed-capacity producer set (a disk partition never pays for it).  Without
+    /// it every producer counts as unmarked (conservative pins, overflows counted).
+    void reserveRingRebuild(std::size_t maxPids = kRingMarkedPidsCapacity) { ringMarkedPids_.reserve(maxPids); }
     void setResidencyProbe(RcResidencyProbe fn, void* ctx) noexcept { probeFn_ = fn; probeCtx_ = ctx; }
     /// F15 S5 (§2.5, I3): the owning worker's producer state for THIS partition.
     /// The build feeds it from the same pass (RcBuilder::step): data batches as
@@ -601,8 +662,10 @@ private:
     // it at its own offset, as before.  A transaction ALL of whose batches were
     // evicted leaves nothing in the ring to rebuild from: unrecoverable (its
     // producer is unknown — UnknownProducerId on its next produce — and
-    // read_committed follows the evicted-cursor rule).  `ringMarkedPids_` is
-    // reserved (cold path; a growth is counted).
+    // read_committed follows the evicted-cursor rule).  `ringMarkedPids_` is a
+    // fixed-capacity O(1) set (reserveRingRebuild): never allocates; a producer
+    // it cannot hold counts as unmarked — pinned at the ring start, the
+    // conservative side — and the overflow is counted.
     std::size_t rebuildRcFromRing_(rune::storage::InMemoryLog& ring) {
         using namespace rune::protocol::batch;
         rune::transaction::RcBuilder builder(&tracker_, &aborted_);
@@ -620,13 +683,10 @@ private:
                 const auto attrs = static_cast<uint16_t>(r.attributes());
                 const int64_t pid = r.producerId();
                 if (pid >= 0 && (attrs & static_cast<uint16_t>(kAttrControl)) != 0) {
-                    if (std::find(ringMarkedPids_.begin(), ringMarkedPids_.end(), pid) == ringMarkedPids_.end()) {
-                        if (ringMarkedPids_.size() == ringMarkedPids_.capacity()) [[unlikely]] ++ringMarkedPidsGrowths_;
-                        ringMarkedPids_.push_back(pid);
-                    }
+                    if (ringMarkedPids_.insert(pid) == FixedPidSet::Insert::Full) [[unlikely]]
+                        ++ringMarkedPidsOverflows_;
                 } else if (pid >= 0 && (attrs & static_cast<uint16_t>(kAttrTransactional)) != 0 &&
-                           tracker_.firstOffsetOf(pid) < 0 &&
-                           std::find(ringMarkedPids_.begin(), ringMarkedPids_.end(), pid) == ringMarkedPids_.end()) {
+                           tracker_.firstOffsetOf(pid) < 0 && !ringMarkedPids_.contains(pid)) {
                     tracker_.onProduceBatch(pid, ringStart);   // conservative pin; the step below keeps it
                     ++ringPinnedTxns_;
                 }
@@ -650,7 +710,7 @@ private:
     int64_t cleanerLsoPublished_ = std::numeric_limits<int64_t>::min();   ///< D3b: last value published
     rune::transaction::AbortedTxnIndex aborted_;
     std::vector<TailEvent>             tail_;
-    std::vector<int64_t>               ringMarkedPids_;   ///< E2 finding B: pass-local, reserved
+    FixedPidSet                        ringMarkedPids_;   ///< E2 finding B: pass-local, fixed capacity
 #if defined(__APPLE__)
     std::vector<char>                  residency_;   ///< mincore vector (pre-reserved)
 #else
@@ -678,10 +738,11 @@ private:
     uint64_t    nonResidentSteps_ = 0;
     uint64_t    probeErrors_      = 0;
     uint64_t    ringPinnedTxns_        = 0;   ///< E2 finding B: open txns pinned at the ring start
-    uint64_t    ringMarkedPidsGrowths_ = 0;
+    uint64_t    ringMarkedPidsOverflows_ = 0;   ///< producers the fixed set could not hold (pinned conservatively)
 public:
     [[nodiscard]] uint64_t ringPinnedTxns() const noexcept { return ringPinnedTxns_; }
-    [[nodiscard]] uint64_t ringMarkedPidsGrowths() const noexcept { return ringMarkedPidsGrowths_; }
+    [[nodiscard]] uint64_t ringMarkedPidsOverflows() const noexcept { return ringMarkedPidsOverflows_; }
+    [[nodiscard]] const FixedPidSet& ringMarkedPids() const noexcept { return ringMarkedPids_; }
 };
 
 } // namespace rune::node

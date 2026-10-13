@@ -5218,6 +5218,7 @@ private:
             if (!slot.rc) {
                 slot.rc = std::make_unique<RcState>();
                 slot.rc->reserve(rcOpenTxnCapacity_);
+                if (!r->isDiskBacked()) slot.rc->reserveRingRebuild();   // E2: memory-backed only
                 slot.rc->setResidencyProbe(rcProbeFn_, rcProbeCtx_);
                 // F15 S5 (I3): the build rebuilds THIS worker's producer state.
                 slot.rc->bindProducerState(&psm_, r->topicId(), static_cast<int32_t>(r->partitionId()));

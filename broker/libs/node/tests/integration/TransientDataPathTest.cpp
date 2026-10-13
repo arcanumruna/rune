@@ -351,6 +351,7 @@ TEST(TransientDataPathRegression, RcRingRebuildPinsAnOpenTxnWhoseFirstBatchWasEv
 
     rune::node::RcState rc;
     rc.reserve(64);
+    rc.reserveRingRebuild();
     rune::node::RcFacts f;
     f.leader = true; f.epoch = 1;
     (void)rc.advance(f, nullptr, rune::node::RcState::kDefaultScanBytesPerPass, &mem);
