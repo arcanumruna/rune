@@ -1,5 +1,6 @@
 // conformance/gen_vectors.cpp
-// One-shot generator: produces all 13 golden .bin files in conformance/vectors/.
+// Generator for the golden .bin files in conformance/vectors/ (not the cg1_* / v0 /
+// record_batch ones, which have their own generators or are hand-pinned).
 // Run once, commit the output, then delete (or keep) this file.
 // The harness (ConformanceTest.cpp) only READS the committed vectors.
 //
@@ -20,6 +21,7 @@
 #include "rune/protocol/client/ControlMessages.h"
 #include "rune/protocol/client/DataMessages.h"
 #include "rune/protocol/client/PingMessages.h"
+#include "rune/protocol/client/SchemaMessages.h"
 
 namespace rpc = rune::protocol::client;
 
@@ -380,6 +382,78 @@ int main(int argc, char** argv) {
         write_vec(dir, "unsubscribe.bin", buf, n);
     }
 
-    std::printf("Done. 18 vectors written to %s/\n", dir);
+    // -----------------------------------------------------------------------
+    // Catalog history (client version 8) — CatalogDdlMessagesTest.cpp builds the
+    // same frames (CatalogDdlConformance.*Golden).
+    // -----------------------------------------------------------------------
+    // 18. define_topic_v8.bin — DefineTopic + persistence + rf + config + ext
+    {
+        rpc::DefineTopic m;
+        m.sessionId = kSessionId; m.correlationId = kCorrelationId;
+        m.topicName = "events"; m.partitionCount = 4; m.persistence = 0; m.replicationFactor = 3;
+        m.config.retentionMs = 60'000; m.config.cleanupPolicy = 1; m.config.partitionKey = "k";
+        m.hasExt = true; m.ext.statement = "topic events partitions 4 replicas 3;"; m.ext.clientName = "cli";
+        m.ext.requestId = {.hi = 0xC11E, .lo = 77};
+        m.ext.hasReplayedFrom = 1; m.ext.replayedClusterId = "src"; m.ext.replayedOffset = 5;
+        n = m.encode(buf);
+        if (n == 0) { std::fprintf(stderr, "define_topic_v8: encode failed\n"); return 1; }
+        write_vec(dir, "define_topic_v8.bin", buf, n);
+    }
+    // 19. drop_topic.bin
+    {
+        rpc::DropTopic m;
+        m.sessionId = kSessionId; m.correlationId = kCorrelationId; m.topicName = "t";
+        m.ext.statement = "drop topic t;"; m.ext.clientName = "cli"; m.ext.requestId = {.hi = 1, .lo = 9};
+        n = m.encode(buf);
+        if (n == 0) { std::fprintf(stderr, "drop_topic: encode failed\n"); return 1; }
+        write_vec(dir, "drop_topic.bin", buf, n);
+    }
+    // 20. alter_topic_config.bin — one change: retention.ms (key 1) = 60000
+    {
+        const rpc::ConfigChangeWire change{1, 60'000};
+        uint8_t changes[rpc::configChangesEncodedSize(1)];
+        rpc::putConfigChanges(changes, std::span<const rpc::ConfigChangeWire>(&change, 1));
+        rpc::AlterTopicConfig m;
+        m.sessionId = kSessionId; m.correlationId = kCorrelationId;
+        m.topicName = "events"; m.expectedVersion = 2; m.changes = changes;
+        m.ext.statement = "ALTER TOPIC events SET (retention.ms=60000)"; m.ext.clientName = "cli";
+        m.ext.requestId = {.hi = 1, .lo = 10};
+        n = m.encode(buf);
+        if (n == 0) { std::fprintf(stderr, "alter_topic_config: encode failed\n"); return 1; }
+        write_vec(dir, "alter_topic_config.bin", buf, n);
+    }
+    // 21. drop_view.bin
+    {
+        rpc::DropView m;
+        m.sessionId = kSessionId; m.correlationId = kCorrelationId; m.viewName = "v";
+        m.ext.statement = "drop view v;"; m.ext.clientName = "cli"; m.ext.requestId = {.hi = 1, .lo = 11};
+        n = m.encode(buf);
+        if (n == 0) { std::fprintf(stderr, "drop_view: encode failed\n"); return 1; }
+        write_vec(dir, "drop_view.bin", buf, n);
+    }
+    // 22. alter_view.bin — plan blob DE AD BE EF
+    {
+        static constexpr uint8_t kPlan[] = {0xDE, 0xAD, 0xBE, 0xEF};
+        rpc::AlterView m;
+        m.sessionId = kSessionId; m.correlationId = kCorrelationId;
+        m.viewName = "v"; m.keyField = "id"; m.persistence = 0; m.expectedVersion = 1;
+        m.planBlob = kPlan; m.planLen = sizeof(kPlan);
+        m.ext.statement = "alter view v;"; m.ext.clientName = "cli"; m.ext.requestId = {.hi = 1, .lo = 12};
+        n = m.encode(buf);
+        if (n == 0) { std::fprintf(stderr, "alter_view: encode failed\n"); return 1; }
+        write_vec(dir, "alter_view.bin", buf, n);
+    }
+    // 23. ddl_response.bin
+    {
+        rpc::DdlResponse r;
+        r.sessionId = kSessionId; r.correlationId = kCorrelationId;
+        r.errorCode = 39; r.objectId = 12; r.newVersion = 3; r.gateTopicId = 5;
+        r.detail = "replicationFactor 5 > broker count 3";
+        n = r.encode(buf);
+        if (n == 0) { std::fprintf(stderr, "ddl_response: encode failed\n"); return 1; }
+        write_vec(dir, "ddl_response.bin", buf, n);
+    }
+
+    std::printf("Done. 25 vectors written to %s/\n", dir);
     return 0;
 }

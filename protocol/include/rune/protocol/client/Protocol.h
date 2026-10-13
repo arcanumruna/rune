@@ -86,6 +86,12 @@ enum class TemplateId : uint16_t {  // reserved ranges: control 1-15, produce/co
     CreateViewResponse   = 71,
     GetViewRow           = 72,
     ViewRowResponse      = 73,
+    // catalog history (client version 8): the remaining DDL ops, all answered by DdlResponse
+    DropTopic            = 74,
+    AlterTopicConfig     = 75,
+    DropView             = 76,
+    AlterView            = 77,
+    DdlResponse          = 78,
 };
 
 enum class ErrorCode : uint16_t {
@@ -243,7 +249,28 @@ inline constexpr int32_t kClientVersionMovedPositionNote          = 6;
 //     not the partition's current lineage, the retriable NotLeader while the
 //     lineage is unknown, and serves it otherwise.  No format change.
 inline constexpr int32_t kClientVersionLineageNote                = 7;
-inline constexpr int32_t kClientVersion                           = 7;   // what this protocol's client announces
+// 8 — catalog history: DDL extension trailer (statement, clientName, 128-bit
+//   requestId, replayedFrom), DefineTopic replicationFactor + topic config,
+//   DropTopic/AlterTopicConfig/DropView/AlterView (74–77) answered by
+//   DdlResponse (78).  DDL to a broker that is not the `__catalog` leader is
+//   answered ErrorResponse{Redirect, leader client endpoint}; a leader change,
+//   a catching-up leader, a commit that did not complete in time or
+//   `__catalog` below minIsr answers NotLeader (retriable; the retry with the
+//   same requestId is deduplicated); a broker whose catalog apply halted
+//   answers Internal.  Any DDL may be answered ErrorResponse{InvalidRequest,
+//   detail} (e.g. replicationFactor bounds, a requestId reused for a
+//   different statement).  A session below 8 never receives a Redirect for
+//   DDL: on a broker that is not the catalog leader its
+//   DefineTopic/AlterTopic/CreateView is answered in its own response type
+//   with InvalidRequest (client too old for cluster DDL routing; upgrade).
+//   (A session below 8 never receives DdlResponse: it never sends 74–77.)
+inline constexpr int32_t kClientVersionCatalog                    = 8;
+inline constexpr int32_t kClientVersion                           = 8;   // what this protocol's client announces
+
+// Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
+// the `__catalog` log (catalog history) from ANY broker — see DataMessages.h
+// above `struct Subscribe` for the caught-up marker.
+inline constexpr int32_t kCatalogTopicId                          = -6;
 
 // ---------------------------------------------------------------------------
 // Broker versions (ConnectResponse.brokerVersion, an additive trailing field;
@@ -286,6 +313,13 @@ inline constexpr int32_t kBrokerVersion                           = 4;   // what
 /// transient lineage note and may send a lineage claim (see version 7).
 [[nodiscard]] constexpr bool clientUnderstandsLineageNote(int32_t clientVersion) noexcept {
     return clientVersion >= kClientVersionLineageNote;
+}
+
+/// True when a session that connected with `clientVersion` speaks catalog
+/// DDL (version 8): the DDL extension, 74–78 and a DDL Redirect.  Below 8 a
+/// non-leader broker answers its DDL InvalidRequest in its own response type (F37).
+[[nodiscard]] constexpr bool clientUnderstandsCatalogDdl(int32_t clientVersion) noexcept {
+    return clientVersion >= kClientVersionCatalog;
 }
 
 /// The produce error code a session that connected with `clientVersion` is

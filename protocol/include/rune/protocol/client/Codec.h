@@ -99,6 +99,29 @@ inline std::size_t putVarStr(uint8_t* buf, std::string_view s) noexcept {
                        static_cast<uint16_t>(s.size()));
 }
 
+/// String with a 32-bit length prefix (e.g. a DDL statement, which can exceed
+/// 64 KiB).  The caller checks s.size() <= UINT32_MAX first (never truncates
+/// silently: see SchemaMessages.h fits()).
+inline std::size_t putVarStr32(uint8_t* buf, std::string_view s) noexcept {
+    return putVarBytes32(buf, reinterpret_cast<const uint8_t*>(s.data()),
+                         static_cast<uint32_t>(s.size()));
+}
+
+/// Decodes a 32-bit-length var-bytes field as a string_view; false if truncated.
+inline bool getVarStr32(const uint8_t* buf, std::size_t avail, std::size_t& pos,
+                        std::string_view& out) noexcept {
+    const uint8_t* data = nullptr;
+    uint32_t       len  = 0;
+    if (!getVarBytes32(buf, avail, pos, data, len)) return false;
+    out = std::string_view(reinterpret_cast<const char*>(data), len);
+    return true;
+}
+
+/// Wire-width checks for a length-prefixed field: encoders of frames with these
+/// checks return 0 (explicit failure) instead of truncating an oversize field.
+[[nodiscard]] constexpr bool fitsVarLen16(std::size_t n) noexcept { return n <= 0xFFFFu; }
+[[nodiscard]] constexpr bool fitsVarLen32(std::size_t n) noexcept { return n <= 0xFFFFFFFFu; }
+
 /// String convenience — decodes a var-bytes field as a string_view.
 inline bool getVarStr(const uint8_t* buf, std::size_t avail, std::size_t& pos,
                       std::string_view& out) noexcept {

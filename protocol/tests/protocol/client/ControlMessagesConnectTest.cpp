@@ -804,7 +804,7 @@ TEST(HandshakeContinueResponse, TemplateIdIsEleven) {
 // kProtocolVersion (the MessageHeader wire version) stays at 3.
 // ---------------------------------------------------------------------------
 TEST(VersionGates, ClientBrokerVersionBumpedProtocolVersionUnchanged) {
-    EXPECT_EQ(rpc::kClientVersion, 7);   // v7: transient lineage note + claim (v6: TransientLogFull)
+    EXPECT_EQ(rpc::kClientVersion, 8);   // v8: catalog history DDL (v7: transient lineage note + claim)
     EXPECT_EQ(rpc::kBrokerVersion, 4);
     EXPECT_EQ(rpc::kClientVersionCrypto, 4);
     EXPECT_EQ(rpc::kBrokerVersionCrypto, 4);

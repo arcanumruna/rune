@@ -308,6 +308,13 @@ struct ProduceResponse {
 //
 // Total = 24 + 18 + 2 + key.size()
 //       = 44 + key.size()
+//
+// Catalog history (client version 8): Subscribe{topicId = kCatalogTopicId
+// (−6), partition 0, partitionKnown 1} reads `__catalog` from ANY broker,
+// served from that broker's replica up to its high watermark.  After the
+// committed backlog the broker pushes ONE Records frame with baseOffset = its
+// HW and an EMPTY records payload — the caught-up marker (catalog
+// subscriptions only); live events follow as they commit.
 // ---------------------------------------------------------------------------
 struct Subscribe {
     int64_t  sessionId      = 0;

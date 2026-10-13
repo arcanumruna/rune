@@ -753,12 +753,23 @@ TEST(DispatchCheckFrame, KnownTemplateSeventyThree) {
     EXPECT_EQ(fc.templateId, 73u);
 }
 
-TEST(DispatchCheckFrame, UnknownTemplateSeventyFour) {
-    // 74 = first unassigned id in schema/view range after ViewRowResponse=73
-    auto buf = makeValidHeaderBuf(74);
+TEST(DispatchCheckFrame, KnownTemplatesSeventyFourToSeventyEight) {
+    // 74..78 = DropTopic..DdlResponse (catalog history, client version 8 — F1:
+    // without them the broker gateway's checkFrame drops every new DDL frame)
+    for (uint16_t tid = 74; tid <= 78; ++tid) {
+        auto buf = makeValidHeaderBuf(tid);
+        const auto fc = rpc::checkFrame(buf.data(), buf.size());
+        EXPECT_EQ(fc.status, rpc::FrameStatus::Ok) << "tid=" << tid;
+        EXPECT_EQ(fc.templateId, tid);
+    }
+}
+
+TEST(DispatchCheckFrame, UnknownTemplateSeventyNine) {
+    // 79 = first unassigned id in schema/view range after DdlResponse=78
+    auto buf = makeValidHeaderBuf(79);
     const auto fc = rpc::checkFrame(buf.data(), buf.size());
     EXPECT_EQ(fc.status, rpc::FrameStatus::UnknownTemplate);
-    EXPECT_EQ(fc.templateId, 74u);
+    EXPECT_EQ(fc.templateId, 79u);
 }
 
 TEST(DispatchCheckFrame, UnknownTemplateNinetyNine) {
@@ -924,15 +935,16 @@ TEST(DispatchIsKnownTemplate, KnownBoundaries) {
     EXPECT_TRUE(rpc::isKnownTemplate(10));
     EXPECT_TRUE(rpc::isKnownTemplate(11));
 
-    // 0b/0c schema + view-engine range: 64..73 must all be known
-    // (DefineTopic..AlterTopicResponse 64..69; CreateView..ViewRowResponse 70..73, Task 18).
-    for (uint16_t tid = 64; tid <= 73; ++tid) {
+    // 0b/0c schema + view-engine range + catalog DDL: 64..78 must all be known
+    // (DefineTopic..AlterTopicResponse 64..69; CreateView..ViewRowResponse 70..73, Task 18;
+    //  DropTopic..DdlResponse 74..78, catalog history).
+    for (uint16_t tid = 64; tid <= 78; ++tid) {
         EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
     }
 
     // Not known: 0, 12..15 (unassigned control gap after HandshakeContinue{,Response}),
     //            22..31 (unassigned produce/consume gap),
-    //            55..63 (unassigned groups/txn gap after TX-1), 74+ (unassigned schema/view gap),
+    //            55..63 (unassigned groups/txn gap after TX-1), 79+ (unassigned schema/view gap),
     //            65535.
     EXPECT_FALSE(rpc::isKnownTemplate(0));
     EXPECT_FALSE(rpc::isKnownTemplate(12));
@@ -940,6 +952,9 @@ TEST(DispatchIsKnownTemplate, KnownBoundaries) {
     EXPECT_FALSE(rpc::isKnownTemplate(22));
     EXPECT_FALSE(rpc::isKnownTemplate(31));
     EXPECT_FALSE(rpc::isKnownTemplate(55));
-    EXPECT_FALSE(rpc::isKnownTemplate(74));
+    for (uint16_t tid = 74; tid <= 78; ++tid) {
+        EXPECT_TRUE(rpc::isKnownTemplate(tid)) << "tid=" << tid;
+    }
+    EXPECT_FALSE(rpc::isKnownTemplate(79));
     EXPECT_FALSE(rpc::isKnownTemplate(65535));
 }
