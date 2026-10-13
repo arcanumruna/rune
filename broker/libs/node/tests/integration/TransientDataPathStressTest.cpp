@@ -77,6 +77,7 @@ struct Step {
     K        k     = K::Produce;
     mx::Op   op    = mx::Op::ProduceAcks0;   // Produce: which produce row (acks byte = mx::wireAcks)
     uint8_t  iso   = 0;                      // Read
+    uint8_t  who   = 0;                      // ProduceTxn / Marker: which transactional producer (0 or 1)
     Cur      cur   = Cur::Offset;            // Read
     bool     flag  = false;                  // Marker: commit; Restart: into an uncommitted topic
     int32_t  recs  = 1;                      // Produce
@@ -88,8 +89,8 @@ std::string str(const Step& s) {
     std::ostringstream o;
     switch (s.k) {
     case K::Produce:    o << "produce " << mx::name(s.op) << " recs=" << s.recs << " bytes=" << s.bytes; break;
-    case K::ProduceTxn: o << "produceTxn"; break;
-    case K::Marker:     o << "marker " << (s.flag ? "COMMIT" : "ABORT"); break;
+    case K::ProduceTxn: o << "produceTxn" << (s.who ? " p1" : ""); break;
+    case K::Marker:     o << "marker " << (s.flag ? "COMMIT" : "ABORT") << (s.who ? " p1" : ""); break;
     case K::Fetch:      o << "followerFetch maxBytes=" << s.raw; break;
     case K::Read:
         o << "pushRead iso=" << int(s.iso) << " cursor="
@@ -107,7 +108,7 @@ std::string str(const Step& s) {
 
 // Trace builders (the Regression tests below pin minimal traces with them).
 Step produce(mx::Op op, int recs, int bytes) { Step s; s.k = K::Produce; s.op = op; s.recs = recs; s.bytes = bytes; return s; }
-Step op(K k, bool flag = false) { Step s; s.k = k; s.flag = flag; return s; }
+Step op(K k, bool flag = false, uint8_t who = 0) { Step s; s.k = k; s.flag = flag; s.who = who; return s; }
 Step fetch(uint32_t maxBytes) { Step s; s.k = K::Fetch; s.raw = maxBytes; return s; }
 Step read(uint8_t iso, Cur cur, uint32_t raw = 0) { Step s; s.k = K::Read; s.iso = iso; s.cur = cur; s.raw = raw; return s; }
 
@@ -249,11 +250,21 @@ private:
     int64_t     leo_ = 0, hw_ = 0, ringStart_ = 0;
     std::size_t maxLen_ = 0;        // largest batch ever appended (bounds wrap padding)
     Own         own_ = Own::Owned;
-    int64_t     pid_ = kPidBase;
-    int32_t     seq_ = 0;
-    bool        txnOpen_ = false;
-    std::optional<bool> decision_;  // the coordinator's commit/abort, retried until it lands
-    std::optional<bool> markerRetry_;   // a LANDED marker answered NotLeader (moved before its HW): re-sent
+    // Two concurrent transactional producers (review M2): each holds exactly its own state.
+    struct Producer {
+        int64_t pid = -1;
+        int32_t seq = 0;
+        bool    txnOpen = false;
+        std::optional<bool>    decision;      // the coordinator's commit/abort, retried until it lands
+        std::optional<bool>    markerRetry;   // a LANDED marker answered NotLeader (moved before its HW): re-sent
+        bool                   lost = false;               // see producerLost below
+        bool                   forgotten = false;          // the open txn was forgotten by the last rebuild
+        bool                   reinitAfterAbort = false;   // the client aborts the forgotten txn, then re-inits
+        std::optional<int64_t> pin;                        // the finding-B ring-start pin of the last rebuild
+    };
+    static constexpr std::size_t kTxnProducers = 2;
+    std::array<Producer, kTxnProducers> prods_{};
+    int64_t     nextPid_ = kPidBase;
     bool        justRestarted_ = false;
     std::optional<Step> refusedUncommitted_;   // R2: the produce the client retries after the commit
     int64_t     fStart_ = 0, fLeo_ = 0;
@@ -267,23 +278,19 @@ private:
     // ring: an IDLE transactional producer (no open transaction) none of whose data batches
     // is left there is unknown to the new owner — its next produce may answer
     // UnknownProducerId (28) / OutOfOrderSequence (20; a marker alone carries no sequence).
-    // Kafka parity: retention drops an idle producer's state; the client re-inits (KIP-360).
-    // An OPEN transaction with a batch still in the ring stays known and pinned (ruling
-    // "finding B", option (c)): no allowance.  An open transaction ALL of whose batches were
-    // evicted is unrecoverable (the ruling's documented case): the rebuilt state forgets it
-    // (read_committed follows the evicted-cursor rule, its LSO pin is gone) and its next
-    // transactional produce may be refused 28/20 — the client aborts, then re-inits.
-    bool        producerLost_ = false;
-    bool        openForgotten_ = false;      // the open txn was forgotten by the last rebuild
-    bool        reinitAfterAbort_ = false;   // the client aborts the forgotten txn, then re-inits
-    // Finding-B ruling, option (c): a rebuild that finds an open transaction in the ring whose
-    // first in-ring batch is not provably its first (ring start > 0 and no marker of its
-    // producer earlier in the ring) pins it at the ring start of that moment until it resolves.
-    std::optional<int64_t> rebuildPin_;
+    // producerLost: Kafka parity — retention drops an idle producer's state; the client
+    // re-inits (KIP-360).  An OPEN transaction with a batch still in the ring stays known and
+    // pinned (ruling "finding B", option (c)): no allowance.  An open transaction ALL of whose
+    // batches were evicted is unrecoverable (the ruling's documented case): the rebuilt state
+    // forgets it (read_committed follows the evicted-cursor rule, its LSO pin is gone) and its
+    // next transactional produce may be refused 28/20 — the client aborts, then re-inits.
+    // pin: a rebuild that finds an open transaction in the ring whose first in-ring batch is
+    // not provably its first (ring start > 0 and no marker of its producer earlier in the
+    // ring) pins it at the ring start of that moment until it resolves.
     int64_t     lastFetch_ = -1, hwAtLastFetch_ = 0, hwAtStepStart_ = 0, leoAtLastFetch_ = -1;
     int64_t     incarnation_ = 1;   // follower 2's process incarnation
 
-    struct Pending { enum Kind : uint8_t { AcksAll, Marker } kind; int64_t id; int64_t base; int64_t end; bool commit = false; };
+    struct Pending { enum Kind : uint8_t { AcksAll, Marker } kind; int64_t id; int64_t base; int64_t end; bool commit = false; uint8_t who = 0; };
     std::vector<Pending> pending_;                      // answers owed once the HW passes `end`
     std::set<int64_t>    heldReads_;                    // read_committed reads held while the RC state builds
     std::map<int64_t, std::pair<int16_t, int64_t>> produceAns_;   // corr  -> (code, base)
@@ -329,9 +336,10 @@ private:
             s.raw = rng();
             return s;
         }
-        if (p < 870) { s.k = K::ProduceTxn; return s; }
+        if (p < 870) { s.k = K::ProduceTxn; s.who = std::bernoulli_distribution(0.5)(rng) ? 1 : 0; return s; }
         s.k = K::Marker;
         s.flag = std::bernoulli_distribution(0.5)(rng);
+        s.who = std::bernoulli_distribution(0.5)(rng) ? 1 : 0;
         return s;
     }
 
@@ -347,9 +355,8 @@ private:
         batches_.clear(); pending_.clear(); heldReads_.clear();
         produceAns_.clear(); readAns_.clear(); markerAns_.clear();
         leo_ = hw_ = ringStart_ = 0;
-        seq_ = 0; txnOpen_ = false; decision_.reset(); markerRetry_.reset(); refusedUncommitted_.reset();
-        producerLost_ = openForgotten_ = reinitAfterAbort_ = false;
-        rebuildPin_.reset();
+        refusedUncommitted_.reset();
+        for (Producer& P : prods_) P = Producer{nextPid_++};   // a (re)started client: a fresh producer
         inIsr_ = true; lastFetch_ = -1; hwAtLastFetch_ = 0; hwAtStepStart_ = 0; leoAtLastFetch_ = -1;
     }
     /// Follower 2 as a fresh process: an empty ring of the same (node-wide) size, a new incarnation.
@@ -459,26 +466,28 @@ private:
         case K::Reown:
             if (own_ != Own::Disowned) break;
             setOwned(true); passDrain(4); own_ = Own::Owned;
-            if (std::none_of(batches_.begin() + static_cast<std::ptrdiff_t>(firstHeldIdx(ringStart_)), batches_.end(),
-                             [&](const MBatch& b) { return b.pid == pid_ && b.fate != Fate::Control; })) {
-                producerLost_ = true;
-                if (txnOpen_) { openForgotten_ = true; ++d_.openTxnAllEvicted; }
-            } else if (txnOpen_ && ringStart_ > 0) {
-                bool markerFirst = false;   // a marker of this producer before its first in-ring open batch
-                for (std::size_t i = firstHeldIdx(ringStart_); i < batches_.size(); ++i) {
-                    const MBatch& b = batches_[i];
-                    if (b.pid != pid_) continue;
-                    if (b.fate == Fate::Control) { markerFirst = true; continue; }
-                    if (b.fate == Fate::Open) break;
+            for (Producer& P : prods_) {   // what the rebuilt state can know of each producer
+                if (std::none_of(batches_.begin() + static_cast<std::ptrdiff_t>(firstHeldIdx(ringStart_)),
+                                 batches_.end(),
+                                 [&](const MBatch& b) { return b.pid == P.pid && b.fate != Fate::Control; })) {
+                    P.lost = true;
+                    if (P.txnOpen) { P.forgotten = true; ++d_.openTxnAllEvicted; }
+                } else if (P.txnOpen && ringStart_ > 0) {
+                    bool markerFirst = false;   // a marker of this producer before its first in-ring open batch
+                    for (std::size_t i = firstHeldIdx(ringStart_); i < batches_.size(); ++i) {
+                        const MBatch& b = batches_[i];
+                        if (b.pid != P.pid) continue;
+                        if (b.fate == Fate::Control) { markerFirst = true; continue; }
+                        if (b.fate == Fate::Open) break;
+                    }
+                    if (!markerFirst) { P.pin = ringStart_; ++d_.rebuildPins; }   // each rebuild re-pins
                 }
-                if (!markerFirst) { rebuildPin_ = ringStart_; ++d_.rebuildPins; }   // each rebuild re-pins
             }
             break;
         case K::Restart:
             boot(s.flag);
             ++d_.restarts;
             if (s.flag) ++d_.uncommittedRestarts;
-            ++pid_;   // a restarted transactional client re-inits (InitProducerId): a fresh producer
             justRestarted_ = true;
             REQ(rig_->mem.logEndOffset() == 0 && rig_->mem.logStartOffset() == 0 && rig_->rep->highWatermark() == 0,
                 "restart.notEmpty", "R12: a transient topic kept data across a full restart");
@@ -531,15 +540,18 @@ private:
 
     /// One produce; returns the appended length (0 = nothing appended).
     std::size_t doProduce(const Step& s, bool txn, bool afterCommit) {
+        Producer& P = prods_[s.who % kTxnProducers];
         // The transactional client cannot add this partition to a new transaction until the
         // previous one's marker is acknowledged (CONCURRENT_TRANSACTIONS): it waits.
-        if (txn && (markerRetry_ || reinitAfterAbort_ || std::any_of(pending_.begin(), pending_.end(),
-                                                [](const Pending& p) { return p.kind == Pending::Marker; })))
+        if (txn && (P.markerRetry || P.reinitAfterAbort ||
+                    std::any_of(pending_.begin(), pending_.end(), [&](const Pending& p) {
+                        return p.kind == Pending::Marker && p.who == s.who % kTxnProducers;
+                    })))
             return 0;
         const mx::Op op = txn ? mx::Op::ProduceAcks0 : s.op;
         const uint8_t acks = mx::wireAcks(op);
         const int n = txn ? 1 : s.recs;
-        const auto batch = txn ? batchOf(1, 200, pid_, 0, seq_, /*txn=*/true)
+        const auto batch = txn ? batchOf(1, 200, P.pid, 0, P.seq, /*txn=*/true)
                                : batchOf(n, static_cast<std::size_t>(s.bytes));
         const std::size_t len = batch.size();
         const RingClass rc = ringClass(len);
@@ -576,7 +588,7 @@ private:
         int64_t base = -1;
         for (int attempt = 0; attempt < 16; ++attempt) {   // txn: NotLeader while the RC state builds (retriable)
             const int64_t c = ++corr_;
-            const auto frame = produceFrame(c, batch, acks, txn ? pid_ : -1, 0, txn ? seq_ : -1);
+            const auto frame = produceFrame(c, batch, acks, txn ? P.pid : -1, 0, txn ? P.seq : -1);
             rig_->pass(&frame);
             drain();
             code = -1;
@@ -603,6 +615,7 @@ private:
     std::size_t finishProduce(const Step& s, bool txn, bool afterCommit, const std::vector<mx::Outcome>& allowed,
                               mx::Timing t, bool appended, int16_t code, int64_t base, int64_t leoBefore, int n,
                               std::size_t len, uint32_t crc) {
+        Producer& P = prods_[s.who % kTxnProducers];
         std::size_t out = 0;
         auto body = [&]() {
             mx::Outcome got;
@@ -622,18 +635,18 @@ private:
                 REQ(code != -1, "produce.unanswered", "a refused produce was never answered (a hang)");
                 if (code == kTransientLogFull) { got = mx::Outcome::RetriableLogFull; ++d_.ringFullRefusals; }
                 else if (code == kNotLeader)   got = mx::Outcome::RetriableNotLeader;
-                else if (txn && producerLost_ && (code == 28 || code == 20)) {
+                else if (txn && P.lost && (code == 28 || code == 20)) {
                     ++d_.producerExpired;
-                    if (txnOpen_) { decision_ = false; reinitAfterAbort_ = true; }   // abort it, then re-init
-                    else { ++pid_; seq_ = 0; producerLost_ = false; }                 // re-init (KIP-360)
+                    if (P.txnOpen) { P.decision = false; P.reinitAfterAbort = true; }   // abort it, then re-init
+                    else { P = Producer{nextPid_++}; }                                   // re-init (KIP-360)
                     return;
                 }
                 else {
                     std::ostringstream o;
-                    o << "a produce answered " << code << " (txn=" << txn << " pid=" << pid_ << " seq=" << seq_
-                      << " txnOpen=" << txnOpen_ << " producerLost=" << producerLost_ << " ringStart=" << ringStart_
+                    o << "a produce answered " << code << " (txn=" << txn << " pid=" << P.pid << " seq=" << P.seq
+                      << " txnOpen=" << P.txnOpen << " producerLost=" << P.lost << " ringStart=" << ringStart_
                       << "; this producer's batches:";
-                    for (const MBatch& b : batches_) if (b.pid == pid_) o << ' ' << b.base << (b.fate == Fate::Control ? "c" : "");
+                    for (const MBatch& b : batches_) if (b.pid == P.pid) o << ' ' << b.base << (b.fate == Fate::Control ? "c" : "");
                     o << ")";
                     fail("produce.code" + std::to_string(code), o.str());
                     return;
@@ -652,11 +665,11 @@ private:
             if (got == mx::Outcome::RetriableNotLeader && own_ == Own::Uncommitted && !txn) refusedUncommitted_ = s;
             if (!appended) return;
             appendedThisStep_ = true;
-            batches_.push_back(MBatch{leoBefore, n, txn ? Fate::Open : Fate::Plain, len, crc, txn ? pid_ : -1});
+            batches_.push_back(MBatch{leoBefore, n, txn ? Fate::Open : Fate::Plain, len, crc, txn ? P.pid : -1});
             leo_ += n;
             if (!inIsr_) hw_ = leo_;   // the leader alone is the ISR
             maxLen_ = std::max(maxLen_, len);
-            if (txn) { ++seq_; txnOpen_ = true; }
+            if (txn) { ++P.seq; P.txnOpen = true; }
             out = len;
         };
         body();
@@ -664,11 +677,13 @@ private:
     }
 
     std::size_t doMarker(const Step& s) {
-        if (!txnOpen_ && !markerRetry_) return 0;   // R1/R2: no transaction includes this partition
-        if (!markerRetry_ && !decision_) decision_ = s.flag;   // the coordinator decided; it retries THAT decision
-        const bool commit = markerRetry_ ? *markerRetry_ : *decision_;
+        const uint8_t who = static_cast<uint8_t>(s.who % kTxnProducers);
+        Producer& P = prods_[who];
+        if (!P.txnOpen && !P.markerRetry) return 0;   // R1/R2: no transaction includes this partition
+        if (!P.markerRetry && !P.decision) P.decision = s.flag;   // the coordinator decided; it retries THAT decision
+        const bool commit = P.markerRetry ? *P.markerRetry : *P.decision;
         const auto bytes = rune::transaction::ControlMarker::build(
-            pid_, 0, commit ? rune::transaction::ControlType::Commit : rune::transaction::ControlType::Abort, 0);
+            P.pid, 0, commit ? rune::transaction::ControlType::Commit : rune::transaction::ControlType::Abort, 0);
         const std::size_t len = bytes.size();
         const RingClass rc = ringClass(len);
         mx::Timing t = own_ == Own::Disowned ? mx::Timing::LeaderMovesMidOp
@@ -682,7 +697,7 @@ private:
         const int64_t leoBefore = leo_;
         WorkerOp op;
         op.type = WorkerOp::Type::AppendControlRecord; op.topicId = kTopic; op.partition = 0;
-        op.correlationId = token; op.producerId = pid_;
+        op.correlationId = token; op.producerId = P.pid;
         op.recordBatchBytes = bytes;
         if (!rig_->pool.tryEnqueueOp(kTopic, 0, std::move(op))) { fail("marker.enqueue", "op ring full"); return 0; }
         for (int i = 0; i < kPassCap; ++i) {
@@ -696,7 +711,7 @@ private:
             if (appended) {
                 REQ(rig_->mem.logEndOffset() == leoBefore + 1, "marker.length", "a marker appended more than one record");
                 got = mx::Outcome::Ok;
-                pending_.push_back(Pending{Pending::Marker, token, leoBefore, leoBefore + 1, commit});   // D9: may wait for the HW
+                pending_.push_back(Pending{Pending::Marker, token, leoBefore, leoBefore + 1, commit, who});   // D9: may wait for the HW
                 ++d_.markersLanded;
             } else {
                 auto it = markerAns_.find(token);
@@ -714,17 +729,18 @@ private:
             count(t, got);
             if (!appended) return;
             appendedThisStep_ = true;
-            markerRetry_.reset();   // a re-sent marker finds no open batch: it changes no fate
-            for (MBatch& b : batches_) if (b.fate == Fate::Open) b.fate = commit ? Fate::Committed : Fate::Aborted;
-            batches_.push_back(MBatch{leoBefore, 1, Fate::Control, len, crcOf(bytes.data()), pid_});
+            P.markerRetry.reset();   // a re-sent marker finds no open batch: it changes no fate
+            for (MBatch& b : batches_)   // per producer: only ITS open batches resolve
+                if (b.fate == Fate::Open && b.pid == P.pid) b.fate = commit ? Fate::Committed : Fate::Aborted;
+            batches_.push_back(MBatch{leoBefore, 1, Fate::Control, len, crcOf(bytes.data()), P.pid});
             leo_ += 1;
             if (!inIsr_) hw_ = leo_;
             maxLen_ = std::max(maxLen_, len);
-            txnOpen_ = false;
-            decision_.reset();
-            openForgotten_ = false;
-            rebuildPin_.reset();
-            if (reinitAfterAbort_) { reinitAfterAbort_ = false; producerLost_ = false; ++pid_; seq_ = 0; }
+            P.txnOpen = false;
+            P.decision.reset();
+            P.forgotten = false;
+            P.pin.reset();
+            if (P.reinitAfterAbort) P = Producer{nextPid_++};   // the aborted client re-inits
             out = len;
         };
         body();
@@ -881,7 +897,7 @@ private:
                     // re-sends the same decision (a duplicate marker is harmless: no open batch).
                     const MBatch* m = containing(it->base);
                     REQ(m != nullptr && m->fate == Fate::Control, "marker.answer", "no marker at " << it->base);
-                    markerRetry_ = it->commit;
+                    prods_[it->who].markerRetry = it->commit;
                 } else {
                     REQ(a->second.first == kOk && a->second.second == it->base, "marker.answer",
                         "a landed marker at " << it->base << " answered (" << a->second.first << ", " << a->second.second << ")");
@@ -902,12 +918,24 @@ private:
         REQ(markerAns_.empty(), "answer.stray", "a marker answer nobody asked for (token " << markerAns_.begin()->first << ")");
     }
 
+    [[nodiscard]] const Producer* byPid(int64_t pid) const {
+        for (const Producer& P : prods_) if (P.pid == pid) return &P;
+        return nullptr;
+    }
+    [[nodiscard]] bool anyTxnOutstanding() const {
+        return std::any_of(prods_.begin(), prods_.end(), [](const Producer& P) { return P.txnOpen || P.markerRetry; });
+    }
     /// read_committed bound: the HW, pinned at the first offset of an OPEN transaction.
     [[nodiscard]] int64_t lso() const {
-        const int64_t bound = rebuildPin_ ? std::min(*rebuildPin_, hw_) : hw_;
-        for (std::size_t i = firstHeldIdx(-1); i < batches_.size(); ++i)
-            if (batches_[i].fate == Fate::Open && !openForgotten_ && batches_[i].base < hw_)
-                return std::min(bound, batches_[i].base);
+        int64_t bound = hw_;
+        for (const Producer& P : prods_) if (P.pin) bound = std::min(bound, *P.pin);
+        for (std::size_t i = firstHeldIdx(-1); i < batches_.size(); ++i) {
+            const MBatch& b = batches_[i];
+            if (b.fate != Fate::Open || b.base >= hw_) continue;
+            const Producer* P = byPid(b.pid);
+            if (P != nullptr && P->forgotten) continue;   // forgotten by the rebuild: no pin
+            return std::min(bound, b.base);
+        }
         return bound;
     }
     /// Plan, "Every cell asserts" 3: never a control batch (either isolation); read_committed
@@ -1086,15 +1114,20 @@ private:
         step_ = static_cast<int>(trace_.size());
         if (own_ == Own::Disowned) { Step s; s.k = K::Reown; exec(s); BAIL(); }
         if (own_ == Own::Uncommitted) { Step s; s.k = K::Commit; exec(s); BAIL(); }
-        for (int round = 0; round < 400 && (fLeo_ < leo_ || hw_ < leo_ || txnOpen_ || !pending_.empty()); ++round) {
+        for (int round = 0; round < 400 && (fLeo_ < leo_ || hw_ < leo_ || anyTxnOutstanding() || !pending_.empty());
+             ++round) {
             Step s;
-            if (txnOpen_ && round % 2 == 0) { s.k = K::Marker; s.flag = true; }
+            if (anyTxnOutstanding() && round % 2 == 0) {
+                s.k = K::Marker; s.flag = true;
+                s.who = (prods_[0].txnOpen || prods_[0].markerRetry) ? 0 : 1;
+            }
             else { s.k = K::Fetch; s.raw = 16384; }
             rig_->now += 100'000'000;   // past any fetch conflation window
             exec(s); BAIL();
         }
-        REQ(fLeo_ == leo_ && hw_ == leo_ && !txnOpen_, "quiesce.stall",
-            "never converged: follower " << fLeo_ << ", HW " << hw_ << ", LEO " << leo_ << ", txn open " << txnOpen_);
+        REQ(fLeo_ == leo_ && hw_ == leo_ && !anyTxnOutstanding(), "quiesce.stall",
+            "never converged: follower " << fLeo_ << ", HW " << hw_ << ", LEO " << leo_ << ", txn outstanding "
+                                         << anyTxnOutstanding());
         for (int i = 0; i < kPassCap && (!pending_.empty() || !heldReads_.empty()); ++i) { passDrain(); settleAnswers(); BAIL(); }
         REQ(pending_.empty(), "quiesce.unanswered", pending_.size() << " owed answers never arrived (a hang)");
         REQ(heldReads_.empty(), "quiesce.heldRead", heldReads_.size() << " held read_committed reads never answered");
@@ -1140,20 +1173,35 @@ std::string traceText(const std::vector<Step>& t) {
     return o.str();
 }
 
-void runSeed(uint32_t seed) {
+/// Review M1: the coverage the gate must keep — a generator change that stops reaching any
+/// of these makes the gate fail loudly instead of passing on a silently narrower run.
+std::string missingCoverage(const Dist& d) {
+    std::ostringstream o;
+    auto need = [&](const char* name, uint64_t v) { if (v == 0) o << ' ' << name; };
+    need("ringFull(42)", d.ringFullRefusals);
+    need("evictedCursor", d.evictedReads);
+    need("followerReset", d.followerResets);
+    need("leaderMove", d.leaderMoves);
+    need("restart", d.restarts);
+    need("uncommittedTopic", d.uncommittedRestarts);
+    need("openTxnPinnedAtRingStart", d.rebuildPins);
+    return o.str();
+}
+
+Dist runSeed(uint32_t seed) {
     Stress s;
     s.run(seed);
     Dist d = s.dist();
     d.seeds = 1;
     g_total.add(d);
     std::printf("[stress] seed %u: %s\n", seed, d.line().c_str());
-    if (!s.failed()) return;
+    if (!s.failed()) return d;
     const Failure f = s.failure();
     std::vector<Step> full = s.trace();
     if (f.step >= 0 && static_cast<std::size_t>(f.step) + 1 < full.size()) full.resize(static_cast<std::size_t>(f.step) + 1);
     if (std::getenv("RUNE_STRESS_NO_MINIMISE") != nullptr) {   // survey runs: the seed + step suffice
         ADD_FAILURE() << "seed " << seed << " failed at step " << f.step << " [" << f.id << "]: " << f.detail;
-        return;
+        return d;
     }
     const auto min = minimise(full, f.id);
     Stress again;
@@ -1163,6 +1211,7 @@ void runSeed(uint32_t seed) {
                   << "  -> " << (again.failed() ? "at step " + std::to_string(again.failure().step) + ": " +
                                                       again.failure().detail
                                                 : std::string("(did not reproduce)"));
+    return d;
 }
 
 class StressTotals : public ::testing::Environment {
@@ -1172,6 +1221,11 @@ public:
     void SetUp() override { spdlog::set_level(spdlog::level::err); }
     void TearDown() override {
         if (g_total.seeds > 1) std::printf("[stress] distribution: %s\n", g_total.line().c_str());
+        // A direct run of all 64 gate seeds in one process: their aggregate must cover everything.
+        if (g_total.seeds >= 64) {
+            const std::string miss = missingCoverage(g_total);
+            if (!miss.empty()) ADD_FAILURE() << "the 64 gate seeds never reached:" << miss;
+        }
     }
 };
 [[maybe_unused]] ::testing::Environment* const g_env = ::testing::AddGlobalTestEnvironment(new StressTotals);
@@ -1180,16 +1234,37 @@ class TransientDataPathStressRegression : public testing::TestWithParam<uint32_t
 
 TEST_P(TransientDataPathStressRegression, SeededModelChecked) {
     SCOPED_TRACE("seed " + std::to_string(GetParam()));
-    runSeed(GetParam());
+    const Dist d = runSeed(GetParam());
+    // Per seed (every gate seed reaches these many times over; floors > 0).
+    EXPECT_GT(d.evictedReads, 0u) << "seed " << GetParam() << " never read an evicted cursor";
+    EXPECT_GT(d.followerResets, 0u) << "seed " << GetParam() << " never reset the follower";
+    EXPECT_GT(d.leaderMoves, 0u) << "seed " << GetParam() << " never moved the ownership";
+    EXPECT_GT(d.restarts, 0u) << "seed " << GetParam() << " never restarted";
+}
+
+// Review M1, under ctest (one process per seed, so no cross-seed aggregate there): the
+// sparse coverage — 42 refusals, restarts into an uncommitted topic, finding-B ring-start
+// pins — is asserted on the aggregate of the first four gate seeds (a fixed subset: it
+// reaches each of them; a direct run of all 64 asserts the whole aggregate in TearDown).
+TEST(TransientDataPathStressRegression, CoverageFloorsOfTheGateSeedsRegression) {
+    Dist agg;
+    for (uint32_t seed = 1; seed <= 4; ++seed) agg.add(runSeed(seed));
+    EXPECT_EQ(missingCoverage(agg), "") << "the gate seeds 1-4 no longer reach these: " << agg.line();
 }
 
 INSTANTIATE_TEST_SUITE_P(Seeds, TransientDataPathStressRegression, testing::Range(1u, 65u));
 
-/// Smoke: 20 fresh random seeds per run (printed, so a failure reproduces with
-/// `--gtest_filter='*SeededModelChecked/<n>'` after adding it to the Range or via replay).
+/// Smoke: 20 fresh random seeds per run (each printed: a failure replays from its seed).
+/// NOT in the gating run (review M3: ~120 s, non-deterministic): it skips unless
+/// RUNE_STRESS_SMOKE=1 (RUNE_STRESS_SMOKE_SEEDS=N changes the count), e.g.
+///   RUNE_STRESS_SMOKE=1 rune_transient_stress_tests --gtest_filter='*Smoke*'
 TEST(TransientDataPathStressSmoke, TwentyRandomSeeds) {
+    if (std::getenv("RUNE_STRESS_SMOKE") == nullptr)
+        GTEST_SKIP() << "opt-in: RUNE_STRESS_SMOKE=1 (not part of the gating run)";
+    const char* n = std::getenv("RUNE_STRESS_SMOKE_SEEDS");
+    const int seeds = n != nullptr ? std::max(1, std::atoi(n)) : 20;
     std::random_device rd;
-    for (int i = 0; i < 20; ++i) {
+    for (int i = 0; i < seeds; ++i) {
         const uint32_t seed = rd();
         SCOPED_TRACE("random seed " + std::to_string(seed));
         runSeed(seed);
