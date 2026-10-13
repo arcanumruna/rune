@@ -1059,3 +1059,46 @@ TEST(TransientGatewayRegression, LegacyPushClassifiesATransientSubscriptionOnceP
     ASSERT_TRUE(r.awaitProduced(r.produce(sid, 2)).has_value());
     ASSERT_TRUE(r.pushUntil(before + 1)) << "the cached classification stopped delivery";
 }
+
+// ---------------------------------------------------------------------------
+// E2 final fix wave (final review I1) — the broker half of the cross-layer
+// cell "a plain moved subscription x a lagging new-leader HW".  After a
+// failover the new leader's HW lags (it starts from its follower HW, one fetch
+// round behind).  The client re-arms its moved subscription at its position
+// (here 3); the leader clamps the explicit offset DOWN to its HW (0) and, once
+// the HW moves, pushes from there — batches wholly below the position.  Those
+// are re-deliveries: the client's sticky resume floor drops every one of them
+// (rune-client-cpp SubscribeNotLeaderRegression.MovedSubscriptionDropsABatch-
+// WhollyBelowItsPosition / ...FloorHoldsAcrossALaggingLeadersBatches — the
+// client half, driven by exactly this push pattern).
+// ---------------------------------------------------------------------------
+TEST(TransientGatewayRegression, ReArmedSubscriptionAboveALaggingHwIsPushedFromTheHwRegression) {
+    Rig r(RigOpts{.withFollower = true});   // ISR {1,2}: the HW waits for follower 2
+    const int64_t sid = r.gw.injectTestSession(0);
+    for (int i = 0; i < 3; ++i) ASSERT_EQ(r.awaitProduced(r.produce(sid, 1, /*acks=*/0)).value().errorCode, kOk);
+    for (int i = 0; i < 4; ++i) r.pass();
+    ASSERT_EQ(r.rep->logEndOffset(), 3);
+    ASSERT_EQ(r.rep->gatewayHighWatermark(), 0) << "precondition: the new leader's HW lags its log";
+
+    r.subscribe(sid, /*fromOffset=*/3, 301);   // the moved subscription's position on the old leader
+    ASSERT_EQ(r.subscribed.at(301).errorCode, kOk);
+    EXPECT_EQ(r.gw.subscriptionNextOffsetForTest(r.subscribed[301].subscriptionId), 0)
+        << "an explicit offset above the HW is clamped down to it";
+
+    // Follower 2 catches up: the HW reaches the log end; the leader pushes from 0.
+    rune::node::WorkerOp op;
+    op.type = rune::node::WorkerOp::Type::FetchRequest; op.topicId = 0; op.partition = 0; op.replica = r.rep;
+    op.fetchRequestPayload.leaderEpoch = 1; op.fetchRequestPayload.partition = 0;
+    op.fetchRequestPayload.followerId = 2;  op.fetchRequestPayload.fetchOffset = 3;
+    op.fetchRequestPayload.maxBytes = 512 * 1024; op.fetchRequestPayload.topicId = 0;
+    op.fetchRequestPayload.nowNs = r.now;
+    ASSERT_TRUE(r.pool->tryEnqueueOp(0, 0, std::move(op)));
+    for (int i = 0; i < 8 && r.rep->gatewayHighWatermark() < 3; ++i) r.pass();
+    ASSERT_EQ(r.rep->gatewayHighWatermark(), 3) << "precondition: the follower fetch moved the HW";
+    ASSERT_TRUE(r.pushUntil(1)) << "nothing pushed once the HW moved";
+    int64_t first = INT64_MAX;
+    for (const auto& rec : r.records)
+        if (rec.subscriptionId == r.subscribed[301].subscriptionId && !rec.recordBatch.empty())
+            first = std::min(first, rec.baseOffset);
+    EXPECT_EQ(first, 0) << "the lagging leader pushes from its HW, below the re-armed position (the client drops these)";
+}
