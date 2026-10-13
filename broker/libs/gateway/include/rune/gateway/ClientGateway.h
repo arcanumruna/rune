@@ -2040,6 +2040,23 @@ private:
     [[nodiscard]] bool routesToWorker_(int32_t topicId) const noexcept {
         return workerPool_ != nullptr && (!perWorkerIngressActive_ || topicId >= 0);
     }
+
+    // Phase 2b E2: what this gateway can serve for (topic, partition) — ONE
+    // explicit kind each (CLAUDE.md rule 3), C1 first:
+    //   AwaitingCommit — a runtime topic whose catalog record has not committed
+    //                    (TopicRegistry::awaitingCommit): retriable NotLeader.
+    //   Disk           — its servable disk Log (`log`).
+    //   Transient      — committed, persistence=transient, in range, replica
+    //                    registered: NO disk Log; its InMemoryLog is owned by the
+    //                    replica's worker and is NEVER touched here (its
+    //                    published HW is the subscribe clamp).
+    //   Unknown        — nothing servable here.
+    struct ServedPartition {
+        enum class Kind : uint8_t { Unknown, AwaitingCommit, Disk, Transient };
+        Kind                kind = Kind::Unknown;
+        rune::storage::Log* log  = nullptr;   ///< Kind::Disk only
+    };
+    [[nodiscard]] ServedPartition servedPartition_(int32_t topicId, int32_t partition) const noexcept;
     int  pumpMarkerQueue_();
     // D9 (see TxnMarkerChannel).
     TxnMarkerChannel txnMarkerChannel_{};

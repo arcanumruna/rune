@@ -2967,6 +2967,30 @@ void ClientGateway::noteUnanswerable_(const uint8_t* buf, std::size_t len, const
                  unanswerableFrames_);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2b E2: servedPartition_ — see ServedPartition.  The disk fast path is the
+// same single servableLog() probe every site made before; the C1 / topic /
+// replica probes run only when there is no servable disk Log.  Control thread.
+// ---------------------------------------------------------------------------
+ClientGateway::ServedPartition ClientGateway::servedPartition_(int32_t topicId, int32_t partition) const noexcept
+{
+    using Kind = ServedPartition::Kind;
+    ServedPartition s;
+    if (topicRegistry_ == nullptr) return s;
+    if (rune::storage::Log* log = topicRegistry_->servableLog(topicId, partition)) [[likely]] {
+        s.kind = Kind::Disk;
+        s.log  = log;
+        return s;
+    }
+    if (topicRegistry_->awaitingCommit(topicId)) { s.kind = Kind::AwaitingCommit; return s; }   // C1
+    const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
+    if (spec == nullptr || spec->persistence != rune::node::PersistenceMode::Transient) return s;
+    if (partition < 0 || partition >= spec->partitionCount) return s;
+    if (replicaRegistry_ != nullptr && replicaRegistry_->lookup(topicId, partition) != nullptr)
+        s.kind = Kind::Transient;
+    return s;
+}
+
 bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 {
     // 1. Decode Produce.
@@ -3158,18 +3182,21 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
     // writable — answered NotLeader (retriable: the client refreshes metadata, which
     // lists the topic once it commits, and retries).  Nothing is appended, so a
     // topic boot may later reclaim as an orphan never holds an acknowledged record.
-    rune::storage::Log* log = topicRegistry_->servableLog(msg.topicId, partition);
-    if (!log) [[unlikely]] {
-        if (topicRegistry_->awaitingCommit(msg.topicId)) {
-            spdlog::debug("ClientGateway: Produce to topicId={} awaiting its DDL commit — NotLeader "
-                          "(retriable)", msg.topicId);
-            sendResp(pc::ErrorCode::NotLeader, partition, 0);
-            return true;
-        }
+    // Phase 2b E2: a TRANSIENT partition has no disk Log — routed to its owning
+    // worker below (op.logPtr = nullptr: the worker appends to the replica's ring).
+    const ServedPartition served = servedPartition_(msg.topicId, partition);
+    if (served.kind == ServedPartition::Kind::AwaitingCommit) [[unlikely]] {
+        spdlog::debug("ClientGateway: Produce to topicId={} awaiting its DDL commit — NotLeader "
+                      "(retriable)", msg.topicId);
+        sendResp(pc::ErrorCode::NotLeader, partition, 0);
+        return true;
+    }
+    if (served.kind == ServedPartition::Kind::Unknown) [[unlikely]] {
         spdlog::debug("ClientGateway: Produce bad partition={} for topicId={}", partition, msg.topicId);
         sendResp(pc::ErrorCode::UnknownPartition, partition, 0);
         return true;
     }
+    rune::storage::Log* log = served.log;   // nullptr ⟺ Kind::Transient
 
     // GR-4 / F15 §3.1 (I1): per-partition NotLeader.
     //
@@ -3512,6 +3539,14 @@ bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
             takeProduceCredit_(*session, routedWorker);
         }
         // Response (or pending-ack) will be processed in drainWorkerReturns_().
+        return true;
+    }
+
+    // Phase 2b E2: a TRANSIENT partition is appended only by its owning worker —
+    // never inline (the gateway never touches a worker-owned ring).  Reached
+    // only without a worker pool (unit rigs; ruling 6).
+    if (log == nullptr) [[unlikely]] {
+        sendResp(pc::ErrorCode::UnknownPartition, partition, 0);
         return true;
     }
 
@@ -4178,18 +4213,22 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // C1: a runtime topic awaiting its DDL commit is not readable — the bare
     // ErrorResponse{NotLeader} every unservable-here subscribe gets (retriable:
     // refresh metadata, retry); no subscription is registered.
-    rune::storage::Log* log = topicRegistry_->servableLog(msg.topicId, partition);
-    if (!log) {
-        if (topicRegistry_->awaitingCommit(msg.topicId)) {
-            spdlog::debug("ClientGateway: Subscribe to topicId={} awaiting its DDL commit — NotLeader "
-                          "(retriable)", msg.topicId);
-            sendSubRedirect(std::string{}, msg.correlationId);
-            return;
-        }
+    const ServedPartition served = servedPartition_(msg.topicId, partition);
+    if (served.kind == ServedPartition::Kind::AwaitingCommit) {
+        spdlog::debug("ClientGateway: Subscribe to topicId={} awaiting its DDL commit — NotLeader "
+                      "(retriable)", msg.topicId);
+        sendSubRedirect(std::string{}, msg.correlationId);
+        return;
+    }
+    // Phase 2b E2: a TRANSIENT partition (no disk Log) is pushed by its owning
+    // worker only — refused without a worker pool (no inline push path).
+    if (served.kind == ServedPartition::Kind::Unknown ||
+        (served.kind == ServedPartition::Kind::Transient && !workerPool_)) {
         spdlog::debug("ClientGateway: Subscribe bad partition={} for topicId={}", partition, msg.topicId);
         sendResp(pc::ErrorCode::UnknownPartition, partition, 0);
         return;
     }
+    rune::storage::Log* const log = served.log;   // nullptr ⟺ Kind::Transient
 
     // 5. Clamp fromOffset to [0, HW] (GR-6) — or [0, LEO] for non-replicated topics.
     //    fromOffset < 0 → "from Latest"; fromOffset > clamp-limit → clamped.
@@ -4218,7 +4257,9 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // "nothing to deliver" stall on a reconnecting subscriber).
     static constexpr int64_t kFromEarliest = -2;
     static constexpr int64_t kFromLatest   = -1;
-    const int64_t leo = log->logEndOffset();
+    // E2: a transient partition's replica is registered (servedPartition_), so
+    // its clamp is the published HW below — the ring itself is never read here.
+    const int64_t leo = log != nullptr ? log->logEndOffset() : 0;
     // GR-6: use HW as the clamp limit when a replica is available.
     // For non-replicated / single-node topics, HW == LEO — no behavioral change.
     int64_t clampLimit;
@@ -4236,7 +4277,10 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // begin()), so an Earliest subscriber pinned to 0 gets 0 records for the life
     // of the subscription.  Resolve Earliest — and clamp any explicit fromOffset
     // that points into a deleted region — UP to the live log start instead.
-    const int64_t logStart = log->logStartOffset();
+    // E2: a transient ring's start is worker-owned state (never read cross-
+    // thread): Earliest resolves to 0 and the owning worker moves a cursor below
+    // its ring start up to it (TRANSIENT_EVICTED, Worker::skipEvictedCursor_).
+    const int64_t logStart = log != nullptr ? log->logStartOffset() : 0;
     int64_t nextOffset;
     if (msg.fromOffset == kFromEarliest) {
         // Earliest → the oldest offset still readable (NOT hardcoded 0).
@@ -4495,7 +4539,11 @@ void ClientGateway::pushSubscriptions()
         // See block comment above for the full rationale.
         rune::storage::Log* log = topicRegistry_ ?
             topicRegistry_->log(sub.topicId, sub.partition) : nullptr;
-        if (!log) continue; // registry removed or not set — skip
+        // Phase 2b E2: a TRANSIENT partition (no disk Log) is read by its owning
+        // worker only (the PushRead below) — never by the inline path.
+        if (!log && (!workerPool_ ||
+                     servedPartition_(sub.topicId, sub.partition).kind != ServedPartition::Kind::Transient))
+            continue; // registry removed or not set — skip
 
         // GR-6: Look up the PartitionReplica for this (topicId, partition).
         // If found → bound = replica->highWatermark() (majority-committed).
@@ -4505,10 +4553,10 @@ void ClientGateway::pushSubscriptions()
         if (replicaRegistry_) {
             const rune::replication::PartitionReplica* replica =
                 replicaRegistry_->lookup(sub.topicId, sub.partition);
-            hw = replica ? replica->gatewayHighWatermark() : log->logEndOffset();
+            hw = replica ? replica->gatewayHighWatermark() : (log ? log->logEndOffset() : 0);
         } else {
             // No replication wired — single-node pass-through: HW == LEO.
-            hw = log->logEndOffset();
+            hw = log ? log->logEndOffset() : 0;
         }
 
         // TX-4 Task 9: Apply isolation-level bound.
@@ -5169,8 +5217,14 @@ void ClientGateway::appendRemoteControlRecord(const rune::replication::WriteTxnM
     // Review MEDIUM-5: this node's routing image is NOT consulted — it can lag
     // the replica role; the worker's role gate is the authority (a follower
     // replica answers NotLeader through it).
-    rune::storage::Log* log = topicRegistry_ ? topicRegistry_->servableLog(w.topicId, w.partition) : nullptr;   // C1
-    if (log == nullptr || w.topicId < 0 || w.marker.empty()) {
+    // C1 + E2: a committed transient partition takes markers too (its owning
+    // worker appends the control batch to the ring); uncommitted / unknown →
+    // NotLeader (the coordinator re-resolves — never Unknown*, see above).
+    const ServedPartition served = servedPartition_(w.topicId, w.partition);
+    rune::storage::Log* const log = served.log;
+    const bool servable = served.kind == ServedPartition::Kind::Disk ||
+                          served.kind == ServedPartition::Kind::Transient;
+    if (!servable || w.topicId < 0 || w.marker.empty()) {
         answerRemoteOrigin_(m, static_cast<int16_t>(pcl::ErrorCode::NotLeader), -1);
         return;
     }
@@ -5227,7 +5281,8 @@ void ClientGateway::appendRemoteControlRecord(const rune::replication::WriteTxnM
         return;
     }
     // No worker pool (unit rigs / single-thread): the inline append.
-    const int64_t base = appendControlRecordInline_(w.topicId, w.partition, w.marker, log);
+    // E2: a transient partition has no inline append (worker-owned ring) — NotLeader, the coordinator retries.
+    const int64_t base = log != nullptr ? appendControlRecordInline_(w.topicId, w.partition, w.marker, log) : -1;
     if (base >= 0) notifyControlMarker(w.topicId, w.partition, w.producerId, base, w.commit != 0);
     answerRemoteOrigin_(m, base >= 0 ? int16_t{0} : static_cast<int16_t>(pcl::ErrorCode::NotLeader), base);
 }
@@ -6524,16 +6579,21 @@ int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
         return -1;
     }
 
-    rune::storage::Log* log = topicRegistry_->servableLog(topicId, partition);   // C1
-    if (!log) {
+    // C1 + E2: uncommitted / unknown → refused; a TRANSIENT partition (no disk
+    // Log) is pushed by its owning worker only — refused without a worker pool.
+    const ServedPartition served = servedPartition_(topicId, partition);
+    if (served.kind == ServedPartition::Kind::AwaitingCommit || served.kind == ServedPartition::Kind::Unknown ||
+        (served.kind == ServedPartition::Kind::Transient && !workerPool_)) {
         spdlog::warn("ClientGateway::addGroupSubscription: unknown (or uncommitted) topicId={} partition={}",
                      topicId, partition);
         return -1;
     }
+    rune::storage::Log* const log = served.log;   // nullptr ⟺ Kind::Transient
 
     // Clamp fromOffset to [0, bound] where bound is HW when a replica is
-    // wired (GR-6), else LEO.  Negative fromOffset is clamped to 0 (log start).
-    const int64_t leo = log->logEndOffset();
+    // wired (GR-6), else LEO.  Negative fromOffset is clamped to 0 (log start;
+    // E2: a transient cursor below the ring start is moved up by the worker).
+    const int64_t leo = log != nullptr ? log->logEndOffset() : 0;
     int64_t bound;
     if (replicaRegistry_) {
         const rune::replication::PartitionReplica* replica =
@@ -6700,12 +6760,15 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
         return -1;
     }
 
-    rune::storage::Log* log = topicRegistry_->servableLog(topicId, partition);   // C1
-    if (!log) {
+    // C1 + E2: a committed TRANSIENT partition's markers ride the same worker /
+    // remote paths below (the worker appends the control batch to the ring).
+    const ServedPartition served = servedPartition_(topicId, partition);
+    if (served.kind != ServedPartition::Kind::Disk && served.kind != ServedPartition::Kind::Transient) {
         spdlog::debug("ClientGateway::appendControlRecord: unknown (or uncommitted) topicId={} partition={} "
                       "— dropped", topicId, partition);
         return -1;
     }
+    rune::storage::Log* const log = served.log;   // nullptr ⟺ Kind::Transient
 
     if (producerId < 0 && marker.size() >= 43u + 8u) {   // the control batch's producerId (LE @43)
         producerId = 0;
@@ -6778,6 +6841,11 @@ int64_t ClientGateway::appendControlRecord(int32_t topicId, int32_t partition,
                          topicId, partition, markerSendQueue_.size());
         }
         return kControlRecordAsync;
+    }
+    if (log == nullptr) [[unlikely]] {   // E2: transient without a worker pool — no inline append (ruling 6)
+        spdlog::debug("ClientGateway::appendControlRecord: transient topicId={} partition={} without a "
+                      "worker pool — dropped", topicId, partition);
+        return -1;
     }
     return appendControlRecordInline_(topicId, partition, marker, log);
 }

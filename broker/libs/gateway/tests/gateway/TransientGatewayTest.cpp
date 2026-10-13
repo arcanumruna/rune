@@ -1,0 +1,347 @@
+// TransientGatewayTest.cpp — Phase 2b E2: the gateway serves a TRANSIENT
+// partition (no disk Log) through its owning worker — produce routed to the
+// worker, Subscribe accepted and clamped to the HW snapshot, PushReads issued
+// (legacy worker-pool mode), group subscriptions, txn markers routed — gates it
+// by C1 exactly like a disk topic (uncommitted → NotLeader, nothing served),
+// answers a full ring TransientLogFull (42) to v6 sessions and NotLeader to
+// older ones, and refuses it (UnknownPartition) without a worker pool: no
+// gateway-inline path may touch a worker-owned ring.  Deterministic: no Aeron.
+#include <rune/gateway/ClientGateway.h>
+#include <rune/gateway/TopicRegistry.h>
+#include <rune/metadata/ShardRouter.h>
+#include <rune/node/ReplicaRegistry.h>
+#include <rune/node/WorkerOp.h>
+#include <rune/node/WorkerPool.h>
+#include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/ControlMessages.h>
+#include <rune/protocol/client/DataMessages.h>
+#include <rune/protocol/client/Protocol.h>
+#include <rune/replication/PartitionReplica.h>
+#include <rune/storage/InMemoryLog.h>
+#include <rune/transaction/ControlMarker.h>
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
+#include <map>
+#include <memory>
+#include <optional>
+#include <random>
+#include <span>
+#include <string>
+#include <vector>
+
+using namespace rune::gateway;
+namespace pc = rune::protocol::client;
+namespace fs = std::filesystem;
+using rune::replication::PartitionConfig;
+using rune::replication::PartitionReplica;
+using rune::replication::Role;
+
+namespace {
+
+struct TempDir {
+    fs::path path;
+    TempDir() {
+        std::random_device rd;
+        path = fs::temp_directory_path() / ("rune-transient-gw-" + std::to_string(rd()));
+        fs::create_directories(path);
+    }
+    ~TempDir() { std::error_code ec; fs::remove_all(path, ec); }
+};
+
+std::vector<uint8_t> batchOf(int recs, std::size_t valueBytes = 1) {
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    const std::string v(valueBytes, 'v');
+    for (int i = 0; i < recs; ++i) b.append("k", v, 1000 + i);
+    return b.build();
+}
+
+struct RigOpts {
+    bool        workers      = true;      // a 1-worker pool (legacy mode: the gateway issues PushReads)
+    bool        runtime      = false;     // create the topic at RUNTIME: awaiting its commit (C1) until commit()
+    std::size_t ringBytes    = 1u << 20;
+    bool        withFollower = false;     // ISR {1,2}: follower 2 never fetches → the HW stays 0
+};
+
+// Gateway + topic 0 "presence" (1 partition, TRANSIENT) + its leader replica on
+// an InMemoryLog (built at construction, or — runtime — only on commit(), the
+// way BrokerNode builds it on kA2cTopicCommitted).
+struct Rig {
+    TempDir                                   dir;
+    RigOpts                                   o;
+    rune::storage::InMemoryLog                mem;           // outlives the replica
+    rune::replication::NullPartitionTransport transport;
+    rune::node::ReplicaRegistry               reg;
+    std::unique_ptr<TopicRegistry>            registry;
+    std::unique_ptr<rune::node::WorkerPool>   pool;
+    ClientGateway                             gw;
+    PartitionReplica*                         rep = nullptr;
+    std::map<int64_t, pc::ProduceResponse>    produced;      // by correlationId
+    std::map<int64_t, pc::SubscribeResponse>  subscribed;    // by correlationId
+    std::map<int64_t, int16_t>                errors;        // ErrorResponse code by correlationId
+    std::vector<pc::Records>                  records;       // baseOffset / subscriptionId only
+    int64_t                                   now  = 1'000'000'000;
+    int64_t                                   corr = 0;
+
+    explicit Rig(RigOpts opts = {})
+        : o(opts),
+          mem(opts.ringBytes, 10'000),
+          gw(ClientGateway::makeForTest([this](const uint8_t* b, std::size_t n) -> int64_t {
+              onFrame(b, n, /*sessionEgress=*/false);
+              return 1;
+          }, 1)) {
+        rune::node::TopicSpec ts;
+        ts.name = "presence"; ts.partitionCount = 1; ts.topicId = 0;
+        ts.persistence = rune::node::PersistenceMode::Transient;
+        if (o.runtime) {
+            registry = std::make_unique<TopicRegistry>(std::vector<rune::node::TopicSpec>{}, dir.path.string());
+            EXPECT_EQ(registry->createTopic(ts), 0);   // C1: awaiting its catalog commit
+            EXPECT_TRUE(registry->awaitingCommit(0));
+        } else {
+            registry = std::make_unique<TopicRegistry>(std::vector<rune::node::TopicSpec>{ts}, dir.path.string());
+        }
+        if (o.workers) {
+            pool = std::make_unique<rune::node::WorkerPool>(1, rune::metadata::ShardRouter(1));
+            pool->setRegistry(&reg);
+        }
+        if (!o.runtime) addReplica();
+        gw.setTopicRegistry(registry.get());
+        gw.setReplicaRegistry(&reg);
+        gw.setCommittedMetadataReady(true);
+        gw.setOnEgressFrame([this](int64_t, const uint8_t* b, std::size_t n) { onFrame(b, n, true); });
+        if (pool) gw.setWorkerPool(pool.get());
+    }
+    void addReplica() {
+        PartitionConfig c;
+        c.topicId = 0; c.partitionId = 0; c.selfId = 1; c.minIsr = 1;
+        c.replicaLagMaxOffset = 1'000'000'000; c.replicaLagMaxMs = 600'000;
+        const std::vector<int32_t> set = o.withFollower ? std::vector<int32_t>{1, 2} : std::vector<int32_t>{1};
+        auto r = std::make_unique<PartitionReplica>(c, Role::Leader, 1, set, set, &mem, &transport);
+        r->setExternalFollowerFlush(true);
+        rep = r.get();
+        reg.add(0, 0, std::move(r));
+        if (pool) pool->assignFromRegistry(reg);
+    }
+    /// What BrokerNode's kA2cTopicCommitted handler does: the topic becomes
+    /// servable and its replicas are built (createRuntimeUserReplicas).
+    void commit() {
+        ASSERT_TRUE(registry->commitTopic(0));
+        addReplica();
+    }
+    void onFrame(const uint8_t* b, std::size_t n, bool sessionEgress) {
+        const auto h = pc::MessageHeader::decode(b, n);
+        if (!h) return;
+        switch (static_cast<pc::TemplateId>(h->templateId)) {
+        case pc::TemplateId::ProduceResponse:
+            if (auto r = pc::ProduceResponse::decode(b, n)) produced[r->correlationId] = *r;
+            break;
+        case pc::TemplateId::SubscribeResponse:
+            if (auto r = pc::SubscribeResponse::decode(b, n)) subscribed[r->correlationId] = *r;
+            break;
+        case pc::TemplateId::ErrorResponse:
+            if (auto r = pc::ErrorResponse::decode(b, n)) errors[r->correlationId] = r->code;
+            break;
+        case pc::TemplateId::Records:
+            if (sessionEgress) if (auto r = pc::Records::decode(b, n)) records.push_back(*r);
+            break;
+        default: break;
+        }
+    }
+    void pass() {
+        now += 1'000'000;
+        if (pool) (void)pool->worker(0).doWork(now);
+        gw.drainWorkerReturnsForTest(now);
+    }
+    int64_t produce(int64_t sid, int recs, uint8_t acks = 1, std::size_t valueBytes = 1) {
+        pc::Produce msg;
+        msg.sessionId = sid; msg.correlationId = ++corr; msg.topicId = 0; msg.partition = 0;
+        msg.partitionKnown = 1; msg.acks = acks; msg.producerId = -1; msg.producerEpoch = 0; msg.baseSequence = -1;
+        const auto batch = batchOf(recs, valueBytes);
+        msg.recordBatch = std::span<const uint8_t>(batch);
+        std::vector<uint8_t> frame(msg.encodedSize());
+        msg.encode(frame.data());
+        gw.applyProduceForTest(frame.data(), frame.size());
+        return corr;
+    }
+    std::optional<pc::ProduceResponse> awaitProduced(int64_t c) {
+        for (int i = 0; i < 64 && !produced.count(c); ++i) pass();
+        const auto it = produced.find(c);
+        return it == produced.end() ? std::nullopt : std::optional<pc::ProduceResponse>(it->second);
+    }
+    void subscribe(int64_t sid, int64_t fromOffset, int64_t subCorr) {
+        pc::Subscribe s;
+        s.sessionId = sid; s.correlationId = subCorr; s.topicId = 0; s.partition = 0;
+        s.partitionKnown = 1; s.fromOffset = fromOffset; s.isolation = 0;
+        std::vector<uint8_t> buf(s.encodedSize());
+        buf.resize(s.encode(buf.data()));
+        gw.applySubscribeForTest(buf.data(), buf.size());
+    }
+    /// Push cycles (PushRead → worker → PushReadResult → Records) until n frames (bounded).
+    bool pushUntil(std::size_t n) {
+        for (int i = 0; i < 64 && records.size() < n; ++i) { gw.pushSubscriptionsForTest(); pass(); }
+        return records.size() >= n;
+    }
+};
+
+constexpr int16_t kOk               = 0;
+constexpr int16_t kNotLeader        = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+constexpr int16_t kUnknownPartition = static_cast<int16_t>(pc::ErrorCode::UnknownPartition);
+constexpr int16_t kTransientLogFull = static_cast<int16_t>(pc::ErrorCode::TransientLogFull);
+
+} // namespace
+
+TEST(TransientGatewayRegression, SubscribeToATransientPartitionIsAcceptedRegression) {
+    Rig r;
+    const int64_t sid = r.gw.injectTestSession(0);
+    r.subscribe(sid, /*Earliest=*/-2, 41);
+    ASSERT_TRUE(r.subscribed.count(41));
+    EXPECT_EQ(r.subscribed[41].errorCode, kOk) << "was UnknownPartition: the topic has no disk Log";
+    EXPECT_EQ(r.gw.subscriptionNextOffsetForTest(r.subscribed[41].subscriptionId), 0);
+}
+
+TEST(TransientGatewayRegression, ProduceThroughTheWorkerAndPushToTheSubscriberRegression) {
+    Rig r;
+    const int64_t sid = r.gw.injectTestSession(0);
+    const auto p1 = r.awaitProduced(r.produce(sid, 3, /*acks=all*/1));
+    ASSERT_TRUE(p1.has_value());
+    ASSERT_EQ(p1->errorCode, kOk) << "was UnknownPartition: the topic has no disk Log";
+    EXPECT_EQ(p1->baseOffset, 0);
+    const auto p2 = r.awaitProduced(r.produce(sid, 2, 1));
+    ASSERT_TRUE(p2.has_value());
+    ASSERT_EQ(p2->errorCode, kOk);
+    EXPECT_EQ(p2->baseOffset, 3);
+    EXPECT_EQ(r.mem.logEndOffset(), 5) << "the owning worker appended to the ring";
+
+    r.subscribe(sid, -2, 42);
+    ASSERT_TRUE(r.pushUntil(2)) << "no Records pushed for a transient subscription";
+    EXPECT_EQ(r.records[0].baseOffset, 0);
+    EXPECT_EQ(r.records[1].baseOffset, 3);
+    EXPECT_EQ(r.records[0].subscriptionId, r.subscribed[42].subscriptionId);
+}
+
+TEST(TransientGatewayRegression, SubscribeLatestAndExplicitOffsetClampToTheHighWatermarkRegression) {
+    Rig r;
+    const int64_t sid = r.gw.injectTestSession(0);
+    ASSERT_EQ(r.awaitProduced(r.produce(sid, 1)).value().errorCode, kOk);
+    ASSERT_EQ(r.awaitProduced(r.produce(sid, 1)).value().errorCode, kOk);
+    for (int i = 0; i < 4; ++i) r.pass();   // the worker published its HW
+    ASSERT_EQ(r.rep->gatewayHighWatermark(), 2);
+    r.subscribe(sid, /*Latest=*/-1, 101);
+    r.subscribe(sid, 1, 102);
+    r.subscribe(sid, 99, 103);
+    for (int64_t c : {101, 102, 103}) ASSERT_EQ(r.subscribed.at(c).errorCode, kOk);
+    EXPECT_EQ(r.gw.subscriptionNextOffsetForTest(r.subscribed[101].subscriptionId), 2) << "Latest replays old records";
+    EXPECT_EQ(r.gw.subscriptionNextOffsetForTest(r.subscribed[102].subscriptionId), 1);
+    EXPECT_EQ(r.gw.subscriptionNextOffsetForTest(r.subscribed[103].subscriptionId), 2) << "beyond the HW clamps to it";
+}
+
+TEST(TransientGatewayRegression, GroupSubscriptionOnATransientPartitionIsPushedRegression) {
+    Rig r;
+    const int64_t sid = r.gw.injectTestSession(0);
+    ASSERT_EQ(r.awaitProduced(r.produce(sid, 2)).value().errorCode, kOk);
+    const int64_t subId = r.gw.addGroupSubscription(sid, 0, 0, /*fromOffset=*/0, /*isolation=*/0,
+                                                    /*pendingCarrier=*/false);
+    ASSERT_GE(subId, 0) << "a group member could not be assigned a transient partition (was: -1)";
+    ASSERT_TRUE(r.pushUntil(1));
+    EXPECT_EQ(r.records[0].subscriptionId, subId);
+    EXPECT_EQ(r.records[0].baseOffset, 0);
+}
+
+TEST(TransientGatewayRegression, TxnMarkerForATransientPartitionIsRoutedToTheWorkerRegression) {
+    Rig r;
+    const auto marker = rune::transaction::ControlMarker::build(7, 0, rune::transaction::ControlType::Commit, 0);
+    EXPECT_EQ(r.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), /*producerId=*/7, /*commit=*/true,
+                                       /*coordinatorEpoch=*/0),
+              ClientGateway::kControlRecordAsync) << "was -1 (dropped): no disk Log";
+    for (int i = 0; i < 8; ++i) r.pass();
+    EXPECT_EQ(r.mem.logEndOffset(), 1) << "the owning worker appended the marker to the ring";
+}
+
+// C1 (DDL conformance final review) × E2: a RUNTIME transient topic whose
+// catalog record has not committed serves NOTHING — produce NotLeader (nothing
+// appended), subscribe the bare ErrorResponse{NotLeader} (nothing registered),
+// no group subscription, no marker — exactly like an uncommitted disk topic.
+// Once committed (and its replica built, as kA2cTopicCommitted does) it serves.
+TEST(TransientGatewayRegression, UncommittedTransientTopicServesNothingUntilCommitRegression) {
+    Rig r({.workers = true, .runtime = true});
+    const int64_t sid = r.gw.injectTestSession(0);
+    const int64_t c = r.produce(sid, 1);
+    ASSERT_TRUE(r.produced.count(c));
+    EXPECT_EQ(r.produced[c].errorCode, kNotLeader) << "an uncommitted transient topic took a produce";
+    EXPECT_EQ(r.mem.logEndOffset(), 0);
+    r.subscribe(sid, -2, 51);
+    EXPECT_FALSE(r.subscribed.count(51)) << "an uncommitted transient topic registered a subscription";
+    ASSERT_TRUE(r.errors.count(51));
+    EXPECT_EQ(r.errors[51], kNotLeader);
+    EXPECT_EQ(r.gw.addGroupSubscription(sid, 0, 0, 0, 0, false), -1);
+    const auto marker = rune::transaction::ControlMarker::build(7, 0, rune::transaction::ControlType::Commit, 0);
+    EXPECT_EQ(r.gw.appendControlRecord(0, 0, std::span<const uint8_t>(marker), 7, true, 0), -1);
+
+    r.commit();
+    const auto ok = r.awaitProduced(r.produce(sid, 2));
+    ASSERT_TRUE(ok.has_value());
+    EXPECT_EQ(ok->errorCode, kOk) << "the committed transient topic must serve";
+    EXPECT_EQ(ok->baseOffset, 0);
+    r.subscribe(sid, -2, 52);
+    ASSERT_TRUE(r.subscribed.count(52));
+    EXPECT_EQ(r.subscribed[52].errorCode, kOk);
+    ASSERT_TRUE(r.pushUntil(1));
+    EXPECT_EQ(r.records[0].baseOffset, 0);
+}
+
+// The DDL final-fix concern: a COMMITTED runtime transient topic produced
+// through the gateway (legacy runtime) answered UnknownPartition (8) because it
+// has no servable disk Log.  It is served through its owning worker.
+TEST(TransientGatewayRegression, CommittedRuntimeTransientTopicServesThroughTheWorkerRegression) {
+    Rig r({.workers = true, .runtime = true});
+    r.commit();
+    const int64_t sid = r.gw.injectTestSession(0);
+    for (int64_t want : {0, 2}) {
+        const auto p = r.awaitProduced(r.produce(sid, 2, /*acks=all*/1));
+        ASSERT_TRUE(p.has_value());
+        ASSERT_EQ(p->errorCode, kOk) << "was UnknownPartition (8)";
+        EXPECT_EQ(p->baseOffset, want);
+    }
+    r.subscribe(sid, -2, 61);
+    ASSERT_TRUE(r.pushUntil(2));
+    EXPECT_EQ(r.records[0].baseOffset, 0);
+    EXPECT_EQ(r.records[1].baseOffset, 2);
+}
+
+// Ruling 2 on the wire: a ring full of not-yet-replicated records answers 42 to
+// a v6 session and NotLeader (its retriable code) to a v5 session; nothing is
+// appended either way.
+TEST(TransientGatewayRegression, FullRingAnswersTransientLogFullOnlyToV6SessionsRegression) {
+    Rig r({.workers = true, .ringBytes = 16 * 1024, .withFollower = true});
+    const int64_t v6 = r.gw.injectTestSession(0);
+    const int64_t v5 = r.gw.injectTestSession(0, /*clientVersion=*/5);
+    int16_t code = kOk;
+    for (int i = 0; i < 64 && code == kOk; ++i) {
+        const auto p = r.awaitProduced(r.produce(v6, 1, /*acks=*/0, /*valueBytes=*/1000));
+        ASSERT_TRUE(p.has_value());
+        code = p->errorCode;
+    }
+    ASSERT_EQ(code, kTransientLogFull) << "a v6 session must see 42 for a full ring";
+    const int64_t leo = r.mem.logEndOffset();
+    const auto old = r.awaitProduced(r.produce(v5, 1, 0, 1000));
+    ASSERT_TRUE(old.has_value());
+    EXPECT_EQ(old->errorCode, kNotLeader) << "a v5 session must never see 42";
+    EXPECT_EQ(r.mem.logEndOffset(), leo) << "a refused produce appended";
+    EXPECT_EQ(r.mem.logStartOffset(), 0) << "an unreplicated record was evicted";
+}
+
+// Pins "never inline": without a worker pool nothing may touch a worker-owned
+// ring — every path refuses the transient partition explicitly.
+TEST(TransientGateway, WithoutAWorkerPoolTransientIsRefusedNeverInline) {
+    Rig r({.workers = false});
+    const int64_t sid = r.gw.injectTestSession(0);
+    const int64_t c = r.produce(sid, 1);
+    ASSERT_TRUE(r.produced.count(c));
+    EXPECT_EQ(r.produced[c].errorCode, kUnknownPartition);
+    EXPECT_EQ(r.mem.logEndOffset(), 0);
+    r.subscribe(sid, -2, 9);
+    ASSERT_TRUE(r.subscribed.count(9));
+    EXPECT_EQ(r.subscribed[9].errorCode, kUnknownPartition);
+    EXPECT_EQ(r.gw.addGroupSubscription(sid, 0, 0, 0, 0, false), -1);
+}
