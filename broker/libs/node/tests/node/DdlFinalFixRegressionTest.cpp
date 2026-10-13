@@ -315,3 +315,28 @@ TEST(DdlFixRegression, C1_ViewPlanNeverOvertakesItsSinkCommitOnTheFailureRingReg
     EXPECT_EQ(order.front(), kA2cTopicCommitted) << "the backlogged commit precedes the plan";
     EXPECT_EQ(agent.topicCommittedBacklogForTest(), 0u);
 }
+
+// C1 x KL2: an in-doubt record that a later PROMOTION replays (its HW now covers
+// it) makes the topic a live catalog entry — it must serve from then on too, not
+// only after a restart.  The promotion's replay posts kA2cTopicCommitted for every
+// replayed topic (a no-op for one already servable).
+TEST(DdlFixRegression, C1_InDoubtRecordReplayedByAPromotionServesRegression) {
+    for (const Op op : {Op::DefineDisk, Op::ViewPersisted}) {
+        SCOPED_TRACE(opName(op));
+        DdlHarnessOptions o;
+        o.holdCommits = true;
+        DdlHarness h(o);
+        makeInDoubt(h, op, "x", InDoubtFault::Timeout);
+        if (HasFatalFailure()) return;
+        const int32_t id = h.idOf("x");
+        ASSERT_TRUE(h.topics().awaitingCommit(id)) << "live: in doubt, not servable";
+        h.demote();
+        for (int i = 0; i < 3; ++i) h.tick();
+        h.promote();   // replays the (now committed) record
+        h.tick();
+        if (isView(op)) EXPECT_NE(h.views().byName("x"), nullptr) << "the replay applied the view";
+        else            EXPECT_NE(h.schemas().byName("x"), nullptr) << "the replay applied the schema";
+        EXPECT_FALSE(h.topics().awaitingCommit(id)) << "and the topic serves";
+        EXPECT_TRUE(h.violations().empty()) << h.violationText();
+    }
+}

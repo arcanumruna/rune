@@ -1043,6 +1043,10 @@ void AdminWorker::rebuildFromLog_() {
     if (hw <= 0) return;
 
     static constexpr int32_t kChunk = 64 * 1024 * 1024;
+    // C1 x KL2: every topic this replay applies is a committed catalog entry and
+    // must serve — an in-doubt record (its op answered Internal, never applied
+    // live) becomes servable here, not only at the next restart.  Cold path.
+    std::vector<int32_t> replayed;
     rune::replication::Offset fetchOffset = 0;
     while (fetchOffset < hw) {
         std::vector<uint8_t> data = replica_->read(fetchOffset, kChunk);
@@ -1060,12 +1064,15 @@ void AdminWorker::rebuildFromLog_() {
             const int32_t tl = reader.totalLength();
             if (tl <= 0 || static_cast<std::size_t>(tl) > rem) break;
             const rune::replication::Offset batchBase = reader.baseOffset();
-            reader.forEachRecord([this, batchBase](std::string_view /*key*/, std::string_view val,
+            reader.forEachRecord([this, batchBase, &replayed](std::string_view /*key*/, std::string_view val,
                                   int64_t /*offset*/, int64_t /*ts*/) {
                 auto ts = TopicSchema::deserialize(std::span<const uint8_t>(
                     reinterpret_cast<const uint8_t*>(val.data()), val.size()));
                 if (ts) {
                     reg_.applyRecord(*ts);
+                    if (ts->topicId >= 0 &&
+                        std::find(replayed.begin(), replayed.end(), ts->topicId) == replayed.end())
+                        replayed.push_back(ts->topicId);
                     return;
                 }
                 // FAIL LOUD (never a silent skip): SchemaRegistry stores
@@ -1090,6 +1097,10 @@ void AdminWorker::rebuildFromLog_() {
         if (lastBatchEnd <= fetchOffset) break;
         fetchOffset = lastBatchEnd;
     }
+    // kA2cTopicCommitted for each replayed topic (a no-op on the control thread for
+    // one that already serves — boot-built topics, earlier commits).
+    if (deps_.topicCommitted)
+        for (const int32_t id : replayed) deps_.topicCommitted(id);
     spdlog::info("AdminWorker: rebuilt SchemaRegistry from __topic_schemas log (hw={})", hw);
 }
 
@@ -1201,6 +1212,11 @@ void AdminWorker::recoverViewsOnPromotion_() {
                 // from the plan); only GetTopicSchema is affected.
             }
         }
+
+        // C1 x KL2: the view's record is committed — its sink serves (a no-op on the
+        // control thread unless it was in doubt).  Posted before the plan: the same
+        // FIFO ring.
+        if (deps_.topicCommitted) deps_.topicCommitted(rec->viewTopicId);
 
         // Fan out a RECOVERY install — installViewForRecovery on each worker's own
         // thread, which loads the checkpoint + rebuilds to the committed tail.
