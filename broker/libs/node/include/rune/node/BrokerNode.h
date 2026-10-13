@@ -54,6 +54,7 @@
 #include <rune/node/AdminWorker.h>
 #include <rune/node/AdminChannels.h>
 #include <rune/node/AdminControlPlane.h>
+#include <rune/node/DdlAnswerGate.h>
 #include <rune/node/SchemaFanout.h>
 #include <rune/node/ViewSnapshotChannel.h>
 #include <rune/node/ViewSnapshotIoAgent.h>
@@ -336,8 +337,11 @@ public:
         // 4b. F3 round 6, item 3: retry SchemaUpdates the admin→control ring
         //     could not take (full) — retry-on-full, never a drop.
         if (!schemaBacklog_.empty()) [[unlikely]] work += flushSchemaBacklog_();
-        if (!viewPlanBacklog_.empty()) [[unlikely]] work += flushViewPlanBacklog_();  // Task 19
+        // C1: commits before plans — a view plan never overtakes its sink's commit
+        // (the control thread builds the sink's replicas on kA2cTopicCommitted).
         if (!topicCommittedBacklog_.empty()) [[unlikely]] work += flushTopicCommittedBacklog_();  // B10
+        if (!viewPlanBacklog_.empty() && topicCommittedBacklog_.empty()) [[unlikely]]
+            work += flushViewPlanBacklog_();  // Task 19
         if (!egressBacklog_.empty()) [[unlikely]] work += flushEgressBacklog_();       // no-hang R2 / fix round 2
 
         // 5. fsyncgate (Task 10 fix 3 / I1): the schema log this thread drives
@@ -472,7 +476,9 @@ public:
                           vp.viewTopicId, viewPlanUpdateWireLen(vp), failureRing_.maxMsgLength());
             return;
         }
-        if (!viewPlanBacklog_.empty() ||
+        // C1: behind any backlogged commit too — a plan never overtakes its sink's
+        // kA2cTopicCommitted on the ring (the commits flush first, see doWork).
+        if (!viewPlanBacklog_.empty() || !topicCommittedBacklog_.empty() ||
             !encodeViewPlanUpdate(failureRing_, kA2cViewPlanUpdate, vp))
             viewPlanBacklog_.push_back(vp);   // keep FIFO order
     }
@@ -673,8 +679,7 @@ public:
     /// work — an orphan).  Set before start(); afterwards only the control thread
     /// reads/writes it (single owner).
     void setAdminCreateFaultForTest(std::string name, bool afterCreate) {
-        adminCreateFaultName_ = std::move(name);
-        adminCreateFaultAfterCreate_ = afterCreate;
+        adminCreateFault_ = AdminCreateFaultForTest{std::move(name), afterCreate};
     }
 
     // -----------------------------------------------------------------------
@@ -1334,9 +1339,20 @@ private:
     int  recoveryFaultForTest_ = 0;
     bool skipProvisionerRunnerForTest_ = false;
     int  schemaRecoveryFaultForTest_ = 0;
-    std::string adminCreateFaultName_;              // control thread after start()
-    bool        adminCreateFaultAfterCreate_ = false;
-    bool        adminCreateFaultFired_       = false;
+    // Final review M4: ONE armed test fault (no loose flags) — disarmed when it fires.
+    struct AdminCreateFaultForTest {
+        std::string name;          // the first create request for this name fails
+        bool        afterCreate;   // true: the topic is created first (an orphan)
+    };
+    std::optional<AdminCreateFaultForTest> adminCreateFault_;   // control thread after start()
+    // C1 / M7: a DefineTopic / CreateView OK leaves only once its topic serves
+    // (see DdlAnswerGate.h).  Control-thread-owned; one drain of the admin egress
+    // ring (16 frames of at most a ring message each) always fits.
+    static constexpr int64_t kDdlAnswerMaxHoldNs = 5'000'000'000LL;
+    DdlAnswerGate ddlAnswerGate_{2u * static_cast<std::size_t>(kAdminRequestRingBytes) + 4096u,
+                                 kDdlAnswerMaxHoldNs};
+    uint64_t      ddlAnswersOverdue_ = 0;   // control thread only
+    [[nodiscard]] bool ddlTopicServes_(int32_t topicId) const noexcept;
     int32_t                                      shardResolveStallWorkerForTest_ = -1;
     std::chrono::milliseconds                    shardResolveStallForTest_{0};
     void buildShardRuntimes_();

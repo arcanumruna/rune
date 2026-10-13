@@ -211,7 +211,16 @@ struct CreateTopicReplyMsg {
     // exactly the requested view sink's (Compact, key, partitions, mode) — the admin
     // thread may adopt it when no catalog record claims it (its own orphan sink).
     // Ring trailer byte 19; absent => false.
+    // Final review I1: also requires the topic to be UNCOMMITTED (not servable — so
+    // nothing could have been acknowledged into it) and every partition log EMPTY
+    // (read by the control thread, which alone has touched an uncommitted topic).
     bool    sinkSpecMatches = false;
+    // Final review I2: the existing topic is a RUNTIME topic with the Compact
+    // cleanup policy — only a CREATE VIEW sink is one (DefineTopic creates Delete
+    // topics).  The admin thread answers a DefineTopic over it TopicExists (25):
+    // a view sink is never adopted as a typed topic (KL1b closed), so the two
+    // catalogs never both claim one id.  Ring trailer byte 20; absent => false.
+    bool    existingIsRuntimeCompact = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -466,7 +475,7 @@ inline CreateTopicReqMsg decodeCreateTopicReq(const uint8_t* buf, std::size_t le
 // ---- CreateTopicReply ----
 inline bool encodeCreateTopicReply(OneToOneByteRing& ring, const CreateTopicReplyMsg& m) {
     using namespace admin_wire;
-    const std::size_t len = 8 + 4 + 4 + 1 + 1 + 1 + 1;
+    const std::size_t len = 8 + 4 + 4 + 1 + 1 + 1 + 1 + 1;
     const auto idx = ring.tryClaim(kMsgCreateTopicReply, len);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
@@ -476,7 +485,8 @@ inline bool encodeCreateTopicReply(OneToOneByteRing& ring, const CreateTopicRepl
     *p++ = m.existed ? 1 : 0;
     *p++ = m.persistence;
     *p++ = m.caseConflict ? 1 : 0;      // DDL conformance B3 trailer
-    *p   = m.sinkSpecMatches ? 1 : 0;   // Task 14 (KL1 follow-up) trailer
+    *p++ = m.sinkSpecMatches ? 1 : 0;   // Task 14 (KL1 follow-up) trailer
+    *p   = m.existingIsRuntimeCompact ? 1 : 0;   // final review I2 trailer
     ring.commit(idx);
     return true;
 }
@@ -493,11 +503,13 @@ inline CreateTopicReplyMsg decodeCreateTopicReply(const uint8_t* buf, std::size_
     if (len < 18) return m;   // pre-2b-E frame: persistence not reported
     if (len >= 19) m.caseConflict = buf[18] != 0;   // DDL conformance B3 trailer
     if (len >= 20) m.sinkSpecMatches = buf[19] != 0;   // Task 14 (KL1 follow-up) trailer
+    if (len >= 21) m.existingIsRuntimeCompact = buf[20] != 0;   // final review I2 trailer
     if (buf[17] == CreateTopicReplyMsg::kPersistenceNotReported) return m;
     if (buf[17] > 1) {        // unknown mode: never cast — fail the create
         m.topicId      = -1;
         m.caseConflict = false;   // a failed create is Internal, never TopicExists
         m.sinkSpecMatches = false;   // nor an adoptable sink
+        m.existingIsRuntimeCompact = false;
         return m;
     }
     m.persistence = buf[17];

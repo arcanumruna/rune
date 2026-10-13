@@ -212,6 +212,11 @@ if(BUILD_TESTING)
     target_link_libraries(rune_gateway_subscribe_dedupe_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
     gtest_discover_tests(rune_gateway_subscribe_dedupe_tests)
 
+    # DDL conformance final review C1: an uncommitted runtime topic serves nothing — no Aeron.
+    add_executable(rune_gateway_topic_servability_tests tests/gateway/TopicServabilityTest.cpp)
+    target_link_libraries(rune_gateway_topic_servability_tests PRIVATE rune_gateway rune_node spdlog::spdlog GTest::gtest_main)
+    gtest_discover_tests(rune_gateway_topic_servability_tests)
+
     # D4: a follower redirects group / txn coordinator requests to the leader — no Aeron.
     add_executable(rune_gateway_coordinator_redirect_tests tests/gateway/CoordinatorRedirectTest.cpp)
     target_link_libraries(rune_gateway_coordinator_redirect_tests PRIVATE rune_gateway spdlog::spdlog GTest::gtest_main)

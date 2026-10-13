@@ -246,6 +246,15 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
             inFlight_ = Idle{};
             return;
         }
+        // Final review I2 (KL1b closed): a runtime Compact topic is a CREATE VIEW
+        // sink — committed, in doubt (KL2) or an orphan.  Never adopted as a typed
+        // topic: its view record (if any) would then share an id with this schema
+        // record and the next boot would refuse the dual claim.  TopicExists.
+        if (reply.existingIsRuntimeCompact) {
+            deps_.respondDefine(op.msg.session, op.msg.corr, reply.topicId, 0, kTopicExists);
+            inFlight_ = Idle{};
+            return;
+        }
     }
     const int32_t partitionCount = reply.partitionCount > 0 ? reply.partitionCount
                                                             : op.msg.partitionCount;
@@ -335,7 +344,6 @@ void AdminWorker::onCreateTopicReply(const CreateTopicReplyMsg& reply) {
     // Single-record keyed batch → last == base.
     DefineAwaitingCommit next{
         .msg            = std::move(op.msg),
-        .ticket         = op.ticket,
         .startedNs      = op.startedNs,
         .fieldCount     = op.fieldCount,
         .topicId        = reply.topicId,
@@ -413,16 +421,26 @@ void AdminWorker::onCreateViewReply_(ViewAwaitingId& op, const CreateTopicReplyM
         inFlight_ = Idle{};
         return;
     }
+    // The sink's partition count: the AUTHORITATIVE one the control thread
+    // reported (final review I1); a reply that did not report one falls back to
+    // the source's (the sink is requested co-partitioned with it).
+    int32_t sinkPartitions = reply.partitionCount;
+    if (sinkPartitions <= 0) {
+        sinkPartitions = 1;
+        if (!op.compiledPlan.sourceTopicId.empty()) {
+            if (const RegistryEntry* se = reg_.byId(op.compiledPlan.sourceTopicId[0]))
+                sinkPartitions = se->partitionCount;
+        }
+    }
     ViewAwaitingCommit next{
-        .view           = std::move(op.view),
-        .ticket         = op.ticket,
-        .startedNs      = op.startedNs,
-        .compiledPlan   = std::move(op.compiledPlan),
-        .viewOutDesc    = std::move(op.viewOutDesc),
-        .viewSrcDesc    = std::move(op.viewSrcDesc),
-        .partitionCount = reply.partitionCount,   // authoritative sink count (I1)
-        .viewRecord     = std::move(rec),         // applied on the HW gate (advance_)
-        .appendedLast   = base,
+        .view              = std::move(op.view),
+        .startedNs         = op.startedNs,
+        .outputFingerprint = op.compiledPlan.outputFingerprint,
+        .viewOutDesc       = std::move(op.viewOutDesc),
+        .viewSrcDesc       = std::move(op.viewSrcDesc),
+        .partitionCount    = sinkPartitions,
+        .viewRecord        = std::move(rec),         // applied on the HW gate (advance_)
+        .appendedLast      = base,
     };
     viewsReplica_->onLeaderLogAppended();
     inFlight_ = std::move(next);
@@ -452,6 +470,23 @@ void AdminWorker::startNext_(int64_t nowNs) {
     ++started_;
     PendingDdl pd = std::move(pending_.front());
     pending_.pop_front();
+
+    // Final review M2: the last promotion's catalog rebuild failed — the registries
+    // may miss records past the corrupt one (a create could adopt a committed
+    // topic's sink, a define re-use a recorded name).  Serve no DDL: Internal.
+    if ((rebuildFailed_ || viewsRebuildFailed_) && leader_) [[unlikely]] {
+        ++refusedForFailedRebuild_;
+        std::visit([&](const auto& m) {
+            using M = std::decay_t<decltype(m)>;
+            if constexpr (std::is_same_v<M, DefineTopicMsg>)
+                deps_.respondDefine(m.session, m.corr, -1, 0, kInternal);
+            else if constexpr (std::is_same_v<M, CreateViewMsg>)
+                deps_.respondCreateView(m.session, m.corr, -1, 0, kInternal);
+            else
+                deps_.respondAlter(m.session, m.corr, -1, 0, kInternal);
+        }, pd);
+        return;
+    }
 
     if (auto* alter = std::get_if<AlterTopicMsg>(&pd)) {
         startAlter_(std::move(*alter), nowNs);
@@ -852,14 +887,17 @@ std::string_view AdminWorker::inFlightStateName() const noexcept {
 // replica — so it is loud: logged, counted, answered Internal (outcome unknown).
 void AdminWorker::answerMissingCommitReplica_(const char* catalog) {
     ++commitReplicaMissing_;
-    // An ALTER never takes a create-topic ticket: it logs ticket=0.
-    const int64_t ticket = std::visit([](const auto& st) -> int64_t {
-        if constexpr (requires { st.ticket; }) return st.ticket;
+    // The client's correlation id identifies the op (M3: no ticket kept past the reply).
+    const int64_t corr = std::visit([](const auto& st) -> int64_t {
+        using S = std::decay_t<decltype(st)>;
+        if constexpr (std::is_same_v<S, DefineAwaitingCommit>) return st.msg.corr;
+        else if constexpr (std::is_same_v<S, ViewAwaitingCommit>) return st.view.corr;
+        else if constexpr (std::is_same_v<S, AlterAwaitingCommit>) return st.alter.corr;
         else return 0;
     }, inFlight_);
-    spdlog::error("AdminWorker: in-flight DDL op (ticket={}) in AwaitingCommit has no {} "
+    spdlog::error("AdminWorker: in-flight DDL op (corr={}) in AwaitingCommit has no {} "
                   "replica / catalog to commit on; answering Internal (count={})",
-                  ticket, catalog, commitReplicaMissing_);
+                  corr, catalog, commitReplicaMissing_);
     answerInFlight_(kInternal, inFlightAlterTopicId_());
 }
 
@@ -964,22 +1002,12 @@ void AdminWorker::commitCreateView_(const ViewAwaitingCommit& op) {
     // 2. Register the view's OUTPUT descriptor in the SchemaRegistry so the view
     //    is a typed topic (GetTopicSchema / openView handshake).  In-memory only
     //    here (create-and-run); restart recovery (Task 19b) re-registers it from
-    //    the ViewRecord's compiled plan.
-    //    The sink's partition count is the AUTHORITATIVE one the control thread
-    //    reported (final review I1); a reply that did not report one falls back
-    //    to the source's (the sink is requested co-partitioned with it).
-    int32_t sinkPartitions = op.partitionCount;
-    if (sinkPartitions <= 0) {
-        sinkPartitions = 1;
-        if (!op.compiledPlan.sourceTopicId.empty()) {
-            if (const RegistryEntry* se = reg_.byId(op.compiledPlan.sourceTopicId[0]))
-                sinkPartitions = se->partitionCount;
-        }
-    }
+    //    the ViewRecord's compiled plan.  op.partitionCount was resolved on the
+    //    reply (authoritative, or the source's).
     TopicSchema ts;
     ts.topicId        = viewTopicId;
     ts.version        = kInitialSchemaVersion;
-    ts.partitionCount = sinkPartitions;
+    ts.partitionCount = op.partitionCount;
     ts.keyField       = op.view.keyField;
     ts.validate       = false;
     ts.descriptorBlob = rune::codec::serialize(op.viewOutDesc);
@@ -991,15 +1019,16 @@ void AdminWorker::commitCreateView_(const ViewAwaitingCommit& op) {
 
     // 3. Respond OK with the view's topic id + output fingerprint.
     deps_.respondCreateView(op.view.session, op.view.corr,
-                            viewTopicId, op.compiledPlan.outputFingerprint, kOK);
+                            viewTopicId, op.outputFingerprint, kOK);
 
     // 4. Fan the compiled plan out to the workers (installView on each worker's
-    //    OWN thread, via the control thread — never cross-thread here).
+    //    OWN thread, via the control thread — never cross-thread here).  The
+    //    durable record's blob IS the serialized plan (M3: one copy).
     if (deps_.pushViewPlan) {
         ViewPlanUpdateMsg vp;
         vp.viewTopicId = viewTopicId;
         vp.persistence = op.view.persistence;
-        vp.planBlob    = rune::view::serialize(op.compiledPlan);
+        vp.planBlob    = op.viewRecord.compiledPlanBlob;
         vp.outDescBlob = rune::codec::serialize(op.viewOutDesc);
         vp.srcDescBlob = rune::codec::serialize(op.viewSrcDesc);
         deps_.pushViewPlan(vp);
@@ -1067,6 +1096,7 @@ void AdminWorker::rebuildFromLog_() {
 // ─── recoverViewsOnPromotion_ — rebuild ViewRegistry + fan out recovery ───────
 // The view counterpart of rebuildFromLog_, on the SAME Follower->Leader edge.
 void AdminWorker::recoverViewsOnPromotion_() {
+    viewsRebuildFailed_ = false;   // fresh attempt on every Follower->Leader edge
     if (!viewsReplica_ || !viewRegistry_) return;
 
     // 1. Rebuild the ViewRegistry from the committed __views log [0, HW).
@@ -1115,7 +1145,10 @@ void AdminWorker::recoverViewsOnPromotion_() {
             if (lastBatchEnd <= fetchOffset) break;
             fetchOffset = lastBatchEnd;
         }
-        if (failed) return;  // surfaced loudly above; do not fan out a partial catalog
+        if (failed) {   // surfaced loudly above; do not fan out a partial catalog
+            viewsRebuildFailed_ = true;   // M2: no DDL is served on a partial view catalog
+            return;
+        }
     }
 
     // 2. For each recovered durable view: re-register its OUTPUT schema in reg_

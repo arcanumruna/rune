@@ -119,9 +119,22 @@ createTopicForAdmin(rune::gateway::TopicRegistry& reg, const CreateTopicReqMsg& 
         // requested view sink's — the admin thread may adopt it as the sink when no
         // catalog record claims it (a failed CREATE VIEW's own orphan sink).  A static
         // (RUNE_TOPICS) topic — id < firstRuntimeId — never matches.
+        // Final review I1: and only while it is still UNCOMMITTED (never servable, so
+        // no client write can have been acknowledged into it) with every partition
+        // log EMPTY — adoption then implies the sink holds nothing.  The logs of an
+        // uncommitted topic have no replica and no worker: this (control) thread is
+        // the only one that ever touched them.
+        // Final review I2: report a runtime Compact topic (a view sink) so a
+        // DefineTopic over it is refused instead of adopting it.
         if (reply.existed && reply.topicId >= firstRuntimeId) {
             if (const TopicSpec* s = reg.topic(reply.topicId)) {
+                reply.existingIsRuntimeCompact = s->cleanupPolicy == TopicSpec::CleanupPolicy::Compact;
+                bool unwritten = reg.awaitingCommit(reply.topicId);
+                for (int32_t p = 0; unwritten && p < s->partitionCount; ++p)
+                    if (rune::storage::Log* l = reg.log(reply.topicId, p); l != nullptr && l->logEndOffset() > 0)
+                        unwritten = false;
                 reply.sinkSpecMatches =
+                    unwritten &&
                     req.cleanupPolicy == static_cast<uint8_t>(TopicSpec::CleanupPolicy::Compact) &&
                     static_cast<uint8_t>(s->cleanupPolicy) == req.cleanupPolicy &&
                     s->partitionKey == req.keyField &&

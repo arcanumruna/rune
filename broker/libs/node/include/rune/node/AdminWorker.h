@@ -222,18 +222,15 @@ public:
     /// B4 fix round 1: in-flight ops answered Internal because their commit
     /// replica (or the view catalog) was missing in AwaitingCommit — never dropped.
     [[nodiscard]] uint64_t commitReplicaMissing() const noexcept { return commitReplicaMissing_; }
-    /// Test-only: swap the schema / __views replica pointers (nullptr forces the
-    /// missing-replica AwaitingCommit branch).  Returns the previous pair.
+    /// The schema / __views replica pair (test access swaps it — final review M4:
+    /// no public mutator; see AdminWorkerTestAccess in the tests' support headers).
     struct ReplicasForTest {
         rune::replication::PartitionReplica* schema = nullptr;
         rune::replication::PartitionReplica* views  = nullptr;
     };
-    ReplicasForTest swapReplicasForTest(ReplicasForTest r) noexcept {
-        const ReplicasForTest old{replica_, viewsReplica_};
-        replica_ = r.schema;
-        viewsReplica_ = r.views;
-        return old;
-    }
+    /// Final review M2: DDL ops refused Internal because the last promotion's
+    /// catalog rebuild failed (__topic_schemas or __views).
+    [[nodiscard]] uint64_t refusedForFailedRebuild() const noexcept { return refusedForFailedRebuild_; }
 
     // Fail-loud recovery signal (regression fix): true iff the most recent
     // rebuildFromLog_() (Follower->Leader promotion replay) hit a corrupt or
@@ -244,6 +241,8 @@ public:
     // control-plane wiring) poll this to detect/halt instead of trusting a
     // silently-incomplete registry.
     [[nodiscard]] bool rebuildFailed() const noexcept { return rebuildFailed_; }
+    /// The view-catalog counterpart (recoverViewsOnPromotion_ hit a corrupt record).
+    [[nodiscard]] bool viewsRebuildFailed() const noexcept { return viewsRebuildFailed_; }
 
     // DDL conformance (tests): with startedCount() a test proves AT MOST ONE op is
     // ever started-but-unanswered — started - answered == (hasInFlight() ? 1 : 0).
@@ -281,7 +280,6 @@ public:
     // AUTHORITATIVE values from the create reply (final review I1, Phase 2b E).
     struct DefineAwaitingCommit {
         DefineTopicMsg  msg;
-        int64_t         ticket         = 0;
         int64_t         startedNs      = 0;
         uint16_t        fieldCount     = 0;
         int32_t         topicId        = -1;
@@ -310,19 +308,19 @@ public:
         rune::codec::Descriptor      viewSrcDesc;    // source descriptor (fan-out evolvingSrc)
     };
     // CreateView: ViewRecord appended to __views; waiting for the views replica's
-    // HW to cover `appendedLast`.  The view's topic id is viewRecord.viewTopicId
-    // (== compiledPlan.viewTopicId); `partitionCount` is the sink's authoritative
-    // count from the reply (<= 0 = not reported).
+    // HW to cover `appendedLast`.  The view's topic id is viewRecord.viewTopicId;
+    // the compiled plan lives ONCE, serialized in viewRecord.compiledPlanBlob (final
+    // review M3) — the commit fans out those bytes.  `partitionCount` is the sink's
+    // partition count, resolved on the reply (authoritative, or the source's).
     struct ViewAwaitingCommit {
         CreateViewMsg                view;
-        int64_t                      ticket         = 0;
-        int64_t                      startedNs      = 0;
-        rune::view::CompiledViewPlan compiledPlan;
+        int64_t                      startedNs         = 0;
+        uint64_t                     outputFingerprint = 0;
         rune::codec::Descriptor      viewOutDesc;
         rune::codec::Descriptor      viewSrcDesc;
-        int32_t                      partitionCount = 0;
+        int32_t                      partitionCount    = 1;
         ViewRecord                   viewRecord;     // applied on the HW gate
-        int64_t                      appendedLast   = -1;
+        int64_t                      appendedLast      = -1;
     };
     using InFlight = std::variant<Idle, DefineAwaitingId, DefineAwaitingCommit,
                                   AlterAwaitingCommit, ViewAwaitingId, ViewAwaitingCommit>;
@@ -413,6 +411,14 @@ private:
     // Set by rebuildFromLog_() on a corrupt/truncated TopicSchema record; see
     // rebuildFailed() above. Admin-thread-owned (no atomics — shared-nothing).
     bool     rebuildFailed_ = false;
+    // M2: the __views counterpart.  While either is set, new DDL is refused
+    // Internal: the registries may miss records past the corrupt one, so a create
+    // could adopt (Task 14 / KL1b) a committed topic's sink.
+    bool     viewsRebuildFailed_ = false;
+    uint64_t refusedForFailedRebuild_ = 0;
+
+    // Final review M4: tests swap the replica pointers through this friend only.
+    friend struct AdminWorkerTestAccess;
 
     // In-flight DDL state machine.
     InFlight        inFlight_;              // Idle when no DDL op is in flight

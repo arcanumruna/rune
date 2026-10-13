@@ -174,6 +174,35 @@ public:
     bool markTopicCommitted(int32_t topicId);
 
     // -----------------------------------------------------------------------
+    // Servability (DDL conformance final review C1).  A topic created at RUNTIME
+    // (DefineTopic / CreateView sink) is AWAITING COMMIT until its catalog record
+    // commits: it is neither writable nor readable (produce / subscribe answer the
+    // retriable NotLeader, metadata hides it), so nothing can be acknowledged into a
+    // topic a later boot may reclaim as an orphan.  Boot-built topics (static
+    // RUNE_TOPICS + recovered runtime topics) are committed from construction.
+    //
+    // commitTopic — the record committed (kA2cTopicCommitted on the admin→control
+    // ring): the topic becomes servable and its dir marker moves pending ->
+    // committed (markTopicCommitted).  Returns true iff the topic was awaiting
+    // commit (the caller then builds its replicas + assignment).  Idempotent.
+    // SINGLE-WRITER: control thread only.
+    // -----------------------------------------------------------------------
+    bool commitTopic(int32_t topicId);
+
+    /// The topic exists and is still awaiting its commit (not servable).
+    [[nodiscard]] bool awaitingCommit(int32_t topicId) const noexcept {
+        return topicId >= 0 && static_cast<std::size_t>(topicId) < topics_.size() &&
+               !topics_[static_cast<std::size_t>(topicId)].committed;
+    }
+
+    /// The data-plane accessor: log() for a SERVABLE topic, nullptr while the topic
+    /// is awaiting commit (callers tell the two apart with awaitingCommit(), off the
+    /// hot path).  One extra byte compare on the entry log() already reads.
+    /// SINGLE-WRITER: gateway duty-cycle (control) thread only.
+    [[nodiscard]] rune::storage::Log*
+    servableLog(int32_t topicId, int32_t partition) noexcept;
+
+    // -----------------------------------------------------------------------
     // CP-1: per-topic retention + compaction config accessors.
     // All return a default/safe value when topicId is out of range.
     // -----------------------------------------------------------------------
@@ -213,6 +242,7 @@ private:
         rune::node::TopicSpec             spec;
         std::vector<PartitionEntry>       partitions; // size == spec.partitionCount
         MarkerState                       marker = MarkerState::None;
+        bool                              committed = true;   // false: runtime create awaiting its record (C1)
     };
 
     std::string                            dataDir_;       // root data directory (for createTopic)

@@ -409,7 +409,7 @@ TEST(RuntimeTopicRecoveryRegression, MarkerIsNeverWrittenIntoAPreexistingDirRegr
 TEST(RuntimeTopicRecoveryRegression, OrphanPlaceholderDirIsDeletedRegression) {
     TempDataDir d("orphan-dir");
     touchFile(d.path / "topics" / "orphan_v" / "topic-id", "pending 2\n");
-    touchFile(d.path / "topics" / "orphan_v" / "0" / "00000000000000000000.log");
+    touchFile(d.path / "topics" / "orphan_v" / "0" / "00000000000000000000.log", "");   // C1: never written
     touchFile(d.path / "topics" / "live" / "topic-id", "committed 0\n");
     touchFile(d.path / "topics" / "live" / "0" / "00000000000000000000.log");
     const auto r = rune::node::reconcileTopicDirs(
@@ -432,7 +432,7 @@ TEST(RuntimeTopicRecoveryRegression, FailedCreateOrphanDirIsDeletedEndToEndRegre
         rune::gateway::TopicRegistry reg({spec("events", 0)}, d.path.string());
         ASSERT_EQ(reg.createTopic(spec("orphan_v", -1)), 1);
         ASSERT_EQ(reg.createTopic(spec("kept", -1)), 2);
-        reg.log(1, 0)->append(oneRecordBatch("orphan-data"), 0);
+        // Final review C1: an uncommitted topic is unwritable — the orphan holds nothing.
         reg.log(2, 0)->append(oneRecordBatch("kept-data"), 0);
         appendRecords(d.path / "__topic_schemas", {schemaRecord(2, 1, 1, "kept", "kept_desc")});
         fs::create_directories(d.path / "__views");   // a real broker always has both catalogs
@@ -753,7 +753,7 @@ void bootOneWithAnOrphan(const fs::path& dataDir) {
     ASSERT_EQ(reg.createTopic(spec("orphan_o", -1)), 1);
     ASSERT_EQ(reg.createTopic(spec("t2", -1)), 2);
     ASSERT_EQ(reg.createTopic(spec("v3", -1)), 3);
-    reg.log(1, 0)->append(oneRecordBatch("orphan-bytes"), 0);
+    // Final review C1: the orphan is unwritable (empty); deletes are about markers here.
     reg.log(2, 0)->append(oneRecordBatch("acked-t2"), 0);
     appendRecords(dataDir / "__topic_schemas", {schemaRecord(2, 1, 1, "t2", "d2")});
     appendRecords(dataDir / "__views", {viewRecord(3, "v3", /*source*/ 0)});
@@ -963,9 +963,9 @@ TEST(RuntimeTopicRecoveryRegression, MalformedMarkerNeverDeletesRegression) {
         touchFile(d.path / "topics" / name / "0" / "seg.log");
     }
     touchFile(d.path / "topics" / "ok_newline" / "topic-id", "pending 2\n");
-    touchFile(d.path / "topics" / "ok_newline" / "0" / "seg.log");
+    touchFile(d.path / "topics" / "ok_newline" / "0" / "seg.log", "");      // C1: an orphan is empty
     touchFile(d.path / "topics" / "ok_no_newline" / "topic-id", "pending 3");
-    touchFile(d.path / "topics" / "ok_no_newline" / "0" / "seg.log");
+    touchFile(d.path / "topics" / "ok_no_newline" / "0" / "seg.log", "");
     const auto r = rune::node::reconcileTopicDirs(d.path.string(), {placeholder(2), placeholder(3)},
                                                   {2, 3}, kNow);
     EXPECT_EQ(r.deleted.size(), 2u);
@@ -1038,7 +1038,7 @@ TEST(RuntimeTopicRecoveryRegression, NothingOutsideTopicsDirIsTouchedRegression)
     touchFile(d.path / "__views" / "0" / "seg.log");
     touchFile(d.path / "__topic_schemas" / "00000000000000000000.log");
     touchFile(d.path / "topics" / "orphan_v" / "topic-id", "pending 2\n");
-    touchFile(d.path / "topics" / "orphan_v" / "0" / "seg.log");
+    touchFile(d.path / "topics" / "orphan_v" / "0" / "seg.log", "");   // C1: an orphan is empty
     touchFile(d.path / "topics" / "gone" / "0" / "seg.log");
     const auto r = rune::node::reconcileTopicDirs(d.path.string(), {placeholder(2)}, {2}, kNow);
     EXPECT_EQ(r.deleted.size(), 1u);
@@ -1142,4 +1142,153 @@ TEST(RuntimeTopicRecoveryRegression, MissingTopicsDirIsANoOpRegression) {
     EXPECT_TRUE(r.quarantined.empty());
     EXPECT_FALSE(fs::exists(d.path / "topics")) << "nothing is created";
     EXPECT_FALSE(fs::exists(d.path / "quarantine"));
+}
+
+// ── Final review C1 (a): boot deletes an orphan dir only when it holds no record ──
+// Belt-and-braces under C1 (b) (an uncommitted topic is unwritable): a "pending"
+// orphan placeholder dir is deleted only if every <partition>/*.log is 0 bytes.  One
+// that holds bytes — acked data on a pre-C1 broker — is quarantined with an error
+// naming the placeholder, never deleted.  An empty orphan in the same boot is still
+// deleted.
+TEST(ReconcileRegression, PendingOrphanWithRecordsIsQuarantinedNotDeletedRegression) {
+    TempDataDir d("c1a-written-orphan");
+    {   // boot 1: static "src" (0); orphans "orphan_w" (1, written) and "orphan_e" (3,
+        // empty) never recorded; "kept" (2) and "kept2" (4) committed.
+        rune::gateway::TopicRegistry reg({spec("src", 0)}, d.path.string());
+        ASSERT_EQ(reg.createTopic(spec("orphan_w", -1, 2)), 1);
+        ASSERT_EQ(reg.createTopic(spec("kept", -1)), 2);
+        ASSERT_EQ(reg.createTopic(spec("orphan_e", -1, 2)), 3);
+        ASSERT_EQ(reg.createTopic(spec("kept2", -1)), 4);
+        reg.log(1, 1)->append(oneRecordBatch("acked-into-orphan"), 0);   // partition 1 only
+        appendRecords(d.path / "__topic_schemas",
+                      {schemaRecord(2, 1, 1, "kept", "kept_d"), schemaRecord(4, 1, 1, "kept2", "kept2_d")});
+        fs::create_directories(d.path / "__views");
+        ASSERT_TRUE(reg.markTopicCommitted(2));
+        ASSERT_TRUE(reg.markTopicCommitted(4));
+    }
+    const Boot b = recoverBoot(d.path, {spec("src", 0)});
+    ASSERT_EQ(b.placeholderIds, (std::vector<int32_t>{1, 3}));
+    ASSERT_EQ(b.catalogDamage, "");
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow, b.catalogDamage);
+    ASSERT_EQ(r.deleted.size(), 1u);
+    EXPECT_EQ(r.deleted[0].filename(), "orphan_e") << "an EMPTY pending orphan is still deleted";
+    ASSERT_EQ(r.quarantined.size(), 1u);
+    const fs::path q = d.path / "quarantine" / ("orphan_w-" + std::to_string(kNow));
+    EXPECT_EQ(r.quarantined[0], q);
+    rune::storage::Log moved((q / "1").string());
+    moved.recover();
+    EXPECT_EQ(moved.logEndOffset(), 1) << "the written orphan's record is intact in quarantine";
+    EXPECT_FALSE(fs::exists(d.path / "topics" / "orphan_w"));
+}
+
+// The zero-byte rule looks at every partition's .log files, not just partition 0,
+// and a non-.log file with bytes (an index) does not count as a record.
+TEST(ReconcileRegression, OnlyLogBytesInAnyPartitionBlockTheDeleteRegression) {
+    TempDataDir d("c1a-zero-byte");
+    touchFile(d.path / "topics" / "idx_only" / "topic-id", "pending 1\n");
+    touchFile(d.path / "topics" / "idx_only" / "0" / "00000000000000000000.log", "");
+    touchFile(d.path / "topics" / "idx_only" / "0" / "00000000000000000000.index", "not-a-record");
+    touchFile(d.path / "topics" / "p3_written" / "topic-id", "pending 2\n");
+    touchFile(d.path / "topics" / "p3_written" / "0" / "00000000000000000000.log", "");
+    touchFile(d.path / "topics" / "p3_written" / "3" / "00000000000000000000.log", "bytes");
+    const auto r = rune::node::reconcileTopicDirs(
+        d.path.string(), {spec("live", 0), placeholder(1), placeholder(2), spec("later", 3)}, {1, 2}, kNow);
+    ASSERT_EQ(r.deleted.size(), 1u);
+    EXPECT_EQ(r.deleted[0].filename(), "idx_only");
+    ASSERT_EQ(r.quarantined.size(), 1u);
+    EXPECT_TRUE(fs::exists(d.path / "quarantine" / ("p3_written-" + std::to_string(kNow)) / "3"));
+}
+
+// ── Final review M1: catalog damage is latched across boots ─────────────────────
+// A damaged boot deletes nothing — but recovery truncates the damaged catalog, so
+// the NEXT boot sees it intact.  If quarantining failed on the damaged boot, the
+// orphan's dir is still in topics/ — and must not be deleted then either.  The
+// damage persists as dataDir/.catalog-damaged until no unclaimed dir remains.
+TEST(RuntimeTopicRecoveryRegression, CatalogDamageIsLatchedAcrossBootsRegression) {
+    TempDataDir d("m1-latch");
+    {   // static "src" (0); "orphan_e" (1, pending, EMPTY); "t2" (2, committed)
+        rune::gateway::TopicRegistry reg({spec("src", 0)}, d.path.string());
+        ASSERT_EQ(reg.createTopic(spec("orphan_e", -1)), 1);
+        ASSERT_EQ(reg.createTopic(spec("t2", -1)), 2);
+        reg.log(2, 0)->append(oneRecordBatch("acked-t2"), 0);
+        appendRecords(d.path / "__topic_schemas", {schemaRecord(2, 1, 1, "t2", "d2")});
+        appendRecords(d.path / "__views", {viewRecord(3, "v3", /*source*/ 0)});
+        ASSERT_TRUE(reg.markTopicCommitted(2));
+    }
+    flipByteNearEnd(onlySegment(d.path / "__views"));
+    touchFile(d.path / "quarantine", "a file where the quarantine dir should be");
+    {   // boot A: damaged -> nothing deleted; the quarantine cannot be created
+        const Boot b = recoverBoot(d.path, {spec("src", 0)});
+        ASSERT_FALSE(b.catalogDamage.empty());
+        const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow, b.catalogDamage);
+        EXPECT_TRUE(r.deleted.empty());
+        EXPECT_TRUE(fs::exists(d.path / "topics" / "orphan_e")) << "quarantine failed: left in place";
+        EXPECT_TRUE(fs::exists(d.path / rune::node::kCatalogDamagedSentinel)) << "the damage is latched";
+    }
+    {   // boot B: recovery truncated the catalog last boot -> it reads intact now
+        const Boot b = recoverBoot(d.path, {spec("src", 0)});
+        ASSERT_EQ(b.catalogDamage, "") << "precondition: the damage is invisible to this boot's recovery";
+        ASSERT_EQ(b.placeholderIds, (std::vector<int32_t>{1}));
+        const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow + 1, b.catalogDamage);
+        EXPECT_TRUE(r.deleted.empty()) << "the latched damage still forbids every delete";
+        EXPECT_TRUE(fs::exists(d.path / "topics" / "orphan_e"));
+        EXPECT_TRUE(fs::exists(d.path / rune::node::kCatalogDamagedSentinel));
+    }
+    fs::remove(d.path / "quarantine");   // the operator fixes the quarantine path
+    {   // boot C: everything unclaimed is quarantined -> nothing left to protect
+        const Boot b = recoverBoot(d.path, {spec("src", 0)});
+        const auto r = rune::node::reconcileTopicDirs(d.path.string(), b.all, b.placeholderIds, kNow + 2, b.catalogDamage);
+        EXPECT_TRUE(r.deleted.empty());
+        ASSERT_EQ(r.quarantined.size(), 1u);
+        EXPECT_FALSE(fs::exists(d.path / rune::node::kCatalogDamagedSentinel))
+            << "cleared once no unclaimed topic dir remains";
+    }
+}
+
+// ── Final review I3: a RUNE_TOPICS name colliding with a recovered runtime topic ──
+// Exact: TopicRegistry dedupes by name, so the duplicate takes no id slot and every
+// later recovered topic would come back one id lower (schemas / views on the wrong
+// topics).  Fold: two Logs over one dir on a case-insensitive filesystem.  Both
+// refuse boot, naming both entries and the runtime topic's id.
+TEST(RuntimeTopicRecoveryRegression, StaticNameCollidingWithRuntimeTopicRefusesBootRegression) {
+    const std::vector<TopicSpec> recovered = {spec("ddl_ready", 1), spec("orders", 2), spec("v_orders", 3)};
+    for (const char* staticName : {"orders", "Orders", "ORDERS", "V_Orders"}) {
+        SCOPED_TRACE(staticName);
+        try {
+            rune::node::refuseStaticNamesCollidingWithRecovered({spec("events", 0), spec(staticName, 1)}, recovered);
+            ADD_FAILURE() << "a colliding static name must refuse boot";
+        } catch (const std::runtime_error& ex) {
+            const std::string what = ex.what();
+            EXPECT_NE(what.find(std::string("'") + staticName + "'"), std::string::npos) << what;
+            EXPECT_NE(what.find("(id "), std::string::npos) << what;
+        }
+    }
+    EXPECT_NO_THROW(rune::node::refuseStaticNamesCollidingWithRecovered(
+        {spec("events", 0), spec("orders2", 1), spec("_orders", 2)}, recovered)) << "no false positive";
+    EXPECT_NO_THROW(rune::node::refuseStaticNamesCollidingWithRecovered({spec("events", 0)}, {placeholder(1)}));
+    EXPECT_NO_THROW(rune::node::refuseStaticNamesCollidingWithRecovered(
+        {spec("a", 0), spec("b", 1), spec("orders", 2)}, recovered))
+        << "the same name at the same id (its RUNE_TOPICS position) is one topic: a static topic typed by DDL";
+}
+
+// I3 end to end on real files: boot 1 recorded runtime topic "orders"; boot 2 adds a
+// static "Orders" — recovery + the check refuse it before any dir is touched.
+TEST(RuntimeTopicRecoveryRegression, StaticCaseVariantOfARecoveredTopicRefusesBootEndToEndRegression) {
+    TempDataDir d("i3-e2e");
+    {
+        rune::gateway::TopicRegistry reg({}, d.path.string());
+        ASSERT_EQ(reg.createTopic(spec("orders", -1)), 0);
+        appendRecords(d.path / "__topic_schemas", {schemaRecord(0, 1, 1, "orders", "orders_d")});
+        fs::create_directories(d.path / "__views");
+        ASSERT_TRUE(reg.commitTopic(0));
+    }
+    const std::vector<TopicSpec> statics = {spec("Orders", 0)};
+    // RUNE_TOPICS now has one entry, so the boundary moves to 1: the runtime topic's
+    // id 0 is below it — the check still sees it (catalogTopics holds every id).
+    auto rec = rune::node::recoverRuntimeTopics(d.path.string(), /*firstRuntimeId=*/1);
+    EXPECT_TRUE(rec.specs.empty()) << "precondition: the shifted boundary hides id 0 from the recovered specs";
+    EXPECT_THROW(rune::node::refuseStaticNamesCollidingWithRecovered(statics, rec.catalogTopics), std::runtime_error);
+    // The SAME name and id is one topic (a static topic DefineTopic typed): accepted.
+    EXPECT_NO_THROW(rune::node::refuseStaticNamesCollidingWithRecovered({spec("orders", 0)}, rec.catalogTopics));
+    EXPECT_TRUE(fs::exists(d.path / "topics" / "orders" / "0"));
 }

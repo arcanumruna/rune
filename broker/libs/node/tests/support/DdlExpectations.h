@@ -85,6 +85,10 @@ inline constexpr int kOccupantCount = 10;
 struct Cell { uint16_t code; uint8_t createRequests; };
 
 // Columns: DefD DefT ViewP ViewT Add Drop Rename RenameKey SetCompat CasCur CasStale Get
+// OrphanSink x DefineDisk (final review I2, KL1b closed): a DefineTopic never adopts
+// a runtime view sink (the control thread reports existingIsRuntimeCompact) — 25.
+// Only the view retry adopts it (Task 14), and only while it is uncommitted and
+// unwritten (I1).
 inline constexpr uint16_t kExpectedCode[kOccupantCount][kOpCount] = {
     /* Free                */ { 0,  0,  0,  0,  7,  7,  7,  7,  7,  7,  7,  7},
     /* TypedDisk           */ {25, 25, 25, 25,  0,  0,  0,  0,  0,  0, 31,  0},
@@ -93,7 +97,7 @@ inline constexpr uint16_t kExpectedCode[kOccupantCount][kOpCount] = {
     /* ViewTransient       */ {25, 25, 32, 32, 38, 38, 38, 38, 38, 38, 38,  0},
     /* SchemaLessDisk      */ { 0, 25, 25, 25,  7,  7,  7,  7,  7,  7,  7,  7},
     /* SchemaLessTransient */ { 0,  0, 25, 25,  7,  7,  7,  7,  7,  7,  7,  7},
-    /* OrphanSink (KL1)    */ { 0, 25,  0,  0,  7,  7,  7,  7,  7,  7,  7,  7},
+    /* OrphanSink (KL1/I2) */ {25, 25,  0,  0,  7,  7,  7,  7,  7,  7,  7,  7},
     /* CaseVariant (B3)    */ {25, 25, 25, 25,  7,  7,  7,  7,  7,  7,  7,  7},
     /* BadName (B1/B2)     */ {40, 40, 40, 40,  7,  7,  7,  7,  7,  7,  7,  7},
 };

@@ -765,17 +765,19 @@ TEST(DdlFixRegression, B3_CaseConflictCrossesTheReplyRing) {
                    aeron::util::index_t len) {
         const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
         const std::size_t n = static_cast<std::size_t>(len);
-        ASSERT_EQ(n, 20u) << "the B3 trailer is byte 18 (Task 14's sinkSpecMatches is byte 19)";
+        ASSERT_EQ(n, 21u) << "the B3 trailer is byte 18 (Task 14's sinkSpecMatches 19, I2's 20)";
         const CreateTopicReplyMsg got = decodeCreateTopicReply(p, n);
         EXPECT_EQ(got.caseConflict, frames == 0);
+        EXPECT_EQ(decodeCreateTopicReply(p, n - 1).caseConflict, frames == 0)
+            << "a pre-I2 (20-byte) frame still carries the B3 trailer";
         EXPECT_EQ(got.ticket, 5);
         EXPECT_EQ(got.topicId, 3);
         EXPECT_EQ(got.partitionCount, 2);
         EXPECT_TRUE(got.existed);
         EXPECT_EQ(got.persistence, 0);
-        EXPECT_EQ(decodeCreateTopicReply(p, n - 1).caseConflict, frames == 0)
+        EXPECT_EQ(decodeCreateTopicReply(p, n - 2).caseConflict, frames == 0)
             << "a pre-Task-14 (19-byte) frame still carries the B3 trailer";
-        const CreateTopicReplyMsg old = decodeCreateTopicReply(p, n - 2);
+        const CreateTopicReplyMsg old = decodeCreateTopicReply(p, n - 3);
         EXPECT_FALSE(old.caseConflict) << "a pre-B3 frame decodes as no conflict";
         EXPECT_EQ(old.persistence, 0) << "and keeps every earlier field";
         ++frames;
@@ -1286,7 +1288,7 @@ TEST(DdlFixRegression, B9_AViewOutputAsALaterSourceIsViewSourceIsView) {
 //    op Internal (never a silent drop: the client would hang), logs, counts, and
 //    the next queued op starts.  Unreachable in production (an op reaches
 //    AwaitingCommit only after appending to that replica); forced via the
-//    test-only swapReplicasForTest hook.
+//    test-only AdminWorkerTestAccess::swapReplicas hook.
 TEST(DdlFixRegression, B4_MissingSchemaReplicaInAwaitingCommitAnswersInternal) {
     for (const Op op : {Op::AlterAdd, Op::DefineDisk}) {
         SCOPED_TRACE(opName(op));
@@ -1297,14 +1299,14 @@ TEST(DdlFixRegression, B4_MissingSchemaReplicaInAwaitingCommitAnswersInternal) {
         ASSERT_TRUE(h.tickUntilAppended());
         ASSERT_TRUE(h.worker().hasInFlight());
         const int64_t next = h.submit(Op::ViewPersisted, "v");   // uses only the __views replica
-        const auto saved = h.worker().swapReplicasForTest({});
-        (void)h.worker().swapReplicasForTest({nullptr, saved.views});
+        const auto saved = AdminWorkerTestAccess::swapReplicas(h.worker(), {});
+        (void)AdminWorkerTestAccess::swapReplicas(h.worker(), {nullptr, saved.views});
         h.tick();
         ASSERT_TRUE(h.response(a).has_value()) << "answered, never silently dropped";
         EXPECT_EQ(h.response(a)->err, kInternal);
         EXPECT_EQ(h.worker().commitReplicaMissing(), 1u);
         EXPECT_EQ(h.worker().startedCount(), 4u) << "the next queued op started (2 setup defines + a + next)";
-        (void)h.worker().swapReplicasForTest(saved);
+        (void)AdminWorkerTestAccess::swapReplicas(h.worker(), saved);
         h.settle();
         ASSERT_TRUE(h.response(next).has_value());
         EXPECT_EQ(h.response(next)->err, kOk);
@@ -1323,14 +1325,14 @@ TEST(DdlFixRegression, B4_MissingViewsReplicaInAwaitingCommitAnswersInternal) {
     ASSERT_TRUE(h.tickUntilAppended());
     ASSERT_TRUE(h.worker().hasInFlight());
     const int64_t next = h.submit(Op::AlterAdd, "src");   // uses only the schema replica
-    const auto saved = h.worker().swapReplicasForTest({});
-    (void)h.worker().swapReplicasForTest({saved.schema, nullptr});
+    const auto saved = AdminWorkerTestAccess::swapReplicas(h.worker(), {});
+    (void)AdminWorkerTestAccess::swapReplicas(h.worker(), {saved.schema, nullptr});
     h.tick();
     ASSERT_TRUE(h.response(v).has_value()) << "answered, never silently dropped";
     EXPECT_EQ(h.response(v)->err, kInternal);
     EXPECT_EQ(h.worker().commitReplicaMissing(), 1u);
     EXPECT_TRUE(h.worker().hasInFlight()) << "the next queued op (the ALTER) started on the same tick";
-    (void)h.worker().swapReplicasForTest(saved);
+    (void)AdminWorkerTestAccess::swapReplicas(h.worker(), saved);
     h.settle();
     ASSERT_TRUE(h.response(next).has_value());
     EXPECT_EQ(h.response(next)->err, kOk);
@@ -1650,14 +1652,15 @@ TEST(DdlFixRegression, Optional_SinkSpecMatchesCrossesTheReplyRing) {
                    aeron::util::index_t len) {
         const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
         const std::size_t n = static_cast<std::size_t>(len);
-        ASSERT_EQ(n, 20u) << "the sinkSpecMatches trailer is byte 19";
+        ASSERT_EQ(n, 21u) << "the sinkSpecMatches trailer is byte 19 (I2's existingIsRuntimeCompact 20)";
         const CreateTopicReplyMsg got = decodeCreateTopicReply(p, n);
         EXPECT_EQ(got.sinkSpecMatches, frames == 0);
         EXPECT_FALSE(got.caseConflict);
         EXPECT_EQ(got.ticket, 9);
         EXPECT_EQ(got.topicId, 4);
         EXPECT_TRUE(got.existed);
-        const CreateTopicReplyMsg old = decodeCreateTopicReply(p, n - 1);
+        EXPECT_EQ(decodeCreateTopicReply(p, n - 1).sinkSpecMatches, frames == 0) << "a pre-I2 frame keeps it";
+        const CreateTopicReplyMsg old = decodeCreateTopicReply(p, n - 2);
         EXPECT_FALSE(old.sinkSpecMatches) << "a pre-Task-14 frame decodes as no match";
         EXPECT_EQ(old.topicId, 4) << "and keeps every earlier field";
         ++frames;
@@ -1673,6 +1676,31 @@ TEST(DdlFixRegression, Optional_SinkSpecMatchesCrossesTheReplyRing) {
     const CreateTopicReplyMsg bad = decodeCreateTopicReply(raw, sizeof raw);
     EXPECT_EQ(bad.topicId, -1);
     EXPECT_FALSE(bad.sinkSpecMatches);
+}
+
+// Final review I2: the existingIsRuntimeCompact trailer (byte 20) crosses the ring;
+// a 20-byte (pre-I2) frame decodes it false, and an unknown mode clears it.
+TEST(DdlFixRegression, I2_ExistingIsRuntimeCompactCrossesTheReplyRingRegression) {
+    OneToOneByteRing ring{kCreateTopicRingBytes};
+    CreateTopicReplyMsg m;
+    m.ticket = 11; m.topicId = 6; m.partitionCount = 1; m.existed = true; m.persistence = 0;
+    m.existingIsRuntimeCompact = true;
+    ASSERT_TRUE(encodeCreateTopicReply(ring, m));
+    int frames = 0;
+    ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                   aeron::util::index_t len) {
+        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+        const std::size_t n = static_cast<std::size_t>(len);
+        ASSERT_EQ(n, 21u);
+        EXPECT_TRUE(decodeCreateTopicReply(p, n).existingIsRuntimeCompact);
+        EXPECT_FALSE(decodeCreateTopicReply(p, n - 1).existingIsRuntimeCompact) << "a pre-I2 frame: false";
+        ++frames;
+    }, 4);
+    EXPECT_EQ(frames, 1);
+    uint8_t raw[21] = {};
+    raw[8] = 6; raw[16] = 1; raw[17] = 7;   // unknown persistence
+    raw[20] = 1;
+    EXPECT_FALSE(decodeCreateTopicReply(raw, sizeof raw).existingIsRuntimeCompact);
 }
 
 // The admin-thread guard: a spec-matching reply is adopted ONLY when no catalog

@@ -29,6 +29,7 @@
 //
 // Single-threaded, test-only.  Must NOT be included from production code.
 #include "DdlExpectations.h"
+#include "AdminWorkerTestAccess.h"
 
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/AdminChannels.h>
@@ -260,7 +261,7 @@ public:
         w_->doWork(now_);
         checkInvariant_("doWork");
         while (!committedTopics_.empty()) {          // the control thread drains the ring
-            (void)topics_->markTopicCommitted(committedTopics_.front());
+            (void)topics_->commitTopic(committedTopics_.front());   // servable + marker (C1)
             committedTopics_.pop_front();
         }
         if (control_ == ControlMode::Auto)
@@ -311,6 +312,7 @@ public:
         reply.existed = false;
         reply.caseConflict = false;   // B3: a failed create is Internal, never TopicExists
         reply.sinkSpecMatches = false;   // Task 14: nor an adoptable sink
+        reply.existingIsRuntimeCompact = false;
         w_->onCreateTopicReply(reply);
         checkInvariant_("failed create reply");
     }
@@ -371,6 +373,19 @@ public:
         startedBeforeBoot_ += w_->startedCount();
         teardown_();
         boot_(/*reboot=*/true);
+    }
+
+    /// Append a raw record to a live catalog (`views` = __views, else
+    /// __topic_schemas) as the leader — e.g. an undecodable payload, so the next
+    /// promotion's catalog rebuild fails (M2).  Never call it with a restart after:
+    /// boot recovery refuses a corrupt catalog by design.
+    void appendRawCatalogRecordForTest(bool views, std::vector<uint8_t> payload) {
+        PartitionReplica& r = views ? *viewsReplica_ : *schemaReplica_;
+        const uint8_t key[4] = {0xee, 0xee, 0xee, 0x7f};
+        if (r.appendKeyed(std::span<const uint8_t>(key, 4),
+                          std::span<const uint8_t>(payload.data(), payload.size()), /*acksAll=*/true) < 0)
+            violations_.push_back("appendRawCatalogRecordForTest: append refused");
+        r.onLeaderLogAppended();
     }
 
     // ── checker self-test ───────────────────────────────────────────────────
@@ -487,6 +502,7 @@ private:
         std::vector<TopicSpec> specs = opt_.statics;
         RecoveredRuntimeTopics recovered =
             recoverRuntimeTopics(root_.string(), static_cast<int32_t>(opt_.statics.size()));
+        refuseStaticNamesCollidingWithRecovered(opt_.statics, recovered.catalogTopics);   // I3, as BrokerNode::start
         for (TopicSpec& s : recovered.specs) specs.push_back(std::move(s));
         // B10: exactly as BrokerNode::start boots — placeholder ids are structural,
         // a damaged catalog disables every delete.
@@ -530,7 +546,8 @@ private:
             if (vp.recovery) ++recoveryViewInstalls_; else ++viewPlanPushes_;
         };
         // B10 / D4: the admin->control kA2cTopicCommitted hand-off; the simulated
-        // control thread rewrites the dir marker pending -> committed in tick().
+        // control thread makes the topic servable and rewrites the dir marker
+        // pending -> committed in tick() (TopicRegistry::commitTopic, C1).
         d.topicCommitted = [this](int32_t topicId) { committedTopics_.push_back(topicId); };
         d.respondDefine = [this](int64_t, int64_t corr, int32_t id, uint16_t v, uint16_t e) {
             onDdlAnswer_(corr, id, v, e);

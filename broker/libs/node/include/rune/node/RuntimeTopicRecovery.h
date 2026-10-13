@@ -71,6 +71,11 @@ struct RecoveredRuntimeTopics {
     /// catalogs is missing — a gap may then be a LOST committed record, so
     /// reconcileTopicDirs must delete nothing (pass it through).
     std::string            catalogDamage;
+    /// Final review I3: every topic the catalogs name — ALL ids, also those below
+    /// firstRuntimeId (a static topic typed by DefineTopic, or a runtime topic an
+    /// added RUNE_TOPICS entry shifted below the boundary) — id + name only, the
+    /// latest record's name per id.  Input to refuseStaticNamesCollidingWithRecovered.
+    std::vector<TopicSpec> catalogTopics;
 };
 [[nodiscard]] RecoveredRuntimeTopics recoverRuntimeTopics(const std::string& dataDir,
                                                           int32_t firstRuntimeId);
@@ -78,6 +83,23 @@ struct RecoveredRuntimeTopics {
 /// recoverRuntimeTopics(...).specs — for callers that do not reconcile topic dirs.
 [[nodiscard]] std::vector<TopicSpec> recoverRuntimeTopicSpecs(const std::string& dataDir,
                                                               int32_t firstRuntimeId);
+
+/// Final review M1: dataDir/<this> latches catalog damage across boots (see
+/// reconcileTopicDirs).  A regular file; its content is the damage reason.
+inline constexpr const char* kCatalogDamagedSentinel = ".catalog-damaged";
+
+/// Final review I3: throws (refusing to boot, naming both entries and the catalog
+/// topic's id) when a static RUNE_TOPICS name differs only by ASCII case from a
+/// topic the catalogs name, or equals it under a DIFFERENT id: both would own one
+/// dataDir/topics/<name>/ (a case-fold match opens two Logs over the same files on a
+/// case-insensitive filesystem; an exact match is deduplicated by name and shifts
+/// every later recovered id).  The same name AND id is one topic (a static topic
+/// typed by DefineTopic) — accepted.  A static's id is its position in `statics`.
+/// `catalogTopics` = RecoveredRuntimeTopics::
+/// catalogTopics.  Call after recoverRuntimeTopics, before anything consumes the
+/// merged list (reconcile, TopicRegistry).
+void refuseStaticNamesCollidingWithRecovered(const std::vector<TopicSpec>& statics,
+                                             const std::vector<TopicSpec>& catalogTopics);
 
 /// "__orphan.<topicId>" — the recovery placeholder name for a catalog-less id.
 [[nodiscard]] std::string orphanPlaceholderName(int32_t topicId);
@@ -96,9 +118,11 @@ struct TopicDirReconciliation {
 /// canonical(dataDir/topics) that no topic claims (exactly or ignoring ASCII case)
 /// and that has the recognised layout
 /// <name>/[topic-id][topic-id.tmp] + <digits>/<regular files>:
-///   * its marker is exactly "pending <id>", <id> is in placeholderIds, and no
-///     topic-id.tmp is present — a runtime create whose catalog record never
-///     committed -> DELETED (a failed delete quarantines what remains);
+///   * its marker is exactly "pending <id>", <id> is in placeholderIds, no
+///     topic-id.tmp is present, and every <partition>/*.log is 0 bytes (final
+///     review C1: an uncommitted topic is unwritable, so a never-committed orphan
+///     holds nothing) — a runtime create whose catalog record never committed ->
+///     DELETED (a failed delete quarantines what remains);
 ///   * otherwise -> MOVED to dataDir/quarantine/<name>-<nowUnixSeconds>[-N], never
 ///     deleted.  That covers no marker (static / older builds), a "committed"
 ///     marker (its record committed, so an unclaimed one means CATALOG DAMAGE —
@@ -106,6 +130,10 @@ struct TopicDirReconciliation {
 ///     an unreadable or malformed marker.
 /// Fix round 2b: a non-empty `catalogDamage` (RecoveredRuntimeTopics) disables
 /// EVERY delete this boot — placeholder dirs are quarantined, with one warn line.
+/// Final review M1: the damage is latched in dataDir/kCatalogDamagedSentinel, which
+/// keeps disabling deletes on later boots (whose recovery reads the truncated or
+/// recreated catalog as intact) until a reconcile leaves no unclaimed topic dir in
+/// place; then it is removed (or remove it by hand).
 /// FIRST (fix round 1b), before any delete decision: every catalog-claimed runtime
 /// topic dir (exact name, non-placeholder) whose marker reads "pending <its id>" is
 /// rewritten "committed <id>" (atomic) — a crash between the record's commit and

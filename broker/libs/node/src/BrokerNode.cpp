@@ -386,6 +386,9 @@ void BrokerNode::start() {
         RecoveredRuntimeTopics recoveredTopics = recoverRuntimeTopics(
             config_.dataDir, firstRuntimeTopicId_);
         std::vector<TopicSpec>& recovered = recoveredTopics.specs;
+        // Final review I3: a RUNE_TOPICS name equal (or equal but for case) to a
+        // recovered runtime topic refuses boot — before anything on disk is touched.
+        refuseStaticNamesCollidingWithRecovered(config_.topics, recoveredTopics.catalogTopics);
         if (!recovered.empty()) {
             spdlog::info("BrokerNode[{}]: recovered {} runtime topic(s) from the admin "
                          "catalogs (ids {}..{})", config_.nodeId, recovered.size(),
@@ -3832,9 +3835,25 @@ int BrokerNode::serviceAdminControl_() {
             }
             // B10 / D4 fix round 1: the topic's catalog record committed — this
             // (control) thread owns TopicRegistry, so it rewrites the dir marker.
+            // C1 (final review): the commit is also what makes a runtime topic
+            // SERVABLE — commitTopic flips it, and only then are its replicas and
+            // metadata assignment built (createRuntimeUserReplicas), so an orphan
+            // (a create whose record never committed) is never routable: no
+            // produce, subscribe, worker ingress or metadata entry can reach it.
+            // kA2cTopicCommitted precedes the view plan on this FIFO ring, so a
+            // view's install still finds its sink's replicas.
             if (tid == kA2cTopicCommitted) {
                 const int32_t topicId = decodeTopicCommitted(p, n);
-                if (topicId >= 0 && topicRegistry_) (void)topicRegistry_->markTopicCommitted(topicId);
+                if (topicId >= 0 && topicRegistry_ && topicRegistry_->commitTopic(topicId)) {
+                    try {
+                        if (const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId))
+                            (void)createRuntimeUserReplicas(*spec);
+                    } catch (const std::exception& ex) {
+                        spdlog::error("BrokerNode[{}]: committed runtime topic id={} — building its replicas "
+                                      "failed: {} (produce answers NotLeader until a restart rebuilds it)",
+                                      config_.nodeId, topicId, ex.what());
+                    }
+                }
                 return;
             }
             const A2cDispatch d = dispatchAdminToControl(tid, p, n,
@@ -3869,41 +3888,25 @@ int BrokerNode::serviceAdminControl_() {
             CreateTopicReplyMsg reply;
             reply.ticket = req.ticket;
             // Test-only fault (setAdminCreateFaultForTest): the first request for the
-            // configured name fails, before or after the topic is created.
-            const bool inject = !adminCreateFaultFired_ && !adminCreateFaultName_.empty() &&
-                                req.name == adminCreateFaultName_;
-            if (inject) adminCreateFaultFired_ = true;
-            if (inject && !adminCreateFaultAfterCreate_) {
+            // configured name fails, before or after the topic is created; firing
+            // disarms it.
+            std::optional<AdminCreateFaultForTest> fault;
+            if (adminCreateFault_ && req.name == adminCreateFault_->name) [[unlikely]] {
+                fault = std::move(adminCreateFault_);
+                adminCreateFault_.reset();
+            }
+            if (fault && !fault->afterCreate) {
                 reply.topicId = -1;
             } else if (topicRegistry_) {
                 // createTopicForAdmin (AdminCreateTopic.h): createTopic + the
                 // AUTHORITATIVE partition count + `existed` (final review I1 —
                 // an existing name returns that topic, never the requested spec).
+                // C1: the topic is created AWAITING COMMIT — no replica, no
+                // assignment, not servable — until kA2cTopicCommitted (above).
                 reply = createTopicForAdmin(*topicRegistry_, req, firstRuntimeTopicId_);
-                // Task 8b (SINGLE-NODE): make the runtime topic
-                // produce/consume-capable by creating its user
-                // PartitionReplica(s) NOW, on this same control
-                // thread that owns TopicRegistry / replicaRegistry_
-                // / replTransport_ / MetadataService (no new
-                // cross-thread mutation).  The authoritative spec
-                // (assigned id + all fields, dirs/logs already
-                // created by createTopic) is read back from the
-                // registry and replayed through the boot path
-                // (idempotent for an existing topic's replicas).
-                if (reply.topicId >= 0 && !reply.caseConflict) {   // B3: nothing was created
-                    try {
-                        if (const rune::node::TopicSpec* authSpec =
-                                topicRegistry_->topic(reply.topicId))
-                            (void)createRuntimeUserReplicas(*authSpec);
-                    } catch (const std::exception& ex) {
-                        spdlog::error("BrokerNode: admin createTopic('{}') replicas failed: {}",
-                                      req.name, ex.what());
-                        reply.topicId = -1;
-                    }
-                }
-                if (inject) {
+                if (fault) {
                     reply.topicId = -1; reply.existed = false; reply.caseConflict = false;
-                    reply.sinkSpecMatches = false;
+                    reply.sinkSpecMatches = false; reply.existingIsRuntimeCompact = false;
                 }
             }
             // Reply ring is 1-deep in flight (one DDL at a time) → never full.
@@ -3911,24 +3914,67 @@ int BrokerNode::serviceAdminControl_() {
         }, 8);
 
     // (3) Drain response frames (admin → control) → session egress.
-    work += agent->egressRing().drain(
-        [this](int32_t /*tid*/,
-               aeron::concurrent::AtomicBuffer& b,
-               aeron::util::index_t off,
-               aeron::util::index_t len) {
-            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
-            const auto n = static_cast<std::size_t>(len);
-            if (n < 8) return;
-            int64_t session;
-            std::memcpy(&session, p, 8);
-            if (gateway_)
-                (void)gateway_->sendControlFrame(session, p + 8, n - 8);
-        }, 16);
+    //     C1 / M7: through the DDL answer gate — a DefineTopic / CreateView OK
+    //     leaves only once its topic serves (committed above, in (1b), and its
+    //     assignment routed); FIFO behind it.  The ring is drained only while the
+    //     gate holds nothing, so one drain always fits the gate.
+    auto send = [this](int64_t session, const uint8_t* f, std::size_t n) {
+        if (gateway_) (void)gateway_->sendControlFrame(session, f, n);
+    };
+    auto serves = [this](int32_t topicId) { return ddlTopicServes_(topicId); };
+    if (!ddlAnswerGate_.empty()) {
+        const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        work += ddlAnswerGate_.release(nowNs, serves, send, [this](int64_t session, int32_t topicId) {
+            ++ddlAnswersOverdue_;
+            spdlog::warn("BrokerNode[{}]: DDL OK for topic id={} (session {}) held {} ms waiting for the "
+                         "topic to serve — sent anyway (overdue answers: {})", config_.nodeId, topicId,
+                         session, kDdlAnswerMaxHoldNs / 1'000'000, ddlAnswersOverdue_);
+        });
+    }
+    if (ddlAnswerGate_.empty()) {
+        work += agent->egressRing().drain(
+            [this, &send, &serves](int32_t /*tid*/,
+                                   aeron::concurrent::AtomicBuffer& b,
+                                   aeron::util::index_t off,
+                                   aeron::util::index_t len) {
+                const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
+                const auto n = static_cast<std::size_t>(len);
+                if (n < 8) return;
+                int64_t session;
+                std::memcpy(&session, p, 8);
+                const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                switch (ddlAnswerGate_.offer(session, p + 8, n - 8, nowNs, serves)) {
+                    case DdlAnswerGate::Offer::Pass: send(session, p + 8, n - 8); break;
+                    case DdlAnswerGate::Offer::Held: break;
+                    case DdlAnswerGate::Offer::Full:   // impossible by sizing: never dropped silently
+                        spdlog::critical("BrokerNode[{}]: DDL answer gate full — sending the answer ungated",
+                                         config_.nodeId);
+                        send(session, p + 8, n - 8);
+                        break;
+                }
+            }, 16);
+    }
 
     return work;
 }
 
 int AdminControlPlane::doWork(int64_t /*nowNs*/) { return node_.serviceAdminControl_(); }
+
+// C1 / M7: the topic of a DDL OK serves — its record committed (servable) and, when
+// a metadata service drives assignments, every partition's role has been routed
+// (the control-owned intended-role hint the bridge records).  Control thread.
+bool BrokerNode::ddlTopicServes_(int32_t topicId) const noexcept {
+    if (!topicRegistry_) return true;
+    if (topicRegistry_->awaitingCommit(topicId)) return false;
+    const rune::node::TopicSpec* spec = topicRegistry_->topic(topicId);
+    if (spec == nullptr || !replicaRegistry_ || !metadataService_) return true;
+    for (int32_t p = 0; p < spec->partitionCount; ++p)
+        if (replicaRegistry_->lookupHandle(topicId, p).intendedRole == ReplicaRegistry::IntendedRole::Unknown)
+            return false;
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // A9 (findings §4.15): fused placement — the runtime runs in worker 0's pass, so the cross-thread rings the

@@ -104,7 +104,8 @@ coord::TopicPartitionCounts GroupCoordinationService::buildTopicPartitionCounts(
     const int32_t n = topics_->topicCount();
     for (int32_t tid = 0; tid < n; ++tid) {
         const rune::node::TopicSpec* spec = topics_->topic(tid);
-        if (spec) {
+        // C1: a runtime topic awaiting its DDL commit is not assignable.
+        if (spec && !topics_->awaitingCommit(tid)) {
             counts[spec->name] = spec->partitionCount;
         }
     }

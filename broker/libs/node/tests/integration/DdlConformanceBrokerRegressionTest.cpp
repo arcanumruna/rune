@@ -499,3 +499,312 @@ TEST(DdlConformanceBrokerRegression, T8_RemovedStaticTopicIsQuarantinedNotDelete
         EXPECT_TRUE(fs::exists(quarantined / "0")) << "the quarantined copy stays until restored by hand";
     }
 }
+
+// ── Final review C1 / I1 / I3 / M7 (final fix wave) ─────────────────────────────
+namespace {
+
+constexpr int16_t kNotLeaderCode = 2;   // rune::protocol::client::ErrorCode::NotLeader (retriable)
+
+std::vector<uint8_t> oneRecord(std::string_view value) {
+    rune::protocol::RecordBatchBuilder b(0, 0);
+    b.append(std::string_view{}, value, 0);
+    return b.build();
+}
+
+/// One produce, no retry: its ProduceResponse code, or the code of an ErrorResponse
+/// on its correlation id (nullopt = unanswered within 10 s).
+std::optional<int16_t> produceOnce(ShardTestClient& c, const Wire& w, int64_t sid, int32_t topicId,
+                                   std::string_view value) {
+    const int64_t corr = c.nextCorrelationId();
+    if (!c.produce(w.gw, w.stream, sid, corr, topicId, 0, /*acks=*/1, oneRecord(value))) return std::nullopt;
+    const auto deadline = Clock::now() + 10s;
+    std::optional<int16_t> code;
+    while (!code && Clock::now() < deadline) {
+        (void)c.pollUntil([&] {
+            if (auto a = c.ackFor(corr)) { code = a->errorCode; return true; }
+            for (const auto& e : c.errors()) if (e.correlationId == corr) { code = e.code; return true; }
+            return false;
+        });
+    }
+    return code;
+}
+
+bool listed(ShardTestClient& c, const Wire& w, int64_t sid, int32_t topicId) {
+    for (const PartitionInfo& p : c.metadata(w.gw, w.stream, sid))
+        if (p.topicId == topicId) return true;
+    return false;
+}
+
+std::size_t logBytes(const fs::path& topicDir) {
+    std::size_t n = 0;
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(topicDir, ec), end; !ec && it != end; it.increment(ec))
+        if (it->path().extension() == ".log") n += static_cast<std::size_t>(fs::file_size(it->path(), ec));
+    return n;
+}
+
+} // namespace
+
+// C1: a runtime topic whose catalog record never committed (a DefineTopic whose
+// control reply failed after the create) is neither writable nor readable: produce
+// and subscribe are refused NotLeader (retriable, never silent), metadata hides it.
+// Nothing can be acked into it, so boot deletes its (empty) dir — and a committed
+// topic created later serves at once.
+TEST(DdlConformanceBrokerRegression, C1_UncommittedTopicIsNeitherWritableNorReadableRegression) {
+    const TempDataDir tmp("c1_");
+    const fs::path& dir = tmp.path;
+    const NodeConfig cfg = makeSingleNodeConfig(dir);
+    int32_t orphanId = -1, laterId = -1;
+    {
+        BrokerNode node{cfg};
+        node.setAdminCreateFaultForTest("orph", /*afterCreate=*/true);
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ShardTestClient client(dir / "client-aeron");
+        client.keepSessionsAlive(true);
+        Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+        const int64_t sid = client.connect(w.gw, w.stream);
+        ASSERT_TRUE(w.awaitDdlReady(sid));
+        EXPECT_EQ(w.define(sid, "orph"), kInternal);
+        ASSERT_EQ(w.define(sid, "later"), kOk);
+        laterId = w.schema(sid, "later")->topicId;
+        orphanId = laterId - 1;   // ids: ddl_ready, orph, later
+        ASSERT_TRUE(fs::exists(dir / "topics" / "orph")) << "the failed create left its topic behind";
+
+        const auto p = produceOnce(client, w, sid, orphanId, "must-not-land");
+        ASSERT_TRUE(p.has_value()) << "a produce to an uncommitted topic is answered (never silent)";
+        EXPECT_EQ(*p, kNotLeaderCode) << "refused, retriable";
+        const auto sub = client.awaitSubscribeCode(client.sendSubscribe(w.gw, w.stream, sid, orphanId, 0),
+                                                   Clock::now() + 10s);
+        ASSERT_TRUE(sub.has_value()) << "a subscribe to an uncommitted topic is answered";
+        EXPECT_EQ(*sub, kNotLeaderCode) << "refused, retriable";
+        EXPECT_FALSE(listed(client, w, sid, orphanId)) << "hidden from metadata";
+        EXPECT_EQ(leoOrMinusOne(node, orphanId, 0), -1) << "no replica: nothing can be routed to it";
+
+        // M7: the committed topic is listed and serves on the FIRST produce after its OK.
+        EXPECT_TRUE(listed(client, w, sid, laterId));
+        const auto ok = produceOnce(client, w, sid, laterId, "kept");
+        ASSERT_TRUE(ok.has_value());
+        EXPECT_EQ(*ok, 0) << "a committed topic serves at once";
+        node.stop();
+    }
+    EXPECT_EQ(logBytes(dir / "topics" / "orph"), 0u) << "nothing was ever written to the orphan";
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        EXPECT_FALSE(fs::exists(dir / "topics" / "orph")) << "the empty orphan dir is deleted at boot";
+        EXPECT_FALSE(fs::exists(dir / "quarantine"));
+        EXPECT_EQ(leoOnOwner(node, laterId, 0), 1) << "the committed topic's acked record survives";
+        node.stop();
+    }
+}
+
+// C1 + M7: every DefineTopic OK is answered only once the topic serves — the
+// first produce after the answer is accepted (no retry).  Disk topics: this
+// (legacy-runtime) gateway produce path answers a transient topic UnknownPartition
+// on the base code too (TopicRegistry holds no log for it) — not a DDL property.
+TEST(DdlConformanceBrokerRegression, C1_DefineOkMeansTheTopicServesAtOnceRegression) {
+    const TempDataDir tmp("c1ok_");
+    const fs::path& dir = tmp.path;
+    const NodeConfig cfg = makeSingleNodeConfig(dir);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(30s));
+    ShardTestClient client(dir / "client-aeron");
+    client.keepSessionsAlive(true);
+    Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+    const int64_t sid = client.connect(w.gw, w.stream);
+    ASSERT_TRUE(w.awaitDdlReady(sid));
+    for (int i = 0; i < 12; ++i) {
+        const std::string n = "served" + std::to_string(i);
+        const auto r = client.awaitDefine(client.sendDefineTopic(w.gw, w.stream, sid, n, 1, charBlob(), 0),
+                                          Clock::now() + 10s);
+        ASSERT_TRUE(r.has_value());
+        ASSERT_EQ(r->errorCode, kOk) << n;
+        const auto p = produceOnce(client, w, sid, r->topicId, "first");
+        ASSERT_TRUE(p.has_value()) << n;
+        EXPECT_EQ(*p, 0) << n << ": the first produce after the OK is accepted";
+    }
+    node.stop();
+}
+
+// C1 / I1 / I5(a): write to an orphan view SINK, then retry the CREATE VIEW, then
+// restart.  The write is refused (the sink is unroutable until a record claims it),
+// so the retry adopts an EMPTY sink — raw bytes can never become view output — and
+// the view survives the restart with an empty sink log.
+TEST(DdlConformanceBrokerRegression, C1_WriteToAnOrphanSinkThenRetryAndRestartRegression) {
+    const TempDataDir tmp("c1sink_");
+    const fs::path& dir = tmp.path;
+    const NodeConfig cfg = makeSingleNodeConfig(dir);
+    int32_t sinkId = -1;
+    {
+        BrokerNode node{cfg};
+        node.setAdminCreateFaultForTest("osink", /*afterCreate=*/true);
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ShardTestClient client(dir / "client-aeron");
+        client.keepSessionsAlive(true);
+        Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+        const int64_t sid = client.connect(w.gw, w.stream);
+        ASSERT_TRUE(w.awaitDdlReady(sid));
+        ASSERT_EQ(w.define(sid, "character"), kOk);
+        const int32_t charId = w.schema(sid, "character")->topicId;
+        EXPECT_EQ(w.view(sid, "osink", "character"), kInternal);
+        sinkId = charId + 1;
+        for (int i = 0; i < 3; ++i) {
+            const auto p = produceOnce(client, w, sid, sinkId, "foreign-bytes");
+            ASSERT_TRUE(p.has_value());
+            EXPECT_EQ(*p, kNotLeaderCode) << "a raw write to an orphan sink is refused";
+        }
+        EXPECT_EQ(w.view(sid, "osink", "character"), kOk) << "the retry adopts its own (empty) orphan sink";
+        EXPECT_EQ(w.schema(sid, "osink")->topicId, sinkId);
+        EXPECT_EQ(leoOnOwner(node, sinkId, 0), 0) << "the adopted sink holds no foreign bytes";
+        node.stop();
+    }
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ShardTestClient client(dir / "client-aeron2");
+        client.keepSessionsAlive(true);
+        Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+        const int64_t sid = client.connect(w.gw, w.stream);
+        ASSERT_TRUE(w.awaitDdlReady(sid));
+        EXPECT_EQ(w.view(sid, "osink", "character"), kViewExists);
+        EXPECT_EQ(w.schema(sid, "osink")->topicId, sinkId);
+        EXPECT_EQ(leoOnOwner(node, sinkId, 0), 0);
+        node.stop();
+    }
+}
+
+// C1 / I5(a): write to an orphan DefineTopic topic, then retry the define: the write
+// was refused, the retry adopts the topic, and from then on it serves.
+TEST(DdlConformanceBrokerRegression, C1_WriteToAnOrphanTopicThenRetryRegression) {
+    const TempDataDir tmp("c1retry_");
+    const fs::path& dir = tmp.path;
+    const NodeConfig cfg = makeSingleNodeConfig(dir);
+    BrokerNode node{cfg};
+    node.setAdminCreateFaultForTest("orph", /*afterCreate=*/true);
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(30s));
+    ShardTestClient client(dir / "client-aeron");
+    client.keepSessionsAlive(true);
+    Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+    const int64_t sid = client.connect(w.gw, w.stream);
+    ASSERT_TRUE(w.awaitDdlReady(sid));
+    EXPECT_EQ(w.define(sid, "orph"), kInternal);
+    const int32_t orphanId = 1;   // ids: ddl_ready, orph
+    const auto refused = produceOnce(client, w, sid, orphanId, "early");
+    ASSERT_TRUE(refused.has_value());
+    EXPECT_EQ(*refused, kNotLeaderCode);
+    ASSERT_EQ(w.define(sid, "orph"), kOk) << "the retry adopts the orphan";
+    EXPECT_EQ(w.schema(sid, "orph")->topicId, orphanId);
+    EXPECT_EQ(leoOnOwner(node, orphanId, 0), 0) << "the refused write never landed";
+    const auto ok = produceOnce(client, w, sid, orphanId, "after-commit");
+    ASSERT_TRUE(ok.has_value());
+    EXPECT_EQ(*ok, 0);
+    EXPECT_TRUE(listed(client, w, sid, orphanId));
+    node.stop();
+}
+
+// I3 / I5(c): a RUNE_TOPICS name equal to (or a case variant of) a recovered runtime
+// topic refuses boot, naming both — two specs over one directory would corrupt it
+// (fold) or shift every later id (exact).  Nothing on disk is touched; the old
+// configuration still boots.
+TEST(DdlConformanceBrokerRegression, I3_StaticNameCollidingWithARuntimeTopicRefusesBootRegression) {
+    const TempDataDir tmp("i3_");
+    const fs::path& dir = tmp.path;
+    const NodeConfig cfg = makeSingleNodeConfig(dir);
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ShardTestClient client(dir / "client-aeron");
+        client.keepSessionsAlive(true);
+        Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+        const int64_t sid = client.connect(w.gw, w.stream);
+        ASSERT_TRUE(w.awaitDdlReady(sid));
+        ASSERT_EQ(w.define(sid, "orders"), kOk);
+        node.stop();
+    }
+    for (const char* staticName : {"orders", "Orders", "ORDERS"}) {
+        SCOPED_TRACE(staticName);
+        NodeConfig c2 = cfg;
+        TopicSpec s; s.name = staticName; s.partitionCount = 1; s.topicId = 0;
+        c2.topics = {s};
+        BrokerNode node{c2};
+        try {
+            node.start();
+            ADD_FAILURE() << "boot must refuse a static name colliding with runtime topic 'orders'";
+            node.stop();
+        } catch (const std::exception& ex) {
+            const std::string what = ex.what();
+            EXPECT_NE(what.find(staticName), std::string::npos) << what;
+            EXPECT_NE(what.find("'orders'"), std::string::npos) << what;
+        }
+        EXPECT_TRUE(fs::exists(dir / "topics" / "orders" / "0")) << "nothing moved or deleted";
+        EXPECT_FALSE(fs::exists(dir / "quarantine"));
+    }
+    {
+        BrokerNode node{cfg};
+        node.start();   // the unchanged configuration still boots
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ShardTestClient client(dir / "client-aeron2");
+        client.keepSessionsAlive(true);
+        Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+        const int64_t sid = client.connect(w.gw, w.stream);
+        ASSERT_TRUE(w.awaitDdlReady(sid));   // the admin thread replayed the catalog
+        const auto s = w.schema(sid, "orders");
+        ASSERT_TRUE(s.has_value());
+        EXPECT_EQ(s->errorCode, kOk) << "the runtime topic is intact";
+        node.stop();
+    }
+}
+
+// I5(c): a NON-colliding RUNE_TOPICS addition while runtime topics exist.  A static
+// topic's id is its RUNE_TOPICS position, so adding one moves the static/runtime id
+// boundary (firstRuntimeId) — the documented, pre-existing limitation: the runtime
+// topic whose id the new entry takes is no longer recovered as a runtime topic.
+// This pins the DATA-SAFETY half: the broker boots, every other runtime topic keeps
+// its id and its acked records, and the displaced topic's dir is quarantined
+// (committed marker), never deleted.
+TEST(DdlConformanceBrokerRegression, I5c_AddingAStaticTopicWhileRuntimeTopicsExistNeverDeletesDataRegression) {
+    const TempDataDir tmp("i5c_");
+    const fs::path& dir = tmp.path;
+    const NodeConfig cfg = makeSingleNodeConfig(dir);
+    int32_t ordersId = -1;
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ShardTestClient client(dir / "client-aeron");
+        client.keepSessionsAlive(true);
+        Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+        const int64_t sid = client.connect(w.gw, w.stream);
+        ASSERT_TRUE(w.awaitDdlReady(sid));   // "ddl_ready": runtime id 0
+        ASSERT_EQ(w.define(sid, "orders"), kOk);
+        ordersId = w.schema(sid, "orders")->topicId;
+        ASSERT_EQ(ordersId, 1);
+        const auto p = produceOnce(client, w, sid, ordersId, "acked-order");
+        ASSERT_TRUE(p.has_value());
+        ASSERT_EQ(*p, 0);
+        node.stop();
+    }
+    NodeConfig c2 = cfg;
+    TopicSpec extra; extra.name = "extra"; extra.partitionCount = 1; extra.topicId = 0;
+    c2.topics = {extra};
+    {
+        BrokerNode node{c2};
+        node.start();   // no name collides: boots
+        ASSERT_TRUE(node.awaitLeader(30s));
+        EXPECT_EQ(leoOnOwner(node, ordersId, 0), 1) << "a runtime topic above the boundary keeps id + data";
+        node.stop();
+    }
+    EXPECT_FALSE(fs::exists(dir / "topics" / "ddl_ready")) << "the displaced runtime topic left topics/";
+    bool quarantined = false;
+    if (fs::exists(dir / "quarantine"))
+        for (const auto& e : fs::directory_iterator(dir / "quarantine"))
+            quarantined = quarantined || e.path().filename().string().starts_with("ddl_ready-");
+    EXPECT_TRUE(quarantined) << "quarantined, never deleted";
+}

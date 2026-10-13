@@ -174,7 +174,50 @@ struct DefinedTopic {
     PersistenceMode persistence = PersistenceMode::Disk;   // latest version's (Phase 2b E)
 };
 
+/// Final review C1 (a): true when any <partition>/*.log file of `topicDir` holds a
+/// byte.  Segments are not preallocated, so a log nothing was ever appended to is
+/// empty.  An unreadable size counts as "holds records" (never delete on doubt).
+bool anyLogBytes(const fs::path& topicDir) {
+    std::error_code ec;
+    for (fs::directory_iterator it(topicDir, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code sec;
+        if (!fs::is_directory(it->symlink_status(sec)) || sec) continue;   // the marker files
+        std::error_code pec;
+        for (fs::directory_iterator pit(it->path(), pec), pend; !pec && pit != pend; pit.increment(pec)) {
+            if (pit->path().extension() != ".log") continue;
+            std::error_code fec;
+            const auto size = fs::file_size(pit->path(), fec);
+            if (fec || size > 0) return true;
+        }
+        if (pec) return true;
+    }
+    return static_cast<bool>(ec);
+}
+
 } // namespace
+
+void refuseStaticNamesCollidingWithRecovered(const std::vector<TopicSpec>& statics,
+                                             const std::vector<TopicSpec>& catalogTopics) {
+    for (const TopicSpec& r : catalogTopics) {
+        for (std::size_t i = 0; i < statics.size(); ++i) {
+            const TopicSpec& st = statics[i];
+            // A static topic's id is its RUNE_TOPICS position (TopicRegistry assigns
+            // ids sequentially), whatever the spec's topicId field says.
+            const int32_t staticId = static_cast<int32_t>(i);
+            const bool exact = st.name == r.name;
+            if (!exact && !topicNamesFoldEqual(st.name, r.name)) continue;
+            if (exact && staticId == r.topicId) continue;   // one topic: a static typed by DDL
+            throw std::runtime_error(
+                "RUNE_TOPICS topic '" + escapeNameForLog(st.name) + "' " +
+                (st.name == r.name ? "has the same name as" : "differs only by letter case from") +
+                " the runtime topic '" + escapeNameForLog(r.name) + "' (id " + std::to_string(r.topicId) +
+                ", created by DefineTopic / CREATE VIEW and recorded in the admin catalogs; the RUNE_TOPICS "
+                "entry is id " + std::to_string(staticId) + ") — both would own dataDir/topics/" +
+                escapeNameForLog(r.name) + "/; refusing to boot. Remove or rename the RUNE_TOPICS entry (a "
+                "runtime topic is managed by DDL, not RUNE_TOPICS).");
+        }
+    }
+}
 
 std::string orphanPlaceholderName(int32_t topicId) {
     return "__orphan." + std::to_string(topicId);
@@ -194,12 +237,31 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
     if (ec) return result;
 
     // Fix round 2b: on a damaged catalog NOTHING is deleted this boot.
-    const bool deletesAllowed = catalogDamage.empty();
-    if (!deletesAllowed) {
+    // Final review M1: and the damage is LATCHED (dataDir/.catalog-damaged) — this
+    // boot's recovery truncated the damaged catalog (or the replica recreates a
+    // missing one), so the next boot would read it intact and could delete a dir
+    // this boot failed to quarantine.  Cleared once no unclaimed topic dir remains.
+    const fs::path sentinel = fs::path(dataDir) / kCatalogDamagedSentinel;
+    std::error_code sec0;
+    const bool latched = fs::exists(fs::symlink_status(sentinel, sec0));
+    if (!catalogDamage.empty() && !latched) {
+        std::ofstream out(sentinel, std::ios::binary | std::ios::trunc);
+        out << catalogDamage << "\n";
+        out.close();
+        if (!out) spdlog::error("topic-dir reconcile: cannot write '{}' — the catalog damage is not latched",
+                                sentinel.string());
+    }
+    const bool deletesAllowed = catalogDamage.empty() && !latched;
+    if (!catalogDamage.empty()) {
         spdlog::warn("topic-dir reconcile: the topic catalog is damaged ({}) — NO topic dir is "
                      "deleted this boot; every orphan-placeholder dir is quarantined instead",
                      catalogDamage);
+    } else if (latched) {
+        spdlog::warn("topic-dir reconcile: an earlier boot found the topic catalog damaged ('{}' exists) — "
+                     "NO topic dir is deleted; every orphan-placeholder dir is quarantined instead",
+                     sentinel.string());
     }
+    std::size_t leftInPlace = 0;   // candidates neither deleted nor quarantined (M1)
 
     // I2: placeholders are what RECOVERY created (structural), never a name match.
     const std::set<int32_t> placeholders(placeholderIds.begin(), placeholderIds.end());
@@ -284,6 +346,7 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
         if (cec || c.parent_path() != canonicalRoot) {   // guard: a direct child of dataDir/topics only
             spdlog::error("topic-dir reconcile: refusing to touch '{}' (outside '{}')",
                           p.string(), canonicalRoot.string());
+            ++leftInPlace;
             continue;
         }
         const TopicIdMarker marker = readTopicIdMarker(c);
@@ -299,7 +362,16 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
                          "marker rewrite ('{}') — quarantining, NOT deleting", c.string(),
                          rune::gateway::kTopicIdMarkerTmpFile);
         }
-        if (marker.kind == MarkerKind::Pending && isPlaceholderId && !tmpPresent && deletesAllowed) {
+        // Final review C1 (a): an uncommitted topic is unwritable (C1 b), so a
+        // never-committed orphan's logs are empty.  One holding bytes (acked data on
+        // an older broker) is quarantined, never deleted.
+        const bool holdsRecords = marker.kind == MarkerKind::Pending && isPlaceholderId && anyLogBytes(c);
+        if (holdsRecords) {
+            spdlog::error("topic-dir reconcile: '{}' is the dir of orphan placeholder '{}' but its log holds "
+                          "records — quarantining, NOT deleting", c.string(), orphanPlaceholderName(marker.id));
+        }
+        if (marker.kind == MarkerKind::Pending && isPlaceholderId && !tmpPresent && deletesAllowed &&
+            !holdsRecords) {
             spdlog::warn("topic-dir reconcile: deleting '{}' — the data dir of orphan placeholder '{}' "
                          "(a runtime create whose catalog record never committed)",
                          c.string(), orphanPlaceholderName(marker.id));
@@ -329,12 +401,14 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
         if (fs::is_symlink(qst) || (fs::exists(qst) && !fs::is_directory(qst))) {
             spdlog::error("topic-dir reconcile: '{}' is not a plain directory — not quarantining '{}'",
                           quarantineRoot.string(), c.string());
+            ++leftInPlace;
             continue;
         }
         qec.clear();
         fs::create_directories(quarantineRoot, qec);
         if (qec) {
             spdlog::error("topic-dir reconcile: cannot create '{}': {}", quarantineRoot.string(), qec.message());
+            ++leftInPlace;
             continue;
         }
         const std::string base = c.filename().string() + "-" + std::to_string(nowUnixSeconds);
@@ -346,12 +420,20 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir,
         if (mec) {
             spdlog::error("topic-dir reconcile: moving '{}' to '{}' failed: {}", c.string(), dest.string(),
                           mec.message());
+            ++leftInPlace;
             continue;
         }
         spdlog::warn("topic-dir reconcile: quarantined '{}' -> '{}' — no topic in the catalog claims it "
                      "(removed from RUNE_TOPICS, a typo, or another build's dir); it is NOT restored "
                      "automatically", c.string(), dest.string());
         result.quarantined.push_back(dest);
+    }
+    // M1: the latch protects unclaimed dirs a damaged boot could not move; once none
+    // remains in topics/ there is nothing left to protect.
+    if ((latched || !catalogDamage.empty()) && leftInPlace == 0 && !ec) {
+        std::error_code rec;
+        if (fs::remove(sentinel, rec))
+            spdlog::info("topic-dir reconcile: no unclaimed topic dir remains — cleared '{}'", sentinel.string());
     }
     return result;
 }
@@ -395,6 +477,8 @@ RecoveredRuntimeTopics recoverRuntimeTopics(const std::string& dataDir,
         }
     });
 
+    std::map<int32_t, std::string> catalogNames;   // I3: every id the catalogs name
+    for (const auto& [id, t] : defined) catalogNames[id] = t.name;
     std::map<int32_t, TopicSpec> runtime;
     for (const auto& [id, t] : defined) {
         if (id < firstRuntimeId) continue;   // a static topic: booted from config
@@ -415,6 +499,7 @@ RecoveredRuntimeTopics recoverRuntimeTopics(const std::string& dataDir,
                         [&](std::span<const uint8_t> val, int64_t batchBase) {
         auto rec = ViewRecord::deserialize(val);
         if (!rec) corrupt("__views", batchBase, "ViewRecord::deserialize failed");
+        if (rec->viewTopicId >= 0) catalogNames[rec->viewTopicId] = rec->viewName;   // I3
         if (rec->viewTopicId < firstRuntimeId) return;   // sink resolved to a static topic
 
         // Mirror AdminWorker::startCreateView_: partitions = the source's (or 1),
@@ -473,6 +558,12 @@ RecoveredRuntimeTopics recoverRuntimeTopics(const std::string& dataDir,
         (schemasState == CatalogState::Missing) != (viewsState == CatalogState::Missing)) {
         result.catalogDamage = std::string("__topic_schemas ") + stateText(schemasState) +
                                ", __views " + stateText(viewsState);
+    }
+    for (const auto& [id, name] : catalogNames) {
+        TopicSpec t;
+        t.topicId = id;
+        t.name    = name;
+        result.catalogTopics.push_back(std::move(t));
     }
     std::vector<TopicSpec>& out = result.specs;
     out.reserve(runtime.size());

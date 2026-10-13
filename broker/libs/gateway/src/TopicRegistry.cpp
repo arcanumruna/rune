@@ -135,6 +135,9 @@ TopicRegistry::createTopicImpl(const rune::node::TopicSpec& spec, CreateOrigin o
             entry.marker = MarkerState::Pending;
     }
 
+    // C1: a runtime create is not servable until its catalog record commits.
+    entry.committed = (origin == CreateOrigin::Boot);
+
     nameIndex_.emplace(spec.name, assignedId);
     topics_.push_back(std::move(entry));
 
@@ -241,6 +244,31 @@ TopicRegistry::markTopicCommitted(int32_t topicId)
     if (!writeTopicIdMarker(topicDir.string(), kTopicIdMarkerCommitted, topicId)) return false;
     e.marker = MarkerState::Committed;
     return true;
+}
+
+bool
+TopicRegistry::commitTopic(int32_t topicId)
+{
+    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size()) return false;
+    TopicEntry& e = topics_[static_cast<std::size_t>(topicId)];
+    // The marker rewrite is best-effort (logged on failure); servability never
+    // waits on it — the record IS committed.
+    (void)markTopicCommitted(topicId);
+    if (e.committed) return false;
+    e.committed = true;
+    return true;
+}
+
+rune::storage::Log*
+TopicRegistry::servableLog(int32_t topicId, int32_t partition) noexcept
+{
+    if (topicId < 0 || static_cast<std::size_t>(topicId) >= topics_.size())
+        return nullptr;
+    const auto& entry = topics_[static_cast<std::size_t>(topicId)];
+    if (!entry.committed) [[unlikely]] return nullptr;
+    if (partition < 0 || static_cast<std::size_t>(partition) >= entry.partitions.size())
+        return nullptr;
+    return entry.partitions[static_cast<std::size_t>(partition)].log.get();
 }
 
 // ---------------------------------------------------------------------------
