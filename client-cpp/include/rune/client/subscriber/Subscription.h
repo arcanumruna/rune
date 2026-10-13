@@ -165,9 +165,14 @@ struct SubscriptionStatus {
 // ---------------------------------------------------------------------------
 struct SubscriptionImpl {
     // ---- Immutable after construction -----------------------------------------
-    int64_t       correlationId = 0;   // the Subscribe correlationId (duty-assigned at adoption)
+    // correlationId: duty-assigned at adoption; re-assigned (duty thread) when a
+    // bound subscription is moved to the partition's new leader
+    // (SubscriberHub::rearmMovedAway) — the duty side's identity, never the handle's.
+    int64_t       correlationId = 0;   // the Subscribe correlationId
     int32_t       topicId       = 0;
     int32_t       partition     = 0;
+    int64_t       fromWire      = -1;  // the requested From (From::toWire): the resume point while nothing was delivered
+    uint8_t       isolation     = 0;   // the requested Isolation (wire byte)
     RecordHandler handler;             // always valid (non-null after subscribe())
 
     // ---- Duty-thread owned ------------------------------------------------------

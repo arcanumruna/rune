@@ -174,6 +174,22 @@ public:
     bool failPendingSubscribe(int64_t correlationId, SubscriptionFailReason reason,
                               uint16_t brokerErrorCode = 0);
 
+    /// Rune E2 Task 13: the broker answered the Subscribe `correlationId` of a
+    /// BOUND subscription with NotLeader / Redirect — its node stopped leading
+    /// the partition and dropped the subscription.  Re-arm it as PENDING under
+    /// `newCorrId`: its Subscribe is re-encoded from the resume position
+    /// (nextOffset; the requested From while nothing was delivered), the same
+    /// isolation, its bound partition (partitionKnown), stamped `sessionId`,
+    /// with `deadline` as its subscribe timeout.  The Subscribe is NOT sent
+    /// here: the caller routes it like any refused pending Subscribe.  The old
+    /// instance gets a best-effort Unsubscribe (`unsubCorrId`) on `sessionId`;
+    /// its Records (old id / correlationId) are dropped from now on.  False (no
+    /// change) when `correlationId` names no active bound subscription.  Cold.
+    bool rearmMovedAway(int64_t correlationId, int64_t newCorrId, int64_t unsubCorrId, int64_t sessionId,
+                        std::chrono::steady_clock::time_point deadline);
+    /// Bound subscriptions moved by rearmMovedAway.
+    [[nodiscard]] uint64_t subscriptionsMoved() const noexcept { return subscriptionsMoved_; }
+
     /// Spend one bare-NotLeader retry of the pending Subscribe `correlationId`.
     /// True while within `maxRetries` (re-send it); false when the budget is
     /// exhausted or the corr is not pending (caller fails it explicitly).
@@ -349,6 +365,7 @@ private:
     std::size_t unsentSubscribes_      = 0;
     uint64_t    staleResponsesIgnored_ = 0;
     uint64_t    subscribesFailed_      = 0;  // fix4 M1: Fatal Subscribe offers
+    uint64_t    subscriptionsMoved_    = 0;  // E2 Task 13: rearmMovedAway
     detail::SendResult sendSubscribeFrame_(const SubscribeRequest& req);
     /// F8c C3: the Subscribe correlationId of the subscription whose impl is
     /// `key`, found by address in this hub's own tables (0 = not held).

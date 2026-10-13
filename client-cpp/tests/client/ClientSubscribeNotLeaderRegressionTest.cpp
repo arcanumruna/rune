@@ -15,6 +15,7 @@
 #include <rune/client/Client.h>
 #include <rune/client/TopicHandle.h>
 #include <rune/client/codec/Codec.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/MetadataMessages.h>
 
 #include <Aeron.h>
@@ -47,11 +48,14 @@ std::string uniqueDir(const char* prefix) {
            "_" + std::to_string(g_ctr.fetch_add(1));
 }
 
-enum class SubMode { OkAfterOneNotLeader, AlwaysNotLeader, Silent };
+enum class SubMode { OkAfterOneNotLeader, AlwaysNotLeader, Silent, MovesAfterBind };
 
 struct SubGateway {
     std::atomic<int> subscribesSeen{0};
     SubMode          mode;
+    // MovesAfterBind (test thread only: poll() runs here).
+    std::vector<rcc::SubscribeView> subscribes;   // key span not kept
+    std::vector<int64_t>            unsubscribedIds;
     static constexpr int64_t kSessionId = 77;
 
     std::shared_ptr<aeron::Aeron>                aeronC;
@@ -109,6 +113,36 @@ struct SubGateway {
         if (n > 0) send(replyBuf, n);
     }
 
+    void pushRecords(int64_t subId, int64_t base, int n, int64_t sessionId, int64_t corr) {
+        rune::protocol::RecordBatchBuilder b(base, 1000);
+        for (int i = 0; i < n; ++i) b.append("k", "v", 1000 + i);
+        const auto batch = b.build();
+        const std::size_t len = rcc::encodeRecords(replyBuf, sizeof(replyBuf), subId, 1, 0, base,
+                                                   std::span<const uint8_t>(batch), sessionId, corr);
+        if (len > 0) send(replyBuf, len);
+    }
+    // The first Subscribe binds (id 9) and delivers offsets 0..2; then this node
+    // stops leading the partition: NotLeader on that Subscribe's correlation id
+    // (what the broker answers a demoted leader's read_committed subscription).
+    // The re-subscribe binds (id 10) and delivers offsets 3..4.
+    void movesAfterBind(const rcc::SubscribeView& v, int k) {
+        rcc::SubscribeView copy = v;
+        copy.key = {};
+        subscribes.push_back(copy);
+        const int64_t subId = k == 1 ? 9 : 10;
+        std::size_t n = rcc::encodeSubscribeResponse(replyBuf, sizeof(replyBuf), 0, v.partition, subId,
+                                                     v.sessionId, v.correlationId);
+        if (n > 0) send(replyBuf, n);
+        if (k == 1) {
+            pushRecords(9, 0, 3, v.sessionId, v.correlationId);
+            n = rcc::encodeErrorResponse(replyBuf, sizeof(replyBuf), static_cast<int16_t>(rp::ErrorCode::NotLeader),
+                                         std::string_view{}, v.sessionId, v.correlationId);
+            if (n > 0) send(replyBuf, n);
+        } else if (k == 2) {
+            pushRecords(10, 3, 2, v.sessionId, v.correlationId);
+        }
+    }
+
     void onFrame(const uint8_t* buf, std::size_t len) {
         const auto tidOpt = rcc::peekTemplate(buf, len);
         if (!tidOpt) return;
@@ -123,11 +157,14 @@ struct SubGateway {
         } else if (tid == rcc::TemplateId::MetadataRequest) {
             const auto opt = rp::MetadataRequest::decode(buf, len);
             if (opt) sendMetadata(opt->sessionId, opt->correlationId);
+        } else if (tid == rcc::TemplateId::Unsubscribe) {
+            if (const auto opt = rcc::decodeUnsubscribe(buf, len)) unsubscribedIds.push_back(opt->subscriptionId);
         } else if (tid == rcc::TemplateId::Subscribe) {
             const auto opt = rcc::decodeSubscribe(buf, len);
             if (!opt) return;
             const int k = subscribesSeen.fetch_add(1) + 1;
             if (mode == SubMode::Silent) return;
+            if (mode == SubMode::MovesAfterBind) { movesAfterBind(*opt, k); return; }
             std::size_t n;
             if (mode == SubMode::AlwaysNotLeader || k == 1) {
                 n = rcc::encodeErrorResponse(replyBuf, sizeof(replyBuf),
@@ -178,10 +215,10 @@ struct Rig {
         client->close();
         try { std::filesystem::remove_all(agentDir); } catch (...) {}
     }
-    Subscription subscribe() {
+    Subscription subscribe(Isolation iso = Isolation::ReadUncommitted, RecordHandler h = [](const Record&) {}) {
         auto th = client->topic("inventory");
-        SubscribeOptions o; o.from = From::earliest(); o.isolation = Isolation::ReadUncommitted;
-        return client->subscribe(th, 0, o, [](const Record&) {});
+        SubscribeOptions o; o.from = From::earliest(); o.isolation = iso;
+        return client->subscribe(th, 0, o, std::move(h));
     }
 };
 }  // namespace
@@ -237,4 +274,47 @@ TEST(SubscribeNotLeaderRegression, NoAnswerFailsWithExplicitTimeout) {
     ASSERT_TRUE(failed);
     EXPECT_EQ(sub.failReason(), SubscriptionFailReason::TimedOut);
     EXPECT_GE(r.errors.load(), 1);
+}
+
+// Rune E2 Task 13 (Task 11 carry): a BOUND read_committed subscription whose
+// node stops leading the partition.  The broker answers its Subscribe
+// correlation id with a bare NotLeader and drops it (it can no longer serve
+// read_committed).  The client used to ignore that answer (it only retried
+// PENDING Subscribes): the subscription stayed bound to a node that would never
+// push again — a silent stall.  It now moves: a new Subscribe (fresh
+// correlation id) from its resume position, read_committed, partition known;
+// the leader binds it and committed data keeps flowing, every record once.
+TEST(SubscribeNotLeaderRegression, BoundSubscriptionAnsweredNotLeaderMovesFromItsPositionRegression) {
+    Rig r("snl_d", 4730, 4731, SubMode::MovesAfterBind, 60'000);
+    std::atomic<uint32_t> seenMask{0};
+    std::atomic<int>      seen{0};
+    auto sub = r.subscribe(Isolation::ReadCommitted, [&](const Record& rec) {
+        if (rec.offset >= 0 && rec.offset < 32) seenMask.fetch_or(1u << rec.offset);
+        seen.fetch_add(1);
+    });
+    bool moved = false;
+    for (int i = 0; i < 2500 && !moved; ++i) {   // ~5 s: the NotLeader retry is paced sub-second
+        r.gw->poll(16);
+        moved = sub.subscriptionId() == 10 && sub.position() == 5;
+        if (!moved) std::this_thread::sleep_for(2ms);
+    }
+    ASSERT_TRUE(moved) << "SILENT STALL: the subscription never moved off the node that stopped leading "
+                       << "(gateway saw " << r.gw->subscribesSeen.load() << " Subscribe(s); id "
+                       << sub.subscriptionId() << ", position " << sub.position() << ")";
+    ASSERT_EQ(r.gw->subscribes.size(), 2u);
+    const auto& first = r.gw->subscribes[0];
+    const auto& again = r.gw->subscribes[1];
+    EXPECT_NE(again.correlationId, first.correlationId) << "the moved Subscribe reused the old instance's identity";
+    EXPECT_EQ(again.fromOffset, 3) << "not resumed at the subscription's position";
+    EXPECT_EQ(again.isolation, static_cast<uint8_t>(Isolation::ReadCommitted));
+    EXPECT_EQ(again.partitionKnown, 1);
+    EXPECT_EQ(again.partition, 0);
+    EXPECT_EQ(seen.load(), 5) << "a record was lost or delivered twice across the move";
+    EXPECT_EQ(seenMask.load(), 0x1Fu);
+    EXPECT_TRUE(sub.active());
+    EXPECT_EQ(sub.failReason(), SubscriptionFailReason::None);
+    EXPECT_EQ(r.errors.load(), 0);
+    ASSERT_FALSE(r.gw->unsubscribedIds.empty()) << "the old instance was not released";
+    EXPECT_EQ(r.gw->unsubscribedIds.front(), 9);
+    sub.unsubscribe();
 }

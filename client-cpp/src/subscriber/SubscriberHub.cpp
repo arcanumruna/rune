@@ -626,6 +626,49 @@ bool SubscriberHub::resendOne(int64_t correlationId, int64_t sessionId, const Se
 // M2 FIX: failPendingSubscribes — fail all unbound pending subscribes
 // ---------------------------------------------------------------------------
 
+bool SubscriberHub::rearmMovedAway(int64_t correlationId, int64_t newCorrId, int64_t unsubCorrId,
+                                   int64_t sessionId, std::chrono::steady_clock::time_point deadline)
+{
+    if (correlationId == 0 || newCorrId == 0) return false;
+    for (auto it = activeById_.begin(); it != activeById_.end(); ++it) {
+        SubscriptionImpl& impl = *it->second;
+        if (impl.correlationId != correlationId) continue;
+        // Unsubscribed (erase deferred / Unsubscribe pending) or its handler is
+        // running: nothing to move.
+        if (!impl.active || impl.unsubPending || &impl == dispatching_) return false;
+        const int32_t part = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
+        const int64_t from = impl.nextOffset > 0 ? impl.nextOffset : impl.fromWire;  // 0 = nothing delivered
+        uint8_t frameBuf[256]{};
+        const std::size_t frameLen = codec::encodeSubscribe(frameBuf, sizeof(frameBuf), impl.topicId, part,
+                                                            /*partitionKnown=*/1, from, impl.isolation,
+                                                            std::span<const uint8_t>{}, sessionId, newCorrId);
+        if (frameLen == 0) return false;
+        auto req = std::make_unique<SubscribeRequest>();   // cold: once per leadership move
+        req->impl     = &impl;
+        req->deadline = deadline;
+        req->subscribeFrame.assign(frameBuf, frameBuf + frameLen);
+        // Belt and braces: release the old instance on this session too.  The
+        // node that answered NotLeader already dropped it (an Unsubscribe of an
+        // unknown id is ignored); should the answer have been a stray one, this
+        // keeps a second broker-side stream from leaking until the session
+        // ends.  Best-effort by design: a refused offer is moot either way.
+        if (directSend_ != nullptr) {
+            uint8_t unsubBuf[64]{};
+            const std::size_t unsubLen =
+                codec::encodeUnsubscribe(unsubBuf, sizeof(unsubBuf), impl.subscriptionId, sessionId, unsubCorrId);
+            if (unsubLen > 0) (void)directSend_(directSendCtx_, unsubBuf, unsubLen);
+        }
+        activeById_.erase(it);
+        impl.correlationId  = newCorrId;
+        impl.subscriptionId = 0;   // pending again until the leader binds it
+        pendingByCorrelation_.emplace(newCorrId, std::move(req));
+        ++subscriptionsMoved_;
+        publishStatus_(impl);
+        return true;
+    }
+    return false;
+}
+
 bool SubscriberHub::chargeNotLeaderRetry(int64_t correlationId, int maxRetries)
 {
     const auto it = pendingByCorrelation_.find(correlationId);

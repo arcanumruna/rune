@@ -2176,6 +2176,31 @@ void Client::onEgressFrame(codec::TemplateId tid,
             break;
         }
 
+        // Rune E2 Task 13 (Task 11 carry): a node that stops leading a partition
+        // answers the Subscribe correlation id of a BOUND read_committed
+        // subscription with NotLeader and drops it (it can no longer serve it —
+        // it used to go silent).  The subscription moves: it becomes a PENDING
+        // Subscribe again under a fresh correlationId, from its resume position
+        // (same isolation, its bound partition), and takes the pending-Subscribe
+        // paths below exactly like a refused new one — bare NotLeader: fresh
+        // metadata + backoff, bounded budget, then an explicit failure; Redirect:
+        // follow the leader (and the subscribe timeout fails it explicitly if no
+        // answer ever comes).  `opt` is this handler's own decoded copy: from here
+        // on it names the re-armed Subscribe.  Cold (a leadership move).
+        // Only an answer of the CURRENT session moves anything (a stale one of
+        // an earlier session concerns a subscription that died with it).
+        if ((ec == rpc::ErrorCode::NotLeader || ec == rpc::ErrorCode::Redirect) && opt->correlationId != 0)
+            [[unlikely]] {
+            const auto snap = agent_.stateAndSessionId();
+            if (snap.sessionId != 0 && opt->sessionId == snap.sessionId &&
+                subscriberHub_.rearmMovedAway(
+                    opt->correlationId, nextCorrId_, nextCorrId_ + 1, snap.sessionId,
+                    std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg_.subscribeTimeoutMs))) {
+                opt->correlationId = nextCorrId_;
+                nextCorrId_ += 2;
+            }
+        }
+
         // D4 (coordinator redirect): a follower answers a group / txn
         // COORDINATOR request with ErrorResponse{NotCoordinator, coordinator
         // endpoint} (the coordinator is the consensus leader).  The coordinator
@@ -3475,6 +3500,8 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
     auto impl = std::make_unique<SubscriptionImpl>();
     impl->topicId       = topic.topicId;
     impl->partition     = partition;
+    impl->fromWire      = opts.from.toWire();
+    impl->isolation     = static_cast<uint8_t>(opts.isolation);
     impl->handler       = std::move(handler);
 
     // M2 FIX: a deadline so sweepTimedOut() can fail this subscribe if
