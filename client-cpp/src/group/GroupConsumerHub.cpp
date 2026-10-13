@@ -943,7 +943,10 @@ bool GroupConsumerHub::onFetchSubscribeRefused(int64_t corrId, bool park, int32_
     if (!isFetchCorrId(corrId)) return false;
     for (GroupConsumerImpl* impl : impls_) {
         for (auto& [tp, fs] : impl->fetch) {
-            if (fs.corrId != corrId) continue;
+            // Unanswered (corrId), or — Rune E2 Task 13 — a BOUND instance its
+            // node stopped serving (it answers the instance's Subscribe id
+            // NotLeader and drops it after a demotion): re-routed the same way.
+            if (fs.corrId != corrId && !(fs.epoch != 0 && fs.instanceCorr == corrId)) continue;
             fs.corrId         = 0;
             fs.epoch          = 0;  // registered nothing
             fs.brokerSid      = 0;

@@ -1975,3 +1975,47 @@ TEST(GroupRoutingRegression, CommitSyncRidesTheCoordinatorSessionRegression) {
     ASSERT_TRUE(oc.has_value());
     EXPECT_EQ(oc->sessionId, coordSid) << "the OffsetCommit did not ride the coordinator session";
 }
+
+// Rune E2 Task 13 fix round 1: a BOUND group fetch subscription whose node
+// stops leading the partition (demoted: controlled shutdown, failover, a
+// higher epoch).  The broker answers the fetch Subscribe's correlation id with
+// a bare NotLeader and drops it.  A bound fetch subscription had already
+// forgotten that id (corrId is cleared on binding), so the answer was taken as
+// stale: no metadata asked, no re-route — the partition stalled silently until
+// some unrelated refresh.  It now matches the instance id, asks for metadata
+// and re-subscribes on the new leader FROM ITS POSITION.
+TEST(GroupRoutingRegression, BoundFetchSubscriptionAnsweredNotLeaderMovesToTheNewLeaderRegression) {
+    GroupRig r(4223, 4224);
+    const auto [n1, p1port] = r.addNode(4223);
+    const auto [n2, p2port] = r.addNode(4223);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4223, ""}, {1, 1, 1, 1, 4223, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment = {{1, 1}};
+    r.gw.committedOffsets[{1, 1}] = 10;
+
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    Consumed led;
+    wire(gc, led);
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr; }));
+    const auto s1 = *r.subAt(1, n1);
+    r.gw.pushRecords(s1, 10, 5);   // binds it by push (its corrId is forgotten locally)
+    ASSERT_TRUE(r.drive([&] { return led.records[1] == 5; }));
+
+    // Node 1 is demoted: the cluster now routes partition 1 to node 2 (no metadata
+    // is pushed to the client), and node 1 answers the subscription NotLeader.
+    r.gw.subscribeLeader[1] = n2;
+    r.gw.partitions = {{1, 0, 0, 1, 4223, ""}, {1, 1, 2, 2, 4223, ""}};
+    r.gw.sendError(n1, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader), "", s1.sessionId,
+                   s1.corrId);
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n2) != nullptr; }, 200'000))
+        << "SILENT STALL: the group partition never moved off the node that stopped leading it";
+    const auto s2 = *r.subAt(1, n2);
+    EXPECT_EQ(s2.fromOffset, 15) << "the moved fetch subscription resumes at the member's position";
+    r.gw.pushRecords(s2, 15, 2);
+    ASSERT_TRUE(r.drive([&] { return led.records[1] == 7; }));
+    EXPECT_EQ(led.next[1], 17);
+}
