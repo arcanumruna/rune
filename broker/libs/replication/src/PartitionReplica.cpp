@@ -1349,6 +1349,13 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
 
             Offset currentLeo = logEndOffset_();
             std::size_t newStart = resp.records.size(); // byte-offset of first new batch
+            std::size_t newEnd   = newStart;            // one past the last new batch applied
+            // Phase 2b E2: a transient follower applies at most one ring's worth of
+            // whole batches (a push / a leader frame sized by ITS config may be
+            // larger); the rest is re-fetched.  Only a SINGLE batch larger than the
+            // ring is refused TooLarge (and wedges).  Disk: no cap.
+            const std::size_t spanCap = memoryBacked_ ? memLog_->capacityBytes()
+                                                      : std::numeric_limits<std::size_t>::max();
             int64_t lastOff = -1;
             std::size_t pos = 0;
             while (pos < resp.records.size()) {
@@ -1370,12 +1377,16 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
                     break;
                 }
                 // batchBase == currentLeo: this is where new data starts.
+                if (newStart != resp.records.size() &&
+                    pos + static_cast<std::size_t>(total) - newStart > spanCap) [[unlikely]]
+                    break;   // E2: the next batch would not fit this node's ring with the span
                 if (newStart == resp.records.size()) {
                     newStart = pos; // mark the byte offset of the first new batch
                 }
                 lastOff = batchBase + r.lastOffsetDelta();
                 currentLeo = lastOff + 1; // advance the expected-next offset
                 pos += static_cast<std::size_t>(total);
+                newEnd = pos;             // end of the last whole contiguous new batch
             }
 
             if (newStart < resp.records.size() && lastOff >= logEndOffset_()) {
@@ -1390,12 +1401,16 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
                 // appendNoSync contract).  A single coalesced sync() runs once per
                 // duty cycle below (followerApplyDirty_), amortising the fsync.
                 const uint8_t* const newData = resp.records.data() + newStart;
-                const std::size_t    newLen  = resp.records.size() - newStart;
-                refreshTransientEvictionFloor_();   // E2: a transient ring never evicts above followerHw_
-                if (onLog([&](auto& L){ return L.appendNoSync(newData, newLen, lastOff); }) < 0) [[unlikely]] {
-                    // E2: the ring is full of records above our HW — nothing applied;
-                    // the leader re-serves them once our HW (from its answers) moves.
-                    ++transientApplyRefusals_;
+                // Phase 2b E2 fix-on-sight: exactly the walked batches — was
+                // `records.size() - newStart`, which also appended any bytes past a
+                // gap / truncated tail the walk stopped at (and past the ring cap).
+                const std::size_t    newLen  = newEnd - newStart;
+                refreshTransientApplyFloor_(resp.highWatermark);   // E2: never evict uncommitted data
+                if (const int64_t rc = onLog([&](auto& L){ return L.appendNoSync(newData, newLen, lastOff); });
+                    rc < 0) [[unlikely]] {
+                    // E2: nothing applied — full of records above the HW (re-served
+                    // once it moves) or a batch larger than our ring (wedge).
+                    onTransientApplyRefused_(rc, newLen);
                 } else {
                     followerApplyDirty_ = true;
                     // Kafka LeaderEpochFileCache.assign on append: the cache is built
@@ -1415,9 +1430,10 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
             rune::protocol::RecordBatchReader::stampLeaderEpoch(batchScratch_.data(),
                                                                 static_cast<int32_t>(resp.leaderEpoch));
             const auto& batch = batchScratch_;
-            refreshTransientEvictionFloor_();
-            if (onLog([&](auto& L){ return L.appendNoSync(batch.data(), batch.size(), baseOffset); }) < 0) [[unlikely]] {
-                ++transientApplyRefusals_;
+            refreshTransientApplyFloor_(resp.highWatermark);
+            if (const int64_t rc = onLog([&](auto& L){ return L.appendNoSync(batch.data(), batch.size(), baseOffset); });
+                rc < 0) [[unlikely]] {
+                onTransientApplyRefused_(rc, batch.size());
             } else {
                 followerApplyDirty_ = true;
                 if (assignEpochsFromBatches_(batch.data(), batch.size()) &&
@@ -1511,6 +1527,12 @@ FetchRequestMsg PartitionReplica::nextFetch() const noexcept
     req.followerId  = cfg_.selfId;
     req.fetchOffset = logEndOffset_();
     req.maxBytes    = cfg_.maxFetchBytes;
+    // Phase 2b E2: never ask for more than this node's transient ring holds
+    // (the leader still serves a first batch larger than maxBytes — KIP-74 —
+    // which then wedges the follower explicitly: onTransientApplyRefused_).
+    if (memoryBacked_)
+        req.maxBytes = static_cast<int32_t>(std::min<std::size_t>(
+            static_cast<std::size_t>(req.maxBytes), memLog_->capacityBytes()));
     req.topicId     = cfg_.topicId;   // DR-BUG-5: stamp topicId for transport routing
     req.lastFetchedEpoch = lastFetchedEpoch();   // KIP-320/595
     req.incarnation      = processIncarnation_;  // KIP-903
@@ -3269,6 +3291,32 @@ void PartitionReplica::resetTransientLogTo_(Offset start)
     spdlog::warn("PartitionReplica[node={} topic={} part={}]: transient follower at offset {} is below the "
                  "leader's ring start {} — ring restarted empty at {} (resets={})",
                  cfg_.selfId, cfg_.topicId, cfg_.partitionId, was, start, start, transientLogResets_);
+}
+
+// Phase 2b E2: a transient follower's replicated apply refused by its ring.
+void PartitionReplica::onTransientApplyRefused_(int64_t rc, std::size_t frameBytes)
+{
+    const Offset at = logEndOffset_();
+    if (rc == rune::storage::InMemoryLog::kRefusedTooLarge) {
+        ++transientApplyTooLargeRefusals_;
+        followerSync_.forceBehind();   // real data, never "caught up" (F3)
+        if (role_ != Role::Follower) return;
+        if (wedgedAtOffset_ != at)
+            spdlog::error("PartitionReplica[node={} topic={} part={}]: transient batch at offset {} "
+                          "({} bytes) is larger than this node's transient ring ({} bytes, "
+                          "RUNE_TRANSIENT_LOG_RING_BYTES) — it cannot be replicated here (refusals={})",
+                          cfg_.selfId, cfg_.topicId, cfg_.partitionId, at, frameBytes,
+                          memLog_->capacityBytes(), transientApplyTooLargeRefusals_);
+        wedgeAt_(at, "larger than this node's transient ring");
+        return;
+    }
+    ++transientApplyFullRefusals_;
+    // Rate-limited (1st, 2nd, 4th, 8th … refusal): retriable, resolves once the HW moves.
+    if ((transientApplyFullRefusals_ & (transientApplyFullRefusals_ - 1)) == 0)
+        spdlog::warn("PartitionReplica[node={} topic={} part={}]: transient ring ({} bytes) full above the "
+                     "HW — replicated apply of {} bytes at offset {} refused, re-fetched once the HW "
+                     "moves (refusals={})", cfg_.selfId, cfg_.topicId, cfg_.partitionId,
+                     memLog_->capacityBytes(), frameBytes, at, transientApplyFullRefusals_);
 }
 
 void PartitionReplica::truncateLog(Offset truncateOffset)

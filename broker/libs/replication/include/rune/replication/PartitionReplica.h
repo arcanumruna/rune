@@ -1208,10 +1208,19 @@ public:
     void prepareTransientAppend() noexcept { refreshTransientEvictionFloor_(); }
     /// Follower ring restarts at the leader's ring start / replicated applies the ring refused.
     [[nodiscard]] uint64_t transientLogResetsForTest() const noexcept { return transientLogResets_; }
-    [[nodiscard]] uint64_t transientApplyRefusalsForTest() const noexcept { return transientApplyRefusals_; }
+    [[nodiscard]] uint64_t transientApplyRefusalsForTest() const noexcept {
+        return transientApplyFullRefusals_ + transientApplyTooLargeRefusals_;
+    }
+    /// Stats (owner thread): transient follower ring restarts, and replicated
+    /// applies the ring refused — full of records above the HW (retried when the
+    /// HW moves) / a batch larger than this node's ring (the follower wedges).
+    [[nodiscard]] uint64_t transientLogResets() const noexcept { return transientLogResets_; }
+    [[nodiscard]] uint64_t transientApplyFullRefusals() const noexcept { return transientApplyFullRefusals_; }
+    [[nodiscard]] uint64_t transientApplyTooLargeRefusals() const noexcept { return transientApplyTooLargeRefusals_; }
 private:
-    uint64_t transientLogResets_     = 0;
-    uint64_t transientApplyRefusals_ = 0;
+    uint64_t transientLogResets_             = 0;
+    uint64_t transientApplyFullRefusals_     = 0;
+    uint64_t transientApplyTooLargeRefusals_ = 0;
     /// The ring never evicts at/above what is not committed: the leader's HW
     /// (min-ISR-gated served HW), a follower's followerHw_.
     void refreshTransientEvictionFloor_() noexcept {
@@ -1222,6 +1231,18 @@ private:
         if (memoryBacked_) { if (memLog_ != nullptr) memLog_->setLeaderEpochStamp(epoch); }
         else if (diskLog_ != nullptr) diskLog_->setLeaderEpochStamp(epoch);
     }
+    /// Follower replicated apply: everything below min(our LEO, the frame's HW)
+    /// is committed by THIS frame already — free it before the append, so a ring
+    /// full of records the frame commits is not refused for a wasted round trip.
+    void refreshTransientApplyFloor_(Offset leaderHw) noexcept {
+        if (memoryBacked_)
+            memLog_->setEvictionFloor(std::max(followerHw_, std::min(logEndOffset_(), leaderHw)));
+    }
+    /// A replicated apply the ring refused (`rc` < 0): kRefusedFull is counted and
+    /// logged (rate-limited) — retried once the HW moves; kRefusedTooLarge (a batch
+    /// larger than this node's ring) is counted, logged and WEDGES the follower
+    /// (F18: stops fetching, leaves the ISR) — never a silent re-fetch loop.  Cold.
+    void onTransientApplyRefused_(int64_t rc, std::size_t frameBytes);
     /// A transient follower below the leader's ring start restarts its ring there.  Cold.
     void resetTransientLogTo_(Offset start);
 

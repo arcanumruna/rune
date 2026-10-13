@@ -334,6 +334,8 @@ public:
     [[nodiscard]] constexpr bool storageFailed() const noexcept { return false; }
     void markStorageFailed(int /*err*/) noexcept {}
 
+    /// The ring's byte capacity (a batch larger than this is kRefusedTooLarge).
+    [[nodiscard]] std::size_t capacityBytes() const noexcept { return maxBytes_; }
     /// Appends refused because the ring would have had to evict at/above the floor.
     [[nodiscard]] uint64_t fullRefusals() const noexcept { return fullRefusals_; }
     /// Records evicted (retention), summed over evicted batches.
