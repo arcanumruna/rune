@@ -378,6 +378,7 @@ TEST(CompletionsClient, ControlOpTimeoutCompletesTimeoutRegression) {
     g_now = 1'000'000'000;
     rc::ClientConfig c = cfgFor(5224, rc::RunnerMode::Invoker, &fakeNow);
     c.pingTimeoutMs    = 50;
+    c.ddlTimeoutMs     = 50;   // catalog history: a DDL's own deadline (DefineTopic below)
     c.connectTimeoutMs = 30'000;
     Rig r(c);
     TestCq cq(r.client);

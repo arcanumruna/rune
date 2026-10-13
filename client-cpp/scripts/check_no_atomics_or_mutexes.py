@@ -120,20 +120,10 @@ SLICE_B = {
     # allowlist stays as a mechanism (empty: any new site fails).
 }
 
-# PERMANENT per-thread state (F8c fix round 1, controller ruling): a
-# thread_local is not shared state — each thread owns its own copy.  Allowed
-# only as an EXACT multiset of ('tls', 'thread_local') sites per file, with the
-# reason next to each declaration; any other kind here is a violation.
-PER_THREAD = {
-    # tClosing (the Client this thread is closing: a Completions released by
-    # user code that close() runs frees directly — I1) and tWaitToken (a
-    # distinct token per *AndWait call — I3/m6).
-    "src/Client.cpp": {("tls", "thread_local"): 2},
-}
-for _rel, _ms in PER_THREAD.items():
-    assert all(k[0] == "tls" for k in _ms), f"PER_THREAD entry {_rel} allows a non-tls construct"
-# n4: the two allowlists are merged per file — a shared key would silently drop one.
-assert not (set(PER_THREAD) & set(SLICE_B)), "PER_THREAD and SLICE_B must not share a file"
+# thread_local is BANNED outright in src/** and include/** (CLAUDE.md hard
+# rule 1: "no thread_local"; catalog history Task 5 fix round 0 removed the
+# former per-thread allowance and its two Client.cpp sites).  There is no
+# per-thread allowlist: any thread_local is a violation.
 
 CHAR_PREFIXES = {"L", "u", "U", "u8"}
 
@@ -477,7 +467,7 @@ def main(argv):
         print(f"check_no_atomics_or_mutexes --futures: OK ({len(all_files)} files, no future/promise/"
               f"packaged_task/async)")
         return 0
-    violations = evaluate(files, RING_FILES, {**SLICE_B, **PER_THREAD})
+    violations = evaluate(files, RING_FILES, SLICE_B)
     violations += evaluate_futures(collect(root, FUTURE_ONLY_DIRS))
     if violations:
         print(f"check_no_atomics_or_mutexes: {len(violations)} violation(s)")

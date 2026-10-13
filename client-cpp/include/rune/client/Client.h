@@ -347,9 +347,15 @@ struct ClientConfig {
     std::string clientName = "rune-client";
     // ddlRetryBudget: how long a DDL answered NotLeader (a catalog leader change
     // / a catching-up leader) is retried, with a 100 ms backoff doubling to 1 s,
-    // before it fails explicitly (BrokerError NotLeader).  Bounded by the op's
-    // own deadline (pingTimeoutMs) too.
+    // before it fails explicitly (BrokerError NotLeader).  Bounded by the DDL's
+    // own deadline (ddlTimeoutMs) too.
     std::chrono::milliseconds ddlRetryBudget{10'000};
+    // ddlTimeoutMs: the deadline of EVERY DDL (DefineTopic, AlterTopic,
+    // CreateView, DropTopic, DropView, AlterView, AlterTopicConfig) — the whole
+    // op, its Redirect hops and NotLeader retries included; no answer by then ->
+    // Timeout.  Independent of pingTimeoutMs: a catalog leader holds a
+    // CreateTopic OK until the topic serves (up to 5 s).
+    int64_t ddlTimeoutMs = 15'000;
 };
 
 /// Maps a ClientConfig to the agent/transport configuration (applies env overrides).
@@ -698,9 +704,9 @@ public:
     //       "redirected more than 3 times";
     //   NotLeader (ErrorResponse or a response's errorCode 2) -> re-sent after a
     //       100 ms backoff doubling to 1 s while inside ClientConfig::
-    //       ddlRetryBudget (and the op deadline), then BrokerError errorCode 2;
+    //       ddlRetryBudget (and the DDL deadline), then BrokerError errorCode 2;
     //   ErrorResponse{InvalidRequest | other} -> BrokerError, payload = its message;
-    //   no answer by the op deadline (pingTimeoutMs) -> Timeout.
+    //   no answer by the DDL deadline (ClientConfig::ddlTimeoutMs) -> Timeout.
     // Completion of the four new ops: value = objectId, aux = newVersion,
     // payload = detail (or the ErrorResponse message).
     static constexpr int kMaxDdlRedirects = 3;
@@ -1494,7 +1500,20 @@ private:
     std::thread       runnerThread_;
 
     // ---- F8c C3: control ops (duty-thread owned; PendingX maps + mtx_ gone) --
-    int64_t                 nextCorrId_ = 1;           // duty-owned correlation counter
+    // Correlation-id spaces (disjoint; an answer is matched by its id alone):
+    //   session i's ConnectRequests   i * ClientAgent::kSessionCorrIdStride + n (< 2^50)
+    //   keepalive Pings               negative (-(session index + 1))
+    //   the Client's counter (below)  kClientCorrIdTag | n — every control op
+    //                                 (ping / DDL / schema / view / metadata),
+    //                                 Subscribe / Unsubscribe, txn, OffsetCommit
+    //   group OffsetFetch             bit 60 (GroupConsumerHub::kOffsetFetchCorrTag)
+    //   group fetch Subscribes        bit 61 (GroupConsumerHub::kFetchCorrTag)
+    //   producer batches              bit 62 (producer::batchcorr::kTag)
+    // Task 5 fix round 0 (C): the counter used to start at 1 — the seed's
+    // connect ids (session 0) count from 1 too, so the n-th connect and the
+    // n-th control op shared an id and an answer to one was taken for the other.
+    static constexpr int64_t kClientCorrIdTag = int64_t{1} << 59;
+    int64_t                 nextCorrId_ = kClientCorrIdTag | 1;   // duty-owned correlation counter
     std::vector<PendingCtl> pendingCtl_;               // ping / define / get, by corrId (linear: cold)
     // Catalog history (F14): this Client's random 64-bit instance id (drawn once
     // at construction, never 0; immutable) and the duty thread's DDL counter.

@@ -44,17 +44,6 @@
 namespace rune::client {
 
 namespace {
-// F8c fix round 1 (I1): the Client this thread is closing (set right after the
-// runner join, cleared when closeImpl_ returns).  Per-THREAD state — never
-// shared: it lets a Completions released by user code that close() itself runs
-// (a callable destroyed by the final drain, a callback during teardown)
-// recognise that its thread already owns every duty structure, and release
-// directly instead of waiting for a hand-back only this thread would perform.
-thread_local const Client* tClosing = nullptr;
-// F8c fix round 1 (m6): a distinct token per *AndWait call on THIS thread (two
-// threads may draw the same value; each call has its own fresh queue, and the
-// I3 quarantine makes cross-queue delivery impossible, so this is hygiene).
-thread_local Token tWaitToken = 0;
 // F8c C8: the runner start latch (spec §3.4) — one empty record on a
 // stack-local OneToOneRingBuffer of the smallest useful capacity.
 constexpr std::size_t   kStartLatchCapacity = 64;
@@ -448,11 +437,6 @@ void Client::closeImpl_() {
     // From here this thread owns every duty-side structure (the join / the
     // Invoker contract orders it after the last duty cycle).
     closing_ = true;
-    struct ClosingMark {  // I1: this thread is the closer until closeImpl_ returns
-        const Client* prev;
-        explicit ClosingMark(const Client* c) : prev(tClosing) { tClosing = c; }
-        ~ClosingMark() { tClosing = prev; }
-    } closingMark(this);
 
     // Single-threaded from here.  Drain the command ring up to its (now frozen)
     // tail: registrations are adopted (the hubs hold their share; the failAll below
@@ -528,7 +512,7 @@ void Client::closeImpl_() {
     // is every registered Completions handed back (producer-closed: its owner
     // sees every Closed record, then finished()) — so no completion delivered
     // during close is dropped.  A queue released by user code that this close
-    // runs (above) was freed directly (tClosing, I1), never waited on.
+    // runs (above) detached its side (I1), never waited on: the hand-back frees it.
     failAllControl_(OpStatus::Closed);
     // F8c C7: a Client::close() drain still pending (another thread's close
     // won, or this is the destructor) completes Closed, exactly once.
@@ -737,10 +721,11 @@ void Client::releaseCq_(Completions& q) noexcept {
     // stale by the generation check (misdelivery would need 32 generation wraps
     // of this one slot within a single drain — not reachable in practice).
     const uint64_t prodIssued = q.producerIssued_;  // C6: producer-op accounting
-    if (tClosing == this) {
-        applyCqRelease_(ref, ring, prodIssued);
-        return;
-    }
+    // I1 (Task 5 fix round 0: no thread_local): a queue released by user code
+    // that close() itself runs (a callable destroyed by the final drain) takes
+    // the same closed-ring path as any thread below — it detaches its side and
+    // never waits; closeCqRegistry_'s hand-back (later on this same thread)
+    // frees it.
     if (std::this_thread::get_id() == dutyThreadId_) {
         // Thread-mode runner: every op it issues is applied directly.
         if (cfg_.runnerMode == RunnerMode::Thread) {
@@ -1444,7 +1429,9 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
     }
     namespace rpc = rune::protocol::client;
     p.corrId     = nextCorrId_++;
-    p.deadlineNs = nowNs + cfg_.pingTimeoutMs * 1'000'000LL;
+    // Catalog history (fix round 0, A): a DDL has its own deadline — the whole
+    // op, its Redirect hops and its NotLeader budget (budgetEnd <= deadline).
+    p.deadlineNs = nowNs + (isDdlOp(h.op) ? cfg_.ddlTimeoutMs : cfg_.pingTimeoutMs) * 1'000'000LL;
     if (h.op == OpKind::DefineTopic) {
         if (auto d = rpc::DefineTopic::decode(frame.data(), frame.size())) p.topicName = std::string(d->topicName);
     }
@@ -1771,10 +1758,10 @@ void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32
     qc.capacityBytes = cap;
     Completions q(*this, qc);
 
-    // A distinct token per call (m6): a completion for an earlier call can
-    // never be taken for this one's answer.
-    tWaitToken = (tWaitToken % kMaxToken) + 1;
-    const Token kToken = tWaitToken;
+    // m6: every call has its OWN fresh queue (above) and the I3 quarantine makes
+    // cross-queue delivery impossible, so a fixed token can never be answered
+    // by an earlier call (Task 5 fix round 0: no per-thread counter).
+    constexpr Token kToken = 1;
     // n1: ONE budget for issue + wait.
     const auto issueDeadline = std::chrono::steady_clock::now() + timeout;
     aeron::concurrent::BackoffIdleStrategy backoff(
@@ -3600,12 +3587,9 @@ void Client::applyProducerCommand_(const detail::HubCommand& cmd) {
 // can mark such impls in their own ring word when the drain is abandoned.
 
 detail::HubSubmit Client::submitRelease_(const detail::HubCommand& cmd) {
-    // I1: this thread runs this Client's close(): it owns every duty structure
-    // (the drain, the hub teardown and the hand-back are its own work).
-    if (tClosing == this) {
-        applyRelease_(cmd, 0, /*closing=*/true);
-        return detail::HubSubmit::Accepted;
-    }
+    // I1 (Task 5 fix round 0: no thread_local): a release made by user code
+    // that close() itself runs finds the ring closed below (Closed: the
+    // hand-back, later on this same thread, owns the impl) — never a wait.
     const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
     if (onDuty) {
         // The duty thread itself — the Invoker owner (in or outside a cycle) or

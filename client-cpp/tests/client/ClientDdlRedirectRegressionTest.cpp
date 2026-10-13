@@ -295,7 +295,11 @@ class ClientDdlAnswerMatrixRegression : public ::testing::TestWithParam<std::tup
 
 TEST_P(ClientDdlAnswerMatrixRegression, EveryDdlOpHandlesEveryAnswerClass) {
     const auto [op, answer] = GetParam();
-    Rig r(invokerCfg(3970, 3971));
+    rc::ClientConfig cfg = invokerCfg(3970, 3971);
+    // NoAnswer ends at the DDL deadline: 2 s keeps it inside the idle fake
+    // session's liveness window (past it the session, not the op, would end).
+    cfg.ddlTimeoutMs = 2'000;
+    Rig r(cfg);
     const std::string leaderCh = udp(freePort());
     const int leader = r.gw.addEndpoint(leaderCh, 3970);
     r.connect();
@@ -458,7 +462,7 @@ TEST(ClientDdlRedirectRegression, DdlResponseSpecificCodeIsSurfacedNotRetried) {
 // node — and the op still ends, explicitly, at its deadline (never a hang).
 TEST(ClientDdlRedirectRegression, RedirectToAnUnreachableNodeEndsInTimeout) {
     rc::ClientConfig cfg = invokerCfg(3978, 3979);
-    cfg.pingTimeoutMs = 500;   // the control-op deadline
+    cfg.ddlTimeoutMs = 500;   // the DDL deadline
     Rig r(cfg);
     r.connect();
     const std::string nowhere = udp(freePort());   // no fake node listens there
@@ -511,4 +515,121 @@ TEST(ClientDdlRedirectRegression, NotLeaderAfterARedirectResendsToTheLeaderWithT
     EXPECT_EQ(at[2], leader);
     EXPECT_EQ(ids[0], ids[1]);
     EXPECT_EQ(ids[1], ids[2]);
+}
+
+// Fix round 0 (A): the broker holds a CreateTopic OK until the topic serves (up
+// to 5 s).  A DDL's deadline is its own (ClientConfig::ddlTimeoutMs, 15 s by
+// default) — not the 5 s control-op deadline, which would expire exactly as
+// the broker answers.
+TEST(ClientDdlRedirectRegression, DdlAnsweredAfterSixSecondsSucceedsRegression) {
+    Rig r(invokerCfg(4430, 4431));   // default config
+    r.connect();
+    int ep = -1;
+    int64_t sid = 0, corr = 0;
+    r.gw.templateHandlers[pc::DefineTopic::TEMPLATE_ID] = [&](int e, const uint8_t* f, std::size_t len) {
+        auto m = pc::DefineTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        ep = e; sid = m->sessionId; corr = m->correlationId;   // held: answered later
+    };
+    test_support::TestCq cq(r.client);
+    const int64_t t0 = g_now;
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) {
+        return r.client.defineTopic("t", 1, "", {}, false, rc::Persistence::Disk, {}, {}, q, t);
+    });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_FALSE(r.drive([&] { return f.ready() || g_now - t0 >= 6'000'000'000; }, /*stepNs=*/10'000'000) &&
+                 f.ready())
+        << "the DDL must still be pending at 6 s: " << f.describe();
+    ASSERT_GE(ep, 0);
+    pc::DefineTopicResponse resp; resp.sessionId = sid; resp.correlationId = corr; resp.topicId = 21; resp.version = 1;
+    std::vector<uint8_t> out(resp.encodedSize());
+    r.gw.send(ep, out.data(), resp.encode(out.data()));
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(f.outcome().c.value, 21);
+}
+
+// Fix round 0 (A): ddlTimeoutMs bounds the WHOLE DDL — an unanswered one ends
+// Timeout at that deadline, and the NotLeader retry budget never outlives it.
+TEST(ClientDdlRedirectRegression, DdlTimeoutBoundsTheWholeDdlIncludingItsRetryBudgetRegression) {
+    rc::ClientConfig cfg = invokerCfg(4432, 4433);
+    cfg.ddlTimeoutMs   = 700;
+    cfg.ddlRetryBudget = std::chrono::milliseconds(60'000);
+    Rig r(cfg);
+    r.connect();
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        r.answerError(ep, pc::ErrorCode::NotLeader, "", m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    const int64_t t0 = g_now;
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/10'000'000));
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(f.outcome().c.errorCode, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
+    EXPECT_LT(g_now - t0, int64_t{1'000'000'000}) << "the 700 ms DDL deadline, not the 60 s budget";
+}
+
+// Fix round 0 (C): the seed session's ConnectRequest correlationIds and the
+// Client's control-op correlationIds come from two counters that both counted
+// from 1 — the n-th connect and the n-th control op carried the SAME id, so an
+// answer to one was taken for the other.  Here the seed's connect and a pending
+// control op are counter value n of their own spaces; a (late) answer to the
+// connect must not complete the control op, and the control op's own answer
+// still completes it.  The id spaces are disjoint for every control op.
+TEST(ClientCorrIdRegression, ConnectAnswerAndControlAnswerFromTheSameCounterValueAreEachRoutedRegression) {
+    rc::ClientConfig cfg = invokerCfg(4434, 4435);
+    cfg.connectTimeoutMs = 1'000;   // = the session's per-attempt connect timeout
+    Rig r(cfg);
+    ASSERT_TRUE(r.drive([&] { return r.gw.ready(); }));
+    // The node drops the first ConnectRequests: each timed-out attempt takes the
+    // seed's NEXT connect id (the first connect op times out meanwhile; the
+    // session keeps trying), while the Client's counter does not move.
+    r.gw.silentEndpoints.insert(0);
+    test_support::TestCq cq(r.client);
+    auto first = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.connect(q, t); });
+    ASSERT_TRUE(r.drive([&] { return r.gw.connectCorrIds.size() >= 3; }, /*stepNs=*/10'000'000));
+    r.gw.silentEndpoints.clear();
+    ASSERT_TRUE(r.drive([&] { return r.client.state() == rune::client::session::SessionState::Connected; },
+                        /*stepNs=*/10'000'000));
+    auto conn = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.connect(q, t); });
+    ASSERT_TRUE(r.drive([&] { return conn.ready(); }));
+    ASSERT_TRUE(conn.ok()) << conn.describe();
+    const int64_t connectCorr = r.gw.connectCorrIds.back();   // the connect that was answered
+
+    int     ep = -1;
+    int64_t sid = 0, ddlCorr = 0;
+    bool    held = false;
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int e, const uint8_t* f, std::size_t len) {
+        auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        ep = e; sid = m->sessionId; ddlCorr = m->correlationId;
+        if (m->correlationId < connectCorr) {   // below the connect's id: answer, the test issues another
+            pc::DdlResponse resp; resp.sessionId = sid; resp.correlationId = ddlCorr;
+            r.gw.sendDdlResponse(e, resp);
+        } else {
+            held = true;                          // at / past it: held until the end
+        }
+    };
+    test_support::PendingOp f;
+    for (int n = 0; n < 64 && !held; ++n) {   // a control op whose counter value reaches the connect's
+        f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+        ASSERT_TRUE(r.drive([&] { return held || f.ready(); }));
+        if (!held) ASSERT_TRUE(f.ok()) << f.describe();
+    }
+    ASSERT_TRUE(held);
+    // A (late) answer to the CONNECT, carrying the connect's own correlationId.
+    r.answerError(0, pc::ErrorCode::InvalidRequest, "late answer to the connect", sid, connectCorr);
+    for (int i = 0; i < 200; ++i) { r.client.doWork(); r.gw.pump(); }
+    ASSERT_FALSE(f.ready()) << "a connect answer completed a control op (ids " << connectCorr << " / " << ddlCorr
+                            << "): " << f.describe();
+    EXPECT_NE(ddlCorr, connectCorr) << "control-op ids and connect ids are disjoint";
+    EXPECT_EQ(r.client.state(), rune::client::session::SessionState::Connected);
+    // The control op's own answer completes it.
+    pc::DdlResponse resp; resp.sessionId = sid; resp.correlationId = ddlCorr; resp.objectId = 5;
+    r.gw.sendDdlResponse(ep, resp);
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    ASSERT_TRUE(f.ok()) << f.describe();
+    EXPECT_EQ(f.outcome().c.value, 5);
 }
