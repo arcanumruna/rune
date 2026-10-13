@@ -584,6 +584,10 @@ void BrokerNode::start() {
         spdlog::info("BrokerNode[{}]: {} worker thread(s) started (shard={})",
                      config_.nodeId, workerPool_->workerCount(), config_.shardMode());
     }
+    // Fix round 0 (Task 6): the control thread's identity, for the test
+    // accessors that must never run on it (they would await themselves).
+    controlThreadId_ = config_.fused() ? (workerPool_ ? workerPool_->runnerThreadId(0) : std::thread::id{})
+                                       : agentRunner_->threadId();
 
     // 7c. Task 6: start the AdminWorker AgentRunner thread.
     //     Must start AFTER agentRunner_ (control thread drives replication for
@@ -3058,10 +3062,16 @@ void BrokerNode::buildCatalog_() {
         }
         transport = catalogPlane_.get();
     } else {
+        // Fix round 0 (Task 6): never a silent fallback — a multi-node catalog
+        // without a replication transport could never be replicated (nor reach
+        // its majority minIsr).
         if (!config_.isSingleNode()) {
-            spdlog::error("BrokerNode[{}]: multi-node without a replication transport — __catalog is NOT "
-                          "replicated and can never reach its majority minIsr ({}): catalog writes will "
-                          "be refused", config_.nodeId, catalogMinIsr(allNodeIds.size()));
+            throw std::runtime_error(
+                "BrokerNode[" + std::to_string(config_.nodeId) + "]: multi-node (" +
+                std::to_string(allNodeIds.size()) + " brokers) without a replication transport (" +
+                (config_.self().replicationPort == 0 ? std::string("no replicationPort configured for this node")
+                                                     : std::string("the replication transport failed to build")) +
+                ") — __catalog is replicated to every broker; refusing to start");
         }
         nullTransports_.push_back(std::make_unique<rr::NullPartitionTransport>());
         transport = nullTransports_.back().get();
@@ -3661,6 +3671,7 @@ bool BrokerNode::onCatalogAlterIsrResponseThunk_(void* self,
 void BrokerNode::stop() {
     if (stopped_) return; // idempotent (controller-owned flag, F9a)
     stopped_ = true;
+    controlThreadId_ = std::thread::id{};   // fix round 0: a joined thread's id may be reused
 
     // Controlled shutdown fix round 2 (N2): before ANY thread is joined, halt
     // the controller role — this node decides nothing more while its data

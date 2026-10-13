@@ -107,7 +107,8 @@ static NodeConfig makeThreeNodeConfig(
     int nodeId,
     const fs::path& dataDir,
     const std::vector<uint16_t>& consensusPorts,  // 3 ports, one per node
-    const std::vector<uint16_t>& clientPorts)     // 3 ports, one per node
+    const std::vector<uint16_t>& clientPorts,     // 3 ports, one per node
+    const std::vector<uint16_t>& replPorts)       // 3 ports, one per node (Task 6: __catalog)
 {
     NodeConfig cfg;
     rune::node::test::pinLegacyRuntime(cfg);   // orthogonal to the worker runtime
@@ -127,6 +128,7 @@ static NodeConfig makeThreeNodeConfig(
         p.id            = i;
         p.host          = "127.0.0.1";
         p.consensusPort = consensusPorts[static_cast<std::size_t>(i)];
+        p.replicationPort = replPorts[static_cast<std::size_t>(i)];
         cfg.peers.push_back(p);
     }
 
@@ -211,10 +213,13 @@ TEST(UdpClusterElectionTest, ThreeNodeUdpCluster_ElectsOneLeader) {
     // Discover 6 free UDP ports at test start (3 consensus + 3 client).
     const auto cPorts = discoverFreePorts(3);
     const auto kPorts = discoverFreePorts(3);
+    // Catalog history Task 6: a multi-node broker needs a replication port
+    // (__catalog is replicated to every broker; without one it refuses to start).
+    const auto rPorts = discoverFreePorts(3);
 
-    NodeConfig cfg0 = makeThreeNodeConfig(0, dir0.path, cPorts, kPorts);
-    NodeConfig cfg1 = makeThreeNodeConfig(1, dir1.path, cPorts, kPorts);
-    NodeConfig cfg2 = makeThreeNodeConfig(2, dir2.path, cPorts, kPorts);
+    NodeConfig cfg0 = makeThreeNodeConfig(0, dir0.path, cPorts, kPorts, rPorts);
+    NodeConfig cfg1 = makeThreeNodeConfig(1, dir1.path, cPorts, kPorts, rPorts);
+    NodeConfig cfg2 = makeThreeNodeConfig(2, dir2.path, cPorts, kPorts, rPorts);
 
     // Construct all 3 nodes.
     BrokerNode node0{cfg0};
@@ -250,10 +255,13 @@ TEST(UdpClusterElectionTest, ThreeNodeUdpCluster_NoSplitBrain_LoopedFiveTimes) {
         // Fresh ports each iteration — eliminates port-reuse races.
         const auto cPorts = discoverFreePorts(3);
         const auto kPorts = discoverFreePorts(3);
+        // Catalog history Task 6: a multi-node broker needs a replication port
+        // (__catalog is replicated to every broker; without one it refuses to start).
+        const auto rPorts = discoverFreePorts(3);
 
-        NodeConfig cfg0 = makeThreeNodeConfig(0, dir0.path, cPorts, kPorts);
-        NodeConfig cfg1 = makeThreeNodeConfig(1, dir1.path, cPorts, kPorts);
-        NodeConfig cfg2 = makeThreeNodeConfig(2, dir2.path, cPorts, kPorts);
+        NodeConfig cfg0 = makeThreeNodeConfig(0, dir0.path, cPorts, kPorts, rPorts);
+        NodeConfig cfg1 = makeThreeNodeConfig(1, dir1.path, cPorts, kPorts, rPorts);
+        NodeConfig cfg2 = makeThreeNodeConfig(2, dir2.path, cPorts, kPorts, rPorts);
 
         BrokerNode node0{cfg0};
         BrokerNode node1{cfg1};
@@ -281,10 +289,13 @@ TEST(UdpClusterElectionTest, ThreeNodeUdpCluster_LateJoin_Converges) {
 
     const auto cPorts = discoverFreePorts(3);
     const auto kPorts = discoverFreePorts(3);
+    // Catalog history Task 6: a multi-node broker needs a replication port
+    // (__catalog is replicated to every broker; without one it refuses to start).
+    const auto rPorts = discoverFreePorts(3);
 
-    NodeConfig cfg0 = makeThreeNodeConfig(0, dir0.path, cPorts, kPorts);
-    NodeConfig cfg1 = makeThreeNodeConfig(1, dir1.path, cPorts, kPorts);
-    NodeConfig cfg2 = makeThreeNodeConfig(2, dir2.path, cPorts, kPorts);
+    NodeConfig cfg0 = makeThreeNodeConfig(0, dir0.path, cPorts, kPorts, rPorts);
+    NodeConfig cfg1 = makeThreeNodeConfig(1, dir1.path, cPorts, kPorts, rPorts);
+    NodeConfig cfg2 = makeThreeNodeConfig(2, dir2.path, cPorts, kPorts, rPorts);
 
     BrokerNode node0{cfg0};
     BrokerNode node1{cfg1};
@@ -328,10 +339,13 @@ TEST(UdpClusterElectionTest, ThreeNodeUdpCluster_LeaderKill_SurvivorsReElect) {
 
     const auto cPorts = discoverFreePorts(3);
     const auto kPorts = discoverFreePorts(3);
+    // Catalog history Task 6: a multi-node broker needs a replication port
+    // (__catalog is replicated to every broker; without one it refuses to start).
+    const auto rPorts = discoverFreePorts(3);
 
-    NodeConfig cfg0 = makeThreeNodeConfig(0, dir0.path, cPorts, kPorts);
-    NodeConfig cfg1 = makeThreeNodeConfig(1, dir1.path, cPorts, kPorts);
-    NodeConfig cfg2 = makeThreeNodeConfig(2, dir2.path, cPorts, kPorts);
+    NodeConfig cfg0 = makeThreeNodeConfig(0, dir0.path, cPorts, kPorts, rPorts);
+    NodeConfig cfg1 = makeThreeNodeConfig(1, dir1.path, cPorts, kPorts, rPorts);
+    NodeConfig cfg2 = makeThreeNodeConfig(2, dir2.path, cPorts, kPorts, rPorts);
 
     auto node0 = std::make_unique<BrokerNode>(cfg0);
     auto node1 = std::make_unique<BrokerNode>(cfg1);

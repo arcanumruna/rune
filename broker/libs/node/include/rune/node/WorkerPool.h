@@ -598,6 +598,15 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    /// Worker w's runner thread id (default id when not started).  Controller
+    /// only, after the runners started (fused placement: worker 0 hosts the
+    /// runtime — BrokerNode records it as the control thread).
+    [[nodiscard]] std::thread::id runnerThreadId(std::size_t w) const noexcept {
+        if (w < shardRunners_.size() && shardRunners_[w]) return shardRunners_[w]->threadId();
+        if (w < runners_.size() && runners_[w]) return runners_[w]->threadId();
+        return {};
+    }
+
     // E2 inc2b: per-worker AgentRunner lifecycle
     // -----------------------------------------------------------------------
 

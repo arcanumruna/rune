@@ -885,6 +885,10 @@ public:
     /// Test-only: the __catalog Log — ONLY while the admin thread is quiesced
     /// (before start(), after stop()); otherwise read it inside onAdminThreadForTest.
     [[nodiscard]] rune::storage::Log* catalogLogForTest() const noexcept { return catalogLog_.get(); }
+    /// Test-only: the control (runtime) thread's id — its own runner, or worker
+    /// 0's in fused placement.  Recorded by start() on the controller, immutable
+    /// until stop(); default id when not running.
+    [[nodiscard]] std::thread::id controlThreadIdForTest() const noexcept { return controlThreadId_; }
     /// Test-only: this node's id (immutable config).
     [[nodiscard]] int32_t nodeIdForTest() const noexcept { return config_.nodeId; }
 
@@ -939,6 +943,7 @@ public:
     /// already runs on the control thread.
     template <class = void>   // instantiated after submitOwnerThreadTestTask_ is defined
     bool replicationIsLeaderForTest() {
+        requireNotOnControlThread_("replicationIsLeaderForTest");
         if (!started_ || stopped_ || !runtimeAgent_ || !replBridge_) return false;
         return onControlThreadForTest([this] { return replBridge_ && replBridge_->isLeader(); });
     }
@@ -947,6 +952,7 @@ public:
     /// above).  Not running → 0.
     template <class = void>
     rune::replication::Epoch replicationEpochForTest() {
+        requireNotOnControlThread_("replicationEpochForTest");
         if (!started_ || stopped_ || !runtimeAgent_ || !replBridge_) return 0;
         return onControlThreadForTest([this]() -> rune::replication::Epoch {
             return replBridge_ ? replBridge_->lastEpoch() : 0;
@@ -1166,6 +1172,16 @@ public:
     }
 
 private:
+    // Fix round 0 (Task 6): a control-thread round trip awaited ON the control
+    // thread would wait for itself forever — refuse loudly instead.
+    void requireNotOnControlThread_(const char* what) const {
+        if (controlThreadId_ != std::thread::id{} && std::this_thread::get_id() == controlThreadId_) {
+            spdlog::critical("BrokerNode[{}]: {} called ON the control thread — it posts a control-thread "
+                             "task and would wait for itself forever (deadlock); refused",
+                             config_.nodeId, what);
+            throw std::logic_error(std::string(what) + ": called on the control thread (would deadlock)");
+        }
+    }
     // F1: test-side submit + await (see onOwnerThreadForTest).  Runs on the TEST
     // thread only; the node's threads only ever see the ring-carried ref.
     template <OwnerThreadTestTask::Target T, class F>
@@ -1424,6 +1440,7 @@ private:
     std::unique_ptr<rune::replication::PubAddBroker>      catalogAddBroker_;
     std::unique_ptr<rune::replication::PartitionReplica>  catalogReplica_;
     bool                                                  catalogOnController_ = false;
+    std::thread::id                                       controlThreadId_;   // start() (controller); see controlThreadIdForTest
     // Control thread: the last consensus-driven catalog role posted (single node).
     struct PostedRole { bool leader = false; int32_t epoch = -1; };
     PostedRole                                            catalogLastRole_;

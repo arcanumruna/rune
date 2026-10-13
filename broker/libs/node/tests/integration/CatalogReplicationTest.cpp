@@ -679,3 +679,56 @@ TEST(BridgeObserverRegression, LeadershipIsObservedOnTheControlThreadNotThroughA
     n.stop();
     EXPECT_FALSE(n.replicationIsLeaderForTest()) << "stopped: the bridge is gone";
 }
+
+// ===========================================================================
+// Fix round 0 (Task 6 review rulings).
+// ===========================================================================
+
+// Ruling on concern 3: a multi-node broker without a replication transport
+// REFUSES to start — never a NullPartitionTransport catalog that can never be
+// replicated (nor reach its majority minIsr).
+TEST(CatalogReplicationRegression, MultiNodeWithoutAReplicationTransportRefusesToStartRegression) {
+    TmpDir dir{"cat_norepl"};
+    const Ports ports = Ports::discover(3);
+    NodeConfig cfg = makeConfig(1, dir.path, ports, 3, Mode::Legacy);
+    cfg.perWorkerReplication = false;
+    for (auto& p : cfg.peers) p.replicationPort = 0;   // no replication endpoint anywhere
+    BrokerNode n{cfg};
+    try {
+        n.start();
+        ADD_FAILURE() << "a multi-node broker without a replication transport started";
+    } catch (const std::runtime_error& e) {
+        const std::string what = e.what();
+        EXPECT_NE(what.find("__catalog"), std::string::npos) << what;
+        EXPECT_NE(what.find("replication transport"), std::string::npos) << what;
+    }
+    n.stop();
+}
+
+// Ruling on concern 2: the control-thread observers, called ON the control
+// thread, fail loudly instead of awaiting themselves forever.
+namespace {
+void expectObserversRefuseOnTheControlThread(Mode mode, const char* tag) {
+    TmpDir dir{tag};
+    const Ports ports = Ports::discover(1);
+    BrokerNode n{makeConfig(1, dir.path, ports, 1, mode)};
+    n.start();
+    ASSERT_TRUE(n.awaitLeader(10'000ms));
+    const std::thread::id onControl = n.onControlThreadForTest([] { return std::this_thread::get_id(); });
+    EXPECT_EQ(n.controlThreadIdForTest(), onControl) << "start() records the real control thread";
+    EXPECT_NE(n.controlThreadIdForTest(), std::this_thread::get_id());
+    EXPECT_THROW((void)n.onControlThreadForTest([&n] { return n.replicationIsLeaderForTest(); }), std::logic_error);
+    EXPECT_THROW((void)n.onControlThreadForTest([&n] { return n.replicationEpochForTest(); }), std::logic_error);
+    EXPECT_NO_THROW((void)n.replicationIsLeaderForTest()) << "the test thread still reads it";
+    n.stop();
+    EXPECT_EQ(n.controlThreadIdForTest(), std::thread::id{});
+}
+} // namespace
+
+TEST(BridgeObserverRegression, ObserverCalledOnTheControlThreadFailsLoudlyNotDeadlocksRegression) {
+    expectObserversRefuseOnTheControlThread(Mode::Shard, "cat_obs_thr");
+}
+
+TEST(BridgeObserverRegression, ObserverCalledOnTheFusedControlThreadFailsLoudlyNotDeadlocksRegression) {
+    expectObserversRefuseOnTheControlThread(Mode::ShardFused, "cat_obs_fus");
+}

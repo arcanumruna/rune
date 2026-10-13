@@ -109,6 +109,11 @@ public:
         thread_  = std::thread([this]() { run(); });
     }
 
+    /// The agent thread's id (default-constructed before start()).  Written by
+    /// start() on the controller; read only by threads ordered after start()
+    /// returned (a thread start / join edge) — immutable while running.
+    [[nodiscard]] std::thread::id threadId() const noexcept { return thread_.get_id(); }
+
     /// Ask the agent thread to stop: posts ONE Stop command on the control ring.
     /// Does NOT join.  Idempotent; a stop() before start() is a no-op (matching
     /// the old flag semantics, where start() re-armed the flag).
