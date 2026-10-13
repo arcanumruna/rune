@@ -105,11 +105,11 @@ term   := [tag u16][primType u8][op u8: 1=Eq, 2=In][count u8 (Eq: 1; In: 1..64)]
 
 - `worldId == x` (u32) takes 2 + 5 + 4 = **11 bytes**.
 - The largest legal filter is bounded at 2 + 8 × (5 + 64 × 16) = 8,234 bytes, the widest value being a 16-byte `FixedStr`. The encoder checks the whole Subscribe frame against the transport's maximum message length. A filter that cannot fit fails explicitly before anything is sent, which follows the existing `std::length_error` rule for Subscribe.
-- **In the wire message:** `Subscribe` (templateId 18) gains a second variable-length field after `key`, a `u16` length prefix followed by the filter bytes. The field is present only when the session's client version is 7 or higher (`kClientVersionFilter`).
-  - A v7 client sends a zero length for "no filter".
-  - `JoinGroup` gains the same trailing filter field for v7, so the coordinator can enforce one filter per group (§13.3).
+- **In the wire message:** `Subscribe` (templateId 18) gains a second variable-length field after `key`, a `u16` length prefix followed by the filter bytes. The field is present only when the session's client version is 8 or higher (`kClientVersionFilter`; v7 is taken by E2's PartitionDataReset).
+  - A v8 client sends a zero length for "no filter".
+  - `JoinGroup` gains the same trailing filter field for v8, so the coordinator can enforce one filter per group (§13.3).
   - Older clients and brokers never see the field.
-  - A v7 client connected to a broker that predates filters is refused at session setup by the existing version negotiation, so a filter is never silently dropped.
+  - A v8 client connected to a broker that predates filters is refused at session setup by the existing version negotiation, so a filter is never silently dropped.
 - **Canonical form:** the client sorts `in` values and sorts terms by tag before encoding. Two equal filters therefore encode identically, which the broker's index relies on (§6).
 
 ## 6. Broker evaluation
