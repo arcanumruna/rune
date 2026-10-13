@@ -113,7 +113,8 @@ gtest_discover_tests(rune_codec_tests)
 
 add_executable(rune_catalog_tests
     tests/catalog/CatalogEventTest.cpp
-    tests/catalog/CatalogApplyV1Test.cpp)
+    tests/catalog/CatalogApplyV1Test.cpp
+    tests/catalog/CatalogTopicNameTest.cpp)
 target_link_libraries(rune_catalog_tests PRIVATE rune_catalog GTest::gtest_main)
 gtest_discover_tests(rune_catalog_tests)
 

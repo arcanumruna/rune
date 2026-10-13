@@ -98,6 +98,9 @@ public:
     [[nodiscard]] const ViewObject*  viewByViewTopicId(int32_t topicId) const;
     /// A live topic or view owns this name.
     [[nodiscard]] bool nameTaken(std::string_view n) const { return topicByName(n) || viewByName(n); }
+    /// A live topic or view name that differs from `n` only in ASCII letter case (two such
+    /// names would share one directory on a case-insensitive filesystem); nullptr: none.
+    [[nodiscard]] const std::string* liveNameFoldingOnto(std::string_view n) const;
     /// A live view whose sources include `topicName` (nullptr: none).
     [[nodiscard]] const ViewObject* viewReading(std::string_view topicName) const;
     /// Live objects in objectId order.

@@ -275,7 +275,7 @@ std::vector<RefusalCase> refusalCases() {
     std::vector<RefusalCase> c;
     auto ct = [](int32_t tid) { return createOps(tid, false); };
     // CreateTopic
-    c.push_back({"create: empty name", raw(ct(3), "", 4, 0, 1), C::Precondition, "name is empty"});
+    c.push_back({"create: empty name", raw(ct(3), "", 4, 0, 1), C::Precondition, "is invalid (empty)"});
     c.push_back({"create: name is a topic", raw(ct(3), "u", 4, 0, 1), C::Precondition, "'u' is taken"});
     c.push_back({"create: name is a view", raw(ct(3), "v", 4, 0, 1), C::Precondition, "'v' is taken"});
     c.push_back({"create: objectId", raw(ct(3), "n", 5, 0, 1), C::Precondition, "objectId 5, next is 4"});

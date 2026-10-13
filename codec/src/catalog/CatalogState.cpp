@@ -2,6 +2,7 @@
 // fingerprint verification), the digest, and the F20 resolve / unresolve of ALTER ops.
 #include <rune/catalog/CatalogState.h>
 #include <rune/catalog/CatalogFingerprint.h>
+#include <rune/catalog/TopicName.h>
 #include <rune/codec/Fingerprint.h>
 #include <rune/codec/Serialize.h>
 #include "ApplyV1.h"
@@ -35,6 +36,13 @@ const TopicObject* CatalogState::topicByTopicId(int32_t topicId) const { return 
 const ViewObject*  CatalogState::viewByName(std::string_view n) const { return viaIndex(views_, viewNames_, n); }
 const ViewObject*  CatalogState::viewByObjectId(uint64_t id) const { return byObjectId(views_, id); }
 const ViewObject*  CatalogState::viewByViewTopicId(int32_t topicId) const { return viaIndex(views_, viewTopicIds_, topicId); }
+
+const std::string* CatalogState::liveNameFoldingOnto(std::string_view n) const {
+    for (const auto* index : {&topicNames_, &viewNames_})
+        for (const auto& [name, id] : *index)
+            if (name != n && topicNamesFoldEqual(name, n)) return &name;
+    return nullptr;
+}
 
 const ViewObject* CatalogState::viewReading(std::string_view topicName) const {
     for (const auto& [id, v] : views_)

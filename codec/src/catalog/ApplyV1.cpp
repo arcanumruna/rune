@@ -5,8 +5,10 @@
 // builds a staged change without touching the state; `commit` installs it.  The state
 // is therefore a pure function of the applied prefix, and apply is atomic.
 //
-//   CreateTopic       name non-empty and free; objectId == nextObjectId; ops.topicId ==
-//                     nextTopicId; versions 0 -> 1; partitions >= 1; replicationFactor >= 0;
+//   CreateTopic       name valid (TopicName.h: 1..249 bytes of [A-Za-z0-9._-], not "." / "..",
+//                     no "__" prefix), free, not case-folding onto a different live name;
+//                     objectId == nextObjectId; ops.topicId == nextTopicId; versions 0 -> 1;
+//                     partitions >= 1; replicationFactor >= 0;
 //                     schema (if any): descriptor deserializes, nextTag past every tag,
 //                     keyField (if any) a live field
 //   DropTopic         live topic: objectId, name, topicId agree; versions chain; no live
@@ -22,7 +24,7 @@
 //                     (checkCompatibility under the effective mode) and applyOps succeed
 //   SetCompatibility  live typed topic; versions chain; schema version not exhausted;
 //                     applyOps({SET COMPATIBILITY mode}) succeeds (F9: today's bump)
-//   CreateView        name non-empty and free; objectId == nextObjectId; viewTopicId ==
+//   CreateView        name as for CreateTopic; objectId == nextObjectId; viewTopicId ==
 //                     nextTopicId; versions 0 -> 1; the definition (below)
 //   AlterView         live view: objectId, name agree; versions chain; viewTopicId ==
 //                     nextTopicId (a fresh sink, ruling 4); the definition
@@ -37,6 +39,7 @@
 #include "Wire.h"
 
 #include <rune/catalog/CatalogFingerprint.h>
+#include <rune/catalog/TopicName.h>
 #include <rune/codec/Evolve.h>
 #include <rune/codec/Serialize.h>
 
@@ -59,7 +62,8 @@ constexpr uint16_t kMaxSchemaVersion = 0xFFFE;   // the next one must stay below
 std::unexpected<ApplyError> fail(int64_t offset, Code code, std::string detail) {
     return std::unexpected(ApplyError{offset, code, 0, 0, std::move(detail)});
 }
-std::string quoted(std::string_view s) { return "'" + std::string(s) + "'"; }
+/// Names in a detail are client-supplied: escaped so a rejected one cannot forge log lines.
+std::string quoted(std::string_view s) { return "'" + escapeNameForLog(s) + "'"; }
 std::string prefix(const CatalogEvent& e) { return std::string(kindName(e.kind)) + ": "; }
 
 /// An existing object's version chain: prev == current, new == current + 1.
@@ -75,8 +79,11 @@ std::optional<std::string> chainError(const CatalogEvent& e, uint32_t current) {
 /// A new object: a free non-empty name, the next objectId, the next topic id, versions 0 -> 1.
 std::optional<std::string> createError(const CatalogState& s, const CatalogEvent& e, int32_t topicId,
                                        std::string_view topicIdName) {
-    if (e.objectName.empty()) return prefix(e) + "object name is empty";
+    if (const TopicNameError ne = checkTopicName(e.objectName); ne != TopicNameError::None)
+        return prefix(e) + "name " + quoted(e.objectName) + " is invalid (" + std::string(topicNameErrorText(ne)) + ")";
     if (s.nameTaken(e.objectName)) return prefix(e) + "name " + quoted(e.objectName) + " is taken";
+    if (const std::string* other = s.liveNameFoldingOnto(e.objectName))
+        return prefix(e) + "name " + quoted(e.objectName) + " case-folds onto the live name " + quoted(*other);
     if (s.nextObjectId() == std::numeric_limits<uint64_t>::max()) return prefix(e) + "object ids are exhausted";
     if (e.objectId != s.nextObjectId())
         return prefix(e) + "objectId " + std::to_string(e.objectId) + ", next is " + std::to_string(s.nextObjectId());
