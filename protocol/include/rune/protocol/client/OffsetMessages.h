@@ -405,6 +405,10 @@ struct OffsetFetch {
 // __consumer_offsets partition yet (after a restart or a coordinator move, until
 // the whole log is replayed): an answer then would be a guess.  A fetch-all
 // (no entries) gets one sentinel {-1, -1, offset -1, NotLeader}.  No format change.
+// (E2 residual round 5) When a transient partition starts a NEW lineage, every
+// group holding a committed offset of the old one is rebalanced (generation
+// bump); an OffsetCommit from before that rebalance is answered
+// IllegalGeneration (15) — the member re-joins and re-fetches (-1).
 // ---------------------------------------------------------------------------
 struct OffsetFetchResult {
     int32_t topicId   = 0;
