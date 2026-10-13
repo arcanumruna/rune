@@ -18,7 +18,10 @@ target_include_directories(rune_codec PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
 set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include" CACHE PATH
     "rune-protocol include dir (rune/protocol/CatalogTypes.h: the one TopicConfig + RequestId)")
 add_library(rune_catalog STATIC
-    src/catalog/CatalogEvent.cpp)
+    src/catalog/CatalogEvent.cpp
+    src/catalog/CatalogState.cpp
+    src/catalog/CatalogFingerprint.cpp
+    src/catalog/ApplyV1.cpp)
 target_include_directories(rune_catalog PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${RUNE_PROTOCOL_INCLUDE})
 target_link_libraries(rune_catalog PUBLIC rune_codec)
 target_compile_features(rune_catalog PUBLIC cxx_std_23)
@@ -109,7 +112,8 @@ include(GoogleTest)
 gtest_discover_tests(rune_codec_tests)
 
 add_executable(rune_catalog_tests
-    tests/catalog/CatalogEventTest.cpp)
+    tests/catalog/CatalogEventTest.cpp
+    tests/catalog/CatalogApplyV1Test.cpp)
 target_link_libraries(rune_catalog_tests PRIVATE rune_catalog GTest::gtest_main)
 gtest_discover_tests(rune_catalog_tests)
 

@@ -133,4 +133,9 @@ private:
     std::size_t pos_ = 0;
 };
 
+/// THE formatVer-1 value validation (CatalogEvent.cpp) — the one rule set encode and decode
+/// run, exported so apply() refuses an in-memory event exactly where encode would
+/// (formatVer, kind, kind/ops agreement, every enum range).  nullopt = valid.
+[[nodiscard]] std::optional<EncodeError> validateEvent(const CatalogEvent& e) noexcept;
+
 } // namespace rune::catalog::wire
