@@ -49,6 +49,13 @@ struct DdlExtension {
     return n;
 }
 
+/// Offset of the requestId (hi:u64, lo:u64) inside an encoded extension: after
+/// statement(varstr32) and clientName(varstr).  A sender that stamps the
+/// requestId after encoding writes it at msg.extOffset() + extRequestIdOffset(ext).
+[[nodiscard]] constexpr std::size_t extRequestIdOffset(const DdlExtension& e) noexcept {
+    return 4u + e.statement.size() + 2u + e.clientName.size();
+}
+
 /// Writes the extension (the caller checked extFits); returns bytes written.
 inline std::size_t putExt(uint8_t* buf, const DdlExtension& e) noexcept {
     std::size_t pos = 0;
@@ -207,6 +214,11 @@ struct DefineTopic {
              + 4u + descriptorLen;
         if (hasExt) return base + 1u + 2u + topicConfigEncodedSize(config) + extEncodedSize(ext);
         return base + (persistence != kPersistenceDisk ? 1u : 0u);
+    }
+    /// Where the DdlExtension starts in the encoded frame (meaningful when hasExt).
+    [[nodiscard]] std::size_t extOffset() const noexcept {
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 2u + topicName.size() + 2u + keyField.size() + 4u +
+               descriptorLen + 1u + 2u + topicConfigEncodedSize(config);
     }
     std::size_t encode(uint8_t* buf) const noexcept {
         if (!fits()) return 0;
@@ -395,6 +407,10 @@ struct AlterTopic {
              + 4u + opsLen
              + (hasExt ? extEncodedSize(ext) : 0u);
     }
+    /// Where the DdlExtension starts in the encoded frame (meaningful when hasExt).
+    [[nodiscard]] std::size_t extOffset() const noexcept {
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 2u + topicName.size() + 4u + opsLen;
+    }
     std::size_t encode(uint8_t* buf) const noexcept {
         if (!fits()) return 0;
         MessageHeader hdr; hdr.blockLength = BODY_FIXED; hdr.templateId = TEMPLATE_ID;
@@ -485,6 +501,10 @@ struct CreateView {
              + 2u + keyField.size()
              + 4u + planLen
              + (hasExt ? extEncodedSize(ext) : 0u);
+    }
+    /// Where the DdlExtension starts in the encoded frame (meaningful when hasExt).
+    [[nodiscard]] std::size_t extOffset() const noexcept {
+        return MessageHeader::ENCODED_SIZE + BODY_FIXED + 2u + viewName.size() + 2u + keyField.size() + 4u + planLen;
     }
     std::size_t encode(uint8_t* buf) const noexcept {
         if (!fits()) return 0;
@@ -584,6 +604,8 @@ struct DropTopic {
     std::size_t encodedSize() const noexcept {
         return MessageHeader::ENCODED_SIZE + 2u + topicName.size() + extEncodedSize(ext);
     }
+    /// Where the DdlExtension starts in the encoded frame.
+    [[nodiscard]] std::size_t extOffset() const noexcept { return MessageHeader::ENCODED_SIZE + 2u + topicName.size(); }
     std::size_t encode(uint8_t* buf) const noexcept {
         if (!fits()) return 0;
         ddl_detail::putDdlHeader(buf, TEMPLATE_ID, BODY_FIXED, sessionId, correlationId);
@@ -662,6 +684,10 @@ struct AlterTopicConfig {
     std::size_t encodedSize() const noexcept {
         return MessageHeader::ENCODED_SIZE + 2u + topicName.size() + 4u + changes.size() + extEncodedSize(ext);
     }
+    /// Where the DdlExtension starts in the encoded frame.
+    [[nodiscard]] std::size_t extOffset() const noexcept {
+        return MessageHeader::ENCODED_SIZE + 2u + topicName.size() + 4u + changes.size();
+    }
     std::size_t encode(uint8_t* buf) const noexcept {
         if (!fits()) return 0;
         ddl_detail::putDdlHeader(buf, TEMPLATE_ID, BODY_FIXED, sessionId, correlationId);
@@ -706,6 +732,8 @@ struct DropView {
     std::size_t encodedSize() const noexcept {
         return MessageHeader::ENCODED_SIZE + 2u + viewName.size() + extEncodedSize(ext);
     }
+    /// Where the DdlExtension starts in the encoded frame.
+    [[nodiscard]] std::size_t extOffset() const noexcept { return MessageHeader::ENCODED_SIZE + 2u + viewName.size(); }
     std::size_t encode(uint8_t* buf) const noexcept {
         if (!fits()) return 0;
         ddl_detail::putDdlHeader(buf, TEMPLATE_ID, BODY_FIXED, sessionId, correlationId);
@@ -749,6 +777,10 @@ struct AlterView {
     std::size_t encodedSize() const noexcept {
         return MessageHeader::ENCODED_SIZE + 2u + viewName.size() + 2u + keyField.size() + 1u + 4u
              + 4u + planLen + extEncodedSize(ext);
+    }
+    /// Where the DdlExtension starts in the encoded frame.
+    [[nodiscard]] std::size_t extOffset() const noexcept {
+        return MessageHeader::ENCODED_SIZE + 2u + viewName.size() + 2u + keyField.size() + 1u + 4u + 4u + planLen;
     }
     std::size_t encode(uint8_t* buf) const noexcept {
         if (!fits()) return 0;

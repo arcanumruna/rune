@@ -556,3 +556,64 @@ TEST(CatalogDdlWireRegression, ConfigKeyIsTheOneDefinitionAndItsValuesArePinnedR
     EXPECT_EQ(pc::kConfigKeyFirst, static_cast<uint8_t>(K::RetentionMs));
     EXPECT_EQ(pc::kConfigKeyLast, static_cast<uint8_t>(K::MaxCompactionLagMs));
 }
+
+// Catalog history (Task 5 fix round 1, M2): every DDL encoder exposes where its
+// DdlExtension starts (extOffset) and where the extension's requestId sits in
+// it (extRequestIdOffset), so a sender that stamps the requestId later (the
+// client's duty thread) never re-derives the layout.  Pinned against decode:
+// the decoded statement view starts 4 bytes into the extension, and the bytes
+// at extOffset + extRequestIdOffset are the requestId — with and without
+// replayedFrom, for all seven DDL frames.
+namespace {
+template <class Msg>
+void expectExtOffsetMatchesDecode(const Msg& msg, const char* what) {
+    std::vector<uint8_t> buf(msg.encodedSize());
+    const std::size_t n = msg.encode(buf.data());
+    ASSERT_EQ(n, buf.size()) << what;
+    const auto d = Msg::decode(buf.data(), n);
+    ASSERT_TRUE(d.has_value()) << what;
+    const std::size_t at = msg.extOffset();
+    EXPECT_EQ(reinterpret_cast<const uint8_t*>(d->ext.statement.data()), buf.data() + at + 4u) << what;
+    const std::size_t rid = at + pc::extRequestIdOffset(msg.ext);
+    ASSERT_LE(rid + 16u, n) << what;
+    EXPECT_EQ(static_cast<uint64_t>(pc::detail::getLE64(buf.data(), static_cast<int>(rid))), msg.ext.requestId.hi) << what;
+    EXPECT_EQ(static_cast<uint64_t>(pc::detail::getLE64(buf.data(), static_cast<int>(rid + 8))), msg.ext.requestId.lo) << what;
+    EXPECT_EQ(d->ext.requestId, msg.ext.requestId) << what;
+}
+} // namespace
+
+TEST(CatalogDdlWireRegression, EveryDdlEncoderExposesItsExtensionAndRequestIdOffsets) {
+    static const uint8_t blob[] = {1, 2, 3, 4};
+    std::vector<uint8_t> changes(pc::configChangesEncodedSize(2));
+    const pc::ConfigChangeWire ch[] = {{1, 5}, {2, 6}};
+    ASSERT_EQ(pc::putConfigChanges(changes.data(), ch), changes.size());
+    for (int replayed = 0; replayed <= 1; ++replayed) {
+        pc::DdlExtension ext;
+        ext.statement  = "CREATE TOPIC t";
+        ext.clientName = "probe";
+        ext.requestId  = {0x1122334455667788ull, 0x99AABBCCDDEEFF01ull};
+        if (replayed == 1) {
+            ext.hasReplayedFrom = 1; ext.replayedClusterId = "c1"; ext.replayedOffset = 9; ext.replayedPrincipal = "p";
+        }
+        pc::DefineTopic dt; dt.topicName = "t"; dt.keyField = "k"; dt.partitionCount = 2;
+        dt.descriptorBlob = blob; dt.descriptorLen = sizeof blob; dt.replicationFactor = 3;
+        dt.config.coPartitionGroup = "g"; dt.hasExt = true; dt.ext = ext;
+        expectExtOffsetMatchesDecode(dt, "DefineTopic");
+        pc::AlterTopic at; at.topicName = "t"; at.expectedVersion = 2; at.opsBlob = blob; at.opsLen = sizeof blob;
+        at.hasExt = true; at.ext = ext;
+        expectExtOffsetMatchesDecode(at, "AlterTopic");
+        pc::CreateView cv; cv.viewName = "v"; cv.keyField = "k"; cv.planBlob = blob; cv.planLen = sizeof blob;
+        cv.hasExt = true; cv.ext = ext;
+        expectExtOffsetMatchesDecode(cv, "CreateView");
+        pc::DropTopic dpt; dpt.topicName = "t"; dpt.ext = ext;
+        expectExtOffsetMatchesDecode(dpt, "DropTopic");
+        pc::DropView dpv; dpv.viewName = "v"; dpv.ext = ext;
+        expectExtOffsetMatchesDecode(dpv, "DropView");
+        pc::AlterView av; av.viewName = "v"; av.keyField = "k"; av.persistence = 1; av.expectedVersion = 4;
+        av.planBlob = blob; av.planLen = sizeof blob; av.ext = ext;
+        expectExtOffsetMatchesDecode(av, "AlterView");
+        pc::AlterTopicConfig atc; atc.topicName = "t"; atc.expectedVersion = 7;
+        atc.changes = std::span<const uint8_t>(changes.data(), changes.size()); atc.ext = ext;
+        expectExtOffsetMatchesDecode(atc, "AlterTopicConfig");
+    }
+}
