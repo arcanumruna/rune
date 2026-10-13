@@ -489,3 +489,34 @@ TEST(ProducerRoutePark, ResendAllRedirectedStopsAtTheFirstRefusalRegression) {
     for (int i = 0; i < 3; ++i)
         EXPECT_EQ(batchcorr::base(w.frames[3 + i].corrId), batchcorr::base(first[i].corrId));
 }
+
+// Phase 2b E2 (ruling 2): TransientLogFull (42) is a definite non-append on the
+// RIGHT leader (its transient ring is full of not-yet-replicated records): the
+// batch is re-sent with the SAME identity after the retriable backoff — never
+// failed, never a route park (no metadata refresh, unlike NotLeader).
+TEST(ProducerRoutePark, TransientLogFullIsRetriedAfterBackoffWithoutParkingRegression) {
+    ProducerImpl impl(ackedCfg());
+    Wire w;
+    const auto sink = w.fn();
+    BatchTally t;
+    impl.setOnBatchAck(&BatchTally::on, &t);
+    const std::vector<uint8_t> v(8, 1);
+    ASSERT_TRUE(impl.submitSendRecord(1, 0, Key(uint64_t{1}), v, false, 0));
+    pump(impl, sink);
+    ASSERT_EQ(w.frames.size(), 1u);
+    impl.onProduceResponse(w.frames[0].corrId, -1,
+                           static_cast<int16_t>(rune::protocol::client::ErrorCode::TransientLogFull));
+    EXPECT_EQ(t.failed, 0) << "TransientLogFull (nothing appended) failed the batch";
+    EXPECT_FALSE(impl.routeParked(1, 0)) << "42 must not park the route (no metadata refresh)";
+    EXPECT_FALSE(impl.takeMetadataWanted()) << "42 must not request metadata";
+    impl.retransmitStalled(kNow + 1'000'000LL, sink);   // inside the backoff
+    EXPECT_EQ(w.frames.size(), 1u) << "re-sent without a backoff";
+    impl.retransmitStalled(kNow + 200'000'000LL, sink); // past it
+    ASSERT_EQ(w.frames.size(), 2u);
+    EXPECT_EQ(batchcorr::base(w.frames[1].corrId), batchcorr::base(w.frames[0].corrId));
+    EXPECT_EQ(w.frames[1].epoch, w.frames[0].epoch);
+    EXPECT_EQ(w.frames[1].baseSequence, w.frames[0].baseSequence);
+    impl.onProduceResponse(w.frames[1].corrId, 100, 0);
+    EXPECT_EQ(t.okRecords, 1);
+    EXPECT_EQ(t.failed, 0);
+}

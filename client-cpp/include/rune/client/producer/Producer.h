@@ -93,7 +93,11 @@ struct ProducerConfig {
                                           // rune::protocol::client::kIdempotentMaxInFlightBatches
                                           // (the broker's dedup window; Kafka caps at 5) — logged
                                           // once at producer creation when clamped.
-    int64_t produceTimeoutMs = 5'000;    // timeout for a pending ProduceResponse ack
+    // Timeout for a pending ProduceResponse ack.  It also bounds the retriable
+    // answers: MinIsrViolation and (Phase 2b E2) TransientLogFull (42 — a
+    // transient topic's ring is full of not-yet-replicated records) are re-sent
+    // after a backoff with the same identity, never failed early.
+    int64_t produceTimeoutMs = 5'000;
     // F8c fix round 1 (I-4): TransactionalProducer only — the deadline of
     // initTransactions / sendOffsetsToTransaction / commit / abort (Kafka
     // max.block.ms; >= the default transaction timeout).  EndTxn gets a fresh

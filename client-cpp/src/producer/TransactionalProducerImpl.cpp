@@ -54,6 +54,7 @@ constexpr int16_t kOutOfOrderSequence     = static_cast<int16_t>(rpc::ErrorCode:
 constexpr int16_t kConcurrentTransactions = static_cast<int16_t>(rpc::ErrorCode::ConcurrentTransactions);
 constexpr int16_t kNotLeader              = static_cast<int16_t>(rpc::ErrorCode::NotLeader);
 constexpr int16_t kInvalidRequest         = static_cast<int16_t>(rpc::ErrorCode::InvalidRequest);
+constexpr int16_t kTransientLogFull       = static_cast<int16_t>(rpc::ErrorCode::TransientLogFull);
 
 } // namespace
 
@@ -989,7 +990,10 @@ int TransactionalProducerImpl::doWork(int64_t nowNs, int64_t sessionId, const Se
                     --pit->second.awaitingRoute;
                 }
             }
-            if (b.sentSessionId == 0 && !b.parked && !b.awaitRoute) due.push_back(corr);
+            if (b.sentSessionId == 0 && !b.parked && !b.awaitRoute) {
+                if (b.backoffCycles > 0) { --b.backoffCycles; continue; }   // E2: TransientLogFull backoff
+                due.push_back(corr);
+            }
         }
         std::sort(due.begin(), due.end(), [&](int64_t x, int64_t y) {
             const InFlightBatch& a = batches_.at(x);
@@ -1389,6 +1393,19 @@ void TransactionalProducerImpl::onProduceResponse(const uint8_t* buf, std::size_
             if (ps != nullptr) ++ps->awaitingRoute;
         }
         ib.awaitGen      = discoveryGen_;
+        ib.sentSessionId = 0;
+        return;
+    }
+    if (ec == kTransientLogFull) {
+        // Phase 2b E2 (ruling 2): the partition's transient ring is full of
+        // not-yet-replicated records — definitely NOT appended, and the leader is
+        // right (no re-discovery, no metadata).  Re-offered after a duty-cycle
+        // backoff with the same identity; the retry budget is not spent (a slow
+        // follower can keep the ring full longer than kMaxRetries cycles); the
+        // batch deadline (sweep_) still bounds it.
+        const uint32_t shift = std::min<uint32_t>(ib.logFullStreak, 30u);
+        ib.backoffCycles = std::min<uint32_t>(1u << shift, kRetryBackoffCapCycles);
+        ++ib.logFullStreak;
         ib.sentSessionId = 0;
         return;
     }

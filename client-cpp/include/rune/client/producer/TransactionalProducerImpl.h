@@ -332,6 +332,12 @@ private:
         bool                 awaitRoute = false;
         uint64_t             awaitGen   = 0;
         uint64_t             sendTick = 0;      // TransactionalProducerImpl::sendTick_ at the latest offer
+        // Phase 2b E2 (ruling 2): answered TransientLogFull — not re-offered for
+        // this many more duty cycles (exponential, capped at
+        // kRetryBackoffCapCycles); logFullStreak = consecutive 42 answers.  Never
+        // spends retryCount; bounded by deadlineNs (sweep_).
+        uint32_t             backoffCycles = 0;
+        uint32_t             logFullStreak = 0;
         std::vector<int64_t> priorCorrIds;      // the superseded attempts' ids
     };
 

@@ -2616,3 +2616,39 @@ TEST(TransactionalProducerRegression, AddPartitionsInvalidRequestPoisonsNotRetri
     ASSERT_TRUE(commit.ready()) << "a commit over a poisoned transaction stayed pending";
     EXPECT_NE(commit.status(), OpStatus::Ok);
 }
+
+// Phase 2b E2 (ruling 2): a transactional batch answered TransientLogFull (42)
+// is re-offered (same identity, a new attempt) after a duty-cycle backoff, never
+// spends the retry budget (a full ring can last longer than kMaxRetries cycles)
+// and never aborts the transaction.  RED (pre-fix): the generic path re-sent it
+// on the next cycle and poisoned the transaction after kMaxRetries answers.
+TEST(TransactionalProducerTest, TransientLogFullBacksOffWithoutSpendingRetriesRegression) {
+    TxnRig r;
+    r.acquire(77, 0);
+    r.tp.beginTransaction();
+    r.tp.send(kTopic, Key(uint64_t{0}), std::span<const uint8_t>(kVal));
+    r.doWork();
+    r.addPartitionsOk();
+    r.sink.clear();
+    r.doWork();
+    auto cur = r.sink.last(rpc::TemplateId::Produce);
+    ASSERT_FALSE(cur.empty());
+    const int32_t seq0 = decodeBaseSeqFromProduce(cur);
+    for (int round = 0; round < 3 * 5 /* > kMaxRetries */; ++round) {
+        SCOPED_TRACE(round);
+        auto err = makeProduceResponse(corrIdOf(cur), ecOf(rpc::ErrorCode::TransientLogFull));
+        r.impl->onProduceResponse(err.data(), err.size());
+        r.sink.clear();
+        r.doWork();
+        ASSERT_EQ(r.sink.count(rpc::TemplateId::Produce), 0) << "re-sent on the very next cycle (no backoff)";
+        int waited = 0;
+        while (r.sink.count(rpc::TemplateId::Produce) == 0) { r.doWork(); ASSERT_LE(++waited, 2048); }
+        cur = r.sink.last(rpc::TemplateId::Produce);
+        EXPECT_EQ(decodeBaseSeqFromProduce(cur), seq0) << "same identity";
+        ASSERT_EQ(r.tp.state(), TxnState::InTransaction) << "42 poisoned the transaction";
+    }
+    auto ok = makeProduceResponse(corrIdOf(cur), 0, 7);
+    r.impl->onProduceResponse(ok.data(), ok.size());
+    EXPECT_EQ(r.tp.state(), TxnState::InTransaction);
+    EXPECT_EQ(r.impl->testInFlightBatches(), 0u);
+}
