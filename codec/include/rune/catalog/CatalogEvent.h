@@ -18,6 +18,7 @@
 #include <rune/codec/PrimType.h>
 #include <rune/protocol/CatalogTypes.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -146,12 +147,27 @@ enum class DecodeError : uint8_t {
     Truncated, UnknownFormatVer, ReservedKind, UnknownKind, KindOpsMismatch, BadEnum, TrailingBytes,
 };
 
+/// Wire widths (formatVer 1): a str16 holds at most kMaxStr16Bytes, a str32/bytes32 (and the
+/// whole ops blob) at most kMaxStr32Bytes, a list at most kMaxListCount elements.
+inline constexpr std::size_t kMaxStr16Bytes = 0xFFFF;
+inline constexpr std::size_t kMaxStr32Bytes = 0xFFFF'FFFF;
+inline constexpr std::size_t kMaxListCount  = 0xFFFF;
+
+/// Why an event cannot be encoded.  Encoding never truncates a length or a count: any field
+/// over its wire width is refused, so no undecodable event is ever produced.
+enum class EncodeError : uint8_t {
+    FieldTooLong,      // a string / blob (or the ops blob) exceeds its length prefix's width
+    TooManyElements,   // a list exceeds its u16 count
+};
+
 [[nodiscard]] EventKind kindOf(const Ops& ops) noexcept;
-void encodeInto(const CatalogEvent& e, std::vector<uint8_t>& out);
-[[nodiscard]] std::vector<uint8_t> encode(const CatalogEvent& e);
+/// Clears `out` and encodes into it, reusing its capacity.  On error `out` is left empty.
+[[nodiscard]] std::expected<void, EncodeError> encodeInto(const CatalogEvent& e, std::vector<uint8_t>& out);
+[[nodiscard]] std::expected<std::vector<uint8_t>, EncodeError> encode(const CatalogEvent& e);
 [[nodiscard]] std::expected<CatalogEvent, DecodeError> decode(std::span<const uint8_t> bytes) noexcept;
 [[nodiscard]] std::string_view kindName(EventKind k) noexcept;
 [[nodiscard]] std::string_view decodeErrorName(DecodeError e) noexcept;
+[[nodiscard]] std::string_view encodeErrorName(EncodeError e) noexcept;
 
 namespace detail_testing {
 /// Encoded size of a CreateTopicOps body (no tag byte).  Test-only.

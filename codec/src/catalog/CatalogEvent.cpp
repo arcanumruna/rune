@@ -11,6 +11,9 @@ namespace {
 using wire::Reader;
 using wire::Writer;
 
+static_assert(kMaxStr16Bytes == 0xFFFF && kMaxStr32Bytes == 0xFFFF'FFFF && kMaxListCount == 0xFFFF,
+              "formatVer-1 wire widths are frozen: u16 / u32 length prefixes, u16 list counts");
+
 // ── body writers (frozen, formatVer 1) ─────────────────────────────────────
 void putConfig(Writer& w, const TopicConfig& c) {
     w.u8(c.cleanupPolicy); w.i64(c.retentionMs); w.i64(c.retentionBytes); w.i64(c.deleteRetentionMs);
@@ -24,7 +27,7 @@ void putSchema(Writer& w, const SchemaDef& s) {
 void putView(Writer& w, const ViewDef& v) {
     w.i32(v.viewTopicId); w.i32(v.sinkPartitions); w.u8(static_cast<uint8_t>(v.persistence));
     w.str16(v.keyField);
-    w.u16(static_cast<uint16_t>(v.sourceNames.size()));
+    w.count16(v.sourceNames.size());
     for (const auto& n : v.sourceNames) w.str16(n);
     w.bytes32(v.normalizedPlanBlob); w.bytes32(v.compiledPlanBlob); w.bytes32(v.outputDescriptorBlob);
 }
@@ -40,12 +43,12 @@ void putOps(Writer& w, const Ops& ops) {
         } else if constexpr (std::is_same_v<T, DropTopicOps>) {
             w.i32(o.topicId);
         } else if constexpr (std::is_same_v<T, AlterTopicConfigOps>) {
-            w.u16(static_cast<uint16_t>(o.changes.size()));
+            w.count16(o.changes.size());
             for (const auto& c : o.changes) { w.u8(static_cast<uint8_t>(c.key)); w.i64(c.value); }
         } else if constexpr (std::is_same_v<T, CreateSchemaOps>) {
             putSchema(w, o.schema);
         } else if constexpr (std::is_same_v<T, AlterSchemaOps>) {
-            w.u16(static_cast<uint16_t>(o.ops.size()));
+            w.count16(o.ops.size());
             for (const auto& a : o.ops) {   // u8 type, u16 tag, str16 name, u8 primType, u16 fixedLen, u8 mode
                 w.u8(static_cast<uint8_t>(a.type)); w.u16(a.tag); w.str16(a.name);
                 w.u8(static_cast<uint8_t>(a.primType)); w.u16(a.fixedLen); w.u8(static_cast<uint8_t>(a.mode));
@@ -61,6 +64,11 @@ void putOps(Writer& w, const Ops& ops) {
 }
 
 // ── body readers ────────────────────────────────────────────────────────────
+// The smallest encoding of one list element: a list's count is checked against the
+// remaining bytes with these BEFORE the list is sized (a corrupt count never allocates).
+constexpr std::size_t kMinSourceNameBytes      = 2;                  // str16 ""
+constexpr std::size_t kConfigChangeBytes       = 1 + 8;              // u8 key, i64 value
+constexpr std::size_t kMinResolvedAlterOpBytes = 1 + 2 + 2 + 1 + 2 + 1;   // type, tag, str16 "", prim, fixedLen, mode
 // Each returns Truncated / BadEnum explicitly; an enum byte is never cast unchecked.
 std::optional<DecodeError> getPersistence(Reader& r, Persistence& p) {
     uint8_t b; if (!r.u8(b)) return DecodeError::Truncated;
@@ -90,6 +98,7 @@ std::optional<DecodeError> getView(Reader& r, ViewDef& v) {
     if (auto e = getPersistence(r, v.persistence)) return e;
     uint16_t n;
     if (!r.str16(v.keyField) || !r.u16(n)) return DecodeError::Truncated;
+    if (!r.canHold(n, kMinSourceNameBytes)) return DecodeError::Truncated;
     v.sourceNames.resize(n);
     for (auto& s : v.sourceNames) if (!r.str16(s)) return DecodeError::Truncated;
     if (!r.bytes32(v.normalizedPlanBlob) || !r.bytes32(v.compiledPlanBlob) || !r.bytes32(v.outputDescriptorBlob))
@@ -114,6 +123,7 @@ std::expected<Ops, DecodeError> getOps(Reader& r, EventKind kind) {
     case EventKind::DropTopic: { DropTopicOps o; if (!r.i32(o.topicId)) return std::unexpected(DecodeError::Truncated); return o; }
     case EventKind::AlterTopicConfig: {
         AlterTopicConfigOps o; uint16_t n; if (!r.u16(n)) return std::unexpected(DecodeError::Truncated);
+        if (!r.canHold(n, kConfigChangeBytes)) return std::unexpected(DecodeError::Truncated);
         o.changes.resize(n);
         for (auto& c : o.changes) {
             uint8_t k; if (!r.u8(k) || !r.i64(c.value)) return std::unexpected(DecodeError::Truncated);
@@ -125,6 +135,7 @@ std::expected<Ops, DecodeError> getOps(Reader& r, EventKind kind) {
     case EventKind::CreateSchema: { CreateSchemaOps o; if (auto e = getSchema(r, o.schema)) return std::unexpected(*e); return o; }
     case EventKind::AlterSchema: {
         AlterSchemaOps o; uint16_t n; if (!r.u16(n)) return std::unexpected(DecodeError::Truncated);
+        if (!r.canHold(n, kMinResolvedAlterOpBytes)) return std::unexpected(DecodeError::Truncated);
         o.ops.resize(n);
         for (auto& a : o.ops) {
             uint8_t t, pt, m;
@@ -155,7 +166,7 @@ EventKind kindOf(const Ops& ops) noexcept {
     return static_cast<EventKind>(ops.index() + 1);   // variant order == kind order (1..9)
 }
 
-void encodeInto(const CatalogEvent& e, std::vector<uint8_t>& out) {
+std::expected<void, EncodeError> encodeInto(const CatalogEvent& e, std::vector<uint8_t>& out) {
     out.clear();
     Writer w(out);
     w.u16(e.formatVer); w.u16(static_cast<uint16_t>(e.kind)); w.u64(e.objectId);
@@ -169,10 +180,19 @@ void encodeInto(const CatalogEvent& e, std::vector<uint8_t>& out) {
     const std::size_t lenAt = w.size();
     w.u32(0);
     putOps(w, e.ops);
-    w.patchU32(lenAt, static_cast<uint32_t>(w.size() - lenAt - 4));
+    w.patchLen32(lenAt);
+    if (const auto err = w.error()) {   // never leave a truncated, undecodable prefix behind
+        out.clear();
+        return std::unexpected(*err);
+    }
+    return {};
 }
 
-std::vector<uint8_t> encode(const CatalogEvent& e) { std::vector<uint8_t> b; encodeInto(e, b); return b; }
+std::expected<std::vector<uint8_t>, EncodeError> encode(const CatalogEvent& e) {
+    std::vector<uint8_t> b;
+    if (auto r = encodeInto(e, b); !r) return std::unexpected(r.error());
+    return b;
+}
 
 std::expected<CatalogEvent, DecodeError> decode(std::span<const uint8_t> bytes) noexcept {
     try {
@@ -226,6 +246,13 @@ std::string_view decodeErrorName(DecodeError e) noexcept {
     case DecodeError::ReservedKind: return "ReservedKind"; case DecodeError::UnknownKind: return "UnknownKind";
     case DecodeError::KindOpsMismatch: return "KindOpsMismatch"; case DecodeError::BadEnum: return "BadEnum";
     case DecodeError::TrailingBytes: return "TrailingBytes";
+    }
+    return "?";
+}
+
+std::string_view encodeErrorName(EncodeError e) noexcept {
+    switch (e) {
+    case EncodeError::FieldTooLong: return "FieldTooLong"; case EncodeError::TooManyElements: return "TooManyElements";
     }
     return "?";
 }
