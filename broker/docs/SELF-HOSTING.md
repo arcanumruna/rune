@@ -208,6 +208,12 @@ before a produce is acknowledged but is **never written to disk**.
     and the application must re-subscribe.
     A new subscription that a node redirects to the partition's leader is also made on that leader's
     own session; the client's other subscriptions stay where they are.
+  - **A plain subscription never carries its position into new data.** For a transient partition the
+    broker tells the client which data lineage its subscription reads. When the client resumes a
+    subscription after losing that node's session, it names that lineage. If the partition's node
+    restarted empty meanwhile, the broker answers `PartitionDataReset`. The client restarts the
+    subscription at the log start and counts the reset (`Subscription::dataResets()`), so the
+    application knows records it had not yet read are gone. Records are never skipped silently.
 - A transient topic defined at runtime serves only once its definition has committed, exactly like a
   disk topic: until then produce and subscribe answer `NotLeader` (retriable) and metadata does not list it.
 - **Retention is the in-memory ring:** `RUNE_TRANSIENT_LOG_RING_BYTES` per partition (node-wide, default

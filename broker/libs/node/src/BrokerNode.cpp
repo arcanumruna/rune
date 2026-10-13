@@ -1983,6 +1983,7 @@ void BrokerNode::buildGateway() {
         // append so the leader replica's tracked LEO/HW is reconciled and followers
         // can fetch the new bytes (Mode A seam — no double-append).
         gateway_->setReplicaRegistry(replicaRegistry_.get());
+        gateway_->setTransientLineage(&BrokerNode::transientLineageTrampoline_, this);   // round 6 (F1)
 
         // M1: Apply the cluster-majority minIsr gate for acks=All produces.
         // gatewayMinIsr is computed from the peer count (or RUNE_MIN_ISR env override)

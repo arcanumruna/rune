@@ -492,6 +492,16 @@ public:
     // pool's worker intake limit, so a gateway-routed batch the worker op /
     // return ring cannot carry is answered MessageTooLarge, never thrown.
     void setWorkerPool(rune::node::WorkerPool* pool) noexcept;
+
+    /// E2 residual round 6 (F1, plain subscriptions): a TRANSIENT partition's
+    /// current data lineage (0 = not transient, UINT64_MAX = not known yet,
+    /// else the token) — the same provider the group coordinator uses (this
+    /// thread).  Drives the lineage note (bind) and the claim check (resume),
+    /// see rune-protocol kClientVersionLineageNote.
+    using TransientLineageFn = uint64_t (*)(void* ctx, int32_t topicId, int32_t partition) noexcept;
+    void setTransientLineage(TransientLineageFn fn, void* ctx) noexcept { lineageFn_ = fn; lineageCtx_ = ctx; }
+    [[nodiscard]] uint64_t partitionDataResetsForTest() const noexcept { return partitionDataResets_; }
+    [[nodiscard]] uint64_t lineageNotesSentForTest() const noexcept { return lineageNotesSent_; }
     /// F15 S3 (re-review 2 B-1) ⇄ F18: THE client-visible batch limit — the ONE
     /// gateway setter.  BrokerNode sets NodeConfig::produceIntakeLimit()
     /// (= rune::node::Worker::maxAcceptableBatchBytes(config): rings, replication
@@ -1866,6 +1876,20 @@ private:
     // pushSubscriptions() route log work through the owning worker's ring;
     // drainWorkerReturns_() sends deferred responses at the top of doWork().
     rune::node::WorkerPool* workerPool_ = nullptr;
+
+    // E2 residual round 6 (F1): see setTransientLineage().  Cold state (bind /
+    // resume rate); pendingLineageNotes_ is non-empty only while a bound
+    // transient subscription's lineage is still unknown.
+    static constexpr uint64_t kLineageUnknown = UINT64_MAX;
+    TransientLineageFn lineageFn_  = nullptr;
+    void*              lineageCtx_ = nullptr;
+    uint64_t           partitionDataResets_ = 0;
+    uint64_t           lineageNotesSent_    = 0;
+    std::vector<int64_t> pendingLineageNotes_;   ///< subscriptionIds awaiting their lineage
+    /// Send (or queue until known) subscription `subId`'s lineage note.
+    void noteLineage_(int64_t subId);
+    void sendLineageNote_(Session& session, int64_t subId, const Subscription& sub, uint64_t lineage);
+    int  flushPendingLineageNotes_();
 
     // E5.1.3 (e): per-worker ingress active flag.
     //

@@ -245,6 +245,21 @@ public:
         const std::size_t len = s.encode(buf.data());
         return send(gatewayChannel, stream, buf.data(), len) ? s.correlationId : 0;
     }
+    /// E2 round 6: a RESUMED Subscribe claiming data lineage `claim` (8 LE bytes
+    /// in key, partitionKnown = 1); returns its correlationId (0 = not sent).
+    int64_t subscribeClaiming(const std::string& gatewayChannel, int32_t stream, int64_t sessionId, int32_t topicId,
+                              int32_t partition, int64_t fromOffset, uint64_t claim) {
+        uint8_t key[8];
+        for (int i = 0; i < 8; ++i) key[i] = static_cast<uint8_t>(claim >> (8 * i));
+        pc::Subscribe s;
+        s.sessionId = sessionId; s.correlationId = ++corr_;
+        s.topicId = topicId; s.partition = partition; s.partitionKnown = 1;
+        s.fromOffset = fromOffset; s.isolation = 0;
+        s.key = std::span<const uint8_t>(key, 8);
+        std::vector<uint8_t> buf(s.encodedSize());
+        const std::size_t len = s.encode(buf.data());
+        return send(gatewayChannel, stream, buf.data(), len) ? s.correlationId : 0;
+    }
     struct PushedRecords { int64_t subscriptionId; int64_t baseOffset; std::vector<uint8_t> bytes; };
     struct ErrorSeen     { int64_t correlationId; int16_t code; std::string message; };
     /// Poll the egress until `pred()` holds (bounded: kMaxIters × 100 µs).

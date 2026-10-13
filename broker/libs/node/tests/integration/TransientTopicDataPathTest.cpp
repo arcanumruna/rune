@@ -1297,3 +1297,88 @@ TEST(TransientLineageClusterRegression, Rf1GroupWithoutACommitIsRebalancedOnANew
     for (int64_t o = 0; o < 6; ++o) EXPECT_EQ(seen[o], 1) << "post-restart record " << o;
     std::printf("[F1] stale commit answered %d\n", *stale);
 }
+
+// E2 final fix wave, residual round 6 — F1 (plain subscriptions, broker half):
+// an RF=1 transient partition P; a v7 plain subscriber bound on P's node L is
+// sent the partition's data lineage (the lineage note: an 8-byte batch) and
+// consumes 0..19.  L crashes and restarts EMPTY (a new lineage).  The client's
+// resume from its position, claiming the noted lineage, must be answered
+// PartitionDataReset — never served from a clamped position (its floor would
+// drop the refilled records); a fresh subscription from the log start then
+// gets every post-restart record exactly once.  RED (no claim check): the
+// resume was served (SubscribeResponse OK).
+TEST(TransientLineageClusterRegression, Rf1PlainSubscriptionResumeAcrossANewLineageIsAnsweredDataResetRegression) {
+    GroupCluster g;
+    g.crashStops = true;
+    g.rf         = 1;
+    g.partitions = 3;
+    for (int i = 0; i < 3; ++i) g.start(i);
+    ASSERT_TRUE(g.nodes[0]->awaitLeader(15'000ms));
+    ShardTestClient c(g.cdir.path);
+    c.setClientVersion(rune::protocol::client::kClientVersion);
+    ASSERT_GE(rune::protocol::client::kClientVersion, rune::protocol::client::kClientVersionLineageNote);
+    const int coord = g.coordinator();
+    ASSERT_GE(coord, 0);
+    int P = -1, L = -1;
+    {
+        const int64_t s = c.connect(gatewayChannel(g.ports, coord), kClientStream);
+        for (int k = 0; k < 400 && P < 0; ++k) {
+            for (const auto& pi : c.metadata(gatewayChannel(g.ports, coord), kClientStream, s))
+                if (pi.topicId == 0 && pi.leaderId >= 0 && pi.leaderId != coord) { P = pi.partition; L = pi.leaderId; break; }
+            if (P < 0) std::this_thread::sleep_for(50ms);   // metadata settling (poll interval)
+        }
+    }
+    ASSERT_GE(P, 0);
+    const std::string gwL = gatewayChannel(g.ports, L);
+    const int64_t sidL = c.connect(gwL, kClientStream);
+    for (int b = 0; b < 5; ++b)
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sidL, 0, P, 1, makeBatch(4)));
+    ASSERT_TRUE(c.subscribe(gwL, kClientStream, sidL, 0, P, 0));
+    uint64_t token = 0;
+    ASSERT_TRUE(c.pollUntil([&] {
+        for (const auto& r : c.records())
+            if (r.bytes.size() == 8) {
+                token = 0;
+                for (int i = 0; i < 8; ++i) token |= static_cast<uint64_t>(r.bytes[static_cast<std::size_t>(i)]) << (8 * i);
+            }
+        return token != 0 && pushedAt(c, 16) >= 1;
+    })) << "no lineage note for the transient subscription (or the records never came)";
+
+    // L crashes and restarts empty.
+    g.stop(L);
+    g.start(L);
+    const std::string gwL2 = gatewayChannel(g.ports, L);
+    std::optional<int16_t> answer;
+    for (int k = 0; k < 600; ++k) {
+        const int64_t sid = c.connect(gwL2, kClientStream);
+        if (sid <= 0) { std::this_thread::sleep_for(50ms); continue; }
+        const int64_t corr = c.subscribeClaiming(gwL2, kClientStream, sid, 0, P, /*position=*/20, token);
+        answer = c.awaitSubscribeCode(corr, std::chrono::steady_clock::now() + 2s);
+        if (answer && *answer != static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader) &&
+            *answer != static_cast<int16_t>(rune::protocol::client::ErrorCode::Redirect))
+            break;   // NotLeader: the lineage is not known yet (retriable)
+        std::this_thread::sleep_for(50ms);   // the client's retry pacing (poll interval)
+    }
+    ASSERT_TRUE(answer.has_value());
+    EXPECT_EQ(*answer, static_cast<int16_t>(rune::protocol::client::ErrorCode::PartitionDataReset))
+        << "SILENT LOSS: a resume claiming the superseded lineage was answered " << *answer
+        << " (served from a clamped position: the client's floor drops the refilled records)";
+
+    // From the log start: every post-restart record exactly once.
+    const int64_t sid2 = c.connect(gwL2, kClientStream);
+    for (int64_t want = 0; want < 6; ++want) {
+        const auto ack = c.produceUntilOk(workerIngressChannel(g.ports, L), kClientStream, sid2, 0, P, 1, makeBatch(1));
+        ASSERT_TRUE(ack.has_value());
+        ASSERT_EQ(ack->baseOffset, want);
+    }
+    const std::size_t before = c.records().size();
+    ASSERT_TRUE(c.subscribe(gwL2, kClientStream, sid2, 0, P, /*Earliest=*/-2));
+    std::map<int64_t, int> seen;
+    ASSERT_TRUE(c.pollUntil([&] {
+        seen.clear();
+        for (std::size_t i = before; i < c.records().size(); ++i)
+            if (c.records()[i].bytes.size() > 8) ++seen[c.records()[i].baseOffset];
+        return seen.size() >= 6;
+    }));
+    for (int64_t o = 0; o < 6; ++o) EXPECT_EQ(seen[o], 1) << "post-restart record " << o;
+}

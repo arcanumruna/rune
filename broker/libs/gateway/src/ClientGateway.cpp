@@ -670,6 +670,7 @@ int ClientGateway::doWork(int64_t nowNs) {
     // produce ack is sent as soon as the publication clears back-pressure,
     // preserving the "no silent drop on back-pressure" invariant.
     drainPendingResponses(nowNs);
+    if (!pendingLineageNotes_.empty()) [[unlikely]] (void)flushPendingLineageNotes_();   // round 6 (F1)
     // No-hang fix round 3: the no-hang counters, logged while the broker runs
     // (on change, at most every kNoHangStatsLogNs) — one compare per duty cycle.
     if (nowNs >= nextNoHangStatsLogNs_) [[unlikely]] (void)logNoHangStatsIfChanged_(nowNs);
@@ -4396,6 +4397,36 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
         return;
     }
 
+    // 4b. E2 residual round 6 (F1): a RESUMED plain subscription of a v7 client
+    //     claims, in `key`, the data lineage its position belongs to.  A claim
+    //     against a TRANSIENT partition whose ring restarted (a new lineage) is
+    //     answered PartitionDataReset — never served from a clamped position
+    //     (the client's resume floor would drop the refilled records: silent
+    //     loss); a claim while the lineage is unknown: the retriable NotLeader.
+    if (lineageFn_ != nullptr && served.kind == ServedPartition::Kind::Transient && msg.partitionKnown == 1 &&
+        msg.key.size() == 8 && pc::clientUnderstandsLineageNote(session->clientVersion)) [[unlikely]] {
+        uint64_t claim = 0;
+        for (int i = 0; i < 8; ++i) claim |= static_cast<uint64_t>(msg.key[static_cast<std::size_t>(i)]) << (8 * i);
+        const uint64_t now = lineageFn_(lineageCtx_, msg.topicId, partition);
+        if (claim != 0 && now == kLineageUnknown) {
+            sendSubRedirect(std::string{}, msg.correlationId);   // retriable: decided once it is known
+            return;
+        }
+        if (claim != 0 && now != 0 && now != claim) {
+            ++partitionDataResets_;
+            spdlog::info("ClientGateway: resumed Subscribe sessionId={} topicId={} partition={} claims data lineage "
+                         "{:#x}, now {:#x} — PartitionDataReset (the client resumes from the log start)",
+                         msg.sessionId, msg.topicId, partition, claim, now);
+            pc::ErrorResponse er;
+            er.sessionId     = msg.sessionId;
+            er.correlationId = msg.correlationId;
+            er.code          = static_cast<int16_t>(pc::ErrorCode::PartitionDataReset);
+            const std::size_t n = er.encode(scratch_.data());
+            sendAnswer_(*session, scratch_.data(), n);
+            return;
+        }
+    }
+
     // 5. Clamp fromOffset to [0, HW] (GR-6) — or [0, LEO] for non-replicated topics.
     //    fromOffset < 0 → "from Latest"; fromOffset > clamp-limit → clamped.
     //    Convention: negative fromOffset is the "Latest" sentinel documented in the brief.
@@ -4574,9 +4605,67 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
 
     // Reply SubscribeResponse{OK, partition, subscriptionId}.
     sendResp(pc::ErrorCode::OK, partition, subId);
+    if (served.kind == ServedPartition::Kind::Transient) noteLineage_(subId);   // round 6 (F1)
 
     spdlog::debug("ClientGateway: Subscribe sessionId={} subId={} topic={} partition={} nextOffset={} isolation={}",
                   msg.sessionId, subId, msg.topicId, partition, nextOffset, msg.isolation);
+}
+
+// ---------------------------------------------------------------------------
+// E2 residual round 6 (F1): the transient LINEAGE NOTE — a Records frame of the
+// subscription whose recordBatch is exactly the 8-byte LE lineage token (see
+// rune-protocol kClientVersionLineageNote), on the session's reliable egress
+// after its SubscribeResponse.  Plain subscriptions of v7 sessions only; a
+// lineage still unknown at bind is noted once it resolves (doWork, cold).
+// ---------------------------------------------------------------------------
+void ClientGateway::sendLineageNote_(Session& session, int64_t subId, const Subscription& sub, uint64_t lineage) {
+    uint8_t token[8];
+    for (int i = 0; i < 8; ++i) token[i] = static_cast<uint8_t>(lineage >> (8 * i));
+    pc::Records note;
+    note.sessionId      = sub.sessionId;
+    note.correlationId  = sub.subscribeCorrId;
+    note.subscriptionId = subId;
+    note.topicId        = sub.topicId;
+    note.partition      = sub.partition;
+    note.baseOffset     = -1;
+    note.recordBatch    = std::span<const uint8_t>(token, 8);
+    const std::size_t n = note.encode(scratch_.data());
+    sendAnswer_(session, scratch_.data(), n);
+    ++lineageNotesSent_;
+}
+
+void ClientGateway::noteLineage_(int64_t subId) {
+    if (lineageFn_ == nullptr) return;
+    const auto it = subscriptions_.find(subId);
+    if (it == subscriptions_.end() || it->second.isGroup) return;
+    constexpr int64_t kGroupFetchCorrTag = int64_t{1} << 61;   // group-member fetches resume via their group
+    if ((it->second.subscribeCorrId & kGroupFetchCorrTag) != 0) return;
+    Session* session = sessions_.find(it->second.sessionId);
+    if (session == nullptr || !pc::clientUnderstandsLineageNote(session->clientVersion)) return;
+    const uint64_t now = lineageFn_(lineageCtx_, it->second.topicId, it->second.partition);
+    if (now == 0) return;
+    if (now == kLineageUnknown) {
+        try { pendingLineageNotes_.push_back(subId); } catch (...) {}   // cold; a lost note = no claim (old behaviour)
+        return;
+    }
+    sendLineageNote_(*session, subId, it->second, now);
+}
+
+int ClientGateway::flushPendingLineageNotes_() {
+    int work = 0;
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < pendingLineageNotes_.size(); ++i) {
+        const int64_t subId = pendingLineageNotes_[i];
+        const auto it = subscriptions_.find(subId);
+        Session* session = it != subscriptions_.end() ? sessions_.find(it->second.sessionId) : nullptr;
+        if (session == nullptr) { ++work; continue; }   // gone
+        const uint64_t now = lineageFn_(lineageCtx_, it->second.topicId, it->second.partition);
+        if (now == kLineageUnknown) { pendingLineageNotes_[kept++] = subId; continue; }
+        if (now != 0) sendLineageNote_(*session, subId, it->second, now);
+        ++work;
+    }
+    pendingLineageNotes_.resize(kept);
+    return work;
 }
 
 // ---------------------------------------------------------------------------
