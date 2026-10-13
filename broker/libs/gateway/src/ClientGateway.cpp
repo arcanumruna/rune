@@ -3040,6 +3040,11 @@ bool ClientGateway::movedAway_(const Subscription& sub) const noexcept
 
 bool ClientGateway::retireReadCommittedMovedAway_(int64_t subId, Subscription& sub)
 {
+    // Precondition (both callers gate on movedAwayEligible_): never a
+    // coordinator-created group subscription — those are revoked by the group
+    // coordinator, not retired here (E2 final fix wave: was a dead `!isGroup`
+    // term in the Redirect condition below).
+    assert(!sub.isGroup && "retireReadCommittedMovedAway_: a coordinator-created group subscription");
     Session* session = sessions_.find(sub.sessionId);
     if (session == nullptr) return false;   // dies with its session (dropSessionSubscriptions_)
     // Fix round 2 (M3): first the POSITION NOTE (Protocol.h, client version 6)
@@ -3073,11 +3078,12 @@ bool ClientGateway::retireReadCommittedMovedAway_(int64_t subId, Subscription& s
     // metadata over it — stranded when this node is stopping (controlled
     // shutdown).  When the routing image already names ANOTHER leader with a
     // known client endpoint, a v6 session is answered Redirect{endpoint}: the
-    // client follows it (retarget + reconnect + re-subscribe from its
-    // position).  Group-member partition subscriptions (bit-61 correlation ids)
+    // client follows it per partition (that leader's own session; the seed is
+    // never retargeted — E2 final fix wave I2) and re-subscribes from its
+    // position.  Group-member partition subscriptions (bit-61 correlation ids)
     // ride per-leader sessions and keep the NotLeader their re-route handles.
     constexpr int64_t kGroupFetchCorrTag = int64_t{1} << 61;   // rune-client GroupConsumerHub
-    if (pc::clientUnderstandsMovedPositionNote(session->clientVersion) && !sub.isGroup &&
+    if (pc::clientUnderstandsMovedPositionNote(session->clientVersion) &&
         (sub.subscribeCorrId & kGroupFetchCorrTag) == 0 && routingImage_) {
         const auto& entry = routingImage_->lookup(rune::metadata::gpidOf(sub.topicId, sub.partition));
         if (entry.leaderNodeId != rune::metadata::RoutingImage::NO_LEADER_NODE_ID &&
