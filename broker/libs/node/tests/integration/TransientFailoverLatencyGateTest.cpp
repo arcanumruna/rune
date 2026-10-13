@@ -41,6 +41,7 @@
 #include <rune/protocol/RecordBatch.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/InMemoryLog.h>
+#include <rune/storage/Log.h>
 #include <rune/transaction/ControlMarker.h>
 
 #include <gtest/gtest.h>
@@ -50,6 +51,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -297,4 +299,57 @@ TEST(TransientFailoverLatencyGateRegression, WorkerWideRingBudgetIsSharedFairlyR
         << " B per WORKER pass, not per partition)";
     std::printf("[ring budget fairness] K=%d rings of %zu KiB: Ready after %d passes, max %llu B per pass\n", K,
                 kRing >> 10, pass + 1, static_cast<unsigned long long>(maxPassBytes));
+}
+
+// ---------------------------------------------------------------------------
+// E2 final fix wave, residual round 3 — N5: the worker-wide ring budget costs
+// NOTHING on a worker that owns no memory-backed partition: rcAdvanceAll_
+// never enters the ring walk there (the count of memory-backed slots is kept on
+// ownership apply).  A worker that owns one does walk.  RED (no skip): the
+// disk-only worker walked the slots for ring work on every pass.
+// ---------------------------------------------------------------------------
+TEST(TransientFailoverLatencyGateRegression, DiskOnlyWorkerSkipsTheRingBudgetWalkRegression) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("rune-n5-" + std::to_string(::getpid()));
+    fs::remove_all(dir);
+    std::vector<std::unique_ptr<rune::storage::Log>> logs;
+    std::unique_ptr<rune::storage::InMemoryLog> mem;
+    rune::replication::NullPartitionTransport transport;
+    auto run = [&](bool withMemory) -> uint64_t {
+        rune::node::ReplicaRegistry reg;
+        WorkerPool pool{1, rune::metadata::ShardRouter(1)};
+        constexpr int kDisk = 4;
+        for (int p = 0; p < kDisk + (withMemory ? 1 : 0); ++p) {
+            PartitionConfig c;
+            c.topicId = kTopic; c.partitionId = p; c.selfId = 1; c.minIsr = 1;
+            c.replicaLagMaxOffset = 1'000'000'000; c.replicaLagMaxMs = 600'000; c.followerFlushIntervalNs = 0;
+            std::unique_ptr<PartitionReplica> r;
+            if (p < kDisk) {
+                const fs::path pd = dir / (std::string(withMemory ? "m" : "d") + std::to_string(p));
+                fs::create_directories(pd);
+                logs.push_back(std::make_unique<rune::storage::Log>(pd.string()));
+                logs.back()->recover();
+                r = std::make_unique<PartitionReplica>(c, Role::Leader, 1, std::vector<int32_t>{1},
+                                                       std::vector<int32_t>{1}, logs.back().get(), &transport);
+            } else {
+                mem = std::make_unique<rune::storage::InMemoryLog>(1u << 20, kMaxBatch);
+                r = std::make_unique<PartitionReplica>(c, Role::Leader, 1, std::vector<int32_t>{1},
+                                                       std::vector<int32_t>{1}, mem.get(), &transport);
+            }
+            reg.add(kTopic, p, std::move(r));
+        }
+        pool.setRegistry(&reg);
+        Worker& w = pool.worker(0);
+        w.setWorkerIngress(nullptr, /*active=*/true);
+        w.setShardMode(true);
+        pool.assignFromRegistry(reg);
+        int64_t now = 1'000'000'000;
+        for (int i = 0; i < 64; ++i) { now += 1'000'000; (void)w.doWork(now); pool.drainAllReturns([](WorkerReturn) {}); }
+        EXPECT_EQ(w.rcStatusForTest(kTopic, 0), 2) << "precondition: the disk partitions' RC states are driven";
+        return w.ringWalksForTest();
+    };
+    EXPECT_EQ(run(false), 0u) << "a worker with no memory-backed partition walked its slots for ring work";
+    EXPECT_GT(run(true), 0u) << "a worker owning a memory-backed partition never walked for ring work";
+    logs.clear();
+    fs::remove_all(dir);
 }

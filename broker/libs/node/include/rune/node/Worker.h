@@ -515,6 +515,9 @@ public:
         for (auto& sl : rcSlots_) installReadAhead_(sl);
     }
     [[nodiscard]] uint64_t rcHintsSyncForTest() const noexcept { return rcHintsSync_; }
+    /// E2 residual N5: passes whose rcAdvanceAll_ walked the slots for ring
+    /// (memory-backed) rebuild work — stays 0 on a worker with no memory-backed partition.
+    [[nodiscard]] uint64_t ringWalksForTest() const noexcept { return ringWalks_; }
     [[nodiscard]] uint64_t rcHintsSkippedForTest() const noexcept { return rcHintsSkipped_; }
     [[nodiscard]] uint64_t rcHintErrorsForTest() const noexcept { return rcHintErrors_; }
     /// Fix round 3 test seams.  Fake async hints: the issuer behaves as on
@@ -5149,6 +5152,8 @@ private:
     std::size_t           rcWalkStart_ = 0;   // r3-1: rcAdvanceAll_'s round-robin start slot
     std::size_t           ringCursor_  = 0;   // E2 residual: the next slot the shared ring budget starts at
     std::size_t           ringBudgetLeft_ = RcState::kDefaultScanBytesPerPass;   // E2 residual: ring-rebuild bytes left this pass
+    std::size_t           ringSlots_   = 0;   // E2 residual N5: memory-backed rcSlots_ (set on ownership apply)
+    uint64_t              ringWalks_   = 0;   // N5: passes that walked the slots for ring work (test seam)
     // Review I-2: read_committed PushReads held while their partition's RC
     // state builds — answered on Ready (or unanswered on ownership loss).
     // Each owes one return: counted in reservedAckSlots_(), capped, reserved.
@@ -5257,6 +5262,8 @@ private:
             next.push_back(std::move(slot));
         }
         rcSlots_ = std::move(next);
+        ringSlots_ = 0;   // E2 residual N5: memory-backed slots (0 -> no ring walk at all)
+        for (const auto& sl : rcSlots_) ringSlots_ += sl.replica->isDiskBacked() ? 0u : 1u;
         rcById_.assign(ownedInc_.size(), nullptr);
         for (auto& sl : rcSlots_)
             if (sl.inc != 0 && sl.replica->registryId() < rcById_.size()) rcById_[sl.replica->registryId()] = sl.rc.get();
@@ -5433,6 +5440,8 @@ private:
             if (++i == n) i = 0;
         }
         if (++rcWalkStart_ == n) rcWalkStart_ = 0;
+        if (ringSlots_ == 0) return work;   // N5: a disk-only worker pays nothing for the ring budget
+        ++ringWalks_;
         if (ringCursor_ >= n) ringCursor_ = 0;
         for (std::size_t k = 0, i = ringCursor_; k < n && ringBudgetLeft_ > 0; ++k) {
             RcSlot& sl = rcSlots_[i];
