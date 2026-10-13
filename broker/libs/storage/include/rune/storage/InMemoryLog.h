@@ -141,6 +141,11 @@ public:
     /// with nothing appended.  Zero allocation.
     int64_t appendNoSyncRestamp(const uint8_t* batch, std::size_t len,
                                 int32_t lastOffsetDelta, int64_t& outBaseOffset) {
+        // A batch shorter than its base-offset field is never storable (the
+        // patch below would write past the copy).  handleProduceBatch size-checks
+        // first; this guards any direct caller.
+        if (len < static_cast<std::size_t>(rune::protocol::batch::kBaseOffsetOffset + 8)) [[unlikely]]
+            return kRefusedTooLarge;
         const int64_t base = logEndOffset_;
         const int64_t r = appendImpl(batch, len, base + static_cast<int64_t>(lastOffsetDelta));
         if (r < 0) return r;

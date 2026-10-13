@@ -13,8 +13,10 @@
 //   handleProduceBatch — given an ALREADY RESOLVED (log, producerState,
 //   batch bytes) produce request, performs:
 //     1. Batch size / header sanity guards.
-//     2. Base-offset restamp IN PLACE in `batch` (CRC-safe — base-offset field
-//        at [0..7] is before the CRC region that starts at kAttributesOffset=21).
+//     2. Base-offset restamp — never in the caller's `batch` (it is read-only):
+//        the log stamps its own copy (disk: the segment write; transient: the
+//        ring copy).  CRC-safe — base-offset field at [0..7] is before the CRC
+//        region that starts at kAttributesOffset=21.
 //     3. lastOffsetDelta / recordCount parse & consistency check.
 //     4. CRC validation (RecordBatchReader::ensureValid).
 //    4b. Producer identity: frame producerId (always) / epoch + baseSequence

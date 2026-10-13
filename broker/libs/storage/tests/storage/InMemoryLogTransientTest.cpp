@@ -136,3 +136,14 @@ TEST(InMemoryLogTransientRegression, ProducePathOverTheRingAppendsAndRefusesFull
     EXPECT_EQ(tooLarge.error, pc::ErrorCode::MessageTooLarge) << "a batch larger than the ring can never fit";
     EXPECT_TRUE(tooLarge.logFull);
 }
+
+// E2 Task 2 review: a batch shorter than its base-offset field is refused, never
+// patched past the copy; nothing is appended.
+TEST(InMemoryLogTransientRegression, ShortBatchIsRefusedNotPatchedPastTheCopy) {
+    InMemoryLog log(1 << 20, 1024);
+    const uint8_t tiny[4] = {1, 2, 3, 4};
+    int64_t base = -7;
+    EXPECT_EQ(log.appendNoSyncRestamp(tiny, sizeof(tiny), 0, base), InMemoryLog::kRefusedTooLarge);
+    EXPECT_EQ(base, -7) << "no base offset is reported for a refused batch";
+    EXPECT_EQ(log.logEndOffset(), 0);
+}
