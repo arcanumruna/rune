@@ -274,8 +274,7 @@ void PartitionReplica::initReplica(std::vector<NodeId> replicas,
         if (epoch_ >= 0) {
             epochCache_.assign(static_cast<int32_t>(epoch_),
                                logEndOffset_());
-            if (!memoryBacked_ && diskLog_ != nullptr)
-                diskLog_->setLeaderEpochStamp(static_cast<int32_t>(epoch_));
+            stampEpochOnLog_(static_cast<int32_t>(epoch_));
         }
     }
     // (Follower: the epoch cache holds only what the log's batches carry —
@@ -453,10 +452,8 @@ void PartitionReplica::becomeLeader(Epoch newEpoch, std::vector<NodeId> isr, int
     // from now on carries it (Log restamp for the produce path; the replica's
     // own append paths stamp it explicitly).
     epochCache_.assign(static_cast<int32_t>(epoch_), logEndOffset_());
-    if (!memoryBacked_ && diskLog_ != nullptr) {
-        diskLog_->setLeaderEpochStamp(static_cast<int32_t>(epoch_));
-        checkpointEpochs_();
-    }
+    stampEpochOnLog_(static_cast<int32_t>(epoch_));
+    if (!memoryBacked_ && diskLog_ != nullptr) checkpointEpochs_();
 
     lastIsrCheckNs_ = 0;
 
@@ -511,7 +508,7 @@ void PartitionReplica::becomeFollower(Epoch leaderEpoch, NodeId leaderId)
     followerHw_ = 0;
     followerSync_.reset();    // new leadership epoch → bootstrap fetch state afresh
     wedgedAtOffset_ = -1;     // F18: a new leadership may serve it (re-evaluated)
-    if (!memoryBacked_ && diskLog_ != nullptr) diskLog_->setLeaderEpochStamp(-1);
+    stampEpochOnLog_(-1);
     // Drop a phantom epoch entry (assigned at becomeLeader at our LEO, never
     // appended in): our lastFetchedEpoch must name the epoch of our last record.
     {
@@ -565,15 +562,21 @@ Offset PartitionReplica::append(std::span<const uint8_t> records, bool acksAll)
                                                         static_cast<int32_t>(epoch_));
     const auto& batch = batchScratch_;
     // lastOffset = baseOffset + 0 (one record per batch = lastOffsetDelta=0).
-    if (externalFollowerFlush_) {
+    if (memoryBacked_) {
+        // Phase 2b E2: the ring never evicts at/above the HW — a full ring
+        // refuses (retriable back-pressure), nothing appended.
+        refreshTransientEvictionFloor_();
+        if (memLog_->appendNoSync(batch.data(), batch.size(), baseOffset) < 0) [[unlikely]]
+            return kAppendBackPressure;
+    } else if (externalFollowerFlush_) {
         // Worker-driven replica (spec §3.1, every placement — F30): no inline
         // fsync on the worker (txn markers come through here).  Page-cache
         // append + a flush request the owning worker submits to its io backend
         // in the same pass.
-        onLog([&](auto& L){ L.appendNoSync(batch.data(), batch.size(), baseOffset); });
-        if (!memoryBacked_) followerFlushRequested_ = true;
+        diskLog_->appendNoSync(batch.data(), batch.size(), baseOffset);
+        followerFlushRequested_ = true;
     } else {
-        onLog([&](auto& L){ L.append(batch, baseOffset); });
+        diskLog_->append(batch, baseOffset);
     }
 
     // Leader LEO is now baseOffset + 1.
@@ -632,6 +635,7 @@ Offset PartitionReplica::appendControlBatch(std::span<const uint8_t> controlBatc
         for (int i = 0; i < 8; ++i) batchScratch_[static_cast<std::size_t>(i)] = static_cast<uint8_t>(u >> (8 * i));
         rune::protocol::RecordBatchReader::stampLeaderEpoch(batchScratch_.data(),
                                                             static_cast<int32_t>(epoch_));
+        refreshTransientEvictionFloor_();   // Phase 2b E2: never evict uncommitted data
         if (memLog_->appendNoSync(batchScratch_.data(), batchScratch_.size(),
                                   baseOffset + lastOffsetDelta) < 0) return kAppendBackPressure;
     } else {
@@ -676,7 +680,9 @@ Offset PartitionReplica::appendKeyed(std::span<const uint8_t> key,
     auto batch = builder.build();
     rune::protocol::RecordBatchReader::stampLeaderEpoch(batch.data(), static_cast<int32_t>(epoch_));
 
-    onLog([&](auto& L){ L.append(batch, baseOffset); });
+    refreshTransientEvictionFloor_();   // Phase 2b E2 (no-op on disk)
+    if (onLog([&](auto& L){ return L.append(batch, baseOffset); }) < 0) [[unlikely]]
+        return kAppendBackPressure;
 
     leaderState_.setLeaderLogEndOffset(logEndOffset_());
     recomputeHw();
@@ -776,7 +782,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
 
         // (No truncation / probe here: our next fetch carries lastFetchedEpoch
         //  and the real leader's validation drives any KIP-279 truncation.)
-        if (!memoryBacked_ && diskLog_ != nullptr) diskLog_->setLeaderEpochStamp(-1);
+        stampEpochOnLog_(-1);
 
         // Self-demotion: publish the role change so the cleaner stops treating
         // this node as Leader (no live-state read on the cleaner thread).
@@ -1009,7 +1015,12 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
     // FollowerSync treat it as caught up; skip responding this cycle instead —
     // the follower's un-acked fetch resends and the lazy map retries.  ISR
     // liveness / HW bookkeeping above is unaffected.
-    if (serve == FetchServe::Data && req.fetchOffset < logEndOffset_() && view.empty())
+    // Phase 2b E2: a TRANSIENT follower fetching BELOW our ring start asks for
+    // records the ring evicted (committed; retention) — answer it (no records;
+    // makeFetchResponse carries our ring start) so it restarts its ring there,
+    // instead of the read-map-failure skip below (which would never answer it).
+    const bool belowRingStart = memoryBacked_ && req.fetchOffset < memLog_->logStartOffset();
+    if (serve == FetchServe::Data && req.fetchOffset < logEndOffset_() && view.empty() && !belowRingStart)
         [[unlikely]] return kErrNone;
     if (serve == FetchServe::Data && !view.empty()) {
         // GR-1: whole batches only.  F18 / KIP-74: the first batch at fetchOffset
@@ -1288,6 +1299,14 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     // Capture pre-apply state to detect if anything changed (for fast-ack guard).
     const Offset preLeo = logEndOffset_();
     const Offset preHw  = followerHw_;
+    // Phase 2b E2 — TRANSIENT follower behind the leader's ring start: the
+    // leader no longer holds [our LEO, its ring start) (evicted committed
+    // records), so a fetch from our LEO can never be served.  Restart our ring
+    // EMPTY at the leader's ring start (Kafka: a follower out of range below the
+    // leader's log start truncates fully and resumes there).  After preLeo is
+    // captured, so the fast-ack below fetches from the new position at once.
+    if (memoryBacked_ && role_ == Role::Follower && resp.logStartOffset > logEndOffset_()) [[unlikely]]
+        resetTransientLogTo_(resp.logStartOffset);
     // (FR: applyReplicated entry is measured by the ReplFetchRespApply SPAN; the
     //  control→worker handoff that delivers this op is ReplFragRecv→ReplWorkerOpRun.)
 
@@ -1360,9 +1379,9 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
             }
 
             if (newStart < resp.records.size() && lastOff >= logEndOffset_()) {
-                // Append only the strictly-new suffix.
-                std::vector<uint8_t> raw(resp.records.begin() + static_cast<std::ptrdiff_t>(newStart),
-                                          resp.records.end());
+                // Append only the strictly-new suffix — straight from the
+                // response view (Phase 2b E2 fix-on-sight: was copied into a
+                // fresh std::vector per apply — a hot-path heap allocation).
                 // THROUGHPUT FIX: appendNoSync — do NOT fsync per apply.  The syncing
                 // append() cost ~693µs mean (disk fsync) PER batch on the follower,
                 // capping acks=all at ~1.5k rec/s.  acks=all crash-durability comes
@@ -1370,13 +1389,21 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
                 // fsync on each follower (same as Kafka's default + rune's documented
                 // appendNoSync contract).  A single coalesced sync() runs once per
                 // duty cycle below (followerApplyDirty_), amortising the fsync.
-                onLog([&](auto& L){ L.appendNoSync(raw.data(), raw.size(), lastOff); });
-                followerApplyDirty_ = true;
-                // Kafka LeaderEpochFileCache.assign on append: the cache is built
-                // from the epochs the leader STAMPED on the batches.
-                if (assignEpochsFromBatches_(raw.data(), raw.size()) &&
-                    !memoryBacked_ && diskLog_ != nullptr)
-                    checkpointEpochs_();
+                const uint8_t* const newData = resp.records.data() + newStart;
+                const std::size_t    newLen  = resp.records.size() - newStart;
+                refreshTransientEvictionFloor_();   // E2: a transient ring never evicts above followerHw_
+                if (onLog([&](auto& L){ return L.appendNoSync(newData, newLen, lastOff); }) < 0) [[unlikely]] {
+                    // E2: the ring is full of records above our HW — nothing applied;
+                    // the leader re-serves them once our HW (from its answers) moves.
+                    ++transientApplyRefusals_;
+                } else {
+                    followerApplyDirty_ = true;
+                    // Kafka LeaderEpochFileCache.assign on append: the cache is built
+                    // from the epochs the leader STAMPED on the batches.
+                    if (assignEpochsFromBatches_(newData, newLen) &&
+                        !memoryBacked_ && diskLog_ != nullptr)
+                        checkpointEpochs_();
+                }
             }
         } else {
             // Fallback: raw user bytes (e.g. injected by unit tests) — wrap in
@@ -1388,11 +1415,15 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
             rune::protocol::RecordBatchReader::stampLeaderEpoch(batchScratch_.data(),
                                                                 static_cast<int32_t>(resp.leaderEpoch));
             const auto& batch = batchScratch_;
-            onLog([&](auto& L){ L.appendNoSync(batch.data(), batch.size(), baseOffset); });
-            followerApplyDirty_ = true;
-            if (assignEpochsFromBatches_(batch.data(), batch.size()) &&
-                !memoryBacked_ && diskLog_ != nullptr)
-                checkpointEpochs_();
+            refreshTransientEvictionFloor_();
+            if (onLog([&](auto& L){ return L.appendNoSync(batch.data(), batch.size(), baseOffset); }) < 0) [[unlikely]] {
+                ++transientApplyRefusals_;
+            } else {
+                followerApplyDirty_ = true;
+                if (assignEpochsFromBatches_(batch.data(), batch.size()) &&
+                    !memoryBacked_ && diskLog_ != nullptr)
+                    checkpointEpochs_();
+            }
         }
     }
 
@@ -3213,6 +3244,31 @@ void PartitionReplica::recomputeHw()
 void PartitionReplica::syncIsrToLeaderState()
 {
     leaderState_.setIsr(isrManager_->isr());
+}
+
+// Phase 2b E2: a TRANSIENT follower whose position is below the leader's ring
+// start.  Cold (once per catch-up episode).
+void PartitionReplica::resetTransientLogTo_(Offset start)
+{
+    const Offset was       = logEndOffset_();
+    const Offset prevStart = memLog_->logStartOffset();
+    memLog_->resetTo(start);
+    // F15 §2.1 step 3 parity (truncateLog): the log's existing content changed —
+    // every held record is gone.  Bump the generation, cut at the OLD ring start
+    // (nothing below it was held), so parked waiters, the RC state and a view
+    // over this source (Phase 2b E2 Task 9) re-validate instead of trusting a
+    // cursor into the dropped ring.
+    lastTruncationOffset_ = prevStart;
+    ++logGeneration_;
+    // Every epoch entry named offsets this ring no longer holds; the next
+    // fetch carries lastFetchedEpoch -1 (an empty log: no lineage to validate)
+    // and the cache is rebuilt from the stamped batches the leader sends.
+    epochCache_.truncateFromEnd(std::numeric_limits<int64_t>::min());
+    followerSync_.forceBehind();   // fetch on at once (the leader holds [start, LEO))
+    ++transientLogResets_;
+    spdlog::warn("PartitionReplica[node={} topic={} part={}]: transient follower at offset {} is below the "
+                 "leader's ring start {} — ring restarted empty at {} (resets={})",
+                 cfg_.selfId, cfg_.topicId, cfg_.partitionId, was, start, start, transientLogResets_);
 }
 
 void PartitionReplica::truncateLog(Offset truncateOffset)

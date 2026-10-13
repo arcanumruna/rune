@@ -1200,6 +1200,30 @@ public:
 private:
     uint64_t truncatesDeferred_ = 0;
     uint64_t appliesDroppedTruncatePending_ = 0;
+public:
+    /// Phase 2b E2 (TRANSIENT partitions): refresh the ring's eviction floor to
+    /// the current high watermark before an append that bypasses this replica
+    /// (the worker produce path appends to memoryLog() directly).  No-op on a
+    /// disk partition.  Owner thread.
+    void prepareTransientAppend() noexcept { refreshTransientEvictionFloor_(); }
+    /// Follower ring restarts at the leader's ring start / replicated applies the ring refused.
+    [[nodiscard]] uint64_t transientLogResetsForTest() const noexcept { return transientLogResets_; }
+    [[nodiscard]] uint64_t transientApplyRefusalsForTest() const noexcept { return transientApplyRefusals_; }
+private:
+    uint64_t transientLogResets_     = 0;
+    uint64_t transientApplyRefusals_ = 0;
+    /// The ring never evicts at/above what is not committed: the leader's HW
+    /// (min-ISR-gated served HW), a follower's followerHw_.
+    void refreshTransientEvictionFloor_() noexcept {
+        if (memoryBacked_) memLog_->setEvictionFloor(role_ == Role::Leader ? highWatermark() : followerHw_);
+    }
+    /// Kafka leader-epoch stamp of the ACTIVE log (disk Log or ring).
+    void stampEpochOnLog_(int32_t epoch) noexcept {
+        if (memoryBacked_) { if (memLog_ != nullptr) memLog_->setLeaderEpochStamp(epoch); }
+        else if (diskLog_ != nullptr) diskLog_->setLeaderEpochStamp(epoch);
+    }
+    /// A transient follower below the leader's ring start restarts its ring there.  Cold.
+    void resetTransientLogTo_(Offset start);
 
     /// (Leader) GR-10: push records to all ISR followers via unsolicited
     /// FetchResponse.  Non-blocking (tryClaim/offer).  F27: each follower is
@@ -1276,7 +1300,9 @@ private:
         r.leaderEpoch    = epoch_;
         r.partition      = cfg_.partitionId;
         r.highWatermark  = highWatermark;
-        r.logStartOffset = 0;
+        // Phase 2b E2: a TRANSIENT leader advertises its ring start — a follower
+        // below it restarts its ring there (applyReplicated).  Disk: 0, unchanged.
+        r.logStartOffset = memoryBacked_ ? memLog_->logStartOffset() : 0;
         r.errorCode      = errorCode;
         r.topicId        = cfg_.topicId;
         r.records        = records;
