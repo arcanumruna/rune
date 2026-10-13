@@ -118,6 +118,11 @@ endif()
 # (compile-in default; runtime-disabled until RUNE_FR_ENABLE=1).
 option(ENABLE_FLIGHT_RECORDER "Compile in rune-fr flight-recorder instrumentation" ON)
 set(RUNE_FR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rune-fr" CACHE PATH "Path to the rune-fr sibling repo")
+# Catalog history (Task 5, F7): every shared sibling target below is defined
+# only when absent, so a parent project (the broker's rune_client_broker_tests)
+# can embed this one with add_subdirectory and supply its own copy.  The
+# standalone build is unchanged.
+if(NOT TARGET rune_fr)
 add_library(rune_fr STATIC
     ${RUNE_FR_DIR}/src/Calibration.cpp
     ${RUNE_FR_DIR}/src/Enable.cpp
@@ -133,6 +138,7 @@ if(ENABLE_FLIGHT_RECORDER)
 else()
     target_compile_definitions(rune_fr PUBLIC RUNE_FR=0)
 endif()
+endif()
 
 # ── rune-crypto (client<->broker TLS/AEAD, Task 5) — sibling source static lib ──
 # Mirrors the rune-fr wiring above: TlsSession (TLS 1.3 memory-BIO handshake) +
@@ -140,6 +146,7 @@ endif()
 # (header-only) and, once Task 6 lands, the produce/egress seal/open seams.
 set(RUNE_CRYPTO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-crypto"
     CACHE PATH "Path to the rune-crypto sibling repo")
+if(NOT TARGET rune_crypto)
 add_library(rune_crypto STATIC
     ${RUNE_CRYPTO_ROOT}/src/Caps.cpp
     ${RUNE_CRYPTO_ROOT}/src/Aead.cpp
@@ -147,10 +154,12 @@ add_library(rune_crypto STATIC
 target_include_directories(rune_crypto PUBLIC ${RUNE_CRYPTO_ROOT}/include)
 target_link_libraries(rune_crypto PUBLIC OpenSSL::SSL OpenSSL::Crypto)
 target_compile_features(rune_crypto PUBLIC cxx_std_23)
+endif()
 
 # ── rune-codec (0a) — consumed as a SIBLING source static lib (like rune-fr) ──
 set(RUNE_CODEC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-codec"
     CACHE PATH "Path to the rune-codec sibling repo")
+if(NOT TARGET rune_codec)
 add_library(rune_codec STATIC
     ${RUNE_CODEC_ROOT}/src/Serialize.cpp
     ${RUNE_CODEC_ROOT}/src/Record.cpp
@@ -160,6 +169,7 @@ add_library(rune_codec STATIC
     ${RUNE_CODEC_ROOT}/src/Evolve.cpp)
 target_include_directories(rune_codec PUBLIC ${RUNE_CODEC_ROOT}/include)
 target_compile_features(rune_codec PUBLIC cxx_std_23)
+endif()
 
 # ── rune-ql — DDL parser + code-gen backends (sibling source static lib) ──────
 # Mirrors the rune-codec wiring above.  rune-ql's sources include rune-codec
@@ -189,6 +199,8 @@ endif()
 # other platforms compile a no-op (create() returns NULL -> stock Aeron).
 if(aeron_FOUND)
     enable_language(C)
+endif()
+if(aeron_FOUND AND NOT TARGET rune_gso)
     add_library(rune_gso STATIC ${RUNE_PROTOCOL_INCLUDE}/../src/net/rune_gso_bindings.c)
     set_target_properties(rune_gso PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
     target_include_directories(rune_gso PUBLIC $<BUILD_INTERFACE:${RUNE_PROTOCOL_INCLUDE}>)
@@ -1348,6 +1360,21 @@ if(BUILD_TESTING)
             endif()
         endif()
         gtest_discover_tests(rune_invoker_tests)
+
+        # Catalog history (Task 5): every DDL op — the wire the client sends
+        # (ClientCatalogDdl) and Redirect / NotLeader / InvalidRequest / timeout
+        # handling (ClientDdlRedirectRegression, ClientDdlAnswerMatrixRegression),
+        # non-blocking on the InvokerGateway fake (F7; *AndWait: Tasks 11/22).
+        add_executable(rune_client_ddl_tests
+            tests/client/ClientDdlRedirectRegressionTest.cpp
+            tests/client/ClientCatalogDdlTest.cpp
+        )
+        target_include_directories(rune_client_ddl_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+        target_link_libraries(rune_client_ddl_tests PRIVATE rune_client_api GTest::gtest_main)
+        if(UNIX AND NOT APPLE AND UUID_LIB_INVOKER)
+            target_link_libraries(rune_client_ddl_tests PRIVATE ${UUID_LIB_INVOKER})
+        endif()
+        gtest_discover_tests(rune_client_ddl_tests)
 
         # EOS-OOS / EOS-DUP follow-ups: idempotence end to end against the
         # InvokerGateway's broker idempotence model + fault injection (own

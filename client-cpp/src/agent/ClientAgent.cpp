@@ -1302,6 +1302,13 @@ transport::AeronTransport::OfferResult ClientAgent::offerToCoordinator(uint32_t 
     return offerOnSession(index, buf, len);   // seals under THIS session's crypto state
 }
 
+transport::AeronTransport::OfferResult ClientAgent::offerToEndpoint(const std::string& channel, uint8_t* buf,
+                                                                   std::size_t len, int64_t nowNs) noexcept {
+    // The node's one session (0 = the seed: "" or where the seed physically is).
+    const uint32_t idx = coordinatorSessionIndex(channel, nowNs);
+    return offerToCoordinator(idx, buf, len);   // stamps that session's id; Retry while not Connected
+}
+
 bool ClientAgent::reviveSession(uint32_t index, int64_t nowNs) noexcept {
     if (failed_ || index == 0 || index >= sessions_.size()) return false;
     session::SessionMachine& m = sessions_[index]->machine;

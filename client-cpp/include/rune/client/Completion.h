@@ -38,6 +38,11 @@ enum class OpKind : uint8_t {
     AlterTopic,     ///< Task 18: Client::alterTopic() / alterTopicAndWait()
     CreateView,     ///< Task 21: Client::createView() / createViewAndWait()
     GetViewRow,     ///< Task 21: Client::getViewRow() / getViewRowAndWait()
+    // Catalog history (Task 5): the remaining DDL ops (wire 74-77, answered by DdlResponse 78).
+    DropTopic,         ///< Client::dropTopic() / dropTopicAndWait()
+    DropView,          ///< Client::dropView() / dropViewAndWait()
+    AlterView,         ///< Client::alterView() / alterViewAndWait()
+    AlterTopicConfig,  ///< Client::alterTopicConfig() / alterTopicConfigAndWait()
 };
 
 enum class OpStatus : uint8_t {

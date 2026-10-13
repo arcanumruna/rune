@@ -35,6 +35,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -58,6 +59,12 @@ thread_local Token tWaitToken = 0;
 // stack-local OneToOneRingBuffer of the smallest useful capacity.
 constexpr std::size_t   kStartLatchCapacity = 64;
 constexpr std::int32_t  kStartLatchMsgType  = 1;
+// Catalog history: the completion value of a failed DDL — the pre-catalog ops
+// (topicId / viewTopicId) report -1 as before; the new ops' objectId is 0.
+int64_t ddlNoValue(rune::client::OpKind op) noexcept {
+    using rune::client::OpKind;
+    return op == OpKind::DefineTopic || op == OpKind::AlterTopic || op == OpKind::CreateView ? -1 : 0;
+}
 // Task 16: "host:port" (or a full Aeron channel) -> an Aeron UDP channel.
 std::string toChannel(const std::string& endpoint) {
     return endpoint.rfind("aeron:", 0) == 0 ? endpoint : ("aeron:udp?endpoint=" + endpoint);
@@ -1044,7 +1051,7 @@ Completion Client::andWaitTrampoline_(void* ctx, const char* what, std::chrono::
 // ---------------------------------------------------------------------------
 
 OpResult Client::issueControl_(OpKind op, CompletionTarget target, Token token,
-                               std::span<const uint8_t> frame, uint32_t payloadHint) {
+                               std::span<const uint8_t> frame, uint32_t payloadHint, uint32_t requestIdAt) {
     if (token > kMaxToken) return OpResult::InvalidArgument;
     if (target.cq == nullptr && target.handler.fn == nullptr) return OpResult::InvalidArgument;
     if (frame.size() > agent_.maxFrameLength()) return OpResult::InvalidArgument;
@@ -1055,8 +1062,9 @@ OpResult Client::issueControl_(OpKind op, CompletionTarget target, Token token,
     if (cfg_.runnerMode == RunnerMode::Invoker && !onDuty) return OpResult::WrongThread;
 
     ControlOpHeader h;
-    h.token = token;
-    h.op    = op;
+    h.token       = token;
+    h.op          = op;
+    h.requestIdAt = requestIdAt;
     Completions* q = target.cq;
     if (q != nullptr) {
         if (q->client_ != this) return OpResult::InvalidArgument;
@@ -1126,23 +1134,35 @@ OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::st
 OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::string_view keyField,
                              bool validate, std::span<const uint8_t> descriptorBlob,
                              Persistence persistence, CompletionTarget target, Token token) {
+    return defineTopic(name, partitions, keyField, descriptorBlob, validate, persistence, TopicOptions{},
+                       DdlOptions{}, target, token);
+}
+
+OpResult Client::defineTopic(std::string_view name, uint32_t partitions, std::string_view keyField,
+                             std::span<const uint8_t> descriptorBlob, bool validate, Persistence persistence,
+                             const TopicOptions& topic, const DdlOptions& ddl, CompletionTarget target,
+                             Token token) {
     namespace rpc = rune::protocol::client;
     if (persistence != Persistence::Disk && persistence != Persistence::Transient)
         return OpResult::InvalidArgument;   // wire decode rejects >1; never cast garbage
     rpc::DefineTopic msg;
-    msg.sessionId      = 0;
-    msg.correlationId  = 0;
-    msg.topicName      = name;
-    msg.partitionCount = partitions;
-    msg.keyField       = keyField;
-    msg.validate       = validate;
-    msg.descriptorBlob = descriptorBlob.data();
-    msg.descriptorLen  = static_cast<uint32_t>(descriptorBlob.size());
-    msg.persistence    = static_cast<uint8_t>(persistence);   // Disk writes no byte (old layout)
-    std::vector<uint8_t> frame(msg.encodedSize() + 32u);
+    msg.sessionId         = 0;
+    msg.correlationId     = 0;
+    msg.topicName         = name;
+    msg.partitionCount    = partitions;
+    msg.keyField          = keyField;
+    msg.validate          = validate;
+    msg.descriptorBlob    = descriptorBlob.data();
+    msg.descriptorLen     = static_cast<uint32_t>(descriptorBlob.size());   // 0 = an untyped topic
+    msg.persistence       = static_cast<uint8_t>(persistence);
+    msg.replicationFactor = topic.replicationFactor;
+    msg.config            = rune::protocol::convertTopicConfig<rpc::TopicConfigWire>(topic.config);
+    msg.hasExt            = true;   // catalog history: every DDL carries the extension
+    msg.ext               = ddlExt_(ddl);
+    std::vector<uint8_t> frame(msg.encodedSize());
     const std::size_t n = msg.encode(frame.data());
-    if (n == 0) return OpResult::InvalidArgument;
-    return issueControl_(OpKind::DefineTopic, target, token, std::span<const uint8_t>(frame.data(), n), 0);
+    if (n == 0) return OpResult::InvalidArgument;   // a field does not fit its wire width
+    return issueDdl_(OpKind::DefineTopic, target, token, std::span<const uint8_t>(frame.data(), n), msg.ext);
 }
 
 OpResult Client::getTopicSchema(std::string_view name, CompletionTarget target, Token token) {
@@ -1165,6 +1185,11 @@ OpResult Client::getTopicSchema(std::string_view name, uint64_t requestedFingerp
 
 OpResult Client::alterTopic(std::string_view name, uint16_t expectedVersion,
                             std::span<const uint8_t> opsBlob, CompletionTarget target, Token token) {
+    return alterTopic(name, expectedVersion, opsBlob, DdlOptions{}, target, token);
+}
+
+OpResult Client::alterTopic(std::string_view name, uint16_t expectedVersion, std::span<const uint8_t> opsBlob,
+                            const DdlOptions& ddl, CompletionTarget target, Token token) {
     namespace rpc = rune::protocol::client;
     rpc::AlterTopic msg;
     msg.sessionId       = 0;
@@ -1173,10 +1198,12 @@ OpResult Client::alterTopic(std::string_view name, uint16_t expectedVersion,
     msg.expectedVersion = expectedVersion;
     msg.opsBlob         = opsBlob.data();
     msg.opsLen          = static_cast<uint32_t>(opsBlob.size());
-    std::vector<uint8_t> frame(msg.encodedSize() + 32u);
+    msg.hasExt          = true;
+    msg.ext             = ddlExt_(ddl);
+    std::vector<uint8_t> frame(msg.encodedSize());
     const std::size_t n = msg.encode(frame.data());
     if (n == 0) return OpResult::InvalidArgument;
-    return issueControl_(OpKind::AlterTopic, target, token, std::span<const uint8_t>(frame.data(), n), 0);
+    return issueDdl_(OpKind::AlterTopic, target, token, std::span<const uint8_t>(frame.data(), n), msg.ext);
 }
 
 OpResult Client::listTopics(CompletionTarget target, Token token) {
@@ -1185,6 +1212,12 @@ OpResult Client::listTopics(CompletionTarget target, Token token) {
 
 OpResult Client::createView(std::string_view viewName, std::string_view keyField, uint8_t persistence,
                             std::span<const uint8_t> planBlob, CompletionTarget target, Token token) {
+    return createView(viewName, keyField, persistence, planBlob, DdlOptions{}, target, token);
+}
+
+OpResult Client::createView(std::string_view viewName, std::string_view keyField, uint8_t persistence,
+                            std::span<const uint8_t> planBlob, const DdlOptions& ddl, CompletionTarget target,
+                            Token token) {
     namespace rpc = rune::protocol::client;
     rpc::CreateView msg;
     msg.sessionId     = 0;
@@ -1194,10 +1227,114 @@ OpResult Client::createView(std::string_view viewName, std::string_view keyField
     msg.persistence   = persistence;
     msg.planBlob      = planBlob.data();
     msg.planLen       = static_cast<uint32_t>(planBlob.size());
-    std::vector<uint8_t> frame(msg.encodedSize() + 32u);
+    msg.hasExt        = true;
+    msg.ext           = ddlExt_(ddl);
+    std::vector<uint8_t> frame(msg.encodedSize());
     const std::size_t n = msg.encode(frame.data());
     if (n == 0) return OpResult::InvalidArgument;
-    return issueControl_(OpKind::CreateView, target, token, std::span<const uint8_t>(frame.data(), n), 0);
+    return issueDdl_(OpKind::CreateView, target, token, std::span<const uint8_t>(frame.data(), n), msg.ext);
+}
+
+// ---------------------------------------------------------------------------
+// Catalog history (Task 5): the remaining DDL ops + the DDL extension
+// ---------------------------------------------------------------------------
+
+uint64_t Client::drawClientInstanceId_() {
+    // F14: a random 64-bit id per Client instance (two 32-bit draws), never 0 —
+    // the requestId's hi word; {0, 0} means "none" on the wire.
+    std::random_device rd;
+    uint64_t id = 0;
+    while (id == 0) id = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+    return id;
+}
+
+rune::protocol::client::DdlExtension Client::ddlExt_(const DdlOptions& ddl) const noexcept {
+    rune::protocol::client::DdlExtension e;
+    e.statement  = ddl.statement;
+    e.clientName = ddl.clientName.empty() ? std::string_view(cfg_.clientName) : std::string_view(ddl.clientName);
+    e.requestId  = ddl.requestId;   // none() = stamped by the duty thread (issueDdl_)
+    if (ddl.replayedFrom) {
+        e.hasReplayedFrom   = 1;
+        e.replayedClusterId = ddl.replayedFrom->clusterId;
+        e.replayedOffset    = ddl.replayedFrom->offset;
+        e.replayedPrincipal = ddl.replayedFrom->principal;
+    }
+    return e;
+}
+
+OpResult Client::issueDdl_(OpKind op, CompletionTarget target, Token token, std::span<const uint8_t> frame,
+                           const rune::protocol::client::DdlExtension& ext) {
+    // The extension ends every DDL frame: ..., requestIdHi:u64, requestIdLo:u64,
+    // hasReplayedFrom:u8, [clusterId(varstr), offset:i64, principal(varstr)].
+    uint32_t requestIdAt = 0;
+    if (ext.requestId.none()) {
+        const std::size_t replayTail =
+            ext.hasReplayedFrom == 1
+                ? 2u + ext.replayedClusterId.size() + 8u + 2u + ext.replayedPrincipal.size()
+                : 0u;
+        const std::size_t tail = 16u + 1u + replayTail;
+        if (frame.size() < rune::protocol::client::MessageHeader::ENCODED_SIZE + tail) return OpResult::InvalidArgument;
+        requestIdAt = static_cast<uint32_t>(frame.size() - tail);
+    }
+    return issueControl_(op, target, token, frame, 0, requestIdAt);
+}
+
+OpResult Client::dropTopic(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::DropTopic msg;
+    msg.topicName = name;
+    msg.ext       = ddlExt_(ddl);
+    std::vector<uint8_t> frame(msg.encodedSize());
+    const std::size_t n = msg.encode(frame.data());
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueDdl_(OpKind::DropTopic, target, token, std::span<const uint8_t>(frame.data(), n), msg.ext);
+}
+
+OpResult Client::dropView(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::DropView msg;
+    msg.viewName = name;
+    msg.ext      = ddlExt_(ddl);
+    std::vector<uint8_t> frame(msg.encodedSize());
+    const std::size_t n = msg.encode(frame.data());
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueDdl_(OpKind::DropView, target, token, std::span<const uint8_t>(frame.data(), n), msg.ext);
+}
+
+OpResult Client::alterView(std::string_view name, std::string_view keyField, uint8_t persistence,
+                           uint32_t expectedVersion, std::span<const uint8_t> planBlob, const DdlOptions& ddl,
+                           CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    rpc::AlterView msg;
+    msg.viewName        = name;
+    msg.keyField        = keyField;
+    msg.persistence     = persistence;
+    msg.expectedVersion = expectedVersion;
+    msg.planBlob        = planBlob.data();
+    msg.planLen         = static_cast<uint32_t>(planBlob.size());
+    msg.ext             = ddlExt_(ddl);
+    std::vector<uint8_t> frame(msg.encodedSize());
+    const std::size_t n = msg.encode(frame.data());
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueDdl_(OpKind::AlterView, target, token, std::span<const uint8_t>(frame.data(), n), msg.ext);
+}
+
+OpResult Client::alterTopicConfig(std::string_view name, uint32_t expectedVersion,
+                                  std::span<const rune::protocol::client::ConfigChangeWire> changes,
+                                  const DdlOptions& ddl, CompletionTarget target, Token token) {
+    namespace rpc = rune::protocol::client;
+    if (changes.size() > 0xFFFFu) return OpResult::InvalidArgument;   // the count is a u16
+    std::vector<uint8_t> block(rpc::configChangesEncodedSize(changes.size()));
+    if (rpc::putConfigChanges(block.data(), changes) != block.size()) return OpResult::InvalidArgument;
+    rpc::AlterTopicConfig msg;
+    msg.topicName       = name;
+    msg.expectedVersion = expectedVersion;
+    msg.changes         = std::span<const uint8_t>(block.data(), block.size());
+    msg.ext             = ddlExt_(ddl);
+    std::vector<uint8_t> frame(msg.encodedSize());
+    const std::size_t n = msg.encode(frame.data());
+    if (n == 0) return OpResult::InvalidArgument;
+    return issueDdl_(OpKind::AlterTopicConfig, target, token, std::span<const uint8_t>(frame.data(), n), msg.ext);
 }
 
 OpResult Client::getViewRow(int32_t viewTopicId, uint64_t keyU64, uint64_t requestedFingerprint,
@@ -1314,6 +1451,19 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
     ctlScratch_.assign(frame.begin(), frame.end());
     rpc::detail::putLE64(ctlScratch_.data(), 8, machine.sessionId());
     rpc::detail::putLE64(ctlScratch_.data(), 16, p.corrId);
+    if (isDdlOp(h.op)) {
+        // Catalog history (F14): the requestId is stamped HERE, by the duty
+        // thread that owns the counter, then kept with the frame — every resend
+        // (Redirect / NotLeader) re-offers these exact bytes.
+        if (h.requestIdAt != 0 && std::size_t{h.requestIdAt} + 16u <= ctlScratch_.size()) {
+            rpc::detail::putLE64(ctlScratch_.data(), static_cast<int>(h.requestIdAt),
+                                 static_cast<int64_t>(clientInstanceId_));
+            rpc::detail::putLE64(ctlScratch_.data(), static_cast<int>(h.requestIdAt + 8u),
+                                 static_cast<int64_t>(++requestCounter_));
+        }
+        p.frame = ctlScratch_;
+        p.retry = DdlSent{};
+    }
     switch (agent_.offerDefault(ctlScratch_.data(), ctlScratch_.size())) {
     case transport::AeronTransport::OfferResult::Accepted:
         break;
@@ -1347,7 +1497,158 @@ Client::PendingCtl Client::takeCtl_(std::size_t i) {
     PendingCtl p = std::move(pendingCtl_[i]);
     pendingCtl_.erase(pendingCtl_.begin() + static_cast<std::ptrdiff_t>(i));
     if (!p.unsentFrame.empty()) --unsentCtl_;
+    if (ddlWaitsForResend(p.retry)) --ddlAwaitingResend_;
     return p;
+}
+
+// ---------------------------------------------------------------------------
+// Catalog history (Task 5): a pending DDL's answers — Redirect, NotLeader,
+// resend pump.  Duty thread; cold.  Every path ends in exactly one completion.
+// ---------------------------------------------------------------------------
+
+void Client::setDdlRetry_(PendingCtl& p, DdlRetry next) noexcept {
+    ddlAwaitingResend_ += (ddlWaitsForResend(next) ? 1 : 0) - (ddlWaitsForResend(p.retry) ? 1 : 0);
+    p.retry = std::move(next);
+}
+
+transport::AeronTransport::OfferResult Client::offerDdl_(PendingCtl& p, int64_t nowNs) {
+    return agent_.offerToEndpoint(p.endpoint, p.frame.data(), p.frame.size(), nowNs);
+}
+
+void Client::failDdl_(std::size_t i, uint16_t code, std::string_view detail, int64_t value, int64_t aux) {
+    PendingCtl p = takeCtl_(i);   // removed first: the delivery may issue a new op
+    completeCtl_(p, OpStatus::BrokerError, value, aux, code,
+                 std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(detail.data()), detail.size()));
+}
+
+void Client::onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t nowNs) {
+    using Offer = transport::AeronTransport::OfferResult;
+    PendingCtl& p = pendingCtl_[i];
+    if (endpoint.empty()) {   // a Redirect that names no node: nothing to follow — retriable as NotLeader
+        onDdlNotLeader_(i, "redirect without a leader endpoint", nowNs);
+        return;
+    }
+    // Only an in-flight DDL is answered; one waiting for its resend has no
+    // request out (a duplicate answer) — its own pump / deadline ends it.
+    int redirects = 0;
+    const DdlNotLeaderSeen* nl = nullptr;
+    if (const auto* s = std::get_if<DdlSent>(&p.retry)) redirects = s->redirects;
+    else if (const auto* n = std::get_if<DdlNotLeaderSeen>(&p.retry)) { redirects = n->redirects; nl = n; }
+    else return;
+    if (++redirects > kMaxDdlRedirects) {
+        const std::string why = "redirected more than " + std::to_string(kMaxDdlRedirects) + " times";
+        failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::Redirect), why,
+                 ddlNoValue(p.op));
+        return;
+    }
+    // The leader's own session (the seed never moves for a DDL: it carries the
+    // data ops / subscriptions); the same frame, so the same requestId.
+    p.endpoint = toChannel(std::string(endpoint));
+    const DdlNotLeaderSeen seen = nl != nullptr ? *nl : DdlNotLeaderSeen{};
+    switch (offerDdl_(p, nowNs)) {
+    case Offer::Accepted:
+        if (nl != nullptr) setDdlRetry_(p, DdlNotLeaderSeen{redirects, seen.budgetEndNs, seen.backoffNs});
+        else               setDdlRetry_(p, DdlSent{redirects});
+        return;
+    case Offer::Retry:   // that node's session is still connecting: the pump re-offers it
+        if (nl != nullptr) setDdlRetry_(p, DdlAwaitingResend{redirects, seen.budgetEndNs, seen.backoffNs, nowNs});
+        else               setDdlRetry_(p, DdlHeldForNode{redirects});
+        return;
+    case Offer::Fatal: {   // the transport can never carry it
+        PendingCtl dead = takeCtl_(i);
+        completeCtl_(dead, OpStatus::NotConnected);
+        return;
+    }
+    }
+}
+
+void Client::onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t nowNs) {
+    PendingCtl& p = pendingCtl_[i];
+    constexpr int64_t kInitialBackoffNs = 100'000'000;     // 100 ms
+    constexpr int64_t kMaxBackoffNs     = 1'000'000'000;   // 1 s
+    int     redirects   = 0;
+    int64_t budgetEndNs = 0;
+    int64_t backoffNs   = 0;
+    if (const auto* s = std::get_if<DdlSent>(&p.retry)) {
+        redirects   = s->redirects;
+        budgetEndNs = std::min(p.deadlineNs, nowNs + static_cast<int64_t>(
+                                                         std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                             cfg_.ddlRetryBudget).count()));
+        backoffNs   = kInitialBackoffNs;
+    } else if (const auto* n = std::get_if<DdlNotLeaderSeen>(&p.retry)) {
+        redirects   = n->redirects;
+        budgetEndNs = n->budgetEndNs;
+        backoffNs   = std::min(n->backoffNs * 2, kMaxBackoffNs);
+    } else {
+        return;   // not in flight (a duplicate answer): its pump / deadline ends it
+    }
+    if (nowNs >= budgetEndNs) {   // spec §5.5: retried within the budget, then an explicit failure
+        std::string why(detail);
+        why += why.empty() ? "not leader: DDL retry budget exhausted" : " (DDL retry budget exhausted)";
+        failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader), why,
+                 ddlNoValue(p.op));
+        return;
+    }
+    // The last resend lands at the budget's end at the latest; its answer decides.
+    setDdlRetry_(p, DdlAwaitingResend{redirects, budgetEndNs, backoffNs, std::min(nowNs + backoffNs, budgetEndNs)});
+}
+
+int Client::resendDueDdl_(int64_t nowNs) {
+    using Offer = transport::AeronTransport::OfferResult;
+    int work = 0;
+    for (std::size_t i = 0; i < pendingCtl_.size() && ddlAwaitingResend_ != 0;) {
+        PendingCtl& p = pendingCtl_[i];
+        if (const auto* a = std::get_if<DdlAwaitingResend>(&p.retry)) {
+            if (nowNs < a->resendAtNs) { ++i; continue; }
+            const DdlAwaitingResend due = *a;
+            switch (offerDdl_(p, nowNs)) {
+            case Offer::Accepted:
+                setDdlRetry_(p, DdlNotLeaderSeen{due.redirects, due.budgetEndNs, due.backoffNs});
+                ++work;
+                ++i;
+                break;
+            case Offer::Retry:   // refused (its node's session is not up): every cycle, inside the budget
+                if (nowNs >= due.budgetEndNs) {
+                    failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader),
+                             "not leader: DDL retry budget exhausted (the node could not be reached)",
+                             ddlNoValue(p.op));
+                    ++work;
+                } else {
+                    ++i;
+                }
+                break;
+            case Offer::Fatal: {
+                PendingCtl dead = takeCtl_(i);
+                completeCtl_(dead, OpStatus::NotConnected);
+                ++work;
+                break;
+            }
+            }
+            continue;
+        }
+        if (const auto* hld = std::get_if<DdlHeldForNode>(&p.retry)) {
+            const int redirects = hld->redirects;
+            switch (offerDdl_(p, nowNs)) {
+            case Offer::Accepted:
+                setDdlRetry_(p, DdlSent{redirects});
+                ++work;
+                ++i;
+                break;
+            case Offer::Retry:   // still connecting: the op deadline bounds it (Timeout)
+                ++i;
+                break;
+            case Offer::Fatal: {
+                PendingCtl dead = takeCtl_(i);
+                completeCtl_(dead, OpStatus::NotConnected);
+                ++work;
+                break;
+            }
+            }
+            continue;
+        }
+        ++i;
+    }
+    return work;
 }
 
 std::size_t Client::findCtl_(int64_t corrId) const noexcept {
@@ -1552,6 +1853,27 @@ DefineTopicResult Client::defineTopicAndWait(std::string_view name, uint32_t par
                  result.topicId   = static_cast<int32_t>(c.value);
                  result.version   = static_cast<uint16_t>(c.aux);
                  result.errorCode = c.errorCode;
+                 result.detail.assign(reinterpret_cast<const char*>(p.data()), p.size());
+             });
+    return result;
+}
+
+DefineTopicResult Client::defineTopicAndWait(std::string_view name, uint32_t partitions, std::string_view keyField,
+                                             std::span<const uint8_t> descriptorBlob, bool validate,
+                                             Persistence persistence, const TopicOptions& topic,
+                                             const DdlOptions& ddl, std::chrono::milliseconds timeout) {
+    DefineTopicResult result;
+    andWait_("defineTopic()", timeout, 0,
+             [&](Completions& q, Token t) {
+                 return defineTopic(name, partitions, keyField, descriptorBlob, validate, persistence, topic, ddl,
+                                    q, t);
+             },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError) throwForStatus_("defineTopic()", c, p);
+                 result.topicId   = static_cast<int32_t>(c.value);
+                 result.version   = static_cast<uint16_t>(c.aux);
+                 result.errorCode = c.errorCode;
+                 result.detail.assign(reinterpret_cast<const char*>(p.data()), p.size());
              });
     return result;
 }
@@ -1587,6 +1909,23 @@ AlterTopicResult Client::alterTopicAndWait(std::string_view name, uint16_t expec
                  result.topicId    = static_cast<int32_t>(c.value);
                  result.newVersion = static_cast<uint16_t>(c.aux);
                  result.errorCode  = c.errorCode;
+                 result.detail.assign(reinterpret_cast<const char*>(p.data()), p.size());
+             });
+    return result;
+}
+
+AlterTopicResult Client::alterTopicAndWait(std::string_view name, uint16_t expectedVersion,
+                                           std::span<const uint8_t> opsBlob, const DdlOptions& ddl,
+                                           std::chrono::milliseconds timeout) {
+    AlterTopicResult result;
+    andWait_("alterTopic()", timeout, 0,
+             [&](Completions& q, Token t) { return alterTopic(name, expectedVersion, opsBlob, ddl, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError) throwForStatus_("alterTopic()", c, p);
+                 result.topicId    = static_cast<int32_t>(c.value);
+                 result.newVersion = static_cast<uint16_t>(c.aux);
+                 result.errorCode  = c.errorCode;
+                 result.detail.assign(reinterpret_cast<const char*>(p.data()), p.size());
              });
     return result;
 }
@@ -1602,6 +1941,86 @@ CreateViewResult Client::createViewAndWait(std::string_view viewName, std::strin
                  result.viewTopicId       = static_cast<int32_t>(c.value);
                  result.outputFingerprint = static_cast<uint64_t>(c.aux);
                  result.errorCode         = c.errorCode;
+                 result.detail.assign(reinterpret_cast<const char*>(p.data()), p.size());
+             });
+    return result;
+}
+
+CreateViewResult Client::createViewAndWait(std::string_view viewName, std::string_view keyField,
+                                           uint8_t persistence, std::span<const uint8_t> planBlob,
+                                           const DdlOptions& ddl, std::chrono::milliseconds timeout) {
+    CreateViewResult result;
+    andWait_("createView()", timeout, 0,
+             [&](Completions& q, Token t) { return createView(viewName, keyField, persistence, planBlob, ddl, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError) throwForStatus_("createView()", c, p);
+                 result.viewTopicId       = static_cast<int32_t>(c.value);
+                 result.outputFingerprint = static_cast<uint64_t>(c.aux);
+                 result.errorCode         = c.errorCode;
+                 result.detail.assign(reinterpret_cast<const char*>(p.data()), p.size());
+             });
+    return result;
+}
+
+namespace {
+// Catalog history: the DdlResult of a DropTopic / DropView / AlterView /
+// AlterTopicConfig completion (Ok or BrokerError).
+DdlResult ddlResultOf(const Completion& c, std::span<const uint8_t> p) {
+    DdlResult r;
+    r.errorCode  = c.errorCode;
+    r.objectId   = static_cast<uint64_t>(c.value);
+    r.newVersion = static_cast<uint32_t>(c.aux);
+    r.detail.assign(reinterpret_cast<const char*>(p.data()), p.size());
+    return r;
+}
+} // namespace
+
+DdlResult Client::dropTopicAndWait(std::string_view name, const DdlOptions& ddl, std::chrono::milliseconds timeout) {
+    DdlResult result;
+    andWait_("dropTopic()", timeout, 0,
+             [&](Completions& q, Token t) { return dropTopic(name, ddl, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError) throwForStatus_("dropTopic()", c, p);
+                 result = ddlResultOf(c, p);
+             });
+    return result;
+}
+
+DdlResult Client::dropViewAndWait(std::string_view name, const DdlOptions& ddl, std::chrono::milliseconds timeout) {
+    DdlResult result;
+    andWait_("dropView()", timeout, 0,
+             [&](Completions& q, Token t) { return dropView(name, ddl, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError) throwForStatus_("dropView()", c, p);
+                 result = ddlResultOf(c, p);
+             });
+    return result;
+}
+
+DdlResult Client::alterViewAndWait(std::string_view name, std::string_view keyField, uint8_t persistence,
+                                   uint32_t expectedVersion, std::span<const uint8_t> planBlob, const DdlOptions& ddl,
+                                   std::chrono::milliseconds timeout) {
+    DdlResult result;
+    andWait_("alterView()", timeout, 0,
+             [&](Completions& q, Token t) {
+                 return alterView(name, keyField, persistence, expectedVersion, planBlob, ddl, q, t);
+             },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError) throwForStatus_("alterView()", c, p);
+                 result = ddlResultOf(c, p);
+             });
+    return result;
+}
+
+DdlResult Client::alterTopicConfigAndWait(std::string_view name, uint32_t expectedVersion,
+                                          std::span<const rune::protocol::client::ConfigChangeWire> changes,
+                                          const DdlOptions& ddl, std::chrono::milliseconds timeout) {
+    DdlResult result;
+    andWait_("alterTopicConfig()", timeout, 0,
+             [&](Completions& q, Token t) { return alterTopicConfig(name, expectedVersion, changes, ddl, q, t); },
+             [&](const Completion& c, std::span<const uint8_t> p) {
+                 if (c.status != OpStatus::BrokerError) throwForStatus_("alterTopicConfig()", c, p);
+                 result = ddlResultOf(c, p);
              });
     return result;
 }
@@ -1710,6 +2129,9 @@ int Client::dutyCycle(int64_t nowNs) {
     work += watchProduceRoutes_(nowNs);
     // DR-15: Subscribes redirected to an unreachable node, after fresh metadata.
     if (!redirectedSubscribes_.empty()) [[unlikely]] work += retryRedirectedSubscribes_(nowNs);
+    // Catalog history (Task 5): DDLs whose NotLeader backoff elapsed / held for a
+    // redirected node's connect (one branch when none).
+    if (ddlAwaitingResend_ != 0) [[unlikely]] work += resendDueDdl_(nowNs);
     if (!heldRedirectFollows_.empty()) [[unlikely]] work += releaseHeldRedirectFollows_();   // R3
     // E2 final fix wave (I2): moved subscriptions on their leader node's own
     // session — held Subscribes flushed, a lost session's ones re-armed.
@@ -2198,6 +2620,31 @@ void Client::onEgressFrame(codec::TemplateId tid,
         namespace rpc = rune::protocol::client;
         const auto ec = static_cast<rpc::ErrorCode>(
             static_cast<uint16_t>(opt->code));
+
+        // Catalog history (Task 5, spec §5.1/§5.2/§9): an answer to a pending
+        // DDL is decided HERE, before every data-op branch below (which would
+        // treat a DDL Redirect as a connect-time one and drop it): Redirect ->
+        // re-sent on the named node's session; NotLeader -> re-sent after a
+        // backoff inside the retry budget; anything else -> its BrokerError
+        // with the message as detail.  Session-fatal codes take the shared
+        // path below (every pending op of the dead session ends SessionLost).
+        if (opt->correlationId != 0 && ec != rpc::ErrorCode::SessionExpired &&
+            ec != rpc::ErrorCode::UnknownSession) {
+            if (const std::size_t i = findCtl_(opt->correlationId);
+                i < pendingCtl_.size() && isDdlOp(pendingCtl_[i].op)) {
+                if (ec == rpc::ErrorCode::Redirect) {
+                    onDdlRedirect_(i, opt->message, now());
+                } else if (ec == rpc::ErrorCode::NotLeader) {
+                    onDdlNotLeader_(i, opt->message, now());
+                } else {
+                    std::string msg(opt->message);
+                    if (msg.empty()) msg = "ErrorResponse code: " + std::to_string(opt->code);
+                    failDdl_(i, static_cast<uint16_t>(opt->code), msg, ddlNoValue(pendingCtl_[i].op));
+                    if (cbError_) invokeUserCallback_("onError", [&] { cbError_(msg); });
+                }
+                break;
+            }
+        }
 
         // A group member's per-partition Subscribe refused by a non-leader:
         // re-route THAT partition (never a seed-level redirect — the seed
@@ -2790,6 +3237,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
 
         if (const std::size_t i = findCtl_(opt->correlationId);
             i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::DefineTopic) {
+            if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::NotLeader)) {   // catalog history: retriable
+                onDdlNotLeader_(i, {}, now());
+                break;
+            }
             PendingCtl p = takeCtl_(i);
             // Task 9 (CLI): on success, register (name, topicId) so listTopics()
             // can enumerate topics that were applied via this client.
@@ -2837,6 +3288,10 @@ void Client::onEgressFrame(codec::TemplateId tid,
 
         if (const std::size_t i = findCtl_(opt->correlationId);
             i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::AlterTopic) {
+            if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::NotLeader)) {   // catalog history: retriable
+                onDdlNotLeader_(i, {}, now());
+                break;
+            }
             PendingCtl p = takeCtl_(i);
             completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
                          opt->topicId, opt->newVersion, opt->errorCode);
@@ -2852,9 +3307,38 @@ void Client::onEgressFrame(codec::TemplateId tid,
 
         if (const std::size_t i = findCtl_(opt->correlationId);
             i < pendingCtl_.size() && pendingCtl_[i].op == OpKind::CreateView) {
+            if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::NotLeader)) {   // catalog history: retriable
+                onDdlNotLeader_(i, {}, now());
+                break;
+            }
             PendingCtl p = takeCtl_(i);
             completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
                          opt->viewTopicId, static_cast<int64_t>(opt->outputFingerprint), opt->errorCode);
+        }
+        break;
+    }
+
+    // ---- Catalog history (Task 5): DdlResponse (78) — DropTopic / DropView /
+    //      AlterView / AlterTopicConfig.  errorCode 2 = NotLeader (retriable).
+    case codec::TemplateId::DdlResponse: {
+        namespace rpc = rune::protocol::client;
+        auto opt = rpc::DdlResponse::decode(buf, len);
+        if (!opt) break;
+
+        if (const std::size_t i = findCtl_(opt->correlationId);
+            i < pendingCtl_.size() &&
+            (pendingCtl_[i].op == OpKind::DropTopic || pendingCtl_[i].op == OpKind::DropView ||
+             pendingCtl_[i].op == OpKind::AlterView || pendingCtl_[i].op == OpKind::AlterTopicConfig)) {
+            if (opt->errorCode == static_cast<uint16_t>(rpc::ErrorCode::NotLeader)) {
+                onDdlNotLeader_(i, opt->detail, now());
+                break;
+            }
+            PendingCtl p = takeCtl_(i);
+            completeCtl_(p, opt->errorCode == 0 ? OpStatus::Ok : OpStatus::BrokerError,
+                         static_cast<int64_t>(opt->objectId), static_cast<int64_t>(opt->newVersion),
+                         opt->errorCode,
+                         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(opt->detail.data()),
+                                                  opt->detail.size()));
         }
         break;
     }

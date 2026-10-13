@@ -212,6 +212,17 @@ struct InvokerGateway {
     // arriving on a node that is not coordinatorEndpoint is answered
     // ErrorResponse{NotCoordinator, coordinatorRedirectTo, its corrId}.
     std::vector<int> coordinatorEndpoints;
+    /// Catalog history (Task 5, F7): per-template frame handlers, consulted first
+    /// in onFrame (after the dead-endpoint check).  `endpoint` is the index of
+    /// the endpoint the frame arrived on; the handler answers through send() /
+    /// sendError() / sendDdlResponse().
+    std::map<uint16_t, std::function<void(int endpoint, const uint8_t*, std::size_t)>> templateHandlers;
+    /// A DdlResponse (78) from endpoint `from`.
+    void sendDdlResponse(int from, const rune::protocol::client::DdlResponse& r) {
+        std::vector<uint8_t> out(r.encodedSize());
+        const std::size_t n = r.encode(out.data());
+        send(from, out.data(), n);
+    }
     /// An ErrorResponse from endpoint `from` (a late / unsolicited answer).
     void sendError(int from, int16_t code, const std::string& message, int64_t sessionId, int64_t corrId) {
         namespace rcc = rune::client::codec;
@@ -942,6 +953,13 @@ private:
         if (!tid) return;
         if (deadEndpoints.count(endpoint) != 0) return;  // a dead node hears nothing
         if (!replay) ++framesReceived;
+        // Catalog history (Task 5, F7): a test-installed handler for this template
+        // answers the frame itself (e.g. Redirect / NotLeader / DdlResponse) —
+        // consulted before any built-in behaviour.
+        if (const auto h = templateHandlers.find(*tid); h != templateHandlers.end()) {
+            h->second(endpoint, buf, len);
+            return;
+        }
         switch (static_cast<rcc::TemplateId>(*tid)) {
         case rcc::TemplateId::Connect: {
             const auto c = rcc::decodeConnectRequest(buf, len);

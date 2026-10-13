@@ -495,6 +495,16 @@ public:
     /// re-sends on that session's connect) while it is not Connected.
     transport::AeronTransport::OfferResult offerToCoordinator(uint32_t index, const uint8_t* buf,
                                                               std::size_t len) noexcept;
+    /// Catalog history (Task 5): offer ONE control frame (a redirected / re-sent
+    /// DDL) to the node at `channel` on that node's ONE session — the per-endpoint
+    /// session pool partition routes and the coordinator use (lazily opened,
+    /// async connect, revived when it gave up); "" or the seed's physical channel
+    /// = the seed.  The seed never moves for it.  The header sessionId is
+    /// re-stamped with that session's id and the frame sealed under its crypto
+    /// state.  Retry (= hold; the owner re-offers) while that session is not
+    /// Connected.  Agent thread only; cold path.
+    transport::AeronTransport::OfferResult offerToEndpoint(const std::string& channel, uint8_t* buf,
+                                                           std::size_t len, int64_t nowNs) noexcept;
     /// D4: session `index`'s machine (read-only; the seed when out of range).
     [[nodiscard]] const session::SessionMachine& sessionMachineAt(uint32_t index) const noexcept {
         return (index < sessions_.size() ? *sessions_[index] : *sessions_[0]).machine;

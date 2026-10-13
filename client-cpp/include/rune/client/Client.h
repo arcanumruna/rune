@@ -56,6 +56,8 @@
 #include <rune/client/detail/StatusRing.h>
 #include <rune/client/DutyView.h>
 #include <rune/client/shard/ShardState.h>
+#include <rune/protocol/CatalogTypes.h>
+#include <rune/protocol/client/SchemaMessages.h>
 
 #include <chrono>
 #include <cstddef>
@@ -71,6 +73,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace rune::client {
@@ -100,6 +103,41 @@ struct DefineTopicResult {
     int32_t  topicId   = -1;
     uint16_t version   = 0;
     uint16_t errorCode = 0;
+    std::string detail;   ///< catalog history: the broker's reason (an ErrorResponse message); "" on OK
+};
+
+// ---------------------------------------------------------------------------
+// Catalog history (Task 5): DDL options, topic creation options, DDL result.
+// ---------------------------------------------------------------------------
+
+/// Carried by every DDL in the DDL extension (client version 8).
+struct DdlOptions {
+    std::string statement;                  ///< original DDL text (QL/CLI fill it; "" for API-issued)
+    std::string clientName;                 ///< "" = ClientConfig::clientName
+    /// {0,0} = the client generates one (its random instance id + a counter);
+    /// reused verbatim on every resend of this DDL (F14).
+    rune::protocol::RequestId requestId{};
+    struct ReplayedFrom { std::string clusterId; int64_t offset = -1; std::string principal; };
+    /// `rune catalog replay` only (Task 15) -> DdlExtension.hasReplayedFrom.
+    std::optional<ReplayedFrom> replayedFrom;
+};
+
+/// DefineTopic's catalog-history fields (F32: TopicConfig is the ONE definition,
+/// rune/protocol/CatalogTypes.h).  replicationFactor 0 = the cluster default.
+struct TopicOptions {
+    int16_t                     replicationFactor = 0;
+    rune::protocol::TopicConfig config{};
+};
+
+/// Result of DropTopic / DropView / AlterView / AlterTopicConfig (DdlResponse 78).
+/// errorCode 0 OK, else a broker ErrorCode (e.g. UnknownTopic 7, InvalidRequest 39
+/// with detail); NotLeader (2) only once the retry budget ran out, Redirect (3)
+/// only after more than Client::kMaxDdlRedirects hops.
+struct DdlResult {
+    uint16_t    errorCode  = 0;
+    uint64_t    objectId   = 0;
+    uint32_t    newVersion = 0;
+    std::string detail;
 };
 
 struct TopicSchemaResult {
@@ -120,6 +158,7 @@ struct AlterTopicResult {
     int32_t  topicId    = -1;
     uint16_t newVersion = 0;
     uint16_t errorCode  = 0;
+    std::string detail;   ///< catalog history: the broker's reason; "" on OK
 };
 
 // ---------------------------------------------------------------------------
@@ -136,6 +175,7 @@ struct CreateViewResult {
     int32_t  viewTopicId       = -1;
     uint64_t outputFingerprint = 0;
     uint16_t errorCode         = 0;
+    std::string detail;   ///< catalog history: the broker's reason; "" on OK
 };
 
 /// Result of GetViewRow (wire 72/73). `status` is ViewRowResponse::Status
@@ -300,6 +340,16 @@ struct ClientConfig {
     // offer off the wire before the broker ever sees it. Meaningless unless
     // offerCrypto is also true. Default false (back-compat).
     bool requireCrypto = false;
+
+    // ---- Catalog history (Task 5) — DDL.
+    // clientName: carried in every DDL's extension (DdlOptions::clientName
+    // overrides it per call); the catalog event's principal records it.
+    std::string clientName = "rune-client";
+    // ddlRetryBudget: how long a DDL answered NotLeader (a catalog leader change
+    // / a catching-up leader) is retried, with a 100 ms backoff doubling to 1 s,
+    // before it fails explicitly (BrokerError NotLeader).  Bounded by the op's
+    // own deadline (pingTimeoutMs) too.
+    std::chrono::milliseconds ddlRetryBudget{10'000};
 };
 
 /// Maps a ClientConfig to the agent/transport configuration (applies env overrides).
@@ -637,6 +687,46 @@ public:
     OpResult getViewRow(int32_t viewTopicId, uint64_t keyU64, uint64_t requestedFingerprint,
                         CompletionTarget target, Token token);
 
+    // ---- Catalog history (Task 5): DDL with the DDL extension ---------------
+    // Every DDL (the overloads above included, with default DdlOptions) carries
+    // the DDL extension: statement, clientName, a 128-bit requestId (F14) and
+    // optionally replayedFrom.  Every DDL handles every answer explicitly:
+    //   OK / a specific code      -> its completion (BrokerError for a code);
+    //   ErrorResponse{Redirect, endpoint} -> re-sent, the SAME frame and
+    //       requestId, on that node's own session (the seed never moves); more
+    //       than kMaxDdlRedirects hops -> BrokerError errorCode 3, payload
+    //       "redirected more than 3 times";
+    //   NotLeader (ErrorResponse or a response's errorCode 2) -> re-sent after a
+    //       100 ms backoff doubling to 1 s while inside ClientConfig::
+    //       ddlRetryBudget (and the op deadline), then BrokerError errorCode 2;
+    //   ErrorResponse{InvalidRequest | other} -> BrokerError, payload = its message;
+    //   no answer by the op deadline (pingTimeoutMs) -> Timeout.
+    // Completion of the four new ops: value = objectId, aux = newVersion,
+    // payload = detail (or the ErrorResponse message).
+    static constexpr int kMaxDdlRedirects = 3;
+
+    OpResult dropTopic(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token);
+    OpResult dropView(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token);
+    /// Ruling 4: replaces the view's plan and output under the same objectId
+    /// (a fresh sink topic).  expectedVersion = the view object's version.
+    OpResult alterView(std::string_view name, std::string_view keyField, uint8_t persistence,
+                       uint32_t expectedVersion, std::span<const uint8_t> planBlob, const DdlOptions& ddl,
+                       CompletionTarget target, Token token);
+    /// Ruling 5: changes = (ConfigKey, value) pairs (retention / compaction keys only).
+    OpResult alterTopicConfig(std::string_view name, uint32_t expectedVersion,
+                              std::span<const rune::protocol::client::ConfigChangeWire> changes,
+                              const DdlOptions& ddl, CompletionTarget target, Token token);
+    /// DefineTopic with the catalog-history fields: an empty descriptorBlob is an
+    /// UNTYPED topic; TopicOptions carries replicationFactor + the topic config.
+    OpResult defineTopic(std::string_view name, uint32_t partitions, std::string_view keyField,
+                         std::span<const uint8_t> descriptorBlob, bool validate, Persistence persistence,
+                         const TopicOptions& topic, const DdlOptions& ddl, CompletionTarget target, Token token);
+    OpResult alterTopic(std::string_view name, uint16_t expectedVersion, std::span<const uint8_t> opsBlob,
+                        const DdlOptions& ddl, CompletionTarget target, Token token);
+    OpResult createView(std::string_view viewName, std::string_view keyField, uint8_t persistence,
+                        std::span<const uint8_t> planBlob, const DdlOptions& ddl, CompletionTarget target,
+                        Token token);
+
     /// Decoded ListTopics payload: (name, topicId) in definition order.
     [[nodiscard]] static std::vector<std::pair<std::string, int32_t>>
     decodeTopicList(std::span<const uint8_t> payload);
@@ -689,6 +779,30 @@ public:
     /// throws.
     ViewRowResult getViewRowAndWait(int32_t viewTopicId, uint64_t keyU64, uint64_t requestedFingerprint,
                                     std::chrono::nanoseconds timeout = kDefaultWaitTimeout);
+
+    // ---- Catalog history (Task 5): blocking DDL conveniences ----------------
+    // Pump-until-done wrappers over the token forms above.  A broker errorCode
+    // (incl. NotLeader past the budget / Redirect past kMaxDdlRedirects) is
+    // returned in the result with its detail; Timeout / NotConnected /
+    // SessionLost / Closed throw (as every *AndWait).
+    DefineTopicResult defineTopicAndWait(std::string_view name, uint32_t partitions, std::string_view keyField,
+                                         std::span<const uint8_t> descriptorBlob, bool validate,
+                                         Persistence persistence, const TopicOptions& topic,
+                                         const DdlOptions& ddl, std::chrono::milliseconds timeout);
+    AlterTopicResult alterTopicAndWait(std::string_view name, uint16_t expectedVersion,
+                                       std::span<const uint8_t> opsBlob, const DdlOptions& ddl,
+                                       std::chrono::milliseconds timeout);
+    CreateViewResult createViewAndWait(std::string_view viewName, std::string_view keyField, uint8_t persistence,
+                                       std::span<const uint8_t> planBlob, const DdlOptions& ddl,
+                                       std::chrono::milliseconds timeout);
+    DdlResult dropTopicAndWait(std::string_view name, const DdlOptions& ddl, std::chrono::milliseconds timeout);
+    DdlResult dropViewAndWait(std::string_view name, const DdlOptions& ddl, std::chrono::milliseconds timeout);
+    DdlResult alterViewAndWait(std::string_view name, std::string_view keyField, uint8_t persistence,
+                               uint32_t expectedVersion, std::span<const uint8_t> planBlob, const DdlOptions& ddl,
+                               std::chrono::milliseconds timeout);
+    DdlResult alterTopicConfigAndWait(std::string_view name, uint32_t expectedVersion,
+                                      std::span<const rune::protocol::client::ConfigChangeWire> changes,
+                                      const DdlOptions& ddl, std::chrono::milliseconds timeout);
 
     /// Topics successfully defined through this Client (Task 9 CLI), in
     /// definition order.  Duty-owned registry, read through a ListTopics op.
@@ -864,6 +978,31 @@ private:
     /// the group / txn libraries since F8c C4).
     using DutyTarget = detail::OpTarget;
 
+    // ---- Catalog history (Task 5): a pending DDL's retry state — one explicit
+    // state per phase, each holding exactly its variables (hard rule 3, F29).
+    // `redirects` counts the Redirect hops followed (> kMaxDdlRedirects fails);
+    // budgetEndNs = min(op deadline, first NotLeader + ddlRetryBudget).
+    /// Sent (or awaiting its first offer on the seed); no NotLeader seen yet.
+    struct DdlSent           { int redirects = 0; };
+    /// Re-sent after a NotLeader; awaiting its answer.
+    struct DdlNotLeaderSeen  { int redirects; int64_t budgetEndNs; int64_t backoffNs; };
+    /// Answered NotLeader; re-sent at resendAtNs (or, if refused then, every cycle after).
+    struct DdlAwaitingResend { int redirects; int64_t budgetEndNs; int64_t backoffNs; int64_t resendAtNs; };
+    /// Redirected (no NotLeader seen) to a node whose session cannot take the
+    /// frame yet (still connecting): re-offered every cycle until it does.
+    struct DdlHeldForNode    { int redirects; };
+    using DdlRetry = std::variant<std::monostate, DdlSent, DdlNotLeaderSeen, DdlAwaitingResend, DdlHeldForNode>;
+    /// The DDL ops (the seven that carry the DDL extension).
+    [[nodiscard]] static constexpr bool isDdlOp(OpKind op) noexcept {
+        return op == OpKind::DefineTopic || op == OpKind::AlterTopic || op == OpKind::CreateView ||
+               op == OpKind::DropTopic || op == OpKind::DropView || op == OpKind::AlterView ||
+               op == OpKind::AlterTopicConfig;
+    }
+    /// A DDL that is not in flight (its frame waits for the resend pump).
+    [[nodiscard]] static bool ddlWaitsForResend(const DdlRetry& r) noexcept {
+        return std::holds_alternative<DdlAwaitingResend>(r) || std::holds_alternative<DdlHeldForNode>(r);
+    }
+
     /// One pending control op (duty-thread owned; cold path).
     struct PendingCtl {
         int64_t              corrId     = 0;  // 0 for connect
@@ -873,6 +1012,10 @@ private:
         DutyTarget           target{};
         std::string          topicName;       // DefineTopic: for listTopics()
         std::vector<uint8_t> unsentFrame;     // transport said Retry: re-offered each cycle
+        // Catalog history (DDL ops only; monostate otherwise):
+        std::vector<uint8_t> frame;           // the encoded request, re-sent verbatim (stable requestId)
+        std::string          endpoint;        // the node it goes to ("" = the seed); a Redirect moves it
+        DdlRetry             retry{};
     };
 
     /// Header of a kMsgControlOp ring record (followed by the op's frame).
@@ -883,6 +1026,10 @@ private:
         CqRef             cqRef         = kNoCqRef;
         OpKind            op            = OpKind::Ping;
         uint8_t           pad           = 0;
+        // Catalog history (F14): offset of the DDL extension's requestId in the
+        // frame, stamped by the duty thread (instance id + its counter); 0 = the
+        // frame carries an explicit requestId (or is not a DDL).
+        uint32_t          requestIdAt   = 0;
     };
 
     /// A handler completion deferred while close() runs (delivered after every
@@ -1027,7 +1174,27 @@ private:
 
     // ---- F8c C3: control ops (duty-thread owned pending table) --------------
     OpResult issueControl_(OpKind op, CompletionTarget target, Token token,
-                           std::span<const uint8_t> frame, uint32_t payloadHint);
+                           std::span<const uint8_t> frame, uint32_t payloadHint, uint32_t requestIdAt = 0);
+    // ---- Catalog history (Task 5): DDL issue + answers (duty thread, cold) ----
+    /// The DDL extension of `ddl` (views into `ddl` / cfg_; requestId as given).
+    [[nodiscard]] rune::protocol::client::DdlExtension ddlExt_(const DdlOptions& ddl) const noexcept;
+    /// Issue an encoded DDL frame of `n` bytes whose extension is `ext`: the
+    /// duty thread stamps a generated requestId when ext.requestId is none().
+    OpResult issueDdl_(OpKind op, CompletionTarget target, Token token, std::span<const uint8_t> frame,
+                       const rune::protocol::client::DdlExtension& ext);
+    /// ErrorResponse{Redirect, endpoint} for pendingCtl_[i] (a DDL).
+    void onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t nowNs);
+    /// NotLeader (ErrorResponse or a response's errorCode 2) for pendingCtl_[i] (a DDL).
+    void onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t nowNs);
+    /// Offer p.frame to p.endpoint's node (the seed when "").
+    transport::AeronTransport::OfferResult offerDdl_(PendingCtl& p, int64_t nowNs);
+    /// Move p to `next`, keeping ddlAwaitingResend_ exact.
+    void setDdlRetry_(PendingCtl& p, DdlRetry next) noexcept;
+    /// Complete pendingCtl_[i] (a DDL) as a terminal failure with `code` / `detail`.
+    void failDdl_(std::size_t i, uint16_t code, std::string_view detail, int64_t value = 0, int64_t aux = 0);
+    /// Duty cycle: re-offer every DDL whose resend is due (NotLeader backoff
+    /// elapsed, or held for a connecting node); fail one whose budget ran out.
+    int resendDueDdl_(int64_t nowNs);
     void applyControlOpRecord_(const uint8_t* rec, std::size_t len);
     void applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> frame);
     void completeCtl_(PendingCtl& p, OpStatus st, int64_t value = 0, int64_t aux = 0,
@@ -1329,6 +1496,12 @@ private:
     // ---- F8c C3: control ops (duty-thread owned; PendingX maps + mtx_ gone) --
     int64_t                 nextCorrId_ = 1;           // duty-owned correlation counter
     std::vector<PendingCtl> pendingCtl_;               // ping / define / get, by corrId (linear: cold)
+    // Catalog history (F14): this Client's random 64-bit instance id (drawn once
+    // at construction, never 0; immutable) and the duty thread's DDL counter.
+    static uint64_t         drawClientInstanceId_();   // std::random_device, 2 x 32 bits, redrawn while 0
+    const uint64_t          clientInstanceId_ = drawClientInstanceId_();
+    uint64_t                requestCounter_ = 0;       // duty thread only
+    int                     ddlAwaitingResend_ = 0;    // pending DDLs in a ddlWaitsForResend() state
     PendingCtl              pendingConnect_;           // at most one connect
     bool                    hasPendingConnect_ = false;
     uint32_t                unsentCtl_ = 0;            // entries holding an unsent frame
