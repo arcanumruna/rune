@@ -116,3 +116,100 @@ TEST(TransientDataPathRegression, UnregisteredTransientPartitionIsNotLeaderRegre
     EXPECT_EQ(rig.produce(b, /*acks=*/1), kNotLeader);
     EXPECT_EQ(rig.mem.logEndOffset(), 0) << "an uncommitted / unowned transient partition was appended to";
 }
+
+// ---------------------------------------------------------------------------
+// Task 5: push reads served from the ring; the evicted cursor (TRANSIENT_EVICTED);
+// read_committed; ownership moves.
+// ---------------------------------------------------------------------------
+TEST(TransientDataPathRegression, PushReadServesTheRingRegression) {
+    Rig rig;
+    ASSERT_EQ(rig.produce(batchOf(3, 100), 0), kOk);
+    ASSERT_EQ(rig.produce(batchOf(3, 100), 0), kOk);
+    const auto r = rig.readOnce(/*subId=*/7, /*from=*/0);
+    ASSERT_TRUE(r.has_value()) << "no PushReadResult";
+    ASSERT_FALSE(r->chunk.empty()) << "a transient PushRead was left unanswered (no disk Log)";
+    EXPECT_EQ(r->pushEffectiveBound(), 6);
+    EXPECT_EQ(r->newNextOffset, 6);
+    std::size_t pos = 0;
+    int64_t expect = 0;
+    while (pos < r->chunk.size()) {
+        rune::protocol::RecordBatchReader b(r->chunk.data() + pos, r->chunk.size() - pos);
+        ASSERT_GT(b.totalLength(), 0);
+        EXPECT_EQ(b.baseOffset(), expect);
+        expect = b.baseOffset() + b.lastOffsetDelta() + 1;
+        pos += static_cast<std::size_t>(b.totalLength());
+    }
+    EXPECT_EQ(expect, 6) << "whole contiguous batches from the cursor";
+}
+
+TEST(TransientDataPathRegression, PushReadBelowRingStartResumesAtRingStartRegression) {
+    Rig rig(/*ringBytes=*/8 * 1024, /*maxBatches=*/1000);
+    for (int i = 0; i < 20; ++i) ASSERT_EQ(rig.produce(batchOf(1, 1000), 0), kOk);
+    const int64_t start = rig.mem.logStartOffset();
+    ASSERT_GT(start, 0) << "precondition: the ring evicted committed records (retention)";
+    const auto r = rig.readOnce(9, /*from=*/0);   // a consumer that fell behind the ring
+    ASSERT_TRUE(r.has_value());
+    ASSERT_FALSE(r->chunk.empty()) << "a cursor below the ring start stalled";
+    EXPECT_EQ(rune::protocol::RecordBatchReader(r->chunk.data(), r->chunk.size()).baseOffset(), start);
+    EXPECT_EQ(rig.worker().transientCursorSkipsForTest(), 1u);
+    EXPECT_EQ(rig.worker().transientRecordsSkippedForTest(), static_cast<uint64_t>(start));
+}
+
+TEST(TransientDataPathRegression, ReadCommittedHoldsTheOpenTransactionUntilItsCommitRegression) {
+    Rig rig;
+    constexpr int64_t kPid = 7;
+    const auto txn = batchOf(1, 50, kPid, /*epoch=*/0, /*seq=*/0, /*txn=*/true);
+    int16_t code = -1;
+    int64_t base = -1;
+    for (int i = 0; i < 64 && code != kOk; ++i)   // NotLeader while the RC state builds (retriable)
+        code = rig.produce(txn, /*acks=*/0, &base, kPid, 0, 0);
+    ASSERT_EQ(code, kOk);
+    ASSERT_EQ(base, 0);
+
+    const auto open = rig.readOnce(21, 0, /*read_committed=*/1);
+    ASSERT_TRUE(open.has_value());
+    EXPECT_TRUE(open->chunk.empty()) << "an OPEN transaction leaked to read_committed";
+    EXPECT_EQ(open->pushEffectiveBound(), 0) << "the LSO pins at the open transaction's first offset";
+
+    rig.marker(/*token=*/3, kPid, /*commit=*/true);
+    int16_t mcode = -1;
+    for (int i = 0; i < 64 && mcode == -1; ++i) {
+        rig.pass();
+        rig.pool.drainAllReturns([&](WorkerReturn r) {
+            if (r.type == WorkerReturn::Type::ControlRecordAppended && r.correlationId == 3) mcode = r.errorCode;
+        });
+    }
+    ASSERT_EQ(mcode, kOk);
+
+    const auto committed = rig.readOnce(22, 0, 1);
+    ASSERT_TRUE(committed.has_value());
+    ASSERT_FALSE(committed->chunk.empty()) << "the committed transaction was never delivered";
+    rune::protocol::RecordBatchReader b(committed->chunk.data(), committed->chunk.size());
+    EXPECT_EQ(b.baseOffset(), 0);
+    EXPECT_EQ(static_cast<std::size_t>(b.totalLength()), committed->chunk.size()) << "a marker was delivered";
+    EXPECT_EQ(committed->newNextOffset, 2) << "the cursor passes the marker";
+}
+
+TEST(TransientDataPathRegression, DeferredPushReadAfterOwnershipMovedNeverReadsTheRingRegression) {
+    Rig rig;   // 4 MiB ring
+    const auto b = batchOf(4, 1000);
+    for (int i = 0; i < 300; ++i) ASSERT_EQ(rig.produce(b, 0), kOk);   // ~1.2 MiB: several passes of push budget
+    for (int s = 0; s < 4; ++s) rig.pushRead(200 + s, 0);
+    rig.pass();
+    ASSERT_GT(rig.worker().deferredPushReadsForTest(), 0u) << "precondition: reads deferred";
+    int answeredWithData = 0;
+    rig.pool.drainAllReturns([&](WorkerReturn r) {
+        if (r.type == WorkerReturn::Type::PushReadResult && !r.chunk.empty()) ++answeredWithData;
+    });
+    rig.worker().setOwnedDirect({});   // the partition moved to another worker
+    for (int k = 0; k < 4; ++k) rig.pass();
+    int unanswered = 0;
+    rig.pool.drainAllReturns([&](WorkerReturn r) {
+        if (r.type != WorkerReturn::Type::PushReadResult) return;
+        EXPECT_TRUE(r.chunk.empty()) << "read a ring this worker no longer owns (a cross-thread read)";
+        EXPECT_EQ(r.pushEffectiveBound(), -1);
+        ++unanswered;
+    });
+    EXPECT_EQ(answeredWithData + unanswered, 4);
+    EXPECT_EQ(rig.worker().deferredPushReadsForTest(), 0u);
+}

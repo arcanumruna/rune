@@ -2806,7 +2806,7 @@ private:
             const std::size_t si = (pushRotor_ + k) % nSubs;
             auto& s = subs_[si];
             if (pushBudgetLeft_ == 0) { pushRotor_ = si; break; }
-            if (!s.logPtr || !s.active) continue;   // parked: partition moved away
+            if (!s.active) continue;   // parked: partition moved away (E2: the source is resolved below)
 
             // Hybrid egress: prefer this consumer's UNICAST pub (independent
             // per-consumer offsets); fall back to the shared MDC pub (broadcast).
@@ -2857,6 +2857,12 @@ private:
             // Not Ready (§2.3): skip this subscription this pass.
             auto* rep = subReplica_(s);
             if (s.incarnation != 0 && !rep) continue;   // not owned (defensive: active implies owned)
+            // Phase 2b E2: a TRANSIENT partition's source is the owned replica's
+            // ring (the Subscribe op carried no disk Log); no source → nothing to push.
+            rune::storage::InMemoryLog* const mem =
+                (s.logPtr == nullptr && rep != nullptr) ? rep->memoryLog() : nullptr;
+            if (s.logPtr == nullptr && mem == nullptr) continue;
+            if (mem != nullptr) s.nextOffset = skipEvictedCursor_(*mem, s.nextOffset);   // TRANSIENT_EVICTED
             int64_t bound = rep ? rep->highWatermark()
                                 : s.logPtr->logEndOffset();
             const RcState* rc = nullptr;
@@ -2873,8 +2879,10 @@ private:
             // segment read mmap — stopping near the bound (D26).  noexcept (F3):
             // a failed read is an empty view (retry next pass; an I/O error is
             // counted + logged, never retried through the mapping).
-            const rune::storage::LogReadView view = readNoFault_(
-                s.logPtr, s.nextOffset, std::min<std::size_t>(kPushMaxChunkBytes, pushBudgetLeft_), bound);
+            const std::size_t readCap = std::min<std::size_t>(kPushMaxChunkBytes, pushBudgetLeft_);
+            const rune::storage::LogReadView view =
+                s.logPtr != nullptr ? readNoFault_(s.logPtr, s.nextOffset, readCap, bound)
+                                    : mem->readView(s.nextOffset, static_cast<int32_t>(readCap));   // E2: zero-copy ring view
             if (view.empty()) continue;
 
             std::size_t pos = 0;
@@ -3228,7 +3236,17 @@ private:
         servePushRead_(a, /*mayHold=*/true);
     }
 
-    void servePushRead_(const PushReadArgs& a, bool mayHold) {
+    void servePushRead_(const PushReadArgs& in, bool mayHold) {
+        PushReadArgs a = in;   // Phase 2b E2: the cursor may move up (TRANSIENT_EVICTED) — a stack copy
+        rune::storage::Log* log = a.logPtr;
+        // Phase 2b E2: a TRANSIENT partition has no disk Log — its source is the
+        // owning replica's InMemoryLog.  a.replica is THIS worker's replica here:
+        // PushRead is ownership-gated, and a deferred / held read whose partition
+        // moved away is re-served with replica == nullptr (beginPushPass_,
+        // serveHeldPushReads_) — never a ring this worker does not own.
+        rune::storage::InMemoryLog* const mem =
+            (log == nullptr && a.replica != nullptr) ? a.replica->memoryLog() : nullptr;
+        if (mem != nullptr) a.nextOffset = skipEvictedCursor_(*mem, a.nextOffset);
         const int32_t topicId    = a.topicId;
         const int32_t partition  = a.partition;
         const int64_t nextOffset = a.nextOffset;
@@ -3246,9 +3264,8 @@ private:
         ret.groupCarrierReceived = a.carrier;
         ret.setPushEffectiveBound(-1);   // N5: unanswered unless a path below answers explicitly
 
-        rune::storage::Log* log = a.logPtr;
-        if (!log) {
-            // No log: an UNANSWERED read (review I-1) — the gateway re-issues it
+        if (!log && !mem) {
+            // No source: an UNANSWERED read (review I-1) — the gateway re-issues it
             // and never parks the subscription on it.
             ret.setPushEffectiveBound(-1);
             enqueueReturn_(ret);
@@ -3308,7 +3325,7 @@ private:
         // clamped on the fly (bound, markers, aborted batches), within this
         // pass's push byte budget.
         if (nextOffset < bound) {
-            switch (readPushChunk_(a, ret, log, bound, rc)) {
+            switch (readPushChunk_(a, ret, log, mem, bound, rc)) {
             case PushChunk::Written:
                 return;                         // answered in place (ret_ slot)
             case PushChunk::Deferred:
@@ -3350,8 +3367,8 @@ private:
     //              (the read is idempotent — nothing consumed);
     //   TooLarge — the first deliverable batch alone exceeds the ring's max message.
     enum class PushChunk : uint8_t { Written, Empty, Deferred, TooLarge };
-    PushChunk readPushChunk_(const PushReadArgs& a, WorkerReturn& ret, rune::storage::Log* log, int64_t bound,
-                             const RcState* rc) {
+    PushChunk readPushChunk_(const PushReadArgs& a, WorkerReturn& ret, rune::storage::Log* log,
+                             rune::storage::InMemoryLog* mem, int64_t bound, const RcState* rc) {
         using rune::protocol::RecordBatchReader;
         namespace b = rune::protocol::batch;
         if (pushBudgetLeft_ == 0) return PushChunk::Deferred;
@@ -3362,7 +3379,11 @@ private:
         // segment read mmap — stopping near the bound (D26).  noexcept (F3): a
         // failed read is an empty view — answered empty, the gateway retries
         // next cycle.
-        const rune::storage::LogReadView v = readNoFault_(log, a.nextOffset, cap, bound);
+        // Phase 2b E2: a TRANSIENT partition reads a zero-copy view of its ring
+        // (same thread, no syscall); the bound clamp below applies unchanged.
+        const rune::storage::LogReadView v =
+            log != nullptr ? readNoFault_(log, a.nextOffset, cap, bound)
+                           : mem->readView(a.nextOffset, static_cast<int32_t>(cap));
         if (v.empty()) return PushChunk::Empty;
         const bool preCarrier = a.isGroup && !a.carrier;
         std::size_t rd = 0, nRuns = 0, total = 0;
@@ -3468,12 +3489,31 @@ private:
                 a.replica = r;
                 a.logPtr  = r->isDiskBacked() ? r->log() : nullptr;
             } else {
-                a.logPtr = nullptr;   // never read a log this worker no longer owns → unanswered
+                // Never read a log — or (E2) a transient ring, found through the
+                // replica — this worker no longer owns → unanswered.
+                a.logPtr  = nullptr;
+                a.replica = nullptr;
             }
             servePushRead_(a, /*mayHold=*/true);
             ++n;
         }
         return n;
+    }
+
+    // Phase 2b E2 — TRANSIENT_EVICTED: the ring evicted committed records this
+    // reader had not read yet (the in-memory retention).  The cursor resumes AT
+    // the ring start — counted, logged first + every power of two — never a
+    // stall on an offset the ring no longer holds.  Disk logs never take this.
+    [[nodiscard]] int64_t skipEvictedCursor_(const rune::storage::InMemoryLog& mem, int64_t cursor) noexcept {
+        const int64_t start = mem.logStartOffset();
+        if (cursor >= start) [[likely]] return cursor;
+        ++transientCursorSkips_;
+        transientRecordsSkipped_ += static_cast<uint64_t>(start - cursor);
+        if ((transientCursorSkips_ & (transientCursorSkips_ - 1)) == 0)
+            spdlog::warn("Worker {}: a reader of a transient partition fell behind its ring: cursor {} < ring "
+                         "start {} — resumed at {} (skips={}, records skipped={})", workerId_, cursor, start,
+                         start, transientCursorSkips_, transientRecordsSkipped_);
+        return start;
     }
 
     // #65: the worker's push reads.  First-touch page faults on a segment read
@@ -5113,7 +5153,8 @@ private:
                 if (r->isDiskBacked()) a.logPtr = r->log();
                 servePushRead_(a, /*mayHold=*/false);
             } else {
-                a.logPtr = nullptr;   // never read a log this worker no longer owns
+                a.logPtr  = nullptr;   // never read a log this worker no longer owns
+                a.replica = nullptr;   // E2: nor its ring (a transient read finds it through the replica)
                 servePushRead_(a, false);   // → unanswered: the gateway re-issues to the new owner
             }
             ++n;
