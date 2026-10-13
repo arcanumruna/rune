@@ -9,6 +9,7 @@
 // the legacy gateway this answered UnknownPartition (8) before E2.
 #include "support/OwnerThreadTestHelpers.h"
 #include "support/ShardTestClient.h"
+#include "support/TransientMatrixExpectations.h"
 
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
@@ -21,6 +22,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -321,4 +323,201 @@ TEST(TransientTopicDataPathRegression, LegacyRuntimeTransientDefineThenProduceAn
         EXPECT_EQ(pushedAt(c, 0), 1u);
     }
     node.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b E2 interaction matrix — the BrokerNode slice: both worker modes x
+// {3 produce acks, 3 subscribe starts} x {Steady, EvictedCursor, Restart,
+// CommitLandsMidOp} over REAL Aeron (48 cells; shard = produce on the worker's
+// ingress, Records pushed by the worker's owned subscriptions — the loop the
+// unit matrix cannot reach), plus LeaderMovesMidOp on 3 nodes.  Outcomes from
+// support/TransientMatrixExpectations.h (alias `mx`: `tm` collides with struct tm).
+// ---------------------------------------------------------------------------
+namespace {
+namespace mx = rune::node::test::tmatrix;
+
+std::vector<uint8_t> valueBatch(int records, std::size_t valueBytes) {
+    rune::protocol::RecordBatchBuilder b(0, 1000);
+    const std::string v(valueBytes, 'v');
+    for (int i = 0; i < records; ++i) b.append("k", v, 1000 + i);
+    return b.build();
+}
+
+struct SliceParam {
+    mx::Mode   mode;
+    mx::Timing timing;
+};
+std::string sliceName(const testing::TestParamInfo<SliceParam>& i) {
+    return std::string(i.param.mode == mx::Mode::Shard ? "Shard" : "Legacy") + "_" +
+           std::string(mx::name(i.param.timing));
+}
+
+/// The first base a subscription created after `known` delivered (polls; -1 = none).
+int64_t firstOfNewSubscription(ShardTestClient& c, const std::set<int64_t>& known, int64_t* subOut = nullptr) {
+    int64_t first = -1;
+    (void)c.pollUntil([&] {
+        for (const auto& r : c.records())
+            if (!known.count(r.subscriptionId)) { first = r.baseOffset; if (subOut) *subOut = r.subscriptionId; return true; }
+        return false;
+    });
+    return first;
+}
+std::set<int64_t> knownSubscriptions(const ShardTestClient& c) {
+    std::set<int64_t> s;
+    for (const auto& r : c.records()) s.insert(r.subscriptionId);
+    return s;
+}
+} // namespace
+
+class TransientSliceRegression : public testing::TestWithParam<SliceParam> {};
+
+TEST_P(TransientSliceRegression, ProduceAndSubscribeCells) {
+    const auto [mode, timing] = GetParam();
+    const bool shard = mode == mx::Mode::Shard;
+    const bool evict = timing == mx::Timing::EvictedCursor;
+    const mx::Commit commit = timing == mx::Timing::CommitLandsMidOp ? mx::Commit::Uncommitted : mx::Commit::Committed;
+    const mx::Entity e{mx::Persist::Transient, mode, mx::Role::Leader, commit};
+    TmpDir dir{"slice"}, c1{"slice_c1"}, c2{"slice_c2"};
+    const auto ports = Ports::discover(1);
+    const NodeConfig cfg = makeConfig(0, dir.path, ports, 1, shard, /*ringBytes=*/evict ? 16 * 1024 : 0);
+    auto node = std::make_unique<BrokerNode>(cfg);
+    node->start();
+    ASSERT_TRUE(node->awaitLeader(10'000ms));
+    auto client = std::make_unique<ShardTestClient>(c1.path);
+    int64_t sid = client->connect(gatewayChannel(ports, 0), kClientStream);
+    ASSERT_GT(sid, 0);
+    int32_t tid = 0;   // the static "tt" (makeConfig)
+    if (commit == mx::Commit::Uncommitted) {
+        // CommitLandsMidOp over a real node: the uncommitted window is internal (the DDL OK
+        // is held until the topic serves — DdlAnswerGate, C1); the cell asserts the first op
+        // after the OK is served, never refused for good (OkAfterCommit).
+        tid = defineTransient(*client, gatewayChannel(ports, 0), sid, "tt_slice_rt");
+        ASSERT_GE(tid, 0);
+    }
+    const std::string produceCh = shard ? workerIngressChannel(ports, 0) : gatewayChannel(ports, 0);
+    std::vector<int64_t> acked;   // acked batch bases (2 records each)
+    auto produce = [&](uint8_t acks, std::size_t valueBytes) -> std::optional<int64_t> {
+        auto ack = client->produceUntilOk(produceCh, kClientStream, sid, tid, 0, acks, valueBatch(2, valueBytes));
+        if (!ack) return std::nullopt;
+        acked.push_back(ack->baseOffset);
+        return ack->baseOffset;
+    };
+    // The timing's preconditions.
+    for (int i = 0; i < (evict ? 40 : 2); ++i) ASSERT_TRUE(produce(0, evict ? 1000 : 8).has_value());
+    if (timing == mx::Timing::Restart) {
+        client.reset();
+        node->stop();
+        node.reset();
+        node = std::make_unique<BrokerNode>(cfg);
+        node->start();
+        ASSERT_TRUE(node->awaitLeader(10'000ms));
+        client = std::make_unique<ShardTestClient>(c2.path);
+        sid = client->connect(gatewayChannel(ports, 0), kClientStream);
+        ASSERT_GT(sid, 0);
+        acked.clear();   // the ring restarted empty
+    }
+
+    // ---- 3 produce cells ------------------------------------------------------
+    for (mx::Op op : {mx::Op::ProduceAcks0, mx::Op::ProduceAcks1, mx::Op::ProduceAcksAll}) {
+        const mx::Outcome want = mx::expect(op, e, timing);
+        SCOPED_TRACE(std::string(mx::name(op)) + " expect " + std::string(mx::name(want)));
+        const int64_t expectBase = acked.empty() ? 0 : acked.back() + 2;
+        const auto base = produce(mx::wireAcks(op), 8);
+        ASSERT_TRUE(base.has_value()) << "a transient produce was never acked";
+        EXPECT_EQ(*base, expectBase) << "not contiguous with the acked history";
+        if (want == mx::Outcome::OkEmptyAfterRestart && op == mx::Op::ProduceAcks0)
+            EXPECT_EQ(*base, 0) << "a transient topic restarted non-empty";
+    }
+
+    // ---- 3 subscribe cells ----------------------------------------------------
+    for (mx::Op op : {mx::Op::SubEarliest, mx::Op::SubLatest, mx::Op::SubOffset}) {
+        const mx::Outcome want = mx::expect(op, e, timing);
+        SCOPED_TRACE(std::string(mx::name(op)) + " expect " + std::string(mx::name(want)));
+        const auto known = knownSubscriptions(*client);
+        const int64_t hwBefore = acked.back() + 2;   // every acked record is committed (single node)
+        const int64_t from = op == mx::Op::SubEarliest ? -2 : op == mx::Op::SubLatest ? -1 : 3;
+        ASSERT_TRUE(client->subscribe(gatewayChannel(ports, 0), kClientStream, sid, tid, 0, from));
+        if (op == mx::Op::SubLatest) {
+            // Latest never replays: produce until the new subscription delivers; its FIRST batch is new.
+            int64_t first = -1;
+            for (int i = 0; i < 20 && first < 0; ++i) {
+                ASSERT_TRUE(produce(1, 8).has_value());
+                first = firstOfNewSubscription(*client, known);
+            }
+            ASSERT_GE(first, 0) << "the latest subscription never delivered";
+            EXPECT_GE(first, hwBefore) << "Latest replayed an old record";
+            continue;
+        }
+        const int64_t first = firstOfNewSubscription(*client, known);
+        ASSERT_GE(first, 0) << "the subscription delivered nothing (a stall)";
+        switch (want) {
+        case mx::Outcome::OkFromRingStart:   // resumed at the ring start (> the cursor), never a stall
+            EXPECT_GT(first, op == mx::Op::SubEarliest ? 0 : 3) << "read an evicted offset?";
+            EXPECT_LE(first, acked.back());
+            break;
+        default:                             // Ok / OkEmptyAfterRestart / OkAfterCommit
+            EXPECT_EQ(first, op == mx::Op::SubEarliest ? acked.front() : int64_t{2})
+                << "whole-batch delivery from the batch containing the cursor";
+            break;
+        }
+    }
+    client.reset();
+    node->stop();
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Cells, TransientSliceRegression,
+    testing::Values(SliceParam{mx::Mode::Shard, mx::Timing::Steady}, SliceParam{mx::Mode::Legacy, mx::Timing::Steady},
+                    SliceParam{mx::Mode::Shard, mx::Timing::EvictedCursor},
+                    SliceParam{mx::Mode::Legacy, mx::Timing::EvictedCursor},
+                    SliceParam{mx::Mode::Shard, mx::Timing::Restart}, SliceParam{mx::Mode::Legacy, mx::Timing::Restart},
+                    SliceParam{mx::Mode::Shard, mx::Timing::CommitLandsMidOp},
+                    SliceParam{mx::Mode::Legacy, mx::Timing::CommitLandsMidOp}),
+    sliceName);
+
+// LeaderMovesMidOp on 3 nodes (shard): acks=all records acked before the partition
+// leader stops are all on the new leader — the next produce lands right after them
+// (no gap, nothing lost) and a subscription from earliest on the new leader gets
+// every one of them.  ProduceAcksAll: RetriableNotLeader then Ok (produceUntilOk
+// retries); SubEarliest on the new leader: Ok.
+TEST(TransientSliceRegression, ThreeNodeLeaderMovesMidOpLosesNoAckedRecordRegression) {
+    TmpDir d0{"lm0"}, d1{"lm1"}, d2{"lm2"}, cdir{"lmc"};
+    const auto ports = Ports::discover(3);
+    std::unique_ptr<BrokerNode> nodes[3];
+    const TmpDir* dirs[3] = {&d0, &d1, &d2};
+    for (int i = 0; i < 3; ++i) nodes[i] = std::make_unique<BrokerNode>(makeConfig(i, dirs[i]->path, ports, 3, true));
+    for (auto& n : nodes) n->start();
+    ASSERT_TRUE(nodes[0]->awaitLeader(15'000ms));
+    ShardTestClient c(cdir.path);
+    auto leaderVia = [&](int gwNode, int notThis) {
+        const int64_t s = c.connect(gatewayChannel(ports, gwNode), kClientStream);
+        for (int i = 0; s > 0 && i < 400; ++i) {
+            for (const auto& pi : c.metadata(gatewayChannel(ports, gwNode), kClientStream, s))
+                if (pi.topicId == 0 && pi.partition == 0 && pi.leaderId >= 0 && pi.leaderId != notThis)
+                    return static_cast<int>(pi.leaderId);
+            std::this_thread::sleep_for(50ms);   // metadata settling (poll interval)
+        }
+        return -1;
+    };
+    const int leader = leaderVia(0, -1);
+    ASSERT_GE(leader, 0);
+    const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
+    ASSERT_GT(sid, 0);
+    for (int b = 0; b < 5; ++b)
+        ASSERT_TRUE(c.produceUntilOk(workerIngressChannel(ports, leader), kClientStream, sid, 0, 0, /*acks=all*/1,
+                                     makeBatch(2)).has_value());
+    nodes[leader]->stop();        // the partition leader goes away mid-stream
+    nodes[leader].reset();
+    const int survivor = (leader + 1) % 3;
+    const int next = leaderVia(survivor, leader);
+    ASSERT_GE(next, 0) << "no new partition leader";
+    const int64_t sidN = c.connect(gatewayChannel(ports, next), kClientStream);
+    ASSERT_GT(sidN, 0);
+    const auto ack = c.produceUntilOk(workerIngressChannel(ports, next), kClientStream, sidN, 0, 0, 1, makeBatch(2));
+    ASSERT_TRUE(ack.has_value()) << "the new leader never took a produce";
+    EXPECT_EQ(ack->baseOffset, 10) << "an acks=all record acked by the old leader is missing on the new one";
+    ASSERT_TRUE(c.subscribe(gatewayChannel(ports, next), kClientStream, sidN, 0, 0, /*Earliest=*/-2));
+    ASSERT_TRUE(c.pollUntil([&] { return pushedAt(c, 10) >= 1; }));
+    for (int64_t b : {0, 2, 4, 6, 8}) EXPECT_GE(pushedAt(c, b), 1u) << "acked batch " << b << " lost in the failover";
+    for (auto& n : nodes) if (n) n->stop();
 }
