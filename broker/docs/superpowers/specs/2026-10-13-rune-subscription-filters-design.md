@@ -1,6 +1,6 @@
 # Rune Phase 2c — Subscription filters (DRAFT, awaiting user review)
 
-**Status:** draft for review. Scheduled after Phase 2b Part A.
+**Status:** draft; the open questions are resolved (§13). It awaits the user's final approval. Scheduled after Phase 2b Part A.
 **Repos:** rune-codec (generator), rune-protocol (Subscribe filter field), rune-broker (evaluation and push), rune-client-cpp (API and encoder), rune-ql (`WHERE` → filter, later with Part D's console).
 
 ## 1. Goal
@@ -44,7 +44,7 @@ A subscription is **which partitions** plus an **optional filter**.
 
 - Code without a filter behaves exactly as today, byte for byte on the wire.
 - `subscribe(topic, key)` keeps its meaning: it delivers **the whole partition** that the key hashes to. For exactly one key's records on a typed topic with a key field, combine the two: `subscribe(topic, key, opts.filter(E::Filter{ .playerId = key }))`. The partition selection keeps the broker to one partition, and the filter keeps it to one key. The documentation states this explicitly, because the partition-wide meaning of `subscribe(topic, key)` has surprised users.
-- A consumer group's filter is **per member**. Members of one group may use different filters, but a group usually shares one. Committed offsets stay log offsets (§7).
+- A consumer group has **one filter**, shared by every member (§13.3). A member with a different filter is rejected with an explicit error. Committed offsets stay log offsets (§7).
 
 ## 4. API: a functional definition, checked at compile time
 
@@ -175,6 +175,7 @@ All tables and slabs are sized from the configuration and preallocated. Steady s
 | A filter on an untyped topic | `InvalidRequest` (39), detail "filter needs a typed topic" |
 | A malformed encoding, an unknown tag, a type mismatch, a var-len or float field, a limit exceeded | `InvalidRequest` (39), detail naming the term index |
 | A filter-index or slab capacity cap is reached | `InvalidRequest` (39), detail "filter capacity"; a config knob, documented |
+| A group member whose filter differs from the group's | `InvalidRequest` (39) at JoinGroup, detail "group filter mismatch" (§13.3) |
 | A broker that predates filters | refused at session version negotiation (§5) |
 
 The client surfaces each of these as a failed `Subscription` with the error. It never quietly falls back to an unfiltered subscription.
@@ -219,8 +220,13 @@ Every cell is covered by a parameterized unit matrix. Shared-state paths get a s
 
 The compiled filter (term list, plus the per-version accessor table) is the **Filter** operator that the view-engine spec lists as a follow-on: a predicate that drops records before the fold. Phase 2c builds it as a standalone component owned by the push point, so a later view-source filter reuses it unchanged.
 
-## 13. Open questions for review
+## 13. Decisions (user review, 2026-10-13)
 
-1. **Position-note cadence on quiet filters.** The defaults are 50 ms or 64 Ki skipped records. Is that the right trade-off between commit freshness and noise?
-2. **Capacity caps.** What are the default limits for filtered subscriptions per partition and distinct index values per partition, given the expected number of world servers?
-3. **Group members with differing filters.** Allowed (proposed), or should every member of a group be required to send the same filter?
+1. **Position-note cadence on quiet filters:** keep the defaults: every 50 ms or every 64 Ki skipped records, whichever comes first. Both are configurable.
+2. **Capacity caps:** preallocated from config.
+   - The defaults are 4,096 filtered subscriptions per partition and 4,096 distinct index values per partition. That is ample for hundreds of world servers.
+   - Exceeding a cap answers the Subscribe explicitly (§9).
+3. **Consumer groups require one filter.**
+   - Every member of a group must send byte-identical filter bytes; the canonical encoding (§5) makes equal filters identical.
+   - The first member to join fixes the group's filter. The filter can change only once the group is empty.
+   - A member whose filter differs is rejected at JoinGroup with `InvalidRequest` (39), detail "group filter mismatch: the group uses filter <hex>". It is never admitted.
