@@ -2998,6 +2998,32 @@ bool ClientGateway::readCommittedServableHere_(int32_t topicId, int32_t partitio
     return !v || v.publishedLeader();
 }
 
+bool ClientGateway::retireReadCommittedMovedAway_(int64_t subId, Subscription& sub)
+{
+    Session* session = sessions_.find(sub.sessionId);
+    if (session == nullptr) return false;   // dies with its session (dropSessionSubscriptions_)
+    pc::ErrorResponse err;
+    err.sessionId     = sub.sessionId;
+    err.correlationId = sub.subscribeCorrId;
+    err.code          = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+    static_assert(pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 <= kScratchSize,
+                  "scratch too small for a bare ErrorResponse");
+    const std::size_t encoded = err.encode(scratch_.data());
+    sendAnswer_(*session, scratch_.data(), encoded);   // queued + retried, never best-effort
+    if (perWorkerEgressActive_ && workerPool_)
+        forwardUnsubscribeToWorker_(subId, sub.topicId, sub.partition);   // the worker drops its cursor
+    pendingWorkerReads_.erase(subId);   // a PushRead in flight answers a sub that is gone (ignored)
+    if (const auto ix = session->subIdByKey.find(Session::SubKey{sub.subscribeCorrId, sub.topicId, sub.partition});
+        ix != session->subIdByKey.end() && ix->second == subId)
+        session->subIdByKey.erase(ix);
+    ++readCommittedMovedAway_;
+    spdlog::info("ClientGateway: read_committed subscription {} (sessionId={} topicId={} partition={} "
+                 "nextOffset={}) — this node no longer leads the partition: NotLeader, dropped (the client "
+                 "re-subscribes from its position on the leader)",
+                 subId, sub.sessionId, sub.topicId, sub.partition, sub.nextOffset);
+    return true;
+}
+
 bool ClientGateway::handleProduce(const uint8_t* buf, std::size_t len)
 {
     // 1. Decode Produce.
@@ -4540,7 +4566,25 @@ void ClientGateway::pushSubscriptions()
     ++pushCycle_;   // F15 S4 fix round 1: the backoff clock (cycles, never wall time)
     if (subscriptions_.empty()) return;
 
-    for (auto& [subId, sub] : subscriptions_) {
+    // Task 11 carry (E2 Task 13): a plain read_committed subscription whose
+    // partition this node no longer leads is answered NotLeader and dropped —
+    // both worker modes (checked BEFORE the per-worker-egress skip: the owning
+    // worker cannot tell the client, it only stops pushing).  Swept only on a
+    // routed role change (one compare per pass otherwise).
+    const bool rcSweep = replicaRegistry_ != nullptr && replicaRegistry_->roleChanges() != seenRcSweepRoleChanges_;
+    if (rcSweep) [[unlikely]] seenRcSweepRoleChanges_ = replicaRegistry_->roleChanges();
+    for (auto subIt = subscriptions_.begin(); subIt != subscriptions_.end(); ) {
+        const int64_t subId = subIt->first;
+        Subscription& sub   = subIt->second;
+        if (rcSweep && sub.isolation == static_cast<uint8_t>(rune::transaction::IsolationLevel::ReadCommitted) &&
+            !sub.isGroup && sub.topicId >= 0 && !sub.failed) [[unlikely]] {
+            if (!readCommittedServableHere_(sub.topicId, sub.partition) &&
+                retireReadCommittedMovedAway_(subId, sub)) {
+                subIt = subscriptions_.erase(subIt);
+                continue;
+            }
+        }
+        ++subIt;
         // read-rework T3/T4 (I3b): when per-worker egress is active the OWNING worker
         // reads+encodes+pushes user partitions on its own dynamic-MDC egress — the
         // gateway must NOT also push them (that would double-deliver).  Internal

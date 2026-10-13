@@ -538,3 +538,48 @@ TEST(TransientGatewayRegression, ReadCommittedGroupSubscriptionOnAFollowerIsRefu
     ASSERT_TRUE(r.errors.count(0));
     EXPECT_EQ(r.errors[0], kNotLeader);
 }
+
+// ---------------------------------------------------------------------------
+// Task 11 carry (E2 Task 13): a read_committed subscription ACCEPTED while this
+// node led the partition, which it then stops leading (demoted).  No RC state
+// serves it here any more — it used to stay registered and push nothing,
+// forever (a silent stall; disk and transient, both modes: the BrokerNode
+// proof is DemotedLeaderReadCommittedRegression).  The gateway now answers its
+// Subscribe correlation id with the bare ErrorResponse{NotLeader} ONCE and
+// drops it (the client re-subscribes from its position on the leader).
+// read_uncommitted subscriptions keep their follower reads.
+// ---------------------------------------------------------------------------
+TEST(TransientGatewayRegression, ReadCommittedSubscriptionOnADemotedLeaderAnswersNotLeaderOnceRegression) {
+    Rig r;
+    const int64_t sid = r.gw.injectTestSession(0);
+    r.subscribe(sid, -2, 61, /*read_committed=*/1);
+    r.subscribe(sid, -2, 62, /*read_uncommitted=*/0);
+    ASSERT_TRUE(r.subscribed.count(61));
+    ASSERT_TRUE(r.subscribed.count(62));
+    r.gw.pushSubscriptionsForTest();
+    r.pass();
+    EXPECT_FALSE(r.errors.count(61)) << "a LEADER's read_committed subscription was retired";
+    EXPECT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), 0u);
+
+    // Demoted, as a node does it: the owner flips the replica (the rig is its
+    // thread) and the control plane records the routed role
+    // (ReplicationMetadataBridge::recordIntendedRole_) — the sweep's trigger.
+    r.rep->becomeFollower(/*leaderEpoch=*/2, /*leaderId=*/2);
+    for (int i = 0; i < 4; ++i) { r.gw.pushSubscriptionsForTest(); r.pass(); }
+    EXPECT_FALSE(r.errors.count(61)) << "swept without a routed role change (a per-pass lookup)";
+    const auto h = r.reg.lookupHandle(0, 0);
+    r.reg.setIntendedRole(0, 0, h.incarnation, rune::node::ReplicaRegistry::IntendedRole::Follower);
+    for (int i = 0; i < 4; ++i) { r.gw.pushSubscriptionsForTest(); r.pass(); }
+    ASSERT_TRUE(r.errors.count(61))
+        << "SILENT STALL: the demoted leader kept the read_committed subscription and never told the client";
+    EXPECT_EQ(r.errors[61], kNotLeader) << "the move signal is the retriable bare NotLeader";
+    EXPECT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), 1u) << "answered and dropped exactly once";
+    EXPECT_FALSE(r.errors.count(62)) << "a read_uncommitted subscription was retired (follower reads are served)";
+    // The same correlation id is a NEW subscription once the old one is gone (dedupe
+    // index cleared) — and, here on a follower, refused NotLeader at subscribe time.
+    r.errors.erase(61);
+    r.subscribe(sid, 4, 61, /*read_committed=*/1);
+    ASSERT_TRUE(r.errors.count(61));
+    EXPECT_EQ(r.errors[61], kNotLeader);
+    EXPECT_EQ(r.gw.readCommittedSubscriptionsMovedAway(), 1u);
+}

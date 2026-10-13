@@ -957,6 +957,9 @@ public:
     /// Test seam: one gateway push pass (pushSubscriptions) without doWork's
     /// Aeron polling.
     void pushSubscriptionsForTest() { pushSubscriptions(); }
+    /// Read_committed subscriptions answered NotLeader + dropped because this
+    /// node stopped leading their partition (retireReadCommittedMovedAway_).
+    [[nodiscard]] uint64_t readCommittedSubscriptionsMovedAway() const noexcept { return readCommittedMovedAway_; }
 
     // -----------------------------------------------------------------------
     // applyProduceForTest — feed a raw Produce frame through the real
@@ -2062,8 +2065,25 @@ private:
     /// state only (RcState I2): a follower answered OK and then delivered nothing
     /// (a silent stall).  False only for a registered replica that is not a
     /// published leader (GatewayReplicaView::publishedLeader); no replica
-    /// (unreplicated / internal) → true, unchanged.  Cold (subscribe time).
+    /// (unreplicated / internal) → true, unchanged.  Cold (subscribe time, and
+    /// the demotion sweep on a routed role change — retireReadCommittedMovedAway_).
     [[nodiscard]] bool readCommittedServableHere_(int32_t topicId, int32_t partition) const noexcept;
+    /// Task 11 carry (E2 Task 13): a plain read_committed subscription accepted
+    /// while this node led the partition, which it no longer leads (demoted:
+    /// controlled shutdown, failover, a higher epoch) — no RC state serves it
+    /// here any more, so it would push nothing, forever (a silent stall, disk
+    /// and transient, both worker modes).  Answer its Subscribe correlation id
+    /// with the bare ErrorResponse{NotLeader} (the retriable re-route every
+    /// unservable-here read_committed subscribe gets; the client re-subscribes
+    /// from its position and follows the leader) and drop it here and on the
+    /// owning worker.  True = retired (the caller erases the record).
+    bool retireReadCommittedMovedAway_(int64_t subId, Subscription& sub);
+    uint64_t readCommittedMovedAway_ = 0;   ///< cold counter: subscriptions retired by retireReadCommittedMovedAway_
+    /// The registry's roleChanges() the last read_committed demotion sweep saw:
+    /// the sweep runs only on a role change (the control plane records every
+    /// routed role — ReplicationMetadataBridge::recordIntendedRole_), never a
+    /// per-pass lookup per subscription.
+    uint64_t seenRcSweepRoleChanges_ = 0;
     int  pumpMarkerQueue_();
     // D9 (see TxnMarkerChannel).
     TxnMarkerChannel txnMarkerChannel_{};

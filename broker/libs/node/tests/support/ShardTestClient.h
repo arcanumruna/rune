@@ -230,6 +230,18 @@ public:
         const std::size_t len = s.encode(buf.data());
         return send(gatewayChannel, stream, buf.data(), len);
     }
+    /// Push subscription with an explicit isolation (0 = read_uncommitted,
+    /// 1 = read_committed); returns its correlationId (0 = not sent).
+    int64_t subscribeIsolated(const std::string& gatewayChannel, int32_t stream, int64_t sessionId,
+                              int32_t topicId, int32_t partition, int64_t fromOffset, uint8_t isolation) {
+        pc::Subscribe s;
+        s.sessionId = sessionId; s.correlationId = ++corr_;
+        s.topicId = topicId; s.partition = partition; s.partitionKnown = 1;
+        s.fromOffset = fromOffset; s.isolation = isolation;
+        std::vector<uint8_t> buf(s.encodedSize());
+        const std::size_t len = s.encode(buf.data());
+        return send(gatewayChannel, stream, buf.data(), len) ? s.correlationId : 0;
+    }
     struct PushedRecords { int64_t subscriptionId; int64_t baseOffset; std::vector<uint8_t> bytes; };
     struct ErrorSeen     { int64_t correlationId; int16_t code; std::string message; };
     /// Poll the egress until `pred()` holds (bounded: kMaxIters × 100 µs).

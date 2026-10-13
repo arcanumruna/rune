@@ -78,7 +78,8 @@ struct Ports {
 };
 
 NodeConfig makeConfig(int nodeId, const fs::path& dataDir, const Ports& p, int nodes, bool shard,
-                      int32_t ringBytes = 0 /* 0 = the default 8 MiB */) {
+                      int32_t ringBytes = 0 /* 0 = the default 8 MiB */,
+                      PersistenceMode persistence = PersistenceMode::Transient) {
     NodeConfig cfg;
     cfg.nodeId = nodeId;
     cfg.dataDir = dataDir.string();
@@ -112,7 +113,7 @@ NodeConfig makeConfig(int nodeId, const fs::path& dataDir, const Ports& p, int n
     cfg.clientEndpoint.streamId = kClientStream;
     TopicSpec t;
     t.name = "tt"; t.partitionCount = 1; t.topicId = 0;
-    t.persistence = PersistenceMode::Transient;
+    t.persistence = persistence;   // topic 0 "tt": transient unless a cell asks for its disk twin
     cfg.topics.push_back(t);
     return cfg;
 }
@@ -521,3 +522,149 @@ TEST(TransientSliceRegression, ThreeNodeLeaderMovesMidOpLosesNoAckedRecordRegres
     for (int64_t b : {0, 2, 4, 6, 8}) EXPECT_GE(pushedAt(c, b), 1u) << "acked batch " << b << " lost in the failover";
     for (auto& n : nodes) if (n) n->stop();
 }
+
+// ---------------------------------------------------------------------------
+// Task 11 carry (ledger): a partition leader DEMOTED while it stays alive (a
+// controlled shutdown hands its partitions off before the process exits) AFTER
+// it accepted a read_committed subscription.  read_committed is served from a
+// LEADER's RC state only (RcState I2), so the demoted node can no longer serve
+// it — and must not go silent: it answers the subscription's Subscribe
+// correlation id with ErrorResponse{NotLeader} (the retriable re-route every
+// unservable-here subscribe gets).  The client then does what rune-client-cpp
+// does with it: re-subscribes read_committed from its position on its session
+// (the demoted node redirects it to the new leader) and follows the Redirect;
+// committed data keeps flowing, nothing below its position is re-delivered.
+// Transient and disk, shard and legacy.  Every wait is bounded and fails with
+// a message naming the stall.
+// ---------------------------------------------------------------------------
+namespace {
+struct DemoteParam {
+    mx::Mode    mode;
+    mx::Persist persist;
+};
+std::string demoteName(const testing::TestParamInfo<DemoteParam>& i) {
+    return std::string(i.param.mode == mx::Mode::Shard ? "Shard" : "Legacy") + "_" +
+           (i.param.persist == mx::Persist::Transient ? "Transient" : "Disk");
+}
+constexpr uint8_t kReadCommitted = 1;
+constexpr int16_t kCodeNotLeader = static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader);
+constexpr int16_t kCodeRedirect  = static_cast<int16_t>(rune::protocol::client::ErrorCode::Redirect);
+
+/// The error answered on `corr` (nullopt = none within ~4 x 5 s of polling).
+std::optional<ShardTestClient::ErrorSeen> awaitErrorOn(ShardTestClient& c, int64_t corr) {
+    std::optional<ShardTestClient::ErrorSeen> seen;
+    for (int round = 0; round < 4 && !seen; ++round)
+        (void)c.pollUntil([&] {
+            for (const auto& e : c.errors())
+                if (e.correlationId == corr) { seen = e; return true; }
+            return false;
+        });
+    return seen;
+}
+std::size_t pushedOn(const ShardTestClient& c, int64_t subId, int64_t base) {
+    std::size_t n = 0;
+    for (const auto& r : c.records()) n += (r.subscriptionId == subId && r.baseOffset == base) ? 1u : 0u;
+    return n;
+}
+} // namespace
+
+class DemotedLeaderReadCommittedRegression : public testing::TestWithParam<DemoteParam> {};
+
+TEST_P(DemotedLeaderReadCommittedRegression, SubscriptionMovesToTheNewLeaderRegression) {
+    const auto [mode, persist] = GetParam();
+    const bool shard = mode == mx::Mode::Shard;
+    const PersistenceMode pm = persist == mx::Persist::Transient ? PersistenceMode::Transient : PersistenceMode::Disk;
+    TmpDir d0{"dm0"}, d1{"dm1"}, d2{"dm2"}, cdir{"dmc"};
+    const auto ports = Ports::discover(3);
+    std::unique_ptr<BrokerNode> nodes[3];
+    const TmpDir* dirs[3] = {&d0, &d1, &d2};
+    for (int i = 0; i < 3; ++i)
+        nodes[i] = std::make_unique<BrokerNode>(makeConfig(i, dirs[i]->path, ports, 3, shard, 0, pm));
+    for (auto& n : nodes) n->start();
+    for (auto& n : nodes) ASSERT_TRUE(n->awaitLeader(30'000ms));
+    ShardTestClient c(cdir.path);
+    c.keepSessionsAlive(true);   // a real client keeps its sessions alive (1 s keepalive)
+    auto leaderVia = [&](int gwNode, int notThis) {
+        const int64_t s = c.connect(gatewayChannel(ports, gwNode), kClientStream);
+        for (int i = 0; s > 0 && i < 400; ++i) {
+            for (const auto& pi : c.metadata(gatewayChannel(ports, gwNode), kClientStream, s))
+                if (pi.topicId == 0 && pi.partition == 0 && pi.leaderId >= 0 && pi.leaderId != notThis)
+                    return static_cast<int>(pi.leaderId);
+            std::this_thread::sleep_for(50ms);   // metadata settling (poll interval)
+        }
+        return -1;
+    };
+    const int leader = leaderVia(0, -1);
+    ASSERT_GE(leader, 0) << "no partition leader advertised";
+    const int64_t sid = c.connect(gatewayChannel(ports, leader), kClientStream);
+    ASSERT_GT(sid, 0);
+    auto produceCh = [&](int node) { return shard ? workerIngressChannel(ports, node) : gatewayChannel(ports, node); };
+    for (int64_t want : {0, 2, 4}) {
+        const auto ack = c.produceUntilOk(produceCh(leader), kClientStream, sid, 0, 0, /*acks=all*/1, makeBatch(2));
+        ASSERT_TRUE(ack.has_value()) << "acks=all produce on the leader failed";
+        ASSERT_EQ(ack->baseOffset, want);
+    }
+
+    // 1. A read_committed subscription accepted by the leader, delivering.
+    const int64_t subCorr = c.subscribeIsolated(gatewayChannel(ports, leader), kClientStream, sid, 0, 0,
+                                                /*Earliest=*/-2, kReadCommitted);
+    ASSERT_GT(subCorr, 0);
+    ASSERT_TRUE(c.pollUntil([&] { return pushedAt(c, 4) >= 1; }))
+        << "the leader accepted read_committed but delivered nothing";
+    const int64_t oldSub = c.records().back().subscriptionId;
+    const int64_t position = 6;   // the next offset the client wants (records 0..5 delivered)
+
+    // 2. The leader is DEMOTED and stays alive.
+    ASSERT_TRUE(c.whilePumping([&] { return nodes[leader]->controlledShutdown(20'000ms); }))
+        << "the controlled shutdown never handed the partition off";
+
+    // 3. The demoted node tells the client to move — never a silent stall.
+    const auto told = awaitErrorOn(c, subCorr);
+    ASSERT_TRUE(told.has_value())
+        << "SILENT STALL: the demoted leader neither serves the read_committed subscription nor answers it "
+           "NotLeader — the client has no signal to move it";
+    EXPECT_EQ(told->code, kCodeNotLeader) << "the move signal is the retriable bare NotLeader";
+
+    // 4. The client re-subscribes from its position on its session: the demoted
+    //    node redirects it to the new leader, and it follows.
+    const int next = leaderVia((leader + 1) % 3, leader);
+    ASSERT_GE(next, 0) << "no new partition leader";
+    const int64_t reCorr = c.subscribeIsolated(gatewayChannel(ports, leader), kClientStream, sid, 0, 0, position,
+                                               kReadCommitted);
+    ASSERT_GT(reCorr, 0);
+    const auto redirect = awaitErrorOn(c, reCorr);
+    ASSERT_TRUE(redirect.has_value()) << "the demoted node never answered the re-subscribe";
+    EXPECT_EQ(redirect->code, kCodeRedirect);
+    EXPECT_NE(redirect->message.find(std::to_string(ports.client[next])), std::string::npos)
+        << "redirected to " << redirect->message << ", not the new leader";
+    const int64_t sidN = c.connect(gatewayChannel(ports, next), kClientStream);
+    ASSERT_GT(sidN, 0);
+    const auto known = knownSubscriptions(c);
+    const int64_t movedCorr = c.subscribeIsolated(gatewayChannel(ports, next), kClientStream, sidN, 0, 0, position,
+                                                  kReadCommitted);
+    ASSERT_GT(movedCorr, 0);
+
+    // 5. Committed data keeps flowing on the moved subscription.
+    for (int64_t want : {6, 8}) {
+        const auto ack = c.produceUntilOk(produceCh(next), kClientStream, sidN, 0, 0, 1, makeBatch(2));
+        ASSERT_TRUE(ack.has_value()) << "the new leader never took a produce";
+        ASSERT_EQ(ack->baseOffset, want) << "an acks=all record acked by the old leader is missing";
+    }
+    int64_t newSub = -1;
+    const int64_t first = firstOfNewSubscription(c, known, &newSub);
+    ASSERT_GE(first, 0) << "SILENT STALL: the moved read_committed subscription never delivered on the new leader";
+    EXPECT_EQ(first, position) << "the moved subscription did not resume at its position";
+    ASSERT_TRUE(c.pollUntil([&] { return pushedOn(c, newSub, 8) >= 1; }))
+        << "SILENT STALL: committed data stopped flowing after the move";
+    for (int64_t b : {0, 2, 4}) EXPECT_EQ(pushedOn(c, newSub, b), 0u) << "re-delivered below the position: " << b;
+    for (int64_t b : {6, 8}) EXPECT_EQ(pushedOn(c, oldSub, b), 0u) << "the demoted node kept pushing " << b;
+    c.whilePumping([&] { nodes[leader]->stop(); });
+    for (auto& n : nodes) n->stop();
+}
+
+INSTANTIATE_TEST_SUITE_P(Cells, DemotedLeaderReadCommittedRegression,
+                         testing::Values(DemoteParam{mx::Mode::Shard, mx::Persist::Transient},
+                                         DemoteParam{mx::Mode::Legacy, mx::Persist::Transient},
+                                         DemoteParam{mx::Mode::Shard, mx::Persist::Disk},
+                                         DemoteParam{mx::Mode::Legacy, mx::Persist::Disk}),
+                         demoteName);
