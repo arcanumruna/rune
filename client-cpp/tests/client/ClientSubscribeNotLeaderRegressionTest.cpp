@@ -455,3 +455,26 @@ TEST(SubscribeNotLeaderRegression, MovedLatestSubscriptionWithNothingDeliveredRe
     EXPECT_EQ(seen.count.load(), 2);
     sub.unsubscribe();
 }
+
+// E2 Task 14 (Task 13 re-review N4): the position note is used ONLY while
+// nothing was delivered.  A subscription that delivered 0..2 and then gets a
+// note (here 7: anything other than its own position) before the NotLeader
+// must resume at ITS position 3 — acting on the note would skip 3..6 (or,
+// with a note below the position, re-deliver).
+TEST(SubscribeNotLeaderRegression, PositionNoteIsIgnoredAfterADeliveryRegression) {
+    Rig r("snl_j", 4790, 4791, SubMode::MovesAfterBind, 60'000);
+    r.gw->firstPushes  = {{0, 3}};    // delivered: nextOffset 3 > 0
+    r.gw->noteBase     = 7;           // a note that disagrees with the position
+    r.gw->secondPushes = {{3, 2}};
+    Seen seen;
+    auto sub = r.subscribe(Isolation::ReadCommitted, seen.handler());
+    ASSERT_TRUE(driveUntil(r, [&] { return sub.subscriptionId() == 10 && sub.position() == 5; }))
+        << "id " << sub.subscriptionId() << ", position " << sub.position();
+    ASSERT_EQ(r.gw->subscribes.size(), 2u);
+    EXPECT_EQ(r.gw->subscribes[1].fromOffset, 3) << "the move acted on the position note after a delivery";
+    settle(r);
+    EXPECT_EQ(seen.count.load(), 5);
+    EXPECT_EQ(seen.mask.load(), 0x1Fu);
+    EXPECT_EQ(seen.dupes.load(), 0);
+    sub.unsubscribe();
+}

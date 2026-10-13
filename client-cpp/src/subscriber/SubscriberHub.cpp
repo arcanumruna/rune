@@ -657,7 +657,7 @@ bool SubscriberHub::rearmMovedAway(int64_t correlationId, int64_t newCorrId, int
         // running: nothing to move.
         if (!impl.active || impl.unsubPending || &impl == dispatching_) return false;
         const int32_t part = impl.boundPartition >= 0 ? impl.boundPartition : impl.partition;
-            // Nothing delivered (nextOffset 0): the broker's position note (its
+        // Nothing delivered (nextOffset 0): the broker's position note (its
         // bind-time resolved start / cursor), else the requested From.
         const int64_t from = impl.nextOffset > 0  ? impl.nextOffset
                            : impl.resumeHint >= 0 ? impl.resumeHint

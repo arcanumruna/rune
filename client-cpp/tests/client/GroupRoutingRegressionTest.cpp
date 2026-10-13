@@ -2073,3 +2073,73 @@ TEST(GroupRoutingRegression, MovedFetchSubscriptionStraddlingBatchSkipsConsumedR
     for (const auto& [off, n] : consumed) EXPECT_EQ(n, 1) << "offset " << off << " handed over " << n << " times";
     EXPECT_EQ(consumed.size(), 7u);   // 10..16
 }
+
+// E2 Task 14 (Task 13 re-review N4): a group fetch instance NEVER acts on a
+// broker position note (an empty-batch Records frame, client version 6) — the
+// note concerns plain subscriptions; a member resumes from its own position.
+// Should one reach the group hub, an empty view would count as one record:
+// the member's position would jump to the note's base + 1 (21 here), the next
+// real batch (15..16) would be dropped as "below the position" and the move
+// would resume from 21.  Expected: no onRecords for the note, the position
+// stays 15, the move resumes there and every record arrives exactly once.
+TEST(GroupRoutingRegression, GroupFetchInstanceNeverActsOnAPositionNoteRegression) {
+    GroupRig r(4227, 4228);
+    const auto [n1, p1port] = r.addNode(4227);
+    const auto [n2, p2port] = r.addNode(4227);
+    r.gw.moreBrokers     = {{1, "127.0.0.1", p1port}, {2, "127.0.0.1", p2port}};
+    r.gw.partitions      = {{1, 0, 0, 1, 4227, ""}, {1, 1, 1, 1, 4227, ""}};
+    r.gw.subscribeLeader = {{0, 0}, {1, n1}};
+    r.gw.groupAssignment = {{1, 1}};
+    r.gw.committedOffsets[{1, 1}] = 10;
+
+    auto gc = r.client.subscribeGroup("g", {"t"});
+    int                     callbacks = 0;
+    std::map<int64_t, int>  consumed;   // offset -> times handed over (from deliverFrom)
+    int64_t                 next = -1;
+    gc.onRecords([&](const rc::RecordSet& rs) {
+        ++callbacks;
+        next = rs.baseOffset + rs.recordCount;
+        rune::protocol::RecordBatchReader rd(rs.recordBatch.data(), rs.recordBatch.size());
+        if (!rd.ensureValid()) return;
+        rd.forEach([&](std::string_view, std::string_view, int64_t off, int64_t) {
+            if (off >= rs.deliverFrom) ++consumed[off];
+        });
+    });
+    r.connect();
+    ASSERT_TRUE(r.drive([&] { return !r.client.testDataChannelFor(1, 1).empty() && !r.gw.pendingJoins.empty(); }));
+    r.gw.releaseJoins();
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n1) != nullptr; }));
+    const auto s1 = *r.subAt(1, n1);
+    r.gw.pushRecords(s1, 10, 5);   // 10..14 -> position 15
+    ASSERT_TRUE(r.drive([&] { return consumed.size() == 5; }));
+
+    // The demoted node sends a position note on the fetch instance (exactly the
+    // instance the member is bound to: its id, session and correlation id) ...
+    {
+        namespace rcc = rune::client::codec;
+        uint8_t buf[256]{};
+        const std::size_t n = rcc::encodeRecords(buf, sizeof(buf), s1.subscriptionId, s1.topicId, s1.partition,
+                                                 /*baseOffset=*/20, std::span<const uint8_t>{}, s1.sessionId,
+                                                 s1.corrId);
+        ASSERT_GT(n, 0u);
+        r.gw.send(n1, buf, n);
+    }
+    // ... followed by a real batch (still node 1), then NotLeader.
+    r.gw.pushRecords(s1, 15, 1);   // 15 -> position 16
+    ASSERT_TRUE(r.drive([&] { return consumed.size() == 6; }, 200'000))
+        << "the batch after the note was dropped: the note moved the member's position";
+    EXPECT_EQ(callbacks, 2) << "onRecords fired for the position note";
+    EXPECT_EQ(next, 16);
+
+    r.gw.subscribeLeader[1] = n2;
+    r.gw.partitions = {{1, 0, 0, 1, 4227, ""}, {1, 1, 2, 2, 4227, ""}};
+    r.gw.sendError(n1, static_cast<int16_t>(rune::protocol::client::ErrorCode::NotLeader), "", s1.sessionId,
+                   s1.corrId);
+    ASSERT_TRUE(r.drive([&] { return r.subAt(1, n2) != nullptr; }, 200'000));
+    const auto s2 = *r.subAt(1, n2);
+    EXPECT_EQ(s2.fromOffset, 16) << "the moved fetch subscription resumed from the note, not its position";
+    r.gw.pushRecords(s2, 16, 2);
+    ASSERT_TRUE(r.drive([&] { return consumed.size() == 8; }));
+    EXPECT_EQ(callbacks, 3);
+    for (const auto& [off, n] : consumed) EXPECT_EQ(n, 1) << "offset " << off << " handed over " << n << " times";
+}
