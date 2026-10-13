@@ -167,6 +167,13 @@ enum class ErrorCode : uint16_t {
                                   // after a backoff, without a metadata refresh.  Answered only to
                                   // clients >= kClientVersionTransientLogFull (6); older clients get
                                   // NotLeader (their retriable code) — see produceErrorForClient.
+    PartitionDataReset     = 43,  // Subscribe (Phase 2b E2, residual round 6): a RESUMED plain
+                                  // subscription claimed (Subscribe.key, see kClientVersionLineageNote)
+                                  // a position in a TRANSIENT partition's data lineage that did not
+                                  // survive (the ring restarted empty).  NO subscription is registered;
+                                  // the client resubscribes from the log start (no resume floor) and
+                                  // surfaces the reset to the application.  Sent as ErrorResponse on
+                                  // the Subscribe's correlationId, only to clients >= 7 (only they claim).
 };
 
 // ---------------------------------------------------------------------------
@@ -222,7 +229,21 @@ inline constexpr int32_t kClientVersionExplicitGroupSubscriptions = 3;
 inline constexpr int32_t kClientVersionInvalidRequest             = 5;
 inline constexpr int32_t kClientVersionTransientLogFull           = 6;
 inline constexpr int32_t kClientVersionMovedPositionNote          = 6;
-inline constexpr int32_t kClientVersion                           = 6;   // what this protocol's client announces
+// 7 (Phase 2b E2, residual round 6) — the transient LINEAGE NOTE and claim:
+//   - broker → client: after binding a plain subscription on a TRANSIENT
+//     partition (and again once its data lineage resolves, if it was still
+//     unknown at bind) the broker sends a Records frame of that subscription
+//     whose recordBatch is EXACTLY 8 bytes — the partition's data-lineage
+//     token, little-endian (baseOffset -1).  No valid RecordBatch is 8 bytes:
+//     an older client drops it as malformed.
+//   - client → broker: a RESUMED Subscribe (partitionKnown = 1, from a
+//     position the subscription already reached) carries the token it holds
+//     in its `key` field (8 bytes LE; the key is unused when the partition is
+//     known).  The broker answers PartitionDataReset (43) when the token is
+//     not the partition's current lineage, the retriable NotLeader while the
+//     lineage is unknown, and serves it otherwise.  No format change.
+inline constexpr int32_t kClientVersionLineageNote                = 7;
+inline constexpr int32_t kClientVersion                           = 7;   // what this protocol's client announces
 
 // ---------------------------------------------------------------------------
 // Broker versions (ConnectResponse.brokerVersion, an additive trailing field;
@@ -259,6 +280,12 @@ inline constexpr int32_t kBrokerVersion                           = 4;   // what
 /// moved-subscription position note (an empty-batch Records frame; see 6).
 [[nodiscard]] constexpr bool clientUnderstandsMovedPositionNote(int32_t clientVersion) noexcept {
     return clientVersion >= kClientVersionMovedPositionNote;
+}
+
+/// True when a session that connected with `clientVersion` understands the
+/// transient lineage note and may send a lineage claim (see version 7).
+[[nodiscard]] constexpr bool clientUnderstandsLineageNote(int32_t clientVersion) noexcept {
+    return clientVersion >= kClientVersionLineageNote;
 }
 
 /// The produce error code a session that connected with `clientVersion` is

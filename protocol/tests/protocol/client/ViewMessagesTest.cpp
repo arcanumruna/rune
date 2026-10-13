@@ -235,7 +235,7 @@ TEST(ViewMessagesRegression, ViewSourceIsViewCodeIsPinned) {
 TEST(ViewMessagesRegression, RowTooLargeStatusAndInvalidRequestClientGateArePinnedRegression) {
     EXPECT_EQ(static_cast<uint16_t>(ViewRowResponse::kRowTooLarge), 7u);
     EXPECT_EQ(kClientVersionInvalidRequest, 5);
-    EXPECT_EQ(kClientVersion, 6);
+    EXPECT_EQ(kClientVersion, 7);   // round 6: v7 = the transient lineage note
     EXPECT_FALSE(clientUnderstandsInvalidRequest(4));
     EXPECT_TRUE(clientUnderstandsInvalidRequest(5));
 }

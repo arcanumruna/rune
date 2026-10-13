@@ -804,10 +804,19 @@ TEST(HandshakeContinueResponse, TemplateIdIsEleven) {
 // kProtocolVersion (the MessageHeader wire version) stays at 3.
 // ---------------------------------------------------------------------------
 TEST(VersionGates, ClientBrokerVersionBumpedProtocolVersionUnchanged) {
-    EXPECT_EQ(rpc::kClientVersion, 6);   // v6: TransientLogFull (v5: InvalidRequest)
+    EXPECT_EQ(rpc::kClientVersion, 7);   // v7: transient lineage note + claim (v6: TransientLogFull)
     EXPECT_EQ(rpc::kBrokerVersion, 4);
     EXPECT_EQ(rpc::kClientVersionCrypto, 4);
     EXPECT_EQ(rpc::kBrokerVersionCrypto, 4);
     EXPECT_EQ(rpc::kProtocolVersion, 3);
     EXPECT_EQ(rpc::kCryptoSchemaId, 121);
+}
+
+// E2 residual round 6: client version 7 = the transient lineage note / claim;
+// PartitionDataReset is error code 43 (pinned: a wire value never moves).
+TEST(VersionGates, TransientLineageNoteGateAndPartitionDataResetArePinnedRegression) {
+    EXPECT_EQ(rpc::kClientVersionLineageNote, 7);
+    EXPECT_FALSE(rpc::clientUnderstandsLineageNote(6));
+    EXPECT_TRUE(rpc::clientUnderstandsLineageNote(7));
+    EXPECT_EQ(static_cast<uint16_t>(rpc::ErrorCode::PartitionDataReset), 43u);
 }
