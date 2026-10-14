@@ -1488,13 +1488,14 @@ endif()
 # tests can link it without a duplicate-main conflict with gtest_main.
 add_library(rune_cli_lib STATIC
     src/cli/Cli.cpp
+    src/cli/CatalogCommands.cpp
 )
 target_include_directories(rune_cli_lib PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${RUNE_QL_ROOT}/include
     ${RUNE_CODEC_ROOT}/include
 )
-target_link_libraries(rune_cli_lib PUBLIC rune_ql rune_codec)
+target_link_libraries(rune_cli_lib PUBLIC rune_ql rune_codec rune_catalog)
 target_compile_features(rune_cli_lib PUBLIC cxx_std_23)
 
 # Enable the live broker path when Aeron is available.
@@ -1529,6 +1530,18 @@ if(BUILD_TESTING)
     target_link_libraries(rune_cli_offline_tests PRIVATE rune_cli_lib GTest::gtest_main)
     target_compile_features(rune_cli_offline_tests PRIVATE cxx_std_23)
     gtest_discover_tests(rune_cli_offline_tests)
+endif()
+
+# ── Catalog history Task 15: `rune ql` / `rune catalog` offline tests ──────────
+# --dry-run, .rcat files, the pure row / step-check functions (no broker, nothing blocks).
+if(BUILD_TESTING)
+    add_executable(rune_cli_catalog_tests
+        tests/RuneCliCatalogTest.cpp
+    )
+    target_include_directories(rune_cli_catalog_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+    target_link_libraries(rune_cli_catalog_tests PRIVATE rune_cli_lib rune_catalog GTest::gtest_main)
+    target_compile_features(rune_cli_catalog_tests PRIVATE cxx_std_23)
+    gtest_discover_tests(rune_cli_catalog_tests)
 endif()
 
 # ── Task 9: rune CLI live tests (schema apply/get/list via loopback Aeron) ─────

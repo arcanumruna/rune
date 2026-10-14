@@ -370,6 +370,10 @@ struct ClientConfig {
     // Timeout.  Independent of pingTimeoutMs: a catalog leader holds a
     // CreateTopic OK until the topic serves (up to 5 s).
     int64_t ddlTimeoutMs = 15'000;
+    // traceDdlRetries: record every FOLLOWED Redirect and every scheduled NotLeader
+    // retry of a DDL (`rune ql --verbose`); read them with Client::takeDdlRetryNotes().
+    // Default false: nothing is recorded, nothing allocates.
+    bool traceDdlRetries = false;
 };
 
 /// Maps a ClientConfig to the agent/transport configuration (applies env overrides).
@@ -736,6 +740,20 @@ public:
         return isDdlOp(c.op) && c.reserved0 != 0 ? rune::protocol::RequestId{clientInstanceId_, c.reserved0}
                                                  : rune::protocol::RequestId{};
     }
+
+    /// One followed Redirect / scheduled NotLeader retry of a DDL (ClientConfig::traceDdlRetries).
+    struct DdlRetryNote {
+        enum class Kind : uint8_t { Redirect, NotLeader } kind = Kind::Redirect;
+        int         redirects = 0;     ///< Redirect: the hop count so far (<= kMaxDdlRedirects)
+        int64_t     backoffMs = 0;     ///< NotLeader: the wait before the resend
+        std::string text;              ///< Redirect: the leader endpoint; NotLeader: the broker's detail
+    };
+    static constexpr std::size_t kMaxDdlRetryNotes = 1024;
+    /// Moves the recorded notes (oldest first) into `out` (appended) and returns how
+    /// many further notes were dropped past kMaxDdlRetryNotes since the last take.
+    /// Duty-thread state: call it from the Invoker owner (RunnerMode::Invoker), where the
+    /// owner IS the duty thread; in Thread mode only while no DDL is in flight.
+    std::size_t takeDdlRetryNotes(std::vector<DdlRetryNote>& out);
 
     OpResult dropTopic(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token);
     OpResult dropView(std::string_view name, const DdlOptions& ddl, CompletionTarget target, Token token);
@@ -1624,6 +1642,9 @@ private:
     uint32_t                requestCounter_ = 0;       // duty thread only: the requestId's lo (32-bit, never 0)
     int                     ddlPending_ = 0;           // pendingCtl_ entries that are DDLs
     int                     ddlAwaitingResend_ = 0;    // pending DDLs in a ddlWaitsForResend() state
+    std::vector<DdlRetryNote> ddlRetryNotes_;          // duty thread; filled only under cfg_.traceDdlRetries
+    std::size_t             ddlRetryNotesDropped_ = 0;
+    void noteDdlRetry_(DdlRetryNote note);
     PendingCtl              pendingConnect_;           // at most one connect
     bool                    hasPendingConnect_ = false;
     uint32_t                unsentCtl_ = 0;            // entries holding an unsent frame

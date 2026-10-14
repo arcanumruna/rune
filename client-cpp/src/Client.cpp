@@ -1623,6 +1623,7 @@ void Client::onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t no
         failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::Redirect), why, ddlNoValue(p.op));
         return;
     }
+    if (cfg_.traceDdlRetries) noteDdlRetry_({DdlRetryNote::Kind::Redirect, redirects, 0, std::string(endpoint)});
     // The leader's own session (the seed never moves for a DDL: it carries the
     // data ops / subscriptions); the same frame, so the same requestId.
     d.endpoint = toChannel(std::string(endpoint));
@@ -1670,7 +1671,21 @@ void Client::onDdlNotLeader_(std::size_t i, std::string_view detail, int64_t now
         return;
     }
     // The last resend lands at the budget's end at the latest; its answer decides.
+    if (cfg_.traceDdlRetries)
+        noteDdlRetry_({DdlRetryNote::Kind::NotLeader, redirects, std::min(backoffNs, budgetEndNs - nowNs) / 1'000'000,
+                       std::string(detail)});
     setDdlRetry_(d, DdlAwaitingResend{redirects, budgetEndNs, backoffNs, std::min(nowNs + backoffNs, budgetEndNs)});
+}
+
+void Client::noteDdlRetry_(DdlRetryNote note) {
+    if (ddlRetryNotes_.size() >= kMaxDdlRetryNotes) { ++ddlRetryNotesDropped_; return; }
+    ddlRetryNotes_.push_back(std::move(note));
+}
+
+std::size_t Client::takeDdlRetryNotes(std::vector<DdlRetryNote>& out) {
+    for (auto& n : ddlRetryNotes_) out.push_back(std::move(n));
+    ddlRetryNotes_.clear();
+    return std::exchange(ddlRetryNotesDropped_, 0);
 }
 
 int Client::driveDdl_(int64_t nowNs) {

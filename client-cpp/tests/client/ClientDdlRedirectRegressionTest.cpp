@@ -695,3 +695,46 @@ TEST(ClientDdlRedirectRegression, ASkippedRequestIdStampFailsTheOpAndIsNeverSent
     ASSERT_TRUE(g.accepted());
     ASSERT_TRUE(r.drive([&] { return arrivals == 1; }));
 }
+
+// Task 15 (`rune ql --verbose`): ClientConfig::traceDdlRetries records every FOLLOWED Redirect
+// and every scheduled NotLeader retry; off (the default) records nothing.
+TEST(ClientDdlRedirectRegression, TraceDdlRetriesRecordsEveryFollowedRedirectAndNotLeaderRetryRegression) {
+    for (const bool trace : {true, false}) {
+        SCOPED_TRACE(trace ? "trace on" : "trace off (default)");
+        rc::ClientConfig cfg = invokerCfg(trace ? 3980 : 3982, trace ? 3981 : 3983);
+        cfg.traceDdlRetries = trace;
+        Rig r(cfg);
+        const std::string leaderCh = udp(freePort());
+        const int leader = r.gw.addEndpoint(leaderCh, cfg.gatewayStreamId);
+        r.connect();
+        int leaderCalls = 0;
+        r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+            auto m = pc::DropTopic::decode(f, len);
+            ASSERT_TRUE(m.has_value());
+            if (ep != leader) { r.answerError(ep, pc::ErrorCode::Redirect, leaderCh, m->sessionId, m->correlationId); return; }
+            if (leaderCalls++ == 0) { r.answerError(ep, pc::ErrorCode::NotLeader, "catching up", m->sessionId, m->correlationId); return; }
+            pc::DdlResponse resp; resp.sessionId = m->sessionId; resp.correlationId = m->correlationId; resp.newVersion = 2;
+            r.gw.sendDdlResponse(ep, resp);
+        };
+        test_support::TestCq cq(r.client);
+        auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+        ASSERT_TRUE(f.accepted());
+        ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/50'000'000));
+        ASSERT_TRUE(f.ok()) << f.describe();
+        std::vector<rc::Client::DdlRetryNote> notes;
+        const std::size_t dropped = r.client.takeDdlRetryNotes(notes);
+        EXPECT_EQ(dropped, 0u);
+        if (!trace) {
+            EXPECT_TRUE(notes.empty()) << "nothing is recorded unless asked for";
+            continue;
+        }
+        ASSERT_EQ(notes.size(), 2u);
+        EXPECT_EQ(notes[0].kind, rc::Client::DdlRetryNote::Kind::Redirect);
+        EXPECT_EQ(notes[0].redirects, 1);
+        EXPECT_EQ(notes[0].text, leaderCh);
+        EXPECT_EQ(notes[1].kind, rc::Client::DdlRetryNote::Kind::NotLeader);
+        EXPECT_EQ(notes[1].text, "catching up");
+        EXPECT_GT(notes[1].backoffMs, 0);
+        EXPECT_TRUE(r.client.takeDdlRetryNotes(notes) == 0 && notes.size() == 2u) << "taking drains: a second take adds nothing";
+    }
+}

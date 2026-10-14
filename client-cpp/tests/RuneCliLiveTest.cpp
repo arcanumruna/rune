@@ -132,6 +132,8 @@ struct CliTestGateway {
     int32_t  defineTopicId   = 0x40000001;
     uint16_t defineVersion   = 1;
     uint16_t defineErrorCode = 0;
+    // Task 15: answer the next N DefineTopics NotLeader (errorCode 2): the client retries them.
+    int      defineNotLeaderReplies = 0;
 
     // Canned GetTopicSchema response.
     int32_t              getTopicId   = 0x40000001;
@@ -265,6 +267,10 @@ struct CliTestGateway {
             resp.topicId       = defineTopicId;
             resp.version       = defineVersion;
             resp.errorCode     = defineErrorCode;
+            if (defineNotLeaderReplies > 0) {
+                --defineNotLeaderReplies;
+                resp.errorCode = static_cast<uint16_t>(rpc::ErrorCode::NotLeader);
+            }
 
             const std::size_t n = resp.encode(replyBuf);
             if (n > 0) send(replyBuf, n);
@@ -1176,4 +1182,42 @@ TEST(CliLiveRegression, ApplyTransientTopicSendsTransientPersistence) {
     EXPECT_EQ(gw.lastDefinePersistence, rpc::DefineTopic::kPersistenceTransient);
     gw.stop();
     try { std::filesystem::remove_all(baseDir); } catch (...) {}
+}
+
+// ===========================================================================
+// Catalog history Task 15: `rune ql` live against the loopback gateway.
+// ===========================================================================
+TEST(CliLiveRegression, QlDefinesATopicAndVerbosePrintsEveryNotLeaderRetry) {
+    for (const bool verbose : {true, false}) {
+        SCOPED_TRACE(verbose ? "--verbose" : "no --verbose");
+        const int32_t kIn = verbose ? 1260 : 1262, kOut = verbose ? 1261 : 1263;
+        const std::string baseDir = cliUniqueDir();
+        const std::string aeronDir = baseDir + "/aeron";
+        CliTestGateway gw(aeronDir, kIn, kOut);
+        gw.defineNotLeaderReplies = 2;   // two NotLeader answers, then success
+        std::vector<std::string> args = {
+            "ql", "-e", "topic presence partitions 4;",
+            "--broker", "aeron:ipc",
+            "--cli-data-dir", baseDir,
+            "--cli-stream-in",  std::to_string(kIn),
+            "--cli-stream-out", std::to_string(kOut),
+        };
+        if (verbose) args.push_back("--verbose");
+        auto r = runCli(gw, aeronDir, args);
+        EXPECT_EQ(r.rc, 0) << r.err;
+        EXPECT_EQ(gw.definesSeen.load(), 3) << "NotLeader, NotLeader, then the answer";
+        EXPECT_EQ(gw.lastDefineName, "presence");
+        EXPECT_EQ(gw.lastDefinePartitions, 4u);
+        EXPECT_NE(r.out.find("created topic 'presence'"), std::string::npos) << r.out;
+        if (verbose) {
+            std::size_t n = 0;
+            for (auto pos = r.err.find("NotLeader"); pos != std::string::npos; pos = r.err.find("NotLeader", pos + 1)) ++n;
+            EXPECT_EQ(n, 2u) << "every NotLeader retry is printed: " << r.err;
+            EXPECT_NE(r.err.find("retrying in"), std::string::npos) << r.err;
+        } else {
+            EXPECT_TRUE(r.err.empty()) << "without --verbose nothing extra is printed: " << r.err;
+        }
+        gw.stop();
+        try { std::filesystem::remove_all(baseDir); } catch (...) {}
+    }
 }

@@ -9,6 +9,7 @@
 //
 
 #include "rune/cli/Cli.h"
+#include "rune/cli/CatalogCommands.h"
 
 #include "rune/ql/Parser.h"
 #include "rune/ql/Backends.h"
@@ -123,6 +124,7 @@ void printUsage(std::ostream& err) {
         << "      Generate C++ header from a serialized descriptor blob.\n"
         << "  rune schema generate <topic> --out <dir> [--broker <ep>]\n"
         << "      Fetch topic schema from broker and generate C++ header (live).\n";
+    rune::cli::printCatalogUsage(err);
 }
 
 // ── Live ClientConfig builder (shared by apply/get/list) ─────────────────────
@@ -800,6 +802,12 @@ int run(std::vector<std::string> args, std::ostream& out, std::ostream& err)
 
     if (cmd == "schema") {
         return cmdSchema(args, out, err);
+    }
+    if (cmd == "ql") {
+        return cmdQl(std::vector<std::string>(args.begin() + 1, args.end()), out, err);
+    }
+    if (cmd == "catalog") {
+        return cmdCatalog(std::vector<std::string>(args.begin() + 1, args.end()), out, err);
     }
 
     err << "rune: unknown command '" << cmd << "'\n";

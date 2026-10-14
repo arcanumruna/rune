@@ -30,6 +30,8 @@
 
 #include <cstdint>
 #include <cstring>
+#include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -148,6 +150,97 @@ inline std::vector<uint8_t> serializeAuthored(const ViewPlan& plan) {
     detail::writeSizing(buf, plan.sizing);
 
     return buf;
+}
+
+namespace detail {
+
+// Bounds-checked little-endian readers: false on truncation, pos advances only on success.
+inline bool readU8(std::span<const uint8_t> b, std::size_t& pos, uint8_t& out) {
+    if (b.size() - pos < 1 || pos > b.size()) return false;
+    out = b[pos++];
+    return true;
+}
+inline bool readU16LE(std::span<const uint8_t> b, std::size_t& pos, uint16_t& out) {
+    if (pos > b.size() || b.size() - pos < 2) return false;
+    out = static_cast<uint16_t>(b[pos] | (b[pos + 1] << 8));
+    pos += 2;
+    return true;
+}
+inline bool readU32LE(std::span<const uint8_t> b, std::size_t& pos, uint32_t& out) {
+    if (pos > b.size() || b.size() - pos < 4) return false;
+    out = static_cast<uint32_t>(b[pos]) | (static_cast<uint32_t>(b[pos + 1]) << 8) |
+          (static_cast<uint32_t>(b[pos + 2]) << 16) | (static_cast<uint32_t>(b[pos + 3]) << 24);
+    pos += 4;
+    return true;
+}
+inline bool readU64LE(std::span<const uint8_t> b, std::size_t& pos, uint64_t& out) {
+    if (pos > b.size() || b.size() - pos < 8) return false;
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= static_cast<uint64_t>(b[pos + static_cast<std::size_t>(i)]) << (8 * i);
+    out = v;
+    pos += 8;
+    return true;
+}
+inline bool readString(std::span<const uint8_t> b, std::size_t& pos, std::string& out) {
+    uint32_t len = 0;
+    if (!readU32LE(b, pos, len)) return false;
+    if (b.size() - pos < len) return false;   // pos <= size here: never an overrun
+    out.assign(reinterpret_cast<const char*>(b.data() + pos), len);
+    pos += len;
+    return true;
+}
+
+} // namespace detail
+
+// The inverse of serializeAuthored (a `rune catalog replay` re-reads the normalized plan an
+// event stores).  Strict like the broker's rune::view::deserializeAuthored: nullopt on a wrong
+// version, a truncated blob, an out-of-range type / merge rule or TRAILING bytes — never a
+// partial plan.  Counts are untrusted: nothing is reserved from them.
+inline std::optional<ViewPlan> deserializeAuthored(std::span<const uint8_t> buf) {
+    std::size_t pos = 0;
+    ViewPlan p;
+    uint8_t version = 0;
+    if (!detail::readU8(buf, pos, version) || version != kAuthoredViewPlanVersion) return std::nullopt;
+    if (!detail::readString(buf, pos, p.viewName) || !detail::readString(buf, pos, p.key)) return std::nullopt;
+
+    uint32_t n = 0;
+    if (!detail::readU32LE(buf, pos, n)) return std::nullopt;
+    for (uint32_t i = 0; i < n; ++i) {
+        SourceSpec s;
+        uint32_t id = 0;
+        if (!detail::readU32LE(buf, pos, id) || !detail::readString(buf, pos, s.keyField)) return std::nullopt;
+        s.topicId = static_cast<int32_t>(id);
+        p.sources.push_back(std::move(s));
+    }
+    if (!detail::readU32LE(buf, pos, n)) return std::nullopt;
+    for (uint32_t i = 0; i < n; ++i) {
+        AuthoredField f;
+        uint8_t type = 0, rule = 0;
+        if (!detail::readString(buf, pos, f.name) || !detail::readU8(buf, pos, type) ||
+            !detail::readU16LE(buf, pos, f.sourceIdx) || !detail::readString(buf, pos, f.srcField) ||
+            !detail::readU8(buf, pos, rule))
+            return std::nullopt;
+        if (type > static_cast<uint8_t>(rune::codec::PrimType::FixedStr)) return std::nullopt;
+        if (rule > static_cast<uint8_t>(MergeRule::CountAll)) return std::nullopt;
+        f.type = static_cast<rune::codec::PrimType>(type);
+        f.rule = static_cast<MergeRule>(rule);
+        p.output.push_back(std::move(f));
+    }
+    if (!detail::readU8(buf, pos, p.persistence)) return std::nullopt;
+    if (!detail::readU32LE(buf, pos, p.sizing.chunkBytes) || !detail::readU32LE(buf, pos, p.sizing.capacity) ||
+        !detail::readU64LE(buf, pos, p.sizing.maxRows))
+        return std::nullopt;
+    if (pos != buf.size()) return std::nullopt;
+    return p;
+}
+
+// Sets source i's topicId to topicIds[i] (a normalized plan names its sources by ordinal,
+// ruling 11; a replay maps them onto the TARGET cluster's topic ids).  False — and the plan
+// untouched — when the counts differ.
+inline bool remapSources(ViewPlan& plan, std::span<const int32_t> topicIds) {
+    if (plan.sources.size() != topicIds.size()) return false;
+    for (std::size_t i = 0; i < topicIds.size(); ++i) plan.sources[i].topicId = topicIds[i];
+    return true;
 }
 
 } // namespace rune::client::view
