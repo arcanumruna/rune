@@ -363,6 +363,12 @@ public:
         checkInvariant_("shrinkIsr");
     }
     void restoreIsr() { promote(); }
+    /// The ISR changes at the SAME epoch (a follower leaves / rejoins it — review
+    /// M7): not a leadership change; an op in AwaitingCommit stays in flight.
+    void setIsrInPlace(std::vector<int32_t> isr) {
+        rig_->updateIsr(std::move(isr));
+        checkInvariant_("setIsrInPlace");
+    }
     /// A broker restart (only when quiescent): same data dir, same replica set.
     void restart() {
         if (!quiescent()) violations_.push_back("restart requested while not quiescent");

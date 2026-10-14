@@ -403,8 +403,16 @@ void BrokerNode::start() {
                              "migration); topics recorded only there are not recovered",
                              config_.nodeId, rdir.string());
         }
+        std::vector<TopicSpec> catalogTopics = catalogLiveTopicSpecs(config_.dataDir);
+        // Task 10 fix round 1 (INTERIM until Task 17): a static topic colliding with
+        // a catalog topic by name or id would open / quarantine its dir or take its
+        // id — refuse to start, explicitly, BEFORE anything on disk is touched.
+        if (auto collision = staticCatalogCollision(config_.topics, catalogTopics)) {
+            spdlog::critical("BrokerNode[{}]: {}", config_.nodeId, *collision);
+            throw std::runtime_error("BrokerNode: " + *collision);
+        }
         std::vector<TopicSpec> claims = config_.topics;
-        for (TopicSpec& t : catalogLiveTopicSpecs(config_.dataDir)) claims.push_back(std::move(t));
+        for (TopicSpec& t : catalogTopics) claims.push_back(std::move(t));
         (void)reconcileTopicDirs(config_.dataDir, claims, /*placeholderIds=*/{},
                                  std::chrono::duration_cast<std::chrono::seconds>(
                                      std::chrono::system_clock::now().time_since_epoch()).count());

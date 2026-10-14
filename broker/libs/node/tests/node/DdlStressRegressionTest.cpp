@@ -87,7 +87,7 @@ const char* faultName(Fault f) {
 enum Timing : uint8_t { T1, T2, T3, T4, T5a, T5c, T5d, T6, T7, kTimingCount };
 const char* const kTimingNames[kTimingCount] = {"T1", "T2", "T3", "T4", "T5a", "T5c", "T5d", "T6", "T7"};
 
-struct Bound { std::string name; uint64_t incarnation; };   // a source bound by id at submit (0 = unbound)
+struct Bound { std::string name; int32_t topicId; };   // a source bound by id at submit (-1 = unbound)
 struct Planned   { Op op; std::string name; Fault fault; std::vector<std::string> sources; };
 struct Submitted {
     int64_t corr; Op op; std::string name; Fault fault;
@@ -95,6 +95,14 @@ struct Submitted {
     bool persistedView = true;   // CREATE VIEW persisted / ALTER VIEW's submit-time persistence
     bool inDoubt = false;        // struck in AwaitingCommit (timeout / demotion): NotLeader, applied later
 };
+
+/// What the model expects an answer to be.  checkIdVersion: an OK whose id and
+/// version the model predicts (the topic / sink id from its own id counter; the
+/// schema version, or the OBJECT version for a DdlResponse).
+struct Expect { uint16_t code; int32_t id = -1; uint32_t version = 0; bool checkIdVersion = false; };
+/// Review I1: an op the implementation APPENDED (struck in AwaitingCommit) that the
+/// model would have refused — never a code the broker sends, so the seed fails.
+constexpr uint16_t kWronglyAccepted = 0xFFFF;
 
 const std::vector<std::string> kPool = {"a", "b", "A", "s", "src", "__views", ""};
 // View sources: typed disk (src, src2), typed transient (tsrc), a view's output
@@ -110,14 +118,16 @@ constexpr uint64_t kSetupDdlOps = 5;   // src, src2 (harness) + s, tsrc, vsrc (r
 struct Model {
     std::map<std::string, Occupant> occ;       // exact name -> occupant (absent = Free)
     std::map<std::string, uint16_t> version;   // the schema version a GetSchema answers
-    std::map<std::string, uint64_t> incarnation;   // bumped whenever the name gets a NEW topic id
+    std::map<std::string, uint32_t> objVersion;   // the catalog object version
+    std::map<std::string, int32_t>  topicId;   // the topic / view-sink id the name holds
     std::map<std::string, std::vector<std::string>> viewSources;   // live view -> its source names
-    uint64_t nextIncarnation = 1;
+    int32_t nextTopicId = 0;   // the catalog's dense id counter (CreateTopic / CreateView / AlterView)
     /// The leader refuses DDL (a demotion or a catch-up on a held event): every op
     /// that starts now is answered NotLeader.
     bool refusing = false;
     bool isrShrunk = false;    // appends refused: an op whose cell succeeds is NotLeader
     std::optional<Submitted> pending;   // the in-doubt op whose event is not applied yet
+    std::string wronglyAccepted;        // why the last kWronglyAccepted was expected
 
     Occupant at(const std::string& n) const {
         if (!rune::catalog::isValidTopicName(n)) return Occupant::BadName;
@@ -133,11 +143,11 @@ struct Model {
     static bool isTyped(Occupant o) { return o == Occupant::TypedDisk || o == Occupant::TypedTransient; }
     static bool isViewOcc(Occupant o) { return o == Occupant::ViewPersisted || o == Occupant::ViewTransient; }
     /// A source as the client binds it at SUBMIT time (GetTopicSchema): a typed topic
-    /// or a view output binds to its id (this incarnation); anything else is unbound.
+    /// or a view output binds to its id; anything else is unbound.
     Bound bind(const std::string& n) const {
         const Occupant o = exact(n);
-        if (!isTyped(o) && !isViewOcc(o)) return Bound{n, 0};
-        return Bound{n, incarnation.at(n)};
+        if (!isTyped(o) && !isViewOcc(o)) return Bound{n, -1};
+        return Bound{n, topicId.at(n)};
     }
     /// The plan's view-source rules, evaluated when the op STARTS on the ids bound
     /// at submit.  Per source, in order: unbound or no longer that id -> 33; a
@@ -145,8 +155,8 @@ struct Model {
     /// topic under a persisted view -> 37 (Phase 2b E).  Then 2+ sources -> 34.
     uint16_t sourceRule(const Submitted& s) const {
         for (const Bound& b : s.sources) {
-            const auto it = incarnation.find(b.name);
-            if (b.incarnation == 0 || it == incarnation.end() || it->second != b.incarnation) return kViewSourceNotFound;
+            const auto it = topicId.find(b.name);
+            if (b.topicId < 0 || it == topicId.end() || it->second != b.topicId) return kViewSourceNotFound;
             const Occupant o = exact(b.name);
             if (isViewOcc(o)) return kViewSourceIsView;
             if (!isTyped(o)) return kViewSourceNotFound;
@@ -170,52 +180,68 @@ struct Model {
         if (s.op == Op::DropTopic && readByAView(s.name)) return kInvalidRequest;
         return kOk;
     }
-    void applyEffect(const Submitted& s) {
+    /// Apply an accepted op; returns the id / version its OK answer carries.
+    Expect applyEffect(const Submitted& s) {
         const Occupant o = at(s.name);
         switch (s.op) {
             case Op::DefineDisk: case Op::DefineTransient:
-                if (o == Occupant::Free) incarnation[s.name] = nextIncarnation++;
+                if (o == Occupant::Free) { topicId[s.name] = nextTopicId++; objVersion[s.name] = 1; }
+                else ++objVersion[s.name];   // an untyped topic adopts the schema: its next event
                 occ[s.name] = occupantAfterSuccess(o, s.op);
                 version[s.name] = 1;
-                return;
+                return Expect{kOk, topicId[s.name], 1, true};
             case Op::ViewPersisted: case Op::ViewTransient:
             case Op::AlterView: {
                 occ[s.name] = s.persistedView ? Occupant::ViewPersisted : Occupant::ViewTransient;
-                incarnation[s.name] = nextIncarnation++;   // a (fresh) sink id
-                version[s.name] = 1;                       // its output's schema
+                topicId[s.name] = nextTopicId++;   // a (fresh) sink id
+                version[s.name] = 1;               // its output's schema
+                objVersion[s.name] = s.op == Op::AlterView ? objVersion[s.name] + 1 : 1;
                 std::vector<std::string> names;
                 for (const Bound& b : s.sources) names.push_back(b.name);
                 viewSources[s.name] = std::move(names);
-                return;
+                // CreateView: its sink id, v1; AlterView (a DdlResponse): gated on the fresh sink, the object version.
+                return Expect{kOk, topicId[s.name], s.op == Op::AlterView ? objVersion[s.name] : 1u, true};
             }
-            case Op::DropTopic: case Op::DropView:
-                occ.erase(s.name); version.erase(s.name); incarnation.erase(s.name); viewSources.erase(s.name);
-                return;
-            case Op::AlterTopicConfig: case Op::GetSchema:
-                return;
-            default:   // every ALTER bumps the schema version
+            case Op::DropTopic: case Op::DropView: {
+                const uint32_t v = objVersion[s.name] + 1;
+                occ.erase(s.name); version.erase(s.name); objVersion.erase(s.name); topicId.erase(s.name);
+                viewSources.erase(s.name);
+                return Expect{kOk, -1, v, true};
+            }
+            case Op::AlterTopicConfig:
+                return Expect{kOk, -1, ++objVersion[s.name], true};
+            case Op::GetSchema:
+                return Expect{kOk};
+            default:   // every ALTER bumps the schema version and the object version
+                ++objVersion[s.name];
                 version[s.name] = static_cast<uint16_t>(version[s.name] + 1);
-                return;
+                return Expect{kOk, topicId[s.name], version[s.name], true};
         }
     }
     /// Apply `s` (FIFO order) and return its expected answer.
-    uint16_t apply(const Submitted& s) {
+    Expect apply(const Submitted& s) {
         if (s.inDoubt) {
-            // It was accepted and appended (only an accepted op awaits a commit):
-            // answered NotLeader; its effect lands once the event is applied.
-            if (refusing) pending = s; else applyEffect(s);
-            return kNotLeader;
+            // Review I1: the implementation appended it (only an accepted op awaits a
+            // commit).  The model must AGREE it was acceptable before its effect may
+            // land — a wrongly accepted op (a second create on a taken name, ...) fails.
+            const uint16_t v = verdict(s);
+            if (v != kOk || isrShrunk) {
+                wronglyAccepted = std::string(opName(s.op)) + " '" + s.name + "' was appended (struck in "
+                                  "AwaitingCommit) but the model refuses it with " + std::to_string(v);
+                return Expect{kWronglyAccepted};
+            }
+            if (refusing) pending = s; else (void)applyEffect(s);
+            return Expect{kNotLeader};
         }
-        if (refusing) return kNotLeader;
+        if (refusing) return Expect{kNotLeader};
         const uint16_t v = verdict(s);
-        if (v != kOk) return v;
-        if (isrShrunk) return kNotLeader;   // the append is refused: nothing appended
-        applyEffect(s);
-        return kOk;
+        if (v != kOk) return Expect{v};
+        if (isrShrunk) return Expect{kNotLeader};   // the append is refused: nothing appended
+        return applyEffect(s);
     }
     /// The held in-doubt event commits and is applied; the leader serves again.
     void resolve() {
-        if (pending) applyEffect(*pending);
+        if (pending) (void)applyEffect(*pending);
         pending.reset();
         refusing = false;
     }
@@ -329,7 +355,11 @@ void runSeed(uint64_t seed) {
     const int commitInstalls0 = h.viewPlanPushes();
 
     Model m;
-    for (const char* n : {"src", "src2", "s", "tsrc", "vsrc"}) m.incarnation[n] = m.nextIncarnation++;
+    for (const char* n : {"src", "src2", "s", "tsrc", "vsrc"}) {
+        m.topicId[n] = m.nextTopicId++;   // the setup's creates, in order
+        m.objVersion[n] = 1;
+        ASSERT_EQ(h.idOf(n), m.topicId[n]) << "setup id of " << n;
+    }
     m.occ["s"]    = Occupant::SchemaLessDisk;
     m.occ["src"]  = Occupant::TypedDisk;      m.version["src"]  = 1;
     m.occ["src2"] = Occupant::TypedDisk;      m.version["src2"] = 1;
@@ -390,20 +420,32 @@ void runSeed(uint64_t seed) {
             if (!r) break;
             const bool refusing = m.refusing;
             const bool hadPending = m.pending.has_value();
-            const uint16_t want = m.apply(sub);
+            const Expect want = m.apply(sub);
             ++st.codes[r->err];
             if (refusing && !sub.inDoubt) ++st.refusedQueued;
-            const bool installs = readsSources(sub.op) && (want == kOk || sub.inDoubt);
+            const bool installs = readsSources(sub.op) && (want.code == kOk || (sub.inDoubt && want.code == kNotLeader));
             // A view installed now (an OK, or an in-doubt one applied at once); a held one at resolve().
             if (installs && !(sub.inDoubt && m.pending.has_value() && !hadPending)) ++expectedCommitInstalls;
-            if (r->err != want) fail(sub.name);
-            EXPECT_EQ(r->err, want) << "op#" << applied << " " << opName(sub.op) << " '" << sub.name
-                                    << "' fault=" << faultName(sub.fault)
-                                    << (readsSources(sub.op) ? " sources=" + [&] {
-                                           std::string x;
-                                           for (const Bound& b : sub.sources) x += (x.empty() ? "" : ",") + b.name;
-                                           return x;
-                                       }() : std::string());
+            const std::string what = std::string("op#") + std::to_string(applied) + " " + opName(sub.op) + " '" +
+                                     sub.name + "' fault=" + faultName(sub.fault) +
+                                     (readsSources(sub.op) ? " sources=" + [&] {
+                                         std::string x;
+                                         for (const Bound& b : sub.sources) x += (x.empty() ? "" : ",") + b.name;
+                                         return x;
+                                     }() : std::string());
+            if (want.code == kWronglyAccepted) {
+                fail(sub.name);
+                ADD_FAILURE() << what << ": " << m.wronglyAccepted;
+            } else {
+                if (r->err != want.code) fail(sub.name);
+                EXPECT_EQ(r->err, want.code) << what;
+                if (want.checkIdVersion && r->err == kOk) {
+                    // Review M3: the answer's id and version, from the model's own counters.
+                    if (r->id != want.id || r->version != want.version) fail(sub.name);
+                    EXPECT_EQ(r->id, want.id) << what << ": the answer's topic / sink id";
+                    EXPECT_EQ(r->version, want.version) << what << ": the answer's version";
+                }
+            }
             ++applied;
         }
     };
@@ -530,8 +572,16 @@ void runSeed(uint64_t seed) {
 
                 Submitted sub{0, p.op, p.name, p.fault, {}, p.op != Op::ViewTransient, false};
                 if (p.op == Op::AlterView) {
+                    // Read at SUBMIT time from the model; review M4: the projected
+                    // ViewRegistry must agree with it (a disagreement fails, never copied).
+                    const Occupant o = m.exact(p.name);
+                    sub.persistedView = o != Occupant::ViewTransient;
                     const ViewRecord* v = h.views().byName(p.name);
-                    sub.persistedView = v == nullptr || v->persistence == 0;   // read at SUBMIT time
+                    const bool agree = Model::isViewOcc(o) ? v != nullptr && (v->persistence == 1) == (o == Occupant::ViewTransient)
+                                                           : v == nullptr;
+                    if (!agree) fail(p.name);
+                    EXPECT_TRUE(agree) << "ALTER VIEW '" << p.name << "': the ViewRegistry disagrees with the model ("
+                                       << occupantName(o) << ")";
                 }
                 for (const std::string& src : p.sources) sub.sources.push_back(m.bind(src));
                 note("session " + std::to_string(si) + " submit " + opName(p.op) + " '" + p.name +

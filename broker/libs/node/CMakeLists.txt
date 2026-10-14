@@ -575,6 +575,8 @@ if(BUILD_TESTING)
     # restored or explicitly ruled out (task-10 report).
     add_executable(rune_ddl_conformance_tests
         tests/node/DdlHarnessRegressionTest.cpp
+        tests/node/DdlLeadershipRegressionTest.cpp
+        tests/node/DdlDedupeRegressionTest.cpp
         tests/node/DdlOccupantMatrixRegressionTest.cpp
         tests/node/DdlPairTimingMatrixRegressionTest.cpp
         tests/node/DdlFinalFixRegressionTest.cpp)

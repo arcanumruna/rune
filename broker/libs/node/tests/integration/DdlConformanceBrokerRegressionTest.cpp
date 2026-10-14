@@ -522,3 +522,115 @@ TEST(DdlConformanceBrokerRegression, C4_HeldOkForATopicThatNeverServesIsAnswered
     node.stop();
 }
 
+
+// ── Task 10 fix round 1 (review I2): RUNE_TOPICS added after catalog topics ──────
+// INTERIM until Task 17 removes RUNE_TOPICS.  A static topic whose name (exact or
+// an ASCII case variant) or id (its RUNE_TOPICS position) collides with a catalog
+// topic would open, or quarantine, the catalog topic's directory: boot REFUSES,
+// naming both, before anything on disk is touched — and the old configuration
+// still boots with the catalog topic intact.
+
+// I3, the boot direction: a static name equal to (or a case variant of) a catalog topic.
+TEST(DdlConformanceBrokerRegression, I3_StaticNameCollidingWithACatalogTopicRefusesBootRegression) {
+    const TempDataDir tmp("i3_");
+    const fs::path& dir = tmp.path;
+    const NodeConfig cfg = makeSingleNodeConfig(dir);
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ShardTestClient client(dir / "client-aeron");
+        client.keepSessionsAlive(true);
+        Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+        const int64_t sid = client.connect(w.gw, w.stream);
+        ASSERT_TRUE(w.awaitDdlReady(sid));
+        ASSERT_EQ(w.define(sid, "orders"), kOk);
+        node.stop();
+    }
+    for (const char* staticName : {"orders", "Orders", "ORDERS"}) {
+        SCOPED_TRACE(staticName);
+        NodeConfig c2 = cfg;
+        TopicSpec s; s.name = staticName; s.partitionCount = 1; s.topicId = 0;
+        c2.topics = {s};
+        BrokerNode node{c2};
+        try {
+            node.start();
+            ADD_FAILURE() << "boot must refuse a static name colliding with catalog topic 'orders'";
+            node.stop();
+        } catch (const std::exception& ex) {
+            const std::string what = ex.what();
+            EXPECT_NE(what.find(std::string("'") + staticName + "'"), std::string::npos) << what;
+            EXPECT_NE(what.find("'orders'"), std::string::npos) << what;
+            EXPECT_NE(what.find("by name"), std::string::npos) << what;
+        }
+        EXPECT_TRUE(fs::exists(dir / "topics" / "orders" / "0")) << "nothing moved or deleted";
+        EXPECT_FALSE(fs::exists(dir / "quarantine"));
+    }
+    {
+        BrokerNode node{cfg};
+        node.start();   // the unchanged configuration still boots
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ShardTestClient client(dir / "client-aeron2");
+        client.keepSessionsAlive(true);
+        Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+        const int64_t sid = client.connect(w.gw, w.stream);
+        ASSERT_TRUE(w.awaitDdlReady(sid));
+        const auto s = w.schema(sid, "orders");
+        ASSERT_TRUE(s.has_value());
+        EXPECT_EQ(s->errorCode, kOk) << "the catalog topic is intact";
+        node.stop();
+    }
+}
+
+// I5c, the boot direction: a NON-colliding static NAME added while catalog topics
+// exist still takes a catalog id (static ids are RUNE_TOPICS positions, catalog ids
+// start at 0): boot refuses, and the catalog topic keeps its id and acked records.
+TEST(DdlConformanceBrokerRegression, I5c_AddingAStaticTopicWhileCatalogTopicsExistRefusesBootAndKeepsDataRegression) {
+    const TempDataDir tmp("i5c_");
+    const fs::path& dir = tmp.path;
+    const NodeConfig cfg = makeSingleNodeConfig(dir);
+    int32_t ordersId = -1;
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ShardTestClient client(dir / "client-aeron");
+        client.keepSessionsAlive(true);
+        Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+        const int64_t sid = client.connect(w.gw, w.stream);
+        ASSERT_TRUE(w.awaitDdlReady(sid));   // "ddl_ready": catalog id 0
+        ASSERT_EQ(w.define(sid, "orders"), kOk);
+        ordersId = w.schema(sid, "orders")->topicId;
+        ASSERT_EQ(ordersId, 1);
+        const auto p = produceOnce(client, w, sid, ordersId, "acked-order");
+        ASSERT_TRUE(p.has_value());
+        ASSERT_EQ(*p, 0);
+        node.stop();
+    }
+    NodeConfig c2 = cfg;
+    TopicSpec extra; extra.name = "extra"; extra.partitionCount = 1; extra.topicId = 0;
+    c2.topics = {extra};
+    {
+        BrokerNode node{c2};
+        try {
+            node.start();
+            ADD_FAILURE() << "boot must refuse a static topic taking catalog id 0";
+            node.stop();
+        } catch (const std::exception& ex) {
+            const std::string what = ex.what();
+            EXPECT_NE(what.find("'extra'"), std::string::npos) << what;
+            EXPECT_NE(what.find("'ddl_ready'"), std::string::npos) << what;
+            EXPECT_NE(what.find("by topic id"), std::string::npos) << what;
+        }
+    }
+    EXPECT_TRUE(fs::exists(dir / "topics" / "ddl_ready")) << "the catalog topic's dir was not touched";
+    EXPECT_FALSE(fs::exists(dir / "quarantine")) << "nothing quarantined";
+    EXPECT_FALSE(fs::exists(dir / "topics" / "extra")) << "the static topic never opened a dir";
+    {
+        BrokerNode node{cfg};
+        node.start();   // the unchanged configuration boots with every record
+        ASSERT_TRUE(node.awaitLeader(30s));
+        EXPECT_EQ(leoOnOwner(node, ordersId, 0), 1) << "the catalog topic keeps its id and acked record";
+        node.stop();
+    }
+}

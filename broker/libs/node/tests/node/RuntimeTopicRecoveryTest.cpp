@@ -1349,3 +1349,42 @@ TEST(RuntimeTopicRecoveryRegression, StaticCaseVariantOfARecoveredTopicRefusesBo
     EXPECT_NO_THROW(rune::node::refuseStaticNamesCollidingWithRecovered({spec("orders", 0)}, rec.catalogTopics));
     EXPECT_TRUE(fs::exists(d.path / "topics" / "orders" / "0"));
 }
+
+// ── Catalog history Task 10 fix round 1 (review I2): the INTERIM boot rule — a
+//    static RUNE_TOPICS topic never shares a broker with a catalog topic. ────────
+namespace {
+rune::node::TopicSpec collisionSpec(const std::string& name, int32_t id) {
+    rune::node::TopicSpec s;
+    s.name = name; s.topicId = id; s.partitionCount = 1;
+    return s;
+}
+}  // namespace
+
+TEST(StaticCatalogCollisionRegression, NameIdAndCaseVariantCollisionsRefuseBootNamingBoth) {
+    using rune::node::staticCatalogCollision;
+    const std::vector<rune::node::TopicSpec> catalog = {collisionSpec("ddl_ready", 0), collisionSpec("orders", 1)};
+    {
+        const auto r = staticCatalogCollision({collisionSpec("orders", 0)}, catalog);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_NE(r->find("'orders' (id 0) collides by name with the catalog topic 'orders' (id 1)"), std::string::npos) << *r;
+    }
+    {
+        const auto r = staticCatalogCollision({collisionSpec("ORDERS", 5)}, catalog);
+        ASSERT_TRUE(r.has_value()) << "a case variant shares the directory";
+        EXPECT_NE(r->find("by name"), std::string::npos) << *r;
+    }
+    {
+        const auto r = staticCatalogCollision({collisionSpec("extra", 0)}, catalog);
+        ASSERT_TRUE(r.has_value()) << "static id 0 is catalog topic ddl_ready's";
+        EXPECT_NE(r->find("'extra' (id 0) collides by topic id with the catalog topic 'ddl_ready' (id 0)"),
+                  std::string::npos) << *r;
+    }
+    {
+        const auto r = staticCatalogCollision({collisionSpec("extra", -1)}, catalog);   // id = its position (0)
+        ASSERT_TRUE(r.has_value());
+        EXPECT_NE(r->find("by topic id"), std::string::npos) << *r;
+    }
+    EXPECT_FALSE(staticCatalogCollision({collisionSpec("extra", 7)}, catalog).has_value()) << "no shared name or id";
+    EXPECT_FALSE(staticCatalogCollision({collisionSpec("events", 0)}, {}).has_value()) << "static topics alone boot";
+    EXPECT_FALSE(staticCatalogCollision({}, catalog).has_value()) << "catalog topics alone boot";
+}

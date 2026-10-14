@@ -170,13 +170,20 @@ void setupOccupant(DdlHarness& h, const Row& row) {
     }
 }
 
-void expectSuccessDelta(const Catalog& before, const Catalog& after, Op op, const std::string& name,
+void expectSuccessDelta(DdlHarness& h, const Catalog& before, const Catalog& after, Op op, const std::string& name,
                         const Response& r) {
     const CatalogEntry* b = findEntry(before, name);
     const CatalogEntry* a = findEntry(after, name);
     if (isDrop(op)) {
         ASSERT_NE(b, nullptr);
         EXPECT_EQ(a, nullptr) << "a drop frees the name";
+        // Review M2: the projections forget it too (catalog() is derived from the
+        // applied state, so a stale registry entry would pass unnoticed).
+        EXPECT_EQ(h.schemas().byName(name), nullptr) << "no stale SchemaRegistry entry";
+        EXPECT_EQ(h.views().byName(name), nullptr) << "no stale ViewRegistry entry";
+        const int64_t g = h.submit(Op::GetSchema, name);
+        ASSERT_TRUE(h.response(g).has_value());
+        EXPECT_EQ(h.response(g)->err, kUnknownTopic) << "GetSchema on the dropped name";
         EXPECT_EQ(after.size(), before.size() - 1);
         EXPECT_EQ(r.version, b->objectVersion + 1) << "the drop event is the object's next version";
     } else {
@@ -264,7 +271,7 @@ TEST_P(DdlOccupantMatrixRegression, OneOpOnAnOccupiedName) {
         EXPECT_EQ(h.catalogLogEnd(), logEnd) << "no stray __catalog event";
         EXPECT_EQ(h.viewPlanPushes(), plans) << "no worker install";
     } else {
-        expectSuccessDelta(before, after, op, row.target, *got);
+        expectSuccessDelta(h, before, after, op, row.target, *got);
         EXPECT_EQ(h.catalogLogEnd() - logEnd, 1) << "exactly one event";
         EXPECT_EQ(h.viewPlanPushes() - plans, isView(op) || op == Op::AlterView ? 1 : 0);
     }

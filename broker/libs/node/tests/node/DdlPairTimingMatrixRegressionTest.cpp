@@ -11,7 +11,8 @@
 // Timing classes on the catalog path (the control-thread AwaitingId state and its
 // create-reply faults are gone — Task 9):
 //   T1 sequential; T2 both queued before either runs;
-//   T3 B submitted behind A's append, before the pass that applies it;
+//   T3 B submitted behind A's append: one held pass, then A committed but not yet
+//      applied (the HW covers it before the pass that applies it);
 //   T4 B submitted while A waits on a HELD HW (AwaitingCommit);
 //   T5a A's append refused (the ISR below minIsr): NotLeader, nothing appended;
 //   T5b A's commit times out (NotLeader, F13) and B runs while the leader catches up
@@ -67,7 +68,7 @@ bool concurrent(Timing t) {
            t == Timing::T4_DuringAwaitingCommit;
 }
 bool heldHw(Timing t) {
-    return t == Timing::T4_DuringAwaitingCommit || t == Timing::T5b_TimeoutThenBWhileCatchingUp ||
+    return t == Timing::T3_BehindAnUnappliedAppend || t == Timing::T4_DuringAwaitingCommit || t == Timing::T5b_TimeoutThenBWhileCatchingUp ||
            t == Timing::T5c_TimeoutThenCommits || t == Timing::T6_DemotedInAwaitingCommit;
 }
 
@@ -158,6 +159,17 @@ void expectOccupant(const Catalog& cat, const std::string& name, Occupant o) {
 
 struct Ran { int64_t a = 0; int64_t b = 0; };
 
+/// `first` was answered strictly before `second` (both answered).
+bool answeredBefore(const DdlHarness& h, int64_t first, int64_t second) {
+    int pf = -1, ps = -1, i = 0;
+    for (const Response& r : h.responses()) {
+        if (r.corr == first && pf < 0) pf = i;
+        if (r.corr == second && ps < 0) ps = i;
+        ++i;
+    }
+    return pf >= 0 && ps >= 0 && pf < ps;
+}
+
 Ran runPair(DdlHarness& h, const PairCase& c) {
     Ran r;
     const std::string an = aName(c.a);
@@ -173,12 +185,24 @@ Ran runPair(DdlHarness& h, const PairCase& c) {
             h.settle();
             break;
         case Timing::T3_BehindAnUnappliedAppend: {
+            // B behind A's event through both of its stages: appended (one held
+            // pass), then COMMITTED but not yet applied (the HW covers it before the
+            // admin pass that applies it).  B starts only after A is answered.
             r.a = h.submit(c.a, an);
             EXPECT_TRUE(h.tickUntilAppended());
-            EXPECT_FALSE(h.response(r.a).has_value()) << "A is answered only once its event is applied";
-            const uint64_t events = h.eventsAppended();
+            const int64_t logEnd = h.catalogLogEnd();
             r.b = h.submit(c.b, bn);
-            EXPECT_EQ(h.eventsAppended(), events) << "B appended while A was in flight";
+            h.tick();   // A held in AwaitingCommit
+            EXPECT_FALSE(h.response(r.a).has_value()) << "A answered before its event committed";
+            if (c.b != Op::GetSchema) EXPECT_FALSE(h.response(r.b).has_value()) << "B ran while A was in flight";
+            EXPECT_EQ(h.catalogLogEnd(), logEnd) << "B appended while A was in flight";
+            h.releaseCommits();   // committed, not applied: no admin pass yet
+            EXPECT_FALSE(h.response(r.a).has_value()) << "A answered before its event was applied";
+            h.tick();   // the pass that applies A: A is answered, THEN B may start
+            EXPECT_TRUE(h.response(r.a).has_value()) << "A's committed event is applied and answered";
+            if (c.b != Op::GetSchema && h.response(r.b).has_value())
+                EXPECT_TRUE(answeredBefore(h, r.a, r.b)) << "B was answered before A";
+            EXPECT_LE(h.catalogLogEnd(), logEnd + 1) << "at most B's own event follows A's";
             h.settle();
             break;
         }

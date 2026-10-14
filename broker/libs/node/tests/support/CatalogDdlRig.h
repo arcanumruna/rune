@@ -136,7 +136,20 @@ public:
         r.leader = true;
         r.epoch = ++epoch_;
         r.leaderId = kSelf;
-        r.partitionEpoch = 0;
+        r.partitionEpoch = partitionEpoch_ = 0;
+        r.isrCount = static_cast<int32_t>(isr.size());
+        for (std::size_t i = 0; i < isr.size(); ++i) r.isr[i] = isr[i];
+        admin_->onCatalogRole(r);
+    }
+    /// Task 10 fix round 1 (review M7): the ISR changes at the SAME leader epoch (a
+    /// committed AlterIsr: a new partitionEpoch) — not a leadership change.  No pump.
+    void updateIsr(std::vector<int32_t> isr) {
+        isr_ = isr;
+        AdminRoleMsg r;
+        r.leader = true;
+        r.epoch = epoch_;
+        r.leaderId = kSelf;
+        r.partitionEpoch = ++partitionEpoch_;
         r.isrCount = static_cast<int32_t>(isr.size());
         for (std::size_t i = 0; i < isr.size(); ++i) r.isr[i] = isr[i];
         admin_->onCatalogRole(r);
@@ -514,6 +527,7 @@ private:
     std::function<void()>                                onAnswer_;
     std::function<void(int64_t, const Answer&)>          onRecorded_;
     int32_t                                              epoch_ = 0;
+    int32_t                                              partitionEpoch_ = 0;
     int64_t                                              now_   = 1'000'000'000;
     int64_t                                              corr_  = 0;
     uint64_t                                             ridCounter_ = 0;

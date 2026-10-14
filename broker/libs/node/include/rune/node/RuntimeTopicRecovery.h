@@ -32,6 +32,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -72,6 +73,16 @@ bool clearTopicIdMarker(const std::string& topicDir);
 /// checkpoint = nothing applied = {}.  Throws on an unreadable checkpoint (boot
 /// refuses, as buildCatalog_ would).
 [[nodiscard]] std::vector<TopicSpec> catalogLiveTopicSpecs(const std::string& dataDir);
+
+/// INTERIM (catalog history Task 10 fix round 1, until Task 17 removes RUNE_TOPICS):
+/// a static RUNE_TOPICS topic and a catalog topic / view sink can never share a
+/// broker — the static topic would open (or quarantine) the catalog topic's dir,
+/// or take its id: silent data loss.  Returns the boot refusal naming the first
+/// collision — by name (exact or an ASCII case variant: one directory) first, then
+/// by topic id (a static topic's id is its RUNE_TOPICS position) — or nullopt.
+/// BrokerNode::start throws it (the broker refuses to start).
+[[nodiscard]] std::optional<std::string> staticCatalogCollision(const std::vector<TopicSpec>& statics,
+                                                                const std::vector<TopicSpec>& catalogTopics);
 
 /// "__orphan.<topicId>" — the recovery placeholder name for a catalog-less id.
 [[nodiscard]] std::string orphanPlaceholderName(int32_t topicId);

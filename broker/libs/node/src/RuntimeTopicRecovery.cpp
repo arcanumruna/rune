@@ -497,4 +497,30 @@ std::vector<TopicSpec> catalogLiveTopicSpecs(const std::string& dataDir) {
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// staticCatalogCollision — INTERIM (Task 10 fix round 1): a static topic and a
+// catalog topic never share a broker.
+// ---------------------------------------------------------------------------
+std::optional<std::string> staticCatalogCollision(const std::vector<TopicSpec>& statics,
+                                                  const std::vector<TopicSpec>& catalogTopics) {
+    auto staticId = [&](std::size_t i) {
+        return statics[i].topicId >= 0 ? statics[i].topicId : static_cast<int32_t>(i);
+    };
+    auto refusal = [](const TopicSpec& s, int32_t sid, const TopicSpec& c, const char* how) {
+        return "static RUNE_TOPICS topic '" + rune::catalog::escapeNameForLog(s.name) + "' (id " + std::to_string(sid) +
+               ") collides " + how + " with the catalog topic '" + rune::catalog::escapeNameForLog(c.name) +
+               "' (id " + std::to_string(c.topicId) +
+               ") — a static topic would take the catalog topic's directory or id; refusing to start (remove it "
+               "from RUNE_TOPICS: create every topic by DDL)";
+    };
+    for (std::size_t i = 0; i < statics.size(); ++i)
+        for (const TopicSpec& c : catalogTopics)
+            if (statics[i].name == c.name || topicNamesFoldEqual(statics[i].name, c.name))
+                return refusal(statics[i], staticId(i), c, "by name");
+    for (std::size_t i = 0; i < statics.size(); ++i)
+        for (const TopicSpec& c : catalogTopics)
+            if (staticId(i) == c.topicId) return refusal(statics[i], staticId(i), c, "by topic id");
+    return std::nullopt;
+}
+
 } // namespace rune::node
