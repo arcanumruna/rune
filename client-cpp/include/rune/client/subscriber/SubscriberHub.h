@@ -204,6 +204,19 @@ public:
     bool rearmMovedAway(int64_t correlationId, int64_t newCorrId, int64_t unsubCorrId, int64_t answerSid,
                         int64_t seedSid, std::chrono::steady_clock::time_point deadline);
 
+    /// Catalog history (Task 13): the broker answered the Subscribe
+    /// `correlationId` of a BOUND catalog subscription (TopicHandle::catalog())
+    /// with the retriable NotLeader — its replica truncated below a high
+    /// watermark it had served, so it ended every catalog read once.  The
+    /// subscription is FINISHED with SubscriptionFailReason::CatalogReadEnded,
+    /// never re-armed from its position (rearmMovedAway): what it delivered may
+    /// no longer be the committed history, and only its reader can re-validate
+    /// that.  `answerSid` must be its home session (`seedSid` on the seed).
+    /// False (no change) when `correlationId` names no active bound catalog
+    /// subscription — the caller then takes the ordinary paths.  Cold.
+    bool endCatalogRead(int64_t correlationId, int64_t answerSid, int64_t seedSid);
+    [[nodiscard]] uint64_t catalogReadsEnded() const noexcept { return catalogReadsEnded_; }
+
     // ---- E2 final fix wave (I2): moved subscriptions live on their leader's
     // own node session (never by retargeting the seed) -------------------------
 
@@ -461,6 +474,7 @@ private:
     uint64_t    staleResponsesIgnored_ = 0;
     uint64_t    subscribesFailed_      = 0;  // fix4 M1: Fatal Subscribe offers
     uint64_t    subscriptionsMoved_    = 0;  // E2 Task 13: rearmMovedAway
+    uint64_t    catalogReadsEnded_     = 0;  // catalog history Task 13: endCatalogRead
     uint64_t    movedDuplicateBatchesDropped_ = 0;  // E2 final fix wave (I1)
     // E2 final fix wave (I2): moved subscriptions homed on leader node sessions.
     NodeRouter  router_{};

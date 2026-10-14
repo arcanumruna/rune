@@ -11,6 +11,7 @@
 #include <rune/client/subscriber/SubscriberHub.h>
 #include <rune/client/group/GroupConsumerHub.h>  // isFetchCorrId (header-only constexpr)
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/Protocol.h>  // kCatalogTopicId
 
 #include <cassert>
 #include <chrono>
@@ -492,6 +493,31 @@ void SubscriberHub::onRecords(const codec::RecordsView& rv, int64_t currentSessi
         uint64_t l = 0;
         for (int i = 0; i < 8; ++i) l |= static_cast<uint64_t>(rb[static_cast<std::size_t>(i)]) << (8 * i);
         impl.lineage = l;
+        return;
+    }
+    if (rb.empty() && impl.topicId == rune::protocol::client::kCatalogTopicId) [[unlikely]] {
+        // Catalog history (Task 13): the CAUGHT-UP MARKER (client version 8) —
+        // the serving broker's high watermark, after the committed backlog.
+        // Never a position note (a catalog subscription is never moved).
+        if (impl.onCaughtUp) {
+            dispatching_ = &impl;
+            try {
+                impl.onCaughtUp(rv.baseOffset);
+            } catch (const std::exception& e) {
+                ++callbackExceptions_;
+                std::fprintf(stderr, "rune-client: catalog onCaughtUp threw: %s (caught; the duty cycle continues)\n",
+                             e.what());
+            } catch (...) {
+                ++callbackExceptions_;
+                std::fprintf(stderr, "rune-client: catalog onCaughtUp threw a non-std::exception (caught; the "
+                                     "duty cycle continues)\n");
+            }
+            dispatching_ = nullptr;
+            if (!impl.active) {   // finished from inside the callback (as for a record handler)
+                closeStatus_(impl);
+                if (!impl.unsubPending) activeById_.erase(it);
+            }
+        }
         return;
     }
     if (rb.empty()) {
@@ -1051,6 +1077,25 @@ void SubscriberHub::failPendingSubscribes(const std::string& reason)
         it = pendingByCorrelation_.erase(it);
     }
     (void)reason;
+}
+
+bool SubscriberHub::endCatalogRead(int64_t correlationId, int64_t answerSid, int64_t seedSid)
+{
+    if (correlationId == 0) return false;
+    for (auto it = activeById_.begin(); it != activeById_.end(); ++it) {
+        SubscriptionImpl* impl = it->second;
+        if (impl == nullptr || impl->correlationId != correlationId) continue;
+        if (impl->topicId != rune::protocol::client::kCatalogTopicId) return false;   // not a catalog read
+        if (!impl->active || impl->unsubPending) return false;
+        const int64_t homeSid = homeSidOf_(*impl, seedSid);
+        if (homeSid == 0 || answerSid != homeSid) return false;   // a stale answer of an earlier session
+        impl->failReason = SubscriptionFailReason::CatalogReadEnded;
+        finish_(*impl);   // inactive + final status (closed by onRecords if dispatching)
+        ++catalogReadsEnded_;
+        if (impl != dispatching_) activeById_.erase(it);   // else onRecords erases it once its handler returns
+        return true;
+    }
+    return false;
 }
 
 int SubscriberHub::endSeedBound()

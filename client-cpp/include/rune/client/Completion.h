@@ -57,6 +57,7 @@ enum class OpStatus : uint8_t {
     Fenced,          ///< txn: ProducerFenced / InvalidProducerEpoch
     DeliveryFailed,  ///< producer: delivery timeout / redirect budget / deferred-buffer full
     ResultTooLarge,  ///< polled form only: variable result > the reservation (value = real size)
+    InvalidArgument, ///< the duty thread refused the op as malformed before sending it (payload = why)
 };
 
 /// One completion record: 40 bytes, trivially copyable.  A variable payload
@@ -76,7 +77,9 @@ struct Completion {
     uint32_t payloadLen = 0;     ///< bytes of inline payload
     uint32_t reservedBytes = 0;  ///< credit returned to the Completions on consume (§2.2)
     uint32_t reserved0 = 0;      ///< BatchAck: producerEpoch; GetTopicSchema: the topic's partitionCount
-                                 ///< (Phase 2b Part C; 0 = a pre-2b broker that does not report it)
+                                 ///< (Phase 2b Part C; 0 = a pre-2b broker that does not report it);
+                                 ///< DDL ops: the generated requestId's lo (0 = the caller's explicit
+                                 ///< requestId — Client::requestIdOf)
 };
 static_assert(sizeof(Completion) == 40);
 

@@ -171,6 +171,19 @@ target_include_directories(rune_codec PUBLIC ${RUNE_CODEC_ROOT}/include)
 target_compile_features(rune_codec PUBLIC cxx_std_23)
 endif()
 
+# ── rune_catalog — the shared catalog-history library (catalog history spec §6:
+#    the verifying replayer, history / as-of / diff), compiled from the
+#    rune-codec sibling's sources so the client, the broker and the CLI link
+#    byte-identical rules.  An embedding project (the broker's
+#    rune_client_broker_tests) defines it first: reused, never duplicated.
+if(NOT TARGET rune_catalog)
+file(GLOB RUNE_CATALOG_SOURCES CONFIGURE_DEPENDS ${RUNE_CODEC_ROOT}/src/catalog/*.cpp)
+add_library(rune_catalog STATIC ${RUNE_CATALOG_SOURCES})
+target_include_directories(rune_catalog PUBLIC ${RUNE_CODEC_ROOT}/include ${RUNE_PROTOCOL_INCLUDE})
+target_link_libraries(rune_catalog PUBLIC rune_codec)
+target_compile_features(rune_catalog PUBLIC cxx_std_23)
+endif()
+
 # ── rune-ql — DDL parser + code-gen backends (sibling source static lib) ──────
 # Mirrors the rune-codec wiring above.  rune-ql's sources include rune-codec
 # headers, so we reuse the rune_codec target (already defined above) rather
@@ -385,6 +398,7 @@ if(aeron_FOUND)
         src/detail/CpuAffinity.cpp
         src/shard/ShardConfig.cpp
         src/shard/ClientShard.cpp
+        src/catalog/CatalogReader.cpp
     )
     target_include_directories(rune_client_api PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -396,6 +410,7 @@ if(aeron_FOUND)
         rune_client_subscriber
         rune_client_producer
         rune_client_agent
+        rune_catalog
         aeron::aeron
         spdlog::spdlog
     )
@@ -1380,6 +1395,19 @@ if(BUILD_TESTING)
             target_link_libraries(rune_client_ddl_tests PRIVATE ${UUID_LIB_INVOKER})
         endif()
         gtest_discover_tests(rune_client_ddl_tests)
+
+        # Catalog history (Task 13): the catalog reader — Subscribe(-6) from the
+        # cache end, the caught-up marker, the verifying replay, the bounded
+        # marker wait, the truncation re-validation — non-blocking on the fake
+        # (F7; the blocking catalogHistory / catalogAsOf / catalogDiff run against
+        # a real BrokerNode in the broker's rune_client_broker_tests).
+        add_executable(rune_client_catalog_tests tests/catalog/CatalogReaderTest.cpp)
+        target_include_directories(rune_client_catalog_tests PRIVATE ${RUNE_PROTOCOL_INCLUDE})
+        target_link_libraries(rune_client_catalog_tests PRIVATE rune_client_api GTest::gtest_main)
+        if(UNIX AND NOT APPLE AND UUID_LIB_INVOKER)
+            target_link_libraries(rune_client_catalog_tests PRIVATE ${UUID_LIB_INVOKER})
+        endif()
+        gtest_discover_tests(rune_client_catalog_tests)
 
         # EOS-OOS / EOS-DUP follow-ups: idempotence end to end against the
         # InvokerGateway's broker idempotence model + fault injection (own

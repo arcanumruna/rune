@@ -64,6 +64,7 @@ struct Rig {   // InvokerClientTest.cpp's Rig: client + fake on the client's emb
         }
         return false;
     }
+    void passes(int n, int64_t stepNs = 0) { for (int i = 0; i < n; ++i) { g_now += stepNs; client.doWork(); gw.pump(); } }
     void connect() {
         ASSERT_TRUE(drive([&] { return gw.ready(); }));
         test_support::TestCq cq(client);
@@ -632,4 +633,65 @@ TEST(ClientCorrIdRegression, ConnectAnswerAndControlAnswerFromTheSameCounterValu
     ASSERT_TRUE(r.drive([&] { return f.ready(); }));
     ASSERT_TRUE(f.ok()) << f.describe();
     EXPECT_EQ(f.outcome().c.value, 5);
+}
+
+// Task 5 re-review F3: repeated leader moves — every hop answers Redirect to the
+// next node — reach the Redirect cap and end the DDL explicitly with BrokerError
+// Redirect (3), never a hang and never an endless hop; every hop carries the
+// SAME requestId.
+TEST(ClientDdlRedirectRegression, RepeatedRedirectsReachTheCapAndEndBrokerErrorRedirectRegression) {
+    Rig r(invokerCfg(3976, 3977));
+    r.gw.uniqueSessionIds = true;
+    const std::string aCh = udp(freePort());
+    const std::string bCh = udp(freePort());
+    const int a = r.gw.addEndpoint(aCh, 3976);
+    const int b = r.gw.addEndpoint(bCh, 3976);
+    r.connect();
+    std::vector<std::pair<int, rune::protocol::RequestId>> hops;
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        hops.emplace_back(ep, m->ext.requestId);
+        // seed -> A -> B -> A -> B ...: the leader keeps moving.
+        r.answerError(ep, pc::ErrorCode::Redirect, ep == a ? bCh : aCh, m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/10'000'000));
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::BrokerError);
+    EXPECT_EQ(f.outcome().c.errorCode, static_cast<uint16_t>(pc::ErrorCode::Redirect));
+    EXPECT_NE(payloadText(f).find("redirected more than"), std::string::npos) << payloadText(f);
+    ASSERT_EQ(hops.size(), static_cast<std::size_t>(rc::Client::kMaxDdlRedirects) + 1)
+        << "the seed + one hop per followed Redirect, then the cap";
+    EXPECT_EQ(hops[1].first, a);
+    EXPECT_EQ(hops[2].first, b);
+    for (const auto& h : hops) EXPECT_EQ(h.second, hops[0].second) << "the SAME requestId on every hop";
+    r.passes(100, 10'000'000);
+    EXPECT_EQ(cq.timesCompleted(f.token()), 1);
+    EXPECT_EQ(r.client.testPendingControlOps(), 0u);
+}
+
+// Task 5 re-review F4: a requestId stamp that would not fit the frame (the
+// issue-time decode check bypassed through the test seam) fails the DDL
+// InvalidArgument on the duty thread — it is never sent carrying {0,0}.
+TEST(ClientDdlRedirectRegression, ASkippedRequestIdStampFailsTheOpAndIsNeverSentRegression) {
+    Rig r(invokerCfg(3974, 3975));
+    r.connect();
+    int arrivals = 0;
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int, const uint8_t*, std::size_t) { ++arrivals; };
+    r.client.testSkewNextDdlRequestIdAt(1);
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    EXPECT_EQ(f.outcome().c.status, rc::OpStatus::InvalidArgument);
+    EXPECT_NE(payloadText(f).find("requestId"), std::string::npos) << payloadText(f);
+    r.passes(50);
+    EXPECT_EQ(arrivals, 0) << "never sent unstamped";
+    EXPECT_EQ(r.client.testPendingControlOps(), 0u);
+    // The seam is one-shot: the next DDL is stamped and sent.
+    auto g = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(g.accepted());
+    ASSERT_TRUE(r.drive([&] { return arrivals == 1; }));
 }

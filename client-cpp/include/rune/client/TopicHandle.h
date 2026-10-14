@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <rune/protocol/client/Protocol.h>   // kCatalogTopicId
+
 #include <cstdint>
 #include <string>
 
@@ -34,6 +36,12 @@ struct TopicHandle {
     int32_t partitionCount =  1;
 
     [[nodiscard]] bool valid() const noexcept { return topicId >= 0; }
+
+    /// Catalog history (Task 13): the `__catalog` log (topic id −6, one
+    /// partition), readable from ANY broker with Client::subscribe(catalog(), 0,
+    /// …) — committed events only, then the caught-up marker
+    /// (SubscribeOptions::onCaughtUp).  Not a producible topic (valid() is false).
+    static constexpr TopicHandle catalog() noexcept { return {rune::protocol::client::kCatalogTopicId, 1}; }
 };
 
 } // namespace rune::client

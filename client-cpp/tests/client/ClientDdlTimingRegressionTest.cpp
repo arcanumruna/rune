@@ -169,6 +169,10 @@ struct Arrival { int ep; int64_t sid; int64_t corr; RequestId id; };
 enum class Timing {
     CloseWhileAwaitingResend, CloseWhileHeldForNode, SeedLostWhileAwaitingResend, DuplicateAnswerWhileAwaiting,
     LeaderSessionLost, FatalOfferOnResend, FatalOfferOnRedirect, ResendPastBudgetEnd,
+    // Task 5 re-review F3 / F1: the SEED's session is lost while the DDL is in
+    // flight on it (DdlSent) — it comes back (resend, same requestId, OK), or it
+    // never does inside the budget (SessionLost — never a misleading NotLeader).
+    SeedLostWhileSent, SeedLostWhileSentPastBudget,
 };
 const char* name(Timing t) {
     switch (t) {
@@ -180,6 +184,8 @@ const char* name(Timing t) {
     case Timing::FatalOfferOnResend: return "FatalOfferOnResend";
     case Timing::FatalOfferOnRedirect: return "FatalOfferOnRedirect";
     case Timing::ResendPastBudgetEnd: return "ResendPastBudgetEnd";
+    case Timing::SeedLostWhileSent: return "SeedLostWhileSent";
+    case Timing::SeedLostWhileSentPastBudget: return "SeedLostWhileSentPastBudget";
     }
     return "?";
 }
@@ -189,7 +195,8 @@ class ClientDdlTimingMatrixRegression : public ::testing::TestWithParam<std::tup
 TEST_P(ClientDdlTimingMatrixRegression, ExactlyOneCompletionAndNoLeftoverState) {
     const auto [op, timing] = GetParam();
     rc::ClientConfig cfg = invokerCfg(4440, 4441);
-    if (timing == Timing::ResendPastBudgetEnd) cfg.ddlRetryBudget = std::chrono::milliseconds(300);
+    if (timing == Timing::ResendPastBudgetEnd || timing == Timing::SeedLostWhileSentPastBudget)
+        cfg.ddlRetryBudget = std::chrono::milliseconds(300);
     Rig r(cfg);
     r.gw.uniqueSessionIds = true;   // every node session its own id (a session-fatal answer names one)
     const std::string l1Ch = udp(freePort());
@@ -234,6 +241,14 @@ TEST_P(ClientDdlTimingMatrixRegression, ExactlyOneCompletionAndNoLeftoverState) 
         case Timing::FatalOfferOnRedirect:
             r.client.testForceIngressOffers(Offer::Fatal, 1);   // the redirect's offer (to the seed itself) fails
             r.answerError(ep, pc::ErrorCode::Redirect, "aeron:ipc", h->sessionId, h->correlationId);
+            break;
+        case Timing::SeedLostWhileSent:
+            if (n == 1) r.gw.expireSession(h->sessionId);   // the seed appends, then its session dies unanswered
+            else answerOk(r.gw, op, ep, h->sessionId, h->correlationId);
+            break;
+        case Timing::SeedLostWhileSentPastBudget:
+            r.gw.expireSession(h->sessionId);
+            r.gw.deadEndpoints.insert(0);   // ... and the seed never answers again (no reconnect)
             break;
         }
     };
@@ -281,6 +296,8 @@ TEST_P(ClientDdlTimingMatrixRegression, ExactlyOneCompletionAndNoLeftoverState) 
         break;
     case Timing::LeaderSessionLost:
     case Timing::FatalOfferOnRedirect:
+    case Timing::SeedLostWhileSent:
+    case Timing::SeedLostWhileSentPastBudget:
         ASSERT_TRUE(r.drive([&] { return f.ready(); }, /*stepNs=*/10'000'000));
         break;
     }
@@ -321,6 +338,20 @@ TEST_P(ClientDdlTimingMatrixRegression, ExactlyOneCompletionAndNoLeftoverState) 
         EXPECT_EQ(c.errorCode, static_cast<uint16_t>(pc::ErrorCode::NotLeader));
         EXPECT_NE(payloadText(f).find("could not be reached"), std::string::npos) << payloadText(f);
         break;
+    case Timing::SeedLostWhileSent:
+        ASSERT_TRUE(f.ok()) << f.describe();
+        EXPECT_EQ(c.value, 9);
+        ASSERT_EQ(at.size(), 2u) << "one resend, after the seed's session came back";
+        EXPECT_EQ(at[0].ep, 0);
+        EXPECT_EQ(at[1].ep, 0);
+        EXPECT_GE(r.gw.connects, 2) << "the resend went out after the seed session was re-established";
+        EXPECT_EQ(at[0].id, at[1].id) << "the resend carries the SAME requestId";
+        break;
+    case Timing::SeedLostWhileSentPastBudget:
+        EXPECT_EQ(c.status, rc::OpStatus::SessionLost) << "F1: a session loss reads SessionLost, not NotLeader";
+        EXPECT_NE(payloadText(f).find("session lost"), std::string::npos) << payloadText(f);
+        EXPECT_EQ(at.size(), 1u);
+        break;
     }
     // Nothing more, ever: later duty cycles deliver no second completion, and
     // the DDL bookkeeping is back to zero.
@@ -337,7 +368,8 @@ INSTANTIATE_TEST_SUITE_P(
                        ::testing::Values(Timing::CloseWhileAwaitingResend, Timing::CloseWhileHeldForNode,
                                          Timing::SeedLostWhileAwaitingResend, Timing::DuplicateAnswerWhileAwaiting,
                                          Timing::LeaderSessionLost, Timing::FatalOfferOnResend,
-                                         Timing::FatalOfferOnRedirect, Timing::ResendPastBudgetEnd)),
+                                         Timing::FatalOfferOnRedirect, Timing::ResendPastBudgetEnd,
+                                         Timing::SeedLostWhileSent, Timing::SeedLostWhileSentPastBudget)),
     [](const ::testing::TestParamInfo<std::tuple<DdlOp, Timing>>& i) {
         return std::string(name(std::get<0>(i.param))) + "_" + name(std::get<1>(i.param));
     });

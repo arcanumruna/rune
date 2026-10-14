@@ -80,6 +80,13 @@ enum class Isolation : uint8_t {
 struct SubscribeOptions {
     From      from      = From::latest();
     Isolation isolation = Isolation::ReadUncommitted;
+    /// Catalog history (Task 13): a subscription of TopicHandle::catalog() only.
+    /// The serving broker pushes ONE empty-payload Records frame at its high
+    /// watermark after the committed backlog — the caught-up marker (Protocol.h,
+    /// client version 8).  It fires this, on the RUNNER thread (must not
+    /// block), with that high watermark.  Ignored for every other topic (an
+    /// empty Records frame there is the broker's position note).
+    std::function<void(int64_t highWatermark)> onCaughtUp;
 };
 
 // ---------------------------------------------------------------------------
@@ -136,6 +143,13 @@ enum class SubscriptionFailReason : int32_t {
     /// ended explicitly — never left active and silent.  Subscribe again
     /// (from position()) to continue.
     SessionLost = 4,
+    /// Catalog history (Task 13): a CATALOG subscription (TopicHandle::catalog())
+    /// the broker ended with the retriable NotLeader — its replica truncated
+    /// below a high watermark it had already served (an unclean / deficient
+    /// leader upstream).  What this subscription delivered may no longer be
+    /// the committed history: it is never resumed silently from position();
+    /// re-read from 0 and re-validate (rune::client::CatalogReader does).
+    CatalogReadEnded = 5,
 };
 
 struct SubscriptionStatus {
@@ -159,7 +173,7 @@ struct SubscriptionStatus {
 // Neither side ever reads or writes a field the other owns:
 //   - immutable after construction (written by the creating app thread BEFORE
 //     the SubscribeAdd command is put on the agent ring, whose release/acquire
-//     publishes them): topicId, partition, handler;
+//     publishes them): topicId, partition, handler, onCaughtUp;
 //   - correlationId: F8c C3 — assigned by the duty thread when it adopts the
 //     SubscribeAdd (the duty-owned correlation counter), never read by an app
 //     thread (an app-side Unsubscribe identifies the impl by address);
@@ -181,6 +195,7 @@ struct SubscriptionImpl {
     int64_t       fromWire      = -1;  // the requested From (From::toWire): the resume point while nothing was delivered
     uint8_t       isolation     = 0;   // the requested Isolation (wire byte)
     RecordHandler handler;             // always valid (non-null after subscribe())
+    std::function<void(int64_t)> onCaughtUp;   // catalog subscriptions only (may be empty)
 
     // ---- Duty-thread owned ------------------------------------------------------
     int64_t subscriptionId = 0;  // bound by SubscribeResponse (0 = pending)

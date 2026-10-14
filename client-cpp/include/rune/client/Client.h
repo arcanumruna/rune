@@ -56,6 +56,8 @@
 #include <rune/client/detail/StatusRing.h>
 #include <rune/client/DutyView.h>
 #include <rune/client/shard/ShardState.h>
+#include <rune/client/catalog/CatalogReader.h>
+#include <rune/catalog/CatalogQueries.h>
 #include <rune/protocol/CatalogTypes.h>
 #include <rune/protocol/client/SchemaMessages.h>
 
@@ -828,6 +830,32 @@ public:
                                       std::span<const rune::protocol::client::ConfigChangeWire> changes,
                                       const DdlOptions& ddl, std::chrono::milliseconds timeout);
 
+    // ---- Catalog history (Task 13, spec §7): reads of `__catalog` ----------------
+    // Each call refreshes this Client's CatalogReader (catalogReader()): it reads
+    // the committed tail from the cache end (from 0 the first time) on the seed
+    // broker — any broker serves it — until the caught-up marker, replaying every
+    // event with the shared verifying library, then answers from the cached,
+    // replayed prefix with that library's history / stateAsOf / diff.  Blocking
+    // like the *AndWait sugar (the Invoker owner pumps doWork()); one app thread
+    // at a time (the reader's owner).  Never a hang: no marker before `timeout`
+    // is CatalogReadError::Kind::Timeout (a long-leaderless catalog withholds the
+    // marker); a fingerprint / decode / gap failure is Kind::Replay naming its
+    // offset (the verified prefix stays cached); a stale prefix (a truncation
+    // below a served high watermark) is re-validated before anything is served.
+    /// SHOW HISTORY: the matching events, in offset order.
+    CatalogResult<std::vector<rune::catalog::RecordedEvent>> catalogHistory(const rune::catalog::HistoryFilter& filter,
+                                                                            std::chrono::milliseconds timeout);
+    /// AS OF: the catalog state at an offset / time / object version.
+    CatalogResult<rune::catalog::CatalogState> catalogAsOf(const rune::catalog::AsOf& at,
+                                                           std::chrono::milliseconds timeout);
+    /// DIFF: every object that differs between the states at `a` and `b`.
+    CatalogResult<std::vector<rune::catalog::DiffEntry>> catalogDiff(const rune::catalog::AsOf& a,
+                                                                     const rune::catalog::AsOf& b,
+                                                                     std::chrono::milliseconds timeout);
+    /// The Client's own reader (created on first use; owned by the calling app
+    /// thread from then on) — e.g. for its non-blocking beginRefresh / pollRefresh.
+    CatalogReader& catalogReader();
+
     /// Topics successfully defined through this Client (Task 9 CLI), in
     /// definition order.  Duty-owned registry, read through a ListTopics op.
     [[nodiscard]] std::vector<std::pair<std::string, int32_t>>
@@ -882,6 +910,12 @@ public:
     void testDeliverToCqRef(CqRef ref, Token token, uint32_t reservedBytes);
     /// Test hook (duty thread only, or after close): registered queues.
     [[nodiscard]] std::size_t testRegisteredCqs() const noexcept;
+    /// Task 5 re-review F4 test seam (the ISSUING thread, before the op): the next
+    /// DDL issued with a generated requestId gets a stamp offset `delta` bytes
+    /// past its frame — as if the issue-time decode check had been bypassed —
+    /// so the duty thread's own guard is exercised (it fails the op
+    /// InvalidArgument, never sends {0,0}).
+    void testSkewNextDdlRequestIdAt(uint32_t delta) noexcept { testSkewDdlRequestIdAt_ = delta; }
     /// Task 5 fix round 1: pending DDLs waiting for a resend (pump work); duty thread.
     [[nodiscard]] int testDdlAwaitingResend() const noexcept { return ddlAwaitingResend_; }
     /// Task 5 fix round 1 (M3): queue releases still deferred behind a ring fence.
@@ -1001,6 +1035,7 @@ private:
     // -------------------------------------------------------------------------
 
     friend class Completions;
+    friend class CatalogReader;   // refresh(): the runner mode, doWork(), checkBlockingCaller_
 
     /// A completion's destination as the duty thread holds it (shared with
     /// the group / txn libraries since F8c C4).
@@ -1020,8 +1055,15 @@ private:
     struct DdlSent           { int redirects = 0; DdlOfferedOn on{}; };
     /// In flight again after a NotLeader / a lost session.
     struct DdlNotLeaderSeen  { int redirects; int64_t budgetEndNs; int64_t backoffNs; DdlOfferedOn on; };
+    /// Why a DDL waits for its resend: a NotLeader answer, or its session was
+    /// lost before any answer (Task 5 re-review F1: past the budget the first
+    /// ends BrokerError NotLeader, the second OpStatus::SessionLost).
+    enum class DdlResendCause : uint8_t { NotLeader, SessionLost };
     /// Not in flight: re-sent at resendAtNs (if refused then, every cycle after, until budgetEndNs).
-    struct DdlAwaitingResend { int redirects; int64_t budgetEndNs; int64_t backoffNs; int64_t resendAtNs; };
+    struct DdlAwaitingResend {
+        int redirects; int64_t budgetEndNs; int64_t backoffNs; int64_t resendAtNs;
+        DdlResendCause cause = DdlResendCause::NotLeader;
+    };
     /// Redirected (no NotLeader seen) to a node whose session cannot take the
     /// frame yet (still connecting): re-offered every cycle until it does.
     struct DdlHeldForNode    { int redirects; };
@@ -1260,6 +1302,10 @@ private:
     void sweepControl_(int64_t nowNs);
     void failAllControl_(OpStatus st);
     void completeConnect_(OpStatus st, int64_t value, uint16_t errorCode, std::string_view text);
+    /// A blocking call (`what`) must not run where it could never complete:
+    /// Invoker mode — only the owner thread, outside a duty-cycle callback;
+    /// Thread mode — never on the runner thread.  std::logic_error otherwise.
+    void checkBlockingCaller_(const char* what) const;
     /// Issue-and-wait shared by the *AndWait wrappers (see their doc).
     template <class Issue, class OnDone>
     void andWait_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
@@ -1746,6 +1792,12 @@ private:
     static constexpr int64_t kUrgentMetadataMinGapNs = 100'000'000LL;  // 100 ms (duty clock)
     int64_t lastUrgentMetadataNs_ = INT64_MIN;
     int     metadataResponses_    = 0;  // MetadataResponses applied (test hook)
+
+    // Catalog history (Task 13): created on first use by its owner app thread
+    // (never touched by the duty thread — its callbacks only write the reader's
+    // own ring).  The LAST member: destroyed first, after ~Client's close.
+    std::unique_ptr<CatalogReader> catalogReader_;
+    uint32_t testSkewDdlRequestIdAt_ = 0;   // F4 test seam: issuing thread only (testSkewNextDdlRequestIdAt)
 
     // Task 1.3: produce routing moved to the agent's flush→sendFn boundary
     // (ClientAgent partition routing table + per-leader sessions).  The old

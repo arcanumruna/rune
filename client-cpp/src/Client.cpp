@@ -1295,6 +1295,10 @@ OpResult Client::issueDdl_(OpKind op, CompletionTarget target, Token token, std:
         const auto decoded = decodedRequestIdOffset(op, frame);
         if (!decoded || *decoded != at || at + 16u > frame.size()) return OpResult::InvalidArgument;
         requestIdAt = static_cast<uint32_t>(at);
+        if (testSkewDdlRequestIdAt_ != 0) [[unlikely]] {   // F4 test seam (issuing thread only)
+            requestIdAt = static_cast<uint32_t>(frame.size()) + testSkewDdlRequestIdAt_;
+            testSkewDdlRequestIdAt_ = 0;
+        }
     }
     return issueControl_(op, target, token, frame, 0, requestIdAt);
 }
@@ -1482,7 +1486,17 @@ void Client::applyControlOp_(const ControlOpHeader& h, std::span<const uint8_t> 
         // thread that owns the counter, then kept with the frame — every resend
         // (Redirect / NotLeader / a lost session) re-offers these exact bytes.
         DdlPending d;
-        if (h.requestIdAt != 0 && std::size_t{h.requestIdAt} + 16u <= ctlScratch_.size()) {
+        if (h.requestIdAt != 0) {
+            if (std::size_t{h.requestIdAt} + 16u > ctlScratch_.size()) [[unlikely]] {
+                // F4: the stamp would not fit (issue-time decode check bypassed):
+                // fail the op explicitly — never send it as requestId {0,0},
+                // which no leader could dedupe.
+                constexpr std::string_view kWhy =
+                    "DDL requestId stamp offset lies outside the frame: not sent (it would carry requestId {0,0})";
+                completeCtl_(p, OpStatus::InvalidArgument, ddlNoValue(p.op), 0, 0,
+                             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kWhy.data()), kWhy.size()));
+                return;
+            }
             if (++requestCounter_ == 0) ++requestCounter_;   // lo is never 0 (requestIdOf: 0 = explicit)
             d.requestLo = requestCounter_;
             rpc::detail::putLE64(ctlScratch_.data(), static_cast<int>(h.requestIdAt),
@@ -1688,7 +1702,8 @@ int Client::driveDdl_(int64_t nowNs) {
         if (on != nullptr) {
             if (agent_.connectedEpoch(on->sessionIndex) != on->sessionEpoch) [[unlikely]] {
                 d->endpoint.clear();   // toward the seed: it redirects to the current leader
-                setDdlRetry_(*d, DdlAwaitingResend{redirects, budgetEndNs, backoffNs, nowNs});
+                setDdlRetry_(*d, DdlAwaitingResend{redirects, budgetEndNs, backoffNs, nowNs,
+                                                   DdlResendCause::SessionLost});
                 ++work;
             } else {
                 ++i;
@@ -1710,9 +1725,21 @@ int Client::driveDdl_(int64_t nowNs) {
                 // the sweep ends it Timeout (the DDL timed out); a shorter
                 // budget ends it NotLeader here.
                 if (nowNs >= due.budgetEndNs && nowNs < p.deadlineNs) {
-                    failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader),
-                             "not leader: DDL retry budget exhausted (the node could not be reached)",
-                             ddlNoValue(p.op));
+                    if (due.cause == DdlResendCause::SessionLost) {
+                        // F1: the DDL's session was lost and never came back
+                        // inside the budget — a session loss, not a NotLeader.
+                        constexpr std::string_view kWhy =
+                            "session lost: the DDL's session was not re-established within the DDL retry budget "
+                            "(it may have been applied; a retry with the same requestId is exact)";
+                        PendingCtl dead = takeCtl_(i);
+                        completeCtl_(dead, OpStatus::SessionLost, ddlNoValue(dead.op), 0, 0,
+                                     std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kWhy.data()),
+                                                              kWhy.size()));
+                    } else {
+                        failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::NotLeader),
+                                 "not leader: DDL retry budget exhausted (the node could not be reached)",
+                                 ddlNoValue(p.op));
+                    }
                     ++work;
                 } else {
                     ++i;
@@ -1837,6 +1864,10 @@ void Client::throwForStatus_(const char* what, const Completion& c, std::span<co
     case OpStatus::Closed:         msg += ": client closed"; break;
     case OpStatus::NotConnected:   msg += ": not connected (state != Connected)"; break;
     case OpStatus::SessionLost:    msg += ": session lost before the answer"; break;
+    case OpStatus::InvalidArgument:
+        msg += ": invalid argument";
+        if (!payload.empty()) msg += ": " + std::string(reinterpret_cast<const char*>(payload.data()), payload.size());
+        break;
     case OpStatus::Superseded:     msg += ": superseded by a newer call"; break;
     case OpStatus::ResultTooLarge: msg += ": result too large (" + std::to_string(c.value) + " bytes)"; break;
     case OpStatus::BrokerError:
@@ -1848,9 +1879,7 @@ void Client::throwForStatus_(const char* what, const Completion& c, std::span<co
     throw std::runtime_error(msg);
 }
 
-template <class Issue, class OnDone>
-void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
-                      Issue&& issue, OnDone&& onDone) {
+void Client::checkBlockingCaller_(const char* what) const {
     const bool onDuty = std::this_thread::get_id() == dutyThreadId_;
     if (cfg_.runnerMode == RunnerMode::Invoker) {
         if (!onDuty) throw std::logic_error(std::string(what) + ": Invoker mode — call from the owner thread");
@@ -1864,6 +1893,12 @@ void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32
                                ": called on the runner thread (a callback would wait for itself) — "
                                "use the token form");
     }
+}
+
+template <class Issue, class OnDone>
+void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32_t maxResultBytes,
+                      Issue&& issue, OnDone&& onDone) {
+    checkBlockingCaller_(what);
     CompletionsConfig qc;
     qc.maxResultBytes = std::max<uint32_t>(maxResultBytes, qc.maxErrorText);
     uint32_t cap = 1u << 16;
@@ -1910,6 +1945,53 @@ void Client::andWait_(const char* what, std::chrono::nanoseconds timeout, uint32
     }
     if (w == Completions::Wait::TimedOut) throw std::runtime_error(std::string(what) + ": timed out waiting");
     if (!ok) throw std::runtime_error(std::string(what) + ": client closed");
+}
+
+// ---------------------------------------------------------------------------
+// Catalog history (Task 13): catalogHistory / catalogAsOf / catalogDiff
+// ---------------------------------------------------------------------------
+
+CatalogReader& Client::catalogReader() {
+    if (!catalogReader_) catalogReader_ = std::make_unique<CatalogReader>(*this);
+    return *catalogReader_;
+}
+
+namespace {
+CatalogReadError asOfError(const rune::catalog::ReplayError& e) {
+    return CatalogReadError{CatalogReadError::Kind::Replay, rune::catalog::describe(e), e.offset, 0};
+}
+} // namespace
+
+CatalogResult<std::vector<rune::catalog::RecordedEvent>> Client::catalogHistory(
+    const rune::catalog::HistoryFilter& filter, std::chrono::milliseconds timeout) {
+    CatalogReader& r = catalogReader();
+    if (auto ok = r.refresh(timeout); !ok) return std::unexpected(std::move(ok.error()));
+    const auto matches = rune::catalog::history(r.events(), filter);
+    std::vector<rune::catalog::RecordedEvent> out;
+    out.reserve(matches.size());
+    for (const rune::catalog::RecordedEvent* e : matches) out.push_back(*e);
+    return out;
+}
+
+CatalogResult<rune::catalog::CatalogState> Client::catalogAsOf(const rune::catalog::AsOf& at,
+                                                               std::chrono::milliseconds timeout) {
+    CatalogReader& r = catalogReader();
+    if (auto ok = r.refresh(timeout); !ok) return std::unexpected(std::move(ok.error()));
+    auto s = rune::catalog::stateAsOf(r.events(), at);
+    if (!s) return std::unexpected(asOfError(s.error()));
+    return std::move(*s);
+}
+
+CatalogResult<std::vector<rune::catalog::DiffEntry>> Client::catalogDiff(const rune::catalog::AsOf& a,
+                                                                         const rune::catalog::AsOf& b,
+                                                                         std::chrono::milliseconds timeout) {
+    CatalogReader& r = catalogReader();
+    if (auto ok = r.refresh(timeout); !ok) return std::unexpected(std::move(ok.error()));
+    auto sa = rune::catalog::stateAsOf(r.events(), a);
+    if (!sa) return std::unexpected(asOfError(sa.error()));
+    auto sb = rune::catalog::stateAsOf(r.events(), b);
+    if (!sb) return std::unexpected(asOfError(sb.error()));
+    return rune::catalog::diff(*sa, *sb);
 }
 
 void Client::connectAndWait(std::chrono::nanoseconds timeout) {
@@ -2804,6 +2886,14 @@ void Client::onEgressFrame(codec::TemplateId tid,
                     std::chrono::steady_clock::now() + std::chrono::milliseconds(cfg_.subscribeTimeoutMs))) {
                 break;
             }
+        }
+        // Catalog history (Task 13): a BOUND catalog subscription answered
+        // NotLeader was ended by a truncation below a served high watermark —
+        // finished explicitly (CatalogReadEnded) for its reader to re-validate,
+        // never re-armed from its position (what it delivered may be stale).
+        if (ec == rpc::ErrorCode::NotLeader && opt->correlationId != 0) [[unlikely]] {
+            const auto snap = agent_.stateAndSessionId();
+            if (subscriberHub_.endCatalogRead(opt->correlationId, opt->sessionId, snap.sessionId)) break;
         }
         if ((ec == rpc::ErrorCode::NotLeader || ec == rpc::ErrorCode::Redirect) && opt->correlationId != 0)
             [[unlikely]] {
@@ -4132,6 +4222,8 @@ Subscription Client::subscribeImpl(TopicHandle              topic,
     impl->fromWire      = opts.from.toWire();
     impl->isolation     = static_cast<uint8_t>(opts.isolation);
     impl->handler       = std::move(handler);
+    // Catalog history (Task 13): the caught-up marker callback (TopicHandle::catalog()).
+    if (topic.topicId == rune::protocol::client::kCatalogTopicId) impl->onCaughtUp = std::move(opts.onCaughtUp);
 
     // M2 FIX: a deadline so sweepTimedOut() can fail this subscribe if
     // SubscribeResponse never arrives (mirrors produce-ack timeout sweep).
