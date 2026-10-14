@@ -468,19 +468,13 @@ struct AlterIsrMsg {
     /// answered): isr[2] = its LEO, isr[3]/isr[4] = its process incarnation
     /// (low/high 32 bits).  `leaderId` is the reporting replica.
     static constexpr int32_t kBumpFollowerReport = 8;
-    /// Catalog history Task 11 fix round 2: not a bump — a REPLICA AVAILABILITY
-    /// report by node `leaderId` for (topicId, partition), whatever the reason
-    /// (its catalog halted before the create, the create not applied in time, a
-    /// build failure): kBumpReplicaUnavailable = "I am in this partition's
-    /// replicas but cannot build it"; kBumpReplicaAvailable = "I built it now".
-    /// isr[3]/isr[4] = the reporting process's node-control identity (low/high
-    /// 32 bits).  Re-sent while the condition and the committed map hold it.
-    static constexpr int32_t kBumpReplicaUnavailable = 1024;
-    static constexpr int32_t kBumpReplicaAvailable   = 2048;
-    /// With kBumpReplicaUnavailable (fix round 3): the reporter HOLDS the
-    /// partition's data on disk (it cannot serve it — e.g. its catalog apply
-    /// halted before the create): it is never removed, never elected.
-    static constexpr int32_t kBumpReplicaHoldsData   = 4096;
+    /// Catalog history Task 11 (fix round 4): not a bump — a LIVE, periodic
+    /// report by node `leaderId` that it is in (topicId, partition)'s replicas but
+    /// cannot serve it (its catalog never applied the create, or its apply
+    /// halted).  The controller keeps it only while refreshed and excludes the
+    /// node from that partition's leader ELECTION — nothing else (no replica-set
+    /// or ISR edit, no metadata record).
+    static constexpr int32_t kBumpReplicaUnservable = 1024;
     /// Controlled shutdown (Kafka parity) — NODE-level requests on the same
     /// channel: topicId == kNodeControlTopicId (no partition), leaderId = the
     /// requesting node, isrCount == kLeaderEpochBump, isr[1] = flags,

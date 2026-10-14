@@ -485,14 +485,13 @@ TEST(CatalogLeadershipBrokerRegression, AllBrokersHaltedKeepAControllerAndADataP
     EXPECT_EQ(ack->errorCode, 0);
 }
 
-// Fix round 2 (re-review BLOCK): the create event that halts broker h ALSO
+// Fix rounds 2/4 (re-review BLOCK): the create event that halts broker h ALSO
 // places the topic on h — h's halt broadcast is held so no member knows yet
-// (the race, forced).  h cannot build the topic, reports it, and the controller
-// removes h from every partition's replicas and ISR, never lets it lead, and —
-// with no other placeable broker — holds the topic short (explicit, counted).
-// The topic serves produce from the others.  RED (no report path): h stays a
-// replica (and the static leader of ~1/3 of the partitions) of a topic it does
-// not host, with no state naming it.
+// (the race, forced).  h cannot serve the topic and REPORTS it, live; the
+// controller only excludes h from those partitions' leader election (round 4:
+// nothing else — h stays in the replicas, no metadata record).  h never leads;
+// the topic serves produce from the others.  RED (no report): h stays the
+// static leader of ~1/3 of the partitions of a topic it does not host.
 TEST(CatalogLeadershipBrokerRegression, TopicPlacedOnABrokerThatHaltsOnItsCreateIsRePlacedAndServesRegression) {
     ThreeNodes c = ThreeNodes::start("ld_halt_race");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
@@ -535,27 +534,30 @@ TEST(CatalogLeadershipBrokerRegression, TopicPlacedOnABrokerThatHaltsOnItsCreate
         return controller.metadataServiceForTest()->catalogHalted(h);
     })) << "precondition: the halt mark is held — the placement could not know";
 
-    // Within a bound: h reported every partition, and is in none of them.
+    // Within a bound: h leads none of the partitions, and the controller holds
+    // h's live reports for them.
     bool clean = false;
     for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && !clean;) {
         clean = true;
         for (int32_t p = 0; p < 3; ++p) {
             const auto pa = assignmentOn(controller, topicId, p);
-            clean = clean && pa && pa->leaderNode > 0 && pa->leaderNode != h &&
-                    std::find(pa->replicas.begin(), pa->replicas.end(), h) == pa->replicas.end() &&
-                    std::find(pa->isr.begin(), pa->isr.end(), h) == pa->isr.end();
+            clean = clean && pa && pa->leaderNode > 0 && pa->leaderNode != h;
         }
         if (!clean) std::this_thread::sleep_for(50ms);
     }
-    ASSERT_TRUE(clean) << "h removed from every partition's replicas and ISR, never its leader";
+    ASSERT_TRUE(clean) << "h never leads a partition it cannot serve";
     const bool reported = controller.onControlThreadForTest([&controller, topicId, h] {
         const MetadataService* ms = controller.metadataServiceForTest();
-        return ms->unbuildable(topicId, 0, h) || ms->unbuildable(topicId, 1, h) || ms->unbuildable(topicId, 2, h);
+        return ms->reportedUnservable(topicId, 0, h) && ms->reportedUnservable(topicId, 1, h) &&
+               ms->reportedUnservable(topicId, 2, h);
     });
-    EXPECT_TRUE(reported) << "the race really placed the topic on h, and h reported it";
-    EXPECT_GE(controller.onControlThreadForTest([&controller] {
-        return controller.metadataServiceForTest()->unplaceableTopicCount();
-    }), 1u) << "no other placeable broker: held short, explicit and counted";
+    EXPECT_TRUE(reported) << "the race really placed the topic on h, and h reports it, live";
+    bool stillReplica = false;
+    for (int32_t p = 0; p < 3; ++p) {
+        const auto pa = assignmentOn(controller, topicId, p);
+        stillReplica = stillReplica || std::find(pa->replicas.begin(), pa->replicas.end(), h) != pa->replicas.end();
+    }
+    EXPECT_TRUE(stillReplica) << "round 4: the report never edits the replica set";
     // Never leads, sampled.
     for (const auto until = Clock::now() + 2s; Clock::now() < until;) {
         for (int32_t p = 0; p < 3; ++p) {

@@ -436,8 +436,9 @@ clearTopicIdMarker(const std::string& topicDir)
 // catalogLiveTopicSpecs — INTERIM (Task 9): the live topics of the local catalog
 // at its checkpoint, for reconcileTopicDirs' claims.
 // ---------------------------------------------------------------------------
-std::vector<TopicSpec> catalogLiveTopicSpecs(const std::string& dataDir) {
+std::vector<TopicSpec> catalogLiveTopicSpecs(const std::string& dataDir, bool* halted) {
     namespace cat = rune::catalog;
+    if (halted != nullptr) *halted = false;
     const fs::path dir = fs::path{dataDir} / "__catalog";
     std::error_code ec;
     if (!fs::is_directory(dir, ec)) return {};
@@ -475,6 +476,7 @@ std::vector<TopicSpec> catalogLiveTopicSpecs(const std::string& dataDir) {
         }
         if (replayer.nextOffset() == from) break;   // no progress: a gap / control batch past it
     }
+    if (halted != nullptr && replayer.nextOffset() <= ckpt->appliedOffset) *halted = true;   // stopped short
     std::vector<TopicSpec> out;
     for (const cat::TopicObject* t : replayer.state().topics()) {
         TopicSpec s;

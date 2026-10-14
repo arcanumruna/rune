@@ -482,6 +482,141 @@ TEST(DdlConformanceBrokerRegression, T9_EveryCatalogDdlOpRoundTripsOverTheWireRe
     node.stop();
 }
 
+namespace {
+/// Rewrite dataDir/__catalog so the event creating `name` carries a WRONG
+/// fingerprint (a determinism break — the boot replay halts there).  Every other
+/// record is copied verbatim; the applied checkpoint is kept.
+void tamperCatalogCreateOf(const fs::path& dataDir, const std::string& name) {
+    const fs::path cat = dataDir / "__catalog";
+    const fs::path tmp = dataDir / "__catalog.rewrite";
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+    {
+        rune::storage::Log in(cat.string());
+        in.recover();
+        rune::storage::Log out(tmp.string());
+        out.recover();
+        int64_t next = 0;
+        bool tampered = false;
+        while (next < in.logEndOffset()) {
+            const std::vector<uint8_t> data = in.read(next, 1 << 20);
+            ASSERT_FALSE(data.empty());
+            std::size_t pos = 0;
+            const int64_t before = next;
+            while (pos < data.size()) {
+                rune::protocol::RecordBatchReader reader(data.data() + pos, data.size() - pos);
+                if (!reader.ensureValid()) break;
+                const auto tl = static_cast<std::size_t>(reader.totalLength());
+                rune::protocol::RecordBatchBuilder b(reader.baseOffset(), 0);
+                int64_t last = -1;
+                bool changed = false;
+                reader.forEachRecord([&](std::string_view key, std::string_view val, int64_t off, int64_t ts) {
+                    auto ev = rune::catalog::decode(
+                        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(val.data()), val.size()));
+                    std::string v(val);
+                    if (ev && ev->kind == rune::catalog::EventKind::CreateTopic && ev->objectName == name) {
+                        ev->fingerprint ^= 1;
+                        auto enc = rune::catalog::encode(*ev);
+                        ASSERT_TRUE(enc.has_value());
+                        v.assign(reinterpret_cast<const char*>(enc->data()), enc->size());
+                        changed = tampered = true;
+                    }
+                    b.append(key, v, ts);
+                    last = off;
+                });
+                if (changed) {
+                    const std::vector<uint8_t> nb = b.build();
+                    ASSERT_GE(out.append(nb, last), 0);
+                } else {
+                    ASSERT_GE(out.append(data.data() + pos, tl, reader.baseOffset() + reader.lastOffsetDelta()), 0);
+                }
+                next = last + 1;
+                if (tl == 0) break;
+                pos += tl;
+            }
+            ASSERT_GT(next, before);
+        }
+        ASSERT_TRUE(tampered) << "found the create of " << name;
+    }
+    // Swap the segments in; keep the checkpoint and every non-segment file.
+    for (const auto& e : fs::directory_iterator(cat))
+        if (e.path().extension() == ".log" || e.path().extension() == ".index" ||
+            e.path().extension() == ".timeindex")
+            fs::remove(e.path());
+    for (const auto& e : fs::directory_iterator(tmp))
+        if (e.path().extension() == ".log" || e.path().extension() == ".index" ||
+            e.path().extension() == ".timeindex")
+            fs::copy_file(e.path(), cat / e.path().filename(), fs::copy_options::overwrite_existing);
+    fs::remove_all(tmp);
+}
+} // namespace
+
+// Task 11 fix round 4 (rule 3, the Part E rule: catalog damage ⇒ no destructive
+// cleanup): a boot whose catalog replay HALTS before its checkpoint moves,
+// renames, deletes and quarantines NO topic dir — the topics created after the
+// halt keep their committed data in place; once the operator repairs the
+// catalog, the next boot serves every committed record.  RED (rounds ≤ 3): the
+// halted boot quarantined the unclaimed dir and the repaired boot rebuilt the
+// topic EMPTY — committed records lost.
+TEST(DdlConformanceBrokerRegression, HaltedBootReplayMovesNoTopicDirAndLosesNoCommittedRecordRegression) {
+    const TempDataDir tmp("hbr_");
+    const fs::path& dir = tmp.path;
+    const NodeConfig cfg = makeSingleNodeConfig(dir);
+    int32_t laterId = -1;
+    constexpr int kRecords = 5;
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ShardTestClient client(dir / "client-aeron");
+        client.keepSessionsAlive(true);
+        Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+        const int64_t sid = client.connect(w.gw, w.stream);
+        ASSERT_TRUE(w.awaitDdlReady(sid));
+        ASSERT_EQ(w.define(sid, "keep"), kOk);
+        ASSERT_EQ(w.define(sid, "later"), kOk);
+        laterId = w.schema(sid, "later")->topicId;
+        rune::protocol::RecordBatchBuilder b(0, 0);
+        b.append(std::string_view{}, std::string_view{"committed"}, 0);
+        const std::vector<uint8_t> batch = b.build();
+        for (int i = 0; i < kRecords; ++i)
+            ASSERT_TRUE(client.produceUntilOk(w.gw, w.stream, sid, laterId, 0, /*acks=*/1, batch).has_value());
+        ASSERT_EQ(leoOnOwner(node, laterId, 0), kRecords);
+        node.stop();
+    }
+    const fs::path saved = dir / "__catalog.saved";
+    fs::copy(dir / "__catalog", saved, fs::copy_options::recursive);
+    tamperCatalogCreateOf(dir, "later");
+    {
+        BrokerNode node{cfg};
+        node.start();   // halted replay: still boots, serves what it applied
+        ASSERT_TRUE(node.awaitLeader(30s));
+        node.stop();
+    }
+    EXPECT_TRUE(fs::exists(dir / "topics" / "later" / "0")) << "the halted boot moved / quarantined the dir";
+    bool quarantined = false;
+    std::error_code qec;
+    for (const auto& e : fs::directory_iterator(dir / "quarantine", qec))
+        quarantined = quarantined || e.path().filename().string().rfind("later", 0) == 0;
+    EXPECT_FALSE(quarantined) << "nothing quarantined while the catalog replay halts";
+    // The operator repairs the catalog; the next boot serves every committed record.
+    fs::remove_all(dir / "__catalog");
+    fs::copy(saved, dir / "__catalog", fs::copy_options::recursive);
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        bool serves = false;
+        for (const auto deadline = Clock::now() + 15s; Clock::now() < deadline && !serves;) {
+            serves = node.catalogTopicServesForTest(laterId);
+            if (!serves) std::this_thread::sleep_for(20ms);
+        }
+        ASSERT_TRUE(serves);
+        EXPECT_EQ(leoOnOwner(node, laterId, 0), kRecords) << "no committed record lost";
+        node.stop();
+    }
+}
+
 TEST(DdlConformanceBrokerRegression, T7_RestartPreservesTheCatalogAndTheCollisions) {
     const TempDataDir tmp("t7_");
     const fs::path& dir = tmp.path;

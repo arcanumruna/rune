@@ -29,8 +29,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <algorithm>
-#include <map>
 #include <span>
 #include <utility>
 #include <string>
@@ -66,28 +64,6 @@ public:
     // -----------------------------------------------------------------------
     [[nodiscard]] std::optional<int32_t>
     topicIdForName(std::string_view name) const;
-
-    // Catalog history Task 11 fix round 3: which topic ids / partitions have
-    // data dirs under dataDir/topics.  Each topic dir carries the topic-id marker
-    // (the SAME file and format boot's topic-dir reconcile reads:
-    // "committed <id>\n" — RuntimeTopicRecovery.h kTopicIdMarkerFile).  A dir
-    // without a readable marker sets `unmarkedDirs` (callers treat it as "may hold
-    // anything" — never "no data").  Cold (a scan of the disk).
-    static constexpr const char* kTopicIdMarker = "topic-id";
-    struct LocalTopicData {
-        std::map<int32_t, std::vector<int32_t>> partitions;   // topic id → partition dirs present
-        bool unmarkedDirs = false;
-        [[nodiscard]] bool holds(int32_t topicId, int32_t partition) const {
-            if (unmarkedDirs) return true;
-            const auto it = partitions.find(topicId);
-            return it != partitions.end() &&
-                   std::find(it->second.begin(), it->second.end(), partition) != it->second.end();
-        }
-    };
-    [[nodiscard]] static LocalTopicData scanLocalTopicData(const std::string& dataDir);
-private:
-    void markCatalogTopicDir_(const rune::node::TopicSpec& spec, int32_t id) const;
-public:
 
     // -----------------------------------------------------------------------
     // topicIdForFoldedName — a topic whose name equals `name` ignoring ASCII case

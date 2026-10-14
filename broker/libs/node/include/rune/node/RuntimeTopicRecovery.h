@@ -72,7 +72,11 @@ bool clearTopicIdMarker(const std::string& topicDir);
 /// replay error stops it at that event (the applier halts on the same one).  No
 /// checkpoint = nothing applied = {}.  Throws on an unreadable checkpoint (boot
 /// refuses, as buildCatalog_ would).
-[[nodiscard]] std::vector<TopicSpec> catalogLiveTopicSpecs(const std::string& dataDir);
+/// Catalog history Task 11 fix round 4: `halted` (optional) is set when the replay
+/// STOPPED SHORT of the checkpoint — the boot applier halts on that event, the
+/// topics created after it are not in the result, and their dirs hold committed
+/// data: the caller must then move / delete / quarantine NO topic dir.
+[[nodiscard]] std::vector<TopicSpec> catalogLiveTopicSpecs(const std::string& dataDir, bool* halted = nullptr);
 
 /// INTERIM (catalog history Task 10 fix round 1, until Task 17 removes RUNE_TOPICS):
 /// a static RUNE_TOPICS topic and a catalog topic / view sink can never share a

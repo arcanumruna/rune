@@ -250,8 +250,16 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
             auto isExcludedLeader = [&](int32_t topicId, int32_t node) {
                 for (const auto& ex : in.excludedLeaders)
                     if (ex.topicId == topicId && ex.partition == p && ex.node == node) return true;
+                for (const auto& ex : in.electionExcluded)   // Task 11 fix round 4
+                    if (ex.topicId == topicId && ex.partition == p && ex.node == node) return true;
                 return false;
             };
+            // Task 11 fix round 4: election-only exclusions at this partition index.
+            std::vector<int32_t> electionOnly;
+            for (const auto& ex : in.electionExcluded)
+                for (const TopicSpec* ts : members)
+                    if (ex.topicId == ts->topicId && ex.partition == p && !isIn(ex.node, electionOnly))
+                        electionOnly.push_back(ex.node);
 
             for (const TopicSpec* ts : members) {
                 const PartitionAssignment* cur = in.cur->get(ts->topicId, p);
@@ -347,6 +355,15 @@ std::vector<BalancerRecord> DynamicBalancer::rebalance(const DynamicBalancerInpu
                     // no clean alternative — the caller re-elects it at a new
                     // epoch (never NO_LEADER / a survivor election from here).
                     if (groupIsr.empty() && hadExcluded) continue;
+                }
+                if (!electionOnly.empty()) {
+                    // Task 11 fix round 4: never elected; with no other live
+                    // in-sync candidate the partition is left exactly as it is
+                    // (BLOCKED — no record, no ISR edit, never an empty leader).
+                    const bool hadUnservable = std::any_of(groupIsr.begin(), groupIsr.end(),
+                        [&](int32_t n) { return isIn(n, electionOnly); });
+                    std::erase_if(groupIsr, [&](int32_t n) { return isIn(n, electionOnly); });
+                    if (groupIsr.empty() && hadUnservable) continue;
                 }
                 // Fix round 2 (N3): a stopping leader still SERVING — heartbeat-
                 // live or data-plane alive (its frontier advances) — keeps a

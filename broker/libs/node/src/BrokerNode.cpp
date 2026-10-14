@@ -404,7 +404,8 @@ void BrokerNode::start() {
                              "migration); topics recorded only there are not recovered",
                              config_.nodeId, rdir.string());
         }
-        std::vector<TopicSpec> catalogTopics = catalogLiveTopicSpecs(config_.dataDir);
+        bool catalogReplayHalted = false;
+        std::vector<TopicSpec> catalogTopics = catalogLiveTopicSpecs(config_.dataDir, &catalogReplayHalted);
         // Task 10 fix round 1 (INTERIM until Task 17): a static topic colliding with
         // a catalog topic by name or id would open / quarantine its dir or take its
         // id — refuse to start, explicitly, BEFORE anything on disk is touched.
@@ -414,9 +415,21 @@ void BrokerNode::start() {
         }
         std::vector<TopicSpec> claims = config_.topics;
         for (TopicSpec& t : catalogTopics) claims.push_back(std::move(t));
-        (void)reconcileTopicDirs(config_.dataDir, claims, /*placeholderIds=*/{},
-                                 std::chrono::duration_cast<std::chrono::seconds>(
-                                     std::chrono::system_clock::now().time_since_epoch()).count());
+        if (catalogReplayHalted) {
+            // Task 11 fix round 4 (the Part E rule: catalog damage ⇒ no destructive
+            // cleanup): the boot replay HALTS before the checkpoint — the topics
+            // created after the halt are unknown here, their dirs hold committed
+            // data.  Nothing is moved, renamed, deleted or quarantined; once the
+            // operator repairs the catalog a restart builds them from those dirs.
+            spdlog::critical("BrokerNode[{}]: the __catalog boot replay halts before its checkpoint — NO topic dir is "
+                             "moved, renamed, deleted or quarantined this boot (catalog damage: no destructive "
+                             "cleanup); topics created after the halt are not served until the catalog is repaired",
+                             config_.nodeId);
+        } else {
+            (void)reconcileTopicDirs(config_.dataDir, claims, /*placeholderIds=*/{},
+                                     std::chrono::duration_cast<std::chrono::seconds>(
+                                         std::chrono::system_clock::now().time_since_epoch()).count());
+        }
     }
 
     // 2. Build the TopicRegistry (after dataDir creation, before the gateway).
@@ -4125,84 +4138,56 @@ int BrokerNode::reportUnbuildableReplicas_() {
     if (!metadataService_ || !replicaRegistry_ || !replTransport_ || !election_ || config_.isSingleNode()) return 0;
     const uint64_t v      = metadataService_->routingVersion();
     const bool     halted = catalogHaltedValue_ != 0;
-    // Steady state (review M2): the map unchanged and nothing left to tell.
-    if (v == unbuiltScanVersion_ && halted == unbuiltScanHalted_ && !unbuiltNeedsSend_) [[likely]] return 0;
+    // Steady state: the map unchanged and nothing assigned here is unbuilt.
+    if (v == unbuiltScanVersion_ && halted == unbuiltScanHalted_ && unbuilt_.empty()) [[likely]] return 0;
     const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     const int32_t self = config_.nodeId;
-    namespace rm = rune::metadata;
     if (v != unbuiltScanVersion_ || halted != unbuiltScanHalted_) {   // cold: a committed-map / halt change
         unbuiltScanVersion_ = v;
         unbuiltScanHalted_  = halted;
         std::set<int64_t> assignedHere;
-        std::optional<rune::gateway::TopicRegistry::LocalTopicData> disk;   // scanned only if needed
-        metadataService_->committedMap().forEach([&](int32_t t, int32_t p, const rm::PartitionAssignment& pa) {
-            if (t < 0 || std::find(pa.replicas.begin(), pa.replicas.end(), self) == pa.replicas.end()) return;
-            if (topicRegistry_ && topicRegistry_->state(t) == rune::gateway::TopicRegistry::TopicState::Dropped)
-                return;   // the removal path, not a build failure
-            const int64_t key = (static_cast<int64_t>(t) << 32) | static_cast<uint32_t>(p);
-            if (replicaRegistry_->lookup(t, p) != nullptr) return;   // built: fine
-            assignedHere.insert(key);
-            auto [it, inserted] = unbuilt_.try_emplace(key, UnbuiltReplica{nowNs, 0, false, false});
-            // Round 3 (a): "unbuildable" means NO LOCAL DATA — a broker that holds
-            // the partition on disk (e.g. its boot replay halted before the create)
-            // reports itself a HOLDER: never removed, never elected.
-            if (inserted) {
-                if (!disk) disk = rune::gateway::TopicRegistry::scanLocalTopicData(config_.dataDir);
-                it->second.holdsData = disk->holds(t, p);
-            }
-            // Acknowledged once the committed mark names this broker for it.
-            it->second.acknowledged = rm::isReplicaMark(pa.mark.kind) && pa.mark.node == self;
-        });
+        metadataService_->committedMap().forEach(
+            [&](int32_t t, int32_t p, const rune::metadata::PartitionAssignment& pa) {
+                if (t < 0 || std::find(pa.replicas.begin(), pa.replicas.end(), self) == pa.replicas.end()) return;
+                if (topicRegistry_ &&
+                    topicRegistry_->state(t) == rune::gateway::TopicRegistry::TopicState::Dropped)
+                    return;   // the removal path, not a serving gap
+                if (replicaRegistry_->lookup(t, p) != nullptr) return;   // built: fine
+                const int64_t key = (static_cast<int64_t>(t) << 32) | static_cast<uint32_t>(p);
+                assignedHere.insert(key);
+                unbuilt_.try_emplace(key, UnbuiltReplica{nowNs, 0});
+            });
         std::erase_if(unbuilt_, [&](const auto& e) { return !assignedHere.contains(e.first); });
-        // Review M2: a halted process never builds — once the map stops naming it,
-        // there is nothing to confirm later.
-        if (halted) reportedUnavailable_.clear();   // never builds in this process: nothing to confirm
-        unbuiltNeedsSend_ = !reportedUnavailable_.empty();
-        for (const auto& [k, u] : unbuilt_) unbuiltNeedsSend_ = unbuiltNeedsSend_ || !u.acknowledged;
-        if (!unbuiltNeedsSend_) return 0;
+        if (unbuilt_.empty()) return 0;
     }
-    if (nowNs - unbuiltLastPassNs_ < kUnbuiltResendNs) return 0;   // loss-recovery cadence
+    // Built since the scan (runCatalogCreate_ registers it): stop reporting it.
+    std::erase_if(unbuilt_, [&](const auto& e) {
+        return replicaRegistry_->lookup(static_cast<int32_t>(e.first >> 32),
+                                        static_cast<int32_t>(static_cast<uint32_t>(e.first))) != nullptr;
+    });
+    if (nowNs - unbuiltLastPassNs_ < kUnservableReportPeriodNs) return 0;   // the live report's period
     unbuiltLastPassNs_ = nowNs;
     const int32_t ctl = static_cast<int32_t>(election_->leaderMemberId());
     if (ctl < 0) return 0;
     int work = 0;
-    auto send = [&](int64_t key, int32_t flags) {
+    for (auto& [key, u] : unbuilt_) {
+        if (!halted && nowNs - u.firstSeenNs < kUnbuiltReportGraceNs) continue;   // may still apply the create
+        if (u.lastSentNs == 0)
+            spdlog::warn("BrokerNode[{}]: assigned ({}, {}) but cannot serve it ({}) — reporting it to the controller "
+                         "(never elected its leader while it cannot)", config_.nodeId, key >> 32,
+                         static_cast<uint32_t>(key), halted ? "catalog apply halted" : "not built within the grace");
+        u.lastSentNs = nowNs;
         rune::replication::AlterIsrMsg m{};
         m.topicId   = static_cast<int32_t>(key >> 32);
         m.partition = static_cast<int32_t>(static_cast<uint32_t>(key));
         m.leaderId  = self;
-        if (const auto* pa = metadataService_->assignment(m.topicId, m.partition)) {
-            m.leaderEpoch    = pa->leaderEpoch;
-            m.partitionEpoch = pa->partitionEpoch;
-        }
-        m.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump;
-        m.isr[1]   = flags;
-        m.isr[3]   = static_cast<int32_t>(static_cast<uint32_t>(lifecycleNonce_));
-        m.isr[4]   = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(lifecycleNonce_) >> 32));
-        (void)replTransport_->sendNodeControl(ctl, m);   // a full outbound ring: re-sent on the cadence
+        m.isrCount  = rune::replication::AlterIsrMsg::kLeaderEpochBump;
+        m.isr[1]    = rune::replication::AlterIsrMsg::kBumpReplicaUnservable;
+        m.isr[3]    = static_cast<int32_t>(static_cast<uint32_t>(lifecycleNonce_));
+        m.isr[4]    = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(lifecycleNonce_) >> 32));
+        (void)replTransport_->sendNodeControl(ctl, m);   // a lost one: the next period's report
         ++work;
-    };
-    for (auto& [key, u] : unbuilt_) {
-        if (u.acknowledged) continue;
-        if (!halted && nowNs - u.firstSeenNs < kUnbuiltReportGraceNs) continue;   // may still apply the create
-        if (u.lastSentNs == 0)
-            spdlog::warn("BrokerNode[{}]: assigned ({}, {}) but cannot serve it ({}; {}) — reporting it to the "
-                         "controller", config_.nodeId, key >> 32, static_cast<uint32_t>(key),
-                         halted ? "catalog apply halted" : "not built within the grace",
-                         u.holdsData ? "it HOLDS the data on disk: never removed" : "no local data");
-        u.lastSentNs = nowNs;
-        send(key, rune::replication::AlterIsrMsg::kBumpReplicaUnavailable |
-                      (u.holdsData ? rune::replication::AlterIsrMsg::kBumpReplicaHoldsData : 0));
-        if (!halted) reportedUnavailable_[key] = kAvailableSends;   // a halted process never builds
-    }
-    // Built since it reported: tell the controller it may serve / place it again.
-    for (auto it = reportedUnavailable_.begin(); it != reportedUnavailable_.end();) {
-        const auto t = static_cast<int32_t>(it->first >> 32);
-        const auto p = static_cast<int32_t>(static_cast<uint32_t>(it->first));
-        if (unbuilt_.contains(it->first) || replicaRegistry_->lookup(t, p) == nullptr) { ++it; continue; }
-        send(it->first, rune::replication::AlterIsrMsg::kBumpReplicaAvailable);
-        it = --it->second <= 0 ? reportedUnavailable_.erase(it) : std::next(it);
     }
     return work;
 }

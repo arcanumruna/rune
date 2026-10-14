@@ -124,6 +124,13 @@ struct DynamicBalancerInputs {
     /// requester at a new epoch: it is the sole in-sync replica).
     struct LeaderExclusion { int32_t topicId; int32_t partition; int32_t node; };
     std::vector<LeaderExclusion> excludedLeaders;
+    /// Catalog history Task 11 (fix round 4): ELECTION-only exclusion — a node
+    /// that cannot serve the partition (it reported so, live).  It is never
+    /// elected (failover / preferred), a partition it leads fails over to another
+    /// live in-sync member when one exists, and it is NEVER removed from the
+    /// ISR or the replicas by this rule (it may hold the data).  With no other
+    /// candidate the partition is left untouched (BLOCKED — the caller reports it).
+    std::vector<LeaderExclusion> electionExcluded;
     /// Controlled shutdown (2026-10-05): nodes stopping gracefully.  Unlike an
     /// exclusion this is a SOFT rule: an avoided node is never a preferred
     /// target, a partition it leads moves to another live in-sync replica (it

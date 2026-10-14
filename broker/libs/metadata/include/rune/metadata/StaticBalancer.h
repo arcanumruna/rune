@@ -68,10 +68,6 @@ struct BalancerRecord {
     /// D15: a leaderless record's mark — appended as the trailer after `rec`
     /// (MetadataExtensions.h); Kind::None = no trailer.
     LeaderlessMark mark{};
-    /// Task 11 fix round 3: this record CLEARS the partition's committed replica
-    /// mark (otherwise a record with mark None carries the committed replica
-    /// mark forward — MetadataService encodes it).
-    bool clearsReplicaMark = false;
 
     BalancerRecord()                                  = default;
     BalancerRecord(BalancerRecord&&)                  = default;

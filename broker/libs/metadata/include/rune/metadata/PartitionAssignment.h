@@ -35,11 +35,6 @@ struct LeaderlessMark {
         None              = 0,
         EmptyMemoryLeader = 1,   ///< `node`, the memory-backed sole-ISR leader, restarted EMPTY
         LogDirOffline     = 2,   ///< `node`'s log dir is offline (until a new incarnation)
-        /// Catalog history Task 11 fix round 3 — REPLICA marks, committed on any
-        /// record of the partition (led or not) and carried forward by every
-        /// later record until cleared (a successor controller rebuilds from them):
-        ReplicaUnbuildable = 3,  ///< `node` holds NO local data and cannot build it (removed when safe)
-        HolderUnservable   = 4,  ///< `node` HOLDS the data on disk but cannot serve it (never removed, never leads)
     };
     Kind    kind        = Kind::None;
     int32_t node        = -1;
@@ -61,10 +56,6 @@ struct TransientLineage {
     int32_t  confirmedLeader = -1;
     int64_t  incarnation     = 0;
 };
-
-[[nodiscard]] constexpr bool isReplicaMark(LeaderlessMark::Kind k) noexcept {
-    return k == LeaderlessMark::Kind::ReplicaUnbuildable || k == LeaderlessMark::Kind::HolderUnservable;
-}
 
 struct PartitionAssignment {
     int32_t              leaderNode;      ///< Current leader; NO_LEADER (-1) if none.

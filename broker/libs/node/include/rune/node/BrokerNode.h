@@ -1837,20 +1837,17 @@ private:
     /// Control thread (Task 11 fix round 1, I2): post the placement view to the
     /// admin thread (kMsgPlacementView) on change only; and the unplaceable-topics gauge.
     int publishPlacementView_();
-    /// Control thread (Task 11 fix round 2): a user partition the committed map
+    /// Control thread (Task 11 fix round 4): a user partition the committed map
     /// assigns HERE that this broker has not built is reported to the controller
-    /// (kBumpReplicaUnavailable) — at once when the catalog apply halted, else
-    /// after kUnbuiltReportGraceNs; built later → kBumpReplicaAvailable.
+    /// LIVE, every kUnservableReportPeriodNs (kBumpReplicaUnservable) — at once
+    /// when the catalog apply halted, else after kUnbuiltReportGraceNs.  The
+    /// controller only excludes it from that partition's leader election while
+    /// the reports keep coming; it stops when the replica is built.
     int reportUnbuildableReplicas_();
-    static constexpr int64_t kUnbuiltReportGraceNs = 10'000'000'000LL;
-    static constexpr int64_t kUnbuiltResendNs      = 200'000'000LL;
-    static constexpr int     kAvailableSends       = 5;   // loss recovery (a new process also clears)
-    /// holdsData: this broker has the partition's data dir on disk (round 3, a);
-    /// acknowledged: the committed mark already names this broker for it.
-    struct UnbuiltReplica { int64_t firstSeenNs = 0; int64_t lastSentNs = 0; bool holdsData = false; bool acknowledged = false; };
-    bool unbuiltNeedsSend_ = false;
-    std::map<int64_t, UnbuiltReplica> unbuilt_;             // (topic<<32|partition) → since
-    std::map<int64_t, int>            reportedUnavailable_;  // → available sends left once built
+    static constexpr int64_t kUnbuiltReportGraceNs    = 10'000'000'000LL;
+    static constexpr int64_t kUnservableReportPeriodNs = 500'000'000LL;   // TTL on the controller: 4 periods
+    struct UnbuiltReplica { int64_t firstSeenNs = 0; int64_t lastSentNs = 0; };
+    std::map<int64_t, UnbuiltReplica> unbuilt_;   // (topic<<32|partition) → since
     uint64_t unbuiltScanVersion_ = ~0ull;
     bool     unbuiltScanHalted_  = false;
     int64_t  unbuiltLastPassNs_  = 0;

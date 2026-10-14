@@ -270,36 +270,3 @@ TEST(TopicRegistrySlotRegression, EverySlotStateAnswersExactlyItsOwnWayRegressio
     ASSERT_TRUE(reg.dropTopic(1));
     EXPECT_EQ(reg.state(1), St::Dropped);
 }
-
-// Task 11 fix round 3 (a): a broker whose catalog apply halted BEFORE a topic's
-// create (e.g. mid boot replay) never builds it in its registry — yet the data
-// is on its disk.  The topic dir names its catalog id, so the broker reports
-// itself a HOLDER (never removed) instead of "no local data".  RED (round 2):
-// such a broker was reported unbuildable and could be removed as the sole
-// in-sync replica, losing the committed data.
-TEST(TopicRegistryRuntimeRegression, OnDiskTopicDataIsFoundWithoutTheCatalogHavingAppliedItRegression) {
-    const fs::path dir = makeTempDir("holder");
-    {
-        TopicRegistry reg({}, dir.string());
-        TopicSpec s; s.name = "orders"; s.partitionCount = 2;
-        ASSERT_EQ(reg.createTopicAt(7, s), 7);
-    }
-    EXPECT_TRUE(fs::exists(dir / "topics" / "orders" / TopicRegistry::kTopicIdMarker));
-    // A fresh process whose catalog never applied 'orders': the registry knows nothing …
-    TopicRegistry fresh({}, dir.string());
-    EXPECT_EQ(fresh.state(7), TopicRegistry::TopicState::Unknown);
-    // … the disk does.
-    const auto disk = TopicRegistry::scanLocalTopicData(dir.string());
-    EXPECT_TRUE(disk.holds(7, 0));
-    EXPECT_TRUE(disk.holds(7, 1));
-    EXPECT_FALSE(disk.holds(7, 2)) << "no such partition dir";
-    EXPECT_FALSE(disk.holds(8, 0)) << "another topic: no local data";
-    EXPECT_FALSE(disk.unmarkedDirs);
-    // A topic dir without a readable marker: conservatively a holder of anything.
-    fs::create_directories(dir / "topics" / "legacy" / "0");
-    const auto conservative = TopicRegistry::scanLocalTopicData(dir.string());
-    EXPECT_TRUE(conservative.unmarkedDirs);
-    EXPECT_TRUE(conservative.holds(8, 0)) << "never 'no data' when unsure";
-    std::error_code ec;
-    fs::remove_all(dir, ec);
-}
