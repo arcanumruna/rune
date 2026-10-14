@@ -1510,12 +1510,13 @@ if(BUILD_TESTING)
 
         # Catalog history Task 11 (F7): the REAL client (rune-client-cpp, embedded by
         # the root CMakeLists) against a REAL in-process single-node BrokerNode.
-        # Task 15 adds rune_cli_lib.
+        # Task 15: rune_cli_lib — the real `rune` CLI against the real nodes.
         add_executable(rune_client_broker_tests tests/client/ClientDdlBrokerRegressionTest.cpp
-                       tests/client/ClientCatalogReadBrokerRegressionTest.cpp)
+                       tests/client/ClientCatalogReadBrokerRegressionTest.cpp
+                       tests/client/RuneCliBrokerRegressionTest.cpp)
         target_include_directories(rune_client_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_client_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
-                              rune_client_api aeron::aeron GTest::gtest_main)
+                              rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
         gtest_discover_tests(rune_client_broker_tests PROPERTIES TIMEOUT 240 RESOURCE_LOCK rune_udp_ports)
 
         # Catalog history Task 11: the DDL route (Redirect / NotLeader / Internal when

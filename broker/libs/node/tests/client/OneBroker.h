@@ -28,6 +28,7 @@
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/protocol/RecordBatch.h>
+#include <rune/protocol/client/SchemaMessages.h>
 #include <rune/replication/PartitionReplica.h>
 #include <rune/storage/Log.h>
 #include <rune/view/ViewPlan.h>
@@ -36,6 +37,7 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -157,6 +159,49 @@ public:
             const auto r = client.alterTopicAndWait(name, 0, ops, {}, 10s);
             if (r.errorCode != 0) throw std::runtime_error("runSchemaLifecycle: alter: " + r.detail);
         }
+    }
+
+    /// Task 15: all nine event kinds through the real client, 10 events in this order —
+    /// 0 CreateTopic players (typed {id, hp}), 1 CreateTopic events (untyped), 2 CreateSchema events,
+    /// 3 AlterSchema events (ADD mana), 4 SetCompatibility events (FORWARD), 5 AlterTopicConfig events
+    /// (retention.ms 60000), 6 CreateView v (over players), 7 AlterView v (wider output), 8 DropView v,
+    /// 9 DropTopic players.  Throws on any refusal (a test precondition).
+    void runEveryKind() {
+        using namespace std::chrono_literals;
+        rune::client::Client& c = *connectClient();
+        auto check = [](uint16_t code, const std::string& detail, const char* what) {
+            if (code != 0) throw std::runtime_error(std::string("runEveryKind: ") + what + ": " + detail);
+        };
+        rune::client::DdlOptions ddl;
+        ddl.statement = "topic players { id int64, hp int64 } partitions 1 key id;";
+        auto r1 = c.defineTopicAndWait("players", 1, "id", idDescriptor("players"), false, rune::client::Persistence::Disk,
+                                       {}, ddl, 10s);
+        check(r1.errorCode, r1.detail, "CreateTopic players");
+        ddl.statement = "topic events partitions 1;";
+        auto r2 = c.defineTopicAndWait("events", 1, "", {}, false, rune::client::Persistence::Disk, {}, ddl, 10s);
+        check(r2.errorCode, r2.detail, "CreateTopic events");
+        ddl.statement = {};
+        auto r3 = c.defineTopicAndWait("events", 1, "id", idDescriptor("events"), false, rune::client::Persistence::Disk,
+                                       {}, ddl, 10s);
+        check(r3.errorCode, r3.detail, "CreateSchema events");
+        auto r4 = c.alterTopicAndWait("events", 0, addColumnOps("mana"), ddl, 10s);
+        check(r4.errorCode, r4.detail, "AlterSchema events");
+        rune::codec::AlterOp compat{};
+        compat.type = rune::codec::AlterOpType::SetCompatibility;
+        compat.mode = rune::codec::CompatMode::Forward;
+        auto r5 = c.alterTopicAndWait("events", 0, rune::codec::encodeAlterOps({compat}), ddl, 10s);
+        check(r5.errorCode, r5.detail, "SetCompatibility events");
+        const rune::protocol::client::ConfigChangeWire ch{1, 60'000};
+        auto r6 = c.alterTopicConfigAndWait("events", 0, std::span(&ch, 1), ddl, 10s);
+        check(r6.errorCode, r6.detail, "AlterTopicConfig events");
+        auto r7 = c.createViewAndWait("v", "id", 0, viewPlanOver("players"), ddl, 10s);
+        check(r7.errorCode, r7.detail, "CreateView v");
+        auto r8 = c.alterViewAndWait("v", "id", 0, 1, viewPlanOver("players", true), ddl, 10s);
+        check(r8.errorCode, r8.detail, "AlterView v");
+        auto r9 = c.dropViewAndWait("v", ddl, 10s);
+        check(r9.errorCode, r9.detail, "DropView v");
+        auto r10 = c.dropTopicAndWait("players", ddl, 10s);
+        check(r10.errorCode, r10.detail, "DropTopic players");
     }
 
     /// Task 13: the requested fromOffset of each catalog Subscribe the node's
