@@ -346,8 +346,12 @@ public:
     //   - StaticBalancer throws (misconfigured — should not occur single-node).
     //
     // Single-writer: must be called on the duty-cycle / control thread.
-    void addRuntimeTopic(const rune::metadata::TopicSpec& spec) {
+    void addRuntimeTopic(rune::metadata::TopicSpec spec) {
         if (spec.topicId < 0) return;  // internal topics are not assigned
+        // rf 0 = every PLACEABLE broker (Task 11 fix round 0: catalog-halted
+        // brokers are never placement targets).
+        if (spec.rf <= 0)
+            spec.rf = static_cast<int16_t>(std::max<std::size_t>(1, liveNodes_.empty() ? 1 : placementNodes().size()));
 
         // (1) Record the topic in the configured set (idempotent by topicId) so
         // it participates in routing-image builds + future rebalances.
@@ -360,6 +364,9 @@ public:
         // (2) Emit the initial assignment for this topic (leader only).
         if (!controllerReady_()) return;
         if (liveNodes_.empty()) return;
+        // Task 11 fix round 0: a halted controller places no catalog topic (the
+        // applied catalog it would place from is stale).
+        if (catalogHalted(selfId_)) { ++catalogPlacementsSkippedHalted_; return; }
 
         // Per-topic idempotency: skip if the MSM already has every partition
         // assigned (e.g. re-invocation after a restart-rebuild replayed it).
@@ -372,9 +379,11 @@ public:
         std::vector<rune::metadata::TopicSpec> one{spec};
         std::vector<rune::metadata::BalancerRecord> records;
         try {
-            records = rune::metadata::StaticBalancer::assign(one, liveNodes_);
-        } catch (const rune::metadata::BalancerError&) {
+            records = rune::metadata::StaticBalancer::assign(one, placementNodes());
+        } catch (const rune::metadata::BalancerError& ex) {
             ++balancerErrors_;
+            spdlog::error("MetadataService[{}]: topic id={} cannot be placed: {} (catalog-halted brokers are never "
+                          "placement targets)", selfId_, spec.topicId, ex.what());
             return;
         }
         dropAssigned_(records);   // M1: never overwrite an existing assignment
@@ -398,6 +407,28 @@ public:
     // Idempotent (a second call changes nothing and appends nothing more).
     // Single-writer: control thread.
     // -----------------------------------------------------------------------
+    /// Task 11 fix round 0: `node`'s current process reported a halted applier.
+    [[nodiscard]] bool catalogHalted(int32_t node) const noexcept {
+        const auto it = nodeLifecycle_.find(node);
+        return it != nodeLifecycle_.end() && it->second.catalogHalted;
+    }
+    /// The nodes a NEW partition may be placed on: the live nodes minus every
+    /// catalog-halted one (it never applies the topic — it would never serve it).
+    [[nodiscard]] std::vector<int32_t> placementNodes() const {
+        std::vector<int32_t> out;
+        out.reserve(liveNodes_.size());
+        for (int32_t n : liveNodes_) if (!catalogHalted(n)) out.push_back(n);
+        return out;
+    }
+    /// A live (in `live`), not stopping, not catalog-halted member other than self:
+    /// a halted controller hands the controllership to it.
+    [[nodiscard]] bool healthyPeerAmong(std::span<const int32_t> live) const noexcept {
+        for (int32_t n : live)
+            if (n != selfId_ && !catalogHalted(n) && !isShutting_(n)) return true;
+        return false;
+    }
+    [[nodiscard]] uint64_t catalogPlacementsSkippedHalted() const noexcept { return catalogPlacementsSkippedHalted_; }
+
     void removeRuntimeTopic(int32_t topicId) {
         if (topicId < 0) return;   // internal partitions are never removed this way
         const auto before = configuredTopics_.size();
@@ -449,7 +480,7 @@ public:
         // Run StaticBalancer.
         std::vector<rune::metadata::BalancerRecord> records;
         try {
-            records = rune::metadata::StaticBalancer::assign(configuredTopics_, liveNodes_);
+            records = rune::metadata::StaticBalancer::assign(configuredTopics_, placementNodes());
         } catch (const rune::metadata::BalancerError& ex) {
             // Balancer validation failure (e.g. RF > nodes, co-partition mismatch).
             // Increment the error counter so callers / tests can detect silent failure.
@@ -678,6 +709,10 @@ public:
         /// by proof of a live process — a NEW process registering (adopt) or
         /// an accepted lineage report from this nonce.
         bool    lineageRevoked = false;
+        /// Catalog history Task 11 fix round 0: this PROCESS reported its
+        /// CatalogApplier halted (kNodeCatalogHalted) — never a placement target;
+        /// cleared only by a new process (adopt).
+        bool    catalogHalted  = false;
         uint32_t supersededNext = 0;
         std::unordered_map<int32_t, int32_t> confirmed;   ///< controller side: member → clear bits
         [[nodiscard]] bool isSuperseded(int64_t n) const noexcept {
@@ -692,6 +727,7 @@ public:
             if (nonce != 0) superseded[supersededNext++ % superseded.size()] = nonce;
             nonce = n; shutting = false; userOnly = false; completePushed = false; pushedBits = -1;
             lineageRevoked = false;   // R1: a new live process
+            catalogHalted  = false;   // Task 11: a new process has a fresh applier
             featureLevel = -1;   // D15: a new process may be another binary
             confirmed.clear();
             return true;
@@ -735,6 +771,13 @@ public:
             spdlog::info("MetadataService[{}]: node {} restarted (new process) — its shutdown mark is "
                          "cleared", selfId_, m.leaderId);
         const bool shutdown = (flags & rr::AlterIsrMsg::kNodeShutdown) != 0;
+        if ((flags & rr::AlterIsrMsg::kNodeCatalogHalted) != 0 && !st.catalogHalted) {
+            st.catalogHalted = true;
+            ++routingInputsEpoch_;
+            spdlog::warn("MetadataService[{}]: node {} reports its __catalog apply HALTED — never a placement "
+                         "target{}", selfId_, m.leaderId,
+                         m.leaderId == selfId_ ? "; this node places / unplaces no catalog topic" : "");
+        }
         if (shutdown && !st.shutting) {
             st.shutting = true;
             ++controlledShutdownRequests_;
@@ -1302,6 +1345,7 @@ public:
         }
     }
     uint64_t lineageIdentitiesRevoked_ = 0;
+    uint64_t catalogPlacementsSkippedHalted_ = 0;   // Task 11: a halted controller's skipped placements / removals
     [[nodiscard]] bool isEligible_(int32_t n) const noexcept {
         return std::find(eligible_.begin(), eligible_.end(), n) != eligible_.end();
     }
@@ -2298,6 +2342,9 @@ private:
         const uint64_t v = msm_.committedVersion();
         if (!force && v == removedReconciledVersion_) return;
         removedReconciledVersion_ = v;
+        // Task 11 fix round 0: a halted controller unplaces no catalog topic (a
+        // healthy successor does: removedTopics_ is kept).
+        if (catalogHalted(selfId_)) { ++catalogPlacementsSkippedHalted_; return; }
         bool queued = false;
         msm_.committedMap().forEach([&](int32_t t, int32_t, const rune::metadata::PartitionAssignment&) {
             if (!std::binary_search(removedTopics_.begin(), removedTopics_.end(), t)) return;

@@ -365,6 +365,17 @@ int Election::canvass(int64_t nowNs)
                 if (m.id != thisMemberId_) publisher_.standDown(m.id, resignedTermId_, thisMemberId_);
         return workCount;
     }
+    // Task 11 fix round 0: a stood-down leader holds its candidacy (bounded).
+    if (standDownHoldUntilNs_ >= 0) {
+        if (nowNs < standDownHoldUntilNs_) {
+            if (workCount > 0 && standDownTermId_ >= 0)
+                for (const ClusterMember& m : clusterMembers_)
+                    if (m.id != thisMemberId_) publisher_.standDown(m.id, standDownTermId_, thisMemberId_);
+            return workCount;
+        }
+        standDownHoldUntilNs_ = -1;   // the hold ended: a candidate again
+        standDownTermId_      = -1;
+    }
 
     ClusterMember* thisM = memberById(thisMemberId_);
     if (thisM != nullptr) {
@@ -1199,6 +1210,22 @@ bool Election::resign(int64_t nowNs)
     // no leader reported) — the node now only votes and follows.
     state(ElectionState::Canvass, nowNs, "controlled shutdown: leader resigned");
     timeOfLastUpdateNs_ = nowNs;   // StandDown just went out: re-send on the interval
+    return true;
+}
+
+bool Election::standDown(int64_t nowNs, int64_t holdNs)
+{
+    if (state_ != ElectionState::Closed || leaderMember_ == nullptr ||
+        leaderMember_->id != thisMemberId_ || clusterMembers_.size() <= 1)
+        return false;
+    standDownTermId_      = leadershipTermId_;
+    standDownHoldUntilNs_ = nowNs + std::max<int64_t>(holdNs, 0);
+    ++standDowns_;
+    for (const ClusterMember& m : clusterMembers_)
+        if (m.id != thisMemberId_) publisher_.standDown(m.id, standDownTermId_, thisMemberId_);
+    followerLiveness_.reset();
+    state(ElectionState::Canvass, nowNs, "leader stood down (a healthier member should lead)");
+    timeOfLastUpdateNs_ = nowNs;
     return true;
 }
 

@@ -1826,9 +1826,10 @@ private:
     PublishedCatalogRoute                                 catalogRoutePublished_;
     /// Control thread: recompute the DDL route; publish it on change.
     int publishCatalogRoute_(bool consensusLeader);
-    /// Control thread: a halted broker never drives placement — it withdraws its
-    /// candidacy (once, when the halt latches) and resigns the consensus
-    /// leadership (the controller) while it holds it.
+    /// Control thread: a halted broker never drives catalog placement — it
+    /// reports its halt to every member (never a placement target) and, while it
+    /// leads the consensus, stands down to a live healthy peer when one exists
+    /// (never leaving the cluster without a controller; fix round 0).
     int resignIfHalted_(bool consensusLeader);
     uint64_t                                              catalogAlterIsrRefused_ = 0;   // control thread
 

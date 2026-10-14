@@ -234,6 +234,16 @@ public:
     /// (resigned() latches).  Returns false (nothing done) unless this node is
     /// the CLOSED leader of a multi-node cluster.  Duty-cycle thread; cold.
     bool resign(int64_t nowNs);
+    /// Catalog history Task 11 fix round 0: hand the leadership to another
+    /// member WITHOUT leaving the candidate pool for good (unlike resign()).  A
+    /// CLOSED multi-node leader sends StandDown to every follower (they elect at
+    /// once, skipping it) and re-enters CANVASS; it does not stand for election
+    /// until `holdNs` has passed (loss recovery: the hold always ends, so a
+    /// cluster whose other members cannot lead is never left headless).  Returns
+    /// false (nothing done) unless this node is the CLOSED leader of a
+    /// multi-node cluster.  Duty-cycle thread; cold.
+    bool standDown(int64_t nowNs, int64_t holdNs);
+    [[nodiscard]] uint64_t standDowns() const noexcept { return standDowns_; }
     /// A follower learns its leader resigned: it starts an election AT ONCE
     /// (no leader-heartbeat timeout), skipping the resigned leader in the
     /// canvass (Aeron gracefulClosedLeaderId).  Ignored unless it comes from
@@ -532,6 +542,11 @@ private:
     /// for the term it resigned (loss recovery on the status interval).
     bool resigned_       = false;
     Term resignedTermId_ = -1;
+    /// standDown(): no candidacy before this time (-1 = no hold); the term it
+    /// stood down from (re-sent StandDown while held).
+    int64_t  standDownHoldUntilNs_ = -1;
+    Term     standDownTermId_      = -1;
+    uint64_t standDowns_           = 0;
     /// Entry time of this node's current leadership (LeaderLogReplication);
     /// INT64_MIN = never led.  The failover-liveness grace (eligibleNodeIds).
     int64_t leaderSinceNs_ = INT64_MIN;

@@ -14,6 +14,7 @@
 #include "support/ShardTestClient.h"
 
 #include <rune/node/BrokerNode.h>
+#include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/Protocol.h>
 
 #include <gtest/gtest.h>
@@ -122,6 +123,33 @@ int64_t connectSettled(ShardTestClient& cl, const ThreeNodes& c, int id, std::ch
         std::this_thread::sleep_for(50ms);
     }
     return -1;
+}
+
+/// Halt `id`'s applier at its NEXT event (only ITS apply is tampered).
+void tamperNextEvent(BrokerNode& n) {
+    n.onAdminThreadForTest([&n] {
+        n.adminWorkerAgentForTest()->worker().applierForTest().tamperNextFingerprintForTest();
+        return 0;
+    });
+}
+bool awaitHalted(BrokerNode& n, std::chrono::seconds within) {
+    for (const auto deadline = Clock::now() + within; Clock::now() < deadline;) {
+        if (n.onAdminThreadForTest([&n] { return n.adminWorkerAgentForTest()->worker().roleName() == "Halted"; }))
+            return true;
+        std::this_thread::sleep_for(20ms);
+    }
+    return false;
+}
+std::optional<rune::metadata::PartitionAssignment> assignmentOn(BrokerNode& n, int32_t topicId, int32_t p) {
+    return n.onControlThreadForTest([&n, topicId, p]() -> std::optional<rune::metadata::PartitionAssignment> {
+        const auto* pa = n.metadataServiceForTest()->assignment(topicId, p);
+        return pa ? std::optional(*pa) : std::nullopt;
+    });
+}
+std::vector<uint8_t> oneRecordBatch(std::string_view value) {
+    rune::protocol::RecordBatchBuilder b(0, 0);
+    b.append(std::string_view{}, value, 0);
+    return b.build();
 }
 
 } // namespace
@@ -243,7 +271,8 @@ TEST(CatalogLeadershipBrokerRegression, HaltedControllerResignsAndAnotherBrokerP
 
     // It resigns the controllership; another broker leads the consensus AND the catalog.
     ASSERT_TRUE(awaitConsensusLeaderOtherThan(c, ctl, 30s)) << "the halted controller resigned";
-    EXPECT_TRUE(halted.onControlThreadForTest([&halted] { return halted.electionForTest()->resigned(); }));
+    EXPECT_GE(halted.onControlThreadForTest([&halted] { return halted.electionForTest()->standDowns(); }), 1u)
+        << "it stood down (never a permanent withdrawal: ruling 1)";
     ASSERT_TRUE(c.awaitCatalogLeaderOtherThan(ctl, 30s));
     const int32_t newCtl = consensusLeader(c);
     const int32_t newLeader = c.catalogLeaderId();
@@ -275,4 +304,132 @@ TEST(CatalogLeadershipBrokerRegression, HaltedControllerResignsAndAnotherBrokerP
     EXPECT_EQ(refused->responseTemplate, kErrorResponse);
     EXPECT_EQ(refused->code, kLdInternal);
     EXPECT_NE(refused->message.find("catalog apply halted at offset"), std::string::npos) << refused->message;
+}
+
+// Fix round 0, ruling 2: a halted broker reports its halt (node-control
+// register, kNodeCatalogHalted) and the controller never places a NEW partition
+// on it.  RED: the fresh topic's replicas name the halted broker (it never
+// applies the topic, so those replicas never serve).
+TEST(CatalogLeadershipBrokerRegression, ControllerNeverPlacesANewPartitionOnAHaltedBrokerRegression) {
+    ThreeNodes c = ThreeNodes::start("ld_halt_place");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int32_t ctl = awaitControllerLeadsTheCatalog(c, 30s);
+    ASSERT_GT(ctl, 0);
+    const int32_t h = ctl == 3 ? 2 : 3;                 // a healthy follower that halts
+    ShardTestClient cl(c.dirs[0]->path / "client-aeron");
+    cl.keepSessionsAlive(true);
+    cl.setClientVersion(pc::kClientVersion);
+    const int64_t sid = connectSettled(cl, c, ctl, 20s);
+    ASSERT_GT(sid, 0);
+    const std::string ch = clientChannelOf(c, ctl);
+    const auto ready = defineSettled(cl, ch, sid, "ready", 30s);
+    ASSERT_TRUE(ready.has_value());
+    ASSERT_EQ(ready->code, kLdOk);
+
+    tamperNextEvent(c.node(h));
+    const auto trigger = defineSettled(cl, ch, sid, "trigger", 30s);
+    ASSERT_TRUE(trigger.has_value());
+    ASSERT_EQ(trigger->code, kLdOk) << "the healthy leader serves; only broker " << h << " halts";
+    ASSERT_TRUE(awaitHalted(c.node(h), 15s));
+    BrokerNode& controller = c.node(ctl);
+    bool known = false;
+    for (const auto deadline = Clock::now() + 15s; Clock::now() < deadline && !known;) {
+        known = controller.onControlThreadForTest([&controller, h] {
+            return controller.metadataServiceForTest()->catalogHalted(h);
+        });
+        if (!known) std::this_thread::sleep_for(20ms);
+    }
+    ASSERT_TRUE(known) << "the controller learned the halt";
+    EXPECT_EQ(consensusLeader(c), ctl) << "a halted FOLLOWER changes no controllership";
+
+    const auto fresh = defineSettled(cl, ch, sid, "fresh", 30s);   // rf 0 = every PLACEABLE broker
+    ASSERT_TRUE(fresh.has_value());
+    ASSERT_EQ(fresh->code, kLdOk);
+    const auto schema = cl.awaitSchema(cl.sendGetTopicSchema(ch, kClientStream, sid, "fresh"), Clock::now() + 10s);
+    ASSERT_TRUE(schema.has_value());
+    const auto pa = assignmentOn(controller, schema->topicId, 0);
+    ASSERT_TRUE(pa.has_value());
+    EXPECT_EQ(pa->replicas.size(), 2u) << "every placeable broker";
+    EXPECT_EQ(std::find(pa->replicas.begin(), pa->replicas.end(), h), pa->replicas.end())
+        << "never placed on the halted broker " << h;
+    EXPECT_NE(pa->leaderNode, h);
+}
+
+// Fix round 0, ruling 1: with EVERY broker halted no broker stands down — a
+// halted controller stays the controller for the data plane, so a data
+// partition still fails over when its leader dies.  RED (the first fix's
+// permanent withdrawal): no controller is left and the partition stays led by
+// the dead broker.
+TEST(CatalogLeadershipBrokerRegression, AllBrokersHaltedKeepAControllerAndADataPartitionStillFailsOverRegression) {
+    ThreeNodes c = ThreeNodes::start("ld_all_halted");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int32_t ctl = awaitControllerLeadsTheCatalog(c, 30s);
+    ASSERT_GT(ctl, 0);
+    ShardTestClient cl(c.dirs[0]->path / "client-aeron");
+    cl.keepSessionsAlive(true);
+    cl.setClientVersion(pc::kClientVersion);
+    std::vector<int64_t> sid(4, 0);
+    sid[static_cast<std::size_t>(ctl)] = connectSettled(cl, c, ctl, 20s);
+    ASSERT_GT(sid[static_cast<std::size_t>(ctl)], 0);
+    const auto data = defineSettled(cl, clientChannelOf(c, ctl), sid[static_cast<std::size_t>(ctl)], "data", 30s);
+    ASSERT_TRUE(data.has_value());
+    ASSERT_EQ(data->code, kLdOk);
+    for (int id = 1; id <= 3; ++id)
+        if (id != ctl) {
+            sid[static_cast<std::size_t>(id)] = connectSettled(cl, c, id, 20s);
+            ASSERT_GT(sid[static_cast<std::size_t>(id)], 0) << id;
+        }
+    const auto schema = cl.awaitSchema(cl.sendGetTopicSchema(clientChannelOf(c, ctl), kClientStream,
+                                                             sid[static_cast<std::size_t>(ctl)], "data"),
+                                       Clock::now() + 10s);
+    ASSERT_TRUE(schema.has_value());
+    const int32_t dataId = schema->topicId;
+
+    // Every broker's applier halts at the same next event.
+    for (int id = 1; id <= 3; ++id) tamperNextEvent(c.node(id));
+    const auto trigger = cl.awaitAnyDdlAnswer(
+        cl.sendDefineTopic(clientChannelOf(c, ctl), kClientStream, sid[static_cast<std::size_t>(ctl)], "trigger", 1,
+                           charBlob()),
+        Clock::now() + 15s);
+    ASSERT_TRUE(trigger.has_value());
+    EXPECT_EQ(trigger->code, kLdInternal) << "the halted catalog leader";
+    for (int id = 1; id <= 3; ++id) ASSERT_TRUE(awaitHalted(c.node(id), 15s)) << id;
+
+    // A controller exists and stays (nobody healthy to hand it to).
+    std::this_thread::sleep_for(2s);
+    const int32_t stayed = consensusLeader(c);
+    ASSERT_GT(stayed, 0) << "never a cluster without a controller";
+
+    // DDL is Internal everywhere.
+    for (int id = 1; id <= 3; ++id) {
+        const auto a = cl.awaitAnyDdlAnswer(cl.sendDropTopic(clientChannelOf(c, id), kClientStream,
+                                                             sid[static_cast<std::size_t>(id)], "data"),
+                                            Clock::now() + 10s);
+        ASSERT_TRUE(a.has_value()) << id;
+        EXPECT_EQ(a->code, kLdInternal) << "broker " << id;
+    }
+
+    // The data partition's leader dies; a survivor takes it over.
+    const auto before = assignmentOn(c.node(stayed), dataId, 0);
+    ASSERT_TRUE(before.has_value());
+    const int32_t dead = before->leaderNode;
+    ASSERT_GT(dead, 0);
+    c.stop(dead);
+    std::optional<rune::metadata::PartitionAssignment> after;
+    for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline;) {
+        const int32_t now = consensusLeader(c);
+        if (now > 0 && now != dead) {
+            after = assignmentOn(c.node(now), dataId, 0);
+            if (after && after->leaderNode > 0 && after->leaderNode != dead) break;
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_TRUE(after.has_value());
+    ASSERT_NE(after->leaderNode, dead) << "failover still works with every broker halted";
+    const int32_t newLeader = after->leaderNode;
+    const auto ack = cl.produceUntilOk(clientChannelOf(c, newLeader), kClientStream,
+                                       sid[static_cast<std::size_t>(newLeader)], dataId, 0, /*acks=*/1,
+                                       oneRecordBatch("after-failover"));
+    ASSERT_TRUE(ack.has_value()) << "the new partition leader serves produce";
+    EXPECT_EQ(ack->errorCode, 0);
 }

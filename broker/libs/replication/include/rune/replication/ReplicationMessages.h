@@ -504,6 +504,12 @@ struct AlterIsrMsg {
     /// answered kAlterIsrLineageConfirmed (committed) or FencedLeaderEpoch.
     /// An older controller drops it (no answer; the leader keeps re-sending).
     static constexpr int32_t kLineageReport = 256;
+    /// Catalog history Task 11 (fix round 0): a node-control REGISTER from a
+    /// process whose CatalogApplier HALTED ("I am halted") — sent to EVERY member
+    /// (each records the mark for that process; a new process clears it).  The
+    /// controller never places a new partition on a halted node, and a halted
+    /// controller hands the controllership to a healthy peer when one is live.
+    static constexpr int32_t kNodeCatalogHalted = 512;
     static constexpr int32_t kConfirmUserClear = 1;
     static constexpr int32_t kConfirmAllClear  = 2;
     /// The controller's answer (responder id in `partition`): kAlterIsrOk =

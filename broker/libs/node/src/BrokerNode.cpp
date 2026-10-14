@@ -1484,8 +1484,14 @@ int32_t BrokerNode::createRuntimeUserReplicas(const TopicSpec& spec) {
         rune::metadata::TopicSpec bs;
         bs.topicId          = topicId;
         bs.partitionCount   = spec.partitionCount;
-        bs.rf               = static_cast<int16_t>(std::max<std::size_t>(1, allNodeIds.size()));
-        if (spec.replicationFactor > 0) bs.rf = std::min<int16_t>(spec.replicationFactor, bs.rf);
+        // rf 0 = "every broker": resolved by the MetadataService against the
+        // placeable brokers (a catalog-halted broker is never a target; Task 11
+        // fix round 0).  An explicit rf is kept (more than the placeable brokers:
+        // an explicit placement error, never a silent shrink).
+        bs.rf               = 0;
+        if (spec.replicationFactor > 0)
+            bs.rf = std::min<int16_t>(spec.replicationFactor,
+                                      static_cast<int16_t>(std::max<std::size_t>(1, allNodeIds.size())));
         bs.coPartitionGroup = spec.coPartitionGroup;
         bs.partitionKey     = spec.partitionKey;
         metadataService_->addRuntimeTopic(bs);
@@ -4092,24 +4098,27 @@ int BrokerNode::publishCatalogRoute_(bool consensusLeader) {
 }
 
 int BrokerNode::resignIfHalted_(bool consensusLeader) {
-    if (catalogHaltedValue_ == 0 || !election_ || config_.isSingleNode()) [[likely]] return 0;
+    if (catalogHaltedValue_ == 0) [[likely]] return 0;
     int work = 0;
-    if (!election_->resigned()) {
-        // Never stand for the controllership again in this process: the controller
-        // places and unplaces topics from the catalog it applied — a halted one
-        // would never place a topic created after its halt (Task 8 binding).
-        election_->withdrawCandidacy();
-        spdlog::critical("BrokerNode[{}]: __catalog apply halted — withdrawing from the controller election "
-                         "(another broker places and unplaces topics)", config_.nodeId);
+    // Fix round 0 (ruling 2): every member — the controller first — learns this
+    // process is halted (a latched mark on the node-control register): it is
+    // never a placement target again.
+    if (runtimeAgent_) work += runtimeAgent_->controlledShutdown().reportCatalogHalted();
+    if (!consensusLeader || !election_ || !metadataService_ || config_.isSingleNode()) return work;
+    // Fix round 0 (ruling 1): hand the controllership to a healthy peer ONLY while
+    // one is live — never leave the cluster without a controller.  With every
+    // broker halted this one stays the controller for the data plane (leader
+    // election, ISR) and places / unplaces no catalog topic (MetadataService).
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::array<rune::consensus::NodeId, 64> live{};
+    const std::size_t n = election_->eligibleNodeIds(nowNs, 3 * election_->leaderHeartbeatTimeoutNs(), live.data(),
+                                                     live.size());
+    if (!metadataService_->healthyPeerAmong(std::span<const int32_t>(live.data(), n))) return work;
+    if (election_->standDown(nowNs, /*holdNs=*/2 * election_->leaderHeartbeatTimeoutNs())) {
+        spdlog::critical("BrokerNode[{}]: __catalog apply halted — stood down from the controllership (a "
+                         "healthy peer is live; it places and unplaces topics from now on)", config_.nodeId);
         ++work;
-    }
-    if (consensusLeader) {
-        const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        if (election_->resign(nowNs)) {
-            spdlog::critical("BrokerNode[{}]: __catalog apply halted — resigned the controllership", config_.nodeId);
-            ++work;
-        }
     }
     return work;
 }

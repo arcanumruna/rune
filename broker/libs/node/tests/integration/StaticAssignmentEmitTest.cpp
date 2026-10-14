@@ -2870,3 +2870,71 @@ TEST(MetadataRemoveTopicRegression, DroppedTopicWhoseAssignmentCommitsLaterIsSti
     EXPECT_EQ(r1->logEndOffset(), leoAfter) << "a second removal appended a record";
     EXPECT_EQ(svc1.assignment(0, 0), nullptr);
 }
+
+// ===========================================================================
+// Catalog history Task 11 fix round 0 — catalog-halted nodes (kNodeCatalogHalted
+// on the node-control register, sent to every member).
+// ===========================================================================
+namespace {
+rune::replication::AlterIsrMsg haltedRegister(int32_t node, int64_t inc) {
+    auto m = nodeControl(node, inc, /*shutdown=*/false);
+    m.isr[1] |= rune::replication::AlterIsrMsg::kNodeCatalogHalted;
+    return m;
+}
+} // namespace
+
+// Ruling 2: the controller never places a NEW partition on a halted node; rf 0
+// ("every broker") means every PLACEABLE broker.  A new process of the node
+// clears the mark.  RED: the halted node is in the new topic's replicas.
+TEST(CatalogHaltedPlacementRegression, ControllerPlacesNoNewPartitionOnAHaltedNodeRegression) {
+    CtlRig c;
+    (void)c.svc->onAlterIsr(haltedRegister(3, 33));
+    ASSERT_TRUE(c.svc->catalogHalted(3));
+    EXPECT_FALSE(c.svc->catalogHalted(2));
+    EXPECT_EQ(c.svc->placementNodes(), (std::vector<int32_t>{1, 2}));
+    c.svc->addRuntimeTopic(TopicSpec{5, 2, 0, "", "fresh"});   // rf 0 = every placeable broker
+    c.drive(100);
+    for (int32_t p = 0; p < 2; ++p) {
+        const auto* pa = c.svc->assignment(5, p);
+        ASSERT_NE(pa, nullptr) << p;
+        EXPECT_EQ(pa->replicas.size(), 2u);
+        EXPECT_EQ(std::count(pa->replicas.begin(), pa->replicas.end(), 3), 0) << "placed on the halted node";
+        EXPECT_NE(pa->leaderNode, 3);
+    }
+    // An explicit rf above the placeable brokers is an explicit placement error.
+    const uint64_t errors = c.svc->balancerErrorCount();
+    c.svc->addRuntimeTopic(TopicSpec{6, 1, 3, "", "rf3"});
+    c.drive(50);
+    EXPECT_EQ(c.svc->assignment(6, 0), nullptr);
+    EXPECT_EQ(c.svc->balancerErrorCount(), errors + 1);
+    // A new process of node 3 (another nonce) is placeable again.
+    (void)c.svc->onAlterIsr(nodeControl(3, 34, false));
+    EXPECT_FALSE(c.svc->catalogHalted(3));
+    EXPECT_EQ(c.svc->placementNodes(), (std::vector<int32_t>{1, 2, 3}));
+}
+
+// Ruling 1: a halted CONTROLLER keeps the data plane but places and unplaces no
+// catalog topic; a halted controller hands over only to a live healthy peer.
+// RED: the halted controller placed / removed from its stale catalog.
+TEST(CatalogHaltedPlacementRegression, HaltedControllerPlacesAndUnplacesNoCatalogTopicRegression) {
+    CtlRig c;
+    c.svc->addRuntimeTopic(TopicSpec{5, 1, 0, "", "before"});
+    c.drive(100);
+    ASSERT_NE(c.svc->assignment(5, 0), nullptr);
+    const std::vector<int32_t> live{1, 2, 3};
+    EXPECT_TRUE(c.svc->healthyPeerAmong(live));
+    (void)c.svc->onAlterIsr(haltedRegister(1, 11));   // the controller (node 1) itself halted
+    EXPECT_TRUE(c.svc->healthyPeerAmong(live)) << "2 and 3 are healthy: hand over";
+    c.svc->addRuntimeTopic(TopicSpec{6, 1, 0, "", "after"});
+    c.svc->removeRuntimeTopic(5);
+    c.drive(100);
+    EXPECT_EQ(c.svc->assignment(6, 0), nullptr) << "no placement from a halted catalog";
+    EXPECT_NE(c.svc->assignment(5, 0), nullptr) << "no unplacement from a halted catalog";
+    EXPECT_GE(c.svc->catalogPlacementsSkippedHalted(), 2u);
+    (void)c.svc->onAlterIsr(haltedRegister(2, 22));
+    (void)c.svc->onAlterIsr(haltedRegister(3, 33));
+    EXPECT_FALSE(c.svc->healthyPeerAmong(live)) << "every broker halted: stay the controller";
+    EXPECT_FALSE(c.svc->healthyPeerAmong(std::vector<int32_t>{1})) << "no live peer";
+    // (The data-plane failover under an all-halted cluster is pinned on real
+    // brokers: CatalogLeadershipBrokerRegression.AllBrokersHalted….)
+}

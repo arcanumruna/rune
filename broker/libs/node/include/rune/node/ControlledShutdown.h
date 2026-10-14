@@ -109,6 +109,20 @@ public:
     [[nodiscard]] bool begin() noexcept { return cmd_.offer(kBeginMsg); }
     /// Fix round 2 (N2): a plain stop() is starting — stop deciding now.
     [[nodiscard]] bool halt() noexcept { return cmd_.offer(kHaltMsg); }
+    /// Catalog history Task 11 fix round 0 — CONTROL thread: this process's
+    /// CatalogApplier halted.  Every node-control request from now on carries
+    /// kNodeCatalogHalted, and the node registers again at once (to EVERY member,
+    /// re-sent until the current controller acked it): the controller never
+    /// places a new partition here, and every member knows this node is no
+    /// healthy controller candidate.  Idempotent.
+    int reportCatalogHalted() {
+        if (catalogHalted_) return 0;
+        catalogHalted_ = true;
+        if (!active_()) return 0;
+        if (std::holds_alternative<Running>(state_) || std::holds_alternative<Registering>(state_))
+            state_ = Registering{};   // a fresh request: re-broadcast at once
+        return 1;
+    }
     /// Control thread / tests: this process's current identity (nonce).
     [[nodiscard]] int64_t nonceOnControl() const noexcept { return incarnation_; }
 
@@ -284,7 +298,7 @@ private:
         m.leaderEpoch = 0;
         m.partitionEpoch = 0;
         m.isrCount  = rune::replication::AlterIsrMsg::kLeaderEpochBump;
-        m.isr[1]    = flags;
+        m.isr[1]    = flags | (catalogHalted_ ? rune::replication::AlterIsrMsg::kNodeCatalogHalted : 0);
         // D15: the metadata feature level this binary supports.
         m.isr[rune::replication::AlterIsrMsg::kNodeFeatureLevelSlot] = rune::replication::MetadataFeature::kLatest;
         m.isr[3]    = static_cast<int32_t>(static_cast<uint32_t>(incarnation_));
@@ -456,6 +470,9 @@ private:
     MetadataService*                            metadata_    = nullptr;
     rune::consensus::Election*                  election_    = nullptr;
     bool                                        rotateNow_   = false;   ///< N1 (control thread)
+    /// Task 11 fix round 0: a latched process attribute (orthogonal to the
+    /// hand-off state machine): every request carries kNodeCatalogHalted.
+    bool                                        catalogHalted_ = false;
     std::vector<int32_t>                        members_;               ///< every cluster member (incl. self)
 
     State  state_{Running{}};                       // control thread
