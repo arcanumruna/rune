@@ -285,3 +285,17 @@ TEST(RuneCliOfflineRegression, SchemaApplyRefusesStatementsItWouldDrop) {
         EXPECT_TRUE(out.str().empty()) << src;
     }
 }
+
+// `schema alter` takes only 'alter topic <ops>'; a config alter / other statement is refused
+// explicitly (never reinterpreted).
+TEST(RuneCliOfflineRegression, SchemaAlterRefusesNonOpsStatementsRegression) {
+    for (const char* src : {"alter topic a set retention.ms = 5;", "drop topic a;", "show history;"}) {
+        fs::path f = fs::temp_directory_path()/"regression_alter_unsupported.rql";
+        { std::ofstream o(f); o << src; }
+        std::ostringstream out, err;
+        int rc = rune::cli::run({"schema","alter", f.string(), "--dry-run"}, out, err);
+        EXPECT_NE(rc, 0) << src;
+        EXPECT_NE(err.str().find("rune ql"), std::string::npos) << src << " got: " << err.str();
+        EXPECT_TRUE(out.str().empty()) << src;
+    }
+}
