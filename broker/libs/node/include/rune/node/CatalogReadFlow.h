@@ -31,7 +31,7 @@
 //   Offer   tryOffer(int64_t session, const uint8_t* frame, std::size_t n);
 //   void    sendReliable(int64_t session, const uint8_t* frame, std::size_t n);
 //   Room    room(int64_t session);
-//   bool    postPaused(int64_t session, int64_t subscriptionId, int64_t baseOffset);
+//   bool    postPaused(int64_t session, int64_t subscriptionId, int64_t baseOffset, bool droppedMarker);
 //   bool    postResume(int64_t session, int64_t subscriptionId);
 
 #include <rune/node/CatalogReadServer.h>
@@ -51,7 +51,7 @@ public:
     enum class Offer : uint8_t { Sent, BackPressured, NoSession };
     enum class Room  : uint8_t { Ready, NotYet, Gone };
 
-    struct PauseOwed    { int64_t baseOffset = -1; };
+    struct PauseOwed    { int64_t baseOffset = -1; bool droppedMarker = false; };
     struct AwaitingAck  {};
     struct AwaitingRoom {};
     struct ResumeOwed   {};
@@ -105,8 +105,10 @@ public:
             sink.sendReliable(h.session, frame, len);
             return;
         }
-        Entry e{h.session, h.subscriptionId, PauseOwed{h.baseOffset}};
-        if (sink.postPaused(h.session, h.subscriptionId, h.baseOffset)) e.state = AwaitingAck{};
+        // I1: the caught-up marker is the one Records with an empty batch.
+        const bool marker = len == kCatalogRecordsOverhead;
+        Entry e{h.session, h.subscriptionId, PauseOwed{h.baseOffset, marker}};
+        if (sink.postPaused(h.session, h.subscriptionId, h.baseOffset, marker)) e.state = AwaitingAck{};
         entries_.push_back(e);   // reserved: never allocates
     }
 
@@ -118,11 +120,20 @@ public:
         for (std::size_t i = 0; i < entries_.size();) {
             Entry& e = entries_[i];
             if (const auto* po = std::get_if<PauseOwed>(&e.state)) {
-                if (sink.postPaused(e.session, e.subscriptionId, po->baseOffset)) { e.state = AwaitingAck{}; ++work; }
+                if (sink.postPaused(e.session, e.subscriptionId, po->baseOffset, po->droppedMarker)) {
+                    e.state = AwaitingAck{};
+                    ++work;
+                }
                 ++i;
                 continue;
             }
-            if (std::holds_alternative<AwaitingAck>(e.state)) { ++i; continue; }
+            if (std::holds_alternative<AwaitingAck>(e.state)) {
+                // M1: a session gone before its ack (the admin drops what it owed
+                // a closed session) clears the entry — never a leaked slot.
+                if (sink.room(e.session) == Room::Gone) { erase_(i); continue; }
+                ++i;
+                continue;
+            }
             if (std::holds_alternative<AwaitingRoom>(e.state)) {
                 const Room r = sink.room(e.session);
                 if (r == Room::Gone) { erase_(i); continue; }

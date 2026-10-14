@@ -4108,8 +4108,8 @@ int BrokerNode::serviceAdminControl_() {
             }
             return Room::Gone;
         }
-        bool postPaused(int64_t session, int64_t subId, int64_t base) {
-            return encodeCatalogReadPaused(agent.controlToAdminRing(), CatalogReadPausedMsg{session, subId, base});
+        bool postPaused(int64_t session, int64_t subId, int64_t base, bool marker) {
+            return encodeCatalogReadPaused(agent.controlToAdminRing(), CatalogReadPausedMsg{session, subId, base, marker});
         }
         bool postResume(int64_t session, int64_t subId) {
             return encodeCatalogReadResume(agent.controlToAdminRing(), CatalogReadResumeMsg{session, subId});

@@ -106,6 +106,11 @@ struct Session {
     //              refused, its ingress is dropped, its SessionExpired is owed.
     // chain / bytes / prevReady / nextReady are meaningful in Spilled only.
     SessionSpill                                   spill;
+    // Catalog history Task 12 fix round 1 (C2): the largest publication window
+    // ever observed for this session (bytes; 0 = not sampled yet) — the receiver's
+    // flow-control window once drained.  A paused catalog reader resumes at a
+    // fraction of it, never at a constant the client's window may never reach.
+    int64_t                                        catalogWindowSeen = 0;
     // Lows batch C (D8c R3): the worker whose full routed share deferred this
     // session's head Produce (-1 = none).  While set, the redelivered frame is
     // ABORTed by ClientGateway::admitClientFrame_ (one probe) instead of being

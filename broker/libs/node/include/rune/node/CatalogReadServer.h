@@ -109,7 +109,8 @@ public:
     using Resumable = std::variant<Backlog, Live>;
     struct PausePending { Resumable resumeAs; };   // paused; its ack is not on the ring yet
     struct Paused       { Resumable resumeAs; };   // paused + acked: nothing sent until onResume
-    using Phase = std::variant<Answering, Backlog, Live, PausePending, Paused>;
+    struct Ending       {};                        // ended this pass (its answer is owed / sent); removed after it
+    using Phase = std::variant<Answering, Backlog, Live, PausePending, Paused, Ending>;
     struct Sub {
         int64_t session        = 0;
         int64_t corr           = 0;   // the creating Subscribe's correlation id (every frame carries it)
@@ -140,10 +141,26 @@ public:
     /// subscription's Records frame at `baseOffset` — rewind to it and pause
     /// (acknowledged on the egress ring).  An unknown subscription is acked too
     /// (the control thread clears its entry).
-    void onPaused(int64_t session, int64_t subscriptionId, int64_t baseOffset);
+    /// `droppedMarker`: the dropped frame was the caught-up marker (an empty
+    /// Records) — re-sent once; a dropped data frame at the marker's offset
+    /// never repeats the marker (fix round 1, I1).
+    void onPaused(int64_t session, int64_t subscriptionId, int64_t baseOffset, bool droppedMarker);
     /// control → admin: the session's egress has room again — continue from the cursor.
     void onResume(int64_t session, int64_t subscriptionId);
 
+    /// Fix round 1 (C1): the committed prefix this server has served from —
+    /// MONOTONIC (max of every HW the replica reported and `noteCommittedFloor`):
+    /// a follower's HW reads 0 after every leader change until the new leader
+    /// answers it, which must never rewind a clamp or fake a caught-up marker.
+    [[nodiscard]] int64_t servedHighWatermark() const noexcept { return servedHw_; }
+    /// A known-committed offset from elsewhere (the applier: applied ⇒ committed).
+    void noteCommittedFloor(int64_t committed) noexcept { if (committed > servedHw_) servedHw_ = committed; }
+    /// Fix round 1 (M3): while true the admin takes no catalog request off the
+    /// request ring (the gateway answers the retriable NotLeader) — the owed
+    /// answers stay within their preallocated capacity.
+    [[nodiscard]] bool intakePaused() const noexcept { return owed_.size() + kIntakeSlack > owedCapacity_; }
+    /// Subscriptions ended because the replica truncated below a served HW.
+    [[nodiscard]] uint64_t truncationEnds() const noexcept { return truncationEnds_; }
     [[nodiscard]] std::size_t subscriptions() const noexcept { return subs_.size(); }
     [[nodiscard]] std::size_t maxSubscriptions() const noexcept { return maxSubs_; }
     /// Subscribes refused beyond maxSubs / subscriptions ended by a read failure.
@@ -177,6 +194,8 @@ private:
     bool sendPauseAck_(int64_t session, int64_t subId);
     bool sendReliable_(int64_t session, std::size_t n);
     void end_(std::size_t index, int16_t code, const char* why, int64_t at);
+    void owe_(const OwedError& e);
+    static constexpr std::size_t kIntakeSlack = 32;   // > one request-ring drain (16)
     int  flushOwed_();
 
     rune::replication::PartitionReplica& catalog_;
@@ -188,6 +207,10 @@ private:
     std::vector<OwedError>               owed_;       // reserved; grows only past maxSubs_ refusals in one burst
     std::vector<uint8_t>                 readBuf_;    // kCatalogReadBufferBytes
     std::vector<uint8_t>                 frameBuf_;   // kCatalogReadMaxFrameBytes
+    std::size_t                          owedCapacity_ = 0;
+    int64_t                              servedHw_ = 0;   // monotonic committed floor (C1)
+    std::size_t                          rr_ = 0;          // round-robin start (M2)
+    uint64_t                             truncationEnds_ = 0;
     uint64_t                             refused_ = 0;
     uint64_t                             ended_   = 0;
 };

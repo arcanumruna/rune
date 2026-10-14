@@ -767,15 +767,14 @@ TEST(CatalogGatewayRegression, CatalogUnsubscribeAndSessionCloseReachTheAdminEve
     g.admin.ringFull = true;
     unsubscribe(g, catalogSubId + 1);
     g.gw.closeSessionForTest(g.sid);
-    EXPECT_EQ(g.gw.pendingCatalogUnsubscribes(), 2u);
+    EXPECT_EQ(g.gw.pendingCatalogUnsubscribes(), 1u) << "fix round 1 (M3): the close supersedes the single one";
     (void)g.gw.pumpCatalogUnsubscribesForTest();   // the doWork retry step
-    EXPECT_EQ(g.gw.pendingCatalogUnsubscribes(), 2u) << "still full: kept";
+    EXPECT_EQ(g.gw.pendingCatalogUnsubscribes(), 1u) << "still full: kept";
     g.admin.ringFull = false;
     (void)g.gw.pumpCatalogUnsubscribesForTest();
     EXPECT_EQ(g.gw.pendingCatalogUnsubscribes(), 0u);
-    ASSERT_EQ(g.admin.catalogUnsubs.size(), 3u);
-    EXPECT_EQ(g.admin.catalogUnsubs[1].subscriptionId, catalogSubId + 1) << "in order";
-    EXPECT_EQ(g.admin.catalogUnsubs[2].subscriptionId, -1) << "the session close: every catalog subscription";
+    ASSERT_EQ(g.admin.catalogUnsubs.size(), 2u);
+    EXPECT_EQ(g.admin.catalogUnsubs[1].subscriptionId, -1) << "the session close: every catalog subscription";
 }
 
 // A data-plane Unsubscribe is never sent to the admin thread.
@@ -813,4 +812,49 @@ TEST(CatalogGatewayRegression, AppliedPlacedSinkWithoutItsPlanOnTheWorkersIsNotR
     g.gw.forgetDroppedTopic(6, 1, logs);
     EXPECT_FALSE(g.gw.viewSinkAwaitingPlan(6)) << "a dropped sink waits for nothing";
     EXPECT_EQ(g.viewRowStatus(6), pc::ViewRowResponse::kUnknownView);
+}
+
+// Fix round 1 (C2): the resume threshold is reachable by ANY receiver window —
+// a fraction of the window actually observed, of the term — never a constant a
+// small window can never reach (a paused reader would hang).  RED: 16 KiB for an
+// 8 KiB window.
+TEST(CatalogGatewayRegression, CatalogResumeThresholdFitsEveryReceiverWindowRegression) {
+    using G = rune::gateway::ClientGateway;
+    for (int64_t window : {int64_t{1408}, int64_t{4096}, int64_t{8192}, int64_t{12 * 1024}, int64_t{1} << 20}) {
+        const int64_t t = G::catalogResumeThreshold(/*term=*/64 * 1024, window);
+        EXPECT_LE(t, window) << "window " << window << ": a fully drained window always resumes";
+        EXPECT_GE(t, 1);
+        EXPECT_LE(t, G::kCatalogResumeWindowBytes);
+    }
+    EXPECT_LE(G::catalogResumeThreshold(/*term=*/16 * 1024, 0), 8 * 1024) << "bounded by the term too";
+}
+
+// Fix round 1 (M3): waiting catalog Unsubscribes stay bounded — a session close
+// supersedes the session's waiting single unsubscribes, duplicates coalesce.
+TEST(CatalogGatewayRegression, PendingCatalogUnsubscribesCoalesceRegression) {
+    GatewayRig g;
+    g.admin.ringFull = true;
+    const int64_t base = rune::gateway::kCatalogSubscriptionIdBase | (int64_t{2} << 40);
+    for (int i = 0; i < 50; ++i) unsubscribe(g, base | (1 + i % 5));   // 5 distinct, repeated
+    EXPECT_EQ(g.gw.pendingCatalogUnsubscribes(), 5u) << "duplicates coalesce";
+    g.gw.closeSessionForTest(g.sid);
+    EXPECT_EQ(g.gw.pendingCatalogUnsubscribes(), 1u) << "the close supersedes them";
+    g.admin.ringFull = false;
+    (void)g.gw.pumpCatalogUnsubscribesForTest();
+    ASSERT_EQ(g.admin.catalogUnsubs.size(), 1u);
+    EXPECT_EQ(g.admin.catalogUnsubs[0].subscriptionId, -1);
+}
+
+// Fix round 1 (M4): a back-pressured catalog frame is never shown to the capture hook as sent.
+TEST(CatalogGatewayRegression, BackPressuredCatalogFrameIsNotCapturedAsSent) {
+    GatewayRig g;
+    std::size_t captured = 0;
+    g.gw.setOnControlFrame([&](int64_t, const uint8_t*, std::size_t) { ++captured; });
+    const uint8_t frame[52] = {};
+    g.gw.setCatalogBackPressureForTest(g.sid, true);
+    EXPECT_EQ(g.gw.tryOfferCatalogFrame(g.sid, frame, sizeof frame), ClientGateway::CatalogOffer::BackPressured);
+    EXPECT_EQ(captured, 0u);
+    g.gw.setCatalogBackPressureForTest(g.sid, false);
+    EXPECT_EQ(g.gw.tryOfferCatalogFrame(g.sid, frame, sizeof frame), ClientGateway::CatalogOffer::Sent);
+    EXPECT_EQ(captured, 1u);
 }

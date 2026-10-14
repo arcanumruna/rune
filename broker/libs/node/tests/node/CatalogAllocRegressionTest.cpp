@@ -79,7 +79,7 @@ struct NotYetSink {
     Offer tryOffer(int64_t, const uint8_t*, std::size_t) { return Offer::BackPressured; }
     void  sendReliable(int64_t, const uint8_t*, std::size_t) {}
     Room  room(int64_t) { return Room::NotYet; }
-    bool  postPaused(int64_t, int64_t, int64_t) { return true; }
+    bool  postPaused(int64_t, int64_t, int64_t, bool) { return true; }
     bool  postResume(int64_t, int64_t) { return true; }
 };
 }   // namespace
@@ -94,7 +94,7 @@ TEST(CatalogAllocRegression, PausedCatalogReaderAllocatesNothingRegression) {
                 return s->subscriptionId;
         return int64_t{0};
     }();
-    r.server.onPaused(7, sub, 0);
+    r.server.onPaused(7, sub, 0, false);
     ASSERT_STREQ(r.server.phaseName(sub), "Paused");
     rune::node::CatalogReadFlow flow(8);
     NotYetSink sink;

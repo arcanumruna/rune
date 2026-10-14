@@ -776,6 +776,7 @@ int16_t PartitionReplica::onFetchRequest(const FetchRequestMsg& req, int64_t now
         epoch_    = req.leaderEpoch;
         leaderId_ = req.followerId; // best-effort; coordinator will correct
         followerHw_ = committedHw;
+        hwLearnedEpoch_ = epoch_;   // our own committed HW as the demoted leader
         followerSync_.reset();    // self-demotion → bootstrap fetch state afresh
         wedgedAtOffset_ = -1;     // F18
         followerSlots_.resetLeadership();
@@ -1459,6 +1460,7 @@ void PartitionReplica::applyReplicated(const FetchResponseMsg& resp)
     if (newHw > followerHw_) {
         followerHw_ = newHw;
     }
+    hwLearnedEpoch_ = epoch_;   // catalog Task 12 fix round 1: this epoch's leader told us its HW
     // (followerSync_.onResponse() was recorded at the top of this function,
     //  before any gap/truncate handling, so a gapped-but-behind follower still
     //  learns the leader is ahead and keeps fetching FAST.)

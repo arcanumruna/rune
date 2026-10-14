@@ -92,8 +92,10 @@ public:
     /// (no status messages to the broker).  Construct, use and destroy it on ONE
     /// thread (the driver's pump owner).
     explicit ShardTestClient(const std::filesystem::path& aeronDir, int32_t termBufferBytes = 1 << 20,
-                             bool legacyTransport = false, DriverMode mode = DriverMode::Threaded)
-        : driver_(cfgFor(aeronDir, termBufferBytes, legacyTransport), mode), invoker_(mode == DriverMode::Invoker)
+                             bool legacyTransport = false, DriverMode mode = DriverMode::Threaded,
+                             int32_t rcvWindowBytes = 128 * 1024)
+        : driver_(cfgFor(aeronDir, termBufferBytes, legacyTransport, rcvWindowBytes), mode),
+          invoker_(mode == DriverMode::Invoker)
     {
         aeron::Context ctx;
         ctx.aeronDir(aeronDir.string());
@@ -733,8 +735,10 @@ private:
                 ++requestCounter_};
     }
     uint64_t requestCounter_ = 0;
+    /// `rcvWindowBytes` (catalog Task 12 fix round 1): the client's receive window
+    /// (a small one also pins the MTU to 1408 so window >= MTU).
     static EmbeddedDriverConfig cfgFor(const std::filesystem::path& d, int32_t termBufferBytes,
-                                       bool legacyTransport = false) {
+                                       bool legacyTransport = false, int32_t rcvWindowBytes = 128 * 1024) {
         EmbeddedDriverConfig c; c.dir = d.string(); c.termBufferBytes = termBufferBytes;
         if (legacyTransport) {
             c.mtuBytes = 1408; c.socketBufferBytes = 2 * 1024 * 1024; c.termBufferSparse = true;
@@ -745,7 +749,8 @@ private:
         // Pinned (test client, orthogonal to the broker defaults): the pre-2026-10-02
         // 128 KiB receive window, so back-pressure tests (a client that stops
         // reading its acks) hit it at the same depth whatever the host derives.
-        c.rcvWindowBytes = 128 * 1024;
+        c.rcvWindowBytes = rcvWindowBytes;
+        if (rcvWindowBytes < 64 * 1024) c.mtuBytes = 1408;
         return c;
     }
     template <class M>

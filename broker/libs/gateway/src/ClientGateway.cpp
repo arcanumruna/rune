@@ -4842,7 +4842,31 @@ void ClientGateway::forwardCatalogUnsubscribe_(int64_t sid, int64_t subscription
     if (adminSink_ == nullptr) return;
     // FIFO behind any already waiting (a close after a single unsubscribe stays after it).
     if (pendingCatalogUnsubs_.empty() && adminSink_->submitCatalogUnsubscribe(sid, subscriptionId)) return;
-    pendingCatalogUnsubs_.push_back(PendingCatalogUnsubscribe{sid, subscriptionId});
+    // M3: a close supersedes the session's waiting single unsubscribes; duplicates coalesce.
+    if (subscriptionId == -1)
+        std::erase_if(pendingCatalogUnsubs_, [sid](const PendingCatalogUnsubscribe& p) { return p.sessionId == sid; });
+    else
+        for (const auto& p : pendingCatalogUnsubs_)
+            if (p.sessionId == sid && (p.subscriptionId == subscriptionId || p.subscriptionId == -1)) return;
+    if (pendingCatalogUnsubs_.size() >= kPendingCatalogUnsubsCap) [[unlikely]] {
+        if (subscriptionId != -1) {
+            // Explicit, bounded: the subscription ends with its session's close at the latest.
+            ++catalogUnsubsDropped_;
+            spdlog::error("ClientGateway: catalog Unsubscribe {:#x} (session {}) not queued — {} waiting for the "
+                          "admin ring (the cap); it ends with the session (dropped so far: {})", subscriptionId, sid,
+                          pendingCatalogUnsubs_.size(), catalogUnsubsDropped_);
+            return;
+        }
+        // A close is never dropped: it replaces the oldest single unsubscribe.
+        for (auto it = pendingCatalogUnsubs_.begin(); it != pendingCatalogUnsubs_.end(); ++it)
+            if (it->subscriptionId != -1) { pendingCatalogUnsubs_.erase(it); ++catalogUnsubsDropped_; break; }
+        if (pendingCatalogUnsubs_.size() >= kPendingCatalogUnsubsCap) {
+            spdlog::critical("ClientGateway: {} closed sessions wait for the admin ring (the cap) — session {}'s close "
+                             "not queued", pendingCatalogUnsubs_.size(), sid);
+            return;
+        }
+    }
+    pendingCatalogUnsubs_.push_back(PendingCatalogUnsubscribe{sid, subscriptionId});   // reserved: never allocates
 }
 
 int ClientGateway::flushPendingCatalogUnsubs_()
@@ -4866,8 +4890,10 @@ ClientGateway::CatalogOffer ClientGateway::tryOfferCatalogFrame(int64_t sessionI
     if (catalogBackPressureForTest_ == sessionId) [[unlikely]] return CatalogOffer::BackPressured;
     // Answers queued ahead of it keep their order: the Records waits (never spills).
     if (s->spill.state != SpillState::Normal) return CatalogOffer::BackPressured;
-    if (onControlFrame_) onControlFrame_(sessionId, buf, len);
-    return sendTo(*s, buf, len) ? CatalogOffer::Sent : CatalogOffer::BackPressured;
+    if (s->egress) s->catalogWindowSeen = std::max(s->catalogWindowSeen, s->egress->availableWindow());   // C2
+    if (!sendTo(*s, buf, len)) return CatalogOffer::BackPressured;
+    if (onControlFrame_) onControlFrame_(sessionId, buf, len);   // M4: a capture sees only what was sent
+    return CatalogOffer::Sent;
 }
 
 ClientGateway::CatalogRoom ClientGateway::catalogEgressRoom(int64_t sessionId)
@@ -4878,7 +4904,10 @@ ClientGateway::CatalogRoom ClientGateway::catalogEgressRoom(int64_t sessionId)
     if (s->spill.state != SpillState::Normal) return CatalogRoom::NotYet;
     if (!s->egress) return CatalogRoom::Ready;   // egress-less test session (capture hook)
     if (!s->egress->isConnected()) return CatalogRoom::NotYet;
-    return s->egress->availableWindow() >= kCatalogResumeWindowBytes ? CatalogRoom::Ready : CatalogRoom::NotYet;
+    const int64_t w = s->egress->availableWindow();
+    s->catalogWindowSeen = std::max(s->catalogWindowSeen, w);
+    const int64_t need = catalogResumeThreshold(s->egress->termBufferLength(), s->catalogWindowSeen);
+    return w >= need ? CatalogRoom::Ready : CatalogRoom::NotYet;
 }
 
 void ClientGateway::noteViewSinkAwaitingPlan(int32_t viewTopicId)

@@ -506,6 +506,7 @@ int AdminWorker::doWork(int64_t nowNs) {
         if (!applyHeldForTest_) [[likely]] work += applier_.applyCommitted(*catalogReplica_);
         // Task 12: catalog reads, after the applier (what it serves is the HW the
         // replica pass just computed; a halted applier does not stop reads).
+        readServer_->noteCommittedFloor(applier_.nextOffset());   // C1: applied ⇒ committed
         work += readServer_->pump();
     }
     if (advance_(nowNs)) ++work;

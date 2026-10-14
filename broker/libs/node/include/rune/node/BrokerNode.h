@@ -449,7 +449,10 @@ public:
         //    growing.  This bounds the backlog to one tick's answers (<= 16
         //    drained + the in-flight op), far below kEgressBacklogBytes.
         if (!egressBacklog_.empty()) [[unlikely]] work += flushEgressBacklog_();
-        if (egressBacklog_.empty()) work += requestRing_.drain([this](int32_t tid,
+        //    Task 12 fix round 1 (M3): likewise while the catalog read server's owed
+        //    answers near their preallocated capacity (the catalog-read ring is
+        //    always drained, so this is transient) — bounded, never grown.
+        if (egressBacklog_.empty() && !worker_.catalogIntakePaused()) work += requestRing_.drain([this](int32_t tid,
                                           aeron::concurrent::AtomicBuffer& b,
                                           aeron::util::index_t off,
                                           aeron::util::index_t len) {

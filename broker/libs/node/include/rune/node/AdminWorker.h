@@ -197,12 +197,14 @@ public:
     void catalogUnsubscribe(const CatalogUnsubscribeMsg& m);
     /// Fix round 0: catalog-read flow control from the control thread.
     void catalogReadPaused(const CatalogReadPausedMsg& m) {
-        if (readServer_) readServer_->onPaused(m.session, m.subscriptionId, m.baseOffset);
+        if (readServer_) readServer_->onPaused(m.session, m.subscriptionId, m.baseOffset, m.droppedMarker);
     }
     void catalogReadResume(const CatalogReadResumeMsg& m) {
         if (readServer_) readServer_->onResume(m.session, m.subscriptionId);
     }
     [[nodiscard]] const CatalogReadServer* readServer() const noexcept { return readServer_ ? &*readServer_ : nullptr; }
+    /// M3: catalog requests wait on the ring while the read server's owed answers are near capacity.
+    [[nodiscard]] bool catalogIntakePaused() const noexcept { return readServer_ && readServer_->intakePaused(); }
 
     /// Task 20: resolve a view NAME for an open-for-read handshake.  Returns a
     /// ViewRowResponse status: 0 OK (out params set), 3 SchemaMismatch (a pin to

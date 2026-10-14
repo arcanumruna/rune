@@ -293,3 +293,113 @@ TEST(CatalogReadBrokerRegression, SlowCatalogReaderIsPausedNeverExpiredAndAFastR
     EXPECT_EQ(resumes, pauses) << "every pause resumed";
     EXPECT_EQ(paused, 0u) << "nothing left paused";
 }
+
+namespace {
+/// `n` catalog events of ~100 KiB each (AlterTopicConfig statements on "cfg").
+void buildLargeCatalog(ShardTestClient& cl, const ThreeNodes& c, int32_t leader, int64_t sid, int n) {
+    ASSERT_EQ(defineSettled(cl, channelOf(c, leader), sid, "cfg"), 0);
+    const std::string statement(100 * 1024, 's');
+    for (int i = 0; i < n; ++i) {
+        const int64_t corr = cl.sendAlterTopicConfig(channelOf(c, leader), kClientStream, sid, "cfg", 0,
+                                                     {{1, 60'000 + i}}, {}, statement);
+        const auto a = cl.awaitDdl(corr, Clock::now() + 15s);
+        ASSERT_TRUE(a.has_value()) << i;
+        ASSERT_EQ(a->errorCode, 0) << i << " " << a->detail;
+    }
+}
+}   // namespace
+
+// Fix round 1 (C2): a reader whose receive window is BELOW the old fixed 16 KiB
+// resume threshold (8 KiB) still reads the whole catalog — every pause resumes.
+// RED: it was paused once and never resumed (availableWindow <= 8 KiB < 16 KiB): a hang.
+TEST(CatalogReadBrokerRegression, ReaderWithASmallReceiveWindowStillReadsTheWholeCatalogRegression) {
+    // A small-MTU deployment (the MTU must fit the client's 8 KiB receive window).
+    ThreeNodes c = ThreeNodes::startWith("rd_smallwin", [](NodeConfig& cfg) { cfg.aeronMtuBytes = 1408; });
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int32_t leader = c.catalogLeaderId();
+    ASSERT_GT(leader, 0);
+    BrokerNode& node = c.node(leader);
+    ShardTestClient writer(c.dirs[0]->path / "writer-aeron");
+    writer.keepSessionsAlive(true);
+    writer.setClientVersion(pc::kClientVersion);
+    const int64_t sidW = connectSettled(writer, c, leader, 20s);
+    ASSERT_GT(sidW, 0);
+    buildLargeCatalog(writer, c, leader, sidW, 10);   // ~1 MB
+    const int64_t hw = catalogHw(node);
+
+    ShardTestClient small(c.dirs[0]->path / "small-aeron", 1 << 20, false, DriverMode::Threaded,
+                          /*rcvWindowBytes=*/8 * 1024);
+    small.keepSessionsAlive(true);
+    small.setClientVersion(pc::kClientVersion);
+    const int64_t sid = connectSettled(small, c, leader, 20s);
+    ASSERT_GT(sid, 0);
+    const int64_t corr = small.sendCatalogSubscribe(channelOf(c, leader), kClientStream, sid, -2);
+    bool done = false;
+    for (const auto deadline = Clock::now() + 60s; Clock::now() < deadline && !done;) {
+        small.pollThrottled(64);
+        const auto id = small.subscriptionIdOf(corr);
+        done = id && !seenBy(small, *id).markers.empty();
+        if (!done) std::this_thread::sleep_for(200us);
+    }
+    ASSERT_TRUE(done) << "the small-window reader reached the end";
+    const Seen s = seenBy(small, *small.subscriptionIdOf(corr));
+    EXPECT_EQ(s.offsets, upTo(s.markers.at(0)));
+    EXPECT_GE(s.markers.at(0), hw);
+    EXPECT_EQ(s.markers.size(), 1u);
+    const auto [pauses, resumes] = node.onControlThreadForTest([&node] {
+        const auto& f = node.catalogReadFlowForTest();
+        return std::pair{f.pauses(), f.resumes()};
+    });
+    EXPECT_GT(pauses, 0u) << "non-vacuous: the 8 KiB window back-pressured it";
+    EXPECT_EQ(resumes, pauses);
+}
+
+// Fix round 1 (M5 / C1 end to end): the catalog leader dies while a slow reader
+// on a FOLLOWER is mid-backlog.  The follower's HW resets with the leader change;
+// the reader still gets every record once, in order, and exactly ONE marker — at
+// the full committed prefix, never a premature one.
+TEST(CatalogReadBrokerRegression, LeaderChangeWhileAFollowerReaderIsMidBacklogKeepsOneTrueMarkerRegression) {
+    ThreeNodes c = ThreeNodes::start("rd_lchange");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int32_t leader = c.catalogLeaderId();
+    ASSERT_GT(leader, 0);
+    const int32_t follower = leader == 1 ? 2 : 1;
+    ShardTestClient writer(c.dirs[0]->path / "writer-aeron");
+    writer.keepSessionsAlive(true);
+    writer.setClientVersion(pc::kClientVersion);
+    const int64_t sidW = connectSettled(writer, c, leader, 20s);
+    ASSERT_GT(sidW, 0);
+    buildLargeCatalog(writer, c, leader, sidW, 30);   // ~3 MB
+    const int64_t hw = catalogHw(c.node(leader));
+    ASSERT_TRUE(c.awaitCatalogHighWatermark(c.node(follower), hw, 15s));
+
+    ShardTestClient reader(c.dirs[0]->path / "reader-aeron");
+    reader.keepSessionsAlive(true);
+    reader.setClientVersion(pc::kClientVersion);
+    const int64_t sid = connectSettled(reader, c, follower, 20s);
+    ASSERT_GT(sid, 0);
+    const int64_t corr = reader.sendCatalogSubscribe(channelOf(c, follower), kClientStream, sid, -2);
+    auto seen = [&] { const auto id = reader.subscriptionIdOf(corr); return id ? seenBy(reader, *id) : Seen{}; };
+    // Read slowly until part of the backlog arrived, then kill the catalog leader.
+    for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && seen().offsets.size() < 5;) {
+        reader.pollThrottled(1);
+        std::this_thread::sleep_for(2ms);
+    }
+    ASSERT_GE(seen().offsets.size(), 5u);
+    ASSERT_TRUE(seen().markers.empty()) << "precondition: mid-backlog";
+    c.stop(leader);
+    bool done = false;
+    for (const auto deadline = Clock::now() + 90s; Clock::now() < deadline && !done;) {
+        reader.pollThrottled(1);
+        done = !seen().markers.empty() && seen().offsets.size() >= static_cast<std::size_t>(hw);
+        std::this_thread::sleep_for(1ms);
+    }
+    // Drain whatever else arrives briefly: a premature or second marker would show here.
+    for (int i = 0; i < 200; ++i) { reader.pollThrottled(64); std::this_thread::sleep_for(1ms); }
+    const Seen s = seen();
+    ASSERT_FALSE(s.markers.empty()) << "caught up after the leader change";
+    EXPECT_EQ(s.markers.size(), 1u) << "one marker";
+    EXPECT_GE(s.markers[0], hw) << "never a premature marker below the committed prefix";
+    EXPECT_EQ(s.offsets, upTo(static_cast<int64_t>(s.offsets.size()))) << "every record once, in order";
+    EXPECT_GE(static_cast<int64_t>(s.offsets.size()), hw);
+}

@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -173,9 +174,19 @@ struct ThreeNodes {
         return c;
     }
 
+    /// Applied to every node's config before it starts (catalog Task 12 fix round 1: a small MTU).
+    std::function<void(NodeConfig&)> configTweak;
+    static ThreeNodes startWith(const std::string& tag, std::function<void(NodeConfig&)> tweak) {
+        ThreeNodes c(tag, Mode::Shard);
+        c.configTweak = std::move(tweak);
+        for (int id : {1, 2, 3}) c.startNode(id);
+        return c;
+    }
+
     void startNode(int id) {
-        nodes[static_cast<std::size_t>(id - 1)] =
-            std::make_unique<BrokerNode>(makeConfig(id, dirs[static_cast<std::size_t>(id - 1)]->path, ports, 3, mode));
+        NodeConfig cfg = makeConfig(id, dirs[static_cast<std::size_t>(id - 1)]->path, ports, 3, mode);
+        if (configTweak) configTweak(cfg);
+        nodes[static_cast<std::size_t>(id - 1)] = std::make_unique<BrokerNode>(cfg);
         nodes[static_cast<std::size_t>(id - 1)]->start();
     }
     void stop(int id) {

@@ -294,7 +294,7 @@ struct FlowHarness {
     ReadRig&                      rig;
     rune::node::CatalogReadFlow   flow{64};
     std::map<int64_t, Session>    sessions;
-    struct Report { bool pause; int64_t session, subId, base; };
+    struct Report { bool pause; int64_t session, subId, base; bool marker; };
     std::vector<Report>           ring;     // control → admin
     std::map<int64_t, std::vector<std::vector<uint8_t>>> delivered;   // session → client frames
 
@@ -318,8 +318,11 @@ struct FlowHarness {
         const std::size_t free = it->second.window - std::min(it->second.window, it->second.inFlight);
         return free >= std::min<std::size_t>(16 * 1024, it->second.window / 2) ? Room::Ready : Room::NotYet;
     }
-    bool postPaused(int64_t s, int64_t sub, int64_t base) { ring.push_back({true, s, sub, base}); return true; }
-    bool postResume(int64_t s, int64_t sub) { ring.push_back({false, s, sub, -1}); return true; }
+    bool postPaused(int64_t s, int64_t sub, int64_t base, bool marker) {
+        ring.push_back({true, s, sub, base, marker});
+        return true;
+    }
+    bool postResume(int64_t s, int64_t sub) { ring.push_back({false, s, sub, -1, false}); return true; }
 
     explicit FlowHarness(ReadRig& r) : rig(r) {
         rig.onFrame = [this](const rune::node::CatalogReadFrameHead& h, std::span<const uint8_t> f) {
@@ -337,7 +340,7 @@ struct FlowHarness {
         std::vector<Report> r;
         r.swap(ring);
         for (const Report& x : r) {
-            if (x.pause) rig.server.onPaused(x.session, x.subId, x.base);
+            if (x.pause) rig.server.onPaused(x.session, x.subId, x.base, x.marker);
             else         rig.server.onResume(x.session, x.subId);
         }
         rig.server.pump();
@@ -413,7 +416,7 @@ TEST(CatalogReadServerRegression, PausedMarkerIsSentAgainOnceAfterTheResumeRegre
     r.server.pump();
     ASSERT_EQ(r.markers(7), (std::vector<int64_t>{2}));
     const int64_t sub = r.subscriptionIdOf(7, 1);
-    r.server.onPaused(7, sub, /*the marker's baseOffset=*/2);
+    r.server.onPaused(7, sub, /*the marker's baseOffset=*/2, /*droppedMarker=*/true);
     EXPECT_STREQ(r.server.phaseName(sub), "Paused") << "acknowledged";
     ASSERT_FALSE(r.frames.empty());
     EXPECT_TRUE(r.frames.back().bytes.empty()) << "the pause ack is an empty frame of the subscription";
@@ -471,4 +474,208 @@ TEST(CatalogReadServerRegression, FlowDropsOnlyThePausedSubscriptionsFramesUntil
     h.sessions.erase(1);
     h.flow.service(h);
     EXPECT_EQ(h.flow.paused(), 0u);
+}
+
+// ─── Fix round 1 ─────────────────────────────────────────────────────────────
+
+// C1: a follower's HW reads 0 after every leader change (and stays 0 while the
+// catalog is leaderless).  A subscription mid-backlog must neither be told it is
+// caught up at a lower offset nor lose its place: the backlog is served up to
+// the committed floor already known, and the marker waits until the HW is
+// current again — then exactly one, at the true HW.  RED: a marker at 0.
+TEST(CatalogReadServerRegression, LeaderChangeMidBacklogNeverSendsAFalseCaughtUpMarkerRegression) {
+    ReadRig r("rd_c1_marker");
+    r.commitEvents(6);
+    r.server.subscribe(9, 1, -1);                      // another reader: the server learns HW 6
+    r.server.pump();
+    r.egressBudget = 1;                                // only the SubscribeResponse goes out
+    r.server.subscribe(7, 1, -2);
+    r.server.pump();
+    ASSERT_TRUE(r.subscribeAnswered(7, 1));
+    ASSERT_STREQ(r.server.phaseName(r.subscriptionIdOf(7, 1)), "Backlog") << "mid-backlog at 0";
+    r.egressBudget = -1;
+    r.replica().becomeFollower(ReadRig::kEpoch + 1, /*leaderless=*/-1);
+    ASSERT_EQ(r.replica().highWatermark(), 0) << "precondition: the HW regressed with the leader change";
+    for (int i = 0; i < 5; ++i) r.server.pump();
+    EXPECT_EQ(r.deliveredOffsets(7), range(0, 6)) << "the committed backlog is still served (the floor)";
+    EXPECT_TRUE(r.markers(7).empty()) << "never 'caught up' while the HW is not current";
+    EXPECT_EQ(r.server.servedHighWatermark(), 6);
+    r.replica().becomeLeader(ReadRig::kEpoch + 2, {ReadRig::kSelf}, 1);
+    r.commitEvents(0);                                 // the new leader's pass: its HW is current
+    r.server.pump();
+    r.server.pump();
+    EXPECT_EQ(r.markers(7), (std::vector<int64_t>{6})) << "exactly one marker, at the true HW";
+}
+
+// C1: a Subscribe from an explicit offset (a client resuming) or from latest
+// during a leader change is clamped to the committed floor, never to the
+// regressed 0.  RED: offsets 0.. replayed (duplicates), a marker at 0.
+TEST(CatalogReadServerRegression, SubscribeDuringALeaderChangeIsNeverClampedBackRegression) {
+    ReadRig r("rd_c1_clamp");
+    r.commitEvents(6);
+    r.server.subscribe(9, 1, -2);
+    r.server.pump();
+    r.replica().becomeFollower(ReadRig::kEpoch + 1, -1);
+    r.server.subscribe(7, 1, /*resume from=*/4);
+    r.server.subscribe(8, 1, /*latest=*/-1);
+    r.server.pump();
+    EXPECT_EQ(r.deliveredOffsets(7), (std::vector<int64_t>{4, 5})) << "from its cursor, never from 0";
+    EXPECT_TRUE(r.deliveredOffsets(8).empty()) << "latest = the committed floor, not a replay from 0";
+    EXPECT_TRUE(r.markers(7).empty());
+    EXPECT_TRUE(r.markers(8).empty());
+}
+
+// C1: a log truncated below a HW already served (an unclean / deficient
+// election upstream) ends every catalog subscription with the retriable
+// NotLeader — the client resubscribes — never served past it, never rewound
+// silently.  RED: the subscriptions stayed, silently.
+TEST(CatalogReadServerRegression, TruncationBelowAServedHwEndsEverySubscriptionRetriablyRegression) {
+    ReadRig r("rd_c1_trunc");
+    r.commitEvents(6);
+    r.server.subscribe(7, 1, -2);
+    r.server.subscribe(8, 1, -1);
+    r.server.pump();
+    ASSERT_EQ(r.markers(7), (std::vector<int64_t>{6}));
+    r.replica().becomeFollower(ReadRig::kEpoch + 1, -1);
+    ASSERT_TRUE(r.replica().log()->truncateTo(3));
+    ASSERT_EQ(r.replica().logEndOffset(), 3);
+    r.server.pump();
+    EXPECT_EQ(r.server.subscriptions(), 0u);
+    EXPECT_EQ(r.server.truncationEnds(), 2u);
+    for (int64_t s : {7, 8}) {
+        const auto e = r.errors(s);
+        ASSERT_EQ(e.size(), 1u) << s;
+        EXPECT_EQ(e[0].code, static_cast<int16_t>(pc::ErrorCode::NotLeader)) << "retriable: resubscribe";
+        EXPECT_EQ(e[0].correlationId, 1);
+    }
+    EXPECT_LE(r.server.servedHighWatermark(), 3) << "the floor follows the truncated log";
+    r.server.subscribe(7, 2, -2);                      // the resubscribe is served from what the log holds
+    r.server.pump();
+    EXPECT_TRUE(r.subscribeAnswered(7, 2));
+}
+
+// M5: below minIsr the leader's HW is frozen; reads are served up to it and the
+// marker is at it — appended-but-uncommitted events are never served.
+TEST(CatalogReadServerRegression, BelowMinIsrServesOnlyUpToTheFrozenHwRegression) {
+    ReadRig r("rd_minisr");
+    r.commitEvents(3);
+    r.replica().setMinIsrForTest(2);                   // ISR {self} < 2: nothing more commits
+    const uint8_t key[8] = {1};
+    const std::vector<uint8_t> v(64, 'u');
+    ASSERT_GE(r.replica().appendKeyed(std::span<const uint8_t>(key, 8), v, /*acksAll=*/false), 0);
+    r.replica().onLeaderLogAppended();
+    (void)r.replica().doWork(9'000'000'000);
+    ASSERT_EQ(r.replica().logEndOffset(), 4);
+    ASSERT_EQ(r.replica().highWatermark(), 3);
+    r.server.subscribe(7, 1, -2);
+    r.server.pump();
+    EXPECT_EQ(r.deliveredOffsets(7), range(0, 3));
+    EXPECT_EQ(r.markers(7), (std::vector<int64_t>{3}));
+}
+
+// I1: the first live Records frame right after the marker is back-pressured
+// (same baseOffset as the marker).  RED: the subscription resumed as Backlog
+// and sent a second marker.
+TEST(CatalogReadServerRegression, DataFrameDroppedRightAfterTheMarkerNeverRepeatsTheMarkerRegression) {
+    ReadRig r("rd_i1");
+    r.commitEvents(2);
+    FlowHarness h(r);
+    h.sessions[7] = {/*window=*/1 << 20, 0, /*drainPerPass=*/1 << 20};
+    r.server.subscribe(7, 1, -2);
+    h.pass();
+    ASSERT_EQ(h.seen(7).second, (std::vector<int64_t>{2}));
+    h.sessions[7].inFlight = h.sessions[7].window;     // the reader's window is full
+    h.sessions[7].drainPerPass = 0;
+    r.commitEvents(1);                                 // Records{base=2} is back-pressured
+    h.pass();
+    ASSERT_EQ(h.flow.pauses(), 1u);
+    h.sessions[7].drainPerPass = 1 << 20;
+    for (int i = 0; i < 10; ++i) h.pass();
+    EXPECT_EQ(h.seen(7).first, range(0, 3)) << "every record once";
+    EXPECT_EQ(h.seen(7).second, (std::vector<int64_t>{2})) << "one marker, never a second";
+    EXPECT_EQ(h.flow.resumes(), 1u);
+}
+
+// I1 (the other side): a dropped MARKER is re-sent once.
+TEST(CatalogReadServerRegression, DroppedMarkerThroughTheFlowIsSentOnceAgainRegression) {
+    // Drop exactly the marker: the window holds the records frame only.
+    ReadRig r2("rd_i1_marker2");
+    r2.commitEvents(2);
+    FlowHarness h2(r2);
+    h2.sessions[7] = {/*window=*/200, 0, 0};           // the records frame fits, the marker does not
+    r2.server.subscribe(7, 1, -2);
+    h2.pass();
+    ASSERT_EQ(h2.flow.pauses(), 1u);
+    ASSERT_TRUE(h2.seen(7).second.empty()) << "the marker was dropped";
+    h2.sessions[7].drainPerPass = 1 << 20;
+    for (int i = 0; i < 10; ++i) h2.pass();
+    EXPECT_EQ(h2.seen(7).first, range(0, 2));
+    EXPECT_EQ(h2.seen(7).second, (std::vector<int64_t>{2})) << "re-sent, once";
+}
+
+// M1: a subscription removed while its pause is unacknowledged (egress ring
+// full) still gets its ack sent; the control entry of a session gone before
+// its ack is cleared.  RED: the control entry leaked (paused() stayed 1).
+TEST(CatalogReadServerRegression, PauseOfARemovedSubscriptionNeverLeaksAFlowEntryRegression) {
+    ReadRig r("rd_m1");
+    r.commitEvents(2);
+    r.server.subscribe(7, 1, -2);
+    r.server.pump();
+    const int64_t sub = r.subscriptionIdOf(7, 1);
+    r.egressFull = true;
+    r.server.onPaused(7, sub, 0, false);
+    ASSERT_STREQ(r.server.phaseName(sub), "PausePending");
+    r.server.unsubscribe(7, sub);
+    r.egressFull = false;
+    const auto before = r.frames.size();
+    r.server.pump();
+    ASSERT_EQ(r.frames.size(), before + 1);
+    EXPECT_TRUE(r.frames.back().bytes.empty()) << "the owed pause ack";
+    EXPECT_EQ(r.frames.back().subscriptionId, sub);
+
+    // Control side: AwaitingAck for a session that closed (its ack never comes).
+    ReadRig r2("rd_m1b");
+    FlowHarness h(r2);
+    h.sessions[5] = {10, 10, 0};
+    std::vector<uint8_t> w(24 + 80, 0);
+    const int64_t s5 = 5, sid = 77, base = 0;
+    std::memcpy(w.data(), &s5, 8); std::memcpy(w.data() + 8, &sid, 8); std::memcpy(w.data() + 16, &base, 8);
+    h.flow.onFrame(w.data(), w.size(), h);
+    ASSERT_EQ(h.flow.paused(), 1u);
+    h.sessions.erase(5);
+    h.flow.service(h);
+    EXPECT_EQ(h.flow.paused(), 0u) << "cleared: the session is gone";
+}
+
+// M2: readers in backlog share a slow egress fairly — a later subscriber is not
+// starved behind earlier ones.  RED: the first subscription took every frame.
+TEST(CatalogReadServerRegression, BacklogReadersShareTheEgressRoundRobinRegression) {
+    ReadRig r("rd_m2");
+    r.commitEvents(3000);
+    r.server.subscribe(1, 1, -2);
+    r.server.subscribe(2, 1, -2);
+    r.server.subscribe(3, 1, -2);
+    for (int p = 0; p < 6; ++p) {
+        r.egressBudget = 1;                            // one frame per pass
+        r.server.pump();
+    }
+    r.egressBudget = -1;
+    for (int64_t s : {1, 2, 3}) EXPECT_GE(r.records(s).size(), 2u) << "session " << s << " progressed";
+}
+
+// M3: the owed answers never outgrow their reservation — catalog intake pauses first.
+TEST(CatalogReadServerRegression, OwedAnswersPauseIntakeInsteadOfGrowingRegression) {
+    ReadRig r("rd_m3", false, /*maxSubs=*/2);
+    r.server.subscribe(1, 1, -2);
+    r.server.subscribe(2, 1, -2);
+    r.server.pump();
+    r.egressFull = true;
+    int refused = 0;
+    for (int c = 0; c < 1000 && !r.server.intakePaused(); ++c, ++refused) r.server.subscribe(3, c, -2);
+    EXPECT_TRUE(r.server.intakePaused()) << "the intake pauses at a fixed bound";
+    EXPECT_LT(refused, 64);
+    r.egressFull = false;
+    r.server.pump();
+    EXPECT_FALSE(r.server.intakePaused());
+    for (int c = 0; c < refused; ++c) EXPECT_EQ(r.subscribeError(3, c), pc::ErrorCode::Internal) << c;
 }

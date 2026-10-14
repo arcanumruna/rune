@@ -999,10 +999,18 @@ public:
     enum class CatalogOffer : uint8_t { Sent, BackPressured, NoSession };
     CatalogOffer tryOfferCatalogFrame(int64_t sessionId, const uint8_t* buf, std::size_t len);
     /// Whether a paused catalog reader's session has room again: its spill is
-    /// empty and its publication's window holds at least kCatalogResumeWindowBytes
+    /// empty and its publication's window holds at least catalogResumeThreshold
     /// (or it is gone).
     enum class CatalogRoom : uint8_t { Ready, NotYet, Gone };
     static constexpr int64_t kCatalogResumeWindowBytes = 16 * 1024;
+    /// Fix round 1 (C2): min(16 KiB, term / 2, the largest window observed / 2),
+    /// at least 1 — reachable by ANY receiver window (a constant could exceed it: a hang).
+    [[nodiscard]] static constexpr int64_t catalogResumeThreshold(int64_t termLength, int64_t windowSeen) noexcept {
+        int64_t t = kCatalogResumeWindowBytes;
+        if (termLength > 0) t = std::min(t, termLength / 2);
+        if (windowSeen > 0) t = std::min(t, windowSeen / 2);
+        return std::max<int64_t>(t, 1);
+    }
     CatalogRoom catalogEgressRoom(int64_t sessionId);
     /// Test seam (egress-less sessions): while set, every catalog offer to `sid`
     /// is back-pressured and its room NotYet.
@@ -1012,6 +1020,7 @@ public:
     /// catalog Unsubscribes waiting for room on its request ring.
     [[nodiscard]] uint64_t catalogSubscribesForwarded() const noexcept { return catalogSubscribesForwarded_; }
     [[nodiscard]] std::size_t pendingCatalogUnsubscribes() const noexcept { return pendingCatalogUnsubs_.size(); }
+    [[nodiscard]] uint64_t catalogUnsubscribesDropped() const noexcept { return catalogUnsubsDropped_; }
     /// Catalog history Task 12 (N5) — control thread: a view sink was applied here
     /// (kA2cCatalogSinkApplied); its plan is not on every worker yet.  Then: its
     /// plan reached every worker's install ring (or the view was dropped).
@@ -2009,9 +2018,13 @@ private:
     // and hold one of its bounded subscription slots).  Reserved; grows only on a
     // pathological backlog.
     struct PendingCatalogUnsubscribe { int64_t sessionId; int64_t subscriptionId; };
+    // Fix round 1 (M3): fixed capacity; a session close supersedes that
+    // session's pending single unsubscribes (one entry per closed session).
+    static constexpr std::size_t kPendingCatalogUnsubsCap = 1024;
     std::vector<PendingCatalogUnsubscribe> pendingCatalogUnsubs_ = [] {
-        std::vector<PendingCatalogUnsubscribe> v; v.reserve(256); return v;
+        std::vector<PendingCatalogUnsubscribe> v; v.reserve(kPendingCatalogUnsubsCap); return v;
     }();
+    uint64_t catalogUnsubsDropped_ = 0;
     uint64_t catalogSubscribesForwarded_ = 0;
     void forwardCatalogUnsubscribe_(int64_t sid, int64_t subscriptionId);
     int  flushPendingCatalogUnsubs_();

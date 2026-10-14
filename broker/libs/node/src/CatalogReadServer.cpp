@@ -24,6 +24,7 @@ namespace {
 constexpr auto kOk              = static_cast<int16_t>(pc::ErrorCode::OK);
 constexpr auto kInternal        = static_cast<int16_t>(pc::ErrorCode::Internal);
 constexpr auto kMessageTooLarge = static_cast<int16_t>(pc::ErrorCode::MessageTooLarge);
+constexpr auto kNotLeader       = static_cast<int16_t>(pc::ErrorCode::NotLeader);
 constexpr int64_t kFromEarliest = -2;
 static_assert(pc::SubscribeResponse::ENCODED_SIZE <= kCatalogReadMaxFrameBytes);
 static_assert(kCatalogReadBufferBytes / 2 >= kCatalogReadMaxBatchBytes,
@@ -35,7 +36,11 @@ CatalogReadServer::CatalogReadServer(rune::replication::PartitionReplica& catalo
     : catalog_(catalog), send_(std::move(send)), maxSubs_(maxSubs), idPrefix_(idPrefix),
       readBuf_(kCatalogReadBufferBytes), frameBuf_(kCatalogReadMaxFrameBytes) {
     subs_.reserve(maxSubs_);
-    owed_.reserve(maxSubs_ + 16);
+    // M3: every owed answer has a bounded source — refusals / re-answers (gated by
+    // intakePaused), one ended answer per subscription, one pause ack per control
+    // entry (<= 2 x maxSubs) — so the reservation is never exceeded.
+    owedCapacity_ = 4 * maxSubs_ + 2 * kIntakeSlack;
+    owed_.reserve(owedCapacity_);
 }
 
 const char* CatalogReadServer::phaseName(int64_t subscriptionId) const noexcept {
@@ -45,7 +50,8 @@ const char* CatalogReadServer::phaseName(int64_t subscriptionId) const noexcept 
         if (std::holds_alternative<Backlog>(s.phase)) return "Backlog";
         if (std::holds_alternative<Live>(s.phase)) return "Live";
         if (std::holds_alternative<PausePending>(s.phase)) return "PausePending";
-        return "Paused";
+        if (std::holds_alternative<Paused>(s.phase)) return "Paused";
+        return "Ending";
     }
     return "";
 }
@@ -57,7 +63,7 @@ void CatalogReadServer::subscribe(int64_t session, int64_t corr, int64_t fromOff
         if (s.session != session || s.corr != corr) continue;
         if (std::holds_alternative<Answering>(s.phase)) return;   // its answer is still owed
         if (!sendSubscribeResponse_(session, corr, kOk, s.subscriptionId))
-            owed_.push_back(OwedError{session, corr, kOk, OwedKind::SubscribeAnswer, s.subscriptionId});
+            owe_(OwedError{session, corr, kOk, OwedKind::SubscribeAnswer, s.subscriptionId});
         return;
     }
     if (subs_.size() >= maxSubs_) {
@@ -66,10 +72,11 @@ void CatalogReadServer::subscribe(int64_t session, int64_t corr, int64_t fromOff
                       "subscriptions already served (the cap) — answered Internal (refused so far: {})",
                       session, corr, subs_.size(), refused_);
         if (!owed_.empty() || !sendSubscribeResponse_(session, corr, kInternal, 0))
-            owed_.push_back(OwedError{session, corr, kInternal, OwedKind::SubscribeAnswer, 0});
+            owe_(OwedError{session, corr, kInternal, OwedKind::SubscribeAnswer, 0});
         return;
     }
-    const int64_t hw = catalog_.highWatermark();
+    noteCommittedFloor(catalog_.highWatermark());
+    const int64_t hw = servedHw_;   // C1: never a HW that regressed with a leader change
     int64_t next = 0;
     if (fromOffset == kFromEarliest) next = 0;
     else if (fromOffset < 0)         next = hw;                       // latest (−1) / any other sentinel
@@ -86,6 +93,10 @@ void CatalogReadServer::unsubscribe(int64_t session, int64_t subscriptionId) {
     for (std::size_t i = 0; i < subs_.size();) {
         const Sub& s = subs_[i];
         if (s.session == session && (subscriptionId == -1 || s.subscriptionId == subscriptionId)) {
+            // M1: a pause not yet acknowledged is acknowledged anyway — the
+            // control thread's entry for it is cleared, never leaked.
+            if (std::holds_alternative<PausePending>(s.phase) && subscriptionId != -1)
+                owe_(OwedError{session, 0, 0, OwedKind::PauseAck, s.subscriptionId});
             subs_[i] = subs_.back();
             subs_.pop_back();
             continue;
@@ -97,7 +108,7 @@ void CatalogReadServer::unsubscribe(int64_t session, int64_t subscriptionId) {
 }
 
 // ─── Flow control (fix round 0) ────────────────────────────────────────────────
-void CatalogReadServer::onPaused(int64_t session, int64_t subscriptionId, int64_t baseOffset) {
+void CatalogReadServer::onPaused(int64_t session, int64_t subscriptionId, int64_t baseOffset, bool droppedMarker) {
     for (Sub& s : subs_) {
         if (s.session != session || s.subscriptionId != subscriptionId) continue;
         Resumable resumeAs{Backlog{0}};
@@ -105,9 +116,11 @@ void CatalogReadServer::onPaused(int64_t session, int64_t subscriptionId, int64_
             resumeAs = Backlog{std::min(baseOffset, b->nextOffset)};
         } else if (const auto* l = std::get_if<Live>(&s.phase)) {
             const int64_t at = std::min(baseOffset, l->nextOffset);
-            // A frame at or before the marker was dropped: the marker is re-sent on catching up again.
-            if (at <= l->markedAt) resumeAs = Backlog{at};
-            else                   resumeAs = Live{at, l->markedAt};
+            // I1: the marker is re-sent only if IT was dropped, or a data frame
+            // BEFORE it was (the marker behind it was in flight, dropped too).  A
+            // dropped data frame at the marker's offset follows the marker.
+            if (droppedMarker || at < l->markedAt) resumeAs = Backlog{at};
+            else                                   resumeAs = Live{at, l->markedAt};
         } else {
             break;   // Answering (no Records sent yet) / already paused: just (re-)acknowledge
         }
@@ -118,7 +131,7 @@ void CatalogReadServer::onPaused(int64_t session, int64_t subscriptionId, int64_
     // Unknown (unsubscribed meanwhile) or not pausable: the ack still clears the
     // control thread's entry for it.
     if (!owed_.empty() || !sendPauseAck_(session, subscriptionId))
-        owed_.push_back(OwedError{session, 0, 0, OwedKind::PauseAck, subscriptionId});
+        owe_(OwedError{session, 0, 0, OwedKind::PauseAck, subscriptionId});
 }
 
 void CatalogReadServer::onResume(int64_t session, int64_t subscriptionId) {
@@ -180,15 +193,29 @@ int CatalogReadServer::flushOwed_() {
     return static_cast<int>(sent);
 }
 
+void CatalogReadServer::owe_(const OwedError& e) {
+    if (owed_.size() >= owedCapacity_) [[unlikely]] {
+        // Unreachable by the bounds above (intakePaused gates the only open-ended
+        // source); never a silent loss — but never growth either.
+        spdlog::critical("CatalogReadServer: {} owed catalog answers (the capacity) — answer to session {} "
+                         "corr {} not queued", owed_.size(), e.session, e.corr);
+        return;
+    }
+    owed_.push_back(e);   // reserved: never allocates
+}
+
+// The subscription becomes Ending (removed after the pass — M2 keeps indices
+// stable); its explicit answer is sent or owed.
 void CatalogReadServer::end_(std::size_t index, int16_t code, const char* why, int64_t at) {
-    const Sub s = subs_[index];
+    Sub& s = subs_[index];
     ++ended_;
     spdlog::error("CatalogReadServer: catalog subscription {:#x} (session {}) ended at offset {} — {} — answered "
                   "{} on its Subscribe (ended so far: {})", s.subscriptionId, s.session, at, why, code, ended_);
-    subs_[index] = subs_.back();
-    subs_.pop_back();
+    if (std::holds_alternative<PausePending>(s.phase))   // M1: its pause still needs its ack
+        owe_(OwedError{s.session, 0, 0, OwedKind::PauseAck, s.subscriptionId});
+    s.phase = Ending{};
     const OwedError e{s.session, s.corr, code, OwedKind::EndedAnswer, s.subscriptionId};
-    if (!owed_.empty() || !sendError_(e)) owed_.push_back(e);
+    if (!owed_.empty() || !sendError_(e)) owe_(e);
 }
 
 // ─── pump ─────────────────────────────────────────────────────────────────────
@@ -269,40 +296,77 @@ int CatalogReadServer::pump() {
         if (!owed_.empty()) return work;   // the egress is full: nothing else fits this pass
     }
     if (subs_.empty()) return work;
-    const int64_t hw = catalog_.highWatermark();
-    for (std::size_t i = 0; i < subs_.size();) {
+
+    // C1: the committed floor is monotonic.  A replica whose log now ends below
+    // a HW already served truncated committed data (only an unclean / deficient
+    // election upstream can): every subscription ends EXPLICITLY with the
+    // retriable NotLeader — the client resubscribes — never served past the
+    // truncation, never rewound silently.
+    const int64_t leo = catalog_.logEndOffset();
+    if (leo < servedHw_) [[unlikely]] {
+        spdlog::critical("CatalogReadServer: the __catalog log ends at {} — below the committed offset {} already "
+                         "served — ending every catalog subscription (NotLeader: resubscribe)", leo, servedHw_);
+        for (std::size_t i = 0; i < subs_.size(); ++i) {
+            ++truncationEnds_;
+            end_(i, kNotLeader, "the log was truncated below a served high watermark", leo);
+        }
+        std::erase_if(subs_, [](const Sub& x) { return std::holds_alternative<Ending>(x.phase); });
+        servedHw_ = std::min(catalog_.highWatermark(), leo);
+        return work + 1;
+    }
+    noteCommittedFloor(catalog_.highWatermark());
+    const int64_t hw = servedHw_;
+    // The marker claims "the whole committed prefix": only while this replica's
+    // HW is current (a leader, or a follower its current leader answered) —
+    // during a leader change the backlog is still served up to the floor.
+    const bool hwCurrent = catalog_.committedHwKnown();
+
+    // M2: round-robin.
+    const std::size_t n = subs_.size();
+    std::size_t first = rr_ % n;
+    bool blocked = false;
+    for (std::size_t k = 0; k < n && !blocked; ++k) {
+        const std::size_t i = (first + k) % n;
         Sub& s = subs_[i];
         if (auto* a = std::get_if<Answering>(&s.phase)) {
-            if (!sendSubscribeResponse_(s.session, s.corr, kOk, s.subscriptionId)) return work;
+            if (!sendSubscribeResponse_(s.session, s.corr, kOk, s.subscriptionId)) { blocked = true; first = i; break; }
             ++work;
             s.phase = Backlog{a->nextOffset};
         }
         if (auto* pp = std::get_if<PausePending>(&s.phase)) {
-            if (!sendPauseAck_(s.session, s.subscriptionId)) return work;
+            if (!sendPauseAck_(s.session, s.subscriptionId)) { blocked = true; first = i; break; }
             ++work;
             s.phase = Paused{pp->resumeAs};
         }
-        if (std::holds_alternative<Paused>(s.phase)) { ++i; continue; }   // waits for onResume: costs nothing
+        if (std::holds_alternative<Paused>(s.phase) || std::holds_alternative<Ending>(s.phase)) continue;
         int64_t* next = std::holds_alternative<Backlog>(s.phase) ? &std::get<Backlog>(s.phase).nextOffset
                                                                  : &std::get<Live>(s.phase).nextOffset;
         const int64_t before = *next;
         const PushResult r = pushRange_(s, *next, hw);
-        if (r.kind == Push::Blocked) return work + (*next != before ? 1 : 0);
+        if (r.kind == Push::Blocked) {
+            work += *next != before ? 1 : 0;
+            blocked = true;
+            first = i;
+            break;
+        }
         if (r.kind == Push::Ended) {
             end_(i, r.code, r.why, *next);
             ++work;
-            continue;   // subs_[i] is now another subscription
+            continue;
         }
         if (r.kind == Push::Progress) ++work;
-        if (auto* bl = std::get_if<Backlog>(&s.phase); bl != nullptr && bl->nextOffset >= hw) {
+        if (auto* bl = std::get_if<Backlog>(&s.phase); bl != nullptr && bl->nextOffset >= hw && hwCurrent) {
             // The caught-up marker (ruling 10): one empty Records at the HW — the
             // Backlog → Live transition is the "once".
-            if (!sendRecords_(s, bl->nextOffset, {})) return work;
+            if (!sendRecords_(s, bl->nextOffset, {})) { blocked = true; first = i; break; }
             s.phase = Live{bl->nextOffset, bl->nextOffset};
             ++work;
         }
-        ++i;
     }
+    // Every pass starts one subscription later (rr_ += 1), blocked or not: a
+    // full ring never pins the order (the blocked one keeps its cursor).
+    rr_ = (rr_ % n) + 1;
+    std::erase_if(subs_, [](const Sub& x) { return std::holds_alternative<Ending>(x.phase); });   // no allocation
     return work;
 }
 

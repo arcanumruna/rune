@@ -66,7 +66,7 @@ enum : int32_t {
     kMsgPlacementView     = 17,
     // Catalog history Task 12 fix round 0 — control → admin on controlToAdminRing:
     // catalog-read flow control (CatalogReadFlow → CatalogReadServer).
-    kMsgCatalogReadPaused = 18,   // [session:i64][subscriptionId:i64][baseOffset:i64]
+    kMsgCatalogReadPaused = 18,   // [session:i64][subscriptionId:i64][baseOffset:i64][droppedMarker:u8]
     kMsgCatalogReadResume = 19,   // [session:i64][subscriptionId:i64]
 };
 
@@ -698,15 +698,18 @@ inline DdlRequest decodeAlterTopicConfig(const uint8_t* buf, std::size_t len) {
     return true;
 }
 /// Fix round 0: catalog-read flow control (control → admin).  false = ring full (retried).
-struct CatalogReadPausedMsg { int64_t session = 0; int64_t subscriptionId = 0; int64_t baseOffset = -1; };
+struct CatalogReadPausedMsg {
+    int64_t session = 0; int64_t subscriptionId = 0; int64_t baseOffset = -1; bool droppedMarker = false;
+};
 struct CatalogReadResumeMsg { int64_t session = 0; int64_t subscriptionId = 0; };
 [[nodiscard]] inline bool encodeCatalogReadPaused(OneToOneByteRing& ring, const CatalogReadPausedMsg& m) {
-    const auto idx = ring.tryClaim(kMsgCatalogReadPaused, 24);
+    const auto idx = ring.tryClaim(kMsgCatalogReadPaused, 25);
     if (idx < 0) return false;
     uint8_t* p = ring.base() + idx;
     admin_wire::putI64(p, m.session);
     admin_wire::putI64(p + 8, m.subscriptionId);
     admin_wire::putI64(p + 16, m.baseOffset);
+    p[24] = m.droppedMarker ? 1 : 0;
     ring.commit(idx);
     return true;
 }
@@ -720,8 +723,8 @@ struct CatalogReadResumeMsg { int64_t session = 0; int64_t subscriptionId = 0; }
     return true;
 }
 [[nodiscard]] inline bool decodeCatalogReadPaused(const uint8_t* p, std::size_t n, CatalogReadPausedMsg& m) noexcept {
-    if (n != 24) return false;
-    m = CatalogReadPausedMsg{admin_wire::getI64(p), admin_wire::getI64(p + 8), admin_wire::getI64(p + 16)};
+    if (n != 25 || p[24] > 1) return false;
+    m = CatalogReadPausedMsg{admin_wire::getI64(p), admin_wire::getI64(p + 8), admin_wire::getI64(p + 16), p[24] == 1};
     return true;
 }
 [[nodiscard]] inline bool decodeCatalogReadResume(const uint8_t* p, std::size_t n, CatalogReadResumeMsg& m) noexcept {

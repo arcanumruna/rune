@@ -691,6 +691,12 @@ public:
     [[nodiscard]] uint64_t    leadershipGeneration() const noexcept { return leadershipGeneration_; }
     [[nodiscard]] Offset      logEndOffset()   const noexcept { return logEndOffset_(); }
     [[nodiscard]] Offset      highWatermark()  const noexcept;
+    /// Catalog Task 12 fix round 1: highWatermark() is this partition's committed
+    /// prefix as of now — a leader's own, or a follower's once its CURRENT
+    /// epoch's leader answered it (it reads 0 after every becomeFollower until then).
+    [[nodiscard]] bool committedHwKnown() const noexcept {
+        return role_ == Role::Leader || hwLearnedEpoch_ == static_cast<int64_t>(epoch_);
+    }
 
     /// Soft per-replica position snapshot for the controller's election path.
     /// leaderEpoch = epoch(); logEndPosition = logEndOffset().
@@ -1465,6 +1471,10 @@ private:
 
     // Follower HW (leader uses leaderState_.highWatermark())
     Offset followerHw_ = 0;
+    // Catalog history Task 12 fix round 1: the epoch whose leader last told this
+    // follower its HW (-1 = none since the process started).  followerHw_ is 0
+    // after every becomeFollower until then — not a committed prefix.
+    int64_t hwLearnedEpoch_ = -1;
 
     // ── Follower replication sync — SINGLE SOURCE OF TRUTH ──────────────────────
     // One explicit state machine (see FollowerSync.h) replaces the former scattered
