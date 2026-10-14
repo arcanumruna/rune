@@ -284,8 +284,28 @@ std::string_view AdminWorker::roleName() const noexcept {
     switch (role_.index()) {
     case 0:  return "Follower";
     case 1:  return "LeaderCatchingUp";
-    default: return "LeaderServing";
+    case 2:  return "LeaderServing";
+    default: return "Halted";
     }
+}
+
+namespace {
+int32_t epochOf(const CatalogRole& r) noexcept {
+    return std::visit([](const auto& st) { return st.epoch; }, r);
+}
+} // namespace
+
+void AdminWorker::setRole_(CatalogRole next) {
+    const bool changed = next.index() != role_.index() || epochOf(next) != epochOf(role_);
+    role_ = std::move(next);
+    if (changed) spdlog::info("AdminWorker: __catalog role -> {} (epoch {})", roleName(), epochOf(role_));
+}
+
+bool AdminWorker::caughtUp_() const noexcept {
+    // Task 11: every record the leader holds — a previous epoch's tail included —
+    // is committed (HW = min LEO over the ISR) AND applied here.
+    const int64_t hw = catalogReplica_->highWatermark();
+    return !applier_.halted() && hw == catalogReplica_->logEndOffset() && applier_.nextOffset() == hw;
 }
 
 std::string_view AdminWorker::inFlightStateName() const noexcept {
@@ -324,11 +344,14 @@ void AdminWorker::onCatalogRole(const AdminRoleMsg& role) {
             isr.push_back(static_cast<rr::NodeId>(role.isr[static_cast<std::size_t>(i)]));
         catalogReplica_->becomeLeader(static_cast<rr::Epoch>(role.epoch), std::move(isr), role.partitionEpoch);
         if (catalogReplica_->role() == rr::Role::Leader) {
+            // A halted broker stays Halted (its replica still leads until the
+            // controller moves the leadership; it accepts no DDL).
+            if (std::holds_alternative<CatalogHalted>(role_)) return;
             // A promotion (or a leadership at a new epoch) starts catching up — the
-            // gate opens in updateRole_ once the whole log is applied; a same-epoch
-            // re-assert (an ISR update) keeps serving.
+            // gate opens in updateRole_ once the whole log is committed and
+            // applied; a same-epoch re-assert (an ISR update) keeps serving.
             const auto* s = std::get_if<CatalogLeaderServing>(&role_);
-            if (s == nullptr || s->epoch != role.epoch) role_ = CatalogLeaderCatchingUp{role.epoch};
+            if (s == nullptr || s->epoch != role.epoch) setRole_(CatalogLeaderCatchingUp{role.epoch});
             return;
         }
         demote_(-1, role.epoch);   // the replica refused the leadership (restart fence)
@@ -339,7 +362,7 @@ void AdminWorker::onCatalogRole(const AdminRoleMsg& role) {
 }
 
 void AdminWorker::demote_(int32_t leaderId, int32_t epoch) {
-    role_ = CatalogFollower{leaderId, epoch};
+    if (!std::holds_alternative<CatalogHalted>(role_)) setRole_(CatalogFollower{leaderId, epoch});
     // Spec §5.2: an in-flight DDL is answered at once — the retriable NotLeader
     // (its event may still commit under the new leader; the retry dedupes).
     if (auto* a = std::get_if<AwaitingCommit>(&inFlight_)) {
@@ -360,29 +383,36 @@ void AdminWorker::onCatalogAlterIsrResponse(const rune::replication::AlterIsrRes
 bool AdminWorker::updateRole_() {
     if (catalogReplica_ == nullptr) return false;
     namespace rr = rune::replication;
+    const auto epoch = static_cast<int32_t>(catalogReplica_->epoch());
+    if (applier_.halted()) {   // terminal: every DDL answers Internal from now on
+        if (std::holds_alternative<CatalogHalted>(role_)) return false;
+        const cat::ApplyError* e = applier_.haltError();
+        setRole_(CatalogHalted{e != nullptr ? e->offset : -1, epoch});
+        return true;
+    }
     const bool leads = catalogReplica_->role() == rr::Role::Leader;
     if (!leads) {
         if (!std::holds_alternative<CatalogFollower>(role_)) {
-            demote_(-1, static_cast<int32_t>(catalogReplica_->epoch()));
+            demote_(-1, epoch);
             return true;
         }
         return false;
     }
-    const bool caughtUp = !applier_.halted() && applier_.nextOffset() >= catalogReplica_->logEndOffset();
+    const bool caughtUp = caughtUp_();
     if (const auto* c = std::get_if<CatalogLeaderCatchingUp>(&role_); c && caughtUp && !hasInFlight()) {
-        role_ = CatalogLeaderServing{c->epoch};
         spdlog::info("AdminWorker: catalog leader (epoch {}) caught up at offset {} — serving DDL", c->epoch,
                      applier_.nextOffset());
+        setRole_(CatalogLeaderServing{c->epoch});
         return true;
     }
     if (const auto* s = std::get_if<CatalogLeaderServing>(&role_); s && !caughtUp && !hasInFlight()) {
         // An appended event this broker has not applied (a commit that timed out):
         // no new event may be built on a state that does not include it.
-        role_ = CatalogLeaderCatchingUp{s->epoch};
+        setRole_(CatalogLeaderCatchingUp{s->epoch});
         return true;
     }
     if (std::holds_alternative<CatalogFollower>(role_)) {
-        role_ = CatalogLeaderCatchingUp{static_cast<int32_t>(catalogReplica_->epoch())};
+        setRole_(CatalogLeaderCatchingUp{epoch});
         return true;
     }
     return false;
@@ -437,7 +467,7 @@ int AdminWorker::doWork(int64_t nowNs) {
     if (viewsReplica_) work += viewsReplica_->doWork(nowNs);   // retired (Task 16 deletes)
     if (catalogReplica_) {
         work += catalogReplica_->doWork(nowNs);
-        work += applier_.applyCommitted(*catalogReplica_);
+        if (!applyHeldForTest_) [[likely]] work += applier_.applyCommitted(*catalogReplica_);
     }
     if (advance_(nowNs)) ++work;
     if (updateRole_()) ++work;
@@ -462,8 +492,10 @@ void AdminWorker::startNext_(int64_t nowNs) {
         answer_(req, kInternal, "this broker has no __catalog");
         return;
     }
-    if (applier_.halted()) {
-        answer_(req, kInternal, "catalog apply is halted on this broker");
+    if (applier_.halted() && !std::holds_alternative<CatalogHalted>(role_)) (void)updateRole_();
+    if (const auto* h = std::get_if<CatalogHalted>(&role_)) {
+        // Spec §9: a halted broker answers Internal — never a redirect or a retry.
+        answer_(req, kInternal, "catalog apply halted at offset " + std::to_string(h->offset));
         return;
     }
     if (const auto* f = std::get_if<CatalogFollower>(&role_)) {

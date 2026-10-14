@@ -351,6 +351,22 @@ TEST_P(CatalogEffectsRegression, CreateBehindDropWaitsForTheDirRenameAndStartsEm
     EXPECT_TRUE(fs::exists(n.dataDir() / "topics" / "t" / "0")) << "the new topic's dir is untouched";
 }
 
+// Fix-on-sight (Task 11, found by the over-the-wire AlterView): an AlterView posts
+// its fresh sink (same name, new id) BEFORE the old sink's drop (install before
+// uninstall).  RED: createTopicAt refused the name held by the still-live old
+// sink — the new sink never served and the gated AlterView OK became Internal.
+TEST_P(CatalogEffectsRegression, AlterViewFreshSinkPostedBeforeTheOldSinkDropWaitsBehindItRegression) {
+    SingleNode n("eff_altview", GetParam());
+    n.applyCreateTopic(0, "v", 1);                     // the view's current sink
+    ASSERT_TRUE(n.awaitServes(0, 10s));
+    n.applyCreateTopic(1, "v", 1);                     // AlterView: the fresh sink first …
+    n.applyDropTopic(0, "v");                          // … then the old sink's drop
+    ASSERT_TRUE(n.awaitServes(1, 10s)) << "the fresh sink serves once the old one retired";
+    EXPECT_EQ(n.topicIdForName("v"), 1);
+    EXPECT_EQ(n.topicState(0), rune::gateway::TopicRegistry::TopicState::Dropped);
+    EXPECT_EQ(n.logEndOffset(1, 0), 0) << "the fresh sink starts empty";
+}
+
 TEST_P(CatalogEffectsRegression, DroppedTopicAnswersUnknownTopicAtOnce) {
     SingleNode n("eff_drop", GetParam());
     n.applyCreateTopic(0, "t", 1);

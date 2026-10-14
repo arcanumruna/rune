@@ -6857,6 +6857,74 @@ void ClientGateway::answerAdminSubmit_(const uint8_t* buf, std::size_t len, rune
 }
 
 // ---------------------------------------------------------------------------
+// Catalog history Task 11: the DDL route gate (spec §5.1 Redirect, §5.2 / §5.5
+// NotLeader, §9 Internal when halted).  The route is a control-thread value
+// (setCatalogRoute); the gateway reads no catalog state.  A pre-v8 session
+// (F37) cannot follow a DDL Redirect and waits an ErrorResponse out, so it is
+// answered in its request's OWN response type: InvalidRequest on a broker that
+// knows another leader (logged at warn — those frames carry no message),
+// Internal when halted, NotLeader when no leader is known.
+// ---------------------------------------------------------------------------
+bool ClientGateway::ddlRouted_(const uint8_t* buf, std::size_t len)
+{
+    if (std::holds_alternative<rune::gateway::RouteLocalLeader>(catalogRoute_)) [[likely]] return false;
+    const auto hdr = pc::MessageHeader::decode(buf, len);
+    if (!hdr) return false;                        // the handler answers / notes it
+    Session* session = sessions_.find(hdr->sessionId);
+    if (!session) return false;                    // the handler notes it (no session to answer)
+    ++ddlRoutedAway_;
+    const auto* halted = std::get_if<rune::gateway::RouteHalted>(&catalogRoute_);
+    const auto* remote = std::get_if<rune::gateway::RouteRemote>(&catalogRoute_);
+
+    if (!pc::clientUnderstandsCatalogDdl(session->clientVersion)) {
+        uint16_t code = static_cast<uint16_t>(pc::ErrorCode::NotLeader);
+        const char* why = "pre-v8 DDL: no catalog leader known";
+        if (halted != nullptr) {
+            code = static_cast<uint16_t>(pc::ErrorCode::Internal);
+            why  = "pre-v8 DDL: catalog apply halted on this broker";
+        } else if (remote != nullptr) {
+            code = static_cast<uint16_t>(pc::ErrorCode::InvalidRequest);
+            why  = "client too old for cluster DDL routing; upgrade";
+            ++preV8DdlRefused_;
+            spdlog::warn("ClientGateway: a pre-v8 client's DDL (session {}, template {}, client version {}) reached "
+                         "a broker that is not the catalog leader — answered InvalidRequest: client too old for "
+                         "cluster DDL routing; upgrade (refused so far: {})", hdr->sessionId, hdr->templateId,
+                         session->clientVersion, preV8DdlRefused_);
+        }
+        if (!answerRejection_(*session, *hdr, code, why, buf, len)) noteUnanswerable_(buf, len, why);
+        return true;
+    }
+
+    pc::ErrorResponse err;
+    err.sessionId     = hdr->sessionId;
+    err.correlationId = hdr->correlationId;
+    char haltedText[64];
+    if (halted != nullptr) {
+        // Spec §9: never a redirect — the leader may be healthy, THIS broker is not.
+        const int n = std::snprintf(haltedText, sizeof haltedText, "catalog apply halted at offset %lld",
+                                    static_cast<long long>(halted->offset));
+        err.code    = static_cast<int16_t>(pc::ErrorCode::Internal);
+        err.message = std::string_view(haltedText, n > 0 ? static_cast<std::size_t>(n) : 0u);
+    } else if (remote != nullptr && !remote->leaderClientEndpoint.empty()) {
+        err.code    = static_cast<int16_t>(pc::ErrorCode::Redirect);
+        err.message = remote->leaderClientEndpoint;
+    } else {
+        err.code = static_cast<int16_t>(pc::ErrorCode::NotLeader);   // retriable: no leader known yet
+    }
+    const std::size_t needed = pc::MessageHeader::ENCODED_SIZE + pc::ErrorResponse::BODY_FIXED + 2 + err.message.size();
+    if (needed > scratch_.size()) [[unlikely]] {
+        // An endpoint too long for the frame is never dropped: the bare NotLeader.
+        err.code    = static_cast<int16_t>(pc::ErrorCode::NotLeader);
+        err.message = {};
+    }
+    const std::size_t n = err.encode(scratch_.data());
+    spdlog::debug("ClientGateway: DDL tid={} session={} corr={} routed ({}): code {}", hdr->templateId,
+                  hdr->sessionId, hdr->correlationId, rune::gateway::catalogRouteName(catalogRoute_), err.code);
+    sendAnswer_(*session, scratch_.data(), n);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Task 8a: handleDefineTopic (RULING-2 F) — route DefineTopic (64) to the admin
 // sink via a ring hand-off.  Validate + require known session + decode, then
 // copy the fields into the sink and RETURN immediately.  NO registry access, NO
@@ -6865,6 +6933,7 @@ void ClientGateway::answerAdminSubmit_(const uint8_t* buf, std::size_t len, rune
 // ---------------------------------------------------------------------------
 void ClientGateway::handleDefineTopic(const uint8_t* buf, std::size_t len)
 {
+    if (ddlRouted_(buf, len)) return;   // Task 11: not the catalog leader / halted — answered here
     if (!adminSink_) {
         // No-hang (R2): no admin thread wired — answered Internal.
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "DefineTopic: admin sink not wired");
@@ -6937,6 +7006,7 @@ void ClientGateway::handleGetTopicSchema(const uint8_t* buf, std::size_t len)
 // ---------------------------------------------------------------------------
 void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
 {
+    if (ddlRouted_(buf, len)) return;   // Task 11: not the catalog leader / halted — answered here
     if (!adminSink_) {
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "AlterTopic: admin sink not wired");
         return;
@@ -6976,6 +7046,7 @@ void ClientGateway::handleAlterTopic(const uint8_t* buf, std::size_t len)
 // ---------------------------------------------------------------------------
 void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
 {
+    if (ddlRouted_(buf, len)) return;   // Task 11: not the catalog leader / halted — answered here
     if (!adminSink_) {
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), "CreateView: admin sink not wired");
         return;
@@ -7014,6 +7085,7 @@ void ClientGateway::handleCreateView(const uint8_t* buf, std::size_t len)
 template <class Msg, class Submit>
 void ClientGateway::handleCatalogDdl_(const uint8_t* buf, std::size_t len, const char* what, Submit&& submit)
 {
+    if (ddlRouted_(buf, len)) return;   // Task 11: not the catalog leader / halted — answered here
     if (!adminSink_) {
         (void)rejectRequest_(buf, len, static_cast<uint16_t>(pc::ErrorCode::Internal), what);
         return;

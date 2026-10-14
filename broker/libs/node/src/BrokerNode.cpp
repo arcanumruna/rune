@@ -3888,6 +3888,10 @@ int BrokerNode::serviceAdminControl_() {
             ++work;
         }
     }
+    // (1c) Catalog history Task 11: the DDL route the gateway answers by, and a
+    //      halted broker giving up the controllership.
+    work += resignIfHalted_(leaderNow);
+    work += publishCatalogRoute_(leaderNow);
 
     // (1b) admin → control ring (F3 round 6/7, ported into T11's direct-call
     //      control plane):
@@ -4036,6 +4040,81 @@ int BrokerNode::serviceAdminControl_() {
 int AdminControlPlane::doWork(int64_t /*nowNs*/) { return node_.serviceAdminControl_(); }
 
 // ---------------------------------------------------------------------------
+// Catalog history Task 11: the DDL route (CatalogRoute.h), control thread.
+//   halted (latched from kA2cCatalogHalted)      → RouteHalted{offset}
+//   multi-node: the committed (-6, 0) leader is self → RouteLocalLeader
+//               another broker                   → RouteRemote{its client channel}
+//               none                             → RouteUnknown
+//   single node: the consensus leader is self    → RouteLocalLeader, else RouteUnknown
+// Published only when its key changes.
+// ---------------------------------------------------------------------------
+int BrokerNode::publishCatalogRoute_(bool consensusLeader) {
+    if (!gateway_) return 0;
+    int     kind = 2;   // RouteUnknown
+    int64_t key  = 0;
+    if (catalogHaltedValue_ != 0) {
+        kind = 3;
+        key  = catalogHaltedValue_ - 1;
+    } else if (catalogOnController_) {
+        const rune::metadata::PartitionAssignment* pa =
+            metadataService_ ? metadataService_->assignment(kCatalogTopicId, kCatalogPartition) : nullptr;
+        const int32_t leader = pa != nullptr ? pa->leaderNode : rune::metadata::NO_LEADER;
+        if (leader == config_.nodeId) {
+            kind = 0;
+        } else if (leader >= 0) {
+            kind = 1;
+            key  = leader;
+        }
+    } else if (consensusLeader) {
+        kind = 0;
+    }
+    if (kind == catalogRoutePublished_.kind && key == catalogRoutePublished_.key) [[likely]] return 0;
+
+    rune::gateway::CatalogRoute route{rune::gateway::RouteUnknown{}};
+    switch (kind) {
+    case 0: route = rune::gateway::RouteLocalLeader{}; break;
+    case 1: {
+        std::string endpoint;
+        for (const auto& peer : config_.peers)
+            if (peer.id == static_cast<int32_t>(key)) endpoint = peer.clientChannel();
+        route = rune::gateway::RouteRemote{std::move(endpoint)};
+        break;
+    }
+    case 3: route = rune::gateway::RouteHalted{key}; break;
+    default: break;
+    }
+    spdlog::info("BrokerNode[{}]: catalog DDL route -> {}{}", config_.nodeId, rune::gateway::catalogRouteName(route),
+                 kind == 1 ? " (leader " + std::to_string(key) + ")"
+                           : kind == 3 ? " (applier halted at offset " + std::to_string(key) + ")" : std::string{});
+    gateway_->setCatalogRoute(std::move(route));
+    catalogRoutePublished_ = PublishedCatalogRoute{kind, key};
+    return 1;
+}
+
+int BrokerNode::resignIfHalted_(bool consensusLeader) {
+    if (catalogHaltedValue_ == 0 || !election_ || config_.isSingleNode()) [[likely]] return 0;
+    int work = 0;
+    if (!election_->resigned()) {
+        // Never stand for the controllership again in this process: the controller
+        // places and unplaces topics from the catalog it applied — a halted one
+        // would never place a topic created after its halt (Task 8 binding).
+        election_->withdrawCandidacy();
+        spdlog::critical("BrokerNode[{}]: __catalog apply halted — withdrawing from the controller election "
+                         "(another broker places and unplaces topics)", config_.nodeId);
+        ++work;
+    }
+    if (consensusLeader) {
+        const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (election_->resign(nowNs)) {
+            spdlog::critical("BrokerNode[{}]: __catalog apply halted — resigned the controllership", config_.nodeId);
+            ++work;
+        }
+    }
+    return work;
+}
+
+// ---------------------------------------------------------------------------
 // Catalog history Task 8 — the control thread executes the catalog's effects.
 // Cold (DDL rate).  See BrokerNode.h for the drop sequence and idempotency.
 // ---------------------------------------------------------------------------
@@ -4101,6 +4180,17 @@ void BrokerNode::onCatalogTopicApplied_(const uint8_t* p, std::size_t n) {
     // Step 3: a create whose name a dropped topic still holds (its dir not renamed
     // away yet) waits — FIFO per name, behind any create of that name already waiting.
     bool behind = catalogNameHeldByDrop_(spec.name);
+    // Fix-on-sight (Task 11): an AlterView's fresh sink carries the view's name
+    // while the OLD sink — dropped by the same event, whose drop effect the
+    // applier posts right after (install before uninstall, F27) — still holds it
+    // live here.  The catalog already freed the name, so the create waits behind
+    // that drop exactly as behind a retiring one (it was refused: the new sink
+    // never served and AlterView answered Internal after the gate's hold).
+    if (!behind && topicRegistry_) {
+        const auto holder = topicRegistry_->topicIdForName(spec.name);
+        const auto folded = topicRegistry_->topicIdForFoldedName(spec.name);
+        behind = (holder && *holder != spec.topicId) || (folded && *folded != spec.topicId);
+    }
     for (const auto& pc : pendingCreatesBehindDrop_) {
         if (pc.spec.topicId == spec.topicId) return;   // the same effect again: already queued (idempotent)
         behind = behind || pc.spec.name == spec.name || rune::catalog::topicNamesFoldEqual(pc.spec.name, spec.name);

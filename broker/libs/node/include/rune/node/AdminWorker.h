@@ -105,15 +105,25 @@ struct AdminDeps {
 // ---------------------------------------------------------------------------
 // The catalog leadership (rule 3: one variant, each state its own variables).
 //   Follower        — not the catalog leader (leaderId -1 = leaderless).
-//   LeaderCatchingUp— the replica leads but its log holds events this broker has
-//                     not applied (a fresh promotion, or the tail of a DDL whose
-//                     commit timed out): DDL answers the retriable NotLeader.
-//   LeaderServing   — leads and has applied its whole log: DDL is served.
+//   LeaderCatchingUp— the replica leads but not every record of its log is both
+//                     COMMITTED and APPLIED here (a fresh promotion — a previous
+//                     epoch's tail included — or the tail of a DDL whose commit
+//                     timed out): DDL answers the retriable NotLeader (Task 11:
+//                     it never validates against a stale catalog).
+//   LeaderServing   — leads, HW == LEO and the applier applied up to the HW: DDL
+//                     is served.
+//   Halted          — this broker's CatalogApplier halted at `offset` (Task 7):
+//                     terminal for the process; every DDL answers Internal (spec
+//                     §9), whatever the replica's role.  The control thread
+//                     resigns the controllership of a halted broker (Task 11).
+// Every transition logs "AdminWorker: __catalog role -> <roleName()> (epoch N)"
+// at info (Task 24 finds the leader by it).
 // ---------------------------------------------------------------------------
 struct CatalogFollower         { int32_t leaderId = -1; int32_t epoch = 0; };
 struct CatalogLeaderCatchingUp { int32_t epoch = 0; };
 struct CatalogLeaderServing    { int32_t epoch = 0; };
-using CatalogRole = std::variant<CatalogFollower, CatalogLeaderCatchingUp, CatalogLeaderServing>;
+struct CatalogHalted           { int64_t offset = -1; int32_t epoch = 0; };
+using CatalogRole = std::variant<CatalogFollower, CatalogLeaderCatchingUp, CatalogLeaderServing, CatalogHalted>;
 
 // DdlRequest (one queued DDL: one request message, or a MalformedDdl) lives in
 // AdminChannels.h — its decoders produce it.
@@ -220,8 +230,12 @@ public:
     [[nodiscard]] const CatalogApplier& applier() const noexcept { return applier_; }
     [[nodiscard]] CatalogApplier& applierForTest() noexcept { return applier_; }
     [[nodiscard]] const CatalogRole& role() const noexcept { return role_; }
-    /// "Follower" | "LeaderCatchingUp" | "LeaderServing".
+    /// "Follower" | "LeaderCatchingUp" | "LeaderServing" | "Halted".
     [[nodiscard]] std::string_view roleName() const noexcept;
+    /// Test seam (Task 11, CatalogLeadershipRegression): while held, doWork does
+    /// not run the applier — a new leader stays CatchingUp with records it holds
+    /// committed but unapplied.  Never set in production.
+    void holdApplyForTest(bool on) noexcept { applyHeldForTest_ = on; }
     /// The catalog leader serving DDL.
     [[nodiscard]] bool isLeader() const noexcept { return std::holds_alternative<CatalogLeaderServing>(role_); }
     [[nodiscard]] std::size_t pendingCount() const noexcept { return pending_.size(); }
@@ -262,6 +276,10 @@ private:
     bool advance_(int64_t nowNs);
     bool updateRole_();
     void demote_(int32_t leaderId, int32_t epoch);
+    /// The ONE place role_ changes: logs the transition (Task 11 / Task 24).
+    void setRole_(CatalogRole next);
+    /// Leads, HW == LEO and every committed record applied (the Serving gate).
+    [[nodiscard]] bool caughtUp_() const noexcept;
 
     // Event building — one function per request kind; each validates against the
     // applied state (the library's own checks, for the answer's CODE) and fills
@@ -340,6 +358,7 @@ private:
     uint64_t answered_          = 0;
     uint64_t eventsAppended_    = 0;
     uint64_t preV8Refused_      = 0;
+    bool     applyHeldForTest_  = false;   // holdApplyForTest (test seam only)
 
     // An appended event that has not committed within this bound is answered the
     // retriable NotLeader (F13: it may still commit; the retry with the same

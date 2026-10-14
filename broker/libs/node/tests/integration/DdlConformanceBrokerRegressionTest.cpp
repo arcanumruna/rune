@@ -11,6 +11,7 @@
 //   T7  catalog + collisions are identical across a restart (the boot replay).
 // T6 / 3-node failover: the catalog leadership suites (Tasks 11 / 20).
 #include <rune/aeronutil/testing/FreePort.h>
+#include <rune/catalog/CatalogEvent.h>
 #include <rune/node/BrokerNode.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/node/SchemaRegistry.h>
@@ -332,6 +333,152 @@ TEST(DdlConformanceBrokerRegression, T5a_RefusedDefineThenRetrySucceeds) {
     ASSERT_TRUE(w.schema(sid, "x").has_value());
     EXPECT_EQ(w.schema(sid, "x")->errorCode, kUnknownTopic) << "nothing was created";
     EXPECT_EQ(w.define(sid, "x"), kOk) << "the retry creates it";
+    node.stop();
+}
+
+// Restores the T5_Retry cell over the wire (Task 10 → Task 11 binding: the test
+// client can now pin a requestId).  A CREATE VIEW retried with the SAME requestId
+// gets its ORIGINAL sink — not ViewExists, never a second sink — before and after
+// a restart (the dedupe record is part of the replayed catalog).  RED (dedupe
+// keyed on anything the restart loses): ViewExists after the restart.
+TEST(DdlConformanceBrokerRegression, T5_RetryWithTheSameRequestIdGetsItsOriginalSinkAcrossARestartRegression) {
+    const TempDataDir tmp("t5r_");
+    const fs::path& dir = tmp.path;
+    const NodeConfig cfg = makeSingleNodeConfig(dir);
+    const rune::protocol::RequestId viewRid{0x75E7, 1};
+    const rune::protocol::RequestId topicRid{0x75E7, 2};
+    int32_t viewTopicId = -1, topicId = -1;
+    uint64_t outputFp = 0;
+    auto createView = [&](ShardTestClient& c, Wire& w, int64_t sid, int32_t srcId) {
+        return c.awaitCreateView(c.sendCreateView(w.gw, w.stream, sid, "v", "id", 0, viewPlanBlob("v", srcId, 0),
+                                                  viewRid),
+                                 Clock::now() + 10s);
+    };
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ShardTestClient client(dir / "client-aeron");
+        client.keepSessionsAlive(true);
+        Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+        const int64_t sid = client.connect(w.gw, w.stream);
+        ASSERT_TRUE(w.awaitDdlReady(sid));
+        const auto first = client.awaitDefine(
+            client.sendDefineTopic(w.gw, w.stream, sid, "character", 1, charBlob(), 0, topicRid), Clock::now() + 10s);
+        ASSERT_TRUE(first.has_value());
+        ASSERT_EQ(first->errorCode, kOk);
+        topicId = first->topicId;
+        const auto again = client.awaitDefine(
+            client.sendDefineTopic(w.gw, w.stream, sid, "character", 1, charBlob(), 0, topicRid), Clock::now() + 10s);
+        ASSERT_TRUE(again.has_value());
+        EXPECT_EQ(again->errorCode, kOk) << "a retried DefineTopic is its original result, not TopicExists";
+        EXPECT_EQ(again->topicId, topicId);
+
+        const auto v1 = createView(client, w, sid, topicId);
+        ASSERT_TRUE(v1.has_value());
+        ASSERT_EQ(v1->errorCode, kOk);
+        viewTopicId = v1->viewTopicId;
+        outputFp    = v1->outputFingerprint;
+        const auto v2 = createView(client, w, sid, topicId);
+        ASSERT_TRUE(v2.has_value());
+        EXPECT_EQ(v2->errorCode, kOk) << "not ViewExists";
+        EXPECT_EQ(v2->viewTopicId, viewTopicId) << "its own sink, never a second one";
+        EXPECT_EQ(v2->outputFingerprint, outputFp);
+        node.stop();
+    }
+    {
+        BrokerNode node{cfg};
+        node.start();
+        ASSERT_TRUE(node.awaitLeader(30s));
+        ShardTestClient client(dir / "client-aeron2");
+        client.keepSessionsAlive(true);
+        Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+        const int64_t sid = client.connect(w.gw, w.stream);
+        ASSERT_TRUE(w.awaitDdlReady(sid));
+        const auto v3 = createView(client, w, sid, topicId);
+        ASSERT_TRUE(v3.has_value());
+        EXPECT_EQ(v3->errorCode, kOk) << "the dedupe survives the restart";
+        EXPECT_EQ(v3->viewTopicId, viewTopicId);
+        EXPECT_EQ(v3->outputFingerprint, outputFp);
+        // A NEW requestId for the same name is a new DDL: ViewExists.
+        const auto fresh = client.awaitCreateView(
+            client.sendCreateView(w.gw, w.stream, sid, "v", "id", 0, viewPlanBlob("v", topicId, 0)),
+            Clock::now() + 10s);
+        ASSERT_TRUE(fresh.has_value());
+        EXPECT_EQ(fresh->errorCode, kViewExists);
+        node.stop();
+    }
+    // Exactly one CreateView event and one CreateTopic for the two request ids.
+    rune::storage::Log log((dir / "__catalog").string());
+    log.recover();
+    std::size_t views = 0, topics = 0;
+    const std::vector<uint8_t> data = log.read(0, 1 << 22);
+    std::size_t pos = 0;
+    while (pos < data.size()) {
+        rune::protocol::RecordBatchReader reader(data.data() + pos, data.size() - pos);
+        if (!reader.ensureValid()) break;
+        reader.forEachRecord([&](std::string_view, std::string_view val, int64_t, int64_t) {
+            const auto ev = rune::catalog::decode(
+                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(val.data()), val.size()));
+            ASSERT_TRUE(ev.has_value());
+            if (ev->principal.requestId == viewRid) ++views;
+            if (ev->principal.requestId == topicRid) ++topics;
+        });
+        if (reader.totalLength() == 0) break;
+        pos += static_cast<std::size_t>(reader.totalLength());
+    }
+    EXPECT_EQ(views, 1u);
+    EXPECT_EQ(topics, 1u);
+}
+
+// Binding (Task 10 → 11): every catalog DDL op 74–77 over REAL Aeron, each
+// answered exactly once by its DdlResponse (78).  Also pins the fix-on-sight it
+// found: an AlterView's fresh sink (same name) was refused while the old sink
+// was live — RED: AlterView answered Internal after the 5 s answer-gate hold.
+TEST(DdlConformanceBrokerRegression, T9_EveryCatalogDdlOpRoundTripsOverTheWireRegression) {
+    const TempDataDir tmp("t9_");
+    const fs::path& dir = tmp.path;
+    const NodeConfig cfg = makeSingleNodeConfig(dir);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(30s));
+    ShardTestClient client(dir / "client-aeron");
+    client.keepSessionsAlive(true);
+    Wire w{client, cfg.clientEndpoint.channel, cfg.clientEndpoint.streamId};
+    const int64_t sid = client.connect(w.gw, w.stream);
+    ASSERT_TRUE(w.awaitDdlReady(sid));
+    ASSERT_EQ(w.define(sid, "u"), kOk);
+    const int32_t uId = w.schema(sid, "u")->topicId;
+
+    auto ddl = [&](int64_t corr) {
+        const auto a = client.awaitDdl(corr, Clock::now() + 10s);
+        EXPECT_TRUE(a.has_value()) << "corr " << corr << " answered";
+        EXPECT_EQ(client.answersFor(corr), 1u) << "corr " << corr << " answered exactly once";
+        return a.value_or(ShardTestClient::DdlAnswer{.errorCode = 0xFFFF});
+    };
+    // 75 AlterTopicConfig: the topic object's version 1 → 2.
+    const auto cfgA = ddl(client.sendAlterTopicConfig(w.gw, w.stream, sid, "u", 1, {{1, 60'000}}));
+    EXPECT_EQ(cfgA.errorCode, kOk) << cfgA.detail;
+    EXPECT_EQ(cfgA.newVersion, 2u);
+    const auto stale = ddl(client.sendAlterTopicConfig(w.gw, w.stream, sid, "u", 1, {{1, 70'000}}));
+    EXPECT_NE(stale.errorCode, kOk) << "expectedVersion 1 is stale now";
+    // 70 CreateView, then 77 AlterView (a fresh sink; the OK is gated on it serving).
+    ASSERT_EQ(w.view(sid, "v", "u"), kOk);
+    const auto av = ddl(client.sendAlterView(w.gw, w.stream, sid, "v", "id", 0, 0,
+                                             viewPlanBlob("v", {uId}, 0, /*extraColumn=*/true)));
+    EXPECT_EQ(av.errorCode, kOk) << av.detail;
+    EXPECT_GE(av.gateTopicId, 0) << "AlterView names its fresh sink";
+    // 74 DropTopic of a topic a view reads: InvalidRequest naming the view.
+    const auto busy = ddl(client.sendDropTopic(w.gw, w.stream, sid, "u"));
+    EXPECT_EQ(busy.errorCode, 39);
+    EXPECT_NE(busy.detail.find("v"), std::string::npos) << busy.detail;
+    // 76 DropView, then 74 DropTopic.
+    EXPECT_EQ(ddl(client.sendDropView(w.gw, w.stream, sid, "v")).errorCode, kOk);
+    EXPECT_EQ(ddl(client.sendDropTopic(w.gw, w.stream, sid, "u")).errorCode, kOk);
+    const auto gone = ddl(client.sendDropTopic(w.gw, w.stream, sid, "u"));
+    EXPECT_EQ(gone.errorCode, kUnknownTopic);
+    EXPECT_FALSE(gone.detail.empty()) << "UnknownTopic carries a detail";
+    EXPECT_EQ(w.schema(sid, "u")->errorCode, kUnknownTopic);
     node.stop();
 }
 

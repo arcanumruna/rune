@@ -1819,6 +1819,17 @@ private:
     // Control thread: the last consensus-driven catalog role posted (single node).
     struct PostedRole { bool leader = false; int32_t epoch = -1; };
     PostedRole                                            catalogLastRole_;
+    // Catalog history Task 11: the DDL route last published to the gateway, as
+    // its key (CatalogRoute index + the leader id / halt offset) — the endpoint
+    // string is built only on a change (an idle control pass allocates nothing).
+    struct PublishedCatalogRoute { int kind = -1; int64_t key = 0; };
+    PublishedCatalogRoute                                 catalogRoutePublished_;
+    /// Control thread: recompute the DDL route; publish it on change.
+    int publishCatalogRoute_(bool consensusLeader);
+    /// Control thread: a halted broker never drives placement — it withdraws its
+    /// candidacy (once, when the halt latches) and resigns the consensus
+    /// leadership (the controller) while it holds it.
+    int resignIfHalted_(bool consensusLeader);
     uint64_t                                              catalogAlterIsrRefused_ = 0;   // control thread
 
     std::unique_ptr<rune::storage::Log>                   schemaLog_;

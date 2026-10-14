@@ -437,36 +437,106 @@ public:
         std::vector<uint8_t> blob;
         bool operator==(const SchemaAnswer&) const = default;
     };
+    /// `rid` (Task 11): {0,0} = a fresh requestId; set = this DDL's id (a retry re-sends the SAME id).
     int64_t sendDefineTopic(const std::string& ch, int32_t stream, int64_t sid, std::string_view name,
-                            uint32_t partitions, const std::vector<uint8_t>& descriptor, uint8_t persistence = 0) {
+                            uint32_t partitions, const std::vector<uint8_t>& descriptor, uint8_t persistence = 0,
+                            rune::protocol::RequestId rid = {}) {
         pc::DefineTopic m;
         m.sessionId = sid; m.correlationId = ++corr_; m.topicName = name; m.partitionCount = partitions;
         m.keyField = "id"; m.validate = false; m.persistence = persistence;
         m.descriptorBlob = descriptor.data(); m.descriptorLen = static_cast<uint32_t>(descriptor.size());
-        m.hasExt = true; m.ext.clientName = "shard-test-client"; m.ext.requestId = nextRequestId_();
+        m.hasExt = true; m.ext.clientName = "shard-test-client"; m.ext.requestId = ridOr_(rid);
         std::vector<uint8_t> buf(m.encodedSize());
         const std::size_t len = m.encode(buf.data());
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
     }
     int64_t sendCreateView(const std::string& ch, int32_t stream, int64_t sid, std::string_view viewName,
-                           std::string_view keyField, uint8_t persistence, const std::vector<uint8_t>& plan) {
+                           std::string_view keyField, uint8_t persistence, const std::vector<uint8_t>& plan,
+                           rune::protocol::RequestId rid = {}) {
         pc::CreateView m;
         m.sessionId = sid; m.correlationId = ++corr_; m.viewName = viewName; m.keyField = keyField;
         m.persistence = persistence; m.planBlob = plan.data(); m.planLen = static_cast<uint32_t>(plan.size());
-        m.hasExt = true; m.ext.clientName = "shard-test-client"; m.ext.requestId = nextRequestId_();
+        m.hasExt = true; m.ext.clientName = "shard-test-client"; m.ext.requestId = ridOr_(rid);
         std::vector<uint8_t> buf(m.encodedSize());
         const std::size_t len = m.encode(buf.data());
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
     }
     int64_t sendAlterTopic(const std::string& ch, int32_t stream, int64_t sid, std::string_view name,
-                           uint16_t expectedVersion, const std::vector<uint8_t>& ops) {
+                           uint16_t expectedVersion, const std::vector<uint8_t>& ops,
+                           rune::protocol::RequestId rid = {}) {
         pc::AlterTopic m;
         m.sessionId = sid; m.correlationId = ++corr_; m.topicName = name; m.expectedVersion = expectedVersion;
         m.opsBlob = ops.data(); m.opsLen = static_cast<uint32_t>(ops.size());
-        m.hasExt = true; m.ext.clientName = "shard-test-client"; m.ext.requestId = nextRequestId_();
+        m.hasExt = true; m.ext.clientName = "shard-test-client"; m.ext.requestId = ridOr_(rid);
         std::vector<uint8_t> buf(m.encodedSize());
         const std::size_t len = m.encode(buf.data());
         return send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
+
+    // ── Catalog history Task 11: the v8 catalog DDL ops (74–77), answered by a
+    //    DdlResponse (78) — or an ErrorResponse (Redirect / NotLeader / Internal)
+    //    from a broker that is not the catalog leader. ──
+    struct DdlAnswer {
+        uint16_t errorCode = 0; uint64_t objectId = 0; uint32_t newVersion = 0; int32_t gateTopicId = -1;
+        std::string detail;
+    };
+    int64_t sendDropTopic(const std::string& ch, int32_t stream, int64_t sid, std::string_view name,
+                          rune::protocol::RequestId rid = {}) {
+        pc::DropTopic m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.topicName = name;
+        m.ext.clientName = "shard-test-client"; m.ext.requestId = ridOr_(rid);
+        return sendEncoded_(ch, stream, m);
+    }
+    int64_t sendAlterTopicConfig(const std::string& ch, int32_t stream, int64_t sid, std::string_view name,
+                                 uint32_t expectedVersion, const std::vector<pc::ConfigChangeWire>& changes,
+                                 rune::protocol::RequestId rid = {}) {
+        std::vector<uint8_t> block(pc::configChangesEncodedSize(changes.size()));
+        if (pc::putConfigChanges(block.data(), std::span<const pc::ConfigChangeWire>(changes)) != block.size())
+            return 0;
+        pc::AlterTopicConfig m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.topicName = name; m.expectedVersion = expectedVersion;
+        m.changes = block;
+        m.ext.clientName = "shard-test-client"; m.ext.requestId = ridOr_(rid);
+        return sendEncoded_(ch, stream, m);
+    }
+    int64_t sendDropView(const std::string& ch, int32_t stream, int64_t sid, std::string_view name,
+                         rune::protocol::RequestId rid = {}) {
+        pc::DropView m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.viewName = name;
+        m.ext.clientName = "shard-test-client"; m.ext.requestId = ridOr_(rid);
+        return sendEncoded_(ch, stream, m);
+    }
+    int64_t sendAlterView(const std::string& ch, int32_t stream, int64_t sid, std::string_view name,
+                          std::string_view keyField, uint8_t persistence, uint32_t expectedVersion,
+                          const std::vector<uint8_t>& plan, rune::protocol::RequestId rid = {}) {
+        pc::AlterView m;
+        m.sessionId = sid; m.correlationId = ++corr_; m.viewName = name; m.keyField = keyField;
+        m.persistence = persistence; m.expectedVersion = expectedVersion;
+        m.planBlob = plan.data(); m.planLen = static_cast<uint32_t>(plan.size());
+        m.ext.clientName = "shard-test-client"; m.ext.requestId = ridOr_(rid);
+        return sendEncoded_(ch, stream, m);
+    }
+    std::optional<DdlAnswer> awaitDdl(int64_t corr, Clock::time_point deadline) {
+        return awaitIn_(ddls_, corr, deadline);
+    }
+    /// Any answer to DDL `corr` — its own response type or an ErrorResponse —
+    /// as (response template, code, message / detail).  nullopt: none by `deadline`.
+    struct AnyAnswer { uint16_t responseTemplate = 0; int16_t code = 0; std::string message; };
+    std::optional<AnyAnswer> awaitAnyDdlAnswer(int64_t corr, Clock::time_point deadline) {
+        if (corr == 0) return std::nullopt;
+        while (Clock::now() < deadline) {
+            poll_();
+            if (auto a = anyDdlAnswer_(corr)) return a;
+            pause_();
+        }
+        return anyDdlAnswer_(corr);
+    }
+    /// How many answers of any kind arrived for `corr` (exactly-once checks).
+    [[nodiscard]] std::size_t answersFor(int64_t corr) const {
+        std::size_t n = (defines_.contains(corr) ? 1u : 0u) + (alters_.contains(corr) ? 1u : 0u) +
+                        (views_.contains(corr) ? 1u : 0u) + (ddls_.contains(corr) ? 1u : 0u);
+        for (const ErrorSeen& e : errors_) n += e.correlationId == corr ? 1u : 0u;
+        return n;
     }
     int64_t sendGetTopicSchema(const std::string& ch, int32_t stream, int64_t sid, std::string_view name) {
         pc::GetTopicSchema m;
@@ -605,6 +675,35 @@ public:
     }
 
 private:
+    rune::protocol::RequestId ridOr_(rune::protocol::RequestId rid) noexcept {
+        return rid.none() ? nextRequestId_() : rid;
+    }
+    template <class Msg>
+    int64_t sendEncoded_(const std::string& ch, int32_t stream, const Msg& m) {
+        if (!m.fits()) return 0;
+        std::vector<uint8_t> buf(m.encodedSize());
+        const std::size_t len = m.encode(buf.data());
+        return len > 0 && send(ch, stream, buf.data(), len) ? m.correlationId : 0;
+    }
+    std::optional<AnyAnswer> anyDdlAnswer_(int64_t corr) const {
+        namespace T = rune::protocol::client;
+        if (auto it = defines_.find(corr); it != defines_.end())
+            return AnyAnswer{static_cast<uint16_t>(T::TemplateId::DefineTopicResponse),
+                             static_cast<int16_t>(it->second.errorCode), {}};
+        if (auto it = alters_.find(corr); it != alters_.end())
+            return AnyAnswer{static_cast<uint16_t>(T::TemplateId::AlterTopicResponse),
+                             static_cast<int16_t>(it->second.errorCode), {}};
+        if (auto it = views_.find(corr); it != views_.end())
+            return AnyAnswer{static_cast<uint16_t>(T::TemplateId::CreateViewResponse),
+                             static_cast<int16_t>(it->second.errorCode), {}};
+        if (auto it = ddls_.find(corr); it != ddls_.end())
+            return AnyAnswer{static_cast<uint16_t>(T::TemplateId::DdlResponse),
+                             static_cast<int16_t>(it->second.errorCode), it->second.detail};
+        for (const ErrorSeen& e : errors_)
+            if (e.correlationId == corr)
+                return AnyAnswer{static_cast<uint16_t>(T::TemplateId::ErrorResponse), e.code, e.message};
+        return std::nullopt;
+    }
     /// A v8 DDL's 128-bit id: this client's instance tag + a counter (F14).
     rune::protocol::RequestId nextRequestId_() noexcept {
         return {0x5C1E'0000'0000'0000ull | static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(this) & 0xFFFF'FFFF),
@@ -740,6 +839,11 @@ private:
                 if (auto e = pc::ErrorResponse::decode(p, n))
                     errors_.push_back({e->correlationId, e->code, std::string(e->message)});
                 break;
+            case pc::TemplateId::DdlResponse:
+                if (auto r = pc::DdlResponse::decode(p, n))
+                    ddls_[r->correlationId] = DdlAnswer{r->errorCode, r->objectId, r->newVersion, r->gateTopicId,
+                                                        std::string(r->detail)};
+                break;
             default: break;
         }
     }
@@ -771,6 +875,7 @@ private:
     std::map<int64_t, pc::DefineTopicResponse>      defines_;
     std::map<int64_t, pc::CreateViewResponse>       views_;
     std::map<int64_t, pc::AlterTopicResponse>       alters_;
+    std::map<int64_t, DdlAnswer>                    ddls_;      // DdlResponse (78) by corr (Task 11)
     std::map<int64_t, uint16_t>                     viewRows_;   // ViewRowResponse status by corr
     std::map<int64_t, SchemaAnswer>                 schemas_;
     std::map<int64_t, int16_t>                      subscribes_;   // SubscribeResponse errorCode by corr

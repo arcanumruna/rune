@@ -57,6 +57,7 @@
 #include <rune/gateway/IGroupRequestHandler.h>
 #include <rune/gateway/ITxnRequestHandler.h>
 #include <rune/gateway/IAdminRequestSink.h>
+#include <rune/gateway/CatalogRoute.h>
 // client<->broker TLS/AEAD (Task 7): server-role handshake driver. SessionTable.h
 // (above) already pulls in rune/crypto/Aead.h + Cipher.h for CryptoState; this
 // adds TlsSession itself for PendingConnect's in-flight handshake.
@@ -371,6 +372,21 @@ public:
     [[nodiscard]] rune::gateway::IAdminRequestSink* adminSink() const noexcept {
         return adminSink_;
     }
+
+    // -----------------------------------------------------------------------
+    // Catalog history Task 11: the DDL route (CatalogRoute.h) — a CONTROL-thread
+    // value BrokerNode publishes on change (same thread as the gateway's duty
+    // cycle).  Every DDL handler (64, 68, 70, 74–77) consults it before
+    // submitting; the reads (66, 72) are always served locally.  Default
+    // RouteLocalLeader: the AdminWorker decides (a gateway with no node).
+    // -----------------------------------------------------------------------
+    void setCatalogRoute(rune::gateway::CatalogRoute r) noexcept { catalogRoute_ = std::move(r); }
+    [[nodiscard]] const rune::gateway::CatalogRoute& catalogRoute() const noexcept { return catalogRoute_; }
+    /// DDLs answered by the route without reaching the admin ring (Redirect /
+    /// NotLeader / Internal / pre-v8 InvalidRequest).
+    [[nodiscard]] uint64_t ddlRoutedAway() const noexcept { return ddlRoutedAway_; }
+    /// F37: pre-v8 DDLs refused on a non-leader (InvalidRequest in their own type).
+    [[nodiscard]] uint64_t preV8DdlRefused() const noexcept { return preV8DdlRefused_; }
 
     // -----------------------------------------------------------------------
     // MD1 Task 9: Per-partition routing image.
@@ -1544,6 +1560,11 @@ private:
         ddlMetaOf_(const rune::protocol::client::DdlExtension* ext, int64_t sessionId, const Session& session) noexcept;
     void answerAdminSubmit_(const uint8_t* buf, std::size_t len, rune::gateway::AdminSubmit r,
                             const char* ringFull, const char* tooLarge);
+    /// Task 11: the DDL route gate — true = answered here (never submitted):
+    /// RouteRemote → Redirect, RouteUnknown → NotLeader, RouteHalted → Internal
+    /// (ErrorResponse; a pre-v8 session gets its own response type, F37).
+    /// false = RouteLocalLeader, or no header / no session (the handler answers).
+    [[nodiscard]] bool ddlRouted_(const uint8_t* buf, std::size_t len);
     // Task 20: GetViewRow (72) — build a GetViewRow WorkerOp routed to the
     // owning worker (same op/return plumbing as PushRead); the worker's
     // ViewRowResult is encoded as a ViewRowResponse (73) in drainWorkerReturns_.
@@ -2020,6 +2041,10 @@ private:
     // Task 8a: schema DDL request sink (RULING-2 F) — non-owning; set via
     // setAdminSink().  Null → DefineTopic/GetTopicSchema are dropped.
     rune::gateway::IAdminRequestSink* adminSink_ = nullptr;
+    // Catalog history Task 11: the DDL route (setCatalogRoute) + its counters.
+    rune::gateway::CatalogRoute catalogRoute_{rune::gateway::RouteLocalLeader{}};
+    uint64_t                    ddlRoutedAway_   = 0;
+    uint64_t                    preV8DdlRefused_ = 0;
 
     // MD1 Task 9: Per-partition RoutingImage (capture-once per duty cycle).
     //

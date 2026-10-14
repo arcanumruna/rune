@@ -210,6 +210,33 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
+# ── Catalog history Task 11 (F7): the REAL client, embedded for
+# rune_client_broker_tests (the client's blocking *AndWait DDL against a real
+# in-process BrokerNode).  Required under BUILD_TESTING — never a silent skip.
+# The client's own `if(NOT TARGET …)` guards (Task 5) reuse the broker's copies
+# of the shared sibling targets (rune_fr / rune_codec / rune_crypto / rune_gso);
+# its own tests and benchmarks are not built here (BUILD_TESTING / BUILD_BENCHMARKS
+# are shadowed OFF for the subdirectory only).
+set(RUNE_CLIENT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../rune-client-cpp" CACHE PATH
+    "Path to the rune-client-cpp sibling repo (rune_client_broker_tests)")
+if(BUILD_TESTING)
+    if(NOT EXISTS "${RUNE_CLIENT_ROOT}/CMakeLists.txt")
+        message(FATAL_ERROR "RUNE_CLIENT_ROOT (${RUNE_CLIENT_ROOT}) has no CMakeLists.txt — the rune-client-cpp "
+                            "sibling is required for rune_client_broker_tests (BUILD_TESTING=ON)")
+    endif()
+    set(_rune_saved_build_testing ${BUILD_TESTING})
+    set(_rune_saved_build_benchmarks ${BUILD_BENCHMARKS})
+    set(BUILD_TESTING OFF)
+    set(BUILD_BENCHMARKS OFF)
+    add_subdirectory(${RUNE_CLIENT_ROOT} ${CMAKE_BINARY_DIR}/rune-client EXCLUDE_FROM_ALL)
+    set(BUILD_TESTING ${_rune_saved_build_testing})
+    set(BUILD_BENCHMARKS ${_rune_saved_build_benchmarks})
+    if(NOT TARGET rune_client_api)
+        message(FATAL_ERROR "the embedded rune-client-cpp defined no rune_client_api (aeron not found?) — "
+                            "rune_client_broker_tests needs it")
+    endif()
+endif()
+
 # gtest_discover_tests() defaults to running each test binary with
 # --gtest_list_tests at BUILD time, under a hardcoded 5s DISCOVERY_TIMEOUT.
 # Under load (e.g. two large builds running in parallel on the same box),
