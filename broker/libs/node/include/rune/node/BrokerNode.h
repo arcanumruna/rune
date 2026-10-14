@@ -305,7 +305,11 @@ public:
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
             const auto  n = static_cast<std::size_t>(len);
             if (tid == kMsgAdminRole) {
-                worker_.onRole(decodeAdminRole(p, n));
+                // Fix round 1 (M4, fix-on-sight): checked decode — a bad frame is
+                // reported, never applied as a default Follower@0 role.
+                AdminRoleMsg m;
+                if (decodeAdminRole(p, n, m)) worker_.onRole(m);
+                else reportBadRoleFrame_(tid, n);
                 return;
             }
             if (tid == kMsgCatalogRole) {
@@ -1275,6 +1279,14 @@ private:
     // own thread.  No PEM text or gateway state ever crosses the ring.
     static constexpr std::int32_t kTlsReloadTrigger = 1;
     rune::consensus::ControlRing<256> tlsReloadRing_;
+    // Task 6 fix round 1 (M5): stop() (controller) → control thread: the admin
+    // runner is joined — the catalog answer relay stops waiting for it.
+    static constexpr std::int32_t kAdminStoppedSignal = 1;
+    rune::consensus::ControlRing<256> adminLifecycleRing_;
+    // Control thread only (set from adminLifecycleRing_).
+    bool                              adminDrainStopped_ = false;
+    uint64_t                          catalogAnswersHeld_    = 0;   // ABORTed: role ahead / ring full
+    uint64_t                          catalogAnswersDropped_ = 0;   // admin thread gone
     // DR-15 fix round 1: the cold peer-hostname resolver thread + the rings it
     // feeds (driver name caches, peer-publication owners).  Declared FIRST so
     // it is destroyed LAST — after every consumer of its rings.

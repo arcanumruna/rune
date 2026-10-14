@@ -360,19 +360,24 @@ TEST(CatalogReplicationRegression, FormationAndReplicationInTheFusedDefaultPlace
     expectReplication(c);
 }
 
-TEST(CatalogReplicationRegression, AppendsReplicateToEveryBrokerBeforeTheHighWatermarkMoves) {
+// (Fix round 1 M7: named for what it shows — a committed append reaches every
+// broker's log.  The HW-only-after-a-majority ordering is pinned at replica
+// level by CatalogMinIsrRegression below.)
+TEST(CatalogReplicationRegression, CommittedAppendsReachEveryBroker) {
     ThreeNodes c = ThreeNodes::start("cat_repl");
     expectReplication(c);
 }
 
-TEST(CatalogReplicationRegression, AppendsReplicateToEveryBrokerWithLegacyWorkers) {
+TEST(CatalogReplicationRegression, CommittedAppendsReachEveryBrokerWithLegacyWorkers) {
     ThreeNodes c = ThreeNodes::start("cat_repl_l", {1, 2, 3}, Mode::Legacy);
     expectReplication(c);
 }
 
-// acks=all + minIsr = majority: with both followers gone the leader may still
-// take an append into its log, but the HW never covers it (no majority holds it).
-TEST(CatalogReplicationRegression, TheHighWatermarkNeverMovesWithoutAMajority) {
+// With both followers unreachable the leader may still take an append into its
+// log, but the HW never covers it: the followers stay in its (maximal) ISR and
+// hold the HW (fix round 1 I1: renamed for what it shows — the min-ISR gate
+// itself is pinned by CatalogMinIsrRegression).
+TEST(CatalogReplicationRegression, NoHighWatermarkProgressWhileBothFollowersAreUnreachable) {
     ThreeNodes c = ThreeNodes::start("cat_major");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     const int64_t hw0 = c.appendRawOnCatalogLeaderForTest({9});
@@ -425,8 +430,20 @@ TEST(CatalogReplicationRegression, CatalogIsNeverCompactedOrRetentionDeleted) {
 TEST(CatalogReplicationRegression, ANewBrokerWithAnEmptyDataDirFetchesTheCatalogFromOffsetZero) {
     ThreeNodes c = ThreeNodes::start("cat_join", /*startOnly=*/{1, 2});
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    // Fix round 1 (M6): the bootstrap assignment seeds the ISR with EVERY
+    // configured broker (MetadataService::decideCoordinatorPartition), including
+    // broker 3, which never started.  HW = min over the ISR, so the catalog
+    // commits nothing until the controller fences it / the leader shrinks it
+    // (≈ the fencing timeout, at most replicaLagMaxMs) — a bounded formation
+    // stall, never a commit without a majority.
+    const auto t0 = std::chrono::steady_clock::now();
     const int64_t hw = c.appendRawOnCatalogLeaderForTest({4, 5});
     ASSERT_GE(hw, 1);
+    const auto pa = catalogAssignmentOf(c.node(1));
+    ASSERT_TRUE(pa.has_value());
+    EXPECT_FALSE(contains(pa->isr, 3)) << "the first commit can only follow the never-started broker leaving the ISR";
+    EXPECT_EQ(pa->replicas.size(), 3u) << "it stays a replica (it fetches from 0 when it starts)";
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 20s) << "the formation stall is bounded";
     c.startNode(3);                                       // empty data dir
     EXPECT_TRUE(c.awaitCatalogEndOffset(c.node(3), hw, 20s));
     EXPECT_EQ(catalogOf(c.node(3)).logStart, 0) << "the catalog always starts at offset 0";
@@ -731,4 +748,112 @@ TEST(BridgeObserverRegression, ObserverCalledOnTheControlThreadFailsLoudlyNotDea
 
 TEST(BridgeObserverRegression, ObserverCalledOnTheFusedControlThreadFailsLoudlyNotDeadlocksRegression) {
     expectObserversRefuseOnTheControlThread(Mode::ShardFused, "cat_obs_fus");
+}
+
+
+// ===========================================================================
+// Fix round 1 (I1): the catalog's minIsr = majority + acks=all, fired at
+// replica level with THE catalog config (no timing: a controller-managed
+// leader, its committed ISR set explicitly).
+// ===========================================================================
+TEST(CatalogMinIsrRegression, AcksAllIsGatedBelowAMajorityAndCommitsOnceAFollowerAcksRegression) {
+    TmpDir dir{"cat_minisr"};
+    rune::storage::Log log{dir.path.string()};
+    log.recover();
+    rr::NullPartitionTransport transport;
+    OneToOneByteRing a2c(1 << 16);
+    AdminIsrChannel isrChannel(a2c);
+    NodeConfig nc;
+    nc.nodeId = 1;
+    const auto cfg = makeCatalogPartitionConfig(nc, 3);
+    EXPECT_EQ(cfg.minIsr, 2);   // EXPECT: the gate checks below must fire on their own
+    rr::PartitionReplica r(cfg, rr::Role::Follower, 0, {1, 2, 3}, {1, 2, 3}, &log, &transport);
+    r.setIsrChannel(&isrChannel);   // controller-managed, as in production
+    const std::vector<uint8_t> rec{1, 2, 3};
+    int64_t now = 1'000'000;
+
+    // Committed ISR {1}: below the majority → acks=all is refused.
+    r.becomeLeader(3, {1}, /*partitionEpoch=*/0);
+    ASSERT_EQ(r.role(), rr::Role::Leader);
+    (void)r.doWork(now += 1'000'000);
+    EXPECT_EQ(r.append(std::span<const uint8_t>(rec), /*acksAll=*/true), rr::PartitionReplica::kAppendMinIsr)
+        << "acks=all must be refused with a committed ISR below minIsr (majority)";
+    EXPECT_EQ(r.logEndOffset(), 0) << "nothing entered the log";
+    EXPECT_EQ(r.highWatermark(), 0);
+
+    // The controller commits ISR {1, 2} (same epoch, partitionEpoch 1): the gate opens,
+    // but the HW stays below the record until follower 2 holds it.
+    r.becomeLeader(3, {1, 2}, /*partitionEpoch=*/1);
+    const rr::Offset base = r.append(std::span<const uint8_t>(rec), /*acksAll=*/true);
+    ASSERT_GE(base, 0) << "a majority ISR admits acks=all";
+    const rr::Offset leo = r.logEndOffset();
+    ASSERT_GT(leo, base);
+    (void)r.doWork(now += 1'000'000);
+    EXPECT_LE(r.highWatermark(), base) << "no follower holds it yet: not committed";
+
+    // Follower 2 acks (fetches at the leader's LEO) → committed.
+    rr::FetchRequestMsg ack{};
+    ack.leaderEpoch = 3; ack.partition = 0; ack.followerId = 2; ack.fetchOffset = leo;
+    ack.maxBytes = 1 << 20; ack.topicId = kCatalogTopicId; ack.lastFetchedEpoch = -1;
+    r.onFetchRequest(ack, now += 1'000'000);
+    (void)r.doWork(now += 1'000'000);
+    EXPECT_EQ(r.highWatermark(), leo) << "the HW advances once a majority (leader + 1 follower) holds it";
+}
+
+// Fix round 1 (M1): -6's never-unclean wiring — no live ISR member → NO_LEADER
+// with the ISR lineage kept (an out-of-sync live replica is never elected).
+TEST(CatalogNeverUncleanRegression, NoLiveIsrMemberLeavesTheCatalogLeaderlessWithItsIsrKeptRegression) {
+    rune::metadata::PartitionAssignment cur;
+    cur.leaderNode = 1; cur.isr = {1}; cur.replicas = {1, 2, 3};
+    cur.leaderEpoch = 4; cur.partitionEpoch = 7;
+    const auto next = MetadataService::decideCoordinatorPartition(
+        kCatalogTopicId, kCatalogPartition, /*self=*/2, &cur, /*eligible=*/{2, 3}, /*positions=*/nullptr,
+        /*bootstrapEpoch=*/9, /*replicas=*/{1, 2, 3});
+    ASSERT_TRUE(next.has_value()) << "the dead leader must be replaced";
+    EXPECT_EQ(next->leaderNode, rune::metadata::NO_LEADER) << "never an unclean (out-of-ISR) leader";
+    EXPECT_EQ(next->isr, std::vector<int32_t>{1}) << "the ISR lineage is kept";
+    EXPECT_GT(next->leaderEpoch, cur.leaderEpoch);
+
+    // With a live ISR member it is elected — and only it.
+    cur.isr = {1, 3};
+    const auto clean = MetadataService::decideCoordinatorPartition(
+        kCatalogTopicId, kCatalogPartition, 2, &cur, {2, 3}, nullptr, 9, {1, 2, 3});
+    ASSERT_TRUE(clean.has_value());
+    EXPECT_EQ(clean->leaderNode, 3);
+    EXPECT_TRUE(contains(clean->isr, 3));
+    EXPECT_FALSE(contains(clean->isr, 2)) << "the out-of-sync controller is not admitted by an election";
+}
+
+// Fix round 1 (M3 + M5): the controller-answer relay decision.
+TEST(CatalogAlterIsrRelayRegression, AnswerNeverOvertakesAHeldRoleAndIsDroppedOnceTheAdminThreadIsGoneRegression) {
+    OneToOneByteRing ring(1 << 12);
+    rr::AlterIsrResponseMsg r{};
+    r.topicId = kCatalogTopicId; r.partition = 0; r.leaderId = 1; r.leaderEpoch = 2;
+    EXPECT_EQ(relayCatalogAlterIsrResponse(&ring, /*rolePending=*/true, r), CatalogAnswerRelay::Held)
+        << "FIFO: a held catalog role goes first";
+    EXPECT_EQ(relayCatalogAlterIsrResponse(nullptr, false, r), CatalogAnswerRelay::Dropped)
+        << "admin thread gone: dropped (counted), never blocking the peer's image";
+    EXPECT_EQ(relayCatalogAlterIsrResponse(nullptr, true, r), CatalogAnswerRelay::Dropped);
+    int frames = 0;
+    (void)ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer&, aeron::util::index_t, aeron::util::index_t) {
+        ++frames;
+    }, 64);
+    EXPECT_EQ(frames, 0) << "neither encoded anything";
+    EXPECT_EQ(relayCatalogAlterIsrResponse(&ring, false, r), CatalogAnswerRelay::Delivered);
+    OneToOneByteRing full(256);
+    while (encodeCatalogAlterIsrResponse(full, r)) {}
+    EXPECT_EQ(relayCatalogAlterIsrResponse(&full, false, r), CatalogAnswerRelay::Held) << "ring full: re-delivered";
+}
+
+// Fix round 1 (M4, fix-on-sight): a malformed __topic_schemas role frame is
+// reported, never applied as a default Follower@0 role.
+TEST(CatalogAlterIsrRelayRegression, MalformedSchemaRoleFrameIsReportedNotAppliedRegression) {
+    CatalogRig rig;
+    const uint8_t junk[3] = {1, 9, 9};
+    const auto idx = rig.agent->roleRing().tryClaim(kMsgAdminRole, sizeof junk);
+    ASSERT_GE(idx, 0);
+    std::memcpy(rig.agent->roleRing().base() + idx, junk, sizeof junk);
+    rig.agent->roleRing().commit(idx);
+    (void)rig.agent->doWork(1'000'000);
+    EXPECT_EQ(rig.agent->badRoleFramesForTest(), 1u);
 }

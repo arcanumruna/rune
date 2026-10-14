@@ -166,7 +166,10 @@ public:
     /// the role PENDING (one slot: a newer committed role supersedes it — roles
     /// are absolute) and retries every cycle, never dropped.  Duty-cycle thread.
     void setCatalogRoleRing(OneToOneByteRing* ring) noexcept { catalogRoleRing_ = ring; }
-    [[nodiscard]] bool catalogRolePendingForTest() const noexcept { return catalogRolePending_.has_value(); }
+    /// A catalog role is held (ring full / not wired).  Duty-cycle thread — the
+    /// controller-answer relay holds its answer behind it (FIFO, fix round 1 M3).
+    [[nodiscard]] bool catalogRolePending() const noexcept { return catalogRolePending_.has_value(); }
+    [[nodiscard]] bool catalogRolePendingForTest() const noexcept { return catalogRolePending(); }
     [[nodiscard]] uint64_t catalogRolesPostedForTest() const noexcept { return catalogRolesPosted_; }
 
     // -----------------------------------------------------------------------

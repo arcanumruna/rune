@@ -102,6 +102,23 @@ private:
     return true;
 }
 
+/// (Control thread) the relay decision for one controller answer for (-6, 0)
+/// (fix round 1, M3 + M5):
+///   Dropped   — the admin thread is gone (`roleRing` null): nothing will ever
+///               drain the ring; holding it would block the peer's whole image;
+///   Held      — a catalog role is still held by the bridge (the answer must not
+///               overtake the role it depends on — FIFO), or the ring is full:
+///               the caller leaves the frame unconsumed (re-delivered);
+///   Delivered — encoded verbatim on the role ring.
+enum class CatalogAnswerRelay : uint8_t { Delivered, Held, Dropped };
+
+[[nodiscard]] inline CatalogAnswerRelay relayCatalogAlterIsrResponse(OneToOneByteRing* roleRing, bool rolePending,
+                                                                     const rune::replication::AlterIsrResponseMsg& r) {
+    if (roleRing == nullptr) return CatalogAnswerRelay::Dropped;
+    if (rolePending) return CatalogAnswerRelay::Held;
+    return encodeCatalogAlterIsrResponse(*roleRing, r) ? CatalogAnswerRelay::Delivered : CatalogAnswerRelay::Held;
+}
+
 /// (Admin thread) decode a kMsgCatalogAlterIsrResponse frame.  false = malformed.
 [[nodiscard]] inline bool decodeCatalogAlterIsrResponse(const uint8_t* p, std::size_t n,
                                                         rune::replication::AlterIsrResponseMsg& out) noexcept {

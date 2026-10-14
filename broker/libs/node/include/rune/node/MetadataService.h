@@ -227,6 +227,14 @@ public:
             return std::find(v.begin(), v.end(), n) != v.end();
         };
         if (cur == nullptr) {
+            // Bootstrap seeds the ISR with EVERY configured replica, including a
+            // broker that never started (catalog history Task 6, review M6):
+            // HW = min over the ISR, so such a partition (e.g. __catalog formed
+            // without one of its brokers) commits nothing until the fencing pass
+            // / the leader's lag shrink drops that broker — a bounded formation
+            // stall (≈ the fencing timeout, at most replicaLagMaxMs), never a
+            // commit without the majority.  Pinned by CatalogReplicationRegression.
+            // ANewBrokerWithAnEmptyDataDirFetchesTheCatalogFromOffsetZero.
             rm::PartitionAssignment pa;
             pa.leaderNode     = selfId;
             pa.isr            = replicas;

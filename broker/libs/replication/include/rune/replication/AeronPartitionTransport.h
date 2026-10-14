@@ -325,6 +325,8 @@ public:
     void setForeignAlterIsrResponseHandler(ForeignAlterIsrResponseHandler fn, void* ctx) noexcept {
         foreignAlterIsrRespHandler_ = fn; foreignAlterIsrRespCtx_ = ctx;
     }
+    /// Task 6 fix round 1 (M2): AlterIsr answers this controller could not send.
+    [[nodiscard]] uint64_t alterIsrAnswersRefusedForTest() const noexcept { return alterIsrAnswersRefused_; }
 
     // -----------------------------------------------------------------------
     // D9: cross-node transaction markers (cold control traffic).
@@ -601,6 +603,7 @@ private:
     NodeControlResponseHandler             nodeControlRespHandler_ = nullptr;  ///< control thread
     void*                                  nodeControlRespCtx_     = nullptr;
     ForeignAlterIsrResponseHandler         foreignAlterIsrRespHandler_ = nullptr;  ///< control thread (Task 6)
+    uint64_t                               alterIsrAnswersRefused_     = 0;        ///< control thread (Task 6 M2)
     void*                                  foreignAlterIsrRespCtx_     = nullptr;
     WriteTxnMarkerHandler                  txnMarkerHandler_     = nullptr;  ///< control thread (D9)
     WriteTxnMarkerResponseHandler          txnMarkerRespHandler_ = nullptr;

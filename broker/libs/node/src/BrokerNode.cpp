@@ -3659,10 +3659,33 @@ bool BrokerNode::onCatalogAlterIsrResponseThunk_(void* self,
                                                  const rune::replication::AlterIsrResponseMsg& r) noexcept {
     auto* node = static_cast<BrokerNode*>(self);
     if (r.topicId != kCatalogTopicId || r.partition != kCatalogPartition) return true;   // not ours: as before
-    if (!node->adminWorkerAgent_) return true;
-    // Verbatim (every field, leaderId included — the E2 shard-mode lesson).
-    // false = role ring full → the transport re-delivers it (never dropped).
-    return encodeCatalogAlterIsrResponse(node->adminWorkerAgent_->roleRing(), r);
+    // Fix round 1 (M5): the admin thread is gone (stop()) — nothing will ever
+    // drain the role ring; holding the answer would block this peer's whole
+    // image (every -1/-2/-3 and node-control frame behind it).  Drop, counted.
+    // Fix round 1 (M3): FIFO with the role it depends on — while the bridge
+    // holds a catalog role, the answer must not overtake it on the ring.
+    // Held = false: re-delivered (Aeron path) / refused (local path; counted
+    // by the transport, the leader re-sends).  Verbatim (leaderId included).
+    OneToOneByteRing* ring = (node->adminWorkerAgent_ && !node->adminDrainStopped_)
+                                 ? &node->adminWorkerAgent_->roleRing() : nullptr;
+    const bool rolePending = node->replBridge_ && node->replBridge_->catalogRolePending();
+    switch (relayCatalogAlterIsrResponse(ring, rolePending, r)) {
+    case CatalogAnswerRelay::Delivered:
+        return true;
+    case CatalogAnswerRelay::Dropped:
+        if (node->catalogAnswersDropped_++ % 1024 == 0)
+            spdlog::warn("BrokerNode[{}]: __catalog AlterIsr answer dropped — the admin thread is stopped "
+                         "(dropped so far: {})", node->config_.nodeId, node->catalogAnswersDropped_);
+        return true;
+    case CatalogAnswerRelay::Held:
+        break;
+    }
+    if (node->catalogAnswersHeld_++ % 1024 == 0)
+        spdlog::warn("BrokerNode[{}]: __catalog AlterIsr answer held ({}) — re-delivered after it "
+                     "(held so far: {})", node->config_.nodeId,
+                     rolePending ? "a catalog role is ahead of it" : "admin role ring full",
+                     node->catalogAnswersHeld_);
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -3744,6 +3767,11 @@ void BrokerNode::stop() {
     }
     // Catalog history Task 6: no admin-thread test task waits forever.
     if (adminWorkerAgent_) adminWorkerAgent_->skipQueuedAdminThreadTestTasks();
+    // Fix round 1 (M5): tell the still-running control thread nobody drains the
+    // admin role ring any more (one command on an otherwise idle ring).
+    if (adminWorkerRunner_ && !adminLifecycleRing_.offer(kAdminStoppedSignal))
+        spdlog::error("BrokerNode[{}]: admin-stopped signal not delivered (ring full) — catalog answers "
+                      "may be held until the control thread stops", config_.nodeId);
     // NOTE (Task 8a): do NOT reset adminWorkerAgent_ here.  The gateway holds it
     // as adminSink_ and the NodeRuntimeAgent's admin control hook captures it;
     // both run on the MAIN agent runner, which is still live at this point.  We
@@ -3987,6 +4015,10 @@ int BrokerNode::serviceAdminControl_() {
     // a trigger; the actual file re-read + swap happen HERE, on the control
     // thread, so gateway_'s tlsCertPem_/tlsKeyPem_ are only ever mutated on
     // their own single-writer thread (shared-nothing).
+    // Task 6 fix round 1 (M5): the admin runner was joined (stop()).
+    work += adminLifecycleRing_.poll([this](std::int32_t type, std::int64_t, std::int64_t) {
+        if (type == kAdminStoppedSignal) adminDrainStopped_ = true;
+    });
     work += tlsReloadRing_.poll([this](std::int32_t type, std::int64_t, std::int64_t) {
         if (type != kTlsReloadTrigger) return;
         if (!gateway_ || config_.tlsCertFile.empty() || config_.tlsKeyFile.empty()) {

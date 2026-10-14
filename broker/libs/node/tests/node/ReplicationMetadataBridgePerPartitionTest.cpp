@@ -590,7 +590,7 @@ TEST_F(BridgePerPartitionTest, CatalogAssignmentIsForwardedOnTheControllerPathRe
     EXPECT_EQ(roles[0].partitionEpoch, 3);
     EXPECT_EQ(roles[0].isrCount, 3);
 
-    // Another node elected → follower of it (leaderless: leaderId -1).
+    // Another node elected → follower of it (leaderId = that node).
     MetadataStateMachine msm3;
     commitCatalogAssignment(msm3, 0, kNode2, {kNode2}, 5, 4);
     bridge->setMsm(&msm3);

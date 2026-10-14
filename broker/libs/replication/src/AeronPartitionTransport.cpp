@@ -388,9 +388,11 @@ bool AeronPartitionTransport::sendAlterIsrResponse(NodeId toLeader, const AlterI
     const std::size_t len = msg.encode(wire, sizeof wire);
     if (len == 0) return false;
     if (toLeader == static_cast<NodeId>(selfId_)) {   // controller == leader: local
-        // Catalog history Task 6: a local answer the owner's relay ring could not
-        // take (ABORT) is REFUSED, not reported delivered — the caller retries it
-        // (the MetadataService outbox) or the leader re-sends its proposal.
+        // Catalog history Task 6: a local answer the owner's relay could not take
+        // (ABORT) is REFUSED, not reported delivered.  Node-control answers are
+        // retried by the MetadataService outbox (NodeRuntimeAgent); a partition
+        // answer is counted + logged by the AlterIsr branch of handleFrame_ and
+        // recovered by the leader's kAlterIsrResendNs re-send.
         return handleFrame_(wire, len) != aeron::ControlledPollAction::ABORT;
     }
     return enqueueOutbound(static_cast<int32_t>(toLeader), wire, len);
@@ -693,8 +695,18 @@ aeron::ControlledPollAction AeronPartitionTransport::handleFrame_(const uint8_t*
         AlterIsrMsg m{};
         AlterIsrResponseMsg resp{};
         if (AlterIsrMsg::decode(buf, len, m) && alterIsrHandler_ != nullptr &&
-            alterIsrHandler_(alterIsrCtx_, m, resp))
-            (void)sendAlterIsrResponse(m.leaderId, resp);   // a refused answer: the leader re-sends
+            alterIsrHandler_(alterIsrCtx_, m, resp) &&
+            !sendAlterIsrResponse(m.leaderId, resp)) [[unlikely]] {
+            // Task 6 fix round 1 (M2): never silent — a refused answer (outbound
+            // ring full, or a local owner relay that could not take it) is
+            // counted and logged.  Nothing retries THIS answer: the proposing
+            // leader re-sends its AlterIsr every kAlterIsrResendNs, and a commit
+            // still reaches it through the committed assignment.
+            if (alterIsrAnswersRefused_++ % 1024 == 0)
+                spdlog::warn("AeronPartitionTransport: AlterIsr answer for topicId={} partition={} to "
+                             "node {} refused (refused so far: {}) — the leader re-sends its proposal",
+                             m.topicId, m.partition, m.leaderId, alterIsrAnswersRefused_);
+        }
         return Action::CONTINUE;
     }
     if (tid == WriteTxnMarkerMsg::TEMPLATE_ID) [[unlikely]] {
