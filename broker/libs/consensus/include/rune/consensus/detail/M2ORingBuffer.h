@@ -29,6 +29,7 @@
 #include <util/BitUtil.h>
 #include <util/Index.h>
 #include <util/Exceptions.h>
+#include <rune/consensus/detail/RingAtomics.h>
 #include <rune/consensus/detail/TsanAnnotations.h>
 
 namespace rune::consensus::detail {
@@ -76,7 +77,7 @@ public:
         const aeron::util::index_t recordIndex = claimCapacity(recordLength);
         if (INSUFFICIENT_CAPACITY == recordIndex) return recordIndex;
 
-        m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
+        ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
         std::atomic_thread_fence(std::memory_order_release);
         m_buffer.putInt32(RD::RecordDescriptor::typeOffset(recordIndex), msgTypeId);
         return RD::RecordDescriptor::encodedMsgOffset(recordIndex);
@@ -88,7 +89,7 @@ public:
         const aeron::util::index_t recordIndex = computeRecordIndex(index);
         const std::int32_t recordLength = verifyClaimedSpaceNotReleased(recordIndex);
         RUNE_TSAN_RELEASE(m_buffer.buffer() + recordIndex);
-        m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
+        ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
     }
 
     /// Discard a message previously reserved with tryClaim() (becomes padding).
@@ -99,7 +100,7 @@ public:
         RUNE_TSAN_RELEASE(m_buffer.buffer() + recordIndex);
         m_buffer.putInt32(RD::RecordDescriptor::typeOffset(recordIndex),
                           RD::RecordDescriptor::PADDING_MSG_TYPE_ID);
-        m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
+        ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength);
     }
 
     /// Convenience: claim + copy + commit (matches Aeron's write()).  Returns false
@@ -155,14 +156,14 @@ public:
             if (bytesRead != 0) {
                 m_buffer.setMemory(headIndex, static_cast<std::size_t>(bytesRead), 0);
                 RUNE_TSAN_RELEASE(m_buffer.buffer() + headPositionIndex);
-                m_buffer.putInt64Ordered(headPositionIndex, head + bytesRead);
+                ring_atomic::putInt64Release(m_buffer, headPositionIndex, head + bytesRead);
             }
         });
 
         while ((bytesRead < maxBlockLength) && (messagesRead < messageCountLimit)) {
             const aeron::util::index_t recordIndex = headIndex + bytesRead;
             const std::int32_t recordLength =
-                m_buffer.getInt32Volatile(RD::RecordDescriptor::lengthOffset(recordIndex));
+                ring_atomic::getInt32Acquire(m_buffer, RD::RecordDescriptor::lengthOffset(recordIndex));
             if (recordLength <= 0) break;
             RUNE_TSAN_ACQUIRE(m_buffer.buffer() + recordIndex);
 
@@ -186,10 +187,10 @@ public:
     }
 
     [[nodiscard]] std::int64_t producerPosition() const {
-        return m_buffer.getInt64Volatile(m_tailPositionIndex);
+        return ring_atomic::getInt64Acquire(m_buffer, m_tailPositionIndex);
     }
     [[nodiscard]] std::int64_t consumerPosition() const {
-        return m_buffer.getInt64Volatile(m_headPositionIndex);
+        return ring_atomic::getInt64Acquire(m_buffer, m_headPositionIndex);
     }
 
 private:
@@ -262,7 +263,7 @@ private:
         const aeron::util::index_t headCachePositionIndex = m_headCachePositionIndex;
         const aeron::util::index_t mask = capacity - 1;
 
-        std::int64_t head = m_buffer.getInt64Volatile(headCachePositionIndex);
+        std::int64_t head = ring_atomic::getInt64Acquire(m_buffer, headCachePositionIndex);
         RUNE_TSAN_ACQUIRE(m_buffer.buffer() + headCachePositionIndex);   // cache written by another producer
 
         std::int64_t tail;
@@ -272,12 +273,12 @@ private:
         aeron::util::index_t writeIndex;
 
         do {
-            tail = m_buffer.getInt64Volatile(tailPositionIndex);
+            tail = ring_atomic::getInt64Acquire(m_buffer, tailPositionIndex);
             const aeron::util::index_t availableCapacity =
                 capacity - static_cast<aeron::util::index_t>(tail - head);
 
             if (requiredCapacity > availableCapacity) {
-                head = m_buffer.getInt64Volatile(m_headPositionIndex);
+                head = ring_atomic::getInt64Acquire(m_buffer, m_headPositionIndex);
                 RUNE_TSAN_ACQUIRE(m_buffer.buffer() + m_headPositionIndex);
 
                 if (requiredCapacity > (capacity - static_cast<aeron::util::index_t>(tail - head))) {
@@ -286,7 +287,7 @@ private:
 
                 RUNE_TSAN_RELEASE(m_buffer.buffer() + headCachePositionIndex);
 
-                m_buffer.putInt64Ordered(headCachePositionIndex, head);
+                ring_atomic::putInt64Release(m_buffer, headCachePositionIndex, head);
             }
 
             newTail = tail + requiredCapacity;
@@ -301,7 +302,7 @@ private:
                 writeIndex = 0;
 
                 if (requiredCapacity > headIndex) {
-                    head = m_buffer.getInt64Volatile(m_headPositionIndex);
+                    head = ring_atomic::getInt64Acquire(m_buffer, m_headPositionIndex);
                     RUNE_TSAN_ACQUIRE(m_buffer.buffer() + m_headPositionIndex);
                     headIndex = static_cast<aeron::util::index_t>(head) & mask;
 
@@ -312,21 +313,21 @@ private:
 
                     RUNE_TSAN_RELEASE(m_buffer.buffer() + headCachePositionIndex);
 
-                    m_buffer.putInt64Ordered(headCachePositionIndex, head);
+                    ring_atomic::putInt64Release(m_buffer, headCachePositionIndex, head);
                 }
 
                 padding = toBufferEndLength;
                 newTail += padding;
             }
-        } while (!m_buffer.compareAndSetInt64(tailPositionIndex, tail, newTail));
+        } while (!ring_atomic::compareAndSetInt64(m_buffer, tailPositionIndex, tail, newTail));
 
         if (0 != padding) {
-            m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(tailIndex), -padding);
+            ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(tailIndex), -padding);
             std::atomic_thread_fence(std::memory_order_release);
             m_buffer.putInt32(RD::RecordDescriptor::typeOffset(tailIndex),
                               RD::RecordDescriptor::PADDING_MSG_TYPE_ID);
             RUNE_TSAN_RELEASE(m_buffer.buffer() + tailIndex);
-            m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(tailIndex), padding);
+            ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(tailIndex), padding);
         }
 
         return writeIndex;

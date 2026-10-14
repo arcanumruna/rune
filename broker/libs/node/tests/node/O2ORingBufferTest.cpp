@@ -5,6 +5,8 @@
 
 #include <concurrent/AtomicBuffer.h>
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 
 #include <cstdint>
@@ -234,5 +236,53 @@ TEST(O2ORingBufferRegression, CrossThreadPayloadHandoffIsOrdered) {
     }
     producer.join();
     EXPECT_TRUE(ok) << "a message arrived out of order or corrupted";
+    EXPECT_EQ(next, kN);
+}
+
+// Sanitizer triage 2026-10-14 (cluster T1, run under build-tsan): an EMPTY read
+// loads the record-length word a later tryClaim() stores into, and size() /
+// producerPosition() load the tail / head words from a third thread.  These were
+// Aeron volatile+fence accesses, invisible to TSan (reported as data races in
+// every worker / flusher ring).  Now std::atomic_ref control words: this must run
+// race-free under TSan through many wraps (padding + pre-zeroed next headers).
+TEST(RingAtomicsTsanRegression, O2OEmptyReadsRacingClaimsAndPositionReadsAreRaceFree) {
+    Backing b(1024);
+    O2ORingBuffer ring(b.bytes.data(), b.bytes.size());
+    constexpr std::uint32_t kN = 20'000;
+    constexpr std::size_t kLen = 44;   // 52 B record, 56 aligned: padding on most wraps
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    std::atomic<bool> done{false};
+    std::thread producer([&] {
+        for (std::uint32_t i = 0; i < kN; ++i) {
+            aeron::util::index_t idx;
+            while ((idx = ring.tryClaim(kType, kLen)) < 0) {
+                if (std::chrono::steady_clock::now() >= deadline) return;
+                std::this_thread::yield();
+            }
+            std::memcpy(ring.base() + idx, &i, sizeof(i));
+            ring.commit(idx);
+        }
+    });
+    std::thread observer([&] {
+        aeron::util::index_t maxSize = 0;
+        while (!done.load()) maxSize = std::max(maxSize, ring.size());
+        EXPECT_LE(maxSize, ring.capacity());
+        EXPECT_GE(ring.producerPosition(), 0);
+    });
+    std::uint32_t next = 0;
+    bool ordered = true;
+    while (next < kN && std::chrono::steady_clock::now() < deadline) {
+        ring.read([&](int32_t, aeron::concurrent::AtomicBuffer& buf, aeron::util::index_t off,
+                      aeron::util::index_t) {
+            std::uint32_t seq;
+            std::memcpy(&seq, buf.buffer() + off, sizeof(seq));
+            ordered = ordered && seq == next;
+            ++next;
+        }, 16);
+    }
+    done.store(true);
+    producer.join();
+    observer.join();
+    EXPECT_TRUE(ordered);
     EXPECT_EQ(next, kN);
 }

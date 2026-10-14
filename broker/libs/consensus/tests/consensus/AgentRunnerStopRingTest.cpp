@@ -12,6 +12,8 @@
 #include <rune/consensus/IdleStrategy.h>
 #include <rune/consensus/NanoClock.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <future>
 #include <thread>
@@ -166,4 +168,39 @@ TEST(ControlRingRegression, PollDeliversAcrossTheWrapInOneCall) {
         EXPECT_EQ(got, 1);
         EXPECT_EQ(a, round);
     }
+}
+
+// Sanitizer triage 2026-10-14 (cluster T1, run under build-tsan): the consumer's
+// EMPTY poll loads a record-length word that a producer's claim later stores
+// into.  With Aeron's volatile+fence accessors TSan saw two plain accesses and
+// reported a data race on every ControlRing / IngressRing (1158 Regression
+// aborts).  The ring control words are now std::atomic_ref (RingAtomics.h): this
+// test must run clean under TSan — busy empty polls racing producer claims across
+// many wraps, plus a third thread reading the positions.
+TEST(RingAtomicsTsanRegression, ControlRingEmptyPollsRacingOffersAreRaceFree) {
+    ControlRing<256> r;   // 10 records per lap: many wraps + padding records
+    constexpr int kPer = 4000;
+    std::atomic<bool> done{false};
+    std::thread producer([&] {
+        for (int i = 0; i < kPer; ++i)
+            while (!r.offer(1, i, -i)) std::this_thread::yield();
+    });
+    std::thread observer([&] {
+        std::int64_t maxPending = 0;
+        while (!done.load()) maxPending = std::max(maxPending, r.pendingBytes());
+        EXPECT_LE(maxPending, 256);
+    });
+    int64_t next = 0;
+    const auto deadline = std::chrono::steady_clock::now() + 30s;
+    while (next < kPer && std::chrono::steady_clock::now() < deadline) {
+        r.poll([&](int32_t, int64_t a, int64_t b) {
+            EXPECT_EQ(a, next);
+            EXPECT_EQ(b, -next);
+            ++next;
+        });
+    }
+    done.store(true);
+    producer.join();
+    observer.join();
+    EXPECT_EQ(next, kPer);
 }

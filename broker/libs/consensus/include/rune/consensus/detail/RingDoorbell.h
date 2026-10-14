@@ -33,6 +33,7 @@
 // ring-implementation internals (scripts/atomics_allowlist.txt, category RING).  Never busy-spins, never
 // allocates after construction, no virtual call.
 #include <concurrent/AtomicBuffer.h>
+#include <rune/consensus/detail/RingAtomics.h>
 #include <util/Index.h>
 
 #include <array>
@@ -127,7 +128,7 @@ public:
             if (w.enabled != nullptr && !*w.enabled) continue;
             const std::int64_t head = w.buf.getInt64(w.headPositionIndex);   // consumer-owned
             const auto idx = static_cast<aeron::util::index_t>(head & (w.capacity - 1));
-            if (w.buf.getInt32Volatile(idx) > 0) return true;                 // committed record or padding
+            if (ring_atomic::getInt32Acquire(w.buf, idx) > 0) return true;                 // committed record or padding
         }
         return false;
     }

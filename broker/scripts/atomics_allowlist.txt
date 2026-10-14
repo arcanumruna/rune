@@ -19,33 +19,23 @@
 
 # ------------------------------------------------------------ RING
 libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | #include <atomic> | 1 | RING | agrona ring implementation internals
-libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength); | 3 | RING | agrona ring implementation internals
 libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | std::atomic_thread_fence(std::memory_order_release); | 2 | RING | agrona ring implementation internals
-libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | m_buffer.putInt64Ordered(headPositionIndex, head + bytesRead); | 1 | RING | agrona ring implementation internals
-libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | m_buffer.getInt32Volatile(RD::RecordDescriptor::lengthOffset(recordIndex)); | 1 | RING | agrona ring implementation internals
-libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | return m_buffer.getInt64Volatile(m_tailPositionIndex); | 1 | RING | agrona ring implementation internals
-libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | return m_buffer.getInt64Volatile(m_headPositionIndex); | 1 | RING | agrona ring implementation internals
-libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | std::int64_t head = m_buffer.getInt64Volatile(headCachePositionIndex); | 1 | RING | agrona ring implementation internals
-libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | tail = m_buffer.getInt64Volatile(tailPositionIndex); | 1 | RING | agrona ring implementation internals
-libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | head = m_buffer.getInt64Volatile(m_headPositionIndex); | 2 | RING | agrona ring implementation internals
-libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | m_buffer.putInt64Ordered(headCachePositionIndex, head); | 2 | RING | agrona ring implementation internals
-libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | } while (!m_buffer.compareAndSetInt64(tailPositionIndex, tail, newTail)); | 1 | RING | agrona ring implementation internals
-libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(tailIndex), -padding); | 1 | RING | agrona ring implementation internals
-libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(tailIndex), padding); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | head = ring_atomic::getInt64Acquire(m_buffer, m_headPositionIndex); | 2 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | return ring_atomic::getInt64Acquire(m_buffer, m_headPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | return ring_atomic::getInt64Acquire(m_buffer, m_tailPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | ring_atomic::getInt32Acquire(m_buffer, RD::RecordDescriptor::lengthOffset(recordIndex)); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength); | 3 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(tailIndex), -padding); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(tailIndex), padding); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | ring_atomic::putInt64Release(m_buffer, headCachePositionIndex, head); | 2 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | ring_atomic::putInt64Release(m_buffer, headPositionIndex, head + bytesRead); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | std::int64_t head = ring_atomic::getInt64Acquire(m_buffer, headCachePositionIndex); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | tail = ring_atomic::getInt64Acquire(m_buffer, tailPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/consensus/include/rune/consensus/detail/M2ORingBuffer.h | } while (!ring_atomic::compareAndSetInt64(m_buffer, tailPositionIndex, tail, newTail)); | 1 | RING | agrona ring implementation internals
 libs/node/include/rune/node/UringFlushBackend.h | const uint32_t head = __atomic_load_n(cqHead_, __ATOMIC_ACQUIRE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail
 libs/node/include/rune/node/UringFlushBackend.h | const uint32_t tail = __atomic_load_n(cqTail_, __ATOMIC_ACQUIRE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail
 libs/node/include/rune/node/UringFlushBackend.h | __atomic_store_n(cqHead_, head + 1, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail
-libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength); | 3 | RING | agrona ring implementation internals
 libs/node/include/rune/node/detail/O2ORingBuffer.h | std::atomic_thread_fence(std::memory_order_release); | 2 | RING | agrona ring implementation internals
-libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.putInt64Ordered(headPositionIndex, head + bytesRead); | 3 | RING | agrona ring implementation internals
-libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.getInt32Volatile(RD::RecordDescriptor::lengthOffset(recordIndex)); | 2 | RING | agrona ring implementation internals
-libs/node/include/rune/node/detail/O2ORingBuffer.h | const std::int64_t tail = m_buffer.getInt64Volatile(m_tailPositionIndex); | 1 | RING | agrona ring implementation internals
-libs/node/include/rune/node/detail/O2ORingBuffer.h | return m_buffer.getInt64Volatile(m_tailPositionIndex); | 1 | RING | agrona ring implementation internals (producerPosition, as M2ORingBuffer; Task 13 fix round 1 I1)
-libs/node/include/rune/node/detail/O2ORingBuffer.h | const std::int64_t head = m_buffer.getInt64Volatile(m_headPositionIndex); | 1 | RING | agrona ring implementation internals
-libs/node/include/rune/node/detail/O2ORingBuffer.h | head = m_buffer.getInt64Volatile(m_headPositionIndex); | 2 | RING | agrona ring implementation internals
-libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.putInt64Ordered(tailPositionIndex, nextTail); | 2 | RING | agrona ring implementation internals
-libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), -padding); | 1 | RING | agrona ring implementation internals
-libs/node/include/rune/node/detail/O2ORingBuffer.h | m_buffer.putInt32Ordered(RD::RecordDescriptor::lengthOffset(recordIndex), padding); | 1 | RING | agrona ring implementation internals
 libs/node/include/rune/node/detail/O2ORingBuffer.h | #include <atomic> | 1 | RING | A9 ring space-wait word (producer waits for space; Dekker fence with the consumer's head advance)
 libs/node/include/rune/node/detail/O2ORingBuffer.h | alignas(64) std::atomic<std::uint32_t> m_spaceWanted{0}; | 1 | RING | A9 ring space-wait word (producer waits for space; Dekker fence with the consumer's head advance)
 libs/node/include/rune/node/detail/O2ORingBuffer.h | if (m_spaceWanted.load(std::memory_order_relaxed) != 0 && | 1 | RING | A9 ring space-wait word (producer waits for space; Dekker fence with the consumer's head advance)
@@ -54,20 +44,46 @@ libs/node/include/rune/node/detail/O2ORingBuffer.h | m_spaceWanted.store(1, std:
 libs/node/include/rune/node/detail/O2ORingBuffer.h | return m_spaceWanted.load(std::memory_order_relaxed) != 0; | 1 | RING | A9 ring space-wait word (producer waits for space; Dekker fence with the consumer's head advance)
 libs/node/include/rune/node/detail/O2ORingBuffer.h | std::atomic_thread_fence(std::memory_order_seq_cst); | 2 | RING | A9 ring space-wait word (producer waits for space; Dekker fence with the consumer's head advance)
 libs/node/include/rune/node/detail/O2ORingBuffer.h | void disarmSpaceWait() noexcept { m_spaceWanted.store(0, std::memory_order_relaxed); } | 1 | RING | A9 ring space-wait word (producer waits for space; Dekker fence with the consumer's head advance)
+libs/node/include/rune/node/detail/O2ORingBuffer.h | const std::int64_t head = ring_atomic::getInt64Acquire(m_buffer, m_headPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | const std::int64_t tail = ring_atomic::getInt64Acquire(m_buffer, m_tailPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | head = ring_atomic::getInt64Acquire(m_buffer, m_headPositionIndex); | 2 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | return ring_atomic::getInt64Acquire(m_buffer, m_tailPositionIndex); | 1 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | ring_atomic::getInt32Acquire(m_buffer, RD::RecordDescriptor::lengthOffset(recordIndex)); | 2 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(recordIndex), -padding); | 1 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(recordIndex), -recordLength); | 3 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | ring_atomic::putInt32Release(m_buffer, RD::RecordDescriptor::lengthOffset(recordIndex), padding); | 1 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | ring_atomic::putInt64Release(m_buffer, headPositionIndex, head + bytesRead); | 3 | RING | agrona ring implementation internals
+libs/node/include/rune/node/detail/O2ORingBuffer.h | ring_atomic::putInt64Release(m_buffer, tailPositionIndex, nextTail); | 2 | RING | agrona ring implementation internals
 libs/consensus/include/rune/consensus/detail/RingDoorbell.h | #include <atomic> | 1 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
 libs/consensus/include/rune/consensus/detail/RingDoorbell.h | [[nodiscard]] bool parkingForTest() const noexcept { return parking_.load(std::memory_order_relaxed) != 0; } | 1 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
 libs/consensus/include/rune/consensus/detail/RingDoorbell.h | alignas(64) std::atomic<std::uint32_t> parking_{0}; | 1 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
 libs/consensus/include/rune/consensus/detail/RingDoorbell.h | if (parking_.load(std::memory_order_relaxed) != 0 && | 1 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
-libs/consensus/include/rune/consensus/detail/RingDoorbell.h | if (w.buf.getInt32Volatile(idx) > 0) return true; | 1 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
 libs/consensus/include/rune/consensus/detail/RingDoorbell.h | parking_.exchange(0, std::memory_order_acq_rel) != 0) | 1 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
 libs/consensus/include/rune/consensus/detail/RingDoorbell.h | parking_.store(0, std::memory_order_relaxed); | 2 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
 libs/consensus/include/rune/consensus/detail/RingDoorbell.h | parking_.store(1, std::memory_order_relaxed); | 1 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
 libs/consensus/include/rune/consensus/detail/RingDoorbell.h | std::atomic_thread_fence(std::memory_order_seq_cst); | 2 | RING | A9 ring doorbell (consumer parking word + Dekker fence; lost-wakeup-free wake of a parked consumer)
+libs/consensus/include/rune/consensus/detail/RingDoorbell.h | if (ring_atomic::getInt32Acquire(w.buf, idx) > 0) return true; | 1 | RING | A9 ring doorbell watch: committed-record length at the head (ring_atomic acquire load)
 libs/node/src/UringFlushBackend.cpp | const uint32_t head = __atomic_load_n(sqHead_, __ATOMIC_ACQUIRE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
 libs/node/src/UringFlushBackend.cpp | const uint32_t tail = __atomic_load_n(sqTail_, __ATOMIC_RELAXED); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
 libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail + n, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
 libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ/CQ ring head/tail (single pushSqes_ submit path: fsync, FADVISE, io-wq NOP, E1d linked write+fsync)
 libs/node/src/UringFlushBackend.cpp | __atomic_store_n(sqTail_, tail + submitted, __ATOMIC_RELEASE); | 1 | RING | kernel-shared io_uring SQ tail: LOW-4b partial-enter rollback of the unconsumed SQEs (single pushSqes_ submit path)
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | #include <atomic> | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | [[nodiscard]] inline bool compareAndSetInt64(const aeron::concurrent::AtomicBuffer& b, aeron::util::index_t offset, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | [[nodiscard]] inline std::atomic_ref<T> word(const aeron::concurrent::AtomicBuffer& b, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | [[nodiscard]] inline std::int32_t getInt32Acquire(const aeron::concurrent::AtomicBuffer& b, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | [[nodiscard]] inline std::int64_t getInt64Acquire(const aeron::concurrent::AtomicBuffer& b, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | inline void putInt32Release(const aeron::concurrent::AtomicBuffer& b, aeron::util::index_t offset, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | inline void putInt64Release(const aeron::concurrent::AtomicBuffer& b, aeron::util::index_t offset, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | return std::atomic_ref<T>(*reinterpret_cast<T*>(b.buffer() + offset)); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | return word<std::int32_t>(b, offset).load(std::memory_order_acquire); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | return word<std::int64_t>(b, offset).compare_exchange_strong(expected, desired, | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | return word<std::int64_t>(b, offset).load(std::memory_order_acquire); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | static_assert(std::atomic_ref<std::int32_t>::is_always_lock_free); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | static_assert(std::atomic_ref<std::int64_t>::is_always_lock_free); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | std::memory_order_seq_cst); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | word<std::int32_t>(b, offset).store(v, std::memory_order_release); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
+libs/consensus/include/rune/consensus/detail/RingAtomics.h | word<std::int64_t>(b, offset).store(v, std::memory_order_release); | 1 | RING | ring control words as std::atomic_ref (TSan-visible; same codegen as Aeron ordered/volatile) — ring implementation internals
 
 # ------------------------------------------------------------ CLEANER
 libs/node/include/rune/node/LogCleanerAgent.h | #include <atomic> | 1 | CLEANER | D25 cleaner cycle counter (tests wait on cleaner progress, not sleeps)
