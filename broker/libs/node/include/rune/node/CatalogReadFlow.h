@@ -33,6 +33,7 @@
 //   Room    room(int64_t session);
 //   bool    postPaused(int64_t session, int64_t subscriptionId, int64_t baseOffset, bool droppedMarker);
 //   bool    postResume(int64_t session, int64_t subscriptionId);
+//   bool    postSessionGone(int64_t session);      // fix round 3: a probe found it gone
 
 #include <rune/node/CatalogReadServer.h>
 
@@ -75,6 +76,13 @@ public:
         const uint8_t*    frame = p + kCatalogReadHeadBytes;
         const std::size_t len   = n - kCatalogReadHeadBytes;
         if (h.subscriptionId == 0) { sink.sendReliable(h.session, frame, len); return; }
+        if (len == 0 && h.baseOffset == kProbeOffset) {
+            // Fix round 3 (F3b): a liveness probe.  A gone session (its close may
+            // never have reached the admin) is reported; a refused report is
+            // simply re-probed next interval — nothing is queued here.
+            if (sink.room(h.session) == Room::Gone && sink.postSessionGone(h.session)) ++sessionsGone_;
+            return;
+        }
         if (Entry* e = find_(h.session, h.subscriptionId)) {
             if (len == 0) {   // the pause ack: every in-flight frame of it is behind us
                 if (std::holds_alternative<AwaitingAck>(e->state) || std::holds_alternative<PauseOwed>(e->state))
@@ -160,6 +168,7 @@ public:
     [[nodiscard]] uint64_t    dropped() const noexcept { return dropped_; }
     [[nodiscard]] uint64_t    delivered() const noexcept { return delivered_; }
     [[nodiscard]] uint64_t    malformed() const noexcept { return malformed_; }
+    [[nodiscard]] uint64_t    sessionsGone() const noexcept { return sessionsGone_; }
 
 private:
     Entry* find_(int64_t session, int64_t subId) noexcept {
@@ -174,7 +183,7 @@ private:
 
     std::size_t        capacity_;
     std::vector<Entry> entries_;
-    uint64_t pauses_ = 0, resumes_ = 0, dropped_ = 0, delivered_ = 0, malformed_ = 0;
+    uint64_t pauses_ = 0, resumes_ = 0, dropped_ = 0, delivered_ = 0, malformed_ = 0, sessionsGone_ = 0;
 };
 
 } // namespace rune::node

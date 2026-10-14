@@ -68,6 +68,7 @@ enum : int32_t {
     // catalog-read flow control (CatalogReadFlow → CatalogReadServer).
     kMsgCatalogReadPaused = 18,   // [session:i64][subscriptionId:i64][baseOffset:i64][droppedMarker:u8]
     kMsgCatalogReadResume = 19,   // [session:i64][subscriptionId:i64]
+    kMsgCatalogSessionGone = 20,  // [session:i64] — fix round 3: a probe found the session gone
 };
 
 /// kMsgPlacementView: [placeable:i32][haltedCount:u16][halted ids: i32 * haltedCount].
@@ -730,6 +731,14 @@ struct CatalogReadResumeMsg { int64_t session = 0; int64_t subscriptionId = 0; }
 [[nodiscard]] inline bool decodeCatalogReadResume(const uint8_t* p, std::size_t n, CatalogReadResumeMsg& m) noexcept {
     if (n != 16) return false;
     m = CatalogReadResumeMsg{admin_wire::getI64(p), admin_wire::getI64(p + 8)};
+    return true;
+}
+
+[[nodiscard]] inline bool encodeCatalogSessionGone(OneToOneByteRing& ring, int64_t session) {
+    const auto idx = ring.tryClaim(kMsgCatalogSessionGone, 8);
+    if (idx < 0) return false;
+    admin_wire::putI64(ring.base() + idx, session);
+    ring.commit(idx);
     return true;
 }
 

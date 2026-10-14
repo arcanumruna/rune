@@ -858,3 +858,20 @@ TEST(CatalogGatewayRegression, BackPressuredCatalogFrameIsNotCapturedAsSent) {
     EXPECT_EQ(g.gw.tryOfferCatalogFrame(g.sid, frame, sizeof frame), ClientGateway::CatalogOffer::Sent);
     EXPECT_EQ(captured, 1u);
 }
+
+// Fix round 3 (F3b): more session closes than the gateway's fixed queue holds
+// while the admin ring is stalled — the queue never grows; the overflow is
+// counted and left to the admin's liveness sweep (which reclaims the slots —
+// CatalogReadServerRegression.ClosesBeyondTheGatewayQueueAreReclaimedByTheLivenessSweepRegression).
+TEST(CatalogGatewayRegression, SessionClosesBeyondTheQueueAreLeftToTheSweepNeverGrowingRegression) {
+    GatewayRig g;
+    g.admin.ringFull = true;
+    std::vector<int64_t> sids;
+    for (int i = 0; i < 1100; ++i) sids.push_back(g.gw.injectTestSession(0, pc::kClientVersion));
+    for (int64_t s : sids) g.gw.closeSessionForTest(s);
+    EXPECT_EQ(g.gw.pendingCatalogUnsubscribes(), 1024u) << "fixed capacity";
+    EXPECT_EQ(g.gw.catalogClosesLeftToTheSweep(), 1100u - 1024u);
+    g.admin.ringFull = false;
+    (void)g.gw.pumpCatalogUnsubscribesForTest();
+    EXPECT_EQ(g.admin.catalogUnsubs.size(), 1024u) << "every queued close is delivered";
+}

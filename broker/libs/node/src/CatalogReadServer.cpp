@@ -83,7 +83,7 @@ void CatalogReadServer::subscribe(int64_t session, int64_t corr, int64_t fromOff
     else if (fromOffset < 0)         next = hw;                       // latest (−1) / any other sentinel
     else                             next = std::min(fromOffset, hw); // never ahead of the committed prefix
     const int64_t id = kCatalogSubscriptionIdBase | idPrefix_ | ++nextId_;
-    Sub s{session, corr, id, Answering{next}};
+    Sub s{session, corr, id, Answering{next}, nowNs_ + kProbeIntervalNs};
     if (owed_.empty() && sendSubscribeResponse_(session, corr, kOk, id)) s.phase = Backlog{next};
     subs_.push_back(s);   // reserved: never allocates
     spdlog::debug("CatalogReadServer: catalog Subscribe session={} corr={} subId={:#x} from={} (HW {})", session,
@@ -325,6 +325,26 @@ CatalogReadServer::PushResult CatalogReadServer::pushRange_(Sub& s, int64_t& nex
     if (!any && atBound) return PushResult{Push::Idle};   // the next batch is not wholly committed yet
     if (!any) return PushResult{Push::Ended, kInternal, "a read below the HW yields no batch"};
     return PushResult{Push::Progress};
+}
+
+int CatalogReadServer::pump(int64_t nowNs) {
+    nowNs_ = nowNs;
+    int work = pump();
+    if (!subs_.empty() && owed_.empty()) work += probe_(nowNs);
+    return work;
+}
+
+// Fix round 3 (F3b): at most one probe per subscription per interval; a full
+// ring keeps it due (retried next pass).  No allocation.
+int CatalogReadServer::probe_(int64_t nowNs) {
+    int sent = 0;
+    for (Sub& s : subs_) {
+        if (nowNs < s.probeDueNs) continue;
+        if (!send_(CatalogReadFrameHead{s.session, s.subscriptionId, kProbeOffset}, {})) break;
+        s.probeDueNs = nowNs + kProbeIntervalNs;
+        ++sent;
+    }
+    return sent;
 }
 
 int CatalogReadServer::pump() {

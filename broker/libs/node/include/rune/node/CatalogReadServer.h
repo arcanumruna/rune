@@ -79,6 +79,9 @@ struct CatalogReadFrameHead {
     int64_t baseOffset     = -1;
 };
 inline constexpr std::size_t kCatalogReadHeadBytes = 24;
+/// An empty frame with this baseOffset is a session-liveness PROBE (fix round 3);
+/// an empty frame with baseOffset -1 is a pause ack.
+inline constexpr int64_t kProbeOffset = -2;
 /// The largest frame the server emits (SubscribeResponse / Records / ErrorResponse).
 inline constexpr std::size_t kCatalogReadMaxFrameBytes =
     static_cast<std::size_t>(kCatalogReadRingBytes) / 8 - kCatalogReadHeadBytes;
@@ -116,6 +119,7 @@ public:
         int64_t corr           = 0;   // the creating Subscribe's correlation id (every frame carries it)
         int64_t subscriptionId = 0;
         Phase   phase;
+        int64_t probeDueNs     = 0;   // fix round 3: when its session-liveness probe is next due
     };
 
     /// \param idPrefix the node's cluster id prefix ((nodeId + 1) << 40, as the
@@ -137,6 +141,15 @@ public:
     /// batches (at most half the read buffer per subscription per pass), then the
     /// marker for a Backlog subscription at the HW.  Returns frames sent + subs ended.
     int pump();
+    /// Fix round 3 (F3b): the same pass at `nowNs` — every subscription also
+    /// sends a session-liveness PROBE (an empty frame, baseOffset kProbeOffset)
+    /// every kProbeIntervalNs; the control thread answers onSessionGone for a
+    /// session that no longer exists.  So a session close the gateway could not
+    /// queue is never lost: its subscriptions are reclaimed within one interval.
+    int pump(int64_t nowNs);
+    static constexpr int64_t kProbeIntervalNs = 1'000'000'000;
+    /// control → admin: `session` is gone — every subscription of it ends (its close).
+    void onSessionGone(int64_t session) { unsubscribe(session, -1); }
     /// control → admin (fix round 0): the session's egress could not take this
     /// subscription's Records frame at `baseOffset` — rewind to it and pause
     /// (acknowledged on the egress ring).  An unknown subscription is acked too
@@ -194,6 +207,8 @@ private:
     bool sendError_(const OwedError& e);
     bool sendRecords_(const Sub& s, int64_t baseOffset, std::span<const uint8_t> batches);
     bool sendPauseAck_(int64_t session, int64_t subId);
+    int  probe_(int64_t nowNs);
+    int64_t nowNs_ = 0;
     bool sendReliable_(int64_t session, std::size_t n);
     void end_(std::size_t index, int16_t code, const char* why, int64_t at);
     void owe_(const OwedError& e);

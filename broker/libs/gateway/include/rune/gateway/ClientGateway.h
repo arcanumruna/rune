@@ -1021,6 +1021,7 @@ public:
     [[nodiscard]] uint64_t catalogSubscribesForwarded() const noexcept { return catalogSubscribesForwarded_; }
     [[nodiscard]] std::size_t pendingCatalogUnsubscribes() const noexcept { return pendingCatalogUnsubs_.size(); }
     [[nodiscard]] uint64_t catalogUnsubscribesDropped() const noexcept { return catalogUnsubsDropped_; }
+    [[nodiscard]] uint64_t catalogClosesLeftToTheSweep() const noexcept { return catalogClosesToSweep_; }
     /// Catalog history Task 12 (N5) — control thread: a view sink was applied here
     /// (kA2cCatalogSinkApplied); its plan is not on every worker yet.  Then: its
     /// plan reached every worker's install ring (or the view was dropped).
@@ -2025,6 +2026,7 @@ private:
         std::vector<PendingCatalogUnsubscribe> v; v.reserve(kPendingCatalogUnsubsCap); return v;
     }();
     uint64_t catalogUnsubsDropped_ = 0;
+    uint64_t catalogClosesToSweep_ = 0;   // fix round 3: closes left to the admin's liveness sweep
     uint64_t catalogSubscribesForwarded_ = 0;
     void forwardCatalogUnsubscribe_(int64_t sid, int64_t subscriptionId);
     int  flushPendingCatalogUnsubs_();

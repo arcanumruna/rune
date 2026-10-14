@@ -425,6 +425,12 @@ public:
                     spdlog::error("AdminWorkerAgent: malformed kMsgCatalogReadPaused (len={}) refused", n);
                 return;
             }
+            if (tid == kMsgCatalogSessionGone) {   // Task 12 fix round 3
+                if (n == 8) worker_.catalogSessionGone(admin_wire::getI64(p));
+                else if (badControlFrames_++ % 1024 == 0)
+                    spdlog::error("AdminWorkerAgent: malformed kMsgCatalogSessionGone (len={}) refused", n);
+                return;
+            }
             if (tid == kMsgCatalogReadResume) {
                 CatalogReadResumeMsg m;
                 if (decodeCatalogReadResume(p, n, m)) worker_.catalogReadResume(m);

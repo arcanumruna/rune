@@ -4861,8 +4861,13 @@ void ClientGateway::forwardCatalogUnsubscribe_(int64_t sid, int64_t subscription
         for (auto it = pendingCatalogUnsubs_.begin(); it != pendingCatalogUnsubs_.end(); ++it)
             if (it->subscriptionId != -1) { pendingCatalogUnsubs_.erase(it); ++catalogUnsubsDropped_; break; }
         if (pendingCatalogUnsubs_.size() >= kPendingCatalogUnsubsCap) {
-            spdlog::critical("ClientGateway: {} closed sessions wait for the admin ring (the cap) — session {}'s close "
-                             "not queued", pendingCatalogUnsubs_.size(), sid);
+            // Fix round 3 (F3b): never lost — the admin's session-liveness probe
+            // (every catalog subscription, each second) finds the session gone and
+            // reclaims its subscriptions.  Counted; no queue growth.
+            if (catalogClosesToSweep_++ % 1024 == 0)
+                spdlog::warn("ClientGateway: {} closed sessions wait for the admin ring (the cap) — session {}'s "
+                             "catalog subscriptions are reclaimed by the liveness sweep (so far: {})",
+                             pendingCatalogUnsubs_.size(), sid, catalogClosesToSweep_);
             return;
         }
     }

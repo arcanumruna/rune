@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <span>
 
 namespace {
 bool     gArmed       = false;   // single-threaded test binary: plain globals, no atomics
@@ -81,6 +82,7 @@ struct NotYetSink {
     Room  room(int64_t) { return Room::NotYet; }
     bool  postPaused(int64_t, int64_t, int64_t, bool) { return true; }
     bool  postResume(int64_t, int64_t) { return true; }
+    bool  postSessionGone(int64_t) { return true; }
 };
 }   // namespace
 TEST(CatalogAllocRegression, PausedCatalogReaderAllocatesNothingRegression) {
@@ -114,4 +116,25 @@ TEST(CatalogAllocRegression, PausedCatalogReaderAllocatesNothingRegression) {
     }
     gArmed = false;
     EXPECT_EQ(gArmedAllocs, 0u);
+}
+
+// Fix round 3 (F3b): the session-liveness probes (one per subscription per
+// second) allocate nothing on the admin thread.
+TEST(CatalogAllocRegression, LivenessProbesAllocateNothingRegression) {
+    rune::node::test::ReadRig r("rd_alloc_probe", false, 64);
+    r.commitEvents(2);
+    for (int64_t s = 1; s <= 32; ++s) r.server.subscribe(s, 1, -2);
+    r.server.pump(0);
+    uint64_t probes = 0;
+    r.onFrame = [&probes](const rune::node::CatalogReadFrameHead& h, std::span<const uint8_t> f) {
+        if (f.empty() && h.baseOffset == rune::node::kProbeOffset) ++probes;
+        return true;
+    };
+    gArmedAllocs = 0;
+    gArmed = true;
+    int64_t now = 0;
+    for (int i = 0; i < 1000; ++i) (void)r.server.pump(now += 10'000'000);   // 10 s of passes
+    gArmed = false;
+    EXPECT_EQ(gArmedAllocs, 0u);
+    EXPECT_GE(probes, 32u * 9u) << "non-vacuous: each subscription probed about every second";
 }

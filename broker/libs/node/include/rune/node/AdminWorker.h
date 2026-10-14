@@ -199,6 +199,9 @@ public:
     void catalogReadPaused(const CatalogReadPausedMsg& m) {
         if (readServer_) readServer_->onPaused(m.session, m.subscriptionId, m.baseOffset, m.droppedMarker);
     }
+    void catalogSessionGone(int64_t session) {
+        if (readServer_) readServer_->onSessionGone(session);
+    }
     void catalogReadResume(const CatalogReadResumeMsg& m) {
         if (readServer_) readServer_->onResume(m.session, m.subscriptionId);
     }

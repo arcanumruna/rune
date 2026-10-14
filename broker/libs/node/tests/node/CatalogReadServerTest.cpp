@@ -297,6 +297,7 @@ struct FlowHarness {
     struct Report { bool pause; int64_t session, subId, base; bool marker; };
     std::vector<Report>           ring;     // control → admin
     std::map<int64_t, std::vector<std::vector<uint8_t>>> delivered;   // session → client frames
+    int64_t nowNs = 0;   // the admin's clock (pass())
 
     using Offer = rune::node::CatalogReadFlow::Offer;
     using Room  = rune::node::CatalogReadFlow::Room;
@@ -323,6 +324,8 @@ struct FlowHarness {
         return true;
     }
     bool postResume(int64_t s, int64_t sub) { ring.push_back({false, s, sub, -1, false}); return true; }
+    std::vector<int64_t> gone;   // control → admin: sessions found gone (fix round 3)
+    bool postSessionGone(int64_t s) { gone.push_back(s); return true; }
 
     explicit FlowHarness(ReadRig& r) : rig(r) {
         rig.onFrame = [this](const rune::node::CatalogReadFrameHead& h, std::span<const uint8_t> f) {
@@ -339,11 +342,14 @@ struct FlowHarness {
     void pass() {
         std::vector<Report> r;
         r.swap(ring);
+        std::vector<int64_t> g;
+        g.swap(gone);
+        for (int64_t s : g) rig.server.onSessionGone(s);
         for (const Report& x : r) {
             if (x.pause) rig.server.onPaused(x.session, x.subId, x.base, x.marker);
             else         rig.server.onResume(x.session, x.subId);
         }
-        rig.server.pump();
+        rig.server.pump(nowNs);
         flow.service(*this);
         for (auto& [id, s] : sessions) s.inFlight -= std::min(s.inFlight, s.drainPerPass);
     }
@@ -752,4 +758,39 @@ TEST(CatalogReadServerRegression, TruncateAndRegrowWithinOnePassStillEndsTheRead
     EXPECT_EQ(r.server.servedHighWatermark(), 3) << "restarted at the cut (the new committed HW is not above it yet)";
     for (int i = 0; i < 5; ++i) r.server.pump();
     EXPECT_EQ(r.server.truncationEnds(), 1u) << "once";
+}
+
+// Fix round 3 (F3b): more closes than the gateway can queue (> 1024) while the
+// admin's request ring is stalled — those closes never reach the read server.
+// Every slot is still reclaimed: each subscription's liveness probe finds its
+// session gone (the control thread's session table) within one interval.  No
+// allocation in the probe path.  RED: the closed sessions' subscriptions held
+// their slots forever (subscriptions() stayed 1100; new Subscribes refused).
+TEST(CatalogReadServerRegression, ClosesBeyondTheGatewayQueueAreReclaimedByTheLivenessSweepRegression) {
+    ReadRig r("rd_f3b", false, /*maxSubs=*/1200);
+    r.commitEvents(1);
+    FlowHarness h(r);
+    constexpr int64_t kSessions = 1100;
+    for (int64_t s = 1; s <= kSessions; ++s) {
+        h.sessions[s] = {1 << 20, 0, 1 << 20};
+        r.server.subscribe(s, 1, -2);
+    }
+    h.sessions[5000] = {1 << 20, 0, 1 << 20};          // one session stays
+    r.server.subscribe(5000, 1, -2);
+    for (int i = 0; i < 5; ++i) h.pass();
+    ASSERT_EQ(r.server.subscriptions(), static_cast<std::size_t>(kSessions + 1));
+    // Every one of the 1100 sessions closes; none of the closes reaches the admin.
+    for (int64_t s = 1; s <= kSessions; ++s) h.sessions.erase(s);
+    for (int i = 0; i < 5; ++i) h.pass();
+    EXPECT_EQ(r.server.subscriptions(), static_cast<std::size_t>(kSessions + 1)) << "before the probe interval";
+    h.nowNs += rune::node::CatalogReadServer::kProbeIntervalNs + 1;
+    for (int i = 0; i < 5; ++i) h.pass();
+    EXPECT_EQ(r.server.subscriptions(), 1u) << "every closed session's slot reclaimed";
+    EXPECT_EQ(h.flow.sessionsGone(), static_cast<uint64_t>(kSessions));
+    EXPECT_EQ(h.seen(5000).second, (std::vector<int64_t>{1})) << "the live session keeps its read";
+    h.sessions[9000] = {1 << 20, 0, 1 << 20};
+    r.server.subscribe(9000, 1, -2);
+    h.pass();
+    EXPECT_EQ(r.server.subscriptions(), 2u) << "slots are free again";
+    EXPECT_EQ(r.server.refusedSubscribes(), 0u);
 }
