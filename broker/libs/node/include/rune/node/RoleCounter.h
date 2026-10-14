@@ -132,7 +132,8 @@ inline constexpr std::int32_t kCatalogUnplaceableTopicsCounterTypeId = 1'000'219
 inline std::string catalogUnplaceableTopicsLabel(std::int32_t nodeId) {
     return "rune-catalog-unplaceable-topics node=" + std::to_string(nodeId);
 }
-/// Task 11 fix round 5 (M5): partitions this controller derives BLOCKED.
+/// Task 11 fix round 5 (M5): partitions derived BLOCKED — by the ready controller
+/// only (other members publish 0; fix round 6), so the cluster sum is the count.
 inline constexpr std::int32_t kCatalogBlockedPartitionsCounterTypeId = 1'000'220;
 inline std::string catalogBlockedPartitionsLabel(std::int32_t nodeId) {
     return "rune-catalog-blocked-partitions node=" + std::to_string(nodeId);

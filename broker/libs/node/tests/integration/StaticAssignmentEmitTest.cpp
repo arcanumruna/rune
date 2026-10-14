@@ -3237,7 +3237,8 @@ TEST(CatalogUnservableRegression, StaleProcessAndNonReplicaReportsAreIgnoredRegr
     (void)c.svc->onAlterIsr(unservable(5, 0, outsider));
     EXPECT_FALSE(c.svc->reportedUnservable(5, 0, outsider)) << "not a replica: ignored";
     const int32_t r = pa->replicas[0];
-    (void)c.svc->onAlterIsr(nodeControl(r, 41, false));            // r's live process is 41
+    (void)c.svc->onAlterIsr(nodeControl(r, 40, false));            // r's process 40 ...
+    (void)c.svc->onAlterIsr(nodeControl(r, 41, false));            // ... superseded by 41
     auto stale = unservable(5, 0, r);
     stale.isr[3] = 40;                                              // an older process
     (void)c.svc->onAlterIsr(stale);
@@ -3246,4 +3247,30 @@ TEST(CatalogUnservableRegression, StaleProcessAndNonReplicaReportsAreIgnoredRegr
     live.isr[3] = 41;
     (void)c.svc->onAlterIsr(live);
     EXPECT_TRUE(c.svc->reportedUnservable(5, 0, r));
+}
+
+// Fix round 6 (r5 check, blocking): a RESTARTED broker's first report comes from
+// its NEW process — possibly before its node-control register.  It is kept and
+// excludes the broker; only a superseded (older) process's report is dropped.
+// RED (round 5's `nonce != inc`): the new process's report was dropped and the
+// restarted, unservable broker was electable again (I1 re-opened).
+TEST(CatalogUnservableRegression, ARestartedBrokersFirstReportFromItsNewProcessIsKeptRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;
+    (void)c.svc->onAlterIsr(nodeControl(L, 41, false));   // L's process 41 is known
+    auto fresh = unservable(0, 0, L);
+    fresh.isr[3] = 42;                                     // its restart: process 42, not registered yet
+    (void)c.svc->onAlterIsr(fresh);
+    EXPECT_TRUE(c.svc->reportedUnservable(0, 0, L)) << "the newer process's report is kept";
+    c.tick();
+    EXPECT_NE(c.pa().leaderNode, L) << "and excludes it from the election";
+    // Once process 42 registers, 41 is superseded: a late 41 report is dropped.
+    (void)c.svc->onAlterIsr(nodeControl(L, 42, false));
+    c.clock += MetadataService::kUnservableReportTtlNs + 1'000'000;
+    c.drive(2);
+    ASSERT_FALSE(c.svc->reportedUnservable(0, 0, L)) << "expired";
+    auto old = unservable(0, 0, L);
+    old.isr[3] = 41;
+    (void)c.svc->onAlterIsr(old);
+    EXPECT_FALSE(c.svc->reportedUnservable(0, 0, L)) << "a superseded process's late report";
 }

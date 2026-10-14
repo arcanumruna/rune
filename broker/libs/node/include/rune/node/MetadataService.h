@@ -2532,11 +2532,13 @@ private:
 
     void noteUnservable_(const rune::replication::AlterIsrMsg& m) {
         const int64_t now = lastNowNs_;
-        // Review M4 (round 5): a late report of an OLDER process of the node is
-        // dropped; a report about a partition it is not a replica of is ignored.
+        // Review M4 (round 5) / fix round 6: a late report of an OLDER (superseded)
+        // process of the node is dropped — never one of a NEWER process (a restarted
+        // broker's first report can arrive before its node-control register);
+        // a report about a partition it is not a replica of is ignored.
         const int64_t inc = incarnationOf_(m);
         if (const auto it = nodeLifecycle_.find(m.leaderId);
-            inc != 0 && it != nodeLifecycle_.end() && it->second.nonce != 0 && it->second.nonce != inc)
+            inc != 0 && it != nodeLifecycle_.end() && it->second.isSuperseded(inc))
             return;
         if (const auto* pa = msm_.assignment(m.topicId, m.partition);
             pa != nullptr && std::find(pa->replicas.begin(), pa->replicas.end(), m.leaderId) == pa->replicas.end())
@@ -2568,6 +2570,12 @@ private:
             return true;
         });
         blockedScratch_.clear();
+        // Fix round 6 (r5 m2): every member HOLDS the reports (I1), but only the
+        // ready controller derives, logs and gauges BLOCKED — never one count per member.
+        if (!controllerReady_()) {
+            blocked_.clear();
+            return;
+        }
         for (const auto& u : unservable_) {
             const rune::metadata::PartitionAssignment* pa = msm_.assignment(u.topicId, u.partition);
             if (pa == nullptr) continue;
@@ -2585,7 +2593,7 @@ private:
             if (std::find(blocked_.begin(), blocked_.end(), k) == blocked_.end())
                 spdlog::error("MetadataService[{}]: ({}, {}) is BLOCKED — no live in-sync replica can serve it (every "
                               "one reports it cannot); it is never led by a replica without its data and recovers "
-                              "when one serves again (rune-catalog-unplaceable-topics)", selfId_, k >> 32,
+                              "when one serves again (rune-catalog-blocked-partitions)", selfId_, k >> 32,
                               static_cast<uint32_t>(k));
         for (int64_t k : blocked_)
             if (std::find(blockedScratch_.begin(), blockedScratch_.end(), k) == blockedScratch_.end())
