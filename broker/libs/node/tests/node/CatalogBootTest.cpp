@@ -262,7 +262,8 @@ public:
             const int64_t corr = client_->sendGetViewRow(gw(), stream(), sid_, *id, 7);
             if (corr == 0) return false;
             const auto st = client_->awaitViewRow(corr, Clock::now() + 5s);
-            return st && *st != pc::ViewRowResponse::kNotReady && *st != pc::ViewRowResponse::kBusy;
+            // kOk / kAbsentKey = the view's plan is installed and its sink serves; kUnknownView = it was never installed.
+            return st && (*st == pc::ViewRowResponse::kOk || *st == pc::ViewRowResponse::kAbsentKey);
         }, timeout);
     }
     int catalogHaltedCounter() {   // 1 iff the applier is halted (the metric's value)

@@ -1049,13 +1049,18 @@ TEST(CatalogApplierRegression, PostBootStashPostsOnlyWhatNeedsARunningBrokerRegr
     EXPECT_EQ(rig.rec.appliedDigests, (std::vector<uint64_t>{digest}));
     EXPECT_TRUE(rig.rec.halts.empty());
     EXPECT_FALSE(rig.rec.bootViewInstalls.empty()) << "every live view reinstalls through the BOOT sink";
-    std::size_t sinkPosts = 0;
+    std::size_t sinkPosts = 0, validatorPosts = 0;
     for (const std::string& s : rig.rec.sequence) {
+        validatorPosts += s.rfind("schemaChanged:", 0) == 0 ? 1 : 0;
         EXPECT_NE(s.rfind("topicApplied:", 0), 0u) << s << ": topics are the startup phase's";
         EXPECT_NE(s.rfind("topicDropped:", 0), 0u) << s << ": a dropped object posts nothing";
         sinkPosts += s.rfind("sinkApplied:", 0) == 0 ? 1 : 0;
     }
     EXPECT_EQ(sinkPosts, boot.state().views().size());
+    std::size_t typed = 0;
+    for (const auto* t : boot.state().topics()) typed += t->schema ? 1 : 0;
+    ASSERT_GT(typed, 0u) << "the golden catalog holds typed topics";
+    EXPECT_EQ(validatorPosts, typed) << "one validator push per typed topic (its current schema version)";
 }
 
 TEST(CatalogApplierRegression, PostBootStashDeliversTheHaltOfAHaltedBootRegression) {
