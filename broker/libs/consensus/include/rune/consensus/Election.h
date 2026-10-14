@@ -45,6 +45,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <random>
+#include <variant>
 #include <vector>
 
 namespace rune::consensus {
@@ -249,11 +250,15 @@ public:
     /// canvass (Aeron gracefulClosedLeaderId).  Ignored unless it comes from
     /// the leader this CLOSED follower follows, for its current term.
     void onStandDown(int64_t nowNs, Term leadershipTermId, NodeId leaderMemberId);
-    [[nodiscard]] bool resigned() const noexcept { return resigned_; }
+    [[nodiscard]] bool resigned() const noexcept { return std::holds_alternative<Resigned>(candidacy_); }
+    /// "Candidate" | "StoodDown" | "Resigned" (tests, logs).
+    [[nodiscard]] const char* candidacyName() const noexcept {
+        switch (candidacy_.index()) { case 0: return "Candidate"; case 1: return "StoodDown"; default: return "Resigned"; }
+    }
     /// Controlled shutdown, any role: never stand for election again in this
     /// process (it still votes).  A current leader keeps leading until
     /// resign().  Duty-cycle thread.
-    void withdrawCandidacy() noexcept { resigned_ = true; }
+    void withdrawCandidacy() noexcept;
 
     /// Review 2026-10-04 MAJOR-2/3 — candidacy rule.  `fn(ctx, candidate)`
     /// decides whether this node may VOTE for `candidate`.  The broker wires it
@@ -540,13 +545,20 @@ private:
     /// Controlled shutdown: this node resigned its leadership (resign()) — it
     /// never nominates itself again; while canvassing it re-sends StandDown
     /// for the term it resigned (loss recovery on the status interval).
-    bool resigned_       = false;
-    Term resignedTermId_ = -1;
-    /// standDown(): no candidacy before this time (-1 = no hold); the term it
-    /// stood down from (re-sent StandDown while held).
-    int64_t  standDownHoldUntilNs_ = -1;
-    Term     standDownTermId_      = -1;
-    uint64_t standDowns_           = 0;
+    // Candidacy (hard rule 3 — one variant, each state its own variables;
+    // catalog history Task 11 fix round 1):
+    //   Candidate — stands for election normally.
+    //   StoodDown — standDown(): no candidacy before `untilNs`; re-sends
+    //               StandDown for `term` meanwhile; then a Candidate again.
+    //   Resigned  — resign() / withdrawCandidacy(): never stands again in this
+    //               process; re-sends StandDown for `term` (-1 = none to send).
+    struct Candidate {};
+    struct StoodDown { int64_t untilNs = 0; Term term = -1; };
+    struct Resigned  { Term term = -1; };
+    std::variant<Candidate, StoodDown, Resigned> candidacy_{Candidate{}};
+    uint64_t standDowns_ = 0;
+    /// Canvass: true = this node must not stand (re-sends its StandDown).
+    bool candidacyBlocks_(int64_t nowNs, int workCount);
     /// Entry time of this node's current leadership (LeaderLogReplication);
     /// INT64_MIN = never led.  The failover-liveness grace (eligibleNodeIds).
     int64_t leaderSinceNs_ = INT64_MIN;

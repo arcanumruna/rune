@@ -401,6 +401,13 @@ public:
                                                  aeron::util::index_t len) {
             const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
             const auto  n = static_cast<std::size_t>(len);
+            if (tid == kMsgPlacementView) {   // Task 11 fix round 1 (I2)
+                PlacementViewMsg v;
+                if (decodePlacementView(p, n, v)) worker_.onPlacementView(v);
+                else if (badControlFrames_++ % 1024 == 0)
+                    spdlog::error("AdminWorkerAgent: malformed kMsgPlacementView (len={}) refused", n);
+                return;
+            }
             if (tid == kMsgPurgeDroppedDir) {
                 onPurgeDroppedDir_(std::string_view(reinterpret_cast<const char*>(p), n));
                 return;
@@ -1822,10 +1829,20 @@ private:
     // Catalog history Task 11: the DDL route last published to the gateway, as
     // its key (CatalogRoute index + the leader id / halt offset) — the endpoint
     // string is built only on a change (an idle control pass allocates nothing).
-    struct PublishedCatalogRoute { int kind = -1; int64_t key = 0; };
+    struct PublishedCatalogRoute { std::optional<rune::gateway::RouteKind> kind; int64_t key = 0; };
     PublishedCatalogRoute                                 catalogRoutePublished_;
     /// Control thread: recompute the DDL route; publish it on change.
     int publishCatalogRoute_(bool consensusLeader);
+    /// Control thread (Task 11 fix round 1, I2): post the placement view to the
+    /// admin thread (kMsgPlacementView) on change only; and the unplaceable-topics gauge.
+    int publishPlacementView_();
+    /// When resignIfHalted_ first saw this broker leading while halted (-1 = not yet; control thread).
+    int64_t          haltedSinceNs_ = -1;
+    PlacementViewMsg placementPosted_{};
+    bool             placementPostedOnce_ = false;
+    std::int64_t     unplaceableCounterRegId_ = -1;
+    std::shared_ptr<aeron::Counter> unplaceableCounter_;
+    std::int64_t     unplaceablePublished_ = -1;
     /// Control thread: a halted broker never drives catalog placement — it
     /// reports its halt to every member (never a placement target) and, while it
     /// leads the consensus, stands down to a live healthy peer when one exists

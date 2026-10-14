@@ -359,23 +359,7 @@ int Election::canvass(int64_t nowNs)
     // others can elect without it.  A resigned leader re-sends its StandDown
     // on the status interval (a lost one would leave a follower waiting for
     // the heartbeat timeout) and waits to follow the successor.
-    if (resigned_) {
-        if (workCount > 0 && resignedTermId_ >= 0)
-            for (const ClusterMember& m : clusterMembers_)
-                if (m.id != thisMemberId_) publisher_.standDown(m.id, resignedTermId_, thisMemberId_);
-        return workCount;
-    }
-    // Task 11 fix round 0: a stood-down leader holds its candidacy (bounded).
-    if (standDownHoldUntilNs_ >= 0) {
-        if (nowNs < standDownHoldUntilNs_) {
-            if (workCount > 0 && standDownTermId_ >= 0)
-                for (const ClusterMember& m : clusterMembers_)
-                    if (m.id != thisMemberId_) publisher_.standDown(m.id, standDownTermId_, thisMemberId_);
-            return workCount;
-        }
-        standDownHoldUntilNs_ = -1;   // the hold ended: a candidate again
-        standDownTermId_      = -1;
-    }
+    if (candidacyBlocks_(nowNs, workCount)) return workCount;
 
     ClusterMember* thisM = memberById(thisMemberId_);
     if (thisM != nullptr) {
@@ -1201,10 +1185,9 @@ bool Election::resign(int64_t nowNs)
     if (state_ != ElectionState::Closed || leaderMember_ == nullptr ||
         leaderMember_->id != thisMemberId_ || clusterMembers_.size() <= 1)
         return false;
-    resigned_       = true;
-    resignedTermId_ = leadershipTermId_;
+    candidacy_ = Resigned{leadershipTermId_};
     for (const ClusterMember& m : clusterMembers_)
-        if (m.id != thisMemberId_) publisher_.standDown(m.id, resignedTermId_, thisMemberId_);
+        if (m.id != thisMemberId_) publisher_.standDown(m.id, leadershipTermId_, thisMemberId_);
     followerLiveness_.reset();
     // Canvass entry resets the members and drops leaderMember_ (no heartbeat,
     // no leader reported) — the node now only votes and follows.
@@ -1218,15 +1201,45 @@ bool Election::standDown(int64_t nowNs, int64_t holdNs)
     if (state_ != ElectionState::Closed || leaderMember_ == nullptr ||
         leaderMember_->id != thisMemberId_ || clusterMembers_.size() <= 1)
         return false;
-    standDownTermId_      = leadershipTermId_;
-    standDownHoldUntilNs_ = nowNs + std::max<int64_t>(holdNs, 0);
+    // A withdrawn node never takes a (bounded) hold that would mask it: it
+    // resigns instead (controlled shutdown owns that path).
+    if (std::holds_alternative<Resigned>(candidacy_)) return false;
+    candidacy_ = StoodDown{nowNs + std::max<int64_t>(holdNs, 0), leadershipTermId_};
     ++standDowns_;
     for (const ClusterMember& m : clusterMembers_)
-        if (m.id != thisMemberId_) publisher_.standDown(m.id, standDownTermId_, thisMemberId_);
+        if (m.id != thisMemberId_) publisher_.standDown(m.id, leadershipTermId_, thisMemberId_);
     followerLiveness_.reset();
     state(ElectionState::Canvass, nowNs, "leader stood down (a healthier member should lead)");
     timeOfLastUpdateNs_ = nowNs;
     return true;
+}
+
+void Election::withdrawCandidacy() noexcept
+{
+    // Any state → Resigned; a pending stand-down's StandDown keeps being re-sent.
+    if (const auto* sd = std::get_if<StoodDown>(&candidacy_)) { candidacy_ = Resigned{sd->term}; return; }
+    if (!std::holds_alternative<Resigned>(candidacy_)) candidacy_ = Resigned{-1};
+}
+
+bool Election::candidacyBlocks_(int64_t nowNs, int workCount)
+{
+    auto resend = [&](Term term) {
+        if (workCount > 0 && term >= 0)
+            for (const ClusterMember& m : clusterMembers_)
+                if (m.id != thisMemberId_) publisher_.standDown(m.id, term, thisMemberId_);
+    };
+    if (const auto* r = std::get_if<Resigned>(&candidacy_)) {
+        resend(r->term);
+        return true;
+    }
+    if (const auto* sd = std::get_if<StoodDown>(&candidacy_)) {
+        if (nowNs < sd->untilNs) {
+            resend(sd->term);
+            return true;
+        }
+        candidacy_ = Candidate{};   // the hold ended: a candidate again
+    }
+    return false;
 }
 
 void Election::onStandDown(int64_t nowNs, Term leadershipTermIdArg, NodeId leaderMemberIdArg)

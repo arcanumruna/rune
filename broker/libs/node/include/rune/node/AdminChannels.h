@@ -59,7 +59,24 @@ enum : int32_t {
     // (dataDir/dropped/<id>.<name>) to remove (cold; std::filesystem::remove_all on
     // the admin thread; a failure is logged and the dir stays for the boot purge).
     kMsgPurgeDroppedDir   = 16,
+    // Catalog history Task 11 fix round 1 (I2), control → admin on
+    // controlToAdminRing: the PLACEMENT VIEW (PlacementViewMsg) — how many
+    // brokers a new partition may be placed on and which are catalog-halted.
+    // Posted on change only; the leader's dry-run refuses rf above it.
+    kMsgPlacementView     = 17,
 };
+
+/// kMsgPlacementView: [placeable:i32][haltedCount:u16][halted ids: i32 * haltedCount].
+struct PlacementViewMsg {
+    static constexpr std::size_t kMaxHalted = 64;
+    int32_t                            placeable   = 0;
+    uint16_t                           haltedCount = 0;
+    std::array<int32_t, kMaxHalted>    halted{};
+    bool operator==(const PlacementViewMsg&) const = default;
+};
+[[nodiscard]] inline std::size_t placementViewWireLen(const PlacementViewMsg& m) noexcept {
+    return 4u + 2u + 4u * static_cast<std::size_t>(m.haltedCount);
+}
 // Catalog history Task 9 — gateway → admin, on the AdminRequestRing (ring-scoped
 // ids: 10 is kMsgCatalogAlterIsrResponse on the ROLE ring, a different ring).
 enum : int32_t {
@@ -1053,6 +1070,23 @@ inline void writeCatalogTopicConfigEntry(uint8_t* p, std::size_t i, uint8_t key,
         m.entries[i] = CatalogConfigEntry{e[0], admin_wire::getI64(e + 1)};
     }
     return m.topicId >= 0;
+}
+
+/// Writes `m` into `p` (placementViewWireLen(m) bytes).  No allocation.
+inline void writePlacementView(uint8_t* p, const PlacementViewMsg& m) noexcept {
+    admin_wire::putI32(p, m.placeable);
+    p[4] = static_cast<uint8_t>(m.haltedCount & 0xff);
+    p[5] = static_cast<uint8_t>(m.haltedCount >> 8);
+    for (uint16_t i = 0; i < m.haltedCount; ++i) admin_wire::putI32(p + 6 + 4 * i, m.halted[i]);
+}
+/// False on a malformed frame (short, a count above kMaxHalted, a trailing byte, placeable < 0).
+[[nodiscard]] inline bool decodePlacementView(const uint8_t* buf, std::size_t len, PlacementViewMsg& m) noexcept {
+    if (len < 6) return false;
+    m.placeable   = admin_wire::getI32(buf);
+    m.haltedCount = static_cast<uint16_t>(buf[4] | (buf[5] << 8));
+    if (m.placeable < 0 || m.haltedCount > PlacementViewMsg::kMaxHalted || len != placementViewWireLen(m)) return false;
+    for (uint16_t i = 0; i < m.haltedCount; ++i) m.halted[i] = admin_wire::getI32(buf + 6 + 4 * i);
+    return true;
 }
 
 inline constexpr std::size_t kViewUninstallWireLen = 4;

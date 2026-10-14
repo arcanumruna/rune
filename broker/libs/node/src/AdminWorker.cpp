@@ -625,8 +625,15 @@ bool AdminWorker::advance_(int64_t nowNs) {
     }
     if (applier_.halted()) {   // halted at or before the event: it will never be applied here
         DdlRequest req = std::move(a->req);
+        const int64_t offset = a->offset;
         inFlight_ = Idle{};
-        answer_(req, kInternal, "catalog apply halted");
+        // Review M4: the event may well have committed (and applied on every
+        // other broker) — say so, and how to learn its result.
+        answer_(req, kInternal, "catalog apply halted on this broker at offset " +
+                                    std::to_string(applier_.haltError() ? applier_.haltError()->offset : -1) +
+                                    "; the DDL's event (offset " + std::to_string(offset) +
+                                    ") may have committed — retry with the same requestId on another broker for "
+                                    "its result");
         return true;
     }
     if (nowNs - a->startedNs > kDdlTimeoutNs) {
@@ -872,6 +879,18 @@ AdminWorker::Built AdminWorker::buildDefine_(const DefineTopicMsg& m, const cat:
     if (rf > deps_.brokerCount)
         return Rejected(reject(kInvalidRequest, "replicationFactor " + std::to_string(rf) + " > broker count " +
                                                     std::to_string(deps_.brokerCount)));
+    // Task 11 fix round 1 (I2): leader-only validation (not a replayed library
+    // rule): never commit a topic its controller cannot place — a catalog-halted
+    // broker is never a placement target.
+    if (const int32_t placeable = placeableBrokers(); rf > placeable) {
+        std::string halted;
+        for (uint16_t i = 0; i < placement_.haltedCount; ++i)
+            halted += (halted.empty() ? "" : ", ") + std::string("broker ") + std::to_string(placement_.halted[i]);
+        return Rejected(reject(kInvalidRequest, "replicationFactor " + std::to_string(rf) + " > placeable brokers " +
+                                                    std::to_string(placeable) +
+                                                    (halted.empty() ? std::string{}
+                                                                    : " (" + halted + ": catalog apply halted)")));
+    }
     if (rf > 0 && rf < deps_.topicMinIsr)
         return Rejected(reject(kInvalidRequest, "replicationFactor " + std::to_string(rf) + " < minIsr " +
                                                     std::to_string(deps_.topicMinIsr)));

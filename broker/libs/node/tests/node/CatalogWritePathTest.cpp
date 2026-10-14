@@ -467,3 +467,88 @@ TEST(CatalogWritePathRegression, RetryAfterALeaderChangeGetsTheOriginalResultReg
     EXPECT_EQ(rig.define({.name = "u", .partitions = 1, .requestId = rid}).code, 39);
     EXPECT_EQ(rig.countEventsWithRequestId(rid), 1u);
 }
+
+// ===========================================================================
+// Task 11 fix round 1 (I2): never commit a topic its controller cannot place.
+// ===========================================================================
+
+// RED: rf 3 with one catalog-halted broker committed, then stranded unplaceable
+// (the client saw Internal "in doubt" after 5 s, and the name was taken).
+TEST(CatalogWritePathRegression, ReplicationFactorAbovePlaceableBrokersIsInvalidRequestRegression) {
+    CatalogDdlRig rig("wp_placeable", 3);
+    rig.becomeServingLeader();
+    EXPECT_EQ(rig.admin().placeableBrokers(), 3) << "every broker until the first view";
+    rune::node::PlacementViewMsg v;
+    v.placeable = 2; v.haltedCount = 1; v.halted[0] = 3;
+    rig.admin().onPlacementView(v);
+    const auto refused = rig.define({.name = "t", .partitions = 1, .rf = 3});
+    EXPECT_EQ(refused.code, 39);
+    EXPECT_EQ(refused.detail, "replicationFactor 3 > placeable brokers 2 (broker 3: catalog apply halted)");
+    EXPECT_TRUE(rig.recordedLog().empty()) << "nothing appended";
+    EXPECT_EQ(rig.define({.name = "t", .partitions = 1, .rf = 2}).code, 0) << "rf within the placeable brokers";
+    EXPECT_EQ(rig.define({.name = "u", .partitions = 1}).code, 0) << "rf 0 = every placeable broker";
+    v.placeable = 3; v.haltedCount = 0;
+    rig.admin().onPlacementView(v);                        // broker 3 restarted healthy
+    EXPECT_EQ(rig.define({.name = "w", .partitions = 1, .rf = 3}).code, 0);
+}
+
+TEST(CatalogWritePathRegression, PlacementViewFrameRoundTripsAndRefusesMalformedFrames) {
+    rune::node::PlacementViewMsg v;
+    v.placeable = 4; v.haltedCount = 2; v.halted[0] = 5; v.halted[1] = 9;
+    std::vector<uint8_t> b(rune::node::placementViewWireLen(v));
+    rune::node::writePlacementView(b.data(), v);
+    rune::node::PlacementViewMsg d;
+    ASSERT_TRUE(rune::node::decodePlacementView(b.data(), b.size(), d));
+    EXPECT_EQ(d, v);
+    EXPECT_FALSE(rune::node::decodePlacementView(b.data(), b.size() - 1, d)) << "short";
+    b.push_back(0);
+    EXPECT_FALSE(rune::node::decodePlacementView(b.data(), b.size(), d)) << "trailing byte";
+    std::vector<uint8_t> big(6, 0);
+    big[4] = 0xFF; big[5] = 0xFF;
+    EXPECT_FALSE(rune::node::decodePlacementView(big.data(), big.size(), d)) << "count above the cap";
+}
+
+// The post-commit race (a broker halts between the commit and the placement):
+// the gate's in-doubt answer is EXPLICIT — a DdlResponse carries the reason in
+// its detail; a v8 DefineTopic gets an ErrorResponse{Internal, reason}; a pre-v8
+// one its own type (no detail field).  RED: a bare Internal with no detail.
+TEST(CatalogWritePathRegression, InDoubtAnswerNamesWhyTheCommittedTopicDoesNotServeRegression) {
+    namespace pc = rune::protocol::client;
+    using Gate = rune::node::DdlAnswerGate;
+    const std::string why = "the DDL committed but topic id=5 does not serve after 5000 ms — UNPLACEABLE: rf";
+    uint8_t out[Gate::kInDoubtMaxBytes];
+    pc::DdlResponse ok;
+    ok.sessionId = 7; ok.correlationId = 9; ok.gateTopicId = 5;
+    std::vector<uint8_t> f(ok.encodedSize());
+    ok.encode(f.data());
+    std::size_t n = Gate::encodeInDoubt(f.data(), f.size(), out, why, true);
+    const auto d = pc::DdlResponse::decode(out, n);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->errorCode, static_cast<uint16_t>(pc::ErrorCode::Internal));
+    EXPECT_EQ(d->detail, why);
+    pc::DefineTopicResponse def;
+    def.sessionId = 7; def.correlationId = 10; def.topicId = 5;
+    std::vector<uint8_t> g(pc::MessageHeader::ENCODED_SIZE + pc::DefineTopicResponse::BODY_FIXED);
+    def.encode(g.data());
+    n = Gate::encodeInDoubt(g.data(), g.size(), out, why, /*asErrorResponse=*/true);
+    const auto e = pc::ErrorResponse::decode(out, n);
+    ASSERT_TRUE(e.has_value()) << "a v8 session gets the reason";
+    EXPECT_EQ(e->code, static_cast<int16_t>(pc::ErrorCode::Internal));
+    EXPECT_EQ(e->correlationId, 10);
+    EXPECT_EQ(e->message, why);
+    n = Gate::encodeInDoubt(g.data(), g.size(), out, why, /*asErrorResponse=*/false);
+    const auto own = pc::DefineTopicResponse::decode(out, n);
+    ASSERT_TRUE(own.has_value()) << "a pre-v8 session gets its own type";
+    EXPECT_EQ(own->errorCode, static_cast<uint16_t>(pc::ErrorCode::Internal));
+    // release() asks for the explanation and sends it.
+    Gate gate(1 << 16, /*maxHoldNs=*/10);
+    auto never = [](int32_t) { return false; };
+    ASSERT_EQ(gate.offer(7, f.data(), f.size(), 0, never), Gate::Offer::Held);
+    std::vector<uint8_t> sent;
+    EXPECT_EQ(gate.release(100, never, [&](int64_t, const uint8_t* p, std::size_t m) { sent.assign(p, p + m); },
+                           [](int64_t, int32_t) {},
+                           [&](int64_t, int32_t) { return Gate::Explanation{why, true}; }), 1);
+    const auto r = pc::DdlResponse::decode(sent.data(), sent.size());
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->detail, why);
+}

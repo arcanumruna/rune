@@ -3611,3 +3611,82 @@ TEST(ElectionLog, D29bRegression_SplitVotesStayRareUnderJitterRegression) {
     EXPECT_LE(lost, 20) << "split real ballots: " << lost << " of " << total << " hand-offs lost a round";
     EXPECT_LE(worst, 600) << "worst hand-off " << worst << " ms";
 }
+
+// ===========================================================================
+// Catalog history Task 11 fix round 1 (I3): candidacy is ONE variant —
+// Candidate | StoodDown{untilNs, term} | Resigned{term}.
+// ===========================================================================
+namespace {
+/// Canvass for `n` election timeouts; true = the node never stood (no RequestVote).
+bool neverStands(Election& e, StandDownRecorder& pub, int64_t& nowNs, Term term, int n) {
+    pub.clear();
+    for (int i = 0; i < n; ++i) {
+        e.onCanvassPosition(0, 0, term, 1);
+        e.onCanvassPosition(0, 0, term, 2);
+        nowNs += kElectionTimeoutNs;
+        e.doWork(nowNs);
+    }
+    return pub.requestVotes == 0;
+}
+} // namespace
+
+// A stood-down leader holds its candidacy only for the hold, then stands again.
+TEST(ElectionCandidacyRegression, StandDownHoldsThenTheNodeIsACandidateAgainRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    StandDownRecorder pub;
+    auto e = makeSdElection(0, pub, nsf, tl, /*seed=*/0);
+    int64_t nowNs = 1'000'000LL;
+    bringToLeaderLogReplication(e, nowNs);
+    ASSERT_TRUE(driveSdLeaderToClosed(e, nowNs));
+    const Term term = e.leadershipTermId();
+    ASSERT_TRUE(e.standDown(nowNs, /*holdNs=*/3 * kElectionTimeoutNs));
+    EXPECT_STREQ(e.candidacyName(), "StoodDown");
+    EXPECT_FALSE(e.resigned());
+    EXPECT_EQ(pub.standDowns.size(), 2u);
+    EXPECT_TRUE(neverStands(e, pub, nowNs, term, 2)) << "stood for election during its hold";
+    nowNs += 3 * kElectionTimeoutNs;
+    e.doWork(nowNs);
+    EXPECT_STREQ(e.candidacyName(), "Candidate") << "the hold always ends";
+    EXPECT_EQ(e.standDowns(), 1u);
+}
+
+// Review I3: withdrawCandidacy() DURING a stand-down hold must never leave a
+// stale hold that expires into candidacy.  RED (two flag sets): after the hold
+// the withdrawn node stood for election again.
+TEST(ElectionCandidacyRegression, WithdrawDuringAStandDownHoldNeverStandsAgainRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    StandDownRecorder pub;
+    auto e = makeSdElection(0, pub, nsf, tl, /*seed=*/0);
+    int64_t nowNs = 1'000'000LL;
+    bringToLeaderLogReplication(e, nowNs);
+    ASSERT_TRUE(driveSdLeaderToClosed(e, nowNs));
+    const Term term = e.leadershipTermId();
+    ASSERT_TRUE(e.standDown(nowNs, kElectionTimeoutNs));
+    e.withdrawCandidacy();
+    EXPECT_STREQ(e.candidacyName(), "Resigned");
+    EXPECT_TRUE(e.resigned());
+    EXPECT_TRUE(neverStands(e, pub, nowNs, term, 20)) << "a withdrawn node stood after its hold expired";
+    EXPECT_FALSE(pub.standDowns.empty()) << "it keeps re-sending the StandDown of the term it left";
+    for (const auto& c : pub.standDowns) EXPECT_EQ(c.term, term);
+}
+
+// And standDown() after withdrawCandidacy() takes no hold (it would be masked).
+TEST(ElectionCandidacyRegression, StandDownAfterWithdrawIsRefusedRegression) {
+    TempFile nsfFile(".nsf"), tlFile(".tl");
+    NodeStateFile nsf(nsfFile.str());
+    TermLog       tl(tlFile.str());
+    StandDownRecorder pub;
+    auto e = makeSdElection(0, pub, nsf, tl, /*seed=*/0);
+    int64_t nowNs = 1'000'000LL;
+    bringToLeaderLogReplication(e, nowNs);
+    ASSERT_TRUE(driveSdLeaderToClosed(e, nowNs));
+    e.withdrawCandidacy();
+    EXPECT_FALSE(e.standDown(nowNs, kElectionTimeoutNs));
+    EXPECT_STREQ(e.candidacyName(), "Resigned");
+    EXPECT_EQ(e.standDowns(), 0u);
+    EXPECT_TRUE(e.resign(nowNs)) << "the withdrawn leader still hands off by resigning";
+}

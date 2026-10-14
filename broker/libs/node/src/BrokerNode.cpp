@@ -1,4 +1,5 @@
 #include <rune/node/BrokerNode.h>
+#include <rune/node/CatalogHaltPolicy.h>
 #include <rune/catalog/TopicName.h>
 #include <rune/node/CatalogCheckpoint.h>
 #include <rune/node/HostDefaults.h>
@@ -496,6 +497,9 @@ void BrokerNode::start() {
             kCatalogApplyHaltedCounterTypeId, roleKey, kRoleKeyLength, catalogApplyHaltedLabel(config_.nodeId));
         catalogAppliedCounterRegId_ = aeron_->addCounter(
             kCatalogAppliedOffsetCounterTypeId, roleKey, kRoleKeyLength, catalogAppliedOffsetLabel(config_.nodeId));
+        unplaceableCounterRegId_ = aeron_->addCounter(
+            kCatalogUnplaceableTopicsCounterTypeId, roleKey, kRoleKeyLength,
+            catalogUnplaceableTopicsLabel(config_.nodeId));
     }
     const auto t2 = sclock::now();
 
@@ -3734,6 +3738,7 @@ void BrokerNode::stop() {
     stuckMarkersCounter_.reset();   // D9: release before aeron_ (the Counter dtor uses the conductor)
     outOfSyncCounter_.reset();      // readiness gate (L5): same rule
     catalogHaltedCounter_.reset();  // catalog history Task 7: same rule
+    unplaceableCounter_.reset();    // Task 11 fix round 1
     catalogAppliedCounter_.reset();
     for (auto& c : provCounters_) c.reset();   // re-review N4: same rule (the provisioner is stopped)
 
@@ -3898,6 +3903,7 @@ int BrokerNode::serviceAdminControl_() {
     //      halted broker giving up the controllership.
     work += resignIfHalted_(leaderNow);
     work += publishCatalogRoute_(leaderNow);
+    work += publishPlacementView_();
 
     // (1b) admin → control ring (F3 round 6/7, ported into T11's direct-call
     //      control plane):
@@ -4008,12 +4014,26 @@ int BrokerNode::serviceAdminControl_() {
     if (!ddlAnswerGate_.empty()) {
         const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
-        work += ddlAnswerGate_.release(nowNs, serves, send, [this](int64_t session, int32_t topicId) {
-            ++ddlAnswersOverdue_;
-            spdlog::error("BrokerNode[{}]: DDL OK for topic id={} (session {}) held {} ms and the topic still "
-                          "does not serve — answered Internal (in doubt), not OK (in-doubt answers: {})",
-                          config_.nodeId, topicId, session, kDdlAnswerMaxHoldNs / 1'000'000, ddlAnswersOverdue_);
-        });
+        std::string why;   // cold: an overdue answer only
+        work += ddlAnswerGate_.release(nowNs, serves, send,
+            [this](int64_t session, int32_t topicId) {
+                ++ddlAnswersOverdue_;
+                spdlog::error("BrokerNode[{}]: DDL OK for topic id={} (session {}) held {} ms and the topic still "
+                              "does not serve — answered Internal (in doubt), not OK (in-doubt answers: {})",
+                              config_.nodeId, topicId, session, kDdlAnswerMaxHoldNs / 1'000'000, ddlAnswersOverdue_);
+            },
+            [this, &why](int64_t session, int32_t topicId) {
+                // Task 11 fix round 1 (I2): the held answer is explicit — the
+                // event committed; the topic is not placed / serving yet.
+                why = "the DDL committed but topic id=" + std::to_string(topicId) + " does not serve after " +
+                      std::to_string(kDdlAnswerMaxHoldNs / 1'000'000) + " ms";
+                const std::string reason = metadataService_ ? metadataService_->unplaceableReason(topicId) : "";
+                why += reason.empty() ? " (placement pending)"
+                                      : " — UNPLACEABLE: " + reason + "; placed when the placeable brokers change";
+                const bool v8 = gateway_ && rune::protocol::client::clientUnderstandsCatalogDdl(
+                                                gateway_->sessionClientVersion(session));
+                return DdlAnswerGate::Explanation{why, v8};
+            });
     }
     if (ddlAnswerGate_.empty()) {
         work += agent->egressRing().drain(
@@ -4056,45 +4076,85 @@ int AdminControlPlane::doWork(int64_t /*nowNs*/) { return node_.serviceAdminCont
 // ---------------------------------------------------------------------------
 int BrokerNode::publishCatalogRoute_(bool consensusLeader) {
     if (!gateway_) return 0;
-    int     kind = 2;   // RouteUnknown
-    int64_t key  = 0;
+    using rune::gateway::RouteKind;
+    RouteKind kind = RouteKind::Unknown;
+    int64_t   key  = 0;
     if (catalogHaltedValue_ != 0) {
-        kind = 3;
+        kind = RouteKind::Halted;
         key  = catalogHaltedValue_ - 1;
     } else if (catalogOnController_) {
         const rune::metadata::PartitionAssignment* pa =
             metadataService_ ? metadataService_->assignment(kCatalogTopicId, kCatalogPartition) : nullptr;
         const int32_t leader = pa != nullptr ? pa->leaderNode : rune::metadata::NO_LEADER;
         if (leader == config_.nodeId) {
-            kind = 0;
+            kind = RouteKind::LocalLeader;
         } else if (leader >= 0) {
-            kind = 1;
+            kind = RouteKind::Remote;
             key  = leader;
         }
     } else if (consensusLeader) {
-        kind = 0;
+        kind = RouteKind::LocalLeader;
     }
-    if (kind == catalogRoutePublished_.kind && key == catalogRoutePublished_.key) [[likely]] return 0;
+    if (catalogRoutePublished_.kind && kind == *catalogRoutePublished_.kind && key == catalogRoutePublished_.key)
+        [[likely]] return 0;
 
     rune::gateway::CatalogRoute route{rune::gateway::RouteUnknown{}};
     switch (kind) {
-    case 0: route = rune::gateway::RouteLocalLeader{}; break;
-    case 1: {
+    case RouteKind::LocalLeader: route = rune::gateway::RouteLocalLeader{}; break;
+    case RouteKind::Remote: {
         std::string endpoint;
         for (const auto& peer : config_.peers)
             if (peer.id == static_cast<int32_t>(key)) endpoint = peer.clientChannel();
         route = rune::gateway::RouteRemote{std::move(endpoint)};
         break;
     }
-    case 3: route = rune::gateway::RouteHalted{key}; break;
-    default: break;
+    case RouteKind::Halted:  route = rune::gateway::RouteHalted{key}; break;
+    case RouteKind::Unknown: break;
     }
     spdlog::info("BrokerNode[{}]: catalog DDL route -> {}{}", config_.nodeId, rune::gateway::catalogRouteName(route),
-                 kind == 1 ? " (leader " + std::to_string(key) + ")"
-                           : kind == 3 ? " (applier halted at offset " + std::to_string(key) + ")" : std::string{});
+                 kind == RouteKind::Remote   ? " (leader " + std::to_string(key) + ")"
+                 : kind == RouteKind::Halted ? " (applier halted at offset " + std::to_string(key) + ")"
+                                             : std::string{});
     gateway_->setCatalogRoute(std::move(route));
     catalogRoutePublished_ = PublishedCatalogRoute{kind, key};
     return 1;
+}
+
+int BrokerNode::publishPlacementView_() {
+    if (!metadataService_ || !adminWorkerAgent_) return 0;
+    int work = 0;
+    // The gauge (no allocation; set on change).
+    const auto unplaceable = static_cast<std::int64_t>(metadataService_->unplaceableTopicCount());
+    if (unplaceable != unplaceablePublished_) {
+        if (!unplaceableCounter_ && unplaceableCounterRegId_ >= 0 && aeron_) {
+            try { unplaceableCounter_ = aeron_->findCounter(unplaceableCounterRegId_); } catch (...) { unplaceableCounter_.reset(); }
+        }
+        if (unplaceableCounter_) {
+            unplaceableCounter_->set(unplaceable);
+            unplaceablePublished_ = unplaceable;
+        }
+    }
+    // The view: every configured broker minus the catalog-halted ones (a fixed
+    // array — no allocation on the per-pass compare).
+    PlacementViewMsg v;
+    for (const auto& peer : config_.peers) {
+        if (metadataService_->catalogHalted(peer.id)) {
+            if (v.haltedCount < PlacementViewMsg::kMaxHalted) v.halted[v.haltedCount++] = peer.id;
+        } else {
+            ++v.placeable;
+        }
+    }
+    if (placementPostedOnce_ && v == placementPosted_) [[likely]] return work;
+    uint8_t buf[4 + 2 + 4 * PlacementViewMsg::kMaxHalted];
+    writePlacementView(buf, v);
+    if (adminWorkerAgent_->controlToAdminRing().write(buf, placementViewWireLen(v), kMsgPlacementView)) {
+        placementPosted_ = v;
+        placementPostedOnce_ = true;
+        spdlog::info("BrokerNode[{}]: placement view -> {} placeable broker(s), {} catalog-halted", config_.nodeId,
+                     v.placeable, v.haltedCount);
+        ++work;
+    }   // ring full: retried on the next pass
+    return work;
 }
 
 int BrokerNode::resignIfHalted_(bool consensusLeader) {
@@ -4111,13 +4171,24 @@ int BrokerNode::resignIfHalted_(bool consensusLeader) {
     // election, ISR) and places / unplaces no catalog topic (MetadataService).
     const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+    // Fix round 1 (review M1/M5): one bad event halts every applier within a
+    // replication round-trip of each other; their halt marks need that long to
+    // reach this node.  Decide only after the settle window, or a peer that is
+    // halting too still looks healthy (observed: two needless stand-downs).
+    const int64_t settleNs = haltedStandDownSettleNs(election_->leaderHeartbeatTimeoutNs());
+    if (haltedSinceNs_ < 0) haltedSinceNs_ = nowNs;
+    if (nowNs - haltedSinceNs_ < settleNs) return work;
     std::array<rune::consensus::NodeId, 64> live{};
     const std::size_t n = election_->eligibleNodeIds(nowNs, 3 * election_->leaderHeartbeatTimeoutNs(), live.data(),
                                                      live.size());
     if (!metadataService_->healthyPeerAmong(std::span<const int32_t>(live.data(), n))) return work;
-    if (election_->standDown(nowNs, /*holdNs=*/2 * election_->leaderHeartbeatTimeoutNs())) {
+    // Review M1: a repeat stand-down (this halted node leads again) doubles the hold, capped.
+    const uint64_t prior = election_->standDowns();
+    const int64_t holdNs = haltedStandDownHoldNs(2 * election_->leaderHeartbeatTimeoutNs(), prior);
+    if (election_->standDown(nowNs, holdNs)) {
         spdlog::critical("BrokerNode[{}]: __catalog apply halted — stood down from the controllership (a "
-                         "healthy peer is live; it places and unplaces topics from now on)", config_.nodeId);
+                         "healthy peer is live; it places and unplaces topics from now on; hold {} ms, stand-down "
+                         "#{})", config_.nodeId, holdNs / 1'000'000, prior + 1);
         ++work;
     }
     return work;

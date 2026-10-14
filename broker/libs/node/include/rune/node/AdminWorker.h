@@ -217,6 +217,14 @@ public:
     /// retriable NotLeader (spec §5.2): the retry dedupes on the new leader if the
     /// event committed.
     void onCatalogRole(const AdminRoleMsg& role);
+    /// control → admin (Task 11 fix round 1, I2): the placement view — the
+    /// leader's dry-run refuses an explicit rf above `placeable` with
+    /// InvalidRequest naming the shortfall and the halted brokers.  Until the
+    /// first view arrives every configured broker is placeable.
+    void onPlacementView(const PlacementViewMsg& v) noexcept { placement_ = v; placementKnown_ = true; }
+    [[nodiscard]] int32_t placeableBrokers() const noexcept {
+        return placementKnown_ ? placement_.placeable : deps_.brokerCount;
+    }
     /// control → admin: the controller's AlterIsrResponse for (-6, 0), verbatim.
     void onCatalogAlterIsrResponse(const rune::replication::AlterIsrResponseMsg& r);
 
@@ -359,6 +367,8 @@ private:
     uint64_t eventsAppended_    = 0;
     uint64_t preV8Refused_      = 0;
     bool     applyHeldForTest_  = false;   // holdApplyForTest (test seam only)
+    PlacementViewMsg placement_{};         // the control thread's placement view (onPlacementView)
+    bool             placementKnown_ = false;
 
     // An appended event that has not committed within this bound is answered the
     // retriable NotLeader (F13: it may still commit; the retry with the same

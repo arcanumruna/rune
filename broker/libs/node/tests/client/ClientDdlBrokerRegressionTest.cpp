@@ -158,11 +158,14 @@ TEST(ClientDdlBrokerRegression, BelowMinIsrTheClientFailsExplicitlyAtItsBudgetAn
     bool explicitFailure = false;
     try {
         const auto r = client.defineTopicAndWait("more", 1, "", {}, false, rune::client::Persistence::Disk, {}, o, 30s);
-        explicitFailure = r.errorCode != 0;
-        EXPECT_NE(r.errorCode, 0) << "below minIsr nothing commits";
+        // Review M5: exactly the retriable NotLeader past the budget — never another code.
+        EXPECT_EQ(r.errorCode, 2) << "below minIsr: NotLeader until the budget ends (" << r.detail << ")";
+        explicitFailure = r.errorCode == 2;
     } catch (const std::exception& e) {
-        explicitFailure = true;   // Timeout at the DDL deadline: explicit
-        SUCCEED() << e.what();
+        // …or the client's DDL deadline: Timeout, explicit.
+        const std::string what = e.what();
+        EXPECT_NE(what.find("timed out"), std::string::npos) << what;
+        explicitFailure = what.find("timed out") != std::string::npos;
     }
     EXPECT_TRUE(explicitFailure);
     EXPECT_LT(std::chrono::steady_clock::now() - t0, 20s) << "ends at the client's budget / deadline, never a hang";

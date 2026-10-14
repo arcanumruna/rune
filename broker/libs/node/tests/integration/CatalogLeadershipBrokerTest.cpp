@@ -294,7 +294,15 @@ TEST(CatalogLeadershipBrokerRegression, HaltedControllerResignsAndAnotherBrokerP
         return placer.metadataServiceForTest()->assignment(id, 0) != nullptr;
     });
     EXPECT_TRUE(placed) << "the new controller placed the topic created after the halt";
-    EXPECT_FALSE(c.node(ctl).isLeader()) << "the halted broker never leads the consensus again";
+    // Review M5/M1: steady state — sampled over 3 s (beyond the stand-down hold),
+    // the halted broker never leads again and stood down exactly once.
+    for (const auto until = Clock::now() + 3s; Clock::now() < until;) {
+        EXPECT_FALSE(c.node(ctl).isLeader()) << "the halted broker led the consensus again";
+        std::this_thread::sleep_for(100ms);
+    }
+    EXPECT_EQ(halted.onControlThreadForTest([&halted] { return halted.electionForTest()->standDowns(); }), 1u)
+        << "one stand-down, no flapping";
+    EXPECT_EQ(consensusLeader(c), newCtl) << "the healthy controller stayed";
 
     // The halted broker answers DDL Internal with its offset — never a Redirect.
     const auto refused = cl.awaitAnyDdlAnswer(
@@ -341,6 +349,24 @@ TEST(CatalogLeadershipBrokerRegression, ControllerNeverPlacesANewPartitionOnAHal
     }
     ASSERT_TRUE(known) << "the controller learned the halt";
     EXPECT_EQ(consensusLeader(c), ctl) << "a halted FOLLOWER changes no controllership";
+
+    // Fix round 1 (I2): the placement view reached the catalog leader's admin
+    // thread (control → admin ring), and its dry-run refuses an rf it cannot place.
+    bool viewArrived = false;
+    for (const auto deadline = Clock::now() + 15s; Clock::now() < deadline && !viewArrived;) {
+        viewArrived = controller.onAdminThreadForTest([&controller] {
+            return controller.adminWorkerAgentForTest()->worker().placeableBrokers() == 2;
+        });
+        if (!viewArrived) std::this_thread::sleep_for(20ms);
+    }
+    ASSERT_TRUE(viewArrived);
+    const auto rf3 = cl.awaitAnyDdlAnswer(
+        cl.sendDefineTopic(ch, kClientStream, sid, "rf3", 1, charBlob(), 0, {}, /*replicationFactor=*/3),
+        Clock::now() + 10s);
+    ASSERT_TRUE(rf3.has_value());
+    EXPECT_EQ(rf3->code, kLdInvalidRequest);
+    EXPECT_EQ(rf3->message, "replicationFactor 3 > placeable brokers 2 (broker " + std::to_string(h) +
+                                ": catalog apply halted)");
 
     const auto fresh = defineSettled(cl, ch, sid, "fresh", 30s);   // rf 0 = every PLACEABLE broker
     ASSERT_TRUE(fresh.has_value());
@@ -395,10 +421,21 @@ TEST(CatalogLeadershipBrokerRegression, AllBrokersHaltedKeepAControllerAndADataP
     EXPECT_EQ(trigger->code, kLdInternal) << "the halted catalog leader";
     for (int id = 1; id <= 3; ++id) ASSERT_TRUE(awaitHalted(c.node(id), 15s)) << id;
 
-    // A controller exists and stays (nobody healthy to hand it to).
-    std::this_thread::sleep_for(2s);
-    const int32_t stayed = consensusLeader(c);
+    // A controller exists and STAYS (nobody healthy to hand it to) — review M5:
+    // sampled over 2 s, and no broker ever stood down.
+    int32_t stayed = -1;
+    for (const auto deadline = Clock::now() + 10s; Clock::now() < deadline && stayed < 0;) {
+        stayed = consensusLeader(c);
+        if (stayed < 0) std::this_thread::sleep_for(20ms);
+    }
     ASSERT_GT(stayed, 0) << "never a cluster without a controller";
+    for (const auto until = Clock::now() + 2s; Clock::now() < until;) {
+        EXPECT_EQ(consensusLeader(c), stayed) << "the controller is stable (no flap)";
+        std::this_thread::sleep_for(100ms);
+    }
+    for (int id = 1; id <= 3; ++id)
+        EXPECT_EQ(c.node(id).onControlThreadForTest([&c, id] { return c.node(id).electionForTest()->standDowns(); }),
+                  0u) << "broker " << id << " stood down although no healthy peer exists";
 
     // DDL is Internal everywhere.
     for (int id = 1; id <= 3; ++id) {

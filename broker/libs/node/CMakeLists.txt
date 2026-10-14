@@ -1506,10 +1506,6 @@ if(BUILD_TESTING)
                               GTest::gtest_main)
         gtest_discover_tests(rune_transient_topic_data_path_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
 
-        # Catalog history Task 6: the __catalog partition on every broker —
-        # real replication on its admin-thread plane, controller-ISR leader
-        # (never unclean), new / wiped brokers refetch from 0; the admin/control
-        # role + ISR relay units.
         # Catalog history Task 11 (F7): the REAL client (rune-client-cpp, embedded by
         # the root CMakeLists) against a REAL in-process single-node BrokerNode.
         # Task 15 adds rune_cli_lib.
@@ -1527,6 +1523,10 @@ if(BUILD_TESTING)
                               GTest::gtest_main)
         gtest_discover_tests(rune_catalog_leadership_broker_tests PROPERTIES TIMEOUT 360 RESOURCE_LOCK rune_udp_ports)
 
+        # Catalog history Task 6: the __catalog partition on every broker —
+        # real replication on its admin-thread plane, controller-ISR leader
+        # (never unclean), new / wiped brokers refetch from 0; the admin/control
+        # role + ISR relay units.
         add_executable(rune_catalog_replication_tests tests/integration/CatalogReplicationTest.cpp)
         target_include_directories(rune_catalog_replication_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_catalog_replication_tests PRIVATE rune_node aeron::aeron GTest::gtest_main)

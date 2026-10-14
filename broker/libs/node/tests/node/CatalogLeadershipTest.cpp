@@ -15,6 +15,8 @@
 // Every DDL in every state is answered exactly once (answersSentFor == 1).
 #include "support/CatalogTrio.h"
 
+#include <rune/node/CatalogHaltPolicy.h>
+
 #include <gtest/gtest.h>
 #include <spdlog/sinks/ringbuffer_sink.h>
 #include <spdlog/spdlog.h>
@@ -238,18 +240,31 @@ TEST(CatalogLeadershipRegression, InFlightAndQueuedDdlsAreEachAnsweredOnceAcross
 
 // Task 24 finds the catalog leader by this line: every role transition logs
 // "AdminWorker: __catalog role -> <roleName()> (epoch N)" at info.
+namespace {
+/// RAII (review M7): the capture logger never leaks into later tests, even when
+/// an ASSERT returns early.
+struct LogCapture {
+    std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> sink = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(512);
+    std::shared_ptr<spdlog::logger> previous = spdlog::default_logger();
+    LogCapture() {
+        auto capture = std::make_shared<spdlog::logger>("trio-capture", sink);
+        capture->set_level(spdlog::level::info);
+        spdlog::set_default_logger(capture);
+    }
+    ~LogCapture() { spdlog::set_default_logger(previous); }
+    LogCapture(const LogCapture&) = delete;
+    LogCapture& operator=(const LogCapture&) = delete;
+};
+} // namespace
+
 TEST(CatalogLeadershipRegression, EveryRoleTransitionIsLoggedWithItsEpoch) {
-    auto sink = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(512);
-    const std::shared_ptr<spdlog::logger> previous = spdlog::default_logger();
-    auto capture = std::make_shared<spdlog::logger>("trio-capture", sink);
-    capture->set_level(spdlog::level::info);
-    spdlog::set_default_logger(capture);
+    LogCapture log;
+    const auto& sink = log.sink;
     {
         CatalogTrio t("ld_log");
         t.moveCatalogLeadership(2);
         ASSERT_TRUE(t.awaitRole(2, "LeaderServing", 10s));
     }
-    spdlog::set_default_logger(previous);
     auto seen = [&sink](const std::string& text) {
         for (const std::string& l : sink->last_formatted())
             if (l.find("[info]") != std::string::npos && l.find(text) != std::string::npos) return true;
@@ -259,4 +274,32 @@ TEST(CatalogLeadershipRegression, EveryRoleTransitionIsLoggedWithItsEpoch) {
     EXPECT_TRUE(seen("AdminWorker: __catalog role -> LeaderServing (epoch 1)"));
     EXPECT_TRUE(seen("AdminWorker: __catalog role -> Follower (epoch 2)"));
     EXPECT_TRUE(seen("AdminWorker: __catalog role -> LeaderServing (epoch 2)"));
+}
+
+// Review M1: a halted controller that leads AGAIN (its stand-down produced no
+// lasting healthy leader) doubles its candidacy hold, capped — repeats are never
+// immediate and never unbounded.
+TEST(CatalogLeadershipRegression, RepeatedHaltedStandDownsBackOffAndAreCapped) {
+    constexpr int64_t base = 100;
+    EXPECT_EQ(rune::node::haltedStandDownHoldNs(base, 0), 100);
+    EXPECT_EQ(rune::node::haltedStandDownHoldNs(base, 1), 200);
+    EXPECT_EQ(rune::node::haltedStandDownHoldNs(base, 2), 400);
+    EXPECT_EQ(rune::node::haltedStandDownHoldNs(base, rune::node::kHaltedStandDownMaxShift), base << 5);
+    EXPECT_EQ(rune::node::haltedStandDownHoldNs(base, 1000), base << 5) << "capped";
+}
+
+// Review M4: a broker that halts AT its own in-flight event answers Internal —
+// and says the event may have committed (it did, on every other broker) and how
+// to learn its result.  RED: a bare "catalog apply halted" an operator reads as
+// "failed".
+TEST(CatalogLeadershipRegression, HaltAtItsOwnEventSaysTheEventMayHaveCommittedRegression) {
+    CatalogTrio t("ld_halt_own");
+    ASSERT_EQ(t.define(1, {.name = "a", .partitions = 1}).code, kOk);
+    t.admin(1).applierForTest().tamperNextFingerprintForTest();
+    const auto a = t.dropTopic(1, "a");                 // a DdlResponse: it carries the detail
+    EXPECT_EQ(a.code, kInternal);
+    EXPECT_NE(a.detail.find("may have committed"), std::string::npos) << a.detail;
+    EXPECT_NE(a.detail.find("same requestId"), std::string::npos) << a.detail;
+    for (int i = 0; i < 50; ++i) t.pump();
+    EXPECT_EQ(t.admin(2).applier().state().topicByName("a"), nullptr) << "it did commit: applied elsewhere";
 }

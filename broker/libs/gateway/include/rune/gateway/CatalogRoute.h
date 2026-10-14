@@ -18,7 +18,9 @@
 // Namespace: rune::gateway.  C++23.
 
 #include <cstdint>
+#include <cstddef>
 #include <string>
+#include <type_traits>
 #include <variant>
 
 namespace rune::gateway {
@@ -40,14 +42,28 @@ struct RouteHalted {    // this broker's applier halted
 
 using CatalogRoute = std::variant<RouteLocalLeader, RouteRemote, RouteUnknown, RouteHalted>;
 
+/// The route's kind — the variant's alternative, by name (review M6: no magic
+/// indices; the static_asserts pin the order).
+enum class RouteKind : uint8_t { LocalLeader = 0, Remote = 1, Unknown = 2, Halted = 3 };
+static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(RouteKind::LocalLeader), CatalogRoute>,
+                             RouteLocalLeader>);
+static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(RouteKind::Remote), CatalogRoute>,
+                             RouteRemote>);
+static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(RouteKind::Unknown), CatalogRoute>,
+                             RouteUnknown>);
+static_assert(std::is_same_v<std::variant_alternative_t<static_cast<std::size_t>(RouteKind::Halted), CatalogRoute>,
+                             RouteHalted>);
+[[nodiscard]] inline RouteKind routeKindOf(const CatalogRoute& r) noexcept { return static_cast<RouteKind>(r.index()); }
+
 /// "LocalLeader" | "Remote" | "Unknown" | "Halted" (logs, tests).
 [[nodiscard]] inline const char* catalogRouteName(const CatalogRoute& r) noexcept {
-    switch (r.index()) {
-    case 0:  return "LocalLeader";
-    case 1:  return "Remote";
-    case 2:  return "Unknown";
-    default: return "Halted";
+    switch (routeKindOf(r)) {
+    case RouteKind::LocalLeader: return "LocalLeader";
+    case RouteKind::Remote:      return "Remote";
+    case RouteKind::Unknown:     return "Unknown";
+    case RouteKind::Halted:      return "Halted";
     }
+    return "Unknown";
 }
 
 } // namespace rune::gateway

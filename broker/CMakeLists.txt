@@ -275,6 +275,10 @@ if(BUILD_TESTING)
     set(BUILD_BENCHMARKS OFF)
     # Exactly one rune_driver_wake.c per link (fix round 0): the client's
     # rune_client_driver_wake IS the broker's rune_driver_wake (libs/node).
+    if(NOT TARGET rune_driver_wake)
+        message(FATAL_ERROR "rune_driver_wake (libs/node) must be defined before the client is embedded — "
+                            "rune_client_driver_wake aliases it (one rune_driver_wake.c per link)")
+    endif()
     add_library(rune_client_driver_wake ALIAS rune_driver_wake)
     add_subdirectory(${RUNE_CLIENT_ROOT} ${CMAKE_BINARY_DIR}/rune-client EXCLUDE_FROM_ALL)
     set(BUILD_TESTING ${_rune_saved_build_testing})

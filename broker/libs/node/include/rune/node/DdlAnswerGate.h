@@ -28,11 +28,13 @@
 // (SpillFifo); offer / release never allocate.  Cold path (DDL answers only).
 #include <rune/gateway/SpillFifo.h>
 #include <rune/protocol/client/MessageHeader.h>
+#include <rune/protocol/client/ControlMessages.h>
 #include <rune/protocol/client/Protocol.h>
 #include <rune/protocol/client/SchemaMessages.h>
 
 #include <cstdint>
 #include <cstring>
+#include <string_view>
 
 namespace rune::node {
 
@@ -85,13 +87,31 @@ public:
     /// Encode, into `out`, the Internal (6, in doubt) answer to the request a held
     /// DefineTopic / CreateView OK `frame` answers: same session + correlation id,
     /// topic id -1.  Returns its length (0 when `frame` is neither).  No allocation.
-    static constexpr std::size_t kInDoubtMaxBytes = 64;
+    ///
+    /// Task 11 fix round 1 (I2): `detail` (truncated to fit) says WHY — e.g. the
+    /// committed topic is unplaceable and when it is retried.  A DdlResponse
+    /// carries it in its own detail; a DefineTopic / CreateView answer carries it
+    /// only as an ErrorResponse{Internal, detail}, which only a v8 session
+    /// understands (`asErrorResponse`) — a pre-v8 session gets its own type.
+    static constexpr std::size_t kInDoubtMaxBytes = 512;
     [[nodiscard]] static std::size_t encodeInDoubt(const uint8_t* frame, std::size_t n,
-                                                   uint8_t (&out)[kInDoubtMaxBytes]) noexcept {
+                                                   uint8_t (&out)[kInDoubtMaxBytes],
+                                                   std::string_view detail = {},
+                                                   bool asErrorResponse = false) noexcept {
         namespace pc = rune::protocol::client;
         const auto h = pc::MessageHeader::decode(frame, n);
         if (!h) return 0;
         const auto internal = static_cast<uint16_t>(pc::ErrorCode::Internal);
+        constexpr std::size_t kDetailRoom = kInDoubtMaxBytes - 64;
+        if (detail.size() > kDetailRoom) detail = detail.substr(0, kDetailRoom);
+        const bool definesOrView = h->templateId == pc::DefineTopicResponse::TEMPLATE_ID ||
+                                   h->templateId == pc::CreateViewResponse::TEMPLATE_ID;
+        if (definesOrView && asErrorResponse && !detail.empty()) {
+            pc::ErrorResponse e;
+            e.sessionId = h->sessionId; e.correlationId = h->correlationId;
+            e.code = static_cast<int16_t>(internal); e.message = detail;
+            return e.encode(out);
+        }
         if (h->templateId == pc::DefineTopicResponse::TEMPLATE_ID) {
             auto r = pc::DefineTopicResponse::decode(frame, n);
             if (!r) return 0;
@@ -109,7 +129,7 @@ public:
         if (h->templateId == pc::DdlResponse::TEMPLATE_ID) {
             auto r = pc::DdlResponse::decode(frame, n);
             if (!r) return 0;
-            r->errorCode = internal; r->gateTopicId = -1; r->detail = {};   // the OK's detail is empty anyway
+            r->errorCode = internal; r->gateTopicId = -1; r->detail = detail;
             static_assert(pc::MessageHeader::ENCODED_SIZE + pc::DdlResponse::BODY_FIXED + 2 <= kInDoubtMaxBytes);
             return r->encode(out);
         }
@@ -121,6 +141,14 @@ public:
     /// encodeInDoubt) and `overdue(session, topicId)` is told; never the OK.
     template <class Ready, class Send, class Overdue>
     int release(int64_t nowNs, Ready&& ready, Send&& send, Overdue&& overdue) {
+        return release(nowNs, ready, send, overdue, [](int64_t, int32_t) { return Explanation{}; });
+    }
+    /// Why an overdue topic does not serve (Task 11 fix round 1): `detail` views
+    /// storage the caller keeps alive across the call; `asErrorResponse` = the
+    /// session understands an ErrorResponse detail (v8).
+    struct Explanation { std::string_view detail; bool asErrorResponse = false; };
+    template <class Ready, class Send, class Overdue, class Explain>
+    int release(int64_t nowNs, Ready&& ready, Send&& send, Overdue&& overdue, Explain&& explain) {
         int sent = 0;
         while (!held_.empty()) {
             const auto r = held_.front();
@@ -128,8 +156,9 @@ public:
             if (t >= 0 && !ready(t)) {
                 if (nowNs - headSinceNs_ < maxHoldNs_) break;
                 overdue(r.key, t);
+                const Explanation why = explain(r.key, t);
                 uint8_t inDoubt[kInDoubtMaxBytes];
-                const std::size_t m = encodeInDoubt(r.data, r.len, inDoubt);
+                const std::size_t m = encodeInDoubt(r.data, r.len, inDoubt, why.detail, why.asErrorResponse);
                 // gatedTopicOf() >= 0 implies a decodable Define/CreateView frame, so m > 0.
                 send(r.key, m > 0 ? inDoubt : r.data, m > 0 ? m : r.len);
                 held_.pop();

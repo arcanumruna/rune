@@ -631,6 +631,41 @@ TEST(CatalogNeverUncleanRegression, NoLiveIsrMemberLeavesTheCatalogLeaderlessWit
     EXPECT_FALSE(contains(clean->isr, 2)) << "the out-of-sync controller is not admitted by an election";
 }
 
+// Task 11 fix round 1 (review M2): a catalog-halted ISR member is never chosen
+// as the __catalog leader while a live, non-halted ISR member exists — and a
+// halted current leader is moved off; with no healthy candidate the rules are
+// unchanged (a leader beats none).  The halted broker stays in the ISR.  RED: the
+// halted broker 1 (lowest id) was elected / kept, so every DDL answered Internal.
+TEST(CatalogNeverUncleanRegression, CatalogLeadershipPrefersANonHaltedIsrMemberRegression) {
+    rune::metadata::PartitionAssignment cur;
+    cur.leaderNode = 9; cur.isr = {1, 3}; cur.replicas = {1, 2, 3};
+    cur.leaderEpoch = 4; cur.partitionEpoch = 7;
+    const std::vector<int32_t> halted{1};
+    // Leader dead; the controller (2) is not in the ISR; ISR = {halted 1, healthy 3}.
+    auto next = MetadataService::decideCoordinatorPartition(
+        kCatalogTopicId, kCatalogPartition, /*self=*/2, &cur, /*eligible=*/{1, 2, 3}, nullptr, 9, {1, 2, 3}, false,
+        &halted);
+    ASSERT_TRUE(next.has_value());
+    EXPECT_EQ(next->leaderNode, 3) << "the healthy ISR member, never the halted one";
+    EXPECT_TRUE(contains(next->isr, 1)) << "the halted broker still replicates: kept in the ISR";
+    // A halted CURRENT leader is moved to the healthy ISR member.
+    cur.leaderNode = 1;
+    next = MetadataService::decideCoordinatorPartition(kCatalogTopicId, kCatalogPartition, 2, &cur, {1, 2, 3},
+                                                       nullptr, 9, {1, 2, 3}, false, &halted);
+    ASSERT_TRUE(next.has_value());
+    EXPECT_EQ(next->leaderNode, 3);
+    // No healthy candidate: unchanged rules — the halted leader is kept.
+    cur.isr = {1};
+    next = MetadataService::decideCoordinatorPartition(kCatalogTopicId, kCatalogPartition, 2, &cur, {1, 2, 3},
+                                                       nullptr, 9, {1, 2, 3}, false, &halted);
+    EXPECT_FALSE(next.has_value()) << "a halted leader beats no leader";
+    // A halted controller in the ISR does not take the leadership from a healthy one.
+    cur.leaderNode = 3; cur.isr = {1, 3};
+    next = MetadataService::decideCoordinatorPartition(kCatalogTopicId, kCatalogPartition, /*self=*/1, &cur,
+                                                       {1, 2, 3}, nullptr, 9, {1, 2, 3}, false, &halted);
+    EXPECT_FALSE(next.has_value()) << "the halted controller never prefers itself";
+}
+
 // Fix round 1 (M3 + M5): the controller-answer relay decision.
 TEST(CatalogAlterIsrRelayRegression, AnswerNeverOvertakesAHeldRoleAndIsDroppedOnceTheAdminThreadIsGoneRegression) {
     OneToOneByteRing ring(1 << 12);

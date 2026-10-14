@@ -2901,16 +2901,19 @@ TEST(CatalogHaltedPlacementRegression, ControllerPlacesNoNewPartitionOnAHaltedNo
         EXPECT_EQ(std::count(pa->replicas.begin(), pa->replicas.end(), 3), 0) << "placed on the halted node";
         EXPECT_NE(pa->leaderNode, 3);
     }
-    // An explicit rf above the placeable brokers is an explicit placement error.
-    const uint64_t errors = c.svc->balancerErrorCount();
+    // An explicit rf above the placeable brokers: the explicit Unplaceable state.
     c.svc->addRuntimeTopic(TopicSpec{6, 1, 3, "", "rf3"});
     c.drive(50);
     EXPECT_EQ(c.svc->assignment(6, 0), nullptr);
-    EXPECT_EQ(c.svc->balancerErrorCount(), errors + 1);
-    // A new process of node 3 (another nonce) is placeable again.
+    EXPECT_EQ(c.svc->unplaceableTopicCount(), 1u);
+    EXPECT_EQ(c.svc->unplaceableEvents(), 1u) << "logged once, not per retry";
+    // A new process of node 3 (another nonce) is placeable again — and topic 6 placed.
     (void)c.svc->onAlterIsr(nodeControl(3, 34, false));
     EXPECT_FALSE(c.svc->catalogHalted(3));
     EXPECT_EQ(c.svc->placementNodes(), (std::vector<int32_t>{1, 2, 3}));
+    c.drive(50);
+    EXPECT_NE(c.svc->assignment(6, 0), nullptr);
+    EXPECT_EQ(c.svc->unplaceableTopicCount(), 0u);
 }
 
 // Ruling 1: a halted CONTROLLER keeps the data plane but places and unplaces no
@@ -2937,4 +2940,55 @@ TEST(CatalogHaltedPlacementRegression, HaltedControllerPlacesAndUnplacesNoCatalo
     EXPECT_FALSE(c.svc->healthyPeerAmong(std::vector<int32_t>{1})) << "no live peer";
     // (The data-plane failover under an all-halted cluster is pinned on real
     // brokers: CatalogLeadershipBrokerRegression.AllBrokersHalted….)
+}
+
+// Review I1 (fix round 1): placement is per unit.  A SUCCESSOR controller catches
+// up with two pending topics — one unplaceable (explicit rf 3 with broker 3
+// halted), one placeable — and an already-placed explicit-rf-3 topic.  The
+// placeable one is placed; the unplaceable one is held explicitly (reason,
+// count) and placed once broker 3 restarts healthy.  RED (one batch over every
+// configured topic): the placed rf-3 topic throws for the batch and NOTHING is
+// placed, silently.
+TEST(CatalogHaltedPlacementRegression, OneUnplaceableTopicNeverBlocksAnotherOnASuccessorControllerRegression) {
+    CtlRig c;                                    // topic 0 (rf 3) placed by controller 1
+    ASSERT_NE(c.svc->assignment(0, 0), nullptr);
+    MetadataService svc2(c.r2.get(), 2);         // broker 2: a follower today
+    svc2.configure(c.topics, c.all);
+    auto drive2 = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            c.clock += 1'000'000LL;
+            c.r1->doWork(c.clock); c.r2->doWork(c.clock); c.r3->doWork(c.clock);
+            c.transport.pump(c.clock);
+            (void)svc2.doWork(c.clock);
+        }
+    };
+    drive2(50);
+    ASSERT_NE(svc2.assignment(0, 0), nullptr) << "the follower applied the committed map";
+    (void)svc2.onAlterIsr(haltedRegister(3, 33));                // broker 3 halted
+    svc2.addRuntimeTopic(TopicSpec{7, 1, 3, "", "rf3"});           // applied while not the controller
+    svc2.addRuntimeTopic(TopicSpec{8, 1, 0, "", "fine"});
+    EXPECT_EQ(svc2.assignment(7, 0), nullptr);
+    EXPECT_EQ(svc2.assignment(8, 0), nullptr) << "a follower places nothing";
+
+    // Broker 2 becomes the controller (a new epoch).
+    c.r1->becomeFollower(2, 2);
+    c.r2->becomeLeader(2, c.all);
+    c.r3->becomeFollower(2, 2);
+    c.transport.setLeader(c.r2.get());
+    c.transport.removeFollower(2);
+    c.transport.addFollower(1, c.r1.get());
+    drive2(200);
+    ASSERT_TRUE(svc2.controllerCaughtUpForTest());
+    ASSERT_NE(svc2.assignment(8, 0), nullptr) << "the placeable topic is placed — never blocked";
+    EXPECT_EQ(std::count(svc2.assignment(8, 0)->replicas.begin(), svc2.assignment(8, 0)->replicas.end(), 3), 0);
+    EXPECT_EQ(svc2.assignment(7, 0), nullptr) << "rf 3 cannot be placed on 2 placeable brokers";
+    EXPECT_EQ(svc2.unplaceableTopicCount(), 1u);
+    EXPECT_NE(svc2.unplaceableReason(7).find("catalog apply halted on broker(s) 3"), std::string::npos)
+        << svc2.unplaceableReason(7);
+    EXPECT_NE(svc2.assignment(0, 0), nullptr) << "the already-placed rf-3 topic is untouched";
+    // Retried on the input change: broker 3 restarts healthy (a new process).
+    (void)svc2.onAlterIsr(nodeControl(3, 34, false));
+    drive2(100);
+    ASSERT_NE(svc2.assignment(7, 0), nullptr) << "placed once broker 3 is placeable again";
+    EXPECT_EQ(svc2.unplaceableTopicCount(), 0u);
 }

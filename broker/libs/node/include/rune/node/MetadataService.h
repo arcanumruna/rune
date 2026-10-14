@@ -83,6 +83,7 @@
 #include <deque>
 #include <utility>
 #include <optional>
+#include <map>
 #include <span>
 #include <unordered_map>
 #include <unordered_set>
@@ -129,14 +130,15 @@ public:
                    int32_t /*batchSize_unused*/ = 256)
     {
         // Filter: only user topics (topicId >= 0).
+        liveNodes_ = liveNodes;
         configuredTopics_.clear();
         configuredTopics_.reserve(topics.size());
         for (const auto& ts : topics) {
             if (ts.topicId >= 0) {
                 configuredTopics_.push_back(ts);
+                if (configuredTopics_.back().rf <= 0) resolveDefaultRf_(configuredTopics_.back());   // M3
             }
         }
-        liveNodes_ = liveNodes;
         assigned_  = false;
         ++routingInputsEpoch_;
     }
@@ -220,12 +222,18 @@ public:
         rune::metadata::ReplicaPositionTable* positions,
         int32_t bootstrapEpoch,
         const std::vector<int32_t>& replicas,
-        bool selfShutting = false)
+        bool selfShutting = false,
+        const std::vector<int32_t>* avoid = nullptr)
     {
         namespace rm = rune::metadata;
         auto in = [](int32_t n, const std::vector<int32_t>& v) {
             return std::find(v.begin(), v.end(), n) != v.end();
         };
+        // Task 11 fix round 1 (M2): `avoid` (the catalog-halted brokers, for
+        // __catalog only) are never preferred while a live, non-avoided ISR member
+        // exists — a halted catalog leader would answer every DDL Internal.  With
+        // none, the rules below apply unchanged (a leader beats no leader).
+        auto avoided = [&](int32_t n) { return avoid != nullptr && in(n, *avoid); };
         if (cur == nullptr) {
             // Bootstrap seeds the ISR with EVERY configured replica, including a
             // broker that never started (catalog history Task 6, review M6):
@@ -245,22 +253,29 @@ public:
             if (it != pa.isr.end()) std::rotate(pa.isr.begin(), it, it + 1);   // leader first
             return pa;
         }
-        if (cur->leaderNode == selfId) return std::nullopt;
         std::vector<int32_t> live = eligible;
         if (!in(selfId, live)) live.push_back(selfId);   // the controller is live
+        bool healthyIsr = false;   // a live, non-avoided ISR member exists
+        for (int32_t n : cur->isr) healthyIsr = healthyIsr || (in(n, live) && !avoided(n));
+        const bool steer = healthyIsr && avoid != nullptr && !avoid->empty();
+        if (cur->leaderNode == selfId && !(steer && avoided(selfId))) return std::nullopt;
+        // The leadership CANDIDATES (live, minus the avoided when steering); the
+        // ISR keeps every live member (a halted broker still replicates).
+        std::vector<int32_t> candidates = live;
+        if (steer) std::erase_if(candidates, [&](int32_t n) { return avoided(n); });
         rm::AssignmentChange chg;
-        if (in(selfId, cur->isr) && !selfShutting) {   // a stopping controller never takes one
+        if (in(selfId, cur->isr) && !selfShutting && in(selfId, candidates)) {   // a stopping controller never takes one
             chg.newLeader = selfId;
             chg.newIsr.push_back(selfId);
             for (int32_t n : cur->isr) if (n != selfId) chg.newIsr.push_back(n);
-        } else if (cur->leaderNode != rm::NO_LEADER && in(cur->leaderNode, live) &&
+        } else if (cur->leaderNode != rm::NO_LEADER && in(cur->leaderNode, candidates) &&
                    in(cur->leaderNode, cur->isr)) {
-            return std::nullopt;
+            return std::nullopt;   // (a halted leader is not a candidate when steering: replaced)
         } else {
             rm::ElectionInputs ei;
             ei.cur            = *cur;
             ei.cur.leaderNode = rm::NO_LEADER;   // dead (or none): always elect
-            ei.liveNodes      = live;
+            ei.liveNodes      = candidates;
             ei.positions      = positions;
             ei.allowUnclean   = false;
             const rm::ElectionOutcome out = rm::FailoverElection::elect(topicId, partition, ei);
@@ -295,9 +310,14 @@ public:
             for (const auto& q : pendingDynamicRecords_)
                 queued = queued || (q.rec.topicId == k.topicId && q.rec.partition == k.partition);
             if (queued) continue;
+            if (k.topicId == -6) {   // __catalog: steer the leadership off catalog-halted brokers (M2)
+                haltedScratch_.clear();
+                for (const auto& [n, st] : nodeLifecycle_) if (st.catalogHalted) haltedScratch_.push_back(n);
+            }
             const auto next = decideCoordinatorPartition(
                 k.topicId, k.partition, selfId_, msm_.assignment(k.topicId, k.partition),
-                eligibleNodes, &positions_, bootstrapEpoch, coordinatorReplicas_, isShutting_(selfId_));
+                eligibleNodes, &positions_, bootstrapEpoch, coordinatorReplicas_, isShutting_(selfId_),
+                k.topicId == -6 ? &haltedScratch_ : nullptr);
             if (!next) continue;
             rune::metadata::BalancerRecord br;
             br.isr      = next->isr;
@@ -350,8 +370,7 @@ public:
         if (spec.topicId < 0) return;  // internal topics are not assigned
         // rf 0 = every PLACEABLE broker (Task 11 fix round 0: catalog-halted
         // brokers are never placement targets).
-        if (spec.rf <= 0)
-            spec.rf = static_cast<int16_t>(std::max<std::size_t>(1, liveNodes_.empty() ? 1 : placementNodes().size()));
+        if (spec.rf <= 0) resolveDefaultRf_(spec);
 
         // (1) Record the topic in the configured set (idempotent by topicId) so
         // it participates in routing-image builds + future rebalances.
@@ -377,23 +396,28 @@ public:
         if (allAssigned) return;
 
         std::vector<rune::metadata::TopicSpec> one{spec};
-        std::vector<rune::metadata::BalancerRecord> records;
-        try {
-            records = rune::metadata::StaticBalancer::assign(one, placementNodes());
-        } catch (const rune::metadata::BalancerError& ex) {
-            ++balancerErrors_;
-            spdlog::error("MetadataService[{}]: topic id={} cannot be placed: {} (catalog-halted brokers are never "
-                          "placement targets)", selfId_, spec.topicId, ex.what());
-            return;
-        }
-        dropAssigned_(records);   // M1: never overwrite an existing assignment
-        if (records.empty()) return;
-
-        // One-record-per-append through the gated queue (never an ignored
-        // append result: a refused record stays queued).
-        for (auto& br : records) pendingDynamicRecords_.push_back(std::move(br));
+        (void)placeUnit_(one);   // an unplaceable topic is held explicitly (unplaceable_), retried
         drainDynamicQueue();
     }
+
+    // -----------------------------------------------------------------------
+    // Catalog history Task 11 fix round 1 (I1/I2): placement is PER UNIT (a
+    // topic, or a co-partition group) — one unplaceable topic never blocks
+    // another.  A unit the balancer refuses (e.g. rf above the placeable
+    // brokers, a catalog-halted broker never being a target) enters the
+    // explicit Unplaceable state: logged once (and on a reason change), counted
+    // (unplaceableTopicCount(), the rune-catalog-unplaceable-topics gauge), and
+    // retried whenever the placement inputs change (routingInputsEpoch_: a halt
+    // mark set or cleared, a configure) and on every controller catch-up.
+    // -----------------------------------------------------------------------
+    struct UnplaceableTopic { std::string reason; };
+    [[nodiscard]] std::size_t unplaceableTopicCount() const noexcept { return unplaceable_.size(); }
+    /// The reason `topicId` is unplaceable ("" = it is not).
+    [[nodiscard]] std::string unplaceableReason(int32_t topicId) const {
+        const auto it = unplaceable_.find(topicId);
+        return it == unplaceable_.end() ? std::string{} : it->second.reason;
+    }
+    [[nodiscard]] uint64_t unplaceableEvents() const noexcept { return unplaceableEvents_; }
 
     // -----------------------------------------------------------------------
     // Catalog history Task 8: the catalog DROPPED topic `topicId`.  Removes it
@@ -477,40 +501,21 @@ public:
             return;
         }
 
-        // Run StaticBalancer.
-        std::vector<rune::metadata::BalancerRecord> records;
-        try {
-            records = rune::metadata::StaticBalancer::assign(configuredTopics_, placementNodes());
-        } catch (const rune::metadata::BalancerError& ex) {
-            // Balancer validation failure (e.g. RF > nodes, co-partition mismatch).
-            // Increment the error counter so callers / tests can detect silent failure.
-            // Do NOT crash the duty-cycle — this must not happen in production when
-            // config is validated at startup.
-            (void)ex;
-            ++balancerErrors_;
-            return;
-        }
-
+        // Task 11 fix round 1 (I1): per placement UNIT (a topic, or its whole
+        // co-partition group), each validated on its own and only when one of
+        // its partitions is unassigned — a placed topic is never re-validated
+        // (its explicit rf may exceed today's placeable brokers), and a unit the
+        // balancer refuses is held Unplaceable (logged, counted, retried) instead
+        // of failing every other topic's placement.
+        //
         // Epoch-restart fix round 1 (M1): the static path only ASSIGNS — it
-        // never overwrites an existing assignment (that would move it back to
-        // the static leader at epoch 0).  Only partitions with no committed
-        // assignment are emitted.
-        dropAssigned_(records);
-        if (records.empty()) {
-            assigned_ = true;
-            return;
-        }
-
-        // One-record-per-append invariant (required by the read path): each
-        // metadata record occupies its own log slot (concatenating N records into
-        // one payload would make replay decode only the first).  The records go
-        // through the gated queue (drainDynamicQueue): appended in order while
-        // this replica leads, kept queued — never dropped, never an ignored
-        // append result — while an append is refused.
-        for (auto& br : records) pendingDynamicRecords_.push_back(std::move(br));
+        // never overwrites an existing assignment (dropAssigned_ in placeUnit_).
+        // One-record-per-append invariant: the records go through the gated
+        // queue (drainDynamicQueue) — appended in order while this replica
+        // leads, kept queued (never dropped) while an append is refused.
+        placeEveryUnassignedUnit_();
         drainDynamicQueue();
-
-        assigned_ = true;
+        assigned_ = true;   // unplaceable units are retried by retryUnplaceable_
     }
 
     // -----------------------------------------------------------------------
@@ -752,6 +757,7 @@ public:
         }
         NodeLifecycle& st = nodeLifecycle_[m.leaderId];
         const bool wasShutting = st.shutting;
+        const bool wasHalted   = st.catalogHalted;
         if (!st.adopt(nonce)) {
             // A superseded identity.  Normally a dead process's late frame
             // (nobody acts on the answer); but if a late frame of an UNSEEN
@@ -766,6 +772,11 @@ public:
             return false;
         }
         st.capable = true;
+        if (wasHalted && !st.catalogHalted) {   // Task 11 fix round 1: a new, healthy process
+            ++routingInputsEpoch_;
+            spdlog::info("MetadataService[{}]: node {} restarted with a healthy catalog — a placement target again",
+                         selfId_, m.leaderId);
+        }
         st.featureLevel = static_cast<int16_t>(m.isr[rr::AlterIsrMsg::kNodeFeatureLevelSlot]);   // D15
         if (wasShutting && !st.shutting)
             spdlog::info("MetadataService[{}]: node {} restarted (new process) — its shutdown mark is "
@@ -1346,6 +1357,11 @@ public:
     }
     uint64_t lineageIdentitiesRevoked_ = 0;
     uint64_t catalogPlacementsSkippedHalted_ = 0;   // Task 11: a halted controller's skipped placements / removals
+    // Task 11 fix round 1 (I1/I2): the explicit Unplaceable state (control thread).
+    std::map<int32_t, UnplaceableTopic> unplaceable_;
+    std::vector<int32_t>                haltedScratch_;   // M2: reused (capacity persists)
+    uint64_t                            unplaceableEvents_     = 0;
+    uint64_t                            unplaceableTriedEpoch_ = ~0ull;
     [[nodiscard]] bool isEligible_(int32_t n) const noexcept {
         return std::find(eligible_.begin(), eligible_.end(), n) != eligible_.end();
     }
@@ -1934,6 +1950,7 @@ public:
             it = (it->second <= hw) ? removalInflight_.erase(it) : std::next(it);
         if (amLeader) maybeRaiseFeatureLevel_();   // D15 (no-op once at the supported level)
         if (amLeader) maybeConfirmSingleNodeLineages_();   // C1 (single node only)
+        if (amLeader) retryUnplaceable_();                  // Task 11 fix round 1 (I1/I2)
         if (hw <= 0 || hw <= lastApplied_) {
             // Nothing new to apply.  Still call commit() so pending records
             // already decoded in a prior partial cycle get committed.
@@ -2337,6 +2354,104 @@ private:
     /// be removed then too — so every broker keeps the set, whichever becomes
     /// controller completes it.  Runs only when something changed (the
     /// committed map's version, a new drop, the readiness edge): cold.
+    /// rf 0 = "every broker" → every PLACEABLE broker, resolved now (review M3:
+    /// logged when a catalog-halted broker makes it smaller than the cluster —
+    /// the topic keeps that replica count after the broker recovers).
+    void resolveDefaultRf_(rune::metadata::TopicSpec& spec) const {
+        const std::size_t placeable = placementNodes().size();
+        spec.rf = static_cast<int16_t>(std::max<std::size_t>(1, placeable));
+        if (!liveNodes_.empty() && placeable < liveNodes_.size())
+            spdlog::warn("MetadataService[{}]: topic id={} (replicationFactor = every broker) is placed on {} of {} "
+                         "brokers — catalog-halted brokers are never placement targets; it keeps {} replicas",
+                         selfId_, spec.topicId, spec.rf, liveNodes_.size(), spec.rf);
+    }
+    /// The configured topics of `t`'s placement unit (its co-partition group, or itself).
+    void unitOf_(const rune::metadata::TopicSpec& t, std::vector<rune::metadata::TopicSpec>& out) const {
+        out.clear();
+        if (t.coPartitionGroup.empty()) { out.push_back(t); return; }
+        for (const auto& ts : configuredTopics_) if (ts.coPartitionGroup == t.coPartitionGroup) out.push_back(ts);
+    }
+    [[nodiscard]] bool unitFullyAssigned_(const std::vector<rune::metadata::TopicSpec>& unit) const noexcept {
+        for (const auto& ts : unit)
+            for (int32_t p = 0; p < ts.partitionCount; ++p)
+                if (msm_.assignment(ts.topicId, p) == nullptr) return false;
+        return true;
+    }
+    /// Place one unit (controller): records enqueued (not drained), or the unit
+    /// held Unplaceable.  Returns false only when the unit is unplaceable.
+    bool placeUnit_(const std::vector<rune::metadata::TopicSpec>& unit) {
+        if (unit.empty()) return true;
+        if (unitFullyAssigned_(unit)) {
+            for (const auto& ts : unit) unplaceable_.erase(ts.topicId);
+            return true;
+        }
+        std::vector<rune::metadata::BalancerRecord> records;
+        try {
+            records = rune::metadata::StaticBalancer::assign(unit, placementNodes());
+        } catch (const rune::metadata::BalancerError& ex) {
+            ++balancerErrors_;
+            std::string halted;
+            for (int32_t n : liveNodes_)
+                if (catalogHalted(n)) halted += (halted.empty() ? "" : ",") + std::to_string(n);
+            const std::string reason = std::string(ex.what()) + " (placeable brokers " +
+                                       std::to_string(placementNodes().size()) +
+                                       (halted.empty() ? std::string{} : "; catalog apply halted on broker(s) " + halted) +
+                                       ")";
+            for (const auto& ts : unit) {
+                auto [it, inserted] = unplaceable_.try_emplace(ts.topicId, UnplaceableTopic{reason});
+                if (inserted || it->second.reason != reason) {
+                    it->second.reason = reason;
+                    ++unplaceableEvents_;
+                    spdlog::error("MetadataService[{}]: topic id={} is UNPLACEABLE — {}; it serves nowhere until the "
+                                  "placeable brokers change (retried then; rune-catalog-unplaceable-topics)",
+                                  selfId_, ts.topicId, reason);
+                }
+            }
+            return false;
+        }
+        dropAssigned_(records);   // never overwrite an existing assignment
+        for (auto& br : records) pendingDynamicRecords_.push_back(std::move(br));
+        for (const auto& ts : unit) {
+            if (unplaceable_.erase(ts.topicId) != 0)
+                spdlog::info("MetadataService[{}]: topic id={} is placeable again — placed", selfId_, ts.topicId);
+        }
+        return true;
+    }
+    /// Every configured unit with an unassigned partition, each on its own.
+    void placeEveryUnassignedUnit_() {
+        std::vector<rune::metadata::TopicSpec> unit;
+        std::vector<std::string> groupsDone;
+        for (const auto& ts : configuredTopics_) {
+            if (!ts.coPartitionGroup.empty()) {
+                if (std::find(groupsDone.begin(), groupsDone.end(), ts.coPartitionGroup) != groupsDone.end()) continue;
+                groupsDone.push_back(ts.coPartitionGroup);
+            }
+            unitOf_(ts, unit);
+            (void)placeUnit_(unit);
+        }
+    }
+    /// Controller: re-try the Unplaceable units once per placement-input change.
+    void retryUnplaceable_() {
+        if (unplaceable_.empty() || routingInputsEpoch_ == unplaceableTriedEpoch_) return;
+        if (!controllerReady_() || catalogHalted(selfId_)) return;
+        unplaceableTriedEpoch_ = routingInputsEpoch_;
+        // Forget topics no longer configured (dropped).
+        for (auto it = unplaceable_.begin(); it != unplaceable_.end();) {
+            bool configured = false;
+            for (const auto& ts : configuredTopics_) configured = configured || ts.topicId == it->first;
+            it = configured ? std::next(it) : unplaceable_.erase(it);
+        }
+        std::vector<int32_t> ids;
+        for (const auto& [id, u] : unplaceable_) ids.push_back(id);
+        std::vector<rune::metadata::TopicSpec> unit;
+        for (int32_t id : ids) {
+            if (!unplaceable_.contains(id)) continue;   // placed with an earlier unit
+            for (const auto& ts : configuredTopics_)
+                if (ts.topicId == id) { unitOf_(ts, unit); (void)placeUnit_(unit); break; }
+        }
+        drainDynamicQueue();
+    }
+
     void reconcileRemovedTopics_(bool force = false) {
         if (removedTopics_.empty() || !controllerReady_()) return;
         const uint64_t v = msm_.committedVersion();

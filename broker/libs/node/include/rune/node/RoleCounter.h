@@ -127,6 +127,11 @@ inline constexpr std::int32_t kCatalogAppliedOffsetCounterTypeId = 1'000'218;
 inline std::string catalogApplyHaltedLabel(std::int32_t nodeId) {
     return "rune-catalog-apply-halted node=" + std::to_string(nodeId);
 }
+/// Task 11 fix round 1 (I1/I2): topics this broker, as controller, holds Unplaceable.
+inline constexpr std::int32_t kCatalogUnplaceableTopicsCounterTypeId = 1'000'219;
+inline std::string catalogUnplaceableTopicsLabel(std::int32_t nodeId) {
+    return "rune-catalog-unplaceable-topics node=" + std::to_string(nodeId);
+}
 inline std::string catalogAppliedOffsetLabel(std::int32_t nodeId) {
     return "rune-catalog-applied-offset node=" + std::to_string(nodeId);
 }
