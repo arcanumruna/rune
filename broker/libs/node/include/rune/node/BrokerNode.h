@@ -23,6 +23,7 @@
 #include <cstring>
 #include <cassert>
 #include <rune/protocol/client/SchemaMessages.h>
+#include <rune/node/CatalogReadFlow.h>
 #include <cstdlib>
 #include <limits>
 #include <rune/gateway/SpillFifo.h>
@@ -417,6 +418,20 @@ public:
                     spdlog::error("AdminWorkerAgent: malformed kMsgPlacementView (len={}) refused", n);
                 return;
             }
+            if (tid == kMsgCatalogReadPaused) {   // Task 12 fix round 0
+                CatalogReadPausedMsg m;
+                if (decodeCatalogReadPaused(p, n, m)) worker_.catalogReadPaused(m);
+                else if (badControlFrames_++ % 1024 == 0)
+                    spdlog::error("AdminWorkerAgent: malformed kMsgCatalogReadPaused (len={}) refused", n);
+                return;
+            }
+            if (tid == kMsgCatalogReadResume) {
+                CatalogReadResumeMsg m;
+                if (decodeCatalogReadResume(p, n, m)) worker_.catalogReadResume(m);
+                else if (badControlFrames_++ % 1024 == 0)
+                    spdlog::error("AdminWorkerAgent: malformed kMsgCatalogReadResume (len={}) refused", n);
+                return;
+            }
             if (tid == kMsgPurgeDroppedDir) {
                 onPurgeDroppedDir_(std::string_view(reinterpret_cast<const char*>(p), n));
                 return;
@@ -620,16 +635,19 @@ public:
     /// Catalog history Task 12: admin → control catalog-read frames ([sessionId:i64][frame]).
     OneToOneByteRing& catalogReadRing() noexcept { return catalogReadRing_; }
 
-    /// ADMIN thread only (deps.catalogRead): one catalog-read frame for `session`.
-    /// false = the ring is full — the read server keeps its position and retries
-    /// (nothing is queued here: the reads' memory stays bounded by the ring).
-    [[nodiscard]] bool postCatalogReadFrame(int64_t session, std::span<const uint8_t> frame) {
-        if (8 + frame.size() > static_cast<std::size_t>(catalogReadRing_.maxMsgLength())) [[unlikely]] return false;
-        const auto idx = catalogReadRing_.tryClaim(kMsgEgressFrame, 8 + frame.size());
+    /// ADMIN thread only (deps.catalogRead): one catalog-read frame
+    /// ([CatalogReadFrameHead][frame]).  false = the ring is full — the read
+    /// server keeps its position and retries (nothing is queued here).
+    [[nodiscard]] bool postCatalogReadFrame(const CatalogReadFrameHead& h, std::span<const uint8_t> frame) {
+        const std::size_t n = kCatalogReadHeadBytes + frame.size();
+        if (n > static_cast<std::size_t>(catalogReadRing_.maxMsgLength())) [[unlikely]] return false;
+        const auto idx = catalogReadRing_.tryClaim(kMsgEgressFrame, n);
         if (idx < 0) return false;
         uint8_t* p = catalogReadRing_.base() + idx;
-        std::memcpy(p, &session, 8);
-        std::memcpy(p + 8, frame.data(), frame.size());
+        std::memcpy(p, &h.session, 8);
+        std::memcpy(p + 8, &h.subscriptionId, 8);
+        std::memcpy(p + 16, &h.baseOffset, 8);
+        if (!frame.empty()) std::memcpy(p + kCatalogReadHeadBytes, frame.data(), frame.size());
         catalogReadRing_.commit(idx);
         return true;
     }
@@ -1373,6 +1391,8 @@ public:
     /// synchronized test context that knows the duty cycle is between doWork
     /// calls (or with the node stopped).  Used by GR-9 to observe the
     /// deferred-ack queue depth for the acks=All HW-gate boundary test.
+    /// Task 12 fix round 0 — control thread only (onControlThreadForTest).
+    [[nodiscard]] const CatalogReadFlow& catalogReadFlowForTest() const noexcept { return catalogReadFlow_; }
     rune::gateway::ClientGateway* gatewayForTest() const noexcept {
         return gateway_.get();
     }
@@ -2058,6 +2078,9 @@ private:
     // (see DdlAnswerGate.h).  Control-thread-owned; one drain of the admin egress
     // ring (16 frames of at most a ring message each) always fits.
     static constexpr int64_t kDdlAnswerMaxHoldNs = 5'000'000'000LL;
+    // Catalog history Task 12 fix round 0: catalog-read flow control (control
+    // thread) — one entry per paused catalog subscription, preallocated.
+    CatalogReadFlow catalogReadFlow_{2u * AdminWorker::kMaxCatalogSubscriptions};
     DdlAnswerGate ddlAnswerGate_{2u * static_cast<std::size_t>(kAdminRequestRingBytes) + 4096u,
                                  kDdlAnswerMaxHoldNs};
     uint64_t      ddlAnswersOverdue_ = 0;   // control thread only: held OKs answered Internal (in doubt)

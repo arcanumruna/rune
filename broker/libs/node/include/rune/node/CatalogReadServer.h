@@ -20,10 +20,20 @@
 //               reached), empty payload} and becomes Live (the transition is the
 //               "once");
 //   Live      — the marker was sent; pushes new commits as they arrive.
-// Egress full: the subscription keeps its phase and nextOffset and resumes next
-// pass (bounded memory: nothing queues here; the egress ring and the session's
-// spill are both bounded, and the gateway expires a session its spill cannot
-// hold — explicitly, SessionExpired — which ends its subscriptions here).
+//   PausePending / Paused — the SESSION's egress is back-pressured (fix round 0):
+//               the control thread could not offer one of its Records frames
+//               and reported it (onPaused, with that frame's baseOffset).  The
+//               subscription rewinds to that offset, acknowledges the pause on
+//               the egress ring (PausePending until the ack is on it — every
+//               frame of it still in flight precedes the ack, so the control
+//               thread drops exactly those) and sends nothing until onResume
+//               (the session's window has room again), then continues from its
+//               own cursor.  The log IS the per-subscription buffer: a paused
+//               reader holds no bytes anywhere, never grows the session's spill,
+//               and is never expired for being slow; other readers and the DDL
+//               answers (their own ring) never wait for it.
+// Egress RING full: the subscription keeps its phase and nextOffset and resumes
+// next pass (nothing queues here).
 //
 // A subscription is ended explicitly — ErrorResponse{code} on its Subscribe's
 // correlation id, then removed — when its log cannot be read below the HW
@@ -54,10 +64,24 @@ namespace rune::node {
 inline constexpr int64_t kCatalogSubscriptionIdBase = rune::gateway::kCatalogSubscriptionIdBase;
 
 /// The admin → control catalog-read ring (one per broker).  Its max message
-/// (capacity / 8) bounds one egress frame: [session:i64][frame].
+/// (capacity / 8) bounds one egress frame: [CatalogReadFrameHead][client frame].
 inline constexpr int kCatalogReadRingBytes = 1 << 21;   // 2 MiB → 256 KiB frames
+/// One catalog-read ring frame's head (fix round 0):
+///   subscriptionId 0              — a RELIABLE answer (SubscribeResponse /
+///                                   ErrorResponse): queued under back-pressure;
+///   subscriptionId ≠ 0 + a frame  — a FLOW-CONTROLLED Records frame at baseOffset:
+///                                   offered, never spilled (back-pressure pauses it);
+///   subscriptionId ≠ 0, no frame  — the subscription's PAUSE ACK (nothing of it follows
+///                                   until it is resumed).
+struct CatalogReadFrameHead {
+    int64_t session        = 0;
+    int64_t subscriptionId = 0;
+    int64_t baseOffset     = -1;
+};
+inline constexpr std::size_t kCatalogReadHeadBytes = 24;
 /// The largest frame the server emits (SubscribeResponse / Records / ErrorResponse).
-inline constexpr std::size_t kCatalogReadMaxFrameBytes = static_cast<std::size_t>(kCatalogReadRingBytes) / 8 - 8;
+inline constexpr std::size_t kCatalogReadMaxFrameBytes =
+    static_cast<std::size_t>(kCatalogReadRingBytes) / 8 - kCatalogReadHeadBytes;
 /// Records framing: the 24-byte header + 24-byte body + the u32 batch-length prefix.
 inline constexpr std::size_t kCatalogRecordsOverhead = 24 + 24 + 4;
 /// The largest stored batch one Records frame can carry.
@@ -72,16 +96,20 @@ inline constexpr std::size_t kCatalogReadCoalesceBytes = 64 * 1024;
 /// The preallocated read buffer; one pass reads at most half of it per subscription.
 inline constexpr std::size_t kCatalogReadBufferBytes = std::size_t{1} << 20;
 
-/// Sends one encoded client frame to `session` (admin → control, then the
-/// session's egress).  false = the egress is full: nothing was sent, retry later.
-using CatalogReadEgress = std::function<bool(int64_t session, std::span<const uint8_t> frame)>;
+/// Sends one encoded client frame (empty: a pause ack) to `head.session` (admin →
+/// control, then the session's egress).  false = the ring is full: nothing was
+/// sent, retry later.
+using CatalogReadEgress = std::function<bool(const CatalogReadFrameHead& head, std::span<const uint8_t> frame)>;
 
 class CatalogReadServer {
 public:
     struct Answering { int64_t nextOffset = 0; };   // SubscribeResponse{OK} owed
     struct Backlog   { int64_t nextOffset = 0; };   // pushing [nextOffset, HW); the marker on leaving
-    struct Live      { int64_t nextOffset = 0; };   // marker sent; pushes new commits
-    using Phase = std::variant<Answering, Backlog, Live>;
+    struct Live      { int64_t nextOffset = 0; int64_t markedAt = 0; };   // marker sent (at markedAt); live
+    using Resumable = std::variant<Backlog, Live>;
+    struct PausePending { Resumable resumeAs; };   // paused; its ack is not on the ring yet
+    struct Paused       { Resumable resumeAs; };   // paused + acked: nothing sent until onResume
+    using Phase = std::variant<Answering, Backlog, Live, PausePending, Paused>;
     struct Sub {
         int64_t session        = 0;
         int64_t corr           = 0;   // the creating Subscribe's correlation id (every frame carries it)
@@ -108,23 +136,31 @@ public:
     /// batches (at most half the read buffer per subscription per pass), then the
     /// marker for a Backlog subscription at the HW.  Returns frames sent + subs ended.
     int pump();
+    /// control → admin (fix round 0): the session's egress could not take this
+    /// subscription's Records frame at `baseOffset` — rewind to it and pause
+    /// (acknowledged on the egress ring).  An unknown subscription is acked too
+    /// (the control thread clears its entry).
+    void onPaused(int64_t session, int64_t subscriptionId, int64_t baseOffset);
+    /// control → admin: the session's egress has room again — continue from the cursor.
+    void onResume(int64_t session, int64_t subscriptionId);
 
     [[nodiscard]] std::size_t subscriptions() const noexcept { return subs_.size(); }
     [[nodiscard]] std::size_t maxSubscriptions() const noexcept { return maxSubs_; }
     /// Subscribes refused beyond maxSubs / subscriptions ended by a read failure.
     [[nodiscard]] uint64_t refusedSubscribes() const noexcept { return refused_; }
     [[nodiscard]] uint64_t endedSubscriptions() const noexcept { return ended_; }
-    /// The phase name of `subscriptionId` ("Answering" | "Backlog" | "Live"; "" = none).
+    /// "Answering" | "Backlog" | "Live" | "PausePending" | "Paused"; "" = none.
     [[nodiscard]] const char* phaseName(int64_t subscriptionId) const noexcept;
 
 private:
     /// A refusal / an ended subscription's answer the egress could not take yet.
+    enum class OwedKind : uint8_t { SubscribeAnswer, EndedAnswer, PauseAck };
     struct OwedError {
-        int64_t session = 0;
-        int64_t corr    = 0;
-        int16_t code    = 0;
-        bool    asSubscribeResponse = false;   // a Subscribe's answer (else ErrorResponse: an ended sub)
-        int64_t subscriptionId = 0;
+        int64_t  session = 0;
+        int64_t  corr    = 0;
+        int16_t  code    = 0;
+        OwedKind kind    = OwedKind::SubscribeAnswer;
+        int64_t  subscriptionId = 0;
     };
 
     enum class Push : uint8_t { Progress, Blocked, Idle, Ended };
@@ -138,6 +174,8 @@ private:
     bool sendSubscribeResponse_(int64_t session, int64_t corr, int16_t code, int64_t subId);
     bool sendError_(const OwedError& e);
     bool sendRecords_(const Sub& s, int64_t baseOffset, std::span<const uint8_t> batches);
+    bool sendPauseAck_(int64_t session, int64_t subId);
+    bool sendReliable_(int64_t session, std::size_t n);
     void end_(std::size_t index, int16_t code, const char* why, int64_t at);
     int  flushOwed_();
 

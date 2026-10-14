@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -52,7 +53,7 @@ public:
                  std::to_string(read_rig_detail::gSeq++))),
           asFollower_(asFollower),
           replica_(open_(root_ / "__catalog", log_, asFollower ? Mode::Follower : Mode::Leader)),
-          server(*replica_, [this](int64_t session, std::span<const uint8_t> f) { return record_(session, f); },
+          server(*replica_, [this](const CatalogReadFrameHead& h, std::span<const uint8_t> f) { return record_(h, f); },
                  maxSubs, /*idPrefix=*/int64_t{kSelf + 1} << 40) {
         frames.reserve(4096);
         if (asFollower_) source_ = open_(root_ / "source", sourceLog_, Mode::Leader);
@@ -98,7 +99,9 @@ public:
     [[nodiscard]] rune::replication::PartitionReplica& replica() { return *replica_; }
 
     // ── The egress ─────────────────────────────────────────────────────────
-    struct Frame { int64_t session; std::vector<uint8_t> bytes; };
+    /// One egress frame: its head (subscriptionId 0 = a reliable answer; an empty
+    /// frame with a subscriptionId = a pause ack) and the client frame bytes.
+    struct Frame { int64_t session; std::vector<uint8_t> bytes; int64_t subscriptionId = 0; int64_t baseOffset = -1; };
     std::vector<Frame> frames;
     bool egressFull = false;    // the egress refuses every frame while set
     int  egressBudget = -1;     // >= 0: the egress takes this many more frames, then refuses
@@ -189,13 +192,21 @@ public:
     CatalogReadServer server;   // after replica_ (it holds a reference)
 
 private:
-    bool record_(int64_t session, std::span<const uint8_t> f) {
+    bool record_(const CatalogReadFrameHead& h, std::span<const uint8_t> f) {
         if (egressFull) return false;
         if (egressBudget == 0) return false;
         if (egressBudget > 0) --egressBudget;
-        frames.push_back(Frame{session, std::vector<uint8_t>(f.begin(), f.end())});
+        if (onFrame) return onFrame(h, f);
+        frames.push_back(Frame{h.session, std::vector<uint8_t>(f.begin(), f.end()), h.subscriptionId, h.baseOffset});
         return true;
     }
+
+public:
+    /// When set, every frame the ring takes goes here instead of `frames`
+    /// (fix round 0: the control-thread flow under test).
+    std::function<bool(const CatalogReadFrameHead&, std::span<const uint8_t>)> onFrame;
+
+private:
     template <class F>
     void forEachRecords_(int64_t session, F&& fn) const {
         namespace pc = rune::protocol::client;

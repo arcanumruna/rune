@@ -3407,8 +3407,8 @@ void BrokerNode::buildAdminWorker() {
         };
         // Catalog history Task 12: the catalog read server's frames (admin thread)
         // → the agent's catalog-read ring → the control thread → the session.
-        deps.catalogRead = [this](int64_t session, std::span<const uint8_t> frame) {
-            return adminWorkerAgent_ != nullptr && adminWorkerAgent_->postCatalogReadFrame(session, frame);
+        deps.catalogRead = [this](const CatalogReadFrameHead& head, std::span<const uint8_t> frame) {
+            return adminWorkerAgent_ != nullptr && adminWorkerAgent_->postCatalogReadFrame(head, frame);
         };
 
         // Construct AdminWorkerAgent (owns the AdminWorker — the __catalog replica,
@@ -4079,16 +4079,49 @@ int BrokerNode::serviceAdminControl_() {
     //     the session's egress (sendControlFrame: queued under back-pressure; a
     //     session its spill cannot hold is expired explicitly, which ends its
     //     catalog subscriptions).  Never behind the DDL answer gate.
+    //     Fix round 0: a Records frame is OFFERED, never spilled — a back-pressured
+    //     session pauses that subscription (CatalogReadFlow); the ring is always
+    //     drained, so a slow reader never holds back another one.
+    struct CatalogReadSink {
+        BrokerNode&       node;
+        AdminWorkerAgent& agent;
+        using Offer = CatalogReadFlow::Offer;
+        using Room  = CatalogReadFlow::Room;
+        Offer tryOffer(int64_t session, const uint8_t* f, std::size_t n) {
+            if (!node.gateway_) return Offer::NoSession;
+            switch (node.gateway_->tryOfferCatalogFrame(session, f, n)) {
+            case rune::gateway::ClientGateway::CatalogOffer::Sent:          return Offer::Sent;
+            case rune::gateway::ClientGateway::CatalogOffer::BackPressured: return Offer::BackPressured;
+            case rune::gateway::ClientGateway::CatalogOffer::NoSession:     break;
+            }
+            return Offer::NoSession;
+        }
+        void sendReliable(int64_t session, const uint8_t* f, std::size_t n) {
+            if (node.gateway_) (void)node.gateway_->sendControlFrame(session, f, n);
+        }
+        Room room(int64_t session) {
+            if (!node.gateway_) return Room::Gone;
+            switch (node.gateway_->catalogEgressRoom(session)) {
+            case rune::gateway::ClientGateway::CatalogRoom::Ready:  return Room::Ready;
+            case rune::gateway::ClientGateway::CatalogRoom::NotYet: return Room::NotYet;
+            case rune::gateway::ClientGateway::CatalogRoom::Gone:   break;
+            }
+            return Room::Gone;
+        }
+        bool postPaused(int64_t session, int64_t subId, int64_t base) {
+            return encodeCatalogReadPaused(agent.controlToAdminRing(), CatalogReadPausedMsg{session, subId, base});
+        }
+        bool postResume(int64_t session, int64_t subId) {
+            return encodeCatalogReadResume(agent.controlToAdminRing(), CatalogReadResumeMsg{session, subId});
+        }
+    } catalogSink{*this, *agent};
     work += agent->catalogReadRing().drain(
-        [&send](int32_t /*tid*/, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
-                aeron::util::index_t len) {
-            const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
-            const auto n = static_cast<std::size_t>(len);
-            if (n < 8) return;
-            int64_t session;
-            std::memcpy(&session, p, 8);
-            send(session, p + 8, n - 8);
-        }, 16);
+        [this, &catalogSink](int32_t /*tid*/, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
+                             aeron::util::index_t len) {
+            catalogReadFlow_.onFrame(reinterpret_cast<const uint8_t*>(b.buffer() + off), static_cast<std::size_t>(len),
+                                     catalogSink);
+        }, 64);
+    if (!catalogReadFlow_.idle()) [[unlikely]] work += catalogReadFlow_.service(catalogSink);
     if (ddlAnswerGate_.empty()) {
         work += agent->egressRing().drain(
             [this, &send, &serves](int32_t /*tid*/,

@@ -43,7 +43,9 @@ const char* CatalogReadServer::phaseName(int64_t subscriptionId) const noexcept 
         if (s.subscriptionId != subscriptionId) continue;
         if (std::holds_alternative<Answering>(s.phase)) return "Answering";
         if (std::holds_alternative<Backlog>(s.phase)) return "Backlog";
-        return "Live";
+        if (std::holds_alternative<Live>(s.phase)) return "Live";
+        if (std::holds_alternative<PausePending>(s.phase)) return "PausePending";
+        return "Paused";
     }
     return "";
 }
@@ -55,7 +57,7 @@ void CatalogReadServer::subscribe(int64_t session, int64_t corr, int64_t fromOff
         if (s.session != session || s.corr != corr) continue;
         if (std::holds_alternative<Answering>(s.phase)) return;   // its answer is still owed
         if (!sendSubscribeResponse_(session, corr, kOk, s.subscriptionId))
-            owed_.push_back(OwedError{session, corr, kOk, true, s.subscriptionId});
+            owed_.push_back(OwedError{session, corr, kOk, OwedKind::SubscribeAnswer, s.subscriptionId});
         return;
     }
     if (subs_.size() >= maxSubs_) {
@@ -64,7 +66,7 @@ void CatalogReadServer::subscribe(int64_t session, int64_t corr, int64_t fromOff
                       "subscriptions already served (the cap) — answered Internal (refused so far: {})",
                       session, corr, subs_.size(), refused_);
         if (!owed_.empty() || !sendSubscribeResponse_(session, corr, kInternal, 0))
-            owed_.push_back(OwedError{session, corr, kInternal, true, 0});
+            owed_.push_back(OwedError{session, corr, kInternal, OwedKind::SubscribeAnswer, 0});
         return;
     }
     const int64_t hw = catalog_.highWatermark();
@@ -94,7 +96,49 @@ void CatalogReadServer::unsubscribe(int64_t session, int64_t subscriptionId) {
         std::erase_if(owed_, [session](const OwedError& e) { return e.session == session; });
 }
 
+// ─── Flow control (fix round 0) ────────────────────────────────────────────────
+void CatalogReadServer::onPaused(int64_t session, int64_t subscriptionId, int64_t baseOffset) {
+    for (Sub& s : subs_) {
+        if (s.session != session || s.subscriptionId != subscriptionId) continue;
+        Resumable resumeAs{Backlog{0}};
+        if (const auto* b = std::get_if<Backlog>(&s.phase)) {
+            resumeAs = Backlog{std::min(baseOffset, b->nextOffset)};
+        } else if (const auto* l = std::get_if<Live>(&s.phase)) {
+            const int64_t at = std::min(baseOffset, l->nextOffset);
+            // A frame at or before the marker was dropped: the marker is re-sent on catching up again.
+            if (at <= l->markedAt) resumeAs = Backlog{at};
+            else                   resumeAs = Live{at, l->markedAt};
+        } else {
+            break;   // Answering (no Records sent yet) / already paused: just (re-)acknowledge
+        }
+        s.phase = PausePending{resumeAs};
+        if (owed_.empty() && sendPauseAck_(session, subscriptionId)) s.phase = Paused{resumeAs};
+        return;
+    }
+    // Unknown (unsubscribed meanwhile) or not pausable: the ack still clears the
+    // control thread's entry for it.
+    if (!owed_.empty() || !sendPauseAck_(session, subscriptionId))
+        owed_.push_back(OwedError{session, 0, 0, OwedKind::PauseAck, subscriptionId});
+}
+
+void CatalogReadServer::onResume(int64_t session, int64_t subscriptionId) {
+    for (Sub& s : subs_) {
+        if (s.session != session || s.subscriptionId != subscriptionId) continue;
+        if (const auto* p = std::get_if<Paused>(&s.phase))
+            s.phase = std::visit([](const auto& r) -> Phase { return r; }, p->resumeAs);
+        return;
+    }
+}
+
 // ─── Egress ───────────────────────────────────────────────────────────────────
+bool CatalogReadServer::sendReliable_(int64_t session, std::size_t n) {
+    return send_(CatalogReadFrameHead{session, 0, -1}, std::span<const uint8_t>(frameBuf_.data(), n));
+}
+
+bool CatalogReadServer::sendPauseAck_(int64_t session, int64_t subId) {
+    return send_(CatalogReadFrameHead{session, subId, -1}, {});
+}
+
 bool CatalogReadServer::sendSubscribeResponse_(int64_t session, int64_t corr, int16_t code, int64_t subId) {
     pc::SubscribeResponse r;
     r.sessionId      = session;
@@ -102,18 +146,17 @@ bool CatalogReadServer::sendSubscribeResponse_(int64_t session, int64_t corr, in
     r.errorCode      = code;
     r.partition      = kCatalogPartition;
     r.subscriptionId = subId;
-    const std::size_t n = r.encode(frameBuf_.data());
-    return send_(session, std::span<const uint8_t>(frameBuf_.data(), n));
+    return sendReliable_(session, r.encode(frameBuf_.data()));
 }
 
 bool CatalogReadServer::sendError_(const OwedError& e) {
-    if (e.asSubscribeResponse) return sendSubscribeResponse_(e.session, e.corr, e.code, e.subscriptionId);
+    if (e.kind == OwedKind::PauseAck) return sendPauseAck_(e.session, e.subscriptionId);
+    if (e.kind == OwedKind::SubscribeAnswer) return sendSubscribeResponse_(e.session, e.corr, e.code, e.subscriptionId);
     pc::ErrorResponse r;
     r.sessionId     = e.session;
     r.correlationId = e.corr;
     r.code          = e.code;
-    const std::size_t n = r.encode(frameBuf_.data());
-    return send_(e.session, std::span<const uint8_t>(frameBuf_.data(), n));
+    return sendReliable_(e.session, r.encode(frameBuf_.data()));
 }
 
 bool CatalogReadServer::sendRecords_(const Sub& s, int64_t baseOffset, std::span<const uint8_t> batches) {
@@ -126,7 +169,8 @@ bool CatalogReadServer::sendRecords_(const Sub& s, int64_t baseOffset, std::span
     r.baseOffset     = baseOffset;
     r.recordBatch    = batches;
     const std::size_t n = r.encode(frameBuf_.data());   // <= kCatalogReadMaxFrameBytes by construction
-    return send_(s.session, std::span<const uint8_t>(frameBuf_.data(), n));
+    return send_(CatalogReadFrameHead{s.session, s.subscriptionId, baseOffset},
+                 std::span<const uint8_t>(frameBuf_.data(), n));
 }
 
 int CatalogReadServer::flushOwed_() {
@@ -143,7 +187,7 @@ void CatalogReadServer::end_(std::size_t index, int16_t code, const char* why, i
                   "{} on its Subscribe (ended so far: {})", s.subscriptionId, s.session, at, why, code, ended_);
     subs_[index] = subs_.back();
     subs_.pop_back();
-    const OwedError e{s.session, s.corr, code, false, s.subscriptionId};
+    const OwedError e{s.session, s.corr, code, OwedKind::EndedAnswer, s.subscriptionId};
     if (!owed_.empty() || !sendError_(e)) owed_.push_back(e);
 }
 
@@ -233,7 +277,14 @@ int CatalogReadServer::pump() {
             ++work;
             s.phase = Backlog{a->nextOffset};
         }
-        int64_t* next = std::visit([](auto& p) -> int64_t* { return &p.nextOffset; }, s.phase);
+        if (auto* pp = std::get_if<PausePending>(&s.phase)) {
+            if (!sendPauseAck_(s.session, s.subscriptionId)) return work;
+            ++work;
+            s.phase = Paused{pp->resumeAs};
+        }
+        if (std::holds_alternative<Paused>(s.phase)) { ++i; continue; }   // waits for onResume: costs nothing
+        int64_t* next = std::holds_alternative<Backlog>(s.phase) ? &std::get<Backlog>(s.phase).nextOffset
+                                                                 : &std::get<Live>(s.phase).nextOffset;
         const int64_t before = *next;
         const PushResult r = pushRange_(s, *next, hw);
         if (r.kind == Push::Blocked) return work + (*next != before ? 1 : 0);
@@ -247,7 +298,7 @@ int CatalogReadServer::pump() {
             // The caught-up marker (ruling 10): one empty Records at the HW — the
             // Backlog → Live transition is the "once".
             if (!sendRecords_(s, bl->nextOffset, {})) return work;
-            s.phase = Live{bl->nextOffset};
+            s.phase = Live{bl->nextOffset, bl->nextOffset};
             ++work;
         }
         ++i;

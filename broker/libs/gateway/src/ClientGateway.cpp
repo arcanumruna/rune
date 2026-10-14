@@ -4858,6 +4858,29 @@ int ClientGateway::flushPendingCatalogUnsubs_()
     return static_cast<int>(sent);
 }
 
+ClientGateway::CatalogOffer ClientGateway::tryOfferCatalogFrame(int64_t sessionId, const uint8_t* buf,
+                                                                std::size_t len)
+{
+    Session* s = sessions_.find(sessionId);
+    if (s == nullptr) return CatalogOffer::NoSession;
+    if (catalogBackPressureForTest_ == sessionId) [[unlikely]] return CatalogOffer::BackPressured;
+    // Answers queued ahead of it keep their order: the Records waits (never spills).
+    if (s->spill.state != SpillState::Normal) return CatalogOffer::BackPressured;
+    if (onControlFrame_) onControlFrame_(sessionId, buf, len);
+    return sendTo(*s, buf, len) ? CatalogOffer::Sent : CatalogOffer::BackPressured;
+}
+
+ClientGateway::CatalogRoom ClientGateway::catalogEgressRoom(int64_t sessionId)
+{
+    Session* s = sessions_.find(sessionId);
+    if (s == nullptr) return CatalogRoom::Gone;
+    if (catalogBackPressureForTest_ == sessionId) [[unlikely]] return CatalogRoom::NotYet;
+    if (s->spill.state != SpillState::Normal) return CatalogRoom::NotYet;
+    if (!s->egress) return CatalogRoom::Ready;   // egress-less test session (capture hook)
+    if (!s->egress->isConnected()) return CatalogRoom::NotYet;
+    return s->egress->availableWindow() >= kCatalogResumeWindowBytes ? CatalogRoom::Ready : CatalogRoom::NotYet;
+}
+
 void ClientGateway::noteViewSinkAwaitingPlan(int32_t viewTopicId)
 {
     if (!viewSinkAwaitingPlan(viewTopicId)) viewSinksAwaitingPlan_.push_back(viewTopicId);   // cold

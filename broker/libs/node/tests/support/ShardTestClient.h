@@ -408,6 +408,13 @@ public:
     /// Invoker mode: one duty cycle of this client's driver + conductor WITHOUT reading the egress (a client that
     /// pumps its Aeron runtime — status messages flow — but does not consume its acks).  No-op when threaded.
     void pumpWithoutReading() { pump_(); }
+    /// Catalog Task 12 fix round 0: a SLOW reader — one pass reading at most
+    /// `fragments` egress fragments (keepalives still flow).
+    void pollThrottled(int fragments) {
+        pump_();
+        keepalive_tick_();
+        if (egress_) egress_->poll(assembler_.handler(), fragments);
+    }
 
     /// DefineTopic (DDL) → the authoritative DefineTopicResponse (nullopt on timeout).
     std::optional<pc::DefineTopicResponse> defineTopic(const std::string& gatewayChannel, int32_t stream,
@@ -490,14 +497,14 @@ public:
     }
     int64_t sendAlterTopicConfig(const std::string& ch, int32_t stream, int64_t sid, std::string_view name,
                                  uint32_t expectedVersion, const std::vector<pc::ConfigChangeWire>& changes,
-                                 rune::protocol::RequestId rid = {}) {
+                                 rune::protocol::RequestId rid = {}, std::string_view statement = {}) {
         std::vector<uint8_t> block(pc::configChangesEncodedSize(changes.size()));
         if (pc::putConfigChanges(block.data(), std::span<const pc::ConfigChangeWire>(changes)) != block.size())
             return 0;
         pc::AlterTopicConfig m;
         m.sessionId = sid; m.correlationId = ++corr_; m.topicName = name; m.expectedVersion = expectedVersion;
         m.changes = block;
-        m.ext.clientName = "shard-test-client"; m.ext.requestId = ridOr_(rid);
+        m.ext.clientName = "shard-test-client"; m.ext.requestId = ridOr_(rid); m.ext.statement = statement;
         return sendEncoded_(ch, stream, m);
     }
     int64_t sendDropView(const std::string& ch, int32_t stream, int64_t sid, std::string_view name,

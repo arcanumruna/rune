@@ -992,6 +992,22 @@ public:
     // -----------------------------------------------------------------------
     // subscriptionCount — number of active subscriptions (for tests).
     // -----------------------------------------------------------------------
+    /// Catalog history Task 12 fix round 0 — control thread: catalog-read
+    /// flow control.  A Records frame of a catalog subscription is OFFERED, never
+    /// spilled: BackPressured when answers wait in the session's spill (order) or
+    /// the publication cannot take it now; the caller pauses the subscription.
+    enum class CatalogOffer : uint8_t { Sent, BackPressured, NoSession };
+    CatalogOffer tryOfferCatalogFrame(int64_t sessionId, const uint8_t* buf, std::size_t len);
+    /// Whether a paused catalog reader's session has room again: its spill is
+    /// empty and its publication's window holds at least kCatalogResumeWindowBytes
+    /// (or it is gone).
+    enum class CatalogRoom : uint8_t { Ready, NotYet, Gone };
+    static constexpr int64_t kCatalogResumeWindowBytes = 16 * 1024;
+    CatalogRoom catalogEgressRoom(int64_t sessionId);
+    /// Test seam (egress-less sessions): while set, every catalog offer to `sid`
+    /// is back-pressured and its room NotYet.
+    void setCatalogBackPressureForTest(int64_t sid, bool on) { catalogBackPressureForTest_ = on ? sid : 0; }
+
     /// Catalog history Task 12: catalog Subscribes forwarded to the admin thread /
     /// catalog Unsubscribes waiting for room on its request ring.
     [[nodiscard]] uint64_t catalogSubscribesForwarded() const noexcept { return catalogSubscribesForwarded_; }
@@ -2007,6 +2023,7 @@ private:
     // the retriable NotReady, never the worker's permanent UnknownView.  Cold
     // (one entry per view in creation); usually empty — one size check per read.
     std::vector<int32_t> viewSinksAwaitingPlan_;
+    int64_t catalogBackPressureForTest_ = 0;   // setCatalogBackPressureForTest (0 = none)
 
     // E5.1.3 (e): per-worker ingress active flag.
     //

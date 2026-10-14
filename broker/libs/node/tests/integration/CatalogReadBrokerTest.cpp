@@ -19,6 +19,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 using namespace rune::node;
@@ -201,4 +202,94 @@ TEST(CatalogReadBrokerRegression, HaltedBrokerStillServesItsCommittedCatalogRegr
     EXPECT_GE(s.markers[0], 2) << "both committed events are served, the tampered one included (it is committed)";
     EXPECT_LE(s.markers[0], catalogHw(halted));
     EXPECT_EQ(s.offsets, upTo(s.markers[0]));
+}
+
+// Fix round 0 (Task 12 ruling 1): a catalog reader SLOWER than its egress
+// window is PAUSED (its subscription keeps its own cursor; nothing queues for
+// it) and resumed when space returns — never expired for being slow (that would
+// kill the client's other subscriptions and produce).  It reads a catalog many
+// times larger than the window + the session spill quota to the end, its
+// session's spill never grows, and a FAST reader on another session is not held
+// back.  RED: the slow session's spill filled and the gateway expired it
+// (SessionExpired) — its catalog read never reached the end.
+TEST(CatalogReadBrokerRegression, SlowCatalogReaderIsPausedNeverExpiredAndAFastReaderIsUnaffectedRegression) {
+    ThreeNodes c = ThreeNodes::start("rd_slow");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int32_t leader = c.catalogLeaderId();
+    ASSERT_GT(leader, 0);
+    BrokerNode& node = c.node(leader);
+    ShardTestClient fast(c.dirs[0]->path / "fast-aeron");
+    fast.keepSessionsAlive(true);
+    fast.setClientVersion(pc::kClientVersion);
+    const int64_t sidF = connectSettled(fast, c, leader, 20s);
+    ASSERT_GT(sidF, 0);
+    ASSERT_EQ(defineSettled(fast, channelOf(c, leader), sidF, "cfg"), 0);
+    // ~4 MB of catalog: 40 events of ~100 KiB (the statement text).
+    const std::string statement(100 * 1024, 's');
+    for (int i = 0; i < 40; ++i) {
+        const int64_t corr = fast.sendAlterTopicConfig(channelOf(c, leader), kClientStream, sidF, "cfg", 0,
+                                                       {{1, 60'000 + i}}, {}, statement);
+        const auto a = fast.awaitDdl(corr, Clock::now() + 15s);
+        ASSERT_TRUE(a.has_value()) << i;
+        ASSERT_EQ(a->errorCode, 0) << i << " " << a->detail;
+    }
+    const int64_t hw = catalogHw(node);
+    ASSERT_GE(hw, 41);
+    const auto quota = rune::gateway::ClientGateway::spillSizing().sessionQuota;
+    ASSERT_GT(static_cast<std::size_t>(hw) * statement.size(), 6 * quota) << "a catalog several times the buffer";
+
+    ShardTestClient slow(c.dirs[0]->path / "slow-aeron");
+    slow.keepSessionsAlive(true);
+    slow.setClientVersion(pc::kClientVersion);
+    const int64_t sidS = connectSettled(slow, c, leader, 20s);
+    ASSERT_GT(sidS, 0);
+    const int64_t corrS = slow.sendCatalogSubscribe(channelOf(c, leader), kClientStream, sidS, -2);
+    const int64_t corrF = fast.sendCatalogSubscribe(channelOf(c, leader), kClientStream, sidF, -2);
+
+    std::size_t maxSpill = 0;
+    bool slowAlive = true;
+    std::optional<Clock::time_point> fastDone, slowDone;
+    const auto start = Clock::now();
+    auto caughtUp = [](const ShardTestClient& cl, std::optional<int64_t> id) {
+        return id && !seenBy(cl, *id).markers.empty();
+    };
+    auto lastSample = Clock::now();
+    uint64_t tick = 0;
+    for (const auto deadline = start + 90s; Clock::now() < deadline && !(fastDone && slowDone);) {
+        if (++tick % 4 == 0) slow.pollThrottled(1);   // 1 fragment / ~4 ms: far slower than the broker pushes
+        fast.pollThrottled(4096);
+        if (!fastDone && caughtUp(fast, fast.subscriptionIdOf(corrF))) fastDone = Clock::now();
+        if (!slowDone && caughtUp(slow, slow.subscriptionIdOf(corrS))) slowDone = Clock::now();
+        if (Clock::now() - lastSample > 20ms) {
+            lastSample = Clock::now();
+            const auto [spill, alive] = node.onControlThreadForTest([&node, sidS] {
+                auto* g = node.gatewayForTest();
+                return std::pair{g->spilledBytesForTest(sidS), g->sessionExistsForTest(sidS)};
+            });
+            maxSpill = std::max(maxSpill, spill);
+            slowAlive = slowAlive && alive;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+    for (const auto& e : slow.errors())
+        EXPECT_NE(e.code, static_cast<int16_t>(pc::ErrorCode::SessionExpired)) << "a slow reader is never expired";
+    EXPECT_TRUE(slowAlive) << "the slow session stayed";
+    ASSERT_TRUE(fastDone.has_value()) << "the fast reader caught up";
+    ASSERT_TRUE(slowDone.has_value()) << "the slow reader read the whole catalog to the end";
+    const Seen s = seenBy(slow, *slow.subscriptionIdOf(corrS));
+    EXPECT_EQ(s.markers.size(), 1u);
+    EXPECT_EQ(s.offsets, upTo(s.markers.at(0))) << "every record once, in order, to the end";
+    EXPECT_GE(s.markers.at(0), hw);
+    const Seen f = seenBy(fast, *fast.subscriptionIdOf(corrF));
+    EXPECT_EQ(f.offsets, upTo(f.markers.at(0)));
+    EXPECT_LE(maxSpill, 4u * 1024u) << "the slow session's spill never grew (catalog frames never spill)";
+    EXPECT_LT(*fastDone, *slowDone) << "the fast reader is not held back by the slow one";
+    EXPECT_LT(*fastDone - start, 10s) << "the fast reader is not held back by the slow one";
+    const auto [pauses, resumes, paused] = node.onControlThreadForTest([&node] {
+        const auto& f = node.catalogReadFlowForTest();
+        return std::tuple{f.pauses(), f.resumes(), f.paused()};
+    });
+    EXPECT_GT(pauses, 0u) << "non-vacuous: the slow reader was back-pressured (paused)";
+    EXPECT_EQ(resumes, pauses) << "every pause resumed";
+    EXPECT_EQ(paused, 0u) << "nothing left paused";
 }

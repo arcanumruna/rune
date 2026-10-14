@@ -5,6 +5,7 @@
 #include "support/CatalogRig.h"
 #include <gtest/gtest.h>
 #include <cstdlib>
+#include <cstring>
 #include <new>
 
 namespace {
@@ -63,6 +64,54 @@ TEST(CatalogAllocRegression, IdleCatalogSubscriptionsAllocateNothingRegression) 
     gArmedAllocs = 0;
     gArmed = true;
     for (int i = 0; i < 1000; ++i) (void)r.server.pump();
+    gArmed = false;
+    EXPECT_EQ(gArmedAllocs, 0u);
+}
+
+// Fix round 0: a PAUSED catalog reader (back-pressured session) costs nothing on
+// either thread — the server skips it, the control flow re-checks its room —
+// and neither allocates.
+#include <rune/node/CatalogReadFlow.h>
+namespace {
+struct NotYetSink {
+    using Offer = rune::node::CatalogReadFlow::Offer;
+    using Room  = rune::node::CatalogReadFlow::Room;
+    Offer tryOffer(int64_t, const uint8_t*, std::size_t) { return Offer::BackPressured; }
+    void  sendReliable(int64_t, const uint8_t*, std::size_t) {}
+    Room  room(int64_t) { return Room::NotYet; }
+    bool  postPaused(int64_t, int64_t, int64_t) { return true; }
+    bool  postResume(int64_t, int64_t) { return true; }
+};
+}   // namespace
+TEST(CatalogAllocRegression, PausedCatalogReaderAllocatesNothingRegression) {
+    rune::node::test::ReadRig r("rd_alloc_paused");
+    r.commitEvents(3);
+    r.server.subscribe(7, 1, -2);
+    r.server.pump();
+    const int64_t sub = r.frames.empty() ? 0 : [&] {
+        for (const auto& f : r.frames)
+            if (auto s = rune::protocol::client::SubscribeResponse::decode(f.bytes.data(), f.bytes.size()))
+                return s->subscriptionId;
+        return int64_t{0};
+    }();
+    r.server.onPaused(7, sub, 0);
+    ASSERT_STREQ(r.server.phaseName(sub), "Paused");
+    rune::node::CatalogReadFlow flow(8);
+    NotYetSink sink;
+    uint8_t frame[24 + 64] = {};
+    const int64_t s7 = 7, base = 0;
+    std::memcpy(frame, &s7, 8);
+    std::memcpy(frame + 8, &sub, 8);
+    std::memcpy(frame + 16, &base, 8);
+    flow.onFrame(frame, sizeof frame, sink);   // back-pressured → paused
+    flow.onFrame(frame, 24, sink);             // its ack → awaiting room
+    ASSERT_EQ(flow.paused(), 1u);
+    gArmedAllocs = 0;
+    gArmed = true;
+    for (int i = 0; i < 1000; ++i) {
+        (void)r.server.pump();
+        (void)flow.service(sink);
+    }
     gArmed = false;
     EXPECT_EQ(gArmedAllocs, 0u);
 }

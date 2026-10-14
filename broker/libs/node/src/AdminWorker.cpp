@@ -279,7 +279,7 @@ AdminWorker::AdminWorker(SchemaRegistry& reg,
         if (!deps_.catalogRead) spdlog::debug("AdminWorker: no catalog read egress wired — catalog reads not served");
         readServer_.emplace(*catalogReplica_,
                             deps_.catalogRead ? deps_.catalogRead
-                                              : CatalogReadEgress([](int64_t, std::span<const uint8_t>) { return false; }),
+                                              : CatalogReadEgress([](const CatalogReadFrameHead&, std::span<const uint8_t>) { return false; }),
                             kMaxCatalogSubscriptions, static_cast<int64_t>(selfId_ + 1) << 40);
     }
     eventBuf_.reserve(64 * 1024);
@@ -300,7 +300,7 @@ void AdminWorker::catalogSubscribe(const CatalogSubscribeMsg& m) {
     r.errorCode     = static_cast<int16_t>(pc::ErrorCode::Internal);
     uint8_t frame[pc::SubscribeResponse::ENCODED_SIZE];
     const std::size_t n = r.encode(frame);
-    (void)deps_.catalogRead(m.session, std::span<const uint8_t>(frame, n));   // cold: test configurations only
+    (void)deps_.catalogRead(CatalogReadFrameHead{m.session, 0, -1}, std::span<const uint8_t>(frame, n));   // cold: test configurations only
 }
 
 void AdminWorker::catalogUnsubscribe(const CatalogUnsubscribeMsg& m) {

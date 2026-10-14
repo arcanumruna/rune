@@ -195,6 +195,13 @@ public:
     /// committed).  No catalog replica: the Subscribe is answered Internal.
     void catalogSubscribe(const CatalogSubscribeMsg& m);
     void catalogUnsubscribe(const CatalogUnsubscribeMsg& m);
+    /// Fix round 0: catalog-read flow control from the control thread.
+    void catalogReadPaused(const CatalogReadPausedMsg& m) {
+        if (readServer_) readServer_->onPaused(m.session, m.subscriptionId, m.baseOffset);
+    }
+    void catalogReadResume(const CatalogReadResumeMsg& m) {
+        if (readServer_) readServer_->onResume(m.session, m.subscriptionId);
+    }
     [[nodiscard]] const CatalogReadServer* readServer() const noexcept { return readServer_ ? &*readServer_ : nullptr; }
 
     /// Task 20: resolve a view NAME for an open-for-read handshake.  Returns a
