@@ -222,7 +222,9 @@ inline LeaderlessMark decode(const uint8_t* buf, std::size_t len) noexcept {
     if (len < kSize || buf[0] != kTag) return m;
     const uint8_t kind = buf[1];
     if (kind != static_cast<uint8_t>(LeaderlessMark::Kind::EmptyMemoryLeader) &&
-        kind != static_cast<uint8_t>(LeaderlessMark::Kind::LogDirOffline))
+        kind != static_cast<uint8_t>(LeaderlessMark::Kind::LogDirOffline) &&
+        kind != static_cast<uint8_t>(LeaderlessMark::Kind::ReplicaUnbuildable) &&
+        kind != static_cast<uint8_t>(LeaderlessMark::Kind::HolderUnservable))
         return m;   // unknown kind (a newer binary): ignored
     m.kind = static_cast<LeaderlessMark::Kind>(kind);
     namespace d = rune::protocol::metadata::detail;

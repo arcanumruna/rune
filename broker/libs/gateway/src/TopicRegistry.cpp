@@ -1,4 +1,7 @@
 #include <rune/gateway/TopicRegistry.h>
+
+#include <climits>
+#include <fstream>
 #include <rune/catalog/TopicName.h>
 
 #include <spdlog/spdlog.h>
@@ -90,6 +93,48 @@ TopicRegistry::buildLive_(const rune::node::TopicSpec& spec, int32_t id)
     return live;
 }
 
+// Catalog history Task 11 fix round 3: a CATALOG topic's dir names its catalog id
+// ("committed <id>": its create committed — it is being applied), so a broker
+// whose catalog never applied the create (a halted boot replay) can still tell it
+// HOLDS this topic's data (scanLocalTopicData).  Boot-built static topics are
+// never marked (boot's reconcile contract).
+void
+TopicRegistry::markCatalogTopicDir_(const rune::node::TopicSpec& spec, int32_t id) const
+{
+    if (spec.persistence == rune::node::PersistenceMode::Transient || id < 0) return;
+    const fs::path marker = fs::path{dataDir_} / "topics" / spec.name / kTopicIdMarker;
+    std::error_code ec;
+    if (fs::exists(marker, ec)) return;   // already marked (an older writer's marker is kept)
+    std::ofstream f(marker, std::ios::trunc);
+    f << "committed " << id << '\n';
+    if (!f) spdlog::error("TopicRegistry: topic='{}' id={} — could not write its {} marker", spec.name, id,
+                          kTopicIdMarker);
+}
+
+TopicRegistry::LocalTopicData
+TopicRegistry::scanLocalTopicData(const std::string& dataDir)
+{
+    LocalTopicData out;
+    std::error_code ec;
+    const fs::path topics = fs::path(dataDir) / "topics";
+    for (const auto& e : fs::directory_iterator(topics, ec)) {
+        if (!e.is_directory(ec)) continue;
+        std::ifstream f(e.path() / kTopicIdMarker);
+        std::string state;
+        int64_t id = -1;
+        if (!(f >> state >> id) || (state != "committed" && state != "pending") || id < 0 || id > INT32_MAX) {
+            out.unmarkedDirs = true;   // unknown topic: conservatively a holder of anything
+            continue;
+        }
+        std::vector<int32_t>& parts = out.partitions[static_cast<int32_t>(id)];
+        for (const auto& pd : fs::directory_iterator(e.path(), ec)) {
+            if (!pd.is_directory(ec)) continue;
+            try { parts.push_back(std::stoi(pd.path().filename().string())); } catch (...) {}
+        }
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Catalog history Task 8: createTopicAt / reserveTopicAt / dropTopic / releaseDroppedLogs
 // ---------------------------------------------------------------------------
@@ -141,6 +186,7 @@ TopicRegistry::createTopicAt(int32_t topicId, const rune::node::TopicSpec& spec)
     ++catalogGeneration_;
     spdlog::info("TopicRegistry::createTopicAt: topic='{}' id={} partitions={} (catalog)",
                  spec.name, topicId, spec.partitionCount);
+    markCatalogTopicDir_(spec, topicId);   // Task 11 fix round 3
     return topicId;
 }
 

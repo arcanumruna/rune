@@ -3013,13 +3013,12 @@ rune::replication::AlterIsrMsg availability(int32_t topicId, int32_t partition, 
 bool contains32(const std::vector<int32_t>& v, int32_t x) { return std::find(v.begin(), v.end(), x) != v.end(); }
 } // namespace
 
-// The unbuildable broker LEADS the partition and no other broker is placeable:
-// it is removed from the replicas and the ISR, the leadership moves to an
-// in-sync member at a new epoch, it is never re-elected, and the partition is
-// held SHORT (explicit, counted, reasoned).  When it later builds the partition
-// it is re-added through the normal path (a replica again, joining the ISR as
-// its leader admits it).  RED (no report path): it stays leader of a partition
-// it does not host, with no state naming it.
+// The no-data broker LEADS the partition and no other broker is placeable: it is
+// removed from the replicas and the ISR (others hold the data), the leadership
+// moves to an in-sync member at a new epoch, it is never re-elected, and the
+// partition is held SHORT — derived from the committed map (fewer replicas
+// than the topic's rf), explicit and counted.  The mark is COMMITTED.  When it
+// can build, it is re-added through the normal path.
 TEST(CatalogHaltedPlacementRegression, UnbuildableLeaderIsRemovedNeverElectedAndHeldShortRegression) {
     CtlRig c;
     const int32_t L = c.pa().leaderNode;
@@ -3028,8 +3027,8 @@ TEST(CatalogHaltedPlacementRegression, UnbuildableLeaderIsRemovedNeverElectedAnd
     bool answer = false;
     (void)c.svc->onAlterIsr(availability(0, 0, L, 77, /*available=*/false), &resp, &answer);
     EXPECT_TRUE(answer) << "the report is acknowledged";
-    EXPECT_TRUE(c.svc->unbuildable(0, 0, L));
     c.drive(100);
+    EXPECT_TRUE(c.svc->unbuildable(0, 0, L)) << "the mark is committed on the assignment";
     const auto& pa = c.pa();
     EXPECT_FALSE(contains32(pa.replicas, L)) << "removed from the replicas";
     EXPECT_FALSE(contains32(pa.isr, L)) << "removed from the ISR";
@@ -3037,23 +3036,23 @@ TEST(CatalogHaltedPlacementRegression, UnbuildableLeaderIsRemovedNeverElectedAnd
     EXPECT_TRUE(contains32(pa.isr, pa.leaderNode));
     EXPECT_EQ(pa.leaderEpoch, le + 1) << "a new leadership";
     EXPECT_EQ(pa.replicas.size(), 2u);
+    EXPECT_EQ(c.svc->shortPartitionCount(), 1u) << "derived: 2 replicas < rf 3";
     EXPECT_EQ(c.svc->unplaceableTopicCount(), 1u) << "held short: explicit and counted";
     EXPECT_NE(c.svc->shortPlacedReason(0, 0).find("2 of 3 replicas"), std::string::npos)
         << c.svc->shortPlacedReason(0, 0);
-    // Rebalances never bring it back as leader.
     for (int i = 0; i < 5; ++i) c.tick();
     EXPECT_NE(c.pa().leaderNode, L);
     EXPECT_FALSE(contains32(c.pa().replicas, L));
-    // It builds the partition now (e.g. an operator cleared its halt): re-added.
+    // It builds the partition now: the mark is cleared and it is re-added.
     (void)c.svc->onAlterIsr(availability(0, 0, L, 77, /*available=*/true));
+    c.drive(100);
     EXPECT_FALSE(c.svc->unbuildable(0, 0, L));
     c.drive(100);
     EXPECT_TRUE(contains32(c.pa().replicas, L)) << "a replica again (it joins the ISR through AlterIsr)";
     EXPECT_EQ(c.svc->unplaceableTopicCount(), 0u);
 }
 
-// With a placeable broker outside the replicas, the partition is RE-PLACED on it
-// (back to its replica count) — not held short.
+// With a placeable broker outside the replicas, the partition is RE-PLACED on it.
 TEST(CatalogHaltedPlacementRegression, UnbuildableReplicaIsReplacedOnAPlaceableBrokerRegression) {
     CtlRig c;
     c.svc->addRuntimeTopic(TopicSpec{5, 1, 2, "", "rf2"});
@@ -3065,6 +3064,7 @@ TEST(CatalogHaltedPlacementRegression, UnbuildableReplicaIsReplacedOnAPlaceableB
     int32_t spare = -1;
     for (int32_t n : {1, 2, 3}) if (!contains32(pa->replicas, n)) spare = n;
     ASSERT_GT(spare, 0);
+    (void)c.svc->onAlterIsr(nodeControl(gone, 55, false));   // the reporter's process is known
     (void)c.svc->onAlterIsr(availability(5, 0, gone, 55, false));
     c.drive(100);
     pa = c.svc->assignment(5, 0);
@@ -3073,7 +3073,106 @@ TEST(CatalogHaltedPlacementRegression, UnbuildableReplicaIsReplacedOnAPlaceableB
     EXPECT_EQ(pa->replicas.size(), 2u);
     EXPECT_NE(pa->leaderNode, gone);
     EXPECT_EQ(c.svc->unplaceableTopicCount(), 0u);
-    // A new process of the reporter clears its mark (normal path back).
-    (void)c.svc->onAlterIsr(nodeControl(gone, 56, false));
+    // Review M3: a late report of an OLDER process is dropped.
+    (void)c.svc->onAlterIsr(nodeControl(gone, 56, false));   // a new process
+    c.drive(100);
+    EXPECT_FALSE(c.svc->unbuildable(5, 0, gone)) << "the new process's node is no longer marked";
+    (void)c.svc->onAlterIsr(availability(5, 0, spare, 1, false));   // another node, unknown identity: decided
+    (void)c.svc->onAlterIsr(availability(5, 0, gone, 55, false));   // stale identity of `gone`: dropped
+    c.drive(100);
     EXPECT_FALSE(c.svc->unbuildable(5, 0, gone));
 }
+
+// Round 3 (a/b): a broker that HOLDS the data (its boot replay halted before the
+// create) and is the SOLE in-sync replica is NEVER removed; the partition is
+// BLOCKED — explicit, counted, logged — with every replica excluded from
+// election (no unclean / out-of-sync replica can take over and lose its
+// committed data).  Once it serves again (a new process) the mark is cleared
+// and it leads again with its data.  RED (round 2): the report emptied the ISR
+// (ISR {} + NO_LEADER: the committed data's only holder removed).
+TEST(CatalogHaltedPlacementRegression, HaltedHolderThatIsTheSoleIsrMemberIsNeverRemovedRegression) {
+    CtlRig c;
+    c.soleIsr();
+    const int32_t L = c.pa().leaderNode;
+    (void)c.svc->onAlterIsr(nodeControl(L, 90, false));
+    auto holder = availability(0, 0, L, 90, false);
+    holder.isr[1] |= rune::replication::AlterIsrMsg::kBumpReplicaHoldsData;
+    (void)c.svc->onAlterIsr(holder);
+    c.drive(100);
+    EXPECT_TRUE(c.svc->holderUnservable(0, 0, L));
+    EXPECT_TRUE(contains32(c.pa().replicas, L)) << "a data holder is never removed";
+    EXPECT_EQ(c.pa().isr, std::vector<int32_t>{L}) << "the ISR keeps its only in-sync replica";
+    EXPECT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER) << "it cannot serve: leaderless, explicitly";
+    EXPECT_EQ(c.svc->blockedPartitionCount(), 1u);
+    EXPECT_GE(c.svc->unplaceableTopicCount(), 1u);
+    EXPECT_NE(c.svc->shortPlacedReason(0, 0).find("BLOCKED on broker " + std::to_string(L)), std::string::npos)
+        << c.svc->shortPlacedReason(0, 0);
+    for (int i = 0; i < 5; ++i) c.tick();
+    EXPECT_EQ(c.pa().leaderNode, rune::metadata::NO_LEADER) << "no other replica is ever elected";
+    EXPECT_EQ(c.pa().isr, std::vector<int32_t>{L});
+    // Fixed (a new process registers): the mark clears and it leads again.
+    (void)c.svc->onAlterIsr(nodeControl(L, 91, false));
+    c.drive(100);
+    EXPECT_FALSE(c.svc->holderUnservable(0, 0, L));
+    c.tick();
+    EXPECT_EQ(c.pa().leaderNode, L) << "the holder leads again — its committed data intact";
+    EXPECT_EQ(c.svc->blockedPartitionCount(), 0u);
+}
+
+// Round 3 (b): a NO-DATA broker that is nonetheless the sole ISR member is not
+// removed either (never empty the ISR) — the partition is blocked, explicitly.
+TEST(CatalogHaltedPlacementRegression, NoDataSoleIsrMemberIsNotRemovedTheIsrNeverEmptiesRegression) {
+    CtlRig c;
+    c.soleIsr();
+    const int32_t L = c.pa().leaderNode;
+    (void)c.svc->onAlterIsr(availability(0, 0, L, 92, false));
+    c.drive(100);
+    EXPECT_FALSE(c.pa().isr.empty()) << "the ISR never empties";
+    EXPECT_TRUE(contains32(c.pa().replicas, L));
+    EXPECT_EQ(c.svc->blockedPartitionCount(), 1u);
+}
+
+// Round 3 (c): the held-short state lives in COMMITTED metadata.  A successor
+// controller counts it and logs it on its first pass, and tops it up once a
+// broker becomes placeable.  RED (round 2): the short state was controller
+// memory — the successor's count read 0 and nothing ever topped it up.
+TEST(CatalogHaltedPlacementRegression, ShortPartitionIsReportedAndToppedUpAfterAControllerHandoverRegression) {
+    CtlRig c;
+    (void)c.svc->onAlterIsr(nodeControl(3, 77, false));
+    (void)c.svc->onAlterIsr(availability(0, 0, 3, 77, false));
+    c.drive(100);
+    ASSERT_FALSE(contains32(c.pa().replicas, 3));
+    ASSERT_EQ(c.svc->shortPartitionCount(), 1u);
+
+    MetadataService svc2(c.r2.get(), 2);   // the successor (follower until now)
+    svc2.configure(c.topics, c.all);
+    auto drive2 = [&](int n) {
+        for (int i = 0; i < n; ++i) {
+            c.clock += 1'000'000LL;
+            c.r1->doWork(c.clock); c.r2->doWork(c.clock); c.r3->doWork(c.clock);
+            c.transport.pump(c.clock);
+            (void)svc2.doWork(c.clock);
+        }
+    };
+    drive2(50);
+    c.r1->becomeFollower(2, 2);
+    c.r2->becomeLeader(2, c.all);
+    c.r3->becomeFollower(2, 2);
+    c.transport.setLeader(c.r2.get());
+    c.transport.removeFollower(2);
+    c.transport.addFollower(1, c.r1.get());
+    drive2(200);
+    ASSERT_TRUE(svc2.controllerCaughtUpForTest());
+    EXPECT_EQ(svc2.shortPartitionCount(), 1u) << "derived from the committed map by the successor";
+    EXPECT_EQ(svc2.unplaceableTopicCount(), 1u);
+    EXPECT_TRUE(svc2.unbuildable(0, 0, 3)) << "the committed mark survives the handover";
+    // Broker 3 restarts (a new process): the mark clears, the successor tops up.
+    (void)svc2.onAlterIsr(nodeControl(3, 78, false));
+    drive2(200);
+    EXPECT_FALSE(svc2.unbuildable(0, 0, 3));
+    const auto* pa = svc2.assignment(0, 0);
+    ASSERT_NE(pa, nullptr);
+    EXPECT_TRUE(contains32(pa->replicas, 3)) << "topped up by the successor";
+    EXPECT_EQ(svc2.shortPartitionCount(), 0u);
+}
+

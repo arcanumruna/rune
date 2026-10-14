@@ -477,6 +477,10 @@ struct AlterIsrMsg {
     /// 32 bits).  Re-sent while the condition and the committed map hold it.
     static constexpr int32_t kBumpReplicaUnavailable = 1024;
     static constexpr int32_t kBumpReplicaAvailable   = 2048;
+    /// With kBumpReplicaUnavailable (fix round 3): the reporter HOLDS the
+    /// partition's data on disk (it cannot serve it — e.g. its catalog apply
+    /// halted before the create): it is never removed, never elected.
+    static constexpr int32_t kBumpReplicaHoldsData   = 4096;
     /// Controlled shutdown (Kafka parity) — NODE-level requests on the same
     /// channel: topicId == kNodeControlTopicId (no partition), leaderId = the
     /// requesting node, isrCount == kLeaderEpochBump, isr[1] = flags,

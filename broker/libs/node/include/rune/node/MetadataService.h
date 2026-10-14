@@ -411,19 +411,11 @@ public:
     // mark set or cleared, a configure) and on every controller catch-up.
     // -----------------------------------------------------------------------
     struct UnplaceableTopic { std::string reason; };
-    /// Task 11 fix round 2: a replica its broker reported it cannot build (per process).
-    struct UnbuildableReplica { int32_t topicId; int32_t partition; int32_t node; int64_t incarnation; };
+
     /// Topics held Unplaceable: never placed (unplaceable_), or placed short of
     /// their replica count (shortPlaced_, fix round 2) — distinct topic ids.
     [[nodiscard]] std::size_t unplaceableTopicCount() const noexcept {
-        std::size_t n = unplaceable_.size();
-        int32_t last = INT32_MIN;
-        for (const auto& [k, r] : shortPlaced_) {
-            const auto t = static_cast<int32_t>(k >> 32);
-            if (t != last && !unplaceable_.contains(t)) ++n;
-            last = t;
-        }
-        return n;
+        return unplaceable_.size() + derived_.unhealthyTopics;
     }
     /// The reason `topicId` is unplaceable ("" = it is not).
     [[nodiscard]] std::string unplaceableReason(int32_t topicId) const {
@@ -788,11 +780,9 @@ public:
             return false;
         }
         st.capable = true;
-        // Task 11 fix round 2: a new process may build what an older one could not.
-        if (std::erase_if(unbuildable_, [&](const UnbuildableReplica& u) {
-                return u.node == m.leaderId && u.incarnation != 0 && u.incarnation != st.nonce;
-            }) != 0)
-            ++routingInputsEpoch_;
+        // Task 11 fix round 3: a new process may serve what an older one could not
+        // (reconcileReplicaMarks_ clears its node's committed marks).
+        if (st.nonce != 0) ++routingInputsEpoch_;
         if (wasHalted && !st.catalogHalted) {   // Task 11 fix round 1: a new, healthy process
             ++routingInputsEpoch_;
             spdlog::info("MetadataService[{}]: node {} restarted with a healthy catalog — a placement target again",
@@ -1019,11 +1009,7 @@ public:
             std::erase_if(offlineReplicas_, [&](const OfflineReplica& o) {
                 return o.node == node && o.incarnation != inc;
             });
-        // Task 11 fix round 2: a new process may build what the old one could not.
-        if (std::erase_if(unbuildable_, [&](const UnbuildableReplica& u) {
-                return u.node == node && u.incarnation != inc && u.incarnation != 0;
-            }) != 0)
-            ++routingInputsEpoch_;
+        ++routingInputsEpoch_;   // Task 11 fix round 3: marks of the old process are re-derived (cleared)
     }
     void markOffline_(int32_t topicId, int32_t partition, int32_t node, int64_t inc) {
         for (auto& o : offlineReplicas_)
@@ -1386,11 +1372,7 @@ public:
     // Task 11 fix round 1 (I1/I2): the explicit Unplaceable state (control thread).
     std::map<int32_t, UnplaceableTopic> unplaceable_;
     std::vector<int32_t>                haltedScratch_;   // M2: reused (capacity persists)
-    // Task 11 fix round 2: replicas a broker cannot build + partitions held short.
-    std::vector<UnbuildableReplica>     unbuildable_;
-    std::map<int64_t, std::string>      shortPlaced_;
-    uint64_t                            shortTriedEpoch_   = ~0ull;
-    uint64_t                            unbuildableReports_ = 0;
+
     uint64_t                            unplaceableEvents_     = 0;
     uint64_t                            unplaceableTriedEpoch_ = ~0ull;
     [[nodiscard]] bool isEligible_(int32_t n) const noexcept {
@@ -1508,8 +1490,14 @@ public:
         }
         // N1 / N2: never (re-)elected by the balancer while marked.
         for (const auto& o : offlineReplicas_) out.push_back({o.topicId, o.partition, o.node});
-        // Task 11 fix round 2: a broker that cannot build the partition never leads it.
-        for (const auto& u : unbuildable_) out.push_back({u.topicId, u.partition, u.node});
+        // Task 11 fix rounds 2–3: a marked replica never leads (committed marks);
+        // a BLOCKED partition elects nobody — every replica excluded, so no
+        // unclean election can lose the marked holder's committed data.
+        msm_.committedMap().forEach([&](int32_t t, int32_t p, const rune::metadata::PartitionAssignment& pa) {
+            if (!rune::metadata::isReplicaMark(pa.mark.kind)) return;
+            if (blockedOn_(pa)) { for (int32_t n : pa.replicas) out.push_back({t, p, n}); return; }
+            out.push_back({t, p, pa.mark.node});
+        });
         for (const auto& [k, e] : emptyMemoryLeader_)
             out.push_back({static_cast<int32_t>(k >> 32), static_cast<int32_t>(static_cast<uint32_t>(k)), e.requester});
     }
@@ -1984,7 +1972,7 @@ public:
         if (amLeader) maybeRaiseFeatureLevel_();   // D15 (no-op once at the supported level)
         if (amLeader) maybeConfirmSingleNodeLineages_();   // C1 (single node only)
         if (amLeader) retryUnplaceable_();                  // Task 11 fix round 1 (I1/I2)
-        if (amLeader) reconcileUnbuildable_();              // Task 11 fix round 2
+        if (amLeader) reconcileReplicaMarks_();             // Task 11 fix rounds 2–3
         if (hw <= 0 || hw <= lastApplied_) {
             // Nothing new to apply.  Still call commit() so pending records
             // already decoded in a prior partial cycle get committed.
@@ -2333,6 +2321,7 @@ private:
         namespace rm = rune::metadata;
         msm_.committedMap().forEach([&](int32_t topicId, int32_t partition, const rm::PartitionAssignment& pa) {
             if (pa.leaderNode != rm::NO_LEADER || pa.mark.kind == rm::LeaderlessMark::Kind::None) return;
+            if (rm::isReplicaMark(pa.mark.kind)) return;   // Task 11 fix round 3: reconcileReplicaMarks_ owns these
             const int64_t key = partitionKey_(topicId, partition);
             if (pa.mark.kind == rm::LeaderlessMark::Kind::LogDirOffline)
                 markOffline_(topicId, partition, pa.mark.node, pa.mark.incarnation);
@@ -2400,61 +2389,164 @@ private:
                          selfId_, spec.topicId, spec.rf, liveNodes_.size(), spec.rf);
     }
     // -----------------------------------------------------------------------
-    // Catalog history Task 11 fix round 2 — replicas a broker CANNOT build.
+    // Catalog history Task 11 fix rounds 2–3 — replicas a broker cannot SERVE.
     //
-    // A broker in a partition's replicas that cannot build it (its catalog halted
-    // before the create, the create not applied within the grace, a build
-    // failure — any reason) reports kBumpReplicaUnavailable.  The controller
-    // records the mark (per node PROCESS: a new process clears it) and, on the
-    // next reconcile pass, commits the partition WITHOUT that broker: removed
-    // from the replicas and the ISR, the leadership moved to a live in-sync
-    // member if it led (never elected while marked — excludedLeaders), and a
-    // placeable broker added in its place up to the topic's replica count.
-    // When none is placeable the partition is held SHORT — explicit, counted in
-    // unplaceableTopicCount() and the gauge, logged — and retried on every
-    // placement-input change (a kBumpReplicaAvailable report or a new process
-    // clears the mark and makes the broker a candidate again).
+    // A broker in a partition's replicas without a built local replica reports
+    // WHY (kBumpReplica*):
+    //   * Unavailable — it holds NO local data (never applied the create): the
+    //     controller removes it from the replicas and the ISR, moves the
+    //     leadership to a LIVE in-sync member, and adds placeable brokers up to
+    //     the topic's replication factor — unless removing it would EMPTY the
+    //     ISR: then nothing is removed (round 3, b) and the partition is
+    //     BLOCKED (explicit, counted, logged) until the broker can serve.
+    //   * Unservable — it HOLDS the data on disk but cannot serve it (its
+    //     catalog apply halted before the create, e.g. mid boot replay): never
+    //     removed (round 3, a/b), never elected leader; when it is the last
+    //     in-sync replica the partition is BLOCKED — leaderless with every
+    //     replica excluded from election (no unclean election can lose its
+    //     committed data) — until it serves again.
+    //   * Available — it can serve now: the mark is cleared (the normal path:
+    //     failover elects it / the short top-up re-adds it).
+    // Every mark is COMMITTED on the partition's assignment record
+    // (LeaderlessMark ReplicaUnbuildable / HolderUnservable, carried forward by
+    // every later record until cleared), and every state — held short (fewer
+    // replicas than the topic's rf), blocked, never placed — is DERIVED from
+    // the committed map: a new controller counts, logs and repairs them on its
+    // first pass (round 3, c).  A mark of an older process of the node is
+    // cleared (a new process may serve).
     // -----------------------------------------------------------------------
 public:
+    /// The committed replica mark of (topicId, partition) names `node` as unable to build it (no data).
     [[nodiscard]] bool unbuildable(int32_t topicId, int32_t partition, int32_t node) const noexcept {
-        for (const auto& u : unbuildable_)
-            if (u.topicId == topicId && u.partition == partition && u.node == node) return true;
-        return false;
+        const auto* pa = msm_.assignment(topicId, partition);
+        return pa != nullptr && pa->mark.kind == rune::metadata::LeaderlessMark::Kind::ReplicaUnbuildable &&
+               pa->mark.node == node;
     }
-    [[nodiscard]] std::size_t unbuildableMarks() const noexcept { return unbuildable_.size(); }
-    /// The reason (topicId, partition) is held short of its replica count ("" = it is not).
+    /// … names `node` as holding the data but unable to serve it.
+    [[nodiscard]] bool holderUnservable(int32_t topicId, int32_t partition, int32_t node) const noexcept {
+        const auto* pa = msm_.assignment(topicId, partition);
+        return pa != nullptr && pa->mark.kind == rune::metadata::LeaderlessMark::Kind::HolderUnservable &&
+               pa->mark.node == node;
+    }
+    /// Derived from the committed map (round 3): partitions with fewer replicas
+    /// than their topic's rf; partitions BLOCKED (leaderless behind a marked holder).
+    [[nodiscard]] std::size_t shortPartitionCount() const noexcept { return derived_.shortPartitions; }
+    [[nodiscard]] std::size_t blockedPartitionCount() const noexcept { return derived_.blockedPartitions; }
+    /// The explicit reason (topicId, partition) is short or blocked ("" = neither).
     [[nodiscard]] std::string shortPlacedReason(int32_t topicId, int32_t partition) const {
-        const auto it = shortPlaced_.find(partitionKey_(topicId, partition));
-        return it == shortPlaced_.end() ? std::string{} : it->second;
+        const auto* pa = msm_.assignment(topicId, partition);
+        if (pa == nullptr) return {};
+        return partitionHealthReason_(topicId, partition, *pa);
     }
 private:
+    struct DerivedPlacement {
+        uint64_t    version = ~0ull;           // committedVersion it was derived at
+        uint64_t    inputs  = ~0ull;           // routingInputsEpoch_ it was derived at
+        std::size_t shortPartitions   = 0;
+        std::size_t blockedPartitions = 0;
+        std::size_t unhealthyTopics   = 0;     // distinct topics short or blocked
+    };
+    DerivedPlacement derived_;
+    std::map<int64_t, std::string> loggedHealth_;   // log dedupe only (the STATE is the committed map)
+
+    [[nodiscard]] static bool blockedOn_(const rune::metadata::PartitionAssignment& pa) noexcept {
+        return pa.leaderNode == rune::metadata::NO_LEADER && rune::metadata::isReplicaMark(pa.mark.kind);
+    }
+    [[nodiscard]] std::string partitionHealthReason_(int32_t topicId, int32_t partition,
+                                                     const rune::metadata::PartitionAssignment& pa) const {
+        if (blockedOn_(pa))
+            return "partition " + std::to_string(partition) + " is BLOCKED on broker " + std::to_string(pa.mark.node) +
+                   (pa.mark.kind == rune::metadata::LeaderlessMark::Kind::HolderUnservable
+                        ? " — it holds the committed data but cannot serve it (catalog apply halted); leaderless, "
+                          "no other replica is elected (no data loss) until it serves again"
+                        : " — its last in-sync replica cannot build it; leaderless until it can");
+        const std::size_t target = targetReplicas_(topicId, pa.replicas.size());
+        if (pa.replicas.size() >= target) return {};
+        std::string halted;
+        for (int32_t n : liveNodes_)
+            if (catalogHalted(n)) halted += (halted.empty() ? "" : ",") + std::to_string(n);
+        return "partition " + std::to_string(partition) + " has " + std::to_string(pa.replicas.size()) + " of " +
+               std::to_string(target) + " replicas: no other placeable broker" +
+               (halted.empty() ? std::string{} : " (catalog apply halted on broker(s) " + halted + ")");
+    }
 
     template <typename Reply>
     bool onReplicaAvailability_(const rune::replication::AlterIsrMsg& m,
                                 const rune::metadata::PartitionAssignment& pa, Reply& reply) {
         namespace rr = rune::replication;
-        const int64_t inc = incarnationOf_(m);
-        if ((m.isr[1] & rr::AlterIsrMsg::kBumpReplicaAvailable) != 0) {
-            const auto before = unbuildable_.size();
-            std::erase_if(unbuildable_, [&](const UnbuildableReplica& u) {
-                return u.topicId == m.topicId && u.partition == m.partition && u.node == m.leaderId;
-            });
-            if (unbuildable_.size() != before) {
-                ++routingInputsEpoch_;   // a candidate again: the short retry may re-add it
-                spdlog::info("MetadataService[{}]: node {} built ({}, {}) — a placement candidate again", selfId_,
-                             m.leaderId, m.topicId, m.partition);
-            }
-            reply(rr::kAlterIsrOk, pa.partitionEpoch);
+        namespace rm = rune::metadata;
+        reply(rr::kAlterIsrOk, pa.partitionEpoch);
+        const int32_t node = m.leaderId;
+        const int64_t inc  = incarnationOf_(m);
+        // Review M3: a late report of an OLDER process of the node is dropped.
+        if (const auto it = nodeLifecycle_.find(node);
+            inc != 0 && it != nodeLifecycle_.end() && it->second.nonce != 0 && it->second.nonce != inc)
+            return false;
+        if (catalogHalted(selfId_)) return false;               // a halted controller decides no catalog placement
+        if (keyBusy_(m.topicId, m.partition)) return false;    // the reporter re-sends
+        if (pa.mark.kind != rm::LeaderlessMark::Kind::None && !rm::isReplicaMark(pa.mark.kind))
+            return false;   // the slot holds a D15 leaderless reason: decided there first
+        const bool available   = (m.isr[1] & rr::AlterIsrMsg::kBumpReplicaAvailable) != 0;
+        const bool holdsData   = (m.isr[1] & rr::AlterIsrMsg::kBumpReplicaHoldsData) != 0;
+        const bool inReplicas  = std::find(pa.replicas.begin(), pa.replicas.end(), node) != pa.replicas.end();
+        if (available) {
+            if (!rm::isReplicaMark(pa.mark.kind) || pa.mark.node != node) return false;
+            spdlog::info("MetadataService[{}]: node {} can serve ({}, {}) now — its mark is cleared", selfId_, node,
+                         m.topicId, m.partition);
+            enqueueReplicaChange_(pa, pa.replicas, pa.isr, pa.leaderNode, m.topicId, m.partition, rm::LeaderlessMark{},
+                                  /*clear=*/true);
+            drainDynamicQueue();
             return false;
         }
-        if (!unbuildable(m.topicId, m.partition, m.leaderId)) {
-            unbuildable_.push_back({m.topicId, m.partition, m.leaderId, inc});
-            ++unbuildableReports_;
-            spdlog::warn("MetadataService[{}]: node {} cannot build ({}, {}) — removing it from the replicas and the "
-                         "ISR, never its leader", selfId_, m.leaderId, m.topicId, m.partition);
+        if (!inReplicas) return false;
+        if (rm::isReplicaMark(pa.mark.kind) && pa.mark.node == node) return false;   // already decided
+        const rm::LeaderlessMark mark{holdsData ? rm::LeaderlessMark::Kind::HolderUnservable
+                                                : rm::LeaderlessMark::Kind::ReplicaUnbuildable,
+                                      node, inc};
+        std::vector<int32_t> replicas = pa.replicas, isr = pa.isr;
+        std::vector<int32_t> isrWithout;
+        for (int32_t n : pa.isr) if (n != node) isrWithout.push_back(n);
+        // Round 3 (b): a holder is never removed; a no-data replica only while the
+        // ISR keeps a member (the data holders).  Otherwise: BLOCKED, explicit.
+        const bool remove = !holdsData && !isrWithout.empty();
+        if (remove) {
+            std::erase(replicas, node);
+            isr = isrWithout;
         }
-        reply(rr::kAlterIsrOk, pa.partitionEpoch);
-        return false;   // decided by reconcileUnbuildable_ (the gated record queue)
+        int32_t leader = pa.leaderNode;
+        if (leader == node || leader == rm::NO_LEADER || std::find(isr.begin(), isr.end(), leader) == isr.end()) {
+            leader = pickLiveLeader_(m.topicId, m.partition, isr, node);
+            if (leader != rm::NO_LEADER) {
+                auto it = std::find(isr.begin(), isr.end(), leader);
+                std::rotate(isr.begin(), it, it + 1);
+            }
+        }
+        if (remove) {   // top up to the replication factor on placeable brokers
+            std::vector<int32_t> candidates;
+            replacementCandidates_(m.topicId, m.partition, replicas, node, candidates);
+            const std::size_t target = targetReplicas_(m.topicId, pa.replicas.size());
+            for (int32_t c : candidates) if (replicas.size() < target) replicas.push_back(c);
+        }
+        spdlog::warn("MetadataService[{}]: node {} cannot serve ({}, {}) ({}) — {}; leader {}", selfId_, node,
+                     m.topicId, m.partition, holdsData ? "it holds the data" : "no local data",
+                     remove ? "removed from the replicas and the ISR" : "kept (never removes a data holder or the "
+                                                                       "last in-sync replica), never its leader",
+                     leader);
+        enqueueReplicaChange_(pa, std::move(replicas), std::move(isr), leader, m.topicId, m.partition, mark, false);
+        drainDynamicQueue();
+        return false;
+    }
+
+    /// A LIVE in-sync member to lead (review M1): not `exclude`, not stopping,
+    /// not offline, alive by the controller's eligible set when known.
+    [[nodiscard]] int32_t pickLiveLeader_(int32_t topicId, int32_t partition, const std::vector<int32_t>& isr,
+                                          int32_t exclude) const noexcept {
+        for (int32_t n : isr) {
+            if (n == exclude || isShutting_(n) || isOffline_(topicId, partition, n)) continue;
+            if (eligibleKnown_ && !isEligible_(n) && n != selfId_) continue;
+            return n;
+        }
+        return rune::metadata::NO_LEADER;
     }
 
     [[nodiscard]] bool keyBusy_(int32_t topicId, int32_t partition) const noexcept {
@@ -2470,22 +2562,25 @@ private:
         return fallback;
     }
     /// Placeable brokers that may join (topicId, partition): not already a replica,
-    /// not catalog-halted, not marked unbuildable for it, not stopping.
+    /// not catalog-halted, not stopping, not the marked broker of its committed mark.
     void replacementCandidates_(int32_t topicId, int32_t partition, const std::vector<int32_t>& replicas,
-                                std::vector<int32_t>& out) const {
+                                int32_t markedNode, std::vector<int32_t>& out) const {
         out.clear();
+        (void)topicId; (void)partition;
         for (int32_t n : liveNodes_) {
-            if (catalogHalted(n) || isShutting_(n) || unbuildable(topicId, partition, n)) continue;
+            if (n == markedNode || catalogHalted(n) || isShutting_(n)) continue;
             if (std::find(replicas.begin(), replicas.end(), n) != replicas.end()) continue;
             out.push_back(n);
         }
     }
-    /// Commit (topicId, partition) as `replicas` / `isr` / `leader` (cold).
-    void enqueuePartitionChange_(const rune::metadata::PartitionAssignment& pa, std::vector<int32_t> replicas,
-                                 std::vector<int32_t> isr, int32_t leader, int32_t topicId, int32_t partition) {
+    void enqueueReplicaChange_(const rune::metadata::PartitionAssignment& pa, std::vector<int32_t> replicas,
+                               std::vector<int32_t> isr, int32_t leader, int32_t topicId, int32_t partition,
+                               rune::metadata::LeaderlessMark mark, bool clear) {
         rune::metadata::BalancerRecord br;
         br.isr      = std::move(isr);
         br.replicas = std::move(replicas);
+        br.mark     = mark;
+        br.clearsReplicaMark = clear;
         br.rec.topicId        = topicId;
         br.rec.partition      = partition;
         br.rec.leaderNode     = leader;
@@ -2495,84 +2590,77 @@ private:
         br.rec.replicas = rune::protocol::metadata::Int32ArrayView{br.replicas.data(), static_cast<uint16_t>(br.replicas.size())};
         pendingDynamicRecords_.push_back(std::move(br));
     }
-    /// Controller pass: every committed partition still naming an unbuildable
-    /// broker is re-committed without it; every short partition is topped up when
-    /// a candidate exists.  Allocation-free when there is nothing to do.
-    void reconcileUnbuildable_() {
-        if ((unbuildable_.empty() && shortPlaced_.empty()) || !controllerReady_() || catalogHalted(selfId_)) return;
+
+    /// Controller pass (round 3, c): every state DERIVED from the committed map
+    /// on a map / input change — counted, logged once per reason, repaired:
+    ///   * a mark of an older process of its node is cleared;
+    ///   * a short partition is topped up when a placeable broker exists.
+    /// A new controller's first pass rebuilds and reports everything.
+    /// Allocation-free when neither the committed map nor the inputs changed.
+    void reconcileReplicaMarks_() {
+        if (!controllerReady_() || catalogHalted(selfId_)) return;
+        const uint64_t v = msm_.committedVersion();
+        if (v == derived_.version && routingInputsEpoch_ == derived_.inputs) [[likely]] return;
+        derived_.version = v;
+        derived_.inputs  = routingInputsEpoch_;
+        namespace rm = rune::metadata;
+        std::size_t shortN = 0, blockedN = 0;
+        std::vector<int32_t> unhealthyTopics, candidates;
+        std::vector<int64_t> seen;
         bool queued = false;
-        std::vector<int32_t> candidates;
-        for (const auto& u : unbuildable_) {
-            const rune::metadata::PartitionAssignment* pa = msm_.assignment(u.topicId, u.partition);
-            if (pa == nullptr || keyBusy_(u.topicId, u.partition)) continue;
-            if (std::find(pa->replicas.begin(), pa->replicas.end(), u.node) == pa->replicas.end()) continue;
-            std::vector<int32_t> replicas, isr;
-            for (int32_t n : pa->replicas) if (!unbuildable(u.topicId, u.partition, n)) replicas.push_back(n);
-            for (int32_t n : pa->isr)      if (!unbuildable(u.topicId, u.partition, n)) isr.push_back(n);
-            int32_t leader = pa->leaderNode;
-            if (leader < 0 || unbuildable(u.topicId, u.partition, leader) ||
-                std::find(isr.begin(), isr.end(), leader) == isr.end()) {
-                leader = rune::metadata::NO_LEADER;
-                for (int32_t n : isr)
-                    if (!isShutting_(n) && !isOffline_(u.topicId, u.partition, n)) { leader = n; break; }
-                if (leader != rune::metadata::NO_LEADER) {   // leader first in the ISR
-                    auto it = std::find(isr.begin(), isr.end(), leader);
-                    std::rotate(isr.begin(), it, it + 1);
+        msm_.committedMap().forEach([&](int32_t t, int32_t p, const rm::PartitionAssignment& pa) {
+            if (t < 0) return;
+            const int64_t key = partitionKey_(t, p);
+            // A mark of an older process of its node: a new process may serve.
+            if (rm::isReplicaMark(pa.mark.kind) && !keyBusy_(t, p)) {
+                const auto it = nodeLifecycle_.find(pa.mark.node);
+                if (pa.mark.incarnation != 0 && it != nodeLifecycle_.end() && it->second.nonce != 0 &&
+                    it->second.nonce != pa.mark.incarnation) {
+                    enqueueReplicaChange_(pa, pa.replicas, pa.isr, pa.leaderNode, t, p, rm::LeaderlessMark{}, true);
+                    queued = true;
+                    return;
                 }
             }
-            replacementCandidates_(u.topicId, u.partition, replicas, candidates);
-            const std::size_t target = targetReplicas_(u.topicId, pa->replicas.size());
-            for (int32_t c : candidates) if (replicas.size() < target) replicas.push_back(c);
-            noteShort_(u.topicId, u.partition, replicas.size(), target);
-            spdlog::warn("MetadataService[{}]: ({}, {}) re-placed without node {}: replicas {} of {}, leader {}", selfId_,
-                         u.topicId, u.partition, u.node, replicas.size(), target, leader);
-            enqueuePartitionChange_(*pa, std::move(replicas), std::move(isr), leader, u.topicId, u.partition);
-            queued = true;
-        }
-        if (!shortPlaced_.empty() && routingInputsEpoch_ != shortTriedEpoch_) {
-            shortTriedEpoch_ = routingInputsEpoch_;
-            std::vector<int64_t> keys;
-            for (const auto& [k, r] : shortPlaced_) keys.push_back(k);
-            for (int64_t k : keys) {
-                const auto t = static_cast<int32_t>(k >> 32);
-                const auto p = static_cast<int32_t>(static_cast<uint32_t>(k));
-                const rune::metadata::PartitionAssignment* pa = msm_.assignment(t, p);
-                if (pa == nullptr) { shortPlaced_.erase(k); continue; }
-                if (keyBusy_(t, p)) { shortTriedEpoch_ = ~0ull; continue; }   // retried next pass
-                const std::size_t target = targetReplicas_(t, pa->replicas.size());
-                replacementCandidates_(t, p, pa->replicas, candidates);
-                if (candidates.empty()) continue;
-                std::vector<int32_t> replicas = pa->replicas;
-                for (int32_t c : candidates) if (replicas.size() < target) replicas.push_back(c);
-                noteShort_(t, p, replicas.size(), target);
-                enqueuePartitionChange_(*pa, std::move(replicas), pa->isr, pa->leaderNode, t, p);
-                queued = true;
+            const bool blocked = blockedOn_(pa);
+            const std::size_t target = targetReplicas_(t, pa.replicas.size());
+            const bool isShort = pa.replicas.size() < target;
+            if (isShort && !blocked && !keyBusy_(t, p)) {   // top up on placeable brokers
+                replacementCandidates_(t, p, pa.replicas,
+                                       pa.mark.kind == rm::LeaderlessMark::Kind::ReplicaUnbuildable ? pa.mark.node : -1,
+                                       candidates);
+                if (!candidates.empty()) {
+                    std::vector<int32_t> replicas = pa.replicas;
+                    for (int32_t c : candidates) if (replicas.size() < target) replicas.push_back(c);
+                    spdlog::info("MetadataService[{}]: ({}, {}) topped up to {} of {} replicas", selfId_, t, p,
+                                 replicas.size(), target);
+                    enqueueReplicaChange_(pa, std::move(replicas), pa.isr, pa.leaderNode, t, p, rm::LeaderlessMark{},
+                                          false);
+                    queued = true;
+                }
             }
-        }
+            if (!isShort && !blocked) { loggedHealth_.erase(key); return; }
+            shortN   += isShort ? 1 : 0;
+            blockedN += blocked ? 1 : 0;
+            if (std::find(unhealthyTopics.begin(), unhealthyTopics.end(), t) == unhealthyTopics.end())
+                unhealthyTopics.push_back(t);
+            const std::string reason = partitionHealthReason_(t, p, pa);
+            auto [it, inserted] = loggedHealth_.try_emplace(key, reason);
+            if (inserted || it->second != reason) {
+                it->second = reason;
+                ++unplaceableEvents_;
+                spdlog::error("MetadataService[{}]: topic id={} {}{} (rune-catalog-unplaceable-topics)", selfId_, t,
+                              reason, blocked ? "" : "; it serves from the placed replicas; topped up when a "
+                                                     "placeable broker exists");
+            }
+            seen.push_back(key);
+        });
+        std::erase_if(loggedHealth_, [&](const auto& e) {
+            return std::find(seen.begin(), seen.end(), e.first) == seen.end();
+        });
+        derived_.shortPartitions   = shortN;
+        derived_.blockedPartitions = blockedN;
+        derived_.unhealthyTopics   = unhealthyTopics.size();
         if (queued) drainDynamicQueue();
-    }
-    void noteShort_(int32_t topicId, int32_t partition, std::size_t have, std::size_t target) {
-        const int64_t k = partitionKey_(topicId, partition);
-        if (have >= target) {
-            if (shortPlaced_.erase(k) != 0)
-                spdlog::info("MetadataService[{}]: ({}, {}) is fully placed again ({} replicas)", selfId_, topicId,
-                             partition, have);
-            return;
-        }
-        std::string halted;
-        for (int32_t n : liveNodes_)
-            if (catalogHalted(n)) halted += (halted.empty() ? "" : ",") + std::to_string(n);
-        const std::string reason = "partition " + std::to_string(partition) + " has " + std::to_string(have) + " of " +
-                                   std::to_string(target) + " replicas: no other placeable broker" +
-                                   (halted.empty() ? std::string{} : " (catalog apply halted on broker(s) " + halted + ")");
-        auto [it, inserted] = shortPlaced_.try_emplace(k, reason);
-        if (inserted || it->second != reason) {
-            it->second = reason;
-            ++unplaceableEvents_;
-            spdlog::error("MetadataService[{}]: topic id={} is UNPLACEABLE at its replica count — {}; it serves from "
-                          "the {} placed replica(s); retried when the placeable brokers change "
-                          "(rune-catalog-unplaceable-topics)", selfId_, topicId, reason, have);
-        }
     }
 
     /// The configured topics of `t`'s placement unit (its co-partition group, or itself).
@@ -2734,9 +2822,18 @@ private:
 
             const auto& br = pendingDynamicRecords_.front();
             std::size_t n = br.rec.encode(encBuf, kEncBufSize);
-            if (n != 0 && br.mark.kind != rune::metadata::LeaderlessMark::Kind::None) {
+            // Task 11 fix round 3: a committed REPLICA mark is carried forward by
+            // every later record of the partition (any path: AlterIsr, fencing,
+            // rebalance) until a record explicitly clears it — committed state,
+            // never controller memory.
+            rune::metadata::LeaderlessMark mark = br.mark;
+            if (mark.kind == rune::metadata::LeaderlessMark::Kind::None && !br.clearsReplicaMark) {
+                const auto* cur = msm_.assignment(br.rec.topicId, br.rec.partition);
+                if (cur != nullptr && rune::metadata::isReplicaMark(cur->mark.kind)) mark = cur->mark;
+            }
+            if (n != 0 && mark.kind != rune::metadata::LeaderlessMark::Kind::None) {
                 // D15: the leaderless mark rides as a trailer older MSMs ignore.
-                const std::size_t t = rune::metadata::leaderless_trailer::encode(encBuf + n, kEncBufSize - n, br.mark);
+                const std::size_t t = rune::metadata::leaderless_trailer::encode(encBuf + n, kEncBufSize - n, mark);
                 n = t == 0 ? 0 : n + t;
             }
             if (n == 0) {

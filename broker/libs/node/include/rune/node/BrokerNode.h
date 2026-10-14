@@ -1845,7 +1845,10 @@ private:
     static constexpr int64_t kUnbuiltReportGraceNs = 10'000'000'000LL;
     static constexpr int64_t kUnbuiltResendNs      = 200'000'000LL;
     static constexpr int     kAvailableSends       = 5;   // loss recovery (a new process also clears)
-    struct UnbuiltReplica { int64_t firstSeenNs = 0; int64_t lastSentNs = 0; };
+    /// holdsData: this broker has the partition's data dir on disk (round 3, a);
+    /// acknowledged: the committed mark already names this broker for it.
+    struct UnbuiltReplica { int64_t firstSeenNs = 0; int64_t lastSentNs = 0; bool holdsData = false; bool acknowledged = false; };
+    bool unbuiltNeedsSend_ = false;
     std::map<int64_t, UnbuiltReplica> unbuilt_;             // (topic<<32|partition) → since
     std::map<int64_t, int>            reportedUnavailable_;  // → available sends left once built
     uint64_t unbuiltScanVersion_ = ~0ull;
