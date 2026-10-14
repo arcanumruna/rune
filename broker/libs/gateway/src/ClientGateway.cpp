@@ -4635,17 +4635,23 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     static constexpr int64_t kFromLatest   = -1;
     // E2: a transient partition's replica is registered (servedPartition_), so
     // its clamp is the published HW below — the ring itself is never read here.
-    const int64_t leo = log != nullptr ? log->logEndOffset() : 0;
+    // Sanitizer triage T2 (2026-10-14): a WORKER-owned Log (shard mode) is the
+    // owning worker's state — its LEO / segment map are never read from this
+    // thread (TSan: logEndOffset_ written by the worker's append, read here).
+    // The clamp is the replica's published HW; the log start resolves on the
+    // worker (Worker::raiseFreshDiskCursor_).  Only a gateway-owned Log
+    // (inline / single-node pass-through) is read here.
+    const bool gatewayLog = gatewayOwnsLog_(log);
+    const rune::replication::PartitionReplica* const clampReplica =
+        replicaRegistry_ ? replicaRegistry_->lookup(msg.topicId, partition) : nullptr;
+    if (log != nullptr && !gatewayLog && clampReplica == nullptr) [[unlikely]] {
+        sendSubRedirect(std::string{}, msg.correlationId);   // retriable: no published HW for it yet
+        return;
+    }
+    const int64_t leo = gatewayLog ? log->logEndOffset() : 0;
     // GR-6: use HW as the clamp limit when a replica is available.
     // For non-replicated / single-node topics, HW == LEO — no behavioral change.
-    int64_t clampLimit;
-    if (replicaRegistry_) {
-        const rune::replication::PartitionReplica* replica =
-            replicaRegistry_->lookup(msg.topicId, partition);
-        clampLimit = replica ? replica->gatewayHighWatermark() : leo;
-    } else {
-        clampLimit = leo;
-    }
+    const int64_t clampLimit = clampReplica ? clampReplica->gatewayHighWatermark() : leo;
     // CP-5.2 FIX (Earliest-below-logStart starvation): the oldest offset that is
     // still on disk.  Retention/compaction can delete the earliest segment(s),
     // advancing the first segment base past 0.  Log::read(offset) for any offset
@@ -4656,7 +4662,8 @@ void ClientGateway::handleSubscribe(const uint8_t* buf, std::size_t len)
     // E2: a transient ring's start is worker-owned state (never read cross-
     // thread): Earliest resolves to 0 and the owning worker moves a cursor below
     // its ring start up to it (TRANSIENT_EVICTED, Worker::skipEvictedCursor_).
-    const int64_t logStart = log != nullptr ? log->logStartOffset() : 0;
+    // T2: a worker-owned log's start is resolved by its worker (fresh cursor).
+    const int64_t logStart = gatewayLog ? log->logStartOffset() : 0;
     int64_t nextOffset;
     if (msg.fromOffset == kFromEarliest) {
         // Earliest → the oldest offset still readable (NOT hardcoded 0).
@@ -7451,15 +7458,17 @@ int64_t ClientGateway::addGroupSubscription(int64_t memberSessionId,
     // Clamp fromOffset to [0, bound] where bound is HW when a replica is
     // wired (GR-6), else LEO.  Negative fromOffset is clamped to 0 (log start;
     // E2: a transient cursor below the ring start is moved up by the worker).
-    const int64_t leo = log != nullptr ? log->logEndOffset() : 0;
-    int64_t bound;
-    if (replicaRegistry_) {
-        const rune::replication::PartitionReplica* replica =
-            replicaRegistry_->lookup(topicId, partition);
-        bound = replica ? replica->gatewayHighWatermark() : leo;
-    } else {
-        bound = leo;
+    // Sanitizer triage T2: never read a worker-owned Log from this thread.
+    const bool gatewayLog = gatewayOwnsLog_(log);
+    const rune::replication::PartitionReplica* const boundReplica =
+        replicaRegistry_ ? replicaRegistry_->lookup(topicId, partition) : nullptr;
+    if (log != nullptr && !gatewayLog && boundReplica == nullptr) [[unlikely]] {
+        spdlog::warn("ClientGateway::addGroupSubscription: worker-owned topicId={} partition={} has no "
+                     "replica (no published HW) — refused", topicId, partition);
+        return -1;
     }
+    const int64_t leo = gatewayLog ? log->logEndOffset() : 0;
+    const int64_t bound = boundReplica ? boundReplica->gatewayHighWatermark() : leo;
     const int64_t nextOffset = (fromOffset < 0)  ? int64_t{0}
                              : (fromOffset > bound) ? bound
                              : fromOffset;

@@ -2886,6 +2886,9 @@ private:
             if (mem != nullptr) {   // TRANSIENT_EVICTED
                 s.nextOffset  = skipEvictedCursor_(*mem, s.nextOffset, s.cursorFresh);
                 s.cursorFresh = false;   // from now on the cursor is this push's own: a later skip is lag
+            } else if (s.cursorFresh) [[unlikely]] {   // T2: the disk log start resolves here
+                s.nextOffset  = raiseFreshDiskCursor_(*s.logPtr, s.nextOffset, true);
+                s.cursorFresh = false;
             }
             int64_t bound = rep ? rep->highWatermark()
                                 : s.logPtr->logEndOffset();
@@ -3280,6 +3283,7 @@ private:
         rune::storage::InMemoryLog* const mem =
             (log == nullptr && a.replica != nullptr) ? a.replica->memoryLog() : nullptr;
         if (mem != nullptr) a.nextOffset = skipEvictedCursor_(*mem, a.nextOffset, a.freshCursor);
+        else if (log != nullptr) a.nextOffset = raiseFreshDiskCursor_(*log, a.nextOffset, a.freshCursor);   // T2
         const int32_t topicId    = a.topicId;
         const int32_t partition  = a.partition;
         const int64_t nextOffset = a.nextOffset;
@@ -3557,6 +3561,19 @@ private:
                          "start {} — resumed at {} (skips={}, records skipped={})", workerId_, cursor, start,
                          start, transientCursorSkips_, transientRecordsSkipped_);
         return start;
+    }
+
+    // Sanitizer triage T2 (2026-10-14): the gateway no longer reads a worker-owned
+    // disk Log's start (a cross-thread walk of its segment map).  A FRESH cursor —
+    // the subscription's bind-time start: Earliest (0) or an explicit offset into a
+    // retention-deleted region (CP-5.2) — is raised to the log start HERE, on the
+    // owning thread, before the first read (Log::read below the first segment is
+    // empty forever).  A non-fresh cursor is the push's own and is left as is.
+    [[nodiscard]] static int64_t raiseFreshDiskCursor_(const rune::storage::Log& log, int64_t cursor,
+                                                       bool fresh) noexcept {
+        if (!fresh) return cursor;
+        const int64_t start = log.logStartOffset();
+        return cursor < start ? start : cursor;
     }
 
     // #65: the worker's push reads.  First-touch page faults on a segment read

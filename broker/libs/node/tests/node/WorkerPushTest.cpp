@@ -349,6 +349,46 @@ TEST_F(WorkerPushFixture, SubscribeFromNonZeroOffset) {
     std::filesystem::remove_all(dir);
 }
 
+// Sanitizer triage T2 (2026-10-14): the gateway read a WORKER-owned Log's LEO and
+// segment map (logStartOffset) from its own thread to resolve Earliest — a TSan
+// data race (worker append vs gateway handleSubscribe).  The gateway now sends a
+// worker-owned subscription's Earliest as 0 (a fresh cursor) and the OWNING worker
+// raises it to its log start: after the head segments are deleted, an Earliest
+// (0) subscription must still deliver from the oldest surviving batch.
+TEST_F(WorkerPushFixture, FreshCursorBelowTheDiskLogStartResumesAtTheStartOnTheWorkerRegression) {
+    auto dir = tempLogDir();
+    rune::storage::Log log(dir.string(), 256);   // tiny roll: many sealed segments
+    log.recover();
+    for (int i = 0; i < 40; ++i) appendBatch(log, i, 1);
+    ASSERT_GT(log.deleteOldSegments(/*retainBytes=*/0), 0);
+    const int64_t start = log.logStartOffset();
+    ASSERT_GT(start, 0);
+    ASSERT_TRUE(log.read(0, 1 << 20).empty()) << "below the log start reads nothing (the starvation trap)";
+
+    const std::string controlEp = freeEndpoint();
+    const char* control = controlEp.c_str();
+    WorkerEgress eg(aeron_, control, 3007);
+    ASSERT_TRUE(eg.resolved());
+    auto sub = resolveSub(control, freeEndpoint(), 3007);
+    ASSERT_TRUE(waitFor([&]() { return eg.isConnected() && sub->isConnected(); }));
+
+    Worker w(0, kRingBytes, kRingBytes);
+    w.setWorkerEgress(&eg);
+    ASSERT_TRUE(w.tryEnqueueOp(subscribeOp(1, 10, 0, /*nextOffset=*/0, &log)));   // Earliest, fresh
+
+    Collector c;
+    const auto expected = static_cast<std::size_t>(40 - start);
+    ASSERT_TRUE(waitFor([&]() {
+        w.doWork(1); sub->poll(c.fa.handler(), 64);
+        return c.baseOffsets.size() >= expected;
+    }, 10s)) << "got " << c.baseOffsets.size() << " of " << expected;
+    ASSERT_EQ(c.baseOffsets.size(), expected);
+    EXPECT_EQ(c.baseOffsets.front(), start) << "resumes at the oldest surviving batch";
+    for (std::size_t i = 0; i < c.baseOffsets.size(); ++i)
+        EXPECT_EQ(c.baseOffsets[i], start + static_cast<int64_t>(i));
+    std::filesystem::remove_all(dir);
+}
+
 TEST_F(WorkerPushFixture, UnsubscribeStopsFurtherDelivery) {
     auto dir = tempLogDir();
     rune::storage::Log log(dir.string(), 64LL * 1024 * 1024);

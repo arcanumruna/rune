@@ -586,6 +586,14 @@ public:
         if (log) workerOwnedLogs_.insert(log);
     }
     [[nodiscard]] std::size_t workerOwnedLogCountForTest() const noexcept { return workerOwnedLogs_.size(); }
+    /// Sanitizer triage T2 (2026-10-14): true iff `log` is read on THIS (gateway)
+    /// thread — not registered as worker-owned.  A worker-owned Log's LEO /
+    /// segment map belong to its worker and are never read here.
+    [[nodiscard]] bool gatewayOwnsLog_(const rune::storage::Log* log) const noexcept {
+        return log != nullptr &&
+               (workerOwnedLogs_.empty() ||
+                workerOwnedLogs_.count(const_cast<rune::storage::Log*>(log)) == 0);
+    }
 
     // -----------------------------------------------------------------------
     // E5.1: setWorkerIngressBaseStreamId — configure the base Aeron stream id
