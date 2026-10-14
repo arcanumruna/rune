@@ -2625,3 +2625,40 @@ TEST_F(GroupConsumerHubTest, AnEightByteNoteNeverMovesAMembersPositionRegression
     EXPECT_EQ(impl_->assignment.at(TopicPartition{kTopicId, kPartition}), 10);
     EXPECT_EQ(hub_->notesIgnored(), 1u);
 }
+
+// Task 13 fix round 3 (M2-r2): a CRC-bad batch on the group path is explicit.
+// Delivery and the position stop at the valid prefix, and the frame is counted.
+// RED (no validation): the position moved to 15 past records never delivered.
+TEST_F(GroupConsumerHubTest, AFrameWithACorruptMiddleBatchDeliversTheValidPrefixAndCountsItRegression) {
+    std::vector<int64_t> seen;
+    impl_->cbRecords = [&](const RecordSet& rs) {
+        rs.forEachRecord([&](std::string_view, std::string_view, int64_t off, int64_t) { seen.push_back(off); });
+    };
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 10);
+    auto bad = batchAt(12, 2);
+    bad[rune::protocol::batch::kCrcOffset] ^= 0xff;   // flip one CRC byte
+    const auto frame = framesOf({batchAt(10, 2), bad, batchAt(14, 1)}, 10);
+    auto rv = codec::decodeRecords(frame.data(), frame.size());
+    ASSERT_TRUE(rv.has_value());
+    hub_->onRecords(*rv);
+    EXPECT_EQ(seen, (std::vector<int64_t>{10, 11}));
+    EXPECT_EQ(impl_->assignment.at(TopicPartition{kTopicId, kPartition}), 12) << "never past an undelivered record";
+    EXPECT_EQ(hub_->malformedBatches(), 1u);
+}
+
+TEST_F(GroupConsumerHubTest, AFrameWhoseOnlyBatchIsCorruptMovesNothingRegression) {
+    int calls = 0;
+    impl_->cbRecords = [&](const RecordSet&) { ++calls; };
+    bringToStable(*hub_, sink_, kTopicId, kPartition);
+    seedPosition(*hub_, 10);
+    auto bad = batchAt(10, 3);
+    bad[rune::protocol::batch::kCrcOffset] ^= 0xff;
+    const auto frame = framesOf({bad}, 10);
+    auto rv = codec::decodeRecords(frame.data(), frame.size());
+    ASSERT_TRUE(rv.has_value());
+    hub_->onRecords(*rv);
+    EXPECT_EQ(calls, 0);
+    EXPECT_EQ(impl_->assignment.at(TopicPartition{kTopicId, kPartition}), 10);
+    EXPECT_EQ(hub_->malformedBatches(), 1u);
+}

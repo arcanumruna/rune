@@ -290,6 +290,10 @@ struct RecordsView {
     // forEachRecord() skips them for you; only code that walks `recordBatch`
     // itself (raw-batch access) must honour deliverFrom.
     int64_t                  deliverFrom     = 0;
+    // Task 13 fix round 3 (M2-r2): -1 = not validated; >= 0 = the valid prefix of
+    // recordBatch, this many bytes, already CRC-checked (set by GroupConsumerHub:
+    // forEachRecord walks only it, without a second CRC pass).  Never on the wire.
+    int32_t                  validBatchBytes = -1;
 
     /// Visit every NEW record of every batch: fn(key, value, offset, timestamp)
     /// for each record with offset >= deliverFrom — the records a straddling
@@ -302,10 +306,18 @@ struct RecordsView {
     template <class Fn>
     void forEachRecord(Fn&& fn) const {
         const int64_t from = deliverFrom;
-        std::span<const uint8_t> rest = recordBatch;
+        const bool validated = validBatchBytes >= 0;
+        std::span<const uint8_t> rest =
+            validated ? recordBatch.first(std::min<std::size_t>(static_cast<std::size_t>(validBatchBytes), recordBatch.size()))
+                      : recordBatch;
         while (rest.size() >= static_cast<std::size_t>(rune::protocol::batch::kRecordBatchOverhead)) {
             rune::protocol::RecordBatchReader reader(rest.data(), rest.size());
-            if (!reader.ensureValid()) return;
+            if (validated) {   // CRC-checked already: only the lengths are checked again
+                const int32_t tl = reader.totalLength();
+                if (tl < rune::protocol::batch::kRecordBatchOverhead || static_cast<std::size_t>(tl) > rest.size()) return;
+            } else if (!reader.ensureValid()) {
+                return;
+            }
             if (!reader.isControl()) {
                 reader.forEachRecord([&](std::string_view key, std::string_view value, int64_t offset, int64_t ts) {
                     if (offset < from) [[unlikely]] return;   // already consumed (straddling re-delivery)

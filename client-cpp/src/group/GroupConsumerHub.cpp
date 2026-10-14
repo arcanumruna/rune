@@ -1292,10 +1292,33 @@ void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
         // The position is seeded only by OffsetFetch / the reset policy (C1).
         const int64_t pos = it->second;
         if (pos == GroupConsumerImpl::kUnseededSentinel) { ++droppedBatches_; return; }
+        // Task 13 fix round 3 (M2-r2): validate every batch (CRC) up front.  The
+        // position never moves past a record that was not handed to the callback
+        // unless that was counted and logged: delivery and the position stop at
+        // the valid prefix.  Stub views (shorter than a batch header) keep the
+        // header-derived fields (test helpers).  No allocation: one stack copy.
+        namespace pb = rune::protocol::batch;
+        std::size_t validLen = 0;
+        int64_t     validEnd = -1;
+        const bool  validate = rv.recordBatch.size() >= static_cast<std::size_t>(pb::kRecordBatchOverhead);
+        if (validate) {
+            std::span<const uint8_t> rest = rv.recordBatch;
+            bool bad = false;
+            while (rest.size() >= static_cast<std::size_t>(pb::kRecordBatchOverhead)) {
+                rune::protocol::RecordBatchReader r(rest.data(), rest.size());
+                if (!r.ensureValid()) { bad = true; break; }
+                validEnd = r.baseOffset() + static_cast<int64_t>(r.lastOffsetDelta()) + 1;
+                validLen += static_cast<std::size_t>(r.totalLength());
+                rest = rest.subspan(static_cast<std::size_t>(r.totalLength()));
+            }
+            if (!rest.empty() && !bad) bad = true;   // a torn tail shorter than a batch header
+            if (bad) noteMalformed_();
+            if (validLen == 0) { ++droppedBatches_; return; }   // nothing valid: nothing delivered, the position stays
+        }
         // LOW-1: last offset + 1 (compaction holes inside a batch), never less
         // than the record count (hand-built views without a batch header).
         const int64_t span = std::max<int64_t>(static_cast<int64_t>(rv.lastOffsetDelta) + 1, rv.recordCount);
-        const int64_t end  = rv.baseOffset + span;
+        const int64_t end  = validate ? validEnd : rv.baseOffset + span;
         if (end <= pos) { ++droppedBatches_; return; }  // entirely below: a duplicate (MEDIUM-3)
         // Otherwise delivered and the position moves to the batch's end — a
         // batch above the position is legitimate (transaction markers, aborted
@@ -1304,12 +1327,14 @@ void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
         // committed offset — brokers push whole batches) carries records
         // already consumed: the view says so (deliverFrom = the position; a
         // stack copy, no allocation) and its iteration skips them.
+        // One stack copy carries both the straddle floor and the validated prefix.
         codec::RecordsView straddle;
         const codec::RecordsView* view = &rv;
-        if (rv.baseOffset < pos) [[unlikely]] {
-            straddle             = rv;
-            straddle.deliverFrom = pos;
-            view                 = &straddle;
+        if (rv.baseOffset < pos || validate) {
+            straddle = rv;
+            if (rv.baseOffset < pos) [[unlikely]] straddle.deliverFrom = pos;
+            if (validate) straddle.validBatchBytes = static_cast<int32_t>(validLen);
+            view = &straddle;
         }
 
         // Deliver to consumer. fix1 C1: noexcept doWork chain — catch/count/log.
@@ -1340,6 +1365,16 @@ void GroupConsumerHub::onRecords(const codec::RecordsView& rv)
     ++droppedBatches_;
     // An abandoned, never-answered instance just revealed its id: clean it up.
     if (routed_() && !late_.empty() && rv.correlationId != 0) learnLateFromRecords_(rv);
+}
+
+// Task 13 fix round 3 (M2-r2): a Records frame whose batch failed its CRC /
+// length check on the group path — counted, logged at most once per 1024.
+void GroupConsumerHub::noteMalformed_() noexcept
+{
+    if (malformedBatches_++ % 1024 == 0)
+        std::fprintf(stderr, "rune-client: a group Records frame carried a malformed batch — delivered up to it, "
+                             "the position stops there (malformed so far: %llu)\n",
+                     static_cast<unsigned long long>(malformedBatches_));
 }
 
 // ---------------------------------------------------------------------------

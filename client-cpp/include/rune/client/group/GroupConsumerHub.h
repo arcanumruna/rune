@@ -323,6 +323,9 @@ public:
     [[nodiscard]] uint64_t droppedRecordBatches() const noexcept { return droppedBatches_; }
     /// 8-byte notes (lineage / catalog epoch) that reached the group path: ignored.
     [[nodiscard]] uint64_t notesIgnored() const noexcept { return notesIgnored_; }
+    /// Task 13 fix round 3 (M2-r2): frames with a CRC-bad / torn batch (delivery and
+    /// the position stopped at the valid prefix).
+    [[nodiscard]] uint64_t malformedBatches() const noexcept { return malformedBatches_; }
 
     /// fix1 C1: onAssigned/onRevoked/onRecords run inside the noexcept
     /// ClientAgent::doWork chain (or, for closeAll's final onRevoked, inside
@@ -377,6 +380,8 @@ private:
     bool        metadataWanted_ = false;
     uint64_t    droppedBatches_ = 0;
     uint64_t    notesIgnored_   = 0;
+    uint64_t    malformedBatches_ = 0;
+    void noteMalformed_() noexcept;
     struct LateSub {  // a Subscribe dropped before its answer
         int64_t        corrId;
         uint32_t       session;
