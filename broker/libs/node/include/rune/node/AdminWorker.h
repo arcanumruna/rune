@@ -245,19 +245,14 @@ public:
     /// worker was built over.  Startup thread, before the admin thread starts.
     void adoptBootedApplier(CatalogApplier booted, LiveEffects live);
 
-    /// Task 16 (B6): the broker booted from an EMPTY local catalog while dataDir
-    /// holds topic dirs (the catalog was wiped, or a new disk) — the topic-dir
-    /// reconcile waits until this broker's applier has caught up to the catalog
-    /// leader's committed prefix, then runs ONCE on the admin thread against the
-    /// applied catalog.  Never run on a halted applier.  Startup thread, before the
-    /// admin thread starts.
-    /// `alsoClaimed`: topics the catalog does not name but this broker serves
-    /// (the INTERIM static RUNE_TOPICS topics until Task 17).
-    void deferTopicDirReconcile(std::string dataDir, std::vector<TopicSpec> alsoClaimed = {});
-    /// "None" | "AwaitingCatchUp" | "Done" — the deferred reconcile's state.
+    /// Task 16 (B6, fix round 1 R2): the broker booted with a local catalog it cannot trust (empty while
+    /// catalog-made topic dirs exist).  Once this broker, as a FOLLOWER, applied the leader's committed
+    /// history, the admin thread writes the durable catch-up sentinel (`caughtup <offset>`); the topic-dir
+    /// reconcile itself runs at the NEXT boot, on the startup thread — never here.  A halt cancels it (the
+    /// sentinel stays pending).  Startup thread, before the admin thread starts.
+    void deferTopicDirReconcile(std::string dataDir);
+    /// "None" | "AwaitingCatchUp" | "Done" — "Done" = the sentinel was written (or the wait was cancelled).
     [[nodiscard]] std::string_view bootReconcileStateName() const noexcept;
-    /// The last deferred reconcile's outcome (admin thread, after it ran).
-    [[nodiscard]] const TopicDirReconciliation& bootReconcileResultForTest() const noexcept { return reconciled_; }
 
     // ── Roles (control → admin, admin thread) ───────────────────────────────
     /// The retired __topic_schemas / __views replicas' role (null in a broker since Task 16).
@@ -425,14 +420,12 @@ private:
     std::optional<LiveEffects> pendingLive_;
     // The deferred boot reconcile (B6) — rule 3: one state, its own variables.
     struct NoBootReconcile {};
-    struct AwaitingCatchUp { std::string dataDir; std::vector<TopicSpec> alsoClaimed; };
+    struct AwaitingCatchUp { std::string dataDir; bool leaderWaitLogged = false; };
     struct BootReconcileDone {};
     std::variant<NoBootReconcile, AwaitingCatchUp, BootReconcileDone> bootReconcile_{NoBootReconcile{}};
-    TopicDirReconciliation reconciled_;
-    /// The applier has caught up to the catalog leader's committed prefix: a
-    /// serving leader, or a follower whose leader told it its HW and answered
-    /// its last fetch with nothing beyond this broker's log end — and everything
-    /// this broker holds is applied.
+    /// A FOLLOWER that applied the catalog leader's committed prefix: its leader told it its HW and
+    /// answered its last fetch empty, it applied everything it holds, and that is not nothing.  A broker
+    /// that LEADS the catalog is never "caught up" this way (its history is whatever its own log holds).
     [[nodiscard]] bool bootReconcileReady_() const noexcept;
     int stepBootReconcile_();
     PlacementViewMsg placement_{};         // the control thread's placement view (onPlacementView)

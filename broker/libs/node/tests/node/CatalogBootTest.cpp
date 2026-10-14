@@ -24,6 +24,7 @@
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/node/BrokerNode.h>
 #include <rune/node/CatalogCheckpoint.h>
+#include <rune/node/TopicDirReconcile.h>
 #include <rune/node/NodeConfig.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/protocol/client/Protocol.h>
@@ -155,8 +156,7 @@ public:
         if (holdApplyAtBoot_) node_->holdCatalogApplyAtBootForTest(true);
         node_->start();
     }
-    /// A started broker serving DDL: the consensus leader, the catalog leader serving, boot reconcile settled,
-    /// and a wire session.
+    /// A started broker serving DDL: the consensus leader, the catalog leader serving, and a wire session.
     bool start() {
         startNoAwait();
         if (!node_->awaitLeader(30s)) return false;
@@ -164,7 +164,6 @@ public:
                 return node_->adminWorkerAgentForTest()->worker().isLeader() ||
                        node_->adminWorkerAgentForTest()->worker().applier().halted(); }); }, 30s))
             return false;
-        if (!node_->awaitBootReconcileSettledForTest(30s)) return false;
         client_ = std::make_unique<ShardTestClient>(dir_.path / ("client-aeron" + std::to_string(++clients_)));
         client_->keepSessionsAlive(true);
         sid_ = client_->connect(cfg_.clientEndpoint.channel, cfg_.clientEndpoint.streamId);
@@ -801,7 +800,33 @@ void plantOrphan(const fs::path& dataDir) {
 }
 } // namespace
 
-TEST(CatalogBootRegression, WipedCatalogBrokerQuarantinesNothingBeforeCatchUpAndServesItsDataAfterRegression) {
+namespace {
+/// `.catalog-catchup` of a data dir.
+rune::node::CatchUpSentinel sentinelOf(const fs::path& dataDir) { return rune::node::readCatchUpSentinel(dataDir.string()); }
+
+/// A DDL (drop) on the catalog leader's wire endpoint, retried while the leadership settles.
+bool dropOnLeader(ThreeNodes& c, ShardTestClient& cl, const std::string& name, std::chrono::seconds within) {
+    const auto deadline = Clock::now() + within;
+    while (Clock::now() < deadline) {
+        const int32_t leader = c.catalogLeaderId();
+        if (leader > 0 && c.running(leader)) {
+            const std::string ch = clientChannelOf(c, leader);
+            const int64_t sid = cl.connect(ch, kClientStream);
+            if (sid > 0) {
+                const auto r = cl.awaitDdl(cl.sendDropTopic(ch, kClientStream, sid, name), Clock::now() + 10s);
+                if (r && r->errorCode == 0) return true;
+            }
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    return false;
+}
+} // namespace
+
+// R2 (fix round 1): a wiped broker catches up as a FOLLOWER, writes the durable catch-up sentinel, and only the
+// NEXT boot reconciles (on the startup thread).  Nothing is touched before.  The applier is held across the first
+// part so the replica holds the whole prefix while NOTHING is applied: not caught up.
+TEST(CatalogBootRegression, WipedCatalogBrokerQuarantinesNothingBeforeCatchUpAndTheNextBootReconcilesRegression) {
     ClusterWithData d{ThreeNodes("boot_b6", Mode::Legacy)};
     ShardTestClient cl(d.c.dirs[0]->path / "client-aeron");
     cl.keepSessionsAlive(true);
@@ -813,32 +838,41 @@ TEST(CatalogBootRegression, WipedCatalogBrokerQuarantinesNothingBeforeCatchUpAnd
     fs::remove_all(vdir / "__catalog");   // an operator deleted the catalog as a "repair" (or a new disk)
     plantOrphan(vdir);
     ASSERT_TRUE(fs::exists(vdir / "topics" / "keep" / "0"));
-    // The victim restarts with its APPLIER held: the replica fetches the leader's whole prefix, but nothing is
-    // applied — it has not caught up.
     d.c.beforeStart = [&](int id, BrokerNode& n) { if (id == d.victim) n.holdCatalogApplyAtBootForTest(true); };
     d.c.startNode(d.victim);
     BrokerNode& v = d.c.node(d.victim);
     ASSERT_TRUE(d.c.awaitCatalogEndOffset(v, d.catalogEnd, 30s)) << "the replica refetched the catalog from 0";
-    std::this_thread::sleep_for(1s);   // a bounded settle: had the reconcile been going to run on a replica-level signal, it would have
+    std::this_thread::sleep_for(1s);
     EXPECT_EQ(v.bootReconcileStateForTest(), "AwaitingCatchUp");
+    EXPECT_EQ(sentinelOf(vdir).kind, rune::node::CatchUpSentinel::Kind::Pending);
     EXPECT_TRUE(fs::exists(vdir / "topics" / "orphan" / "0" / "00000000000000000000.log"))
         << "NO topic dir is touched before the applier caught up";
-    EXPECT_TRUE(fs::exists(vdir / "topics" / "keep" / "0")) << "the real topic's dir least of all";
     EXPECT_FALSE(fs::exists(vdir / "quarantine"));
-    // Catch-up completes: the applier applies the prefix, the topic is built over its surviving dir, and only THEN
-    // are the orphans quarantined.
     v.releaseCatalogApplyForTest();
     ASSERT_TRUE(v.awaitBootReconcileSettledForTest(30s));
     EXPECT_EQ(v.bootReconcileStateForTest(), "Done");
-    EXPECT_FALSE(fs::exists(vdir / "topics" / "orphan")) << "orphans are quarantined after catch-up";
-    EXPECT_TRUE(quarantineHasEntryStartingWith(vdir, "orphan-"));
-    EXPECT_TRUE(fs::exists(vdir / "topics" / "keep" / "0")) << "the catalog-claimed topic is untouched";
-    EXPECT_FALSE(quarantineHasEntryStartingWith(vdir, "keep-"));
+    const auto s = sentinelOf(vdir);
+    EXPECT_EQ(s.kind, rune::node::CatchUpSentinel::Kind::CaughtUp);
+    EXPECT_GE(s.offset, d.catalogEnd - 1) << "the sentinel names the offset it applied up to";
+    EXPECT_TRUE(fs::exists(vdir / "topics" / "orphan")) << "the reconcile does NOT run on the admin thread";
+    EXPECT_FALSE(fs::exists(vdir / "quarantine"));
     ASSERT_TRUE(awaitTrue([&] { return v.catalogTopicServesForTest(d.topicId); }, 20s));
     EXPECT_EQ(leoOnOwner(v, d.topicId, 0), ClusterWithData::kRecords) << "the data serves after catch-up";
+
+    d.c.beforeStart = nullptr;
+    d.c.stop(d.victim);
+    d.c.startNode(d.victim);
+    BrokerNode& v2 = d.c.node(d.victim);
+    EXPECT_FALSE(fs::exists(vdir / "topics" / "orphan")) << "the NEXT boot quarantined the orphan";
+    EXPECT_TRUE(quarantineHasEntryStartingWith(vdir, "orphan-"));
+    EXPECT_FALSE(quarantineHasEntryStartingWith(vdir, "keep-"));
+    EXPECT_TRUE(fs::exists(vdir / "topics" / "keep" / "0"));
+    EXPECT_EQ(sentinelOf(vdir).kind, rune::node::CatchUpSentinel::Kind::Absent);
+    ASSERT_TRUE(awaitTrue([&] { return v2.catalogTopicServesForTest(d.topicId); }, 20s));
+    EXPECT_EQ(leoOnOwner(v2, d.topicId, 0), ClusterWithData::kRecords);
 }
 
-TEST(CatalogBootRegression, WipedCatalogBrokerReconcilesOnItsOwnOnceCaughtUpWithoutAnyHoldRegression) {
+TEST(CatalogBootRegression, WipedCatalogBrokerReconcilesOnItsOwnAtTheBootAfterCatchUpWithoutAnyHoldRegression) {
     ClusterWithData d{ThreeNodes("boot_b6b", Mode::Legacy)};
     ShardTestClient cl(d.c.dirs[0]->path / "client-aeron");
     cl.keepSessionsAlive(true);
@@ -851,11 +885,129 @@ TEST(CatalogBootRegression, WipedCatalogBrokerReconcilesOnItsOwnOnceCaughtUpWith
     plantOrphan(vdir);
     d.c.startNode(d.victim);
     BrokerNode& v = d.c.node(d.victim);
-    ASSERT_TRUE(v.awaitBootReconcileSettledForTest(30s)) << "the follower catches up and reconciles by itself";
+    ASSERT_TRUE(v.awaitBootReconcileSettledForTest(30s)) << "the follower catches up and writes the sentinel by itself";
+    EXPECT_EQ(sentinelOf(vdir).kind, rune::node::CatchUpSentinel::Kind::CaughtUp);
+    EXPECT_GE(sentinelOf(vdir).offset, d.catalogEnd - 1);
+    d.c.stop(d.victim);
+    d.c.startNode(d.victim);
     EXPECT_TRUE(quarantineHasEntryStartingWith(vdir, "orphan-"));
     EXPECT_FALSE(quarantineHasEntryStartingWith(vdir, "keep-"));
-    EXPECT_GE(v.onAdminThreadForTest([&] { return v.adminWorkerAgentForTest()->worker().applier().nextOffset(); }),
-              d.catalogEnd) << "it applied the leader's committed prefix before it quarantined anything";
-    ASSERT_TRUE(awaitTrue([&] { return v.catalogTopicServesForTest(d.topicId); }, 20s));
-    EXPECT_EQ(leoOnOwner(v, d.topicId, 0), ClusterWithData::kRecords);
+    BrokerNode& v2 = d.c.node(d.victim);
+    ASSERT_TRUE(awaitTrue([&] { return v2.catalogTopicServesForTest(d.topicId); }, 20s));
+    EXPECT_EQ(leoOnOwner(v2, d.topicId, 0), ClusterWithData::kRecords);
+}
+
+// R1 (fix round 1, C2): a wiped broker applies the HISTORY live; a historic CreateTopic of a name whose dir
+// belongs to a NEWER incarnation must not open it (it would be dropped and its data purged by the later events).
+TEST(CatalogBootRegression, WipedCatalogCatchUpNeverOpensANewerIncarnationsDirRegression) {
+    ClusterWithData d{ThreeNodes("boot_c2", Mode::Legacy)};
+    ShardTestClient cl(d.c.dirs[0]->path / "client-aeron");
+    cl.keepSessionsAlive(true);
+    for (int id = 1; id <= 3; ++id) d.c.startNode(id);
+    ASSERT_TRUE(d.c.awaitCatalogLeader(30s));
+    ASSERT_TRUE(defineOnLeader(d.c, cl, "t", 30s));      // id 0
+    ASSERT_TRUE(dropOnLeader(d.c, cl, "t", 30s));
+    ASSERT_TRUE(defineOnLeader(d.c, cl, "t", 30s));      // id 1
+    d.topicId = 1;
+    for (int id = 1; id <= 3; ++id)
+        ASSERT_TRUE(awaitTrue([&] { return d.c.node(id).catalogTopicServesForTest(1); }, 20s)) << id;
+    const auto pa = d.c.node(1).onControlThreadForTest([&]() -> std::optional<int32_t> {
+        const auto* a = d.c.node(1).metadataServiceForTest()->assignment(1, 0);
+        return a ? std::optional<int32_t>(a->leaderNode) : std::nullopt;
+    });
+    ASSERT_TRUE(pa.has_value());
+    const std::string ch = clientChannelOf(d.c, *pa);
+    const int64_t sid = cl.connect(ch, kClientStream);
+    ASSERT_GT(sid, 0);
+    for (int i = 0; i < ClusterWithData::kRecords; ++i)
+        ASSERT_TRUE(cl.produceUntilOk(ch, kClientStream, sid, 1, 0, /*acks=*/1, oneRecord("r" + std::to_string(i))));
+    for (int id = 1; id <= 3; ++id)
+        ASSERT_TRUE(awaitTrue([&] { return leoOnOwner(d.c.node(id), 1, 0) == ClusterWithData::kRecords; }, 20s)) << id;
+    const int32_t leader = d.c.catalogLeaderId();
+    d.victim = leader == 3 ? 2 : 3;
+    const fs::path vdir = d.c.dirs[static_cast<std::size_t>(d.victim - 1)]->path;
+    d.c.stop(d.victim);
+    fs::remove_all(vdir / "__catalog");
+    { std::ofstream(vdir / "topics" / "t" / "0" / "probe.txt") << "p"; }
+    d.c.startNode(d.victim);
+    BrokerNode& v = d.c.node(d.victim);
+    ASSERT_TRUE(awaitTrue([&] { return v.catalogTopicServesForTest(1); }, 30s));
+    EXPECT_TRUE(fs::exists(vdir / "topics" / "t" / "0" / "probe.txt"))
+        << "the dir was never renamed or purged by a historic create of the older incarnation";
+    EXPECT_EQ(leoOnOwner(v, 1, 0), ClusterWithData::kRecords);
+    EXPECT_FALSE(fs::exists(vdir / "dropped" / "0.t"));
+}
+
+// R1 (fix round 1, C1): a dropped incarnation's data is never served under a re-created name — the crash window
+// between the drop's checkpoint and the dir rename.
+TEST(CatalogBootRegression, DroppedIncarnationDataIsNeverResurrectedByARecreatedNameRegression) {
+    BootRig r("boot_c1");
+    ASSERT_TRUE(r.start());
+    ASSERT_EQ(r.define({.name = "t", .typed = true}).code, kOk);   // id 0
+    ASSERT_TRUE(r.awaitServes(0));
+    for (int i = 0; i < 3; ++i) ASSERT_TRUE(r.produce(0, 0, "old-" + std::to_string(i)));
+    r.node().holdDroppedDirPurgeForTest(true);
+    ASSERT_EQ(r.dropTopic("t").code, kOk);
+    ASSERT_TRUE(awaitTrue([&] { return fs::exists(r.dataDir() / "dropped" / "0.t"); }, 15s));
+    ASSERT_EQ(r.define({.name = "t", .typed = true}).code, kOk);   // id 1
+    ASSERT_TRUE(r.awaitServes(1));
+    r.stop();
+    // "crash before the rename": the older incarnation's dir is (still) at topics/t
+    fs::remove_all(r.dataDir() / "topics" / "t");
+    fs::rename(r.dataDir() / "dropped" / "0.t", r.dataDir() / "topics" / "t");
+    ASSERT_TRUE(r.start());
+    EXPECT_EQ(r.topicIdForName("t"), 1);
+    EXPECT_EQ(r.logEndOffset(1, 0), 0) << "the dropped incarnation's 3 records are NOT id 1's";
+    EXPECT_FALSE(fs::exists(r.dataDir() / "dropped" / "0.t")) << "purged";
+    EXPECT_FALSE(quarantineHasEntryStartingWith(r.dataDir(), "t-"));
+    EXPECT_EQ(slurp(r.dataDir() / "topics" / "t" / "topic-id"), "1\n");
+    ASSERT_TRUE(r.produce(1, 0, "new"));
+    EXPECT_EQ(r.logEndOffset(1, 0), 1);
+}
+
+// R2 (fix round 1, I1): a crash in the middle of a catch-up leaves the sentinel pending: the next boot touches
+// nothing, however much of the catalog it already applied.
+TEST(CatalogBootRegression, CrashMidCatchUpNeverReconcilesAgainstAPartialCatalogRegression) {
+    BootRig r("boot_i1");
+    ASSERT_TRUE(r.start());
+    ASSERT_EQ(r.define({.name = "a"}).code, kOk);
+    r.stop();
+    fs::create_directories(r.dataDir() / "topics" / "ghost" / "0");
+    { std::ofstream(r.dataDir() / "topics" / "ghost" / "0" / "00000000000000000000.log") << "ghost"; }
+    fs::create_directories(r.dataDir() / "topics" / "late" / "0");
+    { std::ofstream(r.dataDir() / "topics" / "late" / "topic-id") << "7\n"; }
+    { std::ofstream(r.dataDir() / "topics" / "late" / "0" / "00000000000000000000.log") << "x"; }
+    ASSERT_TRUE(rune::node::writeCatchUpSentinel(r.dataDir().string(), -1));
+    const auto ghost = treeOf(r.dataDir() / "topics" / "ghost");
+    const auto late  = treeOf(r.dataDir() / "topics" / "late");
+    ASSERT_TRUE(r.start());
+    EXPECT_EQ(r.node().bootReconcileStateForTest(), "AwaitingCatchUp");
+    std::this_thread::sleep_for(1s);
+    EXPECT_EQ(treeOf(r.dataDir() / "topics" / "ghost"), ghost);
+    EXPECT_EQ(treeOf(r.dataDir() / "topics" / "late"), late);
+    EXPECT_FALSE(fs::exists(r.dataDir() / "quarantine"));
+    EXPECT_EQ(sentinelOf(r.dataDir()).kind, rune::node::CatchUpSentinel::Kind::Pending);
+}
+
+// R2 (fix round 1, I3): a wiped broker that LEADS the catalog (single node: always) is never "caught up" on an
+// empty history — its topic dirs stay in place.
+TEST(CatalogBootRegression, WipedCatalogLeaderNeverReconcilesAgainstAnEmptyCatalogRegression) {
+    BootRig r("boot_i3");
+    ASSERT_TRUE(r.start());
+    ASSERT_EQ(r.define({.name = "a"}).code, kOk);
+    ASSERT_TRUE(r.awaitServes(0));
+    ASSERT_TRUE(r.produce(0, 0, "r1"));
+    ASSERT_TRUE(r.produce(0, 0, "r2"));
+    r.stop();
+    fs::remove_all(r.dataDir() / "__catalog");
+    ASSERT_TRUE(r.start());
+    std::this_thread::sleep_for(2s);
+    std::error_code ec;
+    std::uintmax_t bytes = 0;
+    for (const auto& e : fs::recursive_directory_iterator(r.dataDir() / "topics" / "a", ec))
+        if (e.path().extension() == ".log") bytes += fs::file_size(e.path());
+    EXPECT_GT(bytes, 0u) << "topics/a keeps its log bytes";
+    EXPECT_FALSE(fs::exists(r.dataDir() / "quarantine"));
+    EXPECT_EQ(r.node().bootReconcileStateForTest(), "AwaitingCatchUp");
+    EXPECT_EQ(sentinelOf(r.dataDir()).kind, rune::node::CatchUpSentinel::Kind::Pending);
 }

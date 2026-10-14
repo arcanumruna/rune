@@ -1574,7 +1574,7 @@ public:
     /// (which is what the Phase-1 single-node restart e2e actually relies on):
     /// true when no durable view is installed-for-recovery anywhere, so it never
     /// gates the no-views case closed.  Read-only; call off the hot path.  NOT
-    /// wired into the election path (see AdminWorker::recoverViewsOnPromotion_ / the Task-19b
+    /// wired into the election path (views recover from the boot replay, see bootFromCatalog_ / the Task-19b
     /// report: election-eligibility gating is a multi-node concern, DEFERRED).
     [[nodiscard]] bool viewsReady() const noexcept {
         if (!workerPool_) return true;

@@ -6,6 +6,7 @@
 // Ported from the retired RuntimeTopicRecoveryTest's reconcile cases (the marker /
 // placeholder / damage-latch machinery died with the module); every test here is named
 // *Regression so the suite runs with the checkpoint gate.
+#include <rune/gateway/TopicDirMarker.h>
 #include <rune/node/TopicDirReconcile.h>
 
 #include <gtest/gtest.h>
@@ -41,6 +42,12 @@ void touch(const fs::path& p, const std::string& content = "x") {
     std::ofstream(p, std::ios::binary) << content;
 }
 
+/// A catalog topic's dir as the registry makes it: the topic-id marker names the incarnation.
+void mark(const fs::path& topicDir, int32_t id) {
+    fs::create_directories(topicDir);
+    ASSERT_TRUE(rune::gateway::writeTopicIdMarker(topicDir, id));
+}
+
 TopicSpec spec(const std::string& name, int32_t id) {
     TopicSpec s;
     s.name = name; s.topicId = id; s.partitionCount = 1;
@@ -48,6 +55,13 @@ TopicSpec spec(const std::string& name, int32_t id) {
 }
 
 constexpr int64_t kNow = 1'700'000'000;
+
+bool quarantineHas(const fs::path& dataDir, const std::string& prefix) {
+    std::error_code ec;
+    for (fs::directory_iterator it(dataDir / "quarantine", ec), end; !ec && it != end; it.increment(ec))
+        if (it->path().filename().string().rfind(prefix, 0) == 0) return true;
+    return false;
+}
 const std::vector<int32_t> kNoDrops;
 
 } // namespace
@@ -55,6 +69,7 @@ const std::vector<int32_t> kNoDrops;
 TEST(TopicDirReconcileRegression, UnclaimedTopicDirIsQuarantinedNeverDeletedRegression) {
     TempDataDir d("quar");
     touch(d.path / "topics" / "live" / "0" / "seg.log");
+    mark(d.path / "topics" / "live", 0);
     touch(d.path / "topics" / "ghost" / "0" / "seg.log", "precious");
     const auto r = rune::node::reconcileTopicDirs(d.path.string(), {spec("live", 0)}, kNoDrops, kNow);
     ASSERT_EQ(r.quarantined.size(), 1u);
@@ -72,7 +87,9 @@ TEST(TopicDirReconcileRegression, UnclaimedTopicDirIsQuarantinedNeverDeletedRegr
 TEST(TopicDirReconcileRegression, CaseVariantOfALiveNameIsNotQuarantinedRegression) {
     TempDataDir d("case");
     touch(d.path / "topics" / "Orders" / "0" / "seg.log");
+    mark(d.path / "topics" / "Orders", 0);
     touch(d.path / "topics" / "EVENTS" / "0" / "seg.log");
+    mark(d.path / "topics" / "EVENTS", 1);
     const auto r = rune::node::reconcileTopicDirs(d.path.string(), {spec("orders", 0), spec("events", 1)}, kNoDrops, kNow);
     EXPECT_TRUE(r.quarantined.empty());
     EXPECT_TRUE(fs::exists(d.path / "topics" / "Orders" / "0" / "seg.log"));
@@ -89,23 +106,50 @@ TEST(TopicDirReconcileRegression, OnlyAsciiCaseFoldsClaimADirRegression) {
     EXPECT_EQ(r.quarantined.size(), 2u);
 }
 
-// The edge case "a topic dir without a topic-id marker": the retired marker is not a
-// thing any more — an unclaimed dir with none is quarantined like any other, and a
-// claimed one keeps whatever (stale) marker file it carries, unread and untouched.
-TEST(TopicDirReconcileRegression, MarkerlessAndStaleMarkerDirsAreJudgedByTheCatalogAloneRegression) {
-    TempDataDir d("marker");
-    touch(d.path / "topics" / "nomarker" / "0" / "seg.log");
-    touch(d.path / "topics" / "oldmarker" / "topic-id", "pending 7\n");     // an older build's leftover
-    touch(d.path / "topics" / "oldmarker" / "0" / "seg.log");
-    touch(d.path / "topics" / "claimed" / "topic-id", "pending 7\n");
-    touch(d.path / "topics" / "claimed" / "0" / "seg.log");
-    const auto r = rune::node::reconcileTopicDirs(d.path.string(), {spec("claimed", 0)}, kNoDrops, kNow);
-    EXPECT_EQ(r.quarantined.size(), 2u) << "no marker decides anything: the unclaimed dirs are quarantined";
-    EXPECT_TRUE(fs::exists(d.path / "quarantine" / ("nomarker-" + std::to_string(kNow)) / "0" / "seg.log"));
-    EXPECT_TRUE(fs::exists(d.path / "quarantine" / ("oldmarker-" + std::to_string(kNow)) / "topic-id"));
-    std::ifstream in(d.path / "topics" / "claimed" / "topic-id");
-    std::string line; std::getline(in, line);
-    EXPECT_EQ(line, "pending 7") << "a claimed dir's marker is left exactly as it was";
+// R1.3 step 0 (fix round 1): an OLDER incarnation's dir under a re-created name goes to dropped/ and is purged
+// in the same run; the live topic starts empty (createTopicAt then creates a fresh dir).
+TEST(TopicDirReconcileRegression, OlderIncarnationMarkerGoesToDroppedAndIsPurgedRegression) {
+    TempDataDir d("older");
+    touch(d.path / "topics" / "t" / "0" / "seg.log", "old life");
+    mark(d.path / "topics" / "t", 1);
+    const std::vector<int32_t> dropped = {1};
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(), {spec("t", 4)}, dropped, kNow);
+    ASSERT_EQ(r.retired.size(), 1u);
+    EXPECT_EQ(r.retired[0], d.path / "dropped" / "1.t");
+    ASSERT_EQ(r.purged.size(), 1u);
+    EXPECT_EQ(r.purged[0], d.path / "dropped" / "1.t") << "purged in the same run";
+    EXPECT_FALSE(fs::exists(d.path / "topics" / "t")) << "the live topic starts empty";
+    EXPECT_FALSE(fs::exists(d.path / "dropped" / "1.t"));
+    EXPECT_FALSE(fs::exists(d.path / "quarantine"));
+}
+
+TEST(TopicDirReconcileRegression, MarkerNamingANonDroppedIdOrUnattributedDataIsQuarantinedRegression) {
+    TempDataDir d("unattributed");
+    // a marker naming an id that is neither the claim nor dropped
+    touch(d.path / "topics" / "a" / "0" / "seg.log", "x");
+    mark(d.path / "topics" / "a", 9);
+    // markerless + data, claimed by a CATALOG topic
+    touch(d.path / "topics" / "b" / "0" / "seg.log", "x");
+    // markerless + empty: kept (createTopicAt adopts it)
+    fs::create_directories(d.path / "topics" / "c" / "0");
+    touch(d.path / "topics" / "c" / "0" / "seg.log", "");
+    // markerless + data claimed only as a STATIC topic: kept
+    touch(d.path / "topics" / "s" / "0" / "seg.log", "x");
+    // a fold-claimed dir carrying a dropped id's marker
+    touch(d.path / "topics" / "T" / "0" / "seg.log", "x");
+    mark(d.path / "topics" / "T", 3);
+    const std::vector<int32_t> dropped = {3};
+    const auto r = rune::node::reconcileTopicDirs(d.path.string(),
+                                                  {spec("a", 5), spec("b", 6), spec("c", 7), spec("t", 8)}, dropped,
+                                                  kNow, {spec("s", 0)});
+    EXPECT_TRUE(quarantineHas(d.path, "a-")) << "marker 9 is neither the claim (5) nor dropped";
+    EXPECT_TRUE(quarantineHas(d.path, "b-")) << "unattributed data";
+    EXPECT_FALSE(quarantineHas(d.path, "c-"));
+    EXPECT_TRUE(fs::exists(d.path / "topics" / "c"));
+    EXPECT_TRUE(fs::exists(d.path / "topics" / "s" / "0" / "seg.log")) << "statics are not marked, not checked";
+    EXPECT_FALSE(fs::exists(d.path / "topics" / "T"));
+    ASSERT_EQ(r.retired.size(), 1u);
+    EXPECT_EQ(r.retired[0], d.path / "dropped" / "3.T");
 }
 
 // B8 + the dropped/ rules: only the entries the catalog marks dropped are purged.
@@ -148,6 +192,7 @@ TEST(TopicDirReconcileRegression, CrashDuringReconcileRerunFinishesCleanlyAndIsI
     TempDataDir d("crash");
     for (const char* n : {"a", "b", "c"}) touch(d.path / "topics" / n / "0" / "seg.log", n);
     touch(d.path / "topics" / "live" / "0" / "seg.log");
+    mark(d.path / "topics" / "live", 0);
     // The crashed run moved "a" (one atomic rename) and then died before the others.
     fs::create_directories(d.path / "quarantine");
     fs::rename(d.path / "topics" / "a", d.path / "quarantine" / ("a-" + std::to_string(kNow)));
@@ -183,6 +228,7 @@ TEST(TopicDirReconcileRegression, OnlyDropsEveryUnclaimedDirIsQuarantinedAndTheD
 TEST(TopicDirReconcileRegression, ReCreatedNameKeepsItsDirAndOnlyTheOldIdsDroppedDataGoesRegression) {
     TempDataDir d("recreate");
     touch(d.path / "topics" / "players" / "0" / "seg.log", "new incarnation");
+    mark(d.path / "topics" / "players", 1);
     touch(d.path / "dropped" / "0.players" / "0" / "seg.log", "old incarnation");
     const std::vector<int32_t> dropped = {0};
     const auto r = rune::node::reconcileTopicDirs(d.path.string(), {spec("players", 1)}, dropped, kNow);
@@ -330,4 +376,55 @@ TEST(StaticCatalogCollisionRegression, NameIdAndCaseVariantCollisionsRefuseBootN
     EXPECT_FALSE(staticCatalogCollision({spec("extra", 7)}, catalog).has_value()) << "no shared name or id";
     EXPECT_FALSE(staticCatalogCollision({spec("events", 0)}, {}).has_value()) << "static topics alone boot";
     EXPECT_FALSE(staticCatalogCollision({}, catalog).has_value()) << "catalog topics alone boot";
+    {   // R6: a static topic whose id the catalog DROPPED would be silently dropped at boot
+        const std::vector<int32_t> dropped = {0};
+        const auto r = staticCatalogCollision({spec("s", 0)}, {}, dropped);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_NE(r->find("dropped (id 0)"), std::string::npos) << *r;
+        EXPECT_FALSE(staticCatalogCollision({spec("s", 1)}, {}, dropped).has_value());
+    }
+}
+
+// R2: the boot reconcile decision table, every row (first match wins).
+TEST(TopicDirReconcileRegression, DecideBootReconcileMatrixRegression) {
+    using rune::node::BootReconcile;
+    using rune::node::CatchUpSentinel;
+    using K = CatchUpSentinel::Kind;
+    const CatchUpSentinel none{K::Absent, -1}, pending{K::Pending, -1}, caught{K::CaughtUp, 10};
+    auto d = [](bool halted, int64_t applied, bool marked, bool droppedEntries, CatchUpSentinel s) {
+        return rune::node::decideBootReconcile(halted, applied, marked, droppedEntries, s);
+    };
+    // halted: Skip, whatever the sentinel
+    for (const CatchUpSentinel& s : {none, pending, caught}) EXPECT_EQ(d(true, 20, true, true, s), BootReconcile::Skip);
+    // CaughtUp
+    EXPECT_EQ(d(false, 10, true, true, caught), BootReconcile::RunNowAndClearSentinel);
+    EXPECT_EQ(d(false, 99, false, false, caught), BootReconcile::RunNowAndClearSentinel);
+    EXPECT_EQ(d(false, 9, true, true, caught), BootReconcile::DeferAndWritePending) << "applied less than the sentinel";
+    EXPECT_EQ(d(false, -1, true, true, caught), BootReconcile::DeferAndWritePending);
+    // Pending
+    EXPECT_EQ(d(false, 50, true, true, pending), BootReconcile::Defer);
+    EXPECT_EQ(d(false, -1, false, false, pending), BootReconcile::Defer);
+    // nothing applied: only MARKED dirs / dropped entries defer
+    EXPECT_EQ(d(false, -1, true, false, none), BootReconcile::DeferAndWritePending);
+    EXPECT_EQ(d(false, -1, false, true, none), BootReconcile::DeferAndWritePending);
+    EXPECT_EQ(d(false, -1, false, false, none), BootReconcile::RunNow) << "legacy / static markerless dirs reconcile at once";
+    // a catalog with history
+    EXPECT_EQ(d(false, 0, true, true, none), BootReconcile::RunNow);
+}
+
+TEST(TopicDirReconcileRegression, CatchUpSentinelRoundTripsAndMalformedReadsAsPendingRegression) {
+    using K = rune::node::CatchUpSentinel::Kind;
+    TempDataDir d("sentinel");
+    EXPECT_EQ(rune::node::readCatchUpSentinel(d.path.string()).kind, K::Absent);
+    ASSERT_TRUE(rune::node::writeCatchUpSentinel(d.path.string(), -1));
+    EXPECT_EQ(rune::node::readCatchUpSentinel(d.path.string()).kind, K::Pending);
+    ASSERT_TRUE(rune::node::writeCatchUpSentinel(d.path.string(), 41));
+    const auto s = rune::node::readCatchUpSentinel(d.path.string());
+    EXPECT_EQ(s.kind, K::CaughtUp);
+    EXPECT_EQ(s.offset, 41);
+    touch(d.path / rune::node::kCatchUpSentinelFile, "caughtup banana\n");
+    EXPECT_EQ(rune::node::readCatchUpSentinel(d.path.string()).kind, K::Pending) << "never trusted";
+    ASSERT_TRUE(rune::node::removeCatchUpSentinel(d.path.string()));
+    EXPECT_EQ(rune::node::readCatchUpSentinel(d.path.string()).kind, K::Absent);
+    EXPECT_TRUE(rune::node::removeCatchUpSentinel(d.path.string())) << "absent -> true";
 }

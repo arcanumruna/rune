@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -1128,4 +1129,80 @@ TEST(CatalogApplierRegression, AdminWorkerAdoptsOnlyABootedApplierAndGoesLiveOnI
     EXPECT_EQ(worker.applier().phaseName(), "Live");
     EXPECT_EQ(worker.applier().nextOffset(), 3) << "nothing replayed";
     EXPECT_TRUE(rig.rec.sequence.empty()) << "and no effect re-posted";
+}
+
+// R4 (fix round 1): postBootStash posts exactly what the boot accepted — an object the replay refused as oversize
+// (it halted on it) is skipped here, never posted as a sink / install the control thread would build.
+TEST(CatalogApplierRegression, PostBootStashSkipsObjectsTheBootRefusedAsOversizeRegression) {
+    CatalogRig rig("ap_stash_big");
+    rig.appendEvents(0, rig.golden().size());
+    rig.applier.applyCommitted(rig.replica());
+    ASSERT_FALSE(rig.applier.halted());
+    rig.restart();
+    rune::node::SchemaRegistry schemas;
+    rune::node::ViewRegistry views;
+    rune::node::CatalogApplier boot(rig.catalogDir(), schemas, views);
+    ASSERT_GT(boot.replayLocal(rig.log(), rune::node::BootEffects{}), 0);
+    ASSERT_FALSE(boot.state().views().empty());
+    // Per object (topic or view), the smallest frame cap it fits; pick a cap just below the largest so SOME objects
+    // fit and not all (the golden catalog's objects differ in frame size).
+    std::size_t biggest = 0;
+    std::vector<std::size_t> topicMin, viewMin;
+    for (const auto* t : boot.state().topics()) {
+        std::size_t cap = 1;
+        while (cap < (std::size_t{1} << 20) && rune::node::topicEffectFramesError(*t, cap)) ++cap;
+        topicMin.push_back(cap);
+        biggest = std::max(biggest, cap);
+    }
+    for (const auto* v : boot.state().views()) {
+        std::size_t cap = 1;
+        while (cap < (std::size_t{1} << 20) && rune::node::viewEffectFramesError(*v, boot.state(), cap)) ++cap;
+        viewMin.push_back(cap);
+        biggest = std::max(biggest, cap);
+    }
+    const std::size_t cap = biggest - 1;
+    std::size_t fitTopics = 0, fitViews = 0;
+    for (const std::size_t m : topicMin) fitTopics += m <= cap ? 1 : 0;
+    for (const std::size_t m : viewMin) fitViews += m <= cap ? 1 : 0;
+    ASSERT_LT(fitTopics + fitViews, topicMin.size() + viewMin.size()) << "something is oversize at this cap";
+    ASSERT_GT(fitTopics + fitViews, 0u) << "and something fits";
+    std::size_t sinks = 0, installs = 0, validators = 0;
+    rune::node::CatalogEffects fx;
+    fx.maxFrameBytes = cap;
+    fx.sinkApplied    = [&](const rune::node::SinkSpec&) { ++sinks; };
+    fx.viewInstalled  = [&](const cat::ViewObject&) { ++installs; };
+    fx.schemaChanged  = [&](const cat::TopicObject&) { ++validators; };
+    boot.postBootStash(fx);
+    std::size_t typedFitting = 0;
+    std::size_t i = 0;
+    for (const auto* t : boot.state().topics()) typedFitting += (topicMin[i++] <= cap && t->schema) ? 1 : 0;
+    EXPECT_EQ(sinks, fitViews) << "only the views whose frames fit the sink";
+    EXPECT_EQ(installs, fitViews);
+    EXPECT_EQ(validators, typedFitting) << "and only the topics whose frames fit";
+}
+
+// R5 (fix round 1): the boot sink serves the replay only; its captures are released when the replay ends.
+TEST(CatalogApplierRegression, BootSinkIsReleasedWhenTheReplayEndsRegression) {
+    CatalogRig rig("ap_release");
+    rig.appendEvents(0, 4);
+    rig.applier.applyCommitted(rig.replica());
+    rig.restart();
+    rune::node::SchemaRegistry schemas;
+    rune::node::ViewRegistry views;
+    rune::node::CatalogApplier boot(rig.catalogDir(), schemas, views);
+    auto token = std::make_shared<int>(7);
+    auto bootEffects = [&token] {   // a prvalue: no moved-from std::function (libc++ keeps a copy) outlives the call
+        rune::node::CatalogEffects fx;
+        fx.topicApplied = [token](const cat::TopicObject&) {};
+        return rune::node::BootEffects{std::move(fx)};
+    };
+    ASSERT_GT(boot.replayLocal(rig.log(), bootEffects()), 0);
+    EXPECT_EQ(token.use_count(), 1) << "the Booted phase must not keep the caller's captures alive";
+    // and the no-checkpoint path
+    CatalogRig empty("ap_release_empty");
+    rune::node::SchemaRegistry s2;
+    rune::node::ViewRegistry v2;
+    rune::node::CatalogApplier boot2(empty.catalogDir(), s2, v2);
+    ASSERT_EQ(boot2.replayLocal(empty.log(), bootEffects()), 0);
+    EXPECT_EQ(token.use_count(), 1);
 }

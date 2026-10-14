@@ -6,6 +6,8 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <unistd.h>
 #include <vector>
 
@@ -298,4 +300,70 @@ TEST(TopicRegistryRuntimeRegression, DropOfAnIdBeyondTheRegistryTombstonesItAndT
     ASSERT_TRUE(reg.dropTopic(2));
     EXPECT_EQ(reg.state(0), St::Serving) << "the live topic is untouched";
     EXPECT_FALSE(reg.dropTopic(-1));
+}
+
+// Task 16 fix round 1 (R1): a disk topic dir is opened only by the incarnation that made it.
+TEST(TopicRegistryRuntimeRegression, CreateTopicAtWritesAndHonoursTheTopicIdMarkerRegression) {
+    auto readFile = [](const fs::path& p) {
+        std::ifstream in(p, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    auto writeFile = [](const fs::path& p, const std::string& text) {
+        fs::create_directories(p.parent_path());
+        std::ofstream(p, std::ios::binary) << text;
+    };
+    TopicSpec spec; spec.name = "x"; spec.partitionCount = 1;
+    // (a) a fresh create writes the marker, before the partition dir
+    {
+        fs::path dir = makeTempDir("marker_a"); fs::create_directories(dir);
+        TopicRegistry reg(std::vector<TopicSpec>{}, dir.string());
+        ASSERT_EQ(reg.createTopicAt(0, spec), 0);
+        EXPECT_EQ(readFile(dir / "topics" / "x" / "topic-id"), "0\n");
+        EXPECT_TRUE(fs::exists(dir / "topics" / "x" / "0"));
+    }
+    // (b) another incarnation's dir (marker 5) holding records: refused, byte-identical
+    {
+        fs::path dir = makeTempDir("marker_b"); fs::create_directories(dir);
+        writeFile(dir / "topics" / "x" / "topic-id", "5\n");
+        writeFile(dir / "topics" / "x" / "0" / "00000000000000000000.log", "old records");
+        TopicRegistry reg(std::vector<TopicSpec>{}, dir.string());
+        EXPECT_EQ(reg.createTopicAt(0, spec), -1) << "never opened as id 0";
+        EXPECT_EQ(readFile(dir / "topics" / "x" / "topic-id"), "5\n");
+        EXPECT_EQ(readFile(dir / "topics" / "x" / "0" / "00000000000000000000.log"), "old records");
+        EXPECT_EQ(reg.state(0), TopicRegistry::TopicState::Unknown);
+    }
+    // (c) markerless dir WITH records: refused
+    {
+        fs::path dir = makeTempDir("marker_c"); fs::create_directories(dir);
+        writeFile(dir / "topics" / "x" / "0" / "00000000000000000000.log", "unattributed");
+        TopicRegistry reg(std::vector<TopicSpec>{}, dir.string());
+        EXPECT_EQ(reg.createTopicAt(0, spec), -1);
+        EXPECT_FALSE(fs::exists(dir / "topics" / "x" / "topic-id"));
+    }
+    // (d) markerless EMPTY dir: adopted, marker written
+    {
+        fs::path dir = makeTempDir("marker_d"); fs::create_directories(dir);
+        fs::create_directories(dir / "topics" / "x" / "0");
+        writeFile(dir / "topics" / "x" / "0" / "00000000000000000000.log", "");
+        TopicRegistry reg(std::vector<TopicSpec>{}, dir.string());
+        EXPECT_EQ(reg.createTopicAt(0, spec), 0);
+        EXPECT_EQ(readFile(dir / "topics" / "x" / "topic-id"), "0\n");
+    }
+    // (e) the matching marker over existing records: opened, records recovered
+    {
+        fs::path dir = makeTempDir("marker_e"); fs::create_directories(dir);
+        {
+            TopicRegistry reg(std::vector<TopicSpec>{}, dir.string());
+            ASSERT_EQ(reg.createTopicAt(3, spec), 3);
+            rune::protocol::RecordBatchBuilder b(0, 0);
+            b.append(std::string_view{}, std::string_view{"a"}, 0);
+            b.append(std::string_view{}, std::string_view{"b"}, 0);
+            const auto batch = b.build();
+            ASSERT_GE(reg.log(3, 0)->append(batch.data(), batch.size(), 1), 0);
+        }
+        TopicRegistry reg2(std::vector<TopicSpec>{}, dir.string());
+        EXPECT_EQ(readFile(dir / "topics" / "x" / "topic-id"), "3\n");
+        ASSERT_EQ(reg2.createTopicAt(3, spec), 3);
+        EXPECT_EQ(reg2.log(3, 0)->logEndOffset(), 2);
+    }
 }

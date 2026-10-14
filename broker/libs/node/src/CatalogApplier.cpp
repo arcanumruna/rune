@@ -147,6 +147,7 @@ int CatalogApplier::replay_(rune::storage::Log* log, int64_t leo, BootEffects bo
     }
     if (!ckpt) {
         spdlog::info("CatalogApplier: no applied checkpoint in {} — nothing to replay (log end {})", dir_, leo);
+        std::get<Booted>(phase_).effects = BootEffects{};   // R5
         return 0;
     }
 
@@ -174,6 +175,9 @@ int CatalogApplier::replay_(rune::storage::Log* log, int64_t leo, BootEffects bo
     }
     // The coalesced boot sink (I1): what was applied is served — halted or not.
     emitFinalState_();
+    // R5: the boot sink serves the replay only; release its captures (the caller's locals die with it) —
+    // a later halt in Booted posts nothing, postBootStash delivers it.
+    std::get<Booted>(phase_).effects = BootEffects{};
     return applied;
 }
 
@@ -184,9 +188,15 @@ int CatalogApplier::replay_(rune::storage::Log* log, int64_t leo, BootEffects bo
 // once the workers exist.
 void CatalogApplier::postBootStash(const CatalogEffects& sink) const {
     if (lastApplied_.offset >= 0) {
-        for (const cat::TopicObject* t : state_.topics())
+        // Exactly what the boot accepted (R4): the objects emitFinalState_ refused as oversize are skipped
+        // here too (the replay already halted on them).
+        const std::size_t maxFrame = sink.maxFrameBytes;
+        for (const cat::TopicObject* t : state_.topics()) {
+            if (maxFrame != 0 && topicEffectFramesError(*t, maxFrame)) continue;
             if (t->schema && sink.schemaChanged) sink.schemaChanged(*t);
+        }
         for (const cat::ViewObject* v : state_.views()) {
+            if (maxFrame != 0 && viewEffectFramesError(*v, state_, maxFrame)) continue;
             if (sink.sinkApplied) sink.sinkApplied(sinkSpecOf(*v));
             if (sink.viewInstalled) sink.viewInstalled(*v);
         }

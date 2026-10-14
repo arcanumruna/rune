@@ -1,5 +1,6 @@
 #include <rune/gateway/TopicRegistry.h>
 #include <rune/catalog/TopicName.h>
+#include <rune/gateway/TopicDirMarker.h>
 
 #include <spdlog/spdlog.h>
 
@@ -131,6 +132,43 @@ TopicRegistry::createTopicAt(int32_t topicId, const rune::node::TopicSpec& spec)
         spdlog::error("TopicRegistry::createTopicAt: name '{}' is held by live id={}, refused for id={}",
                       spec.name, it->second, topicId);
         return -1;
+    }
+
+    // Fix round 1 (R1): a disk topic dir is opened only by the incarnation that made it (the topic-id
+    // marker, written durably before any partition dir exists).  The idempotent re-post above returns
+    // before this block, so it never re-reads the disk.
+    if (spec.persistence != rune::node::PersistenceMode::Transient) {
+        const fs::path dir = fs::path{dataDir_} / "topics" / spec.name;
+        std::error_code ec;
+        const fs::file_status st = fs::symlink_status(dir, ec);
+        if (!fs::exists(st)) {
+            fs::create_directories(dir, ec);
+            if (ec || !writeTopicIdMarker(dir, topicId)) {
+                spdlog::error("TopicRegistry::createTopicAt: cannot create '{}' with its topic-id marker ({}) — id={} "
+                              "not built", dir.string(), ec.message(), topicId);
+                return -1;
+            }
+        } else if (fs::is_symlink(st) || !fs::is_directory(st)) {
+            spdlog::error("TopicRegistry::createTopicAt: '{}' is not a plain directory — id={} not built",
+                          dir.string(), topicId);
+            return -1;
+        } else {
+            const TopicIdMarker m = readTopicIdMarker(dir);
+            if (m.kind == TopicIdMarker::Kind::Valid && m.id != topicId) {
+                spdlog::error("TopicRegistry::createTopicAt: '{}' belongs to topic id {} — never opened as id {} "
+                              "(another incarnation of the name); not built", dir.string(), m.id, topicId);
+                return -1;
+            }
+            if (m.kind != TopicIdMarker::Kind::Valid) {
+                if (topicDirHoldsRecords(dir)) {
+                    spdlog::error("TopicRegistry::createTopicAt: '{}' holds records but no topic-id marker — its "
+                                  "incarnation is unknown; never opened as id {} (the boot reconcile quarantines "
+                                  "it)", dir.string(), topicId);
+                    return -1;
+                }
+                if (!writeTopicIdMarker(dir, topicId)) return -1;   // an empty dir: adopted
+            }
+        }
     }
 
     Live live = buildLive_(spec, topicId);   // may throw: nothing changed yet

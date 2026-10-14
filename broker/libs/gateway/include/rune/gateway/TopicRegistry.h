@@ -118,7 +118,8 @@ public:
     // ignored), filling a gap below it with Gap slots.  Creates
     // dataDir/topics/<name>/<p>/ for a disk topic and opens + recovers each Log
     // (an existing dir is recovered, never wiped: a restart re-runs the effect).
-    // No topic-id marker (the catalog is the record of truth).
+    // A disk topic's dir carries the topic-id marker (TopicDirMarker.h): written before any partition dir
+    // exists; a dir marked with another id, or markerless with record bytes, is never opened (returns -1).
     // Idempotent for the same id + name (returns topicId, nothing rebuilt).
     // Returns -1 (logged) when the id is Dropped, holds another name, or the
     // name is held by another live id.

@@ -2,12 +2,18 @@
 #include <rune/node/TopicDirReconcile.h>
 
 #include <rune/catalog/TopicName.h>   // topicNamesFoldEqual, escapeNameForLog
+#include <rune/gateway/TopicDirMarker.h>
 
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <filesystem>
+#include <fstream>
 #include <string>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -98,21 +104,117 @@ void purgeDroppedEntries(const std::string& dataDir, std::span<const int32_t> dr
 
 } // namespace
 
-TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir, const std::vector<TopicSpec>& liveTopics,
-                                          std::span<const int32_t> droppedIds, int64_t nowUnixSeconds) {
-    TopicDirReconciliation result;
-    purgeDroppedEntries(dataDir, droppedIds, result);
+namespace {
 
+/// Moves `c` (a direct child of the canonical topics root) to dataDir/quarantine/<name>-<now>[-N]; never
+/// deletes.  true iff moved.
+bool quarantineOne(const fs::path& p, const fs::path& dataDir, const fs::path& canonicalRoot, int64_t now,
+                   TopicDirReconciliation& result) {
+    std::error_code cec;
+    const fs::path c = fs::canonical(p, cec);
+    if (cec || c.parent_path() != canonicalRoot) {   // guard: a direct child of dataDir/topics only
+        spdlog::error("topic-dir reconcile: refusing to touch '{}' (outside '{}')", p.string(), canonicalRoot.string());
+        return false;
+    }
+    const fs::path quarantineRoot = dataDir / "quarantine";
+    std::error_code qec;
+    const fs::file_status qst = fs::symlink_status(quarantineRoot, qec);
+    if (fs::is_symlink(qst) || (fs::exists(qst) && !fs::is_directory(qst))) {
+        spdlog::error("topic-dir reconcile: '{}' is not a plain directory — not quarantining '{}'",
+                      quarantineRoot.string(), c.string());
+        return false;
+    }
+    qec.clear();
+    fs::create_directories(quarantineRoot, qec);
+    if (qec) {
+        spdlog::error("topic-dir reconcile: cannot create '{}': {}", quarantineRoot.string(), qec.message());
+        return false;
+    }
+    const std::string base = c.filename().string() + "-" + std::to_string(now);
+    fs::path dest = quarantineRoot / base;
+    for (int n = 1; fs::exists(fs::symlink_status(dest, qec)); ++n)
+        dest = quarantineRoot / (base + "-" + std::to_string(n));
+    std::error_code mec;
+    fs::rename(c, dest, mec);   // same filesystem (both under dataDir): atomic, data untouched
+    if (mec) {
+        spdlog::error("topic-dir reconcile: moving '{}' to '{}' failed: {}", c.string(), dest.string(), mec.message());
+        return false;
+    }
+    spdlog::warn("topic-dir reconcile: quarantined '{}' -> '{}' — no topic in the catalog claims it (or it holds "
+                 "data of an unknown incarnation); it is NOT restored automatically (never deleted)",
+                 c.string(), dest.string());
+    result.quarantined.push_back(dest);
+    return true;
+}
+
+/// R1.3 step 0: a dir claimed by a CATALOG topic is opened only by the incarnation that made it.
+void settleClaimedDirs(const fs::path& dataDir, const fs::path& topicsRoot, const fs::path& canonicalRoot,
+                       const std::vector<TopicSpec>& catalogTopics, std::span<const int32_t> droppedIds,
+                       int64_t now, TopicDirReconciliation& result) {
+    namespace gw = rune::gateway;
     std::error_code ec;
-    const fs::path topicsRoot = fs::path(dataDir) / "topics";
+    std::vector<fs::path> children;
+    for (fs::directory_iterator it(topicsRoot, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code sec;
+        const fs::file_status st = it->symlink_status(sec);
+        if (sec || fs::is_symlink(st) || !fs::is_directory(st)) continue;
+        children.push_back(it->path());
+    }
+    for (const fs::path& c : children) {
+        const std::string fname = c.filename().string();
+        const TopicSpec* t = nullptr;
+        for (const TopicSpec& cand : catalogTopics)
+            if (cand.name == fname || topicNamesFoldEqual(cand.name, fname)) { t = &cand; break; }
+        if (t == nullptr || !isTopicDirLayout(c)) continue;
+        const gw::TopicIdMarker m = gw::readTopicIdMarker(c);
+        const bool valid     = m.kind == gw::TopicIdMarker::Kind::Valid;
+        const bool transient = t->persistence == PersistenceMode::Transient;
+        if (valid && m.id == t->topicId && !transient) continue;                 // keep: this incarnation's own dir
+        if (!valid && !gw::topicDirHoldsRecords(c)) continue;                    // keep: holds nothing; createTopicAt adopts it
+        const bool dropped = valid && std::find(droppedIds.begin(), droppedIds.end(), m.id) != droppedIds.end();
+        if (valid && (m.id != t->topicId || transient) && dropped) {
+            const fs::path droppedRoot = dataDir / "dropped";
+            const fs::path dest        = droppedRoot / (std::to_string(m.id) + "." + fname);
+            std::error_code dec;
+            fs::create_directories(droppedRoot, dec);
+            const bool free = !dec && !fs::exists(fs::symlink_status(dest, dec));
+            std::error_code mec;
+            if (free) fs::rename(c, dest, mec);
+            if (free && !mec) {
+                spdlog::warn("topic-dir reconcile: older incarnation id {} of '{}' moved to {} — the live topic id {} "
+                             "starts empty", m.id, fname, dest.string(), t->topicId);
+                result.retired.push_back(dest);
+                continue;
+            }
+        }
+        (void)quarantineOne(c, dataDir, canonicalRoot, now, result);
+    }
+}
+
+} // namespace
+
+TopicDirReconciliation reconcileTopicDirs(const std::string& dataDirStr, const std::vector<TopicSpec>& catalogTopics,
+                                          std::span<const int32_t> droppedIds, int64_t nowUnixSeconds,
+                                          const std::vector<TopicSpec>& staticTopics) {
+    TopicDirReconciliation result;
+    const fs::path dataDir{dataDirStr};
+    std::error_code ec;
+    const fs::path topicsRoot = dataDir / "topics";
     const fs::file_status rootSt = fs::symlink_status(topicsRoot, ec);
-    if (ec || !fs::is_directory(rootSt)) return result;   // absent, or a symlink: never followed
-    const fs::path canonicalRoot = fs::canonical(topicsRoot, ec);
-    if (ec) return result;
+    const bool haveTopics = !ec && fs::is_directory(rootSt);   // absent, or a symlink: never followed
+    fs::path canonicalRoot;
+    if (haveTopics) {
+        canonicalRoot = fs::canonical(topicsRoot, ec);
+        if (ec) { purgeDroppedEntries(dataDirStr, droppedIds, result); return result; }
+        settleClaimedDirs(dataDir, topicsRoot, canonicalRoot, catalogTopics, droppedIds, nowUnixSeconds, result);
+    }
+    purgeDroppedEntries(dataDirStr, droppedIds, result);
+    if (!haveTopics) return result;
 
     auto claimed = [&](const std::string& n) {
-        for (const TopicSpec& t : liveTopics)
-            if (t.name == n || topicNamesFoldEqual(t.name, n)) return true;
+        for (const auto* list : {&catalogTopics, &staticTopics})
+            for (const TopicSpec& t : *list)
+                if (t.name == n || topicNamesFoldEqual(t.name, n)) return true;
         return false;
     };
 
@@ -132,45 +234,115 @@ TopicDirReconciliation reconcileTopicDirs(const std::string& dataDir, const std:
     if (ec)
         spdlog::error("topic-dir reconcile: listing '{}' failed: {} — no further dirs considered",
                       topicsRoot.string(), ec.message());
-
-    const fs::path quarantineRoot = fs::path(dataDir) / "quarantine";
-    for (const fs::path& p : candidates) {
-        std::error_code cec;
-        const fs::path c = fs::canonical(p, cec);
-        if (cec || c.parent_path() != canonicalRoot) {   // guard: a direct child of dataDir/topics only
-            spdlog::error("topic-dir reconcile: refusing to touch '{}' (outside '{}')", p.string(),
-                          canonicalRoot.string());
-            continue;
-        }
-        std::error_code qec;
-        const fs::file_status qst = fs::symlink_status(quarantineRoot, qec);
-        if (fs::is_symlink(qst) || (fs::exists(qst) && !fs::is_directory(qst))) {
-            spdlog::error("topic-dir reconcile: '{}' is not a plain directory — not quarantining '{}'",
-                          quarantineRoot.string(), c.string());
-            continue;
-        }
-        qec.clear();
-        fs::create_directories(quarantineRoot, qec);
-        if (qec) {
-            spdlog::error("topic-dir reconcile: cannot create '{}': {}", quarantineRoot.string(), qec.message());
-            continue;
-        }
-        const std::string base = c.filename().string() + "-" + std::to_string(nowUnixSeconds);
-        fs::path dest = quarantineRoot / base;
-        for (int n = 1; fs::exists(fs::symlink_status(dest, qec)); ++n)
-            dest = quarantineRoot / (base + "-" + std::to_string(n));
-        std::error_code mec;
-        fs::rename(c, dest, mec);   // same filesystem (both under dataDir): atomic, data untouched
-        if (mec) {
-            spdlog::error("topic-dir reconcile: moving '{}' to '{}' failed: {}", c.string(), dest.string(),
-                          mec.message());
-            continue;
-        }
-        spdlog::warn("topic-dir reconcile: quarantined '{}' -> '{}' — no topic in the catalog claims it; it is "
-                     "NOT restored automatically (never deleted)", c.string(), dest.string());
-        result.quarantined.push_back(dest);
-    }
+    for (const fs::path& p : candidates) (void)quarantineOne(p, dataDir, canonicalRoot, nowUnixSeconds, result);
     return result;
+}
+
+namespace {
+bool syncDir(const fs::path& dir) noexcept {
+    const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return false;
+    const bool ok = ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+}
+} // namespace
+
+CatchUpSentinel readCatchUpSentinel(const std::string& dataDir) noexcept {
+    CatchUpSentinel s;
+    try {
+        const fs::path p = fs::path{dataDir} / kCatchUpSentinelFile;
+        std::error_code ec;
+        const fs::file_status st = fs::symlink_status(p, ec);
+        if (ec || !fs::exists(st)) return s;
+        s.kind = CatchUpSentinel::Kind::Pending;   // present but unreadable / malformed: Pending (never trusted)
+        if (fs::is_symlink(st) || !fs::is_regular_file(st)) {
+            spdlog::warn("catch-up sentinel '{}' is not a regular file — read as pending", p.string());
+            return s;
+        }
+        std::ifstream in(p, std::ios::binary);
+        std::string line;
+        std::getline(in, line);
+        if (line.rfind("caughtup ", 0) == 0) {
+            const std::string digits = line.substr(9);
+            if (!digits.empty() && digits.size() <= 18 &&
+                digits.find_first_not_of("0123456789") == std::string::npos) {
+                s.kind   = CatchUpSentinel::Kind::CaughtUp;
+                s.offset = std::stoll(digits);
+                return s;
+            }
+        }
+        if (line != "pending")
+            spdlog::warn("catch-up sentinel '{}' is malformed ('{}') — read as pending", p.string(), line);
+    } catch (...) {
+    }
+    return s;
+}
+
+bool writeCatchUpSentinel(const std::string& dataDir, int64_t caughtUpAt) noexcept {
+    try {
+        const fs::path dir{dataDir};
+        const fs::path tmp = dir / (std::string{kCatchUpSentinelFile} + ".tmp");
+        const fs::path dst = dir / kCatchUpSentinelFile;
+        const std::string text = caughtUpAt < 0 ? std::string{"pending\n"}
+                                                : "caughtup " + std::to_string(caughtUpAt) + "\n";
+        const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
+        if (fd < 0) return false;
+        bool ok = true;
+        for (std::size_t off = 0; ok && off < text.size();) {
+            const ssize_t w = ::write(fd, text.data() + off, text.size() - off);
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) ok = false; else off += static_cast<std::size_t>(w);
+        }
+        if (ok && ::fsync(fd) != 0) ok = false;
+        ::close(fd);
+        std::error_code ec;
+        if (ok) { fs::rename(tmp, dst, ec); ok = !ec; }
+        if (ok) ok = syncDir(dir);
+        if (!ok) { std::error_code rec; fs::remove(tmp, rec); }
+        return ok;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool removeCatchUpSentinel(const std::string& dataDir) noexcept {
+    try {
+        std::error_code ec;
+        fs::remove(fs::path{dataDir} / kCatchUpSentinelFile, ec);
+        if (ec) return false;
+        return syncDir(fs::path{dataDir});
+    } catch (...) {
+        return false;
+    }
+}
+
+bool topicsHoldCatalogMarkedDir(const std::string& dataDir) noexcept {
+    try {
+        std::error_code ec;
+        const fs::path root = fs::path{dataDir} / "topics";
+        const fs::file_status rst = fs::symlink_status(root, ec);
+        if (ec || !fs::is_directory(rst)) return false;
+        for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+            std::error_code sec;
+            const fs::file_status st = it->symlink_status(sec);
+            if (sec || fs::is_symlink(st) || !fs::is_directory(st)) continue;
+            if (rune::gateway::readTopicIdMarker(it->path()).kind == rune::gateway::TopicIdMarker::Kind::Valid)
+                return true;
+        }
+    } catch (...) {
+    }
+    return false;
+}
+
+BootReconcile decideBootReconcile(bool halted, int64_t lastApplied, bool markedDirs, bool droppedHasEntries,
+                                  CatchUpSentinel s) noexcept {
+    if (halted) return BootReconcile::Skip;
+    if (s.kind == CatchUpSentinel::Kind::CaughtUp)
+        return lastApplied >= s.offset ? BootReconcile::RunNowAndClearSentinel : BootReconcile::DeferAndWritePending;
+    if (s.kind == CatchUpSentinel::Kind::Pending) return BootReconcile::Defer;
+    if (lastApplied < 0 && (markedDirs || droppedHasEntries)) return BootReconcile::DeferAndWritePending;
+    return BootReconcile::RunNow;
 }
 
 void warnRetiredCatalogDirs(const std::string& dataDir) {
@@ -189,7 +361,8 @@ void warnRetiredCatalogDirs(const std::string& dataDir) {
 }
 
 std::optional<std::string> staticCatalogCollision(const std::vector<TopicSpec>& statics,
-                                                  const std::vector<TopicSpec>& catalogTopics) {
+                                                  const std::vector<TopicSpec>& catalogTopics,
+                                                  std::span<const int32_t> catalogDroppedIds) {
     auto staticId = [&](std::size_t i) {
         return statics[i].topicId >= 0 ? statics[i].topicId : static_cast<int32_t>(i);
     };
@@ -207,6 +380,12 @@ std::optional<std::string> staticCatalogCollision(const std::vector<TopicSpec>& 
     for (std::size_t i = 0; i < statics.size(); ++i)
         for (const TopicSpec& c : catalogTopics)
             if (staticId(i) == c.topicId) return refusal(statics[i], staticId(i), c, "by topic id");
+    for (std::size_t i = 0; i < statics.size(); ++i)
+        if (std::find(catalogDroppedIds.begin(), catalogDroppedIds.end(), staticId(i)) != catalogDroppedIds.end())
+            return "static RUNE_TOPICS topic '" + rune::catalog::escapeNameForLog(statics[i].name) + "' (id " +
+                   std::to_string(staticId(i)) + ") collides by topic id with a topic the catalog dropped (id " +
+                   std::to_string(staticId(i)) + ") — the boot would drop the static topic; refusing to start "
+                   "(remove it from RUNE_TOPICS: create every topic by DDL)";
     return std::nullopt;
 }
 

@@ -327,8 +327,8 @@ void AdminWorker::adoptBootedApplier(CatalogApplier booted, LiveEffects live) {
     pendingLive_ = std::move(live);
 }
 
-void AdminWorker::deferTopicDirReconcile(std::string dataDir, std::vector<TopicSpec> alsoClaimed) {
-    bootReconcile_ = AwaitingCatchUp{std::move(dataDir), std::move(alsoClaimed)};
+void AdminWorker::deferTopicDirReconcile(std::string dataDir) {
+    bootReconcile_ = AwaitingCatchUp{std::move(dataDir), false};
 }
 
 std::string_view AdminWorker::bootReconcileStateName() const noexcept {
@@ -340,31 +340,34 @@ std::string_view AdminWorker::bootReconcileStateName() const noexcept {
 }
 
 bool AdminWorker::bootReconcileReady_() const noexcept {
-    if (catalogReplica_ == nullptr || applier_.halted()) return false;
-    if (catalogReplica_->role() == rune::replication::Role::Leader) return caughtUp_();
-    return catalogReplica_->caughtUpWithLeader() && applier_.nextOffset() >= catalogReplica_->logEndOffset();
+    return catalogReplica_ != nullptr && !applier_.halted() &&
+           catalogReplica_->role() != rune::replication::Role::Leader && catalogReplica_->caughtUpWithLeader() &&
+           applier_.nextOffset() > 0 && applier_.nextOffset() >= catalogReplica_->logEndOffset();
 }
 
 int AdminWorker::stepBootReconcile_() {
-    const auto* d = std::get_if<AwaitingCatchUp>(&bootReconcile_);
+    auto* d = std::get_if<AwaitingCatchUp>(&bootReconcile_);
     if (d == nullptr) return 0;
     if (applier_.halted()) {
         spdlog::critical("AdminWorker: the deferred topic-dir reconcile is CANCELLED — the catalog apply halted "
-                         "(catalog damage: no destructive cleanup)");
+                         "(catalog damage: no destructive cleanup); the catch-up sentinel stays pending");
         bootReconcile_ = BootReconcileDone{};
         return 1;
     }
+    if (catalogReplica_ != nullptr && catalogReplica_->role() == rune::replication::Role::Leader) {
+        if (!d->leaderWaitLogged) {
+            spdlog::critical("AdminWorker: this broker leads __catalog without a caught-up history — topic dirs stay "
+                             "untouched until __catalog is restored or this broker catches up as a follower");
+            d->leaderWaitLogged = true;
+        }
+        return 0;
+    }
     if (!bootReconcileReady_()) return 0;
-    const cat::CatalogState& s = applier_.state();
-    std::vector<TopicSpec> live = d->alsoClaimed;
-    for (const cat::TopicObject* t : s.topics()) { TopicSpec ts; ts.name = t->name; ts.topicId = t->topicId; live.push_back(std::move(ts)); }
-    for (const cat::ViewObject* v : s.views())  { TopicSpec ts; ts.name = v->name; ts.topicId = v->def.viewTopicId; live.push_back(std::move(ts)); }
-    const std::vector<int32_t> dropped = droppedTopicIds(s);
-    spdlog::info("AdminWorker: the applier caught up to the catalog leader at offset {} ({} live topic(s)) — "
-                 "running the topic-dir reconcile deferred at boot", applier_.nextOffset(), live.size());
-    reconciled_ = reconcileTopicDirs(d->dataDir, live, dropped,
-                                     std::chrono::duration_cast<std::chrono::seconds>(
-                                         std::chrono::system_clock::now().time_since_epoch()).count());
+    if (!writeCatchUpSentinel(d->dataDir, applier_.nextOffset() - 1))
+        spdlog::critical("AdminWorker: cannot persist the catch-up sentinel in {} — it stays pending: the next boot "
+                         "defers again", d->dataDir);
+    spdlog::info("AdminWorker: caught up to the catalog leader at offset {} — the deferred topic-dir reconcile runs "
+                 "at the next boot", applier_.nextOffset());
     bootReconcile_ = BootReconcileDone{};
     return 1;
 }
@@ -402,8 +405,8 @@ std::string_view AdminWorker::inFlightStateName() const noexcept {
 }
 
 // ─── roles ──────────────────────────────────────────────────────────────────
-// The retired __topic_schemas / __views replicas: their role is still driven so
-// they stay consistent until Task 16 deletes them; nothing reads or writes them
+// The retired replica parameters (null in a broker since Task 16; the rigs may still pass
+// one): their role is driven so they stay consistent; nothing reads or writes them
 // (the catalog is the only source — binding 8), and they carry no DDL effect.
 void AdminWorker::onRole(const AdminRoleMsg& role) {
     namespace rr = rune::replication;
@@ -559,8 +562,8 @@ int AdminWorker::doWork(int64_t nowNs) {
                                      nowNs, catalogFrameStats_);
             });
     }
-    if (replica_)      work += replica_->doWork(nowNs);        // retired (Task 16 deletes)
-    if (viewsReplica_) work += viewsReplica_->doWork(nowNs);   // retired (Task 16 deletes)
+    if (replica_)      work += replica_->doWork(nowNs);        // retired parameter (null in a broker)
+    if (viewsReplica_) work += viewsReplica_->doWork(nowNs);   // retired parameter (null in a broker)
     if (catalogReplica_) {
         work += catalogReplica_->doWork(nowNs);
         if (!applyHeldForTest_) [[likely]] work += applier_.applyCommitted(*catalogReplica_);

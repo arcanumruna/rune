@@ -455,6 +455,10 @@ TEST(CatalogGatewayRegression, CreateTopicAtIsIdempotentAndRefusesConflicts) {
     EXPECT_EQ(g.apply(5, 1, "other"), -1) << "an id holding another name";
     EXPECT_EQ(g.apply(6, 1, "orders"), -1) << "a name held by a live id";
     ASSERT_TRUE(g.registry->dropTopic(5));
+    // Task 16 fix round 1 (R1): the dropped incarnation's dir (marker 5) is retired (renamed away) before the
+    // name is re-created — the control thread's drop sequence; a create over it would be refused.
+    EXPECT_EQ(g.apply(6, 1, "orders"), -1) << "the older incarnation's dir is still in place";
+    std::filesystem::rename(g.dir.path / "topics" / "orders", g.dir.path / "retired-orders");
     EXPECT_EQ(g.apply(6, 1, "orders"), 6) << "a dropped name is free for a NEW id";
     EXPECT_EQ(g.registry->topicIdForName("orders"), 6);
     EXPECT_TRUE(g.registry->releaseDroppedLogs(5));

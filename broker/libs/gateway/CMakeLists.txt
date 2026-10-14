@@ -7,7 +7,8 @@ cmake_minimum_required(VERSION 3.20)
 # implementation, cleanly eliminating the circular-dep workaround.
 add_library(rune_gateway
     src/ClientGateway.cpp
-    src/TopicRegistry.cpp)
+    src/TopicRegistry.cpp
+    src/TopicDirMarker.cpp)
 
 target_include_directories(rune_gateway PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)

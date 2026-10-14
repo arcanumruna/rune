@@ -2942,6 +2942,18 @@ TEST(CatalogHaltedPlacementRegression, HaltedControllerPlacesAndUnplacesNoCatalo
     // brokers: CatalogLeadershipBrokerRegression.AllBrokersHalted….)
 }
 
+// Task 16 fix round 1 (R3): the boot feeds every catalog topic through configure(); the STATIC emit path of
+// a halted controller must place nothing either.  RED (guard removed): topic 6 is placed from the stale catalog.
+TEST(CatalogHaltedPlacementRegression, HaltedControllerEmitsNoStaticAssignmentForConfiguredCatalogTopicsRegression) {
+    CtlRig c;
+    (void)c.svc->onAlterIsr(haltedRegister(1, 11));   // the controller (node 1) itself halted
+    c.svc->configure({TopicSpec{6, 1, 0, "", "late"}}, c.all);
+    c.svc->emitStaticAssignmentIfNeeded();
+    c.drive(100);
+    EXPECT_EQ(c.svc->assignment(6, 0), nullptr) << "no placement from a halted catalog";
+    EXPECT_GE(c.svc->catalogPlacementsSkippedHalted(), 1u);
+}
+
 // Review I1 (fix round 1): placement is per unit.  A SUCCESSOR controller catches
 // up with two pending topics — one unplaceable (explicit rf 3 with broker 3
 // halted), one placeable — and an already-placed explicit-rf-3 topic.  The

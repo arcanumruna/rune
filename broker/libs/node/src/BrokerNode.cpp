@@ -33,7 +33,7 @@
 #include <rune/transaction/ReplicatedTxnStateStore.h>
 // MD1 Task 4: MetadataService for __cluster_metadata.
 #include <rune/node/MetadataService.h>
-// Task 6: AdminWorker + SchemaRegistry + __topic_schemas persistence.
+// Task 6 / 16: AdminWorker + SchemaRegistry (the CatalogApplier's projection of __catalog).
 #include <rune/node/AdminWorker.h>
 #include <rune/node/SchemaRegistry.h>
 #include <rune/node/CatalogEffectFrames.h>
@@ -399,13 +399,26 @@ void BrokerNode::start() {
     // collision with a catalog id refused the boot above), then a Dropped slot for
     // every id the catalog dropped — including ids this broker never built (a
     // dropped topic never serves again, and its id is never refilled).
+    // Fix round 1 (R1.4): a topic whose dir belongs to another incarnation is not built (the registry refuses
+    // it).  On a HALTED boot that is logged and the topic stays unbuilt (the broker keeps serving the rest);
+    // otherwise the boot refuses to start.
+    std::vector<int32_t> unbuilt;
     for (std::size_t i = config_.topics.size(); i < bootTopics_.size(); ++i) {   // [0, n) are the static topics
         const TopicSpec& t = bootTopics_[i];
-        if (topicRegistry_->createTopicAt(t.topicId, t) < 0)
-            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: the catalog topic '" +
-                                     t.name + "' (id " + std::to_string(t.topicId) +
-                                     ") could not be built at boot — refusing to start");
+        if (topicRegistry_->createTopicAt(t.topicId, t) >= 0) continue;
+        if (bootApplier_ && bootApplier_->halted()) {
+            spdlog::critical("BrokerNode[{}]: catalog topic '{}' (id {}) not built on this halted boot (see the "
+                             "TopicRegistry error above)", config_.nodeId, t.name, t.topicId);
+            unbuilt.push_back(t.topicId);
+            continue;
+        }
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: the catalog topic '" +
+                                 t.name + "' (id " + std::to_string(t.topicId) +
+                                 ") could not be built at boot — refusing to start");
     }
+    std::erase_if(bootTopics_, [&](const TopicSpec& t) {
+        return std::find(unbuilt.begin(), unbuilt.end(), t.topicId) != unbuilt.end();
+    });
     for (const int32_t id : bootDroppedIds_) (void)topicRegistry_->dropTopic(id);
     topicsAtReplicationBuild_.clear();
     for (int32_t id = 0; id < topicRegistry_->topicCount(); ++id)
@@ -1240,7 +1253,7 @@ void BrokerNode::buildReplication() {
             //
             //   E5 Task 5 routing rules:
             //   1. topicId < 0 (internal: __consumer_offsets=-1, __transaction_state=-2,
-            //      __cluster_metadata=-3, __topic_schemas=-4):
+            //      __cluster_metadata=-3, __catalog=-6):
             //      ALWAYS the legacy replTransport_ regardless of flag.
             //      Rationale: per-worker planes are worker-thread-only; internal
             //      partitions are driven on the control thread by the bridge/services.
@@ -2629,12 +2642,9 @@ void BrokerNode::buildGateway() {
         gateway_->setAdminSink(adminWorkerAgent_.get());
     }
 
-    // Task 19b (restart recovery): a restarted broker recovers its durable view
-    // catalog on the AdminWorker's Follower->Leader promotion edge
-    // (AdminWorker::recoverViewsOnPromotion_) — the same edge where
-    // __topic_schemas is rebuilt — NOT here at buildGateway.  A freshly-built
-    // __views replica is a Follower with highWatermark()==0 at this point, so
-    // the catalog is not yet replayable; recovery must wait for promotion.
+    // Restart recovery (Task 16): a restarted broker's views come back from the ONE boot replay of
+    // __catalog on the startup thread (bootFromCatalog_) on every broker; the recovery installs are
+    // posted by CatalogApplier::postBootStash once the workers exist (start(), step 7c).
 
     // Build the composite runtime agent:
     //   single-node: wraps agent_    (ConsensusAgent)
@@ -3100,6 +3110,10 @@ void BrokerNode::bootFromCatalog_() {
     fs::create_directories(dir);
     catalogLog_ = std::make_unique<rune::storage::Log>(dir.string(), config_.offsetLogSegmentRollBytes);
     catalogLog_->recover();
+    if (catalogLog_->storageFailed())   // fix round 1 (R7): before anything reads the log or touches topics/
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: __catalog recovery failed "
+                                 "(storage error " + std::to_string(catalogLog_->storageErrno()) + ") at " +
+                                 dir.string() + " — refusing to start before the boot replay");
     // Never compacted / retention-deleted: a recovered catalog always starts at
     // 0 — a follower can never be "below the leader's start".  Anything else is
     // a damaged (or foreign) directory: refuse loudly instead of serving it.
@@ -3134,32 +3148,59 @@ void BrokerNode::bootFromCatalog_() {
     std::sort(catalogTopics.begin(), catalogTopics.end(),
               [](const TopicSpec& a, const TopicSpec& b) { return a.topicId < b.topicId; });
 
-    // INTERIM (until Task 17): a static topic never shares a broker with a catalog topic.
-    if (auto collision = staticCatalogCollision(config_.topics, catalogTopics)) {
+    bootDroppedIds_ = droppedTopicIds(bootApplier_->state());
+    // INTERIM (until Task 17): a static topic never shares a broker with a catalog topic, nor takes an id
+    // the catalog dropped.
+    if (auto collision = staticCatalogCollision(config_.topics, catalogTopics, bootDroppedIds_)) {
         spdlog::critical("BrokerNode[{}]: {}", config_.nodeId, *collision);
         throw std::runtime_error("BrokerNode: " + *collision);
     }
-    bootDroppedIds_ = droppedTopicIds(bootApplier_->state());
-    bootTopics_     = config_.topics;
-    for (TopicSpec& t : catalogTopics) bootTopics_.push_back(std::move(t));
+    bootTopics_ = config_.topics;
+    for (const TopicSpec& t : catalogTopics) bootTopics_.push_back(t);
 
     const auto nowSeconds = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
-    if (bootApplier_->halted()) {
+    const bool halted = bootApplier_->halted();
+    // Fix round 1 (R2): the reconcile runs ONLY here, on the startup thread.  A broker whose local catalog
+    // cannot be trusted (empty while catalog-made, marker-carrying topic dirs exist) defers it to a LATER
+    // boot, after it proved as a follower that it applied the leader's history (the catch-up sentinel).
+    const BootReconcile decision = decideBootReconcile(
+        halted, bootApplier_->lastApplied().offset, topicsHoldCatalogMarkedDir(config_.dataDir),
+        dirHoldsEntries(fs::path{config_.dataDir} / "dropped"), readCatchUpSentinel(config_.dataDir));
+    switch (decision) {
+    case BootReconcile::Skip:
         spdlog::critical("BrokerNode[{}]: the __catalog boot replay HALTED — the broker boots with the prefix it "
                          "applied ({} topic(s)), halted, and accepts no catalog change.  The topic-dir reconcile is "
                          "SKIPPED this boot: NO topic dir is moved, renamed, deleted or quarantined (catalog damage: "
                          "no destructive cleanup); topics created after the halt are not served until the catalog is "
                          "repaired", config_.nodeId, bootTopics_.size());
-    } else if (bootApplier_->lastApplied().offset < 0 &&
-               (dirHoldsEntries(fs::path{config_.dataDir} / "topics") ||
-                dirHoldsEntries(fs::path{config_.dataDir} / "dropped"))) {
+        break;
+    case BootReconcile::RunNow:
+    case BootReconcile::RunNowAndClearSentinel: {
+        const std::vector<TopicSpec> catalogOnly(bootTopics_.begin() + static_cast<std::ptrdiff_t>(config_.topics.size()),
+                                                 bootTopics_.end());
+        (void)reconcileTopicDirs(config_.dataDir, catalogOnly, bootDroppedIds_, nowSeconds, config_.topics);
+        if (decision == BootReconcile::RunNowAndClearSentinel && !removeCatchUpSentinel(config_.dataDir))
+            spdlog::error("BrokerNode[{}]: cannot remove the catch-up sentinel in {} — the next boot reconciles "
+                          "again (idempotent)", config_.nodeId, config_.dataDir);
+        break;
+    }
+    case BootReconcile::Defer:
         bootReconcileDeferred_ = true;
-        spdlog::warn("BrokerNode[{}]: the local __catalog is empty but {} holds topic dirs (the catalog was wiped, or "
-                     "this is a new disk) — NO topic dir is touched at boot; the reconcile waits until this broker "
-                     "has caught up to the catalog leader's committed prefix", config_.nodeId, config_.dataDir);
-    } else {
-        (void)reconcileTopicDirs(config_.dataDir, bootTopics_, bootDroppedIds_, nowSeconds);
+        spdlog::warn("BrokerNode[{}]: a catalog catch-up began at an earlier boot and has not completed — no topic dir "
+                     "is touched", config_.nodeId);
+        break;
+    case BootReconcile::DeferAndWritePending:
+        if (!writeCatchUpSentinel(config_.dataDir, -1))
+            throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: cannot persist the catch-up "
+                                     "sentinel in " + config_.dataDir + " — refusing to start: a crash during catch-up "
+                                     "would reconcile against a partial catalog");
+        bootReconcileDeferred_ = true;
+        spdlog::warn("BrokerNode[{}]: the local __catalog is empty but {} holds catalog-made topic dirs (the catalog was "
+                     "wiped, or this is a new disk) — NO topic dir is touched at boot; the reconcile runs at the boot "
+                     "after this broker caught up to the catalog leader as a follower", config_.nodeId,
+                     config_.dataDir);
+        break;
     }
 }
 
@@ -3381,7 +3422,7 @@ void BrokerNode::buildAdminWorker() {
         bootApplier_.reset();
         if (holdCatalogApplyAtBootForTest_) adminWorkerAgent_->worker().holdApplyForTest(true);
         if (bootReconcileDeferred_) {
-            adminWorkerAgent_->worker().deferTopicDirReconcile(config_.dataDir, config_.topics);
+            adminWorkerAgent_->worker().deferTopicDirReconcile(config_.dataDir);
         }
 
         // Catalog history Task 6: wire the __catalog replica's controller path

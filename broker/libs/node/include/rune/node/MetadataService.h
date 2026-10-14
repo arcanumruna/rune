@@ -532,6 +532,9 @@ public:
     /// Single-writer: must be called on the duty-cycle thread.
     void emitStaticAssignmentIfNeeded() {
         if (!controllerReady_()) return;
+        // Task 16 fix round 1 (R3): a halted controller places nothing from its stale catalog (Task 11 ruling) —
+        // the boot now feeds every catalog topic through configure(), so this path must hold too.  Not latched.
+        if (catalogHalted(selfId_)) { ++catalogPlacementsSkippedHalted_; return; }
         if (configuredTopics_.empty() || liveNodes_.empty()) return;
 
         // Idempotency guard: if already assigned (flag latched), skip.

@@ -2066,7 +2066,7 @@ TEST(BrokerNodeRegression, RuntimeTransientTopicIsInMemoryAndRestartsEmptyRegres
 // (kA2cCatalogTopicApplied) — replicas included — and writes NO topic-id marker
 // (the catalog is the record of truth).  Condition-driven, bounded.
 // ---------------------------------------------------------------------------
-TEST(BrokerNodeRegression, CatalogDefineTopicBuildsTheTopicAtItsCatalogIdWithNoMarkerRegression) {
+TEST(BrokerNodeRegression, CatalogDefineTopicBuildsTheTopicAtItsCatalogIdWithItsMarkerRegression) {
     const fs::path dir = makeTempDataDir("marker_e2e_");
     NodeConfig cfg = makeSingleNodeConfig(dir);
     const uint16_t clientPort = rune::node::test::freeUdpPort();
@@ -2107,8 +2107,11 @@ TEST(BrokerNodeRegression, CatalogDefineTopicBuildsTheTopicAtItsCatalogIdWithNoM
     EXPECT_EQ(topicId, 0) << "the first catalog id";
     EXPECT_TRUE(rune::node::test::hasReplica(node, topicId, 0)) << "built from the applied event";
     EXPECT_TRUE(fs::exists(dir / "topics" / "marked" / "0"));
-    EXPECT_FALSE(fs::exists(dir / "topics" / "marked" / "topic-id"))
-        << "a catalog topic carries no topic-id marker";
+    {   // Task 16 fix round 1 (R1): the dir carries the topic-id marker, written before any partition dir
+        std::ifstream in(dir / "topics" / "marked" / "topic-id");
+        std::string line((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        EXPECT_EQ(line, std::to_string(topicId) + "\n") << "a catalog topic's dir is marked with its catalog id";
+    }
 
     node.stop();
     std::error_code ec; fs::remove_all(dir, ec);
