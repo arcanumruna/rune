@@ -34,12 +34,33 @@ namespace rune::cli {
 [[nodiscard]] std::optional<std::string> verifyReplayStep(const rune::catalog::RecordedEvent& source,
                                                           const rune::catalog::RecordedEvent& target);
 
+/// As above, plus: the target event must replay THIS run's cluster id.
+[[nodiscard]] std::optional<std::string> verifyReplayStep(const rune::catalog::RecordedEvent& source,
+                                                          const rune::catalog::RecordedEvent& target,
+                                                          std::string_view clusterId);
+
 /// The deterministic id of replaying `sourceOffset` of `sourceClusterId`:
 /// {fnv1a64(sourceClusterId), uint64(sourceOffset)} — a re-run issues the same ids.
 [[nodiscard]] rune::catalog::RequestId replayRequestId(std::string_view sourceClusterId, int64_t sourceOffset) noexcept;
 
 /// Exactly 32 hex digits (either case): hi = the first 16, lo = the last 16.  Anything else: nullopt.
 [[nodiscard]] std::optional<rune::catalog::RequestId> parseRequestId(std::string_view hex32) noexcept;
+
+/// Repeats refresh() + lookup() until lookup() yields a value, refresh() fails, or nowMs() reaches
+/// deadlineMs (checked after each lookup, so at least one refresh+lookup always runs).  pause() runs
+/// between attempts.  nullopt = not visible; `why` says why ("<refresh error>" or "not visible before
+/// the deadline").  Bounded: the loop ends at the deadline.
+template <class RefreshFn, class LookupFn, class NowFn, class PauseFn>
+[[nodiscard]] std::optional<rune::catalog::RequestRecord> awaitRequestVisible(RefreshFn&& refresh, LookupFn&& lookup,
+                                                                              NowFn&& nowMs, PauseFn&& pause,
+                                                                              int64_t deadlineMs, std::string& why) {
+    for (;;) {
+        if (std::optional<std::string> e = refresh()) { why = std::move(*e); return std::nullopt; }
+        if (std::optional<rune::catalog::RequestRecord> r = lookup()) return r;
+        if (nowMs() >= deadlineMs) { why = "not visible before the deadline"; return std::nullopt; }
+        pause();
+    }
+}
 
 /// `SHOW TOPIC / SCHEMA / VIEW … AS OF` bodies and `DIFF` lines (pure, multi-line, '\n'-terminated).
 [[nodiscard]] std::string formatTopicDefinition(const rune::catalog::TopicObject&);

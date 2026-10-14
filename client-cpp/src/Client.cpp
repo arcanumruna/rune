@@ -45,6 +45,13 @@
 namespace rune::client {
 
 namespace {
+
+ClientConfig validatedConfig(ClientConfig c) {
+    if (c.traceDdlRetries && c.runnerMode != RunnerMode::Invoker)
+        throw std::invalid_argument("ClientConfig::traceDdlRetries requires RunnerMode::Invoker "
+                                    "(the notes are duty-thread state, read by the Invoker owner)");
+    return c;
+}
 // F8c C8: the runner start latch (spec §3.4) — one empty record on a
 // stack-local OneToOneRingBuffer of the smallest useful capacity.
 constexpr std::size_t   kStartLatchCapacity = 64;
@@ -136,11 +143,12 @@ agent::AgentConfig toAgentConfig(const ClientConfig& c) {
 // ---------------------------------------------------------------------------
 
 Client::Client(ClientConfig cfg)
-    : cfg_(std::move(cfg))
+    : cfg_(validatedConfig(std::move(cfg)))
     , agent_(toAgentConfig(cfg_))
     , partitionRouter_(metadataCache_)
     , catalogReader_(std::make_unique<CatalogReader>(*this))   // eagerly, on the owning thread (I2)
 {
+    if (cfg_.traceDdlRetries) ddlRetryNotes_.reserve(kMaxDdlRetryNotes);   // push_back never reallocates on the duty thread
     // F8c review n1: releaseCq_ is noexcept and may defer a release; the list
     // never holds more than one entry per registry slot, so reserve it once
     // here and the push_back there can never allocate (or throw).
@@ -1623,17 +1631,18 @@ void Client::onDdlRedirect_(std::size_t i, std::string_view endpoint, int64_t no
         failDdl_(i, static_cast<uint16_t>(rune::protocol::client::ErrorCode::Redirect), why, ddlNoValue(p.op));
         return;
     }
-    if (cfg_.traceDdlRetries) noteDdlRetry_({DdlRetryNote::Kind::Redirect, redirects, 0, std::string(endpoint)});
     // The leader's own session (the seed never moves for a DDL: it carries the
     // data ops / subscriptions); the same frame, so the same requestId.
     d.endpoint = toChannel(std::string(endpoint));
     DdlOfferedOn on;
     switch (offerDdl_(d, nowNs, on)) {
     case Offer::Accepted:
+        if (cfg_.traceDdlRetries) noteDdlRetry_({DdlRetryNote::Kind::Redirect, redirects, 0, std::string(endpoint)});
         if (nl) setDdlRetry_(d, DdlNotLeaderSeen{redirects, nl->budgetEndNs, nl->backoffNs, on});
         else    setDdlRetry_(d, DdlSent{redirects, on});
         return;
     case Offer::Retry:   // that node's session is still connecting: the pump re-offers it
+        if (cfg_.traceDdlRetries) noteDdlRetry_({DdlRetryNote::Kind::Redirect, redirects, 0, std::string(endpoint)});
         if (nl) setDdlRetry_(d, DdlAwaitingResend{redirects, nl->budgetEndNs, nl->backoffNs, nowNs});
         else    setDdlRetry_(d, DdlHeldForNode{redirects});
         return;
@@ -1683,6 +1692,8 @@ void Client::noteDdlRetry_(DdlRetryNote note) {
 }
 
 std::size_t Client::takeDdlRetryNotes(std::vector<DdlRetryNote>& out) {
+    if (cfg_.runnerMode != RunnerMode::Invoker || std::this_thread::get_id() != ownerThread_)
+        throw std::logic_error("Client::takeDdlRetryNotes: Invoker mode, from the owner thread only");
     for (auto& n : ddlRetryNotes_) out.push_back(std::move(n));
     ddlRetryNotes_.clear();
     return std::exchange(ddlRetryNotesDropped_, 0);

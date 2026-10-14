@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdint>
 #include <charconv>
 #include <cstdio>
 #include <exception>
@@ -47,6 +48,7 @@
 
 #include <chrono>
 #include <memory>
+#include <thread>
 #endif
 
 namespace rune::cli {
@@ -167,6 +169,12 @@ std::string_view errorCodeName(uint16_t code) noexcept {
         "ViewExists", "ViewSourceNotFound", "ViewFieldUnresolved", "ViewKeyInvalid", "ViewNotCoPartitioned",
         "ViewSourceTransient", "ViewNotAlterable", "InvalidRequest", "InvalidTopicName", "ViewSourceIsView",
         "TransientLogFull", "PartitionDataReset"};
+#ifdef RUNE_CLI_LIVE_ENABLED
+    static_assert(std::size(kNames) == static_cast<std::size_t>(rune::protocol::client::ErrorCode::PartitionDataReset) + 1,
+                  "errorCodeName: one name per rune::protocol::client::ErrorCode");
+    static_assert(static_cast<uint16_t>(rune::protocol::client::ErrorCode::TopicExists) == 25,
+                  "errorCodeName: the table is indexed by the enum's values");
+#endif
     return code < std::size(kNames) ? kNames[code] : std::string_view("UnknownErrorCode");
 }
 
@@ -190,9 +198,15 @@ std::string formatHistoryRow(const cat::RecordedEvent& r) {
     return s;
 }
 
+namespace {
+std::string replayHead(const cat::RecordedEvent& source) {
+    return "replay aborted at source offset " + std::to_string(source.offset) + " (" +
+           std::string(cat::kindName(source.event.kind)) + " '" + source.event.objectName + "'): ";
+}
+} // namespace
+
 std::optional<std::string> verifyReplayStep(const cat::RecordedEvent& source, const cat::RecordedEvent& target) {
-    const std::string head = "replay aborted at source offset " + std::to_string(source.offset) + " (" +
-                             std::string(cat::kindName(source.event.kind)) + " '" + source.event.objectName + "'): ";
+    const std::string head = replayHead(source);
     if (!target.event.replayedFrom)
         return head + "target event at offset " + std::to_string(target.offset) + " carries no replayedFrom";
     if (target.event.replayedFrom->offset != source.offset)
@@ -203,6 +217,15 @@ std::optional<std::string> verifyReplayStep(const cat::RecordedEvent& source, co
     if (target.event.fingerprint != source.event.fingerprint)
         return head + "target fingerprint 0x" + hex16(target.event.fingerprint) + " != source 0x" +
                hex16(source.event.fingerprint);
+    return std::nullopt;
+}
+
+std::optional<std::string> verifyReplayStep(const cat::RecordedEvent& source, const cat::RecordedEvent& target,
+                                            std::string_view clusterId) {
+    if (auto m = verifyReplayStep(source, target)) return m;
+    if (target.event.replayedFrom->clusterId != clusterId)
+        return replayHead(source) + "target event at offset " + std::to_string(target.offset) + " replays cluster '" +
+               target.event.replayedFrom->clusterId + "', not '" + std::string(clusterId) + "'";
     return std::nullopt;
 }
 
@@ -467,11 +490,6 @@ private:
     std::filesystem::path path_;
 };
 
-int& dirSeq() {
-    static int s = 0;   // single-threaded CLI
-    return s;
-}
-
 /// One connected Client for one broker.  Invoker mode: this thread is the duty thread, so the
 /// DDL retry notes (--verbose) are read race-free.
 class LiveBroker {
@@ -515,7 +533,8 @@ public:
             cfg.dataDir = a.value("--cli-data-dir");   // the caller's directory, used as is (and left in place)
         } else {   // a private scratch directory per client, removed on close
             dir_ = ScopedDir(std::filesystem::temp_directory_path() /
-                             ("rune-cli-" + std::to_string(::getpid()) + "-" + std::to_string(dirSeq()++)));
+                             ("rune-cli-" + std::to_string(::getpid()) + "-" + std::to_string(reinterpret_cast<std::uintptr_t>(this)) + "-" +
+                              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())));
             cfg.dataDir = dir_.path().string();
         }
         ddlTimeout_ = std::chrono::milliseconds(cfg.ddlTimeoutMs);
@@ -580,6 +599,24 @@ std::string catalogReadFailure(const rc::CatalogReadError& e) {
     return s;
 }
 
+int64_t steadyNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+/// Waits (bounded by kCatalogWait) until the client's catalog reader holds `rid`.  The seed broker
+/// serves the catalog up to ITS OWN high watermark, which can trail the leader that answered the DDL.
+std::optional<cat::RequestRecord> awaitOwnWrite(rc::Client& c, const cat::RequestId& rid, std::string& why) {
+    auto& reader = c.catalogReader();
+    const int64_t deadline = steadyNowMs() + std::chrono::duration_cast<std::chrono::milliseconds>(kCatalogWait).count();
+    return awaitRequestVisible(
+        [&]() -> std::optional<std::string> {
+            const int64_t left = std::max<int64_t>(1, deadline - steadyNowMs());
+            if (auto r = reader.refresh(std::chrono::milliseconds(left)); !r) return catalogReadFailure(r.error());
+            return std::nullopt;
+        },
+        [&] { return reader.state().request(rid); }, steadyNowMs,
+        [] { std::this_thread::sleep_for(std::chrono::milliseconds(20)); }, deadline, why);
+}
+
 rc::Persistence clientPersistence(cat::Persistence p) noexcept {
     return p == cat::Persistence::Transient ? rc::Persistence::Transient : rc::Persistence::Disk;
 }
@@ -593,6 +630,7 @@ rc::Persistence clientPersistence(cat::Persistence p) noexcept {
 namespace {
 
 constexpr uint64_t kMaxVersion = 65535;   // schema versions are u16: never truncated
+constexpr uint64_t kMaxObjectVersion = 4294967295ull;   // topic / view object versions are u32
 
 /// A statement ready to run: every refusal that needs no broker happened while preparing it.
 struct PDefine      { ql::DefineTopicPlan plan; };
@@ -625,10 +663,10 @@ std::string requestIdHex(const cat::RequestId& id) { return hex16(id.hi) + hex16
 /// Parse-and-plan one statement.  nullopt + `why` when it is refused (versions beyond u16, a bad
 /// setting, an undecodable time).
 std::optional<Prepared> prepare(const ql::Statement& st, std::string& why) {
-    auto checkVersion = [&](int64_t v, const char* what) {
-        if (v < 0 || static_cast<uint64_t>(v) > kMaxVersion) {
-            why = std::string(what) + " " + std::to_string(v) + " is out of range: schema versions are 0.." +
-                  std::to_string(kMaxVersion);
+    auto checkVersion = [&](int64_t v, std::string_view kind, uint64_t max) {
+        if (v < 0 || static_cast<uint64_t>(v) > max) {
+            why = "version " + std::to_string(v) + " is out of range: versions of a " + std::string(kind) + " are 0.." +
+                  std::to_string(max);
             return false;
         }
         return true;
@@ -679,7 +717,9 @@ std::optional<Prepared> prepare(const ql::Statement& st, std::string& why) {
                     p.text = "show " + std::string(cat::objectTypeName(p.kind)) + " " + s.name + " as of ";
                     switch (s.at.by) {
                         case ql::AsOfPoint::By::Version:
-                            if (!checkVersion(s.at.number, "version")) return std::nullopt;
+                            if (!checkVersion(s.at.number, cat::objectTypeName(p.kind),
+                                              p.kind == cat::ObjectType::Schema ? kMaxVersion : kMaxObjectVersion))
+                                return std::nullopt;
                             p.at.by = cat::AsOf::By::Version;
                             p.at.value = s.at.number;
                             p.text += "version " + std::to_string(s.at.number);
@@ -706,7 +746,7 @@ std::optional<Prepared> prepare(const ql::Statement& st, std::string& why) {
                     static_assert(std::is_same_v<T, ql::DiffDef>);
                     PDiff p;
                     if (s.scope == ql::DiffDef::Scope::Schema) {
-                        if (!checkVersion(s.from, "version") || !checkVersion(s.to, "version")) return std::nullopt;
+                        if (!checkVersion(s.from, "schema", kMaxVersion) || !checkVersion(s.to, "schema", kMaxVersion)) return std::nullopt;
                         p.a = {cat::AsOf::By::Version, s.from, cat::ObjectType::Schema, s.name};
                         p.b = {cat::AsOf::By::Version, s.to, cat::ObjectType::Schema, s.name};
                         p.onlyTopic = s.name;
@@ -836,6 +876,15 @@ struct QlRun {
     std::ostream& err;
     bool script = false;   // -f: errors read "statement N: …"
     std::size_t index = 1;
+    std::optional<cat::RequestId> lastDdl;   // the last DDL this run issued: reads after it must show it
+
+    /// A read that follows a DDL waits until the reader (the seed broker's own HW) shows that DDL.
+    bool awaitLastDdl() {
+        if (!lastDdl) return true;
+        std::string why;
+        if (awaitOwnWrite(broker.client(), *lastDdl, why)) return true;
+        return fail("the catalog read did not show this script's last DDL (request id " + requestIdHex(*lastDdl) + "): " + why);
+    }
 
     bool fail(const std::string& msg) {
         broker.flushVerbose(err);
@@ -871,6 +920,7 @@ struct QlRun {
             ddl, broker.ddlTimeout());
         broker.flushVerbose(err);
         if (r.errorCode != 0) return fail(brokerFailure(r.errorCode, r.detail));
+        lastDdl = r.requestId;
         out << "created topic '" << d.name << "' topicId=" << r.topicId << " version=" << r.version << "\n";
         return true;
     }
@@ -880,6 +930,7 @@ struct QlRun {
             d.name, d.expectedVersion, std::span<const uint8_t>(d.opsBlob.data(), d.opsBlob.size()), ddl, broker.ddlTimeout());
         broker.flushVerbose(err);
         if (r.errorCode != 0) return fail(brokerFailure(r.errorCode, r.detail));
+        lastDdl = r.requestId;
         out << "altered topic '" << d.name << "' version=" << r.newVersion << "\n";
         return true;
     }
@@ -889,6 +940,7 @@ struct QlRun {
         const auto r = broker.client().alterTopicConfigAndWait(s.plan.name, 0, changes, ddl, broker.ddlTimeout());
         broker.flushVerbose(err);
         if (r.errorCode != 0) return fail(brokerFailure(r.errorCode, r.detail));
+        lastDdl = r.requestId;
         out << "altered config of topic '" << s.plan.name << "' version=" << r.newVersion << "\n";
         return true;
     }
@@ -896,6 +948,7 @@ struct QlRun {
         const auto r = broker.client().dropTopicAndWait(s.name, ddl, broker.ddlTimeout());
         broker.flushVerbose(err);
         if (r.errorCode != 0) return fail(brokerFailure(r.errorCode, r.detail));
+        lastDdl = r.requestId;
         out << "dropped topic '" << s.name << "'\n";
         return true;
     }
@@ -903,11 +956,13 @@ struct QlRun {
         const auto r = broker.client().dropViewAndWait(s.name, ddl, broker.ddlTimeout());
         broker.flushVerbose(err);
         if (r.errorCode != 0) return fail(brokerFailure(r.errorCode, r.detail));
+        lastDdl = r.requestId;
         out << "dropped view '" << s.name << "'\n";
         return true;
     }
 
     bool run(const PHistory& s, const rc::DdlOptions&) {
+        if (!awaitLastDdl()) return false;
         const auto r = broker.client().catalogHistory(s.filter, kCatalogWait);
         if (!r) return fail(catalogReadFailure(r.error()));
         static const std::array<std::string, kHistoryColumns> kHeader = {"offset", "time(UTC)", "kind", "object(objectId)",
@@ -928,6 +983,7 @@ struct QlRun {
     }
 
     bool run(const PAsOf& s, const rc::DdlOptions&) {
+        if (!awaitLastDdl()) return false;
         const auto r = broker.client().catalogAsOf(s.at, kCatalogWait);
         if (!r) return fail(catalogReadFailure(r.error()));
         if (s.kind == cat::ObjectType::View) {
@@ -943,6 +999,7 @@ struct QlRun {
     }
 
     bool run(const PDiff& s, const rc::DdlOptions&) {
+        if (!awaitLastDdl()) return false;
         const auto r = broker.client().catalogDiff(s.a, s.b, kCatalogWait);
         if (!r) return fail(catalogReadFailure(r.error()));
         std::size_t shown = 0;
@@ -1349,6 +1406,7 @@ int cmdReplay(const std::vector<std::string>& args, std::ostream& out, std::ostr
     }
     const std::string from = a.value("--from"), into = a.value("--into");
     const std::string clusterId = a.has("--cluster-id") ? a.value("--cluster-id") : from;
+    if (clusterId.empty()) return usageError("catalog replay", err, "--cluster-id must not be empty");
 
     // 1. Read and VERIFY the source before anything is issued.
     std::vector<cat::RecordedEvent> source;
@@ -1356,7 +1414,8 @@ int cmdReplay(const std::vector<std::string>& args, std::ostream& out, std::ostr
         err << "rune: the source could not be read; nothing was issued\n";
         return 1;
     }
-    if (auto bad = verifyEvents(source, upTo)) {
+    cat::CatalogState sourceFinal;
+    if (auto bad = verifyEvents(source, upTo, &sourceFinal)) {
         err << "rune: source " << from << " does not verify; nothing was issued: " << *bad << "\n";
         return 1;
     }
@@ -1397,13 +1456,11 @@ int cmdReplay(const std::vector<std::string>& args, std::ostream& out, std::ostr
                     return 1;
                 }
                 ++reissued;
-                if (auto r = reader.refresh(kCatalogWait); !r) {
-                    err << "rune: " << head << "reading the target catalog: " << catalogReadFailure(r.error()) << "\n";
-                    return 1;
-                }
-                done = reader.state().request(rid);
+                std::string why;
+                done = awaitOwnWrite(client, rid, why);
                 if (!done) {
-                    err << "rune: " << head << "the target recorded no event for request id " << requestIdHex(rid) << "\n";
+                    err << "rune: " << head << "the target's catalog (read from " << into << ") did not show request id "
+                        << requestIdHex(rid) << " within " << kCatalogWait.count() << " s: " << why << "\n";
                     return 1;
                 }
             }
@@ -1416,7 +1473,7 @@ int cmdReplay(const std::vector<std::string>& args, std::ostream& out, std::ostr
                 err << "rune: " << head << "the target's event at offset " << done->offset << " is not in its catalog\n";
                 return 1;
             }
-            if (auto bad = verifyReplayStep(src, *tgt)) {
+            if (auto bad = verifyReplayStep(src, *tgt, clusterId)) {
                 err << "rune: " << *bad << "\n";
                 return 1;
             }
@@ -1424,6 +1481,25 @@ int cmdReplay(const std::vector<std::string>& args, std::ostream& out, std::ostr
             err << "rune: " << head << ex.what() << "\n";
             return 1;
         }
+    }
+    try {
+        auto& reader = client.catalogReader();
+        if (auto r = reader.refresh(kCatalogWait); !r) {
+            err << "rune: replay into " << into << ": reading the target catalog: " << catalogReadFailure(r.error()) << "\n";
+            return 1;
+        }
+        std::vector<std::string> wrong;
+        for (const cat::DiffEntry& d : cat::diff(sourceFinal, reader.state()))
+            if (d.change != cat::DiffEntry::Change::Added) wrong.push_back(formatDiffEntry(d));   // Added = only on the target: allowed
+        if (!wrong.empty()) {
+            err << "rune: replay into " << into << ": every step verified, but the target now differs from the source at offset "
+                << source.back().offset << " (the target changed these objects after they were replayed):\n";
+            for (const std::string& w : wrong) err << "  " << w << "\n";
+            return 1;
+        }
+    } catch (const std::exception& ex) {
+        err << "rune: replay into " << into << ": " << ex.what() << "\n";
+        return 1;
     }
     out << "replayed " << source.size() << " events (source offsets 0.." << source.back().offset << ") into " << into << ": "
         << reissued << " issued, " << deduplicated << " already applied\n";

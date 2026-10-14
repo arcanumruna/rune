@@ -13,6 +13,8 @@
 #include <netinet/in.h>
 #include <optional>
 #include <span>
+#include <stdexcept>
+#include <thread>
 #include <string>
 #include <sys/socket.h>
 #include <tuple>
@@ -737,4 +739,52 @@ TEST(ClientDdlRedirectRegression, TraceDdlRetriesRecordsEveryFollowedRedirectAnd
         EXPECT_GT(notes[1].backoffMs, 0);
         EXPECT_TRUE(r.client.takeDdlRetryNotes(notes) == 0 && notes.size() == 2u) << "taking drains: a second take adds nothing";
     }
+}
+
+// ── fix round 1, R2: tracing is Invoker-only and enforced ───────────────────
+
+TEST(ClientDdlRedirectRegression, TraceDdlRetriesIsRefusedOutsideInvokerModeRegression) {
+    auto cfg = invokerCfg(4436, 4437);
+    cfg.runnerMode = rc::RunnerMode::Thread;
+    cfg.traceDdlRetries = true;
+    EXPECT_THROW({ rc::Client c(cfg); }, std::invalid_argument);
+}
+
+TEST(ClientDdlRedirectRegression, TakeDdlRetryNotesOffTheOwnerThreadThrowsRegression) {
+    auto cfg = invokerCfg(4438, 4439);
+    cfg.traceDdlRetries = true;
+    Rig r(cfg);
+    bool threw = false;
+    std::thread t([&] {
+        std::vector<rc::Client::DdlRetryNote> v;
+        try { (void)r.client.takeDdlRetryNotes(v); } catch (const std::logic_error&) { threw = true; }
+    });
+    t.join();
+    EXPECT_TRUE(threw);
+    std::vector<rc::Client::DdlRetryNote> v;
+    EXPECT_EQ(r.client.takeDdlRetryNotes(v), 0u) << "the owner thread may take";
+}
+
+// ── fix round 1, R6: a Redirect whose offer is Fatal was never followed ─────
+
+TEST(ClientDdlRedirectRegression, TraceRecordsNoRedirectWhoseOfferIsFatalRegression) {
+    using Offer = rune::client::transport::AeronTransport::OfferResult;
+    auto cfg = invokerCfg(4446, 4447);
+    cfg.traceDdlRetries = true;
+    Rig r(cfg);
+    r.connect();
+    r.gw.templateHandlers[pc::DropTopic::TEMPLATE_ID] = [&](int ep, const uint8_t* f, std::size_t len) {
+        auto m = pc::DropTopic::decode(f, len);
+        ASSERT_TRUE(m.has_value());
+        r.client.testForceIngressOffers(Offer::Fatal, 1);
+        r.answerError(ep, pc::ErrorCode::Redirect, "aeron:ipc", m->sessionId, m->correlationId);
+    };
+    test_support::TestCq cq(r.client);
+    auto f = cq.issue([&](rc::Completions& q, rc::Token t) { return r.client.dropTopic("t", {}, q, t); });
+    ASSERT_TRUE(f.accepted());
+    ASSERT_TRUE(r.drive([&] { return f.ready(); }));
+    EXPECT_FALSE(f.ok());
+    std::vector<rc::Client::DdlRetryNote> notes;
+    (void)r.client.takeDdlRetryNotes(notes);
+    for (const auto& n : notes) EXPECT_NE(n.kind, rc::Client::DdlRetryNote::Kind::Redirect) << "an unfollowed redirect is not reported";
 }

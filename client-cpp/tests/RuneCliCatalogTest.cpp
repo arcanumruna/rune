@@ -295,10 +295,15 @@ TEST(RuneCliCatalogRegression, VersionsAbove65535AreRefusedNotTruncated) {
     EXPECT_EQ(runCli({"ql", "-e", "diff schema t version 1 to 65536;", "--dry-run"}, &out, &err), 1);
     EXPECT_NE(err.find("65536"), std::string::npos) << err;
     EXPECT_EQ(runCli({"ql", "-e", "diff schema t version 70000 to 1;", "--dry-run"}, &out, &err), 1);
+    // topic / view object versions are u32 (every AlterTopicConfig bumps them): only the u32 limit applies
+    EXPECT_EQ(runCli({"ql", "-e", "show topic t as of version 70000;", "--dry-run"}, &out, &err), 0) << err;
+    EXPECT_EQ(runCli({"ql", "-e", "show topic t as of version 4294967296;", "--dry-run"}, &out, &err), 1);
+    EXPECT_NE(err.find("4294967296"), std::string::npos) << err;
+    EXPECT_EQ(runCli({"ql", "-e", "show view v as of version 70000;", "--dry-run"}, &out, &err), 0) << err;
     // offsets are not versions: a catalog diff takes any offset
     EXPECT_EQ(runCli({"ql", "-e", "diff catalog offset 1 to 100000;", "--dry-run"}, &out, &err), 0) << err;
     // -f: named by index, nothing after
-    const auto f = writeTemp("ver.rql", "show topic t as of version 1;\nshow topic t as of version 65536;\n");
+    const auto f = writeTemp("ver.rql", "show topic t as of version 1;\nshow schema t as of version 65536;\n");
     EXPECT_EQ(runCli({"ql", "-f", f, "--dry-run"}, &out, &err), 1);
     EXPECT_NE(err.find("statement 2: "), std::string::npos) << err;
 }
@@ -398,6 +403,13 @@ TEST(RuneCliCatalogRegression, ReplayStepCheckRefusesEveryDeviation) {
     ASSERT_TRUE(m);
     EXPECT_NE(m->find("replay aborted at source offset 6"), std::string::npos) << *m;
 
+    auto other = ok;
+    other.event.replayedFrom->clusterId = "other";
+    EXPECT_FALSE(rune::cli::verifyReplayStep(src, ok, "src"));
+    m = rune::cli::verifyReplayStep(src, other, "src");
+    ASSERT_TRUE(m);
+    EXPECT_NE(m->find("replays cluster 'other'"), std::string::npos) << *m;
+
     auto wrongKind = ok;
     wrongKind.event.kind = cat::EventKind::DropTopic;
     m = rune::cli::verifyReplayStep(src, wrongKind);
@@ -451,6 +463,8 @@ TEST(RuneCliCatalogRegression, ReplayUsageErrors) {
     EXPECT_EQ(runCli({"catalog", "replay", "--into", kUnreachable}, &out, &err), 2) << "--from missing";
     EXPECT_EQ(runCli({"catalog", "replay", "--from", "a.rcat", "--into", kUnreachable, "--up-to", "-3"}, &out, &err), 2);
     EXPECT_EQ(runCli({"catalog", "replay", "--from", "a.rcat", "--into", kUnreachable, "--bogus", "1"}, &out, &err), 2);
+    EXPECT_EQ(runCli({"catalog", "replay", "--from", "a.rcat", "--into", kUnreachable, "--cluster-id", ""}, &out, &err), 2);
+    EXPECT_NE(err.find("--cluster-id"), std::string::npos) << err;
 }
 
 // ── edge case 11: diff ──────────────────────────────────────────────────────
@@ -579,8 +593,58 @@ TEST(RuneCliCatalogRegression, AuthoredViewPlanRoundTripsAndRemapsItsSources) {
     auto trailing = blob;
     trailing.push_back(0);
     EXPECT_FALSE(rv::deserializeAuthored(trailing));
+    const std::size_t ruleAt = blob.size() - 18;   // rule | persistence(1) chunkBytes(4) capacity(4) maxRows(8)
+    const std::size_t typeAt = blob.size() - 28;   // type | sourceIdx(2) srcField "pid"(4+3) rule(1) + 17
+    ASSERT_EQ(blob[ruleAt], static_cast<uint8_t>(rv::MergeRule::Sum)) << "layout anchor";
+    ASSERT_EQ(blob[typeAt], static_cast<uint8_t>(rune::codec::PrimType::Int64)) << "layout anchor";
+    auto badRule = blob; badRule[ruleAt] = 0xFF; EXPECT_FALSE(rv::deserializeAuthored(badRule));
+    auto badType = blob; badType[typeAt] = 0xFF; EXPECT_FALSE(rv::deserializeAuthored(badType));
     auto badVersion = blob;
     badVersion[0] = 9;
     EXPECT_FALSE(rv::deserializeAuthored(badVersion));
     EXPECT_FALSE(rv::deserializeAuthored(std::span<const uint8_t>{}));
+}
+
+// ── fix round 1, R1: the bounded read-your-writes wait ──────────────────────
+
+TEST(RuneCliCatalogRegression, AwaitRequestVisibleRetriesUntilVisibleAndIsBoundedRegression) {
+    using rune::cli::awaitRequestVisible;
+    std::string why;
+    {   // (a) visible on the third look: three refreshes, two pauses
+        int refreshes = 0, pauses = 0, lookups = 0;
+        int64_t t = 0;
+        const auto r = awaitRequestVisible(
+            [&]() -> std::optional<std::string> { ++refreshes; return std::nullopt; },
+            [&]() -> std::optional<cat::RequestRecord> {
+                if (++lookups <= 2) return std::nullopt;
+                cat::RequestRecord rec;
+                rec.offset = 5;
+                return rec;
+            },
+            [&] { return t += 1; }, [&] { ++pauses; }, 1000, why);
+        ASSERT_TRUE(r.has_value());
+        EXPECT_EQ(r->offset, 5);
+        EXPECT_EQ(refreshes, 3);
+        EXPECT_EQ(pauses, 2);
+    }
+    {   // (b) never visible: ends at the deadline, after at least one attempt
+        int refreshes = 0;
+        int64_t t = 0;
+        const auto r = awaitRequestVisible(
+            [&]() -> std::optional<std::string> { ++refreshes; EXPECT_LT(refreshes, 100) << "the deadline must end the loop";
+                                                   return refreshes >= 100 ? std::optional<std::string>("runaway") : std::nullopt; },
+            []() -> std::optional<cat::RequestRecord> { return std::nullopt; }, [&] { return t += 10; }, [] {}, 25, why);
+        EXPECT_FALSE(r.has_value());
+        EXPECT_EQ(why, "not visible before the deadline");
+        EXPECT_EQ(refreshes, 3);
+    }
+    {   // (c) a failing refresh ends it at once, with its own message, before any lookup
+        int lookups = 0;
+        const auto r = awaitRequestVisible(
+            []() -> std::optional<std::string> { return std::string("boom"); },
+            [&]() -> std::optional<cat::RequestRecord> { ++lookups; return std::nullopt; }, [] { return int64_t{0}; }, [] {}, 1000, why);
+        EXPECT_FALSE(r.has_value());
+        EXPECT_EQ(why, "boom");
+        EXPECT_EQ(lookups, 0);
+    }
 }
