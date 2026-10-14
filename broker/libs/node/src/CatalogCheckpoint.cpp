@@ -218,9 +218,10 @@ std::optional<std::string> catalogCheckpointBeyondLog(const std::optional<Catalo
            std::to_string(c->appliedOffset) + " but the local log ends at " + std::to_string(logEndOffset) +
            " — events this broker already applied are missing from its log (lost writes / a replaced data "
            "dir); replaying the shorter history would silently fork the catalog.  Refusing to start: restore "
-           "the data dir, or wipe dataDir/__catalog entirely (including '" +
-           std::string{kCatalogCheckpointFile} + "') so this broker refetches the catalog from its peers "
-           "(docs/CATALOG.md#halted)";
+           "the data dir (including __catalog) from backup.  Only in a multi-broker cluster whose other "
+           "brokers hold the catalog may dataDir/__catalog (including '" +
+           std::string{kCatalogCheckpointFile} + "') be removed so this broker refetches it from its peers; "
+           "never on a single broker (docs/SELF-HOSTING.md)";
 }
 
 } // namespace rune::node
