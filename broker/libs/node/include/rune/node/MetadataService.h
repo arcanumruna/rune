@@ -411,7 +411,20 @@ public:
     // mark set or cleared, a configure) and on every controller catch-up.
     // -----------------------------------------------------------------------
     struct UnplaceableTopic { std::string reason; };
-    [[nodiscard]] std::size_t unplaceableTopicCount() const noexcept { return unplaceable_.size(); }
+    /// Task 11 fix round 2: a replica its broker reported it cannot build (per process).
+    struct UnbuildableReplica { int32_t topicId; int32_t partition; int32_t node; int64_t incarnation; };
+    /// Topics held Unplaceable: never placed (unplaceable_), or placed short of
+    /// their replica count (shortPlaced_, fix round 2) — distinct topic ids.
+    [[nodiscard]] std::size_t unplaceableTopicCount() const noexcept {
+        std::size_t n = unplaceable_.size();
+        int32_t last = INT32_MIN;
+        for (const auto& [k, r] : shortPlaced_) {
+            const auto t = static_cast<int32_t>(k >> 32);
+            if (t != last && !unplaceable_.contains(t)) ++n;
+            last = t;
+        }
+        return n;
+    }
     /// The reason `topicId` is unplaceable ("" = it is not).
     [[nodiscard]] std::string unplaceableReason(int32_t topicId) const {
         const auto it = unplaceable_.find(topicId);
@@ -564,6 +577,9 @@ public:
         if ((m.topicId < 0 && !coordinatorKey_(m.topicId, m.partition)) || m.isrCount < 0) return false;
         const rune::metadata::PartitionAssignment* pa = msm_.assignment(m.topicId, m.partition);
         if (pa == nullptr) return false;
+        if (m.isrCount == rr::AlterIsrMsg::kLeaderEpochBump &&
+            (m.isr[1] & (rr::AlterIsrMsg::kBumpReplicaUnavailable | rr::AlterIsrMsg::kBumpReplicaAvailable)) != 0)
+            return onReplicaAvailability_(m, *pa, reply);   // Task 11 fix round 2
         if (m.isrCount == rr::AlterIsrMsg::kLeaderEpochBump &&
             (m.isr[1] & rr::AlterIsrMsg::kBumpFollowerReport) != 0)
             return onLeaderlessReport_(m, *pa, reply);
@@ -772,6 +788,11 @@ public:
             return false;
         }
         st.capable = true;
+        // Task 11 fix round 2: a new process may build what an older one could not.
+        if (std::erase_if(unbuildable_, [&](const UnbuildableReplica& u) {
+                return u.node == m.leaderId && u.incarnation != 0 && u.incarnation != st.nonce;
+            }) != 0)
+            ++routingInputsEpoch_;
         if (wasHalted && !st.catalogHalted) {   // Task 11 fix round 1: a new, healthy process
             ++routingInputsEpoch_;
             spdlog::info("MetadataService[{}]: node {} restarted with a healthy catalog — a placement target again",
@@ -998,6 +1019,11 @@ public:
             std::erase_if(offlineReplicas_, [&](const OfflineReplica& o) {
                 return o.node == node && o.incarnation != inc;
             });
+        // Task 11 fix round 2: a new process may build what the old one could not.
+        if (std::erase_if(unbuildable_, [&](const UnbuildableReplica& u) {
+                return u.node == node && u.incarnation != inc && u.incarnation != 0;
+            }) != 0)
+            ++routingInputsEpoch_;
     }
     void markOffline_(int32_t topicId, int32_t partition, int32_t node, int64_t inc) {
         for (auto& o : offlineReplicas_)
@@ -1360,6 +1386,11 @@ public:
     // Task 11 fix round 1 (I1/I2): the explicit Unplaceable state (control thread).
     std::map<int32_t, UnplaceableTopic> unplaceable_;
     std::vector<int32_t>                haltedScratch_;   // M2: reused (capacity persists)
+    // Task 11 fix round 2: replicas a broker cannot build + partitions held short.
+    std::vector<UnbuildableReplica>     unbuildable_;
+    std::map<int64_t, std::string>      shortPlaced_;
+    uint64_t                            shortTriedEpoch_   = ~0ull;
+    uint64_t                            unbuildableReports_ = 0;
     uint64_t                            unplaceableEvents_     = 0;
     uint64_t                            unplaceableTriedEpoch_ = ~0ull;
     [[nodiscard]] bool isEligible_(int32_t n) const noexcept {
@@ -1477,6 +1508,8 @@ public:
         }
         // N1 / N2: never (re-)elected by the balancer while marked.
         for (const auto& o : offlineReplicas_) out.push_back({o.topicId, o.partition, o.node});
+        // Task 11 fix round 2: a broker that cannot build the partition never leads it.
+        for (const auto& u : unbuildable_) out.push_back({u.topicId, u.partition, u.node});
         for (const auto& [k, e] : emptyMemoryLeader_)
             out.push_back({static_cast<int32_t>(k >> 32), static_cast<int32_t>(static_cast<uint32_t>(k)), e.requester});
     }
@@ -1951,6 +1984,7 @@ public:
         if (amLeader) maybeRaiseFeatureLevel_();   // D15 (no-op once at the supported level)
         if (amLeader) maybeConfirmSingleNodeLineages_();   // C1 (single node only)
         if (amLeader) retryUnplaceable_();                  // Task 11 fix round 1 (I1/I2)
+        if (amLeader) reconcileUnbuildable_();              // Task 11 fix round 2
         if (hw <= 0 || hw <= lastApplied_) {
             // Nothing new to apply.  Still call commit() so pending records
             // already decoded in a prior partial cycle get committed.
@@ -2365,6 +2399,182 @@ private:
                          "brokers — catalog-halted brokers are never placement targets; it keeps {} replicas",
                          selfId_, spec.topicId, spec.rf, liveNodes_.size(), spec.rf);
     }
+    // -----------------------------------------------------------------------
+    // Catalog history Task 11 fix round 2 — replicas a broker CANNOT build.
+    //
+    // A broker in a partition's replicas that cannot build it (its catalog halted
+    // before the create, the create not applied within the grace, a build
+    // failure — any reason) reports kBumpReplicaUnavailable.  The controller
+    // records the mark (per node PROCESS: a new process clears it) and, on the
+    // next reconcile pass, commits the partition WITHOUT that broker: removed
+    // from the replicas and the ISR, the leadership moved to a live in-sync
+    // member if it led (never elected while marked — excludedLeaders), and a
+    // placeable broker added in its place up to the topic's replica count.
+    // When none is placeable the partition is held SHORT — explicit, counted in
+    // unplaceableTopicCount() and the gauge, logged — and retried on every
+    // placement-input change (a kBumpReplicaAvailable report or a new process
+    // clears the mark and makes the broker a candidate again).
+    // -----------------------------------------------------------------------
+public:
+    [[nodiscard]] bool unbuildable(int32_t topicId, int32_t partition, int32_t node) const noexcept {
+        for (const auto& u : unbuildable_)
+            if (u.topicId == topicId && u.partition == partition && u.node == node) return true;
+        return false;
+    }
+    [[nodiscard]] std::size_t unbuildableMarks() const noexcept { return unbuildable_.size(); }
+    /// The reason (topicId, partition) is held short of its replica count ("" = it is not).
+    [[nodiscard]] std::string shortPlacedReason(int32_t topicId, int32_t partition) const {
+        const auto it = shortPlaced_.find(partitionKey_(topicId, partition));
+        return it == shortPlaced_.end() ? std::string{} : it->second;
+    }
+private:
+
+    template <typename Reply>
+    bool onReplicaAvailability_(const rune::replication::AlterIsrMsg& m,
+                                const rune::metadata::PartitionAssignment& pa, Reply& reply) {
+        namespace rr = rune::replication;
+        const int64_t inc = incarnationOf_(m);
+        if ((m.isr[1] & rr::AlterIsrMsg::kBumpReplicaAvailable) != 0) {
+            const auto before = unbuildable_.size();
+            std::erase_if(unbuildable_, [&](const UnbuildableReplica& u) {
+                return u.topicId == m.topicId && u.partition == m.partition && u.node == m.leaderId;
+            });
+            if (unbuildable_.size() != before) {
+                ++routingInputsEpoch_;   // a candidate again: the short retry may re-add it
+                spdlog::info("MetadataService[{}]: node {} built ({}, {}) — a placement candidate again", selfId_,
+                             m.leaderId, m.topicId, m.partition);
+            }
+            reply(rr::kAlterIsrOk, pa.partitionEpoch);
+            return false;
+        }
+        if (!unbuildable(m.topicId, m.partition, m.leaderId)) {
+            unbuildable_.push_back({m.topicId, m.partition, m.leaderId, inc});
+            ++unbuildableReports_;
+            spdlog::warn("MetadataService[{}]: node {} cannot build ({}, {}) — removing it from the replicas and the "
+                         "ISR, never its leader", selfId_, m.leaderId, m.topicId, m.partition);
+        }
+        reply(rr::kAlterIsrOk, pa.partitionEpoch);
+        return false;   // decided by reconcileUnbuildable_ (the gated record queue)
+    }
+
+    [[nodiscard]] bool keyBusy_(int32_t topicId, int32_t partition) const noexcept {
+        if (inflight_.count(partitionKey_(topicId, partition)) != 0) return true;
+        for (const auto& q : pendingDynamicRecords_)
+            if (q.rec.topicId == topicId && q.rec.partition == partition) return true;
+        return false;
+    }
+    /// The replica count `topicId` should have (its configured rf, or `fallback`).
+    [[nodiscard]] std::size_t targetReplicas_(int32_t topicId, std::size_t fallback) const noexcept {
+        for (const auto& ts : configuredTopics_)
+            if (ts.topicId == topicId && ts.rf > 0) return static_cast<std::size_t>(ts.rf);
+        return fallback;
+    }
+    /// Placeable brokers that may join (topicId, partition): not already a replica,
+    /// not catalog-halted, not marked unbuildable for it, not stopping.
+    void replacementCandidates_(int32_t topicId, int32_t partition, const std::vector<int32_t>& replicas,
+                                std::vector<int32_t>& out) const {
+        out.clear();
+        for (int32_t n : liveNodes_) {
+            if (catalogHalted(n) || isShutting_(n) || unbuildable(topicId, partition, n)) continue;
+            if (std::find(replicas.begin(), replicas.end(), n) != replicas.end()) continue;
+            out.push_back(n);
+        }
+    }
+    /// Commit (topicId, partition) as `replicas` / `isr` / `leader` (cold).
+    void enqueuePartitionChange_(const rune::metadata::PartitionAssignment& pa, std::vector<int32_t> replicas,
+                                 std::vector<int32_t> isr, int32_t leader, int32_t topicId, int32_t partition) {
+        rune::metadata::BalancerRecord br;
+        br.isr      = std::move(isr);
+        br.replicas = std::move(replicas);
+        br.rec.topicId        = topicId;
+        br.rec.partition      = partition;
+        br.rec.leaderNode     = leader;
+        br.rec.leaderEpoch    = leader != pa.leaderNode ? pa.leaderEpoch + 1 : pa.leaderEpoch;
+        br.rec.partitionEpoch = pa.partitionEpoch + 1;
+        br.rec.isr      = rune::protocol::metadata::Int32ArrayView{br.isr.data(), static_cast<uint16_t>(br.isr.size())};
+        br.rec.replicas = rune::protocol::metadata::Int32ArrayView{br.replicas.data(), static_cast<uint16_t>(br.replicas.size())};
+        pendingDynamicRecords_.push_back(std::move(br));
+    }
+    /// Controller pass: every committed partition still naming an unbuildable
+    /// broker is re-committed without it; every short partition is topped up when
+    /// a candidate exists.  Allocation-free when there is nothing to do.
+    void reconcileUnbuildable_() {
+        if ((unbuildable_.empty() && shortPlaced_.empty()) || !controllerReady_() || catalogHalted(selfId_)) return;
+        bool queued = false;
+        std::vector<int32_t> candidates;
+        for (const auto& u : unbuildable_) {
+            const rune::metadata::PartitionAssignment* pa = msm_.assignment(u.topicId, u.partition);
+            if (pa == nullptr || keyBusy_(u.topicId, u.partition)) continue;
+            if (std::find(pa->replicas.begin(), pa->replicas.end(), u.node) == pa->replicas.end()) continue;
+            std::vector<int32_t> replicas, isr;
+            for (int32_t n : pa->replicas) if (!unbuildable(u.topicId, u.partition, n)) replicas.push_back(n);
+            for (int32_t n : pa->isr)      if (!unbuildable(u.topicId, u.partition, n)) isr.push_back(n);
+            int32_t leader = pa->leaderNode;
+            if (leader < 0 || unbuildable(u.topicId, u.partition, leader) ||
+                std::find(isr.begin(), isr.end(), leader) == isr.end()) {
+                leader = rune::metadata::NO_LEADER;
+                for (int32_t n : isr)
+                    if (!isShutting_(n) && !isOffline_(u.topicId, u.partition, n)) { leader = n; break; }
+                if (leader != rune::metadata::NO_LEADER) {   // leader first in the ISR
+                    auto it = std::find(isr.begin(), isr.end(), leader);
+                    std::rotate(isr.begin(), it, it + 1);
+                }
+            }
+            replacementCandidates_(u.topicId, u.partition, replicas, candidates);
+            const std::size_t target = targetReplicas_(u.topicId, pa->replicas.size());
+            for (int32_t c : candidates) if (replicas.size() < target) replicas.push_back(c);
+            noteShort_(u.topicId, u.partition, replicas.size(), target);
+            spdlog::warn("MetadataService[{}]: ({}, {}) re-placed without node {}: replicas {} of {}, leader {}", selfId_,
+                         u.topicId, u.partition, u.node, replicas.size(), target, leader);
+            enqueuePartitionChange_(*pa, std::move(replicas), std::move(isr), leader, u.topicId, u.partition);
+            queued = true;
+        }
+        if (!shortPlaced_.empty() && routingInputsEpoch_ != shortTriedEpoch_) {
+            shortTriedEpoch_ = routingInputsEpoch_;
+            std::vector<int64_t> keys;
+            for (const auto& [k, r] : shortPlaced_) keys.push_back(k);
+            for (int64_t k : keys) {
+                const auto t = static_cast<int32_t>(k >> 32);
+                const auto p = static_cast<int32_t>(static_cast<uint32_t>(k));
+                const rune::metadata::PartitionAssignment* pa = msm_.assignment(t, p);
+                if (pa == nullptr) { shortPlaced_.erase(k); continue; }
+                if (keyBusy_(t, p)) { shortTriedEpoch_ = ~0ull; continue; }   // retried next pass
+                const std::size_t target = targetReplicas_(t, pa->replicas.size());
+                replacementCandidates_(t, p, pa->replicas, candidates);
+                if (candidates.empty()) continue;
+                std::vector<int32_t> replicas = pa->replicas;
+                for (int32_t c : candidates) if (replicas.size() < target) replicas.push_back(c);
+                noteShort_(t, p, replicas.size(), target);
+                enqueuePartitionChange_(*pa, std::move(replicas), pa->isr, pa->leaderNode, t, p);
+                queued = true;
+            }
+        }
+        if (queued) drainDynamicQueue();
+    }
+    void noteShort_(int32_t topicId, int32_t partition, std::size_t have, std::size_t target) {
+        const int64_t k = partitionKey_(topicId, partition);
+        if (have >= target) {
+            if (shortPlaced_.erase(k) != 0)
+                spdlog::info("MetadataService[{}]: ({}, {}) is fully placed again ({} replicas)", selfId_, topicId,
+                             partition, have);
+            return;
+        }
+        std::string halted;
+        for (int32_t n : liveNodes_)
+            if (catalogHalted(n)) halted += (halted.empty() ? "" : ",") + std::to_string(n);
+        const std::string reason = "partition " + std::to_string(partition) + " has " + std::to_string(have) + " of " +
+                                   std::to_string(target) + " replicas: no other placeable broker" +
+                                   (halted.empty() ? std::string{} : " (catalog apply halted on broker(s) " + halted + ")");
+        auto [it, inserted] = shortPlaced_.try_emplace(k, reason);
+        if (inserted || it->second != reason) {
+            it->second = reason;
+            ++unplaceableEvents_;
+            spdlog::error("MetadataService[{}]: topic id={} is UNPLACEABLE at its replica count — {}; it serves from "
+                          "the {} placed replica(s); retried when the placeable brokers change "
+                          "(rune-catalog-unplaceable-topics)", selfId_, topicId, reason, have);
+        }
+    }
+
     /// The configured topics of `t`'s placement unit (its co-partition group, or itself).
     void unitOf_(const rune::metadata::TopicSpec& t, std::vector<rune::metadata::TopicSpec>& out) const {
         out.clear();

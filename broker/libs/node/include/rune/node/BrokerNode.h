@@ -101,6 +101,7 @@ extern "C" {
 #include <variant>
 #include <functional>
 #include <memory>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -1836,6 +1837,29 @@ private:
     /// Control thread (Task 11 fix round 1, I2): post the placement view to the
     /// admin thread (kMsgPlacementView) on change only; and the unplaceable-topics gauge.
     int publishPlacementView_();
+    /// Control thread (Task 11 fix round 2): a user partition the committed map
+    /// assigns HERE that this broker has not built is reported to the controller
+    /// (kBumpReplicaUnavailable) — at once when the catalog apply halted, else
+    /// after kUnbuiltReportGraceNs; built later → kBumpReplicaAvailable.
+    int reportUnbuildableReplicas_();
+    static constexpr int64_t kUnbuiltReportGraceNs = 10'000'000'000LL;
+    static constexpr int64_t kUnbuiltResendNs      = 200'000'000LL;
+    static constexpr int     kAvailableSends       = 5;   // loss recovery (a new process also clears)
+    struct UnbuiltReplica { int64_t firstSeenNs = 0; int64_t lastSentNs = 0; };
+    std::map<int64_t, UnbuiltReplica> unbuilt_;             // (topic<<32|partition) → since
+    std::map<int64_t, int>            reportedUnavailable_;  // → available sends left once built
+    uint64_t unbuiltScanVersion_ = ~0ull;
+    bool     unbuiltScanHalted_  = false;
+    int64_t  unbuiltLastPassNs_  = 0;
+    /// TEST-ONLY seam (control thread): hold this broker's catalog-halt broadcast
+    /// (forces the placement race of fix round 2: a create placed on a broker that
+    /// halts on it before any member knows).
+    bool holdHaltReportForTest_ = false;
+public:
+    void holdCatalogHaltReportForTest(bool on) {
+        onControlThreadForTest([this, on] { holdHaltReportForTest_ = on; return 0; });
+    }
+private:
     /// When resignIfHalted_ first saw this broker leading while halted (-1 = not yet; control thread).
     int64_t          haltedSinceNs_ = -1;
     PlacementViewMsg placementPosted_{};

@@ -146,6 +146,17 @@ std::optional<rune::metadata::PartitionAssignment> assignmentOn(BrokerNode& n, i
         return pa ? std::optional(*pa) : std::nullopt;
     });
 }
+/// `name` is applied on `n` (its catalog has it).
+bool awaitApplied(BrokerNode& n, const std::string& name, std::chrono::seconds within) {
+    for (const auto deadline = Clock::now() + within; Clock::now() < deadline;) {
+        if (n.onAdminThreadForTest([&n, &name] {
+                return n.adminWorkerAgentForTest()->worker().applier().state().topicByName(name) != nullptr;
+            }))
+            return true;
+        std::this_thread::sleep_for(20ms);
+    }
+    return false;
+}
 std::vector<uint8_t> oneRecordBatch(std::string_view value) {
     rune::protocol::RecordBatchBuilder b(0, 0);
     b.append(std::string_view{}, value, 0);
@@ -411,6 +422,9 @@ TEST(CatalogLeadershipBrokerRegression, AllBrokersHaltedKeepAControllerAndADataP
     ASSERT_TRUE(schema.has_value());
     const int32_t dataId = schema->topicId;
 
+    // Fix round 2 (re-review O2): arm the tamper only once EVERY broker applied
+    // 'data' — under load a broker could otherwise halt on 'data' itself.
+    for (int id = 1; id <= 3; ++id) ASSERT_TRUE(awaitApplied(c.node(id), "data", 15s)) << id;
     // Every broker's applier halts at the same next event.
     for (int id = 1; id <= 3; ++id) tamperNextEvent(c.node(id));
     const auto trigger = cl.awaitAnyDdlAnswer(
@@ -469,4 +483,95 @@ TEST(CatalogLeadershipBrokerRegression, AllBrokersHaltedKeepAControllerAndADataP
                                        oneRecordBatch("after-failover"));
     ASSERT_TRUE(ack.has_value()) << "the new partition leader serves produce";
     EXPECT_EQ(ack->errorCode, 0);
+}
+
+// Fix round 2 (re-review BLOCK): the create event that halts broker h ALSO
+// places the topic on h — h's halt broadcast is held so no member knows yet
+// (the race, forced).  h cannot build the topic, reports it, and the controller
+// removes h from every partition's replicas and ISR, never lets it lead, and —
+// with no other placeable broker — holds the topic short (explicit, counted).
+// The topic serves produce from the others.  RED (no report path): h stays a
+// replica (and the static leader of ~1/3 of the partitions) of a topic it does
+// not host, with no state naming it.
+TEST(CatalogLeadershipBrokerRegression, TopicPlacedOnABrokerThatHaltsOnItsCreateIsRePlacedAndServesRegression) {
+    ThreeNodes c = ThreeNodes::start("ld_halt_race");
+    ASSERT_TRUE(c.awaitCatalogLeader(30s));
+    const int32_t ctl = awaitControllerLeadsTheCatalog(c, 30s);
+    ASSERT_GT(ctl, 0);
+    const int32_t h = ctl == 3 ? 2 : 3;
+    ShardTestClient cl(c.dirs[0]->path / "client-aeron");
+    cl.keepSessionsAlive(true);
+    cl.setClientVersion(pc::kClientVersion);
+    std::vector<int64_t> sid(4, 0);
+    sid[static_cast<std::size_t>(ctl)] = connectSettled(cl, c, ctl, 20s);
+    ASSERT_GT(sid[static_cast<std::size_t>(ctl)], 0);
+    const std::string ch = clientChannelOf(c, ctl);
+    const auto ready = defineSettled(cl, ch, sid[static_cast<std::size_t>(ctl)], "ready", 30s);
+    ASSERT_TRUE(ready.has_value());
+    ASSERT_EQ(ready->code, kLdOk);
+    for (int id = 1; id <= 3; ++id) {
+        if (id == ctl) continue;
+        sid[static_cast<std::size_t>(id)] = connectSettled(cl, c, id, 20s);
+        ASSERT_GT(sid[static_cast<std::size_t>(id)], 0) << id;
+    }
+    for (int id = 1; id <= 3; ++id) ASSERT_TRUE(awaitApplied(c.node(id), "ready", 15s)) << id;
+
+    // The race: h halts on the NEXT event, and nobody hears of it.
+    c.node(h).holdCatalogHaltReportForTest(true);
+    tamperNextEvent(c.node(h));
+    const auto racy = cl.awaitAnyDdlAnswer(
+        cl.sendDefineTopic(ch, kClientStream, sid[static_cast<std::size_t>(ctl)], "racy", 3, charBlob()),
+        Clock::now() + 15s);
+    ASSERT_TRUE(racy.has_value()) << "answered explicitly";
+    ASSERT_TRUE(awaitHalted(c.node(h), 15s));
+    const auto schema = cl.awaitSchema(cl.sendGetTopicSchema(ch, kClientStream, sid[static_cast<std::size_t>(ctl)],
+                                                             "racy"),
+                                       Clock::now() + 10s);
+    ASSERT_TRUE(schema.has_value());
+    ASSERT_EQ(schema->errorCode, 0u);
+    const int32_t topicId = schema->topicId;
+    BrokerNode& controller = c.node(ctl);
+    EXPECT_FALSE(controller.onControlThreadForTest([&controller, h] {
+        return controller.metadataServiceForTest()->catalogHalted(h);
+    })) << "precondition: the halt mark is held — the placement could not know";
+
+    // Within a bound: h reported every partition, and is in none of them.
+    bool clean = false;
+    for (const auto deadline = Clock::now() + 30s; Clock::now() < deadline && !clean;) {
+        clean = true;
+        for (int32_t p = 0; p < 3; ++p) {
+            const auto pa = assignmentOn(controller, topicId, p);
+            clean = clean && pa && pa->leaderNode > 0 && pa->leaderNode != h &&
+                    std::find(pa->replicas.begin(), pa->replicas.end(), h) == pa->replicas.end() &&
+                    std::find(pa->isr.begin(), pa->isr.end(), h) == pa->isr.end();
+        }
+        if (!clean) std::this_thread::sleep_for(50ms);
+    }
+    ASSERT_TRUE(clean) << "h removed from every partition's replicas and ISR, never its leader";
+    const bool reported = controller.onControlThreadForTest([&controller, topicId, h] {
+        const MetadataService* ms = controller.metadataServiceForTest();
+        return ms->unbuildable(topicId, 0, h) || ms->unbuildable(topicId, 1, h) || ms->unbuildable(topicId, 2, h);
+    });
+    EXPECT_TRUE(reported) << "the race really placed the topic on h, and h reported it";
+    EXPECT_GE(controller.onControlThreadForTest([&controller] {
+        return controller.metadataServiceForTest()->unplaceableTopicCount();
+    }), 1u) << "no other placeable broker: held short, explicit and counted";
+    // Never leads, sampled.
+    for (const auto until = Clock::now() + 2s; Clock::now() < until;) {
+        for (int32_t p = 0; p < 3; ++p) {
+            const auto pa = assignmentOn(controller, topicId, p);
+            ASSERT_TRUE(pa.has_value());
+            EXPECT_NE(pa->leaderNode, h) << "partition " << p;
+        }
+        std::this_thread::sleep_for(100ms);
+    }
+    // It serves produce from the others.
+    for (int32_t p = 0; p < 3; ++p) {
+        const int32_t leader = assignmentOn(controller, topicId, p)->leaderNode;
+        const auto ack = cl.produceUntilOk(clientChannelOf(c, leader), kClientStream,
+                                           sid[static_cast<std::size_t>(leader)], topicId, p, /*acks=*/1,
+                                           oneRecordBatch("served"));
+        ASSERT_TRUE(ack.has_value()) << "partition " << p << " serves from broker " << leader;
+    }
+    c.node(h).holdCatalogHaltReportForTest(false);
 }

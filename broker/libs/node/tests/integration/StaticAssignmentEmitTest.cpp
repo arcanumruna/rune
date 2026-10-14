@@ -2992,3 +2992,88 @@ TEST(CatalogHaltedPlacementRegression, OneUnplaceableTopicNeverBlocksAnotherOnAS
     ASSERT_NE(svc2.assignment(7, 0), nullptr) << "placed once broker 3 is placeable again";
     EXPECT_EQ(svc2.unplaceableTopicCount(), 0u);
 }
+
+// ===========================================================================
+// Task 11 fix round 2 — a broker that cannot build a partition assigned to it
+// reports it (kBumpReplicaUnavailable); the controller removes it from the
+// replicas and the ISR, never elects it, and re-places or holds it short.
+// ===========================================================================
+namespace {
+rune::replication::AlterIsrMsg availability(int32_t topicId, int32_t partition, int32_t node, int64_t inc,
+                                            bool available) {
+    using rune::replication::AlterIsrMsg;
+    AlterIsrMsg m{};
+    m.topicId = topicId; m.partition = partition; m.leaderId = node;
+    m.isrCount = AlterIsrMsg::kLeaderEpochBump;
+    m.isr[1] = available ? AlterIsrMsg::kBumpReplicaAvailable : AlterIsrMsg::kBumpReplicaUnavailable;
+    m.isr[3] = static_cast<int32_t>(static_cast<uint32_t>(inc));
+    m.isr[4] = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(inc) >> 32));
+    return m;
+}
+bool contains32(const std::vector<int32_t>& v, int32_t x) { return std::find(v.begin(), v.end(), x) != v.end(); }
+} // namespace
+
+// The unbuildable broker LEADS the partition and no other broker is placeable:
+// it is removed from the replicas and the ISR, the leadership moves to an
+// in-sync member at a new epoch, it is never re-elected, and the partition is
+// held SHORT (explicit, counted, reasoned).  When it later builds the partition
+// it is re-added through the normal path (a replica again, joining the ISR as
+// its leader admits it).  RED (no report path): it stays leader of a partition
+// it does not host, with no state naming it.
+TEST(CatalogHaltedPlacementRegression, UnbuildableLeaderIsRemovedNeverElectedAndHeldShortRegression) {
+    CtlRig c;
+    const int32_t L = c.pa().leaderNode;
+    const int32_t le = c.pa().leaderEpoch;
+    rune::replication::AlterIsrResponseMsg resp{};
+    bool answer = false;
+    (void)c.svc->onAlterIsr(availability(0, 0, L, 77, /*available=*/false), &resp, &answer);
+    EXPECT_TRUE(answer) << "the report is acknowledged";
+    EXPECT_TRUE(c.svc->unbuildable(0, 0, L));
+    c.drive(100);
+    const auto& pa = c.pa();
+    EXPECT_FALSE(contains32(pa.replicas, L)) << "removed from the replicas";
+    EXPECT_FALSE(contains32(pa.isr, L)) << "removed from the ISR";
+    EXPECT_NE(pa.leaderNode, L) << "never its leader";
+    EXPECT_TRUE(contains32(pa.isr, pa.leaderNode));
+    EXPECT_EQ(pa.leaderEpoch, le + 1) << "a new leadership";
+    EXPECT_EQ(pa.replicas.size(), 2u);
+    EXPECT_EQ(c.svc->unplaceableTopicCount(), 1u) << "held short: explicit and counted";
+    EXPECT_NE(c.svc->shortPlacedReason(0, 0).find("2 of 3 replicas"), std::string::npos)
+        << c.svc->shortPlacedReason(0, 0);
+    // Rebalances never bring it back as leader.
+    for (int i = 0; i < 5; ++i) c.tick();
+    EXPECT_NE(c.pa().leaderNode, L);
+    EXPECT_FALSE(contains32(c.pa().replicas, L));
+    // It builds the partition now (e.g. an operator cleared its halt): re-added.
+    (void)c.svc->onAlterIsr(availability(0, 0, L, 77, /*available=*/true));
+    EXPECT_FALSE(c.svc->unbuildable(0, 0, L));
+    c.drive(100);
+    EXPECT_TRUE(contains32(c.pa().replicas, L)) << "a replica again (it joins the ISR through AlterIsr)";
+    EXPECT_EQ(c.svc->unplaceableTopicCount(), 0u);
+}
+
+// With a placeable broker outside the replicas, the partition is RE-PLACED on it
+// (back to its replica count) — not held short.
+TEST(CatalogHaltedPlacementRegression, UnbuildableReplicaIsReplacedOnAPlaceableBrokerRegression) {
+    CtlRig c;
+    c.svc->addRuntimeTopic(TopicSpec{5, 1, 2, "", "rf2"});
+    c.drive(100);
+    const auto* pa = c.svc->assignment(5, 0);
+    ASSERT_NE(pa, nullptr);
+    ASSERT_EQ(pa->replicas.size(), 2u);
+    const int32_t gone = pa->replicas.back();
+    int32_t spare = -1;
+    for (int32_t n : {1, 2, 3}) if (!contains32(pa->replicas, n)) spare = n;
+    ASSERT_GT(spare, 0);
+    (void)c.svc->onAlterIsr(availability(5, 0, gone, 55, false));
+    c.drive(100);
+    pa = c.svc->assignment(5, 0);
+    EXPECT_FALSE(contains32(pa->replicas, gone));
+    EXPECT_TRUE(contains32(pa->replicas, spare)) << "re-placed on the placeable broker " << spare;
+    EXPECT_EQ(pa->replicas.size(), 2u);
+    EXPECT_NE(pa->leaderNode, gone);
+    EXPECT_EQ(c.svc->unplaceableTopicCount(), 0u);
+    // A new process of the reporter clears its mark (normal path back).
+    (void)c.svc->onAlterIsr(nodeControl(gone, 56, false));
+    EXPECT_FALSE(c.svc->unbuildable(5, 0, gone));
+}

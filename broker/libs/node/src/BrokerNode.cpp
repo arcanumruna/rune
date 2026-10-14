@@ -3904,6 +3904,7 @@ int BrokerNode::serviceAdminControl_() {
     work += resignIfHalted_(leaderNow);
     work += publishCatalogRoute_(leaderNow);
     work += publishPlacementView_();
+    work += reportUnbuildableReplicas_();
 
     // (1b) admin → control ring (F3 round 6/7, ported into T11's direct-call
     //      control plane):
@@ -4120,6 +4121,75 @@ int BrokerNode::publishCatalogRoute_(bool consensusLeader) {
     return 1;
 }
 
+int BrokerNode::reportUnbuildableReplicas_() {
+    if (!metadataService_ || !replicaRegistry_ || !replTransport_ || !election_ || config_.isSingleNode()) return 0;
+    const uint64_t v      = metadataService_->routingVersion();
+    const bool     halted = catalogHaltedValue_ != 0;
+    // Steady state: nothing assigned-but-unbuilt, nothing to confirm, map unchanged.
+    if (v == unbuiltScanVersion_ && halted == unbuiltScanHalted_ && unbuilt_.empty() && reportedUnavailable_.empty())
+        [[likely]] return 0;
+    const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int32_t self = config_.nodeId;
+    if (v != unbuiltScanVersion_ || halted != unbuiltScanHalted_) {   // cold: a committed-map / halt change
+        unbuiltScanVersion_ = v;
+        unbuiltScanHalted_  = halted;
+        std::set<int64_t> assignedHere;
+        metadataService_->committedMap().forEach(
+            [&](int32_t t, int32_t p, const rune::metadata::PartitionAssignment& pa) {
+                if (t < 0 || std::find(pa.replicas.begin(), pa.replicas.end(), self) == pa.replicas.end()) return;
+                if (topicRegistry_ &&
+                    topicRegistry_->state(t) == rune::gateway::TopicRegistry::TopicState::Dropped)
+                    return;   // the removal path, not a build failure
+                const int64_t key = (static_cast<int64_t>(t) << 32) | static_cast<uint32_t>(p);
+                if (replicaRegistry_->lookup(t, p) != nullptr) return;   // built: fine
+                assignedHere.insert(key);
+                unbuilt_.try_emplace(key, UnbuiltReplica{nowNs, 0});
+            });
+        std::erase_if(unbuilt_, [&](const auto& e) { return !assignedHere.contains(e.first); });
+    }
+    if (nowNs - unbuiltLastPassNs_ < kUnbuiltResendNs) return 0;   // loss-recovery cadence
+    unbuiltLastPassNs_ = nowNs;
+    const int32_t ctl = static_cast<int32_t>(election_->leaderMemberId());
+    if (ctl < 0) return 0;
+    int work = 0;
+    auto send = [&](int64_t key, int32_t flag) {
+        rune::replication::AlterIsrMsg m{};
+        m.topicId   = static_cast<int32_t>(key >> 32);
+        m.partition = static_cast<int32_t>(static_cast<uint32_t>(key));
+        m.leaderId  = self;
+        if (const auto* pa = metadataService_->assignment(m.topicId, m.partition)) {
+            m.leaderEpoch    = pa->leaderEpoch;
+            m.partitionEpoch = pa->partitionEpoch;
+        }
+        m.isrCount = rune::replication::AlterIsrMsg::kLeaderEpochBump;
+        m.isr[1]   = flag;
+        m.isr[3]   = static_cast<int32_t>(static_cast<uint32_t>(lifecycleNonce_));
+        m.isr[4]   = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint64_t>(lifecycleNonce_) >> 32));
+        (void)replTransport_->sendNodeControl(ctl, m);   // a full outbound ring: re-sent on the cadence
+        ++work;
+    };
+    for (auto& [key, u] : unbuilt_) {
+        if (!halted && nowNs - u.firstSeenNs < kUnbuiltReportGraceNs) continue;   // may still apply the create
+        if (u.lastSentNs == 0)
+            spdlog::warn("BrokerNode[{}]: assigned ({}, {}) but cannot build it ({}) — reporting it to the controller",
+                         config_.nodeId, key >> 32, static_cast<uint32_t>(key),
+                         halted ? "catalog apply halted" : "not built within the grace");
+        u.lastSentNs = nowNs;
+        send(key, rune::replication::AlterIsrMsg::kBumpReplicaUnavailable);
+        reportedUnavailable_[key] = kAvailableSends;
+    }
+    // Built since it reported: tell the controller it may place it again.
+    for (auto it = reportedUnavailable_.begin(); it != reportedUnavailable_.end();) {
+        const auto t = static_cast<int32_t>(it->first >> 32);
+        const auto p = static_cast<int32_t>(static_cast<uint32_t>(it->first));
+        if (unbuilt_.contains(it->first) || replicaRegistry_->lookup(t, p) == nullptr) { ++it; continue; }
+        send(it->first, rune::replication::AlterIsrMsg::kBumpReplicaAvailable);
+        it = --it->second <= 0 ? reportedUnavailable_.erase(it) : std::next(it);
+    }
+    return work;
+}
+
 int BrokerNode::publishPlacementView_() {
     if (!metadataService_ || !adminWorkerAgent_) return 0;
     int work = 0;
@@ -4163,7 +4233,7 @@ int BrokerNode::resignIfHalted_(bool consensusLeader) {
     // Fix round 0 (ruling 2): every member — the controller first — learns this
     // process is halted (a latched mark on the node-control register): it is
     // never a placement target again.
-    if (runtimeAgent_) work += runtimeAgent_->controlledShutdown().reportCatalogHalted();
+    if (runtimeAgent_ && !holdHaltReportForTest_) work += runtimeAgent_->controlledShutdown().reportCatalogHalted();
     if (!consensusLeader || !election_ || !metadataService_ || config_.isSingleNode()) return work;
     // Fix round 0 (ruling 1): hand the controllership to a healthy peer ONLY while
     // one is live — never leave the cluster without a controller.  With every
