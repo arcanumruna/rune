@@ -217,7 +217,11 @@ endif()
 # ── rune_client_driver_wake — A7 park-until-work + epoll-first polling ──
 # ONE copy shared with rune-broker (review L4): the rune-protocol sibling C source, like rune_gso.  Aeron's internal
 # driver headers are C (same include probe as rune_gso).  Non-Linux: a stub (0 fds, stock polling).
-if(aeron_FOUND)
+# Catalog history Task 11 (F7): a parent project (the broker's
+# rune_client_broker_tests) that already compiles rune_driver_wake.c supplies
+# rune_client_driver_wake as an ALIAS of its copy — exactly one rune_driver_wake.c
+# per link, on every platform.
+if(aeron_FOUND AND NOT TARGET rune_client_driver_wake)
     add_library(rune_client_driver_wake STATIC ${RUNE_PROTOCOL_INCLUDE}/../src/net/rune_driver_wake.c)
     set_target_properties(rune_client_driver_wake PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
     target_include_directories(rune_client_driver_wake PUBLIC $<BUILD_INTERFACE:${RUNE_PROTOCOL_INCLUDE}>)
