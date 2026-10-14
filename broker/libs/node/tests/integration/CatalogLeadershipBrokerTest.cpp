@@ -113,8 +113,8 @@ int32_t awaitControllerLeadsTheCatalog(ThreeNodes& c, std::chrono::seconds withi
     return -1;
 }
 
-/// A session on broker `id`.  Until a user topic is committed, a broker that is
-/// not the consensus leader redirects connects (pre-MD1 bootstrap gate): retried.
+/// A session on broker `id` (every broker hosts sessions in every role — the
+/// follower-connect hang fix; retried only while its client endpoint warms up).
 int64_t connectSettled(ShardTestClient& cl, const ThreeNodes& c, int id, std::chrono::seconds within) {
     const auto deadline = Clock::now() + within;
     while (Clock::now() < deadline) {

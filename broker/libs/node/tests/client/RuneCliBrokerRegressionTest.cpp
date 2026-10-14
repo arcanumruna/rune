@@ -527,10 +527,10 @@ TEST(RuneCliBrokerRegression, ReplayAndQlIntoAFollowerSeeTheirOwnWritesRegressio
     ThreeNodes c = ThreeNodes::start("cli_follow");
     ASSERT_TRUE(c.awaitCatalogLeader(30s));
     const int32_t leader = c.settledLeader();
-    // FINDING: a real Client that Connects to a catalog FOLLOWER never completes its connect here (the gateway
-    // answers a non-leader's Connect with a Redirect that the Client does not converge on, 40 s and Thread mode
-    // alike), so the seed is the leader of the 3-node cluster: the replicated multi-node path, not a lagging seed.
-    const int32_t follower = leader;
+    // The seed is a catalog FOLLOWER (the recipe): it hosts the CLI's session itself, its DDL is redirected to
+    // the leader, and its reads lag the leader's commit — the read-your-writes wait covers that.  (A follower
+    // used to Redirect the Connect itself and the client never followed: follower-connect-hang.md.)
+    const int32_t follower = leader == 1 ? 2 : 1;
     const std::string ep = "127.0.0.1:" + std::to_string(c.ports.client[static_cast<std::size_t>(follower - 1)]);
 
     ASSERT_EQ(runCli({"catalog", "replay", "--from", path, "--into", ep, "--cluster-id", "f", "--cli-stream-in",

@@ -1893,9 +1893,19 @@ void ClientGateway::handleConnect(const uint8_t* buf, std::size_t len, int64_t n
     //   When routingImage_ is null (not yet set), fall back to the original
     //   Raft-leader gate (Path B / pre-MD1 behaviour).
     // -----------------------------------------------------------------------
+    //
+    // Follower-connect hang fix (2026-10-14): which node hosts a session is the
+    // gateway's explicit SessionAdmission, never inferred from whether a
+    // routing image happens to exist.  A BrokerNode (metadata-driven routing)
+    // admits sessions on EVERY broker (AnyNode): its data ops route per
+    // partition and its DDL per catalog leader, so the Raft-leader gate below
+    // only applies to a gateway left in ClusterLeaderOnly.  The old inference
+    // ("no image yet ⇒ bootstrap ⇒ Raft-leader gate") was wrong for a cluster
+    // with no user topic: it has no image FOREVER (NodeRuntimeAgent publishes
+    // none without one), so every follower Redirected every Connect.
     bool capturedIsLeader = true;
     std::string capturedLeaderEndpoint;
-    if (leaderView_ && !routingImage_) {
+    if (leaderView_ && sessionAdmission_ == SessionAdmission::ClusterLeaderOnly && !routingImage_) {
         // No per-partition routing image yet: use the Raft-leader gate (Path B /
         // pre-MD1 bootstrap).  Raft followers redirect sessions to the Raft leader.
         const LeaderView lv = leaderView_();
@@ -2401,7 +2411,7 @@ void ClientGateway::pollPendingConnects(int64_t nowNs)
             continue;
         }
 
-        // Send succeeded.  Redirect / handshake-failure entries create NO
+            // Send succeeded.  Redirect / handshake-failure entries create NO
         // session (the resolvedPub shared_ptr release on erase frees the
         // transient egress registration).
         if (isRedirect || pending.cryptoFailed || pending.refuseCode != 0) {

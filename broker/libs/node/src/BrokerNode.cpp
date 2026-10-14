@@ -2593,6 +2593,11 @@ void BrokerNode::buildGateway() {
 
             spdlog::info("BrokerNode[{}]: MetadataService wired (__cluster_metadata at {})",
                          nodeId, metaDir.string());
+            // Follower-connect hang fix: metadata-driven routing ⇒ every broker
+            // hosts client sessions, in every role (only DDL is redirected, to
+            // the catalog leader; data ops per partition).  Never inferred from
+            // the routing image, which an empty cluster never has.
+            gateway_->setSessionAdmission(rune::gateway::ClientGateway::SessionAdmission::AnyNode);
         } catch (const std::exception& ex) {
             spdlog::error("BrokerNode[{}]: MetadataService setup failed: {}; "
                           "cluster metadata will not be tracked", nodeId, ex.what());

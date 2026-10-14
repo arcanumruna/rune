@@ -493,6 +493,22 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // SessionAdmission — which brokers host client sessions (set once, before
+    // doWork; duty-cycle thread single-writer after that).
+    //
+    //   ClusterLeaderOnly (default — a bare gateway, BR-5): with no routing
+    //     image, a Raft follower answers Connect with ErrorResponse{Redirect,
+    //     the Raft leader's client endpoint} and creates no session.
+    //   AnyNode (BrokerNode: metadata-driven routing): every broker hosts the
+    //     session in every role (leader, follower, catching up, halted, below
+    //     minIsr) — data ops are routed per partition, DDL per catalog leader;
+    //     the Connect itself is never redirected.
+    // -----------------------------------------------------------------------
+    enum class SessionAdmission : uint8_t { ClusterLeaderOnly, AnyNode };
+    void setSessionAdmission(SessionAdmission a) noexcept { sessionAdmission_ = a; }
+    [[nodiscard]] SessionAdmission sessionAdmission() const noexcept { return sessionAdmission_; }
+
+    // -----------------------------------------------------------------------
     // E2 inc2a: setWorkerPool — wire in the WorkerPool for per-partition SPSC
     // routing.  When set, produce-append and pushSubscriptions log-reads are
     // enqueued to the owning worker's ingress ring and the return ring is
@@ -2143,6 +2159,7 @@ private:
     bool                                                 committedMetadataReady_ = false;
     int8_t                                               localLeader_ = -1;   // see setLocalLeadership()
     std::unordered_map<int32_t, std::string>             nodeEndpointMap_;
+    SessionAdmission                                     sessionAdmission_ = SessionAdmission::ClusterLeaderOnly;
 
     // Cached nowNs for the current doWork() invocation (passed into handlers).
     int64_t                              nowNs_ = 0;

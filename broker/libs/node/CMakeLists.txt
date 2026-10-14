@@ -1513,7 +1513,8 @@ if(BUILD_TESTING)
         # Task 15: rune_cli_lib — the real `rune` CLI against the real nodes.
         add_executable(rune_client_broker_tests tests/client/ClientDdlBrokerRegressionTest.cpp
                        tests/client/ClientCatalogReadBrokerRegressionTest.cpp
-                       tests/client/RuneCliBrokerRegressionTest.cpp)
+                       tests/client/RuneCliBrokerRegressionTest.cpp
+                       tests/client/ClientConnectRoleRegressionTest.cpp)
         target_include_directories(rune_client_broker_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
         target_link_libraries(rune_client_broker_tests PRIVATE rune_node rune_view rune_codec rune_catalog
                               rune_client_api rune_cli_lib aeron::aeron GTest::gtest_main)
