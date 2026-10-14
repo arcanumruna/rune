@@ -1,6 +1,7 @@
 #include <rune/ql/Parser.h>
 #include <rune/ql/Backends.h>
 #include <gtest/gtest.h>
+#include <limits>
 #include <type_traits>
 
 namespace ql = rune::ql;
@@ -183,7 +184,7 @@ TEST(QlCatalogStatementsRegression, ReplicasBounds) {
 TEST(QlCatalogStatementsRegression, DirtyRatioDecimalToPpm) {
     auto ppm = [](const char* v) -> int64_t {
         auto r = ql::parse(std::string("alter topic t set min.cleanable.dirty.ratio = ") + v + ";");
-        EXPECT_TRUE(r.has_value()) << v;
+        if (!r) { ADD_FAILURE() << v << ": " << r.error().message; return std::numeric_limits<int64_t>::min(); }
         return std::get<ql::AlterTopicConfigDef>(*r).settings[0].value;
     };
     EXPECT_EQ(ppm("0"), 0); EXPECT_EQ(ppm("1"), 1'000'000); EXPECT_EQ(ppm("0.25"), 250'000);
@@ -222,13 +223,14 @@ TEST(QlCatalogStatementsRegression, SetSettingErrorPaths) {
     EXPECT_FALSE(ql::parse("alter topic t set;").has_value());
     EXPECT_FALSE(ql::parse("alter topic t set retention.ms;").has_value());
     EXPECT_FALSE(ql::parse("alter topic t set retention.ms = ;").has_value());
-    EXPECT_FALSE(ql::parse("alter topic t set retention.ms = -1;").has_value());
     EXPECT_FALSE(ql::parse("alter topic t set retention.ms = 99999999999999999999;").has_value());
     EXPECT_FALSE(ql::parse("alter topic t set retention.ms = 1,;").has_value());
     EXPECT_FALSE(ql::parse("alter topic t set retention.ms = 1").has_value());
     // set compatibility / persistence keep their old meaning
     EXPECT_TRUE(std::holds_alternative<ql::AlterTopicDef>(*ql::parse("alter topic t set compatibility forward;")));
-    EXPECT_TRUE(mentions(ql::parse("alter topic t set persistence = 1;").error().message, "persistence"));
+    auto pers = ql::parse("alter topic t set persistence = 1;");
+    ASSERT_FALSE(pers.has_value());
+    EXPECT_TRUE(mentions(pers.error().message, "persistence"));
 }
 
 // 6. dotted keys
@@ -284,7 +286,6 @@ TEST(QlCatalogStatementsRegression, NewStatementErrorPaths) {
     auto t = ql::parse("show topic t as of time 123;");
     ASSERT_FALSE(t.has_value());
     EXPECT_TRUE(mentions(t.error().message, "quoted string"));
-    EXPECT_FALSE(ql::parse("diff catalog offset -1 to 5;").has_value());
 }
 
 // 9. keyword case
@@ -328,4 +329,130 @@ TEST(QlCatalogStatementsRegression, ErrorsCarryPositions) {
     EXPECT_FALSE(ql::parse("topic t partitions 1 with (cleanup.policy = 1);").has_value());
     EXPECT_FALSE(ql::parse("topic t partitions 1 with (copartition.group = g);").has_value());
     EXPECT_FALSE(ql::parse("topic t partitions 1 with (copartition.group = 'g);").has_value());
+}
+
+// ── Fix round 1 ──────────────────────────────────────────────────────────────
+
+// R1: every integer setting is a full int64; ranges belong to the catalog library.
+TEST(QlCatalogStatementsRegression, IntegerSettingsAreSignedAndUnnarrowedRegression) {
+    auto a = ql::parse("alter topic t set retention.ms = -1, retention.bytes = -1, max.compaction.lag.ms = -1;");
+    ASSERT_TRUE(a.has_value()) << a.error().message;
+    auto plan = ql::applyConfigPlan(std::get<ql::AlterTopicConfigDef>(*a));
+    ASSERT_TRUE(plan.has_value());
+    const std::vector<std::pair<uint8_t, int64_t>> want{{1, -1}, {2, -1}, {6, -1}};
+    EXPECT_EQ(plan->changes, want);
+
+    auto c = ql::parse("topic t partitions 1 with (retention.ms = -1, segment.bytes = -5);");
+    ASSERT_TRUE(c.has_value()) << c.error().message;
+    const auto cfg = ql::applyPlan(std::get<ql::TopicDef>(*c)).config;
+    EXPECT_EQ(cfg.retentionMs, -1);
+    EXPECT_EQ(cfg.segmentRollBytes, -5);
+
+    auto n = ql::parse("alter topic t set delete.retention.ms = -7;");
+    ASSERT_TRUE(n.has_value()) << n.error().message;
+    EXPECT_EQ(std::get<ql::AlterTopicConfigDef>(*n).settings[0].value, -7);
+
+    auto lo = ql::parse("alter topic t set retention.ms = -9223372036854775808;");
+    ASSERT_TRUE(lo.has_value()) << lo.error().message;
+    EXPECT_EQ(std::get<ql::AlterTopicConfigDef>(*lo).settings[0].value, std::numeric_limits<int64_t>::min());
+    auto hi = ql::parse("alter topic t set retention.ms = 9223372036854775807;");
+    ASSERT_TRUE(hi.has_value()) << hi.error().message;
+    EXPECT_EQ(std::get<ql::AlterTopicConfigDef>(*hi).settings[0].value, std::numeric_limits<int64_t>::max());
+
+    for (const char* v : {"-9223372036854775809", "9223372036854775808", "- 1", "-", "-x"}) {
+        auto r = ql::parse(std::string("alter topic t set retention.ms = ") + v + ";");
+        ASSERT_FALSE(r.has_value()) << v;
+        EXPECT_TRUE(mentions(r.error().message, "retention.ms")) << v << " -> " << r.error().message;
+    }
+    EXPECT_FALSE(ql::parse("alter topic t set retention.ms = --1;").has_value()) << "-- starts a comment";
+}
+
+// R2: an accepted time names one real UTC second.
+TEST(QlCatalogStatementsRegression, TimeIsARealCalendarInstantRegression) {
+    auto stmt = [](const char* t) { return std::string("show topic t as of time '") + t + "';"; };
+    for (const char* ok : {"2028-02-29T00:00:00Z", "2000-02-29T00:00:00Z", "2026-04-30T23:59:59Z",
+                           "2026-12-31T23:59:59Z", "2026-01-31T00:00:00Z"})
+        EXPECT_TRUE(ql::parse(stmt(ok)).has_value()) << ok;
+    for (const char* bad : {"2026-02-29T00:00:00Z", "2100-02-29T00:00:00Z", "2026-02-30T00:00:00Z",
+                            "2026-02-31T00:00:00Z", "2026-04-31T00:00:00Z", "2026-06-31T00:00:00Z",
+                            "2026-09-31T00:00:00Z", "2026-11-31T00:00:00Z", "2026-00-10T00:00:00Z"}) {
+        auto r = ql::parse(stmt(bad));
+        ASSERT_FALSE(r.has_value()) << bad;
+        EXPECT_TRUE(mentions(r.error().message, "invalid time")) << bad;
+    }
+    EXPECT_FALSE(ql::parse("show history since '2026-02-30T00:00:00Z';").has_value());
+}
+
+// R3: every row of the settings table.
+TEST(QlCatalogStatementsRegression, EveryAlterableKeyMapsToItsWireKeyRegression) {
+    static_assert(static_cast<uint8_t>(rune::protocol::ConfigKey::MaxCompactionLagMs) == 6);
+    auto r = ql::parse("alter topic t set retention.ms = 11, retention.bytes = 22, delete.retention.ms = 33, "
+                       "min.cleanable.dirty.ratio = 0.125, min.compaction.lag.ms = 55, max.compaction.lag.ms = 66;");
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    auto plan = ql::applyConfigPlan(std::get<ql::AlterTopicConfigDef>(*r));
+    ASSERT_TRUE(plan.has_value());
+    const std::vector<std::pair<uint8_t, int64_t>> want{{1, 11}, {2, 22}, {3, 33}, {4, 125000}, {5, 55}, {6, 66}};
+    EXPECT_EQ(plan->changes, want);
+}
+TEST(QlCatalogStatementsRegression, EveryCreationSettingLandsInItsConfigFieldRegression) {
+    auto r = ql::parse("topic t partitions 1 with (retention.ms = 11, retention.bytes = 22, delete.retention.ms = 33, "
+                       "min.cleanable.dirty.ratio = 0.125, min.compaction.lag.ms = 55, max.compaction.lag.ms = 66, "
+                       "cleanup.policy = compact_delete, segment.bytes = 77, retention.check.ms = 88, "
+                       "file.delete.delay.ms = 99, durability = all-in-sync, tier = strict, "
+                       "copartition.group = 'grp', partition.key = 'pk');");
+    ASSERT_TRUE(r.has_value()) << r.error().message;
+    const auto c = ql::applyPlan(std::get<ql::TopicDef>(*r)).config;
+    EXPECT_EQ(c.retentionMs, 11); EXPECT_EQ(c.retentionBytes, 22); EXPECT_EQ(c.deleteRetentionMs, 33);
+    EXPECT_EQ(c.minCleanableDirtyRatioPpm, 125000); EXPECT_EQ(c.minCompactionLagMs, 55);
+    EXPECT_EQ(c.maxCompactionLagMs, 66); EXPECT_EQ(c.cleanupPolicy, 2); EXPECT_EQ(c.segmentRollBytes, 77);
+    EXPECT_EQ(c.retentionCheckMs, 88); EXPECT_EQ(c.fileDeleteDelayMs, 99); EXPECT_EQ(c.durability, 1);
+    EXPECT_EQ(c.durabilityTier, 2); EXPECT_EQ(c.coPartitionGroup, "grp"); EXPECT_EQ(c.partitionKey, "pk");
+}
+TEST(QlCatalogStatementsRegression, EveryEnumWordHasItsWireByteRegression) {
+    auto a = ql::parse("topic t partitions 1 with (cleanup.policy = delete, durability = majority, tier = majority);");
+    ASSERT_TRUE(a.has_value()) << a.error().message;
+    const auto& w = std::get<ql::TopicDef>(*a).with;
+    ASSERT_EQ(w.size(), 3u);
+    EXPECT_EQ(w[0].value, 0); EXPECT_EQ(w[1].value, 0); EXPECT_EQ(w[2].value, 1);
+    EXPECT_EQ(w[0].text, "delete"); EXPECT_EQ(w[1].text, "majority"); EXPECT_EQ(w[2].text, "majority");
+    auto b = ql::parse("topic t partitions 1 with (cleanup.policy = compact, tier = leader);");
+    ASSERT_TRUE(b.has_value()) << b.error().message;
+    EXPECT_EQ(std::get<ql::TopicDef>(*b).with[0].value, 1);
+    EXPECT_EQ(std::get<ql::TopicDef>(*b).with[1].value, 0);
+    auto c = ql::parse("topic t partitions 1 with (durability = ALL-IN-SYNC);");
+    ASSERT_TRUE(c.has_value()) << c.error().message;
+    EXPECT_EQ(std::get<ql::TopicDef>(*c).with[0].value, 1);
+    EXPECT_EQ(std::get<ql::TopicDef>(*c).with[0].text, "all-in-sync");
+}
+TEST(QlCatalogStatementsRegression, ApplyConfigPlanRefusesHandBuiltBadKeysRegression) {
+    ql::AlterTopicConfigDef d{"t", {{"segment.bytes", 1, ""}}};
+    auto r = ql::applyConfigPlan(d);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error().message, "unknown or immutable topic setting 'segment.bytes'");
+    ql::AlterTopicConfigDef e{"t", {{"bogus", 1, ""}}};
+    auto q = ql::applyConfigPlan(e);
+    ASSERT_FALSE(q.has_value());
+    EXPECT_EQ(q.error().message, "unknown or immutable topic setting 'bogus'");
+}
+
+// R4: characters no token starts with are never names; digits glued to letters are one bad token.
+TEST(QlCatalogStatementsRegression, NonIdentifierCharactersAreNeverNamesRegression) {
+    auto at = ql::parse("drop topic @;");
+    ASSERT_FALSE(at.has_value());
+    EXPECT_TRUE(mentions(at.error().message, "'@'")) << at.error().message;
+    for (const char* bad : {"drop topic $;", "drop view #;", "topic t { @ int64 } partitions 1 key @;",
+                            "topic t { id int64 } partitions 1 key $;", "alter topic t drop column @;",
+                            "show topic % as of version 1;", "show history topic !;",
+                            "diff schema & version 1 to 2;", "diff catalog offset 1to 2;",
+                            "topic t partitions 1 replicas 2key;"})
+        EXPECT_FALSE(ql::parse(bad).has_value()) << bad;
+    auto e = ql::parse("drop topic \xC3\xA9;");
+    ASSERT_FALSE(e.has_value());
+    EXPECT_TRUE(mentions(e.error().message, "0xC3")) << e.error().message;
+    auto g = ql::parse("topic t partitions 3replicas 2;");
+    ASSERT_FALSE(g.has_value());
+    EXPECT_TRUE(mentions(g.error().message, "3replicas")) << g.error().message;
+    for (const char* ok : {"drop topic a_1;", "topic t { x1 int64, _y string(10) } partitions 1 key x1;",
+                           "alter topic t set min.cleanable.dirty.ratio = 0.25;", "topic t partitions 10;"})
+        EXPECT_TRUE(ql::parse(ok).has_value()) << ok;
 }

@@ -8,14 +8,15 @@
 //                   replicas is 0..32767, 0 = the broker's default)
 //   createSetting := setting
 //                  | "cleanup.policy" "=" ("delete" | "compact" | "compact_delete")
-//                  | ("segment.bytes" | "retention.check.ms" | "file.delete.delay.ms") "=" INT
+//                  | ("segment.bytes" | "retention.check.ms" | "file.delete.delay.ms") "=" SIGNED_INT
 //                  | "durability" "=" ("majority" | "all-in-sync") | "tier" "=" ("leader" | "majority" | "strict")
 //                  | ("copartition.group" | "partition.key") "=" STRING
 //                  (creation-only; a key may appear once)
 //   alterStmt   := "alter" "topic" IDENT ( alterOp ("," alterOp)* | "set" setting ("," setting)* ) ";"
 //                  ("alter transient …" and "set persistence …" are rejected:
 //                   a topic's persistence is fixed when it is defined)
-//   setting     := CONFIGKEY "=" INT | "min.cleanable.dirty.ratio" "=" DECIMAL     (DECIMAL in [0,1], <= 6 places → ppm)
+//   setting     := CONFIGKEY "=" SIGNED_INT | "min.cleanable.dirty.ratio" "=" DECIMAL     (DECIMAL in [0,1], <= 6 places → ppm)
+//   SIGNED_INT  := ["-"] INT  ('-' directly before the digits); any int64 — ranges are the catalog library's (topicConfigError)
 //   CONFIGKEY   := "retention.ms" | "retention.bytes" | "delete.retention.ms" | "min.compaction.lag.ms" | "max.compaction.lag.ms"
 //   dropStmt    := "drop" ("topic" | "view") IDENT ";"
 //   showStmt    := "show" "history" [ ("topic" | "view" | "schema") IDENT ] [ "since" STRING ] ";"
@@ -63,6 +64,7 @@ enum class TK : uint8_t {
     Eq,      // =
     String,  // '…'   (text = the characters between the quotes)
     BadString, // ' with no closing quote
+    Unknown,   // a character no token starts with, or digits glued to letters ("3replicas")
     Eof,
 };
 
@@ -138,6 +140,11 @@ struct Lexer {
         if (c >= '0' && c <= '9') {
             std::size_t start = pos;
             while (pos < src.size() && src[pos] >= '0' && src[pos] <= '9') advance();
+            if (pos < src.size() && ((src[pos] >= 'a' && src[pos] <= 'z') || (src[pos] >= 'A' && src[pos] <= 'Z') || src[pos] == '_')) {
+                while (pos < src.size() && ((src[pos] >= 'a' && src[pos] <= 'z') || (src[pos] >= 'A' && src[pos] <= 'Z') ||
+                                            (src[pos] >= '0' && src[pos] <= '9') || src[pos] == '_')) advance();
+                return {TK::Unknown, src.substr(start, pos - start), tline, tcol};
+            }
             return {TK::Int, src.substr(start, pos - start), tline, tcol};
         }
 
@@ -154,9 +161,9 @@ struct Lexer {
             return {TK::Ident, src.substr(start, pos - start), tline, tcol};
         }
 
-        // Unknown character — return a 1-char Ident so the parser can produce an error
+        // Unknown character — its own token kind, so no IDENT position (a name) can accept it.
         advance();
-        return {TK::Ident, src.substr(pos - 1, 1), tline, tcol};
+        return {TK::Unknown, src.substr(pos - 1, 1), tline, tcol};
     }
 };
 
@@ -196,7 +203,15 @@ struct Parser {
     // Keywords are case-insensitive (names are not).
     [[nodiscard]] bool isKw(std::string_view kw) const noexcept { return cur.kind == TK::Ident && ieq(cur.text, kw); }
     [[nodiscard]] std::string got() const {
-        return cur.kind == TK::Eof ? std::string("end of input") : "'" + std::string(cur.text) + "'";
+        if (cur.kind == TK::Eof) return "end of input";
+        if (cur.kind == TK::Unknown && cur.text.size() == 1) {
+            const auto c = static_cast<unsigned char>(cur.text[0]);
+            if (c < 0x21 || c >= 0x7F) {
+                static constexpr char hex[] = "0123456789ABCDEF";
+                return std::string("byte 0x") + hex[c >> 4] + hex[c & 0xF];
+            }
+        }
+        return "'" + std::string(cur.text) + "'";
     }
 
     // Consume the current token and advance; returns it.
@@ -311,6 +326,34 @@ struct Parser {
         return static_cast<int64_t>(v);
     }
 
+    // SIGNED_INT := ["-"] INT, the '-' written directly before the digits; any int64.
+    // No range check here: the catalog library's topicConfigError is the ONE range
+    // authority (ruling 4), so e.g. retention.ms = -1 (unlimited) parses.
+    std::expected<int64_t, ParseError> parseSignedInt(std::string_view what) noexcept {
+        const Token start = cur;
+        bool neg = false;
+        if (cur.kind == TK::Dash) {
+            neg = true;
+            advance();
+            if (cur.kind != TK::Int || !cur.adj) {
+                return std::unexpected(err("expected digits right after '-' for " + std::string(what) + ", got " + got()));
+            }
+        }
+        if (cur.kind != TK::Int) {
+            return std::unexpected(err("expected integer for " + std::string(what) + ", got " + got()));
+        }
+        constexpr uint64_t kMaxMag = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+        uint64_t mag = 0;
+        auto [ptr, ec] = std::from_chars(cur.text.data(), cur.text.data() + cur.text.size(), mag);
+        if (ec != std::errc{} || mag > kMaxMag + (neg ? 1u : 0u)) {
+            return std::unexpected(errAt(start, std::string(what) + " is outside the 64-bit signed range"));
+        }
+        advance();
+        if (!neg) return static_cast<int64_t>(mag);
+        if (mag == kMaxMag + 1) return std::numeric_limits<int64_t>::min();
+        return -static_cast<int64_t>(mag);
+    }
+
     // IDENT ("." IDENT)* with no blanks around the dots, lower-cased (keys are keywords).
     std::expected<std::string, ParseError> parseDottedKey() noexcept {
         auto first = expect(TK::Ident, "setting name");
@@ -400,8 +443,12 @@ struct Parser {
                 ok = shape[i] == 'd' ? ((*s)[i] >= '0' && (*s)[i] <= '9') : (*s)[i] == shape[i];
         }
         if (ok) {
+            const int y = num(0, 4);
             const int mo = num(5, 2), d = num(8, 2), h = num(11, 2), mi = num(14, 2), se = num(17, 2);
-            ok = mo >= 1 && mo <= 12 && d >= 1 && d <= 31 && h <= 23 && mi <= 59 && se <= 59;
+            const bool leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+            static constexpr int kDays[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+            ok = mo >= 1 && mo <= 12 && h <= 23 && mi <= 59 && se <= 59 && d >= 1 &&
+                 d <= kDays[mo - 1] + ((mo == 2 && leap) ? 1 : 0);
         }
         if (!ok) {
             return std::unexpected(errAt(t, "invalid time '" + *s + "': expected ISO-8601 UTC like '2026-10-13T12:00:00Z'"));
@@ -426,7 +473,7 @@ struct Parser {
         cs.key = std::string(spec->name);
         switch (spec->value) {
             case detail::Value::Int: {
-                auto v = parseBoundedInt(spec->name, std::numeric_limits<int64_t>::max());
+                auto v = parseSignedInt(spec->name);
                 if (!v) return std::unexpected(std::move(v.error()));
                 cs.value = *v;
                 break;
