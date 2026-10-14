@@ -122,6 +122,13 @@ public:
     /// Startup replay: clear and re-apply a span of records.
     void rebuildFromRecords(std::span<const TopicSchema> records);
 
+    /// Catalog history Task 7: forget every version of `topicId` (a DropTopic /
+    /// DropView / AlterView-retired sink applied).  Its name stops resolving (only
+    /// when it still names THIS id — a reused name already re-pointed is kept).
+    /// Invalidates every `const RegistryEntry*` previously returned for `topicId`
+    /// (only); an unknown id is a no-op.  Returns whether anything was erased.
+    bool erase(int32_t topicId);
+
     [[nodiscard]] uint32_t runtimeIdHighWater() const noexcept { return runtimeIdHighWater_; }
 
 private:

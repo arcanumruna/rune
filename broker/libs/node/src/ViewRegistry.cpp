@@ -209,11 +209,23 @@ void ViewRegistry::rebuildFromRecords(std::span<const ViewRecord> records) {
 
 std::vector<const ViewRecord*> ViewRegistry::all() const {
     std::vector<const ViewRecord*> out;
-    out.reserve(records_.size());
+    out.reserve(idToIndex_.size());
     for (const auto& v : records_) {
+        if (v.viewTopicId < 0) continue;   // a retired (erased) slot
         out.push_back(&v);
     }
     return out;
+}
+
+bool ViewRegistry::erase(int32_t viewTopicId) {
+    const auto it = idToIndex_.find(viewTopicId);
+    if (it == idToIndex_.end()) return false;
+    ViewRecord& slot = records_[it->second];
+    const auto nameIt = nameToId_.find(slot.viewName);
+    if (nameIt != nameToId_.end() && nameIt->second == viewTopicId) nameToId_.erase(nameIt);
+    slot = ViewRecord{};   // retired in place: viewTopicId = -1, no blobs
+    idToIndex_.erase(it);
+    return true;
 }
 
 } // namespace rune::node

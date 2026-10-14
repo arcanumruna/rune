@@ -21,9 +21,10 @@ rune::replication::PartitionConfig makeCatalogPartitionConfig(const NodeConfig& 
     c.minIsr              = catalogMinIsr(brokers);
     // Majority durability with periodic fsync off (the default) is Kafka
     // parity: a power loss on a MAJORITY of brokers can lose committed catalog
-    // events (DUR-1 only protects followers).  Review M8 carry-over → Task 8:
-    // the persisted `applied` checkpoint (ruling 8) must refuse to boot when
-    // applied > LEO — never replay a shorter history silently.
+    // events (DUR-1 only protects followers).  Review M8 (closed in Task 7):
+    // the persisted `applied` checkpoint (ruling 8) refuses to boot when it
+    // names an offset at or past the recovered LEO (BrokerNode::buildCatalog_,
+    // CatalogApplier::replayLocal) — never a shorter history replayed silently.
     c.durability          = rune::replication::DurabilityMode::Majority;
     c.durabilityTier      = 1;   // Majority: acked on the replicated HW
     c.replicaLagMaxMs     = config.replicaLagMaxMs;

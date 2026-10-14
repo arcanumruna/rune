@@ -115,6 +115,22 @@ inline constexpr std::int32_t kProvisionRollHoldsCounterTypeId     = 1'000'213;
 inline constexpr std::int32_t kProvisionUnpreallocCounterTypeId    = 1'000'214;
 inline constexpr std::int32_t kProvisionParkedDroppedCounterTypeId = 1'000'215;
 inline constexpr std::int32_t kProvisionReadMapFailuresCounterTypeId = 1'000'216;   // hot-path B review Md5
+// Catalog history Task 7 — the CatalogApplier's metrics, set on the control
+// thread from the admin→control kA2cCatalogHalted / kA2cCatalogApplied messages.
+//   * HALTED counter: 0 = applying; otherwise (halted offset + 1) — an operator
+//     alert (docs/CATALOG.md#halted): the broker serves what it applied and
+//     accepts no catalog change.
+//   * APPLIED-OFFSET counter: the last applied __catalog offset (-1 = none yet).
+// Key = the nodeId.
+inline constexpr std::int32_t kCatalogApplyHaltedCounterTypeId  = 1'000'217;
+inline constexpr std::int32_t kCatalogAppliedOffsetCounterTypeId = 1'000'218;
+inline std::string catalogApplyHaltedLabel(std::int32_t nodeId) {
+    return "rune-catalog-apply-halted node=" + std::to_string(nodeId);
+}
+inline std::string catalogAppliedOffsetLabel(std::int32_t nodeId) {
+    return "rune-catalog-applied-offset node=" + std::to_string(nodeId);
+}
+
 inline std::string provisionMetricLabel(const char* what, std::int32_t nodeId) {
     return std::string("rune-segment-provision-") + what + " node=" + std::to_string(nodeId);
 }

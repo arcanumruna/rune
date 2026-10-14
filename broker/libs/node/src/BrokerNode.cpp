@@ -1,4 +1,5 @@
 #include <rune/node/BrokerNode.h>
+#include <rune/node/CatalogCheckpoint.h>
 #include <rune/node/HostDefaults.h>
 #include <rune/node/ThreadAffinity.h>
 #include <rune/node/TlsStartupPolicy.h>
@@ -483,6 +484,10 @@ void BrokerNode::start() {
             stuckMarkersLabel(config_.nodeId));
         outOfSyncCounterRegId_ = aeron_->addCounter(
             kOutOfSyncCounterTypeId, roleKey, kRoleKeyLength, outOfSyncLabel(config_.nodeId));
+        catalogHaltedCounterRegId_ = aeron_->addCounter(
+            kCatalogApplyHaltedCounterTypeId, roleKey, kRoleKeyLength, catalogApplyHaltedLabel(config_.nodeId));
+        catalogAppliedCounterRegId_ = aeron_->addCounter(
+            kCatalogAppliedOffsetCounterTypeId, roleKey, kRoleKeyLength, catalogAppliedOffsetLabel(config_.nodeId));
     }
     const auto t2 = sclock::now();
 
@@ -2937,6 +2942,28 @@ void BrokerNode::publishRole() noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// BrokerNode::publishCatalogMetrics_ — catalog history Task 7 (CONTROL thread).
+// Resolves the catalog counters once the driver acked them and sets both; a
+// value that arrived before its counter resolved is re-published every control
+// pass until it lands (catalogMetricsUnpublished_).
+// ---------------------------------------------------------------------------
+void BrokerNode::publishCatalogMetrics_() noexcept {
+    catalogMetricsUnpublished_ = false;
+    if (!aeron_) return;
+    auto resolve = [this](std::shared_ptr<aeron::Counter>& c, std::int64_t regId) {
+        if (c || regId < 0) return;
+        try { c = aeron_->findCounter(regId); }
+        catch (...) { c.reset(); }
+    };
+    resolve(catalogHaltedCounter_, catalogHaltedCounterRegId_);
+    resolve(catalogAppliedCounter_, catalogAppliedCounterRegId_);
+    if (catalogHaltedCounter_) catalogHaltedCounter_->set(catalogHaltedValue_);
+    else if (catalogHaltedCounterRegId_ >= 0) catalogMetricsUnpublished_ = true;
+    if (catalogAppliedCounter_) catalogAppliedCounter_->set(catalogAppliedValue_);
+    else if (catalogAppliedCounterRegId_ >= 0) catalogMetricsUnpublished_ = true;
+}
+
+// ---------------------------------------------------------------------------
 // BrokerNode::leaderClientEndpoint (GB-4)
 // ---------------------------------------------------------------------------
 std::string BrokerNode::leaderClientEndpoint() const noexcept {
@@ -3010,6 +3037,15 @@ void BrokerNode::buildCatalog_() {
                                  dir.string() + " starts at offset " +
                                  std::to_string(catalogLog_->logStartOffset()) +
                                  " — the catalog is never truncated at the front; refusing to start");
+    }
+    // Catalog history Task 7 (review M8): the applied checkpoint (ruling 8) must
+    // never let this broker replay a SHORTER history than it already applied — a
+    // checkpoint at or past the recovered log end (lost writes, a replaced data
+    // dir) refuses to start, explicitly.  A damaged checkpoint file throws too.
+    if (auto refusal = catalogCheckpointBeyondLog(readCatalogCheckpoint(dir.string()),
+                                                  catalogLog_->logEndOffset(), dir.string())) {
+        spdlog::critical("BrokerNode[{}]: {}", config_.nodeId, *refusal);
+        throw std::runtime_error("BrokerNode[" + std::to_string(config_.nodeId) + "]: " + *refusal);
     }
 
     std::vector<rr::NodeId> allNodeIds;
@@ -3922,6 +3958,8 @@ void BrokerNode::stop() {
     termCounter_.reset();
     stuckMarkersCounter_.reset();   // D9: release before aeron_ (the Counter dtor uses the conductor)
     outOfSyncCounter_.reset();      // readiness gate (L5): same rule
+    catalogHaltedCounter_.reset();  // catalog history Task 7: same rule
+    catalogAppliedCounter_.reset();
     for (auto& c : provCounters_) c.reset();   // re-review N4: same rule (the provisioner is stopped)
 
     // 4. Close the Aeron client (joins the C++ conductor thread).
@@ -4102,6 +4140,33 @@ int BrokerNode::serviceAdminControl_() {
                 fanoutViewPlan_(decodeViewPlanUpdate(p, n));
                 return;
             }
+            // Catalog history Task 7: the CatalogApplier's metrics.  A halt is
+            // loud here too (the admin thread logged it critical as it halted).
+            if (tid == kA2cCatalogApplied) {
+                int64_t offset = -1;
+                uint64_t digest = 0;
+                if (decodeCatalogApplied(p, n, offset, digest)) {
+                    catalogAppliedValue_ = offset;
+                    publishCatalogMetrics_();
+                } else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]] {
+                    spdlog::error("BrokerNode[{}]: malformed kA2cCatalogApplied (len={}) skipped", config_.nodeId, n);
+                }
+                return;
+            }
+            if (tid == kA2cCatalogHalted) {
+                CatalogHaltedMsg m;
+                if (decodeCatalogHalted(p, n, m)) {
+                    catalogHaltedValue_ = m.offset + 1;
+                    publishCatalogMetrics_();
+                    spdlog::critical("BrokerNode[{}]: __catalog apply HALTED at offset {} (expected={:#x} actual={:#x}) "
+                                     "— {}; serving what was applied, accepting no catalog change "
+                                     "(docs/CATALOG.md#halted)", config_.nodeId, m.offset, m.expected, m.actual,
+                                     m.detail);
+                } else if (adminToControlRejects_++ % 1024 == 0) [[unlikely]] {
+                    spdlog::error("BrokerNode[{}]: malformed kA2cCatalogHalted (len={}) skipped", config_.nodeId, n);
+                }
+                return;
+            }
             // Catalog history Task 6: the __catalog replica's AlterIsr → the
             // controller channel (this thread owns replTransport_).
             if (tid == kA2cCatalogAlterIsr) {
@@ -4149,6 +4214,7 @@ int BrokerNode::serviceAdminControl_() {
                               tid, n, adminToControlRejects_);
             }
         }, 16);
+    if (catalogMetricsUnpublished_) [[unlikely]] publishCatalogMetrics_();   // a counter resolved late
     // Control (runtime) thread = the single producer of every worker ring.
     if (workerPool_) work += schemaFanout_.pump(*workerPool_);
     // Task 19: retry any view-plan install frames a worker ring could not take.

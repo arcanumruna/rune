@@ -55,6 +55,8 @@
 #include <rune/node/AdminChannels.h>
 #include <rune/node/AdminIsrChannel.h>
 #include <rune/node/CatalogPartition.h>
+#include <rune/node/CatalogApplier.h>
+#include <rune/codec/Serialize.h>
 #include <rune/node/AdminControlPlane.h>
 #include <rune/node/DdlAnswerGate.h>
 #include <rune/node/SchemaFanout.h>
@@ -217,6 +219,7 @@ public:
                      rune::replication::WorkerReplicationTransport* catalogPlane = nullptr)
         : worker_(reg, replica, selfId, std::move(replicaSet), std::move(deps),
                   viewsReplica, viewRegistry, catalogReplica, catalogPlane)
+        , catalogSchemas_(&reg)
         , requestRing_(kAdminRequestRingBytes)
         , replyRing_(kCreateTopicRingBytes)
         , roleRing_(kAdminRoleRingBytes) {}
@@ -379,6 +382,8 @@ public:
         if (!viewPlanBacklog_.empty() && topicCommittedBacklog_.empty()) [[unlikely]]
             work += flushViewPlanBacklog_();  // Task 19
         if (!egressBacklog_.empty()) [[unlikely]] work += flushEgressBacklog_();       // no-hang R2 / fix round 2
+        // Catalog history Task 7: the CatalogApplier's effects that found the ring full.
+        if (!catalogBacklog_.empty()) [[unlikely]] work += flushCatalogBacklog_();
 
         // 5. fsyncgate (Task 10 fix 3 / I1): the schema log this thread drives
         //    failed an fsync → hand it to the control thread (ring, no shared
@@ -548,6 +553,23 @@ public:
 
     AdminWorker& worker() noexcept { return worker_; }
 
+    // ── Catalog history Task 7: the production CatalogApplier sinks ──────────
+    // ADMIN thread only (the applier is admin-owned).  Every effect becomes one
+    // admin→control message on failureRing_ (the control thread is the single
+    // producer of every worker ring and the owner of TopicRegistry / placement /
+    // the cleaner's policy ring).  Ring full → the preallocated, bounded FIFO
+    // catalogBacklog_, flushed every doWork, never dropped; one FIFO for every
+    // catalog effect, so their order on the ring is the applier's order.
+    //
+    // Boot vs live is the SINK, never a flag (F4): the live sink's view installs
+    // carry the recovery byte 0 (a commit install), the boot sink's 1 (a recovery
+    // install — the workers rebuild from their checkpoints).  Task 16 replaces
+    // the boot sink.
+    [[nodiscard]] LiveEffects catalogLiveEffects() { return LiveEffects{catalogSink_(/*viewInstallRecovery=*/0)}; }
+    [[nodiscard]] BootEffects catalogBootEffects() { return BootEffects{catalogSink_(/*viewInstallRecovery=*/1)}; }
+    [[nodiscard]] std::size_t catalogBacklogForTest() const noexcept { return catalogBacklog_.count(); }
+    int flushCatalogBacklogForTest() { return flushCatalogBacklog_(); }
+
     /// Catalog history Task 6: the __catalog replica's ISR channel (admin →
     /// control, kA2cCatalogAlterIsr).  BrokerNode wires it as the replica's
     /// setIsrChannel on the controller-ISR path, before the admin thread starts.
@@ -578,6 +600,7 @@ private:
     }
 
     AdminWorker      worker_;
+    SchemaRegistry*  catalogSchemas_;  // admin-owned (the AdminWorker's registry): validator / view-source descriptors
     OneToOneByteRing requestRing_;     // gateway/control → admin (DefineTopic/GetSchema)
     OneToOneByteRing replyRing_;       // control → admin (createTopic reply)
     OneToOneByteRing roleRing_;        // control → admin (role events)
@@ -606,6 +629,151 @@ private:
     static constexpr std::size_t kEgressBacklogBytes = 4u * static_cast<std::size_t>(kAdminEgressRingBytes);
     rune::gateway::SpillFifo egressBacklog_{kEgressBacklogBytes};
     std::vector<uint8_t> egressStage_ = std::vector<uint8_t>(static_cast<std::size_t>(kAdminEgressRingBytes) / 8);
+
+    // Catalog history Task 7: catalog effects the ring could not take, FIFO as
+    // (key = the a2c type id, frame bytes).  Preallocated; 4x the ring.
+    static constexpr std::size_t kCatalogBacklogBytes = 4u * static_cast<std::size_t>(kAdminToControlRingBytes);
+    rune::gateway::SpillFifo catalogBacklog_{kCatalogBacklogBytes};
+    std::vector<uint8_t> catalogStage_ = std::vector<uint8_t>(static_cast<std::size_t>(kAdminToControlRingBytes) / 8);
+
+    [[nodiscard]] std::size_t catalogMaxFrame_() const noexcept {
+        return static_cast<std::size_t>(failureRing_.maxMsgLength());
+    }
+
+    /// Post one catalog effect frame of `len` bytes (written by `write(uint8_t*)`)
+    /// on failureRing_, or into the FIFO backlog behind any earlier one.
+    template <typename Write>
+    void postCatalog_(int32_t typeId, std::size_t len, Write&& write) {
+        if (len == 0 || len > catalogMaxFrame_()) [[unlikely]] haltCatalogEffectTooLarge_(typeId, len);
+        if (catalogBacklog_.empty()) {
+            const auto idx = failureRing_.tryClaim(typeId, len);
+            if (idx >= 0) {
+                write(failureRing_.base() + idx);
+                failureRing_.commit(idx);
+                return;
+            }
+        }
+        write(catalogStage_.data());
+        if (!catalogBacklog_.push(typeId, catalogStage_.data(), len)) [[unlikely]] haltCatalogBacklogFull_();
+    }
+
+    int flushCatalogBacklog_() {
+        int sent = 0;
+        while (!catalogBacklog_.empty()) {
+            const auto r = catalogBacklog_.front();
+            const auto idx = failureRing_.tryClaim(static_cast<int32_t>(r.key), r.len);
+            if (idx < 0) break;
+            std::memcpy(failureRing_.base() + idx, r.data, r.len);
+            failureRing_.commit(idx);
+            catalogBacklog_.pop();
+            ++sent;
+        }
+        return sent;
+    }
+
+    [[noreturn]] [[gnu::cold]] [[gnu::noinline]] void haltCatalogEffectTooLarge_(int32_t typeId, std::size_t len) const noexcept {
+        spdlog::critical("AdminWorkerAgent: catalog effect type={} ({} B) cannot fit one admin→control ring message "
+                         "({} B) — halting rather than dropping an applied catalog effect", typeId, len,
+                         catalogMaxFrame_());
+        std::abort();
+    }
+    [[noreturn]] [[gnu::cold]] [[gnu::noinline]] void haltCatalogBacklogFull_() const noexcept {
+        spdlog::critical("AdminWorkerAgent: catalog effect backlog full ({} effects, {} B) — the control thread "
+                         "stopped draining; halting rather than dropping an applied catalog effect",
+                         catalogBacklog_.count(), catalogBacklog_.usedBytes());
+        std::abort();
+    }
+
+    void postCatalogTopicApplied_(int32_t topicId, std::string_view name, int32_t partitions, int16_t rf,
+                                  rune::catalog::Persistence persistence, const rune::protocol::TopicConfig& c) {
+        const std::size_t len = catalogTopicAppliedWireLen(name, c);
+        const uint8_t pers = persistence == rune::catalog::Persistence::Transient ? 1 : 0;
+        postCatalog_(kA2cCatalogTopicApplied, len, [&](uint8_t* p) {
+            writeCatalogTopicApplied(p, topicId, name, partitions, rf, pers, c);
+        });
+    }
+
+    /// The validator fan-out of a typed topic's CURRENT schema version (the
+    /// materialized descriptor, exactly as deps.pushValidators posts it).
+    void postCatalogValidator_(const rune::catalog::TopicObject& t) {
+        if (!t.schema || !t.schema->validate) return;
+        const RegistryEntry* e = catalogSchemas_->byIdVersion(t.topicId, t.schema->schemaVersion);
+        if (e == nullptr) [[unlikely]] {
+            spdlog::error("AdminWorkerAgent: catalog topic '{}' (id={}) schema v{} not in the SchemaRegistry — "
+                          "validator not pushed", t.name, t.topicId, t.schema->schemaVersion);
+            return;
+        }
+        const std::vector<uint8_t> blob = rune::codec::serialize(e->descriptor);
+        postCatalog_(kA2cSchemaUpdate, schemaUpdateWireLen(blob.size()), [&](uint8_t* p) {
+            writeSchemaUpdate(p, t.topicId, e->version, blob);
+        });
+    }
+
+    CatalogEffects catalogSink_(uint8_t viewInstallRecovery) {
+        CatalogEffects fx;
+        fx.topicApplied = [this](const rune::catalog::TopicObject& t) {
+            postCatalogTopicApplied_(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence, t.config);
+            postCatalogValidator_(t);   // a typed CreateTopic's validators follow its creation
+        };
+        fx.sinkApplied = [this](const SinkSpec& s) {
+            // A view sink is a keyed, compacted table (Task 19's sink spec), every broker (rf 0).
+            rune::protocol::TopicConfig c;
+            c.cleanupPolicy = 1;   // Compact
+            c.partitionKey  = s.keyField;
+            postCatalogTopicApplied_(s.topicId, s.name, s.partitions, /*rf=*/0, s.persistence, c);
+        };
+        fx.topicDropped = [this](int32_t topicId, const std::string& name) {
+            postCatalog_(kA2cCatalogTopicDropped, catalogTopicDroppedWireLen(name),
+                         [&](uint8_t* p) { writeCatalogTopicDropped(p, topicId, name); });
+        };
+        fx.topicConfig = [this](int32_t topicId, std::span<const rune::catalog::ConfigChange> changes) {
+            const std::size_t n = changes.size();
+            postCatalog_(kA2cCatalogTopicConfig, n > kMaxCatalogConfigEntries ? 0 : catalogTopicConfigWireLen(n),
+                         [&](uint8_t* p) {
+                writeCatalogTopicConfigHeader(p, topicId, static_cast<uint16_t>(n));
+                for (std::size_t i = 0; i < n; ++i)
+                    writeCatalogTopicConfigEntry(p, i, static_cast<uint8_t>(changes[i].key), changes[i].value);
+            });
+        };
+        fx.schemaChanged = [this](const rune::catalog::TopicObject& t) { postCatalogValidator_(t); };
+        fx.viewInstalled = [this, viewInstallRecovery](const rune::catalog::ViewObject& v) {
+            std::vector<uint8_t> src;   // the first source's materialized descriptor (empty: untyped)
+            if (!v.def.sourceNames.empty())
+                if (const RegistryEntry* e = catalogSchemas_->byName(v.def.sourceNames.front()))
+                    src = rune::codec::serialize(e->descriptor);
+            const std::span<const uint8_t> plan(v.def.compiledPlanBlob), out(v.def.outputDescriptorBlob), sd(src);
+            const uint8_t pers = v.def.persistence == rune::catalog::Persistence::Transient ? 1 : 0;
+            postCatalog_(kA2cViewPlanUpdate, viewPlanUpdateWireLen(plan, out, sd), [&](uint8_t* p) {
+                writeViewPlanUpdate(p, v.def.viewTopicId, pers, viewInstallRecovery, plan, out, sd);
+            });
+        };
+        fx.viewUninstalled = [this](int32_t viewTopicId) {
+            postCatalog_(kA2cViewUninstall, kViewUninstallWireLen,
+                         [&](uint8_t* p) { writeViewUninstall(p, viewTopicId); });
+        };
+        fx.applied = [this](int64_t offset, uint64_t digest) {
+            postCatalog_(kA2cCatalogApplied, kCatalogAppliedWireLen,
+                         [&](uint8_t* p) { writeCatalogApplied(p, offset, digest); });
+        };
+        fx.halted = [this](const rune::catalog::ApplyError& err) {
+            std::string detail = std::string{rune::catalog::applyErrorName(err.code)} + ": " + err.detail;
+            const std::size_t room = catalogMaxFrame_() - kCatalogHaltedFixedBytes;
+            if (detail.size() > room) detail.resize(room);
+            postCatalog_(kA2cCatalogHalted, kCatalogHaltedFixedBytes + detail.size(), [&](uint8_t* p) {
+                writeCatalogHalted(p, err.offset, err.expected, err.actual, detail);
+            });
+        };
+        fx.storageFailed = [this](int e, const std::string& dir) {
+            std::string shown = dir;   // keep the path's TAIL (as the log storage-failure post)
+            const std::size_t maxDir = catalogMaxFrame_() - 4u;
+            if (shown.size() > maxDir) shown = "..." + dir.substr(dir.size() - (maxDir - 3u));
+            postCatalog_(kA2cStorageFailure, 4 + shown.size(), [&](uint8_t* p) {
+                std::memcpy(p, &e, 4);
+                std::memcpy(p + 4, shown.data(), shown.size());
+            });
+        };
+        return fx;
+    }
 
     // The bound (doWork step 3 pauses intake while the backlog is non-empty) was
     // exceeded: an invariant breach — halt loudly, never drop a DDL answer.
@@ -1669,6 +1837,17 @@ private:
     std::shared_ptr<aeron::Counter>  termCounter_;
     std::int64_t                     outOfSyncCounterRegId_ = -1;   ///< readiness gate (L5)
     std::shared_ptr<aeron::Counter>  outOfSyncCounter_;
+    // Catalog history Task 7: the CatalogApplier's metrics (RoleCounter.h).
+    // Resolved and set on the CONTROL thread only, from the admin→control drain
+    // (kA2cCatalogHalted / kA2cCatalogApplied); released in stop() before aeron_.
+    std::int64_t                     catalogHaltedCounterRegId_  = -1;
+    std::int64_t                     catalogAppliedCounterRegId_ = -1;
+    std::shared_ptr<aeron::Counter>  catalogHaltedCounter_;
+    std::shared_ptr<aeron::Counter>  catalogAppliedCounter_;
+    std::int64_t                     catalogHaltedValue_  = 0;    // control-thread-owned (0 = applying)
+    std::int64_t                     catalogAppliedValue_ = -1;   // control-thread-owned
+    bool                             catalogMetricsUnpublished_ = false;   // a value awaits an unresolved counter
+    void publishCatalogMetrics_() noexcept;
     // D9 review MEDIUM-3: the TCS stuck-markers gauge counter.  Resolved and
     // set on the CONTROL (runtime) thread only, from the TCS sink below.
     std::int64_t                     stuckMarkersCounterRegId_ = -1;

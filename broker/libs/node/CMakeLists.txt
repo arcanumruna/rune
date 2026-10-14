@@ -14,6 +14,8 @@ add_library(rune_node
     src/ViewRegistry.cpp
     src/AdminWorker.cpp
     src/CatalogPartition.cpp
+    src/CatalogCheckpoint.cpp
+    src/CatalogApplier.cpp
     src/ViewSnapshotIoAgent.cpp
     src/WorkerViewSet.cpp
     src/RuntimeTopicRecovery.cpp)
@@ -52,6 +54,9 @@ target_link_libraries(rune_node PUBLIC rune_consensus rune_gateway rune_coordina
 # (rune::view::kViewCheckpointMagic) -- node -> view is the sanctioned
 # dependency direction (libs/view must NEVER depend on libs/node).
 target_link_libraries(rune_node PUBLIC rune_view)
+# Catalog history Task 7: the CatalogApplier folds __catalog through the shared
+# rune_catalog library (decode / apply / fingerprints — one set of frozen rules).
+target_link_libraries(rune_node PUBLIC rune_catalog)
 if(aeron_FOUND)
     target_link_libraries(rune_node PUBLIC aeron::aeron rune_replication_aeron rune_aeron_util)
     # Aeron's embedded media driver calls uuid_generate() from libuuid on Linux;
@@ -155,7 +160,9 @@ if(BUILD_TESTING)
         tests/node/TopicNameTest.cpp
         tests/node/ViewReadinessRegressionTest.cpp
         tests/node/ViewRecoveryRegressionTest.cpp
+        tests/node/CatalogApplierTest.cpp
         )
+    target_include_directories(rune_node_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
     target_link_libraries(rune_node_tests PRIVATE
         rune_node
         rune_codec
@@ -163,6 +170,18 @@ if(BUILD_TESTING)
         GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_node_tests)
+
+    # Catalog history Task 7 (F12): the admin thread's catalog steady state never
+    # allocates.  Replaces the global operator new (binary-wide) — own binary, like
+    # rune_ddl_stress_tests / rune_transient_alloc_regression_tests.  Tasks 12 and
+    # 23 append to it.
+    add_executable(rune_catalog_alloc_regression_tests
+        tests/node/CatalogAllocRegressionTest.cpp)
+    target_include_directories(rune_catalog_alloc_regression_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_catalog_alloc_regression_tests PRIVATE
+        rune_node
+        GTest::gtest_main)
+    gtest_discover_tests(rune_catalog_alloc_regression_tests)
 
     # ---------------------------------------------------------------------------
     # E5 Task 2: WorkerReplicationValidator unit tests — pure symmetric-worker-count

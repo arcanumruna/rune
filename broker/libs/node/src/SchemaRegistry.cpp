@@ -311,6 +311,15 @@ int32_t SchemaRegistry::allocateRuntimeId() {
     return static_cast<int32_t>(runtimeIdHighWater_++);
 }
 
+bool SchemaRegistry::erase(int32_t topicId) {
+    const bool had = byId_.erase(topicId) > 0;
+    for (auto it = nameToId_.begin(); it != nameToId_.end();) {
+        if (it->second == topicId) it = nameToId_.erase(it);
+        else ++it;
+    }
+    return had;
+}
+
 void SchemaRegistry::rebuildFromRecords(std::span<const TopicSchema> records) {
     byId_.clear();
     nameToId_.clear();

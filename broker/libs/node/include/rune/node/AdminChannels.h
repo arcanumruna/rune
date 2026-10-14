@@ -31,6 +31,7 @@
 // rare — so a per-op allocation there is acceptable and off any hot path).
 
 #include <rune/node/OneToOneByteRing.h>
+#include <rune/protocol/CatalogTypes.h>
 
 #include <concurrent/AtomicBuffer.h>
 
@@ -85,6 +86,14 @@ enum : int32_t {
     // SBE AlterIsrMsg).  The control thread hands it to the controller channel
     // (replTransport_->sendAlterIsr) — the same one the coordinator partitions use.
     kA2cCatalogAlterIsr = 10,
+    // Catalog history Task 7: the CatalogApplier's effects (admin → control).
+    // Layouts and codecs below ("CatalogApplier effects").  Task 8 drains 5–8.
+    kA2cCatalogTopicApplied = 5,    // a CreateTopic / view sink applied: build the topic at its catalog id
+    kA2cCatalogTopicDropped = 6,    // a DropTopic / retired view sink applied
+    kA2cCatalogTopicConfig  = 7,    // an AlterTopicConfig applied (cleaner policy override)
+    kA2cViewUninstall       = 8,    // a DropView / AlterView retired a view plan
+    kA2cCatalogHalted       = 9,    // the applier HALTED (metric + loud log on the control thread)
+    kA2cCatalogApplied      = 11,   // the applier applied offset N (metric)
 };
 
 // ---------------------------------------------------------------------------
@@ -602,16 +611,20 @@ struct SchemaUpdateMsg {
     return 4 + 2 + blobLen;
 }
 
-inline bool encodeSchemaUpdate(OneToOneByteRing& ring, int32_t topicId, uint16_t version,
-                               std::span<const uint8_t> blob) {
+/// Writes exactly schemaUpdateWireLen(blob.size()) bytes at `p`.
+inline void writeSchemaUpdate(uint8_t* p, int32_t topicId, uint16_t version, std::span<const uint8_t> blob) noexcept {
     using namespace admin_wire;
-    const auto idx = ring.tryClaim(kA2cSchemaUpdate, schemaUpdateWireLen(blob.size()));
-    if (idx < 0) return false;
-    uint8_t* p = ring.base() + idx;
     putI32(p, topicId);
     p[4] = static_cast<uint8_t>(version & 0xff);
     p[5] = static_cast<uint8_t>((version >> 8) & 0xff);
     if (!blob.empty()) std::memcpy(p + 6, blob.data(), blob.size());
+}
+
+inline bool encodeSchemaUpdate(OneToOneByteRing& ring, int32_t topicId, uint16_t version,
+                               std::span<const uint8_t> blob) {
+    const auto idx = ring.tryClaim(kA2cSchemaUpdate, schemaUpdateWireLen(blob.size()));
+    if (idx < 0) return false;
+    writeSchemaUpdate(ring.base() + idx, topicId, version, blob);
     ring.commit(idx);
     return true;
 }
@@ -658,21 +671,36 @@ struct ViewPlanUpdateMsg {
     return 4 + 1 + 1 + 4 + m.planBlob.size() + 4 + m.outDescBlob.size() + 4 + m.srcDescBlob.size();
 }
 
+[[nodiscard]] inline std::size_t viewPlanUpdateWireLen(std::span<const uint8_t> plan, std::span<const uint8_t> outDesc,
+                                                      std::span<const uint8_t> srcDesc) noexcept {
+    return 4 + 1 + 1 + 4 + plan.size() + 4 + outDesc.size() + 4 + srcDesc.size();
+}
+
+/// Writes exactly viewPlanUpdateWireLen(plan, outDesc, srcDesc) bytes at `p`
+/// (catalog history Task 7: the catalog effect sink writes it from spans).
+inline void writeViewPlanUpdate(uint8_t* p, int32_t viewTopicId, uint8_t persistence, uint8_t recovery,
+                                std::span<const uint8_t> plan, std::span<const uint8_t> outDesc,
+                                std::span<const uint8_t> srcDesc) noexcept {
+    using namespace admin_wire;
+    putI32(p, viewTopicId); p += 4;
+    *p++ = persistence;
+    *p++ = recovery;
+    putI32(p, static_cast<int32_t>(plan.size())); p += 4;
+    if (!plan.empty()) std::memcpy(p, plan.data(), plan.size());
+    p += plan.size();
+    putI32(p, static_cast<int32_t>(outDesc.size())); p += 4;
+    if (!outDesc.empty()) std::memcpy(p, outDesc.data(), outDesc.size());
+    p += outDesc.size();
+    putI32(p, static_cast<int32_t>(srcDesc.size())); p += 4;
+    if (!srcDesc.empty()) std::memcpy(p, srcDesc.data(), srcDesc.size());
+}
+
 inline bool encodeViewPlanUpdate(OneToOneByteRing& ring, int32_t msgType,
                                  const ViewPlanUpdateMsg& m) {
-    using namespace admin_wire;
     const auto idx = ring.tryClaim(msgType, viewPlanUpdateWireLen(m));
     if (idx < 0) return false;
-    uint8_t* p = ring.base() + idx;
-    putI32(p, m.viewTopicId); p += 4;
-    *p++ = m.persistence;
-    *p++ = m.recovery ? uint8_t{1} : uint8_t{0};
-    putI32(p, static_cast<int32_t>(m.planBlob.size())); p += 4;
-    std::memcpy(p, m.planBlob.data(), m.planBlob.size()); p += m.planBlob.size();
-    putI32(p, static_cast<int32_t>(m.outDescBlob.size())); p += 4;
-    std::memcpy(p, m.outDescBlob.data(), m.outDescBlob.size()); p += m.outDescBlob.size();
-    putI32(p, static_cast<int32_t>(m.srcDescBlob.size())); p += 4;
-    std::memcpy(p, m.srcDescBlob.data(), m.srcDescBlob.size());
+    writeViewPlanUpdate(ring.base() + idx, m.viewTopicId, m.persistence, m.recovery ? uint8_t{1} : uint8_t{0},
+                        m.planBlob, m.outDescBlob, m.srcDescBlob);
     ring.commit(idx);
     return true;
 }
@@ -715,6 +743,249 @@ inline bool encodeTopicCommitted(OneToOneByteRing& ring, int32_t topicId) {
 [[nodiscard]] inline int32_t decodeTopicCommitted(const uint8_t* buf, std::size_t len) {
     if (len < kTopicCommittedWireLen) return -1;
     return admin_wire::getI32(buf);
+}
+
+// ===========================================================================
+// Catalog history Task 7 — CatalogApplier effects (admin → control, failureRing).
+//
+// Every layout is little-endian, fixed fields + u16-length-prefixed strings.
+// Each message has a `...WireLen` (exact size), a `write...` (writes exactly
+// that many bytes at a caller pointer: the ring claim, or the admin-owned
+// preallocated stage of the ring-full backlog) and a CHECKED `decode...` that
+// refuses a short / over-long / inconsistent frame (false — never a default
+// value applied as a real effect).
+//
+//   kA2cCatalogTopicApplied : [topicId:i32][nameLen:u16 + name][partitions:i32][rf:i16]
+//                             [persistence:u8][TopicConfig block]
+//       TopicConfig block   : cleanupPolicy:u8 retentionMs:i64 retentionBytes:i64
+//                             deleteRetentionMs:i64 minCleanableDirtyRatioPpm:i32
+//                             segmentRollBytes:i64 minCompactionLagMs:i64
+//                             maxCompactionLagMs:i64 retentionCheckMs:i64
+//                             fileDeleteDelayMs:i64 durability:u8 durabilityTier:u8
+//                             coPartitionGroupLen:u16 + bytes, partitionKeyLen:u16 + bytes
+//   kA2cCatalogTopicDropped : [topicId:i32][nameLen:u16 + name]
+//   kA2cCatalogTopicConfig  : [topicId:i32][count:u16][(key:u8, value:i64) * count]
+//   kA2cViewUninstall       : [viewTopicId:i32]
+//   kA2cCatalogHalted       : [offset:i64][expected:u64][actual:u64][detail bytes (rest)]
+//   kA2cCatalogApplied      : [offset:i64][digest:u64]
+// ===========================================================================
+namespace admin_wire {
+inline void putI16(uint8_t* p, int16_t v) { std::memcpy(p, &v, 2); }
+inline void putU64(uint8_t* p, uint64_t v) { std::memcpy(p, &v, 8); }
+inline int16_t  getI16(const uint8_t* p) { int16_t v; std::memcpy(&v, p, 2); return v; }
+inline uint64_t getU64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
+/// u16-length-prefixed string; the caller sized the buffer (len <= 0xFFFF checked by the WireLen user).
+inline uint8_t* putStr16(uint8_t* p, std::string_view s) {
+    putU16(p, static_cast<uint16_t>(s.size()));
+    if (!s.empty()) std::memcpy(p + 2, s.data(), s.size());
+    return p + 2 + s.size();
+}
+/// Checked read of a str16 at [pos, len): false on a short frame.
+inline bool getStr16(const uint8_t* buf, std::size_t len, std::size_t& pos, std::string& out) {
+    if (pos + 2 > len) return false;
+    const uint16_t n = getU16(buf + pos);
+    pos += 2;
+    if (pos + n > len) return false;
+    out.assign(reinterpret_cast<const char*>(buf + pos), n);
+    pos += n;
+    return true;
+}
+} // namespace admin_wire
+
+inline constexpr std::size_t kTopicConfigFixedBytes = 1 + 8 + 8 + 8 + 4 + 8 + 8 + 8 + 8 + 8 + 1 + 1;
+inline constexpr std::size_t kMaxStr16              = 0xFFFF;
+
+[[nodiscard]] inline std::size_t topicConfigWireLen(const rune::protocol::TopicConfig& c) noexcept {
+    return kTopicConfigFixedBytes + 2 + c.coPartitionGroup.size() + 2 + c.partitionKey.size();
+}
+
+struct CatalogTopicAppliedMsg {
+    int32_t                     topicId           = -1;
+    std::string                 name;
+    int32_t                     partitions        = 0;
+    int16_t                     replicationFactor = 0;
+    uint8_t                     persistence       = 0;   // 0 disk, 1 transient
+    rune::protocol::TopicConfig config;
+};
+
+/// 0 = cannot be encoded (a string longer than a u16 prefix holds).
+[[nodiscard]] inline std::size_t catalogTopicAppliedWireLen(std::string_view name,
+                                                            const rune::protocol::TopicConfig& c) noexcept {
+    if (name.size() > kMaxStr16 || c.coPartitionGroup.size() > kMaxStr16 || c.partitionKey.size() > kMaxStr16)
+        return 0;
+    return 4 + 2 + name.size() + 4 + 2 + 1 + topicConfigWireLen(c);
+}
+
+inline void writeCatalogTopicApplied(uint8_t* p, int32_t topicId, std::string_view name, int32_t partitions,
+                                     int16_t rf, uint8_t persistence, const rune::protocol::TopicConfig& c) {
+    using namespace admin_wire;
+    putI32(p, topicId); p += 4;
+    p = putStr16(p, name);
+    putI32(p, partitions); p += 4;
+    putI16(p, rf); p += 2;
+    *p++ = persistence;
+    *p++ = c.cleanupPolicy;
+    putI64(p, c.retentionMs); p += 8;
+    putI64(p, c.retentionBytes); p += 8;
+    putI64(p, c.deleteRetentionMs); p += 8;
+    putI32(p, c.minCleanableDirtyRatioPpm); p += 4;
+    putI64(p, c.segmentRollBytes); p += 8;
+    putI64(p, c.minCompactionLagMs); p += 8;
+    putI64(p, c.maxCompactionLagMs); p += 8;
+    putI64(p, c.retentionCheckMs); p += 8;
+    putI64(p, c.fileDeleteDelayMs); p += 8;
+    *p++ = c.durability;
+    *p++ = c.durabilityTier;
+    p = putStr16(p, c.coPartitionGroup);
+    (void)putStr16(p, c.partitionKey);
+}
+
+[[nodiscard]] inline bool decodeCatalogTopicApplied(const uint8_t* buf, std::size_t len, CatalogTopicAppliedMsg& m) {
+    using namespace admin_wire;
+    std::size_t pos = 0;
+    if (len < 4) return false;
+    m.topicId = getI32(buf); pos = 4;
+    if (!getStr16(buf, len, pos, m.name)) return false;
+    if (pos + 4 + 2 + 1 + kTopicConfigFixedBytes > len) return false;
+    m.partitions        = getI32(buf + pos); pos += 4;
+    m.replicationFactor = getI16(buf + pos); pos += 2;
+    m.persistence       = buf[pos++];
+    if (m.persistence > 1) return false;
+    auto& c = m.config;
+    c.cleanupPolicy             = buf[pos++];
+    c.retentionMs               = getI64(buf + pos); pos += 8;
+    c.retentionBytes            = getI64(buf + pos); pos += 8;
+    c.deleteRetentionMs         = getI64(buf + pos); pos += 8;
+    c.minCleanableDirtyRatioPpm = getI32(buf + pos); pos += 4;
+    c.segmentRollBytes          = getI64(buf + pos); pos += 8;
+    c.minCompactionLagMs        = getI64(buf + pos); pos += 8;
+    c.maxCompactionLagMs        = getI64(buf + pos); pos += 8;
+    c.retentionCheckMs          = getI64(buf + pos); pos += 8;
+    c.fileDeleteDelayMs         = getI64(buf + pos); pos += 8;
+    c.durability                = buf[pos++];
+    c.durabilityTier            = buf[pos++];
+    if (!getStr16(buf, len, pos, c.coPartitionGroup)) return false;
+    if (!getStr16(buf, len, pos, c.partitionKey)) return false;
+    return pos == len && m.topicId >= 0 && m.partitions > 0 && !m.name.empty();
+}
+
+struct CatalogTopicDroppedMsg {
+    int32_t     topicId = -1;
+    std::string name;
+};
+[[nodiscard]] inline std::size_t catalogTopicDroppedWireLen(std::string_view name) noexcept {
+    return name.size() > kMaxStr16 ? 0 : 4 + 2 + name.size();
+}
+inline void writeCatalogTopicDropped(uint8_t* p, int32_t topicId, std::string_view name) {
+    admin_wire::putI32(p, topicId);
+    (void)admin_wire::putStr16(p + 4, name);
+}
+[[nodiscard]] inline bool decodeCatalogTopicDropped(const uint8_t* buf, std::size_t len, CatalogTopicDroppedMsg& m) {
+    if (len < 4) return false;
+    m.topicId = admin_wire::getI32(buf);
+    std::size_t pos = 4;
+    if (!admin_wire::getStr16(buf, len, pos, m.name)) return false;
+    return pos == len && m.topicId >= 0;
+}
+
+/// One (key, value) of kA2cCatalogTopicConfig.  `key` = rune::protocol::ConfigKey's byte.
+struct CatalogConfigEntry {
+    uint8_t key   = 0;
+    int64_t value = 0;
+    bool operator==(const CatalogConfigEntry&) const = default;
+};
+inline constexpr std::size_t kCatalogConfigEntryBytes = 1 + 8;
+/// The most entries one AlterTopicConfig can carry (one per alterable key, ruling 5).
+inline constexpr std::size_t kMaxCatalogConfigEntries =
+    static_cast<std::size_t>(rune::protocol::kLastConfigKey) - static_cast<std::size_t>(rune::protocol::kFirstConfigKey) + 1;
+struct CatalogTopicConfigMsg {
+    int32_t                                                  topicId = -1;
+    uint16_t                                                 count   = 0;
+    std::array<CatalogConfigEntry, kMaxCatalogConfigEntries> entries{};   // fixed: no allocation
+};
+[[nodiscard]] inline constexpr std::size_t catalogTopicConfigWireLen(std::size_t count) noexcept {
+    return 4 + 2 + count * kCatalogConfigEntryBytes;
+}
+/// Writes the header; the caller then writes each entry with writeCatalogTopicConfigEntry.
+inline void writeCatalogTopicConfigHeader(uint8_t* p, int32_t topicId, uint16_t count) noexcept {
+    admin_wire::putI32(p, topicId);
+    admin_wire::putU16(p + 4, count);
+}
+inline void writeCatalogTopicConfigEntry(uint8_t* p, std::size_t i, uint8_t key, int64_t value) noexcept {
+    uint8_t* e = p + 6 + i * kCatalogConfigEntryBytes;
+    e[0] = key;
+    admin_wire::putI64(e + 1, value);
+}
+[[nodiscard]] inline bool decodeCatalogTopicConfig(const uint8_t* buf, std::size_t len, CatalogTopicConfigMsg& m) {
+    if (len < 6) return false;
+    m.topicId = admin_wire::getI32(buf);
+    m.count   = admin_wire::getU16(buf + 4);
+    if (m.count == 0 || m.count > kMaxCatalogConfigEntries) return false;
+    if (len != catalogTopicConfigWireLen(m.count)) return false;
+    for (std::size_t i = 0; i < m.count; ++i) {
+        const uint8_t* e = buf + 6 + i * kCatalogConfigEntryBytes;
+        if (e[0] < static_cast<uint8_t>(rune::protocol::kFirstConfigKey) ||
+            e[0] > static_cast<uint8_t>(rune::protocol::kLastConfigKey))
+            return false;
+        m.entries[i] = CatalogConfigEntry{e[0], admin_wire::getI64(e + 1)};
+    }
+    return m.topicId >= 0;
+}
+
+inline constexpr std::size_t kViewUninstallWireLen = 4;
+inline void writeViewUninstall(uint8_t* p, int32_t viewTopicId) noexcept { admin_wire::putI32(p, viewTopicId); }
+/// The view's sink topic id, or -1 on a malformed frame.
+[[nodiscard]] inline int32_t decodeViewUninstall(const uint8_t* buf, std::size_t len) noexcept {
+    if (len != kViewUninstallWireLen) return -1;
+    const int32_t id = admin_wire::getI32(buf);
+    return id >= 0 ? id : -1;
+}
+
+struct CatalogHaltedMsg {
+    int64_t     offset   = -1;
+    uint64_t    expected = 0;
+    uint64_t    actual   = 0;
+    std::string detail;
+};
+inline constexpr std::size_t kCatalogHaltedFixedBytes = 8 + 8 + 8;
+/// `detail` is truncated by the caller to fit the ring's max message.
+inline void writeCatalogHalted(uint8_t* p, int64_t offset, uint64_t expected, uint64_t actual,
+                               std::string_view detail) noexcept {
+    admin_wire::putI64(p, offset);
+    admin_wire::putU64(p + 8, expected);
+    admin_wire::putU64(p + 16, actual);
+    if (!detail.empty()) std::memcpy(p + kCatalogHaltedFixedBytes, detail.data(), detail.size());
+}
+[[nodiscard]] inline bool decodeCatalogHalted(const uint8_t* buf, std::size_t len, CatalogHaltedMsg& m) {
+    if (len < kCatalogHaltedFixedBytes) return false;
+    m.offset   = admin_wire::getI64(buf);
+    m.expected = admin_wire::getU64(buf + 8);
+    m.actual   = admin_wire::getU64(buf + 16);
+    m.detail.assign(reinterpret_cast<const char*>(buf) + kCatalogHaltedFixedBytes, len - kCatalogHaltedFixedBytes);
+    return true;
+}
+
+inline constexpr std::size_t kCatalogAppliedWireLen = 8 + 8;
+inline void writeCatalogApplied(uint8_t* p, int64_t offset, uint64_t digest) noexcept {
+    admin_wire::putI64(p, offset);
+    admin_wire::putU64(p + 8, digest);
+}
+[[nodiscard]] inline bool decodeCatalogApplied(const uint8_t* buf, std::size_t len, int64_t& offset, uint64_t& digest) noexcept {
+    if (len != kCatalogAppliedWireLen) return false;
+    offset = admin_wire::getI64(buf);
+    digest = admin_wire::getU64(buf + 8);
+    return offset >= 0;
+}
+
+/// Claim `len` bytes of type `typeId` on `ring`, let `write(uint8_t*)` fill them,
+/// commit.  false (nothing written) when the ring is full.
+template <typename Write>
+[[nodiscard]] inline bool encodeA2c(OneToOneByteRing& ring, int32_t typeId, std::size_t len, Write&& write) {
+    const auto idx = ring.tryClaim(typeId, len);
+    if (idx < 0) return false;
+    write(ring.base() + idx);
+    ring.commit(idx);
+    return true;
 }
 
 // ---- F3 round 7, item 4: descriptor size is bounded BY CONSTRUCTION ----

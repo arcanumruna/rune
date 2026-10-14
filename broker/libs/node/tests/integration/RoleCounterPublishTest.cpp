@@ -175,3 +175,66 @@ TEST(RoleCounterPublishTest, BothCountersPresentWithNodeKey) {
 
     node.stop();
 }
+
+// ===========================================================================
+// Catalog history Task 7: the CatalogApplier's metrics.  The admin thread's
+// production sink posts kA2cCatalogApplied / kA2cCatalogHalted on the
+// admin→control ring; the control thread sets the two counters
+// (kCatalogAppliedOffsetCounterTypeId = last applied offset,
+// kCatalogApplyHaltedCounterTypeId = halted offset + 1, 0 while applying).
+// ===========================================================================
+namespace {
+bool readCatalogCounters(const fs::path& aeronDir, std::int64_t& applied, std::int64_t& halted) {
+    aeron::CncFileReader reader = aeron::CncFileReader::mapExisting(aeronDir.string().c_str());
+    aeron::concurrent::CountersReader counters = reader.countersReader();
+    bool a = false, h = false;
+    counters.forEach([&](std::int32_t id, std::int32_t typeId, const aeron::concurrent::AtomicBuffer&,
+                         const std::string&) {
+        if (typeId == kCatalogAppliedOffsetCounterTypeId) { applied = counters.getCounterValue(id); a = true; }
+        if (typeId == kCatalogApplyHaltedCounterTypeId) { halted = counters.getCounterValue(id); h = true; }
+    });
+    return a && h;
+}
+} // namespace
+
+TEST(RoleCounterPublishTest, CatalogApplyMetricsReadableFromCncRegression) {
+    TempDir tmp{"catalog_"};
+    NodeConfig cfg = makeSingleNodeConfig(tmp.path);
+    BrokerNode node{cfg};
+    node.start();
+    ASSERT_TRUE(node.awaitLeader(3s));
+    const fs::path aeronDir = tmp.path / "aeron";
+
+    std::int64_t applied = -2, halted = -2;
+    auto await = [&](std::int64_t wantApplied, std::int64_t wantHalted) {
+        const auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (readCatalogCounters(aeronDir, applied, halted) && applied == wantApplied && halted == wantHalted)
+                return true;
+            std::this_thread::sleep_for(20ms);
+        }
+        return false;
+    };
+    ASSERT_TRUE(readCatalogCounters(aeronDir, applied, halted) || await(0, 0)) << "catalog counters registered";
+
+    AdminWorkerAgent* agent = node.adminWorkerAgentForTest();
+    ASSERT_NE(agent, nullptr);
+    node.onAdminThreadForTest([agent] {
+        const LiveEffects live = agent->catalogLiveEffects();
+        live.sink.applied(5, 0xABCD);
+        return 0;
+    });
+    EXPECT_TRUE(await(5, 0)) << "applied=" << applied << " halted=" << halted;
+
+    node.onAdminThreadForTest([agent] {
+        const LiveEffects live = agent->catalogLiveEffects();
+        rune::catalog::ApplyError err;
+        err.offset = 7;
+        err.code   = rune::catalog::ApplyError::Code::FingerprintMismatch;
+        err.detail = "test";
+        live.sink.halted(err);
+        return 0;
+    });
+    EXPECT_TRUE(await(5, 8)) << "halted offset 7 → counter 8; applied=" << applied << " halted=" << halted;
+    node.stop();
+}

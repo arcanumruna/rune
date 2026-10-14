@@ -124,6 +124,16 @@ add_library(rune_codec STATIC
 target_include_directories(rune_codec PUBLIC ${RUNE_CODEC_ROOT}/include)
 target_compile_features(rune_codec PUBLIC cxx_std_23)
 
+# ── rune_catalog — the shared catalog-history library (catalog history spec §6):
+#    event model, frozen per-formatVer apply rules, fingerprints, the verifying
+#    replayer.  Compiled from the rune-codec sibling's sources (ruling 1) so the
+#    broker, the client and the CLI link byte-identical rules.
+file(GLOB RUNE_CATALOG_SOURCES CONFIGURE_DEPENDS ${RUNE_CODEC_ROOT}/src/catalog/*.cpp)
+add_library(rune_catalog STATIC ${RUNE_CATALOG_SOURCES})
+target_include_directories(rune_catalog PUBLIC ${RUNE_CODEC_ROOT}/include ${RUNE_PROTOCOL_INCLUDE})
+target_link_libraries(rune_catalog PUBLIC rune_codec)
+target_compile_features(rune_catalog PUBLIC cxx_std_23)
+
 # Task 9 / spec §11: RUNE_TLS — the client<->broker TLS/AEAD enablement gate.
 # OFF (default): NodeConfig.cpp never reads RUNE_TLS_CERT_FILE/RUNE_TLS_KEY_FILE/
 # RUNE_REQUIRE_TLS from the environment (guarded by the RUNE_TLS_ENABLED compile

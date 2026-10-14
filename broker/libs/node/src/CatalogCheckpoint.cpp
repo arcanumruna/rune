@@ -1,0 +1,141 @@
+// CatalogCheckpoint.cpp — `dataDir/__catalog/applied` (catalog history ruling 8).
+#include <rune/node/CatalogCheckpoint.h>
+
+#include <array>
+#include <cerrno>
+#include <cstring>
+#include <filesystem>
+#include <stdexcept>
+
+#include <fcntl.h>
+#include <unistd.h>
+
+namespace rune::node {
+namespace {
+
+constexpr std::array<char, 8> kMagic{'R', 'C', 'A', 'T', 'A', 'P', 'L', '1'};
+constexpr std::size_t kFileBytes = 8 + 8 + 8 + 8;
+
+uint64_t fnv1a64(const uint8_t* p, std::size_t n) noexcept {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (std::size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 0x100000001b3ULL; }
+    return h;
+}
+void putU64(uint8_t* p, uint64_t v) noexcept { for (int i = 0; i < 8; ++i) p[i] = static_cast<uint8_t>(v >> (8 * i)); }
+uint64_t getU64(const uint8_t* p) noexcept {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= static_cast<uint64_t>(p[i]) << (8 * i);
+    return v;
+}
+
+bool writeAllAndSync(int fd, const uint8_t* p, std::size_t n) noexcept {
+    std::size_t done = 0;
+    while (done < n) {
+        const ssize_t w = ::write(fd, p + done, n - done);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        done += static_cast<std::size_t>(w);
+    }
+    return ::fsync(fd) == 0;
+}
+
+bool fsyncDir(const std::string& dir) noexcept {
+    const int fd = ::open(dir.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    const bool ok = ::fsync(fd) == 0;
+    const int saved = errno;
+    ::close(fd);
+    errno = saved;
+    return ok;
+}
+
+} // namespace
+
+std::optional<CatalogCheckpoint> readCatalogCheckpoint(const std::string& catalogDir) {
+    const std::string path = (std::filesystem::path{catalogDir} / kCatalogCheckpointFile).string();
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        if (errno == ENOENT) return std::nullopt;
+        throw std::runtime_error("__catalog checkpoint " + path + ": open failed: " + std::strerror(errno));
+    }
+    std::array<uint8_t, kFileBytes + 1> buf{};
+    std::size_t got = 0;
+    while (got < buf.size()) {
+        const ssize_t r = ::read(fd, buf.data() + got, buf.size() - got);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            const int saved = errno;
+            ::close(fd);
+            throw std::runtime_error("__catalog checkpoint " + path + ": read failed: " + std::strerror(saved));
+        }
+        if (r == 0) break;
+        got += static_cast<std::size_t>(r);
+    }
+    ::close(fd);
+    if (got != kFileBytes)
+        throw std::runtime_error("__catalog checkpoint " + path + " is " + std::to_string(got) + " bytes (expected " +
+                                 std::to_string(kFileBytes) + ") — damaged; refusing to guess what was applied");
+    if (std::memcmp(buf.data(), kMagic.data(), kMagic.size()) != 0)
+        throw std::runtime_error("__catalog checkpoint " + path + " has a foreign magic — refusing to guess what was applied");
+    if (fnv1a64(buf.data(), 24) != getU64(buf.data() + 24))
+        throw std::runtime_error("__catalog checkpoint " + path + " fails its checksum — damaged; refusing to guess "
+                                 "what was applied");
+    CatalogCheckpoint c;
+    c.appliedOffset = static_cast<int64_t>(getU64(buf.data() + 8));
+    c.digest        = getU64(buf.data() + 16);
+    if (c.appliedOffset < 0)
+        throw std::runtime_error("__catalog checkpoint " + path + " names a negative offset " +
+                                 std::to_string(c.appliedOffset));
+    return c;
+}
+
+bool writeCatalogCheckpoint(const std::string& catalogDir, const CatalogCheckpoint& c) {
+    std::array<uint8_t, kFileBytes> buf{};
+    std::memcpy(buf.data(), kMagic.data(), kMagic.size());
+    putU64(buf.data() + 8, static_cast<uint64_t>(c.appliedOffset));
+    putU64(buf.data() + 16, c.digest);
+    putU64(buf.data() + 24, fnv1a64(buf.data(), 24));
+
+    // Fixed-size path buffers would cap the dir length; this is the cold control
+    // plane (one write per applied DDL), and the strings are built per call.
+    const std::string path = (std::filesystem::path{catalogDir} / kCatalogCheckpointFile).string();
+    const std::string tmp  = path + ".tmp";
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return false;
+    if (!writeAllAndSync(fd, buf.data(), buf.size())) {
+        const int saved = errno;
+        ::close(fd);
+        ::unlink(tmp.c_str());
+        errno = saved;
+        return false;
+    }
+    if (::close(fd) != 0) {
+        const int saved = errno;
+        ::unlink(tmp.c_str());
+        errno = saved;
+        return false;
+    }
+    if (::rename(tmp.c_str(), path.c_str()) != 0) {
+        const int saved = errno;
+        ::unlink(tmp.c_str());
+        errno = saved;
+        return false;
+    }
+    return fsyncDir(catalogDir);
+}
+
+std::optional<std::string> catalogCheckpointBeyondLog(const std::optional<CatalogCheckpoint>& c,
+                                                      int64_t logEndOffset, const std::string& catalogDir) {
+    if (!c || c->appliedOffset < logEndOffset) return std::nullopt;
+    return "__catalog at " + catalogDir + ": the applied checkpoint names offset " +
+           std::to_string(c->appliedOffset) + " but the local log ends at " + std::to_string(logEndOffset) +
+           " — events this broker already applied are missing from its log (lost writes / a replaced data "
+           "dir); replaying the shorter history would silently fork the catalog.  Refusing to start: restore "
+           "the data dir, or wipe dataDir/__catalog entirely (including '" +
+           std::string{kCatalogCheckpointFile} + "') so this broker refetches the catalog from its peers "
+           "(docs/CATALOG.md#halted)";
+}
+
+} // namespace rune::node

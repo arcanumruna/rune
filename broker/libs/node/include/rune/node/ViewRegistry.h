@@ -65,6 +65,13 @@ public:
     /// All currently-registered views (stable pointers into the backing store).
     [[nodiscard]] std::vector<const ViewRecord*> all() const;
 
+    /// Catalog history Task 7: forget the view whose sink is `viewTopicId` (a
+    /// DropView / AlterView applied).  Its slot is retired in place (the deque
+    /// never moves the others — their pointers stay valid); a pointer to the
+    /// retired slot then reads an empty record (viewTopicId -1).  Its name stops
+    /// resolving unless it already names another id.  Unknown id: no-op.
+    bool erase(int32_t viewTopicId);
+
 private:
     // std::deque, NOT std::vector/std::unordered_map<..., ViewRecord>:
     // callers may hold a `const ViewRecord*` from byName/byViewTopicId across

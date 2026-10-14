@@ -16,6 +16,7 @@
 
 #include <rune/node/AdminIsrChannel.h>
 #include <rune/node/BrokerNode.h>
+#include <rune/node/CatalogCheckpoint.h>
 #include <rune/node/CatalogPartition.h>
 #include <rune/node/EmbeddedDriver.h>
 #include <rune/node/NodeConfig.h>
@@ -26,6 +27,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -526,6 +528,65 @@ TEST(CatalogReplicationRegression, SingleNodeLeadsTheCatalogAndKeepsItAcrossARes
     n.start();
     ASSERT_TRUE(n.awaitLeader(10'000ms));
     EXPECT_GE(catalogOf(n).leo, hw) << "the catalog is disk-backed: recovered on restart";
+    n.stop();
+}
+
+// Catalog history Task 7 (review M8, the Task 6 carry-over): the applied checkpoint
+// must never let a broker silently replay a SHORTER history than it applied.  A
+// checkpoint at or past the recovered __catalog log end refuses to start, with an
+// explicit error; one below it starts; a damaged checkpoint refuses too.
+TEST(CatalogReplicationRegression, AppliedCheckpointPastTheLocalLogEndRefusesToStartRegression) {
+    TmpDir dir{"cat_m8"};
+    const Ports ports = Ports::discover(1);
+    int64_t leo = -1;
+    {
+        BrokerNode n{makeConfig(1, dir.path, ports, 1, Mode::Shard)};
+        n.start();
+        ASSERT_TRUE(n.awaitLeader(10'000ms));
+        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        while (leo < 2 && std::chrono::steady_clock::now() < deadline) {
+            leo = n.onAdminThreadForTest([&n]() -> int64_t {
+                rr::PartitionReplica* r = n.catalogReplicaForTest();
+                if (r == nullptr || r->role() != rr::Role::Leader) return -1;
+                const std::vector<uint8_t> rec{2, 7};
+                if (r->append(std::span<const uint8_t>(rec), /*acksAll=*/true) < 0) return -1;
+                return r->logEndOffset();
+            });
+            if (leo < 2) std::this_thread::sleep_for(20ms);
+        }
+        ASSERT_GE(leo, 2);
+        n.stop();
+        leo = n.catalogLogForTest()->logEndOffset();
+    }
+    const std::string catalogDir = (dir.path / "__catalog").string();
+    auto expectRefused = [&](const char* why, const char* needle) {
+        BrokerNode n{makeConfig(1, dir.path, ports, 1, Mode::Shard)};
+        try {
+            n.start();
+            ADD_FAILURE() << why << ": the broker started";
+        } catch (const std::runtime_error& e) {
+            const std::string what = e.what();
+            EXPECT_NE(what.find("__catalog"), std::string::npos) << what;
+            EXPECT_NE(what.find(needle), std::string::npos) << what;
+        }
+        n.stop();
+    };
+    ASSERT_TRUE(writeCatalogCheckpoint(catalogDir, {leo, 0x1234}));
+    expectRefused("checkpoint == LEO (the event at it is missing)", "Refusing to start");
+    ASSERT_TRUE(writeCatalogCheckpoint(catalogDir, {leo + 40, 0x1234}));
+    expectRefused("checkpoint beyond the LEO", "Refusing to start");
+    {   // a damaged checkpoint is not "none" (that would re-apply every effect)
+        std::FILE* f = std::fopen((dir.path / "__catalog" / kCatalogCheckpointFile).string().c_str(), "wb");
+        ASSERT_NE(f, nullptr);
+        std::fputs("RCAT", f);
+        std::fclose(f);
+    }
+    expectRefused("damaged checkpoint", "damaged");
+    // A checkpoint below the log end is consistent: the broker starts.
+    ASSERT_TRUE(writeCatalogCheckpoint(catalogDir, {leo - 1, 0x1234}));
+    BrokerNode n{makeConfig(1, dir.path, ports, 1, Mode::Shard)};
+    n.start();
+    EXPECT_TRUE(n.awaitLeader(10'000ms));
     n.stop();
 }
 
