@@ -21,6 +21,7 @@
 #include <rune/replication/InternalIsrKnowledge.h>
 #include <rune/protocol/RecordBatch.h>
 #include <rune/storage/Log.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <deque>
@@ -4878,6 +4879,13 @@ TEST(InternalIsrRegression, TransientOpenErrorRetriedNotFailClosed) {
     a.topicId = -3; a.partition = 0; a.leaderEpoch = 4; a.version = 2; a.count = 2;
     a.members[0] = 1; a.members[1] = 2;
     { InternalIsrKnowledge k(path); ASSERT_TRUE(k.offer(a)); }
+    // Sanitizer triage (2026-10-14, build-asan UBSan vptr): the first log line of
+    // the process (spdlog registry construction) used to happen INSIDE the EMFILE
+    // window below; UBSan's vptr check probes memory readability through a pipe,
+    // which fails with EMFILE -> a false "invalid vptr" on fmt's buffer.  Build
+    // the logger (and warm the check's type cache) before exhausting the fds.
+    spdlog::warn("InternalIsrRegression: logger ready before the EMFILE window ({} {} {})", "path",
+                 std::string("detail"), 0);
     // Exhaust the descriptor table: the next open() fails with EMFILE.
     rlimit old{};
     ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &old), 0);

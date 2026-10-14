@@ -30,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -730,10 +731,18 @@ private:
         return std::nullopt;
     }
     /// A v8 DDL's 128-bit id: this client's instance tag + a counter (F14).
+    // Sanitizer triage (2026-10-14, DdlConformance T5/T7 under TSan): the id was
+    // keyed on `this` — a client re-created at the SAME address (the next block of
+    // a restart test) restarted the counter and re-sent a previous client's
+    // requestIds, which the broker's durable DDL dedupe (Task 11) rightly answered
+    // with the ORIGINAL outcome (a "define t_disk" answered OK after a restart).
+    // Which ids collided depended on how many NotLeader probes each boot took —
+    // timing — so it surfaced only under TSan.  A fresh random nonce per instance.
     rune::protocol::RequestId nextRequestId_() noexcept {
-        return {0x5C1E'0000'0000'0000ull | static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(this) & 0xFFFF'FFFF),
-                ++requestCounter_};
+        return {0x5C1E'0000'0000'0000ull | requestNonce_, ++requestCounter_};
     }
+    uint64_t requestNonce_   = (static_cast<uint64_t>(std::random_device{}()) << 16 ^ std::random_device{}()) &
+                               0x0000'FFFF'FFFF'FFFFull;
     uint64_t requestCounter_ = 0;
     /// `rcvWindowBytes` (catalog Task 12 fix round 1): the client's receive window
     /// (a small one also pins the MTU to 1408 so window >= MTU).

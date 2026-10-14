@@ -188,6 +188,22 @@ Result runOnce() {
     return res;
 }
 
+// Sanitizer triage (2026-10-14): a microsecond pass budget is meaningless under
+// TSan / ASan (5-15x slowdown; same convention as DutyPassLatencyGateTest).  The
+// functional half (all K Ready, rebuilds spread over passes) still runs.
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+#define RUNE_TFG_SANITIZED 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+#define RUNE_TFG_SANITIZED 1
+#endif
+#ifndef RUNE_TFG_SANITIZED
+#define RUNE_TFG_SANITIZED 0
+#endif
+constexpr bool kSanitized = RUNE_TFG_SANITIZED != 0;
+
 }  // namespace
 
 TEST(TransientFailoverLatencyGateRegression, KTransientPartitionsBecomingLeaderNeverStallAWorkerPass) {
@@ -203,16 +219,18 @@ TEST(TransientFailoverLatencyGateRegression, KTransientPartitionsBecomingLeaderN
                     static_cast<long long>(r.p99PassUs), r.passes, static_cast<long long>(r.allReadyUs),
                     static_cast<long long>(kMaxPassUs), static_cast<long long>(kP99PassUs));
         if (r.p99PassUs < best.p99PassUs || (r.p99PassUs == best.p99PassUs && r.maxPassUs < best.maxPassUs)) best = r;
+        if (kSanitized && !benchMode()) break;   // one functional attempt
         if (best.maxPassUs <= kMaxPassUs && best.p99PassUs <= kP99PassUs && !benchMode()) break;
     }
     if (benchMode()) return;
+    EXPECT_GT(best.passes, kK) << "the K rebuilds were not spread over passes";
+    if (kSanitized) GTEST_SKIP() << "pass-latency budgets are meaningless under a sanitizer (functional checks ran)";
     EXPECT_LE(best.p99PassUs, kP99PassUs)
         << "the p99 worker pass was " << best.p99PassUs << " us while K=" << kK
         << " transient partitions rebuilt (a per-partition budget: K steps per pass)";
     EXPECT_LE(best.maxPassUs, kMaxPassUs)
         << "a worker pass stalled " << best.maxPassUs << " us while K=" << kK
         << " transient partitions rebuilt their read_committed state (one pass rebuilding whole rings)";
-    EXPECT_GT(best.passes, kK) << "the K rebuilds were not spread over passes";
 }
 
 // ---------------------------------------------------------------------------
