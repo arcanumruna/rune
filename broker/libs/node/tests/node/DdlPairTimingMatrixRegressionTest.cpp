@@ -1,10 +1,24 @@
-// DdlPairTimingMatrixRegressionTest.cpp — DDL conformance plan Task 9.
+// DdlPairTimingMatrixRegressionTest.cpp — DDL conformance plan Task 9, ported to the
+// catalog write path by catalog history Task 10.
 //
-// A then B, for every create kind of A (and AlterAdd), 7 kinds of B, Same/Different
+// A then B, for every create kind of A (and AlterAdd), 11 kinds of B, Same/Different
 // name, and the 9 timing classes T1..T7.  B's expectation = the Occupant table row
 // for the state of its name WHEN B EXECUTES (B is serialized behind A), except that
-// a read (GetSchema) and a CAS version are taken at SUBMIT time.  Concurrent timings
-// (T2-T4) are also checked for timing-invariance against a sequential T1 twin.
+// a read (GetSchema), a CAS version and ALTER VIEW's persistence are taken at SUBMIT
+// time.  Concurrent timings (T2-T4) are also checked for timing-invariance against a
+// sequential T1 twin.
+//
+// Timing classes on the catalog path (the control-thread AwaitingId state and its
+// create-reply faults are gone — Task 9):
+//   T1 sequential; T2 both queued before either runs;
+//   T3 B submitted behind A's append, before the pass that applies it;
+//   T4 B submitted while A waits on a HELD HW (AwaitingCommit);
+//   T5a A's append refused (the ISR below minIsr): NotLeader, nothing appended;
+//   T5b A's commit times out (NotLeader, F13) and B runs while the leader catches up
+//       (B answered the retriable NotLeader); A's event then commits and applies;
+//   T5c A's commit times out, then commits and applies; then B;
+//   T6  A demoted in AwaitingCommit (NotLeader), re-promoted, its event commits; then B;
+//   T7  a restart between A and B.
 #include <gtest/gtest.h>
 #include "support/DdlHarness.h"
 
@@ -18,21 +32,21 @@ using namespace rune::node::test;
 namespace {
 
 enum class Timing : uint8_t {
-    T1_Sequential, T2_BothQueued, T3_DuringAwaitingId, T4_DuringAwaitingCommit,
-    T5a_ReplyFailsNoCreate, T5b_ReplyFailsAfterCreate, T5c_TimeoutInAwaitingId,
-    T6_DemotedInAwaitingId, T7_RestartBetween,
+    T1_Sequential, T2_BothQueued, T3_BehindAnUnappliedAppend, T4_DuringAwaitingCommit,
+    T5a_RefusedBelowMinIsr, T5b_TimeoutThenBWhileCatchingUp, T5c_TimeoutThenCommits,
+    T6_DemotedInAwaitingCommit, T7_RestartBetween,
 };
 const char* timingName(Timing t) {
     switch (t) {
-        case Timing::T1_Sequential:             return "T1_Sequential";
-        case Timing::T2_BothQueued:             return "T2_BothQueued";
-        case Timing::T3_DuringAwaitingId:       return "T3_DuringAwaitingId";
-        case Timing::T4_DuringAwaitingCommit:   return "T4_DuringAwaitingCommit";
-        case Timing::T5a_ReplyFailsNoCreate:    return "T5a_ReplyFailsNoCreate";
-        case Timing::T5b_ReplyFailsAfterCreate: return "T5b_ReplyFailsAfterCreate";
-        case Timing::T5c_TimeoutInAwaitingId:   return "T5c_TimeoutInAwaitingId";
-        case Timing::T6_DemotedInAwaitingId:    return "T6_DemotedInAwaitingId";
-        case Timing::T7_RestartBetween:         return "T7_RestartBetween";
+        case Timing::T1_Sequential:                  return "T1_Sequential";
+        case Timing::T2_BothQueued:                  return "T2_BothQueued";
+        case Timing::T3_BehindAnUnappliedAppend:     return "T3_BehindAnUnappliedAppend";
+        case Timing::T4_DuringAwaitingCommit:        return "T4_DuringAwaitingCommit";
+        case Timing::T5a_RefusedBelowMinIsr:         return "T5a_RefusedBelowMinIsr";
+        case Timing::T5b_TimeoutThenBWhileCatchingUp: return "T5b_TimeoutThenBWhileCatchingUp";
+        case Timing::T5c_TimeoutThenCommits:         return "T5c_TimeoutThenCommits";
+        case Timing::T6_DemotedInAwaitingCommit:     return "T6_DemotedInAwaitingCommit";
+        case Timing::T7_RestartBetween:              return "T7_RestartBetween";
     }
     return "?";
 }
@@ -44,13 +58,17 @@ void PrintTo(const PairCase& c, std::ostream* os) {
         << timingName(c.t);
 }
 
-bool aFails(Timing t) { return t >= Timing::T5a_ReplyFailsNoCreate && t <= Timing::T6_DemotedInAwaitingId; }
-bool aLeavesOrphan(Timing t) {
-    return t == Timing::T5b_ReplyFailsAfterCreate || t == Timing::T5c_TimeoutInAwaitingId ||
-           t == Timing::T6_DemotedInAwaitingId;
-}
+/// A is answered NotLeader (retriable) instead of OK.
+bool aAnsweredNotLeader(Timing t) { return t >= Timing::T5a_RefusedBelowMinIsr && t <= Timing::T6_DemotedInAwaitingCommit; }
+/// A's event is appended (and, by the end of the schedule, committed and applied).
+bool aApplied(Timing t) { return t != Timing::T5a_RefusedBelowMinIsr; }
 bool concurrent(Timing t) {
-    return t == Timing::T2_BothQueued || t == Timing::T3_DuringAwaitingId || t == Timing::T4_DuringAwaitingCommit;
+    return t == Timing::T2_BothQueued || t == Timing::T3_BehindAnUnappliedAppend ||
+           t == Timing::T4_DuringAwaitingCommit;
+}
+bool heldHw(Timing t) {
+    return t == Timing::T4_DuringAwaitingCommit || t == Timing::T5b_TimeoutThenBWhileCatchingUp ||
+           t == Timing::T5c_TimeoutThenCommits || t == Timing::T6_DemotedInAwaitingCommit;
 }
 
 std::string aName(Op a) { return a == Op::AlterAdd ? "src" : "n"; }
@@ -68,32 +86,44 @@ Occupant committedKind(Op a) {
         default:                  return Occupant::TypedDisk;   // AlterAdd on src
     }
 }
-Occupant occupantAfterA(const PairCase& c) {
-    if (!aFails(c.t)) return committedKind(c.a);
-    return aLeavesOrphan(c.t) ? orphanOf(c.a) : Occupant::Free;
+Occupant occupantAfterA(const PairCase& c) { return aApplied(c.t) ? committedKind(c.a) : Occupant::Free; }
+/// B's name as B is SUBMITTED (before A applied, in a concurrent timing).
+Occupant occupantAtBSubmit(const PairCase& c) {
+    if (c.rel == Rel::Different) return isCreate(c.b) ? Occupant::Free : Occupant::TypedDisk;
+    if (concurrent(c.t) || c.t == Timing::T5b_TimeoutThenBWhileCatchingUp)
+        return c.a == Op::AlterAdd ? Occupant::TypedDisk : Occupant::Free;
+    return occupantAfterA(c);
 }
 
 Cell expectedB(const PairCase& c) {
     const Occupant o = c.rel == Rel::Same ? occupantAfterA(c)
                      : (isCreate(c.b) ? Occupant::Free : Occupant::TypedDisk);
+    // KL3: a read is answered at SUBMIT time from the applied state.
+    if (c.b == Op::GetSchema) return expectedCell(occupantAtBSubmit(c), Op::GetSchema);
+    // T5b: B starts while the leader catches up on A's timed-out event.
+    if (c.t == Timing::T5b_TimeoutThenBWhileCatchingUp) return Cell{kNotLeader, 0};
     Cell cell = expectedCell(o, c.b);
-    if (c.rel == Rel::Same && concurrent(c.t)) {
-        // KL3: a read is answered at SUBMIT time from the committed state (before A).
-        if (c.b == Op::GetSchema)
-            cell = expectedCell(c.a == Op::AlterAdd ? Occupant::TypedDisk : Occupant::Free, Op::GetSchema);
-        // CAS read v1 at submit time; A's ALTER commits v2 first: lost-update protection.
-        if (c.b == Op::AlterCasCurrent && c.a == Op::AlterAdd) cell = Cell{kSchemaConflict, 0};
-    }
+    // CAS read v1 at submit time; A's ALTER commits v2 first: lost-update protection.
+    if (c.rel == Rel::Same && concurrent(c.t) && c.b == Op::AlterCasCurrent && c.a == Op::AlterAdd)
+        cell = Cell{kSchemaConflict, 0};
     return cell;
 }
 
-uint16_t expectedBVersion(const PairCase& c) {
+/// ALTER VIEW sends the view's persistence as read at SUBMIT time: in a concurrent
+/// timing the view does not exist yet, so the request asks for a persisted view.
+Occupant occupantAfterB(const PairCase& c, Occupant before) {
+    if (c.b == Op::AlterView && concurrent(c.t) && c.rel == Rel::Same) return Occupant::ViewPersisted;
+    return occupantAfterSuccess(before, c.b);
+}
+
+uint32_t expectedBVersion(const PairCase& c) {
     const bool aAlter = c.a == Op::AlterAdd;
     switch (c.b) {
         case Op::DefineDisk: case Op::DefineTransient:
         case Op::ViewPersisted: case Op::ViewTransient:
             return 1;
-        case Op::AlterAdd: case Op::AlterCasCurrent:
+        case Op::AlterAdd: case Op::AlterCasCurrent:   // the schema version
+        case Op::DropTopic: case Op::DropView: case Op::AlterView: case Op::AlterTopicConfig:   // the object version
             return c.rel == Rel::Different ? 2 : (aAlter ? 3 : 2);
         case Op::GetSchema:
             if (c.rel == Rel::Different) return 1;
@@ -121,13 +151,6 @@ void expectOccupant(const Catalog& cat, const std::string& name, Occupant o) {
             EXPECT_EQ(e->kind, EntryKind::View) << name;
             EXPECT_EQ(e->persistence, o == Occupant::ViewTransient ? PersistenceMode::Transient : PersistenceMode::Disk);
             return;
-        case Occupant::SchemaLessDisk:
-        case Occupant::OrphanSink:
-        case Occupant::SchemaLessTransient:
-            ASSERT_NE(e, nullptr) << name;
-            EXPECT_EQ(e->kind, EntryKind::SchemaLess) << name;
-            EXPECT_EQ(e->persistence, o == Occupant::SchemaLessTransient ? PersistenceMode::Transient : PersistenceMode::Disk);
-            return;
         default:
             ADD_FAILURE() << "unexpected occupant " << occupantName(o);
     }
@@ -149,17 +172,13 @@ Ran runPair(DdlHarness& h, const PairCase& c) {
             r.b = h.submit(c.b, bn);
             h.settle();
             break;
-        case Timing::T3_DuringAwaitingId: {
-            h.setControl(ControlMode::Hold);
+        case Timing::T3_BehindAnUnappliedAppend: {
             r.a = h.submit(c.a, an);
-            EXPECT_TRUE(h.tickUntilCreatePending());
+            EXPECT_TRUE(h.tickUntilAppended());
+            EXPECT_FALSE(h.response(r.a).has_value()) << "A is answered only once its event is applied";
+            const uint64_t events = h.eventsAppended();
             r.b = h.submit(c.b, bn);
-            const int reqs = h.createRequests();
-            for (int i = 0; i < 5; ++i) h.tick();
-            if (c.b != Op::GetSchema) EXPECT_FALSE(h.response(r.b).has_value()) << "B ran while A was AwaitingId";
-            EXPECT_EQ(h.createRequests(), reqs) << "B requested a topic while A was in flight";
-            h.setControl(ControlMode::Auto);
-            h.deliverCreate();
+            EXPECT_EQ(h.eventsAppended(), events) << "B appended while A was in flight";
             h.settle();
             break;
         }
@@ -167,48 +186,54 @@ Ran runPair(DdlHarness& h, const PairCase& c) {
             r.a = h.submit(c.a, an);
             EXPECT_TRUE(h.tickUntilAppended());
             r.b = h.submit(c.b, bn);
-            const int reqs = h.createRequests();
+            const uint64_t events = h.eventsAppended();
             for (int i = 0; i < 5; ++i) h.tick();
-            EXPECT_FALSE(h.response(r.a).has_value()) << "A answered before its record committed";
+            EXPECT_FALSE(h.response(r.a).has_value()) << "A answered before its event committed";
             if (c.b != Op::GetSchema) EXPECT_FALSE(h.response(r.b).has_value()) << "B ran while A was AwaitingCommit";
-            EXPECT_EQ(h.createRequests(), reqs);
-            h.settle();   // releases the held commits
+            EXPECT_EQ(h.eventsAppended(), events) << "B appended while A was in flight";
+            h.settle();   // releases the held commit
             break;
         }
-        case Timing::T5a_ReplyFailsNoCreate:
-        case Timing::T5b_ReplyFailsAfterCreate:
-            h.setControl(ControlMode::Hold);
+        case Timing::T5a_RefusedBelowMinIsr:
+            h.shrinkIsr();
             r.a = h.submit(c.a, an);
-            EXPECT_TRUE(h.tickUntilCreatePending());
-            h.failCreate(/*afterCreate=*/c.t == Timing::T5b_ReplyFailsAfterCreate);
-            h.setControl(ControlMode::Auto);
+            h.settle();
+            EXPECT_TRUE(h.response(r.a).has_value()) << "A refused at its append";
+            h.restoreIsr();
             h.settle();
             r.b = h.submit(c.b, bn);
             h.settle();
             break;
-        case Timing::T5c_TimeoutInAwaitingId:
-            h.setControl(ControlMode::Hold);
+        case Timing::T5b_TimeoutThenBWhileCatchingUp:
             r.a = h.submit(c.a, an);
-            EXPECT_TRUE(h.tickUntilCreatePending());
+            EXPECT_TRUE(h.tickUntilAppended());
             h.advance(AdminWorker::ddlTimeoutNs() + 1'000'000);
             h.tick();
             EXPECT_TRUE(h.response(r.a).has_value()) << "A timed out";
-            h.deliverCreate();   // the late reply: stale ticket, topic created (orphan)
-            h.setControl(ControlMode::Auto);
+            EXPECT_EQ(h.worker().roleName(), "LeaderCatchingUp") << "its event is not applied yet";
+            r.b = h.submit(c.b, bn);
+            h.tick();
+            EXPECT_TRUE(h.response(r.b).has_value()) << "B answered while the leader catches up";
+            h.settle();   // A's event commits and applies; the leader serves again
+            break;
+        case Timing::T5c_TimeoutThenCommits:
+            r.a = h.submit(c.a, an);
+            EXPECT_TRUE(h.tickUntilAppended());
+            h.advance(AdminWorker::ddlTimeoutNs() + 1'000'000);
+            h.tick();
+            EXPECT_TRUE(h.response(r.a).has_value()) << "A timed out";
             h.settle();
             r.b = h.submit(c.b, bn);
             h.settle();
             break;
-        case Timing::T6_DemotedInAwaitingId:
-            h.setControl(ControlMode::Hold);
+        case Timing::T6_DemotedInAwaitingCommit:
             r.a = h.submit(c.a, an);
-            EXPECT_TRUE(h.tickUntilCreatePending());
+            EXPECT_TRUE(h.tickUntilAppended());
             h.demote();
-            EXPECT_TRUE(h.response(r.a).has_value()) << "B4: answered at demotion";
-            h.deliverCreate();   // the late reply: stale ticket, topic created (orphan)
+            EXPECT_TRUE(h.response(r.a).has_value()) << "answered at the demotion (spec §5.2)";
+            for (int i = 0; i < 5; ++i) h.tick();
             h.promote();
-            h.setControl(ControlMode::Auto);
-            h.settle();
+            h.settle();   // re-promoted: the event commits under the new epoch and applies
             r.b = h.submit(c.b, bn);
             h.settle();
             break;
@@ -224,7 +249,8 @@ Ran runPair(DdlHarness& h, const PairCase& c) {
 std::vector<PairCase> pairCases() {
     const Op as[] = {Op::DefineDisk, Op::DefineTransient, Op::ViewPersisted, Op::ViewTransient};
     const Op bs[] = {Op::DefineDisk, Op::DefineTransient, Op::ViewPersisted, Op::ViewTransient,
-                     Op::AlterAdd, Op::AlterCasCurrent, Op::GetSchema};
+                     Op::AlterAdd, Op::AlterCasCurrent, Op::GetSchema,
+                     Op::DropTopic, Op::DropView, Op::AlterView, Op::AlterTopicConfig};
     std::vector<PairCase> v;
     for (Op a : as)
         for (Op b : bs)
@@ -244,13 +270,12 @@ class DdlPairTimingMatrixRegression : public ::testing::TestWithParam<PairCase> 
 TEST_P(DdlPairTimingMatrixRegression, AThenB) {
     const PairCase& c = GetParam();
     DdlHarnessOptions o;
-    o.holdCommits = c.t == Timing::T4_DuringAwaitingCommit;
+    o.holdCommits = heldHw(c.t);
     DdlHarness h(o);
     ASSERT_TRUE(h.violations().empty()) << h.violationText();
-    const int reqs0 = h.createRequests();
+    const uint64_t events0 = h.eventsAppended();
     const Catalog cat0 = h.catalog();
-    const int64_t schemaEnd0 = h.schemaLogEnd();
-    const int64_t viewsEnd0 = h.viewsLogEnd();
+    const int64_t logEnd0 = h.catalogLogEnd();
     const int plans0 = h.viewPlanPushes();
     const int recovery0 = h.recoveryViewInstalls();
 
@@ -261,42 +286,36 @@ TEST_P(DdlPairTimingMatrixRegression, AThenB) {
     const std::optional<Response> rb = h.response(r.b);
     ASSERT_TRUE(ra.has_value()) << "A answered";
     ASSERT_TRUE(rb.has_value()) << "B answered";
-    EXPECT_EQ(ra->err, aFails(c.t) ? kInternal : kOk);
-    if (!aFails(c.t)) EXPECT_EQ(ra->version, c.a == Op::AlterAdd ? 2u : 1u);
+    EXPECT_EQ(ra->err, aAnsweredNotLeader(c.t) ? kNotLeader : kOk);
+    if (!aAnsweredNotLeader(c.t)) EXPECT_EQ(ra->version, c.a == Op::AlterAdd ? 2u : 1u);
     const Cell wb = expectedB(c);
     EXPECT_EQ(rb->err, wb.code);
     if (wb.code == kOk) EXPECT_EQ(rb->version, expectedBVersion(c));
-    EXPECT_EQ(h.createRequests() - reqs0, (isCreate(c.a) ? 1 : 0) + wb.createRequests)
-        << "requestCreateTopic calls (A's + B's)";
+    const uint8_t aEvents = aApplied(c.t) ? 1 : 0;
+    EXPECT_EQ(h.eventsAppended() - events0, aEvents + wb.events) << "__catalog events appended (A's + B's)";
+    EXPECT_EQ(h.catalogLogEnd() - logEnd0, aEvents + wb.events) << "one event per accepted op: no half-state";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 
-    // Catalog log ends: exactly one record per COMMITTED DDL op, in the right log —
-    // a failed A (T5-T6) and a rejected B append nothing (no half-state).
-    const bool aOk = !aFails(c.t);
+    // Live view installs: A's view once applied, B's CREATE / ALTER VIEW.  A restart
+    // re-installs every live view through the boot replay (T7: A's view); a
+    // leadership flap re-installs nothing — every broker applies each event once.
+    const auto installs = [](Op op) { return isView(op) || op == Op::AlterView ? 1 : 0; };
     const bool bWrote = wb.code == kOk && c.b != Op::GetSchema;
-    const auto schemaRecs = [](Op op) { return isDefine(op) || isAlter(op) ? 1 : 0; };
-    const auto viewRecs = [](Op op) { return isView(op) ? 1 : 0; };
-    EXPECT_EQ(h.schemaLogEnd() - schemaEnd0, (aOk ? schemaRecs(c.a) : 0) + (bWrote ? schemaRecs(c.b) : 0))
-        << "TopicSchema records appended (A's + B's)";
-    EXPECT_EQ(h.viewsLogEnd() - viewsEnd0, (aOk ? viewRecs(c.a) : 0) + (bWrote ? viewRecs(c.b) : 0))
-        << "__views records appended (A's + B's)";
-    EXPECT_EQ(h.viewPlanPushes() - plans0, (aOk ? viewRecs(c.a) : 0) + (bWrote ? viewRecs(c.b) : 0))
+    EXPECT_EQ(h.viewPlanPushes() - plans0, (aApplied(c.t) && isView(c.a) ? 1 : 0) + (bWrote ? installs(c.b) : 0))
         << "worker view installs (A's + B's)";
-    // A restart re-installs every committed view as a recovery install (T7: A's
-    // view, if A made one); a T6 flap's re-promotion has no committed view to
-    // recover (A failed); no other timing promotes.
-    EXPECT_EQ(h.recoveryViewInstalls() - recovery0, c.t == Timing::T7_RestartBetween ? viewRecs(c.a) : 0)
+    EXPECT_EQ(h.recoveryViewInstalls() - recovery0,
+              c.t == Timing::T7_RestartBetween && isView(c.a) ? 1 : 0)
         << "recovery view installs";
 
-    // Final registry state of both names.
+    // Final state of both names.
     const Catalog fin = h.catalog();
     const Occupant afterA = occupantAfterA(c);
     if (c.rel == Rel::Same) {
-        expectOccupant(fin, aName(c.a), wb.code == kOk ? occupantAfterSuccess(afterA, c.b) : afterA);
+        expectOccupant(fin, aName(c.a), wb.code == kOk ? occupantAfterB(c, afterA) : afterA);
     } else {
         expectOccupant(fin, aName(c.a), afterA);
         const Occupant before = isCreate(c.b) ? Occupant::Free : Occupant::TypedDisk;
-        expectOccupant(fin, bName(c), wb.code == kOk ? occupantAfterSuccess(before, c.b) : before);
+        expectOccupant(fin, bName(c), wb.code == kOk ? occupantAfterB(c, before) : before);
     }
     // Versions: A's committed version, then B's ALTER (if any) on top of it.
     if (c.rel == Rel::Same && wb.code == kOk && isAlter(c.b))
@@ -308,13 +327,19 @@ TEST_P(DdlPairTimingMatrixRegression, AThenB) {
         ASSERT_NE(x, nullptr) << e.name;
         EXPECT_EQ(*x, e) << "every other entry is untouched";
     }
-    size_t present = 0;   // the pair's names that are new in the catalog
-    if (!findEntry(cat0, aName(c.a)) && findEntry(fin, aName(c.a))) ++present;
-    if (c.rel == Rel::Different && !findEntry(cat0, bName(c)) && findEntry(fin, bName(c))) ++present;
-    EXPECT_EQ(fin.size(), cat0.size() + present) << "only the pair's own names were added";
+    std::ptrdiff_t delta = 0;   // the pair's names that are new (+1) or dropped (-1)
+    if (!findEntry(cat0, aName(c.a)) && findEntry(fin, aName(c.a))) ++delta;
+    if (findEntry(cat0, aName(c.a)) && !findEntry(fin, aName(c.a))) --delta;
+    if (c.rel == Rel::Different) {
+        if (!findEntry(cat0, bName(c)) && findEntry(fin, bName(c))) ++delta;
+        if (findEntry(cat0, bName(c)) && !findEntry(fin, bName(c))) --delta;
+    }
+    EXPECT_EQ(static_cast<std::ptrdiff_t>(fin.size()), static_cast<std::ptrdiff_t>(cat0.size()) + delta)
+        << "only the pair's own names were added or dropped";
 
-    // Timing invariance: a concurrent schedule ends exactly like the sequential one.
-    if (concurrent(c.t) && c.b != Op::GetSchema && c.b != Op::AlterCasCurrent) {
+    // Timing invariance: a concurrent schedule ends exactly like the sequential one
+    // (the submit-time reads — GetSchema, a CAS, ALTER VIEW's persistence — excepted).
+    if (concurrent(c.t) && c.b != Op::GetSchema && c.b != Op::AlterCasCurrent && c.b != Op::AlterView) {
         DdlHarness twin;
         PairCase s = c;
         s.t = Timing::T1_Sequential;
@@ -325,7 +350,7 @@ TEST_P(DdlPairTimingMatrixRegression, AThenB) {
     }
 
     h.restart();
-    EXPECT_EQ(h.catalog(), h.expectedAfterRestart(fin)) << "state after a restart";
+    EXPECT_EQ(h.catalog(), fin) << "state after a restart";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 

@@ -1,32 +1,31 @@
-// DdlStressRegressionTest.cpp — DDL conformance plan Task 10.
+// DdlStressRegressionTest.cpp — DDL conformance plan Task 10, ported to the
+// __catalog write path by catalog history Task 10.
 //
-// Deterministic, seeded, model-checked: 3 simulated sessions submit random DDL over
-// a small colliding name pool (incl. a case variant, a reserved and an empty name)
-// while the scheduler delivers control replies (ok / fail / fail-after-create /
-// timeout / demotion — in AwaitingId, and after the record was appended: timeout /
-// demotion in AwaitingCommit, KL2 "in doubt") and releases commits in random
-// interleavings, with frequent
-// restarts (>= 5% of steps; each drains to quiescence first).  The broker is
-// multi-node throughout (replica set {1,2}, also after a restart): commits can be
-// held and leadership can flap in every boot.  CREATE VIEW reads 1 or 2 sources
-// drawn from typed disk / typed transient topics, view outputs, schema-less and
-// missing names.  Every answer is checked against a reference model — name ->
-// Occupant (kind + persistence) + version — that applies ops in FIFO submission
-// order using ONLY the expectation table and the plan's view-source rules.  A
-// demotion answers the in-flight op AND every queued op (the admin thread keeps
-// ticking while demoted: the leader guard answers each Internal, after the
-// admin-detected name / TopicExists checks).  An op answered Internal in
-// AwaitingCommit is IN DOUBT: live its topic is an orphan (a DefineTopic over it
-// adopts it; a DefineTopic over an in-doubt view sink is refused 25, I2); once
-// its record commits, the next promotion or restart makes it the committed kind.
-// Worker
-// view installs (commit and recovery) are checked against the model.  The final
+// Deterministic, seeded, model-checked: 3 simulated sessions submit random DDL —
+// creates, alters, reads, and the catalog ops DROP TOPIC / DROP VIEW / ALTER VIEW /
+// ALTER TOPIC CONFIG — over a small colliding name pool (incl. a case variant, an
+// untyped topic, a reserved and an empty name) while the scheduler holds and
+// releases the catalog's HW in random interleavings and strikes the in-flight op
+// with its planned fault: none (the commit is released), a commit TIMEOUT (F13:
+// answered NotLeader; the leader catches up — NotLeader to every DDL — until the
+// event commits, released at once or left held across later steps and restarts) or
+// a DEMOTION (spec §5.2: NotLeader, every queued op NotLeader, the event commits
+// under the re-promoted leader).  It also opens ISR-below-minIsr windows (every
+// append refused, NotLeader, nothing appended) and restarts frequently (>= 5% of
+// steps; each drains to quiescence first).  The broker is multi-node throughout
+// (replica set {1,2}, also after a restart).  CREATE / ALTER VIEW read 1 or 2
+// sources drawn from typed disk / typed transient topics, view outputs, an untyped
+// topic and missing names, each bound by id at SUBMIT time.  Every answer is
+// checked against a reference model — name -> Occupant (kind + persistence) +
+// version + incarnation (its topic id) — that applies ops in FIFO order using ONLY
+// the expectation table and the plan's view-source and drop rules.  Worker view
+// installs (live and boot replay) are checked against the model.  The final
 // catalog is checked against the model before and after a restart.
 //
 // Zero-alloc gate: the admin thread's steady-state loop — AdminWorker::doWork while
-// idle, while parked in AwaitingId, and while an op waits on a held HW gate — must
-// not allocate.  (DDL processing itself is the cold path and may.)  Own executable:
-// replaces global operator new.
+// idle, while an op waits on a held HW gate, and while the leader waits to catch
+// up on a held event — must not allocate.  (DDL processing itself is the cold path
+// and may.)  Own executable: replaces global operator new.
 //
 // On the first failure of a seed the run stops and prints the seed, the replay
 // command, the event trace up to the failure (the reproducing prefix) and its
@@ -67,192 +66,176 @@ using namespace rune::node::test;
 
 namespace {
 
-enum class Fault : uint8_t {
-    None, FailNoCreate, FailAfterCreate, TimeoutInAwaitingId, DemoteInAwaitingId,
-    TimeoutInAwaitingCommit, DemoteInAwaitingCommit,   // final review I5(b): after the append (KL2)
-};
-constexpr int kFaultCount = 7;
+enum class Fault : uint8_t { None, TimeoutInAwaitingCommit, DemoteInAwaitingCommit };
+constexpr int kFaultCount = 3;
 
 const char* faultName(Fault f) {
     switch (f) {
         case Fault::None:                    return "none";
-        case Fault::FailNoCreate:            return "failNoCreate";
-        case Fault::FailAfterCreate:         return "failAfterCreate";
-        case Fault::TimeoutInAwaitingId:     return "timeout";
-        case Fault::DemoteInAwaitingId:      return "demote";
-        case Fault::TimeoutInAwaitingCommit: return "timeoutAfterAppend";
-        case Fault::DemoteInAwaitingCommit:  return "demoteAfterAppend";
+        case Fault::TimeoutInAwaitingCommit: return "timeout";
+        case Fault::DemoteInAwaitingCommit:  return "demote";
     }
     return "?";
 }
-constexpr bool isCommitFault(Fault f) noexcept {
-    return f == Fault::TimeoutInAwaitingCommit || f == Fault::DemoteInAwaitingCommit;
-}
 
-/// Task 9's timing classes, as the stress schedule produces them.  T1..T4: the
-/// worker's state when a DDL op is SUBMITTED (idle / behind queued ops / another op
-/// in AwaitingId / another op in AwaitingCommit).  T5a..T6: a create reply acted on
-/// with that fault.  T5d / T6b: a timeout / demotion AFTER the record was appended
-/// (AwaitingCommit — the op is in doubt).  T7: an op on a name a DDL op touched in
-/// an earlier boot and none since this boot (A, restart, B).
-enum Timing : uint8_t { T1, T2, T3, T4, T5a, T5b, T5c, T5d, T6, T6b, T7, kTimingCount };
-const char* const kTimingNames[kTimingCount] = {"T1", "T2", "T3", "T4", "T5a", "T5b", "T5c", "T5d", "T6", "T6b", "T7"};
-Timing timingOfFault(Fault f) {
-    switch (f) {
-        case Fault::FailNoCreate:            return T5a;
-        case Fault::FailAfterCreate:         return T5b;
-        case Fault::TimeoutInAwaitingId:     return T5c;
-        case Fault::DemoteInAwaitingId:      return T6;
-        case Fault::TimeoutInAwaitingCommit: return T5d;
-        case Fault::DemoteInAwaitingCommit:  return T6b;
-        case Fault::None:                    break;
-    }
-    return kTimingCount;
-}
+/// The timing classes the stress schedule produces.  T1..T4: the worker's state
+/// when a DDL op is SUBMITTED (idle / behind queued ops / the leader catching up on
+/// a held event / another op in AwaitingCommit).  T5a: an op started while the ISR
+/// is below minIsr (its append refused).  T5c / T5d: a commit timeout released at
+/// once / left held.  T6: a demotion in AwaitingCommit.  T7: an op on a name a DDL
+/// op touched in an earlier boot and none since this boot (A, restart, B).
+enum Timing : uint8_t { T1, T2, T3, T4, T5a, T5c, T5d, T6, T7, kTimingCount };
+const char* const kTimingNames[kTimingCount] = {"T1", "T2", "T3", "T4", "T5a", "T5c", "T5d", "T6", "T7"};
 
+struct Bound { std::string name; uint64_t incarnation; };   // a source bound by id at submit (0 = unbound)
 struct Planned   { Op op; std::string name; Fault fault; std::vector<std::string> sources; };
 struct Submitted {
     int64_t corr; Op op; std::string name; Fault fault;
-    std::vector<std::string> sources;
-    uint16_t sourceErr;   // the view-source rules' verdict at SUBMIT time (0 = sources ok)
-    bool demotedQueued = false;   // still queued when the leader was demoted (I4)
+    std::vector<Bound> sources;
+    bool persistedView = true;   // CREATE VIEW persisted / ALTER VIEW's submit-time persistence
+    bool inDoubt = false;        // struck in AwaitingCommit (timeout / demotion): NotLeader, applied later
 };
 
 const std::vector<std::string> kPool = {"a", "b", "A", "s", "src", "__views", ""};
 // View sources: typed disk (src, src2), typed transient (tsrc), a view's output
-// (vsrc), schema-less static (s), a never-defined name (nosuch), and pool names
-// whose kind changes as the schedule runs (typed / view / orphan / case variant).
+// (vsrc), an untyped topic (s), a never-defined name (nosuch), and pool names whose
+// kind changes as the schedule runs (typed / view / dropped / case variant).
 const std::vector<std::string> kSources = {"src", "src2", "tsrc", "vsrc", "s", "nosuch", "a", "b", "A"};
 constexpr int kSessions = 3;
 constexpr int kOpsPerSession = 40;
 constexpr int kMaxSteps = 50'000;
 constexpr int kMaxDrainIterations = 10'000;
-constexpr uint64_t kSetupDdlOps = 4;   // src, src2 (harness) + tsrc, vsrc (runSeed) before the schedule
+constexpr uint64_t kSetupDdlOps = 5;   // src, src2 (harness) + s, tsrc, vsrc (runSeed) before the schedule
 
 struct Model {
     std::map<std::string, Occupant> occ;       // exact name -> occupant (absent = Free)
-    std::map<std::string, uint16_t> version;
-    std::vector<std::string>        statics;   // schema-less boot topics survive restarts
-    /// KL2: per name, the in-doubt records in log order — the kind each would give
-    /// the name, and whether the HW covers it yet (releaseCommits / a restart).
-    struct InDoubt { Occupant committedAs; bool recordCommitted; };
-    std::map<std::string, std::vector<InDoubt>> inDoubt;
+    std::map<std::string, uint16_t> version;   // the schema version a GetSchema answers
+    std::map<std::string, uint64_t> incarnation;   // bumped whenever the name gets a NEW topic id
+    std::map<std::string, std::vector<std::string>> viewSources;   // live view -> its source names
+    uint64_t nextIncarnation = 1;
+    /// The leader refuses DDL (a demotion or a catch-up on a held event): every op
+    /// that starts now is answered NotLeader.
+    bool refusing = false;
+    bool isrShrunk = false;    // appends refused: an op whose cell succeeds is NotLeader
+    std::optional<Submitted> pending;   // the in-doubt op whose event is not applied yet
 
     Occupant at(const std::string& n) const {
         if (!rune::catalog::isValidTopicName(n)) return Occupant::BadName;
-        if (const auto it = occ.find(n); it != occ.end() && it->second != Occupant::Free) return it->second;
+        if (const auto it = occ.find(n); it != occ.end()) return it->second;
         for (const auto& [m, o] : occ)
-            if (m != n && o != Occupant::Free && rune::catalog::topicNamesFoldEqual(m, n)) return Occupant::CaseVariant;
+            if (m != n && rune::catalog::topicNamesFoldEqual(m, n)) return Occupant::CaseVariant;
         return Occupant::Free;
     }
     Occupant exact(const std::string& n) const {
         const auto it = occ.find(n);
         return it == occ.end() ? Occupant::Free : it->second;
     }
-    /// The plan's view-source rules, on the sources as they stand at SUBMIT time
-    /// (a source is bound by exact name to a topic id then).  Per source, in order:
-    /// a view's output -> 41 (D3b/B9; checked first); not a typed topic (missing,
-    /// schema-less, orphan, case variant) -> 33; a typed transient topic under a
-    /// persisted view -> 37 (Phase 2b E).  Then 2+ sources -> 34: Phase 1 views are
-    /// single-source and the compiler rejects more fail-closed.
-    uint16_t sourceRule(Op op, const std::vector<std::string>& sources) const {
-        for (const std::string& s : sources) {
-            const Occupant o = exact(s);
-            if (o == Occupant::ViewPersisted || o == Occupant::ViewTransient) return kViewSourceIsView;
-            if (o != Occupant::TypedDisk && o != Occupant::TypedTransient) return kViewSourceNotFound;
-            if (o == Occupant::TypedTransient && op == Op::ViewPersisted) return kViewSourceTransient;
-        }
-        return sources.size() > 1 ? kViewFieldUnresolved : kOk;
+    static bool isTyped(Occupant o) { return o == Occupant::TypedDisk || o == Occupant::TypedTransient; }
+    static bool isViewOcc(Occupant o) { return o == Occupant::ViewPersisted || o == Occupant::ViewTransient; }
+    /// A source as the client binds it at SUBMIT time (GetTopicSchema): a typed topic
+    /// or a view output binds to its id (this incarnation); anything else is unbound.
+    Bound bind(const std::string& n) const {
+        const Occupant o = exact(n);
+        if (!isTyped(o) && !isViewOcc(o)) return Bound{n, 0};
+        return Bound{n, incarnation.at(n)};
     }
-    /// Apply `s` (FIFO order) and return its expected answer.  The table's
-    /// admin-detected rejections (createRequests == 0: 40, 32, 25 on a typed name)
-    /// precede the source rules; the source rules precede the sink request, so they
-    /// precede every control-detected cell (createRequests == 1) and every fault.
-    uint16_t apply(const Submitted& s) {
+    /// The plan's view-source rules, evaluated when the op STARTS on the ids bound
+    /// at submit.  Per source, in order: unbound or no longer that id -> 33; a
+    /// view's output -> 41 (D3b/B9); not a typed topic -> 33; a typed transient
+    /// topic under a persisted view -> 37 (Phase 2b E).  Then 2+ sources -> 34.
+    uint16_t sourceRule(const Submitted& s) const {
+        for (const Bound& b : s.sources) {
+            const auto it = incarnation.find(b.name);
+            if (b.incarnation == 0 || it == incarnation.end() || it->second != b.incarnation) return kViewSourceNotFound;
+            const Occupant o = exact(b.name);
+            if (isViewOcc(o)) return kViewSourceIsView;
+            if (!isTyped(o)) return kViewSourceNotFound;
+            if (o == Occupant::TypedTransient && s.persistedView) return kViewSourceTransient;
+        }
+        return s.sources.size() > 1 ? kViewFieldUnresolved : kOk;
+    }
+    bool readByAView(const std::string& topic) const {
+        for (const auto& [v, srcs] : viewSources)
+            for (const std::string& x : srcs) if (x == topic) return true;
+        return false;
+    }
+    /// The answer `s` gets on the state as it stands (no effect applied).
+    uint16_t verdict(const Submitted& s) const {
         const Occupant o = at(s.name);
-        if (s.demotedQueued) return demotedAnswer(o, s.op);
         const Cell c = expectedCell(o, s.op);
-        if (isView(s.op) && c.createRequests == 1 && s.sourceErr != kOk) return s.sourceErr;
-        if (c.createRequests == 1 && isCommitFault(s.fault)) {
-            // The fault strikes in AwaitingCommit — only an op whose cell succeeds
-            // gets there (a control-detected rejection ends at the reply).
-            if (c.code != kOk) return c.code;
-            if (o == Occupant::Free) occ[s.name] = orphanOf(s.op);   // live: an orphan
-            inDoubt[s.name].push_back(InDoubt{occupantAfterSuccess(o, s.op), false});
-            return kInternal;
+        if (c.code != kOk) return c.code;
+        if (readsSources(s.op)) {
+            if (const uint16_t e = sourceRule(s); e != kOk) return e;
         }
-        if (c.createRequests == 1 && s.fault != Fault::None) {
-            if (s.fault != Fault::FailNoCreate && o == Occupant::Free) occ[s.name] = orphanOf(s.op);
-            return kInternal;
-        }
-        if (c.code == kOk) {
-            if (isCreate(s.op)) { occ[s.name] = occupantAfterSuccess(o, s.op); version[s.name] = 1; }
-            else if (isAlter(s.op)) version[s.name] = static_cast<uint16_t>(version[s.name] + 1);
-        }
-        return c.code;
+        if (s.op == Op::DropTopic && readByAView(s.name)) return kInvalidRequest;
+        return kOk;
     }
-    /// I4: an op still queued when the leader was demoted is answered on the next
-    /// admin tick: a DefineTopic's admin-detected checks (name rule 40, an exact
-    /// typed / view name 25) precede the leader guard; everything else is Internal.
-    uint16_t demotedAnswer(Occupant o, Op op) const {
-        if (o == Occupant::BadName && isCreate(op)) return kInvalidTopicName;
-        if (isDefine(op) && (o == Occupant::TypedDisk || o == Occupant::TypedTransient ||
-                             o == Occupant::ViewPersisted || o == Occupant::ViewTransient))
-            return kTopicExists;
-        return kInternal;
-    }
-    static bool unclaimed(Occupant o) {
-        return o == Occupant::Free || o == Occupant::SchemaLessDisk || o == Occupant::SchemaLessTransient ||
-               o == Occupant::OrphanSink;
-    }
-    /// The HW now covers every appended record (releaseCommits while leading).
-    void commitsReleased() {
-        for (auto& [n, v] : inDoubt) for (InDoubt& d : v) d.recordCommitted = true;
-    }
-    /// A promotion replays the committed catalogs: a committed in-doubt record on a
-    /// name nothing claimed live since becomes that name's kind.  `all` (a restart:
-    /// the rebooted follower learns the HW = every appended record) resolves all.
-    void resolveInDoubt(bool all) {
-        for (auto it = inDoubt.begin(); it != inDoubt.end();) {
-            std::vector<InDoubt>& v = it->second;
-            const Occupant* last = nullptr;
-            std::size_t keepFrom = 0;
-            for (std::size_t i = 0; i < v.size(); ++i)
-                if (all || v[i].recordCommitted) { last = &v[i].committedAs; keepFrom = i + 1; }
-            if (last != nullptr && unclaimed(exact(it->first))) {
-                occ[it->first] = *last;
-                version[it->first] = 1;
+    void applyEffect(const Submitted& s) {
+        const Occupant o = at(s.name);
+        switch (s.op) {
+            case Op::DefineDisk: case Op::DefineTransient:
+                if (o == Occupant::Free) incarnation[s.name] = nextIncarnation++;
+                occ[s.name] = occupantAfterSuccess(o, s.op);
+                version[s.name] = 1;
+                return;
+            case Op::ViewPersisted: case Op::ViewTransient:
+            case Op::AlterView: {
+                occ[s.name] = s.persistedView ? Occupant::ViewPersisted : Occupant::ViewTransient;
+                incarnation[s.name] = nextIncarnation++;   // a (fresh) sink id
+                version[s.name] = 1;                       // its output's schema
+                std::vector<std::string> names;
+                for (const Bound& b : s.sources) names.push_back(b.name);
+                viewSources[s.name] = std::move(names);
+                return;
             }
-            v.erase(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(keepFrom));
-            it = v.empty() ? inDoubt.erase(it) : std::next(it);
+            case Op::DropTopic: case Op::DropView:
+                occ.erase(s.name); version.erase(s.name); incarnation.erase(s.name); viewSources.erase(s.name);
+                return;
+            case Op::AlterTopicConfig: case Op::GetSchema:
+                return;
+            default:   // every ALTER bumps the schema version
+                version[s.name] = static_cast<uint16_t>(version[s.name] + 1);
+                return;
         }
     }
-    void restart() {   // an orphan's name is free again (it became __orphan.<id> or vanished)
-        resolveInDoubt(/*all=*/true);
-        for (auto& [n, o] : occ) {
-            const bool schemaLess = o == Occupant::SchemaLessDisk || o == Occupant::SchemaLessTransient ||
-                                    o == Occupant::OrphanSink;
-            bool isStatic = false;
-            for (const std::string& s : statics) isStatic = isStatic || s == n;
-            if (schemaLess && !isStatic) o = Occupant::Free;
+    /// Apply `s` (FIFO order) and return its expected answer.
+    uint16_t apply(const Submitted& s) {
+        if (s.inDoubt) {
+            // It was accepted and appended (only an accepted op awaits a commit):
+            // answered NotLeader; its effect lands once the event is applied.
+            if (refusing) pending = s; else applyEffect(s);
+            return kNotLeader;
         }
+        if (refusing) return kNotLeader;
+        const uint16_t v = verdict(s);
+        if (v != kOk) return v;
+        if (isrShrunk) return kNotLeader;   // the append is refused: nothing appended
+        applyEffect(s);
+        return kOk;
+    }
+    /// The held in-doubt event commits and is applied; the leader serves again.
+    void resolve() {
+        if (pending) applyEffect(*pending);
+        pending.reset();
+        refusing = false;
     }
     int views() const {
         int n = 0;
-        for (const auto& [name, o] : occ) n += (o == Occupant::ViewPersisted || o == Occupant::ViewTransient) ? 1 : 0;
+        for (const auto& [name, o] : occ) n += isViewOcc(o) ? 1 : 0;
         return n;
     }
 };
 
 Op drawOp(std::mt19937_64& rng) {
     static const Op ops[] = {Op::DefineDisk, Op::DefineTransient, Op::ViewPersisted, Op::ViewTransient,
-                             Op::AlterAdd, Op::AlterSetCompat, Op::GetSchema};
+                             Op::AlterAdd, Op::AlterSetCompat, Op::GetSchema,
+                             Op::DropTopic, Op::DropView, Op::AlterView, Op::AlterTopicConfig};
     return ops[rng() % (sizeof(ops) / sizeof(ops[0]))];
 }
 Fault drawFault(std::mt19937_64& rng) {
     const uint64_t r = rng() % 100;
-    if (r < 70) return Fault::None;
-    return static_cast<Fault>(1 + (r % (kFaultCount - 1)));
+    if (r < 76) return Fault::None;
+    return r < 88 ? Fault::TimeoutInAwaitingCommit : Fault::DemoteInAwaitingCommit;
 }
 std::vector<std::string> drawSources(std::mt19937_64& rng) {
     std::vector<std::string> v{kSources[rng() % kSources.size()]};
@@ -272,8 +255,7 @@ void expectCatalogMatchesModel(DdlHarness& h, const Model& m, const char* when) 
     for (const std::string& n : names) {
         SCOPED_TRACE(std::string(when) + " name='" + n + "'");
         const CatalogEntry* e = findEntry(cat, n);
-        const auto it = m.occ.find(n);
-        const Occupant o = (it == m.occ.end() || !rune::catalog::isValidTopicName(n)) ? Occupant::Free : it->second;
+        const Occupant o = rune::catalog::isValidTopicName(n) ? m.exact(n) : Occupant::Free;
         switch (o) {
             case Occupant::Free:
                 EXPECT_EQ(e, nullptr);
@@ -291,7 +273,7 @@ void expectCatalogMatchesModel(DdlHarness& h, const Model& m, const char* when) 
                 EXPECT_EQ(e->kind, EntryKind::View);
                 EXPECT_EQ(e->persistence, o == Occupant::ViewTransient ? PersistenceMode::Transient : PersistenceMode::Disk);
                 break;
-            default:   // SchemaLessDisk / SchemaLessTransient / OrphanSink
+            default:   // SchemaLessDisk / SchemaLessTransient
                 ASSERT_NE(e, nullptr);
                 EXPECT_EQ(e->kind, EntryKind::SchemaLess);
                 EXPECT_EQ(e->persistence, o == Occupant::SchemaLessTransient ? PersistenceMode::Transient : PersistenceMode::Disk);
@@ -313,10 +295,12 @@ void expectNoSteadyStateAlloc(DdlHarness& h, const char* what) {
 struct StressStats {
     uint64_t steps = 0, ddl = 0, reads = 0, views = 0, twoSourceViews = 0, restarts = 0, flaps = 0, flapsAfterRestart = 0;
     uint64_t allocGates = 0, heldAfterRestart = 0;   // HW-gate waits in a rebooted (multi-node) broker
-    uint64_t faults[kFaultCount] = {};      // create replies acted on, by Fault
-    uint64_t inDoubtOps = 0;                // ops actually struck in AwaitingCommit
-    uint64_t demotedQueued = 0;             // queued ops answered by a demotion (I4)
-    uint64_t timing[kTimingCount] = {};     // Task 9 timing classes produced
+    uint64_t faults[kFaultCount] = {};      // in-flight ops struck, by Fault
+    uint64_t inDoubtOps = 0;                // ops answered NotLeader in AwaitingCommit
+    uint64_t heldInDoubt = 0;               // ... whose event stayed held across later steps
+    uint64_t refusedQueued = 0;             // ops answered NotLeader while the leader refused DDL
+    uint64_t isrWindows = 0;                // ISR-below-minIsr windows opened
+    uint64_t timing[kTimingCount] = {};     // timing classes produced
     std::map<uint16_t, uint64_t> codes;     // DDL + read answers, by error code
 };
 StressStats gTotals;   // summed over the seeds this process ran (reported at the end)
@@ -328,9 +312,13 @@ void runSeed(uint64_t seed) {
 
     DdlHarnessOptions o;
     o.holdCommits = true;   // replica set {1,2} for the whole run, restarts included
-    TopicSpec s; s.name = "s"; s.partitionCount = 1;
-    o.statics.push_back(s);
-    DdlHarness h(o);   // pre-defines src, src2 (typed disk v1)
+    DdlHarness h(o);        // pre-defines src, src2 (typed disk v1)
+    {
+        DefineTopicMsg s; s.name = "s"; s.partitionCount = 1;   // untyped (was a static RUNE_TOPICS topic)
+        const int64_t c = h.submitRawDefine(std::move(s));
+        h.settle();
+        ASSERT_TRUE(h.response(c).has_value() && h.response(c)->err == kOk) << "setup s";
+    }
     for (const auto& [op, name] : {std::pair{Op::DefineTransient, "tsrc"}, std::pair{Op::ViewPersisted, "vsrc"}}) {
         const int64_t c = h.submit(op, name);   // vsrc reads src
         h.settle();
@@ -338,22 +326,22 @@ void runSeed(uint64_t seed) {
     }
     ASSERT_TRUE(h.violations().empty()) << h.violationText();
     ASSERT_EQ(h.startedTotal(), kSetupDdlOps);
-    h.setControl(ControlMode::Hold);
     const int commitInstalls0 = h.viewPlanPushes();
 
     Model m;
-    m.statics = {"s"};
-    m.occ["s"] = Occupant::SchemaLessDisk;
+    for (const char* n : {"src", "src2", "s", "tsrc", "vsrc"}) m.incarnation[n] = m.nextIncarnation++;
+    m.occ["s"]    = Occupant::SchemaLessDisk;
     m.occ["src"]  = Occupant::TypedDisk;      m.version["src"]  = 1;
     m.occ["src2"] = Occupant::TypedDisk;      m.version["src2"] = 1;
     m.occ["tsrc"] = Occupant::TypedTransient; m.version["tsrc"] = 1;
     m.occ["vsrc"] = Occupant::ViewPersisted;  m.version["vsrc"] = 1;
+    m.viewSources["vsrc"] = {"src"};
 
     std::vector<std::vector<Planned>> scripts(kSessions);
     for (auto& sc : scripts)
         for (int i = 0; i < kOpsPerSession; ++i) {
             Planned p{drawOp(rng), kPool[rng() % kPool.size()], drawFault(rng), {}};
-            if (isView(p.op)) p.sources = drawSources(rng);
+            if (readsSources(p.op)) p.sources = drawSources(rng);
             sc.push_back(std::move(p));
         }
     std::vector<int> next(kSessions, 0);
@@ -367,9 +355,6 @@ void runSeed(uint64_t seed) {
     };
 
     // The event trace: every scheduler action, in order (runs of ticks coalesced).
-    // On a failure it is printed twice: the whole reproducing prefix, and the
-    // minimal slice — the events on the failing name (case-folded: a case variant
-    // collides) plus every leadership flap and restart.
     struct Event { std::string text; std::string name; bool global; int ticks; };
     std::vector<Event> trace;
     std::string failName;
@@ -403,100 +388,108 @@ void runSeed(uint64_t seed) {
             const Submitted& sub = ddl[applied];
             const std::optional<Response> r = h.response(sub.corr);
             if (!r) break;
+            const bool refusing = m.refusing;
+            const bool hadPending = m.pending.has_value();
             const uint16_t want = m.apply(sub);
             ++st.codes[r->err];
-            if (isView(sub.op) && want == kOk) ++expectedCommitInstalls;
+            if (refusing && !sub.inDoubt) ++st.refusedQueued;
+            const bool installs = readsSources(sub.op) && (want == kOk || sub.inDoubt);
+            // A view installed now (an OK, or an in-doubt one applied at once); a held one at resolve().
+            if (installs && !(sub.inDoubt && m.pending.has_value() && !hadPending)) ++expectedCommitInstalls;
             if (r->err != want) fail(sub.name);
             EXPECT_EQ(r->err, want) << "op#" << applied << " " << opName(sub.op) << " '" << sub.name
                                     << "' fault=" << faultName(sub.fault)
-                                    << (isView(sub.op) ? " sources=" + joined(sub.sources) : std::string());
+                                    << (readsSources(sub.op) ? " sources=" + [&] {
+                                           std::string x;
+                                           for (const Bound& b : sub.sources) x += (x.empty() ? "" : ",") + b.name;
+                                           return x;
+                                       }() : std::string());
             ++applied;
         }
     };
-    auto expectRecoveryInstalls = [&](int before, const char* when) {
-        if (h.recoveryViewInstalls() - before != m.views()) fail("");
-        EXPECT_EQ(h.recoveryViewInstalls() - before, m.views()) << "recovery view installs at " << when;
+    /// The model's in-doubt event is applied (its commit released, or a restart).
+    auto resolveModel = [&] {
+        if (m.pending && readsSources(m.pending->op)) ++expectedCommitInstalls;
+        m.resolve();
     };
-    /// I4 (production truth): a demotion answers the in-flight op at once, and the
-    /// admin thread — which keeps ticking while demoted — answers every queued op
-    /// on the following ticks (the leader guard).  Marks those ops for the model.
-    auto demoteAndDrainQueue = [&] {
-        const std::size_t firstQueued = h.startedTotal() - kSetupDdlOps;   // after the in-flight op
-        h.demote();
-        for (std::size_t i = firstQueued; i < ddl.size(); ++i) { ddl[i].demotedQueued = true; ++st.demotedQueued; }
+    /// Release a held in-doubt event: first every queued op is answered NotLeader
+    /// (they bound their sources on the state without it), then the HW covers the
+    /// event, the leader applies it and serves again.
+    auto releaseHeldEvent = [&] {
         for (int i = 0; i < kMaxDrainIterations && h.worker().pendingCount() > 0; ++i) h.tick();
-        if (h.worker().pendingCount() > 0) ADD_FAILURE() << "the demoted admin thread did not drain its queue";
+        processAnswers();
+        note("release the held event", {}, true);
+        h.releaseCommits();
+        for (int i = 0; i < kMaxDrainIterations && !h.worker().isLeader(); ++i) h.tick();
+        if (!h.worker().isLeader()) ADD_FAILURE() << "the leader never caught up on the released event";
+        resolveModel();
     };
-    auto flap = [&](auto&& whileDemoted) {
-        const int rec0 = h.recoveryViewInstalls();
-        ++st.flaps;
-        if (st.restarts > 0) ++st.flapsAfterRestart;
-        demoteAndDrainQueue();
-        whileDemoted();
-        h.promote();
-        processAnswers();          // the demoted ops' answers (they committed no view)
-        m.resolveInDoubt(/*all=*/false);   // the promotion replays every committed record
-        expectRecoveryInstalls(rec0, "a leadership flap");
-    };
-    auto actOnCreate = [&] {
-        if (!h.worker().hasInFlight()) { note("deliver stale create", {}, true); h.deliverCreate(); return; }
-        const Submitted& in = ddl[h.startedTotal() - kSetupDdlOps - 1];
-        const bool demotes = in.fault == Fault::DemoteInAwaitingId || in.fault == Fault::DemoteInAwaitingCommit;
-        note(std::string("act on create of ") + opName(in.op) + " '" + in.name + "': " + faultName(in.fault),
-             in.name, demotes);
+    /// The in-flight op (the oldest unanswered, FIFO) takes its planned fault.
+    auto actOnInFlight = [&] {
+        processAnswers();
+        Submitted& in = ddl[applied];
+        note(std::string("act on ") + opName(in.op) + " '" + in.name + "': " + faultName(in.fault), in.name,
+             in.fault == Fault::DemoteInAwaitingCommit);
         ++st.faults[static_cast<int>(in.fault)];
-        if (const Timing t = timingOfFault(in.fault); t != kTimingCount) ++st.timing[t];
         switch (in.fault) {
-            case Fault::None:            h.deliverCreate(); break;
-            case Fault::FailNoCreate:    h.failCreate(false); break;
-            case Fault::FailAfterCreate: h.failCreate(true); break;
-            case Fault::TimeoutInAwaitingId:
-                h.advance(AdminWorker::ddlTimeoutNs() + 1'000'000);
-                h.tick();            // answers the op Internal (may start the next op)
-                h.deliverCreate();   // the stale reply (FIFO: it is the oldest request)
+            case Fault::None:
+                h.releaseCommits();
+                h.tick();   // applied + answered (may start the next op)
                 break;
-            case Fault::DemoteInAwaitingId:
-                // B4: the demotion answers the in-flight op Internal; the stale reply
-                // then creates its topic (an orphan).
-                flap([&] { h.deliverCreate(); });
-                break;
-            case Fault::TimeoutInAwaitingCommit:
-            case Fault::DemoteInAwaitingCommit: {
-                h.deliverCreate();   // the op appends its record (if its cell succeeds)
-                const std::string_view state = h.worker().inFlightStateName();
-                if (state != "DefineAwaitingCommit" && state != "ViewAwaitingCommit") break;   // ended at the reply
+            case Fault::TimeoutInAwaitingCommit: {
+                in.inDoubt = true;
                 ++st.inDoubtOps;
-                if (in.fault == Fault::TimeoutInAwaitingCommit) {
-                    h.advance(AdminWorker::ddlTimeoutNs() + 1'000'000);
-                    h.tick();        // answered Internal in AwaitingCommit: in doubt (KL2)
-                } else {
-                    flap([] {});
-                }
+                m.refusing = true;
+                h.advance(AdminWorker::ddlTimeoutNs() + 1'000'000);
+                h.tick();   // NotLeader (F13); the leader catches up: queued ops NotLeader
+                processAnswers();
+                if (rng() % 2 == 0) { ++st.timing[T5c]; releaseHeldEvent(); }
+                else { ++st.timing[T5d]; ++st.heldInDoubt; note("the event stays held", {}, true); }
+                break;
+            }
+            case Fault::DemoteInAwaitingCommit: {
+                in.inDoubt = true;
+                ++st.inDoubtOps;
+                ++st.timing[T6];
+                ++st.flaps;
+                if (st.restarts > 0) ++st.flapsAfterRestart;
+                const int rec0 = h.recoveryViewInstalls();
+                m.refusing = true;
+                h.demote();   // the in-flight op: NotLeader at once (spec §5.2)
+                for (int i = 0; i < kMaxDrainIterations && h.worker().pendingCount() > 0; ++i) h.tick();
+                if (h.worker().pendingCount() > 0) ADD_FAILURE() << "the demoted admin thread did not drain its queue";
+                processAnswers();
+                h.promote();
+                releaseHeldEvent();
+                if (h.recoveryViewInstalls() != rec0) fail("");
+                EXPECT_EQ(h.recoveryViewInstalls(), rec0) << "a leadership flap re-installs no view";
                 break;
             }
         }
     };
     /// A restart: drain to quiescence (the harness restarts only then), restart,
-    /// check the recovered views were re-installed.
+    /// check the boot replay re-installed every live view; a held event is applied.
     auto restartNow = [&]() -> bool {
         note("restart: drain", {}, true);
         for (int i = 0; !h.quiescent(); ++i) {
             if (i == kMaxDrainIterations) { ADD_FAILURE() << "restart drain did not quiesce\n" << dumpTrace(); return false; }
-            if (h.hasPendingCreate()) actOnCreate();
-            else if (h.commitHeld()) { h.releaseCommits(); m.commitsReleased(); }
+            if (h.worker().hasInFlight() && h.commitHeld()) actOnInFlight();
             else h.tick();
             processAnswers();
         }
         processAnswers();
+        if (m.isrShrunk) { h.restoreIsr(); m.isrShrunk = false; }
         note("restart", {}, true);
         ++st.restarts;
         for (const std::string& n : touchedThisBoot)
             if (!contains(touchedEarlierBoot, n)) touchedEarlierBoot.push_back(n);
         touchedThisBoot.clear();
         const int rec0 = h.recoveryViewInstalls();
-        m.restart();
+        const int viewsAtCheckpoint = m.views();   // a held event is not in the boot replay
         h.restart();
-        expectRecoveryInstalls(rec0, "a restart");
+        if (h.recoveryViewInstalls() - rec0 != viewsAtCheckpoint) fail("");
+        EXPECT_EQ(h.recoveryViewInstalls() - rec0, viewsAtCheckpoint) << "recovery view installs at a restart";
+        resolveModel();   // the rebooted leader learned the HW: the held event is applied live
         return true;
     };
     auto scriptsDone = [&] {
@@ -506,7 +499,7 @@ void runSeed(uint64_t seed) {
 
     int step = 0;
     for (; step < kMaxSteps; ++step) {
-        if (scriptsDone() && h.quiescent()) break;
+        if (scriptsDone() && h.quiescent() && !m.refusing && !m.isrShrunk) break;
         const uint64_t a = rng() % 100;
         if (a < 28) {
             const int si = static_cast<int>(rng() % kSessions);
@@ -526,50 +519,67 @@ void runSeed(uint64_t seed) {
                 if (r->err == kOk) EXPECT_EQ(r->version, m.version[p.name]) << "GetSchema '" << p.name << "'";
             } else {
                 processAnswers();   // the model must stand where the registry stands (sources bind now)
-                // Timing class of this submission.
                 Timing t = T1;
                 if (h.worker().pendingCount() > 0) t = T2;
-                else if (h.worker().hasInFlight()) t = h.hasPendingCreate() ? T3 : T4;
+                else if (m.refusing) t = T3;
+                else if (h.worker().hasInFlight()) t = T4;
                 ++st.timing[t];
+                if (m.isrShrunk) ++st.timing[T5a];
                 if (contains(touchedEarlierBoot, p.name) && !contains(touchedThisBoot, p.name)) ++st.timing[T7];
                 if (!contains(touchedThisBoot, p.name)) touchedThisBoot.push_back(p.name);
 
-                const uint16_t srcErr = isView(p.op) ? m.sourceRule(p.op, p.sources) : kOk;
+                Submitted sub{0, p.op, p.name, p.fault, {}, p.op != Op::ViewTransient, false};
+                if (p.op == Op::AlterView) {
+                    const ViewRecord* v = h.views().byName(p.name);
+                    sub.persistedView = v == nullptr || v->persistence == 0;   // read at SUBMIT time
+                }
+                for (const std::string& src : p.sources) sub.sources.push_back(m.bind(src));
                 note("session " + std::to_string(si) + " submit " + opName(p.op) + " '" + p.name +
                      "' fault=" + faultName(p.fault) +
-                     (isView(p.op) ? " sources=" + joined(p.sources) : std::string()), p.name);
+                     (readsSources(p.op) ? " sources=" + joined(p.sources) : std::string()), p.name);
                 ++st.ddl;
-                if (isView(p.op)) { ++st.views; if (p.sources.size() > 1) ++st.twoSourceViews; }
-                const int64_t c = isView(p.op) ? h.submitView(p.op, p.name, p.sources) : h.submit(p.op, p.name);
-                ddl.push_back(Submitted{c, p.op, p.name, p.fault, p.sources, srcErr});
+                if (readsSources(p.op)) { ++st.views; if (p.sources.size() > 1) ++st.twoSourceViews; }
+                sub.corr = readsSources(p.op) ? h.submitView(p.op, p.name, p.sources) : h.submit(p.op, p.name);
+                ddl.push_back(std::move(sub));
             }
         } else if (a < 64) {
             noteTick();
             h.tick();
-        } else if (a < 79) {
-            if (h.hasPendingCreate()) {
-                if (h.worker().hasInFlight() && rng() % 4 == 0) {   // parked in AwaitingId
-                    note("alloc gate: create-reply wait");
+        } else if (a < 82) {
+            // A held HW: the in-flight op takes its fault, or a held in-doubt event
+            // is released.  Only a genuinely held commit is a steady-state wait.
+            if (h.worker().hasInFlight() && h.commitHeld()) {
+                if (rng() % 4 == 0) {
+                    note("alloc gate: HW-gate wait");
                     ++st.allocGates;
-                    expectNoSteadyStateAlloc(h, "create-reply wait");
+                    if (st.restarts > 0) ++st.heldAfterRestart;
+                    expectNoSteadyStateAlloc(h, "HW-gate wait");
                 }
-                actOnCreate();
+                actOnInFlight();
+            } else if (m.refusing && !h.worker().hasInFlight()) {
+                if (h.worker().pendingCount() == 0 && rng() % 3 == 0) {
+                    note("alloc gate: catching-up wait");
+                    ++st.allocGates;
+                    expectNoSteadyStateAlloc(h, "catching-up wait");
+                }
+                releaseHeldEvent();
             }
-        } else if (a < 89) {
-            // Only a genuinely held commit is a steady-state HW-gate wait: once the HW
-            // covers the record the next tick commits + answers + starts the next op
-            // (the cold path, which may allocate).
-            if (h.worker().hasInFlight() && !h.hasPendingCreate() && h.commitHeld()) {
-                note("alloc gate: HW-gate wait");
-                ++st.allocGates;
-                if (st.restarts > 0) ++st.heldAfterRestart;
-                expectNoSteadyStateAlloc(h, "HW-gate wait");
+        } else if (a < 87) {
+            // An ISR-below-minIsr window opens or closes (never over an in-flight op
+            // or a held event: the leadership change would release it).
+            processAnswers();
+            if (m.isrShrunk) {
+                note("isr restored", {}, true);
+                h.restoreIsr();
+                m.isrShrunk = false;
+            } else if (!h.worker().hasInFlight() && !m.refusing) {
+                note("isr below minIsr", {}, true);
+                ++st.isrWindows;
+                h.shrinkIsr();
+                m.isrShrunk = true;
             }
-            note("release commits");
-            h.releaseCommits();
-            m.commitsReleased();
         } else if (a < 93) {
-            if (h.quiescent()) {
+            if (h.quiescent() && !m.refusing) {
                 note("alloc gate: idle");
                 ++st.allocGates;
                 expectNoSteadyStateAlloc(h, "idle");
@@ -587,15 +597,14 @@ void runSeed(uint64_t seed) {
     processAnswers();
     EXPECT_EQ(applied, ddl.size()) << "every DDL op answered";
     EXPECT_EQ(h.viewPlanPushes() - commitInstalls0, expectedCommitInstalls)
-        << "one worker install per committed CREATE VIEW (recovery installs counted apart)";
+        << "one live install per applied CREATE / ALTER VIEW (boot replay installs counted apart)";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
     expectCatalogMatchesModel(h, m, "end");
     expectNoSteadyStateAlloc(h, "idle at end");
 
     const int rec0 = h.recoveryViewInstalls();
-    m.restart();
     h.restart();
-    expectRecoveryInstalls(rec0, "the final restart");
+    EXPECT_EQ(h.recoveryViewInstalls() - rec0, m.views()) << "recovery view installs at the final restart";
     expectCatalogMatchesModel(h, m, "after restart");
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
     if (::testing::Test::HasFailure()) ADD_FAILURE() << "trace:\n" << dumpTrace();
@@ -603,11 +612,14 @@ void runSeed(uint64_t seed) {
     st.steps = static_cast<uint64_t>(step);
     gTotals.steps += st.steps; gTotals.ddl += st.ddl; gTotals.reads += st.reads;
     gTotals.views += st.views; gTotals.twoSourceViews += st.twoSourceViews;
-    gTotals.restarts += st.restarts; gTotals.heldAfterRestart += st.heldAfterRestart; gTotals.flaps += st.flaps; gTotals.flapsAfterRestart += st.flapsAfterRestart;
+    gTotals.restarts += st.restarts; gTotals.heldAfterRestart += st.heldAfterRestart; gTotals.flaps += st.flaps;
+    gTotals.flapsAfterRestart += st.flapsAfterRestart;
     gTotals.allocGates += st.allocGates;
     for (int i = 0; i < kFaultCount; ++i) gTotals.faults[i] += st.faults[i];
     gTotals.inDoubtOps += st.inDoubtOps;
-    gTotals.demotedQueued += st.demotedQueued;
+    gTotals.heldInDoubt += st.heldInDoubt;
+    gTotals.refusedQueued += st.refusedQueued;
+    gTotals.isrWindows += st.isrWindows;
     for (int i = 0; i < kTimingCount; ++i) gTotals.timing[i] += st.timing[i];
     for (const auto& [c, n] : st.codes) gTotals.codes[c] += n;
     ::testing::Test::RecordProperty("steps", static_cast<int>(st.steps));
@@ -643,13 +655,11 @@ class StressTotalsPrinter : public ::testing::EmptyTestEventListener {
         line += std::string(")") + " heldCommitsAfterRestart=" + std::to_string(t.heldAfterRestart) +
                 " flaps=" + std::to_string(t.flaps) + " (after a restart " + std::to_string(t.flapsAfterRestart) + ")" +
                 " allocGates=" + std::to_string(t.allocGates);
-        line += " | createReplies ok=" + std::to_string(t.faults[0]) + " failNoCreate=" + std::to_string(t.faults[1]) +
-                " failAfterCreate=" + std::to_string(t.faults[2]) + " timeout=" + std::to_string(t.faults[3]) +
-                " demote=" + std::to_string(t.faults[4]) +
-                " timeoutAfterAppend=" + std::to_string(t.faults[5]) +
-                " demoteAfterAppend=" + std::to_string(t.faults[6]) +
-                " (in doubt " + std::to_string(t.inDoubtOps) + ")" +
-                " demotedQueued=" + std::to_string(t.demotedQueued);
+        line += " | inFlight ok=" + std::to_string(t.faults[0]) + " timeout=" + std::to_string(t.faults[1]) +
+                " demote=" + std::to_string(t.faults[2]) +
+                " (in doubt " + std::to_string(t.inDoubtOps) + ", held " + std::to_string(t.heldInDoubt) + ")" +
+                " refusedQueued=" + std::to_string(t.refusedQueued) +
+                " isrWindows=" + std::to_string(t.isrWindows);
         line += " | codes";
         for (const auto& [c, n] : t.codes) line += " " + std::to_string(c) + "=" + std::to_string(n);
         line += " | timing";

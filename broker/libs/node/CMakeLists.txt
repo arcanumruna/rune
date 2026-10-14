@@ -570,15 +570,13 @@ if(BUILD_TESTING)
     # Occupant x Op matrix and the pair x timing matrix.  On-host (no Aeron),
     # deterministic.  Every suite name contains "Regression".
     # ---------------------------------------------------------------------------
-    # Catalog history Task 9: DdlHarness.h (and the suites below built on it)
-    # drives the deleted create-topic round-trip, its __orphan placeholders and
-    # static RUNE_TOPICS occupants.  Task 10 ports the harness onto CatalogDdlRig
-    # — their error-code expectations stay binding — and re-adds
-    # DdlHarnessRegressionTest / DdlOccupantMatrixRegressionTest /
-    # DdlPairTimingMatrixRegressionTest here, rune_ddl_stress_tests and
-    # rune_ddl_broker_tests.  Until then they are NOT built (an explicit gap,
-    # recorded in the Task 9 report — never a silently skipped suite).
+    # Catalog history Task 10: DdlHarness.h is built on CatalogDdlRig (the
+    # __catalog write path); the suites below are ported to it — every former cell
+    # restored or explicitly ruled out (task-10 report).
     add_executable(rune_ddl_conformance_tests
+        tests/node/DdlHarnessRegressionTest.cpp
+        tests/node/DdlOccupantMatrixRegressionTest.cpp
+        tests/node/DdlPairTimingMatrixRegressionTest.cpp
         tests/node/DdlFinalFixRegressionTest.cpp)
     target_include_directories(rune_ddl_conformance_tests PRIVATE
         ${RUNE_PROTOCOL_INCLUDE}
@@ -594,8 +592,21 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT 120)
 
     # DDL conformance plan Task 10: seeded model-checked DDL stress + the admin
-    # steady-state zero-alloc gate (rune_ddl_stress_tests) — ported by catalog
-    # history Task 10 (see rune_ddl_conformance_tests above).
+    # steady-state zero-alloc gate.  Own executable (replaces global operator new).
+    # Ported to the catalog write path by catalog history Task 10.
+    add_executable(rune_ddl_stress_tests
+        tests/node/DdlStressRegressionTest.cpp)
+    target_include_directories(rune_ddl_stress_tests PRIVATE
+        ${RUNE_PROTOCOL_INCLUDE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    target_link_libraries(rune_ddl_stress_tests PRIVATE
+        rune_node
+        rune_view
+        rune_replication
+        rune_codec
+        GTest::gtest_main)
+    gtest_discover_tests(rune_ddl_stress_tests
+        PROPERTIES TIMEOUT 180)
 
     # ---------------------------------------------------------------------------
     # Task 20: GetViewRowRegressionTest — the GetViewRow point-read path (real
@@ -1040,8 +1051,22 @@ if(BUILD_TESTING)
                 PROPERTIES TIMEOUT 60 RESOURCE_LOCK rune_udp_ports
                 ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
-            # DDL conformance plan Task 12 (rune_ddl_broker_tests): ported by
-            # catalog history Task 10 (see rune_ddl_conformance_tests above).
+            # DDL conformance plan Task 12: DDL serialization + name collisions over
+            # a REAL single-node BrokerNode and real Aeron (T1/T2/T3-T4/T7) — on the
+            # __catalog write path since catalog history Task 10.
+            add_executable(rune_ddl_broker_tests
+                tests/integration/DdlConformanceBrokerRegressionTest.cpp)
+            target_include_directories(rune_ddl_broker_tests PRIVATE
+                ${RUNE_PROTOCOL_INCLUDE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+            target_link_libraries(rune_ddl_broker_tests PRIVATE
+                rune_node
+                rune_view
+                aeron::aeron
+                GTest::gtest_main)
+            gtest_discover_tests(rune_ddl_broker_tests
+                PROPERTIES TIMEOUT 180 RESOURCE_LOCK rune_udp_ports
+                ENVIRONMENT "${RUNE_AERON_TSAN_ENV}")
 
             # EmbeddedDriver: one driver, one pumping thread (spec §3.6).
             add_executable(rune_embedded_driver_tests tests/node/EmbeddedDriverTest.cpp)

@@ -116,11 +116,21 @@ public:
     /// each follower in it starts SILENT (resumeFollower lets it fetch).
     void becomeServingLeader(std::vector<int32_t> isr = {}) {
         if (isr.empty()) {
-            for (int32_t b = 1; b <= brokers_; ++b) isr.push_back(b);
             silent_.clear();
         } else {
             for (int32_t f : isr) if (f != kSelf) silent_.insert(f);
         }
+        assumeLeadership(std::move(isr));
+        for (int i = 0; i < kCap && admin_->roleName() != "LeaderServing"; ++i) pump();
+        if (admin_->roleName() != "LeaderServing")
+            throw std::logic_error("CatalogDdlRig: the leader never served DDL (" + std::string(admin_->roleName()) + ")");
+    }
+    /// Task 10: the catalog leadership at a NEW epoch with this ISR (empty = every
+    /// broker) WITHOUT driving — the caller's pumps catch it up (CatchingUp →
+    /// Serving).  The followers' silence is left as it is.
+    void assumeLeadership(std::vector<int32_t> isr = {}) {
+        if (isr.empty())
+            for (int32_t b = 1; b <= brokers_; ++b) isr.push_back(b);
         isr_ = isr;
         AdminRoleMsg r;
         r.leader = true;
@@ -130,19 +140,27 @@ public:
         r.isrCount = static_cast<int32_t>(isr.size());
         for (std::size_t i = 0; i < isr.size(); ++i) r.isr[i] = isr[i];
         admin_->onCatalogRole(r);
-        for (int i = 0; i < kCap && admin_->roleName() != "LeaderServing"; ++i) pump();
-        if (admin_->roleName() != "LeaderServing")
-            throw std::logic_error("CatalogDdlRig: the leader never served DDL (" + std::string(admin_->roleName()) + ")");
     }
-    void becomeFollower(int32_t leaderId) {
+    /// `drive` false (Task 10): the role only — the in-flight DDL is answered inside
+    /// onCatalogRole; the queued ones on the caller's next pumps.
+    void becomeFollower(int32_t leaderId, bool drive = true) {
         AdminRoleMsg r;
         r.leader = false;
         r.epoch = ++epoch_;
         r.leaderId = leaderId;
         admin_->onCatalogRole(r);
-        pump();
+        if (drive) pump();
     }
     void silence(int32_t follower) { silent_.insert(follower); }
+    /// Task 10: the follower fetches again from the next pump on (no pumping here).
+    void unsilence(int32_t follower) { silent_.erase(follower); }
+    /// Task 10: ONE fetch by `follower` at the leader's LEO (the HW covers every
+    /// appended event once the replica's pass runs) — no admin pass.
+    void fetchOnce(int32_t follower) {
+        if (replica_->role() != rune::replication::Role::Leader) return;
+        fetch_(follower);
+        (void)replica_->doWork(now_);
+    }
     /// The silent follower fetches again; pumped until its fetch landed.
     void resumeFollower(int32_t follower) {
         silent_.erase(follower);
@@ -236,6 +254,17 @@ public:
     /// Any request (its corr is replaced); pumped until answered.
     Answer submitRaw(DdlRequest req) { return await_(submit_(std::move(req))); }
     int64_t submitRawNoWait(DdlRequest req) { return submit_(std::move(req)); }
+    /// Task 10: queued on the worker WITHOUT any pump (the caller drives) — its corr.
+    int64_t enqueue(DdlRequest req) {
+        const int64_t corr = std::visit([](auto& m) { return m.corr; }, req);
+        admin_->submit(std::move(req));
+        return corr;
+    }
+    /// The DdlMeta every rig request carries (a fresh requestId unless `rid` is set).
+    [[nodiscard]] DdlMeta meta(const std::string& statement = {}, rune::protocol::RequestId rid = {},
+                               bool preV8 = false) {
+        return meta_(statement, "rig", rid, preV8);
+    }
 
     // ── observation ──────────────────────────────────────────────────────────
     [[nodiscard]] std::optional<Answer> answerFor(int64_t corr) const {
@@ -244,6 +273,12 @@ public:
         return it->second;
     }
     [[nodiscard]] std::size_t answerCount() const noexcept { return answers_.size(); }
+    /// The GetTopicSchema answer recorded for `corr` (a direct submitGetSchema).
+    [[nodiscard]] std::optional<SchemaAnswer> schemaAnswerFor(int64_t corr) const {
+        const auto it = gets_.find(corr);
+        if (it == gets_.end()) return std::nullopt;
+        return it->second;
+    }
     /// Every event the log holds (committed or not), in offset order.
     [[nodiscard]] std::vector<rune::catalog::RecordedEvent> recordedLog() const {
         std::vector<rune::catalog::RecordedEvent> out;
@@ -285,6 +320,15 @@ public:
     [[nodiscard]] int64_t sessionId() const noexcept { return kSession; }
     [[nodiscard]] std::string catalogDir() const { return (root_ / "__catalog").string(); }
     void onAnswer(std::function<void()> fn) { onAnswer_ = std::move(fn); }
+    /// Task 10: called with every answer right AFTER it is recorded.
+    void onAnswerRecorded(std::function<void(int64_t corr, const Answer&)> fn) { onRecorded_ = std::move(fn); }
+    /// The effects the boot replay posted (the coalesced BOOT sink, Task 7 I1), same
+    /// format as effects(); cleared by restart().
+    [[nodiscard]] const std::vector<std::string>& bootEffects() const noexcept { return bootEffects_; }
+    [[nodiscard]] const std::filesystem::path& root() const noexcept { return root_; }
+    [[nodiscard]] int64_t now() const noexcept { return now_; }
+    /// The clock moves WITHOUT a pump (Task 10: the caller's next pump sees it).
+    void advanceClock(int64_t ns) noexcept { now_ += ns; }
     /// The live effects the applier posted: "<effect>:<topicId>".
     [[nodiscard]] const std::vector<std::string>& effects() const noexcept { return effects_; }
 
@@ -297,6 +341,7 @@ public:
         schemas_ = SchemaRegistry{};
         views_   = ViewRegistry{};
         effects_.clear();
+        bootEffects_.clear();
         isr_.clear();
         silent_.clear();
         open_();
@@ -315,15 +360,7 @@ public:
         if (replica_->role() != rune::replication::Role::Leader) return;
         for (int32_t f : isr_) {
             if (f == kSelf || silent_.contains(f)) continue;
-            rune::replication::FetchRequestMsg ack{};
-            ack.leaderEpoch      = static_cast<int32_t>(replica_->epoch());
-            ack.partition        = kCatalogPartition;
-            ack.followerId       = f;
-            ack.fetchOffset      = replica_->logEndOffset();
-            ack.maxBytes         = 1 << 20;
-            ack.topicId          = kCatalogTopicId;
-            ack.lastFetchedEpoch = -1;
-            replica_->onFetchRequest(ack, now_);
+            fetch_(f);
         }
         (void)replica_->doWork(now_);
     }
@@ -382,6 +419,18 @@ private:
     void record_(int64_t corr, Answer a) {
         if (onAnswer_) onAnswer_();
         answers_[corr] = std::move(a);
+        if (onRecorded_) onRecorded_(corr, answers_[corr]);
+    }
+    void fetch_(int32_t f) {
+        rune::replication::FetchRequestMsg ack{};
+        ack.leaderEpoch      = static_cast<int32_t>(replica_->epoch());
+        ack.partition        = kCatalogPartition;
+        ack.followerId       = f;
+        ack.fetchOffset      = replica_->logEndOffset();
+        ack.maxBytes         = 1 << 20;
+        ack.topicId          = kCatalogTopicId;
+        ack.lastFetchedEpoch = -1;
+        replica_->onFetchRequest(ack, now_);
     }
 
     void open_() {
@@ -436,7 +485,13 @@ private:
         };
         fx.halted = [this](const rune::catalog::ApplyError&) { effects_.push_back("halted"); };
         fx.maxFrameBytes = effectMaxFrame_;   // the applier sizes against the same frame as the leader gate
-        (void)admin_->bootCatalog(BootEffects{}, LiveEffects{std::move(fx)});
+        CatalogEffects boot;                  // Task 10: the boot replay's (coalesced) sink, recorded apart
+        boot.topicApplied  = [this](const rune::catalog::TopicObject& t) { bootEffects_.push_back("topicApplied:" + std::to_string(t.topicId)); };
+        boot.sinkApplied   = [this](const SinkSpec& s) { bootEffects_.push_back("sinkApplied:" + std::to_string(s.topicId)); };
+        boot.viewInstalled = [this](const rune::catalog::ViewObject& v) { bootEffects_.push_back("viewInstalled:" + std::to_string(v.def.viewTopicId)); };
+        boot.halted        = [this](const rune::catalog::ApplyError&) { bootEffects_.push_back("halted"); };
+        boot.maxFrameBytes = effectMaxFrame_;
+        (void)admin_->bootCatalog(BootEffects{std::move(boot)}, LiveEffects{std::move(fx)});
     }
 
     std::size_t                                          effectMaxFrame_ = 0;
@@ -455,7 +510,9 @@ private:
     std::map<int64_t, Answer>                            answers_;
     std::map<int64_t, SchemaAnswer>                      gets_;
     std::vector<std::string>                             effects_;
+    std::vector<std::string>                             bootEffects_;
     std::function<void()>                                onAnswer_;
+    std::function<void(int64_t, const Answer&)>          onRecorded_;
     int32_t                                              epoch_ = 0;
     int64_t                                              now_   = 1'000'000'000;
     int64_t                                              corr_  = 0;

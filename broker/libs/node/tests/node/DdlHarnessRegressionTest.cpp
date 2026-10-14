@@ -1,14 +1,22 @@
 // DdlHarnessRegressionTest.cpp — DDL conformance plan: smoke tests of DdlHarness
 // itself (Task 4) and the targeted regression for every fix the matrices exposed
-// (B1-B4, KL2: Tasks 5-7).  Every suite name contains "Regression".
+// (B1-B9, KL2: Tasks 5-7), ported to the __catalog write path by catalog history
+// Task 10.  Every suite name contains "Regression".
+//
+// Former cells that tested the deleted control-thread create round-trip (the
+// createTopicForAdmin reply ring, orphan topics / sinks and their adoption, the
+// __orphan.<id> placeholders, the topic-id dir markers, the per-catalog commit
+// replicas) are either re-pinned on their catalog-path counterpart (named in each
+// test's comment) or ruled out in the Task 10 report.
 #include <gtest/gtest.h>
 #include "support/DdlHarness.h"
 
-#include <rune/codec/AlterOps.h>
+#include <rune/catalog/CatalogEvent.h>
+#include <rune/catalog/CatalogState.h>
 #include <rune/catalog/TopicName.h>
-
-#include <spdlog/sinks/ringbuffer_sink.h>
-#include <spdlog/spdlog.h>
+#include <rune/codec/AlterOps.h>
+#include <rune/gateway/TopicRegistry.h>
+#include <rune/protocol/RecordBatch.h>
 
 #include <algorithm>
 #include <cctype>
@@ -21,9 +29,39 @@
 #include <variant>
 #include <vector>
 
+#include <unistd.h>
+
 using namespace rune::node;
 using namespace rune::node::test;
 namespace fs = std::filesystem;
+namespace cat = rune::catalog;
+
+namespace {
+void createOk(DdlHarness& h, Op op, const std::string& name, const std::string& src = "src") {
+    const int64_t c = h.submit(op, name, src);
+    h.settle();
+    ASSERT_TRUE(h.response(c).has_value());
+    ASSERT_EQ(h.response(c)->err, kOk) << opName(op) << " '" << name << "'";
+}
+/// An UNTYPED topic (an empty descriptor) created by DDL — the former static
+/// schema-less RUNE_TOPICS topic.
+int64_t submitUntyped(DdlHarness& h, const std::string& name, uint8_t persistence = 0) {
+    DefineTopicMsg m;
+    m.name = name; m.partitionCount = 1; m.persistence = persistence;
+    return h.submitRawDefine(std::move(m));
+}
+/// `op` on `name` while the ISR is below the catalog's minIsr: its append is
+/// refused (NotLeader, nothing appended) — the catalog counterpart of a create
+/// that never committed.  Returns its answer code.
+uint16_t refusedAtAppend(DdlHarness& h, Op op, const std::string& name) {
+    h.shrinkIsr();
+    const int64_t c = h.submit(op, name);
+    h.settle();
+    h.restoreIsr();
+    h.settle();
+    return h.response(c) ? h.response(c)->err : uint16_t{0xFFFF};
+}
+} // namespace
 
 TEST(DdlHarnessRegression, DefineViewAlterRoundTripAndRestartKeepsTheCatalog) {
     DdlHarness h;
@@ -45,17 +83,18 @@ TEST(DdlHarnessRegression, DefineViewAlterRoundTripAndRestartKeepsTheCatalog) {
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-TEST(DdlHarnessRegression, HeldControlReplyKeepsTheNextOpQueued) {
+// Was HeldControlReplyKeepsTheNextOpQueued: the held stage is now the HW.
+TEST(DdlHarnessRegression, HeldHwKeepsTheNextOpQueued) {
     DdlHarness h;
     h.setControl(ControlMode::Hold);
     const int64_t x = h.submit(Op::DefineDisk, "x");
     const int64_t y = h.submit(Op::DefineDisk, "y");
-    ASSERT_TRUE(h.tickUntilCreatePending());
-    const int reqs = h.createRequests();
+    ASSERT_TRUE(h.tickUntilAppended());
+    const uint64_t events = h.eventsAppended();
     for (int i = 0; i < 5; ++i) h.tick();
-    EXPECT_EQ(h.createRequests(), reqs) << "y must not start while x is AwaitingId";
+    EXPECT_EQ(h.eventsAppended(), events) << "y must not start while x is AwaitingCommit";
+    EXPECT_FALSE(h.response(x).has_value());
     EXPECT_FALSE(h.response(y).has_value());
-    h.deliverCreate();
     h.setControl(ControlMode::Auto);
     h.settle();
     EXPECT_EQ(h.response(x)->err, kOk);
@@ -70,7 +109,7 @@ TEST(DdlHarnessRegression, HeldCommitKeepsTheOpInFlightUntilReleased) {
     const int64_t a = h.submit(Op::AlterAdd, "src");
     ASSERT_TRUE(h.tickUntilAppended());
     for (int i = 0; i < 5; ++i) h.tick();
-    EXPECT_FALSE(h.response(a).has_value()) << "an op is answered only after its record commits";
+    EXPECT_FALSE(h.response(a).has_value()) << "an op is answered only after its event commits";
     EXPECT_TRUE(h.worker().hasInFlight());
     h.settle();   // releases commits
     EXPECT_EQ(h.response(a)->err, kOk);
@@ -78,27 +117,27 @@ TEST(DdlHarnessRegression, HeldCommitKeepsTheOpInFlightUntilReleased) {
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-TEST(DdlHarnessRegression, OrphanThenLaterTopicRestartsWithAPlaceholder) {
+// Was OrphanThenLaterTopicRestartsWithAPlaceholder.  A create whose event never
+// committed leaves no topic, dir or id: the next topic takes the id it would have
+// had, and a restart shows no trace of it (no __orphan placeholder exists any more).
+TEST(DdlHarnessRegression, UncommittedCreateThenLaterTopicLeavesNoTraceAcrossARestart) {
     DdlHarness h;
-    h.setControl(ControlMode::Hold);
-    const int64_t o = h.submit(Op::ViewPersisted, "orph");
-    ASSERT_TRUE(h.tickUntilCreatePending());
-    h.failCreate(/*afterCreate=*/true);
-    h.setControl(ControlMode::Auto);
-    h.settle();
-    ASSERT_EQ(h.response(o)->err, kInternal);
-    const int32_t orphanId = h.idOf("orph");
-    ASSERT_GE(orphanId, 0) << "the control thread created the sink: an orphan";
+    const int32_t nextId = h.state().nextTopicId();
+    ASSERT_EQ(refusedAtAppend(h, Op::ViewPersisted, "orph"), kNotLeader);
+    EXPECT_EQ(h.idOf("orph"), -1);
+    EXPECT_EQ(h.state().nextTopicId(), nextId) << "the refused create used no id";
     const int64_t l = h.submit(Op::DefineDisk, "later");
     h.settle();
     ASSERT_EQ(h.response(l)->err, kOk);
+    EXPECT_EQ(h.idOf("later"), nextId);
     const Catalog before = h.catalog();
-    h.restart();   // B5: must not throw
-    EXPECT_EQ(h.catalog(), h.expectedAfterRestart(before));
-    EXPECT_EQ(h.idOf("orph"), -1) << "the orphan's name is free after the restart";
-    EXPECT_EQ(h.idOf(orphanPlaceholderName(orphanId)), orphanId);
-    EXPECT_EQ(h.topics().topic(orphanId)->partitionCount, 0) << "hidden, inert placeholder (D1)";
-    EXPECT_FALSE(fs::exists(h.root() / "topics" / "orph")) << "the orphan sink's data dir is deleted (B10)";
+    h.restart();
+    EXPECT_EQ(h.catalog(), before);
+    EXPECT_EQ(h.idOf("orph"), -1) << "the name is free after the restart";
+    EXPECT_EQ(h.idOf(std::string("__orphan.") + std::to_string(nextId)), -1) << "no placeholder exists";
+    const int64_t again = h.submit(Op::ViewPersisted, "orph");
+    h.settle();
+    EXPECT_EQ(h.response(again)->err, kOk) << "the name was never taken";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
@@ -132,7 +171,6 @@ TEST(DdlHarnessRegression, InvariantFlagsAnAnswerWithNoOpInFlight) {
     DdlHarness h;
     ASSERT_TRUE(h.violations().empty()) << h.violationText();
     ASSERT_FALSE(h.worker().hasInFlight());
-    // A second answer for an already-answered op: nothing is started-but-unanswered.
     const int64_t d = h.submit(Op::DefineDisk, "t");
     h.settle();
     ASSERT_EQ(h.response(d)->err, kOk);
@@ -151,7 +189,6 @@ TEST(DdlHarnessRegression, InvariantFlagsAnOutOfOrderAnswer) {
     ASSERT_EQ(h.response(a)->err, kOk);
     ASSERT_EQ(h.response(b)->err, kOk);
     ASSERT_TRUE(h.violations().empty()) << h.violationText();
-    // An answer for an EARLIER submission after a later one was answered.
     h.injectAnswerForCheckerSelfTest(a, kOk);
     ASSERT_FALSE(h.violations().empty()) << "a misordered answer must be flagged";
     EXPECT_TRUE(anyViolationContains(h, "answer for corr " + std::to_string(a) + " out of FIFO order (previous " +
@@ -162,10 +199,10 @@ TEST(DdlHarnessRegression, InvariantFlagsAnAnswerWhileAnotherOpIsInFlight) {
     DdlHarness h;
     h.setControl(ControlMode::Hold);
     const int64_t x = h.submit(Op::DefineDisk, "x");
-    ASSERT_TRUE(h.tickUntilCreatePending());
+    ASSERT_TRUE(h.tickUntilAppended());
     ASSERT_TRUE(h.worker().hasInFlight());
     ASSERT_TRUE(h.violations().empty()) << h.violationText();
-    // x is AwaitingId; an answer that is not x's leaves x started-but-unanswered
+    // x is AwaitingCommit; an answer that is not x's leaves x started-but-unanswered
     // while the worker still reports it in flight: a second, phantom op.
     h.injectAnswerForCheckerSelfTest(x + 1000, kOk);
     h.injectAnswerForCheckerSelfTest(x + 1001, kOk);
@@ -175,63 +212,79 @@ TEST(DdlHarnessRegression, InvariantFlagsAnAnswerWhileAnotherOpIsInFlight) {
     EXPECT_TRUE(anyViolationContains(h, "injected answer: -1 DDL ops started-but-unanswered, in flight 1"))
         << h.violationText();
     EXPECT_TRUE(anyViolationContains(h, "with 0 ops started-but-unanswered (want 1)")) << h.violationText();
-    h.deliverCreate();   // let x finish so the harness tears down cleanly
     h.setControl(ControlMode::Auto);
     h.settle();
 }
 
 // ── B1 / B2 / B6 ──────────────────────────────────────────────────────────────
-// Every rune::catalog::TopicNameError kind, sampled several ways each, on every path: DefineTopic
-// (disk + transient), CreateView (persisted + transient), createTopicForAdmin (the
-// control thread).  The config-parse path is in NodeConfigTest.cpp (Task 5a).
+// Every rune::catalog::TopicNameError kind, sampled several ways each, on every path:
+// DefineTopic (disk + transient), CreateView (persisted + transient), and the shared
+// library's apply (the defensive layer every broker runs — was the control thread's
+// createTopicForAdmin).  The config-parse path is in NodeConfigTest.cpp (Task 5a).
 namespace {
 struct BadName {
     std::string   name;
-    rune::catalog::TopicNameError kind;
+    cat::TopicNameError kind;
     const char*   label;
 };
 std::vector<BadName> badNames() {
     return {
-        {"", rune::catalog::TopicNameError::Empty, "empty"},
-        {std::string(250, 'x'), rune::catalog::TopicNameError::TooLong, "len250"},
-        {std::string(1000, 'y'), rune::catalog::TopicNameError::TooLong, "len1000"},
-        {".", rune::catalog::TopicNameError::DotSegment, "dot"},
-        {"..", rune::catalog::TopicNameError::DotSegment, "dotdot"},
-        {"../escape", rune::catalog::TopicNameError::BadChar, "traversal"},
-        {"a/b", rune::catalog::TopicNameError::BadChar, "slash"},
-        {"/abs", rune::catalog::TopicNameError::BadChar, "absolute"},
-        {"a\\b", rune::catalog::TopicNameError::BadChar, "backslash"},
-        {"has space", rune::catalog::TopicNameError::BadChar, "space"},
-        {"tab\tname", rune::catalog::TopicNameError::BadChar, "tab"},
-        {"new\nline", rune::catalog::TopicNameError::BadChar, "newline"},
-        {std::string("nul\0byte", 8), rune::catalog::TopicNameError::BadChar, "nul"},
-        {"caf\xc3\xa9", rune::catalog::TopicNameError::BadChar, "nonascii"},
-        {"a:b", rune::catalog::TopicNameError::BadChar, "colon"},
-        {"__topic_schemas", rune::catalog::TopicNameError::Reserved, "topic_schemas"},
-        {"__views", rune::catalog::TopicNameError::Reserved, "views"},
-        {"__consumer_offsets", rune::catalog::TopicNameError::Reserved, "consumer_offsets"},
-        {"__transaction_state", rune::catalog::TopicNameError::Reserved, "transaction_state"},
-        {"__cluster_metadata", rune::catalog::TopicNameError::Reserved, "cluster_metadata"},
-        {"__view_snapshots", rune::catalog::TopicNameError::Reserved, "view_snapshots"},
-        {"__orphan.1", rune::catalog::TopicNameError::Reserved, "orphan"},
-        {"__x", rune::catalog::TopicNameError::Reserved, "x"},
-        {"__", rune::catalog::TopicNameError::Reserved, "bare"},
+        {"", cat::TopicNameError::Empty, "empty"},
+        {std::string(250, 'x'), cat::TopicNameError::TooLong, "len250"},
+        {std::string(1000, 'y'), cat::TopicNameError::TooLong, "len1000"},
+        {".", cat::TopicNameError::DotSegment, "dot"},
+        {"..", cat::TopicNameError::DotSegment, "dotdot"},
+        {"../escape", cat::TopicNameError::BadChar, "traversal"},
+        {"a/b", cat::TopicNameError::BadChar, "slash"},
+        {"/abs", cat::TopicNameError::BadChar, "absolute"},
+        {"a\\b", cat::TopicNameError::BadChar, "backslash"},
+        {"has space", cat::TopicNameError::BadChar, "space"},
+        {"tab\tname", cat::TopicNameError::BadChar, "tab"},
+        {"new\nline", cat::TopicNameError::BadChar, "newline"},
+        {std::string("nul\0byte", 8), cat::TopicNameError::BadChar, "nul"},
+        {"caf\xc3\xa9", cat::TopicNameError::BadChar, "nonascii"},
+        {"a:b", cat::TopicNameError::BadChar, "colon"},
+        {"__topic_schemas", cat::TopicNameError::Reserved, "topic_schemas"},
+        {"__views", cat::TopicNameError::Reserved, "views"},
+        {"__consumer_offsets", cat::TopicNameError::Reserved, "consumer_offsets"},
+        {"__transaction_state", cat::TopicNameError::Reserved, "transaction_state"},
+        {"__cluster_metadata", cat::TopicNameError::Reserved, "cluster_metadata"},
+        {"__view_snapshots", cat::TopicNameError::Reserved, "view_snapshots"},
+        {"__orphan.1", cat::TopicNameError::Reserved, "orphan"},
+        {"__x", cat::TopicNameError::Reserved, "x"},
+        {"__", cat::TopicNameError::Reserved, "bare"},
     };
+}
+
+/// A CreateTopic event for `name` built exactly as the leader would on `s`.
+cat::CatalogEvent createTopicEvent(const cat::CatalogState& s, const std::string& name, int32_t partitions = 1) {
+    cat::CatalogEvent e;
+    e.formatVer   = cat::kCurrentFormatVer;
+    e.objectName  = name;
+    e.objectId    = s.nextObjectId();
+    e.prevVersion = 0;
+    e.newVersion  = 1;
+    cat::CreateTopicOps op;
+    op.topicId    = s.nextTopicId();
+    op.partitions = partitions;
+    e.ops  = op;
+    e.kind = cat::kindOf(e.ops);
+    return e;
 }
 } // namespace
 
 class DdlNameRegression : public ::testing::TestWithParam<BadName> {};
 
 TEST_P(DdlNameRegression, TableCoversTheKindItClaims) {
-    EXPECT_EQ(rune::catalog::checkTopicName(GetParam().name), GetParam().kind);
+    EXPECT_EQ(cat::checkTopicName(GetParam().name), GetParam().kind);
 }
 
 TEST_P(DdlNameRegression, AdminPathRejectsEveryOpWithInvalidTopicNameAndCreatesNothing) {
     const BadName& b = GetParam();
     DdlHarness h;
     const int32_t topics = h.topicCount();
-    const int64_t schemaEnd = h.schemaLogEnd(), viewsEnd = h.viewsLogEnd();
-    const int reqs = h.createRequests();
+    const int64_t logEnd = h.catalogLogEnd();
+    const uint64_t events = h.eventsAppended();
     int64_t c[4];
     int i = 0;
     for (const Op op : {Op::DefineDisk, Op::DefineTransient, Op::ViewPersisted, Op::ViewTransient})
@@ -243,11 +296,10 @@ TEST_P(DdlNameRegression, AdminPathRejectsEveryOpWithInvalidTopicNameAndCreatesN
         EXPECT_EQ(h.response(corr)->id, -1);
     }
     EXPECT_EQ(h.topicCount(), topics);
-    EXPECT_EQ(h.createRequests(), reqs) << "never reaches the control thread";
-    EXPECT_EQ(h.schemaLogEnd(), schemaEnd);
-    EXPECT_EQ(h.viewsLogEnd(), viewsEnd);
-    EXPECT_FALSE(fs::exists(h.root() / "escape")) << "nothing written outside dataDir/topics";
-    EXPECT_FALSE(fs::exists(h.root() / "topics" / "a")) << "no partial path";
+    EXPECT_EQ(h.eventsAppended(), events) << "never reaches the catalog";
+    EXPECT_EQ(h.catalogLogEnd(), logEnd);
+    EXPECT_FALSE(fs::exists(h.root() / "escape")) << "nothing written outside the data dir";
+    EXPECT_FALSE(fs::exists(h.root() / "topics")) << "the admin path writes no topic dir at all";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
@@ -263,24 +315,21 @@ TEST_P(DdlNameRegression, InvalidNameIsCheckedBeforeEveryLaterDefineCheck) {
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-TEST_P(DdlNameRegression, ControlThreadRefusesTheNameDefensively) {
+// Was ControlThreadRefusesTheNameDefensively (createTopicForAdmin is deleted): the
+// defensive layer is now the shared library's frozen apply rules — a CreateTopic
+// event naming a bad name is refused by every broker's apply (and the leader's
+// dry run), so it can never be written or applied.
+TEST_P(DdlNameRegression, CatalogApplyRefusesTheNameDefensively) {
     const BadName& b = GetParam();
-    const fs::path dir = fs::temp_directory_path() / ("rune_ddl_ctl_" + std::to_string(::getpid()));
-    fs::create_directories(dir);
-    {
-        rune::gateway::TopicRegistry reg({}, dir.string());
-        CreateTopicReqMsg req; req.ticket = 1; req.partitionCount = 1; req.name = b.name;
-        for (const uint8_t persistence : {uint8_t{0}, uint8_t{1}}) {
-            req.persistence = persistence;
-            const CreateTopicReplyMsg r = createTopicForAdmin(reg, req);
-            EXPECT_EQ(r.topicId, -1);
-            EXPECT_FALSE(r.existed);
-            EXPECT_EQ(r.ticket, 1);
-        }
-        EXPECT_EQ(reg.topicCount(), 0);
-    }
-    EXPECT_FALSE(fs::exists(dir / "escape"));
-    std::error_code ec; fs::remove_all(dir, ec);
+    cat::CatalogState s;
+    const cat::CatalogEvent e = createTopicEvent(s, b.name);
+    const auto preview = cat::previewFingerprint(s, e);
+    ASSERT_FALSE(preview.has_value());
+    EXPECT_EQ(preview.error().code, cat::ApplyError::Code::Precondition);
+    const auto applied = cat::apply(s, e, 0);
+    ASSERT_FALSE(applied.has_value());
+    EXPECT_EQ(s.appliedOffset(), -1) << "the state is unchanged";
+    EXPECT_TRUE(s.topics().empty());
 }
 
 INSTANTIATE_TEST_SUITE_P(EveryKind, DdlNameRegression, ::testing::ValuesIn(badNames()),
@@ -289,9 +338,10 @@ INSTANTIATE_TEST_SUITE_P(EveryKind, DdlNameRegression, ::testing::ValuesIn(badNa
 TEST(DdlFixRegression, B1_EveryTopicNameErrorKindIsCoveredByTheTable) {
     bool seen[6] = {};
     for (const BadName& b : badNames()) seen[static_cast<int>(b.kind)] = true;
-    EXPECT_FALSE(seen[static_cast<int>(rune::catalog::TopicNameError::None)]);
-    for (const rune::catalog::TopicNameError k : {rune::catalog::TopicNameError::Empty, rune::catalog::TopicNameError::TooLong, rune::catalog::TopicNameError::DotSegment,
-                                   rune::catalog::TopicNameError::BadChar, rune::catalog::TopicNameError::Reserved})
+    EXPECT_FALSE(seen[static_cast<int>(cat::TopicNameError::None)]);
+    for (const cat::TopicNameError k : {cat::TopicNameError::Empty, cat::TopicNameError::TooLong,
+                                        cat::TopicNameError::DotSegment, cat::TopicNameError::BadChar,
+                                        cat::TopicNameError::Reserved})
         EXPECT_TRUE(seen[static_cast<int>(k)]) << static_cast<int>(k);
 }
 
@@ -325,10 +375,11 @@ TEST(DdlFixRegression, B1_RejectedNamesDoNotPoisonTheQueueBehindThem) {
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-TEST(DdlFixRegression, B6_PartitionCountBelowOneIsInvalidSchemaOnAdminAndControl) {
+// The control-thread half is now the library's apply (partitions < 1 refused).
+TEST(DdlFixRegression, B6_PartitionCountBelowOneIsInvalidSchemaOnAdminAndCatalogApply) {
     DdlHarness h;
     const int32_t topicsBefore = h.topicCount();
-    const int reqsBefore = h.createRequests();
+    const uint64_t eventsBefore = h.eventsAppended();
     for (const int32_t parts : {0, -1, -1000, INT32_MIN}) {
         SCOPED_TRACE(parts);
         for (const uint8_t persistence : {uint8_t{0}, uint8_t{1}}) {
@@ -341,7 +392,7 @@ TEST(DdlFixRegression, B6_PartitionCountBelowOneIsInvalidSchemaOnAdminAndControl
         }
     }
     EXPECT_EQ(h.topicCount(), topicsBefore);
-    EXPECT_EQ(h.createRequests(), reqsBefore);
+    EXPECT_EQ(h.eventsAppended(), eventsBefore);
     EXPECT_EQ(h.idOf("zero_parts"), -1);
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 
@@ -352,18 +403,14 @@ TEST(DdlFixRegression, B6_PartitionCountBelowOneIsInvalidSchemaOnAdminAndControl
     h.settle();
     EXPECT_EQ(h.response(c)->err, kOk);
 
-    // Control thread: same refusal, nothing created.
-    const fs::path dir = fs::temp_directory_path() / ("rune_ddl_ctl0_" + std::to_string(::getpid()));
-    fs::create_directories(dir);
-    {
-        rune::gateway::TopicRegistry reg({}, dir.string());
-        for (const int32_t parts : {0, -1, INT32_MIN}) {
-            CreateTopicReqMsg zero; zero.ticket = 2; zero.partitionCount = parts; zero.name = "ok";
-            EXPECT_EQ(createTopicForAdmin(reg, zero).topicId, -1) << parts;
-        }
-        EXPECT_EQ(reg.topicCount(), 0);
+    // The shared apply: the same refusal, nothing applied.
+    cat::CatalogState s;
+    for (const int32_t parts : {0, -1, INT32_MIN}) {
+        const auto r = cat::previewFingerprint(s, createTopicEvent(s, "ok", parts));
+        ASSERT_FALSE(r.has_value()) << parts;
+        EXPECT_EQ(r.error().code, cat::ApplyError::Code::Precondition);
     }
-    std::error_code ec; fs::remove_all(dir, ec);
+    EXPECT_TRUE(cat::previewFingerprint(s, createTopicEvent(s, "ok", 1)).has_value());
 }
 
 TEST(DdlFixRegression, B1_RestartAfterRejectedNamesKeepsTheCatalogUnchanged) {
@@ -381,12 +428,8 @@ TEST(DdlFixRegression, B1_RestartAfterRejectedNamesKeepsTheCatalogUnchanged) {
 // ── B3 ────────────────────────────────────────────────────────────────────────
 // Names are case-sensitive identifiers, but no two may differ only in ASCII case
 // (they would share dataDir/topics/<name>/ on a case-insensitive filesystem).  The
-// control thread (owner of TopicRegistry) decides; the admin thread answers
-// TopicExists (25) with the colliding topic's id and nothing is created.
-//
-// Fold matrix: {DefineDisk, DefineTransient, ViewPersisted, ViewTransient} for the
-// existing name × the same four for the case variant (topic×topic, topic×view,
-// view×topic, view×view) × several spellings in both directions.
+// admin thread decides from the applied catalog (the library's fold rule): it
+// answers TopicExists (25) with the colliding topic's id and appends nothing.
 namespace {
 struct FoldPair { const char* existing; const char* variant; const char* label; };
 const FoldPair kFoldPairs[] = {
@@ -397,15 +440,7 @@ const FoldPair kFoldPairs[] = {
 };
 const Op kCreateOps[] = {Op::DefineDisk, Op::DefineTransient, Op::ViewPersisted, Op::ViewTransient};
 
-const char* opLabel(Op op) {
-    switch (op) {
-        case Op::DefineDisk:      return "DefineDisk";
-        case Op::DefineTransient: return "DefineTransient";
-        case Op::ViewPersisted:   return "ViewPersisted";
-        case Op::ViewTransient:   return "ViewTransient";
-        default:                  return "Other";
-    }
-}
+const char* opLabel(Op op) { return opName(op); }
 bool isViewOp(Op op) { return op == Op::ViewPersisted || op == Op::ViewTransient; }
 
 struct FoldCase { Op first; Op second; FoldPair names; };
@@ -436,7 +471,7 @@ TEST_P(DdlCaseFoldRegression, CaseVariantIsTopicExistsAndCreatesNothing) {
     const int32_t existingId = h.idOf(c.names.existing);
     ASSERT_GE(existingId, 0);
     const int32_t topics = h.topicCount();
-    const int64_t schemaEnd = h.schemaLogEnd(), viewsEnd = h.viewsLogEnd();
+    const int64_t logEnd = h.catalogLogEnd();
     const size_t viewCount = h.views().all().size();
 
     const int64_t b = h.submit(c.second, c.names.variant);
@@ -448,15 +483,14 @@ TEST_P(DdlCaseFoldRegression, CaseVariantIsTopicExistsAndCreatesNothing) {
     EXPECT_EQ(h.idOf(c.names.variant), -1);
     EXPECT_EQ(h.views().byName(c.names.variant), nullptr);
     EXPECT_EQ(h.views().all().size(), viewCount);
-    EXPECT_EQ(h.schemaLogEnd(), schemaEnd) << "no schema record for the variant";
-    EXPECT_EQ(h.viewsLogEnd(), viewsEnd) << "no view record for the variant";
+    EXPECT_EQ(h.catalogLogEnd(), logEnd) << "no event for the variant";
     if (isViewOp(c.first)) EXPECT_NE(h.views().byName(c.names.existing), nullptr) << "the existing view is intact";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 
     // The refusal leaves nothing behind that a restart could resurrect.
     const Catalog before = h.catalog();
     h.restart();
-    EXPECT_EQ(h.catalog(), h.expectedAfterRestart(before));
+    EXPECT_EQ(h.catalog(), before);
     EXPECT_EQ(h.idOf(c.names.variant), -1);
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
@@ -520,65 +554,64 @@ TEST_P(DdlExactNameRegression, ExactSameNameKeepsItsExistingOutcome) {
 INSTANTIATE_TEST_SUITE_P(EveryKindPair, DdlExactNameRegression, ::testing::ValuesIn(exactCases()),
                          [](const ::testing::TestParamInfo<ExactCase>& i) { return std::string(i.param.label); });
 
-// Runtime DDL against a schema-less static (RUNE_TOPICS) topic: the exact name
-// adopts it (DefineTopic) / is TopicExists (CreateView); any case variant is
+// Was DdlStaticCaseFoldRegression (a schema-less static RUNE_TOPICS topic): the
+// occupant is now an UNTYPED topic created by DDL.  The exact name adopts it
+// (DefineTopic disk) / is TopicExists (anything else); any case variant is
 // TopicExists and never gets its own topic.
 namespace {
-struct StaticCase { const char* staticName; const char* runtimeName; Op op; uint16_t want; std::string label; };
-void PrintTo(const StaticCase& c, std::ostream* os) {
-    *os << "static '" << c.staticName << "' then " << opLabel(c.op) << " '" << c.runtimeName << "'";
+struct UntypedCase { const char* untypedName; const char* otherName; Op op; uint16_t want; std::string label; };
+void PrintTo(const UntypedCase& c, std::ostream* os) {
+    *os << "untyped '" << c.untypedName << "' then " << opLabel(c.op) << " '" << c.otherName << "'";
 }
-std::vector<StaticCase> staticCases() {
-    std::vector<StaticCase> v;
+std::vector<UntypedCase> untypedCases() {
+    std::vector<UntypedCase> v;
     const struct { const char* s; const char* r; const char* l; } names[] = {
-        {"Stat", "stat", "UpperStatic_LowerRuntime"},
-        {"stat", "Stat", "LowerStatic_UpperRuntime"},
-        {"events", "EVENTS", "LowerStatic_CapsRuntime"},
-        {"Player.Pos", "player.pos", "DottedStatic"},
+        {"Stat", "stat", "UpperUntyped_LowerOther"},
+        {"stat", "Stat", "LowerUntyped_UpperOther"},
+        {"events", "EVENTS", "LowerUntyped_CapsOther"},
+        {"Player.Pos", "player.pos", "DottedUntyped"},
     };
-    for (const auto& n : names) {
+    for (const auto& n : names)
         for (const Op op : kCreateOps)
             v.push_back({n.s, n.r, op, kTopicExists, std::string(n.l) + "_" + opLabel(op)});
-    }
     return v;
 }
 } // namespace
 
-class DdlStaticCaseFoldRegression : public ::testing::TestWithParam<StaticCase> {};
+class DdlUntypedCaseFoldRegression : public ::testing::TestWithParam<UntypedCase> {};
 
-TEST_P(DdlStaticCaseFoldRegression, CaseVariantOfAStaticTopicIsTopicExists) {
-    const StaticCase& c = GetParam();
-    DdlHarnessOptions o;
-    TopicSpec s; s.name = c.staticName; s.partitionCount = 1;
-    o.statics.push_back(s);
-    DdlHarness h(o);
-    const int32_t staticId = h.idOf(c.staticName);
-    ASSERT_GE(staticId, 0);
+TEST_P(DdlUntypedCaseFoldRegression, CaseVariantOfAnUntypedTopicIsTopicExists) {
+    const UntypedCase& c = GetParam();
+    DdlHarness h;
+    const int64_t u = submitUntyped(h, c.untypedName);
+    h.settle();
+    ASSERT_EQ(h.response(u)->err, kOk);
+    const int32_t untypedId = h.idOf(c.untypedName);
+    ASSERT_GE(untypedId, 0);
     const int32_t topics = h.topicCount();
-    const int64_t b = h.submit(c.op, c.runtimeName);
+    const int64_t b = h.submit(c.op, c.otherName);
     h.settle();
     EXPECT_EQ(h.response(b)->err, c.want);
-    EXPECT_EQ(h.response(b)->id, staticId);
+    EXPECT_EQ(h.response(b)->id, untypedId);
     EXPECT_EQ(h.topicCount(), topics);
-    EXPECT_EQ(h.idOf(c.runtimeName), -1);
-    EXPECT_EQ(h.views().byName(c.runtimeName), nullptr);
-    EXPECT_EQ(h.schemas().byName(c.runtimeName), nullptr) << "no schema adopted under the variant";
-    EXPECT_EQ(h.schemas().byId(staticId), nullptr) << "the static topic stays schema-less";
+    EXPECT_EQ(h.idOf(c.otherName), -1);
+    EXPECT_EQ(h.views().byName(c.otherName), nullptr);
+    EXPECT_EQ(h.schemas().byName(c.otherName), nullptr) << "no schema adopted under the variant";
+    EXPECT_EQ(h.schemas().byId(untypedId), nullptr) << "the untyped topic stays untyped";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 
-    // The exact name keeps its pre-B3 outcome.
-    const int64_t exact = h.submit(c.op, c.staticName);
+    // The exact name keeps its pre-B3 outcome: a disk DefineTopic adopts the untyped
+    // topic; a CreateView never adopts it; an explicit transient define over a disk
+    // topic is TopicExists (final review I1).
+    const int64_t exact = h.submit(c.op, c.untypedName);
     h.settle();
-    // Pre-B3 outcomes: a disk DefineTopic adopts the schema-less static topic; a
-    // CreateView never adopts it; an explicit transient define over a disk topic is
-    // TopicExists (final review I1).
     EXPECT_EQ(h.response(exact)->err, c.op == Op::DefineDisk ? kOk : kTopicExists);
-    EXPECT_EQ(h.response(exact)->id, staticId);
+    EXPECT_EQ(h.response(exact)->id, untypedId);
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-INSTANTIATE_TEST_SUITE_P(EveryKind, DdlStaticCaseFoldRegression, ::testing::ValuesIn(staticCases()),
-                         [](const ::testing::TestParamInfo<StaticCase>& i) { return i.param.label; });
+INSTANTIATE_TEST_SUITE_P(EveryKind, DdlUntypedCaseFoldRegression, ::testing::ValuesIn(untypedCases()),
+                         [](const ::testing::TestParamInfo<UntypedCase>& i) { return i.param.label; });
 
 TEST(DdlFixRegression, B3_CaseVariantOfATypedTopicIsTopicExists) {
     DdlHarness h;
@@ -598,23 +631,22 @@ TEST(DdlFixRegression, B3_CaseVariantOfATypedTopicIsTopicExists) {
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-TEST(DdlFixRegression, B3_CaseVariantOfASchemaLessStaticTopicIsTopicExists) {
-    DdlHarnessOptions o;
-    TopicSpec s; s.name = "Stat"; s.partitionCount = 1;
-    o.statics.push_back(s);
-    DdlHarness h(o);
+TEST(DdlFixRegression, B3_CaseVariantOfAnUntypedTopicIsTopicExists) {
+    DdlHarness h;
+    const int64_t u = submitUntyped(h, "Stat");
+    h.settle();
+    ASSERT_EQ(h.response(u)->err, kOk);
     const int64_t b = h.submit(Op::DefineDisk, "stat");
     h.settle();
     EXPECT_EQ(h.response(b)->err, kTopicExists);
     EXPECT_EQ(h.idOf("stat"), -1);
     const int64_t exact = h.submit(Op::DefineDisk, "Stat");
     h.settle();
-    EXPECT_EQ(h.response(exact)->err, kOk) << "the exact name still adopts the static topic";
+    EXPECT_EQ(h.response(exact)->err, kOk) << "the exact name still adopts the untyped topic";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
 TEST(DdlFixRegression, B3_CaseVariantsOfTheSourceTopicAreRefused) {
-    // The harness's typed source "src": SRC / Src never become new topics or views.
     DdlHarness h;
     const int32_t srcId = h.idOf("src");
     ASSERT_GE(srcId, 0);
@@ -656,28 +688,15 @@ TEST(DdlFixRegression, B3_ARefusedVariantDoesNotPoisonTheQueueBehindIt) {
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-TEST(DdlFixRegression, B3_OrphanPlaceholderNamesCanNeverBeAFoldTarget) {
-    // __orphan.<id> placeholders are hidden, and every name folding onto one starts
-    // with "__" — refused InvalidTopicName (40) before the fold rule is reached.
+// Was B3_OrphanPlaceholderNamesCanNeverBeAFoldTarget: no placeholder exists any
+// more, but every "__"-name (a placeholder's included) is still refused 40 before
+// the fold rule, and the name of a create that never committed is free in any case.
+TEST(DdlFixRegression, B3_ReservedNamesAreRefusedBeforeTheFoldRuleAndAnUncommittedNameIsFree) {
     DdlHarness h;
-    h.setControl(ControlMode::Hold);
-    const int64_t o = h.submit(Op::ViewPersisted, "orph");
-    ASSERT_TRUE(h.tickUntilCreatePending());
-    h.failCreate(/*afterCreate=*/true);
-    h.setControl(ControlMode::Auto);
-    h.settle();
-    ASSERT_EQ(h.response(o)->err, kInternal);
-    const int32_t orphanId = h.idOf("orph");
-    const int64_t l = h.submit(Op::DefineDisk, "later");   // a later id keeps the orphan's slot
-    h.settle();
-    ASSERT_EQ(h.response(l)->err, kOk);
-    h.restart();
-    const std::string placeholder = orphanPlaceholderName(orphanId);
-    ASSERT_EQ(h.idOf(placeholder), orphanId);
-    std::string upper = placeholder;
-    for (char& ch : upper) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-    ASSERT_NE(upper, placeholder);
-    ASSERT_TRUE(rune::catalog::topicNamesFoldEqual(upper, placeholder));
+    const int32_t wouldBe = h.state().nextTopicId();
+    ASSERT_EQ(refusedAtAppend(h, Op::ViewPersisted, "orph"), kNotLeader);
+    std::string upper = "__ORPHAN." + std::to_string(wouldBe);
+    ASSERT_TRUE(cat::topicNamesFoldEqual(upper, "__orphan." + std::to_string(wouldBe)));
     const int32_t topics = h.topicCount();
     int64_t c[4];
     int i = 0;
@@ -685,14 +704,13 @@ TEST(DdlFixRegression, B3_OrphanPlaceholderNamesCanNeverBeAFoldTarget) {
     h.settle();
     for (const int64_t corr : c) EXPECT_EQ(h.response(corr)->err, kInvalidTopicName);
     EXPECT_EQ(h.topicCount(), topics);
-    // And the orphan's freed user name is creatable again in any case.
     const int64_t again = h.submit(Op::DefineDisk, "ORPH");
     h.settle();
-    EXPECT_EQ(h.response(again)->err, kOk);
+    EXPECT_EQ(h.response(again)->err, kOk) << "the uncommitted create's name is creatable in any case";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-// ── B3: the control-thread half (createTopicForAdmin) and the reply ring ──────
+// ── B3: the TopicRegistry's folded lookup (control thread, unchanged) ──────────
 TEST(DdlFixRegression, B3_TopicRegistryFoldedLookupNeverMatchesTheExactName) {
     const fs::path dir = fs::temp_directory_path() / ("rune_ddl_fold_" + std::to_string(::getpid()));
     fs::create_directories(dir);
@@ -709,104 +727,67 @@ TEST(DdlFixRegression, B3_TopicRegistryFoldedLookupNeverMatchesTheExactName) {
     std::error_code ec; fs::remove_all(dir, ec);
 }
 
-namespace {
-struct ControlFoldCase { const char* existing; const char* variant; uint8_t existingMode; uint8_t requestMode; int32_t parts; };
-} // namespace
-
-TEST(DdlFixRegression, B3_ControlThreadRefusesEveryCaseVariantAndReportsTheExistingTopic) {
-    const ControlFoldCase cases[] = {
-        {"Orders", "orders", 0, 0, 3}, {"orders", "Orders", 0, 1, 2}, {"Orders", "ORDERS", 1, 0, 1},
-        {"Ab.c-D_1", "aB.C-d_1", 1, 1, 4},
+// Was B3_ControlThreadRefusesEveryCaseVariantAndReportsTheExistingTopic: the
+// catalog's fold rule (CatalogState::liveNameFoldingOnto) names the existing live
+// name; the leader answers 25 with ITS id and the library's apply refuses a
+// fold-colliding create on every broker.
+TEST(DdlFixRegression, B3_CatalogRefusesEveryCaseVariantAndReportsTheExistingTopic) {
+    struct FoldCase2 { const char* existing; const char* variant; uint8_t existingMode; uint8_t requestMode; };
+    const FoldCase2 cases[] = {
+        {"Orders", "orders", 0, 0}, {"orders", "Orders", 0, 1}, {"Orders", "ORDERS", 1, 0}, {"Ab.c-D_1", "aB.C-d_1", 1, 1},
     };
-    for (const ControlFoldCase& c : cases) {
+    for (const FoldCase2& c : cases) {
         SCOPED_TRACE(std::string(c.existing) + " vs " + c.variant);
-        const fs::path dir = fs::temp_directory_path() / ("rune_ddl_ctlfold_" + std::to_string(::getpid()));
-        fs::create_directories(dir);
-        {
-            rune::gateway::TopicRegistry reg({}, dir.string());
-            CreateTopicReqMsg first; first.ticket = 1; first.name = c.existing; first.partitionCount = c.parts;
-            first.persistence = c.existingMode;
-            const CreateTopicReplyMsg r1 = createTopicForAdmin(reg, first);
-            ASSERT_GE(r1.topicId, 0);
-            EXPECT_FALSE(r1.caseConflict);
-
-            CreateTopicReqMsg variant; variant.ticket = 2; variant.name = c.variant; variant.partitionCount = 7;
-            variant.persistence = c.requestMode;
-            const CreateTopicReplyMsg r2 = createTopicForAdmin(reg, variant);
-            EXPECT_EQ(r2.ticket, 2);
-            EXPECT_EQ(r2.topicId, r1.topicId) << "the colliding topic's id";
-            EXPECT_TRUE(r2.existed);
-            EXPECT_TRUE(r2.caseConflict);
-            EXPECT_EQ(r2.partitionCount, c.parts) << "the existing topic's count, never the request's";
-            EXPECT_EQ(r2.persistence, c.existingMode) << "the existing topic's mode";
-            EXPECT_EQ(reg.topicCount(), 1) << "nothing created";
-            EXPECT_EQ(reg.topicIdForName(c.variant), std::nullopt);
-
-            // The exact name is the pre-B3 idempotent path: existed, no conflict.
-            const CreateTopicReplyMsg r3 = createTopicForAdmin(reg, first);
-            EXPECT_EQ(r3.topicId, r1.topicId);
-            EXPECT_TRUE(r3.existed);
-            EXPECT_FALSE(r3.caseConflict);
-        }
-        std::error_code ec; fs::remove_all(dir, ec);
+        DdlHarness h;
+        const int64_t a = h.submit(c.existingMode ? Op::DefineTransient : Op::DefineDisk, c.existing);
+        h.settle();
+        ASSERT_EQ(h.response(a)->err, kOk);
+        const std::string* folds = h.state().liveNameFoldingOnto(c.variant);
+        ASSERT_NE(folds, nullptr);
+        EXPECT_EQ(*folds, c.existing);
+        EXPECT_EQ(h.state().liveNameFoldingOnto(c.existing), nullptr) << "the exact name is not a conflict";
+        const int64_t b = h.submit(c.requestMode ? Op::DefineTransient : Op::DefineDisk, c.variant);
+        h.settle();
+        EXPECT_EQ(h.response(b)->err, kTopicExists);
+        EXPECT_EQ(h.response(b)->id, h.idOf(c.existing)) << "the colliding topic's id";
+        EXPECT_EQ(h.topicCount(), 3) << "nothing created (src, src2, the existing one)";
+        const Catalog cat = h.catalog();
+        const CatalogEntry* e = findEntry(cat, c.existing);
+        ASSERT_NE(e, nullptr);
+        EXPECT_EQ(e->persistence, c.existingMode ? PersistenceMode::Transient : PersistenceMode::Disk)
+            << "the existing topic keeps its mode";
+        // The library: a fold-colliding create is refused by every broker's apply.
+        const auto r = cat::previewFingerprint(h.state(), createTopicEvent(h.state(), c.variant));
+        ASSERT_FALSE(r.has_value());
+        EXPECT_NE(r.error().detail.find("case-folds onto"), std::string::npos) << r.error().detail;
+        EXPECT_TRUE(h.violations().empty()) << h.violationText();
     }
 }
 
-TEST(DdlFixRegression, B3_CaseConflictCrossesTheReplyRing) {
-    OneToOneByteRing ring{kCreateTopicRingBytes};
-    CreateTopicReplyMsg m;
-    m.ticket = 5; m.topicId = 3; m.partitionCount = 2; m.existed = true; m.persistence = 0; m.caseConflict = true;
-    ASSERT_TRUE(encodeCreateTopicReply(ring, m));
-    CreateTopicReplyMsg plain = m;
-    plain.caseConflict = false;
-    ASSERT_TRUE(encodeCreateTopicReply(ring, plain));
-    int frames = 0;
-    ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
-                   aeron::util::index_t len) {
-        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
-        const std::size_t n = static_cast<std::size_t>(len);
-        ASSERT_EQ(n, 21u) << "the B3 trailer is byte 18 (Task 14's sinkSpecMatches 19, I2's 20)";
-        const CreateTopicReplyMsg got = decodeCreateTopicReply(p, n);
-        EXPECT_EQ(got.caseConflict, frames == 0);
-        EXPECT_EQ(decodeCreateTopicReply(p, n - 1).caseConflict, frames == 0)
-            << "a pre-I2 (20-byte) frame still carries the B3 trailer";
-        EXPECT_EQ(got.ticket, 5);
-        EXPECT_EQ(got.topicId, 3);
-        EXPECT_EQ(got.partitionCount, 2);
-        EXPECT_TRUE(got.existed);
-        EXPECT_EQ(got.persistence, 0);
-        EXPECT_EQ(decodeCreateTopicReply(p, n - 2).caseConflict, frames == 0)
-            << "a pre-Task-14 (19-byte) frame still carries the B3 trailer";
-        const CreateTopicReplyMsg old = decodeCreateTopicReply(p, n - 3);
-        EXPECT_FALSE(old.caseConflict) << "a pre-B3 frame decodes as no conflict";
-        EXPECT_EQ(old.persistence, 0) << "and keeps every earlier field";
-        ++frames;
-    }, 4);
-    EXPECT_EQ(frames, 2);
-}
-
-TEST(DdlFixRegression, B3_FailedCreateAfterAFoldCheckIsInternalNotTopicExists) {
-    // The harness's failCreate overwrites the reply with a failure: a stale
-    // caseConflict flag must not survive it (else the admin thread would answer 25).
+// Was B3_FailedCreateAfterAFoldCheckIsInternalNotTopicExists: a refused APPEND is
+// never TopicExists, and the fold answer never depends on the append — below
+// minIsr the variant is still 25 (decided first), the free name the retriable 2.
+TEST(DdlFixRegression, B3_FoldAnswerPrecedesTheAppendAndARefusedAppendIsNotLeader) {
     DdlHarness h;
     const int64_t a = h.submit(Op::DefineDisk, "Orders");
     h.settle();
     ASSERT_EQ(h.response(a)->err, kOk);
+    h.shrinkIsr();
     for (const Op op : kCreateOps) {
         SCOPED_TRACE(opLabel(op));
-        h.setControl(ControlMode::Hold);
-        const int64_t b = h.submit(op, "orders");
-        ASSERT_TRUE(h.tickUntilCreatePending());
-        h.failCreate(/*afterCreate=*/true);
-        h.setControl(ControlMode::Auto);
+        const int64_t v = h.submit(op, "orders");
+        const int64_t f = h.submit(op, std::string("free_") + opLabel(op));
         h.settle();
-        EXPECT_EQ(h.response(b)->err, kInternal);
+        EXPECT_EQ(h.response(v)->err, kTopicExists);
+        EXPECT_EQ(h.response(f)->err, kNotLeader);
         EXPECT_EQ(h.idOf("orders"), -1);
     }
+    h.restoreIsr();
+    h.settle();
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-// ── fix-on-sight: a REJECTED name is logged escaped (no log-line injection) ────
+// ── fix-on-sight: a REJECTED name is reported escaped (no log-line injection) ────
 namespace {
 struct EscapeCase { std::string raw; std::string logged; const char* label; };
 std::vector<EscapeCase> escapeCases() {
@@ -827,28 +808,19 @@ std::vector<EscapeCase> escapeCases() {
     };
 }
 void PrintTo(const EscapeCase& c, std::ostream* os) { *os << c.label; }
-
-struct LogCapture {
-    std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> sink =
-        std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(64);
-    std::shared_ptr<spdlog::logger> prev = spdlog::default_logger();
-    LogCapture() {
-        auto lg = std::make_shared<spdlog::logger>("capture", sink);
-        lg->set_level(spdlog::level::trace);
-        lg->set_pattern("%v");
-        spdlog::set_default_logger(lg);
-    }
-    ~LogCapture() { spdlog::set_default_logger(prev); }
-    LogCapture(const LogCapture&) = delete;
-    LogCapture& operator=(const LogCapture&) = delete;
-};
+bool printableAscii(const std::string& s) {
+    return std::all_of(s.begin(), s.end(), [](char ch) {
+        const auto u = static_cast<unsigned char>(ch);
+        return u >= 0x20 && u < 0x7f;
+    });
+}
 } // namespace
 
 class DdlLogEscapeRegression : public ::testing::TestWithParam<EscapeCase> {};
 
 TEST_P(DdlLogEscapeRegression, EscapedNameIsPrintableAsciiOnly) {
     const EscapeCase& c = GetParam();
-    const std::string got = rune::catalog::escapeNameForLog(c.raw);
+    const std::string got = cat::escapeNameForLog(c.raw);
     EXPECT_EQ(got, c.logged);
     for (const char ch : got) {
         const auto u = static_cast<unsigned char>(ch);
@@ -856,73 +828,75 @@ TEST_P(DdlLogEscapeRegression, EscapedNameIsPrintableAsciiOnly) {
     }
 }
 
-TEST_P(DdlLogEscapeRegression, ControlThreadLogsTheRejectedNameOnOneEscapedLine) {
+// Was ControlThreadLogsTheRejectedNameOnOneEscapedLine: the client-visible detail
+// the admin thread answers for a rejected name (DropTopic of an unknown topic) is
+// one escaped, printable line.
+TEST_P(DdlLogEscapeRegression, AdminDetailCarriesTheRejectedNameOnOneEscapedLine) {
     const EscapeCase& c = GetParam();
-    if (rune::catalog::isValidTopicName(c.raw)) GTEST_SKIP() << "only rejected names are logged here";
-    const fs::path dir = fs::temp_directory_path() / ("rune_ddl_logesc_" + std::to_string(::getpid()));
-    fs::create_directories(dir);
-    {
-        rune::gateway::TopicRegistry reg({}, dir.string());
-        CreateTopicReqMsg req; req.ticket = 1; req.partitionCount = 1; req.name = c.raw;
-        std::vector<std::string> lines;
-        {
-            LogCapture cap;
-            EXPECT_EQ(createTopicForAdmin(reg, req).topicId, -1);
-            lines = cap.sink->last_formatted();
-        }
-        ASSERT_EQ(lines.size(), 1u);
-        const std::string& line = lines[0];
-        EXPECT_NE(line.find("name='" + c.logged + "'"), std::string::npos) << line;
-        const std::string body = line.substr(0, line.find_last_not_of("\r\n") + 1);
-        for (const char ch : body) {
-            const auto u = static_cast<unsigned char>(ch);
-            EXPECT_TRUE(u >= 0x20 && u < 0x7f) << "raw byte " << static_cast<int>(u) << " in: " << body;
-        }
-    }
-    std::error_code ec; fs::remove_all(dir, ec);
+    if (cat::isValidTopicName(c.raw)) GTEST_SKIP() << "only rejected names are checked here";
+    DdlHarness h;
+    DropTopicMsg m;
+    m.name = c.raw;
+    const int64_t corr = h.submitRawDropTopic(std::move(m));
+    h.settle();
+    ASSERT_TRUE(h.response(corr).has_value());
+    EXPECT_EQ(h.response(corr)->err, kUnknownTopic);
+    const std::string detail = h.response(corr)->detail;
+    EXPECT_EQ(detail, "no topic named '" + c.logged + "'");
+    EXPECT_TRUE(printableAscii(detail)) << detail;
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
 INSTANTIATE_TEST_SUITE_P(EveryByteClass, DdlLogEscapeRegression, ::testing::ValuesIn(escapeCases()),
                          [](const ::testing::TestParamInfo<EscapeCase>& i) { return std::string(i.param.label); });
 
 TEST(DdlFixRegression, LogEscape_ForgedLogLineStaysOnTheRejectionLine) {
-    const fs::path dir = fs::temp_directory_path() / ("rune_ddl_logforge_" + std::to_string(::getpid()));
-    fs::create_directories(dir);
-    {
-        rune::gateway::TopicRegistry reg({}, dir.string());
-        CreateTopicReqMsg req; req.ticket = 1; req.partitionCount = 1;
-        req.name = "x\n[2026-10-12 00:00:00.000] [info] admin: granted superuser";
-        LogCapture cap;
-        (void)createTopicForAdmin(reg, req);
-        const std::vector<std::string> lines = cap.sink->last_formatted();
-        ASSERT_EQ(lines.size(), 1u);
-        EXPECT_EQ(std::count(lines[0].begin(), lines[0].end(), '\n'), 1) << "only the line terminator: " << lines[0];
-        EXPECT_NE(lines[0].find("x\\x0a[2026-10-12"), std::string::npos) << lines[0];
-    }
-    std::error_code ec; fs::remove_all(dir, ec);
+    DdlHarness h;
+    DropTopicMsg m;
+    m.name = "x\n[2026-10-12 00:00:00.000] [info] admin: granted superuser";
+    const int64_t corr = h.submitRawDropTopic(std::move(m));
+    h.settle();
+    ASSERT_TRUE(h.response(corr).has_value());
+    const std::string detail = h.response(corr)->detail;
+    EXPECT_EQ(std::count(detail.begin(), detail.end(), '\n'), 0) << detail;
+    EXPECT_NE(detail.find("x\\x0a[2026-10-12"), std::string::npos) << detail;
 }
 
 // ── B4 / KL2 / re-promotion ──────────────────────────────────────────────────
-TEST(DdlFixRegression, B4_DemotionAnswersAnInFlightCreateImmediately) {
-    DdlHarness h;
-    h.setControl(ControlMode::Hold);
-    const int64_t a = h.submit(Op::DefineDisk, "n");
-    ASSERT_TRUE(h.tickUntilCreatePending());
+// Was B4_DemotionAnswersAnInFlightCreateImmediately (AwaitingId): the in-flight
+// define is in AwaitingCommit.  Spec §5.2: answered the retriable NotLeader at
+// once; its event commits under the re-promoted leader, and the client's retry
+// (same requestId) is answered the ORIGINAL result (was: adopts the orphan).
+TEST(DdlFixRegression, B4_DemotionAnswersAnInFlightCreateImmediatelyAndTheRetryDedupes) {
+    DdlHarnessOptions o;
+    o.holdCommits = true;
+    DdlHarness h(o);
+    DefineTopicMsg m;
+    m.name = "n"; m.partitionCount = 1; m.keyField = "id"; m.blob = charBlob();
+    m.meta = h.rig().meta("CREATE TOPIC n");
+    const DefineTopicMsg retry = m;
+    const int64_t a = h.submitRawDefine(std::move(m));
+    ASSERT_TRUE(h.tickUntilAppended());
     h.demote();
     ASSERT_TRUE(h.response(a).has_value()) << "answered on demotion, not after the 30 s timeout";
-    EXPECT_EQ(h.response(a)->err, kInternal);
+    EXPECT_EQ(h.response(a)->err, kNotLeader);
     EXPECT_FALSE(h.worker().hasInFlight());
-    h.deliverCreate();   // the control thread's reply arrives late: a stale ticket
-    EXPECT_EQ(h.schemas().byName("n"), nullptr) << "never applied";
+    EXPECT_EQ(h.schemas().byName("n"), nullptr) << "not applied off a follower";
     h.promote();
-    h.setControl(ControlMode::Auto);
-    const int64_t b = h.submit(Op::DefineDisk, "n");
     h.settle();
-    EXPECT_EQ(h.response(b)->err, kOk) << "the retry adopts the orphan (SchemaLessDisk row)";
+    const int64_t events = static_cast<int64_t>(h.eventsAppended());
+    const int64_t b = h.submitRawDefine(retry);
+    h.settle();
+    EXPECT_EQ(h.response(b)->err, kOk) << "the retry gets the original result";
+    EXPECT_EQ(h.response(b)->id, h.idOf("n"));
+    EXPECT_EQ(static_cast<int64_t>(h.eventsAppended()), events) << "deduped: nothing appended twice";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-TEST(DdlFixRegression, B4_DemotionAnswersAnInFlightCommitAndNeverAppliesIt) {
+// A follower never commits an op off its own HW; once re-promoted the event
+// commits under the new epoch and applies (spec §5.2, F13 — it was answered the
+// retriable NotLeader, never applied twice).
+TEST(DdlFixRegression, B4_DemotionAnswersAnInFlightCommitAndAFollowerNeverAppliesIt) {
     DdlHarnessOptions o;
     o.holdCommits = true;
     DdlHarness h(o);
@@ -930,9 +904,12 @@ TEST(DdlFixRegression, B4_DemotionAnswersAnInFlightCommitAndNeverAppliesIt) {
     ASSERT_TRUE(h.tickUntilAppended());
     h.demote();
     ASSERT_TRUE(h.response(a).has_value());
-    EXPECT_EQ(h.response(a)->err, kInternal);
+    EXPECT_EQ(h.response(a)->err, kNotLeader);
     for (int i = 0; i < 10; ++i) h.tick();
     EXPECT_EQ(h.schemas().byName("src")->version, 1u) << "a follower never commits an op off its own HW";
+    h.promote();
+    h.settle();
+    EXPECT_EQ(h.schemas().byName("src")->version, 2u) << "committed under the re-promoted leader, applied once";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
@@ -943,20 +920,24 @@ TEST(DdlFixRegression, B4_RepromotionKeepsTheCatalogExact) {
     ASSERT_EQ(h.response(v)->err, kOk);
     const Catalog before = h.catalog();
     const std::size_t views = h.views().all().size();
+    const int installs = h.viewPlanPushes() + h.recoveryViewInstalls();
     h.demote();
     h.promote();
-    EXPECT_EQ(h.catalog(), before) << "promotion replays onto un-cleared registries: no duplicates, no loss";
+    h.settle();
+    EXPECT_EQ(h.catalog(), before) << "a promotion rebuilds nothing: no duplicates, no loss";
     EXPECT_EQ(h.views().all().size(), views);
+    EXPECT_EQ(h.viewPlanPushes() + h.recoveryViewInstalls(), installs) << "no view re-installed";
     const int64_t d = h.submit(Op::DefineDisk, "after");
     h.settle();
     EXPECT_EQ(h.response(d)->err, kOk);
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-// KNOWN LIMITATION KL2: an op answered Internal after its record was appended is in
-// doubt.  The live registry never applies it; its committed record is replayed on
-// restart.  Pinned so any change to this behaviour is deliberate.
-TEST(DdlFixRegression, KL2_TimeoutInAwaitingCommitIsInDoubtAndReplayedOnRestart) {
+// KL2 resolved by F13: an op whose commit timed out is answered the retriable
+// NotLeader (was Internal, in doubt); the leader catches up (NotLeader to new
+// DDL) until its event is applied, and the committed event is applied LIVE (was:
+// only on restart).  A restart keeps it.
+TEST(DdlFixRegression, KL2_TimeoutInAwaitingCommitIsNotLeaderAndAppliedOnceCommitted) {
     DdlHarnessOptions o;
     o.holdCommits = true;
     DdlHarness h(o);
@@ -965,150 +946,130 @@ TEST(DdlFixRegression, KL2_TimeoutInAwaitingCommitIsInDoubtAndReplayedOnRestart)
     h.advance(AdminWorker::ddlTimeoutNs() + 1'000'000);
     h.tick();
     ASSERT_TRUE(h.response(a).has_value());
-    EXPECT_EQ(h.response(a)->err, kInternal);
+    EXPECT_EQ(h.response(a)->err, kNotLeader);
+    EXPECT_EQ(h.worker().roleName(), "LeaderCatchingUp");
+    const int64_t b = h.submit(Op::DefineDisk, "behind");
+    h.tick();
+    ASSERT_TRUE(h.response(b).has_value());
+    EXPECT_EQ(h.response(b)->err, kNotLeader) << "no event is built on a state missing the appended one";
+    EXPECT_EQ(h.schemas().byName("src")->version, 1u) << "not applied before it commits";
     h.releaseCommits();
     for (int i = 0; i < 5; ++i) h.tick();
-    EXPECT_EQ(h.schemas().byName("src")->version, 1u) << "KL2: the live registry never applies it";
+    EXPECT_EQ(h.schemas().byName("src")->version, 2u) << "the committed event is applied live";
+    EXPECT_TRUE(h.worker().isLeader()) << "caught up: serving again";
     h.restart();
-    EXPECT_EQ(h.schemas().byName("src")->version, 2u) << "KL2: its committed record is replayed on restart";
+    EXPECT_EQ(h.schemas().byName("src")->version, 2u) << "and replayed on restart";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-// ── B4 matrix: demotion at EVERY async state of an in-flight DDL op ───────────
-// Define / CreateView AwaitingId (the id / sink request is with the control
-// thread), Define / CreateView / Alter AwaitingCommit (the record is appended,
-// the HW does not cover it yet).  For each: an immediate Internal; nothing
-// applied live (not on the late reply, not after the HW later covers the
-// record, not on re-promotion); a demoted worker starts nothing (every op it
-// dequeues is refused Internal at the leader guard: no create request, no
-// append); after re-promotion the queue runs in FIFO order.  After a restart an
-// AwaitingId op is still absent; an AwaitingCommit op is in doubt (KL2): its
-// appended record is replayed.
+// ── B4 matrix: demotion while an op awaits its commit ─────────────────────────
+// The AwaitingId states (DefineAwaitingId / ViewAwaitingId) are gone with the
+// create round-trip (Task 9); every DDL kind now has exactly one async state,
+// AwaitingCommit — pinned for Define, View, Alter and two of the new kinds.  For
+// each: an immediate NotLeader; nothing applied off a follower; a demoted worker
+// starts nothing (every queued op is refused NotLeader at the role gate: no
+// append); after re-promotion the event commits and applies once (spec §5.2), and
+// the leader serves.  A restart keeps it.
 enum class B4State : uint8_t {
-    DefineAwaitingId, ViewAwaitingId, DefineAwaitingCommit, ViewAwaitingCommit, AlterAwaitingCommit,
+    DefineAwaitingCommit, ViewAwaitingCommit, AlterAwaitingCommit, DropTopicAwaitingCommit, AlterViewAwaitingCommit,
 };
 
 [[nodiscard]] static const char* b4StateName(B4State s) noexcept {
     switch (s) {
-        case B4State::DefineAwaitingId:     return "DefineAwaitingId";
-        case B4State::ViewAwaitingId:       return "ViewAwaitingId";
-        case B4State::DefineAwaitingCommit: return "DefineAwaitingCommit";
-        case B4State::ViewAwaitingCommit:   return "ViewAwaitingCommit";
-        case B4State::AlterAwaitingCommit:  return "AlterAwaitingCommit";
+        case B4State::DefineAwaitingCommit:    return "DefineAwaitingCommit";
+        case B4State::ViewAwaitingCommit:      return "ViewAwaitingCommit";
+        case B4State::AlterAwaitingCommit:     return "AlterAwaitingCommit";
+        case B4State::DropTopicAwaitingCommit: return "DropTopicAwaitingCommit";
+        case B4State::AlterViewAwaitingCommit: return "AlterViewAwaitingCommit";
     }
     return "?";
 }
 static void PrintTo(B4State s, std::ostream* os) { *os << b4StateName(s); }
-[[nodiscard]] static bool b4AwaitingCommit(B4State s) noexcept {
-    return s == B4State::DefineAwaitingCommit || s == B4State::ViewAwaitingCommit ||
-           s == B4State::AlterAwaitingCommit;
-}
-[[nodiscard]] static bool b4AwaitingId(B4State s) noexcept { return !b4AwaitingCommit(s); }
 
 class DdlDemotionRegression : public ::testing::TestWithParam<B4State> {
 protected:
-    static DdlHarnessOptions options(B4State s) {
+    static DdlHarnessOptions options() {
         DdlHarnessOptions o;
-        o.holdCommits = b4AwaitingCommit(s);
+        o.holdCommits = true;
         return o;
     }
-    /// Submit the op and drive it into state `s`; returns its corr.
+    /// The setup the state needs (a view to alter, a topic to drop), committed.
+    static void prepare(DdlHarness& h, B4State s) {
+        if (s == B4State::DropTopicAwaitingCommit) createOk(h, Op::DefineDisk, "n");
+        if (s == B4State::AlterViewAwaitingCommit) createOk(h, Op::ViewPersisted, "v");
+    }
+    /// Submit the op and drive it into AwaitingCommit; returns its corr.
     static int64_t driveInto(DdlHarness& h, B4State s) {
         int64_t c = -1;
         switch (s) {
-            case B4State::DefineAwaitingId:
-                h.setControl(ControlMode::Hold);
-                c = h.submit(Op::DefineDisk, "n");
-                EXPECT_TRUE(h.tickUntilCreatePending());
-                break;
-            case B4State::ViewAwaitingId:
-                h.setControl(ControlMode::Hold);
-                c = h.submit(Op::ViewPersisted, "v");
-                EXPECT_TRUE(h.tickUntilCreatePending());
-                break;
-            case B4State::DefineAwaitingCommit:
-                c = h.submit(Op::DefineDisk, "n");
-                EXPECT_TRUE(h.tickUntilAppended());
-                break;
-            case B4State::ViewAwaitingCommit:
-                c = h.submit(Op::ViewPersisted, "v");
-                EXPECT_TRUE(h.tickUntilAppended());
-                break;
-            case B4State::AlterAwaitingCommit:
-                c = h.submit(Op::AlterAdd, "src");
-                EXPECT_TRUE(h.tickUntilAppended());
-                break;
+            case B4State::DefineAwaitingCommit:    c = h.submit(Op::DefineDisk, "n"); break;
+            case B4State::ViewAwaitingCommit:      c = h.submit(Op::ViewPersisted, "v"); break;
+            case B4State::AlterAwaitingCommit:     c = h.submit(Op::AlterAdd, "src"); break;
+            case B4State::DropTopicAwaitingCommit: c = h.submit(Op::DropTopic, "n"); break;
+            case B4State::AlterViewAwaitingCommit: c = h.submit(Op::AlterView, "v"); break;
         }
+        EXPECT_TRUE(h.tickUntilAppended());
         EXPECT_TRUE(h.worker().hasInFlight());
         EXPECT_FALSE(h.response(c).has_value());
         return c;
     }
-    /// Did the in-flight op's effect reach the admin catalogs?
-    static bool applied(DdlHarness& h, B4State s) {
+    /// Did the in-flight op's effect reach the applied catalog?
+    static bool applied(DdlHarness& h, B4State s, int32_t viewSinkBefore) {
         switch (s) {
-            case B4State::DefineAwaitingId:
-            case B4State::DefineAwaitingCommit:
-                return h.schemas().byName("n") != nullptr;
-            case B4State::ViewAwaitingId:
-            case B4State::ViewAwaitingCommit:
-                return h.views().byName("v") != nullptr || h.schemas().byName("v") != nullptr;
-            case B4State::AlterAwaitingCommit:
-                return h.schemas().byName("src")->version != 1u;
+            case B4State::DefineAwaitingCommit:    return h.schemas().byName("n") != nullptr;
+            case B4State::ViewAwaitingCommit:      return h.views().byName("v") != nullptr;
+            case B4State::AlterAwaitingCommit:     return h.schemas().byName("src")->version != 1u;
+            case B4State::DropTopicAwaitingCommit: return h.idOf("n") == -1;
+            case B4State::AlterViewAwaitingCommit: return h.idOf("v") != viewSinkBefore;
         }
         return true;
     }
 };
 
-TEST_P(DdlDemotionRegression, DemotionAnswersInternalAtOnceStartsNothingAndAppliesNothing) {
+TEST_P(DdlDemotionRegression, DemotionAnswersNotLeaderAtOnceStartsNothingAndAppliesOnlyOnceCommitted) {
     const B4State s = GetParam();
-    DdlHarness h(options(s));
-    const int pushes0 = h.viewPlanPushes(), validators0 = h.validatorPushes();
+    DdlHarness h(options());
+    prepare(h, s);
+    if (HasFatalFailure()) return;
+    const int32_t sink0 = h.idOf("v");
     const int64_t x = driveInto(h, s);
     const int64_t y = h.submit(Op::AlterAdd, "src2");       // queued behind x
     const int64_t w = h.submit(Op::DefineDisk, "queued");   // queued behind y
 
     h.demote();
-    ASSERT_TRUE(h.response(x).has_value()) << "answered inside onRole(follower), not on a tick or the timeout";
-    EXPECT_EQ(h.response(x)->err, kInternal);
+    ASSERT_TRUE(h.response(x).has_value()) << "answered inside onCatalogRole(follower), not on a tick or the timeout";
+    EXPECT_EQ(h.response(x)->err, kNotLeader);
     EXPECT_FALSE(h.worker().hasInFlight());
     EXPECT_FALSE(h.response(y).has_value()) << "demotion answers only the in-flight op";
 
-    // A demoted worker starts nothing: every queued op is refused at the leader
-    // guard (FIFO, checked by the harness), no create request, no append.
-    const int reqs = h.createRequests();
-    const int64_t schemaEnd = h.schemaLogEnd(), viewsEnd = h.viewsLogEnd();
+    // A demoted worker starts nothing: every queued op is refused at the role gate
+    // (FIFO, checked by the harness), no append.
+    const uint64_t events = h.eventsAppended();
+    const int64_t logEnd = h.catalogLogEnd();
     for (int i = 0; i < 10; ++i) h.tick();
     ASSERT_TRUE(h.response(y).has_value());
     ASSERT_TRUE(h.response(w).has_value());
-    EXPECT_EQ(h.response(y)->err, kInternal);
-    EXPECT_EQ(h.response(w)->err, kInternal);
-    EXPECT_EQ(h.createRequests(), reqs) << "no create request while demoted";
-    EXPECT_EQ(h.schemaLogEnd(), schemaEnd) << "no __topic_schemas append while demoted";
-    EXPECT_EQ(h.viewsLogEnd(), viewsEnd) << "no __views append while demoted";
+    EXPECT_EQ(h.response(y)->err, kNotLeader);
+    EXPECT_EQ(h.response(w)->err, kNotLeader);
+    EXPECT_EQ(h.eventsAppended(), events) << "no append while demoted";
+    EXPECT_EQ(h.catalogLogEnd(), logEnd);
     EXPECT_EQ(h.schemas().byName("src2")->version, 1u);
     EXPECT_EQ(h.schemas().byName("queued"), nullptr);
-
-    if (b4AwaitingId(s)) h.deliverCreate();   // the late reply: a stale ticket (an orphan)
-    for (int i = 0; i < 5; ++i) h.tick();
-    EXPECT_FALSE(applied(h, s)) << "never applied off a follower";
+    EXPECT_FALSE(applied(h, s, sink0)) << "never applied off a follower";
 
     h.promote();
-    h.setControl(ControlMode::Auto);
-    h.settle();   // releases held commits: the HW now covers x's record
-    EXPECT_FALSE(applied(h, s)) << "re-promotion never applies an answered op";
-    EXPECT_EQ(h.viewPlanPushes(), pushes0);
-    EXPECT_EQ(h.validatorPushes(), validators0);
+    h.settle();   // the HW now covers x's event under the new epoch
+    EXPECT_TRUE(applied(h, s, sink0)) << "spec §5.2: the event answered NotLeader commits and applies once";
 
     const int64_t z = h.submit(Op::DefineDisk, "after");
     h.settle();
     ASSERT_TRUE(h.response(z).has_value());
     EXPECT_EQ(h.response(z)->err, kOk) << "the re-promoted leader serves DDL";
 
+    const Catalog before = h.catalog();
     h.restart();
-    if (b4AwaitingId(s))
-        EXPECT_FALSE(applied(h, s)) << "nothing was appended: still absent after a restart";
-    else
-        EXPECT_TRUE(applied(h, s)) << "KL2: an op demoted in AwaitingCommit is in doubt; its record replays";
+    EXPECT_EQ(h.catalog(), before);
+    EXPECT_TRUE(applied(h, s, sink0));
     EXPECT_NE(h.schemas().byName("after"), nullptr);
     EXPECT_EQ(h.schemas().byName("queued"), nullptr);
     EXPECT_EQ(h.schemas().byName("src2")->version, 1u);
@@ -1116,43 +1077,40 @@ TEST_P(DdlDemotionRegression, DemotionAnswersInternalAtOnceStartsNothingAndAppli
 }
 
 // Final review I4 (production truth): the admin thread keeps ticking while demoted,
-// so the leader guard answers every QUEUED op Internal on the ticks after the
-// demotion — in FIFO order, nothing started, nothing applied.  (The queue never
-// "survives into the new term": that needs zero admin ticks between demote and
-// promote, which production cannot produce.)  The re-promoted leader then serves
+// so the role gate answers every QUEUED op NotLeader on the ticks after the
+// demotion — in FIFO order, nothing started.  The re-promoted leader then serves
 // a fresh request.
-TEST_P(DdlDemotionRegression, DemotionAnswersEveryQueuedOpInternalInFifoOrder) {
+TEST_P(DdlDemotionRegression, DemotionAnswersEveryQueuedOpNotLeaderInFifoOrder) {
     const B4State s = GetParam();
-    DdlHarness h(options(s));
+    DdlHarness h(options());
+    prepare(h, s);
+    if (HasFatalFailure()) return;
     const int64_t x = driveInto(h, s);
     const int64_t y = h.submit(Op::DefineDisk, "q1");
     const int64_t w = h.submit(Op::AlterAdd, "src2");
     const int64_t u = h.submit(Op::ViewTransient, "q3");
-    const int reqs = h.createRequests();
+    const uint64_t events = h.eventsAppended();
 
     h.demote();
     ASSERT_TRUE(h.response(x).has_value());
-    EXPECT_EQ(h.response(x)->err, kInternal);
+    EXPECT_EQ(h.response(x)->err, kNotLeader);
     for (int i = 0; i < 10; ++i) h.tick();   // the admin thread ticks while demoted
     EXPECT_EQ(h.worker().pendingCount(), 0u) << "the queue drains while demoted";
     for (const int64_t c : {y, w, u}) {
         ASSERT_TRUE(h.response(c).has_value()) << "every queued op is answered while demoted";
-        EXPECT_EQ(h.response(c)->err, kInternal) << "retry on the new leader";
+        EXPECT_EQ(h.response(c)->err, kNotLeader) << "retry on the new leader";
     }
     std::vector<int64_t> order;
     for (const Response& r : h.responses())
         if (r.corr == x || r.corr == y || r.corr == w || r.corr == u) order.push_back(r.corr);
     EXPECT_EQ(order, (std::vector<int64_t>{x, y, w, u})) << "answered in FIFO order";
-    EXPECT_EQ(h.createRequests(), reqs) << "a demoted leader requests no topic";
+    EXPECT_EQ(h.eventsAppended(), events) << "a demoted leader appends nothing";
 
-    if (b4AwaitingId(s)) h.deliverCreate();   // x's stale reply
     h.promote();
-    h.setControl(ControlMode::Auto);
     h.settle();
     EXPECT_EQ(h.schemas().byName("q1"), nullptr);
     EXPECT_EQ(h.schemas().byName("src2")->version, 1u);
     EXPECT_EQ(h.views().byName("q3"), nullptr);
-    EXPECT_FALSE(applied(h, s));
     const int64_t z = h.submit(Op::DefineDisk, "q1");
     h.settle();
     ASSERT_TRUE(h.response(z).has_value());
@@ -1161,12 +1119,12 @@ TEST_P(DdlDemotionRegression, DemotionAnswersEveryQueuedOpInternalInFifoOrder) {
 }
 
 INSTANTIATE_TEST_SUITE_P(EveryAsyncState, DdlDemotionRegression,
-                         ::testing::Values(B4State::DefineAwaitingId, B4State::ViewAwaitingId,
-                                           B4State::DefineAwaitingCommit, B4State::ViewAwaitingCommit,
-                                           B4State::AlterAwaitingCommit),
+                         ::testing::Values(B4State::DefineAwaitingCommit, B4State::ViewAwaitingCommit,
+                                           B4State::AlterAwaitingCommit, B4State::DropTopicAwaitingCommit,
+                                           B4State::AlterViewAwaitingCommit),
                          [](const ::testing::TestParamInfo<B4State>& i) { return std::string(b4StateName(i.param)); });
 
-// ── B8 / user decision D3a: renaming the key field moves TopicSchema.keyField ────
+// ── B8 / user decision D3a: renaming the key field moves the schema's keyField ───
 TEST(DdlFixRegression, B8_RenamingTheKeyFieldMovesKeyFieldAndSurvivesRestart) {
     DdlHarness h;
     ASSERT_EQ(h.schemas().byName("src")->keyField, "id");
@@ -1176,7 +1134,7 @@ TEST(DdlFixRegression, B8_RenamingTheKeyFieldMovesKeyFieldAndSurvivesRestart) {
     EXPECT_EQ(h.schemas().byName("src")->keyField, "pk") << "live";
     EXPECT_EQ(h.schemas().byName("src")->version, 2u);
     h.restart();
-    EXPECT_EQ(h.schemas().byName("src")->keyField, "pk") << "replayed from the durable record";
+    EXPECT_EQ(h.schemas().byName("src")->keyField, "pk") << "replayed from the durable event";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
@@ -1190,7 +1148,7 @@ TEST(DdlFixRegression, B8_ChainedRenamesEndAtTheLastName) {
     ASSERT_EQ(h.response(c)->err, kOk);
     EXPECT_EQ(h.schemas().byName("src")->keyField, "b");
     h.restart();
-    EXPECT_EQ(h.schemas().byName("src")->keyField, "b") << "replayed from the durable record";
+    EXPECT_EQ(h.schemas().byName("src")->keyField, "b") << "replayed from the durable event";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
@@ -1208,11 +1166,13 @@ TEST(DdlFixRegression, B8_ARejectedAlterNeverMovesKeyField) {
     rune::codec::AlterOp r{}; r.type = rune::codec::AlterOpType::Rename; r.name = "id"; r.newName = "pk";
     rune::codec::AlterOp d{}; d.type = rune::codec::AlterOpType::Drop; d.name = "nosuch";
     AlterTopicMsg m; m.topicName = "src"; m.opsBlob = rune::codec::encodeAlterOps({r, d});
+    const int64_t logEnd = h.catalogLogEnd();
     const int64_t c = h.submitRawAlter(std::move(m));
     h.settle();
-    EXPECT_EQ(h.response(c)->err, kInvalidSchema) << "applyOps is atomic";
+    EXPECT_EQ(h.response(c)->err, kInvalidSchema) << "the ALTER is atomic";
     EXPECT_EQ(h.schemas().byName("src")->keyField, "id");
     EXPECT_EQ(h.schemas().byName("src")->version, 1u);
+    EXPECT_EQ(h.catalogLogEnd(), logEnd) << "nothing appended";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
@@ -1245,15 +1205,19 @@ TEST(DdlFixRegression, B9_ViewOverAViewIsViewSourceIsViewAndCreatesNothing) {
         for (const Op outer : {Op::ViewPersisted, Op::ViewTransient}) {
             SCOPED_TRACE(std::string(opName(first)) + " then " + opName(outer));
             const Catalog before = h.catalog();
-            const int reqs = h.createRequests();
-            const int64_t viewsEnd = h.viewsLogEnd();
+            const uint64_t events = h.eventsAppended();
+            const int64_t logEnd = h.catalogLogEnd();
             const int64_t c = h.submit(outer, "outer", inner);
             h.settle();
             EXPECT_EQ(h.response(c)->err, kViewSourceIsView);
-            EXPECT_EQ(h.createRequests(), reqs) << "no sink requested";
-            EXPECT_EQ(h.viewsLogEnd(), viewsEnd) << "no __views record";
+            EXPECT_EQ(h.eventsAppended(), events) << "no event";
+            EXPECT_EQ(h.catalogLogEnd(), logEnd);
             EXPECT_EQ(h.catalog(), before);
         }
+        // ALTER VIEW onto a view's output is refused the same way.
+        const int64_t av = h.submit(Op::AlterView, inner, inner);
+        h.settle();
+        EXPECT_EQ(h.response(av)->err, kViewSourceIsView) << "ALTER VIEW over a view";
     }
     h.restart();
     const int64_t again = h.submit(Op::ViewPersisted, "outer", "inner_p");
@@ -1277,87 +1241,71 @@ TEST(DdlFixRegression, B9_AViewOutputAsALaterSourceIsViewSourceIsView) {
     const int64_t c0 = h.submit(Op::ViewPersisted, "inner");
     h.settle();
     ASSERT_EQ(h.response(c0)->err, kOk);
-    namespace rv = rune::view;
-    rv::ViewPlan p;
-    p.viewName = "outer";
-    p.key = "id";
-    p.persistence = 0;
-    p.sources.push_back(rv::SourceSpec{h.idOf("src"), "id"});
-    p.sources.push_back(rv::SourceSpec{h.idOf("inner"), "id"});
-    p.output.push_back(rv::AuthoredField{"id", rune::codec::PrimType::Int64, 0, "id", rv::MergeRule::Replace});
     CreateViewMsg m;
     m.viewName = "outer"; m.keyField = "id"; m.persistence = 0;
-    m.planBlob = rv::serializeAuthored(p);
+    m.planBlob = viewPlanBlob("outer", std::vector<int32_t>{h.idOf("src"), h.idOf("inner")}, 0);
     const Catalog before = h.catalog();
-    const int reqs = h.createRequests();
+    const uint64_t events = h.eventsAppended();
     const int64_t c = h.submitRawView(std::move(m));
     h.settle();
     EXPECT_EQ(h.response(c)->err, kViewSourceIsView);
-    EXPECT_EQ(h.createRequests(), reqs);
+    EXPECT_EQ(h.eventsAppended(), events);
     EXPECT_EQ(h.catalog(), before);
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-// ── B4 fix round 1: AwaitingCommit with its commit replica missing answers the
-//    op Internal (never a silent drop: the client would hang), logs, counts, and
-//    the next queued op starts.  Unreachable in production (an op reaches
-//    AwaitingCommit only after appending to that replica); forced via the
-//    test-only AdminWorkerTestAccess::swapReplicas hook.
-TEST(DdlFixRegression, B4_MissingSchemaReplicaInAwaitingCommitAnswersInternal) {
-    for (const Op op : {Op::AlterAdd, Op::DefineDisk}) {
-        SCOPED_TRACE(opName(op));
-        DdlHarnessOptions o;
-        o.holdCommits = true;
-        DdlHarness h(o);
-        const int64_t a = h.submit(op, op == Op::AlterAdd ? "src" : "n");
-        ASSERT_TRUE(h.tickUntilAppended());
-        ASSERT_TRUE(h.worker().hasInFlight());
-        const int64_t next = h.submit(Op::ViewPersisted, "v");   // uses only the __views replica
-        const auto saved = AdminWorkerTestAccess::swapReplicas(h.worker(), {});
-        (void)AdminWorkerTestAccess::swapReplicas(h.worker(), {nullptr, saved.views});
-        h.tick();
-        ASSERT_TRUE(h.response(a).has_value()) << "answered, never silently dropped";
-        EXPECT_EQ(h.response(a)->err, kInternal);
-        EXPECT_EQ(h.worker().commitReplicaMissing(), 1u);
-        EXPECT_EQ(h.worker().startedCount(), 4u) << "the next queued op started (2 setup defines + a + next)";
-        (void)AdminWorkerTestAccess::swapReplicas(h.worker(), saved);
-        h.settle();
-        ASSERT_TRUE(h.response(next).has_value());
-        EXPECT_EQ(h.response(next)->err, kOk);
-        EXPECT_EQ(h.schemas().byName("n"), nullptr);
-        EXPECT_EQ(h.schemas().byName("src")->version, 1u) << "never applied live";
-        EXPECT_TRUE(h.violations().empty()) << h.violationText();
-    }
+// Was B4_Missing{Schema,Views}ReplicaInAwaitingCommitAnswersInternal (the two
+// per-catalog commit replicas are one __catalog replica now).  The catalog
+// counterparts: an AdminWorker with NO catalog answers every DDL kind Internal
+// (never a silent drop), and an applier that HALTS while an op awaits its commit
+// answers it Internal — and every later DDL Internal (spec §5.3: a halted broker
+// accepts no catalog change).
+TEST(DdlFixRegression, B4_NoCatalogReplicaAnswersEveryDdlInternal) {
+    SchemaRegistry reg;
+    ViewRegistry views;
+    std::vector<uint16_t> codes;
+    AdminDeps d;
+    d.respondDefine = [&](int64_t, int64_t, int32_t, uint16_t, uint16_t e) { codes.push_back(e); };
+    d.respondAlter  = [&](int64_t, int64_t, int32_t, uint16_t, uint16_t e) { codes.push_back(e); };
+    d.respondCreateView = [&](int64_t, int64_t, int32_t, uint64_t, uint16_t e) { codes.push_back(e); };
+    d.respondDdl = [&](int64_t, int64_t, uint16_t e, uint64_t, uint32_t, int32_t, std::string_view) { codes.push_back(e); };
+    d.respondError = [&](int64_t, int64_t, uint16_t e, std::string_view) { codes.push_back(e); };
+    AdminWorker w(reg, nullptr, 1, {1}, std::move(d), nullptr, &views, /*catalogReplica=*/nullptr);
+    (void)w.bootCatalog(BootEffects{}, LiveEffects{});
+    w.submit(DdlRequest{DefineTopicMsg{1, 1, 1, false, "t", "id", charBlob(), 0, 0, {}, {}}});
+    w.submit(DdlRequest{AlterTopicMsg{1, 2, 0, "t", alterOpsFor(Op::AlterAdd, 1), {}}});
+    w.submit(DdlRequest{CreateViewMsg{1, 3, 0, "v", "id", {}, {}}});
+    w.submit(DdlRequest{DropTopicMsg{1, 4, "t", {}}});
+    w.submit(DdlRequest{DropViewMsg{1, 5, "v", {}}});
+    w.submit(DdlRequest{AlterViewMsg{1, 6, "v", "id", 0, 0, {}, {}}});
+    w.submit(DdlRequest{AlterTopicConfigMsg{1, 7, "t", 0, configChangesFor(1), {}}});
+    for (int i = 0; i < 4; ++i) (void)w.doWork(1'000'000LL * (i + 1));
+    EXPECT_EQ(codes, std::vector<uint16_t>(7, kInternal)) << "answered, never silently dropped";
+    EXPECT_EQ(w.startedCount(), 7u);
+    EXPECT_EQ(w.answeredCount(), 7u);
 }
 
-TEST(DdlFixRegression, B4_MissingViewsReplicaInAwaitingCommitAnswersInternal) {
+TEST(DdlFixRegression, B4_ApplierHaltInAwaitingCommitAnswersInternalAndRefusesLaterDdl) {
     DdlHarnessOptions o;
     o.holdCommits = true;
     DdlHarness h(o);
-    const int pushes0 = h.viewPlanPushes();
-    const int64_t v = h.submit(Op::ViewPersisted, "v");
+    const int64_t a = h.submit(Op::AlterAdd, "src");
     ASSERT_TRUE(h.tickUntilAppended());
-    ASSERT_TRUE(h.worker().hasInFlight());
-    const int64_t next = h.submit(Op::AlterAdd, "src");   // uses only the schema replica
-    const auto saved = AdminWorkerTestAccess::swapReplicas(h.worker(), {});
-    (void)AdminWorkerTestAccess::swapReplicas(h.worker(), {saved.schema, nullptr});
-    h.tick();
-    ASSERT_TRUE(h.response(v).has_value()) << "answered, never silently dropped";
-    EXPECT_EQ(h.response(v)->err, kInternal);
-    EXPECT_EQ(h.worker().commitReplicaMissing(), 1u);
-    EXPECT_TRUE(h.worker().hasInFlight()) << "the next queued op (the ALTER) started on the same tick";
-    (void)AdminWorkerTestAccess::swapReplicas(h.worker(), saved);
-    h.settle();
+    const int64_t next = h.submit(Op::ViewPersisted, "v");
+    h.worker().applierForTest().tamperNextFingerprintForTest();   // the event's fingerprint will not verify
+    h.releaseCommits();
+    for (int i = 0; i < 5; ++i) h.tick();
+    ASSERT_TRUE(h.response(a).has_value()) << "answered, never silently dropped";
+    EXPECT_EQ(h.response(a)->err, kInternal);
     ASSERT_TRUE(h.response(next).has_value());
-    EXPECT_EQ(h.response(next)->err, kOk);
-    EXPECT_EQ(h.response(next)->version, 2u);
-    EXPECT_EQ(h.views().byName("v"), nullptr) << "never applied live";
-    EXPECT_EQ(h.viewPlanPushes(), pushes0);
+    EXPECT_EQ(h.response(next)->err, kInternal) << "a halted applier accepts no catalog change";
+    EXPECT_TRUE(h.worker().applier().halted());
+    EXPECT_EQ(h.schemas().byName("src")->version, 1u) << "never applied";
+    EXPECT_EQ(h.views().byName("v"), nullptr);
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-// ── Task 10 fix round 1: harness restart keeps the replica set; restart-aware installs ──
-
+// ── Task 10 fix round 1 (DDL plan): harness restart keeps the replica set ──────
 TEST(DdlHarnessRegression, MultiNodeRestartKeepsTheReplicaSetAndHoldsCommitsAgain) {
     DdlHarnessOptions o;
     o.holdCommits = true;
@@ -1371,7 +1319,7 @@ TEST(DdlHarnessRegression, MultiNodeRestartKeepsTheReplicaSetAndHoldsCommitsAgai
     h.restart();
     EXPECT_TRUE(h.holdingCommits()) << "replica set {1,2} survives the restart";
     EXPECT_FALSE(h.commitHeld()) << "the rebooted leader learned the committed HW";
-    EXPECT_EQ(h.catalog(), before) << "promotion replayed both catalogs up to the learned HW";
+    EXPECT_EQ(h.catalog(), before) << "the boot replay rebuilt the catalog";
 
     // A commit after the restart is held until follower 2 fetches.
     const int64_t b = h.submit(Op::AlterAdd, "t");
@@ -1385,7 +1333,7 @@ TEST(DdlHarnessRegression, MultiNodeRestartKeepsTheReplicaSetAndHoldsCommitsAgai
     EXPECT_EQ(h.response(b)->err, kOk);
     EXPECT_EQ(h.response(b)->version, 2u);
 
-    // A leadership flap after the restart keeps the catalog (rebuild from the HW).
+    // A leadership flap after the restart keeps the catalog.
     h.demote();
     h.promote();
     h.settle();
@@ -1393,6 +1341,10 @@ TEST(DdlHarnessRegression, MultiNodeRestartKeepsTheReplicaSetAndHoldsCommitsAgai
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
+// Install accounting: one live install per committed CREATE VIEW; a restart's boot
+// replay re-installs every live view (recovery installs); a leadership flap
+// re-installs NOTHING (was +1 per view per promotion: every broker applies each
+// event once — Task 7 — and a promotion rebuilds nothing).
 TEST(DdlHarnessRegression, RecoveryViewInstallsAreCountedApartFromCommitInstalls) {
     DdlHarness h;
     const int64_t v = h.submit(Op::ViewPersisted, "v");
@@ -1409,21 +1361,21 @@ TEST(DdlHarnessRegression, RecoveryViewInstallsAreCountedApartFromCommitInstalls
 
     h.demote();
     h.promote();
-    EXPECT_EQ(h.recoveryViewInstalls(), 4) << "every promotion edge re-recovers the views";
+    h.settle();
+    EXPECT_EQ(h.recoveryViewInstalls(), 2) << "a promotion re-installs nothing";
+    EXPECT_EQ(h.viewPlanPushes(), 2);
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
 // ── Task 10b (hard rule 3): the in-flight DDL op is ONE std::variant of explicit
 //    per-state structs; Idle holds nothing, so no stale op field survives an answer.
-static_assert(std::variant_size_v<AdminWorker::InFlight> == 6,
-              "Idle + Define{AwaitingId,AwaitingCommit} + AlterAwaitingCommit + "
-              "View{AwaitingId,AwaitingCommit}");
+static_assert(std::variant_size_v<AdminWorker::InFlight> == 2,
+              "Idle + AwaitingCommit (the AwaitingId states left with the create round-trip)");
 static_assert(std::is_same_v<std::variant_alternative_t<0, AdminWorker::InFlight>, AdminWorker::Idle>,
               "a default-constructed worker is Idle");
 static_assert(std::is_empty_v<AdminWorker::Idle>, "Idle holds no op variables");
 
 namespace {
-// Tick until `corr` is answered; releases held commits only when asked.
 bool tickUntilAnswered(DdlHarness& h, int64_t corr, bool releaseCommits) {
     for (int i = 0; i < 50 && !h.response(corr).has_value(); ++i) {
         if (releaseCommits) h.releaseCommits();
@@ -1449,333 +1401,202 @@ TEST(InFlightStateRegression, IdleWorkerHoldsNoOp) {
 
 TEST(InFlightStateRegression, CommittedOpsWalkTheirStatesAndEndIdle) {
     DdlHarness h(heldCommits());
-    h.setControl(ControlMode::Hold);
-
-    const int64_t d = h.submit(Op::DefineDisk, "d");
-    ASSERT_TRUE(h.tickUntilCreatePending());
-    EXPECT_EQ(h.worker().inFlightStateName(), "DefineAwaitingId");
-    h.deliverCreate();
-    EXPECT_EQ(h.worker().inFlightStateName(), "DefineAwaitingCommit");
-    for (int i = 0; i < 3; ++i) h.tick();
-    EXPECT_FALSE(h.response(d).has_value());
-    ASSERT_TRUE(tickUntilAnswered(h, d, /*releaseCommits=*/true));
-    EXPECT_EQ(h.response(d)->err, kOk);
-    expectIdle(h, "define committed");
-
-    const int64_t a = h.submit(Op::AlterAdd, "d");
-    ASSERT_TRUE(h.tickUntilAppended());
-    EXPECT_EQ(h.worker().inFlightStateName(), "AlterAwaitingCommit");
-    ASSERT_TRUE(tickUntilAnswered(h, a, /*releaseCommits=*/true));
-    EXPECT_EQ(h.response(a)->err, kOk);
-    EXPECT_EQ(h.response(a)->version, 2u);
-    expectIdle(h, "alter committed");
-
-    const int64_t v = h.submit(Op::ViewPersisted, "v");
-    ASSERT_TRUE(h.tickUntilCreatePending());
-    EXPECT_EQ(h.worker().inFlightStateName(), "ViewAwaitingId");
-    h.deliverCreate();
-    EXPECT_EQ(h.worker().inFlightStateName(), "ViewAwaitingCommit");
-    ASSERT_TRUE(tickUntilAnswered(h, v, /*releaseCommits=*/true));
-    EXPECT_EQ(h.response(v)->err, kOk);
-    expectIdle(h, "view committed");
+    struct Step { Op op; const char* name; uint32_t version; };
+    const Step steps[] = {
+        {Op::DefineDisk, "d", 1}, {Op::AlterAdd, "d", 2}, {Op::ViewPersisted, "v", 1},
+        {Op::AlterView, "v", 2}, {Op::AlterTopicConfig, "d", 3}, {Op::DropView, "v", 3}, {Op::DropTopic, "d", 4},
+    };
+    for (const Step& s : steps) {
+        SCOPED_TRACE(opName(s.op));
+        const int64_t c = h.submit(s.op, s.name);
+        ASSERT_TRUE(h.tickUntilAppended());
+        EXPECT_EQ(h.worker().inFlightStateName(), "AwaitingCommit");
+        for (int i = 0; i < 3; ++i) h.tick();
+        EXPECT_FALSE(h.response(c).has_value());
+        ASSERT_TRUE(tickUntilAnswered(h, c, /*releaseCommits=*/true));
+        EXPECT_EQ(h.response(c)->err, kOk);
+        EXPECT_EQ(h.response(c)->version, s.version);
+        expectIdle(h, "committed");
+    }
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
 TEST(InFlightStateRegression, EveryUncommittedExitEndsIdle) {
     DdlHarness h(heldCommits());
-    h.setControl(ControlMode::Hold);
 
-    // AwaitingId -> failed create reply.
-    const int64_t f = h.submit(Op::DefineDisk, "f");
-    ASSERT_TRUE(h.tickUntilCreatePending());
-    h.failCreate(/*afterCreate=*/false);
-    ASSERT_TRUE(h.response(f).has_value());
-    EXPECT_EQ(h.response(f)->err, kInternal);
-    expectIdle(h, "failed create");
-
-    // ViewAwaitingId -> timeout; the late reply is a stale ticket and changes nothing.
-    const int64_t vt = h.submit(Op::ViewPersisted, "vt");
-    ASSERT_TRUE(h.tickUntilCreatePending());
-    EXPECT_EQ(h.worker().inFlightStateName(), "ViewAwaitingId");
-    h.advance(AdminWorker::ddlTimeoutNs() + 1);
-    ASSERT_TRUE(tickUntilAnswered(h, vt, /*releaseCommits=*/false));
-    EXPECT_EQ(h.response(vt)->err, kInternal);
-    expectIdle(h, "view timed out in AwaitingId");
-    h.deliverCreate();
-    expectIdle(h, "stale reply after timeout");
-
-    // DefineAwaitingCommit -> timeout on the held HW gate.
+    // AwaitingCommit -> timeout on the held HW gate (the retriable NotLeader, F13).
     const int64_t dt = h.submit(Op::DefineDisk, "dt");
-    ASSERT_TRUE(h.tickUntilCreatePending());
-    h.deliverCreate();
-    EXPECT_EQ(h.worker().inFlightStateName(), "DefineAwaitingCommit");
+    ASSERT_TRUE(h.tickUntilAppended());
     h.advance(AdminWorker::ddlTimeoutNs() + 1);
     ASSERT_TRUE(tickUntilAnswered(h, dt, /*releaseCommits=*/false));
-    EXPECT_EQ(h.response(dt)->err, kInternal);
+    EXPECT_EQ(h.response(dt)->err, kNotLeader);
     expectIdle(h, "define timed out in AwaitingCommit");
+    h.settle();   // the event commits; the leader catches up
 
-    // AlterAwaitingCommit -> demotion answers it at once with the ALTER's topic id.
-    const int32_t srcId = h.schemas().byName("src")->topicId;
+    // AwaitingCommit -> demotion answers it at once.
     const int64_t a = h.submit(Op::AlterAdd, "src");
     ASSERT_TRUE(h.tickUntilAppended());
-    EXPECT_EQ(h.worker().inFlightStateName(), "AlterAwaitingCommit");
     h.demote();
     ASSERT_TRUE(h.response(a).has_value());
-    EXPECT_EQ(h.response(a)->err, kInternal);
-    EXPECT_EQ(h.response(a)->id, srcId);
+    EXPECT_EQ(h.response(a)->err, kNotLeader);
     expectIdle(h, "alter demoted in AwaitingCommit");
     h.promote();
     expectIdle(h, "after re-promotion");
+    h.settle();
+
+    // A refused append (below minIsr) never enters AwaitingCommit.
+    h.shrinkIsr();
+    const int64_t r = h.submit(Op::DefineDisk, "refused");
+    for (int i = 0; i < 5; ++i) h.tick();
+    ASSERT_TRUE(h.response(r).has_value());
+    EXPECT_EQ(h.response(r)->err, kNotLeader);
+    expectIdle(h, "append refused below minIsr");
+    h.restoreIsr();
+
+    // AwaitingCommit -> the applier halts at the event.
+    h.settle();
+    const int64_t hx = h.submit(Op::AlterAdd, "src2");
+    ASSERT_TRUE(h.tickUntilAppended());
+    h.worker().applierForTest().tamperNextFingerprintForTest();
+    ASSERT_TRUE(tickUntilAnswered(h, hx, /*releaseCommits=*/true));
+    EXPECT_EQ(h.response(hx)->err, kInternal);
+    expectIdle(h, "apply halted in AwaitingCommit");
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-// ── OPTIONAL KL1 follow-up ────────────────────────────────────────────────────
-TEST(DdlFixRegression, Optional_CreateViewRetryAdoptsItsOwnOrphanSink) {
-    DdlHarness h;
-    h.setControl(ControlMode::Hold);
-    const int64_t a = h.submit(Op::ViewPersisted, "v");
-    ASSERT_TRUE(h.tickUntilCreatePending());
-    h.failCreate(/*afterCreate=*/true);
-    h.setControl(ControlMode::Auto);
+// ── KL1 follow-up, on the catalog path: there is no orphan to adopt ───────────
+// Was Optional_CreateViewRetryAdoptsItsOwnOrphanSink: a CREATE VIEW answered
+// NotLeader by a demotion is retried with its requestId — answered the ORIGINAL
+// result (the same sink), nothing appended twice (F14 dedupe replaces adoption).
+TEST(DdlFixRegression, Optional_CreateViewRetryAfterNotLeaderGetsItsOriginalSink) {
+    DdlHarness h(heldCommits());
+    CreateViewMsg m;
+    m.viewName = "v"; m.keyField = "id";
+    m.planBlob = viewPlanBlob("v", h.idOf("src"), 0);
+    m.meta = h.rig().meta("CREATE VIEW v");
+    const CreateViewMsg retry = m;
+    const int64_t a = h.submitRawView(std::move(m));
+    ASSERT_TRUE(h.tickUntilAppended());
+    h.demote();
+    ASSERT_EQ(h.response(a)->err, kNotLeader);
+    h.promote();
     h.settle();
-    ASSERT_EQ(h.response(a)->err, kInternal);
     const int32_t sink = h.idOf("v");
-    const int64_t b = h.submit(Op::ViewPersisted, "v");
+    ASSERT_GE(sink, 0) << "the event committed under the re-promoted leader";
+    const uint64_t events = h.eventsAppended();
+    const int64_t b = h.submitRawView(retry);
     h.settle();
-    EXPECT_EQ(h.response(b)->err, kOk) << "the retry adopts the identical orphan sink";
+    EXPECT_EQ(h.response(b)->err, kOk) << "the retry gets the original result";
     EXPECT_EQ(h.response(b)->id, sink);
+    EXPECT_EQ(h.eventsAppended(), events) << "deduped";
     EXPECT_NE(h.views().byName("v"), nullptr);
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-TEST(DdlFixRegression, Optional_AViewNeverAdoptsAnOrphanDefineOrAStaticCompactTopic) {
-    DdlHarnessOptions o;
-    TopicSpec s; s.name = "stat_sink"; s.partitionCount = 1; s.cleanupPolicy = TopicSpec::CleanupPolicy::Compact;
-    s.partitionKey = "id";
-    o.statics.push_back(s);
-    DdlHarness h(o);
-    const int64_t st = h.submit(Op::ViewPersisted, "stat_sink");
-    h.settle();
-    EXPECT_EQ(h.response(st)->err, kTopicExists) << "a static topic is never a sink";
-    h.setControl(ControlMode::Hold);
-    const int64_t d = h.submit(Op::DefineDisk, "orph_def");
-    ASSERT_TRUE(h.tickUntilCreatePending());
-    h.failCreate(true);
-    h.setControl(ControlMode::Auto);
-    h.settle();
-    ASSERT_EQ(h.response(d)->err, kInternal);
-    const int64_t v = h.submit(Op::ViewPersisted, "orph_def");
-    h.settle();
-    EXPECT_EQ(h.response(v)->err, kTopicExists) << "a Delete-policy orphan is not a view sink";
-    EXPECT_TRUE(h.violations().empty()) << h.violationText();
-}
-
-namespace {
-/// A fresh temp dir removed on scope exit — even when an ASSERT returns early.
-struct OptionalTempDir {
-    fs::path path;
-    explicit OptionalTempDir(const char* tag)
-        : path(fs::temp_directory_path() / (std::string(tag) + std::to_string(::getpid()))) {
-        std::error_code ec; fs::remove_all(path, ec);
-        fs::create_directories(path);
-    }
-    ~OptionalTempDir() { std::error_code ec; fs::remove_all(path, ec); }
-    OptionalTempDir(const OptionalTempDir&) = delete;
-    OptionalTempDir& operator=(const OptionalTempDir&) = delete;
-};
-
-std::string optionalReadFile(const fs::path& p) {
-    std::ifstream in(p, std::ios::binary);
-    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-}
-
-CreateTopicReqMsg sinkReq(const std::string& name) {
-    CreateTopicReqMsg r;
-    r.ticket = 1; r.name = name; r.partitionCount = 2; r.keyField = "id";
-    r.cleanupPolicy = static_cast<uint8_t>(TopicSpec::CleanupPolicy::Compact); r.persistence = 0;
-    return r;
-}
-} // namespace
-
-// The control-thread half: sinkSpecMatches is set iff the name already names a
-// RUNTIME topic whose spec is exactly the requested sink's (Compact, key,
-// partitions, mode) — every other existing / created topic leaves it false.
-TEST(DdlFixRegression, Optional_SinkSpecMatchesOnlyForAnIdenticalRuntimeCompactTopic) {
-    OptionalTempDir dir("rune_ddl_sinkspec_");
-    TopicSpec stat; stat.name = "stat"; stat.partitionCount = 2; stat.partitionKey = "id";
-    stat.cleanupPolicy = TopicSpec::CleanupPolicy::Compact;
-    rune::gateway::TopicRegistry reg({stat}, dir.path.string());
-    constexpr int32_t kFirstRuntime = 1;
-
-    const CreateTopicReplyMsg fresh = createTopicForAdmin(reg, sinkReq("sink"), kFirstRuntime);
-    ASSERT_GE(fresh.topicId, kFirstRuntime);
-    EXPECT_FALSE(fresh.existed);
-    EXPECT_FALSE(fresh.sinkSpecMatches) << "a freshly created sink is not an existing one";
-
-    const CreateTopicReplyMsg again = createTopicForAdmin(reg, sinkReq("sink"), kFirstRuntime);
-    EXPECT_TRUE(again.existed);
-    EXPECT_EQ(again.topicId, fresh.topicId);
-    EXPECT_TRUE(again.sinkSpecMatches) << "an identical runtime Compact topic matches";
-    EXPECT_FALSE(createTopicForAdmin(reg, sinkReq("sink")).sinkSpecMatches)
-        << "the default firstRuntimeId never matches (existing callers keep today's behaviour)";
-
-    struct Mismatch { const char* what; CreateTopicReqMsg req; };
-    std::vector<Mismatch> ms;
-    { CreateTopicReqMsg r = sinkReq("sink"); r.keyField = "hp";       ms.push_back({"key", r}); }
-    { CreateTopicReqMsg r = sinkReq("sink"); r.keyField = "";         ms.push_back({"no key", r}); }
-    { CreateTopicReqMsg r = sinkReq("sink"); r.partitionCount = 3;    ms.push_back({"partitions", r}); }
-    { CreateTopicReqMsg r = sinkReq("sink"); r.persistence = 1;       ms.push_back({"mode", r}); }
-    { CreateTopicReqMsg r = sinkReq("sink"); r.cleanupPolicy = 0;     ms.push_back({"policy Delete", r}); }
-    { CreateTopicReqMsg r = sinkReq("sink"); r.cleanupPolicy = 2;     ms.push_back({"policy CompactDelete", r}); }
-    for (const Mismatch& m : ms) {
-        SCOPED_TRACE(m.what);
-        const CreateTopicReplyMsg r = createTopicForAdmin(reg, m.req, kFirstRuntime);
-        EXPECT_TRUE(r.existed);
-        EXPECT_FALSE(r.sinkSpecMatches);
-    }
-
-    const CreateTopicReplyMsg st = createTopicForAdmin(reg, sinkReq("stat"), kFirstRuntime);
-    EXPECT_TRUE(st.existed);
-    EXPECT_EQ(st.topicId, 0);
-    EXPECT_FALSE(st.sinkSpecMatches) << "a static topic never matches, even when spec-identical";
-
-    // A runtime Delete-policy topic (an orphan DefineTopic) never matches a sink.
-    CreateTopicReqMsg def = sinkReq("def"); def.cleanupPolicy = 0;
-    ASSERT_GE(createTopicForAdmin(reg, def, kFirstRuntime).topicId, kFirstRuntime);
-    EXPECT_FALSE(createTopicForAdmin(reg, def, kFirstRuntime).sinkSpecMatches)
-        << "only a Compact request can match";
-    EXPECT_FALSE(createTopicForAdmin(reg, sinkReq("def"), kFirstRuntime).sinkSpecMatches);
-
-    // A case variant is a conflict (B3), never a match.
-    const CreateTopicReplyMsg cv = createTopicForAdmin(reg, sinkReq("SINK"), kFirstRuntime);
-    EXPECT_TRUE(cv.caseConflict);
-    EXPECT_FALSE(cv.sinkSpecMatches);
-}
-
-TEST(DdlFixRegression, Optional_SinkSpecMatchesCrossesTheReplyRing) {
-    OneToOneByteRing ring{kCreateTopicRingBytes};
-    CreateTopicReplyMsg m;
-    m.ticket = 9; m.topicId = 4; m.partitionCount = 1; m.existed = true; m.persistence = 0;
-    m.sinkSpecMatches = true;
-    ASSERT_TRUE(encodeCreateTopicReply(ring, m));
-    CreateTopicReplyMsg plain = m;
-    plain.sinkSpecMatches = false;
-    ASSERT_TRUE(encodeCreateTopicReply(ring, plain));
-    int frames = 0;
-    ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
-                   aeron::util::index_t len) {
-        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
-        const std::size_t n = static_cast<std::size_t>(len);
-        ASSERT_EQ(n, 21u) << "the sinkSpecMatches trailer is byte 19 (I2's existingIsRuntimeCompact 20)";
-        const CreateTopicReplyMsg got = decodeCreateTopicReply(p, n);
-        EXPECT_EQ(got.sinkSpecMatches, frames == 0);
-        EXPECT_FALSE(got.caseConflict);
-        EXPECT_EQ(got.ticket, 9);
-        EXPECT_EQ(got.topicId, 4);
-        EXPECT_TRUE(got.existed);
-        EXPECT_EQ(decodeCreateTopicReply(p, n - 1).sinkSpecMatches, frames == 0) << "a pre-I2 frame keeps it";
-        const CreateTopicReplyMsg old = decodeCreateTopicReply(p, n - 2);
-        EXPECT_FALSE(old.sinkSpecMatches) << "a pre-Task-14 frame decodes as no match";
-        EXPECT_EQ(old.topicId, 4) << "and keeps every earlier field";
-        ++frames;
-    }, 4);
-    EXPECT_EQ(frames, 2);
-
-    // An unknown mode byte fails the create: a stale match flag must not survive it.
-    uint8_t raw[20] = {};
-    raw[8] = 4;          // topicId 4
-    raw[16] = 1;         // existed
-    raw[17] = 7;         // unknown persistence
-    raw[19] = 1;         // sinkSpecMatches
-    const CreateTopicReplyMsg bad = decodeCreateTopicReply(raw, sizeof raw);
-    EXPECT_EQ(bad.topicId, -1);
-    EXPECT_FALSE(bad.sinkSpecMatches);
-}
-
-// Final review I2: the existingIsRuntimeCompact trailer (byte 20) crosses the ring;
-// a 20-byte (pre-I2) frame decodes it false, and an unknown mode clears it.
-TEST(DdlFixRegression, I2_ExistingIsRuntimeCompactCrossesTheReplyRingRegression) {
-    OneToOneByteRing ring{kCreateTopicRingBytes};
-    CreateTopicReplyMsg m;
-    m.ticket = 11; m.topicId = 6; m.partitionCount = 1; m.existed = true; m.persistence = 0;
-    m.existingIsRuntimeCompact = true;
-    ASSERT_TRUE(encodeCreateTopicReply(ring, m));
-    int frames = 0;
-    ring.drain([&](int32_t, aeron::concurrent::AtomicBuffer& b, aeron::util::index_t off,
-                   aeron::util::index_t len) {
-        const auto* p = reinterpret_cast<const uint8_t*>(b.buffer() + off);
-        const std::size_t n = static_cast<std::size_t>(len);
-        ASSERT_EQ(n, 21u);
-        EXPECT_TRUE(decodeCreateTopicReply(p, n).existingIsRuntimeCompact);
-        EXPECT_FALSE(decodeCreateTopicReply(p, n - 1).existingIsRuntimeCompact) << "a pre-I2 frame: false";
-        ++frames;
-    }, 4);
-    EXPECT_EQ(frames, 1);
-    uint8_t raw[21] = {};
-    raw[8] = 6; raw[16] = 1; raw[17] = 7;   // unknown persistence
-    raw[20] = 1;
-    EXPECT_FALSE(decodeCreateTopicReply(raw, sizeof raw).existingIsRuntimeCompact);
-}
-
-// The admin-thread guard: a spec-matching reply is adopted ONLY when no catalog
-// record claims the id — a TopicSchema (typed topic) or a ViewRecord never is.
-TEST(DdlFixRegression, Optional_AMatchingReplyForAClaimedTopicIsStillTopicExists) {
+// Was Optional_AViewNeverAdoptsAnOrphanDefineOrAStaticCompactTopic: a CREATE VIEW
+// whose name is taken by ANY topic — untyped (the former static / orphan) or typed —
+// is TopicExists; a view never takes over a topic.
+TEST(DdlFixRegression, Optional_AViewNeverTakesOverAnExistingTopic) {
     DdlHarness h;
-    const int64_t v1 = h.submit(Op::ViewPersisted, "v1");
+    const int64_t u = submitUntyped(h, "untyped_sink");
     h.settle();
-    ASSERT_EQ(h.response(v1)->err, kOk);
-    const int32_t srcId = h.idOf("src");
-    const int32_t v1Id  = h.idOf("v1");
-    const int topicsBefore = h.topicCount();
-    for (const int32_t claimed : {srcId, v1Id}) {
-        SCOPED_TRACE(claimed);
-        h.setControl(ControlMode::Hold);
-        const int64_t x = h.submit(Op::ViewPersisted, "x");
-        ASSERT_TRUE(h.tickUntilCreatePending());
-        h.deliverForgedReply(claimed, /*existed=*/true, /*sinkSpecMatches=*/true);
-        h.setControl(ControlMode::Auto);
+    ASSERT_EQ(h.response(u)->err, kOk);
+    for (const char* name : {"untyped_sink", "src"}) {
+        SCOPED_TRACE(name);
+        const int64_t v = h.submit(Op::ViewPersisted, name);
         h.settle();
-        ASSERT_TRUE(h.response(x).has_value());
-        EXPECT_EQ(h.response(x)->err, kTopicExists);
-        EXPECT_EQ(h.views().byName("x"), nullptr);
+        EXPECT_EQ(h.response(v)->err, kTopicExists);
+        EXPECT_EQ(h.response(v)->id, h.idOf(name));
+        EXPECT_EQ(h.views().byName(name), nullptr);
     }
-    EXPECT_EQ(h.topicCount(), topicsBefore);
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
 
-// The adopting commit promotes the sink's dir marker pending -> committed, and the
-// adopted view survives a restart exactly as created (never an __orphan placeholder).
-TEST(DdlFixRegression, Optional_AnAdoptedSinkIsCommittedAndSurvivesRestart) {
-    DdlHarness h;
-    h.setControl(ControlMode::Hold);
+// Was Optional_AnAdoptedSinkIsCommittedAndSurvivesRestart: the view whose CREATE
+// was answered NotLeader (demotion) and then deduped survives a restart under its
+// one sink id; a third CREATE (a NEW requestId) is ViewExists.
+TEST(DdlFixRegression, Optional_ADedupedViewSurvivesRestartUnderItsOneSinkId) {
+    DdlHarness h(heldCommits());
     const int64_t a = h.submit(Op::ViewPersisted, "v");
-    ASSERT_TRUE(h.tickUntilCreatePending());
-    h.failCreate(/*afterCreate=*/true);
-    h.setControl(ControlMode::Auto);
+    ASSERT_TRUE(h.tickUntilAppended());
+    h.demote();
+    ASSERT_EQ(h.response(a)->err, kNotLeader);
+    h.promote();
     h.settle();
-    ASSERT_EQ(h.response(a)->err, kInternal);
     const int32_t sink = h.idOf("v");
     ASSERT_GE(sink, 0);
-    const fs::path marker = h.root() / "topics" / "v" / rune::gateway::kTopicIdMarkerFile;
-    EXPECT_EQ(optionalReadFile(marker), "pending " + std::to_string(sink) + "\n")
-        << "the orphan sink's record never committed";
-    const int64_t b = h.submit(Op::ViewPersisted, "v");
-    h.settle();
-    ASSERT_EQ(h.response(b)->err, kOk);
-    EXPECT_EQ(optionalReadFile(marker), "committed " + std::to_string(sink) + "\n")
-        << "the adopting commit promotes the marker";
-    EXPECT_EQ(h.createRequests(), 2 + 2) << "src, src2, then one request per attempt";
-
     const Catalog before = h.catalog();
     ASSERT_NE(findEntry(before, "v"), nullptr);
     EXPECT_EQ(findEntry(before, "v")->kind, EntryKind::View);
     h.restart();
-    EXPECT_EQ(h.catalog(), h.expectedAfterRestart(before));
+    EXPECT_EQ(h.catalog(), before);
     EXPECT_EQ(h.idOf("v"), sink);
     ASSERT_NE(h.views().byName("v"), nullptr);
     EXPECT_EQ(h.views().byName("v")->viewTopicId, sink);
     const int64_t c = h.submit(Op::ViewPersisted, "v");
     h.settle();
     EXPECT_EQ(h.response(c)->err, kViewExists);
+    EXPECT_TRUE(h.violations().empty()) << h.violationText();
+}
+
+// ── Task 9 re-review follow-up: a deduped CREATE VIEW whose output fingerprint
+//    cannot be recovered is answered Internal, never OK with a made-up fingerprint.
+namespace {
+/// Flip one byte inside the record batch holding `offset` in the catalog's segment
+/// files: its CRC no longer verifies, so any later read of it fails.
+bool corruptCatalogBatchAt(const std::string& dir, int64_t offset) {
+    for (const auto& f : fs::directory_iterator(dir)) {
+        if (f.path().extension() != ".log") continue;
+        std::fstream io(f.path(), std::ios::in | std::ios::out | std::ios::binary);
+        std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(io)), std::istreambuf_iterator<char>());
+        std::size_t pos = 0;
+        while (pos < bytes.size()) {
+            rune::protocol::RecordBatchReader r(bytes.data() + pos, bytes.size() - pos);
+            if (!r.ensureValid()) break;
+            const auto tl = static_cast<std::size_t>(r.totalLength());
+            bool holds = false;
+            r.forEachRecord([&](std::string_view, std::string_view, int64_t off, int64_t) { holds = holds || off == offset; });
+            if (holds) {
+                const std::size_t at = pos + tl - 1;   // the last byte of its records
+                io.clear();
+                io.seekp(static_cast<std::streamoff>(at));
+                const char flipped = static_cast<char>(bytes[at] ^ 0xFF);
+                io.write(&flipped, 1);
+                io.flush();
+                return static_cast<bool>(io);
+            }
+            if (tl == 0) break;
+            pos += tl;
+        }
+    }
+    return false;
+}
+} // namespace
+
+TEST(DdlFixRegression, DedupedCreateViewWhoseFingerprintIsUnrecoverableIsInternalRegression) {
+    DdlHarness h;
+    CreateViewMsg m;
+    m.viewName = "v"; m.keyField = "id";
+    m.planBlob = viewPlanBlob("v", h.idOf("src"), 0);
+    m.meta = h.rig().meta("CREATE VIEW v");
+    const CreateViewMsg retry = m;
+    const int64_t a = h.submitRawView(std::move(m));
+    h.settle();
+    ASSERT_EQ(h.response(a)->err, kOk);
+    const int64_t createdAt = h.catalogLogEnd() - 1;
+    // The view moves on (ALTER VIEW: version 2), so a retry's original output
+    // fingerprint must be re-read from the CreateView event in the log ...
+    const int64_t alt = h.submit(Op::AlterView, "v");
+    h.settle();
+    ASSERT_EQ(h.response(alt)->err, kOk);
+    // ... and that event no longer reads back.
+    ASSERT_TRUE(corruptCatalogBatchAt(h.catalogDir(), createdAt));
+    const uint64_t events = h.eventsAppended();
+    const int64_t b = h.submitRawView(retry);
+    h.settle();
+    ASSERT_TRUE(h.response(b).has_value()) << "answered, never dropped";
+    EXPECT_EQ(h.response(b)->err, kInternal) << "never an OK carrying a made-up fingerprint";
+    EXPECT_EQ(h.eventsAppended(), events) << "a dedupe appends nothing";
+    EXPECT_FALSE(h.worker().applier().halted()) << "the applier already applied it: it keeps applying";
     EXPECT_TRUE(h.violations().empty()) << h.violationText();
 }
