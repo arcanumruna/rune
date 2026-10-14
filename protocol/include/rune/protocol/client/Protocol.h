@@ -269,7 +269,8 @@ inline constexpr int32_t kClientVersion                           = 8;   // what
 
 // Subscribe{topicId = kCatalogTopicId, partition 0, partitionKnown 1} reads
 // the `__catalog` log (catalog history) from ANY broker — see DataMessages.h
-// above `struct Subscribe` for the caught-up marker.
+// above `struct Subscribe` for the history-epoch note and the caught-up marker
+// (both v8-only and format-neutral: an 8-byte recordBatch, like the lineage note).
 inline constexpr int32_t kCatalogTopicId                          = -6;
 
 // ---------------------------------------------------------------------------

@@ -311,10 +311,27 @@ struct ProduceResponse {
 //
 // Catalog history (client version 8): Subscribe{topicId = kCatalogTopicId
 // (−6), partition 0, partitionKnown 1} reads `__catalog` from ANY broker,
-// served from that broker's replica up to its high watermark.  After the
-// committed backlog the broker pushes ONE Records frame with baseOffset = its
-// HW and an EMPTY records payload — the caught-up marker (catalog
-// subscriptions only); live events follow as they commit.
+// served from that broker's replica up to its high watermark.  Catalog
+// subscriptions only, two frames carry the HISTORY EPOCH (u64 LE, as the
+// recordBatch, EXACTLY 8 bytes — format-neutral like the transient lineage
+// note of version 7: no valid RecordBatch is 8 bytes):
+//   - the EPOCH NOTE, Records{baseOffset −1, the epoch}: the FIRST Records frame
+//     of every catalog stream (sent again only if the session dropped it) —
+//     every record of the stream belongs to the committed history it names;
+//   - the CAUGHT-UP MARKER, Records{baseOffset = the broker's HW, the epoch},
+//     ONE, after the committed backlog; live events follow as they commit.
+// The epoch names one committed history of THAT broker's `__catalog`: it
+// changes on every truncation below a high watermark it served (which also ends
+// every catalog read once, NotLeader), it is persisted, and it starts random
+// (two brokers never share a value).  A reader caches (prefix, epoch) and
+// continues from its cache end only while the epoch is unchanged; any other
+// value: drop the cache, re-read from 0.
+//
+// Records frames (every topic): the recordBatch may hold SEVERAL whole batches
+// back to back (the catalog read server coalesces them; data pushes send one).
+// A decoder walks every batch; a control batch's offsets are consumed, never
+// delivered.  An EMPTY recordBatch is the position note (version 6) and an
+// 8-byte one the lineage note (version 7) / the catalog epoch frames above.
 // ---------------------------------------------------------------------------
 struct Subscribe {
     int64_t  sessionId      = 0;
