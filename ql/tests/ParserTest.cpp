@@ -127,7 +127,7 @@ TEST(Parser, ExistingTopicStatementStillParses) {
 }
 
 TEST(Parser, RejectsUnknownStatementKeyword) {
-    auto r = rune::ql::parse("drop topic users;");
+    auto r = rune::ql::parse("truncate topic users;");
     ASSERT_FALSE(r.has_value());
 }
 
@@ -202,7 +202,7 @@ TEST(ParserRegression, AlterCannotChangePersistence) {
 }
 
 TEST(ParserRegression, UnknownStatementMentionsTransient) {
-    auto r = rune::ql::parse("drop topic users;");
+    auto r = rune::ql::parse("truncate topic users;");
     ASSERT_FALSE(r.has_value());
     EXPECT_NE(r.error().message.find("'transient'"), std::string::npos) << r.error().message;
 }

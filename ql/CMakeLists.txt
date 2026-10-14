@@ -18,6 +18,9 @@ target_include_directories(rune_codec_dep PUBLIC ${RUNE_CODEC_ROOT}/include)
 file(GLOB RUNE_QL_SOURCES CONFIGURE_DEPENDS src/*.cpp)
 add_library(rune_ql STATIC ${RUNE_QL_SOURCES})
 target_include_directories(rune_ql PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# rune-ql includes only the std-only rune/protocol/CatalogTypes.h (F32).
+set(RUNE_PROTOCOL_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../rune-protocol/include" CACHE PATH "rune-protocol include dir")
+target_include_directories(rune_ql PUBLIC ${RUNE_PROTOCOL_INCLUDE})
 target_link_libraries(rune_ql PUBLIC rune_codec_dep)
 
 # ── Tests ────────────────────────────────────────────────────────────────────
@@ -27,7 +30,8 @@ if(BUILD_TESTING)
     add_executable(rune_ql_tests
         tests/AstSmokeTest.cpp
         tests/ParserTest.cpp
-        tests/BackendsTest.cpp)
+        tests/BackendsTest.cpp
+        tests/CatalogStatementsTest.cpp)
     target_link_libraries(rune_ql_tests PRIVATE rune_ql GTest::gtest_main)
     include(GoogleTest)
     gtest_discover_tests(rune_ql_tests)
