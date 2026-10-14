@@ -13,12 +13,15 @@
 #include <rune/node/BrokerNode.h>   // AdminWorkerAgent (the production sinks)
 #include <rune/node/CatalogApplier.h>
 #include <rune/node/CatalogCheckpoint.h>
+#include <rune/node/CatalogEffectFrames.h>
 #include <rune/node/SchemaRegistry.h>
 #include <rune/node/ViewRegistry.h>
 
 #include <rune/catalog/CatalogEvent.h>
 #include <rune/codec/Descriptor.h>
 #include <rune/codec/Serialize.h>
+#include <rune/protocol/RecordBatch.h>
+#include <rune/storage/LogReadView.h>
 
 #include <gtest/gtest.h>
 
@@ -218,37 +221,49 @@ TEST(CatalogApplierRegression, ApplyRefusalHaltsAtItsOffsetRegression) {
         << "the refused event posted no effect";
 }
 
+// Fix round 1 (M5): the crash points are SIMULATED, not inferred.
 TEST(CatalogApplierRegression, RestartNeverAppliesAnEventTwiceNorSkipsOneRegression) {
-    CatalogRig rig("ap_crash");
-    rig.appendEvents(0, 5);
-    rig.applier.applyCommitted(rig.replica());
-    const std::vector<uint64_t> digests = rig.rec.appliedDigests;   // digest after each offset 0..4
-    ASSERT_EQ(digests.size(), 5u);
-    const auto ck = rune::node::readCatalogCheckpoint(rig.catalogDir());
-    ASSERT_TRUE(ck.has_value());
-    EXPECT_EQ(*ck, (rune::node::CatalogCheckpoint{4, digests[4]})) << "one checkpoint per applied event";
+    // (a) A crash AFTER offset 2's checkpoint, inside its first side effect: the
+    //     effect throws out of applyCommitted (the process "dies" there).
+    {
+        CatalogRig rig("ap_crash_a");
+        rig.appendEvents(0, 5);
+        rig.rec.onTopicAppliedId = [](int32_t id) {
+            if (id == 2) throw std::runtime_error("simulated crash in offset 2's first side effect");
+        };
+        EXPECT_THROW((void)rig.applier.applyCommitted(rig.replica()), std::runtime_error);
+        const auto ck = rune::node::readCatalogCheckpoint(rig.catalogDir());
+        ASSERT_TRUE(ck.has_value());
+        EXPECT_EQ(ck->appliedOffset, 2) << "the checkpoint of offset 2 was durable before its effect ran";
 
-    // (a) Crash AFTER offset 4's checkpoint, before its effects: boot re-runs them
-    //     through the BOOT sink; live resumes at 5 — offset 4 is never applied live again.
-    rig.restart();
-    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 5);
-    rig.applier.goLive(rig.rec.liveEffects());
-    rig.appendEvents(5, 8);
-    const std::size_t bootCount = rig.rec.appliedOffsets.size();
-    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 3);
-    EXPECT_EQ(std::vector<int64_t>(rig.rec.appliedOffsets.begin() + static_cast<std::ptrdiff_t>(bootCount),
-                                   rig.rec.appliedOffsets.end()),
-              (std::vector<int64_t>{5, 6, 7}));
-
-    // (b) Crash BEFORE offset 4's checkpoint (the checkpoint still names 3): boot
-    //     replays [0, 3]; live applies 4..7 — offset 4 is not skipped.
-    rig.restart();
-    ASSERT_TRUE(rune::node::writeCatalogCheckpoint(rig.catalogDir(), {3, digests[3]}));
-    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 4);
-    rig.applier.goLive(rig.rec.liveEffects());
-    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 4);
-    EXPECT_EQ(rig.rec.appliedOffsets, (std::vector<int64_t>{0, 1, 2, 3, 4, 5, 6, 7})) << "each offset exactly once";
-    EXPECT_FALSE(rig.applier.halted());
+        rig.restart();
+        ASSERT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 3) << "boot replays [0, 2]";
+        EXPECT_TRUE(has(rig.rec.sequence, "topicApplied:2")) << "offset 2's effect re-runs through the BOOT sink";
+        EXPECT_EQ(rig.rec.appliedOffsets, (std::vector<int64_t>{2})) << "the coalesced boot sink: one applied";
+        const std::size_t bootSeq = rig.rec.sequence.size();
+        ASSERT_TRUE(rig.applier.goLive(rig.rec.liveEffects()));
+        EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 2);
+        const std::vector<std::string> live(rig.rec.sequence.begin() + static_cast<std::ptrdiff_t>(bootSeq),
+                                            rig.rec.sequence.end());
+        EXPECT_FALSE(has(live, "topicApplied:2")) << "offset 2 is never applied live a second time";
+        EXPECT_EQ(rig.rec.appliedOffsets, (std::vector<int64_t>{2, 3, 4}));
+    }
+    // (b) A crash BEFORE offset 2's checkpoint: the durable checkpoint still names 1.
+    {
+        CatalogRig rig("ap_crash_b");
+        rig.appendEvents(0, 5);
+        rig.applier.applyCommitted(rig.replica());
+        const uint64_t digestAt1 = rig.rec.appliedDigests.at(1);
+        rig.restart();
+        ASSERT_TRUE(rune::node::writeCatalogCheckpoint(rig.catalogDir(), {1, digestAt1}));
+        ASSERT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 2) << "boot replays [0, 1]";
+        EXPECT_FALSE(has(rig.rec.sequence, "topicApplied:2"));
+        ASSERT_TRUE(rig.applier.goLive(rig.rec.liveEffects()));
+        EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 3);
+        EXPECT_TRUE(has(rig.rec.sequence, "topicApplied:2")) << "offset 2 is re-applied live: not skipped";
+        EXPECT_EQ(rig.rec.appliedOffsets, (std::vector<int64_t>{1, 2, 3, 4}));
+        EXPECT_FALSE(rig.applier.halted());
+    }
 }
 
 TEST(CatalogApplierRegression, CheckpointWriteFailureIsAStorageFailureAndPostsNoEffectRegression) {
@@ -342,7 +357,10 @@ TEST(CatalogApplierRegression, GoldenScriptProjectsTheRegistriesAndPostsEveryEff
     rig.restart();
     EXPECT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), static_cast<int>(rig.golden().size()));
     EXPECT_EQ(rig.applier.state().digest(), digest);
-    EXPECT_EQ(rig.rec.bootViewInstalls, (std::vector<int32_t>{3, 4, 5, 8, 9}));
+    EXPECT_EQ(rig.rec.bootViewInstalls, (std::vector<int32_t>{9})) << "coalesced: the live view only (I1)";
+    EXPECT_FALSE(has(rig.rec.sequence, "topicDropped:0")) << "no create/drop pair for a dropped object";
+    EXPECT_FALSE(has(rig.rec.sequence, "viewUninstalled:3"));
+    EXPECT_EQ(rig.rec.appliedOffsets, (std::vector<int64_t>{22})) << "one applied, at the checkpoint";
     ASSERT_NE(rig.views.byName("ev_view"), nullptr);
     EXPECT_EQ(rig.views.all().size(), 1u);
     ASSERT_NE(rig.schemas.byName("presence"), nullptr);
@@ -454,7 +472,7 @@ TEST(CatalogApplierRegression, ProductionSinkEncodesEveryEffectOnTheAdminToContr
         EXPECT_TRUE(decodeViewPlanUpdate(f.bytes.data(), f.bytes.size()).recovery) << "the BOOT sink: recovery installs";
         ++recoveryInstalls;
     }
-    EXPECT_EQ(recoveryInstalls, 2);
+    EXPECT_EQ(recoveryInstalls, 1) << "coalesced: the one live view (top_players, sink 4)";
 }
 
 TEST(CatalogApplierRegression, ProductionSinkHaltAndRingFullAreNeverDroppedRegression) {
@@ -626,4 +644,338 @@ TEST(CatalogEffectWireTest, EveryMessageRoundTripsAndAMalformedFrameIsRefused) {
     ASSERT_TRUE(decodeCatalogApplied(ap, sizeof ap, off, dg));
     EXPECT_EQ(off, 9); EXPECT_EQ(dg, 0xD1u);
     EXPECT_FALSE(decodeCatalogApplied(ap, 8, off, dg));
+}
+
+// ═══ Fix round 1 ═════════════════════════════════════════════════════════════
+
+namespace {
+
+namespace gd = rune::catalog::testing::golden_detail;
+
+/// A serialized descriptor of `fields` fields with ~`nameLen`-byte names.
+std::vector<uint8_t> wideDescriptor(const std::string& name, int fields, std::size_t nameLen, bool key = true) {
+    rune::codec::DescriptorBuilder d(name);
+    for (int i = 0; i < fields; ++i) {
+        std::string f = "f" + std::to_string(i) + "_";
+        f.resize(nameLen, 'x');
+        d.add(f, rune::codec::PrimType::Int64, 1, key && i == 0);
+    }
+    return rune::codec::serialize(d.build());
+}
+
+/// offset 0: CreateTopic `wide` (typed, `validate`, a `fields`-field descriptor);
+/// then (withView) offset 1: CreateView `wv` over it with an equally wide output.
+std::vector<cat::CatalogEvent> wideScript(int fields, bool validate, bool withView) {
+    gd::ScriptBuilder b;
+    cat::CreateTopicOps o;
+    o.partitions = 1;
+    o.schema = cat::SchemaDef{.keyField = "", .validate = validate,
+                              .descriptorBlob = wideDescriptor("wide", fields, 40, false),
+                              .nextTag = static_cast<uint16_t>(fields)};
+    b.createTopic("wide", std::move(o), "CREATE TOPIC wide (...)");
+    if (withView) {
+        cat::ViewDef v;
+        v.sinkPartitions = 1;
+        v.keyField = "f0_";
+        v.keyField.resize(40, 'x');
+        v.sourceNames = {"wide"};
+        v.normalizedPlanBlob = {0x01, 0x00, 0x00, 0x00, 0x00};
+        v.compiledPlanBlob = {0xC0, 0x00, 0x00, 0x00, 0x00};
+        v.outputDescriptorBlob = wideDescriptor("wv", fields, 40, true);
+        b.createView("wv", std::move(v), "CREATE VIEW wv AS SELECT * FROM wide");
+    }
+    return std::move(b).take();
+}
+
+} // namespace
+
+// C1 — follower side: an oversize effect HALTS apply at its offset; nothing aborts.
+TEST(CatalogApplierRegression, OversizeViewEffectHaltsAtItsOffsetAndNeverAbortsRegression) {
+    using namespace rune::node;
+    // ~2000 fields x ~46 B: each descriptor ~95 KB (< the 128 KiB frame), the view
+    // plan carries the output AND the source descriptor: ~190 KB > 128 KiB.
+    const auto events = wideScript(2000, /*validate=*/false, /*withView=*/true);
+    CatalogRig rig("ap_bigview");
+    AdminWorkerAgent agent(rig.schemas, nullptr, 1, {1}, AdminDeps{});
+    rig.restart();
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), agent.catalogBootEffects()), 0);
+    ASSERT_TRUE(rig.applier.goLive(agent.catalogLiveEffects()));
+    for (const auto& e : events) rig.appendEventCommitted(e);
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 1) << "the topic applied; the view halted";
+    ASSERT_TRUE(rig.applier.halted()) << "an oversize effect halts — the process is still here";
+    ASSERT_NE(rig.applier.haltError(), nullptr);
+    EXPECT_EQ(rig.applier.haltError()->offset, 1);
+    EXPECT_NE(rig.applier.haltError()->detail.find("ViewPlanUpdate"), std::string::npos) << rig.applier.haltError()->detail;
+    EXPECT_EQ(agent.catalogEffectsRefusedForTest(), 0u) << "sized before posting: nothing reached the refusal backstop";
+    // M1: the halted state names the staged event; nothing of it was effected or made durable.
+    EXPECT_EQ(rig.applier.stagedOffset(), 1);
+    EXPECT_EQ(rig.applier.lastApplied().offset, 0);
+    EXPECT_NE(rig.applier.state().viewByName("wv"), nullptr) << "staged in state()";
+    EXPECT_EQ(rig.views.byName("wv"), nullptr) << "never projected";
+    EXPECT_EQ(rune::node::readCatalogCheckpoint(rig.catalogDir())->appliedOffset, 0) << "never checkpointed";
+    // The metric frame is on the ring, after the topic's effects.
+    const auto frames = drainFailureRing(agent);
+    ASSERT_FALSE(frames.empty());
+    EXPECT_EQ(frames.back().type, kA2cCatalogHalted);
+    CatalogHaltedMsg h;
+    ASSERT_TRUE(decodeCatalogHalted(frames.back().bytes.data(), frames.back().bytes.size(), h));
+    EXPECT_EQ(h.offset, 1);
+    // A restart halts at the same offset again (never checkpointed → re-applied live → halts).
+    rig.restart();
+    AdminWorkerAgent agent2(rig.schemas, nullptr, 1, {1}, AdminDeps{});
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), agent2.catalogBootEffects()), 1);
+    ASSERT_TRUE(rig.applier.goLive(agent2.catalogLiveEffects()));
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 0);
+    EXPECT_TRUE(rig.applier.halted());
+    EXPECT_EQ(rig.applier.haltError()->offset, 1);
+}
+
+TEST(CatalogApplierRegression, OversizeValidatorHaltsAtItsOffsetAndNeverAbortsRegression) {
+    using namespace rune::node;
+    // ~3000 fields x ~46 B ≈ 140 KB materialized: its validator frame exceeds 128 KiB.
+    const auto events = wideScript(3000, /*validate=*/true, /*withView=*/false);
+    CatalogRig rig("ap_bigval");
+    AdminWorkerAgent agent(rig.schemas, nullptr, 1, {1}, AdminDeps{});
+    rig.restart();
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), agent.catalogBootEffects()), 0);
+    ASSERT_TRUE(rig.applier.goLive(agent.catalogLiveEffects()));
+    rig.appendEventCommitted(events.at(0));
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 0);
+    ASSERT_TRUE(rig.applier.halted());
+    EXPECT_EQ(rig.applier.haltError()->offset, 0);
+    EXPECT_NE(rig.applier.haltError()->detail.find("SchemaUpdate"), std::string::npos) << rig.applier.haltError()->detail;
+    EXPECT_EQ(rig.applier.stagedOffset(), 0);
+    EXPECT_FALSE(rune::node::readCatalogCheckpoint(rig.catalogDir()).has_value());
+    const auto frames = drainFailureRing(agent);
+    ASSERT_EQ(frames.size(), 1u) << "only the halt: no partial effect of the event";
+    EXPECT_EQ(frames[0].type, kA2cCatalogHalted);
+}
+
+// C1 — leader side (Task 9 wires it): the dry run refuses such an event BEFORE it
+// is ever appended; every golden event passes.
+TEST(CatalogApplierRegression, LeaderDryRunRefusesAnEventWhoseEffectsCannotBePostedRegression) {
+    using namespace rune::node;
+    {
+        SchemaRegistry reg;
+        AdminWorkerAgent agent(reg, nullptr, 1, {1}, AdminDeps{});
+        EXPECT_EQ(catalogEffectMaxFrame(), static_cast<std::size_t>(agent.failureRing().maxMsgLength()))
+            << "the leader's gate and the follower's sink use one frame limit";
+    }
+    const auto view = wideScript(2000, false, true);
+    cat::CatalogState s;
+    ASSERT_FALSE(catalogEventEffectsRefusal(s, view[0]).has_value()) << "the wide topic alone fits";
+    ASSERT_TRUE(cat::apply(s, view[0], 0).has_value());
+    const auto refusal = catalogEventEffectsRefusal(s, view[1]);
+    ASSERT_TRUE(refusal.has_value()) << "the oversize view is refused before it is appended";
+    EXPECT_NE(refusal->find("CreateView 'wv'"), std::string::npos) << *refusal;
+    EXPECT_NE(refusal->find("ViewPlanUpdate"), std::string::npos) << *refusal;
+    EXPECT_EQ(s.viewByName("wv"), nullptr) << "a dry run: the caller's state is untouched";
+
+    const auto val = wideScript(3000, true, false);
+    EXPECT_TRUE(catalogEventEffectsRefusal(cat::CatalogState{}, val[0]).has_value());
+
+    const auto golden = rune::catalog::testing::goldenScriptV1();
+    cat::CatalogState g;
+    for (std::size_t i = 0; i < golden.size(); ++i) {
+        EXPECT_FALSE(catalogEventEffectsRefusal(g, golden[i]).has_value()) << "golden offset " << i;
+        ASSERT_TRUE(cat::apply(g, golden[i], static_cast<int64_t>(i)).has_value());
+    }
+}
+
+// I1 — the coalesced boot sink: a history whose naive (per-event) effect volume
+// exceeds the ring + the initial backlog boots, posting the final state only.
+TEST(CatalogApplierRegression, CoalescedBootSurvivesAHistoryLargerThanTheBacklogRegression) {
+    using namespace rune::node;
+    gd::ScriptBuilder b;
+    {
+        cat::CreateTopicOps o;
+        o.schema = cat::SchemaDef{.keyField = "", .validate = true,
+                                  .descriptorBlob = wideDescriptor("grow", 300, 40, false), .nextTag = 300};
+        b.createTopic("grow", std::move(o), "CREATE TOPIC grow (...)");
+    }
+    for (int i = 0; i < 400; ++i) {
+        std::string f = "added_" + std::to_string(i) + "_";
+        f.resize(40, 'y');
+        b.alterSchema("grow", {gd::addOp(f, rune::codec::PrimType::Int32)}, "ALTER TOPIC grow ADD ...");
+    }
+    const auto events = std::move(b).take();
+    // The naive volume: one validator frame per schema version.
+    std::size_t naive = 0;
+    {
+        cat::CatalogState s;
+        for (std::size_t i = 0; i < events.size(); ++i) {
+            ASSERT_TRUE(cat::apply(s, events[i], static_cast<int64_t>(i)).has_value());
+            naive += schemaUpdateWireLen(materializedDescriptorOf(*s.topicByName("grow")).size());
+        }
+    }
+    ASSERT_GT(naive, static_cast<std::size_t>(kAdminToControlRingBytes) * 5) << "naive volume > ring + 4x-ring backlog";
+
+    CatalogRig rig("ap_bigboot");
+    for (const auto& e : events) rig.appendEventCommitted(e);
+    ASSERT_EQ(rig.applier.applyCommitted(rig.replica()), static_cast<int>(events.size()));   // checkpoint at the end
+    rig.restart();
+    AdminWorkerAgent agent(rig.schemas, nullptr, 1, {1}, AdminDeps{});
+    // Nothing drains the ring during the boot replay (it runs before the admin thread).
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), agent.catalogBootEffects()), static_cast<int>(events.size()));
+    EXPECT_FALSE(rig.applier.halted());
+    EXPECT_EQ(agent.catalogBacklogForTest(), 0u) << "the final state fits the ring outright";
+    EXPECT_EQ(typesOf(drainFailureRing(agent)),
+              (std::vector<int32_t>{kA2cCatalogTopicApplied, kA2cSchemaUpdate, kA2cCatalogApplied}))
+        << "one topic, its current validator, one applied";
+}
+
+// I1 — the backlog never aborts: it grows (capacity kept) and drains in order.
+TEST(CatalogApplierRegression, EffectBacklogGrowsInsteadOfAbortingAndDrainsInOrderRegression) {
+    using namespace rune::node;
+    CatalogRig rig("ap_backlog");
+    AdminWorkerAgent agent(rig.schemas, nullptr, 1, {1}, AdminDeps{});
+    rig.restart();
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), agent.catalogBootEffects()), 0);
+    ASSERT_TRUE(rig.applier.goLive(agent.catalogLiveEffects()));
+    for (const std::size_t size : {std::size_t{4096}, std::size_t{64}, std::size_t{1}}) {
+        const std::vector<uint8_t> junk(size, 0xEE);
+        while (agent.failureRing().write(junk.data(), junk.size(), 0x7777)) {}
+    }
+    // ~6 MiB of backlog: 50 validated topics with ~95 KB descriptors (beyond the 4 MiB initial size).
+    gd::ScriptBuilder b;
+    for (int i = 0; i < 60; ++i) {
+        cat::CreateTopicOps o;
+        o.schema = cat::SchemaDef{.keyField = "", .validate = true,
+                                  .descriptorBlob = wideDescriptor("t" + std::to_string(i), 2000, 40, false),
+                                  .nextTag = 2000};
+        b.createTopic("t" + std::to_string(i), std::move(o), "CREATE TOPIC");
+    }
+    for (const auto& e : std::move(b).take()) rig.appendEventCommitted(e);
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 60);
+    EXPECT_FALSE(rig.applier.halted());
+    EXPECT_GT(agent.catalogBacklogBytesForTest(), static_cast<std::size_t>(kAdminToControlRingBytes) * 4);
+    std::vector<int32_t> types;
+    for (int pass = 0; pass < 1000 && (agent.catalogBacklogForTest() > 0 || pass == 0); ++pass) {
+        for (const auto& f : drainFailureRing(agent))
+            if (f.type != 0x7777) types.push_back(f.type);
+        (void)agent.flushCatalogBacklogForTest();
+    }
+    for (const auto& f : drainFailureRing(agent)) types.push_back(f.type);
+    EXPECT_EQ(agent.catalogBacklogForTest(), 0u);
+    ASSERT_EQ(types.size(), 180u);
+    for (std::size_t i = 0; i < 60; ++i) {
+        EXPECT_EQ(types[3 * i], kA2cCatalogTopicApplied);
+        EXPECT_EQ(types[3 * i + 1], kA2cSchemaUpdate);
+        EXPECT_EQ(types[3 * i + 2], kA2cCatalogApplied);
+    }
+}
+
+// I2 — no progress below the HW is an explicit halt, one cause each.
+namespace {
+void expectReadHalt(const char* tag, rune::storage::ReadIntoStatus status, std::vector<uint8_t> bytes, int count,
+                    const std::string& cause) {
+    CatalogRig rig(tag);
+    rig.appendEvents(0, 2);
+    rig.applier.injectReadForTest(static_cast<int>(status), std::move(bytes), count);
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 0);
+    ASSERT_TRUE(rig.applier.halted()) << cause << ": a stall below the HW must halt, not retry silently";
+    ASSERT_EQ(rig.rec.halts.size(), 1u);
+    EXPECT_EQ(rig.rec.halts[0].offset, 0);
+    EXPECT_NE(rig.rec.halts[0].detail.find("cannot read committed offset 0"), std::string::npos) << rig.rec.halts[0].detail;
+    EXPECT_NE(rig.rec.halts[0].detail.find(cause), std::string::npos) << rig.rec.halts[0].detail;
+}
+} // namespace
+
+TEST(CatalogApplierRegression, AbsentReadBelowTheHighWatermarkHaltsRegression) {
+    expectReadHalt("ap_absent", rune::storage::ReadIntoStatus::Absent, {}, 1, "Absent");
+}
+TEST(CatalogApplierRegression, EmptyReadBelowTheHighWatermarkHaltsRegression) {
+    expectReadHalt("ap_empty", rune::storage::ReadIntoStatus::Ok, {}, 1, "empty");
+}
+TEST(CatalogApplierRegression, ShortReadBelowTheHighWatermarkHaltsRegression) {
+    expectReadHalt("ap_shortread", rune::storage::ReadIntoStatus::Ok, std::vector<uint8_t>(10, 0), 1, "short");
+}
+TEST(CatalogApplierRegression, OversizeBatchPastTheBufferCapHaltsRegression) {
+    expectReadHalt("ap_oversize", rune::storage::ReadIntoStatus::FirstTooLarge, {}, -1, "oversize");
+}
+TEST(CatalogApplierRegression, ALargeBatchGrowsTheReadBufferOnceNotEveryPassRegression) {
+    CatalogRig rig("ap_grow");
+    rig.appendEvents(0, 2);
+    EXPECT_EQ(rig.applier.readBufferBytesForTest(), rune::node::kCatalogReadChunk);
+    rig.applier.injectReadForTest(static_cast<int>(rune::storage::ReadIntoStatus::FirstTooLarge), {}, 1);
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 2);
+    EXPECT_FALSE(rig.applier.halted());
+    EXPECT_EQ(rig.applier.readBufferBytesForTest(), 2 * rune::node::kCatalogReadChunk) << "grown once, capacity kept";
+    rig.appendEvents(2, 4);
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 2);
+    EXPECT_EQ(rig.applier.readBufferBytesForTest(), 2 * rune::node::kCatalogReadChunk) << "no regrowth per pass";
+}
+
+// I3 — gaps, from hand-built batches appended straight to the Log (Log::append
+// does not check contiguity), re-committed by the restart's follower ack.
+namespace {
+std::vector<uint8_t> handBuiltBatch(int64_t baseOffset, const std::vector<uint8_t>& value, bool control) {
+    rune::protocol::RecordBatchBuilder bb(baseOffset, 1'760'000'000'000);
+    bb.setControl(control);
+    bb.append(std::string_view{}, std::string_view(reinterpret_cast<const char*>(value.data()), value.size()),
+              1'760'000'000'000);
+    std::vector<uint8_t> out;
+    bb.buildInto(out);
+    return out;
+}
+} // namespace
+
+TEST(CatalogApplierRegression, GapInTheLogHaltsAtTheMissingOffsetRegression) {
+    CatalogRig rig("ap_gap");
+    rig.appendEvents(0, 3);                                         // offsets 0..2, LEO 3
+    const auto batch = handBuiltBatch(4, CatalogRig::encodeEvent(rig.golden()[3]), /*control=*/false);
+    rig.log().append(batch, /*lastOffset=*/4);                      // offset 3 never written
+    rig.restart();
+    ASSERT_EQ(rig.replica().highWatermark(), 5);
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 0);
+    ASSERT_TRUE(rig.applier.goLive(rig.rec.liveEffects()));
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 3);
+    ASSERT_TRUE(rig.applier.halted());
+    ASSERT_EQ(rig.rec.halts.size(), 1u);
+    EXPECT_EQ(rig.rec.halts[0].offset, 3) << "halts at the MISSING offset";
+    EXPECT_NE(rig.rec.halts[0].detail.find("a gap in __catalog"), std::string::npos) << rig.rec.halts[0].detail;
+    EXPECT_EQ(rig.rec.appliedOffsets, (std::vector<int64_t>{0, 1, 2})) << "offset 4 is never applied past the gap";
+}
+
+TEST(CatalogApplierRegression, ControlBatchPastAGapHaltsRegression) {
+    CatalogRig rig("ap_ctlgap");
+    rig.appendEvents(0, 3);                                         // LEO 3
+    rig.log().append(handBuiltBatch(4, {0x00, 0x00, 0x00, 0x00}, /*control=*/true), /*lastOffset=*/4);
+    const auto ev = handBuiltBatch(5, CatalogRig::encodeEvent(rig.golden()[3]), /*control=*/false);
+    rig.log().append(ev, /*lastOffset=*/5);
+    rig.restart();
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 0);
+    ASSERT_TRUE(rig.applier.goLive(rig.rec.liveEffects()));
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 3);
+    ASSERT_TRUE(rig.applier.halted()) << "a control batch must never carry nextOffset over a gap";
+    EXPECT_EQ(rig.rec.halts.at(0).offset, 3);
+    EXPECT_NE(rig.rec.halts.at(0).detail.find("control batch"), std::string::npos) << rig.rec.halts.at(0).detail;
+    EXPECT_EQ(rig.rec.appliedOffsets, (std::vector<int64_t>{0, 1, 2}));
+}
+
+TEST(CatalogApplierRegression, ContiguousControlBatchIsConsumedNotAGap) {
+    CatalogRig rig("ap_ctlok");
+    rig.appendEvents(0, 3);
+    rig.log().append(handBuiltBatch(3, {0x00, 0x00, 0x00, 0x00}, /*control=*/true), /*lastOffset=*/3);
+    rig.log().append(handBuiltBatch(4, CatalogRig::encodeEvent(rig.golden()[3]), false), /*lastOffset=*/4);
+    rig.restart();
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 0);
+    ASSERT_TRUE(rig.applier.goLive(rig.rec.liveEffects()));
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 4);
+    EXPECT_FALSE(rig.applier.halted());
+    EXPECT_EQ(rig.rec.appliedOffsets, (std::vector<int64_t>{0, 1, 2, 4}));
+}
+
+// M2 — AwaitingBoot → Live only for an empty catalog.
+TEST(CatalogApplierRegression, GoLiveWithoutTheBootReplayIsRefusedWhenACheckpointExistsRegression) {
+    CatalogRig rig("ap_golive");
+    rig.appendEvents(0, 3);
+    rig.applier.applyCommitted(rig.replica());
+    rig.restart();
+    EXPECT_FALSE(rig.applier.goLive(rig.rec.liveEffects()));
+    EXPECT_EQ(rig.applier.phaseName(), "AwaitingBoot");
+    EXPECT_EQ(rig.applier.applyCommitted(rig.replica()), 0) << "nothing re-applied live";
+    ASSERT_EQ(rig.applier.replayLocal(rig.replica(), rig.rec.bootEffects()), 3);
+    EXPECT_TRUE(rig.applier.goLive(rig.rec.liveEffects()));
+    EXPECT_FALSE(rig.applier.goLive(rig.rec.liveEffects())) << "already Live";
 }

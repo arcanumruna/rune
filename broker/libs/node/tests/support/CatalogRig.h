@@ -56,17 +56,20 @@ struct Recorder {
     std::vector<int32_t>                    liveViewInstalls;  // ... through the LIVE sink
     std::vector<std::pair<int, std::string>> storageFailures;
     std::function<void()>                   onTopicApplied;    // test hook, runs inside topicApplied
+    std::function<void(int32_t topicId)>    onTopicAppliedId;  // test hook (may throw: a simulated crash)
 
     void clear() {
         appliedOffsets.clear(); appliedDigests.clear(); halts.clear(); sequence.clear();
         bootViewInstalls.clear(); liveViewInstalls.clear(); storageFailures.clear();
         onTopicApplied = nullptr;
+        onTopicAppliedId = nullptr;
     }
 
     [[nodiscard]] CatalogEffects effects(std::vector<int32_t>& viewInstalls) {
         CatalogEffects e;
         e.topicApplied = [this](const rune::catalog::TopicObject& t) {
             if (onTopicApplied) onTopicApplied();
+            if (onTopicAppliedId) onTopicAppliedId(t.topicId);
             sequence.push_back("topicApplied:" + std::to_string(t.topicId));
         };
         e.sinkApplied = [this](const SinkSpec& s) { sequence.push_back("sinkApplied:" + std::to_string(s.topicId)); };
@@ -136,6 +139,10 @@ public:
     }
     /// Golden event i appended, NOT committed: follower 2 stays silent (HW held).
     void appendUncommitted(std::size_t i) { (void)appendBytes_(encode_(golden_.at(i))); }
+    /// Any event (not from the golden script), committed.
+    void appendEventCommitted(const rune::catalog::CatalogEvent& e) { appendCommitted_(e); }
+    /// Encode `e` exactly as appendEvents does.
+    [[nodiscard]] static std::vector<uint8_t> encodeEvent(const rune::catalog::CatalogEvent& e) { return encode_(e); }
     /// Raw record bytes, committed.
     void appendRawCommitted(const std::vector<uint8_t>& bytes) { ack_(appendBytes_(bytes)); }
 

@@ -568,6 +568,8 @@ public:
     [[nodiscard]] LiveEffects catalogLiveEffects() { return LiveEffects{catalogSink_(/*viewInstallRecovery=*/0)}; }
     [[nodiscard]] BootEffects catalogBootEffects() { return BootEffects{catalogSink_(/*viewInstallRecovery=*/1)}; }
     [[nodiscard]] std::size_t catalogBacklogForTest() const noexcept { return catalogBacklog_.count(); }
+    [[nodiscard]] std::size_t catalogBacklogBytesForTest() const noexcept { return catalogBacklog_.usedBytes(); }
+    [[nodiscard]] uint64_t catalogEffectsRefusedForTest() const noexcept { return catalogEffectsRefused_; }
     int flushCatalogBacklogForTest() { return flushCatalogBacklog_(); }
 
     /// Catalog history Task 6: the __catalog replica's ISR channel (admin →
@@ -630,21 +632,66 @@ private:
     rune::gateway::SpillFifo egressBacklog_{kEgressBacklogBytes};
     std::vector<uint8_t> egressStage_ = std::vector<uint8_t>(static_cast<std::size_t>(kAdminEgressRingBytes) / 8);
 
-    // Catalog history Task 7: catalog effects the ring could not take, FIFO as
-    // (key = the a2c type id, frame bytes).  Preallocated; 4x the ring.
-    static constexpr std::size_t kCatalogBacklogBytes = 4u * static_cast<std::size_t>(kAdminToControlRingBytes);
-    rune::gateway::SpillFifo catalogBacklog_{kCatalogBacklogBytes};
-    std::vector<uint8_t> catalogStage_ = std::vector<uint8_t>(static_cast<std::size_t>(kAdminToControlRingBytes) / 8);
+    // Catalog history Task 7: catalog effects the ring could not take, FIFO.
+    // GROWABLE (fix round 1, C1/I1): its volume is input-derived (a boot posts the
+    // live catalog), so it never has a fixed bound that could abort; capacity
+    // persists (steady state allocates nothing once warmed).
+    static constexpr std::size_t kCatalogBacklogInitialBytes = 4u * static_cast<std::size_t>(kAdminToControlRingBytes);
+    class CatalogFrameFifo {
+    public:
+        explicit CatalogFrameFifo(std::size_t initial) { buf_.reserve(initial); }
+        [[nodiscard]] bool        empty() const noexcept { return count_ == 0; }
+        [[nodiscard]] std::size_t count() const noexcept { return count_; }
+        [[nodiscard]] std::size_t usedBytes() const noexcept { return buf_.size() - head_; }
+        /// Reserve one frame of `len` bytes; the caller writes it at the returned pointer.
+        uint8_t* append(int32_t typeId, std::size_t len) {
+            const std::size_t at = buf_.size();
+            buf_.resize(at + kHeader + len);
+            const auto l = static_cast<uint32_t>(len);
+            std::memcpy(buf_.data() + at, &typeId, 4);
+            std::memcpy(buf_.data() + at + 4, &l, 4);
+            ++count_;
+            return buf_.data() + at + kHeader;
+        }
+        struct Front { int32_t typeId; const uint8_t* data; std::size_t len; };
+        [[nodiscard]] Front front() const noexcept {
+            int32_t t = 0;
+            uint32_t l = 0;
+            std::memcpy(&t, buf_.data() + head_, 4);
+            std::memcpy(&l, buf_.data() + head_ + 4, 4);
+            return Front{t, buf_.data() + head_ + kHeader, l};
+        }
+        void pop() noexcept {
+            head_ += kHeader + front().len;
+            if (--count_ == 0) { buf_.clear(); head_ = 0; }   // capacity kept
+        }
+    private:
+        static constexpr std::size_t kHeader = 8;   // [typeId:i32][len:u32]
+        std::vector<uint8_t> buf_;
+        std::size_t          head_  = 0;
+        std::size_t          count_ = 0;
+    };
+    CatalogFrameFifo catalogBacklog_{kCatalogBacklogInitialBytes};
+    uint64_t         catalogEffectsRefused_ = 0;   // admin-owned: frames that could never fit (see postCatalog_)
 
     [[nodiscard]] std::size_t catalogMaxFrame_() const noexcept {
         return static_cast<std::size_t>(failureRing_.maxMsgLength());
     }
 
     /// Post one catalog effect frame of `len` bytes (written by `write(uint8_t*)`)
-    /// on failureRing_, or into the FIFO backlog behind any earlier one.
+    /// on failureRing_, or into the FIFO backlog behind any earlier one.  Never
+    /// aborts (C1): the applier sizes every frame first (CatalogEffectFrames.h —
+    /// an oversize effect HALTS apply before it reaches here), so a frame that
+    /// still cannot fit is refused loudly and counted, never posted half.
     template <typename Write>
     void postCatalog_(int32_t typeId, std::size_t len, Write&& write) {
-        if (len == 0 || len > catalogMaxFrame_()) [[unlikely]] haltCatalogEffectTooLarge_(typeId, len);
+        if (len == 0 || len > catalogMaxFrame_()) [[unlikely]] {
+            ++catalogEffectsRefused_;
+            spdlog::critical("AdminWorkerAgent: catalog effect type={} ({} B) cannot fit one admin→control ring "
+                             "message ({} B) — NOT posted (the applier's frame sizing should have halted on it; "
+                             "refused so far: {})", typeId, len, catalogMaxFrame_(), catalogEffectsRefused_);
+            return;
+        }
         if (catalogBacklog_.empty()) {
             const auto idx = failureRing_.tryClaim(typeId, len);
             if (idx >= 0) {
@@ -653,15 +700,14 @@ private:
                 return;
             }
         }
-        write(catalogStage_.data());
-        if (!catalogBacklog_.push(typeId, catalogStage_.data(), len)) [[unlikely]] haltCatalogBacklogFull_();
+        write(catalogBacklog_.append(typeId, len));
     }
 
     int flushCatalogBacklog_() {
         int sent = 0;
         while (!catalogBacklog_.empty()) {
             const auto r = catalogBacklog_.front();
-            const auto idx = failureRing_.tryClaim(static_cast<int32_t>(r.key), r.len);
+            const auto idx = failureRing_.tryClaim(r.typeId, r.len);
             if (idx < 0) break;
             std::memcpy(failureRing_.base() + idx, r.data, r.len);
             failureRing_.commit(idx);
@@ -669,19 +715,6 @@ private:
             ++sent;
         }
         return sent;
-    }
-
-    [[noreturn]] [[gnu::cold]] [[gnu::noinline]] void haltCatalogEffectTooLarge_(int32_t typeId, std::size_t len) const noexcept {
-        spdlog::critical("AdminWorkerAgent: catalog effect type={} ({} B) cannot fit one admin→control ring message "
-                         "({} B) — halting rather than dropping an applied catalog effect", typeId, len,
-                         catalogMaxFrame_());
-        std::abort();
-    }
-    [[noreturn]] [[gnu::cold]] [[gnu::noinline]] void haltCatalogBacklogFull_() const noexcept {
-        spdlog::critical("AdminWorkerAgent: catalog effect backlog full ({} effects, {} B) — the control thread "
-                         "stopped draining; halting rather than dropping an applied catalog effect",
-                         catalogBacklog_.count(), catalogBacklog_.usedBytes());
-        std::abort();
     }
 
     void postCatalogTopicApplied_(int32_t topicId, std::string_view name, int32_t partitions, int16_t rf,
@@ -711,9 +744,10 @@ private:
 
     CatalogEffects catalogSink_(uint8_t viewInstallRecovery) {
         CatalogEffects fx;
+        fx.maxFrameBytes = catalogMaxFrame_();   // C1: the applier sizes every frame against it
         fx.topicApplied = [this](const rune::catalog::TopicObject& t) {
+            // A typed topic's validator follows as schemaChanged (the applier posts both).
             postCatalogTopicApplied_(t.topicId, t.name, t.partitions, t.replicationFactor, t.persistence, t.config);
-            postCatalogValidator_(t);   // a typed CreateTopic's validators follow its creation
         };
         fx.sinkApplied = [this](const SinkSpec& s) {
             // A view sink is a keyed, compacted table (Task 19's sink spec), every broker (rf 0).
@@ -1846,8 +1880,15 @@ private:
     std::shared_ptr<aeron::Counter>  catalogAppliedCounter_;
     std::int64_t                     catalogHaltedValue_  = 0;    // control-thread-owned (0 = applying)
     std::int64_t                     catalogAppliedValue_ = -1;   // control-thread-owned
-    bool                             catalogMetricsUnpublished_ = false;   // a value awaits an unresolved counter
     void publishCatalogMetrics_() noexcept;
+    /// A value arrived (applied >= 0 or halted) while a registered counter is
+    /// still unresolved — derived from the values and the counter pointers, no
+    /// stored flag (fix round 1, M4).
+    [[nodiscard]] bool catalogMetricsPending_() const noexcept {
+        const bool hasValue = catalogAppliedValue_ >= 0 || catalogHaltedValue_ != 0;
+        return hasValue && ((!catalogHaltedCounter_ && catalogHaltedCounterRegId_ >= 0) ||
+                            (!catalogAppliedCounter_ && catalogAppliedCounterRegId_ >= 0));
+    }
     // D9 review MEDIUM-3: the TCS stuck-markers gauge counter.  Resolved and
     // set on the CONTROL (runtime) thread only, from the TCS sink below.
     std::int64_t                     stuckMarkersCounterRegId_ = -1;

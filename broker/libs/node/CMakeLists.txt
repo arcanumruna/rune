@@ -16,6 +16,7 @@ add_library(rune_node
     src/CatalogPartition.cpp
     src/CatalogCheckpoint.cpp
     src/CatalogApplier.cpp
+    src/CatalogEffectFrames.cpp
     src/ViewSnapshotIoAgent.cpp
     src/WorkerViewSet.cpp
     src/RuntimeTopicRecovery.cpp)

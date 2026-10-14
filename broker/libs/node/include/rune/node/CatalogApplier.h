@@ -24,11 +24,26 @@
 //   6. effects by kind into the CURRENT PHASE's sink;
 //   7. lastApplied_ = {offset, applied} (F28); the `applied` effect.
 //
-// replayLocal (boot) replays [0, checkpoint] through steps 1–3 and 5–7 into the
-// BOOT sink (no checkpoint rewrite) and verifies the resulting digest against the
-// checkpoint's (a difference = local log damage → Halted).  It runs exactly once,
-// from AwaitingBoot.  A checkpoint at or past the local log end REFUSES to start
-// (throws: the log lost applied events — review M8).
+// Before step 4 (Live), every effect frame the event will post is sized against
+// the sink's maxFrameBytes (CatalogEffectFrames.h): an oversize effect HALTS at
+// that offset (fix round 1, C1) — no input-derived size ever aborts.  Such a halt
+// (and a checkpoint / projection failure) happens after the library applied the
+// event: Halted::stagedOffset names it — state() then INCLUDES that event, whose
+// projections / effects never ran (lastApplied() / the checkpoint stay before it).
+//
+// replayLocal (boot) replays [0, checkpoint] through steps 1–3 and 5 (no
+// checkpoint rewrite, no per-event effects) and verifies the resulting digest
+// against the checkpoint's (a difference = local log damage → Halted).  Its BOOT
+// sink is COALESCED (fix round 1, I1): after the replay it posts the FINAL state
+// only — each live topic (topicApplied [+ schemaChanged]), then each live view
+// (sinkApplied + viewInstalled) — and ONE `applied`; nothing for a dropped
+// object.  Its effect volume is O(live catalog), never O(history).  It runs
+// exactly once, from AwaitingBoot.  A checkpoint at or past the local log end
+// REFUSES to start (throws: the log lost applied events — review M8).
+//
+// A read that makes no progress below the bound is an explicit halt naming its
+// cause (Absent / empty / short / oversize — fix round 1, I2), and a record or a
+// control batch past nextOffset is a gap halt (I3): nothing is ever skipped.
 //
 // Hard rules: owned by the admin thread (shared-nothing — the registries and the
 // replica are admin-owned too); effects leave the thread only through the sink,
@@ -81,6 +96,9 @@ struct CatalogEffects {
     /// The checkpoint could not be made durable (errno, catalog dir) — the broker's
     /// storage-failure halt path (kA2cStorageFailure).
     std::function<void(int err, const std::string& dir)>                 storageFailed;
+    /// The largest effect frame this sink can carry (0 = unlimited).  Production:
+    /// the admin→control ring's max message (fix round 1, C1).
+    std::size_t maxFrameBytes = 0;
 };
 
 /// Boot vs live effects are selected by the applier's PHASE, never by a flag (hard rule 3, F4).
@@ -90,11 +108,17 @@ struct LiveEffects { CatalogEffects sink; };   // applyCommitted: every view ins
 /// The reused read buffer's size (capacity persists; one event never exceeds the
 /// admin request ring's max message, far below it).
 inline constexpr std::size_t kCatalogReadChunk = std::size_t{1} << 20;
+/// A batch larger than the buffer grows it (doubling, capacity kept — never a
+/// per-pass allocation) up to this cap; past it the read is an explicit halt.
+inline constexpr std::size_t kCatalogReadMaxBuffer = std::size_t{64} << 20;
 
 class CatalogApplier {
 public:
     struct Applying { int64_t nextOffset = 0; };
-    struct Halted   { rune::catalog::ApplyError error; };
+    /// stagedOffset >= 0: the library applied that event into state() but its
+    /// projections / effects never ran (an effect too large, a checkpoint or a
+    /// projection failure — fix round 1, M1).  -1: state() is the effected prefix.
+    struct Halted   { rune::catalog::ApplyError error; int64_t stagedOffset = -1; };
     struct AwaitingBoot {};                          // constructed; the one boot replay has not run
     struct Booted { BootEffects effects; };          // replayLocal ran (exactly once); not yet live
     struct Live   { LiveEffects effects; };          // applyCommitted runs here only
@@ -114,8 +138,11 @@ public:
     /// refuse to start — when the checkpoint is unreadable or names an offset at or
     /// past the local log end (review M8: never replay a shorter history).
     int replayLocal(rune::replication::PartitionReplica& r, BootEffects boot);
-    /// AwaitingBoot | Booted → Live.  The broker calls it once, on the admin thread.
-    void goLive(LiveEffects live);
+    /// Booted → Live; AwaitingBoot → Live only when no checkpoint exists (an empty
+    /// catalog — fix round 1, M2: with one, the boot replay must run first or the
+    /// whole history would be re-applied live).  Refused: an error log, the phase
+    /// unchanged, false.  The broker calls it once, on the admin thread.
+    bool goLive(LiveEffects live);
     /// Steady: apply every committed record in [nextOffset, hw) — Live only (any
     /// other phase, or halted: 0, nothing applied).  Returns the events applied.
     int applyCommitted(rune::replication::PartitionReplica& r);
@@ -125,6 +152,9 @@ public:
     [[nodiscard]] bool halted() const noexcept { return std::holds_alternative<Halted>(st_); }
     /// The halt's cause (nullptr while applying).
     [[nodiscard]] const rune::catalog::ApplyError* haltError() const noexcept;
+    /// Halted with an event staged in state() but not effected (M1); -1 otherwise.
+    [[nodiscard]] int64_t stagedOffset() const noexcept;
+    [[nodiscard]] std::size_t readBufferBytesForTest() const noexcept { return readBuf_.size(); }
     [[nodiscard]] int64_t nextOffset() const noexcept;           // -1 when halted
     [[nodiscard]] std::string_view stateName() const noexcept;   // "Applying" | "Halted"
     [[nodiscard]] std::string_view phaseName() const noexcept;   // "AwaitingBoot" | "Booted" | "Live"
@@ -132,6 +162,11 @@ public:
     /// The matrix FingerprintMismatch seam (test-only): the NEXT decoded event's
     /// fingerprint is flipped (^1) before it is applied.
     void tamperNextFingerprintForTest() noexcept { tamperXor_ = 1; }
+    /// I2 seam (test-only): the next `count` log reads answer `status` with
+    /// `bytes` (-1 = every read) instead of reading the log.
+    void injectReadForTest(int status, std::vector<uint8_t> bytes, int count) {
+        readFault_ = ReadFault{status, std::move(bytes), count};
+    }
 
 private:
     // The step list is the phase's: Booted (replayLocal) skips the checkpoint
@@ -140,7 +175,8 @@ private:
     bool applyRecord_(int64_t offset, std::span<const uint8_t> bytes);
     void project_(const rune::catalog::CatalogEvent& e, const rune::catalog::Applied& a);
     void effects_(const CatalogEffects& sink, const rune::catalog::CatalogEvent& e, const rune::catalog::Applied& a);
-    void halt_(rune::catalog::ApplyError err);
+    void halt_(rune::catalog::ApplyError err, int64_t stagedOffset = -1);
+    void emitFinalState_();   // the coalesced boot sink (I1)
     [[nodiscard]] const CatalogEffects* sink_() const noexcept;
 
     std::string                                  dir_;
@@ -152,6 +188,8 @@ private:
     AppliedAt                                    lastApplied_;
     std::vector<uint8_t>                         readBuf_;      // kCatalogReadChunk, capacity kept
     uint64_t                                     tamperXor_ = 0;
+    struct ReadFault { int status = 0; std::vector<uint8_t> bytes; int count = 0; };
+    ReadFault                                    readFault_;   // count 0 = none (test seam)
 };
 
 } // namespace rune::node

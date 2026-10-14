@@ -223,7 +223,12 @@ bool ViewRegistry::erase(int32_t viewTopicId) {
     ViewRecord& slot = records_[it->second];
     const auto nameIt = nameToId_.find(slot.viewName);
     if (nameIt != nameToId_.end() && nameIt->second == viewTopicId) nameToId_.erase(nameIt);
-    slot = ViewRecord{};   // retired in place: viewTopicId = -1, no blobs
+    // Retired in place: viewTopicId = -1, no blobs (the blobs' memory is freed).
+    // The slot is deliberately NOT reused (fix round 1, M3): a caller may still
+    // hold a pointer to it, which must read "gone", never silently alias another
+    // view.  One empty ViewRecord per DropView / AlterView for the process life —
+    // cold, bounded by the DDL count.
+    slot = ViewRecord{};
     idToIndex_.erase(it);
     return true;
 }

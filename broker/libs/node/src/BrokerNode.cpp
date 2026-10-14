@@ -2945,10 +2945,9 @@ void BrokerNode::publishRole() noexcept {
 // BrokerNode::publishCatalogMetrics_ — catalog history Task 7 (CONTROL thread).
 // Resolves the catalog counters once the driver acked them and sets both; a
 // value that arrived before its counter resolved is re-published every control
-// pass until it lands (catalogMetricsUnpublished_).
+// pass until it lands (catalogMetricsPending_()).
 // ---------------------------------------------------------------------------
 void BrokerNode::publishCatalogMetrics_() noexcept {
-    catalogMetricsUnpublished_ = false;
     if (!aeron_) return;
     auto resolve = [this](std::shared_ptr<aeron::Counter>& c, std::int64_t regId) {
         if (c || regId < 0) return;
@@ -2958,9 +2957,7 @@ void BrokerNode::publishCatalogMetrics_() noexcept {
     resolve(catalogHaltedCounter_, catalogHaltedCounterRegId_);
     resolve(catalogAppliedCounter_, catalogAppliedCounterRegId_);
     if (catalogHaltedCounter_) catalogHaltedCounter_->set(catalogHaltedValue_);
-    else if (catalogHaltedCounterRegId_ >= 0) catalogMetricsUnpublished_ = true;
     if (catalogAppliedCounter_) catalogAppliedCounter_->set(catalogAppliedValue_);
-    else if (catalogAppliedCounterRegId_ >= 0) catalogMetricsUnpublished_ = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -4214,7 +4211,7 @@ int BrokerNode::serviceAdminControl_() {
                               tid, n, adminToControlRejects_);
             }
         }, 16);
-    if (catalogMetricsUnpublished_) [[unlikely]] publishCatalogMetrics_();   // a counter resolved late
+    if (catalogMetricsPending_()) [[unlikely]] publishCatalogMetrics_();   // a counter resolved late
     // Control (runtime) thread = the single producer of every worker ring.
     if (workerPool_) work += schemaFanout_.pump(*workerPool_);
     // Task 19: retry any view-plan install frames a worker ring could not take.
